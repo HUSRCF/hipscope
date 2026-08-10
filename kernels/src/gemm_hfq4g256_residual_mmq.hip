@@ -91,6 +91,9 @@
 #ifndef MMQ_SKIP_ZERO_CORRECTION
 #define MMQ_SKIP_ZERO_CORRECTION 0
 #endif
+#ifndef MMQ_SYMMETRIC_I4
+#define MMQ_SYMMETRIC_I4 0
+#endif
 #ifndef MMQ_STREAM_K128
 #define MMQ_STREAM_K128 0
 #endif
@@ -139,10 +142,34 @@
 #ifndef MMQ_WEIGHT_PREFETCH_NEXT
 #define MMQ_WEIGHT_PREFETCH_NEXT 0
 #endif
+#if MMQ_SYMMETRIC_I4 && (MMQ_WEIGHT_PREFETCH_NEXT || MMQ_STREAM_K128 || \
+                         MMQ_STREAM_K128_PHASED_X256 || MMQ_STREAM_K128_X256Y128)
+#error "MMQ_SYMMETRIC_I4 only supports the direct quad-row loader"
+#endif
 #define HFQ4_GROUP_BYTES (MMQ_WEIGHT_EXPANDED_I8 ? 264 : 136)
 #define WARP_SIZE 32
 #define QK8_1 32
 #define QI8_1 8
+
+static __device__ __forceinline__ int center_i4_bytes(int packed) {
+#if MMQ_SYMMETRIC_I4
+    using int8x4_t = __attribute__((__vector_size__(4))) signed char;
+    const int8x4_t values = __builtin_bit_cast(int8x4_t, packed);
+    const int8x4_t offset = {8, 8, 8, 8};
+    return __builtin_bit_cast(int, values - offset);
+#else
+    return packed;
+#endif
+}
+
+static __device__ __forceinline__ float load_hfq4_zero(const char* group) {
+#if MMQ_SYMMETRIC_I4
+    (void)group;
+    return 0.0f;
+#else
+    return __builtin_bit_cast(float, *(const unsigned int*)(group + 4));
+#endif
+}
 #define MMQ_TILE_NE_K 32
 #define MMQ_TILE_Y_K 36
 #define MMQ_STREAM_WEIGHT_K128 \
@@ -647,24 +674,24 @@ static __device__ __forceinline__ void load_hfq4_tile(
             unsigned int q = words.x;
             unsigned int lo = q & 0x0F0F0F0Fu;
             unsigned int hi = (q >> 4) & 0x0F0F0F0Fu;
-            dst[0] = (int)__builtin_amdgcn_perm(hi, lo, 0x05010400u);
-            dst[1] = (int)__builtin_amdgcn_perm(hi, lo, 0x07030602u);
+            dst[0] = center_i4_bytes((int)__builtin_amdgcn_perm(hi, lo, 0x05010400u));
+            dst[1] = center_i4_bytes((int)__builtin_amdgcn_perm(hi, lo, 0x07030602u));
             q = words.y;
             lo = q & 0x0F0F0F0Fu;
             hi = (q >> 4) & 0x0F0F0F0Fu;
-            dst[2] = (int)__builtin_amdgcn_perm(hi, lo, 0x05010400u);
-            dst[3] = (int)__builtin_amdgcn_perm(hi, lo, 0x07030602u);
+            dst[2] = center_i4_bytes((int)__builtin_amdgcn_perm(hi, lo, 0x05010400u));
+            dst[3] = center_i4_bytes((int)__builtin_amdgcn_perm(hi, lo, 0x07030602u));
             words = packed[1];
             q = words.x;
             lo = q & 0x0F0F0F0Fu;
             hi = (q >> 4) & 0x0F0F0F0Fu;
-            dst[4] = (int)__builtin_amdgcn_perm(hi, lo, 0x05010400u);
-            dst[5] = (int)__builtin_amdgcn_perm(hi, lo, 0x07030602u);
+            dst[4] = center_i4_bytes((int)__builtin_amdgcn_perm(hi, lo, 0x05010400u));
+            dst[5] = center_i4_bytes((int)__builtin_amdgcn_perm(hi, lo, 0x07030602u));
             q = words.y;
             lo = q & 0x0F0F0F0Fu;
             hi = (q >> 4) & 0x0F0F0F0Fu;
-            dst[6] = (int)__builtin_amdgcn_perm(hi, lo, 0x05010400u);
-            dst[7] = (int)__builtin_amdgcn_perm(hi, lo, 0x07030602u);
+            dst[6] = center_i4_bytes((int)__builtin_amdgcn_perm(hi, lo, 0x05010400u));
+            dst[7] = center_i4_bytes((int)__builtin_amdgcn_perm(hi, lo, 0x07030602u));
         }
     }
     #else
@@ -681,24 +708,24 @@ static __device__ __forceinline__ void load_hfq4_tile(
         unsigned int q = words.x;
         unsigned int lo = q & 0x0F0F0F0Fu;
         unsigned int hi = (q >> 4) & 0x0F0F0F0Fu;
-        dst[0] = (int)__builtin_amdgcn_perm(hi, lo, 0x05010400u);
-        dst[1] = (int)__builtin_amdgcn_perm(hi, lo, 0x07030602u);
+        dst[0] = center_i4_bytes((int)__builtin_amdgcn_perm(hi, lo, 0x05010400u));
+        dst[1] = center_i4_bytes((int)__builtin_amdgcn_perm(hi, lo, 0x07030602u));
         q = words.y;
         lo = q & 0x0F0F0F0Fu;
         hi = (q >> 4) & 0x0F0F0F0Fu;
-        dst[2] = (int)__builtin_amdgcn_perm(hi, lo, 0x05010400u);
-        dst[3] = (int)__builtin_amdgcn_perm(hi, lo, 0x07030602u);
+        dst[2] = center_i4_bytes((int)__builtin_amdgcn_perm(hi, lo, 0x05010400u));
+        dst[3] = center_i4_bytes((int)__builtin_amdgcn_perm(hi, lo, 0x07030602u));
         words = packed[1];
         q = words.x;
         lo = q & 0x0F0F0F0Fu;
         hi = (q >> 4) & 0x0F0F0F0Fu;
-        dst[4] = (int)__builtin_amdgcn_perm(hi, lo, 0x05010400u);
-        dst[5] = (int)__builtin_amdgcn_perm(hi, lo, 0x07030602u);
+        dst[4] = center_i4_bytes((int)__builtin_amdgcn_perm(hi, lo, 0x05010400u));
+        dst[5] = center_i4_bytes((int)__builtin_amdgcn_perm(hi, lo, 0x07030602u));
         q = words.y;
         lo = q & 0x0F0F0F0Fu;
         hi = (q >> 4) & 0x0F0F0F0Fu;
-        dst[6] = (int)__builtin_amdgcn_perm(hi, lo, 0x05010400u);
-        dst[7] = (int)__builtin_amdgcn_perm(hi, lo, 0x07030602u);
+        dst[6] = center_i4_bytes((int)__builtin_amdgcn_perm(hi, lo, 0x05010400u));
+        dst[7] = center_i4_bytes((int)__builtin_amdgcn_perm(hi, lo, 0x07030602u));
     }
     #endif
     #elif MMQ_WEIGHT_DUAL_ROW_U32X2 || MMQ_WEIGHT_DUAL_ROW_SCALAR2
@@ -774,7 +801,7 @@ static __device__ __forceinline__ void load_hfq4_tile(
         const char* gp =
             A + ((long long)row * groups_per_row + kb) * HFQ4_GROUP_BYTES;
         const float sc = __builtin_bit_cast(float, *(const unsigned int*)gp);
-        const float zp = __builtin_bit_cast(float, *(const unsigned int*)(gp + 4));
+        const float zp = load_hfq4_zero(gp);
         const int ksc = threadIdx.x & 1;
         const half2 dm = make_half2((_Float16)sc, (_Float16)zp);
         #pragma unroll
@@ -823,7 +850,7 @@ static __device__ __forceinline__ void load_hfq4_tile(
             const char* gp = A + group * HFQ4_GROUP_BYTES;
             #endif
             const float sc = __builtin_bit_cast(float, *(const unsigned int*)gp);
-            const float zp = __builtin_bit_cast(float, *(const unsigned int*)(gp + 4));
+            const float zp = load_hfq4_zero(gp);
             const half2 dm = make_half2((_Float16)sc, (_Float16)zp);
             const unsigned int dm_bits = __builtin_bit_cast(unsigned int, dm);
             const uint4 repeated = make_uint4(dm_bits, dm_bits, dm_bits, dm_bits);
@@ -844,7 +871,7 @@ static __device__ __forceinline__ void load_hfq4_tile(
             const char* gp = A + group * HFQ4_GROUP_BYTES;
             #endif
             const float sc = __builtin_bit_cast(float, *(const unsigned int*)gp);
-            const float zp = __builtin_bit_cast(float, *(const unsigned int*)(gp + 4));
+            const float zp = load_hfq4_zero(gp);
             const int ksc = threadIdx.x & 1;
             const half2 dm = make_half2((_Float16)sc, (_Float16)zp);
             #pragma unroll
@@ -927,8 +954,9 @@ static __device__ __forceinline__ void commit_hfq4_quad_row(
         if (txi < 2) {
             const float sc =
                 __builtin_bit_cast(float, prefetched.metadata[row_half].x);
-            const float zp =
-                __builtin_bit_cast(float, prefetched.metadata[row_half].y);
+            const float zp = MMQ_SYMMETRIC_I4
+                ? 0.0f
+                : __builtin_bit_cast(float, prefetched.metadata[row_half].y);
             const half2 dm = make_half2((_Float16)sc, (_Float16)zp);
 #pragma unroll
             for (int l = 0; l < 4; ++l) {
@@ -993,7 +1021,7 @@ static __device__ __forceinline__ void load_hfq4_tile_window(
             const int row = FULL ? row0 + tid : min(row0 + tid, M - 1);
             const char* gp = A + ((long long)row * groups_per_row + kb) * HFQ4_GROUP_BYTES;
             const float sc = __builtin_bit_cast(float, *(const unsigned int*)gp);
-            const float zp = __builtin_bit_cast(float, *(const unsigned int*)(gp + 4));
+            const float zp = load_hfq4_zero(gp);
             x_dm[tid * MMQ_TILE_X_K] = make_half2((_Float16)sc, (_Float16)zp);
         }
     }
@@ -1150,7 +1178,7 @@ static __device__ __forceinline__ void load_hfq4_gate_up_dual_tile(
 #endif
         const char* gp = A + ((long long)storage_row * groups_per_row + kb) * HFQ4_GROUP_BYTES;
         const float sc = __builtin_bit_cast(float, *(const unsigned int*)gp);
-        const float zp = __builtin_bit_cast(float, *(const unsigned int*)(gp + 4));
+        const float zp = load_hfq4_zero(gp);
         const int ksc = threadIdx.x & 1;
         const half2 dm = make_half2((_Float16)sc, (_Float16)zp);
 #pragma unroll

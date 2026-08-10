@@ -54,6 +54,24 @@ fn build_hfq4g256(m: usize, k: usize, zero_metadata: bool) -> Vec<u8> {
     out
 }
 
+fn build_symmetric_i4_hfq4g256(m: usize, k: usize) -> Vec<u8> {
+    let groups = k / 256;
+    let mut out = vec![0u8; m * groups * 136];
+    for row in 0..m {
+        for group in 0..groups {
+            let off = (row * groups + group) * 136;
+            let scale = 0.01 + ((row * 17 + group * 13) % 97) as f32 * 0.0001;
+            let zero = -8.0 * scale;
+            out[off..off + 4].copy_from_slice(&scale.to_le_bytes());
+            out[off + 4..off + 8].copy_from_slice(&zero.to_le_bytes());
+            for byte in 0..128 {
+                out[off + 8 + byte] = ((row * 29 + group * 19 + byte * 23) & 0xff) as u8;
+            }
+        }
+    }
+    out
+}
+
 fn build_hfq4g256_planar(m: usize, k: usize, zero_metadata: bool) -> Vec<u8> {
     let groups = k / 256;
     let group_count = m * groups;
@@ -173,6 +191,7 @@ fn main() {
     let mut f32a_k64_compact_decode = false;
     let mut group128_k32_stationary = false;
     let mut skip_zero = false;
+    let mut symmetric_i4 = false;
     let mut zero_metadata = false;
     let mut stream_k128 = false;
     let mut stream_k128_phased_x256 = false;
@@ -234,6 +253,7 @@ fn main() {
             "--f32a-k64-compact-decode" => f32a_k64_compact_decode = true,
             "--group128-k32-stationary" => group128_k32_stationary = true,
             "--skip-zero" => skip_zero = true,
+            "--symmetric-i4" => symmetric_i4 = true,
             "--zero-metadata" => zero_metadata = true,
             "--stream-k128" => stream_k128 = true,
             "--stream-k128-phased-x256" => stream_k128_phased_x256 = true,
@@ -281,6 +301,7 @@ fn main() {
             f32a_k64_compact_decode,
             group128_k32_stationary,
             skip_zero,
+            symmetric_i4,
             stream_k128,
             stream_k128_phased_x256,
             stream_k128_x256y128,
@@ -294,9 +315,12 @@ fn main() {
 
     let mut gpu = Gpu::init().expect("GPU init");
     eprintln!("arch={} M={m} K={k} N={n} pairs={pairs}", gpu.arch);
-    let a = gpu
-        .upload_raw(&build_hfq4g256(m, k, zero_metadata), &[m, k])
-        .expect("upload A");
+    let a_host = if symmetric_i4 {
+        build_symmetric_i4_hfq4g256(m, k)
+    } else {
+        build_hfq4g256(m, k, zero_metadata)
+    };
+    let a = gpu.upload_raw(&a_host, &[m, k]).expect("upload A");
     let a_half_meta = group128_half_meta.then(|| {
         gpu.upload_raw(&build_hfq4g256_half_meta(m, k, zero_metadata), &[m, k])
             .expect("upload half-meta A")
@@ -354,6 +378,8 @@ fn main() {
             )
         } else if stream_k128 {
             gpu.gemm_hfq4g256_mmq_prequant_x128y64_stream_k128(&a, xq128, &y256, m, k, n, add)
+        } else if symmetric_i4 {
+            gpu.gemm_hfq4g256_mmq_prequant_x256y64_symmetric_i4(&a, xq128, &y256, m, k, n, add)
         } else if skip_zero {
             gpu.gemm_hfq4g256_mmq_prequant_x256y64_skip_zero(&a, xq128, &y256, m, k, n, add)
         } else if group128_k32_stationary {
@@ -488,19 +514,38 @@ fn main() {
     run128(&mut gpu).expect("group128 correctness");
     run_candidate(&mut gpu).expect("candidate correctness");
     gpu.hip.device_synchronize().expect("correctness sync");
-    let (max_abs, mean_abs) = if skip_correctness {
-        (f32::NAN, f64::NAN)
+    let (max_abs, mean_abs, relative_l2, cosine) = if skip_correctness {
+        (f32::NAN, f64::NAN, f64::NAN, f64::NAN)
     } else {
         let ref_host = gpu.download_f32(&y128).expect("download group128");
         let candidate_host = gpu.download_f32(&y256).expect("download group256");
         let mut max_abs = 0.0f32;
         let mut abs_sum = 0.0f64;
+        let mut diff_sq_sum = 0.0f64;
+        let mut ref_sq_sum = 0.0f64;
+        let mut candidate_sq_sum = 0.0f64;
+        let mut dot_sum = 0.0f64;
         for (a, b) in ref_host.iter().zip(candidate_host.iter()) {
             let d = (a - b).abs();
             max_abs = max_abs.max(d);
             abs_sum += d as f64;
+            let a = *a as f64;
+            let b = *b as f64;
+            let diff = a - b;
+            diff_sq_sum += diff * diff;
+            ref_sq_sum += a * a;
+            candidate_sq_sum += b * b;
+            dot_sum += a * b;
         }
-        (max_abs, abs_sum / ref_host.len() as f64)
+        let relative_l2 = (diff_sq_sum / ref_sq_sum.max(f64::MIN_POSITIVE)).sqrt();
+        let cosine = dot_sum
+            / (ref_sq_sum.sqrt() * candidate_sq_sum.sqrt()).max(f64::MIN_POSITIVE);
+        (
+            max_abs,
+            abs_sum / ref_host.len() as f64,
+            relative_l2,
+            cosine,
+        )
     };
 
     for _ in 0..3 {
@@ -558,6 +603,8 @@ fn main() {
             "stream-k128-phased-x256"
         } else if stream_k128 {
             "stream-k128"
+        } else if symmetric_i4 {
+            "symmetric-i4"
         } else if skip_zero {
             "skip-zero"
         } else if group128_k32_stationary {
@@ -632,4 +679,6 @@ fn main() {
     println!("group256_speedup={:.4}x", med128 / med256);
     println!("max_abs={max_abs:.8e}");
     println!("mean_abs={mean_abs:.8e}");
+    println!("relative_l2={relative_l2:.8e}");
+    println!("cosine={cosine:.10}");
 }
