@@ -1103,6 +1103,8 @@ pub const GEMM_HFQ4G256_RESIDUAL_MFMA_V3_GFX942_SRC: &str =
     include_str!("../../../kernels/src/gemm_hfq4g256_residual_mfma_v3.gfx942.hip");
 pub const GEMM_HFQ4G256_RESIDUAL_MFMA_V4_GFX942_SRC: &str =
     include_str!("../../../kernels/src/gemm_hfq4g256_residual_mfma_v4.gfx942.hip");
+pub const GEMM_MQ4V2_LANE_MAJOR_PACKED_LDS_GFX1100_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq4v2_lane_major_packed_lds.gfx1100.hip");
 pub const FUSED_SILU_MUL_MQ_ROTATE_SRC: &str =
     include_str!("../../../kernels/src/fused_silu_mul_mq_rotate.hip");
 pub const FUSED_SILU_MUL_MQ_ROTATE_Q8_GROUP128_SRC: &str =
