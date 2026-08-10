@@ -1,0 +1,19 @@
+RotatingMemWrapperMultiD: { size_a: {71303168}, size_b: {44564480}, rotating_count: 0}
+instance=0 supported=1 ms=4.53715 tflops=80.4629 name=DeviceGemm_Wmma_CShuffleV3<Default, RCR> BlkSize: 256, BlkTile: 128x128x32, WaveTile: 16x16, WaveMap: 4x2, VmemReadVec: 8x8, BlkGemmPipelineScheduler: Intrawave, BlkGemmPipelineVersion: v1, BlkGemmPipelinePrefetchStages: 1, KPack: 16
+RotatingMemWrapperMultiD: { size_a: {71303168}, size_b: {44564480}, rotating_count: 0}
+instance=1 supported=1 ms=4.20582 tflops=86.8016 name=DeviceGemm_Wmma_CShuffleV3<Default, RCR> BlkSize: 128, BlkTile: 128x128x32, WaveTile: 16x16, WaveMap: 4x4, VmemReadVec: 8x8, BlkGemmPipelineScheduler: Intrawave, BlkGemmPipelineVersion: v1, BlkGemmPipelinePrefetchStages: 1, KPack: 16
+RotatingMemWrapperMultiD: { size_a: {71303168}, size_b: {44564480}, rotating_count: 0}
+instance=2 supported=1 ms=6.07648 tflops=60.0796 name=DeviceGemm_Wmma_CShuffleV3<Default, RCR> BlkSize: 64, BlkTile: 32x64x64, WaveTile: 16x16, WaveMap: 2x2, VmemReadVec: 8x8, BlkGemmPipelineScheduler: Intrawave, BlkGemmPipelineVersion: v1, BlkGemmPipelinePrefetchStages: 1, KPack: 16
+RotatingMemWrapperMultiD: { size_a: {71303168}, size_b: {44564480}, rotating_count: 0}
+instance=3 supported=1 ms=5.27199 tflops=69.2476 name=DeviceGemm_Wmma_CShuffleV3<Default, RCR> BlkSize: 256, BlkTile: 128x128x32, WaveTile: 16x16, WaveMap: 4x2, VmemReadVec: 8x8, BlkGemmPipelineScheduler: Interwave, BlkGemmPipelineVersion: v1, BlkGemmPipelinePrefetchStages: 1, KPack: 16
+RotatingMemWrapperMultiD: { size_a: {71303168}, size_b: {44564480}, rotating_count: 0}
+instance=4 supported=1 ms=11.6866 tflops=31.2387 name=DeviceGemm_Wmma_CShuffleV3<Default, RCR> BlkSize: 256, BlkTile: 128x128x64, WaveTile: 16x16, WaveMap: 4x2, VmemReadVec: 8x8, BlkGemmPipelineScheduler: Interwave, BlkGemmPipelineVersion: v1, BlkGemmPipelinePrefetchStages: 1, KPack: 16
+RotatingMemWrapperMultiD: { size_a: {71303168}, size_b: {44564480}, rotating_count: 0}
+instance=5 supported=1 ms=6.55682 tflops=55.6782 name=DeviceGemm_Wmma_CShuffleV3<Default, RCR> BlkSize: 64, BlkTile: 32x64x64, WaveTile: 16x16, WaveMap: 2x2, VmemReadVec: 8x8, BlkGemmPipelineScheduler: Interwave, BlkGemmPipelineVersion: v1, BlkGemmPipelinePrefetchStages: 1, KPack: 16
+RotatingMemWrapperMultiD: { size_a: {71303168}, size_b: {44564480}, rotating_count: 0}
+instance=6 supported=1 ms=4.96679 tflops=73.5027 name=DeviceGemm_Wmma_CShuffleV3<Default, RCR> BlkSize: 256, BlkTile: 128x128x32, WaveTile: 16x16, WaveMap: 4x2, VmemReadVec: 8x8, BlkGemmPipelineScheduler: Intrawave, BlkGemmPipelineVersion: v3, BlkGemmPipelinePrefetchStages: 2, KPack: 16
+RotatingMemWrapperMultiD: { size_a: {71303168}, size_b: {44564480}, rotating_count: 0}
+instance=7 supported=1 ms=10.7095 tflops=34.0886 name=DeviceGemm_Wmma_CShuffleV3<Default, RCR> BlkSize: 256, BlkTile: 128x128x64, WaveTile: 16x16, WaveMap: 4x2, VmemReadVec: 8x8, BlkGemmPipelineScheduler: Intrawave, BlkGemmPipelineVersion: v3, BlkGemmPipelinePrefetchStages: 2, KPack: 16
+RotatingMemWrapperMultiD: { size_a: {71303168}, size_b: {44564480}, rotating_count: 0}
+instance=8 supported=1 ms=6.3975 tflops=57.0649 name=DeviceGemm_Wmma_CShuffleV3<Default, RCR> BlkSize: 64, BlkTile: 32x64x64, WaveTile: 16x16, WaveMap: 2x2, VmemReadVec: 8x8, BlkGemmPipelineScheduler: Intrawave, BlkGemmPipelineVersion: v3, BlkGemmPipelinePrefetchStages: 2, KPack: 16
+best_ms=4.20582 best_name=DeviceGemm_Wmma_CShuffleV3<Default, RCR> BlkSize: 128, BlkTile: 128x128x32, WaveTile: 16x16, WaveMap: 4x4, VmemReadVec: 8x8, BlkGemmPipelineScheduler: Intrawave, BlkGemmPipelineVersion: v1, BlkGemmPipelinePrefetchStages: 1, KPack: 16

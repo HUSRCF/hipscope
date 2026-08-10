@@ -1,0 +1,3 @@
+bench_ck_bf16_i4_all
+bench_ck_f16_i4_all
+!*.log
