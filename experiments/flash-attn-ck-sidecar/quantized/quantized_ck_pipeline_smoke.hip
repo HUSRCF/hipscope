@@ -7,6 +7,10 @@
 
 #include "quantized_ck_buffer_view.hpp"
 #include "hipfire_flash_attn_ck_quantized.h"
+#if defined(HIPFIRE_ENABLE_STAGED_QUANTIZED_CK)
+#include "quantized_kv_predecode.hpp"
+#include "../hipfire_flash_attn_ck.h"
+#endif
 
 #include "fmha_fwd.hpp"
 
@@ -510,6 +514,30 @@ size_t quantized_workspace_bytes(int32_t seqlen_q, int32_t nhead_q, int32_t head
     return 2 * values * sizeof(__half);
 }
 
+#if defined(HIPFIRE_ENABLE_STAGED_QUANTIZED_CK)
+size_t staged_workspace_bytes(int32_t seqlen_q,
+                              int32_t seqlen_k,
+                              int32_t nhead_q,
+                              int32_t nhead_k,
+                              int32_t head_dim)
+{
+    if(seqlen_q <= 0 || seqlen_k <= 0 || nhead_q <= 0 || nhead_k <= 0 ||
+       head_dim <= 0)
+    {
+        return 0;
+    }
+    const size_t q_values = static_cast<size_t>(seqlen_q) * nhead_q * head_dim;
+    const size_t kv_values = static_cast<size_t>(seqlen_k) * nhead_k * head_dim;
+    if(q_values > SIZE_MAX / (2 * sizeof(__half)) ||
+       kv_values > SIZE_MAX / (2 * sizeof(__half)) ||
+       2 * q_values > SIZE_MAX - 2 * kv_values)
+    {
+        return 0;
+    }
+    return (2 * q_values + 2 * kv_values) * sizeof(__half);
+}
+#endif
+
 void set_quantized_error(char* error, size_t capacity, const char* message)
 {
     if(error == nullptr || capacity == 0)
@@ -679,6 +707,120 @@ int launch_quantized_prefill_impl(
     return 0;
 }
 
+#if defined(HIPFIRE_ENABLE_STAGED_QUANTIZED_CK)
+int validate_staged_prefill(const hipfire_flash_attn_ck_quantized_prefill_params* p,
+                            char* error,
+                            size_t error_capacity)
+{
+    if(const int status = validate_quantized_prefill(p, error, error_capacity); status != 0)
+    {
+        return status;
+    }
+    const size_t required = staged_workspace_bytes(
+        p->seqlen_q, p->seqlen_k, p->nhead_q, p->nhead_k, p->head_dim);
+    if(required == 0 || p->workspace_bytes < required)
+    {
+        set_quantized_error(error, error_capacity, "staged prefill workspace is too small");
+        return 1;
+    }
+    set_quantized_error(error, error_capacity, "");
+    return 0;
+}
+
+int launch_staged_prefill_impl(
+    const hipfire_flash_attn_ck_quantized_prefill_params* p,
+    char* error,
+    size_t error_capacity)
+{
+    const size_t q_values =
+        static_cast<size_t>(p->seqlen_q) * p->nhead_q * p->head_dim;
+    const size_t kv_values =
+        static_cast<size_t>(p->seqlen_k) * p->nhead_k * p->head_dim;
+    auto* q_rotated = reinterpret_cast<__half*>(p->workspace);
+    auto* out_half = q_rotated + q_values;
+    auto* dense_k = out_half + q_values;
+    auto* dense_v = dense_k + kv_values;
+    auto stream = reinterpret_cast<hipStream_t>(p->stream);
+
+    hipLaunchKernelGGL(rotate_q_givens_f32_to_f16,
+                       dim3(p->nhead_q * p->seqlen_q),
+                       dim3(32),
+                       0,
+                       stream,
+                       p->q,
+                       q_rotated,
+                       p->cos_theta,
+                       p->sin_theta,
+                       p->seqlen_q,
+                       p->nhead_q);
+    hipLaunchKernelGGL(hipfire::ck_attention::predecode_asym3_k_q8_v_f16,
+                       dim3(p->seqlen_k, p->nhead_k),
+                       dim3(32),
+                       0,
+                       stream,
+                       p->packed_k,
+                       p->packed_v,
+                       dense_k,
+                       dense_v,
+                       p->seqlen_k,
+                       p->k_row_stride_bytes,
+                       p->v_row_stride_bytes);
+
+    hipfire_flash_attn_ck_fwd_params dense{};
+    dense.abi_version = HIPFIRE_FLASH_ATTN_CK_ABI_VERSION;
+    dense.struct_size = sizeof(dense);
+    dense.q = q_rotated;
+    dense.k = dense_k;
+    dense.v = dense_v;
+    dense.out = out_half;
+    dense.stream = p->stream;
+    dense.dtype = HIPFIRE_FLASH_ATTN_CK_F16;
+    dense.batch = 1;
+    dense.seqlen_q = p->seqlen_q;
+    dense.seqlen_k = p->seqlen_k;
+    dense.nhead_q = p->nhead_q;
+    dense.nhead_k = p->nhead_k;
+    dense.head_dim = p->head_dim;
+    dense.causal = p->causal;
+    dense.softmax_scale = p->softmax_scale;
+    dense.stride_q = static_cast<int64_t>(p->nhead_q) * p->head_dim;
+    dense.stride_k = static_cast<int64_t>(p->nhead_k) * p->head_dim;
+    dense.stride_v = dense.stride_k;
+    dense.stride_out = dense.stride_q;
+    dense.nhead_stride_q = p->head_dim;
+    dense.nhead_stride_k = p->head_dim;
+    dense.nhead_stride_v = p->head_dim;
+    dense.nhead_stride_out = p->head_dim;
+    dense.batch_stride_q = static_cast<int64_t>(q_values);
+    dense.batch_stride_k = static_cast<int64_t>(kv_values);
+    dense.batch_stride_v = static_cast<int64_t>(kv_values);
+    dense.batch_stride_out = static_cast<int64_t>(q_values);
+    const int dense_status = hipfire_flash_attn_ck_fwd(&dense, error, error_capacity);
+    if(dense_status != 0)
+    {
+        return dense_status;
+    }
+
+    const size_t pair_count = q_values / 2;
+    hipLaunchKernelGGL(convert_f16_to_f32,
+                       dim3((pair_count + 255) / 256),
+                       dim3(256),
+                       0,
+                       stream,
+                       out_half,
+                       p->out,
+                       pair_count);
+    const hipError_t status = hipPeekAtLastError();
+    if(status != hipSuccess)
+    {
+        set_quantized_error(error, error_capacity, hipGetErrorString(status));
+        return 2;
+    }
+    set_quantized_error(error, error_capacity, "");
+    return 0;
+}
+#endif
+
 } // namespace
 
 extern "C" uint32_t hipfire_flash_attn_ck_quantized_abi_version(void)
@@ -693,6 +835,38 @@ extern "C" size_t hipfire_flash_attn_ck_quantized_prefill_workspace_bytes(
 {
     return quantized_workspace_bytes(seqlen_q, nhead_q, head_dim);
 }
+
+#if defined(HIPFIRE_ENABLE_STAGED_QUANTIZED_CK)
+extern "C" size_t hipfire_flash_attn_ck_quantized_staged_workspace_bytes(
+    int32_t seqlen_q,
+    int32_t seqlen_k,
+    int32_t nhead_q,
+    int32_t nhead_k,
+    int32_t head_dim)
+{
+    return staged_workspace_bytes(seqlen_q, seqlen_k, nhead_q, nhead_k, head_dim);
+}
+
+extern "C" int hipfire_flash_attn_ck_quantized_staged_supported(
+    const hipfire_flash_attn_ck_quantized_prefill_params* params,
+    char* error,
+    size_t error_capacity)
+{
+    return validate_staged_prefill(params, error, error_capacity);
+}
+
+extern "C" int hipfire_flash_attn_ck_quantized_staged_prefill(
+    const hipfire_flash_attn_ck_quantized_prefill_params* params,
+    char* error,
+    size_t error_capacity)
+{
+    if(const int status = validate_staged_prefill(params, error, error_capacity); status != 0)
+    {
+        return status;
+    }
+    return launch_staged_prefill_impl(params, error, error_capacity);
+}
+#endif
 
 extern "C" int hipfire_flash_attn_ck_quantized_prefill_supported(
     const hipfire_flash_attn_ck_quantized_prefill_params* params,

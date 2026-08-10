@@ -9,12 +9,15 @@ CK_ROOT="${SIDECAR_ROOT}/build/ck-source"
 FMHA_DIR="${CK_ROOT}/example/ck_tile/01_fmha"
 BUILD_DIR="${ROOT}/build"
 OUT="${OUT:-${BUILD_DIR}/libhipfire_flash_attn_ck_quantized.so}"
+DENSE_SIDECAR="${DENSE_SIDECAR:-${SIDECAR_ROOT}/build/libhipfire_flash_attn_ck.so}"
+STAGED="${STAGED:-0}"
 ASYM3_CODEBOOK="${ASYM3_CODEBOOK:-0}"
 ASYM3_LDS_CODEBOOK="${ASYM3_LDS_CODEBOOK:-0}"
 HIP_ROOT="$("${ROCM_PATH}/bin/hipconfig" --path)"
 HIP_LIB_DIR="${HIP_ROOT}/lib"
 
 extra_defines=()
+extra_links=()
 if [[ "${ASYM3_CODEBOOK}" == "1" && "${ASYM3_LDS_CODEBOOK}" == "1" ]]; then
     echo "ASYM3_CODEBOOK and ASYM3_LDS_CODEBOOK are mutually exclusive" >&2
     exit 2
@@ -25,12 +28,30 @@ fi
 if [[ "${ASYM3_LDS_CODEBOOK}" == "1" ]]; then
     extra_defines+=("-DHIPFIRE_CK_ASYM3_LDS_CODEBOOK=1")
 fi
+case "${STAGED}" in
+    0) ;;
+    1)
+        if [[ ! -f "${DENSE_SIDECAR}" ]]; then
+            echo "missing dense CK sidecar ${DENSE_SIDECAR}; run ../build_sidecar.sh first" >&2
+            exit 2
+        fi
+        extra_defines+=("-DHIPFIRE_ENABLE_STAGED_QUANTIZED_CK=1")
+        extra_links+=(
+            "-L$(dirname "${DENSE_SIDECAR}")"
+            "-lhipfire_flash_attn_ck"
+            "-Wl,-rpath,$(dirname "${DENSE_SIDECAR}")"
+        )
+        ;;
+    *)
+        echo "STAGED must be 0 or 1" >&2
+        exit 2
+        ;;
+esac
 
 if [[ ! -f "${FMHA_DIR}/fmha_fwd.hpp" ]]; then
     echo "missing prepared CK source under ${CK_ROOT}; run ../build_sidecar.sh first" >&2
     exit 2
 fi
-
 mkdir -p "$(dirname "${OUT}")"
 "${ROCM_PATH}/bin/hipcc" \
     -std=c++20 \
@@ -60,10 +81,12 @@ mkdir -p "$(dirname "${OUT}")"
     -mllvm -amdgpu-early-inline-all=true \
     -mllvm -amdgpu-function-calls=false \
     -I"${ROOT}" \
+    -I"${SIDECAR_ROOT}" \
     -I"${FMHA_DIR}" \
     -I"${CK_ROOT}/include" \
     -I"${CK_ROOT}/library/include" \
     "${ROOT}/quantized_ck_pipeline_smoke.hip" \
+    "${extra_links[@]}" \
     -Wl,-rpath,"${HIP_LIB_DIR}" \
     -o "${OUT}"
 
@@ -74,6 +97,7 @@ SMOKE="$(dirname "${OUT}")/smoke_quantized_abi"
 "${CXX:-c++}" \
     -std=c++20 \
     -O2 \
+    "${extra_defines[@]}" \
     -I"${ROOT}" \
     "${ROOT}/smoke_quantized_abi.cpp" \
     "${OUT}" \
