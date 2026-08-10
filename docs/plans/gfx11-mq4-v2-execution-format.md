@@ -65,6 +65,8 @@ WMMA kernels with a different numerical contract.
 | Symmetric signed-int4, no affine zero correction | 1.027x gate/up, 1.039x down | rejected |
 | Mature Q8_0 WMMA execution copy, 2x weight bytes | 0.279x gate/up, 0.310x down | rejected |
 | Current HFP4G32 kernel implementation | 0.361x gate/up, 0.330x down | rejected implementation, not format |
+| Current HFQ3-G256 Wave32 WMMA implementation | 0.397x gate/up, 0.293x down | rejected implementation, not all 3-bit formats |
+| Current MQ3-Lloyd-G256 Wave32 WMMA core | 0.348x gate/up, 0.300x down; pre-rotation excluded | rejected implementation, not all codebook formats |
 | rocBLAS rowwise-W8A8 full hot path | 1.06x gate/up, 1.01x down, about 1.88x bytes | rejected |
 
 The lossless packed-layout experiments show that eliminating or relocating
@@ -144,6 +146,14 @@ The current HFP4G32 implementation and a complete rocBLAS rowwise-W8A8 hot
 path have both been screened and rejected. These results do not disprove all
 HFP4 numerical formats or future vendor primitives, but neither existing
 implementation is a viable production fallback for this workload.
+
+The existing HFQ3-G256 and MQ3-Lloyd-G256 Wave32 WMMA cores were
+also screened at the same full FFN shapes. Their smaller resident weight
+footprints did not offset their current cross-byte/codebook decode and operand
+feed costs; both were substantially slower than retained MQ4. They are closed
+as implementation reuse candidates, not as format-level impossibility results.
+The Lloyd timing excludes its required activation pre-rotation and is therefore
+an optimistic core upper bound.
 
 ## Required coverage
 

@@ -136,6 +136,42 @@ an immediate numerical blocker (`relative_l2=0.00644/0.00697`,
 result. Steady-state throughput and capacity already reject the candidate, so
 do not add rocBLAS/hipBLASLt W8 serving integration for this path.
 
+The existing gfx11 3-bit Wave32 WMMA implementations were then screened with
+`bench_hfq3g256_mq4v2`. The harness uses the retained group128 quad-row MQ4
+primitive as its reference and tests both HFQ3-G256 affine weights and
+MQ3-Lloyd-G256 codebook weights. It runs the production FFN shapes in one
+process with alternating order after kernel warmup and a five-second DPM
+warmup. MQ3-Lloyd inputs are FWHT-rotated before timing; excluding that required
+rotation makes its reported time an optimistic GEMM-core upper bound. The
+independently generated synthetic formats are not compared for quality; this
+is an execution-format admission screen only.
+
+```text
+GPU: AMD Radeon Pro W7900 / gfx1100, HIP 7.14
+N: 2048
+pairs: 7
+
+shape                         retained MQ4    HFQ3-G256    speedup
+gate/up M=2x17408 K=5120       10.1220 ms      25.5000 ms   0.3969x
+down add M=5120 K=17408         5.2344 ms      17.8467 ms   0.2933x
+
+shape                         retained MQ4    MQ3-Lloyd    speedup
+gate/up M=2x17408 K=5120       10.0392 ms      28.8407 ms   0.3481x
+down add M=5120 K=17408         5.0735 ms      16.9011 ms   0.3002x
+```
+
+For gate, up, and down combined, resident weights are `142,049,280` bytes for
+MQ4, `108,625,920` bytes for HFQ3 (-23.5%), and `116,981,760` bytes for
+MQ3-Lloyd (-17.6%). Code-object inspection found Wave32 throughout. HFQ3 gate
+and residual use 102 VGPRs, no private segment, and no LDS; MQ3-Lloyd uses 105
+VGPRs, no private segment, and 256 bytes of LDS. The respective gate/residual
+objects contain 1433/1013 and 1466/1050 static instructions, with eight static
+WMMA instructions each. The candidates therefore fail despite avoiding the
+retained kernel's spill and large-LDS footprint. Current 3-bit decode/operand
+feeding is not a viable MQ4-v2 shortcut, so neither path proceeds to checkpoint
+requantization or serving integration. This rejects these implementations, not
+all possible 3-bit or codebook execution formats.
+
 The first accepted probe must cover both production FFN shapes:
 
 ```text
