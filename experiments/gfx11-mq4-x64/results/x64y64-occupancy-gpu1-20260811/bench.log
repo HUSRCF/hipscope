@@ -1,0 +1,18 @@
+GPU dev 0: gfx1100 (48.3 GB VRAM, HIP 7.14)
+  pre-compiled kernels: .hipfire_kernels/gfx1100
+arch=gfx1100 n=2048 pairs=9
+warming caches... took 5.00s
+gate_reference_ms=4.8368
+gate_candidate_ms=5.9503
+gate_speedup=0.8129x
+gate_max_abs=0.00000000e0
+gate_reference_raw_ms=[4.1736819999999994, 4.393645, 4.503436000000001, 4.790106, 4.836774999999999, 4.977304999999999, 4.95402, 4.986483, 4.947208]
+gate_candidate_raw_ms=[5.5898520000000005, 5.495369, 5.575754, 5.733366999999999, 5.950263, 6.033042, 6.04767, 6.08452, 6.006511]
+warming caches... took 5.00s
+down_reference_ms=4.8166
+down_candidate_ms=5.8293
+down_speedup=0.8263x
+down_max_abs=0.00000000e0
+down_reference_raw_ms=[4.2165550000000005, 4.588919000000001, 4.565455, 4.796819, 4.8165960000000005, 4.995289, 4.987725999999999, 5.015729, 4.967677]
+down_candidate_raw_ms=[5.727335, 5.313792, 5.588669, 5.72441, 5.829261, 5.918973, 5.946314999999999, 5.976484, 5.897061]
+x64y64_admission=REJECT

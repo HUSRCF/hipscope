@@ -20,6 +20,7 @@ mod kernels;
 pub mod kv_slots;
 pub mod moe;
 pub mod mq4v2;
+pub mod mq4x64;
 pub mod norm;
 pub mod pool;
 pub mod profile;
