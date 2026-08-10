@@ -35,6 +35,29 @@ The runtime timeline attributes about 71.7% of prefill wall time to the
 packed-MQ4 family. If no other component changes, that whole family must reach
 about 1.56x local speedup to reach 1500 tok/s.
 
+That family label does not mean weight bytes dominate the kernel. For the
+retained X256/Y64 geometry at N=2048, the explicit movement model is:
+
+```text
+gate/set M17408 K5120:
+  Q8 activation staging  ~= (M/64) * N * K * (144/128) = 3.21 GB
+  MQ4 weight staging     ~= (N/256) * M * K * (136/256) = 0.379 GB
+  FP32 output write      ~= N * M * 4 = 0.143 GB
+  total                  ~= 3.73 GB / 4.275 ms = 872 GB/s effective
+
+down/add M5120 K17408:
+  Q8 activation staging  ~= 3.21 GB
+  MQ4 weight staging     ~= 0.379 GB
+  FP32 output access     ~= 0.042 GB per read or write
+```
+
+The effective rate includes cache/LDS behavior and is not a claim that every
+byte reaches HBM. It does establish that repeated activation-tile movement,
+not only packed-weight decode, is a first-order part of the primitive. A new
+weight representation alone cannot be assumed to deliver the 1.56x family
+speedup; it must either materially change the whole feed path or be paired
+with a dataflow that reduces activation replication.
+
 A new experiment is admitted only if its plausible affected wall share is at
 least 10%, or it can be implemented and rejected within one short probe. A
 new execution backend is promoted beyond standalone only after the large
@@ -68,6 +91,7 @@ WMMA kernels with a different numerical contract.
 | Current HFQ3-G256 Wave32 WMMA implementation | 0.397x gate/up, 0.293x down | rejected implementation, not all 3-bit formats |
 | Current MQ3-Lloyd-G256 Wave32 WMMA core | 0.348x gate/up, 0.300x down; pre-rotation excluded | rejected implementation, not all codebook formats |
 | rocBLAS rowwise-W8A8 full hot path | 1.06x gate/up, 1.01x down, about 1.88x bytes | rejected |
+| Lane-major exact MQ4, packed LDS + register decode | 0.448x gate, 0.408x down; zero spills | closed |
 
 The lossless packed-layout experiments show that eliminating or relocating
 nibble expansion alone did not help the measured gate/up shape. The exact IU4
@@ -75,6 +99,16 @@ experiment shows that two native IU4 WMMA passes cost more than the expansion
 they remove on that shape. A globally expanded INT8 execution copy is also not
 an acceptable default: it nearly doubles resident weight bytes and reduces the
 context capacity that makes the 27B single-GPU configuration useful.
+
+The lane-major execution copy additionally removes the row-major access
+pattern as a confounder. It keeps the exact 136-byte affine MQ4 contract but
+reorders each 16-row, 256-K tile as
+`payload[subK32][packed_word][row]`, allowing contiguous global staging and
+conflict-light LDS fragment reads. Despite 217 VGPRs, zero spills, and zero
+private bytes, it reached only 0.448x on gate and 0.408x on down. Packed-nibble
+register decode inside the WMMA loop, rather than the old physical row order,
+therefore remains the dominant failure in this architecture. The full record
+is in `experiments/gfx11-mq4-v2/results/lane-major-packed-lds-gpu1-20260811/`.
 
 The measured mature Q8_0 backend made this tradeoff worse rather than better:
 it doubled resident weight bytes and was 3.2-3.6x slower than retained MQ4 on
