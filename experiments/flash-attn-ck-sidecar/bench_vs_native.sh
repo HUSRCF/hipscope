@@ -53,6 +53,7 @@ HIP_VISIBLE_DEVICES="${GPU_ID}" \
         --iterations "${ITERATIONS}" \
         --head-dim "${HEAD_DIM}" \
         --causal "${CAUSAL}" \
+        "$@" \
     | tee "${OUT}"
 
 echo "wrote ${OUT}" >&2

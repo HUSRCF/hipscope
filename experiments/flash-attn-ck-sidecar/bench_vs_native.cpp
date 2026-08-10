@@ -623,6 +623,10 @@ int main(int argc, char** argv)
     int iterations = 5;
     int head_dim = 64;
     bool causal = false;
+    int custom_seqlen_q = 0;
+    int custom_seqlen_k = 0;
+    int custom_nhead_q = 0;
+    int custom_nhead_k = 0;
     for(int index = 1; index < argc; ++index)
     {
         const std::string option = argv[index];
@@ -667,6 +671,22 @@ int main(int argc, char** argv)
             }
             causal = value != 0;
         }
+        else if(option == "--seqlen-q")
+        {
+            custom_seqlen_q = parse_positive(argv[++index], "--seqlen-q");
+        }
+        else if(option == "--seqlen-k")
+        {
+            custom_seqlen_k = parse_positive(argv[++index], "--seqlen-k");
+        }
+        else if(option == "--nhead-q")
+        {
+            custom_nhead_q = parse_positive(argv[++index], "--nhead-q");
+        }
+        else if(option == "--nhead-k")
+        {
+            custom_nhead_k = parse_positive(argv[++index], "--nhead-k");
+        }
         else
         {
             std::fprintf(stderr, "unknown option: %s\n", option.c_str());
@@ -676,6 +696,22 @@ int main(int argc, char** argv)
     if(causal && head_dim == 64)
     {
         std::fprintf(stderr, "the native causal comparison currently requires --head-dim 128 or 256\n");
+        return 2;
+    }
+    const bool has_custom_case = custom_seqlen_q != 0 || custom_seqlen_k != 0 ||
+                                 custom_nhead_q != 0 || custom_nhead_k != 0;
+    if(has_custom_case &&
+       (custom_seqlen_q == 0 || custom_seqlen_k == 0 || custom_nhead_q == 0 ||
+        custom_nhead_k == 0))
+    {
+        std::fprintf(stderr,
+                     "--seqlen-q, --seqlen-k, --nhead-q, and --nhead-k must be "
+                     "specified together\n");
+        return 2;
+    }
+    if(has_custom_case && custom_nhead_q % custom_nhead_k != 0)
+    {
+        std::fprintf(stderr, "--nhead-q must be divisible by --nhead-k\n");
         return 2;
     }
 
@@ -707,7 +743,14 @@ int main(int argc, char** argv)
         {4096, 4096, 8, 8},
         {2048, 2048, 8, 2},
     };
-    const auto& cases = causal ? causal_cases : noncausal_cases;
+    const std::vector<Case> custom_cases = has_custom_case
+                                               ? std::vector<Case>{{custom_seqlen_q,
+                                                                    custom_seqlen_k,
+                                                                    custom_nhead_q,
+                                                                    custom_nhead_k}}
+                                               : std::vector<Case>{};
+    const auto& cases = has_custom_case ? custom_cases
+                                        : (causal ? causal_cases : noncausal_cases);
     std::puts(
         "seqlen_q,seqlen_k,nhead_q,nhead_k,head_dim,causal,native_f32_ms,ck_f16_ms,"
         "ck_qo_bridge_ms,ck_full_f32_bridge_ms,"

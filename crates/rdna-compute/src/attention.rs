@@ -6067,8 +6067,8 @@ impl Gpu {
             if let Some(sidecar) = self.flash_attn_ck_quantized.as_ref() {
                 use crate::flash_attn_ck::FlashAttnCkQuantizedPrefillParams;
 
-                let required = sidecar.workspace_bytes(batch_size as i32, 24, 256);
-                if required > 0 && partials.buf.size() >= required {
+                let packed_required = sidecar.workspace_bytes(batch_size as i32, 24, 256);
+                if packed_required > 0 && partials.buf.size() >= packed_required {
                     let mut params = FlashAttnCkQuantizedPrefillParams::new();
                     params.q = q.buf.as_ptr().cast::<f32>();
                     params.packed_k = k_cache.buf.as_ptr().cast::<u8>();
@@ -6091,6 +6091,40 @@ impl Gpu {
                     params.causal = 1;
                     params.k_row_stride_bytes = (n_kv_heads * 100) as i32;
                     params.v_row_stride_bytes = (n_kv_heads * 272) as i32;
+
+                    let staged_required = sidecar.staged_workspace_bytes(
+                        batch_size as i32,
+                        max_ctx_len as i32,
+                        n_heads as i32,
+                        n_kv_heads as i32,
+                        head_dim as i32,
+                    );
+                    if staged_required
+                        .is_some_and(|required| required > 0 && partials.buf.size() >= required)
+                        && sidecar.is_staged_supported(&params).is_ok()
+                    {
+                        unsafe { sidecar.staged_prefill(&params) }.map_err(|error| {
+                            hip_bridge::HipError::new(
+                                0,
+                                &format!(
+                                    "staged quantized FlashAttention CK launch failed: {error}"
+                                ),
+                            )
+                        })?;
+                        static REPORT_STAGED_ACTIVE: std::sync::Once = std::sync::Once::new();
+                        REPORT_STAGED_ACTIVE.call_once(|| {
+                            eprintln!(
+                                "staged quantized FlashAttention CK prefill active: Q={} K={} Hq={} Hkv={} D={} scratch={} bytes",
+                                batch_size,
+                                max_ctx_len,
+                                n_heads,
+                                n_kv_heads,
+                                head_dim,
+                                staged_required.unwrap_or_default()
+                            );
+                        });
+                        return Ok(());
+                    }
 
                     if sidecar.is_supported(&params).is_ok() {
                         unsafe { sidecar.prefill(&params) }.map_err(|error| {

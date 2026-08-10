@@ -53,6 +53,25 @@ size_t hipfire_flash_attn_ck_quantized_prefill_workspace_bytes(
     int32_t nhead_q,
     int32_t head_dim);
 
+// Optional staged route: decode physical KV heads once into FP16 scratch, then
+// invoke the mature dense CK pipeline. These symbols are additive to ABI v1.
+size_t hipfire_flash_attn_ck_quantized_staged_workspace_bytes(
+    int32_t seqlen_q,
+    int32_t seqlen_k,
+    int32_t nhead_q,
+    int32_t nhead_k,
+    int32_t head_dim);
+
+int hipfire_flash_attn_ck_quantized_staged_supported(
+    const struct hipfire_flash_attn_ck_quantized_prefill_params* params,
+    char* error,
+    size_t error_capacity);
+
+int hipfire_flash_attn_ck_quantized_staged_prefill(
+    const struct hipfire_flash_attn_ck_quantized_prefill_params* params,
+    char* error,
+    size_t error_capacity);
+
 int hipfire_flash_attn_ck_quantized_prefill_supported(
     const struct hipfire_flash_attn_ck_quantized_prefill_params* params,
     char* error,
