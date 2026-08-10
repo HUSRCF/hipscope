@@ -202,6 +202,18 @@ only 1.016x-1.034x on gate/up and 1.066x-1.078x on down across two runs. See
 `coarse-scale-int32-accum/` for source, raw timing, resource metadata, and the
 synthetic exactness boundary.
 
+The repository's mature MQ2-Lloyd FP16-WMMA grouped kernel was also screened
+as an optimistic sub-4-bit execution upper bound by mapping one expert and one
+routed slot per token onto the production dense FFN shapes. Same-process,
+alternating-order paired medians put the available MQ2 path at only
+0.1786-0.1788x of retained MQ4 for gate/up and 0.1833-0.1834x for down across
+two independent GPU1 processes. This is an implementation-level performance
+rejection in addition to MQ2-Lloyd's existing quality rejection (historical 9B
+perplexity 2163 / text collapse); it is not a claim that every two-bit format
+must be slow. Reproduce with `run_mq2_dense_ffn_upper_bound.sh`; the default
+MoE benchmark matrix is unchanged unless `HIPFIRE_MQ2_DENSE_FFN_PROBE=1` is
+set.
+
 Passing the local speed threshold is necessary but not sufficient for routing.
 Exact candidates must also match the retained output tolerance. Approximate
 candidates must pass long-prompt generation and a task-level quality suite.

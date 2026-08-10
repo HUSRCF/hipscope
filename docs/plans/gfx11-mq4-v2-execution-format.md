@@ -90,6 +90,7 @@ WMMA kernels with a different numerical contract.
 | Current HFP4G32 kernel implementation | 0.361x gate/up, 0.330x down | rejected implementation, not format |
 | Current HFQ3-G256 Wave32 WMMA implementation | 0.397x gate/up, 0.293x down | rejected implementation, not all 3-bit formats |
 | Current MQ3-Lloyd-G256 Wave32 WMMA core | 0.348x gate/up, 0.300x down; pre-rotation excluded | rejected implementation, not all codebook formats |
+| Current MQ2-Lloyd FP16-WMMA four-wave core | 0.1786-0.1834x in same-process paired dense FFN runs; quality already rejected | rejected implementation and current MQ2 quality contract |
 | rocBLAS rowwise-W8A8 full hot path | 1.06x gate/up, 1.01x down, about 1.88x bytes | rejected |
 | Lane-major exact MQ4, packed LDS + register decode | 0.448x gate, 0.408x down; zero spills | closed |
 
@@ -205,6 +206,16 @@ feed costs; both were substantially slower than retained MQ4. They are closed
 as implementation reuse candidates, not as format-level impossibility results.
 The Lloyd timing excludes its required activation pre-rotation and is therefore
 an optimistic core upper bound.
+
+The mature MQ2-Lloyd grouped FP16-WMMA kernel was mapped to a one-expert,
+top-k-1 dense projection as a deliberately optimistic lower-bit upper bound.
+Same-process paired medians across two GPU1 processes were 26.39-26.75 ms for
+gate/up and 26.29-26.72 ms for down. The retained MQ4 set-mode control measured
+4.71-4.78 ms and 4.82-4.90 ms respectively, placing this MQ2 implementation at
+only 0.1786-0.1834x. The result rejects the current implementation without
+assigning the slowdown to one unisolated mechanism. MQ2-Lloyd had already
+failed the model-quality gate, so no dense serving adapter or checkpoint
+conversion is justified by this result.
 
 ## Required coverage
 

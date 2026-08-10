@@ -1,0 +1,5 @@
+gpu_id=1
+runs=2
+dense_ffn_probe=1
+head_commit=b44364b60c22b71b5f46b4a7651424b16ba8e0f4
+benchmark_sha256=16c509bf050c11afed0428e02a593799eb62fc3a96c4ca65b537a6a0f720b765
