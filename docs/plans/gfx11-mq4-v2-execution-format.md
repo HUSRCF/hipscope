@@ -67,6 +67,41 @@ new execution backend is promoted beyond standalone only after the large
 gate/up and down shapes each reach at least 1.30x. A 1-3% local result does not
 justify production integration.
 
+## Measured same-math ceiling
+
+A mature CK A16 x I4 screen and a dense-FP16 rocBLAS roofline now bound the
+remaining same-math execution-format space on this host. The best CK FP16 x I4
+instances reached only 1.061x on gate/up and 1.015x on down. Dense FP16, which
+optimistically removes packed decode, affine scale/zero handling, and Q8 feed
+conversion, reached 1.138x and 1.092x respectively. Applying the better 1.138x
+ceiling to the entire measured packed-MQ4 wall share yields only about 1.095x
+overall, or roughly 1.30k tok/s from the 1.189k controlled baseline.
+
+Consequently, MQ4-v2 is no longer admitted as a layout-only rewrite. A future
+same-math backend must first demonstrate a mechanism that materially exceeds
+the measured dense rocBLAS/CK roofline. Otherwise the only candidates with a
+credible path to 1.5k must reduce effective model work and pass an explicit
+quality gate.
+
+## Model-work reduction boundary
+
+An active-width sweep of the retained packed-MQ4 primitive establishes the
+performance requirement before any checkpoint surgery:
+
+| FFN width retained | Combined gate/up/down local speedup | Projected overall |
+|---:|---:|---:|
+| 75% | ~1.35x | ~1.36k tok/s |
+| 62% | ~1.60x | ~1.46k tok/s |
+| 58% | ~1.70x | ~1.49k tok/s |
+
+The projection uses the measured 49% wall share of the three large FFN
+projections. It shows that reaching 1.5k requires approximately 42-44% less FFN
+work. Contiguous tail truncation is not a quality proposal: MQ checkpoints use
+a rotation contract around the down projection, so any channel-pruned artifact
+needs calibration, a rotation-aware repack or retraining, and task-level
+quality evaluation. The reproducible timing record is in
+`experiments/gfx11-mq4-v2/ffn-width-work-reduction/`.
+
 ## Closed directions
 
 These results apply to the current HFQ4/MQ4 affine contract and Wave32 WMMA
