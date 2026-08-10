@@ -1,0 +1,2 @@
+bench_rocblas_f16
+!*.log

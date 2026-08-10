@@ -235,6 +235,16 @@ scales. This closes serving integration of the current CK universal A16 x I4
 family. Sources, raw logs, and reproduction commands are in
 `ck-a16-i4-admission/`.
 
+A pure dense-FP16 rocBLAS roofline then removed packed-weight decode, scale,
+and affine correction entirely while retaining the production FFN shapes.
+It reached 3.728 ms on gate/up and 3.909 ms on down, only 1.138x and 1.092x
+over retained MQ4. Even granting the more optimistic 1.138x to the entire
+71.7% packed-MQ4 wall share projects only about 1.095x overall, or roughly
+1.30k tok/s from the 1189 tok/s controlled best. The 1.5k target is therefore
+outside the measured same-math execution-format budget. Further work must
+reduce effective model work or exceed the observed dense backend roofline,
+not merely remove MQ4 decode. See `dense-f16-roofline/`.
+
 Passing the local speed threshold is necessary but not sufficient for routing.
 Exact candidates must also match the retained output tolerance. Approximate
 candidates must pass long-prompt generation and a task-level quality suite.
