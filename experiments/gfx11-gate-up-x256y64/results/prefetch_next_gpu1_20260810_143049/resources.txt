@@ -1,0 +1,25 @@
+scalar_quad_row:
+  instructions=1422
+  global_loads=75
+  waitcnt=117
+  branches=10
+  compares=5
+  lds=179
+  wmma=128
+  barriers=5
+  vgpr=256
+  vgpr_spills=4
+  private_segment_bytes=20
+
+prefetch_next:
+  instructions=1458
+  global_loads=80
+  waitcnt=119
+  branches=17
+  compares=8
+  lds=181
+  wmma=128
+  barriers=5
+  vgpr=247
+  vgpr_spills=0
+  private_segment_bytes=0

@@ -9,6 +9,7 @@ CK_LIB="${CK_LIB:-${QUANT_ROOT}/build/libhipfire_flash_attn_ck_quantized.so}"
 GPU_ID="${GPU_ID:-0}"
 PREFILL="${PREFILL:-8192}"
 PREFILL_CHUNK="${PREFILL_CHUNK:-2048}"
+PREFILL_RUNS="${PREFILL_RUNS:-1}"
 TRIALS="${TRIALS:-3}"
 WARMUP="${WARMUP:-2}"
 GEN="${GEN:-8}"
@@ -33,6 +34,7 @@ printf 'trial\torder\tmode\tprefill_ms\tprefill_tok_s\tgen_tok_s\tck_active\n' \
     echo "gpu_id=${GPU_ID}"
     echo "prefill=${PREFILL}"
     echo "prefill_chunk=${PREFILL_CHUNK}"
+    echo "prefill_runs=${PREFILL_RUNS}"
     echo "trials=${TRIALS}"
     sha256sum "${EXE}" "${MODEL}" "${CK_LIB}"
 } >"${RESULT_DIR}/meta.txt"
@@ -52,7 +54,7 @@ run_one() {
         HIPFIRE_DPM_WARMUP_SECS="${DPM_WARMUP_SECS}" \
         "${sidecar_env[@]}" \
         timeout --signal=INT --kill-after=5s "${TIMEOUT_SECS}s" \
-        "${EXE}" "${MODEL}" --prefill "${PREFILL}" --prefill-runs 1 \
+        "${EXE}" "${MODEL}" --prefill "${PREFILL}" --prefill-runs "${PREFILL_RUNS}" \
         --warmup "${WARMUP}" --gen "${GEN}" >"${log}" 2>&1
 
     local prefill_ms prefill_tok_s gen_tok_s ck_active

@@ -1,0 +1,11 @@
+trial	order	mode	prefill_ms	prefill_tok_s	gen_tok_s	ck_active
+1	1	switch	15489.42	528.9	32.8	1
+1	2	candidate	15521.66	527.8	32.8	1
+2	1	candidate	15568.54	526.2	32.8	1
+2	2	switch	15551.79	526.8	32.7	1
+3	1	switch	15556.90	526.6	32.9	1
+3	2	candidate	15564.72	526.3	32.7	1
+4	1	candidate	15565.40	526.3	32.8	1
+4	2	switch	15545.88	527.0	32.8	1
+5	1	switch	15564.72	526.3	32.7	1
+5	2	candidate	15561.96	526.4	32.7	1

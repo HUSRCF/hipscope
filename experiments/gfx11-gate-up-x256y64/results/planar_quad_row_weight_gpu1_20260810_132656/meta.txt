@@ -1,0 +1,7 @@
+gpu_id=1
+pairs=21
+idle_secs=5
+shape=gate_up
+m=17408
+k=5120
+n=2048

@@ -1,0 +1,17 @@
+gfx1100 batch-3 activation staging full_set/full_add
+  VGPR: 237
+  SGPR: 27
+  VGPR spills: 0
+  SGPR spills: 0
+  private segment: 0 B
+  wavefront: 32
+
+Static full_set comparison:
+  scalar quad: 1422 instructions, 72 global_load_b32, 2 global_load_b128,
+               116 s_waitcnt, 5 barriers, 128 WMMA, 4 scratch loads/stores
+  batch-3:     1272 instructions, 0 global_load_b32, 20 global_load_b128,
+               115 s_waitcnt, 5 barriers, 128 WMMA, 0 scratch loads/stores
+
+Schedule observation:
+  first activation half: vector load -> vmcnt(0) -> LDS store, repeated
+  second activation half: 9 vector loads issued before descending vmcnt waits/stores

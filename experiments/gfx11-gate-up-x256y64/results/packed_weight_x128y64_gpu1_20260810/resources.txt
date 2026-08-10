@@ -1,0 +1,30 @@
+Code object:
+  .hipfire_kernels/gfx1100/gemm_hfq4g256_mmq_packed_weight_x128y64.hsaco
+
+Extraction:
+  /opt/rocm/llvm/bin/clang-offload-bundler --unbundle --type=o \
+    --targets=hipv4-amdgcn-amd-amdhsa--gfx1100 \
+    --input=.hipfire_kernels/gfx1100/gemm_hfq4g256_mmq_packed_weight_x128y64.hsaco \
+    --output=/tmp/packed_x128y64_gfx1100.co
+  /opt/rocm/llvm/bin/llvm-readobj --notes /tmp/packed_x128y64_gfx1100.co
+
+AMDGPU metadata excerpt (full-set):
+  .name: gemm_hfq4g256_packed_weight_x128y64_full_set
+  .private_segment_fixed_size: 0
+  .sgpr_count: 28
+  .sgpr_spill_count: 0
+  .vgpr_count: 197
+  .vgpr_spill_count: 0
+  .wavefront_size: 32
+
+AMDGPU metadata excerpt (full-add):
+  .name: gemm_hfq4g256_packed_weight_x128y64_full_add
+  .private_segment_fixed_size: 0
+  .sgpr_count: 28
+  .sgpr_spill_count: 0
+  .vgpr_count: 197
+  .vgpr_spill_count: 0
+  .wavefront_size: 32
+
+Runtime dynamic LDS from the Rust launch wrapper:
+  (128 * 36 + 64 * 33) * sizeof(int) = 26,880 bytes

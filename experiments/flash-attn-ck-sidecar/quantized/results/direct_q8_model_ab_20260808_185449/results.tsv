@@ -1,0 +1,11 @@
+trial	order	mode	prefill_ms	prefill_tok_s	gen_tok_s	bridge_active
+1	1	baseline	11869.34	690.2	32.9	0
+1	2	candidate	11947.06	685.7	33.1	1
+2	1	candidate	11933.15	686.5	33.0	1
+2	2	baseline	11967.60	684.5	33.0	0
+3	1	baseline	12005.99	682.3	33.0	0
+3	2	candidate	12026.83	681.1	32.8	1
+4	1	candidate	12039.32	680.4	32.9	1
+4	2	baseline	11995.19	682.9	32.8	0
+5	1	baseline	12212.57	670.8	32.8	0
+5	2	candidate	12348.92	663.4	32.7	1

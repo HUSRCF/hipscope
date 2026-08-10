@@ -1,0 +1,8 @@
+m=17408 k=5120 n=2048
+add=false
+group128_lds_ms=4.7907
+group256_mode=group128-half-meta
+group256_ms=4.7605
+group256_speedup=1.0064x
+max_abs=0.00000000e0
+mean_abs=0.00000000e0

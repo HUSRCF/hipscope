@@ -1,0 +1,11 @@
+gfx1100 vector-activation full_set/full_add
+  VGPR: 237
+  SGPR: 27
+  VGPR spills: 0
+  SGPR spills: 0
+  private segment: 0 B
+  wavefront: 32
+
+Static full_set comparison:
+  scalar quad: 1423 instructions, 72 global_load_b32, 2 global_load_b128
+  uint4 stage: 1273 instructions, 0 global_load_b32, 20 global_load_b128

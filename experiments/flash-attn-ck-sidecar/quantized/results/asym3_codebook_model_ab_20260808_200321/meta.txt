@@ -1,0 +1,21 @@
+date=2026-08-08T20:04:49+08:00
+git_head=58721c083656505adea834a6569a964b8f598c3a
+exe=/home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-flashattn-beta-latest/target/release/examples/bench_qwen35_mq4
+model=/home/husrcf/.hipfire/models/qwen3.6-27b.mq4
+model_size_bytes=14984158208
+model_mtime=2026-06-09 16:54:07.222764889 +0800
+gpu_id=0
+gpu_arch=gfx1100
+rocm_path=/opt/rocm
+hip_root=/opt/rocm/core-7.14
+runtime_ld_library_path=/opt/rocm/core-7.14/lib:/opt/rocm-7.2.0/lib:/opt/rocm-7.2.0/lib64:/opt/AMD/aocc-compiler-5.1.0/ompd:/opt/AMD/aocc-compiler-5.1.0/lib:/opt/AMD/aocc-compiler-5.1.0/lib32:/usr/lib/x86_64-linux-gnu:/usr/lib64:/usr/lib32:/usr/lib:/opt/rocm-7.2.0/lib:/opt/rocm-7.2.0/lib64:/opt/AMD/aocc-compiler-5.1.0/ompd:/opt/AMD/aocc-compiler-5.1.0/lib:/opt/AMD/aocc-compiler-5.1.0/lib32:/usr/lib/x86_64-linux-gnu:/usr/lib64:/usr/lib32:/usr/lib:
+prefill=8192
+prefill_runs=3
+gen=8
+warmup=2
+trials=5
+candidate_storage=lds
+9d576ecd5714ba03d50e767a808b53228c00f2f0bdaea478cbde3903abf3d054  /home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-flashattn-beta-latest/target/release/examples/bench_qwen35_mq4
+86a5f80fd29d545abb1093dead242725ced6d68b8607c6d566d897b1a82442dc  /home/husrcf/.hipfire/models/qwen3.6-27b.mq4
+e2117bc358dde2301e68254ebea769d74f1250b241cbfd878d3c14900ac5636f  /home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-flashattn-beta-latest/experiments/flash-attn-ck-sidecar/quantized/results/asym3_codebook_model_ab_20260808_200321/lib/libhipfire_flash_attn_ck_switch.so
+752a5c551504128af461ecfb2c4fc62f555f03741cf5ee363ccaeee64e15911a  /home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-flashattn-beta-latest/experiments/flash-attn-ck-sidecar/quantized/results/asym3_codebook_model_ab_20260808_200321/lib/libhipfire_flash_attn_ck_lds.so

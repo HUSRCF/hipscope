@@ -1,0 +1,12 @@
+date=2026-08-09T00:02:51+08:00
+git_head=58721c083656505adea834a6569a964b8f598c3a
+exe=/home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-flashattn-beta-latest/target/release/examples/bench_qwen35_mq4
+model=/home/husrcf/.hipfire/models/qwen3.6-27b.mq4
+ck_lib=/tmp/libhipfire_flash_attn_ck_quantized_target750.so
+gpu_id=1
+prefill=8192
+prefill_chunk=2048
+trials=3
+516d421a83b2b242a7064694456734d9ded3a66cf571a0b90993f5c6137baefd  /home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-flashattn-beta-latest/target/release/examples/bench_qwen35_mq4
+86a5f80fd29d545abb1093dead242725ced6d68b8607c6d566d897b1a82442dc  /home/husrcf/.hipfire/models/qwen3.6-27b.mq4
+0a7442b5bf4c64b940932963cd84953ece12dd6b1894c097d33d97009073f129  /tmp/libhipfire_flash_attn_ck_quantized_target750.so

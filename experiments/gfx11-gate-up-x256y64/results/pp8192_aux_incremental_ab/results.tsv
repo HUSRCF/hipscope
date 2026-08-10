@@ -1,0 +1,11 @@
+pair	order	mode	prefill_tok_s	gen_tok_s
+1	0	gate_residual	894.4	33.0
+1	1	all_x256y64	879.9	32.8
+2	0	all_x256y64	868.4	32.7
+2	1	gate_residual	861.3	32.7
+3	0	gate_residual	864.7	32.9
+3	1	all_x256y64	872.9	32.8
+4	0	all_x256y64	872.6	32.8
+4	1	gate_residual	866.0	32.9
+5	0	gate_residual	864.7	32.9
+5	1	all_x256y64	875.0	32.8

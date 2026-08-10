@@ -1,0 +1,2 @@
+2239fad0ef95251de4cb7021e13f969d3c054b27c3a2959293e62979a084777b  /home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-flashattn-beta-latest/target/release/examples/bench_hfq4_group256_direct
+7920119d1ac55159d22706f2e6e06df31d70029de9a210efb0e0cab4fcea0c09  ./experiments/gfx11-gate-up-x256y64/run_group128_vector_activation_gate_ab.sh

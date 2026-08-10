@@ -652,6 +652,7 @@ fn minimax_attn_block(
         tree_bias: None,
         block_start: 0,
         block_cols: 0,
+        contiguous_prefix: false,
         output_gate: None,
         output: &state.fa_attn_out,
     };
