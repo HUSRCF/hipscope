@@ -5,6 +5,8 @@ Status: research plan. This is not a serving route or a new checkpoint format.
 ## Objective
 
 The retained gfx1100 Qwen3.6-27B prefill path is mature at about 1.12k tok/s.
+The best controlled combination measured so far, including staged CK,
+group256, and the F16 FFN intermediate, is about 1.189k tok/s.
 The next backend must improve the common packed-MQ4 primitive used by gate,
 up, down, and the other large projections. It must not be another launch-tile
 sweep over the existing dataflow.
@@ -23,17 +25,18 @@ spills, and 57,344 bytes of dynamic LDS per workgroup.
 
 ## Performance admission line
 
-Use the production-style F16-intermediate median, 1115.4 tok/s, as the stable
-reference. Reaching 1500 tok/s requires:
+Use 1115.4 tok/s as the conservative stable reference and 1189 tok/s as the
+best controlled configuration. Reaching 1500 tok/s requires:
 
 ```text
-overall speedup = 1500 / 1115.4 = 1.3448x
-wall-time reduction = 25.64%
+stable reference: 1500 / 1115.4 = 1.3448x, 25.64% wall reduction
+best reference:   1500 / 1189.0 = 1.2616x, 20.73% wall reduction
 ```
 
 The runtime timeline attributes about 71.7% of prefill wall time to the
 packed-MQ4 family. If no other component changes, that whole family must reach
-about 1.56x local speedup to reach 1500 tok/s.
+about 1.56x local speedup from the conservative reference or 1.41x from the
+best controlled configuration to reach 1500 tok/s.
 
 That family label does not mean weight bytes dominate the kernel. For the
 retained X256/Y64 geometry at N=2048, the explicit movement model is:
@@ -93,6 +96,8 @@ WMMA kernels with a different numerical contract.
 | Current MQ2-Lloyd FP16-WMMA four-wave core | 0.1786-0.1834x in same-process paired dense FFN runs; quality already rejected | rejected implementation and current MQ2 quality contract |
 | rocBLAS rowwise-W8A8 full hot path | 1.06x gate/up, 1.01x down, about 1.88x bytes | rejected |
 | Lane-major exact MQ4, packed LDS + register decode | 0.448x gate, 0.408x down; zero spills | closed |
+| Row-I8, row-scale, full-K int32 accumulation | 0.404x gate, 0.414x down; 1.88x bytes | closed |
+| Row-Q4, row-scale, full-K int32 accumulation | 0.480x gate, 0.434x down; 0.94x bytes | closed |
 
 The lossless packed-layout experiments show that eliminating or relocating
 nibble expansion alone did not help the measured gate/up shape. The exact IU4
@@ -115,6 +120,14 @@ The measured mature Q8_0 backend made this tradeoff worse rather than better:
 it doubled resident weight bytes and was 3.2-3.6x slower than retained MQ4 on
 the full gate/up and down shapes. It is therefore not an execution-format upper
 bound for this workload.
+
+The row-scale probes additionally changed the accumulation contract: integer
+Wave32-WMMA accumulators remained live across the complete K range and scales
+were applied only in the epilogue. Row-I8 nearly doubled resident weight
+bytes; row-Q4 was slightly smaller than retained MQ4. Both were less than half
+as fast despite at most 93 VGPRs and zero spills. This closes the specific
+full-K-accumulator/K128-staging topology; the negative result is not a claim
+against Wave32 WMMA itself.
 
 ## Open design space
 
