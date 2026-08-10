@@ -64,6 +64,158 @@ const LDSSTAGE_MAX_BATCH: usize = 96;
 const LDSSTAGE_MAX_BATCH_GFX11: usize = 96;
 
 impl Gpu {
+    /// Standalone gfx11 MQ4-v2 execution-format probe. The caller supplies
+    /// rowwise signed-I8 weights/activations and one FP32 scale per row.
+    /// This method is deliberately not used by model dispatch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_mq4v2_row_i8_q8_wmma_256x64(
+        &mut self,
+        weights: &GpuTensor,
+        weight_scales: &GpuTensor,
+        activations: &GpuTensor,
+        activation_scales: &GpuTensor,
+        output: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        add: bool,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if !self.arch_caps.is_gfx1100()
+            || m % 64 != 0
+            || k % 128 != 0
+            || batch_size % 256 != 0
+        {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "row-I8/Q8 probe requires gfx1100 and M%64=K%128=N%256=0",
+            ));
+        }
+        const MODULE: &str = "gemm_mq4v2_row_i8_q8_wmma_256x64";
+        let kernel = if add {
+            "gemm_mq4v2_row_i8_q8_wmma_256x64_add"
+        } else {
+            "gemm_mq4v2_row_i8_q8_wmma_256x64_set"
+        };
+        self.ensure_kernel(
+            MODULE,
+            kernels::GEMM_MQ4V2_ROW_I8_Q8_WMMA_256X64_SRC,
+            kernel,
+        )?;
+        let mut weights_ptr = weights.buf.as_ptr();
+        let mut weight_scales_ptr = weight_scales.buf.as_ptr();
+        let mut activations_ptr = activations.buf.as_ptr();
+        let mut activation_scales_ptr = activation_scales.buf.as_ptr();
+        let mut output_ptr = output.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut weights_ptr as *mut _ as *mut c_void,
+            &mut weight_scales_ptr as *mut _ as *mut c_void,
+            &mut activations_ptr as *mut _ as *mut c_void,
+            &mut activation_scales_ptr as *mut _ as *mut c_void,
+            &mut output_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            kernel,
+            [(m / 64) as u32, (batch_size / 256) as u32, 1],
+            [32, 8, 1],
+            ((64 + 256) * 128) as u32,
+            &mut params,
+            || {
+                let mut blob = hip_bridge::KernargBlob::new();
+                blob.push_ptr(weights_ptr);
+                blob.push_ptr(weight_scales_ptr);
+                blob.push_ptr(activations_ptr);
+                blob.push_ptr(activation_scales_ptr);
+                blob.push_ptr(output_ptr);
+                blob.push_i32(m_val);
+                blob.push_i32(k_val);
+                blob.push_i32(n_val);
+                blob
+            },
+        )
+    }
+
+    /// Packed-Q4 sibling of the row-scale execution-format probe.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_mq4v2_row_q4_q8_wmma_256x64(
+        &mut self,
+        weights: &GpuTensor,
+        weight_scales: &GpuTensor,
+        activations: &GpuTensor,
+        activation_scales: &GpuTensor,
+        output: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        add: bool,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if !self.arch_caps.is_gfx1100()
+            || m % 64 != 0
+            || k % 128 != 0
+            || batch_size % 256 != 0
+        {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "row-Q4/Q8 probe requires gfx1100 and M%64=K%128=N%256=0",
+            ));
+        }
+        const MODULE: &str = "gemm_mq4v2_row_i8_q8_wmma_256x64";
+        let kernel = if add {
+            "gemm_mq4v2_row_q4_q8_wmma_256x64_add"
+        } else {
+            "gemm_mq4v2_row_q4_q8_wmma_256x64_set"
+        };
+        self.ensure_kernel(
+            MODULE,
+            kernels::GEMM_MQ4V2_ROW_I8_Q8_WMMA_256X64_SRC,
+            kernel,
+        )?;
+        let mut weights_ptr = weights.buf.as_ptr();
+        let mut weight_scales_ptr = weight_scales.buf.as_ptr();
+        let mut activations_ptr = activations.buf.as_ptr();
+        let mut activation_scales_ptr = activation_scales.buf.as_ptr();
+        let mut output_ptr = output.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut weights_ptr as *mut _ as *mut c_void,
+            &mut weight_scales_ptr as *mut _ as *mut c_void,
+            &mut activations_ptr as *mut _ as *mut c_void,
+            &mut activation_scales_ptr as *mut _ as *mut c_void,
+            &mut output_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            kernel,
+            [(m / 64) as u32, (batch_size / 256) as u32, 1],
+            [32, 8, 1],
+            ((64 + 256) * 128) as u32,
+            &mut params,
+            || {
+                let mut blob = hip_bridge::KernargBlob::new();
+                blob.push_ptr(weights_ptr);
+                blob.push_ptr(weight_scales_ptr);
+                blob.push_ptr(activations_ptr);
+                blob.push_ptr(activation_scales_ptr);
+                blob.push_ptr(output_ptr);
+                blob.push_i32(m_val);
+                blob.push_i32(k_val);
+                blob.push_i32(n_val);
+                blob
+            },
+        )
+    }
+
     /// CDNA3-only: prefill GEMM used by `gemm_hfq4g256` rocBLAS path.
     ///
     /// Computes Y_rowmajor[N × M] = X_rowmajor[N × K] · W_transposed, where

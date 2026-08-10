@@ -214,6 +214,17 @@ must be slow. Reproduce with `run_mq2_dense_ffn_upper_bound.sh`; the default
 MoE benchmark matrix is unchanged unless `HIPFIRE_MQ2_DENSE_FFN_PROBE=1` is
 set.
 
+A row-scale execution-format probe then tested whether removing per-group
+FP32 flushes could pay for a fundamentally different full-K Wave32-WMMA
+schedule. Row-I8 expanded resident weights to about 1.88x retained MQ4 and
+reached only 0.391x-0.448x. Its packed row-Q4 sibling reduced resident bytes
+to about 0.94x retained MQ4, but still reached only 0.457x-0.487x and worsened
+synthetic relative L2 error to 0.136-0.138. All four code objects were wave32,
+used at most 93 VGPRs, and had zero spills. This rejects the specific
+row-scale/full-K-accumulator/K128-staging architecture rather than Wave32
+WMMA or execution-format work in general. Full data and reproduction commands
+are in `results/row-scale-full-k-wmma-gpu1-20260811/`.
+
 Passing the local speed threshold is necessary but not sufficient for routing.
 Exact candidates must also match the retained output tolerance. Approximate
 candidates must pass long-prompt generation and a task-level quality suite.
