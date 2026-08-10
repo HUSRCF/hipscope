@@ -1,0 +1,19 @@
+device name=AMD Radeon Pro W7900 Dual Slot arch=gfx1100 visible_device_count=1 current_device=0
+kernel_stats exact_full_set regs=73 local_bytes=0 static_lds=0 max_threads=32
+kernel_stats exact_full_add regs=73 local_bytes=0 static_lds=0 max_threads=32
+kernel_stats coarse_full_set regs=73 local_bytes=0 static_lds=0 max_threads=32
+kernel_stats coarse_full_add regs=73 local_bytes=0 static_lds=0 max_threads=32
+validation small_case shape=small_control_set exact_flushes_per_output=4 coarse_flushes_per_output=1 reduction=4.00x
+validation cpu_vs_exact max_abs=0 relative_l2=0 cosine=1
+validation cpu_vs_coarse max_abs=0 relative_l2=0 cosine=1
+validation exact_vs_coarse max_abs=0 relative_l2=0 cosine=1
+resident_bytes shape=gate_up_full_set exact_weight=50135040 coarse_weight=45957120 exact_act=11141120 coarse_act=10649600
+shape=gate_up_full_set M=17408 K=5120 N=2048 add=0
+exact_ms: 22.873779 23.693686 23.516369 23.578169 23.740564 23.946640 24.044720
+coarse_ms: 21.914238 22.559425 23.324492 23.517128 22.907539 23.499289 22.788221
+summary shape=gate_up_full_set exact_median_ms=23.693686 coarse_median_ms=22.907539 speedup=1.034318x max_abs=0 relative_l2=0 cosine=1
+resident_bytes shape=down_full_add exact_weight=50135040 coarse_weight=45957120 exact_act=37879808 coarse_act=36208640
+shape=down_full_add M=5120 K=17408 N=2048 add=1
+exact_ms: 29.720346 29.421831 30.094700 29.679707 29.166117 28.803404 29.392672
+coarse_ms: 27.592184 27.561504 28.232412 27.705622 27.064514 27.260071 27.991339
+summary shape=down_full_add exact_median_ms=29.421831 coarse_median_ms=27.592184 speedup=1.066310x max_abs=0 relative_l2=0 cosine=1
