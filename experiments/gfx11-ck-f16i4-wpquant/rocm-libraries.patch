@@ -1,0 +1,28 @@
+diff --git a/projects/composablekernel/example/ck_tile/38_block_scale_gemm/CMakeLists.txt b/projects/composablekernel/example/ck_tile/38_block_scale_gemm/CMakeLists.txt
+index b9f94b7..a1b7e2a 100644
+--- a/projects/composablekernel/example/ck_tile/38_block_scale_gemm/CMakeLists.txt
++++ b/projects/composablekernel/example/ck_tile/38_block_scale_gemm/CMakeLists.txt
+@@ -48,3 +48,14 @@ if(GPU_TARGETS MATCHES "gfx94|gfx95|gfx12")
+ else()
+     message(DEBUG "Skipping ck_tile quant gemm tests for current target")
+ endif()
++
++if(GPU_TARGETS MATCHES "gfx11")
++    add_executable(tile_example_gemm_quant_f16i4_gfx11
++        gemm_quant.cpp
++        gemm_bquant_quantgrouped_preshuffleb_f16i4_gfx11.cpp)
++    target_compile_options(tile_example_gemm_quant_f16i4_gfx11 PRIVATE
++        ${EXAMPLE_GEMM_COMPILE_OPTIONS})
++endif()
+diff --git a/projects/composablekernel/example/ck_tile/38_block_scale_gemm/run_gemm_quant_example.inc b/projects/composablekernel/example/ck_tile/38_block_scale_gemm/run_gemm_quant_example.inc
+index b23815e..054d863 100644
+--- a/projects/composablekernel/example/ck_tile/38_block_scale_gemm/run_gemm_quant_example.inc
++++ b/projects/composablekernel/example/ck_tile/38_block_scale_gemm/run_gemm_quant_example.inc
+@@ -1004,6 +1004,7 @@ int run_gemm_example_prec_type(const ck_tile::ArgParser& arg_parser)
+                  std::is_same_v<typename TypeConfig::ADataType, ck_tile::pk_fp4_t> ||
+                  std::is_same_v<typename TypeConfig::ADataType, ck_tile::fp8_t> ||
+                  std::is_same_v<typename TypeConfig::ADataType, ck_tile::bf8_t> ||
++                 std::is_same_v<typename TypeConfig::ADataType, ck_tile::fp16_t> ||
+                  std::is_same_v<typename TypeConfig::ADataType, ck_tile::bf16_t>)
+     {
+         std::string a_layout = arg_parser.get_str("a_layout");
