@@ -1,0 +1,25 @@
+GPU dev 0: gfx1100 (48.3 GB VRAM, HIP 7.14)
+  pre-compiled kernels: .hipfire_kernels/gfx1100
+Arch: gfx1100
+
+=== Qwen3.6 dense gate/up | M=17408 K=5120 batch=2048 m_total=2048 ===
+  correctness: max_abs=0.000e0  max_rel=0.000e0  bad=0/35651584  nan=0  OK
+  ref (1w16x16):  22499.9 µs ( 16226 GFLOPS)   4w (64x16):     24465.6 µs ( 14922 GFLOPS)   speedup: 0.92×
+warming caches... took 5.00s
+  paired retained MQ4 set median: 4.7829 ms
+  paired MQ2 4w set median:      26.7536 ms
+  paired MQ2/MQ4 speed ratio:     0.1788×
+  paired retained MQ4 raw ms: [4.168387, 4.76423, 4.800129999999999, 4.782927, 4.795370999999999, 4.756596, 4.790080000000001]
+  paired MQ2 4w raw ms:      [25.172177, 26.059544, 27.065631, 26.780098, 26.825306, 26.643093, 26.753558]
+  i8-mmq:        SKIP (gfx1151-only implementation)
+
+=== Qwen3.6 dense down | M=5120 K=17408 batch=2048 m_total=2048 ===
+  correctness: max_abs=0.000e0  max_rel=0.000e0  bad=0/10485760  nan=0  OK
+  ref (1w16x16):  24037.3 µs ( 15188 GFLOPS)   4w (64x16):     25564.1 µs ( 14281 GFLOPS)   speedup: 0.94×
+warming caches... took 5.00s
+  paired retained MQ4 set median: 4.8984 ms
+  paired MQ2 4w set median:      26.7198 ms
+  paired MQ2/MQ4 speed ratio:     0.1833×
+  paired retained MQ4 raw ms: [4.399213, 4.921263000000001, 4.964727000000001, 4.899381, 4.887498, 4.889391, 4.898369]
+  paired MQ2 4w raw ms:      [25.087628000000002, 26.565829, 27.063983, 26.888433, 26.789451999999997, 26.710929, 26.719776]
+  i8-mmq:        SKIP (gfx1151-only implementation)
