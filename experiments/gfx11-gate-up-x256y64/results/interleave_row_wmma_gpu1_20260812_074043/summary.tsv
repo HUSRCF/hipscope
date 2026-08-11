@@ -1,0 +1,3 @@
+shape	runs	quad_row_ms_median	interleaved_ms_median	interleaved_vs_quad	max_abs_max
+gate_up_set	5	4.6327	4.6458	1.0028	0.00000000e+00
+down_residual_add	5	4.7208	4.7253	1.0010	0.00000000e+00

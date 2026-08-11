@@ -1,0 +1,7 @@
+date=2026-08-12T07:31:05+08:00
+git_commit=2b56afc950463d254e1d341d433e3cf3a8bb0d89
+gpu_id=1
+prefill_tokens=16384
+prefill_runs=3
+trials=3
+candidate=interleave two independent row-fragment WMMA dependency chains

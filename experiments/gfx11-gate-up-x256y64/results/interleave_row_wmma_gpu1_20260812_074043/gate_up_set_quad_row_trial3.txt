@@ -1,0 +1,12 @@
+GPU dev 0: gfx1100 (48.3 GB VRAM, HIP 7.14)
+  pre-compiled kernels: .hipfire_kernels/gfx1100
+arch=gfx1100 M=17408 K=5120 N=2048 pairs=31
+m=17408 k=5120 n=2048
+add=false
+reference_mode=group128-lds
+group128_lds_ms=4.8728
+group256_mode=group128-quad-row-u32x2
+group256_ms=4.5612
+group256_speedup=1.0683x
+max_abs=0.00000000e0
+mean_abs=0.00000000e0

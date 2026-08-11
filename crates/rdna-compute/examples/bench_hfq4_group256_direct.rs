@@ -155,6 +155,7 @@ fn main() {
     let mut group128_dual_row_u32x2 = false;
     let mut group128_dual_row_scalar2 = false;
     let mut group128_quad_row_u32x2 = false;
+    let mut group128_interleave_row_wmma = false;
     let mut group128_quad_row_min1 = false;
     let mut group128_quad_row_vector_activation = false;
     let mut group128_quad_row_vector_activation_batch3 = false;
@@ -214,6 +215,7 @@ fn main() {
             "--group128-dual-row-u32x2" => group128_dual_row_u32x2 = true,
             "--group128-dual-row-scalar2" => group128_dual_row_scalar2 = true,
             "--group128-quad-row-u32x2" => group128_quad_row_u32x2 = true,
+            "--group128-interleave-row-wmma" => group128_interleave_row_wmma = true,
             "--group128-quad-row-min1" => group128_quad_row_min1 = true,
             "--group128-quad-row-vector-activation" => group128_quad_row_vector_activation = true,
             "--group128-quad-row-vector-activation-batch3" => {
@@ -263,6 +265,7 @@ fn main() {
             group128_dual_row_u32x2,
             group128_dual_row_scalar2,
             group128_quad_row_u32x2,
+            group128_interleave_row_wmma,
             group128_quad_row_min1,
             group128_quad_row_vector_activation,
             group128_quad_row_vector_activation_batch3,
@@ -392,6 +395,10 @@ fn main() {
             )
         } else if group128_quad_row_u32x2 {
             gpu.gemm_hfq4g256_mmq_prequant_x256y64_group128_quad_row_u32x2(
+                &a, xq128, &y256, m, k, n, add,
+            )
+        } else if group128_interleave_row_wmma {
+            gpu.gemm_hfq4g256_mmq_prequant_x256y64_group128_interleave_row_wmma(
                 &a, xq128, &y256, m, k, n, add,
             )
         } else if group128_quad_row_min1 {
@@ -584,6 +591,8 @@ fn main() {
             "group128-dual-row-scalar2"
         } else if group128_quad_row_u32x2 {
             "group128-quad-row-u32x2"
+        } else if group128_interleave_row_wmma {
+            "group128-interleave-row-wmma"
         } else if group128_quad_row_min1 {
             "group128-quad-row-min1"
         } else if group128_quad_row_vector_activation {

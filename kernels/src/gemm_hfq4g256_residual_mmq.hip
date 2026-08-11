@@ -118,6 +118,10 @@
 #ifndef MMQ_WEIGHT_QUAD_ROW_U32X2
 #define MMQ_WEIGHT_QUAD_ROW_U32X2 0
 #endif
+
+#ifndef MMQ_INTERLEAVE_ROW_WMMA
+#define MMQ_INTERLEAVE_ROW_WMMA 0
+#endif
 #ifndef MMQ_WEIGHT_OCT_ROW_U32X2
 #define MMQ_WEIGHT_OCT_ROW_U32X2 0
 #endif
@@ -521,6 +525,27 @@ static __device__ __forceinline__ void mma_i8(
     const int32x4_t* b_vec = (const int32x4_t*)B.x;
     acc[0] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a_vec[0], true, b_vec[0], acc[0], true);
     acc[0] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a_vec[1], true, b_vec[1], acc[0], true);
+}
+
+template <data_layout dl_d, data_layout dl_ab>
+static __device__ __forceinline__ void mma_i8_row2_interleaved(
+    tile<16, 16, int, dl_d>& D0,
+    tile<16, 16, int, dl_d>& D1,
+    const tile<16, 8, int, dl_ab>& A0,
+    const tile<16, 8, int, dl_ab>& A1,
+    const tile<16, 8, int, dl_ab>& B
+) {
+    using int32x8_t = __attribute__((__vector_size__(8 * sizeof(int)))) int;
+    using int32x4_t = __attribute__((__vector_size__(4 * sizeof(int)))) int;
+    int32x8_t* acc0 = (int32x8_t*)D0.x;
+    int32x8_t* acc1 = (int32x8_t*)D1.x;
+    const int32x4_t* a0_vec = (const int32x4_t*)A0.x;
+    const int32x4_t* a1_vec = (const int32x4_t*)A1.x;
+    const int32x4_t* b_vec = (const int32x4_t*)B.x;
+    acc0[0] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a0_vec[0], true, b_vec[0], acc0[0], true);
+    acc1[0] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a1_vec[0], true, b_vec[0], acc1[0], true);
+    acc0[0] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a0_vec[1], true, b_vec[1], acc0[0], true);
+    acc1[0] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a1_vec[1], true, b_vec[1], acc1[0], true);
 }
 
 // quantize_q8_1_mmq_ds4 hoisted above the HIPFIRE_RDNA3 split (line ~38)
@@ -1809,6 +1834,20 @@ static __device__ __forceinline__ void vec_dot_q8_1_group128_mma(
             tile_B b_frag;
             load_ldmatrix_16x8(
                 b_frag, y_qs + j0 * MMQ_TILE_Y_K + k01, MMQ_TILE_Y_K);
+#if MMQ_INTERLEAVE_ROW_WMMA
+            static_assert(row_frags == 2,
+                          "row-interleaved WMMA requires two row fragments");
+            tile_A a_frag[row_frags];
+            #pragma unroll
+            for (int n = 0; n < row_frags; ++n) {
+                load_ldmatrix_16x8(
+                    a_frag[n],
+                    x_qs + (plane_row + i0 + n * tile_A::I) * MMQ_TILE_X_K + k0,
+                    MMQ_TILE_X_K);
+            }
+            mma_i8_row2_interleaved(
+                c_acc[0], c_acc[1], a_frag[0], a_frag[1], b_frag);
+#else
             #pragma unroll
             for (int n = 0; n < row_frags; ++n) {
                 tile_A a_frag;
@@ -1818,6 +1857,7 @@ static __device__ __forceinline__ void vec_dot_q8_1_group128_mma(
                     MMQ_TILE_X_K);
                 mma_i8(c_acc[n], a_frag, b_frag);
             }
+#endif
         }
 
         const int j = j0 + tile_C::get_j(0);
