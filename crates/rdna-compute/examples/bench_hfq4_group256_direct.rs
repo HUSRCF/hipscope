@@ -160,6 +160,7 @@ fn main() {
     let mut skip_correctness = false;
     let mut staged = false;
     let mut serial_row = false;
+    let mut serial_row_quad_weight = false;
     let mut group128_serial_row = false;
     let mut group128_direct = false;
     let mut group128_direct_x512 = false;
@@ -220,6 +221,7 @@ fn main() {
             "--skip-correctness" => skip_correctness = true,
             "--staged" => staged = true,
             "--serial-row" => serial_row = true,
+            "--serial-row-quad-weight" => serial_row_quad_weight = true,
             "--group128-serial-row" => group128_serial_row = true,
             "--group128-direct" => group128_direct = true,
             "--group128-direct-x512" => group128_direct_x512 = true,
@@ -270,6 +272,7 @@ fn main() {
         [
             staged,
             serial_row,
+            serial_row_quad_weight,
             group128_serial_row,
             group128_direct,
             group128_direct_x512,
@@ -350,7 +353,11 @@ fn main() {
         .expect("quantize group256");
 
     let run128 = |gpu: &mut Gpu| {
-        if f32a_k32_unique_decode
+        if serial_row_quad_weight {
+            gpu.gemm_hfq4g256_mmq_prequant_x256y64_group256_serial_row(
+                &a, xq256, &y128, m, k, n, add,
+            )
+        } else if f32a_k32_unique_decode
             || f32a_k32_compact_decode
             || f32a_k32_compact_perm_decode
             || f32a_k64
@@ -500,6 +507,10 @@ fn main() {
             gpu.gemm_hfq4g256_mmq_prequant_x256y64_group128_serial_row(
                 &a, xq128, &y256, m, k, n, add,
             )
+        } else if serial_row_quad_weight {
+            gpu.gemm_hfq4g256_mmq_prequant_x256y64_group256_serial_row_quad_weight(
+                &a, xq256, &y256, m, k, n, add,
+            )
         } else if staged {
             gpu.gemm_hfq4g256_mmq_prequant_x256y64_group256_staged(&a, xq256, &y256, m, k, n, add)
         } else if serial_row {
@@ -579,7 +590,9 @@ fn main() {
     println!("add={add}");
     println!(
         "reference_mode={}",
-        if f32a_k32_unique_decode
+        if serial_row_quad_weight {
+            "group256-serial-row"
+        } else if f32a_k32_unique_decode
             || f32a_k32_compact_decode
             || f32a_k32_compact_perm_decode
             || f32a_k64
@@ -597,7 +610,9 @@ fn main() {
     println!("group128_lds_ms={med128:.4}");
     println!(
         "group256_mode={}",
-        if stream_k128_x256y128 {
+        if serial_row_quad_weight {
+            "group256-serial-row-quad-weight"
+        } else if stream_k128_x256y128 {
             "stream-k128-x256y128"
         } else if stream_k128_phased_x256 {
             "stream-k128-phased-x256"

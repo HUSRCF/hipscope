@@ -148,6 +148,7 @@ WMMA kernels with a different numerical contract.
 | Module-exact gfx11 CU-mode scheduling | PP8192 1144.6 -> 1123.7 tok/s (0.9817x); decode 33.3 -> 33.2 tok/s | closed |
 | Late-lane epilogue index reconstruction | spills 4 -> 2, private 20 -> 12 B/thread; weighted set/add +0.04% | rejected |
 | Group256 activation staged in LDS | candidate throughput is 0.755x serial-row gate/set and 0.704x serial-row down/add | closed |
+| Group256 serial-row with quad-row weight staging | 0.9649x gate/set, 0.9734x down/add; bit-exact | closed |
 
 The lossless packed-layout experiments show that eliminating or relocating
 nibble expansion alone did not help the measured gate/up shape. The exact IU4
@@ -164,6 +165,16 @@ be reconstructed from `HW_ID1.WAVE_ID`, because that register reports a
 physical SIMD wave slot rather than the wave's logical index within its
 workgroup. The exact probe and resource record are in
 `experiments/gfx11-mq4-v2/results/late-lane-epilogue-gpu1-20260812/`.
+
+Reusing the retained group128 quad-row weight loader in the group256
+serial-row path did not transfer its benefit. Both full shapes remained
+bit-exact, but gate/set regressed from 4.1564 to 4.3074 ms and down/add from
+4.2456 to 4.3618 ms. The full kernels remained spill-free and used the same
+19,456 bytes of dynamic LDS, while VGPR use rose from 228 to 244 and the
+static instruction count grew by 9-14%. This closes loader reuse for the
+group256 direct-activation dataflow; it does not reject quad-row staging in
+the retained group128 path. The exact record is in
+`experiments/gfx11-gate-up-x256y64/results/group256_quad_row_weight_gpu1_20260812/`.
 
 The existing 140-byte compact group128 activation record is also not admitted
 as a new single-output backend. It saves only four bytes from the 144-byte

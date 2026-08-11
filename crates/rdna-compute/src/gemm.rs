@@ -18672,6 +18672,41 @@ impl Gpu {
         batch_size: usize,
         add: bool,
     ) -> HipResult<()> {
+        self.gemm_hfq4g256_mmq_prequant_x256y64_group256_serial_row_impl(
+            a_raw, x_q8_ptr, y, m, k, batch_size, add, false,
+        )
+    }
+
+    /// Standalone group256 serial-row probe using the exact quad-row weight
+    /// staging already retained by the group128 production path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_hfq4g256_mmq_prequant_x256y64_group256_serial_row_quad_weight(
+        &mut self,
+        a_raw: &GpuTensor,
+        x_q8_ptr: *mut c_void,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        add: bool,
+    ) -> HipResult<()> {
+        self.gemm_hfq4g256_mmq_prequant_x256y64_group256_serial_row_impl(
+            a_raw, x_q8_ptr, y, m, k, batch_size, add, true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_hfq4g256_mmq_prequant_x256y64_group256_serial_row_impl(
+        &mut self,
+        a_raw: &GpuTensor,
+        x_q8_ptr: *mut c_void,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        add: bool,
+        quad_weight: bool,
+    ) -> HipResult<()> {
         self.bind_thread()?;
         if !self.arch_caps.is_rdna3_dgpu() || m % 64 != 0 || k % 256 != 0 || batch_size % 256 != 0 {
             return Err(hip_bridge::HipError::new(
@@ -18679,23 +18714,40 @@ impl Gpu {
                 "group256 serial-row requires gfx11 dGPU and M%64=K%256=N%256=0",
             ));
         }
-        const MODULE: &str = "gemm_hfq4g256_mmq_x256y64_group256_serial_row";
-        let kernel = if add {
+        const BASE_MODULE: &str = "gemm_hfq4g256_mmq_x256y64_group256_serial_row";
+        const QUAD_MODULE: &str = "gemm_hfq4g256_mmq_x256y64_group256_serial_row_quad_weight";
+        let module = if quad_weight {
+            QUAD_MODULE
+        } else {
+            BASE_MODULE
+        };
+        let kernel = if quad_weight && add {
+            "gemm_hfq4g256_mmq_x256y64_group256_serial_row_quad_weight_full_add"
+        } else if quad_weight {
+            "gemm_hfq4g256_mmq_x256y64_group256_serial_row_quad_weight_full_set"
+        } else if add {
             "gemm_hfq4g256_mmq_x256y64_group256_serial_row_full_add"
         } else {
             "gemm_hfq4g256_mmq_x256y64_group256_serial_row_full_set"
         };
-        static SRC: OnceLock<String> = OnceLock::new();
-        let src = SRC.get_or_init(|| {
+        static BASE_SRC: OnceLock<String> = OnceLock::new();
+        static QUAD_SRC: OnceLock<String> = OnceLock::new();
+        let slot = if quad_weight { &QUAD_SRC } else { &BASE_SRC };
+        let src = slot.get_or_init(|| {
             let body = kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_SRC.replace(
                 "gemm_hfq4g256_residual_mmq",
-                MODULE,
+                module,
             );
+            let weight_loader = if quad_weight {
+                "#define MMQ_WEIGHT_QUAD_ROW_U32X2 1\n"
+            } else {
+                ""
+            };
             format!(
-                "#define MMQ_X 256\n#define MMQ_Y 64\n#define MMQ_ROW_FRAGS 2\n#define MMQ_COL_GROUPS 4\n#define MMQ_PERM_NIBBLE 1\n#define MMQ_Q8_GROUP256_DIRECT 1\n#define MMQ_Q8_GROUP256_SERIAL_ROW 1\n{body}",
+                "#define MMQ_X 256\n#define MMQ_Y 64\n#define MMQ_ROW_FRAGS 2\n#define MMQ_COL_GROUPS 4\n#define MMQ_PERM_NIBBLE 1\n#define MMQ_Q8_GROUP256_DIRECT 1\n#define MMQ_Q8_GROUP256_SERIAL_ROW 1\n{weight_loader}{body}",
             )
         });
-        self.ensure_kernel(MODULE, src, kernel)?;
+        self.ensure_kernel(module, src, kernel)?;
         let mut a_ptr = a_raw.buf.as_ptr();
         let mut xq_ptr = x_q8_ptr;
         let mut y_ptr = y.buf.as_ptr();

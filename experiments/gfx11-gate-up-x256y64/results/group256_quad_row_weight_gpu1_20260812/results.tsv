@@ -1,0 +1,3 @@
+shape\toperation\tbaseline_ms\tcandidate_ms\tspeedup\tmax_abs\tmean_abs\trel_l2\tcosine
+M17408_K5120_N2048\tset\t4.1564\t4.3074\t0.9649\t0\t0\t0\t1
+M5120_K17408_N2048\tadd\t4.2456\t4.3618\t0.9734\t0\t0\t0\t1
