@@ -7471,7 +7471,8 @@ impl PrefillBatchScratch {
             && gpu.flags.rdna3_q8_group128_quad_row_weight
             && gpu.flags.rdna3_fused_swiglu_q8_group128
             && dim == 5_120
-            && hidden_dim == 17_408
+            && (hidden_dim == 17_408
+                || (gpu.flags.rdna3_ffn_variable_width && hidden_dim % 256 == 0))
             && max_batch % 256 == 0;
 
         Ok(Self {
@@ -12977,7 +12978,8 @@ fn try_run_hfq4_group128_swiglu_down(
         || w_down.gpu_dtype != DType::MQ4G256
         || w_down.awq_scale.is_some()
         || w_down.m != 5_120
-        || w_down.k != 17_408
+        || (w_down.k != 17_408
+            && (!gpu.flags.rdna3_ffn_variable_width || w_down.k % 256 != 0))
         || n % 256 != 0
         || gate.dtype != up.dtype
         || !matches!(gate.dtype, DType::F32 | DType::F16)
@@ -15161,11 +15163,12 @@ fn forward_batch_chunk_impl(
                     && layer.w_gate.gpu_dtype == DType::MQ4G256
                     && layer.w_up.gpu_dtype == DType::MQ4G256
                     && layer.w_down.gpu_dtype == DType::MQ4G256
-                    && layer.w_gate.m == 17_408
-                    && layer.w_up.m == 17_408
+                    && (layer.w_gate.m == 17_408
+                        || (gpu.flags.rdna3_ffn_variable_width && layer.w_gate.m % 256 == 0))
+                    && layer.w_up.m == layer.w_gate.m
                     && layer.w_gate.k == 5_120
                     && layer.w_down.m == 5_120
-                    && layer.w_down.k == 17_408
+                    && layer.w_down.k == layer.w_gate.m
                     && layer.w_down.awq_scale.is_none();
 
                 // Batched gate+up projection.
@@ -16051,11 +16054,12 @@ fn forward_batch_chunk_impl(
                     && layer.w_gate.gpu_dtype == DType::MQ4G256
                     && layer.w_up.gpu_dtype == DType::MQ4G256
                     && layer.w_down.gpu_dtype == DType::MQ4G256
-                    && layer.w_gate.m == 17_408
-                    && layer.w_up.m == 17_408
+                    && (layer.w_gate.m == 17_408
+                        || (gpu.flags.rdna3_ffn_variable_width && layer.w_gate.m % 256 == 0))
+                    && layer.w_up.m == layer.w_gate.m
                     && layer.w_gate.k == 5_120
                     && layer.w_down.m == 5_120
-                    && layer.w_down.k == 17_408
+                    && layer.w_down.k == layer.w_gate.m
                     && layer.w_down.awq_scale.is_none();
 
                 // #397 Ship 5.2 slice 2: FA-FFN fused gate+up → FusedQkvFamily
