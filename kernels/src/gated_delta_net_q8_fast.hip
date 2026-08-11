@@ -57,7 +57,7 @@
 __device__ __forceinline__ float hipfire_gdn_reduce_sum_lane0_dpp(float value) {
     int bits = __builtin_bit_cast(int, value);
     const int other_half = __builtin_amdgcn_permlanex16(
-        bits, bits, 0, 0, false, false);
+        bits, bits, 0x76543210, 0xfedcba98, false, false);
     value += __builtin_bit_cast(float, other_half);
 
     bits = __builtin_bit_cast(int, value);
