@@ -2238,6 +2238,7 @@ fn sliding_layer_decode_impl(
             tree_bias: None,
             block_start: 0,
             block_cols: 0,
+            contiguous_prefix: false,
             output_gate: None,
             output: &scratch.attn_out,
         };
@@ -2499,6 +2500,7 @@ fn full_layer_decode_impl(
             tree_bias: None,
             block_start: 0,
             block_cols: 0,
+            contiguous_prefix: false,
             output_gate: None,
             output: &scratch.attn_out,
         };
@@ -2929,6 +2931,7 @@ fn forward_prefill_batch_v2(
                         tree_bias: None,
                         block_start: 0,
                         block_cols: 0,
+                        contiguous_prefix: false,
                         output_gate: None,
                         output: &scratch.attn_out,
                     };
@@ -3069,6 +3072,7 @@ fn forward_prefill_batch_v2(
                     tree_bias: None,
                     block_start: 0,
                     block_cols: 0,
+                    contiguous_prefix: false,
                     output_gate: None,
                     output: &scratch.pb_attn_q,
                 };
@@ -3106,6 +3110,7 @@ fn forward_prefill_batch_v2(
                             flash_partials: Some(&scratch.flash_partials),
                             givens_cos: kv_full.givens_cos.as_ref(), givens_sin: kv_full.givens_sin.as_ref(),
                             tree_bias: None, block_start: 0, block_cols: 0,
+                            contiguous_prefix: false,
                             output_gate: None,
                             output: &scratch.attn_out,
                         };
@@ -3615,6 +3620,7 @@ impl<'a> ForwardBindings for Gemma4Bindings<'a> {
                     givens_sin: kv.givens_sin.as_ref(),
                     tree_bias: None,
                     block_start: 0, block_cols: 0,
+                    contiguous_prefix: false,
                     output_gate: None,
                     output: &s.attn_out,
                 };
@@ -3692,6 +3698,7 @@ impl<'a> ForwardBindings for Gemma4Bindings<'a> {
                     givens_sin: kv.givens_sin.as_ref(),
                     tree_bias: None,
                     block_start: 0, block_cols: 0,
+                    contiguous_prefix: false,
                     output_gate: None,
                     output: &s.attn_out,
                 };

@@ -2815,6 +2815,7 @@ fn forward_prefill_chunk(
                 tree_bias: None,
                 block_start: 0,
                 block_cols: 0,
+                contiguous_prefix: false,
                 output_gate: None,
                 output: &pbs.fa_attn_out_batch,
             };
