@@ -17196,13 +17196,13 @@ impl Gpu {
         if !self.arch_caps.is_gfx1100()
             || gate_output.dtype != DType::F16
             || up_output.dtype != DType::F16
-            || m != 17_408
+            || (m != 17_408 && (!self.flags.rdna3_ffn_variable_width || m % 256 != 0))
             || k != 5_120
             || batch_size % 256 != 0
         {
             return Err(hip_bridge::HipError::new(
                 0,
-                "FP16 FFN gate/up requires gfx1100, M=17408, K=5120, N%256=0, and FP16 outputs",
+                "FP16 FFN gate/up requires gfx1100, K=5120, N%256=0, FP16 outputs, and M=17408 or an enabled 256-aligned variable width",
             ));
         }
         let xq = self.ensure_q8_1_mmq_x(x, batch_size, k)?;

@@ -98,6 +98,9 @@ pub struct FeatureFlags {
     /// Store the validated gfx1100 Qwen dense-FFN gate/up intermediates as
     /// FP16 and consume them directly in the fused SwiGLU/Q8 producer.
     pub rdna3_ffn_f16_intermediate: bool,
+    /// Admit 256-aligned experimental dense-FFN widths to the gfx1100 FP16
+    /// intermediate and group128 down-projection path.
+    pub rdna3_ffn_variable_width: bool,
     pub fp8_wmma: bool,
     pub dot2_gemv: bool,
     pub gcn5_wave64_hybrid: Option<bool>,
@@ -459,6 +462,8 @@ impl FeatureFlags {
                 == Ok("1"),
             rdna3_ffn_f16_intermediate: value("HIPFIRE_RDNA3_FFN_F16_INTERMEDIATE").as_deref()
                 == Ok("1"),
+            rdna3_ffn_variable_width: value("HIPFIRE_RDNA3_FFN_VARIABLE_WIDTH").as_deref()
+                == Ok("1"),
             fp8_wmma: value("HIPFIRE_FP8_WMMA").map_or(false, |v| v == "1"),
             dot2_gemv: value("HIPFIRE_DOT2_GEMV").map_or(false, |v| v == "1"),
             gcn5_wave64_hybrid: parse_bool("HIPFIRE_GCN5_WAVE64_HYBRID"),
@@ -735,6 +740,7 @@ impl FeatureFlags {
             rdna3_hfq4_gate_up_iu4_a4: false,
             rdna3_fused_swiglu_q8_group128: false,
             rdna3_ffn_f16_intermediate: false,
+            rdna3_ffn_variable_width: false,
             fp8_wmma: false,
             dot2_gemv: false,
             gcn5_wave64_hybrid: None,
