@@ -163,6 +163,7 @@ fn main() {
     let mut serial_row_quad_weight = false;
     let mut group128_serial_row = false;
     let mut group128_direct = false;
+    let mut group128_direct_quad_weight = false;
     let mut group128_direct_x512 = false;
     let mut group128_x128y128 = false;
     let mut group128_x192y96 = false;
@@ -224,6 +225,7 @@ fn main() {
             "--serial-row-quad-weight" => serial_row_quad_weight = true,
             "--group128-serial-row" => group128_serial_row = true,
             "--group128-direct" => group128_direct = true,
+            "--group128-direct-quad-weight" => group128_direct_quad_weight = true,
             "--group128-direct-x512" => group128_direct_x512 = true,
             "--group128-x128y128" => group128_x128y128 = true,
             "--group128-x192y96" => group128_x192y96 = true,
@@ -275,6 +277,7 @@ fn main() {
             serial_row_quad_weight,
             group128_serial_row,
             group128_direct,
+            group128_direct_quad_weight,
             group128_direct_x512,
             group128_x128y128,
             group128_x192y96,
@@ -353,7 +356,11 @@ fn main() {
         .expect("quantize group256");
 
     let run128 = |gpu: &mut Gpu| {
-        if serial_row_quad_weight {
+        if group128_direct_quad_weight {
+            gpu.gemm_hfq4g256_mmq_prequant_x256y64_group128_quad_row_u32x2(
+                &a, xq128, &y128, m, k, n, add,
+            )
+        } else if serial_row_quad_weight {
             gpu.gemm_hfq4g256_mmq_prequant_x256y64_group256_serial_row(
                 &a, xq256, &y128, m, k, n, add,
             )
@@ -501,6 +508,10 @@ fn main() {
             gpu.gemm_hfq4g256_f32a_wmma_128x64_k64(&a, &x, &y256, m, k, n, add)
         } else if f32a_k64_compact_decode {
             gpu.gemm_hfq4g256_f32a_wmma_128x64_k64_compact_decode(&a, &x, &y256, m, k, n, add)
+        } else if group128_direct_quad_weight {
+            gpu.gemm_hfq4g256_mmq_prequant_x256y64_group128_direct_quad_weight(
+                &a, xq128, &y256, m, k, n, add,
+            )
         } else if group128_direct {
             gpu.gemm_hfq4g256_mmq_prequant_x256y64_group128_direct(&a, xq128, &y256, m, k, n, add)
         } else if group128_serial_row {
@@ -590,7 +601,9 @@ fn main() {
     println!("add={add}");
     println!(
         "reference_mode={}",
-        if serial_row_quad_weight {
+        if group128_direct_quad_weight {
+            "group128-quad-row-lds"
+        } else if serial_row_quad_weight {
             "group256-serial-row"
         } else if f32a_k32_unique_decode
             || f32a_k32_compact_decode
@@ -610,7 +623,9 @@ fn main() {
     println!("group128_lds_ms={med128:.4}");
     println!(
         "group256_mode={}",
-        if serial_row_quad_weight {
+        if group128_direct_quad_weight {
+            "group128-direct-quad-weight"
+        } else if serial_row_quad_weight {
             "group256-serial-row-quad-weight"
         } else if stream_k128_x256y128 {
             "stream-k128-x256y128"

@@ -149,6 +149,7 @@ WMMA kernels with a different numerical contract.
 | Late-lane epilogue index reconstruction | spills 4 -> 2, private 20 -> 12 B/thread; weighted set/add +0.04% | rejected |
 | Group256 activation staged in LDS | candidate throughput is 0.755x serial-row gate/set and 0.704x serial-row down/add | closed |
 | Group256 serial-row with quad-row weight staging | 0.9649x gate/set, 0.9734x down/add; bit-exact | closed |
+| Group128 direct activation with quad-row weight staging | 0.9900x gate/set, 0.9732x down/add; FP32-order differences only | closed |
 
 The lossless packed-layout experiments show that eliminating or relocating
 nibble expansion alone did not help the measured gate/up shape. The exact IU4
@@ -175,6 +176,15 @@ static instruction count grew by 9-14%. This closes loader reuse for the
 group256 direct-activation dataflow; it does not reject quad-row staging in
 the retained group128 path. The exact record is in
 `experiments/gfx11-gate-up-x256y64/results/group256_quad_row_weight_gpu1_20260812/`.
+
+Combining direct group128 activation reads with the retained quad-row weight
+loader also failed the standalone gate. It reduced dynamic LDS from 57,344 to
+19,456 bytes, VGPR use from 256 to 163, and eliminated four VGPR spills, but
+gate/set was 0.9900x and down/add was 0.9732x. The small output differences
+match the already established direct-path FP32 accumulation-order boundary.
+This closes direct activation as a serving candidate even when the weight
+loader confounder is removed. The record is in
+`experiments/gfx11-gate-up-x256y64/results/group128_direct_quad_weight_gpu1_20260812/`.
 
 The existing 140-byte compact group128 activation record is also not admitted
 as a new single-output backend. It saves only four bytes from the 144-byte
