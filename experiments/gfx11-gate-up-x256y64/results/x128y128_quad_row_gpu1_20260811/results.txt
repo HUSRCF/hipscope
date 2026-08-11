@@ -1,0 +1,31 @@
+GPU: AMD Radeon Pro W7900 / gfx1100
+HIP: 7.14
+device: GPU1
+reference: X256/Y64 group128 quad-row u32x2
+candidate: X128/Y128 group128 quad-row u32x2
+pairs: 15
+
+gate/up set M=17408 K=5120 N=2048
+reference_ms=4.4780
+candidate_ms=4.4981
+speedup=0.9955x
+max_abs=0.00000000e0
+mean_abs=0.00000000e0
+relative_l2=0.00000000e0
+cosine=1.0000000000
+
+down add M=5120 K=17408 N=2048
+reference_ms=4.5610
+candidate_ms=4.6309
+speedup=0.9849x
+max_abs=0.00000000e0
+mean_abs=0.00000000e0
+relative_l2=0.00000000e0
+cosine=1.0000000000
+
+code object full_set/full_add
+wavefront_size=32
+vgpr_count=228
+vgpr_spill_count=0
+sgpr_spill_count=0
+private_segment_fixed_size=0
