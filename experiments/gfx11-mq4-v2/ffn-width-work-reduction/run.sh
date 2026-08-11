@@ -9,14 +9,14 @@ PAIRS=${PAIRS:-11}
 
 mkdir -p "$OUT"
 
-for width in 17408 15232 13056 10880 10112; do
+for width in 17408 15232 13056 10880 10496 10112 9984 9728; do
     HIP_VISIBLE_DEVICES="$GPU" "$BIN" \
         --m "$width" --k 5120 --n 2048 --pairs "$PAIRS" \
         | tee "$OUT/gate_${width}.log"
     sleep 3
 done
 
-for width in 17408 15104 13056 10752 9984; do
+for width in 17408 15104 13056 10752 10496 9984 9728; do
     HIP_VISIBLE_DEVICES="$GPU" "$BIN" \
         --m 5120 --k "$width" --n 2048 --pairs "$PAIRS" \
         | tee "$OUT/down_${width}.log"
