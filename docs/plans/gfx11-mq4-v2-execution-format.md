@@ -67,6 +67,26 @@ new execution backend is promoted beyond standalone only after the large
 gate/up and down shapes each reach at least 1.30x. A 1-3% local result does not
 justify production integration.
 
+### Long-prefill validation gate
+
+PP8192 remains a fast screen, but a candidate is not retained from that result
+alone. It must survive a thermally comparable, multi-round PP16384 A/B run on
+the production path. The retained prefill chunk is 2048 tokens. Increasing it
+to 4096 reduced median throughput from 1158.4 to 1074.5 tok/s (`0.9276x`). An
+ABBA run of 2048/1024/1024/2048, with two inner prefill runs per point and 60
+seconds between points, measured:
+
+| Prefill chunk | Pair 1 | Pair 2 | Mean of pair medians | Relative to 2048 |
+|---:|---:|---:|---:|---:|
+| 1024 | 1057.9 tok/s | 1048.1 tok/s | 1053.0 tok/s | `0.9040x` |
+| 2048 | 1183.4 tok/s | 1146.2 tok/s | 1164.8 tok/s | `1.0000x` |
+
+Both bookending 2048 samples exceeded both middle 1024 samples despite the
+run-to-run thermal decline. Smaller chunks therefore add enough repeated model
+work or dispatch overhead to outweigh any scheduling benefit at PP16384.
+Future prefill changes keep chunk 2048 unless they change the underlying
+execution contract and repeat this long-prefill gate.
+
 ## Measured same-math ceiling
 
 A mature CK A16 x I4 screen and a dense-FP16 rocBLAS roofline now bound the
@@ -82,6 +102,32 @@ same-math backend must first demonstrate a mechanism that materially exceeds
 the measured dense rocBLAS/CK roofline. Otherwise the only candidates with a
 credible path to 1.5k must reduce effective model work and pass an explicit
 quality gate.
+
+### Upstream and ISA boundary audit
+
+The current llama.cpp RDNA3 Q4_1 MMQ path was checked as an external mature
+implementation. It expands packed nibbles into an I8 SRAM tile, consumes a
+Q8_1 activation tile with integer Wave32 WMMA, and applies the affine scale and
+sum correction after the integer dot. This is the same execution-class already
+covered by the aligned expanded-I8 probe above (`0.9997x` gate/up and `1.0045x`
+down, with roughly twice the resident weight bytes). Its large-N RDNA3
+`I=128/J=128` configuration is also equivalent to the measured X128/Y128 probe
+(`0.9955x` gate/up and `0.9849x` down). There is no untested upstream dataflow
+to import from that implementation.
+
+The gfx11 ISA exposes native IU4 WMMA, but an exact Q8 activation requires two
+planes (`q8 = low_u4 + 16 * high_i4`) and therefore two IU4 WMMA passes. The
+measured instruction-only speedup was `1.567x` for one IU4 instruction over
+IU8, giving an optimistic two-pass ceiling of only `0.784x` before staging and
+correction. The full exact implementation reached `0.462x`. Reworking that
+implementation cannot beat the retained single-pass IU8 path without changing
+the numerical activation contract.
+
+Full LDS double buffering is not feasible for the retained X256/Y64 primitive:
+one workgroup already reserves 57,344 bytes. The corrected register-prefetch
+probe was slower, and the smaller-tile paths needed to make a second LDS buffer
+fit were already neutral or negative. This closes K-group pipelining under the
+current tile and numerical contract.
 
 ## Model-work reduction boundary
 
@@ -364,9 +410,16 @@ measured dense-FP16 backend roofline.
    footprint must be a separately named high-memory profile.
 4. Exact formats match the retained output tolerance. Approximate formats pass
    long-prompt generation and a task-level quality suite before model routing.
-5. PP8192 ABBA confirms an end-to-end gain with identical routing except for
-   the candidate backend.
-6. The old backend remains available as the stable A/B reference and fallback.
+5. PP8192 ABBA is only the fast serving screen. A retained candidate must then
+   pass a PP16384 multi-round A/B with identical routing except for the backend.
+   Compare thermally equivalent samples: on this W7900, consecutive PP16384
+   runs raised junction temperature from about 48 C to 95 C while SCLK fell
+   from about 2243 MHz to 2016 MHz, producing a repeatable throughput decline
+   unrelated to kernel correctness.
+6. The PP16384 run must use the retained 2048-token prefill chunk unless the
+   chunk size itself is the candidate. A 4096-token chunk measured `1074.5`
+   tok/s versus `1158.4` tok/s for 2048 (`-7.24%`).
+7. The old backend remains available as the stable A/B reference and fallback.
 
 ## Frozen retained improvements
 

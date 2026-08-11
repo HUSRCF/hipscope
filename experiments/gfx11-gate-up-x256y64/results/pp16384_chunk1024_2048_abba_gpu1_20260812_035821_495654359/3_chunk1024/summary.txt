@@ -1,0 +1,2 @@
+PREFILL_SUMMARY  prefill_tok_s=1048.1  prefill_wall_ms=15632.55
+SUMMARY  gen_tok_s=31.9  bw_gib_s=444.6  prefill_tok_s=1048.1  avg_ms=31.10  p50_ms=31.15

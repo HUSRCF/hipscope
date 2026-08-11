@@ -1,0 +1,8 @@
+date=2026-08-12T04:04:09+08:00
+git_commit=df0c0da45ebe3d9d232209d87e76a40f352f078e
+gpu_id=1
+prefill_tokens=16384
+prefill_batch=2048
+prefill_runs=2
+kv_mode=asym3
+graph=0
