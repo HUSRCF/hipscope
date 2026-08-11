@@ -139,6 +139,7 @@ WMMA kernels with a different numerical contract.
 | Current MQ3-Lloyd-G256 Wave32 WMMA core | 0.348x gate/up, 0.300x down; pre-rotation excluded | rejected implementation, not all codebook formats |
 | Current MQ2-Lloyd FP16-WMMA four-wave core | 0.1786-0.1834x in same-process paired dense FFN runs; quality already rejected | rejected implementation and current MQ2 quality contract |
 | rocBLAS rowwise-W8A8 full hot path | 1.06x gate/up, 1.01x down, about 1.88x bytes | rejected |
+| X128/Y128 with retained quad-row loader | 0.9955x gate/up, 0.9849x down | rejected |
 | Lane-major exact MQ4, packed LDS + register decode | 0.448x gate, 0.408x down; zero spills | closed |
 | Row-I8, row-scale, full-K int32 accumulation | 0.404x gate, 0.414x down; 1.88x bytes | closed |
 | Row-Q4, row-scale, full-K int32 accumulation | 0.480x gate, 0.434x down; 0.94x bytes | closed |
@@ -289,6 +290,15 @@ GDN QKVZA:     M=10240, K=5120
 Gate/up multi-output fusion is deferred until the single-projection primitive
 has resource headroom. Fusing outputs on top of the current 256-VGPR,
 57-KiB-LDS kernel is likely to increase pressure rather than remove it.
+
+The balanced X128/Y128 activation-reuse probe was repeated with the retained
+quad-row loader to remove the loader confound from the earlier comparison. It
+remained neutral-to-negative on both full FFN shapes despite using 228 VGPRs
+and zero spills. This closes nearby tile-geometry work under the current
+packed-MQ4 contract when combined with the earlier topology screens; this
+probe by itself rejects the balanced X128/Y128 candidate. Future candidates
+must change effective model work or demonstrate a primitive that exceeds the
+measured dense-FP16 backend roofline.
 
 ## Promotion gates
 
