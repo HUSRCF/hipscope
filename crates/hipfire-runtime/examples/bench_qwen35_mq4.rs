@@ -97,6 +97,23 @@ fn main() {
     }
 
     let calibration_out = std::env::var("HIPFIRE_RDNA3_FFN_GROUP_CALIBRATION_OUT").ok();
+    let capture_dir = std::env::var("HIPFIRE_RDNA3_FFN_CAPTURE_DIR").ok();
+    let capture_layer = capture_dir.as_ref().map(|_| {
+        std::env::var("HIPFIRE_RDNA3_FFN_CAPTURE_LAYER")
+            .expect("FFN tensor capture requires HIPFIRE_RDNA3_FFN_CAPTURE_LAYER")
+            .parse::<usize>()
+            .expect("HIPFIRE_RDNA3_FFN_CAPTURE_LAYER must be a non-negative integer")
+    });
+    let capture_max_tokens = capture_dir.as_ref().map(|_| {
+        std::env::var("HIPFIRE_RDNA3_FFN_CAPTURE_MAX_TOKENS")
+            .ok()
+            .map(|value| {
+                value
+                    .parse::<usize>()
+                    .expect("HIPFIRE_RDNA3_FFN_CAPTURE_MAX_TOKENS must be a positive integer")
+            })
+            .unwrap_or(8192)
+    });
     if calibration_out.is_some() {
         assert!(
             prompt_file.is_some(),
@@ -110,6 +127,31 @@ fn main() {
             std::env::var("HIPFIRE_GRAPH_PREFILL").ok().as_deref(),
             Some("1"),
             "FFN group calibration output does not support HIPFIRE_GRAPH_PREFILL=1"
+        );
+    }
+    if capture_dir.is_some() {
+        assert!(
+            prompt_file.is_some(),
+            "FFN tensor capture requires a real --prompt-file"
+        );
+        assert_eq!(
+            prefill_runs, 1,
+            "FFN tensor capture requires --prefill-runs 1"
+        );
+        assert!(capture_max_tokens.is_some_and(|tokens| tokens > 0));
+        assert_ne!(
+            std::env::var("HIPFIRE_GRAPH_PREFILL").ok().as_deref(),
+            Some("1"),
+            "FFN tensor capture does not support HIPFIRE_GRAPH_PREFILL=1"
+        );
+        assert_ne!(
+            std::env::var("HIPFIRE_PROFILE").ok().as_deref(),
+            Some("1"),
+            "FFN tensor capture does not support HIPFIRE_PROFILE=1"
+        );
+        assert!(
+            Path::new(model_path).is_file(),
+            "FFN tensor capture currently requires one reproducible HFQ model file"
         );
     }
 
@@ -171,9 +213,8 @@ fn main() {
             let mut hfq = HfqFile::open(model_path_buf).expect("open model");
             let metadata_fingerprint =
                 format!("fnv1a64:{:016x}", fnv1a64(hfq.metadata_json.as_bytes()));
-            let model_sha256 = calibration_out
-                .as_ref()
-                .map(|_| sha256_file(model_path_buf));
+            let model_sha256 = (calibration_out.is_some() || capture_dir.is_some())
+                .then(|| sha256_file(model_path_buf));
             let tokenizer = prompt_file.as_ref().map(|_| {
                 hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
                     .expect("tokenizer from HFQ metadata")
@@ -203,6 +244,19 @@ fn main() {
             )
         };
     eprintln!("Weights loaded in {:.2}s", t_load.elapsed().as_secs_f64());
+    if let Some(layer) = capture_layer {
+        assert!(
+            layer < config.n_layers,
+            "FFN capture layer {layer} is outside model layer count {}",
+            config.n_layers
+        );
+        qwen35::begin_ffn_capture(
+            Path::new(capture_dir.as_deref().expect("capture directory")),
+            layer,
+            capture_max_tokens.expect("capture token cap"),
+        )
+        .expect("begin FFN tensor capture");
+    }
 
     let kv_seq = (prefill_len + warmup_len + gen_len + 16).max(512);
     // KV cache mode via resolved TOML policy:
@@ -628,6 +682,43 @@ fn main() {
             );
         }
     }
+    if let Some(output_dir) = capture_dir {
+        let summary = qwen35::finish_ffn_capture()
+            .expect("finish FFN capture")
+            .expect("FFN capture was configured but no capture state was initialized");
+        let expected_tokens = prefill_len.min(summary.max_tokens);
+        assert_eq!(
+            summary.captured_tokens, expected_tokens,
+            "FFN capture produced {} of {expected_tokens} expected tokens; the selected layer may not use the batched dense FFN path",
+            summary.captured_tokens
+        );
+        let prompt_path = prompt_file
+            .as_deref()
+            .expect("FFN tensor capture requires --prompt-file");
+        let document = serde_json::json!({
+            "version": 1,
+            "kind": "qwen35_ffn_residual_teacher_capture",
+            "model": model_path,
+            "model_bytes": model_bytes,
+            "model_sha256": model_sha256
+                .as_deref()
+                .expect("FFN tensor capture currently requires an HFQ model"),
+            "model_metadata_fingerprint": metadata_fingerprint
+                .as_deref()
+                .expect("FFN tensor capture currently requires an HFQ model"),
+            "prompt_file": prompt_path,
+            "prompt_sha256": sha256_file(Path::new(prompt_path)),
+            "prefill_tokens": prefill_len,
+            "capture": summary,
+        });
+        let output_path = Path::new(&output_dir).join("run_manifest.json");
+        std::fs::write(
+            &output_path,
+            serde_json::to_vec_pretty(&document).expect("serialize FFN capture run manifest"),
+        )
+        .unwrap_or_else(|error| panic!("write {}: {error}", output_path.display()));
+        eprintln!("  FFN tensor capture: {}", output_path.display());
+    }
     let prefill_ms = *prefill_samples_ms.last().unwrap();
     // Captured outside `do_profile` so SUMMARY can split kernel vs wall.
     // None when profiling is disabled (HIPFIRE_PROFILE != 1).
@@ -671,9 +762,7 @@ fn main() {
                 } else {
                     0.0
                 };
-                let shape = shape.map_or_else(String::new, |[m, k, n]| {
-                    format!("M{m} K{k} N{n}")
-                });
+                let shape = shape.map_or_else(String::new, |[m, k, n]| format!("M{m} K{k} N{n}"));
                 eprintln!(
                     "  {kern:45} {shape:24} {n:5}x  {:.1}ms  ({:.0}µs/call)  {:.1}%  {:.1} GiB/s",
                     us / 1000.0,
@@ -832,10 +921,7 @@ fn main() {
     // Read logits to get a valid next token
     let logits = gpu.download_f32(&scratch.logits).unwrap();
     let mut next_token = llama::argmax(&logits);
-    let dump_tokens = std::env::var("HIPFIRE_BENCH_DUMP_TOKENS")
-        .ok()
-        .as_deref()
-        == Some("1");
+    let dump_tokens = std::env::var("HIPFIRE_BENCH_DUMP_TOKENS").ok().as_deref() == Some("1");
     let mut generated_token_ids = dump_tokens.then(|| vec![next_token]);
 
     // === WARMUP ===

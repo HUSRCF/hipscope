@@ -34,7 +34,12 @@ use hipfire_runtime::weight_backend::{
 };
 use hipfire_runtime::{screen_weight_tensor, MmqScreenable};
 use rdna_compute::{DType, Gpu, GpuTensor};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::thread::ThreadId;
 
 /// RMSNorm weight bias for qwen3.5/gemma-style norms: dequant computes `w + norm_bias`.
 /// qwen2/llama use `0.0`. Single source of truth — referenced by the backend constructors
@@ -42,6 +47,264 @@ use serde::Deserialize;
 const QWEN35_NORM_BIAS: f32 = 1.0;
 
 const _: () = assert!(QWEN35_NORM_BIAS == 1.0);
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FfnCaptureChunk {
+    pub index: usize,
+    pub tokens: usize,
+    pub residual_in_file: String,
+    pub residual_out_file: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FfnCaptureSummary {
+    pub version: u32,
+    pub layer: usize,
+    pub hidden_dim: usize,
+    pub dtype: &'static str,
+    pub max_tokens: usize,
+    pub captured_tokens: usize,
+    pub chunks: Vec<FfnCaptureChunk>,
+}
+
+#[derive(Debug)]
+struct FfnCapturePending {
+    index: usize,
+    tokens: usize,
+    residual_in_file: String,
+}
+
+#[derive(Debug)]
+struct FfnCaptureState {
+    dir: PathBuf,
+    summary: FfnCaptureSummary,
+    reserved_tokens: usize,
+    next_index: usize,
+    pending: HashMap<ThreadId, FfnCapturePending>,
+}
+
+static FFN_CAPTURE_ACTIVE: AtomicBool = AtomicBool::new(false);
+static FFN_CAPTURE_STATE: OnceLock<Mutex<Option<FfnCaptureState>>> = OnceLock::new();
+
+fn ffn_capture_state() -> &'static Mutex<Option<FfnCaptureState>> {
+    FFN_CAPTURE_STATE.get_or_init(|| Mutex::new(None))
+}
+
+#[inline(always)]
+fn ffn_capture_active() -> bool {
+    FFN_CAPTURE_ACTIVE.load(Ordering::Acquire)
+}
+
+pub fn begin_ffn_capture(dir: &Path, layer: usize, max_tokens: usize) -> HipResult<()> {
+    if dir.as_os_str().is_empty() {
+        return Err(HipError::new(0, "FFN capture directory must not be empty"));
+    }
+    if max_tokens == 0 {
+        return Err(HipError::new(0, "FFN capture token cap must be positive"));
+    }
+    let mut slot = ffn_capture_state()
+        .lock()
+        .map_err(|_| HipError::new(0, "FFN capture state mutex poisoned"))?;
+    if slot.is_some() {
+        return Err(HipError::new(0, "an FFN capture session is already active"));
+    }
+    if let Some(parent) = dir.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            HipError::new(
+                0,
+                &format!("create FFN capture parent {}: {error}", parent.display()),
+            )
+        })?;
+    }
+    std::fs::create_dir(dir).map_err(|error| {
+        HipError::new(
+            0,
+            &format!("create new FFN capture dir {}: {error}", dir.display()),
+        )
+    })?;
+    *slot = Some(FfnCaptureState {
+        dir: dir.to_path_buf(),
+        summary: FfnCaptureSummary {
+            version: 1,
+            layer,
+            hidden_dim: 0,
+            dtype: "f16-le",
+            max_tokens,
+            captured_tokens: 0,
+            chunks: Vec::new(),
+        },
+        reserved_tokens: 0,
+        next_index: 0,
+        pending: HashMap::new(),
+    });
+    FFN_CAPTURE_ACTIVE.store(true, Ordering::Release);
+    Ok(())
+}
+
+pub fn finish_ffn_capture() -> HipResult<Option<FfnCaptureSummary>> {
+    if !ffn_capture_active() {
+        return Ok(None);
+    }
+    let mut slot = ffn_capture_state()
+        .lock()
+        .map_err(|_| HipError::new(0, "FFN capture state mutex poisoned"))?;
+    let state = slot
+        .as_ref()
+        .ok_or_else(|| HipError::new(0, "FFN capture active flag has no session state"))?;
+    if !state.pending.is_empty() {
+        return Err(HipError::new(
+            0,
+            "cannot finish FFN capture while a prefill call is in flight",
+        ));
+    }
+    let summary = slot.take().map(|state| state.summary);
+    FFN_CAPTURE_ACTIVE.store(false, Ordering::Release);
+    Ok(summary)
+}
+
+#[cfg(test)]
+mod ffn_capture_tests {
+    use super::{begin_ffn_capture, finish_ffn_capture};
+
+    #[test]
+    fn capture_session_resets_and_rejects_existing_output() {
+        let unique = format!(
+            "hipfire-ffn-capture-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let root = std::env::temp_dir().join(unique);
+        let first = root.join("first");
+        let second = root.join("second");
+
+        begin_ffn_capture(&first, 3, 17).unwrap();
+        assert!(begin_ffn_capture(&second, 4, 19).is_err());
+        let first_summary = finish_ffn_capture().unwrap().unwrap();
+        assert_eq!(first_summary.layer, 3);
+        assert_eq!(first_summary.max_tokens, 17);
+
+        begin_ffn_capture(&second, 4, 19).unwrap();
+        let second_summary = finish_ffn_capture().unwrap().unwrap();
+        assert_eq!(second_summary.layer, 4);
+        assert_eq!(second_summary.max_tokens, 19);
+        assert!(begin_ffn_capture(&second, 4, 19).is_err());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+fn write_f16_file(path: &Path, values: Vec<f32>) -> HipResult<()> {
+    let mut bytes = Vec::with_capacity(values.len() * 2);
+    for value in values {
+        bytes.extend_from_slice(&half::f16::from_f32(value).to_le_bytes());
+    }
+    std::fs::write(path, bytes)
+        .map_err(|error| HipError::new(0, &format!("write {}: {error}", path.display())))
+}
+
+fn write_ffn_capture_manifest(state: &FfnCaptureState) -> HipResult<()> {
+    let path = state.dir.join("tensor_manifest.json");
+    let bytes = serde_json::to_vec_pretty(&state.summary)
+        .map_err(|error| HipError::new(0, &format!("serialize {}: {error}", path.display())))?;
+    std::fs::write(&path, bytes)
+        .map_err(|error| HipError::new(0, &format!("write {}: {error}", path.display())))
+}
+
+fn capture_ffn_residual_in(
+    gpu: &Gpu,
+    layer: usize,
+    residual: &GpuTensor,
+    tokens: usize,
+    hidden_dim: usize,
+) -> HipResult<()> {
+    if !ffn_capture_active() {
+        return Ok(());
+    }
+    if gpu.graphs.capture_mode {
+        return Err(HipError::new(0, "FFN tensor capture is not graph-safe"));
+    }
+    let mut slot = ffn_capture_state()
+        .lock()
+        .map_err(|_| HipError::new(0, "FFN capture state mutex poisoned"))?;
+    let state = slot
+        .as_mut()
+        .ok_or_else(|| HipError::new(0, "FFN capture active flag has no session state"))?;
+    if state.summary.layer != layer || state.summary.captured_tokens >= state.summary.max_tokens {
+        return Ok(());
+    }
+    let thread_id = std::thread::current().id();
+    if state.pending.contains_key(&thread_id) {
+        return Err(HipError::new(
+            0,
+            "FFN capture input called twice on one thread before its output was captured",
+        ));
+    }
+    if state.summary.hidden_dim == 0 {
+        state.summary.hidden_dim = hidden_dim;
+    } else if state.summary.hidden_dim != hidden_dim {
+        return Err(HipError::new(0, "FFN capture hidden dimension changed"));
+    }
+    let take = tokens.min(state.summary.max_tokens - state.reserved_tokens);
+    if take == 0 {
+        return Ok(());
+    }
+    let index = state.next_index;
+    state.next_index += 1;
+    state.reserved_tokens += take;
+    let file = format!("chunk_{index:04}_residual_in.f16");
+    let view = residual.sub_offset(0, take * hidden_dim);
+    write_f16_file(&state.dir.join(&file), gpu.download_f32(&view)?)?;
+    state.pending.insert(
+        thread_id,
+        FfnCapturePending {
+            index,
+            tokens: take,
+            residual_in_file: file,
+        },
+    );
+    Ok(())
+}
+
+fn capture_ffn_residual_out(
+    gpu: &Gpu,
+    layer: usize,
+    residual: &GpuTensor,
+    hidden_dim: usize,
+) -> HipResult<()> {
+    if !ffn_capture_active() {
+        return Ok(());
+    }
+    if gpu.graphs.capture_mode {
+        return Err(HipError::new(0, "FFN tensor capture is not graph-safe"));
+    }
+    let mut slot = ffn_capture_state()
+        .lock()
+        .map_err(|_| HipError::new(0, "FFN capture state mutex poisoned"))?;
+    let state = slot
+        .as_mut()
+        .ok_or_else(|| HipError::new(0, "FFN capture active flag has no session state"))?;
+    if state.summary.layer != layer {
+        return Ok(());
+    }
+    let Some(pending) = state.pending.remove(&std::thread::current().id()) else {
+        return Ok(());
+    };
+    let file = format!("chunk_{:04}_residual_out.f16", pending.index);
+    let view = residual.sub_offset(0, pending.tokens * hidden_dim);
+    write_f16_file(&state.dir.join(&file), gpu.download_f32(&view)?)?;
+    state.summary.captured_tokens += pending.tokens;
+    state.summary.chunks.push(FfnCaptureChunk {
+        index: pending.index,
+        tokens: pending.tokens,
+        residual_in_file: pending.residual_in_file,
+        residual_out_file: file,
+    });
+    state.summary.chunks.sort_by_key(|chunk| chunk.index);
+    write_ffn_capture_manifest(&state)
+}
 
 // ─── Config ─────────────────────────────────────────────────────────────
 
@@ -5927,11 +6190,7 @@ impl PrefillBatchScratch {
                 &[max_batch * hidden_dim],
                 DType::F16
             ),
-            up_f16_batch: alloc_opt!(
-                use_f16_ffn_scratch,
-                &[max_batch * hidden_dim],
-                DType::F16
-            ),
+            up_f16_batch: alloc_opt!(use_f16_ffn_scratch, &[max_batch * hidden_dim], DType::F16),
             ffn_hidden_batch: alloc!(&[max_batch * hidden_dim], DType::F32),
             ffn_group_energy: zeros_opt!(
                 gpu.flags.rdna3_ffn_group_calibration && hidden_dim % 256 == 0,
@@ -7777,8 +8036,7 @@ fn try_run_hfq4_group128_swiglu_down(
         || w_down.gpu_dtype != DType::MQ4G256
         || w_down.awq_scale.is_some()
         || w_down.m != 5_120
-        || (w_down.k != 17_408
-            && (!gpu.flags.rdna3_ffn_variable_width || w_down.k % 256 != 0))
+        || (w_down.k != 17_408 && (!gpu.flags.rdna3_ffn_variable_width || w_down.k % 256 != 0))
         || n % 256 != 0
         || gate.dtype != up.dtype
         || !matches!(gate.dtype, DType::F32 | DType::F16)
@@ -9675,6 +9933,10 @@ fn forward_prefill_chunk(
                     )?;
                 }
 
+                if ffn_capture_active() {
+                    capture_ffn_residual_in(gpu, layer_idx, &pbs.x_batch, n, dim)?;
+                }
+
                 // FFN: rmsnorm (+ rotate for MQ).
                 let ffn_is_mq = matches!(
                     layer.w_gate.gpu_dtype,
@@ -10032,6 +10294,10 @@ fn forward_prefill_chunk(
                         layer.w_down.k,
                         n,
                     )?;
+                }
+
+                if ffn_capture_active() {
+                    capture_ffn_residual_out(gpu, layer_idx, &pbs.x_batch, dim)?;
                 }
 
                 // Post-layer hidden extract for the DFlash draft path.
@@ -10557,6 +10823,10 @@ fn forward_prefill_chunk(
 
                 // 10. FFN: rmsnorm (+ rotate for MQ), gate+up, silu_mul
                 // (+ rotate for MQ), w_down residual.
+                if ffn_capture_active() {
+                    capture_ffn_residual_in(gpu, layer_idx, &pbs.x_batch, n, dim)?;
+                }
+
                 let fa_ffn_is_mq = matches!(
                     layer.w_gate.gpu_dtype,
                     DType::MQ4G256
@@ -10901,6 +11171,10 @@ fn forward_prefill_chunk(
                         layer.w_down.k,
                         n,
                     )?;
+                }
+
+                if ffn_capture_active() {
+                    capture_ffn_residual_out(gpu, layer_idx, &pbs.x_batch, dim)?;
                 }
 
                 // Post-layer hidden extract for the DFlash draft path.
