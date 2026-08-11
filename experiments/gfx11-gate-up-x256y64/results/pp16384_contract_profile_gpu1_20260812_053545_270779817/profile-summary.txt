@@ -1,0 +1,31 @@
+=== PROFILE (8216 launches, 14520.5ms wall) ===
+  gemm_hfq4g256_mmq_set_x256y64_perm_group128_quad_row M17408 K5120 N2048        1024x  5024.6ms  (4907µs/call)  38.6%  36.1 GiB/s
+  gemm_hfq4g256_residual_mmq_x256y64_perm_group128_quad_row M5120 K17408 N2048         512x  2574.1ms  (5028µs/call)  19.8%  16.6 GiB/s
+  gemm_hfq4g256_mmq_set_x256y64_perm_group128_quad_row M10240 K5120 N2048         384x  1101.1ms  (2867µs/call)  8.5%  36.3 GiB/s
+  gated_delta_net_q8_batch_seq                                             384x  949.9ms  (2474µs/call)  7.3%  76.7 GiB/s
+  gemm_hfq4g256_residual_mmq_x256y64_perm_group128_quad_row M5120 K6144 N2048          512x  933.0ms  (1822µs/call)  7.2%  30.0 GiB/s
+  gemm_hfq4g256_mmq_set_x256y64_perm_group128_quad_row M6144 K5120 N2048          384x  658.9ms  (1716µs/call)  5.1%  36.4 GiB/s
+  gemm_hfq4g256_mmq_set_x256y64_perm_group128_quad_row M12288 K5120 N2048         128x  433.7ms  (3389µs/call)  3.3%  36.9 GiB/s
+  fused_silu_mul_mq_rotate_q8_group128          M17408 K2048 N0            512x  317.6ms  (620µs/call)  2.4%  488.4 GiB/s
+  conv1d_silu_split_f32_n                                                  384x  315.6ms  (822µs/call)  2.4%  1140.6 GiB/s
+  fused_rmsnorm_mq_rotate_awq_batched                                     1024x  162.6ms  (159µs/call)  1.2%  1008.5 GiB/s
+  gemm_hfq4g256_mmq_set                                                    256x  124.5ms  (486µs/call)  1.0%  21.5 GiB/s
+  gated_norm_f32_batched                                                   384x  103.4ms  (269µs/call)  0.8%  696.6 GiB/s
+  gemm_gate_up_hfq4g256_dot2                                               384x  69.3ms  (181µs/call)  0.5%  113.8 GiB/s
+  mq_rotate_x_batched                                                      512x  65.9ms  (129µs/call)  0.5%  758.9 GiB/s
+  fused_qk_l2_norm_scale_interleave_f32_batched                            384x  63.3ms  (165µs/call)  0.5%  1138.1 GiB/s
+  deinterleave_f32_batched                                                 128x  38.3ms  (299µs/call)  0.3%  469.7 GiB/s
+  rmsnorm_batched                                                          256x  36.3ms  (142µs/call)  0.3%  577.9 GiB/s
+  sigmoid_mul_f32                                                          128x  22.2ms  (173µs/call)  0.2%  1624.2 GiB/s
+  rope_partial_halfsplit_batched_f32                                       128x  12.6ms  (98µs/call)  0.1%  1112.0 GiB/s
+  gemv_hfq4g256                                                              8x  7.9ms  (982µs/call)  0.1%  641.6 GiB/s
+  fused_sigmoid_alpha_gate_f32_batched                                     384x  5.8ms  (15µs/call)  0.0%  97.7 GiB/s
+  rmsnorm_f32                                                                8x  0.2ms  (24µs/call)  0.0%  2.4 GiB/s
+  mq_rotate_x                                                                8x  0.1ms  (13µs/call)  0.0%  3.2 GiB/s
+  TOTAL (serialized)                                                             13020.8ms
+  total: 14520.5ms
+  tok/s: 1128.3
+  NOTE: first prefill run includes kernel JIT compile cost
+PREFILL_SUMMARY  prefill_tok_s=1128.3  prefill_wall_ms=14520.52  prefill_tok_s_kernel=1258.3  prefill_kernel_ms=13020.84  startup_overhead_ms=1499.67  cold_overhead_pct=10.3
+
+=== warmup (2 tokens — untimed, lets JIT settle) ===

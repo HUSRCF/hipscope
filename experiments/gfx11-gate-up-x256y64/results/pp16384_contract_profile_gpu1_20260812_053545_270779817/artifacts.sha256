@@ -1,0 +1,4 @@
+86a5f80fd29d545abb1093dead242725ced6d68b8607c6d566d897b1a82442dc  /home/husrcf/.hipfire/models/qwen3.6-27b.mq4
+900c6da1837b65dbe861774a50bd415d9e16c1a0de08504c0672d72e690c8641  /tmp/libhipfire_flash_attn_ck_quantized_staged.so
+42166f37aa471da8c4fb7446ed0d0052c26a154fbd8c04e590e339fe0b94478e  /home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-prefill-beta-latest/target/release/examples/bench_qwen35_mq4
+a03ee32005668a311af65f0974fc2490be7f70ae12499271a6f10e58cf3f58f3  experiments/gfx11-gate-up-x256y64/run_pp16384_contract_profile.sh
