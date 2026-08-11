@@ -143,6 +143,9 @@ WMMA kernels with a different numerical contract.
 | Lane-major exact MQ4, packed LDS + register decode | 0.448x gate, 0.408x down; zero spills | closed |
 | Row-I8, row-scale, full-K int32 accumulation | 0.404x gate, 0.414x down; 1.88x bytes | closed |
 | Row-Q4, row-scale, full-K int32 accumulation | 0.480x gate, 0.434x down; 0.94x bytes | closed |
+| Independent K16 IU8-WMMA halves plus exact i32 merge | 0.8886x gate, 0.8940x down; bit-exact | closed |
+| Lane-owned affine metadata plus `ds_bpermute` | 0.7672x gate, 0.7607x down; bit-exact | closed |
+| Module-exact gfx11 CU-mode scheduling | PP8192 1144.6 -> 1123.7 tok/s (0.9817x); decode 33.3 -> 33.2 tok/s | closed |
 
 The lossless packed-layout experiments show that eliminating or relocating
 nibble expansion alone did not help the measured gate/up shape. The exact IU4
