@@ -14860,18 +14860,6 @@ fn forward_batch_chunk_impl(
                     }
                 }
 
-                // Batched gated output norm.
-                gpu.gated_norm_f32_batched(
-                    &pbs.dn_attn_out_batch,
-                    &pbs.dn_z_batch,
-                    &layer.norm_weight,
-                    &pbs.dn_normed_batch,
-                    n_v_heads,
-                    config.linear_value_head_dim,
-                    config.norm_eps,
-                    n,
-                )?;
-
                 // Batched wo + residual.
                 //
                 // For MQ weights, the decode path's weight_gemv_residual
@@ -14893,16 +14881,48 @@ fn forward_batch_chunk_impl(
                 let wo_is_mq3_lloyd = matches!(layer.wo.gpu_dtype, DType::MQ3G256Lloyd);
                 let wo_is_fp4 = matches!(layer.wo.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
                 let wo_is_q8 = matches!(layer.wo.gpu_dtype, DType::Q8_0);
-                let wo_input = if wo_is_mq {
-                    // F2: AWQ-aware rotate for linear_attn wo (out_proj) input.
-                    rotate_x_mq_batched_for(
-                        gpu,
-                        &layer.wo,
-                        &pbs.dn_normed_batch,
+                let wo_has_fused_norm_rotate = gated_norm_mq_rotate_batched_enabled(
+                    gpu,
+                    n_v_heads,
+                    config.linear_value_head_dim,
+                    &layer.wo,
+                    n,
+                );
+                if wo_has_fused_norm_rotate {
+                    gpu.gated_norm_rotate_mq_batched_gfx1100(
+                        &pbs.dn_attn_out_batch,
+                        &pbs.dn_z_batch,
+                        &layer.norm_weight,
                         &pbs.dn_normed_rot_batch,
-                        layer.wo.k,
+                        n_v_heads,
+                        config.linear_value_head_dim,
+                        config.norm_eps,
                         n,
                     )?;
+                } else {
+                    gpu.gated_norm_f32_batched(
+                        &pbs.dn_attn_out_batch,
+                        &pbs.dn_z_batch,
+                        &layer.norm_weight,
+                        &pbs.dn_normed_batch,
+                        n_v_heads,
+                        config.linear_value_head_dim,
+                        config.norm_eps,
+                        n,
+                    )?;
+                }
+                let wo_input = if wo_is_mq {
+                    if !wo_has_fused_norm_rotate {
+                        // F2: AWQ-aware rotate for linear_attn wo (out_proj) input.
+                        rotate_x_mq_batched_for(
+                            gpu,
+                            &layer.wo,
+                            &pbs.dn_normed_batch,
+                            &pbs.dn_normed_rot_batch,
+                            layer.wo.k,
+                            n,
+                        )?;
+                    }
                     &pbs.dn_normed_rot_batch
                 } else {
                     &pbs.dn_normed_batch
@@ -16881,16 +16901,6 @@ fn forward_batch_chunk_impl(
                         );
                     }
                 }
-                gpu.gated_norm_f32_batched(
-                    &pbs.dn_attn_out_batch,
-                    &pbs.dn_z_batch,
-                    &layer.norm_weight,
-                    &pbs.dn_normed_batch,
-                    n_v_heads,
-                    config.linear_value_head_dim,
-                    config.norm_eps,
-                    n,
-                )?;
                 // wo + residual. Q8 wo lands un-rotated (Q8 weights were
                 // quantized against un-rotated activations); MQ4/MQ6 wo
                 // require FWHT(awq_scale-adjusted) rotation. Mirrors the
@@ -16902,6 +16912,36 @@ fn forward_batch_chunk_impl(
                 let dn_wo_is_q8 = matches!(layer.wo.gpu_dtype, DType::Q8_0);
                 let dn_wo_is_6bit = matches!(layer.wo.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
                 let dn_wo_is_paro = matches!(layer.wo.gpu_dtype, DType::ParoQ4G128);
+                let dn_wo_has_fused_norm_rotate = gated_norm_mq_rotate_batched_enabled(
+                    gpu,
+                    n_v_heads,
+                    config.linear_value_head_dim,
+                    &layer.wo,
+                    n,
+                );
+                if dn_wo_has_fused_norm_rotate {
+                    gpu.gated_norm_rotate_mq_batched_gfx1100(
+                        &pbs.dn_attn_out_batch,
+                        &pbs.dn_z_batch,
+                        &layer.norm_weight,
+                        &pbs.dn_normed_rot_batch,
+                        n_v_heads,
+                        config.linear_value_head_dim,
+                        config.norm_eps,
+                        n,
+                    )?;
+                } else {
+                    gpu.gated_norm_f32_batched(
+                        &pbs.dn_attn_out_batch,
+                        &pbs.dn_z_batch,
+                        &layer.norm_weight,
+                        &pbs.dn_normed_batch,
+                        n_v_heads,
+                        config.linear_value_head_dim,
+                        config.norm_eps,
+                        n,
+                    )?;
+                }
                 let dn_wo_input = if dn_wo_is_q8 {
                     &pbs.dn_normed_batch
                 } else if dn_wo_is_paro {
@@ -16921,6 +16961,8 @@ fn forward_batch_chunk_impl(
                         layer.wo.k,
                         paro_wo.krot as usize,
                     )?;
+                    &pbs.dn_normed_rot_batch
+                } else if dn_wo_has_fused_norm_rotate {
                     &pbs.dn_normed_rot_batch
                 } else {
                     // F2: AWQ-aware rotate for linear_attn wo (out_proj) input.
@@ -20517,6 +20559,26 @@ fn gated_norm_mq_rotate_enabled(
         && n_v_heads == 32
         && config.linear_value_head_dim == 128
         && wo.k == n_v_heads * config.linear_value_head_dim
+        && wo.gpu_dtype == DType::MQ4G256
+        && wo.awq_scale.is_none()
+}
+
+/// Batched prefill sibling of the certified decode fusion. The shape gate
+/// ensures every 256-value MQ group is exactly two independent 128-value GDN
+/// heads. FeatureFlags resolves the default and escape hatch once at startup.
+fn gated_norm_mq_rotate_batched_enabled(
+    gpu: &Gpu,
+    n_v_heads: usize,
+    head_dim: usize,
+    wo: &WeightTensor,
+    batch_size: usize,
+) -> bool {
+    gpu.flags.rdna3_gdn_norm_rotate_batched
+        && gpu.arch_caps.is_gfx1100()
+        && batch_size > 1
+        && n_v_heads % 2 == 0
+        && head_dim == 128
+        && wo.k == n_v_heads * head_dim
         && wo.gpu_dtype == DType::MQ4G256
         && wo.awq_scale.is_none()
 }

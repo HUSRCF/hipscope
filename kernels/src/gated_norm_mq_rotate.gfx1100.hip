@@ -8,11 +8,12 @@
 #define HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL gated_norm_mq_rotate_gfx1100
 #endif
 
-// gfx1100 Qwen3.6 DeltaNet decode specialization. Two wave32s reproduce two
+// gfx1100 Qwen3.6 DeltaNet specialization. Two wave32s reproduce two
 // independent head_dim=128 gated_norm_f32 workgroups, publish their normalized
 // 256-value group through LDS, then wave 0 performs the exact mq_rotate_x
-// butterfly. This removes the normalized global-memory round trip and one
-// dependent dispatch without changing either operation's arithmetic order.
+// butterfly. Grid.y selects an independent token row; decode keeps grid.y=1.
+// This removes the normalized global-memory round trip and one dependent
+// dispatch without changing either operation's arithmetic order.
 extern "C" __launch_bounds__(64, 1)
 __global__ void HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL(
     const float* __restrict__ x,
@@ -25,7 +26,7 @@ __global__ void HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL(
     int head_dim,
     float eps)
 {
-    if (n_heads != 32 || head_dim != 128) return;
+    if ((n_heads & 1) != 0 || head_dim != 128) return;
 
     __shared__ float normalized[256];
 
@@ -34,9 +35,10 @@ __global__ void HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL(
     const int lane = tid & 31;
     const int group = blockIdx.x;
     const int head = group * 2 + wave;
+    const size_t token_base = (size_t)blockIdx.y * n_heads * head_dim;
 
-    const float* xh = x + head * head_dim;
-    const float* zh = z + head * head_dim;
+    const float* xh = x + token_base + head * head_dim;
+    const float* zh = z + token_base + head * head_dim;
     float* oh = normalized + wave * head_dim;
 
     // Match gated_norm_f32's per-lane accumulation and XOR reduction exactly.
@@ -55,7 +57,7 @@ __global__ void HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL(
     }
     __syncthreads();
 
-    // Each 256-value MQ group spans exactly four normalized heads. One wave
+    // Each 256-value MQ group spans exactly two normalized heads. One wave
     // consumes the LDS row using mq_rotate_x's original lane ownership.
     if (wave != 0) return;
     const int d0 = lane * 8;
@@ -106,7 +108,7 @@ __global__ void HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL(
     #undef HBFLY
 
     const float scale = 0.0625f;
-    float* out = x_rot + group * 256 + d0;
+    float* out = x_rot + token_base + group * 256 + d0;
     float4 out0 = {
         v0 * scale * s20.x,
         v1 * scale * s20.y,

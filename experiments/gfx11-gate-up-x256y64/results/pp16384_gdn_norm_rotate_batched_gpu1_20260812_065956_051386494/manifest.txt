@@ -1,0 +1,9 @@
+date=2026-08-12T07:00:04+08:00
+git_commit=09be6c56564d06cec481b0709f132e80cb8242e8
+gpu_id=1
+prefill_tokens=16384
+prefill_runs=3
+trials=3
+sleep_secs=20
+required_build_features=deltanet,flash-attn-ck
+candidate=batched gated_norm + MQ rotation, exact arithmetic order
