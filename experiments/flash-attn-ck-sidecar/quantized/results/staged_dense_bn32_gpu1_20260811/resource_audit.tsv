@@ -1,0 +1,3 @@
+recipe	trace	lds_bytes	scratch_field_bytes	vgpr_count	sgpr_count	workgroup_size	grid_size
+base_n64	base_n64_kernel_trace.csv	32768	400	256	128	128	3072x32
+candidate_n32	candidate_n32_kernel_trace.csv	32768	400	256	128	128	3072x32
