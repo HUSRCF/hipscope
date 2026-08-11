@@ -1,0 +1,40 @@
+window_start_ns=187237871691011
+window_end_ns=187251935633329
+agent_id=Agent 2
+window_ms=14063.942
+kernel_busy_ms=13943.278
+no_kernel_gap_ms=120.665
+dispatches=10935
+
+category	calls	ms	wall_pct
+packed_mq4_set	2176	7149.458	50.84
+packed_mq4_add	1024	3455.275	24.57
+ck_attention_and_bridges	512	1244.610	8.85
+gated_delta_net_core	384	961.077	6.83
+other	4015	515.042	3.66
+conv1d_silu	384	309.056	2.20
+fused_swiglu_rotate	512	169.435	1.20
+packed_mq4_tail_and_lm_head	392	73.428	0.52
+q8_activation_quantization	1536	65.896	0.47
+
+top_kernel	calls	ms	wall_pct
+gemm_hfq4g256_mmq_x256y64_group128_quad_row_f16_output_full_set_f16	1024	5056.623	35.95
+gemm_hfq4g256_mmq_x256y64_group128_quad_row_u32x2_full_add	512	2596.052	18.46
+gemm_hfq4g256_mmq_x256y64_group256_serial_row_full_set	1152	2092.835	14.88
+void ck_tile::kentry<ck_tile::gfx11_t, 1, ck_tile::FmhaFwdKernel<ck_tile::BlockFmhaPipelineQRKSVS<ck_tile::BlockFmhaPipelineProblem<_Float16, _Float16, _Float16, float, float, _Float16, unsigned char, float, _Float16, float, _Float16, ck_tile::TileFmhaShape<ck_tile::sequence<64, 64, 32, 256, 32, 256>, ck_tile::sequence<4, 1, 1>, ck_tile::sequence<16, 16, 16>, ck_tile::sequence<4, 1, 1>, ck_tile::sequence<16, 16, 16>, true>, false, ck_tile::ComposedAttention<0u, true>, ck_tile::SimplifiedGenericAttentionMask<true>, false, ck_tile::TileFmhaTraits<false, false, false, false, false, (ck_tile::BlockAttentionBiasEnum)0, false, false, false, (ck_tile::BlockAttentionQuantScaleEnum)0, -1, false> >, ck_tile::BlockFmhaPipelineQXKSVSCustomPolicy<true, false, 1, 1> >, ck_tile::DefaultGemm2DEpilogue<ck_tile::DefaultGemm2DEpilogueProblem<_Float16, _Float16, ck_tile::tuple<>, float, _Float16, ck_tile::tuple<>, ck_tile::tensor_layout::gemm::RowMajor, ck_tile::element_wise::PassThrough, 64, 256, false, false, 16, 16, 16, true, true, (ck_tile::memory_operation_enum)0>, void> >, ck_tile::FmhaFwdKernel<ck_tile::BlockFmhaPipelineQRKSVS<ck_tile::BlockFmhaPipelineProblem<_Float16, _Float16, _Float16, float, float, _Float16, unsigned char, float, _Float16, float, _Float16, ck_tile::TileFmhaShape<ck_tile::sequence<64, 64, 32, 256, 32, 256>, ck_tile::sequence<4, 1, 1>, ck_tile::sequence<16, 16, 16>, ck_tile::sequence<4, 1, 1>, ck_tile::sequence<16, 16, 16>, true>, false, ck_tile::ComposedAttention<0u, true>, ck_tile::SimplifiedGenericAttentionMask<true>, false, ck_tile::TileFmhaTraits<false, false, false, false, false, (ck_tile::BlockAttentionBiasEnum)0, false, false, false, (ck_tile::BlockAttentionQuantScaleEnum)0, -1, false> >, ck_tile::BlockFmhaPipelineQXKSVSCustomPolicy<true, false, 1, 1> >, ck_tile::DefaultGemm2DEpilogue<ck_tile::DefaultGemm2DEpilogueProblem<_Float16, _Float16, ck_tile::tuple<>, float, _Float16, ck_tile::tuple<>, ck_tile::tensor_layout::gemm::RowMajor, ck_tile::element_wise::PassThrough, 64, 256, false, false, 16, 16, 16, true, true, (ck_tile::memory_operation_enum)0>, void> >::FmhaFwdBatchModeKargs>(ck_tile::FmhaFwdKernel<ck_tile::BlockFmhaPipelineQRKSVS<ck_tile::BlockFmhaPipelineProblem<_Float16, _Float16, _Float16, float, float, _Float16, unsigned char, float, _Float16, float, _Float16, ck_tile::TileFmhaShape<ck_tile::sequence<64, 64, 32, 256, 32, 256>, ck_tile::sequence<4, 1, 1>, ck_tile::sequence<16, 16, 16>, ck_tile::sequence<4, 1, 1>, ck_tile::sequence<16, 16, 16>, true>, false, ck_tile::ComposedAttention<0u, true>, ck_tile::SimplifiedGenericAttentionMask<true>, false, ck_tile::TileFmhaTraits<false, false, false, false, false, (ck_tile::BlockAttentionBiasEnum)0, false, false, false, (ck_tile::BlockAttentionQuantScaleEnum)0, -1, false> >, ck_tile::BlockFmhaPipelineQXKSVSCustomPolicy<true, false, 1, 1> >, ck_tile::DefaultGemm2DEpilogue<ck_tile::DefaultGemm2DEpilogueProblem<_Float16, _Float16, ck_tile::tuple<>, float, _Float16, ck_tile::tuple<>, ck_tile::tensor_layout::gemm::RowMajor, ck_tile::element_wise::PassThrough, 64, 256, false, false, 16, 16, 16, true, true, (ck_tile::memory_operation_enum)0>, void> >::FmhaFwdBatchModeKargs)	128	1145.975	8.15
+gated_delta_net_q8_fast	384	961.077	6.83
+gemm_hfq4g256_mmq_x256y64_group256_serial_row_full_add	512	859.224	6.11
+conv1d_silu_split_f32	384	309.056	2.20
+fused_silu_mul_mq_rotate_q8_group128_f16	512	169.435	1.20
+fused_rmsnorm_mq_rotate_awq	1024	153.668	1.09
+gated_norm_f32	384	98.378	0.70
+hipfire::ck_attention::predecode_asym3_k_q8_v_f16(unsigned char const*, unsigned char const*, __half*, __half*, int, int, int)	128	86.373	0.61
+gemm_gate_up_hfq4g256_dot2	384	65.739	0.47
+fused_qk_l2_norm_scale_interleave_f32_batched	384	58.904	0.42
+mq_rotate_x	520	56.503	0.40
+quantize_q8_1_mmq_ds4_group256	1024	46.116	0.33
+convert_f32_to_f16	384	39.262	0.28
+deinterleave_f32_batched	128	36.663	0.26
+rmsnorm_f32	264	34.281	0.24
+sigmoid_mul_f32	128	20.579	0.15
+quantize_q8_1_mmq_ds4_group128	512	19.779	0.14
