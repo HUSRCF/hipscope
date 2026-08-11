@@ -18729,6 +18729,81 @@ impl Gpu {
         )
     }
 
+    /// Group256 serial-row math with FP16 output storage for FFN gate/up.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_hfq4g256_mmq_prequant_x256y64_group256_serial_row_f16_output(
+        &mut self,
+        a_raw: &GpuTensor,
+        x_q8_ptr: *mut c_void,
+        y_f16: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if !self.arch_caps.is_gfx1100()
+            || y_f16.dtype != DType::F16
+            || m % 64 != 0
+            || k % 256 != 0
+            || batch_size % 256 != 0
+        {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "group256 serial-row F16 output requires gfx1100, F16 output, and aligned M/K/N",
+            ));
+        }
+        const MODULE: &str = "gemm_hfq4g256_mmq_x256y64_group256_serial_row_f16_output";
+        const KERNEL: &str =
+            "gemm_hfq4g256_mmq_x256y64_group256_serial_row_f16_output_full_set_f16";
+        static SRC: OnceLock<String> = OnceLock::new();
+        let src = SRC.get_or_init(|| {
+            let body = kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_SRC.replace(
+                "gemm_hfq4g256_residual_mmq",
+                MODULE,
+            );
+            format!(
+                "#define MMQ_X 256\n#define MMQ_Y 64\n#define MMQ_ROW_FRAGS 2\n#define MMQ_COL_GROUPS 4\n#define MMQ_PERM_NIBBLE 1\n#define MMQ_Q8_GROUP256_DIRECT 1\n#define MMQ_Q8_GROUP256_SERIAL_ROW 1\n{body}",
+            )
+        });
+        self.ensure_kernel(MODULE, src, KERNEL)?;
+
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut xq_ptr = x_q8_ptr;
+        let mut y_ptr = y_f16.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+        let mut ignored = 0i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut xq_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+            &mut ignored as *mut _ as *mut c_void,
+        ];
+        let shared_mem = (64 * 76 * std::mem::size_of::<i32>()) as u32;
+        self.launch_maybe_blob(
+            KERNEL,
+            [(m / 64) as u32, (batch_size / 256) as u32, 1],
+            [32, 8, 1],
+            shared_mem,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(xq_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b.push_i32(ignored);
+                b
+            },
+        )
+    }
+
     /// Standalone group256 serial-row probe using the exact quad-row weight
     /// staging already retained by the group128 production path.
     #[allow(clippy::too_many_arguments)]

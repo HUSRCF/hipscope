@@ -12,6 +12,8 @@ MAX_TOKENS="${MAX_TOKENS:-128}"
 CTX="${CTX:-8192}"
 SLEEP_SECS="${SLEEP_SECS:-5}"
 GROUP256_SCOPE="${GROUP256_SCOPE:-all}"
+REQUIRE_CK="${REQUIRE_CK:-1}"
+F16_INTERMEDIATE="${HIPFIRE_RDNA3_FFN_F16_INTERMEDIATE:-0}"
 BIN="${BIN:-${ROOT}/target/release/examples/greedy_dump}"
 CK_LIB="${HIPFIRE_FLASH_ATTN_CK_QUANTIZED_LIB:-${ROOT}/experiments/flash-attn-ck-sidecar/quantized/build/libhipfire_flash_attn_ck_quantized.so}"
 
@@ -54,16 +56,18 @@ run_one() {
         HIPFIRE_RDNA3_Q8_GROUP128=1 \
         HIPFIRE_RDNA3_Q8_GROUP128_ROW2=1 \
         HIPFIRE_RDNA3_FUSED_SWIGLU_Q8_GROUP128=1 \
+        HIPFIRE_RDNA3_FFN_F16_INTERMEDIATE="${F16_INTERMEDIATE}" \
         HIPFIRE_RDNA3_Q8_GROUP256_SERIAL_ROW="${group256_all}" \
         HIPFIRE_RDNA3_Q8_GROUP256_GATE_UP="${group256_gate_up}" \
         PROMPT_MODE=thinking \
         "${BIN}" "${MODEL}" "${tokens}" "${prompt}" \
         > "${log}" 2>&1
 
-    rg -q '^loaded optional quantized FlashAttention CK sidecar:' "${log}" || {
+    if [[ "${REQUIRE_CK}" == "1" ]] &&
+       ! rg -q '^loaded optional quantized FlashAttention CK sidecar:' "${log}"; then
         echo "quantized CK sidecar was not loaded: ${log}" >&2
         return 1
-    }
+    fi
     if [[ "${group256}" == "1" ]]; then
         rg -q '^RDNA3 Q8 group256 gate/up prefill active:' "${log}" || {
             echo "group256 serial-row route was not active: ${log}" >&2

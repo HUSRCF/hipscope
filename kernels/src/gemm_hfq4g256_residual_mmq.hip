@@ -2179,12 +2179,12 @@ gemm_hfq4g256_group128_direct_full_body(
 #endif
 
 #if MMQ_Q8_GROUP256_DIRECT
-template <bool ADD>
+template <bool ADD, typename OutputT = float>
 static __device__ __forceinline__ void
 gemm_hfq4g256_group256_direct_full_body(
     const char* __restrict__ A,
     const block_q8_1_mmq* __restrict__ Xq,
-    float* __restrict__ Y,
+    OutputT* __restrict__ Y,
     int M,
     int K,
     int N
@@ -2221,7 +2221,7 @@ gemm_hfq4g256_group256_direct_full_body(
                 const int j = j0 + (threadIdx.y % col_groups) * tile_C::J
                     + tile_C::get_j(l);
                 const int i = i0 + n * tile_C::I + tile_C::get_i(l);
-                float* dst = Y + (long long)(col0 + j) * M + row0 + i;
+                OutputT* dst = Y + (long long)(col0 + j) * M + row0 + i;
                 const int acc = (j0 / (col_groups * tile_C::J)) * row_frags + n;
                 if constexpr (ADD) {
                     *dst += sum[acc * tile_C::ne + l];
@@ -3511,7 +3511,11 @@ void gemm_hfq4g256_residual_mmq_full_set_f16(
     int N,
     int
 ) {
+#if MMQ_Q8_GROUP256_DIRECT
+    gemm_hfq4g256_group256_direct_full_body<false, half>(A, Xq, Y, M, K, N);
+#else
     gemm_hfq4g256_residual_mmq_full_body<false, true, false, half>(A, Xq, Y, M, K, N);
+#endif
 }
 
 extern "C" __global__ __launch_bounds__(MMQ_NWARPS * WARP_SIZE, 2)

@@ -339,6 +339,108 @@ fn main() {
     println!("f16_max_abs={f16_max_abs:.8e}");
     println!("f16_mean_abs={:.8e}", f16_mean_abs / count as f64);
 
+    let run_group128_f16_fresh = |gpu: &mut Gpu| {
+        let xq = gpu.ensure_q8_1_mmq_x(&x, n, k).expect("group128 quantize X");
+        gpu.gemm_hfq4g256_mmq_prequant_x256y64_group128_quad_row_f16_output(
+            &gate_weight,
+            xq,
+            &f16_gate,
+            m,
+            k,
+            n,
+        )
+        .expect("group128 F16 gate");
+        gpu.gemm_hfq4g256_mmq_prequant_x256y64_group128_quad_row_f16_output(
+            &up_weight,
+            xq,
+            &f16_up,
+            m,
+            k,
+            n,
+        )
+        .expect("group128 F16 up");
+        gpu.hip.device_synchronize().expect("sync group128 F16 pair");
+    };
+    let run_group256_f16_fresh = |gpu: &mut Gpu| {
+        let xq = gpu
+            .ensure_q8_1_mmq_group256_x(&x, n, k)
+            .expect("group256 quantize X");
+        gpu.gemm_hfq4g256_mmq_prequant_x256y64_group256_serial_row_f16_output(
+            &gate_weight,
+            xq,
+            &f16_gate,
+            m,
+            k,
+            n,
+        )
+        .expect("group256 F16 gate");
+        gpu.gemm_hfq4g256_mmq_prequant_x256y64_group256_serial_row_f16_output(
+            &up_weight,
+            xq,
+            &f16_up,
+            m,
+            k,
+            n,
+        )
+        .expect("group256 F16 up");
+        gpu.hip.device_synchronize().expect("sync group256 F16 pair");
+    };
+    for _ in 0..3 {
+        run_group128_f16_fresh(&mut gpu);
+        run_group256_f16_fresh(&mut gpu);
+    }
+    let mut group128_f16_ms = Vec::with_capacity(pairs);
+    let mut group256_f16_ms = Vec::with_capacity(pairs);
+    for pair in 0..pairs {
+        let group128_first = pair % 2 == 0;
+        for group128_mode in [group128_first, !group128_first] {
+            let start = Instant::now();
+            if group128_mode {
+                run_group128_f16_fresh(&mut gpu);
+                group128_f16_ms.push(start.elapsed().as_secs_f64() * 1_000.0);
+            } else {
+                run_group256_f16_fresh(&mut gpu);
+                group256_f16_ms.push(start.elapsed().as_secs_f64() * 1_000.0);
+            }
+        }
+    }
+    run_group256_f16_fresh(&mut gpu);
+    let mut group256_gate_raw = vec![0u8; f16_gate.byte_size()];
+    let mut group256_up_raw = vec![0u8; f16_up.byte_size()];
+    gpu.hip
+        .memcpy_dtoh(&mut group256_gate_raw, &f16_gate.buf)
+        .expect("download group256 F16 gate");
+    gpu.hip
+        .memcpy_dtoh(&mut group256_up_raw, &f16_up.buf)
+        .expect("download group256 F16 up");
+    let group128_values = f16_gate_raw
+        .chunks_exact(2)
+        .chain(f16_up_raw.chunks_exact(2))
+        .map(|bytes| f16_to_f32(u16::from_le_bytes([bytes[0], bytes[1]])));
+    let group256_values = group256_gate_raw
+        .chunks_exact(2)
+        .chain(group256_up_raw.chunks_exact(2))
+        .map(|bytes| f16_to_f32(u16::from_le_bytes([bytes[0], bytes[1]])));
+    let (group256_max_abs, group256_mean_abs, group256_count) = group128_values
+        .zip(group256_values)
+        .fold((0.0f32, 0.0f64, 0usize), |(max_abs, sum, count), (a, b)| {
+            let diff = (a - b).abs();
+            (max_abs.max(diff), sum + diff as f64, count + 1)
+        });
+    let group128_f16_median = median(&mut group128_f16_ms);
+    let group256_f16_median = median(&mut group256_f16_ms);
+    println!("group128_f16_quant_plus_pair_ms={group128_f16_median:.4}");
+    println!("group256_f16_quant_plus_pair_ms={group256_f16_median:.4}");
+    println!(
+        "group256_f16_quant_plus_pair_speedup={:.4}x",
+        group128_f16_median / group256_f16_median
+    );
+    println!("group256_f16_cross_path_max_abs={group256_max_abs:.8e}");
+    println!(
+        "group256_f16_cross_path_mean_abs={:.8e}",
+        group256_mean_abs / group256_count as f64
+    );
+
     let run_f32_ffn = |gpu: &mut Gpu, stream: &mut Option<hip_bridge::Stream>| {
         gpu.active_stream = stream.take();
         launch_projection(gpu, &gate_weight, xq, &serial_gate, m, k, n);
