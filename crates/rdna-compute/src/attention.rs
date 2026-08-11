@@ -4804,7 +4804,35 @@ impl Gpu {
                         .is_some_and(|required| required > 0 && partials.buf.size() >= required)
                         && sidecar.is_staged_supported(&params).is_ok()
                     {
-                        unsafe { sidecar.staged_prefill(&params) }.map_err(|error| {
+                        let bytes = batch_size
+                            .checked_mul(n_heads)
+                            .and_then(|value| value.checked_mul(head_dim))
+                            .and_then(|value| value.checked_mul(8))
+                            .and_then(|q_bytes| {
+                                max_ctx_len
+                                    .checked_mul(n_kv_heads)
+                                    .and_then(|value| value.checked_mul(100 + 272))
+                                    .and_then(|kv_bytes| q_bytes.checked_add(kv_bytes))
+                            })
+                            .unwrap_or(0);
+                        // The generic profile timer records on the null stream.
+                        // Skip it for explicit-stream callers rather than report
+                        // an unrelated interval.
+                        let timer = if self.active_stream.is_none() {
+                            crate::profile::begin_timer(
+                                &self.hip,
+                                "attention",
+                                "flash_attn_ck_quantized_staged_prefill",
+                                bytes,
+                            )
+                        } else {
+                            None
+                        };
+                        let result = unsafe { sidecar.staged_prefill(&params) };
+                        if let Some(timer) = timer {
+                            timer.finish(&self.hip);
+                        }
+                        result.map_err(|error| {
                             hip_bridge::HipError::new(
                                 0,
                                 &format!(
@@ -4828,7 +4856,32 @@ impl Gpu {
                     }
 
                     if sidecar.is_supported(&params).is_ok() {
-                        unsafe { sidecar.prefill(&params) }.map_err(|error| {
+                        let bytes = batch_size
+                            .checked_mul(n_heads)
+                            .and_then(|value| value.checked_mul(head_dim))
+                            .and_then(|value| value.checked_mul(8))
+                            .and_then(|q_bytes| {
+                                max_ctx_len
+                                    .checked_mul(n_kv_heads)
+                                    .and_then(|value| value.checked_mul(100 + 272))
+                                    .and_then(|kv_bytes| q_bytes.checked_add(kv_bytes))
+                            })
+                            .unwrap_or(0);
+                        let timer = if self.active_stream.is_none() {
+                            crate::profile::begin_timer(
+                                &self.hip,
+                                "attention",
+                                "flash_attn_ck_quantized_prefill",
+                                bytes,
+                            )
+                        } else {
+                            None
+                        };
+                        let result = unsafe { sidecar.prefill(&params) };
+                        if let Some(timer) = timer {
+                            timer.finish(&self.hip);
+                        }
+                        result.map_err(|error| {
                             hip_bridge::HipError::new(
                                 0,
                                 &format!("quantized FlashAttention CK launch failed: {error}"),

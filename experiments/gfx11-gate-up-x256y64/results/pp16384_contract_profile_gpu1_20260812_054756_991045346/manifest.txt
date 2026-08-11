@@ -1,0 +1,8 @@
+date=2026-08-12T05:48:48+08:00
+git_commit=feae22afe175d1ae2ef89fbc322f60630648f27c
+gpu_id=1
+prefill_tokens=16384
+prefill_batch=2048
+activation_contract=group128
+ffn_intermediate=F32
+ck_sidecar=on
