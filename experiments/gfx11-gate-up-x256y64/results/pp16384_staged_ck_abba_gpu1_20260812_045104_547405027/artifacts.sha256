@@ -1,0 +1,3 @@
+86a5f80fd29d545abb1093dead242725ced6d68b8607c6d566d897b1a82442dc  /home/husrcf/.hipfire/models/qwen3.6-27b.mq4
+900c6da1837b65dbe861774a50bd415d9e16c1a0de08504c0672d72e690c8641  /tmp/libhipfire_flash_attn_ck_quantized_staged.so
+3cc65f15be969a29ba513cf91692e38b82e4109c9afe3e7e54a3c1410c96aa65  /home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-prefill-beta-latest/target/release/examples/bench_qwen35_mq4

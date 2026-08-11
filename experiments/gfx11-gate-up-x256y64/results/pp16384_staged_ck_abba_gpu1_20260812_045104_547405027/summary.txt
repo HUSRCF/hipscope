@@ -1,0 +1,4 @@
+off_mean_tok_s=510.650
+on_mean_tok_s=1147.500
+speedup=2.247136
+delta_pct=124.714

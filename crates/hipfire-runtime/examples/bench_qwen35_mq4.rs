@@ -681,6 +681,14 @@ fn main() {
 
     // Read logits to get a valid next token
     let logits = gpu.download_f32(&scratch.logits).unwrap();
+    if let Ok(path) = std::env::var("HIPFIRE_BENCH_DUMP_PREFILL_LOGITS") {
+        let mut bytes = Vec::with_capacity(logits.len() * std::mem::size_of::<f32>());
+        for value in &logits {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        std::fs::write(&path, &bytes).expect("write prefill logits");
+        eprintln!("PREFILL_LOGITS path={path} values={}", logits.len());
+    }
     let mut next_token = llama::argmax(&logits);
     let dump_tokens = std::env::var("HIPFIRE_BENCH_DUMP_TOKENS")
         .ok()
