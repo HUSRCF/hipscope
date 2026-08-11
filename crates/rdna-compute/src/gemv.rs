@@ -169,6 +169,73 @@ pub(crate) fn e8_soa_experts_enabled() -> bool {
 }
 
 impl Gpu {
+    /// Diagnostic-only accumulation of per-layer, per-256-channel SwiGLU
+    /// energy. The accumulator is persistent across prefill chunks and calls.
+    pub fn accumulate_ffn_group_energy(
+        &mut self,
+        gate: &GpuTensor,
+        up: &GpuTensor,
+        energy: &GpuTensor,
+        k: usize,
+        batch_size: usize,
+        layer: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if gate.dtype != up.dtype
+            || !matches!(gate.dtype, DType::F32 | DType::F16)
+            || energy.dtype != DType::F32
+            || k % 256 != 0
+            || gate.numel() < batch_size * k
+            || up.numel() < batch_size * k
+            || energy.numel() < (layer + 1) * (k / 256)
+        {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "FFN group calibration requires matching F32/F16 gate/up, K%256=0, and a sized F32 accumulator",
+            ));
+        }
+
+        const MODULE: &str = "ffn_group_energy";
+        let kernel = if gate.dtype == DType::F16 {
+            "ffn_group_energy_f16"
+        } else {
+            "ffn_group_energy_f32"
+        };
+        self.ensure_kernel(MODULE, kernels::FFN_GROUP_ENERGY_SRC, kernel)?;
+
+        let mut gate_ptr = gate.buf.as_ptr();
+        let mut up_ptr = up.buf.as_ptr();
+        let mut energy_ptr = energy.buf.as_ptr();
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+        let mut layer_val = layer as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut gate_ptr as *mut _ as *mut c_void,
+            &mut up_ptr as *mut _ as *mut c_void,
+            &mut energy_ptr as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+            &mut layer_val as *mut _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            kernel,
+            [(k / 256) as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(gate_ptr);
+                b.push_ptr(up_ptr);
+                b.push_ptr(energy_ptr);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b.push_i32(layer_val);
+                b
+            },
+        )
+    }
+
     /// Q4_LUT GEMV: 4-bit with LDS codebook lookup. 48 bytes per 32 elements.
     pub fn gemv_q4lut(
         &mut self,

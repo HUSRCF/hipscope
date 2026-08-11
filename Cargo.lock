@@ -1021,6 +1021,7 @@ dependencies = [
  "safetensors",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
 ]
 
@@ -1079,6 +1080,7 @@ dependencies = [
  "safetensors",
  "serde",
  "serde_json",
+ "sha2",
  "smallvec",
  "tempfile",
  "tracing",

@@ -7283,6 +7283,8 @@ pub struct PrefillBatchScratch {
     pub up_f16_batch: Option<GpuTensor>,
     // SwiGLU output (FWHT-rotated for MQ4) feeding w_down.
     pub ffn_hidden_batch: GpuTensor,
+    // Diagnostic-only [n_layers × hidden_dim/256] accumulated SwiGLU energy.
+    pub ffn_group_energy: Option<GpuTensor>,
 
     // FWHT-rotated dn_normed [N × v_dim] feeding wo for MQ4 weights.
     // Decode path handles this via an internal mq_x_rot scratch inside
@@ -7458,6 +7460,31 @@ impl PrefillBatchScratch {
             };
         }
 
+        macro_rules! zeros_opt {
+            ($cond:expr, $shape:expr, $dt:expr) => {
+                if $cond {
+                    match gpu.zeros($shape, $dt) {
+                        Ok(t) => {
+                            ledger.push(GpuTensor {
+                                buf: unsafe { t.buf.alias() },
+                                shape: t.shape.clone(),
+                                dtype: t.dtype,
+                            });
+                            Some(t)
+                        }
+                        Err(e) => {
+                            for prev in ledger.drain(..) {
+                                let _ = gpu.free_tensor(prev);
+                            }
+                            return Err(e);
+                        }
+                    }
+                } else {
+                    None
+                }
+            };
+        }
+
         // Hoisted grouped-GEMM sizing (same value across the Path-2 fields).
         let grouped_m_total_max =
             moe_grouped_m_total_max(max_batch, config.num_experts_per_tok, config.num_experts);
@@ -7504,6 +7531,11 @@ impl PrefillBatchScratch {
                 DType::F16
             ),
             ffn_hidden_batch: alloc!(&[max_batch * hidden_dim], DType::F32),
+            ffn_group_energy: zeros_opt!(
+                gpu.flags.rdna3_ffn_group_calibration && hidden_dim % 256 == 0,
+                &[config.n_layers * (hidden_dim / 256)],
+                DType::F32
+            ),
             dn_normed_rot_batch: alloc!(&[max_batch * v_dim], DType::F32),
             // F32 dtype = 4 bytes/element, same layout as i32. The rope /
             // attention / kv_write kernels cast the pointer to `const int*`,
@@ -7704,6 +7736,7 @@ impl PrefillBatchScratch {
             self.dn_s_tape_q8,
             self.dn_s_tape_scales,
             self.dn_s_tape_f32,
+            self.ffn_group_energy,
         ] {
             if let Some(t) = t {
                 note(gpu.free_tensor(t));
@@ -15325,6 +15358,17 @@ fn forward_batch_chunk_impl(
                 let w_down_is_fp4 =
                     matches!(layer.w_down.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
                 let w_down_is_q8 = matches!(layer.w_down.gpu_dtype, DType::Q8_0);
+                if let Some(energy) = pbs.ffn_group_energy.as_ref() {
+                    let (gate, up) = if use_f16_ffn {
+                        (
+                            pbs.gate_ffn_f16_batch.as_ref().unwrap(),
+                            pbs.up_f16_batch.as_ref().unwrap(),
+                        )
+                    } else {
+                        (&pbs.gate_ffn_batch, &pbs.up_batch)
+                    };
+                    gpu.accumulate_ffn_group_energy(gate, up, energy, hidden_dim, n, layer_idx)?;
+                }
                 let direct_group128_down = if use_f16_ffn {
                     try_run_hfq4_group128_swiglu_down(
                         gpu,
@@ -16206,6 +16250,17 @@ fn forward_batch_chunk_impl(
                 let fa_w_down_is_fp4 =
                     matches!(layer.w_down.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
                 let fa_w_down_is_q8 = matches!(layer.w_down.gpu_dtype, DType::Q8_0);
+                if let Some(energy) = pbs.ffn_group_energy.as_ref() {
+                    let (gate, up) = if use_f16_ffn {
+                        (
+                            pbs.gate_ffn_f16_batch.as_ref().unwrap(),
+                            pbs.up_f16_batch.as_ref().unwrap(),
+                        )
+                    } else {
+                        (&pbs.gate_ffn_batch, &pbs.up_batch)
+                    };
+                    gpu.accumulate_ffn_group_energy(gate, up, energy, hidden_dim, n, layer_idx)?;
+                }
                 let direct_group128_down = if use_f16_ffn {
                     try_run_hfq4_group128_swiglu_down(
                         gpu,

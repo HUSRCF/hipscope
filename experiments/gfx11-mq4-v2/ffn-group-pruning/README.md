@@ -80,3 +80,52 @@ At 1303 tok/s, reaching 1500 tok/s requires a 1.151x overall speedup. With
 whole packed family. Restricting the optimization to gate/up/down requires
 about 1.324x. Further width reduction is not admissible without activation
 calibration and quality recovery.
+
+## Activation-aware follow-up
+
+The default-off `HIPFIRE_RDNA3_FFN_GROUP_CALIBRATION=1` diagnostic collects
+per-layer sums of squared `silu(gate) * up` values for each 256-channel group.
+`prune_dense_ffn_groups --activation-energy FILE.json` combines that measured
+activation energy with the corresponding down-projection input-group weight
+energy. This preserves the same 60/68 shape and runtime path while replacing
+the static gate/up/down weight-only ranking.
+
+The calibration used the first 3072 real tokens from `docs/testINPUT.md`:
+
+```bash
+HIP_VISIBLE_DEVICES=1 \
+HIPFIRE_PREFILL_REUSE_PBS=1 \
+HIPFIRE_RDNA3_FFN_GROUP_CALIBRATION=1 \
+HIPFIRE_RDNA3_FFN_GROUP_CALIBRATION_OUT=/tmp/ffn-energy.json \
+target/release/examples/bench_qwen35_mq4 \
+  "$HOME/.hipfire/models/qwen3.6-27b.mq4" \
+  --prefill 3072 --prefill-runs 1 --warmup 0 --gen 1 \
+  --prompt-file docs/testINPUT.md
+
+target/release/examples/prune_dense_ffn_groups \
+  --input "$HOME/.hipfire/models/qwen3.6-27b.mq4" \
+  --keep-groups 60 \
+  --activation-energy /tmp/ffn-energy.json \
+  --output /tmp/qwen3.6-27b-ffn60g-activation.mq4
+```
+
+The calibration JSON contained all 64 layers and all 68 groups per layer, with
+no zero or non-finite measurements. Export requires a real prompt, one prefill
+run, and graph-prefill disabled; the converter also checks the full model
+SHA-256, byte size, metadata fingerprint, and hidden width before accepting the
+calibration.
+Quality was then measured on the existing fixed 512-token window (`warmup=8`,
+`offset=0`):
+
+| model/ranking | PPL | delta vs original |
+| --- | ---: | ---: |
+| original 68/68 | 4.2070 | - |
+| static weight-energy 60/68 | 5.0505 | +20.05% |
+| activation x down-weight energy 60/68 | 5.1319 | +21.99% |
+
+This in-domain test is already optimistic because calibration and evaluation
+come from the same source document. The activation-aware ranking did not
+recover quality even under that favorable condition, so structured 60/68 FFN
+reduction remains rejected as a production route. The calibration hook is kept
+as diagnostic infrastructure for future execution-format analysis; it is
+disabled by default and adds no allocation or kernel launch to normal serving.

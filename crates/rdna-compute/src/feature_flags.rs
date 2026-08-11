@@ -105,6 +105,9 @@ pub struct FeatureFlags {
     /// Admit 256-aligned experimental dense-FFN widths to the gfx1100 FP16
     /// intermediate and group128 down-projection path.
     pub rdna3_ffn_variable_width: bool,
+    /// Diagnostic-only per-layer SwiGLU group-energy collection. Default off;
+    /// production dispatch pays no allocation or launch cost.
+    pub rdna3_ffn_group_calibration: bool,
     pub fp8_wmma: bool,
     pub dot2_gemv: bool,
     pub gcn5_wave64_hybrid: Option<bool>,
@@ -484,6 +487,8 @@ impl FeatureFlags {
                 == Ok("1"),
             rdna3_ffn_variable_width: value("HIPFIRE_RDNA3_FFN_VARIABLE_WIDTH").as_deref()
                 == Ok("1"),
+            rdna3_ffn_group_calibration: value("HIPFIRE_RDNA3_FFN_GROUP_CALIBRATION").as_deref()
+                == Ok("1"),
             fp8_wmma: value("HIPFIRE_FP8_WMMA").map_or(false, |v| v == "1"),
             dot2_gemv: value("HIPFIRE_DOT2_GEMV").map_or(false, |v| v == "1"),
             gcn5_wave64_hybrid: parse_bool("HIPFIRE_GCN5_WAVE64_HYBRID"),
@@ -766,6 +771,7 @@ impl FeatureFlags {
             rdna3_fused_swiglu_q8_group128: false,
             rdna3_ffn_f16_intermediate: false,
             rdna3_ffn_variable_width: false,
+            rdna3_ffn_group_calibration: false,
             fp8_wmma: false,
             dot2_gemv: false,
             gcn5_wave64_hybrid: None,
