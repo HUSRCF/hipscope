@@ -105,6 +105,9 @@ pub struct FeatureFlags {
     /// Store the validated gfx1100 Qwen dense-FFN gate/up intermediates as
     /// FP16 and consume them directly in the fused SwiGLU/Q8 producer.
     pub rdna3_ffn_f16_intermediate: bool,
+    /// Fuse batched GDN output normalization with the following MQ rotation
+    /// for even collections of 128-value heads. Certified default on gfx1100.
+    pub rdna3_gdn_norm_rotate_batched: bool,
     pub fp8_wmma: bool,
     pub dot2_gemv: bool,
     pub gcn5_wave64_hybrid: Option<bool>,
@@ -500,6 +503,8 @@ impl FeatureFlags {
                 == Ok("1"),
             rdna3_ffn_f16_intermediate: value("HIPFIRE_RDNA3_FFN_F16_INTERMEDIATE").as_deref()
                 == Ok("1"),
+            rdna3_gdn_norm_rotate_batched: parse_bool("HIPFIRE_GATED_NORM_MQ_ROTATE_BATCHED")
+                .unwrap_or(arch == "gfx1100"),
             fp8_wmma: value("HIPFIRE_FP8_WMMA").map_or(false, |v| v == "1"),
             dot2_gemv: value("HIPFIRE_DOT2_GEMV").map_or(false, |v| v == "1"),
             gcn5_wave64_hybrid: parse_bool("HIPFIRE_GCN5_WAVE64_HYBRID"),
@@ -797,6 +802,7 @@ impl FeatureFlags {
             rdna3_gdn_conv_token_parallel: false,
             rdna3_fused_swiglu_q8_group128: false,
             rdna3_ffn_f16_intermediate: false,
+            rdna3_gdn_norm_rotate_batched: false,
             fp8_wmma: false,
             dot2_gemv: false,
             gcn5_wave64_hybrid: None,
@@ -980,6 +986,26 @@ mod tests {
             assert!(!flags.gemma4_ple_branch_batched_prefill, "arch={arch}");
             assert!(!flags.gemma4_ple_activation_fused_prefill, "arch={arch}");
         }
+    }
+
+    #[test]
+    fn batched_gdn_norm_rotate_defaults_only_on_gfx1100() {
+        let gfx1100 = FeatureFlags::from_lookup("gfx1100", |_| Err(()));
+        let gfx1201 = FeatureFlags::from_lookup("gfx1201", |_| Err(()));
+        assert!(gfx1100.rdna3_gdn_norm_rotate_batched);
+        assert!(!gfx1201.rdna3_gdn_norm_rotate_batched);
+    }
+
+    #[test]
+    fn batched_gdn_norm_rotate_accepts_explicit_disable() {
+        let flags = FeatureFlags::from_lookup("gfx1100", |name| {
+            if name == "HIPFIRE_GATED_NORM_MQ_ROTATE_BATCHED" {
+                Ok("0".to_owned())
+            } else {
+                Err(())
+            }
+        });
+        assert!(!flags.rdna3_gdn_norm_rotate_batched);
     }
 
     #[test]

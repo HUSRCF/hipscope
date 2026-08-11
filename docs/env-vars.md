@@ -547,6 +547,7 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_FUSE_QKV_BIAS` | crates/hipfire-dispatch/src/pipeline/steps.rs, crates/rdna-compute/examples/test_fused_qkv_bias_parity.rs |
 | `HIPFIRE_FUSE_QKV_BIAS_DEBUG` | crates/hipfire-dispatch/src/pipeline/steps.rs, crates/rdna-compute/src/feature_flags.rs |
 | `HIPFIRE_GATED_NORM_MQ_ROTATE` | crates/hipfire-arch-qwen35/src/qwen35.rs |
+| `HIPFIRE_GATED_NORM_MQ_ROTATE_BATCHED` | crates/rdna-compute/src/feature_flags.rs, crates/hipfire-arch-qwen35/src/qwen35.rs |
 | `HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL` | crates/rdna-compute/src/kernels.rs |
 | `HIPFIRE_GATE_KV_MODE` | scripts/coherence-gate-dflash.sh |
 | `HIPFIRE_GATE_MODEL` | scripts/gates.sh |

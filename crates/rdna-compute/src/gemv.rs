@@ -3526,6 +3526,121 @@ impl Gpu {
         result
     }
 
+    /// Batched sibling of `gated_norm_rotate_mq_gfx1100`. Grid.y selects the
+    /// token row while each workgroup retains the decode kernel's exact
+    /// two-head normalization and 256-value MQ rotation order.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gated_norm_rotate_mq_batched_gfx1100(
+        &mut self,
+        x: &GpuTensor,
+        z: &GpuTensor,
+        weight: &GpuTensor,
+        x_rot: &GpuTensor,
+        n_heads: usize,
+        head_dim: usize,
+        eps: f32,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let row = n_heads.checked_mul(head_dim).ok_or_else(|| {
+            hip_bridge::HipError::new(1, "gated_norm_rotate_mq_batched_gfx1100: row overflow")
+        })?;
+        let total = row.checked_mul(batch_size).ok_or_else(|| {
+            hip_bridge::HipError::new(1, "gated_norm_rotate_mq_batched_gfx1100: size overflow")
+        })?;
+        if n_heads % 2 != 0 || head_dim != 128 {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "gated_norm_rotate_mq_batched_gfx1100: expected an even head count with head_dim=128",
+            ));
+        }
+        if x.numel() < total
+            || z.numel() < total
+            || weight.numel() < head_dim
+            || x_rot.numel() < total
+        {
+            return Err(hip_bridge::HipError::new(
+                1,
+                &format!(
+                    "gated_norm_rotate_mq_batched_gfx1100: undersized tensor (x={}, z={}, weight={}, x_rot={}, required x/z/x_rot={}, weight={})",
+                    x.numel(),
+                    z.numel(),
+                    weight.numel(),
+                    x_rot.numel(),
+                    total,
+                    head_dim,
+                ),
+            ));
+        }
+        if batch_size == 0 {
+            return Ok(());
+        }
+        self.ensure_mq_signs()?;
+        let (module, src, kernel) = if self.arch_caps.is_gfx1151() {
+            (
+                "gated_norm_mq_rotate_gfx1151",
+                kernels::GATED_NORM_MQ_ROTATE_GFX1151_SRC,
+                "gated_norm_mq_rotate_gfx1151",
+            )
+        } else {
+            (
+                "gated_norm_mq_rotate_gfx1100",
+                kernels::GATED_NORM_MQ_ROTATE_GFX1100_SRC,
+                "gated_norm_mq_rotate_gfx1100",
+            )
+        };
+        self.ensure_kernel(module, src, kernel)?;
+
+        let xp = x.buf.as_ptr();
+        let zp = z.buf.as_ptr();
+        let wp = weight.buf.as_ptr();
+        let s1 = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2 = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let xrp = x_rot.buf.as_ptr();
+        let nh = n_heads as i32;
+        let hd = head_dim as i32;
+        let ep = eps;
+        let mut params: Vec<*mut c_void> = vec![
+            &xp as *const _ as *mut c_void,
+            &zp as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &s1 as *const _ as *mut c_void,
+            &s2 as *const _ as *mut c_void,
+            &xrp as *const _ as *mut c_void,
+            &nh as *const _ as *mut c_void,
+            &hd as *const _ as *mut c_void,
+            &ep as *const _ as *mut c_void,
+        ];
+        let bytes =
+            crate::profile::gated_norm_bytes(total) + crate::profile::mq_rotate_bytes(total);
+        let timer = crate::profile::begin_timer(&self.hip, "fused", kernel, bytes);
+        let result = self.launch_maybe_blob(
+            kernel,
+            [(n_heads / 2) as u32, batch_size as u32, 1],
+            [64, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(xp);
+                b.push_ptr(zp);
+                b.push_ptr(wp);
+                b.push_ptr(s1);
+                b.push_ptr(s2);
+                b.push_ptr(xrp);
+                b.push_i32(nh);
+                b.push_i32(hd);
+                b.push_f32(ep);
+                b
+            },
+        );
+        if let Some(timer) = timer {
+            timer.finish(&self.hip);
+        }
+        self.invalidate_x_caches_for(xrp);
+        result
+    }
+
     /// Standalone FWHT rotation for MagnumQuant (MQ4). Writes K floats into x_rot.
     pub fn rotate_x_mq(&mut self, x: &GpuTensor, x_rot: &GpuTensor, k: usize) -> HipResult<()> {
         self.bind_thread()?;
