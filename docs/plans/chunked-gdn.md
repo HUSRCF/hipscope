@@ -1,11 +1,10 @@
 # Chunked (parallel) GDN for hipfire
 
-> **Status: F32 chunked == sequential VALIDATED at machine precision
-> (max out-diff 1.332e-15); q8_ef boundary error-feedback VALIDATED
-> (all four claims pass).** The math below is no longer a sketch — it is
-> the parity-proven recurrence from the two numpy references in
-> `/home/kaden/.claude/jobs/3b7dee40/tmp/` (`gdn_chunk_parity_3.py`,
-> `gdn_chunk_q8ef.py`). What remains is the HIP kernel.
+> **Status: math and F32 HIP parity validated; current HIP architecture
+> rejected for performance.** The parity harness remains useful, but the
+> multi-launch chunk implementation is 0.10x-0.44x the sequential F32 path on
+> W7900/gfx1100. It is not a production candidate in its current form. See
+> `experiments/gdn-chunked/results/gpu1_20260811/`.
 
 ## Why
 hipfire's gated-delta-net runs **sequentially per token** (`gated_delta_net_*_batch_seq`,
@@ -154,7 +153,20 @@ but this is not where EF matters.
 The load-bearing idea holds: requantizing S only at chunk boundaries and carrying the EF residual
 across them keeps the chunked state ~FP32 across arbitrarily many chunks, at Q8's byte container.
 
-## Kernel plan
+## Measured HIP boundary
+
+The source-level PoC now exists in `kernels/src/gated_delta_net_f32_chunked.hip`
+and is wired through `Gpu::gated_delta_net_f32_chunked`. The GPU parity harness
+passes at approximately `1.5e-7` max error. The implementation uses one host
+launch per chunk, roughly 45.7 KiB LDS per workgroup, scalar 128x128 work, and
+a row-serial triangular solve. The aggregate timing proves that this combined
+architecture is substantially slower than the sequential kernel; it does not
+attribute the loss to any one of those characteristics.
+
+Any future chunked implementation must change this execution architecture; it
+must not treat the current source as a tunable production kernel.
+
+## Original kernel plan
 
 ### What hipfire already has (reuse)
 - The **GDN sequential kernels** for the `n==1` arm and as the parity oracle:

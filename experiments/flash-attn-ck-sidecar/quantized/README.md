@@ -101,6 +101,17 @@ This is a model-level backend improvement, not a route to 1.5k tok/s by itself;
 packed-MQ4 projections remain the dominant wall-time target. Raw logs and the
 summary are under `results/staged_model_ab_warm_20260811/`.
 
+A follow-up replaced only the staged dense D256 `M64/N64` CK recipe with
+`M64/N32`. Fifteen alternating process pairs measured a stable 1.0561x
+aggregate attention-local gain, with per-K results from 1.0320x to 1.0748x.
+The resource trace reports the same 32 KiB LDS, 400-byte scratch field, and 256
+VGPR for both recipes, so the candidate does not open a new occupancy tier. At
+the measured 11.27% PP8192 attention wall share, this is only about 0.6%
+modeled end-to-end value, below the 1.10x local admission threshold. The
+production N64 recipe is retained;
+the rejected patch and raw data are archived under
+`results/staged_dense_bn32_gpu1_20260811/`.
+
 The loader smoke also compares scalar element decoding with a 32-dimension
 batch decoder. The latter shares one Asym3 cnorm, four packed words, and one Q8
 scale per work item. It is a deliberate ablation, not the selected path: on
