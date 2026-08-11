@@ -81,6 +81,76 @@ pub(crate) fn e8_soa_experts_enabled() -> bool {
 }
 
 impl Gpu {
+    /// Diagnostic-only per-token top-K pruning of an already packed group128
+    /// Q8 down-projection input. The operation is in-place and deliberately
+    /// does not alter production dispatch or claim a performance benefit.
+    pub fn prune_ffn_q8_groups_oracle(
+        &mut self,
+        x_q8_ptr: *mut c_void,
+        k: usize,
+        batch_size: usize,
+        keep_groups: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let groups = k / 256;
+        if !self.arch_caps.is_rdna3_dgpu()
+            || k % 256 != 0
+            || groups == 0
+            || groups > 256
+            || keep_groups == 0
+            || keep_groups > groups
+        {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "FFN Q8 group oracle requires gfx11, K%256=0, 1<=keep<=groups<=256",
+            ));
+        }
+        if keep_groups == groups {
+            return Ok(());
+        }
+
+        const MODULE: &str = "ffn_q8_group_oracle";
+        const KERNEL: &str = "ffn_q8_group_oracle_topk";
+        self.ensure_kernel(MODULE, kernels::FFN_Q8_GROUP_ORACLE_SRC, KERNEL)?;
+        let mut q8_ptr = x_q8_ptr;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+        let mut keep_val = keep_groups as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut q8_ptr as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+            &mut keep_val as *mut _ as *mut c_void,
+        ];
+        let bytes = batch_size * (k / 128) * 144;
+        let timer = crate::profile::begin_timer_shape(
+            &self.hip,
+            "diagnostic",
+            KERNEL,
+            [k, batch_size, keep_groups],
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            KERNEL,
+            [batch_size as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(q8_ptr);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b.push_i32(keep_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// Diagnostic-only accumulation of per-layer, per-256-channel SwiGLU
     /// energy. The accumulator is persistent across prefill chunks and calls.
     pub fn accumulate_ffn_group_energy(

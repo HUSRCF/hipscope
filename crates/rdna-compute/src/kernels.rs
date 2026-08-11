@@ -1094,6 +1094,8 @@ pub const FUSED_SILU_MUL_MQ_ROTATE_SRC: &str =
     include_str!("../../../kernels/src/fused_silu_mul_mq_rotate.hip");
 pub const FUSED_SILU_MUL_MQ_ROTATE_Q8_GROUP128_SRC: &str =
     include_str!("../../../kernels/src/fused_silu_mul_mq_rotate_q8_group128.hip");
+pub const FFN_Q8_GROUP_ORACLE_SRC: &str =
+    include_str!("../../../kernels/src/ffn_q8_group_oracle.hip");
 pub const FFN_GROUP_ENERGY_SRC: &str = include_str!("../../../kernels/src/ffn_group_energy.hip");
 pub const GATED_NORM_MQ_ROTATE_GFX1100_SRC: &str =
     include_str!("../../../kernels/src/gated_norm_mq_rotate.gfx1100.hip");

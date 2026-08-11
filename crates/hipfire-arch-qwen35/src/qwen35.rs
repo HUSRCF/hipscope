@@ -7790,6 +7790,14 @@ fn try_run_hfq4_group128_swiglu_down(
     } else {
         gpu.fused_silu_mul_rotate_mq_q8_group128_batched(gate, up, w_down.k, n)?
     };
+    static ORACLE_KEEP_GROUPS: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    if let Some(keep_groups) = *ORACLE_KEEP_GROUPS.get_or_init(|| {
+        hipfire_config::developer_var("HIPFIRE_RDNA3_FFN_ORACLE_KEEP_GROUPS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+    }) {
+        gpu.prune_ffn_q8_groups_oracle(xq, w_down.k, n, keep_groups)?;
+    }
     gpu.gemm_hfq4g256_mmq_add_prequant_x256y64_perm_group128(
         &w_down.buf,
         xq,

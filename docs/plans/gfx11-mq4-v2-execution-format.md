@@ -102,6 +102,15 @@ needs calibration, a rotation-aware repack or retraining, and task-level
 quality evaluation. The reproducible timing record is in
 `experiments/gfx11-mq4-v2/ffn-width-work-reduction/`.
 
+A per-token post-SwiGLU energy oracle tested the most favorable dynamic version
+of this idea. Keeping 41/68 rotated 256-channel groups, close to the required
+work reduction, increased PPL by 9.25% on the original document and 52.79% on
+an out-of-domain WikiText2 slice. Keeping 60/68 groups increased PPL by 1.02%
+and 6.92% respectively; even its ideal affected wall share is below 10%. The
+route is closed as a transparent optimization. The oracle is diagnostic only:
+it zeroes the packed Q8 input after gate/up and does not reduce work. Results
+and the reproducer are in `experiments/gfx11-mq4-v2/dynamic-ffn-oracle/`.
+
 ## Closed directions
 
 These results apply to the current HFQ4/MQ4 affine contract and Wave32 WMMA
