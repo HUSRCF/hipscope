@@ -1,0 +1,11 @@
+date=2026-08-12T05:27:06+08:00
+git_commit=462a3bff0bbb6348fe4605cfcc6507de5aee1d87
+gpu_id=1
+prefill_tokens=16384
+prefill_batch=2048
+prefill_runs=2
+idle_seconds=30
+order=contract tuned tuned contract
+ck_sidecar=on in both modes
+contract=group128 activation scaling and F32 FFN intermediate
+tuned=group256 activation scaling and F16 FFN intermediate

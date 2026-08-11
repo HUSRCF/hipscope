@@ -1,6 +1,6 @@
 # PP16384 staged CK ABBA validation
 
-This run validates the optional quantized-KV CK sidecar on a Qwen3.6-27B MQ4 prefill workload. The benchmark binary was built with the `flash-attn-ck` Cargo feature. Samples were run on GPU 1 in `off/on/on/off` order with a 30-second idle interval and two prefill measurements per process.
+This run validates the optional quantized-KV CK sidecar on a Qwen3.6-27B MQ4 prefill workload. The benchmark binary was built with the `flash-attn-ck` Cargo feature. Samples were run on GPU 1 in `off/on/on/off` order with a 30-second idle interval and two prefill measurements per process. Both modes include the opt-in group256 activation-scale and F16 FFN-intermediate routes, so this is the throughput-tuned profile rather than the strict group128/F32 contract profile.
 
 ## Performance
 

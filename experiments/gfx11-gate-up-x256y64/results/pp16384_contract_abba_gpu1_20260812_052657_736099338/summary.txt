@@ -1,0 +1,4 @@
+contract_mean_tok_s=1133.700
+tuned_mean_tok_s=1146.950
+tuned_over_contract=1.011687
+delta_pct=1.169
