@@ -1,0 +1,10 @@
+fp16_i4_bscale_ms=35.7224
+fp16_i4_bscale_effective_tflops=10.2197
+fp16_i4_ms=5.60188
+fp16_i4_effective_tflops=65.1696
+int8_ms=5.14729
+int8_effective_tflops=70.9251
+device=AMD Radeon Pro W7900
+arch=gfx1100
+rocm=7.14
+ck_shape=M2048_N17408_K5120

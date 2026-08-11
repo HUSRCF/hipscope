@@ -1,0 +1,4 @@
+chunk2048: prefill_median=1122.100 decode_median=31.900 raw_prefill=[1165.9, 1120.1, 1122.1]
+chunk4096: prefill_median=1127.800 decode_median=32.000 raw_prefill=[1145.6, 1127.8, 1123.8]
+chunk4096_vs_2048=1.0051x (+0.51%)
+token_ids_match=False chunk2048_variants=1 chunk4096_variants=1
