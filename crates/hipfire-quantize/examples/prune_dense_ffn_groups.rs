@@ -7,9 +7,10 @@
 
 use hipfire_runtime::hfq::{HfqFile, HfqTensorInfo};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 const HFQ_MAGIC: &[u8; 4] = b"HFQM";
@@ -44,14 +45,43 @@ struct OutputTensor {
 struct Args {
     input: PathBuf,
     output: Option<PathBuf>,
+    activation_energy: Option<PathBuf>,
     keep_groups: usize,
     dry_run: bool,
+}
+
+struct ActivationCalibration {
+    energy: BTreeMap<usize, Vec<f64>>,
+    model_bytes: u64,
+    model_sha256: String,
+    metadata_fingerprint: String,
+    hidden_dim: usize,
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf29ce484222325, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+    })
+}
+
+fn sha256_file(path: &Path) -> String {
+    let mut file = File::open(path).expect("open model for SHA-256");
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 8 * 1024 * 1024];
+    loop {
+        let n = file.read(&mut buffer).expect("read model for SHA-256");
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buffer[..n]);
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 fn usage() -> ! {
     eprintln!(
         "usage: prune_dense_ffn_groups --input MODEL --keep-groups N \
-         [--output MODEL] [--dry-run]"
+         [--output MODEL] [--activation-energy FILE.json] [--dry-run]"
     );
     std::process::exit(2);
 }
@@ -59,6 +89,7 @@ fn usage() -> ! {
 fn parse_args() -> Args {
     let mut input = None;
     let mut output = None;
+    let mut activation_energy = None;
     let mut keep_groups = None;
     let mut dry_run = false;
     let args: Vec<String> = std::env::args().collect();
@@ -73,6 +104,10 @@ fn parse_args() -> Args {
                 i += 1;
                 output = args.get(i).map(PathBuf::from);
             }
+            "--activation-energy" => {
+                i += 1;
+                activation_energy = args.get(i).map(PathBuf::from);
+            }
             "--keep-groups" => {
                 i += 1;
                 keep_groups = args.get(i).and_then(|v| v.parse().ok());
@@ -85,6 +120,7 @@ fn parse_args() -> Args {
     let args = Args {
         input: input.unwrap_or_else(|| usage()),
         output,
+        activation_energy,
         keep_groups: keep_groups.unwrap_or_else(|| usage()),
         dry_run,
     };
@@ -174,7 +210,74 @@ fn assert_canonical_mq4(tensor: &HfqTensorInfo, m: usize, k: usize, label: &str)
     );
 }
 
-fn collect_selections(hfq: &HfqFile, keep_groups: usize) -> BTreeMap<usize, Vec<usize>> {
+fn load_activation_energy(path: &Path) -> ActivationCalibration {
+    let root: Value = serde_json::from_slice(&std::fs::read(path).expect("read activation energy"))
+        .expect("parse activation energy JSON");
+    assert_eq!(
+        root.get("group_size").and_then(Value::as_u64),
+        Some(GROUP as u64),
+        "activation calibration group_size mismatch"
+    );
+    assert_eq!(
+        root.get("metric").and_then(Value::as_str),
+        Some("sum_square_silu_gate_mul_up"),
+        "unsupported activation calibration metric"
+    );
+    let mut result = BTreeMap::new();
+    for entry in root
+        .get("layers")
+        .and_then(Value::as_array)
+        .expect("activation calibration layers array")
+    {
+        let layer = entry
+            .get("layer")
+            .and_then(Value::as_u64)
+            .expect("activation calibration layer id") as usize;
+        let energy: Vec<f64> = entry
+            .get("energy")
+            .and_then(Value::as_array)
+            .expect("activation calibration energy array")
+            .iter()
+            .map(|v| {
+                let x = v.as_f64().expect("activation energy number");
+                assert!(x.is_finite() && x >= 0.0, "invalid activation energy");
+                x
+            })
+            .collect();
+        assert!(
+            result.insert(layer, energy).is_none(),
+            "duplicate layer {layer}"
+        );
+    }
+    assert!(!result.is_empty(), "empty activation calibration");
+    ActivationCalibration {
+        energy: result,
+        model_bytes: root
+            .get("model_bytes")
+            .and_then(Value::as_u64)
+            .expect("activation calibration model_bytes"),
+        model_sha256: root
+            .get("model_sha256")
+            .and_then(Value::as_str)
+            .expect("activation calibration model_sha256")
+            .to_string(),
+        metadata_fingerprint: root
+            .get("model_metadata_fingerprint")
+            .and_then(Value::as_str)
+            .expect("activation calibration model_metadata_fingerprint")
+            .to_string(),
+        hidden_dim: root
+            .get("hidden_dim")
+            .and_then(Value::as_u64)
+            .expect("activation calibration hidden_dim") as usize,
+    }
+}
+
+fn collect_selections(
+    hfq: &HfqFile,
+    keep_groups: usize,
+    activation: Option<&BTreeMap<usize, Vec<f64>>>,
+) -> BTreeMap<usize, Vec<usize>> {
     let mut layers: BTreeMap<usize, [Option<&HfqTensorInfo>; 3]> = BTreeMap::new();
     for tensor in hfq.tensors() {
         let Some((layer, kind)) = projection(&tensor.name) else {
@@ -208,16 +311,40 @@ fn collect_selections(hfq: &HfqFile, keep_groups: usize) -> BTreeMap<usize, Vec<
         let gate_data = hfq.tensor_data(&gate.name).unwrap().1;
         let up_data = hfq.tensor_data(&up.name).unwrap().1;
         let down_data = hfq.tensor_data(&down.name).unwrap().1;
-        let gate_energy = output_group_energy(gate_data, m, k);
-        let up_energy = output_group_energy(up_data, m, k);
+        let gate_energy = activation
+            .is_none()
+            .then(|| output_group_energy(gate_data, m, k));
+        let up_energy = activation
+            .is_none()
+            .then(|| output_group_energy(up_data, m, k));
         let down_energy = input_group_energy(down_data, k, m);
+        let activation_energy = activation.map(|all| {
+            let energy = all
+                .get(&layer)
+                .unwrap_or_else(|| panic!("activation calibration missing layer {layer}"));
+            assert_eq!(
+                energy.len(),
+                total_groups,
+                "layer {layer}: activation group count mismatch"
+            );
+            energy
+        });
 
         let mut ranked: Vec<(usize, f64)> = (0..total_groups)
             .map(|group| {
-                let score = (gate_energy[group].max(f64::MIN_POSITIVE).ln()
-                    + up_energy[group].max(f64::MIN_POSITIVE).ln()
-                    + down_energy[group].max(f64::MIN_POSITIVE).ln())
-                    / 3.0;
+                let score = if let Some(energy) = activation_energy {
+                    energy[group].max(f64::MIN_POSITIVE).ln()
+                        + down_energy[group].max(f64::MIN_POSITIVE).ln()
+                } else {
+                    (gate_energy.as_ref().unwrap()[group]
+                        .max(f64::MIN_POSITIVE)
+                        .ln()
+                        + up_energy.as_ref().unwrap()[group]
+                            .max(f64::MIN_POSITIVE)
+                            .ln()
+                        + down_energy[group].max(f64::MIN_POSITIVE).ln())
+                        / 3.0
+                };
                 (group, score)
             })
             .collect();
@@ -273,7 +400,7 @@ fn output_tensors(hfq: &HfqFile, selections: &BTreeMap<usize, Vec<usize>>) -> Ve
         .collect()
 }
 
-fn rewrite_metadata(metadata: &str, keep_groups: usize) -> String {
+fn rewrite_metadata(metadata: &str, keep_groups: usize, ranking: &str) -> String {
     let mut root: Value = serde_json::from_str(metadata).expect("valid metadata JSON");
     let width = (keep_groups * GROUP) as u64;
     let text_config = root
@@ -287,7 +414,7 @@ fn rewrite_metadata(metadata: &str, keep_groups: usize) -> String {
             "group_size": GROUP,
             "keep_groups": keep_groups,
             "intermediate_size": width,
-            "ranking": "weight_energy_geomean_gate_up_down",
+            "ranking": ranking,
             "experimental": true,
         }),
     );
@@ -378,7 +505,52 @@ fn write_output(
 fn main() {
     let args = parse_args();
     let hfq = HfqFile::open_at_offset(&args.input, 0).expect("open input HFQ");
-    let selections = collect_selections(&hfq, args.keep_groups);
+    let activation = args
+        .activation_energy
+        .as_deref()
+        .map(load_activation_energy);
+    if let Some(calibration) = activation.as_ref() {
+        assert_eq!(
+            calibration.model_bytes,
+            std::fs::metadata(&args.input)
+                .expect("stat input HFQ")
+                .len(),
+            "activation calibration model size mismatch"
+        );
+        assert_eq!(
+            calibration.model_sha256,
+            sha256_file(&args.input),
+            "activation calibration model SHA-256 mismatch"
+        );
+        assert_eq!(
+            calibration.metadata_fingerprint,
+            format!("fnv1a64:{:016x}", fnv1a64(hfq.metadata_json.as_bytes())),
+            "activation calibration model metadata mismatch"
+        );
+        let model_hidden_dim = hfq
+            .tensors()
+            .iter()
+            .find_map(|tensor| {
+                projection(&tensor.name)
+                    .filter(|(_, kind)| *kind == Projection::Gate)
+                    .map(|_| tensor.shape[0] as usize)
+            })
+            .expect("model gate projection");
+        assert_eq!(
+            calibration.hidden_dim, model_hidden_dim,
+            "activation calibration hidden_dim mismatch"
+        );
+    }
+    let ranking = if activation.is_some() {
+        "activation_swiglu_energy_times_down_weight_energy"
+    } else {
+        "weight_energy_geomean_gate_up_down"
+    };
+    let selections = collect_selections(
+        &hfq,
+        args.keep_groups,
+        activation.as_ref().map(|calibration| &calibration.energy),
+    );
     let tensors = output_tensors(&hfq, &selections);
     let input_bytes: usize = hfq.tensors().iter().map(|x| x.data_size).sum();
     let output_bytes: usize = tensors.iter().map(|x| x.data_size).sum();
@@ -392,7 +564,7 @@ fn main() {
     if args.dry_run {
         return;
     }
-    let metadata = rewrite_metadata(&hfq.metadata_json, args.keep_groups);
+    let metadata = rewrite_metadata(&hfq.metadata_json, args.keep_groups, ranking);
     write_output(
         &hfq,
         args.output.as_deref().unwrap(),

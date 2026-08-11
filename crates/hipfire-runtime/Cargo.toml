@@ -135,6 +135,7 @@ hipfire-atlas = { path = "../hipfire-atlas" }
 # In-test minimal HFQ writer (overlay resolution tests in src/hfq.rs).
 tempfile = "3"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+sha2 = "0.10"
 
 # Each example below carries `required-features` listing the cargo
 # features its `use hipfire_arch_*` imports depend on. This documents
