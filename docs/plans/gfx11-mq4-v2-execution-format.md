@@ -146,6 +146,8 @@ WMMA kernels with a different numerical contract.
 | Independent K16 IU8-WMMA halves plus exact i32 merge | 0.8886x gate, 0.8940x down; bit-exact | closed |
 | Lane-owned affine metadata plus `ds_bpermute` | 0.7672x gate, 0.7607x down; bit-exact | closed |
 | Module-exact gfx11 CU-mode scheduling | PP8192 1144.6 -> 1123.7 tok/s (0.9817x); decode 33.3 -> 33.2 tok/s | closed |
+| Late-lane epilogue index reconstruction | spills 4 -> 2, private 20 -> 12 B/thread; weighted set/add +0.04% | rejected |
+| Group256 activation staged in LDS | candidate throughput is 0.755x serial-row gate/set and 0.704x serial-row down/add | closed |
 
 The lossless packed-layout experiments show that eliminating or relocating
 nibble expansion alone did not help the measured gate/up shape. The exact IU4
@@ -153,6 +155,24 @@ experiment shows that two native IU4 WMMA passes cost more than the expansion
 they remove on that shape. A globally expanded INT8 execution copy is also not
 an acceptable default: it nearly doubles resident weight bytes and reduces the
 context capacity that makes the 27B single-GPU configuration useful.
+
+The late-lane epilogue probe confirms that the reported four-spill count is not
+itself a useful optimization target. Reconstructing the Wave32 lane ID at the
+epilogue removed two spills, but the code object remained in the 256-VGPR tier
+and the production-weighted timing was neutral. The logical wave index cannot
+be reconstructed from `HW_ID1.WAVE_ID`, because that register reports a
+physical SIMD wave slot rather than the wave's logical index within its
+workgroup. The exact probe and resource record are in
+`experiments/gfx11-mq4-v2/results/late-lane-epilogue-gpu1-20260812/`.
+
+The existing 140-byte compact group128 activation record is also not admitted
+as a new single-output backend. It saves only four bytes from the 144-byte
+wire record. More importantly, its 35-dword row stride rotates 16-byte
+alignment across LDS rows while the Wave32 WMMA feed uses 16-byte fragment
+loads. A safe exact path must expand or repack it to the canonical 36-dword
+LDS stride before the WMMA loop, leaving only a 2.78% global metadata saving
+and adding a repack. This remains useful inside bounded standalone probes, but
+it has no credible path to the 1.30x primitive admission line.
 
 The lane-major execution copy additionally removes the row-major access
 pattern as a confounder. It keeps the exact 136-byte affine MQ4 contract but
