@@ -27,3 +27,20 @@ quantized CK sidecar loaded and executed.
 The three-pass median is `1158.4 tok/s`; decode was `31.8 tok/s`. The benchmark
 currently writes the final pass rather than the median into `PREFILL_SUMMARY`,
 so the raw per-pass lines are authoritative for this report.
+
+## Prefill-chunk boundary
+
+A follow-up run kept the model, GPU, KV mode, staged CK sidecar, and retained
+MQ4 routes unchanged while increasing `HIPFIRE_PREFILL_MAX_BATCH` from 2048 to
+4096. PP16384 then used four chunks instead of eight. The follow-up manifest,
+artifact hashes, and raw result lines are retained in
+`../pp16384_chunk4096_gpu1_20260812/`.
+
+| Max prefill batch | Pass 1 | Pass 2 | Pass 3 | Median |
+| ---: | ---: | ---: | ---: | ---: |
+| 2048 | 1178.8 | 1158.4 | 1143.6 | **1158.4 tok/s** |
+| 4096 | 1092.8 | 1074.5 | 1060.4 | **1074.5 tok/s** |
+
+The 4096-token chunk is `0.9276x` the retained 2048-token configuration
+(`-7.24%`). Reducing the number of chunks does not offset the less favorable
+large-chunk execution shape, so 2048 remains the PP16384 default.

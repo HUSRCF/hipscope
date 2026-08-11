@@ -1,0 +1,7 @@
+loaded optional quantized FlashAttention CK sidecar: /tmp/libhipfire_flash_attn_ck_quantized_staged.so
+staged quantized FlashAttention CK prefill active: Q=4096 K=4096 Hq=24 Hkv=4 D=256 scratch=117440512 bytes
+  run  1: 14993.2ms  1092.8 tok/s
+  run  2: 15248.4ms  1074.5 tok/s
+  run  3: 15450.2ms  1060.4 tok/s
+PREFILL_SUMMARY  prefill_tok_s=1060.4  prefill_wall_ms=15450.17
+SUMMARY  gen_tok_s=31.9  bw_gib_s=444.7  prefill_tok_s=1060.4  avg_ms=31.08  p50_ms=31.07
