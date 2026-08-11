@@ -72,6 +72,8 @@ CLAUDE.local.md
 # Training artifacts (draft ckpts, converted hfq, prompt files, logs)
 .dflash-runs/
 artifacts/
+experiments/gfx11-mq4-v2/trained-ffn-v2-capture/captures/
+experiments/gfx11-mq4-v2/trained-ffn-v2-reconstruction/outputs/
 !crates/radiowave/tests/artifacts/
 !crates/radiowave/tests/artifacts/*.json
 !crates/radiowave/tests/artifacts/recipes/

@@ -53,7 +53,10 @@ pub struct FfnCaptureChunk {
     pub index: usize,
     pub tokens: usize,
     pub residual_in_file: String,
-    pub residual_out_file: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub residual_out_file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ffn_delta_file: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -72,6 +75,7 @@ struct FfnCapturePending {
     index: usize,
     tokens: usize,
     residual_in_file: String,
+    residual_in_f32: Vec<f32>,
 }
 
 #[derive(Debug)]
@@ -125,7 +129,7 @@ pub fn begin_ffn_capture(dir: &Path, layer: usize, max_tokens: usize) -> HipResu
     *slot = Some(FfnCaptureState {
         dir: dir.to_path_buf(),
         summary: FfnCaptureSummary {
-            version: 1,
+            version: 2,
             layer,
             hidden_dim: 0,
             dtype: "f16-le",
@@ -164,7 +168,19 @@ pub fn finish_ffn_capture() -> HipResult<Option<FfnCaptureSummary>> {
 
 #[cfg(test)]
 mod ffn_capture_tests {
-    use super::{begin_ffn_capture, finish_ffn_capture};
+    use super::{begin_ffn_capture, ffn_delta, finish_ffn_capture};
+
+    #[test]
+    fn direct_delta_avoids_independent_f16_rounding_cancellation() {
+        let input = [1024.0_f32];
+        let output = [1024.25_f32];
+        let direct = ffn_delta(&input, &output).unwrap();
+        assert_eq!(half::f16::from_f32(direct[0]).to_f32(), 0.25);
+
+        let rounded_input = half::f16::from_f32(input[0]).to_f32();
+        let rounded_output = half::f16::from_f32(output[0]).to_f32();
+        assert_eq!(rounded_output - rounded_input, 0.0);
+    }
 
     #[test]
     fn capture_session_resets_and_rejects_existing_output() {
@@ -196,13 +212,24 @@ mod ffn_capture_tests {
     }
 }
 
-fn write_f16_file(path: &Path, values: Vec<f32>) -> HipResult<()> {
+fn write_f16_file(path: &Path, values: &[f32]) -> HipResult<()> {
     let mut bytes = Vec::with_capacity(values.len() * 2);
     for value in values {
-        bytes.extend_from_slice(&half::f16::from_f32(value).to_le_bytes());
+        bytes.extend_from_slice(&half::f16::from_f32(*value).to_le_bytes());
     }
     std::fs::write(path, bytes)
         .map_err(|error| HipError::new(0, &format!("write {}: {error}", path.display())))
+}
+
+fn ffn_delta(residual_in: &[f32], residual_out: &[f32]) -> HipResult<Vec<f32>> {
+    if residual_out.len() != residual_in.len() {
+        return Err(HipError::new(0, "FFN capture input/output size mismatch"));
+    }
+    Ok(residual_out
+        .iter()
+        .zip(residual_in)
+        .map(|(output, input)| output - input)
+        .collect())
 }
 
 fn write_ffn_capture_manifest(state: &FfnCaptureState) -> HipResult<()> {
@@ -256,13 +283,15 @@ fn capture_ffn_residual_in(
     state.reserved_tokens += take;
     let file = format!("chunk_{index:04}_residual_in.f16");
     let view = residual.sub_offset(0, take * hidden_dim);
-    write_f16_file(&state.dir.join(&file), gpu.download_f32(&view)?)?;
+    let residual_in_f32 = gpu.download_f32(&view)?;
+    write_f16_file(&state.dir.join(&file), &residual_in_f32)?;
     state.pending.insert(
         thread_id,
         FfnCapturePending {
             index,
             tokens: take,
             residual_in_file: file,
+            residual_in_f32,
         },
     );
     Ok(())
@@ -292,15 +321,18 @@ fn capture_ffn_residual_out(
     let Some(pending) = state.pending.remove(&std::thread::current().id()) else {
         return Ok(());
     };
-    let file = format!("chunk_{:04}_residual_out.f16", pending.index);
+    let file = format!("chunk_{:04}_ffn_delta.f16", pending.index);
     let view = residual.sub_offset(0, pending.tokens * hidden_dim);
-    write_f16_file(&state.dir.join(&file), gpu.download_f32(&view)?)?;
+    let residual_out_f32 = gpu.download_f32(&view)?;
+    let delta = ffn_delta(&pending.residual_in_f32, &residual_out_f32)?;
+    write_f16_file(&state.dir.join(&file), &delta)?;
     state.summary.captured_tokens += pending.tokens;
     state.summary.chunks.push(FfnCaptureChunk {
         index: pending.index,
         tokens: pending.tokens,
         residual_in_file: pending.residual_in_file,
-        residual_out_file: file,
+        residual_out_file: None,
+        ffn_delta_file: Some(file),
     });
     state.summary.chunks.sort_by_key(|chunk| chunk.index);
     write_ffn_capture_manifest(&state)

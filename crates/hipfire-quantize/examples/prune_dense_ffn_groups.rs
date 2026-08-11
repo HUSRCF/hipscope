@@ -45,6 +45,7 @@ struct OutputTensor {
 struct Args {
     input: PathBuf,
     output: Option<PathBuf>,
+    selection_output: Option<PathBuf>,
     activation_energy: Option<PathBuf>,
     keep_groups: usize,
     dry_run: bool,
@@ -81,7 +82,8 @@ fn sha256_file(path: &Path) -> String {
 fn usage() -> ! {
     eprintln!(
         "usage: prune_dense_ffn_groups --input MODEL --keep-groups N \
-         [--output MODEL] [--activation-energy FILE.json] [--dry-run]"
+         [--output MODEL] [--selection-output FILE.json] \
+         [--activation-energy FILE.json] [--dry-run]"
     );
     std::process::exit(2);
 }
@@ -89,6 +91,7 @@ fn usage() -> ! {
 fn parse_args() -> Args {
     let mut input = None;
     let mut output = None;
+    let mut selection_output = None;
     let mut activation_energy = None;
     let mut keep_groups = None;
     let mut dry_run = false;
@@ -103,6 +106,10 @@ fn parse_args() -> Args {
             "--output" => {
                 i += 1;
                 output = args.get(i).map(PathBuf::from);
+            }
+            "--selection-output" => {
+                i += 1;
+                selection_output = args.get(i).map(PathBuf::from);
             }
             "--activation-energy" => {
                 i += 1;
@@ -120,6 +127,7 @@ fn parse_args() -> Args {
     let args = Args {
         input: input.unwrap_or_else(|| usage()),
         output,
+        selection_output,
         activation_energy,
         keep_groups: keep_groups.unwrap_or_else(|| usage()),
         dry_run,
@@ -551,6 +559,29 @@ fn main() {
         args.keep_groups,
         activation.as_ref().map(|calibration| &calibration.energy),
     );
+    if let Some(path) = args.selection_output.as_deref() {
+        let layers: Vec<Value> = selections
+            .iter()
+            .map(|(layer, groups)| json!({"layer": layer, "groups": groups}))
+            .collect();
+        let manifest = json!({
+            "version": 1,
+            "kind": "hipfire_dense_ffn_group_selection",
+            "model": args.input,
+            "model_bytes": std::fs::metadata(&args.input).expect("stat input HFQ").len(),
+            "model_sha256": sha256_file(&args.input),
+            "model_metadata_fingerprint": format!(
+                "fnv1a64:{:016x}",
+                fnv1a64(hfq.metadata_json.as_bytes())
+            ),
+            "group_size": GROUP,
+            "keep_groups": args.keep_groups,
+            "ranking": ranking,
+            "layers": layers,
+        });
+        std::fs::write(path, serde_json::to_vec_pretty(&manifest).unwrap())
+            .expect("write selection manifest");
+    }
     let tensors = output_tensors(&hfq, &selections);
     let input_bytes: usize = hfq.tensors().iter().map(|x| x.data_size).sum();
     let output_bytes: usize = tensors.iter().map(|x| x.data_size).sum();
