@@ -6,42 +6,31 @@ GPU_ID=${GPU_ID:-1}
 PAIRS=${PAIRS:-31}
 RUNS=${RUNS:-5}
 STAMP=${STAMP:-$(date +%Y%m%d_%H%M%S)}
-OUT_DIR=${OUT_DIR:-"$ROOT/experiments/gfx11-gate-up-x256y64/results/j0_nounroll_gpu${GPU_ID}_${STAMP}"}
+OUT_DIR=${OUT_DIR:-"$ROOT/experiments/gfx11-gate-up-x256y64/results/half_meta_quad_row_gpu${GPU_ID}_${STAMP}"}
 BIN="$ROOT/target/release/examples/bench_hfq4_group256_direct"
 
 mkdir -p "$OUT_DIR"
 
-run_mode() {
-    local label=$1 m=$2 k=$3 add=$4 mode=$5 trial=$6
+run_shape() {
+    local label=$1 m=$2 k=$3 add=$4
     local add_arg=()
-    local mode_arg=(--group128-quad-row-u32x2)
     if [[ "$add" == 1 ]]; then
         add_arg+=(--add)
     fi
-    if [[ "$mode" == j0_nounroll ]]; then
-        mode_arg=(--group128-j0-nounroll)
-    fi
-
-    env \
-        -u HIPFIRE_RDNA3_Q8_GROUP128 \
-        -u HIPFIRE_RDNA3_Q8_GROUP128_ROW2 \
-        -u HIPFIRE_RDNA3_Q8_GROUP128_DUAL_ROW_WEIGHT \
-        -u HIPFIRE_RDNA3_Q8_GROUP128_QUAD_ROW_WEIGHT \
-        -u HIPFIRE_RDNA3_Q8_GROUP128_K128 \
-        -u HIPFIRE_RDNA3_Q8_GROUP128_DIRECT \
-        -u HIPFIRE_RDNA3_Q8_GROUP128_DIRECT_X512 \
-        HIP_VISIBLE_DEVICES="$GPU_ID" "$BIN" \
-        --m "$m" --k "$k" --n 2048 --pairs "$PAIRS" \
-        "${mode_arg[@]}" "${add_arg[@]}" \
-        2>&1 | tee "$OUT_DIR/${label}_${mode}_trial${trial}.txt"
-    sleep 2
-}
-
-run_shape() {
-    local label=$1 m=$2 k=$3 add=$4
-    local trial
     for ((trial = 1; trial <= RUNS; ++trial)); do
-        run_mode "$label" "$m" "$k" "$add" j0_nounroll "$trial"
+        env \
+            -u HIPFIRE_RDNA3_Q8_GROUP128 \
+            -u HIPFIRE_RDNA3_Q8_GROUP128_ROW2 \
+            -u HIPFIRE_RDNA3_Q8_GROUP128_DUAL_ROW_WEIGHT \
+            -u HIPFIRE_RDNA3_Q8_GROUP128_QUAD_ROW_WEIGHT \
+            -u HIPFIRE_RDNA3_Q8_GROUP128_K128 \
+            -u HIPFIRE_RDNA3_Q8_GROUP128_DIRECT \
+            -u HIPFIRE_RDNA3_Q8_GROUP128_DIRECT_X512 \
+            HIP_VISIBLE_DEVICES="$GPU_ID" "$BIN" \
+            --m "$m" --k "$k" --n 2048 --pairs "$PAIRS" \
+            --group128-half-meta-quad-row "${add_arg[@]}" \
+            2>&1 | tee "$OUT_DIR/${label}_trial${trial}.txt"
+        sleep 2
     done
 }
 
@@ -64,7 +53,7 @@ expected_runs = int(sys.argv[2])
 rows = []
 for label in ("gate_up_set", "down_residual_add"):
     trials = []
-    for path in sorted(root.glob(f"{label}_j0_nounroll_trial*.txt")):
+    for path in sorted(root.glob(f"{label}_trial*.txt")):
         text = path.read_text()
         if "reference_mode=group128-quad-row-u32x2" not in text:
             raise SystemExit(f"unexpected reference mode in {path}")
@@ -83,18 +72,18 @@ for label in ("gate_up_set", "down_residual_add"):
 
 with (root / "summary.tsv").open("w") as out:
     out.write(
-        "shape\truns\tquad_row_ms_median\tj0_nounroll_ms_median\t"
+        "shape\truns\tquad_row_ms_median\thalf_meta_quad_row_ms_median\t"
         "paired_time_ratio_median\tmax_abs_max\n"
     )
     for label, trials in rows:
-        quad = statistics.median(x["group128_lds_ms"] for x in trials)
+        baseline = statistics.median(x["group128_lds_ms"] for x in trials)
         candidate = statistics.median(x["group256_ms"] for x in trials)
         paired_ratio = statistics.median(
             trial["group256_ms"] / trial["group128_lds_ms"] for trial in trials
         )
         max_abs = max(x["max_abs"] for x in trials)
         out.write(
-            f"{label}\t{len(trials)}\t{quad:.4f}\t{candidate:.4f}\t"
+            f"{label}\t{len(trials)}\t{baseline:.4f}\t{candidate:.4f}\t"
             f"{paired_ratio:.4f}\t{max_abs:.8e}\n"
         )
 PY

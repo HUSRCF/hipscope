@@ -10,10 +10,10 @@ Five process-level trials used 31 alternating pairs per process on W7900/gfx1100
 
 | Shape | Existing quad-row median | N-subtile no-unroll median | Candidate / baseline time | Exact |
 |---|---:|---:|---:|---:|
-| gate/up set, M17408 K5120 N2048 | 4.4985 ms | 7.9681 ms | 1.7713x | yes |
-| down/residual add, M5120 K17408 N2048 | 4.6058 ms | 7.9005 ms | 1.7153x | yes |
+| gate/up set, M17408 K5120 N2048 | 5.9309 ms | 7.9982 ms | 1.3511x | yes |
+| down/residual add, M5120 K17408 N2048 | 5.8358 ms | 7.8556 ms | 1.3508x | yes |
 
-The candidate is substantially slower on both dominant production shapes, so it did not qualify for a PP16384 serving check.
+Each process alternated the production quad-row baseline and candidate directly; the ratio is the median of the five within-process ratios. The candidate is substantially slower on both dominant `N=2048` production chunk shapes, so it did not qualify for a PP16384 serving check.
 
 ## ISA/resource audit
 
@@ -27,4 +27,4 @@ Reject production promotion and do not run PP16384. Keep the standalone probe an
 
 Artifacts:
 
-- `experiments/gfx11-gate-up-x256y64/results/j0_nounroll_gpu1_20260812_083000_addseed/`
+- `experiments/gfx11-gate-up-x256y64/results/j0_nounroll_gpu1_20260812_091000_sameprocess/`

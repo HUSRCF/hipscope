@@ -20177,6 +20177,86 @@ impl Gpu {
         )
     }
 
+    /// Standalone execution-format probe that moves the existing FP16
+    /// scale/zero conversion from kernel staging to weight repacking.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_hfq4g256_mmq_prequant_x256y64_group128_half_meta_quad_row(
+        &mut self,
+        a_half_meta: &GpuTensor,
+        x_q8_ptr: *mut c_void,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        add: bool,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if !self.arch_caps.is_gfx1100() || m % 64 != 0 || k % 256 != 0 || batch_size % 256 != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "group128 half-meta quad-row requires gfx1100 and M%64=K%256=N%256=0",
+            ));
+        }
+
+        const MODULE: &str = "gemm_hfq4g256_mmq_x256y64_group128_half_meta_quad_row";
+        let kernel = if add {
+            "gemm_hfq4g256_mmq_x256y64_group128_half_meta_quad_row_full_add"
+        } else {
+            "gemm_hfq4g256_mmq_x256y64_group128_half_meta_quad_row_full_set"
+        };
+        static SRC: OnceLock<String> = OnceLock::new();
+        let src = SRC.get_or_init(|| {
+            let body = kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_SRC
+                .replace("gemm_hfq4g256_residual_mmq", MODULE);
+            format!(
+                "#define MMQ_X 256\n#define MMQ_Y 64\n#define MMQ_ROW_FRAGS 2\n#define MMQ_COL_GROUPS 4\n#define MMQ_PERM_NIBBLE 1\n#define MMQ_Q8_GROUP128 1\n#define MMQ_WEIGHT_HALF_META 1\n#define MMQ_WEIGHT_QUAD_ROW_U32X2 1\n{body}",
+            )
+        });
+        self.ensure_kernel(MODULE, src, kernel)?;
+
+        let mut a_ptr = a_half_meta.buf.as_ptr();
+        let mut xq_ptr = x_q8_ptr;
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+        let mut add_val = i32::from(add);
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut xq_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+            &mut add_val as *mut _ as *mut c_void,
+        ];
+        const MMQ_X: usize = 256;
+        const MMQ_Y: usize = 64;
+        const MMQ_TILE_Y_K: usize = 36;
+        const MMQ_TILE_X_K: usize = 76;
+        let shared_mem = ((MMQ_X * MMQ_TILE_Y_K + MMQ_Y * MMQ_TILE_X_K)
+            * std::mem::size_of::<i32>()
+            + MMQ_X * std::mem::size_of::<f32>()) as u32;
+        self.launch_maybe_blob(
+            kernel,
+            [(m / MMQ_Y) as u32, (batch_size / MMQ_X) as u32, 1],
+            [32, 8, 1],
+            shared_mem,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(xq_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b.push_i32(add_val);
+                b
+            },
+        )
+    }
+
     /// Standalone exact-weight sidecar probe. The HFQ4 nibbles are expanded
     /// once to unsigned int8 while preserving each group's FP32 scale/zero.
     #[allow(clippy::too_many_arguments)]

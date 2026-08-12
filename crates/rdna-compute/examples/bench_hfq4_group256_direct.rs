@@ -167,6 +167,7 @@ fn main() {
     let mut group128_tile64_planar_quad_uint4 = false;
     let mut group128_f16_accum = false;
     let mut group128_half_meta = false;
+    let mut group128_half_meta_quad_row = false;
     let mut f32a_k32 = false;
     let mut f32a_k32_unique_decode = false;
     let mut f32a_k32_compact_decode = false;
@@ -230,6 +231,7 @@ fn main() {
             "--group128-tile64-planar-quad-uint4" => group128_tile64_planar_quad_uint4 = true,
             "--group128-f16-accum" => group128_f16_accum = true,
             "--group128-half-meta" => group128_half_meta = true,
+            "--group128-half-meta-quad-row" => group128_half_meta_quad_row = true,
             "--f32a-k32" => f32a_k32 = true,
             "--f32a-k32-unique-decode" => f32a_k32_unique_decode = true,
             "--f32a-k32-compact-decode" => f32a_k32_compact_decode = true,
@@ -279,6 +281,7 @@ fn main() {
             group128_tile64_planar_quad_uint4,
             group128_f16_accum,
             group128_half_meta,
+            group128_half_meta_quad_row,
             f32a_k32,
             f32a_k32_unique_decode,
             f32a_k32_compact_decode,
@@ -303,7 +306,7 @@ fn main() {
     let a = gpu
         .upload_raw(&build_hfq4g256(m, k, zero_metadata), &[m, k])
         .expect("upload A");
-    let a_half_meta = group128_half_meta.then(|| {
+    let a_half_meta = (group128_half_meta || group128_half_meta_quad_row).then(|| {
         gpu.upload_raw(&build_hfq4g256_half_meta(m, k, zero_metadata), &[m, k])
             .expect("upload half-meta A")
     });
@@ -338,7 +341,11 @@ fn main() {
         .expect("quantize group256");
 
     let run128 = |gpu: &mut Gpu| {
-        if f32a_k32_unique_decode
+        if group128_j0_nounroll || group128_half_meta_quad_row {
+            gpu.gemm_hfq4g256_mmq_prequant_x256y64_group128_quad_row_u32x2(
+                &a, xq128, &y128, m, k, n, add,
+            )
+        } else if f32a_k32_unique_decode
             || f32a_k32_compact_decode
             || f32a_k32_compact_perm_decode
             || f32a_k64
@@ -472,6 +479,16 @@ fn main() {
                 n,
                 add,
             )
+        } else if group128_half_meta_quad_row {
+            gpu.gemm_hfq4g256_mmq_prequant_x256y64_group128_half_meta_quad_row(
+                a_half_meta.as_ref().expect("half-meta weights"),
+                xq128,
+                &y256,
+                m,
+                k,
+                n,
+                add,
+            )
         } else if f32a_k32 {
             if add {
                 gpu.gemm_hfq4g256_f32a_wmma_128x64_k32_add(&a, &x, &y256, m, k, n)
@@ -565,6 +582,8 @@ fn main() {
             } else {
                 "f32a-k32"
             }
+        } else if group128_j0_nounroll || group128_half_meta_quad_row {
+            "group128-quad-row-u32x2"
         } else {
             "group128-lds"
         }
@@ -628,6 +647,8 @@ fn main() {
             "group128-f16-accum"
         } else if group128_half_meta {
             "group128-half-meta"
+        } else if group128_half_meta_quad_row {
+            "group128-half-meta-quad-row"
         } else if f32a_k32 {
             "f32a-k32"
         } else if f32a_k32_unique_decode {
