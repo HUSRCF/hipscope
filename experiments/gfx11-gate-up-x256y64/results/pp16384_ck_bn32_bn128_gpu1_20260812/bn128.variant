@@ -1,0 +1,16 @@
+gpu_arch=gfx1100
+ck_bm=64
+ck_bn=128
+ck_root=/home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-flashattn-beta-latest/experiments/flash-attn-ck-sidecar/build/ck-source
+dense_sidecar=/home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-flashattn-beta-latest/experiments/flash-attn-ck-sidecar/build/libhipfire_flash_attn_ck.so
+ck_tree_sha256=f21ec9563689c7cadf1e1f7bdb54ab2f44c3b4753bc33eeafd1a00500f3ec7df
+local_tree_sha256=28fcd2163138a2108e584ca8992a376539616969c2bad40ac0c4606b99f153ba
+staged=1
+packet_store=0
+asym3_codebook=0
+asym3_lds_codebook=0
+092fe41de4bd8bba2ec05eba263582f2476b38825f81e4075d7ee759e8b1eee0  experiments/flash-attn-ck-sidecar/quantized/build_quantized_sidecar.sh
+e7deca6f3ec196f7d594ed7c0509d55e9f3a6b5531128b7a62fd53009b76384d  /home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-flashattn-beta-latest/experiments/flash-attn-ck-sidecar/build/ck-source/example/ck_tile/01_fmha/fmha_fwd.hpp
+8a3f7411be49893474042697359dce476ae0d75ecbde38637c6e1cd3e9f60fa9  /home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-prefill-beta-latest/experiments/flash-attn-ck-sidecar/quantized/quantized_ck_pipeline_smoke.hip
+93b04770dee273f6a6c5379906d50a812d36821afb91843e1925dbe8fba79c9c  /home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-prefill-beta-latest/experiments/flash-attn-ck-sidecar/quantized/quantized_kv_predecode.hpp
+57cb01d47a642c126ef482d1ebf9a4c254d24e59b6f9beae1249d53c511c813e  /home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-flashattn-beta-latest/experiments/flash-attn-ck-sidecar/build/libhipfire_flash_attn_ck.so

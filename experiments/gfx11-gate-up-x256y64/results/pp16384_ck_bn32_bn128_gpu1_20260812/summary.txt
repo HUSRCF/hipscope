@@ -1,0 +1,4 @@
+bn32: process_median=1124.900 raw=[1148.9, 1124.9, 1122.4]
+bn128: process_median=1124.800 raw=[1123.3, 1129.8, 1124.8]
+paired_ratio_median=1.002138x positive_pairs=2/3 raw_pair_ratios=[0.977718, 1.004356, 1.002138]
+token_ids_match=True bad_pairs=[] bn32_variants=1 bn128_variants=1

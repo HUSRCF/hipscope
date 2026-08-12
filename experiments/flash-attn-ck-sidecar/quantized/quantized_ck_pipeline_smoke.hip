@@ -66,7 +66,8 @@ static_assert(offsetof(hipfire_flash_attn_ck_quantized_prefill_params,
 constexpr int kFmhaBlockM = HIPFIRE_CK_FMHA_BM;
 constexpr int kFmhaBlockN = HIPFIRE_CK_FMHA_BN;
 static_assert(kFmhaBlockM == 16 || kFmhaBlockM == 32 || kFmhaBlockM == 64);
-static_assert(kFmhaBlockN == 32 || kFmhaBlockN == 64);
+static_assert(kFmhaBlockN == 32 || kFmhaBlockN == 64 || kFmhaBlockN == 128);
+static_assert(kFmhaBlockN != 128 || kFmhaBlockM == 64);
 static_assert(kFmhaBlockM % 16 == 0);
 using FmhaOutput = std::conditional_t<HIPFIRE_CK_FMHA_OUTPUT_F32 != 0,
                                       float,
