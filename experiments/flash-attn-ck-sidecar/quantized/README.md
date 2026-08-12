@@ -112,6 +112,20 @@ production N64 recipe is retained;
 the rejected patch and raw data are archived under
 `results/staged_dense_bn32_gpu1_20260811/`.
 
+The full mature FA4 gfx11 D256 source path was then tested separately from the
+local N32-only patch. It combines the D256 M64/N32 long-query dispatch with
+FA4's Wave32 register-P redistribution; generated sources keep the default O
+epilogue. Ten alternating component pairs on an idle W7900 measured a 1.1268x
+aggregate attention-local paired speedup, with all ten pairs positive and
+elementwise `max_abs=0` against the candidate's packed reference. A five-pair
+strict-semantics Qwen3.6-27B PP16384 validation measured `1130.0` versus
+`1120.6 tok/s`, a 1.00795x paired median with 5/5 positive pairs and exact
+greedy token IDs. This is a small production prefill improvement consistent
+with attention's limited wall-time share, not a general 12.7% model speedup.
+The source is pinned to FA4 commit
+`be194c0792e79ae26f71bf507e51b4d9136cf22c`; compact evidence is under
+`results/staged_fa4_gfx11_d256_gpu1_20260812/`.
+
 The loader smoke also compares scalar element decoding with a 32-dimension
 batch decoder. The latter shares one Asym3 cnorm, four packed words, and one Q8
 scale per work item. It is a deliberate ablation, not the selected path: on
