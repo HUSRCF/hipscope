@@ -64,6 +64,24 @@ HEAD_DIMS=64,128,256 \
 Use `GPU_ARCH=gfx1201` for the native gfx12 recipe. Unsupported architecture
 families fail before generation.
 
+The optional gfx11 D256 build can instead consume the mature FA4 CK recipe at
+the exact top-level revision `be194c0792e79ae26f71bf507e51b4d9136cf22c`:
+
+```bash
+FLASH_ATTN_ROOT=/path/to/flash-attention-fa4 \
+CK_USE_FA4_GFX11_D256_RECIPE=1 \
+GPU_ARCH=gfx1100 \
+HEAD_DIMS=256 \
+OUT="$PWD/experiments/flash-attn-ck-sidecar/build-fa4-gfx11-d256/libhipfire_flash_attn_ck.so" \
+  ./experiments/flash-attn-ck-sidecar/build_sidecar.sh
+```
+
+This mode archives only `csrc/composable_kernel` from the pinned revision, so
+uncommitted changes in the source checkout are excluded. It selects the FA4
+D256 long-query M64/N32 path and its Wave32 register-P redistribution. The
+generated instances explicitly disable the optional native-O epilogue, so the
+measured result must not be attributed to native-O.
+
 The build uses the selected CK sources directly and has no PyTorch dependency.
 No `.so` is copied into or committed to hipfire.
 

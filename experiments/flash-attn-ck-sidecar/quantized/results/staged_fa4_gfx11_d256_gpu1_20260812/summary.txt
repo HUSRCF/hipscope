@@ -1,0 +1,4 @@
+pinned_ck: process_median=1120.600 raw=[1125.6, 1119.5, 1120.6, 1119.5, 1122.2]
+native_recipe: process_median=1130.000 raw=[1133.3, 1130.0, 1130.1, 1128.4, 1128.3]
+paired_ratio_median=1.007950x positive_pairs=5/5 raw_pair_ratios=[1.006841, 1.009379, 1.008478, 1.00795, 1.005436]
+token_ids_match=True bad_pairs=[] pinned_ck_variants=1 native_recipe_variants=1

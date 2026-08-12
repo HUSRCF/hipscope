@@ -13,6 +13,8 @@ HIP_ROOT="$("${ROCM_PATH}/bin/hipconfig" --path)"
 HIP_LIB_DIR="${HIP_ROOT}/lib"
 EXTERNAL_CK_ROOT="${FLASH_ATTN_ROOT}/csrc/composable_kernel"
 REQUIRED_CK_REV="13f6d635653bd5ffbfcac8577f1ef09590c23d78"
+FA4_GFX11_D256_REV="be194c0792e79ae26f71bf507e51b4d9136cf22c"
+CK_USE_FA4_GFX11_D256_RECIPE="${CK_USE_FA4_GFX11_D256_RECIPE:-0}"
 RECIPE_PATCH="${ROOT}/gfx11_ck_recipe.patch"
 REQUIRED_RECIPE_SHA256="b43ea8d12e14cef04518225acaa69b63e62991ba4a83efcd596fc108105ac765"
 CK_ROOT="${BUILD_DIR}/ck-source"
@@ -46,17 +48,33 @@ case "${CK_TARGET}:${HEAD_DIMS}" in
         ;;
 esac
 
+if [[ "${CK_USE_FA4_GFX11_D256_RECIPE}" == "1" ]]; then
+    if [[ "${CK_TARGET}:${HEAD_DIMS}" != "gfx11:256" ]]; then
+        echo "FA4 gfx11 recipe currently supports HEAD_DIMS=256 only" >&2
+        exit 2
+    fi
+    CK_SOURCE_REV="${FA4_GFX11_D256_REV}"
+    CK_GIT_ROOT="${CK_GIT_ROOT:-${FLASH_ATTN_ROOT}}"
+    CK_ARCHIVE_SUBTREE="${CK_ARCHIVE_SUBTREE:-csrc/composable_kernel}"
+    APPLY_GFX11_RECIPE=0
+    EXPECTED_GENERATED_SOURCES=17
+else
+    CK_SOURCE_REV="${REQUIRED_CK_REV}"
+    CK_GIT_ROOT="${EXTERNAL_CK_ROOT}"
+    CK_ARCHIVE_SUBTREE=""
+fi
+
 if [[ ! -f "${HIP_LIB_DIR}/libamdhip64.so" ]]; then
     echo "missing HIP runtime under ${HIP_LIB_DIR}" >&2
     exit 2
 fi
 
-if [[ ! -d "${EXTERNAL_CK_ROOT}/.git" && ! -f "${EXTERNAL_CK_ROOT}/.git" ]]; then
-    echo "missing composable_kernel git checkout under ${EXTERNAL_CK_ROOT}" >&2
+if [[ ! -d "${EXTERNAL_CK_ROOT}" ]]; then
+    echo "missing composable_kernel source under ${EXTERNAL_CK_ROOT}" >&2
     exit 2
 fi
-if ! git -C "${EXTERNAL_CK_ROOT}" cat-file -e "${REQUIRED_CK_REV}^{commit}"; then
-    echo "composable_kernel checkout does not contain required revision ${REQUIRED_CK_REV}" >&2
+if ! git -C "${CK_GIT_ROOT}" cat-file -e "${CK_SOURCE_REV}^{commit}"; then
+    echo "composable_kernel checkout does not contain requested revision ${CK_SOURCE_REV}" >&2
     exit 2
 fi
 if (( APPLY_GFX11_RECIPE )); then
@@ -81,7 +99,11 @@ reset_dir "${BUILD_DIR}/generated"
 reset_dir "${BUILD_DIR}/objects"
 reset_dir "${CK_ROOT}"
 
-git -C "${EXTERNAL_CK_ROOT}" archive "${REQUIRED_CK_REV}" | tar -x -C "${CK_ROOT}"
+if [[ -n "${CK_ARCHIVE_SUBTREE}" ]]; then
+    git -C "${CK_GIT_ROOT}" archive "${CK_SOURCE_REV}:${CK_ARCHIVE_SUBTREE}" | tar -x -C "${CK_ROOT}"
+else
+    git -C "${CK_GIT_ROOT}" archive "${CK_SOURCE_REV}" | tar -x -C "${CK_ROOT}"
+fi
 if (( APPLY_GFX11_RECIPE )); then
     patch -d "${CK_ROOT}" -p1 < "${RECIPE_PATCH}"
 fi
