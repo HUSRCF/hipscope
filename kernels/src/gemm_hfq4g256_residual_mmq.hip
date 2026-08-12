@@ -122,6 +122,9 @@
 #ifndef MMQ_INTERLEAVE_ROW_WMMA
 #define MMQ_INTERLEAVE_ROW_WMMA 0
 #endif
+#ifndef MMQ_Q8_GROUP128_J0_NOUNROLL
+#define MMQ_Q8_GROUP128_J0_NOUNROLL 0
+#endif
 #ifndef MMQ_WEIGHT_OCT_ROW_U32X2
 #define MMQ_WEIGHT_OCT_ROW_U32X2 0
 #endif
@@ -1792,7 +1795,11 @@ static __device__ __forceinline__ void vec_dot_q8_1_group128_mma(
         }
     }
 #else
+#if MMQ_Q8_GROUP128_J0_NOUNROLL
+    #pragma unroll 1
+#else
     #pragma unroll
+#endif
     for (int j0 = 0; j0 < MMQ_X; j0 += col_groups * tile_C::J) {
 #if MMQ_Q8_GROUP128_SERIAL_ROW
         const int j = j0 + tile_C::get_j(0);

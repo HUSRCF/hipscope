@@ -156,6 +156,7 @@ fn main() {
     let mut group128_dual_row_scalar2 = false;
     let mut group128_quad_row_u32x2 = false;
     let mut group128_interleave_row_wmma = false;
+    let mut group128_j0_nounroll = false;
     let mut group128_quad_row_min1 = false;
     let mut group128_quad_row_vector_activation = false;
     let mut group128_quad_row_vector_activation_batch3 = false;
@@ -216,6 +217,7 @@ fn main() {
             "--group128-dual-row-scalar2" => group128_dual_row_scalar2 = true,
             "--group128-quad-row-u32x2" => group128_quad_row_u32x2 = true,
             "--group128-interleave-row-wmma" => group128_interleave_row_wmma = true,
+            "--group128-j0-nounroll" => group128_j0_nounroll = true,
             "--group128-quad-row-min1" => group128_quad_row_min1 = true,
             "--group128-quad-row-vector-activation" => group128_quad_row_vector_activation = true,
             "--group128-quad-row-vector-activation-batch3" => {
@@ -266,6 +268,7 @@ fn main() {
             group128_dual_row_scalar2,
             group128_quad_row_u32x2,
             group128_interleave_row_wmma,
+            group128_j0_nounroll,
             group128_quad_row_min1,
             group128_quad_row_vector_activation,
             group128_quad_row_vector_activation_batch3,
@@ -316,9 +319,15 @@ fn main() {
         .map(|idx| ((idx * 17 + idx / k * 31) % 101) as f32 * 0.01 - 0.5)
         .collect();
     let x = gpu.upload_f32(&x_host, &[n, k]).expect("upload X");
-    let zeros = vec![0.0f32; n * m];
-    let y128 = gpu.upload_f32(&zeros, &[n, m]).expect("group128 output");
-    let y256 = gpu.upload_f32(&zeros, &[n, m]).expect("group256 output");
+    let output_seed: Vec<f32> = (0..n * m)
+        .map(|idx| ((idx * 13 + idx / m * 7) % 43) as f32 * 0.0025 - 0.05)
+        .collect();
+    let y128 = gpu
+        .upload_f32(&output_seed, &[n, m])
+        .expect("group128 output");
+    let y256 = gpu
+        .upload_f32(&output_seed, &[n, m])
+        .expect("group256 output");
     let xq128_storage = gpu.hip.malloc((k / 128) * n * 144).expect("Xq128");
     let xq256_storage = gpu.hip.malloc((k / 128) * n * 144).expect("Xq256");
     let xq128 = xq128_storage.as_ptr();
@@ -399,6 +408,10 @@ fn main() {
             )
         } else if group128_interleave_row_wmma {
             gpu.gemm_hfq4g256_mmq_prequant_x256y64_group128_interleave_row_wmma(
+                &a, xq128, &y256, m, k, n, add,
+            )
+        } else if group128_j0_nounroll {
+            gpu.gemm_hfq4g256_mmq_prequant_x256y64_group128_j0_nounroll(
                 &a, xq128, &y256, m, k, n, add,
             )
         } else if group128_quad_row_min1 {
@@ -593,6 +606,8 @@ fn main() {
             "group128-quad-row-u32x2"
         } else if group128_interleave_row_wmma {
             "group128-interleave-row-wmma"
+        } else if group128_j0_nounroll {
+            "group128-j0-nounroll"
         } else if group128_quad_row_min1 {
             "group128-quad-row-min1"
         } else if group128_quad_row_vector_activation {

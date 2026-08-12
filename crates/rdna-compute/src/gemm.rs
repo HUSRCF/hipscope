@@ -18252,6 +18252,81 @@ impl Gpu {
         )
     }
 
+    /// Standalone exact-contract probe that limits N-subtile unrolling to
+    /// test whether lower peak VGPR pressure outweighs private accumulator storage.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_hfq4g256_mmq_prequant_x256y64_group128_j0_nounroll(
+        &mut self,
+        a_raw: &GpuTensor,
+        x_q8_ptr: *mut c_void,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        add: bool,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if !self.arch_caps.is_gfx1100() || m % 64 != 0 || k % 256 != 0 || batch_size % 256 != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "group128 j0 no-unroll requires gfx1100 and M%64=K%256=N%256=0",
+            ));
+        }
+        const MODULE: &str = "gemm_hfq4g256_mmq_x256y64_group128_j0_nounroll";
+        let kernel = if add {
+            "gemm_hfq4g256_mmq_x256y64_group128_j0_nounroll_full_add"
+        } else {
+            "gemm_hfq4g256_mmq_x256y64_group128_j0_nounroll_full_set"
+        };
+        static SRC: OnceLock<String> = OnceLock::new();
+        let src = SRC.get_or_init(|| {
+            let body = kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_SRC.replace(
+                "gemm_hfq4g256_residual_mmq",
+                MODULE,
+            );
+            format!(
+                "#define MMQ_X 256\n#define MMQ_Y 64\n#define MMQ_ROW_FRAGS 2\n#define MMQ_COL_GROUPS 4\n#define MMQ_PERM_NIBBLE 1\n#define MMQ_Q8_GROUP128 1\n#define MMQ_WEIGHT_QUAD_ROW_U32X2 1\n#define MMQ_Q8_GROUP128_J0_NOUNROLL 1\n{body}",
+            )
+        });
+        self.ensure_kernel(MODULE, src, kernel)?;
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut xq_ptr = x_q8_ptr;
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+        let mut add_val = i32::from(add);
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut xq_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+            &mut add_val as *mut _ as *mut c_void,
+        ];
+        let shared_mem = ((256 * 36 + 64 * 76) * std::mem::size_of::<i32>()
+            + 256 * std::mem::size_of::<f32>()) as u32;
+        self.launch_maybe_blob(
+            kernel,
+            [(m / 64) as u32, (batch_size / 256) as u32, 1],
+            [32, 8, 1],
+            shared_mem,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(xq_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b.push_i32(add_val);
+                b
+            },
+        )
+    }
+
     /// Standalone FFN dataflow probe: production quad-row math with an FP16
     /// output epilogue. This is deliberately not selected by serving dispatch.
     #[allow(clippy::too_many_arguments)]
