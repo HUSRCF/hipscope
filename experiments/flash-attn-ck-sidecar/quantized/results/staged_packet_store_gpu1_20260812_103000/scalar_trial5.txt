@@ -1,0 +1,4 @@
+seqlen_q=2048,seqlen_k=2048,packed_ck_ms=3.31327105,staged_ck_ms=1.39591599,staged_speedup=2.37354612,max_abs=6.10351562e-05,mean_abs=5.01400014e-07,staged_scratch_bytes=58720256
+seqlen_q=2048,seqlen_k=4096,packed_ck_ms=9.02964783,staged_ck_ms=3.33362889,staged_speedup=2.70865417,max_abs=1.90734863e-06,mean_abs=9.28949362e-08,staged_scratch_bytes=67108864
+seqlen_q=2048,seqlen_k=6144,packed_ck_ms=14.3155117,staged_ck_ms=5.46098185,staged_speedup=2.62141728,max_abs=9.53674316e-07,mean_abs=5.43407547e-08,staged_scratch_bytes=75497472
+seqlen_q=2048,seqlen_k=8192,packed_ck_ms=19.9221725,staged_ck_ms=7.74277401,staged_speedup=2.57300186,max_abs=4.76837158e-07,mean_abs=3.8546015e-08,staged_scratch_bytes=83886080

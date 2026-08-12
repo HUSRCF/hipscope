@@ -5,12 +5,13 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SIDECAR_ROOT="$(cd "${ROOT}/.." && pwd)"
 ROCM_PATH="${ROCM_PATH:-/opt/rocm}"
 GPU_ARCH="${GPU_ARCH:-gfx1100}"
-CK_ROOT="${SIDECAR_ROOT}/build/ck-source"
+CK_ROOT="${CK_ROOT:-${SIDECAR_ROOT}/build/ck-source}"
 FMHA_DIR="${CK_ROOT}/example/ck_tile/01_fmha"
-BUILD_DIR="${ROOT}/build"
+BUILD_DIR="${BUILD_DIR:-${ROOT}/build}"
 OUT="${OUT:-${BUILD_DIR}/libhipfire_flash_attn_ck_quantized.so}"
 DENSE_SIDECAR="${DENSE_SIDECAR:-${SIDECAR_ROOT}/build/libhipfire_flash_attn_ck.so}"
 STAGED="${STAGED:-0}"
+PACKET_STORE="${PACKET_STORE:-0}"
 ASYM3_CODEBOOK="${ASYM3_CODEBOOK:-0}"
 ASYM3_LDS_CODEBOOK="${ASYM3_LDS_CODEBOOK:-0}"
 HIP_ROOT="$("${ROCM_PATH}/bin/hipconfig" --path)"
@@ -18,6 +19,14 @@ HIP_LIB_DIR="${HIP_ROOT}/lib"
 
 extra_defines=()
 extra_links=()
+case "${PACKET_STORE}" in
+    0) ;;
+    1) extra_defines+=("-DHIPFIRE_PREDECODE_PACKET_STORE=1") ;;
+    *)
+        echo "PACKET_STORE must be 0 or 1" >&2
+        exit 2
+        ;;
+esac
 if [[ "${ASYM3_CODEBOOK}" == "1" && "${ASYM3_LDS_CODEBOOK}" == "1" ]]; then
     echo "ASYM3_CODEBOOK and ASYM3_LDS_CODEBOOK are mutually exclusive" >&2
     exit 2
@@ -104,3 +113,14 @@ SMOKE="$(dirname "${OUT}")/smoke_quantized_abi"
     -Wl,-rpath,"$(dirname "${OUT}")" \
     -o "${SMOKE}"
 "${SMOKE}"
+
+{
+    printf 'gpu_arch=%s\n' "${GPU_ARCH}"
+    printf 'staged=%s\n' "${STAGED}"
+    printf 'packet_store=%s\n' "${PACKET_STORE}"
+    printf 'asym3_codebook=%s\n' "${ASYM3_CODEBOOK}"
+    printf 'asym3_lds_codebook=%s\n' "${ASYM3_LDS_CODEBOOK}"
+    sha256sum \
+        "${ROOT}/quantized_ck_pipeline_smoke.hip" \
+        "${ROOT}/quantized_kv_predecode.hpp"
+} > "${OUT}.variant"

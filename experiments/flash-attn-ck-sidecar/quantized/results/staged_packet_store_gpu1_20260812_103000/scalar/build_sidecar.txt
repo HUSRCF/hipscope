@@ -1,0 +1,107 @@
+In file included from /home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-prefill-beta-latest/experiments/flash-attn-ck-sidecar/quantized/quantized_ck_pipeline_smoke.hip:8:
+In file included from /home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-prefill-beta-latest/experiments/flash-attn-ck-sidecar/quantized/quantized_ck_buffer_view.hpp:5:
+In file included from /home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-flashattn-beta-latest/experiments/flash-attn-ck-sidecar/build/ck-source/include/ck_tile/core.hpp:6:
+In file included from /home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-flashattn-beta-latest/experiments/flash-attn-ck-sidecar/build/ck-source/include/ck_tile/core/algorithm/cluster_descriptor.hpp:7:
+In file included from /home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-flashattn-beta-latest/experiments/flash-attn-ck-sidecar/build/ck-source/include/ck_tile/core/algorithm/coordinate_transform.hpp:7:
+In file included from /home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-flashattn-beta-latest/experiments/flash-attn-ck-sidecar/build/ck-source/include/ck_tile/core/container/multi_index.hpp:7:
+In file included from /home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-flashattn-beta-latest/experiments/flash-attn-ck-sidecar/build/ck-source/include/ck_tile/core/container/array.hpp:13:
+In file included from /home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-flashattn-beta-latest/experiments/flash-attn-ck-sidecar/build/ck-source/include/ck_tile/core/utility/functional.hpp:9:
+In file included from /home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-flashattn-beta-latest/experiments/flash-attn-ck-sidecar/build/ck-source/include/ck_tile/core/container/sequence.hpp:9:
+/home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-flashattn-beta-latest/experiments/flash-attn-ck-sidecar/build/ck-source/include/ck_tile/core/numeric/math.hpp:46:21: warning: use of CUDA/HIP target attributes on deduction guides is deprecated; they will be rejected in a future version of Clang [-Wdeprecated-attributes]
+   46 | __host__ __device__ scales(Scale) -> scales<Scale>;
+      |                     ^
+/home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-flashattn-beta-latest/experiments/flash-attn-ck-sidecar/build/ck-source/include/ck_tile/core/numeric/math.hpp:70:21: warning: use of CUDA/HIP target attributes on deduction guides is deprecated; they will be rejected in a future version of Clang [-Wdeprecated-attributes]
+   70 | __host__ __device__ plus() -> plus<void, void>;
+      |                     ^
+/home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-flashattn-beta-latest/experiments/flash-attn-ck-sidecar/build/ck-source/include/ck_tile/core/numeric/math.hpp:94:21: warning: use of CUDA/HIP target attributes on deduction guides is deprecated; they will be rejected in a future version of Clang [-Wdeprecated-attributes]
+   94 | __host__ __device__ minus() -> minus<void, void>;
+      |                     ^
+/home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-flashattn-beta-latest/experiments/flash-attn-ck-sidecar/build/ck-source/include/ck_tile/core/numeric/math.hpp:118:21: warning: use of CUDA/HIP target attributes on deduction guides is deprecated; they will be rejected in a future version of Clang [-Wdeprecated-attributes]
+  118 | __host__ __device__ multiplies() -> multiplies<void, void>;
+      |                     ^
+/home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-flashattn-beta-latest/experiments/flash-attn-ck-sidecar/build/ck-source/include/ck_tile/core/numeric/math.hpp:349:21: warning: use of CUDA/HIP target attributes on deduction guides is deprecated; they will be rejected in a future version of Clang [-Wdeprecated-attributes]
+  349 | __host__ __device__ equal() -> equal<void, void>;
+      |                     ^
+/home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-flashattn-beta-latest/experiments/flash-attn-ck-sidecar/build/ck-source/include/ck_tile/core/numeric/math.hpp:391:21: warning: use of CUDA/HIP target attributes on deduction guides is deprecated; they will be rejected in a future version of Clang [-Wdeprecated-attributes]
+  391 | __host__ __device__ less() -> less<void, void>;
+      |                     ^
+/home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-flashattn-beta-latest/experiments/flash-attn-ck-sidecar/build/ck-source/include/ck_tile/core/numeric/math.hpp:415:21: warning: use of CUDA/HIP target attributes on deduction guides is deprecated; they will be rejected in a future version of Clang [-Wdeprecated-attributes]
+  415 | __host__ __device__ less_equal() -> less_equal<void, void>;
+      |                     ^
+In file included from /home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-prefill-beta-latest/experiments/flash-attn-ck-sidecar/quantized/quantized_ck_pipeline_smoke.hip:8:
+In file included from /home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-prefill-beta-latest/experiments/flash-attn-ck-sidecar/quantized/quantized_ck_buffer_view.hpp:5:
+In file included from /home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-flashattn-beta-latest/experiments/flash-attn-ck-sidecar/build/ck-source/include/ck_tile/core.hpp:69:
+/home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-flashattn-beta-latest/experiments/flash-attn-ck-sidecar/build/ck-source/include/ck_tile/core/tensor/sweep_tile.hpp:306:28: warning: use of CUDA/HIP target attributes on deduction guides is deprecated; they will be rejected in a future version of Clang [-Wdeprecated-attributes]
+  306 | CK_TILE_HOST_DEVICE_EXTERN tile_sweeper(const T&, const F&, U = {}) -> tile_sweeper<T, F, U>;
+      |                            ^
+In file included from /home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-prefill-beta-latest/experiments/flash-attn-ck-sidecar/quantized/quantized_ck_pipeline_smoke.hip:8:
+In file included from /home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-prefill-beta-latest/experiments/flash-attn-ck-sidecar/quantized/quantized_ck_buffer_view.hpp:5:
+In file included from /home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-flashattn-beta-latest/experiments/flash-attn-ck-sidecar/build/ck-source/include/ck_tile/core.hpp:103:
+/home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-flashattn-beta-latest/experiments/flash-attn-ck-sidecar/build/ck-source/include/ck_tile/core/utility/unary_element_function.hpp:52:21: warning: use of CUDA/HIP target attributes on deduction guides is deprecated; they will be rejected in a future version of Clang [-Wdeprecated-attributes]
+   52 | __host__ __device__ composes(Ts&&...) -> composes<remove_cvref_t<Ts>...>;
+      |                     ^
+In file included from /home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-prefill-beta-latest/experiments/flash-attn-ck-sidecar/quantized/quantized_ck_pipeline_smoke.hip:15:
+In file included from /home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-flashattn-beta-latest/experiments/flash-attn-ck-sidecar/build/ck-source/example/ck_tile/01_fmha/fmha_fwd.hpp:9:
+In file included from /home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-flashattn-beta-latest/experiments/flash-attn-ck-sidecar/build/ck-source/include/ck_tile/ops/epilogue.hpp:7:
+In file included from /home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-flashattn-beta-latest/experiments/flash-attn-ck-sidecar/build/ck-source/include/ck_tile/ops/epilogue/default_2d_and_dynamic_quant_epilogue.hpp:7:
+In file included from /home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-flashattn-beta-latest/experiments/flash-attn-ck-sidecar/build/ck-source/include/ck_tile/ops/epilogue/dynamic_quant_epilogue.hpp:7:
+In file included from /home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-flashattn-beta-latest/experiments/flash-attn-ck-sidecar/build/ck-source/include/ck_tile/ops/reduce.hpp:6:
+/home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-flashattn-beta-latest/experiments/flash-attn-ck-sidecar/build/ck-source/include/ck_tile/ops/reduce/block/block_reduce.hpp:397:28: warning: use of CUDA/HIP target attributes on deduction guides is deprecated; they will be rejected in a future version of Clang [-Wdeprecated-attributes]
+  397 | CK_TILE_HOST_DEVICE_EXTERN BlockReduce2D(const T&, const typename T::DataType&) -> BlockReduce2D<T>;
+      |                            ^
+10 warnings generated when compiling for gfx1100.
+In file included from /home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-prefill-beta-latest/experiments/flash-attn-ck-sidecar/quantized/quantized_ck_pipeline_smoke.hip:8:
+In file included from /home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-prefill-beta-latest/experiments/flash-attn-ck-sidecar/quantized/quantized_ck_buffer_view.hpp:5:
+In file included from /home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-flashattn-beta-latest/experiments/flash-attn-ck-sidecar/build/ck-source/include/ck_tile/core.hpp:6:
+In file included from /home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-flashattn-beta-latest/experiments/flash-attn-ck-sidecar/build/ck-source/include/ck_tile/core/algorithm/cluster_descriptor.hpp:7:
+In file included from /home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-flashattn-beta-latest/experiments/flash-attn-ck-sidecar/build/ck-source/include/ck_tile/core/algorithm/coordinate_transform.hpp:7:
+In file included from /home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-flashattn-beta-latest/experiments/flash-attn-ck-sidecar/build/ck-source/include/ck_tile/core/container/multi_index.hpp:7:
+In file included from /home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-flashattn-beta-latest/experiments/flash-attn-ck-sidecar/build/ck-source/include/ck_tile/core/container/array.hpp:13:
+In file included from /home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-flashattn-beta-latest/experiments/flash-attn-ck-sidecar/build/ck-source/include/ck_tile/core/utility/functional.hpp:9:
+In file included from /home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-flashattn-beta-latest/experiments/flash-attn-ck-sidecar/build/ck-source/include/ck_tile/core/container/sequence.hpp:9:
+/home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-flashattn-beta-latest/experiments/flash-attn-ck-sidecar/build/ck-source/include/ck_tile/core/numeric/math.hpp:46:21: warning: use of CUDA/HIP target attributes on deduction guides is deprecated; they will be rejected in a future version of Clang [-Wdeprecated-attributes]
+   46 | __host__ __device__ scales(Scale) -> scales<Scale>;
+      |                     ^
+/home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-flashattn-beta-latest/experiments/flash-attn-ck-sidecar/build/ck-source/include/ck_tile/core/numeric/math.hpp:70:21: warning: use of CUDA/HIP target attributes on deduction guides is deprecated; they will be rejected in a future version of Clang [-Wdeprecated-attributes]
+   70 | __host__ __device__ plus() -> plus<void, void>;
+      |                     ^
+/home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-flashattn-beta-latest/experiments/flash-attn-ck-sidecar/build/ck-source/include/ck_tile/core/numeric/math.hpp:94:21: warning: use of CUDA/HIP target attributes on deduction guides is deprecated; they will be rejected in a future version of Clang [-Wdeprecated-attributes]
+   94 | __host__ __device__ minus() -> minus<void, void>;
+      |                     ^
+/home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-flashattn-beta-latest/experiments/flash-attn-ck-sidecar/build/ck-source/include/ck_tile/core/numeric/math.hpp:118:21: warning: use of CUDA/HIP target attributes on deduction guides is deprecated; they will be rejected in a future version of Clang [-Wdeprecated-attributes]
+  118 | __host__ __device__ multiplies() -> multiplies<void, void>;
+      |                     ^
+/home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-flashattn-beta-latest/experiments/flash-attn-ck-sidecar/build/ck-source/include/ck_tile/core/numeric/math.hpp:349:21: warning: use of CUDA/HIP target attributes on deduction guides is deprecated; they will be rejected in a future version of Clang [-Wdeprecated-attributes]
+  349 | __host__ __device__ equal() -> equal<void, void>;
+      |                     ^
+/home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-flashattn-beta-latest/experiments/flash-attn-ck-sidecar/build/ck-source/include/ck_tile/core/numeric/math.hpp:391:21: warning: use of CUDA/HIP target attributes on deduction guides is deprecated; they will be rejected in a future version of Clang [-Wdeprecated-attributes]
+  391 | __host__ __device__ less() -> less<void, void>;
+      |                     ^
+/home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-flashattn-beta-latest/experiments/flash-attn-ck-sidecar/build/ck-source/include/ck_tile/core/numeric/math.hpp:415:21: warning: use of CUDA/HIP target attributes on deduction guides is deprecated; they will be rejected in a future version of Clang [-Wdeprecated-attributes]
+  415 | __host__ __device__ less_equal() -> less_equal<void, void>;
+      |                     ^
+In file included from /home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-prefill-beta-latest/experiments/flash-attn-ck-sidecar/quantized/quantized_ck_pipeline_smoke.hip:8:
+In file included from /home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-prefill-beta-latest/experiments/flash-attn-ck-sidecar/quantized/quantized_ck_buffer_view.hpp:5:
+In file included from /home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-flashattn-beta-latest/experiments/flash-attn-ck-sidecar/build/ck-source/include/ck_tile/core.hpp:69:
+/home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-flashattn-beta-latest/experiments/flash-attn-ck-sidecar/build/ck-source/include/ck_tile/core/tensor/sweep_tile.hpp:306:28: warning: use of CUDA/HIP target attributes on deduction guides is deprecated; they will be rejected in a future version of Clang [-Wdeprecated-attributes]
+  306 | CK_TILE_HOST_DEVICE_EXTERN tile_sweeper(const T&, const F&, U = {}) -> tile_sweeper<T, F, U>;
+      |                            ^
+In file included from /home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-prefill-beta-latest/experiments/flash-attn-ck-sidecar/quantized/quantized_ck_pipeline_smoke.hip:8:
+In file included from /home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-prefill-beta-latest/experiments/flash-attn-ck-sidecar/quantized/quantized_ck_buffer_view.hpp:5:
+In file included from /home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-flashattn-beta-latest/experiments/flash-attn-ck-sidecar/build/ck-source/include/ck_tile/core.hpp:103:
+/home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-flashattn-beta-latest/experiments/flash-attn-ck-sidecar/build/ck-source/include/ck_tile/core/utility/unary_element_function.hpp:52:21: warning: use of CUDA/HIP target attributes on deduction guides is deprecated; they will be rejected in a future version of Clang [-Wdeprecated-attributes]
+   52 | __host__ __device__ composes(Ts&&...) -> composes<remove_cvref_t<Ts>...>;
+      |                     ^
+In file included from /home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-prefill-beta-latest/experiments/flash-attn-ck-sidecar/quantized/quantized_ck_pipeline_smoke.hip:15:
+In file included from /home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-flashattn-beta-latest/experiments/flash-attn-ck-sidecar/build/ck-source/example/ck_tile/01_fmha/fmha_fwd.hpp:9:
+In file included from /home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-flashattn-beta-latest/experiments/flash-attn-ck-sidecar/build/ck-source/include/ck_tile/ops/epilogue.hpp:7:
+In file included from /home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-flashattn-beta-latest/experiments/flash-attn-ck-sidecar/build/ck-source/include/ck_tile/ops/epilogue/default_2d_and_dynamic_quant_epilogue.hpp:7:
+In file included from /home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-flashattn-beta-latest/experiments/flash-attn-ck-sidecar/build/ck-source/include/ck_tile/ops/epilogue/dynamic_quant_epilogue.hpp:7:
+In file included from /home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-flashattn-beta-latest/experiments/flash-attn-ck-sidecar/build/ck-source/include/ck_tile/ops/reduce.hpp:6:
+/home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-flashattn-beta-latest/experiments/flash-attn-ck-sidecar/build/ck-source/include/ck_tile/ops/reduce/block/block_reduce.hpp:397:28: warning: use of CUDA/HIP target attributes on deduction guides is deprecated; they will be rejected in a future version of Clang [-Wdeprecated-attributes]
+  397 | CK_TILE_HOST_DEVICE_EXTERN BlockReduce2D(const T&, const typename T::DataType&) -> BlockReduce2D<T>;
+      |                            ^
+10 warnings generated when compiling for host.
+/home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-prefill-beta-latest/experiments/flash-attn-ck-sidecar/quantized/results/staged_packet_store_gpu1_20260812_103000/scalar/libhipfire_flash_attn_ck_quantized_scalar.so: ELF 64-bit LSB shared object, x86-64, version 1 (SYSV), dynamically linked, not stripped
+128K	/home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-prefill-beta-latest/experiments/flash-attn-ck-sidecar/quantized/results/staged_packet_store_gpu1_20260812_103000/scalar/libhipfire_flash_attn_ck_quantized_scalar.so
+quantized ABI smoke passed: abi=1 workspace=3145728 staged=11534336 bytes

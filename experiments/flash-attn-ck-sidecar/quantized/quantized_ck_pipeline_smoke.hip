@@ -753,7 +753,11 @@ int launch_staged_prefill_impl(
                        p->sin_theta,
                        p->seqlen_q,
                        p->nhead_q);
+#if defined(HIPFIRE_PREDECODE_PACKET_STORE)
+    hipLaunchKernelGGL(hipfire::ck_attention::predecode_asym3_k_q8_v_f16_packet_store,
+#else
     hipLaunchKernelGGL(hipfire::ck_attention::predecode_asym3_k_q8_v_f16,
+#endif
                        dim3(p->seqlen_k, p->nhead_k),
                        dim3(32),
                        0,

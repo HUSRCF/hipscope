@@ -1,0 +1,30 @@
+seqlen=73,kv_heads=4,head_dim=256,packed_bytes=108624,dense_bytes=299008,predecode_f16_ms=0.00609799009,packet_store_ms=0.00576318987,packet_time_ratio=0.945096612,scalar_raw_ms=0.00622877013;0.00609718962;0.00609159004;0.00610558968;0.00609559007;0.00611398974;0.00608358998;0.00611118972;0.00609799009,packet_raw_ms=0.00574958976;0.00575559027;0.00576318987;0.00574398972;0.00585798034;0.00576399034;0.00574199017;0.00577557972;0.00576838991
+dense_k_max_abs=0 dense_k_mean_abs=0
+dense_v_max_abs=0.0009765625 dense_v_mean_abs=0.000120165005
+packet_k_max_abs=0 packet_k_mean_abs=0
+packet_v_max_abs=0.0009765625 packet_v_mean_abs=0.000120165005
+packet_k_bit_mismatches=0 packet_v_bit_mismatches=0
+seqlen=2048,kv_heads=4,head_dim=256,packed_bytes=3047424,dense_bytes=8388608,predecode_f16_ms=0.0752812847,packet_store_ms=0.0131043401,packet_time_ratio=0.174071684,scalar_raw_ms=0.0825674906;0.0761095285;0.074893333;0.0760201216;0.0750825331;0.0757573172;0.0749836937;0.0751688927;0.0752812847,packet_raw_ms=0.0131475199;0.0130507192;0.0132015599;0.01306195;0.0130895497;0.0132063497;0.0130151501;0.0131043401;0.0131735504
+dense_k_max_abs=0 dense_k_mean_abs=0
+dense_v_max_abs=0.0009765625 dense_v_mean_abs=0.000120215249
+packet_k_max_abs=0 packet_k_mean_abs=0
+packet_v_max_abs=0.0009765625 packet_v_mean_abs=0.000120215249
+packet_k_bit_mismatches=0 packet_v_bit_mismatches=0
+seqlen=4096,kv_heads=4,head_dim=256,packed_bytes=6094848,dense_bytes=16777216,predecode_f16_ms=0.176836401,packet_store_ms=0.0306362696,packet_time_ratio=0.173246399,scalar_raw_ms=0.176956847;0.176402837;0.17738004;0.17701;0.176836401;0.175588414;0.177069604;0.17576161;0.176745206,packet_raw_ms=0.0306362696;0.0307018701;0.0306434706;0.0304382704;0.0309302583;0.0306542609;0.0306338593;0.030606661;0.0303626601
+dense_k_max_abs=0 dense_k_mean_abs=0
+dense_v_max_abs=0.0009765625 dense_v_mean_abs=0.00012021677
+packet_k_max_abs=0 packet_k_mean_abs=0
+packet_v_max_abs=0.0009765625 packet_v_mean_abs=0.00012021677
+packet_k_bit_mismatches=0 packet_v_bit_mismatches=0
+seqlen=6144,kv_heads=4,head_dim=256,packed_bytes=9142272,dense_bytes=25165824,predecode_f16_ms=0.299001813,packet_store_ms=0.0476681627,packet_time_ratio=0.15942432,scalar_raw_ms=0.298780531;0.298307031;0.299762636;0.301892996;0.299129784;0.296975046;0.297423035;0.301192194;0.299001813,packet_raw_ms=0.0476461686;0.0476681627;0.0477505773;0.0477117784;0.0475685783;0.0478929803;0.0479033813;0.0476541817;0.047451783
+dense_k_max_abs=0 dense_k_mean_abs=0
+dense_v_max_abs=0.0009765625 dense_v_mean_abs=0.00012021781
+packet_k_max_abs=0 packet_k_mean_abs=0
+packet_v_max_abs=0.0009765625 packet_v_mean_abs=0.00012021781
+packet_k_bit_mismatches=0 packet_v_bit_mismatches=0
+seqlen=8192,kv_heads=4,head_dim=256,packed_bytes=12189696,dense_bytes=33554432,predecode_f16_ms=0.39596656,packet_store_ms=0.0636629015,packet_time_ratio=0.160778478,scalar_raw_ms=0.397323251;0.398426592;0.395781785;0.39909336;0.393891424;0.395444959;0.397114158;0.393654555;0.39596656,packet_raw_ms=0.0637896955;0.0636629015;0.0635421202;0.063427709;0.0637585148;0.0637348965;0.0634692982;0.0636329055;0.0638964996
+dense_k_max_abs=0 dense_k_mean_abs=0
+dense_v_max_abs=0.0009765625 dense_v_mean_abs=0.000120216464
+packet_k_max_abs=0 packet_k_mean_abs=0
+packet_v_max_abs=0.0009765625 packet_v_mean_abs=0.000120216464
+packet_k_bit_mismatches=0 packet_v_bit_mismatches=0

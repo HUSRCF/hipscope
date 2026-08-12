@@ -1,0 +1,1 @@
+/home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-prefill-beta-latest/experiments/flash-attn-ck-sidecar/quantized/results/staged_packet_store_gpu1_20260812_103000/scalar/staged_quantized_ck_bench: ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2, for GNU/Linux 3.2.0, not stripped

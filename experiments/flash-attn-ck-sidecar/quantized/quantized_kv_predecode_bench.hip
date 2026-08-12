@@ -152,6 +152,20 @@ void compare(const char* label,
     }
 }
 
+size_t bit_mismatches(const std::vector<__half>& lhs, const std::vector<__half>& rhs)
+{
+    size_t mismatches = 0;
+    for(size_t index = 0; index < lhs.size(); ++index)
+    {
+        uint16_t lhs_bits = 0;
+        uint16_t rhs_bits = 0;
+        std::memcpy(&lhs_bits, &lhs[index], sizeof(lhs_bits));
+        std::memcpy(&rhs_bits, &rhs[index], sizeof(rhs_bits));
+        mismatches += lhs_bits != rhs_bits;
+    }
+    return mismatches;
+}
+
 #ifndef HIPFIRE_PREDECODE_LIBRARY_ONLY
 
 void run_case(int seqlen)
@@ -168,18 +182,26 @@ void run_case(int seqlen)
     std::vector<__half> expected_v(dense_values);
     std::vector<__half> actual_k(dense_values);
     std::vector<__half> actual_v(dense_values);
+    std::vector<__half> packet_k(dense_values);
+    std::vector<__half> packet_v(dense_values);
     make_packed(packed_k, packed_v, expected_k, expected_v, seqlen);
 
     uint8_t* packed_k_device = nullptr;
     uint8_t* packed_v_device = nullptr;
     __half* dense_k_device = nullptr;
     __half* dense_v_device = nullptr;
+    __half* packet_k_device = nullptr;
+    __half* packet_v_device = nullptr;
     check_hip(hipMalloc(&packed_k_device, k_bytes), "hipMalloc(packed K)");
     check_hip(hipMalloc(&packed_v_device, v_bytes), "hipMalloc(packed V)");
     check_hip(hipMalloc(&dense_k_device, dense_values * sizeof(__half)),
               "hipMalloc(dense K)");
     check_hip(hipMalloc(&dense_v_device, dense_values * sizeof(__half)),
               "hipMalloc(dense V)");
+    check_hip(hipMalloc(&packet_k_device, dense_values * sizeof(__half)),
+              "hipMalloc(packet K)");
+    check_hip(hipMalloc(&packet_v_device, dense_values * sizeof(__half)),
+              "hipMalloc(packet V)");
     check_hip(hipMemcpy(packed_k_device,
                         packed_k.data(),
                         k_bytes,
@@ -191,7 +213,7 @@ void run_case(int seqlen)
                         hipMemcpyHostToDevice),
               "hipMemcpy(packed V)");
 
-    const auto launch = [&]() {
+    const auto launch_scalar = [&]() {
         hipLaunchKernelGGL(hipfire::ck_attention::predecode_asym3_k_q8_v_f16,
                            dim3(seqlen, kKvHeads),
                            dim3(32),
@@ -205,22 +227,39 @@ void run_case(int seqlen)
                            k_row_stride_bytes,
                            v_row_stride_bytes);
     };
+    const auto launch_packet = [&]() {
+        hipLaunchKernelGGL(
+            hipfire::ck_attention::predecode_asym3_k_q8_v_f16_packet_store,
+            dim3(seqlen, kKvHeads),
+            dim3(32),
+            0,
+            nullptr,
+            packed_k_device,
+            packed_v_device,
+            packet_k_device,
+            packet_v_device,
+            seqlen,
+            k_row_stride_bytes,
+            v_row_stride_bytes);
+    };
     for(int iteration = 0; iteration < 20; ++iteration)
     {
-        launch();
+        launch_scalar();
+        launch_packet();
     }
     check_hip(hipDeviceSynchronize(), "hipDeviceSynchronize(warmup)");
 
     constexpr int trials = 9;
     constexpr int iterations = 100;
-    std::vector<float> samples;
-    samples.reserve(trials);
+    std::vector<float> scalar_samples;
+    std::vector<float> packet_samples;
+    scalar_samples.reserve(trials);
+    packet_samples.reserve(trials);
     hipEvent_t start = nullptr;
     hipEvent_t stop = nullptr;
     check_hip(hipEventCreate(&start), "hipEventCreate(start)");
     check_hip(hipEventCreate(&stop), "hipEventCreate(stop)");
-    for(int trial = 0; trial < trials; ++trial)
-    {
+    const auto time_launch = [&](const auto& launch) {
         check_hip(hipEventRecord(start), "hipEventRecord(start)");
         for(int iteration = 0; iteration < iterations; ++iteration)
         {
@@ -231,7 +270,20 @@ void run_case(int seqlen)
         float elapsed_ms = 0.0f;
         check_hip(hipEventElapsedTime(&elapsed_ms, start, stop),
                   "hipEventElapsedTime");
-        samples.push_back(elapsed_ms / static_cast<float>(iterations));
+        return elapsed_ms / static_cast<float>(iterations);
+    };
+    for(int trial = 0; trial < trials; ++trial)
+    {
+        if((trial & 1) == 0)
+        {
+            scalar_samples.push_back(time_launch(launch_scalar));
+            packet_samples.push_back(time_launch(launch_packet));
+        }
+        else
+        {
+            packet_samples.push_back(time_launch(launch_packet));
+            scalar_samples.push_back(time_launch(launch_scalar));
+        }
     }
     check_hip(hipGetLastError(), "predecode launch");
     check_hip(hipMemcpy(actual_k.data(),
@@ -244,22 +296,52 @@ void run_case(int seqlen)
                         dense_values * sizeof(__half),
                         hipMemcpyDeviceToHost),
               "hipMemcpy(dense V)");
+    check_hip(hipMemcpy(packet_k.data(),
+                        packet_k_device,
+                        dense_values * sizeof(__half),
+                        hipMemcpyDeviceToHost),
+              "hipMemcpy(packet K)");
+    check_hip(hipMemcpy(packet_v.data(),
+                        packet_v_device,
+                        dense_values * sizeof(__half),
+                        hipMemcpyDeviceToHost),
+              "hipMemcpy(packet V)");
 
     std::printf("seqlen=%d,kv_heads=%d,head_dim=%d,packed_bytes=%zu,dense_bytes=%zu,"
-                "predecode_f16_ms=%.9g,raw_ms=",
+                "predecode_f16_ms=%.9g,packet_store_ms=%.9g,packet_time_ratio=%.9g,"
+                "scalar_raw_ms=",
                 seqlen,
                 kKvHeads,
                 kHeadDim,
                 k_bytes + v_bytes,
                 dense_values * sizeof(__half) * 2,
-                median(samples));
-    for(size_t index = 0; index < samples.size(); ++index)
+                median(scalar_samples),
+                median(packet_samples),
+                median(packet_samples) / median(scalar_samples));
+    for(size_t index = 0; index < scalar_samples.size(); ++index)
     {
-        std::printf("%s%.9g", index == 0 ? "" : ";", samples[index]);
+        std::printf("%s%.9g", index == 0 ? "" : ";", scalar_samples[index]);
+    }
+    std::printf(",packet_raw_ms=");
+    for(size_t index = 0; index < packet_samples.size(); ++index)
+    {
+        std::printf("%s%.9g", index == 0 ? "" : ";", packet_samples[index]);
     }
     std::putchar('\n');
     compare("dense_k", actual_k, expected_k);
     compare("dense_v", actual_v, expected_v);
+    compare("packet_k", packet_k, expected_k);
+    compare("packet_v", packet_v, expected_v);
+    const size_t k_mismatches = bit_mismatches(actual_k, packet_k);
+    const size_t v_mismatches = bit_mismatches(actual_v, packet_v);
+    std::printf("packet_k_bit_mismatches=%zu packet_v_bit_mismatches=%zu\n",
+                k_mismatches,
+                v_mismatches);
+    if(k_mismatches != 0 || v_mismatches != 0)
+    {
+        std::fprintf(stderr, "packet-store output is not bit-exact\n");
+        std::exit(4);
+    }
 
     check_hip(hipEventDestroy(start), "hipEventDestroy(start)");
     check_hip(hipEventDestroy(stop), "hipEventDestroy(stop)");
@@ -267,6 +349,8 @@ void run_case(int seqlen)
     check_hip(hipFree(packed_v_device), "hipFree(packed V)");
     check_hip(hipFree(dense_k_device), "hipFree(dense K)");
     check_hip(hipFree(dense_v_device), "hipFree(dense V)");
+    check_hip(hipFree(packet_k_device), "hipFree(packet K)");
+    check_hip(hipFree(packet_v_device), "hipFree(packet V)");
 }
 
 #endif

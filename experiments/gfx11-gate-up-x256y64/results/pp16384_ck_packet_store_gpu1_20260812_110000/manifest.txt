@@ -1,0 +1,51 @@
+date=2026-08-12T08:46:40+08:00
+git_commit=9c52e973d3f4205cd594933b7666b31e6deed2e5
+gpu_id=1
+prefill_tokens=16384
+prefill_runs=3
+trials=3
+sleep_secs=20
+scalar_lib=/home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-prefill-beta-latest/experiments/flash-attn-ck-sidecar/quantized/results/staged_packet_store_gpu1_20260812_103000/scalar/libhipfire_flash_attn_ck_quantized_scalar.so
+packet_lib=/home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-prefill-beta-latest/experiments/flash-attn-ck-sidecar/quantized/results/staged_packet_store_gpu1_20260812_103000/packet/libhipfire_flash_attn_ck_quantized_packet.so
+contract=group128, F32 FFN intermediate, accepted batched GDN norm/rotate
+
+
+============================ ROCm System Management Interface ============================
+=================================== % time GPU is busy ===================================
+GPU[0]		: GPU use (%): 0
+GPU[1]		: GPU use (%): 0
+==========================================================================================
+=================================== Current Memory Use ===================================
+GPU[0]		: GPU Memory Allocated (VRAM%): 0
+GPU[0]		: GPU Memory Read/Write Activity (%): 0
+GPU[0]		: Memory Activity: N/A
+GPU[0]		: Avg. Memory Bandwidth: 0
+GPU[1]		: GPU Memory Allocated (VRAM%): 0
+GPU[1]		: GPU Memory Read/Write Activity (%): 0
+GPU[1]		: Memory Activity: N/A
+GPU[1]		: Avg. Memory Bandwidth: 0
+==========================================================================================
+===================================== KFD Processes ======================================
+No KFD PIDs currently running
+==========================================================================================
+====================================== Product Info ======================================
+GPU[0]		: Card Series: 		AMD Radeon Pro W7900
+GPU[0]		: Card Model: 		0x7448
+GPU[0]		: Card Vendor: 		Advanced Micro Devices, Inc. [AMD/ATI]
+GPU[0]		: Card SKU: 		D7070100
+GPU[0]		: Subsystem ID: 	0x0e0d
+GPU[0]		: Device Rev: 		0x00
+GPU[0]		: Node ID: 		1
+GPU[0]		: GUID: 		61205
+GPU[0]		: GFX Version: 		gfx1100
+GPU[1]		: Card Series: 		AMD Radeon Pro W7900 Dual Slot
+GPU[1]		: Card Model: 		0x744a
+GPU[1]		: Card Vendor: 		Advanced Micro Devices, Inc. [AMD/ATI]
+GPU[1]		: Card SKU: 		D7070600
+GPU[1]		: Subsystem ID: 	0x0e0e
+GPU[1]		: Device Rev: 		0x00
+GPU[1]		: Node ID: 		2
+GPU[1]		: GUID: 		35059
+GPU[1]		: GFX Version: 		gfx1100
+==========================================================================================
+================================== End of ROCm SMI Log ===================================

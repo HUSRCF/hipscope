@@ -1,0 +1,5 @@
+5418219cacda124cec6d8479cafcebe60105e2bc7e7147ac67dc9e95b8ff0363  /home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-prefill-beta-latest/target/release/examples/bench_qwen35_mq4
+86a5f80fd29d545abb1093dead242725ced6d68b8607c6d566d897b1a82442dc  /home/husrcf/.hipfire/models/qwen3.6-27b.mq4
+0b19200b65d06294b270949e93ed50aa7d169a571cce141418f6efea019e05b5  /home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-prefill-beta-latest/experiments/flash-attn-ck-sidecar/quantized/results/staged_packet_store_gpu1_20260812_103000/scalar/libhipfire_flash_attn_ck_quantized_scalar.so
+f7592de48df6cca750277f99fe86551aa655e8814dbc13d6c2a212513a714ee5  /home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-prefill-beta-latest/experiments/flash-attn-ck-sidecar/quantized/results/staged_packet_store_gpu1_20260812_103000/packet/libhipfire_flash_attn_ck_quantized_packet.so
+88f387b9edbc3774de9d90fb15f31361bbe73f29562c6ec5000e1603283334a4  experiments/gfx11-gate-up-x256y64/run_pp16384_ck_predecode_packet_ab.sh
