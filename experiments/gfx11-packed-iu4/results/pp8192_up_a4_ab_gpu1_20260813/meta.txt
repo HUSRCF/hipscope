@@ -1,0 +1,8 @@
+gpu_id=1
+trials=5
+trim_each_side=1
+prefill_runs=3
+a4_target=up
+sleep_secs=3
+model=/home/husrcf/.hipfire/models/qwen3.6-27b.mq4
+ck_lib=/tmp/libhipfire_flash_attn_ck_quantized_staged.so

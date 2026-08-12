@@ -18,10 +18,24 @@ to the Q8 group128 contract within FP32 accumulation order, but reaches only
 
 ## Signed-A4 boundary
 
-The group128 activation approximation improved Qwen3.6-27B PP8192 prefill by
-`4.89%`, but failed the longer real-prompt quality gate after 32 matching output
-tokens. A finer group32-scale prototype was then tested only in the standalone
-GEMM harness:
+The original combined gate/up group128 activation approximation improved an
+older Qwen3.6-27B PP8192 path by `4.89%`, but failed the longer real-prompt
+quality gate after 32 matching output tokens. Projection-isolated tests on the
+current production recipe narrowed the result further:
+
+| Mode | PP8192 paired gain | LongBench accuracy | Token-exact vs Q8 |
+| --- | ---: | ---: | ---: |
+| Q8 control | baseline | 8/20 | 20/20 |
+| gate A4 | not retained | 7/20 | 16/20 |
+| up A4 | +2.05% | 8/20 | 15/20 |
+
+The up-only result is a stable five-pair median (`1217.4` vs `1192.9 tok/s`),
+but the output trajectory changes on five of twenty long-context cases. The
+accuracy tie is too small a quality sample to approve a semantic change for a
+2% prefill gain. Both projection-isolation flags therefore remain default-off
+research controls.
+
+A finer group32-scale prototype was tested only in the standalone GEMM harness:
 
 | Activation format | Shape | Q8-relative speed | Relative L2 | Cosine |
 | --- | --- | ---: | ---: | ---: |

@@ -5811,8 +5811,19 @@ impl Gpu {
                         };
                         return r1.and(r2);
                     }
+                    let a4_gate =
+                        self.flags.rdna3_hfq4_gate_up_iu4_a4 || self.flags.rdna3_hfq4_gate_iu4_a4;
+                    let a4_up =
+                        self.flags.rdna3_hfq4_gate_up_iu4_a4 || self.flags.rdna3_hfq4_up_iu4_a4;
+                    let a4_shape = (a4_gate || a4_up)
+                        && self.arch_caps.is_gfx1100()
+                        && gate_m == 17_408
+                        && up_m == 17_408
+                        && k == 5_120
+                        && batch_size == 2_048;
                     if (self.flags.rdna3_q8_group256_serial_row
                         || self.flags.rdna3_q8_group256_gate_up)
+                        && !a4_shape
                         && self.arch_caps.is_gfx1100()
                         && gate_m == 17_408
                         && up_m == 17_408
@@ -5836,27 +5847,76 @@ impl Gpu {
                         };
                         return r1.and(r2);
                     }
-                    if self.flags.rdna3_hfq4_gate_up_iu4_a4
-                        && self.arch_caps.is_gfx1100()
-                        && gate_m == 17_408
-                        && up_m == 17_408
-                        && k == 5_120
-                        && batch_size == 2_048
-                    {
+                    if a4_shape {
                         static ANNOUNCE: std::sync::Once = std::sync::Once::new();
                         ANNOUNCE.call_once(|| {
-                            eprintln!(
-                                "RDNA3 IU4-A4 gate/up prefill active: gfx1100 M=17408 K=5120 N=2048"
-                            );
+                            if a4_gate && a4_up {
+                                eprintln!(
+                                    "RDNA3 IU4-A4 gate/up prefill active: gfx1100 M=17408 K=5120 N=2048"
+                                );
+                            } else {
+                                eprintln!(
+                                    "RDNA3 IU4-A4 projection prefill active: gate={} up={} gfx1100 M=17408 K=5120 N=2048",
+                                    a4_gate, a4_up
+                                );
+                            }
                         });
                         let xq4 = self.ensure_q4_1_group128_x(x, batch_size, k)?;
-                        let r1 = self.gemm_hfq4g256_mmq_iu4_a4(
-                            a_gate, xq4, y_gate, gate_m, k, batch_size, false,
-                        );
-                        let r2 = if r1.is_ok() {
-                            self.gemm_hfq4g256_mmq_iu4_a4(
-                                a_up, xq4, y_up, up_m, k, batch_size, false,
+                        let (r1, a_q8, y_q8, m_q8) = if a4_gate {
+                            (
+                                self.gemm_hfq4g256_mmq_iu4_a4(
+                                    a_gate, xq4, y_gate, gate_m, k, batch_size, false,
+                                ),
+                                a_up,
+                                y_up,
+                                up_m,
                             )
+                        } else {
+                            (
+                                self.gemm_hfq4g256_mmq_iu4_a4(
+                                    a_up, xq4, y_up, up_m, k, batch_size, false,
+                                ),
+                                a_gate,
+                                y_gate,
+                                gate_m,
+                            )
+                        };
+                        let r2 = if r1.is_ok() {
+                            if a4_gate && a4_up {
+                                self.gemm_hfq4g256_mmq_iu4_a4(
+                                    a_up, xq4, y_up, up_m, k, batch_size, false,
+                                )
+                            } else if self.flags.rdna3_q8_group256_serial_row
+                                || self.flags.rdna3_q8_group256_gate_up
+                            {
+                                // Q4_1 and Q8_1 intentionally share activation scratch. The
+                                // A4 launch must precede this re-quantization on the same stream.
+                                let xq8 =
+                                    self.ensure_q8_1_mmq_group256_x(x, batch_size, k)?;
+                                self.gemm_hfq4g256_mmq_prequant_x256y64_group256_serial_row(
+                                    a_q8, xq8, y_q8, m_q8, k, batch_size, false,
+                                )
+                            } else if self.flags.rdna3_q8_group128 {
+                                // Q4_1 and Q8_1 intentionally share activation scratch. The
+                                // A4 launch must precede this re-quantization on the same stream.
+                                let xq8 = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
+                                self.gemm_hfq4g256_mmq_set_prequant_x256y64_perm_group128(
+                                    a_q8, xq8, y_q8, m_q8, k, batch_size,
+                                )
+                            } else {
+                                // Preserve the regular non-grouped Q8 contract for the
+                                // projection not selected by the isolation experiment.
+                                let xq8 = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
+                                if self.flags.rdna3_hfq4_perm_nibble {
+                                    self.gemm_hfq4g256_mmq_set_prequant_x256y64_perm(
+                                        a_q8, xq8, y_q8, m_q8, k, batch_size,
+                                    )
+                                } else {
+                                    self.gemm_hfq4g256_mmq_set_prequant_x256y64(
+                                        a_q8, xq8, y_q8, m_q8, k, batch_size,
+                                    )
+                                }
+                            }
                         } else {
                             Ok(())
                         };
@@ -17055,14 +17115,22 @@ impl Gpu {
         add: bool,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        if !self.arch_caps.is_rdna3_dgpu() || m % 64 != 0 || k % 256 != 0 || batch_size % 256 != 0 {
+        if !self.arch_caps.is_rdna3_dgpu()
+            || !matches!(y.dtype, DType::F32 | DType::F16)
+            || (y.dtype == DType::F16 && add)
+            || m % 64 != 0
+            || k % 256 != 0
+            || batch_size % 256 != 0
+        {
             return Err(hip_bridge::HipError::new(
                 0,
-                "IU4 A4 probe requires gfx11 dGPU and M%64=K%256=N%256=0",
+                "IU4 A4 probe requires gfx11 dGPU, F32 output (set/add) or F16 output (set), and M%64=K%256=N%256=0",
             ));
         }
         const MODULE: &str = "gemm_hfq4g256_mmq_iu4_a4";
-        let kernel = if add {
+        let kernel = if y.dtype == DType::F16 {
+            "gemm_hfq4g256_mmq_iu4_a4_f16_set"
+        } else if add {
             "gemm_hfq4g256_mmq_iu4_a4_add"
         } else {
             "gemm_hfq4g256_mmq_iu4_a4_set"
@@ -18429,6 +18497,83 @@ impl Gpu {
                 0,
                 "FP16 FFN gate/up requires gfx1100, M=17408, K=5120, N%256=0, and FP16 outputs",
             ));
+        }
+        let a4_gate =
+            self.flags.rdna3_hfq4_gate_up_iu4_a4 || self.flags.rdna3_hfq4_gate_iu4_a4;
+        let a4_up =
+            self.flags.rdna3_hfq4_gate_up_iu4_a4 || self.flags.rdna3_hfq4_up_iu4_a4;
+        if (a4_gate || a4_up) && batch_size == 2_048 {
+            static ANNOUNCE: std::sync::Once = std::sync::Once::new();
+            ANNOUNCE.call_once(|| {
+                if a4_gate && a4_up {
+                    eprintln!(
+                        "RDNA3 IU4-A4 gate/up prefill active: gfx1100 M=17408 K=5120 N=2048"
+                    );
+                } else {
+                    eprintln!(
+                        "RDNA3 IU4-A4 projection prefill active: gate={} up={} gfx1100 M=17408 K=5120 N=2048",
+                        a4_gate, a4_up
+                    );
+                }
+            });
+            let xq4 = self.ensure_q4_1_group128_x(x, batch_size, k)?;
+            let (r1, q8_weight, q8_output) = if a4_gate {
+                (
+                    self.gemm_hfq4g256_mmq_iu4_a4(
+                        gate_raw,
+                        xq4,
+                        gate_output,
+                        m,
+                        k,
+                        batch_size,
+                        false,
+                    ),
+                    up_raw,
+                    up_output,
+                )
+            } else {
+                (
+                    self.gemm_hfq4g256_mmq_iu4_a4(
+                        up_raw,
+                        xq4,
+                        up_output,
+                        m,
+                        k,
+                        batch_size,
+                        false,
+                    ),
+                    gate_raw,
+                    gate_output,
+                )
+            };
+            let r2 = if r1.is_ok() {
+                if a4_gate && a4_up {
+                    self.gemm_hfq4g256_mmq_iu4_a4(
+                        up_raw,
+                        xq4,
+                        up_output,
+                        m,
+                        k,
+                        batch_size,
+                        false,
+                    )
+                } else {
+                    // The Q4_1 launch consumes shared activation scratch before
+                    // the same stream reuses it for the production Q8_1 branch.
+                    let xq8 = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
+                    self.gemm_hfq4g256_mmq_prequant_x256y64_group128_quad_row_f16_output(
+                        q8_weight,
+                        xq8,
+                        q8_output,
+                        m,
+                        k,
+                        batch_size,
+                    )
+                }
+            } else {
+                Ok(())
+            };
+            return r1.and(r2);
         }
         let xq = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
         self.gemm_hfq4g256_mmq_prequant_x256y64_group128_quad_row_f16_output(

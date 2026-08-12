@@ -96,6 +96,10 @@ pub struct FeatureFlags {
     /// Approximate signed-A4 activation path using native packed IU4 WMMA for
     /// the validated gfx1100 Qwen3.6 gate/up N=2048 prefill shape. Opt-in.
     pub rdna3_hfq4_gate_up_iu4_a4: bool,
+    /// Research-only projection isolation for the signed-A4 gate branch.
+    pub rdna3_hfq4_gate_iu4_a4: bool,
+    /// Research-only projection isolation for the signed-A4 up branch.
+    pub rdna3_hfq4_up_iu4_a4: bool,
     /// Fuse dense FFN SwiGLU, FWHT rotation, and group128 Q8 packing directly
     /// into MMQ scratch. Requires rdna3_q8_group128 and remains opt-in.
     pub rdna3_fused_swiglu_q8_group128: bool,
@@ -462,6 +466,8 @@ impl FeatureFlags {
                 == Ok("1"),
             rdna3_hfq4_gate_up_iu4_a4: value("HIPFIRE_RDNA3_HFQ4_GATE_UP_IU4_A4").as_deref()
                 == Ok("1"),
+            rdna3_hfq4_gate_iu4_a4: value("HIPFIRE_RDNA3_HFQ4_GATE_IU4_A4").as_deref() == Ok("1"),
+            rdna3_hfq4_up_iu4_a4: value("HIPFIRE_RDNA3_HFQ4_UP_IU4_A4").as_deref() == Ok("1"),
             rdna3_fused_swiglu_q8_group128: value("HIPFIRE_RDNA3_FUSED_SWIGLU_Q8_GROUP128")
                 .as_deref()
                 == Ok("1"),
@@ -744,6 +750,8 @@ impl FeatureFlags {
             rdna3_q8_group256_serial_row: false,
             rdna3_q8_group256_gate_up: false,
             rdna3_hfq4_gate_up_iu4_a4: false,
+            rdna3_hfq4_gate_iu4_a4: false,
+            rdna3_hfq4_up_iu4_a4: false,
             rdna3_fused_swiglu_q8_group128: false,
             rdna3_ffn_f16_intermediate: false,
             rdna3_gdn_norm_rotate_batched: false,

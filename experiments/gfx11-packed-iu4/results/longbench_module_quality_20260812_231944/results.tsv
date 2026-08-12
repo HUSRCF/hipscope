@@ -1,0 +1,61 @@
+ordinal	reference	mode	prediction	correct	first_diff	output_tokens
+0	A	q8	A	1		10
+0	A	gate	A	1		10
+0	A	up	A	1		10
+1	B	q8	D	0		18
+1	B	gate	D	0		18
+1	B	up	D	0		18
+2	D	q8	D	1		10
+2	D	gate	D	1		10
+2	D	up	D	1		10
+3	C	q8	D	0		10
+3	C	gate	D	0		10
+3	C	up	D	0		10
+4	C	q8	C	1		12
+4	C	gate	C	1		12
+4	C	up	C	1		12
+5	C	q8	B	0		12
+5	C	gate	B	0		12
+5	C	up	B	0	0	10
+6	C	q8	A	0		10
+6	C	gate	A	0		10
+6	C	up	A	0		10
+7	A	q8	C	0		10
+7	A	gate	C	0		10
+7	A	up	C	0		10
+8	B	q8	B	1		10
+8	B	gate	B	1		10
+8	B	up	B	1	0	12
+9	A	q8	C	0		12
+9	A	gate	C	0		12
+9	A	up	C	0		12
+10	C	q8	A	0		10
+10	C	gate	A	0		10
+10	C	up	A	0		10
+11	D	q8	A	0		10
+11	D	gate	C	0	5	10
+11	D	up	C	0	5	10
+12	D	q8	D	1		10
+12	D	gate	A	0	5	10
+12	D	up	D	1		10
+13	B	q8	B	1		10
+13	B	gate	B	1		10
+13	B	up	B	1		10
+14	B	q8		0		25
+14	B	gate		0	23	25
+14	B	up	C	0	0	10
+15	A	q8	D	0		10
+15	A	gate	D	0		10
+15	A	up	D	0		10
+16	C	q8		0		25
+16	C	gate	B	0	0	10
+16	C	up	B	0	0	10
+17	C	q8	D	0		10
+17	C	gate	D	0		10
+17	C	up	D	0		10
+18	D	q8	D	1		10
+18	D	gate	D	1		10
+18	D	up	D	1		10
+19	C	q8	C	1		10
+19	C	gate	C	1		10
+19	C	up	C	1		10

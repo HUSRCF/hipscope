@@ -27,7 +27,10 @@ fn main() {
     }
     let model_path = &args[1];
     let out_path = args.get(2).cloned();
-    let prompt_text = if args.len() > 3 {
+    let prompt_text = if let Ok(path) = std::env::var("GREEDY_DUMP_PROMPT_FILE") {
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("read GREEDY_DUMP_PROMPT_FILE {path}: {err}"))
+    } else if args.len() > 3 {
         args[3..].join(" ")
     } else {
         "Write a 500-word essay about Federalist No. 10 by James Madison.".to_string()
@@ -103,9 +106,25 @@ fn main() {
             chat.extend_from_slice(&im_start);
             chat.extend_from_slice(&asst);
             chat.extend_from_slice(&nl);
-            if mode == "thinking" {
-                chat.extend_from_slice(&tokenizer.encode("<think>"));
-                chat.extend_from_slice(&nl);
+            match mode.as_str() {
+                "thinking" => {
+                    chat.extend_from_slice(&tokenizer.encode("<think>"));
+                    chat.extend_from_slice(&nl);
+                }
+                "nothinking" => {
+                    if let (Some(open), Some(close)) = (
+                        tokenizer.special_token_id("<think>"),
+                        tokenizer.special_token_id("</think>"),
+                    ) {
+                        chat.push(open);
+                        chat.extend_from_slice(&nl);
+                        chat.extend_from_slice(&nl);
+                        chat.push(close);
+                        chat.extend_from_slice(&nl);
+                        chat.extend_from_slice(&nl);
+                    }
+                }
+                _ => {}
             }
             chat
         }

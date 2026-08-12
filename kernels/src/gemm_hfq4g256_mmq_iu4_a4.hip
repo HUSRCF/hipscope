@@ -347,11 +347,11 @@ static __device__ __forceinline__ void gemm_body_q8_iu4_exact(
     }
 }
 
-template <bool ADD>
+template <bool ADD, bool OUTPUT_F16>
 static __device__ __forceinline__ void gemm_body(
     const char* __restrict__ weights,
     const block_q4_1_group128* __restrict__ activations,
-    float* __restrict__ output,
+    void* __restrict__ output,
     int m,
     int k,
     int n
@@ -446,12 +446,22 @@ static __device__ __forceinline__ void gemm_body(
                 const int local_row = row_base + rf * 16 + c_row(lane, l);
                 const int acc_group = j0 / (COL_GROUPS * 16);
                 const int acc_index = (acc_group * ROW_FRAGS + rf) * 8 + l;
-                float* dst = output +
+                const long long dst_index =
                     (long long)(col0 + token) * m + row0 + local_row;
-                if constexpr (ADD) {
-                    *dst += accum[acc_index];
+                if constexpr (OUTPUT_F16) {
+                    _Float16* dst = (_Float16*)output + dst_index;
+                    if constexpr (ADD) {
+                        *dst = (_Float16)((float)*dst + accum[acc_index]);
+                    } else {
+                        *dst = (_Float16)accum[acc_index];
+                    }
                 } else {
-                    *dst = accum[acc_index];
+                    float* dst = (float*)output + dst_index;
+                    if constexpr (ADD) {
+                        *dst += accum[acc_index];
+                    } else {
+                        *dst = accum[acc_index];
+                    }
                 }
             }
         }
@@ -595,7 +605,7 @@ void gemm_hfq4g256_mmq_iu4_a4_set(
     int k,
     int n
 ) {
-    gemm_body<false>(weights, activations, output, m, k, n);
+    gemm_body<false, false>(weights, activations, output, m, k, n);
 }
 
 extern "C" __global__ __launch_bounds__(NWARPS * 32, 2)
@@ -607,7 +617,19 @@ void gemm_hfq4g256_mmq_iu4_a4_add(
     int k,
     int n
 ) {
-    gemm_body<true>(weights, activations, output, m, k, n);
+    gemm_body<true, false>(weights, activations, output, m, k, n);
+}
+
+extern "C" __global__ __launch_bounds__(NWARPS * 32, 2)
+void gemm_hfq4g256_mmq_iu4_a4_f16_set(
+    const char* weights,
+    const block_q4_1_group128* activations,
+    _Float16* output,
+    int m,
+    int k,
+    int n
+) {
+    gemm_body<false, true>(weights, activations, output, m, k, n);
 }
 
 extern "C" __global__ __launch_bounds__(NWARPS * 32, 2)
@@ -673,6 +695,8 @@ extern "C" __global__ void gemm_hfq4g256_mmq_iu4_a4_set(
     const char*, const block_q4_1_group128*, float*, int, int, int) {}
 extern "C" __global__ void gemm_hfq4g256_mmq_iu4_a4_add(
     const char*, const block_q4_1_group128*, float*, int, int, int) {}
+extern "C" __global__ void gemm_hfq4g256_mmq_iu4_a4_f16_set(
+    const char*, const block_q4_1_group128*, _Float16*, int, int, int) {}
 extern "C" __global__ void gemm_hfq4g256_mmq_iu4_a4_group32_set(
     const char*, const block_q4_1_group32*, float*, int, int, int) {}
 extern "C" __global__ void gemm_hfq4g256_mmq_iu4_a4_group32_add(

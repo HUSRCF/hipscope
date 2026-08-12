@@ -9,8 +9,9 @@ TRIALS="${TRIALS:-5}"
 TRIM_EACH_SIDE="${TRIM_EACH_SIDE:-1}"
 SLEEP_SECS="${SLEEP_SECS:-5}"
 PREFILL_RUNS="${PREFILL_RUNS:-3}"
+A4_TARGET="${A4_TARGET:-both}"
 BIN="${BIN:-${ROOT}/target/release/examples/bench_qwen35_mq4}"
-CK_LIB="${HIPFIRE_FLASH_ATTN_CK_QUANTIZED_LIB:-${ROOT}/experiments/flash-attn-ck-sidecar/quantized/build/libhipfire_flash_attn_ck_quantized.so}"
+CK_LIB="${HIPFIRE_FLASH_ATTN_CK_QUANTIZED_LIB:-/tmp/libhipfire_flash_attn_ck_quantized_staged.so}"
 
 for path in "${MODEL}" "${BIN}" "${CK_LIB}"; do
     [[ -e "${path}" ]] || { echo "missing required path: ${path}" >&2; exit 1; }
@@ -24,13 +25,22 @@ sha256sum "${BIN}" "${CK_LIB}" > "${OUT_DIR}/artifacts.sha256"
     printf 'trials=%s\n' "${TRIALS}"
     printf 'trim_each_side=%s\n' "${TRIM_EACH_SIDE}"
     printf 'prefill_runs=%s\n' "${PREFILL_RUNS}"
+    printf 'a4_target=%s\n' "${A4_TARGET}"
     printf 'sleep_secs=%s\n' "${SLEEP_SECS}"
     printf 'model=%s\n' "${MODEL}"
     printf 'ck_lib=%s\n' "${CK_LIB}"
 } > "${OUT_DIR}/meta.txt"
 
 run_command() {
-    local log="$1" a4="$2"
+    local log="$1" a4="$2" both=0 gate=0 up=0
+    if [[ "${a4}" == 1 ]]; then
+        case "${A4_TARGET}" in
+            both) both=1 ;;
+            gate) gate=1 ;;
+            up) up=1 ;;
+            *) echo "unsupported A4_TARGET=${A4_TARGET}" >&2; return 1 ;;
+        esac
+    fi
     timeout --signal=INT --kill-after=5s 240s \
         env \
         HIP_VISIBLE_DEVICES="${GPU_ID}" \
@@ -40,31 +50,43 @@ run_command() {
         HIPFIRE_PREFILL_MAX_BATCH=2048 \
         HIPFIRE_FLASH_PARTIALS_BATCH=32 \
         HIPFIRE_DPM_WARMUP_SECS=5 \
+        HIPFIRE_QKVZA_SPLIT_TAIL=1 \
         HIPFIRE_RDNA3_HFQ4_GATE_UP_X256Y64=1 \
         HIPFIRE_RDNA3_HFQ4_RESIDUAL_X256Y64=1 \
         HIPFIRE_RDNA3_HFQ4_AUX_X256Y64=1 \
         HIPFIRE_RDNA3_HFQ4_PERM_NIBBLE=1 \
         HIPFIRE_RDNA3_Q8_GROUP128=1 \
         HIPFIRE_RDNA3_Q8_GROUP128_ROW2=1 \
+        HIPFIRE_RDNA3_Q8_GROUP128_QUAD_ROW_WEIGHT=1 \
         HIPFIRE_RDNA3_Q8_GROUP128_K128=0 \
         HIPFIRE_RDNA3_FUSED_SWIGLU_Q8_GROUP128=1 \
-        HIPFIRE_RDNA3_HFQ4_GATE_UP_IU4_A4="${a4}" \
+        HIPFIRE_RDNA3_FFN_F16_INTERMEDIATE=1 \
+        HIPFIRE_RDNA3_Q8_GROUP256_SERIAL_ROW=1 \
+        HIPFIRE_RDNA3_Q8_GROUP256_GATE_UP=0 \
+        HIPFIRE_RDNA3_HFQ4_GATE_UP_IU4_A4="${both}" \
+        HIPFIRE_RDNA3_HFQ4_GATE_IU4_A4="${gate}" \
+        HIPFIRE_RDNA3_HFQ4_UP_IU4_A4="${up}" \
         HIPFIRE_BENCH_DUMP_TOKENS=1 \
         "${BIN}" "${MODEL}" \
         --prefill 8192 --prefill-runs "${PREFILL_RUNS}" --warmup 2 --gen 32 \
         > "${log}" 2>&1
 
     if ! rg -q '^loaded optional quantized FlashAttention CK sidecar:' "${log}" ||
-       ! rg -q '^quantized FlashAttention CK prefill active:' "${log}"; then
+       ! rg -q '^staged quantized FlashAttention CK prefill active:' "${log}"; then
         echo "quantized CK sidecar was not active; refusing invalid A/B: ${log}" >&2
         return 1
     fi
     if [[ "${a4}" == "1" ]]; then
-        if ! rg -q '^RDNA3 IU4-A4 gate/up prefill active:' "${log}"; then
-            echo "IU4-A4 gate/up route was not active; refusing invalid A/B: ${log}" >&2
+        case "${A4_TARGET}" in
+            both) pattern='^RDNA3 IU4-A4 gate/up prefill active:' ;;
+            gate) pattern='^RDNA3 IU4-A4 projection prefill active: gate=true up=false ' ;;
+            up) pattern='^RDNA3 IU4-A4 projection prefill active: gate=false up=true ' ;;
+        esac
+        rg -q "${pattern}" "${log}" || {
+            echo "requested IU4-A4 ${A4_TARGET} route was not active: ${log}" >&2
             return 1
-        fi
-    elif rg -q '^RDNA3 IU4-A4 gate/up prefill active:' "${log}"; then
+        }
+    elif rg -q '^RDNA3 IU4-A4 .*prefill active:' "${log}"; then
         echo "IU4-A4 route unexpectedly active in Q8 control: ${log}" >&2
         return 1
     fi
