@@ -44,6 +44,45 @@ const QWEN35_NORM_BIAS: f32 = 1.0;
 
 const _: () = assert!(QWEN35_NORM_BIAS == 1.0);
 
+fn a4_layer_selected(variable: &'static str, layer_idx: usize) -> Option<bool> {
+    use std::sync::OnceLock;
+
+    static GATE: OnceLock<Option<Vec<(usize, usize)>>> = OnceLock::new();
+    static UP: OnceLock<Option<Vec<(usize, usize)>>> = OnceLock::new();
+    let slot = match variable {
+        "HIPFIRE_RDNA3_HFQ4_GATE_IU4_A4_LAYERS" => &GATE,
+        "HIPFIRE_RDNA3_HFQ4_UP_IU4_A4_LAYERS" => &UP,
+        _ => return None,
+    };
+    slot.get_or_init(|| {
+        hipfire_config::developer_var(variable).ok().map(|value| {
+            value
+                .split(',')
+                .map(|part| {
+                    let mut bounds = part.trim().splitn(2, '-');
+                    let first = bounds
+                        .next()
+                        .and_then(|value| value.parse::<usize>().ok())
+                        .unwrap_or_else(|| panic!("invalid {variable} layer mask: {value}"));
+                    let last = match bounds.next() {
+                        Some(value) => value
+                            .parse::<usize>()
+                            .unwrap_or_else(|_| panic!("invalid {variable} layer mask: {value}")),
+                        None => first,
+                    };
+                    (first.min(last), first.max(last))
+                })
+                .collect()
+        })
+    })
+    .as_ref()
+    .map(|ranges| {
+        ranges
+            .iter()
+            .any(|&(first, last)| (first..=last).contains(&layer_idx))
+    })
+}
+
 // ─── Config ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -7412,11 +7451,7 @@ impl PrefillBatchScratch {
                 &[max_batch * hidden_dim],
                 DType::F16
             ),
-            up_f16_batch: alloc_opt!(
-                use_f16_ffn_scratch,
-                &[max_batch * hidden_dim],
-                DType::F16
-            ),
+            up_f16_batch: alloc_opt!(use_f16_ffn_scratch, &[max_batch * hidden_dim], DType::F16),
             ffn_hidden_batch: alloc!(&[max_batch * hidden_dim], DType::F32),
             dn_normed_rot_batch: alloc!(&[max_batch * v_dim], DType::F32),
             // F32 dtype = 4 bytes/element, same layout as i32. The rope /
@@ -15191,7 +15226,19 @@ fn forward_batch_chunk_impl(
                     )?;
                 } else {
                     if use_f16_ffn {
-                        gpu.gemm_gate_up_hfq4g256_group128_f16_intermediate(
+                        let a4_gate =
+                            a4_layer_selected("HIPFIRE_RDNA3_HFQ4_GATE_IU4_A4_LAYERS", layer_idx)
+                                .unwrap_or(
+                                    gpu.flags.rdna3_hfq4_gate_up_iu4_a4
+                                        || gpu.flags.rdna3_hfq4_gate_iu4_a4,
+                                );
+                        let a4_up =
+                            a4_layer_selected("HIPFIRE_RDNA3_HFQ4_UP_IU4_A4_LAYERS", layer_idx)
+                                .unwrap_or(
+                                    gpu.flags.rdna3_hfq4_gate_up_iu4_a4
+                                        || gpu.flags.rdna3_hfq4_up_iu4_a4,
+                                );
+                        gpu.gemm_gate_up_hfq4g256_group128_f16_intermediate_a4(
                             &layer.w_gate.buf,
                             &layer.w_up.buf,
                             &pbs.x_rot_batch,
@@ -15200,6 +15247,8 @@ fn forward_batch_chunk_impl(
                             layer.w_gate.m,
                             layer.w_gate.k,
                             n,
+                            a4_gate,
+                            a4_up,
                         )?;
                     } else {
                         run_fused_gate_up_key(
@@ -16078,7 +16127,19 @@ fn forward_batch_chunk_impl(
                     )?;
                 } else {
                     if use_f16_ffn {
-                        gpu.gemm_gate_up_hfq4g256_group128_f16_intermediate(
+                        let a4_gate =
+                            a4_layer_selected("HIPFIRE_RDNA3_HFQ4_GATE_IU4_A4_LAYERS", layer_idx)
+                                .unwrap_or(
+                                    gpu.flags.rdna3_hfq4_gate_up_iu4_a4
+                                        || gpu.flags.rdna3_hfq4_gate_iu4_a4,
+                                );
+                        let a4_up =
+                            a4_layer_selected("HIPFIRE_RDNA3_HFQ4_UP_IU4_A4_LAYERS", layer_idx)
+                                .unwrap_or(
+                                    gpu.flags.rdna3_hfq4_gate_up_iu4_a4
+                                        || gpu.flags.rdna3_hfq4_up_iu4_a4,
+                                );
+                        gpu.gemm_gate_up_hfq4g256_group128_f16_intermediate_a4(
                             &layer.w_gate.buf,
                             &layer.w_up.buf,
                             &pbs.x_rot_batch,
@@ -16087,6 +16148,8 @@ fn forward_batch_chunk_impl(
                             layer.w_gate.m,
                             layer.w_gate.k,
                             n,
+                            a4_gate,
+                            a4_up,
                         )?;
                     } else {
                         run_fused_gate_up_key(

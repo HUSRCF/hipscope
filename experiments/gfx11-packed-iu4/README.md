@@ -46,3 +46,32 @@ The group32 decomposition is both slower and less accurate in the current IU4
 WMMA organization. No A4 variant is approved for production. The production
 flag remains default-off and research-only; further prefill work must preserve
 the Q8 activation contract.
+
+## Layer-isolation probe
+
+`HIPFIRE_RDNA3_HFQ4_GATE_IU4_A4_LAYERS` and
+`HIPFIRE_RDNA3_HFQ4_UP_IU4_A4_LAYERS` accept comma-separated layer numbers or
+ranges (for example `8,16-19`). They are research-only overrides for the
+Qwen3.6 FP16-intermediate prefill path. With neither variable set, dispatch is
+unchanged and continues to use the startup feature flags.
+
+An eight-layer up-A4 sample on the 3375-token `docs/testINPUT.md` prompt dumped
+the hidden state at absolute position 2047 and compared the final layer against
+Q8. Each run changed only one layer:
+
+| A4 layer | Final cosine | Final relative L2 | First generated token |
+| ---: | ---: | ---: | --- |
+| 0 | 0.998842 | 4.81% | match |
+| 8 | 0.999144 | 4.17% | match |
+| 16 | 0.999039 | 4.39% | match |
+| 24 | 0.998735 | 5.80% | match |
+| 32 | 0.999226 | 3.97% | match |
+| 40 | 0.998992 | 4.51% | match |
+| 48 | 0.999273 | 3.82% | match |
+| 56 | 0.998665 | 5.20% | match |
+
+No sampled layer is close to numerically lossless, and quantizing one of 64
+FFN up projections has only about `2.05% / 64 = 0.03%` overall prefill upside.
+Layer masking therefore does not rescue the current group128 A4 contract as a
+production optimization. Use `analyze_hidden_layers.py` to parse future
+`HIPFIRE_DUMP_HIDDEN` comparisons.

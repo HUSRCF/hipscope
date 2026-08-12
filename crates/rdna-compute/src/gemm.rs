@@ -18485,6 +18485,39 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        let a4_gate =
+            self.flags.rdna3_hfq4_gate_up_iu4_a4 || self.flags.rdna3_hfq4_gate_iu4_a4;
+        let a4_up =
+            self.flags.rdna3_hfq4_gate_up_iu4_a4 || self.flags.rdna3_hfq4_up_iu4_a4;
+        self.gemm_gate_up_hfq4g256_group128_f16_intermediate_a4(
+            gate_raw,
+            up_raw,
+            x,
+            gate_output,
+            up_output,
+            m,
+            k,
+            batch_size,
+            a4_gate,
+            a4_up,
+        )
+    }
+
+    /// Research entrypoint allowing the model adapter to isolate A4 by layer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_gate_up_hfq4g256_group128_f16_intermediate_a4(
+        &mut self,
+        gate_raw: &GpuTensor,
+        up_raw: &GpuTensor,
+        x: &GpuTensor,
+        gate_output: &GpuTensor,
+        up_output: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        a4_gate: bool,
+        a4_up: bool,
+    ) -> HipResult<()> {
         self.bind_thread()?;
         if !self.arch_caps.is_gfx1100()
             || gate_output.dtype != DType::F16
@@ -18498,10 +18531,6 @@ impl Gpu {
                 "FP16 FFN gate/up requires gfx1100, M=17408, K=5120, N%256=0, and FP16 outputs",
             ));
         }
-        let a4_gate =
-            self.flags.rdna3_hfq4_gate_up_iu4_a4 || self.flags.rdna3_hfq4_gate_iu4_a4;
-        let a4_up =
-            self.flags.rdna3_hfq4_gate_up_iu4_a4 || self.flags.rdna3_hfq4_up_iu4_a4;
         if (a4_gate || a4_up) && batch_size == 2_048 {
             static ANNOUNCE: std::sync::Once = std::sync::Once::new();
             ANNOUNCE.call_once(|| {
