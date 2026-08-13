@@ -598,9 +598,7 @@ macro_rules! process_field {
 
 macro_rules! diagnostic_field {
     ($key:literal, $legacy:literal, $default:expr, $rule:expr, $env:literal, $help:literal) => {
-        bridge_field!(
-            $key, $legacy, Diagnostic, Diagnostic, $default, $rule, true, $env, $help
-        )
+        bridge_field!($key, $legacy, Diagnostic, Diagnostic, $default, $rule, true, $env, $help)
     };
 }
 
@@ -2351,6 +2349,15 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         "HIPFIRE_Q8_BATCHED_LEGACY",
         "Use the legacy batched Q8 route."
+    ),
+    process_bool_field!(
+        "kernel.gemma4_q8_fused_prefill",
+        "gemma4_q8_fused_prefill",
+        Kernel,
+        false,
+        true,
+        "HIPFIRE_GEMMA4_Q8_FUSED_PREFILL",
+        "Fuse eligible Gemma 4 Q8 prefill projections on gfx1100."
     ),
     process_bool_field!(
         "kernel.deepseek4_q8_wmma",
@@ -4533,16 +4540,12 @@ mod tests {
             .set_cli("diagnostic.kernel.rdna2_variant", "5")
             .unwrap();
         layer.set_cli("kernel.lm_head_f16", "f32").unwrap();
-        assert!(
-            layer
-                .set_cli("diagnostic.kernel.gate_up_variant", "unknown")
-                .is_err()
-        );
-        assert!(
-            layer
-                .set_cli("diagnostic.kernel.rdna2_variant", "6")
-                .is_err()
-        );
+        assert!(layer
+            .set_cli("diagnostic.kernel.gate_up_variant", "unknown")
+            .is_err());
+        assert!(layer
+            .set_cli("diagnostic.kernel.rdna2_variant", "6")
+            .is_err());
 
         write_global_toml(&paths, &layer).unwrap();
         let loaded = load_global(&paths).unwrap();
@@ -4678,12 +4681,10 @@ mod tests {
         let wrong_version = encoded.replace("\"schema_version\":1", "\"schema_version\":2");
         let decoded: ProcessConfig = serde_json::from_str(&wrong_version).unwrap();
         assert!(decoded.validate().is_err());
-        assert!(
-            serde_json::from_str::<ProcessConfig>(
-                r#"{"schema_version":1,"values":{"values":{}},"unknown":true}"#
-            )
-            .is_err()
-        );
+        assert!(serde_json::from_str::<ProcessConfig>(
+            r#"{"schema_version":1,"values":{"values":{}},"unknown":true}"#
+        )
+        .is_err());
     }
 
     #[test]
