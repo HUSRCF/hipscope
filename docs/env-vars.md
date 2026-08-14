@@ -401,7 +401,7 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_DEEPSEEK4_MOE_CND` | crates/hipfire-arch-deepseek4/examples/deepseek4_prefill_bench.rs, crates/hipfire-dispatch/src/pipeline/mod.rs |
 | `HIPFIRE_DEEPSEEK4_MOE_DETERMINISTIC` | crates/hipfire-arch-deepseek4/src/forward.rs, crates/hipfire-dispatch/src/pipeline/mod.rs |
 | `HIPFIRE_DEEPSEEK4_MOE_GROUPED` | crates/hipfire-dispatch/src/pipeline/mod.rs |
-| `HIPFIRE_DEEPSEEK4_MOE_GROUPED_GATE` | crates/hipfire-dispatch/src/families/moe.rs, crates/hipfire-dispatch/src/pipeline/mod.rs |
+| `HIPFIRE_DEEPSEEK4_MOE_GROUPED_GATE` | crates/hipfire-dispatch/src/families/moe.rs, crates/hipfire-dispatch/src/pipeline/mod.rs (batch threshold; default 160 for opt-in gfx90a MQ2 MFMA, otherwise 128) |
 | `HIPFIRE_DEEPSEEK4_MOE_LLOYD_4W` | crates/hipfire-dispatch/src/pipeline/mod.rs |
 | `HIPFIRE_DEEPSEEK4_MOE_MMQLOAD` | crates/hipfire-arch-deepseek4/examples/deepseek4_prefill_bench.rs, crates/hipfire-dispatch/src/pipeline/mod.rs |
 | `HIPFIRE_DEEPSEEK4_MOE_N32` | crates/hipfire-arch-deepseek4/examples/deepseek4_prefill_bench.rs, crates/hipfire-dispatch/src/pipeline/mod.rs |
@@ -490,7 +490,25 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_E8_SOA_EXPERTS` | crates/hipfire-arch-qwen35/src/qwen35.rs, crates/rdna-compute/src/gemv.rs |
 | `HIPFIRE_E8_STRIP` | crates/rdna-compute/src/gemv.rs, crates/rdna-compute/src/kernels.rs |
 | `HIPFIRE_EMIT_TOKEN_IDS` | autoresearch/ar/certify/serve_runner.py, crates/hipfire-arch-cohere2moe/src/spec_emit.rs |
+| `HIPFIRE_DS4_COARSE_PROBE` | crates/hipfire-arch-deepseek4/src/forward.rs, crates/hipfire-runtime/src/ep.rs |
+| `HIPFIRE_DS4_FINE_PROBE` | crates/hipfire-arch-deepseek4/src/forward.rs |
+| `HIPFIRE_DS4_PROBE_LAYERS` | crates/hipfire-arch-deepseek4/src/forward.rs (comma-separated layer whitelist, or `all`; default all) |
+| `HIPFIRE_DS4_PROBE_WARMUP_STEPS` | crates/hipfire-arch-deepseek4/src/forward.rs (skip this many forward steps after the process first reaches a selected probe layer; includes prompt forward steps) |
 | `HIPFIRE_EP_DECODE_TIMING` | crates/hipfire-arch-deepseek4/src/forward.rs, crates/hipfire-arch-minimax/src/forward.rs |
+| `HIPFIRE_EP_COARSE_PROBE` | crates/hipfire-runtime/src/ep.rs (all-rank all-reduce timing; independent of model layer probes) |
+| `HIPFIRE_GFX90A_EP_CHUNK_ROWS` | crates/hipfire-runtime/src/ep.rs (experimental; default 1024 rows) |
+| `HIPFIRE_GFX90A_EP_FUSED_DOWN` | crates/hipfire-dispatch/src/pipeline/mod.rs (experimental deterministic pure-wave64 fused down) |
+| `HIPFIRE_GFX90A_EP_FUSED_DOWN_ROW_TILE` | crates/rdna-compute/src/gemv.rs (diagnostic fallback row tile; default 1, explicit 2 is not strict-token admitted) |
+| `HIPFIRE_GFX90A_EP_FUSED_DOWN_ROW_WAVES` | crates/rdna-compute/src/gemv.rs (native wave64s assigned to independent rows; default 2, set 1 for strict row1 fallback) |
+| `HIPFIRE_GFX90A_EP_FUSED_DOWN_WAVES` | crates/rdna-compute/src/gemv.rs (experimental deterministic fused-down expert parallelism; 1/default, 2, or 4 native wave64s) |
+| `HIPFIRE_GFX90A_EP_OVERLAP` | crates/hipfire-runtime/src/ep.rs (experimental two-rank gfx90a routed-MoE/peer-reduce overlap; default off; pair with `HIPFIRE_GFX90A_EP_FUSED_DOWN=1` for performance) |
+| `HIPFIRE_GFX90A_MQ2_BATCHED_K4_ROW2` | crates/rdna-compute/src/gemv.rs (CDNA2 pure-wave64 two-row MQ2 K4 gate/up; default on for gfx90a, set 0 to use the scalar block32 fallback) |
+| `HIPFIRE_GFX90A_DS4_COMP_TWIN_Q8` | crates/hipfire-arch-deepseek4/src/forward.rs (experimental gfx90a compressor wkv+wgate single-launch Q8 decode path) |
+| `HIPFIRE_GFX90A_DS4_COMP_TWIN_Q8_WAVE64_APE` | crates/hipfire-arch-deepseek4/src/forward.rs (requires `...COMP_TWIN_Q8=1`; pure wave64 two-row Q8 projection with score APE epilogue) |
+| `HIPFIRE_GFX90A_DS4_COMP_TWIN_F16_WAVE64_APE` | crates/hipfire-arch-deepseek4/src/forward.rs (experimental pure-wave64 twin F16xF32 compressor projection with score APE epilogue) |
+| `HIPFIRE_GFX90A_DS4_COMP_PAIRED_RING` | crates/hipfire-arch-deepseek4/src/forward.rs (experimental; fuses compressor KV+score ring writes into one launch) |
+| `HIPFIRE_GFX90A_DS4_COMP_PAIRED_CONCAT_SHIFT` | crates/hipfire-arch-deepseek4/src/forward.rs (experimental; fuses ratio4 compressor KV+score concat and state-shift launch pairs) |
+| `HIPFIRE_GFX90A_DS4_WO_WAVE64` | crates/hipfire-arch-deepseek4/src/forward.rs |
 | `HIPFIRE_EP_DUMP_IDX` | crates/hipfire-arch-deepseek4/src/forward.rs |
 | `HIPFIRE_EP_DUMP_POS` | crates/hipfire-arch-deepseek4/src/forward.rs |
 | `HIPFIRE_EP_FAIL_RANK` | crates/hipfire-loader/src/lib.rs |
@@ -624,6 +642,10 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_GFX12_WEIGHT_CPOL_AUX` | crates/rdna-compute/src/feature_flags.rs |
 | `HIPFIRE_GFX12_WEIGHT_GLOBAL_LOADS` | crates/rdna-compute/src/feature_flags.rs |
 | `HIPFIRE_GFX12_WEIGHT_LOAD_POLICY` | crates/rdna-compute/src/feature_flags.rs |
+| `HIPFIRE_CDNA_MFMA_PREFILL` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/gemm.rs |
+| `HIPFIRE_GFX90A_MQ2_MFMA` | crates/hipfire-dispatch/src/pipeline/mod.rs, crates/rdna-compute/src/gemm.rs (opt-in grouped MQ2-Lloyd CDNA2 MFMA prefill path) |
+| `HIPFIRE_GFX90A_MQ2_ROW2` | crates/rdna-compute/src/gemv.rs |
+| `HIPFIRE_GFX90A_MQ2_WAVE64` | crates/rdna-compute/src/gemv.rs |
 | `HIPFIRE_GFX942_GEMV_V2` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/gemm.rs |
 | `HIPFIRE_GFX942_GEMV_V3` | crates/rdna-compute/src/feature_flags.rs |
 | `HIPFIRE_GFX942_LDS_GEMV` | crates/rdna-compute/src/feature_flags.rs |

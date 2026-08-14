@@ -438,8 +438,8 @@ pub struct Gpu {
     // ── hipGraph capture state (extracted to graph.rs) ─────────────────────
     pub graphs: crate::graph::GraphState,
 
-    // ── rocBLAS (CDNA3 MFMA-accelerated GEMM) ─────────────────────────────
-    /// Optional rocBLAS handle. `None` on non-CDNA3 archs or when
+    // ── rocBLAS (CDNA MFMA-accelerated GEMM) ──────────────────────────────
+    /// Optional rocBLAS handle. `None` on non-MFMA archs or when
     /// librocblas.so fails to load. Engine code should always gate on
     /// `.is_some()` and fall back to the hand-rolled HFQ4 kernels otherwise.
     pub rocblas: Option<Rocblas>,
@@ -451,7 +451,7 @@ pub struct Gpu {
     /// owns the GPU-side FP16 tensor. Memory is not freed until the Gpu
     /// itself drops (weights are assumed immutable for a model's lifetime).
     ///
-    /// Only populated on CDNA3 when rocBLAS loaded — 4× VRAM blow-up vs MQ4
+    /// Only populated on CDNA2/CDNA3 when rocBLAS loaded — 4× VRAM blow-up vs MQ4
     /// so consumer cards stay on the wave32/64 hand-rolled GEMV path.
     fp16_shadow_cache: HashMap<usize, GpuTensor>,
 
@@ -905,14 +905,14 @@ impl Gpu {
             if gpu.flags.force_blob_path {
                 eprintln!("[diag] HIPFIRE_BLOB_FORCE=1: all kernel launches will use the blob path (kernelParams bypassed). Diagnostic only.");
             }
-            // Auto-init rocBLAS on CDNA3 so the batched-prefill MFMA path is
+            // Auto-init rocBLAS on MFMA-capable CDNA so batched prefill is
             // available out of the box. No-op on consumer arches.
             gpu.try_init_rocblas();
             gpu
         })
     }
 
-    /// Try to load rocBLAS. Safe no-op on non-CDNA3 archs (we don't use
+    /// Try to load rocBLAS. Safe no-op on non-MFMA archs (we don't use
     /// rocBLAS on RDNA — the hand-rolled kernels outperform it there).
     ///
     /// On success, sets `self.rocblas = Some(_)`; prefill dispatch paths can
@@ -924,9 +924,9 @@ impl Gpu {
         if self.rocblas.is_some() {
             return;
         }
-        let cdna3 = self.arch_caps.is_cdna3();
+        let mfma = self.arch_caps.has_mfma_f16();
         let all_archs = self.flags.rocblas_all_archs;
-        if !cdna3 && !all_archs {
+        if !mfma && !all_archs {
             return;
         }
         match Rocblas::load() {
@@ -1695,7 +1695,7 @@ impl Gpu {
     }
 
     /// Whether the arch is eligible for the rocBLAS/MFMA batched-prefill
-    /// path. Default: CDNA3 only (MI300-series, gfx94x). Override with
+    /// path. Default: CDNA2/CDNA3 (MI200/MI300, gfx90a/gfx94x). Override with
     /// `HIPFIRE_ROCBLAS_ALL_ARCHS=1` for local testing on RDNA3+ — rocBLAS
     /// runs fine there (uses WMMA backends on RDNA3, not MFMA) so this is
     /// a useful smoke-path in the absence of an MI300.
@@ -1705,7 +1705,7 @@ impl Gpu {
         if all_archs {
             return self.rocblas.is_some();
         }
-        self.arch_caps.is_cdna3()
+        self.arch_caps.has_mfma_f16()
     }
 
     /// Configurable batch threshold for MFMA dispatch. Below this we stay on

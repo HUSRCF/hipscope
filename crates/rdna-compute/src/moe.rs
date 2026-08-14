@@ -89,6 +89,67 @@ impl Gpu {
         result
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_down_combine_k8_batched_rows(
+        &mut self,
+        expert_outputs: &GpuTensor,
+        topk_weights: &GpuTensor,
+        x_residual: &GpuTensor,
+        m: usize,
+        k_top: usize,
+        batch_size: usize,
+        row_base: usize,
+        row_count: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if row_base > m || row_count > m - row_base {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "moe_down_combine rows out of bounds",
+            ));
+        }
+        let name = "moe_down_combine_k8_batched_rows";
+        self.ensure_kernel(name, kernels::MOE_DOWN_COMBINE_K8_BATCHED_ROWS_SRC, name)?;
+        let eop = expert_outputs.buf.as_ptr();
+        let wp = topk_weights.buf.as_ptr();
+        let xrp = x_residual.buf.as_ptr();
+        let m_val = m as i32;
+        let kt_val = k_top as i32;
+        let row_base_val = row_base as i32;
+        let row_count_val = row_count as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &eop as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &xrp as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &kt_val as *const _ as *mut c_void,
+            &row_base_val as *const _ as *mut c_void,
+            &row_count_val as *const _ as *mut c_void,
+        ];
+        let block = 256u32;
+        self.launch_maybe_blob(
+            name,
+            [
+                row_count.div_ceil(block as usize) as u32,
+                batch_size as u32,
+                1,
+            ],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(eop);
+                b.push_ptr(wp);
+                b.push_ptr(xrp);
+                b.push_i32(m_val);
+                b.push_i32(kt_val);
+                b.push_i32(row_base_val);
+                b.push_i32(row_count_val);
+                b
+            },
+        )
+    }
     /// gfx1100 decode experiment: finish one atomic-free routed-MoE row and
     /// immediately produce the following layer's RMS-normalized MQ rotation.
     /// This replaces `moe_down_combine_k8_batched` plus

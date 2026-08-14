@@ -5,6 +5,13 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 
+#ifndef HIPFIRE_MQ2_K4_ROW_TILE
+#define HIPFIRE_MQ2_K4_ROW_TILE 1
+#endif
+#ifndef HIPFIRE_MQ2_K4_KERNEL
+#define HIPFIRE_MQ2_K4_KERNEL gemv_mq2g256_lloyd_moe_gate_up_k8_indexed_batched_k4
+#endif
+
 // K4-unrolled batched MoE gate_up GEMV for MQ2-Lloyd. Same shape contract
 // as `gemv_mq2g256_lloyd_moe_gate_up_k8_indexed_batched` but with 4
 // independent accumulators per thread so ILP can hide codebook-lookup
@@ -24,8 +31,8 @@
 // the result is NOT bit-identical to the older kernel but is within
 // FMA-order epsilon.
 
-__launch_bounds__(32, 20)
-extern "C" __global__ void gemv_mq2g256_lloyd_moe_gate_up_k8_indexed_batched_k4(
+__launch_bounds__(HIPFIRE_MQ2_K4_ROW_TILE * 32, 20)
+extern "C" __global__ void HIPFIRE_MQ2_K4_KERNEL(
     const unsigned long long* __restrict__ expert_ptrs, // [n_exp]
     const int* __restrict__ topk_indices,                // [N × K_TOP]
     const float* __restrict__ x_rot,                     // [N × K] FWHT-rotated
@@ -33,11 +40,12 @@ extern "C" __global__ void gemv_mq2g256_lloyd_moe_gate_up_k8_indexed_batched_k4(
     float* __restrict__ y_up,                            // [N × K_TOP × MI]
     int M, int K, int K_TOP
 ) {
-    const int row = blockIdx.x;
+    const int logical_warp = threadIdx.x >> 5;
+    const int row = blockIdx.x * HIPFIRE_MQ2_K4_ROW_TILE + logical_warp;
     if (row >= M) return;
     const int krank = blockIdx.y;
     const int bid = blockIdx.z;
-    const int tid = threadIdx.x;
+    const int tid = threadIdx.x & 31;
 
     const int expert_id = topk_indices[bid * K_TOP + krank];
     const char* __restrict__ A =
@@ -97,7 +105,7 @@ extern "C" __global__ void gemv_mq2g256_lloyd_moe_gate_up_k8_indexed_batched_k4(
 
     float acc = (acc0 + acc1) + (acc2 + acc3);
     for (int offset = 16; offset > 0; offset >>= 1)
-        acc += __shfl_down(acc, offset);
+        acc += __shfl_down(acc, offset, 32);
 
     if (tid == 0) {
         const int mi = M >> 1;

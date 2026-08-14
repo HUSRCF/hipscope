@@ -46,6 +46,102 @@ fn main() {
 
     let mut total_fail = 0usize;
 
+    // DeepSeek V4 compressor decode: main/indexer each issue wkv+wgate
+    // projections from the same F32 input. The fused gate+up kernel has the
+    // identical two-output contract, so validate and time it at both shapes.
+    eprintln!("\n=== DeepSeek V4 compressor twin Q8 ===");
+    for (m, k, label) in [
+        (1024usize, 4096usize, "main compressor"),
+        (256usize, 4096usize, "index compressor"),
+    ] {
+        eprintln!("\n--- {label}: M={m} K={k} ---");
+        let w0_host = synth_q8(m, k, 0x3141_5926);
+        let w1_host = synth_q8(m, k, 0x2718_2818);
+        let w0 = gpu.upload_raw(&w0_host, &[w0_host.len()]).unwrap();
+        let w1 = gpu.upload_raw(&w1_host, &[w1_host.len()]).unwrap();
+        let x_host: Vec<f32> = (0..k).map(synth_x).collect();
+        let x = gpu.upload_f32(&x_host, &[k]).unwrap();
+        let fused0 = gpu.zeros(&[m], DType::F32).unwrap();
+        let fused1 = gpu.zeros(&[m], DType::F32).unwrap();
+        let reference0 = gpu.zeros(&[m], DType::F32).unwrap();
+        let reference1 = gpu.zeros(&[m], DType::F32).unwrap();
+
+        gpu.fused_gate_up_q8_0(&w0, &w1, &x, &fused0, &fused1, m, m, k)
+            .unwrap();
+        gpu.gemv_q8_0(&w0, &x, &reference0, m, k).unwrap();
+        gpu.gemv_q8_0(&w1, &x, &reference1, m, k).unwrap();
+        gpu.hip.device_synchronize().unwrap();
+
+        let stats = [
+            compare(
+                "compressor kv",
+                &gpu.download_f32(&fused0).unwrap(),
+                &gpu.download_f32(&reference0).unwrap(),
+            ),
+            compare(
+                "compressor score",
+                &gpu.download_f32(&fused1).unwrap(),
+                &gpu.download_f32(&reference1).unwrap(),
+            ),
+        ];
+        let pass = stats
+            .iter()
+            .all(|value| value.mean_rel < 2e-3 && value.max_rel < 3.5e-2);
+        if !pass {
+            total_fail += 1;
+        }
+        eprintln!(
+            "  parity={} kv={:.2e}/{:.2e} score={:.2e}/{:.2e}",
+            if pass { "PASS" } else { "FAIL" },
+            stats[0].mean_rel,
+            stats[0].max_rel,
+            stats[1].mean_rel,
+            stats[1].max_rel,
+        );
+
+        const WARMUP: usize = 500;
+        const ITERS: usize = 5_000;
+        for _ in 0..WARMUP {
+            gpu.gemv_q8_0(&w0, &x, &reference0, m, k).unwrap();
+            gpu.gemv_q8_0(&w1, &x, &reference1, m, k).unwrap();
+            gpu.fused_gate_up_q8_0(&w0, &w1, &x, &fused0, &fused1, m, m, k)
+                .unwrap();
+        }
+        gpu.hip.device_synchronize().unwrap();
+
+        let time_pair = |gpu: &mut Gpu| {
+            let started = std::time::Instant::now();
+            for _ in 0..ITERS {
+                gpu.gemv_q8_0(&w0, &x, &reference0, m, k).unwrap();
+                gpu.gemv_q8_0(&w1, &x, &reference1, m, k).unwrap();
+            }
+            gpu.hip.device_synchronize().unwrap();
+            started.elapsed().as_secs_f64() * 1.0e6 / ITERS as f64
+        };
+        let time_fused = |gpu: &mut Gpu| {
+            let started = std::time::Instant::now();
+            for _ in 0..ITERS {
+                gpu.fused_gate_up_q8_0(&w0, &w1, &x, &fused0, &fused1, m, m, k)
+                    .unwrap();
+            }
+            gpu.hip.device_synchronize().unwrap();
+            started.elapsed().as_secs_f64() * 1.0e6 / ITERS as f64
+        };
+
+        for sample in 0..5 {
+            let (pair_us, fused_us) = if sample % 2 == 0 {
+                (time_pair(&mut gpu), time_fused(&mut gpu))
+            } else {
+                let fused = time_fused(&mut gpu);
+                (time_pair(&mut gpu), fused)
+            };
+            eprintln!(
+                "  sample={sample} pair={pair_us:.3}us fused={fused_us:.3}us speedup={:.2}%",
+                (pair_us / fused_us - 1.0) * 100.0,
+            );
+        }
+    }
+
     // ── 4-way QKVZA parity ──────────────────────────────────────────
     eprintln!("\n=== 4-way QKVZA (fused_qkvza_q8_0 vs 4× gemv_q8_0) ===");
     for (qkv_m, z_m, beta_m, alpha_m, k, label) in &shapes_4way {

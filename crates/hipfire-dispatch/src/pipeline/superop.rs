@@ -366,6 +366,44 @@ pub trait ForwardBindings {
     /// EP: add the all-reduced routed partial into this rank's residual stream
     /// (the arch-specific buffer that holds the post-attention residual). Called
     /// by the EP executor once, after the MoE all-reduce.
+    /// Whether this binding can split routed expert down projection by output
+    /// rows for overlap with a two-rank EP collective.
+    fn supports_moe_ep_rows(&self) -> bool {
+        false
+    }
+
+    /// Run the MoE prefix through router, gate/up, activation and rotation,
+    /// stopping before the routed down projection.
+    fn run_moe_ep_prepare(
+        &mut self,
+        _gpu: &mut Gpu,
+        _ctx: &DispatchCtx,
+        _op: &OpBinding,
+        _routed_out: &GpuTensor,
+    ) -> Result<(), DispatchError> {
+        Err(DispatchError::UnsupportedVariant {
+            family: "ep",
+            variant: "run_moe_ep_prepare-not-implemented-for-arch",
+            arch: "",
+            quant: "",
+        })
+    }
+
+    /// Produce one contiguous routed-output row range after prepare.
+    fn run_moe_ep_rows(
+        &mut self,
+        _gpu: &mut Gpu,
+        _routed_out: &GpuTensor,
+        _row_base: usize,
+        _row_count: usize,
+    ) -> Result<(), DispatchError> {
+        Err(DispatchError::UnsupportedVariant {
+            family: "ep",
+            variant: "run_moe_ep_rows-not-implemented-for-arch",
+            arch: "",
+            quant: "",
+        })
+    }
     fn ep_add_into_residual(
         &mut self,
         _gpu: &mut Gpu,

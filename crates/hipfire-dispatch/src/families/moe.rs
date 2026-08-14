@@ -384,6 +384,8 @@ pub struct MoeBiasAwareParams<'a> {
     // activations / residual
     /// FWHT-rotated activation (model pre-rotates; this arm does not re-rotate).
     pub x_rot: &'a GpuTensor,
+    /// Present only when gate_up weights were load-time transcoded for I8DOT.
+    pub x_a8: Option<&'a GpuTensor>,
     /// Residual stream the routed-down kernel atomic-accumulates into. The
     /// model's shared-expert step must have run first to seed this buffer.
     pub ffn_out: &'a GpuTensor,
@@ -446,7 +448,9 @@ pub struct MoeBiasAwarePrefillParams<'a> {
     pub expert_gate_up_ptrs: &'a GpuTensor,
     pub expert_down_ptrs: &'a GpuTensor,
     // activation / residual
-    pub x_rot: &'a GpuTensor,   // ffn_x_rot_batch [B, hidden]
+    pub x_rot: &'a GpuTensor, // ffn_x_rot_batch [B, hidden]
+    /// One-token SG8 A8 scratch when this layer's gate/up weights use I8DOT.
+    pub x_a8: Option<&'a GpuTensor>,
     pub ffn_out: &'a GpuTensor, // ffn_out_batch [B, hidden] (accumulate target)
     // grouped-path scratch
     pub expert_token_counts: &'a GpuTensor,
@@ -631,7 +635,7 @@ impl MoePrefillResolution {
         let use_path2 = use_path2 && !e8_no_grouped;
         // Path 0: gfx9* wave64 archs (gfx906/gfx908/gfx94x) — cheap HBM
         // atomics make the atomic GEMV pattern competitive vs expanded scratch.
-        let down_path0 = arch.is_gcn5() || arch.is_cdna1() || arch.is_cdna3();
+        let down_path0 = arch.is_gcn5() || arch.is_cdna1() || arch.is_cdna2() || arch.is_cdna3();
         let is_gfx1151 = arch.is_gfx1151();
         let use_paro_i8 = paro_mode && use_path2 && is_gfx1151 && flags.moe_paro_i8.unwrap_or(true);
         let use_paro_i8_k8 = use_paro_i8 && flags.moe_paro_i8_k8.unwrap_or(true);

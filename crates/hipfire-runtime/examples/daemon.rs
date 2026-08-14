@@ -8405,6 +8405,17 @@ fn generate_ep(
     } else {
         m.deepseek4_eos_tok
     };
+    let started_in_think = if m.arch_id == 10 {
+        primed_think
+    } else {
+        matches!(think_mode, ThinkMode::High | ThinkMode::Max)
+    };
+    emit_gen_start(
+        stdout,
+        id,
+        started_in_think,
+        gen_start_contract_version_for_arch(m.arch_id),
+    );
     match m.arch_id {
         10 => ep_serve_minimax(
             m,

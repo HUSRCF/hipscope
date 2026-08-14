@@ -461,8 +461,9 @@ pub fn run_moe_decode(
         && p.smi == 512
         && p.shared_down_w.dtype == DType::MQ4G256
         && p.shared_down_w.awq_scale.is_none()
-        && *ROUTER_SHARED_FUSE
-            .get_or_init(|| hipfire_config::developer_var("HIPFIRE_MOE_ROUTER_SHARED_FUSE").as_deref() == Ok("1"));
+        && *ROUTER_SHARED_FUSE.get_or_init(|| {
+            hipfire_config::developer_var("HIPFIRE_MOE_ROUTER_SHARED_FUSE").as_deref() == Ok("1")
+        });
     let wave64_router = (ctx.arch.is_gfx1201()
         && hipfire_config::developer_var("HIPFIRE_GFX1201_ROUTER_W64").as_deref() != Ok("0"))
         || (ctx.arch.is_gfx1100()
@@ -620,8 +621,7 @@ pub fn run_moe_decode(
     // (production default: byte-exact with the chain, +0.8% on the A3B
     // serve battery — .research/microbench/FINDINGS-moe.md).
     let ninepath_d3 = ninepath_eligible && matches!(ninepath_mode, "1" | "d3" | "on");
-    let ninepath_d4 =
-        ninepath_eligible && !matches!(ninepath_mode, "0" | "off" | "d3");
+    let ninepath_d4 = ninepath_eligible && !matches!(ninepath_mode, "0" | "off" | "d3");
 
     {
         // ── Routed-expert dispatch via device-indexed merged kernels ──────────
@@ -1285,6 +1285,70 @@ fn run_moe_decode_cpu_fallback(
     Ok(())
 }
 
+fn i8dot_diag_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED
+        .get_or_init(|| hipfire_config::developer_var("HIPFIRE_I8DOT_DIAG").as_deref() == Ok("1"))
+}
+
+fn i8dot_diag_f32(gpu: &mut Gpu, label: &str, tensor: &GpuTensor) -> Result<(), DispatchError> {
+    if !i8dot_diag_enabled() {
+        return Ok(());
+    }
+    let values = gpu
+        .download_f32(tensor)
+        .map_err(|e| DispatchError::Hip(e.to_string()))?;
+    let nan = values.iter().filter(|value| value.is_nan()).count();
+    let inf = values.iter().filter(|value| value.is_infinite()).count();
+    let max_abs = values
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite())
+        .map(f32::abs)
+        .fold(0.0_f32, f32::max);
+    eprintln!(
+        "I8DOT-DIAG dev={} {label}: n={} nan={nan} inf={inf} max_abs={max_abs:.7e}",
+        gpu.device_id,
+        values.len(),
+    );
+    Ok(())
+}
+
+fn i8dot_diag_a8(gpu: &mut Gpu, tensor: &GpuTensor) -> Result<(), DispatchError> {
+    if !i8dot_diag_enabled() {
+        return Ok(());
+    }
+    const BLOCK: usize = 136;
+    let mut bytes = vec![0_u8; tensor.byte_size()];
+    gpu.hip
+        .memcpy_dtoh(&mut bytes, &tensor.buf)
+        .map_err(|e| DispatchError::Hip(e.to_string()))?;
+    let mut nan_scale = 0_usize;
+    let mut inf_scale = 0_usize;
+    let mut max_scale = 0.0_f32;
+    let mut max_sum = 0_i32;
+    let mut max_q = 0_i32;
+    for block in bytes.chunks_exact(BLOCK) {
+        let d = f32::from_le_bytes(block[0..4].try_into().unwrap());
+        let sum = i32::from_le_bytes(block[4..8].try_into().unwrap());
+        nan_scale += usize::from(d.is_nan());
+        inf_scale += usize::from(d.is_infinite());
+        if d.is_finite() {
+            max_scale = max_scale.max(d.abs());
+        }
+        max_sum = max_sum.max(sum.abs());
+        for &q in &block[8..] {
+            max_q = max_q.max((q as i8 as i32).abs());
+        }
+    }
+    eprintln!(
+        "I8DOT-DIAG dev={} a8: blocks={} nan_scale={nan_scale} inf_scale={inf_scale} max_scale={max_scale:.7e} max_sum={max_sum} max_q={max_q}",
+        gpu.device_id,
+        bytes.len() / BLOCK,
+    );
+    Ok(())
+}
+
 /// DeepSeek-V4 bias-aware MoE decode executor. Transcribes the routed sub-graph
 /// of `hipfire-arch-deepseek4::forward::ffn_routed` (the fused
 /// `expert_gate_up_blob` branch): bias-aware top-k select → indexed MQ2-Lloyd
@@ -1295,6 +1359,150 @@ fn run_moe_decode_cpu_fallback(
 /// expert stay model-owned — the shared expert seeds `p.ffn_out` and this arm
 /// accumulates into it, so the model must run it first. Decode only
 /// (`batch_size == 1`); batched prefill is the grouped executor (Step 8).
+pub fn run_moe_decode_bias_aware_prepare(
+    gpu: &mut Gpu,
+    p: &crate::families::moe::MoeBiasAwareParams,
+) -> Result<(), DispatchError> {
+    macro_rules! hip {
+        ($e:expr) => {
+            $e.map_err(|e| DispatchError::Hip(e.to_string()))
+        };
+    }
+    if p.batch_size != 1 {
+        return Err(DispatchError::UnsupportedVariant {
+            family: "moe",
+            variant: "bias-aware-decode-requires-batch-1",
+            arch: "",
+            quant: "",
+        });
+    }
+    hip!(gpu.deepseek4_moe_topk_bias_aware_f32(
+        p.scores,
+        p.gate_bias,
+        p.topk_indices,
+        p.topk_weights,
+        p.n_exp as i32,
+        p.k_top as i32,
+        p.route_scale,
+    ))?;
+    if let Some(x_a8) = p.x_a8 {
+        i8dot_diag_f32(gpu, "x_rot", p.x_rot)?;
+        hip!(gpu.deepseek4_quantize_f32_a8_g128_gfx90a(p.x_rot, x_a8, p.hidden, true,))?;
+        i8dot_diag_a8(gpu, x_a8)?;
+        hip!(
+            gpu.deepseek4_gemv_mq2g256_i8dot_affine_moe_gate_up_indexed_gfx90a(
+                p.expert_gate_up_ptrs,
+                p.topk_indices,
+                x_a8,
+                p.gate_batch,
+                p.up_batch,
+                2 * p.mi,
+                p.hidden,
+                p.k_top,
+                87,
+            )
+        )?;
+        i8dot_diag_f32(gpu, "gate", p.gate_batch)?;
+        i8dot_diag_f32(gpu, "up", p.up_batch)?;
+    } else {
+        hip!(gpu.deepseek4_gemv_mq2g256_lloyd_moe_gate_up_indexed(
+            p.expert_gate_up_ptrs,
+            p.topk_indices,
+            p.x_rot,
+            p.gate_batch,
+            p.up_batch,
+            2 * p.mi,
+            p.hidden,
+            p.k_top,
+        ))?;
+    }
+    hip!(gpu.deepseek4_silu_mul_clamp_f32_batched(
+        p.gate_batch,
+        p.up_batch,
+        p.gate_batch,
+        p.mi,
+        p.k_top,
+        p.swiglu_limit,
+    ))?;
+    if p.x_a8.is_some() {
+        i8dot_diag_f32(gpu, "silu", p.gate_batch)?;
+    }
+    hip!(gpu.rotate_x_mq_batched(p.gate_batch, p.rot_batch, p.mi, p.k_top,))?;
+    if p.x_a8.is_some() {
+        i8dot_diag_f32(gpu, "rot", p.rot_batch)?;
+    }
+    Ok(())
+}
+
+pub fn run_moe_decode_bias_aware_rows(
+    gpu: &mut Gpu,
+    p: &crate::families::moe::MoeBiasAwareParams,
+    row_base: usize,
+    row_count: usize,
+) -> Result<(), DispatchError> {
+    macro_rules! hip {
+        ($e:expr) => {
+            $e.map_err(|e| DispatchError::Hip(e.to_string()))
+        };
+    }
+    let deterministic =
+        hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_DETERMINISTIC").as_deref() != Ok("0");
+    let fused_gfx90a =
+        hipfire_config::developer_var("HIPFIRE_GFX90A_EP_FUSED_DOWN").as_deref() == Ok("1");
+    if fused_gfx90a {
+        hip!(gpu.deepseek4_gemv_mq2g256_lloyd_moe_down_fused_rows(
+            p.expert_down_ptrs,
+            p.topk_indices,
+            p.topk_weights,
+            p.rot_batch,
+            p.ffn_out,
+            p.hidden,
+            p.mi,
+            p.k_top,
+            row_base,
+            row_count,
+        ))?;
+    } else if deterministic {
+        hip!(gpu.deepseek4_gemv_mq2g256_lloyd_moe_down_expanded_k4_rows(
+            p.expert_down_ptrs,
+            p.topk_indices,
+            p.rot_batch,
+            p.down_expanded,
+            p.hidden,
+            p.mi,
+            p.k_top,
+            1,
+            row_base,
+            row_count,
+        ))?;
+        hip!(gpu.moe_down_combine_k8_batched_rows(
+            p.down_expanded,
+            p.topk_weights,
+            p.ffn_out,
+            p.hidden,
+            p.k_top,
+            1,
+            row_base,
+            row_count,
+        ))?;
+    } else {
+        hip!(
+            gpu.deepseek4_gemv_mq2g256_lloyd_moe_down_residual_scaled_indexed_rows(
+                p.expert_down_ptrs,
+                p.topk_indices,
+                p.topk_weights,
+                p.rot_batch,
+                p.ffn_out,
+                p.hidden,
+                p.mi,
+                p.k_top,
+                row_base,
+                row_count,
+            )
+        )?;
+    }
+    Ok(())
+}
 pub fn run_moe_decode_bias_aware(
     gpu: &mut Gpu,
     p: &crate::families::moe::MoeBiasAwareParams,
@@ -1325,20 +1533,40 @@ pub fn run_moe_decode_bias_aware(
         p.route_scale,
     ))?;
 
-    // 2. Indexed MQ2-Lloyd gate_up: all k_top experts in one launch
-    //    (M = 2*mi; the kernel splits rows r<mi → gate, r>=mi → up).
-    hip!(gpu.deepseek4_gemv_mq2g256_lloyd_moe_gate_up_indexed(
-        p.expert_gate_up_ptrs,
-        p.topk_indices,
-        p.x_rot,
-        p.gate_batch,
-        p.up_batch,
-        2 * p.mi,
-        p.hidden,
-        p.k_top,
-    ))?;
+    // 2. Indexed gate/up. I8DOT-enabled layers use the transcoded TILED8
+    // affine metadata; all other layers retain the MQ2-Lloyd path.
+    if let Some(x_a8) = p.x_a8 {
+        i8dot_diag_f32(gpu, "x_rot", p.x_rot)?;
+        hip!(gpu.deepseek4_quantize_f32_a8_g128_gfx90a(p.x_rot, x_a8, p.hidden, true,))?;
+        i8dot_diag_a8(gpu, x_a8)?;
+        hip!(
+            gpu.deepseek4_gemv_mq2g256_i8dot_affine_moe_gate_up_indexed_gfx90a(
+                p.expert_gate_up_ptrs,
+                p.topk_indices,
+                x_a8,
+                p.gate_batch,
+                p.up_batch,
+                2 * p.mi,
+                p.hidden,
+                p.k_top,
+                87,
+            )
+        )?;
+        i8dot_diag_f32(gpu, "gate", p.gate_batch)?;
+        i8dot_diag_f32(gpu, "up", p.up_batch)?;
+    } else {
+        hip!(gpu.deepseek4_gemv_mq2g256_lloyd_moe_gate_up_indexed(
+            p.expert_gate_up_ptrs,
+            p.topk_indices,
+            p.x_rot,
+            p.gate_batch,
+            p.up_batch,
+            2 * p.mi,
+            p.hidden,
+            p.k_top,
+        ))?;
+    }
 
-    // 3. Batched silu·mul·clamp (in-place into gate_batch) then batched FWHT rotate.
     hip!(gpu.deepseek4_silu_mul_clamp_f32_batched(
         p.gate_batch,
         p.up_batch,
@@ -1347,13 +1575,20 @@ pub fn run_moe_decode_bias_aware(
         p.k_top,
         p.swiglu_limit,
     ))?;
-    hip!(gpu.rotate_x_mq_batched(p.gate_batch, p.rot_batch, p.mi, p.k_top))?;
+    if p.x_a8.is_some() {
+        i8dot_diag_f32(gpu, "silu", p.gate_batch)?;
+    }
+    hip!(gpu.rotate_x_mq_batched(p.gate_batch, p.rot_batch, p.mi, p.k_top,))?;
+    if p.x_a8.is_some() {
+        i8dot_diag_f32(gpu, "rot", p.rot_batch)?;
+    }
 
     // 4. Indexed MQ2-Lloyd down. Deterministic (default): expanded per-expert
     //    write + fixed-order non-atomic combine into ffn_out — bit-reproducible
     //    for greedy/spec-decode. MOE_DETERMINISTIC=0 uses the faster
     //    atomicAdd-fused path (nondeterministic; bench only).
-    let deterministic = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_DETERMINISTIC").as_deref() != Ok("0");
+    let deterministic =
+        hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_DETERMINISTIC").as_deref() != Ok("0");
     if deterministic {
         hip!(gpu.deepseek4_gemv_mq2g256_lloyd_moe_down_expanded_k4(
             p.expert_down_ptrs,
@@ -1564,6 +1799,16 @@ fn dispatch_grouped_lloyd(
     r.map_err(|e| DispatchError::Hip(e.to_string()))
 }
 
+#[inline]
+fn grouped_m_total_bound(total_slots: usize, n_exp: usize, block_m: usize) -> usize {
+    debug_assert!(block_m > 0);
+    // Only experts receiving a route contribute padding. Keep the bound tile
+    // aligned because grouped kernels round the slot grid up to block_m.
+    let live_expert_bound = total_slots.min(n_exp);
+    let unaligned = total_slots + live_expert_bound * (block_m - 1);
+    unaligned.div_ceil(block_m) * block_m
+}
+
 /// DeepSeek-V4 batched/prefill MoE executor. Transcribes the routed block of
 /// `hipfire-arch-deepseek4::forward::ffn_batched`: routing (hash or bias-aware)
 /// → routed experts (grouped GEMM when `batch_size >= gate`, else scalar K4
@@ -1635,31 +1880,39 @@ pub fn run_moe_prefill_bias_aware(
     }
 
     // ── Grouped vs scalar gate ────────────────────────────────────────────────
+    let gfx90a_mfma = gpu.arch == "gfx90a"
+        && hipfire_config::developer_var("HIPFIRE_GFX90A_MQ2_MFMA").as_deref() == Ok("1");
+    let default_gate_threshold = if gfx90a_mfma { 160 } else { 128 };
     let gate_threshold: usize = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_GROUPED_GATE")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(128);
-    let use_grouped = batch_size >= gate_threshold
+        .unwrap_or(default_gate_threshold);
+    let use_grouped = p.x_a8.is_none()
+        && batch_size >= gate_threshold
         && hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_GROUPED").as_deref() != Ok("0");
 
     // Shared research levers (read once; default 4w on gfx11+).
-    let lloyd_4w_base = match hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_LLOYD_4W").as_deref() {
-        Ok("0") => Some(false),
-        Ok("1") => Some(true),
-        _ => None,
-    };
+    let lloyd_4w_base =
+        match hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_LLOYD_4W").as_deref() {
+            Ok("0") => Some(false),
+            Ok("1") => Some(true),
+            _ => None,
+        };
     let arch_4w = gpu.arch.starts_with("gfx11") || gpu.arch.starts_with("gfx12");
     let n32 = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_N32").as_deref() == Ok("1");
     let cnd = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_CND").as_deref() == Ok("1");
     let eightw = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_8W").as_deref() == Ok("1");
-    let mmqload_env = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_MMQLOAD").as_deref() == Ok("1");
-    let nosync_env = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_NOSYNC").as_deref() == Ok("1");
+    let mmqload_env =
+        hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_MMQLOAD").as_deref() == Ok("1");
+    let nosync_env =
+        hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_NOSYNC").as_deref() == Ok("1");
     // i8 MMQ path (gfx1151 only): 2-bit Lloyd → int8 codebook LUT + i8 WMMA.
     let i8_moe = use_gfx1151_i8_moe(&gpu.arch);
 
     if use_grouped {
         const BLOCK_M: usize = 16;
-        let m_total_max = batch_size * k_top + n_exp * BLOCK_M;
+        let total_slots = batch_size * k_top;
+        let m_total_max = grouped_m_total_bound(total_slots, n_exp, BLOCK_M);
 
         // Scatter: histogram + offsets + permute (single launch).
         hip!(gpu.moe_scatter_fused_k8(
@@ -1691,25 +1944,41 @@ pub fn run_moe_prefill_bias_aware(
             use_mmqload_gu,
             use_nosync_gu,
         );
-        dispatch_grouped_lloyd(
-            gpu,
-            v_gu,
-            p.expert_gate_up_ptrs,
-            p.expert_tile_ids,
-            p.sorted_slot_index,
-            p.x_rot,
-            p.y_gate_up_grouped,
-            2 * im,
-            hidden,
-            k_top,
-            m_total_max,
-            batch_size,
-        )?;
+        if gfx90a_mfma {
+            hip!(gpu.gemm_mq2g256_lloyd_moe_grouped_mfma_gfx90a(
+                p.expert_gate_up_ptrs,
+                p.expert_tile_ids,
+                p.sorted_slot_index,
+                p.x_rot,
+                p.y_gate_up_grouped,
+                2 * im,
+                hidden,
+                k_top,
+                m_total_max,
+                batch_size,
+            ))?;
+        } else {
+            dispatch_grouped_lloyd(
+                gpu,
+                v_gu,
+                p.expert_gate_up_ptrs,
+                p.expert_tile_ids,
+                p.sorted_slot_index,
+                p.x_rot,
+                p.y_gate_up_grouped,
+                2 * im,
+                hidden,
+                k_top,
+                m_total_max,
+                batch_size,
+            )?;
+        }
 
         // Unscatter + SwiGLU·clamp.
-        let use_fused_unscatter_silu = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_FUSED_UNSCATTER_SILU")
-            .map(|s| s != "0")
-            .unwrap_or(false);
+        let use_fused_unscatter_silu =
+            hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_FUSED_UNSCATTER_SILU")
+                .map(|s| s != "0")
+                .unwrap_or(false);
         if use_fused_unscatter_silu {
             hip!(gpu.moe_unscatter_silu_clamp_k8(
                 p.y_gate_up_grouped,
@@ -1757,20 +2026,35 @@ pub fn run_moe_prefill_bias_aware(
             use_mmqload_dn,
             use_nosync_dn,
         );
-        dispatch_grouped_lloyd(
-            gpu,
-            v_dn,
-            p.expert_down_ptrs,
-            p.expert_tile_ids,
-            p.sorted_slot_index,
-            p.rot_batch,
-            p.y_down_grouped,
-            hidden,
-            im,
-            1,
-            m_total_max,
-            batch_size * k_top,
-        )?;
+        if gfx90a_mfma {
+            hip!(gpu.gemm_mq2g256_lloyd_moe_grouped_mfma_gfx90a(
+                p.expert_down_ptrs,
+                p.expert_tile_ids,
+                p.sorted_slot_index,
+                p.rot_batch,
+                p.y_down_grouped,
+                hidden,
+                im,
+                1,
+                m_total_max,
+                batch_size * k_top,
+            ))?;
+        } else {
+            dispatch_grouped_lloyd(
+                gpu,
+                v_dn,
+                p.expert_down_ptrs,
+                p.expert_tile_ids,
+                p.sorted_slot_index,
+                p.rot_batch,
+                p.y_down_grouped,
+                hidden,
+                im,
+                1,
+                m_total_max,
+                batch_size * k_top,
+            )?;
+        }
 
         // Down-combine: weighted Σ over k_top slots, per (token, m), into ffn_out.
         hip!(gpu.moe_down_combine_grouped_k8(
@@ -1784,19 +2068,38 @@ pub fn run_moe_prefill_bias_aware(
         ))?;
     } else {
         // ── Scalar K4 path (batch_size < gate, or grouped opt-out) ──
-        hip!(
-            gpu.deepseek4_gemv_mq2g256_lloyd_moe_gate_up_indexed_batched_k4(
-                p.expert_gate_up_ptrs,
-                p.topk_indices,
-                p.x_rot,
-                p.gate_batch,
-                p.up_batch,
-                2 * im,
-                hidden,
-                k_top,
-                batch_size,
-            )
-        )?;
+        if let Some(x_a8) = p.x_a8 {
+            hip!(gpu.deepseek4_quantize_f32_a8_g128_sg8_batched_gfx90a(
+                p.x_rot, x_a8, hidden, batch_size,
+            ))?;
+            hip!(
+                gpu.deepseek4_gemv_mq2g256_i8dot_affine_moe_gate_up_batched_gfx90a(
+                    p.expert_gate_up_ptrs,
+                    p.topk_indices,
+                    x_a8,
+                    p.gate_batch,
+                    p.up_batch,
+                    2 * im,
+                    hidden,
+                    k_top,
+                    batch_size,
+                )
+            )?;
+        } else {
+            hip!(
+                gpu.deepseek4_gemv_mq2g256_lloyd_moe_gate_up_indexed_batched_k4(
+                    p.expert_gate_up_ptrs,
+                    p.topk_indices,
+                    p.x_rot,
+                    p.gate_batch,
+                    p.up_batch,
+                    2 * im,
+                    hidden,
+                    k_top,
+                    batch_size,
+                )
+            )?;
+        }
         hip!(gpu.deepseek4_silu_mul_clamp_f32_batched(
             p.gate_batch,
             p.up_batch,
@@ -1809,8 +2112,9 @@ pub fn run_moe_prefill_bias_aware(
 
         // Down: deterministic expanded+combine (default; bit-reproducible for
         // spec-decode) vs non-deterministic atomic-accumulate.
-        let deterministic =
-            hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_DETERMINISTIC").as_deref() != Ok("0");
+        let deterministic = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_DETERMINISTIC")
+            .as_deref()
+            != Ok("0");
         if deterministic {
             hip!(gpu.deepseek4_gemv_mq2g256_lloyd_moe_down_expanded_k4(
                 p.expert_down_ptrs,
@@ -2057,7 +2361,11 @@ pub fn run_moe_prefill(
 
     let res = MoePrefillResolution::resolve(&p.dtypes, &ctx.arch, &ctx.flags);
     let force_mq4_grouped_fp16 = res.force_mq4_grouped_fp16 || p.force_mq4_grouped_fp16;
-    if hipfire_config::developer_var("HIPFIRE_MOE_PREFILL_TRACE").ok().as_deref() == Some("1") {
+    if hipfire_config::developer_var("HIPFIRE_MOE_PREFILL_TRACE")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
         eprintln!(
             "[moe-prefill] arch={} shared=({:?},{:?},{:?},{:?}) routed=({:?},{:?}) \
              path2={} force_mq4_fp16={} grouped_i8={:?}",
@@ -2529,7 +2837,7 @@ pub fn dispatch_fused(
 
 #[cfg(test)]
 mod mixed_dispatch_tests {
-    use super::{build_contiguous_permutation, use_gfx1151_i8_moe};
+    use super::{build_contiguous_permutation, grouped_m_total_bound, use_gfx1151_i8_moe};
     use crate::families::moe_buckets::bucket_topk_by_tier;
     use rdna_compute::DType::*;
 
@@ -2539,6 +2847,19 @@ mod mixed_dispatch_tests {
         for arch in ["gfx1100", "gfx1150", "gfx1152", "gfx1200", "gfx1201"] {
             assert!(!use_gfx1151_i8_moe(arch), "unexpected i8 route on {arch}");
         }
+    }
+
+    #[test]
+    fn deepseek4_grouped_bound_tracks_only_live_experts() {
+        const E: usize = 256;
+        const TILE: usize = 16;
+        assert_eq!(grouped_m_total_bound(0, E, TILE), 0);
+        assert_eq!(grouped_m_total_bound(6, E, TILE), 96);
+        assert_eq!(grouped_m_total_bound(96, E, TILE), 1536);
+        assert_eq!(grouped_m_total_bound(192, E, TILE), 3072);
+        assert_eq!(grouped_m_total_bound(384, E, TILE), 4224);
+        assert_eq!(grouped_m_total_bound(768, E, TILE), 4608);
+        assert_eq!(grouped_m_total_bound(7, E, TILE) % TILE, 0);
     }
 
     /// EQUIVALENCE INVARIANT (host half): an all-ONE-tier table yields the

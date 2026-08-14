@@ -362,6 +362,9 @@ struct RunArgs {
     #[arg(long, value_parser = ["contiguous", "vmm"])]
     /// One-shot KV storage backend override for this model load.
     kv_backend: Option<String>,
+    /// Expert-parallel degree for this one-shot model load.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=64))]
+    tp: Option<u64>,
     /// Select one speculative mechanism: off, auto, ngram, dflash, mtp, or dspark.
     #[arg(long = "spec", alias = "speculation")]
     speculation: Option<String>,
@@ -1866,6 +1869,7 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
         || args.image.is_some()
         || args.kv_mode.is_some()
         || args.kv_backend.is_some()
+        || args.tp.is_some()
         || args.speculation.is_some()
         || args.model_draft.is_some()
         || args.draft_max.is_some()
@@ -1905,6 +1909,9 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
         args.kv_mode.as_deref(),
         args.kv_backend.as_deref(),
     )?;
+    if let Some(tp) = args.tp {
+        params["tp"] = serde_json::json!(tp);
+    }
     let selector = args
         .speculation
         .clone()
@@ -1961,6 +1968,7 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
     let mut request = serde_json::json!({
         "type": "generate",
         "id": "run",
+        "attempt_id": 1,
         "prompt": prompt,
         "max_tokens": max_tokens,
     });
@@ -6402,10 +6410,7 @@ fn bench_generate_request(prompt: &str, max_tokens: u64) -> serde_json::Value {
 }
 
 fn bench_generate(engine: &mut Engine, prompt: &str, max_tokens: u64) -> Result<serde_json::Value> {
-    Ok(engine.generate(
-        &bench_generate_request(prompt, max_tokens),
-        |_| Ok(()),
-    )?)
+    Ok(engine.generate(&bench_generate_request(prompt, max_tokens), |_| Ok(()))?)
 }
 
 fn bench_probe(
@@ -13390,26 +13395,14 @@ for line in sys.stdin:
     #[test]
     fn bench_generate_request_includes_numeric_first_attempt() {
         let req = bench_generate_request("bench prompt", 37);
-        assert_eq!(
-            req.get("type").and_then(|v| v.as_str()),
-            Some("generate")
-        );
-        assert_eq!(
-            req.get("attempt_id").and_then(|v| v.as_u64()),
-            Some(1)
-        );
-        let id = req
-            .get("id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        assert_eq!(req.get("type").and_then(|v| v.as_str()), Some("generate"));
+        assert_eq!(req.get("attempt_id").and_then(|v| v.as_u64()), Some(1));
+        let id = req.get("id").and_then(|v| v.as_str()).unwrap_or("");
         assert!(!id.is_empty(), "id must be a non-empty string");
         assert_eq!(
             req.get("prompt").and_then(|v| v.as_str()),
             Some("bench prompt")
         );
-        assert_eq!(
-            req.get("max_tokens").and_then(|v| v.as_u64()),
-            Some(37)
-        );
+        assert_eq!(req.get("max_tokens").and_then(|v| v.as_u64()), Some(37));
     }
 }

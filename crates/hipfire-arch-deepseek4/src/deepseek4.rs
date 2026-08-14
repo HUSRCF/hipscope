@@ -1200,6 +1200,8 @@ pub struct DeepseekV4State {
     pub moe_rot_batch: Option<rdna_compute::GpuTensor>,
     /// `[k_top × hidden]` per-expert down outputs for the deterministic MoE combine.
     pub moe_down_expert_outputs: Option<rdna_compute::GpuTensor>,
+    /// Per-token SG8-ordered A8 activation for gfx90a MQ2-I8DOT gate/up.
+    pub moe_x_a8: Option<rdna_compute::GpuTensor>,
 
     /// Buffer of all-ones, length `head_dim`, used as the weight arg
     /// to the per-head Q RMSNorm (upstream DeepSeek V4 has NO learnable scale
@@ -1372,6 +1374,7 @@ impl DeepseekV4State {
             moe_up_batch: None,
             moe_rot_batch: None,
             moe_down_expert_outputs: None,
+            moe_x_a8: None,
             q_head_ones: None,
             attn_out_raw: None,
             attn_out_raw_rot: None,
@@ -1591,6 +1594,7 @@ impl DeepseekV4State {
         free_opt(gpu, &mut self.moe_up_batch);
         free_opt(gpu, &mut self.moe_rot_batch);
         free_opt(gpu, &mut self.moe_down_expert_outputs);
+        free_opt(gpu, &mut self.moe_x_a8);
         free_opt(gpu, &mut self.q_head_ones);
         free_opt(gpu, &mut self.attn_out_raw);
         free_opt(gpu, &mut self.attn_out_raw_rot);

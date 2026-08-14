@@ -8334,6 +8334,53 @@ impl Gpu {
             )
         }
     }
+    pub fn compressor_overlap_concat_pair_f32(
+        &mut self,
+        src0: &GpuTensor,
+        src1: &GpuTensor,
+        dst0: &GpuTensor,
+        dst1: &GpuTensor,
+        ratio: i32,
+        head_dim: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "compressor_overlap_concat_pair_f32",
+            kernels::COMPRESSOR_OVERLAP_CONCAT_PAIR_SRC,
+            "compressor_overlap_concat_pair_f32",
+        )?;
+        let s0p = src0.buf.as_ptr();
+        let s1p = src1.buf.as_ptr();
+        let d0p = dst0.buf.as_ptr();
+        let d1p = dst1.buf.as_ptr();
+        let rv = ratio;
+        let hd = head_dim;
+        let mut params: Vec<*mut c_void> = vec![
+            &s0p as *const _ as *mut c_void,
+            &s1p as *const _ as *mut c_void,
+            &d0p as *const _ as *mut c_void,
+            &d1p as *const _ as *mut c_void,
+            &rv as *const _ as *mut c_void,
+            &hd as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "compressor_overlap_concat_pair_f32",
+            [(2 * ratio) as u32, 2, 1],
+            [head_dim as u32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(s0p);
+                b.push_ptr(s1p);
+                b.push_ptr(d0p);
+                b.push_ptr(d1p);
+                b.push_i32(rv);
+                b.push_i32(hd);
+                b
+            },
+        )
+    }
     pub fn compressor_ring_write_batched_f32(
         &mut self,
         kv_batch: &GpuTensor,
@@ -9762,6 +9809,51 @@ impl Gpu {
             blob_builder,
         )
     }
+    pub fn state_overlap_shift_pair_f32_buf(
+        &mut self,
+        state0: &GpuTensor,
+        state1: &GpuTensor,
+        commit_slot_buf: &GpuTensor,
+        ratio: i32,
+        proj_dim: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "state_overlap_shift_pair_f32_buf",
+            kernels::STATE_OVERLAP_SHIFT_PAIR_F32_BUF_SRC,
+            "state_overlap_shift_pair_f32_buf",
+        )?;
+        let s0p = state0.buf.as_ptr();
+        let s1p = state1.buf.as_ptr();
+        let cp = commit_slot_buf.buf.as_ptr();
+        let rv = ratio;
+        let pd = proj_dim;
+        let mut params: Vec<*mut c_void> = vec![
+            &s0p as *const _ as *mut c_void,
+            &s1p as *const _ as *mut c_void,
+            &cp as *const _ as *mut c_void,
+            &rv as *const _ as *mut c_void,
+            &pd as *const _ as *mut c_void,
+        ];
+        let block = 256u32;
+        let grid = ((ratio * proj_dim) as u32).div_ceil(block);
+        self.launch_maybe_blob(
+            "state_overlap_shift_pair_f32_buf",
+            [grid, 2, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(s0p);
+                b.push_ptr(s1p);
+                b.push_ptr(cp);
+                b.push_i32(rv);
+                b.push_i32(pd);
+                b
+            },
+        )
+    }
     pub fn state_ring_write_f32_buf(
         &mut self,
         src: &GpuTensor,
@@ -9804,6 +9896,56 @@ impl Gpu {
             blob_builder,
         )
     }
+    pub fn state_ring_write_pair_f32_buf(
+        &mut self,
+        src0: &GpuTensor,
+        src1: &GpuTensor,
+        state0: &GpuTensor,
+        state1: &GpuTensor,
+        ring_slot_buf: &GpuTensor,
+        proj_dim: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "state_ring_write_pair_f32_buf",
+            kernels::STATE_RING_WRITE_PAIR_F32_BUF_SRC,
+            "state_ring_write_pair_f32_buf",
+        )?;
+        let s0 = src0.buf.as_ptr();
+        let s1 = src1.buf.as_ptr();
+        let d0 = state0.buf.as_ptr();
+        let d1 = state1.buf.as_ptr();
+        let rp = ring_slot_buf.buf.as_ptr();
+        let mut pd = proj_dim;
+        let mut params: Vec<*mut c_void> = vec![
+            &s0 as *const _ as *mut c_void,
+            &s1 as *const _ as *mut c_void,
+            &d0 as *const _ as *mut c_void,
+            &d1 as *const _ as *mut c_void,
+            &rp as *const _ as *mut c_void,
+            &mut pd as *mut _ as *mut c_void,
+        ];
+        let block = 256u32;
+        let grid = ((2 * proj_dim as u32) + block - 1) / block;
+        self.launch_maybe_blob(
+            "state_ring_write_pair_f32_buf",
+            [grid, 1, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(s0);
+                b.push_ptr(s1);
+                b.push_ptr(d0);
+                b.push_ptr(d1);
+                b.push_ptr(rp);
+                b.push_i32(pd);
+                b
+            },
+        )
+    }
+
     pub fn swa_ring_write_batched_f32(
         &mut self,
         kv_batch: &GpuTensor, // [B, head_dim]

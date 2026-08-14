@@ -2125,6 +2125,8 @@ pub const GEMV_HFQ5G256_MOE_GATE_UP_INDEXED_BATCHED_SRC: &str =
 /// per-token residual row. No cross-token contention.
 pub const MOE_DOWN_COMBINE_K8_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/moe_down_combine_k8_batched.hip");
+pub const MOE_DOWN_COMBINE_K8_BATCHED_ROWS_SRC: &str =
+    include_str!("../../../kernels/src/moe_down_combine_k8_batched_rows.hip");
 
 /// Cross-layer gfx1100 experiment: combine one K=8 routed output row and
 /// consume it immediately for the following K=2048 RMSNorm + MQ rotation.
@@ -3727,6 +3729,10 @@ pub const FUSED_GATE_UP_HFQ4G256_K1024_GFX1201_SRC: &str = concat!(
 /// Grid=[gate_m + up_m], block=[32]. +5.8 tok/s decode on dots.ocr.
 pub const FUSED_GATE_UP_Q8_0_SRC: &str =
     include_str!("../../../kernels/src/fused_gate_up_q8_0.hip");
+/// CDNA wave64 twin Q8_0 decode projection with a bias epilogue on the second
+/// output. One 64-lane wave computes two rows.
+pub const FUSED_GATE_UP_Q8_0_WAVE64_BIAS_SRC: &str =
+    include_str!("../../../kernels/src/fused_gate_up_q8_0_wave64_bias.hip");
 
 /// 4-way fused QKVZA for Q8_0 weights (DECODE, n=1). Mirrors
 /// fused_qkvza_hfq4g256 but with Q8_0 dequant. Grid=[total_m], block=[32].
@@ -4734,6 +4740,10 @@ pub const GEMM_F16_WMMA_MB8_GFX12_SRC: &str =
 /// Tiled F16 GEMM with shared memory (no WMMA dependency, works on all RDNA).
 /// ~5-10x faster than naive gemm_f16 via LDS data reuse. Tile size 64K.
 pub const GEMM_F16_TILED_SRC: &str = include_str!("../../../kernels/src/gemm_f16_tiled.hip");
+/// gfx90a wave64 twin F16xF32 decode projection with bias on output 1.
+pub const FUSED_TWIN_F16_XF32_WAVE64_BIAS_GFX90A_SRC: &str =
+    include_str!("../../../kernels/src/fused_twin_f16_xf32_wave64_bias.gfx90a.hip");
+
 /// Fused GEMM + bias: Y[N,M] = X[N,K] @ W_f16[M,K]^T + bias[M].
 /// Eliminates transpose + bias_add kernel launches (~7MB saved per linear layer).
 /// Grid=[N,1], Block=[256], 8-way unrolled.
@@ -4831,9 +4841,133 @@ pub const PFLASH_SCORE_FWHT2_KV_SRC: &str =
 /// MoE indexed kernels. X must be FWHT-pre-rotated by the caller.
 pub const GEMV_MQ2G256_LLOYD_MOE_GATE_UP_INDEXED_SRC: &str =
     include_str!("../../../kernels/src/gemv_mq2g256_lloyd_moe_gate_up_indexed.hip");
+pub const GEMV_MQ2G256_LLOYD_MOE_GATE_UP_INDEXED_GFX90A_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mq2g256_lloyd_moe_gate_up_indexed.gfx90a.hip");
+pub const GEMV_MQ2G256_LLOYD_MOE_GATE_UP_INDEXED_ROW2_GFX90A_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mq2g256_lloyd_moe_gate_up_indexed_row2.gfx90a.hip");
+pub const GEMV_MQ2G256_I8DOT_AFFINE_MOE_GATE_UP_ROW1_GFX90A_SRC: &str = concat!(
+    "#define HIPFIRE_MQ2_I8DOT_ROW_TILE 1\n",
+    "#define HIPFIRE_MQ2_I8DOT_KERNEL ",
+    "gemv_mq2g256_i8dot_affine_moe_gate_up_indexed_row1_gfx90a\n",
+    include_str!("../../../kernels/src/gemv_mq2g256_lloyd_i8dot_affine.gfx90a.hip")
+);
+pub const GEMV_MQ2G256_I8DOT_AFFINE_MOE_GATE_UP_ROW2_GFX90A_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mq2g256_lloyd_i8dot_affine.gfx90a.hip");
+pub const GEMV_MQ2G256_I8DOT_AFFINE_MOE_GATE_UP_ROW4_GFX90A_SRC: &str = concat!(
+    "#define HIPFIRE_MQ2_I8DOT_ROW_TILE 4\n",
+    "#define HIPFIRE_MQ2_I8DOT_KERNEL ",
+    "gemv_mq2g256_i8dot_affine_moe_gate_up_indexed_row4_gfx90a\n",
+    include_str!("../../../kernels/src/gemv_mq2g256_lloyd_i8dot_affine_sg8.gfx90a.hip")
+);
+pub const GEMV_MQ2G256_I8DOT_AFFINE_MOE_GATE_UP_ROW8_GFX90A_SRC: &str = concat!(
+    "#define HIPFIRE_MQ2_I8DOT_ROW_TILE 8\n",
+    "#define HIPFIRE_MQ2_I8DOT_TILED8 1\n",
+    "#define HIPFIRE_MQ2_I8DOT_TILED_A8 1\n",
+    "#define HIPFIRE_MQ2_I8DOT_KERNEL ",
+    "gemv_mq2g256_i8dot_affine_moe_gate_up_indexed_row8_gfx90a\n",
+    include_str!("../../../kernels/src/gemv_mq2g256_lloyd_i8dot_affine_sg8.gfx90a.hip")
+);
+pub const GEMV_MQ2G256_I8DOT_ROW8_NO_SELECTOR_GFX90A_SRC: &str = concat!(
+    "#define HIPFIRE_MQ2_I8DOT_ROW_TILE 8\n#define HIPFIRE_MQ2_I8DOT_TILED8 1\n#define HIPFIRE_MQ2_I8DOT_TILED_A8 1\n#define HIPFIRE_MQ2_I8DOT_ABLATE_SELECTOR 1\n#define HIPFIRE_MQ2_I8DOT_KERNEL gemv_mq2g256_i8dot_row8_no_selector_gfx90a\n",
+    include_str!("../../../kernels/src/gemv_mq2g256_lloyd_i8dot_affine_sg8.gfx90a.hip")
+);
+pub const GEMV_MQ2G256_I8DOT_ROW8_NO_REDUCE_GFX90A_SRC: &str = concat!(
+    "#define HIPFIRE_MQ2_I8DOT_ROW_TILE 8\n#define HIPFIRE_MQ2_I8DOT_TILED8 1\n#define HIPFIRE_MQ2_I8DOT_TILED_A8 1\n#define HIPFIRE_MQ2_I8DOT_ABLATE_REDUCE 1\n#define HIPFIRE_MQ2_I8DOT_KERNEL gemv_mq2g256_i8dot_row8_no_reduce_gfx90a\n",
+    include_str!("../../../kernels/src/gemv_mq2g256_lloyd_i8dot_affine_sg8.gfx90a.hip")
+);
+pub const GEMV_MQ2G256_I8DOT_ROW8_NO_EPILOGUE_GFX90A_SRC: &str = concat!(
+    "#define HIPFIRE_MQ2_I8DOT_ROW_TILE 8\n#define HIPFIRE_MQ2_I8DOT_TILED8 1\n#define HIPFIRE_MQ2_I8DOT_TILED_A8 1\n#define HIPFIRE_MQ2_I8DOT_ABLATE_EPILOGUE 1\n#define HIPFIRE_MQ2_I8DOT_KERNEL gemv_mq2g256_i8dot_row8_no_epilogue_gfx90a\n",
+    include_str!("../../../kernels/src/gemv_mq2g256_lloyd_i8dot_affine_sg8.gfx90a.hip")
+);
+pub const GEMV_MQ2G256_I8DOT_ROW8_SCALE_ONLY_GFX90A_SRC: &str = concat!(
+    "#define HIPFIRE_MQ2_I8DOT_ROW_TILE 8\n#define HIPFIRE_MQ2_I8DOT_TILED8 1\n#define HIPFIRE_MQ2_I8DOT_TILED_A8 1\n#define HIPFIRE_MQ2_I8DOT_SCALE_ONLY 1\n#define HIPFIRE_MQ2_I8DOT_KERNEL gemv_mq2g256_i8dot_row8_scale_only_gfx90a\n",
+    include_str!("../../../kernels/src/gemv_mq2g256_lloyd_i8dot_affine_sg8.gfx90a.hip")
+);
+pub const GEMV_MQ2G256_I8DOT_ROW8_DIRECT4_GFX90A_SRC: &str = concat!(
+    "#define HIPFIRE_MQ2_I8DOT_ROW_TILE 8\n#define HIPFIRE_MQ2_I8DOT_TILED8 1\n#define HIPFIRE_MQ2_I8DOT_TILED_A8 1\n#define HIPFIRE_MQ2_I8DOT_SELECTOR_DIRECT4 1\n#define HIPFIRE_MQ2_I8DOT_KERNEL gemv_mq2g256_i8dot_row8_direct4_gfx90a\n",
+    include_str!("../../../kernels/src/gemv_mq2g256_lloyd_i8dot_affine_sg8.gfx90a.hip")
+);
+pub const GEMV_MQ2G256_I8DOT_ROW8_CONST_GFX90A_SRC: &str = concat!(
+    "#define HIPFIRE_MQ2_I8DOT_ROW_TILE 8\n#define HIPFIRE_MQ2_I8DOT_TILED8 1\n#define HIPFIRE_MQ2_I8DOT_TILED_A8 1\n#define HIPFIRE_MQ2_I8DOT_SELECTOR_CONST 1\n#define HIPFIRE_MQ2_I8DOT_KERNEL gemv_mq2g256_i8dot_row8_const_gfx90a\n",
+    include_str!("../../../kernels/src/gemv_mq2g256_lloyd_i8dot_affine_sg8.gfx90a.hip")
+);
+pub const GEMV_MQ2G256_I8DOT_ROW8_PIPE2_GFX90A_SRC: &str = concat!(
+    "#define HIPFIRE_MQ2_I8DOT_ROW_TILE 8\n#define HIPFIRE_MQ2_I8DOT_TILED8 1\n#define HIPFIRE_MQ2_I8DOT_TILED_A8 1\n#define HIPFIRE_MQ2_I8DOT_GROUP_UNROLL4 1\n#define HIPFIRE_MQ2_I8DOT_KERNEL gemv_mq2g256_i8dot_row8_pipe2_gfx90a\n",
+    include_str!("../../../kernels/src/gemv_mq2g256_lloyd_i8dot_affine_sg8_pipe2.gfx90a.hip")
+);
+pub const GEMV_MQ2G256_I8DOT_ROW8_PIPE2_BATCHED_GFX90A_SRC: &str = concat!(
+    "#define HIPFIRE_MQ2_I8DOT_ROW_TILE 8\n#define HIPFIRE_MQ2_I8DOT_TILED8 1\n#define HIPFIRE_MQ2_I8DOT_TILED_A8 1\n#define HIPFIRE_MQ2_I8DOT_BATCHED 1\n#define HIPFIRE_MQ2_I8DOT_GROUP_UNROLL4 1\n#define HIPFIRE_MQ2_I8DOT_KERNEL gemv_mq2g256_i8dot_row8_pipe2_batched_gfx90a\n",
+    include_str!("../../../kernels/src/gemv_mq2g256_lloyd_i8dot_affine_sg8_pipe2.gfx90a.hip")
+);
+pub const GEMV_MQ2G256_I8DOT_ROW8_PIPE2_UNROLL2_GFX90A_SRC: &str = concat!(
+    "#define HIPFIRE_MQ2_I8DOT_ROW_TILE 8\n#define HIPFIRE_MQ2_I8DOT_TILED8 1\n#define HIPFIRE_MQ2_I8DOT_TILED_A8 1\n#define HIPFIRE_MQ2_I8DOT_GROUP_UNROLL2 1\n#define HIPFIRE_MQ2_I8DOT_KERNEL gemv_mq2g256_i8dot_row8_pipe2_unroll2_gfx90a\n",
+    include_str!("../../../kernels/src/gemv_mq2g256_lloyd_i8dot_affine_sg8_pipe2.gfx90a.hip")
+);
+pub const GEMV_MQ2G256_I8DOT_ROW8_PIPE2_UNROLL4_GFX90A_SRC: &str = concat!(
+    "#define HIPFIRE_MQ2_I8DOT_ROW_TILE 8\n#define HIPFIRE_MQ2_I8DOT_TILED8 1\n#define HIPFIRE_MQ2_I8DOT_TILED_A8 1\n#define HIPFIRE_MQ2_I8DOT_GROUP_UNROLL4 1\n#define HIPFIRE_MQ2_I8DOT_KERNEL gemv_mq2g256_i8dot_row8_pipe2_unroll4_gfx90a\n",
+    include_str!("../../../kernels/src/gemv_mq2g256_lloyd_i8dot_affine_sg8_pipe2.gfx90a.hip")
+);
+pub const GEMV_MQ2G256_I8DOT_ROW8_PIPE2_SCALE_ONLY_GFX90A_SRC: &str = concat!(
+    "#define HIPFIRE_MQ2_I8DOT_ROW_TILE 8\n#define HIPFIRE_MQ2_I8DOT_TILED8 1\n#define HIPFIRE_MQ2_I8DOT_TILED_A8 1\n#define HIPFIRE_MQ2_I8DOT_SCALE_ONLY 1\n#define HIPFIRE_MQ2_I8DOT_KERNEL gemv_mq2g256_i8dot_row8_pipe2_scale_only_gfx90a\n",
+    include_str!("../../../kernels/src/gemv_mq2g256_lloyd_i8dot_affine_sg8_pipe2.gfx90a.hip")
+);
+pub const GEMV_MQ2G256_I8DOT_ROW8_PIPE2_NO_SELECTOR_GFX90A_SRC: &str = concat!(
+    "#define HIPFIRE_MQ2_I8DOT_ROW_TILE 8\n#define HIPFIRE_MQ2_I8DOT_TILED8 1\n#define HIPFIRE_MQ2_I8DOT_TILED_A8 1\n#define HIPFIRE_MQ2_I8DOT_ABLATE_SELECTOR 1\n#define HIPFIRE_MQ2_I8DOT_KERNEL gemv_mq2g256_i8dot_row8_pipe2_no_selector_gfx90a\n",
+    include_str!("../../../kernels/src/gemv_mq2g256_lloyd_i8dot_affine_sg8_pipe2.gfx90a.hip")
+);
+pub const GEMV_MQ2G256_I8DOT_ROW8_PIPE2_SELECTOR_INIT_ONLY_GFX90A_SRC: &str = concat!(
+    "#define HIPFIRE_MQ2_I8DOT_ROW_TILE 8\n#define HIPFIRE_MQ2_I8DOT_TILED8 1\n#define HIPFIRE_MQ2_I8DOT_TILED_A8 1\n#define HIPFIRE_MQ2_I8DOT_ABLATE_SELECTOR_LOOKUP 1\n#define HIPFIRE_MQ2_I8DOT_KERNEL gemv_mq2g256_i8dot_row8_pipe2_selector_init_only_gfx90a\n",
+    include_str!("../../../kernels/src/gemv_mq2g256_lloyd_i8dot_affine_sg8_pipe2.gfx90a.hip")
+);
+pub const GEMV_MQ2G256_I8DOT_ROW8_PIPE2_SCALE_ONLY_NO_SELECTOR_GFX90A_SRC: &str = concat!(
+    "#define HIPFIRE_MQ2_I8DOT_ROW_TILE 8\n#define HIPFIRE_MQ2_I8DOT_TILED8 1\n#define HIPFIRE_MQ2_I8DOT_TILED_A8 1\n#define HIPFIRE_MQ2_I8DOT_SCALE_ONLY 1\n#define HIPFIRE_MQ2_I8DOT_ABLATE_SELECTOR 1\n#define HIPFIRE_MQ2_I8DOT_KERNEL gemv_mq2g256_i8dot_row8_pipe2_scale_only_no_selector_gfx90a\n",
+    include_str!("../../../kernels/src/gemv_mq2g256_lloyd_i8dot_affine_sg8_pipe2.gfx90a.hip")
+);
+pub const GEMV_MQ2G256_I8DOT_ROW8_PIPE2_NO_REDUCE_GFX90A_SRC: &str = concat!(
+    "#define HIPFIRE_MQ2_I8DOT_ROW_TILE 8\n#define HIPFIRE_MQ2_I8DOT_TILED8 1\n#define HIPFIRE_MQ2_I8DOT_TILED_A8 1\n#define HIPFIRE_MQ2_I8DOT_ABLATE_REDUCE 1\n#define HIPFIRE_MQ2_I8DOT_KERNEL gemv_mq2g256_i8dot_row8_pipe2_no_reduce_gfx90a\n",
+    include_str!("../../../kernels/src/gemv_mq2g256_lloyd_i8dot_affine_sg8_pipe2.gfx90a.hip")
+);
+pub const GEMV_MQ2G256_I8DOT_ROW8_PIPE2_NO_EPILOGUE_GFX90A_SRC: &str = concat!(
+    "#define HIPFIRE_MQ2_I8DOT_ROW_TILE 8\n#define HIPFIRE_MQ2_I8DOT_TILED8 1\n#define HIPFIRE_MQ2_I8DOT_TILED_A8 1\n#define HIPFIRE_MQ2_I8DOT_ABLATE_EPILOGUE 1\n#define HIPFIRE_MQ2_I8DOT_KERNEL gemv_mq2g256_i8dot_row8_pipe2_no_epilogue_gfx90a\n",
+    include_str!("../../../kernels/src/gemv_mq2g256_lloyd_i8dot_affine_sg8_pipe2.gfx90a.hip")
+);
+pub const GEMV_MQ2G256_I8DOT_ROW8_PIPE2_DIRECT4_GFX90A_SRC: &str = concat!(
+    "#define HIPFIRE_MQ2_I8DOT_ROW_TILE 8\n#define HIPFIRE_MQ2_I8DOT_TILED8 1\n#define HIPFIRE_MQ2_I8DOT_TILED_A8 1\n#define HIPFIRE_MQ2_I8DOT_SELECTOR_DIRECT4 1\n#define HIPFIRE_MQ2_I8DOT_KERNEL gemv_mq2g256_i8dot_row8_pipe2_direct4_gfx90a\n",
+    include_str!("../../../kernels/src/gemv_mq2g256_lloyd_i8dot_affine_sg8_pipe2.gfx90a.hip")
+);
+pub const GEMV_MQ2G256_I8DOT_AFFINE_MOE_GATE_UP_ROW16_GFX90A_SRC: &str = concat!(
+    "#define HIPFIRE_MQ2_I8DOT_ROW_TILE 16\n",
+    "#define HIPFIRE_MQ2_I8DOT_KERNEL ",
+    "gemv_mq2g256_i8dot_affine_moe_gate_up_indexed_row16_gfx90a\n",
+    include_str!("../../../kernels/src/gemv_mq2g256_lloyd_i8dot_affine_sg4.gfx90a.hip")
+);
 
 pub const GEMV_MQ2G256_LLOYD_MOE_DOWN_INDEXED_SRC: &str =
     include_str!("../../../kernels/src/gemv_mq2g256_lloyd_moe_down_indexed.hip");
+pub const GEMV_MQ2G256_LLOYD_MOE_DOWN_INDEXED_GFX90A_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mq2g256_lloyd_moe_down_indexed.gfx90a.hip");
+pub const GEMM_MQ2G256_LLOYD_MOE_GROUPED_MFMA_GFX90A_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq2g256_lloyd_moe_grouped_mfma.gfx90a.hip");
+pub const GEMV_MQ2G256_LLOYD_MOE_DOWN_EXPANDED_K4_GFX90A_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mq2g256_lloyd_moe_down_expanded_k4.gfx90a.hip");
+pub const GEMV_MQ2G256_LLOYD_MOE_DOWN_FUSED_ROW2_GFX90A_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mq2g256_lloyd_moe_down_fused_row2.gfx90a.hip");
+pub const GEMV_MQ2G256_LLOYD_MOE_DOWN_FUSED_ROWS_WAVE2_GFX90A_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mq2g256_lloyd_moe_down_fused_rows_wave2.gfx90a.hip");
+pub const GEMV_MQ2G256_LLOYD_MOE_DOWN_FUSED_ROW1_GFX90A_SRC: &str = concat!(
+    "#define HIPFIRE_MQ2_FUSED_ROW_TILE 1\n",
+    "#define HIPFIRE_MQ2_FUSED_KERNEL ",
+    "gemv_mq2g256_lloyd_moe_down_fused_row1_gfx90a\n",
+    include_str!("../../../kernels/src/gemv_mq2g256_lloyd_moe_down_fused_row2.gfx90a.hip")
+);
+pub const GEMV_MQ2G256_LLOYD_MOE_DOWN_FUSED_WAVE2_GFX90A_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mq2g256_lloyd_moe_down_fused_waves.gfx90a.hip");
+pub const GEMV_MQ2G256_LLOYD_MOE_DOWN_FUSED_WAVE4_GFX90A_SRC: &str = concat!(
+    "#define HIPFIRE_MQ2_FUSED_WAVES 4\n",
+    "#define HIPFIRE_MQ2_FUSED_WAVE_KERNEL ",
+    "gemv_mq2g256_lloyd_moe_down_fused_wave4_gfx90a\n",
+    include_str!("../../../kernels/src/gemv_mq2g256_lloyd_moe_down_fused_waves.gfx90a.hip")
+);
 
 /// MQ3-Lloyd MoE indexed family (MiniMax-M2, arch_id=10): routed-experts
 /// gate_up + down with device-side topk routing + per-expert pointer table.
@@ -4998,12 +5132,16 @@ pub const ROPE_TAIL_YARN_INTERLEAVED_AT_SLOT_BUF_SRC: &str =
 /// `memcpy_dtod_auto` writes in compressor_forward_impl.
 pub const STATE_RING_WRITE_F32_BUF_SRC: &str =
     include_str!("../../../kernels/src/state_ring_write_f32_buf.hip");
+pub const STATE_RING_WRITE_PAIR_F32_BUF_SRC: &str =
+    include_str!("../../../kernels/src/state_ring_write_pair_f32_buf.hip");
 
 /// HIP-graphs-safe overlap-shift: state[:ratio*proj_dim] = state[ratio*proj_dim:].
 /// Gated by `commit_slot_buf[0] >= 0` so captured graphs only fire it on
 /// commit positions. Twin of the post-commit memcpy_dtod_auto state shift.
 pub const STATE_OVERLAP_SHIFT_F32_BUF_SRC: &str =
     include_str!("../../../kernels/src/state_overlap_shift_f32_buf.hip");
+pub const STATE_OVERLAP_SHIFT_PAIR_F32_BUF_SRC: &str =
+    include_str!("../../../kernels/src/state_overlap_shift_pair_f32_buf.hip");
 
 /// HIP-graphs-safe twin of `deepseek4_attn_swa_topk_f32`: reads `n_valid_swa`
 /// + `n_active_topk` from device buffers.
@@ -5133,6 +5271,10 @@ pub const WO_PER_GROUP_BATCHED_HFQ4G256_SRC: &str =
 pub const WO_PER_GROUP_BATCHED_Q8_0_SRC: &str =
     include_str!("../../../kernels/src/wo_per_group_batched_q8_0.hip");
 
+/// Native wave64, two-output-row Q8_0 O-LoRA projection for CDNA2/gfx90a.
+pub const WO_PER_GROUP_BATCHED_Q8_0_WAVE64_ROW2_GFX90A_SRC: &str =
+    include_str!("../../../kernels/src/wo_per_group_batched_q8_0_wave64_row2.gfx90a.hip");
+
 /// Multi-row Q8_0 variant (Lever 1). Same contract as the single-row
 /// `wo_per_group_batched_q8_0` but with block processing R output rows
 /// and hoisting x loads across rows. Grid = [ceil(M/R), B, G].
@@ -5204,6 +5346,12 @@ pub const COMPRESSOR_ADD_APE_BATCHED_SRC: &str =
 /// epsilon drift.
 pub const GEMV_MQ2G256_LLOYD_MOE_GATE_UP_INDEXED_BATCHED_K4_SRC: &str =
     include_str!("../../../kernels/src/gemv_mq2g256_lloyd_moe_gate_up_indexed_batched_k4.hip");
+pub const GEMV_MQ2G256_LLOYD_MOE_GATE_UP_INDEXED_BATCHED_K4_ROW2_GFX90A_SRC: &str = concat!(
+    "#define HIPFIRE_MQ2_K4_ROW_TILE 2\n",
+    "#define HIPFIRE_MQ2_K4_KERNEL ",
+    "gemv_mq2g256_lloyd_moe_gate_up_k8_indexed_batched_k4_row2_gfx90a\n",
+    include_str!("../../../kernels/src/gemv_mq2g256_lloyd_moe_gate_up_indexed_batched_k4.hip")
+);
 
 /// DeepSeek V4 MoE down — POSITION-BATCHED MQ2-Lloyd indexed GEMV with K4-unrolled
 /// accumulator and scaled residual atomicAdd. Sibling of qwen35's HFQ4 K4
@@ -5233,6 +5381,8 @@ pub const COMPRESSOR_SOFTMAX_POOL_SRC: &str =
 /// kv_state / score_state buffer (overlap=true, ratio=4 case).
 pub const COMPRESSOR_OVERLAP_CONCAT_SRC: &str =
     include_str!("../../../kernels/src/compressor_overlap_concat.hip");
+pub const COMPRESSOR_OVERLAP_CONCAT_PAIR_SRC: &str =
+    include_str!("../../../kernels/src/compressor_overlap_concat_pair_f32.hip");
 
 pub const INDEXER_RELU_SCORE_BUF_SRC: &str =
     include_str!("../../../kernels/src/indexer_relu_score_buf.hip");

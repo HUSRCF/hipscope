@@ -9958,7 +9958,10 @@ impl Gpu {
         // gfx11 sister of the gfx12 ldsstage path. Reorders FP32 K accumulation;
         // K must be a multiple of 512. Batch ceiling: see the measured 3.6-trunk
         // tables on LDSSTAGE_MAX_BATCH_GFX11 (one value covers dGPU and iGPU).
-        if self.flags.hfq4g256_ldsstage_wmma && k % 512 == 0 && batch_size <= LDSSTAGE_MAX_BATCH_GFX11 {
+        if self.flags.hfq4g256_ldsstage_wmma
+            && k % 512 == 0
+            && batch_size <= LDSSTAGE_MAX_BATCH_GFX11
+        {
             let kname = "gemm_gate_up_hfq4g256_wmma_ldsstage";
             let ksrc = kernels::GEMM_GATE_UP_HFQ4G256_WMMA_SRC;
             self.ensure_kernel(kname, ksrc, kname)?;
@@ -13314,15 +13317,16 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        // gfx94x MFMA-direct opt-in: skips FP16 shadow + rocBLAS launch.
-        // Opt-in via HIPFIRE_GFX942_MFMA_PREFILL=1 while validating; this
+        // CDNA2/CDNA3 MFMA-direct opt-in: skips FP16 shadow + rocBLAS launch.
+        // Opt-in via HIPFIRE_CDNA_MFMA_PREFILL=1 while validating; the legacy
+        // HIPFIRE_GFX942_MFMA_PREFILL name remains accepted. This
         // fires BEFORE the rocBLAS branch on purpose (rocBLAS goes through
         // FP16 dequant shadow, which is the cost we want to avoid).
         {
             let mfma_v = self.flags.gfx942_mfma_prefill.clone();
             let want = mfma_v.as_deref();
             if (want == Some("1") || want == Some("2") || want == Some("3") || want == Some("4"))
-                && self.arch_caps.is_cdna3()
+                && self.arch_caps.has_mfma_f16()
                 && batch_size >= 16
                 && m % 16 == 0
                 && k % 256 == 0
@@ -15047,7 +15051,10 @@ impl Gpu {
         // gfx11 sister of the gfx12 ldsstage path. Reorders FP32 K accumulation;
         // K must be a multiple of 512. Batch ceiling: see the measured 3.6-trunk
         // tables on LDSSTAGE_MAX_BATCH_GFX11 (one value covers dGPU and iGPU).
-        if self.flags.hfq4g256_ldsstage_wmma && k % 512 == 0 && batch_size <= LDSSTAGE_MAX_BATCH_GFX11 {
+        if self.flags.hfq4g256_ldsstage_wmma
+            && k % 512 == 0
+            && batch_size <= LDSSTAGE_MAX_BATCH_GFX11
+        {
             let kname = "gemm_hfq4g256_residual_wmma_ldsstage";
             let ksrc = kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_SRC;
             self.ensure_kernel(kname, ksrc, kname)?;
@@ -15751,6 +15758,41 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        // CDNA2/CDNA3 MFMA prefill probe. The available MFMA kernels use
+        // residual (Y += XW^T) semantics, so clear Y first to implement the
+        // plain GEMM contract. Prefill scratch pointers are reused with new
+        // contents between layers, so force a fresh FP16 conversion each call.
+        {
+            let mfma_v = self.flags.gfx942_mfma_prefill.as_deref();
+            if matches!(mfma_v, Some("1" | "2" | "3" | "4"))
+                && self.arch_caps.has_mfma_f16()
+                && batch_size >= 16
+                && m % 16 == 0
+                && k % 256 == 0
+                && !self.graphs.capture_mode
+            {
+                self.scratch.fp16_x_source_ptr = std::ptr::null_mut();
+                match self.active_stream.as_ref() {
+                    Some(stream) => self
+                        .hip
+                        .memset_async(&y.buf, 0, batch_size * m * 4, stream)?,
+                    None => self.hip.memset(&y.buf, 0, batch_size * m * 4)?,
+                }
+                if mfma_v == Some("4") && batch_size % 64 == 0 {
+                    return self
+                        .gemm_hfq4g256_residual_mfma_v4_gfx942(a_raw, x, y, m, k, batch_size);
+                }
+                if mfma_v == Some("3") && batch_size % 32 == 0 && m % 32 == 0 {
+                    return self
+                        .gemm_hfq4g256_residual_mfma_v3_gfx942(a_raw, x, y, m, k, batch_size);
+                }
+                if mfma_v == Some("2") && batch_size % 32 == 0 && m % 32 == 0 {
+                    return self
+                        .gemm_hfq4g256_residual_mfma_v2_gfx942(a_raw, x, y, m, k, batch_size);
+                }
+                return self.gemm_hfq4g256_residual_mfma_gfx942(a_raw, x, y, m, k, batch_size);
+            }
+        }
         // gfx906 dp4a opt-in for the LM-head batched GEMM. PMC at 2026-05-06
         // showed gemm_hfq4g256_wave64 was 17 % of DFlash 27B steady-state
         // decode time on the FP wave64 path. The dp4a port pre-quantizes x
@@ -20140,6 +20182,68 @@ impl Gpu {
             },
         )
     }
+    /// CDNA wave64 twin Q8_0 projection. The second output receives `up_bias`
+    /// in the same kernel, removing the DeepSeek V4 compressor APE add launch.
+    pub fn fused_gate_up_q8_0_wave64_bias(
+        &mut self,
+        a_gate: &GpuTensor,
+        a_up: &GpuTensor,
+        x: &GpuTensor,
+        y_gate: &GpuTensor,
+        y_up: &GpuTensor,
+        up_bias: &GpuTensor,
+        gate_m: usize,
+        up_m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "fused_gate_up_q8_0_wave64_bias",
+            kernels::FUSED_GATE_UP_Q8_0_WAVE64_BIAS_SRC,
+            "fused_gate_up_q8_0_wave64_bias",
+        )?;
+
+        let ag = a_gate.buf.as_ptr();
+        let au = a_up.buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let yg = y_gate.buf.as_ptr();
+        let yu = y_up.buf.as_ptr();
+        let bp = up_bias.buf.as_ptr();
+        let gm = gate_m as i32;
+        let um = up_m as i32;
+        let kv = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &ag as *const _ as *mut c_void,
+            &au as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yg as *const _ as *mut c_void,
+            &yu as *const _ as *mut c_void,
+            &bp as *const _ as *mut c_void,
+            &gm as *const _ as *mut c_void,
+            &um as *const _ as *mut c_void,
+            &kv as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "fused_gate_up_q8_0_wave64_bias",
+            [((gate_m + up_m) as u32).div_ceil(2), 1, 1],
+            [64, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ag);
+                b.push_ptr(au);
+                b.push_ptr(xp);
+                b.push_ptr(yg);
+                b.push_ptr(yu);
+                b.push_ptr(bp);
+                b.push_i32(gm);
+                b.push_i32(um);
+                b.push_i32(kv);
+                b
+            },
+        )
+    }
 
     /// 4-way fused QKVZA for Q8_0 weights (DECODE, n=1).
     /// Bit-exact with four sequential gemv_q8_0 calls.
@@ -21015,6 +21119,68 @@ impl Gpu {
             )
         }
     }
+    /// gfx90a wave64 twin F16xF32 decode projection with a bias epilogue on
+    /// the second output. Each half-wave preserves gemm_f16_tiled's order.
+    pub fn fused_twin_f16_xf32_wave64_bias_gfx90a(
+        &mut self,
+        w0: &GpuTensor,
+        w1: &GpuTensor,
+        x: &GpuTensor,
+        y0: &GpuTensor,
+        y1: &GpuTensor,
+        bias1: &GpuTensor,
+        m0: usize,
+        m1: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "fused_twin_f16_xf32_wave64_bias_gfx90a",
+            kernels::FUSED_TWIN_F16_XF32_WAVE64_BIAS_GFX90A_SRC,
+            "fused_twin_f16_xf32_wave64_bias_gfx90a",
+        )?;
+
+        let w0p = w0.buf.as_ptr();
+        let w1p = w1.buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let y0p = y0.buf.as_ptr();
+        let y1p = y1.buf.as_ptr();
+        let bp = bias1.buf.as_ptr();
+        let m0i = m0 as i32;
+        let m1i = m1 as i32;
+        let ki = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &w0p as *const _ as *mut c_void,
+            &w1p as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &y0p as *const _ as *mut c_void,
+            &y1p as *const _ as *mut c_void,
+            &bp as *const _ as *mut c_void,
+            &m0i as *const _ as *mut c_void,
+            &m1i as *const _ as *mut c_void,
+            &ki as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "fused_twin_f16_xf32_wave64_bias_gfx90a",
+            [((m0 + m1) as u32).div_ceil(2), 1, 1],
+            [64, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(w0p);
+                b.push_ptr(w1p);
+                b.push_ptr(xp);
+                b.push_ptr(y0p);
+                b.push_ptr(y1p);
+                b.push_ptr(bp);
+                b.push_i32(m0i);
+                b.push_i32(m1i);
+                b.push_i32(ki);
+                b
+            },
+        )
+    }
 
     /// Fused GEMM + bias: Y[N,M] = X[N,K] @ W_f16[M,K]^T + bias[M].
     /// Replaces gemm_f16 + transpose_f32 + bias_add_f32 (3 ops → 1).
@@ -21537,6 +21703,15 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        if !self.arch_caps.has_wmma_w32() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "gemm_f16_x_f16_wmma requires gfx11 wave32 WMMA; arch={} is unsupported",
+                    self.arch
+                ),
+            ));
+        }
         self.ensure_kernel(
             "gemm_f16_x_f16_wmma",
             kernels::GEMM_F16_X_F16_WMMA_SRC,
@@ -21624,6 +21799,15 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        if !self.arch_caps.has_wmma_w32() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "gemm_hfq4g256_wmma requires gfx11 wave32 WMMA; arch={} is unsupported",
+                    self.arch
+                ),
+            ));
+        }
         self.ensure_kernel(
             "gemm_hfq4g256_wmma",
             kernels::GEMM_HFQ4G256_WMMA_SRC,
@@ -21657,6 +21841,69 @@ impl Gpu {
             )
         }
     }
+    pub fn gemm_mq2g256_lloyd_moe_grouped_mfma_gfx90a(
+        &mut self,
+        expert_weight_ptrs: &GpuTensor,
+        expert_tile_ids: &GpuTensor,
+        sorted_slot_index: &GpuTensor,
+        x_src: &GpuTensor,
+        y_grouped: &GpuTensor,
+        m: usize,
+        k: usize,
+        x_row_div: usize,
+        m_total: usize,
+        x_src_rows: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let name = "gemm_mq2g256_lloyd_moe_grouped_mfma_gfx90a";
+        self.ensure_kernel(
+            name,
+            kernels::GEMM_MQ2G256_LLOYD_MOE_GROUPED_MFMA_GFX90A_SRC,
+            name,
+        )?;
+        let xp = self.ensure_fp16_x(x_src, x_src_rows * k)?;
+        let ep = expert_weight_ptrs.buf.as_ptr();
+        let tp = expert_tile_ids.buf.as_ptr();
+        let sp = sorted_slot_index.buf.as_ptr();
+        let yp = y_grouped.buf.as_ptr();
+        let mv = m as i32;
+        let kv = k as i32;
+        let xrd = x_row_div as i32;
+        let mt = m_total as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &ep as *const _ as *mut c_void,
+            &tp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &mv as *const _ as *mut c_void,
+            &kv as *const _ as *mut c_void,
+            &xrd as *const _ as *mut c_void,
+            &mt as *const _ as *mut c_void,
+        ];
+        let result = self.launch_maybe_blob(
+            name,
+            [m.div_ceil(16) as u32, m_total.div_ceil(16) as u32, 1],
+            [64, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ep);
+                b.push_ptr(tp);
+                b.push_ptr(sp);
+                b.push_ptr(xp);
+                b.push_ptr(yp);
+                b.push_i32(mv);
+                b.push_i32(kv);
+                b.push_i32(xrd);
+                b.push_i32(mt);
+                b
+            },
+        );
+        result
+    }
+
     pub fn gemm_mq2g256_lloyd_moe_grouped_wmma_k2(
         &mut self,
         expert_weight_ptrs: &GpuTensor,

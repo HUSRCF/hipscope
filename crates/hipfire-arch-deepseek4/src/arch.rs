@@ -24,6 +24,7 @@ use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::model_source::ModelSource;
 use hipfire_runtime::safetensors_source::{bf16_bytes_to_f16, bf16_to_f32};
+use rayon::prelude::*;
 use rdna_compute::Gpu;
 
 /// Type marker for DeepSeek V4 Flash. `arch_id = 9` — next free slot
@@ -279,6 +280,8 @@ impl DeepseekV4 {
                 .tensor_data_pread(&w1_0)
                 .ok_or_else(|| format!("deepseek4: missing {w1_0}"))?;
             let stride_w1 = w1_info0.data_size;
+            let gate_rows = w1_info0.shape[0] as usize;
+            let hidden = w1_info0.shape[1] as usize;
             drop(_b1);
             let (w3_info0, _b3) = hfq
                 .tensor_data_pread(&w3_0)
@@ -316,6 +319,15 @@ impl DeepseekV4 {
                     combined.extend_from_slice(&w3_bytes);
                 }
             }
+            let combined = maybe_transcode_gate_up_i8dot(
+                combined,
+                &gpu.arch,
+                prefix,
+                n_owned,
+                combined_stride,
+                2 * gate_rows,
+                hidden,
+            )?;
             let combined_tensor = gpu
                 .upload_raw(&combined, &[n_owned, combined_stride])
                 .map_err(|e| format!("deepseek4: upload gate_up {prefix}: {e:?}"))?;
@@ -1948,6 +1960,8 @@ impl DeepseekV4 {
                 .tensor_data(&w1_0)
                 .ok_or_else(|| format!("deepseek4: missing {w1_0}"))?;
             let stride_w1 = w1_info0.data_size;
+            let gate_rows = w1_info0.shape[0] as usize;
+            let hidden = w1_info0.shape[1] as usize;
             let (w3_info0, _b3) = source
                 .tensor_data(&w3_0)
                 .ok_or_else(|| format!("deepseek4: missing {w3_0}"))?;
@@ -1979,6 +1993,15 @@ impl DeepseekV4 {
                     combined.extend_from_slice(w3_bytes);
                 }
             }
+            let combined = maybe_transcode_gate_up_i8dot(
+                combined,
+                &gpu.arch,
+                prefix,
+                n_owned,
+                combined_stride,
+                2 * gate_rows,
+                hidden,
+            )?;
             let combined_tensor = gpu
                 .upload_raw(&combined, &[n_owned, combined_stride])
                 .map_err(|e| format!("deepseek4: upload gate_up {prefix}: {e:?}"))?;
@@ -2587,4 +2610,39 @@ mod tests {
         assert_eq!(DeepseekV4::arch_id(), 9);
         assert_eq!(DeepseekV4::name(), "deepseek4");
     }
+}
+fn maybe_transcode_gate_up_i8dot(
+    combined: Vec<u8>,
+    arch: &str,
+    prefix: &str,
+    n_owned: usize,
+    combined_stride: usize,
+    m: usize,
+    k: usize,
+) -> Result<Vec<u8>, String> {
+    let layer = prefix
+        .strip_prefix("layers.")
+        .and_then(|value| value.parse().ok());
+    if !rdna_compute::mq2_i8dot::layer_enabled(layer) {
+        return Ok(combined);
+    }
+    if arch != "gfx90a" {
+        return Err(format!(
+            "HIPFIRE_GFX90A_MQ2_I8DOT requires gfx90a, got {arch}"
+        ));
+    }
+    if combined.len() != n_owned * combined_stride {
+        return Err(format!(
+            "gate_up compact blob mismatch: bytes={} owned={n_owned} stride={combined_stride}",
+            combined.len()
+        ));
+    }
+    let experts: Result<Vec<Vec<u8>>, String> = combined
+        .par_chunks_exact(combined_stride)
+        .map(|expert| {
+            let affine = rdna_compute::mq2_i8dot::transcode_affine(expert)?;
+            rdna_compute::mq2_i8dot::tile_sg8(&affine, m, k)
+        })
+        .collect();
+    Ok(experts?.into_iter().flatten().collect())
 }

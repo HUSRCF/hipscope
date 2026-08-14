@@ -307,6 +307,38 @@ impl Gpu {
         result
     }
 
+    /// In-place add on an explicit stream. Used by EP communication pipelines
+    /// where the compute stream must remain free to launch the next row chunk.
+    pub fn add_inplace_f32_on_stream(
+        &mut self,
+        a: &GpuTensor,
+        b: &GpuTensor,
+        stream: &hip_bridge::Stream,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("add_inplace", kernels::ADD_INPLACE_SRC, "add_inplace_f32")?;
+
+        let n = a.numel() as i32;
+        let a_ptr = a.buf.as_ptr();
+        let b_ptr = b.buf.as_ptr();
+        let mut blob = hip_bridge::KernargBlob::new();
+        blob.push_ptr(a_ptr);
+        blob.push_ptr(b_ptr);
+        blob.push_i32(n);
+        let block = 256u32;
+        let grid = (n as u32).div_ceil(block);
+        let func = &self.functions["add_inplace_f32"];
+        unsafe {
+            self.hip.launch_kernel_blob(
+                func,
+                [grid, 1, 1],
+                [block, 1, 1],
+                0,
+                Some(stream),
+                blob.as_mut_slice(),
+            )
+        }
+    }
     /// c = a * b (element-wise)
     pub fn mul_f32(&mut self, a: &GpuTensor, b: &GpuTensor, c: &GpuTensor) -> HipResult<()> {
         self.bind_thread()?;
@@ -856,13 +888,8 @@ impl Gpu {
         ];
         let bytes = (16 * 256 * 3 + 2 * 256 * 2 + 18 * 256) * 4;
         let timer = crate::profile::begin_timer(&self.hip, "fused", kernel, bytes);
-        let result = self.launch_maybe_blob(
-            kernel,
-            [18, 1, 1],
-            [256, 1, 1],
-            0,
-            &mut params,
-            || {
+        let result =
+            self.launch_maybe_blob(kernel, [18, 1, 1], [256, 1, 1], 0, &mut params, || {
                 let mut b = hip_bridge::KernargBlob::new();
                 b.push_ptr(qip);
                 b.push_ptr(qp);
@@ -874,8 +901,7 @@ impl Gpu {
                 b.push_f32(ep);
                 b.push_f32(fb);
                 b
-            },
-        );
+            });
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -2418,7 +2444,10 @@ impl Gpu {
             )
         } else {
             let (kernel_name, kernel_src) =
-                match hipfire_config::developer_var("HIPFIRE_GDN_COMPACT2_SHAPE").ok().as_deref() {
+                match hipfire_config::developer_var("HIPFIRE_GDN_COMPACT2_SHAPE")
+                    .ok()
+                    .as_deref()
+                {
                     Some("b2") => (
                         "gated_delta_net_q8_compact2_b2",
                         kernels::GATED_DELTA_NET_Q8_COMPACT2_B2_SRC,
@@ -3477,7 +3506,10 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         let (kernel_name, kernel_src, block) =
-            match hipfire_config::developer_var("HIPFIRE_CONV_QKNORM_SHAPE").ok().as_deref() {
+            match hipfire_config::developer_var("HIPFIRE_CONV_QKNORM_SHAPE")
+                .ok()
+                .as_deref()
+            {
                 Some("b32") => (
                     "conv1d_silu_split_qknorm_b32",
                     kernels::CONV1D_SILU_SPLIT_QKNORM_B32_SRC,
@@ -3649,30 +3681,30 @@ impl Gpu {
         let qk_blocks = (n_heads as u32 + heads_per_wg - 1) / heads_per_wg;
         let v_blocks = (v_dim as u32 + BLOCK - 1) / BLOCK;
         let grid = qk_blocks + v_blocks + 1;
-        let bytes = crate::profile::conv1d_silu_bytes(2 * k_dim + v_dim)
-            + n_v_heads * 4 * 4;
+        let bytes = crate::profile::conv1d_silu_bytes(2 * k_dim + v_dim) + n_v_heads * 4 * 4;
         let timer = crate::profile::begin_timer(&self.hip, "deltanet", KERNEL, bytes);
-        let result = self.launch_maybe_blob(KERNEL, [grid, 1, 1], [BLOCK, 1, 1], 0, &mut params, || {
-            let mut b = hip_bridge::KernargBlob::new();
-            b.push_ptr(qp);
-            b.push_ptr(kp);
-            b.push_ptr(vp);
-            b.push_ptr(ip);
-            b.push_ptr(wp);
-            b.push_ptr(sp);
-            b.push_ptr(bp);
-            b.push_ptr(ap);
-            b.push_ptr(dp);
-            b.push_ptr(lp);
-            b.push_i32(kd);
-            b.push_i32(vd);
-            b.push_i32(nh);
-            b.push_i32(hd);
-            b.push_f32(qs);
-            b.push_f32(ep);
-            b.push_i32(nvh);
-            b
-        });
+        let result =
+            self.launch_maybe_blob(KERNEL, [grid, 1, 1], [BLOCK, 1, 1], 0, &mut params, || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(qp);
+                b.push_ptr(kp);
+                b.push_ptr(vp);
+                b.push_ptr(ip);
+                b.push_ptr(wp);
+                b.push_ptr(sp);
+                b.push_ptr(bp);
+                b.push_ptr(ap);
+                b.push_ptr(dp);
+                b.push_ptr(lp);
+                b.push_i32(kd);
+                b.push_i32(vd);
+                b.push_i32(nh);
+                b.push_i32(hd);
+                b.push_f32(qs);
+                b.push_f32(ep);
+                b.push_i32(nvh);
+                b
+            });
         if let Some(t) = timer {
             t.finish(&self.hip);
         }

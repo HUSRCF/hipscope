@@ -773,6 +773,7 @@ dependencies = [
  "hipfire-dispatch",
  "hipfire-reap",
  "hipfire-runtime",
+ "rayon",
  "rdna-compute",
  "serde",
  "serde_json",
@@ -1936,6 +1937,7 @@ dependencies = [
 name = "rdna-compute"
 version = "0.3.0"
 dependencies = [
+ "half",
  "hip-bridge",
  "hipfire-config",
  "rayon",

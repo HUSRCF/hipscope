@@ -69,8 +69,8 @@ fn main() {
         gpu.free_tensor(d_y_gemm).unwrap();
 
         // ─── Throughput scaling ───
-        let batches = [1, 4, 8, 16, 20, 32];
-        let n_iters = 100;
+        let batches = [1, 4, 8, 16, 20, 32, 64, 128, 256];
+        let n_iters = 20;
 
         // GEMV baseline (repeated single-vector calls)
         let d_x1 = gpu.upload_f32(&vec![0.01f32; k], &[k]).unwrap();

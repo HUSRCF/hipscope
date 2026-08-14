@@ -23,6 +23,7 @@ pub struct ArchCaps {
     // ── Atoms: per-gfx-code predicates ──────────────────────────────
     is_gfx906: bool,
     is_gfx908: bool,
+    is_gfx90a: bool,
     is_gfx1010: bool,
     is_gfx1011: bool,
     is_gfx1012: bool,
@@ -45,6 +46,7 @@ pub struct ArchCaps {
     // ── Molecules: architecture families composed from atoms ────────
     is_gcn5: bool,
     is_cdna1: bool,
+    is_cdna2: bool,
     is_rdna1: bool,
     is_rdna1p1: bool,
     is_rdna2: bool,
@@ -58,6 +60,7 @@ pub struct ArchCaps {
     has_wmma: bool,
     has_wmma_w32: bool,
     has_wmma_w32_gfx12: bool,
+    has_mfma_f16: bool,
     has_dot2_f32_f16: bool,
     has_mmq: bool,
     is_gcn5_wave64: bool,
@@ -83,6 +86,7 @@ impl ArchCaps {
         // Atoms
         let is_gfx906 = arch == "gfx906";
         let is_gfx908 = arch == "gfx908";
+        let is_gfx90a = arch == "gfx90a";
         let is_gfx1010 = arch == "gfx1010";
         let is_gfx1011 = arch == "gfx1011";
         let is_gfx1012 = arch == "gfx1012";
@@ -105,6 +109,7 @@ impl ArchCaps {
         // Architecture molecules
         let is_gcn5 = is_gfx906;
         let is_cdna1 = is_gfx908;
+        let is_cdna2 = is_gfx90a;
         let is_rdna1 = is_gfx1010;
         let is_rdna1p1 = is_gfx1011 || is_gfx1012;
         let is_rdna2 = is_gfx1030 || is_gfx1031 || is_gfx1032;
@@ -124,11 +129,12 @@ impl ArchCaps {
         let has_wmma = is_rdna3 || is_rdna4;
         let has_wmma_w32 = is_rdna3;
         let has_wmma_w32_gfx12 = is_rdna4;
+        let has_mfma_f16 = is_cdna2 || is_cdna3;
         let has_dot2_f32_f16 = is_rdna1p1 || is_rdna2 || is_rdna3 || is_rdna4;
         let has_mmq = is_gfx906 || is_rdna3;
         let is_gcn5_wave64 = is_gfx906 || (is_gfx908 && flags.gcn5_wave64_hybrid.unwrap_or(false));
         let is_wave32 = is_rdna1 || is_rdna1p1 || is_rdna2 || is_rdna3 || is_rdna4;
-        let is_wave64_native = is_gfx906 || is_gfx908 || is_cdna3;
+        let is_wave64_native = is_gfx906 || is_gfx908 || is_cdna2 || is_cdna3;
         let has_hfq3_sdot4 = is_rdna1p1 || is_rdna2;
 
         // Env-gated capabilities
@@ -154,6 +160,7 @@ impl ArchCaps {
             arch: arch.to_string(),
             is_gfx906,
             is_gfx908,
+            is_gfx90a,
             is_gfx1010,
             is_gfx1011,
             is_gfx1012,
@@ -174,6 +181,7 @@ impl ArchCaps {
             is_gfx942,
             is_gcn5,
             is_cdna1,
+            is_cdna2,
             is_rdna1,
             is_rdna1p1,
             is_rdna2,
@@ -185,6 +193,7 @@ impl ArchCaps {
             has_wmma,
             has_wmma_w32,
             has_wmma_w32_gfx12,
+            has_mfma_f16,
             has_dot2_f32_f16,
             has_mmq,
             is_gcn5_wave64,
@@ -250,6 +259,9 @@ impl ArchCaps {
     pub fn is_gfx908(&self) -> bool {
         self.is_gfx908
     }
+    pub fn is_gfx90a(&self) -> bool {
+        self.is_gfx90a
+    }
     pub fn is_gfx1010(&self) -> bool {
         self.is_gfx1010
     }
@@ -312,6 +324,9 @@ impl ArchCaps {
     pub fn is_cdna1(&self) -> bool {
         self.is_cdna1
     }
+    pub fn is_cdna2(&self) -> bool {
+        self.is_cdna2
+    }
     pub fn is_rdna1(&self) -> bool {
         self.is_rdna1
     }
@@ -366,6 +381,9 @@ impl ArchCaps {
     }
     pub fn has_wmma_w32_gfx12(&self) -> bool {
         self.has_wmma_w32_gfx12
+    }
+    pub fn has_mfma_f16(&self) -> bool {
+        self.has_mfma_f16
     }
     pub fn has_dot2_f32_f16(&self) -> bool {
         self.has_dot2_f32_f16
@@ -429,9 +447,9 @@ mod tests {
     #[test]
     fn gfx_atoms_exclusive() {
         let all_gfxs = [
-            "gfx906", "gfx908", "gfx1010", "gfx1011", "gfx1012", "gfx1030", "gfx1031", "gfx1032",
-            "gfx1100", "gfx1101", "gfx1102", "gfx1103", "gfx1150", "gfx1151", "gfx1152", "gfx1200",
-            "gfx1201", "gfx940", "gfx941", "gfx942",
+            "gfx906", "gfx908", "gfx90a", "gfx1010", "gfx1011", "gfx1012", "gfx1030", "gfx1031",
+            "gfx1032", "gfx1100", "gfx1101", "gfx1102", "gfx1103", "gfx1150", "gfx1151", "gfx1152",
+            "gfx1200", "gfx1201", "gfx940", "gfx941", "gfx942",
         ];
         for &arch in &all_gfxs {
             let caps = make_caps(arch);
@@ -439,6 +457,7 @@ mod tests {
             let count = [
                 caps.is_gfx906(),
                 caps.is_gfx908(),
+                caps.is_gfx90a(),
                 caps.is_gfx1010(),
                 caps.is_gfx1011(),
                 caps.is_gfx1012(),
@@ -529,7 +548,20 @@ mod tests {
         let caps = make_caps("gfx942");
         assert!(caps.is_cdna3());
         assert!(caps.is_wave64_native());
+        assert!(caps.has_mfma_f16());
         assert!(!caps.is_rdna3());
+        assert!(!caps.has_wmma());
+    }
+
+    #[test]
+    fn cdna2_90a() {
+        let caps = make_caps("gfx90a");
+        assert!(caps.is_gfx90a());
+        assert!(caps.is_cdna2());
+        assert!(caps.is_wave64_native());
+        assert!(caps.has_mfma_f16());
+        assert!(!caps.is_cdna1());
+        assert!(!caps.is_cdna3());
         assert!(!caps.has_wmma());
     }
 
@@ -619,6 +651,7 @@ mod tests {
     fn wave64_native() {
         assert!(make_caps("gfx906").is_wave64_native());
         assert!(make_caps("gfx908").is_wave64_native());
+        assert!(make_caps("gfx90a").is_wave64_native());
         assert!(make_caps("gfx942").is_wave64_native());
         assert!(!make_caps("gfx1100").is_wave64_native());
     }

@@ -21,8 +21,8 @@
 //! 3. Pass the multi-GPU coherence gate.
 
 use hip_bridge::{
-    DeviceBuffer, Event, HipError, HipResult, RcclComms, HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED,
-    HIP_ERROR_PEER_ACCESS_UNSUPPORTED,
+    DeviceBuffer, Event, HipError, HipResult, RcclComms, Stream,
+    HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED, HIP_ERROR_PEER_ACCESS_UNSUPPORTED,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -82,6 +82,9 @@ pub struct Gpus {
     /// `count` seen. Leaked on teardown (raw `DeviceBuffer`, no Drop-free).
     peer_ar_tmp: Vec<Vec<DeviceBuffer>>,
     peer_ar_tmp_bytes: usize,
+    /// Per-rank communication streams for chunked EP peer all-reduce.
+    /// Compute kernels remain on the active stream of each device.
+    ep_comm_streams: Vec<Stream>,
 }
 
 const DEFAULT_VRAM_TOLERANCE_GB: f64 = 2.0;
@@ -166,6 +169,7 @@ impl Gpus {
             givens_sin_per_dev: Vec::new(),
             peer_ar_tmp: Vec::new(),
             peer_ar_tmp_bytes: 0,
+            ep_comm_streams: Vec::new(),
         }
     }
 
@@ -215,6 +219,7 @@ impl Gpus {
             givens_sin_per_dev: Vec::new(),
             peer_ar_tmp: Vec::new(),
             peer_ar_tmp_bytes: 0,
+            ep_comm_streams: Vec::new(),
         })
     }
 
@@ -329,8 +334,17 @@ impl Gpus {
                 ),
             ));
         }
+        // Source producers and destination writes (for example a zero-fill)
+        // may run on different devices and streams. HIP provides no implicit
+        // ordering between them and a null-stream operation is not sufficient
+        // on all ROCm versions, so establish a conservative device boundary.
+        let dst_gpu = &self.devices[dst_dev];
+        dst_gpu.bind_thread()?;
+        dst_gpu.hip.device_synchronize()?;
+
         let src_gpu = &self.devices[src_dev];
         src_gpu.bind_thread()?;
+        src_gpu.hip.device_synchronize()?;
         let src_dev_id = src_gpu.device_id;
         let dst_dev_id = self.devices[dst_dev].device_id;
         match src_gpu.active_stream.as_ref() {
@@ -423,6 +437,7 @@ impl Gpus {
             givens_sin_per_dev: Vec::new(),
             peer_ar_tmp: Vec::new(),
             peer_ar_tmp_bytes: 0,
+            ep_comm_streams: Vec::new(),
         })
     }
 
@@ -574,6 +589,138 @@ impl Gpus {
         Ok(())
     }
 
+    fn ensure_ep_comm_streams(&mut self) -> HipResult<()> {
+        if self.ep_comm_streams.len() == self.devices.len() {
+            return Ok(());
+        }
+        self.ep_comm_streams.clear();
+        for device in &self.devices {
+            device.bind_thread()?;
+            self.ep_comm_streams.push(device.hip.stream_create()?);
+        }
+        Ok(())
+    }
+
+    /// Enqueue one two-rank peer all-reduce chunk without device-wide syncs.
+    /// ready[r] must be recorded after rank r produced this row range.
+    /// Returned events are recorded after each local add on the comm stream.
+    pub fn all_reduce_sum_f32_peer_chunk_async(
+        &mut self,
+        buffers: &[&DeviceBuffer],
+        row_base: usize,
+        count: usize,
+        ready: [Event; 2],
+    ) -> HipResult<[Event; 2]> {
+        if self.devices.len() != 2 || buffers.len() != 2 {
+            return Err(HipError::new(
+                0,
+                "chunked peer all-reduce currently requires exactly two ranks",
+            ));
+        }
+        let end = row_base
+            .checked_add(count)
+            .ok_or_else(|| HipError::new(0, "chunked peer all-reduce range overflow"))?;
+        let byte_offset = row_base * 4;
+        let bytes = count * 4;
+        if buffers.iter().any(|buffer| buffer.size() < end * 4) {
+            return Err(HipError::new(
+                0,
+                "chunked peer all-reduce range exceeds input buffer",
+            ));
+        }
+        self.ensure_peer_ar_tmp(end * 4)?;
+        self.ensure_ep_comm_streams()?;
+        let [ready0, ready1] = ready;
+
+        let view = |buffer: &DeviceBuffer| unsafe {
+            DeviceBuffer::from_raw((buffer.as_ptr() as *mut u8).add(byte_offset).cast(), bytes)
+        };
+        let src0 = view(buffers[0]);
+        let src1 = view(buffers[1]);
+        let tmp0 = view(&self.peer_ar_tmp[0][0]);
+        let tmp1 = view(&self.peer_ar_tmp[1][0]);
+        let dev0_id = self.devices[0].device_id;
+        let dev1_id = self.devices[1].device_id;
+
+        let (devices, streams) = (&mut self.devices, &self.ep_comm_streams);
+        devices[0].bind_thread()?;
+        devices[0].hip.stream_wait_event(&streams[0], &ready0)?;
+        devices[0]
+            .hip
+            .memcpy_peer_async(&tmp1, dev1_id, &src0, dev0_id, bytes, &streams[0])?;
+        let copy0 = devices[0].hip.event_create()?;
+        devices[0].hip.event_record(&copy0, Some(&streams[0]))?;
+
+        devices[1].bind_thread()?;
+        devices[1].hip.stream_wait_event(&streams[1], &ready1)?;
+        devices[1]
+            .hip
+            .memcpy_peer_async(&tmp0, dev0_id, &src1, dev1_id, bytes, &streams[1])?;
+        let copy1 = devices[1].hip.event_create()?;
+        devices[1].hip.event_record(&copy1, Some(&streams[1]))?;
+
+        devices[0].bind_thread()?;
+        devices[0].hip.stream_wait_event(&streams[0], &copy1)?;
+        let dst0 = GpuTensor {
+            buf: src0,
+            shape: vec![count],
+            dtype: DType::F32,
+        };
+        let peer0 = GpuTensor {
+            buf: tmp0,
+            shape: vec![count],
+            dtype: DType::F32,
+        };
+        devices[0].add_inplace_f32_on_stream(&dst0, &peer0, &streams[0])?;
+        let done0 = devices[0].hip.event_create()?;
+        devices[0].hip.event_record(&done0, Some(&streams[0]))?;
+
+        devices[1].bind_thread()?;
+        devices[1].hip.stream_wait_event(&streams[1], &copy0)?;
+        let dst1 = GpuTensor {
+            buf: src1,
+            shape: vec![count],
+            dtype: DType::F32,
+        };
+        let peer1 = GpuTensor {
+            buf: tmp1,
+            shape: vec![count],
+            dtype: DType::F32,
+        };
+        devices[1].add_inplace_f32_on_stream(&dst1, &peer1, &streams[1])?;
+        let done1 = devices[1].hip.event_create()?;
+        devices[1].hip.event_record(&done1, Some(&streams[1]))?;
+
+        devices[0].hip.event_destroy(ready0)?;
+        devices[1].hip.event_destroy(ready1)?;
+        devices[0].hip.event_destroy(copy0)?;
+        devices[1].hip.event_destroy(copy1)?;
+        Ok([done0, done1])
+    }
+
+    /// Make both compute streams wait for the final chunk reduction and consume
+    /// all completion events. Each rank's communication stream is FIFO, so the
+    /// final event also proves completion of every preceding chunk.
+    pub fn finish_peer_chunks(&mut self, mut done: Vec<[Event; 2]>) -> HipResult<()> {
+        let Some(last) = done.pop() else {
+            return Ok(());
+        };
+        for events in done {
+            for (rank, event) in events.into_iter().enumerate() {
+                self.devices[rank].bind_thread()?;
+                self.devices[rank].hip.event_destroy(event)?;
+            }
+        }
+        for (rank, event) in last.into_iter().enumerate() {
+            self.devices[rank].bind_thread()?;
+            let stream = self.devices[rank].active_stream.as_ref().ok_or_else(|| {
+                HipError::new(0, "finish_peer_chunks requires active compute streams")
+            })?;
+            self.devices[rank].hip.stream_wait_event(stream, &event)?;
+            self.devices[rank].hip.event_destroy(event)?;
+        }
+        Ok(())
+    }
     /// All-reduce-sum of f32 buffers across all ranks via **direct peer copy +
     /// local add** — bypassing RCCL. On consumer/prosumer RDNA P2P (no xGMI,
     /// e.g. hiptrx 4× gfx1201), `ncclAllReduce` costs ~40 ms/call for these

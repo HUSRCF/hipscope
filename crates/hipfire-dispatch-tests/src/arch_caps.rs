@@ -3,7 +3,7 @@ use rdna_compute::feature_flags::FeatureFlags;
 use std::sync::Arc;
 
 const ALL_ARCHS: &[&str] = &[
-    "gfx906", "gfx908", "gfx1010", "gfx1011", "gfx1012", "gfx1030", "gfx1031", "gfx1032",
+    "gfx906", "gfx908", "gfx90a", "gfx1010", "gfx1011", "gfx1012", "gfx1030", "gfx1031", "gfx1032",
     "gfx1100", "gfx1101", "gfx1102", "gfx1103", "gfx1150", "gfx1151", "gfx1152", "gfx1200",
     "gfx1201", "gfx940", "gfx941", "gfx942",
 ];
@@ -23,6 +23,9 @@ fn atoms_are_exclusive() {
             count += 1;
         }
         if caps.is_gfx908() {
+            count += 1;
+        }
+        if caps.is_gfx90a() {
             count += 1;
         }
         if caps.is_gfx1010() {
@@ -93,6 +96,16 @@ fn gcn5_is_only_gfx906() {
     assert!(make_caps("gfx906").is_gcn5());
     for &arch in &ALL_ARCHS[1..] {
         assert!(!make_caps(arch).is_gcn5(), "{arch} should not be GCN5");
+    }
+}
+
+#[test]
+fn cdna2_is_only_gfx90a() {
+    assert!(make_caps("gfx90a").is_cdna2());
+    for &arch in ALL_ARCHS {
+        if arch != "gfx90a" {
+            assert!(!make_caps(arch).is_cdna2(), "{arch} should not be CDNA2");
+        }
     }
 }
 
@@ -214,6 +227,22 @@ fn wmma_w32_gfx12_is_rdna4_only() {
 }
 
 #[test]
+fn mfma_f16_is_cdna2_or_cdna3() {
+    for &arch in &["gfx90a", "gfx940", "gfx941", "gfx942"] {
+        assert!(
+            make_caps(arch).has_mfma_f16(),
+            "{arch} should have F16 MFMA"
+        );
+    }
+    for &arch in &["gfx906", "gfx908", "gfx1030", "gfx1100", "gfx1201"] {
+        assert!(
+            !make_caps(arch).has_mfma_f16(),
+            "{arch} should not use the validated F16 MFMA kernels"
+        );
+    }
+}
+
+#[test]
 fn dot2_f32_f16_coverage() {
     for &arch in &[
         "gfx1011", "gfx1012", "gfx1030", "gfx1031", "gfx1032", "gfx1100", "gfx1101", "gfx1102",
@@ -262,8 +291,8 @@ fn wave32_on_rdna() {
 }
 
 #[test]
-fn wave64_native_on_gcn5_cdna1_cdna3() {
-    for &arch in &["gfx906", "gfx908", "gfx940", "gfx941", "gfx942"] {
+fn wave64_native_on_gcn5_cdna1_cdna2_cdna3() {
+    for &arch in &["gfx906", "gfx908", "gfx90a", "gfx940", "gfx941", "gfx942"] {
         assert!(
             make_caps(arch).is_wave64_native(),
             "{arch} should be wave64 native"
@@ -275,8 +304,8 @@ fn wave64_native_on_gcn5_cdna1_cdna3() {
 #[test]
 fn gemv_rows_default_is_1_on_wave64_rdna2_rdna3dgpu() {
     for &arch in &[
-        "gfx906", "gfx908", "gfx940", "gfx941", "gfx942", "gfx1030", "gfx1031", "gfx1100",
-        "gfx1101", "gfx1102",
+        "gfx906", "gfx908", "gfx90a", "gfx940", "gfx941", "gfx942", "gfx1030", "gfx1031",
+        "gfx1100", "gfx1101", "gfx1102",
     ] {
         assert_eq!(
             make_caps(arch).gemv_rows_default(),

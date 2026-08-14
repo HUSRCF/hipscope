@@ -42,7 +42,11 @@ fn main() {
     let mut model: Option<PathBuf> = None;
     let mut prompt = "The capital of France is".to_string();
     let mut max: usize = 48;
+    let mut warmup: usize = 2;
     let mut tp: usize = 4;
+    let mut prefill_tokens: Option<usize> = None;
+    let mut batched_prefill = false;
+    let mut prefill_batch: usize = 256;
     let mut no_bos = false;
     let mut mtp = false;
     let mut i = 1;
@@ -60,8 +64,24 @@ fn main() {
                 max = argv[i + 1].parse().expect("--max");
                 i += 2;
             }
+            "--warmup" => {
+                warmup = argv[i + 1].parse().expect("--warmup");
+                i += 2;
+            }
             "--tp" => {
                 tp = argv[i + 1].parse().expect("--tp");
+                i += 2;
+            }
+            "--prefill-tokens" => {
+                prefill_tokens = Some(argv[i + 1].parse().expect("--prefill-tokens"));
+                i += 2;
+            }
+            "--batched-prefill" => {
+                batched_prefill = true;
+                i += 1;
+            }
+            "--prefill-batch" => {
+                prefill_batch = argv[i + 1].parse().expect("--prefill-batch");
                 i += 2;
             }
             "--no-bos" => {
@@ -151,6 +171,17 @@ fn main() {
         }
     }
     prompt_ids.extend(tok.encode(&prompt));
+    if let Some(target) = prefill_tokens {
+        assert!(target > 0, "--prefill-tokens must be greater than zero");
+        assert!(
+            prompt_ids.len() <= target,
+            "prompt already has {} tokens, larger than --prefill-tokens {target}",
+            prompt_ids.len()
+        );
+        let filler = tok.encode(" ");
+        assert_eq!(filler.len(), 1, "space must encode to one token");
+        prompt_ids.resize(target, filler[0]);
+    }
 
     let mut state_per_rank: Vec<DeepseekV4State> = Vec::with_capacity(n);
     let mut partials: Vec<GpuTensor> = Vec::with_capacity(n);
@@ -159,9 +190,29 @@ fn main() {
         state_per_rank.push(DeepseekV4State::new(&cfg).expect("state"));
         partials.push(
             gpus.devices[r]
-                .zeros(&[cfg.hidden_size], DType::F32)
+                .zeros(
+                    &[
+                        if batched_prefill { prefill_batch } else { 1 },
+                        cfg.hidden_size,
+                    ],
+                    DType::F32,
+                )
                 .expect("partial"),
         );
+    }
+    let mut pbs_per_rank = Vec::new();
+    if batched_prefill {
+        assert!(
+            prefill_batch > 0,
+            "--prefill-batch must be greater than zero"
+        );
+        for r in 0..n {
+            gpus.devices[r].bind_thread().expect("bind prefill scratch");
+            pbs_per_rank.push(
+                forward::PrefillBatchScratch::new(&mut gpus.devices[r], &cfg, prefill_batch)
+                    .expect("prefill scratch"),
+            );
+        }
     }
     let peer = gpus.enable_peer_all().expect("enable_peer_all");
     eprintln!("  peer_access_enabled={peer}");
@@ -200,25 +251,43 @@ fn main() {
 
     // ── EP prefill (per-token) + greedy decode ──────────────────────────────
     eprintln!(
-        "\nprompt {:?} → {} tokens (bos-prepended={})",
-        prompt,
+        "\nprompt {} chars → {} tokens (bos-prepended={}, synthetic-fill={})",
+        prompt.chars().count(),
         prompt_ids.len(),
-        !no_bos
+        !no_bos,
+        prefill_tokens.is_some()
     );
     let t0 = std::time::Instant::now();
-    for (pos, &t) in prompt_ids.iter().enumerate() {
-        forward::forward_ep(
-            &mut gpus,
-            &weights_per_rank,
-            &cfg,
-            &mut state_per_rank,
-            &partials,
-            t,
-            pos as u32,
-        )
-        .expect("forward_ep prefill");
+    let mut logits = Vec::new();
+    if batched_prefill {
+        for (chunk_idx, chunk) in prompt_ids.chunks(prefill_batch).enumerate() {
+            logits = forward::forward_prefill_batch_chunk_ep(
+                &mut gpus,
+                &weights_per_rank,
+                &cfg,
+                &mut state_per_rank,
+                &pbs_per_rank,
+                &partials,
+                chunk,
+                (chunk_idx * prefill_batch) as u32,
+            )
+            .expect("forward_prefill_batch_chunk_ep");
+        }
+    } else {
+        for (pos, &t) in prompt_ids.iter().enumerate() {
+            forward::forward_ep(
+                &mut gpus,
+                &weights_per_rank,
+                &cfg,
+                &mut state_per_rank,
+                &partials,
+                t,
+                pos as u32,
+            )
+            .expect("forward_ep prefill");
+        }
+        logits = dl_logits(&mut gpus, &state_per_rank[0]);
     }
-    let mut logits = dl_logits(&mut gpus, &state_per_rank[0]);
     eprintln!(
         "prefill {} tok in {:.2}s",
         prompt_ids.len(),
@@ -289,7 +358,7 @@ fn main() {
             break;
         }
         gen.push(next);
-        if step == 2 {
+        if step == warmup {
             steady_t = std::time::Instant::now();
             steady = 0;
         }
@@ -312,22 +381,26 @@ fn main() {
                 top8(&logits, &tok)
             );
         }
-        if step >= 2 {
+        if step >= warmup {
             steady += 1;
         }
         pos += 1;
     }
     let dt = t1.elapsed().as_secs_f64();
+    let steady_dt = steady_t.elapsed().as_secs_f64();
     let steady_tps = if steady > 0 {
-        steady as f64 / steady_t.elapsed().as_secs_f64()
+        steady as f64 / steady_dt
     } else {
         f64::NAN
     };
     eprintln!(
-        "decoded {} tok in {:.2}s ({:.1} tok/s overall, {:.1} tok/s steady)",
+        "decoded {} tok in {:.3}s ({:.3} tok/s overall); steady {} tok after {} warmup in {:.3}s ({:.3} tok/s)",
         gen.len(),
         dt,
         gen.len() as f64 / dt,
+        steady,
+        warmup,
+        steady_dt,
         steady_tps,
     );
     println!(

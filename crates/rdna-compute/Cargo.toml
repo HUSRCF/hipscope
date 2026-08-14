@@ -13,3 +13,4 @@ hip-bridge = { path = "../hip-bridge" }
 hipfire-config = { path = "../hipfire-config" }
 redline-dispatch = { path = "../redline-dispatch" }
 rayon = "1"
+half.workspace = true

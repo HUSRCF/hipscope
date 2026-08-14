@@ -106,41 +106,127 @@ pub fn run_layer_program_ep<B: ForwardBindings>(
                     .map_err(hip_err)?;
             }
 
-            // 2. Each rank computes its owned-expert routed partial (+ shared on
-            //    rank 0 via skip_shared=false; ranks>0 skip the shared down).
-            for r in 0..n {
-                gpus.devices[r].bind_thread().map_err(hip_err)?;
-                let ctx = DispatchCtx::new(&gpus.devices[r]);
-                bindings[r].run_moe_ep(
-                    &mut gpus.devices[r],
-                    &ctx,
-                    &op.binding,
-                    &partials[r],
-                    /* skip_shared = */ r != 0,
-                )?;
-            }
+            let overlap_requested =
+                hipfire_config::developer_var("HIPFIRE_GFX90A_EP_OVERLAP").as_deref() == Ok("1");
+            let use_overlap = overlap_requested
+                && n == 2
+                && gpus.devices.iter().all(|device| device.arch == "gfx90a")
+                && bindings.iter().all(ForwardBindings::supports_moe_ep_rows);
 
-            // 3. All-reduce-sum the partials across ranks (in-place, RCCL).
-            //    Decode stays on RCCL: its tiny per-token reduce is already fast
-            //    (NOT the bottleneck — measured 51.4 RCCL vs 48.0 peer-direct on
-            //    MiniMax 62-layer decode), peer-direct's per-layer wait_boundary
-            //    host-sync only adds overhead, and RCCL preserves qwen35's
-            //    validated byte-identical decode. Peer-direct is the win for
-            //    PREFILL (large batched reduce), where RCCL is ~40 ms/call —
-            //    that path uses all_reduce_sum_f32_peer directly. Opt decode into
-            //    peer-direct with HIPFIRE_EP_PEER_ALLREDUCE_DECODE=1 if needed.
-            let refs: Vec<&DeviceBuffer> = partials.iter().map(|p| &p.buf).collect();
-            static PEER_DECODE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            let use_peer = *PEER_DECODE.get_or_init(|| {
-                hipfire_config::developer_var("HIPFIRE_EP_PEER_ALLREDUCE_DECODE").as_deref()
-                    == Ok("1")
-            });
-            if use_peer {
-                gpus.all_reduce_sum_f32_peer(&refs, residual_dim)
-                    .map_err(hip_err)?;
+            if use_overlap {
+                for r in 0..n {
+                    gpus.devices[r].bind_thread().map_err(hip_err)?;
+                    let ctx = DispatchCtx::new(&gpus.devices[r]);
+                    bindings[r].run_moe_ep_prepare(
+                        &mut gpus.devices[r],
+                        &ctx,
+                        &op.binding,
+                        &partials[r],
+                    )?;
+                }
+
+                let chunk_rows = hipfire_config::developer_var("HIPFIRE_GFX90A_EP_CHUNK_ROWS")
+                    .ok()
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .filter(|value| *value > 0)
+                    .unwrap_or(1024)
+                    .min(residual_dim);
+                let refs = [&partials[0].buf, &partials[1].buf];
+                let mut done = Vec::with_capacity(residual_dim.div_ceil(chunk_rows));
+                for row_base in (0..residual_dim).step_by(chunk_rows) {
+                    let row_count = chunk_rows.min(residual_dim - row_base);
+                    for r in 0..2 {
+                        gpus.devices[r].bind_thread().map_err(hip_err)?;
+                        bindings[r].run_moe_ep_rows(
+                            &mut gpus.devices[r],
+                            &partials[r],
+                            row_base,
+                            row_count,
+                        )?;
+                    }
+                    gpus.devices[0].bind_thread().map_err(hip_err)?;
+                    let ready0 = gpus.devices[0].hip.event_create().map_err(hip_err)?;
+                    gpus.devices[0]
+                        .hip
+                        .event_record(&ready0, gpus.devices[0].active_stream.as_ref())
+                        .map_err(hip_err)?;
+                    gpus.devices[1].bind_thread().map_err(hip_err)?;
+                    let ready1 = gpus.devices[1].hip.event_create().map_err(hip_err)?;
+                    gpus.devices[1]
+                        .hip
+                        .event_record(&ready1, gpus.devices[1].active_stream.as_ref())
+                        .map_err(hip_err)?;
+                    done.push(
+                        gpus.all_reduce_sum_f32_peer_chunk_async(
+                            &refs,
+                            row_base,
+                            row_count,
+                            [ready0, ready1],
+                        )
+                        .map_err(hip_err)?,
+                    );
+                }
+                gpus.finish_peer_chunks(done).map_err(hip_err)?;
             } else {
-                gpus.all_reduce_sum_f32(&refs, residual_dim)
-                    .map_err(hip_err)?;
+                // 2. Each rank computes its owned-expert routed partial (+ shared on
+                //    rank 0 via skip_shared=false; ranks>0 skip the shared down).
+                for r in 0..n {
+                    gpus.devices[r].bind_thread().map_err(hip_err)?;
+                    let ctx = DispatchCtx::new(&gpus.devices[r]);
+                    bindings[r].run_moe_ep(
+                        &mut gpus.devices[r],
+                        &ctx,
+                        &op.binding,
+                        &partials[r],
+                        /* skip_shared = */ r != 0,
+                    )?;
+                }
+
+                // 3. All-reduce-sum the partials across ranks in place. Two-rank
+                //    gfx90a EP defaults to peer-direct after a byte-identical
+                //    32-token DeepSeek V4 A/B showed a decode win together with HIP
+                //    Graph. Other configurations retain RCCL; the environment
+                //    variable explicitly forces either path for regression bisects.
+                static COARSE_PROBE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                let coarse_probe = *COARSE_PROBE.get_or_init(|| {
+                    hipfire_config::developer_var("HIPFIRE_EP_COARSE_PROBE").as_deref() == Ok("1")
+                });
+                if coarse_probe {
+                    for r in 0..n {
+                        gpus.devices[r].bind_thread().map_err(hip_err)?;
+                        gpus.devices[r].hip.device_synchronize().map_err(hip_err)?;
+                    }
+                }
+                let allreduce_started = std::time::Instant::now();
+                let refs: Vec<&DeviceBuffer> = partials.iter().map(|p| &p.buf).collect();
+                static PEER_DECODE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                let use_peer = *PEER_DECODE.get_or_init(|| {
+                    match hipfire_config::developer_var("HIPFIRE_EP_PEER_ALLREDUCE_DECODE")
+                        .ok()
+                        .as_deref()
+                    {
+                        Some("1") => true,
+                        Some("0") => false,
+                        _ => n == 2 && gpus.devices.iter().all(|device| device.arch == "gfx90a"),
+                    }
+                });
+                if use_peer {
+                    gpus.all_reduce_sum_f32_peer(&refs, residual_dim)
+                        .map_err(hip_err)?;
+                } else {
+                    gpus.all_reduce_sum_f32(&refs, residual_dim)
+                        .map_err(hip_err)?;
+                }
+                if coarse_probe {
+                    for r in 0..n {
+                        gpus.devices[r].bind_thread().map_err(hip_err)?;
+                        gpus.devices[r].hip.device_synchronize().map_err(hip_err)?;
+                    }
+                    eprintln!(
+                        "EP-COARSE stage=ep_allreduce ranks={n} ms={:.3}",
+                        allreduce_started.elapsed().as_secs_f64() * 1000.0,
+                    );
+                }
             }
 
             // 4. Each rank adds the reduced partial into its residual stream.

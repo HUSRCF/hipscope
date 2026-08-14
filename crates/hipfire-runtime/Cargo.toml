@@ -432,3 +432,6 @@ required-features = []
 name = "collect_hessian"
 path = "src/bin/collect_hessian.rs"
 required-features = []
+
+[[example]]
+name = "probe_hfq_tensor"

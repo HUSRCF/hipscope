@@ -432,7 +432,9 @@ impl FeatureFlags {
             rdna3_rmsnorm_sign_lds: value("HIPFIRE_RDNA3_RMSNORM_SIGN_LDS").as_deref() == Ok("1"),
             rdna3_rmsnorm_sign_const: value("HIPFIRE_RDNA3_RMSNORM_SIGN_CONST").as_deref()
                 == Ok("1"),
-            gfx942_mfma_prefill: value("HIPFIRE_GFX942_MFMA_PREFILL").ok(),
+            gfx942_mfma_prefill: value("HIPFIRE_CDNA_MFMA_PREFILL")
+                .ok()
+                .or_else(|| value("HIPFIRE_GFX942_MFMA_PREFILL").ok()),
             moe_grouped_i8: match value("HIPFIRE_MOE_GROUPED_I8").ok().as_deref() {
                 Some("1") => Some(true),
                 Some("0") => Some(false),
@@ -706,7 +708,7 @@ impl FeatureFlags {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hipfire_config::{ConfigLayer, ConfigSource, NamedLayer, ProcessConfig, resolve};
+    use hipfire_config::{resolve, ConfigLayer, ConfigSource, NamedLayer, ProcessConfig};
 
     #[test]
     fn force_unfused_defaults_false_in_test_ctor() {
