@@ -28867,7 +28867,11 @@ fn generate_deepseek4_heterogeneous(
 #[inline]
 fn gemma4_prefill_batch_for_arch(gpu_arch: &str, requested: Option<usize>) -> usize {
     requested
-        .unwrap_or(if gpu_arch == "gfx1100" { 64 } else { 1 })
+        .unwrap_or(if matches!(gpu_arch, "gfx1100" | "gfx1201") {
+            64
+        } else {
+            1
+        })
         .clamp(1, 64)
 }
 
@@ -28876,13 +28880,14 @@ mod gemma4_prefill_batch_tests {
     use super::gemma4_prefill_batch_for_arch;
 
     #[test]
-    fn gfx1100_defaults_to_full_wmma_batch_tile_group() {
+    fn validated_arches_default_to_full_wmma_batch_tile_group() {
         assert_eq!(gemma4_prefill_batch_for_arch("gfx1100", None), 64);
+        assert_eq!(gemma4_prefill_batch_for_arch("gfx1201", None), 64);
     }
 
     #[test]
     fn unvalidated_arches_keep_the_sequential_default() {
-        for arch in ["gfx1151", "gfx1201", "gfx942"] {
+        for arch in ["gfx1151", "gfx1200", "gfx942"] {
             assert_eq!(gemma4_prefill_batch_for_arch(arch, None), 1);
         }
     }
