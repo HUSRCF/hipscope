@@ -7078,6 +7078,8 @@ fn attention_block_batched_mixed(
         }
     }
 
+    let fine_step = start_pos as u64;
+    let visibility_probe = ds4_fine_probe_start(gpu, layer_idx, fine_step)?;
     // 1. Stage per-batch SWA visibility window.
     {
         let swa_k = state._attention[layer_idx].swa_k.as_ref().unwrap();
@@ -7092,6 +7094,7 @@ fn attention_block_batched_mixed(
         )
         .map_err(|e| format!("swa_visibility_stage_batched l{layer_idx}: {e:?}"))?;
     }
+    ds4_fine_probe_end(gpu, visibility_probe, layer_idx, "batch_mixed_swa_staging")?;
 
     // 2a. Compressor commits (sequential per batch — stateful ring writes
     //     and conditional pools to indexer/main_kv_cache). MUST run before
@@ -7111,6 +7114,7 @@ fn attention_block_batched_mixed(
     let q_rank = cfg.q_lora_rank;
     let mut loop_err: Option<String> = None;
 
+    let compressor_projection_probe = ds4_fine_probe_start(gpu, layer_idx, fine_step)?;
     // 2a-pre. Batched compressor GEMVs for the whole chunk. Collapses
     // 2 × batch_size sequential gemv_auto calls into ONE batched GEMM
     // per (wkv|wgate) × (main|indexer). Wires through to
@@ -7268,6 +7272,13 @@ fn attention_block_batched_mixed(
     // PHASE A: batched commit/compress for the whole chunk in one call
     // per (main, indexer) per layer. Replaces the per-batch loop when
     // start_pos % ratio == 0 (aligned chunk).
+    ds4_fine_probe_end(
+        gpu,
+        compressor_projection_probe,
+        layer_idx,
+        "batch_mixed_compressor_projection",
+    )?;
+    let compressor_commit_probe = ds4_fine_probe_start(gpu, layer_idx, fine_step)?;
     let comp_fully_batched = (start_pos as usize).is_multiple_of(ratio);
 
     if comp_fully_batched {
@@ -7384,6 +7395,13 @@ fn attention_block_batched_mixed(
         return Err(e);
     }
 
+    ds4_fine_probe_end(
+        gpu,
+        compressor_commit_probe,
+        layer_idx,
+        "batch_mixed_compressor_commit",
+    )?;
+    let indexer_probe = ds4_fine_probe_start(gpu, layer_idx, fine_step)?;
     // 2b. Batched indexer chain (ratio == 4 only) OR batched identity gather
     //     (ratio == 128). Replaces the per-batch indexer_forward + gather
     //     loop with one batched call per stage.
@@ -7603,6 +7621,8 @@ fn attention_block_batched_mixed(
     gpu.memcpy_htod_auto(&pbs.n_active_topk_arr.buf, n_active_bytes)
         .map_err(|e| format!("htod n_active_topk_arr: {e:?}"))?;
 
+    ds4_fine_probe_end(gpu, indexer_probe, layer_idx, "batch_mixed_indexer_gather")?;
+    let attention_core_probe = ds4_fine_probe_start(gpu, layer_idx, fine_step)?;
     // 4. Batched joint-softmax attention over SWA + topK + sink.
     if use_topk_direct {
         let main_kv_cache = state._indexer[layer_idx]
@@ -7716,6 +7736,14 @@ fn attention_block_batched_mixed(
         }
     }
 
+    ds4_fine_probe_end(
+        gpu,
+        attention_core_probe,
+        layer_idx,
+        "batch_mixed_attention_core",
+    )?;
+    let output_probe = ds4_fine_probe_start(gpu, layer_idx, fine_step)?;
+    let inverse_rope_probe = ds4_fine_probe_start(gpu, layer_idx, fine_step)?;
     // 5. Inverse RoPE.
     {
         let (freq_base, freq_scale, ext_factor, attn_factor, corr_low, corr_high) =
@@ -7739,8 +7767,15 @@ fn attention_block_batched_mixed(
         )
         .map_err(|e| format!("rope_tail_yarn_inv_batched l{layer_idx}: {e:?}"))?;
     }
+    ds4_fine_probe_end(
+        gpu,
+        inverse_rope_probe,
+        layer_idx,
+        "batch_mixed_inverse_rope",
+    )?;
 
     // 6. FWHT rotate attn_out_raw_batch → attn_out_raw_rot_batch.
+    let raw_rotate_probe = ds4_fine_probe_start(gpu, layer_idx, fine_step)?;
     gpu.rotate_x_mq_batched(
         &pbs.attn_out_raw_batch,
         &pbs.attn_out_raw_rot_batch,
@@ -7748,12 +7783,14 @@ fn attention_block_batched_mixed(
         batch_size,
     )
     .map_err(|e| format!("rotate attn_out_raw l{layer_idx}: {e:?}"))?;
+    ds4_fine_probe_end(gpu, raw_rotate_probe, layer_idx, "batch_mixed_raw_rotate")?;
 
     // 7. wo_a per-group batched.
     //    F32     → wo_per_group_batched_f32 (single launch).
     //    HFQ4G256→ wo_per_group_batched_hfq4g256 (single launch).
     //    Q8_0    → wo_per_group_batched_q8_0 (single launch, plain input).
     let per_group_in = (n_heads / n_groups) * head_dim;
+    let wo_a_probe = ds4_fine_probe_start(gpu, layer_idx, fine_step)?;
     match wo_a.dtype {
         DType::F32 => {
             gpu.wo_per_group_batched_f32(
@@ -7818,8 +7855,10 @@ fn attention_block_batched_mixed(
             ));
         }
     }
+    ds4_fine_probe_end(gpu, wo_a_probe, layer_idx, "batch_mixed_wo_a")?;
 
     // 8. FWHT rotate wo_a_out → wo_a_out_rot.
+    let wo_a_rotate_probe = ds4_fine_probe_start(gpu, layer_idx, fine_step)?;
     gpu.rotate_x_mq_batched(
         &pbs.wo_a_out_batch,
         &pbs.wo_a_out_rot_batch,
@@ -7827,8 +7866,10 @@ fn attention_block_batched_mixed(
         batch_size,
     )
     .map_err(|e| format!("rotate wo_a_out l{layer_idx}: {e:?}"))?;
+    ds4_fine_probe_end(gpu, wo_a_rotate_probe, layer_idx, "batch_mixed_wo_a_rotate")?;
 
     // 9. wo_b GEMV batched.
+    let wo_b_probe = ds4_fine_probe_start(gpu, layer_idx, fine_step)?;
     gemv_auto_batched_wmma(
         gpu,
         wo_b,
@@ -7840,8 +7881,10 @@ fn attention_block_batched_mixed(
         batch_size,
         Some(&pbs.wmma_x_scratch_f16),
     )?;
+    ds4_fine_probe_end(gpu, wo_b_probe, layer_idx, "batch_mixed_wo_b")?;
 
     // 10. Advance the SWA ring.
+    let ring_write_probe = ds4_fine_probe_start(gpu, layer_idx, fine_step)?;
     {
         let swa_k = state._attention[layer_idx].swa_k.as_ref().unwrap();
         let swa_v = state._attention[layer_idx].swa_v.as_ref().unwrap();
@@ -7866,6 +7909,13 @@ fn attention_block_batched_mixed(
         )
         .map_err(|e| format!("swa_ring_write_batched (v) l{layer_idx}: {e:?}"))?;
     }
+    ds4_fine_probe_end(gpu, ring_write_probe, layer_idx, "batch_mixed_ring_write")?;
+    ds4_fine_probe_end(
+        gpu,
+        output_probe,
+        layer_idx,
+        "batch_mixed_output_projection",
+    )?;
 
     Ok(())
 }
@@ -9356,10 +9406,22 @@ pub fn forward_prefill_batch_chunk_ep(
             gpu.bind_thread()
                 .map_err(|e| format!("prefill EP bind r{r} l{layer_idx}: {e:?}"))?;
 
+            let probe_step = start_pos as u64;
+
+            let probe = ds4_coarse_probe_start(gpu, layer_idx, probe_step)?;
             mhc_pre_batched(cfg, layer, pbs, gpu, layer_idx, true, n)?;
+            ds4_coarse_probe_end(gpu, probe, layer_idx, "batch_mhc_attn_pre")?;
+
+            let probe = ds4_coarse_probe_start(gpu, layer_idx, probe_step)?;
             q_lora_batched(cfg, layer, pbs, &pbs.hc_x_in_batch, gpu, layer_idx, n)?;
+            ds4_coarse_probe_end(gpu, probe, layer_idx, "batch_q_lora")?;
+
+            let probe = ds4_coarse_probe_start(gpu, layer_idx, probe_step)?;
             kv_joint_batched(cfg, layer, pbs, gpu, layer_idx, n)?;
             apply_tail_rope_batched(cfg, layer, pbs, gpu, layer_idx, n)?;
+            ds4_coarse_probe_end(gpu, probe, layer_idx, "batch_kv_joint_rope")?;
+
+            let probe = ds4_coarse_probe_start(gpu, layer_idx, probe_step)?;
             if layer.compress_ratio == 0 {
                 attention_block_batched_swa_only(
                     cfg, weights, state, pbs, gpu, layer_idx, start_pos, n,
@@ -9369,9 +9431,17 @@ pub fn forward_prefill_batch_chunk_ep(
                     cfg, weights, state, pbs, gpu, layer_idx, start_pos, n,
                 )?;
             }
-            hc_attn_mix_batched(cfg, pbs, gpu, n)?;
-            mhc_pre_batched(cfg, layer, pbs, gpu, layer_idx, false, n)?;
+            ds4_coarse_probe_end(gpu, probe, layer_idx, "batch_attention")?;
 
+            let probe = ds4_coarse_probe_start(gpu, layer_idx, probe_step)?;
+            hc_attn_mix_batched(cfg, pbs, gpu, n)?;
+            ds4_coarse_probe_end(gpu, probe, layer_idx, "batch_attn_mix")?;
+
+            let probe = ds4_coarse_probe_start(gpu, layer_idx, probe_step)?;
+            mhc_pre_batched(cfg, layer, pbs, gpu, layer_idx, false, n)?;
+            ds4_coarse_probe_end(gpu, probe, layer_idx, "batch_mhc_ffn_pre")?;
+
+            let probe = ds4_coarse_probe_start(gpu, layer_idx, probe_step)?;
             let stream = gpu
                 .active_stream
                 .as_ref()
@@ -9390,6 +9460,7 @@ pub fn forward_prefill_batch_chunk_ep(
                 tokens,
                 Some(&partials[r]),
             )?;
+            ds4_coarse_probe_end(gpu, probe, layer_idx, "batch_ffn")?;
         }
 
         let refs: Vec<&hip_bridge::DeviceBuffer> =
