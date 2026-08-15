@@ -1577,32 +1577,63 @@ fn indexer_forward(
         .ok_or_else(|| "indexer: attn_state_buf missing".to_string())?;
     let n_buf = attn_buf.sub_offset(2, 1); // n_compressed_4
     let k_buf = attn_buf.sub_offset(4, 1); // k_active_4
-    gpu.indexer_relu_score_f32_buf(
-        q_idx,
-        kv_cache,
-        idx_w,
-        scores,
-        &n_buf,
-        max_compressed as i32,
-        h as i32,
-        d as i32,
-    )
-    .map_err(|e| format!("idx score buf l{layer_idx}: {e:?}"))?;
-
-    // 5. Top-K: read N + K from device buffers.
     let topk = state._indexer[layer_idx].topk_idx_indices.as_ref().unwrap();
-    gpu.indexer_top_k_buf(
-        scores,
-        topk,
-        &n_buf,
-        &k_buf,
-        /*n_idx_heads=*/ 1,
-        max_compressed as i32,
-        k as i32,
-    )
-    .map_err(|e| format!("idx top_k buf l{layer_idx}: {e:?}"))?;
+    if gpu.graphs.capture_mode {
+        // A captured graph must keep fixed grid/kernarg shapes. Device-side N/K
+        // buffers make the replay correct as the compressed history grows.
+        gpu.indexer_relu_score_f32_buf(
+            q_idx,
+            kv_cache,
+            idx_w,
+            scores,
+            &n_buf,
+            max_compressed as i32,
+            h as i32,
+            d as i32,
+        )
+        .map_err(|e| format!("idx score buf l{layer_idx}: {e:?}"))?;
+        gpu.indexer_top_k_buf(
+            scores,
+            topk,
+            &n_buf,
+            &k_buf,
+            /*n_idx_heads=*/ 1,
+            max_compressed as i32,
+            k as i32,
+        )
+        .map_err(|e| format!("idx top_k buf l{layer_idx}: {e:?}"))?;
+    } else {
+        // Eager decode already knows the active compressed prefix on the host.
+        // Avoid launching max_compressed score blocks and reuse the exact,
+        // stable-rank batched top-K at B=1 instead of the serial O(N*K) path.
+        if n > 0 {
+            gpu.indexer_relu_score_batched_f32(
+                q_idx,
+                kv_cache,
+                idx_w,
+                &n_buf,
+                scores,
+                h as i32,
+                d as i32,
+                max_compressed as i32,
+                n as i32,
+                1,
+            )
+            .map_err(|e| format!("idx score eager-active l{layer_idx}: {e:?}"))?;
+        }
+        gpu.indexer_top_k_batched(
+            scores,
+            topk,
+            /*n_idx_heads=*/ 1,
+            max_compressed as i32,
+            n as i32,
+            k as i32,
+            k.min(n) as i32,
+            1,
+        )
+        .map_err(|e| format!("idx top_k eager-active l{layer_idx}: {e:?}"))?;
+    }
     ds4_fine_probe_end(gpu, selection_probe, layer_idx, "indexer_selection")?;
-    let _ = n; // legacy host-computed; not used after migration
 
     Ok(n)
 }
