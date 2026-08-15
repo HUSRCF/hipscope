@@ -1,0 +1,1 @@
+Write a self-contained technical essay of at least 1800 words explaining how virtual memory, page tables, TLBs, page faults, copy-on-write, and NUMA placement interact on a modern Linux system. Use clear section headings and one concrete worked example. Do not stop or give a conclusion until every requested mechanism and their interactions have been explained.
