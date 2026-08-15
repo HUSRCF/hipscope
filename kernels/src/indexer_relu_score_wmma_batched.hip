@@ -22,7 +22,7 @@
 // antirez/ds4 ds4_cuda.cu line 4609 approach). Keeps Q and K_cache in
 // F32 on the engine side — no extra storage.
 //
-// Grid:  [batch_size, ceil(N_max / 16), 1]
+// Grid:  [batch_size, ceil(N_iter / 16), 1]
 // Block: [128, 1, 1]            = 4 warps × 32 threads
 // LDS:   64 × 16 × 4 = 4096 B   (per-(head, slot_in_tile) partial)
 
@@ -43,10 +43,11 @@ extern "C" __global__ void indexer_relu_score_wmma_batched_f32(
     const float* __restrict__ k_cache,   // [N_max, D] shared across batch
     const float* __restrict__ weights,   // [B, H]
     const int*   __restrict__ n_per_batch, // [B] per-batch valid prefix
-    float*       __restrict__ scores,    // [B, N_max]
+    float*       __restrict__ scores,    // [B, N_stride]
     int H,
     int D,
-    int N_max,
+    int N_stride,
+    int N_iter,
     int batch_size
 ) {
     const int b       = blockIdx.x;
@@ -58,7 +59,7 @@ extern "C" __global__ void indexer_relu_score_wmma_batched_f32(
 
     if (b >= batch_size) return;
     const int n_start = n_block * WMMA_TILE;
-    if (n_start >= N_max) return;
+    if (n_start >= N_iter) return;
 
     const int n_valid_b = n_per_batch[b];
 
@@ -66,8 +67,8 @@ extern "C" __global__ void indexer_relu_score_wmma_batched_f32(
     if (n_start >= n_valid_b) {
         if (tid < WMMA_TILE) {
             const int slot = n_start + tid;
-            if (slot < N_max) {
-                scores[(size_t)b * N_max + slot] = -1e30f;
+            if (slot < N_iter) {
+                scores[(size_t)b * N_stride + slot] = -1e30f;
             }
         }
         return;
@@ -153,9 +154,9 @@ extern "C" __global__ void indexer_relu_score_wmma_batched_f32(
             for (int h = 0; h < MAX_HEADS; ++h) {
                 if (h < H) sum += lds[h][tid];
             }
-            scores[(size_t)b * N_max + slot] = sum;
-        } else if (slot < N_max) {
-            scores[(size_t)b * N_max + slot] = -1e30f;
+            scores[(size_t)b * N_stride + slot] = sum;
+        } else if (slot < N_iter) {
+            scores[(size_t)b * N_stride + slot] = -1e30f;
         }
     }
 }

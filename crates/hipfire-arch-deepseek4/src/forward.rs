@@ -6616,6 +6616,7 @@ impl PrefillBatchScratch {
         let n_heads = cfg.num_attention_heads;
         let head_dim = cfg.head_dim;
         let hc_mult = cfg.hc_mult;
+        let max_compressed = config_cache::max_compress_pos();
 
         let alloc = |gpu: &mut Gpu, shape: &[usize], label: &str| -> Result<GpuTensor, String> {
             gpu.alloc_tensor(shape, DType::F32)
@@ -6752,7 +6753,7 @@ impl PrefillBatchScratch {
                 "idx_q_batch",
             )?,
             idx_w_batch: alloc(gpu, &[max_batch, cfg.index_n_heads], "idx_w_batch")?,
-            idx_scores_batch: alloc(gpu, &[max_batch, 2048], "idx_scores_batch")?,
+            idx_scores_batch: alloc(gpu, &[max_batch, max_compressed], "idx_scores_batch")?,
             idx_topk_indices_batch: alloc(
                 gpu,
                 &[max_batch, cfg.index_topk],
@@ -7923,12 +7924,11 @@ fn attention_block_batched_mixed(
                 Some(&pbs.wmma_x_scratch_f16),
             )?;
 
-            // Batched scoring. Pass the SCORE BUFFER STRIDE (max_compressed,
-            // = the allocated row stride of pbs.idx_scores_batch), not the
-            // chunk's n_max_chunk. The kernel writes scores[b * stride + n];
-            // slots with n >= n_per_batch[b] get -inf and slots with
-            // n >= n_max_chunk read uninit K_cache data but also get -inf
-            // (since n_per_batch[b] ≤ n_max_chunk ≤ n).
+            // Batched scoring. Keep score storage stride (max_compressed)
+            // separate from the active iteration bound (n_max_chunk).
+            // Scanning the full configured capacity made long-context
+            // prefill cost scale with the reservation rather than the
+            // number of committed compressed slots.
             let kv_cache = state._indexer[layer_idx]
                 .indexer_kv_cache
                 .as_ref()
@@ -7953,6 +7953,7 @@ fn attention_block_batched_mixed(
                     h_idx as i32,
                     d_idx as i32,
                     max_compressed as i32,
+                    n_max_chunk as i32,
                     batch_size as i32,
                 )
                 .map_err(|e| format!("indexer_relu_score_wmma_batched l{layer_idx}: {e:?}"))?;
@@ -7966,6 +7967,7 @@ fn attention_block_batched_mixed(
                     h_idx as i32,
                     d_idx as i32,
                     max_compressed as i32,
+                    n_max_chunk as i32,
                     batch_size as i32,
                 )
                 .map_err(|e| format!("indexer_relu_score_batched l{layer_idx}: {e:?}"))?;

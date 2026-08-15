@@ -12,7 +12,7 @@
 // K_cache is shared across batch (single global compressed-K cache).
 // Q and weights are per-batch.
 //
-// Grid:  [N, batch_size, 1]  — one block per (compressed slot, batch)
+// Grid:  [N_iter, batch_size, 1] — one block per active (slot, batch)
 // Block: [H, 1, 1]            — one thread per head, reduce via LDS
 //
 // Byte-identical to indexer_relu_score_f32 at batch_size == 1.
@@ -27,15 +27,16 @@ void indexer_relu_score_batched_f32(
     const float* __restrict__ k_cache,   // [N_max, D] shared
     const float* __restrict__ weights,   // [B, H]
     const int*   __restrict__ n_per_batch, // [B] per-batch valid prefix
-    float*       __restrict__ scores,    // [B, N_max]
+    float*       __restrict__ scores,    // [B, N_stride]
     int H,
     int D,
-    int N_max,
+    int N_stride,
+    int N_iter,
     int batch_size
 ) {
     const int n = blockIdx.x;
     const int b = blockIdx.y;
-    if (n >= N_max || b >= batch_size) return;
+    if (n >= N_iter || b >= batch_size) return;
     const int tid = threadIdx.x;
     if (tid >= H) return;
 
@@ -44,7 +45,7 @@ void indexer_relu_score_batched_f32(
     // visible to batch row b. Write -inf so top-K skips them.
     const int n_valid_b = n_per_batch[b];
     if (n >= n_valid_b) {
-        if (tid == 0) scores[(size_t)b * N_max + n] = -1e30f;
+        if (tid == 0) scores[(size_t)b * N_stride + n] = -1e30f;
         return;
     }
 
@@ -63,5 +64,5 @@ void indexer_relu_score_batched_f32(
         if (tid < s) reduce[tid] += reduce[tid + s];
         __syncthreads();
     }
-    if (tid == 0) scores[(size_t)b * N_max + n] = reduce[0];
+    if (tid == 0) scores[(size_t)b * N_stride + n] = reduce[0];
 }

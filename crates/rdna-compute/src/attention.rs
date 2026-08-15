@@ -8585,7 +8585,9 @@ impl Gpu {
             dtypes => {
                 return Err(hip_bridge::HipError::new(
                     0,
-                    &format!("hc_apply_alpha requires matching F16 or F32 controls, got {dtypes:?}"),
+                    &format!(
+                        "hc_apply_alpha requires matching F16 or F32 controls, got {dtypes:?}"
+                    ),
                 ))
             }
         };
@@ -8631,8 +8633,8 @@ impl Gpu {
                 return Err(hip_bridge::HipError::new(
                     0,
                     &format!(
-                        "hc_apply_alpha_batched requires matching F16 or F32 controls, got {dtypes:?}"
-                    ),
+                    "hc_apply_alpha_batched requires matching F16 or F32 controls, got {dtypes:?}"
+                ),
                 ))
             }
         };
@@ -8670,9 +8672,7 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         let (kernel_name, kernel_src) = match (w_fn.dtype, base.dtype) {
-            (DType::F16, DType::F16) => {
-                ("hc_compute_control", kernels::HC_COMPUTE_CONTROL_SRC)
-            }
+            (DType::F16, DType::F16) => ("hc_compute_control", kernels::HC_COMPUTE_CONTROL_SRC),
             (DType::F32, DType::F32) => (
                 "hc_compute_control_f32weights",
                 kernels::HC_COMPUTE_CONTROL_F32WEIGHTS_SRC,
@@ -8785,9 +8785,7 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         let (kernel_name, kernel_src) = match (w_fn.dtype, base.dtype) {
-            (DType::F16, DType::F16) => {
-                ("hc_head_compute_pre", kernels::HC_HEAD_COMPUTE_PRE_SRC)
-            }
+            (DType::F16, DType::F16) => ("hc_head_compute_pre", kernels::HC_HEAD_COMPUTE_PRE_SRC),
             (DType::F32, DType::F32) => (
                 "hc_head_compute_pre_f32weights",
                 kernels::HC_HEAD_COMPUTE_PRE_F32WEIGHTS_SRC,
@@ -9275,10 +9273,11 @@ impl Gpu {
         k_cache: &GpuTensor,     // [N_max, D] shared
         weights: &GpuTensor,     // [B, H]
         n_per_batch: &GpuTensor, // [B] i32
-        scores: &GpuTensor,      // [B, N_max] output
+        scores: &GpuTensor,      // [B, N_stride] output
         n_idx_heads: i32,        // H
         idx_head_dim: i32,       // D
-        n_max: i32,              // N_max (cache slots considered)
+        n_stride: i32,           // score row storage stride
+        n_iter: i32,             // active cache slots considered
         batch_size: i32,
     ) -> HipResult<()> {
         self.bind_thread()?;
@@ -9295,7 +9294,8 @@ impl Gpu {
         let sp = scores.buf.as_ptr();
         let mut h = n_idx_heads;
         let mut d = idx_head_dim;
-        let mut nc = n_max;
+        let mut ns = n_stride;
+        let mut ni = n_iter;
         let mut bs = batch_size;
         let mut params: Vec<*mut c_void> = vec![
             &qp as *const _ as *mut c_void,
@@ -9305,13 +9305,14 @@ impl Gpu {
             &sp as *const _ as *mut c_void,
             &mut h as *mut _ as *mut c_void,
             &mut d as *mut _ as *mut c_void,
-            &mut nc as *mut _ as *mut c_void,
+            &mut ns as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
             &mut bs as *mut _ as *mut c_void,
         ];
         unsafe {
             self.hip.launch_kernel(
                 func,
-                [n_max as u32, batch_size as u32, 1],
+                [n_iter as u32, batch_size as u32, 1],
                 [n_idx_heads as u32, 1, 1],
                 0,
                 self.stream_ref(),
@@ -9325,10 +9326,11 @@ impl Gpu {
         k_cache: &GpuTensor,     // [N_max, D] shared
         weights: &GpuTensor,     // [B, H]
         n_per_batch: &GpuTensor, // [B] i32
-        scores: &GpuTensor,      // [B, N_max] output
+        scores: &GpuTensor,      // [B, N_stride] output
         n_idx_heads: i32,
         idx_head_dim: i32,
-        n_max: i32,
+        n_stride: i32,
+        n_iter: i32,
         batch_size: i32,
     ) -> HipResult<()> {
         self.bind_thread()?;
@@ -9353,7 +9355,8 @@ impl Gpu {
         let sp = scores.buf.as_ptr();
         let mut h = n_idx_heads;
         let mut d = idx_head_dim;
-        let mut nc = n_max;
+        let mut ns = n_stride;
+        let mut ni = n_iter;
         let mut bs = batch_size;
         let mut params: Vec<*mut c_void> = vec![
             &qp as *const _ as *mut c_void,
@@ -9363,10 +9366,11 @@ impl Gpu {
             &sp as *const _ as *mut c_void,
             &mut h as *mut _ as *mut c_void,
             &mut d as *mut _ as *mut c_void,
-            &mut nc as *mut _ as *mut c_void,
+            &mut ns as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
             &mut bs as *mut _ as *mut c_void,
         ];
-        let grid_n = (n_max as u32 + 15) / 16;
+        let grid_n = (n_iter as u32 + 15) / 16;
         unsafe {
             self.hip.launch_kernel(
                 func,
