@@ -5,8 +5,8 @@
 // HC 4-stream residual mix — BATCHED variant (Phase A5, 2026-05-18).
 //
 // Batched twin of `hc_mix_4stream`. Per batch position b:
-//   x_out[b, s, d] = sum_t(A[b, s, t] * x_in[b, t, d])
-//                  + scale[b, s] * transform_out[b, d]
+//   x_out[b, dst, d] = sum_src(A[b, src, dst] * x_in[b, src, d])
+//                      + scale[b, dst] * transform_out[b, d]
 //
 // Grid:  [hidden_blocks, HC_MULT, batch_size]
 // Block: [BLOCK_HIDDEN, 1, 1]
@@ -43,7 +43,9 @@ extern "C" __global__ void hc_mix_4stream_batched(
     float acc = 0.0f;
     #pragma unroll
     for (int s_in = 0; s_in < HC_MULT; ++s_in) {
-        float gate = A[a_base + stream_out * HC_MULT + s_in];
+        // A is contiguous [source_stream, destination_stream], matching the
+        // official HC reference and the scalar kernel.
+        float gate = A[a_base + s_in * HC_MULT + stream_out];
         float val  = x_in[x_base + s_in * hidden + d];
         acc += gate * val;
     }

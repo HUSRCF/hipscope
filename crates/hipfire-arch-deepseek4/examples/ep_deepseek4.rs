@@ -32,7 +32,9 @@ fn main() {
     use hipfire_arch_deepseek4::{DeepseekV4, DeepseekV4State};
     use hipfire_runtime::arch::Architecture;
     use hipfire_runtime::hfq::HfqFile;
+    use hipfire_runtime::model_source::ModelSource;
     use hipfire_runtime::multi_gpu::Gpus;
+    use hipfire_runtime::safetensors_source::SafetensorsSource;
     use hipfire_runtime::tokenizer::Tokenizer;
     use hipfire_runtime::tp_shard::{ExpertAssign, ShardConfig};
     use rdna_compute::{DType, GpuTensor};
@@ -43,6 +45,7 @@ fn main() {
     let mut overlay: Option<PathBuf> = None;
     let mut prompt = "The capital of France is".to_string();
     let mut prompt_file: Option<PathBuf> = None;
+    let mut explicit_token_ids: Option<Vec<u32>> = None;
     let mut max: usize = 48;
     let mut warmup: usize = 2;
     let mut tp: usize = 4;
@@ -74,6 +77,15 @@ fn main() {
             }
             "--prompt-file" => {
                 prompt_file = Some(PathBuf::from(&argv[i + 1]));
+                i += 2;
+            }
+            "--token-ids" => {
+                let ids = argv[i + 1]
+                    .split(',')
+                    .map(|value| value.parse().expect("--token-ids"))
+                    .collect::<Vec<_>>();
+                assert!(!ids.is_empty(), "--token-ids requires at least one ID");
+                explicit_token_ids = Some(ids);
                 i += 2;
             }
             "--max" => {
@@ -141,7 +153,7 @@ fn main() {
             }
         }
     }
-    if let Some(path) = prompt_file {
+    if let Some(path) = prompt_file.as_ref() {
         prompt = std::fs::read_to_string(&path).expect("read --prompt-file");
     }
     let model = model.expect("--model required");
@@ -157,18 +169,41 @@ fn main() {
         !(moe_probe_out.is_some() && batched_prefill),
         "--moe-probe-out requires sequential prefill; omit --batched-prefill"
     );
+    assert!(
+        explicit_token_ids.is_none() || (!chat && prompt_file.is_none()),
+        "--token-ids bypasses prompt construction; do not combine it with --chat or --prompt-file"
+    );
 
     // ── config + tokenizer (per-rank loads reopen the file) ─────────────────
+    let source_is_dir = model.is_dir();
     let attach_overlay = |hfq: &mut HfqFile| {
         if let Some(path) = overlay.as_deref() {
             let control = HfqFile::open_at_offset(path, 0).expect("open --overlay");
             hfq.attach_overlay(control).expect("attach --overlay");
         }
     };
-    let mut hfq0 = HfqFile::open(&model).expect("open model");
-    attach_overlay(&mut hfq0);
-    let cfg = DeepseekV4::config_from_hfq(&hfq0).expect("config");
-    let tok = Tokenizer::from_hfq_metadata(&hfq0.metadata_json).expect("tokenizer");
+    let (cfg, tok) = if source_is_dir {
+        assert!(
+            overlay.is_none(),
+            "--overlay is only supported for HFQ input"
+        );
+        let source = SafetensorsSource::open(&model).expect("open safetensors model");
+        let cfg = hipfire_arch_deepseek4::config_from_safetensors(&source)
+            .expect("config_from_safetensors");
+        let tok_path = source
+            .tokenizer_json_path()
+            .expect("tokenizer.json in safetensors directory");
+        let tok = Tokenizer::from_tokenizer_json(&tok_path)
+            .expect("tokenizer parse")
+            .expect("tokenizer load");
+        (cfg, tok)
+    } else {
+        let mut hfq0 = HfqFile::open(&model).expect("open model");
+        attach_overlay(&mut hfq0);
+        let cfg = DeepseekV4::config_from_hfq(&hfq0).expect("config");
+        let tok = Tokenizer::from_hfq_metadata(&hfq0.metadata_json).expect("tokenizer");
+        (cfg, tok)
+    };
     let n_exp = cfg.n_routed_experts;
     eprintln!(
         "deepseek4 EP: tp={tp} hidden={} layers={} hash_layers={} experts={}/{} vocab={} route_scale={} swiglu_limit={}",
@@ -202,8 +237,6 @@ fn main() {
             "--chat requires BOS/User/Assistant special tokens in model metadata"
         );
     }
-    drop(hfq0);
-
     // ── bring up N ranks ────────────────────────────────────────────────────
     let mut gpus = Gpus::init_tp(tp, cfg.num_hidden_layers).expect("init_tp");
     let n = gpus.devices.len();
@@ -216,47 +249,68 @@ fn main() {
     }
 
     // ── shard-aware replicated load (each rank uploads only its owned experts) ─
-    let shard = ShardConfig::new(
-        tp,
-        /*tp_kv_replicate=*/ true,
-        n_exp,
-        ExpertAssign::Stride,
-    )
-    .expect("ShardConfig");
+    let expert_assign = if source_is_dir {
+        ExpertAssign::Contiguous
+    } else {
+        ExpertAssign::Stride
+    };
+    let shard =
+        ShardConfig::new(tp, /*tp_kv_replicate=*/ true, n_exp, expert_assign).expect("ShardConfig");
     let mut weights_per_rank = Vec::with_capacity(n);
     for r in 0..n {
         gpus.devices[r].bind_thread().expect("bind");
-        let mut hfq = HfqFile::open(&model).expect("reopen model");
-        attach_overlay(&mut hfq);
         let t = std::time::Instant::now();
-        let w = DeepseekV4::load_weights_sharded(&mut hfq, &cfg, &mut gpus.devices[r], &shard, r)
-            .expect("shard-aware load");
+        let w = if source_is_dir {
+            let source = SafetensorsSource::open(&model).expect("reopen safetensors model");
+            DeepseekV4::load_weights_from_safetensors_sharded(
+                &source,
+                &cfg,
+                &mut gpus.devices[r],
+                &shard,
+                r,
+            )
+            .expect("safetensors shard-aware load")
+        } else {
+            let mut hfq = HfqFile::open(&model).expect("reopen model");
+            attach_overlay(&mut hfq);
+            DeepseekV4::load_weights_sharded(&mut hfq, &cfg, &mut gpus.devices[r], &shard, r)
+                .expect("HFQ shard-aware load")
+        };
         eprintln!(
             "  [rank {r}] loaded owned shard in {:.1}s",
             t.elapsed().as_secs_f64()
         );
         weights_per_rank.push(w);
     }
-    eprintln!("  all ranks loaded (stride: rank r owns experts e%{tp}==r)");
+    eprintln!("  all ranks loaded (expert assignment: {expert_assign:?})");
 
     // ── per-rank state + routed partials ([hidden] = ffn_out width) ──────────
-    let mut prompt_ids: Vec<u32> = Vec::new();
-    if chat {
-        prompt_ids.push(bos_tok.unwrap());
-        prompt_ids.push(user_tok.unwrap());
-        prompt_ids.extend(tok.encode(&prompt));
-        prompt_ids.push(asst_tok.unwrap());
+    let mut prompt_ids: Vec<u32> = if let Some(ids) = explicit_token_ids.as_ref() {
+        ids.clone()
+    } else if chat {
+        let mut ids = Vec::new();
+        ids.push(bos_tok.unwrap());
+        ids.push(user_tok.unwrap());
+        ids.extend(tok.encode(&prompt));
+        ids.push(asst_tok.unwrap());
         // DeepSeek V4 non-thinking template. The model requires this marker
         // immediately after Assistant to skip the reasoning block; omitting it
         // leaves the prompt off-distribution and commonly produces attractors.
-        prompt_ids.extend(tok.encode("</think>"));
+        ids.extend(tok.encode("</think>"));
+        ids
     } else {
+        let mut ids = Vec::new();
         if !no_bos {
             if let Some(b) = bos_tok {
-                prompt_ids.push(b);
+                ids.push(b);
             }
         }
-        prompt_ids.extend(tok.encode(&prompt));
+        ids.extend(tok.encode(&prompt));
+        ids
+    };
+    assert!(!prompt_ids.is_empty(), "input token sequence is empty");
+    if explicit_token_ids.is_some() {
+        eprintln!("explicit token IDs (no BOS/chat/tokenizer additions): {prompt_ids:?}");
     }
     if let Some(target) = prefill_tokens {
         assert!(target > 0, "--prefill-tokens must be greater than zero");
@@ -434,8 +488,14 @@ fn main() {
         "\nprompt {} chars → {} tokens (mode={}, bos-prepended={}, synthetic-fill={})",
         prompt.chars().count(),
         prompt_ids.len(),
-        if chat { "chat" } else { "raw" },
-        chat || !no_bos,
+        if explicit_token_ids.is_some() {
+            "token-ids"
+        } else if chat {
+            "chat"
+        } else {
+            "raw"
+        },
+        explicit_token_ids.is_none() && (chat || !no_bos),
         prefill_tokens.is_some()
     );
     let t0 = std::time::Instant::now();

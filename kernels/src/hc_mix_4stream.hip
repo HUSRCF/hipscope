@@ -8,7 +8,8 @@
 // 4×4 gating matrix produced by `hc_sinkhorn_4x4`, then adds the
 // layer transform's output scaled by per-stream scaling factors.
 //
-//   x_out[s, d] = sum_t(A[s, t] * x_in[t, d]) + scale[s] * transform_out[d]
+//   x_out[dst, d] = sum_src(A[src, dst] * x_in[src, d])
+//                   + scale[dst] * transform_out[d]
 //
 // Signature (subject to revision):
 //
@@ -45,11 +46,14 @@ extern "C" __global__ void hc_mix_4stream(
     const int d   = blockIdx.x * BLOCK_HIDDEN + tid;
     if (d >= hidden || stream_out >= HC_MULT) return;
 
-    // Sum over input streams via gating matrix row A[stream_out, :].
+    // hc_sinkhorn_4x4 preserves the reference model's contiguous
+    // [source_stream, destination_stream] layout. Sum the source column for
+    // this destination; reading A[destination, source] transposes the HC
+    // transport matrix and changes model semantics from the first layer.
     float acc = 0.0f;
     #pragma unroll
     for (int s_in = 0; s_in < HC_MULT; ++s_in) {
-        float gate = A[stream_out * HC_MULT + s_in];
+        float gate = A[s_in * HC_MULT + stream_out];
         float val  = x_in[s_in * hidden + d];
         acc += gate * val;
     }
