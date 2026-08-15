@@ -21,7 +21,7 @@
 //                   pass via a device buffer with a `_buf` variant)
 //   n_exp         — number of routed experts (256 on DeepSeek V4)
 //   k             — number of experts per token (8 on DeepSeek V4)
-//   route_scale   — multiplier (DeepSeek V4 default 2.2)
+//   route_scale   — multiplier from the model config (environment-overridable)
 //
 // Outputs:
 //   topk_idx[k]   — i32 expert IDs from tid2eid[token_id][0..k]

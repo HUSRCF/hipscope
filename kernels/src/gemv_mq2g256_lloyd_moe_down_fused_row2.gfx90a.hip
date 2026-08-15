@@ -31,8 +31,10 @@ void HIPFIRE_MQ2_FUSED_KERNEL(
 
     float weighted[ROW_TILE] = {};
     for (int krank = 0; krank < K_TOP; ++krank) {
+        const int expert_id = topk_indices[krank];
+        if (expert_id < 0) continue;
         const char* A =
-            reinterpret_cast<const char*>(expert_ptrs[topk_indices[krank]]);
+            reinterpret_cast<const char*>(expert_ptrs[expert_id]);
         const float* x = rot_batch + (long long)krank * K;
         const float weight = topk_weights[krank];
         float acc0[ROW_TILE] = {};

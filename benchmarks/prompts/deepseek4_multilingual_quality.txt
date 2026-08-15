@@ -1,0 +1,8 @@
+请严格按以下四个标签回答，每个标签只写两句话，并保持对应语言，不要翻译标签：
+
+中文：解释为什么缓存失效消息需要幂等处理。
+English: Explain why a reconnecting node should not trust a stale local cache.
+日本語：分散システムで順序保証が重要な理由を説明してください。
+Español: Explica por qué una respuesta rápida pero incorrecta no es una optimización.
+
+最后另起一行，原样输出：Unicode check: 中文 / 日本語 / español / naïve / café / Δt

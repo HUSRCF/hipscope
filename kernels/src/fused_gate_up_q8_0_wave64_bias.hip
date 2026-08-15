@@ -15,7 +15,8 @@ extern "C" __global__ void fused_gate_up_q8_0_wave64_bias(
     float* __restrict__ y_gate,
     float* __restrict__ y_up,
     const float* __restrict__ up_bias,
-    int gate_m, int up_m, int K
+    const int* __restrict__ pos_buf,
+    int ratio, int gate_m, int up_m, int K
 ) {
     const int tid = threadIdx.x;
     const int lane = tid & 31;
@@ -54,7 +55,9 @@ extern "C" __global__ void fused_gate_up_q8_0_wave64_bias(
 
     if (lane == 0) {
         if (is_up) {
-            y_up[out_row] = sum + up_bias[out_row];
+            int bias_row = pos_buf[0] % ratio;
+            if (bias_row < 0) bias_row += ratio;
+            y_up[out_row] = sum + up_bias[(size_t)bias_row * up_m + out_row];
         } else {
             y_gate[out_row] = sum;
         }

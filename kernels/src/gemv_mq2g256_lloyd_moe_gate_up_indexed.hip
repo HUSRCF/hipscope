@@ -39,6 +39,14 @@ extern "C" __global__ void gemv_mq2g256_lloyd_moe_gate_up_k8_indexed(
     const int tid = threadIdx.x;
 
     const int expert_id = topk_indices[krank];
+    if (expert_id < 0) {
+        if (tid == 0) {
+            const int mi = M >> 1;
+            if (row < mi) y_gate[(long long)krank * mi + row] = 0.0f;
+            else y_up[(long long)krank * mi + row - mi] = 0.0f;
+        }
+        return;
+    }
     const char* __restrict__ A =
         reinterpret_cast<const char*>(expert_ptrs[expert_id]);
 

@@ -8299,6 +8299,53 @@ impl Gpu {
             )
         }
     }
+    /// Graph-safe single-position compressor APE add. Unlike passing a
+    /// host-selected APE row pointer, this keeps the full APE base in the
+    /// captured kernargs and selects `pos_buf[0] % ratio` on every replay.
+    pub fn compressor_add_ape_pos_buf_f32(
+        &mut self,
+        score: &GpuTensor,
+        ape: &GpuTensor,
+        pos_buf: &GpuTensor,
+        ratio: i32,
+        proj_dim: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "compressor_add_ape_pos_buf",
+            kernels::COMPRESSOR_ADD_APE_POS_BUF_SRC,
+            "compressor_add_ape_pos_buf_f32",
+        )?;
+
+        let sp = score.buf.as_ptr();
+        let ap = ape.buf.as_ptr();
+        let pp = pos_buf.buf.as_ptr();
+        let rr = ratio;
+        let pd = proj_dim;
+        let mut params: Vec<*mut c_void> = vec![
+            &sp as *const _ as *mut c_void,
+            &ap as *const _ as *mut c_void,
+            &pp as *const _ as *mut c_void,
+            &rr as *const _ as *mut c_void,
+            &pd as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "compressor_add_ape_pos_buf_f32",
+            [(proj_dim as u32).div_ceil(256), 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(sp);
+                b.push_ptr(ap);
+                b.push_ptr(pp);
+                b.push_i32(rr);
+                b.push_i32(pd);
+                b
+            },
+        )
+    }
     pub fn compressor_overlap_concat_f32(
         &mut self,
         src: &GpuTensor, // [2*ratio, 2*head_dim] F32
@@ -8529,12 +8576,21 @@ impl Gpu {
         base: &GpuTensor,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel(
-            "hc_apply_alpha",
-            kernels::HC_APPLY_ALPHA_SRC,
-            "hc_apply_alpha",
-        )?;
-        let func = &self.functions["hc_apply_alpha"];
+        let (kernel_name, kernel_src) = match (alpha.dtype, base.dtype) {
+            (DType::F16, DType::F16) => ("hc_apply_alpha", kernels::HC_APPLY_ALPHA_SRC),
+            (DType::F32, DType::F32) => (
+                "hc_apply_alpha_f32weights",
+                kernels::HC_APPLY_ALPHA_F32WEIGHTS_SRC,
+            ),
+            dtypes => {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    &format!("hc_apply_alpha requires matching F16 or F32 controls, got {dtypes:?}"),
+                ))
+            }
+        };
+        self.ensure_kernel(kernel_name, kernel_src, kernel_name)?;
+        let func = &self.functions[kernel_name];
         let cp = c.buf.as_ptr();
         let ap = alpha.buf.as_ptr();
         let bp = base.buf.as_ptr();
@@ -8562,12 +8618,26 @@ impl Gpu {
         batch_size: i32,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel(
-            "hc_apply_alpha_batched",
-            kernels::HC_APPLY_ALPHA_BATCHED_SRC,
-            "hc_apply_alpha_batched",
-        )?;
-        let func = &self.functions["hc_apply_alpha_batched"];
+        let (kernel_name, kernel_src) = match (alpha.dtype, base.dtype) {
+            (DType::F16, DType::F16) => (
+                "hc_apply_alpha_batched",
+                kernels::HC_APPLY_ALPHA_BATCHED_SRC,
+            ),
+            (DType::F32, DType::F32) => (
+                "hc_apply_alpha_batched_f32weights",
+                kernels::HC_APPLY_ALPHA_BATCHED_F32WEIGHTS_SRC,
+            ),
+            dtypes => {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    &format!(
+                        "hc_apply_alpha_batched requires matching F16 or F32 controls, got {dtypes:?}"
+                    ),
+                ))
+            }
+        };
+        self.ensure_kernel(kernel_name, kernel_src, kernel_name)?;
+        let func = &self.functions[kernel_name];
         let cp = c.buf.as_ptr();
         let ap = alpha.buf.as_ptr();
         let bp = base.buf.as_ptr();
@@ -8599,12 +8669,25 @@ impl Gpu {
         x_dim: i32,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel(
-            "hc_compute_control",
-            kernels::HC_COMPUTE_CONTROL_SRC,
-            "hc_compute_control",
-        )?;
-        let func = &self.functions["hc_compute_control"];
+        let (kernel_name, kernel_src) = match (w_fn.dtype, base.dtype) {
+            (DType::F16, DType::F16) => {
+                ("hc_compute_control", kernels::HC_COMPUTE_CONTROL_SRC)
+            }
+            (DType::F32, DType::F32) => (
+                "hc_compute_control_f32weights",
+                kernels::HC_COMPUTE_CONTROL_F32WEIGHTS_SRC,
+            ),
+            dtypes => {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    &format!(
+                        "hc_compute_control requires matching F16 or F32 controls, got {dtypes:?}"
+                    ),
+                ))
+            }
+        };
+        self.ensure_kernel(kernel_name, kernel_src, kernel_name)?;
+        let func = &self.functions[kernel_name];
         let xp = x_flat.buf.as_ptr();
         let wp = w_fn.buf.as_ptr();
         let bp = base.buf.as_ptr();
@@ -8641,12 +8724,26 @@ impl Gpu {
         batch_size: i32,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel(
-            "hc_compute_control_batched",
-            kernels::HC_COMPUTE_CONTROL_BATCHED_SRC,
-            "hc_compute_control_batched",
-        )?;
-        let func = &self.functions["hc_compute_control_batched"];
+        let (kernel_name, kernel_src) = match (w_fn.dtype, base.dtype) {
+            (DType::F16, DType::F16) => (
+                "hc_compute_control_batched",
+                kernels::HC_COMPUTE_CONTROL_BATCHED_SRC,
+            ),
+            (DType::F32, DType::F32) => (
+                "hc_compute_control_batched_f32weights",
+                kernels::HC_COMPUTE_CONTROL_BATCHED_F32WEIGHTS_SRC,
+            ),
+            dtypes => {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    &format!(
+                        "hc_compute_control_batched requires matching F16 or F32 controls, got {dtypes:?}"
+                    ),
+                ))
+            }
+        };
+        self.ensure_kernel(kernel_name, kernel_src, kernel_name)?;
+        let func = &self.functions[kernel_name];
         let xp = x_flat.buf.as_ptr();
         let wp = w_fn.buf.as_ptr();
         let bp = base.buf.as_ptr();
@@ -8687,12 +8784,25 @@ impl Gpu {
         hc_eps: f32,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel(
-            "hc_head_compute_pre",
-            kernels::HC_HEAD_COMPUTE_PRE_SRC,
-            "hc_head_compute_pre",
-        )?;
-        let func = &self.functions["hc_head_compute_pre"];
+        let (kernel_name, kernel_src) = match (w_fn.dtype, base.dtype) {
+            (DType::F16, DType::F16) => {
+                ("hc_head_compute_pre", kernels::HC_HEAD_COMPUTE_PRE_SRC)
+            }
+            (DType::F32, DType::F32) => (
+                "hc_head_compute_pre_f32weights",
+                kernels::HC_HEAD_COMPUTE_PRE_F32WEIGHTS_SRC,
+            ),
+            dtypes => {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    &format!(
+                        "hc_head_compute_pre requires matching F16 or F32 controls, got {dtypes:?}"
+                    ),
+                ))
+            }
+        };
+        self.ensure_kernel(kernel_name, kernel_src, kernel_name)?;
+        let func = &self.functions[kernel_name];
         let xp = x_flat.buf.as_ptr();
         let wp = w_fn.buf.as_ptr();
         let bp = base.buf.as_ptr();
@@ -8987,6 +9097,7 @@ impl Gpu {
         pre: &GpuTensor,  // [B, 4]
         post: &GpuTensor, // [B, 4]
         comb: &GpuTensor, // [B, 16]
+        hc_eps: f32,
         post_scale: f32,
         batch_size: i32,
     ) -> HipResult<()> {
@@ -9001,6 +9112,7 @@ impl Gpu {
         let prp = pre.buf.as_ptr();
         let pop = post.buf.as_ptr();
         let cop = comb.buf.as_ptr();
+        let mut he = hc_eps;
         let mut ps = post_scale;
         let mut bs = batch_size;
         let mut params: Vec<*mut c_void> = vec![
@@ -9008,6 +9120,7 @@ impl Gpu {
             &prp as *const _ as *mut c_void,
             &pop as *const _ as *mut c_void,
             &cop as *const _ as *mut c_void,
+            &mut he as *mut _ as *mut c_void,
             &mut ps as *mut _ as *mut c_void,
             &mut bs as *mut _ as *mut c_void,
         ];

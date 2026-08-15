@@ -149,6 +149,7 @@ def build_config(args):
         draft = os.path.abspath(os.path.expanduser(env_draft)) if env_draft else None
     return {
         "model": args.model, "tag": tag, "kv": args.kv, "mtp": args.mtp,
+        "tp": getattr(args, "tp", None),
         "kv_backend": getattr(args, "kv_backend", "contiguous") or "contiguous",
         "dflash": getattr(args, "dflash", "off") or "off",
         "draft": draft,
@@ -175,6 +176,7 @@ def show_config(cfg):
     print("==================== serve_harness pre-flight (CONFIRM before run) ====================")
     print(f"  model         : {cfg['model']}")
     print(f"  registry tag  : {cfg['tag'] or '(none — sampling cannot be registry-resolved)'}")
+    print(f"  expert parallel: tp={cfg.get('tp') or 1}")
     print(f"  kv_mode       : {cfg['kv']}   kv_backend: {cfg.get('kv_backend', 'contiguous')}   mtp_mode: {cfg['mtp']}   mode: {cfg['mode']}")
     print(f"  dflash        : {cfg.get('dflash', 'off')}   draft: {cfg.get('draft') or '(none / filename auto-match)'}")
     print(f"  seed          : {cfg.get('seed')}   prompts_file: {cfg.get('prompts_file') or '(built-in battery)'}")
@@ -635,6 +637,8 @@ def spawn_serve(cfg, home, log):
     cli = _native_cli()
     serve_cmd = [cli, "serve", "127.0.0.1", str(cfg["port"]),
                  "--kv-backend", cfg.get("kv_backend", "contiguous")]
+    if cfg.get("tp") is not None:
+        serve_cmd.extend(["--tp", str(cfg["tp"])])
     atexit.register(_kill_serve)
     # Append-only log: prior attempts remain for debugging; proofs use per-attempt offsets.
     os.makedirs(os.path.dirname(os.path.abspath(log)) or ".", exist_ok=True)
@@ -800,6 +804,9 @@ def main():
     ap.add_argument("--kv", default="fwht3")
     ap.add_argument("--kv-backend", default="contiguous", choices=["contiguous", "vmm"],
                     help="hipfire serve --kv-backend override (default contiguous; use vmm for PR #549 path)")
+    ap.add_argument("--tp", type=int, default=None, choices=range(1, 65),
+                    help="expert-parallel degree forwarded to hipfire serve; "
+                         "omit for the existing single-GPU default")
     ap.add_argument("--mtp", default="off", choices=["off", "on", "auto"])
     ap.add_argument("--dflash", default="off", choices=["off", "auto", "on"],
                     help="DFlash mode written to temporary [speculation] TOML (default off). "

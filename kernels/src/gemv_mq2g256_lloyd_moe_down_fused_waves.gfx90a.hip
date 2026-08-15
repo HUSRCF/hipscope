@@ -34,8 +34,13 @@ void HIPFIRE_MQ2_FUSED_WAVE_KERNEL(
     __shared__ float expert_acc[8];
 
     for (int krank = wave; krank < K_TOP; krank += WAVES) {
+        const int expert_id = topk_indices[krank];
+        if (expert_id < 0) {
+            if (lane == 0) expert_acc[krank] = 0.0f;
+            continue;
+        }
         const char* A =
-            reinterpret_cast<const char*>(expert_ptrs[topk_indices[krank]]);
+            reinterpret_cast<const char*>(expert_ptrs[expert_id]);
         const float* x = rot_batch + (long long)krank * K;
         const char* row_ptr = A + (long long)row * groups * 72;
         float acc0 = 0.0f;

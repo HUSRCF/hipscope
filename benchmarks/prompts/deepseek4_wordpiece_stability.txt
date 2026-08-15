@@ -1,0 +1,5 @@
+Review the following operational note for clarity and correctness.
+
+The cache invalidation service provides at-least-once delivery. When an edge node receives a late or duplicated invalidation, it drops the named key and re-fetches the current value. A reconnecting node flushes its local cache because it cannot identify which invalidations were missed. The implementation must preserve read-your-writes behavior for pinned sessions while allowing asynchronous propagation to other nodes.
+
+Engineers should distinguish invalidation, identification, initialization, indentation, synchronization, compression, and decompression in logs and documentation. Each term has a specific meaning: identification selects an object, initialization prepares state, indentation structures code, synchronization orders concurrent work, and compression reduces stored data. Clear terminology prevents operational mistakes during compaction, rebalancing, and background hand-off.

@@ -5,6 +5,7 @@
 //! and `load_model` — the single arch-dispatch point for the daemon.
 
 mod carriers;
+mod safetensors_index;
 pub use carriers::*;
 
 /// Speculative-decode build/glue (RAII slot guard now; `DflashSpeculator` +
@@ -1501,9 +1502,26 @@ impl Drop for MinimaxEpStaging {
 /// tests the completed-rank cleanup path (which IS fixed), not this inner window.
 /// The proper fix is an unwind-safe allocation-tracking loader refactor. Deferred.
 pub fn load_model_ep(path: &str, max_seq: usize, tp: usize) -> Result<LoadedModel, String> {
-    let hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
+    let model_path = Path::new(path);
+    if model_path.is_dir() {
+        let indexed = safetensors_index::validate_indexed_safetensors_dir(model_path)?;
+        // Open only after the index proves that directory discovery equals the
+        // canonical weight_map shard whitelist.
+        let source = hipfire_runtime::safetensors_source::SafetensorsSource::open(model_path)
+            .map_err(|e| format!("safetensors open failed: {e}"))?;
+        let arch_id = source.arch_id();
+        drop(source);
+        return match arch_id {
+            9 => load_model_ep_ds4(path, max_seq, tp, Ds4EpSource::IndexedSafetensors(indexed)),
+            id => Err(format!(
+                "safetensors EP not supported for arch_id={id} (expected 9 for DeepSeek V4)"
+            )),
+        };
+    }
+
+    let hfq = HfqFile::open(model_path).map_err(|e| format!("{e}"))?;
     match hfq.arch_id {
-        9 => load_model_ep_ds4(path, max_seq, tp),
+        9 => load_model_ep_ds4(path, max_seq, tp, Ds4EpSource::Hfq),
         10 => load_model_ep_minimax(path, max_seq, tp),
         id => Err(format!(
             "EP not supported for arch_id={id} (expected 9 for DeepSeek V4 or 10 for MiniMax)"
@@ -1511,28 +1529,78 @@ pub fn load_model_ep(path: &str, max_seq: usize, tp: usize) -> Result<LoadedMode
     }
 }
 
-fn load_model_ep_ds4(path: &str, max_seq: usize, tp: usize) -> Result<LoadedModel, String> {
+enum Ds4EpSource {
+    Hfq,
+    IndexedSafetensors(safetensors_index::IndexedSafetensors),
+}
+
+fn load_model_ep_ds4(
+    path: &str,
+    max_seq: usize,
+    tp: usize,
+    source_kind: Ds4EpSource,
+) -> Result<LoadedModel, String> {
     use hipfire_runtime::arch::Architecture;
+    use hipfire_runtime::model_source::ModelSource as _;
     use hipfire_runtime::tp_shard::{ExpertAssign, ShardConfig};
 
-    let hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
-    let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
-        .map_err(|e| format!("tokenizer not found: {e}"))?;
-    let config = <deepseek4::DeepseekV4 as Architecture>::config_from_hfq(&hfq)?;
-    let arch_id = hfq.arch_id;
+    // Resolve all host metadata before allocating GPU state / capturing graphs.
+    // The safetensors directory reached this point only after index validation.
+    let source_is_dir = matches!(&source_kind, Ds4EpSource::IndexedSafetensors(_));
+    let (tokenizer, config, arch_id, chat_template, rec) = match &source_kind {
+        Ds4EpSource::Hfq => {
+            let hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
+            let tokenizer =
+                hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
+                    .map_err(|e| format!("tokenizer not found: {e}"))?;
+            let config = <deepseek4::DeepseekV4 as Architecture>::config_from_hfq(&hfq)?;
+            let arch_id = hfq.arch_id;
+            let chat_template = resolve_chat_template(&hfq, path);
+            let rec = hfq.recommended_sampling();
+            (tokenizer, config, arch_id, chat_template, rec)
+        }
+        Ds4EpSource::IndexedSafetensors(indexed) => {
+            let source =
+                hipfire_runtime::safetensors_source::SafetensorsSource::open(Path::new(path))
+                    .map_err(|e| format!("safetensors open failed: {e}"))?;
+            if source.arch_id() != 9 {
+                return Err(format!(
+                    "deepseek4: safetensors directory resolved to arch_id={}, expected 9",
+                    source.arch_id()
+                ));
+            }
+            let tok_path = source.tokenizer_json_path().ok_or_else(|| {
+                format!(
+                    "deepseek4: no tokenizer.json found in {}",
+                    Path::new(path).display()
+                )
+            })?;
+            let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_tokenizer_json(&tok_path)
+                .map_err(|e| {
+                    format!(
+                        "deepseek4: failed to parse tokenizer at {}: {e}",
+                        tok_path.display()
+                    )
+                })?
+                .ok_or_else(|| {
+                    format!(
+                        "deepseek4: failed to load tokenizer from {}",
+                        tok_path.display()
+                    )
+                })?;
+            let config = deepseek4::config_from_safetensors(&source)
+                .ok_or_else(|| "deepseek4: failed to parse config from safetensors".to_string())?;
+            let chat_template =
+                resolve_chat_template_overrides(path).or_else(|| source.chat_template());
+            eprintln!(
+                "[loader] indexed safetensors verified: shards={} tensors={}",
+                indexed.shard_count, indexed.tensor_count
+            );
+            let arch_id = source.arch_id();
+            (tokenizer, config, arch_id, chat_template, None)
+        }
+    };
     let n_exp = config.n_routed_experts;
-
-    // Host-side metadata work (chat template + author-recommended sampling) BEFORE
-    // any GPU allocation / EP hipGraph capture. `recommended_sampling()` reparses
-    // the .hfq metadata_json (serde_json::from_str); doing that post-allocation but
-    // pre-capture churns the host heap and — on gfx12 / ROCm 7.2, which snapshots
-    // buffer addresses at graph-instantiate — slows the captured EP-decode graph
-    // replay. Same regression as load_model (gfx12 A3B 99→50), mirrored here for the
-    // ds4 EP path; see project_gfx12_hipgraph_late_host_alloc_clobber. The EP graph
-    // itself (deepseek4 forward.rs begin_graph_capture) is untouched — it still
-    // captures + engages; this only settles the heap before it instantiates.
-    let chat_template = resolve_chat_template(&hfq, path);
-    let rec = hfq.recommended_sampling();
 
     let gpus =
         Gpus::init_tp(tp, config.num_hidden_layers).map_err(|e| format!("init_tp: {e:?}"))?;
@@ -1542,14 +1610,15 @@ fn load_model_ep_ds4(path: &str, max_seq: usize, tp: usize) -> Result<LoadedMode
             "init_tp gave {n} devices, expected tp={tp} (check ROCR_VISIBLE_DEVICES / HIP_VISIBLE_DEVICES)"
         ));
     }
-    eprintln!("[loader] EP load: tp={tp} arch=ds4 experts={n_exp} (rank r owns e%{tp}==r)");
-    let shard = ShardConfig::new(
-        tp,
-        /*tp_kv_replicate=*/ true,
-        n_exp,
-        ExpertAssign::Stride,
-    )
-    .map_err(|e| format!("ShardConfig: {e:?}"))?;
+    let expert_assign = if source_is_dir {
+        eprintln!("[loader] EP load: tp={tp} arch=ds4 experts={n_exp} (contiguous source experts)");
+        ExpertAssign::Contiguous
+    } else {
+        eprintln!("[loader] EP load: tp={tp} arch=ds4 experts={n_exp} (stride HFQ experts)");
+        ExpertAssign::Stride
+    };
+    let shard = ShardConfig::new(tp, /*tp_kv_replicate=*/ true, n_exp, expert_assign)
+        .map_err(|e| format!("ShardConfig: {e:?}"))?;
     // Transactional partial-load: build per-rank weights/state/partials INTO the
     // staging guard. Every `?` below early-returns while `staging` is alive, so
     // its `Drop` frees the ranks already loaded.
@@ -1560,10 +1629,24 @@ fn load_model_ep_ds4(path: &str, max_seq: usize, tp: usize) -> Result<LoadedMode
         staging.gpus_mut().devices[r]
             .bind_thread()
             .map_err(|e| format!("bind {r}: {e:?}"))?;
-        let mut h = HfqFile::open(Path::new(path)).map_err(|e| format!("reopen rank {r}: {e}"))?;
         let dev = &mut staging.gpus_mut().devices[r];
-        let w = deepseek4::DeepseekV4::load_weights_sharded(&mut h, &config, dev, &shard, r)
-            .map_err(|e| format!("shard load rank {r}: {e:?}"))?;
+        let w = match &source_kind {
+            Ds4EpSource::Hfq => {
+                let mut hfq =
+                    HfqFile::open(Path::new(path)).map_err(|e| format!("reopen rank {r}: {e}"))?;
+                deepseek4::DeepseekV4::load_weights_sharded(&mut hfq, &config, dev, &shard, r)
+                    .map_err(|e| format!("shard load rank {r}: {e:?}"))?
+            }
+            Ds4EpSource::IndexedSafetensors(_) => {
+                let source =
+                    hipfire_runtime::safetensors_source::SafetensorsSource::open(Path::new(path))
+                        .map_err(|e| format!("safetensors reopen rank {r}: {e}"))?;
+                deepseek4::DeepseekV4::load_weights_from_safetensors_sharded(
+                    &source, &config, dev, &shard, r,
+                )
+                .map_err(|e| format!("source shard load rank {r}: {e}"))?
+            }
+        };
         staging.weights.push(w);
         // Deterministic partial-load fault for testing the cleanup path. Fires
         // AFTER ranks 0..=r loaded; the guard's Drop frees them all.

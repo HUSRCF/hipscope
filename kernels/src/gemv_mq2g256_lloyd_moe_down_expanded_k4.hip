@@ -47,6 +47,12 @@ extern "C" __global__ void gemv_mq2g256_lloyd_moe_down_expanded_k4(
 
     const int routing_base = bid * K_TOP;
     const int expert_id = topk_indices[routing_base + krank];
+    if (expert_id < 0) {
+        if (tid == 0) {
+            expert_outputs[((long long)bid * K_TOP + krank) * M + row] = 0.0f;
+        }
+        return;
+    }
     const char* __restrict__ A =
         reinterpret_cast<const char*>(expert_ptrs[expert_id]);
     const float* __restrict__ x =

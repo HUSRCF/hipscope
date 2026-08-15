@@ -16,7 +16,9 @@ void gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexed_gfx90a(
     if (row >= M) return;
     const int krank = blockIdx.y;
     const int lane = threadIdx.x;
-    const char* A = reinterpret_cast<const char*>(expert_ptrs[topk_indices[krank]]);
+    const int expert_id = topk_indices[krank];
+    if (expert_id < 0) return;
+    const char* A = reinterpret_cast<const char*>(expert_ptrs[expert_id]);
     const float* x = rot_batch + (long long)krank * K;
     const int groups = K / 256;
     const char* row_ptr = A + (long long)row * groups * 72;

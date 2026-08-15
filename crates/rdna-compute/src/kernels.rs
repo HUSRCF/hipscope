@@ -1886,6 +1886,16 @@ pub const GEMV_HFQ4G256_MOE_DOWN_INDEXED_BATCHED_SRC: &str =
 pub const GEMV_HFQ4G256_MOE_DOWN_INDEXED_BATCHED_WAVE64_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq4g256_moe_down_indexed_batched_wave64.hip");
 
+/// gfx90a/wave64 indexed MoE gate+up over the released DeepSeek-V4
+/// FP4 E2M1 + UE8M0/G32 expert representation reframed as HFP4G32.
+pub const GEMV_HFP4G32_MOE_GATE_UP_INDEXED_BATCHED_WAVE64_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfp4g32_moe_gate_up_indexed_batched_wave64.hip");
+
+/// gfx90a/wave64 indexed MoE down + scaled residual over released
+/// DeepSeek-V4 FP4 experts. Consumes the plain post-SwiGLU activation.
+pub const GEMV_HFP4G32_MOE_DOWN_INDEXED_BATCHED_WAVE64_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfp4g32_moe_down_indexed_batched_wave64.hip");
+
 /// Atomic-free batched indexed MoE down — writes per-(token, krank) row into
 /// an expanded [N × K_TOP × M] output buffer instead of atomicAdd'ing into
 /// a shared residual row. Pairs with `MOE_DOWN_COMBINE_K8_BATCHED_SRC`.
@@ -4843,6 +4853,8 @@ pub const GEMV_MQ2G256_LLOYD_MOE_GATE_UP_INDEXED_SRC: &str =
     include_str!("../../../kernels/src/gemv_mq2g256_lloyd_moe_gate_up_indexed.hip");
 pub const GEMV_MQ2G256_LLOYD_MOE_GATE_UP_INDEXED_GFX90A_SRC: &str =
     include_str!("../../../kernels/src/gemv_mq2g256_lloyd_moe_gate_up_indexed.gfx90a.hip");
+pub const DEEPSEEK4_MASK_TOPK_OWNED_SRC: &str =
+    include_str!("../../../kernels/src/deepseek4_mask_topk_owned.hip");
 pub const GEMV_MQ2G256_LLOYD_MOE_GATE_UP_INDEXED_ROW2_GFX90A_SRC: &str =
     include_str!("../../../kernels/src/gemv_mq2g256_lloyd_moe_gate_up_indexed_row2.gfx90a.hip");
 pub const GEMV_MQ2G256_I8DOT_AFFINE_MOE_GATE_UP_ROW1_GFX90A_SRC: &str = concat!(
@@ -4975,9 +4987,13 @@ pub const GEMV_MQ2G256_LLOYD_MOE_DOWN_FUSED_WAVE4_GFX90A_SRC: &str = concat!(
 /// 112 B/group). X must be FWHT-pre-rotated by the caller.
 pub const GEMV_MQ3G256_LLOYD_MOE_GATE_UP_INDEXED_SRC: &str =
     include_str!("../../../kernels/src/gemv_mq3g256_lloyd_moe_gate_up_indexed.hip");
+pub const GEMV_MQ3G256_LLOYD_MOE_GATE_UP_INDEXED_GFX90A_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mq3g256_lloyd_moe_gate_up_indexed.gfx90a.hip");
 
 pub const GEMV_MQ3G256_LLOYD_MOE_DOWN_INDEXED_SRC: &str =
     include_str!("../../../kernels/src/gemv_mq3g256_lloyd_moe_down_indexed.hip");
+pub const GEMV_MQ3G256_LLOYD_MOE_DOWN_INDEXED_GFX90A_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mq3g256_lloyd_moe_down_indexed.gfx90a.hip");
 
 /// Strict superset of fused_rmsnorm_mq_rotate that ALSO writes the
 /// plain (non-FWHT) RMSNormed output to a second buffer. Eliminates the
@@ -5066,6 +5082,9 @@ pub const INDEXER_KV_GATHER_SRC: &str = include_str!("../../../kernels/src/index
 pub const HC_COMPUTE_CONTROL_SRC: &str =
     include_str!("../../../kernels/src/hc_compute_control.hip");
 
+pub const HC_COMPUTE_CONTROL_F32WEIGHTS_SRC: &str =
+    include_str!("../../../kernels/src/hc_compute_control_f32weights.hip");
+
 pub const HC_SINKHORN_4X4_SRC: &str = include_str!("../../../kernels/src/hc_sinkhorn_4x4.hip");
 
 pub const HC_MIX_4STREAM_SRC: &str = include_str!("../../../kernels/src/hc_mix_4stream.hip");
@@ -5073,6 +5092,9 @@ pub const HC_MIX_4STREAM_SRC: &str = include_str!("../../../kernels/src/hc_mix_4
 pub const HC_INPUT_MAP_SRC: &str = include_str!("../../../kernels/src/hc_input_map.hip");
 
 pub const HC_APPLY_ALPHA_SRC: &str = include_str!("../../../kernels/src/hc_apply_alpha.hip");
+
+pub const HC_APPLY_ALPHA_F32WEIGHTS_SRC: &str =
+    include_str!("../../../kernels/src/hc_apply_alpha_f32weights.hip");
 
 pub const SQRT_SOFTPLUS_F32_SRC: &str = include_str!("../../../kernels/src/sqrt_softplus_f32.hip");
 
@@ -5192,11 +5214,17 @@ pub const ROPE_TAIL_YARN_INTERLEAVED_BATCHED_SRC: &str =
 pub const HC_COMPUTE_CONTROL_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/hc_compute_control_batched.hip");
 
+pub const HC_COMPUTE_CONTROL_BATCHED_F32WEIGHTS_SRC: &str =
+    include_str!("../../../kernels/src/hc_compute_control_batched_f32weights.hip");
+
 /// HC α-scaling post-step — BATCHED (Phase B2, 2026-05-18). Per-batch
 /// in-place rescale of c[b, 0..24] using the shared 3-segment α + base.
 pub const HC_APPLY_ALPHA_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/hc_apply_alpha_batched.hip");
 
+
+pub const HC_APPLY_ALPHA_BATCHED_F32WEIGHTS_SRC: &str =
+    include_str!("../../../kernels/src/hc_apply_alpha_batched_f32weights.hip");
 /// HC Sinkhorn 4×4 — BATCHED (Phase B2, 2026-05-18). Per-batch
 /// independent Sinkhorn iterations on each 4×4 matrix slot.
 pub const HC_SINKHORN_4X4_BATCHED_SRC: &str =
@@ -5338,6 +5366,8 @@ pub const COMPRESSOR_RING_WRITE_BATCHED_SRC: &str =
 /// as the sequential per-position path.
 pub const COMPRESSOR_ADD_APE_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/compressor_add_ape_batched.hip");
+pub const COMPRESSOR_ADD_APE_POS_BUF_SRC: &str =
+    include_str!("../../../kernels/src/compressor_add_ape_pos_buf.hip");
 
 /// K4-unrolled batched MoE gate_up for MQ2-Lloyd (Phase 1, 2026-05-19).
 /// 4 independent accumulators per thread for ILP; mirrors qwen35's
@@ -5368,6 +5398,9 @@ pub const GEMV_MQ3G256_LLOYD_MOE_DOWN_INDEXED_BATCHED_K4_SRC: &str =
 /// 4-stream → hidden projection before lm_head.
 pub const HC_HEAD_COMPUTE_PRE_SRC: &str =
     include_str!("../../../kernels/src/hc_head_compute_pre.hip");
+
+pub const HC_HEAD_COMPUTE_PRE_F32WEIGHTS_SRC: &str =
+    include_str!("../../../kernels/src/hc_head_compute_pre_f32weights.hip");
 
 /// DeepSeek V4 Compressor softmax-weighted pool along window dim.
 /// Used in Compressor.forward when should_compress fires every

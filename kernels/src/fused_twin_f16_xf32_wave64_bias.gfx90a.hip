@@ -14,6 +14,8 @@ extern "C" __global__ void fused_twin_f16_xf32_wave64_bias_gfx90a(
     float* __restrict__ y0,
     float* __restrict__ y1,
     const float* __restrict__ bias1,
+    const int* __restrict__ pos_buf,
+    int ratio,
     int m0,
     int m1,
     int K
@@ -54,7 +56,9 @@ extern "C" __global__ void fused_twin_f16_xf32_wave64_bias_gfx90a(
 
     if (lane == 0) {
         if (second) {
-            y1[out_row] = sum + bias1[out_row];
+            int bias_row = pos_buf[0] % ratio;
+            if (bias_row < 0) bias_row += ratio;
+            y1[out_row] = sum + bias1[(size_t)bias_row * m1 + out_row];
         } else {
             y0[out_row] = sum;
         }

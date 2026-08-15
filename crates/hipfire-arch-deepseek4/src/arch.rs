@@ -23,9 +23,9 @@ use hipfire_reap::hook::ReapArchHook;
 use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::model_source::ModelSource;
-use hipfire_runtime::safetensors_source::{bf16_bytes_to_f16, bf16_to_f32};
+use hipfire_runtime::safetensors_source::bf16_to_f32;
 use rayon::prelude::*;
-use rdna_compute::Gpu;
+use rdna_compute::{DType, Gpu};
 
 /// Type marker for DeepSeek V4 Flash. `arch_id = 9` — next free slot
 /// after `8 = Qwen2-VL (dots.ocr)` reserved in `docs/architecture-ids.md`.
@@ -149,6 +149,69 @@ impl DeepseekV4 {
         Ok(t)
     }
 
+    fn routed_expert_dtype(
+        name: &str,
+        quant_type: u8,
+        group_size: u32,
+    ) -> Result<rdna_compute::DType, String> {
+        if group_size != 256 {
+            return Err(format!(
+                "deepseek4: routed expert '{name}' requires group_size=256, got {group_size}"
+            ));
+        }
+        match quant_type {
+            13 => Ok(rdna_compute::DType::MQ4G256),
+            19 => Ok(rdna_compute::DType::MQ2G256Lloyd),
+            20 => Ok(rdna_compute::DType::MQ3G256Lloyd),
+            30 => Err(format!(
+                "deepseek4: routed expert '{name}' uses MQ4-Lloyd qt=30, but no indexed DeepSeek4 MoE kernel supports that layout"
+            )),
+            other => Err(format!(
+                "deepseek4: routed expert '{name}' has unsupported quant_type={other}; expected MQ4 qt=13, MQ2-Lloyd qt=19, or MQ3-Lloyd qt=20"
+            )),
+        }
+    }
+
+    fn validate_routed_expert_layout(
+        name: &str,
+        dtype: rdna_compute::DType,
+        shape: &[u32],
+        data_size: usize,
+    ) -> Result<(), String> {
+        if shape.len() != 2 {
+            return Err(format!(
+                "deepseek4: routed expert '{name}' must be rank-2, got shape {shape:?}"
+            ));
+        }
+        let rows = shape[0] as usize;
+        let cols = shape[1] as usize;
+        if cols == 0 || cols % 256 != 0 {
+            return Err(format!(
+                "deepseek4: routed expert '{name}' requires non-zero K divisible by 256, got shape {shape:?}"
+            ));
+        }
+        let bytes_per_group = match dtype {
+            rdna_compute::DType::MQ4G256 => 136usize,
+            rdna_compute::DType::MQ2G256Lloyd => 72,
+            rdna_compute::DType::MQ3G256Lloyd => 112,
+            other => {
+                return Err(format!(
+                    "deepseek4: routed expert '{name}' has no packed-layout validator for {other:?}"
+                ))
+            }
+        };
+        let expected = rows
+            .checked_mul(cols / 256)
+            .and_then(|groups| groups.checked_mul(bytes_per_group))
+            .ok_or_else(|| format!("deepseek4: routed expert '{name}' byte-size overflow"))?;
+        if data_size != expected {
+            return Err(format!(
+                "deepseek4: routed expert '{name}' byte size {data_size} != expected {expected} for {dtype:?} shape {shape:?}"
+            ));
+        }
+        Ok(())
+    }
+
     /// Upload routed-expert blobs for one "layer-shaped" block (a normal
     /// transformer layer or the MTP layer). Mirrors the original
     /// inline logic but is parameterized on `prefix` so the same code
@@ -208,6 +271,18 @@ impl DeepseekV4 {
         if n_owned == 0 {
             return Err(format!("deepseek4: {prefix} shard rank owns no experts"));
         }
+        if shard.is_some()
+            && n_owned < n_exp
+            && hipfire_config::developer_var("HIPFIRE_EP_OWNER_MASK").as_deref() != Ok("0")
+        {
+            let mask: Vec<u8> = (0..n_exp).map(|e| u8::from(owns(e))).collect();
+            layer.expert_owned_mask = Some(
+                gpu.upload_raw(&mask, &[n_exp])
+                    .map_err(|e| format!("deepseek4: upload ownership mask {prefix}: {e:?}"))?,
+            );
+        }
+
+        let gate_shape_from_down: Vec<u32>;
 
         // w2 (down): pread each expert; pack ONLY owned into a layer-local host
         // Vec, then one upload. Non-owned experts are read for stride
@@ -219,6 +294,12 @@ impl DeepseekV4 {
                 .ok_or_else(|| format!("deepseek4: missing {name0}"))?;
             let stride = info0.data_size;
             let shape0: Vec<usize> = info0.shape.iter().map(|&s| s as usize).collect();
+            let down_dtype = Self::routed_expert_dtype(&name0, info0.quant_type, info0.group_size)?;
+            Self::validate_routed_expert_layout(&name0, down_dtype, &info0.shape, info0.data_size)?;
+            let down_quant_type = info0.quant_type;
+            let down_group_size = info0.group_size;
+            let down_shape = info0.shape.clone();
+            gate_shape_from_down = vec![down_shape[1], down_shape[0]];
             drop(_b0);
 
             let mut blob = Vec::with_capacity(stride * n_owned);
@@ -234,10 +315,21 @@ impl DeepseekV4 {
                 let (info, bytes) = hfq
                     .tensor_data_pread(&name)
                     .ok_or_else(|| format!("deepseek4: missing {name}"))?;
-                if info.data_size != stride {
+                if info.quant_type != down_quant_type
+                    || info.group_size != down_group_size
+                    || info.shape != down_shape
+                    || info.data_size != stride
+                {
                     return Err(format!(
-                        "deepseek4: {name} size {} != stride {}",
-                        info.data_size, stride
+                        "deepseek4: {name} metadata mismatch: qt={} group={} shape={:?} size={}; expected qt={} group={} shape={:?} size={}",
+                        info.quant_type,
+                        info.group_size,
+                        info.shape,
+                        info.data_size,
+                        down_quant_type,
+                        down_group_size,
+                        down_shape,
+                        stride,
                     ));
                 }
                 blob.extend_from_slice(&bytes);
@@ -270,6 +362,7 @@ impl DeepseekV4 {
             layer.expert_w2_blob = Some(blob_tensor);
             layer.expert_w2_ptrs = Some(ptr_tensor);
             layer.expert_w2_stride = stride;
+            layer.expert_down_dtype = Some(down_dtype);
         }
         // gate_up (combined w1 ‖ w3): per-expert pread, pack ONLY owned, single
         // upload. Non-owned ptr → a shared ZEROED dummy gate_up buffer.
@@ -279,6 +372,28 @@ impl DeepseekV4 {
             let (w1_info0, _b1) = hfq
                 .tensor_data_pread(&w1_0)
                 .ok_or_else(|| format!("deepseek4: missing {w1_0}"))?;
+            if w1_info0.shape.len() != 2 {
+                return Err(format!(
+                    "deepseek4: {w1_0} expected rank-2 expert matrix, got {:?}",
+                    w1_info0.shape
+                ));
+            }
+            let gate_dtype =
+                Self::routed_expert_dtype(&w1_0, w1_info0.quant_type, w1_info0.group_size)?;
+            Self::validate_routed_expert_layout(
+                &w1_0,
+                gate_dtype,
+                &w1_info0.shape,
+                w1_info0.data_size,
+            )?;
+            let gate_quant_type = w1_info0.quant_type;
+            let gate_group_size = w1_info0.group_size;
+            let gate_shape = w1_info0.shape.clone();
+            if gate_shape != gate_shape_from_down {
+                return Err(format!(
+                    "deepseek4: {prefix} routed projection shape mismatch: gate/up {gate_shape:?}, expected {gate_shape_from_down:?} from transposed down projection"
+                ));
+            }
             let stride_w1 = w1_info0.data_size;
             let gate_rows = w1_info0.shape[0] as usize;
             let hidden = w1_info0.shape[1] as usize;
@@ -286,6 +401,30 @@ impl DeepseekV4 {
             let (w3_info0, _b3) = hfq
                 .tensor_data_pread(&w3_0)
                 .ok_or_else(|| format!("deepseek4: missing {w3_0}"))?;
+            let up_dtype =
+                Self::routed_expert_dtype(&w3_0, w3_info0.quant_type, w3_info0.group_size)?;
+            Self::validate_routed_expert_layout(
+                &w3_0,
+                up_dtype,
+                &w3_info0.shape,
+                w3_info0.data_size,
+            )?;
+            if up_dtype != gate_dtype
+                || w3_info0.shape != gate_shape
+                || w3_info0.data_size != stride_w1
+            {
+                return Err(format!(
+                    "deepseek4: {prefix} w1/w3 metadata mismatch: w1 qt={} group={} shape={:?} size={}; w3 qt={} group={} shape={:?} size={}",
+                    gate_quant_type,
+                    gate_group_size,
+                    gate_shape,
+                    stride_w1,
+                    w3_info0.quant_type,
+                    w3_info0.group_size,
+                    w3_info0.shape,
+                    w3_info0.data_size,
+                ));
+            }
             let stride_w3 = w3_info0.data_size;
             drop(_b3);
             if stride_w1 != stride_w3 {
@@ -306,28 +445,58 @@ impl DeepseekV4 {
                 }
                 let w1_name = format!("{prefix}.ffn.experts.{}.w1.weight", src(e));
                 {
-                    let (_, w1_bytes) = hfq
+                    let (w1_info, w1_bytes) = hfq
                         .tensor_data_pread(&w1_name)
                         .ok_or_else(|| format!("deepseek4: missing {w1_name}"))?;
+                    if w1_info.quant_type != gate_quant_type
+                        || w1_info.group_size != gate_group_size
+                        || w1_info.shape != gate_shape
+                        || w1_info.data_size != stride_w1
+                    {
+                        return Err(format!(
+                            "deepseek4: {w1_name} metadata differs from layer gate projection: qt={} group={} shape={:?} size={}",
+                            w1_info.quant_type,
+                            w1_info.group_size,
+                            w1_info.shape,
+                            w1_info.data_size,
+                        ));
+                    }
                     combined.extend_from_slice(&w1_bytes);
                 }
                 let w3_name = format!("{prefix}.ffn.experts.{}.w3.weight", src(e));
                 {
-                    let (_, w3_bytes) = hfq
+                    let (w3_info, w3_bytes) = hfq
                         .tensor_data_pread(&w3_name)
                         .ok_or_else(|| format!("deepseek4: missing {w3_name}"))?;
+                    if w3_info.quant_type != gate_quant_type
+                        || w3_info.group_size != gate_group_size
+                        || w3_info.shape != gate_shape
+                        || w3_info.data_size != stride_w3
+                    {
+                        return Err(format!(
+                            "deepseek4: {w3_name} metadata differs from layer up projection: qt={} group={} shape={:?} size={}",
+                            w3_info.quant_type,
+                            w3_info.group_size,
+                            w3_info.shape,
+                            w3_info.data_size,
+                        ));
+                    }
                     combined.extend_from_slice(&w3_bytes);
                 }
             }
-            let combined = maybe_transcode_gate_up_i8dot(
-                combined,
-                &gpu.arch,
-                prefix,
-                n_owned,
-                combined_stride,
-                2 * gate_rows,
-                hidden,
-            )?;
+            let combined = if gate_dtype == rdna_compute::DType::MQ2G256Lloyd {
+                maybe_transcode_gate_up_i8dot(
+                    combined,
+                    &gpu.arch,
+                    prefix,
+                    n_owned,
+                    combined_stride,
+                    2 * gate_rows,
+                    hidden,
+                )?
+            } else {
+                combined
+            };
             let combined_tensor = gpu
                 .upload_raw(&combined, &[n_owned, combined_stride])
                 .map_err(|e| format!("deepseek4: upload gate_up {prefix}: {e:?}"))?;
@@ -373,6 +542,7 @@ impl DeepseekV4 {
             layer.expert_gate_up_blob = Some(combined_tensor);
             layer.expert_gate_up_ptrs = Some(ptr_tensor);
             layer.expert_gate_up_stride = combined_stride;
+            layer.expert_gate_up_dtype = Some(gate_dtype);
             // Store the owning handle (None on single-GPU / fully-owned shards).
             // Its device pointer is already baked into `ptr_tensor` above.
             layer.expert_gate_up_dummy = dummy_gate_up;
@@ -380,10 +550,9 @@ impl DeepseekV4 {
         Ok(())
     }
 
-    /// Upload an F16-on-disk HFQ tensor as F32 on GPU. Used for norms
-    /// where the kernel side (rmsnorm_f32) expects F32 weight, but the
-    /// quantizer stored F16 bytes. The conversion cost is one host-side
-    /// f16→f32 pass; norms are tiny (~4 KB each) so this is negligible.
+    /// Upload an F16- or F32-on-disk HFQ tensor as F32 on GPU. Legacy
+    /// DeepSeek V4 quants stored small non-matmul tensors as F16, while
+    /// source-precision quants and overlays preserve selected F32 tensors.
     fn upload_global_f16_as_f32(
         hfq: &HfqFile,
         gpu: &mut Gpu,
@@ -394,21 +563,24 @@ impl DeepseekV4 {
             .ok_or_else(|| format!("deepseek4: tensor '{name}' missing in HFQ"))?;
         let shape: Vec<usize> = info.shape.iter().map(|&s| s as usize).collect();
         let n: usize = shape.iter().product();
-        if bytes.len() != n * 2 {
-            return Err(format!(
-                "deepseek4: '{name}' expected F16 bytes ({} = 2 × {}), got {}",
-                n * 2,
-                n,
-                bytes.len()
-            ));
-        }
-        let f32_vals: Vec<f32> = (0..n)
-            .map(|i| {
-                let lo = bytes[i * 2];
-                let hi = bytes[i * 2 + 1];
-                hipfire_runtime::llama::f16_to_f32(u16::from_le_bytes([lo, hi]))
-            })
-            .collect();
+        let f32_vals: Vec<f32> = match info.quant_type {
+            1 if bytes.len() == n * 2 => bytes
+                .chunks_exact(2)
+                .map(|b| hipfire_runtime::llama::f16_to_f32(u16::from_le_bytes([b[0], b[1]])))
+                .collect(),
+            2 if bytes.len() == n * 4 => bytes
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect(),
+            qt => {
+                return Err(format!(
+                    "deepseek4: '{name}' expected F16 qt=1 ({} bytes) or F32 qt=2 ({} bytes), got qt={qt} bytes={}",
+                    n * 2,
+                    n * 4,
+                    bytes.len()
+                ))
+            }
+        };
         gpu.upload_f32(&f32_vals, &shape)
             .map_err(|e| format!("deepseek4: upload f16→f32 '{name}' failed: {e:?}"))
     }
@@ -440,7 +612,7 @@ impl DeepseekV4 {
     }
 
     /// REAP keep-map variant of `upload_global_f16_as_f32`: gather kept rows
-    /// of an F16 `[n_orig, ..]` (or `[n_orig]`) tensor, then decode to F32.
+    /// of an F16/F32 `[n_orig, ..]` (or `[n_orig]`) tensor as F32.
     fn upload_global_f16_as_f32_keep(
         hfq: &HfqFile,
         gpu: &mut Gpu,
@@ -451,13 +623,22 @@ impl DeepseekV4 {
             .tensor_data_pread(name)
             .ok_or_else(|| format!("deepseek4: tensor '{name}' missing in HFQ"))?;
         let orig_rows = *info.shape.first().unwrap_or(&0) as usize;
-        if orig_rows == 0 || bytes.len() % (orig_rows * 2) != 0 {
+        let element_bytes = match info.quant_type {
+            1 => 2,
+            2 => 4,
+            qt => {
+                return Err(format!(
+                    "deepseek4: '{name}' keep-gather expected F16/F32, got qt={qt}"
+                ))
+            }
+        };
+        if orig_rows == 0 || bytes.len() % (orig_rows * element_bytes) != 0 {
             return Err(format!(
-                "deepseek4: '{name}' f16 keep-gather: {orig_rows} rows × 2B don't divide {} bytes",
-                bytes.len()
+                "deepseek4: '{name}' keep-gather: {orig_rows} rows × {element_bytes}B don't divide {} bytes",
+                bytes.len(),
             ));
         }
-        let per_row = bytes.len() / (orig_rows * 2); // f16 elems per row
+        let per_row = bytes.len() / (orig_rows * element_bytes);
         let mut f32_vals: Vec<f32> = Vec::with_capacity(per_row * keep.len());
         for &oe in keep {
             let oe = oe as usize;
@@ -466,13 +647,15 @@ impl DeepseekV4 {
                     "deepseek4: '{name}' keep idx {oe} >= rows {orig_rows}"
                 ));
             }
-            let base = oe * per_row * 2;
+            let base = oe * per_row * element_bytes;
             for j in 0..per_row {
-                let lo = bytes[base + j * 2];
-                let hi = bytes[base + j * 2 + 1];
-                f32_vals.push(hipfire_runtime::llama::f16_to_f32(u16::from_le_bytes([
-                    lo, hi,
-                ])));
+                let p = base + j * element_bytes;
+                let value = if element_bytes == 2 {
+                    hipfire_runtime::llama::f16_to_f32(u16::from_le_bytes([bytes[p], bytes[p + 1]]))
+                } else {
+                    f32::from_le_bytes([bytes[p], bytes[p + 1], bytes[p + 2], bytes[p + 3]])
+                };
+                f32_vals.push(value);
             }
         }
         let mut shape: Vec<usize> = info.shape.iter().map(|&s| s as usize).collect();
@@ -1049,9 +1232,9 @@ impl DeepseekV4 {
                 layer.gate_bias = Some(bias_gpu);
             } else {
                 // Hash-routed layer: read `tid2eid` lookup table (I32 raw
-                // bytes) if present. Pre-FP4-fix HFQs skipped this tensor
-                // at quant time, in which case forward falls back to
-                // shared-only on hash layers (current default behaviour).
+                // bytes) if present. Pre-FP4-fix HFQs skipped this tensor;
+                // forward now fails closed instead of silently running the
+                // numerically-invalid shared-only fallback.
                 let tid_name = format!("layers.{l}.ffn.gate.tid2eid");
                 if let Some((info, file_bytes)) = hfq.tensor_data_pread(&tid_name) {
                     // Under a REAP keep-map the hash table is REMAPPED (pruned
@@ -1713,26 +1896,416 @@ impl DeepseekV4 {
 
 // ── ModelSource (safetensors) load helpers ──────────────────────
 
+/// CPU conversion pool for the official source checkpoint. HIP objects remain
+/// on the daemon thread; only independent host rows/chunks enter this pool.
+/// Four workers match the four EP ranks without violating Gpu's non-Send
+/// Redline/AQL ownership. Override for bring-up with
+/// HIPFIRE_DEEPSEEK4_SOURCE_LOAD_THREADS.
+fn source_load_pool() -> &'static rayon::ThreadPool {
+    static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        let threads = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_SOURCE_LOAD_THREADS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(4)
+            .clamp(1, 64);
+        eprintln!("[deepseek4 source] host conversion workers={threads}");
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .thread_name(|idx| format!("ds4-source-load-{idx}"))
+            .build()
+            .expect("deepseek4 source conversion pool")
+    })
+}
+
 impl DeepseekV4 {
-    /// Determine whether a tensor's bytes represent F16 values or a
-    /// quantized format by comparing the byte count against the
-    /// expected sizes. Returns `(is_f16, is_q8_0)`.
-    fn classify_tensor_bytes(bytes: &[u8], numel: usize, dtype: &str) -> (bool, bool) {
-        // BF16 has 2 bytes/element just like F16, so explicitly exclude it
-        // from the heuristic — the caller already knows the dtype.
-        if dtype == "BF16" {
-            return (false, false);
+    /// Reframe the released DeepSeek-V4 packed expert representation as
+    /// HFP4G32 without changing a single E2M1 code or UE8M0 scale byte.
+    ///
+    /// Source rows are split across two tensors:
+    /// - weight: `[rows, logical_k / 2]` packed low/high E2M1 nibbles;
+    /// - scale:  `[rows, logical_k / 32]` UE8M0 bytes.
+    ///
+    /// HFP4G32 stores the same 32-value blocks as
+    /// `[scale:u8][16 packed nibble bytes]`, preceded by a 16-byte row header.
+    /// Setting the HFP4 row scale to exactly `1.0` makes this a byte-only
+    /// permutation, not a re-quantization.
+    fn reframe_source_fp4_as_hfp4g32(
+        weight_bytes: &[u8],
+        scale_bytes: &[u8],
+        rows: usize,
+        logical_k: usize,
+        name: &str,
+    ) -> Result<Vec<u8>, String> {
+        if logical_k == 0 || logical_k % 32 != 0 {
+            return Err(format!(
+                "deepseek4: '{name}' source FP4 logical K must be a positive multiple of 32, got {logical_k}"
+            ));
         }
-        let is_f16 = bytes.len() == numel * 2;
-        // Q8_0: 34 bytes per block of 32 elements:
-        //   [f16 scale (2 bytes)] [32 × i8 (32 bytes)]
-        let q8_0_expected = ((numel + 31) / 32) * 34;
-        let is_q8_0 = !is_f16 && bytes.len() == q8_0_expected;
-        (is_f16, is_q8_0)
+        let packed_k = logical_k / 2;
+        let blocks_per_row = logical_k / 32;
+        let expected_weight = rows
+            .checked_mul(packed_k)
+            .ok_or_else(|| format!("deepseek4: '{name}' source FP4 weight size overflow"))?;
+        let expected_scale = rows
+            .checked_mul(blocks_per_row)
+            .ok_or_else(|| format!("deepseek4: '{name}' source FP4 scale size overflow"))?;
+        if weight_bytes.len() != expected_weight || scale_bytes.len() != expected_scale {
+            return Err(format!(
+                "deepseek4: '{name}' source FP4 bytes mismatch: weight={} (expected {expected_weight}), scale={} (expected {expected_scale})",
+                weight_bytes.len(),
+                scale_bytes.len(),
+            ));
+        }
+        let block_count = u16::try_from(blocks_per_row).map_err(|_| {
+            format!(
+                "deepseek4: '{name}' source FP4 block count {blocks_per_row} exceeds HFP4G32 header capacity"
+            )
+        })?;
+        let row_bytes = 16 + blocks_per_row * 17;
+        let mut out = vec![0_u8; rows * row_bytes];
+        let one_f16 = hipfire_runtime::llama::f32_to_f16(1.0).to_le_bytes();
+        source_load_pool().install(|| {
+            out.par_chunks_exact_mut(row_bytes)
+                .enumerate()
+                .try_for_each(|(row, dst_row)| -> Result<(), String> {
+                    dst_row[0..2].copy_from_slice(&one_f16);
+                    dst_row[4..6].copy_from_slice(&block_count.to_le_bytes());
+                    // row_scale_b, format_flags and reserved bytes stay zero.
+                    let src_weight_row = &weight_bytes[row * packed_k..(row + 1) * packed_k];
+                    let src_scale_row =
+                        &scale_bytes[row * blocks_per_row..(row + 1) * blocks_per_row];
+                    for block in 0..blocks_per_row {
+                        let dst = 16 + block * 17;
+                        let src = block * 16;
+                        let scale = src_scale_row[block];
+                        if scale == u8::MAX {
+                            return Err(format!(
+                                "deepseek4: '{name}' source FP4 contains reserved UE8M0 NaN scale at row {row}, block {block}"
+                            ));
+                        }
+                        if scale == 0
+                            && src_weight_row[src..src + 16].iter().any(|&packed| {
+                                packed & 0x0f != 0 && packed & 0x0f != 8
+                                    || packed >> 4 != 0 && packed >> 4 != 8
+                            })
+                        {
+                            return Err(format!(
+                                "deepseek4: '{name}' source FP4 uses UE8M0 exponent 0 with a non-zero E2M1 code at row {row}, block {block}; HFP4G32 reserves exponent 0 for an exact zero block"
+                            ));
+                        }
+                        dst_row[dst] = scale;
+                        dst_row[dst + 1..dst + 17]
+                            .copy_from_slice(&src_weight_row[src..src + 16]);
+                    }
+                    Ok(())
+                })
+        })?;
+        Ok(out)
     }
 
-    /// Upload a tensor verbatim (raw bytes) from ModelSource to GPU.
-    /// Mirrors `upload_global_raw` but sources from `&dyn ModelSource`.
+    /// Read one released FP4 expert matrix and losslessly reframe it as
+    /// HFP4G32. The returned logical shape restores the packed source K
+    /// dimension (`I8 [M, K/2]` -> `[M, K]`).
+    fn source_fp4_matrix_as_hfp4g32(
+        source: &dyn ModelSource,
+        weight_name: &str,
+    ) -> Result<(Vec<u8>, Vec<usize>), String> {
+        let (weight_info, weight_bytes) = source
+            .tensor_data(weight_name)
+            .ok_or_else(|| format!("deepseek4: tensor '{weight_name}' missing in source"))?;
+        if weight_info.dtype != "I8" || weight_info.shape.len() != 2 {
+            return Err(format!(
+                "deepseek4: '{weight_name}' official FP4 weight must be rank-2 I8 packed nibbles, got dtype={} shape={:?}",
+                weight_info.dtype, weight_info.shape
+            ));
+        }
+        let rows = weight_info.shape[0];
+        let logical_k = weight_info.shape[1]
+            .checked_mul(2)
+            .ok_or_else(|| format!("deepseek4: '{weight_name}' logical K overflow"))?;
+        let stem = weight_name.strip_suffix(".weight").ok_or_else(|| {
+            format!(
+                "deepseek4: FP4 tensor '{weight_name}' does not end in .weight; cannot resolve scale sibling"
+            )
+        })?;
+        let scale_name = format!("{stem}.scale");
+        let (scale_info, scale_bytes) = source.tensor_data(&scale_name).ok_or_else(|| {
+            format!("deepseek4: FP4 tensor '{weight_name}' is missing {scale_name}")
+        })?;
+        let expected_scale_shape = vec![rows, logical_k.div_ceil(32)];
+        if scale_info.dtype != "F8_E8M0" || scale_info.shape != expected_scale_shape {
+            return Err(format!(
+                "deepseek4: '{weight_name}' scale {scale_name} must be F8_E8M0 {:?}, got dtype={} shape={:?}",
+                expected_scale_shape, scale_info.dtype, scale_info.shape
+            ));
+        }
+        let reframed = Self::reframe_source_fp4_as_hfp4g32(
+            weight_bytes,
+            scale_bytes,
+            rows,
+            logical_k,
+            weight_name,
+        )?;
+        Ok((reframed, vec![rows, logical_k]))
+    }
+
+    fn source_float_to_f16_bytes(
+        dtype: &str,
+        bytes: &[u8],
+        numel: usize,
+        name: &str,
+    ) -> Result<Vec<u8>, String> {
+        let bytes_per_element = match dtype {
+            "F16" | "BF16" => 2,
+            "F32" => 4,
+            other => {
+                return Err(format!(
+                    "deepseek4: '{name}' expected F16/BF16/F32 source, got {other}"
+                ));
+            }
+        };
+        let expected = numel
+            .checked_mul(bytes_per_element)
+            .ok_or_else(|| format!("deepseek4: '{name}' source byte count overflow"))?;
+        if bytes.len() != expected {
+            return Err(format!(
+                "deepseek4: '{name}' dtype={dtype} byte size {} != {bytes_per_element} × {numel}",
+                bytes.len()
+            ));
+        }
+        if dtype == "F16" {
+            return Ok(bytes.to_vec());
+        }
+
+        const CHUNK_ELEMS: usize = 1 << 18;
+        let mut out = vec![0_u8; numel * 2];
+        source_load_pool().install(|| {
+            out.par_chunks_mut(CHUNK_ELEMS * 2)
+                .enumerate()
+                .for_each(|(chunk_idx, dst)| {
+                    let chunk_elems = dst.len() / 2;
+                    let src_start = chunk_idx * CHUNK_ELEMS * bytes_per_element;
+                    let src_end = src_start + chunk_elems * bytes_per_element;
+                    let src = &bytes[src_start..src_end];
+                    match dtype {
+                        "BF16" => {
+                            for (dst_half, src_word) in
+                                dst.chunks_exact_mut(2).zip(src.chunks_exact(2))
+                            {
+                                let value =
+                                    bf16_to_f32(u16::from_le_bytes([src_word[0], src_word[1]]));
+                                dst_half.copy_from_slice(
+                                    &hipfire_runtime::llama::f32_to_f16(value).to_le_bytes(),
+                                );
+                            }
+                        }
+                        "F32" => {
+                            for (dst_half, src_word) in
+                                dst.chunks_exact_mut(2).zip(src.chunks_exact(4))
+                            {
+                                let value = f32::from_le_bytes([
+                                    src_word[0],
+                                    src_word[1],
+                                    src_word[2],
+                                    src_word[3],
+                                ]);
+                                dst_half.copy_from_slice(
+                                    &hipfire_runtime::llama::f32_to_f16(value).to_le_bytes(),
+                                );
+                            }
+                        }
+                        _ => unreachable!("dtype checked above"),
+                    }
+                });
+        });
+        Ok(out)
+    }
+
+    fn source_scalar_f32(dtype: &str, bytes: &[u8], name: &str) -> Result<f32, String> {
+        match dtype {
+            "F16" if bytes.len() == 2 => {
+                Ok(hipfire_runtime::llama::f16_to_f32(u16::from_le_bytes([
+                    bytes[0], bytes[1],
+                ])))
+            }
+            "BF16" if bytes.len() == 2 => Ok(bf16_to_f32(u16::from_le_bytes([bytes[0], bytes[1]]))),
+            "F32" if bytes.len() == 4 => {
+                Ok(f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+            }
+            other => Err(format!(
+                "deepseek4: '{name}' expected one F16/BF16/F32 scalar, got dtype={other} bytes={}",
+                bytes.len()
+            )),
+        }
+    }
+    fn source_tid2eid_i32_bytes(
+        dtype: &str,
+        bytes: &[u8],
+        shape: &[usize],
+        vocab_size: usize,
+        topk: usize,
+        n_experts: usize,
+        name: &str,
+    ) -> Result<(Vec<u32>, Vec<u8>), String> {
+        let expected_shape = [vocab_size, topk];
+        if shape != expected_shape.as_slice() {
+            return Err(format!(
+                "deepseek4: '{name}' shape {shape:?} != expected {expected_shape:?}"
+            ));
+        }
+        let expected = vocab_size
+            .checked_mul(topk)
+            .ok_or_else(|| format!("deepseek4: '{name}' element count overflow"))?;
+        let element_bytes = match dtype {
+            "I64" => 8,
+            "I32" => 4,
+            other => {
+                return Err(format!(
+                    "deepseek4: '{name}' must be I64 or I32, got {other}"
+                ));
+            }
+        };
+        let expected_bytes = expected
+            .checked_mul(element_bytes)
+            .ok_or_else(|| format!("deepseek4: '{name}' byte count overflow"))?;
+        if bytes.len() != expected_bytes {
+            return Err(format!(
+                "deepseek4: '{name}' byte size {} != expected {expected_bytes} for {dtype}",
+                bytes.len()
+            ));
+        }
+
+        let mut vals = Vec::with_capacity(expected);
+        let mut push_checked = |idx: usize, value: i64| -> Result<(), String> {
+            if value < 0 || value as usize >= n_experts {
+                return Err(format!(
+                    "deepseek4: '{name}' expert id {value} at flat index {idx} is outside [0, {n_experts})"
+                ));
+            }
+            vals.push(value as u32);
+            Ok(())
+        };
+        match dtype {
+            "I64" => {
+                for (idx, word) in bytes.chunks_exact(8).enumerate() {
+                    push_checked(idx, i64::from_le_bytes(word.try_into().unwrap()))?;
+                }
+            }
+            "I32" => {
+                for (idx, word) in bytes.chunks_exact(4).enumerate() {
+                    push_checked(idx, i32::from_le_bytes(word.try_into().unwrap()) as i64)?;
+                }
+            }
+            _ => unreachable!("dtype checked above"),
+        }
+
+        let mut compact = Vec::with_capacity(expected * 4);
+        for value in &vals {
+            compact.extend_from_slice(&value.to_le_bytes());
+        }
+        Ok((vals, compact))
+    }
+
+    #[inline]
+    fn source_e4m3_to_f32(byte: u8, name: &str) -> Result<f32, String> {
+        let sign = if byte & 0x80 != 0 { -1.0 } else { 1.0 };
+        let exp = ((byte >> 3) & 0x0f) as i32;
+        let mant = (byte & 0x07) as f32;
+        if exp == 0x0f && mant == 7.0 {
+            return Err(format!(
+                "deepseek4: '{name}' contains E4M3 NaN byte 0x{byte:02x}"
+            ));
+        }
+        if exp == 0 {
+            return Ok(if mant == 0.0 {
+                sign * 0.0
+            } else {
+                sign * 2.0f32.powi(-6) * (mant / 8.0)
+            });
+        }
+        Ok(sign * 2.0f32.powi(exp - 7) * (1.0 + mant / 8.0))
+    }
+
+    /// Losslessly expand the released block-128 E4M3 + UE8M0 source weights
+    /// into native F16 values. E4M3 has only three mantissa bits and the block
+    /// scale is a power of two, so every finite in-range product is exactly
+    /// representable by F16; this changes storage, not the model's quant grid.
+    fn source_fp8_e4m3_ue8m0_to_f16_bytes(
+        weight_bytes: &[u8],
+        weight_shape: &[usize],
+        scale_bytes: &[u8],
+        scale_shape: &[usize],
+        name: &str,
+    ) -> Result<Vec<u8>, String> {
+        if weight_shape.len() != 2 || scale_shape.len() != 2 {
+            return Err(format!(
+                "deepseek4: '{name}' FP8 weight/scale must both be rank-2, got {:?} and {:?}",
+                weight_shape, scale_shape
+            ));
+        }
+        let (rows, cols) = (weight_shape[0], weight_shape[1]);
+        let expected_scales = [rows.div_ceil(128), cols.div_ceil(128)];
+        if scale_shape != expected_scales {
+            return Err(format!(
+                "deepseek4: '{name}' FP8 scale shape {:?} != expected {:?} for 128x128 blocks",
+                scale_shape, expected_scales
+            ));
+        }
+        if weight_bytes.len() != rows * cols
+            || scale_bytes.len() != expected_scales[0] * expected_scales[1]
+        {
+            return Err(format!(
+                "deepseek4: '{name}' FP8 payload mismatch: weight={} expected={}, scale={} expected={}",
+                weight_bytes.len(),
+                rows * cols,
+                scale_bytes.len(),
+                expected_scales[0] * expected_scales[1],
+            ));
+        }
+
+        let e4m3_lut: [f32; 256] = std::array::from_fn(|idx| {
+            Self::source_e4m3_to_f32(idx as u8, name).unwrap_or(f32::NAN)
+        });
+        let scale_lut: [f32; 255] = std::array::from_fn(|idx| 2.0f32.powi(idx as i32 - 127));
+        let mut out = vec![0_u8; rows * cols * 2];
+        source_load_pool().install(|| {
+            out.par_chunks_exact_mut(cols * 2)
+                .enumerate()
+                .try_for_each(|(row, dst_row)| -> Result<(), String> {
+                    for col in 0..cols {
+                        let scale_byte =
+                            scale_bytes[(row / 128) * expected_scales[1] + col / 128];
+                        if scale_byte == 255 {
+                            return Err(format!(
+                                "deepseek4: '{name}' contains reserved UE8M0 NaN scale at row {row}, col {col}"
+                            ));
+                        }
+                        let fp8_byte = weight_bytes[row * cols + col];
+                        let base = e4m3_lut[fp8_byte as usize];
+                        if base.is_nan() {
+                            return Err(format!(
+                                "deepseek4: '{name}' contains E4M3 NaN byte 0x{fp8_byte:02x} at row {row}, col {col}"
+                            ));
+                        }
+                        let value = base * scale_lut[scale_byte as usize];
+                        let half = hipfire_runtime::llama::f32_to_f16(value);
+                        let roundtrip = hipfire_runtime::llama::f16_to_f32(half);
+                        if !value.is_finite() || !roundtrip.is_finite() || roundtrip != value {
+                            return Err(format!(
+                                "deepseek4: '{name}' FP8 value {value:?} at row {row}, col {col} is not exactly representable as F16"
+                            ));
+                        }
+                        let dst = col * 2;
+                        dst_row[dst..dst + 2].copy_from_slice(&half.to_le_bytes());
+                    }
+                    Ok(())
+                })
+        })?;
+        Ok(out)
+    }
+
+    /// Upload a floating-point source tensor as native F16.
     fn upload_global_raw_from_source(
         source: &dyn ModelSource,
         gpu: &mut Gpu,
@@ -1742,20 +2315,24 @@ impl DeepseekV4 {
             .tensor_data(name)
             .ok_or_else(|| format!("deepseek4: tensor '{name}' missing in source"))?;
         let shape: Vec<usize> = info.shape.clone();
-        // BF16 and F16 share the same element size, but the GPU only
-        // understands F16.  Decode BF16 → F16 on the host first.
-        let upload_bytes = if info.dtype == "BF16" {
-            bf16_bytes_to_f16(bytes)
-        } else {
-            bytes.to_vec()
-        };
-        gpu.upload_raw(&upload_bytes, &shape)
-            .map_err(|e| format!("deepseek4: upload '{name}' failed: {e:?}"))
+        let numel: usize = shape.iter().product();
+        // Every consumer of this helper (embedding + HC controls) expects
+        // native half values. Convert BF16/F32 explicitly instead of
+        // uploading their bytes verbatim and letting kernels reinterpret them.
+        let upload_bytes = Self::source_float_to_f16_bytes(&info.dtype, bytes, numel, name)?;
+        let mut tensor = gpu
+            .upload_raw(&upload_bytes, &shape)
+            .map_err(|e| format!("deepseek4: upload '{name}' failed: {e:?}"))?;
+        // `upload_raw` cannot infer the byte layout. This source-only helper
+        // has normalized every accepted floating input to native F16, so keep
+        // that contract in the metadata for dtype-aware consumers.
+        tensor.dtype = DType::F16;
+        Ok(tensor)
     }
 
-    /// Upload a weight tensor, classifying it as F16, Q8_0, or Raw
-    /// (MQ4-family) based on byte-count heuristics. Mirrors
-    /// `upload_quant_or_f16` but sources from `&dyn ModelSource`.
+    /// Upload a floating-point source weight as native F16. Quantized
+    /// safetensors have their own dtype + scale contract and must never be
+    /// inferred from byte counts as though they were HFQ/MQ blocks.
     fn upload_quant_or_f16_from_source(
         source: &dyn ModelSource,
         gpu: &mut Gpu,
@@ -1766,33 +2343,40 @@ impl DeepseekV4 {
             .ok_or_else(|| format!("deepseek4: tensor '{name}' missing in source"))?;
         let shape: Vec<usize> = info.shape.clone();
         let numel: usize = shape.iter().product();
-        let (is_f16, is_q8_0) = Self::classify_tensor_bytes(bytes, numel, info.dtype.as_str());
-
-        if is_f16 {
-            if bytes.len() != numel * 2 {
+        let upload_bytes = if info.dtype == "F8_E4M3" {
+            let stem = name.strip_suffix(".weight").ok_or_else(|| {
+                format!(
+                    "deepseek4: FP8 tensor '{name}' does not end in .weight; cannot resolve scale sibling"
+                )
+            })?;
+            let scale_name = format!("{stem}.scale");
+            let (scale_info, scale_bytes) = source
+                .tensor_data(&scale_name)
+                .ok_or_else(|| format!("deepseek4: FP8 tensor '{name}' is missing {scale_name}"))?;
+            if scale_info.dtype != "F8_E8M0" {
                 return Err(format!(
-                    "deepseek4: '{name}' appears F16 but byte size {} != 2 × {numel}",
-                    bytes.len()
+                    "deepseek4: FP8 tensor '{name}' scale {scale_name} must be F8_E8M0, got {}",
+                    scale_info.dtype
                 ));
             }
-            let mut t = gpu
-                .upload_raw(bytes, &shape)
-                .map_err(|e| format!("deepseek4: upload f16-native '{name}' failed: {e:?}"))?;
-            t.dtype = rdna_compute::DType::F16;
-            return Ok(t);
-        }
-
+            Self::source_fp8_e4m3_ue8m0_to_f16_bytes(
+                bytes,
+                &shape,
+                scale_bytes,
+                &scale_info.shape,
+                name,
+            )?
+        } else {
+            Self::source_float_to_f16_bytes(&info.dtype, bytes, numel, name)?
+        };
         let mut t = gpu
-            .upload_raw(bytes, &shape)
-            .map_err(|e| format!("deepseek4: upload '{name}' failed: {e:?}"))?;
-        if is_q8_0 {
-            t.dtype = rdna_compute::DType::Q8_0;
-        }
+            .upload_raw(&upload_bytes, &shape)
+            .map_err(|e| format!("deepseek4: upload f16-native '{name}' failed: {e:?}"))?;
+        t.dtype = rdna_compute::DType::F16;
         Ok(t)
     }
 
-    /// Upload an F16-on-disk tensor as F32 on GPU. Mirrors
-    /// `upload_global_f16_as_f32` but sources from `&dyn ModelSource`.
+    /// Upload an F16/BF16/F32 source tensor as F32 on GPU.
     fn upload_global_f16_as_f32_from_source(
         source: &dyn ModelSource,
         gpu: &mut Gpu,
@@ -1803,61 +2387,44 @@ impl DeepseekV4 {
             .ok_or_else(|| format!("deepseek4: tensor '{name}' missing in source"))?;
         let shape: Vec<usize> = info.shape.clone();
         let n: usize = shape.iter().product();
-        if bytes.len() != n * 2 {
-            return Err(format!(
-                "deepseek4: '{name}' expected F16 bytes ({} = 2 × {}), got {}",
-                n * 2,
-                n,
-                bytes.len()
-            ));
-        }
-        let f32_vals: Vec<f32> = (0..n)
-            .map(|i| {
-                let lo = bytes[i * 2];
-                let hi = bytes[i * 2 + 1];
-                hipfire_runtime::llama::f16_to_f32(u16::from_le_bytes([lo, hi]))
-            })
-            .collect();
+        let f32_vals: Vec<f32> = match info.dtype.as_str() {
+            "F16" if bytes.len() == n * 2 => bytes
+                .chunks_exact(2)
+                .map(|b| hipfire_runtime::llama::f16_to_f32(u16::from_le_bytes([b[0], b[1]])))
+                .collect(),
+            "BF16" if bytes.len() == n * 2 => bytes
+                .chunks_exact(2)
+                .map(|b| bf16_to_f32(u16::from_le_bytes([b[0], b[1]])))
+                .collect(),
+            "F32" if bytes.len() == n * 4 => bytes
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect(),
+            dtype => {
+                return Err(format!(
+                    "deepseek4: '{name}' expected F16/BF16/F32 source bytes for {n} elements, got dtype={dtype} bytes={}",
+                    bytes.len()
+                ))
+            }
+        };
         gpu.upload_f32(&f32_vals, &shape)
             .map_err(|e| format!("deepseek4: upload f16→f32 '{name}' failed: {e:?}"))
     }
 
-    /// Upload an F16-on-disk tensor as F16 bytes on GPU (no conversion).
-    /// Mirrors `upload_quant_as_f16_native` but sources from
-    /// `&dyn ModelSource`. Errors if the tensor isn't F16.
+    /// Upload a source matrix as native F16, including the released
+    /// F8_E4M3 + per-128x128 UE8M0 representation.
     fn upload_quant_as_f16_native_from_source(
         source: &dyn ModelSource,
         gpu: &mut Gpu,
         name: &str,
     ) -> Result<rdna_compute::GpuTensor, String> {
-        let (info, bytes) = source
-            .tensor_data(name)
-            .ok_or_else(|| format!("deepseek4: tensor '{name}' missing in source"))?;
-        let shape: Vec<usize> = info.shape.clone();
-        let numel: usize = shape.iter().product();
-        let (is_f16, _) = Self::classify_tensor_bytes(bytes, numel, info.dtype.as_str());
-        if !is_f16 {
-            return Err(format!(
-                "deepseek4: '{name}' not F16 ({} bytes for {numel} elems); cannot upload as F16 native",
-                bytes.len()
-            ));
-        }
-        if bytes.len() != numel * 2 {
-            return Err(format!(
-                "deepseek4: '{name}' marked F16 but byte size {} != 2 × {numel}",
-                bytes.len()
-            ));
-        }
-        let mut t = gpu
-            .upload_raw(bytes, &shape)
-            .map_err(|e| format!("deepseek4: upload f16-native '{name}' failed: {e:?}"))?;
-        t.dtype = rdna_compute::DType::F16;
-        Ok(t)
+        Self::upload_quant_or_f16_from_source(source, gpu, name)
     }
 
-    /// Upload routed-expert blobs for one layer from a ModelSource.
-    /// Mirrors `upload_layer_routed_experts` but sources from
-    /// `&dyn ModelSource`.
+    /// Upload the released DeepSeek-V4 FP4 routed experts without fitting a
+    /// second quantizer. Each source matrix is I8-packed E2M1 plus a sibling
+    /// UE8M0 scale tensor; `source_fp4_matrix_as_hfp4g32` only interleaves the
+    /// existing bytes into the HFP4G32 row framing consumed by hipfire.
     fn upload_layer_routed_experts_from_source(
         source: &dyn ModelSource,
         gpu: &mut Gpu,
@@ -1883,29 +2450,32 @@ impl DeepseekV4 {
         if n_owned == 0 {
             return Err(format!("deepseek4: {prefix} shard rank owns no experts"));
         }
+        if shard.is_some()
+            && n_owned < n_exp
+            && hipfire_config::developer_var("HIPFIRE_EP_OWNER_MASK").as_deref() != Ok("0")
+        {
+            let mask: Vec<u8> = (0..n_exp).map(|e| u8::from(owns(e))).collect();
+            layer.expert_owned_mask = Some(
+                gpu.upload_raw(&mask, &[n_exp])
+                    .map_err(|e| format!("deepseek4: upload ownership mask {prefix}: {e:?}"))?,
+            );
+        }
 
-        // w2 (down): read each expert, pack ONLY owned into blob.
+        let hfp4 = rdna_compute::DType::HFP4G32;
+        let gate_shape_from_down: Vec<usize>;
+
+        // w2 (down): losslessly reframe and pack ONLY owned experts.
         {
             let name0 = format!("{prefix}.ffn.experts.0.w2.weight");
-            let (info0, _b0) = source
-                .tensor_data(&name0)
-                .ok_or_else(|| format!("deepseek4: missing {name0}"))?;
-            // Guard: the indexed-MoE forward has no float-expert path — it
-            // reinterprets the packed expert blob as quant blocks. A raw-HF
-            // safetensors checkpoint ships bf16/f16/f32 experts, which would be
-            // misread → silent garbage. Refuse cleanly (quantized experts only),
-            // mirroring the lfm2moe Dir guard. (This Dir arm is otherwise
-            // unvalidated — no deepseek_v4 checkpoint was available locally.)
-            if matches!(info0.dtype.as_str(), "BF16" | "F16" | "F32") {
+            let (probe, shape0) = Self::source_fp4_matrix_as_hfp4g32(source, &name0)?;
+            if shape0.len() != 2 {
                 return Err(format!(
-                    "deepseek4: routed experts at {prefix} are raw float ({}); the \
-                     indexed-MoE forward requires quantized experts. Quantize the \
-                     checkpoint first or load the prebuilt HFQ.",
-                    info0.dtype
+                    "deepseek4: '{name0}' restored FP4 matrix must be rank-2, got {shape0:?}"
                 ));
             }
-            let stride = info0.data_size;
-            let shape0: Vec<usize> = info0.shape.clone();
+            let stride = probe.len();
+            gate_shape_from_down = vec![shape0[1], shape0[0]];
+            drop(probe);
 
             let mut blob = Vec::with_capacity(stride * n_owned);
             for e in 0..n_exp {
@@ -1913,22 +2483,21 @@ impl DeepseekV4 {
                     continue;
                 }
                 let name = format!("{prefix}.ffn.experts.{e}.w2.weight");
-                let (info, bytes) = source
-                    .tensor_data(&name)
-                    .ok_or_else(|| format!("deepseek4: missing {name}"))?;
-                if info.data_size != stride {
+                let (packed, shape) = Self::source_fp4_matrix_as_hfp4g32(source, &name)?;
+                if shape != shape0 || packed.len() != stride {
                     return Err(format!(
-                        "deepseek4: {name} size {} != stride {}",
-                        info.data_size, stride
+                        "deepseek4: {name} restored FP4 metadata mismatch: shape={shape:?} bytes={}; expected shape={shape0:?} bytes={stride}",
+                        packed.len()
                     ));
                 }
-                blob.extend_from_slice(bytes);
+                blob.extend_from_slice(&packed);
             }
             let mut blob_shape = vec![n_owned];
             blob_shape.extend_from_slice(&shape0);
-            let blob_tensor = gpu
+            let mut blob_tensor = gpu
                 .upload_raw(&blob, &blob_shape)
                 .map_err(|e| format!("deepseek4: upload blob {prefix}.w2: {e:?}"))?;
+            blob_tensor.dtype = hfp4;
             drop(blob);
             let base_ptr = blob_tensor.buf.as_ptr() as u64;
             let ptrs: Vec<u64> = (0..n_exp)
@@ -1950,28 +2519,29 @@ impl DeepseekV4 {
             layer.expert_w2_blob = Some(blob_tensor);
             layer.expert_w2_ptrs = Some(ptr_tensor);
             layer.expert_w2_stride = stride;
+            layer.expert_down_dtype = Some(hfp4);
         }
 
-        // gate_up (combined w1 ‖ w3).
+        // gate_up (combined w1 || w3): the combined stride is based on the
+        // reframed HFP4 bytes, not the smaller split safetensors payloads.
         {
             let w1_0 = format!("{prefix}.ffn.experts.0.w1.weight");
             let w3_0 = format!("{prefix}.ffn.experts.0.w3.weight");
-            let (w1_info0, _b1) = source
-                .tensor_data(&w1_0)
-                .ok_or_else(|| format!("deepseek4: missing {w1_0}"))?;
-            let stride_w1 = w1_info0.data_size;
-            let gate_rows = w1_info0.shape[0] as usize;
-            let hidden = w1_info0.shape[1] as usize;
-            let (w3_info0, _b3) = source
-                .tensor_data(&w3_0)
-                .ok_or_else(|| format!("deepseek4: missing {w3_0}"))?;
-            let stride_w3 = w3_info0.data_size;
-            if stride_w1 != stride_w3 {
+            let (w1_probe, gate_shape) = Self::source_fp4_matrix_as_hfp4g32(source, &w1_0)?;
+            let (w3_probe, up_shape) = Self::source_fp4_matrix_as_hfp4g32(source, &w3_0)?;
+            let stride_w1 = w1_probe.len();
+            let stride_w3 = w3_probe.len();
+            if gate_shape != gate_shape_from_down {
                 return Err(format!(
-                    "deepseek4: {prefix} w1/w3 stride mismatch: w1={} w3={}",
-                    stride_w1, stride_w3
+                    "deepseek4: {prefix} routed projection shape mismatch: gate/up {gate_shape:?}, expected {gate_shape_from_down:?} from transposed down projection"
                 ));
             }
+            if up_shape != gate_shape || stride_w3 != stride_w1 {
+                return Err(format!(
+                    "deepseek4: {prefix} w1/w3 restored FP4 mismatch: w1 shape={gate_shape:?} bytes={stride_w1}; w3 shape={up_shape:?} bytes={stride_w3}"
+                ));
+            }
+            drop((w1_probe, w3_probe));
             let combined_stride = stride_w1 + stride_w3;
             let mut combined = Vec::with_capacity(combined_stride * n_owned);
             for e in 0..n_exp {
@@ -1979,44 +2549,42 @@ impl DeepseekV4 {
                     continue;
                 }
                 let w1_name = format!("{prefix}.ffn.experts.{e}.w1.weight");
-                {
-                    let (_, w1_bytes) = source
-                        .tensor_data(&w1_name)
-                        .ok_or_else(|| format!("deepseek4: missing {w1_name}"))?;
-                    combined.extend_from_slice(w1_bytes);
+                let (w1, shape) = Self::source_fp4_matrix_as_hfp4g32(source, &w1_name)?;
+                if shape != gate_shape || w1.len() != stride_w1 {
+                    return Err(format!(
+                        "deepseek4: {w1_name} restored FP4 metadata mismatch: shape={shape:?} bytes={}; expected shape={gate_shape:?} bytes={stride_w1}",
+                        w1.len()
+                    ));
                 }
+                combined.extend_from_slice(&w1);
                 let w3_name = format!("{prefix}.ffn.experts.{e}.w3.weight");
-                {
-                    let (_, w3_bytes) = source
-                        .tensor_data(&w3_name)
-                        .ok_or_else(|| format!("deepseek4: missing {w3_name}"))?;
-                    combined.extend_from_slice(w3_bytes);
+                let (w3, shape) = Self::source_fp4_matrix_as_hfp4g32(source, &w3_name)?;
+                if shape != gate_shape || w3.len() != stride_w3 {
+                    return Err(format!(
+                        "deepseek4: {w3_name} restored FP4 metadata mismatch: shape={shape:?} bytes={}; expected shape={gate_shape:?} bytes={stride_w3}",
+                        w3.len()
+                    ));
                 }
+                combined.extend_from_slice(&w3);
             }
-            let combined = maybe_transcode_gate_up_i8dot(
-                combined,
-                &gpu.arch,
-                prefix,
-                n_owned,
-                combined_stride,
-                2 * gate_rows,
-                hidden,
-            )?;
-            let combined_tensor = gpu
+            let mut combined_tensor = gpu
                 .upload_raw(&combined, &[n_owned, combined_stride])
                 .map_err(|e| format!("deepseek4: upload gate_up {prefix}: {e:?}"))?;
+            combined_tensor.dtype = hfp4;
             drop(combined);
             let base_ptr = combined_tensor.buf.as_ptr() as u64;
-            let dummy_gu = if shard.is_some() && n_owned < n_exp {
-                let z = gpu
-                    .zeros(&[combined_stride / 4], rdna_compute::DType::F32)
-                    .map_err(|e| format!("deepseek4: {prefix} zero gate_up dummy: {e:?}"))?;
-                let p = z.buf.as_ptr() as u64;
-                std::mem::forget(z);
-                p
+            let dummy_gate_up = if shard.is_some() && n_owned < n_exp {
+                Some(
+                    gpu.zeros(&[combined_stride.div_ceil(4)], rdna_compute::DType::F32)
+                        .map_err(|e| format!("deepseek4: {prefix} zero gate_up dummy: {e:?}"))?,
+                )
             } else {
-                base_ptr
+                None
             };
+            let dummy_gu = dummy_gate_up
+                .as_ref()
+                .map(|z| z.buf.as_ptr() as u64)
+                .unwrap_or(base_ptr);
             let ptrs: Vec<u64> = (0..n_exp)
                 .map(|e| {
                     if owns(e) {
@@ -2036,6 +2604,8 @@ impl DeepseekV4 {
             layer.expert_gate_up_blob = Some(combined_tensor);
             layer.expert_gate_up_ptrs = Some(ptr_tensor);
             layer.expert_gate_up_stride = combined_stride;
+            layer.expert_gate_up_dtype = Some(hfp4);
+            layer.expert_gate_up_dummy = dummy_gate_up;
         }
         Ok(())
     }
@@ -2044,22 +2614,54 @@ impl DeepseekV4 {
 // ── Top-level safetensors load entry point ──────────────────────
 
 impl DeepseekV4 {
-    /// Load model weights from a `&dyn ModelSource` (safetensors or HFQ
-    /// wrapper). Mirrors `load_weights_inner` but reads tensor data via
-    /// `ModelSource::tensor_data()` instead of `HfqFile::tensor_data_pread()`.
-    ///
-    /// Tensor names match those used in the HFQ path (the safetensors
-    /// created by `hipfire-quantize` use the same naming convention).
-    /// Quantization format is inferred from byte counts (F16 vs Q8_0 vs
-    /// MQ4-family) matching the HFQ byte layout.
-    ///
-    /// Only `shard = None` is currently exposed — EP-shard-aware loading
-    /// from safetensors is a future extension when multi-GPU deepseek4
-    /// is brought up.
+    /// Load an unsharded DeepSeek-V4 safetensors source. Native FP8 dense
+    /// weights are expanded exactly onto the F16 grid, while released FP4
+    /// routed experts are only reframed as HFP4G32 (no second quantizer).
     pub fn load_weights_from_safetensors(
         source: &dyn ModelSource,
         cfg: &DeepseekV4Config,
         gpu: &mut Gpu,
+    ) -> Result<DeepseekV4Weights, String> {
+        Self::load_weights_from_safetensors_inner(source, cfg, gpu, None)
+    }
+
+    /// Load one EP rank directly from the released safetensors shards. Only
+    /// rank-owned routed experts are reframed and uploaded.
+    pub fn load_weights_from_safetensors_sharded(
+        source: &dyn ModelSource,
+        cfg: &DeepseekV4Config,
+        gpu: &mut Gpu,
+        shard: &hipfire_runtime::tp_shard::ShardConfig,
+        rank: usize,
+    ) -> Result<DeepseekV4Weights, String> {
+        if rank >= shard.tp_size {
+            return Err(format!(
+                "deepseek4: safetensors EP rank {rank} is outside tp_size {}",
+                shard.tp_size
+            ));
+        }
+        shard
+            .validate_moe(cfg.n_routed_experts)
+            .map_err(|e| format!("deepseek4: invalid safetensors EP split: {e}"))?;
+        if !shard.is_single() && shard.expert_to_rank.len() != cfg.n_routed_experts {
+            return Err(format!(
+                "deepseek4: safetensors EP ownership map has {} entries, expected {}",
+                shard.expert_to_rank.len(),
+                cfg.n_routed_experts
+            ));
+        }
+        let shard = (!shard.is_single()).then_some((shard, rank));
+        Self::load_weights_from_safetensors_inner(source, cfg, gpu, shard)
+    }
+
+    /// Shared source loader. Per-tensor helpers own the accepted dtype/scale
+    /// contracts and fail closed on every unsupported representation.
+    /// `shard=None` keeps the original single-rank behavior.
+    fn load_weights_from_safetensors_inner(
+        source: &dyn ModelSource,
+        cfg: &DeepseekV4Config,
+        gpu: &mut Gpu,
+        shard: Option<(&hipfire_runtime::tp_shard::ShardConfig, usize)>,
     ) -> Result<DeepseekV4Weights, String> {
         let upload_experts = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_UPLOAD_EXPERTS")
             .ok()
@@ -2110,12 +2712,12 @@ impl DeepseekV4 {
             "head.weight",
         )?);
 
-        weights.hc_head_fn = Some(Self::upload_global_raw_from_source(
+        weights.hc_head_fn = Some(Self::upload_global_f16_as_f32_from_source(
             source,
             gpu,
             "hc_head_fn",
         )?);
-        weights.hc_head_base = Some(Self::upload_global_raw_from_source(
+        weights.hc_head_base = Some(Self::upload_global_f16_as_f32_from_source(
             source,
             gpu,
             "hc_head_base",
@@ -2130,13 +2732,7 @@ impl DeepseekV4 {
                     info.shape
                 ));
             }
-            let raw = u16::from_le_bytes([bytes[0], bytes[1]]);
-            let scale = if info.dtype == "BF16" {
-                bf16_to_f32(raw)
-            } else {
-                hipfire_runtime::llama::f16_to_f32(raw)
-            };
-            weights.hc_head_scale = scale;
+            weights.hc_head_scale = Self::source_scalar_f32(&info.dtype, bytes, "hc_head_scale")?;
         }
 
         // ── Per-layer ──────────────────────────────────────────────────
@@ -2280,33 +2876,33 @@ impl DeepseekV4 {
                 )?);
             }
 
-            // Hyper-Connections (F16 small matrices).
-            layer.hc_attn_base = Some(Self::upload_global_raw_from_source(
+            // Hyper-Connections: preserve the official source FP32 controls.
+            layer.hc_attn_base = Some(Self::upload_global_f16_as_f32_from_source(
                 source,
                 gpu,
                 &format!("layers.{l}.hc_attn_base"),
             )?);
-            layer.hc_attn_fn = Some(Self::upload_global_raw_from_source(
+            layer.hc_attn_fn = Some(Self::upload_global_f16_as_f32_from_source(
                 source,
                 gpu,
                 &format!("layers.{l}.hc_attn_fn"),
             )?);
-            layer.hc_attn_scale = Some(Self::upload_global_raw_from_source(
+            layer.hc_attn_scale = Some(Self::upload_global_f16_as_f32_from_source(
                 source,
                 gpu,
                 &format!("layers.{l}.hc_attn_scale"),
             )?);
-            layer.hc_ffn_base = Some(Self::upload_global_raw_from_source(
+            layer.hc_ffn_base = Some(Self::upload_global_f16_as_f32_from_source(
                 source,
                 gpu,
                 &format!("layers.{l}.hc_ffn_base"),
             )?);
-            layer.hc_ffn_fn = Some(Self::upload_global_raw_from_source(
+            layer.hc_ffn_fn = Some(Self::upload_global_f16_as_f32_from_source(
                 source,
                 gpu,
                 &format!("layers.{l}.hc_ffn_fn"),
             )?);
-            layer.hc_ffn_scale = Some(Self::upload_global_raw_from_source(
+            layer.hc_ffn_scale = Some(Self::upload_global_f16_as_f32_from_source(
                 source,
                 gpu,
                 &format!("layers.{l}.hc_ffn_scale"),
@@ -2326,35 +2922,27 @@ impl DeepseekV4 {
                     .map_err(|e| format!("d2h gate_bias l{l}: {e:?}"))?;
                 layer.gate_bias = Some(bias_gpu);
             } else {
-                // Hash-routed layer: read `tid2eid` lookup table (I32 raw bytes).
+                // Official hash-router table is I64; compact to the I32 ABI
+                // consumed by the GPU router after strict shape/range checks.
                 let tid_name = format!("layers.{l}.ffn.gate.tid2eid");
-                if let Some((info, bytes)) = source.tensor_data(&tid_name) {
-                    if bytes.len() % 4 == 0 {
-                        let vals: Vec<u32> = bytes
-                            .chunks_exact(4)
-                            .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
-                            .collect();
-                        let expected = info.shape.iter().product::<usize>();
-                        if vals.len() == expected {
-                            let shape: Vec<usize> = info.shape.clone();
-                            match gpu.upload_raw(bytes, &shape) {
-                                Ok(t) => layer.tid2eid_dev = Some(t),
-                                Err(e) => eprintln!(
-                                    "deepseek4: tid2eid l{l} upload failed: {e:?}; \
-                                    fall back to host gather"
-                                ),
-                            }
-                            layer.tid2eid_host = vals;
-                        } else {
-                            eprintln!(
-                                "deepseek4: tid2eid l{l} size mismatch \
-                                ({} vs expected {}); ignoring",
-                                vals.len(),
-                                expected
-                            );
-                        }
-                    }
-                }
+                let (info, bytes) = source.tensor_data(&tid_name).ok_or_else(|| {
+                    format!("deepseek4: required hash-router tensor '{tid_name}' missing")
+                })?;
+                let (vals, compact) = Self::source_tid2eid_i32_bytes(
+                    &info.dtype,
+                    bytes,
+                    &info.shape,
+                    cfg.vocab_size,
+                    cfg.num_experts_per_tok,
+                    cfg.n_routed_experts,
+                    &tid_name,
+                )?;
+                let shape = info.shape.clone();
+                let t = gpu
+                    .upload_raw(&compact, &shape)
+                    .map_err(|e| format!("deepseek4: upload compact tid2eid l{l}: {e:?}"))?;
+                layer.tid2eid_dev = Some(t);
+                layer.tid2eid_host = vals;
             }
 
             // Shared expert.
@@ -2446,32 +3034,32 @@ impl DeepseekV4 {
                 )?);
 
                 // HC blocks.
-                mtp.hc_attn_base = Some(Self::upload_global_raw_from_source(
+                mtp.hc_attn_base = Some(Self::upload_global_f16_as_f32_from_source(
                     source,
                     gpu,
                     "mtp.0.hc_attn_base",
                 )?);
-                mtp.hc_attn_fn = Some(Self::upload_global_raw_from_source(
+                mtp.hc_attn_fn = Some(Self::upload_global_f16_as_f32_from_source(
                     source,
                     gpu,
                     "mtp.0.hc_attn_fn",
                 )?);
-                mtp.hc_attn_scale = Some(Self::upload_global_raw_from_source(
+                mtp.hc_attn_scale = Some(Self::upload_global_f16_as_f32_from_source(
                     source,
                     gpu,
                     "mtp.0.hc_attn_scale",
                 )?);
-                mtp.hc_ffn_base = Some(Self::upload_global_raw_from_source(
+                mtp.hc_ffn_base = Some(Self::upload_global_f16_as_f32_from_source(
                     source,
                     gpu,
                     "mtp.0.hc_ffn_base",
                 )?);
-                mtp.hc_ffn_fn = Some(Self::upload_global_raw_from_source(
+                mtp.hc_ffn_fn = Some(Self::upload_global_f16_as_f32_from_source(
                     source,
                     gpu,
                     "mtp.0.hc_ffn_fn",
                 )?);
-                mtp.hc_ffn_scale = Some(Self::upload_global_raw_from_source(
+                mtp.hc_ffn_scale = Some(Self::upload_global_f16_as_f32_from_source(
                     source,
                     gpu,
                     "mtp.0.hc_ffn_scale",
@@ -2535,12 +3123,12 @@ impl DeepseekV4 {
                 )?);
 
                 // MTP-specific head-HC matrices.
-                mtp.mtp_hc_head_fn = Some(Self::upload_global_raw_from_source(
+                mtp.mtp_hc_head_fn = Some(Self::upload_global_f16_as_f32_from_source(
                     source,
                     gpu,
                     "mtp.0.hc_head_fn",
                 )?);
-                mtp.mtp_hc_head_base = Some(Self::upload_global_raw_from_source(
+                mtp.mtp_hc_head_base = Some(Self::upload_global_f16_as_f32_from_source(
                     source,
                     gpu,
                     "mtp.0.hc_head_base",
@@ -2556,9 +3144,7 @@ impl DeepseekV4 {
                         ));
                     }
                     mtp.mtp_hc_head_scale =
-                        hipfire_runtime::llama::f16_to_f32(u16::from_le_bytes([
-                            bytes[0], bytes[1],
-                        ]));
+                        Self::source_scalar_f32(&info.dtype, bytes, "mtp.0.hc_head_scale")?;
                 }
 
                 weights.mtp_layer = Some(mtp);
@@ -2579,7 +3165,7 @@ impl DeepseekV4 {
                     &format!("layers.{l}"),
                     n_exp,
                     layer,
-                    None, // No EP shard in safetensors path yet.
+                    shard,
                 )?;
             }
         }
@@ -2592,7 +3178,7 @@ impl DeepseekV4 {
                     "mtp.0",
                     cfg.n_routed_experts,
                     mtp,
-                    None,
+                    shard,
                 )?;
             }
         }
@@ -2609,6 +3195,178 @@ mod tests {
     fn deepseek4_arch_id_is_nine() {
         assert_eq!(DeepseekV4::arch_id(), 9);
         assert_eq!(DeepseekV4::name(), "deepseek4");
+    }
+
+    #[test]
+    fn source_float_helpers_handle_all_supported_dtypes() {
+        let f16_one = hipfire_runtime::llama::f32_to_f16(1.0).to_le_bytes();
+        let bf16_one = 0x3f80u16.to_le_bytes();
+        let f32_one = 1.0f32.to_le_bytes();
+
+        for (dtype, bytes) in [
+            ("F16", f16_one.as_slice()),
+            ("BF16", bf16_one.as_slice()),
+            ("F32", f32_one.as_slice()),
+        ] {
+            let converted =
+                DeepseekV4::source_float_to_f16_bytes(dtype, bytes, 1, "probe").unwrap();
+            assert_eq!(converted, f16_one);
+            assert_eq!(
+                DeepseekV4::source_scalar_f32(dtype, bytes, "probe").unwrap(),
+                1.0
+            );
+        }
+    }
+
+    #[test]
+    fn source_fp8_expansion_preserves_the_official_grid_exactly() {
+        let rows = 128;
+        let cols = 256;
+        let mut weight = vec![0x38_u8; rows * cols]; // E4M3 1.0
+        for row in 0..rows {
+            weight[row * cols + 128..(row + 1) * cols].fill(0x40); // E4M3 2.0
+        }
+        // First 128-column block: 1.0 * 2^0. Second: 2.0 * 2^-1.
+        let scale = [127_u8, 126];
+        let out = DeepseekV4::source_fp8_e4m3_ue8m0_to_f16_bytes(
+            &weight,
+            &[rows, cols],
+            &scale,
+            &[1, 2],
+            "probe",
+        )
+        .unwrap();
+        let one = hipfire_runtime::llama::f32_to_f16(1.0).to_le_bytes();
+        assert_eq!(out.len(), rows * cols * 2);
+        assert!(out.chunks_exact(2).all(|v| v == one));
+
+        let err = DeepseekV4::source_fp8_e4m3_ue8m0_to_f16_bytes(
+            &[0x38; 128 * 128],
+            &[128, 128],
+            &[255],
+            &[1, 1],
+            "bad-scale",
+        )
+        .unwrap_err();
+        assert!(err.contains("reserved UE8M0 NaN"));
+
+        let err = DeepseekV4::source_fp8_e4m3_ue8m0_to_f16_bytes(
+            &[0x7f; 128 * 128],
+            &[128, 128],
+            &[127],
+            &[1, 1],
+            "bad-weight",
+        )
+        .unwrap_err();
+        assert!(err.contains("E4M3 NaN"));
+    }
+
+    #[test]
+    fn source_fp4_reframe_is_bitwise_lossless() {
+        let rows = 2;
+        let logical_k = 64;
+        let weight: Vec<u8> = (0..rows * logical_k / 2)
+            .map(|i| (i as u8).wrapping_mul(37))
+            .collect();
+        let scale = vec![126_u8, 127, 128, 129];
+
+        let packed =
+            DeepseekV4::reframe_source_fp4_as_hfp4g32(&weight, &scale, rows, logical_k, "probe")
+                .unwrap();
+        let row_bytes = 16 + (logical_k / 32) * 17;
+        assert_eq!(packed.len(), rows * row_bytes);
+
+        const E2M1: [f32; 16] = [
+            0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+        ];
+        for row in 0..rows {
+            let dst = &packed[row * row_bytes..(row + 1) * row_bytes];
+            assert_eq!(
+                hipfire_runtime::llama::f16_to_f32(u16::from_le_bytes([dst[0], dst[1]])),
+                1.0
+            );
+            assert_eq!(
+                u16::from_le_bytes([dst[4], dst[5]]) as usize,
+                logical_k / 32
+            );
+            assert_eq!(dst[6], 0);
+            for block in 0..logical_k / 32 {
+                let src_scale = scale[row * (logical_k / 32) + block];
+                let payload = 16 + block * 17;
+                assert_eq!(dst[payload], src_scale);
+                let src = row * (logical_k / 2) + block * 16;
+                assert_eq!(&dst[payload + 1..payload + 17], &weight[src..src + 16]);
+
+                let factor = f32::from_bits((src_scale as u32) << 23);
+                for i in 0..16 {
+                    let source_byte = weight[src + i];
+                    let reframed_byte = dst[payload + 1 + i];
+                    for shift in [0, 4] {
+                        let source_value = factor * E2M1[((source_byte >> shift) & 0x0f) as usize];
+                        let reframed_value =
+                            factor * E2M1[((reframed_byte >> shift) & 0x0f) as usize];
+                        assert_eq!(source_value.to_bits(), reframed_value.to_bits());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn routed_expert_dtype_is_explicit_and_fail_closed() {
+        assert_eq!(
+            DeepseekV4::routed_expert_dtype("w", 13, 256).unwrap(),
+            rdna_compute::DType::MQ4G256
+        );
+        assert_eq!(
+            DeepseekV4::routed_expert_dtype("w", 19, 256).unwrap(),
+            rdna_compute::DType::MQ2G256Lloyd
+        );
+        assert_eq!(
+            DeepseekV4::routed_expert_dtype("w", 20, 256).unwrap(),
+            rdna_compute::DType::MQ3G256Lloyd
+        );
+        assert!(DeepseekV4::routed_expert_dtype("w", 19, 128)
+            .unwrap_err()
+            .contains("group_size=256"));
+        assert!(DeepseekV4::routed_expert_dtype("w", 30, 256)
+            .unwrap_err()
+            .contains("MQ4-Lloyd"));
+        assert!(DeepseekV4::routed_expert_dtype("w", 99, 256)
+            .unwrap_err()
+            .contains("unsupported quant_type=99"));
+    }
+
+    #[test]
+    fn routed_expert_layout_is_size_checked() {
+        assert!(DeepseekV4::validate_routed_expert_layout(
+            "w1",
+            rdna_compute::DType::MQ4G256,
+            &[2048, 4096],
+            4_456_448,
+        )
+        .is_ok());
+        assert!(DeepseekV4::validate_routed_expert_layout(
+            "w2",
+            rdna_compute::DType::MQ2G256Lloyd,
+            &[4096, 2048],
+            2_359_296,
+        )
+        .is_ok());
+        assert!(DeepseekV4::validate_routed_expert_layout(
+            "bad-k",
+            rdna_compute::DType::MQ4G256,
+            &[2048, 4095],
+            4_456_448,
+        )
+        .is_err());
+        assert!(DeepseekV4::validate_routed_expert_layout(
+            "bad-size",
+            rdna_compute::DType::MQ4G256,
+            &[2048, 4096],
+            2_228_224,
+        )
+        .is_err());
     }
 }
 fn maybe_transcode_gate_up_i8dot(

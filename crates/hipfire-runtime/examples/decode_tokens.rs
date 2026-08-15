@@ -12,6 +12,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let model_path = args.get(1).expect("model path");
     let tokens_path = args.get(2).expect("tokens path");
+    let pieces = args.iter().any(|arg| arg == "--pieces");
 
     let hfq = HfqFile::open(Path::new(model_path)).expect("open model");
     let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
@@ -22,6 +23,12 @@ fn main() {
         .lines()
         .filter_map(|l| l.trim().parse().ok())
         .collect();
-    let text = tokenizer.decode(&tokens);
-    print!("{text}");
+    if pieces {
+        for (position, &token) in tokens.iter().enumerate() {
+            println!("{position}\t{token}\t{:?}", tokenizer.decode(&[token]));
+        }
+    } else {
+        let text = tokenizer.decode(&tokens);
+        print!("{text}");
+    }
 }

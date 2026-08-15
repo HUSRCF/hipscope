@@ -62,10 +62,10 @@ fn main() {
     eprintln!("arch={} warmup={WARMUP} iterations={ITERS}", gpu.arch);
 
     let mut failures = 0usize;
-    for (m, k, label) in [
-        (1024usize, 4096usize, "main ratio4"),
-        (512usize, 4096usize, "main ratio128"),
-        (256usize, 4096usize, "index"),
+    for (m, k, ratio, label) in [
+        (1024usize, 4096usize, 4usize, "main ratio4"),
+        (512usize, 4096usize, 128usize, "main ratio128"),
+        (256usize, 4096usize, 4usize, "index"),
     ] {
         eprintln!("\n--- {label}: M={m} K={k} ---");
         let w0_host: Vec<f32> = (0..m * k).map(|i| synth_value(i, 0.03125)).collect();
@@ -73,14 +73,18 @@ fn main() {
             .map(|i| synth_value(i ^ 0x5a5a, 0.03125))
             .collect();
         let x_host: Vec<f32> = (0..k).map(|i| synth_value(i, 0.25)).collect();
-        let bias_host: Vec<f32> = (0..m).map(|i| synth_value(i, 0.125)).collect();
+        let bias_host: Vec<f32> = (0..ratio * m).map(|i| synth_value(i, 0.125)).collect();
+        let pos = ratio as i32 + 1;
+        let pos_bytes = pos.to_le_bytes();
         let w0_bytes = to_f16_bytes(&w0_host);
         let w1_bytes = to_f16_bytes(&w1_host);
 
         let w0 = gpu.upload_raw(&w0_bytes, &[w0_bytes.len()]).unwrap();
         let w1 = gpu.upload_raw(&w1_bytes, &[w1_bytes.len()]).unwrap();
         let x = gpu.upload_f32(&x_host, &[k]).unwrap();
-        let bias = gpu.upload_f32(&bias_host, &[m]).unwrap();
+        let bias = gpu.upload_f32(&bias_host, &[ratio, m]).unwrap();
+        let bias_row = bias.sub_offset(m, m);
+        let pos_buf = gpu.upload_raw(&pos_bytes, &[1]).unwrap();
         let ref0 = gpu.zeros(&[m], DType::F32).unwrap();
         let ref1 = gpu.zeros(&[m], DType::F32).unwrap();
         let wave0 = gpu.zeros(&[m], DType::F32).unwrap();
@@ -88,9 +92,21 @@ fn main() {
 
         gpu.gemm_f16_tiled(&w0, &x, &ref0, m, k, 1).unwrap();
         gpu.gemm_f16_tiled(&w1, &x, &ref1, m, k, 1).unwrap();
-        gpu.add_inplace_f32(&ref1, &bias).unwrap();
-        gpu.fused_twin_f16_xf32_wave64_bias_gfx90a(&w0, &w1, &x, &wave0, &wave1, &bias, m, m, k)
-            .unwrap();
+        gpu.add_inplace_f32(&ref1, &bias_row).unwrap();
+        gpu.fused_twin_f16_xf32_wave64_bias_gfx90a(
+            &w0,
+            &w1,
+            &x,
+            &wave0,
+            &wave1,
+            &bias,
+            &pos_buf,
+            ratio as i32,
+            m,
+            m,
+            k,
+        )
+        .unwrap();
         gpu.hip.device_synchronize().unwrap();
 
         let ref0_host = gpu.download_f32(&ref0).unwrap();
@@ -106,9 +122,19 @@ fn main() {
         for _ in 0..WARMUP {
             gpu.gemm_f16_tiled(&w0, &x, &ref0, m, k, 1).unwrap();
             gpu.gemm_f16_tiled(&w1, &x, &ref1, m, k, 1).unwrap();
-            gpu.add_inplace_f32(&ref1, &bias).unwrap();
+            gpu.add_inplace_f32(&ref1, &bias_row).unwrap();
             gpu.fused_twin_f16_xf32_wave64_bias_gfx90a(
-                &w0, &w1, &x, &wave0, &wave1, &bias, m, m, k,
+                &w0,
+                &w1,
+                &x,
+                &wave0,
+                &wave1,
+                &bias,
+                &pos_buf,
+                ratio as i32,
+                m,
+                m,
+                k,
             )
             .unwrap();
         }
@@ -121,7 +147,7 @@ fn main() {
             for _ in 0..ITERS {
                 gpu.gemm_f16_tiled(&w0, &x, &ref0, m, k, 1).unwrap();
                 gpu.gemm_f16_tiled(&w1, &x, &ref1, m, k, 1).unwrap();
-                gpu.add_inplace_f32(&ref1, &bias).unwrap();
+                gpu.add_inplace_f32(&ref1, &bias_row).unwrap();
             }
             gpu.hip.device_synchronize().unwrap();
             pair_samples.push(started.elapsed().as_secs_f64() * 1.0e6 / ITERS as f64);
@@ -129,7 +155,17 @@ fn main() {
             let started = std::time::Instant::now();
             for _ in 0..ITERS {
                 gpu.fused_twin_f16_xf32_wave64_bias_gfx90a(
-                    &w0, &w1, &x, &wave0, &wave1, &bias, m, m, k,
+                    &w0,
+                    &w1,
+                    &x,
+                    &wave0,
+                    &wave1,
+                    &bias,
+                    &pos_buf,
+                    ratio as i32,
+                    m,
+                    m,
+                    k,
                 )
                 .unwrap();
             }

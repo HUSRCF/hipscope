@@ -239,6 +239,47 @@ fn main() {
     ok &= compare("indexed_gate", &download(&gpu, &gate, TOP_K * M), &gate_ref);
     ok &= compare("indexed_up", &download(&gpu, &up, TOP_K * M), &up_ref);
 
+    // EP owner-mask channel: expert 0 is local, every other selected route is
+    // remote. Routing weights stay global; only indices are replaced by -1.
+    let ep_indices = upload(&mut gpu, &index_bytes, DType::Raw);
+    let mut owned = vec![0_u8; TOP_K];
+    owned[0] = 1;
+    let owned_gpu = upload(&mut gpu, &owned, DType::Raw);
+    gpu.deepseek4_mask_topk_owned(&ep_indices, &owned_gpu, TOP_K, TOP_K)
+        .expect("mask EP top-k");
+    let ep_gate = gpu
+        .alloc_tensor(&[TOP_K * M], DType::F32)
+        .expect("EP gate out");
+    let ep_up = gpu
+        .alloc_tensor(&[TOP_K * M], DType::F32)
+        .expect("EP up out");
+    gpu.deepseek4_gemv_mq2g256_lloyd_moe_gate_up_indexed(
+        &expert_ptrs,
+        &ep_indices,
+        &x_gpu,
+        &ep_gate,
+        &ep_up,
+        M * 2,
+        K,
+        TOP_K,
+    )
+    .expect("EP masked gate/up");
+    gpu.hip.device_synchronize().expect("EP gate/up sync");
+    let mut ep_gate_ref = vec![0.0; TOP_K * M];
+    let mut ep_up_ref = vec![0.0; TOP_K * M];
+    ep_gate_ref[..M].copy_from_slice(&gate_ref[..M]);
+    ep_up_ref[..M].copy_from_slice(&up_ref[..M]);
+    ok &= compare(
+        "ep_masked_gate",
+        &download(&gpu, &ep_gate, TOP_K * M),
+        &ep_gate_ref,
+    );
+    ok &= compare(
+        "ep_masked_up",
+        &download(&gpu, &ep_up, TOP_K * M),
+        &ep_up_ref,
+    );
+
     let gate_k4 = gpu
         .alloc_tensor(&[BATCH * TOP_K * M], DType::F32)
         .expect("K4 gate out");
@@ -315,7 +356,37 @@ fn main() {
         .collect();
     ok &= compare("indexed_down", &download(&gpu, &down, M), &down_ref);
 
-    let row_splits = [0, M / 3, 2 * M / 3, M];
+    let ep_down = gpu.alloc_tensor(&[M], DType::F32).expect("EP down out");
+    gpu.hip
+        .memset(&ep_down.buf, 0, M * 4)
+        .expect("zero EP down");
+    gpu.deepseek4_gemv_mq2g256_lloyd_moe_down_residual_scaled_indexed(
+        &expert_ptrs,
+        &ep_indices,
+        &scales_gpu,
+        &rot_gpu,
+        &ep_down,
+        M,
+        K,
+        TOP_K,
+    )
+    .expect("EP masked indexed down");
+    gpu.hip.device_synchronize().expect("EP down sync");
+    let ep_down_ref: Vec<f32> = (0..M)
+        .map(|row| scales[0] * dequant_dot(&weights[0], row, &rot[..K], M * 2, K))
+        .collect();
+    ok &= compare(
+        "ep_masked_indexed_down",
+        &download(&gpu, &ep_down, M),
+        &ep_down_ref,
+    );
+
+    // The row2 ranged kernels require even row_base and row_count. Preserve a
+    // three-way coverage split while aligning both interior boundaries.
+    let split1 = (M / 3) & !1;
+    let split2 = (2 * M / 3) & !1;
+    assert!(split1 > 0 && split2 > split1 && split2 < M);
+    let row_splits = [0, split1, split2, M];
     let down_rows = gpu.alloc_tensor(&[M], DType::F32).expect("ranged down");
     gpu.hip
         .memset(&down_rows.buf, 0, M * 4)
@@ -375,6 +446,29 @@ fn main() {
         "expanded_down",
         &download(&gpu, &expanded, TOP_K * M),
         &expanded_ref,
+    );
+
+    let ep_expanded = gpu
+        .alloc_tensor(&[TOP_K * M], DType::F32)
+        .expect("EP expanded down");
+    gpu.deepseek4_gemv_mq2g256_lloyd_moe_down_expanded_k4(
+        &expert_ptrs,
+        &ep_indices,
+        &rot_gpu,
+        &ep_expanded,
+        M,
+        K,
+        TOP_K,
+        1,
+    )
+    .expect("EP masked expanded down");
+    gpu.hip.device_synchronize().expect("EP expanded sync");
+    let mut ep_expanded_ref = vec![0.0; TOP_K * M];
+    ep_expanded_ref[..M].copy_from_slice(&expanded_ref[..M]);
+    ok &= compare(
+        "ep_masked_expanded_down",
+        &download(&gpu, &ep_expanded, TOP_K * M),
+        &ep_expanded_ref,
     );
 
     let expanded_rows = gpu

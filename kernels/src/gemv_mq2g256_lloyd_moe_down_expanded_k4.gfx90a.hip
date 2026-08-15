@@ -17,7 +17,12 @@ void gemv_mq2g256_lloyd_moe_down_expanded_k4_gfx90a(
     const int bid = blockIdx.z;
     const int lane = threadIdx.x;
     const int route = bid * K_TOP + krank;
-    const char* A = reinterpret_cast<const char*>(expert_ptrs[topk_indices[route]]);
+    const int expert_id = topk_indices[route];
+    if (expert_id < 0) {
+        if (lane == 0) expert_outputs[(long long)route * M + row] = 0.0f;
+        return;
+    }
+    const char* A = reinterpret_cast<const char*>(expert_ptrs[expert_id]);
     const float* x = rot_batch + (long long)route * K;
     const int groups = K / 256;
     const char* row_ptr = A + (long long)row * groups * 72;

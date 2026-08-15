@@ -37,6 +37,7 @@ extern "C" __global__ void gemv_mq3g256_lloyd_moe_down_residual_scaled_k8_indexe
     const int tid = threadIdx.x;
 
     const int expert_id = topk_indices[krank];
+    if (expert_id < 0) return;
     const char* __restrict__ A =
         reinterpret_cast<const char*>(expert_ptrs[expert_id]);
     const float* __restrict__ x = rot_batch + (long long)krank * K;

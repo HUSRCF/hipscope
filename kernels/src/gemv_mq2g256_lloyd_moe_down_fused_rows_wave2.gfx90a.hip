@@ -26,8 +26,10 @@ void gemv_mq2g256_lloyd_moe_down_fused_rows_wave2_gfx90a(
     float weighted = 0.0f;
 
     for (int krank = 0; krank < K_TOP; ++krank) {
+        const int expert_id = topk_indices[krank];
+        if (expert_id < 0) continue;
         const char* A =
-            reinterpret_cast<const char*>(expert_ptrs[topk_indices[krank]]);
+            reinterpret_cast<const char*>(expert_ptrs[expert_id]);
         const float* x = rot_batch + (long long)krank * K;
         const char* row_ptr = A + (long long)row * groups * 72;
         const float weight = topk_weights[krank];

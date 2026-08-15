@@ -1348,6 +1348,210 @@ fn i8dot_diag_a8(gpu: &mut Gpu, tensor: &GpuTensor) -> Result<(), DispatchError>
     );
     Ok(())
 }
+fn run_moe_bias_aware_gate_up(
+    gpu: &mut Gpu,
+    p: &crate::families::moe::MoeBiasAwareParams,
+) -> Result<(), DispatchError> {
+    macro_rules! hip {
+        ($e:expr) => {
+            $e.map_err(|e| DispatchError::Hip(e.to_string()))
+        };
+    }
+    match p.gate_up_dtype {
+        DType::HFP4G32 => {
+            if p.x_a8.is_some() {
+                return Err(DispatchError::Hip(
+                    "DeepSeek4 native FP4 gate/up cannot use the MQ2 I8DOT activation path".into(),
+                ));
+            }
+            hip!(gpu.gemv_hfp4g32_moe_gate_up_indexed_batched(
+                p.expert_gate_up_ptrs,
+                p.topk_indices,
+                p.x_rot,
+                p.gate_batch,
+                p.up_batch,
+                2 * p.mi,
+                p.hidden,
+                p.k_top,
+                1,
+            ))?;
+        }
+        DType::MQ4G256 => {
+            if p.x_a8.is_some() {
+                return Err(DispatchError::Hip(
+                    "DeepSeek4 MQ4 gate/up cannot use the MQ2 I8DOT activation path".into(),
+                ));
+            }
+            hip!(gpu.gemv_hfq4g256_moe_gate_up_k8_indexed_batched(
+                p.expert_gate_up_ptrs,
+                p.topk_indices,
+                p.x_rot,
+                p.gate_batch,
+                p.up_batch,
+                2 * p.mi,
+                p.hidden,
+                p.k_top,
+                1,
+            ))?;
+        }
+        DType::MQ2G256Lloyd => {
+            if let Some(x_a8) = p.x_a8 {
+                i8dot_diag_f32(gpu, "x_rot", p.x_rot)?;
+                hip!(gpu.deepseek4_quantize_f32_a8_g128_gfx90a(p.x_rot, x_a8, p.hidden, true,))?;
+                i8dot_diag_a8(gpu, x_a8)?;
+                hip!(
+                    gpu.deepseek4_gemv_mq2g256_i8dot_affine_moe_gate_up_indexed_gfx90a(
+                        p.expert_gate_up_ptrs,
+                        p.topk_indices,
+                        x_a8,
+                        p.gate_batch,
+                        p.up_batch,
+                        2 * p.mi,
+                        p.hidden,
+                        p.k_top,
+                        87,
+                    )
+                )?;
+                i8dot_diag_f32(gpu, "gate", p.gate_batch)?;
+                i8dot_diag_f32(gpu, "up", p.up_batch)?;
+            } else {
+                hip!(gpu.deepseek4_gemv_mq2g256_lloyd_moe_gate_up_indexed(
+                    p.expert_gate_up_ptrs,
+                    p.topk_indices,
+                    p.x_rot,
+                    p.gate_batch,
+                    p.up_batch,
+                    2 * p.mi,
+                    p.hidden,
+                    p.k_top,
+                ))?;
+            }
+        }
+        DType::MQ3G256Lloyd => {
+            if p.x_a8.is_some() {
+                return Err(DispatchError::Hip(
+                    "DeepSeek4 MQ3 gate/up cannot use the MQ2 I8DOT activation path".into(),
+                ));
+            }
+            hip!(gpu.deepseek4_gemv_mq3g256_lloyd_moe_gate_up_indexed(
+                p.expert_gate_up_ptrs,
+                p.topk_indices,
+                p.x_rot,
+                p.gate_batch,
+                p.up_batch,
+                2 * p.mi,
+                p.hidden,
+                p.k_top,
+            ))?;
+        }
+        dtype => {
+            return Err(DispatchError::Hip(format!(
+                "DeepSeek4 routed gate/up dtype {dtype:?} is unsupported"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn run_moe_bias_aware_down(
+    gpu: &mut Gpu,
+    p: &crate::families::moe::MoeBiasAwareParams,
+) -> Result<(), DispatchError> {
+    macro_rules! hip {
+        ($e:expr) => {
+            $e.map_err(|e| DispatchError::Hip(e.to_string()))
+        };
+    }
+    match p.down_dtype {
+        DType::HFP4G32 => {
+            hip!(gpu.gemv_hfp4g32_moe_down_residual_scaled_indexed_batched(
+                p.expert_down_ptrs,
+                p.topk_indices,
+                p.topk_weights,
+                p.gate_batch,
+                p.ffn_out,
+                p.hidden,
+                p.mi,
+                p.k_top,
+                1,
+            ))?;
+        }
+        DType::MQ4G256 => {
+            hip!(
+                gpu.gemv_hfq4g256_moe_down_residual_scaled_k8_indexed_batched(
+                    p.expert_down_ptrs,
+                    p.topk_indices,
+                    p.topk_weights,
+                    p.rot_batch,
+                    p.ffn_out,
+                    p.hidden,
+                    p.mi,
+                    p.k_top,
+                    1,
+                )
+            )?;
+        }
+        DType::MQ2G256Lloyd => {
+            let deterministic =
+                hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_DETERMINISTIC").as_deref()
+                    != Ok("0");
+            if deterministic {
+                hip!(gpu.deepseek4_gemv_mq2g256_lloyd_moe_down_expanded_k4(
+                    p.expert_down_ptrs,
+                    p.topk_indices,
+                    p.rot_batch,
+                    p.down_expanded,
+                    p.hidden,
+                    p.mi,
+                    p.k_top,
+                    1,
+                ))?;
+                hip!(gpu.moe_down_combine_k8_batched(
+                    p.down_expanded,
+                    p.topk_weights,
+                    p.ffn_out,
+                    p.hidden,
+                    p.k_top,
+                    1,
+                ))?;
+            } else {
+                hip!(
+                    gpu.deepseek4_gemv_mq2g256_lloyd_moe_down_residual_scaled_indexed(
+                        p.expert_down_ptrs,
+                        p.topk_indices,
+                        p.topk_weights,
+                        p.rot_batch,
+                        p.ffn_out,
+                        p.hidden,
+                        p.mi,
+                        p.k_top,
+                    )
+                )?;
+            }
+        }
+        DType::MQ3G256Lloyd => {
+            // Correctness-first atomic path; expanded MQ3 is not implemented.
+            hip!(
+                gpu.deepseek4_gemv_mq3g256_lloyd_moe_down_residual_scaled_indexed(
+                    p.expert_down_ptrs,
+                    p.topk_indices,
+                    p.topk_weights,
+                    p.rot_batch,
+                    p.ffn_out,
+                    p.hidden,
+                    p.mi,
+                    p.k_top,
+                )
+            )?;
+        }
+        dtype => {
+            return Err(DispatchError::Hip(format!(
+                "DeepSeek4 routed down dtype {dtype:?} is unsupported"
+            )));
+        }
+    }
+    Ok(())
+}
 
 /// DeepSeek-V4 bias-aware MoE decode executor. Transcribes the routed sub-graph
 /// of `hipfire-arch-deepseek4::forward::ffn_routed` (the fused
@@ -1385,37 +1589,10 @@ pub fn run_moe_decode_bias_aware_prepare(
         p.k_top as i32,
         p.route_scale,
     ))?;
-    if let Some(x_a8) = p.x_a8 {
-        i8dot_diag_f32(gpu, "x_rot", p.x_rot)?;
-        hip!(gpu.deepseek4_quantize_f32_a8_g128_gfx90a(p.x_rot, x_a8, p.hidden, true,))?;
-        i8dot_diag_a8(gpu, x_a8)?;
-        hip!(
-            gpu.deepseek4_gemv_mq2g256_i8dot_affine_moe_gate_up_indexed_gfx90a(
-                p.expert_gate_up_ptrs,
-                p.topk_indices,
-                x_a8,
-                p.gate_batch,
-                p.up_batch,
-                2 * p.mi,
-                p.hidden,
-                p.k_top,
-                87,
-            )
-        )?;
-        i8dot_diag_f32(gpu, "gate", p.gate_batch)?;
-        i8dot_diag_f32(gpu, "up", p.up_batch)?;
-    } else {
-        hip!(gpu.deepseek4_gemv_mq2g256_lloyd_moe_gate_up_indexed(
-            p.expert_gate_up_ptrs,
-            p.topk_indices,
-            p.x_rot,
-            p.gate_batch,
-            p.up_batch,
-            2 * p.mi,
-            p.hidden,
-            p.k_top,
-        ))?;
+    if let Some(expert_owned) = p.expert_owned_mask {
+        hip!(gpu.deepseek4_mask_topk_owned(p.topk_indices, expert_owned, p.k_top, p.n_exp,))?;
     }
+    run_moe_bias_aware_gate_up(gpu, p)?;
     hip!(gpu.deepseek4_silu_mul_clamp_f32_batched(
         p.gate_batch,
         p.up_batch,
@@ -1427,6 +1604,15 @@ pub fn run_moe_decode_bias_aware_prepare(
     if p.x_a8.is_some() {
         i8dot_diag_f32(gpu, "silu", p.gate_batch)?;
     }
+    if p.down_dtype != DType::MQ2G256Lloyd {
+        return Err(DispatchError::UnsupportedVariant {
+            family: "moe",
+            variant: "bias-aware-ranged-down-requires-mq2-lloyd",
+            arch: "",
+            quant: "non-mq2",
+        });
+    }
+
     hip!(gpu.rotate_x_mq_batched(p.gate_batch, p.rot_batch, p.mi, p.k_top,))?;
     if p.x_a8.is_some() {
         i8dot_diag_f32(gpu, "rot", p.rot_batch)?;
@@ -1532,40 +1718,18 @@ pub fn run_moe_decode_bias_aware(
         p.k_top as i32,
         p.route_scale,
     ))?;
-
-    // 2. Indexed gate/up. I8DOT-enabled layers use the transcoded TILED8
-    // affine metadata; all other layers retain the MQ2-Lloyd path.
-    if let Some(x_a8) = p.x_a8 {
-        i8dot_diag_f32(gpu, "x_rot", p.x_rot)?;
-        hip!(gpu.deepseek4_quantize_f32_a8_g128_gfx90a(p.x_rot, x_a8, p.hidden, true,))?;
-        i8dot_diag_a8(gpu, x_a8)?;
-        hip!(
-            gpu.deepseek4_gemv_mq2g256_i8dot_affine_moe_gate_up_indexed_gfx90a(
-                p.expert_gate_up_ptrs,
-                p.topk_indices,
-                x_a8,
-                p.gate_batch,
-                p.up_batch,
-                2 * p.mi,
-                p.hidden,
-                p.k_top,
-                87,
-            )
-        )?;
-        i8dot_diag_f32(gpu, "gate", p.gate_batch)?;
-        i8dot_diag_f32(gpu, "up", p.up_batch)?;
-    } else {
-        hip!(gpu.deepseek4_gemv_mq2g256_lloyd_moe_gate_up_indexed(
-            p.expert_gate_up_ptrs,
-            p.topk_indices,
-            p.x_rot,
-            p.gate_batch,
-            p.up_batch,
-            2 * p.mi,
-            p.hidden,
-            p.k_top,
-        ))?;
+    if let Some(expert_owned) = p.expert_owned_mask {
+        // MQ4's existing wave64 indexed kernels do not accept the -1 sentinel.
+        // Keep global expert ids for that layout and use the loader's zero
+        // gate/up dummy pointer for remote experts. The resulting activation is
+        // exactly zero, so the compact-base down pointer also contributes zero.
+        // MQ2/MQ3 kernels retain the early-return mask and its compute saving.
+        if p.gate_up_dtype != DType::MQ4G256 || p.down_dtype != DType::MQ4G256 {
+            hip!(gpu.deepseek4_mask_topk_owned(p.topk_indices, expert_owned, p.k_top, p.n_exp,))?;
+        }
     }
+
+    run_moe_bias_aware_gate_up(gpu, p)?;
 
     hip!(gpu.deepseek4_silu_mul_clamp_f32_batched(
         p.gate_batch,
@@ -1578,50 +1742,18 @@ pub fn run_moe_decode_bias_aware(
     if p.x_a8.is_some() {
         i8dot_diag_f32(gpu, "silu", p.gate_batch)?;
     }
-    hip!(gpu.rotate_x_mq_batched(p.gate_batch, p.rot_batch, p.mi, p.k_top,))?;
-    if p.x_a8.is_some() {
-        i8dot_diag_f32(gpu, "rot", p.rot_batch)?;
+    if p.down_dtype != DType::HFP4G32 {
+        hip!(gpu.rotate_x_mq_batched(p.gate_batch, p.rot_batch, p.mi, p.k_top,))?;
+        if p.x_a8.is_some() {
+            i8dot_diag_f32(gpu, "rot", p.rot_batch)?;
+        }
     }
 
-    // 4. Indexed MQ2-Lloyd down. Deterministic (default): expanded per-expert
-    //    write + fixed-order non-atomic combine into ffn_out — bit-reproducible
-    //    for greedy/spec-decode. MOE_DETERMINISTIC=0 uses the faster
-    //    atomicAdd-fused path (nondeterministic; bench only).
-    let deterministic =
-        hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_DETERMINISTIC").as_deref() != Ok("0");
-    if deterministic {
-        hip!(gpu.deepseek4_gemv_mq2g256_lloyd_moe_down_expanded_k4(
-            p.expert_down_ptrs,
-            p.topk_indices,
-            p.rot_batch,
-            p.down_expanded,
-            p.hidden,
-            p.mi,
-            p.k_top,
-            1,
-        ))?;
-        hip!(gpu.moe_down_combine_k8_batched(
-            p.down_expanded,
-            p.topk_weights,
-            p.ffn_out,
-            p.hidden,
-            p.k_top,
-            1,
-        ))?;
-    } else {
-        hip!(
-            gpu.deepseek4_gemv_mq2g256_lloyd_moe_down_residual_scaled_indexed(
-                p.expert_down_ptrs,
-                p.topk_indices,
-                p.topk_weights,
-                p.rot_batch,
-                p.ffn_out,
-                p.hidden,
-                p.mi,
-                p.k_top,
-            )
-        )?;
-    }
+    // 4. Indexed routed down. Native HFP4 consumes `gate_batch` directly;
+    //    MQ layouts consume the FWHT-rotated `rot_batch`. MQ2's default
+    //    expanded path combines in a fixed order; other formats currently use
+    //    their atomic accumulation kernel.
+    run_moe_bias_aware_down(gpu, p)?;
 
     Ok(())
 }
@@ -1808,6 +1940,250 @@ fn grouped_m_total_bound(total_slots: usize, n_exp: usize, block_m: usize) -> us
     let unaligned = total_slots + live_expert_bound * (block_m - 1);
     unaligned.div_ceil(block_m) * block_m
 }
+fn run_moe_prefill_bias_aware_indexed_fallback(
+    gpu: &mut Gpu,
+    p: &crate::families::moe::MoeBiasAwarePrefillParams,
+) -> Result<(), DispatchError> {
+    macro_rules! hip {
+        ($e:expr) => {
+            $e.map_err(|e| DispatchError::Hip(e.to_string()))
+        };
+    }
+    if p.gate_up_dtype == DType::HFP4G32 && p.down_dtype == DType::HFP4G32 {
+        if p.x_a8.is_some() {
+            return Err(DispatchError::Hip(
+                "DeepSeek4 native FP4 prefill cannot use MQ2 I8DOT activations".into(),
+            ));
+        }
+        hip!(gpu.gemv_hfp4g32_moe_gate_up_indexed_batched(
+            p.expert_gate_up_ptrs,
+            p.topk_indices,
+            p.x_rot,
+            p.gate_batch,
+            p.up_batch,
+            2 * p.mi,
+            p.hidden,
+            p.k_top,
+            p.batch_size,
+        ))?;
+        hip!(gpu.deepseek4_silu_mul_clamp_f32_batched(
+            p.gate_batch,
+            p.up_batch,
+            p.gate_batch,
+            p.mi,
+            p.batch_size * p.k_top,
+            p.swiglu_limit,
+        ))?;
+        hip!(gpu.gemv_hfp4g32_moe_down_residual_scaled_indexed_batched(
+            p.expert_down_ptrs,
+            p.topk_indices,
+            p.topk_weights,
+            p.gate_batch,
+            p.ffn_out,
+            p.hidden,
+            p.mi,
+            p.k_top,
+            p.batch_size,
+        ))?;
+        return Ok(());
+    }
+
+    if p.gate_up_dtype == DType::MQ4G256 && p.down_dtype == DType::MQ4G256 {
+        if p.x_a8.is_some() {
+            return Err(DispatchError::Hip(
+                "DeepSeek4 MQ4 prefill cannot use MQ2 I8DOT weights".into(),
+            ));
+        }
+        hip!(gpu.gemv_hfq4g256_moe_gate_up_k8_indexed_batched(
+            p.expert_gate_up_ptrs,
+            p.topk_indices,
+            p.x_rot,
+            p.gate_batch,
+            p.up_batch,
+            2 * p.mi,
+            p.hidden,
+            p.k_top,
+            p.batch_size,
+        ))?;
+        hip!(gpu.deepseek4_silu_mul_clamp_f32_batched(
+            p.gate_batch,
+            p.up_batch,
+            p.gate_batch,
+            p.mi,
+            p.batch_size * p.k_top,
+            p.swiglu_limit,
+        ))?;
+        hip!(gpu.rotate_x_mq_batched(p.gate_batch, p.rot_batch, p.mi, p.batch_size * p.k_top,))?;
+        hip!(
+            gpu.gemv_hfq4g256_moe_down_residual_scaled_k8_indexed_batched(
+                p.expert_down_ptrs,
+                p.topk_indices,
+                p.topk_weights,
+                p.rot_batch,
+                p.ffn_out,
+                p.hidden,
+                p.mi,
+                p.k_top,
+                p.batch_size,
+            )
+        )?;
+        return Ok(());
+    }
+
+    let a8_stride = (p.hidden / 128) * 136;
+    for batch in 0..p.batch_size {
+        let indices = p.topk_indices.sub_offset(batch * p.k_top, p.k_top);
+        let weights = p.topk_weights.sub_offset(batch * p.k_top, p.k_top);
+        let x = p.x_rot.sub_offset(batch * p.hidden, p.hidden);
+        let gate = p
+            .gate_batch
+            .sub_offset(batch * p.k_top * p.mi, p.k_top * p.mi);
+        let up = p
+            .up_batch
+            .sub_offset(batch * p.k_top * p.mi, p.k_top * p.mi);
+        let rot = p
+            .rot_batch
+            .sub_offset(batch * p.k_top * p.mi, p.k_top * p.mi);
+        let out = p.ffn_out.sub_offset(batch * p.hidden, p.hidden);
+        let x_a8 = p
+            .x_a8
+            .map(|tensor| tensor.sub_offset(batch * a8_stride, a8_stride));
+
+        match p.gate_up_dtype {
+            DType::MQ4G256 => {
+                if x_a8.is_some() {
+                    return Err(DispatchError::Hip(
+                        "DeepSeek4 MQ4 prefill cannot use MQ2 I8DOT weights".into(),
+                    ));
+                }
+                hip!(gpu.gemv_hfq4g256_moe_gate_up_k8_indexed_batched(
+                    p.expert_gate_up_ptrs,
+                    &indices,
+                    &x,
+                    &gate,
+                    &up,
+                    2 * p.mi,
+                    p.hidden,
+                    p.k_top,
+                    1,
+                ))?;
+            }
+            DType::MQ2G256Lloyd => {
+                if let Some(x_a8) = x_a8.as_ref() {
+                    hip!(gpu.deepseek4_quantize_f32_a8_g128_gfx90a(&x, x_a8, p.hidden, true,))?;
+                    hip!(
+                        gpu.deepseek4_gemv_mq2g256_i8dot_affine_moe_gate_up_indexed_gfx90a(
+                            p.expert_gate_up_ptrs,
+                            &indices,
+                            x_a8,
+                            &gate,
+                            &up,
+                            2 * p.mi,
+                            p.hidden,
+                            p.k_top,
+                            87,
+                        )
+                    )?;
+                } else {
+                    hip!(gpu.deepseek4_gemv_mq2g256_lloyd_moe_gate_up_indexed(
+                        p.expert_gate_up_ptrs,
+                        &indices,
+                        &x,
+                        &gate,
+                        &up,
+                        2 * p.mi,
+                        p.hidden,
+                        p.k_top,
+                    ))?;
+                }
+            }
+            DType::MQ3G256Lloyd => {
+                if x_a8.is_some() {
+                    return Err(DispatchError::Hip(
+                        "DeepSeek4 MQ3 prefill cannot use MQ2 I8DOT weights".into(),
+                    ));
+                }
+                hip!(gpu.deepseek4_gemv_mq3g256_lloyd_moe_gate_up_indexed(
+                    p.expert_gate_up_ptrs,
+                    &indices,
+                    &x,
+                    &gate,
+                    &up,
+                    2 * p.mi,
+                    p.hidden,
+                    p.k_top,
+                ))?;
+            }
+            dtype => {
+                return Err(DispatchError::Hip(format!(
+                    "DeepSeek4 prefill gate/up dtype {dtype:?} is unsupported"
+                )));
+            }
+        }
+
+        hip!(gpu.deepseek4_silu_mul_clamp_f32_batched(
+            &gate,
+            &up,
+            &gate,
+            p.mi,
+            p.k_top,
+            p.swiglu_limit,
+        ))?;
+        hip!(gpu.rotate_x_mq_batched(&gate, &rot, p.mi, p.k_top,))?;
+
+        match p.down_dtype {
+            DType::MQ4G256 => {
+                hip!(
+                    gpu.gemv_hfq4g256_moe_down_residual_scaled_k8_indexed_batched(
+                        p.expert_down_ptrs,
+                        &indices,
+                        &weights,
+                        &rot,
+                        &out,
+                        p.hidden,
+                        p.mi,
+                        p.k_top,
+                        1,
+                    )
+                )?;
+            }
+            DType::MQ2G256Lloyd => {
+                hip!(
+                    gpu.deepseek4_gemv_mq2g256_lloyd_moe_down_residual_scaled_indexed(
+                        p.expert_down_ptrs,
+                        &indices,
+                        &weights,
+                        &rot,
+                        &out,
+                        p.hidden,
+                        p.mi,
+                        p.k_top,
+                    )
+                )?;
+            }
+            DType::MQ3G256Lloyd => {
+                hip!(
+                    gpu.deepseek4_gemv_mq3g256_lloyd_moe_down_residual_scaled_indexed(
+                        p.expert_down_ptrs,
+                        &indices,
+                        &weights,
+                        &rot,
+                        &out,
+                        p.hidden,
+                        p.mi,
+                        p.k_top,
+                    )
+                )?;
+            }
+            dtype => {
+                return Err(DispatchError::Hip(format!(
+                    "DeepSeek4 prefill down dtype {dtype:?} is unsupported"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
 
 /// DeepSeek-V4 batched/prefill MoE executor. Transcribes the routed block of
 /// `hipfire-arch-deepseek4::forward::ffn_batched`: routing (hash or bias-aware)
@@ -1888,6 +2264,8 @@ pub fn run_moe_prefill_bias_aware(
         .and_then(|s| s.parse().ok())
         .unwrap_or(default_gate_threshold);
     let use_grouped = p.x_a8.is_none()
+        && p.gate_up_dtype == DType::MQ2G256Lloyd
+        && p.down_dtype == DType::MQ2G256Lloyd
         && batch_size >= gate_threshold
         && hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_GROUPED").as_deref() != Ok("0");
 
@@ -2066,6 +2444,8 @@ pub fn run_moe_prefill_bias_aware(
             k_top,
             batch_size,
         ))?;
+    } else if p.gate_up_dtype != DType::MQ2G256Lloyd || p.down_dtype != DType::MQ2G256Lloyd {
+        run_moe_prefill_bias_aware_indexed_fallback(gpu, p)?;
     } else {
         // ── Scalar K4 path (batch_size < gate, or grouped opt-out) ──
         if let Some(x_a8) = p.x_a8 {

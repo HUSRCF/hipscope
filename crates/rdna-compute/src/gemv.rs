@@ -98,6 +98,49 @@ pub(crate) fn e8_soa_experts_enabled() -> bool {
 }
 
 impl Gpu {
+    /// Mark non-owned DeepSeek4 EP routes with -1 without changing the global
+    /// top-k weights. The indexed gfx90a expert kernels treat -1 as a zero
+    /// contribution and return before reading their weight pointer table.
+    pub fn deepseek4_mask_topk_owned(
+        &mut self,
+        topk_indices: &GpuTensor,
+        expert_owned: &GpuTensor,
+        k_top: usize,
+        n_exp: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "deepseek4_mask_topk_owned",
+            kernels::DEEPSEEK4_MASK_TOPK_OWNED_SRC,
+            "deepseek4_mask_topk_owned_i32",
+        )?;
+        let ip = topk_indices.buf.as_ptr();
+        let op = expert_owned.buf.as_ptr();
+        let kt = k_top as i32;
+        let ne = n_exp as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &ip as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &kt as *const _ as *mut c_void,
+            &ne as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "deepseek4_mask_topk_owned_i32",
+            [k_top.div_ceil(64) as u32, 1, 1],
+            [64, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ip);
+                b.push_ptr(op);
+                b.push_i32(kt);
+                b.push_i32(ne);
+                b
+            },
+        )
+    }
+
     /// Q4_LUT GEMV: 4-bit with LDS codebook lookup. 48 bytes per 32 elements.
     pub fn gemv_q4lut(
         &mut self,
@@ -7934,6 +7977,160 @@ impl Gpu {
         result
     }
 
+    /// gfx90a/wave64 N-batched indexed MoE gate+up over released
+    /// DeepSeek-V4 FP4 experts reframed losslessly as HFP4G32.
+    ///
+    /// Unlike MQ formats, these source weights are not FWHT-rotated: `x`
+    /// must be the plain activation. Grid = (ceil(M/2), K_TOP, N).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_hfp4g32_moe_gate_up_indexed_batched(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        x: &GpuTensor,
+        y_gate: &GpuTensor,
+        y_up: &GpuTensor,
+        m: usize,
+        k: usize,
+        k_top: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(k % 256, 0, "HFP4 indexed gate_up requires K%256==0");
+        self.ensure_kernel(
+            "gemv_hfp4g32_moe_gate_up_indexed_batched_wave64",
+            kernels::GEMV_HFP4G32_MOE_GATE_UP_INDEXED_BATCHED_WAVE64_SRC,
+            "gemv_hfp4g32_moe_gate_up_indexed_batched_wave64",
+        )?;
+
+        let pp = expert_ptrs.buf.as_ptr();
+        let ip = topk_indices.buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let ygp = y_gate.buf.as_ptr();
+        let yup = y_up.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let kt_val = k_top as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &ygp as *const _ as *mut c_void,
+            &yup as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &kt_val as *const _ as *mut c_void,
+        ];
+        let weight_bytes = m * (16 + (k / 32) * 17);
+        let bytes = batch_size * k_top * (weight_bytes + (k + m) * 4);
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "gemv",
+            "gemv_hfp4g32_moe_gate_up_indexed_batched_wave64",
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "gemv_hfp4g32_moe_gate_up_indexed_batched_wave64",
+            [m.div_ceil(2) as u32, k_top as u32, batch_size as u32],
+            [64, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp);
+                b.push_ptr(ip);
+                b.push_ptr(xp);
+                b.push_ptr(ygp);
+                b.push_ptr(yup);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(kt_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// gfx90a/wave64 N-batched indexed MoE down + scaled residual over
+    /// released DeepSeek-V4 FP4 experts reframed as HFP4G32.
+    ///
+    /// `gate_batch` is the plain post-SwiGLU activation; no FWHT is valid
+    /// for the released source weights.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_hfp4g32_moe_down_residual_scaled_indexed_batched(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        topk_weights: &GpuTensor,
+        gate_batch: &GpuTensor,
+        x_residual: &GpuTensor,
+        m: usize,
+        k: usize,
+        k_top: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(k % 256, 0, "HFP4 indexed down requires K%256==0");
+        self.ensure_kernel(
+            "gemv_hfp4g32_moe_down_indexed_batched_wave64",
+            kernels::GEMV_HFP4G32_MOE_DOWN_INDEXED_BATCHED_WAVE64_SRC,
+            "gemv_hfp4g32_moe_down_residual_scaled_indexed_batched_wave64",
+        )?;
+
+        let pp = expert_ptrs.buf.as_ptr();
+        let ip = topk_indices.buf.as_ptr();
+        let wp = topk_weights.buf.as_ptr();
+        let gbp = gate_batch.buf.as_ptr();
+        let xrp = x_residual.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let kt_val = k_top as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &gbp as *const _ as *mut c_void,
+            &xrp as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &kt_val as *const _ as *mut c_void,
+        ];
+        let weight_bytes = m * (16 + (k / 32) * 17);
+        let bytes = batch_size * k_top * (weight_bytes + (k + m) * 4);
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "gemv",
+            "gemv_hfp4g32_moe_down_residual_scaled_indexed_batched_wave64",
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "gemv_hfp4g32_moe_down_residual_scaled_indexed_batched_wave64",
+            [m.div_ceil(2) as u32, k_top as u32, batch_size as u32],
+            [64, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp);
+                b.push_ptr(ip);
+                b.push_ptr(wp);
+                b.push_ptr(gbp);
+                b.push_ptr(xrp);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(kt_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// Atomic-free counterpart to
     /// `gemv_hfq4g256_moe_down_residual_scaled_k8_indexed_batched`. Writes
     /// each (token, krank) result to its own row of `expert_outputs`
@@ -10230,11 +10427,21 @@ impl Gpu {
         k_top: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel(
-            "gemv_mq3g256_lloyd_moe_gate_up_indexed",
-            kernels::GEMV_MQ3G256_LLOYD_MOE_GATE_UP_INDEXED_SRC,
-            "gemv_mq3g256_lloyd_moe_gate_up_k8_indexed",
-        )?;
+        let gfx90a = self.arch_caps.is_cdna2();
+        let (module, source, function) = if gfx90a {
+            (
+                "gemv_mq3g256_lloyd_moe_gate_up_indexed_gfx90a",
+                kernels::GEMV_MQ3G256_LLOYD_MOE_GATE_UP_INDEXED_GFX90A_SRC,
+                "gemv_mq3g256_lloyd_moe_gate_up_k8_indexed_gfx90a",
+            )
+        } else {
+            (
+                "gemv_mq3g256_lloyd_moe_gate_up_indexed",
+                kernels::GEMV_MQ3G256_LLOYD_MOE_GATE_UP_INDEXED_SRC,
+                "gemv_mq3g256_lloyd_moe_gate_up_k8_indexed",
+            )
+        };
+        self.ensure_kernel(module, source, function)?;
         let pp = expert_ptrs.buf.as_ptr();
         let ip = topk_indices.buf.as_ptr();
         let xp = x_rot.buf.as_ptr();
@@ -10261,9 +10468,9 @@ impl Gpu {
             bytes,
         );
         let result = self.launch_maybe_blob(
-            "gemv_mq3g256_lloyd_moe_gate_up_k8_indexed",
+            function,
             [m as u32, k_top as u32, 1],
-            [32, 1, 1],
+            [if gfx90a { 64 } else { 32 }, 1, 1],
             0,
             &mut params,
             || {
@@ -10300,11 +10507,21 @@ impl Gpu {
         k_top: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel(
-            "gemv_mq3g256_lloyd_moe_down_indexed",
-            kernels::GEMV_MQ3G256_LLOYD_MOE_DOWN_INDEXED_SRC,
-            "gemv_mq3g256_lloyd_moe_down_residual_scaled_k8_indexed",
-        )?;
+        let gfx90a = self.arch_caps.is_cdna2();
+        let (module, source, function) = if gfx90a {
+            (
+                "gemv_mq3g256_lloyd_moe_down_indexed_gfx90a",
+                kernels::GEMV_MQ3G256_LLOYD_MOE_DOWN_INDEXED_GFX90A_SRC,
+                "gemv_mq3g256_lloyd_moe_down_residual_scaled_k8_indexed_gfx90a",
+            )
+        } else {
+            (
+                "gemv_mq3g256_lloyd_moe_down_indexed",
+                kernels::GEMV_MQ3G256_LLOYD_MOE_DOWN_INDEXED_SRC,
+                "gemv_mq3g256_lloyd_moe_down_residual_scaled_k8_indexed",
+            )
+        };
+        self.ensure_kernel(module, source, function)?;
         let pp = expert_ptrs.buf.as_ptr();
         let ip = topk_indices.buf.as_ptr();
         let wp = topk_weights.buf.as_ptr();
@@ -10331,9 +10548,9 @@ impl Gpu {
             bytes,
         );
         let result = self.launch_maybe_blob(
-            "gemv_mq3g256_lloyd_moe_down_residual_scaled_k8_indexed",
+            function,
             [m as u32, k_top as u32, 1],
-            [32, 1, 1],
+            [if gfx90a { 64 } else { 32 }, 1, 1],
             0,
             &mut params,
             || {

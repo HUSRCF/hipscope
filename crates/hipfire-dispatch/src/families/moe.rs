@@ -381,6 +381,10 @@ pub struct MoeBiasAwareParams<'a> {
     /// Token-batch width. Decode = 1. A value > 1 must route to the grouped
     /// prefill executor (Step 8), never this decode arm — guarded in the executor.
     pub batch_size: usize,
+    /// Uniform packed formats for this layer's routed projections.
+    pub gate_up_dtype: DType,
+    pub down_dtype: DType,
+
     // activations / residual
     /// FWHT-rotated activation (model pre-rotates; this arm does not re-rotate).
     pub x_rot: &'a GpuTensor,
@@ -395,6 +399,9 @@ pub struct MoeBiasAwareParams<'a> {
     // routed expert pointer tables
     pub expert_gate_up_ptrs: &'a GpuTensor,
     pub expert_down_ptrs: &'a GpuTensor,
+    /// EP rank-local ownership bitmap. When present, remote top-k indices are
+    /// replaced by -1 on-device before the indexed gfx90a kernels run.
+    pub expert_owned_mask: Option<&'a GpuTensor>,
     // scratch buffers (model-owned)
     pub topk_indices: &'a GpuTensor,
     pub topk_weights: &'a GpuTensor,
@@ -439,6 +446,10 @@ pub struct MoeBiasAwarePrefillParams<'a> {
     pub route_scale: f32,
     pub swiglu_limit: f32,
     pub layer_idx: usize, // for the optional HIPFIRE_DEEPSEEK4_DUMP_TOPK header
+    /// Uniform packed formats for this layer's routed projections.
+    pub gate_up_dtype: DType,
+    pub down_dtype: DType,
+
     // routing
     pub routing: MoePrefillRouting<'a>,
     pub scores: &'a GpuTensor, // post-sqrt_softplus moe_scores_batch [B, n_exp]

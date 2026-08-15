@@ -142,8 +142,23 @@ void HIPFIRE_MQ2_I8DOT_KERNEL(
     if (row_start >= M) return;
 
     const int krank = blockIdx.y;
+    const int expert_id = topk_indices[krank];
+    if (expert_id < 0) {
+        if (lane == 31) {
+            const int split = M >> 1;
+            #pragma unroll
+            for (int r = 0; r < HIPFIRE_MQ2_I8DOT_ROW_TILE; ++r) {
+                const int row = row_start + r;
+                if (row < M) {
+                    if (row < split) y_gate[(long long)krank * split + row] = 0.0f;
+                    else y_up[(long long)krank * split + row - split] = 0.0f;
+                }
+            }
+        }
+        return;
+    }
     const char* weights = reinterpret_cast<const char*>(
-        expert_ptrs[topk_indices[krank]]);
+        expert_ptrs[expert_id]);
     const int groups = K / 256;
     const long long row_bytes = (long long)groups * 72;
     float output[HIPFIRE_MQ2_I8DOT_ROW_TILE] = {};

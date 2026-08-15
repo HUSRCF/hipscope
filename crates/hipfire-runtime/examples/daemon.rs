@@ -17015,11 +17015,17 @@ fn build_deepseek4_dsml_prompt(
     let user_tok = lookup("<｜User｜>");
     let asst_tok = lookup("<｜Assistant｜>");
 
-    // HF "Reasoning Effort: Absolute maximum..." preamble for `Max` mode.
-    // Quoted from the model card's encoding/README.md.
+    // Official 0731 reasoning-effort prefixes. These strings are byte-for-byte
+    // identical to `encoding/encoding_dsv4.py`, including the trailing blank
+    // line before the optional system message.
+    const HIGH_THINK_PREAMBLE: &str =
+        "Reasoning Effort: Absolute maximum with no shortcuts permitted.\n\
+You MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\n\
+Explicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n";
     const MAX_THINK_PREAMBLE: &str =
-        "Reasoning Effort: Absolute maximum with no shortcuts permitted. \
-You MUST be very thorough in your thinking and comprehensively decompose the problem.";
+        "Reasoning Effort: Beyond maximum — exhaustive, relentless, and uncompromising.\n\
+You MUST reason with the utmost depth and rigor, leaving absolutely nothing to chance: exhaustively decompose the problem into its most fundamental components, trace every causal chain to its root, and resolve the underlying cause rather than any surface symptom.\n\
+Do not stop reasoning until you have independently verified the solution from multiple angles and are certain that no assumption remains unchecked and no error remains undiscovered.\n\n";
 
     // Build the effective system message: optional user-supplied system
     // text + (if request has tools) the DSML "## Tools" preamble.
@@ -17051,8 +17057,10 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
     if let Some(b) = bos_tok {
         prompt_ids.push(b);
     }
-    if matches!(think_mode, ThinkMode::Max) {
-        prompt_ids.extend(tokenizer.encode(MAX_THINK_PREAMBLE));
+    match think_mode {
+        ThinkMode::High => prompt_ids.extend(tokenizer.encode(HIGH_THINK_PREAMBLE)),
+        ThinkMode::Max => prompt_ids.extend(tokenizer.encode(MAX_THINK_PREAMBLE)),
+        ThinkMode::NonThink => {},
     }
     if let Some(ref sys) = effective_system {
         prompt_ids.extend(tokenizer.encode(sys));

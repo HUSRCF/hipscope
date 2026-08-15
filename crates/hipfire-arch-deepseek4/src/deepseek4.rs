@@ -544,6 +544,15 @@ pub struct DeepseekV4LayerWeights {
     pub expert_gate_up_blob: Option<rdna_compute::GpuTensor>,
     pub expert_gate_up_ptrs: Option<rdna_compute::GpuTensor>,
     pub expert_gate_up_stride: usize,
+    /// Packed format shared by every w1/w3 expert in this layer. This is
+    /// explicit metadata because the combined arena itself is byte-oriented.
+    pub expert_gate_up_dtype: Option<rdna_compute::DType>,
+    /// Packed format shared by every w2 expert in this layer.
+    pub expert_down_dtype: Option<rdna_compute::DType>,
+
+    /// EP-shard only: one byte per global routed expert (1 = owned by this
+    /// rank, 0 = remote). Decode masks remote top-k slots to -1 on-device.
+    pub expert_owned_mask: Option<rdna_compute::GpuTensor>,
 
     /// EP-shard only: the shared zeroed gate_up buffer that non-owned experts'
     /// pointers index into (→ SwiGLU(0,0)=0 ⇒ 0 routed contribution). Owned
@@ -626,6 +635,9 @@ impl DeepseekV4LayerWeights {
             expert_gate_up_blob: sc(&self.expert_gate_up_blob),
             expert_gate_up_ptrs: sc(&self.expert_gate_up_ptrs),
             expert_gate_up_stride: self.expert_gate_up_stride,
+            expert_owned_mask: sc(&self.expert_owned_mask),
+            expert_gate_up_dtype: self.expert_gate_up_dtype,
+            expert_down_dtype: self.expert_down_dtype,
             expert_gate_up_dummy: sc(&self.expert_gate_up_dummy),
         }
     }
@@ -691,7 +703,10 @@ impl DeepseekV4LayerWeights {
             expert_gate_up_blob: None,
             expert_gate_up_ptrs: None,
             expert_gate_up_stride: 0,
+            expert_owned_mask: None,
             expert_gate_up_dummy: None,
+            expert_gate_up_dtype: None,
+            expert_down_dtype: None,
         }
     }
 
@@ -755,6 +770,7 @@ impl DeepseekV4LayerWeights {
         free_opt(gpu, &mut self.expert_w3_ptrs);
         free_opt(gpu, &mut self.expert_gate_up_blob);
         free_opt(gpu, &mut self.expert_gate_up_ptrs);
+        free_opt(gpu, &mut self.expert_owned_mask);
         // EP-shard dummy gate_up buffer (was previously mem::forget-leaked).
         // Freed last so the pointer table that baked its address is already
         // gone — no live aliasing into a returned buffer. No double-free: this

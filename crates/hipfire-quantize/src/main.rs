@@ -182,9 +182,10 @@ struct QuantizeArgs {
     #[arg(long, default_value = "", value_name = "FORMAT")]
     vision_quant: String,
 
-    /// Ingest only tensors whose names start with this prefix.
+    /// Ingest only tensors whose names start with any of these prefixes.
+    /// Repeat the flag to select disjoint tensor families.
     #[arg(long, value_name = "PREFIX")]
-    include_prefix: Option<String>,
+    include_prefix: Vec<String>,
 }
 
 /// Refuse an `--arch-id` override that strips a qwen3* model (auto-detected
@@ -315,6 +316,202 @@ fn tensor_to_f32_with_optional_fp8_scale(
         );
     }
     to_f32(raw_data, &meta.dtype)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Deepseek4ExpertSourceEncoding {
+    Native,
+    Fp8E4m3,
+    Fp4E2m1,
+}
+
+/// Resolve the routed-expert source encoding from the checkpoint contract.
+///
+/// DeepSeek-V4-Flash declares `expert_dtype: "fp4"`, while the Base model
+/// declares `expert_dtype: "fp8"`. The first Base revision omitted that
+/// field but still declared an FP8/E4M3 quantization_config, so retain that
+/// unambiguous compatibility fallback. A checkpoint without either
+/// declaration is treated as a native floating-point source.
+fn deepseek4_expert_source_encoding(
+    config: &serde_json::Value,
+) -> Result<Deepseek4ExpertSourceEncoding, String> {
+    if let Some(value) = config.get("expert_dtype") {
+        if !value.is_null() {
+            let dtype = value
+                .as_str()
+                .ok_or_else(|| "DeepSeek V4 expert_dtype must be a string or null".to_string())?;
+            return match dtype.to_ascii_lowercase().as_str() {
+                "fp4" => Ok(Deepseek4ExpertSourceEncoding::Fp4E2m1),
+                "fp8" => Ok(Deepseek4ExpertSourceEncoding::Fp8E4m3),
+                other => Err(format!(
+                    "unsupported DeepSeek V4 expert_dtype {other:?}; expected fp4 or fp8"
+                )),
+            };
+        }
+    }
+
+    let quant_config = config.get("quantization_config").or_else(|| {
+        config
+            .get("text_config")
+            .and_then(|text| text.get("quantization_config"))
+    });
+    if let Some(quant_config) = quant_config {
+        let method = quant_config
+            .get("quant_method")
+            .and_then(|value| value.as_str());
+        let format = quant_config.get("fmt").and_then(|value| value.as_str());
+        if method == Some("fp8") && format == Some("e4m3") {
+            return Ok(Deepseek4ExpertSourceEncoding::Fp8E4m3);
+        }
+        return Err(format!(
+            "cannot infer DeepSeek V4 expert encoding from quantization_config: quant_method={method:?}, fmt={format:?}"
+        ));
+    }
+
+    Ok(Deepseek4ExpertSourceEncoding::Native)
+}
+
+/// Decode one routed-expert source tensor without guessing FP4 from the
+/// presence of a scale sibling. The config-selected encoding is authoritative
+/// and the tensor dtype/shape contract must agree with it.
+fn decode_deepseek4_expert_source(
+    name: &str,
+    raw_data: &[u8],
+    meta: &TensorMeta,
+    scale: Option<(&str, &TensorMeta, &[u8])>,
+    encoding: Deepseek4ExpertSourceEncoding,
+) -> Result<(Vec<f32>, Vec<usize>), String> {
+    if meta.shape.len() != 2 {
+        return Err(format!(
+            "{name}: routed expert must be 2D, got shape {:?}",
+            meta.shape
+        ));
+    }
+
+    match encoding {
+        Deepseek4ExpertSourceEncoding::Native => {
+            if scale.is_some() {
+                return Err(format!(
+                    "{name}: native routed expert unexpectedly has a quantization scale sibling"
+                ));
+            }
+            if meta.dtype == "I8" {
+                return Err(format!(
+                    "{name}: native routed expert cannot use ambiguous I8 storage"
+                ));
+            }
+            Ok((to_f32(raw_data, &meta.dtype), meta.shape.clone()))
+        }
+        Deepseek4ExpertSourceEncoding::Fp8E4m3 => {
+            if meta.dtype != "I8" && meta.dtype != "F8_E4M3" {
+                return Err(format!(
+                    "{name}: FP8 routed expert requires I8 or F8_E4M3 storage, got {}",
+                    meta.dtype
+                ));
+            }
+            let (scale_name, scale_meta, scale_bytes) = scale
+                .ok_or_else(|| format!("{name}: FP8 routed expert is missing its scale sibling"))?;
+            let rows = meta.shape[0];
+            let cols = meta.shape[1];
+            if raw_data.len() != rows * cols {
+                return Err(format!(
+                    "{name}: FP8 byte count {} does not match shape {:?}",
+                    raw_data.len(),
+                    meta.shape
+                ));
+            }
+            if scale_meta.shape.len() != 2
+                || scale_meta.shape[0] == 0
+                || scale_meta.shape[1] == 0
+                || rows % scale_meta.shape[0] != 0
+                || cols % scale_meta.shape[1] != 0
+            {
+                return Err(format!(
+                    "{name}: FP8 scale {scale_name} shape {:?} does not tile weight shape {:?}",
+                    scale_meta.shape, meta.shape
+                ));
+            }
+            let values = match scale_meta.dtype.as_str() {
+                "F32" => {
+                    if scale_bytes.len() != scale_meta.shape[0] * scale_meta.shape[1] * 4 {
+                        return Err(format!(
+                            "{name}: F32 scale {scale_name} byte count {} does not match shape {:?}",
+                            scale_bytes.len(),
+                            scale_meta.shape
+                        ));
+                    }
+                    dequantize_e4m3_f32scale_to_f32(
+                        raw_data,
+                        &meta.shape,
+                        scale_bytes,
+                        &scale_meta.shape,
+                    )
+                }
+                "F8_E8M0" => {
+                    if scale_bytes.len() != scale_meta.shape[0] * scale_meta.shape[1] {
+                        return Err(format!(
+                            "{name}: UE8M0 scale {scale_name} byte count {} does not match shape {:?}",
+                            scale_bytes.len(),
+                            scale_meta.shape
+                        ));
+                    }
+                    dequantize_e4m3_ue8m0_to_f32(
+                        raw_data,
+                        &meta.shape,
+                        scale_bytes,
+                        &scale_meta.shape,
+                    )
+                }
+                other => {
+                    return Err(format!(
+                        "{name}: FP8 routed expert scale {scale_name} has unsupported dtype {other}"
+                    ));
+                }
+            };
+            Ok((values, meta.shape.clone()))
+        }
+        Deepseek4ExpertSourceEncoding::Fp4E2m1 => {
+            if meta.dtype != "I8" {
+                return Err(format!(
+                    "{name}: packed FP4 routed expert requires I8 byte storage, got {}",
+                    meta.dtype
+                ));
+            }
+            let (scale_name, scale_meta, scale_bytes) = scale
+                .ok_or_else(|| format!("{name}: FP4 routed expert is missing its scale sibling"))?;
+            if scale_meta.dtype != "F8_E8M0" {
+                return Err(format!(
+                    "{name}: FP4 routed expert scale {scale_name} must be F8_E8M0, got {}",
+                    scale_meta.dtype
+                ));
+            }
+            let rows = meta.shape[0];
+            let stored_cols = meta.shape[1];
+            let logical_cols = stored_cols
+                .checked_mul(2)
+                .ok_or_else(|| format!("{name}: FP4 logical column count overflow"))?;
+            let expected_scale_cols = logical_cols / 32;
+            if logical_cols % 32 != 0
+                || scale_meta.shape != [rows, expected_scale_cols]
+                || raw_data.len() != rows * stored_cols
+                || scale_bytes.len() != rows * expected_scale_cols
+            {
+                return Err(format!(
+                    "{name}: packed FP4 contract mismatch: weight shape {:?}, bytes {}, scale {scale_name} shape {:?}, bytes {}; expected scale [{rows}, {expected_scale_cols}] for K-block 32",
+                    meta.shape,
+                    raw_data.len(),
+                    scale_meta.shape,
+                    scale_bytes.len()
+                ));
+            }
+            Ok(dequantize_e2m1_ue8m0_to_f32(
+                raw_data,
+                &meta.shape,
+                scale_bytes,
+                &scale_meta.shape,
+            ))
+        }
+    }
 }
 
 /// Convert one E2M1 nibble (4-bit FP: 1 sign + 2 exp + 1 mantissa, bias=1) to f32.
@@ -4410,6 +4607,43 @@ fn parse_layer_idx(name: &str) -> Option<usize> {
     None
 }
 
+/// Parse an inclusive comma/range layer list such as "0,3-7,42".
+/// Invalid tokens are rejected instead of being silently ignored because this
+/// selector controls the packed expert stride written into an HFQ artifact.
+fn parse_layer_set(spec: &str) -> Result<std::collections::BTreeSet<usize>, String> {
+    let mut layers = std::collections::BTreeSet::new();
+    for token in spec.split(',') {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+        if let Some((start, end)) = token.split_once('-') {
+            let start = start
+                .trim()
+                .parse::<usize>()
+                .map_err(|_| format!("invalid layer range start '{start}'"))?;
+            let end = end
+                .trim()
+                .parse::<usize>()
+                .map_err(|_| format!("invalid layer range end '{end}'"))?;
+            let lo = start.min(end);
+            let hi = start.max(end);
+            if hi - lo > 65_535 {
+                return Err(format!(
+                    "layer range '{token}' is unreasonably large (more than 65536 layers)"
+                ));
+            }
+            layers.extend(lo..=hi);
+        } else {
+            let layer = token
+                .parse::<usize>()
+                .map_err(|_| format!("invalid layer '{token}'"))?;
+            layers.insert(layer);
+        }
+    }
+    Ok(layers)
+}
+
 /// Stride for alternating-mode promotion: edge layers always promoted,
 /// plus every Nth middle layer. 3 was chosen empirically — promotes ~40%
 /// of middle layers, matching llama.cpp Q4_K_M's budget-allocation pattern.
@@ -4827,6 +5061,15 @@ fn is_deepseek4_keep_f16(name: &str) -> bool {
         || name.ends_with(".compressor.wgate.weight")
         || name.ends_with(".indexer.wq_b.weight")
         || name.ends_with(".indexer.weights_proj.weight")
+}
+
+/// DeepSeek V4 F32 tensors that affect persistent attention state or discrete
+/// expert selection. They are small and already consumed as F32 at runtime, so
+/// downcasting only loses checkpoint information without meaningful savings.
+fn is_deepseek4_keep_f32(name: &str) -> bool {
+    name.ends_with(".ffn.gate.bias")
+        || name.ends_with(".attn.attn_sink")
+        || name.ends_with(".compressor.ape")
 }
 
 /// For mixed quant: should this tensor be Q8 (fast) or Q4 (compressed)?
@@ -6625,15 +6868,21 @@ fn main() {
         || format == "deepseek4-source-precision"
         || format == "deepseek4-source"
         || format == "deepseek4-mtp-precise"
+        || format == "deepseek4-mq4"
+        || format == "deepseek4-mq4g256"
         || format == "deepseek4-mq4lloyd"
-        || format == "deepseek4-mq3lloyd";
-    // deepseek4-mq4lloyd / deepseek4-mq3lloyd: identical recipe to deepseek4-q8
-    // (non-expert 2D → Q8F16, norms/HC → F16) EXCEPT routed experts ship as
-    // MQ4G256Lloyd (qt=30, 160 B/group) resp. MQ3G256Lloyd (qt=20, 112 B/group)
-    // instead of MQ2G256Lloyd. Both require the matching MoE GEMV kernels in the
-    // ds4 forward (MQ3-Lloyd kernels pre-existed; MQ4-Lloyd added alongside).
-    let use_deepseek4_mq4_experts = format == "deepseek4-mq4lloyd";
+        || format == "deepseek4-mq3lloyd"
+        || format == "deepseek4-mq2-mq3"
+        || format == "deepseek4-mq2mq3";
+    // DeepSeek4 precision recipes keep non-expert 2D weights at Q8F16 and
+    // norms/HC at F16, while selecting the routed-expert format explicitly.
+    // `deepseek4-mq4` is the gfx90a-capable affine MQ4G256 layout (qt=13,
+    // 136 B/group). MQ4-Lloyd remains a separate research format (qt=30,
+    // 160 B/group) because its indexed DeepSeek4 MoE kernels do not exist.
+    let use_deepseek4_mq4_experts = format == "deepseek4-mq4" || format == "deepseek4-mq4g256";
+    let use_deepseek4_mq4_lloyd_experts = format == "deepseek4-mq4lloyd";
     let use_deepseek4_mq3_experts = format == "deepseek4-mq3lloyd";
+    let use_deepseek4_mixed_experts = format == "deepseek4-mq2-mq3" || format == "deepseek4-mq2mq3";
     // deepseek4-mtp-precise: addon-only build (use with --include-prefix mtp.) that
     // keeps every mtp.0.* DENSE weight at F16 instead of Q8F16. Doubles the
     // addon size (~2 GB → ~3 GB) but eliminates Q8 quant noise on the MTP
@@ -6805,6 +7054,32 @@ fn main() {
             .ok()
             .as_deref()
             == Some("1");
+    if use_deepseek4_mixed_experts && !allow_mq3_lloyd_for_mixed {
+        eprintln!("error: --format deepseek4-mq2-mq3 requires --allow-mq3-lloyd or HIPFIRE_ALLOW_MQ3_LLOYD=1");
+        std::process::exit(2);
+    }
+    let deepseek4_mq3_layers = if use_deepseek4_mixed_experts {
+        let spec = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MQ3_LAYERS")
+            .unwrap_or_else(|_| {
+                eprintln!("error: --format deepseek4-mq2-mq3 requires HIPFIRE_DEEPSEEK4_MQ3_LAYERS=<comma/range list>");
+                std::process::exit(2);
+            });
+        let layers = parse_layer_set(&spec).unwrap_or_else(|error| {
+            eprintln!("error: HIPFIRE_DEEPSEEK4_MQ3_LAYERS={spec:?}: {error}");
+            std::process::exit(2);
+        });
+        if layers.is_empty() {
+            eprintln!("error: HIPFIRE_DEEPSEEK4_MQ3_LAYERS selects no layers");
+            std::process::exit(2);
+        }
+        eprintln!(
+            "note: DeepSeek4 routed experts use MQ3-Lloyd on layers {:?}; every other routed-expert layer uses MQ2-Lloyd",
+            layers
+        );
+        layers
+    } else {
+        std::collections::BTreeSet::new()
+    };
     if use_mq4_mq3lloyd_kmap && !allow_mq3_lloyd_for_mixed {
         eprintln!(
             "note: --format mq4-mq3lloyd-kmap requires --allow-mq3-lloyd or\n\
@@ -7154,7 +7429,7 @@ fn main() {
             .ok()
             .as_deref()
             == Some("1");
-    if use_mq3g256_lloyd && !allow_mq3_lloyd {
+    if (use_mq3g256_lloyd || use_deepseek4_mq3_experts) && !allow_mq3_lloyd {
         eprintln!(
             "note: --format mq3-lloyd is research — Lloyd-Max 8-entry codebook +\n\
              3-bit indices (112 B/group, +7.7% over uniform MQ3). Hypothesis is\n\
@@ -7183,7 +7458,10 @@ fn main() {
         || use_mq4_mqlloyd_antirez
         || use_mq4_mqlloyd_antirez_gptq
         || use_mq4_mq2lloyd_gptq_all
-        || use_deepseek4_source_precision)
+        || (use_deepseek4_source_precision
+            && !use_deepseek4_mq4_experts
+            && !use_deepseek4_mq4_lloyd_experts
+            && !use_deepseek4_mq3_experts))
         && !allow_mq2_lloyd
     {
         eprintln!(
@@ -7210,7 +7488,7 @@ fn main() {
             .ok()
             .as_deref()
             == Some("1");
-    if use_mq4g256_lloyd && !allow_mq4_lloyd {
+    if (use_mq4g256_lloyd || use_deepseek4_mq4_lloyd_experts) && !allow_mq4_lloyd {
         eprintln!(
             "note: --format mq4-lloyd is research — Lloyd-Max 16-entry codebook +\n\
              4-bit indices (160 B/group, +17.6% over uniform MQ4). Hypothesis is\n\
@@ -7356,6 +7634,33 @@ fn main() {
     // the standard 2D quant path; the routing fan-out into top-k experts
     // happens at forward time, not quant time.
     let is_deepseek4 = arch_id == 9;
+    let deepseek4_expert_encoding = if is_deepseek4 {
+        deepseek4_expert_source_encoding(&config).unwrap_or_else(|error| {
+            eprintln!("error: invalid DeepSeek V4 routed-expert source contract: {error}");
+            std::process::exit(2);
+        })
+    } else {
+        Deepseek4ExpertSourceEncoding::Native
+    };
+    let deepseek4_expert_dims = if is_deepseek4 {
+        let hidden = config
+            .get("hidden_size")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0) as usize;
+        let intermediate = config
+            .get("moe_intermediate_size")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0) as usize;
+        if hidden == 0 || intermediate == 0 {
+            eprintln!(
+                "error: DeepSeek V4 config requires positive hidden_size and moe_intermediate_size"
+            );
+            std::process::exit(2);
+        }
+        Some((hidden, intermediate))
+    } else {
+        None
+    };
     // LFM2.5 (arch_id 11): A1B routes per-expert w1/w2/w3 → MQ4G256, expert_bias
     // → F32, everything else → Q8; dense lfm2 (Lfm2ForCausalLM, e.g. 350M/1.2B)
     // has no experts so the ingest just Q8s every tensor (the loader's load_f32
@@ -7401,6 +7706,23 @@ fn main() {
         })
         .and_then(|v| v.as_u64())
         .unwrap_or(0) as usize;
+    if use_deepseek4_mixed_experts {
+        if n_layers == 0 {
+            eprintln!(
+                "error: DeepSeek4 MQ2/MQ3 layer selection requires num_hidden_layers in config"
+            );
+            std::process::exit(2);
+        }
+        if let Some(&layer) = deepseek4_mq3_layers
+            .iter()
+            .find(|&&layer| layer >= n_layers)
+        {
+            eprintln!(
+                "error: HIPFIRE_DEEPSEEK4_MQ3_LAYERS contains layer {layer}, but model has only {n_layers} layers"
+            );
+            std::process::exit(2);
+        }
+    }
     if n_layers == 0 {
         eprintln!(
             "  warning: num_hidden_layers not found in config.json — edge-layer promotion disabled"
@@ -7579,14 +7901,67 @@ fn main() {
                 continue;
             }
             let (meta, raw_data) = st_files[*file_idx].tensor_data(name).unwrap();
-            let f32 = tensor_to_f32_with_optional_fp8_scale(
-                name,
-                raw_data,
-                &meta,
-                &fp8_scale_for,
-                &st_files,
-            );
-            let shape: Vec<usize> = meta.shape.clone();
+            let (f32, shape) = if arch == reap_overlay::ReapArch::Deepseek4
+                && name.contains(".ffn.experts.")
+                && name.ends_with(".weight")
+                && meta.shape.len() == 2
+            {
+                // DeepSeek V4 Flash 0731 stores routed experts as packed FP4
+                // in an I8 container. The generic I8+E8M0 helper interprets
+                // that contract as FP8 and preserves the physical half-width
+                // K, producing a structurally valid but incorrect overlay.
+                // Reuse the config-selected routed-expert decoder used by the
+                // normal DeepSeek4 quantization path so overlays retain the
+                // expanded logical shape.
+                let scale = fp8_scale_for.get(*name).map(|(sfi, sname)| {
+                    let (smeta, sbytes) = st_files[*sfi]
+                        .tensor_data(sname)
+                        .unwrap_or_else(|| panic!("FP scale tensor missing: {sname}"));
+                    (sname.as_str(), smeta, sbytes)
+                });
+                let (values, logical_shape) = decode_deepseek4_expert_source(
+                    name,
+                    raw_data,
+                    &meta,
+                    scale,
+                    deepseek4_expert_encoding,
+                )
+                .unwrap_or_else(|error| {
+                    eprintln!("reap overlay: {error}");
+                    std::process::exit(2);
+                });
+                let (hidden, intermediate) = deepseek4_expert_dims.unwrap();
+                let expected_shape = if name.ends_with(".w1.weight") || name.ends_with(".w3.weight")
+                {
+                    [intermediate, hidden]
+                } else if name.ends_with(".w2.weight") {
+                    [hidden, intermediate]
+                } else {
+                    eprintln!(
+                        "reap overlay: unrecognized DeepSeek V4 routed-expert projection {name}"
+                    );
+                    std::process::exit(2);
+                };
+                if logical_shape.as_slice() != expected_shape {
+                    eprintln!(
+                        "reap overlay: {name}: decoded logical shape {:?}, expected {:?} from config",
+                        logical_shape, expected_shape
+                    );
+                    std::process::exit(2);
+                }
+                (values, logical_shape)
+            } else {
+                (
+                    tensor_to_f32_with_optional_fp8_scale(
+                        name,
+                        raw_data,
+                        &meta,
+                        &fp8_scale_for,
+                        &st_files,
+                    ),
+                    meta.shape.clone(),
+                )
+            };
             let tier = reap_overlay::reap_override_for(name, arch, &plan).unwrap();
             match reap_overlay::quantize_to_format(name, tier, &f32, &shape) {
                 Ok(t) => {
@@ -7836,15 +8211,21 @@ fn main() {
     let include_vision = args.include_vision;
     let vision_quant = args.vision_quant.as_str();
     // --include-prefix <prefix>: when set, ONLY tensors whose name starts
-    // with this prefix are ingested; everything else is silently skipped.
+    // with one of the supplied prefixes are ingested; everything else is
+    // silently skipped. The flag is repeatable for disjoint tensor families.
     // Used to produce side-car HFQs (e.g. `--include-prefix mtp.` builds an
     // MTP-only addon that pairs with an existing base HFQ via the loader's
     // `.mtp-addon.hfq` discovery). When unset (default), all tensors pass
     // this gate and the usual mtp/vision skip rules below apply.
-    let include_prefix = args.include_prefix.as_deref();
-    if let Some(p) = include_prefix {
+    let include_prefixes = args
+        .include_prefix
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    if !include_prefixes.is_empty() {
         eprintln!(
-            "  [filter] --include-prefix {p:?} — only tensors with this prefix will be ingested"
+            "  [filter] --include-prefix {:?} — only tensors with these prefixes will be ingested",
+            include_prefixes
         );
     }
     let mut skipped_params = 0u64;
@@ -7858,13 +8239,15 @@ fn main() {
         all_tensors.iter().map(|(n, fi)| (*n, *fi)).collect();
     for (name, file_idx) in &all_tensors {
         // --include-prefix filter (highest priority — runs before mtp/vision skips).
-        if let Some(p) = include_prefix {
-            if !name.starts_with(p) {
-                let (meta, _) = st_files[*file_idx].tensor_data(name).unwrap();
-                let n: usize = meta.shape.iter().product();
-                skipped_params += n as u64;
-                continue;
-            }
+        if !include_prefixes.is_empty()
+            && !include_prefixes
+                .iter()
+                .any(|prefix| name.starts_with(prefix))
+        {
+            let (meta, _) = st_files[*file_idx].tensor_data(name).unwrap();
+            let n: usize = meta.shape.iter().product();
+            skipped_params += n as u64;
+            continue;
         }
         // Skip MTP head; optionally include vision encoder for VL inference.
         // Qwen3.5-VL names vision tensors `model.visual.*` / `visual.*`;
@@ -8525,8 +8908,9 @@ fn main() {
         // we downcast I64 → U32 (4 bytes/element) before write — antirez
         // does the same and the DeepSeek V4 loader at arch.rs reads them as U32
         // (`bytes.chunks_exact(4)`). Without these in the HFQ, the loader
-        // sees an empty `tid2eid_host` and `ffn_hash_routed` falls back
-        // to shared-only on the first `num_hash_layers` (3) layers —
+        // sees an empty `tid2eid_host` and the DeepSeek4 forward refuses
+        // the model rather than silently dropping routed experts on the first
+        // `num_hash_layers` (3) layers —
         // measured 2× wikitext2 PPL regression on deepseek4-q8-mtp (21.85
         // vs 11.42 antirez) before this fix landed.
         //
@@ -8792,35 +9176,44 @@ fn main() {
             && name.ends_with(".weight")
             && meta.shape.len() == 2
         {
-            // DeepSeek V4 routed experts are FP4 (E2M1) per upstream `inference/
-            // model.py:132-137` and config `expert_dtype:"fp4"`. Safetensors
-            // shape is [out, in/2] with each byte packing two nibbles; the
-            // paired scale tensor is `<name>.scale` UE8M0 with block size 32
-            // along logical K.
-            //
-            // The outer condition `name.contains(".ffn.experts.")` already
-            // excludes shared_experts (which use the non-routed `.shared_
-            // experts.` infix). So everything reaching here is a routed
-            // expert → unconditionally FP4 unpack. Logical K dim doubles.
+            // Flash declares packed FP4 experts; Flash Base declares FP8
+            // experts. Resolve the checkpoint contract from config.json and
+            // require every weight/scale dtype and shape to agree with it.
+            // The outer name condition excludes shared_experts.
             let name_owned = name.to_string();
-            let (f32_data, logical_shape) = if (meta.dtype == "I8" || meta.dtype == "F8_E4M3")
-                && fp8_scale_for.contains_key(&name_owned)
-            {
-                let (sfi, sname) = &fp8_scale_for[&name_owned];
+            let scale = fp8_scale_for.get(&name_owned).map(|(sfi, sname)| {
                 let (smeta, sbytes) = st_files[*sfi]
                     .tensor_data(sname)
                     .unwrap_or_else(|| panic!("FP scale tensor missing: {sname}"));
-                dequantize_e2m1_ue8m0_to_f32(raw_data, &meta.shape, sbytes, &smeta.shape)
+                (sname.as_str(), smeta, sbytes)
+            });
+            let (f32_data, logical_shape) = decode_deepseek4_expert_source(
+                name,
+                raw_data,
+                meta,
+                scale,
+                deepseek4_expert_encoding,
+            )
+            .unwrap_or_else(|error| {
+                eprintln!("error: {error}");
+                std::process::exit(2);
+            });
+            let (hidden, intermediate) = deepseek4_expert_dims.unwrap();
+            let expected_shape = if name.ends_with(".w1.weight") || name.ends_with(".w3.weight") {
+                [intermediate, hidden]
+            } else if name.ends_with(".w2.weight") {
+                [hidden, intermediate]
             } else {
-                let vals = tensor_to_f32_with_optional_fp8_scale(
-                    name,
-                    raw_data,
-                    meta,
-                    &fp8_scale_for,
-                    &st_files,
-                );
-                (vals, meta.shape.clone())
+                eprintln!("error: unrecognized DeepSeek V4 routed-expert projection {name}");
+                std::process::exit(2);
             };
+            if logical_shape.as_slice() != expected_shape {
+                eprintln!(
+                    "error: {name}: decoded logical shape {:?}, expected {:?} from config",
+                    logical_shape, expected_shape
+                );
+                std::process::exit(2);
+            }
             let k = logical_shape[1];
             if k % 256 == 0
                 && (use_mq4_mq2lloyd_gptq_all
@@ -8833,14 +9226,24 @@ fn main() {
                 let signs1 = gen_fwht_signs(42, 256);
                 let signs2 = gen_fwht_signs(1042, 256);
                 let unit_col_weights: Vec<f32> = vec![1.0; k];
+                let deepseek4_tensor_is_mq3 = use_deepseek4_mq3_experts
+                    || (use_deepseek4_mixed_experts
+                        && parse_layer_idx(name)
+                            .is_some_and(|layer| deepseek4_mq3_layers.contains(&layer)));
                 let (q, expert_qt, expert_label): (Vec<u8>, QuantType, &str) =
                     if use_deepseek4_mq4_experts {
+                        (
+                            quantize_mq4g256(&f32_data, &signs1, &signs2),
+                            QuantType::MQ4G256,
+                            "MQ4-DeepSeek V4",
+                        )
+                    } else if use_deepseek4_mq4_lloyd_experts {
                         (
                             quantize_mq4g256_lloyd(&f32_data, &signs1, &signs2),
                             QuantType::MQ4G256Lloyd,
                             "MQ4L-DeepSeek V4",
                         )
-                    } else if use_deepseek4_mq3_experts {
+                    } else if deepseek4_tensor_is_mq3 {
                         (
                             quantize_mq3g256_lloyd(&f32_data, &signs1, &signs2),
                             QuantType::MQ3G256Lloyd,
@@ -10957,6 +11360,26 @@ fn main() {
                 data,
                 spilled_len: 0,
             });
+        } else if use_deepseek4_source_precision
+            && meta.dtype == "F32"
+            && is_deepseek4_keep_f32(name)
+        {
+            let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
+            eprintln!(
+                "  F32:        {} {:?} ({} elements, {:.1} KB) [DeepSeek V4 source precision]",
+                name,
+                meta.shape,
+                n_elements,
+                raw_data.len() as f64 / 1024.0,
+            );
+            hfq_tensors.push(HfqTensor {
+                name: name.to_string(),
+                quant_type: QuantType::F32,
+                shape,
+                group_size: 0,
+                data: raw_data.to_vec(),
+                spilled_len: 0,
+            });
         } else {
             // Keep as F16 (convert BF16 -> F16 if needed)
             let f16_data = match meta.dtype.as_str() {
@@ -13008,6 +13431,122 @@ mod tests {
     use super::*;
 
     #[test]
+    fn deepseek4_source_f32_controls_are_narrowly_whitelisted() {
+        assert!(is_deepseek4_keep_f32("layers.3.ffn.gate.bias"));
+        assert!(is_deepseek4_keep_f32("layers.3.attn.attn_sink"));
+        assert!(is_deepseek4_keep_f32("layers.3.attn.compressor.ape"));
+        assert!(is_deepseek4_keep_f32(
+            "layers.4.attn.indexer.compressor.ape"
+        ));
+
+        assert!(!is_deepseek4_keep_f32("layers.3.hc_attn_base"));
+        assert!(!is_deepseek4_keep_f32("layers.3.attn.q_norm.weight"));
+        assert!(!is_deepseek4_keep_f32("layers.3.ffn.gate.weight"));
+    }
+
+    #[test]
+    fn deepseek4_expert_encoding_uses_explicit_contract_then_fp8_fallback() {
+        assert_eq!(
+            deepseek4_expert_source_encoding(&serde_json::json!({
+                "expert_dtype": "fp4",
+                "quantization_config": {"quant_method": "fp8", "fmt": "e4m3"}
+            }))
+            .unwrap(),
+            Deepseek4ExpertSourceEncoding::Fp4E2m1
+        );
+        assert_eq!(
+            deepseek4_expert_source_encoding(&serde_json::json!({
+                "expert_dtype": "fp8"
+            }))
+            .unwrap(),
+            Deepseek4ExpertSourceEncoding::Fp8E4m3
+        );
+        assert_eq!(
+            deepseek4_expert_source_encoding(&serde_json::json!({
+                "quantization_config": {"quant_method": "fp8", "fmt": "e4m3"}
+            }))
+            .unwrap(),
+            Deepseek4ExpertSourceEncoding::Fp8E4m3
+        );
+        assert_eq!(
+            deepseek4_expert_source_encoding(&serde_json::json!({})).unwrap(),
+            Deepseek4ExpertSourceEncoding::Native
+        );
+        assert!(deepseek4_expert_source_encoding(&serde_json::json!({
+            "expert_dtype": "int4"
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn deepseek4_fp8_expert_decode_preserves_logical_shape() {
+        let weight_meta = TensorMeta {
+            dtype: "F8_E4M3".to_string(),
+            shape: vec![1, 2],
+            data_offsets: [0, 2],
+        };
+        let scale_meta = TensorMeta {
+            dtype: "F32".to_string(),
+            shape: vec![1, 1],
+            data_offsets: [0, 4],
+        };
+        let scale = 0.5f32.to_le_bytes();
+        let (values, shape) = decode_deepseek4_expert_source(
+            "layers.0.ffn.experts.0.w1.weight",
+            &[0x38, 0x40],
+            &weight_meta,
+            Some(("layers.0.ffn.experts.0.w1.scale", &scale_meta, &scale)),
+            Deepseek4ExpertSourceEncoding::Fp8E4m3,
+        )
+        .unwrap();
+        assert_eq!(shape, vec![1, 2]);
+        assert_eq!(values, vec![0.5, 1.0]);
+    }
+
+    #[test]
+    fn deepseek4_fp4_expert_decode_requires_packed_k32_contract() {
+        let weight_meta = TensorMeta {
+            dtype: "I8".to_string(),
+            shape: vec![1, 16],
+            data_offsets: [0, 16],
+        };
+        let scale_meta = TensorMeta {
+            dtype: "F8_E8M0".to_string(),
+            shape: vec![1, 1],
+            data_offsets: [0, 1],
+        };
+        let weight = vec![0x42; 16];
+        let (values, shape) = decode_deepseek4_expert_source(
+            "layers.0.ffn.experts.0.w1.weight",
+            &weight,
+            &weight_meta,
+            Some(("layers.0.ffn.experts.0.w1.scale", &scale_meta, &[127])),
+            Deepseek4ExpertSourceEncoding::Fp4E2m1,
+        )
+        .unwrap();
+        assert_eq!(shape, vec![1, 32]);
+        assert_eq!(&values[..4], &[1.0, 2.0, 1.0, 2.0]);
+
+        let bad_scale_meta = TensorMeta {
+            dtype: "F32".to_string(),
+            shape: vec![1, 1],
+            data_offsets: [0, 4],
+        };
+        assert!(decode_deepseek4_expert_source(
+            "layers.0.ffn.experts.0.w1.weight",
+            &weight,
+            &weight_meta,
+            Some((
+                "layers.0.ffn.experts.0.w1.scale",
+                &bad_scale_meta,
+                &[0, 0, 0, 0]
+            )),
+            Deepseek4ExpertSourceEncoding::Fp4E2m1,
+        )
+        .is_err());
+    }
+
+    #[test]
     fn e2m1_lookup_matches_ocp_spec() {
         // OCP MX FP4 (E2M1) spec values for the 8 magnitude codes.
         // Sign bit (0x8) flips sign of the magnitude.
@@ -13089,6 +13628,19 @@ mod tests {
     fn parse_layer_idx_no_match() {
         assert_eq!(parse_layer_idx("token_embd.weight"), None);
         assert_eq!(parse_layer_idx("output.weight"), None);
+    }
+
+    #[test]
+    fn parse_layer_set_is_inclusive_deduplicated_and_fail_closed() {
+        let layers = parse_layer_set("0, 3-5, 5, 9-7").unwrap();
+        assert_eq!(
+            layers.into_iter().collect::<Vec<_>>(),
+            vec![0, 3, 4, 5, 7, 8, 9]
+        );
+        assert!(parse_layer_set("").unwrap().is_empty());
+        assert!(parse_layer_set("3-nope").is_err());
+        assert!(parse_layer_set("one").is_err());
+        assert!(parse_layer_set("0-70000").is_err());
     }
 
     #[test]
@@ -13454,6 +14006,394 @@ mod tests {
         assert_eq!(
             kmap_resolve_mode("model.layers.15.mlp.gate_proj.weight", 40, false, 2),
             QuantLevel::Base
+        );
+    }
+}
+
+#[cfg(test)]
+mod deepseek4_expert_format_sweep {
+    use super::*;
+
+    fn dequant_mq3_lloyd(data: &[u8], n: usize, signs1: &[f32], signs2: &[f32]) -> Vec<f32> {
+        assert_eq!(n % 256, 0);
+        assert_eq!(data.len(), (n / 256) * 112);
+        let mut out = vec![0.0f32; n];
+        for block in 0..n / 256 {
+            let src = &data[block * 112..(block + 1) * 112];
+            let codebook = std::array::from_fn::<_, 8, _>(|i| {
+                f16_to_f32(u16::from_le_bytes([src[2 * i], src[2 * i + 1]]))
+            });
+            let mut group = [0.0f32; 256];
+            for chunk in 0..32 {
+                let p = 16 + chunk * 3;
+                let b0 = src[p];
+                let b1 = src[p + 1];
+                let b2 = src[p + 2];
+                let codes = [
+                    b0 & 7,
+                    (b0 >> 3) & 7,
+                    ((b0 >> 6) & 3) | ((b1 & 1) << 2),
+                    (b1 >> 1) & 7,
+                    (b1 >> 4) & 7,
+                    ((b1 >> 7) & 1) | ((b2 & 3) << 1),
+                    (b2 >> 2) & 7,
+                    (b2 >> 5) & 7,
+                ];
+                for i in 0..8 {
+                    group[chunk * 8 + i] = codebook[codes[i] as usize];
+                }
+            }
+            cpu_inv_fwht_256(&mut group, signs1, signs2);
+            out[block * 256..(block + 1) * 256].copy_from_slice(&group);
+        }
+        out
+    }
+
+    fn dequant_mq4(data: &[u8], n: usize, signs1: &[f32], signs2: &[f32]) -> Vec<f32> {
+        assert_eq!(n % 256, 0);
+        assert_eq!(data.len(), (n / 256) * 136);
+        let mut out = vec![0.0f32; n];
+        for block in 0..n / 256 {
+            let src = &data[block * 136..(block + 1) * 136];
+            let scale = f32::from_le_bytes(src[0..4].try_into().unwrap());
+            let minimum = f32::from_le_bytes(src[4..8].try_into().unwrap());
+            let mut group = [0.0f32; 256];
+            for i in 0..128 {
+                let packed = src[8 + i];
+                group[2 * i] = minimum + scale * (packed & 15) as f32;
+                group[2 * i + 1] = minimum + scale * (packed >> 4) as f32;
+            }
+            cpu_inv_fwht_256(&mut group, signs1, signs2);
+            out[block * 256..(block + 1) * 256].copy_from_slice(&group);
+        }
+        out
+    }
+
+    fn report(label: &str, bytes: usize, reference: &[f32], candidate: &[f32]) {
+        let mut error2 = 0.0f64;
+        let mut ref2 = 0.0f64;
+        let mut cand2 = 0.0f64;
+        let mut dot = 0.0f64;
+        let mut max_abs = 0.0f64;
+        for (&r, &c) in reference.iter().zip(candidate) {
+            let r = r as f64;
+            let c = c as f64;
+            let d = c - r;
+            error2 += d * d;
+            ref2 += r * r;
+            cand2 += c * c;
+            dot += r * c;
+            max_abs = max_abs.max(d.abs());
+        }
+        eprintln!(
+            "{label:12} bytes={bytes:10} bpw={:5.3} nrmse={:.9e} cosine={:.9} max_abs={:.9e}",
+            bytes as f64 * 8.0 / reference.len() as f64,
+            (error2 / ref2).sqrt(),
+            dot / (ref2 * cand2).sqrt(),
+            max_abs,
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn official_fp4_to_mq_format_sweep() {
+        let weight_path =
+            std::env::var("HIPFIRE_DS4_EXPERT_WEIGHT").expect("HIPFIRE_DS4_EXPERT_WEIGHT");
+        let scale_path =
+            std::env::var("HIPFIRE_DS4_EXPERT_SCALE").expect("HIPFIRE_DS4_EXPERT_SCALE");
+        let rows = std::env::var("HIPFIRE_DS4_EXPERT_ROWS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(2048usize);
+        let cols = std::env::var("HIPFIRE_DS4_EXPERT_COLS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(4096usize);
+        let weight = std::fs::read(&weight_path).expect("read official FP4 weight");
+        let scale = std::fs::read(&scale_path).expect("read official UE8M0 scale");
+        let (reference, logical_shape) =
+            dequantize_e2m1_ue8m0_to_f32(&weight, &[rows, cols / 2], &scale, &[rows, cols / 32]);
+        assert_eq!(logical_shape, vec![rows, cols]);
+        assert!(reference.iter().all(|v| v.is_finite()));
+
+        let signs1 = gen_fwht_signs(42, 256);
+        let signs2 = gen_fwht_signs(1042, 256);
+        let mq2 = quantize_mq2g256_lloyd(&reference, &signs1, &signs2);
+        let mq3 = quantize_mq3g256_lloyd(&reference, &signs1, &signs2);
+        let mq4 = quantize_mq4g256(&reference, &signs1, &signs2);
+        let mq2_recon = dequantize_mq2g256_lloyd_to_f32(&mq2, reference.len(), &signs1, &signs2);
+        let mq3_recon = dequant_mq3_lloyd(&mq3, reference.len(), &signs1, &signs2);
+        let mq4_recon = dequant_mq4(&mq4, reference.len(), &signs1, &signs2);
+
+        eprintln!("reference=official-shipped-fp4 rows={rows} cols={cols}");
+        report("MQ2-Lloyd", mq2.len(), &reference, &mq2_recon);
+        report("MQ3-Lloyd", mq3.len(), &reference, &mq3_recon);
+        report("MQ4", mq4.len(), &reference, &mq4_recon);
+    }
+
+    fn read_f32_le(path: &std::path::Path) -> Vec<f32> {
+        let bytes =
+            std::fs::read(path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+        assert_eq!(bytes.len() % 4, 0, "{} is not F32-aligned", path.display());
+        bytes
+            .chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect()
+    }
+
+    fn read_i32_le(path: &std::path::Path) -> Vec<i32> {
+        let bytes =
+            std::fs::read(path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+        assert_eq!(bytes.len() % 4, 0, "{} is not I32-aligned", path.display());
+        bytes
+            .chunks_exact(4)
+            .map(|chunk| i32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect()
+    }
+
+    fn gemv_rows(matrix: &[f32], rows: usize, cols: usize, x: &[f32]) -> Vec<f32> {
+        assert_eq!(matrix.len(), rows * cols);
+        assert_eq!(x.len(), cols);
+        matrix
+            .chunks_exact(cols)
+            .map(|row| {
+                row.iter()
+                    .zip(x)
+                    .map(|(&weight, &value)| weight as f64 * value as f64)
+                    .sum::<f64>() as f32
+            })
+            .collect()
+    }
+
+    fn report_vector(label: &str, reference: &[f32], candidate: &[f32]) {
+        assert_eq!(reference.len(), candidate.len());
+        let mut error2 = 0.0f64;
+        let mut ref2 = 0.0f64;
+        let mut cand2 = 0.0f64;
+        let mut dot = 0.0f64;
+        let mut max_abs = 0.0f64;
+        for (&reference, &candidate) in reference.iter().zip(candidate) {
+            assert!(reference.is_finite() && candidate.is_finite());
+            let reference = reference as f64;
+            let candidate = candidate as f64;
+            let error = candidate - reference;
+            error2 += error * error;
+            ref2 += reference * reference;
+            cand2 += candidate * candidate;
+            dot += reference * candidate;
+            max_abs = max_abs.max(error.abs());
+        }
+        assert!(ref2 > 0.0 && cand2 > 0.0);
+        eprintln!(
+            "{label:34} nrmse={:.9e} cosine={:.9} max_abs={:.9e}",
+            (error2 / ref2).sqrt(),
+            dot / (ref2 * cand2).sqrt(),
+            max_abs,
+        );
+    }
+
+    fn load_official_matrix(
+        dir: &std::path::Path,
+        expert: i32,
+        projection: &str,
+        rows: usize,
+        cols: usize,
+    ) -> Vec<f32> {
+        let weight = std::fs::read(dir.join(format!("e{expert}.{projection}.weight.bin")))
+            .expect("read official FP4 expert weight");
+        let scale = std::fs::read(dir.join(format!("e{expert}.{projection}.scale.bin")))
+            .expect("read official UE8M0 expert scale");
+        let (matrix, shape) =
+            dequantize_e2m1_ue8m0_to_f32(&weight, &[rows, cols / 2], &scale, &[rows, cols / 32]);
+        assert_eq!(shape, vec![rows, cols]);
+        matrix
+    }
+
+    fn reconstruct_candidate(
+        format: usize,
+        matrix: &[f32],
+        signs1: &[f32],
+        signs2: &[f32],
+    ) -> Vec<f32> {
+        match format {
+            0 => matrix.to_vec(),
+            1 => {
+                let encoded = quantize_mq2g256_lloyd(matrix, signs1, signs2);
+                dequantize_mq2g256_lloyd_to_f32(&encoded, matrix.len(), signs1, signs2)
+            }
+            2 => {
+                let encoded = quantize_mq3g256_lloyd(matrix, signs1, signs2);
+                dequant_mq3_lloyd(&encoded, matrix.len(), signs1, signs2)
+            }
+            3 => {
+                let encoded = quantize_mq4g256(matrix, signs1, signs2);
+                dequant_mq4(&encoded, matrix.len(), signs1, signs2)
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn real_activation_routed_format_sweep() {
+        const HIDDEN: usize = 4096;
+        const INTERMEDIATE: usize = 2048;
+        const K_TOP: usize = 6;
+        const LABELS: [&str; 4] = ["Official-FP4", "MQ2-Lloyd", "MQ3-Lloyd", "MQ4"];
+
+        let probe_dir = std::path::PathBuf::from(
+            std::env::var("HIPFIRE_DS4_MOE_PROBE_DIR").expect("HIPFIRE_DS4_MOE_PROBE_DIR"),
+        );
+        let official_dir = std::path::PathBuf::from(
+            std::env::var("HIPFIRE_DS4_OFFICIAL_EXPERT_DIR")
+                .expect("HIPFIRE_DS4_OFFICIAL_EXPERT_DIR"),
+        );
+        let x = read_f32_le(&probe_dir.join("rank0.ffn_x_plain.f32le"));
+        assert_eq!(x.len(), HIDDEN);
+        let rank0_ids = read_i32_le(&probe_dir.join("rank0.topk_indices.i32le"));
+        let rank1_ids = read_i32_le(&probe_dir.join("rank1.topk_indices.i32le"));
+        let weights = read_f32_le(&probe_dir.join("rank0.topk_weights.f32le"));
+        let rank0_down = read_f32_le(&probe_dir.join("rank0.down_expanded.f32le"));
+        let rank1_down = read_f32_le(&probe_dir.join("rank1.down_expanded.f32le"));
+        let gpu_routed = read_f32_le(&probe_dir.join("rank0.routed_partial.f32le"));
+        assert_eq!(rank0_ids.len(), K_TOP);
+        assert_eq!(rank1_ids.len(), K_TOP);
+        assert_eq!(weights.len(), K_TOP);
+        assert_eq!(rank0_down.len(), K_TOP * HIDDEN);
+        assert_eq!(rank1_down.len(), K_TOP * HIDDEN);
+        assert_eq!(gpu_routed.len(), HIDDEN);
+        let expert_ids = (0..K_TOP)
+            .map(|slot| {
+                let ids = [rank0_ids[slot], rank1_ids[slot]];
+                let owned = ids
+                    .into_iter()
+                    .filter(|&expert| expert >= 0)
+                    .collect::<Vec<_>>();
+                assert_eq!(owned.len(), 1, "slot {slot} must have exactly one EP owner");
+                owned[0]
+            })
+            .collect::<Vec<_>>();
+        eprintln!("real activation topk={expert_ids:?} weights={weights:?}");
+
+        let signs1 = gen_fwht_signs(42, 256);
+        let signs2 = gen_fwht_signs(1042, 256);
+        let mut routed = std::array::from_fn::<_, 4, _>(|_| vec![0.0f32; HIDDEN]);
+        let mut routed_mixed = std::array::from_fn::<_, 6, _>(|_| vec![0.0f32; HIDDEN]);
+
+        for slot in 0..K_TOP {
+            let expert = expert_ids[slot];
+            let w1 = load_official_matrix(&official_dir, expert, "w1", INTERMEDIATE, HIDDEN);
+            let w3 = load_official_matrix(&official_dir, expert, "w3", INTERMEDIATE, HIDDEN);
+            let mut activations = std::array::from_fn::<_, 4, _>(|_| Vec::new());
+            for format in 0..4 {
+                let gate_matrix = reconstruct_candidate(format, &w1, &signs1, &signs2);
+                let up_matrix = reconstruct_candidate(format, &w3, &signs1, &signs2);
+                let gate = gemv_rows(&gate_matrix, INTERMEDIATE, HIDDEN, &x);
+                let up = gemv_rows(&up_matrix, INTERMEDIATE, HIDDEN, &x);
+                activations[format] = gate
+                    .into_iter()
+                    .zip(up)
+                    .map(|(gate, up)| {
+                        let gate = gate.min(10.0);
+                        let up = up.clamp(-10.0, 10.0);
+                        gate / (1.0 + (-gate).exp()) * up
+                    })
+                    .collect();
+            }
+            drop(w1);
+            drop(w3);
+
+            let w2 = load_official_matrix(&official_dir, expert, "w2", HIDDEN, INTERMEDIATE);
+            let gpu_down = if rank0_ids[slot] >= 0 {
+                &rank0_down[slot * HIDDEN..(slot + 1) * HIDDEN]
+            } else {
+                &rank1_down[slot * HIDDEN..(slot + 1) * HIDDEN]
+            };
+            for format in 0..4 {
+                let down_matrix = reconstruct_candidate(format, &w2, &signs1, &signs2);
+                let down = gemv_rows(&down_matrix, HIDDEN, INTERMEDIATE, &activations[format]);
+                if format == 0 || format == 1 {
+                    report_vector(
+                        &format!("slot{slot} e{expert} GPU vs {}", LABELS[format]),
+                        gpu_down,
+                        &down,
+                    );
+                }
+                for (out, value) in routed[format].iter_mut().zip(down) {
+                    *out += weights[slot] * value;
+                }
+                if format == 1 {
+                    for (mixed, activation_format) in [(3, 2), (4, 3)] {
+                        let down = gemv_rows(
+                            &down_matrix,
+                            HIDDEN,
+                            INTERMEDIATE,
+                            &activations[activation_format],
+                        );
+                        for (out, value) in routed_mixed[mixed].iter_mut().zip(down) {
+                            *out += weights[slot] * value;
+                        }
+                    }
+                } else if format == 2 {
+                    let down = gemv_rows(&down_matrix, HIDDEN, INTERMEDIATE, &activations[1]);
+                    for (out, value) in routed_mixed[0].iter_mut().zip(down) {
+                        *out += weights[slot] * value;
+                    }
+                    let down = gemv_rows(&down_matrix, HIDDEN, INTERMEDIATE, &activations[3]);
+                    for (out, value) in routed_mixed[5].iter_mut().zip(down) {
+                        *out += weights[slot] * value;
+                    }
+                } else if format == 3 {
+                    for (mixed, activation_format) in [(1, 1), (2, 2)] {
+                        let down = gemv_rows(
+                            &down_matrix,
+                            HIDDEN,
+                            INTERMEDIATE,
+                            &activations[activation_format],
+                        );
+                        for (out, value) in routed_mixed[mixed].iter_mut().zip(down) {
+                            *out += weights[slot] * value;
+                        }
+                    }
+                }
+            }
+        }
+
+        eprintln!("full routed-output comparisons:");
+        report_vector("GPU-MQ2 vs Official-FP4", &routed[0], &gpu_routed);
+        report_vector("GPU-MQ2 vs CPU-requant-MQ2", &routed[1], &gpu_routed);
+        report_vector("MQ2-Lloyd vs Official-FP4", &routed[0], &routed[1]);
+        report_vector("MQ3-Lloyd vs Official-FP4", &routed[0], &routed[2]);
+        report_vector("MQ4 vs Official-FP4", &routed[0], &routed[3]);
+        report_vector(
+            "MQ2 gate/up + MQ3 down vs FP4",
+            &routed[0],
+            &routed_mixed[0],
+        );
+        report_vector(
+            "MQ2 gate/up + MQ4 down vs FP4",
+            &routed[0],
+            &routed_mixed[1],
+        );
+        report_vector(
+            "MQ3 gate/up + MQ4 down vs FP4",
+            &routed[0],
+            &routed_mixed[2],
+        );
+        report_vector(
+            "MQ3 gate/up + MQ2 down vs FP4",
+            &routed[0],
+            &routed_mixed[3],
+        );
+        report_vector(
+            "MQ4 gate/up + MQ2 down vs FP4",
+            &routed[0],
+            &routed_mixed[4],
+        );
+        report_vector(
+            "MQ4 gate/up + MQ3 down vs FP4",
+            &routed[0],
+            &routed_mixed[5],
         );
     }
 }

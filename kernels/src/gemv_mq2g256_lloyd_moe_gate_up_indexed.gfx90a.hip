@@ -15,7 +15,16 @@ void gemv_mq2g256_lloyd_moe_gate_up_k8_indexed_gfx90a(
     if (row >= M) return;
     const int krank = blockIdx.y;
     const int lane = threadIdx.x;
-    const char* A = reinterpret_cast<const char*>(expert_ptrs[topk_indices[krank]]);
+    const int expert_id = topk_indices[krank];
+    if (expert_id < 0) {
+        if (lane == 0) {
+            const int mi = M >> 1;
+            if (row < mi) y_gate[(long long)krank * mi + row] = 0.0f;
+            else y_up[(long long)krank * mi + row - mi] = 0.0f;
+        }
+        return;
+    }
+    const char* A = reinterpret_cast<const char*>(expert_ptrs[expert_id]);
     const int groups = K / 256;
     const char* row_ptr = A + (long long)row * groups * 72;
     __shared__ float codebooks[16];

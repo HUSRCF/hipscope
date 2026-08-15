@@ -40,14 +40,22 @@ fn main() {
 
     let argv: Vec<String> = std::env::args().collect();
     let mut model: Option<PathBuf> = None;
+    let mut overlay: Option<PathBuf> = None;
     let mut prompt = "The capital of France is".to_string();
+    let mut prompt_file: Option<PathBuf> = None;
     let mut max: usize = 48;
     let mut warmup: usize = 2;
     let mut tp: usize = 4;
     let mut prefill_tokens: Option<usize> = None;
     let mut batched_prefill = false;
     let mut prefill_batch: usize = 256;
+    let mut prefill_logits_out: Option<PathBuf> = None;
+    let mut score_out: Option<PathBuf> = None;
+    let mut gen_ids_out: Option<PathBuf> = None;
+    let mut trace_next: Vec<usize> = Vec::new();
+    let mut moe_probe_out: Option<PathBuf> = None;
     let mut no_bos = false;
+    let mut chat = false;
     let mut mtp = false;
     let mut i = 1;
     while i < argv.len() {
@@ -56,8 +64,16 @@ fn main() {
                 model = Some(PathBuf::from(&argv[i + 1]));
                 i += 2;
             }
+            "--overlay" => {
+                overlay = Some(PathBuf::from(&argv[i + 1]));
+                i += 2;
+            }
             "--prompt" => {
                 prompt = argv[i + 1].clone();
+                i += 2;
+            }
+            "--prompt-file" => {
+                prompt_file = Some(PathBuf::from(&argv[i + 1]));
                 i += 2;
             }
             "--max" => {
@@ -84,8 +100,35 @@ fn main() {
                 prefill_batch = argv[i + 1].parse().expect("--prefill-batch");
                 i += 2;
             }
+            "--prefill-logits-out" => {
+                prefill_logits_out = Some(PathBuf::from(&argv[i + 1]));
+                i += 2;
+            }
+            "--score-out" => {
+                score_out = Some(PathBuf::from(&argv[i + 1]));
+                i += 2;
+            }
+            "--gen-ids-out" => {
+                gen_ids_out = Some(PathBuf::from(&argv[i + 1]));
+                i += 2;
+            }
+            "--trace-next" => {
+                trace_next = argv[i + 1]
+                    .split(',')
+                    .map(|value| value.parse().expect("--trace-next"))
+                    .collect();
+                i += 2;
+            }
+            "--moe-probe-out" => {
+                moe_probe_out = Some(PathBuf::from(&argv[i + 1]));
+                i += 2;
+            }
             "--no-bos" => {
                 no_bos = true;
+                i += 1;
+            }
+            "--chat" => {
+                chat = true;
                 i += 1;
             }
             "--mtp" => {
@@ -98,21 +141,45 @@ fn main() {
             }
         }
     }
+    if let Some(path) = prompt_file {
+        prompt = std::fs::read_to_string(&path).expect("read --prompt-file");
+    }
     let model = model.expect("--model required");
+    assert!(
+        !(chat && no_bos),
+        "--chat requires the model BOS; do not combine it with --no-bos"
+    );
+    assert!(
+        !(score_out.is_some() && batched_prefill),
+        "--score-out requires sequential prefill; omit --batched-prefill"
+    );
+    assert!(
+        !(moe_probe_out.is_some() && batched_prefill),
+        "--moe-probe-out requires sequential prefill; omit --batched-prefill"
+    );
 
     // ── config + tokenizer (per-rank loads reopen the file) ─────────────────
-    let hfq0 = HfqFile::open(&model).expect("open model");
+    let attach_overlay = |hfq: &mut HfqFile| {
+        if let Some(path) = overlay.as_deref() {
+            let control = HfqFile::open_at_offset(path, 0).expect("open --overlay");
+            hfq.attach_overlay(control).expect("attach --overlay");
+        }
+    };
+    let mut hfq0 = HfqFile::open(&model).expect("open model");
+    attach_overlay(&mut hfq0);
     let cfg = DeepseekV4::config_from_hfq(&hfq0).expect("config");
     let tok = Tokenizer::from_hfq_metadata(&hfq0.metadata_json).expect("tokenizer");
     let n_exp = cfg.n_routed_experts;
     eprintln!(
-        "deepseek4 EP: tp={tp} hidden={} layers={} hash_layers={} experts={}/{} vocab={}",
+        "deepseek4 EP: tp={tp} hidden={} layers={} hash_layers={} experts={}/{} vocab={} route_scale={} swiglu_limit={}",
         cfg.hidden_size,
         cfg.num_hidden_layers,
         cfg.num_hash_layers,
         n_exp,
         cfg.num_experts_per_tok,
         cfg.vocab_size,
+        cfg.routed_scaling_factor,
+        cfg.swiglu_limit,
     );
 
     // Special tokens (DeepSeek `<｜...｜>` markers live in the tokenizer table).
@@ -125,8 +192,16 @@ fn main() {
         }
     };
     let bos_tok = lookup_id("<｜begin▁of▁sentence｜>");
+    let user_tok = lookup_id("<｜User｜>");
+    let asst_tok = lookup_id("<｜Assistant｜>");
     let eos_tok = lookup_id("<｜end▁of▁sentence｜>").unwrap_or(tok.eos_id);
-    eprintln!("  bos={bos_tok:?} eos={eos_tok}");
+    eprintln!("  bos={bos_tok:?} user={user_tok:?} assistant={asst_tok:?} eos={eos_tok}");
+    if chat {
+        assert!(
+            bos_tok.is_some() && user_tok.is_some() && asst_tok.is_some(),
+            "--chat requires BOS/User/Assistant special tokens in model metadata"
+        );
+    }
     drop(hfq0);
 
     // ── bring up N ranks ────────────────────────────────────────────────────
@@ -152,6 +227,7 @@ fn main() {
     for r in 0..n {
         gpus.devices[r].bind_thread().expect("bind");
         let mut hfq = HfqFile::open(&model).expect("reopen model");
+        attach_overlay(&mut hfq);
         let t = std::time::Instant::now();
         let w = DeepseekV4::load_weights_sharded(&mut hfq, &cfg, &mut gpus.devices[r], &shard, r)
             .expect("shard-aware load");
@@ -165,12 +241,23 @@ fn main() {
 
     // ── per-rank state + routed partials ([hidden] = ffn_out width) ──────────
     let mut prompt_ids: Vec<u32> = Vec::new();
-    if !no_bos {
-        if let Some(b) = bos_tok {
-            prompt_ids.push(b);
+    if chat {
+        prompt_ids.push(bos_tok.unwrap());
+        prompt_ids.push(user_tok.unwrap());
+        prompt_ids.extend(tok.encode(&prompt));
+        prompt_ids.push(asst_tok.unwrap());
+        // DeepSeek V4 non-thinking template. The model requires this marker
+        // immediately after Assistant to skip the reasoning block; omitting it
+        // leaves the prompt off-distribution and commonly produces attractors.
+        prompt_ids.extend(tok.encode("</think>"));
+    } else {
+        if !no_bos {
+            if let Some(b) = bos_tok {
+                prompt_ids.push(b);
+            }
         }
+        prompt_ids.extend(tok.encode(&prompt));
     }
-    prompt_ids.extend(tok.encode(&prompt));
     if let Some(target) = prefill_tokens {
         assert!(target > 0, "--prefill-tokens must be greater than zero");
         assert!(
@@ -234,6 +321,99 @@ fn main() {
         let l = s.logits.as_ref().expect("logits unset");
         gpus.devices[0].download_f32(l).expect("dl")
     };
+    let dump_moe_probe = |gpus: &mut Gpus,
+                          states: &[DeepseekV4State],
+                          partials: &[GpuTensor],
+                          out_dir: &std::path::Path,
+                          position: usize| {
+        std::fs::create_dir_all(out_dir).expect("create --moe-probe-out");
+        let mut manifest = format!(
+            "format=hipfire-deepseek4-moe-probe-v1\nlayer={}\nposition={}\n\
+             hidden={}\nmoe_intermediate={}\nk_top={}\nranks={}\n",
+            cfg.num_hidden_layers - 1,
+            position,
+            cfg.hidden_size,
+            cfg.moe_intermediate_size,
+            cfg.num_experts_per_tok,
+            states.len(),
+        );
+        for (rank, state) in states.iter().enumerate() {
+            gpus.devices[rank].bind_thread().expect("bind probe rank");
+            gpus.devices[rank]
+                .hip
+                .device_synchronize()
+                .expect("sync probe rank");
+
+            let tensors = [
+                ("ffn_x_plain", state.ffn_x_plain.as_ref()),
+                ("ffn_x_rot", state.ffn_x_rot.as_ref()),
+                ("router_scores", state.router_scores.as_ref()),
+                ("topk_weights", state.moe_topk_weights.as_ref()),
+                ("silu_batch", state.moe_gate_batch.as_ref()),
+                ("up_batch", state.moe_up_batch.as_ref()),
+                ("rot_batch", state.moe_rot_batch.as_ref()),
+                ("down_expanded", state.moe_down_expert_outputs.as_ref()),
+                ("ffn_out", state.ffn_out.as_ref()),
+            ];
+            for (name, tensor) in tensors {
+                let tensor = tensor.unwrap_or_else(|| panic!("probe tensor {name} unset"));
+                let values = gpus.devices[rank]
+                    .download_f32(tensor)
+                    .unwrap_or_else(|error| panic!("download probe tensor {name}: {error:?}"));
+                let bytes = values
+                    .iter()
+                    .flat_map(|value| value.to_le_bytes())
+                    .collect::<Vec<_>>();
+                let path = out_dir.join(format!("rank{rank}.{name}.f32le"));
+                std::fs::write(&path, bytes)
+                    .unwrap_or_else(|error| panic!("write {}: {error}", path.display()));
+                manifest.push_str(&format!("rank{rank}.{name}.count={}\n", values.len()));
+            }
+
+            let indices = state
+                .moe_topk_indices
+                .as_ref()
+                .expect("probe topk indices unset");
+            let index_bits = gpus.devices[rank]
+                .download_f32(indices)
+                .expect("download probe topk indices")
+                .into_iter()
+                .map(|value| value.to_bits() as i32)
+                .collect::<Vec<_>>();
+            let index_bytes = index_bits
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect::<Vec<_>>();
+            std::fs::write(
+                out_dir.join(format!("rank{rank}.topk_indices.i32le")),
+                index_bytes,
+            )
+            .expect("write probe topk indices");
+            manifest.push_str(&format!("rank{rank}.topk_indices={index_bits:?}\n"));
+
+            let routed = gpus.devices[rank]
+                .download_f32(&partials[rank])
+                .expect("download probe routed partial");
+            let routed_bytes = routed
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect::<Vec<_>>();
+            std::fs::write(
+                out_dir.join(format!("rank{rank}.routed_partial.f32le")),
+                routed_bytes,
+            )
+            .expect("write probe routed partial");
+            manifest.push_str(&format!(
+                "rank{rank}.routed_partial.count={}\n",
+                routed.len()
+            ));
+        }
+        std::fs::write(out_dir.join("manifest.txt"), manifest).expect("write probe manifest");
+        eprintln!(
+            "wrote last-layer real-activation MoE probe to {}",
+            out_dir.display()
+        );
+    };
     // Fork-margin diagnostic: top-8 logits at a position, decoded for eyeballing.
     let top8 = |v: &[f32], tok: &Tokenizer| -> String {
         let mut idx: Vec<u32> = (0..v.len() as u32).collect();
@@ -251,14 +431,16 @@ fn main() {
 
     // ── EP prefill (per-token) + greedy decode ──────────────────────────────
     eprintln!(
-        "\nprompt {} chars → {} tokens (bos-prepended={}, synthetic-fill={})",
+        "\nprompt {} chars → {} tokens (mode={}, bos-prepended={}, synthetic-fill={})",
         prompt.chars().count(),
         prompt_ids.len(),
-        !no_bos,
+        if chat { "chat" } else { "raw" },
+        chat || !no_bos,
         prefill_tokens.is_some()
     );
     let t0 = std::time::Instant::now();
     let mut logits = Vec::new();
+    let mut score_rows: Vec<(u32, f32)> = Vec::new();
     if batched_prefill {
         for (chunk_idx, chunk) in prompt_ids.chunks(prefill_batch).enumerate() {
             logits = forward::forward_prefill_batch_chunk_ep(
@@ -285,8 +467,29 @@ fn main() {
                 pos as u32,
             )
             .expect("forward_ep prefill");
+            if score_out.is_some() {
+                logits = dl_logits(&mut gpus, &state_per_rank[0]);
+                if let Some(&target) = prompt_ids.get(pos + 1) {
+                    assert!(
+                        logits.iter().all(|value| value.is_finite()),
+                        "non-finite teacher-forcing logits at position {pos}"
+                    );
+                    let max_logit = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                    let lse = logits
+                        .iter()
+                        .map(|&value| ((value - max_logit) as f64).exp())
+                        .sum::<f64>()
+                        .ln()
+                        + max_logit as f64;
+                    let nll = lse - logits[target as usize] as f64;
+                    assert!(nll.is_finite(), "non-finite NLL at position {pos}");
+                    score_rows.push((target, nll as f32));
+                }
+            }
         }
-        logits = dl_logits(&mut gpus, &state_per_rank[0]);
+        if score_out.is_none() {
+            logits = dl_logits(&mut gpus, &state_per_rank[0]);
+        }
     }
     eprintln!(
         "prefill {} tok in {:.2}s",
@@ -298,6 +501,44 @@ fn main() {
         prompt_ids.len() - 1,
         top8(&logits, &tok)
     );
+    if let Some(path) = prefill_logits_out.as_ref() {
+        let bytes = logits
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        std::fs::write(path, bytes).expect("write --prefill-logits-out");
+        eprintln!(
+            "wrote {} F32 prefill logits to {}",
+            logits.len(),
+            path.display()
+        );
+    }
+    if let Some(path) = score_out.as_ref() {
+        assert!(!score_rows.is_empty(), "--score-out produced no positions");
+        let mut bytes = Vec::with_capacity(score_rows.len() * 8);
+        for &(target, nll) in &score_rows {
+            bytes.extend_from_slice(&target.to_le_bytes());
+            bytes.extend_from_slice(&nll.to_le_bytes());
+        }
+        std::fs::write(path, bytes).expect("write --score-out");
+        let mean_nll =
+            score_rows.iter().map(|&(_, nll)| nll as f64).sum::<f64>() / score_rows.len() as f64;
+        eprintln!(
+            "teacher forcing: {} positions mean_nll={mean_nll:.9} ppl={:.9}; wrote {}",
+            score_rows.len(),
+            mean_nll.exp(),
+            path.display()
+        );
+    }
+    if let Some(path) = moe_probe_out.as_deref() {
+        dump_moe_probe(
+            &mut gpus,
+            &state_per_rank,
+            &partials,
+            path,
+            prompt_ids.len() - 1,
+        );
+    }
 
     // ── MTP EP draft (spec-decode drafter under expert parallelism) ─────────
     // After prefill, `logits` predicts t0. Capture h_n (the last-position full
@@ -373,7 +614,7 @@ fn main() {
         )
         .expect("forward_ep decode");
         logits = dl_logits(&mut gpus, &state_per_rank[0]);
-        if step < 3 {
+        if step < 3 || trace_next.contains(&(step + 1)) {
             eprintln!(
                 "top8 @pos {} (decode step {}): {}",
                 pos,
@@ -409,6 +650,22 @@ fn main() {
     );
     eprintln!("gen ids: {:?}", &gen[..gen.len().min(40)]);
     eprintln!("gen FNV: 0x{:016x}", fnv1a(&gen));
+    if let Some(path) = gen_ids_out.as_ref() {
+        let mut text = gen
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        std::fs::write(path, text).expect("write --gen-ids-out");
+        eprintln!(
+            "wrote {} generated token IDs to {}",
+            gen.len(),
+            path.display()
+        );
+    }
 
     // MTP-EP accept check: the draft predicted the token AFTER t0; the decode
     // loop's gen[1] IS that true token. A match = spec-decode accept.

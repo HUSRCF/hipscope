@@ -20192,6 +20192,8 @@ impl Gpu {
         y_gate: &GpuTensor,
         y_up: &GpuTensor,
         up_bias: &GpuTensor,
+        pos_buf: &GpuTensor,
+        ratio: i32,
         gate_m: usize,
         up_m: usize,
         k: usize,
@@ -20209,6 +20211,8 @@ impl Gpu {
         let yg = y_gate.buf.as_ptr();
         let yu = y_up.buf.as_ptr();
         let bp = up_bias.buf.as_ptr();
+        let pp = pos_buf.buf.as_ptr();
+        let rr = ratio;
         let gm = gate_m as i32;
         let um = up_m as i32;
         let kv = k as i32;
@@ -20219,6 +20223,8 @@ impl Gpu {
             &yg as *const _ as *mut c_void,
             &yu as *const _ as *mut c_void,
             &bp as *const _ as *mut c_void,
+            &pp as *const _ as *mut c_void,
+            &rr as *const _ as *mut c_void,
             &gm as *const _ as *mut c_void,
             &um as *const _ as *mut c_void,
             &kv as *const _ as *mut c_void,
@@ -20237,6 +20243,8 @@ impl Gpu {
                 b.push_ptr(yg);
                 b.push_ptr(yu);
                 b.push_ptr(bp);
+                b.push_ptr(pp);
+                b.push_i32(rr);
                 b.push_i32(gm);
                 b.push_i32(um);
                 b.push_i32(kv);
@@ -21129,6 +21137,8 @@ impl Gpu {
         y0: &GpuTensor,
         y1: &GpuTensor,
         bias1: &GpuTensor,
+        pos_buf: &GpuTensor,
+        ratio: i32,
         m0: usize,
         m1: usize,
         k: usize,
@@ -21146,6 +21156,8 @@ impl Gpu {
         let y0p = y0.buf.as_ptr();
         let y1p = y1.buf.as_ptr();
         let bp = bias1.buf.as_ptr();
+        let pp = pos_buf.buf.as_ptr();
+        let rr = ratio;
         let m0i = m0 as i32;
         let m1i = m1 as i32;
         let ki = k as i32;
@@ -21156,6 +21168,8 @@ impl Gpu {
             &y0p as *const _ as *mut c_void,
             &y1p as *const _ as *mut c_void,
             &bp as *const _ as *mut c_void,
+            &pp as *const _ as *mut c_void,
+            &rr as *const _ as *mut c_void,
             &m0i as *const _ as *mut c_void,
             &m1i as *const _ as *mut c_void,
             &ki as *const _ as *mut c_void,
@@ -21174,6 +21188,8 @@ impl Gpu {
                 b.push_ptr(y0p);
                 b.push_ptr(y1p);
                 b.push_ptr(bp);
+                b.push_ptr(pp);
+                b.push_i32(rr);
                 b.push_i32(m0i);
                 b.push_i32(m1i);
                 b.push_i32(ki);

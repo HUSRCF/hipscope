@@ -7,7 +7,7 @@
 // Combines the per-segment transforms applied after `hc_apply_alpha`
 // in the sequential mhc_pre path:
 //
-//   pre[b, h]    = sigmoid(c[b, 0..4][h])
+//   pre[b, h]    = sigmoid(c[b, 0..4][h]) + hc_eps
 //   post[b, h]   = post_scale * sigmoid(c[b, 4..8][h])
 //   comb[b, i]   = c[b, 8..24][i]
 //
@@ -29,6 +29,7 @@ extern "C" __global__ void hc_split_finalize_batched(
     float*       __restrict__ pre,      // [B, 4]
     float*       __restrict__ post,     // [B, 4]
     float*       __restrict__ comb,     // [B, 16]
+    float        hc_eps,
     float        post_scale,
     int          batch_size
 ) {
@@ -39,7 +40,7 @@ extern "C" __global__ void hc_split_finalize_batched(
     const float v = c[(size_t)b * 24 + i];
     if (i < 4) {
         const float s = 1.0f / (1.0f + expf(-v));
-        pre[(size_t)b * 4 + i] = s;
+        pre[(size_t)b * 4 + i] = s + hc_eps;
     } else if (i < 8) {
         const float s = 1.0f / (1.0f + expf(-v));
         post[(size_t)b * 4 + (i - 4)] = s * post_scale;
