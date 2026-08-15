@@ -9523,6 +9523,41 @@ impl Gpu {
             )
         }
     }
+    pub fn indexer_top_k_radix512_gfx90a(
+        &mut self,
+        scores: &GpuTensor,
+        top_indices: &GpuTensor,
+        n_stride: i32,
+        n_iter: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "indexer_top_k_radix512_gfx90a",
+            kernels::INDEXER_TOP_K_RADIX512_GFX90A_SRC,
+            "indexer_top_k_radix512_gfx90a",
+        )?;
+        let func = &self.functions["indexer_top_k_radix512_gfx90a"];
+        let sp = scores.buf.as_ptr();
+        let ti = top_indices.buf.as_ptr();
+        let mut ns = n_stride;
+        let mut ni = n_iter;
+        let mut params: Vec<*mut c_void> = vec![
+            &sp as *const _ as *mut c_void,
+            &ti as *const _ as *mut c_void,
+            &mut ns as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [1, 1, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
     pub fn indexer_top_k_buf(
         &mut self,
         scores: &GpuTensor,

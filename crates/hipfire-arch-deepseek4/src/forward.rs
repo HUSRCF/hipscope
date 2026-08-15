@@ -1621,17 +1621,22 @@ fn indexer_forward(
             )
             .map_err(|e| format!("idx score eager-active l{layer_idx}: {e:?}"))?;
         }
-        gpu.indexer_top_k_batched(
-            scores,
-            topk,
-            /*n_idx_heads=*/ 1,
-            max_compressed as i32,
-            n as i32,
-            k as i32,
-            k.min(n) as i32,
-            1,
-        )
-        .map_err(|e| format!("idx top_k eager-active l{layer_idx}: {e:?}"))?;
+        if gpu.arch == "gfx90a" && k == 512 && n > k {
+            gpu.indexer_top_k_radix512_gfx90a(scores, topk, max_compressed as i32, n as i32)
+                .map_err(|e| format!("idx top_k radix512 gfx90a l{layer_idx}: {e:?}"))?;
+        } else {
+            gpu.indexer_top_k_batched(
+                scores,
+                topk,
+                /*n_idx_heads=*/ 1,
+                max_compressed as i32,
+                n as i32,
+                k as i32,
+                k.min(n) as i32,
+                1,
+            )
+            .map_err(|e| format!("idx top_k eager-active l{layer_idx}: {e:?}"))?;
+        }
     }
     ds4_fine_probe_end(gpu, selection_probe, layer_idx, "indexer_selection")?;
 

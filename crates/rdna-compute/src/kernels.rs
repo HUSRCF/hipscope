@@ -5457,6 +5457,11 @@ pub const V4F_ATTN_SWA_BATCHED_SRC: &str =
 pub const INDEXER_TOP_K_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/indexer_top_k_batched.hip");
 
+/// gfx90a exact stable top-512 selection for eager DeepSeek V4 Indexer decode.
+/// Uses radix selection plus an LDS bitonic sort instead of O(N^2) ranking.
+pub const INDEXER_TOP_K_RADIX512_GFX90A_SRC: &str =
+    include_str!("../../../kernels/src/indexer_top_k_radix512.gfx90a.hip");
+
 /// HC 4-stream residual mix — BATCHED (Phase A5, 2026-05-18). Twin of
 /// HC_MIX_4STREAM_SRC; batch dim parallelizes cleanly across blockIdx.z.
 pub const HC_MIX_4STREAM_BATCHED_SRC: &str =
