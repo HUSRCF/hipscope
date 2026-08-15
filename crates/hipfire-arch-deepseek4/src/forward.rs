@@ -609,7 +609,7 @@ fn compressor_forward_impl(
             && *GFX90A_COMP_TWIN_F16_WAVE64_APE.get_or_init(|| {
                 hipfire_config::developer_var("HIPFIRE_GFX90A_DS4_COMP_TWIN_F16_WAVE64_APE")
                     .as_deref()
-                    == Ok("1")
+                    != Ok("0")
             });
         if f16_wave64_ape {
             gpu.fused_twin_f16_xf32_wave64_bias_gfx90a(
