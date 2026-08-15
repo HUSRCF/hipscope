@@ -5222,7 +5222,6 @@ pub const HC_COMPUTE_CONTROL_BATCHED_F32WEIGHTS_SRC: &str =
 pub const HC_APPLY_ALPHA_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/hc_apply_alpha_batched.hip");
 
-
 pub const HC_APPLY_ALPHA_BATCHED_F32WEIGHTS_SRC: &str =
     include_str!("../../../kernels/src/hc_apply_alpha_batched_f32weights.hip");
 /// HC Sinkhorn 4×4 — BATCHED (Phase B2, 2026-05-18). Per-batch
@@ -5285,6 +5284,10 @@ pub const V4F_TOPK_KV_GATHER_IDENTITY_BATCHED_SRC: &str =
 /// Block-diagonal: wo_a[G, M, K] @ x_in[B, G, K] → y_out[B, G, M].
 pub const WO_PER_GROUP_BATCHED_F32_SRC: &str =
     include_str!("../../../kernels/src/wo_per_group_batched_f32.hip");
+
+/// Native wave64, two-output-row F16 O-LoRA projection for CDNA2/gfx90a.
+pub const WO_PER_GROUP_BATCHED_F16_WAVE64_ROW2_GFX90A_SRC: &str =
+    include_str!("../../../kernels/src/wo_per_group_batched_f16_wave64_row2.gfx90a.hip");
 
 /// DeepSeek V4 per-group O-LoRA batched GEMV for HFQ4G256-packed wo_a.
 /// Single launch in place of B × G separate gemv_mq4g256_prerotated calls.

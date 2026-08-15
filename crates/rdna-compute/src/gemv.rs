@@ -10699,6 +10699,59 @@ impl Gpu {
             )
         }
     }
+
+    pub fn wo_per_group_batched_f16_wave64_row2_gfx90a(
+        &mut self,
+        wo_a: &GpuTensor,  // [G, M, K] F16
+        x_in: &GpuTensor,  // [B, G, K] F32
+        y_out: &GpuTensor, // [B, G, M] F32
+        g: i32,
+        m: i32,
+        k: i32,
+        batch_size: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if self.arch != "gfx90a" {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "wo_per_group_batched_f16_wave64_row2_gfx90a requires gfx90a",
+            ));
+        }
+        let name = "wo_per_group_batched_f16_wave64_row2_gfx90a";
+        self.ensure_kernel(
+            name,
+            kernels::WO_PER_GROUP_BATCHED_F16_WAVE64_ROW2_GFX90A_SRC,
+            name,
+        )?;
+        let func = &self.functions[name];
+        let wp = wo_a.buf.as_ptr();
+        let xp = x_in.buf.as_ptr();
+        let yp = y_out.buf.as_ptr();
+        let mut g_i = g;
+        let mut m_i = m;
+        let mut k_i = k;
+        let mut bs = batch_size;
+        let mut params: Vec<*mut c_void> = vec![
+            &wp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &mut g_i as *mut _ as *mut c_void,
+            &mut m_i as *mut _ as *mut c_void,
+            &mut k_i as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [((m as u32) + 1) / 2, batch_size as u32, g as u32],
+                [64, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     pub fn wo_per_group_batched_hfq4g256(
         &mut self,
         wo_a: &GpuTensor,  // [G * M * K / 256 * 136] bytes

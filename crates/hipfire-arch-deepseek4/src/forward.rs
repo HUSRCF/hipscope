@@ -7278,6 +7278,7 @@ fn attention_block_batched_swa_only(
 
     // 7. wo_a per-group batched.
     //    F32     → wo_per_group_batched_f32 (single launch).
+    //    F16     → gfx90a native wave64 row2 (single launch).
     //    HFQ4G256→ wo_per_group_batched_hfq4g256 (single launch, MQ4 prerotated).
     //    Q8_0    → wo_per_group_batched_q8_0 (single launch, plain input).
     let per_group_in = (n_heads / n_groups) * head_dim;
@@ -7293,6 +7294,18 @@ fn attention_block_batched_swa_only(
                 batch_size as i32,
             )
             .map_err(|e| format!("wo_per_group_batched_f32 l{layer_idx}: {e:?}"))?;
+        }
+        DType::F16 => {
+            gpu.wo_per_group_batched_f16_wave64_row2_gfx90a(
+                wo_a,
+                &pbs.attn_out_raw_batch,
+                &pbs.wo_a_out_batch,
+                n_groups as i32,
+                o_lora_rank as i32,
+                per_group_in as i32,
+                batch_size as i32,
+            )
+            .map_err(|e| format!("wo_per_group_batched_f16_wave64 l{layer_idx}: {e:?}"))?;
         }
         DType::Q8_0 => {
             // Q8_0 contract: plain (non-FWHT) input. attn_out_raw_batch
@@ -8230,6 +8243,7 @@ fn attention_block_batched_mixed(
 
     // 7. wo_a per-group batched.
     //    F32     → wo_per_group_batched_f32 (single launch).
+    //    F16     → gfx90a native wave64 row2 (single launch).
     //    HFQ4G256→ wo_per_group_batched_hfq4g256 (single launch).
     //    Q8_0    → wo_per_group_batched_q8_0 (single launch, plain input).
     let per_group_in = (n_heads / n_groups) * head_dim;
@@ -8246,6 +8260,18 @@ fn attention_block_batched_mixed(
                 batch_size as i32,
             )
             .map_err(|e| format!("wo_per_group_batched_f32 l{layer_idx}: {e:?}"))?;
+        }
+        DType::F16 => {
+            gpu.wo_per_group_batched_f16_wave64_row2_gfx90a(
+                wo_a,
+                &pbs.attn_out_raw_batch,
+                &pbs.wo_a_out_batch,
+                n_groups as i32,
+                o_lora_rank as i32,
+                per_group_in as i32,
+                batch_size as i32,
+            )
+            .map_err(|e| format!("wo_per_group_batched_f16_wave64 l{layer_idx}: {e:?}"))?;
         }
         DType::Q8_0 => {
             // Q8_0 contract: plain (non-FWHT) input. Same layout
@@ -11119,7 +11145,7 @@ fn dspark_wo_project(
         .map_err(|e| format!("dspark rotate attn_out_raw[{stage}]: {e:?}"))?;
     }
 
-    // 7. wo_a per-group batched (F32 / Q8_0 / MQ4).
+    // 7. wo_a per-group batched (F32 / F16 / Q8_0 / MQ4).
     match wo_a.dtype {
         DType::F32 => gpu
             .wo_per_group_batched_f32(
@@ -11132,6 +11158,17 @@ fn dspark_wo_project(
                 block as i32,
             )
             .map_err(|e| format!("dspark wo_a f32[{stage}]: {e:?}"))?,
+        DType::F16 => gpu
+            .wo_per_group_batched_f16_wave64_row2_gfx90a(
+                wo_a,
+                &pbs.attn_out_raw_batch,
+                &pbs.wo_a_out_batch,
+                n_groups as i32,
+                o_lora_rank as i32,
+                per_group_in as i32,
+                block as i32,
+            )
+            .map_err(|e| format!("dspark wo_a f16 wave64[{stage}]: {e:?}"))?,
         DType::Q8_0 => gpu
             .wo_per_group_batched_q8_0(
                 wo_a,
