@@ -5169,12 +5169,6 @@ fn attn_stub(
 
         if do_mixed {
             let topk_max = cfg.index_topk;
-            if state._attention[layer_idx].gathered_k.is_none() {
-                state._attention[layer_idx].gathered_k = Some(
-                    gpu.zeros(&[n_kv, head_dim, topk_max], DType::F32)
-                        .map_err(|e| format!("alloc gathered_k l{layer_idx}: {e:?}"))?,
-                );
-            }
             // n_compressed / k_active values for the current position are
             // pre-computed into state.attn_state_buf (slots 2-5) by
             // precompute_attn_state. Select the right slot based on
@@ -5194,7 +5188,27 @@ fn attn_stub(
 
             let use_topk_gather =
                 layer.compress_ratio == 4 && state._indexer[layer_idx].topk_idx_indices.is_some();
-            if use_topk_gather {
+            // On gfx90a eager decode, the existing direct B=1 kernel is
+            // bit-exact with gather+attention and avoids staging 512x512 F32
+            // values per indexed layer. Keep capture replay on the fixed-grid
+            // device-buffer path because the direct kernel takes host N as a
+            // kernarg; keep ratio=128 and every other arch unchanged.
+            let use_gfx90a_direct = use_topk_gather
+                && gpu.arch == "gfx90a"
+                && !gpu.graphs.capture_mode
+                && hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_DIRECT_ATTN").as_deref()
+                    != Ok("0");
+            // Preserve the baseline lazy-allocation order even when the direct
+            // kernel bypasses this staging tensor. Several runtime caches are
+            // pointer-keyed, so changing subsequent scratch addresses is not
+            // a semantics-neutral optimization during correctness bring-up.
+            if state._attention[layer_idx].gathered_k.is_none() {
+                state._attention[layer_idx].gathered_k = Some(
+                    gpu.zeros(&[n_kv, head_dim, topk_max], DType::F32)
+                        .map_err(|e| format!("alloc gathered_k l{layer_idx}: {e:?}"))?,
+                );
+            }
+            if use_topk_gather && !use_gfx90a_direct {
                 // ratio=4 path: indexer top-K gather. Launch with fixed
                 // grid = topk_max so capture sees a constant grid; lanes
                 // past K_buf[0] early-return.
@@ -5214,7 +5228,7 @@ fn attn_stub(
                     1.0,
                 )
                 .map_err(|e| format!("mixed gather (idx,buf) l{layer_idx}: {e:?}"))?;
-            } else {
+            } else if !use_gfx90a_direct {
                 // ratio=128 (or fallback): identity gather over first K rows.
                 let main_kv_cache = state._indexer[layer_idx].main_kv_cache.as_ref().unwrap();
                 let gathered_k = state._attention[layer_idx].gathered_k.as_ref().unwrap();
@@ -5231,28 +5245,55 @@ fn attn_stub(
 
             let swa_k = state._attention[layer_idx].swa_k.as_ref().unwrap();
             let swa_v = state._attention[layer_idx].swa_v.as_ref().unwrap();
-            let gathered_k = state._attention[layer_idx].gathered_k.as_ref().unwrap();
             let n_valid_buf = attn_buf.sub_offset(1, 1);
             // Joint softmax: scores = Q·K for [swa_k, gathered_k, attn_sink],
             // single normalization, V = swa_v + gathered_v (K=V tied, so
             // we pass gathered_k as V too). n_valid_swa + n_active_topk
             // come from the device-side attn_state_buf.
-            gpu.deepseek4_attn_swa_topk_f32_buf(
-                q,
-                swa_k,
-                swa_v,
-                gathered_k,
-                gathered_k,
-                attn_sink,
-                attn_out_raw,
-                &n_valid_buf,
-                &k_active_buf,
-                n_heads as i32,
-                head_dim as i32,
-                win as i32,
-                topk_max as i32,
-            )
-            .map_err(|e| format!("deepseek4_attn_swa_topk_buf l{layer_idx}: {e:?}"))?;
+            if use_gfx90a_direct {
+                let topk_idx = state._indexer[layer_idx].topk_idx_indices.as_ref().unwrap();
+                let main_kv_cache = state._indexer[layer_idx].main_kv_cache.as_ref().unwrap();
+                let n_compressed = state
+                    .attn_state_host
+                    .as_ref()
+                    .ok_or_else(|| "attn_state_host missing".to_string())?[2];
+                gpu.deepseek4_attn_swa_topk_direct_batched_f32(
+                    q,
+                    swa_k,
+                    swa_v,
+                    main_kv_cache,
+                    topk_idx,
+                    attn_sink,
+                    &n_valid_buf,
+                    &k_active_buf,
+                    attn_out_raw,
+                    n_heads as i32,
+                    head_dim as i32,
+                    win as i32,
+                    topk_max as i32,
+                    n_compressed,
+                    1,
+                )
+                .map_err(|e| format!("deepseek4_attn_swa_topk_direct l{layer_idx}: {e:?}"))?;
+            } else {
+                let gathered_k = state._attention[layer_idx].gathered_k.as_ref().unwrap();
+                gpu.deepseek4_attn_swa_topk_f32_buf(
+                    q,
+                    swa_k,
+                    swa_v,
+                    gathered_k,
+                    gathered_k,
+                    attn_sink,
+                    attn_out_raw,
+                    &n_valid_buf,
+                    &k_active_buf,
+                    n_heads as i32,
+                    head_dim as i32,
+                    win as i32,
+                    topk_max as i32,
+                )
+                .map_err(|e| format!("deepseek4_attn_swa_topk_buf l{layer_idx}: {e:?}"))?;
+            }
             let _ = n_valid; // legacy host-computed value not used after migration
         } else {
             let swa_k = state._attention[layer_idx].swa_k.as_ref().unwrap();
