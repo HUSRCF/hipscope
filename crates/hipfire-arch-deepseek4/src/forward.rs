@@ -82,6 +82,17 @@ mod config_cache {
                 == Some("pos0")
         })
     }
+    /// gfx90a EP4 attention tensor-parallel path. Default ON after exact
+    /// 1024-token parity; set `HIPFIRE_GFX90A_DS4_ATTN_TP=0` to fall back.
+    pub(super) fn gfx90a_attn_tp() -> bool {
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| {
+            hipfire_config::developer_var("HIPFIRE_GFX90A_DS4_ATTN_TP")
+                .ok()
+                .as_deref()
+                != Some("0")
+        })
+    }
     /// `HIPFIRE_DEEPSEEK4_MTP_HEAD_HC` — default ON since 2026-05-21: route
     /// the MTP output (step 8 of mtp_forward) through head-HC mix using
     /// `mtp.0.hc_head_fn / hc_head_base / hc_head_scale`. Mirrors the
@@ -2076,7 +2087,7 @@ pub fn decode_step_body(
         }
 
         // v + vi. Main attention + O-LoRA — STUB.
-        attn_stub(cfg, weights, state, gpu, layer_idx)?;
+        attn_stub(cfg, weights, state, gpu, layer_idx, None)?;
 
         hc_attn_mix(cfg, weights, state, gpu, layer_idx)?;
 
@@ -2186,12 +2197,63 @@ fn ds4_attn_block(
     }
 
     let probe = ds4_coarse_probe_start(gpu, layer_idx, state.n_tokens)?;
-    attn_stub(cfg, weights, state, gpu, layer_idx)?;
+    attn_stub(cfg, weights, state, gpu, layer_idx, None)?;
     ds4_coarse_probe_end(gpu, probe, layer_idx, "attention_core")?;
 
     let probe = ds4_coarse_probe_start(gpu, layer_idx, state.n_tokens)?;
     hc_attn_mix(cfg, weights, state, gpu, layer_idx)?;
     ds4_coarse_probe_end(gpu, probe, layer_idx, "attn_mix")
+}
+
+/// Experimental EP4 attention-TP body. Q-LoRA, joint KV, compressor and
+/// indexer remain replicated so their state/cache evolution is unchanged. Only
+/// the head-independent attention work and complete O-LoRA groups are sliced;
+/// wo_b and HC mixing are finalized after the four local chunks are gathered.
+fn ds4_attn_block_tp_local(
+    cfg: &DeepseekV4Config,
+    weights: &DeepseekV4Weights,
+    state: &mut DeepseekV4State,
+    gpu: &mut Gpu,
+    layer_idx: usize,
+    position: u32,
+    slice: AttnTpSlice,
+) -> Result<(), String> {
+    let layer = weights.resolve_layer(layer_idx);
+
+    let probe = ds4_coarse_probe_start(gpu, layer_idx, state.n_tokens)?;
+    mhc_pre(cfg, weights, state, gpu, layer_idx, /*is_attn=*/ true)?;
+    ds4_coarse_probe_end(gpu, probe, layer_idx, "attn_mhc_pre")?;
+
+    let probe = ds4_coarse_probe_start(gpu, layer_idx, state.n_tokens)?;
+    q_lora(cfg, weights, state, gpu, layer_idx)?;
+    ds4_coarse_probe_end(gpu, probe, layer_idx, "q_lora")?;
+
+    let probe = ds4_coarse_probe_start(gpu, layer_idx, state.n_tokens)?;
+    kv_joint(cfg, weights, state, gpu, layer_idx)?;
+    apply_tail_rope(cfg, weights, state, gpu, position, layer_idx)?;
+    ds4_coarse_probe_end(gpu, probe, layer_idx, "kv_joint_rope")?;
+
+    if layer.compress_ratio > 0 {
+        let probe = ds4_coarse_probe_start(gpu, layer_idx, state.n_tokens)?;
+        let tmp_view = {
+            let tensor = state.tmp.as_ref().unwrap();
+            tensor.sub_offset(0, tensor.numel())
+        };
+        compressor_forward(
+            cfg, weights, state, gpu, layer_idx, &tmp_view, position, /*is_indexer=*/ false,
+        )?;
+        if layer.compress_ratio == 4 {
+            compressor_forward(
+                cfg, weights, state, gpu, layer_idx, &tmp_view, position, /*is_indexer=*/ true,
+            )?;
+            let _n = indexer_forward(cfg, weights, state, gpu, layer_idx, position)?;
+        }
+        ds4_coarse_probe_end(gpu, probe, layer_idx, "compressor_indexer")?;
+    }
+
+    let probe = ds4_coarse_probe_start(gpu, layer_idx, state.n_tokens)?;
+    attn_stub(cfg, weights, state, gpu, layer_idx, Some(slice))?;
+    ds4_coarse_probe_end(gpu, probe, layer_idx, "attention_core")
 }
 
 fn ds4_probe_layer_selected(layer: usize) -> bool {
@@ -2818,6 +2880,12 @@ fn ds4_lower_program() -> superop::LayerProgram {
     ]
 }
 
+/// Attention is orchestrated explicitly by the experimental gfx90a EP4 TP
+/// path; the established EP executor still owns the routed-MoE collective.
+fn ds4_lower_moe_program() -> superop::LayerProgram {
+    vec![ds4_superop(SuperOpKind::Moe)]
+}
+
 /// Cached HIPFIRE_FORWARD_LOWERED toggle for deepseek4 (default ON, matching
 /// qwen35/lfm2/minimax; set =0 to fall back to the hand loop). Flipped on after
 /// hipx byte-parity in both plain AR and MTP spec-decode modes.
@@ -2955,7 +3023,120 @@ pub fn forward_ep(
         .and_then(|value| value.parse::<usize>().ok());
     let t_layers = std::time::Instant::now();
     let program = ds4_lower_program();
+    let moe_program = ds4_lower_moe_program();
+    // First-stage attention TP is deliberately narrow. The official
+    // 0731 shape maps 64 heads / 8 O-groups to four contiguous 16-head /
+    // 2-group slices. Q-LoRA, KV and compressor/indexer state remain fully
+    // replicated; only attention + wo_a are sliced.
+    let attention_tp = config_cache::gfx90a_attn_tp()
+        && n == 4
+        && gpus.peer_access_enabled
+        && cfg.num_attention_heads == 64
+        && cfg.o_groups == 8
+        && cfg.o_lora_rank == 1024
+        && cfg.hidden_size == 4096
+        && gpus
+            .devices
+            .iter()
+            .all(|device| device.arch == "gfx90a" && !device.graphs.capture_mode);
     for l in 0..cfg.num_hidden_layers {
+        if attention_tp {
+            let heads_per_rank = cfg.num_attention_heads / n;
+            let groups_per_rank = cfg.o_groups / n;
+            for r in 0..n {
+                gpus.devices[r]
+                    .bind_thread()
+                    .map_err(|e| format!("ds4 attention TP bind rank {r}: {e:?}"))?;
+                ds4_attn_block_tp_local(
+                    cfg,
+                    &weights_per_rank[r],
+                    &mut state_per_rank[r],
+                    &mut gpus.devices[r],
+                    l,
+                    position,
+                    AttnTpSlice {
+                        head_start: r * heads_per_rank,
+                        head_count: heads_per_rank,
+                        group_start: r * groups_per_rank,
+                        group_count: groups_per_rank,
+                        defer_wo_b: true,
+                    },
+                )?;
+            }
+
+            // Every rank wrote its two [1024] O-LoRA chunks at the global
+            // group offset in its local full-width wo_a_out. Concatenate those
+            // four disjoint 8 KiB slices into rank 0's complete [8192] buffer.
+            let chunk_elems = groups_per_rank * cfg.o_lora_rank;
+            let local_chunks: Vec<GpuTensor> = state_per_rank
+                .iter()
+                .enumerate()
+                .map(|(rank, state)| {
+                    state
+                        .wo_a_out
+                        .as_ref()
+                        .unwrap()
+                        .sub_offset(rank * chunk_elems, chunk_elems)
+                })
+                .collect();
+            let root_wo_a_out = state_per_rank[0].wo_a_out.as_ref().unwrap();
+            let root_chunks: Vec<GpuTensor> = (0..n)
+                .map(|rank| root_wo_a_out.sub_offset(rank * chunk_elems, chunk_elems))
+                .collect();
+            let local_buffers: Vec<_> = local_chunks.iter().map(|tensor| &tensor.buf).collect();
+            let root_buffers: Vec<_> = root_chunks.iter().map(|tensor| &tensor.buf).collect();
+            gpus.gather_equal_chunks_peer_root_async(
+                &local_buffers,
+                &root_buffers,
+                chunk_elems * std::mem::size_of::<f32>(),
+                0,
+            )
+            .map_err(|e| format!("ds4 attention TP gather L{l}: {e:?}"))?;
+
+            gpus.devices[0]
+                .bind_thread()
+                .map_err(|e| format!("ds4 attention TP root bind L{l}: {e:?}"))?;
+            attn_wo_b_project(
+                cfg,
+                &weights_per_rank[0],
+                &state_per_rank[0],
+                &mut gpus.devices[0],
+                l,
+            )?;
+
+            // Broadcast the finalized 16 KiB attention contribution. Each
+            // compute stream waits only for its own peer copy before HC mix.
+            let root_attn_out = state_per_rank[0].attn_out.as_ref().unwrap().shallow_clone();
+            let attn_destinations: Vec<GpuTensor> = state_per_rank
+                .iter()
+                .map(|state| state.attn_out.as_ref().unwrap().shallow_clone())
+                .collect();
+            let destination_buffers: Vec<_> =
+                attn_destinations.iter().map(|tensor| &tensor.buf).collect();
+            gpus.broadcast_peer_root_async(
+                &root_attn_out.buf,
+                &destination_buffers,
+                cfg.hidden_size * std::mem::size_of::<f32>(),
+                0,
+            )
+            .map_err(|e| format!("ds4 attention TP broadcast L{l}: {e:?}"))?;
+
+            for r in 0..n {
+                gpus.devices[r]
+                    .bind_thread()
+                    .map_err(|e| format!("ds4 attention TP mix bind rank {r}: {e:?}"))?;
+                let probe =
+                    ds4_coarse_probe_start(&mut gpus.devices[r], l, state_per_rank[r].n_tokens)?;
+                hc_attn_mix(
+                    cfg,
+                    &weights_per_rank[r],
+                    &mut state_per_rank[r],
+                    &mut gpus.devices[r],
+                    l,
+                )?;
+                ds4_coarse_probe_end(&mut gpus.devices[r], probe, l, "attn_mix")?;
+            }
+        }
         {
             let mut binds: Vec<Deepseek4Bindings> = Vec::with_capacity(n);
             for (r, st) in state_per_rank.iter_mut().enumerate() {
@@ -2973,7 +3154,7 @@ pub fn forward_ep(
                 gpus,
                 binds.as_mut_slice(),
                 partials,
-                &program,
+                if attention_tp { &moe_program } else { &program },
                 hidden,
             )
             .map_err(|e| format!("ds4 forward_ep run_layer_program_ep L{l}: {e}"))?;
@@ -3524,7 +3705,7 @@ fn mtp_pre_ffn(
     kv_joint(cfg, weights, state, gpu, mtp_layer_idx)?;
     apply_tail_rope(cfg, weights, state, gpu, position, mtp_layer_idx)?;
     // (No compressor / indexer for MTP — compress_ratio == 0.)
-    attn_stub(cfg, weights, state, gpu, mtp_layer_idx)?;
+    attn_stub(cfg, weights, state, gpu, mtp_layer_idx, None)?;
     hc_attn_mix(cfg, weights, state, gpu, mtp_layer_idx)?;
     Ok(())
 }
@@ -5229,12 +5410,22 @@ fn final_norm_and_head_ep_vocab_parallel(
 ///
 /// This handles position 0. For position > 0 we need SWA cache +
 /// real Q·K·V over history — pending.
+#[derive(Clone, Copy, Debug)]
+struct AttnTpSlice {
+    head_start: usize,
+    head_count: usize,
+    group_start: usize,
+    group_count: usize,
+    defer_wo_b: bool,
+}
+
 fn attn_stub(
     cfg: &DeepseekV4Config,
     weights: &DeepseekV4Weights,
     state: &mut DeepseekV4State,
     gpu: &mut Gpu,
     layer_idx: usize,
+    tp_slice: Option<AttnTpSlice>,
 ) -> Result<(), String> {
     // Final attention contribution: shape [hidden]. Consumed by hc_attn_mix.
     if state.attn_out.is_none() {
@@ -5244,12 +5435,12 @@ fn attn_stub(
         );
     }
     // Raw attention output [n_heads, head_dim] — kernel writes here.
-    let n_heads = cfg.num_attention_heads;
+    let total_n_heads = cfg.num_attention_heads;
     let head_dim = cfg.head_dim;
-    let n_heads_head_dim = n_heads * head_dim;
+    let n_heads_head_dim = total_n_heads * head_dim;
     if state.attn_out_raw.is_none() {
         state.attn_out_raw = Some(
-            gpu.alloc_tensor(&[n_heads, head_dim], DType::F32)
+            gpu.alloc_tensor(&[total_n_heads, head_dim], DType::F32)
                 .map_err(|e| format!("alloc attn_out_raw: {e:?}"))?,
         );
     }
@@ -5259,9 +5450,9 @@ fn attn_stub(
                 .map_err(|e| format!("alloc attn_out_raw_rot: {e:?}"))?,
         );
     }
-    let n_groups = cfg.o_groups;
+    let total_n_groups = cfg.o_groups;
     let o_lora_rank = cfg.o_lora_rank;
-    let groups_o_lora = n_groups * o_lora_rank;
+    let groups_o_lora = total_n_groups * o_lora_rank;
     if state.wo_a_out.is_none() {
         state.wo_a_out = Some(
             gpu.alloc_tensor(&[groups_o_lora], DType::F32)
@@ -5279,23 +5470,53 @@ fn attn_stub(
     // diagnostic/regression-check escape hatch via HIPFIRE_DEEPSEEK4_ATTN=pos0.
     let use_swa = !config_cache::attn_pos0();
 
-    let q = state.q.as_ref().unwrap();
+    let slice = tp_slice.unwrap_or(AttnTpSlice {
+        head_start: 0,
+        head_count: total_n_heads,
+        group_start: 0,
+        group_count: total_n_groups,
+        defer_wo_b: false,
+    });
+    if slice.head_count == 0
+        || slice.group_count == 0
+        || slice.head_start + slice.head_count > total_n_heads
+        || slice.group_start + slice.group_count > total_n_groups
+        || total_n_heads % total_n_groups != 0
+        || slice.head_start != slice.group_start * (total_n_heads / total_n_groups)
+        || slice.head_count != slice.group_count * (total_n_heads / total_n_groups)
+    {
+        return Err(format!(
+            "invalid attention TP slice l{layer_idx}: {slice:?}, total_heads={total_n_heads}, total_groups={total_n_groups}"
+        ));
+    }
+    let n_heads = slice.head_count;
+    let n_groups = slice.group_count;
+    let q = state
+        .q
+        .as_ref()
+        .unwrap()
+        .sub_offset(slice.head_start * head_dim, n_heads * head_dim);
     let kv = state.kv.as_ref().unwrap();
-    let attn_out_raw = state.attn_out_raw.as_ref().unwrap();
+    let attn_out_raw = state
+        .attn_out_raw
+        .as_ref()
+        .unwrap()
+        .sub_offset(slice.head_start * head_dim, n_heads * head_dim);
     let layer = weights.resolve_layer(layer_idx);
     let attn_sink = layer
         .attn_sink
         .as_ref()
-        .ok_or_else(|| format!("layer {layer_idx} attn_sink not uploaded"))?;
+        .ok_or_else(|| format!("layer {layer_idx} attn_sink not uploaded"))?
+        .sub_offset(slice.head_start, n_heads);
 
     let attention_probe = ds4_fine_probe_start(gpu, layer_idx, state.n_tokens)?;
     if !use_swa {
         // Pos-0 attention (default). Each step independent.
         gpu.deepseek4_attn_pos0(
-            q,
+            &q,
             kv,
-            attn_sink,
-            attn_out_raw,
+            &attn_sink,
+            &attn_out_raw,
             n_heads as i32,
             head_dim as i32,
             n_groups as i32,
@@ -5465,15 +5686,15 @@ fn attn_stub(
                     .as_ref()
                     .ok_or_else(|| "attn_state_host missing".to_string())?[2];
                 gpu.deepseek4_attn_swa_topk_direct_batched_f32(
-                    q,
+                    &q,
                     swa_k,
                     swa_v,
                     main_kv_cache,
                     topk_idx,
-                    attn_sink,
+                    &attn_sink,
                     &n_valid_buf,
                     &k_active_buf,
-                    attn_out_raw,
+                    &attn_out_raw,
                     n_heads as i32,
                     head_dim as i32,
                     win as i32,
@@ -5485,13 +5706,13 @@ fn attn_stub(
             } else {
                 let gathered_k = state._attention[layer_idx].gathered_k.as_ref().unwrap();
                 gpu.deepseek4_attn_swa_topk_f32_buf(
-                    q,
+                    &q,
                     swa_k,
                     swa_v,
                     gathered_k,
                     gathered_k,
-                    attn_sink,
-                    attn_out_raw,
+                    &attn_sink,
+                    &attn_out_raw,
                     &n_valid_buf,
                     &k_active_buf,
                     n_heads as i32,
@@ -5516,11 +5737,11 @@ fn attn_stub(
                 .sub_offset(1, 1);
             let _ = n_valid; // legacy host-computed value; not used after migration
             gpu.deepseek4_attn_swa_buf(
-                q,
+                &q,
                 swa_k,
                 swa_v,
-                attn_sink,
-                attn_out_raw,
+                &attn_sink,
+                &attn_out_raw,
                 &n_valid_buf,
                 n_heads as i32,
                 head_dim as i32,
@@ -5549,8 +5770,8 @@ fn attn_stub(
         let (freq_base, freq_scale, ext_factor, attn_factor, corr_low, corr_high) =
             layer_rope_params(cfg, layer.compress_ratio);
         gpu.rope_tail_yarn_interleaved(
-            attn_out_raw,
-            attn_out_raw,
+            &attn_out_raw,
+            &attn_out_raw,
             pos_buf,
             n_heads as i32,
             0,
@@ -5578,14 +5799,16 @@ fn attn_stub(
         .wo_a
         .as_ref()
         .ok_or_else(|| format!("layer {layer_idx} wo_a missing"))?;
-    let wo_b = layer
-        .wo_b
+    let attn_out_raw_rot = state
+        .attn_out_raw_rot
         .as_ref()
-        .ok_or_else(|| format!("layer {layer_idx} wo_b missing"))?;
-    let attn_out_raw_rot = state.attn_out_raw_rot.as_ref().unwrap();
-    let wo_a_out = state.wo_a_out.as_ref().unwrap();
-    let wo_a_out_rot = state.wo_a_out_rot.as_ref().unwrap();
-    let final_attn_out = state.attn_out.as_ref().unwrap();
+        .unwrap()
+        .sub_offset(slice.head_start * head_dim, n_heads * head_dim);
+    let wo_a_out = state
+        .wo_a_out
+        .as_ref()
+        .unwrap()
+        .sub_offset(slice.group_start * o_lora_rank, n_groups * o_lora_rank);
 
     // FWHT-rotate per-group slices of attn_out_raw (k=heads_per_group*head_dim).
     let heads_per_group = n_heads / n_groups;
@@ -5604,26 +5827,102 @@ fn attn_stub(
     // each group at stride per_group_in. Skip when wo_a is Q8/F16
     // (gemv_auto reads x_plain in those paths, not x_rotated).
     let wo_a_needs_fwht = weight_needs_fwht(wo_a);
-    let wo_b_needs_fwht = weight_needs_fwht(wo_b);
     let wo_a_probe = ds4_fine_probe_start(gpu, layer_idx, state.n_tokens)?;
     if wo_a_needs_fwht {
-        gpu.rotate_x_mq_batched(attn_out_raw, attn_out_raw_rot, per_group_in, n_groups)
+        gpu.rotate_x_mq_batched(&attn_out_raw, &attn_out_raw_rot, per_group_in, n_groups)
             .map_err(|e| format!("rotate attn_out batched l{layer_idx}: {e:?}"))?;
     }
 
-    static GFX90A_WO_WAVE64: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let use_gfx90a_wo_wave64 = wo_a.dtype == DType::Q8_0
-        && gpu.arch == "gfx90a"
-        && *GFX90A_WO_WAVE64.get_or_init(|| {
-            hipfire_config::developer_var("HIPFIRE_GFX90A_DS4_WO_WAVE64")
-                .map(|v| v != "0")
-                .unwrap_or(true)
-        });
-    if use_gfx90a_wo_wave64 {
+    let use_gfx90a_wo_wave64 = ds4_gfx90a_wo_wave64_enabled(gpu);
+    if tp_slice.is_some() {
+        // Each TP rank owns a contiguous set of complete O-LoRA groups. Build
+        // a dtype-aware group-major weight view so the existing batched gfx90a
+        // kernels see a local [G, M, K] tensor beginning at group zero.
+        let local_wo_a = match wo_a.dtype {
+            DType::F16 | DType::F32 => {
+                let mut view = wo_a.sub_offset(
+                    slice.group_start * per_group_elems,
+                    n_groups * per_group_elems,
+                );
+                view.shape = vec![n_groups, o_lora_rank, per_group_in];
+                view
+            }
+            DType::Q8_0 => wo_a.sub_offset(
+                slice.group_start * per_group_wa_bytes_q8,
+                n_groups * per_group_wa_bytes_q8,
+            ),
+            _ => wo_a.sub_offset(
+                slice.group_start * per_group_wa_bytes_raw,
+                n_groups * per_group_wa_bytes_raw,
+            ),
+        };
+        match wo_a.dtype {
+            DType::F32 => gpu
+                .wo_per_group_batched_f32(
+                    &local_wo_a,
+                    &attn_out_raw,
+                    &wo_a_out,
+                    n_groups as i32,
+                    o_lora_rank as i32,
+                    per_group_in as i32,
+                    1,
+                )
+                .map_err(|e| format!("attention TP wo_a f32 l{layer_idx}: {e:?}"))?,
+            DType::F16 => gpu
+                .wo_per_group_batched_f16_wave64_row2_gfx90a(
+                    &local_wo_a,
+                    &attn_out_raw,
+                    &wo_a_out,
+                    n_groups as i32,
+                    o_lora_rank as i32,
+                    per_group_in as i32,
+                    1,
+                )
+                .map_err(|e| format!("attention TP wo_a f16 wave64 l{layer_idx}: {e:?}"))?,
+            DType::Q8_0 if use_gfx90a_wo_wave64 => gpu
+                .wo_per_group_batched_q8_0_wave64_row2_gfx90a(
+                    &local_wo_a,
+                    &attn_out_raw,
+                    &wo_a_out,
+                    n_groups as i32,
+                    o_lora_rank as i32,
+                    per_group_in as i32,
+                    1,
+                )
+                .map_err(|e| format!("attention TP wo_a q8 wave64 l{layer_idx}: {e:?}"))?,
+            DType::Q8_0 => gpu
+                .wo_per_group_batched_q8_0(
+                    &local_wo_a,
+                    &attn_out_raw,
+                    &wo_a_out,
+                    n_groups as i32,
+                    o_lora_rank as i32,
+                    per_group_in as i32,
+                    1,
+                )
+                .map_err(|e| format!("attention TP wo_a q8 l{layer_idx}: {e:?}"))?,
+            DType::Raw => gpu
+                .wo_per_group_batched_hfq4g256(
+                    &local_wo_a,
+                    &attn_out_raw_rot,
+                    &wo_a_out,
+                    n_groups as i32,
+                    o_lora_rank as i32,
+                    per_group_in as i32,
+                    1,
+                )
+                .map_err(|e| format!("attention TP wo_a hfq4 l{layer_idx}: {e:?}"))?,
+            other => {
+                return Err(format!(
+                    "attention TP wo_a l{layer_idx}: unsupported dtype {other:?}"
+                ));
+            }
+        }
+    } else if wo_a.dtype == DType::Q8_0 && use_gfx90a_wo_wave64 {
         gpu.wo_per_group_batched_q8_0_wave64_row2_gfx90a(
             wo_a,
-            attn_out_raw,
-            wo_a_out,
+            &attn_out_raw,
+            &wo_a_out,
             n_groups as i32,
             o_lora_rank as i32,
             per_group_in as i32,
@@ -5664,14 +5963,62 @@ fn attn_stub(
     }
     ds4_fine_probe_end(gpu, wo_a_probe, layer_idx, "attention_wo_a")?;
 
-    // FWHT-rotate wo_a_out then wo_b GEMV → final_attn_out [hidden].
-    // wo_b path: F32/Q8 use plain wo_a_out; MQ4 uses wo_a_out_rot.
+    if !slice.defer_wo_b {
+        attn_wo_b_project(cfg, weights, state, gpu, layer_idx)?;
+    }
+
+    Ok(())
+}
+
+#[inline]
+fn ds4_gfx90a_wo_wave64_enabled(gpu: &Gpu) -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    gpu.arch == "gfx90a"
+        && *ENABLED.get_or_init(|| {
+            hipfire_config::developer_var("HIPFIRE_GFX90A_DS4_WO_WAVE64")
+                .map(|value| value != "0")
+                .unwrap_or(true)
+        })
+}
+
+/// Complete O-LoRA after all TP ranks' disjoint `wo_a_out` chunks have been
+/// concatenated on the root. Kept separate so the ordinary path and the EP4 TP
+/// path execute the same full-width wo_b projection.
+fn attn_wo_b_project(
+    cfg: &DeepseekV4Config,
+    weights: &DeepseekV4Weights,
+    state: &DeepseekV4State,
+    gpu: &mut Gpu,
+    layer_idx: usize,
+) -> Result<(), String> {
+    let layer = weights.resolve_layer(layer_idx);
+    let wo_a = layer
+        .wo_a
+        .as_ref()
+        .ok_or_else(|| format!("layer {layer_idx} wo_a missing"))?;
+    let wo_b = layer
+        .wo_b
+        .as_ref()
+        .ok_or_else(|| format!("layer {layer_idx} wo_b missing"))?;
+    let wo_a_out = state
+        .wo_a_out
+        .as_ref()
+        .ok_or_else(|| format!("layer {layer_idx} wo_a_out missing"))?;
+    let wo_a_out_rot = state
+        .wo_a_out_rot
+        .as_ref()
+        .ok_or_else(|| format!("layer {layer_idx} wo_a_out_rot missing"))?;
+    let final_attn_out = state
+        .attn_out
+        .as_ref()
+        .ok_or_else(|| format!("layer {layer_idx} attn_out missing"))?;
+    let groups_o_lora = cfg.o_groups * cfg.o_lora_rank;
     let wo_b_probe = ds4_fine_probe_start(gpu, layer_idx, state.n_tokens)?;
-    if wo_b_needs_fwht {
+    if weight_needs_fwht(wo_b) {
         gpu.rotate_x_mq(wo_a_out, wo_a_out_rot, groups_o_lora)
             .map_err(|e| format!("rotate wo_a_out l{layer_idx}: {e:?}"))?;
     }
-    if wo_b.dtype == DType::Q8_0 && gpu.arch == "gfx90a" && use_gfx90a_wo_wave64 {
+    if wo_b.dtype == DType::Q8_0 && ds4_gfx90a_wo_wave64_enabled(gpu) && wo_a.dtype == DType::Q8_0 {
         gpu.wo_per_group_batched_q8_0_wave64_row2_gfx90a(
             wo_b,
             wo_a_out,
@@ -5693,9 +6040,7 @@ fn attn_stub(
             groups_o_lora,
         )?;
     }
-    ds4_fine_probe_end(gpu, wo_b_probe, layer_idx, "attention_wo_b")?;
-
-    Ok(())
+    ds4_fine_probe_end(gpu, wo_b_probe, layer_idx, "attention_wo_b")
 }
 
 /// DeepSeek V4 MoE router: scores and top-K expert selection.
