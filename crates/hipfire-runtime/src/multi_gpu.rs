@@ -917,26 +917,71 @@ impl Gpus {
                 .hip
                 .stream_wait_event(root_stream, event)?;
         }
-        let dst = GpuTensor {
-            buf: unsafe { buffers[root].alias() },
-            shape: vec![count],
-            dtype: DType::F32,
-        };
-        for slot in 0..n - 1 {
-            let src = GpuTensor {
-                buf: unsafe { self.peer_ar_tmp[root][slot].alias() },
-                shape: vec![count],
-                dtype: DType::F32,
-            };
-            self.devices[root].add_inplace_f32_on_stream(&dst, &src, root_stream)?;
-        }
-        if let Some(outputs) = final_outputs {
+        static FUSED_FINALIZE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let use_fused_finalize = final_outputs.is_some()
+            && n == 4
+            && *FUSED_FINALIZE.get_or_init(|| {
+                hipfire_config::developer_var("HIPFIRE_GFX90A_EP_FUSED_FINALIZE")
+                    .map(|value| value != "0")
+                    .unwrap_or(true)
+            });
+        if use_fused_finalize {
+            let outputs = final_outputs.expect("checked above");
             let final_dst = GpuTensor {
                 buf: unsafe { outputs[root].alias() },
                 shape: vec![count],
                 dtype: DType::F32,
             };
-            self.devices[root].add_inplace_f32_on_stream(&final_dst, &dst, root_stream)?;
+            let p0 = GpuTensor {
+                buf: unsafe { buffers[root].alias() },
+                shape: vec![count],
+                dtype: DType::F32,
+            };
+            let p1 = GpuTensor {
+                buf: unsafe { self.peer_ar_tmp[root][0].alias() },
+                shape: vec![count],
+                dtype: DType::F32,
+            };
+            let p2 = GpuTensor {
+                buf: unsafe { self.peer_ar_tmp[root][1].alias() },
+                shape: vec![count],
+                dtype: DType::F32,
+            };
+            let p3 = GpuTensor {
+                buf: unsafe { self.peer_ar_tmp[root][2].alias() },
+                shape: vec![count],
+                dtype: DType::F32,
+            };
+            self.devices[root].reduce4_add_shared_f32_on_stream(
+                &final_dst,
+                &p0,
+                &p1,
+                &p2,
+                &p3,
+                root_stream,
+            )?;
+        } else {
+            let dst = GpuTensor {
+                buf: unsafe { buffers[root].alias() },
+                shape: vec![count],
+                dtype: DType::F32,
+            };
+            for slot in 0..n - 1 {
+                let src = GpuTensor {
+                    buf: unsafe { self.peer_ar_tmp[root][slot].alias() },
+                    shape: vec![count],
+                    dtype: DType::F32,
+                };
+                self.devices[root].add_inplace_f32_on_stream(&dst, &src, root_stream)?;
+            }
+            if let Some(outputs) = final_outputs {
+                let final_dst = GpuTensor {
+                    buf: unsafe { outputs[root].alias() },
+                    shape: vec![count],
+                    dtype: DType::F32,
+                };
+                self.devices[root].add_inplace_f32_on_stream(&final_dst, &dst, root_stream)?;
+            }
         }
         let reduced = self.devices[root].hip.event_create()?;
         self.devices[root]

@@ -52,7 +52,13 @@ fn download(gpus: &mut Gpus, rank: usize, buffer: &DeviceBuffer) -> Vec<f32> {
 fn verify_nonzero(gpus: &mut Gpus, bytes: usize) {
     let mut rccl = Vec::with_capacity(4);
     let mut async_root = Vec::with_capacity(4);
+    let mut finalize_partials = Vec::with_capacity(4);
+    let mut finalize_outputs = Vec::with_capacity(4);
     let mut inputs = Vec::with_capacity(4);
+    let shared: Vec<f32> = (0..COUNT)
+        .map(|i| (((i * 53 + 17) % 997) as f32 - 498.0) * 0.25)
+        .collect();
+    let zeros = vec![0.0f32; COUNT];
     for rank in 0..4 {
         gpus.devices[rank].bind_thread().expect("bind alloc");
         rccl.push(gpus.devices[rank].hip.malloc(bytes).expect("malloc RCCL"));
@@ -62,12 +68,31 @@ fn verify_nonzero(gpus: &mut Gpus, bytes: usize) {
                 .malloc(bytes)
                 .expect("malloc async root"),
         );
+        finalize_partials.push(
+            gpus.devices[rank]
+                .hip
+                .malloc(bytes)
+                .expect("malloc finalize partial"),
+        );
+        finalize_outputs.push(
+            gpus.devices[rank]
+                .hip
+                .malloc(bytes)
+                .expect("malloc finalize output"),
+        );
         let scale = [0.001f32, 1.0, 1000.0, 0.1][rank];
         let values: Vec<f32> = (0..COUNT)
             .map(|i| (((i * 37 + rank * 101) % 1009) as f32 - 504.0) * scale)
             .collect();
         upload(gpus, rank, &rccl[rank], &values);
         upload(gpus, rank, &async_root[rank], &values);
+        upload(gpus, rank, &finalize_partials[rank], &values);
+        upload(
+            gpus,
+            rank,
+            &finalize_outputs[rank],
+            if rank == 0 { &shared } else { &zeros },
+        );
         inputs.push(values);
     }
     let rccl_refs: Vec<&DeviceBuffer> = rccl.iter().collect();
@@ -76,6 +101,15 @@ fn verify_nonzero(gpus: &mut Gpus, bytes: usize) {
     let async_refs: Vec<&DeviceBuffer> = async_root.iter().collect();
     gpus.all_reduce_sum_f32_peer_root_async(&async_refs, COUNT, 0)
         .expect("async-root oracle");
+    let finalize_partial_refs: Vec<&DeviceBuffer> = finalize_partials.iter().collect();
+    let finalize_output_refs: Vec<&DeviceBuffer> = finalize_outputs.iter().collect();
+    gpus.reduce_sum_f32_peer_root_finalize_async(
+        &finalize_partial_refs,
+        &finalize_output_refs,
+        COUNT,
+        0,
+    )
+    .expect("fused final-output oracle");
     sync_all(gpus);
 
     let rccl0 = download(gpus, 0, &rccl[0]);
@@ -106,6 +140,25 @@ fn verify_nonzero(gpus: &mut Gpus, bytes: usize) {
         max_abs,
         (squared / COUNT as f64).sqrt()
     );
+
+    let expected_final: Vec<f32> = (0..COUNT)
+        .map(|i| {
+            let routed = ((inputs[0][i] + inputs[1][i]) + inputs[2][i]) + inputs[3][i];
+            shared[i] + routed
+        })
+        .collect();
+    for rank in 0..4 {
+        let output = download(gpus, rank, &finalize_outputs[rank]);
+        assert_eq!(
+            expected_final
+                .iter()
+                .map(|x| x.to_bits())
+                .collect::<Vec<_>>(),
+            output.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            "fused final-output rank {rank} differs from canonical CPU order"
+        );
+    }
+    println!("oracle fused-final-output-ranks-bit-exact=true");
 
     let mut best_seq = (0usize, [0usize; 4]);
     let mut best_pair = (0usize, [0usize; 4]);

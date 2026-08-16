@@ -339,6 +339,48 @@ impl Gpu {
             )
         }
     }
+
+    /// Canonically reduce four routed EP partials and add the result to the
+    /// shared-expert output in one launch on an explicit communication stream.
+    #[allow(clippy::too_many_arguments)]
+    pub fn reduce4_add_shared_f32_on_stream(
+        &mut self,
+        shared: &GpuTensor,
+        p0: &GpuTensor,
+        p1: &GpuTensor,
+        p2: &GpuTensor,
+        p3: &GpuTensor,
+        stream: &hip_bridge::Stream,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "reduce4_add_shared",
+            kernels::ADD_INPLACE_SRC,
+            "reduce4_add_shared_f32",
+        )?;
+
+        let n = shared.numel() as i32;
+        let mut blob = hip_bridge::KernargBlob::new();
+        blob.push_ptr(shared.buf.as_ptr());
+        blob.push_ptr(p0.buf.as_ptr());
+        blob.push_ptr(p1.buf.as_ptr());
+        blob.push_ptr(p2.buf.as_ptr());
+        blob.push_ptr(p3.buf.as_ptr());
+        blob.push_i32(n);
+        let block = 256u32;
+        let grid = (n as u32).div_ceil(block);
+        let func = &self.functions["reduce4_add_shared_f32"];
+        unsafe {
+            self.hip.launch_kernel_blob(
+                func,
+                [grid, 1, 1],
+                [block, 1, 1],
+                0,
+                Some(stream),
+                blob.as_mut_slice(),
+            )
+        }
+    }
     /// c = a * b (element-wise)
     pub fn mul_f32(&mut self, a: &GpuTensor, b: &GpuTensor, c: &GpuTensor) -> HipResult<()> {
         self.bind_thread()?;
