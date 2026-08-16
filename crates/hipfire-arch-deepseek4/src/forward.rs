@@ -3122,7 +3122,11 @@ pub fn forward_ep(
         }
     }
 
-    // 3. Final norm + head on rank 0 → state_per_rank[0].logits.
+    // 3. Final norm + head. The source-weight EP loader replicates the native
+    // F16 head on every rank, so the gfx90a EP4 fast path can split independent
+    // vocab rows across the otherwise-idle ranks and gather the disjoint logits
+    // slices back to rank 0. Unsupported configurations retain the established
+    // rank-0 implementation.
     {
         gpus.devices[0]
             .bind_thread()
@@ -3132,12 +3136,40 @@ pub fn forward_ep(
             cfg.num_hidden_layers,
             state_per_rank[0].n_tokens,
         )?;
-        final_norm_and_head(
-            cfg,
-            &weights_per_rank[0],
-            &mut state_per_rank[0],
-            &mut gpus.devices[0],
-        )?;
+        static VOCAB_PARALLEL_POLICY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static COARSE_PROBE_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let vocab_parallel_policy = *VOCAB_PARALLEL_POLICY.get_or_init(|| {
+            hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_EP_VOCAB_PARALLEL")
+                .map(|value| value != "0")
+                .unwrap_or(true)
+        });
+        let coarse_probe_enabled = *COARSE_PROBE_ENABLED.get_or_init(|| {
+            hipfire_config::developer_var("HIPFIRE_DS4_COARSE_PROBE").as_deref() == Ok("1")
+        });
+        let vocab_parallel = vocab_parallel_policy
+            && n == 4
+            && !dump_pos_hit
+            && !coarse_probe_enabled
+            && gpus.peer_access_enabled
+            && gpus.devices.iter().all(|device| device.arch == "gfx90a")
+            && weights_per_rank.iter().all(|weights| {
+                weights.head.as_ref().is_some_and(|head| {
+                    head.dtype == DType::F16 && head.shape == [cfg.vocab_size, cfg.hidden_size]
+                })
+            });
+        if vocab_parallel {
+            final_norm_and_head_ep_vocab_parallel(cfg, weights_per_rank, state_per_rank, gpus)?;
+            gpus.devices[0]
+                .bind_thread()
+                .map_err(|e| format!("ds4 EP vocab head rebind root: {e:?}"))?;
+        } else {
+            final_norm_and_head(
+                cfg,
+                &weights_per_rank[0],
+                &mut state_per_rank[0],
+                &mut gpus.devices[0],
+            )?;
+        }
         if dump_pos_hit {
             if let Some(final_norm) = state_per_rank[0].final_norm.as_ref() {
                 dump_buf(
@@ -5047,6 +5079,135 @@ fn final_norm_and_head(
         cfg.vocab_size,
         cfg.hidden_size,
     )?;
+
+    Ok(())
+}
+
+/// EP-only source-weight LM-head sharding fast path.
+///
+/// Every rank owns an identical native-F16 `[vocab, hidden]` head and an
+/// identical residual stream after the final layer. Each rank therefore
+/// computes the same final-norm activation, evaluates a disjoint contiguous
+/// set of vocab rows, and queues its logits slice directly into rank 0's full
+/// logits buffer. The peer copies run after each producer GEMV on that rank's
+/// active stream. `forward_ep` synchronizes every rank before returning, so no
+/// consumer can observe rank 0's logits before all disjoint writes complete.
+fn final_norm_and_head_ep_vocab_parallel(
+    cfg: &DeepseekV4Config,
+    weights_per_rank: &[DeepseekV4Weights],
+    state_per_rank: &mut [DeepseekV4State],
+    gpus: &mut hipfire_runtime::multi_gpu::Gpus,
+) -> Result<(), String> {
+    let n = gpus.devices.len();
+    if n != 4 || weights_per_rank.len() != n || state_per_rank.len() != n {
+        return Err(format!(
+            "ds4 EP vocab head requires matching EP4 inputs: devices={n} weights={} states={}",
+            weights_per_rank.len(),
+            state_per_rank.len(),
+        ));
+    }
+    if !gpus.devices.iter().all(|device| device.arch == "gfx90a") {
+        return Err("ds4 EP vocab head is only validated on gfx90a".to_string());
+    }
+    if !gpus.peer_access_enabled {
+        return Err("ds4 EP vocab head requires direct peer access".to_string());
+    }
+    for (rank, weights) in weights_per_rank.iter().enumerate() {
+        let head = weights
+            .head
+            .as_ref()
+            .ok_or_else(|| format!("ds4 EP vocab head missing on rank {rank}"))?;
+        if head.dtype != DType::F16 {
+            return Err(format!(
+                "ds4 EP vocab head only supports native F16 source weights, rank {rank} has {:?}",
+                head.dtype,
+            ));
+        }
+        if head.shape != [cfg.vocab_size, cfg.hidden_size] {
+            return Err(format!(
+                "ds4 EP vocab head rank {rank} shape {:?}, expected [{}, {}]",
+                head.shape, cfg.vocab_size, cfg.hidden_size,
+            ));
+        }
+    }
+
+    for rank in 0..n {
+        gpus.devices[rank]
+            .bind_thread()
+            .map_err(|e| format!("ds4 EP vocab head bind {rank}: {e:?}"))?;
+        final_norm_compute(
+            cfg,
+            &weights_per_rank[rank],
+            &mut state_per_rank[rank],
+            &mut gpus.devices[rank],
+        )?;
+        if state_per_rank[rank].logits.is_none() {
+            state_per_rank[rank].logits = Some(
+                gpus.devices[rank]
+                    .alloc_tensor(&[cfg.vocab_size], DType::F32)
+                    .map_err(|e| format!("alloc EP vocab logits rank {rank}: {e:?}"))?,
+            );
+        }
+
+        let row_start = rank * cfg.vocab_size / n;
+        let row_end = (rank + 1) * cfg.vocab_size / n;
+        let rows = row_end - row_start;
+        let head = weights_per_rank[rank].head.as_ref().unwrap();
+        let mut head_rows = head.sub_offset(row_start * cfg.hidden_size, rows * cfg.hidden_size);
+        head_rows.shape = vec![rows, cfg.hidden_size];
+        let logits_rows = state_per_rank[rank]
+            .logits
+            .as_ref()
+            .unwrap()
+            .sub_offset(row_start, rows);
+        let final_norm = state_per_rank[rank].final_norm.as_ref().unwrap();
+        let final_norm_rot = state_per_rank[rank].final_norm_rot.as_ref().unwrap();
+        gemv_auto(
+            &mut gpus.devices[rank],
+            &head_rows,
+            final_norm_rot,
+            final_norm,
+            &logits_rows,
+            rows,
+            cfg.hidden_size,
+        )?;
+    }
+
+    let root_device = gpus.devices[0].device_id;
+    for rank in 1..n {
+        gpus.devices[rank]
+            .bind_thread()
+            .map_err(|e| format!("ds4 EP vocab gather bind {rank}: {e:?}"))?;
+        let row_start = rank * cfg.vocab_size / n;
+        let row_end = (rank + 1) * cfg.vocab_size / n;
+        let rows = row_end - row_start;
+        let src = state_per_rank[rank]
+            .logits
+            .as_ref()
+            .unwrap()
+            .sub_offset(row_start, rows);
+        let dst = state_per_rank[0]
+            .logits
+            .as_ref()
+            .unwrap()
+            .sub_offset(row_start, rows);
+        let src_device = gpus.devices[rank].device_id;
+        let stream = gpus.devices[rank]
+            .active_stream
+            .as_ref()
+            .ok_or_else(|| format!("ds4 EP vocab head rank {rank} has no active stream"))?;
+        gpus.devices[rank]
+            .hip
+            .memcpy_peer_async(
+                &dst.buf,
+                root_device,
+                &src.buf,
+                src_device,
+                rows * std::mem::size_of::<f32>(),
+                stream,
+            )
+            .map_err(|e| format!("ds4 EP vocab logits gather rank {rank}: {e:?}"))?;
+    }
 
     Ok(())
 }
