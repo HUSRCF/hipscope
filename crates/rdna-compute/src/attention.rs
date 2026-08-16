@@ -9071,6 +9071,51 @@ impl Gpu {
             )
         }
     }
+    pub fn hc_pre_post_sinkhorn_4x4_f32(
+        &mut self,
+        hc_c: &GpuTensor,
+        hc_eps: f32,
+        post_scale: f32,
+        iters: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(
+            hc_c.numel(),
+            24,
+            "hc_pre_post_sinkhorn_4x4_f32 expects 24 controls"
+        );
+        self.ensure_kernel(
+            "hc_pre_post_sinkhorn_4x4_f32",
+            kernels::HC_PRE_POST_SINKHORN_4X4_F32_SRC,
+            "hc_pre_post_sinkhorn_4x4_f32",
+        )?;
+        let cp = hc_c.buf.as_ptr();
+        let mut eps = hc_eps;
+        let mut ps = post_scale;
+        let mut iters_v = iters;
+        let mut params: Vec<*mut c_void> = vec![
+            &cp as *const _ as *mut c_void,
+            &mut eps as *mut _ as *mut c_void,
+            &mut ps as *mut _ as *mut c_void,
+            &mut iters_v as *mut _ as *mut c_void,
+        ];
+        let blob_builder = || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(cp);
+            b.push_f32(eps);
+            b.push_f32(ps);
+            b.push_i32(iters_v);
+            b
+        };
+        self.launch_maybe_blob(
+            "hc_pre_post_sinkhorn_4x4_f32",
+            [1, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            blob_builder,
+        )
+    }
     pub fn hc_sinkhorn_4x4_batched(
         &mut self,
         matrix: &GpuTensor,

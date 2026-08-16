@@ -5938,15 +5938,31 @@ fn mhc_pre(
             .unwrap_or(2.0)
     });
     let hc_c_full = state.hc_c.as_ref().unwrap();
-    gpu.hc_pre_post_sigmoid_scale_f32(hc_c_full, cfg.hc_eps, post_scale)
-        .map_err(|e| format!("hc_pre_post_sigmoid_scale layer {layer_idx}: {e:?}"))?;
+    let fused_post = gpu.arch == "gfx90a"
+        && std::env::var("HIPFIRE_GFX90A_HC_POST_FUSED")
+            .map(|value| value != "0")
+            .unwrap_or(true);
+    if fused_post {
+        gpu.hc_pre_post_sinkhorn_4x4_f32(
+            hc_c_full,
+            cfg.hc_eps,
+            post_scale,
+            cfg.hc_sinkhorn_iters as i32,
+        )
+        .map_err(|e| format!("hc_pre_post_sinkhorn_4x4 layer {layer_idx}: {e:?}"))?;
+    } else {
+        gpu.hc_pre_post_sigmoid_scale_f32(hc_c_full, cfg.hc_eps, post_scale)
+            .map_err(|e| format!("hc_pre_post_sigmoid_scale layer {layer_idx}: {e:?}"))?;
+    }
     let _post_view = hc_c_full.sub_offset(4, 4);
 
     // COMB (16-dim → 4x4): cross-stream combining matrix, Sinkhorn-
     //   normalized to be doubly stochastic.
     let comb_view = state.hc_c.as_ref().unwrap().sub_offset(8, 16);
-    gpu.hc_sinkhorn_4x4(&comb_view, cfg.hc_eps, cfg.hc_sinkhorn_iters as i32)
-        .map_err(|e| format!("hc_sinkhorn_4x4 layer {layer_idx}: {e:?}"))?;
+    if !fused_post {
+        gpu.hc_sinkhorn_4x4(&comb_view, cfg.hc_eps, cfg.hc_sinkhorn_iters as i32)
+            .map_err(|e| format!("hc_sinkhorn_4x4 layer {layer_idx}: {e:?}"))?;
+    }
     if dump_hc {
         dump_buf(gpu, &format!("{dump_prefix}_pre_post_comb"), hc_c_full);
     }
