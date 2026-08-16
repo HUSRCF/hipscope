@@ -2613,6 +2613,263 @@ impl DeepseekV4 {
         }
         Ok(())
     }
+
+    /// Load one official source-checkpoint DSpark stage under `prefix`
+    /// (`mtp.{s}`). This is the safetensors twin of
+    /// [`Self::load_dspark_stage_dense`]: DSpark stages deliberately omit the
+    /// legacy MTP-only enorm/hnorm/e_proj/h_proj tensors.
+    fn load_dspark_stage_dense_from_source(
+        source: &dyn ModelSource,
+        gpu: &mut Gpu,
+        prefix: &str,
+        layer: &mut DeepseekV4LayerWeights,
+    ) -> Result<(), String> {
+        layer.attn_norm = Some(Self::upload_global_f16_as_f32_from_source(
+            source,
+            gpu,
+            &format!("{prefix}.attn_norm.weight"),
+        )?);
+        layer.ffn_norm = Some(Self::upload_global_f16_as_f32_from_source(
+            source,
+            gpu,
+            &format!("{prefix}.ffn_norm.weight"),
+        )?);
+        layer.q_norm = Some(Self::upload_global_f16_as_f32_from_source(
+            source,
+            gpu,
+            &format!("{prefix}.attn.q_norm.weight"),
+        )?);
+        layer.kv_norm = Some(Self::upload_global_f16_as_f32_from_source(
+            source,
+            gpu,
+            &format!("{prefix}.attn.kv_norm.weight"),
+        )?);
+        layer.attn_sink = Some(Self::upload_global_f16_as_f32_from_source(
+            source,
+            gpu,
+            &format!("{prefix}.attn.attn_sink"),
+        )?);
+
+        layer.wq_a = Some(Self::upload_quant_or_f16_from_source(
+            source,
+            gpu,
+            &format!("{prefix}.attn.wq_a.weight"),
+        )?);
+        layer.wq_b = Some(Self::upload_quant_or_f16_from_source(
+            source,
+            gpu,
+            &format!("{prefix}.attn.wq_b.weight"),
+        )?);
+        layer.wkv = Some(Self::upload_quant_or_f16_from_source(
+            source,
+            gpu,
+            &format!("{prefix}.attn.wkv.weight"),
+        )?);
+        layer.wo_a = Some(Self::upload_quant_or_f16_from_source(
+            source,
+            gpu,
+            &format!("{prefix}.attn.wo_a.weight"),
+        )?);
+        layer.wo_b = Some(Self::upload_quant_or_f16_from_source(
+            source,
+            gpu,
+            &format!("{prefix}.attn.wo_b.weight"),
+        )?);
+
+        // The official checkpoint keeps the HC controls in FP32. Preserve
+        // that source precision, matching the trunk source-weight loader.
+        layer.hc_attn_base = Some(Self::upload_global_f16_as_f32_from_source(
+            source,
+            gpu,
+            &format!("{prefix}.hc_attn_base"),
+        )?);
+        layer.hc_attn_fn = Some(Self::upload_global_f16_as_f32_from_source(
+            source,
+            gpu,
+            &format!("{prefix}.hc_attn_fn"),
+        )?);
+        layer.hc_attn_scale = Some(Self::upload_global_f16_as_f32_from_source(
+            source,
+            gpu,
+            &format!("{prefix}.hc_attn_scale"),
+        )?);
+        layer.hc_ffn_base = Some(Self::upload_global_f16_as_f32_from_source(
+            source,
+            gpu,
+            &format!("{prefix}.hc_ffn_base"),
+        )?);
+        layer.hc_ffn_fn = Some(Self::upload_global_f16_as_f32_from_source(
+            source,
+            gpu,
+            &format!("{prefix}.hc_ffn_fn"),
+        )?);
+        layer.hc_ffn_scale = Some(Self::upload_global_f16_as_f32_from_source(
+            source,
+            gpu,
+            &format!("{prefix}.hc_ffn_scale"),
+        )?);
+
+        layer.gate_weight = Some(Self::upload_quant_or_f16_from_source(
+            source,
+            gpu,
+            &format!("{prefix}.ffn.gate.weight"),
+        )?);
+        let bias_name = format!("{prefix}.ffn.gate.bias");
+        let bias_gpu = Self::upload_global_f16_as_f32_from_source(source, gpu, &bias_name)?;
+        layer.gate_bias_host = gpu
+            .download_f32(&bias_gpu)
+            .map_err(|e| format!("d2h dspark {prefix} gate_bias: {e:?}"))?;
+        layer.gate_bias = Some(bias_gpu);
+
+        layer.shared_w1 = Some(Self::upload_quant_or_f16_from_source(
+            source,
+            gpu,
+            &format!("{prefix}.ffn.shared_experts.w1.weight"),
+        )?);
+        layer.shared_w2 = Some(Self::upload_quant_or_f16_from_source(
+            source,
+            gpu,
+            &format!("{prefix}.ffn.shared_experts.w2.weight"),
+        )?);
+        layer.shared_w3 = Some(Self::upload_quant_or_f16_from_source(
+            source,
+            gpu,
+            &format!("{prefix}.ffn.shared_experts.w3.weight"),
+        )?);
+
+        Ok(())
+    }
+
+    /// Load the official in-checkpoint DSpark stages from a safetensors model.
+    /// Routed experts honor the same optional EP shard assignment as the trunk;
+    /// dense stage weights and DSpark globals remain replicated per rank.
+    fn load_dspark_from_source(
+        source: &dyn ModelSource,
+        gpu: &mut Gpu,
+        cfg: &DeepseekV4Config,
+        shard: Option<(&hipfire_runtime::tp_shard::ShardConfig, usize)>,
+    ) -> Result<Option<DsparkWeights>, String> {
+        // Official 0731 DSpark has no `mtp.0.norm.weight`: final norm lives on
+        // the last stage. `main_proj` is therefore the stable stage-0 canary.
+        if source.tensor_info("mtp.0.main_proj.weight").is_none() {
+            return Ok(None);
+        }
+        let dspark_cfg =
+            DsparkConfig::from_metadata_json(source.metadata_json()).ok_or_else(|| {
+                "deepseek4: source has mtp.0.main_proj.weight but config is missing DSpark metadata"
+                    .to_string()
+            })?;
+        if let Some(&bad) = dspark_cfg
+            .target_layer_ids
+            .iter()
+            .find(|&&layer| layer >= cfg.num_hidden_layers)
+        {
+            return Err(format!(
+                "deepseek4: source DSpark target_layer_id {bad} >= num_hidden_layers {}",
+                cfg.num_hidden_layers
+            ));
+        }
+
+        let mut n_stages = 0usize;
+        while source
+            .tensor_info(&format!("mtp.{n_stages}.attn_norm.weight"))
+            .is_some()
+        {
+            n_stages += 1;
+        }
+        if n_stages == 0 {
+            return Err(
+                "deepseek4: source DSpark canary present but no mtp.{N} stages found".into(),
+            );
+        }
+        eprintln!(
+            "deepseek4: source DSpark drafter present — uploading {n_stages} stages{}",
+            shard
+                .map(|(_, rank)| format!(" for EP rank {rank}"))
+                .unwrap_or_default()
+        );
+
+        let last = n_stages - 1;
+        let mut stages = Vec::with_capacity(n_stages);
+        for stage in 0..n_stages {
+            let prefix = format!("mtp.{stage}");
+            let mut layer = DeepseekV4LayerWeights::new_empty(0);
+            Self::load_dspark_stage_dense_from_source(source, gpu, &prefix, &mut layer)?;
+            Self::upload_layer_routed_experts_from_source(
+                source,
+                gpu,
+                &prefix,
+                cfg.n_routed_experts,
+                &mut layer,
+                shard,
+            )?;
+            if stage == last {
+                layer.mtp_hc_head_fn = Some(Self::upload_global_f16_as_f32_from_source(
+                    source,
+                    gpu,
+                    &format!("{prefix}.hc_head_fn"),
+                )?);
+                layer.mtp_hc_head_base = Some(Self::upload_global_f16_as_f32_from_source(
+                    source,
+                    gpu,
+                    &format!("{prefix}.hc_head_base"),
+                )?);
+                let scale_name = format!("{prefix}.hc_head_scale");
+                let (info, bytes) = source
+                    .tensor_data(&scale_name)
+                    .ok_or_else(|| format!("deepseek4: {scale_name} missing in source"))?;
+                if info.shape != vec![1] {
+                    return Err(format!(
+                        "deepseek4: {scale_name} unexpected shape {:?}",
+                        info.shape
+                    ));
+                }
+                layer.mtp_hc_head_scale = Self::source_scalar_f32(&info.dtype, bytes, &scale_name)?;
+                layer.mtp_final_norm = Some(Self::upload_global_f16_as_f32_from_source(
+                    source,
+                    gpu,
+                    &format!("{prefix}.norm.weight"),
+                )?);
+            }
+            stages.push(layer);
+        }
+
+        let main_proj = Some(Self::upload_quant_or_f16_from_source(
+            source,
+            gpu,
+            "mtp.0.main_proj.weight",
+        )?);
+        let main_norm = Some(Self::upload_global_f16_as_f32_from_source(
+            source,
+            gpu,
+            "mtp.0.main_norm.weight",
+        )?);
+        let markov_w1 = Some(Self::upload_quant_or_f16_from_source(
+            source,
+            gpu,
+            &format!("mtp.{last}.markov_head.markov_w1.weight"),
+        )?);
+        let markov_w2 = Some(Self::upload_quant_or_f16_from_source(
+            source,
+            gpu,
+            &format!("mtp.{last}.markov_head.markov_w2.weight"),
+        )?);
+        let confidence_proj = Some(Self::upload_quant_or_f16_from_source(
+            source,
+            gpu,
+            &format!("mtp.{last}.confidence_head.proj.weight"),
+        )?);
+
+        Ok(Some(DsparkWeights {
+            cfg: dspark_cfg,
+            stages,
+            main_proj,
+            main_norm,
+            markov_w1,
+            markov_w2,
+            confidence_proj,
+        }))
+    }
 }
 
 // ── Top-level safetensors load entry point ──────────────────────
@@ -3185,6 +3442,13 @@ impl DeepseekV4 {
                     shard,
                 )?;
             }
+        }
+
+        // The official 0731 checkpoint embeds three DSpark stages under
+        // `mtp.0/1/2`. Keep this large (~3.4 GiB/rank under EP4) additive load
+        // explicitly opt-in until the EP DSpark runtime is wired.
+        if hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_SOURCE_DSPARK").as_deref() == Ok("1") {
+            weights.dspark = Self::load_dspark_from_source(source, gpu, cfg, shard)?;
         }
 
         Ok(weights)

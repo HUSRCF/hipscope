@@ -121,6 +121,7 @@ Values and defaults below match `hipfire-config`, the native CLI, and/or `Runtim
 | `HIPFIRE_QWEN35_MTP` / `HIPFIRE_QWEN35_MTP_K` | Qwen35 MTP opt-in gate | Loader — separate from DeepSeek MTP |
 | `HIPFIRE_DEEPSEEK4_SPEC_DECODE` / `HIPFIRE_DEEPSEEK4_SPEC_K` | DeepSeek MTP legacy | |
 | `HIPFIRE_DEEPSEEK4_DSPARK` / `HIPFIRE_DEEPSEEK4_DSPARK_CONF_THRESHOLD` | DSpark | |
+| `HIPFIRE_DEEPSEEK4_SOURCE_DSPARK=1` | Off unless exactly `1` | Opt-in upload of the official in-checkpoint `mtp.0/1/2` DSpark stages for DeepSeek-V4 safetensors, sharding routed experts under EP; loader-only until the source-weight EP DSpark runtime is wired. |
 | `HIPFIRE_QWEN3_DSPARK_CONF_THRESHOLD` / `HIPFIRE_QWEN35_DSPARK_CONF_THRESHOLD` | per-arch conf | |
 | `HIPFIRE_DDTREE_BUDGET` / `HIPFIRE_DDTREE_TOPK` | tree draft | Runtime defaults 256/8 if env-only; CLI config defaults 0/4 |
 | `HIPFIRE_DDTREE_*` | research/diag family | See inventory; not product defaults |
