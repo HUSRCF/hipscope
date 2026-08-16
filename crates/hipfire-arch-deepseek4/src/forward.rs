@@ -893,14 +893,16 @@ fn compressor_forward_impl(
     static GFX90A_COMP_PAIRED_RING: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let paired_ring = gpu.arch == "gfx90a"
         && *GFX90A_COMP_PAIRED_RING.get_or_init(|| {
-            hipfire_config::developer_var("HIPFIRE_GFX90A_DS4_COMP_PAIRED_RING").as_deref()
-                == Ok("1")
+            hipfire_config::developer_var("HIPFIRE_GFX90A_DS4_COMP_PAIRED_RING")
+                .map(|value| value != "0")
+                .unwrap_or(true)
         });
     static GFX90A_COMP_PAIRED_CONCAT_SHIFT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let paired_concat_shift = gpu.arch == "gfx90a"
         && *GFX90A_COMP_PAIRED_CONCAT_SHIFT.get_or_init(|| {
-            hipfire_config::developer_var("HIPFIRE_GFX90A_DS4_COMP_PAIRED_CONCAT_SHIFT").as_deref()
-                == Ok("1")
+            hipfire_config::developer_var("HIPFIRE_GFX90A_DS4_COMP_PAIRED_CONCAT_SHIFT")
+                .map(|value| value != "0")
+                .unwrap_or(true)
         });
     if paired_ring {
         gpu.state_ring_write_pair_f32_buf(
