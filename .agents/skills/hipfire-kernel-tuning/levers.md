@@ -202,6 +202,21 @@ RDNA because CDNA won.
 
 ## 9. Negative results (do not re-burn casually)
 
+### gfx90a DeepSeek4 paired HC control + alpha fusion
+
+- Measured 2026-08-17 at source baseline `6c8219ac`, ROCm 7.14, MI250
+  gfx90a; microbenchmark binary md5
+  `5fb5515c0859c69565437dd9b056106f`.
+- A bitwise-exact fused epilogue reduced the two-launch median from
+  13.737 to 12.131 us on GCD0 and 13.770 to 12.182 us on GCD4, only
+  1.59--1.61 us per HC pre. At 86 calls/token this exposes about
+  0.14 ms/token, below the 3--4 us/seam threshold for touching the
+  high-risk `mhc_pre` forward surface.
+- ISA stayed spill-free (26 VGPR, 26 SGPR, 192 B LDS, wave64), but exact
+  parity required a volatile F32 global materialization between the control
+  and alpha expressions. **Rejected before E2E integration.** Revisit only as
+  part of a larger HC seam fusion that removes more than one small launch.
+
 ### Nontemporal weight loads on gfx1100
 
 - Candidate `0532579` claimed small within-session gain; revert `34eb024`
