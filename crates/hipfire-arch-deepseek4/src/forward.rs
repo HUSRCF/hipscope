@@ -2081,7 +2081,7 @@ pub fn decode_step_body(
         // ── 2b. FFN block ─────────────────────────────────────────────
         mhc_pre(cfg, weights, state, gpu, layer_idx, /*is_attn=*/ false)?;
         if !skip_ffn {
-            ffn_stub(cfg, weights, state, gpu, layer_idx)?;
+            ffn_stub(cfg, weights, state, gpu, layer_idx, true)?;
             if layer_idx < cfg.num_hash_layers {
                 ffn_hash_routed(cfg, weights, state, gpu, layer_idx, token_id, None)?;
             } else {
@@ -2318,7 +2318,8 @@ fn ds4_moe_block(
     // shared expert seeded by `ffn_stub`), and the HC mix folds ffn_out into
     // `residual_streams` in the same call.
     ds4_moe_block_core(
-        cfg, weights, state, gpu, layer_idx, token_id, skip_ffn, None, /*do_mix=*/ true,
+        cfg, weights, state, gpu, layer_idx, token_id, skip_ffn, /*skip_shared=*/ false, None,
+        /*do_mix=*/ true,
     )
 }
 
@@ -2342,6 +2343,7 @@ fn ds4_moe_block_core(
     layer_idx: usize,
     token_id: u32,
     skip_ffn: bool,
+    skip_shared: bool,
     routed_out: Option<&GpuTensor>,
     do_mix: bool,
 ) -> Result<(), String> {
@@ -2350,7 +2352,7 @@ fn ds4_moe_block_core(
     ds4_coarse_probe_end(gpu, probe, layer_idx, "ffn_mhc_pre")?;
     if !skip_ffn {
         let probe = ds4_coarse_probe_start(gpu, layer_idx, state.n_tokens)?;
-        ffn_stub(cfg, weights, state, gpu, layer_idx)?;
+        ffn_stub(cfg, weights, state, gpu, layer_idx, !skip_shared)?;
         ds4_coarse_probe_end(gpu, probe, layer_idx, "shared_ffn")?;
 
         let probe = ds4_coarse_probe_start(gpu, layer_idx, state.n_tokens)?;
@@ -2526,6 +2528,14 @@ impl<'a> ForwardBindings for Deepseek4Bindings<'a> {
         true
     }
 
+    fn supports_moe_ep_final_output_broadcast(&self) -> bool {
+        true
+    }
+
+    fn ep_final_output(&self) -> Option<&GpuTensor> {
+        self.state.ffn_out.as_ref()
+    }
+
     fn run_attend(
         &mut self,
         gpu: &mut Gpu,
@@ -2568,16 +2578,13 @@ impl<'a> ForwardBindings for Deepseek4Bindings<'a> {
         _ctx: &DispatchCtx,
         _op: &OpBinding,
         routed_out: &GpuTensor,
-        _skip_shared: bool,
+        skip_shared: bool,
     ) -> Result<(), DispatchError> {
-        // EP: run mhc_pre + the SHARED expert (ffn_stub, replicated into
-        // state.ffn_out on every rank) + the ROUTED experts redirected into the
-        // zeroed `routed_out` partial. `hc_ffn_mix` is DEFERRED (do_mix=false)
-        // to `ep_add_into_residual`, which runs after the cross-rank all-reduce
-        // assembles the full routed output. `skip_shared` is intentionally
-        // ignored: DeepSeek's shared expert lives in ffn_out (outside the
-        // all-reduced partial), so replicating it per rank is correct — it is
-        // never summed across ranks.
+        // EP: run mhc_pre + the routed experts on every rank.  Only the chosen
+        // final-output-broadcast root computes the shared projections; other
+        // ranks still run the shared FFN's RMSNorm/FWHT prefix because routed
+        // MQ experts consume ffn_x_rot.  hc_ffn_mix remains deferred until the
+        // root has added the reduced routed partial and broadcast final ffn_out.
         if let Some(residual) = self.state.residual_streams.as_ref() {
             ep_trace_boundary(
                 gpu,
@@ -2595,6 +2602,7 @@ impl<'a> ForwardBindings for Deepseek4Bindings<'a> {
             self.layer_idx,
             self.token_id,
             self.skip_ffn,
+            skip_shared,
             Some(routed_out),
             /*do_mix=*/ false,
         )
@@ -2641,8 +2649,15 @@ impl<'a> ForwardBindings for Deepseek4Bindings<'a> {
             false,
         )
         .map_err(DispatchError::Hip)?;
-        ffn_stub(self.cfg, self.weights, self.state, gpu, self.layer_idx)
-            .map_err(DispatchError::Hip)?;
+        ffn_stub(
+            self.cfg,
+            self.weights,
+            self.state,
+            gpu,
+            self.layer_idx,
+            true,
+        )
+        .map_err(DispatchError::Hip)?;
         ffn_routed(
             self.cfg,
             self.weights,
@@ -2698,6 +2713,26 @@ impl<'a> ForwardBindings for Deepseek4Bindings<'a> {
             gpu.add_inplace_f32(ffn_out, partial)
                 .map_err(|e| DispatchError::Hip(e.to_string()))?;
         }
+        hc_ffn_mix(self.cfg, self.weights, self.state, gpu, self.layer_idx)
+            .map_err(DispatchError::Hip)?;
+        ds4_coarse_probe_end(gpu, probe, self.layer_idx, "ep_post_mix").map_err(DispatchError::Hip)
+    }
+
+    fn ep_mix_final_output(&mut self, gpu: &mut Gpu) -> Result<(), DispatchError> {
+        let ffn_out = self
+            .state
+            .ffn_out
+            .as_ref()
+            .ok_or_else(|| DispatchError::Hip("ep_mix_final_output: ffn_out unset".into()))?;
+        ep_trace_boundary(
+            gpu,
+            ffn_out,
+            self.position,
+            self.layer_idx,
+            "final_ffn_output",
+        )?;
+        let probe = ds4_coarse_probe_start(gpu, self.layer_idx, self.state.n_tokens)
+            .map_err(DispatchError::Hip)?;
         hc_ffn_mix(self.cfg, self.weights, self.state, gpu, self.layer_idx)
             .map_err(DispatchError::Hip)?;
         ds4_coarse_probe_end(gpu, probe, self.layer_idx, "ep_post_mix").map_err(DispatchError::Hip)
@@ -3209,7 +3244,7 @@ pub fn mtp_forward(
         mtp_layer_idx,
         /*is_attn=*/ false,
     )?;
-    ffn_stub(cfg, weights, state, gpu, mtp_layer_idx)?;
+    ffn_stub(cfg, weights, state, gpu, mtp_layer_idx, true)?;
     ffn_routed(cfg, weights, state, gpu, mtp_layer_idx, None, false)?;
     hc_ffn_mix(cfg, weights, state, gpu, mtp_layer_idx)?;
     // Step 7: capture full HC residual → mtp_last_hidden (chaining input).
@@ -4024,6 +4059,7 @@ fn ffn_stub(
     state: &mut DeepseekV4State,
     gpu: &mut Gpu,
     layer_idx: usize,
+    compute_shared: bool,
 ) -> Result<(), String> {
     let layer = weights.resolve_layer(layer_idx);
     let ffn_norm = layer.ffn_norm.as_ref().unwrap();
@@ -4110,6 +4146,10 @@ fn ffn_stub(
         // ffn_x_plain.
         gpu.rmsnorm_f32(hc_x_in, ffn_norm, ffn_x_plain, cfg.rms_norm_eps)
             .map_err(|e| format!("rmsnorm_f32 ffn-side plain l{layer_idx}: {e:?}"))?;
+    }
+
+    if !compute_shared {
+        return Ok(());
     }
 
     // 2. gate = x @ shared_w1

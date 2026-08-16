@@ -380,6 +380,18 @@ pub trait ForwardBindings {
         false
     }
 
+    /// Whether this binding can expose a per-rank final FFN buffer so the
+    /// four-rank root-peer collective can add the routed reduction to the
+    /// root's single shared-expert output and broadcast the result directly.
+    fn supports_moe_ep_final_output_broadcast(&self) -> bool {
+        false
+    }
+
+    /// Final FFN output buffer used by the specialized EP root finalization.
+    fn ep_final_output(&self) -> Option<&GpuTensor> {
+        None
+    }
+
     /// Run the MoE prefix through router, gate/up, activation and rotation,
     /// stopping before the routed down projection.
     fn run_moe_ep_prepare(
@@ -420,6 +432,18 @@ pub trait ForwardBindings {
         Err(DispatchError::UnsupportedVariant {
             family: "ep",
             variant: "ep_add_into_residual-not-implemented-for-arch",
+            arch: "",
+            quant: "",
+        })
+    }
+
+    /// Fold an already-finalized `shared + routed` FFN output into this rank's
+    /// residual streams.  Unlike [`Self::ep_add_into_residual`], this must not
+    /// add a routed partial first.
+    fn ep_mix_final_output(&mut self, _gpu: &mut Gpu) -> Result<(), DispatchError> {
+        Err(DispatchError::UnsupportedVariant {
+            family: "ep",
+            variant: "ep_mix_final_output-not-implemented-for-arch",
             arch: "",
             quant: "",
         })

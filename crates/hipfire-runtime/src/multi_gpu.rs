@@ -808,6 +808,30 @@ impl Gpus {
         count: usize,
         root: usize,
     ) -> HipResult<()> {
+        self.reduce_sum_f32_peer_root_async_impl(buffers, None, count, root)
+    }
+
+    /// Deterministic four-rank root reduction that finalizes
+    /// `final[root] += sum(partials)` before broadcasting the finalized FFN
+    /// output to every rank.  This lets EP architectures compute a replicated
+    /// shared expert only on the root without adding a second collective.
+    pub fn reduce_sum_f32_peer_root_finalize_async(
+        &mut self,
+        partials: &[&DeviceBuffer],
+        final_outputs: &[&DeviceBuffer],
+        count: usize,
+        root: usize,
+    ) -> HipResult<()> {
+        self.reduce_sum_f32_peer_root_async_impl(partials, Some(final_outputs), count, root)
+    }
+
+    fn reduce_sum_f32_peer_root_async_impl(
+        &mut self,
+        buffers: &[&DeviceBuffer],
+        final_outputs: Option<&[&DeviceBuffer]>,
+        count: usize,
+        root: usize,
+    ) -> HipResult<()> {
         let n = self.devices.len();
         if buffers.len() != n || root >= n {
             return Err(HipError::new(
@@ -818,7 +842,29 @@ impl Gpus {
                 ),
             ));
         }
+        if final_outputs.is_some_and(|outputs| outputs.len() != n) {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "reduce_sum_f32_peer_root_finalize_async: final_outputs={} ranks={n}",
+                    final_outputs.map_or(0, <[_]>::len),
+                ),
+            ));
+        }
         if n == 1 {
+            if let Some(outputs) = final_outputs {
+                let dst = GpuTensor {
+                    buf: unsafe { outputs[root].alias() },
+                    shape: vec![count],
+                    dtype: DType::F32,
+                };
+                let src = GpuTensor {
+                    buf: unsafe { buffers[root].alias() },
+                    shape: vec![count],
+                    dtype: DType::F32,
+                };
+                self.devices[root].add_inplace_f32(&dst, &src)?;
+            }
             return Ok(());
         }
         let bytes = count * std::mem::size_of::<f32>();
@@ -884,10 +930,20 @@ impl Gpus {
             };
             self.devices[root].add_inplace_f32_on_stream(&dst, &src, root_stream)?;
         }
+        if let Some(outputs) = final_outputs {
+            let final_dst = GpuTensor {
+                buf: unsafe { outputs[root].alias() },
+                shape: vec![count],
+                dtype: DType::F32,
+            };
+            self.devices[root].add_inplace_f32_on_stream(&final_dst, &dst, root_stream)?;
+        }
         let reduced = self.devices[root].hip.event_create()?;
         self.devices[root]
             .hip
             .event_record(&reduced, Some(root_stream))?;
+
+        let broadcast_buffers = final_outputs.unwrap_or(buffers);
 
         // Fan the finalized root bytes out concurrently on each destination's
         // communication stream. The previous implementation serialized all
@@ -903,9 +959,9 @@ impl Gpus {
             let stream = &self.ep_comm_streams[rank];
             self.devices[rank].hip.stream_wait_event(stream, &reduced)?;
             self.devices[rank].hip.memcpy_peer_async(
-                buffers[rank],
+                broadcast_buffers[rank],
                 self.devices[rank].device_id,
-                buffers[root],
+                broadcast_buffers[root],
                 root_device,
                 bytes,
                 stream,

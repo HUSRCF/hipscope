@@ -113,6 +113,28 @@ pub fn run_layer_program_ep<B: ForwardBindings>(
                 && gpus.devices.iter().all(|device| device.arch == "gfx90a")
                 && bindings.iter().all(ForwardBindings::supports_moe_ep_rows);
 
+            static ROOT_PEER_POLICY: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+            let root_peer_policy = *ROOT_PEER_POLICY.get_or_init(|| {
+                match hipfire_config::developer_var("HIPFIRE_EP_ROOT_PEER_ALLREDUCE_DECODE")
+                    .ok()
+                    .as_deref()
+                {
+                    Some("1") => Some(true),
+                    Some("0") => Some(false),
+                    _ => None,
+                }
+            });
+            let binding_default = bindings
+                .iter()
+                .all(ForwardBindings::supports_moe_ep_root_peer_allreduce);
+            let use_root_peer = n == 4
+                && gpus.devices.iter().all(|device| device.arch == "gfx90a")
+                && root_peer_policy.unwrap_or(binding_default);
+            let use_final_output_broadcast = use_root_peer
+                && bindings
+                    .iter()
+                    .all(ForwardBindings::supports_moe_ep_final_output_broadcast);
+
             if use_overlap {
                 for r in 0..n {
                     gpus.devices[r].bind_thread().map_err(hip_err)?;
@@ -178,7 +200,7 @@ pub fn run_layer_program_ep<B: ForwardBindings>(
                         &ctx,
                         &op.binding,
                         &partials[r],
-                        /* skip_shared = */ r != 0,
+                        /* skip_shared = */ use_final_output_broadcast && r != 0,
                     )?;
                 }
 
@@ -200,25 +222,29 @@ pub fn run_layer_program_ep<B: ForwardBindings>(
                 }
                 let allreduce_started = std::time::Instant::now();
                 let refs: Vec<&DeviceBuffer> = partials.iter().map(|p| &p.buf).collect();
-                static ROOT_PEER_POLICY: std::sync::OnceLock<Option<bool>> =
-                    std::sync::OnceLock::new();
-                let root_peer_policy = *ROOT_PEER_POLICY.get_or_init(|| {
-                    match hipfire_config::developer_var("HIPFIRE_EP_ROOT_PEER_ALLREDUCE_DECODE")
-                        .ok()
-                        .as_deref()
-                    {
-                        Some("1") => Some(true),
-                        Some("0") => Some(false),
-                        _ => None,
-                    }
-                });
-                let binding_default = bindings
-                    .iter()
-                    .all(ForwardBindings::supports_moe_ep_root_peer_allreduce);
-                let use_root_peer = n == 4
-                    && gpus.devices.iter().all(|device| device.arch == "gfx90a")
-                    && root_peer_policy.unwrap_or(binding_default);
-                if use_root_peer {
+                if use_final_output_broadcast {
+                    let final_outputs = bindings
+                        .iter()
+                        .map(|binding| {
+                            binding
+                                .ep_final_output()
+                                .map(|tensor| &tensor.buf)
+                                .ok_or_else(|| {
+                                    DispatchError::Hip(
+                                    "EP final-output broadcast opted in without an output buffer"
+                                        .into(),
+                                )
+                                })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    gpus.reduce_sum_f32_peer_root_finalize_async(
+                        &refs,
+                        &final_outputs,
+                        residual_dim,
+                        0,
+                    )
+                    .map_err(hip_err)?;
+                } else if use_root_peer {
                     gpus.all_reduce_sum_f32_peer_root_async(&refs, residual_dim, 0)
                         .map_err(hip_err)?;
                 } else {
@@ -257,10 +283,15 @@ pub fn run_layer_program_ep<B: ForwardBindings>(
                 }
             }
 
-            // 4. Each rank adds the reduced partial into its residual stream.
+            // 4. Either mix the already-finalized FFN output, or retain the
+            //    generic path that adds the reduced routed partial first.
             for r in 0..n {
                 gpus.devices[r].bind_thread().map_err(hip_err)?;
-                bindings[r].ep_add_into_residual(&mut gpus.devices[r], &partials[r])?;
+                if use_final_output_broadcast {
+                    bindings[r].ep_mix_final_output(&mut gpus.devices[r])?;
+                } else {
+                    bindings[r].ep_add_into_residual(&mut gpus.devices[r], &partials[r])?;
+                }
             }
         } else {
             // Replicated op — every rank runs it unchanged on full weights.
