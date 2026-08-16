@@ -93,6 +93,18 @@ mod config_cache {
                 != Some("0")
         })
     }
+    /// Second-stage gfx90a attention TP: shard wq_b, per-head Q norm and Q
+    /// RoPE with the same head slice as the attention core. Default ON; set
+    /// `HIPFIRE_GFX90A_DS4_Q_TP=0` for the first-stage attention-only path.
+    pub(super) fn gfx90a_q_tp() -> bool {
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| {
+            hipfire_config::developer_var("HIPFIRE_GFX90A_DS4_Q_TP")
+                .ok()
+                .as_deref()
+                != Some("0")
+        })
+    }
     /// `HIPFIRE_DEEPSEEK4_MTP_HEAD_HC` — default ON since 2026-05-21: route
     /// the MTP output (step 8 of mtp_forward) through head-HC mix using
     /// `mtp.0.hc_head_fn / hc_head_base / hc_head_scale`. Mirrors the
@@ -2038,7 +2050,7 @@ pub fn decode_step_body(
         // bounded but architecturally-trivial logits.
         // Real mHC with corrected kernels (F32 throughout for residuals).
         mhc_pre(cfg, weights, state, gpu, layer_idx, /*is_attn=*/ true)?;
-        q_lora(cfg, weights, state, gpu, layer_idx)?;
+        q_lora(cfg, weights, state, gpu, layer_idx, None)?;
 
         // (Q-LoRA call moved above into the fused RMSNorm + GEMV step.)
 
@@ -2049,7 +2061,7 @@ pub fn decode_step_body(
         //     Apply rotation on last `qk_rope_head_dim = 64` of each
         //     head's 512 dims.
         //     SWA ring write deferred (needs swa state alloc per layer).
-        apply_tail_rope(cfg, weights, state, gpu, position, layer_idx)?;
+        apply_tail_rope(cfg, weights, state, gpu, position, layer_idx, None)?;
 
         // iv. Indexer path (only when compress_ratio > 0):
         //     a. Compressor: x @ compressor.wkv → idx_qk
@@ -2170,12 +2182,12 @@ fn ds4_attn_block(
     ds4_coarse_probe_end(gpu, probe, layer_idx, "attn_mhc_pre")?;
 
     let probe = ds4_coarse_probe_start(gpu, layer_idx, state.n_tokens)?;
-    q_lora(cfg, weights, state, gpu, layer_idx)?;
+    q_lora(cfg, weights, state, gpu, layer_idx, None)?;
     ds4_coarse_probe_end(gpu, probe, layer_idx, "q_lora")?;
 
     let probe = ds4_coarse_probe_start(gpu, layer_idx, state.n_tokens)?;
     kv_joint(cfg, weights, state, gpu, layer_idx)?;
-    apply_tail_rope(cfg, weights, state, gpu, position, layer_idx)?;
+    apply_tail_rope(cfg, weights, state, gpu, position, layer_idx, None)?;
     ds4_coarse_probe_end(gpu, probe, layer_idx, "kv_joint_rope")?;
 
     if layer.compress_ratio > 0 {
@@ -2225,12 +2237,13 @@ fn ds4_attn_block_tp_local(
     ds4_coarse_probe_end(gpu, probe, layer_idx, "attn_mhc_pre")?;
 
     let probe = ds4_coarse_probe_start(gpu, layer_idx, state.n_tokens)?;
-    q_lora(cfg, weights, state, gpu, layer_idx)?;
+    let q_tp_slice = config_cache::gfx90a_q_tp().then_some(slice);
+    q_lora(cfg, weights, state, gpu, layer_idx, q_tp_slice)?;
     ds4_coarse_probe_end(gpu, probe, layer_idx, "q_lora")?;
 
     let probe = ds4_coarse_probe_start(gpu, layer_idx, state.n_tokens)?;
     kv_joint(cfg, weights, state, gpu, layer_idx)?;
-    apply_tail_rope(cfg, weights, state, gpu, position, layer_idx)?;
+    apply_tail_rope(cfg, weights, state, gpu, position, layer_idx, q_tp_slice)?;
     ds4_coarse_probe_end(gpu, probe, layer_idx, "kv_joint_rope")?;
 
     if layer.compress_ratio > 0 {
@@ -3701,9 +3714,9 @@ fn mtp_pre_ffn(
         mtp_layer_idx,
         /*is_attn=*/ true,
     )?;
-    q_lora(cfg, weights, state, gpu, mtp_layer_idx)?;
+    q_lora(cfg, weights, state, gpu, mtp_layer_idx, None)?;
     kv_joint(cfg, weights, state, gpu, mtp_layer_idx)?;
-    apply_tail_rope(cfg, weights, state, gpu, position, mtp_layer_idx)?;
+    apply_tail_rope(cfg, weights, state, gpu, position, mtp_layer_idx, None)?;
     // (No compressor / indexer for MTP — compress_ratio == 0.)
     attn_stub(cfg, weights, state, gpu, mtp_layer_idx, None)?;
     hc_attn_mix(cfg, weights, state, gpu, mtp_layer_idx)?;
@@ -6483,6 +6496,7 @@ fn apply_tail_rope(
     gpu: &mut Gpu,
     position: u32,
     layer_idx: usize,
+    tp_slice: Option<AttnTpSlice>,
 ) -> Result<(), String> {
     // Position is pre-loaded into `state.pos_array_device` at decode_step
     // entry (single htod for all layers). Slice the qk_pos slot for this
@@ -6495,7 +6509,17 @@ fn apply_tail_rope(
     let pos_buf = state.pos_buf.as_ref().unwrap();
     let _ = position; // silence unused; precompute_positions already used it
 
-    let q = state.q.as_ref().unwrap();
+    let q_full = state.q.as_ref().unwrap();
+    let (q, n_heads) = if let Some(slice) = tp_slice {
+        let mut q = q_full.sub_offset(
+            slice.head_start * cfg.head_dim,
+            slice.head_count * cfg.head_dim,
+        );
+        q.shape = vec![slice.head_count, cfg.head_dim];
+        (q, slice.head_count)
+    } else {
+        (q_full.shallow_clone(), cfg.num_attention_heads)
+    };
     let kv = state.kv.as_ref().unwrap();
 
     // DeepSeek V4 upstream (per antirez ds4 reference):
@@ -6507,10 +6531,10 @@ fn apply_tail_rope(
         layer_rope_params(cfg, layer.compress_ratio);
 
     gpu.rope_tail_yarn_interleaved(
-        q,
+        &q,
         kv,
         pos_buf,
-        cfg.num_attention_heads as i32,
+        n_heads as i32,
         cfg.num_key_value_heads as i32,
         cfg.head_dim as i32,
         cfg.qk_rope_head_dim as i32,
@@ -6609,6 +6633,7 @@ fn q_lora(
     state: &mut DeepseekV4State,
     gpu: &mut Gpu,
     layer_idx: usize,
+    tp_slice: Option<AttnTpSlice>,
 ) -> Result<(), String> {
     let layer = weights.resolve_layer(layer_idx);
     let attn_norm = layer
@@ -6669,7 +6694,7 @@ fn q_lora(
     let tmp_plain = state.tmp_plain.as_ref().unwrap();
     let q_lat = state.q_lat.as_ref().unwrap();
     let q_lat_rot = state.q_lat_rot.as_ref().unwrap();
-    let q = state.q.as_ref().unwrap();
+    let q_full = state.q.as_ref().unwrap();
     let q_head_ones = state.q_head_ones.as_ref().unwrap();
     let _ = streams; // streams not used directly anymore; transform reads hc_x_in
 
@@ -6736,12 +6761,51 @@ fn q_lora(
 
     // 4. wq_b @ q_lat_rot → q. M = n_heads * head_dim, K = q_lora_rank.
     //    Use q_lat (un-rotated) for F16 path; q_lat_rot for MQ4 path.
-    let q_total = cfg.num_attention_heads * cfg.head_dim;
-    gemv_auto(gpu, wq_b, q_lat_rot, q_lat, q, q_total, cfg.q_lora_rank)?;
+    let (wq_b_local, q, q_total) = if let Some(slice) = tp_slice {
+        let row_start = slice.head_start * cfg.head_dim;
+        let row_count = slice.head_count * cfg.head_dim;
+        let (row_offset_units, row_len_units) = match wq_b.dtype {
+            // sub_offset scales logical elements by dtype.size().
+            DType::F32 | DType::F16 => (row_start * cfg.q_lora_rank, row_count * cfg.q_lora_rank),
+            // Quantized/Raw tensors are byte-addressed (dtype.size() == 1).
+            DType::Q8_0 => (
+                row_start * (cfg.q_lora_rank / 32) * 34,
+                row_count * (cfg.q_lora_rank / 32) * 34,
+            ),
+            DType::Raw => (
+                row_start * (cfg.q_lora_rank / 256) * 136,
+                row_count * (cfg.q_lora_rank / 256) * 136,
+            ),
+            other => {
+                return Err(format!(
+                    "unsupported attention TP wq_b dtype {other:?} in layer {layer_idx}"
+                ));
+            }
+        };
+        let weight = wq_b.sub_offset(row_offset_units, row_len_units);
+        let mut q = q_full.sub_offset(row_start, row_count);
+        q.shape = vec![slice.head_count, cfg.head_dim];
+        (weight, q, row_count)
+    } else {
+        (
+            wq_b.shallow_clone(),
+            q_full.shallow_clone(),
+            cfg.num_attention_heads * cfg.head_dim,
+        )
+    };
+    gemv_auto(
+        gpu,
+        &wq_b_local,
+        q_lat_rot,
+        q_lat,
+        &q,
+        q_total,
+        cfg.q_lora_rank,
+    )?;
 
     // 4.5. Per-head RMSNorm of Q (upstream DeepSeek V4:
     //     `q *= rsqrt(q.square().mean(-1, keepdim=True) + eps)`).
-    gpu.rmsnorm_f32(q, q_head_ones, q, cfg.rms_norm_eps)
+    gpu.rmsnorm_f32(&q, q_head_ones, &q, cfg.rms_norm_eps)
         .map_err(|e| format!("q per-head rmsnorm layer {layer_idx}: {e:?}"))?;
     ds4_fine_probe_end(gpu, q_b_probe, layer_idx, "q_lora_b")?;
 
