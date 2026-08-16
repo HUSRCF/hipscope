@@ -2263,6 +2263,19 @@ pub fn run_moe_prefill_bias_aware(
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(default_gate_threshold);
+    // The low-B indexed kernels understand the -1 ownership sentinel. Keep
+    // large EP prefill on its existing grouped path until grouped sorting has
+    // an ownership-aware compaction contract.
+    if batch_size < gate_threshold {
+        if let Some(expert_owned) = p.expert_owned_mask {
+            hip!(gpu.deepseek4_mask_topk_owned(
+                p.topk_indices,
+                expert_owned,
+                batch_size * k_top,
+                n_exp,
+            ))?;
+        }
+    }
     let use_grouped = p.x_a8.is_none()
         && p.gate_up_dtype == DType::MQ2G256Lloyd
         && p.down_dtype == DType::MQ2G256Lloyd

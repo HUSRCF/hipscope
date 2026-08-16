@@ -8921,6 +8921,7 @@ fn ffn_batched(
         scores: &pbs.moe_scores_batch,
         topk_indices: &pbs.moe_topk_indices_batch,
         topk_weights: &pbs.moe_topk_weights_batch,
+        expert_owned_mask: layer.expert_owned_mask.as_ref(),
         expert_gate_up_ptrs: gate_up_ptrs,
         expert_down_ptrs: w2_ptrs,
         x_rot: if gate_up_dtype == DType::HFP4G32 {
@@ -10316,6 +10317,27 @@ pub fn forward_prefill_batch_chunk_ep(
             gpu.add_inplace_f32(&out, &partial)
                 .map_err(|e| format!("prefill EP add routed r{r} l{layer_idx}: {e:?}"))?;
             hc_ffn_mix_batched(cfg, pbs, gpu, n)?;
+            // The trunk activations are replicated after the routed partial
+            // reduction, so rank 0 alone can capture the DSpark target layers.
+            // Keep the normal EP prefill/decode path byte-for-byte unchanged
+            // unless a speculative caller explicitly arms capture.
+            if r == 0 && state_per_rank[r].dspark_capture_active {
+                if let Some(slot) = state_per_rank[r]
+                    .dspark_target_layers
+                    .iter()
+                    .position(|&layer| layer == layer_idx)
+                {
+                    dspark_capture_layer(
+                        cfg,
+                        &mut state_per_rank[r],
+                        gpu,
+                        pbs,
+                        layer_idx,
+                        slot,
+                        n,
+                    )?;
+                }
+            }
             if r == 0 && layer_idx <= 3 {
                 dump_buf(
                     gpu,

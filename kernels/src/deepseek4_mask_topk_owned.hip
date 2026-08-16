@@ -9,11 +9,11 @@
 extern "C" __global__ void deepseek4_mask_topk_owned_i32(
     int* __restrict__ topk_indices,
     const unsigned char* __restrict__ expert_owned,
-    int k_top,
+    int slot_count,
     int n_exp
 ) {
     const int slot = blockIdx.x * blockDim.x + threadIdx.x;
-    if (slot >= k_top) return;
+    if (slot >= slot_count) return;
     const int eid = topk_indices[slot];
     if (eid < 0 || eid >= n_exp || expert_owned[eid] == 0) {
         topk_indices[slot] = -1;

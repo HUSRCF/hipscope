@@ -105,7 +105,7 @@ impl Gpu {
         &mut self,
         topk_indices: &GpuTensor,
         expert_owned: &GpuTensor,
-        k_top: usize,
+        slot_count: usize,
         n_exp: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
@@ -116,17 +116,17 @@ impl Gpu {
         )?;
         let ip = topk_indices.buf.as_ptr();
         let op = expert_owned.buf.as_ptr();
-        let kt = k_top as i32;
+        let slots = slot_count as i32;
         let ne = n_exp as i32;
         let mut params: Vec<*mut c_void> = vec![
             &ip as *const _ as *mut c_void,
             &op as *const _ as *mut c_void,
-            &kt as *const _ as *mut c_void,
+            &slots as *const _ as *mut c_void,
             &ne as *const _ as *mut c_void,
         ];
         self.launch_maybe_blob(
             "deepseek4_mask_topk_owned_i32",
-            [k_top.div_ceil(64) as u32, 1, 1],
+            [slot_count.div_ceil(64) as u32, 1, 1],
             [64, 1, 1],
             0,
             &mut params,
@@ -134,7 +134,7 @@ impl Gpu {
                 let mut b = hip_bridge::KernargBlob::new();
                 b.push_ptr(ip);
                 b.push_ptr(op);
-                b.push_i32(kt);
+                b.push_i32(slots);
                 b.push_i32(ne);
                 b
             },

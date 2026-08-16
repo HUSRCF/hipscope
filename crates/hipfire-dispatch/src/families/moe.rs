@@ -455,6 +455,9 @@ pub struct MoeBiasAwarePrefillParams<'a> {
     pub scores: &'a GpuTensor, // post-sqrt_softplus moe_scores_batch [B, n_exp]
     pub topk_indices: &'a GpuTensor, // [B, k_top] (routing out, expert in)
     pub topk_weights: &'a GpuTensor, // [B, k_top]
+    /// EP ownership bitmap. Remote routes become the indexed-kernel sentinel
+    /// after global top-k routing; the globally-normalized weights stay intact.
+    pub expert_owned_mask: Option<&'a GpuTensor>,
     // routed expert pointer tables
     pub expert_gate_up_ptrs: &'a GpuTensor,
     pub expert_down_ptrs: &'a GpuTensor,
