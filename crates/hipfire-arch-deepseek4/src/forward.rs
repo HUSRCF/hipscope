@@ -330,6 +330,28 @@ fn gemv_auto_batched_wmma(
             .map_err(|e| format!("gemm_q8_0_wmma_prefill_auto: {e:?}"))
         }
         DType::F16 => {
+            // DSpark verifies a small block (normally B=3/5/7). On gfx90a,
+            // reuse the bit-exact eager Row2 GEMV instead of sending those
+            // narrow batches through the generic batched F16 kernel. Keep
+            // graph capture on its existing blob-backed dispatch.
+            if gpu.arch == "gfx90a"
+                && !gpu.graphs.capture_mode
+                && (2..=8).contains(&batch_size)
+                && config_cache::gfx90a_f16_row2()
+            {
+                return gpu
+                    .wo_per_group_batched_f16_wave64_row2_gfx90a(
+                        weight,
+                        x_plain_batch,
+                        y,
+                        1,
+                        m as i32,
+                        k as i32,
+                        batch_size as i32,
+                    )
+                    .map_err(|e| format!("gfx90a DeepSeek4 F16 row2 batched GEMV: {e:?}"));
+            }
+
             // gfx12/RDNA4: route through the VALIDATED gfx12 f16 WMMA kernel
             // `gemm_f16_wmma_mb8` (takes F32 X directly, has a known-good
             // `_gfx12` port) rather than `gemm_f16_x_f16_wmma`'s gfx12 port.
