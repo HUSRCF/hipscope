@@ -5203,6 +5203,14 @@ pub const ROPE_TAIL_INTERLEAVED_SRC: &str =
 pub const ROPE_TAIL_YARN_INTERLEAVED_SRC: &str =
     include_str!("../../../kernels/src/rope_tail_yarn_interleaved.hip");
 
+/// gfx90a eager DeepSeek4 sibling that also writes the 32 final compressed
+/// YaRN cos/sin pairs for later direct-attention inverse epilogues.
+pub const ROPE_TAIL_YARN_INTERLEAVED_TABLE_GFX90A_SRC: &str = concat!(
+    "#define HIPFIRE_DS4_YARN_WRITE_TABLE 1\n",
+    "#define HIPFIRE_DS4_YARN_KERNEL rope_tail_yarn_interleaved_table_f32\n",
+    include_str!("../../../kernels/src/rope_tail_yarn_interleaved.hip")
+);
+
 /// Tail-only RoPE — BATCHED (Phase B2, 2026-05-18). Per-batch positions
 /// from a device array; rotation on the LAST n_rot dims of each head.
 pub const ROPE_TAIL_INTERLEAVED_BATCHED_SRC: &str =
@@ -5436,6 +5444,15 @@ pub const V4F_ATTN_SWA_TOPK_BATCHED_SRC: &str =
 /// DeepSeek V4 SWA + indexer top-K attention, direct main-KV variant.
 pub const V4F_ATTN_SWA_TOPK_DIRECT_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/deepseek4_attn_swa_topk_direct_batched.hip");
+
+/// gfx90a eager sibling that consumes a precomputed YaRN cos/sin table in
+/// the direct-attention output epilogue.
+pub const V4F_ATTN_SWA_TOPK_DIRECT_BATCHED_YARN_TABLE_GFX90A_SRC: &str = concat!(
+    "#define HIPFIRE_DS4_ATTN_FUSE_INVERSE_YARN_TABLE 1\n",
+    "#define HIPFIRE_DS4_ATTN_DIRECT_KERNEL ",
+    "deepseek4_attn_swa_topk_direct_batched_yarn_table_f32\n",
+    include_str!("../../../kernels/src/deepseek4_attn_swa_topk_direct_batched.hip")
+);
 
 /// Head-batched f16-WMMA port of the direct-batched DSA attention (gfx1151).
 /// Same joint-softmax math; 16 heads/block so the score/output GEMVs become

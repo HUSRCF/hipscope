@@ -5559,6 +5559,7 @@ fn attn_stub(
         .sub_offset(slice.head_start, n_heads);
 
     let attention_probe = ds4_fine_probe_start(gpu, layer_idx, state.n_tokens)?;
+    let mut inverse_rope_fused = false;
     if !use_swa {
         // Pos-0 attention (default). Each step independent.
         gpu.deepseek4_attn_pos0(
@@ -5734,24 +5735,55 @@ fn attn_stub(
                     .attn_state_host
                     .as_ref()
                     .ok_or_else(|| "attn_state_host missing".to_string())?[2];
-                gpu.deepseek4_attn_swa_topk_direct_batched_f32(
-                    &q,
-                    swa_k,
-                    swa_v,
-                    main_kv_cache,
-                    topk_idx,
-                    &attn_sink,
-                    &n_valid_buf,
-                    &k_active_buf,
-                    &attn_out_raw,
-                    n_heads as i32,
-                    head_dim as i32,
-                    win as i32,
-                    topk_max as i32,
-                    n_compressed,
-                    1,
-                )
-                .map_err(|e| format!("deepseek4_attn_swa_topk_direct l{layer_idx}: {e:?}"))?;
+                let use_yarn_table = head_dim == 512
+                    && cfg.qk_rope_head_dim == 64
+                    && state.compressed_yarn_cs.is_some()
+                    && hipfire_config::developer_var("HIPFIRE_GFX90A_DS4_ATTN_YARN_TABLE")
+                        .as_deref()
+                        != Ok("0");
+                if use_yarn_table {
+                    gpu.deepseek4_attn_swa_topk_direct_batched_yarn_table_f32(
+                        &q,
+                        swa_k,
+                        swa_v,
+                        main_kv_cache,
+                        topk_idx,
+                        &attn_sink,
+                        &n_valid_buf,
+                        &k_active_buf,
+                        &attn_out_raw,
+                        state.compressed_yarn_cs.as_ref().unwrap(),
+                        n_heads as i32,
+                        head_dim as i32,
+                        win as i32,
+                        topk_max as i32,
+                        n_compressed,
+                        1,
+                    )
+                    .map_err(|e| {
+                        format!("deepseek4_attn_swa_topk_direct_yarn_table l{layer_idx}: {e:?}")
+                    })?;
+                    inverse_rope_fused = true;
+                } else {
+                    gpu.deepseek4_attn_swa_topk_direct_batched_f32(
+                        &q,
+                        swa_k,
+                        swa_v,
+                        main_kv_cache,
+                        topk_idx,
+                        &attn_sink,
+                        &n_valid_buf,
+                        &k_active_buf,
+                        &attn_out_raw,
+                        n_heads as i32,
+                        head_dim as i32,
+                        win as i32,
+                        topk_max as i32,
+                        n_compressed,
+                        1,
+                    )
+                    .map_err(|e| format!("deepseek4_attn_swa_topk_direct l{layer_idx}: {e:?}"))?;
+                }
             } else {
                 let gathered_k = state._attention[layer_idx].gathered_k.as_ref().unwrap();
                 gpu.deepseek4_attn_swa_topk_f32_buf(
@@ -5809,34 +5841,36 @@ fn attn_stub(
     //   rope_tail_layer_inplace(q,     ..., pos, il, false)  // forward
     //   rope_tail_layer_inplace(heads, ..., pos, il, true)   // inverse
     // (ds4.c:7868, 7874)
-    let pos_buf = state
-        .pos_buf
-        .as_ref()
-        .ok_or_else(|| "pos_buf not allocated".to_string())?;
-    let inverse_rope_probe = ds4_fine_probe_start(gpu, layer_idx, state.n_tokens)?;
-    {
-        let layer = weights.resolve_layer(layer_idx);
-        let (freq_base, freq_scale, ext_factor, attn_factor, corr_low, corr_high) =
-            layer_rope_params(cfg, layer.compress_ratio);
-        gpu.rope_tail_yarn_interleaved(
-            &attn_out_raw,
-            &attn_out_raw,
-            pos_buf,
-            n_heads as i32,
-            0,
-            head_dim as i32,
-            cfg.qk_rope_head_dim as i32,
-            freq_base,
-            freq_scale,
-            ext_factor,
-            attn_factor,
-            corr_low,
-            corr_high,
-            /*inverse=*/ 1,
-        )
-        .map_err(|e| format!("rope_tail_yarn_interleaved (inverse) l{layer_idx}: {e:?}"))?;
+    if !inverse_rope_fused {
+        let pos_buf = state
+            .pos_buf
+            .as_ref()
+            .ok_or_else(|| "pos_buf not allocated".to_string())?;
+        let inverse_rope_probe = ds4_fine_probe_start(gpu, layer_idx, state.n_tokens)?;
+        {
+            let layer = weights.resolve_layer(layer_idx);
+            let (freq_base, freq_scale, ext_factor, attn_factor, corr_low, corr_high) =
+                layer_rope_params(cfg, layer.compress_ratio);
+            gpu.rope_tail_yarn_interleaved(
+                &attn_out_raw,
+                &attn_out_raw,
+                pos_buf,
+                n_heads as i32,
+                0,
+                head_dim as i32,
+                cfg.qk_rope_head_dim as i32,
+                freq_base,
+                freq_scale,
+                ext_factor,
+                attn_factor,
+                corr_low,
+                corr_high,
+                /*inverse=*/ 1,
+            )
+            .map_err(|e| format!("rope_tail_yarn_interleaved (inverse) l{layer_idx}: {e:?}"))?;
+        }
+        ds4_fine_probe_end(gpu, inverse_rope_probe, layer_idx, "attention_inverse_rope")?;
     }
-    ds4_fine_probe_end(gpu, inverse_rope_probe, layer_idx, "attention_inverse_rope")?;
 
     // O-LoRA projection: wo_a per-group + wo_b.
     //   wo_a: [n_groups * o_lora_rank, heads_per_group * head_dim] MQ4
@@ -6566,23 +6600,60 @@ fn apply_tail_rope(
     let (freq_base, freq_scale, ext_factor, attn_factor, corr_low, corr_high) =
         layer_rope_params(cfg, layer.compress_ratio);
 
-    gpu.rope_tail_yarn_interleaved(
-        &q,
-        kv,
-        pos_buf,
-        n_heads as i32,
-        cfg.num_key_value_heads as i32,
-        cfg.head_dim as i32,
-        cfg.qk_rope_head_dim as i32,
-        freq_base,
-        freq_scale,
-        ext_factor,
-        attn_factor,
-        corr_low,
-        corr_high,
-        /*inverse=*/ 0,
-    )
-    .map_err(|e| format!("rope_tail_yarn_interleaved: {e:?}"))?;
+    let first_compressed_layer = cfg
+        .compress_ratios
+        .iter()
+        .take(cfg.num_hidden_layers)
+        .position(|&ratio| ratio > 0);
+    let write_compressed_yarn_table = gpu.arch == "gfx90a"
+        && !gpu.graphs.capture_mode
+        && first_compressed_layer == Some(layer_idx)
+        && cfg.qk_rope_head_dim == 64
+        && hipfire_config::developer_var("HIPFIRE_GFX90A_DS4_ATTN_YARN_TABLE").as_deref()
+            != Ok("0");
+    if write_compressed_yarn_table {
+        if state.compressed_yarn_cs.is_none() {
+            state.compressed_yarn_cs = Some(
+                gpu.alloc_tensor(&[cfg.qk_rope_head_dim], DType::F32)
+                    .map_err(|e| format!("alloc compressed_yarn_cs: {e:?}"))?,
+            );
+        }
+        gpu.rope_tail_yarn_interleaved_write_table(
+            &q,
+            kv,
+            pos_buf,
+            state.compressed_yarn_cs.as_ref().unwrap(),
+            n_heads as i32,
+            cfg.num_key_value_heads as i32,
+            cfg.head_dim as i32,
+            cfg.qk_rope_head_dim as i32,
+            freq_base,
+            freq_scale,
+            ext_factor,
+            attn_factor,
+            corr_low,
+            corr_high,
+        )
+        .map_err(|e| format!("rope_tail_yarn_interleaved_write_table: {e:?}"))?;
+    } else {
+        gpu.rope_tail_yarn_interleaved(
+            &q,
+            kv,
+            pos_buf,
+            n_heads as i32,
+            cfg.num_key_value_heads as i32,
+            cfg.head_dim as i32,
+            cfg.qk_rope_head_dim as i32,
+            freq_base,
+            freq_scale,
+            ext_factor,
+            attn_factor,
+            corr_low,
+            corr_high,
+            /*inverse=*/ 0,
+        )
+        .map_err(|e| format!("rope_tail_yarn_interleaved: {e:?}"))?;
+    }
 
     Ok(())
 }

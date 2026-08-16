@@ -16,7 +16,11 @@
 #define HEAD_DIM_LDS 512
 #define MAX_WARPS 16
 
-extern "C" __global__ __launch_bounds__(512, 1) void deepseek4_attn_swa_topk_direct_batched_f32(
+#ifndef HIPFIRE_DS4_ATTN_DIRECT_KERNEL
+#define HIPFIRE_DS4_ATTN_DIRECT_KERNEL deepseek4_attn_swa_topk_direct_batched_f32
+#endif
+
+extern "C" __global__ __launch_bounds__(512, 1) void HIPFIRE_DS4_ATTN_DIRECT_KERNEL(
     const float* __restrict__ q,                 // [batch, n_heads, head_dim]
     const float* __restrict__ swa_k,             // [batch, head_dim, swa_window]
     const float* __restrict__ swa_v,             // [batch, head_dim, swa_window]
@@ -32,6 +36,9 @@ extern "C" __global__ __launch_bounds__(512, 1) void deepseek4_attn_swa_topk_dir
     int topk_window,
     int n_compressed,
     int batch_size
+#ifdef HIPFIRE_DS4_ATTN_FUSE_INVERSE_YARN_TABLE
+    , const float* __restrict__ yarn_cs
+#endif
 ) {
     const int h = blockIdx.x;
     const int b = blockIdx.y;
@@ -165,5 +172,30 @@ extern "C" __global__ __launch_bounds__(512, 1) void deepseek4_attn_swa_topk_dir
             acc += scores_lds[n_valid_swa + p] * kv_cache[(size_t)idx * head_dim + d];
         }
     }
+#ifdef HIPFIRE_DS4_ATTN_FUSE_INVERSE_YARN_TABLE
+    // The gfx90a production dispatch hard-gates head_dim=512/n_rot=64 and
+    // launches exactly head_dim threads. Stage only the 64-value tail in LDS;
+    // every thread must reach the barrier. Coefficients were produced once by
+    // this token's first compressed-layer forward RoPE launch.
+    constexpr int n_rot = 64;
+    const int tail_off = head_dim - n_rot;
+    if (d < tail_off) {
+        attn_out[out_base + d] = acc;
+    } else {
+        q_lds[d - tail_off] = acc;
+    }
+    __syncthreads();
+
+    const int tail_d = d - tail_off;
+    if (tail_d >= 0 && tail_d < n_rot && (tail_d & 1) == 0) {
+        const float cos_a = yarn_cs[tail_d];
+        const float sin_a = -yarn_cs[tail_d + 1];
+        const float x0 = q_lds[tail_d];
+        const float x1 = q_lds[tail_d + 1];
+        attn_out[out_base + tail_off + tail_d] = x0 * cos_a - x1 * sin_a;
+        attn_out[out_base + tail_off + tail_d + 1] = x0 * sin_a + x1 * cos_a;
+    }
+#else
     attn_out[out_base + d] = acc;
+#endif
 }

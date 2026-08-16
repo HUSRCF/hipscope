@@ -1076,6 +1076,13 @@ pub struct DeepseekV4State {
     /// gets overwritten per layer.
     pub pos_buf: Option<rdna_compute::GpuTensor>,
 
+    /// Final compressed-layer YaRN coefficients for the current token,
+    /// laid out as `[cos0, sin0, ... cos31, sin31]`. On gfx90a eager
+    /// decode, the first compressed layer's existing forward-RoPE launch
+    /// writes this 256-byte table; ratio=4 direct attention epilogues reuse
+    /// it for inverse RoPE without repeating transcendental work per head.
+    pub compressed_yarn_cs: Option<rdna_compute::GpuTensor>,
+
     /// Separate position buffer for the indexer compressor's tail-RoPE
     /// step. Distinct from `pos_buf` because the compressor uses a
     /// start-of-window position `(pos / ratio) * ratio`, while the main
@@ -1361,6 +1368,7 @@ impl DeepseekV4State {
             q: None,
             kv: None,
             pos_buf: None,
+            compressed_yarn_cs: None,
             comp_pos_buf: None,
             pos_array_device: None,
             pos_array_host: None,
@@ -1585,6 +1593,7 @@ impl DeepseekV4State {
         free_opt(gpu, &mut self.q);
         free_opt(gpu, &mut self.kv);
         free_opt(gpu, &mut self.pos_buf);
+        free_opt(gpu, &mut self.compressed_yarn_cs);
         free_opt(gpu, &mut self.comp_pos_buf);
         free_opt(gpu, &mut self.pos_array_device);
         free_opt(gpu, &mut self.token_id_buf);

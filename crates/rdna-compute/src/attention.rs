@@ -9840,6 +9840,75 @@ impl Gpu {
             )
         }
     }
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope_tail_yarn_interleaved_write_table(
+        &mut self,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        pos_buf: &GpuTensor,
+        yarn_cs: &GpuTensor,
+        n_heads_q: i32,
+        n_heads_k: i32,
+        head_dim: i32,
+        n_rot: i32,
+        freq_base: f32,
+        freq_scale: f32,
+        ext_factor: f32,
+        attn_factor: f32,
+        corr_low: f32,
+        corr_high: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "rope_tail_yarn_interleaved_table_gfx90a",
+            kernels::ROPE_TAIL_YARN_INTERLEAVED_TABLE_GFX90A_SRC,
+            "rope_tail_yarn_interleaved_table_f32",
+        )?;
+        let func = &self.functions["rope_tail_yarn_interleaved_table_f32"];
+        let qp = q.buf.as_ptr();
+        let kp = k.buf.as_ptr();
+        let pp = pos_buf.buf.as_ptr();
+        let tp = yarn_cs.buf.as_ptr();
+        let mut nq = n_heads_q;
+        let mut nk = n_heads_k;
+        let mut hd = head_dim;
+        let mut nr = n_rot;
+        let mut fb = freq_base;
+        let mut fs = freq_scale;
+        let mut ef = ext_factor;
+        let mut af = attn_factor;
+        let mut cl = corr_low;
+        let mut ch = corr_high;
+        let mut inv = 0i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &pp as *const _ as *mut c_void,
+            &mut nq as *mut _ as *mut c_void,
+            &mut nk as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut nr as *mut _ as *mut c_void,
+            &mut fb as *mut _ as *mut c_void,
+            &mut fs as *mut _ as *mut c_void,
+            &mut ef as *mut _ as *mut c_void,
+            &mut af as *mut _ as *mut c_void,
+            &mut cl as *mut _ as *mut c_void,
+            &mut ch as *mut _ as *mut c_void,
+            &mut inv as *mut _ as *mut c_void,
+            &tp as *const _ as *mut c_void,
+        ];
+        let half = (n_rot / 2) as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [(half + 31) / 32, 1, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
     pub fn rope_tail_yarn_interleaved_at_slot_buf(
         &mut self,
         base: &GpuTensor,
@@ -10697,6 +10766,80 @@ impl Gpu {
             &mut tw as *mut _ as *mut c_void,
             &mut nc as *mut _ as *mut c_void,
             &mut bs as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_heads as u32, batch_size as u32, 1],
+                [head_dim as u32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn deepseek4_attn_swa_topk_direct_batched_yarn_table_f32(
+        &mut self,
+        q: &GpuTensor,
+        swa_k: &GpuTensor,
+        swa_v: &GpuTensor,
+        kv_cache: &GpuTensor,
+        topk_idx: &GpuTensor,
+        attn_sink: &GpuTensor,
+        n_valid_swa_arr: &GpuTensor,
+        n_active_topk_arr: &GpuTensor,
+        attn_out: &GpuTensor,
+        yarn_cs: &GpuTensor,
+        n_heads: i32,
+        head_dim: i32,
+        swa_window: i32,
+        topk_window: i32,
+        n_compressed: i32,
+        batch_size: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        debug_assert_eq!(head_dim, 512);
+        debug_assert_eq!(batch_size, 1);
+        self.ensure_kernel(
+            "deepseek4_attn_swa_topk_direct_batched_yarn_table_gfx90a",
+            kernels::V4F_ATTN_SWA_TOPK_DIRECT_BATCHED_YARN_TABLE_GFX90A_SRC,
+            "deepseek4_attn_swa_topk_direct_batched_yarn_table_f32",
+        )?;
+        let func = &self.functions["deepseek4_attn_swa_topk_direct_batched_yarn_table_f32"];
+        let qp = q.buf.as_ptr();
+        let kp = swa_k.buf.as_ptr();
+        let vp = swa_v.buf.as_ptr();
+        let cp = kv_cache.buf.as_ptr();
+        let ip = topk_idx.buf.as_ptr();
+        let sp = attn_sink.buf.as_ptr();
+        let nvp = n_valid_swa_arr.buf.as_ptr();
+        let nap = n_active_topk_arr.buf.as_ptr();
+        let op = attn_out.buf.as_ptr();
+        let tp = yarn_cs.buf.as_ptr();
+        let mut nh = n_heads;
+        let mut hd = head_dim;
+        let mut sw = swa_window;
+        let mut tw = topk_window;
+        let mut nc = n_compressed;
+        let mut bs = batch_size;
+        let mut params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &vp as *const _ as *mut c_void,
+            &cp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &nvp as *const _ as *mut c_void,
+            &nap as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut sw as *mut _ as *mut c_void,
+            &mut tw as *mut _ as *mut c_void,
+            &mut nc as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+            &tp as *const _ as *mut c_void,
         ];
         unsafe {
             self.hip.launch_kernel(

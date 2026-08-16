@@ -34,7 +34,11 @@
 
 #include <hip/hip_runtime.h>
 
-extern "C" __global__ void rope_tail_yarn_interleaved_f32(
+#ifndef HIPFIRE_DS4_YARN_KERNEL
+#define HIPFIRE_DS4_YARN_KERNEL rope_tail_yarn_interleaved_f32
+#endif
+
+extern "C" __global__ void HIPFIRE_DS4_YARN_KERNEL(
     float* __restrict__ q,
     float* __restrict__ k,
     const int* __restrict__ pos_buf,
@@ -49,6 +53,9 @@ extern "C" __global__ void rope_tail_yarn_interleaved_f32(
     float corr_low,
     float corr_high,
     int inverse  // 0 = forward, 1 = inverse (negate sin)
+#ifdef HIPFIRE_DS4_YARN_WRITE_TABLE
+    , float* __restrict__ yarn_cs
+#endif
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int half = n_rot / 2;
@@ -77,6 +84,13 @@ extern "C" __global__ void rope_tail_yarn_interleaved_f32(
     float sin_sign = (inverse != 0) ? -1.0f : 1.0f;
     float cos_a = cosf(theta) * mscale;
     float sin_a = sin_sign * sinf(theta) * mscale;
+
+#ifdef HIPFIRE_DS4_YARN_WRITE_TABLE
+    // This variant is dispatched only for forward rotation, so sin_a is the
+    // positive coefficient. Consumers obtain inverse sin by exact sign flip.
+    yarn_cs[idx_pair] = cos_a;
+    yarn_cs[idx_pair + 1] = sin_a;
+#endif
 
     int tail_off = head_dim - n_rot;
     int d_even = tail_off + idx_pair;
