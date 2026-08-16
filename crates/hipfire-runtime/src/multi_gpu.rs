@@ -884,28 +884,54 @@ impl Gpus {
             };
             self.devices[root].add_inplace_f32_on_stream(&dst, &src, root_stream)?;
         }
-        for rank in 0..n {
-            if rank != root {
-                self.devices[root].hip.memcpy_peer_async(
-                    buffers[rank],
-                    self.devices[rank].device_id,
-                    buffers[root],
-                    root_device,
-                    bytes,
-                    root_stream,
-                )?;
-            }
-        }
-        let done = self.devices[root].hip.event_create()?;
+        let reduced = self.devices[root].hip.event_create()?;
         self.devices[root]
             .hip
-            .event_record(&done, Some(root_stream))?;
+            .event_record(&reduced, Some(root_stream))?;
+
+        // Fan the finalized root bytes out concurrently on each destination's
+        // communication stream. The previous implementation serialized all
+        // N-1 peer copies on the root stream; destination-side streams let HIP
+        // use independent copy engines/links where the topology permits, so
+        // the critical path approaches the maximum rather than the sum.
+        let mut broadcast = Vec::with_capacity(n - 1);
         for rank in 0..n {
+            if rank == root {
+                continue;
+            }
             self.devices[rank].bind_thread()?;
-            let compute = self.devices[rank].active_stream.as_ref().ok_or_else(|| {
+            let stream = &self.ep_comm_streams[rank];
+            self.devices[rank].hip.stream_wait_event(stream, &reduced)?;
+            self.devices[rank].hip.memcpy_peer_async(
+                buffers[rank],
+                self.devices[rank].device_id,
+                buffers[root],
+                root_device,
+                bytes,
+                stream,
+            )?;
+            let event = self.devices[rank].hip.event_create()?;
+            self.devices[rank].hip.event_record(&event, Some(stream))?;
+            broadcast.push((rank, event));
+        }
+
+        // Non-root compute streams only need their own copy. Root waits for
+        // every reader before the next layer may zero/reuse its partial.
+        for (rank, event) in &broadcast {
+            let compute = self.devices[*rank].active_stream.as_ref().ok_or_else(|| {
                 HipError::new(0, "peer_root_async requires active compute streams")
             })?;
-            self.devices[rank].hip.stream_wait_event(compute, &done)?;
+            self.devices[*rank].hip.stream_wait_event(compute, event)?;
+        }
+        self.devices[root].bind_thread()?;
+        let root_compute = self.devices[root]
+            .active_stream
+            .as_ref()
+            .ok_or_else(|| HipError::new(0, "peer_root_async requires active compute streams"))?;
+        for (_, event) in &broadcast {
+            self.devices[root]
+                .hip
+                .stream_wait_event(root_compute, event)?;
         }
 
         for (rank, event) in ready.into_iter().enumerate() {
@@ -916,8 +942,12 @@ impl Gpus {
             self.devices[rank].bind_thread()?;
             self.devices[rank].hip.event_destroy(event)?;
         }
+        for (rank, event) in broadcast {
+            self.devices[rank].bind_thread()?;
+            self.devices[rank].hip.event_destroy(event)?;
+        }
         self.devices[root].bind_thread()?;
-        self.devices[root].hip.event_destroy(done)?;
+        self.devices[root].hip.event_destroy(reduced)?;
         Ok(())
     }
 }
