@@ -7,8 +7,8 @@
 //! shards the 256 routed experts/layer across `--tp` ranks (shard-aware load:
 //! each rank uploads only its owned experts; non-owned → zeroed dummy) and runs
 //! the lowered decode through the EP executor: MLA attention replicated, the
-//! SHARED expert replicated in ffn_out, only the ROUTED combine all-reduce-EP'd,
-//! and `hc_ffn_mix` deferred past the all-reduce.
+//! SHARED expert computed once on the finalization root, only the ROUTED combine
+//! reduced across ranks, and the final FFN output broadcast before `hc_ffn_mix`.
 //!
 //! Run (hiptrx, 4× gfx1201):
 //!   HIP_VISIBLE_DEVICES=0,1,2,3 cargo run --release \
@@ -25,6 +25,23 @@ fn fnv1a(ids: &[u32]) -> u64 {
         }
     }
     h
+}
+
+/// Scoped transfer for one exclusively-borrowed rank during model load only.
+/// The worker rebinds HIP before use and joins before the main thread regains
+/// access; this deliberately does not make `Gpu` generally `Send`.
+struct ScopedLoadGpu<'a> {
+    gpu: &'a mut rdna_compute::Gpu,
+}
+
+// SAFETY: instances come only from disjoint `gpus.devices.iter_mut()` items in
+// the scoped load below, and every worker is joined inside that scope.
+unsafe impl Send for ScopedLoadGpu<'_> {}
+
+impl ScopedLoadGpu<'_> {
+    fn get_mut(&mut self) -> &mut rdna_compute::Gpu {
+        self.gpu
+    }
 }
 
 fn main() {
@@ -315,32 +332,69 @@ fn main() {
     };
     let shard =
         ShardConfig::new(tp, /*tp_kv_replicate=*/ true, n_exp, expert_assign).expect("ShardConfig");
-    let mut weights_per_rank = Vec::with_capacity(n);
-    for r in 0..n {
-        gpus.devices[r].bind_thread().expect("bind");
-        let t = std::time::Instant::now();
-        let w = if source_is_dir {
-            let source = SafetensorsSource::open(&model).expect("reopen safetensors model");
-            DeepseekV4::load_weights_from_safetensors_sharded(
-                &source,
-                &cfg,
-                &mut gpus.devices[r],
-                &shard,
+    let weights_per_rank = std::thread::scope(|scope| {
+        let mut workers = Vec::with_capacity(n);
+        for (r, dev) in gpus.devices.iter_mut().enumerate() {
+            let model_path = model.clone();
+            let overlay_path = overlay.clone();
+            let rank_config = cfg.clone();
+            let rank_shard = shard.clone();
+            let mut scoped_gpu = ScopedLoadGpu { gpu: dev };
+            workers.push((
                 r,
-            )
-            .expect("safetensors shard-aware load")
-        } else {
-            let mut hfq = HfqFile::open(&model).expect("reopen model");
-            attach_overlay(&mut hfq);
-            DeepseekV4::load_weights_sharded(&mut hfq, &cfg, &mut gpus.devices[r], &shard, r)
-                .expect("HFQ shard-aware load")
-        };
-        eprintln!(
-            "  [rank {r}] loaded owned shard in {:.1}s",
-            t.elapsed().as_secs_f64()
-        );
-        weights_per_rank.push(w);
-    }
+                scope.spawn(move || {
+                    let dev = scoped_gpu.get_mut();
+                    dev.bind_thread().expect("bind");
+                    let started = std::time::Instant::now();
+                    let weights = if source_is_dir {
+                        let source =
+                            SafetensorsSource::open(&model_path).expect("reopen safetensors model");
+                        DeepseekV4::load_weights_from_safetensors_sharded(
+                            &source,
+                            &rank_config,
+                            dev,
+                            &rank_shard,
+                            r,
+                        )
+                        .expect("safetensors shard-aware load")
+                    } else {
+                        let mut hfq = HfqFile::open(&model_path).expect("reopen model");
+                        if let Some(path) = overlay_path.as_ref() {
+                            let control = HfqFile::open_at_offset(path, 0).expect("open --overlay");
+                            hfq.attach_overlay(control).expect("attach --overlay");
+                        }
+                        DeepseekV4::load_weights_sharded(
+                            &mut hfq,
+                            &rank_config,
+                            dev,
+                            &rank_shard,
+                            r,
+                        )
+                        .expect("HFQ shard-aware load")
+                    };
+                    (r, weights, started.elapsed())
+                }),
+            ));
+        }
+        workers
+            .into_iter()
+            .map(|(r, worker)| {
+                worker
+                    .join()
+                    .unwrap_or_else(|_| panic!("EP load worker rank {r} panicked"))
+            })
+            .collect::<Vec<_>>()
+    });
+    let weights_per_rank = weights_per_rank
+        .into_iter()
+        .map(|(r, weights, elapsed)| {
+            eprintln!(
+                "  [rank {r}] loaded owned shard in {:.1}s (parallel)",
+                elapsed.as_secs_f64()
+            );
+            weights
+        })
+        .collect::<Vec<_>>();
     eprintln!("  all ranks loaded (expert assignment: {expert_assign:?})");
 
     // ── per-rank state + routed partials ([hidden] = ffn_out width) ──────────

@@ -1349,6 +1349,26 @@ struct Ds4EpStaging {
     partials: Vec<rdna_compute::GpuTensor>,
 }
 
+/// Narrow thread-transfer bridge used only while DeepSeek EP weights load.
+///
+/// `Gpu` intentionally does not promise general `Send`: it owns HIP, rocBLAS,
+/// scratch, and retained-replay handles. Loading has a smaller contract: every
+/// wrapper comes from a disjoint `iter_mut()` borrow, its scoped worker calls
+/// `bind_thread()` before use, and all workers join before `Gpus` is accessible.
+struct ScopedDs4LoadGpu<'a> {
+    gpu: &'a mut Gpu,
+}
+
+// SAFETY: construction and use are confined to `load_model_ep_ds4`'s scoped
+// load, which enforces exclusive rank ownership and joins every worker.
+unsafe impl Send for ScopedDs4LoadGpu<'_> {}
+
+impl ScopedDs4LoadGpu<'_> {
+    fn get_mut(&mut self) -> &mut Gpu {
+        self.gpu
+    }
+}
+
 impl Ds4EpStaging {
     fn new(gpus: Gpus) -> Self {
         Self {
@@ -1494,13 +1514,13 @@ impl Drop for MinimaxEpStaging {
 /// at the call site left intact). ds4 (arch_id 9) and MiniMax (arch_id 10) only.
 ///
 /// KNOWN RESIDUAL — constructor-mid-failure leak (scoped follow-up, NOT fixed):
-/// the staging guard frees every rank that has been COMPLETED and `push`ed, so a
-/// failure BETWEEN ranks leaks no VRAM. But a failure INSIDE a single rank's
-/// constructor — after it uploaded some tensors but before it returns `Ok` —
-/// leaks those partial allocations (`GpuTensor` has no `Drop`). The fault injector
-/// (`HIPFIRE_EP_FAIL_RANK`) fires AFTER a rank's constructor returns `Ok`, so it
-/// tests the completed-rank cleanup path (which IS fixed), not this inner window.
-/// The proper fix is an unwind-safe allocation-tracking loader refactor. Deferred.
+/// the parallel loader joins every rank worker and explicitly frees every sibling
+/// constructor that returned `Ok`; the staging guard owns successful results after
+/// collection. But a failure INSIDE one rank's constructor — after it uploaded
+/// tensors but before returning `Ok` — still leaks those partial allocations
+/// (`GpuTensor` has no `Drop`). `HIPFIRE_EP_FAIL_RANK` stages only ranks 0..=r
+/// after all workers complete, so it tests completed-weight cleanup, not this inner
+/// window. The proper fix remains an unwind-safe allocation-tracking loader.
 pub fn load_model_ep(path: &str, max_seq: usize, tp: usize) -> Result<LoadedModel, String> {
     let model_path = Path::new(path);
     if model_path.is_dir() {
@@ -1623,38 +1643,100 @@ fn load_model_ep_ds4(
     // staging guard. Every `?` below early-returns while `staging` is alive, so
     // its `Drop` frees the ranks already loaded.
     let fail_rank = ep_fail_rank();
-    let _ = fail_rank;
     let mut staging = Ds4EpStaging::new(gpus);
-    for r in 0..n {
-        staging.gpus_mut().devices[r]
-            .bind_thread()
-            .map_err(|e| format!("bind {r}: {e:?}"))?;
-        let dev = &mut staging.gpus_mut().devices[r];
-        let w = match &source_kind {
-            Ds4EpSource::Hfq => {
-                let mut hfq =
-                    HfqFile::open(Path::new(path)).map_err(|e| format!("reopen rank {r}: {e}"))?;
-                deepseek4::DeepseekV4::load_weights_sharded(&mut hfq, &config, dev, &shard, r)
-                    .map_err(|e| format!("shard load rank {r}: {e:?}"))?
+    let load_results = {
+        let devices = &mut staging.gpus_mut().devices;
+        std::thread::scope(|scope| {
+            let mut workers = Vec::with_capacity(n);
+            for (r, dev) in devices.iter_mut().enumerate() {
+                let model_path = Path::new(path).to_path_buf();
+                let rank_config = config.clone();
+                let rank_shard = shard.clone();
+                let mut scoped_gpu = ScopedDs4LoadGpu { gpu: dev };
+                workers.push((
+                    r,
+                    scope.spawn(move || {
+                        let dev = scoped_gpu.get_mut();
+                        dev.bind_thread().map_err(|e| format!("bind {r}: {e:?}"))?;
+                        let started = std::time::Instant::now();
+                        let weights = if source_is_dir {
+                            let source =
+                                hipfire_runtime::safetensors_source::SafetensorsSource::open(
+                                    &model_path,
+                                )
+                                .map_err(|e| format!("safetensors reopen rank {r}: {e}"))?;
+                            deepseek4::DeepseekV4::load_weights_from_safetensors_sharded(
+                                &source,
+                                &rank_config,
+                                dev,
+                                &rank_shard,
+                                r,
+                            )
+                            .map_err(|e| format!("source shard load rank {r}: {e}"))?
+                        } else {
+                            let mut hfq = HfqFile::open(&model_path)
+                                .map_err(|e| format!("reopen rank {r}: {e}"))?;
+                            deepseek4::DeepseekV4::load_weights_sharded(
+                                &mut hfq,
+                                &rank_config,
+                                dev,
+                                &rank_shard,
+                                r,
+                            )
+                            .map_err(|e| format!("shard load rank {r}: {e:?}"))?
+                        };
+                        Ok::<_, String>((r, weights, started.elapsed()))
+                    }),
+                ));
             }
-            Ds4EpSource::IndexedSafetensors(_) => {
-                let source =
-                    hipfire_runtime::safetensors_source::SafetensorsSource::open(Path::new(path))
-                        .map_err(|e| format!("safetensors reopen rank {r}: {e}"))?;
-                deepseek4::DeepseekV4::load_weights_from_safetensors_sharded(
-                    &source, &config, dev, &shard, r,
-                )
-                .map_err(|e| format!("source shard load rank {r}: {e}"))?
-            }
-        };
-        staging.weights.push(w);
-        // Deterministic partial-load fault for testing the cleanup path. Fires
-        // AFTER ranks 0..=r loaded; the guard's Drop frees them all.
-        if fail_rank == Some(r) {
-            return Err(format!(
-                "HIPFIRE_EP_FAIL_RANK={r}: synthetic ds4 EP load failure after rank {r} (testing partial-load cleanup)"
-            ));
+            workers
+                .into_iter()
+                .map(|(r, worker)| {
+                    worker
+                        .join()
+                        .map_err(|_| format!("ds4 EP load worker rank {r} panicked"))
+                        .and_then(|result| result)
+                })
+                .collect::<Vec<_>>()
+        })
+    };
+
+    if let Some(error) = load_results
+        .iter()
+        .find_map(|result| result.as_ref().err().cloned())
+    {
+        // A sibling may have completed before another rank failed. Those
+        // weights have not entered the staging guard yet, so free them on the
+        // matching device explicitly; staging::Drop then drains every pool.
+        for (r, weights, _) in load_results.into_iter().flatten() {
+            let dev = &mut staging.gpus_mut().devices[r];
+            let _ = dev.bind_thread();
+            weights.free_gpu(dev);
         }
+        return Err(error);
+    }
+
+    let injected_rank = fail_rank.filter(|&r| r < n);
+    for (r, weights, elapsed) in load_results.into_iter().map(Result::unwrap) {
+        eprintln!(
+            "[loader] EP rank {r} loaded owned shard in {:.1}s (parallel)",
+            elapsed.as_secs_f64()
+        );
+        if injected_rank.is_none_or(|fail| r <= fail) {
+            staging.weights.push(weights);
+        } else {
+            // Preserve the fault-injection contract that only ranks 0..=fail
+            // reach the staging guard, even though workers completed together.
+            let dev = &mut staging.gpus_mut().devices[r];
+            dev.bind_thread()
+                .map_err(|e| format!("bind cleanup {r}: {e:?}"))?;
+            weights.free_gpu(dev);
+        }
+    }
+    if let Some(r) = injected_rank {
+        return Err(format!(
+            "HIPFIRE_EP_FAIL_RANK={r}: synthetic ds4 EP load failure after rank {r} (testing partial-load cleanup)"
+        ));
     }
     for r in 0..n {
         staging.gpus_mut().devices[r]

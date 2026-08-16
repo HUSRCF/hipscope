@@ -1896,18 +1896,22 @@ impl DeepseekV4 {
 
 // ── ModelSource (safetensors) load helpers ──────────────────────
 
-/// CPU conversion pool for the official source checkpoint. HIP objects remain
-/// on the daemon thread; only independent host rows/chunks enter this pool.
-/// Four workers match the four EP ranks without violating Gpu's non-Send
-/// Redline/AQL ownership. Override for bring-up with
-/// HIPFIRE_DEEPSEEK4_SOURCE_LOAD_THREADS.
+/// CPU conversion pool for the official source checkpoint. Independent
+/// rows/chunks from all scoped EP rank loaders share this pool; HIP access stays
+/// exclusive to each rank worker. Default to the host's available parallelism,
+/// capped at the measured EP4 sweet spot of 32 workers. Override for bring-up
+/// with `HIPFIRE_DEEPSEEK4_SOURCE_LOAD_THREADS`.
 fn source_load_pool() -> &'static rayon::ThreadPool {
     static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
     POOL.get_or_init(|| {
         let threads = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_SOURCE_LOAD_THREADS")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(4)
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map_or(4, std::num::NonZeroUsize::get)
+                    .min(32)
+            })
             .clamp(1, 64);
         eprintln!("[deepseek4 source] host conversion workers={threads}");
         rayon::ThreadPoolBuilder::new()
