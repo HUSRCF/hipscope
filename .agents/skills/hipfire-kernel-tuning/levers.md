@@ -217,6 +217,20 @@ RDNA because CDNA won.
   and alpha expressions. **Rejected before E2E integration.** Revisit only as
   part of a larger HC seam fusion that removes more than one small launch.
 
+### gfx90a DeepSeek4 HC mix + next-control direct seam fusion
+
+- Measured 2026-08-17 at source baseline `a87c36ef`, ROCm 7.14, MI250
+  gfx90a; microbenchmark binary md5
+  `6d3cdd087e970d136d23183d743ceed2`.
+- A bitwise-exact 12-block kernel recomputed the four-stream mix inside every
+  paired-control block, replacing `mix + 64 KiB D2D + control` with
+  `fused + 64 KiB D2D`. It regressed 16.430 to 24.518 us on GCD0 and
+  16.502 to 24.582 us on GCD4 (about 33% slower).
+- ISA remained spill-free (26 VGPR, 49 SGPR, 192 B LDS, wave64), so the loss
+  is duplicated mix/input traffic, not occupancy collapse. **Rejected before
+  E2E integration.** A retry needs cooperative chunk staging that computes
+  each mixed value once; direct per-control recomputation is closed.
+
 ### Nontemporal weight loads on gfx1100
 
 - Candidate `0532579` claimed small within-session gain; revert `34eb024`
