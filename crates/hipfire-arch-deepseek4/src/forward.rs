@@ -105,6 +105,18 @@ mod config_cache {
                 != Some("0")
         })
     }
+    /// Skip the sentinel-only compressor commit graphlet on direct-dispatch
+    /// non-commit tokens. Default ON for gfx90a; set
+    /// `HIPFIRE_GFX90A_DS4_COMP_HOST_GATING=0` for the legacy enqueue path.
+    pub(super) fn gfx90a_comp_host_gating() -> bool {
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| {
+            hipfire_config::developer_var("HIPFIRE_GFX90A_DS4_COMP_HOST_GATING")
+                .ok()
+                .as_deref()
+                != Some("0")
+        })
+    }
     /// `HIPFIRE_DEEPSEEK4_MTP_HEAD_HC` — default ON since 2026-05-21: route
     /// the MTP output (step 8 of mtp_forward) through head-HC mix using
     /// `mtp.0.hc_head_fn / hc_head_base / hc_head_scale`. Mirrors the
@@ -950,6 +962,30 @@ fn compressor_forward_impl(
         score_state,
         state_rows * proj_dim,
     );
+
+    // Direct dispatch knows the position on the host. Avoid enqueueing the
+    // sentinel-gated commit graphlet on the overwhelmingly common
+    // non-commit tokens (3/4 for ratio=4, 127/128 for ratio=128). During HIP
+    // graph capture we must retain the full graphlet so replay can select the
+    // commit path from commit_slot_buf without re-running this host code.
+    let host_commit = (pos + 1).is_multiple_of(ratio) && pos / ratio < max_compressed;
+    if gpu.arch == "gfx90a"
+        && config_cache::gfx90a_comp_host_gating()
+        && !gpu.graphs.capture_mode
+        && !host_commit
+    {
+        ds4_fine_probe_end(
+            gpu,
+            state_probe,
+            layer_idx,
+            if is_indexer {
+                "compressor_index_state"
+            } else {
+                "compressor_main_state"
+            },
+        )?;
+        return Ok(());
+    }
 
     // Compress event — concat (overlap only) is unconditional within graph;
     // pool/rmsnorm/rope/shift all sentinel-gate on commit_slot_buf.
