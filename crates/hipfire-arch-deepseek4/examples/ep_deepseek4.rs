@@ -27,6 +27,51 @@ fn fnv1a(ids: &[u32]) -> u64 {
     h
 }
 
+fn begin_replay_sequence_probe(
+    gpus: &mut hipfire_runtime::multi_gpu::Gpus,
+    positions: &[usize],
+    position: usize,
+) -> bool {
+    if !positions.contains(&position) {
+        return false;
+    }
+    hip_bridge::launch_counters::reset();
+    for (rank, gpu) in gpus.devices.iter_mut().enumerate() {
+        gpu.replay.begin_capture().unwrap_or_else(|error| {
+            panic!(
+                "begin replay sequence probe at position {position} rank {rank}: {error}; \
+                 set HIPFIRE_REPLAY_BACKEND=shadow HIPFIRE_REPLAY_MANUAL_CAPTURE=1"
+            )
+        });
+    }
+    true
+}
+
+fn finish_replay_sequence_probe(gpus: &mut hipfire_runtime::multi_gpu::Gpus, position: usize) {
+    let total_launches = hip_bridge::launch_counters::count() as usize;
+    let mut typed_launches = 0usize;
+    for (rank, gpu) in gpus.devices.iter_mut().enumerate() {
+        let summary = gpu.replay.finish_capture().unwrap_or_else(|error| {
+            panic!("finish replay sequence probe at position {position} rank {rank}: {error}")
+        });
+        typed_launches += summary.launch_count;
+        eprintln!(
+            "REPLAY_SEQUENCE position={position} rank={rank} typed_launches={} \
+             unique_kernels={} sequence_hash=0x{:016x}",
+            summary.launch_count, summary.unique_kernel_count, summary.sequence_hash,
+        );
+    }
+    let coverage = if total_launches == 0 {
+        0.0
+    } else {
+        100.0 * typed_launches as f64 / total_launches as f64
+    };
+    eprintln!(
+        "REPLAY_SEQUENCE position={position} total_launches={total_launches} \
+         typed_launches={typed_launches} typed_coverage={coverage:.2}%"
+    );
+}
+
 /// Scoped transfer for one exclusively-borrowed rank during model load only.
 /// The worker rebinds HIP before use and joins before the main thread regains
 /// access; this deliberately does not make `Gpu` generally `Send`.
@@ -76,6 +121,7 @@ fn main() {
     let mut score_out: Option<PathBuf> = None;
     let mut gen_ids_out: Option<PathBuf> = None;
     let mut trace_next: Vec<usize> = Vec::new();
+    let mut replay_sequence_probe: Vec<usize> = Vec::new();
     let mut moe_probe_out: Option<PathBuf> = None;
     let mut no_bos = false;
     let mut chat = false;
@@ -154,6 +200,13 @@ fn main() {
                 trace_next = argv[i + 1]
                     .split(',')
                     .map(|value| value.parse().expect("--trace-next"))
+                    .collect();
+                i += 2;
+            }
+            "--replay-sequence-probe" => {
+                replay_sequence_probe = argv[i + 1]
+                    .split(',')
+                    .map(|value| value.parse().expect("--replay-sequence-probe"))
                     .collect();
                 i += 2;
             }
@@ -647,6 +700,8 @@ fn main() {
         }
     } else {
         for (pos, &t) in prompt_ids.iter().enumerate() {
+            let replay_probe_active =
+                begin_replay_sequence_probe(&mut gpus, &replay_sequence_probe, pos);
             forward::forward_ep(
                 &mut gpus,
                 &weights_per_rank,
@@ -657,6 +712,9 @@ fn main() {
                 pos as u32,
             )
             .expect("forward_ep prefill");
+            if replay_probe_active {
+                finish_replay_sequence_probe(&mut gpus, pos);
+            }
             if score_out.is_some() {
                 logits = dl_logits(&mut gpus, &state_per_rank[0]);
                 if let Some(&target) = prompt_ids.get(pos + 1) {
@@ -795,6 +853,8 @@ fn main() {
             steady_t = std::time::Instant::now();
             steady = 0;
         }
+        let replay_probe_active =
+            begin_replay_sequence_probe(&mut gpus, &replay_sequence_probe, pos);
         forward::forward_ep(
             &mut gpus,
             &weights_per_rank,
@@ -805,6 +865,9 @@ fn main() {
             pos as u32,
         )
         .expect("forward_ep decode");
+        if replay_probe_active {
+            finish_replay_sequence_probe(&mut gpus, pos);
+        }
         logits = dl_logits(&mut gpus, &state_per_rank[0]);
         if step < 3 || trace_next.contains(&(step + 1)) {
             eprintln!(
@@ -948,6 +1011,8 @@ fn main() {
                 break;
             }
             second_gen.push(next);
+            let replay_probe_active =
+                begin_replay_sequence_probe(&mut gpus, &replay_sequence_probe, pos);
             forward::forward_ep(
                 &mut gpus,
                 &weights_per_rank,
@@ -958,6 +1023,9 @@ fn main() {
                 pos as u32,
             )
             .expect("forward_ep second-turn decode");
+            if replay_probe_active {
+                finish_replay_sequence_probe(&mut gpus, pos);
+            }
             logits = dl_logits(&mut gpus, &state_per_rank[0]);
             pos += 1;
         }
