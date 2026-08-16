@@ -8671,8 +8671,16 @@ impl Gpu {
         x_dim: i32,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        let pair_gfx90a = self.arch == "gfx90a"
+            && std::env::var("HIPFIRE_GFX90A_HC_CONTROL_PAIR")
+                .map(|value| value != "0")
+                .unwrap_or(true);
         let (kernel_name, kernel_src) = match (w_fn.dtype, base.dtype) {
             (DType::F16, DType::F16) => ("hc_compute_control", kernels::HC_COMPUTE_CONTROL_SRC),
+            (DType::F32, DType::F32) if pair_gfx90a => (
+                "hc_compute_control_f32weights_pair_gfx90a",
+                kernels::HC_COMPUTE_CONTROL_F32WEIGHTS_PAIR_GFX90A_SRC,
+            ),
             (DType::F32, DType::F32) => (
                 "hc_compute_control_f32weights",
                 kernels::HC_COMPUTE_CONTROL_F32WEIGHTS_SRC,
@@ -8702,11 +8710,20 @@ impl Gpu {
             &mut nc as *mut _ as *mut c_void,
             &mut xd as *mut _ as *mut c_void,
         ];
+        let pair = kernel_name == "hc_compute_control_f32weights_pair_gfx90a";
         unsafe {
             self.hip.launch_kernel(
                 func,
-                [n_ctrl as u32, 1, 1],
-                [256, 1, 1],
+                [
+                    if pair {
+                        (n_ctrl as u32).div_ceil(2)
+                    } else {
+                        n_ctrl as u32
+                    },
+                    1,
+                    1,
+                ],
+                [if pair { 512 } else { 256 }, 1, 1],
                 0,
                 self.stream_ref(),
                 &mut params,

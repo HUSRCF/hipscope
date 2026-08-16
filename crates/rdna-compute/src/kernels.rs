@@ -5084,6 +5084,8 @@ pub const HC_COMPUTE_CONTROL_SRC: &str =
 
 pub const HC_COMPUTE_CONTROL_F32WEIGHTS_SRC: &str =
     include_str!("../../../kernels/src/hc_compute_control_f32weights.hip");
+pub const HC_COMPUTE_CONTROL_F32WEIGHTS_PAIR_GFX90A_SRC: &str =
+    include_str!("../../../kernels/src/hc_compute_control_f32weights_pair_gfx90a.hip");
 
 pub const HC_SINKHORN_4X4_SRC: &str = include_str!("../../../kernels/src/hc_sinkhorn_4x4.hip");
 
