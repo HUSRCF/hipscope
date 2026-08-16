@@ -117,6 +117,21 @@ mod config_cache {
                 != Some("0")
         })
     }
+    /// Pack two independent F16 GEMV output rows into each gfx90a wave64.
+    /// The two 32-lane half-waves preserve the existing accumulation tree and
+    /// are bit-exact across the native DeepSeek4 projection shape matrix.
+    /// Default ON for eager execution; graph capture keeps the existing
+    /// blob-backed dispatch. Set `HIPFIRE_GFX90A_DS4_F16_ROW2=0` to use the
+    /// portable one-row `gemm_f16_tiled` dispatch everywhere.
+    pub(super) fn gfx90a_f16_row2() -> bool {
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| {
+            hipfire_config::developer_var("HIPFIRE_GFX90A_DS4_F16_ROW2")
+                .ok()
+                .as_deref()
+                != Some("0")
+        })
+    }
     /// `HIPFIRE_DEEPSEEK4_MTP_HEAD_HC` — default ON since 2026-05-21: route
     /// the MTP output (step 8 of mtp_forward) through head-HC mix using
     /// `mtp.0.hc_head_fn / hc_head_base / hc_head_scale`. Mirrors the
@@ -171,6 +186,18 @@ fn gemv_auto(
 ) -> Result<(), String> {
     use hipfire_dispatch::context::DispatchCtx;
     use hipfire_dispatch::families::gemv::WeightRef;
+
+    if gpu.arch == "gfx90a"
+        && !gpu.graphs.capture_mode
+        && weight.dtype == DType::F16
+        && config_cache::gfx90a_f16_row2()
+    {
+        return gpu
+            .wo_per_group_batched_f16_wave64_row2_gfx90a(
+                weight, x_plain, y, 1, m as i32, k as i32, 1,
+            )
+            .map_err(|e| format!("gfx90a DeepSeek4 F16 row2 GEMV: {e}"));
+    }
 
     let gemv = hipfire_runtime::llama::gemv_family();
     let ctx = DispatchCtx::new(gpu);
