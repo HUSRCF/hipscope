@@ -372,6 +372,14 @@ pub trait ForwardBindings {
         false
     }
 
+    /// Whether this architecture opts into the deterministic four-rank
+    /// root-peer all-reduce on gfx90a by default. The environment policy in
+    /// the EP executor may still force either collective for experiments and
+    /// regression bisects.
+    fn supports_moe_ep_root_peer_allreduce(&self) -> bool {
+        false
+    }
+
     /// Run the MoE prefix through router, gate/up, activation and rotation,
     /// stopping before the routed down projection.
     fn run_moe_ep_prepare(

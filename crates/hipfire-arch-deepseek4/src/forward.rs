@@ -2522,6 +2522,10 @@ fn ep_trace_moe_i32(
 }
 
 impl<'a> ForwardBindings for Deepseek4Bindings<'a> {
+    fn supports_moe_ep_root_peer_allreduce(&self) -> bool {
+        true
+    }
+
     fn run_attend(
         &mut self,
         gpu: &mut Gpu,

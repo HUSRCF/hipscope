@@ -182,11 +182,12 @@ pub fn run_layer_program_ep<B: ForwardBindings>(
                     )?;
                 }
 
-                // 3. All-reduce-sum the partials across ranks in place. Two-rank
-                //    gfx90a EP defaults to peer-direct after a byte-identical
-                //    32-token DeepSeek V4 A/B showed a decode win together with HIP
-                //    Graph. Other configurations retain RCCL; the environment
-                //    variable explicitly forces either path for regression bisects.
+                // 3. All-reduce-sum the partials across ranks in place. gfx90a
+                //    uses peer paths for the latency-sensitive decode payload:
+                //    two ranks use the legacy all-to-all path, while four ranks
+                //    use ordered root reduction + byte-identical broadcast.
+                //    Other configurations retain RCCL. Both peer paths have
+                //    explicit environment kill switches for regression bisects.
                 static COARSE_PROBE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
                 let coarse_probe = *COARSE_PROBE.get_or_init(|| {
                     hipfire_config::developer_var("HIPFIRE_EP_COARSE_PROBE").as_deref() == Ok("1")
@@ -199,23 +200,50 @@ pub fn run_layer_program_ep<B: ForwardBindings>(
                 }
                 let allreduce_started = std::time::Instant::now();
                 let refs: Vec<&DeviceBuffer> = partials.iter().map(|p| &p.buf).collect();
-                static PEER_DECODE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-                let use_peer = *PEER_DECODE.get_or_init(|| {
-                    match hipfire_config::developer_var("HIPFIRE_EP_PEER_ALLREDUCE_DECODE")
+                static ROOT_PEER_POLICY: std::sync::OnceLock<Option<bool>> =
+                    std::sync::OnceLock::new();
+                let root_peer_policy = *ROOT_PEER_POLICY.get_or_init(|| {
+                    match hipfire_config::developer_var("HIPFIRE_EP_ROOT_PEER_ALLREDUCE_DECODE")
                         .ok()
                         .as_deref()
                     {
-                        Some("1") => true,
-                        Some("0") => false,
-                        _ => n == 2 && gpus.devices.iter().all(|device| device.arch == "gfx90a"),
+                        Some("1") => Some(true),
+                        Some("0") => Some(false),
+                        _ => None,
                     }
                 });
-                if use_peer {
-                    gpus.all_reduce_sum_f32_peer(&refs, residual_dim)
+                let binding_default = bindings
+                    .iter()
+                    .all(ForwardBindings::supports_moe_ep_root_peer_allreduce);
+                let use_root_peer = n == 4
+                    && gpus.devices.iter().all(|device| device.arch == "gfx90a")
+                    && root_peer_policy.unwrap_or(binding_default);
+                if use_root_peer {
+                    gpus.all_reduce_sum_f32_peer_root_async(&refs, residual_dim, 0)
                         .map_err(hip_err)?;
                 } else {
-                    gpus.all_reduce_sum_f32(&refs, residual_dim)
-                        .map_err(hip_err)?;
+                    static PEER_DECODE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                    let use_peer =
+                        *PEER_DECODE.get_or_init(|| {
+                            match hipfire_config::developer_var("HIPFIRE_EP_PEER_ALLREDUCE_DECODE")
+                                .ok()
+                                .as_deref()
+                            {
+                                Some("1") => true,
+                                Some("0") => false,
+                                _ => {
+                                    n == 2
+                                        && gpus.devices.iter().all(|device| device.arch == "gfx90a")
+                                }
+                            }
+                        });
+                    if use_peer {
+                        gpus.all_reduce_sum_f32_peer(&refs, residual_dim)
+                            .map_err(hip_err)?;
+                    } else {
+                        gpus.all_reduce_sum_f32(&refs, residual_dim)
+                            .map_err(hip_err)?;
+                    }
                 }
                 if coarse_probe {
                     for r in 0..n {

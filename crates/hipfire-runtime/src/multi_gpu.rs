@@ -796,6 +796,130 @@ impl Gpus {
         }
         Ok(())
     }
+
+    /// Deterministic async small-message peer all-reduce through one root rank.
+    /// Compute streams publish ready events, per-rank communication streams
+    /// feed root scratch, and one root communication stream performs the
+    /// ordered reduction plus byte-identical broadcast. Every compute stream
+    /// waits for the final broadcast event without a device-wide host sync.
+    pub fn all_reduce_sum_f32_peer_root_async(
+        &mut self,
+        buffers: &[&DeviceBuffer],
+        count: usize,
+        root: usize,
+    ) -> HipResult<()> {
+        let n = self.devices.len();
+        if buffers.len() != n || root >= n {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "all_reduce_sum_f32_peer_root_async: buffers={} ranks={n} root={root}",
+                    buffers.len()
+                ),
+            ));
+        }
+        if n == 1 {
+            return Ok(());
+        }
+        let bytes = count * std::mem::size_of::<f32>();
+        self.ensure_peer_ar_tmp(bytes)?;
+        self.ensure_ep_comm_streams()?;
+
+        let mut ready = Vec::with_capacity(n);
+        for rank in 0..n {
+            self.devices[rank].bind_thread()?;
+            let event = self.devices[rank].hip.event_create()?;
+            self.devices[rank]
+                .hip
+                .event_record(&event, self.devices[rank].active_stream.as_ref())?;
+            ready.push(event);
+        }
+
+        let root_device = self.devices[root].device_id;
+        let mut copied = Vec::with_capacity(n - 1);
+        let mut slot = 0usize;
+        for rank in 0..n {
+            if rank == root {
+                continue;
+            }
+            self.devices[rank].bind_thread()?;
+            let stream = &self.ep_comm_streams[rank];
+            self.devices[rank]
+                .hip
+                .stream_wait_event(stream, &ready[rank])?;
+            self.devices[rank].hip.memcpy_peer_async(
+                &self.peer_ar_tmp[root][slot],
+                root_device,
+                buffers[rank],
+                self.devices[rank].device_id,
+                bytes,
+                stream,
+            )?;
+            let event = self.devices[rank].hip.event_create()?;
+            self.devices[rank].hip.event_record(&event, Some(stream))?;
+            copied.push((rank, event));
+            slot += 1;
+        }
+
+        self.devices[root].bind_thread()?;
+        let root_stream = &self.ep_comm_streams[root];
+        self.devices[root]
+            .hip
+            .stream_wait_event(root_stream, &ready[root])?;
+        for (_, event) in &copied {
+            self.devices[root]
+                .hip
+                .stream_wait_event(root_stream, event)?;
+        }
+        let dst = GpuTensor {
+            buf: unsafe { buffers[root].alias() },
+            shape: vec![count],
+            dtype: DType::F32,
+        };
+        for slot in 0..n - 1 {
+            let src = GpuTensor {
+                buf: unsafe { self.peer_ar_tmp[root][slot].alias() },
+                shape: vec![count],
+                dtype: DType::F32,
+            };
+            self.devices[root].add_inplace_f32_on_stream(&dst, &src, root_stream)?;
+        }
+        for rank in 0..n {
+            if rank != root {
+                self.devices[root].hip.memcpy_peer_async(
+                    buffers[rank],
+                    self.devices[rank].device_id,
+                    buffers[root],
+                    root_device,
+                    bytes,
+                    root_stream,
+                )?;
+            }
+        }
+        let done = self.devices[root].hip.event_create()?;
+        self.devices[root]
+            .hip
+            .event_record(&done, Some(root_stream))?;
+        for rank in 0..n {
+            self.devices[rank].bind_thread()?;
+            let compute = self.devices[rank].active_stream.as_ref().ok_or_else(|| {
+                HipError::new(0, "peer_root_async requires active compute streams")
+            })?;
+            self.devices[rank].hip.stream_wait_event(compute, &done)?;
+        }
+
+        for (rank, event) in ready.into_iter().enumerate() {
+            self.devices[rank].bind_thread()?;
+            self.devices[rank].hip.event_destroy(event)?;
+        }
+        for (rank, event) in copied {
+            self.devices[rank].bind_thread()?;
+            self.devices[rank].hip.event_destroy(event)?;
+        }
+        self.devices[root].bind_thread()?;
+        self.devices[root].hip.event_destroy(done)?;
+        Ok(())
+    }
 }
 
 fn uniform_split_counts(n_devices: usize, n_layers: usize) -> Vec<usize> {
