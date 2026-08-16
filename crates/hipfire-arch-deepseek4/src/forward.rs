@@ -10941,18 +10941,31 @@ pub fn dspark_forward(
     // Embed each block id into pbs.embed_batch rows, then broadcast → streams.
     {
         let pbs = state.dspark_pbs.as_ref().unwrap();
-        // Embed the block ids via the SAME proven batched kernel the AR/prefill
-        // path uses (the per-token embedding_lookup_q8 produced garbage). Upload
-        // ids → pbs.tokens (i32-in-F32 slots), then batched lookup → embed_batch.
-        // Called unconditionally — matches forward_prefill_batch_chunk, which
-        // runs this on weights.token_embd regardless of its dtype enum.
+        // Embed the block ids through the same dtype-aware batched path as
+        // trunk prefill. Official source checkpoints keep token_embd in F16;
+        // quantized HFQ sidecars keep using the established Q8 kernel.
         let tok_host: Vec<i32> = block_ids.iter().map(|&t| t as i32).collect();
         let tok_bytes: &[u8] =
             unsafe { std::slice::from_raw_parts(tok_host.as_ptr() as *const u8, block * 4) };
         gpu.memcpy_htod_auto(&pbs.tokens.buf, tok_bytes)
             .map_err(|e| format!("dspark htod block tokens: {e:?}"))?;
-        gpu.embedding_lookup_q8_batched(token_embd, &pbs.embed_batch, &pbs.tokens, block, hidden)
-            .map_err(|e| format!("dspark embedding_lookup_q8_batched: {e:?}"))?;
+        match token_embd.dtype {
+            DType::F16 => gpu.embedding_lookup_f16_batched(
+                token_embd,
+                &pbs.embed_batch,
+                &pbs.tokens,
+                block,
+                hidden,
+            ),
+            _ => gpu.embedding_lookup_q8_batched(
+                token_embd,
+                &pbs.embed_batch,
+                &pbs.tokens,
+                block,
+                hidden,
+            ),
+        }
+        .map_err(|e| format!("dspark embedding_lookup_batched: {e:?}"))?;
         gpu.hc_streams_init_from_embed_batched(
             &pbs.embed_batch,
             &pbs.streams_batch,
@@ -11213,8 +11226,23 @@ pub fn dspark_run_body_and_hc_gate(
             unsafe { std::slice::from_raw_parts(tok_host.as_ptr() as *const u8, block * 4) };
         gpu.memcpy_htod_auto(&pbs.tokens.buf, tok_bytes)
             .map_err(|e| format!("dspark body htod block tokens: {e:?}"))?;
-        gpu.embedding_lookup_q8_batched(token_embd, &pbs.embed_batch, &pbs.tokens, block, hidden)
-            .map_err(|e| format!("dspark body embedding_lookup_q8_batched: {e:?}"))?;
+        match token_embd.dtype {
+            DType::F16 => gpu.embedding_lookup_f16_batched(
+                token_embd,
+                &pbs.embed_batch,
+                &pbs.tokens,
+                block,
+                hidden,
+            ),
+            _ => gpu.embedding_lookup_q8_batched(
+                token_embd,
+                &pbs.embed_batch,
+                &pbs.tokens,
+                block,
+                hidden,
+            ),
+        }
+        .map_err(|e| format!("dspark body embedding_lookup_batched: {e:?}"))?;
         gpu.hc_streams_init_from_embed_batched(
             &pbs.embed_batch,
             &pbs.streams_batch,
