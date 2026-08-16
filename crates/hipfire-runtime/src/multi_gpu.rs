@@ -825,6 +825,180 @@ impl Gpus {
         self.reduce_sum_f32_peer_root_async_impl(partials, Some(final_outputs), count, root)
     }
 
+    /// Gather one equally-sized chunk from every rank into distinct root
+    /// destinations. This is a concat, not a reduction: callers provide the
+    /// already-offset destination buffers on the root rank.
+    pub fn gather_equal_chunks_peer_root_async(
+        &mut self,
+        chunks: &[&DeviceBuffer],
+        root_chunks: &[&DeviceBuffer],
+        bytes: usize,
+        root: usize,
+    ) -> HipResult<()> {
+        let n = self.devices.len();
+        if chunks.len() != n || root_chunks.len() != n || root >= n {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "gather_equal_chunks_peer_root_async: chunks={} root_chunks={} ranks={n} root={root}",
+                    chunks.len(),
+                    root_chunks.len(),
+                ),
+            ));
+        }
+        if n == 1 {
+            return Ok(());
+        }
+        self.ensure_ep_comm_streams()?;
+
+        let root_device = self.devices[root].device_id;
+        self.devices[root].bind_thread()?;
+        if chunks[root].as_ptr() != root_chunks[root].as_ptr() {
+            let compute = self.devices[root].active_stream.as_ref().ok_or_else(|| {
+                HipError::new(
+                    0,
+                    "attention TP gather requires an active root compute stream",
+                )
+            })?;
+            self.devices[root].hip.memcpy_dtod_async_at(
+                root_chunks[root],
+                0,
+                chunks[root],
+                0,
+                bytes,
+                compute,
+            )?;
+        }
+        let mut copied = Vec::with_capacity(n - 1);
+        for rank in 0..n {
+            if rank == root {
+                continue;
+            }
+            self.devices[rank].bind_thread()?;
+            let compute = self.devices[rank].active_stream.as_ref().ok_or_else(|| {
+                HipError::new(0, "attention TP gather requires active compute streams")
+            })?;
+            let ready = self.devices[rank].hip.event_create()?;
+            self.devices[rank].hip.event_record(&ready, Some(compute))?;
+            let stream = &self.ep_comm_streams[rank];
+            self.devices[rank].hip.stream_wait_event(stream, &ready)?;
+            self.devices[rank].hip.memcpy_peer_async(
+                root_chunks[rank],
+                root_device,
+                chunks[rank],
+                self.devices[rank].device_id,
+                bytes,
+                stream,
+            )?;
+            let done = self.devices[rank].hip.event_create()?;
+            self.devices[rank].hip.event_record(&done, Some(stream))?;
+            self.devices[rank].hip.stream_wait_event(compute, &done)?;
+            copied.push((rank, ready, done));
+        }
+
+        self.devices[root].bind_thread()?;
+        let root_compute = self.devices[root].active_stream.as_ref().ok_or_else(|| {
+            HipError::new(
+                0,
+                "attention TP gather requires an active root compute stream",
+            )
+        })?;
+        for (_, _, done) in &copied {
+            self.devices[root]
+                .hip
+                .stream_wait_event(root_compute, done)?;
+        }
+        for (rank, ready, done) in copied {
+            self.devices[rank].bind_thread()?;
+            self.devices[rank].hip.event_destroy(ready)?;
+            self.devices[rank].hip.event_destroy(done)?;
+        }
+        Ok(())
+    }
+
+    /// Broadcast one root buffer to matching per-rank destinations. Each
+    /// compute stream resumes after its own copy; root waits for every reader
+    /// before it may reuse the source.
+    pub fn broadcast_peer_root_async(
+        &mut self,
+        source: &DeviceBuffer,
+        destinations: &[&DeviceBuffer],
+        bytes: usize,
+        root: usize,
+    ) -> HipResult<()> {
+        let n = self.devices.len();
+        if destinations.len() != n || root >= n {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "broadcast_peer_root_async: destinations={} ranks={n} root={root}",
+                    destinations.len(),
+                ),
+            ));
+        }
+        if n == 1 {
+            return Ok(());
+        }
+        self.ensure_ep_comm_streams()?;
+
+        self.devices[root].bind_thread()?;
+        let root_compute = self.devices[root].active_stream.as_ref().ok_or_else(|| {
+            HipError::new(
+                0,
+                "attention TP broadcast requires an active root compute stream",
+            )
+        })?;
+        let ready = self.devices[root].hip.event_create()?;
+        self.devices[root]
+            .hip
+            .event_record(&ready, Some(root_compute))?;
+        let root_device = self.devices[root].device_id;
+
+        let mut copied = Vec::with_capacity(n - 1);
+        for rank in 0..n {
+            if rank == root {
+                continue;
+            }
+            self.devices[rank].bind_thread()?;
+            let stream = &self.ep_comm_streams[rank];
+            self.devices[rank].hip.stream_wait_event(stream, &ready)?;
+            self.devices[rank].hip.memcpy_peer_async(
+                destinations[rank],
+                self.devices[rank].device_id,
+                source,
+                root_device,
+                bytes,
+                stream,
+            )?;
+            let done = self.devices[rank].hip.event_create()?;
+            self.devices[rank].hip.event_record(&done, Some(stream))?;
+            let compute = self.devices[rank].active_stream.as_ref().ok_or_else(|| {
+                HipError::new(0, "attention TP broadcast requires active compute streams")
+            })?;
+            self.devices[rank].hip.stream_wait_event(compute, &done)?;
+            copied.push((rank, done));
+        }
+
+        self.devices[root].bind_thread()?;
+        let root_compute = self.devices[root].active_stream.as_ref().ok_or_else(|| {
+            HipError::new(
+                0,
+                "attention TP broadcast requires an active root compute stream",
+            )
+        })?;
+        for (_, done) in &copied {
+            self.devices[root]
+                .hip
+                .stream_wait_event(root_compute, done)?;
+        }
+        self.devices[root].hip.event_destroy(ready)?;
+        for (rank, done) in copied {
+            self.devices[rank].bind_thread()?;
+            self.devices[rank].hip.event_destroy(done)?;
+        }
+        Ok(())
+    }
+
     fn reduce_sum_f32_peer_root_async_impl(
         &mut self,
         buffers: &[&DeviceBuffer],

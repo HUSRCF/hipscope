@@ -10,6 +10,7 @@ use hipfire_runtime::multi_gpu::Gpus;
 use std::time::Instant;
 
 const COUNT: usize = 4096;
+const ATTN_TP_CHUNK_COUNT: usize = 2048;
 const WARMUP: usize = 20;
 const ITERS: usize = 200;
 
@@ -43,6 +44,21 @@ fn download(gpus: &mut Gpus, rank: usize, buffer: &DeviceBuffer) -> Vec<f32> {
         .hip
         .memcpy_dtoh(&mut bytes, buffer)
         .expect("download");
+    bytes
+        .chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+        .collect()
+}
+
+fn download_count(gpus: &mut Gpus, rank: usize, buffer: &DeviceBuffer, count: usize) -> Vec<f32> {
+    let mut bytes = vec![0u8; count * std::mem::size_of::<f32>()];
+    gpus.devices[rank]
+        .bind_thread()
+        .expect("bind download count");
+    gpus.devices[rank]
+        .hip
+        .memcpy_dtoh(&mut bytes, buffer)
+        .expect("download count");
     bytes
         .chunks_exact(4)
         .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
@@ -240,6 +256,102 @@ fn measure(gpus: &mut Gpus, buffers: &[DeviceBuffer], mode: &str) -> (f64, f64, 
     )
 }
 
+fn measure_attention_tp_comm(gpus: &mut Gpus) -> (f64, f64, f64) {
+    let chunk_bytes = ATTN_TP_CHUNK_COUNT * std::mem::size_of::<f32>();
+    let output_bytes = COUNT * std::mem::size_of::<f32>();
+    let mut local_chunks = Vec::with_capacity(4);
+    let mut root_chunks = Vec::with_capacity(4);
+    let mut outputs = Vec::with_capacity(4);
+    for rank in 0..4 {
+        gpus.devices[rank]
+            .bind_thread()
+            .expect("bind attention TP alloc");
+        local_chunks.push(
+            gpus.devices[rank]
+                .hip
+                .malloc(chunk_bytes)
+                .expect("malloc local chunk"),
+        );
+        outputs.push(
+            gpus.devices[rank]
+                .hip
+                .malloc(output_bytes)
+                .expect("malloc output"),
+        );
+    }
+    root_chunks.push(unsafe { local_chunks[0].alias() });
+    for _ in 1..4 {
+        gpus.devices[0]
+            .bind_thread()
+            .expect("bind root chunk alloc");
+        root_chunks.push(
+            gpus.devices[0]
+                .hip
+                .malloc(chunk_bytes)
+                .expect("malloc root chunk"),
+        );
+    }
+    let local_refs: Vec<&DeviceBuffer> = local_chunks.iter().collect();
+    let root_refs: Vec<&DeviceBuffer> = root_chunks.iter().collect();
+    let output_refs: Vec<&DeviceBuffer> = outputs.iter().collect();
+
+    let chunk_values: Vec<Vec<f32>> = (0..4)
+        .map(|rank| {
+            (0..ATTN_TP_CHUNK_COUNT)
+                .map(|i| rank as f32 * 10000.0 + i as f32)
+                .collect()
+        })
+        .collect();
+    let output_values: Vec<f32> = (0..COUNT).map(|i| i as f32 * 0.125 - 17.0).collect();
+    for rank in 0..4 {
+        upload(gpus, rank, &local_chunks[rank], &chunk_values[rank]);
+    }
+    upload(gpus, 0, &outputs[0], &output_values);
+    gpus.gather_equal_chunks_peer_root_async(&local_refs, &root_refs, chunk_bytes, 0)
+        .expect("attention TP gather oracle");
+    gpus.broadcast_peer_root_async(&outputs[0], &output_refs, output_bytes, 0)
+        .expect("attention TP broadcast oracle");
+    sync_all(gpus);
+    for rank in 0..4 {
+        assert_eq!(
+            download_count(gpus, 0, &root_chunks[rank], ATTN_TP_CHUNK_COUNT),
+            chunk_values[rank],
+            "attention TP gathered chunk {rank}",
+        );
+        assert_eq!(
+            download(gpus, rank, &outputs[rank]),
+            output_values,
+            "attention TP broadcast rank {rank}",
+        );
+    }
+    println!("oracle attention-tp-gather-broadcast-bit-exact=true");
+
+    for _ in 0..WARMUP {
+        gpus.gather_equal_chunks_peer_root_async(&local_refs, &root_refs, chunk_bytes, 0)
+            .expect("attention TP gather warmup");
+        gpus.broadcast_peer_root_async(&outputs[0], &output_refs, output_bytes, 0)
+            .expect("attention TP broadcast warmup");
+        sync_all(gpus);
+    }
+
+    let mut samples = Vec::with_capacity(ITERS);
+    for _ in 0..ITERS {
+        let started = Instant::now();
+        gpus.gather_equal_chunks_peer_root_async(&local_refs, &root_refs, chunk_bytes, 0)
+            .expect("attention TP gather");
+        gpus.broadcast_peer_root_async(&outputs[0], &output_refs, output_bytes, 0)
+            .expect("attention TP broadcast");
+        sync_all(gpus);
+        samples.push(started.elapsed().as_secs_f64() * 1.0e6);
+    }
+    samples.sort_by(f64::total_cmp);
+    (
+        samples[ITERS / 2],
+        samples[ITERS / 10],
+        samples[ITERS * 9 / 10],
+    )
+}
+
 fn main() {
     let mut gpus = Gpus::init_uniform(4, 4).expect("init four ranks");
     assert!(
@@ -266,6 +378,7 @@ fn main() {
     let rccl = measure(&mut gpus, &buffers, "rccl");
     let peer = measure(&mut gpus, &buffers, "peer");
     let async_root = measure(&mut gpus, &buffers, "async");
+    let attention_tp = measure_attention_tp_comm(&mut gpus);
     println!("payload={} bytes ranks=4", bytes);
     println!(
         "rccl median={:.3} us p10={:.3} p90={:.3}",
@@ -284,5 +397,14 @@ fn main() {
         async_root.1,
         async_root.2,
         rccl.0 / async_root.0
+    );
+    println!(
+        "attention-tp gather={}x{} bytes broadcast={} bytes median={:.3} us p10={:.3} p90={:.3}",
+        4,
+        ATTN_TP_CHUNK_COUNT * std::mem::size_of::<f32>(),
+        COUNT * std::mem::size_of::<f32>(),
+        attention_tp.0,
+        attention_tp.1,
+        attention_tp.2,
     );
 }
