@@ -348,6 +348,7 @@ the prefill MMQ redesign log is at
 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | Engine layout, dispatch, two model paths |
 | [QUANTIZATION.md](docs/QUANTIZATION.md) | MQ4 / HF4 design, asym KV cache, FWHT math |
 | [CONTAINER.md](docs/CONTAINER.md) | Runtime and GPU gate-runner containers |
+| [CK_SIDECAR_DEPLOYMENT.md](docs/CK_SIDECAR_DEPLOYMENT.md) | Optional gfx11 CK prefill preview: build, deploy, verify, and migrate |
 | [multi-gpu.md](docs/multi-gpu.md) | Pipeline-parallel (pp≥2) — memory budget, deployment, refusals |
 | [methodology/perf-benchmarking.md](docs/methodology/perf-benchmarking.md) | Bench protocol — read before claiming a perf win |
 | [HIPFIRE-GRAFT.md](crates/redline-dispatch/HIPFIRE-GRAFT.md) | Redline integration and enablement boundary |
