@@ -23,6 +23,8 @@ PREFILL_COLOR = "#087E8B"
 PREFILL_POINT_COLOR = "#78BEC7"
 DECODE_COLOR = "#D1495B"
 DECODE_POINT_COLOR = "#E9A0AA"
+CAPACITY_COLOR = "#6F5AA8"
+CAPACITY_POINT_COLOR = "#B6AAD4"
 JITTER = np.array([-0.12, -0.06, 0.0, 0.06, 0.12])
 
 
@@ -73,13 +75,16 @@ def save_figure(fig: plt.Figure, output_dir: Path, stem: str) -> None:
 
 
 def plot_prefill(data: pd.DataFrame, output_dir: Path) -> None:
-    data = data[data["workload"] == "prefill"].copy()
-    token_counts = np.sort(data["prefill_tokens"].unique())
-    summary = data.groupby("prefill_tokens", sort=True)["prefill_tok_s"].median()
+    prefill = data[data["workload"] == "prefill"].copy()
+    capacity = data[data["workload"] == "capacity"].copy()
+    token_counts = np.sort(prefill["prefill_tokens"].unique())
+    summary = prefill.groupby("prefill_tokens", sort=True)["prefill_tok_s"].median()
 
     fig, ax = plt.subplots(figsize=(3.45, 2.55))
     for x in token_counts:
-        samples = data.loc[data["prefill_tokens"] == x, "prefill_tok_s"].to_numpy()
+        samples = prefill.loc[
+            prefill["prefill_tokens"] == x, "prefill_tok_s"
+        ].to_numpy()
         x_jittered = x * np.power(2.0, JITTER[: len(samples)])
         ax.scatter(
             x_jittered,
@@ -123,6 +128,61 @@ def plot_prefill(data: pd.DataFrame, output_dir: Path) -> None:
     ax.set_xlabel("Prompt length (tokens)")
     ax.set_ylabel("Prefill throughput (tokens/s)")
     finish_axes(ax)
+
+    capacities = np.sort(capacity["kv_seq"].astype(int).unique())
+    capacity_positions = np.arange(len(capacities), dtype=float)
+    capacity_summary = capacity.groupby("kv_seq")["prefill_tok_s"].median()
+    inset = ax.inset_axes((0.57, 0.17, 0.39, 0.34))
+    for position, kv_capacity in zip(capacity_positions, capacities):
+        samples = capacity.loc[
+            capacity["kv_seq"].astype(int) == kv_capacity, "prefill_tok_s"
+        ].to_numpy()
+        inset.scatter(
+            position + JITTER[: len(samples)] * 0.65,
+            samples,
+            s=10,
+            color=CAPACITY_POINT_COLOR,
+            alpha=0.75,
+            linewidth=0,
+            zorder=2,
+        )
+
+    capacity_medians = np.array(
+        [capacity_summary.loc[str(value)] for value in capacities]
+    )
+    inset.plot(
+        capacity_positions,
+        capacity_medians,
+        color=CAPACITY_COLOR,
+        linewidth=1.25,
+        marker="D",
+        markersize=3.8,
+        markeredgecolor="white",
+        markeredgewidth=0.6,
+        zorder=3,
+    )
+    inset.set_xticks(capacity_positions)
+    inset.set_xticklabels([f"{value // 1024}K" for value in capacities], fontsize=6.5)
+    inset.set_yticks([1240, 1280])
+    inset.set_ylim(1225, 1292)
+    inset.set_xlabel("Allocated KV capacity", fontsize=6.7, labelpad=2)
+    inset.set_ylabel("tokens/s", fontsize=6.7, labelpad=1)
+    inset.text(
+        0.02,
+        0.96,
+        "PP2048",
+        transform=inset.transAxes,
+        ha="left",
+        va="top",
+        fontsize=6.8,
+        color=CAPACITY_COLOR,
+    )
+    inset.tick_params(axis="both", labelsize=6.3, width=0.6, length=2.5, pad=1.5)
+    for spine in ("left", "bottom"):
+        inset.spines[spine].set_linewidth(0.65)
+        inset.spines[spine].set_color("#4A4A4A")
+    sns.despine(ax=inset, top=True, right=True, left=False, bottom=False)
+    inset.grid(False)
     save_figure(fig, output_dir, "qwen38_prefill_scaling")
 
 
