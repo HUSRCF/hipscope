@@ -189,4 +189,3 @@ unset HIPFIRE_FLASH_ATTN_CK_QUANTIZED_LIB
 To return fully to the default build, rebuild the daemon without the optional
 feature. Generated sidecars and CK sources are ignored build artifacts and
 can be removed independently of the repository history.
-
