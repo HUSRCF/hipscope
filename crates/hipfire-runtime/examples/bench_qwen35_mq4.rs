@@ -47,7 +47,7 @@ fn main() {
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: bench_qwen35_mq4 <model.hfq> [--prefill N] [--prefill-runs N] [--gen N] [--warmup N] [--prompt-file FILE] [--emit-atlas <path.jsonl>]");
+        eprintln!("Usage: bench_qwen35_mq4 <model.hfq> [--prefill N] [--prefill-runs N] [--gen N] [--warmup N] [--kv-seq N] [--prompt-file FILE] [--emit-atlas <path.jsonl>]");
         std::process::exit(1);
     }
     let model_path = &args[1];
@@ -57,6 +57,7 @@ fn main() {
     let mut prefill_runs: usize = 1;
     let mut gen_len: usize = 100;
     let mut warmup_len: usize = 5;
+    let mut kv_seq_override: Option<usize> = None;
     let mut prompt_file: Option<String> = None;
     // Optional kernel-atlas emission: when set, write one typed AtlasRow
     // per timed phase (prefill, decode_ar) to this JSONL file. Replaces
@@ -79,6 +80,10 @@ fn main() {
             }
             "--warmup" => {
                 warmup_len = args[i + 1].parse().unwrap();
+                i += 2;
+            }
+            "--kv-seq" => {
+                kv_seq_override = Some(args[i + 1].parse().unwrap());
                 i += 2;
             }
             "--emit-atlas" => {
@@ -115,7 +120,12 @@ fn main() {
 
     eprintln!("=== bench_qwen35_mq4 ===");
     eprintln!("Model: {model_path}");
-    eprintln!("Phases: prefill={prefill_len} prefill_runs={prefill_runs} warmup={warmup_len} gen={gen_len}");
+    eprintln!(
+        "Phases: prefill={prefill_len} prefill_runs={prefill_runs} warmup={warmup_len} gen={gen_len} kv_seq={}",
+        kv_seq_override
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "auto".to_string())
+    );
 
     let model_path_buf = Path::new(model_path);
     let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
@@ -204,7 +214,12 @@ fn main() {
         };
     eprintln!("Weights loaded in {:.2}s", t_load.elapsed().as_secs_f64());
 
-    let kv_seq = (prefill_len + warmup_len + gen_len + 16).max(512);
+    let min_kv_seq = (prefill_len + warmup_len + gen_len + 16).max(512);
+    let kv_seq = kv_seq_override.unwrap_or(min_kv_seq);
+    assert!(
+        kv_seq >= min_kv_seq,
+        "--kv-seq {kv_seq} is too small: need at least {min_kv_seq} for prefill + warmup + gen + guard"
+    );
     // KV cache mode via resolved TOML policy:
     //   q8 (default) | asym4 | asym3 | asym2
     let kv_mode = match hipfire_runtime::config::get().kv_mode.as_str() {

@@ -397,6 +397,69 @@ export HIPFIRE_RDNA3_Q8_GROUP256_GATE_UP=0
 HIP_VISIBLE_DEVICES=0 ./target/release/examples/daemon
 ```
 
+For an OpenAI-compatible Qwen3.8-27B AR service with every validated gfx11
+prefill and packed-MQ4 route enabled, launch the native CLI with the same
+production variables. This example reserves a 262144-token logical context,
+uses contiguous Asym3-K/Q8-V storage, and explicitly disables every
+speculative route so a sibling `.mtp` file cannot change decode semantics.
+
+```bash
+cargo build --release --locked -p hipfire-cli
+
+./target/release/hipfire config set memory.max_seq 262144
+./target/release/hipfire config set speculation.mode off
+
+env \
+  HIP_VISIBLE_DEVICES=0 \
+  HIPFIRE_FLASH_ATTN_CK_QUANTIZED_LIB="$PWD/experiments/flash-attn-ck-sidecar/quantized/build/libhipfire_flash_attn_ck_quantized_staged.so" \
+  HIPFIRE_KV_MODE=asym3 \
+  HIPFIRE_SPECULATION=off \
+  HIPFIRE_DFLASH_MODE=off \
+  HIPFIRE_MTP_MODE=off \
+  HIPFIRE_GRAPH=0 \
+  HIPFIRE_PREFILL_MAX_BATCH=2048 \
+  HIPFIRE_FLASH_PARTIALS_BATCH=32 \
+  HIPFIRE_QKVZA_SPLIT_TAIL=1 \
+  HIPFIRE_RDNA3_HFQ4_GATE_UP_X256Y64=1 \
+  HIPFIRE_RDNA3_HFQ4_RESIDUAL_X256Y64=1 \
+  HIPFIRE_RDNA3_HFQ4_AUX_X256Y64=1 \
+  HIPFIRE_RDNA3_HFQ4_PERM_NIBBLE=1 \
+  HIPFIRE_RDNA3_Q8_GROUP128=1 \
+  HIPFIRE_RDNA3_Q8_GROUP128_ROW2=1 \
+  HIPFIRE_RDNA3_Q8_GROUP128_QUAD_ROW_WEIGHT=1 \
+  HIPFIRE_RDNA3_FUSED_SWIGLU_Q8_GROUP128=1 \
+  HIPFIRE_RDNA3_FFN_F16_INTERMEDIATE=1 \
+  HIPFIRE_RDNA3_Q8_GROUP256_SERIAL_ROW=1 \
+  HIPFIRE_RDNA3_Q8_GROUP256_GATE_UP=0 \
+  ./target/release/hipfire serve \
+    --model qwen3.8:27b \
+    --kv-mode asym3 \
+    --kv-backend contiguous \
+    0.0.0.0:11435
+```
+
+This is the pure AR configuration. The two `config set` commands persist in
+the normal hipfire config and preserve the existing model registry. Reset
+them with `hipfire config reset memory.max_seq` and
+`hipfire config reset speculation.mode` when this service profile is no
+longer needed. Remove the three speculation-off environment settings only
+when deliberately benchmarking a compatible draft or MTP sidecar.
+
+The retained Qwen3.8 AR matrix measures five steady-state samples per point:
+PP64/256/1024/2048/4096/8192, PP2048 with 64K/128K/192K allocated KV
+capacity, and 4096-token AR decode beginning near 0/64K/128K/192K context.
+Each prefill point executes one additional unreported warmup pass.
+
+```bash
+GPU_ID=1 \
+TRIALS=5 \
+DECODE_TOKENS=4096 \
+COOL_SECS=10 \
+MODEL="$HOME/.hipfire/models/qwen3.8-27b.mq4" \
+HIPFIRE_FLASH_ATTN_CK_QUANTIZED_LIB="$PWD/experiments/flash-attn-ck-sidecar/quantized/build/libhipfire_flash_attn_ck_quantized_staged.so" \
+  ./scripts/bench_qwen38_fullopt_ar_matrix.sh
+```
+
 On the first admitted prefill call, stderr must include both messages:
 
 ```text
