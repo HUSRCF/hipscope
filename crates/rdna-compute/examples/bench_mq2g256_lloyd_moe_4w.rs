@@ -19,16 +19,51 @@ use std::time::Instant;
 
 const WARMUP: usize = 4;
 const TRIALS: usize = 30;
-const ATOL:   f32   = 1e-2;
-const RTOL:   f32   = 1e-2;
+const ATOL: f32 = 1e-2;
+const RTOL: f32 = 1e-2;
+
+fn median(values: &[f64]) -> f64 {
+    let mut sorted = values.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    sorted[sorted.len() / 2]
+}
+
+/// Synthetic retained MQ4-G256 storage: fp32 scale/zero followed by 256
+/// packed 4-bit values per group. This matches the execution-format control
+/// used by the other MQ4-v2 admission benchmarks.
+fn synth_mq4(m: usize, k: usize, seed: u64) -> Vec<u8> {
+    let groups = k / 256;
+    let mut out = vec![0u8; m * groups * 136];
+    let mut state = seed;
+    for row in 0..m {
+        for group in 0..groups {
+            let off = (row * groups + group) * 136;
+            let scale = 0.005 + ((row * 17 + group * 13) % 97) as f32 * 0.00005;
+            let zero = ((row * 7 + group * 11) % 31) as f32 * 0.001 - 0.015;
+            out[off..off + 4].copy_from_slice(&scale.to_le_bytes());
+            out[off + 4..off + 8].copy_from_slice(&zero.to_le_bytes());
+            for packed in &mut out[off + 8..off + 136] {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                *packed = (state >> 32) as u8;
+            }
+        }
+    }
+    out
+}
 
 fn f32_to_f16_bits(v: f32) -> u16 {
     let bits = v.to_bits();
     let sign = ((bits >> 16) & 0x8000) as u16;
-    let exp  = (((bits >> 23) & 0xff) as i32) - 127 + 15;
+    let exp = (((bits >> 23) & 0xff) as i32) - 127 + 15;
     let mant = (bits & 0x7fffff) as u32;
-    if exp <= 0  { return sign; }
-    if exp >= 31 { return sign | 0x7c00; }
+    if exp <= 0 {
+        return sign;
+    }
+    if exp >= 31 {
+        return sign | 0x7c00;
+    }
     sign | ((exp as u16) << 10) | ((mant >> 13) as u16)
 }
 
@@ -40,7 +75,12 @@ fn f32_to_f16_bytes(f: &[f32]) -> Vec<u8> {
     out
 }
 
-fn wrap_buf(raw_ptr: *mut std::ffi::c_void, bytes: usize, shape: Vec<usize>, dtype: DType) -> GpuTensor {
+fn wrap_buf(
+    raw_ptr: *mut std::ffi::c_void,
+    bytes: usize,
+    shape: Vec<usize>,
+    dtype: DType,
+) -> GpuTensor {
     GpuTensor {
         buf: unsafe { hip_bridge::DeviceBuffer::from_raw(raw_ptr, bytes) },
         shape,
@@ -66,7 +106,9 @@ fn quantize_mq2_lloyd(k: usize, rows: usize, seed: u64) -> Vec<u8> {
             for _ in 0..64 {
                 let mut byte = 0u8;
                 for nibble in 0..4 {
-                    rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    rng = rng
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
                     let idx = ((rng >> 48) & 0x3) as u8;
                     byte |= idx << (nibble * 2);
                 }
@@ -81,21 +123,32 @@ fn main() {
     let mut gpu = Gpu::init().expect("gpu init");
     println!("Arch: {}", gpu.arch);
 
-    // V4F MoE config: top_k = 6.
-    const TOP_K: usize = 6;
+    // Keep the original V4F MoE matrix as the default. The dense probe is an
+    // optimistic execution-format screen for Qwen3.6 FFN shapes: one expert
+    // and one routed slot per token make the grouped kernel equivalent to a
+    // dense projection without adding a second benchmark implementation.
+    let dense_ffn_probe = std::env::var("HIPFIRE_MQ2_DENSE_FFN_PROBE").as_deref() == Ok("1");
+    let top_k = if dense_ffn_probe { 1 } else { 6 };
 
     // (M, K, batch, label) — batch is PP_BATCH; m_total = batch × TOP_K.
-    let shapes: &[(usize, usize, usize, &str)] = &[
-        (2048, 4096, 128,  "gate/up B=128"),
-        (2048, 4096, 256,  "gate/up B=256"),
-        (2048, 4096, 1024, "gate/up B=1024 (V4F prefill default)"),
-        (4096, 2048, 128,  "down B=128"),
-        (4096, 2048, 256,  "down B=256"),
-        (4096, 2048, 1024, "down B=1024 (V4F prefill default)"),
-    ];
+    let shapes: Vec<(usize, usize, usize, &str)> = if dense_ffn_probe {
+        vec![
+            (17408, 5120, 2048, "Qwen3.6 dense gate/up"),
+            (5120, 17408, 2048, "Qwen3.6 dense down"),
+        ]
+    } else {
+        vec![
+            (2048, 4096, 128, "gate/up B=128"),
+            (2048, 4096, 256, "gate/up B=256"),
+            (2048, 4096, 1024, "gate/up B=1024 (V4F prefill default)"),
+            (4096, 2048, 128, "down B=128"),
+            (4096, 2048, 256, "down B=256"),
+            (4096, 2048, 1024, "down B=1024 (V4F prefill default)"),
+        ]
+    };
 
-    for &(m, k, batch, label) in shapes {
-        let m_total = batch * TOP_K;
+    for &(m, k, batch, label) in &shapes {
+        let m_total = batch * top_k;
         println!("\n=== {label} | M={m} K={k} batch={batch} m_total={m_total} ===");
         if m % 64 != 0 {
             println!("  SKIP — 4w kernel requires M%64==0 (got M={m})");
@@ -122,7 +175,8 @@ fn main() {
         let w_gpu = gpu.hip.malloc(weight_bytes.len()).expect("malloc W");
         let x_gpu = gpu.hip.malloc(x_f32_bytes.len()).expect("malloc X");
         let yref_gpu = gpu.hip.malloc(m_total * m * 4).expect("malloc Yref");
-        let y4w_gpu  = gpu.hip.malloc(m_total * m * 4).expect("malloc Y4w");
+        let y4w_gpu = gpu.hip.malloc(m_total * m * 4).expect("malloc Y4w");
+        let ymmq_gpu = gpu.hip.malloc(m_total * m * 4).expect("malloc Ymmq");
         gpu.hip.memcpy_htod(&w_gpu, &weight_bytes).expect("htod W");
         gpu.hip.memcpy_htod(&x_gpu, &x_f32_bytes).expect("htod X");
 
@@ -138,7 +192,9 @@ fn main() {
             .flat_map(|_| 0i32.to_le_bytes().to_vec())
             .collect();
         let tp_gpu = gpu.hip.malloc(tile_ids_bytes.len()).expect("malloc TP");
-        gpu.hip.memcpy_htod(&tp_gpu, &tile_ids_bytes).expect("htod TP");
+        gpu.hip
+            .memcpy_htod(&tp_gpu, &tile_ids_bytes)
+            .expect("htod TP");
 
         // sorted_slot_index = identity
         let perm_bytes: Vec<u8> = (0..m_total)
@@ -149,44 +205,83 @@ fn main() {
 
         // Wrap as GpuTensor for the dispatch fn.
         let ep_t = wrap_buf(ep_gpu.as_ptr(), 8, vec![1], DType::F32);
-        let tp_t = wrap_buf(tp_gpu.as_ptr(), tile_ids_bytes.len(), vec![slot_tiles], DType::F32);
+        let tp_t = wrap_buf(
+            tp_gpu.as_ptr(),
+            tile_ids_bytes.len(),
+            vec![slot_tiles],
+            DType::F32,
+        );
         let sp_t = wrap_buf(sp_gpu.as_ptr(), perm_bytes.len(), vec![m_total], DType::F32);
-        let x_t  = wrap_buf(x_gpu.as_ptr(),  x_f32_bytes.len(), vec![m_total, k], DType::F32);
-        let yref_t = wrap_buf(yref_gpu.as_ptr(), m_total * m * 4, vec![m_total, m], DType::F32);
-        let y4w_t  = wrap_buf(y4w_gpu.as_ptr(),  m_total * m * 4, vec![m_total, m], DType::F32);
+        let x_t = wrap_buf(
+            x_gpu.as_ptr(),
+            x_f32_bytes.len(),
+            vec![m_total, k],
+            DType::F32,
+        );
+        let yref_t = wrap_buf(
+            yref_gpu.as_ptr(),
+            m_total * m * 4,
+            vec![m_total, m],
+            DType::F32,
+        );
+        let y4w_t = wrap_buf(
+            y4w_gpu.as_ptr(),
+            m_total * m * 4,
+            vec![m_total, m],
+            DType::F32,
+        );
+        let ymmq_t = wrap_buf(
+            ymmq_gpu.as_ptr(),
+            m_total * m * 4,
+            vec![m_total, m],
+            DType::F32,
+        );
 
         // ── Correctness pass: baseline vs 4w, element-wise compare.
         gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_k2(
             &ep_t, &tp_t, &sp_t, &x_t, &yref_t, m, k, 1, m_total, m_total,
-        ).expect("baseline");
+        )
+        .expect("baseline");
         gpu.hip.device_synchronize().expect("sync");
         gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2(
             &ep_t, &tp_t, &sp_t, &x_t, &y4w_t, m, k, 1, m_total, m_total,
-        ).expect("4w");
+        )
+        .expect("4w");
         gpu.hip.device_synchronize().expect("sync");
 
         let mut y_ref_bytes = vec![0u8; m_total * m * 4];
-        let mut y_4w_bytes  = vec![0u8; m_total * m * 4];
-        gpu.hip.memcpy_dtoh(&mut y_ref_bytes, &yref_gpu).expect("dtoh ref");
-        gpu.hip.memcpy_dtoh(&mut y_4w_bytes,  &y4w_gpu).expect("dtoh 4w");
-        let y_ref: &[f32] = unsafe {
-            std::slice::from_raw_parts(y_ref_bytes.as_ptr() as *const f32, m_total * m)
-        };
-        let y_4w: &[f32]  = unsafe {
-            std::slice::from_raw_parts(y_4w_bytes.as_ptr()  as *const f32, m_total * m)
-        };
+        let mut y_4w_bytes = vec![0u8; m_total * m * 4];
+        gpu.hip
+            .memcpy_dtoh(&mut y_ref_bytes, &yref_gpu)
+            .expect("dtoh ref");
+        gpu.hip
+            .memcpy_dtoh(&mut y_4w_bytes, &y4w_gpu)
+            .expect("dtoh 4w");
+        let y_ref: &[f32] =
+            unsafe { std::slice::from_raw_parts(y_ref_bytes.as_ptr() as *const f32, m_total * m) };
+        let y_4w: &[f32] =
+            unsafe { std::slice::from_raw_parts(y_4w_bytes.as_ptr() as *const f32, m_total * m) };
 
         let mut max_abs = 0f32;
         let mut max_rel = 0f32;
         let mut bad = 0usize;
         let mut nan_count = 0usize;
         for i in 0..(m_total * m) {
-            if !y_4w[i].is_finite() { nan_count += 1; continue; }
+            if !y_4w[i].is_finite() {
+                nan_count += 1;
+                continue;
+            }
             let d = (y_ref[i] - y_4w[i]).abs();
             let r = d / y_ref[i].abs().max(1e-6);
-            if d > max_abs { max_abs = d; }
-            if r > max_rel { max_rel = r; }
-            if d > ATOL && r > RTOL { bad += 1; }
+            if d > max_abs {
+                max_abs = d;
+            }
+            if r > max_rel {
+                max_rel = r;
+            }
+            if d > ATOL && r > RTOL {
+                bad += 1;
+            }
         }
         let ok = bad == 0 && nan_count == 0;
         println!(
@@ -196,8 +291,13 @@ fn main() {
         );
         if !ok {
             println!("  ✗ CORRECTNESS FAIL — skipping perf");
-            std::mem::forget(ep_t); std::mem::forget(tp_t); std::mem::forget(sp_t);
-            std::mem::forget(x_t); std::mem::forget(yref_t); std::mem::forget(y4w_t);
+            std::mem::forget(ep_t);
+            std::mem::forget(tp_t);
+            std::mem::forget(sp_t);
+            std::mem::forget(x_t);
+            std::mem::forget(yref_t);
+            std::mem::forget(y4w_t);
+            std::mem::forget(ymmq_t);
             continue;
         }
 
@@ -205,14 +305,16 @@ fn main() {
         for _ in 0..WARMUP {
             gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_k2(
                 &ep_t, &tp_t, &sp_t, &x_t, &yref_t, m, k, 1, m_total, m_total,
-            ).unwrap();
+            )
+            .unwrap();
         }
         gpu.hip.device_synchronize().unwrap();
         let t0 = Instant::now();
         for _ in 0..TRIALS {
             gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_k2(
                 &ep_t, &tp_t, &sp_t, &x_t, &yref_t, m, k, 1, m_total, m_total,
-            ).unwrap();
+            )
+            .unwrap();
         }
         gpu.hip.device_synchronize().unwrap();
         let ref_us = t0.elapsed().as_secs_f64() / TRIALS as f64 * 1e6;
@@ -220,14 +322,16 @@ fn main() {
         for _ in 0..WARMUP {
             gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2(
                 &ep_t, &tp_t, &sp_t, &x_t, &y4w_t, m, k, 1, m_total, m_total,
-            ).unwrap();
+            )
+            .unwrap();
         }
         gpu.hip.device_synchronize().unwrap();
         let t0 = Instant::now();
         for _ in 0..TRIALS {
             gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2(
                 &ep_t, &tp_t, &sp_t, &x_t, &y4w_t, m, k, 1, m_total, m_total,
-            ).unwrap();
+            )
+            .unwrap();
         }
         gpu.hip.device_synchronize().unwrap();
         let new_us = t0.elapsed().as_secs_f64() / TRIALS as f64 * 1e6;
@@ -241,7 +345,141 @@ fn main() {
              4w (64x16):    {new_us:>8.1} µs ({new_gflops:>6.0} GFLOPS)   speedup: {speedup:.2}×"
         );
 
-        std::mem::forget(ep_t); std::mem::forget(tp_t); std::mem::forget(sp_t);
-        std::mem::forget(x_t); std::mem::forget(yref_t); std::mem::forget(y4w_t);
+        if dense_ffn_probe {
+            // Same-process control against the retained gfx11 MQ4 primitive.
+            // Both projections use set mode so this comparison isolates the
+            // weight execution format rather than a residual epilogue.
+            let mq4_host = synth_mq4(m, k, 0x4D51_3456);
+            let mq4 = gpu
+                .upload_raw(&mq4_host, &[mq4_host.len()])
+                .expect("upload retained MQ4 control");
+            drop(mq4_host);
+            let mq4_y = gpu
+                .zeros(&[m_total, m], DType::F32)
+                .expect("allocate retained MQ4 output");
+            let xq = gpu
+                .ensure_q8_1_mmq_x(&x_t, m_total, k)
+                .expect("quantize retained MQ4 input");
+
+            for _ in 0..3 {
+                gpu.gemm_hfq4g256_mmq_prequant_x256y64_group128_quad_row_u32x2(
+                    &mq4, xq, &mq4_y, m, k, m_total, false,
+                )
+                .expect("retained MQ4 warmup");
+                gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2(
+                    &ep_t, &tp_t, &sp_t, &x_t, &y4w_t, m, k, 1, m_total, m_total,
+                )
+                .expect("MQ2 warmup");
+            }
+            gpu.hip.device_synchronize().expect("sync paired warmup");
+            gpu.dpm_warmup(5.0).expect("DPM warmup");
+
+            let mut mq4_ms = Vec::with_capacity(7);
+            let mut mq2_ms = Vec::with_capacity(7);
+            for pair in 0..7 {
+                let mq4_first = pair % 2 == 0;
+                for run_mq4 in [mq4_first, !mq4_first] {
+                    let start = Instant::now();
+                    if run_mq4 {
+                        gpu.gemm_hfq4g256_mmq_prequant_x256y64_group128_quad_row_u32x2(
+                            &mq4, xq, &mq4_y, m, k, m_total, false,
+                        )
+                        .expect("retained MQ4 paired run");
+                    } else {
+                        gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2(
+                            &ep_t, &tp_t, &sp_t, &x_t, &y4w_t, m, k, 1, m_total, m_total,
+                        )
+                        .expect("MQ2 paired run");
+                    }
+                    gpu.hip.device_synchronize().expect("sync paired run");
+                    let elapsed_ms = start.elapsed().as_secs_f64() * 1e3;
+                    if run_mq4 {
+                        mq4_ms.push(elapsed_ms);
+                    } else {
+                        mq2_ms.push(elapsed_ms);
+                    }
+                }
+            }
+            let mq4_median = median(&mq4_ms);
+            let mq2_median = median(&mq2_ms);
+            println!("  paired retained MQ4 set median: {mq4_median:.4} ms");
+            println!("  paired MQ2 4w set median:      {mq2_median:.4} ms");
+            println!(
+                "  paired MQ2/MQ4 speed ratio:     {:.4}×",
+                mq4_median / mq2_median
+            );
+            println!("  paired retained MQ4 raw ms: {mq4_ms:?}");
+            println!("  paired MQ2 4w raw ms:      {mq2_ms:?}");
+        }
+
+        // ── i8-MMQ variant: correctness (RMS-rel vs f16) + perf.
+        if gpu.arch != "gfx1151" {
+            println!("  i8-mmq:        SKIP (gfx1151-only implementation)");
+            std::mem::forget(ep_t);
+            std::mem::forget(tp_t);
+            std::mem::forget(sp_t);
+            std::mem::forget(x_t);
+            std::mem::forget(yref_t);
+            std::mem::forget(y4w_t);
+            std::mem::forget(ymmq_t);
+            continue;
+        }
+
+        gpu.gemm_mq2g256_lloyd_moe_grouped_mmq_gfx1151(
+            &ep_t, &tp_t, &sp_t, &x_t, &ymmq_t, m, k, 1, m_total, m_total,
+        )
+        .expect("mmq");
+        gpu.hip.device_synchronize().expect("sync mmq");
+        let mut y_mmq_bytes = vec![0u8; m_total * m * 4];
+        gpu.hip
+            .memcpy_dtoh(&mut y_mmq_bytes, &ymmq_gpu)
+            .expect("dtoh mmq");
+        let y_mmq: &[f32] =
+            unsafe { std::slice::from_raw_parts(y_mmq_bytes.as_ptr() as *const f32, m_total * m) };
+        let (mut num, mut den, mut nan2) = (0f64, 0f64, 0usize);
+        for i in 0..(m_total * m) {
+            if !y_mmq[i].is_finite() {
+                nan2 += 1;
+                continue;
+            }
+            num += ((y_mmq[i] - y_ref[i]) as f64).powi(2);
+            den += (y_ref[i] as f64).powi(2);
+        }
+        let rms_rel = (num / den.max(1e-12)).sqrt();
+        for _ in 0..WARMUP {
+            gpu.gemm_mq2g256_lloyd_moe_grouped_mmq_gfx1151(
+                &ep_t, &tp_t, &sp_t, &x_t, &ymmq_t, m, k, 1, m_total, m_total,
+            )
+            .unwrap();
+        }
+        gpu.hip.device_synchronize().unwrap();
+        let t0 = Instant::now();
+        for _ in 0..TRIALS {
+            gpu.gemm_mq2g256_lloyd_moe_grouped_mmq_gfx1151(
+                &ep_t, &tp_t, &sp_t, &x_t, &ymmq_t, m, k, 1, m_total, m_total,
+            )
+            .unwrap();
+        }
+        gpu.hip.device_synchronize().unwrap();
+        let mmq_us = t0.elapsed().as_secs_f64() / TRIALS as f64 * 1e6;
+        let mmq_gflops = flops / mmq_us / 1e3;
+        println!(
+            "  i8-mmq:        {mmq_us:>8.1} µs ({mmq_gflops:>6.0} GFLOPS)   \
+             vs-4w: {:.2}×   rms_rel_vs_f16={rms_rel:.4} nan={nan2} {}",
+            new_us / mmq_us,
+            if rms_rel < 0.05 && nan2 == 0 {
+                "OK"
+            } else {
+                "CHECK"
+            }
+        );
+
+        std::mem::forget(ep_t);
+        std::mem::forget(tp_t);
+        std::mem::forget(sp_t);
+        std::mem::forget(x_t);
+        std::mem::forget(yref_t);
+        std::mem::forget(y4w_t);
+        std::mem::forget(ymmq_t);
     }
 }

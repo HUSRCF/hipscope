@@ -1,0 +1,5 @@
+group128: prefill_median=1059.400 decode_median=33.000 raw_prefill=[1059.8, 1061.8, 1059.4, 1057.1, 1057.6]
+group256: prefill_median=1106.000 decode_median=33.000 raw_prefill=[1106.0, 1105.1, 1107.2, 1104.5, 1111.0]
+trim_each_side=1 group128_trimmed_median=1059.400 group256_trimmed_median=1106.000
+group256_vs_group128=1.0440x (+4.40%)
+token_ids_match=True group128_variants=1 group256_variants=1

@@ -20,12 +20,34 @@ fn main() {
     use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
     use hipfire_runtime::hfq::HfqFile;
     use hipfire_runtime::llama::{self, KvCache};
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
     use std::path::Path;
     use std::time::Instant;
 
+    fn fnv1a64(bytes: &[u8]) -> u64 {
+        bytes.iter().fold(0xcbf29ce484222325, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+        })
+    }
+
+    fn sha256_file(path: &Path) -> String {
+        let mut file = std::fs::File::open(path).expect("open model for SHA-256");
+        let mut hasher = Sha256::new();
+        let mut buffer = vec![0u8; 8 * 1024 * 1024];
+        loop {
+            let n = file.read(&mut buffer).expect("read model for SHA-256");
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buffer[..n]);
+        }
+        format!("{:x}", hasher.finalize())
+    }
+
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: bench_qwen35_mq4 <model.hfq> [--prefill N] [--prefill-runs N] [--gen N] [--warmup N] [--emit-atlas <path.jsonl>]");
+        eprintln!("Usage: bench_qwen35_mq4 <model.hfq> [--prefill N] [--prefill-runs N] [--gen N] [--warmup N] [--prompt-file FILE] [--emit-atlas <path.jsonl>]");
         std::process::exit(1);
     }
     let model_path = &args[1];
@@ -35,6 +57,7 @@ fn main() {
     let mut prefill_runs: usize = 1;
     let mut gen_len: usize = 100;
     let mut warmup_len: usize = 5;
+    let mut prompt_file: Option<String> = None;
     // Optional kernel-atlas emission: when set, write one typed AtlasRow
     // per timed phase (prefill, decode_ar) to this JSONL file. Replaces
     // stdout-scraping by external collectors like scripts/kernel_atlas.py.
@@ -62,11 +85,32 @@ fn main() {
                 atlas_out = Some(args[i + 1].clone());
                 i += 2;
             }
+            "--prompt-file" => {
+                prompt_file = Some(args[i + 1].clone());
+                i += 2;
+            }
             other => {
                 eprintln!("unknown arg: {other}");
                 std::process::exit(1);
             }
         }
+    }
+
+    let calibration_out = std::env::var("HIPFIRE_RDNA3_FFN_GROUP_CALIBRATION_OUT").ok();
+    if calibration_out.is_some() {
+        assert!(
+            prompt_file.is_some(),
+            "FFN group calibration output requires a real --prompt-file"
+        );
+        assert_eq!(
+            prefill_runs, 1,
+            "FFN group calibration output requires --prefill-runs 1"
+        );
+        assert_ne!(
+            std::env::var("HIPFIRE_GRAPH_PREFILL").ok().as_deref(),
+            Some("1"),
+            "FFN group calibration output does not support HIPFIRE_GRAPH_PREFILL=1"
+        );
     }
 
     eprintln!("=== bench_qwen35_mq4 ===");
@@ -81,64 +125,92 @@ fn main() {
     // mirrors daemon.rs:1500-1504 and eval_hipfire's load path. HFQ files
     // take the canonical HFQ path below.
     let t_load = Instant::now();
-    let (config, weights, model_bytes) = if model_path_buf.is_dir() {
-        use hipfire_runtime::safetensors_source::SafetensorsSource;
-        let source = SafetensorsSource::open(model_path_buf).expect("safetensors open");
-        let config = qwen35::config_from_safetensors(&source).expect("config_from_safetensors");
-        eprintln!(
-            "Config: dim={} layers={} heads={} kv_heads={} vocab={}",
-            config.dim, config.n_layers, config.n_heads, config.n_kv_heads, config.vocab_size
-        );
-        let bytes = std::fs::read_dir(model_path_buf)
-            .ok()
-            .map(|rd| {
-                rd.filter_map(|e| e.ok())
-                    .filter(|e| e.path().extension().is_some_and(|x| x == "safetensors"))
-                    .filter_map(|e| std::fs::metadata(e.path()).ok())
-                    .map(|m| m.len())
-                    .sum::<u64>()
-            })
-            .unwrap_or(0);
-        eprintln!(
-            "Model size: {:.3} GiB ({} bytes, safetensors)",
-            bytes as f64 / (1024.0 * 1024.0 * 1024.0),
-            bytes
-        );
-        eprintln!("  loading via safetensors (ParoQuant path)");
-        let mut paro_source = qwen35::ParoSource::new(&source, &config).expect("ParoSource::new");
-        let paro_layout = qwen35::Layout::single(config.n_layers);
-        let weights = qwen35::load_weights(
-            &mut paro_source,
-            std::slice::from_mut(&mut gpu),
-            &paro_layout,
-        )
-        .expect("load_weights");
-        (config, weights, bytes)
-    } else {
-        let mut hfq = HfqFile::open(model_path_buf).expect("open model");
-        let config = qwen35::config_from_hfq(&hfq).expect("read config");
-        eprintln!(
-            "Config: dim={} layers={} heads={} kv_heads={} vocab={}",
-            config.dim, config.n_layers, config.n_heads, config.n_kv_heads, config.vocab_size
-        );
-        let bytes = std::fs::metadata(model_path).map(|m| m.len()).unwrap_or(0);
-        eprintln!(
-            "Model size: {:.3} GiB ({} bytes)",
-            bytes as f64 / (1024.0 * 1024.0 * 1024.0),
-            bytes
-        );
-        let mut src = qwen35::HfqSource::new(&mut hfq, &config);
-        let layout = qwen35::Layout::single(config.n_layers);
-        let weights = qwen35::load_weights(&mut src, std::slice::from_mut(&mut gpu), &layout)
-            .expect("load weights");
-        (config, weights, bytes)
-    };
+    let (config, weights, model_bytes, tokenizer, metadata_fingerprint, model_sha256) =
+        if model_path_buf.is_dir() {
+            use hipfire_runtime::safetensors_source::SafetensorsSource;
+            let source = SafetensorsSource::open(model_path_buf).expect("safetensors open");
+            let tokenizer = prompt_file.as_ref().map(|_| {
+                hipfire_runtime::tokenizer::Tokenizer::from_tokenizer_json(
+                    &model_path_buf.join("tokenizer.json"),
+                )
+                .expect("read tokenizer.json")
+                .expect("parse tokenizer.json")
+            });
+            let config = qwen35::config_from_safetensors(&source).expect("config_from_safetensors");
+            eprintln!(
+                "Config: dim={} layers={} heads={} kv_heads={} vocab={}",
+                config.dim, config.n_layers, config.n_heads, config.n_kv_heads, config.vocab_size
+            );
+            let bytes = std::fs::read_dir(model_path_buf)
+                .ok()
+                .map(|rd| {
+                    rd.filter_map(|e| e.ok())
+                        .filter(|e| e.path().extension().is_some_and(|x| x == "safetensors"))
+                        .filter_map(|e| std::fs::metadata(e.path()).ok())
+                        .map(|m| m.len())
+                        .sum::<u64>()
+                })
+                .unwrap_or(0);
+            eprintln!(
+                "Model size: {:.3} GiB ({} bytes, safetensors)",
+                bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                bytes
+            );
+            eprintln!("  loading via safetensors (ParoQuant path)");
+            let mut paro_source =
+                qwen35::ParoSource::new(&source, &config).expect("ParoSource::new");
+            let paro_layout = qwen35::Layout::single(config.n_layers);
+            let weights = qwen35::load_weights(
+                &mut paro_source,
+                std::slice::from_mut(&mut gpu),
+                &paro_layout,
+            )
+            .expect("load_weights");
+            (config, weights, bytes, tokenizer, None, None)
+        } else {
+            let mut hfq = HfqFile::open(model_path_buf).expect("open model");
+            let metadata_fingerprint =
+                format!("fnv1a64:{:016x}", fnv1a64(hfq.metadata_json.as_bytes()));
+            let model_sha256 = calibration_out
+                .as_ref()
+                .map(|_| sha256_file(model_path_buf));
+            let tokenizer = prompt_file.as_ref().map(|_| {
+                hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
+                    .expect("tokenizer from HFQ metadata")
+            });
+            let config = qwen35::config_from_hfq(&hfq).expect("read config");
+            eprintln!(
+                "Config: dim={} layers={} heads={} kv_heads={} vocab={}",
+                config.dim, config.n_layers, config.n_heads, config.n_kv_heads, config.vocab_size
+            );
+            let bytes = std::fs::metadata(model_path).map(|m| m.len()).unwrap_or(0);
+            eprintln!(
+                "Model size: {:.3} GiB ({} bytes)",
+                bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                bytes
+            );
+            let mut src = qwen35::HfqSource::new(&mut hfq, &config);
+            let layout = qwen35::Layout::single(config.n_layers);
+            let weights = qwen35::load_weights(&mut src, std::slice::from_mut(&mut gpu), &layout)
+                .expect("load weights");
+            (
+                config,
+                weights,
+                bytes,
+                tokenizer,
+                Some(metadata_fingerprint),
+                model_sha256,
+            )
+        };
     eprintln!("Weights loaded in {:.2}s", t_load.elapsed().as_secs_f64());
 
     let kv_seq = (prefill_len + warmup_len + gen_len + 16).max(512);
-    // KV cache mode via HIPFIRE_KV_MODE env var:
+    // KV cache mode via resolved TOML policy:
     //   q8 (default) | asym4 | asym3 | asym2
-    let kv_mode = std::env::var("HIPFIRE_KV_MODE").unwrap_or_else(|_| "q8".to_string());
+    let kv_mode = match hipfire_runtime::config::get().kv_mode.as_str() {
+        "auto" => "q8".to_string(),
+        mode => mode.to_string(),
+    };
     eprintln!("KV mode: {kv_mode}");
     let mut kv_cache = match kv_mode.as_str() {
         "q8" => KvCache::new_gpu_q8(
@@ -178,9 +250,26 @@ fn main() {
     let mut dn_state = DeltaNetState::new(&mut gpu, &config).unwrap();
     let scratch = Qwen35Scratch::new_with_kv_max(&mut gpu, &config, 128, kv_seq).unwrap();
 
-    // Deterministic fake-prompt: token 0, 1, 2, ... prefill_len-1. Keeps the
-    // benchmark independent of tokenizer / chat template behaviour.
-    let prompt_tokens: Vec<u32> = (0..prefill_len as u32).collect();
+    // Default remains deterministic fake tokens for stable kernel timing.
+    // Calibration runs may opt into a real, reproducible text corpus.
+    let prompt_tokens: Vec<u32> = if let Some(path) = prompt_file.as_deref() {
+        let text = std::fs::read_to_string(path).expect("read --prompt-file");
+        let mut ids = tokenizer
+            .as_ref()
+            .expect("--prompt-file tokenizer")
+            .encode(&text);
+        assert!(
+            ids.len() >= prefill_len,
+            "--prompt-file produced {} tokens, fewer than --prefill {}",
+            ids.len(),
+            prefill_len
+        );
+        ids.truncate(prefill_len);
+        eprintln!("Prompt source: {path} (using {} tokens)", ids.len());
+        ids
+    } else {
+        (0..prefill_len as u32).collect()
+    };
 
     // DPM warmup BEFORE prefill (issue #65). The default `HIPFIRE_DPM_WARMUP_SECS`
     // hook fires AFTER the warmup tokens, before the timed gen — useless for
@@ -271,6 +360,14 @@ fn main() {
         };
         eprintln!("  JIT complete, profiling next pass...");
         rdna_compute::profile::start();
+    }
+    if let Some(energy) = scratch
+        .prefill_batch
+        .as_ref()
+        .and_then(|pbs| pbs.ffn_group_energy.as_ref())
+    {
+        gpu.fill_f32(energy, 0.0)
+            .expect("reset FFN group calibration accumulator");
     }
     eprintln!("\n=== prefill ({prefill_len} tokens) ===");
     let mut prefill_samples_ms = Vec::with_capacity(prefill_runs);
@@ -475,6 +572,62 @@ fn main() {
             }
         }
     }
+    if let Some(output_path) = calibration_out {
+        if let Some(energy) = scratch
+            .prefill_batch
+            .as_ref()
+            .and_then(|pbs| pbs.ffn_group_energy.as_ref())
+        {
+            let values = gpu
+                .download_f32(energy)
+                .expect("download FFN group calibration accumulator");
+            let groups = config.hidden_dim / 256;
+            let layers: Vec<serde_json::Value> = (0..config.n_layers)
+                .map(|layer| {
+                    let layer_energy = values[layer * groups..(layer + 1) * groups].to_vec();
+                    let mut ranking: Vec<usize> = (0..groups).collect();
+                    ranking.sort_by(|&a, &b| {
+                        layer_energy[b]
+                            .partial_cmp(&layer_energy[a])
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    serde_json::json!({
+                        "layer": layer,
+                        "energy": layer_energy,
+                        "groups_descending": ranking,
+                    })
+                })
+                .collect();
+            let document = serde_json::json!({
+                "version": 1,
+                "metric": "sum_square_silu_gate_mul_up",
+                "model": model_path,
+                "model_bytes": model_bytes,
+                "model_sha256": model_sha256
+                    .as_deref()
+                    .expect("FFN group calibration currently requires an HFQ model"),
+                "model_metadata_fingerprint": metadata_fingerprint
+                    .as_deref()
+                    .expect("FFN group calibration currently requires an HFQ model"),
+                "prefill_tokens_per_run": prefill_len,
+                "prefill_runs": prefill_runs,
+                "hidden_dim": config.hidden_dim,
+                "group_size": 256,
+                "layers": layers,
+            });
+            std::fs::write(
+                &output_path,
+                serde_json::to_vec_pretty(&document).expect("serialize FFN group calibration"),
+            )
+            .unwrap_or_else(|e| panic!("write FFN group calibration {output_path}: {e}"));
+            eprintln!("  FFN group calibration: {output_path}");
+        } else {
+            eprintln!(
+                "WARN: HIPFIRE_RDNA3_FFN_GROUP_CALIBRATION_OUT is set but \
+                 HIPFIRE_RDNA3_FFN_GROUP_CALIBRATION=1 is not active"
+            );
+        }
+    }
     let prefill_ms = *prefill_samples_ms.last().unwrap();
     // Captured outside `do_profile` so SUMMARY can split kernel vs wall.
     // None when profiling is disabled (HIPFIRE_PROFILE != 1).
@@ -494,10 +647,12 @@ fn main() {
         };
         if let Some(ref report) = report {
             let entries = &report.internal;
-            let mut by_kernel: std::collections::HashMap<&str, (f64, usize, usize)> =
-                Default::default();
+            let mut by_kernel: std::collections::HashMap<
+                (&str, Option<[usize; 3]>),
+                (f64, usize, usize),
+            > = Default::default();
             for e in entries {
-                let (time, count, bytes) = by_kernel.entry(e.kernel).or_default();
+                let (time, count, bytes) = by_kernel.entry((e.kernel, e.shape)).or_default();
                 *time += e.time_us;
                 *count += 1;
                 *bytes += e.bytes;
@@ -510,14 +665,17 @@ fn main() {
             let mut kerns: Vec<_> = by_kernel.iter().collect();
             kerns.sort_by(|a, b| b.1 .0.partial_cmp(&a.1 .0).unwrap());
             let total_us: f64 = kerns.iter().map(|(_, (t, _, _))| t).sum();
-            for (kern, (us, n, bytes)) in &kerns {
+            for ((kern, shape), (us, n, bytes)) in &kerns {
                 let gib_s = if *us > 0.0 {
                     (*bytes as f64 / (1024.0 * 1024.0 * 1024.0)) / (*us / 1_000_000.0)
                 } else {
                     0.0
                 };
+                let shape = shape.map_or_else(String::new, |[m, k, n]| {
+                    format!("M{m} K{k} N{n}")
+                });
                 eprintln!(
-                    "  {kern:45} {n:5}x  {:.1}ms  ({:.0}µs/call)  {:.1}%  {:.1} GiB/s",
+                    "  {kern:45} {shape:24} {n:5}x  {:.1}ms  ({:.0}µs/call)  {:.1}%  {:.1} GiB/s",
                     us / 1000.0,
                     us / *n as f64,
                     us / total_us * 100.0,
@@ -525,8 +683,9 @@ fn main() {
                 );
             }
             eprintln!(
-                "  {:45} {:5}   {:.1}ms",
+                "  {:45} {:24} {:5}   {:.1}ms",
                 "TOTAL (serialized)",
+                "",
                 "",
                 total_us / 1000.0
             );
@@ -673,6 +832,11 @@ fn main() {
     // Read logits to get a valid next token
     let logits = gpu.download_f32(&scratch.logits).unwrap();
     let mut next_token = llama::argmax(&logits);
+    let dump_tokens = std::env::var("HIPFIRE_BENCH_DUMP_TOKENS")
+        .ok()
+        .as_deref()
+        == Some("1");
+    let mut generated_token_ids = dump_tokens.then(|| vec![next_token]);
 
     // === WARMUP ===
     eprintln!("\n=== warmup ({warmup_len} tokens — untimed, lets JIT settle) ===");
@@ -695,6 +859,9 @@ fn main() {
         .expect("warmup forward failed");
         let logits = gpu.download_f32(&scratch.logits).unwrap();
         next_token = llama::argmax(&logits);
+        if let Some(tokens) = generated_token_ids.as_mut() {
+            tokens.push(next_token);
+        }
     }
     let warmup_ms = t_warmup.elapsed().as_secs_f64() * 1000.0;
     eprintln!(
@@ -744,6 +911,9 @@ fn main() {
         let t_ms = t.elapsed().as_secs_f64() * 1000.0;
         per_token_ms.push(t_ms);
         next_token = llama::argmax(&logits);
+        if let Some(tokens) = generated_token_ids.as_mut() {
+            tokens.push(next_token);
+        }
     }
     let gen_total_ms = t_gen_start.elapsed().as_secs_f64() * 1000.0;
     if do_profile_decode {
@@ -807,6 +977,9 @@ fn main() {
     let p90_ms = sorted[(n * 90) / 100];
     let p99_ms = sorted[(n.saturating_sub(1) * 99) / 100];
     let gen_tok_s = n as f64 / (gen_total_ms / 1000.0);
+    if let Some(tokens) = generated_token_ids.as_ref() {
+        eprintln!("TOKEN_IDS {tokens:?}");
+    }
 
     // BW estimate: each gen token reads ~all weights (minus KV cache writes,
     // which are separate). Effective BW = model_bytes × tok/s.

@@ -1,0 +1,9 @@
+q8: prefill_median=1054.300 decode_median=33.200 raw_prefill=[1062.6, 1054.3, 1052.0]
+a4: prefill_median=1105.900 decode_median=33.100 raw_prefill=[1110.6, 1105.9, 1105.1]
+pair=1 a4_order=1 ratio=1.0452x tokens_match=True
+pair=2 a4_order=0 ratio=1.0489x tokens_match=True
+pair=3 a4_order=1 ratio=1.0505x tokens_match=True
+trim_each_side=0 q8_trimmed_median=1054.300 a4_trimmed_median=1105.900
+a4_vs_q8=1.0489x (+4.89%)
+pairwise_ratio_median=1.0489x raw_pairwise_ratios=[1.0452, 1.0489, 1.0505]
+token_ids_match=True pairwise_tokens_match=True q8_variants=1 a4_variants=1

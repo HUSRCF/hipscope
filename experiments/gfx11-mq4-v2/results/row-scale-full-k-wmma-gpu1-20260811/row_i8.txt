@@ -1,0 +1,33 @@
+GPU dev 0: gfx1100 (48.3 GB VRAM, HIP 7.14)
+  pre-compiled kernels: .hipfire_kernels/gfx1100
+arch=gfx1100 pairs=3
+shape=gate m=17408 k=5120 n=2048 add=false
+execution_format=row-i8
+packed_weight_bytes=47349760
+execution_weight_bytes=89198592
+execution_weight_ratio=1.8838x
+max_abs=2.01874495e-1
+mean_abs=5.37912955e-2
+relative_l2=6.16219930e-2
+cosine=0.9989173872
+warming caches... took 5.00s
+reference_ms=4.1796
+candidate_ms=10.3588
+speedup=0.4035x
+reference_raw_ms=[4.179622, 4.165074000000001, 4.293982]
+candidate_raw_ms=[10.358837, 9.058909, 10.460091]
+shape=down m=5120 k=17408 n=2048 add=true
+execution_format=row-i8
+packed_weight_bytes=47349760
+execution_weight_bytes=89149440
+execution_weight_ratio=1.8828x
+max_abs=3.76400352e-1
+mean_abs=1.11469677e-1
+relative_l2=6.15179419e-2
+cosine=0.9987767651
+warming caches... took 5.00s
+reference_ms=4.3453
+candidate_ms=10.4900
+speedup=0.4142x
+reference_raw_ms=[4.102925, 4.345271, 4.466463]
+candidate_raw_ms=[10.489959, 9.35124, 10.766110000000001]

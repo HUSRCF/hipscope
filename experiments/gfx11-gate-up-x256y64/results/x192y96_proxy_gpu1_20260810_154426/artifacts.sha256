@@ -1,0 +1,5 @@
+f2067634c250ec1ae3f1c1c1bc0ace9f8538a8c67a4b34102a4f0138c01c5745  /home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-flashattn-beta-latest/target/release/examples/bench_hfq4_group256_direct
+f2396dfd1319221ee58af8b7d431884aca3cfa4b5e90c4cd352af7414b1e3912  experiments/gfx11-gate-up-x256y64/run_group128_x192y96_proxy_ab.sh
+5ea2ff082e760ddde50f59289c125b8f53e00b4055947bb9991bf3a76e2622c5  /home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-flashattn-beta-latest/kernels/src/gemm_hfq4g256_residual_mmq.hip
+bef4145dd10987f3e09c7d6b5dc0ba93d7e5e1087ea4466be762c32b8932f828  /home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-flashattn-beta-latest/crates/rdna-compute/src/gemm.rs
+30b6b223c845aed3ba43288cff5ad38ce0c47f54399e967e97f7f39b28a1a8a5  /home/husrcf/Code/ProtBind/unidec/.worktrees/hipfire-flashattn-beta-latest/crates/rdna-compute/examples/bench_hfq4_group256_direct.rs

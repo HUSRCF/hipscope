@@ -1,0 +1,14 @@
+gfx1100 full_set/full_add
+  VGPR: 256
+  SGPR: 27
+  VGPR spills: 4
+  SGPR spills: 0
+  private segment: 20 B
+  wavefront: 32
+
+Reference group128 row2 full_set/full_add
+  VGPR: 252
+  SGPR: 31
+  VGPR spills: 0
+  private segment: 0 B
+  wavefront: 32

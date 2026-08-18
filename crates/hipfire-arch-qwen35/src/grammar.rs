@@ -27,10 +27,18 @@
 //! moment the model commits to `<tool_call>`: from then until the JSON
 //! header `\n{"name": "<TOOL_NAME>", "arguments": ` is fully laid
 //! down, only tokens that continue that template are allowed. The
-//! `arguments` value itself is unconstrained (state `InArgs`) — qwen
-//! emits free-form JSON for the arguments object and naturally closes
-//! with `}\n</tool_call>`. Once `</tool_call>` lands, the matcher
+//! `arguments` value itself is free-form JSON (state `InArgs`), with one
+//! structural constraint: the model may not emit `</tool_call>` until the
+//! OUTER tool-call object is brace-balanced. The header opens `{...`, so
+//! the canonical close is `}}\n</tool_call>` — one `}` for the args value,
+//! one for the enclosing object. Once `</tool_call>` lands, the matcher
 //! returns to free emission.
+//!
+//! Enforcing the outer `}` is the "JSON-aware brace counting" future phase
+//! flagged below: qwen3.6:27b (mq4, temp>0) intermittently jumped from the
+//! inner `}` straight to `</tool_call>`, dropping the outer brace and
+//! emitting invalid JSON (`{"name":"read","arguments":{"path":"x"}`) that
+//! failed Pi's tool-call parser — the "dropped closing bracket" bug.
 //!
 //! ## States
 //!
@@ -40,18 +48,19 @@
 //! - [`State::AfterOpen`] — between `<tool_call>` and the
 //!   `"arguments": ` colon-space. Constrained to a literal byte
 //!   sequence that names one of the available tools.
-//! - [`State::InArgs`] — between `"arguments": ` and `</tool_call>`.
-//!   Unconstrained — qwen emits the args value as free JSON.
+//! - [`State::InArgs`] — between `"arguments": ` and `</tool_call>`. The
+//!   args value is free JSON, but `</tool_call>` is masked out until the
+//!   enclosing tool-call object is brace-balanced (the outer `}` is
+//!   emitted). String-aware, so `{`/`}`/`<` inside string values don't
+//!   count. The attractor force-close path is exempt.
 //! - (back to `Out` after `</tool_call>`.)
 //!
 //! ## What this does NOT do
 //!
-//! Enforce JSON-validity inside `arguments`. The args value can be a
-//! nested object, array, string, etc.; tracking JSON balance under
-//! BPE fragmentation would multiply the grammar code size for little
-//! payoff — the failure mode we care about (Pi turn 12) corrupts the
-//! header, not the body. A future phase can layer in JSON-aware
-//! brace counting if production traffic ever shows body drift.
+//! Enforce full JSON-validity inside `arguments` (well-formed keys,
+//! quoting, commas). It tracks only string-aware brace balance — enough
+//! to require the outer `}` before the close — leaving trailing-comma /
+//! unquoted-key glitches to the daemon's downstream tool-call repair.
 
 /// Position in the qwen35 tool-call grammar. See module docs for
 /// transitions.
@@ -123,7 +132,7 @@ fn ngram_min_repeats() -> usize {
     use std::sync::OnceLock;
     static CACHED: OnceLock<usize> = OnceLock::new();
     *CACHED.get_or_init(|| {
-        std::env::var("HIPFIRE_QWEN35_NGRAM_MIN_REPEATS")
+        hipfire_config::developer_var("HIPFIRE_QWEN35_NGRAM_MIN_REPEATS")
             .ok()
             .and_then(|s| s.parse().ok())
             .filter(|&n: &usize| n >= 2 && n <= 32)
@@ -135,7 +144,7 @@ fn ngram_len_min() -> usize {
     use std::sync::OnceLock;
     static CACHED: OnceLock<usize> = OnceLock::new();
     *CACHED.get_or_init(|| {
-        std::env::var("HIPFIRE_QWEN35_NGRAM_LEN_MIN")
+        hipfire_config::developer_var("HIPFIRE_QWEN35_NGRAM_LEN_MIN")
             .ok()
             .and_then(|s| s.parse().ok())
             .filter(|&n: &usize| n >= 1 && n <= NGRAM_LEN_MAX)
@@ -369,6 +378,63 @@ impl Matcher {
         false
     }
 
+    /// Simulate the args-body brace state over `text` (seeded from the
+    /// committed [`State::InArgs`] state) and return whether the OUTER
+    /// tool-call object is already closed (`args_brace_depth < 0`) at the
+    /// point a `</tool_call>` marker begins within `text`.
+    ///
+    /// Used by [`Self::is_token_allowed`] to permit a close-forming token
+    /// iff it does not drop the outer `}`: a lone `</tool_call>` after the
+    /// inner `}` (depth back to 0) is rejected, while a merged
+    /// `}}\n</tool_call>` token — whose second `}` drives depth to -1 before
+    /// the marker — is allowed. A `<` inside a JSON string value is data,
+    /// not the marker, so the scan is string-aware. By the block invariant
+    /// (this gate rejects any premature close-prefix token), the marker can
+    /// only begin inside `text`, never straddling `partial_buf`.
+    fn outer_closed_before_marker(&self, text: &str) -> bool {
+        const CLOSE: &[u8] = b"</tool_call>";
+        let mut depth = self.args_brace_depth;
+        let mut in_string = self.args_in_string;
+        let mut escape = self.args_string_escape;
+        let bytes = text.as_bytes();
+        for i in 0..bytes.len() {
+            let rem = &bytes[i..];
+            // A `</tool_call>` marker (full, or a terminal prefix running to
+            // the end of `text`) begins here — only meaningful outside a
+            // string value. Decide against the outer-object state at this
+            // position.
+            if !in_string && (rem.starts_with(CLOSE) || CLOSE.starts_with(rem)) {
+                return depth < 0;
+            }
+            let byte = bytes[i];
+            if escape {
+                escape = false;
+                continue;
+            }
+            if in_string {
+                match byte {
+                    b'\\' => escape = true,
+                    b'"' => in_string = false,
+                    _ => {}
+                }
+                continue;
+            }
+            match byte {
+                b'"' => in_string = true,
+                b'{' => depth += 1,
+                b'}' => depth -= 1,
+                _ => {}
+            }
+        }
+        // No `</tool_call>` marker actually begins (outside a string) within
+        // `text` — the caller's `touches_close_marker` matched a `<` that is
+        // string-value CONTENT (heredoc `<<`, `#include <stdio.h>`, `a < b`,
+        // …) or a bare `<` that isn't a real close prefix. It does not close
+        // the tool call, so allow it. (A real close prefix outside a string is
+        // caught by the in-loop `return depth < 0` above.)
+        true
+    }
+
     /// True iff the n-gram loop guard has tripped on the current
     /// [`State::InArgs`] body. Exposed for diagnostics; the daemon
     /// uses this to log the trip event.
@@ -510,7 +576,9 @@ impl Matcher {
     ///      enforce the per-token check.
     pub fn is_free(&self) -> bool {
         match self.state {
-            State::Out => !Self::has_open_prefix(&self.partial_buf),
+            // Masking on a partial `<tool_call>` prefix strands free text: a
+            // bare `<` (`<ip>`, `<p>`, `2 < 3`) leaves only `t`/`to`… legal.
+            State::Out => true,
             State::AfterOpen => false,
             State::InArgs => {
                 if self.attractor_detected {
@@ -519,21 +587,19 @@ impl Matcher {
                 if !self.required_fields_satisfied() {
                     return false;
                 }
+                if self.args_brace_depth >= 0 {
+                    // The OUTER tool-call object `{"name":..,"arguments":<v>}` is
+                    // still open. `args_brace_depth` counts only the args-VALUE
+                    // object (it re-enters InArgs at 0, the header's outer `{`
+                    // already consumed), so a balanced value nets back to 0 while
+                    // the enclosing `}` is still outstanding (depth -> -1 once it
+                    // lands). Stay constrained so `is_token_allowed` can block a
+                    // premature `</tool_call>` before the outer brace.
+                    return false;
+                }
                 !Self::has_close_prefix(&self.partial_buf)
             }
         }
-    }
-
-    /// Does the buffer end with a strict prefix of `<tool_call>` (so a
-    /// follow-up token could complete the open)?
-    fn has_open_prefix(s: &str) -> bool {
-        const OPEN: &str = "<tool_call>";
-        for n in 1..=OPEN.len() {
-            if s.ends_with(&OPEN[..n]) {
-                return true;
-            }
-        }
-        false
     }
 
     /// Does the buffer end with a strict prefix of `</tool_call>`?
@@ -631,6 +697,24 @@ impl Matcher {
                         false
                     } else if self.would_close_args_body(text) {
                         false
+                    } else {
+                        true
+                    }
+                } else if !self.attractor_detected && self.args_brace_depth >= 0 {
+                    // Required fields are present, but the OUTER tool-call object
+                    // is not yet closed (`args_brace_depth` tracks only the
+                    // args-VALUE object, which nets to 0; the outer `}` drives it
+                    // to -1). A token that begins a `</tool_call>` marker while the
+                    // outer brace is still open would drop that brace and emit
+                    // structurally-invalid JSON (the Pi "dropped closing bracket"
+                    // failure: `{"name":"read","arguments":{"path":"x"}`). Allow a
+                    // close-forming token ONLY if the outer `}` lands (brace depth
+                    // < 0) before the marker begins — this still permits a merged
+                    // `}}\n</tool_call>` token. Non-close content is always free.
+                    // The attractor force-close path is exempt (falls through to
+                    // the `else` below) so a looped model can still escape.
+                    if Self::touches_close_marker(&combined) {
+                        self.outer_closed_before_marker(text)
                     } else {
                         true
                     }
@@ -944,13 +1028,20 @@ mod tests {
     }
 
     #[test]
-    fn in_args_is_free_until_close_prefix() {
+    fn in_args_allows_content_but_gates_close_until_outer_brace() {
         let mut m = Matcher::new(schemas(&["bash"]));
         m.advance("<tool_call>\n{\"name\": \"bash\", \"arguments\": ");
-        assert!(m.is_free());
-        // Inside args, any payload is fine.
+        // The outer tool-call object is open (args_brace_depth == 0), so the
+        // matcher stays constrained — NOT free — to gate a premature close.
+        assert!(!m.is_free());
+        // Inside args, any non-close payload is still fine.
         assert!(m.is_token_allowed("{\"command\": \"ls -la\"}"));
         assert!(m.is_token_allowed("\n"));
+        // Once the full body (args value + outer `}`) is balanced, InArgs is
+        // free again and the close marker is allowed.
+        m.advance("{\"command\": \"ls -la\"}}");
+        assert!(m.is_free());
+        assert!(m.is_token_allowed("</tool_call>"));
     }
 
     #[test]
@@ -958,6 +1049,58 @@ mod tests {
         let mut m = Matcher::new(schemas(&["bash"]));
         m.advance("<tool_call>\n{\"name\": \"bash\", \"arguments\": {}}\n</tool_call>");
         assert!(matches!(m.state(), State::Out));
+    }
+
+    #[test]
+    fn close_blocked_until_outer_object_brace_emitted() {
+        // Regression (Pi "dropped closing bracket"): qwen3.6 mq4 at temp>0
+        // sometimes jumps from the inner args `}` straight to `</tool_call>`,
+        // dropping the OUTER tool-call object's `}` and emitting invalid JSON
+        // (`{"name":"read","arguments":{"path":"/x"}` — no outer close). The
+        // grammar must require the outer `}` before permitting the close.
+        let mut m = Matcher::new(schemas_with_required(&[("read", &["path"])]));
+        m.advance("<tool_call>\n{\"name\": \"read\", \"arguments\": ");
+        // Model emits the balanced args VALUE object (required "path" present).
+        m.advance("{\"path\": \"/x\"}");
+        // Inner object closed (args_brace_depth back to 0) but the OUTER
+        // tool-call object `}` is still outstanding — the close must be blocked.
+        assert!(
+            !m.is_token_allowed("</tool_call>"),
+            "close marker must be rejected while the outer object brace is unclosed"
+        );
+        // The outer `}` itself is still allowed (not a close-marker token).
+        assert!(m.is_token_allowed("}"));
+        // After the outer `}` lands, the close marker is allowed.
+        m.advance("}");
+        assert!(
+            m.is_token_allowed("</tool_call>"),
+            "close marker must be allowed once the outer object is balanced"
+        );
+    }
+
+    #[test]
+    fn lt_char_inside_string_value_is_allowed() {
+        // Regression: the outer-brace close gate must NOT block a `<` that is
+        // part of a JSON STRING VALUE (heredoc `<<`, `#include <stdio.h>`,
+        // `a < b`, …). `touches_close_marker` is not string-aware, so a token
+        // ending in `<` looks like a `</tool_call>` prefix; the gate must still
+        // allow it because inside a string it is content, not the close marker.
+        let mut m = Matcher::new(schemas_with_required(&[("bash", &["command"])]));
+        m.advance("<tool_call>\n{\"name\": \"bash\", \"arguments\": ");
+        // Inside the command string value; required field "command" present.
+        m.advance("{\"command\": \"cat > /tmp/x.c ");
+        assert!(
+            m.is_token_allowed("<"),
+            "a bare '<' inside a string value must be allowed (heredoc/include)"
+        );
+        assert!(
+            m.is_token_allowed("<< 'EOF'"),
+            "a heredoc token inside a string value must be allowed"
+        );
+        assert!(
+            m.is_token_allowed("#include <stdio.h>"),
+            "C include with '<' inside a string value must be allowed"
+        );
     }
 
     #[test]
@@ -1350,7 +1493,7 @@ mod tests {
         assert!(m.is_token_allowed("<tool"));
         m.advance("<tool");
         assert!(matches!(m.state(), State::Out));
-        assert!(!m.is_free(), "matcher must be constraining mid-marker");
+        assert!(m.is_free(), "a partial marker must not constrain free text");
         assert!(m.is_token_allowed("_call>"));
         m.advance("_call>");
         assert!(matches!(m.state(), State::AfterOpen));
@@ -1464,7 +1607,7 @@ mod tests {
         // Every ChatML special token observed in qwen3.6 attractor
         // cases must be rejected at the `<tool_call>` boundary. These
         // are the tokens that leaked into the body in the Pi log + the
-        // CLI's parseOneToolCall sanitizer (cli/index.ts:2273-2278).
+        // Native control plane's parseOneToolCall-compatible sanitizer.
         let mut m = Matcher::new(schemas(&["bash"]));
         m.advance("<tool_call>");
         for tok in &[
@@ -1542,6 +1685,24 @@ mod tests {
         }
         assert!(matches!(m.state(), State::Out));
         assert!(m.is_free());
+    }
+
+    #[test]
+    fn free_text_angle_bracket_does_not_arm_the_mask() {
+        let mut m = Matcher::new(schemas(&["bash"]));
+        m.advance("HTML: ");
+        assert!(m.is_free());
+
+        m.advance("<");
+        assert!(m.is_free(), "a bare '<' must not constrain the sampler");
+        m.advance("p>hi</p>");
+        assert!(m.is_free());
+
+        m.advance(" and 2 < 3, table: <t");
+        assert!(m.is_free(), "'<t' must not constrain the sampler");
+        m.advance("able><tr></tr></table>");
+        assert!(m.is_free());
+        assert!(matches!(m.state(), State::Out));
     }
 
     #[test]
@@ -1797,8 +1958,11 @@ mod tests {
             !m.attractor_detected(),
             "code repetition inside a string value must NOT trip the guard"
         );
-        // The args body is still free so the model keeps writing its file.
-        assert!(m.is_free());
+        // The args body still accepts content so the model keeps writing its
+        // file. (It is no longer `is_free` — the outer-brace close gate is
+        // active while the object is open — but non-close content tokens
+        // remain allowed.)
+        assert!(m.is_token_allowed(" more code here"));
     }
 
     #[test]
@@ -2009,9 +2173,12 @@ mod tests {
         let mut m = Matcher::new(schemas_with_required(&[("write", &["path", "content"])]));
         m.advance("<tool_call>\n{\"name\": \"write\", \"arguments\": ");
         m.advance("{\"path\":\"/tmp/x\",\"content\":\"hello\"");
-        // Both `"path"` and `"content"` present in ngram_history.
+        // Both `"path"` and `"content"` present in ngram_history. The inner
+        // args object still needs its `}` and the outer tool-call object needs
+        // one more — so the canonical close is `}}\n</tool_call>` (the merged
+        // token is allowed because both braces land before the marker).
         assert!(m.is_token_allowed("}"));
-        assert!(m.is_token_allowed("}\n</tool_call>"));
+        assert!(m.is_token_allowed("}}\n</tool_call>"));
     }
 
     #[test]
@@ -2117,8 +2284,9 @@ mod tests {
     fn required_field_guard_allows_close_when_all_satisfied() {
         let mut m = Matcher::new(schemas_with_required(&[("write", &["path", "content"])]));
         m.advance("<tool_call>\n{\"name\": \"write\", \"arguments\": ");
-        m.advance("{\"path\":\"/tmp/x\",\"content\":\"hello\"}");
-        // Both required fields present in body — close is now allowed.
+        m.advance("{\"path\":\"/tmp/x\",\"content\":\"hello\"}}");
+        // Both required fields present AND the object is fully closed (inner
+        // args `}` + outer tool-call `}`) — close is now allowed.
         assert!(m.is_token_allowed("\n"));
         assert!(m.is_token_allowed("\n</tool_call>"));
         m.advance("\n</tool_call>");
@@ -2132,8 +2300,9 @@ mod tests {
         // — the guard is a no-op. Close fires normally.
         let mut m = Matcher::new(schemas_with_required(&[("list", &[])]));
         m.advance("<tool_call>\n{\"name\": \"list\", \"arguments\": ");
-        m.advance("{}");
-        // No required fields → trivially satisfied.
+        m.advance("{}}");
+        // No required fields → trivially satisfied; the args object `{}` and
+        // the outer tool-call object are both closed.
         assert!(m.is_token_allowed("\n</tool_call>"));
     }
 
@@ -2172,8 +2341,9 @@ mod tests {
         let mut m = Matcher::new(schemas_with_required(&[("bash", &["command"])]));
         m.advance("<tool_call>\n{\"name\": \"bash\", \"arguments\": ");
         // Field appears with spaces around the colon — still matches
-        // because we look for `"command"` substring.
-        m.advance("{ \"command\" : \"ls -la\" }");
+        // because we look for `"command"` substring. Close the inner args
+        // object and the outer tool-call object (`}}`) before the marker.
+        m.advance("{ \"command\" : \"ls -la\" }}");
         assert!(m.is_token_allowed("\n</tool_call>"));
     }
 
@@ -2366,5 +2536,201 @@ mod tests {
             "masked argmax should pick `\\n` (vocab[{}]={:?})",
             pick, vocab[pick]
         );
+    }
+
+    // ─── PR #567 regression: free text must not arm the <tool_call> mask ──
+    //
+    // Defect: Matcher::is_free() returned false for State::Out whenever the
+    // buffer ended with any prefix of "<tool_call>" (starting at a bare "<").
+    // The sampler then masked free text to only tokens continuing the marker,
+    // stranding prose like "<p>hi</p>", "2 < 3", or even "</think>".
+    // Fix: State::Out is unconditionally free; masking engages only after a
+    // full "<tool_call>" lands (transition to AfterOpen).
+
+    #[test]
+    fn pr567_genuine_tool_call_still_constrains() {
+        // No regression: a real <tool_call> must still arm the grammar.
+        let mut m = Matcher::new(schemas(&["bash"]));
+        m.advance("<tool_call>");
+        assert!(matches!(m.state(), State::AfterOpen));
+        assert!(!m.is_free(), "full <tool_call> must constrain");
+        assert!(!m.is_token_allowed("<|im_start|>"));
+        assert!(m.is_token_allowed("\n"));
+        assert!(m.is_token_allowed("\n{\"name\": \"bash\""));
+        let vocab = vec![
+            "<|im_start|>".to_string(),
+            "\n".to_string(),
+            "hello".to_string(),
+        ];
+        let mut mask = vec![false; vocab.len()];
+        m.token_mask(&vocab, &mut mask);
+        assert!(!mask[0], "attractor must be blocked after genuine open");
+        assert!(mask[1], "header prefix must be allowed");
+        assert!(!mask[2], "free prose must be blocked in AfterOpen");
+    }
+
+    #[test]
+    fn pr567_partial_prefixes_do_not_arm_mask() {
+        // Every strict prefix of "<tool_call>" must leave the sampler free.
+        let prefixes = [
+            "<",
+            "<t",
+            "<to",
+            "<too",
+            "<tool",
+            "<tool_",
+            "<tool_c",
+            "<tool_ca",
+            "<tool_cal",
+            "<tool_call",
+        ];
+        for prefix in prefixes {
+            let mut m = Matcher::new(schemas(&["bash"]));
+            m.advance(&format!("hello {}", prefix));
+            assert!(
+                m.is_free(),
+                "prefix {:?} must not arm mask; partial={:?}",
+                prefix,
+                m.partial()
+            );
+            assert!(matches!(m.state(), State::Out));
+            for tok in ["p>", "table>", " ", " hello", " 3", "</think>", ">"] {
+                assert!(
+                    m.is_token_allowed(tok),
+                    "prefix {:?} must allow token {:?}",
+                    prefix, tok
+                );
+            }
+            let vocab = vec![
+                "p>".to_string(),
+                "table>".to_string(),
+                "</think>".to_string(),
+                "<".to_string(),
+                "hello".to_string(),
+            ];
+            let mut mask = vec![false; vocab.len()];
+            m.token_mask(&vocab, &mut mask);
+            assert!(
+                mask.iter().all(|&b| b),
+                "prefix {:?} must leave token_mask all-true",
+                prefix
+            );
+        }
+        // Bare prefix at buffer start is also free.
+        let mut m = Matcher::new(schemas(&["bash"]));
+        m.advance("<");
+        assert!(m.is_free(), "bare '<' must be free");
+        assert!(m.is_token_allowed("p>"));
+        assert!(m.is_token_allowed("</think>"));
+    }
+
+    #[test]
+    fn pr567_false_start_diverging_is_not_masked() {
+        // A buffer that looked like a prefix then diverged must stay free.
+        let mut m = Matcher::new(schemas(&["bash"]));
+        m.advance("<tool");
+        assert!(m.is_free());
+        assert!(m.is_token_allowed("box>"), "<tool + box> diverges from marker");
+        m.advance("box>");
+        assert!(m.is_free());
+        assert!(matches!(m.state(), State::Out));
+
+        let mut m = Matcher::new(schemas(&["bash"]));
+        m.advance("<tool_cal");
+        assert!(m.is_free());
+        assert!(m.is_token_allowed("X"), "<tool_cal + X diverges");
+        assert!(m.is_token_allowed("x>"));
+
+        let mut m = Matcher::new(schemas(&["bash"]));
+        m.advance("<tool_call");
+        assert!(m.is_free());
+        assert!(m.is_token_allowed("X"), "<tool_call + X is not the marker");
+        assert!(m.is_token_allowed(" extra"));
+
+        // Whole false markers in one advance must not transition.
+        for txt in ["prefix <toolbox> suffix", "<tool_calX", "<tool-call>", "<tool_callX"] {
+            let mut m = Matcher::new(schemas(&["bash"]));
+            m.advance(txt);
+            assert!(
+                matches!(m.state(), State::Out),
+                "{:?} must not transition to AfterOpen",
+                txt
+            );
+            assert!(m.is_free(), "{:?} must be free", txt);
+        }
+    }
+
+    #[test]
+    fn pr567_partial_prefix_at_eos_stays_free() {
+        // Partial prefix at end-of-stream: next sampler step must be unconstrained.
+        let mut m = Matcher::new(schemas(&["bash"]));
+        m.advance("2 <");
+        assert!(m.is_free(), "'2 <' at EOS must be free");
+        for tok in [" 3", ">", " p>", "</think>", " hello", "\n"] {
+            assert!(m.is_token_allowed(tok), "'2 <' must allow {:?}", tok);
+        }
+        let vocab = vec![
+            " 3".to_string(),
+            ">".to_string(),
+            " p>".to_string(),
+            "</think>".to_string(),
+            "<".to_string(),
+        ];
+        let mut mask = vec![false; vocab.len()];
+        m.token_mask(&vocab, &mut mask);
+        assert!(mask.iter().all(|&b| b), "EOS partial must be all-true mask");
+
+        // Another EOS shape: HTML tag start cut off mid-token.
+        let mut m2 = Matcher::new(schemas(&["bash"]));
+        m2.advance("HTML: <table");
+        assert!(m2.is_free(), "HTML prefix at EOS must be free");
+        assert!(m2.is_token_allowed("><tr>"));
+        assert!(m2.is_token_allowed("</think>"));
+    }
+
+    #[test]
+    fn pr567_prefix_split_across_tokens() {
+        // Free-text prefix split across two token emissions must stay free.
+        let mut m = Matcher::new(schemas(&["bash"]));
+        m.advance("<");
+        assert!(m.is_free(), "'<' split must be free");
+        assert!(m.is_token_allowed("p>"));
+        m.advance("p>");
+        assert!(m.is_free());
+        assert!(matches!(m.state(), State::Out));
+
+        let mut m2 = Matcher::new(schemas(&["bash"]));
+        m2.advance("<tool");
+        assert!(m2.is_free());
+        assert!(m2.is_token_allowed("box>"));
+        m2.advance("box>");
+        assert!(m2.is_free());
+
+        // Genuine marker split across tokens must still transition.
+        let mut m3 = Matcher::new(schemas(&["bash"]));
+        m3.advance("<tool");
+        assert!(m3.is_free(), "partial genuine must be free before completion");
+        assert!(m3.is_token_allowed("_call>"));
+        m3.advance("_call>");
+        assert!(matches!(m3.state(), State::AfterOpen));
+        assert!(!m3.is_free(), "full marker split must constrain");
+
+        // Multi-token free sequence: "2" + " <" + " 3"
+        let mut m4 = Matcher::new(schemas(&["bash"]));
+        m4.advance("2");
+        m4.advance(" <");
+        assert!(m4.is_free(), "'2 <' split must be free");
+        assert!(m4.is_token_allowed(" 3"));
+        assert!(m4.is_token_allowed("</think>"));
+
+        // HTML split: "HTML: " + "<" + "t" + "able>"
+        let mut m5 = Matcher::new(schemas(&["bash"]));
+        m5.advance("HTML: ");
+        m5.advance("<");
+        assert!(m5.is_free());
+        m5.advance("t");
+        assert!(m5.is_free());
+        m5.advance("able>");
+        assert!(m5.is_free());
     }
 }

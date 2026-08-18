@@ -1,0 +1,9 @@
+gpu_id=1
+pairs=21
+idle_secs=5
+git_head=06a758197968c2cfa2727ee81c08fccaae3ac1e8
+git_dirty=1
+shape=gate_up
+m=17408
+k=5120
+n=2048

@@ -1,0 +1,4 @@
+baseline: prefill_single=1115.200 decode_single=32.900 raw_prefill=[1115.2]
+compact3: prefill_single=1110.500 decode_single=32.900 raw_prefill=[1110.5]
+compact3_vs_baseline=0.9958x (-0.42%)
+token_ids_match=True baseline_variants=1 compact3_variants=1

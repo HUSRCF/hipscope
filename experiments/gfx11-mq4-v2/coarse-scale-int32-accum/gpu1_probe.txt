@@ -1,0 +1,2 @@
+visible_device_count=1
+device[0]=AMD Radeon Pro W7900 Dual Slot arch=gfx1100 multiprocessors=48

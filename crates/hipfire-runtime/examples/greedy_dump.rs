@@ -113,21 +113,41 @@ fn main() {
     eprintln!("prompt: {} tokens", prompt_tokens.len());
 
     // ---- KV / DeltaNet / scratch ----
-    let kv_seq = 2048usize;
-    let mut kv_cache = KvCache::new_gpu_q8(
-        &mut gpu,
-        config.n_layers,
-        config.n_kv_heads,
-        config.head_dim,
-        kv_seq,
-    )
-    .unwrap();
-    let mut dn_state = DeltaNetState::new(&mut gpu, &config).unwrap();
-    let scratch = Qwen35Scratch::new(&mut gpu, &config, 128).unwrap();
-
-    let max_gen = std::env::var("MAX_TOKENS")
+    let requested_max_gen = std::env::var("MAX_TOKENS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok());
+    let kv_seq = std::env::var("GREEDY_DUMP_CTX")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(2048)
+        .max(prompt_tokens.len() + requested_max_gen.unwrap_or(64) + 8);
+    let kv_mode = match hipfire_runtime::config::get().kv_mode.as_str() {
+        "auto" => "q8",
+        mode => mode,
+    };
+    eprintln!("greedy_dump: kv_mode={kv_mode} ctx={kv_seq}");
+    let mut kv_cache = match kv_mode {
+        "q8" => KvCache::new_gpu_q8(
+            &mut gpu,
+            config.n_layers,
+            config.n_kv_heads,
+            config.head_dim,
+            kv_seq,
+        ),
+        "asym3" | "turbo3" | "turbo" => KvCache::new_gpu_asym3(
+            &mut gpu,
+            config.n_layers,
+            config.n_kv_heads,
+            config.head_dim,
+            kv_seq,
+        ),
+        other => panic!("unsupported GREEDY_DUMP KV mode: {other} (use q8|asym3)"),
+    }
+    .unwrap();
+    let mut dn_state = DeltaNetState::new(&mut gpu, &config).unwrap();
+    let scratch = Qwen35Scratch::new_with_kv_max(&mut gpu, &config, 128, kv_seq).unwrap();
+
+    let max_gen = requested_max_gen
         .unwrap_or_else(|| kv_seq.saturating_sub(prompt_tokens.len() + 8));
     let mut out: Box<dyn Write> = if let Some(ref path) = out_path {
         Box::new(std::fs::File::create(path).expect("create out"))

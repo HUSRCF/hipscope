@@ -1,0 +1,11 @@
+trial	order	mode	prefill_ms	prefill_tok_s	gen_tok_s	ck_active
+1	1	baseline	9548.62	857.9	33.0	1
+1	2	candidate	9369.37	874.3	32.9	1
+2	1	candidate	9370.17	874.3	32.8	1
+2	2	baseline	9644.25	849.4	32.9	1
+3	1	baseline	9616.05	851.9	32.9	1
+3	2	candidate	9322.78	878.7	33.0	1
+4	1	candidate	9346.41	876.5	32.9	1
+4	2	baseline	9645.67	849.3	32.9	1
+5	1	baseline	9625.03	851.1	32.9	1
+5	2	candidate	9328.41	878.2	32.9	1

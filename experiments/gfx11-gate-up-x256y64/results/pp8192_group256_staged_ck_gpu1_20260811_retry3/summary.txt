@@ -1,0 +1,9 @@
+group128_raw=[1184.5, 1172.4, 1179.5, 1175.7, 1166.6]
+group256_raw=[1189.1, 1180.7, 1194.5, 1196.1, 1178.3]
+trim_each_side=1
+group128_trimmed_median=1175.700
+group256_trimmed_median=1189.100
+group256_vs_group128=1.0114x (+1.14%)
+paired_ratios=[1.003883495145631, 1.007079495052883, 1.0127172530733362, 1.0173513651441692, 1.0100291445225442]
+paired_ratio_median=1.0100x
+token_ids_match=True group128_variants=1 group256_variants=1

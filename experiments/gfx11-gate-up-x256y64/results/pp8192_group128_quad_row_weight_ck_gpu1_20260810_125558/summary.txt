@@ -1,0 +1,5 @@
+baseline: prefill_median=1059.700 decode_median=33.000 raw_prefill=[1066.3, 1059.6, 1059.7, 1058.5, 1059.7]
+quad_row: prefill_median=1101.200 decode_median=33.100 raw_prefill=[1103.2, 1100.4, 1101.2, 1102.0, 1098.1]
+trim_each_side=1 baseline_trimmed_median=1059.700 quad_row_trimmed_median=1101.200
+quad_row_vs_baseline=1.0392x (+3.92%)
+token_ids_match=True baseline_variants=1 quad_row_variants=1
