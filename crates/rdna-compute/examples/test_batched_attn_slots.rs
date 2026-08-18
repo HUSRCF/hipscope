@@ -776,6 +776,7 @@ fn run_general_reference(
                     None,
                     0,
                     0,
+                    false,
                 )
                 .expect("asym3 legacy reference");
             }
