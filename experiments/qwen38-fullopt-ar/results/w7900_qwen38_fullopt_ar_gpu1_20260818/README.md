@@ -24,6 +24,26 @@ gfx11 packed-MQ4 production routes were enabled.
 contains one complete process log per prefill/capacity point and per decode
 trial; each prefill/capacity log records its warmup plus five reported runs.
 
+## Figures
+
+- `figures/qwen38_prefill_scaling.pdf` and `.png`
+- `figures/qwen38_decode_scaling.pdf` and `.png`
+
+![Qwen3.8-27B prefill throughput scaling](figures/qwen38_prefill_scaling.png)
+
+![Qwen3.8-27B AR decode throughput scaling](figures/qwen38_decode_scaling.png)
+
+Regenerate both figures from the raw TSV files with:
+
+```bash
+MPLCONFIGDIR=/tmp/matplotlib-qwen38 \
+python experiments/qwen38-fullopt-ar/plot_results.py
+```
+
+The plotting script requests Arial and automatically uses the metrically
+compatible Liberation Sans fallback when Arial is unavailable. The archived
+PDFs embed Liberation Sans because Arial is not installed on this host.
+
 ## Prefill length sweep
 
 | Prompt tokens | Median tok/s | Five samples (tok/s) |
