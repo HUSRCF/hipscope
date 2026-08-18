@@ -19189,6 +19189,18 @@ struct SpecRun {
     decode_s: f64,
 }
 
+/// Long cold prompts cannot use the current speculative seed path when CASK
+/// bounds the physical KV window. Route them to AR, whose prefill loop evicts
+/// between chunks, before emitting `gen_start` or mutating target state.
+fn dflash_eviction_requires_ar_fallback(
+    prompt_len: usize,
+    block_size: usize,
+    physical_cap: usize,
+    eviction_enabled: bool,
+) -> bool {
+    eviction_enabled && prompt_len.saturating_add(block_size) > physical_cap
+}
+
 fn generate_dflash(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
@@ -19599,6 +19611,22 @@ fn generate_dflash(
         ),
         None => (prompt_tokens.clone(), 0, false, 0),
     };
+
+    let spec_block_size = m.speculator.as_ref().map_or(0, |s| s.block_size());
+    if dflash_eviction_requires_ar_fallback(
+        prompt_tokens.len(),
+        spec_block_size,
+        m.physical_cap,
+        m.eviction.is_some(),
+    ) {
+        eprintln!(
+            "[dflash] prompt={} + block={} exceeds eviction physical_cap={}; falling back to eviction-aware AR prefill",
+            prompt_tokens.len(),
+            spec_block_size,
+            m.physical_cap,
+        );
+        return false;
+    }
 
     // ── Grammar-guided decoding setup (dflash path) ─────────────
     //
@@ -41063,6 +41091,23 @@ mod qwen_dflash_semantic_terminal_tests {
     }
 
     // ── Remaining Important Task 4 vetoes (wrapper / legacy / rewind) ──
+
+    #[test]
+    fn dflash_long_prompt_falls_back_to_ar_only_with_eviction() {
+        assert!(dflash_eviction_requires_ar_fallback(4600, 16, 4608, true));
+        assert!(!dflash_eviction_requires_ar_fallback(4592, 16, 4608, true));
+        assert!(!dflash_eviction_requires_ar_fallback(4600, 16, 4608, false));
+    }
+
+    #[test]
+    fn dflash_eviction_admission_is_overflow_safe() {
+        assert!(dflash_eviction_requires_ar_fallback(
+            usize::MAX,
+            16,
+            4608,
+            true
+        ));
+    }
 
     /// generate_dflash max_tokens==0: emit_active_attempt_error then return true
     /// (handled) before Jinja/render/set_sampling/gen_start. Same wire as the
