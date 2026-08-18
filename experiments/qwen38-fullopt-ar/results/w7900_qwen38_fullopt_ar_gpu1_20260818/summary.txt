@@ -1,0 +1,15 @@
+PREFILL_MEDIANS
+prefill pp=64 kv_seq=auto median_tok_s=386.30 raw=[386.3, 390.8, 384.4, 386.3, 390.1]
+prefill pp=256 kv_seq=auto median_tok_s=1050.00 raw=[1049.0, 1050.9, 1046.8, 1050.3, 1050.0]
+prefill pp=1024 kv_seq=auto median_tok_s=1157.70 raw=[1159.7, 1158.5, 1157.0, 1157.7, 1155.4]
+prefill pp=2048 kv_seq=auto median_tok_s=1250.70 raw=[1257.0, 1255.4, 1250.7, 1247.5, 1244.6]
+prefill pp=4096 kv_seq=auto median_tok_s=1234.40 raw=[1248.4, 1242.1, 1234.4, 1229.8, 1225.4]
+prefill pp=8192 kv_seq=auto median_tok_s=1194.30 raw=[1208.3, 1199.2, 1193.2, 1191.8, 1194.3]
+capacity pp=2048 kv_seq=65536 median_tok_s=1275.20 raw=[1280.8, 1279.5, 1275.2, 1271.1, 1268.3]
+capacity pp=2048 kv_seq=131072 median_tok_s=1249.40 raw=[1255.2, 1253.7, 1249.4, 1246.5, 1243.2]
+capacity pp=2048 kv_seq=196608 median_tok_s=1239.00 raw=[1244.4, 1240.4, 1239.0, 1237.1, 1233.8]
+DECODE_MEDIANS
+context=64 median_tok_s=34.60 raw=[34.6, 34.7, 34.6, 34.6, 34.6]
+context=65536 median_tok_s=24.50 raw=[24.5, 24.5, 24.5, 24.5, 24.5]
+context=131072 median_tok_s=18.60 raw=[18.6, 18.6, 18.6, 18.5, 18.5]
+context=196608 median_tok_s=14.90 raw=[14.9, 14.9, 14.9, 14.9, 14.9]

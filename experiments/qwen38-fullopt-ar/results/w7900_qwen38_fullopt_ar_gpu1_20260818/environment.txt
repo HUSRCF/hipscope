@@ -1,0 +1,15 @@
+date: 2026-08-18
+host: Linux 7.0.0-28-generic x86_64 GNU/Linux
+gpu: AMD Radeon Pro W7900 Dual Slot
+architecture: gfx1100
+reported_vram: 48.3 GB
+rocm_hip: 7.14.60850-0000000
+compiler: AMD clang 23.0.0git 46fcb339fb61119b337f973c7ca9e710a319fdd0
+source_commit: f35877f18666308b9c8208bdc34b721c8812b597
+benchmark: scripts/bench_qwen38_fullopt_ar_matrix.sh
+trials_per_point: 5
+decode_tokens: 4096
+speculation: off (AR only)
+kv_mode: asym3 K / q8 V
+prefill_max_batch: 2048
+short_prefill_start_temperature: junction 58 C, memory 55 C
