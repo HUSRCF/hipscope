@@ -55,4 +55,3 @@ only closes this existing generic pipeline/configuration; a useful replacement
 still needs a hipfire-specific execution format and dataflow that avoids the
 current packed-MQ4 decode/feed costs without losing the specialized kernel's
 projection throughput.
-

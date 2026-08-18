@@ -33,4 +33,3 @@ static auto register_f16i4_gfx11 = []() {
 
     return 0;
 }();
-
