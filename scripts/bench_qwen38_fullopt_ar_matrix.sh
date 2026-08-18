@@ -6,6 +6,9 @@ GPU_ID="${GPU_ID:-1}"
 TRIALS="${TRIALS:-5}"
 COOL_SECS="${COOL_SECS:-10}"
 DECODE_TOKENS="${DECODE_TOKENS:-4096}"
+RUN_PREFILL="${RUN_PREFILL:-1}"
+RUN_CAPACITY="${RUN_CAPACITY:-1}"
+RUN_DECODE="${RUN_DECODE:-1}"
 MODEL="${MODEL:-${HOME}/.hipfire/models/qwen3.8-27b.mq4}"
 BIN="${BIN:-${ROOT}/target/release/examples/bench_qwen35_mq4}"
 SIDECAR="${HIPFIRE_FLASH_ATTN_CK_QUANTIZED_LIB:-${ROOT}/experiments/flash-attn-ck-sidecar/quantized/build/libhipfire_flash_attn_ck_quantized_staged.so}"
@@ -21,8 +24,18 @@ done
 [[ "${TRIALS}" =~ ^[1-9][0-9]*$ ]] || { echo "TRIALS must be positive" >&2; exit 1; }
 
 mkdir -p "${OUT_DIR}/logs"
-printf 'workload\tprefill_tokens\tkv_seq\tsample\tprefill_ms\tprefill_tok_s\n' >"${OUT_DIR}/prefill.tsv"
-printf 'context_tokens\tgen_tokens\tsample\ttotal_ms\tgen_tok_s\tavg_ms\tp50_ms\n' >"${OUT_DIR}/decode.tsv"
+if [[ "${RUN_PREFILL}" == "1" ]]; then
+    printf 'workload\tprefill_tokens\tkv_seq\tsample\tprefill_ms\tprefill_tok_s\n' >"${OUT_DIR}/prefill.tsv"
+elif [[ ! -f "${OUT_DIR}/prefill.tsv" ]]; then
+    echo "RUN_PREFILL=0 requires an existing ${OUT_DIR}/prefill.tsv" >&2
+    exit 1
+fi
+if [[ "${RUN_DECODE}" == "1" ]]; then
+    printf 'context_tokens\tgen_tokens\tsample\ttotal_ms\tgen_tok_s\tavg_ms\tp50_ms\n' >"${OUT_DIR}/decode.tsv"
+elif [[ ! -f "${OUT_DIR}/decode.tsv" ]]; then
+    echo "RUN_DECODE=0 requires an existing ${OUT_DIR}/decode.tsv" >&2
+    exit 1
+fi
 sha256sum "${MODEL}" "${BIN}" "${SIDECAR}" >"${OUT_DIR}/artifacts.sha256"
 
 common_env=(
@@ -76,33 +89,42 @@ for sample, (_, ms, tok_s) in enumerate(rows[-trials:], 1):
 PY
 }
 
-echo "[1/3] steady-state prefill matrix"
-for prefill in "${PREFILL_LENGTHS[@]}"; do
-    log="${OUT_DIR}/logs/prefill_pp${prefill}.log"
-    run_bench 600 "${log}" \
-        --prefill "${prefill}" --prefill-runs "$((TRIALS + 1))" --warmup 0 --gen 0
-    collect_prefill prefill "${prefill}" auto "${log}"
-    sleep "${COOL_SECS}"
-done
+if [[ "${RUN_PREFILL}" == "1" ]]; then
+    echo "[1/3] steady-state prefill matrix"
+    for prefill in "${PREFILL_LENGTHS[@]}"; do
+        log="${OUT_DIR}/logs/prefill_pp${prefill}.log"
+        run_bench 600 "${log}" \
+            --prefill "${prefill}" --prefill-runs "$((TRIALS + 1))" --warmup 0 --gen 0
+        collect_prefill prefill "${prefill}" auto "${log}"
+        sleep "${COOL_SECS}"
+    done
+fi
 
-echo "[2/3] PP2048 at fixed KV capacities"
-for kv_seq in "${CAPACITIES[@]}"; do
-    log="${OUT_DIR}/logs/capacity_pp2048_kv${kv_seq}.log"
-    run_bench 600 "${log}" \
-        --prefill 2048 --prefill-runs "$((TRIALS + 1))" --warmup 0 --gen 0 --kv-seq "${kv_seq}"
-    collect_prefill capacity 2048 "${kv_seq}" "${log}"
-    sleep "${COOL_SECS}"
-done
+if [[ "${RUN_CAPACITY}" == "1" ]]; then
+    echo "[2/3] PP2048 at fixed KV capacities"
+    # Retain ordinary prefill rows while replacing capacity rows on resume.
+    awk -F '\t' 'NR == 1 || $1 != "capacity"' "${OUT_DIR}/prefill.tsv" \
+        >"${OUT_DIR}/prefill.tsv.tmp"
+    mv "${OUT_DIR}/prefill.tsv.tmp" "${OUT_DIR}/prefill.tsv"
+    for kv_seq in "${CAPACITIES[@]}"; do
+        log="${OUT_DIR}/logs/capacity_pp2048_kv${kv_seq}.log"
+        run_bench 600 "${log}" \
+            --prefill 2048 --prefill-runs "$((TRIALS + 1))" --warmup 0 --gen 0 --kv-seq "${kv_seq}"
+        collect_prefill capacity 2048 "${kv_seq}" "${log}"
+        sleep "${COOL_SECS}"
+    done
+fi
 
-echo "[3/3] long AR decode matrix"
-for context in "${DECODE_CONTEXTS[@]}"; do
-    for ((sample=1; sample<=TRIALS; sample++)); do
-        log="${OUT_DIR}/logs/decode_ctx${context}_trial${sample}.log"
-        timeout_s=$((900 + context / 256 + DECODE_TOKENS))
-        run_bench "${timeout_s}" "${log}" \
-            --prefill "${context}" --prefill-runs 1 --warmup 8 --gen "${DECODE_TOKENS}"
-        python3 - "${context}" "${DECODE_TOKENS}" "${sample}" "${log}" \
-            >>"${OUT_DIR}/decode.tsv" <<'PY'
+if [[ "${RUN_DECODE}" == "1" ]]; then
+    echo "[3/3] long AR decode matrix"
+    for context in "${DECODE_CONTEXTS[@]}"; do
+        for ((sample=1; sample<=TRIALS; sample++)); do
+            log="${OUT_DIR}/logs/decode_ctx${context}_trial${sample}.log"
+            timeout_s=$((900 + context / 256 + DECODE_TOKENS))
+            run_bench "${timeout_s}" "${log}" \
+                --prefill "${context}" --prefill-runs 1 --warmup 8 --gen "${DECODE_TOKENS}"
+            python3 - "${context}" "${DECODE_TOKENS}" "${sample}" "${log}" \
+                >>"${OUT_DIR}/decode.tsv" <<'PY'
 import re
 import sys
 
@@ -118,9 +140,10 @@ if int(emitted) != int(gen_tokens):
     raise SystemExit(f"{path}: expected {gen_tokens} generated tokens, got {emitted}")
 print(context, gen_tokens, sample, total_ms, fields["gen_tok_s"], fields["avg_ms"], fields["p50_ms"], sep="\t")
 PY
-        sleep "${COOL_SECS}"
+            sleep "${COOL_SECS}"
+        done
     done
-done
+fi
 
 python3 - "${OUT_DIR}" <<'PY' | tee "${OUT_DIR}/summary.txt"
 import csv

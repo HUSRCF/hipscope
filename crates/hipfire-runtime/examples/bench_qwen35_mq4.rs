@@ -514,49 +514,10 @@ fn main() {
     } else {
         for run in 0..prefill_runs {
             if run > 0 {
-                dn_state = DeltaNetState::new(&mut gpu, &config).unwrap();
-                kv_cache = match kv_mode.as_str() {
-                    "q8" => KvCache::new_gpu_q8(
-                        &mut gpu,
-                        config.n_layers,
-                        config.n_kv_heads,
-                        config.head_dim,
-                        kv_seq,
-                    )
-                    .unwrap(),
-                    "asym4" | "turbo4" => KvCache::new_gpu_asym4(
-                        &mut gpu,
-                        config.n_layers,
-                        config.n_kv_heads,
-                        config.head_dim,
-                        kv_seq,
-                    )
-                    .unwrap(),
-                    "asym3" | "turbo3" | "turbo" => KvCache::new_gpu_asym3(
-                        &mut gpu,
-                        config.n_layers,
-                        config.n_kv_heads,
-                        config.head_dim,
-                        kv_seq,
-                    )
-                    .unwrap(),
-                    "asym2" | "turbo2" => KvCache::new_gpu_asym2(
-                        &mut gpu,
-                        config.n_layers,
-                        config.n_kv_heads,
-                        config.head_dim,
-                        kv_seq,
-                    )
-                    .unwrap(),
-                    _ => KvCache::new_gpu_q8(
-                        &mut gpu,
-                        config.n_layers,
-                        config.n_kv_heads,
-                        config.head_dim,
-                        kv_seq,
-                    )
-                    .unwrap(),
-                };
+                // DeltaNetState has no Drop, so replacing it leaks device
+                // buffers. Reset it in place and reuse the KV allocation;
+                // every timed run overwrites the same [0, prefill_len) slots.
+                dn_state.reset(&mut gpu).expect("reset DeltaNet state");
             }
             let t_prefill = Instant::now();
             qwen35::forward_prefill_batch(
