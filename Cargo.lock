@@ -1973,8 +1973,8 @@ version = "0.3.0"
 dependencies = [
  "hip-bridge",
  "hipfire-config",
- "radiowave",
  "libloading",
+ "radiowave",
  "rayon",
  "redline-dispatch",
  "redline-rocr",
