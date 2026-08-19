@@ -707,6 +707,7 @@ pub(crate) fn serve_foreground(
                 let tokenizer =
                     hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
                         .map_err(|e| anyhow!("multi_slot: tokenizer: {e}"))?;
+                let chat_template = hfq.chat_template();
                 drop(hfq);
                 // The engine runs IN this process, so hardware.devices /
                 // HIPFIRE_DEVICES must be applied here — the daemon does this in
@@ -730,7 +731,15 @@ pub(crate) fn serve_foreground(
                     "serve: multi-slot backend up ({} slots, {} ctx) - requests run concurrently",
                     n_slots, cap_tokens
                 );
-                Some(Arc::new(slots::SlotBackend { engine, tokenizer }))
+                Some(Arc::new(slots::SlotBackend {
+                    engine,
+                    tokenizer,
+                    chat_template,
+                    tool_grammar: hipfire_runtime::prompt_frame::qwen35_grammar_on(
+                        env::var("HIPFIRE_QWEN35_GRAMMAR").ok().as_deref(),
+                        &model_path.to_string_lossy(),
+                    ),
+                }))
             }
             _ => None,
         };

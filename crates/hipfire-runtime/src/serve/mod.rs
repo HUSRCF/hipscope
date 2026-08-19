@@ -37,6 +37,12 @@ pub struct SubmitRequest {
     /// strict extension of the KV rather than a re-render of it.
     pub continuation: Vec<u32>,
     pub max_tokens: usize,
+    /// 0.0 = greedy. Per-request; the engine installs it on the slot.
+    pub temperature: f32,
+    pub top_p: f32,
+    /// 0 disables top-k.
+    pub top_k: i32,
+    pub seed: u32,
     pub reply: Sender<Event>,
 }
 
@@ -51,10 +57,26 @@ pub enum DoneReason {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
-    Accepted { session: u64 },
-    Token { id: u32 },
-    Done { reason: DoneReason },
-    Rejected { reason: String },
+    /// `reused` — prompt tokens served from the session's existing KV;
+    /// `prefill` — tokens actually prefilled this turn. Together they are the
+    /// client-visible prompt accounting (OpenAI `usage.prompt_tokens` =
+    /// reused + prefill, `cached_tokens` = reused).
+    Accepted {
+        session: u64,
+        reused: usize,
+        prefill: usize,
+    },
+    Token {
+        id: u32,
+    },
+    /// `generated` — tokens delivered to the client (terminators excluded).
+    Done {
+        reason: DoneReason,
+        generated: usize,
+    },
+    Rejected {
+        reason: String,
+    },
 }
 
 /// Post an event to a client, reporting a vanished receiver as an error.
@@ -115,21 +137,38 @@ mod tests {
     #[test]
     fn a_live_client_receives_its_events_in_order() {
         let (tx, rx) = channel::<Event>();
-        send_event(&tx, Event::Accepted { session: 4 }).unwrap();
+        send_event(
+            &tx,
+            Event::Accepted {
+                session: 4,
+                reused: 10,
+                prefill: 2,
+            },
+        )
+        .unwrap();
         send_event(&tx, Event::Token { id: 7 }).unwrap();
         send_event(
             &tx,
             Event::Done {
                 reason: DoneReason::Eos,
+                generated: 1,
             },
         )
         .unwrap();
-        assert_eq!(rx.recv().unwrap(), Event::Accepted { session: 4 });
+        assert_eq!(
+            rx.recv().unwrap(),
+            Event::Accepted {
+                session: 4,
+                reused: 10,
+                prefill: 2
+            }
+        );
         assert_eq!(rx.recv().unwrap(), Event::Token { id: 7 });
         assert_eq!(
             rx.recv().unwrap(),
             Event::Done {
-                reason: DoneReason::Eos
+                reason: DoneReason::Eos,
+                generated: 1
             }
         );
     }

@@ -420,7 +420,14 @@ fn run_loop(mut rig: Rig, rx: Receiver<SubmitRequest>, stats: Arc<Mutex<EngineSt
                 } else {
                     DoneReason::MaxTokens
                 };
-                let _ = send_event(&f.reply, Event::Done { reason });
+                // Terminator and undelivered (gone) tokens are counted by
+                // `produced` but never reached the client.
+                let generated = if hit_eos || gone {
+                    f.produced - 1
+                } else {
+                    f.produced
+                };
+                let _ = send_event(&f.reply, Event::Done { reason, generated });
                 slots[s] = None;
                 work[s].remaining_prompt.clear();
                 if matches!(reason, DoneReason::ClientGone) {
@@ -481,7 +488,16 @@ fn admit(
                 );
             }
         }
-        if let Some(existing) = rig.sessions.find_continuation(&req.convo, &busy) {
+        // One-turn-ahead match first (a new user turn); equal-convo reentry
+        // second (a tool-result iteration). Both append `continuation` to the
+        // session's exact stored tokens, so either way the KV and DeltaNet
+        // state extend strictly — the client built the suffix for whichever
+        // tail shape it sent.
+        if let Some(existing) = rig
+            .sessions
+            .find_continuation(&req.convo, &busy)
+            .or_else(|| rig.sessions.find_reentry(&req.convo, &busy))
+        {
             let base = rig
                 .sessions
                 .get(existing)
@@ -525,6 +541,8 @@ fn admit(
                         &req.reply,
                         Event::Accepted {
                             session: existing.0,
+                            reused: plan.reused,
+                            prefill: extended.len() - plan.reused,
                         },
                     )
                     .is_ok()
@@ -532,6 +550,12 @@ fn admit(
                         work[slot.0].remaining_prompt = extended[plan.reused..].to_vec();
                         work[slot.0].next_pos = plan.reused;
                         work[slot.0].decoding = false;
+                        rig.sample_params[slot.0] = SlotSampleParams {
+                            temperature: req.temperature,
+                            top_p: req.top_p,
+                            top_k: req.top_k,
+                            seed: req.seed,
+                        };
                         slots[slot.0] = Some(InFlight {
                             session: existing,
                             reply: req.reply,
@@ -664,7 +688,16 @@ fn admit(
         sess.convo = req.convo.clone();
     }
 
-    if send_event(&req.reply, Event::Accepted { session: id.0 }).is_err() {
+    if send_event(
+        &req.reply,
+        Event::Accepted {
+            session: id.0,
+            reused: plan.reused,
+            prefill: req.prompt_tokens.len() - plan.reused,
+        },
+    )
+    .is_err()
+    {
         rig.sessions.close(&mut rig.pool, &mut rig.adm, id);
         return;
     }
@@ -672,6 +705,12 @@ fn admit(
     work[slot.0].remaining_prompt = req.prompt_tokens[plan.reused..].to_vec();
     work[slot.0].next_pos = plan.reused;
     work[slot.0].decoding = false;
+    rig.sample_params[slot.0] = SlotSampleParams {
+        temperature: req.temperature,
+        top_p: req.top_p,
+        top_k: req.top_k,
+        seed: req.seed,
+    };
     slots[slot.0] = Some(InFlight {
         session: id,
         reply: req.reply,

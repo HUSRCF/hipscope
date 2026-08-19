@@ -187,6 +187,26 @@ impl SessionTable {
             .map(|(id, _)| SessionId(*id))
     }
 
+    /// Find a session whose conversation equals `want` exactly — a tool-result
+    /// iteration: the client feeds tool outputs back without adding a user
+    /// turn, so the user-turn identity is unchanged while the token stream
+    /// still strictly extends the session's KV.
+    pub fn find_reentry(&self, want: &[u64], busy: &[SessionId]) -> Option<SessionId> {
+        if want.is_empty() {
+            return None;
+        }
+        self.sessions
+            .iter()
+            .filter(|(id, s)| {
+                s.residency != Residency::Cold
+                    && s.convo.as_slice() == want
+                    && !s.tokens.is_empty()
+                    && !busy.iter().any(|b| b.0 == **id)
+            })
+            .max_by_key(|(_, s)| s.last_used)
+            .map(|(id, _)| SessionId(*id))
+    }
+
     /// Mark a session as most-recently used, for LRU.
     pub fn touch(&mut self, id: SessionId) {
         self.clock += 1;

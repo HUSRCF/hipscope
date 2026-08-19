@@ -87,6 +87,10 @@ fn main() {
                 convo: Vec::new(),
                 continuation: Vec::new(),
                 max_tokens: MAX_TOKENS,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: 0,
+                seed: 0,
                 reply: tx,
             })
             .expect("submit");

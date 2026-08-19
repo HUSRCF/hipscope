@@ -336,6 +336,10 @@ impl ConcurrencyBackend for SlotDriver {
                     convo,
                     continuation: Vec::new(),
                     max_tokens: max_tokens as usize,
+                    temperature: 0.0,
+                    top_p: 1.0,
+                    top_k: 0,
+                    seed: 0,
                     reply: tx,
                 })
                 .map_err(|e| anyhow::anyhow!("slots submit: {e}"))?;
@@ -348,7 +352,7 @@ impl ConcurrencyBackend for SlotDriver {
         for (i, rx) in rxs.into_iter().enumerate() {
             while let Ok(ev) = rx.recv() {
                 match ev {
-                    Event::Accepted { session } => sessions[i] = Some(session),
+                    Event::Accepted { session, .. } => sessions[i] = Some(session),
                     Event::Token { .. } => tokens += 1,
                     Event::Done { .. } => break,
                     Event::Rejected { .. } => {
@@ -381,6 +385,10 @@ impl ConcurrencyBackend for SlotDriver {
                         convo,
                         continuation,
                         max_tokens: max_tokens as usize,
+                        temperature: 0.0,
+                        top_p: 1.0,
+                        top_k: 0,
+                        seed: 0,
                         reply: tx,
                     })
                     .map_err(|e| anyhow::anyhow!("slots submit turn2: {e}"))?;

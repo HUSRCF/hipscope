@@ -301,6 +301,38 @@ pub fn continuation_suffix(tokenizer: &Tokenizer, user: &str, prefix: AssistantP
     out
 }
 
+/// Continuation for a tool-result iteration: the assistant turn the session's
+/// tokens ended in emitted tool calls, and this turn feeds the results back.
+///
+/// Rendered in the Qwen3.5 official-template shape — one USER turn wrapping
+/// every result in `<tool_response>` blocks — because that is what a cold
+/// jinja render of the same history would produce, so the model sees its
+/// trained format either way. Strict extension for the same reason as
+/// [`continuation_suffix`]: the generated tool-call turn stays in the KV
+/// verbatim instead of being re-rendered from the client's echo.
+pub fn continuation_suffix_tool_results(
+    tokenizer: &Tokenizer,
+    results: &[String],
+    prefix: AssistantPrefix,
+) -> Vec<u32> {
+    let scaffold = ChatScaffold::for_tokenizer(tokenizer);
+    let mut out: Vec<u32> = Vec::new();
+    out.extend_from_slice(&scaffold.im_end);
+    out.extend_from_slice(&scaffold.nl);
+    let mut body = String::new();
+    for (i, r) in results.iter().enumerate() {
+        if i > 0 {
+            body.push('\n');
+        }
+        body.push_str("<tool_response>\n");
+        body.push_str(r);
+        body.push_str("\n</tool_response>");
+    }
+    scaffold.append_user_turn(&mut out, &body);
+    scaffold.append_assistant_prefix(&mut out, prefix);
+    out
+}
+
 /// Pre-encoded ChatML scaffolding plus a borrowed tokenizer reference.
 /// The fixed structural tokens (`<|im_start|>`, role names, `\n`,
 /// `<|im_end|>`) are encoded once up front; per-turn content gets
