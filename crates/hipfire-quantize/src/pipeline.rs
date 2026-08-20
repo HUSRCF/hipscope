@@ -3912,6 +3912,17 @@ fn handle_moe_expert_3d(
     let expert_mq6 = (use_mq6g256
         || use_mq4_mq6exp
         || (kmap_promote && use_mq4g256)
+        // qt44/qt45 must promote too. Without these two terms `--format mq4`
+        // (which sets use_mq4v2, NOT use_mq4g256) silently drops every K-map
+        // Promote6 routed expert from 6-bit to 4-bit. Measured on Ornith 1.5
+        // 35B-A3B: `--format mq4v1` emits 8,235 Mq6G256 tensors, `--format mq4`
+        // emitted 43 — a loss of 8,192 expert tensors' worth of precision.
+        //
+        // #599's description states "K-map Promote6 now emits MQ6 for qt44/qt45
+        // when K%256==0". That holds on the non-expert path; this arm is where
+        // routed experts are decided, and it was never updated.
+        || (kmap_promote && use_mq4v2)
+        || (kmap_promote && use_mq4c)
         || (kmap_promote && use_mq4_mq2lloyd_kmap)
         || (kmap_promote && use_mq4_mq2lloyd_imatrix)
         || (kmap_promote && use_mq4_mq2lloyd_gptq_all)

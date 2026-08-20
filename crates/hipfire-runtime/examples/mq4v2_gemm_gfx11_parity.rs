@@ -190,6 +190,12 @@ fn main() {
     //   gpr = 8  → quads 2, tail 0 — main loop only
     // Run all three. (The first version of this test used only gpr=3 and
     // therefore never executed the main quad loop at all.)
+    // Production shared-expert dimensions. The earlier shapes used tiny
+    // gate_m/up_m and N<16; Ornith 1.5's shared expert is 512/512 with K=2048
+    // and N=512 (a full prefill chunk), i.e. grid.y=64 batch tiles. A kernel can
+    // be correct at N=5 and wrong at N=512.
+    run_gate_up_production_benign(&mut gpu);
+    run_residual_production(&mut gpu);
     for &(k, n, label) in &[
         (768usize, 5usize, "gpr=3 quads=0 tail=3 (tail only)"),
         (1280usize, 5usize, "gpr=5 quads=1 tail=1 (both)"),
@@ -198,12 +204,342 @@ fn main() {
         println!("\n--- shape: K={k} N={n}  {label} ---");
         run_shape(&mut gpu, k, n);
     }
-    println!("\nPASS — gfx11 qt44 gate_up GEMM matches the two-grid oracle on all shapes");
+    for &(k, m, mt) in &[
+        (2048usize, 32usize, 16usize),
+        (512usize, 64usize, 32usize),
+    ] {
+        run_moe_shape(&mut gpu, k, m, mt);
+    }
+    run_moe_pipeline_shape(&mut gpu, 2048, 32);
+    run_moe_pipeline_shape(&mut gpu, 512, 64);
+    println!("\nPASS — gfx11 qt44 gate_up + MoE grouped GEMMs match the two-grid oracle");
+}
+
+/// Parity for the MoE grouped-expert GEMM — the kernel that decodes the routed
+/// experts, i.e. ~99% of an A3B MoE's tensors.
+///
+/// This was NOT covered when the kernel was first written. It compiled, the
+/// model produced fluent text, and that was treated as validation. A later KLD
+/// measurement put qt44 at 0.993 against qt13's 0.089 with identical precision
+/// mixes, which is exactly what a mis-decoding expert path looks like: coherent
+/// greedy output, badly wrong distributions.
+///
+/// Single expert, all slots routed to it, x_row_div = 1 — the simplest
+/// configuration that still exercises the real gather + tiling + WMMA path.
+fn run_moe_shape(gpu: &mut Gpu, k: usize, m: usize, m_total: usize) {
+    println!("\n--- MoE grouped: K={k} M={m} m_total={m_total} ---");
+    // Benign-magnitude fixture, deliberately NOT the [-1,1] / [96,160] one used
+    // for gate_up.
+    //
+    // This kernel's WMMA A operand is fp16, so dequantized weights are
+    // fp16-rounded. With half-1 weights near 128 (fp16 resolution 0.0625) and
+    // +/-1 activations, the 2048-term dot product cancels heavily and amplifies
+    // that rounding into ~20% relative error — which looks exactly like a broken
+    // kernel but is a property of the fixture. Halves of [1,2] and [4,8] with
+    // strictly positive activations keep the two grids clearly distinguishable
+    // (a single-header read reconstructs half 1 as ~1.5 instead of ~6) while
+    // removing the cancellation.
+    let mut w = vec![0.0f32; m * k];
+    for r in 0..m {
+        for g in 0..(k / GROUP) {
+            let base = r * k + g * GROUP;
+            let salt = (r * 7919 + g * 104_729) as u32 ^ 0x5151_5151;
+            for i in 0..HALF {
+                w[base + i] = 1.0 + prng(i, salt);
+            }
+            for i in HALF..GROUP {
+                w[base + i] = 4.0 + prng(i, salt ^ 0x5A5A_5A5A) * 4.0;
+            }
+        }
+    }
+    let blob = pack_mq4g256v2(&w, m, k);
+
+    // One expert; every tile maps to expert 0; slot i gathers source row i.
+    let n_tiles = m_total / 16;
+    let tile_ids: Vec<i32> = vec![0; n_tiles];
+    let slot_index: Vec<i32> = (0..m_total as i32).collect();
+
+    // The launcher converts X to fp16 (ensure_fp16_x), so the reference must be
+    // computed on the SAME fp16-rounded activations. Otherwise the comparison
+    // also measures the input conversion — and with half-1 weights near 128
+    // against +/-1 activations the dot product cancels heavily, amplifying that
+    // conversion error into a false "kernel is wrong" verdict.
+    let mut x = vec![0.0f32; m_total * k];
+    for (i, v) in x.iter_mut().enumerate() {
+        // Strictly positive: no sign cancellation in the dot product.
+        let raw = 0.5 + prng(i, 0x0BAD_F00D);
+        *v = f16::from_f32(raw).to_f32();
+    }
+
+    let d_blob = gpu.upload_raw(&blob, &[blob.len()]).unwrap();
+    let ptr_val: u64 = d_blob.buf.as_ptr() as u64;
+    let d_ptrs = gpu.upload_raw(&ptr_val.to_le_bytes(), &[8]).unwrap();
+    let d_tiles = gpu
+        .upload_raw(
+            &tile_ids.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(),
+            &[n_tiles * 4],
+        )
+        .unwrap();
+    let d_slots = gpu
+        .upload_raw(
+            &slot_index.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(),
+            &[m_total * 4],
+        )
+        .unwrap();
+    let d_x = gpu.upload_f32(&x, &[m_total * k]).unwrap();
+    let d_y = gpu.zeros(&[m_total * m], rdna_compute::DType::F32).unwrap();
+
+    gpu.gemm_mq4g256v2_moe_grouped_wmma_k2(
+        &d_ptrs, &d_tiles, &d_slots, &d_x, &d_y, m, k, 1, m_total, m_total,
+    )
+    .expect("moe grouped launch");
+    gpu.hip.device_synchronize().unwrap();
+    let got = gpu.download_f32(&d_y).unwrap();
+
+    // Oracle: y[slot * m + row] = sum_k W[row][k] * x[slot][k], both headers.
+    let want = ref_gemm_f64(&blob, &x, m, k, m_total);
+    let bad = ref_gemm_single_header_f64(&blob, &x, m, k, m_total);
+
+    let (ctrl, _) = rel_err(&want.iter().map(|&v| v as f32).collect::<Vec<_>>(), &bad);
+    println!("negative-control separation: {ctrl:.4} (want >> 0)");
+
+    let (e, at) = rel_err(&got, &want);
+    let (e_bad, _) = rel_err(&got, &bad);
+    println!("moe worst rel err: {e:.3e} at {at}");
+    println!("moe vs single-header control: {e_bad:.4} (want >> 0)");
+
+    // X is converted to fp16 inside the launcher, so the tolerance is looser
+    // here than for the f32-X gate_up kernel. 11x KLD damage would show as an
+    // error orders of magnitude above this, not near it.
+    const TOL: f64 = 5e-3;
+    if e > TOL {
+        eprintln!("FAIL: moe rel err {e:.3e} > {TOL:.0e} — expert decode is wrong");
+        std::process::exit(1);
+    }
+    if e_bad < 0.10 {
+        eprintln!("FAIL: moe output matches the single-header control — half-select bug");
+        std::process::exit(1);
+    }
+    println!("moe grouped: OK");
+}
+
+/// MoE parity in the kernel's REAL pipeline configuration.
+///
+/// The simple single-expert test above passes, but the pipeline uses:
+///   * many experts, selected per 16-slot tile via `expert_tile_ids`
+///   * `x_row_div = 8` (K_TOP), so slot -> source row is a DIVISION, not identity
+///   * `-1` padding slots, which must contribute zero
+/// Any of those can be wrong while the simple case is right, so test them.
+fn run_moe_pipeline_shape(gpu: &mut Gpu, k: usize, m: usize) {
+    const E: usize = 4;
+    const KTOP: i32 = 8;
+    let n_tokens = 6usize;
+    // 3 tiles of real slots + 1 all-padding tile.
+    let m_total = 64usize;
+    println!("\n--- MoE pipeline-like: K={k} M={m} experts={E} x_row_div={KTOP} m_total={m_total} ---");
+
+    let mut blobs = Vec::new();
+    for e in 0..E {
+        let mut w = vec![0.0f32; m * k];
+        for r in 0..m {
+            for g in 0..(k / GROUP) {
+                let base = r * k + g * GROUP;
+                let salt = (r * 7919 + g * 104_729 + e * 31_337) as u32;
+                for i in 0..HALF {
+                    w[base + i] = 1.0 + prng(i, salt);
+                }
+                for i in HALF..GROUP {
+                    w[base + i] = 4.0 + prng(i, salt ^ 0x5A5A_5A5A) * 4.0;
+                }
+            }
+        }
+        blobs.push(pack_mq4g256v2(&w, m, k));
+    }
+
+    // tile t -> expert t % E; last tile is all padding.
+    let n_tiles = m_total / 16;
+    let tile_ids: Vec<i32> = (0..n_tiles).map(|t| (t % E) as i32).collect();
+    let mut slot_index = vec![-1i32; m_total];
+    for slot in 0..(m_total - 16) {
+        // flat = token * KTOP + rank; x_row = flat / KTOP must stay < n_tokens
+        let flat = (slot as i32) % (n_tokens as i32 * KTOP);
+        slot_index[slot] = flat;
+    }
+
+    let mut x = vec![0.0f32; n_tokens * k];
+    for (i, v) in x.iter_mut().enumerate() {
+        let raw = 0.5 + prng(i, 0x51DE_51DE);
+        *v = f16::from_f32(raw).to_f32();
+    }
+
+    let d_blobs: Vec<_> = blobs.iter().map(|b| gpu.upload_raw(b, &[b.len()]).unwrap()).collect();
+    let ptr_bytes: Vec<u8> = d_blobs.iter()
+        .flat_map(|t| (t.buf.as_ptr() as u64).to_le_bytes())
+        .collect();
+    let d_ptrs = gpu.upload_raw(&ptr_bytes, &[E * 8]).unwrap();
+    let d_tiles = gpu.upload_raw(&tile_ids.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(), &[n_tiles * 4]).unwrap();
+    let d_slots = gpu.upload_raw(&slot_index.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(), &[m_total * 4]).unwrap();
+    let d_x = gpu.upload_f32(&x, &[n_tokens * k]).unwrap();
+    let d_y = gpu.zeros(&[m_total * m], rdna_compute::DType::F32).unwrap();
+
+    gpu.gemm_mq4g256v2_moe_grouped_wmma_k2(
+        &d_ptrs, &d_tiles, &d_slots, &d_x, &d_y, m, k, KTOP as usize, m_total, n_tokens,
+    ).expect("moe pipeline launch");
+    gpu.hip.device_synchronize().unwrap();
+    let got = gpu.download_f32(&d_y).unwrap();
+
+    // Oracle mirroring the kernel contract exactly.
+    let gpr = k / GROUP;
+    let mut want = vec![0.0f64; m_total * m];
+    for slot in 0..m_total {
+        let flat = slot_index[slot];
+        if flat < 0 { continue; }
+        let x_row = (flat / KTOP) as usize;
+        let e = tile_ids[slot / 16] as usize;
+        let blob = &blobs[e];
+        for r in 0..m {
+            let mut acc = 0.0f64;
+            for g in 0..gpr {
+                let dst = (r * gpr + g) * GROUP_BYTES;
+                let mut hdr = [(0.0f32, 0.0f32); 2];
+                for h in 0..2 {
+                    let sc = u16::from_le_bytes([blob[dst + h * 4], blob[dst + h * 4 + 1]]);
+                    let zp = u16::from_le_bytes([blob[dst + h * 4 + 2], blob[dst + h * 4 + 3]]);
+                    hdr[h] = (f16::from_bits(sc).to_f32(), f16::from_bits(zp).to_f32());
+                }
+                for i in 0..GROUP {
+                    let byte = blob[dst + 8 + i / 2];
+                    let q = if i % 2 == 0 { byte & 0xF } else { byte >> 4 };
+                    let (sc, zp) = hdr[i / HALF];
+                    acc += (sc * q as f32 + zp) as f64 * x[x_row * k + g * GROUP + i] as f64;
+                }
+            }
+            want[slot * m + r] = acc;
+        }
+    }
+
+    let (e, at) = rel_err(&got, &want);
+    println!("pipeline moe worst rel err: {e:.3e} at {at}");
+    // padded slots must be exactly zero
+    let pad_bad = (m_total - 16..m_total)
+        .flat_map(|slot| (0..m).map(move |r| slot * m + r))
+        .filter(|&i| got[i] != 0.0)
+        .count();
+    println!("padded-slot outputs non-zero: {pad_bad} (want 0)");
+    if e > 5e-3 || pad_bad > 0 {
+        eprintln!("FAIL: pipeline-config moe decode is wrong (err {e:.3e}, pad_bad {pad_bad})");
+        std::process::exit(1);
+    }
+    println!("moe pipeline-like: OK");
+}
+
+
+/// Production dims with a cancellation-free fixture AND an RMS-normalised error.
+///
+/// Two traps this avoids, both of which produced false verdicts earlier:
+///   * per-element relative error divides by max(|want|,1e-6); with 512x1024
+///     outputs and +/-1 activations some land near zero and blow up. At N=5
+///     there were only 160 outputs so none did.
+///   * fp16/f32 rounding amplified by catastrophic cancellation looks identical
+///     to a decode bug.
+/// Positive weights and positive activations remove both.
+fn run_gate_up_production_benign(gpu: &mut Gpu) {
+    let (k, n, gate_m, up_m) = (2048usize, 512usize, 512usize, 512usize);
+    println!("\n--- gate_up PRODUCTION (benign fixture): K={k} N={n} gate_m={gate_m} up_m={up_m} ---");
+    let mk = |m: usize, salt0: u32| {
+        let mut w = vec![0.0f32; m * k];
+        for r in 0..m {
+            for g in 0..(k / GROUP) {
+                let base = r * k + g * GROUP;
+                let salt = (r * 7919 + g * 104_729) as u32 ^ salt0;
+                for i in 0..HALF { w[base + i] = 1.0 + prng(i, salt); }
+                for i in HALF..GROUP { w[base + i] = 4.0 + prng(i, salt ^ 0x5A5A_5A5A) * 4.0; }
+            }
+        }
+        w
+    };
+    let wg = mk(gate_m, 0x1111_1111);
+    let wu = mk(up_m, 0x2222_2222);
+    let bg = pack_mq4g256v2(&wg, gate_m, k);
+    let bu = pack_mq4g256v2(&wu, up_m, k);
+    let mut x = vec![0.0f32; n * k];
+    for (i, v) in x.iter_mut().enumerate() { *v = 0.5 + prng(i, 0xDEAD_BEEF); }
+
+    let want_g = ref_gemm_f64(&bg, &x, gate_m, k, n);
+    let want_u = ref_gemm_f64(&bu, &x, up_m, k, n);
+
+    let d_ag = gpu.upload_raw(&bg, &[bg.len()]).unwrap();
+    let d_au = gpu.upload_raw(&bu, &[bu.len()]).unwrap();
+    let d_x = gpu.upload_f32(&x, &[n * k]).unwrap();
+    let d_yg = gpu.zeros(&[n * gate_m], rdna_compute::DType::F32).unwrap();
+    let d_yu = gpu.zeros(&[n * up_m], rdna_compute::DType::F32).unwrap();
+    gpu.gemm_gate_up_mq4g256v2_gfx11(&d_ag, &d_au, &d_x, &d_yg, &d_yu, gate_m, up_m, k, n).unwrap();
+    gpu.hip.device_synchronize().unwrap();
+    let gg = gpu.download_f32(&d_yg).unwrap();
+    let gu = gpu.download_f32(&d_yu).unwrap();
+
+    let rms = |v: &[f64]| (v.iter().map(|x| x * x).sum::<f64>() / v.len() as f64).sqrt();
+    let worst_norm = |got: &[f32], want: &[f64]| {
+        let r = rms(want);
+        got.iter().zip(want).map(|(&g, &w)| ((g as f64) - w).abs() / r).fold(0.0f64, f64::max)
+    };
+    let (eg, _) = rel_err(&gg, &want_g);
+    let (eu, _) = rel_err(&gu, &want_u);
+    let ng = worst_norm(&gg, &want_g);
+    let nu = worst_norm(&gu, &want_u);
+    println!("gate per-elem rel {eg:.3e} | RMS-normalised {ng:.3e}");
+    println!("up   per-elem rel {eu:.3e} | RMS-normalised {nu:.3e}");
+    if ng > 1e-3 || nu > 1e-3 {
+        eprintln!("FAIL: gate_up is WRONG at production dims (RMS-norm {ng:.3e}/{nu:.3e})");
+        std::process::exit(1);
+    }
+    println!("gate_up production: OK");
+}
+
+
+/// Residual GEMM at the shared-expert down_proj's production shape.
+/// This kernel was generated by script and wired without a parity test.
+fn run_residual_production(gpu: &mut Gpu) {
+    let (m, k, n) = (2048usize, 512usize, 512usize);
+    println!("\n--- residual PRODUCTION (benign): M={m} K={k} N={n} ---");
+    let mut w = vec![0.0f32; m * k];
+    for r in 0..m {
+        for g in 0..(k / GROUP) {
+            let base = r * k + g * GROUP;
+            let salt = (r * 7919 + g * 104_729) as u32 ^ 0x7373_7373;
+            for i in 0..HALF { w[base + i] = 1.0 + prng(i, salt); }
+            for i in HALF..GROUP { w[base + i] = 4.0 + prng(i, salt ^ 0x5A5A_5A5A) * 4.0; }
+        }
+    }
+    let blob = pack_mq4g256v2(&w, m, k);
+    let mut x = vec![0.0f32; n * k];
+    for (i, v) in x.iter_mut().enumerate() { *v = 0.5 + prng(i, 0xC0FF_EE00); }
+    let want = ref_gemm_f64(&blob, &x, m, k, n);
+
+    let d_a = gpu.upload_raw(&blob, &[blob.len()]).unwrap();
+    let d_x = gpu.upload_f32(&x, &[n * k]).unwrap();
+    let d_y = gpu.zeros(&[n * m], rdna_compute::DType::F32).unwrap();
+    gpu.gemm_mq4g256v2_residual_gfx11(&d_a, &d_x, &d_y, m, k, n).unwrap();
+    gpu.hip.device_synchronize().unwrap();
+    let got = gpu.download_f32(&d_y).unwrap();
+
+    let rms = (want.iter().map(|x| x * x).sum::<f64>() / want.len() as f64).sqrt();
+    let worst = got.iter().zip(&want)
+        .map(|(&g, &w)| ((g as f64) - w).abs() / rms)
+        .fold(0.0f64, f64::max);
+    println!("residual RMS-normalised worst err: {worst:.3e}");
+    if worst > 1e-3 {
+        eprintln!("FAIL: residual kernel is WRONG ({worst:.3e})");
+        std::process::exit(1);
+    }
+    println!("residual production: OK");
 }
 
 fn run_shape(gpu: &mut Gpu, k: usize, n: usize) {
-    let gate_m = 32usize;
-    let up_m = 16usize;
+    run_shape_dims(gpu, k, n, 32, 16)
+}
+
+fn run_shape_dims(gpu: &mut Gpu, k: usize, n: usize, gate_m: usize, up_m: usize) {
 
     let w_gate = build_disjoint_halves(gate_m, k, 0x1111_1111);
     let w_up = build_disjoint_halves(up_m, k, 0x2222_2222);

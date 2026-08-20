@@ -186,6 +186,13 @@ impl MoeResolution {
         let gate_side_mq4 = gate_fusable && d.experts_all_gate_up_mq4;
 
         let routed_gate_up_mq4 = d.routed_gate_up == MQ4G256;
+        // qt44/qt45 are FWHT-G256 formats exactly like qt13 — their kernels read
+        // the ROTATED activations. Omitting them from `needs_x_rot_local` below
+        // feeds unrotated x into rotated weights, which is silent: the model
+        // still emits fluent text. Measured on Ornith 1.5 35B-A3B, prefill KLD
+        // was 0.993 against 0.044 on the per-token path for the SAME artifact.
+        let routed_gate_up_mq4v2 = d.routed_gate_up == MQ4G256V2;
+        let routed_gate_up_mq4c = d.routed_gate_up == MQ4CG256;
         let routed_gate_up_mq5 = d.routed_gate_up == MQ5G256;
         let routed_gate_up_mq6 = d.routed_gate_up == MQ6G256;
         let routed_gate_up_paro = d.routed_gate_up == ParoQ4G128 && d.has_paro_shared;
@@ -247,6 +254,8 @@ impl MoeResolution {
         let needs_x_rot_local = gate_side_mq4
             || routed_indexable_mixed_per_expert
             || routed_gate_up_mq4
+            || routed_gate_up_mq4v2
+            || routed_gate_up_mq4c
             || routed_gate_up_mq5
             || routed_gate_up_mq6
             || routed_gate_up_mq2lloyd

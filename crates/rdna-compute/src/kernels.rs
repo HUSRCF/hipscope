@@ -2568,6 +2568,21 @@ pub const GEMM_MQ4G256V2_MOE_GROUPED_WMMA_K2_SRC: &str =
 pub const GEMM_GATE_UP_MQ4G256V2_SRC: &str =
     include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2.hip");
 
+/// gfx11 scalar MQ4G256V2 (qt=44) fused QKV GEMM. Ported from the qt13
+/// `gemm_qkv_hfq4g256`; only the group header decode differs.
+pub const GEMM_QKV_MQ4G256V2_SRC: &str =
+    include_str!("../../../kernels/src/gemm_qkv_mq4g256v2.hip");
+
+/// gfx11 scalar MQ4G256V2 (qt=44) fused QKV+Z+A GEMM (DeltaNet linear-attention
+/// preamble). Ported from the qt13 `gemm_qkvza_hfq4g256`.
+pub const GEMM_QKVZA_MQ4G256V2_SRC: &str =
+    include_str!("../../../kernels/src/gemm_qkvza_mq4g256v2.hip");
+
+/// gfx11 scalar MQ4G256V2 (qt=44) residual GEMM. Ported from the qt13
+/// `gemm_hfq4g256_residual`.
+pub const GEMM_MQ4G256V2_RESIDUAL_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq4g256v2_residual.hip");
+
 /// gfx12 (RDNA4) sister of GEMM_HFQ4G256_MOE_GROUPED_WMMA_K2_SRC. Same
 /// dispatch contract; differs in WMMA intrinsic (_gfx12), operand
 /// width (half8_t vs half16_t), and K-lane split (K split across 2

@@ -12676,7 +12676,15 @@ impl Gpu {
             kernels::GEMM_MQ4G256V2_MOE_GROUPED_WMMA_K2_SRC,
             kernel_name,
         )?;
-        let x_f16_ptr = self.ensure_fp16_x(x_src, x_src_rows * k)?;
+        // UNCACHED conversion is mandatory here. `ensure_fp16_x` is pointer-keyed,
+        // and MoE prefill reuses the SAME x_rot_batch tensor for every layer with
+        // different contents each time — so the cached variant hands every layer
+        // after the first the fp16 activations of layer 0.
+        //
+        // The failure is silent: the model still emits fluent text. Measured on
+        // Ornith 1.5 35B-A3B, prefill KLD was 0.993 with the cached call against
+        // 0.044 on the per-token path for the identical artifact.
+        let x_f16_ptr = self.convert_fp16_x_uncached(x_src, x_src_rows * k)?;
 
         let ep = expert_weight_ptrs.buf.as_ptr();
         let tp = expert_tile_ids.buf.as_ptr();
@@ -26726,10 +26734,9 @@ impl Gpu {
                 alpha_m, k, batch_size,
             );
         }
-        Err(hip_bridge::HipError::new(
-            0,
-            "gemm_qkvza_hfq4g256_mq4v2: gfx1201 required",
-        ))
+        // gfx11 (RDNA3/3.5): scalar v2 source ported from the qt13 kernel.
+        // Before this existed qt44 could not run batched prefill off gfx12.
+        self.gemm_qkvza_mq4g256v2_gfx11(a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m, beta_m, alpha_m, k, batch_size)
     }
 
     pub fn gemm_qkv_hfq4g256_mq4v2(
@@ -26752,10 +26759,9 @@ impl Gpu {
                 a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size,
             );
         }
-        Err(hip_bridge::HipError::new(
-            0,
-            "gemm_qkv_hfq4g256_mq4v2: gfx1201 required",
-        ))
+        // gfx11 (RDNA3/3.5): scalar v2 source ported from the qt13 kernel.
+        // Before this existed qt44 could not run batched prefill off gfx12.
+        self.gemm_qkv_mq4g256v2_gfx11(a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size)
     }
 
     pub fn gemm_gate_up_hfq4g256_mq4v2(
@@ -26779,6 +26785,106 @@ impl Gpu {
         // `gemm_gate_up_hfq4g256`. Before this existed, qt44 could not run
         // batched prefill off gfx12 at all.
         self.gemm_gate_up_mq4g256v2_gfx11(a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size)
+    }
+
+    /// gfx11 scalar MQ4G256V2 (qt=44) fused QKV GEMM.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_qkv_mq4g256v2_gfx11(
+        &mut self, a_q: &GpuTensor, a_k: &GpuTensor, a_v: &GpuTensor, x: &GpuTensor,
+        y_q: &GpuTensor, y_k: &GpuTensor, y_v: &GpuTensor,
+        q_m: usize, k_m: usize, v_m: usize, k: usize, batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let name = "gemm_qkv_mq4g256v2";
+        self.ensure_kernel(name, kernels::GEMM_QKV_MQ4G256V2_SRC, name)?;
+        let (aq, ak, av) = (a_q.buf.as_ptr(), a_k.buf.as_ptr(), a_v.buf.as_ptr());
+        let xp = x.buf.as_ptr();
+        let (yq, yk, yv) = (y_q.buf.as_ptr(), y_k.buf.as_ptr(), y_v.buf.as_ptr());
+        let (qm, km, vm) = (q_m as i32, k_m as i32, v_m as i32);
+        let (kv, nv) = (k as i32, batch_size as i32);
+        let mut params: Vec<*mut c_void> = vec![
+            &aq as *const _ as *mut c_void, &ak as *const _ as *mut c_void,
+            &av as *const _ as *mut c_void, &xp as *const _ as *mut c_void,
+            &yq as *const _ as *mut c_void, &yk as *const _ as *mut c_void,
+            &yv as *const _ as *mut c_void,
+            &qm as *const _ as *mut c_void, &km as *const _ as *mut c_void,
+            &vm as *const _ as *mut c_void,
+            &kv as *const _ as *mut c_void, &nv as *const _ as *mut c_void,
+        ];
+        let rows = (q_m + k_m + v_m) as u32;
+        let tiles = ((batch_size + 7) / 8) as u32;
+        self.launch_maybe_blob(name, [rows, tiles, 1], [32, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(aq); b.push_ptr(ak); b.push_ptr(av); b.push_ptr(xp);
+            b.push_ptr(yq); b.push_ptr(yk); b.push_ptr(yv);
+            b.push_i32(qm); b.push_i32(km); b.push_i32(vm);
+            b.push_i32(kv); b.push_i32(nv);
+            b
+        })
+    }
+
+    /// gfx11 scalar MQ4G256V2 (qt=44) fused QKV+Z+A GEMM (DeltaNet preamble).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_qkvza_mq4g256v2_gfx11(
+        &mut self, a_qkv: &GpuTensor, a_z: &GpuTensor, a_beta: &GpuTensor, a_alpha: &GpuTensor,
+        x: &GpuTensor, y_qkv: &GpuTensor, y_z: &GpuTensor, y_beta: &GpuTensor, y_alpha: &GpuTensor,
+        qkv_m: usize, z_m: usize, beta_m: usize, alpha_m: usize, k: usize, batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let name = "gemm_qkvza_mq4g256v2";
+        self.ensure_kernel(name, kernels::GEMM_QKVZA_MQ4G256V2_SRC, name)?;
+        let (aq, az, ab, aa) = (a_qkv.buf.as_ptr(), a_z.buf.as_ptr(), a_beta.buf.as_ptr(), a_alpha.buf.as_ptr());
+        let xp = x.buf.as_ptr();
+        let (yq, yz, yb, ya) = (y_qkv.buf.as_ptr(), y_z.buf.as_ptr(), y_beta.buf.as_ptr(), y_alpha.buf.as_ptr());
+        let (qm, zm, bm, am) = (qkv_m as i32, z_m as i32, beta_m as i32, alpha_m as i32);
+        let (kv, nv) = (k as i32, batch_size as i32);
+        let mut params: Vec<*mut c_void> = vec![
+            &aq as *const _ as *mut c_void, &az as *const _ as *mut c_void,
+            &ab as *const _ as *mut c_void, &aa as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yq as *const _ as *mut c_void, &yz as *const _ as *mut c_void,
+            &yb as *const _ as *mut c_void, &ya as *const _ as *mut c_void,
+            &qm as *const _ as *mut c_void, &zm as *const _ as *mut c_void,
+            &bm as *const _ as *mut c_void, &am as *const _ as *mut c_void,
+            &kv as *const _ as *mut c_void, &nv as *const _ as *mut c_void,
+        ];
+        let rows = (qkv_m + z_m + beta_m + alpha_m) as u32;
+        let tiles = ((batch_size + 7) / 8) as u32;
+        self.launch_maybe_blob(name, [rows, tiles, 1], [32, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(aq); b.push_ptr(az); b.push_ptr(ab); b.push_ptr(aa); b.push_ptr(xp);
+            b.push_ptr(yq); b.push_ptr(yz); b.push_ptr(yb); b.push_ptr(ya);
+            b.push_i32(qm); b.push_i32(zm); b.push_i32(bm); b.push_i32(am);
+            b.push_i32(kv); b.push_i32(nv);
+            b
+        })
+    }
+
+    /// gfx11 scalar MQ4G256V2 (qt=44) residual GEMM.
+    pub fn gemm_mq4g256v2_residual_gfx11(
+        &mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor,
+        m: usize, k: usize, batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let name = "gemm_mq4g256v2_residual";
+        self.ensure_kernel(name, kernels::GEMM_MQ4G256V2_RESIDUAL_SRC, name)?;
+        let ap = a_raw.buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let yp = y.buf.as_ptr();
+        let (mv, kv, nv) = (m as i32, k as i32, batch_size as i32);
+        let mut params: Vec<*mut c_void> = vec![
+            &ap as *const _ as *mut c_void, &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &mv as *const _ as *mut c_void, &kv as *const _ as *mut c_void,
+            &nv as *const _ as *mut c_void,
+        ];
+        let tiles = ((batch_size + 7) / 8) as u32;
+        self.launch_maybe_blob(name, [m as u32, tiles, 1], [32, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(ap); b.push_ptr(xp); b.push_ptr(yp);
+            b.push_i32(mv); b.push_i32(kv); b.push_i32(nv);
+            b
+        })
     }
 
     /// gfx11 scalar MQ4G256V2 (qt=44) gate/up GEMM.
@@ -26866,10 +26972,9 @@ impl Gpu {
         if self.arch_caps.has_wmma_w32_gfx12() {
             return self.gemm_hfq4g256_residual_wmma_gfx12_mq4v2(a_raw, x, y, m, k, batch_size);
         }
-        Err(hip_bridge::HipError::new(
-            0,
-            "gemm_hfq4g256_residual_mq4v2: gfx1201 required",
-        ))
+        // gfx11 (RDNA3/3.5): scalar v2 source ported from the qt13 kernel.
+        // Before this existed qt44 could not run batched prefill off gfx12.
+        self.gemm_mq4g256v2_residual_gfx11(a_raw, x, y, m, k, batch_size)
     }
 
     /// MQ4 v2 (qt=44) — plain batched GEMM `gemm_hfq4g256` sibling.
