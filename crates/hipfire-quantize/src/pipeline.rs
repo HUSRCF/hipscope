@@ -2331,10 +2331,8 @@ pub(crate) fn run() {
         //   model.language_model.layers.{N}.experts.down_proj
         // Name-suffix match + shape check handles both qwen3.5 (mlp.experts.*)
         // and gemma4 (experts.*) without prefix-specific conditions.
-        let is_moe_expert_3d = (is_moe || is_gemma4)
-            && (name.ends_with("experts.gate_up_proj") || name.ends_with("experts.down_proj"))
-            && meta.shape.len() == 3;
-        {
+        let is_moe_expert_3d = moe_expert_3d_applies(is_moe, is_gemma4, name, &meta.shape);
+        if is_moe_expert_3d {
             let __ctx = PerTensorCtx {
                 name,
                 file_idx: *file_idx,
@@ -3713,6 +3711,27 @@ fn handle_cohere2moe(
     true
 }
 
+/// Does the stacked-3D routed-expert path apply to this tensor?
+///
+/// Single source of truth for the `handle_moe_expert_3d` precondition, used
+/// both at the call site and as that function's own fail-closed guard.
+///
+/// The `shape.len() == 3` term is load-bearing and easy to lose. `d1d172e9c`
+/// ("decompose quantize run(), byte-identical output") extracted the body into
+/// a function and replaced `if is_moe_expert_3d { … }` with a bare block, so
+/// the predicate was computed and discarded. The function then indexes
+/// `shape[1..][1]` unconditionally and panics on any 2-D tensor whose name ends
+/// in `experts.gate_up_proj` / `experts.down_proj`.
+///
+/// It stayed latent because models whose expert tensors are all stacked-3D
+/// never present a 2-D tensor here. Ornith 1.5 does: its MTP module ships
+/// experts UN-stacked, as 2-D `mtp.layers.0.mlp.experts.{N}.*` tensors.
+fn moe_expert_3d_applies(is_moe: bool, is_gemma4: bool, name: &str, shape: &[usize]) -> bool {
+    (is_moe || is_gemma4)
+        && (name.ends_with("experts.gate_up_proj") || name.ends_with("experts.down_proj"))
+        && shape.len() == 3
+}
+
 fn handle_moe_expert_3d(
     ctx: &PerTensorCtx,
     meta: &TensorMeta,
@@ -3779,6 +3798,13 @@ fn handle_moe_expert_3d(
     let n_elements = ctx.n_elements;
     let arch_id = ctx.arch_id;
     let is_vision = ctx.is_vision;
+
+    // Fail closed rather than assume the caller checked. Everything below
+    // indexes `shape[1..][1]`, so a non-3D tensor panics with an opaque
+    // out-of-bounds instead of falling through to the standard path.
+    if !moe_expert_3d_applies(is_moe, is_gemma4, name, &meta.shape) {
+        return false;
+    }
 
     let n_experts = meta.shape[0];
     let inner_n: usize = meta.shape[1..].iter().product();
@@ -6182,4 +6208,67 @@ pub(crate) fn hfq_requant_to_bq1_example(
 ) -> (Vec<u8>, QuantType, u32) {
     let q = quantize_bq1g128_gptq(f32_data, col_weights, 0.0);
     (q, QuantType::BQ1G128, 128)
+}
+
+#[cfg(test)]
+mod pipeline_tests {
+    use super::moe_expert_3d_applies;
+
+    /// Regression pin for `d1d172e9c`, which extracted `handle_moe_expert_3d`
+    /// and dropped its `shape.len() == 3` precondition at the call site. A 2-D
+    /// expert tensor then reached code that indexes `shape[1..][1]` and
+    /// panicked. Ornith 1.5's MTP module ships exactly such tensors.
+    #[test]
+    fn moe_expert_3d_rejects_two_dimensional_expert_tensors() {
+        // The shape that actually panicked: an un-stacked per-expert 2-D
+        // weight, [2 * moe_intermediate, hidden].
+        assert!(
+            !moe_expert_3d_applies(
+                true,
+                false,
+                "mtp.layers.0.mlp.experts.0.gate_up_proj",
+                &[1024, 2048],
+            ),
+            "a 2-D expert tensor must not enter the stacked-3D path"
+        );
+    }
+
+    #[test]
+    fn moe_expert_3d_accepts_the_stacked_layout() {
+        // Ornith 1.5's body experts, which SHOULD take this path.
+        assert!(moe_expert_3d_applies(
+            true,
+            false,
+            "model.language_model.layers.0.mlp.experts.gate_up_proj",
+            &[256, 1024, 2048],
+        ));
+        assert!(moe_expert_3d_applies(
+            true,
+            false,
+            "model.language_model.layers.0.mlp.experts.down_proj",
+            &[256, 2048, 512],
+        ));
+    }
+
+    /// Gemma 4 reaches the same path via a `.experts.` prefix with no `mlp.`.
+    #[test]
+    fn moe_expert_3d_accepts_gemma4_prefix() {
+        assert!(moe_expert_3d_applies(
+            false,
+            true,
+            "model.language_model.layers.0.experts.gate_up_proj",
+            &[128, 1024, 2048],
+        ));
+    }
+
+    /// Non-MoE models must never enter it, whatever the tensor is called.
+    #[test]
+    fn moe_expert_3d_requires_a_moe_model() {
+        assert!(!moe_expert_3d_applies(
+            false,
+            false,
+            "model.language_model.layers.0.mlp.experts.gate_up_proj",
+            &[256, 1024, 2048],
+        ));
+    }
 }
