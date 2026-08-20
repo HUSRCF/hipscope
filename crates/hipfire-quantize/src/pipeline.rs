@@ -2360,6 +2360,8 @@ pub(crate) fn run() {
                 use_gptq_mfp2e8,
                 use_mq6g256,
                 use_mq4g256,
+                use_mq4v2,
+                use_mq4c,
                 use_mq4_mq6exp,
                 use_mq4_mq2lloydexp,
                 use_mq4_mq2glexp,
@@ -3750,6 +3752,11 @@ fn handle_moe_expert_3d(
     use_gptq_mfp2e8: bool,
     use_mq6g256: bool,
     use_mq4g256: bool,
+    // Routed experts are ~99% of an A3B MoE's tensors, so if these two never
+    // reach here, `--format mq4` silently yields a qt13 model with a handful of
+    // qt44 tensors bolted on. See the default `supports_g256` arm below.
+    use_mq4v2: bool,
+    use_mq4c: bool,
     use_mq4_mq6exp: bool,
     use_mq4_mq2lloydexp: bool,
     use_mq4_mq2glexp: bool,
@@ -4426,6 +4433,18 @@ fn handle_moe_expert_3d(
                 let q =
                     quantize_mfp4g32_e8_soa_2d(&f32_slice, inner_m, inner_k_e, &signs1, &signs2);
                 (q, QuantType::MFP4G32E8SOA, 32u32)
+            } else if supports_g256 && use_mq4c {
+                // qt45 MQ4C — same 136-byte stride as qt13, packed fp16
+                // scale/zero header.
+                let q = quantize_mq4cg256(&f32_slice, inner_m, inner_k_e, &signs1, &signs2);
+                (q, QuantType::MQ4CG256, 256u32)
+            } else if supports_g256 && use_mq4v2 {
+                // qt44 MQ4 v2 — two fp16 scale/zero pairs per 256-weight group.
+                // This arm is what makes `--format mq4` mean qt44 for routed
+                // experts. Without it the experts fall to the qt13 arm below,
+                // and on an A3B MoE that is ~99% of the model by tensor count.
+                let q = quantize_mq4g256v2(&f32_slice, inner_m, inner_k_e, &signs1, &signs2);
+                (q, QuantType::MQ4G256V2, 256u32)
             } else if supports_g256 {
                 let q = quantize_mq4g256(&f32_slice, &signs1, &signs2);
                 (q, QuantType::MQ4G256, 256u32)
