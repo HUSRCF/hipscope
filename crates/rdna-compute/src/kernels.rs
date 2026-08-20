@@ -2561,6 +2561,13 @@ pub const GEMM_HFQ4G256_MOE_GROUPED_WMMA_K2_SRC: &str =
 pub const GEMM_MQ4G256V2_MOE_GROUPED_WMMA_K2_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq4g256v2_moe_grouped_wmma_k2.hip");
 
+/// gfx11 (RDNA3/3.5) scalar MQ4G256V2 (qt=44) gate/up GEMM. Ported from the
+/// qt13 `gemm_gate_up_hfq4g256`; only the group header decode differs. qt44's
+/// GEMM family was previously gfx12-only, so batched prefill was unavailable
+/// on RDNA3/3.5 for this format.
+pub const GEMM_GATE_UP_MQ4G256V2_SRC: &str =
+    include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2.hip");
+
 /// gfx12 (RDNA4) sister of GEMM_HFQ4G256_MOE_GROUPED_WMMA_K2_SRC. Same
 /// dispatch contract; differs in WMMA intrinsic (_gfx12), operand
 /// width (half8_t vs half16_t), and K-lane split (K split across 2

@@ -26775,10 +26775,83 @@ impl Gpu {
                 a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size,
             );
         }
-        Err(hip_bridge::HipError::new(
+        // gfx11 (RDNA3/3.5): scalar v2 source, ported from the qt13 kernel
+        // `gemm_gate_up_hfq4g256`. Before this existed, qt44 could not run
+        // batched prefill off gfx12 at all.
+        self.gemm_gate_up_mq4g256v2_gfx11(a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size)
+    }
+
+    /// gfx11 scalar MQ4G256V2 (qt=44) gate/up GEMM.
+    ///
+    /// Transcribed from `gemm_gate_up_hfq4g256`; the only change is the group
+    /// header decode (qt44's two fp16 affine grids vs qt13's single f32 pair).
+    /// Grid selection is per-thread and loop-invariant — see the kernel source.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_gate_up_mq4g256v2_gfx11(
+        &mut self,
+        a_gate: &GpuTensor,
+        a_up: &GpuTensor,
+        x: &GpuTensor,
+        y_gate: &GpuTensor,
+        y_up: &GpuTensor,
+        gate_m: usize,
+        up_m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let kernel_name = "gemm_gate_up_mq4g256v2";
+        self.ensure_kernel(
+            kernel_name,
+            kernels::GEMM_GATE_UP_MQ4G256V2_SRC,
+            kernel_name,
+        )?;
+
+        let ag = a_gate.buf.as_ptr();
+        let au = a_up.buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let yg = y_gate.buf.as_ptr();
+        let yu = y_up.buf.as_ptr();
+        let gm = gate_m as i32;
+        let um = up_m as i32;
+        let k_val = k as i32;
+        let n_val = batch_size as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &ag as *const _ as *mut c_void,
+            &au as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yg as *const _ as *mut c_void,
+            &yu as *const _ as *mut c_void,
+            &gm as *const _ as *mut c_void,
+            &um as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &n_val as *const _ as *mut c_void,
+        ];
+
+        // BATCH_TILE is 8 in the kernel; grid.y tiles the batch.
+        let total_m = (gate_m + up_m) as u32;
+        let batch_tiles = ((batch_size + 7) / 8) as u32;
+        self.launch_maybe_blob(
+            kernel_name,
+            [total_m, batch_tiles, 1],
+            [32, 1, 1],
             0,
-            "gemm_gate_up_hfq4g256_mq4v2: gfx1201 required",
-        ))
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ag);
+                b.push_ptr(au);
+                b.push_ptr(xp);
+                b.push_ptr(yg);
+                b.push_ptr(yu);
+                b.push_i32(gm);
+                b.push_i32(um);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b
+            },
+        )
     }
 
     pub fn gemm_hfq4g256_residual_mq4v2(
