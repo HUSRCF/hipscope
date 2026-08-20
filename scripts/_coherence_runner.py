@@ -112,7 +112,11 @@ def detect(out_bytes: bytes) -> dict:
 def extract_text(out_bytes: bytes) -> str:
     text = ""
     for ev in _iter_events(out_bytes):
-        if ev.get("type") == "token" and "text" in ev:
+        # Ornith 1.5 is a thinking model: in think mode the daemon emits
+        # "reasoning" events, not "token" ones. Counting only "token" reports
+        # zero output for a model that is generating perfectly well, which
+        # reads as total failure. Accept both.
+        if ev.get("type") in ("token", "reasoning") and "text" in ev:
             text += ev["text"]
     return text
 
@@ -123,7 +127,11 @@ def main() -> int:
     ap.add_argument("--model", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--timeout", type=int, default=420)
-    ap.add_argument("--max-tokens", type=int, default=200)
+    # 200 is too tight for a thinking model: Ornith 1.5 was still mid-reasoning
+    # at 220 tokens, and the daemon then rejects the turn with "open think span
+    # at end of generation". A truncated think span is a harness artefact, not a
+    # coherence failure, so give it room to close.
+    ap.add_argument("--max-tokens", type=int, default=640)
     ap.add_argument("--max-seq", type=int, default=4096)
     ap.add_argument("--genre", action="append", default=[])
     ap.add_argument("--prompt", action="append", default=[])
@@ -141,13 +149,26 @@ def main() -> int:
     empty_count = 0
     attractor_count = 0
 
-    env = {**os.environ, "HIPFIRE_EMIT_TOKEN_IDS": "1"}
+    # HIPFIRE_AR_GRAPH=0: with AR graph capture enabled, qwen35 decode dies with
+    # hipError(906) "hipMemcpy D2H: operation would make the legacy stream depend
+    # on a capturing blocking stream". Unrelated to the quant format; disabling
+    # capture is the documented workaround until that is fixed separately.
+    env = {
+        **os.environ,
+        "HIPFIRE_EMIT_TOKEN_IDS": "1",
+        "HIPFIRE_AR_GRAPH": os.environ.get("HIPFIRE_AR_GRAPH", "0"),
+    }
 
     for genre, prompt in zip(args.genre, args.prompt):
         label = f"ornith15-{genre}"
         script_lines = [
             json.dumps({"type": "load", "model": args.model, "params": {"max_seq": args.max_seq}}),
-            json.dumps({"type": "generate", "id": label, "prompt": prompt,
+            # attempt_id is REQUIRED by this daemon's generate contract. Without it
+            # the daemon answers {"type":"error","message":"generate missing
+            # attempt_id"} and exits 0 — which looks exactly like "the model
+            # produced nothing". The reference gate this was lifted from predates
+            # that contract.
+            json.dumps({"type": "generate", "id": label, "attempt_id": 1, "prompt": prompt,
                         "temperature": 0.0, "max_tokens": args.max_tokens, "repeat_penalty": 1.0}),
             json.dumps({"type": "unload"}),
         ]
@@ -172,7 +193,7 @@ def main() -> int:
         wall = time.time() - t0
 
         text_log = out_bytes.decode("utf-8", "replace")
-        n_tokens = text_log.count('"type":"token"')
+        n_tokens = text_log.count('"type":"token"') + text_log.count('"type":"reasoning"')
         panic_m = re.search(r'.*(panicked|thread .* panicked|FATAL).*', text_log)
         panic = panic_m.group(0).strip() if panic_m else None
         error_ev = '"type":"error"' in text_log
