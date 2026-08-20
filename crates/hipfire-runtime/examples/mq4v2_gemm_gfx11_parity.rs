@@ -199,15 +199,16 @@ fn main() {
     for &(k, n, label) in &[
         (768usize, 5usize, "gpr=3 quads=0 tail=3 (tail only)"),
         (1280usize, 5usize, "gpr=5 quads=1 tail=1 (both)"),
-        (2048usize, 9usize, "gpr=8 quads=2 tail=0 (main only, n>BATCH_TILE)"),
+        (
+            2048usize,
+            9usize,
+            "gpr=8 quads=2 tail=0 (main only, n>BATCH_TILE)",
+        ),
     ] {
         println!("\n--- shape: K={k} N={n}  {label} ---");
         run_shape(&mut gpu, k, n);
     }
-    for &(k, m, mt) in &[
-        (2048usize, 32usize, 16usize),
-        (512usize, 64usize, 32usize),
-    ] {
+    for &(k, m, mt) in &[(2048usize, 32usize, 16usize), (512usize, 64usize, 32usize)] {
         run_moe_shape(&mut gpu, k, m, mt);
     }
     run_moe_pipeline_shape(&mut gpu, 2048, 32);
@@ -276,13 +277,19 @@ fn run_moe_shape(gpu: &mut Gpu, k: usize, m: usize, m_total: usize) {
     let d_ptrs = gpu.upload_raw(&ptr_val.to_le_bytes(), &[8]).unwrap();
     let d_tiles = gpu
         .upload_raw(
-            &tile_ids.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(),
+            &tile_ids
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<u8>>(),
             &[n_tiles * 4],
         )
         .unwrap();
     let d_slots = gpu
         .upload_raw(
-            &slot_index.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(),
+            &slot_index
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<u8>>(),
             &[m_total * 4],
         )
         .unwrap();
@@ -336,7 +343,9 @@ fn run_moe_pipeline_shape(gpu: &mut Gpu, k: usize, m: usize) {
     let n_tokens = 6usize;
     // 3 tiles of real slots + 1 all-padding tile.
     let m_total = 64usize;
-    println!("\n--- MoE pipeline-like: K={k} M={m} experts={E} x_row_div={KTOP} m_total={m_total} ---");
+    println!(
+        "\n--- MoE pipeline-like: K={k} M={m} experts={E} x_row_div={KTOP} m_total={m_total} ---"
+    );
 
     let mut blobs = Vec::new();
     for e in 0..E {
@@ -372,19 +381,49 @@ fn run_moe_pipeline_shape(gpu: &mut Gpu, k: usize, m: usize) {
         *v = f16::from_f32(raw).to_f32();
     }
 
-    let d_blobs: Vec<_> = blobs.iter().map(|b| gpu.upload_raw(b, &[b.len()]).unwrap()).collect();
-    let ptr_bytes: Vec<u8> = d_blobs.iter()
+    let d_blobs: Vec<_> = blobs
+        .iter()
+        .map(|b| gpu.upload_raw(b, &[b.len()]).unwrap())
+        .collect();
+    let ptr_bytes: Vec<u8> = d_blobs
+        .iter()
         .flat_map(|t| (t.buf.as_ptr() as u64).to_le_bytes())
         .collect();
     let d_ptrs = gpu.upload_raw(&ptr_bytes, &[E * 8]).unwrap();
-    let d_tiles = gpu.upload_raw(&tile_ids.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(), &[n_tiles * 4]).unwrap();
-    let d_slots = gpu.upload_raw(&slot_index.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(), &[m_total * 4]).unwrap();
+    let d_tiles = gpu
+        .upload_raw(
+            &tile_ids
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<u8>>(),
+            &[n_tiles * 4],
+        )
+        .unwrap();
+    let d_slots = gpu
+        .upload_raw(
+            &slot_index
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<u8>>(),
+            &[m_total * 4],
+        )
+        .unwrap();
     let d_x = gpu.upload_f32(&x, &[n_tokens * k]).unwrap();
     let d_y = gpu.zeros(&[m_total * m], rdna_compute::DType::F32).unwrap();
 
     gpu.gemm_mq4g256v2_moe_grouped_wmma_k2(
-        &d_ptrs, &d_tiles, &d_slots, &d_x, &d_y, m, k, KTOP as usize, m_total, n_tokens,
-    ).expect("moe pipeline launch");
+        &d_ptrs,
+        &d_tiles,
+        &d_slots,
+        &d_x,
+        &d_y,
+        m,
+        k,
+        KTOP as usize,
+        m_total,
+        n_tokens,
+    )
+    .expect("moe pipeline launch");
     gpu.hip.device_synchronize().unwrap();
     let got = gpu.download_f32(&d_y).unwrap();
 
@@ -393,7 +432,9 @@ fn run_moe_pipeline_shape(gpu: &mut Gpu, k: usize, m: usize) {
     let mut want = vec![0.0f64; m_total * m];
     for slot in 0..m_total {
         let flat = slot_index[slot];
-        if flat < 0 { continue; }
+        if flat < 0 {
+            continue;
+        }
         let x_row = (flat / KTOP) as usize;
         let e = tile_ids[slot / 16] as usize;
         let blob = &blobs[e];
@@ -433,7 +474,6 @@ fn run_moe_pipeline_shape(gpu: &mut Gpu, k: usize, m: usize) {
     println!("moe pipeline-like: OK");
 }
 
-
 /// Production dims with a cancellation-free fixture AND an RMS-normalised error.
 ///
 /// Two traps this avoids, both of which produced false verdicts earlier:
@@ -445,15 +485,21 @@ fn run_moe_pipeline_shape(gpu: &mut Gpu, k: usize, m: usize) {
 /// Positive weights and positive activations remove both.
 fn run_gate_up_production_benign(gpu: &mut Gpu) {
     let (k, n, gate_m, up_m) = (2048usize, 512usize, 512usize, 512usize);
-    println!("\n--- gate_up PRODUCTION (benign fixture): K={k} N={n} gate_m={gate_m} up_m={up_m} ---");
+    println!(
+        "\n--- gate_up PRODUCTION (benign fixture): K={k} N={n} gate_m={gate_m} up_m={up_m} ---"
+    );
     let mk = |m: usize, salt0: u32| {
         let mut w = vec![0.0f32; m * k];
         for r in 0..m {
             for g in 0..(k / GROUP) {
                 let base = r * k + g * GROUP;
                 let salt = (r * 7919 + g * 104_729) as u32 ^ salt0;
-                for i in 0..HALF { w[base + i] = 1.0 + prng(i, salt); }
-                for i in HALF..GROUP { w[base + i] = 4.0 + prng(i, salt ^ 0x5A5A_5A5A) * 4.0; }
+                for i in 0..HALF {
+                    w[base + i] = 1.0 + prng(i, salt);
+                }
+                for i in HALF..GROUP {
+                    w[base + i] = 4.0 + prng(i, salt ^ 0x5A5A_5A5A) * 4.0;
+                }
             }
         }
         w
@@ -463,7 +509,9 @@ fn run_gate_up_production_benign(gpu: &mut Gpu) {
     let bg = pack_mq4g256v2(&wg, gate_m, k);
     let bu = pack_mq4g256v2(&wu, up_m, k);
     let mut x = vec![0.0f32; n * k];
-    for (i, v) in x.iter_mut().enumerate() { *v = 0.5 + prng(i, 0xDEAD_BEEF); }
+    for (i, v) in x.iter_mut().enumerate() {
+        *v = 0.5 + prng(i, 0xDEAD_BEEF);
+    }
 
     let want_g = ref_gemm_f64(&bg, &x, gate_m, k, n);
     let want_u = ref_gemm_f64(&bu, &x, up_m, k, n);
@@ -473,7 +521,8 @@ fn run_gate_up_production_benign(gpu: &mut Gpu) {
     let d_x = gpu.upload_f32(&x, &[n * k]).unwrap();
     let d_yg = gpu.zeros(&[n * gate_m], rdna_compute::DType::F32).unwrap();
     let d_yu = gpu.zeros(&[n * up_m], rdna_compute::DType::F32).unwrap();
-    gpu.gemm_gate_up_mq4g256v2_gfx11(&d_ag, &d_au, &d_x, &d_yg, &d_yu, gate_m, up_m, k, n).unwrap();
+    gpu.gemm_gate_up_mq4g256v2_gfx11(&d_ag, &d_au, &d_x, &d_yg, &d_yu, gate_m, up_m, k, n)
+        .unwrap();
     gpu.hip.device_synchronize().unwrap();
     let gg = gpu.download_f32(&d_yg).unwrap();
     let gu = gpu.download_f32(&d_yu).unwrap();
@@ -481,7 +530,10 @@ fn run_gate_up_production_benign(gpu: &mut Gpu) {
     let rms = |v: &[f64]| (v.iter().map(|x| x * x).sum::<f64>() / v.len() as f64).sqrt();
     let worst_norm = |got: &[f32], want: &[f64]| {
         let r = rms(want);
-        got.iter().zip(want).map(|(&g, &w)| ((g as f64) - w).abs() / r).fold(0.0f64, f64::max)
+        got.iter()
+            .zip(want)
+            .map(|(&g, &w)| ((g as f64) - w).abs() / r)
+            .fold(0.0f64, f64::max)
     };
     let (eg, _) = rel_err(&gg, &want_g);
     let (eu, _) = rel_err(&gu, &want_u);
@@ -496,7 +548,6 @@ fn run_gate_up_production_benign(gpu: &mut Gpu) {
     println!("gate_up production: OK");
 }
 
-
 /// Residual GEMM at the shared-expert down_proj's production shape.
 /// This kernel was generated by script and wired without a parity test.
 fn run_residual_production(gpu: &mut Gpu) {
@@ -507,24 +558,33 @@ fn run_residual_production(gpu: &mut Gpu) {
         for g in 0..(k / GROUP) {
             let base = r * k + g * GROUP;
             let salt = (r * 7919 + g * 104_729) as u32 ^ 0x7373_7373;
-            for i in 0..HALF { w[base + i] = 1.0 + prng(i, salt); }
-            for i in HALF..GROUP { w[base + i] = 4.0 + prng(i, salt ^ 0x5A5A_5A5A) * 4.0; }
+            for i in 0..HALF {
+                w[base + i] = 1.0 + prng(i, salt);
+            }
+            for i in HALF..GROUP {
+                w[base + i] = 4.0 + prng(i, salt ^ 0x5A5A_5A5A) * 4.0;
+            }
         }
     }
     let blob = pack_mq4g256v2(&w, m, k);
     let mut x = vec![0.0f32; n * k];
-    for (i, v) in x.iter_mut().enumerate() { *v = 0.5 + prng(i, 0xC0FF_EE00); }
+    for (i, v) in x.iter_mut().enumerate() {
+        *v = 0.5 + prng(i, 0xC0FF_EE00);
+    }
     let want = ref_gemm_f64(&blob, &x, m, k, n);
 
     let d_a = gpu.upload_raw(&blob, &[blob.len()]).unwrap();
     let d_x = gpu.upload_f32(&x, &[n * k]).unwrap();
     let d_y = gpu.zeros(&[n * m], rdna_compute::DType::F32).unwrap();
-    gpu.gemm_mq4g256v2_residual_gfx11(&d_a, &d_x, &d_y, m, k, n).unwrap();
+    gpu.gemm_mq4g256v2_residual_gfx11(&d_a, &d_x, &d_y, m, k, n)
+        .unwrap();
     gpu.hip.device_synchronize().unwrap();
     let got = gpu.download_f32(&d_y).unwrap();
 
     let rms = (want.iter().map(|x| x * x).sum::<f64>() / want.len() as f64).sqrt();
-    let worst = got.iter().zip(&want)
+    let worst = got
+        .iter()
+        .zip(&want)
         .map(|(&g, &w)| ((g as f64) - w).abs() / rms)
         .fold(0.0f64, f64::max);
     println!("residual RMS-normalised worst err: {worst:.3e}");
@@ -540,7 +600,6 @@ fn run_shape(gpu: &mut Gpu, k: usize, n: usize) {
 }
 
 fn run_shape_dims(gpu: &mut Gpu, k: usize, n: usize, gate_m: usize, up_m: usize) {
-
     let w_gate = build_disjoint_halves(gate_m, k, 0x1111_1111);
     let w_up = build_disjoint_halves(up_m, k, 0x2222_2222);
     let blob_gate = pack_mq4g256v2(&w_gate, gate_m, k);
@@ -576,10 +635,8 @@ fn run_shape_dims(gpu: &mut Gpu, k: usize, n: usize, gate_m: usize, up_m: usize)
     let d_yg = gpu.zeros(&[n * gate_m], rdna_compute::DType::F32).unwrap();
     let d_yu = gpu.zeros(&[n * up_m], rdna_compute::DType::F32).unwrap();
 
-    gpu.gemm_gate_up_mq4g256v2_gfx11(
-        &d_ag, &d_au, &d_x, &d_yg, &d_yu, gate_m, up_m, k, n,
-    )
-    .expect("gemm_gate_up_mq4g256v2_gfx11 launch");
+    gpu.gemm_gate_up_mq4g256v2_gfx11(&d_ag, &d_au, &d_x, &d_yg, &d_yu, gate_m, up_m, k, n)
+        .expect("gemm_gate_up_mq4g256v2_gfx11 launch");
     gpu.hip.device_synchronize().unwrap();
 
     let got_gate = gpu.download_f32(&d_yg).unwrap();
