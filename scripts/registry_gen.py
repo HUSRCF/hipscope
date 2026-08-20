@@ -207,6 +207,10 @@ def arch_id_for(tag: str, entry: dict) -> int | None:
         return 6 if "a3b" in tag else 5
     if family == "nex-n2":
         return 6  # Nex-N2-mini = Qwen3.5-35B-A3B MoE (a3b not in tag name)
+    # Ornith 1.5 = Qwen3.5-family VL finetune. 35B-A3B is qwen3_5_moe (6), the
+    # 9B is dense qwen3_5 (5). Keyed on "a3b" like the qwen3.5 family above.
+    if family in ("ornith1.5", "ornith"):
+        return 6 if "a3b" in tag else 5
     if family == "qwen3":
         return 1
     if family in ("deepseek-v4-flash", "deepseek-v4-flash-preview"):
