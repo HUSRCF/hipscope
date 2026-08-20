@@ -8,17 +8,27 @@ untrained RMSNorms (every weight exactly 1.0, std 0.0). That produced
 tau=0.00 and cost days of engine debugging before the checkpoint itself was
 identified as the defect. hipfire's math was correct to cosine 0.999873.
 
-A trained reference measured norm mean 1.52 / std 0.14.
+A trained reference measured norm mean 1.52 / std 0.14 — but that figure comes
+from a classic weight-near-1 RMSNorm. THIS checkpoint family uses a zero-centred
+(1+w) parameterisation, so its trained norms sit near 0.0, not near 1.0 (verified
+against the model body's own certainly-trained norms: means 0.0311, -0.1052).
+Do not judge trained-ness by the mean here; judge it by per-element variance.
 
 Exit 1 here means: drop MTP from scope and report upstream. Do not debug.
 """
 import json
+import struct
 import sys
 from pathlib import Path
 
-import ml_dtypes  # noqa: F401 — registers bfloat16 with numpy's dtype system
 import numpy as np
-from safetensors import safe_open
+
+# Deliberately NO `safetensors` / `ml_dtypes` dependency. Neither is present in
+# this host's default python3, so importing them made the gate unrunnable by the
+# very command its own docs prescribe — a gate you cannot re-run decays into a
+# claim. The safetensors container is trivial to parse (u64 header length, JSON
+# header, raw tensor bytes) and bf16 -> f32 is an exact 16-bit left shift, so
+# both dependencies are avoidable at no cost in correctness.
 
 SRC = Path(sys.argv[1] if len(sys.argv) > 1 else "/home/nick/hf/Ornith-1.5-35B-A3B")
 
@@ -33,12 +43,33 @@ if not norm_keys:
     print("FAIL: no mtp.* norm tensors found; the module layout is not what we assume")
     sys.exit(1)
 
-handles = {}
+_shards = {}
+def _header(shard):
+    """Parse a safetensors container: u64 header length, JSON header, payload."""
+    if shard not in _shards:
+        fh = open(SRC / shard, "rb")
+        hlen = struct.unpack("<Q", fh.read(8))[0]
+        _shards[shard] = (json.loads(fh.read(hlen)), 8 + hlen, fh)
+    return _shards[shard]
+
 def load(key):
-    shard = wm[key]
-    if shard not in handles:
-        handles[shard] = safe_open(str(SRC / shard), framework="np")
-    return handles[shard].get_tensor(key).astype(np.float32)
+    meta, payload_off, fh = _header(wm[key])
+    entry = meta[key]
+    start, end = entry["data_offsets"]
+    fh.seek(payload_off + start)
+    raw = fh.read(end - start)
+    dtype = entry["dtype"]
+    if dtype == "BF16":
+        # bf16 is the top 16 bits of an f32 — widening is exact, never lossy.
+        return (np.frombuffer(raw, dtype=np.uint16).astype(np.uint32) << 16).view(np.float32)
+    if dtype == "F32":
+        return np.frombuffer(raw, dtype=np.float32)
+    if dtype == "F16":
+        return np.frombuffer(raw, dtype=np.float16).astype(np.float32)
+    # Fail closed: an unhandled dtype must not be silently skipped, because a
+    # skipped norm is an unexamined norm and this is a gate.
+    print(f"FAIL: unhandled dtype {dtype!r} for {key}")
+    sys.exit(1)
 
 def summarize(keys, label):
     rows = []
@@ -64,12 +95,21 @@ mms = summarize(matmul_keys, "MTP matmul weights (trained-ness control)")
 # mean 0.0, and a mean-vs-1.0 test can never fire: the gate would return a
 # vacuous PASS on precisely the defect it exists to catch.
 #
-# Zero per-element variance is the real signature. A trained norm never has
-# std exactly 0.0, whatever constant it is centred on.
-degenerate = [(k, m, s) for k, m, s in norms if s == 0.0]
+# Near-zero per-element variance is the real signature. A trained norm never
+# has vanishing spread, whatever constant it is centred on.
+#
+# EPSILON rather than `== 0.0`: bit-exact equality only catches a perfectly
+# uniform freeze. A norm frozen at a constant but carrying a few denormal or
+# rounding-noise elements would score std ~1e-9 and slip through the same way
+# the old mean-anchored test did. The margin is enormous — the smallest real
+# std measured on this checkpoint is 2e-4, i.e. 200x above this threshold — so
+# the epsilon costs no false positives while removing a dependence on exact
+# floating-point summation that would not survive a differently-shaped export.
+FROZEN_STD_EPS = 1e-6
+degenerate = [(k, m, s) for k, m, s in norms if s < FROZEN_STD_EPS]
 frac = len(degenerate) / len(norms)
 
-print(f"\nFrozen (std exactly 0) norms: {len(degenerate)}/{len(norms)} "
+print(f"\nFrozen (std < {FROZEN_STD_EPS:g}) norms: {len(degenerate)}/{len(norms)} "
       f"({frac:.1%})")
 for k, m, s in degenerate:
     print(f"  FROZEN {k} mean={m:.6f}")
