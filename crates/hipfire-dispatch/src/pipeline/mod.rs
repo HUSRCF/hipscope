@@ -2322,6 +2322,22 @@ fn dispatch_grouped_gemm(
             m_total,
             rows,
         )),
+        // qt44. Routed experts are ~99% of an A3B MoE's tensors, so without
+        // this arm a qt44 MoE model cannot prefill at all — it falls into the
+        // `_other` error below. gfx11 only; the launcher refuses gfx12 rather
+        // than silently running a kernel that would misread qt44's header.
+        DType::MQ4G256V2 => hip!(gpu.gemm_mq4g256v2_moe_grouped_wmma_k2(
+            ptrs,
+            tile_ids,
+            sorted_slot_index,
+            x,
+            y,
+            m,
+            k,
+            x_row_div,
+            m_total,
+            rows,
+        )),
         _other => Err(DispatchError::UnsupportedVariant {
             family: "moe",
             variant: "prefill-grouped-gemm-dtype",
@@ -2603,7 +2619,12 @@ pub fn run_moe_prefill(
             // weight bytes. The GL dtypes are deliberately absent: they are not
             // batched-prefill admissible (no grouped GEMM, no batched GEMV), so
             // reaching here with a GL down is a bug and must stay a loud error.
+            // qt44 belongs here for the same reason as every other MQ dtype:
+            // the silu/rotate kernels below consume f32 gate_batch/up_batch
+            // activations and never touch quantized weights, so this match is
+            // selecting a branch, not a decode path.
             DType::MQ4G256
+            | DType::MQ4G256V2
             | DType::MQ5G256
             | DType::MQ6G256
             | DType::MQ2G256Lloyd

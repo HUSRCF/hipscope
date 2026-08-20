@@ -2548,6 +2548,19 @@ pub const MOE_SCATTER_PERMUTE_K8_SRC: &str =
 pub const GEMM_HFQ4G256_MOE_GROUPED_WMMA_K2_SRC: &str =
     include_str!("../../../kernels/src/gemm_hfq4g256_moe_grouped_wmma_k2.hip");
 
+/// MQ4G256V2 (qt=44) sister of `GEMM_HFQ4G256_MOE_GROUPED_WMMA_K2_SRC`.
+///
+/// Identical gather/tiling/WMMA pipeline; differs only in the group header —
+/// qt44 carries TWO fp16 scale/zero pairs per 256-weight group (one per 128-
+/// weight half) where qt13 carries one f32 pair for all 256. Same 136 B stride,
+/// same nibble packing.
+///
+/// Exists because qt44 previously had no MoE grouped-expert path at all, so a
+/// qt44 A3B MoE model failed prefill outright. **gfx11 (RDNA3/3.5) only** —
+/// there is no gfx12 sister yet, and no i8 MMQ variant.
+pub const GEMM_MQ4G256V2_MOE_GROUPED_WMMA_K2_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq4g256v2_moe_grouped_wmma_k2.hip");
+
 /// gfx12 (RDNA4) sister of GEMM_HFQ4G256_MOE_GROUPED_WMMA_K2_SRC. Same
 /// dispatch contract; differs in WMMA intrinsic (_gfx12), operand
 /// width (half8_t vs half16_t), and K-lane split (K split across 2
