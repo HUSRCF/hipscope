@@ -55,23 +55,46 @@ def summarize(keys, label):
 norms = summarize(norm_keys, "MTP learnable RMSNorm weights")
 mms = summarize(matmul_keys, "MTP matmul weights (trained-ness control)")
 
-# All-ones norm detection. Exactly 1.0 with zero variance is the signature.
-degenerate = [(k, m, s) for k, m, s in norms if s == 0.0 and abs(m - 1.0) < 1e-6]
+# Frozen-norm detection, convention-INDEPENDENT.
+#
+# Do NOT test "mean ~ 1.0". This checkpoint family uses a zero-centred (1+w)
+# RMSNorm parameterisation — verified 2026-08-20 against the model body's own
+# certainly-trained norms, whose means sit near 0.03 / -0.11, not near 1.0.
+# Under (1+w) the identity element is w=0.0, so an untrained export freezes at
+# mean 0.0, and a mean-vs-1.0 test can never fire: the gate would return a
+# vacuous PASS on precisely the defect it exists to catch.
+#
+# Zero per-element variance is the real signature. A trained norm never has
+# std exactly 0.0, whatever constant it is centred on.
+degenerate = [(k, m, s) for k, m, s in norms if s == 0.0]
 frac = len(degenerate) / len(norms)
 
-print(f"\nDegenerate (exactly 1.0, std 0) norms: {len(degenerate)}/{len(norms)} "
+print(f"\nFrozen (std exactly 0) norms: {len(degenerate)}/{len(norms)} "
       f"({frac:.1%})")
+for k, m, s in degenerate:
+    print(f"  FROZEN {k} mean={m:.6f}")
 
 # Control: if the matmuls are ALSO degenerate, the export is broken wholesale
 # rather than norm-specific, which is a different report.
 mm_alive = [s for _, _, s in mms if s > 1e-4]
 print(f"Matmuls with non-trivial std: {len(mm_alive)}/{len(mms)}")
 
-if frac > 0.5:
-    print("\nG2 FAIL — the MTP norms are untrained (ORNITH 1.0 signature).")
-    if len(mm_alive) == len(mms) and mms:
-        print("Matmuls ARE trained, so this is the exact 1.0 defect, not an empty export.")
+# ANY frozen norm fails, not a majority. There are only ~7 norm tensors in a
+# one-layer MTP module; a single dead sub-component (q_norm alone, say) is
+# enough to break the drafter. A `frac > 0.5` threshold would let three of
+# seven be completely frozen and still report PASS.
+if degenerate:
+    print("\nG2 FAIL — MTP norms are frozen (untrained export).")
+    if mms and len(mm_alive) == len(mms):
+        print("Matmuls ARE trained, so this is the norm-specific defect, not an empty export.")
     print("ACTION: drop the MTP sidecar from scope. Report upstream. Do NOT debug engine code.")
+    sys.exit(1)
+
+# The matmul arm must gate too, not merely decorate the failure message: an
+# export with live norms but dead matmuls is equally unusable, and testing
+# only norms would pass it.
+if mms and not mm_alive:
+    print("\nG2 FAIL — every MTP matmul is degenerate; the export is empty.")
     sys.exit(1)
 
 print("\nG2 PASS — MTP norms carry trained variance. Task 8 may proceed.")
