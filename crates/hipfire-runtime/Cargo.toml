@@ -431,6 +431,13 @@ name = "mq4v2_parity"
 required-features = ["lab"]
 
 [[example]]
+# Sibling of mq4v2_parity: that one covers the qt44 GEMV/decode oracle, this one
+# the gfx11 batched-GEMM kernels (gate_up, residual, MoE grouped). Same class of
+# artifact — a GPU correctness oracle — so the same gate.
+name = "mq4v2_gemm_gfx11_parity"
+required-features = ["lab"]
+
+[[example]]
 name = "prefill_microbench"
 required-features = ["lab"]
 
