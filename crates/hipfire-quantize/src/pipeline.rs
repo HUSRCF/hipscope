@@ -112,6 +112,11 @@ struct MainQuantOuter<'a> {
 struct MainQuantState<'a> {
     hfq_tensors: &'a mut Vec<HfqTensor>,
     quantized_params: &'a mut u64,
+    /// Params kept at F16 (norms, biases). Tracked separately so the summary's
+    /// accounting can be made to balance — see the closure check in `run`.
+    /// Without it, dropping every norm shows up only as a rounding artefact in
+    /// the "100.0%" quantized figure.
+    f16_params: &'a mut u64,
     total_quant_error: &'a mut f64,
     max_quant_error: &'a mut f32,
     _n_quant_groups: &'a mut u64,
@@ -1531,6 +1536,7 @@ pub(crate) fn run() {
     let mut hfq_tensors = Vec::new();
     let mut total_params = 0u64;
     let mut quantized_params = 0u64;
+    let mut f16_params = 0u64;
     // Spill file for large models — keeps peak RSS bounded by flushing
     // completed tensor data to disk when accumulated memory exceeds 32 GB.
     // HIPFIRE_SPILL_DIR overrides the spill location (default = output dir).
@@ -2570,6 +2576,7 @@ pub(crate) fn run() {
             let mut state = MainQuantState {
                 hfq_tensors: &mut hfq_tensors,
                 quantized_params: &mut quantized_params,
+                f16_params: &mut f16_params,
                 total_quant_error: &mut total_quant_error,
                 max_quant_error: &mut max_quant_error,
                 _n_quant_groups: &mut _n_quant_groups,
@@ -2667,9 +2674,35 @@ pub(crate) fn run() {
         "  Quantized params: {quantized_params} ({:.1}%)",
         100.0 * quantized_params as f64 / total_params as f64
     );
+    eprintln!("  F16 params:       {f16_params} (norms, biases)");
     eprintln!("  Mean quant error: {mean_quant_error:.8}");
     eprintln!("  Max quant error:  {max_quant_error:.8}");
     eprintln!("  Output size:      {:.1} MB", total_bytes as f64 / 1e6);
+
+    // Accounting must close: every input param is quantized, kept at F16, or
+    // deliberately skipped. A gap means tensors were silently dropped.
+    //
+    // This check exists because `d1d172e9c` deleted the F16 fallback arm and
+    // every norm and bias vanished from the artifact. Nothing caught it — the
+    // quantizer exited 0, tensor count and byte size looked plausible, and the
+    // only symptom was `Quantized params` sitting 176,768 below `Total params`,
+    // printed as "100.0%" after rounding. The failure surfaced a whole task
+    // later, at model load, with an error naming the loader rather than the
+    // quantizer that caused it.
+    // NB: `total_params` counts only ingested tensors — `skipped_params` is
+    // accumulated on the `continue` paths before a tensor ever reaches the
+    // total, so it must NOT appear on this side of the equation. Adding it
+    // double-counts and the check fires on a healthy run.
+    let accounted = quantized_params + f16_params;
+    if accounted != total_params {
+        let gap = total_params as i128 - accounted as i128;
+        eprintln!(
+            "\nERROR: param accounting does not close — {gap} params unaccounted for.\n  \
+             total={total_params} quantized={quantized_params} f16={f16_params} (skipped={skipped_params}, excluded from total)\n  \
+             Tensors were silently dropped; refusing to write a model that cannot load."
+        );
+        std::process::exit(2);
+    }
 
     // ── SP4b: bake prune finalize (rename kept per-expert tensors + patch count) ──
     // Applied only when a bake keep-map is active. Renames the per-expert-named
@@ -5945,6 +5978,48 @@ fn handle_main_quant(
                 });
             }
         } // end else (non-Q8HFQ path)
+    } else {
+        // Keep as F16 (convert BF16 -> F16 if needed).
+        //
+        // RESTORED. `d1d172e9c` ("decompose quantize run(), 5,372 -> 2,441
+        // lines, byte-identical output") deleted this entire `else` arm. Every
+        // tensor for which `should_quantize` returns false — that is, every
+        // norm and every bias — was then silently dropped from the artifact.
+        //
+        // The result is a model that quantizes without error, reports sane
+        // tensor counts and byte sizes, and cannot load: the qwen35 loader
+        // panics with `tensor not found: norm.weight`. On Ornith 1.5 this cost
+        // 501 tensors. The only visible trace was the summary's
+        // `Total params` / `Quantized params` gap of 176,768, rendered as
+        // "100.0%" by rounding.
+        //
+        // The comments at pipeline.rs:210 and :2423 still describe this as
+        // "the F16 fallback path at the bottom" — they outlived the code.
+        let f16_data = match meta.dtype.as_str() {
+            "F16" => raw_data.to_vec(),
+            "BF16" | "F32" => to_f32(raw_data, meta.dtype.as_str())
+                .iter()
+                .flat_map(|&v| f32_to_f16(v).to_le_bytes())
+                .collect(),
+            other => panic!("unsupported dtype for norm/embd: {other}"),
+        };
+        let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
+        eprintln!(
+            "  F16:        {} {:?} ({} elements, {:.1} KB)",
+            name,
+            meta.shape,
+            n_elements,
+            f16_data.len() as f64 / 1024.0
+        );
+        *state.f16_params += n_elements as u64;
+        state.hfq_tensors.push(HfqTensor {
+            name: name.to_string(),
+            quant_type: QuantType::F16,
+            shape,
+            group_size: 0,
+            data: f16_data,
+            spilled_len: 0,
+        });
     }
 }
 
