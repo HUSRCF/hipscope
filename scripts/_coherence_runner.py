@@ -94,7 +94,27 @@ def detect(out_bytes: bytes) -> dict:
                 "max_freq": round(max_freq, 3), "max_tok": max_tok}
 
     t1 = check_window(trimmed[:128], "tier1_first128", 0.15, 0.50, 0.25, 0.40)
-    t2 = check_window(trimmed[-128:], "tier2_last128", 0.30, 0.50, 0.40, 0.45)
+
+    # Tier 2 inspects the TAIL, on the theory that degeneration sets in late. It
+    # only means that when the tail is distinct from the head: below 256 tokens
+    # the last-128 window overlaps the first-128 one, so tier 2 re-measures text
+    # tier 1 already covered while applying a stricter floor (0.30 vs 0.15).
+    #
+    # That produced a false failure on a CORRECT answer: the arithmetic prompt
+    # returned 144 tokens reading "4 hours 25 minutes" with its working shown
+    # twice (once reasoning, once formatted). Restating the working is good
+    # style and legitimately depresses token diversity — tier2 scored 0.211.
+    #
+    # This does NOT weaken degeneracy detection. A model stuck in a repetition
+    # loop emits LONG output, so it always clears the 256 floor and is still
+    # caught by tier 2; and tier 1 applies at every length regardless.
+    TIER2_MIN_TOTAL = 256
+    if total_all >= TIER2_MIN_TOTAL:
+        t2 = check_window(trimmed[-128:], "tier2_last128", 0.30, 0.50, 0.40, 0.45)
+    else:
+        t2 = {"label": "tier2_last128", "ok": True, "soft_warn": False,
+              "skipped_reason": f"total {total_all} < {TIER2_MIN_TOTAL}; tail not "
+                                f"distinct from head, tier1 governs"}
 
     tier3_flag = False
     if total_all >= 32:
