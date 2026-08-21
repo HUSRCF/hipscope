@@ -125,24 +125,59 @@ there. Slot 3 duplicates slot 2 and is never indexed.
   indexed gate_up, indexed down, batched k4/k8 and grouped GEMM across
   gfx1151 / gfx12 / gfx942 / gfx1030.
 
-The blocker, and the reason this is spiked before anything else is built:
-`quantize_mq2g256_lloyd_k3` calls `cpu_fwht_256` **unconditionally**. FWHT is
-orthogonal so the *math* is transparent, but it destroys the three-value
-structure, which is precisely what makes the K=3 codebook exact. Unrotated
-weights then require the runtime to skip `rotate_x_mq` / `rotate_x_mq_batched`
-for these tensors.
-
-A per-model seam exists — `MoeBiasAwareMq2Backend::rotate_x_batched`
-(`crates/hipfire-dispatch/src/families/moe.rs:433`) is model-owned, so an
-identity implementation is expressible. But the generic MoE decode path calls
-`gpu.rotate_x_mq_batched` directly (`crates/hipfire-dispatch/src/pipeline/mod.rs:1508`).
-So arm B needs either that trait impl or a dtype-gated skip in the generic path.
+The obstacle: `quantize_mq2g256_lloyd_k3` calls `cpu_fwht_256`
+**unconditionally**. FWHT is orthogonal so the *math* is transparent, but it
+destroys the three-value structure, which is precisely what makes the K=3
+codebook exact. Unrotated weights then require the runtime to skip
+`rotate_x_mq` / `rotate_x_mq_batched` for these tensors.
 `quantize_mq2g256_lloyd_no_fwht` already exists in `diagnostics.rs` as the
 unrotated packer precedent.
 
-**Spike B0 gates everything:** can an unrotated MQ2-Lloyd tensor be decoded
-correctly by the existing kernels? If no, arm B is dead and arm A becomes the
-critical path rather than the comparison.
+### Spike B0 — RESOLVED, arm B is viable
+
+**Kernel: rotation-agnostic** — `branch-implemented`, read from
+`kernels/src/gemv_mq2g256_lloyd_moe_gate_up_indexed.hip`. The kernel is a pure
+codebook lookup plus dot product; there is no FWHT inside it. Its header comment
+("X must be FWHT-pre-rotated by the caller") confirms rotation is purely a
+caller-side convention. Unrotated weights + unrotated x therefore compute the
+correct dot product on the existing kernel, unmodified.
+
+**Packing: value-exact on real weights** — `measured`. A no-FWHT K=3 packer
+mirroring the tree's exact byte layout, run against published Maple tensors:
+
+| tensor | max distinct / 256-block | max abs err | value-exact |
+|---|---:|---:|---|
+| `experts.0.gate_proj` | 3 | **0** | yes |
+| `experts.0.down_proj` | 3 | **0** | yes |
+| `self_attn.q_proj` | 3 | **0** | yes |
+| `lm_head` (negative control) | 246 | 0.468 | **no**, as required |
+
+The negative control confirms the test discriminates rather than passing
+vacuously. Row scales also survive bf16→fp16→f32 unchanged (1953 scales,
+0.00873–0.137), which is the precondition for fp16 codebook entries being exact.
+
+**One real caveat: signed zeros.** ~19% of weights are `-0.0` in the source and
+come back `+0.0`. Numerically identical (max err is exactly 0) and irrelevant to
+a GEMV, but the round-trip is therefore **value-exact, not bitwise-identical**.
+Both arms emit `+0.0` from a zero code, so they still agree with each other and
+the A-vs-B differential oracle is unaffected.
+
+**What B still needs (the one code change): a new DType tag.**
+`needs_x_rot_local` is derived *purely from DType*
+(`crates/hipfire-dispatch/src/families/moe.rs:247`) — `routed_gate_up_mq2lloyd`
+forces rotation on, and the resolver's own comment warns that unrotated x into
+rotated weights is "a silent garbage-output failure". So reusing `MQ2G256Lloyd`
+as-is would wrongly rotate. Arm B adds a tag — say `MQ2G256LloydU` — that:
+
+- shares the 72 B/group layout byte-for-byte, so **existing kernels bind unchanged**;
+- joins `CODEBOOK_INDEXABLE` and the `routed_dtype_indexable` ORs;
+- is **excluded** from the `needs_x_rot_local` ORs;
+- satisfies the resolver's stated SAFETY INVARIANT — (a) an indexed gate_up GEMV
+  arm, (b) an atomic self-combining down GEMV arm, (c) membership in
+  `routed_down_self_combines`. Missing (c) "double-counts every MoE layer,
+  silently". All three are satisfied by pointing at the identical kernels.
+
+This is additive dispatch wiring plus a packer variant. **No new HIP.**
 
 ### Arm A — TQ2G128 (qt40)
 
@@ -214,8 +249,11 @@ weight dtype, nothing else.
 Following #610's template: `scripts/coherence-gate-maple.sh` +
 `_coherence_runner.py`, a `registry_gen.py` entry with a matching test.
 
-1. **Bit-exactness** — packed→dequantized weights compared against the source
-   BF16 tensors. Must be exact, not "close". This is the arm gate.
+1. **Value-exactness** — packed→dequantized weights compared against the source
+   BF16 tensors. `max |err|` must be exactly 0, not "close". Bitwise equality is
+   *not* the bar: signed zeros legitimately differ (B0). The assertion is
+   "every differing word is a zero on both sides" — anything else fails.
+   This is the arm gate.
 2. **Differential** — arm A vs arm B logits on a fixed prompt set. Must be
    identical.
 3. **Reference** — per-layer hidden-state cosine against `modeling_maple.py` on
@@ -225,8 +263,8 @@ Following #610's template: `scripts/coherence-gate-maple.sh` +
 
 ## Open questions
 
-- **B0 (blocking):** is unrotated MQ2-Lloyd decodable by the existing kernels?
-  Decides whether B is a day of work or a dead end.
+- ~~**B0 (blocking):** is unrotated MQ2-Lloyd decodable by the existing
+  kernels?~~ **Resolved: yes.** See "Spike B0" above.
 - Precision policy for `word_embeddings` / `lm_head` (622 M params). BF16 costs
   1.24 GB; Q8 halves it. Deepgrove's 5.31 GB implies they quantize these; we
   need not match that to ship.
