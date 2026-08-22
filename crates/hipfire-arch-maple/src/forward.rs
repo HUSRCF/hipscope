@@ -450,6 +450,22 @@ pub fn forward_batch(
         .memcpy_htod(&state.b_positions.buf, &pos_bytes)
         .map_err(|e| format!("maple: htod positions: {e:?}"))?;
 
+    // ALSO stage the single-i32 `pos_buf` scalar, mirroring `decode_step`.
+    // `AttnParams` carries both `positions` (batch_size > 1) and `pos_buf`
+    // (batch_size == 1), and every KV-write/attend dispatch in
+    // `hipfire-dispatch/src/families/attention.rs` picks between them purely
+    // on `plan.batch_size` — which is `b`, the PER-CALL token count, not the
+    // logical prefill size. Any chunk with b == 1 (an unbatched `--b 1` run,
+    // or a ragged trailing remainder like `prefill_chunks(256, 17)`'s final
+    // 1-token chunk) takes the `pos_buf` branch. Leaving it unwritten here
+    // meant that branch silently read whatever a PRIOR call — or GPU-zeroed
+    // scratch — left behind, corrupting the KV write and attend position for
+    // that chunk. Do not delete this thinking it's dead because b_positions
+    // "covers" the batched case; it doesn't cover b == 1.
+    gpu.hip
+        .memcpy_htod(&state.pos_buf, &((start_pos + b - 1) as i32).to_ne_bytes())
+        .map_err(|e| format!("maple: htod pos_buf: {e:?}"))?;
+
     // Re-stamp the dense slot index for THIS B: identity over the live rows and
     // -1 across the BLOCK_M tail, so the grouped kernel skips the pad tile rows
     // instead of computing them from whatever is left in the scratch. The table
