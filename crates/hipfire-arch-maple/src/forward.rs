@@ -494,6 +494,17 @@ fn moe_block_batched(
     .map_err(|e| format!("maple L{l}: scatter: {e:?}"))?;
 
     // gate_up: x_row_div = k_top (slot -> token), x rows = b.
+    //
+    // Same F16 contract `dense_qt51_gemm` asserts: an F32 `x_src` here does not
+    // fail, it routes through the kernel's pointer-keyed `ensure_fp16_x` and
+    // serves layer 0's activations for all 24 layers. That was demonstrated
+    // once already (cosine 0.537), so assert it at the call site rather than
+    // relying on the comment above.
+    debug_assert_eq!(
+        state.b_normed_f16.dtype,
+        DType::F16,
+        "moe gate_up: x must be pre-converted F16"
+    );
     gpu.gemm_mq2g256_lloyd_moe_grouped_wmma(
         &m.expert_gate_up_ptrs,
         &state.b_expert_tiles,
@@ -527,6 +538,11 @@ fn moe_block_batched(
         .map_err(|e| format!("maple L{l}: swiglu f32->f16: {e:?}"))?;
 
     // down: x_row_div = 1 (act rows ARE slots), x rows = total_slots.
+    debug_assert_eq!(
+        state.b_act_f16.dtype,
+        DType::F16,
+        "moe down: x must be pre-converted F16"
+    );
     gpu.gemm_mq2g256_lloyd_moe_grouped_wmma(
         &m.expert_down_ptrs,
         &state.b_expert_tiles,
@@ -589,7 +605,15 @@ pub fn forward_batch(
         ));
     }
     if !forward_batch_supported(weights) {
-        return Err("maple forward_batch: unsupported tier (needs uniform qt51)".into());
+        // Name BOTH gates. `forward_batch_supported` fails for two distinct
+        // reasons — a non-qt51 attention/expert weight, or a missing router F16
+        // mirror — and a checkpoint with a quantized router would otherwise be
+        // told its experts were the problem.
+        return Err(
+            "maple forward_batch: unsupported tier (needs uniform qt51 attention and \
+                    expert weights, plus the router's F16 mirror)"
+                .into(),
+        );
     }
 
     let hidden = cfg.hidden_size;
@@ -810,6 +834,24 @@ fn row_view(t: &GpuTensor, offset: usize, len: usize) -> GpuTensor {
     }
 }
 
+/// Test-only override: force full causal on the SLIDING layers too, so the
+/// sliding window can be PROVEN live by differential rather than assumed.
+///
+/// Parity against the per-token path alone cannot show it — if both paths
+/// dropped the window they would still agree with each other. Forcing it off on
+/// only the batched side makes a live window observable as a divergence, and a
+/// dead one as silence. At 1200 tokens this drives cosine from 0.996 to -0.725.
+///
+/// Cached in a `OnceLock` for the same reason `dump_hidden_path` is:
+/// `developer_var` scans the config field table and allocates, and this sits on
+/// a per-layer, per-chunk path that is directly measured.
+fn force_full_causal() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        hipfire_config::developer_var("HIPFIRE_MAPLE_FORCE_FULL_CAUSAL").as_deref() == Ok("1")
+    })
+}
+
 /// Batched KV write + windowed masked flash attention for layer `l`.
 ///
 /// `q8_windowed` selects the batched masked windowed Q8 key unconditionally:
@@ -824,7 +866,7 @@ fn batched_attend(
     b: usize,
     start_pos: usize,
 ) -> Result<(), String> {
-    let window = if cfg.layer_type(l) == MapleLayerType::Sliding {
+    let window = if cfg.layer_type(l) == MapleLayerType::Sliding && !force_full_causal() {
         cfg.sliding_window as i32
     } else {
         0

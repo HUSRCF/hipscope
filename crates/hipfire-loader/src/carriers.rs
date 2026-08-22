@@ -1674,6 +1674,43 @@ impl Carrier for MapleCarrier {
     fn sampling_defaults(&self) -> saddle_core::sampling::SamplingDefaults {
         saddle_core::sampling::SamplingDefaults::new(1.0, 0.95, 1.0)
     }
+    /// Batched prefill over `MAPLE_PREFILL_CHUNK`-sized chunks. `forward_batch`
+    /// ERRORS above `MAPLE_PREFILL_MAX_B` rather than splitting silently, so the
+    /// chunking here is mandatory, not an optimisation.
+    ///
+    /// The failure string is propagated through `prefill_err`, which the daemon
+    /// interpolates into `bench_prefill forward failed: {e}` for every carrier —
+    /// not just Glimmer. Dropping it would reduce an unsupported-tier refusal
+    /// (which names the qt51 and router-mirror requirements) to a bare
+    /// "forward failed".
+    fn bench_prefill(
+        &self,
+        m: &mut crate::LoadedModel,
+        gpu: &mut rdna_compute::Gpu,
+        synthetic: &[u32],
+        _n: usize,
+        prefill_err: &mut Option<String>,
+    ) -> Option<bool> {
+        let b = (m.state.as_mut()?.as_mut() as &mut dyn Any)
+            .downcast_mut::<hipfire_arch_maple::MapleBundle>()?;
+        for (start, len) in hipfire_arch_maple::batch::prefill_chunks(
+            synthetic.len(),
+            hipfire_arch_maple::batch::MAPLE_PREFILL_CHUNK,
+        ) {
+            if let Err(e) = hipfire_arch_maple::forward::forward_batch(
+                &b.config,
+                &b.weights,
+                &mut b.state,
+                gpu,
+                &synthetic[start..start + len],
+                start,
+            ) {
+                *prefill_err = Some(e);
+                return Some(false);
+            }
+        }
+        Some(true)
+    }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
         if ctx.pp > 1 {
             return Err("maple: pp>1 unsupported via registry".into());

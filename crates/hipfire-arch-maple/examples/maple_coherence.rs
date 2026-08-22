@@ -14,6 +14,9 @@
 //! Usage:
 //!   maple_coherence --model <model.hfq> [--prompt "..."] [--max-tokens N] [--raw]
 //!
+//! `HIPFIRE_MAPLE_PER_TOKEN_PREFILL=1` forces the per-token prefill path, so the
+//! batched path can be A/B'd against it from one binary on one machine.
+//!
 //! `--raw` skips the ChatML frame and feeds the prompt verbatim (base-model
 //! continuation check). Per-layer hidden-state dumping for cosine comparison
 //! against the HF reference is a separate follow-up; it needs a capture hook
@@ -111,16 +114,42 @@ fn main() {
     );
     eprintln!("prompt: {} token(s)", prompt_toks.len());
 
-    // Prefill: one decode_step per prompt token (the correct, zero-risk
-    // baseline — a batched prefill is a separate follow-up).
-    let mut pos = 0u32;
-    let mut logits = Vec::new();
+    // Prefill: batched when the checkpoint's tier supports it, else the
+    // per-token path (the original zero-risk baseline) unchanged. The fallback
+    // is not dead code — `forward_batch_supported` is false for any checkpoint
+    // whose attention/expert weights are not uniformly qt51, or whose router
+    // has no F16 mirror.
     let t0 = std::time::Instant::now();
-    for &tok in &prompt_toks {
-        logits = decode_step(&b.config, &b.weights, &mut b.state, &mut gpu, tok, pos)
-            .expect("decode_step (prefill)");
-        pos += 1;
+    let mut logits = Vec::new();
+    // `HIPFIRE_MAPLE_PER_TOKEN_PREFILL=1` forces the old per-token path. Both
+    // arms then run from ONE binary on ONE machine, so the batched-vs-per-token
+    // speedup is a controlled A/B rather than a comparison against a figure
+    // recorded in an earlier session under unknown load. Under CPU contention
+    // both arms are depressed together and the RATIO stays meaningful.
+    let force_per_token =
+        hipfire_config::developer_var("HIPFIRE_MAPLE_PER_TOKEN_PREFILL").as_deref() == Ok("1");
+    if hipfire_arch_maple::forward::forward_batch_supported(&b.weights) && !force_per_token {
+        for (start, len) in hipfire_arch_maple::batch::prefill_chunks(
+            prompt_toks.len(),
+            hipfire_arch_maple::batch::MAPLE_PREFILL_CHUNK,
+        ) {
+            logits = hipfire_arch_maple::forward::forward_batch(
+                &b.config,
+                &b.weights,
+                &mut b.state,
+                &mut gpu,
+                &prompt_toks[start..start + len],
+                start,
+            )
+            .expect("forward_batch");
+        }
+    } else {
+        for (p, &tok) in prompt_toks.iter().enumerate() {
+            logits = decode_step(&b.config, &b.weights, &mut b.state, &mut gpu, tok, p as u32)
+                .expect("decode_step (prefill)");
+        }
     }
+    let mut pos = prompt_toks.len() as u32;
     let prefill_s = t0.elapsed().as_secs_f64();
     eprintln!(
         "prefill: {:.2}s ({:.1} tok/s)",

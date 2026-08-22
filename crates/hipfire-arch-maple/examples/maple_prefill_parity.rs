@@ -22,15 +22,36 @@
 //! to perturbation, which exaggerates the arithmetic gap above and is not
 //! representative of how this path is actually exercised.
 //!
-//! KNOWN OPEN FINDING (2026-08-22): on real text with multiple sequential
-//! chunks (`--b 1`, `--b 17`), the hard bar currently FAILS — argmax
-//! mismatches at a minority of comparison points. `--b 256` (single chunk)
-//! and `--chunk-split` (two chunks) pass. See `.superpowers/sdd/task-4-report.md`
-//! and `COSINE_FLOOR` below for full numbers. This is NOT masked by the bar.
+//! RESOLVED (2026-08-22, task 6): on real text with multiple sequential chunks
+//! (`--b 1`, `--b 17`) the hard bar FAILS — argmax mismatches at a minority of
+//! comparison points; `--b 256` and `--chunk-split` pass. `--near-tie` was
+//! added to decide whether those flips are precision or a defect, and the
+//! answer is **precision**. Measured at 200 tokens:
+//!   B=1 : 10-16 flips / 200 points. Median reference top1-top2 gap
+//!         0.086 at FLIPS vs 1.116 at MATCHES (~13x). The largest
+//!         perturbation any flip REQUIRED was 0.451, against a measured
+//!         deciding-margin noise of median 0.117 / max 0.996 — i.e. every
+//!         flip sits inside the noise the F16-vs-F32 gap actually produces.
+//!   B=17: 2 flips / 12 points, gaps 0.033 and 0.002, both rank-1 swaps.
+//! Two further checks back this up. The flip SET is not reproducible run to
+//! run (16 flips one run, 10 the next, same binary and input) — a genuine
+//! defect would be deterministic. And the positive control shows what a real
+//! defect looks like on this same instrument: forcing full-causal attention
+//! with `HIPFIRE_MAPLE_FORCE_FULL_CAUSAL=1` at 1200 tokens drives cosine to
+//! **-0.725**, nothing like the ~0.99 seen here.
+//!
+//! NOTE, and it is the reason cosine is still reported: in that window-off
+//! control the argmax hard bar PASSED 5/5 while cosine collapsed to -0.725.
+//! Argmax alone would not have caught a dropped sliding window. The two
+//! metrics are complementary; neither is sufficient.
 //!
 //! Usage:
 //!   maple_prefill_parity --model <hfq> [--tokens N] [--b N]... [--chunk-split]
-//!                        [--synthetic]
+//!                        [--synthetic] [--near-tie]
+//!
+//! `--near-tie` answers whether the argmax flips above are benign precision or
+//! a real defect, by reporting the REFERENCE top1-top2 logit gap at each flip
+//! against the same gap at the matching points. See `top2_gap`.
 
 use hipfire_arch_maple::bundle::load_maple_from_hfq;
 use hipfire_arch_maple::forward::{decode_step, forward_batch};
@@ -95,6 +116,89 @@ fn argmax(v: &[f32]) -> usize {
         .0
 }
 
+/// `(top1 - top2)` of the REFERENCE logits: how decisive the oracle's own
+/// choice was at this point.
+///
+/// This is the discriminator for the near-tie question. The batched path
+/// differs from the oracle by a ~1e-3-scale numerical perturbation (F16 WMMA
+/// vs F32 scalar GEMV — see the module docs). A perturbation of that size can
+/// only flip the argmax where the reference's own top-1 and top-2 are within
+/// about that distance. So:
+///   - flips concentrated at TINY gaps  => near-ties, benign precision;
+///   - flips at WELL-SEPARATED logits   => a real bug, because no 1e-3
+///     perturbation can reorder logits separated by ~1.0.
+fn top2_gap(v: &[f32]) -> f64 {
+    let (mut t1, mut t2) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
+    for &x in v {
+        if x > t1 {
+            t2 = t1;
+            t1 = x;
+        } else if x > t2 {
+            t2 = x;
+        }
+    }
+    (t1 - t2) as f64
+}
+
+/// Reference top-1 and top-2 TOKEN IDS.
+fn top2_ids(v: &[f32]) -> (usize, usize) {
+    let (mut i1, mut i2) = (0usize, 0usize);
+    let (mut t1, mut t2) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
+    for (i, &x) in v.iter().enumerate() {
+        if x > t1 {
+            t2 = t1;
+            i2 = i1;
+            t1 = x;
+            i1 = i;
+        } else if x > t2 {
+            t2 = x;
+            i2 = i;
+        }
+    }
+    (i1, i2)
+}
+
+/// How much the batched path perturbs the DECIDING MARGIN at this point:
+/// `|(batched[t1] - batched[t2]) - (ref[t1] - ref[t2])|`, where `t1`/`t2` are
+/// the reference's own top-2.
+///
+/// This is the quantity that actually competes with `top2_gap`. An argmax flip
+/// between the reference's top-2 happens precisely when this perturbation
+/// exceeds the gap. Measuring it turns the near-tie verdict from an appeal to
+/// a nominal "~1e-3 relative" figure into a direct comparison on the same
+/// axis and in the same units as the gap: if the typical margin noise is the
+/// same size as the gaps where flips occur, and far smaller than the gaps
+/// where they don't, the flips are precision — not a defect.
+fn margin_noise(batched: &[f32], reference: &[f32]) -> f64 {
+    let (t1, t2) = top2_ids(reference);
+    let rb = (batched[t1] - batched[t2]) as f64;
+    let rr = (reference[t1] - reference[t2]) as f64;
+    (rb - rr).abs()
+}
+
+/// Rank of `tok` in `v`'s descending logit order (0 = argmax).
+///
+/// A flip that lands on rank 1 is the reference's own runner-up — the exact
+/// signature of a near-tie. A flip to a far rank is not explainable by
+/// precision and would indicate a real defect.
+fn rank_of(v: &[f32], tok: usize) -> usize {
+    let x = v[tok];
+    v.iter().filter(|&&y| y > x).count()
+}
+
+fn median(mut xs: Vec<f64>) -> f64 {
+    if xs.is_empty() {
+        return f64::NAN;
+    }
+    xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let n = xs.len();
+    if n % 2 == 1 {
+        xs[n / 2]
+    } else {
+        0.5 * (xs[n / 2 - 1] + xs[n / 2])
+    }
+}
+
 /// OUT-OF-DISTRIBUTION stress case. Deterministic ids scattered across the
 /// vocab, avoiding special ids. On this input the model's logits are flat
 /// and hypersensitive to perturbation, which exaggerates the F16-vs-F32
@@ -144,6 +248,7 @@ fn main() {
     let mut bs: Vec<usize> = Vec::new();
     let mut chunk_split = false;
     let mut synthetic = false;
+    let mut near_tie = false;
     let mut i = 1;
     while i < argv.len() {
         match argv[i].as_str() {
@@ -165,6 +270,12 @@ fn main() {
             }
             "--synthetic" => {
                 synthetic = true;
+                i += 1;
+            }
+            // Near-tie diagnostic: for every argmax flip, report how decisive
+            // the REFERENCE was at that point. See `top2_gap`.
+            "--near-tie" => {
+                near_tie = true;
                 i += 1;
             }
             other => panic!("unknown arg {other}"),
@@ -233,6 +344,12 @@ fn main() {
         let mut points = 0usize;
         let mut mismatches = 0usize;
         let mut cosines: Vec<f64> = Vec::with_capacity(chunks.len());
+        // Near-tie diagnostic state: the reference top1-top2 gap at each point,
+        // split by whether the argmax flipped, plus the flip details.
+        let mut flip_gaps: Vec<f64> = Vec::new();
+        let mut match_gaps: Vec<f64> = Vec::new();
+        let mut flips: Vec<(usize, f64, usize, f64)> = Vec::new();
+        let mut noises: Vec<f64> = Vec::new();
         for (start, len) in &chunks {
             let last = forward_batch(
                 &bb.config,
@@ -245,11 +362,27 @@ fn main() {
             .expect("forward_batch");
             let w = &want[*start + *len - 1];
             let c = cosine(&last, w);
-            let same = argmax(&last) == argmax(w);
+            let got = argmax(&last);
+            let same = got == argmax(w);
             points += 1;
             cosines.push(c);
+            let gap = top2_gap(w);
+            noises.push(margin_noise(&last, w));
             if !same {
                 mismatches += 1;
+                flip_gaps.push(gap);
+                // Where the batched pick sits in the REFERENCE ordering.
+                // `gap` (top1-top2) is the perturbation needed only when the
+                // pick IS the runner-up. For a pick at rank > 1 the required
+                // perturbation is larger, and reporting the top1-top2 gap
+                // there would understate it — so also record the gap to the
+                // token actually chosen. THIS is the number that has to stay
+                // inside the measured noise band for the near-tie verdict to
+                // hold at every flip, not just the rank-1 ones.
+                let need = (w[argmax(w)] - w[got]) as f64;
+                flips.push((*start + *len - 1, gap, rank_of(w, got), need));
+            } else {
+                match_gaps.push(gap);
             }
         }
 
@@ -272,6 +405,60 @@ fn main() {
             if argmax_ok { "PASS" } else { "FAIL" },
             if cosine_ok { "PASS" } else { "FAIL" },
         );
+
+        if near_tie {
+            let (mf, mm) = (median(flip_gaps.clone()), median(match_gaps.clone()));
+            // The perturbation that competes with the gap, in the same units.
+            let mut sorted_noise = noises.clone();
+            sorted_noise.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let p90 = sorted_noise[(sorted_noise.len() * 9 / 10).min(sorted_noise.len() - 1)];
+            println!(
+                "     near-tie: deciding-margin NOISE |Δ(top1-top2)| median={:.6} p90={p90:.6} max={:.6}",
+                median(noises.clone()),
+                sorted_noise[sorted_noise.len() - 1],
+            );
+            println!(
+                "     near-tie: median reference top1-top2 gap at FLIPS  = {mf:.6} (n={})",
+                flip_gaps.len()
+            );
+            println!(
+                "     near-tie: median reference top1-top2 gap at MATCHES= {mm:.6} (n={})",
+                match_gaps.len()
+            );
+            if !flip_gaps.is_empty() {
+                let max_flip = flip_gaps.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                let far = flips.iter().filter(|(_, _, r, _)| *r > 1).count();
+                // The decisive statistic: the largest perturbation any flip
+                // actually required, versus the largest noise measured. If
+                // required <= observed noise everywhere, every flip is
+                // explained by precision alone.
+                let max_need = flips
+                    .iter()
+                    .map(|(_, _, _, n)| *n)
+                    .fold(f64::NEG_INFINITY, f64::max);
+                println!(
+                    "     near-tie: largest gap at a flip = {max_flip:.6}; \
+                     flips landing beyond reference rank 1 = {far}/{}",
+                    flips.len()
+                );
+                println!(
+                    "     near-tie: largest perturbation REQUIRED by any flip = {max_need:.6} \
+                     (vs measured noise max {:.6}) [{}]",
+                    sorted_noise[sorted_noise.len() - 1],
+                    if max_need <= sorted_noise[sorted_noise.len() - 1] {
+                        "within noise => precision"
+                    } else {
+                        "EXCEEDS noise => investigate"
+                    }
+                );
+                for (pos, gap, rank, need) in &flips {
+                    println!(
+                        "       flip @pos {pos:<5} ref top1-top2 gap = {gap:.6}  pick = ref rank \
+                         {rank} (needed {need:.6})"
+                    );
+                }
+            }
+        }
     }
 
     println!("\n{} configuration(s), {failures} failure(s)", bs.len());
