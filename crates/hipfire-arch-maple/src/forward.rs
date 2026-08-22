@@ -54,6 +54,18 @@ pub fn decode_step(
     token_id: u32,
     position: u32,
 ) -> Result<Vec<f32>, String> {
+    // Fail closed on a position past the KV allocation. Without this the KV
+    // write runs off the end of the cache and the first symptom is
+    // `hipMemcpy D2H: an illegal memory access was encountered` from a
+    // downstream kernel — a fault that names the wrong culprit and says
+    // nothing about the cause.
+    if position as usize >= state.max_seq {
+        return Err(format!(
+            "maple: position {position} exceeds max_seq {} — allocate the state \
+             with a larger max_seq (prompt + generation must fit)",
+            state.max_seq
+        ));
+    }
     gpu.hip
         .memcpy_htod(&state.pos_buf, &(position as i32).to_ne_bytes())
         .map_err(|e| format!("maple: htod pos: {e:?}"))?;

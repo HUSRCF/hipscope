@@ -79,19 +79,10 @@ fn main() {
         hfq.arch_id
     );
 
-    let max_seq = args.max_tokens + 512;
-    let mut b = load_maple_from_hfq(&mut hfq, &mut gpu, max_seq).expect("load maple bundle");
-    eprintln!(
-        "maple: hidden={} layers={} experts={}/{} moe_inter={} vocab={} eos={}",
-        b.config.hidden_size,
-        b.config.num_hidden_layers,
-        b.config.num_experts,
-        b.config.num_experts_per_tok,
-        b.config.moe_intermediate_size,
-        b.config.vocab_size,
-        b.eos_tok,
-    );
-
+    // Tokenize BEFORE allocating state: the KV cache must hold prompt +
+    // generation. Sizing it from `max_tokens` alone under-allocates on any
+    // prompt longer than the slack, and the KV write then runs off the end of
+    // the cache.
     let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .expect("tokenizer");
 
@@ -104,6 +95,20 @@ fn main() {
         )
     };
     let prompt_toks = tokenizer.encode(&text);
+
+    let max_seq = prompt_toks.len() + args.max_tokens + 64;
+    let mut b = load_maple_from_hfq(&mut hfq, &mut gpu, max_seq).expect("load maple bundle");
+    eprintln!(
+        "maple: hidden={} layers={} experts={}/{} moe_inter={} vocab={} eos={} max_seq={}",
+        b.config.hidden_size,
+        b.config.num_hidden_layers,
+        b.config.num_experts,
+        b.config.num_experts_per_tok,
+        b.config.moe_intermediate_size,
+        b.config.vocab_size,
+        b.eos_tok,
+        max_seq,
+    );
     eprintln!("prompt: {} token(s)", prompt_toks.len());
 
     // Prefill: one decode_step per prompt token (the correct, zero-risk
