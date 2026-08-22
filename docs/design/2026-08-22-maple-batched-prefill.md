@@ -125,11 +125,69 @@ separate and much larger job), and the arm-A differential (arm A does not exist)
 The per-token path is already verified end to end, so it is the oracle.
 
 1. **Logit parity** — same prompt through `forward_batch` and the per-token
-   path; per-position cosine **>= 0.9999** and **identical greedy argmax** at
-   every position. Bit-exactness is not the bar: a GEMM reassociates differently
-   from a GEMV.
+   path (`crates/hipfire-arch-maple/examples/maple_prefill_parity.rs`).
    Run at **B=1**, **B=17** (deliberately not a multiple of BLOCK_M, to catch
    padding bugs) and **B=256**.
+
+   **Acceptance criterion revised 2026-08-22, after measurement.** The
+   original bar here was "cosine >= 0.9999 AND identical greedy argmax
+   [at the final position]". That was wrong on two counts, established by
+   running the oracle rather than by inspection:
+
+   - It compared only the LAST position of the whole run, i.e. **one**
+     comparison point regardless of how many chunks were involved — a run
+     that split into 12 chunks was reported as if 12 things had been
+     checked, when only 1 had.
+   - Its default input was synthetic ids scattered across the vocab
+     (`1000 + i*7919 % 100000`), which is out-of-distribution: the model's
+     logits go flat and hypersensitive to perturbation there, which
+     *exaggerates* the arithmetic gap below. Feeding the same code real
+     tokenized prose instead measured materially higher cosine.
+   - 0.9999 cosine is unachievable by construction: the batched path is a
+     WMMA GEMM over F16 activations (codebook deltas computed in
+     `_Float16`, F32 accumulate —
+     `kernels/src/gemm_mq2g256_lloyd_moe_grouped_wmma_k2.hip` ~L89-136),
+     while the per-token oracle is an F32 scalar GEMV. A ~1e-3 relative
+     per-GEMM difference is expected and compounds over 24 layers — the
+     same shape as the shipped cohere2moe Q8 prefill path, which also
+     feeds F16 activations to a WMMA GEMM.
+
+   The revised bar:
+
+   - **Hard bar: identical greedy argmax at every comparison point**, where
+     a comparison point is one `forward_batch` CALL (it returns only the
+     last token's logits per call, so a run chunked into N calls yields N
+     points). The harness prints how many points were compared so a
+     1-point run cannot be misread as an N-point pass.
+   - **Reported metric, not the hard bar: cosine, floor 0.85**, set with
+     margin below the worst minimum actually measured on real text (see
+     below), not from the old 0.9999.
+
+   **Measured 2026-08-22, real tokenized prose, 200 tokens, gfx1151,
+   release** (`--tokens 200`, run-to-run range across repeats where the
+   GPU's reduction order is not fully deterministic):
+
+   | Config | Points | Argmax | Cosine min | Cosine mean |
+   |---|---|---|---|---|
+   | B=1 (200 chained 1-token chunks) | 200 | **FAILS every run** (~14-17/200 mismatch) | 0.897-0.906 | ~0.994 |
+   | B=17 (12 chunks) | 12 | **flaky**: 9/12-12/12 across repeats | 0.951-0.984 | ~0.99 |
+   | B=256 (1 chunk, whole prompt) | 1 | passes every run | 0.980-0.998 | — |
+   | chunk-split (2 chunks of 100) | 2 | passes every run | 0.998-0.999 | ~0.999 |
+
+   Synthetic OOD input, for contrast (NOT a representative measurement,
+   see `--synthetic` in the harness): cosine min as low as 0.52, argmax
+   fails at all three B values including B=256.
+
+   **This is an open finding, not swept under the bar.** At B=256 (the
+   production chunk size) and at a 2-chunk split, argmax parity holds on
+   every real-text run so far. At B=1, and intermittently at B=17, it does
+   not: chunk N's KV cache is itself the *output* of the WMMA-batched path
+   for chunk N-1, so with many sequential chunks the F16-vs-F32 gap
+   compounds again at every chunk boundary through the cached K/V, not
+   just once over 24 layers. Whether that residual divergence is
+   acceptable at small chunk sizes, or needs a mitigation (e.g. F32 KV
+   write-back, or a minimum chunk size), is unresolved — tracked as a
+   follow-up, not fixed by loosening this bar.
 2. **Chunk-boundary** — a prompt prefilled as 100+100 must match one 200-token
    chunk. Catches `start_pos` / KV-offset errors.
 3. **Sliding-window liveness** — parity alone cannot prove the window is
