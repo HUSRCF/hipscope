@@ -7450,8 +7450,27 @@ pub fn generate_qwen2(
 ///
 /// Scope, matching the qwen2 precedent: greedy argmax only. `temp` / `top_p` /
 /// `repeat_penalty` / `stop` are accepted and not honoured — no sampler is
-/// wired for arch 15. Tools are not offered (`GenerationRoute::supports_tools`
-/// excludes `MapleAr`).
+/// wired for arch 15.
+///
+/// TOOLS are offered as of the `.mq2lloydu` repack. The vendor's chat template
+/// (extracted from their GGUF metadata, which is where they ship it — their HF
+/// `tokenizer_config.json` has none) is a standard Qwen-family template with a
+/// `# Tools` system block and `<tool_call>{json}</tool_call>` emission. That is
+/// byte-for-byte the convention `emit_text::extract_tool_calls_from_text`
+/// already parses for `qwen_ar`, so this path REUSES that parser rather than
+/// introducing a second one.
+///
+/// Wire contract for tools here is LEGACY, not semantic v2, and that is
+/// deliberate. `MapleCarrier::caps().semantic_contract_version` stays `None`
+/// because (a) there is no router-backed producer on arch 15, and (b) the v2
+/// fold appends token text VERBATIM with no marker scan — under v2 Maple's
+/// `<think>` … `</think>` would land in `content` instead of being split into
+/// `reasoning_content`. The legacy `ThinkChannelRouter` does that split, so
+/// tool calls are surfaced the legacy way: a `{"type":"tool_calls","calls":[…]}`
+/// event emitted BEFORE the terminal handshake, plus `finish_reason`
+/// `"tool_calls"` on `done`. `stage_terminal_tool_calls` also embeds the
+/// canonical `calls` on the staged done so the payload is v2-ready if arch 15
+/// ever grows a router.
 ///
 /// Conversation handling is STATELESS: every turn cold-resets the KV and
 /// re-prefills the full rendered conversation from position 0, which is the
@@ -7476,6 +7495,7 @@ pub fn generate_maple(
     prompt: &str,
     system_prompt: Option<&str>,
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+    tools: Option<&[serde_json::Value]>,
     _temp: f32,
     _top_p: f32,
     max_tokens: usize,
@@ -7519,21 +7539,61 @@ pub fn generate_maple(
     let state = &mut bundle.state;
     let eos_tok = bundle.eos_tok;
 
+    // Tools require the embedded template. `GenerationRoute::supports_tools`
+    // is a per-ROUTE constant, so admitting `maple_ar` admits it for every
+    // arch-15 container — including the pre-repack `.hfq` that carries no
+    // `chat_template`. Only the Jinja frame can render a `# Tools` block; the
+    // hand-rolled ChatML fallback below silently DROPS `tools`, and silently
+    // dropping them is the worst outcome available: measured on this branch,
+    // the same tools request framed 269 prompt tokens against the templated
+    // `.mq2lloydu` container and 21 against the template-less one — the schemas
+    // never reached the model, which then answered in prose (and, in the
+    // session that prompted this work, invented a `str_replace_editor` call).
+    // Refuse instead, with a message that names the fix.
+    if tools.is_some_and(|t| !t.is_empty()) && m.chat_template.is_none() {
+        emit_active_attempt_error(
+            stdout,
+            Some(id),
+            "tools require a chat template, and this arch-15 container embeds none \
+             — re-convert with a `chat_template.jinja` beside the weights \
+             (see pipeline_maple::build_metadata) or request without `tools`",
+            "unsupported",
+            false,
+            false,
+        );
+        let _ = stdout.flush();
+        return;
+    }
+
     // Render the WHOLE conversation, not just the newest user turn: prior turns
     // reach the model through the prompt and never through retained KV, which
     // is what makes the cold reset below safe.
     //
-    // The published Maple-Preview `.hfq` carries NO `chat_template` in its
-    // metadata (verified by byte-scanning the container: the literal
-    // "chat_template" does not occur), so `m.chat_template` is None and the
-    // hand-rolled ChatML path is the LIVE path here, not a fallback. It must
-    // therefore replay history itself — an earlier revision that framed only
-    // `prompt` made the model answer "I don't have memory of previous
+    // The Jinja branch is the LIVE path for any `.hfq` repacked with the
+    // vendor's chat template embedded (see `pipeline_maple::build_metadata` —
+    // the sidecar `chat_template.jinja` is folded into `tokenizer_config`).
+    // Maple-Preview's HF `tokenizer_config.json` genuinely ships no template;
+    // the vendor bakes theirs into GGUF metadata instead. The `.hfq` built
+    // BEFORE that repack has no template, and for it the hand-rolled ChatML
+    // frame below is still the live path — hence it is kept, not deleted.
+    //
+    // The fallback must replay history itself: an earlier revision that framed
+    // only `prompt` made the model answer "I don't have memory of previous
     // conversations" to a request whose `messages` array plainly contained the
-    // answer. The Jinja branch is kept for a future repack that does embed a
-    // template. `tools` is always None: `GenerationRoute::MapleAr` is excluded
-    // from `supports_tools`, so `generate()`'s tools preflight has already
-    // denied any tools request before reaching here.
+    // answer. The Jinja branch gets the same treatment via `render_messages`.
+    //
+    // `tools` is threaded into `render_messages` exactly as `generate_qwen*`
+    // does. Without it the template's `{%- if tools %}` block never fires, no
+    // `<tools>` schema list reaches the model, and the observed failure is not
+    // silence but a CONFIDENT HALLUCINATION: asked to write code, the model
+    // emitted a well-formed `<tool_call>` naming `str_replace_editor` — a tool
+    // the client never declared. It knows the FORMAT from pretraining; only the
+    // template can tell it the INVENTORY.
+    //
+    // `primed_think` records whether the rendered prompt left the model inside
+    // an already-open `<think>` span. False for the hand-rolled ChatML
+    // fallback, which stops at `<|im_start|>assistant\n`.
+    let mut primed_think = false;
     let prompt_ids = if let Some(template) = m.chat_template.as_ref() {
         let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
             tokenizer,
@@ -7545,12 +7605,56 @@ pub fn generate_maple(
             reasoning_strength: None,
             reasoning_effort: None,
         };
-        let rendered = match messages_history {
-            Some(history) => frame.render_messages(history, None, None),
-            None => frame.render(),
+        // `frame.render()` cannot carry tools (it renders `system`/`user`
+        // scalars, not a message array), so any tools request must go through
+        // `render_messages` — synthesizing the [system?, user] turn when the
+        // caller supplied no history. Mirrors the qwen EP/AR pattern.
+        let rendered = if tools.is_some() || messages_history.is_some() {
+            let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
+            let messages_slice: &[hipfire_runtime::prompt_frame::Message] = match messages_history {
+                Some(h) if !h.is_empty() => h,
+                _ => {
+                    let mut v = Vec::new();
+                    if let Some(sys) = system_prompt {
+                        v.push(hipfire_runtime::prompt_frame::Message {
+                            role: hipfire_runtime::prompt_frame::Role::System,
+                            content: sys.to_string(),
+                            reasoning_content: None,
+                            name: None,
+                            rendered_name: None,
+                            tool_calls: Vec::new(),
+                            tool_call_id: None,
+                            tool_plan: String::new(),
+                        });
+                    }
+                    v.push(hipfire_runtime::prompt_frame::Message {
+                        role: hipfire_runtime::prompt_frame::Role::User,
+                        content: prompt.to_string(),
+                        reasoning_content: None,
+                        name: None,
+                        rendered_name: None,
+                        tool_calls: Vec::new(),
+                        tool_call_id: None,
+                        tool_plan: String::new(),
+                    });
+                    synthesized = v;
+                    &synthesized
+                }
+            };
+            frame.render_messages(messages_slice, tools, None)
+        } else {
+            frame.render()
         };
         match rendered {
-            Ok(rendered) => tokenizer.encode(&rendered),
+            Ok(rendered) => {
+                // The vendor template's generation prompt ends
+                // `<|im_start|>assistant\n<think>\n`, so the model resumes
+                // INSIDE an already-open reasoning span and never emits a
+                // `<think>` of its own. Same `primed_think` probe the qwen
+                // paths use. See `started_in_think` at the gen_start below.
+                primed_think = rendered.trim_end().ends_with("<think>");
+                tokenizer.encode(&rendered)
+            }
             Err(e) => {
                 eprintln!(
                     "[daemon] maple jinja render failed ({e}) — falling back to ChatML frame"
@@ -7682,17 +7786,32 @@ pub fn generate_maple(
     //
     // `contract_version` is `gen_start_contract_version_for_arch(15)`, i.e.
     // `MapleCarrier::caps().semantic_contract_version` = None. Maple must NOT
-    // advertise semantic contract v2: it has no router-backed producer and
-    // `GenerationRoute::MapleAr` is excluded from `supports_tools`.
+    // advertise semantic contract v2 even now that `MapleAr` DOES support
+    // tools: it has no router-backed producer, and the v2 fold appends token
+    // text verbatim with no marker scan — under v2 the `<think>` … `</think>`
+    // span below would be misfiled as `content` instead of `reasoning_content`.
+    // The legacy `ThinkChannelRouter` does that split, and the legacy contract
+    // carries tool calls perfectly well via a `{"type":"tool_calls"}` event
+    // (see the terminal at the end of this fn).
     //
-    // `started_in_think` is false. Maple's template opens the assistant turn at
-    // `<|im_start|>assistant\n` and the model emits its own `<think>` token, so
-    // the stream begins OUTSIDE the reasoning span; claiming otherwise would
-    // mis-attribute the first visible tokens.
+    // `started_in_think` is `primed_think`, NOT a constant. It depends on which
+    // frame rendered the prompt, and getting it wrong silently misfiles the
+    // whole reasoning span:
+    //
+    //   * hand-rolled ChatML fallback — stops at `<|im_start|>assistant\n`; the
+    //     model emits its own `<think>`, so the stream begins OUTSIDE the span
+    //     and this is false.
+    //   * vendor template — its generation prompt ends
+    //     `<|im_start|>assistant\n<think>\n`, so the model resumes INSIDE an
+    //     open span and never emits the opening tag. Hardcoding false here made
+    //     the legacy `ThinkChannelRouter` treat the entire chain-of-thought as
+    //     answer text: observed live on the first `.mq2lloydu` run, where the
+    //     model's "The user wants me to write a hello world in Zig…" reasoning
+    //     was returned as `content` with `reasoning_content` empty.
     emit_gen_start(
         stdout,
         id,
-        false,
+        primed_think,
         crate::common::gen_start_contract_version_for_arch(15),
     );
 
@@ -7800,7 +7919,31 @@ pub fn generate_maple(
     let tok_s = rate(generated_count, total_s);
     let prefill_tok_s = rate(prompt_ids.len(), prefill_s);
     let decode_tok_s = rate(generated_count, decode_s);
-    let pending_done = serde_json::json!({
+
+    // Tool calls. REUSE the Qwen `<tool_call>{json}</tool_call>` parser rather
+    // than writing an arch-15 one — Maple's template emits exactly that shape,
+    // and a second parser would be a second place to drift. Whole-buffer
+    // extract over the decoded run, which is the same legacy-tolerant strategy
+    // the non-router DFlash terminal uses.
+    //
+    // A truncated turn (`!hit_eos`, i.e. max_tokens) NEVER releases calls: a
+    // half-written `<tool_call>` body would be recovered by the tolerant parser
+    // into arguments the model never finished writing. Length stays "length".
+    let tool_calls = if hit_eos {
+        hipfire_runtime::emit_text::extract_tool_calls_from_text(
+            &tokenizer.decode(&streamed_tokens),
+        )
+    } else {
+        Vec::new()
+    };
+    let finish_reason = if !hit_eos {
+        "length"
+    } else if !tool_calls.is_empty() {
+        "tool_calls"
+    } else {
+        "stop"
+    };
+    let mut pending_done = serde_json::json!({
         "type": "done",
         "id": id,
         "tokens": generated_count,
@@ -7814,9 +7957,19 @@ pub fn generate_maple(
         // Report the truth: "stop" only when a real end-of-turn token landed.
         // Defaulting to "stop" (what `openai_finish_reason` does for a missing
         // field) would make a truncated reply look like a complete one.
-        "finish_reason": if hit_eos { "stop" } else { "length" },
+        "finish_reason": finish_reason,
         "attempt_id": active_attempt_id(),
     });
+    // Canonical `calls` on the staged done — ignored by the legacy client fold
+    // (which reads the event below) but required by `absorb_terminal_calls` if
+    // arch 15 is ever promoted to contract v2. Cheap, and keeps one source of
+    // truth for the payload.
+    hipfire_engine::emit::stage_terminal_tool_calls(&mut pending_done, finish_reason, &tool_calls);
+    // Legacy contract surfaces tool calls ONLY from a `{"type":"tool_calls"}`
+    // event, and the client's fold reads them BEFORE the commit_ready terminal
+    // — so this must precede `await_client_terminal_commit`, not follow it.
+    hipfire_engine::emit::emit_tool_calls_event(stdout, id, &tool_calls);
+    let _ = stdout.flush();
     match await_client_terminal_commit(stdout, id, &pending_done) {
         ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
         ClientTerminalDecision::Abort => {}

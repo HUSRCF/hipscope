@@ -258,6 +258,13 @@ const SAFE_ROUTES: &[GenerationRoute] = &[
     GenerationRoute::Deepseek4Spec,
     GenerationRoute::GlimmerAr,
     GenerationRoute::GlimmerSpec,
+    // Arch 15. Tool-safe on the LEGACY wire contract — its carrier keeps
+    // `semantic_contract_version: None` (no router-backed producer, and the v2
+    // fold would misfile Maple's `<think>` span as content). `generate_maple`
+    // emits a `{"type":"tool_calls"}` event plus a `finish_reason=tool_calls`
+    // terminal, parsing calls with the same Qwen `<tool_call>` parser as
+    // `qwen_ar` because Maple's vendor template emits the identical shape.
+    GenerationRoute::MapleAr,
 ];
 
 /// Pure gate model mirroring generate()'s tools preflight:
@@ -363,7 +370,7 @@ fn route_matrix_tools_absent_and_present() {
 }
 
 #[test]
-fn exact_safe_set_is_qwen_ar_dflash_ds4_ar_ep_spec_and_glimmer_ar_spec() {
+fn exact_safe_set_is_qwen_ar_dflash_ds4_ar_ep_spec_glimmer_ar_spec_and_maple_ar() {
     let mut from_all: Vec<GenerationRoute> = GenerationRoute::ALL
         .iter()
         .copied()
@@ -373,7 +380,7 @@ fn exact_safe_set_is_qwen_ar_dflash_ds4_ar_ep_spec_and_glimmer_ar_spec() {
     let mut expected = SAFE_ROUTES.to_vec();
     expected.sort_by_key(|r| r.name());
     assert_eq!(from_all, expected);
-    assert_eq!(from_all.len(), 7);
+    assert_eq!(from_all.len(), 8);
     // Negative: every other ALL member is denied for tools.
     for &r in GenerationRoute::ALL {
         if !SAFE_ROUTES.contains(&r) {

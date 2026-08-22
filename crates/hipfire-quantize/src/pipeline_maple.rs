@@ -292,11 +292,47 @@ fn build_metadata(
         );
     }
 
+    // Maple-Preview's published `tokenizer_config.json` carries NO
+    // `chat_template` — the vendor ships the template baked into their GGUF
+    // metadata instead. Mirror `pipeline.rs`'s sidecar rule: when a
+    // `chat_template.jinja` sits next to the weights and tokenizer_config has
+    // no template of its own, fold it in under `chat_template`. That is the key
+    // `m.chat_template` is populated from, and it is what lets `generate_maple`
+    // render the vendor frame (with `# Tools`) instead of the hand-rolled
+    // ChatML fallback, which can never advertise tools.
+    let tokenizer_config = {
+        let mut tc = read_json("tokenizer_config.json");
+        let jinja_path = input_dir.join("chat_template.jinja");
+        if jinja_path.exists() {
+            let has_template = tc
+                .as_ref()
+                .and_then(|v| v.get("chat_template"))
+                .map(|v| !v.is_null())
+                .unwrap_or(false);
+            if !has_template {
+                if let Ok(jinja) = std::fs::read_to_string(&jinja_path) {
+                    let n = jinja.len();
+                    let obj = tc.get_or_insert_with(|| serde_json::json!({}));
+                    if let Some(map) = obj.as_object_mut() {
+                        map.insert(
+                            "chat_template".to_string(),
+                            serde_json::Value::String(jinja),
+                        );
+                        eprintln!(
+                            "  embedded chat_template.jinja into tokenizer_config ({n} bytes)"
+                        );
+                    }
+                }
+            }
+        }
+        tc
+    };
+
     let metadata = serde_json::json!({
         "architecture": "maple",
         "config": config,
         "tokenizer": tokenizer_str.as_deref().unwrap_or("{}"),
-        "tokenizer_config": read_json("tokenizer_config.json"),
+        "tokenizer_config": tokenizer_config,
         "generation_config": read_json("generation_config.json"),
         "hipfire_maple_provenance": {
             "carrier": "MQ2G256LloydU",
@@ -559,6 +595,99 @@ mod tests {
         assert!(v["tokenizer"].is_string(), "tokenizer must be a string");
         assert!(v["tokenizer"].as_str().unwrap().contains("vocab"));
         assert_eq!(v["tokenizer_config"]["add_bos_token"], false);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A `chat_template.jinja` sidecar must land in the metadata envelope under
+    /// `tokenizer_config.chat_template` — that is the ONLY key the runtime
+    /// populates `LoadedModel::chat_template` from. Maple-Preview's HF
+    /// `tokenizer_config.json` genuinely has no template (the vendor ships it in
+    /// GGUF metadata), so without this the daemon falls back to a hand-rolled
+    /// ChatML frame that can never advertise tools.
+    #[test]
+    fn chat_template_sidecar_lands_in_metadata() {
+        let dir = std::env::temp_dir().join("maple_md_chat_template_test");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("tokenizer.json"), r#"{"model":{"vocab":{}}}"#).unwrap();
+        std::fs::write(
+            dir.join("tokenizer_config.json"),
+            r#"{"add_bos_token":false}"#,
+        )
+        .unwrap();
+        let template = "{%- if tools %}<tools>{{ tools }}</tools>{%- endif %}";
+        std::fs::write(dir.join("chat_template.jinja"), template).unwrap();
+
+        let md = build_metadata(
+            &dir,
+            r#"{"model_type":"maple"}"#,
+            &MapleConvertStats::default(),
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&md).unwrap();
+        assert_eq!(v["tokenizer_config"]["chat_template"], template);
+        // The sibling keys survive the fold-in.
+        assert_eq!(v["tokenizer_config"]["add_bos_token"], false);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The sidecar is OPTIONAL: no `chat_template.jinja` is not an error, and it
+    /// must not synthesize an empty/null template key that would make the
+    /// runtime think a template exists.
+    #[test]
+    fn missing_chat_template_sidecar_is_not_an_error() {
+        let dir = std::env::temp_dir().join("maple_md_no_chat_template_test");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("tokenizer.json"), r#"{"model":{"vocab":{}}}"#).unwrap();
+        std::fs::write(
+            dir.join("tokenizer_config.json"),
+            r#"{"add_bos_token":false}"#,
+        )
+        .unwrap();
+
+        let md = build_metadata(
+            &dir,
+            r#"{"model_type":"maple"}"#,
+            &MapleConvertStats::default(),
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&md).unwrap();
+        assert_eq!(v["tokenizer_config"]["add_bos_token"], false);
+        assert!(
+            v["tokenizer_config"].get("chat_template").is_none(),
+            "absent sidecar must not fabricate a chat_template key"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An existing `tokenizer_config.chat_template` WINS over the sidecar —
+    /// same precedence as the generic pipeline. Guards against a stale sidecar
+    /// silently overriding the checkpoint's own template on a future repack.
+    #[test]
+    fn tokenizer_config_template_wins_over_sidecar() {
+        let dir = std::env::temp_dir().join("maple_md_template_precedence_test");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("tokenizer.json"), r#"{"model":{"vocab":{}}}"#).unwrap();
+        std::fs::write(
+            dir.join("tokenizer_config.json"),
+            r#"{"chat_template":"FROM_CONFIG"}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("chat_template.jinja"), "FROM_SIDECAR").unwrap();
+
+        let md = build_metadata(
+            &dir,
+            r#"{"model_type":"maple"}"#,
+            &MapleConvertStats::default(),
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&md).unwrap();
+        assert_eq!(v["tokenizer_config"]["chat_template"], "FROM_CONFIG");
 
         std::fs::remove_dir_all(&dir).ok();
     }
