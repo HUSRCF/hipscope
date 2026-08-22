@@ -14,27 +14,32 @@ Current scope:
 - dense FP16 forward attention;
 - causal or non-causal masks;
 - MHA, MQA, and GQA;
-- head dimension 64;
+- head dimensions 64, 128, and 256;
 - raw HIP stream and element-stride inputs.
 
-It does not support hipfire's Q8/asym/FWHT KV layouts. Those layouts must stay
-on hipfire's native attention kernels. The first possible runtime consumer is
-`AttnFullF16`, after adding reusable FP32-to-FP16 query/output scratch because
-that hipfire boundary currently carries Q and output in FP32.
+The dense sidecar does not consume hipfire's quantized layouts. A separate
+quantized experiment under `quantized/` adds a narrow D256 24Q/4KV prefill
+instance for contiguous Asym3 K and Q8 V. It includes a versioned C ABI and an
+explicit, fail-closed Rust runtime route; decode and unsupported layouts remain
+on hipfire's native kernels.
 
 ## Build
 
-The current upstream CK generator still rejects `gfx1100`, despite gfx1100 being
-accepted by top-level build metadata. To keep this experiment reproducible,
+The build selects the CK recipe from `GPU_ARCH`. The pinned upstream CK
+generator rejects `gfx1100`, despite gfx1100 being accepted by top-level build
+metadata, so gfx11 applies the bundled compatibility recipe. gfx12 uses the
+upstream recipe unchanged. To keep both paths reproducible,
 `build_sidecar.sh` archives CK revision
 `13f6d635653bd5ffbfcac8577f1ef09590c23d78` into the build directory and applies
-the bundled `gfx11_ck_recipe.patch` before generating any kernels. Changes in
-the caller's CK worktree are not consumed. The minimal recipe changes four CK
-files: it adds the gfx11 D64 tile and GEMM epilogue contract, remaps the
-softmax-P and output-accumulator distributions through LDS, and uses an
-explicit tile redistribution where the gfx11 register layouts differ. It does
-not include the research tree's vLLM, split-K, D128/D256, or debug changes. The
-patch SHA256 is:
+the bundled `gfx11_ck_recipe.patch` only for gfx11 before generating any
+kernels. Changes in the caller's CK worktree are not consumed. The minimal
+gfx11 recipe changes four CK files: it adds the D64 tile and GEMM epilogue
+contract, remaps the softmax-P and output-accumulator distributions through
+LDS, and uses an explicit tile redistribution where the gfx11 register layouts
+differ. The patch adds the missing D64 recipe; D128 and D256 use the pinned
+base recipe with the same gfx11 layout-remap compatibility changes. It does
+not include the research tree's vLLM, split-K, or debug changes. The patch
+SHA256 is:
 
 ```text
 b43ea8d12e14cef04518225acaa69b63e62991ba4a83efcd596fc108105ac765
@@ -42,15 +47,40 @@ b43ea8d12e14cef04518225acaa69b63e62991ba4a83efcd596fc108105ac765
 
 `FLASH_ATTN_ROOT` must point to a FlashAttention checkout whose
 `csrc/composable_kernel` Git repository contains that revision. The build also
-fails unless the patched generator emits exactly eight FP16/D64 kernel
-instances plus one dispatcher.
+fails unless the pinned generator emits the validated architecture-specific
+set. The default `HEAD_DIMS=64,128,256` build produces sixteen FP16 kernels
+plus one dispatcher for patched gfx11, or twelve kernels plus one dispatcher
+for upstream gfx12. `HEAD_DIMS=64`, `128`, `256`, or `64,128` can select a
+narrower artifact.
 
 ```bash
-FLASH_ATTN_ROOT=/path/to/gfx11-enabled-flash-attention \
+FLASH_ATTN_ROOT=/path/to/flash-attention \
 ROCM_PATH=/opt/rocm \
 GPU_ARCH=gfx1100 \
+HEAD_DIMS=64,128,256 \
 ./experiments/flash-attn-ck-sidecar/build_sidecar.sh
 ```
+
+Use `GPU_ARCH=gfx1201` for the native gfx12 recipe. Unsupported architecture
+families fail before generation.
+
+The optional gfx11 D256 build can instead consume the mature FA4 CK recipe at
+the exact top-level revision `be194c0792e79ae26f71bf507e51b4d9136cf22c`:
+
+```bash
+FLASH_ATTN_ROOT=/path/to/flash-attention-fa4 \
+CK_USE_FA4_GFX11_D256_RECIPE=1 \
+GPU_ARCH=gfx1100 \
+HEAD_DIMS=256 \
+OUT="$PWD/experiments/flash-attn-ck-sidecar/build-fa4-gfx11-d256/libhipfire_flash_attn_ck.so" \
+  ./experiments/flash-attn-ck-sidecar/build_sidecar.sh
+```
+
+This mode archives only `csrc/composable_kernel` from the pinned revision, so
+uncommitted changes in the source checkout are excluded. It selects the FA4
+D256 long-query M64/N32 path and its Wave32 register-P redistribution. The
+generated instances explicitly disable the optional native-O epilogue, so the
+measured result must not be attributed to native-O.
 
 The build uses the selected CK sources directly and has no PyTorch dependency.
 No `.so` is copied into or committed to hipfire.
@@ -63,8 +93,9 @@ RUNPATH: /opt/rocm/core-7.14/lib
 NEEDED: libamdhip64.so.7
 ```
 
-The resulting D64-only sidecar is about 324 KiB. The full PyTorch extension is
-not required and remains outside hipfire.
+The validated D64-only sidecars were about 324 KiB for gfx1100 and 168 KiB for
+gfx1201. The validated D64/D128/D256 gfx1100 sidecar was 708 KiB. The full
+PyTorch extension is not required and remains outside hipfire.
 
 ## Smoke
 
@@ -74,8 +105,8 @@ HIP_VISIBLE_DEVICES=0 \
 ```
 
 The pure-HIP smoke runs FP16 MHA, MQA, and GQA cases against a CPU reference.
-The causal GQA case uses a non-default HIP stream. A runtime route is out of
-scope until this passes under the same ROCm runtime used to build hipfire.
+The causal GQA case uses a non-default HIP stream. The optional quantized route
+has its own ABI smoke and controlled runtime A/B under `quantized/`.
 
 Validated on Radeon Pro W7900 / gfx1100 with ROCm 7.14:
 
@@ -85,15 +116,25 @@ Validated on Radeon Pro W7900 / gfx1100 with ROCm 7.14:
 | FP16 GQA D64, causal, non-default stream | `5.501509e-05` | `7.329229e-06` |
 | FP16 MHA D64, non-causal, default stream | `4.062802e-05` | `6.646507e-06` |
 | FP16 MQA D64, non-causal, default stream | `4.367530e-05` | `6.348691e-06` |
+| FP16 GQA D128, non-causal, default stream | `4.010648e-05` | `6.054059e-06` |
+| FP16 GQA D128, causal, non-default stream | `7.070601e-05` | `7.611228e-06` |
+| FP16 MHA D128, non-causal, default stream | `4.220754e-05` | `6.031494e-06` |
+| FP16 MQA D128, non-causal, default stream | `4.123151e-05` | `6.053454e-06` |
+| FP16 GQA D256, non-causal, default stream | `4.249066e-05` | `6.040485e-06` |
+| FP16 GQA D256, causal, non-default stream | `7.580221e-05` | `7.560880e-06` |
+
+The same smoke passed on Radeon AI PRO R9700 / gfx1201 with ROCm 7.14.
+Maximum absolute error across its four cases was `5.501509e-05`.
 
 ## Optional Rust loader
 
 `rdna-compute` exposes the versioned C ABI only when built with the
-`flash-attn-ck` feature. Enabling the feature does not search for or load a
-library and does not alter attention dispatch. A caller must pass an explicit,
-trusted sidecar path to the unsafe
-`rdna_compute::flash_attn_ck::FlashAttnCk::load` boundary. A successfully loaded
-library is intentionally pinned for the process lifetime because its HIP
+`flash-attn-ck` feature. The dense loader remains library-only: a caller must
+pass an explicit, trusted sidecar path to the unsafe
+`rdna_compute::flash_attn_ck::FlashAttnCk::load` boundary. The quantized loader
+is also default-off, but `Gpu` will load and route its narrow prefill contract
+when `HIPFIRE_FLASH_ATTN_CK_QUANTIZED_LIB` is explicitly set. Successfully
+loaded libraries are pinned for the process lifetime because their HIP
 launches are asynchronous.
 
 The loader can be checked without changing the default backend:
@@ -105,5 +146,232 @@ HIPFIRE_FLASH_ATTN_CK_TEST_LIB="$PWD/experiments/flash-attn-ck-sidecar/build/lib
 ```
 
 The current hipfire `AttnFullF16` contract still uses FP32 Q and output tensors,
-so it is not routed to this all-FP16 sidecar. A production route requires
-preallocated conversion scratch owned outside the attention hot path.
+so it is not routed to the all-FP16 dense sidecar. The quantized route reuses
+existing preallocated attention scratch for its FP32/FP16 bridges.
+
+## Performance probe
+
+`bench_vs_native.sh` compares four paths at a selected D64, D128, or D256
+shape and attention semantics:
+
+- hipfire's current scalar `attention_dflash_f32` kernel;
+- direct all-FP16 CK attention;
+- an `AttnFullF16`-style bridge that casts FP32 Q to FP16 and output back to
+  FP32 while consuming already-FP16 K/V;
+- a conservative full-FP32 bridge that also casts K/V on every invocation.
+
+GPU-event columns isolate submitted stream work. Synchronized wall-clock
+columns also include the sidecar's host dispatch and kernel enqueue cost and
+are the primary integration metric. The direct number compares all-FP16 CK
+against the native FP32 scalar kernel; it is a mixed-precision reference, not a
+strict upper bound because producer/conversion kernels can change cache state.
+The Q/O bridge estimates the conversion tax at hipfire's FP32-query boundary;
+the full-FP32 bridge also converts K/V. D128 uses hipfire's optimized WMMA
+kernel as its native comparison. D64 and D256 use generic fallbacks, so their
+speedups are component evidence rather than production backend claims.
+
+Check that the selected GPU is idle before running:
+
+```bash
+rocm-smi --showuse --showmemuse --showpids
+
+GPU_ID=1 \
+GPU_ARCH=gfx1100 \
+ROCM_PATH=/opt/rocm \
+WARMUP=3 \
+TRIALS=9 \
+ITERATIONS=20 \
+HEAD_DIM=128 \
+CAUSAL=0 \
+  experiments/flash-attn-ck-sidecar/bench_vs_native.sh
+```
+
+The script writes a CSV to
+`experiments/flash-attn-ck-sidecar/build/bench_vs_native.csv`.
+
+### W7900 result
+
+Radeon Pro W7900 / gfx1100, ROCm 7.14, three warmups, nine trials, twenty
+iterations per trial. The table reports synchronized wall-clock medians:
+
+| Q | K | Hq/Hkv | native F32 ms | CK F16 ms | Q/O bridge ms | full-F32 bridge ms | direct FP16 | Q/O bridge | full-F32 bridge |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 64 | 512 | 8/8 | 0.0329 | 0.0280 | 0.0389 | 0.0546 | 1.17x | 0.84x | 0.60x |
+| 64 | 1024 | 8/8 | 0.0573 | 0.0485 | 0.0596 | 0.0816 | 1.18x | 0.96x | 0.70x |
+| 64 | 2048 | 8/8 | 0.1140 | 0.0888 | 0.0974 | 0.1210 | 1.28x | 1.17x | 0.94x |
+| 64 | 4096 | 8/8 | 0.2245 | 0.1927 | 0.1850 | 0.2100 | 1.17x | 1.21x | 1.07x |
+| 96 | 1024 | 8/8 | 0.0768 | 0.0514 | 0.0597 | 0.0744 | 1.49x | 1.29x | 1.03x |
+| 96 | 2048 | 8/8 | 0.1497 | 0.0974 | 0.1047 | 0.1277 | 1.54x | 1.43x | 1.17x |
+| 128 | 512 | 8/8 | 0.0534 | 0.0268 | 0.0346 | 0.0459 | 1.99x | 1.54x | 1.16x |
+| 128 | 1024 | 8/8 | 0.1006 | 0.0470 | 0.0558 | 0.0706 | 2.14x | 1.80x | 1.43x |
+| 128 | 2048 | 8/8 | 0.2015 | 0.0970 | 0.1000 | 0.1215 | 2.08x | 2.01x | 1.66x |
+| 192 | 1024 | 8/8 | 0.1519 | 0.0482 | 0.0808 | 0.0939 | 3.15x | 1.88x | 1.62x |
+| 192 | 2048 | 8/8 | 0.3264 | 0.0998 | 0.1216 | 0.1439 | 3.27x | 2.68x | 2.27x |
+| 256 | 512 | 8/8 | 0.1062 | 0.0280 | 0.0385 | 0.0495 | 3.80x | 2.76x | 2.15x |
+| 256 | 1024 | 8/8 | 0.2043 | 0.0492 | 0.0607 | 0.0744 | 4.15x | 3.37x | 2.74x |
+| 256 | 2048 | 8/8 | 0.4477 | 0.1052 | 0.1045 | 0.1241 | 4.25x | 4.28x | 3.61x |
+| 512 | 4096 | 8/8 | 2.2773 | 0.2427 | 0.2199 | 0.2589 | 9.38x | 10.36x | 8.80x |
+| 256 | 2048 | 8/2 | 0.3183 | 0.1021 | 0.1025 | 0.1125 | 3.12x | 3.11x | 2.83x |
+
+Raw data:
+[`results/w7900_gfx1100_rocm7.14_20260730.csv`](results/w7900_gfx1100_rocm7.14_20260730.csv).
+
+The maximum output difference against the native FP32 kernel was
+`1.49e-6`. GPU-event and synchronized wall-clock medians were close, showing
+that host dispatch is not the dominant cost in these batched measurements.
+Direct, Q/O-bridge, and full-FP32 paths use separate FP16 working sets. The Q/O
+bridge appearing faster than direct CK in one large case reflects the
+conversion kernel warming the FP16 query; it is not evidence that conversion
+is free.
+
+The useful boundary is the result, not a single peak number: conversion
+overhead loses on the smallest Q tile, while Q=256--512 dense prefill shapes
+show a clear net win over the current D64 scalar kernel. This benchmark does
+not compare against hipfire's D128 WMMA path and therefore does not establish
+a production-backend speedup for that route.
+
+For this exact D64 dense layout, a conservative experimental gate is
+`seqlen_q >= 128 && seqlen_k >= 512`. Every measured Q/O-bridge point in that
+region was at least 1.54x faster. `seqlen_q >= 96 && seqlen_k >= 1024` is an
+aggressive profile; Q=64 remains marginal even at long K and should stay on
+the native path by default. This is a prefill/cross-attention gate on query
+chunk length, not a decode-context gate: Q=1 decode is outside the measured
+profitable region.
+
+### Extended W7900 component result
+
+The D128 comparison uses hipfire's existing optimized FP16-KV WMMA kernels,
+not the D64 scalar fallback. With synchronized wall timing, the Q/O bridge was
+2.07x--3.77x faster for the measured non-causal matrix and 1.12x--3.50x faster
+for causal self-attention. Representative rows are:
+
+| mode | Q | K | Hq/Hkv | Q/O bridge speedup | max abs |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| D128 non-causal | 128 | 2048 | 8/8 | 3.48x | `2.71e-7` |
+| D128 non-causal | 512 | 4096 | 8/8 | 2.84x | `2.34e-7` |
+| D128 non-causal GQA | 256 | 2048 | 8/2 | 3.34x | `3.08e-7` |
+| D128 causal | 512 | 512 | 8/8 | 2.29x | `1.52e-5` |
+| D128 causal | 4096 | 4096 | 8/8 | 3.50x | `1.55e-5` |
+| D128 causal GQA | 2048 | 2048 | 8/2 | 2.93x | `2.33e-5` |
+
+Raw data:
+[`results/w7900_gfx1100_d128_noncausal_rocm7.14_20260730.csv`](results/w7900_gfx1100_d128_noncausal_rocm7.14_20260730.csv)
+and
+[`results/w7900_gfx1100_d128_causal_self_rocm7.14_20260730.csv`](results/w7900_gfx1100_d128_causal_self_rocm7.14_20260730.csv).
+
+D256 also passes the component correctness probe. Its native comparison is the
+generic F32 fallback, so the large speedups at long Q are not a Qwen3.5
+production claim. The full-F32 bridge ranged from 0.93x to 12.09x for the
+non-causal matrix. The causal self-attention bridge lost at Q=64 (0.47x) and
+won from Q=128 onward, but that comparison is against the old generic
+quadratic causal kernel. Raw data:
+[`results/w7900_gfx1100_d256_noncausal_rocm7.14_20260730.csv`](results/w7900_gfx1100_d256_noncausal_rocm7.14_20260730.csv)
+and
+[`results/w7900_gfx1100_d256_causal_self_rocm7.14_20260730.csv`](results/w7900_gfx1100_d256_causal_self_rocm7.14_20260730.csv).
+
+Qwen3.5 uses D256 and writes quantized KV during prefill. A production
+experiment must preserve that Q8 KV write for decode, convert the current
+prefill Q/K/V to preallocated FP16 scratch, run CK causal attention, and
+convert output back to FP32. This sidecar benchmark does not yet compare that
+route against the specialized Q8 M16 prefill path.
+
+### Quantized production-route result
+
+The optional quantized sidecar now consumes hipfire's live contiguous Asym3 K
+and Q8 V cache directly for the validated Qwen3.6 D256 GQA prefill shape. The
+caller must explicitly prove that KV is a dense prefix and that the query rows
+are its contiguous suffix. Decode, compacted KV, tree verification, graph
+capture, and unsupported shapes remain on the native path.
+
+On an otherwise idle Radeon Pro W7900 / gfx1100, Qwen3.6-27B MQ4, Asym3 KV,
+PP8192, prefill chunk 2048, three alternating fresh-process trials produced:
+
+| trial | order | route | prefill tok/s | decode tok/s |
+| ---: | ---: | --- | ---: | ---: |
+| 1 | 1 | native | 596.8 | 33.0 |
+| 1 | 2 | CK | 806.4 | 33.0 |
+| 2 | 1 | CK | 808.1 | 33.1 |
+| 2 | 2 | native | 591.2 | 33.1 |
+| 3 | 1 | native | 593.9 | 33.1 |
+| 3 | 2 | CK | 817.2 | 33.0 |
+
+The medians are **593.9 tok/s native** and **808.1 tok/s CK**, a **1.3607x
+(+36.07%)** prefill improvement. Decode is unchanged because this contract is
+prefill-only. A separate 3369-token real-prompt greedy-AR check, split into
+256-token chunks, emitted the same 16 token IDs on native and CK. In that
+correctness run, prefill was 580.62 versus 635.93 tok/s; it is a plumbing and
+numerical check, not the primary performance result.
+
+Reproduce the alternating A/B with:
+
+```bash
+GPU_ID=1 \
+PREFILL=8192 \
+PREFILL_CHUNK=2048 \
+TRIALS=3 \
+CK_LIB=/path/to/libhipfire_flash_attn_ck_quantized.so \
+  experiments/flash-attn-ck-sidecar/quantized/run_all_chunk_model_ab.sh
+```
+
+Raw tables, hashes, and correctness logs are under
+[`quantized/results/w7900_qwen36_27b_pp8192_chunk2048_20260808`](quantized/results/w7900_qwen36_27b_pp8192_chunk2048_20260808).
+
+### R9700 sidecar result
+
+Radeon AI PRO R9700 / gfx1201, ROCm 7.14, used the clean upstream gfx12 CK
+recipe from the same pinned revision. The sidecar was 168 KiB, and the Rust
+optional-loader integration test passed against it. The benchmark used the
+same three warmups, nine trials, and twenty iterations per trial as the W7900
+sweep. The table reports synchronized wall-clock speedups:
+
+| Q | K | Hq/Hkv | native F32 ms | Q/O bridge ms | direct FP16 | Q/O bridge | full-F32 bridge |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 64 | 512 | 8/8 | 0.0372 | 0.0173 | 3.11x | 2.14x | 0.82x |
+| 64 | 1024 | 8/8 | 0.0579 | 0.0254 | 2.94x | 2.28x | 1.51x |
+| 64 | 2048 | 8/8 | 0.1201 | 0.0408 | 3.41x | 2.95x | 2.14x |
+| 64 | 4096 | 8/8 | 0.2686 | 0.0720 | 4.05x | 3.73x | 2.77x |
+| 96 | 1024 | 8/8 | 0.0793 | 0.0248 | 4.14x | 3.20x | 2.14x |
+| 96 | 2048 | 8/8 | 0.1622 | 0.0387 | 4.90x | 4.19x | 3.00x |
+| 128 | 512 | 8/8 | 0.0597 | 0.0451 | 4.97x | 1.32x | 0.82x |
+| 128 | 1024 | 8/8 | 0.1008 | 0.0529 | 5.07x | 1.91x | 1.57x |
+| 128 | 2048 | 8/8 | 0.2032 | 0.0685 | 5.71x | 2.97x | 2.42x |
+| 192 | 1024 | 8/8 | 0.1395 | 0.0261 | 7.05x | 5.35x | 3.72x |
+| 192 | 2048 | 8/8 | 0.2812 | 0.0417 | 7.95x | 6.75x | 4.92x |
+| 256 | 512 | 8/8 | 0.0991 | 0.0470 | 8.12x | 2.11x | 1.30x |
+| 256 | 1024 | 8/8 | 0.1822 | 0.0548 | 9.01x | 3.32x | 2.75x |
+| 256 | 2048 | 8/8 | 0.3575 | 0.0706 | 9.93x | 5.07x | 4.13x |
+| 512 | 4096 | 8/8 | 1.8731 | 0.0950 | 24.27x | 19.71x | 15.48x |
+| 256 | 2048 | 8/2 | 0.4396 | 0.0706 | 12.34x | 6.23x | 4.45x |
+
+Raw data:
+[`results/r9700_gfx1201_rocm7.14_20260730.csv`](results/r9700_gfx1201_rocm7.14_20260730.csv).
+The benchmark maximum absolute difference was `1.49e-6`.
+
+For the exact D64 dense Q/O-bridge contract, every measured R9700 point with
+`seqlen_q >= 64 && seqlen_k >= 512` was faster, with a minimum measured
+speedup of 1.32x. This measured boundary is not evidence for Q below 64, Q=1
+decode, D128 WMMA attention, or quantized/paged KV. The large peak speedup is
+primarily a comparison against hipfire's scalar D64 fallback.
+
+## gfx1201 default-path regression check
+
+The optional sidecar and its Cargo feature are default-off. To verify that the
+change does not affect the existing gfx1201 path, commit `a2fcd552` was compared
+with its base `b69b28c2` on an AMD Radeon AI PRO R9700 (gfx1201, ROCm 7.14).
+Both isolated trees passed `cargo check -p rdna-compute`; the feature tree also
+passed with `--features flash-attn-ck`. The existing
+`test_dots_ocr_wmma_gfx12` correctness example passed with maximum absolute
+errors `1.948e-5` for GEMM and `6.038e-6` for attention.
+
+For performance, the already-built base and feature binaries alternated over
+five rounds of `bench_attention_vision --iters 20`. The production gfx12
+DotsOCR v5 path was unchanged:
+
+| build | per-run ms/iter | median ms/iter |
+| --- | --- | ---: |
+| base `b69b28c2` | 112.7, 113.2, 113.2, 113.4, 113.5 | 113.2 |
+| feature `a2fcd552` | 112.8, 113.1, 113.4, 113.5, 113.6 | 113.4 |
+
+The median difference was `+0.18%`, within the observed run-to-run variation.
+No measurable regression was observed in the default gfx1201 DotsOCR attention
+path; this is not a FlashAttention CK performance result on gfx1201.

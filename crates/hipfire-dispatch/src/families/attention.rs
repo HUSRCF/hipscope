@@ -1196,6 +1196,7 @@ fn dispatch_attend(
                     io.tree_bias,
                     io.block_start,
                     io.block_cols,
+                    true,
                 ))
             }
             KernelKey::AttnFlashAsym3FwhtBatchedMasked => {

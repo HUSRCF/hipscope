@@ -5,6 +5,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FLASH_ATTN_ROOT="${FLASH_ATTN_ROOT:?set FLASH_ATTN_ROOT to a flash-attention checkout containing composable_kernel}"
 ROCM_PATH="${ROCM_PATH:-/opt/rocm}"
 GPU_ARCH="${GPU_ARCH:-gfx1100}"
+HEAD_DIMS="${HEAD_DIMS:-64,128,256}"
 MAX_JOBS="${MAX_JOBS:-8}"
 OUT="${OUT:-${ROOT}/build/libhipfire_flash_attn_ck.so}"
 BUILD_DIR="$(dirname "${OUT}")"
@@ -12,31 +13,80 @@ HIP_ROOT="$("${ROCM_PATH}/bin/hipconfig" --path)"
 HIP_LIB_DIR="${HIP_ROOT}/lib"
 EXTERNAL_CK_ROOT="${FLASH_ATTN_ROOT}/csrc/composable_kernel"
 REQUIRED_CK_REV="13f6d635653bd5ffbfcac8577f1ef09590c23d78"
+FA4_GFX11_D256_REV="be194c0792e79ae26f71bf507e51b4d9136cf22c"
+CK_USE_FA4_GFX11_D256_RECIPE="${CK_USE_FA4_GFX11_D256_RECIPE:-0}"
 RECIPE_PATCH="${ROOT}/gfx11_ck_recipe.patch"
 REQUIRED_RECIPE_SHA256="b43ea8d12e14cef04518225acaa69b63e62991ba4a83efcd596fc108105ac765"
 CK_ROOT="${BUILD_DIR}/ck-source"
+
+case "${GPU_ARCH}" in
+    gfx11*)
+        CK_TARGET="gfx11"
+        APPLY_GFX11_RECIPE=1
+        ;;
+    gfx12*)
+        CK_TARGET="gfx12"
+        APPLY_GFX11_RECIPE=0
+        ;;
+    *)
+        echo "unsupported GPU_ARCH ${GPU_ARCH}; expected gfx11* or gfx12*" >&2
+        exit 2
+        ;;
+esac
+
+case "${CK_TARGET}:${HEAD_DIMS}" in
+    gfx11:64) EXPECTED_GENERATED_SOURCES=9 ;;
+    gfx11:128 | gfx11:256) EXPECTED_GENERATED_SOURCES=5 ;;
+    gfx11:64,128) EXPECTED_GENERATED_SOURCES=13 ;;
+    gfx11:64,128,256) EXPECTED_GENERATED_SOURCES=17 ;;
+    gfx12:64 | gfx12:128 | gfx12:256) EXPECTED_GENERATED_SOURCES=5 ;;
+    gfx12:64,128) EXPECTED_GENERATED_SOURCES=9 ;;
+    gfx12:64,128,256) EXPECTED_GENERATED_SOURCES=13 ;;
+    *)
+        echo "unsupported HEAD_DIMS ${HEAD_DIMS}; expected 64, 128, 256, 64,128, or 64,128,256" >&2
+        exit 2
+        ;;
+esac
+
+if [[ "${CK_USE_FA4_GFX11_D256_RECIPE}" == "1" ]]; then
+    if [[ "${CK_TARGET}:${HEAD_DIMS}" != "gfx11:256" ]]; then
+        echo "FA4 gfx11 recipe currently supports HEAD_DIMS=256 only" >&2
+        exit 2
+    fi
+    CK_SOURCE_REV="${FA4_GFX11_D256_REV}"
+    CK_GIT_ROOT="${CK_GIT_ROOT:-${FLASH_ATTN_ROOT}}"
+    CK_ARCHIVE_SUBTREE="${CK_ARCHIVE_SUBTREE:-csrc/composable_kernel}"
+    APPLY_GFX11_RECIPE=0
+    EXPECTED_GENERATED_SOURCES=17
+else
+    CK_SOURCE_REV="${REQUIRED_CK_REV}"
+    CK_GIT_ROOT="${EXTERNAL_CK_ROOT}"
+    CK_ARCHIVE_SUBTREE=""
+fi
 
 if [[ ! -f "${HIP_LIB_DIR}/libamdhip64.so" ]]; then
     echo "missing HIP runtime under ${HIP_LIB_DIR}" >&2
     exit 2
 fi
 
-if [[ ! -d "${EXTERNAL_CK_ROOT}/.git" && ! -f "${EXTERNAL_CK_ROOT}/.git" ]]; then
-    echo "missing composable_kernel git checkout under ${EXTERNAL_CK_ROOT}" >&2
+if [[ ! -d "${EXTERNAL_CK_ROOT}" ]]; then
+    echo "missing composable_kernel source under ${EXTERNAL_CK_ROOT}" >&2
     exit 2
 fi
-if ! git -C "${EXTERNAL_CK_ROOT}" cat-file -e "${REQUIRED_CK_REV}^{commit}"; then
-    echo "composable_kernel checkout does not contain required revision ${REQUIRED_CK_REV}" >&2
+if ! git -C "${CK_GIT_ROOT}" cat-file -e "${CK_SOURCE_REV}^{commit}"; then
+    echo "composable_kernel checkout does not contain requested revision ${CK_SOURCE_REV}" >&2
     exit 2
 fi
-if [[ ! -f "${RECIPE_PATCH}" ]]; then
-    echo "missing bundled gfx11 CK recipe ${RECIPE_PATCH}" >&2
-    exit 2
-fi
-RECIPE_SHA256="$(sha256sum "${RECIPE_PATCH}" | cut -d' ' -f1)"
-if [[ "${RECIPE_SHA256}" != "${REQUIRED_RECIPE_SHA256}" ]]; then
-    echo "gfx11 CK recipe SHA256 mismatch: ${RECIPE_SHA256}" >&2
-    exit 2
+if (( APPLY_GFX11_RECIPE )); then
+    if [[ ! -f "${RECIPE_PATCH}" ]]; then
+        echo "missing bundled gfx11 CK recipe ${RECIPE_PATCH}" >&2
+        exit 2
+    fi
+    RECIPE_SHA256="$(sha256sum "${RECIPE_PATCH}" | cut -d' ' -f1)"
+    if [[ "${RECIPE_SHA256}" != "${REQUIRED_RECIPE_SHA256}" ]]; then
+        echo "gfx11 CK recipe SHA256 mismatch: ${RECIPE_SHA256}" >&2
+        exit 2
+    fi
 fi
 
 reset_dir() {
@@ -49,8 +99,14 @@ reset_dir "${BUILD_DIR}/generated"
 reset_dir "${BUILD_DIR}/objects"
 reset_dir "${CK_ROOT}"
 
-git -C "${EXTERNAL_CK_ROOT}" archive "${REQUIRED_CK_REV}" | tar -x -C "${CK_ROOT}"
-patch -d "${CK_ROOT}" -p1 < "${RECIPE_PATCH}"
+if [[ -n "${CK_ARCHIVE_SUBTREE}" ]]; then
+    git -C "${CK_GIT_ROOT}" archive "${CK_SOURCE_REV}:${CK_ARCHIVE_SUBTREE}" | tar -x -C "${CK_ROOT}"
+else
+    git -C "${CK_GIT_ROOT}" archive "${CK_SOURCE_REV}" | tar -x -C "${CK_ROOT}"
+fi
+if (( APPLY_GFX11_RECIPE )); then
+    patch -d "${CK_ROOT}" -p1 < "${RECIPE_PATCH}"
+fi
 
 FMHA_DIR="${CK_ROOT}/example/ck_tile/01_fmha"
 GENERATOR="${FMHA_DIR}/generate.py"
@@ -60,27 +116,27 @@ if [[ ! -f "${FMHA_DIR}/fmha_fwd.hpp" || ! -f "${GENERATOR}" ]]; then
 fi
 
 LIST="${BUILD_DIR}/sources.list"
-FILTER="*d64_fp16_batch*_nlogits_nbias_*nlse_ndropout_nskip_nqscale_ntrload*"
+FILTER="*d*_fp16_batch*_nlogits_nbias_*nlse_ndropout_nskip_nqscale_ntrload*"
 
 python3 "${GENERATOR}" \
-    --targets gfx11 \
+    --targets "${CK_TARGET}" \
     --api fwd \
     --receipt 2 \
-    --optdim 64 \
+    --optdim "${HEAD_DIMS}" \
     --filter "${FILTER}" \
     --list_blobs "${LIST}"
 
-if [[ "$(wc -l < "${LIST}")" -ne 9 ]]; then
-    echo "expected 8 gfx11 FP16/D64 kernels plus one API source" >&2
-    echo "the supplied FlashAttention tree does not carry the validated gfx11 recipe" >&2
+if [[ "$(wc -l < "${LIST}")" -ne "${EXPECTED_GENERATED_SOURCES}" ]]; then
+    echo "expected ${EXPECTED_GENERATED_SOURCES} ${CK_TARGET} FP16/D${HEAD_DIMS} generated sources" >&2
+    echo "the supplied FlashAttention tree does not carry the validated CK recipe" >&2
     exit 2
 fi
 
 python3 "${GENERATOR}" \
-    --targets gfx11 \
+    --targets "${CK_TARGET}" \
     --api fwd \
     --receipt 2 \
-    --optdim 64 \
+    --optdim "${HEAD_DIMS}" \
     --filter "${FILTER}" \
     --output_dir "${BUILD_DIR}/generated"
 
@@ -111,8 +167,8 @@ COMMON_FLAGS=(
 )
 
 mapfile -t GENERATED_SOURCES < <(find "${BUILD_DIR}/generated" -maxdepth 2 -type f -name 'fmha_fwd*.cpp' | sort)
-if [[ "${#GENERATED_SOURCES[@]}" -ne 9 ]]; then
-    echo "generated ${#GENERATED_SOURCES[@]} sources, expected 9" >&2
+if [[ "${#GENERATED_SOURCES[@]}" -ne "${EXPECTED_GENERATED_SOURCES}" ]]; then
+    echo "generated ${#GENERATED_SOURCES[@]} sources, expected ${EXPECTED_GENERATED_SOURCES}" >&2
     exit 2
 fi
 
@@ -136,6 +192,7 @@ wait
 "${ROCM_PATH}/bin/hipcc" \
     -shared \
     -Wl,-z,defs \
+    -Wl,-soname,libhipfire_flash_attn_ck.so \
     -Wl,-rpath,"${HIP_LIB_DIR}" \
     "${BUILD_DIR}"/objects/*.o \
     -lamdhip64 \

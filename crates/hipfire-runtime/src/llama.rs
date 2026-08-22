@@ -2760,6 +2760,7 @@ fn forward_prefill_chunk(
                 tree_bias,
                 tree_block_start,
                 tree_block_cols,
+                false,
             )?;
         } else if kv_cache.quant_asym2 {
             assert!(
@@ -5796,7 +5797,6 @@ impl KvCacheExt for KvCache {
         }
     }
 
-
     fn from_mode(mode: KvMode, target: KvTarget, dims: &KvDims) -> HipResult<Self>
     where
         Self: Sized,
@@ -8480,7 +8480,6 @@ mod tests {
             KvTierPlan::derive(legacy).unwrap().write_key,
         );
     }
-
 
     #[test]
     fn free_gpu_empty_cache_is_ok() {

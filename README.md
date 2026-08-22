@@ -258,6 +258,39 @@ Add `--dry-run` to preview it. `--purge` also deletes all data under
 For Windows, source builds, and verifying the install:
 [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md).
 
+### Optional gfx1100 CK bundle
+
+The gfx1100 Asym3-K/Q8-V CK prefill path is compile-time optional and does not
+change the default install. A release maintainer can package a CK-enabled CLI,
+daemon, relocatable sidecars, and matching code-object cache into one archive:
+
+```bash
+cargo build --release --locked -p hipfire-cli --features flash-attn-ck
+cargo build --release --locked -p hipfire-runtime --example daemon \
+  --features deltanet,flash-attn-ck
+
+./scripts/package-gfx11-ck-bundle.sh \
+  --dense /path/to/libhipfire_flash_attn_ck.so \
+  --quantized /path/to/libhipfire_flash_attn_ck_quantized_staged.so \
+  --version VERSION
+```
+
+Users install that archive without a source checkout or local CK compilation:
+
+```bash
+./scripts/install-gfx11-ck-bundle.sh \
+  --url https://example.invalid/hipfire-gfx11-ck-VERSION.tar.gz \
+  --sha256 ARCHIVE_SHA256
+
+~/.local/bin/hipfire-gfx11 --help
+```
+
+The installer verifies the external checksum, internal manifest, sidecar
+dependencies, code-object inventory, and visible `gfx1100` GPU before switching
+the versioned `current` symlink. This preview is limited to ROCm 7.14 and the
+validated Qwen3.6/3.8 27B MQ4 prefill shape; unsupported calls retain native
+dispatch.
+
 ## NixOS
 
 First-class support via Nix flake. See [docs/NIXOS.md](docs/NIXOS.md).

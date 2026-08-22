@@ -140,6 +140,26 @@ Values and defaults below match `hipfire-config`, the native CLI, and/or `Runtim
 | `HIPFIRE_FLASH_PREFILL_FIXED_HD` | Developer ablation: fixed-head-dimension specialization is on unless `0`. |
 | `HIPFIRE_FLASH_PREFILL_PREFETCH_V` | Developer ablation: gfx12 V prefetch is on unless `0`. |
 
+The prebuilt gfx1100 CK preview launcher sets the following validated Qwen
+hybrid-model combination. These are execution-format controls for that bundle,
+not general defaults for other GPUs or model families. Explicit user values are
+preserved.
+
+| Variable | Bundle default | Notes |
+|---|---:|---|
+| `HIPFIRE_FLASH_ATTN_CK_QUANTIZED_LIB` | bundled `.so` path | Loads the optional staged Asym3-K/Q8-V CK prefill sidecar. |
+| `HIPFIRE_RDNA3_HFQ4_GATE_UP_X256Y64` | `1` | Uses the validated X256/Y64 gate/up packed-MQ4 route. |
+| `HIPFIRE_RDNA3_HFQ4_RESIDUAL_X256Y64` | `1` | Uses the validated X256/Y64 residual/down route. |
+| `HIPFIRE_RDNA3_HFQ4_AUX_X256Y64` | `1` | Uses the corresponding auxiliary projection route. |
+| `HIPFIRE_RDNA3_HFQ4_PERM_NIBBLE` | `1` | Selects the gfx11 execution-oriented packed-nibble layout. |
+| `HIPFIRE_RDNA3_Q8_GROUP128` | `1` | Enables the group-128 Q8 activation contract. |
+| `HIPFIRE_RDNA3_Q8_GROUP128_ROW2` | `1` | Enables its two-row staging specialization. |
+| `HIPFIRE_RDNA3_Q8_GROUP128_QUAD_ROW_WEIGHT` | `1` | Enables the matching quad-row weight layout. |
+| `HIPFIRE_RDNA3_FUSED_SWIGLU_Q8_GROUP128` | `1` | Enables the validated fused SwiGLU consumer. |
+| `HIPFIRE_RDNA3_FFN_F16_INTERMEDIATE` | `1` | Stores the FFN intermediate in FP16 on this route. |
+| `HIPFIRE_RDNA3_Q8_GROUP256_SERIAL_ROW` | `1` | Enables the validated serial-row group-256 fallback. |
+| `HIPFIRE_RDNA3_Q8_GROUP256_GATE_UP` | `0` | Keeps the slower experimental group-256 gate/up route disabled. |
+
 ### LFM (arch 11) — branch-scoped optimized prefill
 
 | Variable | Status | Scope |

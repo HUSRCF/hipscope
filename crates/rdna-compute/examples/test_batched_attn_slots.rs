@@ -685,6 +685,7 @@ fn run_general_candidate(
                 0,
                 Some(&batch.descs_dev),
                 Some(&batch.row_slot),
+                false,
             )
             .expect("asym3 tile candidate");
         }
@@ -776,6 +777,7 @@ fn run_general_reference(
                     None,
                     0,
                     0,
+                    false,
                 )
                 .expect("asym3 legacy reference");
             }

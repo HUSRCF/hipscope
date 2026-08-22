@@ -12,6 +12,7 @@ path = "src/main.rs"
 [features]
 default = ["multi-slot"]
 multi-slot = ["dep:hipfire-arch-qwen35"]
+flash-attn-ck = ["hipfire-runtime/flash-attn-ck"]
 
 [dependencies]
 anyhow = "1"

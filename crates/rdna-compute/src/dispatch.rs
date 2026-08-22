@@ -509,6 +509,11 @@ pub struct Gpu {
     /// Model-scoped Redline warmup recorder and fail-closed backend gate.
     pub replay: crate::replay::ReplayController,
 
+    /// Explicitly loaded quantized CK prefill sidecar. The optional Cargo
+    /// feature and library path are both required; default dispatch is unchanged.
+    #[cfg(feature = "flash-attn-ck")]
+    pub(crate) flash_attn_ck_quantized: Option<crate::flash_attn_ck::FlashAttnCkQuantized>,
+
     // ── MMQ per-weight screening (#87) — extracted to MmqScreenState ──────
     pub mmq_screen: MmqScreenState,
 
@@ -967,6 +972,27 @@ impl Gpu {
         let mmq_screen = flags.mmq_screen;
         let mmq_screen_threshold = flags.mmq_screen_threshold;
 
+        #[cfg(feature = "flash-attn-ck")]
+        let flash_attn_ck_quantized = if arch.starts_with("gfx11") {
+            std::env::var_os("HIPFIRE_FLASH_ATTN_CK_QUANTIZED_LIB").and_then(|path| {
+                match unsafe { crate::flash_attn_ck::FlashAttnCkQuantized::load(&path) } {
+                    Ok(sidecar) => {
+                        eprintln!(
+                            "loaded optional quantized FlashAttention CK sidecar: {}",
+                            std::path::Path::new(&path).display()
+                        );
+                        Some(sidecar)
+                    }
+                    Err(error) => {
+                        eprintln!("WARNING: quantized FlashAttention CK sidecar disabled: {error}");
+                        None
+                    }
+                }
+            })
+        } else {
+            None
+        };
+
         Ok(Self {
             hip,
             arch,
@@ -1008,6 +1034,8 @@ impl Gpu {
                 sample_partials_bytes: 0,
             },
             replay: crate::replay::ReplayController::from_config(),
+            #[cfg(feature = "flash-attn-ck")]
+            flash_attn_ck_quantized,
             mmq_screen: MmqScreenState {
                 cache: HashMap::new(),
                 enabled: mmq_screen,
