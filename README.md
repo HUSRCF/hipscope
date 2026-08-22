@@ -284,6 +284,20 @@ only `gfx1100` code objects and targets ROCm 7.14 / HIP ABI 7. The installer
 checks the archive checksum, its internal manifest, both sidecars, dynamic
 dependencies, and the visible GPU before atomically selecting the release.
 
+Install the published preview without cloning this repository:
+
+```bash
+curl -fsSL \
+  https://raw.githubusercontent.com/HUSRCF/hipscope/master/scripts/install-gfx11-ck-bundle.sh \
+  -o /tmp/install-hipfire-gfx11-ck.sh
+
+bash /tmp/install-hipfire-gfx11-ck.sh \
+  --url https://github.com/HUSRCF/hipscope/releases/download/gfx11-ck-preview-20260822/hipfire-gfx11-ck-preview-20260822-01a45fdb.tar.gz \
+  --sha256 f45d85a4e14f6d467de33e02d8579efd2f12891e09c18790e07e035577d774d1
+
+~/.local/bin/hipfire-gfx11 --help
+```
+
 Install a downloaded release asset without a source checkout:
 
 ```bash
