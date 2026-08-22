@@ -225,6 +225,20 @@ pub fn check_moe_decode_supported(
     Ok(())
 }
 
+/// True when the gate→down step must NOT fuse the FWHT rotation, because the
+/// routed `down` weights were packed in the NATURAL basis.
+///
+/// Every rotated dtype folds the rotation into the silu+mul step so the down
+/// GEMV receives an FWHT-basis activation. `MQ2G256LloydU` is the unrotated
+/// sibling of MQ2-Lloyd: rotating here would feed a rotated activation to
+/// unrotated weights, which produces plausible-looking garbage rather than an
+/// error. Extracted as a predicate so the invariant "unrotated dtype ⇔ no
+/// rotation anywhere in its path" can be pinned by test — see
+/// `unrotated_dtype_skips_both_rotations`.
+pub(crate) fn gate_down_skips_rotation(routed_down: DType) -> bool {
+    matches!(routed_down, DType::MQ2G256LloydU)
+}
+
 /// MoE decode executor. Ports the body of `moe_ffn_decode_impl` verbatim,
 /// substituting `ffn.*`/`config.*`/`s.*` references with `MoeParams` fields.
 /// Resolution is owned here (computed from `MoeDtypes` + k), and `ctx` is
@@ -861,6 +875,19 @@ pub fn run_moe_decode(
                 p.mi,
                 p.k,
             ))?;
+        } else if gate_down_skips_rotation(p.dtypes.routed_down) {
+            // UNROTATED down weights: silu+mul with NO FWHT.
+            //
+            // Every other arm here fuses the rotation in because its down
+            // weights were packed in the FWHT basis. MQ2G256LloydU is the
+            // unrotated sibling — rotating the intermediate before an
+            // unrotated down GEMV is exactly the silent-garbage failure this
+            // dtype exists to avoid, and it would not crash or even look
+            // wrong until the model generated text.
+            //
+            // silu_mul is elementwise, so one launch over the whole
+            // [k_top * mi] buffer covers every selected expert.
+            hip!(gpu.silu_mul_f32(p.gate_batch, p.up_batch, p.rot_batch))?;
         } else {
             // MQ4/MQ6, no AWQ on expert down weights (the common case for A3B).
             hip!(gpu.fused_silu_mul_rotate_mq_batched(

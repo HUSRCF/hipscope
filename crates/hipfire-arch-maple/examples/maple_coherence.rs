@@ -12,13 +12,12 @@
 //! produce a model that loads, runs at full speed, and emits garbage.
 //!
 //! Usage:
-//!   maple_coherence --model <model.hfq> [--prompt "..."] [--max-tokens N]
-//!                   [--dump-hidden <out.bin>]
+//!   maple_coherence --model <model.hfq> [--prompt "..."] [--max-tokens N] [--raw]
 //!
-//! `--dump-hidden` writes the post-layer residual for the LAST prefill position
-//! (u32 n_layers, u32 hidden, then n_layers*hidden f32 LE) for per-layer cosine
-//! comparison against the HF reference — the method that localised the Bonsai
-//! double-norm bug to layer 0.
+//! `--raw` skips the ChatML frame and feeds the prompt verbatim (base-model
+//! continuation check). Per-layer hidden-state dumping for cosine comparison
+//! against the HF reference is a separate follow-up; it needs a capture hook
+//! inside `decode_step_body`, which this harness deliberately does not have.
 
 use hipfire_arch_maple::bundle::load_maple_from_hfq;
 use hipfire_arch_maple::forward::decode_step;
