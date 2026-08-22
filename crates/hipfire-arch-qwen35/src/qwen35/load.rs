@@ -98,6 +98,28 @@ fn qwen35_tensor_data_vec<'a>(
     None
 }
 
+/// Borrowed-first variant of [`qwen35_tensor_data_vec`]: returns the mmap
+/// slice directly when the mapping is alive (dGPU loads keep it, so weight
+/// uploads DMA straight out of page-cache pages with no heap staging copy);
+/// falls back to the owned pread Vec on UMA (mmap dropped there). Same
+/// candidate resolution.
+fn qwen35_tensor_data_cow<'a>(
+    hfq: &'a HfqFile,
+    name: &str,
+) -> Option<(&'a HfqTensorInfo, std::borrow::Cow<'a, [u8]>)> {
+    for candidate in qwen35_tensor_name_candidates(name) {
+        if let Some((info, data)) = hfq.tensor_data(&candidate) {
+            return Some((info, std::borrow::Cow::Borrowed(data)));
+        }
+    }
+    for candidate in qwen35_tensor_name_candidates(name) {
+        if let Some((info, data)) = hfq.tensor_data_vec(&candidate) {
+            return Some((info, std::borrow::Cow::Owned(data)));
+        }
+    }
+    None
+}
+
 fn load_norm_weight(
     hfq: &HfqFile,
     gpu: &mut Gpu,
@@ -813,12 +835,20 @@ pub(crate) fn load_weight_tensor(
     k: usize,
     candidates: fn(&str) -> Vec<String>,
 ) -> HipResult<WeightTensor> {
-    // Use pread path to avoid page cache buildup on unified-memory APUs.
+    // Zero-copy first: when the mmap is alive (dGPU loads keep it), DMA
+    // straight from the page-cache-backed slice — no heap staging copy.
+    // Pread fallback preserves UMA behavior (mmap dropped there).
     #[cfg(unix)]
     {
         let mut wt: Option<WeightTensor> = None;
         let mut matched: Option<String> = None;
         for candidate in candidates(name) {
+            if let Some((info, data)) = hfq.tensor_data(&candidate) {
+                let qt = info.quant_type;
+                wt = Some(load_weight_tensor_raw(gpu, qt, data, m, k)?);
+                matched = Some(candidate);
+                break;
+            }
             if let Some((info, buf)) = hfq.tensor_data_pread(&candidate) {
                 let qt = info.quant_type;
                 wt = Some(load_weight_tensor_raw(gpu, qt, &buf, m, k)?);
@@ -2441,8 +2471,18 @@ impl WeightSource for HfqSource<'_> {
     }
 
     fn prepare(&mut self, n_devices: usize) -> HipResult<()> {
+        // Keep the mmap alive on discrete GPUs (the carrier cleared
+        // `evict_page_cache` there): weight uploads DMA straight out of
+        // page-cache pages with no heap staging copy — measured 11–16 GB/s
+        // end-to-end vs ~4 GB/s through a pread staging buffer.
+        // UMA keeps the drop — evict=true is exactly the carrier's UMA
+        // signal — so cached model pages can't starve hipMalloc of RAM.
+        //
+        // NOTE: do NOT madvise-populate the mapping here. A blocking
+        // MAP_POPULATE measured identical totals (it relocates the same
+        // soft-fault work out of the upload loop into one serial stall).
         #[cfg(unix)]
-        if n_devices == 1 {
+        if n_devices == 1 && self.hfq.evicts_page_cache() {
             self.hfq.drop_mmap();
         }
         let _ = n_devices;
@@ -2463,7 +2503,7 @@ impl WeightSource for HfqSource<'_> {
                 c.mrope_interleaved, c.mrope_section
             );
         }
-        let (embd_meta, embd_data) = qwen35_tensor_data_vec(self.hfq, "embed_tokens.weight")
+        let (embd_meta, embd_data) = qwen35_tensor_data_cow(self.hfq, "embed_tokens.weight")
             .expect("embed_tokens not found");
         let out = load_embedding(gpu, embd_meta.quant_type, &embd_data, c.vocab_size, c.dim)?;
         drop(embd_data);
@@ -2497,11 +2537,11 @@ impl WeightSource for HfqSource<'_> {
             c.dim,
             |gpu| {
                 let (lm_info, lm_data) =
-                    qwen35_tensor_data_vec(hfq, "lm_head.weight").expect("lm_head present");
+                    qwen35_tensor_data_cow(hfq, "lm_head.weight").expect("lm_head present");
                 load_weight_tensor_raw(gpu, lm_info.quant_type, &lm_data, c.vocab_size, c.dim)
             },
             |gpu| {
-                let (embd_meta, embd_data) = qwen35_tensor_data_vec(hfq, "embed_tokens.weight")
+                let (embd_meta, embd_data) = qwen35_tensor_data_cow(hfq, "embed_tokens.weight")
                     .expect("embed_tokens not found");
                 dequant_weight_raw(gpu, embd_meta.quant_type, &embd_data, c.vocab_size, c.dim)
             },
