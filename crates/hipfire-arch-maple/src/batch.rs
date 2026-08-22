@@ -77,10 +77,16 @@ pub fn dense_tile_ids_host(b: usize) -> Vec<i32> {
 /// `x_row_div = 1` because for a dense call the slot index IS the row index
 /// (the MoE case divides by `k_top`).
 ///
-/// `x_f16_src` MUST be a buffer this call owns. The kernel's `ensure_fp16_x`
-/// caches its FP16 conversion keyed on the SOURCE POINTER, so passing a
-/// scratch buffer that is reused across layers returns the FIRST layer's
-/// activations for every later layer — silently, with no error.
+/// `x_f16_src` MUST be an **F16** tensor the caller converted itself, laid out
+/// `[b × k]` row-major. The grouped entry hands an F16 `x_src` straight to the
+/// kernel (whose `X_src` is `_Float16*`) and never touches the shared FP16
+/// scratch.
+///
+/// Passing an F32 tensor here still "works" but routes through the kernel's
+/// `ensure_fp16_x`, whose conversion is cached keyed on the SOURCE POINTER. A
+/// caller that reuses one F32 scratch buffer across layers with new contents
+/// would then get the FIRST layer's activations for every later layer —
+/// silently, with no error. Maple converts explicitly for exactly that reason.
 #[allow(clippy::too_many_arguments)]
 pub fn dense_qt51_gemm(
     gpu: &mut Gpu,

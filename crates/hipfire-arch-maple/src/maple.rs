@@ -519,6 +519,31 @@ pub struct MapleState {
     pub final_norm_buf: GpuTensor,
     pub logits: GpuTensor,
     pub flash_partials: GpuTensor,
+
+    // ── batched prefill scratch (sized for MAPLE_PREFILL_MAX_B) ──
+    //
+    // These are PER-CHUNK scratch, not model-constant data, which is why the
+    // shared tile-id / slot-index tables live here and not on `MapleWeights`.
+    pub max_b: usize,
+    pub b_h: GpuTensor,      // [max_b × hidden] batched residual stream
+    pub b_normed: GpuTensor, // [max_b × hidden] batched RMSNorm output
+    /// F16 mirror of `b_normed`, converted explicitly every layer. MUST be a
+    /// distinct allocation from `b_attn_out_f16`: the grouped GEMM's F32 path
+    /// caches its conversion on the source pointer, and passing F16 straight
+    /// through (as we do) keeps both activations out of that shared scratch
+    /// entirely.
+    pub b_normed_f16: GpuTensor, // [max_b × hidden] F16
+    pub b_q: GpuTensor,      // [max_b × q_dim]
+    pub b_k: GpuTensor,      // [max_b × kv_dim]
+    pub b_v: GpuTensor,      // [max_b × kv_dim]
+    pub b_attn_out: GpuTensor, // [max_b × q_dim]
+    pub b_attn_out_f16: GpuTensor, // [max_b × q_dim] F16 — distinct ptr
+    /// o_proj destination: the grouped GEMM writes `[dense_m_total(b) × hidden]`,
+    /// so the BLOCK_M padding tail is allocated but never read back.
+    pub b_proj_out: GpuTensor, // [dense_m_total(max_b) × hidden]
+    pub b_positions: GpuTensor, // [max_b] i32-in-f32
+    pub b_tile_ids: GpuTensor, // [dense_m_total(max_b)/16] i32, all expert 0
+    pub b_slot_index: GpuTensor, // [dense_m_total(max_b)] i32, rewritten per call
 }
 
 impl MapleState {
@@ -561,6 +586,24 @@ impl MapleState {
             g.alloc_tensor(&[n], DType::F32)
                 .map_err(|e| format!("maple: alloc {label}: {e:?}"))
         };
+        let alloc_f16 = |g: &mut Gpu, n: usize, label: &str| -> Result<GpuTensor, String> {
+            g.alloc_tensor(&[n], DType::F16)
+                .map_err(|e| format!("maple: alloc {label}: {e:?}"))
+        };
+        // i32 payload in an F32-typed tensor — the same 4-byte-per-element
+        // convention `topk_indices` and `b_positions` already use.
+        let alloc_i32 = |g: &mut Gpu, v: &[i32], label: &str| -> Result<GpuTensor, String> {
+            let t = g
+                .alloc_tensor(&[v.len()], DType::F32)
+                .map_err(|e| format!("maple: alloc {label}: {e:?}"))?;
+            let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_ne_bytes()).collect();
+            g.hip
+                .memcpy_htod(&t.buf, &bytes)
+                .map_err(|e| format!("maple: htod {label}: {e:?}"))?;
+            Ok(t)
+        };
+        let max_b = crate::batch::MAPLE_PREFILL_MAX_B;
+        let dm = crate::batch::dense_m_total(max_b);
 
         Ok(MapleState {
             kv,
@@ -589,6 +632,23 @@ impl MapleState {
                     * (2 + cfg.head_dim)
                     * FLASH_PREFILL_SUBBATCH,
                 "flash_partials",
+            )?,
+            max_b,
+            b_h: alloc(gpu, max_b * hidden, "b_h")?,
+            b_normed: alloc(gpu, max_b * hidden, "b_normed")?,
+            b_normed_f16: alloc_f16(gpu, max_b * hidden, "b_normed_f16")?,
+            b_q: alloc(gpu, max_b * q_dim, "b_q")?,
+            b_k: alloc(gpu, max_b * kv_dim, "b_k")?,
+            b_v: alloc(gpu, max_b * kv_dim, "b_v")?,
+            b_attn_out: alloc(gpu, max_b * q_dim, "b_attn_out")?,
+            b_attn_out_f16: alloc_f16(gpu, max_b * q_dim, "b_attn_out_f16")?,
+            b_proj_out: alloc(gpu, dm * hidden, "b_proj_out")?,
+            b_positions: alloc(gpu, max_b, "b_positions")?,
+            b_tile_ids: alloc_i32(gpu, &crate::batch::dense_tile_ids_host(max_b), "b_tile_ids")?,
+            b_slot_index: alloc_i32(
+                gpu,
+                &crate::batch::dense_slot_index_host(max_b),
+                "b_slot_index",
             )?,
         })
     }
@@ -626,6 +686,19 @@ impl MapleState {
             final_norm_buf,
             logits,
             flash_partials,
+            max_b: _,
+            b_h,
+            b_normed,
+            b_normed_f16,
+            b_q,
+            b_k,
+            b_v,
+            b_attn_out,
+            b_attn_out_f16,
+            b_proj_out,
+            b_positions,
+            b_tile_ids,
+            b_slot_index,
         } = self;
         let _ = kv.free_gpu(gpu);
         let _ = gpu.hip.free(pos_buf);
@@ -646,6 +719,18 @@ impl MapleState {
             final_norm_buf,
             logits,
             flash_partials,
+            b_h,
+            b_normed,
+            b_normed_f16,
+            b_q,
+            b_k,
+            b_v,
+            b_attn_out,
+            b_attn_out_f16,
+            b_proj_out,
+            b_positions,
+            b_tile_ids,
+            b_slot_index,
         ] {
             let _ = gpu.free_tensor(t);
         }
