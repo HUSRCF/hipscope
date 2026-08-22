@@ -33,5 +33,14 @@
 //! MQ2-Lloyd's 72 B/group layout byte-for-byte so every existing kernel binds.
 
 pub mod config;
+pub mod forward;
+pub mod maple;
+
+pub use forward::decode_step;
 
 pub use config::{MapleConfig, MapleLayerType, MAPLE_SWIGLU_CLAMP};
+pub use maple::{
+    expert_tensor_name, router_tensor_name, ExpertProj, MapleExpert, MapleLayerWeights,
+    MapleMoeFfn, MapleState, MapleWeights, EMBED_TENSOR_NAME, FINAL_NORM_TENSOR_NAME,
+    LM_HEAD_TENSOR_NAME,
+};
