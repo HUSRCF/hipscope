@@ -273,6 +273,61 @@ Following #610's template: `scripts/coherence-gate-maple.sh` +
 - 256 experts × 24 layers of *tiny* (512×2048) expert matrices is an unusual
   shape for these kernels; per-launch overhead may dominate regardless of arm.
 
+## Implementation findings
+
+Recorded during the arm-B build, because each one is a trap the next reader
+would otherwise re-discover the hard way.
+
+**The shared MoE executor cannot serve this arch.** `run_moe_decode`'s
+gate-side unconditionally runs the shared-expert gate/up GEMVs, and Maple has
+`num_shared_experts: 0`. Worse, its gate→down step used
+`fused_silu_mul_rotate_mq_batched`, which FWHT-rotates the intermediate before
+the down GEMV — correct for MQ2-Lloyd (qt19), and silent garbage for the
+UNROTATED qt51. Widening the gate_up/down/self-combine arms to accept qt51 was
+not sufficient; that step was left behind. Fixed in the executor (a named
+`gate_down_skips_rotation` predicate, with a test requiring the rotated and
+unrotated dtypes to disagree on both rotation flags), but `hipfire-arch-maple`
+drives the indexed MQ2-Lloyd kernels directly regardless, because it also needs
+the clamped SwiGLU and has no shared expert. This mirrors `cohere2moe`, which
+is likewise a no-shared-expert MoE and likewise bypasses the executor.
+
+**The RoPE convention is a three-way trap.** Maple needs pairs
+`(i, i + n_rot/2)` *within* the first `n_rot = 64` dims, frequency denominator
+`n_rot`. hipfire has three near-neighbours:
+
+| kernel | pairing | denominator | fits Maple? |
+|---|---|---|---|
+| `rope_partial_halfsplit_f32` | `(i, i+n_rot/2)` | `n_rot` | **yes** |
+| `rope_partial_halved_f32` | `(i, i+head_dim/2)` | `head_dim` | no — Gemma-4 proportional |
+| `rope_partial_interleaved` (kernel) | `(2i, 2i+1)` | `n_rot` | no |
+
+The correct one is reached through the Rust wrapper named
+`rope_partial_interleaved_f32`, which dispatches the *half-split* kernel by
+default (the name is stale; the interleaved kernel is behind
+`HIPFIRE_ROPE_INTERLEAVED_LEGACY=1`). Picking by name gets this wrong.
+
+**The clamped SwiGLU already exists.** `deepseek4_silu_mul_clamp_f32_batched`
+is byte-for-byte Maple's math — gate capped from above only, `up` clamped both
+ways — with the limit as a runtime parameter. DeepSeek passes 10.0, Maple
+passes 7.0. No new HIP kernel; the "no new kernels" premise survived the whole
+arch, not just the format.
+
+**The HFQ metadata envelope is load-bearing.** The runtime reads the source
+config from a `config` key and the tokenizer from a `tokenizer` STRING holding
+tokenizer.json verbatim. Emitting the bare config.json converts cleanly and
+then fails at load — after a 40 GB round trip.
+
+**There is no BF16 embedding-lookup kernel.** `word_embeddings` is widened to
+F32 at load (~620 MB over the BF16 bytes). That is the cheap answer to the
+"precision policy" open question above for now; a Q8 embedding export would
+halve it and needs no new code, since the Q8 lookup path is already wired.
+
+**Packing verified against the real checkpoint.** The independent-packer parity
+fixture (`scripts/maple_make_parity_fixture.py`, now committed) reproduces the
+Rust packer byte-for-byte on `layers.0.mlp.experts.0.gate_proj` (1,048,576
+weights, 61.3% nonzero) and `layers.0.self_attn.q_proj` (4,194,304 weights,
+61.2% nonzero), both at 2.2500 bpw with `max|err| = 0`.
+
 ## Non-goals
 
 - Reproducing Deepgrove's training or their 5.31 GB packing.
