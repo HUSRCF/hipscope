@@ -32,6 +32,7 @@
 //! plus the scatter/permute/combine suite), and MQ2G256LloydU shares
 //! MQ2-Lloyd's 72 B/group layout byte-for-byte so every existing kernel binds.
 
+pub mod batch;
 pub mod bundle;
 pub mod carrier;
 pub mod config;
