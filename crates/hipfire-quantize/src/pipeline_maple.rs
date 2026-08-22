@@ -21,7 +21,7 @@
 //! Keeping this out of `pipeline.rs` also keeps PR #599's shared convert path
 //! untouched.
 
-use std::collections::BTreeMap;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use hipfire_quantize::float16::bf16_to_f32;
@@ -171,9 +171,18 @@ pub(crate) fn convert_maple_safetensors(
     let mut spill = TensorSpill::new(spill_dir)
         .map_err(|e| format!("create spill file in {}: {e}", spill_dir.display()))?;
 
-    // BTreeMap so the output tensor order is deterministic regardless of shard
-    // iteration order or filesystem enumeration.
-    let mut tensors: BTreeMap<String, HfqTensor> = BTreeMap::new();
+    // ORDER IS LOAD-BEARING. `write_hfq` reads the spill file SEQUENTIALLY in
+    // the order of the slice it is handed — there is no per-tensor spill
+    // offset — so the output list must stay in the exact order the tensors
+    // were spilled. A `BTreeMap` here (alphabetical) silently hands each
+    // tensor another tensor's bytes; the container still validates, and only
+    // the weights are wrong.
+    //
+    // Determinism does not need the map: `shard_paths()` sorts the shards and
+    // `tensor_names()` sorts within a shard, so production order is already
+    // stable across runs. The set is only for duplicate detection.
+    let mut tensors: Vec<HfqTensor> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
     let mut stats = MapleConvertStats::default();
 
     for shard in &shards {
@@ -202,16 +211,18 @@ pub(crate) fn convert_maple_safetensors(
             t.data = Vec::new();
             t.spilled_len = len;
 
-            if tensors.insert(name.clone(), t).is_some() {
+            if !seen.insert(name.clone()) {
                 return Err(format!("{name}: duplicate tensor across shards"));
             }
+            tensors.push(t);
             sf.drop_tensor_pages(name);
         }
     }
 
     spill.flush().map_err(|e| format!("flush spill: {e}"))?;
 
-    let ordered: Vec<HfqTensor> = tensors.into_values().collect();
+    // Spill order == list order; do NOT sort or reorder past this point.
+    let ordered: Vec<HfqTensor> = tensors;
     if stats.ternary_tensors == 0 {
         return Err(
             "no ternary tensors found — this does not look like a Maple checkpoint".to_string(),
@@ -435,6 +446,87 @@ mod tests {
         assert_eq!(v["hipfire_maple_provenance"]["exact"], true);
         assert_eq!(v["hipfire_maple_provenance"]["rotation"], "none");
         assert_eq!(v["hipfire_maple_provenance"]["ternary_tensors"], 3);
+    }
+
+    /// Write a minimal BF16 safetensors file: u64 header length, header JSON,
+    /// then the tensor payloads in `tensors` order.
+    fn write_safetensors(path: &std::path::Path, tensors: &[(&str, Vec<usize>, Vec<f32>)]) {
+        let mut header = serde_json::Map::new();
+        let mut payload: Vec<u8> = Vec::new();
+        for (name, shape, vals) in tensors {
+            let start = payload.len();
+            for v in vals {
+                payload.extend_from_slice(&((v.to_bits() >> 16) as u16).to_le_bytes());
+            }
+            header.insert(
+                (*name).to_string(),
+                serde_json::json!({
+                    "dtype": "BF16",
+                    "shape": shape,
+                    "data_offsets": [start, payload.len()],
+                }),
+            );
+        }
+        let hdr = serde_json::to_vec(&serde_json::Value::Object(header)).unwrap();
+        let mut out = Vec::new();
+        out.extend_from_slice(&(hdr.len() as u64).to_le_bytes());
+        out.extend_from_slice(&hdr);
+        out.extend_from_slice(&payload);
+        std::fs::write(path, out).unwrap();
+    }
+
+    /// REGRESSION: `write_hfq` reads the spill file sequentially in the order
+    /// of the slice it is handed, so the convert must emit tensors in the order
+    /// it spilled them. An earlier version collected them through a BTreeMap,
+    /// which reordered alphabetically and handed each tensor another tensor's
+    /// bytes — the container still validated, only the weights were wrong.
+    ///
+    /// The names are chosen so ALPHABETICAL order differs from PRODUCTION
+    /// order (shard "a" holds `zz_*`, shard "b" holds `aa_*`). Under the bug
+    /// the two tensors swap payloads; with equal-length tensors and identical
+    /// values the test would pass vacuously, so the two carry DIFFERENT
+    /// row scales and the check is value-based.
+    #[test]
+    fn spill_order_is_preserved_when_alphabetical_order_differs() {
+        let dir = std::env::temp_dir().join("maple_spill_order_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Distinct scales => distinct packed bytes => a swap is detectable.
+        let zz = ternary(512, 0.0625);
+        let aa = ternary(512, 0.00390625);
+        write_safetensors(
+            &dir.join("model-00001-of-00002.safetensors"),
+            &[("zz.self_attn.q_proj.weight", vec![1, 512], zz.clone())],
+        );
+        write_safetensors(
+            &dir.join("model-00002-of-00002.safetensors"),
+            &[("aa.self_attn.q_proj.weight", vec![1, 512], aa.clone())],
+        );
+        std::fs::write(dir.join("config.json"), r#"{"model_type":"maple"}"#).unwrap();
+
+        let out = dir.join("out.hfq");
+        convert_maple_safetensors(&dir, &out, r#"{"model_type":"maple"}"#).expect("convert");
+
+        // Read the container back and check each tensor decodes to ITS OWN
+        // values, not its neighbour's.
+        let hfq = hipfire_runtime::hfq::HfqFile::open(&out).expect("open hfq");
+        assert_eq!(hfq.arch_id, ARCH_ID_MAPLE);
+        for (name, expect) in [
+            ("zz.self_attn.q_proj.weight", &zz),
+            ("aa.self_attn.q_proj.weight", &aa),
+        ] {
+            let (info, data) = hfq.tensor_data_vec(name).expect("tensor present");
+            assert_eq!(info.quant_type, QuantType::MQ2G256LloydU as u8);
+            let recon = crate::quant_mq::dequantize_mq2g256_lloyd_u_to_f32(&data, expect.len());
+            let max_err = expect
+                .iter()
+                .zip(&recon)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert_eq!(max_err, 0.0, "{name} decoded to the wrong tensor's bytes");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The runtime reads the source config from `config` and the tokenizer from
