@@ -261,6 +261,50 @@ Following #610's template: `scripts/coherence-gate-maple.sh` +
 4. **Coherence smoke** — real generation, both arms. Non-negotiable regardless of
    what the numbers say.
 
+### Measured — arm B, 2026-08-22, gfx1151
+
+Convert of the full published checkpoint (9 shards, 18,651 tensors, structurally
+validated against `model.safetensors.index.json` first):
+
+```
+18,528 ternary tensor(s), 19,579,011,072 weights, 5.13 GiB packed (2.250 bpw)
+   123 high-precision tensor(s), 1.18 GiB
+   per-tensor nonzero fraction 0.1714..0.6154
+   -> maple-preview.hfq, 6.79 GB
+```
+
+**Zero "not ternary" refusals across every weight in the model.** The per-row
+ternary claim is therefore verified on 100% of the checkpoint, not a sample —
+the converter refuses rather than falling back, so a clean run IS the proof.
+
+1. Value-exactness: `examples/maple_verify_pack` — 12 layers sampled across all
+   9 shards, plus 20 tensors covering every projection type, all `max|err| = 0`,
+   with every bitwise difference accounted for as a signed zero (counts EQUAL,
+   nothing unexplained).
+2. Differential vs arm A: not run — arm A is not implemented (out of scope).
+3. Reference per-layer cosine: not run. Tooling is in place
+   (`HIPFIRE_MAPLE_DUMP_HIDDEN` + `scripts/maple_compare_hidden.py`); it was not
+   needed because the coherence gate passed on the first attempt, and it is the
+   localisation tool for when it does not.
+4. Coherence: **PASS.** Three prompts, coherent and technically correct, correct
+   `<think>` framing, clean EOS. ~130-134 tok/s decode; 136 tok/s prefill once
+   kernels are compiled (the harness prefills one token per step — a batched
+   prefill is a follow-up).
+
+Two real defects were found by this verification rather than by inspection, both
+silent-by-construction:
+
+- The convert reordered tensors through a `BTreeMap` after spilling them
+  sequentially, so `write_hfq` — which reads the spill in slice order — gave
+  most tensors another tensor's bytes. Container valid, sizes right, weights
+  wrong. Layer 0 decoded exactly, layers 2-23 gave `max|err| ~3412`.
+- `run_moe_decode` FWHT-rotated the intermediate before the unrotated qt51 down
+  GEMV (see Implementation findings).
+
+Not done: a `registry/models.json` entry. It carries a published HF repo path
+and measured serving figures for a downloadable artifact; the `.hfq` is local
+only, so an entry now would point at a repo that does not exist.
+
 ## Open questions
 
 - ~~**B0 (blocking):** is unrotated MQ2-Lloyd decodable by the existing
