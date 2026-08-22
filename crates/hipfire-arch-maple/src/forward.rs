@@ -215,6 +215,17 @@ fn decode_step_body(
         .map_err(|e| format!("maple L{l}: post-attn rmsnorm: {e:?}"))?;
 
         moe_block(cfg, layer, state, gpu, l, hidden, moe_inter, n_exp, k_top)?;
+
+        // Per-layer residual capture for reference parity. Off unless
+        // HIPFIRE_MAPLE_DUMP_HIDDEN is set, so the hot path is unchanged.
+        //
+        // A cosine cliff at layer n localises the bug to layer n's block —
+        // the method that localised the Bonsai double-norm bug to layer 0.
+        // The two silent-wrong-answer risks to check first are
+        // RoPE-on-a-NoPE-layer and QK-norm ordering.
+        if let Some(path) = dump_hidden_path() {
+            dump_layer_hidden(gpu, state, l, hidden, &path)?;
+        }
     }
 
     // ── Head ────────────────────────────────────────────────────────────────
@@ -230,6 +241,43 @@ fn decode_step_body(
     weight_gemv(gpu, &weights.lm_head, &state.final_norm_buf, &state.logits)
         .map_err(|e| format!("maple: lm_head: {e}"))?;
     Ok(())
+}
+
+/// Destination for the per-layer residual dump, or `None` when disabled.
+fn dump_hidden_path() -> Option<String> {
+    static P: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    P.get_or_init(|| std::env::var("HIPFIRE_MAPLE_DUMP_HIDDEN").ok())
+        .clone()
+}
+
+/// Append `[u32 layer][u32 hidden][hidden f32 LE]` for the current residual.
+///
+/// Appends rather than truncates so a whole prefill produces one file in
+/// (position, layer) order; the reader keys on the layer index.
+fn dump_layer_hidden(
+    gpu: &mut Gpu,
+    state: &MapleState,
+    layer: usize,
+    hidden: usize,
+    path: &str,
+) -> Result<(), String> {
+    use std::io::Write;
+    let h = gpu
+        .download_f32(&state.h)
+        .map_err(|e| format!("maple: dump hidden L{layer}: {e:?}"))?;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| format!("maple: open {path}: {e}"))?;
+    let mut buf = Vec::with_capacity(8 + hidden * 4);
+    buf.extend_from_slice(&(layer as u32).to_le_bytes());
+    buf.extend_from_slice(&(hidden as u32).to_le_bytes());
+    for v in h.iter().take(hidden) {
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+    f.write_all(&buf)
+        .map_err(|e| format!("maple: write {path}: {e}"))
 }
 
 /// One MoE block: softmax → top-8 → renormalise, then the indexed MQ2-Lloyd
