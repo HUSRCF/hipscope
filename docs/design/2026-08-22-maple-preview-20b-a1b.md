@@ -288,8 +288,43 @@ the converter refuses rather than falling back, so a clean run IS the proof.
    localisation tool for when it does not.
 4. Coherence: **PASS.** Three prompts, coherent and technically correct, correct
    `<think>` framing, clean EOS. ~130-134 tok/s decode; 136 tok/s prefill once
-   kernels are compiled (the harness prefills one token per step — a batched
-   prefill is a follow-up).
+   kernels are compiled (the harness prefilled one token per step at the time —
+   superseded by the batched prefill in item 5).
+5. **Batched prefill (`forward_batch`), 2026-08-22.** Now wired into
+   `maple_coherence` and `MapleCarrier::bench_prefill`. Measured as a
+   CONTROLLED A/B — both arms from one binary on one machine, back to back,
+   selected by `HIPFIRE_MAPLE_PER_TOKEN_PREFILL`, rather than against a figure
+   from an earlier session under unknown load:
+
+   | 3,059-token prompt | prefill | prefill tok/s | decode tok/s |
+   |---|---|---|---|
+   | per-token (previous path) | 25.19 s | 121.4 | 118.3 |
+   | **batched (`forward_batch`, chunk 256)** | **2.00 s** | **1,531.9** | 118.5 |
+
+   **12.6x faster prefill**, decode unchanged (118.3 vs 118.5 — the change does
+   not touch the decode path). Load average was 3.0-4.2 during both arms; the
+   per-token arm reproduces the 24.37 s / 125.5 tok/s reference within 3%, which
+   is what bounds the contention error on the ratio. Same output text on both
+   arms.
+
+   The **sliding window is proven live**, not assumed: with
+   `HIPFIRE_MAPLE_FORCE_FULL_CAUSAL=1` on a 1,200-token prompt (past the 512
+   window) parity cosine collapses from 0.996 to **-0.725**. Note that the
+   argmax bar still passed 5/5 in that run — argmax alone would NOT catch a
+   dropped window, which is why cosine stays a reported metric.
+
+   Batched-vs-per-token argmax flips at small chunk sizes (B=1, B=17) were
+   diagnosed with `maple_prefill_parity --near-tie` and are **F16-vs-F32
+   near-ties, not a defect**: the median reference top1-top2 gap is 0.086 at
+   flips vs 1.116 at matches (13x), the largest perturbation any flip required
+   (0.451) is inside the measured deciding-margin noise (max 0.996), and the
+   flip set is not reproducible run to run. B=256 — the shipped chunk size —
+   shows no flips.
+
+6. **Dedicated dense qt51 WMMA GEMM: not needed, closed out.** At 1,532 tok/s
+   prefill the tile-id indirection and BLOCK_M padding are not worth a new
+   kernel. Driving the grouped MoE kernel as a single-expert case keeps the
+   "no new HIP kernels" property across the whole arch.
 
 Two real defects were found by this verification rather than by inspection, both
 silent-by-construction:
@@ -316,6 +351,25 @@ only, so an entry now would point at a repo that does not exist.
   hipfire's KV paths? Glimmer runs SWA 2048; Maple's 512 is tighter.
 - 256 experts × 24 layers of *tiny* (512×2048) expert matrices is an unusual
   shape for these kernels; per-launch overhead may dominate regardless of arm.
+- **Follow-up: batched-prefill scratch is allocated eagerly, even decode-only.**
+  `MapleState::new_with_max_seq` allocates all batch scratch at load time,
+  sized from `MAPLE_PREFILL_MAX_B` (512), not from the chunk actually used
+  (`MAPLE_PREFILL_CHUNK`, 256). Measured, for hidden 2048 / moe_inter 512 /
+  k_top 8 / 256 experts:
+
+  | group | size |
+  |---|---|
+  | grouped-MoE scratch (`moe_m_total_max` = 7,936) | **93.0 MiB** |
+  | ├ `b_y_down` | 62.0 MiB |
+  | ├ `b_y_gate_up` | 31.0 MiB |
+  | batch scratch (`b_h`, `b_q/k/v`, `b_act`, F16 mirrors, …) | **39.0 MiB** |
+  | **total** | **132.0 MiB** |
+
+  A decode-only process pays all 132 MiB and uses none of it. Two independent
+  reductions are available and neither was taken now (deliberately out of scope
+  for the integration task): allocate lazily on first `forward_batch`, and size
+  from the chunk rather than the cap — `moe_grouped_m_total_bound` at B=256
+  gives 5,888 rows, cutting the grouped-MoE block from 93.0 to **69.0 MiB**.
 
 ## Implementation findings
 
