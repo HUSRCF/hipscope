@@ -220,7 +220,7 @@ pub(crate) fn convert_maple_safetensors(
 
     // Provenance in the metadata, so a model on disk can be told apart from one
     // built by different code. Stale artifacts have burned this project before.
-    let metadata = build_metadata(config_json, &stats)?;
+    let metadata = build_metadata(input_dir, config_json, &stats)?;
 
     write_hfq(output, ARCH_ID_MAPLE, &metadata, &ordered, Some(&mut spill))
         .map_err(|e| format!("write {}: {e}", output.display()))?;
@@ -245,18 +245,49 @@ pub(crate) fn convert_maple_safetensors(
     Ok(stats)
 }
 
-fn build_metadata(config_json: &str, stats: &MapleConvertStats) -> Result<String, String> {
-    let mut v: serde_json::Value = if config_json.trim().is_empty() {
+/// Build the HFQ `metadata_json` envelope.
+///
+/// The envelope shape is NOT free-form: `MapleConfig::from_metadata_json` reads
+/// the source config from the `config` key and
+/// `Tokenizer::from_hfq_metadata` reads the tokenizer from `tokenizer` (a
+/// STRING holding tokenizer.json verbatim), with optional `tokenizer_config`
+/// and `generation_config` siblings. Emitting the bare config.json here
+/// produces a `.hfq` that converts cleanly and then fails at load with a
+/// missing-config-wrapper error — so this mirrors `pipeline.rs`'s envelope
+/// exactly and only ADDS the provenance key.
+fn build_metadata(
+    input_dir: &Path,
+    config_json: &str,
+    stats: &MapleConvertStats,
+) -> Result<String, String> {
+    let config: serde_json::Value = if config_json.trim().is_empty() {
         serde_json::json!({})
     } else {
         serde_json::from_str(config_json).map_err(|e| format!("parse config.json: {e}"))?
     };
-    let obj = v
-        .as_object_mut()
-        .ok_or_else(|| "config.json is not an object".to_string())?;
-    obj.insert(
-        "hipfire_maple_provenance".to_string(),
-        serde_json::json!({
+
+    let read_json = |name: &str| -> Option<serde_json::Value> {
+        std::fs::read_to_string(input_dir.join(name))
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+    };
+    // tokenizer.json is carried as a STRING, not a nested object — that is what
+    // `Tokenizer::from_hfq_metadata` expects.
+    let tokenizer_str = std::fs::read_to_string(input_dir.join("tokenizer.json")).ok();
+    if tokenizer_str.is_none() {
+        eprintln!(
+            "maple: warning: no tokenizer.json in {} — the .hfq will not be servable",
+            input_dir.display()
+        );
+    }
+
+    let metadata = serde_json::json!({
+        "architecture": "maple",
+        "config": config,
+        "tokenizer": tokenizer_str.as_deref().unwrap_or("{}"),
+        "tokenizer_config": read_json("tokenizer_config.json"),
+        "generation_config": read_json("generation_config.json"),
+        "hipfire_maple_provenance": {
             "carrier": "MQ2G256LloydU",
             "quant_type": QuantType::MQ2G256LloydU as u8,
             "exact": true,
@@ -265,9 +296,9 @@ fn build_metadata(config_json: &str, stats: &MapleConvertStats) -> Result<String
             "ternary_weights": stats.ternary_weights,
             "nonzero_frac_min": stats.min_nonzero_frac,
             "nonzero_frac_max": stats.max_nonzero_frac,
-        }),
-    );
-    serde_json::to_string(&v).map_err(|e| format!("serialize metadata: {e}"))
+        },
+    });
+    serde_json::to_string(&metadata).map_err(|e| format!("serialize metadata: {e}"))
 }
 
 #[cfg(test)]
@@ -392,12 +423,51 @@ mod tests {
             max_nonzero_frac: 0.62,
             ..Default::default()
         };
-        let md = build_metadata(r#"{"model_type":"maple"}"#, &stats).unwrap();
+        let md = build_metadata(
+            Path::new("/nonexistent"),
+            r#"{"model_type":"maple"}"#,
+            &stats,
+        )
+        .unwrap();
         let v: serde_json::Value = serde_json::from_str(&md).unwrap();
-        assert_eq!(v["model_type"], "maple");
+        assert_eq!(v["config"]["model_type"], "maple");
         assert_eq!(v["hipfire_maple_provenance"]["quant_type"], 51);
         assert_eq!(v["hipfire_maple_provenance"]["exact"], true);
         assert_eq!(v["hipfire_maple_provenance"]["rotation"], "none");
         assert_eq!(v["hipfire_maple_provenance"]["ternary_tensors"], 3);
+    }
+
+    /// The runtime reads the source config from `config` and the tokenizer from
+    /// a `tokenizer` STRING. A bare config.json at the top level converts fine
+    /// and then fails at load, so pin the envelope shape here rather than
+    /// discovering it on a 40 GB round trip.
+    #[test]
+    fn metadata_is_a_loadable_envelope_not_a_bare_config() {
+        let dir = std::env::temp_dir().join("maple_md_envelope_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("tokenizer.json"), r#"{"model":{"vocab":{}}}"#).unwrap();
+        std::fs::write(
+            dir.join("tokenizer_config.json"),
+            r#"{"add_bos_token":false}"#,
+        )
+        .unwrap();
+
+        let md = build_metadata(
+            &dir,
+            r#"{"model_type":"maple","hidden_size":2048}"#,
+            &MapleConvertStats::default(),
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&md).unwrap();
+
+        assert_eq!(v["architecture"], "maple");
+        assert_eq!(v["config"]["hidden_size"], 2048);
+        // A STRING, not an object — Tokenizer::from_hfq_metadata does
+        // `.as_str()` and silently finds nothing if this is nested JSON.
+        assert!(v["tokenizer"].is_string(), "tokenizer must be a string");
+        assert!(v["tokenizer"].as_str().unwrap().contains("vocab"));
+        assert_eq!(v["tokenizer_config"]["add_bos_token"], false);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
