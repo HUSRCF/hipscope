@@ -3253,6 +3253,14 @@ pub(crate) fn quantize_mq2g256_ternary_exact(f32_data: &[f32]) -> Result<Vec<u8>
         // zero codepoint instead of counting as a fourth level.
         let mut levels: Vec<f32> = Vec::with_capacity(4);
         for &w in group {
+            // Canonicalise -0.0 to +0.0. IEEE `==` already collapses them into
+            // one level, but without this the stored representative would be
+            // whichever SIGN happened to appear first in the block, so the same
+            // tensor could pack to two different byte strings. Invisible
+            // numerically (both are zero, and both contribute identically to a
+            // dot product) but it breaks reproducible, content-hashed
+            // artifacts — so pin the representative.
+            let w = if w == 0.0 { 0.0 } else { w };
             if !levels.iter().any(|&l| l == w) {
                 levels.push(w);
                 if levels.len() > 3 {
@@ -3290,6 +3298,10 @@ pub(crate) fn quantize_mq2g256_ternary_exact(f32_data: &[f32]) -> Result<Vec<u8>
             let mut byte_val = 0u8;
             for j in 0..4 {
                 let w = group[4 * i + j];
+                // Same canonicalisation as above: a -0.0 weight must find the
+                // +0.0 level. IEEE `==` makes this hold either way, but keep
+                // the two sites visibly symmetric.
+                let w = if w == 0.0 { 0.0 } else { w };
                 let idx = levels.iter().position(|&l| l == w).unwrap_or(0) as u8;
                 byte_val |= (idx & 0x3) << (j * 2);
             }
@@ -3451,6 +3463,25 @@ mod maple_ternary_exact_tests {
         // Byte 9 covers weights 4..7 => i%3 = 1,2,0,1 => indices 1,2,0,1
         // => 1 | 2<<2 | 0<<4 | 1<<6 = 0x49.
         assert_eq!(packed[9], 0x49, "weights 4..7");
+    }
+
+    #[test]
+    fn ternary_exact_is_byte_deterministic_regardless_of_zero_sign() {
+        // REGRESSION. Caught by cross-checking against an independent packer on
+        // real weights: IEEE `==` collapses -0.0 and +0.0 into one level, so
+        // the stored representative used to be whichever sign appeared FIRST in
+        // the block. Numerically invisible, but the same tensor could pack to
+        // two different byte strings, which breaks content-hashed artifacts.
+        let pos = ternary_block(256, S);
+        let neg: Vec<f32> = pos
+            .iter()
+            .map(|&w| if w == 0.0 { -0.0 } else { w })
+            .collect();
+        let a = quantize_mq2g256_ternary_exact(&pos).unwrap();
+        let b = quantize_mq2g256_ternary_exact(&neg).unwrap();
+        assert_eq!(a, b, "zero sign must not change the emitted bytes");
+        // And the canonical representative is +0.0 (0x0000), not -0.0 (0x8000).
+        assert_eq!(&a[2..4], &0u16.to_le_bytes(), "zero level must be +0.0");
     }
 
     #[test]

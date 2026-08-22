@@ -20,6 +20,7 @@ mod e8;
 mod e8_gptq;
 mod gguf_input;
 mod hfq;
+mod maple;
 mod model_filter;
 mod pipeline;
 mod pipeline_deepseek;
