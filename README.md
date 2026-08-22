@@ -266,7 +266,7 @@ daemon, relocatable sidecars, and matching code-object cache into one archive:
 
 ```bash
 cargo build --release --locked -p hipfire-cli --features flash-attn-ck
-cargo build --release --locked -p hipfire-runtime --example daemon \
+cargo build --release --locked -p hipfire-daemon \
   --features deltanet,flash-attn-ck
 
 ./scripts/package-gfx11-ck-bundle.sh \

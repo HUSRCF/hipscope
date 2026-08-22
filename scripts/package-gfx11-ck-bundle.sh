@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 HIPFIRE_BIN="${HIPFIRE_BIN:-${ROOT}/target/release/hipfire}"
-DAEMON_BIN="${DAEMON_BIN:-${ROOT}/target/release/examples/daemon}"
+DAEMON_BIN="${DAEMON_BIN:-${ROOT}/target/release/daemon}"
 DENSE_SIDECAR="${DENSE_SIDECAR:-${ROOT}/experiments/flash-attn-ck-sidecar/build/libhipfire_flash_attn_ck.so}"
 QUANTIZED_SIDECAR="${QUANTIZED_SIDECAR:-${ROOT}/experiments/flash-attn-ck-sidecar/quantized/build/libhipfire_flash_attn_ck_quantized_staged.so}"
 KERNEL_CACHE="${KERNEL_CACHE:-${ROOT}/.hipfire_kernels/gfx1100}"
