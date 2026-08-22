@@ -192,6 +192,7 @@ wait
 "${ROCM_PATH}/bin/hipcc" \
     -shared \
     -Wl,-z,defs \
+    -Wl,-soname,libhipfire_flash_attn_ck.so \
     -Wl,-rpath,"${HIP_LIB_DIR}" \
     "${BUILD_DIR}"/objects/*.o \
     -lamdhip64 \

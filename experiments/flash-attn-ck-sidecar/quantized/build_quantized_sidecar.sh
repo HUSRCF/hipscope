@@ -5,7 +5,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SIDECAR_ROOT="$(cd "${ROOT}/.." && pwd)"
 ROCM_PATH="${ROCM_PATH:-/opt/rocm}"
 GPU_ARCH="${GPU_ARCH:-gfx1100}"
-CK_ROOT="${SIDECAR_ROOT}/build/ck-source"
+CK_ROOT="${CK_ROOT:-${SIDECAR_ROOT}/build/ck-source}"
 FMHA_DIR="${CK_ROOT}/example/ck_tile/01_fmha"
 BUILD_DIR="${ROOT}/build"
 OUT="${OUT:-${BUILD_DIR}/libhipfire_flash_attn_ck_quantized.so}"
@@ -39,7 +39,7 @@ case "${STAGED}" in
         extra_links+=(
             "-L$(dirname "${DENSE_SIDECAR}")"
             "-lhipfire_flash_attn_ck"
-            "-Wl,-rpath,$(dirname "${DENSE_SIDECAR}")"
+            '-Wl,-rpath,$ORIGIN'
         )
         ;;
     *)
@@ -87,11 +87,19 @@ mkdir -p "$(dirname "${OUT}")"
     -I"${CK_ROOT}/library/include" \
     "${ROOT}/quantized_ck_pipeline_smoke.hip" \
     "${extra_links[@]}" \
+    -Wl,-soname,"$(basename "${OUT}")" \
     -Wl,-rpath,"${HIP_LIB_DIR}" \
     -o "${OUT}"
 
 file "${OUT}"
 du -h "${OUT}"
+
+if [[ "${STAGED}" == "1" ]]; then
+    DENSE_RUNTIME="$(dirname "${OUT}")/libhipfire_flash_attn_ck.so"
+    if [[ "$(realpath "${DENSE_SIDECAR}")" != "$(realpath -m "${DENSE_RUNTIME}")" ]]; then
+        install -m 0755 "${DENSE_SIDECAR}" "${DENSE_RUNTIME}"
+    fi
+fi
 
 SMOKE="$(dirname "${OUT}")/smoke_quantized_abi"
 "${CXX:-c++}" \

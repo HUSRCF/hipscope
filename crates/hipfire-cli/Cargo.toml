@@ -9,6 +9,10 @@ build = "build.rs"
 name = "hipfire"
 path = "src/main.rs"
 
+[features]
+default = []
+flash-attn-ck = ["hipfire-runtime/flash-attn-ck"]
+
 [dependencies]
 anyhow = "1"
 clap = { version = "4.6", features = ["derive"] }
@@ -24,4 +28,3 @@ serde_json = "1"
 sha2 = "0.10"
 tiny_http = "0.12"
 ureq = "3"
-

@@ -53,6 +53,12 @@ GPU_ARCH=gfx1100 STAGED=1 \
 ./experiments/flash-attn-ck-sidecar/quantized/audit_quantized_ck_resources.sh
 ```
 
+The staged build installs a copy of `libhipfire_flash_attn_ck.so` beside
+`OUT` and records `RUNPATH=$ORIGIN`. Keep that pair together when moving or
+packaging it; no build-tree path is required at runtime. The top-level
+`scripts/package-gfx11-ck-bundle.sh` validates this layout before producing a
+versioned archive.
+
 The loader smoke covers hand-packed fixtures and hipfire's real Asym3/Q8 KV
 writer kernels, including non-monotonic absolute positions. The pipeline smoke
 checks bottom-right causal masking, GQA head mapping, non-tile-aligned lengths,

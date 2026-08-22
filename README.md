@@ -260,12 +260,14 @@ The `master` branch includes an optional gfx11 CK prefill route together with
 the Qwen3.6 packed-MQ4 production paths. The same integration is frozen on
 `publish/qwen36-ck-prefill-preview` for users who need a stable migration
 target. No CK binary is committed to the repository or linked by the default
-build.
+build. A versioned prebuilt bundle is the recommended deployment format: it
+contains a CK-enabled CLI and daemon plus both sidecars, so users do not need
+to merge a source branch or compile CK locally.
 
 The validated route is deliberately narrow:
 
 - Radeon Pro W7900 / `gfx1100` with ROCm 7.14;
-- Qwen3.6-27B MQ4;
+- Qwen3.6-27B or Qwen3.8-27B MQ4 with the validated Qwen hybrid layout;
 - causal dense-prefix prefill with Asym3 K and Q8 V;
 - 24 query heads, 4 KV heads, and head dimension 256;
 - no graph capture, tree mask, or multi-slot attention;
@@ -274,6 +276,68 @@ The validated route is deliberately narrow:
 Unsupported calls fail closed to hipfire's native attention backend. The
 sidecar is loaded only when the binary contains the `flash-attn-ck` Cargo
 feature and `HIPFIRE_FLASH_ATTN_CK_QUANTIZED_LIB` names a compatible library.
+
+### Install a prebuilt bundle (recommended)
+
+The bundle is architecture- and ROCm-specific. The current preview contains
+only `gfx1100` code objects and targets ROCm 7.14 / HIP ABI 7. The installer
+checks the archive checksum, its internal manifest, both sidecars, dynamic
+dependencies, and the visible GPU before atomically selecting the release.
+
+Install a downloaded release asset without a source checkout:
+
+```bash
+./scripts/install-gfx11-ck-bundle.sh \
+  --bundle /path/to/hipfire-gfx11-ck-VERSION.tar.gz
+
+~/.local/bin/hipfire-gfx11 --help
+```
+
+For a remote release asset, checksum verification is mandatory:
+
+```bash
+./scripts/install-gfx11-ck-bundle.sh \
+  --url https://github.com/HUSRCF/hipscope/releases/download/TAG/hipfire-gfx11-ck-VERSION.tar.gz \
+  --sha256 ARCHIVE_SHA256
+```
+
+The versioned files live under
+`~/.local/opt/hipfire-gfx11-ck/releases/`; the installer updates only the
+`current` and `~/.local/bin/hipfire-gfx11` symlinks. The wrapper preserves
+explicit user overrides but otherwise selects the validated Asym3-K/Q8-V,
+2048-token prefill, CK, and packed-MQ4 defaults. It also points the CLI at the
+bundled CK-enabled daemon. The bundle carries the matching gfx1100 code-object
+cache, so normal Qwen3.6/3.8 execution does not require a first-request JIT
+build. When hipcc is installed, HIPFire validates the archived source/hash
+pairs against the local toolchain; runtime-only installations can still use
+the archived code objects through HIPFire's existing no-compiler fallback.
+
+After the model is registered, the service command is short:
+
+```bash
+hipfire-gfx11 config set memory.max_seq 262144
+hipfire-gfx11 config set speculation.mode off
+hipfire-gfx11 serve \
+  --model qwen3.8:27b \
+  --kv-mode asym3 \
+  --kv-backend contiguous \
+  0.0.0.0:11435
+```
+
+Build a release bundle locally after producing both sidecars:
+
+```bash
+cargo build --release --locked -p hipfire-cli --features flash-attn-ck
+cargo build --release --locked -p hipfire-runtime --example daemon \
+  --features deltanet,flash-attn-ck
+
+./scripts/package-gfx11-ck-bundle.sh \
+  --dense experiments/flash-attn-ck-sidecar/quantized/build/libhipfire_flash_attn_ck.so \
+  --quantized experiments/flash-attn-ck-sidecar/quantized/build/libhipfire_flash_attn_ck_quantized_staged.so
+```
+
+The packager refuses sidecars with a host-specific RUNPATH. Its tarball and
+`.sha256` file are suitable for GitHub release assets.
 
 ### Check out or migrate
 
@@ -348,9 +412,10 @@ OUT="$PWD/experiments/flash-attn-ck-sidecar/quantized/build/libhipfire_flash_att
   ./experiments/flash-attn-ck-sidecar/quantized/build_quantized_sidecar.sh
 ```
 
-The quantized build runs its ABI smoke automatically. Keep both `.so` files
-in their build directories: the staged library records an rpath to the dense
-library used during the link. Verify the resulting dependency before launch:
+The quantized build runs its ABI smoke automatically and copies the dense
+runtime dependency beside the staged library. The staged library uses
+`RUNPATH=$ORIGIN`, so this pair can be moved together. Verify the resulting
+dependency before launch:
 
 ```bash
 ldd experiments/flash-attn-ck-sidecar/quantized/build/libhipfire_flash_attn_ck_quantized_staged.so \
@@ -359,13 +424,17 @@ ldd experiments/flash-attn-ck-sidecar/quantized/build/libhipfire_flash_attn_ck_q
 
 ### Build hipfire
 
-Build the daemon with the optional loader enabled:
+Build both the daemon and native CLI with the optional loader enabled:
 
 ```bash
 cargo build --release --locked \
   -p hipfire-runtime \
   --example daemon \
   --features deltanet,flash-attn-ck
+
+cargo build --release --locked \
+  -p hipfire-cli \
+  --features flash-attn-ck
 ```
 
 The default build without `flash-attn-ck` does not load or link either
@@ -404,7 +473,7 @@ uses contiguous Asym3-K/Q8-V storage, and explicitly disables every
 speculative route so a sibling `.mtp` file cannot change decode semantics.
 
 ```bash
-cargo build --release --locked -p hipfire-cli
+cargo build --release --locked -p hipfire-cli --features flash-attn-ck
 
 ./target/release/hipfire config set memory.max_seq 262144
 ./target/release/hipfire config set speculation.mode off
