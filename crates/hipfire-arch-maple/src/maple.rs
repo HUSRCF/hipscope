@@ -194,6 +194,16 @@ pub struct MapleMoeFfn {
     pub expert_down_ptrs: GpuTensor,
 }
 
+/// One-entry pointer tables for the dense attention projections, built ONCE at
+/// load. Rebuilding them per call would add four allocations per layer per
+/// token-chunk.
+pub struct AttnPtrTables {
+    pub wq: GpuTensor,
+    pub wk: GpuTensor,
+    pub wv: GpuTensor,
+    pub wo: GpuTensor,
+}
+
 pub struct MapleLayerWeights {
     pub input_norm: GpuTensor,     // input_layernorm.weight [hidden]
     pub post_attn_norm: GpuTensor, // post_attention_layernorm.weight [hidden]
@@ -205,6 +215,9 @@ pub struct MapleLayerWeights {
     /// BEFORE RoPE.
     pub q_norm: GpuTensor,
     pub k_norm: GpuTensor,
+    /// Single-expert device-pointer tables for `wq`/`wk`/`wv`/`wo`, feeding
+    /// `batch::dense_qt51_gemm` for batched prefill.
+    pub attn_ptr_tables: AttnPtrTables,
     pub moe: MapleMoeFfn,
 }
 
@@ -310,6 +323,13 @@ impl MapleWeights {
                 &[head_dim],
             )?;
 
+            let attn_ptr_tables = AttnPtrTables {
+                wq: crate::batch::upload_single_expert_ptr_table(gpu, &wq)?,
+                wk: crate::batch::upload_single_expert_ptr_table(gpu, &wk)?,
+                wv: crate::batch::upload_single_expert_ptr_table(gpu, &wv)?,
+                wo: crate::batch::upload_single_expert_ptr_table(gpu, &wo)?,
+            };
+
             let router = load_wt(hfq, gpu, &router_tensor_name(l), n_exp, hidden)?;
             let mut experts = Vec::with_capacity(n_exp);
             for e in 0..n_exp {
@@ -363,6 +383,7 @@ impl MapleWeights {
                 wo,
                 q_norm,
                 k_norm,
+                attn_ptr_tables,
                 moe: MapleMoeFfn {
                     router,
                     experts,
@@ -434,6 +455,7 @@ impl MapleLayerWeights {
             wo,
             q_norm,
             k_norm,
+            attn_ptr_tables,
             moe,
         } = self;
         for t in [input_norm, post_attn_norm, q_norm, k_norm] {
@@ -443,6 +465,15 @@ impl MapleLayerWeights {
         wk.free_all(gpu);
         wv.free_all(gpu);
         wo.free_all(gpu);
+        let AttnPtrTables {
+            wq: pq,
+            wk: pk,
+            wv: pv,
+            wo: po,
+        } = attn_ptr_tables;
+        for t in [pq, pk, pv, po] {
+            let _ = gpu.free_tensor(t);
+        }
         moe.free_gpu(gpu);
     }
 }

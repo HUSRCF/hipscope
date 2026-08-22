@@ -4,6 +4,8 @@
 
 //! Batched-prefill scratch, chunk math, and the dense qt51 GEMM.
 
+use rdna_compute::{DType, Gpu, GpuTensor};
+
 /// Row-tile granularity of the grouped WMMA kernels.
 pub const MOE_GROUPED_BLOCK_M: usize = 16;
 
@@ -48,6 +50,78 @@ pub fn prefill_chunks(n_tokens: usize, chunk: usize) -> Vec<(usize, usize)> {
         start += n;
     }
     out
+}
+
+/// Host-side `sorted_slot_index` for a dense (single-expert) GEMM over `b`
+/// rows: identity for real rows, `-1` for the BLOCK_M padding tail so the
+/// kernel skips it.
+pub fn dense_slot_index_host(b: usize) -> Vec<i32> {
+    let m_total = dense_m_total(b);
+    let mut v = vec![-1i32; m_total];
+    for (i, slot) in v.iter_mut().enumerate().take(b) {
+        *slot = i as i32;
+    }
+    v
+}
+
+/// Host-side `expert_tile_ids`: every row tile uses expert 0.
+pub fn dense_tile_ids_host(b: usize) -> Vec<i32> {
+    vec![0i32; dense_m_total(b) / MOE_GROUPED_BLOCK_M]
+}
+
+/// Dense `Y[b × m] = X[b × k] @ W[m × k]^T` for an `MQ2G256LloydU` weight,
+/// by driving the grouped MoE WMMA kernel as a SINGLE-EXPERT case.
+///
+/// `w_ptrs` is a 1-entry `[2] f32` table holding the weight's device pointer,
+/// `tile_ids` is all-zero, `slot_index` is identity+(-1) padding, and
+/// `x_row_div = 1` because for a dense call the slot index IS the row index
+/// (the MoE case divides by `k_top`).
+///
+/// `x_f16_src` MUST be a buffer this call owns. The kernel's `ensure_fp16_x`
+/// caches its FP16 conversion keyed on the SOURCE POINTER, so passing a
+/// scratch buffer that is reused across layers returns the FIRST layer's
+/// activations for every later layer — silently, with no error.
+#[allow(clippy::too_many_arguments)]
+pub fn dense_qt51_gemm(
+    gpu: &mut Gpu,
+    w_ptrs: &GpuTensor,
+    tile_ids: &GpuTensor,
+    slot_index: &GpuTensor,
+    x_f16_src: &GpuTensor,
+    y: &GpuTensor,
+    m: usize,
+    k: usize,
+    b: usize,
+) -> Result<(), String> {
+    gpu.gemm_mq2g256_lloyd_moe_grouped_wmma(
+        w_ptrs,
+        tile_ids,
+        slot_index,
+        x_f16_src,
+        y,
+        m,
+        k,
+        1, // x_row_div: slot index IS the row index for a dense call
+        dense_m_total(b),
+        b,
+    )
+    .map_err(|e| format!("maple: dense qt51 gemm (m={m} k={k} b={b}): {e:?}"))
+}
+
+/// Upload a 1-entry device-pointer table for one weight, in the `[2] f32`
+/// (8-byte) layout the indexed kernels expect.
+pub fn upload_single_expert_ptr_table(
+    gpu: &mut Gpu,
+    w: &hipfire_runtime::llama::WeightTensor,
+) -> Result<GpuTensor, String> {
+    let bytes = (w.buf.buf.as_ptr() as u64).to_ne_bytes();
+    let t = gpu
+        .alloc_tensor(&[2], DType::F32)
+        .map_err(|e| format!("maple: alloc ptr table: {e:?}"))?;
+    gpu.hip
+        .memcpy_htod(&t.buf, &bytes)
+        .map_err(|e| format!("maple: htod ptr table: {e:?}"))?;
+    Ok(t)
 }
 
 #[cfg(test)]
@@ -100,5 +174,25 @@ mod tests {
         assert_eq!(prefill_chunks(256, 256), vec![(0, 256)]);
         assert_eq!(prefill_chunks(1, 256), vec![(0, 1)]);
         assert_eq!(prefill_chunks(0, 256), vec![]);
+    }
+
+    #[test]
+    fn dense_slot_index_is_identity_then_minus_one_padding() {
+        // Real rows map to themselves; padding rows MUST be -1 so the kernel
+        // skips them. A 0 there would silently recompute row 0 into the tail.
+        let v = dense_slot_index_host(17);
+        assert_eq!(v.len(), 32, "padded to BLOCK_M");
+        for (i, s) in v.iter().enumerate().take(17) {
+            assert_eq!(*s, i as i32);
+        }
+        assert!(v[17..].iter().all(|&s| s == -1), "padding must be -1");
+    }
+
+    #[test]
+    fn dense_tile_ids_are_all_expert_zero() {
+        // Single-expert specialization: every 16-row tile uses expert 0.
+        let t = dense_tile_ids_host(256);
+        assert_eq!(t.len(), 256 / 16);
+        assert!(t.iter().all(|&e| e == 0));
     }
 }
