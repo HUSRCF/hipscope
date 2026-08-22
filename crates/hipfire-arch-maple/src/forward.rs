@@ -38,7 +38,7 @@
 //! the same indexed MQ2-Lloyd kernels directly, exactly as `cohere2moe` drives
 //! the MQ4/MQ6 indexed kernels for its own no-shared-expert MoE. No new HIP.
 
-use crate::batch::{dense_qt51_gemm, MAPLE_PREFILL_MAX_B};
+use crate::batch::dense_qt51_gemm;
 use crate::config::{MapleConfig, MapleLayerType};
 use crate::maple::{MapleState, MapleWeights};
 use hipfire_dispatch::context::DispatchCtx;
@@ -72,6 +72,12 @@ pub fn decode_step(
         .map_err(|e| format!("maple: htod pos: {e:?}"))?;
     embed_lookup(gpu, weights, cfg.hidden_size, token_id, &state.h)?;
     decode_step_body(cfg, weights, state, gpu, position)?;
+    // Keep `state.n_tokens` truthful on BOTH paths. `forward_batch` maintains
+    // it, `reset` zeroes it, and it is the only record of how far the KV cache
+    // is populated (`KvCache` itself carries no cursor). A field that only one
+    // of two entry points updates is worse than no field at all: after any
+    // decode it would silently under-report.
+    state.n_tokens = state.n_tokens.max(position as usize + 1);
     gpu.download_f32(&state.logits)
         .map_err(|e| format!("maple: download logits: {e:?}"))
 }
@@ -398,8 +404,16 @@ pub fn forward_batch_supported(weights: &MapleWeights) -> bool {
             && l.wk.gpu_dtype == DType::MQ2G256LloydU
             && l.wv.gpu_dtype == DType::MQ2G256LloydU
             && l.wo.gpu_dtype == DType::MQ2G256LloydU
-            && l.moe.experts[0].gate_up.gpu_dtype == DType::MQ2G256LloydU
-            && l.moe.experts[0].down.gpu_dtype == DType::MQ2G256LloydU
+            // `.first()` rather than `experts[0]`: an expert-less layer is a
+            // malformed checkpoint, not a panic site. Report it as
+            // "unsupported" and let the caller fall back to the per-token path.
+            && l.moe
+                .experts
+                .first()
+                .is_some_and(|e| {
+                    e.gate_up.gpu_dtype == DType::MQ2G256LloydU
+                        && e.down.gpu_dtype == DType::MQ2G256LloydU
+                })
             && l.moe.router_f16.is_some()
     })
 }
@@ -573,8 +587,9 @@ fn moe_block_batched(
 }
 
 /// Prefill `tokens` at `[start_pos, start_pos+B)`; returns the LAST token's
-/// logits. Errors above `MAPLE_PREFILL_MAX_B` rather than splitting — chunking
-/// is the caller's job (`batch::prefill_chunks`).
+/// logits. Errors above `state.max_b` (the row count the batched scratch was
+/// allocated for) rather than splitting — chunking is the caller's job
+/// (`batch::prefill_chunks`).
 ///
 /// Both halves are batched: one GEMM per projection per layer over all B rows
 /// for attention, and one scatter + two grouped expert GEMMs per layer for the
@@ -592,9 +607,20 @@ pub fn forward_batch(
     if b == 0 {
         return Err("maple forward_batch: empty token slice".into());
     }
-    if b > MAPLE_PREFILL_MAX_B {
+    // Bound against what the scratch was ACTUALLY allocated from, not against
+    // the compile-time cap. `MapleState::new_with_max_seq` currently sizes
+    // every `b_*` buffer from `MAPLE_PREFILL_MAX_B`, so today the two are
+    // equal — but the recorded follow-up is to size them from
+    // `MAPLE_PREFILL_CHUNK` (256) instead. Checking the constant would still
+    // admit B=512 the moment that lands, and the dense GEMM would then write
+    // `dense_m_total(512) x q_dim` into a 256-row `b_q`. Checking `state.max_b`
+    // tracks the allocation by construction.
+    if b > state.max_b {
         return Err(format!(
-            "maple forward_batch: B={b} exceeds scratch cap {MAPLE_PREFILL_MAX_B}"
+            "maple forward_batch: B={b} exceeds this state's batched-prefill \
+             scratch capacity ({} rows) — split the prompt with \
+             `batch::prefill_chunks`",
+            state.max_b
         ));
     }
     if start_pos + b > state.max_seq {
@@ -728,6 +754,13 @@ pub fn forward_batch(
         .map_err(|e| format!("maple L{l}: batch k_norm: {e:?}"))?;
 
         // ...THEN RoPE, and only on sliding layers (full layers are NoPE).
+        //
+        // The trailing `pos_offset` is ADDED to each `b_positions[i]` for the
+        // RoPE angle only, so that a COMPACTED KV still rotates at absolute
+        // phase (callers on those paths pass `kv_cache.compact_offset`).
+        // Maple's KV is never evicted or compacted here and `b_positions`
+        // already holds absolute positions, so 0 is a literal no-op — the
+        // correct value, not an unfilled placeholder.
         if cfg.applies_rope(l) {
             gpu.rope_partial_interleaved_f32_batched(
                 &state.b_q,
@@ -739,7 +772,7 @@ pub fn forward_batch(
                 n_rot,
                 cfg.rope_theta,
                 b,
-                0,
+                /*pos_offset=*/ 0,
             )
             .map_err(|e| format!("maple L{l}: batch rope: {e:?}"))?;
         }
@@ -803,7 +836,7 @@ pub fn forward_batch(
     .map_err(|e| format!("maple: final rmsnorm: {e:?}"))?;
     weight_gemv(gpu, &weights.lm_head, &state.final_norm_buf, &state.logits)
         .map_err(|e| format!("maple: lm_head: {e}"))?;
-    state.n_tokens = start_pos + b;
+    state.n_tokens = state.n_tokens.max(start_pos + b);
     gpu.download_f32(&state.logits)
         .map_err(|e| format!("maple: download logits: {e:?}"))
 }

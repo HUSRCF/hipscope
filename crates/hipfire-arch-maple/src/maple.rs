@@ -575,6 +575,10 @@ pub struct MapleState {
     pub kv: KvCache,
     pub pos_buf: hip_bridge::DeviceBuffer,
     pub max_seq: usize,
+    /// How far the KV cache is populated: one past the highest position any
+    /// `decode_step` or `forward_batch` has written. `KvCache` carries no
+    /// cursor of its own, so this is the record. Maintained by BOTH forward
+    /// entry points and zeroed by `reset`.
     pub n_tokens: usize,
 
     pub h: GpuTensor,      // [hidden] residual stream
