@@ -120,14 +120,18 @@ pub(crate) fn classify_ternary_rows(data: &[f32], k: usize) -> Result<TernaryRow
 /// `k % 256 == 0` is required so no 256-block ever straddles a row boundary —
 /// if one did, it would span two different row scales and hold up to 5 distinct
 /// values, and the exactness guarantee would silently depend on tensor shape.
-pub(crate) fn pack_maple_tensor(data: &[f32], k: usize) -> Result<Vec<u8>, String> {
+pub(crate) fn pack_maple_tensor(
+    data: &[f32],
+    k: usize,
+) -> Result<(Vec<u8>, TernaryRowStats), String> {
     if k % 256 != 0 {
         return Err(format!(
             "K={k} must be a multiple of 256 so no 256-block straddles two rows"
         ));
     }
-    classify_ternary_rows(data, k)?;
-    quantize_mq2g256_ternary_exact(data)
+    let stats = classify_ternary_rows(data, k)?;
+    let bytes = quantize_mq2g256_ternary_exact(data)?;
+    Ok((bytes, stats))
 }
 
 #[cfg(test)]
@@ -168,7 +172,10 @@ mod tests {
         let mut data = ternary_row(k, 0.02, 0);
         data.extend((0..k).map(|i| i as f32 * 0.001));
         let err = classify_ternary_rows(&data, k).unwrap_err();
-        assert!(err.contains("row 1"), "must name the offending row; got: {err}");
+        assert!(
+            err.contains("row 1"),
+            "must name the offending row; got: {err}"
+        );
     }
 
     #[test]
@@ -198,7 +205,7 @@ mod tests {
         let s = 0.024169922f32; // a real Maple row scale
         let mut data = ternary_row(k, s, 0);
         data.extend(ternary_row(k, 0.0625, 1));
-        let packed = pack_maple_tensor(&data, k).unwrap();
+        let (packed, _) = pack_maple_tensor(&data, k).unwrap();
         let recon = crate::quant_mq::dequantize_mq2g256_lloyd_u_to_f32(&packed, data.len());
         let max_err = data
             .iter()
@@ -256,7 +263,8 @@ mod tests {
 
         // Maple expert gate_proj/up_proj and every attention projection use
         // K=2048; down_proj uses K=512. Both are multiples of 256.
-        let packed = pack_maple_tensor(&vals, 2048).expect("real Maple weights must be ternary");
+        let (packed, _) =
+            pack_maple_tensor(&vals, 2048).expect("real Maple weights must be ternary");
         assert_eq!(packed.len(), expected.len(), "packed length mismatch");
 
         if let Some(first) = packed.iter().zip(&expected).position(|(a, b)| a != b) {

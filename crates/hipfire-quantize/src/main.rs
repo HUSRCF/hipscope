@@ -25,6 +25,7 @@ mod model_filter;
 mod pipeline;
 mod pipeline_deepseek;
 mod pipeline_gguf;
+mod pipeline_maple;
 mod quant_e8;
 mod quant_fwht;
 mod quant_hfp4;
