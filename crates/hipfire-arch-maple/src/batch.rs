@@ -99,6 +99,15 @@ pub fn dense_qt51_gemm(
     k: usize,
     b: usize,
 ) -> Result<(), String> {
+    // Enforce the contract documented above. Passing F32 here does not fail —
+    // it quietly routes through the kernel's pointer-keyed `ensure_fp16_x` and
+    // serves the FIRST layer's activations for every later layer. Debug-only,
+    // so release pays nothing.
+    debug_assert_eq!(
+        x_f16_src.dtype,
+        DType::F16,
+        "dense_qt51_gemm: x must be pre-converted F16"
+    );
     gpu.gemm_mq2g256_lloyd_moe_grouped_wmma(
         w_ptrs,
         tile_ids,

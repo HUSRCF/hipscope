@@ -295,10 +295,9 @@ fn dump_layer_hidden(
 ///
 /// `x` is the post-attention RMSNorm output `[hidden]` and `h` is the residual
 /// row `[hidden]` the down-projection atomically accumulates into. Decode passes
-/// `&state.normed` / `&state.h`; batched prefill passes row views into
-/// `state.b_normed` / `state.b_h`. Everything else (router scratch, top-k
-/// buffers, the expert activation batch) is shared per-token scratch, which is
-/// why this must stay strictly sequential over rows.
+/// `&state.normed` / `&state.h`. Everything else (router scratch, top-k buffers,
+/// the expert activation batch) is single-row scratch, which is why this must
+/// stay strictly one token per call. Batched prefill uses `moe_block_batched`.
 fn moe_block_row(
     cfg: &MapleConfig,
     layer: &crate::maple::MapleLayerWeights,
@@ -387,6 +386,12 @@ fn moe_block_row(
 
 /// Batched prefill requires uniform qt51 experts (the dense and grouped GEMMs
 /// both decode that layout) — anything else falls back to per-token.
+///
+/// The ROUTER is deliberately checked differently: it is the one Maple weight
+/// that is NOT qt51 (BF16 in the published checkpoint), and the batched path
+/// drives it from the F16 mirror the loader builds. `router_f16` is `None`
+/// exactly when that mirror could not be built, so requiring it here is the
+/// router's dtype gate.
 pub fn forward_batch_supported(weights: &MapleWeights) -> bool {
     weights.layers.iter().all(|l| {
         l.wq.gpu_dtype == DType::MQ2G256LloydU
@@ -395,16 +400,170 @@ pub fn forward_batch_supported(weights: &MapleWeights) -> bool {
             && l.wo.gpu_dtype == DType::MQ2G256LloydU
             && l.moe.experts[0].gate_up.gpu_dtype == DType::MQ2G256LloydU
             && l.moe.experts[0].down.gpu_dtype == DType::MQ2G256LloydU
+            && l.moe.router_f16.is_some()
     })
+}
+
+/// Grouped MoE for B tokens: one router GEMM + one scatter + two grouped
+/// expert GEMMs per layer, in place of B × (1 router GEMV + 8 expert GEMVs).
+///
+/// Mirrors the DeepSeek-V4 prefill sequence (`hipfire-dispatch`'s
+/// `pipeline::mod.rs` grouped arm) with three deliberate differences:
+///
+/// 1. **NO FWHT rotate.** DS4 calls `rotate_x_mq_batched` between the SwiGLU
+///    and the down GEMM because its MQ2-Lloyd (qt19) weights are FWHT-rotated.
+///    Maple's MQ2G256LloydU (qt51) weights are UNROTATED, so the clamped
+///    SwiGLU output feeds the down GEMM directly in the natural basis. Adding
+///    the rotate here is silent garbage, not an error.
+/// 2. **The clamp is `cfg.swiglu_clamp` (7.0), not DeepSeek's 10.0.** Same
+///    kernel, different limit; a copied 10.0 is a silent quality change.
+/// 3. **The router runs from the F16 mirror**, not the qt51 grouped GEMM —
+///    see `maple::upload_router_f16`.
+///
+/// The two `x_row_div` values are NOT interchangeable: gate_up gathers by
+/// TOKEN (`k_top`, slot → token row) while down gathers by SLOT (`1`, the
+/// activation rows ARE slots). Swapping them reads the wrong activation rows
+/// and still produces plausible output.
+fn moe_block_batched(
+    cfg: &MapleConfig,
+    layer: &crate::maple::MapleLayerWeights,
+    state: &MapleState,
+    gpu: &mut Gpu,
+    l: usize,
+    b: usize,
+) -> Result<(), String> {
+    let m = &layer.moe;
+    let (hidden, mi) = (cfg.hidden_size, cfg.moe_intermediate_size);
+    let (k_top, n_exp) = (cfg.num_experts_per_tok, cfg.num_experts);
+    let total_slots = b * k_top;
+    let m_total = crate::batch::moe_grouped_m_total_bound(total_slots, n_exp);
+    debug_assert!(
+        m_total <= state.moe_m_total_max,
+        "grouped MoE scratch too small"
+    );
+    let router_f16 = m
+        .router_f16
+        .as_ref()
+        .ok_or_else(|| format!("maple L{l}: router has no F16 mirror — batched MoE unavailable"))?;
+
+    // RE-CONVERT. `b_normed_f16` was built from the INPUT-layernorm output
+    // before attention; `b_normed` has since been overwritten by the
+    // post-attention norm. Skipping this feeds the whole MoE the pre-attention
+    // activations — a silent, plausible-looking wrong answer.
+    gpu.deepseek4_convert_f32_to_f16(&state.b_normed, &state.b_normed_f16, (b * hidden) as i64)
+        .map_err(|e| format!("maple L{l}: post-attn f32->f16: {e:?}"))?;
+
+    // Router over B rows → [b × n_exp], then softmax + top-k + renorm.
+    gpu.gemm_f16_x_f16_wmma(
+        router_f16,
+        &state.b_normed_f16,
+        &state.b_router_logits,
+        n_exp,
+        hidden,
+        b,
+    )
+    .map_err(|e| format!("maple L{l}: batch router gemm: {e:?}"))?;
+    // Per-ROW softmax over [b × n_exp]. `softmax_f32` normalises the WHOLE
+    // tensor, which would mix all b rows together — use the batched variant at
+    // temp = 1.0 (inv_t = 1.0, i.e. an exact softmax). Writes to a separate
+    // probs buffer rather than aliasing the logits.
+    gpu.softmax_temp_batched_into_f32(&state.b_router_logits, &state.b_router_probs, n_exp, b, 1.0)
+        .map_err(|e| format!("maple L{l}: batch router softmax: {e:?}"))?;
+    gpu.moe_topk_renorm_k8_batched(
+        &state.b_router_probs,
+        &state.b_topk_indices,
+        &state.b_topk_weights,
+        n_exp,
+        cfg.norm_topk_prob,
+        b,
+    )
+    .map_err(|e| format!("maple L{l}: batch topk: {e:?}"))?;
+
+    gpu.moe_scatter_fused_k8(
+        &state.b_topk_indices,
+        &state.b_expert_counts,
+        &state.b_expert_offsets,
+        &state.b_sorted_slot,
+        &state.b_expert_tiles,
+        &state.b_inverse_perm,
+        total_slots,
+        n_exp,
+        m_total,
+        crate::batch::MOE_GROUPED_BLOCK_M,
+    )
+    .map_err(|e| format!("maple L{l}: scatter: {e:?}"))?;
+
+    // gate_up: x_row_div = k_top (slot -> token), x rows = b.
+    gpu.gemm_mq2g256_lloyd_moe_grouped_wmma(
+        &m.expert_gate_up_ptrs,
+        &state.b_expert_tiles,
+        &state.b_sorted_slot,
+        &state.b_normed_f16,
+        &state.b_y_gate_up,
+        2 * mi,
+        hidden,
+        k_top,
+        m_total,
+        b,
+    )
+    .map_err(|e| format!("maple L{l}: grouped gate_up: {e:?}"))?;
+
+    // Unscatter + Maple's asymmetric clamped SwiGLU, one launch. NO rotate.
+    gpu.moe_unscatter_silu_clamp_k8(
+        &state.b_y_gate_up,
+        &state.b_sorted_slot,
+        &state.b_act,
+        mi,
+        k_top,
+        m_total,
+        cfg.swiglu_clamp,
+    )
+    .map_err(|e| format!("maple L{l}: unscatter+swiglu: {e:?}"))?;
+
+    // Convert the activation ourselves for the same reason `b_normed_f16`
+    // exists: the grouped GEMM's F32 arm caches on the source POINTER, and
+    // `b_act` is one buffer refilled every layer. See `MapleState::b_act_f16`.
+    gpu.deepseek4_convert_f32_to_f16(&state.b_act, &state.b_act_f16, (total_slots * mi) as i64)
+        .map_err(|e| format!("maple L{l}: swiglu f32->f16: {e:?}"))?;
+
+    // down: x_row_div = 1 (act rows ARE slots), x rows = total_slots.
+    gpu.gemm_mq2g256_lloyd_moe_grouped_wmma(
+        &m.expert_down_ptrs,
+        &state.b_expert_tiles,
+        &state.b_sorted_slot,
+        &state.b_act_f16,
+        &state.b_y_down,
+        hidden,
+        mi,
+        1,
+        m_total,
+        total_slots,
+    )
+    .map_err(|e| format!("maple L{l}: grouped down: {e:?}"))?;
+
+    // Weighted Σ over the k_top slots of each token, += into the residual.
+    // This IS the combine — the grouped down GEMM, unlike the per-token
+    // `..._down_residual_scaled_indexed` GEMV, does not self-combine.
+    gpu.moe_down_combine_grouped_k8(
+        &state.b_y_down,
+        &state.b_inverse_perm,
+        &state.b_topk_weights,
+        &state.b_h,
+        hidden,
+        k_top,
+        b,
+    )
+    .map_err(|e| format!("maple L{l}: down combine: {e:?}"))
 }
 
 /// Prefill `tokens` at `[start_pos, start_pos+B)`; returns the LAST token's
 /// logits. Errors above `MAPLE_PREFILL_MAX_B` rather than splitting — chunking
 /// is the caller's job (`batch::prefill_chunks`).
 ///
-/// The attention half is fully batched: one GEMM per projection per layer over
-/// all B rows. The MoE half is deliberately still PER-TOKEN here — correct but
-/// slow — so this function is parity-testable before the grouped MoE lands.
+/// Both halves are batched: one GEMM per projection per layer over all B rows
+/// for attention, and one scatter + two grouped expert GEMMs per layer for the
+/// MoE (`moe_block_batched`). Nothing on this path loops over tokens except the
+/// embedding row copies.
 pub fn forward_batch(
     cfg: &MapleConfig,
     weights: &MapleWeights,
@@ -603,14 +762,7 @@ pub fn forward_batch(
         )
         .map_err(|e| format!("maple L{l}: batch post-attn rmsnorm: {e:?}"))?;
 
-        // Task 3: the MoE stays PER-TOKEN over the batch rows. Correct but slow
-        // (one router GEMV + 8 expert GEMVs per token); Task 5 replaces this
-        // whole loop with the grouped path.
-        for i in 0..b {
-            let x_row = row_view(&state.b_normed, i * hidden, hidden);
-            let h_row = row_view(&state.b_h, i * hidden, hidden);
-            moe_block_row(cfg, layer, state, gpu, l, &x_row, &h_row)?;
-        }
+        moe_block_batched(cfg, layer, state, gpu, l, b)?;
     }
 
     // Head: last row only — the caller wants the next-token distribution, and

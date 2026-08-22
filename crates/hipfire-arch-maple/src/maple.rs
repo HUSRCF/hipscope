@@ -24,7 +24,7 @@
 
 use crate::config::MapleConfig;
 use hipfire_runtime::hfq::HfqFile;
-use hipfire_runtime::llama::{f16_to_f32, KvCache, WeightTensor};
+use hipfire_runtime::llama::{f16_to_f32, f32_to_f16, KvCache, WeightTensor};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 /// Maple's embedding tensor. Named `word_embeddings`, not `embed_tokens` —
@@ -96,26 +96,8 @@ fn load_f32(
     shape: &[usize],
 ) -> Result<GpuTensor, String> {
     let (qt, data) = read_tensor(hfq, name)?;
-    let f32_data: Vec<f32> = match qt {
-        1 => data
-            .chunks_exact(2)
-            .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-            .collect(),
-        2 => data
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect(),
-        3 => dequant_q8_0(&data),
-        16 => data
-            .chunks_exact(2)
-            .map(|c| bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-            .collect(),
-        _ => {
-            return Err(format!(
-                "maple: expected F16/BF16/F32/Q8 for {name}, got qt={qt}"
-            ))
-        }
-    };
+    let f32_data = widen_to_f32(qt, &data)
+        .ok_or_else(|| format!("maple: expected F16/BF16/F32/Q8 for {name}, got qt={qt}"))?;
     gpu.upload_f32(&f32_data, shape)
         .map_err(|e| format!("maple: upload {name}: {e:?}"))
 }
@@ -178,6 +160,88 @@ fn wt_from_raw(
     })
 }
 
+/// Widen raw F16/BF16/F32/Q8 bytes to F32, or `None` for anything else.
+///
+/// Split out of `load_f32` so the router can be materialised TWICE from one
+/// read (once as its native `WeightTensor` for decode, once as the F16 mirror
+/// batched prefill needs) without re-reading the tensor.
+fn widen_to_f32(qt: u8, data: &[u8]) -> Option<Vec<f32>> {
+    match qt {
+        1 => Some(
+            data.chunks_exact(2)
+                .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                .collect(),
+        ),
+        2 => Some(
+            data.chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect(),
+        ),
+        3 => Some(dequant_q8_0(data)),
+        16 => Some(
+            data.chunks_exact(2)
+                .map(|c| bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
+/// F16 mirror of the router, `[n_exp × hidden]`, for the batched prefill GEMM.
+///
+/// **The router is the ONE Maple weight that is not qt51.** The published
+/// checkpoint carries every attention projection and every expert as
+/// MQ2G256LloydU (qt=51) but `model.layers.N.mlp.gate.weight` as **BF16**
+/// (qt=16) — the reference even declares `router_dtype: fp32`. So
+/// `batch::dense_qt51_gemm` CANNOT drive the router: that entry decodes
+/// MQ2-Lloyd 72-byte groups, and pointed at BF16 bytes it would read them as
+/// 2-bit codes and return plausible-looking garbage with no error and no
+/// out-of-bounds fault (the BF16 blob is 8× the size the decoder reads).
+///
+/// `gemm_f16_x_f16_wmma` instead takes an F16 weight against the same F16
+/// activation the rest of the batched MoE already consumes, and writes the
+/// `[b × n_exp]` row-major logits the batched top-k expects.
+///
+/// BF16→F16 is bit-exact across F16's NORMAL range (BF16 carries 8 significand
+/// bits, F16 carries 11). Measured on the published checkpoint, ~0.2% of each
+/// router's 524,288 weights fall below that (|w| < 6.1e-5, against a max |w| of
+/// ~0.44) and lose precision or flush to zero; those terms are >3 orders of
+/// magnitude below the dominant weights, so they sit far under the F32→F16
+/// ACTIVATION narrowing the gate_up GEMM already pays. See the two
+/// `bf16_to_f16_narrowing_*` tests.
+///
+/// Returns `None` for a router dtype with no host widening (e.g. a future
+/// requantized MQ router). That is not a load failure — decode still runs
+/// through `weight_gemv` — it just disables batched prefill via
+/// `forward::forward_batch_supported`.
+fn upload_router_f16(
+    gpu: &mut Gpu,
+    qt: u8,
+    data: &[u8],
+    n: usize,
+) -> Result<Option<GpuTensor>, String> {
+    let Some(vals) = widen_to_f32(qt, data) else {
+        return Ok(None);
+    };
+    if vals.len() != n {
+        return Err(format!(
+            "maple: router has {} elements, expected {n}",
+            vals.len()
+        ));
+    }
+    let bytes: Vec<u8> = vals
+        .iter()
+        .flat_map(|&v| f32_to_f16(v).to_le_bytes())
+        .collect();
+    let t = gpu
+        .alloc_tensor(&[n], DType::F16)
+        .map_err(|e| format!("maple: alloc router_f16: {e:?}"))?;
+    gpu.hip
+        .memcpy_htod(&t.buf, &bytes)
+        .map_err(|e| format!("maple: htod router_f16: {e:?}"))?;
+    Ok(Some(t))
+}
+
 // ──────────────────────────── Weights ────────────────────────────
 
 /// One MoE expert: fused gate(gate_proj)‖up(up_proj) and down(down_proj).
@@ -188,8 +252,12 @@ pub struct MapleExpert {
 
 /// 256-expert MoE FFN (softmax top-8 + renorm, no bias, no shared expert).
 pub struct MapleMoeFfn {
-    pub router: WeightTensor,           // mlp.gate.weight [n_exp, hidden]
-    pub experts: Vec<MapleExpert>,      // per-expert buffers (owned here)
+    pub router: WeightTensor, // mlp.gate.weight [n_exp, hidden]
+    /// F16 copy of `router`, `[n_exp × hidden]`, for the batched prefill
+    /// router GEMM. `None` when the router dtype has no host widening — see
+    /// `upload_router_f16` for why the router cannot go through the qt51 path.
+    pub router_f16: Option<GpuTensor>,
+    pub experts: Vec<MapleExpert>, // per-expert buffers (owned here)
     pub expert_gate_up_ptrs: GpuTensor, // [2*n_exp] F32 = n_exp u64 device ptrs
     pub expert_down_ptrs: GpuTensor,
 }
@@ -330,7 +398,14 @@ impl MapleWeights {
                 wo: crate::batch::upload_single_expert_ptr_table(gpu, &wo)?,
             };
 
-            let router = load_wt(hfq, gpu, &router_tensor_name(l), n_exp, hidden)?;
+            // Read the router ONCE and materialise both views: the native
+            // `WeightTensor` decode drives through `weight_gemv`, and the F16
+            // mirror batched prefill needs (the router is BF16, not qt51).
+            let router_name = router_tensor_name(l);
+            let (router_qt, router_bytes) = read_tensor(hfq, &router_name)?;
+            let router = wt_from_raw(gpu, router_qt, &router_bytes, n_exp, hidden)
+                .map_err(|e| format!("maple: load_wt {router_name}: {e}"))?;
+            let router_f16 = upload_router_f16(gpu, router_qt, &router_bytes, n_exp * hidden)?;
             let mut experts = Vec::with_capacity(n_exp);
             for e in 0..n_exp {
                 let (qt_g, g) = read_tensor(hfq, &expert_tensor_name(l, e, ExpertProj::Gate))?;
@@ -386,6 +461,7 @@ impl MapleWeights {
                 attn_ptr_tables,
                 moe: MapleMoeFfn {
                     router,
+                    router_f16,
                     experts,
                     expert_gate_up_ptrs,
                     expert_down_ptrs,
@@ -431,11 +507,15 @@ impl MapleMoeFfn {
     pub fn free_gpu(self, gpu: &mut Gpu) {
         let MapleMoeFfn {
             router,
+            router_f16,
             experts,
             expert_gate_up_ptrs,
             expert_down_ptrs,
         } = self;
         router.free_all(gpu);
+        if let Some(t) = router_f16 {
+            let _ = gpu.free_tensor(t);
+        }
         for e in experts {
             e.free_gpu(gpu);
         }
@@ -544,6 +624,33 @@ pub struct MapleState {
     pub b_positions: GpuTensor, // [max_b] i32-in-f32
     pub b_tile_ids: GpuTensor, // [dense_m_total(max_b)/16] i32, all expert 0
     pub b_slot_index: GpuTensor, // [dense_m_total(max_b)] i32, rewritten per call
+
+    // ── grouped-MoE prefill scratch ──
+    //
+    // Worst-case padded slot count over the whole `max_b` range. Every LIVE
+    // expert can waste up to BLOCK_M-1 pad slots, so this is strictly larger
+    // than `max_b * k_top`; sizing on the raw slot count instead would let the
+    // scatter write past the end of `b_sorted_slot` on a spread-out routing.
+    pub moe_m_total_max: usize,
+    pub b_router_logits: GpuTensor,  // [max_b × n_exp]
+    pub b_router_probs: GpuTensor,   // [max_b × n_exp] softmax output (separate: no aliasing)
+    pub b_topk_indices: GpuTensor,   // [max_b × k_top] i32-in-F32
+    pub b_topk_weights: GpuTensor,   // [max_b × k_top]
+    pub b_expert_counts: GpuTensor,  // [n_exp] i32-in-F32, padded counts
+    pub b_expert_offsets: GpuTensor, // [n_exp + 1] i32-in-F32, exclusive scan
+    pub b_sorted_slot: GpuTensor,    // [moe_m_total_max] i32-in-F32, -1 = padding
+    pub b_expert_tiles: GpuTensor,   // [moe_m_total_max / 16] i32-in-F32, -1 = dead tile
+    pub b_inverse_perm: GpuTensor,   // [max_b × k_top] i32-in-F32
+    pub b_y_gate_up: GpuTensor,      // [moe_m_total_max × 2*moe_inter]
+    pub b_y_down: GpuTensor,         // [moe_m_total_max × hidden]
+    pub b_act: GpuTensor,            // [max_b × k_top × moe_inter] clamped SwiGLU
+    /// F16 mirror of `b_act`, converted explicitly every layer for the same
+    /// reason `b_normed_f16` exists: the grouped GEMM's F32 arm caches its
+    /// conversion on the SOURCE POINTER, and `b_act` is one buffer refilled
+    /// with new contents 24 times per prefill. Handing it the F32 tensor
+    /// would run the down GEMM of every layer on layer 0's activations —
+    /// silently. This buffer is a distinct allocation for that reason.
+    pub b_act_f16: GpuTensor, // [max_b × k_top × moe_inter] F16
 }
 
 impl MapleState {
@@ -604,6 +711,7 @@ impl MapleState {
         };
         let max_b = crate::batch::MAPLE_PREFILL_MAX_B;
         let dm = crate::batch::dense_m_total(max_b);
+        let moe_m_total_max = crate::batch::moe_grouped_m_total_bound(max_b * k, n_exp);
 
         Ok(MapleState {
             kv,
@@ -650,6 +758,24 @@ impl MapleState {
                 &crate::batch::dense_slot_index_host(max_b),
                 "b_slot_index",
             )?,
+            moe_m_total_max,
+            b_router_logits: alloc(gpu, max_b * n_exp, "b_router_logits")?,
+            b_router_probs: alloc(gpu, max_b * n_exp, "b_router_probs")?,
+            b_topk_indices: alloc(gpu, max_b * k, "b_topk_indices")?,
+            b_topk_weights: alloc(gpu, max_b * k, "b_topk_weights")?,
+            b_expert_counts: alloc(gpu, n_exp, "b_expert_counts")?,
+            b_expert_offsets: alloc(gpu, n_exp + 1, "b_expert_offsets")?,
+            b_sorted_slot: alloc(gpu, moe_m_total_max, "b_sorted_slot")?,
+            b_expert_tiles: alloc(
+                gpu,
+                moe_m_total_max / crate::batch::MOE_GROUPED_BLOCK_M,
+                "b_expert_tiles",
+            )?,
+            b_inverse_perm: alloc(gpu, max_b * k, "b_inverse_perm")?,
+            b_y_gate_up: alloc(gpu, moe_m_total_max * 2 * moe_inter, "b_y_gate_up")?,
+            b_y_down: alloc(gpu, moe_m_total_max * hidden, "b_y_down")?,
+            b_act: alloc(gpu, max_b * k * moe_inter, "b_act")?,
+            b_act_f16: alloc_f16(gpu, max_b * k * moe_inter, "b_act_f16")?,
         })
     }
 
@@ -699,6 +825,20 @@ impl MapleState {
             b_positions,
             b_tile_ids,
             b_slot_index,
+            moe_m_total_max: _,
+            b_router_logits,
+            b_router_probs,
+            b_topk_indices,
+            b_topk_weights,
+            b_expert_counts,
+            b_expert_offsets,
+            b_sorted_slot,
+            b_expert_tiles,
+            b_inverse_perm,
+            b_y_gate_up,
+            b_y_down,
+            b_act,
+            b_act_f16,
         } = self;
         let _ = kv.free_gpu(gpu);
         let _ = gpu.hip.free(pos_buf);
@@ -731,6 +871,19 @@ impl MapleState {
             b_positions,
             b_tile_ids,
             b_slot_index,
+            b_router_logits,
+            b_router_probs,
+            b_topk_indices,
+            b_topk_weights,
+            b_expert_counts,
+            b_expert_offsets,
+            b_sorted_slot,
+            b_expert_tiles,
+            b_inverse_perm,
+            b_y_gate_up,
+            b_y_down,
+            b_act,
+            b_act_f16,
         ] {
             let _ = gpu.free_tensor(t);
         }
@@ -777,6 +930,70 @@ mod tests {
         // Untied: the head is its own tensor, not a second view of the embedding.
         assert_eq!(LM_HEAD_TENSOR_NAME, "lm_head.weight");
         assert_ne!(LM_HEAD_TENSOR_NAME, EMBED_TENSOR_NAME);
+    }
+
+    #[test]
+    fn the_router_is_not_ternary_so_it_cannot_take_the_qt51_path() {
+        // The published checkpoint carries every attention projection and all
+        // 18,432 expert tensors as qt=51, but `mlp.gate.weight` as BF16
+        // (qt=16). Driving the router through `batch::dense_qt51_gemm` would
+        // decode BF16 bytes as MQ2-Lloyd 72-byte groups: in-bounds (the BF16
+        // blob is 8x larger than the decoder reads) and therefore SILENT.
+        // `widen_to_f32` is the gate — it accepts the float/Q8 dtypes the F16
+        // router mirror can be built from and refuses the MQ ones, which is
+        // what makes `forward_batch_supported` false for such a checkpoint.
+        assert!(widen_to_f32(16, &[0x80, 0x3F]).is_some(), "BF16 router");
+        assert!(widen_to_f32(1, &[0x00, 0x3C]).is_some(), "F16 router");
+        assert!(widen_to_f32(2, &[0, 0, 0x80, 0x3F]).is_some(), "F32 router");
+        assert!(
+            widen_to_f32(51, &[0u8; 72]).is_none(),
+            "qt51 has no host widening"
+        );
+        assert!(
+            widen_to_f32(19, &[0u8; 72]).is_none(),
+            "qt19 has no host widening"
+        );
+    }
+
+    /// Smallest F16 NORMAL. Below this, F16 goes subnormal and stops carrying
+    /// BF16's 8 significand bits; below ~6e-8 it flushes to zero.
+    const F16_MIN_NORMAL: f32 = 6.103_515_6e-5;
+
+    #[test]
+    fn bf16_to_f16_narrowing_is_exact_over_the_f16_normal_range() {
+        // BF16 carries 8 significand bits, F16 carries 11, so every BF16 value
+        // in F16's NORMAL range round-trips bit-exactly — the F16 router mirror
+        // costs no weight precision there. Exhaustive over the BF16 domain.
+        let mut checked = 0usize;
+        for bits in 0u16..=0xFFFF {
+            let v = bf16_to_f32(bits);
+            if !v.is_finite() || v.abs() > 65504.0 || (v != 0.0 && v.abs() < F16_MIN_NORMAL) {
+                continue;
+            }
+            assert_eq!(
+                f16_to_f32(f32_to_f16(v)),
+                v,
+                "bf16 0x{bits:04X} ({v}) did not survive the f16 narrowing"
+            );
+            checked += 1;
+        }
+        // 2 signs × 30 in-range exponents (2^-14 .. 2^15) × 128 BF16 mantissas
+        // + the zeros. Pinned so a bad filter cannot make the sweep vacuous.
+        assert_eq!(checked, 7682, "sweep covered the wrong value set");
+    }
+
+    #[test]
+    fn the_narrowing_is_lossy_below_the_f16_normal_range() {
+        // State the limit rather than overclaim. Measured on the published
+        // checkpoint (2026-08-22): per router, |w| spans ~4e-9 to ~0.44 and
+        // ~0.2% of the 524,288 weights fall below F16_MIN_NORMAL; the very
+        // smallest flush to zero here. Those terms are >3 orders of magnitude
+        // below the dominant weights, so their contribution sits far under the
+        // F32→F16 ACTIVATION error the batched MoE already accepts — but the
+        // narrowing is not unconditionally exact, and this pins that.
+        assert_eq!(f32_to_f16(1e-8), 0, "flushes to zero");
+        let tiny = bf16_to_f32(0x3800); // 6.1035e-5 — exactly F16_MIN_NORMAL
+        assert_eq!(f16_to_f32(f32_to_f16(tiny)), tiny, "the boundary is exact");
     }
 
     #[test]
