@@ -586,7 +586,25 @@ pub fn run_moe_decode(
     if !res.routed_indexable_paro {
         hip!(gpu.ensure_mq_signs())?;
     }
-    let xr = x_rot_local.expect("use_gpu_topk implies x_rot_local is Some");
+    // The activation the routed-expert GEMVs consume.
+    //
+    // Every rotated dtype gets the FWHT-rotated `x_rot_local`. MQ2G256LloydU is
+    // the unrotated sibling — the resolver leaves `needs_x_rot_local` false for
+    // it, so `x_rot_local` is None and the correct input is the natural-basis
+    // activation. The old unconditional `.expect()` encoded the now-false
+    // invariant "use_gpu_topk implies x_rot_local is Some"; keep it as a
+    // debug_assert on the rotated branch so a dtype that genuinely needs
+    // rotation still trips loudly instead of silently reading unrotated x.
+    let xr = match x_rot_local {
+        Some(xr) => xr,
+        None => {
+            debug_assert!(
+                !res.needs_x_rot_local,
+                "needs_x_rot_local is set but no rotated activation was produced"
+            );
+            p.x_norm
+        }
+    };
     let gate_up_k = p.routed_gate_up_k;
     let down_m = p.routed_down_m;
     let down_k = p.routed_down_k;
@@ -708,7 +726,10 @@ pub fn run_moe_decode(
                 p.k,
                 1,
             ))?;
-        } else if p.dtypes.routed_gate_up == DType::MQ2G256Lloyd {
+        } else if matches!(
+            p.dtypes.routed_gate_up,
+            DType::MQ2G256Lloyd | DType::MQ2G256LloydU
+        ) {
             // Uniform MQ2-Lloyd routed experts: ds4/minimax indexed Lloyd gate_up
             // GEMV. y_gate/y_up are separate buffers; m = 2*p.mi (kernel splits at
             // M/2 internally); trailing k_top = p.k. X is the FWHT-rotated xr.
@@ -904,7 +925,10 @@ pub fn run_moe_decode(
                 p.k,
                 1,
             ))?;
-        } else if p.dtypes.routed_down == DType::MQ2G256Lloyd {
+        } else if matches!(
+            p.dtypes.routed_down,
+            DType::MQ2G256Lloyd | DType::MQ2G256LloydU
+        ) {
             // MQ2-Lloyd down: atomic, weighted, SELF-COMBINING residual GEMV.
             // silu-output rotate (rot_batch) -> down -> * topk_weight[krank] ->
             // atomicAdd into out_target, all in one launch. NO separate combine
@@ -1056,7 +1080,11 @@ pub fn run_moe_decode(
         || (p.expert_dtype_tags.is_none()
             && matches!(
                 p.dtypes.routed_down,
-                DType::MQ2G256Lloyd | DType::MQ3G256Lloyd | DType::MQ2G256GL | DType::MQ3G256GL
+                DType::MQ2G256Lloyd
+                    | DType::MQ2G256LloydU
+                    | DType::MQ3G256Lloyd
+                    | DType::MQ2G256GL
+                    | DType::MQ3G256GL
             ));
     if !ninepath_d4 && !routed_down_self_combines && !p.defer_routed_combine {
         hip!(gpu.moe_down_combine_k8_batched(
@@ -1111,6 +1139,7 @@ fn dtype_name(d: DType) -> &'static str {
         DType::MQ3G256 => "MQ3G256",
         DType::MQ2G256 => "MQ2G256",
         DType::MQ2G256Lloyd => "MQ2G256Lloyd",
+        DType::MQ2G256LloydU => "MQ2G256LloydU",
         DType::MQ3G256Lloyd => "MQ3G256Lloyd",
         DType::MQ2G256GL => "MQ2G256GL",
         DType::MQ3G256GL => "MQ3G256GL",
@@ -2298,18 +2327,19 @@ fn dispatch_grouped_gemm(
         // recipe: gate_up = MQ2-Lloyd 72 B/group, down = MQ3-Lloyd 112 B/group).
         // Both entries are arch-selecting (gfx11 `_k2` / gfx12 `_gfx12`) — do NOT
         // swap either for the bare `_k2` launcher, which fails the JIT on RDNA4.
-        DType::MQ2G256Lloyd => hip!(gpu.gemm_mq2g256_lloyd_moe_grouped_wmma(
-            ptrs,
-            tile_ids,
-            sorted_slot_index,
-            x,
-            y,
-            m,
-            k,
-            x_row_div,
-            m_total,
-            rows,
-        )),
+        DType::MQ2G256Lloyd | DType::MQ2G256LloydU => hip!(gpu
+            .gemm_mq2g256_lloyd_moe_grouped_wmma(
+                ptrs,
+                tile_ids,
+                sorted_slot_index,
+                x,
+                y,
+                m,
+                k,
+                x_row_div,
+                m_total,
+                rows,
+            )),
         DType::MQ3G256Lloyd => hip!(gpu.gemm_mq3g256_lloyd_moe_grouped_wmma(
             ptrs,
             tile_ids,

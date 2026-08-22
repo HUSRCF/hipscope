@@ -702,6 +702,10 @@ impl KernelKey {
             (MQ6G256, Plain) => Ok(Self::GemvMq6G256),
             (MQ8G256, Plain) => Ok(Self::GemvMq8G256),
             (MQ2G256Lloyd, Plain) => Ok(Self::GemvMq2G256Lloyd),
+            // Byte-identical layout, so the same kernel decodes it. The
+            // difference is only which basis x arrives in, which is the
+            // caller's business (RotationPlan::None for this dtype).
+            (MQ2G256LloydU, Plain) => Ok(Self::GemvMq2G256Lloyd),
             (MQ3G256Lloyd, Plain) => Ok(Self::GemvMq3G256Lloyd),
             (MQ4G256Lloyd, Plain) => Ok(Self::GemvMq4G256Lloyd),
             (MFP4G32, Plain) => Ok(Self::GemvMfp4G32),

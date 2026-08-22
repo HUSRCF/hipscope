@@ -973,6 +973,65 @@ fn dtypes_all_mq4() -> MoeDtypes {
 }
 
 #[test]
+fn moe_res_mq2_lloyd_u_is_indexable_but_never_rotates() {
+    // MQ2G256LloydU carries UNROTATED weights. It must reach the same indexed
+    // decode arms as its rotated sibling (same kernels, same byte layout) but
+    // must NOT request the x rotation — feeding a FWHT-rotated x to unrotated
+    // weights is silent garbage output, not an error.
+    let mut d = dtypes_all_mq4();
+    d.router = DType::F32;
+    d.experts_all_gate_up_mq4 = false;
+    d.routed_gate_up = DType::MQ2G256LloydU;
+    d.routed_down = DType::MQ2G256LloydU;
+    let r = MoeResolution::resolve(&d, 8);
+    assert!(
+        r.routed_indexable_mq2lloyd_u,
+        "must reach the indexed MoE decode arms"
+    );
+    assert!(r.use_gpu_topk, "k=8 + indexable implies device-side top-K");
+    assert!(
+        !r.needs_x_rot_local,
+        "UNROTATED dtype must never request the FWHT rotation"
+    );
+}
+
+#[test]
+fn moe_res_mq2_lloyd_rotated_sibling_still_rotates() {
+    // Guard: adding the unrotated arm must not disable rotation for qt19.
+    let mut d = dtypes_all_mq4();
+    d.router = DType::F32;
+    d.experts_all_gate_up_mq4 = false;
+    d.routed_gate_up = DType::MQ2G256Lloyd;
+    d.routed_down = DType::MQ2G256Lloyd;
+    let r = MoeResolution::resolve(&d, 8);
+    assert!(
+        r.needs_x_rot_local,
+        "qt19 is FWHT-rotated and MUST still rotate"
+    );
+}
+
+#[test]
+fn moe_res_mixed_rotated_and_unrotated_experts_is_not_indexable() {
+    // A layer whose gate_up is rotated and whose down is not (or vice versa)
+    // has no coherent single rotation decision. It must fall out of the
+    // indexed path rather than silently picking one and corrupting the other.
+    let mut d = dtypes_all_mq4();
+    d.router = DType::F32;
+    d.experts_all_gate_up_mq4 = false;
+    d.routed_gate_up = DType::MQ2G256LloydU;
+    d.routed_down = DType::MQ2G256Lloyd;
+    let r = MoeResolution::resolve(&d, 8);
+    assert!(
+        !r.routed_indexable_mq2lloyd_u,
+        "rotated/unrotated mix must not resolve to the unrotated indexed arm"
+    );
+    assert!(
+        !r.use_gpu_topk,
+        "no coherent rotation decision, so no indexed decode at all"
+    );
+}
+
+#[test]
 fn moe_res_all_mq4_k8_uses_gpu_topk_and_xrot() {
     let r = MoeResolution::resolve(&dtypes_all_mq4(), 8);
     assert!(r.gate_side_mq4);
