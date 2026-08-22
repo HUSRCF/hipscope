@@ -1,0 +1,173 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Nick Woolmer
+// hipfire — see LICENSE and NOTICE in the project root.
+
+//! maple_coherence — load a Maple-Preview `.hfq`, prefill a prompt and greedily
+//! decode, printing the text.
+//!
+//! This is the coherence gate for the arch-15 port. An exactness number alone
+//! has never been sufficient evidence on this class of work: the packing can be
+//! bit-perfect while the forward pass rotates the wrong activation, applies
+//! RoPE on a NoPE layer, or normalises q/k in the wrong order — all of which
+//! produce a model that loads, runs at full speed, and emits garbage.
+//!
+//! Usage:
+//!   maple_coherence --model <model.hfq> [--prompt "..."] [--max-tokens N]
+//!                   [--dump-hidden <out.bin>]
+//!
+//! `--dump-hidden` writes the post-layer residual for the LAST prefill position
+//! (u32 n_layers, u32 hidden, then n_layers*hidden f32 LE) for per-layer cosine
+//! comparison against the HF reference — the method that localised the Bonsai
+//! double-norm bug to layer 0.
+
+use hipfire_arch_maple::bundle::load_maple_from_hfq;
+use hipfire_arch_maple::forward::decode_step;
+use hipfire_runtime::hfq::HfqFile;
+use std::path::Path;
+
+struct Args {
+    model: String,
+    prompt: String,
+    max_tokens: usize,
+    raw: bool,
+}
+
+fn parse_args() -> Args {
+    let argv: Vec<String> = std::env::args().collect();
+    let mut model = None;
+    let mut prompt = "The capital of France is".to_string();
+    let mut max_tokens = 64usize;
+    let mut raw = false;
+    let mut i = 1;
+    while i < argv.len() {
+        match argv[i].as_str() {
+            "--model" => {
+                model = Some(argv[i + 1].clone());
+                i += 2;
+            }
+            "--prompt" => {
+                prompt = argv[i + 1].clone();
+                i += 2;
+            }
+            "--max-tokens" => {
+                max_tokens = argv[i + 1].parse().expect("--max-tokens");
+                i += 2;
+            }
+            // Skip the ChatML frame and feed the prompt verbatim. Useful for a
+            // base-model continuation check.
+            "--raw" => {
+                raw = true;
+                i += 1;
+            }
+            other => panic!("unknown arg {other}"),
+        }
+    }
+    Args {
+        model: model.expect("--model <model.hfq> is required"),
+        prompt,
+        max_tokens,
+        raw,
+    }
+}
+
+fn main() {
+    let args = parse_args();
+    let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
+    let mut hfq = HfqFile::open(Path::new(&args.model)).expect("open model");
+    assert_eq!(
+        hfq.arch_id, 15,
+        "maple_coherence: expected arch_id 15, got {}",
+        hfq.arch_id
+    );
+
+    let max_seq = args.max_tokens + 512;
+    let mut b = load_maple_from_hfq(&mut hfq, &mut gpu, max_seq).expect("load maple bundle");
+    eprintln!(
+        "maple: hidden={} layers={} experts={}/{} moe_inter={} vocab={} eos={}",
+        b.config.hidden_size,
+        b.config.num_hidden_layers,
+        b.config.num_experts,
+        b.config.num_experts_per_tok,
+        b.config.moe_intermediate_size,
+        b.config.vocab_size,
+        b.eos_tok,
+    );
+
+    let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
+        .expect("tokenizer");
+
+    let text = if args.raw {
+        args.prompt.clone()
+    } else {
+        format!(
+            "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
+            args.prompt
+        )
+    };
+    let prompt_toks = tokenizer.encode(&text);
+    eprintln!("prompt: {} token(s)", prompt_toks.len());
+
+    // Prefill: one decode_step per prompt token (the correct, zero-risk
+    // baseline — a batched prefill is a separate follow-up).
+    let mut pos = 0u32;
+    let mut logits = Vec::new();
+    let t0 = std::time::Instant::now();
+    for &tok in &prompt_toks {
+        logits = decode_step(&b.config, &b.weights, &mut b.state, &mut gpu, tok, pos)
+            .expect("decode_step (prefill)");
+        pos += 1;
+    }
+    let prefill_s = t0.elapsed().as_secs_f64();
+    eprintln!(
+        "prefill: {:.2}s ({:.1} tok/s)",
+        prefill_s,
+        prompt_toks.len() as f64 / prefill_s
+    );
+
+    // Greedy decode.
+    let mut out = String::new();
+    let t1 = std::time::Instant::now();
+    let mut n_gen = 0usize;
+    for _ in 0..args.max_tokens {
+        let (best, _) =
+            logits
+                .iter()
+                .enumerate()
+                .fold((0usize, f32::NEG_INFINITY), |acc, (i, &v)| {
+                    if v > acc.1 {
+                        (i, v)
+                    } else {
+                        acc
+                    }
+                });
+        let tok = best as u32;
+        if tok == b.eos_tok {
+            eprintln!("[eos]");
+            break;
+        }
+        let piece = tokenizer.decode(&[tok]);
+        out.push_str(&piece);
+        print!("{piece}");
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        n_gen += 1;
+        logits = decode_step(&b.config, &b.weights, &mut b.state, &mut gpu, tok, pos)
+            .expect("decode_step (decode)");
+        pos += 1;
+    }
+    let dec_s = t1.elapsed().as_secs_f64();
+    println!();
+    eprintln!(
+        "decode: {n_gen} tok in {dec_s:.2}s ({:.1} tok/s)",
+        n_gen as f64 / dec_s.max(1e-9)
+    );
+
+    // A model that emits the same token forever is the classic
+    // wrong-forward-pass signature; call it out rather than letting a human
+    // eyeball a wall of repeats.
+    let distinct: std::collections::HashSet<char> = out.chars().collect();
+    if n_gen >= 8 && distinct.len() <= 2 {
+        eprintln!("WARNING: output is degenerate ({} distinct chars) — this is what a wrong rotation / RoPE-on-NoPE-layer / QK-norm-order bug looks like", distinct.len());
+        std::process::exit(3);
+    }
+}

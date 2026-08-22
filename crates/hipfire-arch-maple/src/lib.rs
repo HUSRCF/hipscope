@@ -32,10 +32,14 @@
 //! plus the scatter/permute/combine suite), and MQ2G256LloydU shares
 //! MQ2-Lloyd's 72 B/group layout byte-for-byte so every existing kernel binds.
 
+pub mod bundle;
+pub mod carrier;
 pub mod config;
 pub mod forward;
 pub mod maple;
 
+pub use bundle::{load_maple_from_hfq, MapleBundle};
+pub use carrier::load_maple_bundle;
 pub use forward::decode_step;
 
 pub use config::{MapleConfig, MapleLayerType, MAPLE_SWIGLU_CLAMP};
