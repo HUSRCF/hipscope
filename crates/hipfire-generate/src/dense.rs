@@ -7420,3 +7420,487 @@ pub fn generate_qwen2(
         ClientTerminalDecision::Abort => {}
     }
 }
+
+/// Maple-Preview generate path (arch_id=15, hipfire-arch-maple).
+///
+/// Shaped after [`generate_qwen2`], NOT after `generate_cohere2moe`: Maple has
+/// no bespoke marker state machine. It is plain ChatML with `<|im_end|>`
+/// (151645) as end-of-turn, so the qwen2 shape — get tokenizer, downcast the
+/// bundle, apply the chat template, prefill, greedy-decode to EOS — is the
+/// whole job. The ~720-line cohere2moe body is almost entirely Cohere's
+/// `<|START_THINKING|>` / `<|START_ACTION|>` handling, which would be dead
+/// weight here.
+///
+/// Maple IS a reasoning model: it emits `<think>` … `</think>` before its
+/// answer. That is deliberately NOT special-cased — the markers are ordinary
+/// vocabulary items and stream through as text like any other token. Maple's
+/// `Architecture::eos_filter_overrides` is unimplemented and no `EosFilter` is
+/// constructed on this path, so no think-tag stripping or `max_think_tokens`
+/// budget applies — the route's dispatch arm discards `max_think_tokens` the
+/// same way the Qwen2 arm does.
+///
+/// Prefill uses the BATCHED path — `forward_batch` over
+/// `prefill_chunks(n, MAPLE_PREFILL_CHUNK)` — guarded by
+/// [`hipfire_arch_maple::forward::forward_batch_supported`], with the per-token
+/// `decode_step` loop as the fallback. That guard is not decoration:
+/// `forward_batch_supported` is false for any checkpoint whose attention/expert
+/// weights are not uniformly qt51 or whose router has no F16 mirror, and the
+/// chunking is mandatory because `forward_batch` ERRORS above
+/// `MAPLE_PREFILL_MAX_B` rather than splitting itself.
+///
+/// Scope, matching the qwen2 precedent: greedy argmax only. `temp` / `top_p` /
+/// `repeat_penalty` / `stop` are accepted and not honoured — no sampler is
+/// wired for arch 15. Tools are not offered (`GenerationRoute::supports_tools`
+/// excludes `MapleAr`).
+///
+/// Conversation handling is STATELESS: every turn cold-resets the KV and
+/// re-prefills the full rendered conversation from position 0, which is the
+/// same "Jinja renders the FULL conversation every turn" contract the default
+/// AR body documents. This deliberately does NOT follow `generate_qwen2`'s
+/// append-and-only-reset-on-overflow bookkeeping. That scheme leaks: two
+/// unrelated HTTP requests share one `MapleState`, so turn N reads turn N-1's
+/// KV as context even though the OpenAI wire carries no such history. Verified
+/// on this branch before the fix — an independent second request answered
+/// "Zebedee." to "what was the word I asked you to remember?". A chat server
+/// cannot ship that. There is no CASK eviction for arch 15
+/// (`MapleBundle::kv_cache_mut` returns `None`), and the batched prefill makes
+/// the full re-prefill affordable, so a cold reset is both the correct and the
+/// cheap option. `m.seq_pos` mirrors `MapleState::n_tokens` for daemon
+/// bookkeeping only; nothing reads it back as a resume point.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_maple(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+    _temp: f32,
+    _top_p: f32,
+    max_tokens: usize,
+    _repeat_penalty: f32,
+    _repeat_window: usize,
+) {
+    let tokenizer = match m.tokenizer.as_ref() {
+        Some(t) => t,
+        None => {
+            emit_active_attempt_error(
+                stdout,
+                Some(id),
+                "tokenizer not loaded",
+                "validation",
+                false,
+                false,
+            );
+            let _ = stdout.flush();
+            return;
+        }
+    };
+    let bundle = match m.state.as_mut().and_then(|s| {
+        (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_maple::MapleBundle>()
+    }) {
+        Some(b) => b,
+        _ => {
+            emit_active_attempt_error(
+                stdout,
+                Some(id),
+                "maple state missing on arch_id=15 generate",
+                "validation",
+                false,
+                false,
+            );
+            let _ = stdout.flush();
+            return;
+        }
+    };
+    let cfg = &bundle.config;
+    let weights = &bundle.weights;
+    let state = &mut bundle.state;
+    let eos_tok = bundle.eos_tok;
+
+    // Render the WHOLE conversation, not just the newest user turn: prior turns
+    // reach the model through the prompt and never through retained KV, which
+    // is what makes the cold reset below safe.
+    //
+    // The published Maple-Preview `.hfq` carries NO `chat_template` in its
+    // metadata (verified by byte-scanning the container: the literal
+    // "chat_template" does not occur), so `m.chat_template` is None and the
+    // hand-rolled ChatML path is the LIVE path here, not a fallback. It must
+    // therefore replay history itself — an earlier revision that framed only
+    // `prompt` made the model answer "I don't have memory of previous
+    // conversations" to a request whose `messages` array plainly contained the
+    // answer. The Jinja branch is kept for a future repack that does embed a
+    // template. `tools` is always None: `GenerationRoute::MapleAr` is excluded
+    // from `supports_tools`, so `generate()`'s tools preflight has already
+    // denied any tools request before reaching here.
+    let prompt_ids = if let Some(template) = m.chat_template.as_ref() {
+        let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
+            tokenizer,
+            template,
+            system: system_prompt,
+            user: prompt,
+            enable_thinking: true,
+            bos_token: None,
+            reasoning_strength: None,
+            reasoning_effort: None,
+        };
+        let rendered = match messages_history {
+            Some(history) => frame.render_messages(history, None, None),
+            None => frame.render(),
+        };
+        match rendered {
+            Ok(rendered) => tokenizer.encode(&rendered),
+            Err(e) => {
+                eprintln!(
+                    "[daemon] maple jinja render failed ({e}) — falling back to ChatML frame"
+                );
+                tokenizer.encode(&maple_chatml_frame(system_prompt, prompt, messages_history))
+            }
+        }
+    } else {
+        tokenizer.encode(&maple_chatml_frame(system_prompt, prompt, messages_history))
+    };
+    if prompt_ids.is_empty() {
+        emit_active_attempt_error(
+            stdout,
+            Some(id),
+            "empty prompt after tokenize",
+            "validation",
+            false,
+            false,
+        );
+        let _ = stdout.flush();
+        return;
+    }
+
+    // Cold reset EVERY turn. The rendered prompt above already carries the full
+    // conversation, so retaining the previous turn's KV would not add context —
+    // it would only let an unrelated request's tokens leak into this one (the
+    // "Zebedee" leak in the fn doc). Reset first, then size-check against a
+    // known-empty cache so the check is about this turn alone.
+    if let Err(e) = state.reset(gpu) {
+        emit_error_with_id(stdout, id, format!("maple state reset failed: {e}"));
+        let _ = stdout.flush();
+        return;
+    }
+    m.seq_pos = 0;
+    m.conversation_tokens.clear();
+
+    // Capacity guard. No eviction on arch_id=15, and the cache is empty, so a
+    // turn that still does not fit cannot be rescued — prefilling it would
+    // write past the KV allocation. `decode_step` fails closed on that, but a
+    // clean typed error beats a mid-stream arch error.
+    if prompt_ids
+        .len()
+        .saturating_add(max_tokens)
+        .saturating_add(1)
+        > state.max_seq
+    {
+        let cap = state.max_seq;
+        emit_active_attempt_error(
+            stdout,
+            Some(id),
+            &format!(
+                "prompt exceeds context capacity: prompt={} + max_tokens={} > capacity={} \
+                 — reload model with a larger max_seq",
+                prompt_ids.len(),
+                max_tokens,
+                cap
+            ),
+            "context_length",
+            false,
+            false,
+        );
+        let _ = stdout.flush();
+        return;
+    }
+
+    let t0 = Instant::now();
+    // Always 0 after the reset above; named rather than inlined so the
+    // position arithmetic below reads the same as the arch crate's harness.
+    let base_pos = state.n_tokens;
+
+    // Prefill. Batched when the checkpoint's tier supports it (12.6x on this
+    // checkpoint), per-token otherwise. The fallback is not dead code.
+    let mut logits: Vec<f32> = Vec::new();
+    if hipfire_arch_maple::forward::forward_batch_supported(weights) {
+        for (start, len) in hipfire_arch_maple::batch::prefill_chunks(
+            prompt_ids.len(),
+            hipfire_arch_maple::batch::MAPLE_PREFILL_CHUNK,
+        ) {
+            match hipfire_arch_maple::forward::forward_batch(
+                cfg,
+                weights,
+                state,
+                gpu,
+                &prompt_ids[start..start + len],
+                base_pos + start,
+            ) {
+                Ok(l) => logits = l,
+                Err(e) => {
+                    emit_error_with_id(stdout, id, format!("maple batched prefill failed: {e}"));
+                    let _ = stdout.flush();
+                    return;
+                }
+            }
+        }
+    } else {
+        for (i, &tok) in prompt_ids.iter().enumerate() {
+            match hipfire_arch_maple::forward::decode_step(
+                cfg,
+                weights,
+                state,
+                gpu,
+                tok,
+                (base_pos + i) as u32,
+            ) {
+                Ok(l) => logits = l,
+                Err(e) => {
+                    emit_error_with_id(stdout, id, format!("maple prefill failed: {e}"));
+                    let _ = stdout.flush();
+                    return;
+                }
+            }
+        }
+    }
+    for &tok in &prompt_ids {
+        m.conversation_tokens.push(tok);
+    }
+    let t_prefill = Instant::now();
+    let prefill_s = t_prefill.duration_since(t0).as_secs_f64();
+
+    // Open the wire contract before any token can reach the client. The CLI's
+    // stream latch (`StreamContractError::PreStartEvent`) fail-closes on ANY
+    // event that precedes `gen_start` — and then `abort_and_drain_with_rx`
+    // blocks forever waiting for an `aborted`+`done` pair the daemon has
+    // already moved past. Symptom without this line is not an error message but
+    // a hung HTTP request: verified empirically on this branch before the fix.
+    // Errors raised ABOVE this point are still safe — the client special-cases
+    // a pre-start `error` and surfaces the daemon's reason — which is why this
+    // sits after the capacity guard and prefill, mirroring the DS4 call site.
+    //
+    // `contract_version` is `gen_start_contract_version_for_arch(15)`, i.e.
+    // `MapleCarrier::caps().semantic_contract_version` = None. Maple must NOT
+    // advertise semantic contract v2: it has no router-backed producer and
+    // `GenerationRoute::MapleAr` is excluded from `supports_tools`.
+    //
+    // `started_in_think` is false. Maple's template opens the assistant turn at
+    // `<|im_start|>assistant\n` and the model emits its own `<think>` token, so
+    // the stream begins OUTSIDE the reasoning span; claiming otherwise would
+    // mis-attribute the first visible tokens.
+    emit_gen_start(
+        stdout,
+        id,
+        false,
+        crate::common::gen_start_contract_version_for_arch(15),
+    );
+
+    // Decode. Greedy argmax over the CPU-side logits `forward_batch` /
+    // `decode_step` return — there is no `gpu.argmax_f32` step on this path
+    // because the arch crate already brings the row back to the host.
+    let mut generated_count: usize = 0;
+    let mut pos = (base_pos + prompt_ids.len()) as u32;
+    let mut next_tok = maple_argmax(&logits, cfg.vocab_size);
+    // `<|endoftext|>` (151643) is not Maple's declared eos — config.json says
+    // 151645 — but emitting it mid-chat is a terminal condition either way, and
+    // continuing past it produces garbage. Stop on both.
+    let eos_set: [u32; 2] = [eos_tok, 151643];
+    let mut hit_eos = false;
+
+    // Streaming UTF-8 reassembly. A per-token `tokenizer.decode(&[tok])` is
+    // WRONG on a byte-level BPE: one emoji or CJK character is several tokens,
+    // and decoding each in isolation runs `from_utf8_lossy` over half a code
+    // point, so the client receives U+FFFD replacement chars. Observed live —
+    // "Got it — Zebedee, acknowledged. \u{fffd}\u{fffd}\u{fffd}" — before this
+    // was added. Decode the whole run and emit only the delta's longest valid
+    // UTF-8 prefix, carrying any partial trailing code point into the next
+    // token. Mirrors the `decode_bytes` + `bytes_fed_to_filter` pattern the
+    // Qwen/LLaMA AR bodies use, minus the EosFilter that arch 15 has no
+    // overrides for.
+    let mut streamed_tokens: Vec<u32> = Vec::with_capacity(max_tokens);
+    let mut bytes_emitted: usize = 0;
+
+    loop {
+        if generated_count >= max_tokens {
+            break;
+        }
+        if eos_set.contains(&next_tok) {
+            hit_eos = true;
+            break;
+        }
+        // `<think>` / `</think>` are ordinary tokens here and stream through
+        // verbatim — see the fn doc.
+        streamed_tokens.push(next_tok);
+        let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
+        let pending = &all_bytes[bytes_emitted.min(all_bytes.len())..];
+        let valid_len = match std::str::from_utf8(pending) {
+            Ok(_) => pending.len(),
+            // Only a truncated final code point may be held back. Genuinely
+            // invalid bytes (error_len() is Some) must not be buffered forever
+            // — emit them lossily and move on, or the stream would stall.
+            Err(e) if e.error_len().is_none() => e.valid_up_to(),
+            Err(_) => pending.len(),
+        };
+        if valid_len > 0 {
+            let frag = String::from_utf8_lossy(&pending[..valid_len]).into_owned();
+            bytes_emitted += valid_len;
+            let envelope = serde_json::json!({
+                "type": "token",
+                "id": id,
+                "text": frag,
+                "attempt_id": active_attempt_id(),
+            });
+            let _ = writeln!(stdout, "{}", envelope);
+            let _ = stdout.flush();
+        }
+        m.conversation_tokens.push(next_tok);
+        generated_count += 1;
+
+        match hipfire_arch_maple::forward::decode_step(cfg, weights, state, gpu, next_tok, pos) {
+            Ok(l) => {
+                pos += 1;
+                next_tok = maple_argmax(&l, cfg.vocab_size);
+            }
+            Err(e) => {
+                emit_error_with_id(stdout, id, format!("maple decode_step failed: {e}"));
+                let _ = stdout.flush();
+                return;
+            }
+        }
+    }
+
+    // Flush any bytes still held back by the UTF-8 carry. Reaching here with a
+    // non-empty tail means the run ended (EOS or max_tokens) mid-code-point;
+    // dropping it would silently truncate the reply's last character.
+    if !streamed_tokens.is_empty() {
+        let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
+        if bytes_emitted < all_bytes.len() {
+            let frag = String::from_utf8_lossy(&all_bytes[bytes_emitted..]).into_owned();
+            bytes_emitted = all_bytes.len();
+            let envelope = serde_json::json!({
+                "type": "token",
+                "id": id,
+                "text": frag,
+                "attempt_id": active_attempt_id(),
+            });
+            let _ = writeln!(stdout, "{}", envelope);
+            let _ = stdout.flush();
+        }
+    }
+    let _ = bytes_emitted;
+
+    // Daemon bookkeeping: seq_pos matches MapleState's internal cursor.
+    m.seq_pos = state.n_tokens;
+
+    let t_end = Instant::now();
+    let decode_s = t_end.duration_since(t_prefill).as_secs_f64();
+    let total_s = t_end.duration_since(t0).as_secs_f64();
+    let rate = |n: usize, s: f64| if s > 0.0 { n as f64 / s } else { 0.0 };
+    let tok_s = rate(generated_count, total_s);
+    let prefill_tok_s = rate(prompt_ids.len(), prefill_s);
+    let decode_tok_s = rate(generated_count, decode_s);
+    let pending_done = serde_json::json!({
+        "type": "done",
+        "id": id,
+        "tokens": generated_count,
+        "tok_s": (tok_s * 10.0).round() / 10.0,
+        "prefill_tokens": prompt_ids.len(),
+        "prefill_ms": ((prefill_s * 1000.0) * 10.0).round() / 10.0,
+        "prefill_tok_s": (prefill_tok_s * 10.0).round() / 10.0,
+        "decode_tok_s": (decode_tok_s * 10.0).round() / 10.0,
+        "ttft_ms": ((prefill_s * 1000.0) * 10.0).round() / 10.0,
+        "total_ms": ((total_s * 1000.0) * 10.0).round() / 10.0,
+        // Report the truth: "stop" only when a real end-of-turn token landed.
+        // Defaulting to "stop" (what `openai_finish_reason` does for a missing
+        // field) would make a truncated reply look like a complete one.
+        "finish_reason": if hit_eos { "stop" } else { "length" },
+        "attempt_id": active_attempt_id(),
+    });
+    match await_client_terminal_commit(stdout, id, &pending_done) {
+        ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
+        ClientTerminalDecision::Abort => {}
+    }
+}
+
+/// Literal ChatML frame for Maple. This is the LIVE prompt path — the published
+/// `.hfq` embeds no `chat_template` — so it must be able to replay a full
+/// conversation, not just one turn.
+///
+/// Single-turn output is byte-identical to the frame the arch crate's coherence
+/// example uses, which is the frame arch-15 was verified coherent under:
+/// `<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n`.
+///
+/// When `history` is present it is authoritative and `user` is ignored — the
+/// daemon derives `prompt` from the last user message of the same array, so
+/// appending `user` again would duplicate the final turn.
+///
+/// Prior assistant turns are replayed from `content` only. `reasoning_content`
+/// is deliberately dropped: Maple emits `<think>` … `</think>` fresh each turn,
+/// and feeding a previous turn's reasoning back is off-distribution (the same
+/// convention the Qwen3-family templates use).
+fn maple_chatml_frame(
+    system: Option<&str>,
+    user: &str,
+    history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+) -> String {
+    use hipfire_runtime::prompt_frame::Role;
+    let mut s = String::new();
+    let mut turn = |role: &str, content: &str, out: &mut String| {
+        out.push_str("<|im_start|>");
+        out.push_str(role);
+        out.push('\n');
+        out.push_str(content);
+        out.push_str("<|im_end|>\n");
+    };
+    match history.filter(|h| !h.is_empty()) {
+        Some(h) => {
+            // A system message supplied out-of-band still has to lead when the
+            // history array does not already carry one.
+            let has_system = h.iter().any(|msg| msg.role == Role::System);
+            if !has_system {
+                if let Some(sys) = system.filter(|t| !t.trim().is_empty()) {
+                    turn("system", sys, &mut s);
+                }
+            }
+            for msg in h {
+                let role = match msg.role {
+                    Role::System => "system",
+                    Role::User => "user",
+                    Role::Assistant => "assistant",
+                    // Maple has no tool protocol; surface a tool result as a
+                    // user-visible observation rather than inventing a role
+                    // token the model never saw in training.
+                    Role::Tool => "user",
+                };
+                turn(role, &msg.content, &mut s);
+            }
+        }
+        None => {
+            if let Some(sys) = system.filter(|t| !t.trim().is_empty()) {
+                turn("system", sys, &mut s);
+            }
+            turn("user", user, &mut s);
+        }
+    }
+    s.push_str("<|im_start|>assistant\n");
+    s
+}
+
+/// Greedy argmax over the host-side logits row, bounded by `vocab_size`.
+///
+/// The bound matters: the lm_head output row can be padded past `vocab_size`
+/// and an argmax over the padding can return an id the tokenizer has no entry
+/// for.
+fn maple_argmax(logits: &[f32], vocab_size: usize) -> u32 {
+    let n = vocab_size.min(logits.len());
+    let mut best = 0usize;
+    let mut best_v = f32::NEG_INFINITY;
+    for (i, &v) in logits.iter().take(n).enumerate() {
+        if v > best_v {
+            best_v = v;
+            best = i;
+        }
+    }
+    best as u32
+}
