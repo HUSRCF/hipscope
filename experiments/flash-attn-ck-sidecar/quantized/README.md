@@ -117,6 +117,12 @@ same eight greedy token IDs and decode remained neutral at approximately
 `35.2 tok/s`. Compact evidence and the exact reproduction command are under
 `results/beta_w7900_pp8192_ab_20260823/`.
 
+After migrating the complete packed-MQ4 production stack into the same beta
+branch, a new three-pair PP8192 run measured `748.4 -> 1221.5 tok/s`, a
+**1.6321x** paired-median improvement with 3/3 positive pairs and exact greedy
+token-ID agreement. This is the retained full-stack beta result; compact
+evidence is under `results/beta_w7900_pp8192_fullopt_ab_20260823/`.
+
 A follow-up replaced only the staged dense D256 `M64/N64` CK recipe with
 `M64/N32`. Fifteen alternating process pairs measured a stable 1.0561x
 aggregate attention-local gain, with per-K results from 1.0320x to 1.0748x.
