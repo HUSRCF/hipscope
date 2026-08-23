@@ -406,10 +406,11 @@ fn dump_layer_hidden(
 /// MQ2-Lloyd expert GEMVs with the clamped SwiGLU between them.
 ///
 /// `x` is the post-attention RMSNorm output `[hidden]` and `h` is the residual
-/// row `[hidden]` the down-projection atomically accumulates into. Decode passes
-/// `&state.normed` / `&state.h`. Everything else (router scratch, top-k buffers,
-/// the expert activation batch) is single-row scratch, which is why this must
-/// stay strictly one token per call. Batched prefill uses `moe_block_batched`.
+/// row `[hidden]` the down-projection accumulates into — exactly once, by
+/// whichever `DownMode` is active. Decode passes `&state.normed` / `&state.h`.
+/// Everything else (router scratch, top-k buffers, the expert activation batch,
+/// and `down_expanded`) is single-row scratch, which is why this must stay
+/// strictly one token per call. Batched prefill uses `moe_block_batched`.
 #[allow(clippy::too_many_arguments)]
 fn moe_block_row(
     cfg: &MapleConfig,
@@ -502,23 +503,118 @@ fn moe_block_row(
     )
     .map_err(|e| format!("maple L{l}: clamped swiglu: {e:?}"))?;
 
-    // down: atomic, weighted, SELF-COMBINING residual GEMV — one launch does
-    // down → * topk_weight[krank] → atomicAdd into `h`. There is deliberately
-    // NO separate combine after this; adding one double-counts every layer.
-    gpu.deepseek4_gemv_mq2g256_lloyd_moe_down_residual_scaled_indexed(
-        &m.expert_down_ptrs,
-        &state.topk_indices,
-        &state.topk_weights,
-        &state.act_batch,
-        h,
-        hidden,
-        moe_inter,
-        k_top,
-        false,
-    )
-    .map_err(|e| format!("maple L{l}: down: {e:?}"))?;
+    // down: see `DownMode` — either the incumbent atomic self-combining GEMV or
+    // the atomic-free expanded write + combine pair.
+    match down_mode() {
+        DownMode::Atomic => {
+            // atomic, weighted, SELF-COMBINING residual GEMV — one launch does
+            // down → * topk_weight[krank] → atomicAdd into `h`. There is
+            // deliberately NO separate combine after this; adding one
+            // double-counts every layer.
+            gpu.deepseek4_gemv_mq2g256_lloyd_moe_down_residual_scaled_indexed(
+                &m.expert_down_ptrs,
+                &state.topk_indices,
+                &state.topk_weights,
+                &state.act_batch,
+                h,
+                hidden,
+                moe_inter,
+                k_top,
+                false,
+            )
+            .map_err(|e| format!("maple L{l}: down: {e:?}"))?;
+        }
+        mode @ (DownMode::Expanded | DownMode::ExpandedNoCombine) => {
+            // Atomic-free: one dot per (row, krank) into its OWN cell of
+            // `down_expanded` [k_top × hidden] — no cross-rank contention and
+            // no `topk_weights` scale, which `moe_down_combine_k8_batched`
+            // applies during the fold.
+            gpu.deepseek4_gemv_mq2g256_lloyd_moe_down_expanded_k4(
+                &m.expert_down_ptrs,
+                &state.topk_indices,
+                &state.act_batch,
+                &state.down_expanded,
+                hidden,
+                moe_inter,
+                k_top,
+                1,
+            )
+            .map_err(|e| format!("maple L{l}: down expanded: {e:?}"))?;
+            // The combine does `x_residual[col] += Σ_k w[k]·out[k][col]`, i.e.
+            // it accumulates into the residual EXACTLY ONCE — the same net
+            // effect as the self-combining kernel's atomicAdd, so this replaces
+            // that kernel rather than following it.
+            if mode == DownMode::Expanded {
+                gpu.moe_down_combine_k8_batched(
+                    &state.down_expanded,
+                    &state.topk_weights,
+                    h,
+                    hidden,
+                    k_top,
+                    1,
+                )
+                .map_err(|e| format!("maple L{l}: down combine: {e:?}"))?;
+            }
+        }
+    }
 
     Ok(())
+}
+
+/// Which down-projection dispatch `moe_block_row` uses. Default `Expanded`;
+/// override with `HIPFIRE_MAPLE_DOWN=atomic`.
+///
+/// ## The anomaly this exists to fix
+///
+/// The MoE down GEMV cost MORE time than gate_up while reading HALF the bytes —
+/// 36.0 vs 34.4 µs/call for 2.36 vs 4.72 MB, i.e. 66 vs 137 GB/s.
+/// `.superpowers/sdd/maple-decode-profile.md` attributed that to the atomic
+/// self-combining accumulate. **That attribution is wrong**, and this selector
+/// is how it was falsified — see `.superpowers/sdd/maple-moe-down.md`.
+///
+/// The real cause is the K=512 shape. `quads = (K/256) >> 2` is ZERO at
+/// `moe_intermediate = 512`, so the K4-unrolled main loop of
+/// `gemv_mq2g256_lloyd_moe_down_indexed.hip` NEVER RUNS: both groups fall into
+/// `TAIL_LOAD_AND_DOT`, which restages the codebook with 4 of 32 lanes behind
+/// its OWN `__syncthreads`, once per group. Down therefore pays two barriers
+/// per workgroup for 16 FMAs/lane where gate_up (K = hidden = 2048) pays two
+/// for 64 — 4× the barrier-and-restage overhead per byte, on 2× the
+/// workgroups.
+///
+/// Atomics were ruled out by two independent measurements: `HIPFIRE_MQ2_DOWN_ROWS=4`
+/// holds the atomic count (16384) and the per-address contention (8-way) EXACTLY
+/// constant and still cuts the kernel to 24.0 µs, and the atomic-free
+/// `Expanded` arm below lands within ~1% of it. The atomic costs ≈0.
+///
+/// `Expanded` is what ships because it is Maple-local and bit-reproducible; the
+/// row-tiled kernel is marginally faster but is a SHARED default (DS4, MiniMax)
+/// and was measured to be genuinely non-reproducible run to run.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DownMode {
+    /// Incumbent: `..._down_residual_scaled_k8_indexed`, one launch,
+    /// `atomicAdd(&h[row], w[krank] * acc)`. 36.0 µs/call.
+    Atomic,
+    /// DEFAULT. `..._down_expanded_k4` → `moe_down_combine_k8_batched`. Two
+    /// launches, no atomics, deterministic fold order. 26.1 + 2.4 µs/call, and
+    /// +1.6% end-to-end decode over `Atomic` in 10 of 10 paired reps despite
+    /// the extra dispatch.
+    Expanded,
+    /// MEASUREMENT ONLY — the expanded GEMV with the combine OMITTED. The MoE
+    /// contributes NOTHING to the residual in this mode, so the model emits
+    /// garbage; it exists solely to price the atomic in isolation and must
+    /// never be used for a quality number.
+    ExpandedNoCombine,
+}
+
+fn down_mode() -> DownMode {
+    static M: std::sync::OnceLock<DownMode> = std::sync::OnceLock::new();
+    *M.get_or_init(
+        || match std::env::var("HIPFIRE_MAPLE_DOWN").ok().as_deref() {
+            Some("atomic") => DownMode::Atomic,
+            Some("expanded-nocombine") => DownMode::ExpandedNoCombine,
+            _ => DownMode::Expanded,
+        },
+    )
 }
 
 // ───────────────────────── Batched prefill ─────────────────────────

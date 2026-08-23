@@ -604,7 +604,11 @@ pub struct MapleState {
     pub gate_batch: GpuTensor,    // [k_top*moe_inter]
     pub up_batch: GpuTensor,      // [k_top*moe_inter]
     pub act_batch: GpuTensor,     // [k_top*moe_inter] clamped SwiGLU output
-    pub down_expanded: GpuTensor, // [k_top*hidden]
+    /// `[k_top*hidden]` — per-rank down-projection outputs, UNWEIGHTED.
+    /// `DownMode::Expanded` (the decode default) writes one cell per
+    /// `(krank, row)` here and `moe_down_combine_k8_batched` folds the k_top
+    /// slices into `h` with `topk_weights` applied. Unused by `DownMode::Atomic`.
+    pub down_expanded: GpuTensor,
 
     // head
     pub final_norm_buf: GpuTensor,
