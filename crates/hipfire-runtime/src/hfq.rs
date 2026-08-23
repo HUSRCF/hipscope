@@ -73,7 +73,12 @@ impl HfqFile {
             return CacheWarmerGuard::empty();
         }
         const CHUNK: usize = 16 << 20;
-        const THREADS: usize = 4;
+        // Measured 2026-08-23 on gfx1100 + btrfs md0, time-to-99%-resident for
+        // a 5.3 GB mq4 after drop_caches: 4 threads 3.69 GB/s, 8 threads
+        // 4.58 GB/s, 12 threads 5.00 GB/s (plateau = array sequential
+        // ceiling). 8 captures most of the win without a small army of
+        // threads competing with the upload thread.
+        const THREADS: usize = 8;
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let next = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let path = self.path.clone();
