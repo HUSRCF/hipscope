@@ -2946,6 +2946,22 @@ fn contiguous_tensor_span<'a>(hfq: &'a HfqFile, names: &[&str], stride: usize) -
     hfq.data_range(first.data_offset, expect - first.data_offset)
 }
 
+/// Memoized [`HfqFile::mostly_page_cached`] — the probe maps + mincores the
+/// whole multi-GB model file (~0.4 s), far too expensive to run per layer.
+fn model_pages_resident(hfq: &HfqFile) -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static CACHED: AtomicU8 = AtomicU8::new(0); // 0 unknown, 1 resident, 2 not
+    match CACHED.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let resident = hfq.mostly_page_cached();
+            CACHED.store(if resident { 1 } else { 2 }, Ordering::Relaxed);
+            resident
+        }
+    }
+}
+
 fn try_load_packed_mq4_experts(
     hfq: &HfqFile,
     gpu: &mut Gpu,
@@ -3022,7 +3038,7 @@ fn try_load_packed_mq4_experts(
     // an evicted cache soft-faults serially inside the copy loop (~0.25 GB/s
     // off disk), while the parallel-pread fallback reads with multiple lanes.
     let zero_copy_ok =
-        matches!((gate_up_contig, down_contig), (Some(_), Some(_))) && hfq.mostly_page_cached();
+        matches!((gate_up_contig, down_contig), (Some(_), Some(_))) && model_pages_resident(hfq);
     let (gate_up_host, down_host) = if zero_copy_ok {
         let (Some(gu), Some(dn)) = (gate_up_contig, down_contig) else {
             unreachable!("zero_copy_ok implies both spans resolved");
