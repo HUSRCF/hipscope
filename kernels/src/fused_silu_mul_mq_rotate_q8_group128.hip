@@ -19,10 +19,10 @@ struct block_q8_1_mmq {
 
 static_assert(sizeof(block_q8_1_mmq) == 144, "bad block_q8_1_mmq size");
 
-extern "C" __launch_bounds__(32, 16)
-__global__ void fused_silu_mul_mq_rotate_q8_group128(
-    const float* __restrict__ gate,
-    const float* __restrict__ up,
+template <typename InputT>
+__device__ __forceinline__ void fused_silu_mul_mq_rotate_q8_group128_body(
+    const InputT* __restrict__ gate,
+    const InputT* __restrict__ up,
     const float* __restrict__ signs1,
     const float* __restrict__ signs2,
     block_q8_1_mmq* __restrict__ out_q8,
@@ -39,8 +39,8 @@ __global__ void fused_silu_mul_mq_rotate_q8_group128(
     const int base = group * 256 + d0;
 
     #define SILU_MUL_AT(i) ({ \
-        const float _g = gate[batch_off + base + (i)]; \
-        const float _u = up[batch_off + base + (i)]; \
+        const float _g = (float)gate[batch_off + base + (i)]; \
+        const float _u = (float)up[batch_off + base + (i)]; \
         (_g / (1.0f + expf(-_g)) * _u) * signs1[d0 + (i)]; \
     })
     float v0 = SILU_MUL_AT(0);
@@ -122,4 +122,32 @@ __global__ void fused_silu_mul_mq_rotate_q8_group128(
     if ((lane16 & 3) == 0) {
         out->ds4[lane16 >> 2] = make_half2((_Float16)d, (_Float16)sum);
     }
+}
+
+extern "C" __launch_bounds__(32, 16)
+__global__ void fused_silu_mul_mq_rotate_q8_group128(
+    const float* __restrict__ gate,
+    const float* __restrict__ up,
+    const float* __restrict__ signs1,
+    const float* __restrict__ signs2,
+    block_q8_1_mmq* __restrict__ out_q8,
+    int K,
+    int N
+) {
+    fused_silu_mul_mq_rotate_q8_group128_body(
+        gate, up, signs1, signs2, out_q8, K, N);
+}
+
+extern "C" __launch_bounds__(32, 16)
+__global__ void fused_silu_mul_mq_rotate_q8_group128_f16(
+    const half* __restrict__ gate,
+    const half* __restrict__ up,
+    const float* __restrict__ signs1,
+    const float* __restrict__ signs2,
+    block_q8_1_mmq* __restrict__ out_q8,
+    int K,
+    int N
+) {
+    fused_silu_mul_mq_rotate_q8_group128_body(
+        gate, up, signs1, signs2, out_q8, K, N);
 }
