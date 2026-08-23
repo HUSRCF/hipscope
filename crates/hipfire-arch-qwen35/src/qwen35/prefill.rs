@@ -2176,10 +2176,16 @@ fn try_run_hfq4_group128_swiglu_down(
         || w_down.m != 5_120
         || w_down.k != 17_408
         || n % 256 != 0
+        || gate.dtype != up.dtype
+        || !matches!(gate.dtype, DType::F32 | DType::F16)
     {
         return Ok(false);
     }
-    let xq = gpu.fused_silu_mul_rotate_mq_q8_group128_batched(gate, up, w_down.k, n)?;
+    let xq = if gate.dtype == DType::F16 {
+        gpu.fused_silu_mul_rotate_mq_q8_group128_f16_batched(gate, up, w_down.k, n)?
+    } else {
+        gpu.fused_silu_mul_rotate_mq_q8_group128_batched(gate, up, w_down.k, n)?
+    };
     gpu.gemm_hfq4g256_mmq_add_prequant_x256y64_perm_group128(
         &w_down.buf,
         xq,
@@ -2189,6 +2195,28 @@ fn try_run_hfq4_group128_swiglu_down(
         n,
     )?;
     Ok(true)
+}
+
+#[inline]
+fn use_f16_ffn_intermediate(
+    pbs: &PrefillBatchScratch,
+    w_gate: &WeightTensor,
+    w_up: &WeightTensor,
+    w_down: &WeightTensor,
+    n: usize,
+) -> bool {
+    pbs.gate_ffn_f16_batch.is_some()
+        && pbs.up_f16_batch.is_some()
+        && n % 256 == 0
+        && w_gate.gpu_dtype == DType::MQ4G256
+        && w_up.gpu_dtype == DType::MQ4G256
+        && w_down.gpu_dtype == DType::MQ4G256
+        && w_gate.m == 17_408
+        && w_up.m == 17_408
+        && w_gate.k == 5_120
+        && w_down.m == 5_120
+        && w_down.k == 17_408
+        && w_down.awq_scale.is_none()
 }
 
 /// #397 Ship 5.2 slice 2: route a single BATCHED-prefill FUSED gate+up GEMM
@@ -4268,6 +4296,14 @@ fn batch_chunk_delta_net_ffn(
                     )?;
                 }
 
+                let use_f16_ffn = use_f16_ffn_intermediate(
+                    pbs,
+                    &layer.w_gate,
+                    &layer.w_up,
+                    &layer.w_down,
+                    n,
+                );
+
                 // Batched gate+up projection.
                 // #397 Ship 5.2 slice 2: fused gate+up dtypes → FusedQkvFamily
                 // (batched-prefill gate+up variant) via run_fused_gate_up_key.
@@ -4372,6 +4408,17 @@ fn batch_chunk_delta_net_ffn(
                         layer.w_gate.k,
                         n,
                     )?;
+                } else if use_f16_ffn {
+                    gpu.gemm_gate_up_hfq4g256_group128_f16_intermediate(
+                        &layer.w_gate.buf,
+                        &layer.w_up.buf,
+                        &pbs.x_rot_batch,
+                        pbs.gate_ffn_f16_batch.as_ref().unwrap(),
+                        pbs.up_f16_batch.as_ref().unwrap(),
+                        layer.w_gate.m,
+                        layer.w_gate.k,
+                        n,
+                    )?;
                 } else {
                     run_fused_gate_up_key(
                         gpu,
@@ -4409,13 +4456,16 @@ fn batch_chunk_delta_net_ffn(
                 let w_down_is_fp4 =
                     matches!(layer.w_down.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
                 let w_down_is_q8 = matches!(layer.w_down.gpu_dtype, DType::Q8_0);
+                let (gate, up) = if use_f16_ffn {
+                    (
+                        pbs.gate_ffn_f16_batch.as_ref().unwrap(),
+                        pbs.up_f16_batch.as_ref().unwrap(),
+                    )
+                } else {
+                    (&pbs.gate_ffn_batch, &pbs.up_batch)
+                };
                 let direct_group128_down = try_run_hfq4_group128_swiglu_down(
-                    gpu,
-                    &layer.w_down,
-                    &pbs.gate_ffn_batch,
-                    &pbs.up_batch,
-                    &pbs.x_batch,
-                    n,
+                    gpu, &layer.w_down, gate, up, &pbs.x_batch, n,
                 )?;
                 if !direct_group128_down && w_down_is_mq {
                     // F2: AWQ-aware silu_mul+rotate for w_down input.
@@ -5147,6 +5197,13 @@ fn batch_chunk_full_attn_ffn(
                         config.norm_eps,
                     )?;
                 }
+                let use_f16_ffn = use_f16_ffn_intermediate(
+                    pbs,
+                    &layer.w_gate,
+                    &layer.w_up,
+                    &layer.w_down,
+                    n,
+                );
                 // #397 Ship 5.2 slice 2: FA-FFN fused gate+up → FusedQkvFamily
                 // (batched-prefill gate+up variant), mirroring the LA-FFN block
                 // above. Q8-non-WMMA stays as two plain GEMMs; HFQ3 WMMA-vs-base
@@ -5248,6 +5305,17 @@ fn batch_chunk_full_attn_ffn(
                         layer.w_gate.k,
                         n,
                     )?;
+                } else if use_f16_ffn {
+                    gpu.gemm_gate_up_hfq4g256_group128_f16_intermediate(
+                        &layer.w_gate.buf,
+                        &layer.w_up.buf,
+                        &pbs.x_rot_batch,
+                        pbs.gate_ffn_f16_batch.as_ref().unwrap(),
+                        pbs.up_f16_batch.as_ref().unwrap(),
+                        layer.w_gate.m,
+                        layer.w_gate.k,
+                        n,
+                    )?;
                 } else {
                     run_fused_gate_up_key(
                         gpu,
@@ -5278,13 +5346,16 @@ fn batch_chunk_full_attn_ffn(
                 let fa_w_down_is_fp4 =
                     matches!(layer.w_down.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
                 let fa_w_down_is_q8 = matches!(layer.w_down.gpu_dtype, DType::Q8_0);
+                let (gate, up) = if use_f16_ffn {
+                    (
+                        pbs.gate_ffn_f16_batch.as_ref().unwrap(),
+                        pbs.up_f16_batch.as_ref().unwrap(),
+                    )
+                } else {
+                    (&pbs.gate_ffn_batch, &pbs.up_batch)
+                };
                 let direct_group128_down = try_run_hfq4_group128_swiglu_down(
-                    gpu,
-                    &layer.w_down,
-                    &pbs.gate_ffn_batch,
-                    &pbs.up_batch,
-                    &pbs.x_batch,
-                    n,
+                    gpu, &layer.w_down, gate, up, &pbs.x_batch, n,
                 )?;
                 if !direct_group128_down && fa_w_down_is_mq {
                     // F2: AWQ-aware silu_mul+rotate for FullAttention w_down input.
