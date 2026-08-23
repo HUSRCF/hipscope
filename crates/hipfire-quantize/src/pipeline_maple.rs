@@ -28,7 +28,13 @@ use hipfire_quantize::float16::bf16_to_f32;
 use hipfire_quantize::safetensors_file::SafetensorsFile;
 
 use crate::hfq::{write_hfq, HfqTensor, QuantType, TensorSpill};
-use crate::maple::{maple_tensor_policy, pack_maple_tensor, MapleTensorPolicy};
+use crate::maple::{
+    maple_tensor_policy, pack_maple_head, pack_maple_tensor, MapleHeadQuant, MapleTensorPolicy,
+};
+
+/// The head tensor `--head-quant` applies to. Matched exactly, not by suffix:
+/// `word_embeddings.weight` is the same shape and must NOT be caught by this.
+const LM_HEAD_NAME: &str = "lm_head.weight";
 
 /// `arch_id` for Maple-Preview. See `docs/architecture-ids.md`.
 pub(crate) const ARCH_ID_MAPLE: u32 = 15;
@@ -47,6 +53,12 @@ pub(crate) struct MapleConvertStats {
     pub high_precision_bytes: u64,
     pub min_nonzero_frac: f64,
     pub max_nonzero_frac: f64,
+    /// Carrier actually used for `lm_head.weight`, and the byte counts either
+    /// side of it. Recorded so a model on disk can be told apart from a rebuild
+    /// with a different `--head-quant` without decoding a single weight.
+    pub head_quant: MapleHeadQuant,
+    pub head_bytes_src: u64,
+    pub head_bytes_packed: u64,
 }
 
 /// Widen a BF16 blob to f32.
@@ -68,6 +80,7 @@ fn convert_tensor(
     dtype: &str,
     shape: &[usize],
     bytes: &[u8],
+    head_quant: MapleHeadQuant,
     stats: &mut MapleConvertStats,
 ) -> Result<(HfqTensor, bool), String> {
     if dtype != "BF16" {
@@ -76,6 +89,47 @@ fn convert_tensor(
         ));
     }
     let hfq_shape: Vec<u32> = shape.iter().map(|&d| d as u32).collect();
+
+    // lm_head is intercepted BEFORE the name policy. The policy still calls it
+    // KeepHighPrecision — that stays true of the router, embeddings and norms,
+    // and those are untouched here — but the head has its own carrier flag
+    // because it is the only high-precision tensor whose size is a decode-speed
+    // problem rather than a fidelity one. Exact name match: `word_embeddings`
+    // is the same [151936, 2048] shape and must not be swept up (see
+    // `MapleHeadQuant`).
+    if name == LM_HEAD_NAME && head_quant != MapleHeadQuant::Bf16 {
+        let k = *shape
+            .last()
+            .ok_or_else(|| format!("{name}: head tensor has no dimensions"))?;
+        let vals = bf16_blob_to_f32(bytes)?;
+        let (data, quant_type, group_size) =
+            pack_maple_head(&vals, k, head_quant).map_err(|e| format!("{name}: {e}"))?;
+
+        stats.head_quant = head_quant;
+        stats.head_bytes_src = bytes.len() as u64;
+        stats.head_bytes_packed = data.len() as u64;
+        stats.high_precision_tensors += 1;
+        stats.high_precision_bytes += data.len() as u64;
+        eprintln!(
+            "maple:   lm_head {shape:?} {} → {} ({:.1} MB → {:.1} MB, {:.3} bpw)",
+            dtype,
+            head_quant.label(),
+            bytes.len() as f64 / 1e6,
+            data.len() as f64 / 1e6,
+            (data.len() * 8) as f64 / vals.len().max(1) as f64,
+        );
+        return Ok((
+            HfqTensor {
+                name: name.to_string(),
+                quant_type,
+                shape: hfq_shape,
+                group_size,
+                data,
+                spilled_len: 0,
+            },
+            false,
+        ));
+    }
 
     match maple_tensor_policy(name) {
         MapleTensorPolicy::Ternary => {
@@ -159,12 +213,14 @@ pub(crate) fn convert_maple_safetensors(
     input_dir: &Path,
     output: &Path,
     config_json: &str,
+    head_quant: MapleHeadQuant,
 ) -> Result<MapleConvertStats, String> {
     let shards = shard_paths(input_dir)?;
     eprintln!(
-        "maple: converting {} shard(s) from {}",
+        "maple: converting {} shard(s) from {} (head={})",
         shards.len(),
-        input_dir.display()
+        input_dir.display(),
+        head_quant.label(),
     );
 
     let spill_dir = output.parent().unwrap_or(Path::new("."));
@@ -183,7 +239,10 @@ pub(crate) fn convert_maple_safetensors(
     // stable across runs. The set is only for duplicate detection.
     let mut tensors: Vec<HfqTensor> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
-    let mut stats = MapleConvertStats::default();
+    let mut stats = MapleConvertStats {
+        head_quant,
+        ..Default::default()
+    };
 
     for shard in &shards {
         let sf =
@@ -199,8 +258,14 @@ pub(crate) fn convert_maple_safetensors(
             let (meta, bytes) = sf
                 .tensor_data(name)
                 .ok_or_else(|| format!("{name}: vanished from {}", shard.display()))?;
-            let (mut t, _is_ternary) =
-                convert_tensor(name, &meta.dtype, &meta.shape, bytes, &mut stats)?;
+            let (mut t, _is_ternary) = convert_tensor(
+                name,
+                &meta.dtype,
+                &meta.shape,
+                bytes,
+                head_quant,
+                &mut stats,
+            )?;
 
             // Spill immediately: 18,432 expert tensors would otherwise all sit
             // in RSS until write_hfq.
@@ -228,6 +293,18 @@ pub(crate) fn convert_maple_safetensors(
             "no ternary tensors found — this does not look like a Maple checkpoint".to_string(),
         );
     }
+    // A requested head carrier that never fired means the head was not seen
+    // under the name we match on. Falling through silently would emit a BF16
+    // head into a file NAMED for a quantized one — a stale artifact that looks
+    // exactly like a correct build and would quietly poison every measurement
+    // taken against it.
+    if head_quant != MapleHeadQuant::Bf16 && stats.head_bytes_packed == 0 {
+        return Err(format!(
+            "--head-quant {} was requested but no `{LM_HEAD_NAME}` tensor was found \
+             — refusing to write a BF16 head under a quantized name",
+            head_quant.label(),
+        ));
+    }
 
     // Provenance in the metadata, so a model on disk can be told apart from one
     // built by different code. Stale artifacts have burned this project before.
@@ -253,6 +330,15 @@ pub(crate) fn convert_maple_safetensors(
         "maple: per-tensor nonzero fraction {:.4}..{:.4}",
         stats.min_nonzero_frac, stats.max_nonzero_frac
     );
+    if stats.head_bytes_packed > 0 {
+        eprintln!(
+            "maple: lm_head carrier {} — {:.1} MB → {:.1} MB ({:.2}x fewer bytes read per token)",
+            stats.head_quant.label(),
+            stats.head_bytes_src as f64 / 1e6,
+            stats.head_bytes_packed as f64 / 1e6,
+            stats.head_bytes_src as f64 / stats.head_bytes_packed.max(1) as f64,
+        );
+    }
     Ok(stats)
 }
 
@@ -343,6 +429,13 @@ fn build_metadata(
             "ternary_weights": stats.ternary_weights,
             "nonzero_frac_min": stats.min_nonzero_frac,
             "nonzero_frac_max": stats.max_nonzero_frac,
+            // The head carrier is the one thing about this file that a
+            // consumer cannot infer from `carrier` above (which describes the
+            // ternary body). Stamped so a decode measurement can name the
+            // exact artifact it ran against.
+            "head_quant": stats.head_quant.label(),
+            "head_bytes_src": stats.head_bytes_src,
+            "head_bytes_packed": stats.head_bytes_packed,
         },
     });
     serde_json::to_string(&metadata).map_err(|e| format!("serialize metadata: {e}"))
@@ -378,6 +471,7 @@ mod tests {
             "BF16",
             &[2, 256],
             &bytes,
+            MapleHeadQuant::Bf16,
             &mut stats,
         )
         .unwrap();
@@ -400,6 +494,7 @@ mod tests {
             "BF16",
             &[1, 256],
             &bytes,
+            MapleHeadQuant::Bf16,
             &mut stats,
         )
         .unwrap();
@@ -421,6 +516,7 @@ mod tests {
             "BF16",
             &[1, 256],
             &bytes,
+            MapleHeadQuant::Bf16,
             &mut stats,
         )
         .unwrap_err();
@@ -431,6 +527,244 @@ mod tests {
         );
     }
 
+    /// DEFAULT IS UNCHANGED. The whole point of `--head-quant` defaulting to
+    /// `bf16` is that every existing convert keeps producing a byte-identical
+    /// head, so this pins the default arm rather than trusting the flag plumbing.
+    #[test]
+    fn head_stays_bf16_by_default() {
+        let vals: Vec<f32> = (0..512).map(|i| (i as f32 * 0.01).sin()).collect();
+        let bytes = bf16_bytes(&vals);
+        let mut stats = MapleConvertStats::default();
+        let (t, is_ternary) = convert_tensor(
+            "lm_head.weight",
+            "BF16",
+            &[2, 256],
+            &bytes,
+            MapleHeadQuant::Bf16,
+            &mut stats,
+        )
+        .unwrap();
+        assert!(!is_ternary);
+        assert_eq!(t.quant_type, QuantType::BF16);
+        assert_eq!(t.data, bytes, "default head must be carried verbatim");
+        assert_eq!(stats.head_bytes_packed, 0);
+    }
+
+    /// `--head-quant q8` and `mq4` reach the head and produce the expected
+    /// container. Sizes are asserted exactly: Q8_0 is 34 B/32 weights and
+    /// MQ4-Lloyd 160 B/256, and a wrong group_size in the header is the kind of
+    /// thing that decodes to plausible garbage rather than failing.
+    #[test]
+    fn head_quant_packs_the_head() {
+        let vals: Vec<f32> = (0..512).map(|i| (i as f32 * 0.01).sin()).collect();
+        let bytes = bf16_bytes(&vals);
+
+        for (how, qt, gs, want_len) in [
+            (MapleHeadQuant::Q8, QuantType::Q8F16, 32u32, 512 / 32 * 34),
+            (
+                MapleHeadQuant::Mq4,
+                QuantType::MQ4G256Lloyd,
+                256u32,
+                512 / 256 * 160,
+            ),
+        ] {
+            let mut stats = MapleConvertStats::default();
+            let (t, is_ternary) =
+                convert_tensor("lm_head.weight", "BF16", &[2, 256], &bytes, how, &mut stats)
+                    .unwrap();
+            assert!(!is_ternary, "{how:?}");
+            assert_eq!(t.quant_type, qt, "{how:?}");
+            assert_eq!(t.group_size, gs, "{how:?}");
+            assert_eq!(t.data.len(), want_len, "{how:?}");
+            assert_eq!(stats.head_quant, how);
+            assert_eq!(stats.head_bytes_src, bytes.len() as u64);
+            assert_eq!(stats.head_bytes_packed, want_len as u64);
+            assert!(
+                t.data.len() < bytes.len(),
+                "{how:?} must be smaller than BF16"
+            );
+        }
+    }
+
+    /// `word_embeddings` is the SAME `[151936, 2048]` shape as the head and is
+    /// the obvious thing for a suffix match to catch by accident. It must stay
+    /// BF16 under every `--head-quant`: only one row of it is read per token, so
+    /// quantizing it would trade quality for nothing on the decode path.
+    #[test]
+    fn head_quant_does_not_touch_word_embeddings_or_the_router() {
+        let vals: Vec<f32> = (0..512).map(|i| (i as f32 * 0.01).sin()).collect();
+        let bytes = bf16_bytes(&vals);
+        for name in [
+            "model.word_embeddings.weight",
+            "model.layers.0.mlp.gate.weight",
+            "model.norm.weight",
+        ] {
+            for how in [MapleHeadQuant::Q8, MapleHeadQuant::Mq4] {
+                let mut stats = MapleConvertStats::default();
+                let (t, _) =
+                    convert_tensor(name, "BF16", &[2, 256], &bytes, how, &mut stats).unwrap();
+                assert_eq!(t.quant_type, QuantType::BF16, "{name} under {how:?}");
+                assert_eq!(t.data, bytes, "{name} under {how:?} must be verbatim");
+                assert_eq!(stats.head_bytes_packed, 0, "{name} under {how:?}");
+            }
+        }
+    }
+
+    /// The ternary body must be untouched by the head flag — the experts and
+    /// projections still pack to qt=51 regardless.
+    #[test]
+    fn head_quant_does_not_touch_the_ternary_path() {
+        let vals = ternary(512, 0.03125);
+        let bytes = bf16_bytes(&vals);
+        for how in [
+            MapleHeadQuant::Bf16,
+            MapleHeadQuant::Q8,
+            MapleHeadQuant::Mq4,
+        ] {
+            let mut stats = MapleConvertStats::default();
+            let (t, is_ternary) = convert_tensor(
+                "model.layers.0.self_attn.q_proj.weight",
+                "BF16",
+                &[2, 256],
+                &bytes,
+                how,
+                &mut stats,
+            )
+            .unwrap();
+            assert!(is_ternary, "{how:?}");
+            assert_eq!(t.quant_type, QuantType::MQ2G256LloydU, "{how:?}");
+        }
+    }
+
+    /// MQ4-Lloyd is FWHT-rotated with seeds 42/1042, and the runtime rotates `x`
+    /// with `gen_fwht_signs(42, 256)` / `gen_fwht_signs(1042, 256)` from
+    /// `Scratch::ensure_mq_signs`. FWHT is orthogonal so `<Wrot, xrot> ==
+    /// <W, x>` — but ONLY under matching signs. A seed drift produces no error
+    /// and no crash, just wrong logits, so pin the contract here.
+    ///
+    /// NEGATIVE CONTROL: the same check under DELIBERATELY WRONG seeds must
+    /// fail, otherwise the test would pass for a packer that ignored the signs
+    /// entirely.
+    #[test]
+    fn mq4_head_round_trips_only_under_the_runtime_fwht_seeds() {
+        use crate::quant_fwht::{cpu_fwht_256, gen_fwht_signs};
+
+        // A single 256-group with real structure (a constant block would
+        // round-trip under any seed and prove nothing).
+        let w: Vec<f32> = (0..256)
+            .map(|i| ((i * 37 % 101) as f32 - 50.0) * 0.01)
+            .collect();
+        let x: Vec<f32> = (0..256)
+            .map(|i| ((i * 53 % 97) as f32 - 48.0) * 0.02)
+            .collect();
+        let exact: f32 = w.iter().zip(&x).map(|(a, b)| a * b).sum();
+
+        let (packed, qt, gs) = pack_maple_head(&w, 256, MapleHeadQuant::Mq4).unwrap();
+        assert_eq!(qt, QuantType::MQ4G256Lloyd);
+        assert_eq!(gs, 256);
+        assert_eq!(packed.len(), 160);
+
+        // Decode the 160 B block the way the GEMV kernel does: 16 fp16
+        // centroids, then 128 B of 4-bit indices (low nibble first).
+        let cb: Vec<f32> = (0..16)
+            .map(|i| {
+                hipfire_quantize::float16::f16_to_f32(u16::from_le_bytes([
+                    packed[2 * i],
+                    packed[2 * i + 1],
+                ]))
+            })
+            .collect();
+        let w_rot_hat: Vec<f32> = (0..256)
+            .map(|i| {
+                let byte = packed[32 + i / 2];
+                let nib = if i % 2 == 0 { byte & 0xF } else { byte >> 4 };
+                cb[nib as usize]
+            })
+            .collect();
+
+        // Error is normalised by ‖w‖·‖x‖, NOT by the dot itself. This
+        // particular dot cancels ~16x (2.59 against ‖w‖·‖x‖ = 41.9), so
+        // dividing by it would inflate ordinary 4-bit noise into a 15%
+        // "failure" and say nothing about the rotation. ‖w‖·‖x‖ is the
+        // scale-free bound the Cauchy-Schwarz sense of "how big could this
+        // dot have been", and is what quantization error is actually a
+        // fraction of.
+        let norm = w.iter().map(|a| a * a).sum::<f32>().sqrt()
+            * x.iter().map(|b| b * b).sum::<f32>().sqrt();
+        let err_under = |s1_seed: u32, s2_seed: u32| -> f32 {
+            let s1 = gen_fwht_signs(s1_seed, 256);
+            let s2 = gen_fwht_signs(s2_seed, 256);
+            let mut xr = x.clone();
+            cpu_fwht_256(&mut xr, &s1, &s2);
+            let dot: f32 = w_rot_hat.iter().zip(&xr).map(|(a, b)| a * b).sum();
+            (dot - exact).abs() / norm
+        };
+
+        // The real seeds: FWHT is orthogonal, so the rotated dot recovers the
+        // unrotated one up to 4-bit Lloyd quantization error only.
+        let good = err_under(42, 1042);
+        assert!(
+            good < 0.03,
+            "MQ4 head under runtime seeds 42/1042: normalised error {good} (exact dot {exact})"
+        );
+
+        // NEGATIVE CONTROL: wrong seeds must NOT recover it. Without this the
+        // assertion above could pass for a packer that never rotated at all —
+        // and a seed mismatch is silent in production, so this is the only
+        // place the contract is actually pinned.
+        let bad = err_under(7, 9007);
+        assert!(
+            bad > 5.0 * good,
+            "mismatched FWHT seeds gave normalised error {bad} vs {good} for the right seeds — \
+             the rotation contract is not actually being exercised by this test"
+        );
+    }
+
+    #[test]
+    fn head_quant_parses_and_defaults_to_bf16() {
+        assert_eq!(MapleHeadQuant::default(), MapleHeadQuant::Bf16);
+        assert_eq!(
+            "bf16".parse::<MapleHeadQuant>().unwrap(),
+            MapleHeadQuant::Bf16
+        );
+        assert_eq!("q8".parse::<MapleHeadQuant>().unwrap(), MapleHeadQuant::Q8);
+        assert_eq!(
+            "mq4".parse::<MapleHeadQuant>().unwrap(),
+            MapleHeadQuant::Mq4
+        );
+        assert!("mq2".parse::<MapleHeadQuant>().is_err());
+    }
+
+    /// A `--head-quant` that never matched a head must ABORT, not quietly emit a
+    /// BF16 head into a file named for a quantized one. That artifact would be
+    /// indistinguishable from a correct build and would poison every decode
+    /// measurement taken against it.
+    #[test]
+    fn head_quant_with_no_head_tensor_aborts() {
+        let dir = std::env::temp_dir().join("maple_head_quant_missing_head_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        write_safetensors(
+            &dir.join("model-00001-of-00001.safetensors"),
+            &[(
+                "zz.self_attn.q_proj.weight",
+                vec![1, 512],
+                ternary(512, 0.0625),
+            )],
+        );
+        std::fs::write(dir.join("config.json"), r#"{"model_type":"maple"}"#).unwrap();
+
+        let err = convert_maple_safetensors(
+            &dir,
+            &dir.join("out.hfq"),
+            r#"{"model_type":"maple"}"#,
+            MapleHeadQuant::Mq4,
+        )
+        .unwrap_err();
+        assert!(err.contains("no `lm_head.weight`"), "got: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn non_bf16_input_is_rejected() {
         let mut stats = MapleConvertStats::default();
@@ -439,6 +773,7 @@ mod tests {
             "F32",
             &[1, 256],
             &[0u8; 1024],
+            MapleHeadQuant::Bf16,
             &mut stats,
         )
         .unwrap_err();
@@ -455,6 +790,7 @@ mod tests {
             "BF16",
             &[1, 384],
             &bytes,
+            MapleHeadQuant::Bf16,
             &mut stats,
         )
         .unwrap_err();
@@ -542,7 +878,13 @@ mod tests {
         std::fs::write(dir.join("config.json"), r#"{"model_type":"maple"}"#).unwrap();
 
         let out = dir.join("out.hfq");
-        convert_maple_safetensors(&dir, &out, r#"{"model_type":"maple"}"#).expect("convert");
+        convert_maple_safetensors(
+            &dir,
+            &out,
+            r#"{"model_type":"maple"}"#,
+            MapleHeadQuant::Bf16,
+        )
+        .expect("convert");
 
         // Read the container back and check each tensor decodes to ITS OWN
         // values, not its neighbour's.

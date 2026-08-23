@@ -143,6 +143,13 @@ fn wt_from_raw(
         13 => DType::MQ4G256,
         15 => DType::MQ6G256,
         19 => DType::MQ2G256Lloyd,
+        // qt=30 arrives only from `--head-quant mq4`. Unlike qt=51 this one IS
+        // FWHT-rotated (`dtype_rotation_plan(MQ4G256Lloyd) == FwhtG256`), so
+        // `weight_gemv` rotates x with `ensure_mq_signs` (seeds 42/1042) and
+        // dispatches the *Prerotated* kernel. That is the same pair of seeds
+        // `pack_maple_head` quantized against; if the two ever diverge the
+        // result is not an error but silently wrong logits.
+        30 => DType::MQ4G256Lloyd,
         51 => DType::MQ2G256LloydU,
         other => return Err(format!("unsupported quant_type {other}")),
     };

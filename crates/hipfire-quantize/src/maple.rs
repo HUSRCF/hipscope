@@ -28,6 +28,62 @@ pub(crate) enum MapleTensorPolicy {
     KeepHighPrecision,
 }
 
+/// Carrier for `lm_head.weight`.
+///
+/// The head is the ONE high-precision tensor where the carrier is a real
+/// decode-speed decision rather than a fidelity one. It is dense over the full
+/// 151,936-row vocab and is read in its entirety EVERY token: 622 MB of BF16,
+/// measured at 205 GB/s — 90% of this box's 227.7 GB/s achievable ceiling and
+/// 36% of the decode token (`.superpowers/sdd/maple-decode-profile.md`). It is
+/// the only part of the model that is actually bandwidth-bound, so shrinking it
+/// converts directly into tokens/s.
+///
+/// **`word_embeddings` is deliberately NOT covered by this option** even though
+/// it is the same `[151936, 2048]` shape and the same 622 MB. Exactly ONE ROW of
+/// it is read per token, so quantizing it would save RAM (the loader currently
+/// widens it to F32 = 1.24 GB resident) and NOT bandwidth. That is a separate
+/// question with a separate trade-off; conflating the two under one flag would
+/// let a RAM decision silently change output quality.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum MapleHeadQuant {
+    /// Carry the head verbatim as BF16 (qt=16). The default: existing behaviour.
+    #[default]
+    Bf16,
+    /// Q8_0 / Q8F16 (qt=3), 34 B per 32 weights = 1.0625 bpw. 331 MB.
+    /// NOT FWHT-rotated — `dtype_rotation_plan(Q8_0) == None`.
+    Q8,
+    /// MQ4-G256-Lloyd (qt=30), 160 B per 256 weights = 5.0 bpw. 195 MB.
+    /// **FWHT-rotated**: the weights are encoded against FWHT-256-rotated
+    /// blocks, so the runtime MUST rotate `x` to match. See
+    /// `pack_maple_head` for why the seeds are not free parameters.
+    Mq4,
+}
+
+impl std::str::FromStr for MapleHeadQuant {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "bf16" | "none" => Ok(Self::Bf16),
+            "q8" | "q8_0" | "q8f16" => Ok(Self::Q8),
+            "mq4" | "mq4-lloyd" | "mq4g256lloyd" => Ok(Self::Mq4),
+            other => Err(format!(
+                "unknown --head-quant {other:?} (expected bf16, q8 or mq4)"
+            )),
+        }
+    }
+}
+
+impl MapleHeadQuant {
+    /// Name used in the convert log and stamped into the HFQ provenance.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Bf16 => "bf16",
+            Self::Q8 => "q8",
+            Self::Mq4 => "mq4",
+        }
+    }
+}
+
 /// Per-row ternary summary, for provenance and for the convert log.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TernaryRowStats {
@@ -56,6 +112,59 @@ pub(crate) fn maple_tensor_policy(name: &str) -> MapleTensorPolicy {
         MapleTensorPolicy::Ternary
     } else {
         MapleTensorPolicy::KeepHighPrecision
+    }
+}
+
+/// Pack `lm_head.weight` with the requested carrier.
+///
+/// Returns `(bytes, quant_type, group_size)`. `Bf16` is not handled here — the
+/// caller carries the source bytes verbatim rather than round-tripping them
+/// through f32.
+///
+/// **The FWHT sign seeds are 42 and 1042 and they are NOT free parameters.**
+/// `quantize_mq4g256_lloyd` rotates each 256-block by `cpu_fwht_256` before
+/// fitting its codebook, and at runtime `weight_gemv` rotates `x` with the
+/// signs `Scratch::ensure_mq_signs` builds — which are hardcoded
+/// `gen_fwht_signs(42, 256)` / `gen_fwht_signs(1042, 256)`. FWHT is orthogonal,
+/// so `<Wrot, xrot> == <W, x>` holds ONLY when both sides used the same signs.
+/// A mismatch is not an error and not a crash: it is a plausible-looking
+/// logit vector that is entirely wrong. Every other call site in the tree
+/// (`pipeline.rs`, `pipeline_gguf.rs`, `pipeline_deepseek.rs`,
+/// `reap_overlay.rs`) uses these same two seeds for G256.
+///
+/// `K` must be a multiple of 256 for MQ4 and of 32 for Q8. Maple's head is
+/// `[151936, 2048]`, so both divide exactly and no group ever straddles a row
+/// boundary — the flat-array packers are safe to use directly.
+pub(crate) fn pack_maple_head(
+    vals: &[f32],
+    k: usize,
+    how: MapleHeadQuant,
+) -> Result<(Vec<u8>, crate::hfq::QuantType, u32), String> {
+    use crate::hfq::QuantType;
+    match how {
+        MapleHeadQuant::Bf16 => Err("pack_maple_head called with Bf16".to_string()),
+        MapleHeadQuant::Q8 => {
+            if k % 32 != 0 {
+                return Err(format!(
+                    "lm_head K={k} is not a multiple of 32 (Q8_0 block)"
+                ));
+            }
+            Ok((crate::quant_q4::quantize_q8f16(vals), QuantType::Q8F16, 32))
+        }
+        MapleHeadQuant::Mq4 => {
+            if k % 256 != 0 {
+                return Err(format!(
+                    "lm_head K={k} is not a multiple of 256 (MQ4-G256 block)"
+                ));
+            }
+            let signs1 = crate::quant_fwht::gen_fwht_signs(42, 256);
+            let signs2 = crate::quant_fwht::gen_fwht_signs(1042, 256);
+            Ok((
+                crate::quant_mq::quantize_mq4g256_lloyd(vals, &signs1, &signs2),
+                QuantType::MQ4G256Lloyd,
+                256,
+            ))
+        }
     }
 }
 

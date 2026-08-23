@@ -2891,10 +2891,16 @@ fn handle_early_special_formats(args: &QuantizeArgs) -> bool {
             eprintln!("error: read {}: {e}", cfg_path.display());
             std::process::exit(2);
         });
+        let head_quant: crate::maple::MapleHeadQuant =
+            args.head_quant.parse().unwrap_or_else(|e| {
+                eprintln!("error: {e}");
+                std::process::exit(2);
+            });
         match crate::pipeline_maple::convert_maple_safetensors(
             Path::new(input_dir),
             Path::new(output_path),
             &config_json,
+            head_quant,
         ) {
             Ok(_) => eprintln!("maple: wrote {output_path}"),
             Err(e) => {
