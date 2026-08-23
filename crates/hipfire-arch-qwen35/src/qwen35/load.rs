@@ -2431,6 +2431,9 @@ pub fn load_weights(
     devices: &mut [Gpu],
     layout: &Layout,
 ) -> HipResult<Qwen35Weights> {
+    use std::sync::atomic::Ordering;
+    use std::time::Instant;
+    let t_sweep = Instant::now();
     let LoadedWeights {
         token_embd,
         embd_format,
@@ -2439,6 +2442,12 @@ pub fn load_weights(
         layers,
         lm_head_aliases_embd,
     } = rt_load_weights(source, devices, layout)?;
+    eprintln!(
+        "  weight sweep: {} ms (packed-expert host-read {} ms, H2D {} ms)",
+        t_sweep.elapsed().as_millis(),
+        PACKED_READ_MS.load(Ordering::Relaxed),
+        PACKED_UPLOAD_MS.load(Ordering::Relaxed),
+    );
     Ok(Qwen35Weights {
         token_embd,
         embd_format,
@@ -2469,7 +2478,6 @@ impl WeightSource for HfqSource<'_> {
     fn n_layers(&self) -> usize {
         self.c.n_layers
     }
-
     fn prepare(&mut self, n_devices: usize) -> HipResult<()> {
         // Keep the mmap alive on discrete GPUs (the carrier cleared
         // `evict_page_cache` there): weight uploads DMA straight out of
@@ -2898,6 +2906,46 @@ fn packed_mq4_experts_supported(gpu: &Gpu) -> bool {
 /// preserving one `WeightTensor` view and one device pointer-table entry per
 /// expert. Returns `None` for every non-uniform/non-MQ4 layout so mixed tiers,
 /// ParoQuant, paged experts, and EP streaming retain their literal behavior.
+
+/// Host-side byte source for a packed blob: either a borrowed mmap slice
+enum HostBlob<'a> {
+    Borrowed(&'a [u8]),
+    Owned(Vec<u8>),
+}
+
+impl AsRef<[u8]> for HostBlob<'_> {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::Borrowed(s) => s,
+            Self::Owned(v) => v,
+        }
+    }
+}
+
+/// Cumulative packed-expert sweep timings for the current model load, in ms.
+static PACKED_READ_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PACKED_UPLOAD_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Verify that `names[0..n]` are uniform-`stride` tensors laid out back-to-back
+/// in file order, and return the single borrowed mmap slice covering all of
+/// them. Returns `None` on any gap, overlap, stride mismatch, dropped mmap
+/// (UMA), or attached overlay.
+fn contiguous_tensor_span<'a>(hfq: &'a HfqFile, names: &[&str], stride: usize) -> Option<&'a [u8]> {
+    if names.is_empty() || hfq.has_overlay() {
+        return None;
+    }
+    let first = hfq.find_tensor_info(names[0])?;
+    let mut expect = first.data_offset;
+    for name in names {
+        let info = hfq.find_tensor_info(name)?;
+        if info.data_offset != expect || info.data_size != stride {
+            return None;
+        }
+        expect = info.data_offset.checked_add(info.data_size)?;
+    }
+    hfq.data_range(first.data_offset, expect - first.data_offset)
+}
+
 fn try_load_packed_mq4_experts(
     hfq: &HfqFile,
     gpu: &mut Gpu,
@@ -2906,6 +2954,8 @@ fn try_load_packed_mq4_experts(
     mi: usize,
     dim: usize,
 ) -> HipResult<Option<(Vec<ExpertWeights>, PackedExpertOwners)>> {
+    use std::sync::atomic::Ordering;
+    use std::time::Instant;
     if expert_ids.is_empty() {
         return Ok(None);
     }
@@ -2956,12 +3006,34 @@ fn try_load_packed_mq4_experts(
 
     let gate_up_stride = gate_up_stride.expect("non-empty packed MQ4 expert list");
     let down_stride = down_stride.expect("non-empty packed MQ4 expert list");
-    let (gate_up_host, down_host) = if hfq.has_overlay() {
+    // Zero-copy fast path: when every expert's tensor lies contiguous in-file
+    // (expert 0's gate_up ends exactly where expert 1's begins, etc.) and the
+    // mmap is alive (dGPU, no overlay), upload both blobs straight from the
+    // page cache — no pread staging Vec, no heap copy. Measured dominant cost
+    // of A3B MoE loads otherwise: 512 pread segments per blob into a fresh
+    // heap buffer, then a second copy into hipMalloc'd VRAM.
+    let gate_up_names: Vec<&str> = specs.iter().map(|s| s.gate_up_name.as_str()).collect();
+    let down_names: Vec<&str> = specs.iter().map(|s| s.down_name.as_str()).collect();
+    let gate_up_contig = contiguous_tensor_span(hfq, &gate_up_names, gate_up_stride);
+    let down_contig = contiguous_tensor_span(hfq, &down_names, down_stride);
+
+    let t_read = Instant::now();
+    // Zero-copy only pays when pages are resident: a borrowed-slice H2D from
+    // an evicted cache soft-faults serially inside the copy loop (~0.25 GB/s
+    // off disk), while the parallel-pread fallback reads with multiple lanes.
+    let zero_copy_ok =
+        matches!((gate_up_contig, down_contig), (Some(_), Some(_))) && hfq.mostly_page_cached();
+    let (gate_up_host, down_host) = if zero_copy_ok {
+        let (Some(gu), Some(dn)) = (gate_up_contig, down_contig) else {
+            unreachable!("zero_copy_ok implies both spans resolved");
+        };
+        (HostBlob::Borrowed(gu), HostBlob::Borrowed(dn))
+    } else if hfq.has_overlay() {
         // Overlay offsets belong to a second file; retain the overlay-aware
         // serial path exactly rather than crossing files in reader workers.
-        let mut gate_up_host = Vec::with_capacity(gate_up_stride * specs.len());
-        let mut down_host = Vec::with_capacity(down_stride * specs.len());
-        for spec in &specs {
+        let mut gate_up_host = vec![0u8; gate_up_stride * specs.len()];
+        let mut down_host = vec![0u8; down_stride * specs.len()];
+        for (slot, spec) in specs.iter().enumerate() {
             {
                 let (_, bytes) = hfq.tensor_data_pread(&spec.gate_up_name).ok_or_else(|| {
                     HipError::new(
@@ -2982,7 +3054,8 @@ fn try_load_packed_mq4_experts(
                         ),
                     ));
                 }
-                gate_up_host.extend_from_slice(&bytes);
+                gate_up_host[slot * gate_up_stride..(slot + 1) * gate_up_stride]
+                    .copy_from_slice(&bytes);
             }
             {
                 let (_, bytes) = hfq.tensor_data_pread(&spec.down_name).ok_or_else(|| {
@@ -3001,10 +3074,10 @@ fn try_load_packed_mq4_experts(
                         ),
                     ));
                 }
-                down_host.extend_from_slice(&bytes);
+                down_host[slot * down_stride..(slot + 1) * down_stride].copy_from_slice(&bytes);
             }
         }
-        (gate_up_host, down_host)
+        (HostBlob::Owned(gate_up_host), HostBlob::Owned(down_host))
     } else {
         let jobs = [
             HfqReadJob::packed(
@@ -3024,14 +3097,18 @@ fn try_load_packed_mq4_experts(
             .map_err(|e| HipError::new(0, &format!("qwen35: parallel packed expert read: {e}")))?
             .into_iter();
         (
-            results.next().expect("two packed MQ4 jobs").data,
-            results.next().expect("two packed MQ4 jobs").data,
+            HostBlob::Owned(results.next().expect("two packed MQ4 jobs").data),
+            HostBlob::Owned(results.next().expect("two packed MQ4 jobs").data),
         )
     };
+    let trace = std::env::var_os("HIPFIRE_LOAD_TRACE").is_some();
+    let zero_copy =
+        matches!(gate_up_host, HostBlob::Borrowed(_)) && matches!(down_host, HostBlob::Borrowed(_));
+    let t_upload = Instant::now();
 
-    let gate_up_owner = gpu.upload_raw(&gate_up_host, &[specs.len(), gate_up_stride])?;
+    let gate_up_owner = gpu.upload_raw(gate_up_host.as_ref(), &[specs.len(), gate_up_stride])?;
     drop(gate_up_host);
-    let down_owner = match gpu.upload_raw(&down_host, &[specs.len(), down_stride]) {
+    let down_owner = match gpu.upload_raw(down_host.as_ref(), &[specs.len(), down_stride]) {
         Ok(owner) => owner,
         Err(error) => {
             let _ = gpu.free_tensor(gate_up_owner);
@@ -3039,6 +3116,15 @@ fn try_load_packed_mq4_experts(
         }
     };
     drop(down_host);
+    let upload_ms = t_upload.elapsed().as_millis() as u64;
+    let read_ms = t_read.elapsed().as_millis() as u64 - upload_ms;
+    PACKED_READ_MS.fetch_add(read_ms, Ordering::Relaxed);
+    PACKED_UPLOAD_MS.fetch_add(upload_ms, Ordering::Relaxed);
+    if trace {
+        eprintln!(
+            "  [load-trace] packed experts: host-read {read_ms} ms, H2D {upload_ms} ms, zero-copy={zero_copy}"
+        );
+    }
 
     let mut experts = Vec::with_capacity(specs.len());
     for (slot, spec) in specs.iter().enumerate() {

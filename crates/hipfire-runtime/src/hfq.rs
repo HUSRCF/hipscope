@@ -128,7 +128,7 @@ impl HfqFile {
     /// pages in, so this is free). Used to skip the warmer when a repeat
     /// load would only re-copy an already-resident file.
     #[cfg(unix)]
-    fn mostly_page_cached(&self) -> bool {
+    pub fn mostly_page_cached(&self) -> bool {
         let end = self
             .tensors
             .last()
@@ -1002,6 +1002,25 @@ impl HfqFile {
                 mmap[info.data_offset..info.data_offset + info.data_size].to_vec(),
             ))
         }
+    }
+
+    /// Borrowed mmap byte range `[offset, offset+len)`. Zero-copy accessor for
+    /// callers that verified a set of tensors is contiguous in-file (via
+    /// `find_tensor_info` offsets) and want one slice covering all of them —
+    /// e.g. packed-expert blob uploads straight from the page cache.
+    ///
+    /// Returns `None` when the mapping was dropped (UMA / post-`drop_mmap`) or
+    /// when an overlay is attached (a range may span two files). Bounds-checked.
+    pub fn data_range(&self, offset: usize, len: usize) -> Option<&[u8]> {
+        if self.overlay.is_some() {
+            return None;
+        }
+        let mmap = self.mmap.as_ref()?;
+        let end = offset.checked_add(len)?;
+        if end > mmap.len() {
+            return None;
+        }
+        Some(&mmap[offset..end])
     }
 
     /// Release page cache for a byte range. Only works if the range is NOT mmap'd.
