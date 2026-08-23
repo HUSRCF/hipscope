@@ -108,7 +108,9 @@ packed-MQ4 projections remain the dominant wall-time target. Raw logs and the
 summary are under `results/staged_model_ab_warm_20260811/`.
 
 The sidecar was subsequently rebased onto official `beta@80a572c8` and tested
-with the branch's native defaults. Three alternating W7900 process pairs,
+with the branch's native defaults. This CK-only beta branch does not include
+the separate packed-MQ4 production stack whose retained PP8192 result is about
+`1.19-1.21k tok/s`. Three alternating W7900 process pairs,
 each using three PP8192 runs, measured `593.7 -> 865.8 tok/s`: a **1.4583x**
 paired-median prefill speedup with 3/3 positive pairs. All pairs produced the
 same eight greedy token IDs and decode remained neutral at approximately

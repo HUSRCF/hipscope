@@ -2,6 +2,8 @@
 
 This is a three-pair alternating-process comparison of the native Asym3/Q8 prefill path and the optional staged CK sidecar on `upstream/beta@80a572c8`. Each process executes three PP8192 prefill runs; the reported process value is the in-process median. A ten-second idle interval separates arms.
 
+This branch contains the CK integration only. It does not contain the separate gfx11 packed-MQ4 production stack (`X256/Y64`, permuted group128/256 weights, fused SwiGLU packing, and FP16 FFN intermediate). Consequently, these numbers validate the incremental CK backend on official beta; they are not the final all-optimizations throughput result. The retained full-stack PP8192 measurements are approximately `1.19-1.21k tok/s`.
+
 | Mode | Process medians (tok/s) | Median (tok/s) |
 | --- | --- | ---: |
 | Native | `592.4`, `593.9`, `593.7` | **593.7** |
