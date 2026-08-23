@@ -166,6 +166,12 @@ COMMON_FLAGS=(
     -I"${CK_ROOT}/library/include"
 )
 
+IFS=',' read -ra HEAD_DIM_LIST <<< "${HEAD_DIMS}"
+for head_dim in "${HEAD_DIM_LIST[@]}"; do
+    COMMON_FLAGS+=("-DHIPFIRE_CK_HEAD_DIM_${head_dim}=1")
+done
+SMOKE_HEAD_DIM="${HEAD_DIM_LIST[0]}"
+
 mapfile -t GENERATED_SOURCES < <(find "${BUILD_DIR}/generated" -maxdepth 2 -type f -name 'fmha_fwd*.cpp' | sort)
 if [[ "${#GENERATED_SOURCES[@]}" -ne "${EXPECTED_GENERATED_SOURCES}" ]]; then
     echo "generated ${#GENERATED_SOURCES[@]} sources, expected ${EXPECTED_GENERATED_SOURCES}" >&2
@@ -201,6 +207,7 @@ wait
 "${ROCM_PATH}/bin/hipcc" \
     -std=c++20 \
     -O2 \
+    -DHIPFIRE_CK_SMOKE_HEAD_DIM="${SMOKE_HEAD_DIM}" \
     -I"${ROOT}" \
     "${ROOT}/smoke_raw_abi.cpp" \
     -L"${BUILD_DIR}" \
@@ -208,6 +215,17 @@ wait
     -Wl,-rpath,"${HIP_LIB_DIR}" \
     -lhipfire_flash_attn_ck \
     -o "${BUILD_DIR}/smoke_raw_abi"
+
+"${CXX:-c++}" \
+    -std=c++20 \
+    -O2 \
+    -I"${ROOT}" \
+    "${ROOT}/smoke_supported_dims.cpp" \
+    -L"${BUILD_DIR}" \
+    -Wl,-rpath,'$ORIGIN' \
+    -lhipfire_flash_attn_ck \
+    -o "${BUILD_DIR}/smoke_supported_dims"
+"${BUILD_DIR}/smoke_supported_dims" "${HEAD_DIMS}"
 
 file "${OUT}"
 du -h "${OUT}"

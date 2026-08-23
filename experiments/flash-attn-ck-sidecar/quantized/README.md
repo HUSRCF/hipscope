@@ -107,6 +107,14 @@ This is a model-level backend improvement, not a route to 1.5k tok/s by itself;
 packed-MQ4 projections remain the dominant wall-time target. Raw logs and the
 summary are under `results/staged_model_ab_warm_20260811/`.
 
+The sidecar was subsequently rebased onto official `beta@80a572c8` and tested
+with the branch's native defaults. Three alternating W7900 process pairs,
+each using three PP8192 runs, measured `593.7 -> 865.8 tok/s`: a **1.4583x**
+paired-median prefill speedup with 3/3 positive pairs. All pairs produced the
+same eight greedy token IDs and decode remained neutral at approximately
+`35.2 tok/s`. Compact evidence and the exact reproduction command are under
+`results/beta_w7900_pp8192_ab_20260823/`.
+
 A follow-up replaced only the staged dense D256 `M64/N64` CK recipe with
 `M64/N32`. Fifteen alternating process pairs measured a stable 1.0561x
 aggregate attention-local gain, with per-K results from 1.0320x to 1.0748x.

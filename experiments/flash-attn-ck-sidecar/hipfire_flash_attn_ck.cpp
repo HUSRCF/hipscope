@@ -22,6 +22,23 @@ static_assert(offsetof(hipfire_flash_attn_ck_fwd_params, batch_stride_out) == 17
 
 namespace {
 
+bool supports_head_dim(int head_dim)
+{
+    switch(head_dim)
+    {
+#if HIPFIRE_CK_HEAD_DIM_64
+    case 64: return true;
+#endif
+#if HIPFIRE_CK_HEAD_DIM_128
+    case 128: return true;
+#endif
+#if HIPFIRE_CK_HEAD_DIM_256
+    case 256: return true;
+#endif
+    default: return false;
+    }
+}
+
 void set_error(char* error, size_t capacity, const std::string& message)
 {
     if(error == nullptr || capacity == 0)
@@ -66,9 +83,9 @@ int validate(const hipfire_flash_attn_ck_fwd_params* p, char* error, size_t erro
         set_error(error, error_capacity, "batch, sequence lengths, and head counts must be positive");
         return 1;
     }
-    if(p->head_dim != 64)
+    if(!supports_head_dim(p->head_dim))
     {
-        set_error(error, error_capacity, "this optional build supports head_dim=64 only");
+        set_error(error, error_capacity, "head_dim is not included in this optional build");
         return 1;
     }
     if(p->nhead_q % p->nhead_k != 0)

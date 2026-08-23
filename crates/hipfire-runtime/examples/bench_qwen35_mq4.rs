@@ -722,6 +722,8 @@ fn main() {
     let do_profile_decode = std::env::var("HIPFIRE_PROFILE_DECODE").ok().as_deref() == Some("1");
     eprintln!("\n=== gen ({gen_len} tokens — timed) ===");
     let mut per_token_ms: Vec<f64> = Vec::with_capacity(gen_len);
+    let dump_tokens = std::env::var("HIPFIRE_BENCH_DUMP_TOKENS").ok().as_deref() == Some("1");
+    let mut generated_tokens = dump_tokens.then(|| Vec::with_capacity(gen_len));
     if do_profile_decode {
         rdna_compute::profile::start();
     }
@@ -730,6 +732,9 @@ fn main() {
         let pos = prefill_len + warmup_len + step;
         if pos >= kv_seq {
             break;
+        }
+        if let Some(tokens) = generated_tokens.as_mut() {
+            tokens.push(next_token);
         }
         let t = Instant::now();
         qwen35::forward_scratch(
@@ -749,6 +754,14 @@ fn main() {
         next_token = llama::argmax(&logits);
     }
     let gen_total_ms = t_gen_start.elapsed().as_secs_f64() * 1000.0;
+    if let Some(tokens) = generated_tokens {
+        let token_ids = tokens
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        eprintln!("TOKEN_IDS {token_ids}");
+    }
     if do_profile_decode {
         if let Some(entries) = rdna_compute::profile::stop() {
             let mut by_kernel: std::collections::HashMap<&str, (f64, usize, usize)> =

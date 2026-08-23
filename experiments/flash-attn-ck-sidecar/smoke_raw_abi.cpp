@@ -15,6 +15,10 @@
 
 namespace {
 
+#ifndef HIPFIRE_CK_SMOKE_HEAD_DIM
+#define HIPFIRE_CK_SMOKE_HEAD_DIM 64
+#endif
+
 void check_hip(hipError_t status, const char* operation)
 {
     if(status != hipSuccess)
@@ -46,8 +50,8 @@ void run_case(const char* name, int nhead_q, int nhead_k, bool causal, bool non_
     constexpr int batch = 1;
     constexpr int seqlen_q = 64;
     constexpr int seqlen_k = 96;
-    constexpr int hdim = 64;
-    constexpr float scale = 1.0f / 8.0f;
+    constexpr int hdim = HIPFIRE_CK_SMOKE_HEAD_DIM;
+    const float scale = 1.0f / std::sqrt(static_cast<float>(hdim));
     const int groups = nhead_q / nhead_k;
 
     const size_t q_count = static_cast<size_t>(batch) * seqlen_q * nhead_q * hdim;

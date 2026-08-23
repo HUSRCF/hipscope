@@ -1,0 +1,14 @@
+date=2026-08-23T16:28:47+08:00
+base_commit=80a572c8
+benchmark_commit=3122f9bec30f3a9b22bb654c6c4b3578cd499b61
+gpu=AMD Radeon Pro W7900
+gpu_arch=gfx1100
+gpu_id=1
+rocm=7.14
+prefill_tokens=8192
+prefill_runs=3
+trials=3
+model_sha256=86a5f80fd29d545abb1093dead242725ced6d68b8607c6d566d897b1a82442dc
+binary_sha256=64fca9a8b217ca3b099678a38fa3f5baa14367461fb2221d81d5690d679ece53
+ck_lib_sha256=0236d8a98f4e2e8a822841ef0c8a1cccc4f218d83288b2b7a275fc977f3f6fe7
+harness_sha256=b2d3987a00f6faf575dbf5ae8fb588cc0cd4930c56305ce65a4efd653497972e
