@@ -33,6 +33,7 @@ pub enum GgmlType {
     Q5K = 13,
     Q6K = 14,
     Q8K = 15,
+    IQ4XS = 23,
     BF16 = 30,
     Q1_0 = 41,
     Q2_0 = 42,
@@ -55,6 +56,7 @@ impl GgmlType {
             13 => Some(Self::Q5K),
             14 => Some(Self::Q6K),
             15 => Some(Self::Q8K),
+            23 => Some(Self::IQ4XS),
             30 => Some(Self::BF16),
             41 => Some(Self::Q1_0),
             42 => Some(Self::Q2_0),
@@ -66,7 +68,13 @@ impl GgmlType {
         match self {
             Self::F32 | Self::F16 | Self::BF16 => 1,
             Self::Q4_0 | Self::Q4_1 | Self::Q5_0 | Self::Q5_1 | Self::Q8_0 | Self::Q8_1 => 32,
-            Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K | Self::Q8K => 256,
+            Self::Q2K
+            | Self::Q3K
+            | Self::Q4K
+            | Self::Q5K
+            | Self::Q6K
+            | Self::Q8K
+            | Self::IQ4XS => 256,
             Self::Q1_0 | Self::Q2_0 => 128,
         }
     }
@@ -89,6 +97,9 @@ impl GgmlType {
             Self::Q8K => 290,
             Self::Q1_0 => 18,
             Self::Q2_0 => 34,
+            // block_iq4_xs: fp16 d + u16 scales_h + 4 packed low-scale
+            // bytes + 128 packed nibbles = 136 bytes.
+            Self::IQ4XS => 136,
         }
     }
 
@@ -475,8 +486,8 @@ fn dequant_q5_k(data: &[u8], n: usize) -> Vec<f32> {
             let m_odd = dmin * mins[sb_odd] as f32;
             for l in 0..32 {
                 let byte = ql[group * 32 + l];
-                let hbit = ((qh[l] >> group) & 1) as u8;
-                let hbit2 = ((qh[l] >> (group + 4)) & 1) as u8;
+                let hbit = ((qh[l] >> (2 * group)) & 1) as u8;
+                let hbit2 = ((qh[l] >> (2 * group + 1)) & 1) as u8;
                 let idx_even = b * block_size + group * 64 + l;
                 let idx_odd = idx_even + 32;
                 if idx_even < n {
@@ -541,6 +552,48 @@ fn dequant_q6_k(data: &[u8], n: usize) -> Vec<f32> {
     out
 }
 
+/// llama.cpp IQ4_XS: one 256-element super-block with an FP16 scale,
+/// eight signed 6-bit sub-scales (one per 32 values), and IQ4_NL nibbles.
+fn dequant_iq4_xs(data: &[u8], n: usize) -> Vec<f32> {
+    const BLOCK_SIZE: usize = 256;
+    const BLOCK_BYTES: usize = 136;
+    const IQ4_NL: [i8; 16] = [
+        -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
+    ];
+
+    let nblocks = n.div_ceil(BLOCK_SIZE);
+    let mut out = vec![0.0f32; n];
+    for b in 0..nblocks {
+        let off = b * BLOCK_BYTES;
+        if off + BLOCK_BYTES > data.len() {
+            break;
+        }
+        let d = f16_to_f32(u16::from_le_bytes([data[off], data[off + 1]]));
+        let scales_h = u16::from_le_bytes([data[off + 2], data[off + 3]]);
+        let scales_l = &data[off + 4..off + 8];
+        let qs = &data[off + 8..off + BLOCK_BYTES];
+
+        for sub in 0..8 {
+            let low = (scales_l[sub / 2] >> (4 * (sub % 2))) & 0x0f;
+            let high = ((scales_h >> (2 * sub)) & 0x03) as u8;
+            let signed_scale = ((low | (high << 4)) as i32) - 32;
+            let dl = d * signed_scale as f32;
+            let q = &qs[sub * 16..sub * 16 + 16];
+            for j in 0..16 {
+                let lo_idx = b * BLOCK_SIZE + sub * 32 + j;
+                let hi_idx = lo_idx + 16;
+                if lo_idx < n {
+                    out[lo_idx] = dl * IQ4_NL[(q[j] & 0x0f) as usize] as f32;
+                }
+                if hi_idx < n {
+                    out[hi_idx] = dl * IQ4_NL[(q[j] >> 4) as usize] as f32;
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Dispatcher: dequantize any supported tensor to f32. Panics on unsupported types.
 pub fn tensor_to_f32(info: &TensorInfo, data: &[u8]) -> Vec<f32> {
     let n = info.numel();
@@ -573,6 +626,7 @@ pub fn tensor_to_f32(info: &TensorInfo, data: &[u8]) -> Vec<f32> {
         GgmlType::Q4K => dequant_q4_k(data, n),
         GgmlType::Q5K => dequant_q5_k(data, n),
         GgmlType::Q6K => dequant_q6_k(data, n),
+        GgmlType::IQ4XS => dequant_iq4_xs(data, n),
         other => panic!(
             "GGUF tensor type {:?} not implemented (tensor: {})",
             other, info.name
@@ -636,5 +690,69 @@ mod q1_0_tests {
         let mixed = dequant_q1_0(&blk, 128);
         assert!((mixed[0] + 0.5).abs() < 1e-3);
         assert!((mixed[1] - 0.5).abs() < 1e-3);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn iq4_xs_layout_and_known_vector_match_reference_formula() {
+        assert_eq!(GgmlType::from_u32(23), Some(GgmlType::IQ4XS));
+        assert_eq!(GgmlType::IQ4XS.block_size(), 256);
+        assert_eq!(GgmlType::IQ4XS.block_bytes(), 136);
+
+        let mut block = vec![0u8; 136];
+        // d = 1.0; sub-scale 0 is +1 (encoded 33), sub-scale 1 is -1
+        // (encoded 31). Remaining sub-scales encode zero.
+        block[0..2].copy_from_slice(&0x3c00u16.to_le_bytes());
+        block[2..4].copy_from_slice(&0xaaa6u16.to_le_bytes());
+        block[4] = 0xf1;
+        block[5] = 0x00;
+        block[6] = 0x00;
+        block[7] = 0x00;
+        // First sub-block: low nibble 0 -> -127, high nibble 15 -> 113.
+        block[8..24].fill(0xf0);
+        // Second: low nibble 8 -> 1, high nibble 9 -> 13, multiplied by -1.
+        block[24..40].fill(0x98);
+
+        let got = dequant_iq4_xs(&block, 256);
+        assert_eq!(got[0], -127.0);
+        assert_eq!(got[15], -127.0);
+        assert_eq!(got[16], 113.0);
+        assert_eq!(got[31], 113.0);
+        assert_eq!(got[32], -1.0);
+        assert_eq!(got[47], -1.0);
+        assert_eq!(got[48], -13.0);
+        assert_eq!(got[63], -13.0);
+        assert!(got[64..].iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn q5_k_high_bits_follow_interleaved_pair_layout() {
+        let mut block = vec![0u8; 176];
+        // d=1, dmin=0; all eight sub-block scales are one.
+        block[0..2].copy_from_slice(&0x3c00u16.to_le_bytes());
+        block[2..4].copy_from_slice(&0u16.to_le_bytes());
+        block[4..8].fill(1);
+        block[8..12].fill(0);
+        block[12] = 1;
+        block[13] = 1;
+        block[14] = 1;
+        block[15] = 1;
+        // qh byte 0 carries the first element of each 32-value sub-block:
+        // bits (0,1), (2,3), (4,5), (6,7). Low nibbles remain zero.
+        block[16] = 0b1010_0101;
+
+        let got = dequant_q5_k(&block, 256);
+        assert_eq!(got[0], 16.0);
+        assert_eq!(got[32], 0.0);
+        assert_eq!(got[64], 16.0);
+        assert_eq!(got[96], 0.0);
+        assert_eq!(got[128], 0.0);
+        assert_eq!(got[160], 16.0);
+        assert_eq!(got[192], 0.0);
+        assert_eq!(got[224], 16.0);
     }
 }

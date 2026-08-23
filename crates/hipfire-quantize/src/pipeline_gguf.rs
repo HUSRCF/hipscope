@@ -196,6 +196,41 @@ pub(crate) fn convert_binary_tensor(
     (src.to_vec(), crate::hfq::QuantType::BQ1G128, 128)
 }
 
+/// Undo value-domain transforms applied by llama.cpp's Qwen3.5 GGUF exporter.
+/// hipfire consumes the original Hugging Face representation: its loader adds
+/// the RMSNorm unit offset and its DeltaNet kernels compute `-exp(A_log)`.
+fn restore_qwen35_tensor_values(arch: &str, name: &str, values: &mut [f32]) {
+    if !matches!(arch, "qwen35" | "qwen3.5" | "qwen3_5" | "qwen3_5_text") {
+        return;
+    }
+
+    if name.starts_with("blk.") && name.ends_with(".ssm_a") {
+        for value in values {
+            *value = (-*value).ln();
+        }
+    } else if name.ends_with("norm.weight") && !name.ends_with("ssm_norm.weight") {
+        for value in values {
+            *value -= 1.0;
+        }
+    }
+}
+
+fn tensor_to_model_f32(info: &gguf_input::TensorInfo, raw: &[u8], arch: &str) -> Vec<f32> {
+    let mut values = gguf_input::tensor_to_f32(info, raw);
+    restore_qwen35_tensor_values(arch, &info.name, &mut values);
+    values
+}
+
+fn hfq_shape_from_gguf(shape: &[usize], is_qwen35_conv1d: bool) -> Vec<u32> {
+    if is_qwen35_conv1d {
+        vec![shape[1] as u32, 1, shape[0] as u32]
+    } else if shape.len() == 2 {
+        vec![shape[1] as u32, shape[0] as u32]
+    } else {
+        shape.iter().map(|&s| s as u32).collect()
+    }
+}
+
 /// Convert a GGUF file to a hipfire `.hfq`. Per-format quantization target
 /// applies to 2D weight matrices; the embedding table is always Q8F16
 /// (Q4-grade is too lossy for embeddings) and 1D norms stay F16. Tensor
@@ -355,8 +390,8 @@ pub(crate) fn run_gguf_pipeline(
         let mut map = HashMap::new();
         let mut counts = [0u32; 4];
         for info in &gguf.tensors {
-            let out_name =
-                gguf_to_safetensors_name(&info.name).unwrap_or_else(|| info.name.clone());
+            let out_name = gguf_to_safetensors_name(&info.name, &arch_str)
+                .unwrap_or_else(|| info.name.clone());
             let level = kmap_resolve_mode(&out_name, n_layers, is_moe, kmap_mode);
             match level {
                 QuantLevel::F16 => counts[0] += 1,
@@ -399,32 +434,41 @@ pub(crate) fn run_gguf_pipeline(
         total_params += n_elements as u64;
         total_bytes_in += raw.len() as u64;
 
-        let shape: Vec<u32> = info.shape.iter().map(|&s| s as u32).collect();
-
         // Tensor classification (uses the original GGUF name).
         let is_norm = gguf_is_norm_tensor(&info.name);
         let is_embed = gguf_is_embed_tensor(&info.name);
         let is_2d = info.shape.len() == 2;
+        let is_qwen35_conv1d = matches!(
+            arch_str.as_str(),
+            "qwen35" | "qwen3.5" | "qwen3_5" | "qwen3_5_text"
+        ) && info.name.starts_with("blk.")
+            && info.name.ends_with(".ssm_conv1d.weight");
         let k_dim = if is_2d { info.shape[0] } else { n_elements };
+
+        // GGUF records dimensions in GGML ne-order (K first), whereas HFQ
+        // metadata follows safetensors order (output rows first). Data itself
+        // is already laid out row-major for the quantizers below.
+        let shape = hfq_shape_from_gguf(&info.shape, is_qwen35_conv1d);
 
         // Translate to the safetensors-style name `hipfire_runtime::hfq::load_weights_hfq`
         // expects. If we don't have a translation, keep the original name —
         // the future loader can ignore unknown tensors.
-        let out_name = gguf_to_safetensors_name(&info.name).unwrap_or_else(|| info.name.clone());
+        let out_name =
+            gguf_to_safetensors_name(&info.name, &arch_str).unwrap_or_else(|| info.name.clone());
 
         let kmap_level = kmap.get(&out_name).copied().unwrap_or(QuantLevel::Base);
 
         let (data, quant_type, group_size, label) = if is_norm || !is_2d {
             // Norms and 1D tensors always F16 (primary gate)
-            let f32_data = gguf_input::tensor_to_f32(info, raw);
+            let f32_data = tensor_to_model_f32(info, raw, &arch_str);
             let f16_bytes: Vec<u8> = f32_data
                 .iter()
                 .flat_map(|&v| f32_to_f16(v).to_le_bytes())
                 .collect();
             (f16_bytes, QuantType::F16, 0u32, "F16")
-        } else if kmap_level == QuantLevel::Q8 || is_embed {
+        } else if kmap_level == QuantLevel::Q8 || is_embed || is_qwen35_conv1d {
             // K-map Q8 or embedding
-            let f32_data = gguf_input::tensor_to_f32(info, raw);
+            let f32_data = tensor_to_model_f32(info, raw, &arch_str);
             let q = quantize_q8f16(&f32_data);
             quant_params += n_elements as u64;
             (q, QuantType::Q8F16, 32u32, "Q8_F16")
@@ -537,7 +581,7 @@ pub(crate) fn run_gguf_pipeline(
             (bytes, quant_type, group_size, "BQ1G128 (passthrough)")
         } else if kmap_level == QuantLevel::Promote6 && k_dim % 256 == 0 {
             // K-map promote to 6-bit
-            let f32_data = gguf_input::tensor_to_f32(info, raw);
+            let f32_data = tensor_to_model_f32(info, raw, &arch_str);
             quant_params += n_elements as u64;
             match format {
                 GgufFormat::Mq4
@@ -632,7 +676,7 @@ pub(crate) fn run_gguf_pipeline(
             // K-map says override (lm_head when --lm-head-format set).
             // GGUF pipeline has no AWQ wiring (AWQ is safetensors-only today),
             // so this is a plain quantize on the carried target format.
-            let f32_data = gguf_input::tensor_to_f32(info, raw);
+            let f32_data = tensor_to_model_f32(info, raw, &arch_str);
             quant_params += n_elements as u64;
             match override_fmt {
                 GgufFormat::Mq6 => {
@@ -768,7 +812,7 @@ pub(crate) fn run_gguf_pipeline(
             }
         } else if k_dim % 256 == 0 {
             // 256-aligned 2D weight — quantize per the chosen format (Base level).
-            let f32_data = gguf_input::tensor_to_f32(info, raw);
+            let f32_data = tensor_to_model_f32(info, raw, &arch_str);
             quant_params += n_elements as u64;
             match format {
                 GgufFormat::Hfq4 => {
@@ -914,7 +958,7 @@ pub(crate) fn run_gguf_pipeline(
             // K not divisible by 256 — fall back to HFQ4-G128 (no rotation).
             // This branch fires for the rare ragged dim; ignores --format
             // (no G128 variant of mq4/mq6 exists).
-            let f32_data = gguf_input::tensor_to_f32(info, raw);
+            let f32_data = tensor_to_model_f32(info, raw, &arch_str);
             let q = quantize_hfq4g128(&f32_data);
             quant_params += n_elements as u64;
             (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
@@ -1028,5 +1072,45 @@ mod tests {
                     && gguf_arch_is_moe_like(arch))
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod qwen35_gguf_value_tests {
+    use super::{hfq_shape_from_gguf, restore_qwen35_tensor_values};
+
+    #[test]
+    fn restores_exported_deltanet_decay() {
+        let original = [-2.0_f32, -0.5, 1.25];
+        let mut exported: Vec<f32> = original.iter().map(|value| -value.exp()).collect();
+        restore_qwen35_tensor_values("qwen35", "blk.0.ssm_a", &mut exported);
+        for (got, want) in exported.iter().zip(original) {
+            assert!((got - want).abs() < 1e-6, "got {got}, want {want}");
+        }
+    }
+
+    #[test]
+    fn restores_exported_norm_offset_but_not_deltanet_norm() {
+        let mut ordinary = [1.75_f32, 0.5];
+        restore_qwen35_tensor_values("qwen35", "blk.0.attn_norm.weight", &mut ordinary);
+        assert_eq!(ordinary, [0.75, -0.5]);
+
+        let mut deltanet = [1.75_f32, 0.5];
+        restore_qwen35_tensor_values("qwen35", "blk.0.ssm_norm.weight", &mut deltanet);
+        assert_eq!(deltanet, [1.75, 0.5]);
+    }
+
+    #[test]
+    fn leaves_other_architectures_unchanged() {
+        let mut values = [-0.25_f32, -2.0];
+        restore_qwen35_tensor_values("llama", "blk.0.ssm_a", &mut values);
+        assert_eq!(values, [-0.25, -2.0]);
+    }
+
+    #[test]
+    fn converts_ggml_dimension_order_and_restores_conv_axis() {
+        assert_eq!(hfq_shape_from_gguf(&[1024, 6144], false), [6144, 1024]);
+        assert_eq!(hfq_shape_from_gguf(&[4, 6144], true), [6144, 1, 4]);
+        assert_eq!(hfq_shape_from_gguf(&[16], false), [16]);
     }
 }

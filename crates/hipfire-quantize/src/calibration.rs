@@ -3,29 +3,33 @@
 // Copyright (c) 2026 Nick Woolmer
 // hipfire — see LICENSE and NOTICE in the project root.
 
-
-#![allow(dead_code, unused_imports, unused_variables, non_snake_case, clippy::all)]
+#![allow(
+    dead_code,
+    unused_imports,
+    unused_variables,
+    non_snake_case,
+    clippy::all
+)]
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 use std::fs::File;
 use std::io::Write;
-use std::sync::OnceLock;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 
-use clap::Parser;
-use hipfire_quantize::float16::{bf16_to_f32, f16_to_f32, f32_to_f16};
-use hipfire_quantize::safetensors_file::{SafetensorsFile, TensorMeta};
-use hipfire_quantize::hessian_io;
+use crate::dequant::*;
 use crate::e8;
 use crate::e8_gptq;
 use crate::gguf_input;
 use crate::reap_overlay;
-use crate::dequant::*;
+use clap::Parser;
+use hipfire_quantize::float16::{bf16_to_f32, f16_to_f32, f32_to_f16};
+use hipfire_quantize::hessian_io;
+use hipfire_quantize::safetensors_file::{SafetensorsFile, TensorMeta};
 
 pub(crate) static IMATRIX: OnceLock<HashMap<String, Vec<f32>>> = OnceLock::new();
 pub(crate) static AWQ_ALPHA: OnceLock<f32> = OnceLock::new();
-
 
 pub(crate) fn resolve_model_path(input: &str) -> String {
     let path = Path::new(input);
@@ -107,7 +111,7 @@ pub(crate) fn is_gguf_input(p: &Path) -> bool {
 /// Returns None for tensors that don't have a known safetensors equivalent
 /// (we then keep them under their GGUF name; the future loader can decide
 /// what to do, or they're skipped).
-pub(crate) fn gguf_to_safetensors_name(gguf_name: &str) -> Option<String> {
+pub(crate) fn gguf_to_safetensors_name(gguf_name: &str, arch_str: &str) -> Option<String> {
     // Top-level tensors.
     match gguf_name {
         "token_embd.weight" => return Some("model.embed_tokens.weight".to_string()),
@@ -121,11 +125,34 @@ pub(crate) fn gguf_to_safetensors_name(gguf_name: &str) -> Option<String> {
         let dot = rest.find('.')?;
         let layer_idx = &rest[..dot];
         let slot_full = &rest[dot + 1..]; // "<slot>.weight"
-                                          // Drop the trailing ".weight" so we can rewrite slots like "attn_q"→"self_attn.q_proj".
+        let is_qwen35 = matches!(arch_str, "qwen35" | "qwen3.5" | "qwen3_5" | "qwen3_5_text");
+        if is_qwen35 {
+            // llama.cpp stores these two DeltaNet vectors without a `.weight`
+            // suffix, while the HF loader uses the linear-attention names.
+            match slot_full {
+                "ssm_a" => {
+                    return Some(format!("model.layers.{layer_idx}.linear_attn.A_log"));
+                }
+                "ssm_dt.bias" => {
+                    return Some(format!("model.layers.{layer_idx}.linear_attn.dt_bias"));
+                }
+                _ => {}
+            }
+        }
+        // Drop the trailing ".weight" so we can rewrite slots like
+        // "attn_q" -> "self_attn.q_proj".
         let slot = slot_full.strip_suffix(".weight")?;
         let translated = match slot {
             "attn_norm" => "input_layernorm".to_string(),
             "ffn_norm" => "post_attention_layernorm".to_string(),
+            "post_attention_norm" if is_qwen35 => "post_attention_layernorm".to_string(),
+            "attn_qkv" if is_qwen35 => "linear_attn.in_proj_qkv".to_string(),
+            "attn_gate" if is_qwen35 => "linear_attn.in_proj_z".to_string(),
+            "ssm_alpha" if is_qwen35 => "linear_attn.in_proj_a".to_string(),
+            "ssm_beta" if is_qwen35 => "linear_attn.in_proj_b".to_string(),
+            "ssm_out" if is_qwen35 => "linear_attn.out_proj".to_string(),
+            "ssm_conv1d" if is_qwen35 => "linear_attn.conv1d".to_string(),
+            "ssm_norm" if is_qwen35 => "linear_attn.norm".to_string(),
             "attn_q" => "self_attn.q_proj".to_string(),
             "attn_k" => "self_attn.k_proj".to_string(),
             "attn_v" => "self_attn.v_proj".to_string(),
@@ -628,7 +655,149 @@ pub(crate) fn gguf_is_embed_tensor(name: &str) -> bool {
 /// reads. Mirrors the field names HuggingFace uses in `config.json` for
 /// LlamaForCausalLM / Qwen3ForCausalLM, populated from the GGUF
 /// `<arch>.*` metadata keys.
-pub(crate) fn config_json_from_gguf(gguf: &gguf_input::GgufFile, arch_str: &str) -> serde_json::Value {
+fn add_qwen35_hybrid_config(
+    metadata: &HashMap<String, gguf_input::MetaValue>,
+    prefix: &str,
+    cfg: &mut serde_json::Map<String, serde_json::Value>,
+) {
+    use gguf_input::MetaValue as MV;
+
+    let as_u64 = |key: &str| {
+        metadata.get(key).and_then(|value| match value {
+            MV::U8(v) => Some(*v as u64),
+            MV::I8(v) => u64::try_from(*v).ok(),
+            MV::U16(v) => Some(*v as u64),
+            MV::I16(v) => u64::try_from(*v).ok(),
+            MV::U32(v) => Some(*v as u64),
+            MV::I32(v) => u64::try_from(*v).ok(),
+            MV::U64(v) => Some(*v),
+            MV::I64(v) => u64::try_from(*v).ok(),
+            _ => None,
+        })
+    };
+
+    let n_layers = as_u64(&format!("{prefix}.block_count")).unwrap_or(0) as usize;
+    let interval = as_u64(&format!("{prefix}.full_attention_interval")).unwrap_or(0) as usize;
+    if n_layers > 0 && interval > 0 {
+        let layer_types: Vec<_> = (0..n_layers)
+            .map(|layer| {
+                serde_json::Value::from(if (layer + 1) % interval == 0 {
+                    "full_attention"
+                } else {
+                    "linear_attention"
+                })
+            })
+            .collect();
+        cfg.insert(
+            "layer_types".to_string(),
+            serde_json::Value::Array(layer_types),
+        );
+        cfg.insert(
+            "full_attention_interval".to_string(),
+            serde_json::Value::from(interval as u64),
+        );
+    }
+
+    let state_size = as_u64(&format!("{prefix}.ssm.state_size"));
+    let group_count = as_u64(&format!("{prefix}.ssm.group_count"));
+    let inner_size = as_u64(&format!("{prefix}.ssm.inner_size"));
+    let conv_kernel = as_u64(&format!("{prefix}.ssm.conv_kernel"));
+    if let Some(v) = group_count {
+        cfg.insert(
+            "linear_num_key_heads".to_string(),
+            serde_json::Value::from(v),
+        );
+    }
+    if let (Some(inner), Some(state)) = (inner_size, state_size.filter(|&v| v > 0)) {
+        cfg.insert(
+            "linear_num_value_heads".to_string(),
+            serde_json::Value::from(inner / state),
+        );
+    }
+    if let Some(v) = state_size {
+        cfg.insert(
+            "linear_key_head_dim".to_string(),
+            serde_json::Value::from(v),
+        );
+        cfg.insert(
+            "linear_value_head_dim".to_string(),
+            serde_json::Value::from(v),
+        );
+    }
+    if let Some(v) = conv_kernel {
+        cfg.insert(
+            "linear_conv_kernel_dim".to_string(),
+            serde_json::Value::from(v),
+        );
+    }
+
+    let head_dim = as_u64(&format!("{prefix}.attention.key_length"));
+    let rope_dims = as_u64(&format!("{prefix}.rope.dimension_count"));
+    let partial = rope_dims
+        .zip(head_dim)
+        .and_then(|(dims, head)| (head > 0).then_some(dims as f64 / head as f64));
+    if let Some(v) = partial {
+        cfg.insert(
+            "partial_rotary_factor".to_string(),
+            serde_json::Value::from(v),
+        );
+    }
+
+    let rope_theta =
+        metadata
+            .get(&format!("{prefix}.rope.freq_base"))
+            .and_then(|value| match value {
+                MV::F32(v) => Some(*v as f64),
+                MV::F64(v) => Some(*v),
+                _ => None,
+            });
+    let mrope_section = metadata
+        .get(&format!("{prefix}.rope.dimension_sections"))
+        .and_then(|value| match value {
+            MV::Array(values) => Some(
+                values
+                    .iter()
+                    .take(3)
+                    .filter_map(|value| match value {
+                        MV::U32(v) => Some(serde_json::Value::from(*v)),
+                        MV::I32(v) => u64::try_from(*v).ok().map(serde_json::Value::from),
+                        MV::U64(v) => Some(serde_json::Value::from(*v)),
+                        MV::I64(v) => u64::try_from(*v).ok().map(serde_json::Value::from),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+            _ => None,
+        });
+    let mut rope = serde_json::Map::new();
+    if let Some(v) = rope_theta {
+        rope.insert("rope_theta".to_string(), serde_json::Value::from(v));
+    }
+    if let Some(v) = partial {
+        rope.insert(
+            "partial_rotary_factor".to_string(),
+            serde_json::Value::from(v),
+        );
+    }
+    if let Some(v) = mrope_section.filter(|v| v.len() == 3) {
+        rope.insert(
+            "mrope_interleaved".to_string(),
+            serde_json::Value::from(true),
+        );
+        rope.insert("mrope_section".to_string(), serde_json::Value::Array(v));
+    }
+    if !rope.is_empty() {
+        cfg.insert(
+            "rope_parameters".to_string(),
+            serde_json::Value::Object(rope),
+        );
+    }
+}
+
+pub(crate) fn config_json_from_gguf(
+    gguf: &gguf_input::GgufFile,
+    arch_str: &str,
+) -> serde_json::Value {
     // GGUF prefixes its model hyperparameters with the architecture name —
     // e.g. for `general.architecture=llama` the keys live under `llama.*`.
     let prefix = arch_str;
@@ -722,6 +891,9 @@ pub(crate) fn config_json_from_gguf(gguf: &gguf_input::GgufFile, arch_str: &str)
     }
     cfg.insert("bos_token_id".to_string(), serde_json::Value::from(bos));
     cfg.insert("eos_token_id".to_string(), serde_json::Value::from(eos));
+    if matches!(arch_str, "qwen35" | "qwen3.5" | "qwen3_5" | "qwen3_5_text") {
+        add_qwen35_hybrid_config(&gguf.metadata, prefix, &mut cfg);
+    }
     serde_json::Value::Object(cfg)
 }
 
@@ -729,7 +901,9 @@ pub(crate) fn config_json_from_gguf(gguf: &gguf_input::GgufFile, arch_str: &str)
 /// the `.hfq` header's metadata blob. A future engine-side `from_hfq` for
 /// Llama-style models can read these fields the same way the existing
 /// `from_gguf` reads them today.
-pub(crate) fn gguf_meta_to_json(meta: &HashMap<String, gguf_input::MetaValue>) -> serde_json::Value {
+pub(crate) fn gguf_meta_to_json(
+    meta: &HashMap<String, gguf_input::MetaValue>,
+) -> serde_json::Value {
     let mut map = serde_json::Map::new();
     for (k, v) in meta {
         let json_v = mv_to_json(v);
@@ -756,5 +930,99 @@ pub(crate) fn mv_to_json(v: &gguf_input::MetaValue) -> serde_json::Value {
         // Tokenizer arrays (tokens, scores, merges, ...) can be huge —
         // serialize them as JSON arrays so the engine side can re-parse.
         MV::Array(arr) => serde_json::Value::Array(arr.iter().map(mv_to_json).collect()),
+    }
+}
+
+#[cfg(test)]
+mod qwen35_gguf_config_tests {
+    use super::*;
+    use gguf_input::MetaValue as MV;
+
+    #[test]
+    fn qwen35_hybrid_metadata_restores_layer_and_deltanet_shape() {
+        let mut metadata = HashMap::new();
+        metadata.insert("qwen35.block_count".to_string(), MV::U32(8));
+        metadata.insert("qwen35.full_attention_interval".to_string(), MV::U32(4));
+        metadata.insert("qwen35.attention.key_length".to_string(), MV::U32(256));
+        metadata.insert("qwen35.ssm.group_count".to_string(), MV::U32(16));
+        metadata.insert("qwen35.ssm.state_size".to_string(), MV::U32(128));
+        metadata.insert("qwen35.ssm.inner_size".to_string(), MV::U32(6144));
+        metadata.insert("qwen35.ssm.conv_kernel".to_string(), MV::U32(4));
+        metadata.insert("qwen35.rope.dimension_count".to_string(), MV::U32(64));
+        metadata.insert("qwen35.rope.freq_base".to_string(), MV::F32(10_000_000.0));
+        metadata.insert(
+            "qwen35.rope.dimension_sections".to_string(),
+            MV::Array(vec![MV::U32(11), MV::U32(11), MV::U32(10), MV::U32(0)]),
+        );
+
+        let mut cfg = serde_json::Map::new();
+        add_qwen35_hybrid_config(&metadata, "qwen35", &mut cfg);
+
+        let layers = cfg["layer_types"].as_array().unwrap();
+        assert_eq!(layers.len(), 8);
+        assert_eq!(layers[0], "linear_attention");
+        assert_eq!(layers[3], "full_attention");
+        assert_eq!(layers[7], "full_attention");
+        assert_eq!(cfg["linear_num_key_heads"], 16);
+        assert_eq!(cfg["linear_num_value_heads"], 48);
+        assert_eq!(cfg["linear_key_head_dim"], 128);
+        assert_eq!(cfg["linear_value_head_dim"], 128);
+        assert_eq!(cfg["linear_conv_kernel_dim"], 4);
+        assert_eq!(cfg["partial_rotary_factor"], 0.25);
+        assert_eq!(
+            cfg["rope_parameters"]["mrope_section"],
+            serde_json::json!([11, 11, 10])
+        );
+        assert_eq!(cfg["rope_parameters"]["mrope_interleaved"], true);
+    }
+
+    #[test]
+    fn qwen35_gguf_deltanet_names_match_loader_schema() {
+        let cases = [
+            (
+                "blk.0.attn_qkv.weight",
+                "model.layers.0.linear_attn.in_proj_qkv.weight",
+            ),
+            (
+                "blk.0.attn_gate.weight",
+                "model.layers.0.linear_attn.in_proj_z.weight",
+            ),
+            (
+                "blk.0.ssm_alpha.weight",
+                "model.layers.0.linear_attn.in_proj_a.weight",
+            ),
+            (
+                "blk.0.ssm_beta.weight",
+                "model.layers.0.linear_attn.in_proj_b.weight",
+            ),
+            (
+                "blk.0.ssm_out.weight",
+                "model.layers.0.linear_attn.out_proj.weight",
+            ),
+            (
+                "blk.0.ssm_conv1d.weight",
+                "model.layers.0.linear_attn.conv1d.weight",
+            ),
+            (
+                "blk.0.ssm_norm.weight",
+                "model.layers.0.linear_attn.norm.weight",
+            ),
+            ("blk.0.ssm_a", "model.layers.0.linear_attn.A_log"),
+            ("blk.0.ssm_dt.bias", "model.layers.0.linear_attn.dt_bias"),
+            (
+                "blk.0.post_attention_norm.weight",
+                "model.layers.0.post_attention_layernorm.weight",
+            ),
+        ];
+        for (gguf, expected) in cases {
+            assert_eq!(
+                gguf_to_safetensors_name(gguf, "qwen35").as_deref(),
+                Some(expected)
+            );
+        }
+        assert_eq!(
+            gguf_to_safetensors_name("blk.3.attn_q.weight", "qwen35").as_deref(),
+            Some("model.layers.3.self_attn.q_proj.weight")
+        );
     }
 }
