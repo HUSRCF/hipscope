@@ -160,6 +160,25 @@ impl HfqFile {
         resident * 100 >= n_pages * 90
     }
 
+    /// [`Self::mostly_page_cached`] memoized per file instance. The probe
+    /// maps + mincores the whole multi-GB file (~0.4 s on an 18.8 GB model),
+    /// so callers inside a layer sweep must not re-run it per layer — but the
+    /// answer belongs to THIS file: a process-global memo goes stale when the
+    /// daemon swaps models (a warm model A would make a cold model B take the
+    /// zero-copy path and soft-fault serially at ~0.25 GB/s).
+    #[cfg(unix)]
+    pub fn mostly_page_cached_memo(&self) -> bool {
+        match self.pages_resident_memo.get() {
+            1 => true,
+            2 => false,
+            _ => {
+                let resident = self.mostly_page_cached();
+                self.pages_resident_memo.set(if resident { 1 } else { 2 });
+                resident
+            }
+        }
+    }
+
     /// Non-unix fallback: never pre-detected as cached.
     #[cfg(not(unix))]
     fn mostly_page_cached(&self) -> bool {
@@ -289,6 +308,11 @@ pub struct HfqFile {
     /// 2026-08-22 on gfx1100: fadvise-per-tensor forces a full disk re-read
     /// of the model on every load (~1.3 GB/s effective vs multi-GB/s cache).
     evict_page_cache: bool,
+    /// Memoized result of [`Self::mostly_page_cached`] for THIS file:
+    /// 0 = not probed, 1 = resident, 2 = not resident. Per-instance (not a
+    /// process global) so loading a second model in the same daemon probes
+    /// its own file instead of inheriting the previous model's answer.
+    pages_resident_memo: std::cell::Cell<u8>,
     /// Optional overlay HFQ whose tensors shadow this file's by name (the
     /// REAP load-time splice, SP3). When `Some`, every tensor read method
     /// consults the overlay first and falls back to the base. When `None`
@@ -591,6 +615,7 @@ impl HfqFile {
             tensor_map,
             pread_buf: std::cell::RefCell::new(Vec::new()),
             evict_page_cache: true,
+            pages_resident_memo: std::cell::Cell::new(0),
             overlay: None,
         };
 
@@ -870,10 +895,10 @@ impl HfqFile {
         }
         let idx = self.resolve_idx(name)?;
         let info = &self.tensors[idx];
-        debug_assert!(
-            self.mmap.is_some(),
-            "tensor_data() called after drop_mmap() — use tensor_data_vec() or tensor_data_pread() instead (tensor: {name})"
-        );
+        // NOTE: `self.mmap` may legitimately be None here — UMA loads drop the
+        // mapping in prepare() and callers probe tensor_data() first, falling
+        // back to tensor_data_vec()/tensor_data_pread() on None. Do NOT
+        // assert-fail debug builds on that expected path.
         let mmap = self.mmap.as_ref()?;
         Some((
             info,
