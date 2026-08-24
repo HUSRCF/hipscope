@@ -8,23 +8,23 @@ The official extension is a PyTorch/pybind module and is hundreds of megabytes.
 Its public Python ABI is not usable from hipfire's Rust/raw-HIP runtime. This
 experiment instead compiles a selected CK instance set into a small library and
 exports a versioned C ABI. The library remains an optional runtime artifact.
-ABI v2 enumerates exact-architecture layout capabilities and exposes a uniform
-caller-owned workspace query. The dense reference artifact requires no
-workspace; future quantized adapters can request persistent scratch without
-allocating inside a stream-ordered launch.
+ABI v3 enumerates exact-architecture layout capabilities, distinguishes dense
+element strides from packed row-byte strides, and exposes a caller-owned
+workspace query. The first quantized cell stages through persistent caller
+scratch without allocating inside a stream-ordered launch.
 
 Current scope:
 
 - dense FP16 forward attention;
 - causal or non-causal masks;
 - MHA, MQA, and GQA;
-- head dimension 64;
+- dense FP16 head dimension 64;
+- gfx1100 F32-Q/Q8-K/Q8-V causal GQA at head dimension 256;
 - raw HIP stream and element-stride inputs.
 
-It does not support hipfire's Q8/asym/FWHT KV layouts. Those layouts must stay
-on hipfire's native attention kernels. The first possible runtime consumer is
-`AttnFullF16`, after adding reusable FP32-to-FP16 query/output scratch because
-that hipfire boundary currently carries Q and output in FP32.
+The Q8 cell vector-decodes both packed caches into F16, invokes the CK D256
+pipeline, and converts output back to F32. It is a correctness-first staged
+adapter; direct quantized CK and asym/FWHT/Lloyd layouts remain future cells.
 
 ## Build
 
@@ -34,10 +34,10 @@ accepted by top-level build metadata. To keep this experiment reproducible,
 `13f6d635653bd5ffbfcac8577f1ef09590c23d78` into the build directory and applies
 the bundled `gfx11_ck_recipe.patch` before generating any kernels. Changes in
 the caller's CK worktree are not consumed. The minimal recipe changes four CK
-files: it adds the gfx11 D64 tile and GEMM epilogue contract, remaps the
+files: it adds the gfx11 tile and GEMM epilogue contract, remaps the
 softmax-P and output-accumulator distributions through LDS, and uses an
 explicit tile redistribution where the gfx11 register layouts differ. It does
-not include the research tree's vLLM, split-K, D128/D256, or debug changes. The
+not include the research tree's vLLM, split-K, or debug changes. The
 patch SHA256 is:
 
 ```text
@@ -46,8 +46,7 @@ b43ea8d12e14cef04518225acaa69b63e62991ba4a83efcd596fc108105ac765
 
 `FLASH_ATTN_ROOT` must point to a FlashAttention checkout whose
 `csrc/composable_kernel` Git repository contains that revision. The build also
-fails unless the patched generator emits exactly eight FP16/D64 kernel
-instances plus one dispatcher.
+fails unless the patched generator emits the exact D64/D128/D256 instance set.
 
 ```bash
 FLASH_ATTN_ROOT=/path/to/gfx11-enabled-flash-attention \
@@ -67,7 +66,7 @@ RUNPATH: /opt/rocm/core-7.14/lib
 NEEDED: libamdhip64.so.7
 ```
 
-The resulting D64-only sidecar is about 324 KiB. The full PyTorch extension is
+The resulting selected-instance sidecar is under 1 MiB. The full PyTorch extension is
 not required and remains outside hipfire.
 
 ## Smoke
@@ -77,9 +76,9 @@ HIP_VISIBLE_DEVICES=0 \
   experiments/flash-attn-ck-sidecar/build/smoke_raw_abi
 ```
 
-The pure-HIP smoke runs FP16 MHA, MQA, and GQA cases against a CPU reference.
-The causal GQA case uses a non-default HIP stream. A runtime route is out of
-scope until this passes under the same ROCm runtime used to build hipfire.
+The pure-HIP smoke runs dense FP16 MHA/MQA/GQA and packed Q8 D256 GQA cases
+against CPU references. The Q8 reference uses reconstructed quantized values,
+so it checks staging and attention independently of quantization error.
 
 Validated on Radeon Pro W7900 / gfx1100 with ROCm 7.14:
 
@@ -89,6 +88,7 @@ Validated on Radeon Pro W7900 / gfx1100 with ROCm 7.14:
 | FP16 GQA D64, causal, non-default stream | `5.501509e-05` | `7.329229e-06` |
 | FP16 MHA D64, non-causal, default stream | `4.062802e-05` | `6.646507e-06` |
 | FP16 MQA D64, non-causal, default stream | `4.367530e-05` | `6.348691e-06` |
+| F32/Q8/Q8 GQA D256, causal | `4.766881e-05` | `7.248458e-06` |
 
 ## Optional Rust loader
 
@@ -108,6 +108,5 @@ HIPFIRE_FLASH_ATTN_CK_TEST_LIB="$PWD/experiments/flash-attn-ck-sidecar/build/lib
   flash_attn_ck::tests::explicit_test_sidecar_loads
 ```
 
-The current hipfire `AttnFullF16` contract still uses FP32 Q and output tensors,
-so it is not routed to this all-FP16 sidecar. A production route requires
-preallocated conversion scratch owned outside the attention hot path.
+Serving selection remains fail-closed and occurs only after native KV-tier
+resolution. Loading a sidecar alone cannot route an unsupported layout to CK.

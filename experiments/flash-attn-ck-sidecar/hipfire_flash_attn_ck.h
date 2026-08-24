@@ -9,11 +9,12 @@
 extern "C" {
 #endif
 
-#define HIPFIRE_FLASH_ATTN_CK_ABI_VERSION 2u
+#define HIPFIRE_FLASH_ATTN_CK_ABI_VERSION 3u
 
 enum hipfire_flash_attn_ck_dtype {
     HIPFIRE_FLASH_ATTN_CK_F16 = 1,
     HIPFIRE_FLASH_ATTN_CK_BF16 = 2,
+    HIPFIRE_FLASH_ATTN_CK_F32 = 3,
 };
 
 enum hipfire_flash_attn_ck_arch {
@@ -82,6 +83,10 @@ struct hipfire_flash_attn_ck_fwd_params {
     int64_t batch_stride_k;
     int64_t batch_stride_v;
     int64_t batch_stride_out;
+
+    /* Packed KV row strides are bytes. Zero for dense K/V formats. */
+    int64_t packed_k_row_stride_bytes;
+    int64_t packed_v_row_stride_bytes;
 };
 
 uint32_t hipfire_flash_attn_ck_abi_version(void);

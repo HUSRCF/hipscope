@@ -7,6 +7,7 @@ ROCM_PATH="${ROCM_PATH:-/opt/rocm}"
 GPU_ARCH="${GPU_ARCH:-gfx1100}"
 MAX_JOBS="${MAX_JOBS:-8}"
 OUT="${OUT:-${ROOT}/build/libhipfire_flash_attn_ck.so}"
+HEAD_DIMS="${HEAD_DIMS:-64,128,256}"
 
 case "${GPU_ARCH}" in
     gfx1100) TARGET_DEFINE=HIPFIRE_CK_TARGET_GFX1100 ;;
@@ -67,18 +68,18 @@ if [[ ! -f "${FMHA_DIR}/fmha_fwd.hpp" || ! -f "${GENERATOR}" ]]; then
 fi
 
 LIST="${BUILD_DIR}/sources.list"
-FILTER="*d64_fp16_batch*_nlogits_nbias_*nlse_ndropout_nskip_nqscale_ntrload*"
+FILTER="*d*_fp16_batch*_nlogits_nbias_*nlse_ndropout_nskip_nqscale_ntrload*"
 
 python3 "${GENERATOR}" \
     --targets gfx11 \
     --api fwd \
     --receipt 2 \
-    --optdim 64 \
+    --optdim "${HEAD_DIMS}" \
     --filter "${FILTER}" \
     --list_blobs "${LIST}"
 
-if [[ "$(wc -l < "${LIST}")" -ne 9 ]]; then
-    echo "expected 8 gfx11 FP16/D64 kernels plus one API source" >&2
+if [[ "$(wc -l < "${LIST}")" -ne 17 ]]; then
+    echo "expected 17 gfx11 FP16 D64/D128/D256 generated sources" >&2
     echo "the supplied FlashAttention tree does not carry the validated gfx11 recipe" >&2
     exit 2
 fi
@@ -87,7 +88,7 @@ python3 "${GENERATOR}" \
     --targets gfx11 \
     --api fwd \
     --receipt 2 \
-    --optdim 64 \
+    --optdim "${HEAD_DIMS}" \
     --filter "${FILTER}" \
     --output_dir "${BUILD_DIR}/generated"
 
@@ -119,8 +120,8 @@ COMMON_FLAGS=(
 )
 
 mapfile -t GENERATED_SOURCES < <(find "${BUILD_DIR}/generated" -maxdepth 2 -type f -name 'fmha_fwd*.cpp' | sort)
-if [[ "${#GENERATED_SOURCES[@]}" -ne 9 ]]; then
-    echo "generated ${#GENERATED_SOURCES[@]} sources, expected 9" >&2
+if [[ "${#GENERATED_SOURCES[@]}" -ne 17 ]]; then
+    echo "generated ${#GENERATED_SOURCES[@]} sources, expected 17" >&2
     exit 2
 fi
 

@@ -15,7 +15,7 @@ use std::ffi::{c_char, c_void};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-pub const FLASH_ATTN_CK_ABI_VERSION: u32 = 2;
+pub const FLASH_ATTN_CK_ABI_VERSION: u32 = 3;
 const ERROR_CAPACITY: usize = 512;
 
 #[repr(i32)]
@@ -23,6 +23,7 @@ const ERROR_CAPACITY: usize = 512;
 pub enum FlashAttnCkDType {
     F16 = 1,
     Bf16 = 2,
+    F32 = 3,
 }
 
 #[repr(i32)]
@@ -183,6 +184,7 @@ impl FlashAttnCkCapability {
             self.dtype,
             value if value == FlashAttnCkDType::F16 as i32
                 || value == FlashAttnCkDType::Bf16 as i32
+                || value == FlashAttnCkDType::F32 as i32
         ) && matches!(
             self.k_format,
             value if is_known_kv_format(value)
@@ -245,6 +247,8 @@ pub struct FlashAttnCkFwdParams {
     pub batch_stride_k: i64,
     pub batch_stride_v: i64,
     pub batch_stride_out: i64,
+    pub packed_k_row_stride_bytes: i64,
+    pub packed_v_row_stride_bytes: i64,
 }
 
 impl FlashAttnCkFwdParams {
@@ -282,6 +286,8 @@ impl FlashAttnCkFwdParams {
             batch_stride_k: 0,
             batch_stride_v: 0,
             batch_stride_out: 0,
+            packed_k_row_stride_bytes: 0,
+            packed_v_row_stride_bytes: 0,
         }
     }
 }
@@ -544,7 +550,7 @@ mod tests {
 
     #[test]
     fn fwd_params_matches_c_abi_layout() {
-        assert_eq!(std::mem::size_of::<FlashAttnCkFwdParams>(), 208);
+        assert_eq!(std::mem::size_of::<FlashAttnCkFwdParams>(), 224);
         assert_eq!(std::mem::align_of::<FlashAttnCkFwdParams>(), 8);
         assert_eq!(std::mem::offset_of!(FlashAttnCkFwdParams, q), 8);
         assert_eq!(std::mem::offset_of!(FlashAttnCkFwdParams, workspace), 40);
@@ -557,6 +563,10 @@ mod tests {
         assert_eq!(
             std::mem::offset_of!(FlashAttnCkFwdParams, batch_stride_out),
             200
+        );
+        assert_eq!(
+            std::mem::offset_of!(FlashAttnCkFwdParams, packed_k_row_stride_bytes),
+            208
         );
     }
 
