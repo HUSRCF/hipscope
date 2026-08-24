@@ -4,11 +4,12 @@
 
 //! GPU correctness oracle for the qt44 (MQ4G256V2) MoE kernels.
 //!
-//! Covers the three kernels added for RDNA4 / R9700 support:
+//! Covers the four qt44 MoE kernels this branch adds:
 //!   * `gemm_mq4g256v2_moe_grouped_wmma_k2`   — prefill, arch-selecting
 //!     (gfx11 `_k2` source / gfx12 `_gfx12` source)
 //!   * `gemv_mq4g256v2_moe_gate_up_k8_indexed`        — decode
 //!   * `gemv_mq4g256v2_moe_down_k8_indexed_batched_expanded` — decode
+//!   * `gemv_mq4g256v2_moe_ninepath_d4`       — decode, fused down + combine
 //!
 //! WHY THIS EXISTS. The gfx12 grouped kernel was written without access to
 //! gfx12 hardware. It compiles for gfx1201 and its VGPR/LDS budget is checked
@@ -484,6 +485,74 @@ fn grouped_check(gpu: &mut Gpu, rep: &mut Report) {
     println!();
 }
 
+fn ninepath_check(gpu: &mut Gpu, rep: &mut Report) {
+    // The fused down + weighted combine. Requirements from the kernel: down_k
+    // == 512 (2 groups), down_m % 16 == 0, blockDim 256 (8 warps = 8 kranks).
+    //
+    // This kernel folds the k_top partials AND accumulates into the residual,
+    // replacing the expanded GEMV + separate combine. So the reference is the
+    // whole weighted sum, not a per-rank output.
+    let (m, k, k_top, n_exp) = (64usize, 512usize, 8usize, 8usize);
+    println!("ninepath M={m} K={k} k_top={k_top} n_exp={n_exp}");
+
+    let weights: Vec<Vec<f32>> = (0..n_exp)
+        .map(|e| {
+            let mut w = build_disjoint_halves(m, k);
+            for v in w.iter_mut() {
+                *v += e as f32 * 0.25;
+            }
+            w
+        })
+        .collect();
+    let blobs: Vec<Vec<u8>> = weights.iter().map(|w| pack_mq4g256v2(w, m, k)).collect();
+    let (_experts, ptr_tab) = upload_experts(gpu, &blobs);
+
+    let topk: Vec<i32> = (0..k_top).map(|r| (r % n_exp) as i32).collect();
+    let topk_b: Vec<u8> = topk.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let topk_t = gpu.upload_raw(&topk_b, &[k_top]).unwrap();
+
+    // Non-uniform weights so a fold that ignored them, or folded in the wrong
+    // order, would show up.
+    let tw: Vec<f32> = (0..k_top).map(|i| 0.05 + 0.1 * (i as f32)).collect();
+    let tw_t = gpu.upload_f32(&tw, &[k_top]).unwrap();
+
+    let act: Vec<f32> = (0..k_top * k)
+        .map(|i| prng(i, 0x9A17) * 2.0 - 1.0)
+        .collect();
+    let act_t = gpu.upload_f32(&act, &[k_top * k]).unwrap();
+
+    // The kernel accumulates (`out[..] += a`), so start from a known non-zero
+    // residual — that also catches a kernel that overwrites instead of adding.
+    let out0: Vec<f32> = (0..m).map(|i| prng(i, 0x3C3C) - 0.5).collect();
+    let out_t = gpu.upload_f32(&out0, &[m]).unwrap();
+
+    gpu.gemv_mq4g256v2_moe_ninepath_d4(&ptr_tab, &topk_t, &tw_t, &act_t, &out_t, m, k)
+        .expect("ninepath launch");
+    gpu.hip.device_synchronize().unwrap();
+    let got = gpu.download_f32(&out_t).unwrap();
+
+    let mut want = out0.clone();
+    let mut want_swapped = out0.clone();
+    for (r, &e) in topk.iter().enumerate() {
+        let blob = &blobs[e as usize];
+        let xr = &act[r * k..(r + 1) * k];
+        for row in 0..m {
+            let wr = dequant_row(blob, row, k, false);
+            want[row] += tw[r] * wr.iter().zip(xr).map(|(a, b)| a * b).sum::<f32>();
+            let ws = dequant_row(blob, row, k, true);
+            want_swapped[row] += tw[r] * ws.iter().zip(xr).map(|(a, b)| a * b).sum::<f32>();
+        }
+    }
+    rep.check("ninepath d4 fused down+combine", &got, &want, 1e-5);
+    rep.check_disagrees(
+        "ninepath vs grid-swapped ref (negative control)",
+        &got,
+        &want_swapped,
+        1e-2,
+    );
+    println!();
+}
+
 fn main() {
     let mut rep = Report { failures: 0 };
     host_self_test(&mut rep);
@@ -494,6 +563,7 @@ fn main() {
             gate_up_check(&mut gpu, &mut rep);
             down_check(&mut gpu, &mut rep);
             grouped_check(&mut gpu, &mut rep);
+            ninepath_check(&mut gpu, &mut rep);
         }
         Err(e) => {
             println!("GPU init failed ({e:?}); host self-test only.");

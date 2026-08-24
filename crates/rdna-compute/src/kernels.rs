@@ -2337,6 +2337,15 @@ pub const GEMV_HFQ4G256_MOE_NINEPATH_D3_SRC: &str =
 pub const GEMV_HFQ4G256_MOE_NINEPATH_D4_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq4g256_moe_ninepath_d4.hip");
 
+/// MQ4G256V2 (qt=44) sister of [`GEMV_HFQ4G256_MOE_NINEPATH_D4_SRC`].
+///
+/// Identical staging / warp-per-krank / fold structure; differs only in the
+/// group header decode. qt44 previously matched neither `ninepath_hfq4` nor
+/// `ninepath_mq3l`, so it was denied the fused down path despite clearing the
+/// shape gate — which the published Ornith 1.5 artifact does exactly.
+pub const GEMV_MQ4G256V2_MOE_NINEPATH_D4_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mq4g256v2_moe_ninepath_d4.hip");
+
 /// MQ3-Lloyd codebook port of the nine-path fused MoE down + weighted combine.
 /// Stages the rotated activation ONCE for all 8 routed experts (the incumbent
 /// re-reads it in each of 16,384 single-wave workgroups) and folds the 8

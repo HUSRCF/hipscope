@@ -628,7 +628,14 @@ pub fn run_moe_decode(
     let ninepath_mq3l = ninepath_shape_ok
         && p.dtypes.routed_gate_up == DType::MQ2G256Lloyd
         && p.dtypes.routed_down == DType::MQ3G256Lloyd;
-    let ninepath_eligible = ninepath_hfq4 || ninepath_mq3l;
+    // qt44. The published Ornith 1.5 artifact clears `ninepath_shape_ok`
+    // exactly (hidden_size 2048, moe_intermediate_size 512,
+    // num_experts_per_tok 8) but matched neither family above, so it paid the
+    // expanded+combine cost on the shape this path was tuned for.
+    let ninepath_mq4v2 = ninepath_shape_ok
+        && p.dtypes.routed_gate_up == DType::MQ4G256V2
+        && p.dtypes.routed_down == DType::MQ4G256V2;
+    let ninepath_eligible = ninepath_hfq4 || ninepath_mq3l || ninepath_mq4v2;
     // Modes: "0"/off = chain; "d3" = D3 only (RESEARCH: 1-ULP codegen
     // divergence from the baseline gate_up — not byte-exact, and slower);
     // "1"/"on" = D3+D4 (research); anything else incl. unset = D4 only
@@ -872,6 +879,20 @@ pub fn run_moe_decode(
             // krank order (single owner per row, no atomics), so the shared
             // combine below is skipped exactly as it is for the HFQ4 arm.
             hip!(gpu.gemv_mq3g256_lloyd_moe_ninepath_d4(
+                p.expert_down_ptrs,
+                p.topk_indices,
+                p.topk_weights,
+                p.rot_batch,
+                out_target,
+                down_m,
+                down_k,
+            ))?;
+        } else if ninepath_d4 && ninepath_mq4v2 {
+            // MUST precede the bare `ninepath_d4` arm below, which calls the
+            // qt13 kernel. qt13 and qt44 share a 136 B stride and nibble
+            // packing and differ only in the header, so that fallthrough would
+            // misread qt44 silently.
+            hip!(gpu.gemv_mq4g256v2_moe_ninepath_d4(
                 p.expert_down_ptrs,
                 p.topk_indices,
                 p.topk_weights,
