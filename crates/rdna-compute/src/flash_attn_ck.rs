@@ -75,6 +75,94 @@ pub struct FlashAttnCkRequest {
     pub required_flags: u32,
 }
 
+/// Runtime facts resolved by the native KV policy before an optional CK route
+/// is considered. This deliberately contains no pointers: eligibility is a
+/// pure, testable decision and launching remains a separate operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FlashAttnCkPrefillInput {
+    pub request: FlashAttnCkRequest,
+    pub batch_size: usize,
+    pub nhead_q: usize,
+    pub nhead_k: usize,
+    pub causal: bool,
+    pub contiguous_prefix: bool,
+    pub capture_mode: bool,
+    pub has_tree_bias: bool,
+    pub window: usize,
+    pub block_start: usize,
+    pub block_cols: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlashAttnCkRejectReason {
+    Decode,
+    UnsupportedFormat,
+    UnsupportedHeadDim,
+    InvalidGqa,
+    NonCausal,
+    NonContiguousPrefix,
+    GraphCapture,
+    TreeAttention,
+    WindowedAttention,
+    BlockAttention,
+    CapabilityMiss,
+}
+
+/// Admit the first production cell only. Later quantized cells should extend
+/// this policy explicitly instead of weakening its fail-closed conditions.
+pub fn select_q8_d256_prefill(
+    runtime: &FlashAttnCk,
+    input: FlashAttnCkPrefillInput,
+) -> Result<FlashAttnCkRequest, FlashAttnCkRejectReason> {
+    select_q8_d256_prefill_capabilities(runtime.capabilities(), input)
+}
+
+fn select_q8_d256_prefill_capabilities(
+    capabilities: &[FlashAttnCkCapability],
+    input: FlashAttnCkPrefillInput,
+) -> Result<FlashAttnCkRequest, FlashAttnCkRejectReason> {
+    let request = input.request;
+    if input.batch_size <= 1 {
+        return Err(FlashAttnCkRejectReason::Decode);
+    }
+    if request.k_format != FlashAttnCkKvFormat::Q8
+        || request.v_format != FlashAttnCkKvFormat::Q8
+    {
+        return Err(FlashAttnCkRejectReason::UnsupportedFormat);
+    }
+    if request.head_dim != 256 {
+        return Err(FlashAttnCkRejectReason::UnsupportedHeadDim);
+    }
+    if input.nhead_k == 0
+        || input.nhead_q < input.nhead_k
+        || !input.nhead_q.is_multiple_of(input.nhead_k)
+    {
+        return Err(FlashAttnCkRejectReason::InvalidGqa);
+    }
+    if !input.causal {
+        return Err(FlashAttnCkRejectReason::NonCausal);
+    }
+    if !input.contiguous_prefix {
+        return Err(FlashAttnCkRejectReason::NonContiguousPrefix);
+    }
+    if input.capture_mode {
+        return Err(FlashAttnCkRejectReason::GraphCapture);
+    }
+    if input.has_tree_bias {
+        return Err(FlashAttnCkRejectReason::TreeAttention);
+    }
+    if input.window != 0 {
+        return Err(FlashAttnCkRejectReason::WindowedAttention);
+    }
+    if input.block_start != 0 || input.block_cols != 0 {
+        return Err(FlashAttnCkRejectReason::BlockAttention);
+    }
+    if !capabilities.iter().any(|cell| cell.supports(request)) {
+        return Err(FlashAttnCkRejectReason::CapabilityMiss);
+    }
+    Ok(request)
+}
+
 impl FlashAttnCkCapability {
     pub fn supports(&self, request: FlashAttnCkRequest) -> bool {
         self.arch == request.arch as i32
@@ -491,6 +579,120 @@ mod tests {
             head_dim: 64,
             flags: FLASH_ATTN_CK_CAP_CAUSAL | FLASH_ATTN_CK_CAP_GQA,
         }
+    }
+
+    fn q8_d256_capability() -> FlashAttnCkCapability {
+        FlashAttnCkCapability {
+            k_format: FlashAttnCkKvFormat::Q8 as i32,
+            v_format: FlashAttnCkKvFormat::Q8 as i32,
+            head_dim: 256,
+            ..dense_capability(FlashAttnCkArch::Gfx1100)
+        }
+    }
+
+    fn eligible_q8_prefill() -> FlashAttnCkPrefillInput {
+        FlashAttnCkPrefillInput {
+            request: FlashAttnCkRequest {
+                arch: FlashAttnCkArch::Gfx1100,
+                dtype: FlashAttnCkDType::F16,
+                k_format: FlashAttnCkKvFormat::Q8,
+                v_format: FlashAttnCkKvFormat::Q8,
+                head_dim: 256,
+                required_flags: FLASH_ATTN_CK_CAP_CAUSAL | FLASH_ATTN_CK_CAP_GQA,
+            },
+            batch_size: 128,
+            nhead_q: 24,
+            nhead_k: 4,
+            causal: true,
+            contiguous_prefix: true,
+            capture_mode: false,
+            has_tree_bias: false,
+            window: 0,
+            block_start: 0,
+            block_cols: 0,
+        }
+    }
+
+    #[test]
+    fn q8_d256_prefill_selector_accepts_exact_cell() {
+        let input = eligible_q8_prefill();
+        assert_eq!(
+            select_q8_d256_prefill_capabilities(&[q8_d256_capability()], input),
+            Ok(input.request)
+        );
+    }
+
+    #[test]
+    fn q8_d256_prefill_selector_rejects_unsafe_shapes() {
+        let cell = q8_d256_capability();
+        let cases = [
+            (
+                FlashAttnCkPrefillInput {
+                    batch_size: 1,
+                    ..eligible_q8_prefill()
+                },
+                FlashAttnCkRejectReason::Decode,
+            ),
+            (
+                FlashAttnCkPrefillInput {
+                    nhead_q: 23,
+                    ..eligible_q8_prefill()
+                },
+                FlashAttnCkRejectReason::InvalidGqa,
+            ),
+            (
+                FlashAttnCkPrefillInput {
+                    contiguous_prefix: false,
+                    ..eligible_q8_prefill()
+                },
+                FlashAttnCkRejectReason::NonContiguousPrefix,
+            ),
+            (
+                FlashAttnCkPrefillInput {
+                    capture_mode: true,
+                    ..eligible_q8_prefill()
+                },
+                FlashAttnCkRejectReason::GraphCapture,
+            ),
+            (
+                FlashAttnCkPrefillInput {
+                    has_tree_bias: true,
+                    ..eligible_q8_prefill()
+                },
+                FlashAttnCkRejectReason::TreeAttention,
+            ),
+            (
+                FlashAttnCkPrefillInput {
+                    window: 4096,
+                    ..eligible_q8_prefill()
+                },
+                FlashAttnCkRejectReason::WindowedAttention,
+            ),
+            (
+                FlashAttnCkPrefillInput {
+                    block_cols: 32,
+                    ..eligible_q8_prefill()
+                },
+                FlashAttnCkRejectReason::BlockAttention,
+            ),
+        ];
+        for (input, reason) in cases {
+            assert_eq!(
+                select_q8_d256_prefill_capabilities(&[cell], input),
+                Err(reason)
+            );
+        }
+    }
+
+    #[test]
+    fn q8_d256_prefill_selector_rejects_capability_mismatch() {
+        assert_eq!(
+            select_q8_d256_prefill_capabilities(
+                &[dense_capability(FlashAttnCkArch::Gfx1100)],
+                eligible_q8_prefill(),
+            ),
+            Err(FlashAttnCkRejectReason::CapabilityMiss)
+        );
     }
 
     #[test]
