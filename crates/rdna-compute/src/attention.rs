@@ -35,6 +35,29 @@ impl Gpu {
     ) -> HipResult<bool> {
         Ok(false)
     }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_flash_attn_ck_asym3_givens_prefill(
+        &mut self,
+        _q: &GpuTensor,
+        _k_cache: &GpuTensor,
+        _v_cache: &GpuTensor,
+        _output: &GpuTensor,
+        _cos_theta: &GpuTensor,
+        _sin_theta: &GpuTensor,
+        _seqlen_q: usize,
+        _seqlen_k: usize,
+        _nhead_q: usize,
+        _nhead_k: usize,
+        _head_dim: usize,
+        _contiguous_prefix: bool,
+        _has_tree_bias: bool,
+        _window: usize,
+        _block_start: usize,
+        _block_cols: usize,
+    ) -> HipResult<bool> {
+        Ok(false)
+    }
 }
 
 /// HIP `hipDeviceAttributeMaxSharedMemoryPerBlock` (CUDA-compatible block).

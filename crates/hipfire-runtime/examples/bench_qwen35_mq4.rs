@@ -676,6 +676,7 @@ fn main() {
     // Read logits to get a valid next token
     let logits = gpu.download_f32(&scratch.logits).unwrap();
     let mut next_token = llama::argmax(&logits);
+    eprintln!("PREFILL_NEXT_TOKEN  token_id={next_token}");
 
     // === WARMUP ===
     eprintln!("\n=== warmup ({warmup_len} tokens — untimed, lets JIT settle) ===");
