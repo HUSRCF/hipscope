@@ -28,6 +28,16 @@ adapter; direct quantized CK and asym/FWHT/Lloyd layouts remain future cells.
 The D128 cell is capability-, selector-, and raw-ABI-validated; no local model
 currently reaches that cell through the production attention dispatcher.
 
+ABI v4 also defines, but does not yet publish, Asym3 execution cells. Givens
+and FWHT K caches have distinct format IDs, Q8 V remains a separate format,
+and callers provide explicit K/V row and head byte strides plus both transform
+tables. The contract smoke covers D256/D512 and deliberately returns
+`recognized-no-cell` after validating a well-formed layout. This keeps Asym3
+fail-closed until a decoder and CK execution cell pass numerical validation.
+The Rust loader accepts ABI v3 sidecars for their original dense/Q8 cells by
+passing the unchanged v3 struct prefix; v3 quantized format IDs 4+ are rejected
+because their old generic meaning is not the explicit v4 Asym3 contract.
+
 ## Build
 
 The current upstream CK generator still rejects `gfx1100`, despite gfx1100 being

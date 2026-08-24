@@ -9,7 +9,7 @@
 extern "C" {
 #endif
 
-#define HIPFIRE_FLASH_ATTN_CK_ABI_VERSION 3u
+#define HIPFIRE_FLASH_ATTN_CK_ABI_VERSION 4u
 
 enum hipfire_flash_attn_ck_dtype {
     HIPFIRE_FLASH_ATTN_CK_F16 = 1,
@@ -27,8 +27,8 @@ enum hipfire_flash_attn_ck_kv_format {
     HIPFIRE_FLASH_ATTN_CK_DENSE_F16 = 1,
     HIPFIRE_FLASH_ATTN_CK_DENSE_BF16 = 2,
     HIPFIRE_FLASH_ATTN_CK_Q8 = 3,
-    HIPFIRE_FLASH_ATTN_CK_ASYM = 4,
-    HIPFIRE_FLASH_ATTN_CK_FWHT = 5,
+    HIPFIRE_FLASH_ATTN_CK_ASYM3_GIVENS = 4,
+    HIPFIRE_FLASH_ATTN_CK_ASYM3_FWHT = 5,
     HIPFIRE_FLASH_ATTN_CK_LLOYD = 6,
 };
 
@@ -87,6 +87,14 @@ struct hipfire_flash_attn_ck_fwd_params {
     /* Packed KV row strides are bytes. Zero for dense K/V formats. */
     int64_t packed_k_row_stride_bytes;
     int64_t packed_v_row_stride_bytes;
+    int64_t packed_k_head_stride_bytes;
+    int64_t packed_v_head_stride_bytes;
+
+    /* Asym3 transform metadata: cos/sin for Givens, signs1/signs2 for FWHT. */
+    const void* k_transform0;
+    const void* k_transform1;
+    int64_t k_transform0_elements;
+    int64_t k_transform1_elements;
 };
 
 uint32_t hipfire_flash_attn_ck_abi_version(void);
