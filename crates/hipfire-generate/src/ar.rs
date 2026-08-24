@@ -1046,8 +1046,9 @@ pub fn generate(
     // default and leaves every token envelope byte-identical to before.
     logprobs_top_k: Option<usize>,
     // Per-request sampler seed for both the GPU xorshift stream and the
-    // process-global CPU fallback sampler. The caller derives it from the
-    // request key (see batch_rng_for_key) so two requests with the same prompt
+    // process-global CPU fallback sampler. The caller derives it via
+    // hipfire-engine::request_seed_for (explicit wire `seed` wins, else
+    // attempt-key + counter entropy) so two requests with the same prompt
     // no longer replay the identical draw sequence at temp>0.
     request_seed: u32,
 ) {

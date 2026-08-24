@@ -17,20 +17,19 @@
 //!
 //! Moved verbatim.
 
-use std::any::Any;
 use crate::ar::*;
 use crate::common::*;
 use hipfire_arch_deepseek4 as deepseek4;
 use hipfire_arch_lfm2moe as lfm2moe;
+use hipfire_arch_lfm2moe::batch::Lfm2DecodeBatchState;
+use hipfire_arch_lfm2moe::forward_batch::forward_decode_batch_lfm;
 use hipfire_arch_qwen35::qwen35;
 use hipfire_engine::emit::*;
+use hipfire_engine::prompt::{batch_render_prompt_tokens, qwen_jinja_reasoning};
 use hipfire_engine::scheduler::*;
 use hipfire_engine::terminal::*;
+use hipfire_engine::wire_seed;
 use hipfire_loader::{EpArch, EpState, LoadedModel};
-use hipfire_engine::prompt::{batch_render_prompt_tokens, qwen_jinja_reasoning};
-use hipfire_arch_lfm2moe::forward_batch::forward_decode_batch_lfm;
-use hipfire_arch_lfm2moe::batch::Lfm2DecodeBatchState;
-use std::time::Duration;
 use hipfire_runtime::emit_text::{
     currently_in_think, ThinkOutputRouter, ToolOutputRouter, ToolRouteError,
 };
@@ -38,8 +37,10 @@ use hipfire_runtime::eos_filter::{EosFilter, EosFilterConfig, FilterAction};
 use hipfire_runtime::llama;
 use hipfire_runtime::prompt_frame::ThinkMode;
 use hipfire_runtime::sampler::{self, SamplerConfig};
+use std::any::Any;
 use std::io::Write;
 use std::sync::mpsc;
+use std::time::Duration;
 use std::time::Instant;
 /// Cancellable LFM prefill helper. Attempts to use the arch's
 /// `prefill_lane_cancellable` when present; otherwise falls back to the
@@ -148,25 +149,22 @@ pub fn is_batch_request_eligible(
     };
     let route = select_generation_route(&route_inputs);
     if caps.supports_continuous_batch {
-        if let Some(bundle) = m
-            .state
-            .as_ref()
-            .and_then(|s| (s.as_ref() as &dyn Any).downcast_ref::<hipfire_arch_qwen35::Qwen35Bundle>())
-        {
+        if let Some(bundle) = m.state.as_ref().and_then(|s| {
+            (s.as_ref() as &dyn Any).downcast_ref::<hipfire_arch_qwen35::Qwen35Bundle>()
+        }) {
             if route != GenerationRoute::QwenAr {
                 return false;
             }
             if bundle.qwen35_decode_batch.is_none() {
                 return false;
             }
-            if !hipfire_loader::batch_staging::qwen_batch_weight_formats_supported(&bundle.weights) {
+            if !hipfire_loader::batch_staging::qwen_batch_weight_formats_supported(&bundle.weights)
+            {
                 return false;
             }
-        } else if let Some(bundle) = m
-            .state
-            .as_ref()
-            .and_then(|s| (s.as_ref() as &dyn Any).downcast_ref::<hipfire_arch_lfm2moe::Lfm2MoeBundle>())
-        {
+        } else if let Some(bundle) = m.state.as_ref().and_then(|s| {
+            (s.as_ref() as &dyn Any).downcast_ref::<hipfire_arch_lfm2moe::Lfm2MoeBundle>()
+        }) {
             if route != GenerationRoute::LfmAr {
                 return false;
             }
@@ -229,17 +227,11 @@ pub fn drive_qwen_continuous_batch(
     }
     // SAFETY: borrow disjoint fields via raw pointers to avoid &mut aliasing
     // qwen35_decode_batch now lives inside Qwen35Bundle.
-    let b_ptr = match model
-        .state
-        .as_mut()
-        .and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>())
-    {
+    let b_ptr = match model.state.as_mut().and_then(|s| {
+        (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
+    }) {
         Some(b) => b as *mut hipfire_arch_qwen35::Qwen35Bundle,
-        None => {
-            return Err(BatchDriveError::Gpu(
-                "batch model not Qwen35".to_string(),
-            ))
-        }
+        None => return Err(BatchDriveError::Gpu("batch model not Qwen35".to_string())),
     };
     let batch_state_ptr = unsafe {
         let b = &mut *b_ptr;
@@ -623,6 +615,24 @@ pub fn drive_qwen_continuous_batch(
                             batch_clear_terminal(&id, attempt_id);
                             continue;
                         }
+                        // Explicit wire `seed` must reach the lane RNG on the
+                        // batched route too; out-of-domain values are rejected
+                        // loudly, never silently unseeded.
+                        let client_seed = match wire_seed::parse_wire_seed(json.get("seed")) {
+                            Ok(s) => s,
+                            Err(reason) => {
+                                emit_uncorrelated_error(
+                                    stdout,
+                                    Some(&id),
+                                    &reason,
+                                    "validation",
+                                    false,
+                                    false,
+                                );
+                                batch_clear_terminal(&id, attempt_id);
+                                continue;
+                            }
+                        };
                         batch_transition_to_queued(&id, attempt_id);
                         let sampling = resolve_batch_sampling(&json, model);
                         let req = BatchPendingRequest {
@@ -634,6 +644,7 @@ pub fn drive_qwen_continuous_batch(
                             assistant_prefix,
                             max_think_tokens: max_think,
                             max_tokens: max_tokens_req,
+                            client_seed,
                             sampling,
                         };
                         if !sched.enqueue(req) {
@@ -1149,11 +1160,9 @@ pub fn drive_lfm_continuous_batch(
         return Ok(());
     }
     let (batch_state_ptr, config_ptr, weights_ptr, tokenizer_ptr, chat_template_clone, eos_tok) =
-        match model
-            .state
-            .as_mut()
-            .and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_lfm2moe::Lfm2MoeBundle>())
-        {
+        match model.state.as_mut().and_then(|s| {
+            (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_lfm2moe::Lfm2MoeBundle>()
+        }) {
             Some(b) => {
                 let batch_ptr = match b.lfm2_decode_batch.as_mut() {
                     Some(s) => s as *mut Lfm2DecodeBatchState,
@@ -1568,6 +1577,24 @@ pub fn drive_lfm_continuous_batch(
                             batch_clear_terminal(&id, attempt_id);
                             continue;
                         }
+                        // Explicit wire `seed` must reach the lane RNG on the
+                        // batched route too; out-of-domain values are rejected
+                        // loudly, never silently unseeded.
+                        let client_seed = match wire_seed::parse_wire_seed(json.get("seed")) {
+                            Ok(s) => s,
+                            Err(reason) => {
+                                emit_uncorrelated_error(
+                                    stdout,
+                                    Some(&id),
+                                    &reason,
+                                    "validation",
+                                    false,
+                                    false,
+                                );
+                                batch_clear_terminal(&id, attempt_id);
+                                continue;
+                            }
+                        };
                         batch_transition_to_queued(&id, attempt_id);
                         let sampling = resolve_batch_sampling(&json, model);
                         let req = BatchPendingRequest {
@@ -1579,6 +1606,7 @@ pub fn drive_lfm_continuous_batch(
                             assistant_prefix,
                             max_think_tokens: max_think,
                             max_tokens: max_tokens_req,
+                            client_seed,
                             sampling,
                         };
                         if !sched.enqueue(req) {
@@ -1664,7 +1692,9 @@ pub fn drive_lfm_continuous_batch(
                                         rolled_back: true,
                                         context: None,
                                     };
-                                    crate::common::emit_spec_cancel_after_rollback(stdout, &key.id, 0, &ep);
+                                    crate::common::emit_spec_cancel_after_rollback(
+                                        stdout, &key.id, 0, &ep,
+                                    );
                                     let _ = sched.abort_lane(lane_idx, key);
                                     continue;
                                 }
@@ -2401,7 +2431,11 @@ pub fn is_qwen_ep_batch_request_eligible(
     if !caps.supports_ep_batch {
         return false;
     }
-    if m.qwen35().is_some_and(|b| b.qwen35_decode_batch.is_some()) || m.lfm2moe().and_then(|b| b.lfm2_decode_batch.as_ref()).is_some() {
+    if m.qwen35().is_some_and(|b| b.qwen35_decode_batch.is_some())
+        || m.lfm2moe()
+            .and_then(|b| b.lfm2_decode_batch.as_ref())
+            .is_some()
+    {
         return false;
     }
     // EP batch is pure TP=4 gfx1201; validate via existing weight format gate.
@@ -2883,6 +2917,24 @@ pub fn drive_qwen35_ep_continuous_batch(
                             batch_clear_terminal(&id, attempt_id);
                             continue;
                         }
+                        // Explicit wire `seed` must reach the lane RNG on the
+                        // batched route too; out-of-domain values are rejected
+                        // loudly, never silently unseeded.
+                        let client_seed = match wire_seed::parse_wire_seed(json.get("seed")) {
+                            Ok(s) => s,
+                            Err(reason) => {
+                                emit_uncorrelated_error(
+                                    stdout,
+                                    Some(&id),
+                                    &reason,
+                                    "validation",
+                                    false,
+                                    false,
+                                );
+                                batch_clear_terminal(&id, attempt_id);
+                                continue;
+                            }
+                        };
                         batch_transition_to_queued(&id, attempt_id);
                         let sampling = resolve_batch_sampling(&json, model);
                         let req = BatchPendingRequest {
@@ -2894,6 +2946,7 @@ pub fn drive_qwen35_ep_continuous_batch(
                             assistant_prefix,
                             max_think_tokens: max_think,
                             max_tokens: max_tokens_req,
+                            client_seed,
                             sampling,
                         };
                         if !sched.enqueue(req) {

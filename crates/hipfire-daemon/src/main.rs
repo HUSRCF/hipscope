@@ -41,14 +41,7 @@ use hipfire_engine::prompt::*;
 use hipfire_engine::redline::*;
 use hipfire_engine::scheduler::*;
 use hipfire_engine::terminal::*;
-use hipfire_loader::{AsstTurnCache, EpArch, EpState, Eviction, LoadedModel};
-use hipfire_runtime::spec::{
-    ClientEvent, EmitOutcome, EvictRetain, FinishSummary, PrefillOutcome, SpecAdvance, SpecEmit,
-    SpecTarget, Speculator, StopReason,
-};
-
-mod wire_seed;
-
+use hipfire_engine::wire_seed::parse_wire_seed;
 #[cfg(feature = "serve-fault-inject")]
 use hipfire_generate::ar::arm_fault_after_prefill;
 #[cfg(feature = "serve-fault-inject")]
@@ -90,7 +83,11 @@ use hipfire_generate::redline::{
     RedlineQwenSnapshot, RedlineSnapshot,
 };
 use hipfire_generate::vision::{GenerateVLParams, ImageSource};
-use wire_seed::parse_wire_seed;
+use hipfire_loader::{AsstTurnCache, EpArch, EpState, Eviction, LoadedModel};
+use hipfire_runtime::spec::{
+    ClientEvent, EmitOutcome, EvictRetain, FinishSummary, PrefillOutcome, SpecAdvance, SpecEmit,
+    SpecTarget, Speculator, StopReason,
+};
 
 /// Formats the independent Qwen decode-batch path can actually execute.
 /// Must stay aligned with `lm_head_batched` + `prepare_decode_batch_inputs`
@@ -2530,6 +2527,17 @@ fn main() {
                                 batch_clear_terminal(id, gen_attempt_id);
                                 continue;
                             }
+                            // Explicit wire `seed` must reach the lane RNG on
+                            // the batched route too; out-of-domain values are
+                            // rejected loudly, never silently unseeded.
+                            let client_seed = match parse_wire_seed(msg.get("seed")) {
+                                Ok(s) => s,
+                                Err(reason) => {
+                                    write_error(&mut stdout, id, &reason);
+                                    batch_clear_terminal(id, gen_attempt_id);
+                                    continue;
+                                }
+                            };
                             let pending = BatchPendingRequest {
                                 key: AttemptKey::new(id, gen_attempt_id),
                                 prompt: prompt_owned.clone(),
@@ -2539,6 +2547,7 @@ fn main() {
                                 assistant_prefix,
                                 max_think_tokens,
                                 max_tokens,
+                                client_seed,
                                 sampling: sampling.clone(),
                             };
                             if let Some(sched) = batch_scheduler.as_mut() {
@@ -2676,6 +2685,17 @@ fn main() {
                                 batch_clear_terminal(id, gen_attempt_id);
                                 continue;
                             }
+                            // Explicit wire `seed` must reach the lane RNG on
+                            // the batched route too; out-of-domain values are
+                            // rejected loudly, never silently unseeded.
+                            let client_seed = match parse_wire_seed(msg.get("seed")) {
+                                Ok(s) => s,
+                                Err(reason) => {
+                                    write_error(&mut stdout, id, &reason);
+                                    batch_clear_terminal(id, gen_attempt_id);
+                                    continue;
+                                }
+                            };
                             let pending = BatchPendingRequest {
                                 key: AttemptKey::new(id, gen_attempt_id),
                                 prompt: prompt_owned.clone(),
@@ -2685,6 +2705,7 @@ fn main() {
                                 assistant_prefix,
                                 max_think_tokens,
                                 max_tokens,
+                                client_seed,
                                 sampling: sampling.clone(),
                             };
                             if let Some(sched) = batch_scheduler.as_mut() {

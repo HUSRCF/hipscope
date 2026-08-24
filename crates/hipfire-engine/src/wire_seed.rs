@@ -8,7 +8,7 @@
 //! `seed: -1` or `seed: 1.5` is asking for reproducibility and must not get a
 //! fresh entropy stream without notice.
 
-pub(crate) fn parse_wire_seed(value: Option<&serde_json::Value>) -> Result<Option<u64>, String> {
+pub fn parse_wire_seed(value: Option<&serde_json::Value>) -> Result<Option<u64>, String> {
     let Some(value) = value else {
         return Ok(None);
     };
