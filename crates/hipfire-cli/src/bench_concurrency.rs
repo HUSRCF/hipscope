@@ -318,7 +318,7 @@ impl ConcurrencyBackend for SlotDriver {
     }
 
     fn run(&mut self, workload: WorkloadSel, k: usize, max_tokens: u64) -> Result<ArmResult> {
-        use hipfire_runtime::serve::{Event, SubmitRequest};
+        use hipfire_runtime::serve::{Continuation, Event, SubmitRequest};
         check_k(self, k)?;
 
         let hits_before = self.engine.stats().prefix_hits;
@@ -331,10 +331,9 @@ impl ConcurrencyBackend for SlotDriver {
             let (prompt_tokens, convo) = self.render(run, i);
             self.engine
                 .submit(SubmitRequest {
-                    session: None,
                     prompt_tokens,
                     convo,
-                    continuation: Vec::new(),
+                    continuation: Continuation::Cold,
                     max_tokens: max_tokens as usize,
                     temperature: 0.0,
                     top_p: 1.0,
@@ -380,10 +379,9 @@ impl ConcurrencyBackend for SlotDriver {
                 );
                 self.engine
                     .submit(SubmitRequest {
-                        session: Some(*session),
                         prompt_tokens: Vec::new(),
                         convo,
-                        continuation,
+                        continuation: Continuation::UserTurn(continuation),
                         max_tokens: max_tokens as usize,
                         temperature: 0.0,
                         top_p: 1.0,

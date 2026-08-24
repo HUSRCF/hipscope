@@ -2602,10 +2602,22 @@ pub(crate) fn apply_http_reasoning_request(
     request: &mut serde_json::Value,
     deepseek4_effort_contract: bool,
 ) -> Result<()> {
+    // A zero reasoning budget is the same instruction as `enable_thinking:
+    // false`, spelled the way hag and other OpenAI clients spell it. Without
+    // it a small `max_tokens` budget is spent entirely inside `<think>` and
+    // the client gets an empty `content` (seen on title generation).
     let thinking_disabled = body
         .pointer("/chat_template_kwargs/enable_thinking")
         .and_then(serde_json::Value::as_bool)
-        == Some(false);
+        == Some(false)
+        || body
+            .get("reasoning_budget_tokens")
+            .and_then(serde_json::Value::as_u64)
+            == Some(0)
+        || body
+            .get("max_think_tokens")
+            .and_then(serde_json::Value::as_u64)
+            == Some(1);
     let effort = body
         .get("reasoning_effort")
         .and_then(serde_json::Value::as_str)

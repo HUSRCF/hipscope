@@ -24,18 +24,12 @@ use std::sync::mpsc::Sender;
 /// events down it and nothing else. A dropped receiver is how the engine
 /// learns the client is gone.
 pub struct SubmitRequest {
-    /// Continue an existing session, or `None` to open a new one.
-    pub session: Option<u64>,
     /// Full cold render of the conversation. Used when nothing is reusable.
     pub prompt_tokens: Vec<u32>,
     /// Hashes of the conversation's user turns, in order. Identity for
     /// continuation matching — see `Session::convo`.
     pub convo: Vec<u64>,
-    /// Tokens that continue the previous turn into this one, from
-    /// `prompt_frame::continuation_suffix`. When a matching session is found
-    /// these are APPENDED to its exact stored tokens, so the result is a
-    /// strict extension of the KV rather than a re-render of it.
-    pub continuation: Vec<u32>,
+    pub continuation: Continuation,
     pub max_tokens: usize,
     /// 0.0 = greedy. Per-request; the engine installs it on the slot.
     pub temperature: f32,
@@ -44,6 +38,40 @@ pub struct SubmitRequest {
     pub top_k: i32,
     pub seed: u32,
     pub reply: Sender<Event>,
+}
+
+/// How this turn extends what the engine already holds.
+///
+/// The two reuse shapes are NOT interchangeable, and untyped tokens plus a
+/// convo hash cannot tell them apart: a new user turn and a tool-result
+/// iteration both arrive as "a suffix to append", but a tool-result suffix
+/// pinned onto a session that never emitted those calls feeds the model a
+/// `<tool_response>` for a call it did not make, and a user-turn suffix pinned
+/// onto a session that already served that turn duplicates it in the KV.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Continuation {
+    /// Nothing to append: the engine matches on `prompt_tokens` alone.
+    Cold,
+    /// A new user turn, from `prompt_frame::continuation_suffix`. Matched
+    /// against a session holding exactly the preceding user turns; the tokens
+    /// are APPENDED to its stored tokens, so the result is a strict extension
+    /// of the KV rather than a re-render of it.
+    UserTurn(Vec<u32>),
+    /// Tool results answering the tool calls `session` emitted on its previous
+    /// turn, from `prompt_frame::continuation_suffix_tool_results`. The caller
+    /// resolved `session` from the tool-call ids it handed the client, so the
+    /// engine only re-checks that the session still holds this conversation.
+    ToolResults { tokens: Vec<u32>, session: u64 },
+}
+
+impl Continuation {
+    pub fn tokens(&self) -> &[u32] {
+        match self {
+            Self::Cold => &[],
+            Self::UserTurn(tokens) => tokens,
+            Self::ToolResults { tokens, .. } => tokens,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

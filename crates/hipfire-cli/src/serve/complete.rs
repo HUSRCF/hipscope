@@ -2956,6 +2956,18 @@ mod tests {
         .unwrap();
         assert_eq!(disabled["reasoning_effort"], "none");
 
+        // The other two spellings of "do not think" that OpenAI clients send.
+        for body in [
+            serde_json::json!({ "reasoning_budget_tokens": 0 }),
+            serde_json::json!({ "max_think_tokens": 1 }),
+        ] {
+            let mut off = serde_json::json!({});
+            apply_http_reasoning_request(&body, &resolved, &mut off, false).unwrap();
+            assert_eq!(off["reasoning_effort"], "none", "{body}");
+            assert_eq!(off["max_think_tokens"], 1, "{body}");
+            assert_eq!(off["assistant_prefix"], "closed_think", "{body}");
+        }
+
         let completion = Completion {
             id: "chatcmpl_test".into(),
             created: 7,

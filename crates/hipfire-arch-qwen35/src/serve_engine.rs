@@ -20,7 +20,9 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use hipfire_runtime::admission::{AdmissionController, ModelFootprint};
-use hipfire_runtime::serve::{send_event, DoneReason, EngineStats, Event, SubmitRequest};
+use hipfire_runtime::serve::{
+    send_event, Continuation, DoneReason, EngineStats, Event, SubmitRequest,
+};
 use hipfire_runtime::session_table::{SessionId, SessionTable};
 use hipfire_runtime::swap::snapshot::{capture_slot, restore_slot, SnapshotStamp};
 use hipfire_runtime::swap::SwapManager;
@@ -374,7 +376,7 @@ fn run_loop(mut rig: Rig, rx: Receiver<SubmitRequest>, stats: Arc<Mutex<EngineSt
             .gpu
             .sample_per_slot(
                 &rig.logits_out,
-                &rig.sample_params,
+                &mut rig.sample_params,
                 n,
                 rig.config.vocab_size,
                 &rig.out_tokens,
@@ -470,12 +472,18 @@ fn admit(
     // turn began after an OpenThink opener that history rendering does not
     // replay, and re-encoding the decoded reply is not guaranteed to round
     // trip. Reuse also keeps the DeltaNet state, which is the point.
-    if !req.continuation.is_empty() {
+    if !req.continuation.tokens().is_empty() {
         if rig.gpu.slot_trace() {
+            let shape = match &req.continuation {
+                Continuation::ToolResults { session, .. } => {
+                    format!("tool-results of session {session}")
+                }
+                _ => "new user turn".to_string(),
+            };
             eprintln!(
-                "[slot-trace] continuation attempt: convo={:?} suffix={} tokens",
+                "[slot-trace] continuation attempt ({shape}): convo={:?} suffix={} tokens",
                 req.convo,
-                req.continuation.len()
+                req.continuation.tokens().len(),
             );
             for (id, sess) in rig.sessions.iter() {
                 eprintln!(
@@ -488,16 +496,20 @@ fn admit(
                 );
             }
         }
-        // One-turn-ahead match first (a new user turn); equal-convo reentry
-        // second (a tool-result iteration). Both append `continuation` to the
-        // session's exact stored tokens, so either way the KV and DeltaNet
-        // state extend strictly — the client built the suffix for whichever
-        // tail shape it sent.
-        if let Some(existing) = rig
-            .sessions
-            .find_continuation(&req.convo, &busy)
-            .or_else(|| rig.sessions.find_reentry(&req.convo, &busy))
-        {
+        // The suffix shape decides which match is legal — never both. A user
+        // turn searches for the session one turn behind; tool results confirm
+        // the session that emitted the calls being answered. Either way the
+        // suffix is appended to the session's exact stored tokens, so the KV
+        // and DeltaNet state extend strictly.
+        let matched = match &req.continuation {
+            Continuation::Cold => None,
+            Continuation::UserTurn(_) => rig.sessions.find_continuation(&req.convo, &busy),
+            Continuation::ToolResults { session, .. } => {
+                rig.sessions
+                    .confirm_reentry(SessionId(*session), &req.convo, &busy)
+            }
+        };
+        if let Some(existing) = matched {
             let base = rig
                 .sessions
                 .get(existing)
@@ -531,7 +543,7 @@ fn admit(
             }
             if let Some(slot) = slot {
                 let mut extended = base;
-                extended.extend_from_slice(&req.continuation);
+                extended.extend_from_slice(req.continuation.tokens());
                 if let Ok(plan) = rig.sessions.begin_turn(&mut rig.pool, existing, &extended) {
                     if let Some(sess) = rig.sessions.get_mut(existing) {
                         sess.tokens = extended.clone();

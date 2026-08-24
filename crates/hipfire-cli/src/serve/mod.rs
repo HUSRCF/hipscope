@@ -731,6 +731,11 @@ pub(crate) fn serve_foreground(
                     "serve: multi-slot backend up ({} slots, {} ctx) - requests run concurrently",
                     n_slots, cap_tokens
                 );
+                let (tag, entry) = registry
+                    .model(&default_model)
+                    .map(|(tag, entry)| (Some(tag.to_owned()), Some(entry)))
+                    .unwrap_or((None, None));
+                let resolved = resolved_for_model(paths, &default_model, tag.as_deref(), entry)?;
                 Some(Arc::new(slots::SlotBackend {
                     engine,
                     tokenizer,
@@ -739,6 +744,8 @@ pub(crate) fn serve_foreground(
                         env::var("HIPFIRE_QWEN35_GRAMMAR").ok().as_deref(),
                         &model_path.to_string_lossy(),
                     ),
+                    resolved,
+                    pending_tools: std::sync::Mutex::new(Vec::new()),
                 }))
             }
             _ => None,
