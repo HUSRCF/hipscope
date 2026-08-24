@@ -1065,6 +1065,19 @@ mod request_seed_tests {
     }
 
     #[test]
+    fn explicit_seed_boundaries_stay_in_tier1() {
+        // Wire seed 0 and u64::MAX are valid explicit seeds: tier 1 must win
+        // over the attempt-key entropy tiers and be deterministic per seed
+        // alone. request_seed_for never returns 0 (pinned separately below).
+        let z = request_seed_for(&key("b", 1), Some(0));
+        assert_eq!(z, request_seed_for(&key("b", 2), Some(0)));
+        assert_eq!(z, request_seed_for(&key("other", 9), Some(0)));
+        let m = request_seed_for(&key("m", 1), Some(u64::MAX));
+        assert_eq!(m, request_seed_for(&key("m", 2), Some(u64::MAX)));
+        assert_ne!(z, m);
+    }
+
+    #[test]
     fn derived_seeds_distinct_for_reused_client_keys() {
         let k = key("r1", 1);
         let s0 = request_seed_for(&k, None);

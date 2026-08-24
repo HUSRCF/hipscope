@@ -276,6 +276,32 @@ fn require_wire_attempt_id(value: Option<&serde_json::Value>) -> Result<u64, &'s
         Some(_) => parse_wire_attempt_id(value).ok_or("malformed attempt_id"),
     }
 }
+/// Wire `seed` domain: optional non-negative 64-bit integer (OpenAI-compatible
+/// deterministic-sampling field). Unlike `parse_wire_attempt_id`, an out-of-domain
+/// value is an ERROR, not a silent fallback to unseeded: a client that sends
+/// `seed: -1` or `seed: 1.5` is asking for reproducibility and must not get a
+/// fresh entropy stream without notice.
+fn parse_wire_seed(value: Option<&serde_json::Value>) -> Result<Option<u64>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let Some(n) = value.as_number() else {
+        return Err(format!("seed must be a non-negative integer, got {value}"));
+    };
+    if let Some(s) = n.as_u64() {
+        return Ok(Some(s));
+    }
+    if let Some(s) = n.as_i64() {
+        return Err(format!("seed must be non-negative, got {s}"));
+    }
+    Err(format!("seed must be an integer, got {value}"))
+}
+
+
+
 
 
 
@@ -2526,10 +2552,17 @@ fn main() {
                     };
                     // Same tiered derivation as the text path below: explicit
                     // wire `seed` wins, else attempt key + counter entropy.
-                    let vl_request_seed = request_seed_for(
-                        &AttemptKey::new(id, gen_attempt_id),
-                        msg.get("seed").and_then(|v| v.as_u64()),
-                    );
+                    // Out-of-domain seeds (negative, fractional, non-numeric)
+                    // are rejected — never silently treated as unseeded.
+                    let client_seed = match parse_wire_seed(msg.get("seed")) {
+                        Ok(s) => s,
+                        Err(reason) => {
+                            write_error(&mut stdout, id, &reason);
+                            continue;
+                        }
+                    };
+                    let vl_request_seed =
+                        request_seed_for(&AttemptKey::new(id, gen_attempt_id), client_seed);
                     let params = GenerateVLParams {
                         id,
                         prompt,
@@ -3005,10 +3038,16 @@ fn main() {
                     // with the same seed reproduce); otherwise hipfire-engine
                     // mixes the attempt key with a process-global counter and
                     // boot nonce so reused client keys still get distinct
-                    // streams. Non-numeric `seed` values are treated as absent
-                    // — matches the lenient handling of the other optional
-                    // sampling fields on this route.
-                    let client_seed = msg.get("seed").and_then(|v| v.as_u64());
+                    // streams. Out-of-domain seeds (negative, fractional,
+                    // non-numeric) are rejected — never silently treated as
+                    // unseeded.
+                    let client_seed = match parse_wire_seed(msg.get("seed")) {
+                        Ok(s) => s,
+                        Err(reason) => {
+                            write_error(&mut stdout, id, &reason);
+                            continue;
+                        }
+                    };
                     let request_seed =
                         request_seed_for(&AttemptKey::new(id, gen_attempt_id), client_seed);
                     generate(
@@ -3786,6 +3825,45 @@ fn main() {
                 let _ = stdout.flush();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod wire_seed_tests {
+    use super::parse_wire_seed;
+
+    fn parse(json: &str) -> Result<Option<u64>, String> {
+        parse_wire_seed(Some(&serde_json::from_str(json).unwrap()))
+    }
+
+    #[test]
+    fn absent_and_null_are_unseeded() {
+        assert_eq!(parse_wire_seed(None), Ok(None));
+        assert_eq!(parse("null"), Ok(None));
+    }
+
+    #[test]
+    fn non_negative_integers_pass_through_verbatim() {
+        assert_eq!(parse("0"), Ok(Some(0)));
+        assert_eq!(parse("1234"), Ok(Some(1234)));
+        assert_eq!(parse(&u64::MAX.to_string()), Ok(Some(u64::MAX)));
+    }
+
+    #[test]
+    fn negative_seeds_are_rejected_not_treated_as_unseeded() {
+        let err = parse("-1").unwrap_err();
+        assert!(err.contains("non-negative"), "reason: {err}");
+        assert!((0..100).all(|i| parse(&format!("-{i}")).is_err()));
+    }
+
+    #[test]
+    fn fractional_and_non_numeric_seeds_are_rejected() {
+        assert!(parse("1.5").is_err());
+        assert!(parse("0.0").is_err());
+        assert!(parse("\"42\"").is_err());
+        assert!(parse("true").is_err());
+        assert!(parse("[]").is_err());
+        assert!(parse("{}").is_err());
     }
 }
 

@@ -1707,7 +1707,7 @@ impl MtpDrafter for DsparkDrafter {
         self.top_p = cfg.top_p;
         self.top_k = cfg.top_k;
         self.cactus = cfg.cactus_delta;
-        self.rng_state = if cfg.rng_seed == 0 { 0x13579BDF } else { cfg.rng_seed };
+        self.rng_state = crate::spec::request_rng_state(cfg.rng_seed);
     }
 }
 

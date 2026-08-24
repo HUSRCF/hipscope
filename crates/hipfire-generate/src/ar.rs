@@ -1380,6 +1380,7 @@ pub fn generate(
                 top_p,
                 top_k.map(|k| k as usize).unwrap_or(0),
                 cactus_delta,
+                request_seed,
                 think_mode,
                 tools,
                 messages_history,

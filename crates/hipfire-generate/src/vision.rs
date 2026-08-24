@@ -91,6 +91,8 @@ pub struct GenerateVLParams<'a> {
     pub repeat_window: usize,
     pub max_think_tokens: usize,
     pub assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
+    /// Per-request sampler seed (see `hipfire_engine::request_seed_for`).
+    pub seed: u32,
 }
 
 pub fn vl_no_eviction_kv_cap(physical_cap: usize, max_seq: usize, adaptive_engaged: bool) -> usize {

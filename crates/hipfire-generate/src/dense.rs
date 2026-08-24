@@ -284,7 +284,8 @@ pub fn write_error_envelope(
 /// DSA decode-cache miss teardown) and epilogue (the ds4 `done` envelope), and
 /// drives the shared decode core via `m.speculator` (a `Deepseek4MtpDrafter`),
 /// the `Deepseek4Bundle` target (via `spec_target_guard`), and `Deepseek4Emit`.
-/// Greedy-only — the dispatch routes here only at `temp <= 1e-6`.
+/// Sampled verify: temp<=1e-6 → greedy argmax-accept; temp>0 → DSpark sampled
+/// verify drawing from `request_seed`.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 pub fn generate_deepseek4_spec(
@@ -301,6 +302,9 @@ pub fn generate_deepseek4_spec(
     top_p: f32,
     top_k: usize,
     cactus_delta: f32,
+    // Per-request sampler seed (hipfire-engine::request_seed_for) installed on
+    // the speculator via SpecRequestConfig::rng_seed.
+    request_seed: u32,
     think_mode: ThinkMode,
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
@@ -456,7 +460,7 @@ pub fn generate_deepseek4_spec(
             top_k,
             min_p: 0.0,
             cactus_delta,
-            rng_seed: SpecRequestConfig::default().rng_seed,
+            rng_seed: request_seed as u64,
             allow_ngram_modifier: false,
         });
     }

@@ -2759,7 +2759,7 @@ fn is_plausible_device_address(value: u64) -> bool {
     if value < 4096 {
         return false;
     }
-    if value < 0x100000 && value < (1 << 20) {
+    if value < 0x100000 {
         return false;
     }
     // Require either high 32 bits or a large 32-bit value that is not a
