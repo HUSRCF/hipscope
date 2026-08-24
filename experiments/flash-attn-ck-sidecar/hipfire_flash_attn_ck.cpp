@@ -4,6 +4,7 @@
 
 #include "fmha_fwd.hpp"
 #include "mask.hpp"
+#include "turbo_common.h"
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -52,7 +53,13 @@ bool is_asym3_cell(const hipfire_flash_attn_ck_fwd_params* p)
            p->v_format == HIPFIRE_FLASH_ATTN_CK_Q8;
 }
 
-size_t q8_workspace_bytes(const hipfire_flash_attn_ck_fwd_params* p)
+bool is_asym3_givens_cell(const hipfire_flash_attn_ck_fwd_params* p)
+{
+    return is_asym3_cell(p) && p->k_format == HIPFIRE_FLASH_ATTN_CK_ASYM3_GIVENS &&
+           p->head_dim == 256;
+}
+
+size_t staging_workspace_bytes(const hipfire_flash_attn_ck_fwd_params* p)
 {
     const size_t q = static_cast<size_t>(p->batch) * p->seqlen_q * p->nhead_q * p->head_dim;
     const size_t kv = static_cast<size_t>(p->batch) * p->seqlen_k * p->nhead_k * p->head_dim;
@@ -103,6 +110,97 @@ __global__ void decode_q8_kv_d256(const uint8_t* packed_k,
         dense_k[output + index] = __float2half_rn(k_scale * static_cast<float>(k_values[index]));
         dense_v[output + index] = __float2half_rn(v_scale * static_cast<float>(v_values[index]));
     }
+}
+
+__device__ __forceinline__ void givens_rotate(float& a, float& b, float c, float s)
+{
+    const float a2 = a * c - b * s;
+    b = a * s + b * c;
+    a = a2;
+}
+
+__global__ void transform_q_givens_f32_to_f16(const float* input,
+                                               __half* output,
+                                               int rows,
+                                               int heads,
+                                               int head_dim,
+                                               const float* cos_theta,
+                                               const float* sin_theta)
+{
+    const int row = blockIdx.x;
+    const int head = blockIdx.y;
+    const int lane = threadIdx.x;
+    if(row >= rows || head >= heads || lane >= 32) return;
+    const int chunks = head_dim / 256;
+    for(int chunk = 0; chunk < chunks; ++chunk)
+    {
+        const int dim = chunk * 256 + lane * 8;
+        const int block = chunk * 128 + lane * 4;
+        const size_t base = (static_cast<size_t>(row) * heads + head) * head_dim + dim;
+        float values[8];
+#pragma unroll
+        for(int i = 0; i < 8; ++i) values[i] = input[base + i];
+#pragma unroll
+        for(int pair = 0; pair < 4; ++pair)
+            givens_rotate(values[pair * 2], values[pair * 2 + 1],
+                          cos_theta[block + pair], sin_theta[block + pair]);
+#pragma unroll
+        for(int i = 0; i < 8; ++i) output[base + i] = __float2half_rn(values[i]);
+    }
+}
+
+__global__ void decode_asym3_k_givens(const uint8_t* packed,
+                                      __half* dense,
+                                      int rows,
+                                      int heads,
+                                      int64_t row_stride_bytes,
+                                      int64_t head_stride_bytes,
+                                      int head_dim)
+{
+    const int row = blockIdx.x;
+    const int head = blockIdx.y;
+    const int lane = threadIdx.x;
+    if(row >= rows || head >= heads || lane >= 32) return;
+    const uint8_t* source = packed + static_cast<size_t>(row) * row_stride_bytes +
+                            head * head_stride_bytes;
+    const float cnorm = *reinterpret_cast<const float*>(source);
+    const int chunks = head_dim / 256;
+    for(int chunk = 0; chunk < chunks; ++chunk)
+    {
+        const uint8_t* bytes = source + 4 + chunk * 96 + lane * 3;
+        const uint32_t codes = static_cast<uint32_t>(bytes[0]) |
+                               (static_cast<uint32_t>(bytes[1]) << 8) |
+                               (static_cast<uint32_t>(bytes[2]) << 16);
+        const int dim = chunk * 256 + lane * 8;
+        const size_t base = (static_cast<size_t>(row) * heads + head) * head_dim + dim;
+#pragma unroll
+        for(int i = 0; i < 8; ++i)
+            dense[base + i] = __float2half_rn(cnorm * TURBO_C3_256[(codes >> (i * 3)) & 7]);
+    }
+}
+
+__global__ void decode_q8(const uint8_t* packed,
+                          __half* dense,
+                          int rows,
+                          int heads,
+                          int64_t row_stride_bytes,
+                          int64_t head_stride_bytes,
+                          int head_dim)
+{
+    const int row = blockIdx.x;
+    const int head = blockIdx.y;
+    const int lane = threadIdx.x;
+    if(row >= rows || head >= heads || lane >= head_dim / 8) return;
+    const int block = lane >> 2;
+    const int lane_in_block = lane & 3;
+    const uint8_t* source = packed + static_cast<size_t>(row) * row_stride_bytes +
+                            head * head_stride_bytes + block * 34;
+    const float scale = __half2float(*reinterpret_cast<const __half*>(source));
+    const int8_t* values = reinterpret_cast<const int8_t*>(source + 2) + lane_in_block * 8;
+    const size_t base = (static_cast<size_t>(row) * heads + head) * head_dim + lane * 8;
+#pragma unroll
+    for(int i = 0; i < 8; ++i)
+        dense[base + i] = __float2half_rn(scale * static_cast<float>(values[i]));
 }
 
 void set_error(char* error, size_t capacity, const std::string& message)
@@ -203,6 +301,18 @@ int validate(const hipfire_flash_attn_ck_fwd_params* p, char* error, size_t erro
             return 1;
         }
     }
+    if(q8 || asym3)
+    {
+        const int64_t row_elements = static_cast<int64_t>(p->nhead_q) * p->head_dim;
+        const int64_t batch_elements = static_cast<int64_t>(p->seqlen_q) * row_elements;
+        if(p->stride_q != row_elements || p->stride_out != row_elements ||
+           p->nhead_stride_q != p->head_dim || p->nhead_stride_out != p->head_dim ||
+           p->batch_stride_q != batch_elements || p->batch_stride_out != batch_elements)
+        {
+            set_error(error, error_capacity, "packed staging requires contiguous Q and output");
+            return 1;
+        }
+    }
     if(q8)
     {
         const int64_t head_bytes = (p->head_dim / 32) * 34;
@@ -216,7 +326,7 @@ int validate(const hipfire_flash_attn_ck_fwd_params* p, char* error, size_t erro
             set_error(error, error_capacity, "Q8 D256 requires batch=1, causal, and valid packed row strides");
             return 1;
         }
-        if(p->workspace == nullptr || p->workspace_bytes < q8_workspace_bytes(p))
+        if(p->workspace == nullptr || p->workspace_bytes < staging_workspace_bytes(p))
         {
             set_error(error, error_capacity, "caller workspace is too small for Q8 staging");
             return 1;
@@ -244,8 +354,16 @@ int validate(const hipfire_flash_attn_ck_fwd_params* p, char* error, size_t erro
             set_error(error, error_capacity, "Asym3 transform metadata is missing or undersized");
             return 1;
         }
-        set_error(error, error_capacity, "Asym3 packed layout is valid but has no CK execution cell");
-        return 2;
+        if(!is_asym3_givens_cell(p))
+        {
+            set_error(error, error_capacity, "Asym3 packed layout is valid but has no CK execution cell");
+            return 2;
+        }
+        if(p->workspace == nullptr || p->workspace_bytes < staging_workspace_bytes(p))
+        {
+            set_error(error, error_capacity, "caller workspace is too small for Asym3 staging");
+            return 1;
+        }
     }
     set_error(error, error_capacity, "");
     return 0;
@@ -285,6 +403,16 @@ extern "C" size_t hipfire_flash_attn_ck_capabilities(
         sizeof(hipfire_flash_attn_ck_capability),
         HIPFIRE_FLASH_ATTN_CK_GFX1100,
         HIPFIRE_FLASH_ATTN_CK_F32,
+        HIPFIRE_FLASH_ATTN_CK_ASYM3_GIVENS,
+        HIPFIRE_FLASH_ATTN_CK_Q8,
+        256,
+        HIPFIRE_FLASH_ATTN_CK_CAP_CAUSAL | HIPFIRE_FLASH_ATTN_CK_CAP_GQA,
+    },
+    {
+        HIPFIRE_FLASH_ATTN_CK_ABI_VERSION,
+        sizeof(hipfire_flash_attn_ck_capability),
+        HIPFIRE_FLASH_ATTN_CK_GFX1100,
+        HIPFIRE_FLASH_ATTN_CK_F32,
         HIPFIRE_FLASH_ATTN_CK_Q8,
         HIPFIRE_FLASH_ATTN_CK_Q8,
         256,
@@ -305,7 +433,9 @@ extern "C" size_t hipfire_flash_attn_ck_capabilities(
 extern "C" size_t hipfire_flash_attn_ck_fwd_workspace_bytes(
     const hipfire_flash_attn_ck_fwd_params* params)
 {
-    return params != nullptr && is_q8_cell(params) ? q8_workspace_bytes(params) : 0;
+    return params != nullptr && (is_q8_cell(params) || is_asym3_givens_cell(params))
+               ? staging_workspace_bytes(params)
+               : 0;
 }
 
 extern "C" int hipfire_flash_attn_ck_fwd_supported(
@@ -329,6 +459,7 @@ extern "C" int hipfire_flash_attn_ck_fwd(
     try
     {
         const bool q8 = is_q8_cell(p);
+        const bool asym3_givens = is_asym3_givens_cell(p);
         const void* q_ptr = p->q;
         const void* k_ptr = p->k;
         const void* v_ptr = p->v;
@@ -348,7 +479,7 @@ extern "C" int hipfire_flash_attn_ck_fwd(
         __half* staged_out = nullptr;
         hipStream_t stream = reinterpret_cast<hipStream_t>(p->stream);
         const size_t q_count = static_cast<size_t>(p->batch) * p->seqlen_q * p->nhead_q * p->head_dim;
-        if(q8)
+        if(q8 || asym3_givens)
         {
             uint8_t* cursor = static_cast<uint8_t*>(p->workspace);
             __half* staged_q = reinterpret_cast<__half*>(cursor);
@@ -361,12 +492,33 @@ extern "C" int hipfire_flash_attn_ck_fwd(
             staged_out = reinterpret_cast<__half*>(cursor);
 
             const int threads = 256;
-            convert_f32_to_f16<<<(q_count + threads - 1) / threads, threads, 0, stream>>>(
-                static_cast<const float*>(p->q), staged_q, q_count);
-            decode_q8_kv_d256<<<dim3(p->seqlen_k, p->nhead_k), 32, 0, stream>>>(
-                static_cast<const uint8_t*>(p->k), static_cast<const uint8_t*>(p->v),
-                staged_k, staged_v, p->seqlen_k, p->nhead_k,
-                p->packed_k_row_stride_bytes, p->packed_v_row_stride_bytes);
+            if(q8)
+            {
+                convert_f32_to_f16<<<(q_count + threads - 1) / threads, threads, 0, stream>>>(
+                    static_cast<const float*>(p->q), staged_q, q_count);
+                decode_q8_kv_d256<<<dim3(p->seqlen_k, p->nhead_k), 32, 0, stream>>>(
+                    static_cast<const uint8_t*>(p->k), static_cast<const uint8_t*>(p->v),
+                    staged_k, staged_v, p->seqlen_k, p->nhead_k,
+                    p->packed_k_row_stride_bytes, p->packed_v_row_stride_bytes);
+            }
+            else
+            {
+                transform_q_givens_f32_to_f16<<<dim3(p->seqlen_q, p->nhead_q), 32, 0, stream>>>(
+                    static_cast<const float*>(p->q), staged_q, p->seqlen_q, p->nhead_q,
+                    p->head_dim, static_cast<const float*>(p->k_transform0),
+                    static_cast<const float*>(p->k_transform1));
+                decode_asym3_k_givens<<<dim3(p->seqlen_k, p->nhead_k), 32, 0, stream>>>(
+                    static_cast<const uint8_t*>(p->k), staged_k, p->seqlen_k, p->nhead_k,
+                    p->packed_k_row_stride_bytes, p->packed_k_head_stride_bytes, p->head_dim);
+                decode_q8<<<dim3(p->seqlen_k, p->nhead_k), 32, 0, stream>>>(
+                    static_cast<const uint8_t*>(p->v), staged_v, p->seqlen_k, p->nhead_k,
+                    p->packed_v_row_stride_bytes, p->packed_v_head_stride_bytes, p->head_dim);
+            }
+            if(const hipError_t status = hipGetLastError(); status != hipSuccess)
+            {
+                set_error(error, error_capacity, hipGetErrorString(status));
+                return 3;
+            }
             q_ptr = staged_q;
             k_ptr = staged_k;
             v_ptr = staged_v;
@@ -444,11 +596,16 @@ extern "C" int hipfire_flash_attn_ck_fwd(
             set_error(error, error_capacity, "CK found no matching forward kernel");
             return 2;
         }
-        if(q8)
+        if(q8 || asym3_givens)
         {
             const int threads = 256;
             convert_f16_to_f32<<<(q_count + threads - 1) / threads, threads, 0, stream>>>(
                 staged_out, static_cast<float*>(p->out), q_count);
+            if(const hipError_t status = hipGetLastError(); status != hipSuccess)
+            {
+                set_error(error, error_capacity, hipGetErrorString(status));
+                return 3;
+            }
         }
         set_error(error, error_capacity, "");
         return 0;

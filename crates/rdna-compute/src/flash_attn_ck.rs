@@ -1021,6 +1021,16 @@ mod tests {
             return;
         };
         let sidecar = unsafe { FlashAttnCk::load(path) }.expect("load explicit test sidecar");
+        assert!(sidecar.capabilities().iter().any(|cell| {
+            cell.arch == FlashAttnCkArch::Gfx1100 as i32
+                && cell.dtype == FlashAttnCkDType::F32 as i32
+                && cell.k_format == FlashAttnCkKvFormat::Asym3Givens as i32
+                && cell.v_format == FlashAttnCkKvFormat::Q8 as i32
+                && cell.head_dim == 256
+        }));
+        assert!(!sidecar.capabilities().iter().any(|cell| {
+            cell.k_format == FlashAttnCkKvFormat::Asym3Givens as i32 && cell.head_dim == 512
+        }));
         let error = sidecar
             .is_supported(&FlashAttnCkFwdParams::default())
             .expect_err("zero-shape parameters must be rejected");
