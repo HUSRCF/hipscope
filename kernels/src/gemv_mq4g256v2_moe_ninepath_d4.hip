@@ -18,6 +18,27 @@
 // num_experts_per_tok 8 -- so it was paying the expanded+combine cost on the
 // precise shape this path was tuned for.
 //
+// MEASURED: no decode win on single-stream. gfx1151, shipped artifact,
+// 4 alternations x 12 runs, cold run discarded:
+//   OFF (expanded+combine)  medians 71.50 71.50 71.80 71.40  -> 71.55 tok/s
+//   ON  (this kernel)       medians 71.40 72.00 71.90 71.60  -> 71.73 tok/s
+// +0.18 tok/s (+0.25%) against a within-arm spread of 71.33-71.88 -- i.e. the
+// difference is smaller than the noise and is NOT a win.
+//
+// Routing was verified independently rather than inferred from the timings:
+// a probe inside the dispatch arm fires in the ON arm and neither it nor the
+// qt13 fallthrough fires in the OFF arm. (Two weaker checks misled first --
+// the JIT cache is populated eagerly in BOTH arms, so cache presence proves
+// nothing about dispatch.)
+//
+// The "+0.8% on the A3B serve battery" figure attached to qt13's D4 is from a
+// CONCURRENT/multiturn workload, not this single-stream bench -- which is the
+// least favourable case for D4, whose benefit is removing the expanded
+// [8 x down_m] intermediate and a combine launch. That workload is untested
+// here. Keep this kernel for structural parity, lower register pressure
+// (46 VGPRs vs qt13's 48) and one less launch; do NOT quote a speedup for it
+// until the concurrent arm is measured.
+//
 // Affine-grid selection is LANE-CONSTANT: lane reads the u32 at
 // `boff = lane*4`, covering weights [lane*8, lane*8+8) -- wholly inside one
 // 128-weight half, the same half in every group. So the header offset hoists
