@@ -42,13 +42,17 @@ float load(const std::vector<__half>& values,
     return __half2float(values[offset(b, s, h, d, seqlen, heads, hdim)]);
 }
 
-void run_case(const char* name, int nhead_q, int nhead_k, bool causal, bool non_default_stream)
+void run_case(const char* name,
+              int nhead_q,
+              int nhead_k,
+              bool causal,
+              bool non_default_stream,
+              int hdim = 64)
 {
     constexpr int batch = 1;
     constexpr int seqlen_q = 64;
     constexpr int seqlen_k = 96;
-    constexpr int hdim = 64;
-    constexpr float scale = 1.0f / 8.0f;
+    const float scale = 1.0f / std::sqrt(static_cast<float>(hdim));
     const int groups = nhead_q / nhead_k;
 
     const size_t q_count = static_cast<size_t>(batch) * seqlen_q * nhead_q * hdim;
@@ -373,8 +377,10 @@ int main()
         std::fprintf(stderr, "sidecar ABI mismatch\n");
         return 1;
     }
-    run_case("gqa-noncausal", 4, 2, false, false);
-    run_case("gqa-causal", 4, 2, true, true);
+    run_case("gqa-noncausal-d64", 4, 2, false, false);
+    run_case("gqa-causal-d64", 4, 2, true, true);
+    run_case("gqa-causal-d128", 4, 2, true, false, 128);
+    run_case("gqa-causal-d256", 4, 2, true, false, 256);
     run_case("mha-noncausal", 2, 2, false, false);
     run_case("mqa-noncausal", 4, 1, false, false);
     run_q8_case(128);

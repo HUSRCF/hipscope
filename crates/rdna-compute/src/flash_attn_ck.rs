@@ -966,6 +966,15 @@ mod tests {
             return;
         };
         let sidecar = unsafe { FlashAttnCk::load(path) }.expect("load explicit test sidecar");
+        for head_dim in [64, 128, 256] {
+            assert!(sidecar.capabilities().iter().any(|cell| {
+                cell.arch == FlashAttnCkArch::Gfx1100 as i32
+                    && cell.dtype == FlashAttnCkDType::F16 as i32
+                    && cell.k_format == FlashAttnCkKvFormat::DenseF16 as i32
+                    && cell.v_format == FlashAttnCkKvFormat::DenseF16 as i32
+                    && cell.head_dim == head_dim
+            }));
+        }
         for head_dim in [128, 256] {
             assert!(sidecar.capabilities().iter().any(|cell| {
                 cell.arch == FlashAttnCkArch::Gfx1100 as i32

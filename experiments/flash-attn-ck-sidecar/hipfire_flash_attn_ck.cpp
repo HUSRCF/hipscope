@@ -151,7 +151,8 @@ int validate(const hipfire_flash_attn_ck_fwd_params* p, char* error, size_t erro
         set_error(error, error_capacity, "batch, sequence lengths, and head counts must be positive");
         return 1;
     }
-    if((dense && p->head_dim != 64) || (q8 && p->head_dim != 128 && p->head_dim != 256))
+    if((dense && p->head_dim != 64 && p->head_dim != 128 && p->head_dim != 256) ||
+       (q8 && p->head_dim != 128 && p->head_dim != 256))
     {
         set_error(error, error_capacity, "unsupported head dimension for selected cell");
         return 1;
@@ -241,6 +242,38 @@ extern "C" size_t hipfire_flash_attn_ck_capabilities(
         HIPFIRE_FLASH_ATTN_CK_DENSE_F16,
         HIPFIRE_FLASH_ATTN_CK_DENSE_F16,
         64,
+        HIPFIRE_FLASH_ATTN_CK_CAP_CAUSAL | HIPFIRE_FLASH_ATTN_CK_CAP_GQA,
+    },
+    {
+        HIPFIRE_FLASH_ATTN_CK_ABI_VERSION,
+        sizeof(hipfire_flash_attn_ck_capability),
+#if defined(HIPFIRE_CK_TARGET_GFX1201)
+        HIPFIRE_FLASH_ATTN_CK_GFX1201,
+#elif defined(HIPFIRE_CK_TARGET_GFX1151)
+        HIPFIRE_FLASH_ATTN_CK_GFX1151,
+#else
+        HIPFIRE_FLASH_ATTN_CK_GFX1100,
+#endif
+        HIPFIRE_FLASH_ATTN_CK_F16,
+        HIPFIRE_FLASH_ATTN_CK_DENSE_F16,
+        HIPFIRE_FLASH_ATTN_CK_DENSE_F16,
+        128,
+        HIPFIRE_FLASH_ATTN_CK_CAP_CAUSAL | HIPFIRE_FLASH_ATTN_CK_CAP_GQA,
+    },
+    {
+        HIPFIRE_FLASH_ATTN_CK_ABI_VERSION,
+        sizeof(hipfire_flash_attn_ck_capability),
+#if defined(HIPFIRE_CK_TARGET_GFX1201)
+        HIPFIRE_FLASH_ATTN_CK_GFX1201,
+#elif defined(HIPFIRE_CK_TARGET_GFX1151)
+        HIPFIRE_FLASH_ATTN_CK_GFX1151,
+#else
+        HIPFIRE_FLASH_ATTN_CK_GFX1100,
+#endif
+        HIPFIRE_FLASH_ATTN_CK_F16,
+        HIPFIRE_FLASH_ATTN_CK_DENSE_F16,
+        HIPFIRE_FLASH_ATTN_CK_DENSE_F16,
+        256,
         HIPFIRE_FLASH_ATTN_CK_CAP_CAUSAL | HIPFIRE_FLASH_ATTN_CK_CAP_GQA,
     },
 #if defined(HIPFIRE_CK_TARGET_GFX1100)

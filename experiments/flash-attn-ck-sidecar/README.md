@@ -18,7 +18,7 @@ Current scope:
 - dense FP16 forward attention;
 - causal or non-causal masks;
 - MHA, MQA, and GQA;
-- dense FP16 head dimension 64;
+- dense FP16 head dimensions 64, 128, and 256;
 - gfx1100 F32-Q/Q8-K/Q8-V causal GQA at head dimensions 128 and 256;
 - raw HIP stream and element-stride inputs.
 
@@ -88,6 +88,8 @@ Validated on Radeon Pro W7900 / gfx1100 with ROCm 7.14:
 | --- | ---: | ---: |
 | FP16 GQA D64, non-causal, default stream | `4.172325e-05` | `5.800672e-06` |
 | FP16 GQA D64, causal, non-default stream | `5.501509e-05` | `7.329229e-06` |
+| FP16 GQA D128, causal, default stream | `7.070601e-05` | `7.611228e-06` |
+| FP16 GQA D256, causal, default stream | `7.580221e-05` | `7.560880e-06` |
 | FP16 MHA D64, non-causal, default stream | `4.062802e-05` | `6.646507e-06` |
 | FP16 MQA D64, non-causal, default stream | `4.367530e-05` | `6.348691e-06` |
 | F32/Q8/Q8 GQA D128, causal | `5.379319e-05` | `6.874457e-06` |
