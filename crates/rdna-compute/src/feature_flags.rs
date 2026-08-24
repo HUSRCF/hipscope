@@ -179,6 +179,9 @@ pub struct FeatureFlags {
     pub deterministic: bool,
     pub mw16: bool,
     pub q8_batched_legacy: bool,
+    /// Optional ABI-v2 CK runtime artifact. Resolved once at GPU startup;
+    /// absence or load/capability failure leaves native dispatch unchanged.
+    pub flash_attn_ck_lib: Option<String>,
     /// Fuse Gemma 4 Q8 prefill projections on exact gfx1100. This remains an
     /// opt-in while the E-series path is validated across QKV-sharing shapes.
     pub gemma4_q8_fused_prefill: bool,
@@ -498,6 +501,9 @@ impl FeatureFlags {
             deterministic: value("HIPFIRE_DETERMINISTIC").ok().as_deref() == Some("1"),
             mw16: value("HIPFIRE_MW16").map_or(false, |v| v == "1"),
             q8_batched_legacy: value("HIPFIRE_Q8_BATCHED_LEGACY").as_deref() == Ok("1"),
+            flash_attn_ck_lib: value("HIPFIRE_FLASH_ATTN_CK_LIB")
+                .ok()
+                .filter(|path| !path.is_empty()),
             gemma4_q8_fused_prefill: parse_bool("HIPFIRE_GEMMA4_Q8_FUSED_PREFILL").unwrap_or(false),
             gemma4_batched_embedding_prefill: parse_bool(
                 "HIPFIRE_GEMMA4_BATCHED_EMBEDDING_PREFILL",
@@ -733,6 +739,7 @@ impl FeatureFlags {
             deterministic: false,
             mw16: false,
             q8_batched_legacy: false,
+            flash_attn_ck_lib: None,
             gemma4_q8_fused_prefill: false,
             gemma4_batched_embedding_prefill: false,
             gemma4_ple_batched_prefill: false,

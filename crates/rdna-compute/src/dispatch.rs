@@ -630,6 +630,12 @@ pub struct Gpu {
     /// Model-scoped Redline warmup recorder and fail-closed backend gate.
     pub replay: crate::replay::ReplayController,
 
+    /// Process-pinned optional CK runtime. Loading is explicit and fail-closed;
+    /// individual attention families still decide whether a capability cell is
+    /// eligible after their native layout/tier resolution.
+    #[cfg(feature = "flash-attn-ck")]
+    pub(crate) flash_attn_ck: Option<crate::flash_attn_ck::FlashAttnCk>,
+
     // ── MMQ per-weight screening (#87) — extracted to MmqScreenState ──────
     pub mmq_screen: MmqScreenState,
 
@@ -1100,6 +1106,43 @@ impl Gpu {
         let mmq_screen = flags.mmq_screen;
         let mmq_screen_threshold = flags.mmq_screen_threshold;
 
+        #[cfg(feature = "flash-attn-ck")]
+        let flash_attn_ck = flags.flash_attn_ck_lib.as_deref().and_then(|path| {
+            let runtime = match unsafe { crate::flash_attn_ck::FlashAttnCk::load(path) } {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    eprintln!("WARNING: optional CK runtime disabled: {error}");
+                    return None;
+                }
+            };
+            let expected_arch = match arch.as_str() {
+                "gfx1100" => crate::flash_attn_ck::FlashAttnCkArch::Gfx1100 as i32,
+                "gfx1151" => crate::flash_attn_ck::FlashAttnCkArch::Gfx1151 as i32,
+                "gfx1201" => crate::flash_attn_ck::FlashAttnCkArch::Gfx1201 as i32,
+                _ => {
+                    eprintln!(
+                        "WARNING: optional CK runtime disabled: {arch} has no exact-arch ABI cell"
+                    );
+                    return None;
+                }
+            };
+            if !runtime
+                .capabilities()
+                .iter()
+                .any(|cell| cell.arch == expected_arch)
+            {
+                eprintln!(
+                    "WARNING: optional CK runtime disabled: artifact has no {arch} capability"
+                );
+                return None;
+            }
+            eprintln!(
+                "loaded optional CK runtime for {arch}: {} capability cell(s)",
+                runtime.capabilities().len()
+            );
+            Some(runtime)
+        });
+
         Ok(Self {
             hip,
             arch,
@@ -1141,6 +1184,8 @@ impl Gpu {
                 sample_partials_bytes: 0,
             },
             replay: crate::replay::ReplayController::from_config(),
+            #[cfg(feature = "flash-attn-ck")]
+            flash_attn_ck,
             mmq_screen: MmqScreenState {
                 cache: HashMap::new(),
                 enabled: mmq_screen,
