@@ -7,6 +7,13 @@ ROCM_PATH="${ROCM_PATH:-/opt/rocm}"
 GPU_ARCH="${GPU_ARCH:-gfx1100}"
 MAX_JOBS="${MAX_JOBS:-8}"
 OUT="${OUT:-${ROOT}/build/libhipfire_flash_attn_ck.so}"
+
+case "${GPU_ARCH}" in
+    gfx1100) TARGET_DEFINE=HIPFIRE_CK_TARGET_GFX1100 ;;
+    gfx1151) TARGET_DEFINE=HIPFIRE_CK_TARGET_GFX1151 ;;
+    gfx1201) TARGET_DEFINE=HIPFIRE_CK_TARGET_GFX1201 ;;
+    *) echo "unsupported exact CK artifact arch: ${GPU_ARCH}" >&2; exit 2 ;;
+esac
 BUILD_DIR="$(dirname "${OUT}")"
 HIP_ROOT="$("${ROCM_PATH}/bin/hipconfig" --path)"
 HIP_LIB_DIR="${HIP_ROOT}/lib"
@@ -89,6 +96,7 @@ COMMON_FLAGS=(
     -O3
     -fPIC
     --offload-arch="${GPU_ARCH}"
+    -D"${TARGET_DEFINE}"=1
     -DCK_TILE_FMHA_FWD_FAST_EXP2=1
     -fgpu-flush-denormals-to-zero
     -DCK_ENABLE_BF16

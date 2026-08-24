@@ -9,11 +9,40 @@
 extern "C" {
 #endif
 
-#define HIPFIRE_FLASH_ATTN_CK_ABI_VERSION 1u
+#define HIPFIRE_FLASH_ATTN_CK_ABI_VERSION 2u
 
 enum hipfire_flash_attn_ck_dtype {
     HIPFIRE_FLASH_ATTN_CK_F16 = 1,
     HIPFIRE_FLASH_ATTN_CK_BF16 = 2,
+};
+
+enum hipfire_flash_attn_ck_arch {
+    HIPFIRE_FLASH_ATTN_CK_GFX1100 = 1100,
+    HIPFIRE_FLASH_ATTN_CK_GFX1151 = 1151,
+    HIPFIRE_FLASH_ATTN_CK_GFX1201 = 1201,
+};
+
+enum hipfire_flash_attn_ck_kv_format {
+    HIPFIRE_FLASH_ATTN_CK_DENSE_F16 = 1,
+    HIPFIRE_FLASH_ATTN_CK_DENSE_BF16 = 2,
+    HIPFIRE_FLASH_ATTN_CK_Q8 = 3,
+    HIPFIRE_FLASH_ATTN_CK_ASYM = 4,
+    HIPFIRE_FLASH_ATTN_CK_FWHT = 5,
+    HIPFIRE_FLASH_ATTN_CK_LLOYD = 6,
+};
+
+#define HIPFIRE_FLASH_ATTN_CK_CAP_CAUSAL (1u << 0)
+#define HIPFIRE_FLASH_ATTN_CK_CAP_GQA (1u << 1)
+
+struct hipfire_flash_attn_ck_capability {
+    uint32_t abi_version;
+    uint32_t struct_size;
+    int32_t arch;
+    int32_t dtype;
+    int32_t k_format;
+    int32_t v_format;
+    int32_t head_dim;
+    uint32_t flags;
 };
 
 struct hipfire_flash_attn_ck_fwd_params {
@@ -24,9 +53,13 @@ struct hipfire_flash_attn_ck_fwd_params {
     const void* k;
     const void* v;
     void* out;
+    void* workspace;
+    size_t workspace_bytes;
     void* stream;
 
     int32_t dtype;
+    int32_t k_format;
+    int32_t v_format;
     int32_t batch;
     int32_t seqlen_q;
     int32_t seqlen_k;
@@ -52,6 +85,13 @@ struct hipfire_flash_attn_ck_fwd_params {
 };
 
 uint32_t hipfire_flash_attn_ck_abi_version(void);
+
+size_t hipfire_flash_attn_ck_capabilities(
+    struct hipfire_flash_attn_ck_capability* capabilities,
+    size_t capacity);
+
+size_t hipfire_flash_attn_ck_fwd_workspace_bytes(
+    const struct hipfire_flash_attn_ck_fwd_params* params);
 
 int hipfire_flash_attn_ck_fwd_supported(
     const struct hipfire_flash_attn_ck_fwd_params* params,

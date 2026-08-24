@@ -151,6 +151,8 @@ void run_case(const char* name, int nhead_q, int nhead_k, bool causal, bool non_
     params.out = out_device;
     params.stream = reinterpret_cast<void*>(stream);
     params.dtype = HIPFIRE_FLASH_ATTN_CK_F16;
+    params.k_format = HIPFIRE_FLASH_ATTN_CK_DENSE_F16;
+    params.v_format = HIPFIRE_FLASH_ATTN_CK_DENSE_F16;
     params.batch = batch;
     params.seqlen_q = seqlen_q;
     params.seqlen_k = seqlen_k;

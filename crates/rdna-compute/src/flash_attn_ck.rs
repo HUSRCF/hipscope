@@ -15,7 +15,7 @@ use std::ffi::{c_char, c_void};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-pub const FLASH_ATTN_CK_ABI_VERSION: u32 = 1;
+pub const FLASH_ATTN_CK_ABI_VERSION: u32 = 2;
 const ERROR_CAPACITY: usize = 512;
 
 #[repr(i32)]
@@ -23,6 +23,42 @@ const ERROR_CAPACITY: usize = 512;
 pub enum FlashAttnCkDType {
     F16 = 1,
     Bf16 = 2,
+}
+
+#[repr(i32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlashAttnCkArch {
+    Gfx1100 = 1100,
+    Gfx1151 = 1151,
+    Gfx1201 = 1201,
+}
+
+#[repr(i32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlashAttnCkKvFormat {
+    DenseF16 = 1,
+    DenseBf16 = 2,
+    Q8 = 3,
+    Asym = 4,
+    Fwht = 5,
+    Lloyd = 6,
+}
+
+pub const FLASH_ATTN_CK_CAP_CAUSAL: u32 = 1 << 0;
+pub const FLASH_ATTN_CK_CAP_GQA: u32 = 1 << 1;
+
+/// One exact-architecture layout cell exported by a sidecar artifact.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FlashAttnCkCapability {
+    pub abi_version: u32,
+    pub struct_size: u32,
+    pub arch: i32,
+    pub dtype: i32,
+    pub k_format: i32,
+    pub v_format: i32,
+    pub head_dim: i32,
+    pub flags: u32,
 }
 
 /// Stable C layout shared with `hipfire_flash_attn_ck.h`.
@@ -38,9 +74,13 @@ pub struct FlashAttnCkFwdParams {
     pub k: *const c_void,
     pub v: *const c_void,
     pub out: *mut c_void,
+    pub workspace: *mut c_void,
+    pub workspace_bytes: usize,
     pub stream: *mut c_void,
 
     pub dtype: i32,
+    pub k_format: i32,
+    pub v_format: i32,
     pub batch: i32,
     pub seqlen_q: i32,
     pub seqlen_k: i32,
@@ -74,8 +114,12 @@ impl FlashAttnCkFwdParams {
             k: std::ptr::null(),
             v: std::ptr::null(),
             out: std::ptr::null_mut(),
+            workspace: std::ptr::null_mut(),
+            workspace_bytes: 0,
             stream: std::ptr::null_mut(),
             dtype: FlashAttnCkDType::F16 as i32,
+            k_format: FlashAttnCkKvFormat::DenseF16 as i32,
+            v_format: FlashAttnCkKvFormat::DenseF16 as i32,
             batch: 0,
             seqlen_q: 0,
             seqlen_k: 0,
@@ -166,11 +210,15 @@ impl Error for FlashAttnCkError {
 }
 
 type AbiVersionFn = unsafe extern "C" fn() -> u32;
+type CapabilitiesFn = unsafe extern "C" fn(*mut FlashAttnCkCapability, usize) -> usize;
+type WorkspaceBytesFn = unsafe extern "C" fn(*const FlashAttnCkFwdParams) -> usize;
 type FwdFn = unsafe extern "C" fn(*const FlashAttnCkFwdParams, *mut c_char, usize) -> i32;
 
 /// Loaded sidecar and its stable function table.
 pub struct FlashAttnCk {
     _library: &'static Library,
+    capabilities: Vec<FlashAttnCkCapability>,
+    workspace_bytes: WorkspaceBytesFn,
     fwd_supported: FwdFn,
     fwd: FwdFn,
 }
@@ -196,7 +244,7 @@ impl FlashAttnCk {
                 source,
             })?;
 
-        let (fwd_supported, fwd) = unsafe {
+        let (capabilities, workspace_bytes, fwd_supported, fwd) = unsafe {
             let abi_version: Symbol<'_, AbiVersionFn> = symbol(
                 &library,
                 b"hipfire_flash_attn_ck_abi_version",
@@ -206,6 +254,16 @@ impl FlashAttnCk {
                 &library,
                 b"hipfire_flash_attn_ck_fwd_supported",
                 "fwd_supported",
+            )?;
+            let capabilities: Symbol<'_, CapabilitiesFn> = symbol(
+                &library,
+                b"hipfire_flash_attn_ck_capabilities",
+                "capabilities",
+            )?;
+            let workspace_bytes: Symbol<'_, WorkspaceBytesFn> = symbol(
+                &library,
+                b"hipfire_flash_attn_ck_fwd_workspace_bytes",
+                "fwd_workspace_bytes",
             )?;
             let fwd: Symbol<'_, FwdFn> = symbol(&library, b"hipfire_flash_attn_ck_fwd", "fwd")?;
 
@@ -217,14 +275,65 @@ impl FlashAttnCk {
                 });
             }
 
-            (*fwd_supported, *fwd)
+            let count = capabilities(std::ptr::null_mut(), 0);
+            let mut cells = vec![
+                FlashAttnCkCapability {
+                    abi_version: FLASH_ATTN_CK_ABI_VERSION,
+                    struct_size: std::mem::size_of::<FlashAttnCkCapability>() as u32,
+                    arch: 0,
+                    dtype: 0,
+                    k_format: 0,
+                    v_format: 0,
+                    head_dim: 0,
+                    flags: 0,
+                };
+                count
+            ];
+            let written = capabilities(cells.as_mut_ptr(), cells.len());
+            if written != count {
+                return Err(FlashAttnCkError::Call {
+                    operation: "capability query",
+                    status: -1,
+                    message: format!("sidecar reported {count} cells but wrote {written}"),
+                });
+            }
+            if cells.is_empty() {
+                return Err(FlashAttnCkError::Call {
+                    operation: "capability query",
+                    status: -1,
+                    message: "sidecar exported no capability cells".to_string(),
+                });
+            }
+            for cell in &cells {
+                if cell.abi_version != FLASH_ATTN_CK_ABI_VERSION
+                    || cell.struct_size < std::mem::size_of::<FlashAttnCkCapability>() as u32
+                {
+                    return Err(FlashAttnCkError::Call {
+                        operation: "capability query",
+                        status: -1,
+                        message: "sidecar returned an incompatible capability cell".to_string(),
+                    });
+                }
+            }
+
+            (cells, *workspace_bytes, *fwd_supported, *fwd)
         };
         let library = Box::leak(Box::new(library));
         Ok(Self {
             _library: library,
+            capabilities,
+            workspace_bytes,
             fwd_supported,
             fwd,
         })
+    }
+
+    pub fn capabilities(&self) -> &[FlashAttnCkCapability] {
+        &self.capabilities
+    }
+
+    pub fn workspace_bytes(&self, params: &FlashAttnCkFwdParams) -> usize {
+        unsafe { (self.workspace_bytes)(params) }
     }
 
     pub fn is_supported(&self, params: &FlashAttnCkFwdParams) -> Result<(), FlashAttnCkError> {
@@ -287,19 +396,28 @@ mod tests {
 
     #[test]
     fn fwd_params_matches_c_abi_layout() {
-        assert_eq!(std::mem::size_of::<FlashAttnCkFwdParams>(), 184);
+        assert_eq!(std::mem::size_of::<FlashAttnCkFwdParams>(), 208);
         assert_eq!(std::mem::align_of::<FlashAttnCkFwdParams>(), 8);
         assert_eq!(std::mem::offset_of!(FlashAttnCkFwdParams, q), 8);
-        assert_eq!(std::mem::offset_of!(FlashAttnCkFwdParams, dtype), 48);
+        assert_eq!(std::mem::offset_of!(FlashAttnCkFwdParams, workspace), 40);
+        assert_eq!(std::mem::offset_of!(FlashAttnCkFwdParams, dtype), 64);
         assert_eq!(
             std::mem::offset_of!(FlashAttnCkFwdParams, softmax_scale),
-            80
+            104
         );
-        assert_eq!(std::mem::offset_of!(FlashAttnCkFwdParams, stride_q), 88);
+        assert_eq!(std::mem::offset_of!(FlashAttnCkFwdParams, stride_q), 112);
         assert_eq!(
             std::mem::offset_of!(FlashAttnCkFwdParams, batch_stride_out),
-            176
+            200
         );
+    }
+
+    #[test]
+    fn capability_matches_c_abi_layout() {
+        assert_eq!(std::mem::size_of::<FlashAttnCkCapability>(), 32);
+        assert_eq!(std::mem::align_of::<FlashAttnCkCapability>(), 4);
+        assert_eq!(std::mem::offset_of!(FlashAttnCkCapability, arch), 8);
+        assert_eq!(std::mem::offset_of!(FlashAttnCkCapability, flags), 28);
     }
 
     #[test]

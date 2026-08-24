@@ -12,13 +12,15 @@
 #include <string>
 #include <utility>
 
-static_assert(sizeof(hipfire_flash_attn_ck_fwd_params) == 184,
+static_assert(sizeof(hipfire_flash_attn_ck_fwd_params) == 208,
               "FlashAttention CK ABI parameter layout changed");
 static_assert(offsetof(hipfire_flash_attn_ck_fwd_params, q) == 8);
-static_assert(offsetof(hipfire_flash_attn_ck_fwd_params, dtype) == 48);
-static_assert(offsetof(hipfire_flash_attn_ck_fwd_params, softmax_scale) == 80);
-static_assert(offsetof(hipfire_flash_attn_ck_fwd_params, stride_q) == 88);
-static_assert(offsetof(hipfire_flash_attn_ck_fwd_params, batch_stride_out) == 176);
+static_assert(offsetof(hipfire_flash_attn_ck_fwd_params, workspace) == 40);
+static_assert(offsetof(hipfire_flash_attn_ck_fwd_params, dtype) == 64);
+static_assert(offsetof(hipfire_flash_attn_ck_fwd_params, softmax_scale) == 104);
+static_assert(offsetof(hipfire_flash_attn_ck_fwd_params, stride_q) == 112);
+static_assert(offsetof(hipfire_flash_attn_ck_fwd_params, batch_stride_out) == 200);
+static_assert(sizeof(hipfire_flash_attn_ck_capability) == 32);
 
 namespace {
 
@@ -58,6 +60,17 @@ int validate(const hipfire_flash_attn_ck_fwd_params* p, char* error, size_t erro
     if(p->dtype != HIPFIRE_FLASH_ATTN_CK_F16)
     {
         set_error(error, error_capacity, "this optional build supports FP16 only");
+        return 1;
+    }
+    if(p->k_format != HIPFIRE_FLASH_ATTN_CK_DENSE_F16 ||
+       p->v_format != HIPFIRE_FLASH_ATTN_CK_DENSE_F16)
+    {
+        set_error(error, error_capacity, "this artifact supports dense FP16 K/V only");
+        return 1;
+    }
+    if(p->workspace_bytes > 0 && p->workspace == nullptr)
+    {
+        set_error(error, error_capacity, "workspace must be non-null when workspace_bytes is non-zero");
         return 1;
     }
     if(p->batch <= 0 || p->seqlen_q <= 0 || p->seqlen_k <= 0 ||
@@ -117,6 +130,42 @@ int validate(const hipfire_flash_attn_ck_fwd_params* p, char* error, size_t erro
 extern "C" uint32_t hipfire_flash_attn_ck_abi_version(void)
 {
     return HIPFIRE_FLASH_ATTN_CK_ABI_VERSION;
+}
+
+extern "C" size_t hipfire_flash_attn_ck_capabilities(
+    hipfire_flash_attn_ck_capability* capabilities,
+    size_t capacity)
+{
+    static const hipfire_flash_attn_ck_capability cells[] = {{
+        HIPFIRE_FLASH_ATTN_CK_ABI_VERSION,
+        sizeof(hipfire_flash_attn_ck_capability),
+#if defined(HIPFIRE_CK_TARGET_GFX1201)
+        HIPFIRE_FLASH_ATTN_CK_GFX1201,
+#elif defined(HIPFIRE_CK_TARGET_GFX1151)
+        HIPFIRE_FLASH_ATTN_CK_GFX1151,
+#else
+        HIPFIRE_FLASH_ATTN_CK_GFX1100,
+#endif
+        HIPFIRE_FLASH_ATTN_CK_F16,
+        HIPFIRE_FLASH_ATTN_CK_DENSE_F16,
+        HIPFIRE_FLASH_ATTN_CK_DENSE_F16,
+        64,
+        HIPFIRE_FLASH_ATTN_CK_CAP_CAUSAL | HIPFIRE_FLASH_ATTN_CK_CAP_GQA,
+    }};
+    constexpr size_t count = sizeof(cells) / sizeof(cells[0]);
+    if(capabilities != nullptr && capacity > 0)
+    {
+        const size_t written = std::min(capacity, count);
+        std::memcpy(capabilities, cells, written * sizeof(cells[0]));
+        return written;
+    }
+    return count;
+}
+
+extern "C" size_t hipfire_flash_attn_ck_fwd_workspace_bytes(
+    const hipfire_flash_attn_ck_fwd_params*)
+{
+    return 0;
 }
 
 extern "C" int hipfire_flash_attn_ck_fwd_supported(

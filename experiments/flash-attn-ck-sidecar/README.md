@@ -8,6 +8,10 @@ The official extension is a PyTorch/pybind module and is hundreds of megabytes.
 Its public Python ABI is not usable from hipfire's Rust/raw-HIP runtime. This
 experiment instead compiles a selected CK instance set into a small library and
 exports a versioned C ABI. The library remains an optional runtime artifact.
+ABI v2 enumerates exact-architecture layout capabilities and exposes a uniform
+caller-owned workspace query. The dense reference artifact requires no
+workspace; future quantized adapters can request persistent scratch without
+allocating inside a stream-ordered launch.
 
 Current scope:
 
