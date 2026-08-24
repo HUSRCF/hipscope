@@ -707,6 +707,7 @@ mod tests {
 
     /// Perturb a single `scales_a` entry and assert only that row moves.
     #[test]
+    #[allow(clippy::erasing_op)] // perturbing scales_a row 0 exercises 0 * m + n
     fn fp8_scale_a_axis() {
         let m = 2usize;
         let n = 128usize;

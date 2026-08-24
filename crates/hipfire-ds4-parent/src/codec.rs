@@ -735,6 +735,7 @@ mod tests {
     // ── block dequant ──────────────────────────────────────────────────
 
     #[test]
+    #[allow(clippy::erasing_op)] // deliberate "row 0" indexing: 0 * bk + col
     fn dequant_dense_fp8_ragged_260x300() {
         // 260×300 exercises ceil in both dims: scale grid = [3, 3] not [2, 2].
         let m = 260usize;
@@ -782,6 +783,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::erasing_op)] // deliberate "row 0" indexing: 0 * k + col
     fn dequant_expert_fp4_nibble_order_and_scales() {
         // M=2, K=64 → stored [2, 32], scale [2, 2].
         let m = 2usize;

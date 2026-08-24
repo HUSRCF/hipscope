@@ -1669,6 +1669,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::erasing_op)] // row 0 of the mix matrix is written via 0 * r + c
     fn hc_split_sinkhorn_doubly_stochastic_and_iters_matter() {
         let hc = 4usize;
         let rows = 1usize;
