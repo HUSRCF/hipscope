@@ -105,6 +105,7 @@ pub struct MoeResolution {
     /// gate-side is MQ4 (e.g. the redline mq4r).
     pub gate_fusable: bool,
     pub routed_indexable_mq4: bool,
+    pub routed_indexable_mq4v2: bool,
     pub routed_indexable_mq5: bool,
     pub routed_indexable_mq6: bool,
     /// Mixed routed experts: gate_up MQ4, down MQ6 (the "mq6-down" lever —
@@ -200,6 +201,11 @@ impl MoeResolution {
         let routed_gate_up_mq3lloyd = d.routed_gate_up == MQ3G256Lloyd;
 
         let routed_indexable_mq4 = (d.routed_down == MQ4G256) && routed_gate_up_mq4;
+        // qt44. Gated on BOTH sides being MQ4G256V2, like every other uniform
+        // pairing: the indexed GEMVs decode qt44's dual-f16-grid header, and
+        // handing one a qt13 f32-header row reads the scale/zero as the two
+        // halves of a float — silently wrong output, not a fault.
+        let routed_indexable_mq4v2 = (d.routed_down == MQ4G256V2) && routed_gate_up_mq4v2;
         let routed_indexable_mq5 = (d.routed_down == MQ5G256) && routed_gate_up_mq5;
         let routed_indexable_mq6 = (d.routed_down == MQ6G256) && routed_gate_up_mq6;
         let routed_indexable_mixed_gu4_dn6 = routed_gate_up_mq4 && (d.routed_down == MQ6G256);
@@ -240,6 +246,7 @@ impl MoeResolution {
             && matches!(d.routed_down, MFP4G32E8 | MFP3G32E8 | MFP2G32E8);
 
         let routed_dtype_indexable = routed_indexable_mq4
+            || routed_indexable_mq4v2
             || routed_indexable_mq5
             || routed_indexable_mq6
             || routed_indexable_mixed_gu4_dn6
@@ -283,6 +290,7 @@ impl MoeResolution {
             gate_side_mq4,
             gate_fusable,
             routed_indexable_mq4,
+            routed_indexable_mq4v2,
             routed_indexable_mq5,
             routed_indexable_mq6,
             routed_indexable_mixed_gu4_dn6,
@@ -299,6 +307,7 @@ impl MoeResolution {
 
     pub fn routed_indexable(&self) -> bool {
         self.routed_indexable_mq4
+            || self.routed_indexable_mq4v2
             || self.routed_indexable_mq5
             || self.routed_indexable_mq6
             || self.routed_indexable_mixed_gu4_dn6

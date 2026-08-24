@@ -11597,6 +11597,150 @@ impl Gpu {
         result
     }
 
+    /// MQ4G256V2 (qt=44) sister of
+    /// [`Self::gemv_hfq4g256_moe_gate_up_k8_indexed`].
+    ///
+    /// Deliberately carries none of the qt13 method's gfx1100/gfx1151
+    /// specialisations: those were each qualified by measurement on their
+    /// target, and qt44 has no such measurements yet. One kernel, every arch —
+    /// add specialisations only behind their own measured admission gate.
+    pub fn gemv_mq4g256v2_moe_gate_up_k8_indexed(
+        &mut self,
+        expert_ptrs: &GpuTensor,  // [n_exp] of u64 device pointers
+        topk_indices: &GpuTensor, // [k_top] i32
+        x: &GpuTensor,
+        y_gate: &GpuTensor,
+        y_up: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_mq4g256v2_moe_gate_up_k8_indexed",
+            kernels::GEMV_MQ4G256V2_MOE_GATE_UP_K8_INDEXED_SRC,
+            "gemv_mq4g256v2_moe_gate_up_k8_indexed",
+        )?;
+        let pp = expert_ptrs.buf.as_ptr();
+        let ip = topk_indices.buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let ygp = y_gate.buf.as_ptr();
+        let yup = y_up.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &ygp as *const _ as *mut c_void,
+            &yup as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        // Same 136 B/group stride as qt13, so the qt13 byte estimate is exact.
+        let bytes = 8 * (crate::profile::gemv_hfq4g256_bytes(m, k) + m * 4);
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "gemv",
+            "gemv_mq4g256v2_moe_gate_up_k8_indexed",
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "gemv_mq4g256v2_moe_gate_up_k8_indexed",
+            [m as u32, 8, 1],
+            [32u32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp);
+                b.push_ptr(ip);
+                b.push_ptr(xp);
+                b.push_ptr(ygp);
+                b.push_ptr(yup);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// MQ4G256V2 (qt=44) sister of
+    /// [`Self::gemv_hfq4g256_moe_down_k8_indexed_batched_expanded`].
+    ///
+    /// Grid mirrors the qt13 method's DEFAULT (`m` workgroups). That kernel
+    /// owns four consecutive output rows per workgroup, so three quarters exit
+    /// at the row0 guard — the `tight_grid` contraction to `m/4` is
+    /// semantically target-neutral but is kept opt-in per arch behind its own
+    /// measurement, and qt44 has none yet. Same reasoning as the gate_up
+    /// sister: no unqualified specialisation.
+    pub fn gemv_mq4g256v2_moe_down_k8_indexed_batched_expanded(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        rot_batch: &GpuTensor,
+        expert_outputs: &GpuTensor, // [batch_size × k_top × m] f32
+        m: usize,
+        k: usize,
+        k_top: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_mq4g256v2_moe_down_k8_indexed_batched_expanded",
+            kernels::GEMV_MQ4G256V2_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC,
+            "gemv_mq4g256v2_moe_down_k8_indexed_batched_expanded",
+        )?;
+        let pp = expert_ptrs.buf.as_ptr();
+        let ip = topk_indices.buf.as_ptr();
+        let rbp = rot_batch.buf.as_ptr();
+        let eop = expert_outputs.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let kt_val = k_top as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &rbp as *const _ as *mut c_void,
+            &eop as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &kt_val as *const _ as *mut c_void,
+        ];
+        let bytes = batch_size * k_top * (crate::profile::gemv_hfq4g256_bytes(m, k) + m * 4);
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "gemv",
+            "gemv_mq4g256v2_moe_down_k8_indexed_batched_expanded",
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "gemv_mq4g256v2_moe_down_k8_indexed_batched_expanded",
+            [m as u32, k_top as u32, batch_size as u32],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp);
+                b.push_ptr(ip);
+                b.push_ptr(rbp);
+                b.push_ptr(eop);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(kt_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// Expert-wave-preserving down + deterministic combine experiment.
     ///
     /// The GEMV body and expanded stores are identical to the production

@@ -662,6 +662,20 @@ pub fn run_moe_decode(
                 p.mi,
                 gate_up_k,
             ))?;
+        } else if res.routed_indexable_mq4v2 {
+            // qt44. MUST precede the trailing `else`, which dispatches the qt13
+            // kernel: qt13 reads bytes [0..8) as one f32 scale + one f32 zero,
+            // where qt44 stores two f16 scale/zero pairs. Same 136 B stride, so
+            // the misread is silent — fluent text, wrong numbers.
+            hip!(gpu.gemv_mq4g256v2_moe_gate_up_k8_indexed(
+                p.expert_gate_up_ptrs,
+                p.topk_indices,
+                xr,
+                p.gate_batch,
+                p.up_batch,
+                2 * p.mi,
+                gate_up_k,
+            ))?;
         } else if res.routed_indexable_paro {
             hip!(gpu.gemv_paro_q4g128_moe_gate_up_k8_indexed(
                 p.expert_gate_up_ptrs,
@@ -2324,8 +2338,9 @@ fn dispatch_grouped_gemm(
         )),
         // qt44. Routed experts are ~99% of an A3B MoE's tensors, so without
         // this arm a qt44 MoE model cannot prefill at all — it falls into the
-        // `_other` error below. gfx11 only; the launcher refuses gfx12 rather
-        // than silently running a kernel that would misread qt44's header.
+        // `_other` error below. Arch-selecting (gfx11 `_k2` / gfx12 `_gfx12`)
+        // like the MQ2/MQ3-Lloyd sisters — do NOT swap it for the bare `_k2`
+        // launcher, which fails the JIT on RDNA4.
         DType::MQ4G256V2 => hip!(gpu.gemm_mq4g256v2_moe_grouped_wmma_k2(
             ptrs,
             tile_ids,
@@ -2748,6 +2763,16 @@ pub fn run_moe_prefill(
         // (gfx12 via env override); the Gpu method exists.
         let down_result = match p.dtypes.routed_down {
             DType::MQ4G256 => hip!(gpu.gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
+                p.expert_down_ptrs,
+                p.topk_indices,
+                p.rot_batch,
+                p.down_expanded,
+                down_m,
+                down_k,
+                k_top,
+                n,
+            )),
+            DType::MQ4G256V2 => hip!(gpu.gemv_mq4g256v2_moe_down_k8_indexed_batched_expanded(
                 p.expert_down_ptrs,
                 p.topk_indices,
                 p.rot_batch,

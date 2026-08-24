@@ -1005,6 +1005,43 @@ fn moe_res_k6_disables_gpu_topk_even_when_indexable() {
 }
 
 #[test]
+fn moe_res_mq4v2_routed_indexable() {
+    // qt44 uniform: both projections MQ4G256V2 => indexable, GPU top-K on.
+    let mut d = dtypes_all_mq4();
+    d.routed_gate_up = DType::MQ4G256V2;
+    d.routed_down = DType::MQ4G256V2;
+    d.experts_all_gate_up_mq4 = false;
+    let r = MoeResolution::resolve(&d, 8);
+    assert!(r.routed_indexable_mq4v2);
+    assert!(!r.routed_indexable_mq4, "must not claim the qt13 arm");
+    assert!(r.use_gpu_topk);
+    // qt44 is a FWHT-G256 format: its kernels read ROTATED activations.
+    assert!(r.needs_x_rot_local);
+}
+
+#[test]
+fn moe_res_mq4v2_mixed_with_qt13_is_not_indexable() {
+    // The hazard this pairing guards: qt13 and qt44 share a 136 B group stride
+    // and identical nibble packing, differing ONLY in the 8-byte header (one
+    // f32 scale+zero vs two f16 scale/zero pairs). A kernel handed the wrong
+    // one reads plausible garbage and emits fluent, wrong text rather than
+    // faulting. So a split pairing must NOT be indexable on either arm.
+    for (gu, dn) in [
+        (DType::MQ4G256V2, DType::MQ4G256),
+        (DType::MQ4G256, DType::MQ4G256V2),
+    ] {
+        let mut d = dtypes_all_mq4();
+        d.routed_gate_up = gu;
+        d.routed_down = dn;
+        d.experts_all_gate_up_mq4 = false;
+        let r = MoeResolution::resolve(&d, 8);
+        assert!(!r.routed_indexable_mq4v2, "{gu:?}/{dn:?}");
+        assert!(!r.routed_indexable_mq4, "{gu:?}/{dn:?}");
+        assert!(!r.use_gpu_topk, "{gu:?}/{dn:?} must fall back, not guess");
+    }
+}
+
+#[test]
 fn moe_res_mq5_routed_indexable() {
     let mut d = dtypes_all_mq4();
     d.routed_gate_up = DType::MQ5G256;
