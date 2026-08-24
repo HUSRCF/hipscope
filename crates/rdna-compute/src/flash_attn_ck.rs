@@ -15,7 +15,8 @@ use std::ffi::{c_char, c_void};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-pub const FLASH_ATTN_CK_ABI_VERSION: u32 = 3;
+pub const FLASH_ATTN_CK_ABI_VERSION: u32 = 4;
+const FLASH_ATTN_CK_MIN_COMPAT_ABI_VERSION: u32 = 3;
 const ERROR_CAPACITY: usize = 512;
 
 #[repr(i32)]
@@ -40,8 +41,8 @@ pub enum FlashAttnCkKvFormat {
     DenseF16 = 1,
     DenseBf16 = 2,
     Q8 = 3,
-    Asym = 4,
-    Fwht = 5,
+    Asym3Givens = 4,
+    Asym3Fwht = 5,
     Lloyd = 6,
 }
 
@@ -203,9 +204,21 @@ fn is_known_kv_format(value: i32) -> bool {
     value == FlashAttnCkKvFormat::DenseF16 as i32
         || value == FlashAttnCkKvFormat::DenseBf16 as i32
         || value == FlashAttnCkKvFormat::Q8 as i32
-        || value == FlashAttnCkKvFormat::Asym as i32
-        || value == FlashAttnCkKvFormat::Fwht as i32
+        || value == FlashAttnCkKvFormat::Asym3Givens as i32
+        || value == FlashAttnCkKvFormat::Asym3Fwht as i32
         || value == FlashAttnCkKvFormat::Lloyd as i32
+}
+
+fn is_supported_abi(version: u32) -> bool {
+    (FLASH_ATTN_CK_MIN_COMPAT_ABI_VERSION..=FLASH_ATTN_CK_ABI_VERSION).contains(&version)
+}
+
+fn capability_is_compatible(version: u32, cell: &FlashAttnCkCapability) -> bool {
+    let v3_quant_format = version == 3 && (cell.k_format >= 4 || cell.v_format >= 4);
+    cell.abi_version == version
+        && cell.struct_size >= std::mem::size_of::<FlashAttnCkCapability>() as u32
+        && cell.is_well_formed()
+        && !v3_quant_format
 }
 
 /// Stable C layout shared with `hipfire_flash_attn_ck.h`.
@@ -252,6 +265,12 @@ pub struct FlashAttnCkFwdParams {
     pub batch_stride_out: i64,
     pub packed_k_row_stride_bytes: i64,
     pub packed_v_row_stride_bytes: i64,
+    pub packed_k_head_stride_bytes: i64,
+    pub packed_v_head_stride_bytes: i64,
+    pub k_transform0: *const c_void,
+    pub k_transform1: *const c_void,
+    pub k_transform0_elements: i64,
+    pub k_transform1_elements: i64,
 }
 
 impl FlashAttnCkFwdParams {
@@ -291,6 +310,12 @@ impl FlashAttnCkFwdParams {
             batch_stride_out: 0,
             packed_k_row_stride_bytes: 0,
             packed_v_row_stride_bytes: 0,
+            packed_k_head_stride_bytes: 0,
+            packed_v_head_stride_bytes: 0,
+            k_transform0: std::ptr::null(),
+            k_transform1: std::ptr::null(),
+            k_transform0_elements: 0,
+            k_transform1_elements: 0,
         }
     }
 }
@@ -368,6 +393,7 @@ type FwdFn = unsafe extern "C" fn(*const FlashAttnCkFwdParams, *mut c_char, usiz
 /// Loaded sidecar and its stable function table.
 pub struct FlashAttnCk {
     _library: &'static Library,
+    abi_version: u32,
     capabilities: Vec<FlashAttnCkCapability>,
     workspace_bytes: WorkspaceBytesFn,
     fwd_supported: FwdFn,
@@ -395,7 +421,7 @@ impl FlashAttnCk {
                 source,
             })?;
 
-        let (capabilities, workspace_bytes, fwd_supported, fwd) = unsafe {
+        let (actual_abi, capabilities, workspace_bytes, fwd_supported, fwd) = unsafe {
             let abi_version: Symbol<'_, AbiVersionFn> = symbol(
                 &library,
                 b"hipfire_flash_attn_ck_abi_version",
@@ -419,7 +445,7 @@ impl FlashAttnCk {
             let fwd: Symbol<'_, FwdFn> = symbol(&library, b"hipfire_flash_attn_ck_fwd", "fwd")?;
 
             let actual = abi_version();
-            if actual != FLASH_ATTN_CK_ABI_VERSION {
+            if !is_supported_abi(actual) {
                 return Err(FlashAttnCkError::AbiVersion {
                     expected: FLASH_ATTN_CK_ABI_VERSION,
                     actual,
@@ -429,7 +455,7 @@ impl FlashAttnCk {
             let count = capabilities(std::ptr::null_mut(), 0);
             let mut cells = vec![
                 FlashAttnCkCapability {
-                    abi_version: FLASH_ATTN_CK_ABI_VERSION,
+                    abi_version: actual,
                     struct_size: std::mem::size_of::<FlashAttnCkCapability>() as u32,
                     arch: 0,
                     dtype: 0,
@@ -456,10 +482,7 @@ impl FlashAttnCk {
                 });
             }
             for cell in &cells {
-                if cell.abi_version != FLASH_ATTN_CK_ABI_VERSION
-                    || cell.struct_size < std::mem::size_of::<FlashAttnCkCapability>() as u32
-                    || !cell.is_well_formed()
-                {
+                if !capability_is_compatible(actual, cell) {
                     return Err(FlashAttnCkError::Call {
                         operation: "capability query",
                         status: -1,
@@ -468,11 +491,12 @@ impl FlashAttnCk {
                 }
             }
 
-            (cells, *workspace_bytes, *fwd_supported, *fwd)
+            (actual, cells, *workspace_bytes, *fwd_supported, *fwd)
         };
         let library = Box::leak(Box::new(library));
         Ok(Self {
             _library: library,
+            abi_version: actual_abi,
             capabilities,
             workspace_bytes,
             fwd_supported,
@@ -490,7 +514,8 @@ impl FlashAttnCk {
     }
 
     pub fn workspace_bytes(&self, params: &FlashAttnCkFwdParams) -> usize {
-        unsafe { (self.workspace_bytes)(params) }
+        let params = self.compatible_params(params);
+        unsafe { (self.workspace_bytes)(&params) }
     }
 
     pub fn is_supported(&self, params: &FlashAttnCkFwdParams) -> Result<(), FlashAttnCkError> {
@@ -514,8 +539,9 @@ impl FlashAttnCk {
         function: FwdFn,
         params: &FlashAttnCkFwdParams,
     ) -> Result<(), FlashAttnCkError> {
+        let params = self.compatible_params(params);
         let mut error = [0u8; ERROR_CAPACITY];
-        let status = unsafe { function(params, error.as_mut_ptr().cast::<c_char>(), error.len()) };
+        let status = unsafe { function(&params, error.as_mut_ptr().cast::<c_char>(), error.len()) };
         if status == 0 {
             Ok(())
         } else {
@@ -525,6 +551,12 @@ impl FlashAttnCk {
                 message: error_message(&error),
             })
         }
+    }
+
+    fn compatible_params(&self, params: &FlashAttnCkFwdParams) -> FlashAttnCkFwdParams {
+        let mut compatible = *params;
+        compatible.abi_version = self.abi_version;
+        compatible
     }
 }
 
@@ -637,6 +669,8 @@ impl crate::Gpu {
         params.batch_stride_out = params.batch_stride_q;
         params.packed_k_row_stride_bytes = (nhead_k * 272) as i64;
         params.packed_v_row_stride_bytes = params.packed_k_row_stride_bytes;
+        params.packed_k_head_stride_bytes = packed_head_bytes as i64;
+        params.packed_v_head_stride_bytes = packed_head_bytes as i64;
 
         let required = self
             .flash_attn_ck
@@ -720,7 +754,7 @@ mod tests {
 
     #[test]
     fn fwd_params_matches_c_abi_layout() {
-        assert_eq!(std::mem::size_of::<FlashAttnCkFwdParams>(), 224);
+        assert_eq!(std::mem::size_of::<FlashAttnCkFwdParams>(), 272);
         assert_eq!(std::mem::align_of::<FlashAttnCkFwdParams>(), 8);
         assert_eq!(std::mem::offset_of!(FlashAttnCkFwdParams, q), 8);
         assert_eq!(std::mem::offset_of!(FlashAttnCkFwdParams, workspace), 40);
@@ -738,6 +772,14 @@ mod tests {
             std::mem::offset_of!(FlashAttnCkFwdParams, packed_k_row_stride_bytes),
             208
         );
+        assert_eq!(
+            std::mem::offset_of!(FlashAttnCkFwdParams, packed_k_head_stride_bytes),
+            224
+        );
+        assert_eq!(
+            std::mem::offset_of!(FlashAttnCkFwdParams, k_transform0),
+            240
+        );
     }
 
     #[test]
@@ -746,6 +788,20 @@ mod tests {
         assert_eq!(std::mem::align_of::<FlashAttnCkCapability>(), 4);
         assert_eq!(std::mem::offset_of!(FlashAttnCkCapability, arch), 8);
         assert_eq!(std::mem::offset_of!(FlashAttnCkCapability, flags), 28);
+    }
+
+    #[test]
+    fn abi_v3_compatibility_is_limited_to_legacy_cells() {
+        assert!(!is_supported_abi(2));
+        assert!(is_supported_abi(3));
+        assert!(is_supported_abi(4));
+        assert!(!is_supported_abi(5));
+
+        let mut cell = q8_d256_capability();
+        cell.abi_version = 3;
+        assert!(capability_is_compatible(3, &cell));
+        cell.k_format = FlashAttnCkKvFormat::Asym3Givens as i32;
+        assert!(!capability_is_compatible(3, &cell));
     }
 
     fn dense_capability(arch: FlashAttnCkArch) -> FlashAttnCkCapability {
@@ -941,6 +997,10 @@ mod tests {
         let params = FlashAttnCkFwdParams::default();
         assert_eq!(params.abi_version, FLASH_ATTN_CK_ABI_VERSION);
         assert_eq!(params.struct_size as usize, std::mem::size_of_val(&params));
+        assert!(params.k_transform0.is_null());
+        assert!(params.k_transform1.is_null());
+        assert_eq!(params.packed_k_head_stride_bytes, 0);
+        assert_eq!(params.packed_v_head_stride_bytes, 0);
     }
 
     #[test]

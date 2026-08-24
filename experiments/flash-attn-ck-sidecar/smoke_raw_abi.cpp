@@ -340,6 +340,7 @@ void run_q8_d256_case()
     params.batch_stride_k = params.batch_stride_v = seqlen_k * nhead_k * hdim;
     params.batch_stride_out = params.batch_stride_q;
     params.packed_k_row_stride_bytes = params.packed_v_row_stride_bytes = nhead_k * head_bytes;
+    params.packed_k_head_stride_bytes = params.packed_v_head_stride_bytes = head_bytes;
     params.workspace_bytes = hipfire_flash_attn_ck_fwd_workspace_bytes(&params);
     check_hip(hipMalloc(&workspace, params.workspace_bytes), "hipMalloc(q8 workspace)");
     params.workspace = workspace;
@@ -365,6 +366,71 @@ void run_q8_d256_case()
     check_hip(hipFree(workspace), "hipFree(q8 workspace)");
 }
 
+void run_asym3_contract_case(int format, int hdim)
+{
+    int dummy = 0;
+    hipfire_flash_attn_ck_fwd_params params{};
+    params.abi_version = HIPFIRE_FLASH_ATTN_CK_ABI_VERSION;
+    params.struct_size = sizeof(params);
+    params.q = params.k = params.v = &dummy;
+    params.out = &dummy;
+    params.dtype = HIPFIRE_FLASH_ATTN_CK_F32;
+    params.k_format = format;
+    params.v_format = HIPFIRE_FLASH_ATTN_CK_Q8;
+    params.batch = 1;
+    params.seqlen_q = 16;
+    params.seqlen_k = 32;
+    params.nhead_q = 4;
+    params.nhead_k = 2;
+    params.head_dim = hdim;
+    params.causal = 1;
+    params.softmax_scale = 1.0f / std::sqrt(static_cast<float>(hdim));
+    params.stride_q = params.stride_out = 4 * hdim;
+    params.stride_k = params.stride_v = 2 * hdim;
+    params.nhead_stride_q = params.nhead_stride_k = params.nhead_stride_v =
+        params.nhead_stride_out = hdim;
+    params.batch_stride_q = params.batch_stride_out = 16 * 4 * hdim;
+    params.batch_stride_k = params.batch_stride_v = 32 * 2 * hdim;
+    params.packed_k_head_stride_bytes = 4 + (hdim * 3) / 8;
+    params.packed_v_head_stride_bytes = (hdim / 32) * 34;
+    params.packed_k_row_stride_bytes = 2 * params.packed_k_head_stride_bytes;
+    params.packed_v_row_stride_bytes = 2 * params.packed_v_head_stride_bytes;
+    params.k_transform0 = params.k_transform1 = &dummy;
+    const int transform_elements =
+        format == HIPFIRE_FLASH_ATTN_CK_ASYM3_GIVENS ? hdim / 2 : 256;
+    params.k_transform0_elements = params.k_transform1_elements = transform_elements;
+
+    char error[1024]{};
+    const int status = hipfire_flash_attn_ck_fwd_supported(&params, error, sizeof(error));
+    if(status != 2 || std::strstr(error, "no CK execution cell") == nullptr)
+    {
+        std::fprintf(stderr, "asym3 contract status=%d: %s\n", status, error);
+        std::exit(7);
+    }
+    params.packed_k_head_stride_bytes -= 1;
+    if(hipfire_flash_attn_ck_fwd_supported(&params, error, sizeof(error)) != 1)
+    {
+        std::fprintf(stderr, "malformed asym3 layout was accepted\n");
+        std::exit(8);
+    }
+    params.packed_k_head_stride_bytes += 1;
+    params.k_transform0 = nullptr;
+    if(hipfire_flash_attn_ck_fwd_supported(&params, error, sizeof(error)) != 1)
+    {
+        std::fprintf(stderr, "null asym3 transform was accepted\n");
+        std::exit(9);
+    }
+    params.k_transform0 = &dummy;
+    params.k_transform1_elements = transform_elements - 1;
+    if(hipfire_flash_attn_ck_fwd_supported(&params, error, sizeof(error)) != 1)
+    {
+        std::fprintf(stderr, "undersized asym3 transform was accepted\n");
+        std::exit(10);
+    }
+    std::printf("case=asym3-contract format=%s head_dim=%d status=recognized-no-cell\n",
+                format == HIPFIRE_FLASH_ATTN_CK_ASYM3_GIVENS ? "givens" : "fwht", hdim);
+}
+
 } // namespace
 
 int main()
@@ -379,5 +445,9 @@ int main()
     run_case("mha-noncausal", 2, 2, false, false);
     run_case("mqa-noncausal", 4, 1, false, false);
     run_q8_d256_case();
+    run_asym3_contract_case(HIPFIRE_FLASH_ATTN_CK_ASYM3_GIVENS, 256);
+    run_asym3_contract_case(HIPFIRE_FLASH_ATTN_CK_ASYM3_GIVENS, 512);
+    run_asym3_contract_case(HIPFIRE_FLASH_ATTN_CK_ASYM3_FWHT, 256);
+    run_asym3_contract_case(HIPFIRE_FLASH_ATTN_CK_ASYM3_FWHT, 512);
     return 0;
 }
