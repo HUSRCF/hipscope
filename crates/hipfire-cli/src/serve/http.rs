@@ -8,21 +8,13 @@
 //! framing, SSE acknowledgement, CORS/health endpoints. Isolates `tiny_http`
 //! I/O from business logic.
 
-use crate::serve::complete::{
-    self, complete_request, completion_json, gate_chat_completions_tools,
-    openai_stream_delta_for_event, openai_stream_terminal_chunks, Completion,
-};
-use crate::serve::{is_batch_eligible_request, ServeMeta, ServeShared};
-use crate::serve::{Admission, AdmissionError, AdmissionGuard};
-use crate::{list_local_models, unix_timestamp};
 use anyhow::{bail, Context, Result};
-use std::{
-    io::{Read, Write},
-    sync::{mpsc, Arc},
-    thread,
-    time::Duration,
-};
+use std::{io::{Read, Write}, sync::{Arc, mpsc}, thread, time::Duration};
 use tiny_http::{Header, Method, Request, Response, StatusCode};
+use crate::serve::{ServeShared, ServeMeta, is_batch_eligible_request};
+use crate::serve::complete::{self, Completion, complete_request, gate_chat_completions_tools, openai_stream_delta_for_event, openai_stream_terminal_chunks, completion_json};
+use crate::serve::{Admission, AdmissionGuard, AdmissionError};
+use crate::{list_local_models, unix_timestamp};
 
 pub(crate) fn handle_http(mut request: Request, shared: Arc<ServeShared>) -> Result<()> {
     let path = request
@@ -207,10 +199,7 @@ pub(crate) fn request_error_status(message: &str) -> u16 {
     }
 }
 
-pub(crate) fn read_request_json(
-    request: &mut Request,
-    max_bytes: u64,
-) -> Result<serde_json::Value> {
+pub(crate) fn read_request_json(request: &mut Request, max_bytes: u64) -> Result<serde_json::Value> {
     if request
         .headers()
         .iter()
@@ -367,78 +356,77 @@ pub(crate) fn respond_nonstreaming(
         let staged = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let staged_cb = staged.clone();
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-            let result = complete_request(
-                &shared,
-                &body,
-                guard,
-                None,
-                |_event| Ok(()),
-                |completion| {
-                    let bytes =
-                        serde_json::to_vec(&completion_json(completion)).map_err(|err| {
-                            hipfire_client::ClientError::Protocol(format!(
-                                "completion json serialize failed: {err}"
-                            ))
-                        })?;
-                    if bytes.is_empty() {
-                        return Err(hipfire_client::ClientError::Protocol(
-                            "nonstream terminal body must be non-empty".into(),
-                        ));
-                    }
-                    let (ack_tx, ack_rx) = mpsc::channel();
-                    sender
-                        .send(ResponseChunk {
-                            bytes,
-                            ack: Some(ack_tx),
-                            fail: false,
-                        })
-                        .map_err(|_| hipfire_client::ClientError::Cancelled)?;
-                    // Signal handler that terminal bytes are staged (success headers).
-                    staged_cb.store(true, std::sync::atomic::Ordering::SeqCst);
-                    let _ = status_tx.send(Ok(()));
-                    match ack_rx.recv() {
-                        Ok(Ok(())) => Ok(()),
-                        Ok(Err(_)) | Err(_) => Err(hipfire_client::ClientError::Cancelled),
-                    }
-                },
-            );
-            match result {
-                Ok(_completion) => {
-                    if !staged.load(std::sync::atomic::Ordering::SeqCst) {
-                        // Ok with no terminal staged: the generation completed without
-                        // producing a body. Report it rather than closing silently.
-                        let _ = status_tx.send(Err(
-                            "generation completed without a response body".to_string()
-                        ));
-                    }
-                    // Terminal already delivered+acked; close body with no post-commit bytes.
+        let result = complete_request(
+            &shared,
+            &body,
+            guard,
+            None,
+            |_event| Ok(()),
+            |completion| {
+                let bytes = serde_json::to_vec(&completion_json(completion)).map_err(|err| {
+                    hipfire_client::ClientError::Protocol(format!(
+                        "completion json serialize failed: {err}"
+                    ))
+                })?;
+                if bytes.is_empty() {
+                    return Err(hipfire_client::ClientError::Protocol(
+                        "nonstream terminal body must be non-empty".into(),
+                    ));
+                }
+                let (ack_tx, ack_rx) = mpsc::channel();
+                sender
+                    .send(ResponseChunk {
+                        bytes,
+                        ack: Some(ack_tx),
+                        fail: false,
+                    })
+                    .map_err(|_| hipfire_client::ClientError::Cancelled)?;
+                // Signal handler that terminal bytes are staged (success headers).
+                staged_cb.store(true, std::sync::atomic::Ordering::SeqCst);
+                let _ = status_tx.send(Ok(()));
+                match ack_rx.recv() {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(_)) | Err(_) => Err(hipfire_client::ClientError::Cancelled),
+                }
+            },
+        );
+        match result {
+            Ok(_completion) => {
+                if !staged.load(std::sync::atomic::Ordering::SeqCst) {
+                    // Ok with no terminal staged: the generation completed without
+                    // producing a body. Report it rather than closing silently.
+                    let _ = status_tx.send(Err(
+                        "generation completed without a response body".to_string(),
+                    ));
+                }
+                // Terminal already delivered+acked; close body with no post-commit bytes.
+                drop(sender);
+            }
+            Err(error) => {
+                let cancelled = error
+                    .downcast_ref::<hipfire_client::ClientError>()
+                    .is_some_and(|err| matches!(err, hipfire_client::ClientError::Cancelled));
+                if cancelled {
+                    // Tell the handler before leaving. This branch used to `return`
+                    // outright, which dropped `status_tx`, left `status_rx.recv()`
+                    // with a closed channel, and produced the contentless
+                    // "generation worker disconnected" for every cause that mapped
+                    // to Cancelled -- including a daemon that died mid-request. If
+                    // the client really did go away nobody reads this, so sending is
+                    // free; if it did not, the caller finally learns something.
+                            let _ = status_tx.send(Err(error.to_string()));
+                    // Drop without framing — unclean only if bytes already went out.
+                    drop(sender);
+                    return;
+                }
+                // If terminal was never staged, report error status to the handler.
+                let message = error.to_string();
+                if status_tx.send(Err(message)).is_err() {
+                    // Handler already started success body — force unclean close.
                     drop(sender);
                 }
-                Err(error) => {
-                    let cancelled = error
-                        .downcast_ref::<hipfire_client::ClientError>()
-                        .is_some_and(|err| matches!(err, hipfire_client::ClientError::Cancelled));
-                    if cancelled {
-                        // Tell the handler before leaving. This branch used to `return`
-                        // outright, which dropped `status_tx`, left `status_rx.recv()`
-                        // with a closed channel, and produced the contentless
-                        // "generation worker disconnected" for every cause that mapped
-                        // to Cancelled -- including a daemon that died mid-request. If
-                        // the client really did go away nobody reads this, so sending is
-                        // free; if it did not, the caller finally learns something.
-                        let _ = status_tx.send(Err(error.to_string()));
-                        // Drop without framing — unclean only if bytes already went out.
-                        drop(sender);
-                        return;
-                    }
-                    // If terminal was never staged, report error status to the handler.
-                    let message = error.to_string();
-                    if status_tx.send(Err(message)).is_err() {
-                        // Handler already started success body — force unclean close.
-                        drop(sender);
-                    }
-                }
             }
+        }
         }));
         if let Err(payload) = outcome {
             let detail = payload
@@ -591,10 +579,7 @@ pub(crate) fn header(name: &str, value: &str) -> Header {
     Header::from_bytes(name.as_bytes(), value.as_bytes()).expect("static HTTP header")
 }
 
-pub(crate) fn json_response(
-    value: serde_json::Value,
-    status: u16,
-) -> Response<std::io::Cursor<Vec<u8>>> {
+pub(crate) fn json_response(value: serde_json::Value, status: u16) -> Response<std::io::Cursor<Vec<u8>>> {
     let bytes = serde_json::to_vec(&value).expect("JSON value serializes");
     Response::new(
         StatusCode(status),
@@ -622,9 +607,7 @@ pub(crate) fn openai_error(message: &str, status: u16) -> Response<std::io::Curs
     )
 }
 
-pub(crate) fn admission_error_response(
-    error: &AdmissionError,
-) -> Response<std::io::Cursor<Vec<u8>>> {
+pub(crate) fn admission_error_response(error: &AdmissionError) -> Response<std::io::Cursor<Vec<u8>>> {
     openai_error(&error.message, 503).with_header(header(
         "Retry-After",
         &error.retry_after_seconds.to_string(),
@@ -753,3 +736,8 @@ impl Read for ChannelReader {
         }
     }
 }
+
+
+
+
+
