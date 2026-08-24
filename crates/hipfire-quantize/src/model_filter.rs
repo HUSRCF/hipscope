@@ -207,8 +207,6 @@ pub(crate) fn q8_class_of(name: &str) -> Option<&'static str> {
         Some("router")
     } else if name.contains("linear_attn.out_proj") || name.contains("ssm_out") {
         Some("ssm_out")
-    } else if name.contains("mlp.shared_expert.") {
-        Some("shared_expert")
     } else if name.contains("self_attn")
         || name.contains("attn_q")
         || name.contains("attn_k")
