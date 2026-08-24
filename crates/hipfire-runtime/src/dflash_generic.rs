@@ -1006,7 +1006,7 @@ impl Speculator for GenericDflashSpeculator {
         self.sample_temp = cfg.temp;
         self.sample_top_p = cfg.top_p;
         self.sample_top_k = cfg.top_k;
-        self.rng_state = 0x13579BDF;
+        self.rng_state = if cfg.rng_seed == 0 { 0x13579BDF } else { cfg.rng_seed };
     }
 
     fn free(self: Box<Self>, gpu: &mut Gpu) {

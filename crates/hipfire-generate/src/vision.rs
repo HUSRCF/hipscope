@@ -318,12 +318,6 @@ pub fn generate_vl(
     stdout: &mut std::io::Stdout,
     params: &GenerateVLParams,
 ) {
-    // hunt3 M-E: seed the process-global CPU sampler RNG with this request's
-    // fixed seed. The VL path samples exclusively via sampler::sample_cpu, which
-    // draws from this global; without the per-request reset it carried RNG state
-    // across requests (and across earlier text-path requests) → cross-request
-    // nondeterminism. Matches the GPU path's u32 (0x13579BDF).
-    hipfire_runtime::llama::reset_cpu_sampler_rng(0x13579BDF);
     // INVARIANT: all early returns before the `vision_forward` call (the
     // first expensive GPU allocation in this function) use `write_error`
     // and return without owning any GPU buffers. If you add a GPU
@@ -342,7 +336,15 @@ pub fn generate_vl(
         repeat_window,
         max_think_tokens,
         assistant_prefix,
+        seed,
     } = *params;
+    // hunt3 M-E: seed the process-global CPU sampler RNG per request. The VL
+    // path samples exclusively via sampler::sample_cpu, which draws from this
+    // global; without the per-request reset it carried RNG state across
+    // requests (and across earlier text-path requests) → cross-request
+    // nondeterminism. Seeded by hipfire-engine::request_seed_for (wire `seed`
+    // wins, else attempt key + counter), matching the sequential text path.
+    hipfire_runtime::llama::reset_cpu_sampler_rng(seed);
     // Adaptive KV poison is sticky until unload/reload. Refuse VL generation so a
     // partial tier transition cannot continue writing into mixed-tier state.
     // Mirror generate() — reset preserves poison, so VL must refuse independently.

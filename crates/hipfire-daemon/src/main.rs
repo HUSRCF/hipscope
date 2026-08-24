@@ -2524,6 +2524,12 @@ fn main() {
                     } else {
                         max_think_tokens
                     };
+                    // Same tiered derivation as the text path below: explicit
+                    // wire `seed` wins, else attempt key + counter entropy.
+                    let vl_request_seed = request_seed_for(
+                        &AttemptKey::new(id, gen_attempt_id),
+                        msg.get("seed").and_then(|v| v.as_u64()),
+                    );
                     let params = GenerateVLParams {
                         id,
                         prompt,
@@ -2536,6 +2542,7 @@ fn main() {
                         repeat_window,
                         max_think_tokens: vl_max_think_tokens,
                         assistant_prefix,
+                        seed: vl_request_seed,
                     };
                     match vision_route {
                         hipfire_loader::VisionRoute::DotsOcr => hipfire_generate::vision::generate_vl_dots_ocr(m, &mut gpu, &mut stdout, &params),
@@ -2990,6 +2997,20 @@ fn main() {
                     ]
                     .iter()
                     .any(|k| msg.get(*k).is_some());
+                    // Per-request sampler entropy (replaces the historical
+                    // fixed 0x13579BDF that made same-prompt requests
+                    // byte-identical at temp>0 on the sequential noslots path).
+                    // Explicit wire `seed` wins (deterministic per seed alone —
+                    // attempt identity is NOT mixed in, so two HTTP requests
+                    // with the same seed reproduce); otherwise hipfire-engine
+                    // mixes the attempt key with a process-global counter and
+                    // boot nonce so reused client keys still get distinct
+                    // streams. Non-numeric `seed` values are treated as absent
+                    // — matches the lenient handling of the other optional
+                    // sampling fields on this route.
+                    let client_seed = msg.get("seed").and_then(|v| v.as_u64());
+                    let request_seed =
+                        request_seed_for(&AttemptKey::new(id, gen_attempt_id), client_seed);
                     generate(
                         m,
                         &mut gpu,
@@ -3021,8 +3042,8 @@ fn main() {
                         &stop_seqs, // hunt3 M-F
                         reasoning_effort_jinja.as_deref(),
                         enable_thinking_jinja,
-                    
                         logprobs_top_k,
+                        request_seed,
                     );
                 }
                 if let Some(marker) = gpu.replay.replay_observation_marker(id) {
