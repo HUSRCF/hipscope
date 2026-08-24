@@ -1319,10 +1319,10 @@ fn dispatch_attend(
             KernelKey::AttnQ8_0KvBatchedMasked => {
                 // Optional CK selection happens after the paired KV-tier plan
                 // and write have resolved. The first cell accepts only the
-                // standard contiguous-prefix Q8/Q8 D256 contract; every other
+                // standard contiguous-prefix Q8/Q8 D128/D256 contract; every other
                 // shape remains on the native WMMA/scalar routes below.
                 #[cfg(feature = "flash-attn-ck")]
-                if hip!(gpu.try_flash_attn_ck_q8_d256_prefill(
+                if hip!(gpu.try_flash_attn_ck_q8_prefill(
                     io.q,
                     io.k_cache,
                     io.v_cache,
@@ -1331,6 +1331,7 @@ fn dispatch_attend(
                     io.max_ctx_len,
                     io.n_heads,
                     io.n_kv_heads,
+                    io.head_dim,
                     io.max_ctx_len == io.pos.saturating_add(io.batch_size),
                     io.tree_bias.is_some(),
                     plan.window.max(0) as usize,

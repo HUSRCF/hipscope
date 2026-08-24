@@ -62,31 +62,34 @@ __global__ void convert_f16_to_f32(const __half* input, float* output, size_t co
     if(index < count) output[index] = __half2float(input[index]);
 }
 
-__global__ void decode_q8_kv_d256(const uint8_t* packed_k,
+__global__ void decode_q8_kv(const uint8_t* packed_k,
                                    const uint8_t* packed_v,
                                    __half* dense_k,
                                    __half* dense_v,
                                    int rows,
                                    int kv_heads,
                                    int64_t k_row_stride_bytes,
-                                   int64_t v_row_stride_bytes)
+                                   int64_t v_row_stride_bytes,
+                                   int head_dim)
 {
     const int row = blockIdx.x;
     const int head = blockIdx.y;
     const int lane = threadIdx.x;
-    if(row >= rows || head >= kv_heads || lane >= 32) return;
+    if(row >= rows || head >= kv_heads || lane >= head_dim / 8) return;
 
     const int block = lane >> 2;
     const int lane_in_block = lane & 3;
+    const int head_bytes = head_dim / 32 * 34;
     const uint8_t* k_block = packed_k + static_cast<size_t>(row) * k_row_stride_bytes +
-                             head * 272 + block * 34;
+                             head * head_bytes + block * 34;
     const uint8_t* v_block = packed_v + static_cast<size_t>(row) * v_row_stride_bytes +
-                             head * 272 + block * 34;
+                             head * head_bytes + block * 34;
     const float k_scale = __half2float(*reinterpret_cast<const __half*>(k_block));
     const float v_scale = __half2float(*reinterpret_cast<const __half*>(v_block));
     const int8_t* k_values = reinterpret_cast<const int8_t*>(k_block + 2) + lane_in_block * 8;
     const int8_t* v_values = reinterpret_cast<const int8_t*>(v_block + 2) + lane_in_block * 8;
-    const size_t output = (static_cast<size_t>(row) * kv_heads + head) * 256 + lane * 8;
+    const size_t output =
+        (static_cast<size_t>(row) * kv_heads + head) * head_dim + lane * 8;
 #pragma unroll
     for(int index = 0; index < 8; ++index)
     {
@@ -148,7 +151,7 @@ int validate(const hipfire_flash_attn_ck_fwd_params* p, char* error, size_t erro
         set_error(error, error_capacity, "batch, sequence lengths, and head counts must be positive");
         return 1;
     }
-    if((dense && p->head_dim != 64) || (q8 && p->head_dim != 256))
+    if((dense && p->head_dim != 64) || (q8 && p->head_dim != 128 && p->head_dim != 256))
     {
         set_error(error, error_capacity, "unsupported head dimension for selected cell");
         return 1;
@@ -192,12 +195,14 @@ int validate(const hipfire_flash_attn_ck_fwd_params* p, char* error, size_t erro
     }
     if(q8)
     {
-        const int64_t minimum_row = static_cast<int64_t>(p->nhead_k) * 272;
+        const int64_t minimum_row =
+            static_cast<int64_t>(p->nhead_k) * (p->head_dim / 32) * 34;
         if(p->batch != 1 || p->causal != 1 ||
            p->packed_k_row_stride_bytes < minimum_row ||
            p->packed_v_row_stride_bytes < minimum_row)
         {
-            set_error(error, error_capacity, "Q8 D256 requires batch=1, causal, and valid packed row strides");
+            set_error(error, error_capacity,
+                      "Q8 D128/D256 requires batch=1, causal, and valid packed row strides");
             return 1;
         }
         if(p->workspace == nullptr || p->workspace_bytes < q8_workspace_bytes(p))
@@ -239,6 +244,16 @@ extern "C" size_t hipfire_flash_attn_ck_capabilities(
         HIPFIRE_FLASH_ATTN_CK_CAP_CAUSAL | HIPFIRE_FLASH_ATTN_CK_CAP_GQA,
     },
 #if defined(HIPFIRE_CK_TARGET_GFX1100)
+    {
+        HIPFIRE_FLASH_ATTN_CK_ABI_VERSION,
+        sizeof(hipfire_flash_attn_ck_capability),
+        HIPFIRE_FLASH_ATTN_CK_GFX1100,
+        HIPFIRE_FLASH_ATTN_CK_F32,
+        HIPFIRE_FLASH_ATTN_CK_Q8,
+        HIPFIRE_FLASH_ATTN_CK_Q8,
+        128,
+        HIPFIRE_FLASH_ATTN_CK_CAP_CAUSAL | HIPFIRE_FLASH_ATTN_CK_CAP_GQA,
+    },
     {
         HIPFIRE_FLASH_ATTN_CK_ABI_VERSION,
         sizeof(hipfire_flash_attn_ck_capability),
@@ -322,10 +337,10 @@ extern "C" int hipfire_flash_attn_ck_fwd(
             const int threads = 256;
             convert_f32_to_f16<<<(q_count + threads - 1) / threads, threads, 0, stream>>>(
                 static_cast<const float*>(p->q), staged_q, q_count);
-            decode_q8_kv_d256<<<dim3(p->seqlen_k, p->nhead_k), 32, 0, stream>>>(
+            decode_q8_kv<<<dim3(p->seqlen_k, p->nhead_k), 32, 0, stream>>>(
                 static_cast<const uint8_t*>(p->k), static_cast<const uint8_t*>(p->v),
                 staged_k, staged_v, p->seqlen_k, p->nhead_k,
-                p->packed_k_row_stride_bytes, p->packed_v_row_stride_bytes);
+                p->packed_k_row_stride_bytes, p->packed_v_row_stride_bytes, p->head_dim);
             q_ptr = staged_q;
             k_ptr = staged_k;
             v_ptr = staged_v;

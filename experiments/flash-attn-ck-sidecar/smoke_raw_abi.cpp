@@ -227,15 +227,15 @@ void pack_q8(const std::vector<float>& input,
              std::vector<uint8_t>& packed,
              std::vector<float>& decoded,
              int rows,
-             int heads)
+             int heads,
+             int hdim)
 {
-    constexpr int hdim = 256;
-    constexpr int head_bytes = 272;
+    const int head_bytes = hdim / 32 * 34;
     for(int row = 0; row < rows; ++row)
     {
         for(int head = 0; head < heads; ++head)
         {
-            for(int block = 0; block < 8; ++block)
+            for(int block = 0; block < hdim / 32; ++block)
             {
                 const size_t input_base = (static_cast<size_t>(row) * heads + head) * hdim + block * 32;
                 const size_t packed_base = (static_cast<size_t>(row) * heads + head) * head_bytes + block * 34;
@@ -260,15 +260,14 @@ void pack_q8(const std::vector<float>& input,
     }
 }
 
-void run_q8_d256_case()
+void run_q8_case(int hdim)
 {
     constexpr int seqlen_q = 16;
     constexpr int seqlen_k = 32;
     constexpr int nhead_q = 4;
     constexpr int nhead_k = 2;
-    constexpr int hdim = 256;
-    constexpr int head_bytes = 272;
-    constexpr float scale = 1.0f / 16.0f;
+    const int head_bytes = hdim / 32 * 34;
+    const float scale = 1.0f / std::sqrt(static_cast<float>(hdim));
     const size_t q_count = static_cast<size_t>(seqlen_q) * nhead_q * hdim;
     const size_t kv_count = static_cast<size_t>(seqlen_k) * nhead_k * hdim;
     std::vector<float> q(q_count), k(kv_count), v(kv_count), decoded_k(kv_count),
@@ -279,8 +278,8 @@ void run_q8_d256_case()
     std::uniform_real_distribution<float> distribution(-0.25f, 0.25f);
     for(auto* values : {&q, &k, &v})
         for(float& value : *values) value = distribution(rng);
-    pack_q8(k, packed_k, decoded_k, seqlen_k, nhead_k);
-    pack_q8(v, packed_v, decoded_v, seqlen_k, nhead_k);
+    pack_q8(k, packed_k, decoded_k, seqlen_k, nhead_k, hdim);
+    pack_q8(v, packed_v, decoded_v, seqlen_k, nhead_k, hdim);
 
     for(int hq = 0; hq < nhead_q; ++hq)
     {
@@ -355,8 +354,8 @@ void run_q8_d256_case()
         max_abs = std::max(max_abs, delta); mean_abs += delta;
     }
     mean_abs /= q_count;
-    std::printf("case=q8-d256-gqa-causal max_abs=%.7g mean_abs=%.7g workspace=%zu\n",
-                max_abs, mean_abs, params.workspace_bytes);
+    std::printf("case=q8-d%d-gqa-causal max_abs=%.7g mean_abs=%.7g workspace=%zu\n",
+                hdim, max_abs, mean_abs, params.workspace_bytes);
     if(max_abs > 0.01f) std::exit(6);
     check_hip(hipFree(dq), "hipFree(q8 q)");
     check_hip(hipFree(dk), "hipFree(q8 k)");
@@ -378,6 +377,7 @@ int main()
     run_case("gqa-causal", 4, 2, true, true);
     run_case("mha-noncausal", 2, 2, false, false);
     run_case("mqa-noncausal", 4, 1, false, false);
-    run_q8_d256_case();
+    run_q8_case(128);
+    run_q8_case(256);
     return 0;
 }

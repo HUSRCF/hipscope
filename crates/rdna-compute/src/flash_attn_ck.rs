@@ -111,14 +111,14 @@ pub enum FlashAttnCkRejectReason {
 
 /// Admit the first production cell only. Later quantized cells should extend
 /// this policy explicitly instead of weakening its fail-closed conditions.
-pub fn select_q8_d256_prefill(
+pub fn select_q8_prefill(
     runtime: &FlashAttnCk,
     input: FlashAttnCkPrefillInput,
 ) -> Result<FlashAttnCkRequest, FlashAttnCkRejectReason> {
-    select_q8_d256_prefill_capabilities(runtime.capabilities(), input)
+    select_q8_prefill_capabilities(runtime.capabilities(), input)
 }
 
-fn select_q8_d256_prefill_capabilities(
+fn select_q8_prefill_capabilities(
     capabilities: &[FlashAttnCkCapability],
     input: FlashAttnCkPrefillInput,
 ) -> Result<FlashAttnCkRequest, FlashAttnCkRejectReason> {
@@ -129,7 +129,7 @@ fn select_q8_d256_prefill_capabilities(
     if request.k_format != FlashAttnCkKvFormat::Q8 || request.v_format != FlashAttnCkKvFormat::Q8 {
         return Err(FlashAttnCkRejectReason::UnsupportedFormat);
     }
-    if request.head_dim != 256 {
+    if !matches!(request.head_dim, 128 | 256) {
         return Err(FlashAttnCkRejectReason::UnsupportedHeadDim);
     }
     if input.nhead_k == 0
@@ -527,7 +527,7 @@ impl crate::Gpu {
     /// Try the first serving capability cell. `Ok(false)` is an intentional
     /// native fallback, including sidecar support/launch failures.
     #[allow(clippy::too_many_arguments)]
-    pub fn try_flash_attn_ck_q8_d256_prefill(
+    pub fn try_flash_attn_ck_q8_prefill(
         &mut self,
         q: &crate::GpuTensor,
         k_cache: &crate::GpuTensor,
@@ -537,6 +537,7 @@ impl crate::Gpu {
         seqlen_k: usize,
         nhead_q: usize,
         nhead_k: usize,
+        head_dim: usize,
         contiguous_prefix: bool,
         has_tree_bias: bool,
         window: usize,
@@ -563,7 +564,7 @@ impl crate::Gpu {
             dtype: FlashAttnCkDType::F32,
             k_format: FlashAttnCkKvFormat::Q8,
             v_format: FlashAttnCkKvFormat::Q8,
-            head_dim: 256,
+            head_dim: head_dim as i32,
             required_flags: FLASH_ATTN_CK_CAP_CAUSAL | FLASH_ATTN_CK_CAP_GQA,
         };
         let input = FlashAttnCkPrefillInput {
@@ -579,7 +580,7 @@ impl crate::Gpu {
             block_start,
             block_cols,
         };
-        let decision = select_q8_d256_prefill(self.flash_attn_ck.as_ref().unwrap(), input);
+        let decision = select_q8_prefill(self.flash_attn_ck.as_ref().unwrap(), input);
         if let Err(reason) = decision {
             self.report_flash_attn_ck_route(reject_reason_name(reason));
             return Ok(false);
@@ -602,22 +603,23 @@ impl crate::Gpu {
         params.seqlen_k = seqlen_k as i32;
         params.nhead_q = nhead_q as i32;
         params.nhead_k = nhead_k as i32;
-        params.head_dim = 256;
+        params.head_dim = head_dim as i32;
         params.causal = 1;
-        params.softmax_scale = 1.0 / 16.0;
-        params.stride_q = (nhead_q * 256) as i64;
-        params.stride_k = (nhead_k * 256) as i64;
+        params.softmax_scale = 1.0 / (head_dim as f32).sqrt();
+        params.stride_q = (nhead_q * head_dim) as i64;
+        params.stride_k = (nhead_k * head_dim) as i64;
         params.stride_v = params.stride_k;
         params.stride_out = params.stride_q;
-        params.nhead_stride_q = 256;
-        params.nhead_stride_k = 256;
-        params.nhead_stride_v = 256;
-        params.nhead_stride_out = 256;
-        params.batch_stride_q = (seqlen_q * nhead_q * 256) as i64;
-        params.batch_stride_k = (seqlen_k * nhead_k * 256) as i64;
+        params.nhead_stride_q = head_dim as i64;
+        params.nhead_stride_k = head_dim as i64;
+        params.nhead_stride_v = head_dim as i64;
+        params.nhead_stride_out = head_dim as i64;
+        params.batch_stride_q = (seqlen_q * nhead_q * head_dim) as i64;
+        params.batch_stride_k = (seqlen_k * nhead_k * head_dim) as i64;
         params.batch_stride_v = params.batch_stride_k;
         params.batch_stride_out = params.batch_stride_q;
-        params.packed_k_row_stride_bytes = (nhead_k * 272) as i64;
+        let packed_head_bytes = head_dim / 32 * 34;
+        params.packed_k_row_stride_bytes = (nhead_k * packed_head_bytes) as i64;
         params.packed_v_row_stride_bytes = params.packed_k_row_stride_bytes;
 
         let required = self
@@ -649,7 +651,11 @@ impl crate::Gpu {
             }
             return Ok(false);
         }
-        self.report_flash_attn_ck_route("selected_q8_d256");
+        self.report_flash_attn_ck_route(match head_dim {
+            128 => "selected_q8_d128",
+            256 => "selected_q8_d256",
+            _ => unreachable!("selector admitted unsupported head dimension"),
+        });
         Ok(true)
     }
 
@@ -751,6 +757,13 @@ mod tests {
         }
     }
 
+    fn q8_d128_capability() -> FlashAttnCkCapability {
+        FlashAttnCkCapability {
+            head_dim: 128,
+            ..q8_d256_capability()
+        }
+    }
+
     fn eligible_q8_prefill() -> FlashAttnCkPrefillInput {
         FlashAttnCkPrefillInput {
             request: FlashAttnCkRequest {
@@ -775,16 +788,27 @@ mod tests {
     }
 
     #[test]
-    fn q8_d256_prefill_selector_accepts_exact_cell() {
+    fn q8_prefill_selector_accepts_exact_cells() {
         let input = eligible_q8_prefill();
         assert_eq!(
-            select_q8_d256_prefill_capabilities(&[q8_d256_capability()], input),
+            select_q8_prefill_capabilities(&[q8_d256_capability()], input),
             Ok(input.request)
+        );
+        let d128_input = FlashAttnCkPrefillInput {
+            request: FlashAttnCkRequest {
+                head_dim: 128,
+                ..input.request
+            },
+            ..input
+        };
+        assert_eq!(
+            select_q8_prefill_capabilities(&[q8_d128_capability()], d128_input),
+            Ok(d128_input.request)
         );
     }
 
     #[test]
-    fn q8_d256_prefill_selector_rejects_unsafe_shapes() {
+    fn q8_prefill_selector_rejects_unsafe_shapes() {
         let cell = q8_d256_capability();
         let cases = [
             (
@@ -838,21 +862,29 @@ mod tests {
             ),
         ];
         for (input, reason) in cases {
-            assert_eq!(
-                select_q8_d256_prefill_capabilities(&[cell], input),
-                Err(reason)
-            );
+            assert_eq!(select_q8_prefill_capabilities(&[cell], input), Err(reason));
         }
     }
 
     #[test]
-    fn q8_d256_prefill_selector_rejects_capability_mismatch() {
+    fn q8_prefill_selector_rejects_capability_mismatch() {
         assert_eq!(
-            select_q8_d256_prefill_capabilities(
+            select_q8_prefill_capabilities(
                 &[dense_capability(FlashAttnCkArch::Gfx1100)],
                 eligible_q8_prefill(),
             ),
             Err(FlashAttnCkRejectReason::CapabilityMiss)
+        );
+        let d64_input = FlashAttnCkPrefillInput {
+            request: FlashAttnCkRequest {
+                head_dim: 64,
+                ..eligible_q8_prefill().request
+            },
+            ..eligible_q8_prefill()
+        };
+        assert_eq!(
+            select_q8_prefill_capabilities(&[q8_d128_capability()], d64_input),
+            Err(FlashAttnCkRejectReason::UnsupportedHeadDim)
         );
     }
 
@@ -934,6 +966,15 @@ mod tests {
             return;
         };
         let sidecar = unsafe { FlashAttnCk::load(path) }.expect("load explicit test sidecar");
+        for head_dim in [128, 256] {
+            assert!(sidecar.capabilities().iter().any(|cell| {
+                cell.arch == FlashAttnCkArch::Gfx1100 as i32
+                    && cell.dtype == FlashAttnCkDType::F32 as i32
+                    && cell.k_format == FlashAttnCkKvFormat::Q8 as i32
+                    && cell.v_format == FlashAttnCkKvFormat::Q8 as i32
+                    && cell.head_dim == head_dim
+            }));
+        }
         let error = sidecar
             .is_supported(&FlashAttnCkFwdParams::default())
             .expect_err("zero-shape parameters must be rejected");
