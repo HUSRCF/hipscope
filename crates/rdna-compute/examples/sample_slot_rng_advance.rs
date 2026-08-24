@@ -10,7 +10,7 @@
 //! distribution — indistinguishable from working sampling on a single token,
 //! which is why this walks several.
 //!
-//! Run: `cargo run --release -p rdna-compute --example sample_slot_rng_advance`
+//! Run: `cargo run --release -p rdna-compute --features lab --example sample_slot_rng_advance`
 
 use rdna_compute::sampling::SlotSampleParams;
 use rdna_compute::{DType, Gpu};

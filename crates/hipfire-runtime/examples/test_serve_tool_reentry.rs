@@ -13,7 +13,7 @@
 //! engine honours the name and re-prefills rather than substituting a stand-in
 //! when the name does not fit.
 //!
-//! Run: `cargo run --release -p hipfire-runtime --features deltanet
+//! Run: `cargo run --release -p hipfire-runtime --features lab,deltanet
 //!       --example test_serve_tool_reentry -- [model.mq4r]`
 
 #[cfg(not(feature = "deltanet"))]
