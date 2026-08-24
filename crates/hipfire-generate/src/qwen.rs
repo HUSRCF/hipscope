@@ -21,7 +21,6 @@ use hipfire_arch_muse_glimmer as glimmer;
 use hipfire_arch_qwen2::qwen2;
 use hipfire_arch_qwen35::qwen35;
 use hipfire_arch_qwen35::speculative;
-use std::any::Any;
 use hipfire_arch_qwen35_vl::image;
 use hipfire_arch_qwen35_vl::qwen35_vl;
 use hipfire_runtime::emit_text::{
@@ -32,6 +31,7 @@ use hipfire_runtime::eos_filter::{EosFilter, EosFilterConfig, FilterAction};
 use hipfire_runtime::llama;
 use hipfire_runtime::prompt_frame::ThinkMode;
 use hipfire_runtime::sampler::{self, SamplerConfig};
+use std::any::Any;
 use std::io::{BufRead, Write};
 use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -1506,7 +1506,7 @@ pub fn generate_dflash(
             "kv_adaptive cannot use generic speculative decode (DFlash/DSpark/MTP/n-gram); use AR",
             "validation",
             false,
-            false
+            false,
         );
         let _ = stdout.flush();
         return true;
@@ -1797,7 +1797,11 @@ pub fn generate_dflash(
                 cache_eligible,
                 &dflash_ckpt_positions,
                 dflash_resume_enabled,
-                if spec_name == "mtp" { "mtp-jinja" } else { "dflash-jinja" },
+                if spec_name == "mtp" {
+                    "mtp-jinja"
+                } else {
+                    "dflash-jinja"
+                },
             ))
         } else {
             None
@@ -2274,18 +2278,9 @@ pub fn generate_dflash(
                             "ngram_mod_accept_rate".into(),
                             serde_json::json!(stats.ngram_mod_accept_rate),
                         );
-                        obj.insert(
-                            "mtp_windows".into(),
-                            serde_json::json!(stats.mtp_windows),
-                        );
-                        obj.insert(
-                            "ar_windows".into(),
-                            serde_json::json!(stats.ar_windows),
-                        );
-                        obj.insert(
-                            "mtp_retired".into(),
-                            serde_json::json!(stats.mtp_retired),
-                        );
+                        obj.insert("mtp_windows".into(), serde_json::json!(stats.mtp_windows));
+                        obj.insert("ar_windows".into(), serde_json::json!(stats.ar_windows));
+                        obj.insert("mtp_retired".into(), serde_json::json!(stats.mtp_retired));
                     }
                 }
             }
@@ -2399,7 +2394,7 @@ pub fn generate_spec(
             "kv_adaptive cannot use generic speculative decode (DFlash/DSpark/MTP/n-gram); use AR",
             "validation",
             false,
-            false
+            false,
         );
         let _ = stdout.flush();
         return None;
@@ -3598,7 +3593,6 @@ pub fn attach_mtp_window_timings(
         pending_done["mtp_window_timings"] = serde_json::Value::Array(timings);
     }
 }
-
 
 /// Multi-GPU pipeline-parallel AR decode (Stage 7 of #58). Mirrors the pp=1
 /// `generate` Qwen3.5 branch feature-for-feature: ChatFrame ChatML wrap,

@@ -82,9 +82,7 @@ impl DflashState {
         // freed. Unknown quiescence → intentional leak; daemon restart is the
         // containment path.
         if let Err(reason) = verify_pm4.shutdown() {
-            eprintln!(
-                "dflash verify PM4: refusing free after unknown quiescence: {reason}"
-            );
+            eprintln!("dflash verify PM4: refusing free after unknown quiescence: {reason}");
             std::mem::forget((
                 verify_pm4,
                 draft_weights,
@@ -1031,7 +1029,11 @@ impl Speculator for DflashSpeculator {
         self.sample_top_p = cfg.top_p;
         self.sample_top_k = cfg.top_k;
         self.sample_cactus = cfg.cactus_delta;
-        self.rng_state = if cfg.rng_seed == 0 { 0x13579BDF } else { cfg.rng_seed };
+        self.rng_state = if cfg.rng_seed == 0 {
+            0x13579BDF
+        } else {
+            cfg.rng_seed
+        };
     }
 
     fn requires_greedy(&self) -> bool {
@@ -1229,7 +1231,7 @@ mod admit_dflash_verify_pm4_tests {
                 kv_is_q8: true,
                 dn_state_is_q8: true,
                 adaptive_kv_absent: true,
-        runtime_extract_layers: &DFLASH_VERIFY_PM4_EXTRACT_LAYERS,
+                runtime_extract_layers: &DFLASH_VERIFY_PM4_EXTRACT_LAYERS,
                 runtime_block_size: DFLASH_VERIFY_PM4_BLOCK,
                 target_layer_ids: &DFLASH_VERIFY_PM4_EXTRACT_LAYERS,
                 ddtree_present: false,

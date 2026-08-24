@@ -9,15 +9,23 @@
 //! normalisation, finishing). Groups the deterministic, heavily-tested
 //! transformations that convert daemon events into OpenAI responses.
 
+use crate::serve::http::request_id;
+use crate::serve::slots;
+use crate::serve::{Admission, AdmissionGuard, ServeMeta, ServeShared};
+use crate::{
+    apply_http_reasoning_request, config_bool, config_string, config_u64, insert_optional_f64,
+    insert_optional_u64, request_f64, request_string, request_u64, unix_timestamp, Paths,
+};
 use anyhow::{anyhow, bail, Context, Result};
 use hipfire_client::ClientError;
 use hipfire_runtime::prompt_frame::ToolCall;
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeSet, sync::{Arc, Mutex, mpsc}, thread, time::{Duration, Instant}};
-use crate::serve::{ServeShared, ServeMeta, Admission, AdmissionGuard};
-use crate::serve::slots;
-use crate::{Paths, config_string, config_u64, config_bool, request_string, request_f64, request_u64, insert_optional_f64, insert_optional_u64, apply_http_reasoning_request, unix_timestamp};
-use crate::serve::http::{request_id};
+use std::{
+    collections::BTreeSet,
+    sync::{mpsc, Arc, Mutex},
+    thread,
+    time::{Duration, Instant},
+};
 
 #[derive(Debug)]
 pub(crate) struct Completion {
@@ -206,7 +214,9 @@ pub(crate) fn longest_control_prefix_suffix(text: &str) -> usize {
 }
 
 /// Convert a daemon v2 structured tool-call JSON object into canonical [`ToolCall`].
-pub(crate) fn tool_call_from_canonical_value(value: &serde_json::Value) -> Result<ToolCall, String> {
+pub(crate) fn tool_call_from_canonical_value(
+    value: &serde_json::Value,
+) -> Result<ToolCall, String> {
     let obj = value
         .as_object()
         .ok_or_else(|| "tool call must be a JSON object".to_owned())?;
@@ -294,7 +304,9 @@ pub(crate) fn endpoint_adapter_status(kind: EndpointAdapterKind) -> EndpointAdap
 
 /// Gate `/v1/chat/completions` when the request carries a non-empty `tools` array.
 /// Tool-free requests are unchanged. Adapter availability never overrides producer safety.
-pub(crate) fn gate_chat_completions_tools(body: &serde_json::Value) -> Result<(), EndpointAdapterError> {
+pub(crate) fn gate_chat_completions_tools(
+    body: &serde_json::Value,
+) -> Result<(), EndpointAdapterError> {
     let has_tools = body
         .get("tools")
         .and_then(serde_json::Value::as_array)
@@ -447,7 +459,10 @@ impl SemanticEventFold {
     /// Parse canonical `calls` from a staged/final done envelope.
     /// When `finish_reason=tool_calls`, missing/non-array/malformed fails closed.
     /// Other finish reasons ignore `calls` (leave buffer untouched for withhold).
-    pub(crate) fn absorb_terminal_calls(&mut self, done: &serde_json::Value) -> Result<(), SemanticFoldError> {
+    pub(crate) fn absorb_terminal_calls(
+        &mut self,
+        done: &serde_json::Value,
+    ) -> Result<(), SemanticFoldError> {
         let finish = done
             .get("finish_reason")
             .and_then(serde_json::Value::as_str);
@@ -478,7 +493,9 @@ impl SemanticEventFold {
 
     /// Parse attempt_id: JSON numbers only (u64 or non-neg i64). Distinguishes
     /// missing vs malformed (string / null / negative / object).
-    pub(crate) fn parse_event_attempt_id(event: &serde_json::Value) -> Result<Option<u64>, SemanticFoldError> {
+    pub(crate) fn parse_event_attempt_id(
+        event: &serde_json::Value,
+    ) -> Result<Option<u64>, SemanticFoldError> {
         match event.get("attempt_id") {
             None => Ok(None),
             Some(value) => {
@@ -514,7 +531,10 @@ impl SemanticEventFold {
         }
     }
 
-    pub(crate) fn check_correlation(&self, event: &serde_json::Value) -> Result<(), SemanticFoldError> {
+    pub(crate) fn check_correlation(
+        &self,
+        event: &serde_json::Value,
+    ) -> Result<(), SemanticFoldError> {
         let current_attempt = self
             .current_attempt_id
             .ok_or(SemanticFoldError::NoActiveAttempt)?;
@@ -1153,8 +1173,7 @@ pub(crate) fn complete_request_attempt(
     // interval includes admission queueing, which is exactly the component a
     // serving operator needs when latency rises under load.
     let attempt_started = std::time::Instant::now();
-    let first_token_at: std::cell::Cell<Option<std::time::Duration>> =
-        std::cell::Cell::new(None);
+    let first_token_at: std::cell::Cell<Option<std::time::Duration>> = std::cell::Cell::new(None);
 
     // Latch retry-disabling observations on every event bound for the client.
     let mut event_callback = |event: &serde_json::Value| {
@@ -1915,7 +1934,10 @@ pub(crate) fn normalize_openai_messages(
     serde_json::Value::Array(normalized)
 }
 
-pub(crate) fn inject_default_system_message(messages: &mut serde_json::Value, system: Option<&str>) {
+pub(crate) fn inject_default_system_message(
+    messages: &mut serde_json::Value,
+    system: Option<&str>,
+) {
     let Some(system) = system.filter(|value| !value.is_empty()) else {
         return;
     };
@@ -1995,7 +2017,9 @@ pub(crate) fn validate_logprobs_request(body: &serde_json::Value) -> Result<()> 
 /// Returns None if the event lacks `logprob` — some paths do not yet compute
 /// it, and the response must omit `logprobs` entirely rather than emit entries
 /// with null logprob values. `bytes` is the UTF-8 bytes of the token text.
-pub(crate) fn logprob_entry_from_token_event(event: &serde_json::Value) -> Option<serde_json::Value> {
+pub(crate) fn logprob_entry_from_token_event(
+    event: &serde_json::Value,
+) -> Option<serde_json::Value> {
     let text = event.get("text")?.as_str()?;
     let logprob = event.get("logprob")?.as_f64()?;
     let bytes: Vec<serde_json::Value> = text
@@ -2169,7 +2193,9 @@ pub(crate) struct OpenAiToolCallAdapterResult {
 
 /// Build the single shared OpenAI adapter result vector for a completion.
 /// Deterministic response-scoped ids `call_{index}`; no filtering/dropping.
-pub(crate) fn openai_tool_call_adapter_results(calls: &[ToolCall]) -> Vec<OpenAiToolCallAdapterResult> {
+pub(crate) fn openai_tool_call_adapter_results(
+    calls: &[ToolCall],
+) -> Vec<OpenAiToolCallAdapterResult> {
     calls
         .iter()
         .enumerate()
@@ -2209,7 +2235,9 @@ pub(crate) fn openai_tool_calls(calls: &[ToolCall]) -> Vec<serde_json::Value> {
 /// Map a folded callback event to an OpenAI stream delta.
 /// Only clean content/reasoning are forwarded mid-stream; structured tool
 /// calls release only via [`openai_stream_terminal_chunks`].
-pub(crate) fn openai_stream_delta_for_event(event: &serde_json::Value) -> Option<serde_json::Value> {
+pub(crate) fn openai_stream_delta_for_event(
+    event: &serde_json::Value,
+) -> Option<serde_json::Value> {
     match event.get("type").and_then(serde_json::Value::as_str) {
         Some("token") => event
             .get("text")
@@ -2298,18 +2326,23 @@ pub(crate) fn openai_stream_terminal_chunks(
     chunks
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::serve::complete::{Completion};
-    use hipfire_runtime::prompt_frame::ToolCall;
-    use hipfire_client::ClientError;
+    use crate::serve::complete::Completion;
     use crate::{Paths, ServeArgs, StopArgs};
-    use hipfire_config::{ConfigLayer, ConfigPaths, ConfigSource, NamedLayer, resolve, load_global};
-    use hipfire_registry::{RegistryV1, RegistryPaths};
-    use std::{env, fs, path::{Path, PathBuf}, time::{Duration, Instant}, sync::{Arc, Mutex}};
+    use hipfire_client::ClientError;
+    use hipfire_config::{
+        load_global, resolve, ConfigLayer, ConfigPaths, ConfigSource, NamedLayer,
+    };
+    use hipfire_registry::{RegistryPaths, RegistryV1};
+    use hipfire_runtime::prompt_frame::ToolCall;
+    use std::{
+        env, fs,
+        path::{Path, PathBuf},
+        sync::{Arc, Mutex},
+        time::{Duration, Instant},
+    };
 
     fn test_paths(label: &str) -> Paths {
         let nonce = std::time::SystemTime::now()
@@ -4875,7 +4908,8 @@ mod tests {
             validate_logprobs_request(&body).unwrap_or_else(|e| panic!("{n} should be valid: {e}"));
         }
         // logprobs true alone without top_logprobs is also valid
-        validate_logprobs_request(&serde_json::json!({ "logprobs": true })).expect("logprobs true alone");
+        validate_logprobs_request(&serde_json::json!({ "logprobs": true }))
+            .expect("logprobs true alone");
         // absent fields are valid
         validate_logprobs_request(&serde_json::json!({})).expect("empty");
         validate_logprobs_request(&serde_json::json!({ "logprobs": false })).expect("false");
@@ -4887,15 +4921,27 @@ mod tests {
         let bad = serde_json::json!({ "logprobs": true, "top_logprobs": 21 });
         assert!(validate_logprobs_request(&bad).is_err(), "21 should fail");
         let bad_neg = serde_json::json!({ "logprobs": true, "top_logprobs": -1 });
-        assert!(validate_logprobs_request(&bad_neg).is_err(), "-1 should fail");
+        assert!(
+            validate_logprobs_request(&bad_neg).is_err(),
+            "-1 should fail"
+        );
         // float must fail even if integral value
         let bad_float = serde_json::json!({ "logprobs": true, "top_logprobs": 5.0 });
-        assert!(validate_logprobs_request(&bad_float).is_err(), "5.0 float should fail");
+        assert!(
+            validate_logprobs_request(&bad_float).is_err(),
+            "5.0 float should fail"
+        );
         let bad_str = serde_json::json!({ "logprobs": true, "top_logprobs": "5" });
-        assert!(validate_logprobs_request(&bad_str).is_err(), "string should fail");
+        assert!(
+            validate_logprobs_request(&bad_str).is_err(),
+            "string should fail"
+        );
         // logprobs must be bool
         let bad_logprob_type = serde_json::json!({ "logprobs": "true" });
-        assert!(validate_logprobs_request(&bad_logprob_type).is_err(), "string logprobs should fail");
+        assert!(
+            validate_logprobs_request(&bad_logprob_type).is_err(),
+            "string logprobs should fail"
+        );
     }
 
     #[test]
@@ -4906,8 +4952,13 @@ mod tests {
             serde_json::json!({ "logprobs": null, "top_logprobs": 0 }),
         ];
         for body in &cases {
-            let err = validate_logprobs_request(body).expect_err("should reject top without logprobs true");
-            assert!(err.to_string().contains("top_logprobs requires logprobs"), "err={}", err);
+            let err = validate_logprobs_request(body)
+                .expect_err("should reject top without logprobs true");
+            assert!(
+                err.to_string().contains("top_logprobs requires logprobs"),
+                "err={}",
+                err
+            );
         }
     }
 
@@ -4925,7 +4976,10 @@ mod tests {
             logprobs: None,
         };
         let json = completion_json(&completion);
-        assert!(json["choices"][0].get("logprobs").is_none(), "logprobs must be absent, not null");
+        assert!(
+            json["choices"][0].get("logprobs").is_none(),
+            "logprobs must be absent, not null"
+        );
         // empty vec also absent
         let empty = Completion {
             logprobs: Some(vec![]),
@@ -4942,7 +4996,10 @@ mod tests {
             }
         };
         let json2 = completion_json(&empty);
-        assert!(json2["choices"][0].get("logprobs").is_none(), "empty content must also be absent");
+        assert!(
+            json2["choices"][0].get("logprobs").is_none(),
+            "empty content must also be absent"
+        );
     }
 
     #[test]
@@ -4961,7 +5018,10 @@ mod tests {
         assert!((entry["logprob"].as_f64().unwrap() - (-0.31)).abs() < 1e-6);
         assert_eq!(entry["bytes"], serde_json::json!([84, 104, 101]));
         assert_eq!(entry["top_logprobs"][0]["token"], "The");
-        assert_eq!(entry["top_logprobs"][0]["bytes"], serde_json::json!([84, 104, 101]));
+        assert_eq!(
+            entry["top_logprobs"][0]["bytes"],
+            serde_json::json!([84, 104, 101])
+        );
         assert_eq!(entry["top_logprobs"][1]["token"], "A");
         assert_eq!(entry["top_logprobs"][1]["bytes"], serde_json::json!([65]));
         // UTF-8 multi-byte
@@ -5013,6 +5073,9 @@ mod tests {
         };
         let json2 = completion_json(&with);
         assert_eq!(json2["choices"][0]["logprobs"]["content"][0]["token"], "hi");
-        assert_eq!(json2["choices"][0]["logprobs"]["content"][0]["bytes"], serde_json::json!([104, 105]));
+        assert_eq!(
+            json2["choices"][0]["logprobs"]["content"][0]["bytes"],
+            serde_json::json!([104, 105])
+        );
     }
 }

@@ -962,7 +962,6 @@ pub struct MtpRequestStats {
     pub mtp_retired: bool,
 }
 
-
 /// One acceptance window's committed tokens: the accepted draft prefix plus the
 /// verifier's bonus, EXCLUDING the seed. Identical in meaning to qwen35's
 /// `MtpSpecResult.committed` and deepseek4's `accepted_tokens`.
@@ -1095,7 +1094,6 @@ pub trait MtpDrafter {
     fn request_stats(&self) -> MtpRequestStats {
         MtpRequestStats::default()
     }
-
 }
 
 /// Generic adapter driving any [`MtpDrafter`] through the [`Speculator`]

@@ -10,10 +10,10 @@
 use std::time::Instant;
 
 use crate::terminal::{
-    batch_apply_terminal_control, batch_announce_terminal, batch_bind_active, batch_check_abort,
-    batch_clear_terminal, batch_mark_ready_with_pending, batch_poll_decision, batch_terminal_control,
-    batch_transition_to_queued, AttemptKey, BatchRegistryState, ClientTerminalDecision, LaneTicket,
-    CLIENT_TERMINAL_COMMIT_TIMEOUT,
+    batch_announce_terminal, batch_apply_terminal_control, batch_bind_active, batch_check_abort,
+    batch_clear_terminal, batch_mark_ready_with_pending, batch_poll_decision,
+    batch_terminal_control, batch_transition_to_queued, AttemptKey, BatchRegistryState,
+    ClientTerminalDecision, LaneTicket, CLIENT_TERMINAL_COMMIT_TIMEOUT,
 };
 
 // ── Batch sampling controls and cohort key ───────────────────────────────
@@ -672,7 +672,10 @@ pub fn parse_serve_continuous_batch(msg: &serde_json::Value) -> bool {
             .unwrap_or(false)
 }
 
-pub fn resolve_batch_sampling(msg: &serde_json::Value, m: &hipfire_loader::LoadedModel) -> BatchSampling {
+pub fn resolve_batch_sampling(
+    msg: &serde_json::Value,
+    m: &hipfire_loader::LoadedModel,
+) -> BatchSampling {
     let defaults = hipfire_loader::carrier_for(m.arch_id)
         .map(|c| c.sampling_defaults())
         .unwrap_or_default();
@@ -733,7 +736,6 @@ pub fn resolve_batch_sampling(msg: &serde_json::Value, m: &hipfire_loader::Loade
         repeat_window,
     }
 }
-
 
 pub fn lfm_fast_path_candidate_len(sched: &ContinuousBatchScheduler) -> usize {
     if sched.active_count() != 0 || sched.awaiting_count() != 0 {
@@ -796,7 +798,11 @@ pub fn lfm_fast_path_candidate_len(sched: &ContinuousBatchScheduler) -> usize {
         }
         if req.prompt_tokens.is_empty()
             || req.prompt_tokens.len() >= sched.lane_capacity
-            || !crate::terminal::batch_lfm_admission_ok(req.prompt_tokens.len(), req.max_tokens, sched.lane_capacity)
+            || !crate::terminal::batch_lfm_admission_ok(
+                req.prompt_tokens.len(),
+                req.max_tokens,
+                sched.lane_capacity,
+            )
         {
             break;
         }
@@ -923,7 +929,11 @@ pub fn batch_finite_rate(count: usize, seconds: f64) -> f64 {
         return 0.0;
     }
     let rate = count as f64 / seconds;
-    if rate.is_finite() { rate } else { 0.0 }
+    if rate.is_finite() {
+        rate
+    } else {
+        0.0
+    }
 }
 
 pub struct BatchLaneDoneMetrics {
@@ -1105,4 +1115,3 @@ mod request_seed_tests {
         }
     }
 }
-
