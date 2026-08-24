@@ -509,7 +509,7 @@ void run_asym3_givens_case(int hdim)
                     bytes[2] = (codes >> 16) & 0xff;
                 }
         }
-    pack_q8(v, packed_v, decoded_v, seqlen_k, nhead_k, hdim);
+    pack_q8(v, packed_v, decoded_v, seqlen_k, nhead_k);
     const int groups = nhead_q / nhead_k;
     for(int sq = 0; sq < seqlen_q; ++sq)
         for(int hq = 0; hq < nhead_q; ++hq)
