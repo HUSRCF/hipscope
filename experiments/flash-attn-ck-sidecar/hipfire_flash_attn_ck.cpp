@@ -152,7 +152,7 @@ int validate(const hipfire_flash_attn_ck_fwd_params* p, char* error, size_t erro
         return 1;
     }
     if((dense && p->head_dim != 64 && p->head_dim != 128 && p->head_dim != 256) ||
-       (q8 && p->head_dim != 128 && p->head_dim != 256))
+       (q8 && p->head_dim != 64 && p->head_dim != 128 && p->head_dim != 256))
     {
         set_error(error, error_capacity, "unsupported head dimension for selected cell");
         return 1;
@@ -203,7 +203,7 @@ int validate(const hipfire_flash_attn_ck_fwd_params* p, char* error, size_t erro
            p->packed_v_row_stride_bytes < minimum_row)
         {
             set_error(error, error_capacity,
-                      "Q8 D128/D256 requires batch=1, causal, and valid packed row strides");
+                      "Q8 D64/D128/D256 requires batch=1, causal, and valid packed row strides");
             return 1;
         }
         if(p->workspace == nullptr || p->workspace_bytes < q8_workspace_bytes(p))
@@ -277,6 +277,16 @@ extern "C" size_t hipfire_flash_attn_ck_capabilities(
         HIPFIRE_FLASH_ATTN_CK_CAP_CAUSAL | HIPFIRE_FLASH_ATTN_CK_CAP_GQA,
     },
 #if defined(HIPFIRE_CK_TARGET_GFX1100)
+    {
+        HIPFIRE_FLASH_ATTN_CK_ABI_VERSION,
+        sizeof(hipfire_flash_attn_ck_capability),
+        HIPFIRE_FLASH_ATTN_CK_GFX1100,
+        HIPFIRE_FLASH_ATTN_CK_F32,
+        HIPFIRE_FLASH_ATTN_CK_Q8,
+        HIPFIRE_FLASH_ATTN_CK_Q8,
+        64,
+        HIPFIRE_FLASH_ATTN_CK_CAP_CAUSAL | HIPFIRE_FLASH_ATTN_CK_CAP_GQA,
+    },
     {
         HIPFIRE_FLASH_ATTN_CK_ABI_VERSION,
         sizeof(hipfire_flash_attn_ck_capability),

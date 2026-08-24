@@ -129,7 +129,7 @@ fn select_q8_prefill_capabilities(
     if request.k_format != FlashAttnCkKvFormat::Q8 || request.v_format != FlashAttnCkKvFormat::Q8 {
         return Err(FlashAttnCkRejectReason::UnsupportedFormat);
     }
-    if !matches!(request.head_dim, 128 | 256) {
+    if !matches!(request.head_dim, 64 | 128 | 256) {
         return Err(FlashAttnCkRejectReason::UnsupportedHeadDim);
     }
     if input.nhead_k == 0
@@ -652,6 +652,7 @@ impl crate::Gpu {
             return Ok(false);
         }
         self.report_flash_attn_ck_route(match head_dim {
+            64 => "selected_q8_d64",
             128 => "selected_q8_d128",
             256 => "selected_q8_d256",
             _ => unreachable!("selector admitted unsupported head dimension"),
@@ -764,6 +765,13 @@ mod tests {
         }
     }
 
+    fn q8_d64_capability() -> FlashAttnCkCapability {
+        FlashAttnCkCapability {
+            head_dim: 64,
+            ..q8_d256_capability()
+        }
+    }
+
     fn eligible_q8_prefill() -> FlashAttnCkPrefillInput {
         FlashAttnCkPrefillInput {
             request: FlashAttnCkRequest {
@@ -794,17 +802,19 @@ mod tests {
             select_q8_prefill_capabilities(&[q8_d256_capability()], input),
             Ok(input.request)
         );
-        let d128_input = FlashAttnCkPrefillInput {
-            request: FlashAttnCkRequest {
-                head_dim: 128,
-                ..input.request
-            },
-            ..input
-        };
-        assert_eq!(
-            select_q8_prefill_capabilities(&[q8_d128_capability()], d128_input),
-            Ok(d128_input.request)
-        );
+        for (head_dim, capability) in [(64, q8_d64_capability()), (128, q8_d128_capability())] {
+            let alternate = FlashAttnCkPrefillInput {
+                request: FlashAttnCkRequest {
+                    head_dim,
+                    ..input.request
+                },
+                ..input
+            };
+            assert_eq!(
+                select_q8_prefill_capabilities(&[capability], alternate),
+                Ok(alternate.request)
+            );
+        }
     }
 
     #[test]
@@ -875,15 +885,15 @@ mod tests {
             ),
             Err(FlashAttnCkRejectReason::CapabilityMiss)
         );
-        let d64_input = FlashAttnCkPrefillInput {
+        let d32_input = FlashAttnCkPrefillInput {
             request: FlashAttnCkRequest {
-                head_dim: 64,
+                head_dim: 32,
                 ..eligible_q8_prefill().request
             },
             ..eligible_q8_prefill()
         };
         assert_eq!(
-            select_q8_prefill_capabilities(&[q8_d128_capability()], d64_input),
+            select_q8_prefill_capabilities(&[q8_d64_capability()], d32_input),
             Err(FlashAttnCkRejectReason::UnsupportedHeadDim)
         );
     }
@@ -975,7 +985,7 @@ mod tests {
                     && cell.head_dim == head_dim
             }));
         }
-        for head_dim in [128, 256] {
+        for head_dim in [64, 128, 256] {
             assert!(sidecar.capabilities().iter().any(|cell| {
                 cell.arch == FlashAttnCkArch::Gfx1100 as i32
                     && cell.dtype == FlashAttnCkDType::F32 as i32

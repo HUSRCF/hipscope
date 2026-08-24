@@ -19,10 +19,10 @@ Current scope:
 - causal or non-causal masks;
 - MHA, MQA, and GQA;
 - dense FP16 head dimensions 64, 128, and 256;
-- gfx1100 F32-Q/Q8-K/Q8-V causal GQA at head dimensions 128 and 256;
+- gfx1100 F32-Q/Q8-K/Q8-V causal GQA at head dimensions 64, 128, and 256;
 - raw HIP stream and element-stride inputs.
 
-The Q8 cells vector-decode both packed caches into F16, invoke the CK D128/D256
+The Q8 cells vector-decode both packed caches into F16, invoke the CK D64/D128/D256
 pipeline, and convert output back to F32. It is a correctness-first staged
 adapter; direct quantized CK and asym/FWHT/Lloyd layouts remain future cells.
 The D128 cell is capability-, selector-, and raw-ABI-validated; no local model
@@ -78,7 +78,7 @@ HIP_VISIBLE_DEVICES=0 \
   experiments/flash-attn-ck-sidecar/build/smoke_raw_abi
 ```
 
-The pure-HIP smoke runs dense FP16 MHA/MQA/GQA and packed Q8 D128/D256 GQA cases
+The pure-HIP smoke runs dense FP16 MHA/MQA/GQA and packed Q8 D64/D128/D256 GQA cases
 against CPU references. The Q8 reference uses reconstructed quantized values,
 so it checks staging and attention independently of quantization error.
 
@@ -92,6 +92,7 @@ Validated on Radeon Pro W7900 / gfx1100 with ROCm 7.14:
 | FP16 GQA D256, causal, default stream | `7.580221e-05` | `7.560880e-06` |
 | FP16 MHA D64, non-causal, default stream | `4.062802e-05` | `6.646507e-06` |
 | FP16 MQA D64, non-causal, default stream | `4.367530e-05` | `6.348691e-06` |
+| F32/Q8/Q8 GQA D64, causal | `5.394965e-05` | `7.127585e-06` |
 | F32/Q8/Q8 GQA D128, causal | `5.379319e-05` | `6.874457e-06` |
 | F32/Q8/Q8 GQA D256, causal | `4.766881e-05` | `7.248458e-06` |
 

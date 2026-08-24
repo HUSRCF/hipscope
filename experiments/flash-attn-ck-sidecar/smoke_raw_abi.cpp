@@ -383,6 +383,7 @@ int main()
     run_case("gqa-causal-d256", 4, 2, true, false, 256);
     run_case("mha-noncausal", 2, 2, false, false);
     run_case("mqa-noncausal", 4, 1, false, false);
+    run_q8_case(64);
     run_q8_case(128);
     run_q8_case(256);
     return 0;
