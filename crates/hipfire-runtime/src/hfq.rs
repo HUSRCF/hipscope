@@ -42,14 +42,6 @@ fn fadvise_dontneed(fd: std::os::unix::io::RawFd, offset: usize, len: usize) {
 #[cfg(not(unix))]
 fn fadvise_dontneed(_fd: i32, _offset: usize, _len: usize) {}
 
-/// Whether this GPU architecture has unified memory (APU — GPU VRAM is system
-/// RAM). UMA loads must keep page-cache eviction ON: cached model pages and
-/// hipMalloc'd buffers share physical RAM, so keeping pages resident doubles
-/// consumption and can OOM mid-load. Discrete-GPU loads should disable it.
-pub fn arch_is_uma(arch: &str) -> bool {
-    matches!(arch, "gfx1103" | "gfx1150" | "gfx1151" | "gfx1152")
-}
-
 impl HfqFile {
     /// Start a background parallel cache warmer: N worker threads pread the
     /// data region chunk-sequentially into the page cache while the loader
@@ -87,40 +79,52 @@ impl HfqFile {
             let stop = stop.clone();
             let next = next.clone();
             let path = path.clone();
-            handles.push(std::thread::spawn(move || {
-                let Ok(file) = std::fs::File::open(&path) else {
-                    return;
-                };
-                use std::os::unix::io::AsRawFd;
-                let fd = file.as_raw_fd();
-                let mut buf = vec![0u8; CHUNK];
-                loop {
-                    if stop.load(std::sync::atomic::Ordering::Relaxed) {
+            // Fallible spawn: under thread exhaustion (RLIMIT_NPROC, cgroup
+            // pids.max) `thread::spawn` would panic mid-load and kill the
+            // daemon. Degrade instead — fewer warmers only costs disk
+            // bandwidth; zero means the upload proceeds unwarmed.
+            match std::thread::Builder::new()
+                .name("hfq-cache-warmer".into())
+                .spawn(move || {
+                    let Ok(file) = std::fs::File::open(&path) else {
                         return;
-                    }
-                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let off = i * CHUNK;
-                    if off >= end {
-                        return;
-                    }
-                    let len = CHUNK.min(end - off);
-                    let mut got = 0usize;
-                    while got < len {
-                        let n = unsafe {
-                            libc::pread(
-                                fd,
-                                buf[got..].as_mut_ptr() as *mut libc::c_void,
-                                len - got,
-                                (off + got) as libc::off_t,
-                            )
-                        };
-                        if n <= 0 {
+                    };
+                    use std::os::unix::io::AsRawFd;
+                    let fd = file.as_raw_fd();
+                    let mut buf = vec![0u8; CHUNK];
+                    loop {
+                        if stop.load(std::sync::atomic::Ordering::Relaxed) {
                             return;
                         }
-                        got += n as usize;
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let off = i * CHUNK;
+                        if off >= end {
+                            return;
+                        }
+                        let len = CHUNK.min(end - off);
+                        let mut got = 0usize;
+                        while got < len {
+                            let n = unsafe {
+                                libc::pread(
+                                    fd,
+                                    buf[got..].as_mut_ptr() as *mut libc::c_void,
+                                    len - got,
+                                    (off + got) as libc::off_t,
+                                )
+                            };
+                            if n <= 0 {
+                                return;
+                            }
+                            got += n as usize;
+                        }
                     }
-                }
-            }));
+                }) {
+                Ok(handle) => handles.push(handle),
+                Err(_) => break,
+            }
+        }
+        if handles.is_empty() {
+            return CacheWarmerGuard::empty();
         }
         CacheWarmerGuard {
             stop,
@@ -182,6 +186,13 @@ impl HfqFile {
                 resident
             }
         }
+    }
+
+    /// Non-unix fallback: no mincore probe available; never pre-detected as
+    /// cached (callers fall back to the pread path).
+    #[cfg(not(unix))]
+    pub fn mostly_page_cached_memo(&self) -> bool {
+        false
     }
 
     /// Non-unix fallback: never pre-detected as cached.
