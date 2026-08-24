@@ -14,9 +14,12 @@
 // Why this kernel has to exist: qt44 had no MoE GEMV of any kind, so
 // `routed_indexable_*` could never be true for it and a qt44 A3B MoE model
 // fell to the resident CPU-fallback decode path instead of the device-indexed
-// one. That is the reason the shipped Ornith 1.5 artifact was built
-// `--format mq4v1` (qt13) despite qt44 being the better format
-// (reconstruction MSE 0.842x qt13 on real FWHT-rotated expert weights).
+// one.
+//
+// This is not hypothetical. The PUBLISHED artifact
+// hipfire-models/ornith1.5-35b-a3b ships routed experts as qt44 — 20,651 of
+// its 21,093 tensors, read from its HFQ index — so the shipped model has been
+// decoding through the fallback path.
 //
 // Group layout, 136 B stride for BOTH formats:
 //

@@ -1020,6 +1020,36 @@ fn moe_res_mq4v2_routed_indexable() {
 }
 
 #[test]
+fn moe_res_shipped_ornith15_takes_the_indexed_path() {
+    // The dtype combination of the PUBLISHED artifact
+    // hipfire-models/ornith1.5-35b-a3b (read from its HFQ index: 20,651 of
+    // 21,093 tensors are qt44, including every routed expert).
+    //
+    // Note the router and shared_expert_gate are Q8, not MQ4, so `gate_fusable`
+    // is FALSE here — the fused gate-side GEMV does not apply. That does not
+    // disqualify the routed path: the routed experts are uniform qt44, which is
+    // what drives `use_gpu_topk`. Same coupling `moe_res_q8_router_still_gpu_topk`
+    // pins for qt13.
+    //
+    // Before qt44 had indexed MoE GEMVs this resolved to use_gpu_topk=false and
+    // the shipped model decoded through the resident CPU-fallback path.
+    let mut d = dtypes_all_mq4();
+    d.router = DType::Q8_0;
+    d.shared_gate = DType::Q8_0;
+    d.shared_expert_gate = DType::MQ6G256;
+    d.shared_expert_up = DType::MQ6G256;
+    d.shared_expert_down = DType::MQ6G256;
+    d.routed_gate_up = DType::MQ4G256V2;
+    d.routed_down = DType::MQ4G256V2;
+    d.experts_all_gate_up_mq4 = false;
+    let r = MoeResolution::resolve(&d, 8);
+    assert!(!r.gate_fusable, "Q8 router disqualifies the fused gate side");
+    assert!(r.routed_indexable_mq4v2, "routed experts are uniform qt44");
+    assert!(r.use_gpu_topk, "shipped Ornith must take the indexed decode path");
+    assert!(r.needs_x_rot_local, "qt44 kernels read ROTATED activations");
+}
+
+#[test]
 fn moe_res_mq4v2_mixed_with_qt13_is_not_indexable() {
     // The hazard this pairing guards: qt13 and qt44 share a 136 B group stride
     // and identical nibble packing, differing ONLY in the 8-byte header (one
