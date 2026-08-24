@@ -12713,18 +12713,19 @@ impl Gpu {
         x_src_rows: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        if self.arch_caps.is_rdna4() {
+        // Arch-selecting, like the MQ2/MQ3-Lloyd grouped sisters: gfx11 takes
+        // the `_k2` source, gfx12 (RDNA4) the `_gfx12` one. They are DIFFERENT
+        // sources — the gfx12 WMMA intrinsic and operand shape do not exist on
+        // gfx11 and vice versa, so neither JITs on the other's arch.
+        let is_gfx12 = self.arch_caps.is_rdna4();
+        if !is_gfx12 && !self.arch_caps.has_wmma_w32() {
             return Err(hip_bridge::HipError::new(
                 0,
-                "gemm_mq4g256v2_moe_grouped_wmma_k2: no gfx12 kernel for qt44 MoE experts",
+                "gemm_mq4g256v2_moe_grouped_wmma_k2: wave32 WMMA required",
             ));
         }
-        let kernel_name = "gemm_mq4g256v2_moe_grouped_wmma_k2";
-        self.ensure_kernel(
-            kernel_name,
-            kernels::GEMM_MQ4G256V2_MOE_GROUPED_WMMA_K2_SRC,
-            kernel_name,
-        )?;
+        let (kernel_name, kernel_src) = kernels::mq4g256v2_moe_grouped_wmma_source(is_gfx12);
+        self.ensure_kernel(kernel_name, kernel_src, kernel_name)?;
         // UNCACHED conversion is mandatory here. `ensure_fp16_x` is pointer-keyed,
         // and MoE prefill reuses the SAME x_rot_batch tensor for every layer with
         // different contents each time — so the cached variant hands every layer
