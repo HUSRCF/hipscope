@@ -4,7 +4,8 @@
 # hipfire — see LICENSE and NOTICE in the project root.
 """Per-layer cosine between hipfire's Maple residuals and a reference dump.
 
-hipfire side:
+hipfire side (the probe is `lab`-gated, so build it first):
+  cargo build --release -p hipfire-arch-maple --example maple_coherence --features lab
   HIPFIRE_MAPLE_DUMP_HIDDEN=ours.bin \\
     target/release/examples/maple_coherence --model maple.hfq --max-tokens 1
 
