@@ -676,7 +676,22 @@ fn add_qwen35_hybrid_config(
         })
     };
 
-    let n_layers = as_u64(&format!("{prefix}.block_count")).unwrap_or(0) as usize;
+    let n_layers_all = as_u64(&format!("{prefix}.block_count")).unwrap_or(0) as usize;
+    // llama.cpp appends the MTP/nextn blocks to block_count. hipfire loads
+    // those through a separate draft artifact, so only the trunk participates
+    // in the hybrid layer schedule and ordinary model loader.
+    let n_layers_nextn = as_u64(&format!("{prefix}.nextn_predict_layers")).unwrap_or(0) as usize;
+    let n_layers = n_layers_all.saturating_sub(n_layers_nextn);
+    if n_layers_nextn > 0 {
+        cfg.insert(
+            "mtp_num_hidden_layers".to_string(),
+            serde_json::Value::from(n_layers_nextn as u64),
+        );
+        cfg.insert(
+            "num_hidden_layers".to_string(),
+            serde_json::Value::from(n_layers as u64),
+        );
+    }
     let interval = as_u64(&format!("{prefix}.full_attention_interval")).unwrap_or(0) as usize;
     if n_layers > 0 && interval > 0 {
         let layer_types: Vec<_> = (0..n_layers)
@@ -974,6 +989,24 @@ mod qwen35_gguf_config_tests {
             serde_json::json!([11, 11, 10])
         );
         assert_eq!(cfg["rope_parameters"]["mrope_interleaved"], true);
+    }
+
+    #[test]
+    fn qwen35_mtp_layer_is_excluded_from_trunk_schedule() {
+        let mut metadata = HashMap::new();
+        metadata.insert("qwen35.block_count".to_string(), MV::U32(65));
+        metadata.insert("qwen35.nextn_predict_layers".to_string(), MV::U32(1));
+        metadata.insert("qwen35.full_attention_interval".to_string(), MV::U32(4));
+
+        let mut cfg = serde_json::Map::new();
+        cfg.insert("num_hidden_layers".to_string(), serde_json::json!(65));
+        add_qwen35_hybrid_config(&metadata, "qwen35", &mut cfg);
+
+        assert_eq!(cfg["num_hidden_layers"], 64);
+        assert_eq!(cfg["mtp_num_hidden_layers"], 1);
+        let layers = cfg["layer_types"].as_array().unwrap();
+        assert_eq!(layers.len(), 64);
+        assert_eq!(layers[63], "full_attention");
     }
 
     #[test]

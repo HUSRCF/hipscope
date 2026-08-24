@@ -33,6 +33,7 @@ pub enum GgmlType {
     Q5K = 13,
     Q6K = 14,
     Q8K = 15,
+    IQ4NL = 20,
     IQ4XS = 23,
     BF16 = 30,
     Q1_0 = 41,
@@ -56,6 +57,7 @@ impl GgmlType {
             13 => Some(Self::Q5K),
             14 => Some(Self::Q6K),
             15 => Some(Self::Q8K),
+            20 => Some(Self::IQ4NL),
             23 => Some(Self::IQ4XS),
             30 => Some(Self::BF16),
             41 => Some(Self::Q1_0),
@@ -67,14 +69,16 @@ impl GgmlType {
     pub fn block_size(self) -> usize {
         match self {
             Self::F32 | Self::F16 | Self::BF16 => 1,
-            Self::Q4_0 | Self::Q4_1 | Self::Q5_0 | Self::Q5_1 | Self::Q8_0 | Self::Q8_1 => 32,
-            Self::Q2K
-            | Self::Q3K
-            | Self::Q4K
-            | Self::Q5K
-            | Self::Q6K
-            | Self::Q8K
-            | Self::IQ4XS => 256,
+            Self::Q4_0
+            | Self::Q4_1
+            | Self::Q5_0
+            | Self::Q5_1
+            | Self::Q8_0
+            | Self::Q8_1
+            | Self::IQ4NL => 32,
+            Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K | Self::Q8K | Self::IQ4XS => {
+                256
+            }
             Self::Q1_0 | Self::Q2_0 => 128,
         }
     }
@@ -89,6 +93,8 @@ impl GgmlType {
             Self::Q5_1 => 24,
             Self::Q8_0 => 34,
             Self::Q8_1 => 40,
+            // block_iq4_nl: fp16 d + 16 packed nibbles.
+            Self::IQ4NL => 18,
             Self::Q2K => 84,
             Self::Q3K => 110,
             Self::Q4K => 144,
@@ -594,6 +600,37 @@ fn dequant_iq4_xs(data: &[u8], n: usize) -> Vec<f32> {
     out
 }
 
+/// llama.cpp IQ4_NL: one FP16 scale and 32 non-linear 4-bit values.
+fn dequant_iq4_nl(data: &[u8], n: usize) -> Vec<f32> {
+    const BLOCK_SIZE: usize = 32;
+    const BLOCK_BYTES: usize = 18;
+    const VALUES: [i8; 16] = [
+        -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
+    ];
+
+    let nblocks = n.div_ceil(BLOCK_SIZE);
+    let mut out = vec![0.0f32; n];
+    for b in 0..nblocks {
+        let off = b * BLOCK_BYTES;
+        if off + BLOCK_BYTES > data.len() {
+            break;
+        }
+        let d = f16_to_f32(u16::from_le_bytes([data[off], data[off + 1]]));
+        let qs = &data[off + 2..off + BLOCK_BYTES];
+        for (j, &q) in qs.iter().enumerate() {
+            let lo_idx = b * BLOCK_SIZE + j;
+            let hi_idx = lo_idx + 16;
+            if lo_idx < n {
+                out[lo_idx] = d * VALUES[(q & 0x0f) as usize] as f32;
+            }
+            if hi_idx < n {
+                out[hi_idx] = d * VALUES[(q >> 4) as usize] as f32;
+            }
+        }
+    }
+    out
+}
+
 /// Dispatcher: dequantize any supported tensor to f32. Panics on unsupported types.
 pub fn tensor_to_f32(info: &TensorInfo, data: &[u8]) -> Vec<f32> {
     let n = info.numel();
@@ -626,6 +663,7 @@ pub fn tensor_to_f32(info: &TensorInfo, data: &[u8]) -> Vec<f32> {
         GgmlType::Q4K => dequant_q4_k(data, n),
         GgmlType::Q5K => dequant_q5_k(data, n),
         GgmlType::Q6K => dequant_q6_k(data, n),
+        GgmlType::IQ4NL => dequant_iq4_nl(data, n),
         GgmlType::IQ4XS => dequant_iq4_xs(data, n),
         other => panic!(
             "GGUF tensor type {:?} not implemented (tensor: {})",
@@ -755,4 +793,17 @@ mod tests {
         assert_eq!(got[192], 0.0);
         assert_eq!(got[224], 16.0);
     }
+}
+#[test]
+fn iq4_nl_layout_and_known_vector_match_reference_formula() {
+    assert_eq!(GgmlType::from_u32(20), Some(GgmlType::IQ4NL));
+    assert_eq!(GgmlType::IQ4NL.block_size(), 32);
+    assert_eq!(GgmlType::IQ4NL.block_bytes(), 18);
+
+    let mut block = vec![0u8; 18];
+    block[0..2].copy_from_slice(&0x4000u16.to_le_bytes()); // d = 2.0
+    block[2..].fill(0xf0);
+    let got = dequant_iq4_nl(&block, 32);
+    assert!(got[..16].iter().all(|&v| v == -254.0));
+    assert!(got[16..].iter().all(|&v| v == 226.0));
 }
