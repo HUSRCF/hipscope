@@ -407,7 +407,10 @@ void run_asym3_contract_case(int format, int hdim)
 
     char error[1024]{};
     const int status = hipfire_flash_attn_ck_fwd_supported(&params, error, sizeof(error));
-    const bool has_cell = format == HIPFIRE_FLASH_ATTN_CK_ASYM3_GIVENS && hdim == 256;
+    const bool has_cell =
+        (format == HIPFIRE_FLASH_ATTN_CK_ASYM3_GIVENS ||
+         format == HIPFIRE_FLASH_ATTN_CK_ASYM3_FWHT) &&
+        hdim == 256;
     if((has_cell && status != 0) ||
        (!has_cell && (status != 2 || std::strstr(error, "no CK execution cell") == nullptr)))
     {
@@ -446,7 +449,7 @@ void run_asym3_contract_case(int format, int hdim)
                 has_cell ? "supported" : "recognized-no-cell");
 }
 
-void run_asym3_givens_case(int hdim)
+void run_asym3_case(int format, int hdim)
 {
     constexpr float centroids[8] = {
         -0.134860f, -0.083320f, -0.046469f, -0.015176f,
@@ -463,7 +466,9 @@ void run_asym3_givens_case(int hdim)
     const size_t kv_count = static_cast<size_t>(seqlen_k) * nhead_k * hdim;
     std::vector<float> q(q_count), transformed_q(q_count), v(kv_count), decoded_k(kv_count),
         decoded_v(kv_count), expected(q_count, 0.0f), output(q_count);
-    std::vector<float> cos_theta(hdim / 2), sin_theta(hdim / 2);
+    const bool givens = format == HIPFIRE_FLASH_ATTN_CK_ASYM3_GIVENS;
+    std::vector<float> transform0(givens ? hdim / 2 : hdim);
+    std::vector<float> transform1(givens ? hdim / 2 : hdim);
     std::vector<uint8_t> packed_k(static_cast<size_t>(seqlen_k) * nhead_k * k_head_bytes);
     std::vector<uint8_t> packed_v(static_cast<size_t>(seqlen_k) * nhead_k * v_head_bytes);
     std::mt19937 rng(29 + hdim);
@@ -474,19 +479,52 @@ void run_asym3_givens_case(int hdim)
     for(int pair = 0; pair < hdim / 2; ++pair)
     {
         const float angle = 0.001f * static_cast<float>((pair * 17 + 3) % 97);
-        cos_theta[pair] = std::cos(angle);
-        sin_theta[pair] = std::sin(angle);
+        if(givens)
+        {
+            transform0[pair] = std::cos(angle);
+            transform1[pair] = std::sin(angle);
+        }
     }
-    for(int row = 0; row < seqlen_q; ++row)
-        for(int head = 0; head < nhead_q; ++head)
-            for(int pair = 0; pair < hdim / 2; ++pair)
+    if(givens)
+    {
+        for(int row = 0; row < seqlen_q; ++row)
+            for(int head = 0; head < nhead_q; ++head)
+                for(int pair = 0; pair < hdim / 2; ++pair)
+                {
+                    const size_t base =
+                        (static_cast<size_t>(row) * nhead_q + head) * hdim + pair * 2;
+                    const float a = transformed_q[base];
+                    const float b = transformed_q[base + 1];
+                    transformed_q[base] = a * transform0[pair] - b * transform1[pair];
+                    transformed_q[base + 1] = a * transform1[pair] + b * transform0[pair];
+                }
+    }
+    else
+    {
+        for(int dim = 0; dim < hdim; ++dim)
+        {
+            transform0[dim] = ((dim * 13 + 5) & 1) == 0 ? 1.0f : -1.0f;
+            transform1[dim] = ((dim * 29 + 7) & 1) == 0 ? 1.0f : -1.0f;
+        }
+        for(int row = 0; row < seqlen_q; ++row)
+            for(int head = 0; head < nhead_q; ++head)
             {
-                const size_t base = (static_cast<size_t>(row) * nhead_q + head) * hdim + pair * 2;
-                const float a = transformed_q[base];
-                const float b = transformed_q[base + 1];
-                transformed_q[base] = a * cos_theta[pair] - b * sin_theta[pair];
-                transformed_q[base + 1] = a * sin_theta[pair] + b * cos_theta[pair];
+                const size_t base = (static_cast<size_t>(row) * nhead_q + head) * hdim;
+                for(int dim = 0; dim < hdim; ++dim)
+                    transformed_q[base + dim] *= transform0[dim];
+                for(int stride = 1; stride < hdim; stride <<= 1)
+                    for(int index = 0; index < hdim; index += stride * 2)
+                        for(int offset = 0; offset < stride; ++offset)
+                        {
+                            const float a = transformed_q[base + index + offset];
+                            const float b = transformed_q[base + index + offset + stride];
+                            transformed_q[base + index + offset] = a + b;
+                            transformed_q[base + index + offset + stride] = a - b;
+                        }
+                for(int dim = 0; dim < hdim; ++dim)
+                    transformed_q[base + dim] *= 0.0625f * transform1[dim];
             }
+    }
     for(int row = 0; row < seqlen_k; ++row)
         for(int head = 0; head < nhead_k; ++head)
         {
@@ -545,18 +583,18 @@ void run_asym3_givens_case(int hdim)
     check_hip(hipMalloc(&dk, packed_k.size()), "hipMalloc(asym k)");
     check_hip(hipMalloc(&dv, packed_v.size()), "hipMalloc(asym v)");
     check_hip(hipMalloc(&dout, q_count * sizeof(float)), "hipMalloc(asym out)");
-    check_hip(hipMalloc(&dcos, cos_theta.size() * sizeof(float)), "hipMalloc(asym cos)");
-    check_hip(hipMalloc(&dsin, sin_theta.size() * sizeof(float)), "hipMalloc(asym sin)");
+    check_hip(hipMalloc(&dcos, transform0.size() * sizeof(float)), "hipMalloc(asym transform0)");
+    check_hip(hipMalloc(&dsin, transform1.size() * sizeof(float)), "hipMalloc(asym transform1)");
     check_hip(hipMemcpy(dq, q.data(), q_count * sizeof(float), hipMemcpyHostToDevice), "copy asym q");
     check_hip(hipMemcpy(dk, packed_k.data(), packed_k.size(), hipMemcpyHostToDevice), "copy asym k");
     check_hip(hipMemcpy(dv, packed_v.data(), packed_v.size(), hipMemcpyHostToDevice), "copy asym v");
-    check_hip(hipMemcpy(dcos, cos_theta.data(), cos_theta.size() * sizeof(float), hipMemcpyHostToDevice), "copy asym cos");
-    check_hip(hipMemcpy(dsin, sin_theta.data(), sin_theta.size() * sizeof(float), hipMemcpyHostToDevice), "copy asym sin");
+    check_hip(hipMemcpy(dcos, transform0.data(), transform0.size() * sizeof(float), hipMemcpyHostToDevice), "copy asym transform0");
+    check_hip(hipMemcpy(dsin, transform1.data(), transform1.size() * sizeof(float), hipMemcpyHostToDevice), "copy asym transform1");
     hipfire_flash_attn_ck_fwd_params params{};
     params.abi_version = HIPFIRE_FLASH_ATTN_CK_ABI_VERSION; params.struct_size = sizeof(params);
     params.q = dq; params.k = dk; params.v = dv; params.out = dout;
     params.dtype = HIPFIRE_FLASH_ATTN_CK_F32;
-    params.k_format = HIPFIRE_FLASH_ATTN_CK_ASYM3_GIVENS;
+    params.k_format = format;
     params.v_format = HIPFIRE_FLASH_ATTN_CK_Q8;
     params.batch = 1; params.seqlen_q = seqlen_q; params.seqlen_k = seqlen_k;
     params.nhead_q = nhead_q; params.nhead_k = nhead_k; params.head_dim = hdim;
@@ -571,7 +609,7 @@ void run_asym3_givens_case(int hdim)
     params.packed_k_row_stride_bytes = nhead_k * k_head_bytes;
     params.packed_v_row_stride_bytes = nhead_k * v_head_bytes;
     params.k_transform0 = dcos; params.k_transform1 = dsin;
-    params.k_transform0_elements = params.k_transform1_elements = hdim / 2;
+    params.k_transform0_elements = params.k_transform1_elements = givens ? hdim / 2 : hdim;
     params.workspace_bytes = hipfire_flash_attn_ck_fwd_workspace_bytes(&params);
     check_hip(hipMalloc(&workspace, params.workspace_bytes), "hipMalloc(asym workspace)");
     params.workspace = workspace;
@@ -582,8 +620,8 @@ void run_asym3_givens_case(int hdim)
     float max_abs = 0.0f; double mean_abs = 0.0;
     for(size_t i = 0; i < q_count; ++i) { const float d = std::abs(output[i] - expected[i]); max_abs = std::max(max_abs, d); mean_abs += d; }
     mean_abs /= q_count;
-    std::printf("case=asym3-givens-d%d-gqa-causal max_abs=%.7g mean_abs=%.7g workspace=%zu\n",
-                hdim, max_abs, mean_abs, params.workspace_bytes);
+    std::printf("case=asym3-%s-d%d-gqa-causal max_abs=%.7g mean_abs=%.7g workspace=%zu\n",
+                givens ? "givens" : "fwht", hdim, max_abs, mean_abs, params.workspace_bytes);
     if(max_abs > 0.002f) std::exit(13);
     for(void* pointer : {dq, dk, dv, dout, dcos, dsin, workspace}) check_hip(hipFree(pointer), "hipFree(asym)");
 }
@@ -610,6 +648,7 @@ int main()
     run_asym3_contract_case(HIPFIRE_FLASH_ATTN_CK_ASYM3_GIVENS, 512);
     run_asym3_contract_case(HIPFIRE_FLASH_ATTN_CK_ASYM3_FWHT, 256);
     run_asym3_contract_case(HIPFIRE_FLASH_ATTN_CK_ASYM3_FWHT, 512);
-    run_asym3_givens_case(256);
+    run_asym3_case(HIPFIRE_FLASH_ATTN_CK_ASYM3_GIVENS, 256);
+    run_asym3_case(HIPFIRE_FLASH_ATTN_CK_ASYM3_FWHT, 256);
     return 0;
 }

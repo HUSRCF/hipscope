@@ -1230,26 +1230,51 @@ fn dispatch_attend(
                 let ct = io.givens_cos.unwrap();
                 let st = io.givens_sin.unwrap();
                 let fp = io.flash_partials.unwrap();
-                hip!(gpu.attention_flash_fwht3_batched_masked(
-                    io.q,
-                    io.k_cache,
-                    io.v_cache,
-                    io.output,
-                    io.positions(),
-                    ct,
-                    st,
-                    io.n_heads,
-                    io.n_kv_heads,
-                    io.head_dim,
-                    io.physical_cap,
-                    io.max_ctx_len,
-                    io.batch_size,
-                    fp,
-                    io.tree_bias,
-                    io.block_start,
-                    io.block_cols,
-                    plan.v_mode_bits,
-                ))
+                let contiguous_prefix =
+                    is_contiguous_prefill_prefix(io.pos, io.batch_size, io.max_ctx_len);
+                if plan.v_mode_bits == 8
+                    && hip!(gpu.try_flash_attn_ck_asym3_fwht_prefill(
+                        io.q,
+                        io.k_cache,
+                        io.v_cache,
+                        io.output,
+                        ct,
+                        st,
+                        io.batch_size,
+                        io.max_ctx_len,
+                        io.n_heads,
+                        io.n_kv_heads,
+                        io.head_dim,
+                        contiguous_prefix,
+                        io.tree_bias.is_some(),
+                        usize::try_from(plan.window).unwrap_or(usize::MAX),
+                        io.block_start,
+                        io.block_cols,
+                    ))?
+                {
+                    Ok(())
+                } else {
+                    hip!(gpu.attention_flash_fwht3_batched_masked(
+                        io.q,
+                        io.k_cache,
+                        io.v_cache,
+                        io.output,
+                        io.positions(),
+                        ct,
+                        st,
+                        io.n_heads,
+                        io.n_kv_heads,
+                        io.head_dim,
+                        io.physical_cap,
+                        io.max_ctx_len,
+                        io.batch_size,
+                        fp,
+                        io.tree_bias,
+                        io.block_start,
+                        io.block_cols,
+                        plan.v_mode_bits,
+                    ))
+                }
             }
             // 2-bit: _batched only (no _masked — tree-verify gap)
             KernelKey::AttnFlashAsym2Batched => {

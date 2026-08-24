@@ -21,6 +21,7 @@ Current scope:
 - dense FP16 head dimensions 64, 128, and 256;
 - gfx1100 F32-Q/Q8-K/Q8-V causal GQA at head dimensions 64, 128, and 256;
 - gfx1100 F32-Q/Asym3-Givens-K/Q8-V causal GQA at head dimension 256;
+- gfx1100 F32-Q/Asym3-FWHT-K/Q8-V causal GQA at head dimension 256;
 - raw HIP stream and element-stride inputs.
 
 The Q8 cells vector-decode both packed caches into F16, invoke the CK D64/D128/D256
@@ -31,10 +32,11 @@ currently reaches that cell through the production attention dispatcher.
 
 ABI v4 gives Givens and FWHT K caches distinct format IDs; Q8 V remains a
 separate format, and callers provide explicit K/V row and head byte strides
-plus both transform tables. The D256 Givens cell rotates Q and decodes packed K
-and Q8 V into caller-owned F16 staging before invoking CK. D512 Givens and both
-FWHT shapes remain `recognized-no-cell`: their layouts are validated but no
-capability is published. This keeps each unimplemented packed loader fail-closed.
+plus both transform tables. The D256 Givens and FWHT cells apply their respective
+Q transforms and decode packed K and Q8 V into caller-owned F16 staging before
+invoking CK. Both D512 layouts remain `recognized-no-cell`: their layouts are
+validated but no capability is published. This keeps each unimplemented packed
+loader fail-closed.
 Packed staging currently requires contiguous `[row, head, dim]` Q and output;
 the ABI validator rejects non-contiguous element strides rather than ignoring them.
 The Rust loader accepts ABI v3 sidecars for their original dense/Q8 cells by
@@ -92,7 +94,7 @@ HIP_VISIBLE_DEVICES=0 \
 ```
 
 The pure-HIP smoke runs dense FP16 MHA/MQA/GQA, packed Q8 D64/D128/D256 GQA,
-and Asym3-Givens D256 GQA cases against CPU references. Quantized references
+and Asym3-Givens/FWHT D256 GQA cases against CPU references. Quantized references
 use reconstructed values, so they check packed loading and attention
 independently of quantization error.
 
@@ -110,6 +112,7 @@ Validated on Radeon Pro W7900 / gfx1100 with ROCm 7.14:
 | F32/Q8/Q8 GQA D128, causal | `5.379319e-05` | `6.874457e-06` |
 | F32/Q8/Q8 GQA D256, causal | `4.766881e-05` | `7.248458e-06` |
 | F32/Asym3-Givens/Q8 GQA D256, causal | `6.110966e-05` | `1.009769e-05` |
+| F32/Asym3-FWHT/Q8 GQA D256, causal | `7.408857e-05` | `1.015317e-05` |
 
 ## Optional Rust loader
 
@@ -147,7 +150,8 @@ workspace produces a one-time route reason and retains native attention. The
 Asym3 D256 cell is attempted only after the Qwen attention family has completed
 its native KV write and resolved a sequential, non-tree, non-windowed prefill;
 decode and graph capture remain native. Use `scripts/bench_ck_q8_prefill_ab.sh`
-with `KV_MODE=q8` or `KV_MODE=asym3` for a reproducible production-path A/B.
+with `KV_MODE=q8`, `KV_MODE=asym3`, or `KV_MODE=fwht3` for a reproducible
+production-path A/B.
 The script also requires native and CK prefill to produce the same next-token ID.
 
 Qwen3.6-27B MQ4, Asym3 KV, W7900/gfx1100, warm process and identical fake prompt:
@@ -157,3 +161,9 @@ Qwen3.6-27B MQ4, Asym3 KV, W7900/gfx1100, warm process and identical fake prompt
 | 512 | 2 | `836.5 tok/s` | `854.8 tok/s` | `+2.18%` | `29` / `29` |
 | 2048 | 3 | `780.9 tok/s` | `846.7 tok/s` | `+8.43%` | not recorded |
 | 8192 | 5 | `569.9 tok/s` | `795.2 tok/s` | `+39.53%` | `248046` / `248046` |
+
+Qwen3.6-27B MQ4, FWHT3-K/Q8-V KV, W7900/gfx1100, PP8192 and five runs:
+
+| Native median | CK median | Delta | Next token |
+| ---: | ---: | ---: | ---: |
+| `572.4 tok/s` | `797.6 tok/s` | `+39.34%` | `248046` / `248046` |
