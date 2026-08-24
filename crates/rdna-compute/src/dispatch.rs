@@ -635,6 +635,10 @@ pub struct Gpu {
     /// eligible after their native layout/tier resolution.
     #[cfg(feature = "flash-attn-ck")]
     pub(crate) flash_attn_ck: Option<crate::flash_attn_ck::FlashAttnCk>,
+    #[cfg(feature = "flash-attn-ck")]
+    pub(crate) flash_attn_ck_workspace: Option<hip_bridge::DeviceBuffer>,
+    #[cfg(feature = "flash-attn-ck")]
+    pub(crate) flash_attn_ck_reported_routes: std::collections::HashSet<&'static str>,
 
     // ── MMQ per-weight screening (#87) — extracted to MmqScreenState ──────
     pub mmq_screen: MmqScreenState,
@@ -1142,6 +1146,13 @@ impl Gpu {
             );
             Some(runtime)
         });
+        #[cfg(feature = "flash-attn-ck")]
+        let flash_attn_ck_workspace =
+            if flash_attn_ck.is_some() && flags.flash_attn_ck_workspace_bytes > 0 {
+                Some(hip.malloc(flags.flash_attn_ck_workspace_bytes)?)
+            } else {
+                None
+            };
 
         Ok(Self {
             hip,
@@ -1186,6 +1197,10 @@ impl Gpu {
             replay: crate::replay::ReplayController::from_config(),
             #[cfg(feature = "flash-attn-ck")]
             flash_attn_ck,
+            #[cfg(feature = "flash-attn-ck")]
+            flash_attn_ck_workspace,
+            #[cfg(feature = "flash-attn-ck")]
+            flash_attn_ck_reported_routes: std::collections::HashSet::new(),
             mmq_screen: MmqScreenState {
                 cache: HashMap::new(),
                 enabled: mmq_screen,

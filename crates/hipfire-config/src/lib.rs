@@ -2229,6 +2229,16 @@ pub static FIELDS: &[ConfigField] = &[
         "HIPFIRE_FLASH_ATTN_CK_LIB",
         "Optional exact-architecture CK runtime sidecar path; load or capability failure retains native attention."
     ),
+    process_field!(
+        "attention.ck_workspace_bytes",
+        "ck_workspace_bytes",
+        Attention,
+        DefaultValue::Integer(0),
+        ValueRule::Integer { min: 0, max: 17_179_869_184 },
+        true,
+        "HIPFIRE_FLASH_ATTN_CK_WORKSPACE_BYTES",
+        "Preallocated caller-owned bytes for the optional CK staged attention path."
+    ),
     process_bool_field!(
         "kernel.gfx942_gemv_v3",
         "gfx942_gemv_v3",
@@ -4788,6 +4798,9 @@ mod tests {
         global
             .set_cli("attention.ck_runtime_lib", "/opt/hipfire/ck.so")
             .unwrap();
+        global
+            .set_cli("attention.ck_workspace_bytes", "536870912")
+            .unwrap();
         let resolved = resolve([NamedLayer {
             source: ConfigSource::GlobalUser {
                 path: PathBuf::from("config.toml"),
@@ -4801,6 +4814,12 @@ mod tests {
         assert_eq!(
             process.legacy_value("HIPFIRE_FLASH_ATTN_CK_LIB").as_deref(),
             Some("/opt/hipfire/ck.so")
+        );
+        assert_eq!(
+            process
+                .legacy_value("HIPFIRE_FLASH_ATTN_CK_WORKSPACE_BYTES")
+                .as_deref(),
+            Some("536870912")
         );
         assert_eq!(
             process.legacy_value("HIPFIRE_GEMV_ROWS").as_deref(),

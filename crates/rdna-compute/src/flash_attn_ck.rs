@@ -126,9 +126,7 @@ fn select_q8_d256_prefill_capabilities(
     if input.batch_size <= 1 {
         return Err(FlashAttnCkRejectReason::Decode);
     }
-    if request.k_format != FlashAttnCkKvFormat::Q8
-        || request.v_format != FlashAttnCkKvFormat::Q8
-    {
+    if request.k_format != FlashAttnCkKvFormat::Q8 || request.v_format != FlashAttnCkKvFormat::Q8 {
         return Err(FlashAttnCkRejectReason::UnsupportedFormat);
     }
     if request.head_dim != 256 {
@@ -522,6 +520,159 @@ impl FlashAttnCk {
                 message: error_message(&error),
             })
         }
+    }
+}
+
+impl crate::Gpu {
+    /// Try the first serving capability cell. `Ok(false)` is an intentional
+    /// native fallback, including sidecar support/launch failures.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_flash_attn_ck_q8_d256_prefill(
+        &mut self,
+        q: &crate::GpuTensor,
+        k_cache: &crate::GpuTensor,
+        v_cache: &crate::GpuTensor,
+        output: &crate::GpuTensor,
+        seqlen_q: usize,
+        seqlen_k: usize,
+        nhead_q: usize,
+        nhead_k: usize,
+        contiguous_prefix: bool,
+        has_tree_bias: bool,
+        window: usize,
+        block_start: usize,
+        block_cols: usize,
+    ) -> hip_bridge::HipResult<bool> {
+        if self.flash_attn_ck.is_none() {
+            return Ok(false);
+        }
+        let Some(arch) = (match self.arch.as_str() {
+            "gfx1100" => Some(FlashAttnCkArch::Gfx1100),
+            "gfx1151" => Some(FlashAttnCkArch::Gfx1151),
+            "gfx1201" => Some(FlashAttnCkArch::Gfx1201),
+            _ => None,
+        }) else {
+            return Ok(false);
+        };
+        if q.dtype != crate::DType::F32 || output.dtype != crate::DType::F32 {
+            self.report_flash_attn_ck_route("dtype_miss");
+            return Ok(false);
+        }
+        let request = FlashAttnCkRequest {
+            arch,
+            dtype: FlashAttnCkDType::F32,
+            k_format: FlashAttnCkKvFormat::Q8,
+            v_format: FlashAttnCkKvFormat::Q8,
+            head_dim: 256,
+            required_flags: FLASH_ATTN_CK_CAP_CAUSAL | FLASH_ATTN_CK_CAP_GQA,
+        };
+        let input = FlashAttnCkPrefillInput {
+            request,
+            batch_size: seqlen_q,
+            nhead_q,
+            nhead_k,
+            causal: true,
+            contiguous_prefix,
+            capture_mode: self.graphs.capture_mode,
+            has_tree_bias,
+            window,
+            block_start,
+            block_cols,
+        };
+        let decision = select_q8_d256_prefill(self.flash_attn_ck.as_ref().unwrap(), input);
+        if let Err(reason) = decision {
+            self.report_flash_attn_ck_route(reject_reason_name(reason));
+            return Ok(false);
+        }
+
+        let mut params = FlashAttnCkFwdParams::new();
+        params.q = q.buf.as_ptr();
+        params.k = k_cache.buf.as_ptr();
+        params.v = v_cache.buf.as_ptr();
+        params.out = output.buf.as_ptr();
+        params.stream = self
+            .active_stream
+            .as_ref()
+            .map_or(std::ptr::null_mut(), hip_bridge::Stream::as_raw);
+        params.dtype = FlashAttnCkDType::F32 as i32;
+        params.k_format = FlashAttnCkKvFormat::Q8 as i32;
+        params.v_format = FlashAttnCkKvFormat::Q8 as i32;
+        params.batch = 1;
+        params.seqlen_q = seqlen_q as i32;
+        params.seqlen_k = seqlen_k as i32;
+        params.nhead_q = nhead_q as i32;
+        params.nhead_k = nhead_k as i32;
+        params.head_dim = 256;
+        params.causal = 1;
+        params.softmax_scale = 1.0 / 16.0;
+        params.stride_q = (nhead_q * 256) as i64;
+        params.stride_k = (nhead_k * 256) as i64;
+        params.stride_v = params.stride_k;
+        params.stride_out = params.stride_q;
+        params.nhead_stride_q = 256;
+        params.nhead_stride_k = 256;
+        params.nhead_stride_v = 256;
+        params.nhead_stride_out = 256;
+        params.batch_stride_q = (seqlen_q * nhead_q * 256) as i64;
+        params.batch_stride_k = (seqlen_k * nhead_k * 256) as i64;
+        params.batch_stride_v = params.batch_stride_k;
+        params.batch_stride_out = params.batch_stride_q;
+        params.packed_k_row_stride_bytes = (nhead_k * 272) as i64;
+        params.packed_v_row_stride_bytes = params.packed_k_row_stride_bytes;
+
+        let required = self
+            .flash_attn_ck
+            .as_ref()
+            .unwrap()
+            .workspace_bytes(&params);
+        let Some(workspace) = self.flash_attn_ck_workspace.as_ref() else {
+            self.report_flash_attn_ck_route("workspace_unconfigured");
+            return Ok(false);
+        };
+        if workspace.size() < required {
+            self.report_flash_attn_ck_route("workspace_too_small");
+            return Ok(false);
+        }
+        params.workspace = workspace.as_ptr();
+        params.workspace_bytes = workspace.size();
+        let support = self.flash_attn_ck.as_ref().unwrap().is_supported(&params);
+        if let Err(error) = support {
+            if self.flash_attn_ck_reported_routes.insert("support_error") {
+                eprintln!("optional CK attention fallback (support_error): {error}");
+            }
+            return Ok(false);
+        }
+        let launch = unsafe { self.flash_attn_ck.as_ref().unwrap().forward(&params) };
+        if let Err(error) = launch {
+            if self.flash_attn_ck_reported_routes.insert("launch_error") {
+                eprintln!("optional CK attention fallback (launch_error): {error}");
+            }
+            return Ok(false);
+        }
+        self.report_flash_attn_ck_route("selected_q8_d256");
+        Ok(true)
+    }
+
+    fn report_flash_attn_ck_route(&mut self, reason: &'static str) {
+        if self.flash_attn_ck_reported_routes.insert(reason) {
+            eprintln!("optional CK attention route: {reason}");
+        }
+    }
+}
+
+fn reject_reason_name(reason: FlashAttnCkRejectReason) -> &'static str {
+    match reason {
+        FlashAttnCkRejectReason::Decode => "decode",
+        FlashAttnCkRejectReason::UnsupportedFormat => "format_miss",
+        FlashAttnCkRejectReason::UnsupportedHeadDim => "head_dim_miss",
+        FlashAttnCkRejectReason::InvalidGqa => "gqa_miss",
+        FlashAttnCkRejectReason::NonCausal => "non_causal",
+        FlashAttnCkRejectReason::NonContiguousPrefix => "non_contiguous_prefix",
+        FlashAttnCkRejectReason::GraphCapture => "graph_capture",
+        FlashAttnCkRejectReason::TreeAttention => "tree_attention",
+        FlashAttnCkRejectReason::WindowedAttention => "windowed_attention",
+        FlashAttnCkRejectReason::BlockAttention => "block_attention",
+        FlashAttnCkRejectReason::CapabilityMiss => "capability_miss",
     }
 }
 

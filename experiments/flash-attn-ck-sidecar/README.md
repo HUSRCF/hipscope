@@ -110,3 +110,17 @@ HIPFIRE_FLASH_ATTN_CK_TEST_LIB="$PWD/experiments/flash-attn-ck-sidecar/build/lib
 
 Serving selection remains fail-closed and occurs only after native KV-tier
 resolution. Loading a sidecar alone cannot route an unsupported layout to CK.
+
+Build a serving binary with `flash-attn-ck`, then opt in with both an exact-arch
+artifact and an explicitly sized startup allocation:
+
+```bash
+cargo build --release -p hipfire-daemon --features deltanet,flash-attn-ck
+HIPFIRE_FLASH_ATTN_CK_LIB=/opt/hipfire/ck/gfx1100/libhipfire_flash_attn_ck.so \
+HIPFIRE_FLASH_ATTN_CK_WORKSPACE_BYTES=536870912 \
+  target/release/daemon
+```
+
+The workspace is allocated once when `Gpu` is created. Missing or insufficient
+workspace produces a one-time route reason and retains native attention. Use
+`scripts/bench_ck_q8_prefill_ab.sh` for a reproducible production-path A/B.
