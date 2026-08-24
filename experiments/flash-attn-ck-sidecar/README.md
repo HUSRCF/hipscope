@@ -37,6 +37,10 @@ Q transforms and decode packed K and Q8 V into caller-owned F16 staging before
 invoking CK. Both D512 layouts remain `recognized-no-cell`: their layouts are
 validated but no capability is published. This keeps each unimplemented packed
 loader fail-closed.
+Asym4-Givens and Asym4-FWHT also have independent format IDs and packed-loader
+contracts. Both are currently `recognized-no-cell`: D256 K uses `4 + D/2`
+bytes per head, Q8 V uses `(D/32) * 34`, Givens requires `D/2` transform
+elements, and FWHT4+Q8-V requires 128. No Asym4 capability is published yet.
 Packed staging currently requires contiguous `[row, head, dim]` Q and output;
 the ABI validator rejects non-contiguous element strides rather than ignoring them.
 The Rust loader accepts ABI v3 sidecars for their original dense/Q8 cells by
