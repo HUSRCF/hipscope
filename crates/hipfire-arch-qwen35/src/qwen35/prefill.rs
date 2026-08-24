@@ -98,11 +98,69 @@ use rdna_compute::GpuTensor;
 /// to replay GDN recurrence from a pre-verify S-state snapshot for
 /// `accept_len + 1` steps — no full-target re-run needed.
 #[allow(clippy::too_many_arguments)]
-/// Upper bound on `forward_prefill_batch`'s per-chunk size. Exposed so
-/// callers sizing `HiddenStateRingBuffer` staging can match the chunk
-/// upper bound (staging that's smaller than a chunk will assert-fail
-/// on prompt seeding of long prompts).
+/// Conservative cross-arch upper bound on `forward_prefill_batch`'s per-chunk
+/// size. Adaptive-KV outer boundaries, eviction hard-caps, and callers that
+/// need a fixed staging ceiling still use this constant. Production default
+/// chunking is arch-aware via [`prefill_max_batch`] (measured 512 on exact
+/// gfx1100, 384 on exact gfx1201; 256 elsewhere). Exposed so callers sizing
+/// `HiddenStateRingBuffer` staging can match a safe chunk ceiling (staging
+/// smaller than a chunk will assert-fail on prompt seeding of long prompts).
 pub const PREFILL_MAX_BATCH: usize = 256;
+
+/// gfx1100-measured default prefill chunk size (Qwen3.8 / MQ4V2 gate-up BT path).
+/// Exact `gfx1100` only — not gfx1101/1102/1151 or other gfx11 variants.
+const PREFILL_DEFAULT_BATCH_GFX1100: usize = 512;
+
+/// gfx1201-measured default prefill chunk size (Qwen3.8 prefill sweet spot).
+/// Exact `gfx1201` only — not gfx1200 or other gfx12 variants.
+const PREFILL_DEFAULT_BATCH_GFX1201: usize = 384;
+
+/// Architecture default for prefill chunk size when
+/// `HIPFIRE_PREFILL_MAX_BATCH` is unset or invalid.
+#[inline]
+fn prefill_max_batch_for_arch(arch: &str) -> usize {
+    if arch == "gfx1100" {
+        PREFILL_DEFAULT_BATCH_GFX1100
+    } else if arch == "gfx1201" {
+        PREFILL_DEFAULT_BATCH_GFX1201
+    } else {
+        PREFILL_MAX_BATCH
+    }
+}
+
+/// Resolve the prefill chunk upper bound for `gpu`.
+///
+/// Honors explicit `HIPFIRE_PREFILL_MAX_BATCH` when it parses as an integer
+/// `>= MIN_BATCH` (2); otherwise returns the arch default — 512 on exact
+/// gfx1100, 384 on exact gfx1201, [`PREFILL_MAX_BATCH`] (256) on every other
+/// arch string. Capped entry points further min with an explicit caller
+/// ceiling via `prefill_max_batch(gpu).min(max_batch_cap)`.
+pub fn prefill_max_batch(gpu: &Gpu) -> usize {
+    hipfire_config::developer_var("HIPFIRE_PREFILL_MAX_BATCH")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&v| v >= MIN_BATCH)
+        .unwrap_or_else(|| prefill_max_batch_for_arch(gpu.arch.as_str()))
+}
+
+/// Effective per-chunk capacity for one prefill call.
+///
+/// Never form a chunk larger than the configured/capped max, the PBS
+/// staging owner, or (when present) the hidden-ring staging owner. A
+/// `HiddenStateRingBuffer` sized to 256 therefore cannot receive a 384/512-row
+/// write even when an arch default exceeds 256.
+#[inline]
+fn prefill_effective_chunk_batch(
+    configured_max_batch: usize,
+    pbs_max_batch: usize,
+    hidden_rb_max_batch: Option<usize>,
+) -> usize {
+    let mut cap = configured_max_batch.min(pbs_max_batch);
+    if let Some(hb) = hidden_rb_max_batch {
+        cap = cap.min(hb);
+    }
+    cap
+}
 
 pub(crate) const MOE_GROUPED_BLOCK_M: usize = 16;
 
@@ -434,6 +492,12 @@ pub fn forward_prefill_batch_single_chunk_captured_opts(
     )
 }
 
+/// Batched prefill entry point. Chunk ceiling is arch-aware via
+/// [`prefill_max_batch`] (512 on exact gfx1100, 384 on exact gfx1201). Use
+/// [`forward_prefill_batch_capped`] when internal owned-PBS chunks must stay
+/// at a hard staging budget (e.g. eviction ≤ 256), and pass a hidden ring
+/// whose `max_batch` will also bound actual chunks.
+#[allow(clippy::too_many_arguments)]
 pub fn forward_prefill_batch(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,
@@ -467,6 +531,53 @@ pub fn forward_prefill_batch(
     )
 }
 
+/// Like [`forward_prefill_batch`], but forces the configured chunk ceiling
+/// through `prefill_max_batch(gpu).min(max_batch_cap)` before owned-PBS
+/// planning and chunking.
+///
+/// Use when the caller keeps a larger outer window (eviction cadence,
+/// adaptive maybe_evict) but must not allocate or form internal chunks above
+/// a hard staging budget (typically [`PREFILL_MAX_BATCH`] = 256). Preserves
+/// ordinary defaults: `scratch.prefill_batch`, no mask override, full stack
+/// (`max_layer = None`), last-token logits enabled.
+#[allow(clippy::too_many_arguments)]
+pub fn forward_prefill_batch_capped(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    tokens: &[u32],
+    start_pos: usize,
+    kv_cache: &mut llama::KvCache,
+    dn_state: &mut DeltaNetState,
+    scratch: &Qwen35Scratch,
+    hidden_rb: Option<&mut HiddenStateRingBuffer>,
+    per_token_hidden_out: Option<&GpuTensor>,
+    gdn_tape: Option<&mut crate::speculative::GdnTape>,
+    tree_verify: Option<TreeVerifyCtx<'_>>,
+    max_batch_cap: usize,
+) -> HipResult<()> {
+    forward_prefill_batch_with_pbs_opts_inner(
+        gpu,
+        weights,
+        config,
+        tokens,
+        start_pos,
+        kv_cache,
+        dn_state,
+        scratch,
+        hidden_rb,
+        per_token_hidden_out,
+        gdn_tape,
+        tree_verify,
+        scratch.prefill_batch.as_ref(),
+        None,
+        None,
+        true,
+        Some(max_batch_cap),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn forward_prefill_batch_with_pbs(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,
@@ -508,17 +619,62 @@ pub fn forward_prefill_batch_with_pbs(
 /// so the ~25 per-cycle tensor allocations can be amortized across many calls.
 ///
 /// `pbs = None` allocates and frees a right-sized scratch per call;
-/// `pbs = Some(&pbs)` reuses the provided scratch. The provided scratch's
-/// `max_batch` determines the chunk size — `tokens` is processed in chunks of
-/// up to `pbs.max_batch`. Callers driving DFlash verify should size `pbs`
-/// to the maximum block size they'll ever request (e.g. `block_size` or
-/// `1 + tree_budget`) so everything fits in one chunk.
+/// `pbs = Some(&pbs)` reuses the provided scratch. Chunk size is the minimum of
+/// the configured/arch max ([`prefill_max_batch`]), `pbs.max_batch`, and
+/// `hidden_rb.max_batch` when a hidden ring is supplied — never larger than any
+/// staging owner. Callers driving DFlash verify should size `pbs` (and hidden
+/// staging) to the maximum block they will request so everything fits in one
+/// chunk, or accept multi-chunk commits.
 ///
 /// `needs_last_token_logits = false` is only for callers that pass
 /// `per_token_hidden_out` and compute their own logits from those hidden rows.
 /// The default wrapper keeps this true to protect existing callers that rely on
 /// `scratch.logits` being populated with the last token's logits.
+///
+/// For an explicit hard ceiling on owned-PBS planning (eviction path), use
+/// [`forward_prefill_batch_capped`] instead of threading a private cap here.
+#[allow(clippy::too_many_arguments)]
 pub fn forward_prefill_batch_with_pbs_opts(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    tokens: &[u32],
+    start_pos: usize,
+    kv_cache: &mut llama::KvCache,
+    dn_state: &mut DeltaNetState,
+    scratch: &Qwen35Scratch,
+    hidden_rb: Option<&mut HiddenStateRingBuffer>,
+    per_token_hidden_out: Option<&GpuTensor>,
+    gdn_tape: Option<&mut crate::speculative::GdnTape>,
+    tree_verify: Option<TreeVerifyCtx<'_>>,
+    pbs_in: Option<&PrefillBatchScratch>,
+    mask_override: Option<MaskEmbedOverride<'_>>,
+    max_layer: Option<usize>,
+    needs_last_token_logits: bool,
+) -> HipResult<()> {
+    forward_prefill_batch_with_pbs_opts_inner(
+        gpu,
+        weights,
+        config,
+        tokens,
+        start_pos,
+        kv_cache,
+        dn_state,
+        scratch,
+        hidden_rb,
+        per_token_hidden_out,
+        gdn_tape,
+        tree_verify,
+        pbs_in,
+        mask_override,
+        max_layer,
+        needs_last_token_logits,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn forward_prefill_batch_with_pbs_opts_inner(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,
     config: &Qwen35Config,
@@ -535,6 +691,7 @@ pub fn forward_prefill_batch_with_pbs_opts(
     mask_override: Option<MaskEmbedOverride<'_>>,
     max_layer: Option<usize>,
     needs_last_token_logits: bool,
+    max_batch_cap: Option<usize>,
 ) -> HipResult<()> {
     // Plain single-token AR decode? Only then is the per-token `forward_scratch`
     // call below eligible for the AR-forward hipGraph (capture/replay). Any spec
@@ -552,19 +709,25 @@ pub fn forward_prefill_batch_with_pbs_opts(
     //
     // Tuning note: each extra chunk pays full dispatch-overhead for the LA
     // preamble (rmsnorm, rotate, 4-way fused GEMM) and FFN (gate_up + down).
-    // 256 costs ~80 MB of scratch on 9B vs 20 MB at 64 — trivial on modern
-    // cards — and drops chunk count for pp2048 from 32 → 8. The inner
-    // gated_delta_net_q8_batch_seq loop is still sequential per token, so
-    // the per-chunk DeltaNet cost is linear in N either way; raising the
-    // batch just amortizes the NON-DeltaNet kernels more.
-    //
-    // Exposed via PREFILL_MAX_BATCH so callers sizing `HiddenStateRingBuffer`
-    // staging can match the chunk upper bound.
-    let max_batch: usize = hipfire_config::developer_var("HIPFIRE_PREFILL_MAX_BATCH")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|&v| v >= MIN_BATCH)
-        .unwrap_or(PREFILL_MAX_BATCH);
+    // The default is arch-aware via `prefill_max_batch`: measured 512 on
+    // exact gfx1100, measured 384 on exact gfx1201 (Qwen3.8 sweet spots),
+    // conservative `PREFILL_MAX_BATCH` (256) elsewhere. Override with
+    // `HIPFIRE_PREFILL_MAX_BATCH>=2`. An explicit `max_batch_cap` (from
+    // [`forward_prefill_batch_capped`]) mins on top. Actual chunks are further
+    // limited by PBS and hidden-ring staging so a 256-row ring can never
+    // receive a larger arch-default write. 256 costs ~80 MB of scratch on 9B
+    // vs 20 MB at 64 — trivial on modern cards — and drops chunk count for
+    // pp2048 from 32 → 8. The inner gated_delta_net_q8_batch_seq loop is
+    // still sequential per token, so the per-chunk DeltaNet cost is linear
+    // in N either way; raising the batch just amortizes the NON-DeltaNet
+    // kernels more.
+    let max_batch: usize = {
+        let configured = prefill_max_batch(gpu);
+        match max_batch_cap {
+            Some(cap) => configured.min(cap),
+            None => configured,
+        }
+    };
 
     let n = tokens.len();
     if n == 0 {
@@ -788,9 +951,9 @@ pub fn forward_prefill_batch_with_pbs_opts(
     // pairs on the hot verify path. When None, size the allocation to this
     // call's largest possible chunk and allocate the DeltaNet S-state tape only
     // for tree verify. Plain prefill never consumes that tape, and short
-    // prompts should not pay the full 256-row scratch footprint. The chunk size
-    // is `pbs.max_batch` so a caller-owned scratch sized to e.g. `block_size`
-    // or `1 + tree_budget` keeps DFlash verify in one chunk.
+    // prompts should not pay the full configured scratch footprint. Actual
+    // chunk length is min(configured/capped max, pbs.max_batch, hidden_rb
+    // staging) so no write exceeds a staging owner.
     let mut own_pbs: Option<PrefillBatchScratch> = None;
     let result = (|| -> HipResult<()> {
         let pbs: &PrefillBatchScratch = match pbs_in {
@@ -807,7 +970,11 @@ pub fn forward_prefill_batch_with_pbs_opts(
                 own_pbs.as_ref().unwrap()
             }
         };
-        let chunk_batch = pbs.max_batch;
+        let chunk_batch = prefill_effective_chunk_batch(
+            max_batch,
+            pbs.max_batch,
+            hidden_rb.as_ref().map(|rb| rb.max_batch),
+        );
         let mut chunk_start = 0usize;
         while chunk_start < n {
             let remaining = n - chunk_start;
@@ -1091,13 +1258,31 @@ pub(crate) fn is_batchable_la(dt: DType, arch: &str) -> bool {
             .ok()
             .as_deref()
             == Some("1");
-    // MQ4G256V2 / MQ4CG256 (qt44/qt45) batched prefill GEMM exists only on
-    // gfx12 (gfx1200/gfx1201). On gfx10/gfx11 there is no batched GEMM — the
-    // scalar fused decode path is correct and is used via per-token fallback
-    // rather than dispatching a gfx12 WMMA kernel. Lockstep with
-    // hipfire_runtime::llama::is_batchable_la.
-    let mq4_v2_gfx12 =
-        matches!(dt, DType::MQ4G256V2 | DType::MQ4CG256) && matches!(arch, "gfx1200" | "gfx1201");
+    // MQ4G256V2 (qt44) and MQ6/5/3/2G256V2 (qt47-50) batched prefill GEMM.
+    // Dedicated WMMA sources exist for BOTH gfx11
+    // (gfx1100/1101/1102/1150/1151, wave32 WMMA) and gfx12 (gfx1200/1201) —
+    // parity-proven on gfx1100/gfx1151 at rel-RMS 2.5e-4–4.0e-4 across
+    // residual/qkv/qkvza/gate_up K=256/512 N=16/64. Admit on HasWmma
+    // (gfx1100/1101/1102/1150/1151 + gfx1200/1201) but gate the gfx11 half
+    // behind HIPFIRE_MQV2_GFX11_WMMA != "0" — setting
+    // HIPFIRE_MQV2_GFX11_WMMA=0 restores the per-token fallback ONLY on
+    // gfx11, leaving gfx12 untouched. Lockstep with the HasWmma predicate
+    // on GemmMq*G256V2* keys and with gemm_mq*g256v2's has_wmma() guard.
+    // MQ4CG256 (qt45) remains gfx12-only until its gfx11 sibling lands.
+    let mqv2_with_wmma = matches!(
+        dt,
+        DType::MQ4G256V2
+            | DType::MQ6G256V2
+            | DType::MQ5G256V2
+            | DType::MQ3G256V2
+            | DType::MQ2G256V2
+    ) && mqv2_gfx11_wmma_enabled_from_env(
+        hipfire_config::developer_var("HIPFIRE_MQV2_GFX11_WMMA")
+            .ok()
+            .as_deref(),
+        arch,
+    );
+    let mq_other_gfx12 = matches!(dt, DType::MQ4CG256) && matches!(arch, "gfx1200" | "gfx1201");
 
     // BF16 calibration teacher (qt=16) — native BF16 GEMM on gfx942 (CDNA3
     // MFMA v_mfma_f32_16x16x16bf16_1k). Gated on arch == gfx942 so the
@@ -1115,8 +1300,28 @@ pub(crate) fn is_batchable_la(dt: DType, arch: &str) -> bool {
         || lloyd_mq4_with_gfx12_wmma
         || fp4_with_wmma
         || e8_with_wmma
-        || mq4_v2_gfx12
+        || mqv2_with_wmma
+        || mq_other_gfx12
         || bf16_with_gfx942
+}
+
+/// Helper for MQ2/3/4/5/6G256V2 (qt44,47-50) batched prefill admit: gfx12 always, gfx11
+/// gated by HIPFIRE_MQV2_GFX11_WMMA != "0". Public for testability, mirrors
+/// `mq6_batched_admit_enabled_from_env` / `q8_prefill_wmma_enabled_from_env`.
+/// `value` is the raw env var (None = unset → default ON); only Some("0")
+/// disables the gfx11 path. Gfx12 is unaffected by the env var.
+pub(crate) fn mqv2_gfx11_wmma_enabled_from_env(value: Option<&str>, arch: &str) -> bool {
+    let gfx11_enabled = value != Some("0");
+    if matches!(arch, "gfx1200" | "gfx1201") {
+        true
+    } else if matches!(
+        arch,
+        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151"
+    ) {
+        gfx11_enabled
+    } else {
+        false
+    }
 }
 /// Single source of truth for per-layer batchability and checked geometry.
 /// Called by `validate_ep_batch_compatibility`, `prefill_batch_pbs_eligible`,
@@ -3538,7 +3743,11 @@ fn batch_chunk_delta_net_attn(
             | DType::MQ4G256V2
             | DType::MQ4CG256
             | DType::MQ6G256
+            | DType::MQ6G256V2
+            | DType::MQ5G256V2
             | DType::MQ3G256
+            | DType::MQ3G256V2
+            | DType::MQ2G256V2
             | DType::MQ3G256Lloyd
             | DType::MFP4G32
     );
@@ -4109,7 +4318,11 @@ fn batch_chunk_delta_net_attn(
             | DType::MQ4G256V2
             | DType::MQ4CG256
             | DType::MQ6G256
+            | DType::MQ6G256V2
+            | DType::MQ5G256V2
             | DType::MQ3G256
+            | DType::MQ3G256V2
+            | DType::MQ2G256V2
             | DType::MQ3G256Lloyd
             | DType::MFP4G32
     );
@@ -4266,7 +4479,11 @@ fn batch_chunk_delta_net_ffn(
             | DType::MQ4G256V2
             | DType::MQ4CG256
             | DType::MQ6G256
+            | DType::MQ6G256V2
+            | DType::MQ5G256V2
             | DType::MQ3G256
+            | DType::MQ3G256V2
+            | DType::MQ2G256V2
             | DType::MQ3G256Lloyd
             | DType::MFP4G32
     );
@@ -4435,7 +4652,11 @@ fn batch_chunk_delta_net_ffn(
             | DType::MQ4G256V2
             | DType::MQ4CG256
             | DType::MQ6G256
+            | DType::MQ6G256V2
+            | DType::MQ5G256V2
             | DType::MQ3G256
+            | DType::MQ3G256V2
+            | DType::MQ2G256V2
             | DType::MQ3G256Lloyd
             | DType::MFP4G32
     );
@@ -4603,7 +4824,11 @@ fn batch_chunk_full_attn_attn(
             | DType::MQ4G256V2
             | DType::MQ4CG256
             | DType::MQ6G256
+            | DType::MQ6G256V2
+            | DType::MQ5G256V2
             | DType::MQ3G256
+            | DType::MQ3G256V2
+            | DType::MQ2G256V2
             | DType::MQ3G256Lloyd
             | DType::MFP4G32
     );
@@ -4983,7 +5208,11 @@ fn batch_chunk_full_attn_attn(
             | DType::MQ4G256V2
             | DType::MQ4CG256
             | DType::MQ6G256
+            | DType::MQ6G256V2
+            | DType::MQ5G256V2
             | DType::MQ3G256
+            | DType::MQ3G256V2
+            | DType::MQ2G256V2
             | DType::MQ3G256Lloyd
             | DType::MFP4G32
     );
@@ -5138,7 +5367,11 @@ fn batch_chunk_full_attn_ffn(
             | DType::MQ4G256V2
             | DType::MQ4CG256
             | DType::MQ6G256
+            | DType::MQ6G256V2
+            | DType::MQ5G256V2
             | DType::MQ3G256
+            | DType::MQ3G256V2
+            | DType::MQ2G256V2
             | DType::MQ3G256Lloyd
             | DType::MFP4G32
     );
@@ -5296,7 +5529,11 @@ fn batch_chunk_full_attn_ffn(
             | DType::MQ4G256V2
             | DType::MQ4CG256
             | DType::MQ6G256
+            | DType::MQ6G256V2
+            | DType::MQ5G256V2
             | DType::MQ3G256
+            | DType::MQ3G256V2
+            | DType::MQ2G256V2
             | DType::MQ3G256Lloyd
             | DType::MFP4G32
     );
@@ -5524,7 +5761,14 @@ fn batch_chunk_delta_net_moe(
     // at Q8 alongside the Q8 router + shared_expert_gate).
     let is_mq = matches!(
         layer.wqkv.gpu_dtype,
-        DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ4CG256 | DType::MQ6G256
+        DType::MQ4G256
+            | DType::MQ4G256V2
+            | DType::MQ4CG256
+            | DType::MQ6G256
+            | DType::MQ6G256V2
+            | DType::MQ5G256V2
+            | DType::MQ3G256V2
+            | DType::MQ2G256V2
     );
     let is_6bit = matches!(layer.wqkv.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
     let is_q8 = matches!(layer.wqkv.gpu_dtype, DType::Q8_0);
@@ -6284,7 +6528,14 @@ fn batch_chunk_full_attn_moe(
     // wiring lives in a separate PR (see followup issue).
     let qkv_is_mq = matches!(
         layer.wq.gpu_dtype,
-        DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ4CG256 | DType::MQ6G256
+        DType::MQ4G256
+            | DType::MQ4G256V2
+            | DType::MQ4CG256
+            | DType::MQ6G256
+            | DType::MQ6G256V2
+            | DType::MQ5G256V2
+            | DType::MQ3G256V2
+            | DType::MQ2G256V2
     );
     let qkv_is_6bit = matches!(layer.wq.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
     let qkv_is_q8 = matches!(layer.wq.gpu_dtype, DType::Q8_0);
@@ -7667,6 +7918,82 @@ fn batched_gemm_single_weight(
                 n,
             )
         }
+        DType::MQ6G256V2 => {
+            let bytes = w.m * n * 4;
+            if let Some(stream) = gpu.active_stream.as_ref() {
+                gpu.hip.memset_async(&y.buf, 0, bytes, stream)?;
+            } else {
+                gpu.hip.memset(&y.buf, 0, bytes)?;
+            }
+            run_residual_gemm_key(
+                gpu,
+                hipfire_dispatch::types::KernelKey::GemmMq6G256V2Residual,
+                &w.buf,
+                w.gpu_dtype,
+                x,
+                y,
+                w.m,
+                w.k,
+                n,
+            )
+        }
+        DType::MQ5G256V2 => {
+            let bytes = w.m * n * 4;
+            if let Some(stream) = gpu.active_stream.as_ref() {
+                gpu.hip.memset_async(&y.buf, 0, bytes, stream)?;
+            } else {
+                gpu.hip.memset(&y.buf, 0, bytes)?;
+            }
+            run_residual_gemm_key(
+                gpu,
+                hipfire_dispatch::types::KernelKey::GemmMq5G256V2Residual,
+                &w.buf,
+                w.gpu_dtype,
+                x,
+                y,
+                w.m,
+                w.k,
+                n,
+            )
+        }
+        DType::MQ3G256V2 => {
+            let bytes = w.m * n * 4;
+            if let Some(stream) = gpu.active_stream.as_ref() {
+                gpu.hip.memset_async(&y.buf, 0, bytes, stream)?;
+            } else {
+                gpu.hip.memset(&y.buf, 0, bytes)?;
+            }
+            run_residual_gemm_key(
+                gpu,
+                hipfire_dispatch::types::KernelKey::GemmMq3G256V2Residual,
+                &w.buf,
+                w.gpu_dtype,
+                x,
+                y,
+                w.m,
+                w.k,
+                n,
+            )
+        }
+        DType::MQ2G256V2 => {
+            let bytes = w.m * n * 4;
+            if let Some(stream) = gpu.active_stream.as_ref() {
+                gpu.hip.memset_async(&y.buf, 0, bytes, stream)?;
+            } else {
+                gpu.hip.memset(&y.buf, 0, bytes)?;
+            }
+            run_residual_gemm_key(
+                gpu,
+                hipfire_dispatch::types::KernelKey::GemmMq2G256V2Residual,
+                &w.buf,
+                w.gpu_dtype,
+                x,
+                y,
+                w.m,
+                w.k,
+                n,
+            )
+        }
         DType::MQ3G256 => {
             // Same pattern as MQ6: no non-residual batched HFQ3 GEMM
             // exists in the scalar gfx10 family — `gemm_hfq3g256_residual`
@@ -7714,8 +8041,8 @@ fn batched_gemm_single_weight(
             0,
             &format!(
                 "mixed-format batched prefill: weight dtype {other:?} has no \
-             single-weight batched dispatch yet. Currently MQ3/HFQ3, \
-             MQ4/MQ4V2/MQ4C/HFQ4, MQ6/HFQ6, and Q8_0 mixes are wired. Re-quantize with \
+             single-weight batched dispatch yet. Currently MQ3/HFQ3, MQ6/5/3/2V2, \
+             MQ4/MQ4V2/MQ4C/HFQ4, MQ6/HFQ6, MQ6/5/3/2V2, and Q8_0 mixes are wired. Re-quantize with \
              uniform format or extend `batched_gemm_single_weight` to cover this format."
             ),
         )),
@@ -7738,6 +8065,53 @@ mod tests {
         assert!(paro_batched_admit_enabled_from_env(Some("1")));
         assert!(!paro_batched_admit_enabled_from_env(Some("surprise")));
         assert!(!paro_batched_admit_enabled_from_env(Some("0")));
+    }
+
+    #[test]
+    fn prefill_max_batch_arch_defaults() {
+        // Exact gfx1100 / gfx1201 alone get the measured defaults; every other
+        // string keeps the conservative PREFILL_MAX_BATCH=256 ceiling.
+        // Pure helper — no process env mutation.
+        assert_eq!(prefill_max_batch_for_arch("gfx1100"), 512);
+        assert_eq!(
+            prefill_max_batch_for_arch("gfx1100"),
+            PREFILL_DEFAULT_BATCH_GFX1100
+        );
+        assert_eq!(prefill_max_batch_for_arch("gfx1201"), 384);
+        assert_eq!(
+            prefill_max_batch_for_arch("gfx1201"),
+            PREFILL_DEFAULT_BATCH_GFX1201
+        );
+        for arch in ["gfx1200", "gfx1151", "gfx942", "unknown"] {
+            assert_eq!(
+                prefill_max_batch_for_arch(arch),
+                PREFILL_MAX_BATCH,
+                "arch default must stay {PREFILL_MAX_BATCH} on {arch}"
+            );
+        }
+    }
+
+    #[test]
+    fn prefill_effective_chunk_hidden_ring_caps_over_configured_and_pbs() {
+        // DFlash / prompt-seed staging is commonly 256 while gfx1201 default is 384.
+        assert_eq!(
+            prefill_effective_chunk_batch(384, 384, Some(256)),
+            256,
+            "hidden_rb=256 must never receive a 384-row chunk"
+        );
+        assert_eq!(prefill_effective_chunk_batch(384, 512, Some(256)), 256);
+        assert_eq!(prefill_effective_chunk_batch(256, 384, Some(128)), 128);
+    }
+
+    #[test]
+    fn prefill_effective_chunk_explicit_cap_wins_over_larger_pbs() {
+        // Eviction capped path: configured/capped max is already min'd to 256.
+        assert_eq!(prefill_effective_chunk_batch(256, 384, None), 256);
+        assert_eq!(prefill_effective_chunk_batch(256, 256, None), 256);
+        // Ordinary no-hidden/no-cap gfx1201 keeps the 384 win when PBS matches.
+        assert_eq!(prefill_effective_chunk_batch(384, 384, None), 384);
+        // Caller-owned PBS smaller than configured still bounds the chunk.
+        assert_eq!(prefill_effective_chunk_batch(384, 128, None), 128);
     }
 
     // ── Qwen3.5 dispatch: is_batchable_la ────────────────────────
@@ -7797,29 +8171,233 @@ mod tests {
     }
 
     #[test]
-    fn qwen35_is_batchable_la_mq4_v2_gfx12_only() {
-        // MQ4G256V2 / MQ4CG256 batched prefill is gfx12-only; other arches
-        // fall back to per-token scalar fused decode (no batched GEMM).
-        for arch in ["gfx1200", "gfx1201"] {
+    fn qwen35_is_batchable_la_mq4_v2_gfx11_and_gfx12() {
+        // MQ4G256V2 (qt44) now batches on gfx11 (gfx1100/1101/1102/1150/1151)
+        // and gfx12 via WMMA; MQ4CG256 remains gfx12-only. Proves the
+        // parity-proven WMMA kernels are admitted on HasWmma arches.
+        for arch in [
+            "gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151", "gfx1200", "gfx1201",
+        ] {
             assert!(
                 is_batchable_la(DType::MQ4G256V2, arch),
                 "MQ4G256V2 should batch on {arch}"
             );
+        }
+        // non-WMMA must still fall back
+        for arch in ["gfx1010", "gfx1030", "gfx942", "gfx906"] {
+            assert!(
+                !is_batchable_la(DType::MQ4G256V2, arch),
+                "MQ4G256V2 must fall back on {arch}"
+            );
+        }
+        // gfx12 unchanged already proven above, but explicitly re-prove
+        // that the admit set includes both gfx12 variants
+        assert!(is_batchable_la(DType::MQ4G256V2, "gfx1200"));
+        assert!(is_batchable_la(DType::MQ4G256V2, "gfx1201"));
+        // gfx1100/gfx1151 true (the two parity-proven parts)
+        assert!(is_batchable_la(DType::MQ4G256V2, "gfx1100"));
+        assert!(is_batchable_la(DType::MQ4G256V2, "gfx1151"));
+        // MQ4CG256 remains gfx12-only (must NOT widen)
+        for arch in ["gfx1200", "gfx1201"] {
             assert!(
                 is_batchable_la(DType::MQ4CG256, arch),
                 "MQ4CG256 should batch on {arch}"
             );
         }
-        for arch in ["gfx1010", "gfx1100", "gfx942"] {
-            assert!(
-                !is_batchable_la(DType::MQ4G256V2, arch),
-                "MQ4G256V2 must fall back on {arch}"
-            );
+        for arch in ["gfx1010", "gfx1100", "gfx1151", "gfx942"] {
             assert!(
                 !is_batchable_la(DType::MQ4CG256, arch),
                 "MQ4CG256 must fall back on {arch}"
             );
         }
+    }
+
+    #[test]
+    fn qwen35_is_batchable_la_mq4_v2_env_escape() {
+        // HIPFIRE_MQV2_GFX11_WMMA=0 restores fallback ONLY on gfx11; gfx12
+        // remains admitted. Use the helper directly to avoid global env
+        // mutation flakiness in parallel tests — is_batchable_la delegates
+        // to this helper verbatim.
+        for arch in ["gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151"] {
+            assert!(
+                !mqv2_gfx11_wmma_enabled_from_env(Some("0"), arch),
+                "env=0 should disable {arch}"
+            );
+            assert!(
+                mqv2_gfx11_wmma_enabled_from_env(None, arch),
+                "unset should enable {arch}"
+            );
+            assert!(
+                mqv2_gfx11_wmma_enabled_from_env(Some("1"), arch),
+                "env=1 should enable {arch}"
+            );
+        }
+        for arch in ["gfx1200", "gfx1201"] {
+            assert!(
+                mqv2_gfx11_wmma_enabled_from_env(Some("0"), arch),
+                "gfx12 unaffected by env=0 on {arch}"
+            );
+            assert!(
+                mqv2_gfx11_wmma_enabled_from_env(None, arch),
+                "gfx12 enabled without env on {arch}"
+            );
+        }
+        for arch in ["gfx1010", "gfx942", "gfx1030", "gfx1103", "gfx1152"] {
+            assert!(
+                !mqv2_gfx11_wmma_enabled_from_env(None, arch),
+                "non-WMMA {arch} must never admit"
+            );
+            assert!(
+                !mqv2_gfx11_wmma_enabled_from_env(Some("0"), arch),
+                "non-WMMA {arch} with env=0"
+            );
+            assert!(
+                !mqv2_gfx11_wmma_enabled_from_env(Some("1"), arch),
+                "non-WMMA {arch} with env=1"
+            );
+        }
+        // Prove gfx12 unchanged via is_batchable_la even with env=0 — the
+        // helper above shows helper-level, but also confirm the public gate:
+        // We cannot set env globally here without serializing tests, but
+        // helper's gfx12=true with env=0 proves the delegate will keep gfx12
+        // true when is_batchable_la reads HIPFIRE_MQV2_GFX11_WMMA=0.
+    }
+
+    #[test]
+    fn qwen35_is_batchable_la_v2_family_gfx11_and_gfx12() {
+        for arch in [
+            "gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151", "gfx1200", "gfx1201",
+        ] {
+            assert!(is_batchable_la(DType::MQ6G256V2, arch), "MQ6V2 on {arch}");
+            assert!(is_batchable_la(DType::MQ5G256V2, arch), "MQ5V2 on {arch}");
+            assert!(is_batchable_la(DType::MQ3G256V2, arch), "MQ3V2 on {arch}");
+            assert!(is_batchable_la(DType::MQ2G256V2, arch), "MQ2V2 on {arch}");
+        }
+        for arch in ["gfx942", "gfx1010", "gfx1030", "gfx1103", "gfx1152"] {
+            assert!(
+                !is_batchable_la(DType::MQ6G256V2, arch),
+                "MQ6V2 not on {arch}"
+            );
+            assert!(
+                !is_batchable_la(DType::MQ5G256V2, arch),
+                "MQ5V2 not on {arch}"
+            );
+            assert!(
+                !is_batchable_la(DType::MQ3G256V2, arch),
+                "MQ3V2 not on {arch}"
+            );
+            assert!(
+                !is_batchable_la(DType::MQ2G256V2, arch),
+                "MQ2V2 not on {arch}"
+            );
+        }
+        // Distinguish V2 from legacy: same group bytes but different DType
+        assert_ne!(DType::MQ6G256, DType::MQ6G256V2);
+        assert_ne!(DType::MQ3G256, DType::MQ3G256V2);
+        assert_ne!(DType::MQ4G256, DType::MQ4G256V2);
+        assert_ne!(DType::MQ4G256, DType::MQ6G256V2);
+        // Byte counts per contract
+        assert_eq!(rdna_compute::MQ6G256V2_GROUP_BYTES, 200);
+        assert_eq!(rdna_compute::MQ5G256V2_GROUP_BYTES, 168);
+        assert_eq!(rdna_compute::MQ3G256V2_GROUP_BYTES, 104);
+        assert_eq!(rdna_compute::MQ2G256V2_GROUP_BYTES, 72);
+        assert_eq!(rdna_compute::MQ4V2_GROUP_BYTES, 136);
+    }
+
+    #[test]
+    fn qwen35_v2_dense_keys_are_exact_no_hfq4_default() {
+        // Contract: every admitted V2 dtype maps 1:1 to its exact V2 kernel
+        // in every dense operation (plain, residual, QKV, QKVZA, gate_up).
+        // All V2 widths admit on both gfx11 and gfx12 (HasWmma); no qt47-50 falls into HFQ4/default/wildcard.
+        use crate::forward_slots::{
+            fused_gate_up_key_for, fused_qkv_key_for, fused_qkvza_key_for, residual_gemm_key_for,
+        };
+        use hipfire_dispatch::types::KernelKey;
+        use rdna_compute::DType;
+        let cases: &[(DType, KernelKey, KernelKey, KernelKey, KernelKey, &str)] = &[
+            (
+                DType::MQ6G256V2,
+                KernelKey::GemmMq6G256V2,
+                KernelKey::GemmMq6G256V2Residual,
+                KernelKey::FusedQkvMq6G256V2,
+                KernelKey::FusedQkvzaMq6G256V2,
+                "qt47",
+            ),
+            (
+                DType::MQ5G256V2,
+                KernelKey::GemmMq5G256V2,
+                KernelKey::GemmMq5G256V2Residual,
+                KernelKey::FusedQkvMq5G256V2,
+                KernelKey::FusedQkvzaMq5G256V2,
+                "qt48",
+            ),
+            (
+                DType::MQ3G256V2,
+                KernelKey::GemmMq3G256V2,
+                KernelKey::GemmMq3G256V2Residual,
+                KernelKey::FusedQkvMq3G256V2,
+                KernelKey::FusedQkvzaMq3G256V2,
+                "qt49",
+            ),
+            (
+                DType::MQ2G256V2,
+                KernelKey::GemmMq2G256V2,
+                KernelKey::GemmMq2G256V2Residual,
+                KernelKey::FusedQkvMq2G256V2,
+                KernelKey::FusedQkvzaMq2G256V2,
+                "qt50",
+            ),
+        ];
+        for (dt, exp_plain, exp_resid, exp_qkv, exp_qkvza, qt) in cases {
+            // plain GEMM via GemmFamily::resolve through direct key
+            // (plain keys are gfx12-only, but must be exact, not HFQ4)
+            assert_ne!(
+                *exp_plain,
+                KernelKey::GemmHfq4G256,
+                "{} plain must not be HFQ4",
+                qt
+            );
+            assert_ne!(
+                *exp_resid,
+                KernelKey::GemmHfq4G256Residual,
+                "{} residual must not be HFQ4",
+                qt
+            );
+            // fused helpers
+            assert_eq!(fused_qkv_key_for(*dt), *exp_qkv, "{} qkv", qt);
+            assert_eq!(fused_qkvza_key_for(*dt), *exp_qkvza, "{} qkvza", qt);
+            assert_eq!(
+                fused_gate_up_key_for(*dt),
+                match dt {
+                    DType::MQ6G256V2 => KernelKey::FusedGateUpMq6G256V2,
+                    DType::MQ5G256V2 => KernelKey::FusedGateUpMq5G256V2,
+                    DType::MQ3G256V2 => KernelKey::FusedGateUpMq3G256V2,
+                    DType::MQ2G256V2 => KernelKey::FusedGateUpMq2G256V2,
+                    _ => unreachable!(),
+                },
+                "{} gate_up",
+                qt
+            );
+            assert_eq!(
+                residual_gemm_key_for(*dt),
+                *exp_resid,
+                "{} resid helper",
+                qt
+            );
+            // Ensure helpers never return HFQ4 for V2
+            assert_ne!(fused_qkv_key_for(*dt), KernelKey::FusedQkvHfq4G256);
+            assert_ne!(fused_qkvza_key_for(*dt), KernelKey::FusedQkvzaHfq4G256);
+            assert_ne!(fused_gate_up_key_for(*dt), KernelKey::FusedGateUpHfq4G256);
+            assert_ne!(residual_gemm_key_for(*dt), KernelKey::GemmHfq4G256Residual);
+            // batchable on both gfx11 and gfx12 (HasWmma)
+            assert!(is_batchable_la(*dt, "gfx1201"));
+            assert!(is_batchable_la(*dt, "gfx1100"));
+        }
+        // Legacy must stay on HFQ4 path
+        assert_eq!(
+            crate::forward_slots::fused_qkv_key_for(DType::HFQ4G256),
+            KernelKey::FusedQkvHfq4G256
+        );
     }
 
     #[test]
@@ -8459,6 +9037,11 @@ mod tests {
         assert_eq!(owned_prefill_scratch_plan(32, 256, false), (32, false));
         assert_eq!(owned_prefill_scratch_plan(256, 256, false), (256, false));
         assert_eq!(owned_prefill_scratch_plan(1024, 256, false), (256, false));
+        // Capped-256 path: internal owned PBS splits at 256 even if arch default is 384.
+        assert_eq!(owned_prefill_scratch_plan(1024, 256, false), (256, false));
+        // Ordinary gfx1201 owned path may plan 384-row scratch.
+        assert_eq!(owned_prefill_scratch_plan(1024, 384, false), (384, false));
+        assert_eq!(owned_prefill_scratch_plan(200, 384, false), (200, false));
     }
 
     #[test]
@@ -8479,6 +9062,10 @@ mod tests {
         assert_eq!(plan(258, 256), vec![256, 2]);
         assert_eq!(plan(513, 256), vec![256, 255, 2]);
         assert_eq!(plan(129, 128), vec![127, 2]);
+        // 384-row ceiling (gfx1201 ordinary path).
+        assert_eq!(plan(384, 384), vec![384]);
+        assert_eq!(plan(385, 384), vec![383, 2]);
+        assert_eq!(plan(768, 384), vec![384, 384]);
     }
 
     #[test]
@@ -8490,6 +9077,7 @@ mod tests {
     fn owned_prefill_scratch_preserves_tree_verify_tape() {
         assert_eq!(owned_prefill_scratch_plan(22, 256, true), (22, true));
         assert_eq!(owned_prefill_scratch_plan(64, 64, true), (64, true));
+        assert_eq!(owned_prefill_scratch_plan(22, 384, true), (22, true));
     }
 
     #[test]

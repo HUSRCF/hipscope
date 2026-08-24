@@ -358,11 +358,64 @@ pub fn populate(registry: &mut KernelRegistry) {
         has_awq: false,
         tile: TileImpl::None,
     });
-    // Explicit MQ4G256V2/MQ4CG256 GEMM keys are gfx12-only (WMMA sources).
-    // Cross-RDNA scalar decode lives in fused/GEMV families, not here.
+    // MQ4G256V2 (qt44) GEMM keys are WMMA-only (dedicated WMMA sources for
+    // gfx11 wave32 and gfx12). Admit on HasWmma (gfx1100/1101/1102/1150/1151
+    // + gfx1200/1201) via the arch-aware residual/plain wrappers; non-WMMA
+    // arches have no scalar V2 source and must not be admitted. The other
+    // V2 widths (MQ6/5/3/2V2) and MQ4CG256 remain gfx12-only until their
+    // gfx11 WMMA siblings land. Cross-RDNA scalar decode lives in fused/GEMV
+    // families, not here.
+    registry.register(KernelVariant {
+        key: KernelKey::GemmMq6G256V2,
+        arch_required: ArchPredicate::HasWmma,
+        shape_gate: None,
+        steps: &[PipelineOp::Gemv],
+        has_awq: false,
+        tile: TileImpl::None,
+    });
+    registry.register(KernelVariant {
+        key: KernelKey::GemmMq5G256V2,
+        arch_required: ArchPredicate::HasWmma,
+        shape_gate: None,
+        steps: &[PipelineOp::Gemv],
+        has_awq: false,
+        tile: TileImpl::None,
+    });
     registry.register(KernelVariant {
         key: KernelKey::GemmMq4G256V2,
-        arch_required: ArchPredicate::HasWmmaGfx12,
+        arch_required: ArchPredicate::HasWmma,
+        shape_gate: None,
+        steps: &[PipelineOp::Gemv],
+        has_awq: false,
+        tile: TileImpl::None,
+    });
+    registry.register(KernelVariant {
+        key: KernelKey::GemmMq3G256V2,
+        arch_required: ArchPredicate::HasWmma,
+        shape_gate: None,
+        steps: &[PipelineOp::Gemv],
+        has_awq: false,
+        tile: TileImpl::None,
+    });
+    registry.register(KernelVariant {
+        key: KernelKey::GemmMq2G256V2,
+        arch_required: ArchPredicate::HasWmma,
+        shape_gate: None,
+        steps: &[PipelineOp::Gemv],
+        has_awq: false,
+        tile: TileImpl::None,
+    });
+    registry.register(KernelVariant {
+        key: KernelKey::GemmMq6G256V2Residual,
+        arch_required: ArchPredicate::HasWmma,
+        shape_gate: None,
+        steps: &[PipelineOp::Gemv],
+        has_awq: false,
+        tile: TileImpl::None,
+    });
+    registry.register(KernelVariant {
+        key: KernelKey::GemmMq5G256V2Residual,
+        arch_required: ArchPredicate::HasWmma,
         shape_gate: None,
         steps: &[PipelineOp::Gemv],
         has_awq: false,
@@ -370,7 +423,39 @@ pub fn populate(registry: &mut KernelRegistry) {
     });
     registry.register(KernelVariant {
         key: KernelKey::GemmMq4G256V2Residual,
-        arch_required: ArchPredicate::HasWmmaGfx12,
+        arch_required: ArchPredicate::HasWmma,
+        shape_gate: None,
+        steps: &[PipelineOp::Gemv],
+        has_awq: false,
+        tile: TileImpl::None,
+    });
+    registry.register(KernelVariant {
+        key: KernelKey::GemmMq3G256V2Residual,
+        arch_required: ArchPredicate::HasWmma,
+        shape_gate: None,
+        steps: &[PipelineOp::Gemv],
+        has_awq: false,
+        tile: TileImpl::None,
+    });
+    registry.register(KernelVariant {
+        key: KernelKey::GemmMq2G256V2Residual,
+        arch_required: ArchPredicate::HasWmma,
+        shape_gate: None,
+        steps: &[PipelineOp::Gemv],
+        has_awq: false,
+        tile: TileImpl::None,
+    });
+    registry.register(KernelVariant {
+        key: KernelKey::GemmMq6G256V2BatchedLmhead,
+        arch_required: ArchPredicate::HasWmma,
+        shape_gate: None,
+        steps: &[PipelineOp::Gemv],
+        has_awq: false,
+        tile: TileImpl::None,
+    });
+    registry.register(KernelVariant {
+        key: KernelKey::GemmMq5G256V2BatchedLmhead,
+        arch_required: ArchPredicate::HasWmma,
         shape_gate: None,
         steps: &[PipelineOp::Gemv],
         has_awq: false,
@@ -378,7 +463,23 @@ pub fn populate(registry: &mut KernelRegistry) {
     });
     registry.register(KernelVariant {
         key: KernelKey::GemmMq4G256V2BatchedLmhead,
-        arch_required: ArchPredicate::HasWmmaGfx12,
+        arch_required: ArchPredicate::HasWmma,
+        shape_gate: None,
+        steps: &[PipelineOp::Gemv],
+        has_awq: false,
+        tile: TileImpl::None,
+    });
+    registry.register(KernelVariant {
+        key: KernelKey::GemmMq3G256V2BatchedLmhead,
+        arch_required: ArchPredicate::HasWmma,
+        shape_gate: None,
+        steps: &[PipelineOp::Gemv],
+        has_awq: false,
+        tile: TileImpl::None,
+    });
+    registry.register(KernelVariant {
+        key: KernelKey::GemmMq2G256V2BatchedLmhead,
+        arch_required: ArchPredicate::HasWmma,
         shape_gate: None,
         steps: &[PipelineOp::Gemv],
         has_awq: false,
