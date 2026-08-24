@@ -800,6 +800,7 @@ mod tests {
         assert!(!f.gemma4_ple_batched_prefill);
         assert!(!f.gemma4_ple_branch_batched_prefill);
         assert!(!f.gemma4_ple_activation_fused_prefill);
+        assert!(f.flash_attn_ck_lib.is_none());
     }
 
     #[test]

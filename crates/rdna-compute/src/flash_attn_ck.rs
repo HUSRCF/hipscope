@@ -46,6 +46,7 @@ pub enum FlashAttnCkKvFormat {
 
 pub const FLASH_ATTN_CK_CAP_CAUSAL: u32 = 1 << 0;
 pub const FLASH_ATTN_CK_CAP_GQA: u32 = 1 << 1;
+const FLASH_ATTN_CK_KNOWN_CAP_FLAGS: u32 = FLASH_ATTN_CK_CAP_CAUSAL | FLASH_ATTN_CK_CAP_GQA;
 
 /// One exact-architecture layout cell exported by a sidecar artifact.
 #[repr(C)]
@@ -59,6 +60,59 @@ pub struct FlashAttnCkCapability {
     pub v_format: i32,
     pub head_dim: i32,
     pub flags: u32,
+}
+
+/// Backend-agnostic lookup key produced after native attention layout policy
+/// has resolved. Feature flags are requirements: a capability may advertise
+/// additional behavior, but it must contain every requested bit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FlashAttnCkRequest {
+    pub arch: FlashAttnCkArch,
+    pub dtype: FlashAttnCkDType,
+    pub k_format: FlashAttnCkKvFormat,
+    pub v_format: FlashAttnCkKvFormat,
+    pub head_dim: i32,
+    pub required_flags: u32,
+}
+
+impl FlashAttnCkCapability {
+    pub fn supports(&self, request: FlashAttnCkRequest) -> bool {
+        self.arch == request.arch as i32
+            && self.dtype == request.dtype as i32
+            && self.k_format == request.k_format as i32
+            && self.v_format == request.v_format as i32
+            && self.head_dim == request.head_dim
+            && self.flags & request.required_flags == request.required_flags
+    }
+
+    fn is_well_formed(&self) -> bool {
+        matches!(
+            self.arch,
+            value if value == FlashAttnCkArch::Gfx1100 as i32
+                || value == FlashAttnCkArch::Gfx1151 as i32
+                || value == FlashAttnCkArch::Gfx1201 as i32
+        ) && matches!(
+            self.dtype,
+            value if value == FlashAttnCkDType::F16 as i32
+                || value == FlashAttnCkDType::Bf16 as i32
+        ) && matches!(
+            self.k_format,
+            value if is_known_kv_format(value)
+        ) && matches!(
+            self.v_format,
+            value if is_known_kv_format(value)
+        ) && self.head_dim > 0
+            && self.flags & !FLASH_ATTN_CK_KNOWN_CAP_FLAGS == 0
+    }
+}
+
+fn is_known_kv_format(value: i32) -> bool {
+    value == FlashAttnCkKvFormat::DenseF16 as i32
+        || value == FlashAttnCkKvFormat::DenseBf16 as i32
+        || value == FlashAttnCkKvFormat::Q8 as i32
+        || value == FlashAttnCkKvFormat::Asym as i32
+        || value == FlashAttnCkKvFormat::Fwht as i32
+        || value == FlashAttnCkKvFormat::Lloyd as i32
 }
 
 /// Stable C layout shared with `hipfire_flash_attn_ck.h`.
@@ -307,6 +361,7 @@ impl FlashAttnCk {
             for cell in &cells {
                 if cell.abi_version != FLASH_ATTN_CK_ABI_VERSION
                     || cell.struct_size < std::mem::size_of::<FlashAttnCkCapability>() as u32
+                    || !cell.is_well_formed()
                 {
                     return Err(FlashAttnCkError::Call {
                         operation: "capability query",
@@ -330,6 +385,11 @@ impl FlashAttnCk {
 
     pub fn capabilities(&self) -> &[FlashAttnCkCapability] {
         &self.capabilities
+    }
+
+    pub fn supports(&self, request: FlashAttnCkRequest) -> bool {
+        request.required_flags & !FLASH_ATTN_CK_KNOWN_CAP_FLAGS == 0
+            && self.capabilities.iter().any(|cell| cell.supports(request))
     }
 
     pub fn workspace_bytes(&self, params: &FlashAttnCkFwdParams) -> usize {
@@ -418,6 +478,72 @@ mod tests {
         assert_eq!(std::mem::align_of::<FlashAttnCkCapability>(), 4);
         assert_eq!(std::mem::offset_of!(FlashAttnCkCapability, arch), 8);
         assert_eq!(std::mem::offset_of!(FlashAttnCkCapability, flags), 28);
+    }
+
+    fn dense_capability(arch: FlashAttnCkArch) -> FlashAttnCkCapability {
+        FlashAttnCkCapability {
+            abi_version: FLASH_ATTN_CK_ABI_VERSION,
+            struct_size: std::mem::size_of::<FlashAttnCkCapability>() as u32,
+            arch: arch as i32,
+            dtype: FlashAttnCkDType::F16 as i32,
+            k_format: FlashAttnCkKvFormat::DenseF16 as i32,
+            v_format: FlashAttnCkKvFormat::DenseF16 as i32,
+            head_dim: 64,
+            flags: FLASH_ATTN_CK_CAP_CAUSAL | FLASH_ATTN_CK_CAP_GQA,
+        }
+    }
+
+    #[test]
+    fn capability_matching_is_exact_except_for_flag_subset() {
+        let cell = dense_capability(FlashAttnCkArch::Gfx1100);
+        let request = FlashAttnCkRequest {
+            arch: FlashAttnCkArch::Gfx1100,
+            dtype: FlashAttnCkDType::F16,
+            k_format: FlashAttnCkKvFormat::DenseF16,
+            v_format: FlashAttnCkKvFormat::DenseF16,
+            head_dim: 64,
+            required_flags: FLASH_ATTN_CK_CAP_CAUSAL,
+        };
+        assert!(cell.supports(request));
+        assert!(!cell.supports(FlashAttnCkRequest {
+            arch: FlashAttnCkArch::Gfx1201,
+            ..request
+        }));
+        assert!(!cell.supports(FlashAttnCkRequest {
+            k_format: FlashAttnCkKvFormat::Q8,
+            v_format: FlashAttnCkKvFormat::Q8,
+            ..request
+        }));
+        assert!(!cell.supports(FlashAttnCkRequest {
+            head_dim: 128,
+            ..request
+        }));
+    }
+
+    #[test]
+    fn capability_validation_rejects_unknown_contract_values() {
+        let valid = dense_capability(FlashAttnCkArch::Gfx1151);
+        assert!(valid.is_well_formed());
+        assert!(!FlashAttnCkCapability {
+            arch: 9999,
+            ..valid
+        }
+        .is_well_formed());
+        assert!(!FlashAttnCkCapability {
+            k_format: 9999,
+            ..valid
+        }
+        .is_well_formed());
+        assert!(!FlashAttnCkCapability {
+            head_dim: 0,
+            ..valid
+        }
+        .is_well_formed());
+        assert!(!FlashAttnCkCapability {
+            flags: 1 << 31,
+            ..valid
+        }
+        .is_well_formed());
     }
 
     #[test]
