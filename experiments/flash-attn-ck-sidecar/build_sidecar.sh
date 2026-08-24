@@ -2,6 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${ROOT}/../.." && pwd)"
 FLASH_ATTN_ROOT="${FLASH_ATTN_ROOT:?set FLASH_ATTN_ROOT to a flash-attention checkout containing composable_kernel}"
 ROCM_PATH="${ROCM_PATH:-/opt/rocm}"
 GPU_ARCH="${GPU_ARCH:-gfx1100}"
@@ -114,6 +115,7 @@ COMMON_FLAGS=(
     -mllvm -amdgpu-early-inline-all=true
     -mllvm -amdgpu-function-calls=false
     -I"${ROOT}"
+    -I"${REPO_ROOT}/kernels/src"
     -I"${FMHA_DIR}"
     -I"${CK_ROOT}/include"
     -I"${CK_ROOT}/library/include"

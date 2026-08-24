@@ -8,7 +8,7 @@ The official extension is a PyTorch/pybind module and is hundreds of megabytes.
 Its public Python ABI is not usable from hipfire's Rust/raw-HIP runtime. This
 experiment instead compiles a selected CK instance set into a small library and
 exports a versioned C ABI. The library remains an optional runtime artifact.
-ABI v3 enumerates exact-architecture layout capabilities, distinguishes dense
+ABI v4 enumerates exact-architecture layout capabilities, distinguishes dense
 element strides from packed row-byte strides, and exposes a caller-owned
 workspace query. The first quantized cell stages through persistent caller
 scratch without allocating inside a stream-ordered launch.
@@ -20,6 +20,7 @@ Current scope:
 - MHA, MQA, and GQA;
 - dense FP16 head dimensions 64, 128, and 256;
 - gfx1100 F32-Q/Q8-K/Q8-V causal GQA at head dimensions 64, 128, and 256;
+- gfx1100 F32-Q/Asym3-Givens-K/Q8-V causal GQA at head dimension 256;
 - raw HIP stream and element-stride inputs.
 
 The Q8 cells vector-decode both packed caches into F16, invoke the CK D64/D128/D256
@@ -28,12 +29,14 @@ adapter; direct quantized CK and asym/FWHT/Lloyd layouts remain future cells.
 The D128 cell is capability-, selector-, and raw-ABI-validated; no local model
 currently reaches that cell through the production attention dispatcher.
 
-ABI v4 also defines, but does not yet publish, Asym3 execution cells. Givens
-and FWHT K caches have distinct format IDs, Q8 V remains a separate format,
-and callers provide explicit K/V row and head byte strides plus both transform
-tables. The contract smoke covers D256/D512 and deliberately returns
-`recognized-no-cell` after validating a well-formed layout. This keeps Asym3
-fail-closed until a decoder and CK execution cell pass numerical validation.
+ABI v4 gives Givens and FWHT K caches distinct format IDs; Q8 V remains a
+separate format, and callers provide explicit K/V row and head byte strides
+plus both transform tables. The D256 Givens cell rotates Q and decodes packed K
+and Q8 V into caller-owned F16 staging before invoking CK. D512 Givens and both
+FWHT shapes remain `recognized-no-cell`: their layouts are validated but no
+capability is published. This keeps each unimplemented packed loader fail-closed.
+Packed staging currently requires contiguous `[row, head, dim]` Q and output;
+the ABI validator rejects non-contiguous element strides rather than ignoring them.
 The Rust loader accepts ABI v3 sidecars for their original dense/Q8 cells by
 passing the unchanged v3 struct prefix; v3 quantized format IDs 4+ are rejected
 because their old generic meaning is not the explicit v4 Asym3 contract.
@@ -88,9 +91,10 @@ HIP_VISIBLE_DEVICES=0 \
   experiments/flash-attn-ck-sidecar/build/smoke_raw_abi
 ```
 
-The pure-HIP smoke runs dense FP16 MHA/MQA/GQA and packed Q8 D64/D128/D256 GQA cases
-against CPU references. The Q8 reference uses reconstructed quantized values,
-so it checks staging and attention independently of quantization error.
+The pure-HIP smoke runs dense FP16 MHA/MQA/GQA, packed Q8 D64/D128/D256 GQA,
+and Asym3-Givens D256 GQA cases against CPU references. Quantized references
+use reconstructed values, so they check packed loading and attention
+independently of quantization error.
 
 Validated on Radeon Pro W7900 / gfx1100 with ROCm 7.14:
 
@@ -105,6 +109,7 @@ Validated on Radeon Pro W7900 / gfx1100 with ROCm 7.14:
 | F32/Q8/Q8 GQA D64, causal | `5.394965e-05` | `7.127585e-06` |
 | F32/Q8/Q8 GQA D128, causal | `5.379319e-05` | `6.874457e-06` |
 | F32/Q8/Q8 GQA D256, causal | `4.766881e-05` | `7.248458e-06` |
+| F32/Asym3-Givens/Q8 GQA D256, causal | `6.110966e-05` | `1.009769e-05` |
 
 ## Optional Rust loader
 
