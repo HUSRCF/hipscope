@@ -77,6 +77,11 @@ impl<'a> AttnParams<'a> {
     }
 }
 
+#[inline]
+fn is_contiguous_prefill_prefix(pos: usize, batch_size: usize, max_ctx_len: usize) -> bool {
+    pos.checked_add(batch_size) == Some(max_ctx_len)
+}
+
 pub struct AttentionFamily {
     registry: KernelRegistry,
 }
@@ -1178,6 +1183,38 @@ fn dispatch_attend(
                 let ct = io.givens_cos.unwrap();
                 let st = io.givens_sin.unwrap();
                 let fp = io.flash_partials.unwrap();
+                let flash_force_off = matches!(
+                    hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL")
+                        .ok()
+                        .as_deref(),
+                    Some("0") | Some("off") | Some("false")
+                );
+                #[cfg(feature = "flash-attn-ck")]
+                if !flash_force_off {
+                    let contiguous_prefix =
+                        is_contiguous_prefill_prefix(io.pos, io.batch_size, io.max_ctx_len);
+                    if hip!(gpu.try_flash_attn_ck_asym3_givens_prefill(
+                        io.q,
+                        io.k_cache,
+                        io.v_cache,
+                        io.output,
+                        ct,
+                        st,
+                        io.batch_size,
+                        io.max_ctx_len,
+                        io.n_heads,
+                        io.n_kv_heads,
+                        io.head_dim,
+                        contiguous_prefix,
+                        io.tree_bias.is_some(),
+                        usize::try_from(plan.window).unwrap_or(usize::MAX),
+                        io.block_start,
+                        io.block_cols,
+                    ))? {
+                        return Ok(());
+                    }
+                }
+                let _ = flash_force_off;
                 hip!(gpu.attention_flash_asym3_batched_masked(
                     io.q,
                     io.k_cache,
@@ -1616,6 +1653,14 @@ const DISPATCHED_FULL_ATTENTION_KEYS: &[KernelKey] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ck_packed_prefill_requires_exact_contiguous_prefix_extent() {
+        assert!(is_contiguous_prefill_prefix(0, 512, 512));
+        assert!(is_contiguous_prefill_prefix(2048, 512, 2560));
+        assert!(!is_contiguous_prefill_prefix(2048, 512, 4096));
+        assert!(!is_contiguous_prefill_prefix(usize::MAX, 2, usize::MAX));
+    }
 
     #[test]
     fn gfx12_query16_default_envelope_is_conservative() {

@@ -137,5 +137,17 @@ HIPFIRE_FLASH_ATTN_CK_WORKSPACE_BYTES=536870912 \
 ```
 
 The workspace is allocated once when `Gpu` is created. Missing or insufficient
-workspace produces a one-time route reason and retains native attention. Use
-`scripts/bench_ck_q8_prefill_ab.sh` for a reproducible production-path A/B.
+workspace produces a one-time route reason and retains native attention. The
+Asym3 D256 cell is attempted only after the Qwen attention family has completed
+its native KV write and resolved a sequential, non-tree, non-windowed prefill;
+decode and graph capture remain native. Use `scripts/bench_ck_q8_prefill_ab.sh`
+with `KV_MODE=q8` or `KV_MODE=asym3` for a reproducible production-path A/B.
+The script also requires native and CK prefill to produce the same next-token ID.
+
+Qwen3.6-27B MQ4, Asym3 KV, W7900/gfx1100, warm process and identical fake prompt:
+
+| Prefill | Runs | Native median | CK median | Delta | Next token |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 512 | 2 | `836.5 tok/s` | `854.8 tok/s` | `+2.18%` | `29` / `29` |
+| 2048 | 3 | `780.9 tok/s` | `846.7 tok/s` | `+8.43%` | not recorded |
+| 8192 | 5 | `569.9 tok/s` | `795.2 tok/s` | `+39.53%` | `248046` / `248046` |
