@@ -263,6 +263,10 @@ fn fused_qk_rope_enabled() -> bool {
     }
 }
 
+fn ck_full_prefill_candidate(window: usize, batch_tokens: usize) -> bool {
+    window == 0 && batch_tokens > 1
+}
+
 /// Chunk size for batched prefill: 192 for prompts >= 512 tokens, else 256.
 /// Overridable via `HIPFIRE_GLIMMER_PREFILL_CHUNK` (clamped to 1-512); the
 /// rationale for the split is on the function body below.
@@ -3428,8 +3432,16 @@ fn prefill_chunk_batched(
                     && std::env::var("HIPFIRE_GLIMMER_WMMA_FULL")
                         .map(|v| v != "0" && !v.is_empty())
                         .unwrap_or(true);
-                let mut wmma_done = false;
-                if wmma_full {
+                let mut wmma_done = if ck_full_prefill_candidate(window, b) {
+                    gpu.try_flash_attn_ck_q8_prefill(
+                        &q, &k_cache_t, &v_cache_t, &attn_out, b, seq_len, n_heads, n_kv, hd, true,
+                        false, 0, 0, 0,
+                    )
+                    .map_err(|e| format!("glimmer prefill L{layer_idx} CK full: {e:?}"))?
+                } else {
+                    false
+                };
+                if wmma_full && !wmma_done {
                     if window == 0 {
                         gpu.attention_q8_0_flash_prefill_wmma(
                             &q, &k_cache_t, &v_cache_t, &attn_out, &pos_array, n_heads, n_kv, hd, b,
@@ -4117,4 +4129,17 @@ fn prefill_capture_impl(
     }
 
     last_logits.ok_or_else(|| "glimmer prefill: no logits produced".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ck_full_prefill_candidate;
+
+    #[test]
+    fn ck_candidate_is_only_full_multi_token_prefill() {
+        assert!(ck_full_prefill_candidate(0, 2));
+        assert!(ck_full_prefill_candidate(0, 2048));
+        assert!(!ck_full_prefill_candidate(0, 1));
+        assert!(!ck_full_prefill_candidate(2048, 2));
+    }
 }

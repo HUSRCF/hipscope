@@ -12,6 +12,31 @@ use hip_bridge::{DeviceBuffer, HipResult};
 use std::ffi::c_void;
 use std::sync::OnceLock;
 
+#[cfg(not(feature = "flash-attn-ck"))]
+impl Gpu {
+    /// Build-compatible fallback for architecture-private attention callers.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_flash_attn_ck_q8_prefill(
+        &mut self,
+        _q: &GpuTensor,
+        _k_cache: &GpuTensor,
+        _v_cache: &GpuTensor,
+        _output: &GpuTensor,
+        _seqlen_q: usize,
+        _seqlen_k: usize,
+        _nhead_q: usize,
+        _nhead_k: usize,
+        _head_dim: usize,
+        _contiguous_prefix: bool,
+        _has_tree_bias: bool,
+        _window: usize,
+        _block_start: usize,
+        _block_cols: usize,
+    ) -> HipResult<bool> {
+        Ok(false)
+    }
+}
+
 /// HIP `hipDeviceAttributeMaxSharedMemoryPerBlock` (CUDA-compatible block).
 /// Verified against ROCm 5.x/6.x/7.x headers: ordinal 74.
 const HIP_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK: i32 = 74;
