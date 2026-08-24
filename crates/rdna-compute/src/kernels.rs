@@ -2962,6 +2962,11 @@ pub const GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX11_BT_SRC: &str =
 /// format-specific base WMMA order and gfx11 interleaved-C contract.
 pub const GEMM_MQV2_WMMA_GFX11_BT_SRC: &str =
     include_str!("../../../kernels/src/gemm_mqv2_wmma_gfx11_bt.hip");
+/// Shared gfx1100/gfx1151 MQ{3,4,5,6}V2 multi-wave same-row LDS kernels.
+/// Gate/up and residual families instantiate MW4/MW8 over one generic
+/// compile-time bit decoder while preserving the accepted MQ4V2 geometry.
+pub const GEMM_MQV2_WMMA_GFX11_MW_LDS_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mqv2_wmma_gfx11_mw_lds.hip");
 /// Exact-gfx1100 multi-wave same-row LDS residual (production MW4/MW8).
 /// Sister of GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX11_BT_SRC: half16 + interleaved-C,
 /// 136 B dual-half headers, static 8 KiB tile-major LDS, symbols mw{4,8}_lds.
@@ -3062,6 +3067,10 @@ pub const GEMM_HFQ4G256_LMHEAD_WMMA_GFX12_SRC: &str =
 // at pp≥256.
 pub const GEMM_HFQ4G256_RESIDUAL_MMQ_SRC: &str =
     include_str!("../../../kernels/src/gemm_hfq4g256_residual_mmq.hip");
+// MQ4V2 qt44 sister of the RDNA3 Q8_1 MMQ family. Payload geometry is
+// unchanged; metadata loads select the dual fp16 header per 128-weight half.
+pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq.hip");
 // gfx12 (RDNA4) i8-WMMA MMQ port (single-wave 16-row tile, [32,1,1], LDS 0).
 // RDNA3's #if guard excludes gfx12, so RDNA4 needs this separate source.
 pub const GEMM_HFQ4G256_RESIDUAL_MMQ_GFX12_SRC: &str =

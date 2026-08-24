@@ -2101,7 +2101,7 @@ fn main() {
                 // request (rather than silently dropping the fields).
                 let tools_json: Option<Vec<serde_json::Value>> = match msg.get("tools") {
                     Some(v) => match serde_json::from_value::<Vec<serde_json::Value>>(v.clone()) {
-                        Ok(t) => Some(t),
+                        Ok(t) => (!t.is_empty()).then_some(t),
                         Err(e) => {
                             hipfire_generate::dense::emit_active_attempt_error(
                                 &mut stdout,
@@ -3303,6 +3303,14 @@ fn main() {
                     continue;
                 }
                 let n = msg.get("tokens").and_then(|v| v.as_u64()).unwrap_or(128) as usize;
+                let capture = msg
+                    .get("redline_capture")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let capture_detail = msg
+                    .get("redline_detail")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
                 // Guard physical_cap — reserve 32 slots of headroom so a subsequent
                 // generate request against the loaded model still has room. We guard
                 // on the *physical* buffer (not the advertised max_seq) because this
@@ -3348,6 +3356,20 @@ fn main() {
                 // measured interval, then time forward_prefill_batch + a
                 // trailing device_synchronize so we capture actual GPU
                 // completion (kernel launches are async by default).
+                if capture {
+                    if let Err(reason) = gpu.replay.begin_capture() {
+                        emit_uncorrelated_error(
+                            &mut stdout,
+                            None,
+                            &format!("redline prefill capture refused: {reason}"),
+                            "unsupported",
+                            false,
+                            false,
+                        );
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                }
                 let _ = gpu.hip.device_synchronize();
                 let t0 = Instant::now();
                 let mut prefill_err: Option<String> = None;
@@ -3364,6 +3386,11 @@ fn main() {
                 };
                 let _ = gpu.hip.device_synchronize();
                 let elapsed = t0.elapsed().as_secs_f64();
+                let capture_summary = if capture {
+                    gpu.replay.finish_capture().map(Some)
+                } else {
+                    Ok(None)
+                };
 
                 // Reset state AFTER measurement — we've written N KV slots and a
                 // DeltaNet state that the next real request must not inherit.
@@ -3380,6 +3407,21 @@ fn main() {
                         gpu.invalidate_graph_state();
                     }
                 }
+                let capture_summary = match capture_summary {
+                    Ok(summary) => summary,
+                    Err(reason) => {
+                        emit_uncorrelated_error(
+                            &mut stdout,
+                            None,
+                            &format!("redline prefill capture failed: {reason}"),
+                            "internal",
+                            false,
+                            false,
+                        );
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                };
 
                 if run_ok {
                     let tok_s = if elapsed > 0.0 {
@@ -3387,13 +3429,28 @@ fn main() {
                     } else {
                         0.0
                     };
-                    let _ = writeln!(
-                        stdout,
-                        r#"{{"type":"prefill_result","tokens":{},"ms":{:.2},"tok_s":{:.1}}}"#,
-                        n,
-                        elapsed * 1000.0,
-                        tok_s
-                    );
+                    if let Some(summary) = capture_summary {
+                        let response = serde_json::json!({
+                            "type": "prefill_result",
+                            "tokens": n,
+                            "ms": elapsed * 1000.0,
+                            "tok_s": tok_s,
+                            "redline_capture": redline_capture_json(
+                                &gpu,
+                                summary,
+                                capture_detail,
+                            ),
+                        });
+                        let _ = writeln!(stdout, "{response}");
+                    } else {
+                        let _ = writeln!(
+                            stdout,
+                            r#"{{"type":"prefill_result","tokens":{},"ms":{:.2},"tok_s":{:.1}}}"#,
+                            n,
+                            elapsed * 1000.0,
+                            tok_s
+                        );
+                    }
                 } else {
                     emit_uncorrelated_error(
                         &mut stdout,
