@@ -8,7 +8,7 @@
 //
 // Usage:
 //   hfq_overlay_bake <output.hfq> <base.hfq> <overlay.hfq> [expected-overrides]
-//     [--metadata-from-overlay]
+//     [--metadata-from-overlay] [--include-suffix <suffix>]...
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::convert::TryInto;
@@ -51,7 +51,7 @@ fn main() -> io::Result<()> {
     if args.len() < 4 {
         eprintln!(
             "usage: {} <output.hfq> <base.hfq> <overlay.hfq> [expected-overrides] \
-             [--metadata-from-overlay]",
+             [--metadata-from-overlay] [--include-suffix <suffix>]...",
             args[0]
         );
         std::process::exit(2);
@@ -62,6 +62,7 @@ fn main() -> io::Result<()> {
     let overlay = parse_hfq(Path::new(&args[3]))?;
     let mut expected_overrides = None;
     let mut metadata_from_overlay = false;
+    let mut include_suffixes = Vec::new();
     let mut index = 4usize;
     if args
         .get(index)
@@ -78,6 +79,13 @@ fn main() -> io::Result<()> {
     while index < args.len() {
         match args[index].as_str() {
             "--metadata-from-overlay" => metadata_from_overlay = true,
+            "--include-suffix" => {
+                index += 1;
+                let suffix = args
+                    .get(index)
+                    .ok_or_else(|| invalid("--include-suffix requires a value"))?;
+                include_suffixes.push(suffix.clone());
+            }
             other => return Err(invalid(format!("unknown option '{other}'"))),
         }
         index += 1;
@@ -97,12 +105,24 @@ fn main() -> io::Result<()> {
     let overlay_by_name: BTreeMap<&str, &TensorEntry> = overlay
         .tensors
         .iter()
+        .filter(|tensor| {
+            include_suffixes.is_empty()
+                || include_suffixes
+                    .iter()
+                    .any(|suffix| tensor.name.ends_with(suffix))
+        })
         .map(|tensor| (tensor.name.as_str(), tensor))
         .collect();
-    if overlay_by_name.len() != overlay.tensors.len() {
+    if include_suffixes.is_empty() && overlay_by_name.len() != overlay.tensors.len() {
         return Err(invalid("overlay contains duplicate tensor names"));
     }
-    for tensor in &overlay.tensors {
+    if !include_suffixes.is_empty() && overlay_by_name.is_empty() {
+        return Err(invalid(format!(
+            "no overlay tensors match suffixes {:?}",
+            include_suffixes
+        )));
+    }
+    for tensor in overlay_by_name.values() {
         if !base_names.contains(tensor.name.as_str()) {
             return Err(invalid(format!(
                 "overlay tensor '{}' is absent from the base",
@@ -111,10 +131,10 @@ fn main() -> io::Result<()> {
         }
     }
     if let Some(expected) = expected_overrides {
-        if overlay.tensors.len() != expected {
+        if overlay_by_name.len() != expected {
             return Err(invalid(format!(
-                "overlay tensor count {} != expected {expected}",
-                overlay.tensors.len()
+                "selected overlay tensor count {} != expected {expected}",
+                overlay_by_name.len()
             )));
         }
     }
@@ -198,7 +218,7 @@ fn main() -> io::Result<()> {
         "wrote {}: {} tensors, {} byte-identical overlay replacements ({:.2} GiB)",
         output.display(),
         tensors.len(),
-        overlay.tensors.len(),
+        overlay_by_name.len(),
         replacement_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
     );
     Ok(())
