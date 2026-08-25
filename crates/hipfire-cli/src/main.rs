@@ -47,9 +47,9 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 mod bench_concurrency;
 mod serve;
 mod setup;
-use crate::serve::{ServePidRecord, parse_pid_record, detach_serve, parse_host_port};
-use crate::serve::http::request_id;
 use crate::serve::complete::next_attempt_id;
+use crate::serve::http::request_id;
+use crate::serve::{detach_serve, parse_host_port, parse_pid_record, ServePidRecord};
 use setup::setup_command;
 
 pub(crate) const MODEL_SUFFIXES: &[&str] = &[
@@ -654,10 +654,12 @@ fn run() -> Result<()> {
         Some(Commands::Stop(args)) => crate::serve::stop_command(&paths, args),
         Some(Commands::Restart(args)) => {
             let port = args.positionals.iter().find_map(|value| {
-                value
-                    .parse::<u16>()
-                    .ok()
-                    .or_else(|| crate::serve::parse_host_port(value).ok().flatten().map(|(_, port)| port))
+                value.parse::<u16>().ok().or_else(|| {
+                    crate::serve::parse_host_port(value)
+                        .ok()
+                        .flatten()
+                        .map(|(_, port)| port)
+                })
             });
             let _ = crate::serve::stop_command(
                 &paths,
@@ -1929,9 +1931,7 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
     }
 
     let daemon = find_daemon(paths).ok_or_else(|| {
-        anyhow!(
-            "daemon binary not found; build `cargo build --release -p hipfire-daemon`"
-        )
+        anyhow!("daemon binary not found; build `cargo build --release -p hipfire-daemon`")
     })?;
     let process_config = hipfire_config::ProcessConfig::from_resolved(&resolved)?;
     let mut engine = Engine::spawn_configured(&daemon, &BTreeMap::new(), &process_config)?;
@@ -2274,7 +2274,6 @@ fn chat_command(paths: &Paths, args: ChatArgs) -> Result<()> {
     Ok(())
 }
 
-
 pub(crate) fn resolved_for_model(
     paths: &Paths,
     model_name: &str,
@@ -2326,7 +2325,52 @@ pub(crate) fn resolved_for_model(
     Ok(resolve(layers)?)
 }
 
-pub(crate) fn find_model_path(paths: &Paths, registry: &RegistryV1, model: &str) -> Option<PathBuf> {
+/// How [`scan_local_models`] compares an input against on-disk filenames.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MatchMode {
+    /// Compare the lowercased strings as written.
+    Literal,
+    /// Additionally strip `-`, `.` and `_` from both sides, so spellings that
+    /// differ only in separators compare equal (`ornith-1.5` ↔ `ornith1.5`).
+    IgnoreSeparators,
+}
+
+fn scan_local_models(local: &[PathBuf], search: &str, mode: MatchMode) -> Vec<PathBuf> {
+    let normalize = |value: &str| -> String {
+        let lower = value.to_ascii_lowercase();
+        match mode {
+            MatchMode::Literal => lower,
+            MatchMode::IgnoreSeparators => lower
+                .chars()
+                .filter(|c| !matches!(c, '-' | '.' | '_'))
+                .collect(),
+        }
+    };
+    let needle = normalize(search);
+    // A needle that normalizes to nothing (an input of only separators) would
+    // make `contains` true for every file and hand back an arbitrary model.
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    local
+        .iter()
+        .filter(|path| {
+            let name = normalize(
+                path.file_name()
+                    .and_then(|file| file.to_str())
+                    .unwrap_or_default(),
+            );
+            name == needle || name.contains(&needle)
+        })
+        .cloned()
+        .collect()
+}
+
+pub(crate) fn find_model_path(
+    paths: &Paths,
+    registry: &RegistryV1,
+    model: &str,
+) -> Option<PathBuf> {
     let direct = PathBuf::from(model);
     if direct.is_file() {
         return fs::canonicalize(direct).ok();
@@ -2350,18 +2394,22 @@ pub(crate) fn find_model_path(paths: &Paths, registry: &RegistryV1, model: &str)
     }
     let search = model.replace(':', "-").to_ascii_lowercase();
     let explicit_quant = MODEL_SUFFIXES.iter().any(|suffix| search.ends_with(suffix));
-    let mut candidates = local_model_paths(paths)
-        .ok()?
-        .into_iter()
-        .filter(|path| {
-            let name = path
-                .file_name()
-                .and_then(|file| file.to_str())
-                .unwrap_or_default()
-                .to_ascii_lowercase();
-            name == search || name.contains(&search)
-        })
-        .collect::<Vec<_>>();
+    let local = local_model_paths(paths).ok()?;
+    // Two passes. The first matches the literal spelling and is what has always
+    // run. The second retries with `-`, `.` and `_` stripped from both sides, so
+    // an input and an on-disk file that differ only in separators still meet:
+    // `ornith-1.5:35b-a3b` finds the `ornith1.5-35b-a3b.mq4` left on disk by
+    // anyone who downloaded before the artifacts were renamed.
+    //
+    // The fallback is strictly second — it runs only when the literal pass found
+    // nothing, so it can add a match where today there is none but can never
+    // change one that already resolves. That ordering is the safety argument:
+    // separator-stripping is a looser `contains`, and running it first would let
+    // it outrank an exact hit.
+    let mut candidates = scan_local_models(&local, &search, MatchMode::Literal);
+    if candidates.is_empty() {
+        candidates = scan_local_models(&local, &search, MatchMode::IgnoreSeparators);
+    }
     candidates.sort_by_key(|path| {
         let name = path
             .file_name()
@@ -2701,7 +2749,10 @@ pub(crate) fn config_value<'a>(
         .ok_or_else(|| anyhow!("missing resolved configuration key {key}"))
 }
 
-pub(crate) fn config_string(resolved: &hipfire_config::ResolvedConfig, key: &str) -> Result<String> {
+pub(crate) fn config_string(
+    resolved: &hipfire_config::ResolvedConfig,
+    key: &str,
+) -> Result<String> {
     match config_value(resolved, key)? {
         hipfire_config::ConfigValue::String(value) => Ok(value.clone()),
         value => bail!("{key} resolved as {}, expected string", value.kind()),
@@ -5372,16 +5423,15 @@ fn registry_source(source: RegistrySource) -> &'static str {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::serve::complete::{
-        Completion, ThinkFragment, forward_think_fragments, inject_default_system_message,
-        normalize_openai_messages,
+        forward_think_fragments, inject_default_system_message, normalize_openai_messages,
+        Completion, ThinkFragment,
     };
     use crate::serve::http::handle_http;
-    use crate::serve::{Admission, ServeMeta, ServeRuntime, ServeShared, serve_instance_token};
+    use crate::serve::{serve_instance_token, Admission, ServeMeta, ServeRuntime, ServeShared};
     use hipfire_config::CONFIG_PROFILE_NAMES;
     fn test_paths(label: &str) -> Paths {
         let nonce = std::time::SystemTime::now()
@@ -5417,8 +5467,6 @@ mod tests {
         }
     }
 
-
-
     #[test]
     fn model_suffix_filter_covers_current_formats() {
         assert!(is_model_file("qwen3.6-35b-a3b.mq4r"));
@@ -5428,6 +5476,75 @@ mod tests {
         assert!(is_model_file("draft.hfq"));
         assert!(!is_model_file("model.triattn.bin"));
         assert!(!is_model_file("README.md"));
+    }
+
+    /// The Ornith artifacts shipped briefly as `ornith1.5-*` before being
+    /// renamed to `ornith-1.5-*`. Anyone who downloaded during that window has
+    /// the old filename on disk, and the registry now points at the new one —
+    /// so the canonical tag must still find their file rather than silently
+    /// re-downloading 19 GB.
+    #[test]
+    fn separator_spellings_find_an_already_downloaded_file() {
+        let paths = test_paths("separator-spellings");
+        let legacy = paths.models.join("ornith1.5-35b-a3b.mq4");
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        fs::write(&legacy, b"fixture").unwrap();
+        let registry = hipfire_registry::bundled().unwrap();
+
+        // The new canonical spelling reaches the old file only via the
+        // separator-insensitive fallback — this is the case the rename broke.
+        assert_eq!(
+            find_model_path(&paths, &registry, "ornith-1.5:35b-a3b"),
+            Some(legacy.clone()),
+            "hyphenated tag must find the unhyphenated file"
+        );
+        // The old spelling already worked through the literal pass; pin it so
+        // the fallback cannot regress it.
+        assert_eq!(
+            find_model_path(&paths, &registry, "ornith1.5:35b-a3b"),
+            Some(legacy.clone()),
+            "legacy tag must keep working"
+        );
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    /// The fallback must not outrank a literal hit. With both spellings present
+    /// on disk, each input resolves to its own file, not to whichever the
+    /// looser comparison happened to reach first.
+    #[test]
+    fn literal_match_wins_over_the_separator_fallback() {
+        let paths = test_paths("separator-precedence");
+        let legacy = paths.models.join("ornith1.5-35b-a3b.mq4");
+        let renamed = paths.models.join("ornith-1.5-35b-a3b.mq4");
+        fs::create_dir_all(paths.models.as_path()).unwrap();
+        fs::write(&legacy, b"fixture").unwrap();
+        fs::write(&renamed, b"fixture").unwrap();
+        let registry = hipfire_registry::bundled().unwrap();
+
+        assert_eq!(
+            find_model_path(&paths, &registry, "ornith-1.5:35b-a3b"),
+            Some(renamed),
+            "exact spelling must win when it exists"
+        );
+        assert_eq!(
+            find_model_path(&paths, &registry, "ornith1.5:35b-a3b"),
+            Some(legacy),
+            "exact spelling must win when it exists"
+        );
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    /// An input that normalizes to the empty string must not match everything.
+    #[test]
+    fn separator_only_input_matches_nothing() {
+        let paths = test_paths("separator-empty");
+        let model = paths.models.join("qwen3.6-35b-a3b.mq4");
+        fs::create_dir_all(model.parent().unwrap()).unwrap();
+        fs::write(&model, b"fixture").unwrap();
+        let registry = hipfire_registry::bundled().unwrap();
+
+        assert_eq!(find_model_path(&paths, &registry, "-.-"), None);
+        fs::remove_dir_all(&paths.root).unwrap();
     }
 
     #[test]
@@ -5601,7 +5718,12 @@ mod tests {
         let registry = RegistryV1::parse(raw, "test").unwrap();
 
         // Exact Qwen families get VMM + 262144 + 81920
-        for tag in ["qwen3.5:4b", "qwen3.6:35b-a3b", "qwen3.8:27b", "qwen3.8:27b-fast"] {
+        for tag in [
+            "qwen3.5:4b",
+            "qwen3.6:35b-a3b",
+            "qwen3.8:27b",
+            "qwen3.8:27b-fast",
+        ] {
             let (_, entry) = registry.model(tag).unwrap();
             let resolved = resolved_for_model(&paths, tag, Some(tag), Some(entry)).unwrap();
             assert_eq!(
@@ -6083,9 +6205,6 @@ mod tests {
             "final off must drop projected developer.dflash_draft"
         );
     }
-
-
-
 
     #[test]
     pub(crate) fn artifact_urls_honor_endpoint_precedence() {
@@ -6925,7 +7044,6 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-
     #[test]
     fn run_options_after_prompt_and_tui_passthrough_parse() {
         let cli =
@@ -6943,9 +7061,6 @@ mod tests {
         };
         assert_eq!(args.arguments, ["--check"]);
     }
-
-
-
 
     #[test]
     fn registry_system_prompt_is_injected_only_when_client_omits_one() {
@@ -6971,7 +7086,6 @@ mod tests {
         assert_eq!(messages[0]["role"], "system");
         assert_eq!(messages[0]["content"], "client policy");
     }
-
 
     #[test]
     fn normalize_reasoning_sources_with_flag_on_and_off() {
@@ -7103,11 +7217,6 @@ mod tests {
         );
     }
 
-
-
-
-
-
     #[test]
     fn positional_model_config_scope_parses_without_stealing_global_actions() {
         let global = Cli::try_parse_from(["hipfire", "config", "list", "--json"]).unwrap();
@@ -7232,18 +7341,6 @@ mod tests {
         assert_eq!(config_rule_json(variant_field.rule)["maximum"], 5);
     }
 
-
-
-
-
-
-
-
-
-
-
-
-
     fn sample_completion(
         content: &str,
         tool_calls: Vec<ToolCall>,
@@ -7277,15 +7374,6 @@ mod tests {
         }
     }
 
-
-
-
-
-
-
-
-
-
     /// Build a Completion whose done envelope has a non-string/missing finish_reason.
     fn sample_completion_with_done(
         content: &str,
@@ -7305,27 +7393,12 @@ mod tests {
         }
     }
 
-
-
-
     fn sample_tool_call(name: &str) -> serde_json::Value {
         serde_json::json!({
             "name": name,
             "arguments": { "path": "README.md" }
         })
     }
-
-
-
-
-
-
-
-
-
-
-
-
 
     fn task15_daemon_err(class: &str, retryable: bool, attempt_id: u64) -> anyhow::Error {
         anyhow::Error::new(hipfire_client::ClientError::Daemon(
@@ -7340,7 +7413,6 @@ mod tests {
         ))
     }
 
-
     #[test]
     fn task15_serve_retry_config_defaults_off() {
         let resolved = resolve(Vec::<NamedLayer>::new()).expect("resolve empty layers");
@@ -7352,28 +7424,7 @@ mod tests {
 
     // --- StreamContractGate / complete_request framing (fix round 2) ---
 
-
-
-
-
     // ── Task 6: canonical OpenAI tool-call adapter + endpoint registry ──
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
     #[test]
     fn forward_think_fragments_preserves_cancelled_callback_error() {
@@ -7390,8 +7441,6 @@ mod tests {
         // Fragment still applied before callback failure (accumulation is local).
         assert_eq!(content, "x");
     }
-
-
 
     // =========================================================================
     // Task 11 — no-GPU fake-daemon HTTP acceptance through real serve lowering
@@ -7850,27 +7899,16 @@ mod tests {
 
     /// Capability denial: daemon typed error on tools request → no completion/tool payload.
     #[cfg(unix)]
-
     // --- Task 15: server-owned one-retry (disabled-by-default) ---
-
     #[cfg(unix)]
-
     #[cfg(unix)]
-
     #[cfg(unix)]
-
     #[cfg(unix)]
-
     #[cfg(unix)]
-
     #[cfg(unix)]
-
     #[cfg(unix)]
-
     #[cfg(unix)]
-
     #[cfg(unix)]
-
     #[test]
     fn bench_generate_request_includes_numeric_first_attempt() {
         let req = bench_generate_request("bench prompt", 37);
@@ -7925,5 +7963,4 @@ mod tests {
         // Still an ordinary benchmark generate otherwise.
         assert_eq!(req.get("max_tokens").and_then(|v| v.as_u64()), Some(128));
     }
-
 }
