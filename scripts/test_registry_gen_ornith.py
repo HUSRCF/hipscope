@@ -60,12 +60,17 @@ def test_dense_is_arch5_in_both_spellings():
 
 
 def test_curated_entry_uses_the_canonical_tag_and_hyphenated_files():
-    # Pins the rename itself: tag, trunk and MTP sidecar all hyphenated, and the
-    # byte-size claim that SIZE_TOLERANCE checks against the live HF repo.
+    # Pins the rename itself: repo id, tag, trunk and MTP sidecar all hyphenated,
+    # and the byte-size claim that SIZE_TOLERANCE checks against the live HF repo.
+    #
+    # The repo id is pinned to the CURRENT canonical name. HF redirects the old
+    # id, so both resolve today -- but only one of them survives the redirect
+    # being dropped, and a curated `repo` that 404s fails the run closed.
     models = _curated()["models"]
     assert CANONICAL in models, "curated entry must use the hyphenated tag"
     assert "ornith1.5:35b-a3b" not in models, "old tag must be an alias, not a model"
     entry = models[CANONICAL]
+    assert entry["repo"] == "hipfire-models/ornith-1.5-35b-a3b"
     assert entry["file"] == "ornith-1.5-35b-a3b.mq4"
     assert entry["mtp"]["file"] == "ornith-1.5-35b-a3b.mtp"
     assert entry["size_gb"] == 19.02

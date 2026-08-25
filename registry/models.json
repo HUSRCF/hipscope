@@ -1488,7 +1488,7 @@
       "quant_recipe": "prismml-bonsai-q2_0-passthrough"
     },
     "ornith-1.5:35b-a3b": {
-      "repo": "hipfire-models/ornith1.5-35b-a3b",
+      "repo": "hipfire-models/ornith-1.5-35b-a3b",
       "mtp": {
         "file": "ornith-1.5-35b-a3b.mtp"
       },
