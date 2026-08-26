@@ -21,7 +21,6 @@ use hipfire_arch_muse_glimmer as glimmer;
 use hipfire_arch_qwen2::qwen2;
 use hipfire_arch_qwen35::qwen35;
 use hipfire_arch_qwen35::speculative;
-use std::any::Any;
 use hipfire_arch_qwen35_vl::image;
 use hipfire_arch_qwen35_vl::qwen35_vl;
 use hipfire_runtime::emit_text::{
@@ -32,6 +31,7 @@ use hipfire_runtime::eos_filter::{EosFilter, EosFilterConfig, FilterAction};
 use hipfire_runtime::llama;
 use hipfire_runtime::prompt_frame::ThinkMode;
 use hipfire_runtime::sampler::{self, SamplerConfig};
+use std::any::Any;
 use std::io::{BufRead, Write};
 use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -731,7 +731,7 @@ pub fn ep_serve_ds4(
         }
         // Host-side sampler over the downloaded f32 logits (temp → top_k →
         // top_p → min_p → seeded draw, temp<=1e-6 = argmax). RNG seeded once
-        // per request via reset_cpu_sampler_rng(0x13579BDF) in generate().
+        // per request via reset_cpu_sampler_rng(request_seed) in generate().
         let next = hipfire_runtime::llama::sample_full_dist(
             &logits,
             sampling.temp,
@@ -1464,6 +1464,11 @@ pub fn generate_dflash(
     // daemon hardcodes 0.0; the param exists only so a future opt-in request
     // field can reach it without re-touching this signature.
     cactus_delta: f32,
+    // Per-request sampler seed for the drafter's sampled-draw RNG (see
+    // Speculator::set_request_seed). Derived by hipfire-engine's
+    // request_seed_for: explicit wire `seed` wins, otherwise attempt-key +
+    // counter entropy. Greedy requests never draw it.
+    request_seed: u64,
     reasoning_effort: Option<&str>,
     enable_thinking: bool,
     // Returns false in exactly one case: the request does not fit the loaded
@@ -1501,7 +1506,7 @@ pub fn generate_dflash(
             "kv_adaptive cannot use generic speculative decode (DFlash/DSpark/MTP/n-gram); use AR",
             "validation",
             false,
-            false
+            false,
         );
         let _ = stdout.flush();
         return true;
@@ -1792,7 +1797,11 @@ pub fn generate_dflash(
                 cache_eligible,
                 &dflash_ckpt_positions,
                 dflash_resume_enabled,
-                if spec_name == "mtp" { "mtp-jinja" } else { "dflash-jinja" },
+                if spec_name == "mtp" {
+                    "mtp-jinja"
+                } else {
+                    "dflash-jinja"
+                },
             ))
         } else {
             None
@@ -1873,7 +1882,7 @@ pub fn generate_dflash(
             top_k,
             min_p,
             cactus_delta,
-            rng_seed: 0x13579BDF,
+            rng_seed: request_seed,
             allow_ngram_modifier: spec_name == "mtp"
                 && std::env::var("HIPFIRE_MTP_NGRAM").ok().as_deref() == Some("1")
                 && temp <= 1e-6
@@ -2269,18 +2278,9 @@ pub fn generate_dflash(
                             "ngram_mod_accept_rate".into(),
                             serde_json::json!(stats.ngram_mod_accept_rate),
                         );
-                        obj.insert(
-                            "mtp_windows".into(),
-                            serde_json::json!(stats.mtp_windows),
-                        );
-                        obj.insert(
-                            "ar_windows".into(),
-                            serde_json::json!(stats.ar_windows),
-                        );
-                        obj.insert(
-                            "mtp_retired".into(),
-                            serde_json::json!(stats.mtp_retired),
-                        );
+                        obj.insert("mtp_windows".into(), serde_json::json!(stats.mtp_windows));
+                        obj.insert("ar_windows".into(), serde_json::json!(stats.ar_windows));
+                        obj.insert("mtp_retired".into(), serde_json::json!(stats.mtp_retired));
                     }
                 }
             }
@@ -2394,7 +2394,7 @@ pub fn generate_spec(
             "kv_adaptive cannot use generic speculative decode (DFlash/DSpark/MTP/n-gram); use AR",
             "validation",
             false,
-            false
+            false,
         );
         let _ = stdout.flush();
         return None;
@@ -3594,7 +3594,6 @@ pub fn attach_mtp_window_timings(
     }
 }
 
-
 /// Multi-GPU pipeline-parallel AR decode (Stage 7 of #58). Mirrors the pp=1
 /// `generate` Qwen3.5 branch feature-for-feature: ChatFrame ChatML wrap,
 /// EosFilter UTF-8 streaming + strip-think + stop_at, LoopGuard n-gram
@@ -3632,6 +3631,10 @@ pub fn generate_multi(
     stop: &[String],
     reasoning_effort: Option<&str>,
     enable_thinking: bool,
+    // Per-request sampler seed (see hipfire-engine::request_seed_for). Replaces
+    // the historical fixed 0x13579BDF that made PP>1 same-prompt requests
+    // byte-identical at temp>0.
+    request_seed: u64,
 ) {
     let tokenizer = m.tokenizer.as_ref().unwrap();
     let prompt_est = tokenizer.encode(prompt).len() + 20;
@@ -4187,7 +4190,7 @@ pub fn generate_multi(
     // ngram scope: generated tokens only (matches pp=1).
     let ngram_scope_start = m.conversation_tokens.len();
 
-    let mut rng_state: u32 = 0x13579BDFu32;
+    let mut rng_state: u32 = request_seed as u32;
 
     let attractor_pairs: Vec<(u32, u32)> = tool_call_pair
         .into_iter()
