@@ -421,7 +421,7 @@ fn normalize_tool_calls(calls: &mut [ToolCall], body: &serde_json::Value) {
 /// The daemon ignores raw `tool_choice`; the serve gateway projects it into
 /// tools/messages and enforces terminal postconditions.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum ToolChoicePolicy {
+pub(crate) enum ToolChoicePolicy {
     /// Absent, JSON null, or `"auto"` — tools unchanged, no extra instruction.
     Auto,
     /// `"none"` — do not forward tools or expose structured calls.
@@ -583,7 +583,7 @@ fn project_tool_choice(
 /// - `required`: fail closed when zero executable calls
 /// - specific: keep only the named tool; fail closed when none remain
 /// - `auto`: identity beyond argument normalization
-fn finalize_tool_calls_for_choice(
+pub(crate) fn finalize_tool_calls_for_choice(
     policy: &ToolChoicePolicy,
     tool_calls: &mut Vec<ToolCall>,
     done: &mut serde_json::Value,
@@ -1521,6 +1521,48 @@ pub(crate) fn fold_complete_request_stream(
     }
 }
 
+/// One projection of the OpenAI request contract, shared by BOTH serve backends.
+/// The multi-slot path used to bypass all of this; see `complete_request_cancellable`.
+#[derive(Debug)]
+pub(crate) struct RequestContract {
+    pub max_tokens: u64,
+    pub messages: serde_json::Value,
+    pub tool_choice_policy: ToolChoicePolicy,
+    pub forwarded_tools: Option<serde_json::Value>,
+}
+
+/// `muse_glimmer` is the only arch that surfaces reasoning content in messages.
+/// Single source of truth -- both backends call this, neither re-derives it.
+pub(crate) fn include_reasoning_content(arch: Option<&str>) -> bool {
+    arch == Some("muse_glimmer")
+}
+
+pub(crate) fn project_request_contract(
+    body: &serde_json::Value,
+    resolved: &hipfire_config::ResolvedConfig,
+    include_reasoning: bool,
+) -> Result<RequestContract> {
+    let max_tokens = body
+        .get("max_tokens")
+        .or_else(|| body.get("max_completion_tokens"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(config_u64(resolved, "generation.max_tokens")?);
+    if max_tokens == 0 || max_tokens > 393_216 {
+        bail!("max_tokens must be between 1 and 393216");
+    }
+    let mut messages = normalize_openai_messages(body.get("messages"), include_reasoning);
+    let default_system = request_string(resolved, "prompt.system", None)?;
+    inject_default_system_message(&mut messages, default_system.as_deref());
+    let (tool_choice_policy, forwarded_tools) =
+        project_tool_choice(body.get("tool_choice"), body.get("tools"), &mut messages)?;
+    Ok(RequestContract {
+        max_tokens,
+        messages,
+        tool_choice_policy,
+        forwarded_tools,
+    })
+}
+
 /// One correlated generation attempt under the shared serve runtime lock.
 ///
 /// `identity` is the public completion identity (stable across retries);
@@ -1594,28 +1636,19 @@ pub(crate) fn complete_request_attempt(
                 return Err(error.into());
             }
         }
-        let max_tokens = body
-            .get("max_tokens")
-            .or_else(|| body.get("max_completion_tokens"))
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(config_u64(&resolved, "generation.max_tokens")?);
-        if max_tokens == 0 || max_tokens > 393_216 {
-            bail!("max_tokens must be between 1 and 393216");
-        }
+        let contract = project_request_contract(
+            body,
+            &resolved,
+            include_reasoning_content(runtime.current_arch.as_deref()),
+        )?;
+        let max_tokens = contract.max_tokens;
         let required_max_seq = max_tokens.saturating_add(1024);
         if runtime.current_max_seq < required_max_seq {
             runtime.ensure_model(&model, &shared.meta, Some(required_max_seq))?;
         }
-        let include_reasoning_content = runtime.current_arch.as_deref() == Some("muse_glimmer");
-        let mut normalized_messages =
-            normalize_openai_messages(body.get("messages"), include_reasoning_content);
-        let default_system = request_string(&resolved, "prompt.system", None)?;
-        inject_default_system_message(&mut normalized_messages, default_system.as_deref());
-        let (tool_choice_policy, forwarded_tools) = project_tool_choice(
-            body.get("tool_choice"),
-            body.get("tools"),
-            &mut normalized_messages,
-        )?;
+        let normalized_messages = contract.messages;
+        let tool_choice_policy = contract.tool_choice_policy;
+        let forwarded_tools = contract.forwarded_tools;
         let mut generate = serde_json::json!({
             "type": "generate",
             "id": request_id(),
@@ -2043,23 +2076,36 @@ pub(crate) fn complete_request_cancellable(
 ) -> Result<Completion> {
     let identity = request_identity.unwrap_or_else(|| (request_id(), unix_timestamp()));
 
-    // Slot path: retain existing non-cancellable behavior (no disconnect token).
-    let slot_capable = {
-        let runtime = shared
+    // Slot path: project the shared OpenAI request contract once under the lock.
+    let slot_plan = {
+        let mut runtime = shared
             .runtime
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        runtime.current_path.is_some()
+        let capable = runtime.current_path.is_some()
             && matches!(
                 runtime.current_reasoning_contract,
                 saddle_core::caps::ReasoningContract::Unsupported
-            )
+            );
+        if !capable {
+            None
+        } else {
+            let model = body
+                .get("model")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow!("model is required"))?
+                .to_owned();
+            let resolved = runtime.ensure_model(&model, &shared.meta, None)?;
+            let inc = include_reasoning_content(runtime.current_arch.as_deref());
+            Some(project_request_contract(body, &resolved, inc)?)
+        }
     };
-    if slot_capable {
+    if let Some(contract) = slot_plan {
         if let Some(backend) = shared.slot_engine.clone() {
             return crate::serve::slots::complete_request_slots(
                 &backend,
                 body,
+                &contract,
                 &identity,
                 Some(cancelled),
                 &mut event_callback,
@@ -6402,5 +6448,112 @@ mod tests {
         assert!(f_calls.is_empty());
         assert_eq!(p_done, f_done);
         assert_eq!(p_done["finish_reason"], "stop");
+    }
+    fn contract_resolved_with_system(system: &str) -> hipfire_config::ResolvedConfig {
+        let mut layer = ConfigLayer::default();
+        layer.set_cli("prompt.system", system).unwrap();
+        // generation.max_tokens must resolve for the helper's unwrap_or path.
+        layer.set_cli("generation.max_tokens", "512").unwrap();
+        // request_string ignores GlobalUser for prompt.system unless a registry
+        // layer shadows it — match neighbouring tests and use RegistryModel.
+        resolve([NamedLayer {
+            source: ConfigSource::RegistryModel {
+                tag: "qwen:test".into(),
+                revision: "v1".into(),
+            },
+            layer,
+        }])
+        .unwrap()
+    }
+
+    #[test]
+    fn project_request_contract_rejects_max_tokens_bounds() {
+        let resolved = contract_resolved_with_system("");
+        for bad in [0u64, 393_217] {
+            let body = serde_json::json!({
+                "max_tokens": bad,
+                "messages": [{ "role": "user", "content": "hi" }]
+            });
+            let err = project_request_contract(&body, &resolved, false)
+                .expect_err("out of range max_tokens");
+            assert!(
+                err.to_string().contains("max_tokens must be between 1 and 393216"),
+                "unexpected error for {bad}: {err}"
+            );
+        }
+        for ok in [1u64, 393_216] {
+            let body = serde_json::json!({
+                "max_tokens": ok,
+                "messages": [{ "role": "user", "content": "hi" }]
+            });
+            let contract = project_request_contract(&body, &resolved, false)
+                .unwrap_or_else(|e| panic!("expected ok for {ok}: {e}"));
+            assert_eq!(contract.max_tokens, ok);
+        }
+    }
+
+    #[test]
+    fn project_request_contract_injects_default_system() {
+        let resolved = contract_resolved_with_system("injected default system");
+        let body = serde_json::json!({
+            "max_tokens": 16,
+            "messages": [{ "role": "user", "content": "hi" }]
+        });
+        let contract = project_request_contract(&body, &resolved, false).expect("project");
+        let msgs = contract.messages.as_array().expect("messages array");
+        assert_eq!(msgs[0]["role"], "system");
+        assert_eq!(msgs[0]["content"], "injected default system");
+        assert_eq!(msgs[1]["role"], "user");
+    }
+
+    #[test]
+    fn project_request_contract_none_withholds_tools() {
+        let resolved = contract_resolved_with_system("");
+        let tools = echo_and_translate_tools();
+        let body = serde_json::json!({
+            "max_tokens": 16,
+            "tool_choice": "none",
+            "tools": tools,
+            "messages": [{ "role": "user", "content": "hi" }]
+        });
+        let contract = project_request_contract(&body, &resolved, false).expect("project");
+        assert_eq!(contract.tool_choice_policy, ToolChoicePolicy::None);
+        assert!(contract.forwarded_tools.is_none());
+    }
+
+    #[test]
+    fn project_request_contract_required_and_specific_forward_tools() {
+        let resolved = contract_resolved_with_system("");
+        let tools = echo_and_translate_tools();
+
+        let body_required = serde_json::json!({
+            "max_tokens": 16,
+            "tool_choice": "required",
+            "tools": tools,
+            "messages": [{ "role": "user", "content": "hi" }]
+        });
+        let contract = project_request_contract(&body_required, &resolved, false).expect("required");
+        assert_eq!(contract.tool_choice_policy, ToolChoicePolicy::Required);
+        assert_eq!(contract.forwarded_tools.as_ref(), Some(&tools));
+
+        let body_specific = serde_json::json!({
+            "max_tokens": 16,
+            "tool_choice": {
+                "type": "function",
+                "function": { "name": "echo" }
+            },
+            "tools": tools,
+            "messages": [{ "role": "user", "content": "hi" }]
+        });
+        let contract =
+            project_request_contract(&body_specific, &resolved, false).expect("specific");
+        assert_eq!(
+            contract.tool_choice_policy,
+            ToolChoicePolicy::Function("echo".into())
+        );
+        let forwarded = contract.forwarded_tools.expect("filtered tools");
+        let arr = forwarded.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(tool_schema_name(&arr[0]), Some("echo"));
     }
 }
