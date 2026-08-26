@@ -138,6 +138,8 @@ def _effort_native_tag(tag: str) -> bool:
         return True
     if family == "muse-glimmer" or base in {"muse-glimmer", "muse-glimmer:fast"}:
         return True
+    if family in {"ornith-1.5", "ornith1.5", "ornith"}:
+        return True
     return False
 
 
