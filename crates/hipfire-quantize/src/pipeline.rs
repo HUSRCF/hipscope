@@ -3895,6 +3895,16 @@ fn handle_moe_expert_3d(
     let arch_id = ctx.arch_id;
     let is_vision = ctx.is_vision;
 
+    // Guard: this handler is only valid for stacked 3D MoE expert tensors
+    // ([n_experts, ..., ...] named *.experts.{gate_up,down}_proj). Anything
+    // else (e.g. dense rank-2 tensors like lm_head on multimodal qwen3_5
+    // checkpoints) must fall through to the standard quantization path.
+    if meta.shape.len() < 3
+        || !(name.ends_with("experts.gate_up_proj") || name.ends_with("experts.down_proj"))
+    {
+        return false;
+    }
+
     let n_experts = meta.shape[0];
     let inner_n: usize = meta.shape[1..].iter().product();
     let elem_size = match meta.dtype.as_str() {

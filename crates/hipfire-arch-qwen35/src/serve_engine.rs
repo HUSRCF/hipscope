@@ -411,8 +411,16 @@ fn run_loop(mut rig: Rig, rx: Receiver<SubmitRequest>, stats: Arc<Mutex<EngineSt
             };
             f.produced += 1;
             let hit_max = f.produced >= f.max_tokens;
+            // Context-cap guard: stop before the slot's KV length would pass
+            // its cap. Without this, a long multi-turn session overflows
+            // set_seq_len and kills the whole batched step.
+            let hit_ctx_cap = rig
+                .sessions
+                .get(session)
+                .map(|sess| sess.tokens.len() + 1 >= rig.cap_tokens)
+                .unwrap_or(false);
 
-            if gone || hit_eos || hit_max {
+            if gone || hit_eos || hit_max || hit_ctx_cap {
                 let reason = if gone {
                     DoneReason::ClientGone
                 } else if hit_eos {
