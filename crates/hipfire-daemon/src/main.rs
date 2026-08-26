@@ -41,6 +41,7 @@ use hipfire_engine::prompt::*;
 use hipfire_engine::redline::*;
 use hipfire_engine::scheduler::*;
 use hipfire_engine::terminal::*;
+use hipfire_engine::wire_seed::parse_wire_seed;
 #[cfg(feature = "serve-fault-inject")]
 use hipfire_generate::ar::arm_fault_after_prefill;
 #[cfg(feature = "serve-fault-inject")]
@@ -2359,6 +2360,19 @@ fn main() {
                     } else {
                         max_think_tokens
                     };
+                    // Same tiered derivation as the text path below: explicit
+                    // wire `seed` wins, else attempt key + counter entropy.
+                    // Out-of-domain seeds (negative, fractional, non-numeric)
+                    // are rejected — never silently treated as unseeded.
+                    let client_seed = match parse_wire_seed(msg.get("seed")) {
+                        Ok(s) => s,
+                        Err(reason) => {
+                            write_error(&mut stdout, id, &reason);
+                            continue;
+                        }
+                    };
+                    let vl_request_seed =
+                        request_seed_for(&AttemptKey::new(id, gen_attempt_id), client_seed);
                     let params = GenerateVLParams {
                         id,
                         prompt,
@@ -2371,6 +2385,7 @@ fn main() {
                         repeat_window,
                         max_think_tokens: vl_max_think_tokens,
                         assistant_prefix,
+                        seed: vl_request_seed,
                     };
                     match vision_route {
                         hipfire_loader::VisionRoute::DotsOcr => {
@@ -2552,6 +2567,17 @@ fn main() {
                                 batch_clear_terminal(id, gen_attempt_id);
                                 continue;
                             }
+                            // Explicit wire `seed` must reach the lane RNG on
+                            // the batched route too; out-of-domain values are
+                            // rejected loudly, never silently unseeded.
+                            let client_seed = match parse_wire_seed(msg.get("seed")) {
+                                Ok(s) => s,
+                                Err(reason) => {
+                                    write_error(&mut stdout, id, &reason);
+                                    batch_clear_terminal(id, gen_attempt_id);
+                                    continue;
+                                }
+                            };
                             let pending = BatchPendingRequest {
                                 key: AttemptKey::new(id, gen_attempt_id),
                                 prompt: prompt_owned.clone(),
@@ -2561,6 +2587,7 @@ fn main() {
                                 assistant_prefix,
                                 max_think_tokens,
                                 max_tokens,
+                                client_seed,
                                 sampling: sampling.clone(),
                             };
                             if let Some(sched) = batch_scheduler.as_mut() {
@@ -2698,6 +2725,17 @@ fn main() {
                                 batch_clear_terminal(id, gen_attempt_id);
                                 continue;
                             }
+                            // Explicit wire `seed` must reach the lane RNG on
+                            // the batched route too; out-of-domain values are
+                            // rejected loudly, never silently unseeded.
+                            let client_seed = match parse_wire_seed(msg.get("seed")) {
+                                Ok(s) => s,
+                                Err(reason) => {
+                                    write_error(&mut stdout, id, &reason);
+                                    batch_clear_terminal(id, gen_attempt_id);
+                                    continue;
+                                }
+                            };
                             let pending = BatchPendingRequest {
                                 key: AttemptKey::new(id, gen_attempt_id),
                                 prompt: prompt_owned.clone(),
@@ -2707,6 +2745,7 @@ fn main() {
                                 assistant_prefix,
                                 max_think_tokens,
                                 max_tokens,
+                                client_seed,
                                 sampling: sampling.clone(),
                             };
                             if let Some(sched) = batch_scheduler.as_mut() {
@@ -2834,6 +2873,26 @@ fn main() {
                     ]
                     .iter()
                     .any(|k| msg.get(*k).is_some());
+                    // Per-request sampler entropy (replaces the historical
+                    // fixed 0x13579BDF that made same-prompt requests
+                    // byte-identical at temp>0 on the sequential noslots path).
+                    // Explicit wire `seed` wins (deterministic per seed alone —
+                    // attempt identity is NOT mixed in, so two HTTP requests
+                    // with the same seed reproduce); otherwise hipfire-engine
+                    // mixes the attempt key with a process-global counter and
+                    // boot nonce so reused client keys still get distinct
+                    // streams. Out-of-domain seeds (negative, fractional,
+                    // non-numeric) are rejected — never silently treated as
+                    // unseeded.
+                    let client_seed = match parse_wire_seed(msg.get("seed")) {
+                        Ok(s) => s,
+                        Err(reason) => {
+                            write_error(&mut stdout, id, &reason);
+                            continue;
+                        }
+                    };
+                    let request_seed =
+                        request_seed_for(&AttemptKey::new(id, gen_attempt_id), client_seed);
                     generate(
                         m,
                         &mut gpu,
@@ -2866,6 +2925,7 @@ fn main() {
                         reasoning_effort_jinja.as_deref(),
                         enable_thinking_jinja,
                         logprobs_top_k,
+                        request_seed,
                     );
                 }
                 if let Some(marker) = gpu.replay.replay_observation_marker(id) {

@@ -28,6 +28,7 @@ use hipfire_engine::emit::*;
 use hipfire_engine::prompt::{batch_render_prompt_tokens, qwen_jinja_reasoning};
 use hipfire_engine::scheduler::*;
 use hipfire_engine::terminal::*;
+use hipfire_engine::wire_seed;
 use hipfire_loader::{EpArch, EpState, LoadedModel};
 use hipfire_runtime::emit_text::{
     currently_in_think, ThinkOutputRouter, ToolOutputRouter, ToolRouteError,
@@ -616,6 +617,24 @@ pub fn drive_qwen_continuous_batch(
                             batch_clear_terminal(&id, attempt_id);
                             continue;
                         }
+                        // Explicit wire `seed` must reach the lane RNG on the
+                        // batched route too; out-of-domain values are rejected
+                        // loudly, never silently unseeded.
+                        let client_seed = match wire_seed::parse_wire_seed(json.get("seed")) {
+                            Ok(s) => s,
+                            Err(reason) => {
+                                emit_uncorrelated_error(
+                                    stdout,
+                                    Some(&id),
+                                    &reason,
+                                    "validation",
+                                    false,
+                                    false,
+                                );
+                                batch_clear_terminal(&id, attempt_id);
+                                continue;
+                            }
+                        };
                         batch_transition_to_queued(&id, attempt_id);
                         let sampling = resolve_batch_sampling(&json, model);
                         let req = BatchPendingRequest {
@@ -627,6 +646,7 @@ pub fn drive_qwen_continuous_batch(
                             assistant_prefix,
                             max_think_tokens: max_think,
                             max_tokens: max_tokens_req,
+                            client_seed,
                             sampling,
                         };
                         if !sched.enqueue(req) {
@@ -1560,6 +1580,24 @@ pub fn drive_lfm_continuous_batch(
                             batch_clear_terminal(&id, attempt_id);
                             continue;
                         }
+                        // Explicit wire `seed` must reach the lane RNG on the
+                        // batched route too; out-of-domain values are rejected
+                        // loudly, never silently unseeded.
+                        let client_seed = match wire_seed::parse_wire_seed(json.get("seed")) {
+                            Ok(s) => s,
+                            Err(reason) => {
+                                emit_uncorrelated_error(
+                                    stdout,
+                                    Some(&id),
+                                    &reason,
+                                    "validation",
+                                    false,
+                                    false,
+                                );
+                                batch_clear_terminal(&id, attempt_id);
+                                continue;
+                            }
+                        };
                         batch_transition_to_queued(&id, attempt_id);
                         let sampling = resolve_batch_sampling(&json, model);
                         let req = BatchPendingRequest {
@@ -1571,6 +1609,7 @@ pub fn drive_lfm_continuous_batch(
                             assistant_prefix,
                             max_think_tokens: max_think,
                             max_tokens: max_tokens_req,
+                            client_seed,
                             sampling,
                         };
                         if !sched.enqueue(req) {
@@ -2883,6 +2922,24 @@ pub fn drive_qwen35_ep_continuous_batch(
                             batch_clear_terminal(&id, attempt_id);
                             continue;
                         }
+                        // Explicit wire `seed` must reach the lane RNG on the
+                        // batched route too; out-of-domain values are rejected
+                        // loudly, never silently unseeded.
+                        let client_seed = match wire_seed::parse_wire_seed(json.get("seed")) {
+                            Ok(s) => s,
+                            Err(reason) => {
+                                emit_uncorrelated_error(
+                                    stdout,
+                                    Some(&id),
+                                    &reason,
+                                    "validation",
+                                    false,
+                                    false,
+                                );
+                                batch_clear_terminal(&id, attempt_id);
+                                continue;
+                            }
+                        };
                         batch_transition_to_queued(&id, attempt_id);
                         let sampling = resolve_batch_sampling(&json, model);
                         let req = BatchPendingRequest {
@@ -2894,6 +2951,7 @@ pub fn drive_qwen35_ep_continuous_batch(
                             assistant_prefix,
                             max_think_tokens: max_think,
                             max_tokens: max_tokens_req,
+                            client_seed,
                             sampling,
                         };
                         if !sched.enqueue(req) {

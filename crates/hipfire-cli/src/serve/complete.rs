@@ -1691,6 +1691,11 @@ pub(crate) fn complete_request_attempt(
                 generate[name] = value.clone();
             }
         }
+        // OpenAI-compatible `seed`: forwarded to the daemon, which uses it as
+        // the deterministic per-request sampler seed (see request_seed_for).
+        if let Some(value) = body.get("seed") {
+            generate["seed"] = value.clone();
+        }
         if let Some(value) = body.get("top_k") {
             generate["top_k"] = value.clone();
         } else {

@@ -1057,6 +1057,12 @@ pub fn generate(
     // `Some(k)` emits OpenAI logprobs with k candidates per token. `None` is the
     // default and leaves every token envelope byte-identical to before.
     logprobs_top_k: Option<usize>,
+    // Per-request sampler seed for both the GPU xorshift stream and the
+    // process-global CPU fallback sampler. The caller derives it via
+    // hipfire-engine::request_seed_for (explicit wire `seed` wins, else
+    // attempt-key + counter entropy) so two requests with the same prompt
+    // no longer replay the identical draw sequence at temp>0.
+    request_seed: u32,
 ) {
     // ── Producer-route authority (Task 6) ──────────────────────────────
     // Resolve the selected generation route BEFORE sampler RNG reset and
@@ -1208,10 +1214,11 @@ pub fn generate(
     }
 
     // hunt3 M-E: seed the process-global CPU sampler RNG with this request's
-    // fixed seed so the grammar/CPU-fallback sample stream is deterministic per
-    // request and does not carry RNG state across requests. Matches the u32 the
-    // GPU sample path uses (0x13579BDF).
-    hipfire_runtime::llama::reset_cpu_sampler_rng(0x13579BDF);
+    // seed so the grammar/CPU-fallback sample stream is isolated per request
+    // and does not carry RNG state across requests. Matches the u32 the
+    // sample path uses (request_seed, derived by hipfire-engine's
+    // request_seed_for from the wire `seed` field or the attempt key + counter).
+    hipfire_runtime::llama::reset_cpu_sampler_rng(request_seed);
     // Adaptive KV poison is sticky until unload/reload. Refuse generation so a
     // partial tier transition cannot continue writing into mixed-tier state.
     if let Some(ad) = m.kv_adaptive.as_ref() {
@@ -1239,7 +1246,7 @@ pub fn generate(
             // ladder, all done at the call site above) into the EP decode loops.
             // Previously the EP path dropped these to a hardcoded greedy argmax,
             // which loops on ds4's quantized instruct model (card mandates
-            // temp=1.0/top_p=1.0). reset_cpu_sampler_rng(0x13579BDF) was already
+            // temp=1.0/top_p=1.0). reset_cpu_sampler_rng(request_seed) was already
             // called above, so the host-side draw in ep_serve_* is deterministic.
             let ep_sampling = crate::qwen::EpSampling {
                 temp,
@@ -1308,6 +1315,7 @@ pub fn generate(
                 top_k.map(|k| k as usize).unwrap_or(0),
                 min_p.unwrap_or(0.0),
                 cactus_delta,
+                request_seed as u64,
                 reasoning_effort,
                 enable_thinking,
             ) {
@@ -1390,6 +1398,7 @@ pub fn generate(
                 top_p,
                 top_k.map(|k| k as usize).unwrap_or(0),
                 cactus_delta,
+                request_seed,
                 think_mode,
                 tools,
                 messages_history,
@@ -1444,6 +1453,7 @@ pub fn generate(
                 top_k.map(|k| k as usize).unwrap_or(0),
                 min_p.unwrap_or(0.0),
                 cactus_delta,
+                request_seed as u64,
                 reasoning_effort,
                 enable_thinking,
             ) {
@@ -1521,6 +1531,7 @@ pub fn generate(
                 top_k.map(|k| k as usize).unwrap_or(0),
                 min_p.unwrap_or(0.0),
                 cactus_delta,
+                request_seed as u64,
                 reasoning_effort,
                 enable_thinking,
             ) {
@@ -1598,6 +1609,7 @@ pub fn generate(
                 top_k.map(|k| k as usize).unwrap_or(0),
                 min_p.unwrap_or(0.0),
                 cactus_delta,
+                request_seed as u64,
                 reasoning_effort,
                 enable_thinking,
             ) {
@@ -1709,6 +1721,7 @@ pub fn generate(
                 stop,
                 reasoning_effort,
                 enable_thinking,
+                request_seed as u64,
             );
             return;
         }
@@ -1763,6 +1776,7 @@ pub fn generate(
                 top_k.map(|k| k as usize).unwrap_or(0),
                 min_p.unwrap_or(0.0),
                 cactus_delta,
+                request_seed as u64,
                 reasoning_effort,
                 enable_thinking,
             ) {
@@ -3214,7 +3228,7 @@ pub fn generate(
         // stream as the sample kernel launch, so the copy and compute pipeline
         // naturally.
         let vocab_size = config.vocab_size;
-        let mut rng_state: u32 = 0x13579BDFu32;
+        let mut rng_state: u32 = request_seed;
         // Effective penalty window = request `repeat_window` (default 128),
         // bounded by the GPU repeat_buf capacity (2048). The buffer is sized
         // large so presence/frequency penalties CAN use a wider window when a
@@ -3378,8 +3392,7 @@ pub fn generate(
         // and structured tool_calls on this AR path. Raw token commit stays
         // upstream via `commit_and_observe` (conversation_tokens / streamed /
         // seq_pos advance before classify).
-        let mut semantic =
-            QwenArSemanticProducer::new_with_tool_protocol(id, started_in_think, tools_nonempty);
+        let mut semantic = QwenArSemanticProducer::new_with_tool_protocol(id, started_in_think, tools_nonempty);
         let mut alert_fired = false;
         // max_think_tokens enforcement state. think_count increments only
         // while we observe ourselves to be inside a `<think>...</think>`
@@ -4233,7 +4246,7 @@ pub fn generate(
         let scratch = &b.scratch;
         let kv = &mut b.kv;
 
-        let mut rng_state = 42u32;
+        let mut rng_state = request_seed;
         let batched_prefill = llama_qwen3_batched_prefill_eligible(
             &gpu.arch,
             config.arch,
