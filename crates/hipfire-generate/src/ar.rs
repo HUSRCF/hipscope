@@ -1409,20 +1409,13 @@ pub fn generate(
             return;
         }
         GenerationRoute::MapleAr => {
-            // Arch 15 has no pflash, no eviction and no think budget.
-            // `messages_history` is NOT in the discard set — Maple re-renders
-            // the full conversation every turn and cold-resets its KV, so the
-            // history is the only thing carrying prior turns. `tools` is no
-            // longer discarded either: it feeds the vendor template's `# Tools`
-            // block, without which the model invents tool names.
-            let _ = (
-                budget_alert_at_tok,
-                budget_alert_text,
-                max_think_tokens,
-                assistant_prefix,
-                pflash_state,
-                pflash_cfg,
-            );
+            // Arch 15 has no pflash/no eviction, but it DOES honour the
+            // QwenJinja reasoning contract: `enable_thinking` (from
+            // `thinking_enabled`), `assistant_prefix` (open/closed/plain) and
+            // the explicit `max_think_tokens` cap are threaded into the
+            // generate path so a user's `reasoning_effort:"none"` or cap is
+            // not silently ignored.
+            let _ = (budget_alert_at_tok, budget_alert_text, pflash_state, pflash_cfg);
             let _ = stop;
             crate::dense::generate_maple(
                 m,
@@ -1436,6 +1429,9 @@ pub fn generate(
                 temp,
                 top_p,
                 max_tokens,
+                max_think_tokens,
+                assistant_prefix,
+                enable_thinking,
                 repeat_penalty,
                 repeat_window,
             );

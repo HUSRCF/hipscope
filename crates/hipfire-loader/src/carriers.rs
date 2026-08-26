@@ -1690,6 +1690,7 @@ impl Carrier for MapleCarrier {
     }
     fn caps(&self) -> saddle_core::caps::ArchCaps {
         saddle_core::caps::ArchCaps {
+            reasoning_contract: saddle_core::caps::ReasoningContract::QwenJinja,
             supports_continuous_batch: false,
             supports_ep_batch: false,
             dflash: None,
