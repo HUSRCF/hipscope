@@ -2175,7 +2175,24 @@ pub(crate) fn complete_request_cancellable(
                 .and_then(serde_json::Value::as_str)
                 .ok_or_else(|| anyhow!("model is required"))?
                 .to_owned();
-            let resolved = runtime.ensure_model(&model, &shared.meta, None)?;
+            // Config only -- deliberately NOT `ensure_model`. The slot engine
+            // owns its own `Rig { gpu, weights }` and already has this model
+            // resident; `ensure_model` would load a SECOND full copy into the
+            // daemon's engine just to hand back a `ResolvedConfig`. On an 18.7 GB
+            // MoE that is 37.4 GB on a 34.2 GB card -- the slot backend comes up,
+            // then the first request dies with
+            // `load_weights failed: HipError { code: 2 }`, and `--no-prewarm`
+            // cannot save it because the load happens here, per request.
+            // `resolved_for_model` is the same resolver `ensure_model` itself
+            // calls for its config layer, without the weight load. The daemon
+            // still loads lazily if a request actually falls back to it.
+            let (tag, entry) = runtime
+                .registry
+                .model(&model)
+                .map(|(tag, entry)| (Some(tag.to_owned()), Some(entry)))
+                .unwrap_or((None, None));
+            let resolved =
+                crate::resolved_for_model(&runtime.paths, &model, tag.as_deref(), entry)?;
             let inc = include_reasoning_content(runtime.current_arch.as_deref());
             Some(
                 project_request_contract(body, &resolved, inc)?.with_reasoning(
