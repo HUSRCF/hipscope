@@ -318,7 +318,7 @@ impl ConcurrencyBackend for SlotDriver {
     }
 
     fn run(&mut self, workload: WorkloadSel, k: usize, max_tokens: u64) -> Result<ArmResult> {
-        use hipfire_runtime::serve::{Event, SubmitRequest};
+        use hipfire_runtime::serve::{Continuation, Event, SubmitRequest};
         check_k(self, k)?;
 
         let hits_before = self.engine.stats().prefix_hits;
@@ -331,11 +331,14 @@ impl ConcurrencyBackend for SlotDriver {
             let (prompt_tokens, convo) = self.render(run, i);
             self.engine
                 .submit(SubmitRequest {
-                    session: None,
                     prompt_tokens,
                     convo,
-                    continuation: Vec::new(),
+                    continuation: Continuation::Cold,
                     max_tokens: max_tokens as usize,
+                    temperature: 0.0,
+                    top_p: 1.0,
+                    top_k: 0,
+                    seed: 0,
                     reply: tx,
                 })
                 .map_err(|e| anyhow::anyhow!("slots submit: {e}"))?;
@@ -348,7 +351,7 @@ impl ConcurrencyBackend for SlotDriver {
         for (i, rx) in rxs.into_iter().enumerate() {
             while let Ok(ev) = rx.recv() {
                 match ev {
-                    Event::Accepted { session } => sessions[i] = Some(session),
+                    Event::Accepted { session, .. } => sessions[i] = Some(session),
                     Event::Token { .. } => tokens += 1,
                     Event::Done { .. } => break,
                     Event::Rejected { .. } => {
@@ -376,11 +379,14 @@ impl ConcurrencyBackend for SlotDriver {
                 );
                 self.engine
                     .submit(SubmitRequest {
-                        session: Some(*session),
                         prompt_tokens: Vec::new(),
                         convo,
-                        continuation,
+                        continuation: Continuation::UserTurn(continuation),
                         max_tokens: max_tokens as usize,
+                        temperature: 0.0,
+                        top_p: 1.0,
+                        top_k: 0,
+                        seed: 0,
                         reply: tx,
                     })
                     .map_err(|e| anyhow::anyhow!("slots submit turn2: {e}"))?;

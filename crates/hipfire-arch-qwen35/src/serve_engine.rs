@@ -20,7 +20,9 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use hipfire_runtime::admission::{AdmissionController, ModelFootprint};
-use hipfire_runtime::serve::{send_event, DoneReason, EngineStats, Event, SubmitRequest};
+use hipfire_runtime::serve::{
+    send_event, Continuation, DoneReason, EngineStats, Event, SubmitRequest,
+};
 use hipfire_runtime::session_table::{SessionId, SessionTable};
 use hipfire_runtime::swap::snapshot::{capture_slot, restore_slot, SnapshotStamp};
 use hipfire_runtime::swap::SwapManager;
@@ -374,7 +376,7 @@ fn run_loop(mut rig: Rig, rx: Receiver<SubmitRequest>, stats: Arc<Mutex<EngineSt
             .gpu
             .sample_per_slot(
                 &rig.logits_out,
-                &rig.sample_params,
+                &mut rig.sample_params,
                 n,
                 rig.config.vocab_size,
                 &rig.out_tokens,
@@ -428,7 +430,14 @@ fn run_loop(mut rig: Rig, rx: Receiver<SubmitRequest>, stats: Arc<Mutex<EngineSt
                 } else {
                     DoneReason::MaxTokens
                 };
-                let _ = send_event(&f.reply, Event::Done { reason });
+                // Terminator and undelivered (gone) tokens are counted by
+                // `produced` but never reached the client.
+                let generated = if hit_eos || gone {
+                    f.produced - 1
+                } else {
+                    f.produced
+                };
+                let _ = send_event(&f.reply, Event::Done { reason, generated });
                 slots[s] = None;
                 work[s].remaining_prompt.clear();
                 if matches!(reason, DoneReason::ClientGone) {
@@ -471,12 +480,18 @@ fn admit(
     // turn began after an OpenThink opener that history rendering does not
     // replay, and re-encoding the decoded reply is not guaranteed to round
     // trip. Reuse also keeps the DeltaNet state, which is the point.
-    if !req.continuation.is_empty() {
+    if !req.continuation.tokens().is_empty() {
         if rig.gpu.slot_trace() {
+            let shape = match &req.continuation {
+                Continuation::ToolResults { session, .. } => {
+                    format!("tool-results of session {session}")
+                }
+                _ => "new user turn".to_string(),
+            };
             eprintln!(
-                "[slot-trace] continuation attempt: convo={:?} suffix={} tokens",
+                "[slot-trace] continuation attempt ({shape}): convo={:?} suffix={} tokens",
                 req.convo,
-                req.continuation.len()
+                req.continuation.tokens().len(),
             );
             for (id, sess) in rig.sessions.iter() {
                 eprintln!(
@@ -489,7 +504,20 @@ fn admit(
                 );
             }
         }
-        if let Some(existing) = rig.sessions.find_continuation(&req.convo, &busy) {
+        // The suffix shape decides which match is legal — never both. A user
+        // turn searches for the session one turn behind; tool results confirm
+        // the session that emitted the calls being answered. Either way the
+        // suffix is appended to the session's exact stored tokens, so the KV
+        // and DeltaNet state extend strictly.
+        let matched = match &req.continuation {
+            Continuation::Cold => None,
+            Continuation::UserTurn(_) => rig.sessions.find_continuation(&req.convo, &busy),
+            Continuation::ToolResults { session, .. } => {
+                rig.sessions
+                    .confirm_reentry(SessionId(*session), &req.convo, &busy)
+            }
+        };
+        if let Some(existing) = matched {
             let base = rig
                 .sessions
                 .get(existing)
@@ -523,7 +551,7 @@ fn admit(
             }
             if let Some(slot) = slot {
                 let mut extended = base;
-                extended.extend_from_slice(&req.continuation);
+                extended.extend_from_slice(req.continuation.tokens());
                 // Prefill-side context-cap guard (mirrors decode hit_ctx_cap).
                 // A prompt/extension already at the KV cap overflows set_seq_len
                 // during prefill before any decode step can stop it.
@@ -532,6 +560,7 @@ fn admit(
                         &req.reply,
                         Event::Done {
                             reason: DoneReason::MaxTokens,
+                            generated: 0,
                         },
                     );
                     return;
@@ -545,6 +574,8 @@ fn admit(
                         &req.reply,
                         Event::Accepted {
                             session: existing.0,
+                            reused: plan.reused,
+                            prefill: extended.len() - plan.reused,
                         },
                     )
                     .is_ok()
@@ -552,6 +583,12 @@ fn admit(
                         work[slot.0].remaining_prompt = extended[plan.reused..].to_vec();
                         work[slot.0].next_pos = plan.reused;
                         work[slot.0].decoding = false;
+                        rig.sample_params[slot.0] = SlotSampleParams {
+                            temperature: req.temperature,
+                            top_p: req.top_p,
+                            top_k: req.top_k,
+                            seed: req.seed,
+                        };
                         slots[slot.0] = Some(InFlight {
                             session: existing,
                             reply: req.reply,
@@ -587,6 +624,7 @@ fn admit(
             &req.reply,
             Event::Done {
                 reason: DoneReason::MaxTokens,
+                generated: 0,
             },
         );
         return;
@@ -696,7 +734,16 @@ fn admit(
         sess.convo = req.convo.clone();
     }
 
-    if send_event(&req.reply, Event::Accepted { session: id.0 }).is_err() {
+    if send_event(
+        &req.reply,
+        Event::Accepted {
+            session: id.0,
+            reused: plan.reused,
+            prefill: req.prompt_tokens.len() - plan.reused,
+        },
+    )
+    .is_err()
+    {
         rig.sessions.close(&mut rig.pool, &mut rig.adm, id);
         return;
     }
@@ -704,6 +751,12 @@ fn admit(
     work[slot.0].remaining_prompt = req.prompt_tokens[plan.reused..].to_vec();
     work[slot.0].next_pos = plan.reused;
     work[slot.0].decoding = false;
+    rig.sample_params[slot.0] = SlotSampleParams {
+        temperature: req.temperature,
+        top_p: req.top_p,
+        top_k: req.top_k,
+        seed: req.seed,
+    };
     slots[slot.0] = Some(InFlight {
         session: id,
         reply: req.reply,
