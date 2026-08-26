@@ -383,6 +383,12 @@ pub(crate) const RAW_CODECS: &[RawCodec] = &[
         quant_type: 19,
         dtype: DType::MQ2G256Lloyd,
     },
+    // qt=51: unrotated MQ2-Lloyd (Maple native ternary). Same 72 B/group
+    // layout as qt=19, so the same raw codec carries it.
+    RawCodec {
+        quant_type: 51,
+        dtype: DType::MQ2G256LloydU,
+    },
     RawCodec {
         quant_type: 20,
         dtype: DType::MQ3G256Lloyd,
@@ -1617,27 +1623,28 @@ mod tests {
         // (quant_type, dtype) — RHS copied from the pre-refactor arms:
         //   wb = weight_backend.rs (dequant_weight_raw), hfq = hfq.rs (load_weight_tensor)
         let expected: &[(u8, DType)] = &[
-            (0, DType::Q4F16G64),      // hfq:712
-            (3, DType::Q8_0),          // wb:487 / hfq:725
-            (4, DType::Q4K),           // hfq:738
-            (5, DType::Q8HFQ),         // hfq:754
-            (6, DType::HFQ4G256),      // wb:299 / hfq:767
-            (7, DType::HFQ4G128),      // wb:311 / hfq:780
-            (8, DType::HFQ6G256),      // wb:323 / hfq:793
-            (9, DType::HFQ2G256),      // hfq:807
-            (10, DType::HFQ2G128),     // hfq:819
-            (11, DType::HFQ3G256),     // wb:335 / hfq:832
-            (12, DType::HFQ3G128),     // wb:347 / hfq:845
-            (13, DType::MQ4G256),      // wb:359 / hfq:858
-            (14, DType::MQ8G256),      // wb:371 / hfq:871
-            (15, DType::MQ6G256),      // wb:383
-            (17, DType::MQ3G256),      // wb:395 / hfq:884
-            (18, DType::MQ2G256),      // wb:407 / hfq:897
-            (19, DType::MQ2G256Lloyd), // wb:419 / hfq:910
-            (20, DType::MQ3G256Lloyd), // wb:431 / hfq:923
-            (21, DType::HFP4G32),      // wb:459 / hfq:944
-            (24, DType::MFP4G32),      // wb:475 / hfq:963
-            (30, DType::MQ4G256Lloyd), // wb:443 / hfq:978 (renumbered from 21; do not swap)
+            (0, DType::Q4F16G64),       // hfq:712
+            (3, DType::Q8_0),           // wb:487 / hfq:725
+            (4, DType::Q4K),            // hfq:738
+            (5, DType::Q8HFQ),          // hfq:754
+            (6, DType::HFQ4G256),       // wb:299 / hfq:767
+            (7, DType::HFQ4G128),       // wb:311 / hfq:780
+            (8, DType::HFQ6G256),       // wb:323 / hfq:793
+            (9, DType::HFQ2G256),       // hfq:807
+            (10, DType::HFQ2G128),      // hfq:819
+            (11, DType::HFQ3G256),      // wb:335 / hfq:832
+            (12, DType::HFQ3G128),      // wb:347 / hfq:845
+            (13, DType::MQ4G256),       // wb:359 / hfq:858
+            (14, DType::MQ8G256),       // wb:371 / hfq:871
+            (15, DType::MQ6G256),       // wb:383
+            (17, DType::MQ3G256),       // wb:395 / hfq:884
+            (18, DType::MQ2G256),       // wb:407 / hfq:897
+            (19, DType::MQ2G256Lloyd),  // wb:419 / hfq:910
+            (51, DType::MQ2G256LloydU), // unrotated sibling of 19
+            (20, DType::MQ3G256Lloyd),  // wb:431 / hfq:923
+            (21, DType::HFP4G32),       // wb:459 / hfq:944
+            (24, DType::MFP4G32),       // wb:475 / hfq:963
+            (30, DType::MQ4G256Lloyd),  // wb:443 / hfq:978 (renumbered from 21; do not swap)
             // GL ("global Lloyd") codebook formats — MoE-routed-expert only.
             // RHS pinned against hipfire-quantize `QuantType::MQ2G256GL = 38` /
             // `MQ3G256GL = 39`; a swap here mis-decodes 64 B/group indices as

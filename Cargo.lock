@@ -1186,6 +1186,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-arch-maple"
+version = "0.3.0"
+dependencies = [
+ "hip-bridge",
+ "hipfire-config",
+ "hipfire-dispatch",
+ "hipfire-runtime",
+ "rdna-compute",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "hipfire-arch-minimax"
 version = "0.3.0"
 dependencies = [
@@ -1409,6 +1422,7 @@ dependencies = [
  "hipfire-arch-gemma4",
  "hipfire-arch-lfm2moe",
  "hipfire-arch-llama",
+ "hipfire-arch-maple",
  "hipfire-arch-minimax",
  "hipfire-arch-muse-glimmer",
  "hipfire-arch-qwen2",
@@ -1438,6 +1452,7 @@ dependencies = [
  "hipfire-arch-gemma4",
  "hipfire-arch-lfm2moe",
  "hipfire-arch-llama",
+ "hipfire-arch-maple",
  "hipfire-arch-minimax",
  "hipfire-arch-muse-glimmer",
  "hipfire-arch-qwen2",

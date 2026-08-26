@@ -303,6 +303,7 @@ const REGISTRY: &[&dyn Carrier] = &[
     &MinimaxCarrier,
     &Lfm2MoeCarrier,
     &Cohere2MoeCarrier,
+    &MapleCarrier,
     &Gemma4Carrier,
     &MuseGlimmerCarrier,
 ];
@@ -1095,6 +1096,19 @@ impl LoadedModel {
         self.state
             .as_deref_mut()
             .and_then(|s| (s as &mut dyn Any).downcast_mut::<Cohere2MoeBundle>())
+    }
+
+    /// Maple-Preview bundle if this model is arch_id=15, else None.
+    pub fn maple(&self) -> Option<&hipfire_arch_maple::MapleBundle> {
+        self.state
+            .as_deref()
+            .and_then(|s| (s as &dyn Any).downcast_ref::<hipfire_arch_maple::MapleBundle>())
+    }
+
+    pub fn maple_mut(&mut self) -> Option<&mut hipfire_arch_maple::MapleBundle> {
+        self.state
+            .as_deref_mut()
+            .and_then(|s| (s as &mut dyn Any).downcast_mut::<hipfire_arch_maple::MapleBundle>())
     }
 
     /// DeepSeek V4 bundle if this model is a single-GPU arch_id=9, else None.

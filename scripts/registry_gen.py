@@ -57,6 +57,11 @@ SIZE_TOLERANCE = 0.25
 # error: a new format must be added here deliberately, not silently passed.
 KNOWN_QUANTS = {
     "mq2lloyd",
+    # Maple-Preview's UNROTATED MQ2-Lloyd sibling (qt=51, MQ2G256LloydU). Shares
+    # mq2lloyd's 72 B/group layout byte-for-byte but is NOT FWHT-rotated, so it
+    # is a distinct format and must not be filed as "mq2lloyd": feeding a
+    # rotated activation to unrotated weights is silent garbage, not an error.
+    "mq2lloydu",
     "mq2",
     "mq2r",
     "mq3",
@@ -266,6 +271,9 @@ def arch_id_for(tag: str, entry: dict) -> int | None:
         return 11
     if family == "north-mini-code":
         return 12
+    # Maple-Preview: natively-ternary 256-expert MoE, its own arch crate.
+    if family == "maple-preview":
+        return 15
     if family == "vibethinker":
         return 7   # Qwen2 dense (WeiboAI/VibeThinker-3B base)
     return None

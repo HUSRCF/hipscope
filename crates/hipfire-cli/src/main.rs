@@ -58,6 +58,11 @@ pub(crate) const MODEL_SUFFIXES: &[&str] = &[
     ".hfq",
     ".mq2",
     ".mq2lloyd",
+    // qt51 `MQ2G256LloydU` — the UNROTATED sibling of `.mq2lloyd` (qt19, which
+    // is FWHT-rotated). Deliberately NOT folded into `.mq2lloyd`: loading a
+    // rotated container as unrotated (or the reverse) does not fail loudly, it
+    // produces silent garbage, so the two must stay nameable apart.
+    ".mq2lloydu",
     ".mq2r",
     ".mq2rxt",
     ".mq3",

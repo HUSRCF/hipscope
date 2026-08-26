@@ -748,6 +748,7 @@ pub enum GenerationRoute {
     Deepseek4Spec,
     CohereAr,
     CohereSpec,
+    MapleAr,
     MiniMaxAr,
     MiniMaxEp,
     MiniMaxSpec,
@@ -775,6 +776,7 @@ impl GenerationRoute {
         Self::Deepseek4Spec,
         Self::CohereAr,
         Self::CohereSpec,
+        Self::MapleAr,
         Self::MiniMaxAr,
         Self::MiniMaxEp,
         Self::MiniMaxSpec,
@@ -790,7 +792,20 @@ impl GenerationRoute {
     ];
 
     /// Proven semantic-safe producers for non-empty tools.
-    /// Exactly: Qwen AR, Qwen DFlash/spec, DS4 AR, DS4 EP, DS4 spec, Glimmer AR, Glimmer spec.
+    /// Exactly: Qwen AR, Qwen DFlash/spec, DS4 AR, DS4 EP, DS4 spec, Glimmer
+    /// AR, Glimmer spec, Maple AR.
+    ///
+    /// `MapleAr` is admitted on the LEGACY contract, not semantic v2: its
+    /// carrier keeps `semantic_contract_version: None` (no router-backed
+    /// producer on arch 15, and the v2 fold appends token text verbatim, which
+    /// would misfile Maple's `<think>` span as content instead of reasoning).
+    /// Legacy is a first-class tool carrier — the client fold collects
+    /// `{"type":"tool_calls"}` events and releases them on a
+    /// `finish_reason == "tool_calls"` terminal. `generate_maple` emits exactly
+    /// that, parsing calls with the SAME
+    /// `emit_text::extract_tool_calls_from_text` used for `qwen_ar`, because
+    /// Maple's vendor template emits the identical
+    /// `<tool_call>{json}</tool_call>` shape.
     pub const fn supports_tools(self) -> bool {
         matches!(
             self,
@@ -801,6 +816,7 @@ impl GenerationRoute {
                 | Self::Deepseek4Spec
                 | Self::GlimmerAr
                 | Self::GlimmerSpec
+                | Self::MapleAr
         )
     }
 
@@ -815,6 +831,7 @@ impl GenerationRoute {
             Self::Deepseek4Spec => "deepseek4_spec",
             Self::CohereAr => "cohere_ar",
             Self::CohereSpec => "cohere_spec",
+            Self::MapleAr => "maple_ar",
             Self::MiniMaxAr => "minimax_ar",
             Self::MiniMaxEp => "minimax_ep",
             Self::MiniMaxSpec => "minimax_spec",
@@ -907,6 +924,11 @@ pub fn select_generation_route(i: &GenerationRouteInputs) -> GenerationRoute {
                 GenerationRoute::CohereAr
             };
         }
+        // Maple-Preview. No spec variant: `MapleCarrier::caps()` declares no
+        // dflash and no MTP, and there is no maple verify path, so a
+        // speculator built by the carrier must NOT change the route — an
+        // arch-15 turn is always plain AR.
+        15 => return GenerationRoute::MapleAr,
         10 => {
             let spec_ok = i.has_speculator && (i.temp <= 1e-6 || i.ngram_can_sample);
             return if spec_ok {
@@ -1109,9 +1131,20 @@ pub fn generate(
         crate::dense::emit_active_attempt_error(
             stdout,
             Some(id),
+            // Derived from `supports_tools`, not hand-listed: the previous
+            // literal had already drifted (it omitted glimmer_ar/glimmer_spec,
+            // which were tool-capable), so a refusal named routes that were in
+            // fact supported. Deriving it keeps the message true by
+            // construction as the whitelist grows.
             &format!(
-                "tools are not supported on producer route {} (semantic-safe producers: qwen_ar, qwen_dflash, deepseek4_ar, deepseek4_ep, deepseek4_spec)",
-                selected_route.name()
+                "tools are not supported on producer route {} (semantic-safe producers: {})",
+                selected_route.name(),
+                GenerationRoute::ALL
+                    .iter()
+                    .filter(|r| r.supports_tools())
+                    .map(|r| r.name())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ),
             "unsupported",
             false,
@@ -1367,6 +1400,39 @@ pub fn generate(
                 id,
                 prompt,
                 system_prompt,
+                temp,
+                top_p,
+                max_tokens,
+                repeat_penalty,
+                repeat_window,
+            );
+            return;
+        }
+        GenerationRoute::MapleAr => {
+            // Arch 15 has no pflash, no eviction and no think budget.
+            // `messages_history` is NOT in the discard set — Maple re-renders
+            // the full conversation every turn and cold-resets its KV, so the
+            // history is the only thing carrying prior turns. `tools` is no
+            // longer discarded either: it feeds the vendor template's `# Tools`
+            // block, without which the model invents tool names.
+            let _ = (
+                budget_alert_at_tok,
+                budget_alert_text,
+                max_think_tokens,
+                assistant_prefix,
+                pflash_state,
+                pflash_cfg,
+            );
+            let _ = stop;
+            crate::dense::generate_maple(
+                m,
+                gpu,
+                stdout,
+                id,
+                prompt,
+                system_prompt,
+                messages_history,
+                tools,
                 temp,
                 top_p,
                 max_tokens,
