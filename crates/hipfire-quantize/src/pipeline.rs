@@ -118,6 +118,10 @@ struct MainQuantOuter<'a> {
 struct MainQuantState<'a> {
     hfq_tensors: &'a mut Vec<HfqTensor>,
     quantized_params: &'a mut u64,
+    /// Params kept at F16 (norms, biases). Tracked separately so the summary's
+    /// accounting can be made to balance — see the closure check in `run`.
+    /// Without it, dropping every norm shows up only as a rounding artefact in
+    /// the "100.0%" quantized figure.
     total_quant_error: &'a mut f64,
     max_quant_error: &'a mut f32,
     _n_quant_groups: &'a mut u64,
@@ -2395,9 +2399,7 @@ pub(crate) fn run() {
         //   model.language_model.layers.{N}.experts.down_proj
         // Name-suffix match + shape check handles both qwen3.5 (mlp.experts.*)
         // and gemma4 (experts.*) without prefix-specific conditions.
-        let is_moe_expert_3d = (is_moe || is_gemma4)
-            && (name.ends_with("experts.gate_up_proj") || name.ends_with("experts.down_proj"))
-            && meta.shape.len() == 3;
+        let is_moe_expert_3d = moe_expert_3d_applies(is_moe, is_gemma4, name, &meta.shape);
         if is_moe_expert_3d {
             let __ctx = PerTensorCtx {
                 name,
@@ -2426,6 +2428,8 @@ pub(crate) fn run() {
                 use_gptq_mfp2e8,
                 use_mq6g256,
                 use_mq4g256,
+                use_mq4v2,
+                use_mq4c,
                 use_mq4_mq6exp,
                 use_mq4_mq2lloydexp,
                 use_mq4_mq2glexp,
@@ -2740,6 +2744,30 @@ pub(crate) fn run() {
     eprintln!("  Mean quant error: {mean_quant_error:.8}");
     eprintln!("  Max quant error:  {max_quant_error:.8}");
     eprintln!("  Output size:      {:.1} MB", total_bytes as f64 / 1e6);
+
+    // Accounting must close: every input param is quantized, kept at F16, or
+    // deliberately skipped. A gap means tensors were silently dropped.
+    //
+    // This check exists because `d1d172e9c` deleted the F16 fallback arm and
+    // every norm and bias vanished from the artifact. Nothing caught it — the
+    // quantizer exited 0, tensor count and byte size looked plausible, and the
+    // only symptom was `Quantized params` sitting 176,768 below `Total params`,
+    // printed as "100.0%" after rounding. The failure surfaced a whole task
+    // later, at model load, with an error naming the loader rather than the
+    // quantizer that caused it.
+    // NB: `total_params` counts only ingested tensors — `skipped_params` is
+    // accumulated on the `continue` paths before a tensor ever reaches the
+    // total, so it must NOT appear on this side of the equation. Adding it
+    // double-counts and the check fires on a healthy run.
+    if quantized_params != total_params {
+        let gap = total_params as i128 - quantized_params as i128;
+        eprintln!(
+            "\nERROR: param accounting does not close — {gap} params unaccounted for.\n  \
+             total={total_params} quantized={quantized_params} (skipped={skipped_params}, excluded from total)\n  \
+             Tensors were silently dropped; refusing to write a model that cannot load."
+        );
+        std::process::exit(2);
+    }
 
     // ── Deterministic recipe census/metadata ─────────────────────────────
     {
@@ -3828,6 +3856,27 @@ fn handle_cohere2moe(
     true
 }
 
+/// Does the stacked-3D routed-expert path apply to this tensor?
+///
+/// Single source of truth for the `handle_moe_expert_3d` precondition, used
+/// both at the call site and as that function's own fail-closed guard.
+///
+/// The `shape.len() == 3` term is load-bearing and easy to lose. `d1d172e9c`
+/// ("decompose quantize run(), byte-identical output") extracted the body into
+/// a function and replaced `if is_moe_expert_3d { … }` with a bare block, so
+/// the predicate was computed and discarded. The function then indexes
+/// `shape[1..][1]` unconditionally and panics on any 2-D tensor whose name ends
+/// in `experts.gate_up_proj` / `experts.down_proj`.
+///
+/// It stayed latent because models whose expert tensors are all stacked-3D
+/// never present a 2-D tensor here. Ornith 1.5 does: its MTP module ships
+/// experts UN-stacked, as 2-D `mtp.layers.0.mlp.experts.{N}.*` tensors.
+fn moe_expert_3d_applies(is_moe: bool, is_gemma4: bool, name: &str, shape: &[usize]) -> bool {
+    (is_moe || is_gemma4)
+        && (name.ends_with("experts.gate_up_proj") || name.ends_with("experts.down_proj"))
+        && shape.len() == 3
+}
+
 fn handle_moe_expert_3d(
     ctx: &PerTensorCtx,
     meta: &TensorMeta,
@@ -3846,6 +3895,11 @@ fn handle_moe_expert_3d(
     use_gptq_mfp2e8: bool,
     use_mq6g256: bool,
     use_mq4g256: bool,
+    // Routed experts are ~99% of an A3B MoE's tensors, so if these two never
+    // reach here, `--format mq4` silently yields a qt13 model with a handful of
+    // qt44 tensors bolted on. See the default `supports_g256` arm below.
+    use_mq4v2: bool,
+    use_mq4c: bool,
     use_mq4_mq6exp: bool,
     use_mq4_mq2lloydexp: bool,
     use_mq4_mq2glexp: bool,
@@ -3971,6 +4025,17 @@ fn handle_moe_expert_3d(
     let expert_mq6 = (use_mq6g256
         || use_mq4_mq6exp
         || (kmap_promote && use_mq4g256)
+        // qt44/qt45 must promote too. Without these two terms `--format mq4`
+        // (which sets use_mq4v2, NOT use_mq4g256) silently drops every K-map
+        // Promote6 routed expert from 6-bit to 4-bit. Measured on Ornith 1.5
+        // 35B-A3B: `--format mq4v1` emits 8,235 Mq6G256 tensors, `--format mq4`
+        // emitted 43 — a loss of 8,192 expert tensors' worth of precision.
+        //
+        // #599's description states "K-map Promote6 now emits MQ6 for qt44/qt45
+        // when K%256==0". That holds on the non-expert path; this arm is where
+        // routed experts are decided, and it was never updated.
+        || (kmap_promote && use_mq4v2)
+        || (kmap_promote && use_mq4c)
         || (kmap_promote && use_mq4_mq2lloyd_kmap)
         || (kmap_promote && use_mq4_mq2lloyd_imatrix)
         || (kmap_promote && use_mq4_mq2lloyd_gptq_all)
@@ -4525,6 +4590,18 @@ fn handle_moe_expert_3d(
                 let q =
                     quantize_mfp4g32_e8_soa_2d(&f32_slice, inner_m, inner_k_e, &signs1, &signs2);
                 (q, QuantType::MFP4G32E8SOA, 32u32)
+            } else if supports_g256 && use_mq4c {
+                // qt45 MQ4C — same 136-byte stride as qt13, packed fp16
+                // scale/zero header.
+                let q = quantize_mq4cg256(&f32_slice, inner_m, inner_k_e, &signs1, &signs2);
+                (q, QuantType::MQ4CG256, 256u32)
+            } else if supports_g256 && use_mq4v2 {
+                // qt44 MQ4 v2 — two fp16 scale/zero pairs per 256-weight group.
+                // This arm is what makes `--format mq4` mean qt44 for routed
+                // experts. Without it the experts fall to the qt13 arm below,
+                // and on an A3B MoE that is ~99% of the model by tensor count.
+                let q = quantize_mq4g256v2(&f32_slice, inner_m, inner_k_e, &signs1, &signs2);
+                (q, QuantType::MQ4G256V2, 256u32)
             } else if supports_g256 {
                 let q = quantize_mq4g256(&f32_slice, &signs1, &signs2);
                 (q, QuantType::MQ4G256, 256u32)
@@ -6971,4 +7048,67 @@ pub(crate) fn hfq_requant_to_bq1_example(
 ) -> (Vec<u8>, QuantType, u32) {
     let q = quantize_bq1g128_gptq(f32_data, col_weights, 0.0);
     (q, QuantType::BQ1G128, 128)
+}
+
+#[cfg(test)]
+mod pipeline_tests {
+    use super::moe_expert_3d_applies;
+
+    /// Regression pin for `d1d172e9c`, which extracted `handle_moe_expert_3d`
+    /// and dropped its `shape.len() == 3` precondition at the call site. A 2-D
+    /// expert tensor then reached code that indexes `shape[1..][1]` and
+    /// panicked. Ornith 1.5's MTP module ships exactly such tensors.
+    #[test]
+    fn moe_expert_3d_rejects_two_dimensional_expert_tensors() {
+        // The shape that actually panicked: an un-stacked per-expert 2-D
+        // weight, [2 * moe_intermediate, hidden].
+        assert!(
+            !moe_expert_3d_applies(
+                true,
+                false,
+                "mtp.layers.0.mlp.experts.0.gate_up_proj",
+                &[1024, 2048],
+            ),
+            "a 2-D expert tensor must not enter the stacked-3D path"
+        );
+    }
+
+    #[test]
+    fn moe_expert_3d_accepts_the_stacked_layout() {
+        // Ornith 1.5's body experts, which SHOULD take this path.
+        assert!(moe_expert_3d_applies(
+            true,
+            false,
+            "model.language_model.layers.0.mlp.experts.gate_up_proj",
+            &[256, 1024, 2048],
+        ));
+        assert!(moe_expert_3d_applies(
+            true,
+            false,
+            "model.language_model.layers.0.mlp.experts.down_proj",
+            &[256, 2048, 512],
+        ));
+    }
+
+    /// Gemma 4 reaches the same path via a `.experts.` prefix with no `mlp.`.
+    #[test]
+    fn moe_expert_3d_accepts_gemma4_prefix() {
+        assert!(moe_expert_3d_applies(
+            false,
+            true,
+            "model.language_model.layers.0.experts.gate_up_proj",
+            &[128, 1024, 2048],
+        ));
+    }
+
+    /// Non-MoE models must never enter it, whatever the tensor is called.
+    #[test]
+    fn moe_expert_3d_requires_a_moe_model() {
+        assert!(!moe_expert_3d_applies(
+            false,
+            false,
+            "model.language_model.layers.0.mlp.experts.gate_up_proj",
+            &[256, 1024, 2048],
+        ));
+    }
 }

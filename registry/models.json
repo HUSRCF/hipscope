@@ -1451,10 +1451,59 @@
       "default_kv_mode": "q8",
       "desc": "Bonsai-27B ternary (Prism ML, TQ2G128 2.125 bpw). 7.16 GB, native MQ4-teacher KLD 0.505 with f32 KV over the 8-chunk fixture, ~22.4 tok/s decode and ~258 tok/s prefill on gfx1151 (medians of 3, after warmup). Apache-2.0; see the repo NOTICE.",
       "quant_recipe": "prismml-bonsai-q2_0-passthrough"
+    },
+    "ornith-1.5:35b-a3b": {
+      "repo": "hipfire-models/ornith-1.5-35b-a3b",
+      "mtp": {
+        "file": "ornith-1.5-35b-a3b.mtp"
+      },
+      "file": "ornith-1.5-35b-a3b.mq4",
+      "size_gb": 19.02,
+      "min_vram_gb": 22,
+      "default_kv_mode": "q8",
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 1.5,
+        "repeat_penalty": 1.0
+      },
+      "sampling_profiles": {
+        "general": {
+          "temperature": 1.0,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 1.5,
+          "repeat_penalty": 1.0
+        },
+        "coding": {
+          "temperature": 0.6,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 0.0,
+          "repeat_penalty": 1.0
+        },
+        "instruct": {
+          "temperature": 0.7,
+          "top_p": 0.8,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 1.5,
+          "repeat_penalty": 1.0
+        }
+      },
+      "desc": "MoE 35B/3B-active VL finetune (Qwen3.5 family), MQ4G256V2 trunk. 77.4 tok/s with MTP drafting at K=3 vs 69.7 autoregressive on gfx1151. Vision tower ships as ornith-1.5-35b-a3b.vl alongside the trunk. NOTE: the .mtp is a REPLACEMENT draft head derived from shisa-ai/Ornith-1.5-35B-A3B-MTP-ONLY (Apache-2.0), not the head from the Ornith 1.5 release -- that one drafts at ~13% acceptance and makes speculative decode slower than AR. See the repo README and NOTICE."
     }
   },
   "aliases": {
     "bonsai": "bonsai:27b-tq2",
+    "ornith": "ornith-1.5:35b-a3b",
+    "ornith-1.5": "ornith-1.5:35b-a3b",
+    "ornith1.5": "ornith-1.5:35b-a3b",
+    "ornith1.5:35b-a3b": "ornith-1.5:35b-a3b",
     "qwen3.5": "qwen3.5:4b",
     "qwen3.5:latest": "qwen3.5:9b",
     "qwen3.5:small": "qwen3.5:0.8b",

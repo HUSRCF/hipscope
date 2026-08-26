@@ -138,6 +138,8 @@ def _effort_native_tag(tag: str) -> bool:
         return True
     if family == "muse-glimmer" or base in {"muse-glimmer", "muse-glimmer:fast"}:
         return True
+    if family in {"ornith-1.5", "ornith1.5", "ornith"}:
+        return True
     return False
 
 
@@ -242,6 +244,18 @@ def arch_id_for(tag: str, entry: dict) -> int | None:
         return 6 if "a3b" in tag else 5
     if family == "nex-n2":
         return 6  # Nex-N2-mini = Qwen3.5-35B-A3B MoE (a3b not in tag name)
+    # Ornith 1.5 = Qwen3.5-family VL finetune. 35B-A3B is qwen3_5_moe (6), the
+    # 9B is dense qwen3_5 (5). Keyed on "a3b" like the qwen3.5 family above.
+    #
+    # BOTH spellings are mapped on purpose. The canonical tag is the hyphenated
+    # "ornith-1.5"; the artifacts were briefly published as "ornith1.5", which
+    # survives as an alias. Aliases do NOT reach this function (build_registry
+    # calls it over `models` only), so the unhyphenated arm is not load-bearing
+    # today — it is here so that re-adding or reverting to the old tag spelling
+    # cannot fail-close. An unmapped family returns None, which aborts the ENTIRE
+    # daily run, every other model's entry included.
+    if family in ("ornith-1.5", "ornith1.5", "ornith"):
+        return 6 if "a3b" in tag else 5
     if family == "qwen3":
         return 1
     if family in ("deepseek-v4-flash", "deepseek-v4-flash-preview"):

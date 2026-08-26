@@ -2350,6 +2350,46 @@ pub(crate) fn resolved_for_model(
     Ok(resolve(layers)?)
 }
 
+/// How [`scan_local_models`] compares an input against on-disk filenames.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MatchMode {
+    /// Compare the lowercased strings as written.
+    Literal,
+    /// Additionally strip `-`, `.` and `_` from both sides, so spellings that
+    /// differ only in separators compare equal (`ornith-1.5` ↔ `ornith1.5`).
+    IgnoreSeparators,
+}
+
+fn scan_local_models(local: &[PathBuf], search: &str, mode: MatchMode) -> Vec<PathBuf> {
+    let normalize = |value: &str| -> String {
+        let lower = value.to_ascii_lowercase();
+        match mode {
+            MatchMode::Literal => lower,
+            MatchMode::IgnoreSeparators => lower
+                .chars()
+                .filter(|c| !matches!(c, '-' | '.' | '_'))
+                .collect(),
+        }
+    };
+    let needle = normalize(search);
+    // A needle that normalizes to nothing (an input of only separators) would
+    // make `contains` true for every file and hand back an arbitrary model.
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    local
+        .iter()
+        .filter(|path| {
+            let name = normalize(
+                path.file_name()
+                    .and_then(|file| file.to_str())
+                    .unwrap_or_default(),
+            );
+            name == needle || name.contains(&needle)
+        })
+        .cloned()
+        .collect()
+}
 pub(crate) fn find_model_path(
     paths: &Paths,
     registry: &RegistryV1,
@@ -2378,18 +2418,22 @@ pub(crate) fn find_model_path(
     }
     let search = model.replace(':', "-").to_ascii_lowercase();
     let explicit_quant = MODEL_SUFFIXES.iter().any(|suffix| search.ends_with(suffix));
-    let mut candidates = local_model_paths(paths)
-        .ok()?
-        .into_iter()
-        .filter(|path| {
-            let name = path
-                .file_name()
-                .and_then(|file| file.to_str())
-                .unwrap_or_default()
-                .to_ascii_lowercase();
-            name == search || name.contains(&search)
-        })
-        .collect::<Vec<_>>();
+    let local = local_model_paths(paths).ok()?;
+    // Two passes. The first matches the literal spelling and is what has always
+    // run. The second retries with `-`, `.` and `_` stripped from both sides, so
+    // an input and an on-disk file that differ only in separators still meet:
+    // `ornith-1.5:35b-a3b` finds the `ornith1.5-35b-a3b.mq4` left on disk by
+    // anyone who downloaded before the artifacts were renamed.
+    //
+    // The fallback is strictly second — it runs only when the literal pass found
+    // nothing, so it can add a match where today there is none but can never
+    // change one that already resolves. That ordering is the safety argument:
+    // separator-stripping is a looser `contains`, and running it first would let
+    // it outrank an exact hit.
+    let mut candidates = scan_local_models(&local, &search, MatchMode::Literal);
+    if candidates.is_empty() {
+        candidates = scan_local_models(&local, &search, MatchMode::IgnoreSeparators);
+    }
     candidates.sort_by_key(|path| {
         let name = path
             .file_name()
@@ -5911,6 +5955,7 @@ mod tests {
         forward_think_fragments, inject_default_system_message, normalize_openai_messages,
         Completion, ThinkFragment,
     };
+
     use crate::serve::{serve_instance_token, Admission, ServeMeta, ServeRuntime, ServeShared};
     use hipfire_config::CONFIG_PROFILE_NAMES;
     fn test_paths(label: &str) -> Paths {
@@ -5956,6 +6001,75 @@ mod tests {
         assert!(is_model_file("draft.hfq"));
         assert!(!is_model_file("model.triattn.bin"));
         assert!(!is_model_file("README.md"));
+    }
+
+    /// The Ornith artifacts shipped briefly as `ornith1.5-*` before being
+    /// renamed to `ornith-1.5-*`. Anyone who downloaded during that window has
+    /// the old filename on disk, and the registry now points at the new one —
+    /// so the canonical tag must still find their file rather than silently
+    /// re-downloading 19 GB.
+    #[test]
+    fn separator_spellings_find_an_already_downloaded_file() {
+        let paths = test_paths("separator-spellings");
+        let legacy = paths.models.join("ornith1.5-35b-a3b.mq4");
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        fs::write(&legacy, b"fixture").unwrap();
+        let registry = hipfire_registry::bundled().unwrap();
+
+        // The new canonical spelling reaches the old file only via the
+        // separator-insensitive fallback — this is the case the rename broke.
+        assert_eq!(
+            find_model_path(&paths, &registry, "ornith-1.5:35b-a3b"),
+            Some(legacy.clone()),
+            "hyphenated tag must find the unhyphenated file"
+        );
+        // The old spelling already worked through the literal pass; pin it so
+        // the fallback cannot regress it.
+        assert_eq!(
+            find_model_path(&paths, &registry, "ornith1.5:35b-a3b"),
+            Some(legacy.clone()),
+            "legacy tag must keep working"
+        );
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    /// The fallback must not outrank a literal hit. With both spellings present
+    /// on disk, each input resolves to its own file, not to whichever the
+    /// looser comparison happened to reach first.
+    #[test]
+    fn literal_match_wins_over_the_separator_fallback() {
+        let paths = test_paths("separator-precedence");
+        let legacy = paths.models.join("ornith1.5-35b-a3b.mq4");
+        let renamed = paths.models.join("ornith-1.5-35b-a3b.mq4");
+        fs::create_dir_all(paths.models.as_path()).unwrap();
+        fs::write(&legacy, b"fixture").unwrap();
+        fs::write(&renamed, b"fixture").unwrap();
+        let registry = hipfire_registry::bundled().unwrap();
+
+        assert_eq!(
+            find_model_path(&paths, &registry, "ornith-1.5:35b-a3b"),
+            Some(renamed),
+            "exact spelling must win when it exists"
+        );
+        assert_eq!(
+            find_model_path(&paths, &registry, "ornith1.5:35b-a3b"),
+            Some(legacy),
+            "exact spelling must win when it exists"
+        );
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    /// An input that normalizes to the empty string must not match everything.
+    #[test]
+    fn separator_only_input_matches_nothing() {
+        let paths = test_paths("separator-empty");
+        let model = paths.models.join("qwen3.6-35b-a3b.mq4");
+        fs::create_dir_all(model.parent().unwrap()).unwrap();
+        fs::write(&model, b"fixture").unwrap();
+        let registry = hipfire_registry::bundled().unwrap();
+
+        assert_eq!(find_model_path(&paths, &registry, "-.-"), None);
+        fs::remove_dir_all(&paths.root).unwrap();
     }
 
     #[test]
@@ -8763,6 +8877,7 @@ mod tests {
     /// Capability denial: daemon typed error on tools request → no completion/tool payload.
     #[cfg(unix)]
     // --- Task 15: server-owned one-retry (disabled-by-default) ---
+
     #[test]
     fn bench_generate_request_includes_numeric_first_attempt() {
         let req = bench_generate_request("bench prompt", 37);
