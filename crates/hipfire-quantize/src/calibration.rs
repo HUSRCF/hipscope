@@ -107,7 +107,7 @@ pub(crate) fn is_gguf_input(p: &Path) -> bool {
 /// Returns None for tensors that don't have a known safetensors equivalent
 /// (we then keep them under their GGUF name; the future loader can decide
 /// what to do, or they're skipped).
-pub(crate) fn gguf_to_safetensors_name(gguf_name: &str, arch_str: &str) -> Option<String> {
+pub(crate) fn gguf_to_safetensors_name(gguf_name: &str, arch_id: u32) -> Option<String> {
     // Top-level tensors.
     match gguf_name {
         "token_embd.weight" => return Some("model.embed_tokens.weight".to_string()),
@@ -129,7 +129,7 @@ pub(crate) fn gguf_to_safetensors_name(gguf_name: &str, arch_str: &str) -> Optio
         // for gemma4 (that is the pre-FFN norm). The loader reads
         // `{p}.layer_scalar` with NO `.weight` suffix (HF tensor name), so
         // `layer_output_scale` needs an early return.
-        if arch_str == "gemma4" {
+        if arch_id == 13 {
             match slot {
                 "post_attention_norm" => {
                     return Some(format!(
@@ -657,7 +657,11 @@ pub(crate) fn gguf_is_embed_tensor(name: &str) -> bool {
 /// reads. Mirrors the field names HuggingFace uses in `config.json` for
 /// LlamaForCausalLM / Qwen3ForCausalLM, populated from the GGUF
 /// `<arch>.*` metadata keys.
-pub(crate) fn config_json_from_gguf(gguf: &gguf_input::GgufFile, arch_str: &str) -> serde_json::Value {
+pub(crate) fn config_json_from_gguf(
+    gguf: &gguf_input::GgufFile,
+    arch_str: &str,
+    arch_id: u32,
+) -> serde_json::Value {
     // GGUF prefixes its model hyperparameters with the architecture name —
     // e.g. for `general.architecture=llama` the keys live under `llama.*`.
     let prefix = arch_str;
@@ -749,7 +753,7 @@ pub(crate) fn config_json_from_gguf(gguf: &gguf_input::GgufFile, arch_str: &str)
     if let Some(v) = head_dim {
         cfg.insert("head_dim".to_string(), serde_json::Value::from(v));
     }
-    if arch_str == "gemma4" {
+    if arch_id == 13 {
         apply_gemma4_fields(gguf, prefix, &mut cfg);
     }
     cfg.insert("bos_token_id".to_string(), serde_json::Value::from(bos));
@@ -1089,7 +1093,7 @@ mod gemma4_config_tests {
 
     #[test]
     fn gemma4_gguf_config_has_layout_fields() {
-        let cfg = config_json_from_gguf(&gemma4_12b_gguf(), "gemma4");
+        let cfg = config_json_from_gguf(&gemma4_12b_gguf(), "gemma4", 13);
         let lt = cfg["layer_types"].as_array().unwrap();
         assert_eq!(lt.len(), 48);
         for (i, v) in lt.iter().enumerate() {
@@ -1138,7 +1142,7 @@ mod gemma4_config_tests {
 
     #[test]
     fn gemma4_gguf_config_is_admitted_by_loader_parser() {
-        let cfg = config_json_from_gguf(&gemma4_12b_gguf(), "gemma4");
+        let cfg = config_json_from_gguf(&gemma4_12b_gguf(), "gemma4", 13);
         let metadata_json = serde_json::to_string(&serde_json::json!({ "config": cfg })).unwrap();
         let parsed = hipfire_arch_gemma4::config::Gemma4Config::from_metadata_json(&metadata_json)
             .expect("loader parser must admit the generated config");
@@ -1167,7 +1171,7 @@ mod gemma4_config_tests {
             name: "blk.5.attn_v.weight".into(),
             ..fake_tensor()
         });
-        let cfg = config_json_from_gguf(&gguf, "gemma4");
+        let cfg = config_json_from_gguf(&gguf, "gemma4", 13);
         assert!(cfg.get("attention_k_eq_v").is_none());
     }
 
@@ -1182,12 +1186,107 @@ mod gemma4_config_tests {
         m.insert("llama.feed_forward_length".into(), MetaValue::U32(11008));
         m.insert("llama.rope.freq_base".into(), MetaValue::F32(10000.0));
         let gguf = GgufFile::for_tests(m, vec![]).unwrap();
-        let cfg = config_json_from_gguf(&gguf, "llama");
+        let cfg = config_json_from_gguf(&gguf, "llama", 0);
         assert!(cfg.get("layer_types").is_none());
         assert!(cfg.get("rope_parameters").is_none());
         assert!(cfg.get("attention_k_eq_v").is_none());
         assert_eq!(cfg["num_key_value_heads"].as_u64(), Some(8));
         assert_eq!(cfg["head_dim"].as_u64(), Some(128));
+    }
+
+    /// gemma4_text is a distinct GGUF architecture string that still maps to
+    /// arch_id 13. Metadata keys use the raw string as prefix (`gemma4_text.*`),
+    /// but the translation gate must engage via arch_id — not `arch_str == "gemma4"`.
+    fn gemma4_text_12b_gguf() -> GgufFile {
+        let mut m: HashMap<String, MetaValue> = HashMap::new();
+        let kv_arr: Vec<MetaValue> = (0..48)
+            .map(|i| MetaValue::U32(if i % 6 == 5 { 1 } else { 8 }))
+            .collect();
+        let pattern: Vec<MetaValue> = (0..48).map(|i| MetaValue::Bool(i % 6 != 5)).collect();
+        m.insert("gemma4_text.attention.head_count".into(), MetaValue::U32(16));
+        m.insert(
+            "gemma4_text.attention.head_count_kv".into(),
+            MetaValue::Array(kv_arr),
+        );
+        m.insert("gemma4_text.attention.key_length".into(), MetaValue::U32(512));
+        m.insert(
+            "gemma4_text.attention.key_length_swa".into(),
+            MetaValue::U32(256),
+        );
+        m.insert(
+            "gemma4_text.attention.layer_norm_rms_epsilon".into(),
+            MetaValue::F32(1e-6),
+        );
+        m.insert(
+            "gemma4_text.attention.shared_kv_layers".into(),
+            MetaValue::U32(0),
+        );
+        m.insert(
+            "gemma4_text.attention.sliding_window".into(),
+            MetaValue::U32(1024),
+        );
+        m.insert(
+            "gemma4_text.attention.sliding_window_pattern".into(),
+            MetaValue::Array(pattern),
+        );
+        m.insert("gemma4_text.block_count".into(), MetaValue::U32(48));
+        m.insert("gemma4_text.context_length".into(), MetaValue::U32(262144));
+        m.insert("gemma4_text.embedding_length".into(), MetaValue::U32(3840));
+        m.insert(
+            "gemma4_text.embedding_length_per_layer_input".into(),
+            MetaValue::U32(0),
+        );
+        m.insert("gemma4_text.feed_forward_length".into(), MetaValue::U32(15360));
+        m.insert(
+            "gemma4_text.final_logit_softcapping".into(),
+            MetaValue::F32(30.0),
+        );
+        m.insert(
+            "gemma4_text.rope.freq_base".into(),
+            MetaValue::F64(1_000_000.0),
+        );
+        m.insert(
+            "gemma4_text.rope.freq_base_swa".into(),
+            MetaValue::F64(10_000.0),
+        );
+        m.insert(
+            "general.architecture".into(),
+            MetaValue::String("gemma4_text".into()),
+        );
+
+        let mut tensors = vec![TensorInfo {
+            name: "token_embd.weight".into(),
+            shape: vec![3840, 262144],
+            ..fake_tensor()
+        }];
+        for i in 0..48 {
+            tensors.push(TensorInfo {
+                name: format!("blk.{i}.attn_k.weight"),
+                ..fake_tensor()
+            });
+            if i % 6 != 5 {
+                tensors.push(TensorInfo {
+                    name: format!("blk.{i}.attn_v.weight"),
+                    ..fake_tensor()
+                });
+            }
+        }
+        GgufFile::for_tests(m, tensors).unwrap()
+    }
+
+    #[test]
+    fn gemma4_text_arch_engages_translation() {
+        let cfg = config_json_from_gguf(&gemma4_text_12b_gguf(), "gemma4_text", 13);
+        let lt = cfg["layer_types"].as_array().expect(
+            "gemma4_text (arch_id 13) must emit layer_types; gating on raw arch_str skips it",
+        );
+        assert_eq!(lt.len(), 48);
+        assert_eq!(cfg["num_key_value_heads"].as_u64(), Some(8));
+        assert_eq!(cfg["num_global_key_value_heads"].as_u64(), Some(1));
+        assert_eq!(cfg["head_dim"].as_u64(), Some(256));
+        assert_eq!(cfg["global_head_dim"].as_u64(), Some(512));
+        assert_eq!(cfg["attention_k_eq_v"].as_bool(), Some(true));
+        assert_eq!(cfg["model_type"].as_str(), Some("gemma4_text"));
     }
 }
 
@@ -1198,7 +1297,7 @@ mod gemma4_name_translation_tests {
     #[test]
     fn gemma4_sandwich_norms_map_to_loader_names() {
         let f = |slot: &str| {
-            gguf_to_safetensors_name(&format!("blk.7.{slot}.weight"), "gemma4").unwrap()
+            gguf_to_safetensors_name(&format!("blk.7.{slot}.weight"), 13).unwrap()
         };
         assert_eq!(f("attn_norm"), "model.layers.7.input_layernorm.weight");
         assert_eq!(
@@ -1225,14 +1324,28 @@ mod gemma4_name_translation_tests {
         // The two-norm Llama layout must be byte-identical to before the
         // gemma4 arm existed — ffn_norm IS post_attention_layernorm there.
         assert_eq!(
-            gguf_to_safetensors_name("blk.3.ffn_norm.weight", "llama").unwrap(),
+            gguf_to_safetensors_name("blk.3.ffn_norm.weight", 0).unwrap(),
             "model.layers.3.post_attention_layernorm.weight"
         );
         // Gemma-4-only slots do not exist in Llama files; translation of an
         // unexpected slot passes through untouched (no gemma4 arm taken).
         assert_eq!(
-            gguf_to_safetensors_name("blk.3.post_ffw_norm.weight", "llama").unwrap(),
+            gguf_to_safetensors_name("blk.3.post_ffw_norm.weight", 0).unwrap(),
             "model.layers.3.post_ffw_norm.weight"
+        );
+    }
+
+    #[test]
+    fn gemma4_text_arch_id_engages_sandwich_norms() {
+        // arch_id 13 covers gemma4_text / gemma4_unified / gemma4_unified_text;
+        // the gate must not require the literal arch_str "gemma4".
+        assert_eq!(
+            gguf_to_safetensors_name("blk.2.ffn_norm.weight", 13).unwrap(),
+            "model.layers.2.pre_feedforward_layernorm.weight"
+        );
+        assert_eq!(
+            gguf_to_safetensors_name("blk.2.layer_output_scale.weight", 13).unwrap(),
+            "model.layers.2.layer_scalar"
         );
     }
 }
