@@ -301,6 +301,29 @@ pub fn continuation_suffix(tokenizer: &Tokenizer, user: &str, prefix: AssistantP
     out
 }
 
+pub fn continuation_suffix_tool_results(
+    tokenizer: &Tokenizer,
+    results: &[String],
+    prefix: AssistantPrefix,
+) -> Vec<u32> {
+    let scaffold = ChatScaffold::for_tokenizer(tokenizer);
+    let mut out: Vec<u32> = Vec::new();
+    out.extend_from_slice(&scaffold.im_end);
+    out.extend_from_slice(&scaffold.nl);
+    let mut body = String::new();
+    for (i, r) in results.iter().enumerate() {
+        if i > 0 {
+            body.push('\n');
+        }
+        body.push_str("<tool_response>\n");
+        body.push_str(r);
+        body.push_str("\n</tool_response>");
+    }
+    scaffold.append_user_turn(&mut out, &body);
+    scaffold.append_assistant_prefix(&mut out, prefix);
+    out
+}
+
 /// Pre-encoded ChatML scaffolding plus a borrowed tokenizer reference.
 /// The fixed structural tokens (`<|im_start|>`, role names, `\n`,
 /// `<|im_end|>`) are encoded once up front; per-turn content gets
@@ -3880,4 +3903,78 @@ SYS:{{ build_system_message(system_message) }}:END
             );
         }
     }
+    // ── tool-result continuation vs a cold render of the same history ───
+    //
+    // A tool-result turn is appended to a session's stored tokens instead of
+    // being re-rendered, so the suffix has to reproduce the tail the model's
+    // own template would have produced. Drift here is invisible at the call
+    // site and shows up only as a model that answers a `<tool_response>` it
+    // was never framed to see.
+
+    const QWEN35_REFERENCE: &str =
+        include_str!("../templates/eval/qwen35-official-reference.jinja");
+
+    fn tool_history(results: &[&str]) -> Vec<Message> {
+        let blank = |role: Role, content: &str| Message {
+            role,
+            content: content.to_string(),
+            reasoning_content: None,
+            name: None,
+            rendered_name: None,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_plan: String::new(),
+        };
+        let mut msgs = vec![blank(Role::User, "weather in Paris?")];
+        let mut assistant = blank(Role::Assistant, "");
+        assistant.tool_calls = vec![ToolCall {
+            id: Some("call_0".to_string()),
+            name: "get_weather".to_string(),
+            arguments: serde_json::json!({ "city": "Paris" }),
+            rendered_body: None,
+        }];
+        msgs.push(assistant);
+        for (i, r) in results.iter().enumerate() {
+            let mut result = blank(Role::Tool, r);
+            result.tool_call_id = Some(format!("call_{i}"));
+            msgs.push(result);
+        }
+        msgs
+    }
+
+    fn cold_render(msgs: &[Message], tokenizer: &Tokenizer) -> String {
+        JinjaChatFrame {
+            tokenizer,
+            template: QWEN35_REFERENCE,
+            system: None,
+            user: "",
+            enable_thinking: false,
+            bos_token: Some(""),
+            reasoning_strength: None,
+            reasoning_effort: None,
+        }
+        .render_messages(msgs, None, None)
+        .expect("qwen3.5 reference render")
+    }
+
+    #[test]
+    fn tool_result_suffix_reproduces_the_templates_own_tail() {
+        let t = make_tokenizer();
+        for results in [vec!["sunny, 19C"], vec!["sunny, 19C", "wind 4kph"]] {
+            let cold = cold_render(&tool_history(&results), &t);
+            let owned: Vec<String> = results.iter().map(|r| r.to_string()).collect();
+            let suffix = t.decode(&continuation_suffix_tool_results(
+                &t,
+                &owned,
+                AssistantPrefix::ClosedThink,
+            ));
+            assert!(
+                cold.ends_with(&suffix),
+                "appending this suffix diverges from a cold render of the same \
+                 history\n  cold tail: {:?}\n  suffix:    {suffix:?}",
+                &cold[cold.len().saturating_sub(suffix.len() + 32)..]
+            );
+        }
+    }
+
 }

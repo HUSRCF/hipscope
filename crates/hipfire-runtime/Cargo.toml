@@ -536,6 +536,10 @@ name = "test_serve_concurrent"
 required-features = ["lab"]
 
 [[example]]
+name = "test_serve_tool_reentry"
+required-features = ["lab"]
+
+[[example]]
 name = "test_swap_equivalence"
 required-features = ["lab"]
 

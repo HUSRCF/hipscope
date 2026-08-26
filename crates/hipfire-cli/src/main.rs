@@ -2930,6 +2930,45 @@ pub(crate) fn apply_http_reasoning_request(
         }
         toggle_opt = Some(false);
     }
+    // `reasoning_budget_tokens == 0` is the wire spelling hag and other OpenAI
+    // clients use for "do not think". Absent from master but genuine: without
+    // it a small max_tokens budget is burned inside <think> and the client gets
+    // empty content. Route through toggle reduction so it inherits contract
+    // gating and disabled-wins warnings, like is_off_budget.
+    let is_off_reasoning_budget_tokens = !is_effort_native
+        && !matches!(contract, ReasoningContract::GemmaBoolean)
+        && body
+            .get("reasoning_budget_tokens")
+            .and_then(serde_json::Value::as_u64)
+            == Some(0);
+    if is_off_reasoning_budget_tokens {
+        if toggle_opt == Some(true) {
+            push_warn(
+                "thinking enabled conflicts with reasoning_budget_tokens 0; thinking disabled wins"
+                    .to_string(),
+            );
+        }
+        toggle_opt = Some(false);
+    }
+    // `max_think_tokens == 1` is the engine's own lowered encoding of off
+    // (alongside assistant_prefix=closed_think). Incoming 1 must not be a
+    // contract-blind short-circuit: a client legitimately requesting a 1-token
+    // cap would be silently reinterpreted. Gate on contract and participate in
+    // disabled-wins, so every off-path is contract-aware.
+    let is_off_max_think_one = matches!(contract, ReasoningContract::QwenJinja)
+        && body
+            .get("max_think_tokens")
+            .and_then(serde_json::Value::as_u64)
+            == Some(1);
+    if is_off_max_think_one {
+        if toggle_opt == Some(true) {
+            push_warn(
+                "thinking enabled conflicts with max_think_tokens 1; thinking disabled wins"
+                    .to_string(),
+            );
+        }
+        toggle_opt = Some(false);
+    }
     let config_mode = config_string(resolved, "reasoning.mode").unwrap_or_else(|_| "on".into());
     let config_mode_is_explicit = resolved
         .get("reasoning.mode")
