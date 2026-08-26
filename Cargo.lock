@@ -1472,6 +1472,7 @@ dependencies = [
  "clap",
  "faer",
  "half",
+ "hipfire-arch-gemma4",
  "hipfire-config",
  "hipfire-reap",
  "hipfire-runtime",
