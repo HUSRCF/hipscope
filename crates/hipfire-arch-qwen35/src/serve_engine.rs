@@ -411,8 +411,16 @@ fn run_loop(mut rig: Rig, rx: Receiver<SubmitRequest>, stats: Arc<Mutex<EngineSt
             };
             f.produced += 1;
             let hit_max = f.produced >= f.max_tokens;
+            // Context-cap guard: stop before the slot's KV length would pass
+            // its cap. Without this, a long multi-turn session overflows
+            // set_seq_len and kills the whole batched step.
+            let hit_ctx_cap = rig
+                .sessions
+                .get(session)
+                .map(|sess| sess.tokens.len() + 1 >= rig.cap_tokens)
+                .unwrap_or(false);
 
-            if gone || hit_eos || hit_max {
+            if gone || hit_eos || hit_max || hit_ctx_cap {
                 let reason = if gone {
                     DoneReason::ClientGone
                 } else if hit_eos {
@@ -516,6 +524,18 @@ fn admit(
             if let Some(slot) = slot {
                 let mut extended = base;
                 extended.extend_from_slice(&req.continuation);
+                // Prefill-side context-cap guard (mirrors decode hit_ctx_cap).
+                // A prompt/extension already at the KV cap overflows set_seq_len
+                // during prefill before any decode step can stop it.
+                if extended.len() >= rig.cap_tokens {
+                    let _ = send_event(
+                        &req.reply,
+                        Event::Done {
+                            reason: DoneReason::MaxTokens,
+                        },
+                    );
+                    return;
+                }
                 if let Ok(plan) = rig.sessions.begin_turn(&mut rig.pool, existing, &extended) {
                     if let Some(sess) = rig.sessions.get_mut(existing) {
                         sess.tokens = extended.clone();
@@ -558,6 +578,18 @@ fn admit(
         if rig.gpu.slot_trace() {
             eprintln!("[slot-trace] continuation MISS -- falling back to cold prefill");
         }
+    }
+
+    // Prefill-side context-cap guard for cold admits. Same wire reporting as
+    // the decode path (DoneReason::MaxTokens → finish_reason "length").
+    if req.prompt_tokens.len() >= rig.cap_tokens {
+        let _ = send_event(
+            &req.reply,
+            Event::Done {
+                reason: DoneReason::MaxTokens,
+            },
+        );
+        return;
     }
 
     // Try to open; if the pool is full, evict the LRU idle session first.
