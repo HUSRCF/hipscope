@@ -279,7 +279,7 @@ fn load_qwen35_pp(
         std::env::var("HIPFIRE_PAGE_EVICTION")
             .ok()
             .map(|v| v != "0")
-            .unwrap_or_else(|| gpus.devices[0].is_uma()),
+            .unwrap_or_else(|| gpus.devices.iter().any(|g| g.is_uma())),
     );
     let _hfq_cache_warmer = hfq_file.start_cache_warmup();
     let layout = hipfire_arch_qwen35::qwen35::Layout::from_gpus(&gpus, config.n_layers);
