@@ -1684,18 +1684,9 @@ pub struct SlotSampleParams {
     pub seed: u32,
 }
 
-/// Substituted for a zero `seed`: the sampler's xorshift32 maps 0 to 0 forever,
-/// so a slot seeded 0 draws `r = 0` every token and always takes the first
-/// candidate — argmax wearing a temperature.
-const SEED_FALLBACK: u32 = 0x9E37_79B9;
-
 impl SlotSampleParams {
     pub fn rng_state(&self) -> u32 {
-        if self.seed == 0 {
-            SEED_FALLBACK
-        } else {
-            self.seed
-        }
+        self.seed
     }
 }
 

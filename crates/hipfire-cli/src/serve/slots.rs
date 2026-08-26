@@ -339,11 +339,12 @@ pub(crate) fn complete_request_slots(
                 .get("top_k")
                 .and_then(serde_json::Value::as_i64)
                 .unwrap_or(0) as i32,
-            seed: body
-                .get("seed")
-                .and_then(serde_json::Value::as_u64)
-                .map(|s| s as u32)
-                .unwrap_or_else(|| (turn_hash(&identity.0) ^ identity.1) as u32),
+            seed: {
+                let client_seed = hipfire_engine::wire_seed::parse_wire_seed(body.get("seed"))
+                    .map_err(|e| anyhow!("seed: {e}"))?;
+                let key = hipfire_engine::terminal::AttemptKey::new(&identity.0, identity.1);
+                hipfire_engine::scheduler::request_seed_for(&key, client_seed)
+            },
             reply: tx,
         })
         .map_err(|e| anyhow!("multi_slot submit: {e}"))?;
