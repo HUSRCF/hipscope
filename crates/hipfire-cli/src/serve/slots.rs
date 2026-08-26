@@ -43,6 +43,7 @@ pub(crate) struct SlotBackend;
 pub(crate) fn complete_request_slots(
     backend: &SlotBackend,
     body: &serde_json::Value,
+    contract: &crate::serve::complete::RequestContract,
     identity: &(String, u64),
     cancelled: Option<&AtomicBool>,
     event_callback: &mut dyn FnMut(&serde_json::Value) -> Result<(), hipfire_client::ClientError>,
@@ -57,10 +58,7 @@ pub(crate) fn complete_request_slots(
         .and_then(serde_json::Value::as_str)
         .unwrap_or("unknown")
         .to_owned();
-    let max_tokens = body
-        .get("max_tokens")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(512) as usize;
+    let max_tokens = contract.max_tokens as usize;
 
     // Messages -> the shape ChatFrame actually wants. This is not a free
     // mapping: `build_multi_turn` PANICS on a System or Tool role inside the
@@ -69,7 +67,7 @@ pub(crate) fn complete_request_slots(
     // User/Assistant exchange.
     let mut system: Option<String> = None;
     let mut turns: Vec<(Role, String)> = Vec::new();
-    let Some(msgs) = body.get("messages").and_then(serde_json::Value::as_array) else {
+    let Some(msgs) = contract.messages.as_array() else {
         bail!("messages is required");
     };
     for m in msgs {
@@ -243,6 +241,26 @@ pub(crate) fn complete_request_slots(
         event_callback,
     )?;
 
+    // Apply tool_choice terminal postconditions before the Completion is built.
+    // Multi-slot does not yet emit structured tool_calls; the policy still runs
+    // so none/required/specific fail-closed like the daemon path. ChatFrame has
+    // no tools slot, so `contract.forwarded_tools` is the projected source of
+    // truth for schemas (withheld under tool_choice none) once a tools-aware
+    // render is wired — never body["tools"].
+    let mut tool_calls = Vec::new();
+    let mut done = serde_json::json!({ "finish_reason": finish });
+    crate::serve::complete::finalize_tool_calls_for_choice(
+        &contract.tool_choice_policy,
+        &mut tool_calls,
+        &mut done,
+        body,
+    )?;
+    let _finish = done
+        .get("finish_reason")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(finish)
+        .to_owned();
+
     let completion = Completion {
         id: identity.0.clone(),
         created: identity.1,
@@ -250,8 +268,8 @@ pub(crate) fn complete_request_slots(
         content,
         reasoning_content,
         preserve_thinking: false,
-        tool_calls: Vec::new(),
-        done: serde_json::json!({ "finish_reason": finish }),
+        tool_calls,
+        done,
         logprobs: None,
         reasoning: Some(crate::ReasoningResolution {
             effective_mode: "disabled".to_string(),
@@ -274,6 +292,7 @@ pub(crate) fn complete_request_slots(
 pub(crate) fn complete_request_slots(
     _backend: &SlotBackend,
     _body: &serde_json::Value,
+    _contract: &crate::serve::complete::RequestContract,
     _identity: &(String, u64),
     _cancelled: Option<&AtomicBool>,
     _event_callback: &mut dyn FnMut(&serde_json::Value) -> Result<(), hipfire_client::ClientError>,
