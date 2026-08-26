@@ -9,12 +9,14 @@ description = "Compute kernel dispatch for RDNA GPUs"
 # Archived research probes; see the note by the [[example]] blocks.
 lab = []
 deltanet = []
+flash-attn-ck = ["dep:libloading"]
 
 [dependencies]
 hip-bridge = { path = "../hip-bridge" }
 hipfire-config = { path = "../hipfire-config" }
 redline-dispatch = { path = "../redline-dispatch" }
 radiowave = { path = "../radiowave" }
+libloading = { workspace = true, optional = true }
 rayon = "1"
 
 [dev-dependencies]
