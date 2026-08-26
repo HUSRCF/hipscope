@@ -88,6 +88,7 @@ pub struct FlashAttnCkPrefillInput {
     pub causal: bool,
     pub contiguous_prefix: bool,
     pub capture_mode: bool,
+    pub replay_recording: bool,
     pub has_tree_bias: bool,
     pub window: usize,
     pub block_start: usize,
@@ -103,6 +104,7 @@ pub enum FlashAttnCkRejectReason {
     NonCausal,
     NonContiguousPrefix,
     GraphCapture,
+    ReplayRecording,
     TreeAttention,
     WindowedAttention,
     BlockAttention,
@@ -146,6 +148,9 @@ fn select_q8_d256_prefill_capabilities(
     }
     if input.capture_mode {
         return Err(FlashAttnCkRejectReason::GraphCapture);
+    }
+    if input.replay_recording {
+        return Err(FlashAttnCkRejectReason::ReplayRecording);
     }
     if input.has_tree_bias {
         return Err(FlashAttnCkRejectReason::TreeAttention);
@@ -558,6 +563,18 @@ impl crate::Gpu {
             self.report_flash_attn_ck_route("dtype_miss");
             return Ok(false);
         }
+        // Fail closed when Redline is recording: CK launches bypass the native
+        // launch_maybe_blob_bound recorder and would produce a tape missing the
+        // attention work. Fall back to the native path alongside the existing
+        // graph-capture rejection so capture counters stay consistent.
+        if self.replay.is_recording() {
+            self.report_flash_attn_ck_route("replay_recording");
+            return Ok(false);
+        }
+        if self.graphs.capture_mode {
+            self.report_flash_attn_ck_route("graph_capture");
+            return Ok(false);
+        }
         let request = FlashAttnCkRequest {
             arch,
             dtype: FlashAttnCkDType::F32,
@@ -574,6 +591,7 @@ impl crate::Gpu {
             causal: true,
             contiguous_prefix,
             capture_mode: self.graphs.capture_mode,
+            replay_recording: self.replay.is_recording(),
             has_tree_bias,
             window,
             block_start,
@@ -669,6 +687,7 @@ fn reject_reason_name(reason: FlashAttnCkRejectReason) -> &'static str {
         FlashAttnCkRejectReason::NonCausal => "non_causal",
         FlashAttnCkRejectReason::NonContiguousPrefix => "non_contiguous_prefix",
         FlashAttnCkRejectReason::GraphCapture => "graph_capture",
+        FlashAttnCkRejectReason::ReplayRecording => "replay_recording",
         FlashAttnCkRejectReason::TreeAttention => "tree_attention",
         FlashAttnCkRejectReason::WindowedAttention => "windowed_attention",
         FlashAttnCkRejectReason::BlockAttention => "block_attention",
@@ -767,6 +786,7 @@ mod tests {
             causal: true,
             contiguous_prefix: true,
             capture_mode: false,
+            replay_recording: false,
             has_tree_bias: false,
             window: 0,
             block_start: 0,
@@ -814,6 +834,13 @@ mod tests {
                     ..eligible_q8_prefill()
                 },
                 FlashAttnCkRejectReason::GraphCapture,
+            ),
+            (
+                FlashAttnCkPrefillInput {
+                    replay_recording: true,
+                    ..eligible_q8_prefill()
+                },
+                FlashAttnCkRejectReason::ReplayRecording,
             ),
             (
                 FlashAttnCkPrefillInput {
