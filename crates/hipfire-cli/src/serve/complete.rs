@@ -2098,6 +2098,51 @@ pub(crate) fn complete_request_attempt(
 /// Daemon requests use [`hipfire_client::Engine::generate_cancellable`].
 /// Multi-slot requests observe the same flag and drop their reply receiver,
 /// which makes the slot engine stop and free the abandoned slot.
+/// Whether the slot backend can honour this specific request in full.
+///
+/// The routing gate used to be model-level: slots were taken only when the
+/// loaded model reported `ReasoningContract::Unsupported`. That made the slot
+/// backend unreachable in practice, because its engine loads through the
+/// qwen35 loader (`hipfire_arch_qwen35::serve_engine::SlotEngine`) and every
+/// qwen35 checkpoint reports `QwenJinja`, while the archs that do report
+/// `Unsupported` panic that loader outright ("tensor not found: norm.weight").
+/// The two conditions were mutually exclusive, so the backend came up,
+/// allocated its slots, and never received a request.
+///
+/// Now that both backends share one contract projection, a QwenJinja model is
+/// safe on the slot path -- with two exceptions the slot engine genuinely
+/// cannot implement (see `slots.rs`, "no stop sequences yet, and max_think=0"):
+///
+///   * a finite think cap needs a mid-decode force-close via `take_forced`
+///     KV injection, which the slot engine does not support;
+///   * `stop` sequences are not implemented there.
+///
+/// Those are checked per REQUEST rather than per model, so a contract-bearing
+/// model still reaches the slot backend for the requests it can serve
+/// correctly, and falls back to the daemon only for the ones it cannot. Fail
+/// closed: anything unrecognised routes to the daemon.
+fn slot_backend_can_honor(body: &serde_json::Value) -> bool {
+    if body.get("stop").is_some_and(|value| !value.is_null()) {
+        return false;
+    }
+    // `1` is the no-thinking sentinel and `0` is uncapped; neither needs a
+    // force-close. Any other finite cap does.
+    for pointer in ["/max_think_tokens", "/reasoning/max_tokens"] {
+        if let Some(cap) = body.pointer(pointer).and_then(serde_json::Value::as_u64) {
+            if cap >= 2 {
+                return false;
+            }
+        }
+    }
+    // A named budget preset other than "off" lowers to a finite cap.
+    if let Some(budget) = body.get("thinking_budget").and_then(serde_json::Value::as_str) {
+        if !budget.eq_ignore_ascii_case("off") {
+            return false;
+        }
+    }
+    true
+}
+
 pub(crate) fn complete_request_cancellable(
     shared: &ServeShared,
     body: &serde_json::Value,
@@ -2119,7 +2164,9 @@ pub(crate) fn complete_request_cancellable(
             && matches!(
                 runtime.current_reasoning_contract,
                 saddle_core::caps::ReasoningContract::Unsupported
-            );
+                    | saddle_core::caps::ReasoningContract::QwenJinja
+            )
+            && slot_backend_can_honor(body);
         if !capable {
             None
         } else {
@@ -6543,6 +6590,35 @@ mod tests {
         assert_eq!(msgs[0]["role"], "system");
         assert_eq!(msgs[0]["content"], "injected default system");
         assert_eq!(msgs[1]["role"], "user");
+    }
+
+    /// The slot backend is eligible for a QwenJinja model, but only for the
+    /// requests it can serve in full. It cannot force-close a think span
+    /// (no `take_forced` KV injection) and has no `stop` sequences, so those
+    /// requests must fall back to the daemon rather than be served wrong.
+    #[test]
+    fn slot_routing_refuses_only_what_the_slot_engine_cannot_honor() {
+        let ok = |v: serde_json::Value| slot_backend_can_honor(&v);
+
+        // Nothing special asked for -> slots are fine.
+        assert!(ok(serde_json::json!({ "max_tokens": 16 })));
+        // `1` is the no-thinking sentinel, `0` is uncapped: no force-close needed.
+        assert!(ok(serde_json::json!({ "max_think_tokens": 1 })));
+        assert!(ok(serde_json::json!({ "max_think_tokens": 0 })));
+        // An explicit budget of "off" lowers to no thinking at all.
+        assert!(ok(serde_json::json!({ "thinking_budget": "off" })));
+
+        // A finite think cap needs a mid-decode force-close the slot engine lacks.
+        assert!(!ok(serde_json::json!({ "max_think_tokens": 2 })));
+        assert!(!ok(serde_json::json!({ "max_think_tokens": 4096 })));
+        assert!(!ok(serde_json::json!({ "reasoning": { "max_tokens": 2048 } })));
+        // A named preset other than off lowers to a finite cap.
+        assert!(!ok(serde_json::json!({ "thinking_budget": "high" })));
+        // `stop` is not implemented on the slot path.
+        assert!(!ok(serde_json::json!({ "stop": ["\n\n"] })));
+        assert!(!ok(serde_json::json!({ "stop": "END" })));
+        // An explicit null `stop` is absence, not a request.
+        assert!(ok(serde_json::json!({ "stop": serde_json::Value::Null })));
     }
 
     #[test]
