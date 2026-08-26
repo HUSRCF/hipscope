@@ -524,6 +524,18 @@ fn admit(
             if let Some(slot) = slot {
                 let mut extended = base;
                 extended.extend_from_slice(&req.continuation);
+                // Prefill-side context-cap guard (mirrors decode hit_ctx_cap).
+                // A prompt/extension already at the KV cap overflows set_seq_len
+                // during prefill before any decode step can stop it.
+                if extended.len() >= rig.cap_tokens {
+                    let _ = send_event(
+                        &req.reply,
+                        Event::Done {
+                            reason: DoneReason::MaxTokens,
+                        },
+                    );
+                    return;
+                }
                 if let Ok(plan) = rig.sessions.begin_turn(&mut rig.pool, existing, &extended) {
                     if let Some(sess) = rig.sessions.get_mut(existing) {
                         sess.tokens = extended.clone();
@@ -566,6 +578,18 @@ fn admit(
         if rig.gpu.slot_trace() {
             eprintln!("[slot-trace] continuation MISS -- falling back to cold prefill");
         }
+    }
+
+    // Prefill-side context-cap guard for cold admits. Same wire reporting as
+    // the decode path (DoneReason::MaxTokens → finish_reason "length").
+    if req.prompt_tokens.len() >= rig.cap_tokens {
+        let _ = send_event(
+            &req.reply,
+            Event::Done {
+                reason: DoneReason::MaxTokens,
+            },
+        );
+        return;
     }
 
     // Try to open; if the pool is full, evict the LRU idle session first.
