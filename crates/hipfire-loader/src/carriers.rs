@@ -272,6 +272,16 @@ fn load_qwen35_pp(
         None => hipfire_runtime::multi_gpu::Gpus::init_uniform(pp, config.n_layers)
             .map_err(|e| format!("{e}"))?,
     };
+    // Discrete GPUs: keep model pages in the page cache across reads —
+    // fadvise(DONTNEED)-per-tensor forces a full disk re-read on every load.
+    // UMA keeps eviction (default) to avoid OOM vs hipMalloc staging.
+    hfq_file.set_evict_page_cache(
+        std::env::var("HIPFIRE_PAGE_EVICTION")
+            .ok()
+            .map(|v| v != "0")
+            .unwrap_or_else(|| gpus.devices.iter().any(|g| g.is_uma())),
+    );
+    let _hfq_cache_warmer = hfq_file.start_cache_warmup();
     let layout = hipfire_arch_qwen35::qwen35::Layout::from_gpus(&gpus, config.n_layers);
     let mut hfq_source = hipfire_arch_qwen35::qwen35::HfqSource::new(&mut hfq_file, &config);
     let weights =
@@ -495,6 +505,17 @@ impl Carrier for Qwen35Carrier {
                 if ctx.pp > 1 {
                     return load_qwen35_pp(hfq_file, meta, ctx);
                 }
+                // Discrete GPUs: keep model pages in the page cache across
+                // reads — fadvise(DONTNEED)-per-tensor forces a full disk
+                // re-read on every load. UMA keeps eviction (default) to
+                // avoid OOM vs hipMalloc staging.
+                hfq_file.set_evict_page_cache(
+                    std::env::var("HIPFIRE_PAGE_EVICTION")
+                        .ok()
+                        .map(|v| v != "0")
+                        .unwrap_or_else(|| ctx.gpu.is_uma()),
+                );
+                let _hfq_cache_warmer = hfq_file.start_cache_warmup();
 
                 // ── pp=1 path (single-GPU) ────────────────────
                 let physical_cap = ctx.cask.physical_cap(ctx.max_seq)?;
