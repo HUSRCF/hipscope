@@ -1317,6 +1317,28 @@ fn dispatch_attend(
             // gfx1151 measurement showed the opposite. Other arches keep 8192
             // until measured — do not globalise this without per-arch evidence.
             KernelKey::AttnQ8_0KvBatchedMasked => {
+                // Optional CK selection happens after the paired KV-tier plan
+                // and write have resolved. The first cell accepts only the
+                // standard contiguous-prefix Q8/Q8 D256 contract; every other
+                // shape remains on the native WMMA/scalar routes below.
+                #[cfg(feature = "flash-attn-ck")]
+                if hip!(gpu.try_flash_attn_ck_q8_d256_prefill(
+                    io.q,
+                    io.k_cache,
+                    io.v_cache,
+                    io.output,
+                    io.batch_size,
+                    io.max_ctx_len,
+                    io.n_heads,
+                    io.n_kv_heads,
+                    io.max_ctx_len == io.pos.saturating_add(io.batch_size),
+                    io.tree_bias.is_some(),
+                    plan.window.max(0) as usize,
+                    io.block_start,
+                    io.block_cols,
+                ))? {
+                    return Ok(());
+                }
                 // Query-tiled flash prefill. Its LDS depends only on BR/BC and
                 // never on context, so it has no capacity ceiling and no
                 // occupancy decay. Measured on gfx1151 (nh=8 nkv=2 hd=256,

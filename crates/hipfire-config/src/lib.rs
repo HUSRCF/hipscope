@@ -2219,6 +2219,26 @@ pub static FIELDS: &[ConfigField] = &[
         "HIPFIRE_QKVZA_SPLIT_TAIL",
         "Enable the RDNA3 QKVZA split-tail prefill route."
     ),
+    process_field!(
+        "attention.ck_runtime_lib",
+        "ck_runtime_lib",
+        Attention,
+        DefaultValue::Null,
+        ValueRule::NullableString,
+        true,
+        "HIPFIRE_FLASH_ATTN_CK_LIB",
+        "Optional exact-architecture CK runtime sidecar path; load or capability failure retains native attention."
+    ),
+    process_field!(
+        "attention.ck_workspace_bytes",
+        "ck_workspace_bytes",
+        Attention,
+        DefaultValue::Integer(0),
+        ValueRule::Integer { min: 0, max: 17_179_869_184 },
+        true,
+        "HIPFIRE_FLASH_ATTN_CK_WORKSPACE_BYTES",
+        "Preallocated caller-owned bytes for the optional CK staged attention path."
+    ),
     process_bool_field!(
         "kernel.gfx942_gemv_v3",
         "gfx942_gemv_v3",
@@ -4775,6 +4795,12 @@ mod tests {
         let mut global = ConfigLayer::default();
         global.set_cli("kernel.mw16", "true").unwrap();
         global.set_cli("diagnostic.kernel.gemv_rows", "4").unwrap();
+        global
+            .set_cli("attention.ck_runtime_lib", "/opt/hipfire/ck.so")
+            .unwrap();
+        global
+            .set_cli("attention.ck_workspace_bytes", "536870912")
+            .unwrap();
         let resolved = resolve([NamedLayer {
             source: ConfigSource::GlobalUser {
                 path: PathBuf::from("config.toml"),
@@ -4785,6 +4811,16 @@ mod tests {
         let process = ProcessConfig::from_resolved(&resolved).unwrap();
 
         assert_eq!(process.legacy_value("HIPFIRE_MW16").as_deref(), Some("1"));
+        assert_eq!(
+            process.legacy_value("HIPFIRE_FLASH_ATTN_CK_LIB").as_deref(),
+            Some("/opt/hipfire/ck.so")
+        );
+        assert_eq!(
+            process
+                .legacy_value("HIPFIRE_FLASH_ATTN_CK_WORKSPACE_BYTES")
+                .as_deref(),
+            Some("536870912")
+        );
         assert_eq!(
             process.legacy_value("HIPFIRE_GEMV_ROWS").as_deref(),
             Some("4")
