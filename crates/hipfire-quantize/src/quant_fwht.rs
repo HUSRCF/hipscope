@@ -734,9 +734,13 @@ mod tests {
         assert_eq!(QuantType::MQ5G256V2 as u8, 48);
         assert_eq!(QuantType::MQ3G256V2 as u8, 49);
         assert_eq!(QuantType::MQ2G256V2 as u8, 50);
-        // unknown remains rejected
+        // 51 = MQ2G256LloydU, the unrotated MQ2-Lloyd sibling (Maple native
+        // ternary), claimed 2026-08-22. This line previously pinned 51 as free.
+        assert_eq!(QuantType::from_u8(51), Some(QuantType::MQ2G256LloydU));
+        assert_eq!(QuantType::MQ2G256LloydU as u8, 51);
+        // unknown remains rejected — 46 and 52 are the next genuinely free ids
         assert_eq!(QuantType::from_u8(46), None);
-        assert_eq!(QuantType::from_u8(51), None);
+        assert_eq!(QuantType::from_u8(52), None);
         assert_eq!(QuantType::from_u8(255), None);
     }
 

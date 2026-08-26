@@ -338,9 +338,17 @@ pub enum DType {
     MQ3G256, // MagnumQuant: FWHT-rotated HFQ3-G256 (104 bytes/group, same as HFQ3G256)
     MQ2G256, // MagnumQuant: FWHT-rotated HFQ2-G256 (72 bytes/group, same as HFQ2G256)
     MQ2G256Lloyd, // MagnumQuant 2-bit + Lloyd-Max 4-entry fp16 codebook (72 bytes/group)
+    /// Unrotated MQ2-Lloyd (qt=51). Byte-identical to `MQ2G256Lloyd`
+    /// (72 B/group: 4-entry fp16 codebook + 64 B of 2-bit indices), so the same
+    /// kernels bind — but NOT FWHT-rotated. It consumes x in the natural basis,
+    /// so `needs_x_rot_local` is false for it and it must never be added to the
+    /// rotation chain. Carries native-ternary checkpoints (Maple-Preview)
+    /// losslessly: rotation would destroy the three-value structure that lets a
+    /// K=3 codebook be exact.
+    MQ2G256LloydU,
     MQ3G256Lloyd, // MagnumQuant 3-bit + Lloyd-Max 8-entry fp16 codebook (112 bytes/group)
     MQ4G256Lloyd, // MagnumQuant 4-bit + Lloyd-Max 16-entry fp16 codebook (160 bytes/group)
-    MQ2G256GL, // MagnumQuant 2-bit + TENSOR-GLOBAL 4-entry codebook (GL_CB2), SoA:
+    MQ2G256GL,    // MagnumQuant 2-bit + TENSOR-GLOBAL 4-entry codebook (GL_CB2), SoA:
     // [M*gpr*64 B indices][M*gpr*2 B fp16 per-block scales] = 2.0625 bpw. NOT
     // interleaved — no per-group header. Codebook is a compile-time constant
     // passed as scalar kernel args, not stored in the file. MoE-routed-expert
@@ -419,6 +427,7 @@ impl DType {
             | DType::MQ3G256
             | DType::MQ2G256
             | DType::MQ2G256Lloyd
+            | DType::MQ2G256LloydU
             | DType::MQ3G256Lloyd
             | DType::MQ4G256Lloyd
             | DType::MQ2G256GL

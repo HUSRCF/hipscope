@@ -1674,6 +1674,103 @@ impl Carrier for Cohere2MoeCarrier {
     }
 }
 
+// ─── MapleCarrier ────────────────────────────────────────────────────
+// maple (arch_id 15, HFQ-only). Maple-Preview's weights are natively ternary
+// and are carried losslessly by qt=51 MQ2G256LloydU; there is no
+// safetensors-Dir path, so `claims_arch_id` answers for the HFQ namespace only
+// in practice and the Dir case is refused inside `load_maple_bundle` with a
+// message naming the convert command.
+pub struct MapleCarrier;
+impl Carrier for MapleCarrier {
+    fn name(&self) -> &'static str {
+        "maple"
+    }
+    fn claims_arch_id(&self, arch_id: u32, _is_dir: bool) -> bool {
+        arch_id == 15
+    }
+    fn caps(&self) -> saddle_core::caps::ArchCaps {
+        saddle_core::caps::ArchCaps {
+            reasoning_contract: saddle_core::caps::ReasoningContract::QwenJinja,
+            supports_continuous_batch: false,
+            supports_ep_batch: false,
+            dflash: None,
+            supports_mtp: false,
+            spec_excludes_adaptive: false,
+            semantic_contract_version: None,
+            has_deltanet: false,
+            supports_images: false,
+        }
+    }
+    fn sampling_defaults(&self) -> saddle_core::sampling::SamplingDefaults {
+        saddle_core::sampling::SamplingDefaults::new(1.0, 0.95, 1.0)
+    }
+    /// Batched prefill over `MAPLE_PREFILL_CHUNK`-sized chunks. `forward_batch`
+    /// ERRORS above `MAPLE_PREFILL_MAX_B` rather than splitting silently, so the
+    /// chunking here is mandatory, not an optimisation.
+    ///
+    /// The failure string is propagated through `prefill_err`, which the daemon
+    /// interpolates into `bench_prefill forward failed: {e}` for every carrier —
+    /// not just Glimmer. Dropping it would reduce an unsupported-tier refusal
+    /// (which names the qt51 and router-mirror requirements) to a bare
+    /// "forward failed".
+    fn bench_prefill(
+        &self,
+        m: &mut crate::LoadedModel,
+        gpu: &mut rdna_compute::Gpu,
+        synthetic: &[u32],
+        _n: usize,
+        prefill_err: &mut Option<String>,
+    ) -> Option<bool> {
+        let b = (m.state.as_mut()?.as_mut() as &mut dyn Any)
+            .downcast_mut::<hipfire_arch_maple::MapleBundle>()?;
+        for (start, len) in hipfire_arch_maple::batch::prefill_chunks(
+            synthetic.len(),
+            hipfire_arch_maple::batch::MAPLE_PREFILL_CHUNK,
+        ) {
+            if let Err(e) = hipfire_arch_maple::forward::forward_batch(
+                &b.config,
+                &b.weights,
+                &mut b.state,
+                gpu,
+                &synthetic[start..start + len],
+                start,
+            ) {
+                *prefill_err = Some(e);
+                return Some(false);
+            }
+        }
+        Some(true)
+    }
+    fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
+        if ctx.pp > 1 {
+            return Err("maple: pp>1 unsupported via registry".into());
+        }
+        dir_diag(&src);
+        let meta = resolve_source_meta(&src, ctx.path)?;
+        let bundle = hipfire_arch_maple::load_maple_bundle(src, ctx)?;
+        let speculator = crate::spec_build::build_speculator(
+            meta.arch_id,
+            None,
+            None,
+            true,
+            ctx.max_seq,
+            ctx.spec,
+        );
+        Ok(LoadedModel {
+            state: Some(Box::new(bundle)),
+            speculator,
+            ..LoadedModel::skeleton(
+                meta.arch_id,
+                meta.tokenizer,
+                ctx.max_seq,
+                ctx.max_seq,
+                ctx.path.to_string(),
+                meta.chat_template,
+            )
+        })
+    }
+}
+
 // ─── Gemma4Carrier ───────────────────────────────────────────────────
 
 fn gemma4_use_lowered(

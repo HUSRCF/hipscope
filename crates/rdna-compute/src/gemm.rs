@@ -15706,8 +15706,8 @@ impl Gpu {
         expert_weight_ptrs: &GpuTensor, // [E] u64
         expert_tile_ids: &GpuTensor,    // [m_total / 16] i32
         sorted_slot_index: &GpuTensor,  // [m_total] i32
-        x_src: &GpuTensor,              // [x_src_rows × K] f32 (auto-converted to FP16)
-        y_grouped: &GpuTensor,          // [m_total × M] f32, written direct
+        x_src: &GpuTensor, // [x_src_rows × K] f32 (auto-converted to FP16) or f16 (used as-is)
+        y_grouped: &GpuTensor, // [m_total × M] f32, written direct
         m: usize,
         k: usize,
         x_row_div: usize,
@@ -15728,7 +15728,21 @@ impl Gpu {
         }
         let (kernel_name, kernel_src) = kernels::mq2g256_lloyd_moe_grouped_wmma_source(is_gfx12);
         self.ensure_kernel(kernel_name, kernel_src, kernel_name)?;
-        let x_f16_ptr = self.ensure_fp16_x(x_src, x_src_rows * k)?;
+        // Honour an activation the caller ALREADY converted to F16 (the kernel's
+        // `X_src` is `_Float16*`), exactly as `gemm_q8_0_wmma` does.
+        //
+        // `ensure_fp16_x` is pointer-keyed: it reconverts only when the source
+        // POINTER changes. A caller that reuses one F32 scratch buffer across
+        // layers with NEW contents therefore gets layer-0's stale F16 for every
+        // later layer — silently. Such callers (e.g. hipfire-arch-maple's batched
+        // prefill) convert into their own F16 buffer and pass it here; this arm
+        // hands that pointer straight through and never touches the shared
+        // pointer-keyed scratch at all. F32 callers keep the existing behaviour.
+        let x_f16_ptr = if matches!(x_src.dtype, DType::F16) {
+            x_src.buf.as_ptr()
+        } else {
+            self.ensure_fp16_x(x_src, x_src_rows * k)?
+        };
 
         let ep = expert_weight_ptrs.buf.as_ptr();
         let tp = expert_tile_ids.buf.as_ptr();

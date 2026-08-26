@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use hipfire_loader::{AsstTurnCache, LoadedModel};
-use hipfire_runtime::prompt_frame::ThinkMode;
+use hipfire_runtime::prompt_frame::{AssistantPrefix, ThinkMode};
 use std::io::Write;
 use std::time::Instant;
 
@@ -7661,4 +7661,795 @@ pub fn generate_qwen2(
         ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
         ClientTerminalDecision::Abort => {}
     }
+}
+
+/// Maple-Preview generate path (arch_id=15, hipfire-arch-maple).
+///
+/// Shaped after [`generate_qwen2`], NOT after `generate_cohere2moe`: Maple has
+/// no bespoke marker state machine. It is plain ChatML with `<|im_end|>`
+/// (151645) as end-of-turn, so the qwen2 shape — get tokenizer, downcast the
+/// bundle, apply the chat template, prefill, greedy-decode to EOS — is the
+/// whole job. The ~720-line cohere2moe body is almost entirely Cohere's
+/// `<|START_THINKING|>` / `<|START_ACTION|>` handling, which would be dead
+/// weight here.
+///
+/// Maple IS a reasoning model: it emits `<think>` … `</think>` before its
+/// answer. That is deliberately NOT special-cased — the markers are ordinary
+/// vocabulary items and stream through as text like any other token. Maple's
+/// `Architecture::eos_filter_overrides` is unimplemented and no `EosFilter` is
+/// constructed on this path, so no think-tag stripping or `max_think_tokens`
+/// budget applies — the route's dispatch arm discards `max_think_tokens` the
+/// same way the Qwen2 arm does.
+///
+/// Prefill uses the BATCHED path — `forward_batch` over
+/// `prefill_chunks(n, MAPLE_PREFILL_CHUNK)` — guarded by
+/// [`hipfire_arch_maple::forward::forward_batch_supported`], with the per-token
+/// `decode_step` loop as the fallback. That guard is not decoration:
+/// `forward_batch_supported` is false for any checkpoint whose attention/expert
+/// weights are not uniformly qt51 or whose router has no F16 mirror, and the
+/// chunking is mandatory because `forward_batch` ERRORS above
+/// `MAPLE_PREFILL_MAX_B` rather than splitting itself.
+///
+/// Scope, matching the qwen2 precedent: greedy argmax only. `temp` / `top_p` /
+/// `repeat_penalty` / `stop` are accepted and not honoured — no sampler is
+/// wired for arch 15.
+///
+/// TOOLS are offered as of the `.mq2lloydu` repack. The vendor's chat template
+/// (extracted from their GGUF metadata, which is where they ship it — their HF
+/// `tokenizer_config.json` has none) is a standard Qwen-family template with a
+/// `# Tools` system block and `<tool_call>{json}</tool_call>` emission. That is
+/// byte-for-byte the convention `emit_text::extract_tool_calls_from_text`
+/// already parses for `qwen_ar`, so this path REUSES that parser rather than
+/// introducing a second one.
+///
+/// Wire contract for tools here is LEGACY, not semantic v2, and that is
+/// deliberate. `MapleCarrier::caps().semantic_contract_version` stays `None`
+/// because (a) there is no router-backed producer on arch 15, and (b) the v2
+/// fold appends token text VERBATIM with no marker scan — under v2 Maple's
+/// `<think>` … `</think>` would land in `content` instead of being split into
+/// `reasoning_content`. The legacy `ThinkChannelRouter` does that split, so
+/// tool calls are surfaced the legacy way: a `{"type":"tool_calls","calls":[…]}`
+/// event emitted BEFORE the terminal handshake, plus `finish_reason`
+/// `"tool_calls"` on `done`. `stage_terminal_tool_calls` also embeds the
+/// canonical `calls` on the staged done so the payload is v2-ready if arch 15
+/// ever grows a router.
+///
+/// Conversation handling is STATELESS: every turn cold-resets the KV and
+/// re-prefills the full rendered conversation from position 0, which is the
+/// same "Jinja renders the FULL conversation every turn" contract the default
+/// AR body documents. This deliberately does NOT follow `generate_qwen2`'s
+/// append-and-only-reset-on-overflow bookkeeping. That scheme leaks: two
+/// unrelated HTTP requests share one `MapleState`, so turn N reads turn N-1's
+/// KV as context even though the OpenAI wire carries no such history. Verified
+/// on this branch before the fix — an independent second request answered
+/// "Zebedee." to "what was the word I asked you to remember?". A chat server
+/// cannot ship that. There is no CASK eviction for arch 15
+/// (`MapleBundle::kv_cache_mut` returns `None`), and the batched prefill makes
+/// the full re-prefill affordable, so a cold reset is both the correct and the
+/// cheap option. `m.seq_pos` mirrors `MapleState::n_tokens` for daemon
+/// bookkeeping only; nothing reads it back as a resume point.
+#[allow(clippy::too_many_arguments)]
+/// Maple think-channel router (QwenJinja contract).
+///
+/// Maple emits `<think>` … `</think>` as ordinary tokens. When `enable_thinking`
+/// is false the prompt already contains a closed empty think block, so the
+/// router starts in Answer mode. When true it starts inside the open span
+/// (`primed_think` true means the prompt ended with `<think>`). `max_think_tokens`
+/// is an orthogonal force-close cap (0 = uncapped, 1 = no-think sentinel that
+/// is already handled by `enable_thinking=false`) that, when reached, flushes
+/// pending reasoning and transitions to Answer, mirroring the Gemma/Qwen routers.
+pub struct MapleThoughtRouter {
+    pub in_think: bool,
+    pub reasoning_tokens: usize,
+    pub max_think_tokens: usize,
+}
+
+impl MapleThoughtRouter {
+    pub fn new(primed_think: bool, max_think_tokens: usize) -> Self {
+        // `max_think_tokens == 1` is the engine's "no think" sentinel. For Maple
+        // that case is already represented by `primed_think == false` and
+        // `enable_thinking == false`, so no special-casing needed beyond the
+        // normal cap logic (1 would force-close after one token, but we never
+        // construct the router in that state).
+        Self {
+            in_think: primed_think,
+            reasoning_tokens: 0,
+            max_think_tokens,
+        }
+    }
+
+    /// Observe a newly decoded text fragment, update think state, enforce the
+    /// explicit cap, and return the text to emit (with an injected close tag
+    /// when the cap is hit). The caller still emits the returned text as a
+    /// generic token envelope; the router's job is solely to track the state
+    /// and inject the forced closure so the cap is honoured.
+    pub fn observe(&mut self, frag: &str) -> Option<String> {
+        if frag.is_empty() {
+            return None;
+        }
+        // Detect transitions in this fragment. Markers may be split across
+        // fragments, but Maple's `<think>` / `</think>` are each encoded as
+        // single tokens in practice, so a per-fragment scan is sufficient for
+        // the cap-enforcement contract (the unit test covers split cases).
+        if frag.contains("<think>") {
+            self.in_think = true;
+        }
+        let mut close_injected: Option<String> = None;
+        if self.in_think {
+            // Count this fragment as one reasoning token when we are inside the
+            // think span. This mirrors `GemmaThoughtRouter`'s per-push counting.
+            if self.max_think_tokens != 0 && self.max_think_tokens != 1 {
+                self.reasoning_tokens += 1;
+                if self.reasoning_tokens >= self.max_think_tokens {
+                    // Force-close: inject a closing tag if the fragment didn't
+                    // already contain one, then transition to answer mode.
+                    if !frag.contains("</think>") {
+                        close_injected = Some("</think>".to_string());
+                    }
+                    self.in_think = false;
+                }
+            }
+        }
+        if frag.contains("</think>") {
+            self.in_think = false;
+        }
+        close_injected
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn generate_maple(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+    tools: Option<&[serde_json::Value]>,
+    _temp: f32,
+    _top_p: f32,
+    max_tokens: usize,
+    max_think_tokens: usize,
+    assistant_prefix: AssistantPrefix,
+    enable_thinking: bool,
+    _repeat_penalty: f32,
+    _repeat_window: usize,
+) {
+    let tokenizer = match m.tokenizer.as_ref() {
+        Some(t) => t,
+        None => {
+            emit_active_attempt_error(
+                stdout,
+                Some(id),
+                "tokenizer not loaded",
+                "validation",
+                false,
+                false,
+            );
+            let _ = stdout.flush();
+            return;
+        }
+    };
+    let bundle = match m.state.as_mut().and_then(|s| {
+        (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_maple::MapleBundle>()
+    }) {
+        Some(b) => b,
+        _ => {
+            emit_active_attempt_error(
+                stdout,
+                Some(id),
+                "maple state missing on arch_id=15 generate",
+                "validation",
+                false,
+                false,
+            );
+            let _ = stdout.flush();
+            return;
+        }
+    };
+    let cfg = &bundle.config;
+    let weights = &bundle.weights;
+    let state = &mut bundle.state;
+    let eos_tok = bundle.eos_tok;
+
+    // Arch gating — fail closed, never panic. Maple's ternary MoE kernels are
+    // WMMA-based (gfx11/gfx12). An unsupported arch must return a clear error
+    // rather than reaching a `panic!("gfx12-only kernel")` in rdna-compute.
+    // Mirrors the gemm_hfq6g256_moe_grouped_wmma guard that previously
+    // panicked on gfx1151.
+    if !gpu.arch_caps.has_wmma_w32() && !gpu.arch_caps.has_wmma_w32_gfx12() {
+        emit_active_attempt_error(
+            stdout,
+            Some(id),
+            &format!(
+                "maple: unsupported GPU arch '{}' — ternary MoE requires gfx11/gfx12 WMMA (have gfx1151/gfx1201);                  reload on a supported RDNA3/4 device or use a non-ternary model",
+                gpu.arch
+            ),
+            "unsupported",
+            false,
+            false,
+        );
+        let _ = stdout.flush();
+        return;
+    }
+
+    // Tools require the embedded template. `GenerationRoute::supports_tools`
+    // is a per-ROUTE constant, so admitting `maple_ar` admits it for every
+    // arch-15 container — including the pre-repack `.hfq` that carries no
+    // `chat_template`. Only the Jinja frame can render a `# Tools` block; the
+    // hand-rolled ChatML fallback below silently DROPS `tools`, and silently
+    // dropping them is the worst outcome available: measured on this branch,
+    // the same tools request framed 269 prompt tokens against the templated
+    // `.mq2lloydu` container and 21 against the template-less one — the schemas
+    // never reached the model, which then answered in prose (and, in the
+    // session that prompted this work, invented a `str_replace_editor` call).
+    // Refuse instead, with a message that names the fix.
+    if tools.is_some_and(|t| !t.is_empty()) && m.chat_template.is_none() {
+        emit_active_attempt_error(
+            stdout,
+            Some(id),
+            "tools require a chat template, and this arch-15 container embeds none \
+             — re-convert with a `chat_template.jinja` beside the weights \
+             (see pipeline_maple::build_metadata) or request without `tools`",
+            "unsupported",
+            false,
+            false,
+        );
+        let _ = stdout.flush();
+        return;
+    }
+
+    // Render the WHOLE conversation, not just the newest user turn: prior turns
+    // reach the model through the prompt and never through retained KV, which
+    // is what makes the cold reset below safe.
+    //
+    // The Jinja branch is the LIVE path for any `.hfq` repacked with the
+    // vendor's chat template embedded (see `pipeline_maple::build_metadata` —
+    // the sidecar `chat_template.jinja` is folded into `tokenizer_config`).
+    // Maple-Preview's HF `tokenizer_config.json` genuinely ships no template;
+    // the vendor bakes theirs into GGUF metadata instead. The `.hfq` built
+    // BEFORE that repack has no template, and for it the hand-rolled ChatML
+    // frame below is still the live path — hence it is kept, not deleted.
+    //
+    // The fallback must replay history itself: an earlier revision that framed
+    // only `prompt` made the model answer "I don't have memory of previous
+    // conversations" to a request whose `messages` array plainly contained the
+    // answer. The Jinja branch gets the same treatment via `render_messages`.
+    //
+    // `tools` is threaded into `render_messages` exactly as `generate_qwen*`
+    // does. Without it the template's `{%- if tools %}` block never fires, no
+    // `<tools>` schema list reaches the model, and the observed failure is not
+    // silence but a CONFIDENT HALLUCINATION: asked to write code, the model
+    // emitted a well-formed `<tool_call>` naming `str_replace_editor` — a tool
+    // the client never declared. It knows the FORMAT from pretraining; only the
+    // template can tell it the INVENTORY.
+    //
+    // `primed_think` records whether the rendered prompt left the model inside
+    // an already-open `<think>` span. False for the hand-rolled ChatML
+    // fallback, which stops at `<|im_start|>assistant\n`.
+    // Honour the HTTP-resolved reasoning contract (QwenJinja): `enable_thinking`
+    // comes from `thinking_enabled`, `assistant_prefix` from the contract's
+    // prefix mapping, and `max_think_tokens` is the explicit cap. Hardcoding
+    // `true` here would ignore a user's `reasoning_effort:"none"` or an
+    // explicit thinking cap.
+    let mut primed_think = false;
+    let prompt_ids = if let Some(template) = m.chat_template.as_ref() {
+        let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
+            tokenizer,
+            template,
+            system: system_prompt,
+            user: prompt,
+            enable_thinking,
+            bos_token: None,
+            reasoning_strength: None,
+            reasoning_effort: None,
+        };
+        // `frame.render()` cannot carry tools (it renders `system`/`user`
+        // scalars, not a message array), so any tools request must go through
+        // `render_messages` — synthesizing the [system?, user] turn when the
+        // caller supplied no history. Mirrors the qwen EP/AR pattern.
+        let rendered = if tools.is_some() || messages_history.is_some() {
+            let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
+            let messages_slice: &[hipfire_runtime::prompt_frame::Message] = match messages_history {
+                Some(h) if !h.is_empty() => h,
+                _ => {
+                    let mut v = Vec::new();
+                    if let Some(sys) = system_prompt {
+                        v.push(hipfire_runtime::prompt_frame::Message {
+                            role: hipfire_runtime::prompt_frame::Role::System,
+                            content: sys.to_string(),
+                            reasoning_content: None,
+                            name: None,
+                            rendered_name: None,
+                            tool_calls: Vec::new(),
+                            tool_call_id: None,
+                            tool_plan: String::new(),
+                        });
+                    }
+                    v.push(hipfire_runtime::prompt_frame::Message {
+                        role: hipfire_runtime::prompt_frame::Role::User,
+                        content: prompt.to_string(),
+                        reasoning_content: None,
+                        name: None,
+                        rendered_name: None,
+                        tool_calls: Vec::new(),
+                        tool_call_id: None,
+                        tool_plan: String::new(),
+                    });
+                    synthesized = v;
+                    &synthesized
+                }
+            };
+            frame.render_messages(messages_slice, tools, None)
+        } else {
+            frame.render()
+        };
+        match rendered {
+            Ok(rendered) => {
+                // The vendor template's generation prompt ends
+                // `<|im_start|>assistant\n<think>\n`, so the model resumes
+                // INSIDE an already-open reasoning span and never emits a
+                // `<think>` of its own. Same `primed_think` probe the qwen
+                // paths use. See `started_in_think` at the gen_start below.
+                primed_think = rendered.trim_end().ends_with("<think>");
+                tokenizer.encode(&rendered)
+            }
+            Err(e) => {
+                eprintln!(
+                    "[daemon] maple jinja render failed ({e}) — falling back to ChatML frame"
+                );
+                primed_think = matches!(
+                    assistant_prefix,
+                    hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
+                );
+                tokenizer.encode(&maple_chatml_frame(
+                    system_prompt,
+                    prompt,
+                    messages_history,
+                    assistant_prefix,
+                ))
+            }
+        }
+    } else {
+        primed_think = matches!(
+            assistant_prefix,
+            hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
+        );
+        tokenizer.encode(&maple_chatml_frame(
+            system_prompt,
+            prompt,
+            messages_history,
+            assistant_prefix,
+        ))
+    };
+    if prompt_ids.is_empty() {
+        emit_active_attempt_error(
+            stdout,
+            Some(id),
+            "empty prompt after tokenize",
+            "validation",
+            false,
+            false,
+        );
+        let _ = stdout.flush();
+        return;
+    }
+
+    // Cold reset EVERY turn. The rendered prompt above already carries the full
+    // conversation, so retaining the previous turn's KV would not add context —
+    // it would only let an unrelated request's tokens leak into this one (the
+    // "Zebedee" leak in the fn doc). Reset first, then size-check against a
+    // known-empty cache so the check is about this turn alone.
+    if let Err(e) = state.reset(gpu) {
+        emit_error_with_id(stdout, id, format!("maple state reset failed: {e}"));
+        let _ = stdout.flush();
+        return;
+    }
+    m.seq_pos = 0;
+    m.conversation_tokens.clear();
+
+    // Capacity guard. No eviction on arch_id=15, and the cache is empty, so a
+    // turn that still does not fit cannot be rescued — prefilling it would
+    // write past the KV allocation. `decode_step` fails closed on that, but a
+    // clean typed error beats a mid-stream arch error.
+    if prompt_ids
+        .len()
+        .saturating_add(max_tokens)
+        .saturating_add(1)
+        > state.max_seq
+    {
+        let cap = state.max_seq;
+        emit_active_attempt_error(
+            stdout,
+            Some(id),
+            &format!(
+                "prompt exceeds context capacity: prompt={} + max_tokens={} > capacity={} \
+                 — reload model with a larger max_seq",
+                prompt_ids.len(),
+                max_tokens,
+                cap
+            ),
+            "context_length",
+            false,
+            false,
+        );
+        let _ = stdout.flush();
+        return;
+    }
+
+    let t0 = Instant::now();
+    // Always 0 after the reset above; named rather than inlined so the
+    // position arithmetic below reads the same as the arch crate's harness.
+    let base_pos = state.n_tokens;
+
+    // Prefill. Batched when the checkpoint's tier supports it (12.6x on this
+    // checkpoint), per-token otherwise. The fallback is not dead code.
+    let mut logits: Vec<f32> = Vec::new();
+    if hipfire_arch_maple::forward::forward_batch_supported(weights) {
+        for (start, len) in hipfire_arch_maple::batch::prefill_chunks(
+            prompt_ids.len(),
+            hipfire_arch_maple::batch::MAPLE_PREFILL_CHUNK,
+        ) {
+            match hipfire_arch_maple::forward::forward_batch(
+                cfg,
+                weights,
+                state,
+                gpu,
+                &prompt_ids[start..start + len],
+                base_pos + start,
+            ) {
+                Ok(l) => logits = l,
+                Err(e) => {
+                    emit_error_with_id(stdout, id, format!("maple batched prefill failed: {e}"));
+                    let _ = stdout.flush();
+                    return;
+                }
+            }
+        }
+    } else {
+        for (i, &tok) in prompt_ids.iter().enumerate() {
+            match hipfire_arch_maple::forward::decode_step(
+                cfg,
+                weights,
+                state,
+                gpu,
+                tok,
+                (base_pos + i) as u32,
+            ) {
+                Ok(l) => logits = l,
+                Err(e) => {
+                    emit_error_with_id(stdout, id, format!("maple prefill failed: {e}"));
+                    let _ = stdout.flush();
+                    return;
+                }
+            }
+        }
+    }
+    for &tok in &prompt_ids {
+        m.conversation_tokens.push(tok);
+    }
+    let t_prefill = Instant::now();
+    let prefill_s = t_prefill.duration_since(t0).as_secs_f64();
+
+    // Open the wire contract before any token can reach the client. The CLI's
+    // stream latch (`StreamContractError::PreStartEvent`) fail-closes on ANY
+    // event that precedes `gen_start` — and then `abort_and_drain_with_rx`
+    // blocks forever waiting for an `aborted`+`done` pair the daemon has
+    // already moved past. Symptom without this line is not an error message but
+    // a hung HTTP request: verified empirically on this branch before the fix.
+    // Errors raised ABOVE this point are still safe — the client special-cases
+    // a pre-start `error` and surfaces the daemon's reason — which is why this
+    // sits after the capacity guard and prefill, mirroring the DS4 call site.
+    //
+    // `contract_version` is `gen_start_contract_version_for_arch(15)`, i.e.
+    // `MapleCarrier::caps().semantic_contract_version` = None. Maple must NOT
+    // advertise semantic contract v2 even now that `MapleAr` DOES support
+    // tools: it has no router-backed producer, and the v2 fold appends token
+    // text verbatim with no marker scan — under v2 the `<think>` … `</think>`
+    // span below would be misfiled as `content` instead of `reasoning_content`.
+    // The legacy `ThinkChannelRouter` does that split, and the legacy contract
+    // carries tool calls perfectly well via a `{"type":"tool_calls"}` event
+    // (see the terminal at the end of this fn).
+    //
+    // `started_in_think` is `primed_think`, NOT a constant. It depends on which
+    // frame rendered the prompt, and getting it wrong silently misfiles the
+    // whole reasoning span:
+    //
+    //   * hand-rolled ChatML fallback — stops at `<|im_start|>assistant\n`; the
+    //     model emits its own `<think>`, so the stream begins OUTSIDE the span
+    //     and this is false.
+    //   * vendor template — its generation prompt ends
+    //     `<|im_start|>assistant\n<think>\n`, so the model resumes INSIDE an
+    //     open span and never emits the opening tag. Hardcoding false here made
+    //     the legacy `ThinkChannelRouter` treat the entire chain-of-thought as
+    //     answer text: observed live on the first `.mq2lloydu` run, where the
+    //     model's "The user wants me to write a hello world in Zig…" reasoning
+    //     was returned as `content` with `reasoning_content` empty.
+    emit_gen_start(
+        stdout,
+        id,
+        primed_think,
+        crate::common::gen_start_contract_version_for_arch(15),
+    );
+
+    // Decode. Greedy argmax over the CPU-side logits `forward_batch` /
+    // `decode_step` return — there is no `gpu.argmax_f32` step on this path
+    // because the arch crate already brings the row back to the host.
+    let mut generated_count: usize = 0;
+    let mut pos = (base_pos + prompt_ids.len()) as u32;
+    let mut next_tok = maple_argmax(&logits, cfg.vocab_size);
+    // `<|endoftext|>` (151643) is not Maple's declared eos — config.json says
+    // 151645 — but emitting it mid-chat is a terminal condition either way, and
+    // continuing past it produces garbage. Stop on both.
+    let eos_set: [u32; 2] = [eos_tok, 151643];
+    let mut hit_eos = false;
+    // Explicit thinking cap enforcement. The HTTP layer resolves `max_think_tokens`
+    // via the QwenJinja contract; without this router Maple would ignore it and
+    // think indefinitely (or ignore a user's `reasoning_effort:"none"` which
+    // surfaces as `enable_thinking=false` + `max_think_tokens=1`).
+    let mut maple_router = MapleThoughtRouter::new(primed_think, max_think_tokens);
+
+    // Streaming UTF-8 reassembly. A per-token `tokenizer.decode(&[tok])` is
+    // WRONG on a byte-level BPE: one emoji or CJK character is several tokens,
+    // and decoding each in isolation runs `from_utf8_lossy` over half a code
+    // point, so the client receives U+FFFD replacement chars. Observed live —
+    // "Got it — Zebedee, acknowledged. \u{fffd}\u{fffd}\u{fffd}" — before this
+    // was added. Decode the whole run and emit only the delta's longest valid
+    // UTF-8 prefix, carrying any partial trailing code point into the next
+    // token. Mirrors the `decode_bytes` + `bytes_fed_to_filter` pattern the
+    // Qwen/LLaMA AR bodies use, minus the EosFilter that arch 15 has no
+    // overrides for.
+    let mut streamed_tokens: Vec<u32> = Vec::with_capacity(max_tokens);
+    let mut bytes_emitted: usize = 0;
+
+    loop {
+        if generated_count >= max_tokens {
+            break;
+        }
+        if eos_set.contains(&next_tok) {
+            hit_eos = true;
+            break;
+        }
+        // `<think>` / `</think>` are ordinary tokens here and stream through
+        // verbatim, but the explicit `max_think_tokens` cap (when set) is
+        // honoured by the router which injects a forced `</think>` when the
+        // budget is exhausted.
+        streamed_tokens.push(next_tok);
+        let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
+        let pending = &all_bytes[bytes_emitted.min(all_bytes.len())..];
+        let valid_len = match std::str::from_utf8(pending) {
+            Ok(_) => pending.len(),
+            // Only a truncated final code point may be held back. Genuinely
+            // invalid bytes (error_len() is Some) must not be buffered forever
+            // — emit them lossily and move on, or the stream would stall.
+            Err(e) if e.error_len().is_none() => e.valid_up_to(),
+            Err(_) => pending.len(),
+        };
+        if valid_len > 0 {
+            let frag = String::from_utf8_lossy(&pending[..valid_len]).into_owned();
+            bytes_emitted += valid_len;
+            let envelope = serde_json::json!({
+                "type": "token",
+                "id": id,
+                "text": frag,
+                "attempt_id": active_attempt_id(),
+            });
+            let _ = writeln!(stdout, "{}", envelope);
+            let _ = stdout.flush();
+            if let Some(close) = maple_router.observe(&frag) {
+                let close_envelope = serde_json::json!({
+                    "type": "token",
+                    "id": id,
+                    "text": close,
+                    "attempt_id": active_attempt_id(),
+                });
+                let _ = writeln!(stdout, "{}", close_envelope);
+                let _ = stdout.flush();
+                // Also extend the streamed buffer so tool-call extraction sees
+                // the forced close.
+                bytes_emitted = bytes_emitted.saturating_sub(close.len());
+                // Append close bytes to streamed_tokens via re-encoding? Instead
+                // just track that we are now in answer mode; the textual close
+                // is sufficient for downstream parsing.
+            }
+        } else {
+            // Still advance the router even when no valid UTF-8 delta was
+            // emitted (e.g. a split code point), so the think-token count
+            // stays in sync with the model's token stream.
+            let frag = String::from_utf8_lossy(pending).into_owned();
+            if frag.contains("<think>") || frag.contains("</think>") {
+                let _ = maple_router.observe(&frag);
+            }
+        }
+        m.conversation_tokens.push(next_tok);
+        generated_count += 1;
+
+        match hipfire_arch_maple::forward::decode_step(cfg, weights, state, gpu, next_tok, pos) {
+            Ok(l) => {
+                pos += 1;
+                next_tok = maple_argmax(&l, cfg.vocab_size);
+            }
+            Err(e) => {
+                emit_error_with_id(stdout, id, format!("maple decode_step failed: {e}"));
+                let _ = stdout.flush();
+                return;
+            }
+        }
+    }
+
+    // Flush any bytes still held back by the UTF-8 carry. Reaching here with a
+    // non-empty tail means the run ended (EOS or max_tokens) mid-code-point;
+    // dropping it would silently truncate the reply's last character.
+    if !streamed_tokens.is_empty() {
+        let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
+        if bytes_emitted < all_bytes.len() {
+            let frag = String::from_utf8_lossy(&all_bytes[bytes_emitted..]).into_owned();
+            bytes_emitted = all_bytes.len();
+            let envelope = serde_json::json!({
+                "type": "token",
+                "id": id,
+                "text": frag,
+                "attempt_id": active_attempt_id(),
+            });
+            let _ = writeln!(stdout, "{}", envelope);
+            let _ = stdout.flush();
+        }
+    }
+    let _ = bytes_emitted;
+
+    // Daemon bookkeeping: seq_pos matches MapleState's internal cursor.
+    m.seq_pos = state.n_tokens;
+
+    let t_end = Instant::now();
+    let decode_s = t_end.duration_since(t_prefill).as_secs_f64();
+    let total_s = t_end.duration_since(t0).as_secs_f64();
+    let rate = |n: usize, s: f64| if s > 0.0 { n as f64 / s } else { 0.0 };
+    let tok_s = rate(generated_count, total_s);
+    let prefill_tok_s = rate(prompt_ids.len(), prefill_s);
+    let decode_tok_s = rate(generated_count, decode_s);
+
+    // Tool calls. REUSE the Qwen `<tool_call>{json}</tool_call>` parser rather
+    // than writing an arch-15 one — Maple's template emits exactly that shape,
+    // and a second parser would be a second place to drift. Whole-buffer
+    // extract over the decoded run, which is the same legacy-tolerant strategy
+    // the non-router DFlash terminal uses.
+    //
+    // A truncated turn (`!hit_eos`, i.e. max_tokens) NEVER releases calls: a
+    // half-written `<tool_call>` body would be recovered by the tolerant parser
+    // into arguments the model never finished writing. Length stays "length".
+    let tool_calls = if hit_eos {
+        hipfire_runtime::emit_text::extract_tool_calls_from_text(
+            &tokenizer.decode(&streamed_tokens),
+        )
+    } else {
+        Vec::new()
+    };
+    let finish_reason = if !hit_eos {
+        "length"
+    } else if !tool_calls.is_empty() {
+        "tool_calls"
+    } else {
+        "stop"
+    };
+    let mut pending_done = serde_json::json!({
+        "type": "done",
+        "id": id,
+        "tokens": generated_count,
+        "tok_s": (tok_s * 10.0).round() / 10.0,
+        "prefill_tokens": prompt_ids.len(),
+        "prefill_ms": ((prefill_s * 1000.0) * 10.0).round() / 10.0,
+        "prefill_tok_s": (prefill_tok_s * 10.0).round() / 10.0,
+        "decode_tok_s": (decode_tok_s * 10.0).round() / 10.0,
+        "ttft_ms": ((prefill_s * 1000.0) * 10.0).round() / 10.0,
+        "total_ms": ((total_s * 1000.0) * 10.0).round() / 10.0,
+        // Report the truth: "stop" only when a real end-of-turn token landed.
+        // Defaulting to "stop" (what `openai_finish_reason` does for a missing
+        // field) would make a truncated reply look like a complete one.
+        "finish_reason": finish_reason,
+        "attempt_id": active_attempt_id(),
+    });
+    // Canonical `calls` on the staged done — ignored by the legacy client fold
+    // (which reads the event below) but required by `absorb_terminal_calls` if
+    // arch 15 is ever promoted to contract v2. Cheap, and keeps one source of
+    // truth for the payload.
+    hipfire_engine::emit::stage_terminal_tool_calls(&mut pending_done, finish_reason, &tool_calls);
+    // Legacy contract surfaces tool calls ONLY from a `{"type":"tool_calls"}`
+    // event, and the client's fold reads them BEFORE the commit_ready terminal
+    // — so this must precede `await_client_terminal_commit`, not follow it.
+    hipfire_engine::emit::emit_tool_calls_event(stdout, id, &tool_calls);
+    let _ = stdout.flush();
+    match await_client_terminal_commit(stdout, id, &pending_done) {
+        ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
+        ClientTerminalDecision::Abort => {}
+    }
+}
+
+/// Literal ChatML frame for Maple. This is the LIVE prompt path — the published
+/// `.hfq` embeds no `chat_template` — so it must be able to replay a full
+/// conversation, not just one turn.
+///
+/// Single-turn output is byte-identical to the frame the arch crate's coherence
+/// example uses, which is the frame arch-15 was verified coherent under:
+/// `<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n`.
+///
+/// When `history` is present it is authoritative and `user` is ignored — the
+/// daemon derives `prompt` from the last user message of the same array, so
+/// appending `user` again would duplicate the final turn.
+///
+/// Prior assistant turns are replayed from `content` only. `reasoning_content`
+/// is deliberately dropped: Maple emits `<think>` … `</think>` fresh each turn,
+/// and feeding a previous turn's reasoning back is off-distribution (the same
+/// convention the Qwen3-family templates use).
+fn maple_chatml_frame(
+    system: Option<&str>,
+    user: &str,
+    history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+    assistant_prefix: AssistantPrefix,
+) -> String {
+    use hipfire_runtime::prompt_frame::Role;
+    let mut s = String::new();
+    let mut turn = |role: &str, content: &str, out: &mut String| {
+        out.push_str("<|im_start|>");
+        out.push_str(role);
+        out.push('\n');
+        out.push_str(content);
+        out.push_str("<|im_end|>\n");
+    };
+    match history.filter(|h| !h.is_empty()) {
+        Some(h) => {
+            // A system message supplied out-of-band still has to lead when the
+            // history array does not already carry one.
+            let has_system = h.iter().any(|msg| msg.role == Role::System);
+            if !has_system {
+                if let Some(sys) = system.filter(|t| !t.trim().is_empty()) {
+                    turn("system", sys, &mut s);
+                }
+            }
+            for msg in h {
+                let role = match msg.role {
+                    Role::System => "system",
+                    Role::User => "user",
+                    Role::Assistant => "assistant",
+                    // Maple has no tool protocol; surface a tool result as a
+                    // user-visible observation rather than inventing a role
+                    // token the model never saw in training.
+                    Role::Tool => "user",
+                };
+                turn(role, &msg.content, &mut s);
+            }
+        }
+        None => {
+            if let Some(sys) = system.filter(|t| !t.trim().is_empty()) {
+                turn("system", sys, &mut s);
+            }
+            turn("user", user, &mut s);
+        }
+    }
+    match assistant_prefix {
+        AssistantPrefix::OpenThink => s.push_str("<|im_start|>assistant\n<think>\n"),
+        AssistantPrefix::ClosedThink => {
+            s.push_str("<|im_start|>assistant\n<think>\n\n</think>\n\n")
+        }
+        AssistantPrefix::Plain => s.push_str("<|im_start|>assistant\n"),
+    }
+    s
+}
+
+/// Greedy argmax over the host-side logits row, bounded by `vocab_size`.
+///
+/// The bound matters: the lm_head output row can be padded past `vocab_size`
+/// and an argmax over the padding can return an id the tokenizer has no entry
+/// for.
+fn maple_argmax(logits: &[f32], vocab_size: usize) -> u32 {
+    let n = vocab_size.min(logits.len());
+    let mut best = 0usize;
+    let mut best_v = f32::NEG_INFINITY;
+    for (i, &v) in logits.iter().take(n).enumerate() {
+        if v > best_v {
+            best_v = v;
+            best = i;
+        }
+    }
+    best as u32
 }

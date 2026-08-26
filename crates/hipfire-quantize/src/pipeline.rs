@@ -2907,6 +2907,37 @@ fn handle_early_special_formats(args: &QuantizeArgs) -> bool {
     let input_dir = args.input.as_str();
     let output_path = args.output.as_str();
     let format = args.format.as_str();
+    // ── maple: Maple-Preview native-ternary onboarding ──────────────────────
+    // Packs the already-ternary linears EXACTLY into qt=51 MQ2G256LloydU and
+    // carries the router / embeddings / lm_head / norms as BF16. Refuses any
+    // "ternary" tensor that is not actually ternary rather than falling back to
+    // a lossy encode. Input is the safetensors DIRECTORY.
+    //   hipfire-quantize --format maple --input <maple-dir> --output <out.hfq>
+    if matches!(format, "maple" | "maple-preview" | "maple-ternary") {
+        let cfg_path = Path::new(input_dir).join("config.json");
+        let config_json = std::fs::read_to_string(&cfg_path).unwrap_or_else(|e| {
+            eprintln!("error: read {}: {e}", cfg_path.display());
+            std::process::exit(2);
+        });
+        let head_quant: crate::maple::MapleHeadQuant =
+            args.head_quant.parse().unwrap_or_else(|e| {
+                eprintln!("error: {e}");
+                std::process::exit(2);
+            });
+        match crate::pipeline_maple::convert_maple_safetensors(
+            Path::new(input_dir),
+            Path::new(output_path),
+            &config_json,
+            head_quant,
+        ) {
+            Ok(_) => eprintln!("maple: wrote {output_path}"),
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(2);
+            }
+        }
+        return true;
+    }
     if matches!(
         format,
         "deepseek4-dense-mfp4e8soa-overlay" | "ds4-dense-e8soa-overlay"
