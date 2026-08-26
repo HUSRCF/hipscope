@@ -2411,6 +2411,34 @@ pub(crate) fn find_model_path(
             }
         }
     }
+    // An exact on-disk spelling outranks a registry alias that would rewrite it.
+    // The registry maps a model NAME to its canonical FILE, which is what makes
+    // `qwen3.8:27b` resolve to `qwen3.8-27b.mq4`. But when a legacy alias points at
+    // a RENAMED artifact and both spellings are present, that rewrite silently
+    // serves weights the user did not name -- `ornith1.5:35b-a3b` reaching
+    // `ornith-1.5-35b-a3b.mq4` while `ornith1.5-35b-a3b.mq4` sits right there.
+    //
+    // The comparison is on the exact stem, deliberately NOT the looser `contains`
+    // used by scan_local_models: `qwen3.8:27b` would `contains`-match
+    // `qwen3.8-27b.mq4r` and `qwen3.8-27b.mq4-xt` as well, and the quant sort below
+    // ranks `.mq4r` ABOVE `.mq4`, so a looser rule here would silently move users
+    // onto a different tier. An exact stem can only ever match the one file the
+    // user actually spelled.
+    let exact_stem = model.replace(':', "-").to_ascii_lowercase();
+    if let Ok(local) = local_model_paths(paths) {
+        if let Some(hit) = local.iter().find(|path| {
+            let name = path
+                .file_name()
+                .and_then(|file| file.to_str())
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            MODEL_SUFFIXES
+                .iter()
+                .any(|suffix| name == format!("{exact_stem}{suffix}"))
+        }) {
+            return Some(hit.clone());
+        }
+    }
     if let Some((_, entry)) = registry.model(model) {
         let path = paths.models.join(&entry.file);
         if path.is_file() {
