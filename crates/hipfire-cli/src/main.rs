@@ -8126,8 +8126,6 @@ mod tests {
             let registry = hipfire_registry::bundled().unwrap();
             let shared = Arc::new(ServeShared {
                 metrics: crate::serve::metrics::Metrics::default(),
-                // Test harness drives the single-daemon path.
-                slot_engine: None,
                 runtime: Mutex::new(ServeRuntime {
                     engine,
                     paths: paths.clone(),
@@ -8144,6 +8142,10 @@ mod tests {
                     kv_backend_override: None,
                     tp: None,
                     continuous_batch_size: 1,
+                    multi_slot_enabled: false,
+                    multi_slot_slots: 4,
+                    multi_slot_ctx: 8192,
+                    multi_slot_prefill_chunk: 1024,
                 }),
                 meta: Mutex::new(ServeMeta {
                     current_model: None,
@@ -8949,7 +8951,6 @@ mod tests {
     /// Capability denial: daemon typed error on tools request → no completion/tool payload.
     #[cfg(unix)]
     // --- Task 15: server-owned one-retry (disabled-by-default) ---
-
     #[test]
     fn bench_generate_request_includes_numeric_first_attempt() {
         let req = bench_generate_request("bench prompt", 37);

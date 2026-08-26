@@ -166,25 +166,33 @@ impl SessionTable {
     /// Exactly one turn shorter, not merely a prefix: a session two turns
     /// behind is missing an assistant reply that never entered its KV, so
     /// appending the newest user turn to it would skip a turn.
+    /// Returns None when more than one non-busy matching candidate exists —
+    /// an LRU pick among duplicates would append to the wrong session.
     pub fn find_continuation(&self, want: &[u64], busy: &[SessionId]) -> Option<SessionId> {
         if want.len() < 2 {
             return None;
         }
         let expect = &want[..want.len() - 1];
-        self.sessions
-            .iter()
-            .filter(|(id, s)| {
-                // Residency is deliberately NOT a filter. A swapped session is
-                // exactly the case swap exists for: its snapshot holds the KV
-                // this turn wants. The caller restores it before use. Cold
-                // sessions have no snapshot, so they are excluded.
-                s.residency != Residency::Cold
-                    && s.convo.as_slice() == expect
-                    && !s.tokens.is_empty()
-                    && !busy.iter().any(|b| b.0 == **id)
-            })
-            .max_by_key(|(_, s)| s.last_used)
-            .map(|(id, _)| SessionId(*id))
+        let mut candidates: Vec<(u64, u64)> = Vec::new();
+        for (id, s) in self.sessions.iter() {
+            if s.residency == Residency::Cold {
+                continue;
+            }
+            if s.convo.as_slice() != expect {
+                continue;
+            }
+            if s.tokens.is_empty() {
+                continue;
+            }
+            if busy.iter().any(|b| b.0 == *id) {
+                continue;
+            }
+            candidates.push((*id, s.last_used));
+        }
+        if candidates.len() != 1 {
+            return None;
+        }
+        Some(SessionId(candidates[0].0))
     }
 
     /// Confirm that `id` is the session a tool-result iteration names, and that

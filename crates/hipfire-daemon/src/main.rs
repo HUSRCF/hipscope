@@ -82,6 +82,7 @@ use hipfire_generate::redline::{
     RedlineDsparkReplayArm, RedlineDsparkVerifySnapshot, RedlineLfm2MoeSnapshot,
     RedlineQwenSnapshot, RedlineSnapshot,
 };
+mod slots;
 use hipfire_generate::vision::{GenerateVLParams, ImageSource};
 use hipfire_loader::{AsstTurnCache, EpArch, EpState, Eviction, LoadedModel};
 use hipfire_runtime::spec::{
@@ -717,6 +718,10 @@ fn main() {
     let mut continuous_batch_size: usize = 1;
     let mut batch_scheduler: Option<ContinuousBatchScheduler> = None;
     let mut batch_poisoned: Option<String> = None;
+    // Experimental multi-slot backend: alternate model owner (one SlotEngine/weight set).
+    // None => ordinary LoadedModel path. Continuous-batching integration is deferred.
+    // Arc allows request workers to hold the model alive only while active; reset/unload/swap refuse while active.
+    let mut slot_backend: Option<std::sync::Arc<slots::SlotBackend>> = None;
 
     // Background stdin reader. Drains stdin into an mpsc channel so
     // the main loop can pull non-blockingly between messages. Abort /
@@ -863,6 +868,229 @@ fn main() {
                     .and_then(|v| v.as_u64())
                     .unwrap_or(1) as usize;
                 let parsed_continuous_batch_size = parse_continuous_batch_size(msg.get("params"));
+                let experimental_multi_slot = msg
+                    .get("params")
+                    .and_then(|p| p.get("experimental_multi_slot"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if experimental_multi_slot {
+                    // Experimental slot backend is an alternate model owner, not a batch-mode switch.
+                    // Validate mutually exclusive knobs before any GPU work.
+                    if let Some(err) = slots::validate_load_caps(&msg) {
+                        emit_uncorrelated_error(
+                            &mut stdout,
+                            None,
+                            &err,
+                            "validation",
+                            false,
+                            false,
+                        );
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                    // Refuse model swap while slot requests active; do not keep old Arc alive via workers.
+                    if slot_backend.as_ref().is_some_and(|b| b.active_count() > 0) {
+                        emit_uncorrelated_error(
+                            &mut stdout,
+                            None,
+                            "load refused: slot requests active",
+                            "validation",
+                            false,
+                            false,
+                        );
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                    // Unload prior backends safely before loading the slot engine (exactly one weight copy).
+                    // Drop any prior slot backend only after active check.
+                    if let Some(slot) = slot_backend.take() {
+                        match std::sync::Arc::try_unwrap(slot) {
+                            Err(slot) => {
+                                slot_backend = Some(slot);
+                                emit_uncorrelated_error(
+                                    &mut stdout,
+                                    None,
+                                    "load refused: slot requests active (Arc live)",
+                                    "validation",
+                                    false,
+                                    false,
+                                );
+                                let _ = stdout.flush();
+                                continue;
+                            }
+                            Ok(slot) => {
+                                if let Err(reason) = slot.shutdown() {
+                                    emit_uncorrelated_error(
+                                        &mut stdout,
+                                        None,
+                                        &format!("prior slot shutdown failed: {reason}"),
+                                        "internal",
+                                        false,
+                                        false,
+                                    );
+                                    let _ = stdout.flush();
+                                    continue;
+                                }
+                                batch_clear_all_terminals();
+                            }
+                        }
+                    }
+                    // Tear down PFlash / ordinary model (eager; experimental requires pp=tp=1 so no EP deferral).
+                    if let Some(mut pf) = pflash_state.take() {
+                        if let Some(mut dg) = pflash_drafter_gpu.take() {
+                            dg.bind_thread_or_warn();
+                            pf.unload_drafter(&mut dg);
+                            gpu.bind_thread_or_warn();
+                        } else {
+                            pf.unload_drafter(&mut gpu);
+                        }
+                    }
+                    pflash_cfg = None;
+                    if let Some(m) = model.take() {
+                        if let Err(err) = hipfire_loader::unload_model(m, &mut gpu) {
+                            emit_uncorrelated_error(
+                                &mut stdout,
+                                None,
+                                &format!("prior unload failed: {err}"),
+                                "internal",
+                                false,
+                                false,
+                            );
+                            let _ = stdout.flush();
+                            continue;
+                        }
+                    } else if let Err(err) = hipfire_loader::ensure_vmm_ready_for_load(&mut gpu) {
+                        emit_uncorrelated_error(&mut stdout, None, &err, "internal", false, false);
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                    // Continuous-batch state must be cleared — slot backend is not batched.
+                    batch_scheduler = None;
+                    continuous_batch_size = 1;
+                    batch_poisoned = None;
+
+                    let path = msg.get("model").and_then(|v| v.as_str()).unwrap_or("");
+                    if path.is_empty() {
+                        emit_uncorrelated_error(
+                            &mut stdout,
+                            None,
+                            "load: missing model path",
+                            "validation",
+                            false,
+                            false,
+                        );
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                    let requested_max_seq = msg
+                        .get("params")
+                        .and_then(|p| p.get("max_seq"))
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(4096) as usize;
+                    let max_seq = requested_max_seq.min(MAX_REQUESTED_SEQ);
+                    let n_slots = msg
+                        .get("params")
+                        .and_then(|p| p.get("experimental_multi_slot_slots"))
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(4) as usize;
+                    let cap_tokens = msg
+                        .get("params")
+                        .and_then(|p| p.get("experimental_multi_slot_ctx"))
+                        .and_then(|v| v.as_u64())
+                        .map(|v| v as usize)
+                        .unwrap_or(max_seq);
+                    let prefill_chunk = msg
+                        .get("params")
+                        .and_then(|p| p.get("experimental_multi_slot_prefill_chunk"))
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(1024) as usize;
+                    match slots::SlotBackend::load(path, n_slots, cap_tokens, prefill_chunk) {
+                        Ok(backend) => {
+                            let arch = backend.arch_str().to_string();
+                            let dim = backend.dim();
+                            let layers = backend.layers();
+                            let vocab = backend.vocab();
+                            // Ensure ordinary model stays None — exactly one weight copy.
+                            model = None;
+                            slot_backend = Some(std::sync::Arc::new(backend));
+                            // Per contract: continuous_batch_capable false, cache_capable true, reasoning_contract qwen_jinja, plus experimental flag.
+                            let ack = serde_json::json!({
+                                "type": "loaded",
+                                "arch": arch,
+                                "dim": dim,
+                                "layers": layers,
+                                "vocab": vocab,
+                                "vl": false,
+                                "reasoning_contract": "qwen_jinja",
+                                "reasoning_effort_native": false,
+                                "reasoning_efforts": [],
+                                "cache_capable": true,
+                                "retry_reset_eligible": false,
+                                "continuous_batch_capable": false,
+                                "experimental_multi_slot": true
+                            });
+                            let _ = writeln!(stdout, "{ack}");
+                            let _ = stdout.flush();
+                        }
+                        Err(e) => {
+                            emit_uncorrelated_error(
+                                &mut stdout,
+                                None,
+                                &format!("load failed: {e}"),
+                                "internal",
+                                false,
+                                false,
+                            );
+                            let _ = stdout.flush();
+                        }
+                    }
+                    continue;
+                }
+                // Ordinary load: refuse while slot requests active, otherwise checked shutdown
+                if slot_backend.as_ref().is_some_and(|b| b.active_count() > 0) {
+                    emit_uncorrelated_error(
+                        &mut stdout,
+                        None,
+                        "load refused: slot requests active",
+                        "validation",
+                        false,
+                        false,
+                    );
+                    let _ = stdout.flush();
+                    continue;
+                }
+                if let Some(slot) = slot_backend.take() {
+                    match std::sync::Arc::try_unwrap(slot) {
+                        Err(slot) => {
+                            slot_backend = Some(slot);
+                            emit_uncorrelated_error(
+                                &mut stdout,
+                                None,
+                                "load refused: slot requests active (Arc live)",
+                                "validation",
+                                false,
+                                false,
+                            );
+                            let _ = stdout.flush();
+                            continue;
+                        }
+                        Ok(slot) => {
+                            if let Err(reason) = slot.shutdown() {
+                                emit_uncorrelated_error(
+                                    &mut stdout,
+                                    None,
+                                    &format!("prior slot shutdown failed: {reason}"),
+                                    "internal",
+                                    false,
+                                    false,
+                                );
+                                let _ = stdout.flush();
+                                continue;
+                            }
+                            batch_clear_all_terminals();
+                        }
+                    }
+                }
                 // Unload previous if any. PFlash drafter goes first so
                 // its tensors join the pool before unload_model drains
                 // it -- otherwise free_tensor would queue them into the
@@ -1854,6 +2082,29 @@ fn main() {
                     arm_fault_after_prefill(want);
                     FaultAfterPrefillGuard
                 };
+                // Experimental slot backend dispatches before the ordinary model path.
+                // This preserves byte-for-byte default behavior when absent, and in experimental
+                // mode owns exactly one SlotEngine/weight set with no ordinary-model fallback.
+                // Spawn a bounded request worker so the main loop continues accepting independent generates.
+                if let Some(slot) = slot_backend.clone() {
+                    let msg_clone = msg.clone();
+                    let id_owned = id.to_string();
+                    let slot_clone = slot.clone();
+                    // Bounded: refuse if too many active? The backend's active counter bounds concurrency;
+                    // engine itself is the only GPU worker, so workers serialize on engine submit.
+                    std::thread::spawn(move || {
+                        // Each worker uses its own stdout handle; every event is one serde JSON line.
+                        let mut worker_stdout = std::io::stdout();
+                        let _ = slot_clone.handle_generate(
+                            &msg_clone,
+                            &mut worker_stdout,
+                            &id_owned,
+                            gen_attempt_id,
+                        );
+                        let _ = worker_stdout.flush();
+                    });
+                    continue;
+                }
                 let m = match model.as_mut() {
                     Some(m) => m,
                     None => {
@@ -2951,6 +3202,51 @@ fn main() {
                         continue;
                     }
                 };
+                // Experimental slot backend: alternate owner, reset via engine. Refuse while active, otherwise checked teardown, clear keyed entries, ack only success.
+                if let Some(slot) = slot_backend.as_ref() {
+                    if slot.active_count() > 0 {
+                        hipfire_generate::dense::write_error_envelope(
+                            &mut stdout,
+                            None,
+                            "reset refused: slot requests active",
+                            "validation",
+                            false,
+                            false,
+                            reset_attempt_id,
+                        );
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                    match slot.reset() {
+                        Ok(()) => {
+                            batch_clear_all_terminals();
+                            state_epoch = state_epoch.saturating_add(1);
+                            let ack = serde_json::json!({
+                                "type": "reset",
+                                "rolled_back": true,
+                                "state_epoch": state_epoch,
+                                "seq_pos": 0,
+                                "conversation_len": 0,
+                                "attempt_id": reset_attempt_id,
+                                "retry_reset_eligible": false,
+                            });
+                            let _ = writeln!(stdout, "{ack}");
+                        }
+                        Err(e) => {
+                            hipfire_generate::dense::write_error_envelope(
+                                &mut stdout,
+                                None,
+                                &format!("reset failed: {e}"),
+                                "transient",
+                                true,
+                                false,
+                                reset_attempt_id,
+                            );
+                        }
+                    }
+                    let _ = stdout.flush();
+                    continue;
+                }
                 // Reset conversation state without unloading the model.
                 // Single production epilogue owns ordering + graph/replay
                 // invalidate + sync attestation (same path as fail-closed turns).
@@ -3027,6 +3323,70 @@ fn main() {
             }
 
             "unload" => {
+                // Experimental slot backend owns its own weight copy; unload it exclusively. Refuse while active, otherwise checked teardown, clear keyed entries, ack only success. Do not allow old Arc workers to keep prior model alive.
+                if slot_backend.is_some() {
+                    if slot_backend.as_ref().is_some_and(|b| b.active_count() > 0) {
+                        let attempt = msg.get("attempt_id").and_then(|v| v.as_u64()).unwrap_or(0);
+                        hipfire_generate::dense::write_error_envelope(
+                            &mut stdout,
+                            None,
+                            "unload refused: slot requests active",
+                            "validation",
+                            false,
+                            false,
+                            attempt,
+                        );
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                    if let Some(slot) = slot_backend.take() {
+                        match std::sync::Arc::try_unwrap(slot) {
+                            Err(slot) => {
+                                slot_backend = Some(slot);
+                                let attempt =
+                                    msg.get("attempt_id").and_then(|v| v.as_u64()).unwrap_or(0);
+                                hipfire_generate::dense::write_error_envelope(
+                                    &mut stdout,
+                                    None,
+                                    "unload refused: slot requests active (Arc live)",
+                                    "validation",
+                                    false,
+                                    false,
+                                    attempt,
+                                );
+                                let _ = stdout.flush();
+                            }
+                            Ok(slot) => match slot.shutdown() {
+                                Ok(()) => {
+                                    batch_scheduler = None;
+                                    continuous_batch_size = 1;
+                                    batch_poisoned = None;
+                                    batch_clear_all_terminals();
+                                    let _ = writeln!(stdout, "{}", r#"{"type":"unloaded"}"#);
+                                    let _ = stdout.flush();
+                                }
+                                Err(reason) => {
+                                    let attempt =
+                                        msg.get("attempt_id").and_then(|v| v.as_u64()).unwrap_or(0);
+                                    hipfire_generate::dense::write_error_envelope(
+                                        &mut stdout,
+                                        None,
+                                        &format!("unload failed: {reason}"),
+                                        "internal",
+                                        false,
+                                        false,
+                                        attempt,
+                                    );
+                                    let _ = stdout.flush();
+                                }
+                            },
+                        }
+                    } else {
+                        let _ = writeln!(stdout, "{}", r#"{"type":"unloaded"}"#);
+                        let _ = stdout.flush();
+                    }
+                    continue;
+                }
                 // Batch guard: unload is forbidden while lanes active.
                 if batch_scheduler
                     .as_ref()

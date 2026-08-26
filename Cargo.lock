@@ -1291,10 +1291,8 @@ dependencies = [
  "bytes",
  "clap",
  "ctrlc",
- "hipfire-arch-qwen35",
  "hipfire-client",
  "hipfire-config",
- "hipfire-engine",
  "hipfire-registry",
  "hipfire-runtime",
  "http-body-util",
@@ -1337,6 +1335,7 @@ version = "0.3.0"
 dependencies = [
  "base64",
  "hip-bridge",
+ "hipfire-arch-qwen35",
  "hipfire-config",
  "hipfire-dispatch",
  "hipfire-engine",

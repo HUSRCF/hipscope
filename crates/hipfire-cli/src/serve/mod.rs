@@ -36,7 +36,6 @@ pub(crate) mod metrics;
 
 pub mod complete;
 pub mod http;
-pub mod slots;
 
 #[derive(Debug)]
 pub(crate) struct ServeMeta {
@@ -93,6 +92,12 @@ pub(crate) struct ServeRuntime {
     pub(crate) kv_backend_override: Option<String>,
     pub(crate) tp: Option<u64>,
     pub(crate) continuous_batch_size: u64,
+    /// Experimental daemon multi-slot mode (`serve.multi_slot`). Default off.
+    /// Projects load/generate wire markers only; CLI holds no GPU slot backend.
+    pub(crate) multi_slot_enabled: bool,
+    pub(crate) multi_slot_slots: u64,
+    pub(crate) multi_slot_ctx: u64,
+    pub(crate) multi_slot_prefill_chunk: u64,
 }
 
 pub(crate) struct ServeShared {
@@ -105,14 +110,9 @@ pub(crate) struct ServeShared {
     pub(crate) retry_backoff: Duration,
     /// Test seam: when set, invoked instead of `thread::sleep` during retry backoff.
     pub(crate) backoff_hook: Mutex<Option<Arc<dyn Fn(Duration) + Send + Sync>>>,
-    /// Concurrent multi-slot backend (`serve.multi_slot`). Deliberately NOT
-    /// inside `runtime`: that mutex is exactly what serialises requests today,
-    /// so an engine behind it would serve one caller at a time and change
-    /// nothing.
     /// Prometheus counters and histograms for `/metrics`. Lock-free, so a
     /// scrape never contends with a request.
     pub(crate) metrics: metrics::Metrics,
-    pub(crate) slot_engine: Option<Arc<slots::SlotBackend>>, // feature-gated type is still SlotBackend (stub when disabled)
 }
 
 #[derive(Debug, Default)]
@@ -854,6 +854,16 @@ pub(crate) fn serve_foreground(
     if continuous_batch_size == 0 || continuous_batch_size > 256 {
         bail!("--continuous-batch-size must be between 1 and 256");
     }
+    let multi_slot_enabled = config_bool(&global, "serve.multi_slot")?;
+    let multi_slot_slots = config_u64(&global, "serve.multi_slot_slots").unwrap_or(4);
+    let multi_slot_ctx = config_u64(&global, "serve.multi_slot_ctx").unwrap_or(8192);
+    let multi_slot_prefill_chunk =
+        config_u64(&global, "serve.multi_slot_prefill_chunk").unwrap_or(1024);
+    // Multi-slot is an alternate daemon-owned Qwen35 mode, not continuous batching.
+    // Combining them is rejected until a future integration lands.
+    if let Err(message) = validate_multi_slot_startup(multi_slot_enabled, continuous_batch_size) {
+        bail!("{message}");
+    }
     let retry_enabled = config_bool(&global, "serve.retry_enabled")?;
     let retry_backoff = Duration::from_millis(config_u64(&global, "serve.retry_backoff_ms")?);
     let idle_timeout = Duration::from_secs(
@@ -865,75 +875,22 @@ pub(crate) fn serve_foreground(
         .clone()
         .unwrap_or(config_string(&global, "serve.default_model")?);
     let instance_token = serve_instance_token();
-    // Opt-in concurrent backend. Built before ServeShared so a failure here is
-    // a clean startup error rather than a half-configured server.
-    #[cfg(feature = "multi-slot")]
-    let slot_engine: Option<Arc<slots::SlotBackend>> =
-        match config_bool(&global, "serve.multi_slot") {
-            Ok(true) => {
-                let model_path = find_model_path(paths, &registry, &default_model)
-                    .ok_or_else(|| anyhow!("multi_slot: cannot resolve model {default_model}"))?;
-                let n_slots = config_u64(&global, "serve.multi_slot_slots").unwrap_or(4) as usize;
-                let cap_tokens =
-                    config_u64(&global, "serve.multi_slot_ctx").unwrap_or(8192) as usize;
-                let mut hfq = hipfire_runtime::hfq::HfqFile::open(&model_path)
-                    .with_context(|| format!("multi_slot: open {}", model_path.display()))?;
-                let tokenizer =
-                    hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
-                        .map_err(|e| anyhow!("multi_slot: tokenizer: {e}"))?;
-                let chat_template = hfq.chat_template();
-                drop(hfq);
-                // The engine runs IN this process, so hardware.devices /
-                // HIPFIRE_DEVICES must be applied here — the daemon does this in
-                // its own startup, which an in-process backend never runs.
-                // Without it the engine always lands on device 0.
-                hipfire_config::apply_device_visibility(&process_config)
-                    .map_err(|e| anyhow!("multi_slot: device visibility: {e}"))?;
-                let engine = hipfire_arch_qwen35::serve_engine::SlotEngine::spawn(
-                    hipfire_arch_qwen35::serve_engine::EngineConfig {
-                        model_path: model_path.clone(),
-                        n_slots,
-                        cap_tokens,
-                        prefill_chunk: config_u64(&global, "serve.multi_slot_prefill_chunk")
-                            .unwrap_or(1024) as usize,
-                        host_budget_bytes: 16 * 1024 * 1024 * 1024,
-                        swap_dir: std::env::temp_dir().join("hipfire-serve-swap"),
-                    },
-                )
-                .map_err(|e| anyhow!("multi_slot: {e}"))?;
-                eprintln!(
-                    "serve: multi-slot backend up ({} slots, {} ctx) - requests run concurrently",
-                    n_slots, cap_tokens
-                );
-                let (tag, entry) = registry
-                    .model(&default_model)
-                    .map(|(tag, entry)| (Some(tag.to_owned()), Some(entry)))
-                    .unwrap_or((None, None));
-                let resolved = resolved_for_model(paths, &default_model, tag.as_deref(), entry)?;
-                Some(Arc::new(slots::SlotBackend {
-                    engine,
-                    tokenizer,
-                    chat_template,
-                    tool_grammar: hipfire_runtime::prompt_frame::qwen35_grammar_on(
-                        env::var("HIPFIRE_QWEN35_GRAMMAR").ok().as_deref(),
-                        &model_path.to_string_lossy(),
-                    ),
-                    resolved,
-                    pending_tools: std::sync::Mutex::new(Vec::new()),
-                }))
-            }
-            _ => None,
-        };
-    #[cfg(not(feature = "multi-slot"))]
-    let slot_engine: Option<Arc<slots::SlotBackend>> = None;
-    let slot_concurrency = if slot_engine.is_some() {
-        config_u64(&global, "serve.multi_slot_slots").unwrap_or(4) as usize
+    // Admission width: experimental multi-slot projects N concurrent daemon
+    // sessions; continuous batch admits up to continuous_batch_size. Take the
+    // larger so the HTTP gate does not serialise what the backend can run.
+    let slot_concurrency = if multi_slot_enabled {
+        multi_slot_slots.max(1) as usize
     } else {
         1
     };
+    if multi_slot_enabled {
+        eprintln!(
+            "serve: experimental multi-slot mode ({} slots, {} ctx) — daemon-owned, continuous batching deferred",
+            multi_slot_slots, multi_slot_ctx
+        );
+    }
     let shared = Arc::new(ServeShared {
         metrics: metrics::Metrics::default(),
-        slot_engine,
         runtime: Mutex::new(ServeRuntime {
             engine,
             paths: paths.clone(),
@@ -950,6 +907,10 @@ pub(crate) fn serve_foreground(
             kv_backend_override: args.kv_backend.clone(),
             tp: args.tp,
             continuous_batch_size,
+            multi_slot_enabled,
+            multi_slot_slots,
+            multi_slot_ctx,
+            multi_slot_prefill_chunk,
         }),
         meta: Mutex::new(ServeMeta {
             current_model: None,
@@ -963,12 +924,6 @@ pub(crate) fn serve_foreground(
             last_activity: Instant::now(),
         }),
         max_request_bytes,
-        // The HTTP gate must admit as many requests as the live backend can
-        // actually run, or they queue here and never reach it -- the exact
-        // serialisation both batching paths exist to remove. Two independent
-        // mechanisms feed this: the multi-slot engine's slot count (1 when it
-        // is off) and the single-daemon continuous batch width. Take the
-        // larger; each has its own admission behind this gate.
         admission: Arc::new(Admission::new_with_capacity(
             max_queue,
             queue_timeout,
@@ -1170,6 +1125,15 @@ impl ServeRuntime {
         }
         let path = path.ok_or_else(|| anyhow!("model not found locally: {model}"))?;
         let resolved = resolved_for_model(&self.paths, model, tag.as_deref(), entry)?;
+        if let Some(minimum) = minimum_max_seq
+            .filter(|minimum| self.multi_slot_enabled && *minimum > self.multi_slot_ctx)
+        {
+            bail!(
+                "experimental multi-slot request requires context {minimum}, \
+                 exceeding serve.multi_slot_ctx={}",
+                self.multi_slot_ctx
+            );
+        }
         let must_reload = self.current_path.as_ref() != Some(&path)
             || minimum_max_seq.is_some_and(|minimum| self.current_max_seq < minimum);
         if must_reload {
@@ -1188,12 +1152,26 @@ impl ServeRuntime {
                 params["tp"] = serde_json::json!(tp);
             }
             params["continuous_batch_size"] = serde_json::json!(self.continuous_batch_size);
+            // Experimental multi-slot: daemon owns SlotEngine instead of ordinary
+            // LoadedModel. Future continuous-batch integration is deferred.
+            if self.multi_slot_enabled {
+                params["experimental_multi_slot"] = serde_json::json!(true);
+                params["experimental_multi_slot_slots"] = serde_json::json!(self.multi_slot_slots);
+                params["experimental_multi_slot_ctx"] = serde_json::json!(self.multi_slot_ctx);
+                params["experimental_multi_slot_prefill_chunk"] =
+                    serde_json::json!(self.multi_slot_prefill_chunk);
+                // This alternate backend's allocation cap is authoritative.
+                // Do not advertise the ordinary model's larger max_seq to
+                // request budgeting and then stop early at the slot boundary.
+                params["max_seq"] = serde_json::json!(self.multi_slot_ctx);
+            }
             let loaded_max_seq = params["max_seq"].as_u64().unwrap_or(0);
             if minimum_max_seq.is_some() {
                 eprintln!("[hipfire] bumping load max_seq to {loaded_max_seq} for request budget");
             }
             let loaded = self.engine.load(&path, params)?;
-            if should_prewarm_qwen_mq4r_decode(&path, &loaded, self.tp) {
+            if !self.multi_slot_enabled && should_prewarm_qwen_mq4r_decode(&path, &loaded, self.tp)
+            {
                 prewarm_qwen_mq4r_decode(&mut self.engine)?;
             }
             self.cache_capable = loaded
@@ -1235,6 +1213,25 @@ impl ServeRuntime {
         }
         Ok(resolved)
     }
+}
+
+/// Reject experimental multi-slot combined with continuous batching.
+///
+/// Multi-slot is an alternate daemon-owned Qwen35 mode with one weight copy.
+/// Continuous batch integration is deferred; enabling both would imply a
+/// capability the daemon does not implement yet.
+pub(crate) fn validate_multi_slot_startup(
+    multi_slot_enabled: bool,
+    continuous_batch_size: u64,
+) -> Result<(), String> {
+    if multi_slot_enabled && continuous_batch_size > 1 {
+        return Err(
+            "serve.multi_slot cannot be combined with continuous_batch_size > 1; \
+             continuous batching integration is deferred"
+                .to_owned(),
+        );
+    }
+    Ok(())
 }
 
 pub(crate) fn serve_instance_token() -> String {
@@ -2103,5 +2100,17 @@ mod tests {
             })
             .unwrap_or_default();
         assert!(empty_efforts.is_empty());
+    }
+
+    #[test]
+    fn multi_slot_startup_rejects_continuous_batch_gt_one() {
+        assert!(validate_multi_slot_startup(false, 1).is_ok());
+        assert!(validate_multi_slot_startup(false, 8).is_ok());
+        assert!(validate_multi_slot_startup(true, 1).is_ok());
+        let err = validate_multi_slot_startup(true, 2).unwrap_err();
+        assert!(err.contains("continuous_batch_size > 1"), "{err}");
+        assert!(err.contains("deferred"), "{err}");
+        let err = validate_multi_slot_startup(true, 16).unwrap_err();
+        assert!(err.contains("serve.multi_slot"), "{err}");
     }
 }

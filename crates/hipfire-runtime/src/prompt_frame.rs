@@ -40,7 +40,7 @@
 use crate::tokenizer::Tokenizer;
 
 /// Chooses what goes after the assistant role-and-newline opener.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AssistantPrefix {
     /// Plain assistant turn opener: `<|im_start|>assistant\n`.
     Plain,
@@ -3976,5 +3976,4 @@ SYS:{{ build_system_message(system_message) }}:END
             );
         }
     }
-
 }

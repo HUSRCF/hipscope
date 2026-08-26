@@ -9,9 +9,6 @@ build = "build.rs"
 name = "hipfire"
 path = "src/main.rs"
 
-[features]
-default = ["multi-slot"]
-multi-slot = ["dep:hipfire-arch-qwen35", "dep:hipfire-engine"]
 
 [dependencies]
 anyhow = "1"
@@ -27,12 +24,7 @@ hipfire-client = { path = "../hipfire-client" }
 hipfire-registry = { path = "../hipfire-registry" }
 hipfire-runtime = { path = "../hipfire-runtime", default-features = false, features = ["deltanet"] }
 saddle-core = { path = "../saddle-core" }
-hipfire-arch-qwen35 = { path = "../hipfire-arch-qwen35", default-features = false, features = ["deltanet"], optional = true }
-# The slot backend consumes the engine's strict wire-seed parsing and
-# per-request seed derivation (parse_wire_seed / request_seed_for / AttemptKey)
-# so both backends honour one seed contract. Gated with multi-slot because
-# slots.rs is the only consumer.
-hipfire-engine = { path = "../hipfire-engine", optional = true }
+
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

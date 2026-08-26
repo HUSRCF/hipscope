@@ -10,7 +10,6 @@
 //! transformations that convert daemon events into OpenAI responses.
 
 use crate::serve::http::request_id;
-use crate::serve::slots;
 use crate::serve::{Admission, AdmissionGuard, ServeMeta, ServeShared};
 use crate::{
     apply_http_reasoning_request, config_bool, config_string, config_u64, insert_optional_f64,
@@ -1521,43 +1520,19 @@ pub(crate) fn fold_complete_request_stream(
     }
 }
 
-/// One projection of the OpenAI request contract, shared by BOTH serve backends.
-/// The multi-slot path used to bypass all of this; see `complete_request_cancellable`.
+/// One projection of the OpenAI request contract before it crosses the daemon
+/// wire. Validation, default-system injection and tool-choice lowering happen
+/// here exactly once for both ordinary and experimental daemon model owners.
 #[derive(Debug)]
 pub(crate) struct RequestContract {
     pub max_tokens: u64,
     pub messages: serde_json::Value,
     pub tool_choice_policy: ToolChoicePolicy,
     pub forwarded_tools: Option<serde_json::Value>,
-    /// Runtime-owned reasoning capability. The slot backend needs it so it
-    /// projects effort through exactly the same call the daemon backend makes,
-    /// instead of hardcoding a contract and silently dropping the request's
-    /// effort. Defaults describe the no-contract case; `with_reasoning`
-    /// installs the loaded model's real values.
-    pub reasoning_contract: saddle_core::caps::ReasoningContract,
-    pub reasoning_effort_native: bool,
-    pub reasoning_supported_efforts: Vec<String>,
-}
-
-impl RequestContract {
-    /// Install the runtime's reasoning capability. Kept out of
-    /// `project_request_contract` because these three values come from the
-    /// loaded model, not from the request body or the resolved config.
-    pub(crate) fn with_reasoning(
-        mut self,
-        contract: saddle_core::caps::ReasoningContract,
-        effort_native: bool,
-        supported_efforts: &[String],
-    ) -> Self {
-        self.reasoning_contract = contract;
-        self.reasoning_effort_native = effort_native;
-        self.reasoning_supported_efforts = supported_efforts.to_vec();
-        self
-    }
 }
 
 /// `muse_glimmer` is the only arch that surfaces reasoning content in messages.
-/// Single source of truth -- both backends call this, neither re-derives it.
+/// Single source of truth for daemon request projection.
 pub(crate) fn include_reasoning_content(arch: Option<&str>) -> bool {
     arch == Some("muse_glimmer")
 }
@@ -1585,9 +1560,6 @@ pub(crate) fn project_request_contract(
         messages,
         tool_choice_policy,
         forwarded_tools,
-        reasoning_contract: saddle_core::caps::ReasoningContract::Unsupported,
-        reasoning_effort_native: false,
-        reasoning_supported_efforts: Vec::new(),
     })
 }
 
@@ -1761,8 +1733,17 @@ pub(crate) fn complete_request_attempt(
         let (id, created) = identity.clone();
         generate["id"] = serde_json::Value::String(id.clone());
         generate["attempt_id"] = serde_json::json!(attempt_id);
-        if guard.is_eligible {
+        if guard.is_eligible && !runtime.multi_slot_enabled {
             generate["serve_continuous_batch"] = serde_json::Value::Bool(true);
+        }
+        if runtime.multi_slot_enabled {
+            generate["experimental_multi_slot"] = serde_json::Value::Bool(true);
+            // Re-check the fully projected wire request, not only the raw HTTP
+            // body: registry/config defaults may have inserted a penalty or
+            // reasoning control the slot sampler cannot honor.
+            if let Err(reason) = multi_slot_request_supported(&generate) {
+                bail!("experimental multi-slot does not support this request: {reason}");
+            }
         }
         let engine_clone = runtime.engine.clone();
         (
@@ -2093,11 +2074,130 @@ pub(crate) fn complete_request_attempt(
     })
 }
 
+/// Whether the experimental multi-slot daemon path can honour this request.
+///
+/// Pure pre-send gate. Temperature / top_p / top_k remain supported. Rejects
+/// images, tools, non-null stop, logprobs, non-neutral repeat/frequency/
+/// presence penalties, min_p, reasoning caps >= 2, and named thinking budgets
+/// other than `"off"`. Callers with `serve.multi_slot` enabled must surface the
+/// error — there is no ordinary-model fallback in that mode.
+pub(crate) fn multi_slot_request_supported(body: &serde_json::Value) -> Result<(), String> {
+    if multi_slot_request_has_image(body)
+        || body.get("image").is_some_and(|value| !value.is_null())
+        || body
+            .get("image_base64")
+            .is_some_and(|value| !value.is_null())
+    {
+        return Err("images are not supported".to_owned());
+    }
+    if body
+        .get("tools")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|tools| !tools.is_empty())
+    {
+        return Err("tools are not supported".to_owned());
+    }
+    if body
+        .get("messages")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|messages| {
+            messages.iter().any(|message| {
+                message.get("role").and_then(serde_json::Value::as_str) == Some("tool")
+            })
+        })
+    {
+        return Err("tool-result roles are not supported".to_owned());
+    }
+    if body.get("stop").is_some_and(|value| !value.is_null()) {
+        return Err("stop sequences are not supported".to_owned());
+    }
+    if body.get("logprobs").and_then(serde_json::Value::as_bool) == Some(true)
+        || body
+            .get("top_logprobs")
+            .is_some_and(|value| !value.is_null())
+    {
+        return Err("logprobs are not supported".to_owned());
+    }
+    if let Some(value) = body
+        .get("presence_penalty")
+        .and_then(serde_json::Value::as_f64)
+    {
+        if value != 0.0 {
+            return Err("non-neutral presence_penalty is not supported".to_owned());
+        }
+    }
+    if let Some(value) = body
+        .get("frequency_penalty")
+        .and_then(serde_json::Value::as_f64)
+    {
+        if value != 0.0 {
+            return Err("non-neutral frequency_penalty is not supported".to_owned());
+        }
+    }
+    if let Some(value) = body
+        .get("repeat_penalty")
+        .and_then(serde_json::Value::as_f64)
+    {
+        if value != 1.0 {
+            return Err("non-neutral repeat_penalty is not supported".to_owned());
+        }
+    }
+    if let Some(value) = body.get("min_p").and_then(serde_json::Value::as_f64) {
+        if value != 0.0 {
+            return Err("min_p is not supported".to_owned());
+        }
+    }
+    if body
+        .get("reasoning_effort")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|value| !value.eq_ignore_ascii_case("none"))
+    {
+        return Err("reasoning_effort is not supported".to_owned());
+    }
+    // `1` is the no-thinking sentinel and `0` is uncapped; neither needs a
+    // force-close. Any other finite cap does.
+    for pointer in ["/max_think_tokens", "/reasoning/max_tokens"] {
+        if let Some(cap) = body.pointer(pointer).and_then(serde_json::Value::as_u64) {
+            if cap >= 2 {
+                return Err("finite reasoning cap is not supported".to_owned());
+            }
+        }
+    }
+    if let Some(budget) = body
+        .get("thinking_budget")
+        .and_then(serde_json::Value::as_str)
+    {
+        if !budget.eq_ignore_ascii_case("off") {
+            return Err("named thinking budget is not supported".to_owned());
+        }
+    }
+    Ok(())
+}
+
+fn multi_slot_request_has_image(body: &serde_json::Value) -> bool {
+    let Some(messages) = body.get("messages").and_then(serde_json::Value::as_array) else {
+        return false;
+    };
+    for message in messages {
+        let Some(parts) = message.get("content").and_then(serde_json::Value::as_array) else {
+            continue;
+        };
+        if parts
+            .iter()
+            .any(|part| part.get("type").and_then(serde_json::Value::as_str) == Some("image_url"))
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Server-owned retry driver with cooperative cancellation.
 ///
 /// Daemon requests use [`hipfire_client::Engine::generate_cancellable`].
-/// Multi-slot requests observe the same flag and drop their reply receiver,
-/// which makes the slot engine stop and free the abandoned slot.
+/// Experimental multi-slot mode uses the same daemon wire path with
+/// `experimental_multi_slot=true`; unsupported request shapes are rejected
+/// before generate (no ordinary-model fallback while the mode is enabled).
 pub(crate) fn complete_request_cancellable(
     shared: &ServeShared,
     body: &serde_json::Value,
@@ -2109,64 +2209,17 @@ pub(crate) fn complete_request_cancellable(
 ) -> Result<Completion> {
     let identity = request_identity.unwrap_or_else(|| (request_id(), unix_timestamp()));
 
-    // Slot path: project the shared OpenAI request contract once under the lock.
-    let slot_plan = {
-        let mut runtime = shared
+    // Experimental multi-slot: fail closed on shapes the daemon slot engine
+    // cannot honour. Do not fall through to ordinary LoadedModel generate.
+    {
+        let runtime = shared
             .runtime
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        let capable = runtime.current_path.is_some()
-            && matches!(
-                runtime.current_reasoning_contract,
-                saddle_core::caps::ReasoningContract::Unsupported
-            );
-        if !capable {
-            None
-        } else {
-            let model = body
-                .get("model")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| anyhow!("model is required"))?
-                .to_owned();
-            // Config only -- deliberately NOT `ensure_model`. The slot engine
-            // owns its own `Rig { gpu, weights }` and already has this model
-            // resident; `ensure_model` would load a SECOND full copy into the
-            // daemon's engine just to hand back a `ResolvedConfig`. On an 18.7 GB
-            // MoE that is 37.4 GB on a 34.2 GB card -- the slot backend comes up,
-            // then the first request dies with
-            // `load_weights failed: HipError { code: 2 }`, and `--no-prewarm`
-            // cannot save it because the load happens here, per request.
-            // `resolved_for_model` is the same resolver `ensure_model` itself
-            // calls for its config layer, without the weight load. The daemon
-            // still loads lazily if a request actually falls back to it.
-            let (tag, entry) = runtime
-                .registry
-                .model(&model)
-                .map(|(tag, entry)| (Some(tag.to_owned()), Some(entry)))
-                .unwrap_or((None, None));
-            let resolved =
-                crate::resolved_for_model(&runtime.paths, &model, tag.as_deref(), entry)?;
-            let inc = include_reasoning_content(runtime.current_arch.as_deref());
-            Some(
-                project_request_contract(body, &resolved, inc)?.with_reasoning(
-                    runtime.current_reasoning_contract,
-                    runtime.current_reasoning_effort_native,
-                    &runtime.current_reasoning_efforts,
-                ),
-            )
-        }
-    };
-    if let Some(contract) = slot_plan {
-        if let Some(backend) = shared.slot_engine.clone() {
-            return crate::serve::slots::complete_request_slots(
-                &backend,
-                body,
-                &contract,
-                &identity,
-                Some(cancelled),
-                &mut event_callback,
-                &mut terminal_callback,
-            );
+        if runtime.multi_slot_enabled {
+            if let Err(reason) = multi_slot_request_supported(body) {
+                bail!("experimental multi-slot does not support this request: {reason}");
+            }
         }
     }
 
@@ -6533,7 +6586,8 @@ mod tests {
             let err = project_request_contract(&body, &resolved, false)
                 .expect_err("out of range max_tokens");
             assert!(
-                err.to_string().contains("max_tokens must be between 1 and 393216"),
+                err.to_string()
+                    .contains("max_tokens must be between 1 and 393216"),
                 "unexpected error for {bad}: {err}"
             );
         }
@@ -6588,7 +6642,8 @@ mod tests {
             "tools": tools,
             "messages": [{ "role": "user", "content": "hi" }]
         });
-        let contract = project_request_contract(&body_required, &resolved, false).expect("required");
+        let contract =
+            project_request_contract(&body_required, &resolved, false).expect("required");
         assert_eq!(contract.tool_choice_policy, ToolChoicePolicy::Required);
         assert_eq!(contract.forwarded_tools.as_ref(), Some(&tools));
 
@@ -6611,5 +6666,76 @@ mod tests {
         let arr = forwarded.as_array().unwrap();
         assert_eq!(arr.len(), 1);
         assert_eq!(tool_schema_name(&arr[0]), Some("echo"));
+    }
+
+    /// Experimental multi-slot accepts sampling that the daemon slot engine
+    /// implements (temperature/top_p/top_k) and rejects every other listed
+    /// capability before the generate is sent.
+    #[test]
+    fn multi_slot_request_supported_accepts_sampling_rejects_unsupported() {
+        let ok = |v: serde_json::Value| multi_slot_request_supported(&v).is_ok();
+        let err_contains = |v: serde_json::Value, needle: &str| {
+            let err = multi_slot_request_supported(&v).unwrap_err();
+            assert!(err.contains(needle), "err={err:?} needle={needle}");
+        };
+
+        assert!(ok(serde_json::json!({ "max_tokens": 16 })));
+        assert!(ok(serde_json::json!({
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "top_k": 40
+        })));
+        assert!(ok(serde_json::json!({ "max_think_tokens": 0 })));
+        assert!(ok(serde_json::json!({ "max_think_tokens": 1 })));
+        assert!(ok(serde_json::json!({ "thinking_budget": "off" })));
+        assert!(ok(serde_json::json!({ "stop": serde_json::Value::Null })));
+        assert!(ok(serde_json::json!({ "presence_penalty": 0.0 })));
+        assert!(ok(serde_json::json!({ "frequency_penalty": 0.0 })));
+        assert!(ok(serde_json::json!({ "repeat_penalty": 1.0 })));
+        assert!(ok(serde_json::json!({ "min_p": 0.0 })));
+        assert!(ok(serde_json::json!({ "tools": [] })));
+
+        err_contains(
+            serde_json::json!({
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "hi"},
+                        {"type": "image_url", "image_url": {"url": "data:image/png;base64,aa"}}
+                    ]
+                }]
+            }),
+            "images",
+        );
+        err_contains(
+            serde_json::json!({ "tools": [{"type": "function", "function": {"name": "x"}}] }),
+            "tools",
+        );
+        err_contains(serde_json::json!({ "stop": ["\n\n"] }), "stop");
+        err_contains(serde_json::json!({ "stop": "END" }), "stop");
+        err_contains(serde_json::json!({ "logprobs": true }), "logprobs");
+        err_contains(serde_json::json!({ "top_logprobs": 5 }), "logprobs");
+        err_contains(
+            serde_json::json!({ "presence_penalty": 0.5 }),
+            "presence_penalty",
+        );
+        err_contains(
+            serde_json::json!({ "frequency_penalty": 0.1 }),
+            "frequency_penalty",
+        );
+        err_contains(
+            serde_json::json!({ "repeat_penalty": 1.05 }),
+            "repeat_penalty",
+        );
+        err_contains(serde_json::json!({ "min_p": 0.05 }), "min_p");
+        err_contains(
+            serde_json::json!({ "max_think_tokens": 2 }),
+            "reasoning cap",
+        );
+        err_contains(
+            serde_json::json!({ "reasoning": { "max_tokens": 2048 } }),
+            "reasoning cap",
+        );
+        err_contains(serde_json::json!({ "thinking_budget": "high" }), "budget");
     }
 }
