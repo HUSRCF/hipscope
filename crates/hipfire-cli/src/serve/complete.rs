@@ -1529,6 +1529,31 @@ pub(crate) struct RequestContract {
     pub messages: serde_json::Value,
     pub tool_choice_policy: ToolChoicePolicy,
     pub forwarded_tools: Option<serde_json::Value>,
+    /// Runtime-owned reasoning capability. The slot backend needs it so it
+    /// projects effort through exactly the same call the daemon backend makes,
+    /// instead of hardcoding a contract and silently dropping the request's
+    /// effort. Defaults describe the no-contract case; `with_reasoning`
+    /// installs the loaded model's real values.
+    pub reasoning_contract: saddle_core::caps::ReasoningContract,
+    pub reasoning_effort_native: bool,
+    pub reasoning_supported_efforts: Vec<String>,
+}
+
+impl RequestContract {
+    /// Install the runtime's reasoning capability. Kept out of
+    /// `project_request_contract` because these three values come from the
+    /// loaded model, not from the request body or the resolved config.
+    pub(crate) fn with_reasoning(
+        mut self,
+        contract: saddle_core::caps::ReasoningContract,
+        effort_native: bool,
+        supported_efforts: &[String],
+    ) -> Self {
+        self.reasoning_contract = contract;
+        self.reasoning_effort_native = effort_native;
+        self.reasoning_supported_efforts = supported_efforts.to_vec();
+        self
+    }
 }
 
 /// `muse_glimmer` is the only arch that surfaces reasoning content in messages.
@@ -1560,6 +1585,9 @@ pub(crate) fn project_request_contract(
         messages,
         tool_choice_policy,
         forwarded_tools,
+        reasoning_contract: saddle_core::caps::ReasoningContract::Unsupported,
+        reasoning_effort_native: false,
+        reasoning_supported_efforts: Vec::new(),
     })
 }
 
@@ -2102,7 +2130,13 @@ pub(crate) fn complete_request_cancellable(
                 .to_owned();
             let resolved = runtime.ensure_model(&model, &shared.meta, None)?;
             let inc = include_reasoning_content(runtime.current_arch.as_deref());
-            Some(project_request_contract(body, &resolved, inc)?)
+            Some(
+                project_request_contract(body, &resolved, inc)?.with_reasoning(
+                    runtime.current_reasoning_contract,
+                    runtime.current_reasoning_effort_native,
+                    &runtime.current_reasoning_efforts,
+                ),
+            )
         }
     };
     if let Some(contract) = slot_plan {

@@ -175,7 +175,17 @@ pub(crate) fn complete_request_slots(
     // the daemon's own fields. Reading those back is what keeps a `high` or
     // `max` request from arriving here as the hardcoded default level.
     let mut lowered = serde_json::json!({});
-    crate::apply_http_reasoning_request(body, &backend.resolved, &mut lowered, false)?;
+    // The contract carries the loaded model's reasoning capability, so this is
+    // byte-for-byte the projection the daemon backend performs -- not a second
+    // hardcoded contract that would silently drop the request's effort.
+    let reasoning = crate::apply_http_reasoning_request(
+        body,
+        &backend.resolved,
+        &mut lowered,
+        contract.reasoning_contract,
+        contract.reasoning_effort_native,
+        &contract.reasoning_supported_efforts,
+    )?;
     let effort = lowered
         .get("reasoning_effort")
         .and_then(serde_json::Value::as_str);
@@ -519,6 +529,9 @@ pub(crate) fn complete_request_slots(
         tool_calls,
         done,
         logprobs: None,
+        // Same resolution the daemon backend reports, so `reasoning` metadata is
+        // present on both backends rather than only one.
+        reasoning: Some(reasoning),
     };
     // The terminal callback is what stages the response body and signals the
     // HTTP handler that the request succeeded. Skipping it leaves the handler
