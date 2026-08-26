@@ -625,3 +625,11 @@ required-features = ["lab"]
 [[example]]
 name = "wmma_fa_spike"
 required-features = ["lab"]
+
+[[example]]
+name = "h2d_microbench"
+required-features = ["deltanet"]
+
+[[example]]
+name = "h2d_mmap_bench"
+required-features = ["deltanet"]

@@ -41,6 +41,16 @@ pub const LLOYD_MQ3_GROUP_BYTES: usize = 112;
 /// docs/plans/mq-lloyd-batched-prefill-followup.md).
 pub const LLOYD_MQ4_GROUP_BYTES: usize = 160;
 
+/// HIP `hipDeviceAttribute_t` ordinal for `hipDeviceAttributeIntegrated`
+/// ("Device is integrated GPU"). Pinned by enumerating the CUDA-compatible
+/// block in the local `hip_runtime_api.h`; the same enumeration reproduces
+/// the repo's existing pins (`HIP_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT` =
+/// 63 in `profiler.rs`). Ordinals HAVE shifted between ROCm releases before
+/// (`ReservedSharedMemPerBlock` was inserted ahead of
+/// `MaxSharedMemoryPerBlock`, moving it 74 → 75), so re-verify on any ROCm
+/// bump — see [`Gpu::is_uma`], the only consumer.
+const HIP_DEVICE_ATTRIBUTE_INTEGRATED: i32 = 16;
+
 // ── MQ*-GL ("global Lloyd") format constants ────────────────────────────
 //
 // GL = one codebook shared by the whole tensor plus a per-block fp16 scale,
@@ -905,6 +915,31 @@ impl Gpu {
     pub fn slots_decode_graph(&self) -> bool {
         // bind_thread: skip — pure flag read, touches no device state.
         self.flags.slots_decode_graph
+    }
+
+    /// Whether this device is an APU with unified memory (its "VRAM" is
+    /// system RAM). Queried live via
+    /// `hipDeviceGetAttribute(hipDeviceAttributeIntegrated)` instead of an
+    /// arch-string table: APUs and dGPUs share gfx IP across generations, so
+    /// name-based classification drifts every product refresh (gfx1151 is an
+    /// APU while gfx1201 with the same IP family era is not, etc).
+    ///
+    /// Query failure returns `true`, the conservative answer for page-cache
+    /// policy: assuming UMA on a dGPU only costs load speed (eviction is the
+    /// historical behavior), while assuming dGPU on a real APU keeps model
+    /// pages resident next to hipMalloc staging and can OOM the load.
+    // bind_thread: skip — pure device-property query; reads static device
+    // info, touches no stream or per-thread HIP context.
+    pub fn is_uma(&self) -> bool {
+        // bind_thread: skip — pure device-property query; reads static
+        // device info, touches no stream or per-thread HIP context.
+        match self
+            .hip
+            .get_device_attribute(HIP_DEVICE_ATTRIBUTE_INTEGRATED, self.device_id)
+        {
+            Ok(v) => v != 0,
+            Err(_) => true,
+        }
     }
 
     /// Install a real stream if launches are still going to the null stream.
@@ -2519,12 +2554,14 @@ impl Gpu {
     /// Together with `self.graphs.capture_blobs.len()`, this must agree for
     /// any body — see the `Gpu` type-level invariant doc.
     pub fn recorded_launch_count(&self) -> usize {
+        // bind_thread: skip — reads the recorded replay tape, no HIP calls.
         self.replay.recorded_launches().len()
     }
 
     /// Returns the number of HipGraph kernarg blobs captured.
     /// See `recorded_launch_count` and the `Gpu` invariant.
     pub fn graph_blob_count(&self) -> usize {
+        // bind_thread: skip — reads a captured-graph counter, no HIP calls.
         self.graphs.capture_blobs.len()
     }
 
@@ -2533,6 +2570,8 @@ impl Gpu {
     /// separate captures of the same body, passing the other count).
     /// A mismatch indicates a helper bypassed the replay recorder.
     pub fn debug_assert_tape_parity(&self, other_blob_count: Option<usize>) {
+        // bind_thread: skip — pure comparison of the two local tapes above;
+        // no HIP calls.
         let replay_len = self.recorded_launch_count();
         let graph_len = other_blob_count.unwrap_or_else(|| self.graph_blob_count());
         debug_assert_eq!(
@@ -3166,6 +3205,8 @@ impl Gpu {
         n: usize,
         k: usize,
     ) {
+        // bind_thread: skip — early-returns unless a capture is active, and
+        // capture paths run on an already-bound forward thread.
         if self.active_capture.is_none() {
             return;
         }
