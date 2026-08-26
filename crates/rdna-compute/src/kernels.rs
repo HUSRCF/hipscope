@@ -2302,6 +2302,26 @@ pub const GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC: &str = concat!
     include_str!("../../../kernels/src/gemv_hfq4g256_moe_down_k8_indexed_batched_expanded.hip")
 );
 
+/// MQ4G256V2 (qt=44) sister of
+/// [`GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC`]. Same tiling and
+/// output contract; differs only in the group header decode — qt44 carries two
+/// f16 scale/zero pairs per 256-weight group where qt13 carries one f32 pair.
+/// The affine grid is lane-constant, so qt44 reads one header u32 to qt13's two.
+pub const GEMV_MQ4G256V2_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_mq4g256v2_moe_down_k8_indexed_batched_expanded.hip")
+);
+
+/// MQ4G256V2 (qt=44) sister of `gemv_hfq4g256_moe_gate_up_k8_indexed`.
+///
+/// Exists because qt44 had no MoE GEMV at all, so `routed_indexable_*` could
+/// never hold for it and a qt44 A3B MoE model fell to the resident CPU-fallback
+/// decode path. Pairs with
+/// [`GEMV_MQ4G256V2_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC`].
+pub const GEMV_MQ4G256V2_MOE_GATE_UP_K8_INDEXED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mq4g256v2_moe_gate_up_k8_indexed.hip");
+
 /// Nine-path fused MoE gate_up (routed k=8, decode T=1): one CTA stages the
 /// activation into LDS once and all 8 routed-expert warps share it, replacing
 /// the per-(row,krank) x restaging of `gemv_hfq4g256_moe_gate_up_k8_indexed`.
@@ -2316,6 +2336,15 @@ pub const GEMV_HFQ4G256_MOE_NINEPATH_D3_SRC: &str =
 /// Byte-exact with that pair at down_k=512. See kernel header.
 pub const GEMV_HFQ4G256_MOE_NINEPATH_D4_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq4g256_moe_ninepath_d4.hip");
+
+/// MQ4G256V2 (qt=44) sister of [`GEMV_HFQ4G256_MOE_NINEPATH_D4_SRC`].
+///
+/// Identical staging / warp-per-krank / fold structure; differs only in the
+/// group header decode. qt44 previously matched neither `ninepath_hfq4` nor
+/// `ninepath_mq3l`, so it was denied the fused down path despite clearing the
+/// shape gate — which the published Ornith 1.5 artifact does exactly.
+pub const GEMV_MQ4G256V2_MOE_NINEPATH_D4_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mq4g256v2_moe_ninepath_d4.hip");
 
 /// MQ3-Lloyd codebook port of the nine-path fused MoE down + weighted combine.
 /// Stages the rotated activation ONCE for all 8 routed experts (the incumbent
@@ -2575,6 +2604,48 @@ pub const MOE_SCATTER_PERMUTE_K8_SRC: &str =
 /// kernel below uses the _gfx12 WMMA intrinsic.
 pub const GEMM_HFQ4G256_MOE_GROUPED_WMMA_K2_SRC: &str =
     include_str!("../../../kernels/src/gemm_hfq4g256_moe_grouped_wmma_k2.hip");
+
+/// MQ4G256V2 (qt=44) sister of `GEMM_HFQ4G256_MOE_GROUPED_WMMA_K2_SRC`.
+///
+/// Identical gather/tiling/WMMA pipeline; differs only in the group header —
+/// qt44 carries TWO fp16 scale/zero pairs per 256-weight group (one per 128-
+/// weight half) where qt13 carries one f32 pair for all 256. Same 136 B stride,
+/// same nibble packing.
+///
+/// Exists because qt44 previously had no MoE grouped-expert path at all, so a
+/// qt44 A3B MoE model failed prefill outright. gfx11 (RDNA3/3.5); the gfx12
+/// sister is `GEMM_MQ4G256V2_MOE_GROUPED_WMMA_GFX12_SRC`. No i8 MMQ variant.
+pub const GEMM_MQ4G256V2_MOE_GROUPED_WMMA_K2_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq4g256v2_moe_grouped_wmma_k2.hip");
+
+/// gfx12 (RDNA4) sister of `GEMM_MQ4G256V2_MOE_GROUPED_WMMA_K2_SRC`.
+///
+/// Same weight decode byte-for-byte; differs only in the wave32 WMMA operand
+/// shape (half8_t, K split across two lane-groups), the `_gfx12` intrinsic and
+/// the C-output mapping — the same port the MQ2/MQ3-Lloyd gfx12 sisters make.
+///
+/// Before this existed the launcher refused RDNA4 outright, so a qt44 MoE model
+/// could not prefill on an R9700 at all. qt44 was the only MoE quant type with
+/// a grouped kernel and no gfx12 variant.
+pub const GEMM_MQ4G256V2_MOE_GROUPED_WMMA_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq4g256v2_moe_grouped_wmma.gfx12.hip");
+
+/// Arch-selecting source pair for the qt44 grouped MoE GEMM. Mirrors
+/// [`mq3g256_lloyd_moe_grouped_wmma_source`]; do NOT bypass it with the bare
+/// `_k2` launcher, which fails the JIT on RDNA4.
+pub fn mq4g256v2_moe_grouped_wmma_source(is_gfx12: bool) -> (&'static str, &'static str) {
+    if is_gfx12 {
+        (
+            "gemm_mq4g256v2_moe_grouped_wmma_gfx12",
+            GEMM_MQ4G256V2_MOE_GROUPED_WMMA_GFX12_SRC,
+        )
+    } else {
+        (
+            "gemm_mq4g256v2_moe_grouped_wmma_k2",
+            GEMM_MQ4G256V2_MOE_GROUPED_WMMA_K2_SRC,
+        )
+    }
+}
 
 /// gfx12 (RDNA4) sister of GEMM_HFQ4G256_MOE_GROUPED_WMMA_K2_SRC. Same
 /// dispatch contract; differs in WMMA intrinsic (_gfx12), operand
