@@ -42,3 +42,42 @@ Dividing CK-specific aggregate dispatch times by two gives:
 This is about `3.3%` of the `10.8 s` profiled application wall after CK is
 enabled. It bounds the benefit available from additional staging or CK-tile
 work and keeps packed-MQ4 performance claims outside this PR.
+
+## Repository checks
+
+- `cargo build --release --workspace --features deltanet`: passed.
+- `cargo check -p rdna-compute --features flash-attn-ck`: passed.
+- `cargo test -p rdna-compute --features flash-attn-ck flash_attn_ck --lib`:
+  passed.
+- `cargo check -p hipfire-dispatch --features flash-attn-ck`: passed.
+- `cargo check -p hipfire-dispatch`: passed without the optional feature.
+- A clean sidecar rebuild and the gfx1100 GPU smoke passed. The Asym3-Givens
+  D256 cell had `max_abs=6.110966e-05` and `mean_abs=1.009769e-05`; unsupported
+  Givens D512 and FWHT cells remained recognized but fail-closed.
+
+`cargo test --lib --workspace --features deltanet` and `./scripts/no-gpu-ci.sh`
+both reached one existing failure:
+
+```text
+sampling::slot_sample_tests::a_zero_seed_never_reaches_the_xorshift_dead_state
+assertion `left != right` failed: left=0, right=0
+```
+
+The exact test fails identically in a clean worktree at
+`upstream/master@aaf5e3211`, so this is not introduced by the CK change.
+
+`tools.change_gate` selected eight routes against the exact upstream base. Five
+passed. Its three failures were: the same upstream sampling test; a Qwen3.5 4B
+serve-battery configuration rejected before model startup because its thinking
+budget exceeded `max_tokens`; and the locked gfx1100 decode speed floor. The
+last item was also reproduced on clean upstream master on this W7900:
+
+| Tree | PP32 prefill | Decode |
+| --- | ---: | ---: |
+| PR branch | `1204.8 tok/s` | `140.2 tok/s` |
+| Clean `upstream/master@aaf5e3211` | `1169.2 tok/s` | `140.8 tok/s` |
+
+Both decode results are below the shared gfx1100 floor of `169.1 tok/s`, while
+the PR and clean-master measurements agree within `0.5%`. The locked floor does
+not distinguish Radeon Pro W7900 from RX 7900 XTX captures, so this result is
+reported as a machine-baseline mismatch rather than a CK regression.
