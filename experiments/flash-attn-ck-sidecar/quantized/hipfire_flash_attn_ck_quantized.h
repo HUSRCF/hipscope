@@ -10,6 +10,7 @@ extern "C" {
 #endif
 
 #define HIPFIRE_FLASH_ATTN_CK_QUANTIZED_ABI_VERSION 1u
+#define HIPFIRE_FLASH_ATTN_CK_ASYM4_LOADER_ABI_VERSION 1u
 
 struct hipfire_flash_attn_ck_quantized_prefill_params {
     uint32_t abi_version;
@@ -44,6 +45,25 @@ struct hipfire_flash_attn_ck_quantized_mq_q8_params {
     const float* signs1;
     const float* signs2;
     void* q8_1_out;
+};
+
+// Givens-Asym4 and FWHT4 share this packed-K loader contract: both caches
+// already contain K in their respective transformed coordinate system.
+struct hipfire_flash_attn_ck_asym4_loader_params {
+    uint32_t abi_version;
+    uint32_t struct_size;
+
+    const uint8_t* packed_k;
+    const uint8_t* packed_v;
+    void* dense_k_f16;
+    void* dense_v_f16;
+    void* stream;
+
+    int32_t seqlen_k;
+    int32_t nhead_k;
+    int32_t head_dim;
+    int32_t k_row_stride_bytes;
+    int32_t v_row_stride_bytes;
 };
 
 uint32_t hipfire_flash_attn_ck_quantized_abi_version(void);
@@ -89,6 +109,16 @@ int hipfire_flash_attn_ck_quantized_mq_q8_supported(
 
 int hipfire_flash_attn_ck_quantized_prefill_mq_q8(
     const struct hipfire_flash_attn_ck_quantized_mq_q8_params* params,
+    char* error,
+    size_t error_capacity);
+
+int hipfire_flash_attn_ck_asym4_loader_supported(
+    const struct hipfire_flash_attn_ck_asym4_loader_params* params,
+    char* error,
+    size_t error_capacity);
+
+int hipfire_flash_attn_ck_asym4_predecode(
+    const struct hipfire_flash_attn_ck_asym4_loader_params* params,
     char* error,
     size_t error_capacity);
 

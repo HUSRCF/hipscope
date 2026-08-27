@@ -50,6 +50,10 @@ GPU_ARCH=gfx1100 STAGED=1 \
   OUT=/tmp/libhipfire_flash_attn_ck_quantized_staged.so \
   ./experiments/flash-attn-ck-sidecar/quantized/build_quantized_sidecar.sh
 
+HIP_VISIBLE_DEVICES=0 GPU_ARCH=gfx1100 \
+  LIB=/tmp/libhipfire_flash_attn_ck_quantized_asym4_loader.so \
+  ./experiments/flash-attn-ck-sidecar/quantized/run_asym4_loader_smoke.sh
+
 ./experiments/flash-attn-ck-sidecar/quantized/audit_quantized_ck_resources.sh
 ```
 
@@ -87,6 +91,11 @@ unsupported, or do not fit the caller-owned scratch buffer. `STAGED=1` is an
 explicit build variant and links the dense CK sidecar; the default build remains
 standalone and does not acquire that dependency. The staged route is still
 excluded from graph capture and performs no allocation or host sync.
+
+An independent Asym4 loader ABI decodes each physical `(position, kv_head)`
+exactly once into dense FP16 K/V staging. Givens-Asym4 and FWHT4 use the same
+loader because their packed K caches already contain transformed coordinates;
+the corresponding Q transform remains a separate attention-front-end concern.
 
 At Q=2048 with 24 query heads, 4 KV heads, and D256, the complete reusable
 workspace (rotated Q, FP16 output, dense K, and dense V) is about 59/67/75/84

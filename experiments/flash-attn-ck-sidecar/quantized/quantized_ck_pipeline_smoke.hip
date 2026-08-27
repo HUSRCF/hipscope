@@ -50,6 +50,12 @@ static_assert(offsetof(hipfire_flash_attn_ck_quantized_prefill_params, workspace
 static_assert(offsetof(hipfire_flash_attn_ck_quantized_prefill_params, softmax_scale) == 80);
 static_assert(offsetof(hipfire_flash_attn_ck_quantized_prefill_params,
                        v_row_stride_bytes) == 112);
+static_assert(sizeof(hipfire_flash_attn_ck_asym4_loader_params) == 72,
+              "Asym4 loader ABI parameter layout changed");
+static_assert(offsetof(hipfire_flash_attn_ck_asym4_loader_params, packed_k) == 8);
+static_assert(offsetof(hipfire_flash_attn_ck_asym4_loader_params, seqlen_k) == 48);
+static_assert(offsetof(hipfire_flash_attn_ck_asym4_loader_params,
+                       v_row_stride_bytes) == 64);
 
 #ifndef HIPFIRE_CK_FMHA_BM
 #define HIPFIRE_CK_FMHA_BM 64
@@ -821,6 +827,35 @@ int launch_staged_prefill_impl(
 }
 #endif
 
+#if defined(HIPFIRE_ENABLE_STAGED_QUANTIZED_CK)
+int validate_asym4_loader(const hipfire_flash_attn_ck_asym4_loader_params* p,
+                          char* error,
+                          size_t error_capacity)
+{
+    if(p == nullptr || p->abi_version != HIPFIRE_FLASH_ATTN_CK_ASYM4_LOADER_ABI_VERSION ||
+       p->struct_size < sizeof(*p))
+    {
+        set_quantized_error(error, error_capacity, "unsupported Asym4 loader ABI layout");
+        return 1;
+    }
+    if(p->packed_k == nullptr || p->packed_v == nullptr || p->dense_k_f16 == nullptr ||
+       p->dense_v_f16 == nullptr)
+    {
+        set_quantized_error(error, error_capacity, "Asym4 loader pointers must be non-null");
+        return 1;
+    }
+    if(p->seqlen_k <= 0 || p->nhead_k != kKvHeads || p->head_dim != kHeadDim ||
+       p->k_row_stride_bytes != kKvHeads * hipfire::ck_attention::kPredecodeAsym4HeadBytes ||
+       p->v_row_stride_bytes != kKvHeads * kQ8HeadBytes)
+    {
+        set_quantized_error(error, error_capacity, "unsupported Asym4/Q8 KV layout");
+        return 1;
+    }
+    set_quantized_error(error, error_capacity, "");
+    return 0;
+}
+#endif
+
 } // namespace
 
 extern "C" uint32_t hipfire_flash_attn_ck_quantized_abi_version(void)
@@ -939,6 +974,48 @@ extern "C" int hipfire_flash_attn_ck_quantized_prefill_mq_q8(
         return 2;
     }
 }
+
+#if defined(HIPFIRE_ENABLE_STAGED_QUANTIZED_CK)
+extern "C" int hipfire_flash_attn_ck_asym4_loader_supported(
+    const hipfire_flash_attn_ck_asym4_loader_params* params,
+    char* error,
+    size_t error_capacity)
+{
+    return validate_asym4_loader(params, error, error_capacity);
+}
+
+extern "C" int hipfire_flash_attn_ck_asym4_predecode(
+    const hipfire_flash_attn_ck_asym4_loader_params* params,
+    char* error,
+    size_t error_capacity)
+{
+    if(const int status = validate_asym4_loader(params, error, error_capacity); status != 0)
+    {
+        return status;
+    }
+    auto stream = reinterpret_cast<hipStream_t>(params->stream);
+    hipLaunchKernelGGL(hipfire::ck_attention::predecode_asym4_k_q8_v_f16,
+                       dim3(params->seqlen_k, params->nhead_k),
+                       dim3(32),
+                       0,
+                       stream,
+                       params->packed_k,
+                       params->packed_v,
+                       reinterpret_cast<__half*>(params->dense_k_f16),
+                       reinterpret_cast<__half*>(params->dense_v_f16),
+                       params->seqlen_k,
+                       params->k_row_stride_bytes,
+                       params->v_row_stride_bytes);
+    const hipError_t status = hipPeekAtLastError();
+    if(status != hipSuccess)
+    {
+        set_quantized_error(error, error_capacity, hipGetErrorString(status));
+        return 2;
+    }
+    set_quantized_error(error, error_capacity, "");
+    return 0;
+}
+#endif
 
 namespace {
 
