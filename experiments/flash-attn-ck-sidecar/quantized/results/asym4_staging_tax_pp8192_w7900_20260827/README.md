@@ -12,23 +12,25 @@ small part of the production prefill wall time.
 - Prompt: 8192 tokens, four 2048-token chunks
 - Sidecar: staged CK route from commit `160f09c1`
 - Profiler: `rocprofv3` kernel trace through `scripts/rocprof-wrap.sh`
-- Application wall: `8827.9 ms` (`928.0 tok/s`, profiler-instrumented run)
+- Application wall: `6615.8 ms` (`1238.2 tok/s`, profiler-instrumented run)
+- Packed-MQ4 production flags: X256/Y64, permuted nibble, group128 quad-row,
+  group256 serial-row tails, fused SwiGLU, and FP16 FFN intermediates
 - Raw kernel-stat CSV SHA-256:
-  `bec9fe64ee51e66cc189437f65cf7f1b27bf7bfdf39408c1fb73a605f4b5ece1`
+  `3006351c4ce2fbd0f84190841816cbad861b05965d1ee7eded1c54d92adb263a`
 
 ## Relevant kernel totals
 
 | Stage | Calls | Total | Fraction of wall |
 | --- | ---: | ---: | ---: |
-| Asym4 K + Q8 V predecode | 64 | `23.027 ms` | `0.261%` |
-| Q Givens rotation | 64 | `2.081 ms` | `0.024%` |
-| Dense CK attention | 64 | `231.290 ms` | `2.620%` |
-| FP16-to-FP32 output bridge | 64 | `3.222 ms` | `0.036%` |
+| Asym4 K + Q8 V predecode | 64 | `22.986 ms` | `0.347%` |
+| Q Givens rotation | 64 | `2.193 ms` | `0.033%` |
+| Dense CK attention | 64 | `240.201 ms` | `3.630%` |
+| FP16-to-FP32 output bridge | 64 | `3.415 ms` | `0.052%` |
 
 Across four equal chunks, full-history staging decodes `2K+4K+6K+8K` rows,
 whereas a persistent incremental mirror would decode `8K` rows. Even assuming
 perfect 60% removal of predecode work, the upper bound is approximately
-`13.8 ms`, or `0.16%` of this wall time.
+`13.8 ms`, or `0.21%` of this wall time.
 
 Keeping dense FP16 K/V for all 16 full-attention layers would instead consume
 about 512 MiB at 8192 tokens and grow linearly with context (about 2 GiB at
