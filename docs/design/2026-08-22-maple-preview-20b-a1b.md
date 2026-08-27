@@ -283,7 +283,7 @@ the converter refuses rather than falling back, so a clean run IS the proof.
    nothing unexplained).
 2. Differential vs arm A: not run — arm A is not implemented (out of scope).
 3. Reference per-layer cosine: not run. Tooling is in place
-   (`HIPFIRE_MAPLE_DUMP_HIDDEN` + `scripts/maple_compare_hidden.py`); it was not
+   (`HIPFIRE_MAPLE_DUMP_HIDDEN` + `python3 -m tools.models.maple.compare_hidden`); it was not
    needed because the coherence gate passed on the first attempt, and it is the
    localisation tool for when it does not.
 4. Coherence: **PASS.** Three prompts, coherent and technically correct, correct
@@ -421,7 +421,7 @@ F32 at load (~620 MB over the BF16 bytes). That is the cheap answer to the
 halve it and needs no new code, since the Q8 lookup path is already wired.
 
 **Packing verified against the real checkpoint.** The independent-packer parity
-fixture (`scripts/maple_make_parity_fixture.py`, now committed) reproduces the
+fixture (`python3 -m tools.models.maple.make_parity_fixture`, now committed) reproduces the
 Rust packer byte-for-byte on `layers.0.mlp.experts.0.gate_proj` (1,048,576
 weights, 61.3% nonzero) and `layers.0.self_attn.q_proj` (4,194,304 weights,
 61.2% nonzero), both at 2.2500 bpw with `max|err| = 0`.

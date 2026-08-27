@@ -16,7 +16,7 @@
 //! The MQ2G256LloydU decoder below is written from the layout spec, deliberately
 //! NOT reusing `hipfire-quantize`'s (which lives in that crate's bin and is not
 //! importable anyway), so agreement is cross-implementation evidence rather than
-//! a round trip. See scripts/maple_make_parity_fixture.py for the same argument
+//! a round trip. See `python3 -m tools.models.maple.make_parity_fixture` for the same argument
 //! on the packing side.
 //!
 //! Usage:

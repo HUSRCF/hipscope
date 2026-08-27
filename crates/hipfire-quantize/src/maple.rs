@@ -339,7 +339,7 @@ mod tests {
     /// shared misunderstanding of the 72 B/group layout would round-trip
     /// perfectly and still feed the GPU kernel garbage. This one compares our
     /// packed bytes against an independent Python implementation
-    /// (`scripts/maple_b0_ternary_exactness_spike.py`) on a real tensor.
+    /// (`python3 -m tools.models.maple.b0_ternary_exactness_spike`) on a real tensor.
     ///
     /// Fixtures are ~4 MB and not committed. Produce them with that script,
     /// then:
