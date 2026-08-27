@@ -1626,6 +1626,9 @@ pub(crate) fn run() {
     let mut _n_quant_groups = 0u64;
 
     let include_vision = args.include_vision;
+    // Set when a vision-module tensor is actually emitted (loop-level F16
+    // short-circuit) — spill-safe input for the has_vision metadata flag.
+    let mut emitted_vision = false;
     let vision_quant = args.vision_quant.as_str();
     // --include-prefix <prefix>: when set, ONLY tensors whose name starts
     // with this prefix are ingested; everything else is silently skipped.
@@ -1681,11 +1684,25 @@ pub(crate) fn run() {
             || name.starts_with("model.vision_tower.")
             || name.starts_with("model.vision_adapter.")
             || name.starts_with("model.vision_projection.");
-        if is_vision && !include_vision {
+        // VL artifact contract: the vision group is the tower/adapter/projection
+        // tensors plus the LFM2/Idefics-style multi_modal_projector MLP. With
+        // --include-vision they ride the existing F16 fallback path
+        // (should_quantize() == false); without it they are skipped with the
+        // rest of the module. Towers always behaved this way — the projector
+        // is the fix (it used to land on the text-quantize tail).
+        let vision_group =
+            is_vision || name.starts_with("model.multi_modal_projector.");
+        if vision_group && !include_vision {
             let (meta, _) = st_files[*file_idx].tensor_data(name).unwrap();
             let n: usize = meta.shape.iter().product();
             skipped_params += n as u64;
             continue;
+        }
+        if vision_group {
+            // include_vision is implied here. The tensor reaches the bottom-of-loop
+            // F16 fallback unchanged; this only records that the artifact carries a
+            // vision module, for the has_vision metadata flag (VL contract §4).
+            emitted_vision = true;
         }
         // Gemma4 unified (arch 13): text-only bring-up — skip the vision/audio
         // towers + multimodal projectors; quantize only the text decoder.
@@ -2812,6 +2829,70 @@ pub(crate) fn run() {
             }
             obj.insert("hipfire_base_format".to_string(), format.to_string().into());
             metadata_json = serde_json::to_string(&meta_val).unwrap_or(metadata_json);
+        }
+    }
+
+    // ── VL artifact contract (docs/qwen35-vl-mq4v2-spec.md §4) ──────────────
+    // has_vision marks artifacts that carry a vision module. The pixel budget
+    // rides in config.vision_config — alongside the tower params already
+    // carried from the source config.json — as additive keys current readers
+    // ignore. It does not open a second top-level schema under the same name.
+    if emitted_vision {
+        let mut budget = serde_json::Map::new();
+        if let Ok(pc) = std::fs::read_to_string(input_dir.join("processor_config.json")) {
+            if let Ok(pcv) = serde_json::from_str::<serde_json::Value>(&pc) {
+                // Qwen-family processors put pixel fields at the top level;
+                // LFM2/NaFlex nests them under "image_processor". Whitelist
+                // both schemas' budget-relevant keys.
+                const BUDGET_KEYS: [&str; 9] = [
+                    "min_pixels",
+                    "max_pixels",
+                    "patch_size",
+                    "merge_size",
+                    "encoder_patch_size",
+                    "downsample_factor",
+                    "max_tiles",
+                    "max_image_tokens",
+                    "max_num_patches",
+                ];
+                for scope in [Some(&pcv), pcv.get("image_processor")].into_iter().flatten() {
+                    for key in BUDGET_KEYS {
+                        if let Some(v) = scope.get(key) {
+                            budget.entry(key.to_string()).or_insert(v.clone());
+                        }
+                    }
+                }
+            }
+        }
+        if let Ok(mut meta_val) = serde_json::from_str::<serde_json::Value>(&metadata_json) {
+            let mut merged_budget = false;
+            if let Some(obj) = meta_val.as_object_mut() {
+                obj.insert("has_vision".to_string(), true.into());
+                if !budget.is_empty() {
+                    // Sources without a config.json object (config: null) keep
+                    // has_vision only; there is no vision_config home to extend.
+                    if let Some(cfg) = obj.get_mut("config").and_then(|c| c.as_object_mut()) {
+                        let vc = cfg
+                            .entry("vision_config".to_string())
+                            .or_insert_with(|| serde_json::json!({}));
+                        if let serde_json::Value::Object(vc_obj) = vc {
+                            for (k, v) in budget {
+                                vc_obj.entry(k).or_insert(v);
+                            }
+                            merged_budget = true;
+                        }
+                    }
+                }
+                metadata_json = serde_json::to_string(&meta_val).unwrap_or(metadata_json);
+            }
+            eprintln!(
+                "  has_vision: true{}",
+                if merged_budget {
+                    " (pixel budget merged into config.vision_config)"
+                } else {
+                    ""
+                }
+            );
         }
     }
 
