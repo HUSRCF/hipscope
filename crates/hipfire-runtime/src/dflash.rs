@@ -319,6 +319,47 @@ pub struct DflashWeights {
     pub conv_kernel_size: Option<usize>,
 }
 
+thread_local! {
+    static DFLASH_LOAD_FAIL_AFTER: std::cell::Cell<Option<usize>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+/// Fail the DFlash weight-load step after `successful_steps` further steps.
+/// Test/diagnostic hook only; normal loading is unchanged until explicitly
+/// armed on the current thread.
+#[doc(hidden)]
+pub fn inject_dflash_load_failure_after(successful_steps: usize) {
+    DFLASH_LOAD_FAIL_AFTER.with(|counter| counter.set(Some(successful_steps)));
+}
+
+#[doc(hidden)]
+pub fn clear_dflash_load_failure() {
+    DFLASH_LOAD_FAIL_AFTER.with(|counter| counter.set(None));
+}
+
+fn dflash_load_step<T>(load: impl FnOnce() -> HipResult<T>) -> HipResult<T> {
+    let injected = DFLASH_LOAD_FAIL_AFTER.with(|counter| match counter.get() {
+        None => false,
+        Some(0) => {
+            counter.set(None);
+            true
+        }
+        Some(left) => {
+            counter.set(Some(left - 1));
+            false
+        }
+    });
+    if injected {
+        Err(hip_bridge::HipError::new(
+            0x4446_4C46,
+            "injected DFlash weight-load failure",
+        ))
+    } else {
+        load()
+    }
+}
+
 /// Load a F32-only tensor (norms, embedding-shaped scalars). Always F32 on GPU.
 fn hfq_tensor_f32(
     hfq: &HfqFile,
@@ -617,6 +658,292 @@ fn hfq_weight(
     Ok(wt)
 }
 
+#[derive(Default)]
+struct PartialDflashLayer {
+    attn_norm: Option<GpuTensor>,
+    wq: Option<WeightTensor>,
+    wk: Option<WeightTensor>,
+    wv: Option<WeightTensor>,
+    wo: Option<WeightTensor>,
+    q_norm: Option<GpuTensor>,
+    k_norm: Option<GpuTensor>,
+    ffn_norm: Option<GpuTensor>,
+    w_gate: Option<WeightTensor>,
+    w_up: Option<WeightTensor>,
+    w_down: Option<WeightTensor>,
+    attn_conv_base: Option<GpuTensor>,
+    attn_conv_proj: Option<WeightTensor>,
+    mlp_conv_base: Option<GpuTensor>,
+    mlp_conv_proj: Option<WeightTensor>,
+}
+
+impl PartialDflashLayer {
+    fn free_gpu(self, gpu: &mut Gpu) {
+        for tensor in [
+            self.attn_norm,
+            self.q_norm,
+            self.k_norm,
+            self.ffn_norm,
+            self.attn_conv_base,
+            self.mlp_conv_base,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let _ = gpu.free_tensor(tensor);
+        }
+        for weight in [
+            self.wq,
+            self.wk,
+            self.wv,
+            self.wo,
+            self.w_gate,
+            self.w_up,
+            self.w_down,
+            self.attn_conv_proj,
+            self.mlp_conv_proj,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            weight.free_all(gpu);
+        }
+    }
+
+    fn finish(mut self) -> DflashLayerWeights {
+        DflashLayerWeights {
+            attn_norm: self.attn_norm.take().unwrap(),
+            wq: self.wq.take().unwrap(),
+            wk: self.wk.take().unwrap(),
+            wv: self.wv.take().unwrap(),
+            wo: self.wo.take().unwrap(),
+            q_norm: self.q_norm.take().unwrap(),
+            k_norm: self.k_norm.take().unwrap(),
+            ffn_norm: self.ffn_norm.take().unwrap(),
+            w_gate: self.w_gate.take().unwrap(),
+            w_up: self.w_up.take().unwrap(),
+            w_down: self.w_down.take().unwrap(),
+            attn_conv_base: self.attn_conv_base.take(),
+            attn_conv_proj: self.attn_conv_proj.take(),
+            mlp_conv_base: self.mlp_conv_base.take(),
+            mlp_conv_proj: self.mlp_conv_proj.take(),
+        }
+    }
+}
+
+fn free_dflash_layer(layer: DflashLayerWeights, gpu: &mut Gpu) {
+    PartialDflashLayer {
+        attn_norm: Some(layer.attn_norm),
+        wq: Some(layer.wq),
+        wk: Some(layer.wk),
+        wv: Some(layer.wv),
+        wo: Some(layer.wo),
+        q_norm: Some(layer.q_norm),
+        k_norm: Some(layer.k_norm),
+        ffn_norm: Some(layer.ffn_norm),
+        w_gate: Some(layer.w_gate),
+        w_up: Some(layer.w_up),
+        w_down: Some(layer.w_down),
+        attn_conv_base: layer.attn_conv_base,
+        attn_conv_proj: layer.attn_conv_proj,
+        mlp_conv_base: layer.mlp_conv_base,
+        mlp_conv_proj: layer.mlp_conv_proj,
+    }
+    .free_gpu(gpu);
+}
+
+fn load_dflash_layer(
+    hfq: &HfqFile,
+    gpu: &mut Gpu,
+    cfg: &DflashConfig,
+    i: usize,
+) -> HipResult<DflashLayerWeights> {
+    let p = format!("layers.{i}");
+    let conv_k = cfg.conv_kernel_size.unwrap_or(2);
+    let conv_g = cfg.conv_group_size.unwrap_or(16);
+    let proj_m = 2 * conv_k * (cfg.hidden / conv_g);
+    let mut partial = PartialDflashLayer::default();
+
+    macro_rules! put {
+        ($field:ident, $expr:expr) => {{
+            match dflash_load_step(|| $expr) {
+                Ok(value) => partial.$field = Some(value),
+                Err(error) => {
+                    partial.free_gpu(gpu);
+                    return Err(error);
+                }
+            }
+        }};
+    }
+
+    if cfg.conv_kernel_size.is_some() {
+        let primary = format!("{p}.self_attn.attention_conv.base_kernel");
+        let alternate = format!("{p}.attention_conv.base_kernel");
+        let key = if hfq.tensor_data(&primary).is_some() {
+            primary
+        } else {
+            alternate
+        };
+        if hfq.tensor_data(&key).is_some() {
+            put!(
+                attn_conv_base,
+                hfq_tensor_f32(hfq, gpu, &key, vec![2 * conv_k * cfg.hidden])
+            );
+        }
+
+        let primary = format!("{p}.self_attn.attention_conv.kernel_projection.weight");
+        let alternate = format!("{p}.attention_conv.kernel_projection.weight");
+        let key = if hfq.tensor_data(&primary).is_some() {
+            primary
+        } else {
+            alternate
+        };
+        if hfq.tensor_data(&key).is_some() {
+            put!(
+                attn_conv_proj,
+                hfq_weight(hfq, gpu, &key, proj_m, cfg.hidden)
+            );
+        }
+
+        let primary = format!("{p}.mlp.mlp_conv.base_kernel");
+        let alternate = format!("{p}.mlp_conv.base_kernel");
+        let key = if hfq.tensor_data(&primary).is_some() {
+            primary
+        } else {
+            alternate
+        };
+        if hfq.tensor_data(&key).is_some() {
+            put!(
+                mlp_conv_base,
+                hfq_tensor_f32(hfq, gpu, &key, vec![2 * conv_k * cfg.hidden])
+            );
+        }
+
+        let primary = format!("{p}.mlp.mlp_conv.kernel_projection.weight");
+        let alternate = format!("{p}.mlp_conv.kernel_projection.weight");
+        let key = if hfq.tensor_data(&primary).is_some() {
+            primary
+        } else {
+            alternate
+        };
+        if hfq.tensor_data(&key).is_some() {
+            put!(
+                mlp_conv_proj,
+                hfq_weight(hfq, gpu, &key, proj_m, cfg.hidden)
+            );
+        }
+    }
+
+    put!(
+        attn_norm,
+        hfq_tensor_f32(
+            hfq,
+            gpu,
+            &format!("{p}.input_layernorm.weight"),
+            vec![cfg.hidden]
+        )
+    );
+    put!(
+        wq,
+        hfq_weight(
+            hfq,
+            gpu,
+            &format!("{p}.self_attn.q_proj.weight"),
+            cfg.q_dim(),
+            cfg.hidden
+        )
+    );
+    put!(
+        wk,
+        hfq_weight(
+            hfq,
+            gpu,
+            &format!("{p}.self_attn.k_proj.weight"),
+            cfg.kv_dim(),
+            cfg.hidden
+        )
+    );
+    put!(
+        wv,
+        hfq_weight(
+            hfq,
+            gpu,
+            &format!("{p}.self_attn.v_proj.weight"),
+            cfg.kv_dim(),
+            cfg.hidden
+        )
+    );
+    put!(
+        wo,
+        hfq_weight(
+            hfq,
+            gpu,
+            &format!("{p}.self_attn.o_proj.weight"),
+            cfg.hidden,
+            cfg.q_dim()
+        )
+    );
+    put!(
+        q_norm,
+        hfq_tensor_f32(
+            hfq,
+            gpu,
+            &format!("{p}.self_attn.q_norm.weight"),
+            vec![cfg.head_dim]
+        )
+    );
+    put!(
+        k_norm,
+        hfq_tensor_f32(
+            hfq,
+            gpu,
+            &format!("{p}.self_attn.k_norm.weight"),
+            vec![cfg.head_dim]
+        )
+    );
+    put!(
+        ffn_norm,
+        hfq_tensor_f32(
+            hfq,
+            gpu,
+            &format!("{p}.post_attention_layernorm.weight"),
+            vec![cfg.hidden]
+        )
+    );
+    put!(
+        w_gate,
+        hfq_weight(
+            hfq,
+            gpu,
+            &format!("{p}.mlp.gate_proj.weight"),
+            cfg.intermediate,
+            cfg.hidden
+        )
+    );
+    put!(
+        w_up,
+        hfq_weight(
+            hfq,
+            gpu,
+            &format!("{p}.mlp.up_proj.weight"),
+            cfg.intermediate,
+            cfg.hidden
+        )
+    );
+    put!(
+        w_down,
+        hfq_weight(
+            hfq,
+            gpu,
+            &format!("{p}.mlp.down_proj.weight"),
+            cfg.hidden,
+            cfg.intermediate
+        )
+    );
+
+    Ok(partial.finish())
+}
+
 impl DflashWeights {
     /// True when the selector (candidate proposal) path is available.
     pub fn has_candidate_selector(&self) -> bool {
@@ -625,182 +952,48 @@ impl DflashWeights {
             && self.successor_codebook.is_some()
     }
     pub fn load(gpu: &mut Gpu, hfq: &HfqFile, cfg: &DflashConfig) -> HipResult<Self> {
-        let fc = hfq_weight(
-            hfq,
-            gpu,
-            "fc.weight",
-            cfg.hidden,
-            cfg.num_extract() * cfg.hidden,
-        )?;
-        let hidden_norm = hfq_tensor_f32(hfq, gpu, "hidden_norm.weight", vec![cfg.hidden])?;
-        let norm = hfq_tensor_f32(hfq, gpu, "norm.weight", vec![cfg.hidden])?;
-
-        let conv_k = cfg.conv_kernel_size.unwrap_or(2);
-        let conv_g = cfg.conv_group_size.unwrap_or(16);
-        let conv_groups = cfg.hidden / conv_g;
-        let proj_m = 2 * conv_k * conv_groups;
+        let fc = dflash_load_step(|| {
+            hfq_weight(
+                hfq,
+                gpu,
+                "fc.weight",
+                cfg.hidden,
+                cfg.num_extract() * cfg.hidden,
+            )
+        })?;
+        let hidden_norm = match dflash_load_step(|| {
+            hfq_tensor_f32(hfq, gpu, "hidden_norm.weight", vec![cfg.hidden])
+        }) {
+            Ok(tensor) => tensor,
+            Err(error) => {
+                fc.free_all(gpu);
+                return Err(error);
+            }
+        };
+        let norm =
+            match dflash_load_step(|| hfq_tensor_f32(hfq, gpu, "norm.weight", vec![cfg.hidden])) {
+                Ok(tensor) => tensor,
+                Err(error) => {
+                    fc.free_all(gpu);
+                    let _ = gpu.free_tensor(hidden_norm);
+                    return Err(error);
+                }
+            };
 
         let mut layers = Vec::with_capacity(cfg.n_layers);
         for i in 0..cfg.n_layers {
-            let p = format!("layers.{i}");
-            // Attempt DFlash2 conv weights; absent on legacy drafts.
-            let attn_conv_base = if cfg.conv_kernel_size.is_some() {
-                // base_kernel [2, K, H] -> 2*K*H
-                let name = format!("{p}.self_attn.attention_conv.base_kernel");
-                // also try alternate naming `attn_conv` if upstream uses that
-                let alt = format!("{p}.attention_conv.base_kernel");
-                let key = if hfq.tensor_data(&name).is_some() {
-                    name
-                } else {
-                    alt
-                };
-                if hfq.tensor_data(&key).is_some() {
-                    // shape 2*K*H
-                    Some(hfq_tensor_f32(
-                        hfq,
-                        gpu,
-                        &key,
-                        vec![2 * conv_k * cfg.hidden],
-                    )?)
-                } else {
-                    None
+            match load_dflash_layer(hfq, gpu, cfg, i) {
+                Ok(layer) => layers.push(layer),
+                Err(error) => {
+                    fc.free_all(gpu);
+                    let _ = gpu.free_tensor(hidden_norm);
+                    let _ = gpu.free_tensor(norm);
+                    for layer in layers {
+                        free_dflash_layer(layer, gpu);
+                    }
+                    return Err(error);
                 }
-            } else {
-                None
-            };
-            let attn_conv_proj = if cfg.conv_kernel_size.is_some() {
-                let name = format!("{p}.self_attn.attention_conv.kernel_projection.weight");
-                let alt = format!("{p}.attention_conv.kernel_projection.weight");
-                let key = if hfq.tensor_data(&name).is_some() {
-                    name
-                } else {
-                    alt
-                };
-                if hfq.tensor_data(&key).is_some() {
-                    Some(hfq_weight(hfq, gpu, &key, proj_m, cfg.hidden)?)
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-            let mlp_conv_base = if cfg.conv_kernel_size.is_some() {
-                let name = format!("{p}.mlp.mlp_conv.base_kernel");
-                let alt = format!("{p}.mlp_conv.base_kernel");
-                let key = if hfq.tensor_data(&name).is_some() {
-                    name
-                } else {
-                    alt
-                };
-                if hfq.tensor_data(&key).is_some() {
-                    Some(hfq_tensor_f32(
-                        hfq,
-                        gpu,
-                        &key,
-                        vec![2 * conv_k * cfg.hidden],
-                    )?)
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-            let mlp_conv_proj = if cfg.conv_kernel_size.is_some() {
-                let name = format!("{p}.mlp.mlp_conv.kernel_projection.weight");
-                let alt = format!("{p}.mlp_conv.kernel_projection.weight");
-                let key = if hfq.tensor_data(&name).is_some() {
-                    name
-                } else {
-                    alt
-                };
-                if hfq.tensor_data(&key).is_some() {
-                    Some(hfq_weight(hfq, gpu, &key, proj_m, cfg.hidden)?)
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-            let layer = DflashLayerWeights {
-                attn_norm: hfq_tensor_f32(
-                    hfq,
-                    gpu,
-                    &format!("{p}.input_layernorm.weight"),
-                    vec![cfg.hidden],
-                )?,
-                wq: hfq_weight(
-                    hfq,
-                    gpu,
-                    &format!("{p}.self_attn.q_proj.weight"),
-                    cfg.q_dim(),
-                    cfg.hidden,
-                )?,
-                wk: hfq_weight(
-                    hfq,
-                    gpu,
-                    &format!("{p}.self_attn.k_proj.weight"),
-                    cfg.kv_dim(),
-                    cfg.hidden,
-                )?,
-                wv: hfq_weight(
-                    hfq,
-                    gpu,
-                    &format!("{p}.self_attn.v_proj.weight"),
-                    cfg.kv_dim(),
-                    cfg.hidden,
-                )?,
-                wo: hfq_weight(
-                    hfq,
-                    gpu,
-                    &format!("{p}.self_attn.o_proj.weight"),
-                    cfg.hidden,
-                    cfg.q_dim(),
-                )?,
-                q_norm: hfq_tensor_f32(
-                    hfq,
-                    gpu,
-                    &format!("{p}.self_attn.q_norm.weight"),
-                    vec![cfg.head_dim],
-                )?,
-                k_norm: hfq_tensor_f32(
-                    hfq,
-                    gpu,
-                    &format!("{p}.self_attn.k_norm.weight"),
-                    vec![cfg.head_dim],
-                )?,
-                ffn_norm: hfq_tensor_f32(
-                    hfq,
-                    gpu,
-                    &format!("{p}.post_attention_layernorm.weight"),
-                    vec![cfg.hidden],
-                )?,
-                w_gate: hfq_weight(
-                    hfq,
-                    gpu,
-                    &format!("{p}.mlp.gate_proj.weight"),
-                    cfg.intermediate,
-                    cfg.hidden,
-                )?,
-                w_up: hfq_weight(
-                    hfq,
-                    gpu,
-                    &format!("{p}.mlp.up_proj.weight"),
-                    cfg.intermediate,
-                    cfg.hidden,
-                )?,
-                w_down: hfq_weight(
-                    hfq,
-                    gpu,
-                    &format!("{p}.mlp.down_proj.weight"),
-                    cfg.hidden,
-                    cfg.intermediate,
-                )?,
-                attn_conv_base,
-                attn_conv_proj,
-                mlp_conv_base,
-                mlp_conv_proj,
-            };
-            layers.push(layer);
+            }
         }
 
         // Selector: hidden_projection [rank, hidden] + two codebooks [vocab, rank] host-side
@@ -817,7 +1010,20 @@ impl DflashWeights {
             let mut found = None;
             for n in candidates {
                 if hfq.tensor_data(n).is_some() {
-                    found = Some(hfq_weight(hfq, gpu, n, rank, cfg.hidden)?);
+                    found = Some(
+                        match dflash_load_step(|| hfq_weight(hfq, gpu, n, rank, cfg.hidden)) {
+                            Ok(weight) => weight,
+                            Err(error) => {
+                                fc.free_all(gpu);
+                                let _ = gpu.free_tensor(hidden_norm);
+                                let _ = gpu.free_tensor(norm);
+                                for layer in layers {
+                                    free_dflash_layer(layer, gpu);
+                                }
+                                return Err(error);
+                            }
+                        },
+                    );
                     break;
                 }
             }
@@ -922,13 +1128,7 @@ impl DflashWeights {
                         | DType::MQ2G256V2
                 )
             });
-        if has_mq {
-            // MQ dispatch needs the engine's FWHT sign tables uploaded
-            // (matches `gemv_mq4g256_with_rotate`'s setup).
-            gpu.ensure_mq_signs()?;
-        }
-
-        Ok(DflashWeights {
+        let weights = DflashWeights {
             fc,
             hidden_norm,
             norm,
@@ -941,7 +1141,17 @@ impl DflashWeights {
             selector_top_k: selector_top_k_opt,
             conv_group_size: cfg.conv_group_size,
             conv_kernel_size: cfg.conv_kernel_size,
-        })
+        };
+        if has_mq {
+            // MQ dispatch needs the engine's FWHT sign tables uploaded
+            // (matches `gemv_mq4g256_with_rotate`'s setup).
+            if let Err(error) = gpu.ensure_mq_signs() {
+                weights.free_gpu(gpu);
+                return Err(error);
+            }
+        }
+
+        Ok(weights)
     }
     pub fn free_gpu(self, gpu: &mut Gpu) {
         // free_all (not .buf) so the awq_scale / paro sidecars are released too —
@@ -950,30 +1160,8 @@ impl DflashWeights {
         self.fc.free_all(gpu);
         let _ = gpu.free_tensor(self.hidden_norm);
         let _ = gpu.free_tensor(self.norm);
-        for l in self.layers {
-            let _ = gpu.free_tensor(l.attn_norm);
-            l.wq.free_all(gpu);
-            l.wk.free_all(gpu);
-            l.wv.free_all(gpu);
-            l.wo.free_all(gpu);
-            let _ = gpu.free_tensor(l.q_norm);
-            let _ = gpu.free_tensor(l.k_norm);
-            let _ = gpu.free_tensor(l.ffn_norm);
-            l.w_gate.free_all(gpu);
-            l.w_up.free_all(gpu);
-            l.w_down.free_all(gpu);
-            if let Some(t) = l.attn_conv_base {
-                let _ = gpu.free_tensor(t);
-            }
-            if let Some(w) = l.attn_conv_proj {
-                w.free_all(gpu);
-            }
-            if let Some(t) = l.mlp_conv_base {
-                let _ = gpu.free_tensor(t);
-            }
-            if let Some(w) = l.mlp_conv_proj {
-                w.free_all(gpu);
-            }
+        for layer in self.layers {
+            free_dflash_layer(layer, gpu);
         }
         if let Some(w) = self.selector_hidden_proj {
             w.free_all(gpu);
@@ -3036,7 +3224,39 @@ pub fn draft_forward_opts(
 
 #[cfg(test)]
 mod ring_tests {
-    use super::ring_segments;
+    use super::{
+        clear_dflash_load_failure, dflash_load_step, inject_dflash_load_failure_after,
+        ring_segments,
+    };
+
+    #[test]
+    fn load_fault_fires_after_requested_successes_and_clears() {
+        clear_dflash_load_failure();
+        inject_dflash_load_failure_after(2);
+        assert_eq!(
+            dflash_load_step(|| Ok::<_, hip_bridge::HipError>(10)).unwrap(),
+            10
+        );
+        assert_eq!(
+            dflash_load_step(|| Ok::<_, hip_bridge::HipError>(20)).unwrap(),
+            20
+        );
+        let error = dflash_load_step(|| Ok::<_, hip_bridge::HipError>(30)).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("injected DFlash weight-load failure"));
+        assert_eq!(
+            dflash_load_step(|| Ok::<_, hip_bridge::HipError>(40)).unwrap(),
+            40
+        );
+    }
+
+    #[test]
+    fn clearing_load_fault_prevents_injection() {
+        inject_dflash_load_failure_after(0);
+        clear_dflash_load_failure();
+        assert!(dflash_load_step(|| Ok::<_, hip_bridge::HipError>(())).is_ok());
+    }
 
     #[test]
     fn identity_modulus_is_single_segment() {

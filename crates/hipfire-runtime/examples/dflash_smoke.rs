@@ -6,7 +6,7 @@
 //! forward pass with random inputs. Verifies weights load, all kernels
 //! compile + launch, and the output contains finite values.
 //!
-//! Usage: dflash_smoke <draft.hfq> [--block B] [--ctx L]
+//! Usage: dflash_smoke <draft.hfq> [--block B] [--ctx L] [--fail-load-after N]
 
 #[cfg(not(feature = "deltanet"))]
 fn main() {
@@ -28,6 +28,7 @@ fn main() {
     let path = &args[1];
     let mut block_size: usize = 16;
     let mut ctx_len: usize = 32;
+    let mut fail_load_after: Option<usize> = None;
 
     let mut i = 2;
     while i < args.len() {
@@ -38,6 +39,10 @@ fn main() {
             }
             "--ctx" => {
                 ctx_len = args[i + 1].parse().unwrap();
+                i += 2;
+            }
+            "--fail-load-after" => {
+                fail_load_after = Some(args[i + 1].parse().unwrap());
                 i += 2;
             }
             other => {
@@ -69,9 +74,50 @@ fn main() {
     let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
     eprintln!("gpu: {}", gpu.arch);
 
+    if let Some(successful_steps) = fail_load_after {
+        // Establish HIP's lazy context/allocator footprint before taking the
+        // baseline. The first real allocation retains ~150 MiB on gfx1100
+        // even after it is freed; that fixed runtime cost is not a draft leak.
+        let warm = gpu
+            .alloc_tensor(&[1], rdna_compute::DType::F32)
+            .expect("rollback baseline allocation");
+        gpu.free_tensor(warm).expect("rollback baseline free");
+        gpu.drain_pool();
+        gpu.hip.device_synchronize().expect("sync baseline");
+        let free_before = gpu.hip.get_vram_info().expect("VRAM before fault").0;
+        dflash::inject_dflash_load_failure_after(successful_steps);
+        let error = DflashWeights::load(&mut gpu, &hfq, &cfg)
+            .err()
+            .expect("injected draft load must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("injected DFlash weight-load failure"),
+            "unexpected failure: {error}"
+        );
+        gpu.drain_pool();
+        gpu.hip.device_synchronize().expect("sync after rollback");
+        let free_after = gpu.hip.get_vram_info().expect("VRAM after fault").0;
+        let retained = free_before.saturating_sub(free_after);
+        eprintln!(
+            "load rollback: injected_after={successful_steps} free_before={free_before} \
+             free_after={free_after} retained={retained}"
+        );
+        // HIP may retain a fixed allocator heap after the first large upload;
+        // the decisive gates are that this number does not grow with failure
+        // depth and that the complete retry below succeeds in this process.
+    }
+
     let t0 = Instant::now();
     let weights = DflashWeights::load(&mut gpu, &hfq, &cfg).expect("load dflash weights");
     eprintln!("weights loaded in {:.2}s", t0.elapsed().as_secs_f64());
+    if fail_load_after.is_some() {
+        weights.free_gpu(&mut gpu);
+        gpu.drain_pool();
+        gpu.hip.device_synchronize().expect("sync retry unload");
+        eprintln!("dflash_smoke: LOAD_ROLLBACK_RETRY PASS");
+        return;
+    }
 
     let t1 = Instant::now();
     let mut scratch =
