@@ -183,6 +183,15 @@ this section.
    (vision-tower parity route; image-bearing coherence battery route) —
    VL claims stay fail-closed "unknown surface" until those rows land.
 
+   As-built 2026-08-27: both routes landed on `feat/qwen35-vl` in
+   [`docs/VALIDATION.md`](VALIDATION.md)'s Claim → route map ("VL
+   vision-tower forward numerical parity"; "VL image-bearing serve
+   semantics"), after the image-bearing battery ran green over HTTP on the
+   NuExtract3 fixture (see
+   [`specs/2026-08-27-qwen35-vl-vision-serve.md`](specs/2026-08-27-qwen35-vl-vision-serve.md)).
+   Route existence is not per-checkpoint evidence: every VL claim still
+   runs under its named route with its own identity hashes.
+
 ## 6. Out of scope
 
 - **Arch 6 (MoE) VL**: qt44 grouped/indexed MoE kernels are pending PR #610;

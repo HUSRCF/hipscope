@@ -4,7 +4,9 @@
 
 Status: **branch-implemented on `feat/qwen35-vl` (2026-08-27)** — see the
 as-built blockquote below; quality claims beyond the cited smokes remain
-fail-closed until a `docs/VALIDATION.md` VL row exists.
+fail-closed until a `docs/VALIDATION.md` VL row exists. The VL route rows
+landed 2026-08-27 (see the final blockquote); running a claim under its
+route with fresh identity hashes is still required per [`VALIDATION.md`](../VALIDATION.md).
 Author: engineering (hipfire agent)
 Date: 2026-08-27
 Parent family spec: [`qwen35-vl-mq4v2-spec.md`](../qwen35-vl-mq4v2-spec.md)
@@ -180,6 +182,13 @@ bring-up tier.
 > text math "391" unchanged at max_tokens=256; mid-decode kill → follow-up
 > in 1.03 s, no wedge; `run --image` stdio parity in a one-off container
 > (6/6 captions). Evidence:
-> `.codeinsight+research/qwen35-vl-audit-2026-08-27/RESULTS.md`. Still
-> owed, fail-closed: `docs/VALIDATION.md` VL rows per parent spec §5.7;
-> dots.ocr live abort probe.
+> `.codeinsight+research/qwen35-vl-audit-2026-08-27/RESULTS.md`.
+>
+> The `docs/VALIDATION.md` VL rows per parent spec §5.7 landed 2026-08-27
+> (same day), confirmed by a from-scratch container rebuild at HEAD
+> `c91ae3db` (daemon md5 unchanged `d4d63ce0…`): stream typed-emission
+> census 156 reasoning / 27 content chunks, zero marker leakage; doge OCR
+> 6/6 captions; mid-encode kill → follow-up 4.69 s and true mid-decode
+> kill (252 chunks already streamed) → follow-up 1.04 s, no wedge.
+> Evidence: `.codeinsight+research/vl-serve-qwen35-rebuild-2026-08-27/RESULTS.md`.
+> Still owed, fail-closed: dots.ocr live abort probe.
