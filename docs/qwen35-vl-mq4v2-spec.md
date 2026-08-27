@@ -103,6 +103,14 @@ The arch 5 VL path is production. Verification items, in order:
 2. The §1 tied/untied head path for this checkpoint's config.
 3. `vision_config_from_hfq` round-trip against the 9B tower config.
 4. `run --image` smoke on one fixture, then the §5 battery.
+
+As-built note (2026-08-27): items ran green through `run --image`, but the
+HTTP serve arm of item 4 failed live — VL entry points predated the stream
+contract and delivered zero bytes over `/v1/chat/completions`; the same
+probe found a permanent slot wedge after mid-encode client disconnects. Both
+fixed and verified; record:
+[`docs/specs/2026-08-27-qwen35-vl-vision-serve.md`](specs/2026-08-27-qwen35-vl-vision-serve.md)
+(engine touch below reflects it).
 5. Known engine debt this vehicle exercises (from
    `docs/plans/vision-pipeline-cleanup-326.md`): multi-turn image-state reset
    defense, per-image GPU alloc count, and the missing VL output coherence
@@ -190,8 +198,11 @@ this section.
 
 ## 7. Files touched (as-built)
 
-- **Engine: none** (verify-only; any carrier gap found in §3 becomes a
-  scoped fix with its own validation route).
+- **Engine: generate-layer only** (`crates/hipfire-generate/src/vision.rs`,
+  2026-08-27): VL entry points gained the `gen_start` stream opener and
+  `generate_vl` gained client-cancel polls emitting the canonical cancelled
+  terminal pair — no carrier, kernel, or dispatch change; see
+  [`docs/specs/2026-08-27-qwen35-vl-vision-serve.md`](specs/2026-08-27-qwen35-vl-vision-serve.md).
 - `crates/hipfire-quantize/src/pipeline.rs` — the recipe items the shared
   contract needs: arch-11 `embed_tokens` routes through the mq4 bulk branch
   when an mq4 format requests it (tied head covered for free); the

@@ -703,6 +703,17 @@ pub fn generate_vl(
     // transition errors are request-scoped (no panic, no later token emit).
     let mut visual_idx = 0usize;
     for &token in prompt_tokens.iter() {
+        // Client-cancel poll. The encoder phase before this loop cannot be
+        // interrupted mid-kernel, so prefill's first iteration is where an
+        // abort signalled during vision_forward takes effect. The terminal
+        // MUST be the canonical cancelled pair: falling through to the done
+        // handshake on an aborted attempt strands the serve admission guard
+        // permanently (2026-08-27 ledger finding c — slot wedged ≥3 min on
+        // every mid-encode disconnect before these polls existed).
+        if check_abort(id) {
+            emit_qwen_ar_cancelled(stdout, id, 0);
+            return;
+        }
         if token == image_pad_id && visual_idx < n_visual_tokens {
             let emb = &visual_tokens[visual_idx * config.dim..(visual_idx + 1) * config.dim];
             if let Err(e) = qwen35::forward_scratch_embed_mrope(
@@ -892,6 +903,14 @@ pub fn generate_vl(
         hipfire_runtime::loop_guard::LoopGuard::from_config(hipfire_runtime::config::get());
 
     while generated < max_tokens {
+        // Decode-side client-cancel poll — same canonical-terminal rule as
+        // the prefill poll above; partial per-call state (seq_pos,
+        // conversation_tokens) is reclaimed by the next dispatch's
+        // non-zero-seq_pos reset, matching the dots.ocr cancel path.
+        if check_abort(id) {
+            emit_qwen_ar_cancelled(stdout, id, generated);
+            return;
+        }
         // Commit KV for this sampled token BEFORE any client-visible emit so a
         // lazy VMM map/growth failure cannot stream an uncommitted token.
         // Order: forward → seq_pos++ → evict → downshift → then
