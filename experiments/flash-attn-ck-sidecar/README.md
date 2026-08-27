@@ -151,3 +151,19 @@ Qwen3.6-27B MQ4, Asym3 KV, W7900/gfx1100, warm process and identical fake prompt
 | 512 | 2 | `836.5 tok/s` | `854.8 tok/s` | `+2.18%` | `29` / `29` |
 | 2048 | 3 | `780.9 tok/s` | `846.7 tok/s` | `+8.43%` | not recorded |
 | 8192 | 5 | `569.9 tok/s` | `795.2 tok/s` | `+39.53%` | `248046` / `248046` |
+
+The same PP8192 cell was revalidated after porting to current master
+`aaf5e3211` with ROCm 7.14. Five timed runs followed two warmups in each arm:
+
+| Native median | CK median | Delta | Next token |
+| ---: | ---: | ---: | ---: |
+| `572.5 tok/s` | `797.4 tok/s` | `+39.28%` | `248046` / `248046` |
+
+A matching rocprof trace bounds further optimization within this CK cell. After
+dividing the warmup-plus-profile dispatch totals by two, CK FMHA took about
+`283.6 ms`, Asym3 K decode `28.5 ms`, Q8 V decode `38.2 ms`, output conversion
+`5.2 ms`, and Q rotation `2.6 ms` per PP8192 pass. The complete CK chain is
+therefore about `358 ms`, or `3.3%` of the profiled wall after CK is enabled.
+Even removing that entire chain would project only about `825 tok/s` from the
+steady `797.4 tok/s` baseline. Larger end-to-end gains require independent
+packed-weight GEMM work and are not attributed to this attention change.
