@@ -1,0 +1,4 @@
+native: median=1068.400 raw=[949.9, 1071.2, 1068.4]
+ck: median=1079.700 raw=[1082.0, 1079.7, 1075.6]
+paired_ratio_median=1.007935x positive_pairs=3/3 raw=[1.1390672702389726, 1.0079350261389097, 1.0067390490453012]
+token_ids_match=True bad_pairs=[]

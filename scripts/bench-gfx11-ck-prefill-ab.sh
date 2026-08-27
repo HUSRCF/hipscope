@@ -11,15 +11,15 @@ MODEL="${MODEL:-${HOME}/.hipfire/models/qwen3.6-27b.mq4}"
 BIN="${BIN:-${ROOT}/target/release/examples/bench_qwen35_mq4}"
 CK_LIB="${CK_LIB:-${ROOT}/experiments/flash-attn-ck-sidecar/quantized/build/libhipfire_flash_attn_ck_quantized_staged.so}"
 KV_MODE="${KV_MODE:-asym3}"
-PARTIALS_BATCH="${PARTIALS_BATCH:-$([[ "${KV_MODE}" == asym4 ]] && printf 64 || printf 32)}"
+PARTIALS_BATCH="${PARTIALS_BATCH:-$([[ "${KV_MODE}" =~ ^(asym4|fwht4)$ ]] && printf 64 || printf 32)}"
 OUT_DIR="${OUT_DIR:-${ROOT}/.redline-work/gfx11-ck-prefill-ab-$(date +%Y%m%d_%H%M%S)}"
 
 (( PREFILL_TOKENS >= 2048 && PREFILL_RUNS >= 3 && PREFILL_RUNS % 2 == 1 && TRIALS >= 3 )) || {
     echo "require PREFILL_TOKENS>=2048, odd PREFILL_RUNS>=3, TRIALS>=3" >&2
     exit 2
 }
-[[ "${KV_MODE}" == "asym3" || "${KV_MODE}" == "asym4" ]] || {
-    echo "KV_MODE must be asym3 or asym4" >&2
+[[ "${KV_MODE}" =~ ^(asym3|asym4|fwht4)$ ]] || {
+    echo "KV_MODE must be asym3, asym4, or fwht4" >&2
     exit 2
 }
 for path in "${MODEL}" "${BIN}" "${CK_LIB}"; do
@@ -82,6 +82,7 @@ run_one() {
 
     local route='^staged quantized FlashAttention CK prefill active:'
     [[ "${KV_MODE}" == asym4 ]] && route='^Asym4 staged FlashAttention CK prefill active:'
+    [[ "${KV_MODE}" == fwht4 ]] && route='^FWHT4 staged FlashAttention CK prefill active:'
     if [[ "${mode}" == ck ]]; then
         rg -q "${route}" "${log}"
     elif rg -q "${route}" "${log}"; then

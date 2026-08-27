@@ -10,6 +10,7 @@
 #if defined(HIPFIRE_ENABLE_STAGED_QUANTIZED_CK)
 #include "quantized_kv_predecode.hpp"
 #include "../hipfire_flash_attn_ck.h"
+#include "../../../kernels/src/turbo_common.h"
 #endif
 
 #include "fmha_fwd.hpp"
@@ -119,6 +120,41 @@ __global__ void rotate_q_givens_f32_to_f16(const float* __restrict__ input,
         output[index + 1] = __float2half(a * s + b * c);
     }
 }
+
+#if defined(HIPFIRE_ENABLE_STAGED_QUANTIZED_CK)
+__global__ void rotate_q_fwht4_f32_to_f16(const float* __restrict__ input,
+                                           __half* __restrict__ output,
+                                           const float* __restrict__ signs1,
+                                           const float* __restrict__ signs2,
+                                           int query_rows,
+                                           int query_heads)
+{
+    const int row_head = blockIdx.x;
+    const int head = row_head % query_heads;
+    const int row = row_head / query_heads;
+    const int lane = threadIdx.x;
+    if(row >= query_rows || lane >= 32)
+    {
+        return;
+    }
+
+    const int head_base = (row * query_heads + head) * kHeadDim;
+#pragma unroll
+    for(int half = 0; half < 2; ++half)
+    {
+        const int base = head_base + half * 128 + lane * 4;
+        float a = input[base];
+        float b = input[base + 1];
+        float c = input[base + 2];
+        float d = input[base + 3];
+        fwht_shfl_forward(a, b, c, d, signs1, signs2, lane);
+        output[base] = __float2half(a);
+        output[base + 1] = __float2half(b);
+        output[base + 2] = __float2half(c);
+        output[base + 3] = __float2half(d);
+    }
+}
+#endif
 
 __global__ void convert_f16_to_f32(const __half* __restrict__ input,
                                    float* __restrict__ output,
@@ -714,6 +750,13 @@ int launch_quantized_prefill_impl(
 }
 
 #if defined(HIPFIRE_ENABLE_STAGED_QUANTIZED_CK)
+enum class StagedKvKind
+{
+    Asym3Givens,
+    Asym4Givens,
+    Fwht4,
+};
+
 int validate_staged_prefill(const hipfire_flash_attn_ck_quantized_prefill_params* p,
                             char* error,
                             size_t error_capacity)
@@ -757,7 +800,7 @@ int validate_asym4_staged_prefill(
        p->k_row_stride_bytes != kKvHeads * hipfire::ck_attention::kPredecodeAsym4HeadBytes ||
        p->v_row_stride_bytes != kKvHeads * kQ8HeadBytes)
     {
-        set_quantized_error(error, error_capacity, "unsupported Givens-Asym4/Q8 staged layout");
+        set_quantized_error(error, error_capacity, "unsupported 4-bit-K/Q8-V staged layout");
         return 1;
     }
     const size_t required = staged_workspace_bytes(
@@ -773,7 +816,7 @@ int validate_asym4_staged_prefill(
 
 int launch_staged_prefill_impl(
     const hipfire_flash_attn_ck_quantized_prefill_params* p,
-    bool asym4,
+    StagedKvKind kind,
     char* error,
     size_t error_capacity)
 {
@@ -787,18 +830,21 @@ int launch_staged_prefill_impl(
     auto* dense_v = dense_k + kv_values;
     auto stream = reinterpret_cast<hipStream_t>(p->stream);
 
-    hipLaunchKernelGGL(rotate_q_givens_f32_to_f16,
-                       dim3(p->nhead_q * p->seqlen_q),
-                       dim3(32),
-                       0,
-                       stream,
-                       p->q,
-                       q_rotated,
-                       p->cos_theta,
-                       p->sin_theta,
-                       p->seqlen_q,
-                       p->nhead_q);
-    if(asym4)
+    if(kind == StagedKvKind::Fwht4)
+    {
+        hipLaunchKernelGGL(rotate_q_fwht4_f32_to_f16,
+                           dim3(p->nhead_q * p->seqlen_q), dim3(32), 0, stream,
+                           p->q, q_rotated, p->cos_theta, p->sin_theta,
+                           p->seqlen_q, p->nhead_q);
+    }
+    else
+    {
+        hipLaunchKernelGGL(rotate_q_givens_f32_to_f16,
+                           dim3(p->nhead_q * p->seqlen_q), dim3(32), 0, stream,
+                           p->q, q_rotated, p->cos_theta, p->sin_theta,
+                           p->seqlen_q, p->nhead_q);
+    }
+    if(kind != StagedKvKind::Asym3Givens)
     {
         hipLaunchKernelGGL(hipfire::ck_attention::predecode_asym4_k_q8_v_f16,
                            dim3(p->seqlen_k, p->nhead_k), dim3(32), 0, stream,
@@ -940,7 +986,8 @@ extern "C" int hipfire_flash_attn_ck_quantized_staged_prefill(
     {
         return status;
     }
-    return launch_staged_prefill_impl(params, false, error, error_capacity);
+    return launch_staged_prefill_impl(
+        params, StagedKvKind::Asym3Givens, error, error_capacity);
 }
 
 extern "C" int hipfire_flash_attn_ck_asym4_staged_supported(
@@ -960,7 +1007,28 @@ extern "C" int hipfire_flash_attn_ck_asym4_staged_prefill(
     {
         return status;
     }
-    return launch_staged_prefill_impl(params, true, error, error_capacity);
+    return launch_staged_prefill_impl(
+        params, StagedKvKind::Asym4Givens, error, error_capacity);
+}
+
+extern "C" int hipfire_flash_attn_ck_fwht4_staged_supported(
+    const hipfire_flash_attn_ck_quantized_prefill_params* params,
+    char* error,
+    size_t error_capacity)
+{
+    return validate_asym4_staged_prefill(params, error, error_capacity);
+}
+
+extern "C" int hipfire_flash_attn_ck_fwht4_staged_prefill(
+    const hipfire_flash_attn_ck_quantized_prefill_params* params,
+    char* error,
+    size_t error_capacity)
+{
+    if(const int status = validate_asym4_staged_prefill(params, error, error_capacity); status != 0)
+    {
+        return status;
+    }
+    return launch_staged_prefill_impl(params, StagedKvKind::Fwht4, error, error_capacity);
 }
 #endif
 

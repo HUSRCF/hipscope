@@ -5465,7 +5465,7 @@ impl Gpu {
 
     #[cfg(feature = "flash-attn-ck")]
     #[allow(clippy::too_many_arguments)]
-    fn try_attention_flash_asym4_ck(
+    fn try_attention_flash_4bit_ck(
         &mut self,
         q: &GpuTensor,
         k_cache: &GpuTensor,
@@ -5482,6 +5482,7 @@ impl Gpu {
         tree_bias: Option<&GpuTensor>,
         block_start: usize,
         block_cols: usize,
+        fwht4: bool,
     ) -> HipResult<bool> {
         if self.graphs.capture_mode
             || tree_bias.is_some()
@@ -5532,19 +5533,36 @@ impl Gpu {
         params.k_row_stride_bytes = (n_kv_heads * 132) as i32;
         params.v_row_stride_bytes = (n_kv_heads * 272) as i32;
 
-        if sidecar.is_asym4_staged_supported(&params).is_err() {
+        let supported = if fwht4 {
+            sidecar.is_fwht4_staged_supported(&params)
+        } else {
+            sidecar.is_asym4_staged_supported(&params)
+        };
+        if supported.is_err() {
             return Ok(false);
         }
-        unsafe { sidecar.asym4_staged_prefill(&params) }.map_err(|error| {
+        let result = if fwht4 {
+            unsafe { sidecar.fwht4_staged_prefill(&params) }
+        } else {
+            unsafe { sidecar.asym4_staged_prefill(&params) }
+        };
+        result.map_err(|error| {
             hip_bridge::HipError::new(
                 0,
-                &format!("Asym4 staged FlashAttention CK launch failed: {error}"),
+                &format!("4-bit staged FlashAttention CK launch failed: {error}"),
             )
         })?;
-        static REPORT_ASYM4_STAGED_ACTIVE: std::sync::Once = std::sync::Once::new();
-        REPORT_ASYM4_STAGED_ACTIVE.call_once(|| {
+        static REPORT_GIVENS_ACTIVE: std::sync::Once = std::sync::Once::new();
+        static REPORT_FWHT_ACTIVE: std::sync::Once = std::sync::Once::new();
+        let report = if fwht4 {
+            &REPORT_FWHT_ACTIVE
+        } else {
+            &REPORT_GIVENS_ACTIVE
+        };
+        report.call_once(|| {
             eprintln!(
-                "Asym4 staged FlashAttention CK prefill active: Q={} K={} Hq={} Hkv={} D={} scratch={} bytes",
+                "{} staged FlashAttention CK prefill active: Q={} K={} Hq={} Hkv={} D={} scratch={} bytes",
+                if fwht4 { "FWHT4" } else { "Asym4" },
                 batch_size,
                 max_ctx_len,
                 n_heads,
@@ -5584,7 +5602,7 @@ impl Gpu {
         self.bind_thread()?;
 
         #[cfg(feature = "flash-attn-ck")]
-        if self.try_attention_flash_asym4_ck(
+        if self.try_attention_flash_4bit_ck(
             q,
             k_cache,
             v_cache,
@@ -5600,6 +5618,7 @@ impl Gpu {
             tree_bias,
             block_start,
             block_cols,
+            false,
         )? {
             return Ok(());
         }
@@ -5660,7 +5679,7 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         #[cfg(feature = "flash-attn-ck")]
-        if self.try_attention_flash_asym4_ck(
+        if self.try_attention_flash_4bit_ck(
             q,
             k_cache,
             v_cache,
@@ -5676,6 +5695,7 @@ impl Gpu {
             tree_bias,
             block_start,
             block_cols,
+            false,
         )? {
             return Ok(());
         }
@@ -5829,6 +5849,29 @@ impl Gpu {
         v_mode_bits: i32,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        #[cfg(feature = "flash-attn-ck")]
+        if v_mode_bits == V_MODE_Q8
+            && self.try_attention_flash_4bit_ck(
+                q,
+                k_cache,
+                v_cache,
+                out,
+                signs1,
+                signs2,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                max_ctx_len,
+                batch_size,
+                partials,
+                tree_bias,
+                block_start,
+                block_cols,
+                true,
+            )?
+        {
+            return Ok(());
+        }
         self.launch_asym_flash_batched(
             "attention_flash_fwht4_tile_batched",
             kernels::ATTENTION_FLASH_FWHT4_TILE_BATCHED_SRC,

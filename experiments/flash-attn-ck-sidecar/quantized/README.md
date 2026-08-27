@@ -96,10 +96,12 @@ An independent Asym4 loader ABI decodes each physical `(position, kv_head)`
 exactly once into dense FP16 K/V staging. Givens-Asym4 and FWHT4 use the same
 loader because their packed K caches already contain transformed coordinates;
 the corresponding Q transform remains a separate attention-front-end concern.
-The Givens-Asym4 production route activates automatically when a compatible
-sidecar is explicitly loaded and the validated D256 24Q/4KV prefill contract
-matches. It requires a 64-row flash-partials allocation at PP2048 and above;
-the reusable PP8192 A/B harness selects that capacity for Asym4.
+The Givens-Asym4 and FWHT4 production routes activate automatically when a
+compatible sidecar is explicitly loaded and the validated D256 24Q/4KV
+prefill contract matches. FWHT4 reuses the packed-K/Q8-V loader and applies
+the shipping two-half signed FWHT to Q. Both routes require a 64-row
+flash-partials allocation at PP2048 and above; the reusable PP8192 A/B harness
+selects that capacity for either 4-bit mode.
 
 On W7900, three alternating PP8192 process pairs measured scalar Asym4 versus
 the staged CK route at `632.9 -> 1243.1`, `629.7 -> 1240.1`, and
@@ -107,6 +109,14 @@ the staged CK route at `632.9 -> 1243.1`, `629.7 -> 1240.1`, and
 positive pairs and identical greedy token sequences. Decode remained neutral
 at about `33.3-33.5 tok/s`. Raw evidence is under
 `results/asym4_ck_pp8192_abba_w7900_20260827/`.
+
+The corresponding FWHT4 PP8192 run measured a smaller but consistent gain:
+native median `1068.4 tok/s` versus staged CK median `1079.7 tok/s`, with a
+paired-median ratio of **1.0079x**, 3/3 positive process pairs, identical greedy
+token sequences, and neutral decode throughput. The first native process was
+an outlier (`949.9 tok/s`), so this is compatibility evidence and a weak
+positive signal rather than a broad performance claim. Raw evidence is under
+`results/fwht4_ck_pp8192_abba_w7900_20260827/`.
 
 At Q=2048 with 24 query heads, 4 KV heads, and D256, the complete reusable
 workspace (rotated Q, FP16 output, dense K, and dense V) is about 59/67/75/84

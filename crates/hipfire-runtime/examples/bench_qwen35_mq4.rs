@@ -160,6 +160,14 @@ fn main() {
             kv_seq,
         )
         .unwrap(),
+        "fwht4" => KvCache::new_gpu_fwht4(
+            &mut gpu,
+            config.n_layers,
+            config.n_kv_heads,
+            config.head_dim,
+            kv_seq,
+        )
+        .unwrap(),
         "asym3" | "turbo3" | "turbo" => KvCache::new_gpu_asym3(
             &mut gpu,
             config.n_layers,
@@ -176,7 +184,7 @@ fn main() {
             kv_seq,
         )
         .unwrap(),
-        other => panic!("unknown HIPFIRE_KV_MODE: {other}  (use q8|asym4|asym3|asym2)"),
+        other => panic!("unknown HIPFIRE_KV_MODE: {other}  (use q8|asym4|fwht4|asym3|asym2)"),
     };
     let mut dn_state = DeltaNetState::new(&mut gpu, &config).unwrap();
     let scratch = Qwen35Scratch::new_with_kv_max(&mut gpu, &config, 128, kv_seq).unwrap();
@@ -521,9 +529,7 @@ fn main() {
                 } else {
                     0.0
                 };
-                let shape = shape.map_or_else(String::new, |[m, k, n]| {
-                    format!("M{m} K{k} N{n}")
-                });
+                let shape = shape.map_or_else(String::new, |[m, k, n]| format!("M{m} K{k} N{n}"));
                 eprintln!(
                     "  {kern:45} {shape:24} {n:5}x  {:.1}ms  ({:.0}µs/call)  {:.1}%  {:.1} GiB/s",
                     us / 1000.0,
@@ -682,10 +688,7 @@ fn main() {
     // Read logits to get a valid next token
     let logits = gpu.download_f32(&scratch.logits).unwrap();
     let mut next_token = llama::argmax(&logits);
-    let dump_tokens = std::env::var("HIPFIRE_BENCH_DUMP_TOKENS")
-        .ok()
-        .as_deref()
-        == Some("1");
+    let dump_tokens = std::env::var("HIPFIRE_BENCH_DUMP_TOKENS").ok().as_deref() == Some("1");
     let mut generated_token_ids = dump_tokens.then(|| vec![next_token]);
 
     // === WARMUP ===
