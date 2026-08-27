@@ -12,10 +12,18 @@ Target checkpoint: `LiquidAI/LFM2.5-VL-3B` (`model_type: lfm2_vl`)
 > contract (§4 of [`qwen35-vl-mq4v2-spec.md`](qwen35-vl-mq4v2-spec.md)),
 > `lfm2_vl` maps to arch 11 in `arch_mapping.rs`, and the arch-11 loader
 > decodes qt 44 (`MQ4G256V2`) with batch allowlists extended.
+> **Validated on gfx1101 (2026-08-27):** the requantized
+> `lfm2.5-vl-3b-vlval.mq4v2.hfq` loads and generates coherent text on the
+> arch-11 carrier (greedy 17×23→"391" smoke, container-isolated run) with
+> census 441 F16 / 167 MQ4G256V2 / 99 Q8F16 matching lineage exactly.
+> **R1 resolved positively:** the gather path consumes MQ4G256V2 embeds via
+> host-dequant (`weight_backend::dequant_f32` qt44 arm) rather than falling
+> back to Q8. Image requests fail closed ("model has no vision encoder").
+>
 > **Not yet built:** all of §3.3–3.4 (the `hipfire-arch-lfm2-vl` crate,
-> projector wiring, VL forward) — a `lfm2_vl` artifact loads text-only until
-> that lands, so R1 (embed gather consumes MQ4G256V2) and R2 verification
-> are still owed before any §6 criterion is claimed.
+> projector wiring, VL forward) — a `lfm2_vl` artifact therefore serves
+> text-only; the image fail-closed above is that contract's live proof.
+> Full §6 vision acceptance awaits the crate.
 
 ## 0. Goal
 

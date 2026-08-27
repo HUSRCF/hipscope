@@ -543,9 +543,23 @@ impl Lfm2MoeWeights {
                     .map_err(|e| format!("lfm2moe: upload embed BF16->F32: {e:?}"))?;
                 (hipfire_runtime::llama::EmbeddingFormat::F32, buf)
             }
+            44 => {
+                // MQ4G256V2 embed (mq4v2 VL recipe; tied lm_head included) →
+                // host-dequant to a F32 gather table. Same decode the GEMV
+                // kernel does per-weight (level*scale[h]+zero[h]) followed by
+                // the FWHT inverse — dequant_f32 owns both.
+                let buf = hipfire_runtime::weight_backend::dequant_f32(
+                    gpu,
+                    44,
+                    &embed_bytes,
+                    cfg.vocab_size * cfg.hidden_size,
+                )
+                .map_err(|e| format!("lfm2moe: dequant qt44 embed: {:?}", e.message))?;
+                (hipfire_runtime::llama::EmbeddingFormat::F32, buf)
+            }
             other => {
                 return Err(format!(
-                    "lfm2moe: unsupported embedding quant_type {other} (expected 1,3,6,16)"
+                    "lfm2moe: unsupported embedding quant_type {other} (expected 1,3,6,16,44)"
                 ))
             }
         };
@@ -1156,9 +1170,21 @@ pub fn load_weights_from_source(
                 .map_err(|e| format!("lfm2moe: upload embed F32: {e:?}"))?;
             (hipfire_runtime::llama::EmbeddingFormat::F32, buf)
         }
+        44 => {
+            // MQ4G256V2 embed → host-dequant to F32 gather table (see the
+            // HFQ-path arm for rationale).
+            let buf = hipfire_runtime::weight_backend::dequant_f32(
+                gpu,
+                44,
+                &embed_bytes,
+                cfg.vocab_size * cfg.hidden_size,
+            )
+            .map_err(|e| format!("lfm2moe: dequant qt44 embed: {:?}", e.message))?;
+            (hipfire_runtime::llama::EmbeddingFormat::F32, buf)
+        }
         other => {
             return Err(format!(
-                "lfm2moe: unsupported embedding quant_type {other} (expected 1,3,6,16)"
+                "lfm2moe: unsupported embedding quant_type {other} (expected 1,3,6,16,44)"
             ))
         }
     };
