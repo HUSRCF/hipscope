@@ -3375,6 +3375,20 @@ fn try_handle_lfm2moe(
     // lm_head) → Q8 (qt=3 Q8F16). Dense lfm2 (350M/1.2B) has no experts, so
     // every tensor takes the final Q8 path. The loader's load_f32 dequantizes
     // Q8 norms / conv-filter back to F32 on load.
+    //
+    // Vision-module tensors are DECLINED here: this handler claims every
+    // lfm2moe-named tensor including a catch-all Q8 path, so tower/projector
+    // weights must return unclaimed to reach the bottom-of-loop F16 fallback
+    // (VL artifact contract — vision stays F16; see should_quantize()).
+    if is_lfm2moe
+        && (name.starts_with("model.vision_tower.")
+            || name.starts_with("model.vision_adapter.")
+            || name.starts_with("model.vision_projection.")
+            || name.starts_with("model.multi_modal_projector.")
+            || name.starts_with("model.visual."))
+    {
+        return false;
+    }
     if is_lfm2moe {
         let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
         if name.contains(".feed_forward.experts.")
