@@ -768,30 +768,41 @@ mod tests {
             assert_eq!(blob.len(), m * (k / 256) * b, "mq5v2 bytes m={m} k={k}");
             assert_eq!(b, 168);
         }
-        // fp16 header positions, payload offset, degenerate halves
+        // fp16 header positions, payload offset, degenerate halves. FWHT sign
+        // multiplication can turn +0.0 into -0.0, and the wire contract stores
+        // f16(lo), so either signed-zero encoding is valid.
         let m = 2;
         let k = 256;
-        // degenerate: all zeros => both halves scale=0, zero=f16(lo), payload q=0
         let w_zero = vec![0.0f32; m * k];
-        let blob = quantize_mq6g256v2(&w_zero, m, k, &s1, &s2);
-        for g in 0..m * (k / 256) {
-            let base = g * MQ6V2_GROUP_BYTES;
-            let s0 = u16::from_le_bytes([blob[base], blob[base + 1]]);
-            let z0 = u16::from_le_bytes([blob[base + 2], blob[base + 3]]);
-            let s1b = u16::from_le_bytes([blob[base + 4], blob[base + 5]]);
-            let z1 = u16::from_le_bytes([blob[base + 6], blob[base + 7]]);
-            assert_eq!(s0, 0, "degenerate scale half0 must be 0");
-            assert_eq!(s1b, 0, "degenerate scale half1 must be 0");
-            // zero is f16(lo) where lo==0 after FWHT of zeros => 0
-            assert_eq!(z0, f32_to_f16(0.0));
-            assert_eq!(z1, f32_to_f16(0.0));
-            // payload offset 8 must be zeros
-            assert!(
-                blob[base + 8..base + MQ6V2_GROUP_BYTES]
-                    .iter()
-                    .all(|&b| b == 0),
-                "degenerate payload must be 0"
-            );
+        for (name, group_bytes, blob) in [
+            (
+                "mq6v2",
+                MQ6V2_GROUP_BYTES,
+                quantize_mq6g256v2(&w_zero, m, k, &s1, &s2),
+            ),
+            (
+                "mq5v2",
+                MQ5V2_GROUP_BYTES,
+                quantize_mq5g256v2(&w_zero, m, k, &s1, &s2),
+            ),
+        ] {
+            for g in 0..m * (k / 256) {
+                let base = g * group_bytes;
+                let s0 = u16::from_le_bytes([blob[base], blob[base + 1]]);
+                let z0 = u16::from_le_bytes([blob[base + 2], blob[base + 3]]);
+                let s1b = u16::from_le_bytes([blob[base + 4], blob[base + 5]]);
+                let z1 = u16::from_le_bytes([blob[base + 6], blob[base + 7]]);
+                assert_eq!(s0, 0, "{name} degenerate scale half0 must be 0");
+                assert_eq!(s1b, 0, "{name} degenerate scale half1 must be 0");
+                assert_eq!(z0 & 0x7fff, 0, "{name} half0 zero must be signed f16 zero");
+                assert_eq!(z1 & 0x7fff, 0, "{name} half1 zero must be signed f16 zero");
+                assert!(
+                    blob[base + 8..base + group_bytes]
+                        .iter()
+                        .all(|&byte| byte == 0),
+                    "{name} degenerate payload must be 0"
+                );
+            }
         }
         // non-degenerate: ensure header bytes are valid fp16 and payload non-zero
         let w_rand: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.007).sin() * 2.0).collect();
