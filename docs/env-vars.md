@@ -157,6 +157,7 @@ preserved.
 | `HIPFIRE_RDNA3_Q8_GROUP128_QUAD_ROW_WEIGHT` | `1` | Enables the matching quad-row weight layout. |
 | `HIPFIRE_RDNA3_FUSED_SWIGLU_Q8_GROUP128` | `1` | Enables the validated fused SwiGLU consumer. |
 | `HIPFIRE_RDNA3_FFN_F16_INTERMEDIATE` | `1` | Stores the FFN intermediate in FP16 on this route. |
+| `HIPFIRE_RDNA3_GDN_CONV_TOKEN_PARALLEL` | `1` | Parallelizes long eager sequential GDN prefill across tokens; graph, decode, and independent/tree paths are unchanged. |
 | `HIPFIRE_RDNA3_Q8_GROUP256_SERIAL_ROW` | `1` | Enables the validated serial-row group-256 fallback. |
 | `HIPFIRE_RDNA3_Q8_GROUP256_GATE_UP` | `0` | Keeps the slower experimental group-256 gate/up route disabled. |
 

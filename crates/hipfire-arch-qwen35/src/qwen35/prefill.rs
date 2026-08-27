@@ -3864,17 +3864,35 @@ fn batch_chunk_delta_net_attn(
                         )?;
                     }
                 } else {
-                    gpu.conv1d_silu_split_f32_n(
-                        &pbs.dn_q_raw_batch,
-                        &pbs.dn_k_raw_batch,
-                        &pbs.dn_v_batch,
-                        &pbs.dn_qkv_batch,
-                        &layer.conv_weight,
-                        &dn_state.conv_states[delta_layer_idx],
-                        k_dim,
-                        v_dim,
-                        n,
-                    )?;
+                    if gpu.flags.rdna3_gdn_conv_token_parallel
+                        && gpu.arch_caps.is_gfx1100()
+                        && !gpu.graphs.capture_mode
+                        && n >= 128
+                    {
+                        gpu.conv1d_silu_split_f32_n_parallel(
+                            &pbs.dn_q_raw_batch,
+                            &pbs.dn_k_raw_batch,
+                            &pbs.dn_v_batch,
+                            &pbs.dn_qkv_batch,
+                            &layer.conv_weight,
+                            &dn_state.conv_states[delta_layer_idx],
+                            k_dim,
+                            v_dim,
+                            n,
+                        )?;
+                    } else {
+                        gpu.conv1d_silu_split_f32_n(
+                            &pbs.dn_q_raw_batch,
+                            &pbs.dn_k_raw_batch,
+                            &pbs.dn_v_batch,
+                            &pbs.dn_qkv_batch,
+                            &layer.conv_weight,
+                            &dn_state.conv_states[delta_layer_idx],
+                            k_dim,
+                            v_dim,
+                            n,
+                        )?;
+                    }
                 }
 
                 // Fused L2-norm(Q) + scale(Q) + L2-norm(K) + repeat-interleave

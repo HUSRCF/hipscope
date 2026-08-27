@@ -78,6 +78,71 @@ extern "C" __global__ void conv1d_silu_split_f32(
     }
 }
 
+// Prefill sibling: parallelize the token axis. Causal depthwise convolution
+// depends on prior inputs, not prior outputs, so every (token, channel) result
+// is independent once the entry state is held unchanged. A second kernel
+// commits the final three inputs after all readers finish.
+extern "C" __global__ void conv1d_silu_split_f32_parallel(
+    float* __restrict__ q_out,
+    float* __restrict__ k_out,
+    float* __restrict__ v_out,
+    const float* __restrict__ input,
+    const float* __restrict__ weight,
+    const float* __restrict__ state,
+    int k_dim,
+    int v_dim,
+    int n_tokens
+) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    const int t = blockIdx.y;
+    const int n_channels = 2 * k_dim + v_dim;
+    if (c >= n_channels || t >= n_tokens) return;
+
+    const float x = input[(long long)t * n_channels + c];
+    const float s0 = t >= 1
+        ? input[(long long)(t - 1) * n_channels + c]
+        : state[c * 3];
+    const float s1 = t >= 2
+        ? input[(long long)(t - 2) * n_channels + c]
+        : state[c * 3 + (1 - t)];
+    const float s2 = t >= 3
+        ? input[(long long)(t - 3) * n_channels + c]
+        : state[c * 3 + (2 - t)];
+
+    const float y = weight[c * 4 + 3] * x + weight[c * 4 + 2] * s0
+                  + weight[c * 4 + 1] * s1 + weight[c * 4] * s2;
+    const float result = y / (1.0f + expf(-y));
+    if (c < k_dim) {
+        q_out[(long long)t * k_dim + c] = result;
+    } else if (c < 2 * k_dim) {
+        k_out[(long long)t * k_dim + c - k_dim] = result;
+    } else {
+        v_out[(long long)t * v_dim + c - 2 * k_dim] = result;
+    }
+}
+
+extern "C" __global__ void conv1d_commit_state_f32_parallel(
+    const float* __restrict__ input,
+    float* __restrict__ state,
+    int n_channels,
+    int n_tokens
+) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= n_channels || n_tokens <= 0) return;
+    const float old0 = state[c * 3];
+    const float old1 = state[c * 3 + 1];
+    const float last0 = input[(long long)(n_tokens - 1) * n_channels + c];
+    const float last1 = n_tokens >= 2
+        ? input[(long long)(n_tokens - 2) * n_channels + c]
+        : old0;
+    const float last2 = n_tokens >= 3
+        ? input[(long long)(n_tokens - 3) * n_channels + c]
+        : (n_tokens == 2 ? old0 : old1);
+    state[c * 3] = last0;
+    state[c * 3 + 1] = last1;
+    state[c * 3 + 2] = last2;
+}
+
 // Masked sibling: same conv1d + SiLU + Q/K/V split but lane-masked.
 // Derives physical lane from blockIdx.y (existing grid y) and returns before
 // any inactive-lane read/write. Full-mask callers use the unmasked

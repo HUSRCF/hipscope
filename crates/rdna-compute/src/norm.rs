@@ -4468,6 +4468,98 @@ impl Gpu {
         result
     }
 
+    /// Token-parallel prefill variant of [`Self::conv1d_silu_split_f32_n`].
+    #[cfg(feature = "deltanet")]
+    pub fn conv1d_silu_split_f32_n_parallel(
+        &mut self,
+        q_out: &GpuTensor,
+        k_out: &GpuTensor,
+        v_out: &GpuTensor,
+        input: &GpuTensor,
+        weight: &GpuTensor,
+        state: &GpuTensor,
+        k_dim: usize,
+        v_dim: usize,
+        n_tokens: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "conv1d_silu_split",
+            kernels::CONV1D_SILU_SPLIT_SRC,
+            "conv1d_silu_split_f32_parallel",
+        )?;
+        self.ensure_kernel(
+            "conv1d_silu_split",
+            kernels::CONV1D_SILU_SPLIT_SRC,
+            "conv1d_commit_state_f32_parallel",
+        )?;
+        let qp = q_out.buf.as_ptr();
+        let kp = k_out.buf.as_ptr();
+        let vp = v_out.buf.as_ptr();
+        let ip = input.buf.as_ptr();
+        let wp = weight.buf.as_ptr();
+        let sp = state.buf.as_ptr();
+        let kd = k_dim as i32;
+        let vd = v_dim as i32;
+        let nt = n_tokens as i32;
+        let n_channels = 2 * k_dim + v_dim;
+        let nc = n_channels as i32;
+        let block = 256u32;
+        let grid = ((n_channels as u32) + block - 1) / block;
+        let mut conv_params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &vp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &kd as *const _ as *mut c_void,
+            &vd as *const _ as *mut c_void,
+            &nt as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "conv1d_silu_split_f32_parallel",
+            [grid, n_tokens as u32, 1],
+            [block, 1, 1],
+            0,
+            &mut conv_params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(qp);
+                b.push_ptr(kp);
+                b.push_ptr(vp);
+                b.push_ptr(ip);
+                b.push_ptr(wp);
+                b.push_ptr(sp);
+                b.push_i32(kd);
+                b.push_i32(vd);
+                b.push_i32(nt);
+                b
+            },
+        )?;
+        let mut state_params: Vec<*mut c_void> = vec![
+            &ip as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &nc as *const _ as *mut c_void,
+            &nt as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "conv1d_commit_state_f32_parallel",
+            [grid, 1, 1],
+            [block, 1, 1],
+            0,
+            &mut state_params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ip);
+                b.push_ptr(sp);
+                b.push_i32(nc);
+                b.push_i32(nt);
+                b
+            },
+        )
+    }
+
     /// Independent-sequence decode variant of [`Self::conv1d_silu_split_f32_n`].
     /// Each row owns a distinct convolution ring; no token in one lane can
     /// advance another lane's state.
