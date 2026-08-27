@@ -150,3 +150,36 @@ bring-up tier.
 > properly; the dots.ocr arm's n-gram decode-loop abort break still falls
 > through to a done terminal (same class as §2.3, untested here — no dots
 > fixture deployed); `docs/VALIDATION.md` VL rows per parent spec §5.7.
+
+> **Follow-up landed same day (2026-08-27 audit pass): the think-splitting
+> debt is closed.** `generate_vl` decode emission now routes through the
+> shared text-path machinery — `EosFilter` (`qwen_ar_eos_filter_config`:
+> UTF-8 boundaries + `<|im_end|>`/`<|endoftext|>` suppression) →
+> `ThinkOutputRouter` (chunk-boundary-invariant channel split) → typed
+> `emit_visible_token` / `emit_reasoning_token` envelopes — at both emission
+> sites (main decode loop + think-cap force-close) with a `finish_into`
+> flush before the terminal, and `gen_start.started_in_think` now reflects
+> the real assistant prefix instead of a hardcoded false. This replaces the
+> hand-rolled byte emission that violated the v2 typed-channel contract the
+> opener itself claims (arch 5 advertises contract 2, under which the CLI
+> appends `token` text to `content` verbatim — no marker scan; the old
+> envelope also spliced the user-supplied `id` into the JSON unescaped —
+> the typed emitters escape it). The dots.ocr decode-loop abort now emits
+> the canonical cancelled pair + return instead of falling through to a
+> done terminal (§2.3 class; still live-untested — no dots fixture
+> deployed). Quantizer companion fix: `has_vision` latches only after every
+> name-based skip gate, so a gemma4 unified checkpoint quantized with
+> `--include-vision` can no longer record `has_vision: true` while the
+> gemma4 text-only gate drops every vision tensor. 5 unit tests cover the
+> routing (`vision::tests`). Verified over HTTP :6901 (daemon
+> `d4d63ce0…`, cli `25bedc84…`): thinking-on doge desc stream 363
+> reasoning / 31 content chunks, zero markers, answer correct (pre-fix
+> baseline same turn: 0 reasoning chunks, `</think>`+`<|im_end|>` in
+> content); non-stream separates `reasoning_content`, finish stop; doge OCR
+> 6/6 captions with content byte-identical to the pre-fix answer segment;
+> text math "391" unchanged at max_tokens=256; mid-decode kill → follow-up
+> in 1.03 s, no wedge; `run --image` stdio parity in a one-off container
+> (6/6 captions). Evidence:
+> `.codeinsight+research/qwen35-vl-audit-2026-08-27/RESULTS.md`. Still
+> owed, fail-closed: `docs/VALIDATION.md` VL rows per parent spec §5.7;
+> dots.ocr live abort probe.

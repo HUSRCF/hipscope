@@ -1698,12 +1698,6 @@ pub(crate) fn run() {
             skipped_params += n as u64;
             continue;
         }
-        if vision_group {
-            // include_vision is implied here. The tensor reaches the bottom-of-loop
-            // F16 fallback unchanged; this only records that the artifact carries a
-            // vision module, for the has_vision metadata flag (VL contract §4).
-            emitted_vision = true;
-        }
         // Gemma4 unified (arch 13): text-only bring-up — skip the vision/audio
         // towers + multimodal projectors; quantize only the text decoder.
         if gemma4_skip_non_lm && !name.starts_with("model.language_model.") {
@@ -1711,6 +1705,15 @@ pub(crate) fn run() {
             let n: usize = meta.shape.iter().product();
             skipped_params += n as u64;
             continue;
+        }
+        if vision_group {
+            // include_vision is implied here and every name-based skip gate
+            // (include-prefix, gemma4 text-only) is now past: this tensor
+            // genuinely reaches the bottom-of-loop F16 fallback. Only now may
+            // the has_vision metadata flag latch — setting it earlier would
+            // mark gemma4-unified artifacts `has_vision: true` while the
+            // gemma4 gate above silently drops every vision tensor.
+            emitted_vision = true;
         }
         // MTP (Multi-Token Prediction) head: pre-Phase-5 quants skipped these
         // because no forward path consumed them. deepseek4-q8-mtp is the first format

@@ -201,13 +201,20 @@ this section.
 - **Engine: generate-layer only** (`crates/hipfire-generate/src/vision.rs`,
   2026-08-27): VL entry points gained the `gen_start` stream opener and
   `generate_vl` gained client-cancel polls emitting the canonical cancelled
-  terminal pair — no carrier, kernel, or dispatch change; see
+  terminal pair; the same-day audit pass routed `generate_vl` decode
+  emission through the shared typed contract (EosFilter →
+  ThinkOutputRouter → `emit_visible_token`/`emit_reasoning_token`, both
+  emission sites + finish flush, honest `started_in_think`) and fixed the
+  dots.ocr decode-loop abort terminal — no carrier, kernel, or dispatch
+  change; see
   [`docs/specs/2026-08-27-qwen35-vl-vision-serve.md`](specs/2026-08-27-qwen35-vl-vision-serve.md).
 - `crates/hipfire-quantize/src/pipeline.rs` — the recipe items the shared
   contract needs: arch-11 `embed_tokens` routes through the mq4 bulk branch
   when an mq4 format requests it (tied head covered for free); the
   `multi_modal_projector` MLP joins the vision group; `has_vision` +
-  pixel-budget metadata emission per §4 as-built.
+  pixel-budget metadata emission per §4 as-built. `has_vision` latches
+  only after every name-based skip gate (include-prefix, gemma4 text-only)
+  so the flag always means "vision tensors actually emitted".
 - `crates/hipfire-quantize/src/model_filter.rs` — projector joins the
   never-quantize predicate (towers were already there).
 - Carrier items for the arch-11 sibling (`arch_mapping.rs` `lfm2_vl` → 11,

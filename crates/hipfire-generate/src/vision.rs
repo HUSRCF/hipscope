@@ -15,7 +15,8 @@ use hipfire_arch_qwen35::speculative;
 use hipfire_arch_qwen35_vl::image;
 use hipfire_arch_qwen35_vl::qwen35_vl;
 use hipfire_engine::emit::{
-    emit_active_attempt_error, emit_gen_start, emit_qwen_ar_cancelled, write_error,
+    emit_active_attempt_error, emit_gen_start, emit_qwen_ar_cancelled, emit_reasoning_token,
+    emit_visible_token, write_error,
 };
 use hipfire_engine::scheduler::block_attractor_unclosed_cpu;
 use hipfire_engine::terminal::{
@@ -23,6 +24,8 @@ use hipfire_engine::terminal::{
     ClientTerminalDecision,
 };
 use hipfire_loader::LoadedModel;
+use hipfire_runtime::emit_text::{ThinkOutputRouter, ThinkRouteEvent};
+use hipfire_runtime::eos_filter::{EosFilter, FilterAction};
 use hipfire_runtime::sampler::{self, SamplerConfig};
 use hipfire_runtime::spec::{PrefillOutcome, Speculator};
 use std::any::Any;
@@ -73,6 +76,63 @@ fn emit_committed_event(
         "attempt_id": active_attempt_id(),
     });
     let _ = writeln!(stdout, "{}", envelope);
+}
+
+/// Feed one decode-step's new bytes through the v2 typed emission contract:
+/// EosFilter (UTF-8 boundary + EOT marker suppression) → ThinkOutputRouter
+/// (think-channel split) → `token` / `reasoning` envelopes.
+///
+/// Arch 5/6 advertises `gen_start.contract_version = 2`, under which the CLI
+/// appends token text to `content` VERBATIM — no marker scan (complete.rs
+/// SemanticEventFold). The producer therefore owns think-splitting and marker
+/// suppression; before this helper the VL loop emitted every decoded byte as
+/// a bare token envelope, so image turns shipped the whole think block plus
+/// literal `</think>` / `<|im_end|>` markers inside `content` with zero
+/// `reasoning_content` (2026-08-27 ledger, post-thinking garble).
+///
+/// Mirrors `ar::qwen_ar_observe_and_route` minus the ToolOutputRouter: VL
+/// image turns carry no tool contract, so reserved-looking text stays visible
+/// instead of being buffered or failing closed.
+fn vl_route_decode_text(
+    stdout: &mut impl std::io::Write,
+    id: &str,
+    filter: &mut EosFilter,
+    think: &mut ThinkOutputRouter,
+    new_bytes: &[u8],
+) {
+    let bytes = match filter.observe(new_bytes) {
+        FilterAction::Emit(b) | FilterAction::EmitAndStop(b) => b,
+        FilterAction::Hold | FilterAction::Stop => return,
+    };
+    let Ok(text) = std::str::from_utf8(&bytes) else {
+        return;
+    };
+    let mut routed = Vec::new();
+    think.push_into(text, &mut routed);
+    for ev in routed {
+        match ev {
+            ThinkRouteEvent::Reasoning(t) => emit_reasoning_token(stdout, id, &t),
+            ThinkRouteEvent::Content(t) => emit_visible_token(stdout, id, &t),
+        }
+    }
+}
+
+/// Flush a trailing partial think marker as ordinary text in its current
+/// channel at end-of-generation — the same finish the text AR producer runs
+/// (`ThinkOutputRouter::finish_into` contract).
+fn vl_finish_think_routing(
+    stdout: &mut impl std::io::Write,
+    id: &str,
+    think: &mut ThinkOutputRouter,
+) {
+    let mut routed = Vec::new();
+    think.finish_into(&mut routed);
+    for ev in routed {
+        match ev {
+            ThinkRouteEvent::Reasoning(t) => emit_reasoning_token(stdout, id, &t),
+            ThinkRouteEvent::Content(t) => emit_visible_token(stdout, id, &t),
+        }
+    }
 }
 
 pub enum ImageSource<'a> {
@@ -328,7 +388,19 @@ pub fn generate_vl(
     // slot; 2026-08-27 ledger finding b). Text-path generate() has emitted
     // this since the e99583afa-class fixes.
     let gen_contract = crate::common::gen_start_contract_version_for_arch(m.arch_id);
-    emit_gen_start(stdout, params.id, false, gen_contract);
+    // started_in_think mirrors the ChatFrame builder's own conditions: the
+    // `<think>` opener lands in the prompt only for AssistantPrefix::OpenThink
+    // AND a tokenizer that carries the special token (the builder falls back
+    // to Plain otherwise). v2 consumers ignore the field, but the envelope
+    // stays honest for any contract that consults it.
+    let started_in_think = matches!(
+        params.assistant_prefix,
+        hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
+    ) && m
+        .tokenizer
+        .as_ref()
+        .is_some_and(|t| t.special_token_id("<think>").is_some());
+    emit_gen_start(stdout, params.id, started_in_think, gen_contract);
     // INVARIANT: all early returns before the `vision_forward` call (the
     // first expensive GPU allocation in this function) use `write_error`
     // and return without owning any GPU buffers. If you add a GPU
@@ -889,6 +961,14 @@ pub fn generate_vl(
     let mut generated = 0;
     let mut streamed_tokens: Vec<u32> = Vec::new();
     let mut emitted_bytes = 0usize;
+    // Typed-emission state for the v2 stream contract (see
+    // `vl_route_decode_text`): EosFilter owns UTF-8 boundaries + EOT marker
+    // suppression, ThinkOutputRouter owns the reasoning/content channel
+    // split. `emitted_bytes` above becomes the bytes-FED-to-filter cursor —
+    // the filter holds back partial UTF-8/marker tails internally, so the
+    // old valid-prefix arithmetic is gone.
+    let mut vl_filter = EosFilter::new(crate::ar::qwen_ar_eos_filter_config());
+    let mut vl_think = ThinkOutputRouter::new(started_in_think);
     // Think-depth tracking via token IDs (not UTF-8 rfind).
     // The previous implementation decoded the full streamed output to a
     // string and ran rfind on every token — O(N²) total, fragile to
@@ -991,22 +1071,8 @@ pub fn generate_vl(
 
         let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
         let new_bytes = &all_bytes[emitted_bytes..];
-        let valid_len = match std::str::from_utf8(new_bytes) {
-            Ok(_) => new_bytes.len(),
-            Err(e) => e.valid_up_to(),
-        };
-        if valid_len > 0 {
-            let text = std::str::from_utf8(&new_bytes[..valid_len]).unwrap();
-            let _ = writeln!(
-                stdout,
-                r#"{{"type":"token","id":"{}","text":{},"attempt_id":{}}}"#,
-                id,
-                serde_json::to_string(&text).unwrap_or_default(),
-                active_attempt_id()
-            );
-            let _ = stdout.flush();
-            emitted_bytes += valid_len;
-        }
+        emitted_bytes = all_bytes.len();
+        vl_route_decode_text(stdout, id, &mut vl_filter, &mut vl_think, new_bytes);
 
         if next_token == config.eos_token {
             break;
@@ -1164,22 +1230,17 @@ pub fn generate_vl(
 
                         let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
                         let new_bytes = &all_bytes[emitted_bytes..];
-                        let vl = match std::str::from_utf8(new_bytes) {
-                            Ok(_) => new_bytes.len(),
-                            Err(e) => e.valid_up_to(),
-                        };
-                        if vl > 0 {
-                            let text = std::str::from_utf8(&new_bytes[..vl]).unwrap();
-                            let _ = writeln!(
-                                stdout,
-                                r#"{{"type":"token","id":"{}","text":{},"attempt_id":{}}}"#,
-                                id,
-                                serde_json::to_string(&text).unwrap_or_default(),
-                                active_attempt_id()
-                            );
-                            let _ = stdout.flush();
-                            emitted_bytes += vl;
-                        }
+                        emitted_bytes = all_bytes.len();
+                        // Same typed routing as the main decode site: the
+                        // forced `</think>` closer is consumed by the router
+                        // (channel flips to content), never emitted literally.
+                        vl_route_decode_text(
+                            stdout,
+                            id,
+                            &mut vl_filter,
+                            &mut vl_think,
+                            new_bytes,
+                        );
                         generated += 1;
                     }
                     think_count = 0;
@@ -1294,6 +1355,10 @@ pub fn generate_vl(
             m.conversation_tokens.push(t);
         }
     }
+
+    // Flush any trailing partial think marker as ordinary text in its
+    // current channel (text-AR finish parity) before the terminal.
+    vl_finish_think_routing(stdout, id, &mut vl_think);
 
     let t_end = Instant::now();
     let total_s = t_end.duration_since(t0).as_secs_f64();
@@ -1832,10 +1897,14 @@ pub fn run_dots_ocr_ngram_loop(
         if generated >= max_tokens {
             break;
         }
-        // Decode-side cancel: stop early. The next request resets state at
-        // prefill, so no cross-request bleed; the caller restores bundle/spec.
+        // Decode-side cancel: emit the canonical cancelled pair and stop —
+        // falling through to the done handshake on an aborted attempt strands
+        // the serve admission guard (2026-08-27 ledger finding-c class; same
+        // rule as the prefill-cancel site above). The caller restores
+        // bundle/spec state on return; the next request resets at prefill.
         if check_abort(id) {
-            break;
+            emit_qwen_ar_cancelled(stdout, id, generated);
+            return;
         }
         // Context-overflow guard (matches generate_spec): one window writes up
         // to `block_size` KV slots.
@@ -2092,5 +2161,110 @@ pub fn generate_dots_ocr_text(
     match await_client_terminal_commit(stdout, id, &pending_done) {
         ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
         ClientTerminalDecision::Abort => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{vl_finish_think_routing, vl_route_decode_text};
+    use hipfire_runtime::emit_text::ThinkOutputRouter;
+    use hipfire_runtime::eos_filter::EosFilter;
+
+    /// Drive byte chunks through the VL typed-emission pipeline and collect
+    /// (channel, text) wire events parsed back from the JSONL lines.
+    fn drive(started_in_think: bool, chunks: &[&[u8]]) -> Vec<(String, String)> {
+        let mut filter = EosFilter::new(crate::ar::qwen_ar_eos_filter_config());
+        let mut think = ThinkOutputRouter::new(started_in_think);
+        let mut out = Vec::new();
+        for chunk in chunks {
+            vl_route_decode_text(&mut out, "t-id", &mut filter, &mut think, chunk);
+        }
+        vl_finish_think_routing(&mut out, "t-id", &mut think);
+        let out = String::from_utf8_lossy(&out);
+        out.lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .map(|v| {
+                (
+                    v.get("type").and_then(|t| t.as_str()).unwrap_or("").to_string(),
+                    v.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string(),
+                )
+            })
+            .collect()
+    }
+
+    fn joined(events: &[(String, String)], channel: &str) -> String {
+        events
+            .iter()
+            .filter(|(t, _)| t == channel)
+            .map(|(_, s)| s.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn thinking_turn_splits_reasoning_from_content() {
+        // OpenThink prefix: generation starts inside think (no opener in the
+        // generated bytes); closer flips to content; trailing EOT suppressed.
+        let events = drive(
+            true,
+            &[
+                b"The user wants a description.\n\n",
+                b"</think>\n\n",
+                b"A Shiba Inu dog naps on its back.",
+                b"<|im_end|>",
+            ],
+        );
+        assert_eq!(joined(&events, "reasoning"), "The user wants a description.\n\n");
+        assert_eq!(
+            joined(&events, "token"),
+            "A Shiba Inu dog naps on its back."
+        );
+        let all = events
+            .iter()
+            .map(|(_, s)| s.clone())
+            .collect::<String>();
+        assert!(!all.contains("</think>"), "closer leaked: {all:?}");
+        assert!(!all.contains("<|im_end|>"), "EOT leaked: {all:?}");
+    }
+
+    #[test]
+    fn marker_split_across_chunks_still_routes() {
+        // `</thi` + `nk>` arriving as separate decode deltas (token boundary)
+        // must not leak a partial marker as visible text.
+        let events = drive(true, &[b"plan</thi", b"nk>\nanswer", b"<|im_end|>"]);
+        assert_eq!(joined(&events, "reasoning"), "plan");
+        assert_eq!(joined(&events, "token"), "answer");
+    }
+
+    #[test]
+    fn plain_prefix_spontaneous_think_markers_route() {
+        // assistant_prefix=Plain and the model opens think itself.
+        let events = drive(
+            false,
+            &[b"<think>private</think>", b"\n\nvisible answer", b"<|im_end|>"],
+        );
+        assert_eq!(joined(&events, "reasoning"), "private");
+        assert_eq!(joined(&events, "token"), "visible answer");
+    }
+
+    #[test]
+    fn no_think_turn_is_pure_content() {
+        let events = drive(false, &[b"Pointy teeths wow.", b"<|im_end|>"]);
+        assert!(joined(&events, "reasoning").is_empty());
+        assert_eq!(joined(&events, "token"), "Pointy teeths wow.");
+    }
+
+    #[test]
+    fn hostile_request_id_stays_json_escaped() {
+        // The old hand-rolled envelope spliced `id` into the JSON unescaped;
+        // the typed emitters must survive a quote-bearing id.
+        let mut filter = EosFilter::new(crate::ar::qwen_ar_eos_filter_config());
+        let mut think = ThinkOutputRouter::new(false);
+        let mut out = Vec::new();
+        vl_route_decode_text(&mut out, "bad\"id\\", &mut filter, &mut think, b"text");
+        vl_finish_think_routing(&mut out, "bad\"id\\", &mut think);
+        let out = String::from_utf8_lossy(&out);
+        for line in out.lines() {
+            assert!(serde_json::from_str::<serde_json::Value>(line).is_ok(), "{line}");
+        }
     }
 }
