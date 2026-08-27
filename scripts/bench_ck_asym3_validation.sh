@@ -60,8 +60,6 @@ run_longbench() {
             --flash-attn-ck-lib "$SIDECAR"
             --flash-attn-ck-workspace-bytes "$WORKSPACE_BYTES"
         )
-    else
-        ck_args+=(--force-native-prefill)
     fi
     python3 "$ROOT/scripts/eval_gemma4_eseries.py" \
         --daemon "$DAEMON" --model "$MODEL" \
@@ -88,7 +86,7 @@ run_decode() {
                 --warmup 8 --gen "$DECODE_TOKENS" 2>&1 | tee -a "$log"
         else
             env -u HIPFIRE_FLASH_ATTN_CK_LIB -u HIPFIRE_FLASH_ATTN_CK_WORKSPACE_BYTES \
-                HIP_VISIBLE_DEVICES="$gpu_id" HIPFIRE_KV_MODE=asym3 HIPFIRE_FLASH_PREFILL=0 \
+                -u HIPFIRE_FLASH_PREFILL HIP_VISIBLE_DEVICES="$gpu_id" HIPFIRE_KV_MODE=asym3 \
                 "$BENCH" "$MODEL" --prefill "$DECODE_PREFILL" --prefill-runs 1 \
                 --warmup 8 --gen "$DECODE_TOKENS" 2>&1 | tee -a "$log"
         fi
