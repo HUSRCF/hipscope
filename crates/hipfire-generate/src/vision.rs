@@ -2076,7 +2076,6 @@ pub fn generate_dots_ocr_text(
     }
 }
 
-
 // ── LFM2-VL (arch 11) ────────────────────────────────────────────────────────
 //
 // SigLIP2-NaFlex tower + projector executed by `hipfire_arch_lfm2_vl`; the
@@ -2121,22 +2120,27 @@ fn expand_image_placeholders(
             .iter()
             .take(prepared.grid_rows * prepared.grid_cols)
             .enumerate()
-            .map(|(i, s)| (i / prepared.grid_cols + 1, i % prepared.grid_cols + 1, cfg.tokens_for_grid(s.gh(cfg), s.gw(cfg))))
+            .map(|(i, s)| {
+                (
+                    i / prepared.grid_cols + 1,
+                    i % prepared.grid_cols + 1,
+                    cfg.tokens_for_grid(s.gh(cfg), s.gw(cfg)),
+                )
+            })
             .collect()
     } else {
         Vec::new()
     };
 
-    if start_id.is_some() || multi_tile || end_id.is_some() {
-        body.push(start_id.ok_or("tokenizer missing <|image_start|>")?);
-    } else {
-        // single-tile path without any wrapper tokens (defensive branch)
-    }
+    // HF's processor ALWAYS wraps the placeholder run in <|image_start|> …
+    // <|image_end|> (single-tile included — pinned source §1.5), so both
+    // markers are unconditionally required from the tokenizer.
+    body.push(start_id.ok_or("tokenizer missing <|image_start|>")?);
 
     if multi_tile {
         for &(row, col, ntok) in &tiles {
             let marker = special(&format!("<|img_row_{row}_col_{col}|>"))
-                .ok_or_else(|| format!("tokenizer missing <|img_row_{row}_col_{col}|>") )?;
+                .ok_or_else(|| format!("tokenizer missing <|img_row_{row}_col_{col}|>"))?;
             body.push(marker);
             for _ in 0..ntok {
                 body.push(image_token_id);
@@ -2202,7 +2206,14 @@ pub fn generate_lfm2_vl(
         ..
     } = *params;
     if m.tokenizer.is_none() {
-        emit_active_attempt_error(stdout, Some(id), "tokenizer not loaded", "validation", false, false);
+        emit_active_attempt_error(
+            stdout,
+            Some(id),
+            "tokenizer not loaded",
+            "validation",
+            false,
+            false,
+        );
         return;
     }
     let vision_cfg = match m.lfm2_vision() {
@@ -2224,6 +2235,11 @@ pub fn generate_lfm2_vl(
     // HTTP gate rejects a `token` that arrives without gen_start first.
     let gen_contract = crate::common::gen_start_contract_version_for_arch(m.arch_id);
     emit_gen_start(stdout, id, false, gen_contract);
+
+    // Full-turn clock: preprocess + tower encode + prefill + decode. The
+    // tower dominates image turns (~7–10 s of the ~22 s wall on gfx1101),
+    // so a total that excludes it would misreport the turn.
+    let t_turn = Instant::now();
 
     // ── Preprocess (CPU decode + resize/split/thumbnail) ──
     let prepared = match image_source {
@@ -2294,19 +2310,17 @@ pub fn generate_lfm2_vl(
         let template = m.chat_template.as_ref();
         let user_content = format!("<image>{prompt}");
         let rendered = match template {
-            Some(template) => {
-                hipfire_runtime::prompt_frame::JinjaChatFrame {
-                    tokenizer,
-                    template,
-                    system: system_prompt,
-                    user: &user_content,
-                    enable_thinking: max_think_tokens != 1,
-                    bos_token: None,
-                    reasoning_strength: None,
-                    reasoning_effort: None,
-                }
-                .render()
+            Some(template) => hipfire_runtime::prompt_frame::JinjaChatFrame {
+                tokenizer,
+                template,
+                system: system_prompt,
+                user: &user_content,
+                enable_thinking: max_think_tokens != 1,
+                bos_token: None,
+                reasoning_strength: None,
+                reasoning_effort: None,
             }
+            .render(),
             None => Err("no chat template embedded in artifact".to_string()),
         };
         match rendered {
@@ -2380,7 +2394,25 @@ pub fn generate_lfm2_vl(
             return;
         }
     };
-    debug_assert_eq!(visual_tokens.len(), n_visual_tokens * vision_cfg.out_hidden_size);
+    // Release-mode fail-closed length check (the narrow spec §2.3 claims
+    // "fails loud BEFORE splicing"): debug_assert compiles out in release,
+    // and a mismatch would otherwise panic the daemon on the emb slice below
+    // instead of erroring the request. Unreachable while the splitter and
+    // the tower share tokens_for_grid, but the splice must not trust that
+    // by accident.
+    if visual_tokens.len() != n_visual_tokens * vision_cfg.out_hidden_size {
+        write_error(
+            stdout,
+            id,
+            &format!(
+                "vision/projector row mismatch: {} floats for {} tokens × {} dims",
+                visual_tokens.len(),
+                n_visual_tokens,
+                vision_cfg.out_hidden_size
+            ),
+        );
+        return;
+    }
 
     // EOS-class stop set (verbatim rationale lives at the text path copy).
     let stop_toks: Vec<u32> = {
@@ -2398,6 +2430,7 @@ pub fn generate_lfm2_vl(
 
     // ── Prefill with visual embeddings spliced at placeholder positions ──
     let mut last_logits: Vec<f32> = Vec::new();
+    let prefill_t0 = Instant::now();
     {
         let b = m.lfm2moe_mut().unwrap();
         let cfg_t = &b.config;
@@ -2408,14 +2441,28 @@ pub fn generate_lfm2_vl(
         let mut position = state.n_tokens as u32;
         for &tok in &prompt_ids {
             if check_abort(id) {
-                break;
+                // Client-cancel poll (mirrors the generate_vl hardening on
+                // feat/qwen35-vl): the vision-encode phase before this loop
+                // cannot be interrupted mid-kernel, so prefill is where an
+                // abort signalled during the tower takes effect. Emit the
+                // canonical cancelled pair and return — breaking out here
+                // would fall through to the decode loop relying on its
+                // top-of-loop abort check to avoid sampling empty logits,
+                // and would push the full prompt into conversation_tokens
+                // against a partially-filled KV.
+                emit_qwen_ar_cancelled(stdout, id, 0);
+                return;
             }
             let res = if tok == image_token_id && vis_idx < n_visual_tokens {
                 let emb = &visual_tokens[vis_idx * dim..(vis_idx + 1) * dim];
                 vis_idx += 1;
-                hipfire_arch_lfm2moe::forward::prefill_embed_step(cfg_t, weights, state, gpu, emb, position)
+                hipfire_arch_lfm2moe::forward::prefill_embed_step(
+                    cfg_t, weights, state, gpu, emb, position,
+                )
             } else {
-                hipfire_arch_lfm2moe::forward::decode_step(cfg_t, weights, state, gpu, tok, position)
+                hipfire_arch_lfm2moe::forward::decode_step(
+                    cfg_t, weights, state, gpu, tok, position,
+                )
             };
             match res {
                 Ok(logits) => last_logits = logits,
@@ -2430,6 +2477,7 @@ pub fn generate_lfm2_vl(
     for &tok in &prompt_ids {
         m.conversation_tokens.push(tok);
     }
+    let prefill_ms = prefill_t0.elapsed().as_millis().max(1);
 
     // ── Decode loop (identical sampling/stop semantics to generate_lfm2moe) ──
     let seed = std::time::SystemTime::now()
@@ -2440,7 +2488,6 @@ pub fn generate_lfm2_vl(
 
     let mut generated_count: usize = 0;
     let decode_t0 = Instant::now();
-    let t_total = Instant::now();
     loop {
         if check_abort(id) {
             eprintln!("[daemon/vl-lfm2] aborted mid-decode");
@@ -2455,7 +2502,10 @@ pub fn generate_lfm2_vl(
             break;
         }
         let frag = m.tokenizer.as_ref().unwrap().decode(&[next_tok]);
-        if matches!(frag.trim(), "<|endoftext|>" | "</s>" | "<|im_end|>" | "<|startoftext|>") {
+        if matches!(
+            frag.trim(),
+            "<|endoftext|>" | "</s>" | "<|im_end|>" | "<|startoftext|>"
+        ) {
             break;
         }
         let envelope = serde_json::json!({
@@ -2520,7 +2570,8 @@ pub fn generate_lfm2_vl(
         "id": id,
         "tokens": generated_count,
         "tok_s": (tok_s * 100.0).round() / 100.0,
-        "total_ms": t_total.elapsed().as_millis().max(1),
+        "prefill_ms": prefill_ms,
+        "total_ms": t_turn.elapsed().as_millis().max(1),
         "attempt_id": active_attempt_id(),
     });
     match await_client_terminal_commit(stdout, id, &pending_done) {

@@ -42,6 +42,25 @@ yet — VL quality claims stay fail-closed `unknown surface` until a row lands.
 > in ~22 s, **and client-disconnect mid-image-turn frees the slot instantly**
 > (immediate follow-up answers) — findings (b)+(c) closed for arch 11.
 > Bring-up tier only: no perf numbers claimed, no VALIDATION.md rows claimed.
+>
+> **Audit addendum (2026-08-27 evening).** Branch audited end-to-end; design
+> upheld, five hardening fixes landed on top: the visual/projector row-count
+> check before splicing is now a release-mode fail-closed error (§2.3 always
+> claimed "fails loud"; `debug_assert` compiled out in release), prefill
+> client-cancel emits the canonical cancelled pair and returns immediately
+> (mirrors the generate_vl hardening on `feat/qwen35-vl` 84fb32dd — no more
+> break-and-fall-through past an empty-logits hazard), the done envelope
+> carries `prefill_ms` + a full-turn `total_ms` (tower phase included), the
+> dead "defensive" wrapper-marker branch in `expand_image_placeholders` is
+> gone (§1.5: markers always required), and the daemon's VL-dispatch reset
+> guard gained its missing lfm2moe arm (stale "only arch 5|6/8" comment
+> corrected; HTTP-dormant because serve resets per-request for
+> non-cache-capable lfm2 — defense-in-depth for raw JSONL multi-turn).
+> Revalidated container-isolated: text 391 ✓, doge six-caption exact ledger
+> match ✓, scene_2 brands ✓, disconnect-mid-image-turn frees the slot with a
+> clean follow-up ✓, and an old-vs-new A/B container showed byte-identical
+> greedy output (no behavioral drift). Evidence:
+> `.codeinsight+research/lfm2-vl-audit-2026-08-27/RESULTS.md`.
 
 ## 0. Goal and scope
 
