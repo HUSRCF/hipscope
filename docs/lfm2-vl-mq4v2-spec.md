@@ -20,10 +20,12 @@ Target checkpoint: `LiquidAI/LFM2.5-VL-3B` (`model_type: lfm2_vl`)
 > host-dequant (`weight_backend::dequant_f32` qt44 arm) rather than falling
 > back to Q8. Image requests fail closed ("model has no vision encoder").
 >
-> **Not yet built:** all of §3.3–3.4 (the `hipfire-arch-lfm2-vl` crate,
-> projector wiring, VL forward) — a `lfm2_vl` artifact therefore serves
-> text-only; the image fail-closed above is that contract's live proof.
-> Full §6 vision acceptance awaits the crate.
+> **§3.3–3.4 as-built (later the same day):** the `hipfire-arch-lfm2-vl`
+> crate, projector wiring, VL forward and prompt splice are now implemented
+> per [`docs/specs/2026-08-27-lfm2-vl-vision-runtime.md`](specs/2026-08-27-lfm2-vl-vision-runtime.md)
+> — image turns run end-to-end locally and over HTTP on gfx1101. This spec's
+> acceptance §6.4 structural-image clause is thereby met; vision-quality
+> parity remains gated behind future `docs/VALIDATION.md` VL rows.
 
 ## 0. Goal
 
