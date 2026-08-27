@@ -2925,17 +2925,24 @@ impl Gpu {
         self.bind_thread()?;
 
         let use_fast = !dn_requant_per_token();
-        let kernel_name = if use_fast {
+        let use_dpp = use_fast && self.arch_caps.is_gfx1100() && self.flags.rdna3_gdn_dpp_prefill;
+        let kernel_name = if use_dpp {
+            "gated_delta_net_q8_fast_dpp_gfx1100"
+        } else if use_fast {
             "gated_delta_net_q8_fast"
         } else {
             "gated_delta_net_q8"
         };
-        let kernel_src = if use_fast {
+        let kernel_src = if use_dpp {
+            kernels::GATED_DELTA_NET_Q8_FAST_DPP_GFX1100_SRC
+        } else if use_fast {
             kernels::GATED_DELTA_NET_Q8_FAST_SRC
         } else {
             kernels::GATED_DELTA_NET_Q8_SRC
         };
-        let kernel_fn = if use_fast {
+        let kernel_fn = if use_dpp {
+            "gated_delta_net_q8_fast_dpp_gfx1100"
+        } else if use_fast {
             "gated_delta_net_q8_fast"
         } else {
             "gated_delta_net_q8"
@@ -2989,7 +2996,7 @@ impl Gpu {
                 &mut efp as *mut _ as *mut c_void,
             ];
             self.launch_maybe_blob(
-                "gated_delta_net_q8_fast",
+                kernel_fn,
                 [n_heads as u32, n_tiles, 1],
                 [32, 1, 1],
                 0,

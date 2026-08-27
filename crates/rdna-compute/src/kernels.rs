@@ -5057,6 +5057,13 @@ pub const GATED_DELTA_NET_Q8_SRC: &str =
 pub const GATED_DELTA_NET_Q8_FAST_SRC: &str =
     include_str!("../../../kernels/src/gated_delta_net_q8_fast.hip");
 
+/// gfx1100 prefill experiment: preserve the fast GDN geometry and arithmetic
+/// while lowering the two wave reductions to DPP/permlane instructions.
+pub const GATED_DELTA_NET_Q8_FAST_DPP_GFX1100_SRC: &str = concat!(
+    "#define HIPFIRE_GFX1100_GDN_DPP_REDUCE 1\n#define HIPFIRE_GDN_KERNEL gated_delta_net_q8_fast_dpp_gfx1100\n",
+    include_str!("../../../kernels/src/gated_delta_net_q8_fast.hip")
+);
+
 /// Decode-only compact-QK variants for Qwen3.5 DeltaNet GQA (16 Q/K heads,
 /// 32 value/state heads). Each pair of state heads reads one normalized Q/K
 /// head directly, eliminating the materializing repeat-interleave launch.

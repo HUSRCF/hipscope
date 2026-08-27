@@ -108,6 +108,10 @@ pub struct FeatureFlags {
     /// Fuse batched GDN output normalization with the following MQ rotation
     /// for even collections of 128-value heads. Certified default on gfx1100.
     pub rdna3_gdn_norm_rotate_batched: bool,
+    /// Use gfx1100 DPP/permlane reductions in sequential GDN prefill. The
+    /// reduction order matches the certified shuffle tree; explicit `0`
+    /// retains the portable shuffle implementation.
+    pub rdna3_gdn_dpp_prefill: bool,
     pub fp8_wmma: bool,
     pub dot2_gemv: bool,
     pub gcn5_wave64_hybrid: Option<bool>,
@@ -505,6 +509,8 @@ impl FeatureFlags {
                 == Ok("1"),
             rdna3_gdn_norm_rotate_batched: parse_bool("HIPFIRE_GATED_NORM_MQ_ROTATE_BATCHED")
                 .unwrap_or(arch == "gfx1100"),
+            rdna3_gdn_dpp_prefill: parse_bool("HIPFIRE_GFX1100_GDN_DPP")
+                .unwrap_or(arch == "gfx1100"),
             fp8_wmma: value("HIPFIRE_FP8_WMMA").map_or(false, |v| v == "1"),
             dot2_gemv: value("HIPFIRE_DOT2_GEMV").map_or(false, |v| v == "1"),
             gcn5_wave64_hybrid: parse_bool("HIPFIRE_GCN5_WAVE64_HYBRID"),
@@ -803,6 +809,7 @@ impl FeatureFlags {
             rdna3_fused_swiglu_q8_group128: false,
             rdna3_ffn_f16_intermediate: false,
             rdna3_gdn_norm_rotate_batched: false,
+            rdna3_gdn_dpp_prefill: false,
             fp8_wmma: false,
             dot2_gemv: false,
             gcn5_wave64_hybrid: None,
@@ -1006,6 +1013,26 @@ mod tests {
             }
         });
         assert!(!flags.rdna3_gdn_norm_rotate_batched);
+    }
+
+    #[test]
+    fn gdn_dpp_prefill_defaults_only_on_gfx1100() {
+        let gfx1100 = FeatureFlags::from_lookup("gfx1100", |_| Err(()));
+        let gfx1201 = FeatureFlags::from_lookup("gfx1201", |_| Err(()));
+        assert!(gfx1100.rdna3_gdn_dpp_prefill);
+        assert!(!gfx1201.rdna3_gdn_dpp_prefill);
+    }
+
+    #[test]
+    fn gdn_dpp_prefill_accepts_explicit_disable() {
+        let flags = FeatureFlags::from_lookup("gfx1100", |name| {
+            if name == "HIPFIRE_GFX1100_GDN_DPP" {
+                Ok("0".to_owned())
+            } else {
+                Err(())
+            }
+        });
+        assert!(!flags.rdna3_gdn_dpp_prefill);
     }
 
     #[test]

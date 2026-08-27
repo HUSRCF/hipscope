@@ -148,6 +148,7 @@ preserved.
 | Variable | Bundle default | Notes |
 |---|---:|---|
 | `HIPFIRE_FLASH_ATTN_CK_QUANTIZED_LIB` | bundled `.so` path | Loads the optional staged Asym3-K/Q8-V CK prefill sidecar. |
+| `HIPFIRE_GFX1100_GDN_DPP` | `1` | Uses exact DPP/permlane reductions for sequential GDN prefill on gfx1100; set to `0` to retain the portable shuffle path. |
 | `HIPFIRE_RDNA3_HFQ4_GATE_UP_X256Y64` | `1` | Uses the validated X256/Y64 gate/up packed-MQ4 route. |
 | `HIPFIRE_RDNA3_HFQ4_RESIDUAL_X256Y64` | `1` | Uses the validated X256/Y64 residual/down route. |
 | `HIPFIRE_RDNA3_HFQ4_AUX_X256Y64` | `1` | Uses the corresponding auxiliary projection route. |
