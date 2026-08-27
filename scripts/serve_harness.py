@@ -304,9 +304,18 @@ def build_config(args):
             selected_budget = "uncapped"
         else:
             selected_budget = "med"
-    think_cap = THINKING_BUDGET.get(selected_budget)
-    if think_cap is None:
+    named_think_cap = THINKING_BUDGET.get(selected_budget)
+    if named_think_cap is None:
         sys.exit(f"thinking_budget {selected_budget!r} not a key of {list(THINKING_BUDGET)}")
+    request_think_cap = getattr(args, "max_think_tokens", None)
+    if request_think_cap is not None and request_think_cap < 0:
+        sys.exit("--max-think-tokens must be >= 0")
+    think_cap = request_think_cap if request_think_cap is not None else named_think_cap
+    think_cap_source = (
+        "explicit(--max-think-tokens)"
+        if request_think_cap is not None
+        else f"named-budget({selected_budget})"
+    )
     draft = getattr(args, "draft", None)
     if draft:
         draft = os.path.abspath(os.path.expanduser(draft))
@@ -404,7 +413,10 @@ def build_config(args):
         "mtp_ngram_min": mtp_ngram_min,
         "mtp_ngram_max": mtp_ngram_max,
         "draft": draft,
-        "thinking_budget": selected_budget, "thinking_cap_tokens": think_cap,
+        "thinking_budget": selected_budget,
+        "thinking_cap_tokens": think_cap,
+        "thinking_cap_source": think_cap_source,
+        "request_max_think_tokens": request_think_cap,
         "max_tokens": max_tokens,
         "max_tokens_source": max_tokens_source,
         "sampling": samp, "sampling_source": samp_src,
@@ -491,11 +503,11 @@ def show_config(cfg):
     prompt_source = cfg.get("prompt_file") or cfg.get("prompts_file") or cfg.get("niah_file") or "(built-in battery)"
     print(f"  seed          : {cfg.get('seed')}   prompt_source: {prompt_source}")
     _cap = cfg['thinking_cap_tokens']
-    _thinking_off = cfg['thinking_budget'] == 'off'
+    _thinking_off = _cap == 1
     _resolved = ('thinking DISABLED (sentinel cap 1)' if _thinking_off
                  else 'uncapped' if _cap == 0
                  else f'{_cap} tok (CONCRETE cap)')
-    print(f"  thinking_budget: {cfg['thinking_budget']} -> {_resolved}")
+    print(f"  thinking_cap  : {_resolved} [{cfg['thinking_cap_source']}]")
     print(f"  reasoning_effort: {cfg['sampling'].get('reasoning_effort', 'auto')}"
           "  (parent prompt semantics; independent of cap)")
     _note = ('no think block emitted' if _thinking_off
@@ -1706,6 +1718,7 @@ def _self_test_thinking_effort():
             draft=None,
             thinking=None,
             thinking_effort=None,
+            max_think_tokens=None,
             max_tokens=None,
             max_seq=None,
             sampling="greedy",
@@ -1740,6 +1753,23 @@ def _self_test_thinking_effort():
     assert cfg["sampling"]["reasoning_effort"] == "medium"
     assert cfg["thinking_budget"] == "high"
     assert cfg["thinking_cap_tokens"] == THINKING_BUDGET["high"]
+
+    # The exact per-turn numeric cap is independent of semantic effort and
+    # overrides the named budget only on the request wire.
+    cfg = build_config(
+        _ns(
+            thinking_effort="medium",
+            thinking="low",
+            max_think_tokens=4096,
+        )
+    )
+    assert cfg["sampling"]["reasoning_effort"] == "medium"
+    assert cfg["thinking_budget"] == "low"
+    assert cfg["thinking_cap_tokens"] == 4096
+    assert cfg["thinking_cap_source"] == "explicit(--max-think-tokens)"
+    assert cfg["request_max_think_tokens"] == 4096
+    body = _request_body(cfg, [{"role": "user", "content": "test"}])
+    assert body["max_think_tokens"] == 4096
 
     print("serve_harness: thinking-effort self-test OK", flush=True)
 
@@ -2366,14 +2396,26 @@ def _run_glimmer_cache_tool_session(cfg, args, scenario):
 
 
 
-def send(cfg, messages, tools=None):
-    body = {"model": cfg["model"], "messages": messages, "max_tokens": cfg["max_tokens"],
-            "stream": True, "stream_options": {"include_usage": True}}
+def _request_body(cfg, messages, tools=None):
+    body = {
+        "model": cfg["model"],
+        "messages": messages,
+        "max_tokens": cfg["max_tokens"],
+        "stream": True,
+        "stream_options": {"include_usage": True},
+    }
     body.update(cfg["sampling"])
+    if cfg.get("request_max_think_tokens") is not None:
+        body["max_think_tokens"] = cfg["request_max_think_tokens"]
     if cfg.get("seed") is not None:
         body["seed"] = cfg["seed"]
     if tools is not None:
         body["tools"] = tools
+    return body
+
+
+def send(cfg, messages, tools=None):
+    body = _request_body(cfg, messages, tools)
     # Exact bytes sent for md5 (AGENTS.md discipline: byte-identical prompts + request identity)
     body_bytes = json.dumps(body, ensure_ascii=False).encode("utf-8")
     request_md5 = hashlib.md5(body_bytes).hexdigest()
@@ -2772,6 +2814,14 @@ def main():
                     help="explicit reasoning cap policy. Default: registry thinking_budget; "
                          "otherwise uncapped for an explicit effort, med for legacy callers. "
                          "\"off\" disables thinking (cap sentinel 1).")
+    ap.add_argument(
+        "--max-think-tokens",
+        type=int,
+        default=None,
+        help="exact per-request reasoning cap sent as max_think_tokens; "
+             "independent of --thinking-effort and overrides the named --thinking cap "
+             "(0=uncapped, 1=disabled, >=2=force-close at that token count)",
+    )
     ap.add_argument("--max-tokens", type=int, default=None,
                     help="generation cap; omitted resolves canonical-tag policy then 2048")
     ap.add_argument("--max-seq", type=int, default=None,
@@ -2868,15 +2918,15 @@ def main():
         return
     # `off` resolves to the sentinel cap 1, which is not a real think budget — no
     # think block is emitted at all, so the think-only-output guard does not apply.
-    if (cfg['thinking_budget'] != 'off'
+    if (cfg['thinking_cap_tokens'] != 1
             and cfg['thinking_cap_tokens']
             and cfg['max_tokens'] <= cfg['thinking_cap_tokens']):
         sys.exit(
-            f"serve_harness: max_tokens ({cfg['max_tokens']}) <= thinking budget "
-            f"'{cfg['thinking_budget']}' ({cfg['thinking_cap_tokens']} tok) guarantees "
+            f"serve_harness: max_tokens ({cfg['max_tokens']}) <= thinking cap "
+            f"({cfg['thinking_cap_tokens']} tok from {cfg['thinking_cap_source']}) guarantees "
             f"think-only output with zero visible answer. Raise --max-tokens above "
-            f"{cfg['thinking_cap_tokens']}, lower --thinking (low={THINKING_BUDGET['low']}), "
-            f"or use --thinking uncapped."
+            f"{cfg['thinking_cap_tokens']}, lower --max-think-tokens/--thinking, "
+            "or use --max-think-tokens 0."
         )
     log_offset = 0
     if not args.no_spawn:
