@@ -14,7 +14,9 @@ use hipfire_arch_qwen35::qwen35;
 use hipfire_arch_qwen35::speculative;
 use hipfire_arch_qwen35_vl::image;
 use hipfire_arch_qwen35_vl::qwen35_vl;
-use hipfire_engine::emit::{emit_active_attempt_error, emit_qwen_ar_cancelled, write_error};
+use hipfire_engine::emit::{
+    emit_active_attempt_error, emit_gen_start, emit_qwen_ar_cancelled, write_error,
+};
 use hipfire_engine::scheduler::block_attractor_unclosed_cpu;
 use hipfire_engine::terminal::{
     active_attempt_id, await_client_terminal_commit, check_abort, emit_staged_terminal_done,
@@ -319,6 +321,14 @@ pub fn generate_vl(
     stdout: &mut std::io::Stdout,
     params: &GenerateVLParams,
 ) {
+    // Stream-contract opener. MUST be the first event on this request's
+    // stream: the HTTP CLI's StreamContractGate rejects any later event that
+    // arrives without a preceding gen_start for this id — which stranded
+    // image turns after the encoder finished ("no response bytes", wedged
+    // slot; 2026-08-27 ledger finding b). Text-path generate() has emitted
+    // this since the e99583afa-class fixes.
+    let gen_contract = crate::common::gen_start_contract_version_for_arch(m.arch_id);
+    emit_gen_start(stdout, params.id, false, gen_contract);
     // INVARIANT: all early returns before the `vision_forward` call (the
     // first expensive GPU allocation in this function) use `write_error`
     // and return without owning any GPU buffers. If you add a GPU
@@ -1310,6 +1320,13 @@ pub fn generate_vl_dots_ocr(
     params: &GenerateVLParams,
 ) {
     use hipfire_arch_dots_ocr::image as dots_image;
+    // Stream-contract opener — same HTTP-gate rationale as generate_vl above.
+    emit_gen_start(
+        stdout,
+        params.id,
+        false,
+        crate::common::gen_start_contract_version_for_arch(m.arch_id),
+    );
     let t0 = Instant::now();
     let GenerateVLParams {
         id,
