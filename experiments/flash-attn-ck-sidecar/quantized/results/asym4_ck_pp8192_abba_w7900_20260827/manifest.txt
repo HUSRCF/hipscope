@@ -1,0 +1,12 @@
+date=2026-08-27T22:57:39+08:00
+git_commit=4174c47b47da4f0d212f6dcc8f35b82b5e2bbf95
+gpu_id=0
+prefill_tokens=8192
+prefill_runs=3
+trials=3
+kv_mode=asym4
+partials_batch=64
+model_sha256=86a5f80fd29d545abb1093dead242725ced6d68b8607c6d566d897b1a82442dc
+binary_sha256=8ebc00541fc5a3f871a087c7f9fe49f1d037ebd41add8aa25d5a3588061d164e
+ck_lib_sha256=e17fda8d5ff1411698e3baf327249231f398431db4b6dac1c81cdf38130b61d6
+harness_sha256=0d00c7d26bbd7762090e4f72c9cabf59cf71de5679d5b3adff8b7711b7cd7b0e

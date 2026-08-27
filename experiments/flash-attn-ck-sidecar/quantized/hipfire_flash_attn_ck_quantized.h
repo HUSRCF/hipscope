@@ -92,6 +92,18 @@ int hipfire_flash_attn_ck_quantized_staged_prefill(
     char* error,
     size_t error_capacity);
 
+// Givens-Asym4 K + Q8 V route. It shares the v1 prefill parameter layout and
+// staged workspace sizing, but validates the independent 132-byte K-head ABI.
+int hipfire_flash_attn_ck_asym4_staged_supported(
+    const struct hipfire_flash_attn_ck_quantized_prefill_params* params,
+    char* error,
+    size_t error_capacity);
+
+int hipfire_flash_attn_ck_asym4_staged_prefill(
+    const struct hipfire_flash_attn_ck_quantized_prefill_params* params,
+    char* error,
+    size_t error_capacity);
+
 int hipfire_flash_attn_ck_quantized_prefill_supported(
     const struct hipfire_flash_attn_ck_quantized_prefill_params* params,
     char* error,

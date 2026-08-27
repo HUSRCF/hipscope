@@ -96,6 +96,17 @@ An independent Asym4 loader ABI decodes each physical `(position, kv_head)`
 exactly once into dense FP16 K/V staging. Givens-Asym4 and FWHT4 use the same
 loader because their packed K caches already contain transformed coordinates;
 the corresponding Q transform remains a separate attention-front-end concern.
+The Givens-Asym4 production route activates automatically when a compatible
+sidecar is explicitly loaded and the validated D256 24Q/4KV prefill contract
+matches. It requires a 64-row flash-partials allocation at PP2048 and above;
+the reusable PP8192 A/B harness selects that capacity for Asym4.
+
+On W7900, three alternating PP8192 process pairs measured scalar Asym4 versus
+the staged CK route at `632.9 -> 1243.1`, `629.7 -> 1240.1`, and
+`629.6 -> 1237.2 tok/s`. The paired-median speedup was **1.9651x** with 3/3
+positive pairs and identical greedy token sequences. Decode remained neutral
+at about `33.3-33.5 tok/s`. Raw evidence is under
+`results/asym4_ck_pp8192_abba_w7900_20260827/`.
 
 At Q=2048 with 24 query heads, 4 KV heads, and D256, the complete reusable
 workspace (rotated Q, FP16 output, dense K, and dense V) is about 59/67/75/84

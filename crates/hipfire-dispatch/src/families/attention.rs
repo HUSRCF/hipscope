@@ -714,6 +714,27 @@ fn dispatch_attend(
             let ct = io.givens_cos.unwrap();
             let st = io.givens_sin.unwrap();
             let fp = io.flash_partials.unwrap();
+            if hipfire_config::developer_var("HIPFIRE_ASYM4_WMMA").as_deref() == Ok("0") {
+                return hip!(gpu.attention_flash_asym4_batched_masked(
+                    io.q,
+                    io.k_cache,
+                    io.v_cache,
+                    io.output,
+                    io.positions(),
+                    ct,
+                    st,
+                    io.n_heads,
+                    io.n_kv_heads,
+                    io.head_dim,
+                    io.physical_cap,
+                    io.max_ctx_len,
+                    io.batch_size,
+                    fp,
+                    io.tree_bias,
+                    io.block_start,
+                    io.block_cols,
+                ));
+            }
             hip!(gpu.attention_flash_asym4_wmma_tile_batched(
                 io.q,
                 io.k_cache,

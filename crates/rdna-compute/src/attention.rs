@@ -5463,6 +5463,99 @@ impl Gpu {
         )
     }
 
+    #[cfg(feature = "flash-attn-ck")]
+    #[allow(clippy::too_many_arguments)]
+    fn try_attention_flash_asym4_ck(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        cos_theta: &GpuTensor,
+        sin_theta: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+        partials: &GpuTensor,
+        tree_bias: Option<&GpuTensor>,
+        block_start: usize,
+        block_cols: usize,
+    ) -> HipResult<bool> {
+        if self.graphs.capture_mode
+            || tree_bias.is_some()
+            || block_start != 0
+            || block_cols != 0
+            || batch_size < 128
+            || n_heads != 24
+            || n_kv_heads != 4
+            || head_dim != 256
+        {
+            return Ok(false);
+        }
+        let Some(sidecar) = self.flash_attn_ck_quantized.as_ref() else {
+            return Ok(false);
+        };
+        use crate::flash_attn_ck::FlashAttnCkQuantizedPrefillParams;
+
+        let required = sidecar.staged_workspace_bytes(
+            batch_size as i32,
+            max_ctx_len as i32,
+            n_heads as i32,
+            n_kv_heads as i32,
+            head_dim as i32,
+        );
+        if !required.is_some_and(|bytes| bytes > 0 && partials.buf.size() >= bytes) {
+            return Ok(false);
+        }
+        let mut params = FlashAttnCkQuantizedPrefillParams::new();
+        params.q = q.buf.as_ptr().cast::<f32>();
+        params.packed_k = k_cache.buf.as_ptr().cast::<u8>();
+        params.packed_v = v_cache.buf.as_ptr().cast::<u8>();
+        params.out = out.buf.as_ptr().cast::<f32>();
+        params.workspace = partials.buf.as_ptr();
+        params.workspace_bytes = partials.buf.size();
+        params.cos_theta = cos_theta.buf.as_ptr().cast::<f32>();
+        params.sin_theta = sin_theta.buf.as_ptr().cast::<f32>();
+        params.stream = self
+            .active_stream
+            .as_ref()
+            .map_or(std::ptr::null_mut(), hip_bridge::Stream::as_raw);
+        params.softmax_scale = 1.0 / (head_dim as f32).sqrt();
+        params.seqlen_q = batch_size as i32;
+        params.seqlen_k = max_ctx_len as i32;
+        params.nhead_q = n_heads as i32;
+        params.nhead_k = n_kv_heads as i32;
+        params.head_dim = head_dim as i32;
+        params.causal = 1;
+        params.k_row_stride_bytes = (n_kv_heads * 132) as i32;
+        params.v_row_stride_bytes = (n_kv_heads * 272) as i32;
+
+        if sidecar.is_asym4_staged_supported(&params).is_err() {
+            return Ok(false);
+        }
+        unsafe { sidecar.asym4_staged_prefill(&params) }.map_err(|error| {
+            hip_bridge::HipError::new(
+                0,
+                &format!("Asym4 staged FlashAttention CK launch failed: {error}"),
+            )
+        })?;
+        static REPORT_ASYM4_STAGED_ACTIVE: std::sync::Once = std::sync::Once::new();
+        REPORT_ASYM4_STAGED_ACTIVE.call_once(|| {
+            eprintln!(
+                "Asym4 staged FlashAttention CK prefill active: Q={} K={} Hq={} Hkv={} D={} scratch={} bytes",
+                batch_size,
+                max_ctx_len,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                required.unwrap_or_default()
+            );
+        });
+        Ok(true)
+    }
+
     /// Tree-mask variant of `attention_flash_asym4_batched`. See
     /// `attention_q8_0_kv_batched_masked` and `ddtree::linearize_tree` for the
     /// bias layout. Passes `tree_bias` / `block_start` / `block_cols` into the
@@ -5489,6 +5582,28 @@ impl Gpu {
         block_cols: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+
+        #[cfg(feature = "flash-attn-ck")]
+        if self.try_attention_flash_asym4_ck(
+            q,
+            k_cache,
+            v_cache,
+            out,
+            cos_theta,
+            sin_theta,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx_len,
+            batch_size,
+            partials,
+            tree_bias,
+            block_start,
+            block_cols,
+        )? {
+            return Ok(());
+        }
+
         self.launch_asym_flash_batched(
             "attention_flash_asym4_tile_batched",
             kernels::ATTENTION_FLASH_ASYM4_TILE_BATCHED_SRC,
@@ -5544,6 +5659,26 @@ impl Gpu {
         block_cols: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        #[cfg(feature = "flash-attn-ck")]
+        if self.try_attention_flash_asym4_ck(
+            q,
+            k_cache,
+            v_cache,
+            out,
+            cos_theta,
+            sin_theta,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx_len,
+            batch_size,
+            partials,
+            tree_bias,
+            block_start,
+            block_cols,
+        )? {
+            return Ok(());
+        }
         self.launch_asym_flash_batched(
             "attention_flash_asym4_wmma_tile_batched",
             kernels::ATTENTION_FLASH_ASYM4_WMMA_TILE_BATCHED_SRC,

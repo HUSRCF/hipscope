@@ -365,6 +365,8 @@ pub struct FlashAttnCkQuantized {
     staged_workspace_bytes: Option<QuantizedStagedWorkspaceFn>,
     staged_supported: Option<QuantizedFwdFn>,
     staged_prefill: Option<QuantizedFwdFn>,
+    asym4_staged_supported: Option<QuantizedFwdFn>,
+    asym4_staged_prefill: Option<QuantizedFwdFn>,
     mq_q8_supported: Option<QuantizedMqQ8Fn>,
     prefill_mq_q8: Option<QuantizedMqQ8Fn>,
 }
@@ -390,6 +392,8 @@ impl FlashAttnCkQuantized {
             staged_workspace_bytes,
             staged_supported,
             staged_prefill,
+            asym4_staged_supported,
+            asym4_staged_prefill,
             mq_q8_supported,
             prefill_mq_q8,
         ) = unsafe {
@@ -435,6 +439,18 @@ impl FlashAttnCkQuantized {
                 staged_supported = None;
                 staged_prefill = None;
             }
+            let mut asym4_staged_supported = library
+                .get::<QuantizedFwdFn>(b"hipfire_flash_attn_ck_asym4_staged_supported")
+                .ok()
+                .map(|symbol| *symbol);
+            let mut asym4_staged_prefill = library
+                .get::<QuantizedFwdFn>(b"hipfire_flash_attn_ck_asym4_staged_prefill")
+                .ok()
+                .map(|symbol| *symbol);
+            if asym4_staged_supported.is_none() || asym4_staged_prefill.is_none() {
+                asym4_staged_supported = None;
+                asym4_staged_prefill = None;
+            }
             let mq_q8_supported = library
                 .get::<QuantizedMqQ8Fn>(b"hipfire_flash_attn_ck_quantized_mq_q8_supported")
                 .ok()
@@ -458,6 +474,8 @@ impl FlashAttnCkQuantized {
                 staged_workspace_bytes,
                 staged_supported,
                 staged_prefill,
+                asym4_staged_supported,
+                asym4_staged_prefill,
                 mq_q8_supported,
                 prefill_mq_q8,
             )
@@ -471,6 +489,8 @@ impl FlashAttnCkQuantized {
             staged_workspace_bytes,
             staged_supported,
             staged_prefill,
+            asym4_staged_supported,
+            asym4_staged_prefill,
             mq_q8_supported,
             prefill_mq_q8,
         })
@@ -512,6 +532,20 @@ impl FlashAttnCkQuantized {
         self.call("staged support check", function, params)
     }
 
+    pub fn is_asym4_staged_supported(
+        &self,
+        params: &FlashAttnCkQuantizedPrefillParams,
+    ) -> Result<(), FlashAttnCkError> {
+        let function = self
+            .asym4_staged_supported
+            .ok_or_else(|| FlashAttnCkError::Call {
+                operation: "Asym4 staged support check",
+                status: -1,
+                message: "sidecar does not export the optional Asym4 staged route".to_string(),
+            })?;
+        self.call("Asym4 staged support check", function, params)
+    }
+
     /// Launch staged quantized prefill on the stream stored in `params`.
     ///
     /// # Safety
@@ -528,6 +562,26 @@ impl FlashAttnCkQuantized {
             message: "sidecar does not export the optional staged CK route".to_string(),
         })?;
         self.call("staged prefill", function, params)
+    }
+
+    /// Launch Givens-Asym4 staged prefill on the stream stored in `params`.
+    ///
+    /// # Safety
+    ///
+    /// Device pointers and workspace must satisfy the sidecar contract and
+    /// remain valid until the asynchronous stream work completes.
+    pub unsafe fn asym4_staged_prefill(
+        &self,
+        params: &FlashAttnCkQuantizedPrefillParams,
+    ) -> Result<(), FlashAttnCkError> {
+        let function = self
+            .asym4_staged_prefill
+            .ok_or_else(|| FlashAttnCkError::Call {
+                operation: "Asym4 staged prefill",
+                status: -1,
+                message: "sidecar does not export the optional Asym4 staged route".to_string(),
+            })?;
+        self.call("Asym4 staged prefill", function, params)
     }
 
     pub fn is_supported(

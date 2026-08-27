@@ -733,8 +733,47 @@ int validate_staged_prefill(const hipfire_flash_attn_ck_quantized_prefill_params
     return 0;
 }
 
+int validate_asym4_staged_prefill(
+    const hipfire_flash_attn_ck_quantized_prefill_params* p,
+    char* error,
+    size_t error_capacity)
+{
+    if(p == nullptr || p->abi_version != HIPFIRE_FLASH_ATTN_CK_QUANTIZED_ABI_VERSION ||
+       p->struct_size < sizeof(*p))
+    {
+        set_quantized_error(error, error_capacity, "unsupported Asym4 staged ABI layout");
+        return 1;
+    }
+    if(p->q == nullptr || p->packed_k == nullptr || p->packed_v == nullptr ||
+       p->out == nullptr || p->workspace == nullptr || p->cos_theta == nullptr ||
+       p->sin_theta == nullptr)
+    {
+        set_quantized_error(error, error_capacity, "Asym4 staged pointers must be non-null");
+        return 1;
+    }
+    if(p->head_dim != kHeadDim || p->nhead_q != kQueryHeads || p->nhead_k != kKvHeads ||
+       p->causal != 1 || p->seqlen_q < 128 || p->seqlen_k < p->seqlen_q ||
+       !(p->softmax_scale > 0.0f) ||
+       p->k_row_stride_bytes != kKvHeads * hipfire::ck_attention::kPredecodeAsym4HeadBytes ||
+       p->v_row_stride_bytes != kKvHeads * kQ8HeadBytes)
+    {
+        set_quantized_error(error, error_capacity, "unsupported Givens-Asym4/Q8 staged layout");
+        return 1;
+    }
+    const size_t required = staged_workspace_bytes(
+        p->seqlen_q, p->seqlen_k, p->nhead_q, p->nhead_k, p->head_dim);
+    if(required == 0 || p->workspace_bytes < required)
+    {
+        set_quantized_error(error, error_capacity, "Asym4 staged workspace is too small");
+        return 1;
+    }
+    set_quantized_error(error, error_capacity, "");
+    return 0;
+}
+
 int launch_staged_prefill_impl(
     const hipfire_flash_attn_ck_quantized_prefill_params* p,
+    bool asym4,
     char* error,
     size_t error_capacity)
 {
@@ -759,18 +798,20 @@ int launch_staged_prefill_impl(
                        p->sin_theta,
                        p->seqlen_q,
                        p->nhead_q);
-    hipLaunchKernelGGL(hipfire::ck_attention::predecode_asym3_k_q8_v_f16,
-                       dim3(p->seqlen_k, p->nhead_k),
-                       dim3(32),
-                       0,
-                       stream,
-                       p->packed_k,
-                       p->packed_v,
-                       dense_k,
-                       dense_v,
-                       p->seqlen_k,
-                       p->k_row_stride_bytes,
-                       p->v_row_stride_bytes);
+    if(asym4)
+    {
+        hipLaunchKernelGGL(hipfire::ck_attention::predecode_asym4_k_q8_v_f16,
+                           dim3(p->seqlen_k, p->nhead_k), dim3(32), 0, stream,
+                           p->packed_k, p->packed_v, dense_k, dense_v, p->seqlen_k,
+                           p->k_row_stride_bytes, p->v_row_stride_bytes);
+    }
+    else
+    {
+        hipLaunchKernelGGL(hipfire::ck_attention::predecode_asym3_k_q8_v_f16,
+                           dim3(p->seqlen_k, p->nhead_k), dim3(32), 0, stream,
+                           p->packed_k, p->packed_v, dense_k, dense_v, p->seqlen_k,
+                           p->k_row_stride_bytes, p->v_row_stride_bytes);
+    }
 
     hipfire_flash_attn_ck_fwd_params dense{};
     dense.abi_version = HIPFIRE_FLASH_ATTN_CK_ABI_VERSION;
@@ -899,7 +940,27 @@ extern "C" int hipfire_flash_attn_ck_quantized_staged_prefill(
     {
         return status;
     }
-    return launch_staged_prefill_impl(params, error, error_capacity);
+    return launch_staged_prefill_impl(params, false, error, error_capacity);
+}
+
+extern "C" int hipfire_flash_attn_ck_asym4_staged_supported(
+    const hipfire_flash_attn_ck_quantized_prefill_params* params,
+    char* error,
+    size_t error_capacity)
+{
+    return validate_asym4_staged_prefill(params, error, error_capacity);
+}
+
+extern "C" int hipfire_flash_attn_ck_asym4_staged_prefill(
+    const hipfire_flash_attn_ck_quantized_prefill_params* params,
+    char* error,
+    size_t error_capacity)
+{
+    if(const int status = validate_asym4_staged_prefill(params, error, error_capacity); status != 0)
+    {
+        return status;
+    }
+    return launch_staged_prefill_impl(params, true, error, error_capacity);
 }
 #endif
 

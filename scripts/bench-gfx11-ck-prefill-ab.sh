@@ -10,10 +10,16 @@ SLEEP_SECS="${SLEEP_SECS:-20}"
 MODEL="${MODEL:-${HOME}/.hipfire/models/qwen3.6-27b.mq4}"
 BIN="${BIN:-${ROOT}/target/release/examples/bench_qwen35_mq4}"
 CK_LIB="${CK_LIB:-${ROOT}/experiments/flash-attn-ck-sidecar/quantized/build/libhipfire_flash_attn_ck_quantized_staged.so}"
+KV_MODE="${KV_MODE:-asym3}"
+PARTIALS_BATCH="${PARTIALS_BATCH:-$([[ "${KV_MODE}" == asym4 ]] && printf 64 || printf 32)}"
 OUT_DIR="${OUT_DIR:-${ROOT}/.redline-work/gfx11-ck-prefill-ab-$(date +%Y%m%d_%H%M%S)}"
 
 (( PREFILL_TOKENS >= 2048 && PREFILL_RUNS >= 3 && PREFILL_RUNS % 2 == 1 && TRIALS >= 3 )) || {
     echo "require PREFILL_TOKENS>=2048, odd PREFILL_RUNS>=3, TRIALS>=3" >&2
+    exit 2
+}
+[[ "${KV_MODE}" == "asym3" || "${KV_MODE}" == "asym4" ]] || {
+    echo "KV_MODE must be asym3 or asym4" >&2
     exit 2
 }
 for path in "${MODEL}" "${BIN}" "${CK_LIB}"; do
@@ -29,6 +35,8 @@ printf 'pair\torder\tmode\tprefill_tok_s\tdecode_tok_s\ttoken_ids\n' >"${OUT_DIR
     printf 'prefill_tokens=%s\n' "${PREFILL_TOKENS}"
     printf 'prefill_runs=%s\n' "${PREFILL_RUNS}"
     printf 'trials=%s\n' "${TRIALS}"
+    printf 'kv_mode=%s\n' "${KV_MODE}"
+    printf 'partials_batch=%s\n' "${PARTIALS_BATCH}"
     printf 'model_sha256=%s\n' "$(sha256sum "${MODEL}" | awk '{print $1}')"
     printf 'binary_sha256=%s\n' "$(sha256sum "${BIN}" | awk '{print $1}')"
     printf 'ck_lib_sha256=%s\n' "$(sha256sum "${CK_LIB}" | awk '{print $1}')"
@@ -39,15 +47,21 @@ run_one() {
     local pair="$1" order="$2" mode="$3"
     local log="${OUT_DIR}/pair_${pair}_${order}_${mode}.log"
     local -a sidecar=()
-    [[ "${mode}" == ck ]] && sidecar=(HIPFIRE_FLASH_ATTN_CK_QUANTIZED_LIB="${CK_LIB}")
+    local asym4_wmma=1
+    if [[ "${mode}" == ck ]]; then
+        sidecar=(HIPFIRE_FLASH_ATTN_CK_QUANTIZED_LIB="${CK_LIB}")
+    elif [[ "${KV_MODE}" == asym4 ]]; then
+        asym4_wmma=0
+    fi
 
     timeout --signal=INT --kill-after=5s 900s env \
         HIP_VISIBLE_DEVICES="${GPU_ID}" \
         "${sidecar[@]}" \
-        HIPFIRE_KV_MODE=asym3 \
+        HIPFIRE_KV_MODE="${KV_MODE}" \
+        HIPFIRE_ASYM4_WMMA="${asym4_wmma}" \
         HIPFIRE_GRAPH=0 \
         HIPFIRE_PREFILL_MAX_BATCH=2048 \
-        HIPFIRE_FLASH_PARTIALS_BATCH=32 \
+        HIPFIRE_FLASH_PARTIALS_BATCH="${PARTIALS_BATCH}" \
         HIPFIRE_DPM_WARMUP_SECS=5 \
         HIPFIRE_QKVZA_SPLIT_TAIL=1 \
         HIPFIRE_RDNA3_HFQ4_GATE_UP_X256Y64=1 \
@@ -66,9 +80,11 @@ run_one() {
         --prefill "${PREFILL_TOKENS}" --prefill-runs "${PREFILL_RUNS}" \
         --warmup 2 --gen 8 >"${log}" 2>&1
 
+    local route='^staged quantized FlashAttention CK prefill active:'
+    [[ "${KV_MODE}" == asym4 ]] && route='^Asym4 staged FlashAttention CK prefill active:'
     if [[ "${mode}" == ck ]]; then
-        rg -q '^staged quantized FlashAttention CK prefill active:' "${log}"
-    elif rg -q '^staged quantized FlashAttention CK prefill active:' "${log}"; then
+        rg -q "${route}" "${log}"
+    elif rg -q "${route}" "${log}"; then
         echo "native arm unexpectedly used CK" >&2
         return 1
     fi

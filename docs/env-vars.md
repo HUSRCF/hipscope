@@ -139,6 +139,7 @@ Values and defaults below match `hipfire-config`, the native CLI, and/or `Runtim
 | `HIPFIRE_FLASH_PREFILL` | Developer override for Q8 WMMA flash prefill: `0` forces off, `1` forces on; unset uses the architecture/workload envelope. |
 | `HIPFIRE_FLASH_PREFILL_FIXED_HD` | Developer ablation: fixed-head-dimension specialization is on unless `0`. |
 | `HIPFIRE_FLASH_PREFILL_PREFETCH_V` | Developer ablation: gfx12 V prefetch is on unless `0`. |
+| `HIPFIRE_ASYM4_WMMA` | Developer correctness fallback: set to `0` to route gfx11 Asym4 prefill through the scalar tile implementation. |
 
 The prebuilt gfx1100 CK preview launcher sets the following validated Qwen
 hybrid-model combination. These are execution-format controls for that bundle,
@@ -148,6 +149,7 @@ preserved.
 | Variable | Bundle default | Notes |
 |---|---:|---|
 | `HIPFIRE_FLASH_ATTN_CK_QUANTIZED_LIB` | bundled `.so` path | Loads the optional staged Asym3-K/Q8-V CK prefill sidecar. |
+| `HIPFIRE_FLASH_PARTIALS_BATCH` | `64` | Provides reusable staging capacity for the validated Asym3/Asym4 CK D256 prefill routes. |
 | `HIPFIRE_GFX1100_GDN_DPP` | `1` | Uses exact DPP/permlane reductions for sequential GDN prefill on gfx1100; set to `0` to retain the portable shuffle path. |
 | `HIPFIRE_RDNA3_HFQ4_GATE_UP_X256Y64` | `1` | Uses the validated X256/Y64 gate/up packed-MQ4 route. |
 | `HIPFIRE_RDNA3_HFQ4_RESIDUAL_X256Y64` | `1` | Uses the validated X256/Y64 residual/down route. |
