@@ -21,6 +21,7 @@ Current scope:
 - dense FP16 head dimension 64;
 - gfx1100 F32-Q/Q8-K/Q8-V causal GQA at head dimension 256;
 - gfx1100 F32-Q/Asym3-Givens-K/Q8-V causal GQA at head dimension 256;
+- gfx1201 F32-Q/Asym3-Givens-K/Q8-V causal GQA at head dimension 256;
 - raw HIP stream and element-stride inputs.
 
 The Q8 cell vector-decodes both packed caches into F16, invokes the CK D256
@@ -70,6 +71,11 @@ GPU_ARCH=gfx1100 \
 
 The build uses the selected CK sources directly and has no PyTorch dependency.
 No `.so` is copied into or committed to hipfire.
+
+The build script selects CK's `gfx11` generator family for exact gfx1100/gfx1151
+artifacts and the `gfx12` family for exact gfx1201 artifacts. An artifact must
+publish the same exact architecture in its capability table; cross-architecture
+artifacts fail closed in the Rust selector.
 
 The validated local build used ROCm 7.14:
 

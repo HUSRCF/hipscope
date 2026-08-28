@@ -1037,6 +1037,13 @@ mod tests {
             ..q8_d256_capability()
         }
     }
+
+    fn asym3_givens_d256_capability_gfx1201() -> FlashAttnCkCapability {
+        FlashAttnCkCapability {
+            arch: FlashAttnCkArch::Gfx1201 as i32,
+            ..asym3_givens_d256_capability()
+        }
+    }
     fn eligible_q8_prefill() -> FlashAttnCkPrefillInput {
         FlashAttnCkPrefillInput {
             request: FlashAttnCkRequest {
@@ -1134,6 +1141,30 @@ mod tests {
         assert_eq!(
             select_asym3_givens_prefill_capabilities(&[cell], fwht),
             Err(FlashAttnCkRejectReason::UnsupportedFormat)
+        );
+    }
+
+    #[test]
+    fn asym3_givens_prefill_selector_accepts_exact_gfx1201_cell() {
+        let q8 = eligible_q8_prefill();
+        let input = FlashAttnCkPrefillInput {
+            request: FlashAttnCkRequest {
+                arch: FlashAttnCkArch::Gfx1201,
+                k_format: FlashAttnCkKvFormat::Asym3Givens,
+                ..q8.request
+            },
+            ..q8
+        };
+        assert_eq!(
+            select_asym3_givens_prefill_capabilities(
+                &[asym3_givens_d256_capability_gfx1201()],
+                input,
+            ),
+            Ok(input.request)
+        );
+        assert_eq!(
+            select_asym3_givens_prefill_capabilities(&[asym3_givens_d256_capability()], input),
+            Err(FlashAttnCkRejectReason::CapabilityMiss)
         );
     }
 

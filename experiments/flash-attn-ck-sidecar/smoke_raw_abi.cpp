@@ -16,6 +16,71 @@
 
 namespace {
 
+#if defined(HIPFIRE_CK_TARGET_GFX1201)
+constexpr int32_t kExpectedArch = HIPFIRE_FLASH_ATTN_CK_GFX1201;
+constexpr size_t kExpectedCapabilities = 2;
+constexpr bool kExpectedQ8D256 = false;
+constexpr bool kExpectedAsym3GivensD256 = true;
+#elif defined(HIPFIRE_CK_TARGET_GFX1151)
+constexpr int32_t kExpectedArch = HIPFIRE_FLASH_ATTN_CK_GFX1151;
+constexpr size_t kExpectedCapabilities = 1;
+constexpr bool kExpectedQ8D256 = false;
+constexpr bool kExpectedAsym3GivensD256 = false;
+#else
+constexpr int32_t kExpectedArch = HIPFIRE_FLASH_ATTN_CK_GFX1100;
+constexpr size_t kExpectedCapabilities = 3;
+constexpr bool kExpectedQ8D256 = true;
+constexpr bool kExpectedAsym3GivensD256 = true;
+#endif
+
+bool has_capability(int32_t dtype, int32_t k_format, int32_t v_format, int32_t head_dim)
+{
+    const size_t count = hipfire_flash_attn_ck_capabilities(nullptr, 0);
+    std::vector<hipfire_flash_attn_ck_capability> capabilities(count);
+    if(hipfire_flash_attn_ck_capabilities(capabilities.data(), capabilities.size()) != count)
+    {
+        std::fprintf(stderr, "capability table changed while reading\n");
+        std::exit(2);
+    }
+    return std::any_of(capabilities.begin(), capabilities.end(), [&](const auto& capability) {
+        return capability.arch == kExpectedArch && capability.dtype == dtype &&
+               capability.k_format == k_format && capability.v_format == v_format &&
+               capability.head_dim == head_dim;
+    });
+}
+
+void verify_capabilities()
+{
+    const size_t count = hipfire_flash_attn_ck_capabilities(nullptr, 0);
+    const bool has_q8 = has_capability(HIPFIRE_FLASH_ATTN_CK_F32,
+                                       HIPFIRE_FLASH_ATTN_CK_Q8,
+                                       HIPFIRE_FLASH_ATTN_CK_Q8,
+                                       256);
+    const bool has_asym3 = has_capability(HIPFIRE_FLASH_ATTN_CK_F32,
+                                          HIPFIRE_FLASH_ATTN_CK_ASYM3_GIVENS,
+                                          HIPFIRE_FLASH_ATTN_CK_Q8,
+                                          256);
+    if(count != kExpectedCapabilities ||
+       has_q8 != kExpectedQ8D256 || has_asym3 != kExpectedAsym3GivensD256 ||
+       !has_capability(HIPFIRE_FLASH_ATTN_CK_F16,
+                       HIPFIRE_FLASH_ATTN_CK_DENSE_F16,
+                       HIPFIRE_FLASH_ATTN_CK_DENSE_F16,
+                       64))
+    {
+        std::fprintf(stderr,
+                     "unexpected exact-architecture capability table: count=%zu expected=%zu "
+                     "q8=%d expected_q8=%d asym3=%d expected_asym3=%d arch=%d\n",
+                     count,
+                     kExpectedCapabilities,
+                     has_q8,
+                     kExpectedQ8D256,
+                     has_asym3,
+                     kExpectedAsym3GivensD256,
+                     kExpectedArch);
+        std::exit(2);
+    }
+}
+
 void check_hip(hipError_t status, const char* operation)
 {
     if(status != hipSuccess)
@@ -366,7 +431,7 @@ void run_q8_d256_case()
     check_hip(hipFree(workspace), "hipFree(q8 workspace)");
 }
 
-void run_asym3_contract_case(int format, int hdim)
+void run_asym3_contract_case(int format, int hdim, bool artifact_has_cell)
 {
     int dummy = 0;
     hipfire_flash_attn_ck_fwd_params params{};
@@ -404,7 +469,17 @@ void run_asym3_contract_case(int format, int hdim)
 
     char error[1024]{};
     const int status = hipfire_flash_attn_ck_fwd_supported(&params, error, sizeof(error));
-    const bool has_cell = format == HIPFIRE_FLASH_ATTN_CK_ASYM3_GIVENS && hdim == 256;
+    const bool has_cell = artifact_has_cell &&
+                          format == HIPFIRE_FLASH_ATTN_CK_ASYM3_GIVENS && hdim == 256;
+    if(!artifact_has_cell)
+    {
+        if(status != 2 || std::strstr(error, "not published") == nullptr)
+        {
+            std::fprintf(stderr, "unpublished asym3 contract status=%d: %s\n", status, error);
+            std::exit(7);
+        }
+        return;
+    }
     if((has_cell && status != 0) ||
        (!has_cell && (status != 2 || std::strstr(error, "no CK execution cell") == nullptr)))
     {
@@ -594,15 +669,29 @@ int main()
         std::fprintf(stderr, "sidecar ABI mismatch\n");
         return 1;
     }
+    verify_capabilities();
     run_case("gqa-noncausal", 4, 2, false, false);
     run_case("gqa-causal", 4, 2, true, true);
     run_case("mha-noncausal", 2, 2, false, false);
     run_case("mqa-noncausal", 4, 1, false, false);
-    run_q8_d256_case();
-    run_asym3_contract_case(HIPFIRE_FLASH_ATTN_CK_ASYM3_GIVENS, 256);
-    run_asym3_contract_case(HIPFIRE_FLASH_ATTN_CK_ASYM3_GIVENS, 512);
-    run_asym3_contract_case(HIPFIRE_FLASH_ATTN_CK_ASYM3_FWHT, 256);
-    run_asym3_contract_case(HIPFIRE_FLASH_ATTN_CK_ASYM3_FWHT, 512);
-    run_asym3_givens_case(256);
+    if(has_capability(HIPFIRE_FLASH_ATTN_CK_F32,
+                      HIPFIRE_FLASH_ATTN_CK_Q8,
+                      HIPFIRE_FLASH_ATTN_CK_Q8,
+                      256))
+    {
+        run_q8_d256_case();
+    }
+    run_asym3_contract_case(
+        HIPFIRE_FLASH_ATTN_CK_ASYM3_GIVENS, 256, kExpectedAsym3GivensD256);
+    run_asym3_contract_case(
+        HIPFIRE_FLASH_ATTN_CK_ASYM3_GIVENS, 512, kExpectedAsym3GivensD256);
+    run_asym3_contract_case(
+        HIPFIRE_FLASH_ATTN_CK_ASYM3_FWHT, 256, kExpectedAsym3GivensD256);
+    run_asym3_contract_case(
+        HIPFIRE_FLASH_ATTN_CK_ASYM3_FWHT, 512, kExpectedAsym3GivensD256);
+    if(kExpectedAsym3GivensD256)
+    {
+        run_asym3_givens_case(256);
+    }
     return 0;
 }

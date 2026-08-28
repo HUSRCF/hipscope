@@ -11,9 +11,21 @@ OUT="${OUT:-${ROOT}/build/libhipfire_flash_attn_ck.so}"
 HEAD_DIMS="${HEAD_DIMS:-64,128,256}"
 
 case "${GPU_ARCH}" in
-    gfx1100) TARGET_DEFINE=HIPFIRE_CK_TARGET_GFX1100 ;;
-    gfx1151) TARGET_DEFINE=HIPFIRE_CK_TARGET_GFX1151 ;;
-    gfx1201) TARGET_DEFINE=HIPFIRE_CK_TARGET_GFX1201 ;;
+    gfx1100)
+        TARGET_DEFINE=HIPFIRE_CK_TARGET_GFX1100
+        GENERATOR_TARGET=gfx11
+        EXPECTED_SOURCES=17
+        ;;
+    gfx1151)
+        TARGET_DEFINE=HIPFIRE_CK_TARGET_GFX1151
+        GENERATOR_TARGET=gfx11
+        EXPECTED_SOURCES=17
+        ;;
+    gfx1201)
+        TARGET_DEFINE=HIPFIRE_CK_TARGET_GFX1201
+        GENERATOR_TARGET=gfx12
+        EXPECTED_SOURCES=13
+        ;;
     *) echo "unsupported exact CK artifact arch: ${GPU_ARCH}" >&2; exit 2 ;;
 esac
 BUILD_DIR="$(dirname "${OUT}")"
@@ -39,7 +51,7 @@ if ! git -C "${EXTERNAL_CK_ROOT}" cat-file -e "${REQUIRED_CK_REV}^{commit}"; the
     exit 2
 fi
 if [[ ! -f "${RECIPE_PATCH}" ]]; then
-    echo "missing bundled gfx11 CK recipe ${RECIPE_PATCH}" >&2
+    echo "missing bundled CK recipe ${RECIPE_PATCH}" >&2
     exit 2
 fi
 RECIPE_SHA256="$(sha256sum "${RECIPE_PATCH}" | cut -d' ' -f1)"
@@ -72,21 +84,21 @@ LIST="${BUILD_DIR}/sources.list"
 FILTER="*d*_fp16_batch*_nlogits_nbias_*nlse_ndropout_nskip_nqscale_ntrload*"
 
 python3 "${GENERATOR}" \
-    --targets gfx11 \
+    --targets "${GENERATOR_TARGET}" \
     --api fwd \
     --receipt 2 \
     --optdim "${HEAD_DIMS}" \
     --filter "${FILTER}" \
     --list_blobs "${LIST}"
 
-if [[ "$(wc -l < "${LIST}")" -ne 17 ]]; then
-    echo "expected 17 gfx11 FP16 D64/D128/D256 generated sources" >&2
-    echo "the supplied FlashAttention tree does not carry the validated gfx11 recipe" >&2
+if [[ "$(wc -l < "${LIST}")" -ne "${EXPECTED_SOURCES}" ]]; then
+    echo "expected ${EXPECTED_SOURCES} ${GENERATOR_TARGET} FP16 D64/D128/D256 generated sources" >&2
+    echo "the supplied FlashAttention tree does not carry the required CK recipe" >&2
     exit 2
 fi
 
 python3 "${GENERATOR}" \
-    --targets gfx11 \
+    --targets "${GENERATOR_TARGET}" \
     --api fwd \
     --receipt 2 \
     --optdim "${HEAD_DIMS}" \
@@ -122,8 +134,8 @@ COMMON_FLAGS=(
 )
 
 mapfile -t GENERATED_SOURCES < <(find "${BUILD_DIR}/generated" -maxdepth 2 -type f -name 'fmha_fwd*.cpp' | sort)
-if [[ "${#GENERATED_SOURCES[@]}" -ne 17 ]]; then
-    echo "generated ${#GENERATED_SOURCES[@]} sources, expected 17" >&2
+if [[ "${#GENERATED_SOURCES[@]}" -ne "${EXPECTED_SOURCES}" ]]; then
+    echo "generated ${#GENERATED_SOURCES[@]} sources, expected ${EXPECTED_SOURCES}" >&2
     exit 2
 fi
 
@@ -155,6 +167,7 @@ wait
 "${ROCM_PATH}/bin/hipcc" \
     -std=c++20 \
     -O2 \
+    -D"${TARGET_DEFINE}"=1 \
     -I"${ROOT}" \
     "${ROOT}/smoke_raw_abi.cpp" \
     -L"${BUILD_DIR}" \

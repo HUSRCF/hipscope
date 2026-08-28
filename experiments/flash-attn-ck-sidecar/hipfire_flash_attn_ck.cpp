@@ -33,6 +33,18 @@ namespace {
 
 constexpr size_t kWorkspaceAlignment = 256;
 
+#if defined(HIPFIRE_CK_TARGET_GFX1100)
+constexpr bool kHasQ8D256 = true;
+#else
+constexpr bool kHasQ8D256 = false;
+#endif
+
+#if defined(HIPFIRE_CK_TARGET_GFX1100) || defined(HIPFIRE_CK_TARGET_GFX1201)
+constexpr bool kHasAsym3GivensD256 = true;
+#else
+constexpr bool kHasAsym3GivensD256 = false;
+#endif
+
 size_t align_up(size_t value)
 {
     return (value + kWorkspaceAlignment - 1) & ~(kWorkspaceAlignment - 1);
@@ -246,6 +258,11 @@ int validate(const hipfire_flash_attn_ck_fwd_params* p, char* error, size_t erro
         set_error(error, error_capacity, "unsupported dtype and K/V format cell");
         return 1;
     }
+    if((q8 && !kHasQ8D256) || (asym3 && !kHasAsym3GivensD256))
+    {
+        set_error(error, error_capacity, "selected quantized cell is not published by this artifact");
+        return 2;
+    }
     if(p->workspace_bytes > 0 && p->workspace == nullptr)
     {
         set_error(error, error_capacity, "workspace must be non-null when workspace_bytes is non-zero");
@@ -397,17 +414,23 @@ extern "C" size_t hipfire_flash_attn_ck_capabilities(
         64,
         HIPFIRE_FLASH_ATTN_CK_CAP_CAUSAL | HIPFIRE_FLASH_ATTN_CK_CAP_GQA,
     },
-#if defined(HIPFIRE_CK_TARGET_GFX1100)
+#if defined(HIPFIRE_CK_TARGET_GFX1100) || defined(HIPFIRE_CK_TARGET_GFX1201)
     {
         HIPFIRE_FLASH_ATTN_CK_ABI_VERSION,
         sizeof(hipfire_flash_attn_ck_capability),
+#if defined(HIPFIRE_CK_TARGET_GFX1201)
+        HIPFIRE_FLASH_ATTN_CK_GFX1201,
+#else
         HIPFIRE_FLASH_ATTN_CK_GFX1100,
+#endif
         HIPFIRE_FLASH_ATTN_CK_F32,
         HIPFIRE_FLASH_ATTN_CK_ASYM3_GIVENS,
         HIPFIRE_FLASH_ATTN_CK_Q8,
         256,
         HIPFIRE_FLASH_ATTN_CK_CAP_CAUSAL | HIPFIRE_FLASH_ATTN_CK_CAP_GQA,
     },
+#endif
+#if defined(HIPFIRE_CK_TARGET_GFX1100)
     {
         HIPFIRE_FLASH_ATTN_CK_ABI_VERSION,
         sizeof(hipfire_flash_attn_ck_capability),
@@ -433,7 +456,9 @@ extern "C" size_t hipfire_flash_attn_ck_capabilities(
 extern "C" size_t hipfire_flash_attn_ck_fwd_workspace_bytes(
     const hipfire_flash_attn_ck_fwd_params* params)
 {
-    return params != nullptr && (is_q8_cell(params) || is_asym3_givens_cell(params))
+    const bool q8 = params != nullptr && kHasQ8D256 && is_q8_cell(params);
+    const bool asym3 = params != nullptr && kHasAsym3GivensD256 && is_asym3_givens_cell(params);
+    return q8 || asym3
                ? staging_workspace_bytes(params)
                : 0;
 }
