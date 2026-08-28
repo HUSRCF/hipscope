@@ -30,7 +30,10 @@
 //! Greedy-only (temp=0). No DDTree, no PLD, no rejection sampling — that's
 //! Task 11 territory.
 
-use crate::mtp_head::{self, Qwen35MtpHead, Qwen35MtpHeadKvCache, Qwen35MtpHeadScratch};
+use crate::mtp_head::{
+    self, Qwen35MtpHead, Qwen35MtpHeadBatchedScratch, Qwen35MtpHeadKvCache,
+    Qwen35MtpHeadScratch,
+};
 use crate::qwen35::{self, Qwen35Weights};
 use crate::speculative::{apply_topp_trunc, sample_categorical, sample_residual};
 use crate::speculative::{DeltaNetSnapshot, GdnTape, ModelSlot};
@@ -1736,7 +1739,27 @@ where
     let prompt_hidden = gpu.alloc_tensor(&[prompt_tokens.len() * dim], DType::F32)?;
     // Match adaptive margin / AR daemon chunking. Internal forward_prefill_batch
     // also caps at this size; externalizing the loop exposes commit boundaries.
-    let chunk_max = qwen35::PREFILL_MAX_BATCH.max(1);
+    let chunk_max = qwen35::prefill_max_batch(gpu).max(1);
+    let mut mtp_prefill_scratch =
+        match Qwen35MtpHeadBatchedScratch::new(gpu, &head.config, chunk_max) {
+            Ok(scratch) => scratch,
+            Err(error) => {
+                let _ = gpu.free_tensor(prompt_hidden);
+                return Err(error);
+            }
+        };
+    let widest_k = (2 * dim)
+        .max(head.config.n_ff)
+        .max(dim)
+        .max(head.config.n_head * head.config.head_dim);
+    let mtp_prefill_rot = match gpu.alloc_tensor(&[chunk_max * widest_k], DType::F32) {
+        Ok(tensor) => tensor,
+        Err(error) => {
+            mtp_prefill_scratch.free_gpu(gpu);
+            let _ = gpu.free_tensor(prompt_hidden);
+            return Err(error);
+        }
+    };
 
     let result = (|| -> HipResult<TrunkSpinePrefillTimings> {
         let mut trunk_prefill_secs = 0.0f64;
@@ -1769,20 +1792,22 @@ where
             trunk_prefill_secs += t_trunk.elapsed().as_secs_f64();
 
             let t_mtp_fill = Instant::now();
-            for (i, &token) in chunk.iter().enumerate() {
-                let hidden_row = prompt_hidden.sub_offset((off + i) * dim, dim);
-                mtp_head::mtp_head_forward_block_only(
-                    gpu,
-                    head,
-                    &state.mtp_scratch,
-                    &mut state.mtp_kv,
-                    token,
-                    &hidden_row,
-                    None,
-                    chunk_start_pos + i,
-                    &target.weights,
-                )?;
-            }
+            let positions: Vec<i32> = (chunk_start_pos..committed_pos)
+                .map(|position| position as i32)
+                .collect();
+            mtp_head::mtp_head_forward_block_batched(
+                gpu,
+                head,
+                &mut mtp_prefill_scratch,
+                &mut state.mtp_kv,
+                chunk,
+                &chunk_hidden,
+                &positions,
+                chunk.len(),
+                &target.weights,
+                Some(&mtp_prefill_rot),
+                true,
+            )?;
             mtp_prompt_fill_secs += t_mtp_fill.elapsed().as_secs_f64();
 
             // Committed boundary: trunk + MTP private KV now cover [0, committed_pos).
@@ -1804,6 +1829,8 @@ where
         })
     })();
 
+    let _ = gpu.free_tensor(mtp_prefill_rot);
+    mtp_prefill_scratch.free_gpu(gpu);
     let _ = gpu.free_tensor(prompt_hidden);
     result
 }
