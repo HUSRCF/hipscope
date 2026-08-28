@@ -60,12 +60,14 @@
 //!   verify-loop equivalent for MTP would be Task 11.
 
 use crate::qwen35::Qwen35Weights;
-use hip_bridge::{DeviceBuffer, HipResult};
+use hip_bridge::{DeviceBuffer, HipError, HipResult};
+use hipfire_dispatch::pipeline::{run_uniform_moe_down_expanded, run_uniform_moe_gate_up};
 use hipfire_runtime::hfq::{HfqFile, HfqTensorInfo};
+use hipfire_runtime::llama::KvCacheExt;
 use hipfire_runtime::llama::{
     self, f16_to_f32, fused_silu_mul_rotate_mq_batched_for, fused_silu_mul_rotate_mq_for,
-    rotate_x_mq_for, weight_gemv, EmbeddingFormat, WeightTensor};
-use hipfire_runtime::llama::KvCacheExt;
+    rotate_x_mq_for, weight_gemv, EmbeddingFormat, WeightTensor,
+};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::path::Path;
 
@@ -1113,9 +1115,19 @@ fn sanity_check_2d_shape(name: &str, info: &HfqTensorInfo, m: usize, k: usize) {
     );
 }
 
+fn mtp_packed_dtype(quant_type: u8) -> Option<DType> {
+    match quant_type {
+        13 => Some(DType::MQ4G256),
+        15 => Some(DType::MQ6G256),
+        44 => Some(DType::MQ4G256V2),
+        47 => Some(DType::MQ6G256V2),
+        _ => None,
+    }
+}
+
 /// Wrap raw quantized bytes into a [`WeightTensor`]. Local copy of the
 /// dispatch table from `qwen35::load_weight_tensor_raw`, restricted to the
-/// quant types `mtp_extract` actually emits (MQ4, Q8_F16=Q8_0, F16, F32).
+/// quant types emitted by the MTP extractors and published sidecars.
 fn weight_tensor_from_raw(
     gpu: &Gpu,
     quant_type: u8,
@@ -1125,16 +1137,16 @@ fn weight_tensor_from_raw(
     name: &str,
 ) -> HipResult<WeightTensor> {
     match quant_type {
-        13 => {
-            // MQ4G256 — must be K%256-aligned (kernel requirement).
+        qt @ (13 | 15 | 44 | 47) => {
+            let dtype = mtp_packed_dtype(qt).expect("packed quant arm must map");
             assert!(
                 k % 256 == 0,
-                ".mtp tensor '{name}' is MQ4G256 with K={k} not divisible by 256"
+                ".mtp tensor '{name}' is {dtype:?} with K={k} not divisible by 256"
             );
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
-                gpu_dtype: DType::MQ4G256,
+                gpu_dtype: dtype,
                 m,
                 k,
                 row_stride: 0,
@@ -1192,8 +1204,22 @@ fn weight_tensor_from_raw(
         }
         other => panic!(
             ".mtp tensor '{name}': unsupported quant_type={other} \
-             (mtp_extract emits MQ4G256=13, Q8_F16=3, F16=1, F32=2)"
+             (supported: MQ4/MQ6 G256 V1=13/15, V2=44/47, Q8_F16=3, F16=1, F32=2)"
         ),
+    }
+}
+
+#[cfg(test)]
+mod packed_dtype_tests {
+    use super::*;
+
+    #[test]
+    fn published_mtp_packed_formats_map_to_exact_runtime_dtypes() {
+        assert_eq!(mtp_packed_dtype(13), Some(DType::MQ4G256));
+        assert_eq!(mtp_packed_dtype(15), Some(DType::MQ6G256));
+        assert_eq!(mtp_packed_dtype(44), Some(DType::MQ4G256V2));
+        assert_eq!(mtp_packed_dtype(47), Some(DType::MQ6G256V2));
+        assert_eq!(mtp_packed_dtype(48), None);
     }
 }
 
@@ -1741,18 +1767,22 @@ fn mtp_moe_ffn_decode(
     }
 
     let e0 = ffn.experts.first().expect("MoE MTP has no routed experts");
-    assert_eq!(
-        e0.gate_up.gpu_dtype,
-        DType::MQ4G256,
-        "MoE MTP routed gate_up currently requires MQ4G256"
+    let gate_dtype = e0.gate_up.gpu_dtype;
+    let down_dtype = e0.down.gpu_dtype;
+    assert!(
+        ffn.experts
+            .iter()
+            .all(|e| e.gate_up.gpu_dtype == gate_dtype),
+        "MoE MTP routed gate_up experts must have one uniform dtype"
     );
-    assert_eq!(
-        e0.down.gpu_dtype,
-        DType::MQ4G256,
-        "MoE MTP routed down currently requires MQ4G256"
+    assert!(
+        ffn.experts.iter().all(|e| e.down.gpu_dtype == down_dtype),
+        "MoE MTP routed down experts must have one uniform dtype"
     );
     rotate_x_mq_for(gpu, &e0.gate_up, x_norm, x_rot, dim)?;
-    gpu.gemv_hfq4g256_moe_gate_up_k8_indexed(
+    run_uniform_moe_gate_up(
+        gpu,
+        gate_dtype,
         &ffn.expert_gate_up_ptrs,
         topk_indices,
         x_rot,
@@ -1761,11 +1791,14 @@ fn mtp_moe_ffn_decode(
         2 * mi,
         e0.gate_up.k,
         k_top,
-    )?;
+    )
+    .map_err(|error| HipError::new(0, &error.to_string()))?;
     fused_silu_mul_rotate_mq_batched_for(
         gpu, &e0.down, gate_batch, up_batch, rot_batch, mi, k_top,
     )?;
-    gpu.gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
+    run_uniform_moe_down_expanded(
+        gpu,
+        down_dtype,
         &ffn.expert_down_ptrs,
         topk_indices,
         rot_batch,
@@ -1774,7 +1807,8 @@ fn mtp_moe_ffn_decode(
         e0.down.k,
         k_top,
         1,
-    )?;
+    )
+    .map_err(|error| HipError::new(0, &error.to_string()))?;
     gpu.moe_down_combine_k8_batched(down_expanded, topk_weights, x_residual, e0.down.m, k_top, 1)?;
 
     Ok(())
