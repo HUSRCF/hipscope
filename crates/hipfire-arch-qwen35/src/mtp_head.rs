@@ -1766,40 +1766,106 @@ fn mtp_moe_ffn_decode(
     }
 
     let e0 = ffn.experts.first().expect("MoE MTP has no routed experts");
-    assert_eq!(
-        e0.gate_up.gpu_dtype,
-        DType::MQ4G256,
-        "MoE MTP routed gate_up currently requires MQ4G256"
+    let gate_dtype = e0.gate_up.gpu_dtype;
+    let down_dtype = e0.down.gpu_dtype;
+    assert!(
+        ffn.experts
+            .iter()
+            .all(|e| e.gate_up.gpu_dtype == gate_dtype),
+        "MoE MTP routed gate_up experts must have one uniform dtype"
     );
-    assert_eq!(
-        e0.down.gpu_dtype,
-        DType::MQ4G256,
-        "MoE MTP routed down currently requires MQ4G256"
+    assert!(
+        ffn.experts.iter().all(|e| e.down.gpu_dtype == down_dtype),
+        "MoE MTP routed down experts must have one uniform dtype"
     );
     rotate_x_mq_for(gpu, &e0.gate_up, x_norm, x_rot, dim)?;
-    gpu.gemv_hfq4g256_moe_gate_up_k8_indexed(
-        &ffn.expert_gate_up_ptrs,
-        topk_indices,
-        x_rot,
-        gate_batch,
-        up_batch,
-        2 * mi,
-        e0.gate_up.k,
-        k_top,
-    )?;
+    match gate_dtype {
+        DType::MQ4G256 => gpu.gemv_hfq4g256_moe_gate_up_k8_indexed(
+            &ffn.expert_gate_up_ptrs,
+            topk_indices,
+            x_rot,
+            gate_batch,
+            up_batch,
+            2 * mi,
+            e0.gate_up.k,
+            k_top,
+        )?,
+        DType::MQ6G256 => gpu.gemv_hfq6g256_moe_gate_up_k8_indexed(
+            &ffn.expert_gate_up_ptrs,
+            topk_indices,
+            x_rot,
+            gate_batch,
+            up_batch,
+            2 * mi,
+            e0.gate_up.k,
+            k_top,
+        )?,
+        DType::MQ4G256V2 => gpu.gemv_mq4g256v2_moe_gate_up_k8_indexed(
+            &ffn.expert_gate_up_ptrs,
+            topk_indices,
+            x_rot,
+            gate_batch,
+            up_batch,
+            2 * mi,
+            e0.gate_up.k,
+        )?,
+        DType::MQ6G256V2 => gpu.gemv_mq6g256v2_moe_gate_up_k8_indexed(
+            &ffn.expert_gate_up_ptrs,
+            topk_indices,
+            x_rot,
+            gate_batch,
+            up_batch,
+            2 * mi,
+            e0.gate_up.k,
+        )?,
+        other => panic!("MoE MTP routed gate_up unsupported dtype {other:?}"),
+    }
     fused_silu_mul_rotate_mq_batched_for(
         gpu, &e0.down, gate_batch, up_batch, rot_batch, mi, k_top,
     )?;
-    gpu.gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
-        &ffn.expert_down_ptrs,
-        topk_indices,
-        rot_batch,
-        down_expanded,
-        e0.down.m,
-        e0.down.k,
-        k_top,
-        1,
-    )?;
+    match down_dtype {
+        DType::MQ4G256 => gpu.gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
+            &ffn.expert_down_ptrs,
+            topk_indices,
+            rot_batch,
+            down_expanded,
+            e0.down.m,
+            e0.down.k,
+            k_top,
+            1,
+        )?,
+        DType::MQ6G256 => gpu.gemv_hfq6g256_moe_down_k8_indexed_batched_expanded(
+            &ffn.expert_down_ptrs,
+            topk_indices,
+            rot_batch,
+            down_expanded,
+            e0.down.m,
+            e0.down.k,
+            k_top,
+            1,
+        )?,
+        DType::MQ4G256V2 => gpu.gemv_mq4g256v2_moe_down_k8_indexed_batched_expanded(
+            &ffn.expert_down_ptrs,
+            topk_indices,
+            rot_batch,
+            down_expanded,
+            e0.down.m,
+            e0.down.k,
+            k_top,
+            1,
+        )?,
+        DType::MQ6G256V2 => gpu.gemv_mq6g256v2_moe_down_k8_indexed_batched_expanded(
+            &ffn.expert_down_ptrs,
+            topk_indices,
+            rot_batch,
+            down_expanded,
+            e0.down.m,
+            e0.down.k,
+            k_top,
+            1,
+        )?,
+        other => panic!("MoE MTP routed down unsupported dtype {other:?}"),
+    }
     gpu.moe_down_combine_k8_batched(down_expanded, topk_weights, x_residual, e0.down.m, k_top, 1)?;
 
     Ok(())
