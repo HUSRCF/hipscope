@@ -62,10 +62,11 @@
 use crate::qwen35::Qwen35Weights;
 use hip_bridge::{DeviceBuffer, HipResult};
 use hipfire_runtime::hfq::{HfqFile, HfqTensorInfo};
+use hipfire_runtime::llama::KvCacheExt;
 use hipfire_runtime::llama::{
     self, f16_to_f32, fused_silu_mul_rotate_mq_batched_for, fused_silu_mul_rotate_mq_for,
-    rotate_x_mq_for, weight_gemv, EmbeddingFormat, WeightTensor};
-use hipfire_runtime::llama::KvCacheExt;
+    rotate_x_mq_for, weight_gemv, EmbeddingFormat, WeightTensor,
+};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::path::Path;
 
@@ -1113,9 +1114,19 @@ fn sanity_check_2d_shape(name: &str, info: &HfqTensorInfo, m: usize, k: usize) {
     );
 }
 
+fn mtp_packed_dtype(quant_type: u8) -> Option<DType> {
+    match quant_type {
+        13 => Some(DType::MQ4G256),
+        15 => Some(DType::MQ6G256),
+        44 => Some(DType::MQ4G256V2),
+        47 => Some(DType::MQ6G256V2),
+        _ => None,
+    }
+}
+
 /// Wrap raw quantized bytes into a [`WeightTensor`]. Local copy of the
 /// dispatch table from `qwen35::load_weight_tensor_raw`, restricted to the
-/// quant types `mtp_extract` actually emits (MQ4, Q8_F16=Q8_0, F16, F32).
+/// quant types emitted by the MTP extractors and published sidecars.
 fn weight_tensor_from_raw(
     gpu: &Gpu,
     quant_type: u8,
@@ -1125,16 +1136,16 @@ fn weight_tensor_from_raw(
     name: &str,
 ) -> HipResult<WeightTensor> {
     match quant_type {
-        13 => {
-            // MQ4G256 — must be K%256-aligned (kernel requirement).
+        qt @ (13 | 15 | 44 | 47) => {
+            let dtype = mtp_packed_dtype(qt).expect("packed quant arm must map");
             assert!(
                 k % 256 == 0,
-                ".mtp tensor '{name}' is MQ4G256 with K={k} not divisible by 256"
+                ".mtp tensor '{name}' is {dtype:?} with K={k} not divisible by 256"
             );
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
-                gpu_dtype: DType::MQ4G256,
+                gpu_dtype: dtype,
                 m,
                 k,
                 row_stride: 0,
@@ -1192,8 +1203,22 @@ fn weight_tensor_from_raw(
         }
         other => panic!(
             ".mtp tensor '{name}': unsupported quant_type={other} \
-             (mtp_extract emits MQ4G256=13, Q8_F16=3, F16=1, F32=2)"
+             (supported: MQ4/MQ6 G256 V1=13/15, V2=44/47, Q8_F16=3, F16=1, F32=2)"
         ),
+    }
+}
+
+#[cfg(test)]
+mod packed_dtype_tests {
+    use super::*;
+
+    #[test]
+    fn published_mtp_packed_formats_map_to_exact_runtime_dtypes() {
+        assert_eq!(mtp_packed_dtype(13), Some(DType::MQ4G256));
+        assert_eq!(mtp_packed_dtype(15), Some(DType::MQ6G256));
+        assert_eq!(mtp_packed_dtype(44), Some(DType::MQ4G256V2));
+        assert_eq!(mtp_packed_dtype(47), Some(DType::MQ6G256V2));
+        assert_eq!(mtp_packed_dtype(48), None);
     }
 }
 
