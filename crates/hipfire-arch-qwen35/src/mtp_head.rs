@@ -60,7 +60,8 @@
 //!   verify-loop equivalent for MTP would be Task 11.
 
 use crate::qwen35::Qwen35Weights;
-use hip_bridge::{DeviceBuffer, HipResult};
+use hip_bridge::{DeviceBuffer, HipError, HipResult};
+use hipfire_dispatch::pipeline::{run_uniform_moe_down_expanded, run_uniform_moe_gate_up};
 use hipfire_runtime::hfq::{HfqFile, HfqTensorInfo};
 use hipfire_runtime::llama::KvCacheExt;
 use hipfire_runtime::llama::{
@@ -1779,93 +1780,35 @@ fn mtp_moe_ffn_decode(
         "MoE MTP routed down experts must have one uniform dtype"
     );
     rotate_x_mq_for(gpu, &e0.gate_up, x_norm, x_rot, dim)?;
-    match gate_dtype {
-        DType::MQ4G256 => gpu.gemv_hfq4g256_moe_gate_up_k8_indexed(
-            &ffn.expert_gate_up_ptrs,
-            topk_indices,
-            x_rot,
-            gate_batch,
-            up_batch,
-            2 * mi,
-            e0.gate_up.k,
-            k_top,
-        )?,
-        DType::MQ6G256 => gpu.gemv_hfq6g256_moe_gate_up_k8_indexed(
-            &ffn.expert_gate_up_ptrs,
-            topk_indices,
-            x_rot,
-            gate_batch,
-            up_batch,
-            2 * mi,
-            e0.gate_up.k,
-            k_top,
-        )?,
-        DType::MQ4G256V2 => gpu.gemv_mq4g256v2_moe_gate_up_k8_indexed(
-            &ffn.expert_gate_up_ptrs,
-            topk_indices,
-            x_rot,
-            gate_batch,
-            up_batch,
-            2 * mi,
-            e0.gate_up.k,
-        )?,
-        DType::MQ6G256V2 => gpu.gemv_mq6g256v2_moe_gate_up_k8_indexed(
-            &ffn.expert_gate_up_ptrs,
-            topk_indices,
-            x_rot,
-            gate_batch,
-            up_batch,
-            2 * mi,
-            e0.gate_up.k,
-        )?,
-        other => panic!("MoE MTP routed gate_up unsupported dtype {other:?}"),
-    }
+    run_uniform_moe_gate_up(
+        gpu,
+        gate_dtype,
+        &ffn.expert_gate_up_ptrs,
+        topk_indices,
+        x_rot,
+        gate_batch,
+        up_batch,
+        2 * mi,
+        e0.gate_up.k,
+        k_top,
+    )
+    .map_err(|error| HipError::new(0, &error.to_string()))?;
     fused_silu_mul_rotate_mq_batched_for(
         gpu, &e0.down, gate_batch, up_batch, rot_batch, mi, k_top,
     )?;
-    match down_dtype {
-        DType::MQ4G256 => gpu.gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
-            &ffn.expert_down_ptrs,
-            topk_indices,
-            rot_batch,
-            down_expanded,
-            e0.down.m,
-            e0.down.k,
-            k_top,
-            1,
-        )?,
-        DType::MQ6G256 => gpu.gemv_hfq6g256_moe_down_k8_indexed_batched_expanded(
-            &ffn.expert_down_ptrs,
-            topk_indices,
-            rot_batch,
-            down_expanded,
-            e0.down.m,
-            e0.down.k,
-            k_top,
-            1,
-        )?,
-        DType::MQ4G256V2 => gpu.gemv_mq4g256v2_moe_down_k8_indexed_batched_expanded(
-            &ffn.expert_down_ptrs,
-            topk_indices,
-            rot_batch,
-            down_expanded,
-            e0.down.m,
-            e0.down.k,
-            k_top,
-            1,
-        )?,
-        DType::MQ6G256V2 => gpu.gemv_mq6g256v2_moe_down_k8_indexed_batched_expanded(
-            &ffn.expert_down_ptrs,
-            topk_indices,
-            rot_batch,
-            down_expanded,
-            e0.down.m,
-            e0.down.k,
-            k_top,
-            1,
-        )?,
-        other => panic!("MoE MTP routed down unsupported dtype {other:?}"),
-    }
+    run_uniform_moe_down_expanded(
+        gpu,
+        down_dtype,
+        &ffn.expert_down_ptrs,
+        topk_indices,
+        rot_batch,
+        down_expanded,
+        e0.down.m,
+        e0.down.k,
+        k_top,
+        1,
+    )
+    .map_err(|error| HipError::new(0, &error.to_string()))?;
     gpu.moe_down_combine_k8_batched(down_expanded, topk_weights, x_residual, e0.down.m, k_top, 1)?;
 
     Ok(())

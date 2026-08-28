@@ -433,6 +433,149 @@ pub(crate) fn shared_dense_down_kind(dtype: DType) -> Option<&'static str> {
     }
 }
 
+/// Dispatch a uniform single-token routed-expert gate/up projection by its exact
+/// wire dtype. Architecture code supplies tensors and dimensions; format
+/// selection remains in the dispatch layer so V1/V2 headers cannot be confused.
+#[allow(clippy::too_many_arguments)]
+pub fn run_uniform_moe_gate_up(
+    gpu: &mut Gpu,
+    dtype: DType,
+    expert_ptrs: &GpuTensor,
+    topk_indices: &GpuTensor,
+    x_rot: &GpuTensor,
+    gate: &GpuTensor,
+    up: &GpuTensor,
+    m: usize,
+    k: usize,
+    k_top: usize,
+) -> Result<(), DispatchError> {
+    let hip = |result: hip_bridge::HipResult<()>| {
+        result.map_err(|error| DispatchError::Hip(error.to_string()))
+    };
+    match dtype {
+        DType::MQ4G256 => hip(gpu.gemv_hfq4g256_moe_gate_up_k8_indexed(
+            expert_ptrs,
+            topk_indices,
+            x_rot,
+            gate,
+            up,
+            m,
+            k,
+            k_top,
+        )),
+        DType::MQ6G256 => hip(gpu.gemv_hfq6g256_moe_gate_up_k8_indexed(
+            expert_ptrs,
+            topk_indices,
+            x_rot,
+            gate,
+            up,
+            m,
+            k,
+            k_top,
+        )),
+        DType::MQ4G256V2 => {
+            if k_top != 8 {
+                return Err(DispatchError::Hip(format!(
+                    "MQ4G256V2 indexed gate/up requires top_k=8, got {k_top}"
+                )));
+            }
+            hip(gpu.gemv_mq4g256v2_moe_gate_up_k8_indexed(
+                expert_ptrs,
+                topk_indices,
+                x_rot,
+                gate,
+                up,
+                m,
+                k,
+            ))
+        }
+        DType::MQ6G256V2 => {
+            if k_top != 8 {
+                return Err(DispatchError::Hip(format!(
+                    "MQ6G256V2 indexed gate/up requires top_k=8, got {k_top}"
+                )));
+            }
+            hip(gpu.gemv_mq6g256v2_moe_gate_up_k8_indexed(
+                expert_ptrs,
+                topk_indices,
+                x_rot,
+                gate,
+                up,
+                m,
+                k,
+            ))
+        }
+        other => Err(DispatchError::Hip(format!(
+            "uniform indexed gate/up unsupported dtype {other:?}"
+        ))),
+    }
+}
+
+/// Dispatch a uniform routed-expert expanded-down projection by its exact wire
+/// dtype. The expanded result remains uncombined for the caller's weighted sum.
+#[allow(clippy::too_many_arguments)]
+pub fn run_uniform_moe_down_expanded(
+    gpu: &mut Gpu,
+    dtype: DType,
+    expert_ptrs: &GpuTensor,
+    topk_indices: &GpuTensor,
+    x_rot: &GpuTensor,
+    out: &GpuTensor,
+    m: usize,
+    k: usize,
+    k_top: usize,
+    batch_size: usize,
+) -> Result<(), DispatchError> {
+    let hip = |result: hip_bridge::HipResult<()>| {
+        result.map_err(|error| DispatchError::Hip(error.to_string()))
+    };
+    match dtype {
+        DType::MQ4G256 => hip(gpu.gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
+            expert_ptrs,
+            topk_indices,
+            x_rot,
+            out,
+            m,
+            k,
+            k_top,
+            batch_size,
+        )),
+        DType::MQ6G256 => hip(gpu.gemv_hfq6g256_moe_down_k8_indexed_batched_expanded(
+            expert_ptrs,
+            topk_indices,
+            x_rot,
+            out,
+            m,
+            k,
+            k_top,
+            batch_size,
+        )),
+        DType::MQ4G256V2 => hip(gpu.gemv_mq4g256v2_moe_down_k8_indexed_batched_expanded(
+            expert_ptrs,
+            topk_indices,
+            x_rot,
+            out,
+            m,
+            k,
+            k_top,
+            batch_size,
+        )),
+        DType::MQ6G256V2 => hip(gpu.gemv_mq6g256v2_moe_down_k8_indexed_batched_expanded(
+            expert_ptrs,
+            topk_indices,
+            x_rot,
+            out,
+            m,
+            k,
+            k_top,
+            batch_size,
+        )),
+        other => Err(DispatchError::Hip(format!(
+            "uniform expanded down unsupported dtype {other:?}"
+        ))),
+    }
+}
+
 /// MoE decode executor. Ports the body of `moe_ffn_decode_impl` verbatim,
 /// substituting `ffn.*`/`config.*`/`s.*` references with `MoeParams` fields.
 /// Resolution is owned here (computed from `MoeDtypes` + k), and `ctx` is
