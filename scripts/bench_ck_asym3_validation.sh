@@ -14,6 +14,7 @@ DATA_ROOT="${DATA_ROOT:-$HOME/.hipfire/datasets/longbench-v2}"
 DATASET="${DATASET:-$DATA_ROOT/longbench-hard30-pp32k.jsonl}"
 MANIFEST="${MANIFEST:-$DATA_ROOT/longbench-hard30-pp32k.manifest.json}"
 GPU_ID="${GPU_ID:-0}"
+EXPECTED_ARCH="${EXPECTED_ARCH:-gfx1100}"
 NATIVE_GPU_ID="${NATIVE_GPU_ID:-$GPU_ID}"
 CK_GPU_ID="${CK_GPU_ID:-$GPU_ID}"
 PARALLEL_AB="${PARALLEL_AB:-0}"
@@ -66,7 +67,7 @@ run_longbench() {
         --model-label "qwen3.6-27b-asym3-longbench-$mode" \
         --suite longbench --dataset "$DATASET" --manifest "$MANIFEST" \
         --out-dir "$OUT_ROOT/longbench/$mode" --physical-gpu "$gpu_id" \
-        --expected-arch gfx1100 --runtime-home "/tmp/hipfire-ck-asym3-$mode" \
+        --expected-arch "$EXPECTED_ARCH" --runtime-home "/tmp/hipfire-ck-asym3-$mode" \
         --max-seq "$MAX_SEQ" --max-tokens "$LONG_BENCH_MAX_TOKENS" \
         --limit "$LONG_BENCH_LIMIT" --prefill-batch 8 --kv-mode asym3 --closed-think \
         --timeout 3600 "${ck_args[@]}"
