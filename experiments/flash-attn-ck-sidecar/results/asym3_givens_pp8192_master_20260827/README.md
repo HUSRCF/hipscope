@@ -81,3 +81,18 @@ Both decode results are below the shared gfx1100 floor of `169.1 tok/s`, while
 the PR and clean-master measurements agree within `0.5%`. The locked floor does
 not distinguish Radeon Pro W7900 from RX 7900 XTX captures, so this result is
 reported as a machine-baseline mismatch rather than a CK regression.
+
+## LongBench boundary diagnostic
+
+The 30-case hard set with a 768-token output cap completed without runtime
+errors. Case `longbench-16` was the only parsed-answer asymmetry: native emitted
+`C`, while CK reached the 768-token cap without a final choice. A CK-only rerun
+isolated the cause:
+
+| Output cap | Generated | Finish | Parsed choice |
+| ---: | ---: | --- | --- |
+| `768` | `768` | length | none |
+| `2048` | `900` | stop | `C` |
+
+The longer CK run therefore reaches the same `C` choice as native. The gold
+answer is `A`, so this is a truncation diagnosis rather than a correctness gain.
