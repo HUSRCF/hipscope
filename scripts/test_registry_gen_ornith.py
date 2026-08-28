@@ -71,7 +71,7 @@ def test_curated_entry_uses_the_canonical_tag_and_hyphenated_files():
     assert "ornith1.5:35b-a3b" not in models, "old tag must be an alias, not a model"
     entry = models[CANONICAL]
     assert entry["repo"] == "hipfire-models/ornith-1.5-35b-a3b"
-    assert entry["file"] == "ornith-1.5-35b-a3b-v2.mq4"
+    assert entry["file"] == "ornith-1.5-35b-a3b.mq4"
     assert entry["mtp"]["file"] == "ornith-1.5-35b-a3b.mtp"
     assert entry["size_gb"] == 19.02
     expected_sampling = {

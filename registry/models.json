@@ -1468,7 +1468,7 @@
       "mtp": {
         "file": "ornith-1.5-35b-a3b.mtp"
       },
-      "file": "ornith-1.5-35b-a3b-v2.mq4",
+      "file": "ornith-1.5-35b-a3b.mq4",
       "size_gb": 19.02,
       "min_vram_gb": 22,
       "default_kv_mode": "q8",
