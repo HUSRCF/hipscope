@@ -1468,25 +1468,26 @@
       "mtp": {
         "file": "ornith-1.5-35b-a3b.mtp"
       },
-      "file": "ornith-1.5-35b-a3b.mq4",
+      "file": "ornith-1.5-35b-a3b-v2.mq4",
       "size_gb": 19.02,
       "min_vram_gb": 22,
       "default_kv_mode": "q8",
+      "quant_recipe": "published-trunk plus qt13 shared-expert replacement from parent 10fbf86f using MQ4G256V2",
       "recommended_settings": {
-        "temperature": 1.0,
+        "temperature": 0.6,
         "top_p": 0.95,
         "top_k": 20,
         "min_p": 0.0,
-        "presence_penalty": 1.5,
+        "presence_penalty": 0.0,
         "repeat_penalty": 1.0
       },
       "sampling_profiles": {
         "general": {
-          "temperature": 1.0,
+          "temperature": 0.6,
           "top_p": 0.95,
           "top_k": 20,
           "min_p": 0.0,
-          "presence_penalty": 1.5,
+          "presence_penalty": 0.0,
           "repeat_penalty": 1.0
         },
         "coding": {
@@ -1498,15 +1499,15 @@
           "repeat_penalty": 1.0
         },
         "instruct": {
-          "temperature": 0.7,
-          "top_p": 0.8,
+          "temperature": 0.6,
+          "top_p": 0.95,
           "top_k": 20,
           "min_p": 0.0,
-          "presence_penalty": 1.5,
+          "presence_penalty": 0.0,
           "repeat_penalty": 1.0
         }
       },
-      "desc": "MoE 35B/3B-active VL finetune (Qwen3.5 family), MQ4G256V2 trunk. 77.4 tok/s with MTP drafting at K=3 vs 69.7 autoregressive on gfx1151. Vision tower ships as ornith-1.5-35b-a3b.vl alongside the trunk. NOTE: the .mtp is a REPLACEMENT draft head derived from shisa-ai/Ornith-1.5-35B-A3B-MTP-ONLY (Apache-2.0), not the head from the Ornith 1.5 release -- that one drafts at ~13% acceptance and makes speculative decode slower than AR. See the repo README and NOTICE."
+      "desc": "MoE 35B/3B-active VL finetune (Qwen3.5 family). Routed experts and all 96 formerly-MQ4V1 shared-expert projections now use MQ4G256V2; census: 20,747 MQ4G256V2, 43 MQ6G256, 112 Q8F16, 191 F16, zero MQ4G256V1. Parent-card sampling (temperature 0.6, top_p 0.95, top_k 20, no presence penalty) is validated with thinking enabled and disabled under VMM. Vision tower ships as ornith-1.5-35b-a3b.vl alongside the trunk. NOTE: the .mtp is a REPLACEMENT draft head derived from shisa-ai/Ornith-1.5-35B-A3B-MTP-ONLY (Apache-2.0), not the head from the Ornith 1.5 release. See the repo README and NOTICE."
     }
   },
   "aliases": {

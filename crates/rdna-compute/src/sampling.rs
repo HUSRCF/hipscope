@@ -1686,7 +1686,13 @@ pub struct SlotSampleParams {
 
 impl SlotSampleParams {
     pub fn rng_state(&self) -> u32 {
-        self.seed
+        // xorshift32 has an absorbing all-zero state. Preserve every caller
+        // supplied nonzero seed exactly, but map zero onto a fixed live state.
+        if self.seed == 0 {
+            0xA341_316C
+        } else {
+            self.seed
+        }
     }
 }
 

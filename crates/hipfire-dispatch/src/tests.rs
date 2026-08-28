@@ -1136,9 +1136,15 @@ fn moe_res_shipped_ornith15_takes_the_indexed_path() {
     d.routed_down = DType::MQ4G256V2;
     d.experts_all_gate_up_mq4 = false;
     let r = MoeResolution::resolve(&d, 8);
-    assert!(!r.gate_fusable, "Q8 router disqualifies the fused gate side");
+    assert!(
+        !r.gate_fusable,
+        "Q8 router disqualifies the fused gate side"
+    );
     assert!(r.routed_indexable_mq4v2, "routed experts are uniform qt44");
-    assert!(r.use_gpu_topk, "shipped Ornith must take the indexed decode path");
+    assert!(
+        r.use_gpu_topk,
+        "shipped Ornith must take the indexed decode path"
+    );
     assert!(r.needs_x_rot_local, "qt44 kernels read ROTATED activations");
 }
 
@@ -1336,6 +1342,192 @@ fn moe_res_paro_needs_sidecar() {
     let r = MoeResolution::resolve(&d, 8);
     assert!(r.routed_indexable_paro);
     assert!(r.use_gpu_topk);
+}
+
+// ── MQV2 resolver contracts (mixed gate precedence / MQ6V2 / D3) ─────────────
+//
+// Pure helpers exposed by `pipeline` + `MoeResolution` lattice. These pin the
+// three silent-corruption hazards from the MQV2 fix wave: mixed gate before
+// representative V1/V2 arms, uniform MQ6V2 indexability without V1 collapse,
+// and V2 never calling the HFQ4 ninepath D3 gate.
+
+use crate::pipeline::{
+    decode_gate_uses_mixed, gate_up_varies, ninepath_d3_family, ninepath_d4_family,
+    prefill_path1_down_kind_tag_aware, prefill_path1_gate_up_kind_tag_aware,
+};
+
+#[test]
+fn moe_res_mq6v2_routed_indexable() {
+    // qt47 uniform: BOTH projections MQ6G256V2 ⇒ indexable, GPU top-K on.
+    // Dual-half f16 header is wire-incompatible with V1 MQ6G256's f32 header;
+    // the arm must not claim the V1 mq6 or mq4/mq4v2 flags.
+    let mut d = dtypes_all_mq4();
+    d.routed_gate_up = DType::MQ6G256V2;
+    d.routed_down = DType::MQ6G256V2;
+    d.experts_all_gate_up_mq4 = false;
+    let r = MoeResolution::resolve(&d, 8);
+    assert!(r.routed_indexable_mq6v2);
+    assert!(!r.routed_indexable_mq6, "must not claim the V1 MQ6 arm");
+    assert!(!r.routed_indexable_mq4);
+    assert!(!r.routed_indexable_mq4v2);
+    assert!(r.use_gpu_topk);
+    assert!(r.needs_x_rot_local, "qt47 kernels read ROTATED activations");
+    assert!(r.routed_indexable());
+}
+
+#[test]
+fn moe_res_mq6v2_mixed_with_v1_is_not_indexable() {
+    // Same dual-half hazard as mq4v2/qt13: V1 and V2 share the 200 B group
+    // stride and 6-bit packing, differing ONLY in the 8-byte header. A split
+    // pairing must NOT be indexable on either arm — wrong header is silent
+    // fluent garbage, not a fault.
+    for (gu, dn) in [
+        (DType::MQ6G256V2, DType::MQ6G256),
+        (DType::MQ6G256, DType::MQ6G256V2),
+        (DType::MQ6G256V2, DType::MQ4G256),
+        (DType::MQ4G256V2, DType::MQ6G256V2),
+    ] {
+        let mut d = dtypes_all_mq4();
+        d.routed_gate_up = gu;
+        d.routed_down = dn;
+        d.experts_all_gate_up_mq4 = false;
+        let r = MoeResolution::resolve(&d, 8);
+        assert!(!r.routed_indexable_mq6v2, "{gu:?}/{dn:?}");
+        assert!(!r.routed_indexable_mq6, "{gu:?}/{dn:?}");
+        assert!(
+            !r.use_gpu_topk,
+            "{gu:?}/{dn:?} must fall back, not guess a layout"
+        );
+    }
+}
+
+#[test]
+fn moe_res_mq6v2_k_ne_8_disables_gpu_topk() {
+    let mut d = dtypes_all_mq4();
+    d.routed_gate_up = DType::MQ6G256V2;
+    d.routed_down = DType::MQ6G256V2;
+    d.experts_all_gate_up_mq4 = false;
+    let r = MoeResolution::resolve(&d, 6);
+    assert!(r.routed_indexable_mq6v2);
+    assert!(!r.use_gpu_topk);
+}
+
+/// Exact mixed V1/V2 gate precedence: whenever gate_up exact dtype varies,
+/// the mixed gate kernel runs before any representative MQ4V2/MQ6V2/V1 arm.
+/// Uniform shortcut is allowed only when every gate_up DType is equal.
+#[test]
+fn mixed_v1_v2_gate_precedence_requires_exact_variation() {
+    // No table / all-equal table ⇒ no variation ⇒ uniform shortcut.
+    assert!(!gate_up_varies(None));
+    assert!(!gate_up_varies(Some(&[])));
+    assert!(!gate_up_varies(Some(&[DType::MQ4G256V2, DType::MQ4G256V2])));
+    assert!(!gate_up_varies(Some(&[DType::MQ6G256V2; 4])));
+
+    // Exact DType inequality (V1 vs V2, or V2 vs V2 sibling) ⇒ varies.
+    // Family-level sameness (both "MQ4") is NOT enough — headers differ.
+    assert!(gate_up_varies(Some(&[DType::MQ4G256, DType::MQ4G256V2])));
+    assert!(gate_up_varies(Some(&[DType::MQ4G256V2, DType::MQ6G256V2])));
+    assert!(gate_up_varies(Some(&[
+        DType::MQ4G256V2,
+        DType::MQ4G256V2,
+        DType::MQ4G256,
+    ])));
+
+    // Mixed gate fires only when tags exist AND gate_up varies.
+    assert!(decode_gate_uses_mixed(true, true));
+    assert!(
+        !decode_gate_uses_mixed(true, false),
+        "tags alone must not force mixed when every gate_up DType is equal"
+    );
+    assert!(
+        !decode_gate_uses_mixed(false, true),
+        "variation without a tag table has no mixed kernel to dispatch"
+    );
+    assert!(!decode_gate_uses_mixed(false, false));
+
+    // Path1 tag-aware kinds: mixed precedes representative V1/V2 arms.
+    assert_eq!(
+        prefill_path1_gate_up_kind_tag_aware(DType::MQ4G256V2, true, true),
+        Some("mixed"),
+        "varying gate_up + tags ⇒ mixed, not mq4v2 representative"
+    );
+    assert_eq!(
+        prefill_path1_gate_up_kind_tag_aware(DType::MQ6G256V2, true, true),
+        Some("mixed"),
+        "varying gate_up + tags ⇒ mixed, not mq6v2 representative"
+    );
+    assert_eq!(
+        prefill_path1_gate_up_kind_tag_aware(DType::MQ4G256, true, true),
+        Some("mixed"),
+        "varying gate_up + tags ⇒ mixed, not hfq4 representative"
+    );
+    // Uniform shortcut only with exact equality (no variation).
+    assert_eq!(
+        prefill_path1_gate_up_kind_tag_aware(DType::MQ4G256V2, true, false),
+        Some("mq4v2"),
+        "tags + uniform gate_up may take the V2 uniform arm"
+    );
+    assert_eq!(
+        prefill_path1_gate_up_kind_tag_aware(DType::MQ6G256V2, false, false),
+        Some("mq6v2")
+    );
+    // Path1 down: any tag table forces the mixed down launcher — never a
+    // representative V1/V2 dispatch of a tagged layer.
+    assert_eq!(
+        prefill_path1_down_kind_tag_aware(DType::MQ4G256V2, true),
+        Some("mixed")
+    );
+    assert_eq!(
+        prefill_path1_down_kind_tag_aware(DType::MQ6G256V2, true),
+        Some("mixed")
+    );
+    assert_eq!(
+        prefill_path1_down_kind_tag_aware(DType::MQ6G256V2, false),
+        Some("mq6v2")
+    );
+}
+
+/// V2 D3 restriction: only HFQ4/MQ4V1 may call `gemv_hfq4g256_moe_ninepath_d3`.
+/// V2 uniform pairs use exact native indexed gate + V2 D4 — never the HFQ4 D3
+/// gate (dual-half header is silent fluent corruption on the same stride).
+#[test]
+fn ninepath_d3_restricts_v2_to_native_gate_and_d4() {
+    // Sole admitted D3 pair.
+    assert_eq!(
+        ninepath_d3_family(DType::MQ4G256, DType::MQ4G256),
+        Some("hfq4")
+    );
+
+    // V2 uniforms have D4 families but NEVER a D3 family.
+    assert_eq!(ninepath_d3_family(DType::MQ4G256V2, DType::MQ4G256V2), None);
+    assert_eq!(ninepath_d3_family(DType::MQ6G256V2, DType::MQ6G256V2), None);
+    assert_eq!(
+        ninepath_d4_family(DType::MQ4G256V2, DType::MQ4G256V2),
+        Some("mq4v2"),
+        "V2 still has its own D4 path"
+    );
+    assert_eq!(
+        ninepath_d4_family(DType::MQ6G256V2, DType::MQ6G256V2),
+        Some("mq6v2"),
+        "V2 still has its own D4 path"
+    );
+
+    // Lloyd D4 pair is not D3 either (D3 is HFQ4-only).
+    assert_eq!(
+        ninepath_d3_family(DType::MQ2G256Lloyd, DType::MQ3G256Lloyd),
+        None
+    );
+
+    // Split V1/V2 pairings share neither D3 nor D4.
+    for (g, dn) in [
+        (DType::MQ4G256V2, DType::MQ4G256),
+        (DType::MQ4G256, DType::MQ4G256V2),
+        (DType::MQ6G256V2, DType::MQ6G256),
+        (DType::MQ4G256V2, DType::MQ6G256V2),
+    ] {
+        assert_eq!(ninepath_d3_family(g, dn), None, "{g:?}/{dn:?}");
+        assert_eq!(ninepath_d4_family(g, dn), None, "{g:?}/{dn:?}");
+    }
 }
 
 // ── op-list interpreter: match_prefix (pure logic) ──────────────────────────

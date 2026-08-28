@@ -2034,6 +2034,33 @@ def gram3(toks):
     from collections import Counter
     c = Counter(g); return sum(v for v in c.values() if v > 1) / len(g)
 
+def _token_attractor(toks):
+    first, last, half = toks[:128], toks[-128:], toks[len(toks)//2:]
+    return (
+        (bool(first) and (uniq(first) < 0.15 or maxfreq(first) > 0.50))
+        or (bool(last) and (uniq(last) < 0.30 or maxfreq(last) > 0.50))
+        or gram3(half) > 0.50
+    )
+
+def _response_has_attractor(think_text, visible_text):
+    # A reasoning model commonly drafts its eventual answer near the end of
+    # reasoning, then emits that answer visibly. Concatenating both channels
+    # turns this normal cross-channel repetition into a false token attractor.
+    # Score each channel independently; genuine repetition in either still fails.
+    think_tokens = re.findall(r"\S+", think_text.strip())
+    visible_tokens = re.findall(r"\S+", visible_text.strip())
+    return _token_attractor(think_tokens) or _token_attractor(visible_tokens)
+
+def _self_test_attractor_channels():
+    draft = [f"answer-{i}" for i in range(60)]
+    reasoning = " ".join([f"plan-{i}" for i in range(70)] + draft)
+    visible = " ".join(draft)
+    combined = re.findall(r"\S+", f"{reasoning} {visible}")
+    assert _token_attractor(combined), "fixture must reproduce the old false positive"
+    assert not _response_has_attractor(reasoning, visible)
+    assert _response_has_attractor("loop " * 200, "")
+    print("serve_harness: attractor-channel self-test OK", flush=True)
+
 def _project_mtp_ngram_timings(timings):
     """Project MTP/ngram timing fields from a daemon timings object for report rows.
 
@@ -2467,10 +2494,7 @@ def send(cfg, messages, tools=None):
     # Legacy stringified preview for backwards compat
     tool_s = " ".join(json.dumps(tc) for tc in tool_calls) if tool_calls else ""
     visible = (ans_s + " " + tool_s).strip()
-    toks = re.findall(r"\S+", (think_s + " " + visible).strip())
-    first, last, half = toks[:128], toks[-128:], toks[len(toks)//2:]
-    bad = (bool(first) and (uniq(first) < 0.15 or maxfreq(first) > 0.50)) or \
-          (bool(last) and (uniq(last) < 0.30 or maxfreq(last) > 0.50)) or (gram3(half) > 0.50)
+    bad = _response_has_attractor(think_s, visible)
     # ATEM leak detection (visible content deltas must not contain raw ATEM markup)
     atem_leak = ("<atem:" in ans_s) or ("<atem:" in think_s) or any("<atem:" in (tc.get("function", {}).get("arguments") or "") for tc in tool_calls)
     return {
@@ -2908,6 +2932,7 @@ def main():
         _self_test_glimmer_feedback_shape()
         _self_test_glimmer_tool_delta_merge()
         _self_test_glimmer_transcript_and_trace()
+        _self_test_attractor_channels()
         return
     if not args.model:
         ap.error("--model is required unless --self-test")
