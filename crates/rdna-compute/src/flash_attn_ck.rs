@@ -99,6 +99,7 @@ pub struct FlashAttnCkPrefillInput {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlashAttnCkRejectReason {
     Decode,
+    SmallQuery,
     UnsupportedFormat,
     UnsupportedHeadDim,
     InvalidGqa,
@@ -111,6 +112,10 @@ pub enum FlashAttnCkRejectReason {
     BlockAttention,
     CapabilityMiss,
 }
+
+// The current CK cells are bulk-prefill kernels. DSpark verifies at most 15
+// target tokens per step and is faster on the native small-query path.
+const FLASH_ATTN_CK_MIN_QUERY_TOKENS: usize = 16;
 
 /// Admit the first production cell only. Later quantized cells should extend
 /// this policy explicitly instead of weakening its fail-closed conditions.
@@ -161,6 +166,9 @@ fn select_packed_prefill_capabilities(
     let request = input.request;
     if input.batch_size <= 1 {
         return Err(FlashAttnCkRejectReason::Decode);
+    }
+    if input.batch_size < FLASH_ATTN_CK_MIN_QUERY_TOKENS {
+        return Err(FlashAttnCkRejectReason::SmallQuery);
     }
     if input.nhead_k == 0
         || input.nhead_q < input.nhead_k
@@ -919,6 +927,7 @@ impl crate::Gpu {
 fn reject_reason_name(reason: FlashAttnCkRejectReason) -> &'static str {
     match reason {
         FlashAttnCkRejectReason::Decode => "decode",
+        FlashAttnCkRejectReason::SmallQuery => "small_query",
         FlashAttnCkRejectReason::UnsupportedFormat => "format_miss",
         FlashAttnCkRejectReason::UnsupportedHeadDim => "head_dim_miss",
         FlashAttnCkRejectReason::InvalidGqa => "gqa_miss",
@@ -1092,6 +1101,14 @@ mod tests {
             select_asym3_givens_prefill_capabilities(&[cell], input),
             Ok(input.request)
         );
+        let minimum_bulk_query = FlashAttnCkPrefillInput {
+            batch_size: FLASH_ATTN_CK_MIN_QUERY_TOKENS,
+            ..input
+        };
+        assert_eq!(
+            select_asym3_givens_prefill_capabilities(&[cell], minimum_bulk_query),
+            Ok(input.request)
+        );
         for (rejected, reason) in [
             (
                 FlashAttnCkPrefillInput {
@@ -1099,6 +1116,13 @@ mod tests {
                     ..input
                 },
                 FlashAttnCkRejectReason::Decode,
+            ),
+            (
+                FlashAttnCkPrefillInput {
+                    batch_size: FLASH_ATTN_CK_MIN_QUERY_TOKENS - 1,
+                    ..input
+                },
+                FlashAttnCkRejectReason::SmallQuery,
             ),
             (
                 FlashAttnCkPrefillInput {
@@ -1178,6 +1202,13 @@ mod tests {
                     ..eligible_q8_prefill()
                 },
                 FlashAttnCkRejectReason::Decode,
+            ),
+            (
+                FlashAttnCkPrefillInput {
+                    batch_size: FLASH_ATTN_CK_MIN_QUERY_TOKENS - 1,
+                    ..eligible_q8_prefill()
+                },
+                FlashAttnCkRejectReason::SmallQuery,
             ),
             (
                 FlashAttnCkPrefillInput {
