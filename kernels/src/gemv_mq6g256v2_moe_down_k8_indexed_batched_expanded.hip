@@ -1,59 +1,61 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 #include <hip/hip_runtime.h>
-#include <hip/hip_fp16.h>  // __ushort_as_half / __half2float for the qt44 f16 header
+#include <hip/hip_fp16.h>  // __ushort_as_half / __half2float for the qt47 f16 header
 
 #ifndef HIPFIRE_MOE_DOWN_LAST_COMBINE
 #define HIPFIRE_MOE_DOWN_LAST_COMBINE 0
 #endif
 
 #ifndef HIPFIRE_MOE_DOWN_KERNEL
-#define HIPFIRE_MOE_DOWN_KERNEL gemv_mq4g256v2_moe_down_k8_indexed_batched_expanded
+#define HIPFIRE_MOE_DOWN_KERNEL gemv_mq6g256v2_moe_down_k8_indexed_batched_expanded
 #endif
 
-// MQ4G256V2 (qt=44) sister of
-// `gemv_hfq4g256_moe_down_k8_indexed_batched_expanded`.
+// MQ6G256V2 (qt=47) sister of
+// `gemv_mq4g256v2_moe_down_k8_indexed_batched_expanded` (layout/counter tail)
+// and `gemv_hfq6g256_moe_down_k8_indexed_batched_expanded` (6-bit payload).
 //
-// Transcribed from that kernel; the tiling, x hoisting, pairwise fold,
-// wavefront reduction and output layout are identical. The ONLY difference is
-// the group header decode: qt44 carries TWO fp16 scale/zero pairs per
-// 256-weight group (one per 128-weight half) where qt13 carries one f32 pair
-// for all 256. Same 136 B stride, same nibble packing.
+// Transcribed from the MQ4V2 expanded-down kernel; the tiling, x hoisting,
+// pairwise fold, wavefront reduction, expanded output layout, and optional
+// LAST_COMBINE counter tail are identical. The layout axis that changes is
+// the group wire:
 //
-// The affine grid is LANE-CONSTANT here (see `hoff` below), so qt44's header
-// read is one 4-byte load against qt13's two.
+//   qt44 MQ4G256V2  136 B/G256: dual fp16 s/z header + 128 nibble bytes
+//   qt47 MQ6G256V2  200 B/G256: dual fp16 s/z header + 192 B 6-bit payload
 //
-// Atomic-free variant of the residual_scaled sister.
+// Header identity MUST NOT collapse with HFQ6/MQ6 V1 (qt=6 / legacy f32
+// scale+zero over all 256). Wrong dispatch yields fluent corruption:
 //
-// Same per-(token, krank) GEMV compute. Instead of `atomicAdd(scale * acc)`
-// into a shared `x_residual[N × M]` row (K_TOP-way contention per output
-// cell, observed ~387 GiB/s on R9700/gfx1201 vs the sister gate_up at
-// 954 GiB/s with the same MQ4 layout but no atomic), this kernel writes
-// each (token, krank) result to its own row in an expanded buffer
-// `expert_outputs[N × K_TOP × M]`. A separate `moe_down_combine_k8_batched`
-// kernel folds K_TOP outputs back into the residual stream with topk_weights
-// applied — see kernels/src/moe_down_combine_k8_batched.hip.
+//   qt6  HFQ6G256     [0..4)  f32 scale (all 256)
+//                     [4..8)  f32 zero  (all 256)
+//                     [8..200) 192 B 6-bit packed quants
 //
-// Shapes (vs the residual_scaled variant):
-//   expert_ptrs    : [n_exp]                — unchanged
-//   topk_indices   : [N × K_TOP]            — unchanged
-//   rot_batch      : [N × K_TOP × K]        — unchanged
-//   expert_outputs : [N × K_TOP × M]        — replaces x_residual; non-atomic
-// Note: `topk_weights` is NOT consumed here; the combine kernel applies the
-// scale during reduction over K_TOP. Dropping the weights load also saves
-// a small amount of bandwidth.
+//   qt47 MQ6G256V2    [0..2)  f16 scale, weights   0..127
+//                     [2..4)  f16 zero,  weights   0..127
+//                     [4..6)  f16 scale, weights 128..255
+//                     [6..8)  f16 zero,  weights 128..255
+//                     [8..200) 192 B 6-bit packed quants (identical packing)
 //
-// Grid: (M, K_TOP, N). Block = 32 threads. No atomic ops — each output
-// address is written by exactly one workgroup, so the writes are pure
-// stores.
+// Affine-grid selection is LANE-CONSTANT (same as MQ4V2): tid 0..15 → header
+// at gp+0; tid 16..31 → header at gp+4. Payload is 8 weights / 6 bytes per
+// lane (boff = tid*6), decoded exactly as dense `gemv_mq6g256v2` / HFQ6 MoE.
 //
-// VARIANT R17c1 down_g2_hoist_x16:
-// BOD: L2-resident/mixed occ~43% mem_busy~44% (post g2_branchless_fulltile WIN).
-// Current body: per-group LOAD_X8 then 4 DOGs → x-load serializes with weight
-// DOG for each of the 2 groups. residual/multirow R13/R15 WIN was hoisting
-// full x for the group-quad BEFORE dual-row DOG so weight MAC dual-issues
-// against resident x under L2-resident weights. Apply that here: float4×4
-// hoist of both groups' 16 x lanes first, then all 8 DOGs (4 rows × 2
-// groups) with x resident. Value-preserving: same sc/zp/pk, same FMA order
-// per DOG, same pairwise slot fold + shfl reduce + masked store.
+// Atomic-free variant: each (token, krank) GEMV writes its own row in
+// `expert_outputs[N × K_TOP × M]`. Optional LAST_COMBINE folds K_TOP into
+// x_residual via the scratch counter tail immediately after the expanded
+// payload — identical deterministic layout to the MQ4V2 sister.
+//
+// Shapes:
+//   expert_ptrs    : [n_exp]
+//   topk_indices   : [N × K_TOP]
+//   rot_batch      : [N × K_TOP × K]   (already FWHT-G256 rotated F32)
+//   expert_outputs : [N × K_TOP × M]   non-atomic, one writer per cell
+// Note: `topk_weights` is NOT consumed unless LAST_COMBINE is enabled.
+//
+// Grid: (ceil(M/4), K_TOP, N). Block = 32 threads. K%256==0 → groups=K/256
+// (K=512 → 2 groups, matches the MQ4V2 expanded-down specialization this clones).
 
 __launch_bounds__(32, 16)
 extern "C" __global__ void HIPFIRE_MOE_DOWN_KERNEL(
@@ -85,14 +87,17 @@ extern "C" __global__ void HIPFIRE_MOE_DOWN_KERNEL(
         reinterpret_cast<const char*>(expert_ptrs[expert_id]);
     const float* __restrict__ x =
         rot_batch + ((long long)bid * K_TOP + krank) * K;
-    // Arbitrary K%256==0: groups_per_row = K/256 (K=512 → 2). Row stride is groups*136.
+
+    // K%256==0 → groups_per_row = K/256; row stride is groups*200 (qt47), not groups*136 (qt44).
     const int groups_per_row = K / 256;
-    const long long row_stride = (long long)groups_per_row * 136;
+    const long long row_stride = (long long)groups_per_row * 200;
+    // Clamp OOB rows to row0 for weight reads (safe in-bounds); store still masked.
     const char* row_ptr0 = A + (long long)row0 * row_stride;
     const char* row_ptr1 = A + (long long)(have_row1 ? row1 : row0) * row_stride;
     const char* row_ptr2 = A + (long long)(have_row2 ? row2 : row0) * row_stride;
     const char* row_ptr3 = A + (long long)(have_row3 ? row3 : row0) * row_stride;
-    const int boff = tid * 4;
+    // 8 weights × 6 bits = 48 bits = 6 bytes per lane.
+    const int boff = tid * 6;
     // Lane-constant affine-grid header offset: tid 0..15 -> weights 0..127
     // (grid 0, header at gp+0); tid 16..31 -> weights 128..255 (grid 1, gp+4).
     const int hoff = (tid < 16) ? 0 : 4;
@@ -113,14 +118,18 @@ extern "C" __global__ void HIPFIRE_MOE_DOWN_KERNEL(
     __builtin_amdgcn_s_prefetch_data((const void*)row_ptr3, 0);
 #endif
 
-    // Accumulators — general K%256==0, K=512 fast path identical.
-    float acc = 0.0f, bcc = 0.0f, ccc = 0.0f, dcc = 0.0f;
+    // Arbitrary K%256==0: groups_per_row = K/256 (K=512 → 2, K=256 → 1, etc.)
+    // Preserve K=512 unrolled fast path bitwise-identical to prior specialization;
+    // otherwise use general group loop. 4-row tiling/output/counters unchanged.
+    float acc = 0.0f;
+    float bcc = 0.0f;
+    float ccc = 0.0f;
+    float dcc = 0.0f;
 
     #if HIPFIRE_GFX1151_MOE_DOWN_HYBRID_BUFFER
-    // gfx1151 hybrid cache lowering: scale/zero-point are wave-uniform, so
-    // preserve their scalar/global path. Only the lane-divergent packed nibbles
-    // use temporal buffer VMEM. This avoids turning uniform headers into 64
-    // redundant vector loads while retaining the lean packed-weight address.
+    // gfx1151 hybrid cache lowering: scale/zero-point are wave-uniform within
+    // each half, so preserve their scalar/global path. 6-bit packed payload
+    // stays on the lean direct byte path (same as dense gemv_mq6g256v2).
     #define HIPFIRE_MOE_DOWN_LOAD_HDR(rsrc, gp, weight_offset) (*(const unsigned int*)((gp) + hoff))
     #else
     #define HIPFIRE_MOE_DOWN_LOAD_HDR(rsrc, gp, weight_offset) \
@@ -131,20 +140,29 @@ extern "C" __global__ void HIPFIRE_MOE_DOWN_KERNEL(
         unsigned int h = HIPFIRE_MOE_DOWN_LOAD_HDR(rsrc, gp, weight_offset); \
         float sc = __half2float(__ushort_as_half((unsigned short)(h & 0xFFFFu))); \
         float zp = __half2float(__ushort_as_half((unsigned short)(h >> 16))); \
-        unsigned int pk = HIPFIRE_WEIGHT_LOAD_PTR_U32(rsrc, (gp) + 8 + boff, (weight_offset) + 8 + boff); \
-        (a) += (sc * (float)((pk) & 0xFu)         + zp) * (x0) \
-             + (sc * (float)(((pk) >> 4) & 0xFu)  + zp) * (x1) \
-             + (sc * (float)(((pk) >> 8) & 0xFu)  + zp) * (x2) \
-             + (sc * (float)(((pk) >> 12) & 0xFu) + zp) * (x3) \
-             + (sc * (float)(((pk) >> 16) & 0xFu) + zp) * (x4) \
-             + (sc * (float)(((pk) >> 20) & 0xFu) + zp) * (x5) \
-             + (sc * (float)(((pk) >> 24) & 0xFu) + zp) * (x6) \
-             + (sc * (float)(((pk) >> 28) & 0xFu) + zp) * (x7); \
+        const unsigned char* d = (const unsigned char*)((gp) + 8 + boff); \
+        unsigned char b0 = d[0]; unsigned char b1 = d[1]; unsigned char b2 = d[2]; \
+        unsigned char b3 = d[3]; unsigned char b4 = d[4]; unsigned char b5 = d[5]; \
+        int q0 = b0 & 63; \
+        int q1 = (b0 >> 6) | ((b1 & 0xF) << 2); \
+        int q2 = (b1 >> 4) | ((b2 & 3) << 4); \
+        int q3 = b2 >> 2; \
+        int q4 = b3 & 63; \
+        int q5 = (b3 >> 6) | ((b4 & 0xF) << 2); \
+        int q6 = (b4 >> 4) | ((b5 & 3) << 4); \
+        int q7 = b5 >> 2; \
+        (a) += (sc * (float)q0 + zp) * (x0) \
+             + (sc * (float)q1 + zp) * (x1) \
+             + (sc * (float)q2 + zp) * (x2) \
+             + (sc * (float)q3 + zp) * (x3) \
+             + (sc * (float)q4 + zp) * (x4) \
+             + (sc * (float)q5 + zp) * (x5) \
+             + (sc * (float)q6 + zp) * (x6) \
+             + (sc * (float)q7 + zp) * (x7); \
     } while (0)
 
     if (groups_per_row == 2) {
-        // K=512 fast/unrolled — bitwise identical to the original 2-group body.
-        // Preserve pairwise slots and hoisted x for identical scheduling/output.
+        // K=512 fast path — bitwise identical to prior 2-group specialization.
         float acc0 = 0.0f, acc1 = 0.0f;
         float bcc0 = 0.0f, bcc1 = 0.0f;
         float ccc0 = 0.0f, ccc1 = 0.0f;
@@ -154,44 +172,43 @@ extern "C" __global__ void HIPFIRE_MOE_DOWN_KERNEL(
         const float4 xv0b = *reinterpret_cast<const float4*>(x + base0 + 4);
         const float4 xv1a = *reinterpret_cast<const float4*>(x + base0 + 256);
         const float4 xv1b = *reinterpret_cast<const float4*>(x + base0 + 260);
-        DOG_X8(row_ptr0 + 0 * 136, row_rsrc0, 0 * 136, acc0,
+        DOG_X8(row_ptr0 + 0 * 200, row_rsrc0, 0 * 200, acc0,
                xv0a.x, xv0a.y, xv0a.z, xv0a.w, xv0b.x, xv0b.y, xv0b.z, xv0b.w);
-        DOG_X8(row_ptr1 + 0 * 136, row_rsrc1, 0 * 136, bcc0,
+        DOG_X8(row_ptr1 + 0 * 200, row_rsrc1, 0 * 200, bcc0,
                xv0a.x, xv0a.y, xv0a.z, xv0a.w, xv0b.x, xv0b.y, xv0b.z, xv0b.w);
-        DOG_X8(row_ptr2 + 0 * 136, row_rsrc2, 0 * 136, ccc0,
+        DOG_X8(row_ptr2 + 0 * 200, row_rsrc2, 0 * 200, ccc0,
                xv0a.x, xv0a.y, xv0a.z, xv0a.w, xv0b.x, xv0b.y, xv0b.z, xv0b.w);
-        DOG_X8(row_ptr3 + 0 * 136, row_rsrc3, 0 * 136, dcc0,
+        DOG_X8(row_ptr3 + 0 * 200, row_rsrc3, 0 * 200, dcc0,
                xv0a.x, xv0a.y, xv0a.z, xv0a.w, xv0b.x, xv0b.y, xv0b.z, xv0b.w);
-        DOG_X8(row_ptr0 + 1 * 136, row_rsrc0, 1 * 136, acc1,
+        DOG_X8(row_ptr0 + 1 * 200, row_rsrc0, 1 * 200, acc1,
                xv1a.x, xv1a.y, xv1a.z, xv1a.w, xv1b.x, xv1b.y, xv1b.z, xv1b.w);
-        DOG_X8(row_ptr1 + 1 * 136, row_rsrc1, 1 * 136, bcc1,
+        DOG_X8(row_ptr1 + 1 * 200, row_rsrc1, 1 * 200, bcc1,
                xv1a.x, xv1a.y, xv1a.z, xv1a.w, xv1b.x, xv1b.y, xv1b.z, xv1b.w);
-        DOG_X8(row_ptr2 + 1 * 136, row_rsrc2, 1 * 136, ccc1,
+        DOG_X8(row_ptr2 + 1 * 200, row_rsrc2, 1 * 200, ccc1,
                xv1a.x, xv1a.y, xv1a.z, xv1a.w, xv1b.x, xv1b.y, xv1b.z, xv1b.w);
-        DOG_X8(row_ptr3 + 1 * 136, row_rsrc3, 1 * 136, dcc1,
+        DOG_X8(row_ptr3 + 1 * 200, row_rsrc3, 1 * 200, dcc1,
                xv1a.x, xv1a.y, xv1a.z, xv1a.w, xv1b.x, xv1b.y, xv1b.z, xv1b.w);
         acc = acc0 + acc1;
         bcc = bcc0 + bcc1;
         ccc = ccc0 + ccc1;
         dcc = dcc0 + dcc1;
     } else {
-        // General K%256==0: sequential group loop, one accumulator per row.
         for (int g = 0; g < groups_per_row; ++g) {
-            const char* gp0 = row_ptr0 + (long long)g * 136;
-            const char* gp1 = row_ptr1 + (long long)g * 136;
-            const char* gp2 = row_ptr2 + (long long)g * 136;
-            const char* gp3 = row_ptr3 + (long long)g * 136;
-            const long long w_off = (long long)g * 136;
-            const int x_off = g * 256 + tid * 8;
-            const float4 xv_a = *reinterpret_cast<const float4*>(x + x_off);
-            const float4 xv_b = *reinterpret_cast<const float4*>(x + x_off + 4);
-            DOG_X8(gp0, row_rsrc0, w_off, acc,
+            const int g_off = g * 200;
+            const char* gp0 = row_ptr0 + g_off;
+            const char* gp1 = row_ptr1 + g_off;
+            const char* gp2 = row_ptr2 + g_off;
+            const char* gp3 = row_ptr3 + g_off;
+            const int x_base = g * 256 + tid * 8;
+            const float4 xv_a = *reinterpret_cast<const float4*>(x + x_base);
+            const float4 xv_b = *reinterpret_cast<const float4*>(x + x_base + 4);
+            DOG_X8(gp0, row_rsrc0, g_off, acc,
                    xv_a.x, xv_a.y, xv_a.z, xv_a.w, xv_b.x, xv_b.y, xv_b.z, xv_b.w);
-            DOG_X8(gp1, row_rsrc1, w_off, bcc,
+            DOG_X8(gp1, row_rsrc1, g_off, bcc,
                    xv_a.x, xv_a.y, xv_a.z, xv_a.w, xv_b.x, xv_b.y, xv_b.z, xv_b.w);
-            DOG_X8(gp2, row_rsrc2, w_off, ccc,
+            DOG_X8(gp2, row_rsrc2, g_off, ccc,
                    xv_a.x, xv_a.y, xv_a.z, xv_a.w, xv_b.x, xv_b.y, xv_b.z, xv_b.w);
-            DOG_X8(gp3, row_rsrc3, w_off, dcc,
+            DOG_X8(gp3, row_rsrc3, g_off, dcc,
                    xv_a.x, xv_a.y, xv_a.z, xv_a.w, xv_b.x, xv_b.y, xv_b.z, xv_b.w);
         }
     }

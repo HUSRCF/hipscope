@@ -730,6 +730,119 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         return Some(vec![read(0), read(8), read(16), read(24), write(32)]);
     }
 
+    // MQ4G256V2 / MQ6G256V2 MoE routes. Exact sister ABIs of the HFQ4/MQ4V2
+    // launchers — V1/V2 names must never alias. Offsets are the naturally
+    // aligned HIP kernarg fields; launch_maybe_blob pads the recorded block
+    // to 16 B (see expected_kernarg_bytes).
+    if matches!(
+        kernel,
+        "gemv_mq4g256v2_moe_gate_up_k8_indexed"
+            | "gemv_mq6g256v2_moe_gate_up_k8_indexed"
+            // Batched Path1 sisters: same pointer set/modes; K_TOP scalar
+            // only changes the recorded kernarg length (64 B padded).
+            | "gemv_mq4g256v2_moe_gate_up_k8_indexed_batched"
+            | "gemv_mq6g256v2_moe_gate_up_k8_indexed_batched"
+    ) {
+        return Some(vec![read(0), read(8), read(16), write(24), write(32)]);
+    }
+    if matches!(
+        kernel,
+        "gemv_mq4g256v2_moe_down_k8_indexed_batched_expanded"
+            | "gemv_mq6g256v2_moe_down_k8_indexed_batched_expanded"
+    ) {
+        return Some(vec![read(0), read(8), read(16), write(24)]);
+    }
+    if matches!(
+        kernel,
+        "gemv_mq4g256v2_moe_ninepath_d4" | "gemv_mq6g256v2_moe_ninepath_d4"
+    ) {
+        // expert_ptrs, topk_indices, topk_weights, act (read); out is RMW.
+        return Some(vec![read(0), read(8), read(16), read(24), write(32)]);
+    }
+    if matches!(
+        kernel,
+        "gemm_mq4g256v2_moe_grouped_wmma_k2"
+            | "gemm_mq4g256v2_moe_grouped_wmma_gfx12"
+            | "gemm_mq6g256v2_moe_grouped_wmma_k2"
+            | "gemm_mq6g256v2_moe_grouped_wmma_gfx12"
+    ) {
+        // expert_weight_ptrs, tile_ids, sorted_slot_index, X_src (read);
+        // Y_grouped (write).
+        return Some(vec![read(0), read(8), read(16), read(24), write(32)]);
+    }
+    // Mixed-precision MoE (tags 0..18, V1/V2 frozen). Block-uniform dtype_tags branch.
+    // Gate/up carries 6 pointers (adds dtype_tags at +8); down carries 5.
+    // Grouped mixed carries 6 pointers (adds dtype_tags at +8). V1/V2 names never alias.
+    if kernel == "gemv_mixed_moe_gate_up_k8_indexed_batched" {
+        // expert_ptrs, dtype_tags, topk_indices, x, y_gate, y_up
+        return Some(vec![
+            read(0),
+            read(8),
+            read(16),
+            read(24),
+            write(32),
+            write(40),
+        ]);
+    }
+    if kernel == "gemv_mixed_moe_down_k8_indexed_batched_expanded" {
+        // expert_ptrs, dtype_tags, topk_indices, rot_batch, expert_outputs
+        return Some(vec![read(0), read(8), read(16), read(24), write(32)]);
+    }
+    if matches!(
+        kernel,
+        "gemm_mixed_moe_grouped_wmma_k2"
+            | "gemm_mixed_moe_grouped_wmma_gfx12"
+            | "gemm_mixed_moe_grouped_wmma_4w_k2"
+    ) {
+        // expert_weight_ptrs, dtype_tags, tile_ids, sorted_slot_index, X_src (read); Y_grouped (write)
+        return Some(vec![
+            read(0),
+            read(8),
+            read(16),
+            read(24),
+            read(32),
+            write(40),
+        ]);
+    }
+    // Dense shared-expert V2 (qt44 qt47). Plain GEMV / residual / multirow share the same
+    // 3-pointer ABI: a_raw, x (read); y (write/RMW). Same padded size as HFQ4 dense.
+    if matches!(
+        kernel,
+        "gemv_mq4g256v2"
+            | "gemv_mq4g256v2_residual"
+            | "gemv_mq6g256v2"
+            | "gemv_mq6g256v2_residual"
+            | "gemv_mq4g256v2_multirow_r2"
+            | "gemv_mq4g256v2_multirow_r4"
+            | "gemv_mq4g256v2_multirow_r8"
+            | "gemv_mq6g256v2_multirow_r2"
+            | "gemv_mq6g256v2_multirow_r4"
+            | "gemv_mq6g256v2_multirow_r8"
+    ) {
+        return Some(vec![read(0), read(8), write(16)]);
+    }
+    // Dense shared-expert V2 residual WMMA GEMM (prefill/batched). 3 pointers + 3 i32
+    // (M,K,batch). Y is write (output) via residual path; distinct symbols per arch tile.
+    if matches!(
+        kernel,
+        "gemm_mq4g256v2_residual_wmma"
+            | "gemm_mq4g256v2_residual_wmma_gfx12"
+            | "gemm_mq6g256v2_residual_wmma"
+            | "gemm_mq6g256v2_residual_wmma_gfx12"
+            | "gemm_mq4g256v2_residual_wmma_gfx11_bt4"
+            | "gemm_mq4g256v2_residual_wmma_gfx11_bt6"
+            | "gemm_mq4g256v2_residual_wmma_gfx11_bt8"
+            | "gemm_mq6g256v2_residual_wmma_gfx11_bt4"
+            | "gemm_mq6g256v2_residual_wmma_gfx11_bt6"
+            | "gemm_mq6g256v2_residual_wmma_gfx11_bt8"
+            | "gemm_mq4g256v2_residual_wmma_gfx1100_mw4_lds"
+            | "gemm_mq4g256v2_residual_wmma_gfx1100_mw8_lds"
+            | "gemm_mq6g256v2_residual_wmma_gfx11_mw4_lds"
+            | "gemm_mq6g256v2_residual_wmma_gfx11_mw8_lds"
+    ) {
+        return Some(vec![read(0), read(8), write(16)]);
+    }
+
     if kernel == "moe_router_softmax_topk_k8_wave64_exact_shared_silu_mq_rotate" {
         return Some(vec![
             read(0),
@@ -1277,6 +1390,79 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
             | "gemv_mq3g256gl_moe_down_residual_scaled_k8_indexed"
     ) {
         return Some(80);
+    }
+
+    // MQ4G256V2 / MQ6G256V2 MoE: exact sister ABIs. Sizes are the recorded
+    // launch_maybe_blob lengths (natural fields + pad_to(16)).
+    //   gate_up / ninepath: 5 ptr + 2 i32 = 48
+    //   expanded down:      4 ptr + 3 i32 = 44 → 48 padded
+    //   gate_up batched:    5 ptr + 3 i32 = 52 → 64 padded
+    //   grouped WMMA:       5 ptr + 4 i32 = 56 → 64 padded
+    //   mixed gate_up:      6 ptr + 3 i32 = 60 → 64 padded
+    //   mixed down:         5 ptr + 3 i32 = 52 → 64 padded
+    //   mixed grouped:      6 ptr + 4 i32 = 64 (already aligned)
+    //   dense GEMV:         3 ptr + 2 i32 = 32
+    //   dense GEMM WMMA:    3 ptr + 3 i32 = 36 → 48 padded
+    if matches!(
+        kernel,
+        "gemv_mq4g256v2_moe_gate_up_k8_indexed"
+            | "gemv_mq6g256v2_moe_gate_up_k8_indexed"
+            | "gemv_mq4g256v2_moe_down_k8_indexed_batched_expanded"
+            | "gemv_mq6g256v2_moe_down_k8_indexed_batched_expanded"
+            | "gemv_mq4g256v2_moe_ninepath_d4"
+            | "gemv_mq6g256v2_moe_ninepath_d4"
+    ) {
+        return Some(48);
+    }
+    if matches!(
+        kernel,
+        "gemv_mq4g256v2_moe_gate_up_k8_indexed_batched"
+            | "gemv_mq6g256v2_moe_gate_up_k8_indexed_batched"
+            | "gemm_mq4g256v2_moe_grouped_wmma_k2"
+            | "gemm_mq4g256v2_moe_grouped_wmma_gfx12"
+            | "gemm_mq6g256v2_moe_grouped_wmma_k2"
+            | "gemm_mq6g256v2_moe_grouped_wmma_gfx12"
+            | "gemv_mixed_moe_gate_up_k8_indexed_batched"
+            | "gemv_mixed_moe_down_k8_indexed_batched_expanded"
+            | "gemm_mixed_moe_grouped_wmma_k2"
+            | "gemm_mixed_moe_grouped_wmma_gfx12"
+            | "gemm_mixed_moe_grouped_wmma_4w_k2"
+    ) {
+        return Some(64);
+    }
+    if matches!(
+        kernel,
+        "gemv_mq4g256v2"
+            | "gemv_mq4g256v2_residual"
+            | "gemv_mq6g256v2"
+            | "gemv_mq6g256v2_residual"
+            | "gemv_mq4g256v2_multirow_r2"
+            | "gemv_mq4g256v2_multirow_r4"
+            | "gemv_mq4g256v2_multirow_r8"
+            | "gemv_mq6g256v2_multirow_r2"
+            | "gemv_mq6g256v2_multirow_r4"
+            | "gemv_mq6g256v2_multirow_r8"
+    ) {
+        return Some(32);
+    }
+    if matches!(
+        kernel,
+        "gemm_mq4g256v2_residual_wmma"
+            | "gemm_mq4g256v2_residual_wmma_gfx12"
+            | "gemm_mq6g256v2_residual_wmma"
+            | "gemm_mq6g256v2_residual_wmma_gfx12"
+            | "gemm_mq4g256v2_residual_wmma_gfx11_bt4"
+            | "gemm_mq4g256v2_residual_wmma_gfx11_bt6"
+            | "gemm_mq4g256v2_residual_wmma_gfx11_bt8"
+            | "gemm_mq6g256v2_residual_wmma_gfx11_bt4"
+            | "gemm_mq6g256v2_residual_wmma_gfx11_bt6"
+            | "gemm_mq6g256v2_residual_wmma_gfx11_bt8"
+            | "gemm_mq4g256v2_residual_wmma_gfx1100_mw4_lds"
+            | "gemm_mq4g256v2_residual_wmma_gfx1100_mw8_lds"
+            | "gemm_mq6g256v2_residual_wmma_gfx11_mw4_lds"
+            | "gemm_mq6g256v2_residual_wmma_gfx11_mw8_lds"
+    ) {
+        return Some(48);
     }
 
     if kernel.starts_with("gated_delta_net_q8_compact") {
@@ -6092,6 +6278,351 @@ mod tests {
                 assert_eq!(got[3].mode, RecordedAccessMode::Read);
             }
         }
+    }
+
+    // Fail closed if an MQ4V2/MQ6V2 MoE kernel is admitted without a distinct
+    // resource contract. V2 names must never silently fall through to V1.
+    #[test]
+    fn mqv2_moe_symbols_have_resource_contracts() {
+        let gate_up_effects = vec![read(0), read(8), read(16), write(24), write(32)];
+        let expanded_down_effects = vec![read(0), read(8), read(16), write(24)];
+        let ninepath_effects = vec![read(0), read(8), read(16), read(24), write(32)];
+        let grouped_effects = vec![read(0), read(8), read(16), read(24), write(32)];
+
+        // Decode gate_up: 5 ptr + M,K = 48 B (already 16-aligned).
+        for symbol in [
+            "gemv_mq4g256v2_moe_gate_up_k8_indexed",
+            "gemv_mq6g256v2_moe_gate_up_k8_indexed",
+        ] {
+            assert_eq!(expected_kernarg_bytes(symbol), Some(48));
+            let got = pointer_effects(symbol).expect("mqv2 gate_up pointer contract");
+            assert_eq!(got.len(), gate_up_effects.len());
+            for (got_effect, want) in got.iter().zip(gate_up_effects.iter()) {
+                assert_eq!(got_effect.offset, want.offset);
+                assert_eq!(got_effect.mode, want.mode);
+            }
+        }
+
+        // Path1 batched gate_up: 5 ptr + M,K,K_TOP = 52 → pad_to(16) = 64.
+        // Prove the padded recorded length, not the bare field total.
+        for symbol in [
+            "gemv_mq4g256v2_moe_gate_up_k8_indexed_batched",
+            "gemv_mq6g256v2_moe_gate_up_k8_indexed_batched",
+        ] {
+            let mut blob = hip_bridge::KernargBlob::new();
+            for _ in 0..5 {
+                blob.push_ptr(std::ptr::null());
+            }
+            blob.push_i32(0);
+            blob.push_i32(0);
+            blob.push_i32(0);
+            assert_eq!(blob.len(), 52, "{symbol} explicit args occupy 52 bytes");
+            blob.pad_to(16);
+            assert_eq!(blob.len(), 64, "{symbol} recorded launches pad to 16");
+            assert_eq!(expected_kernarg_bytes(symbol), Some(blob.len()));
+            let got = pointer_effects(symbol).expect("mqv2 batched gate_up pointer contract");
+            assert_eq!(got.len(), gate_up_effects.len());
+            for (got_effect, want) in got.iter().zip(gate_up_effects.iter()) {
+                assert_eq!(got_effect.offset, want.offset);
+                assert_eq!(got_effect.mode, want.mode);
+            }
+        }
+
+        // Expanded down: 4 ptr + M,K,K_TOP = 44 → 48 padded.
+        for symbol in [
+            "gemv_mq4g256v2_moe_down_k8_indexed_batched_expanded",
+            "gemv_mq6g256v2_moe_down_k8_indexed_batched_expanded",
+        ] {
+            let mut blob = hip_bridge::KernargBlob::new();
+            for _ in 0..4 {
+                blob.push_ptr(std::ptr::null());
+            }
+            blob.push_i32(0);
+            blob.push_i32(0);
+            blob.push_i32(0);
+            assert_eq!(blob.len(), 44, "{symbol} explicit args occupy 44 bytes");
+            blob.pad_to(16);
+            assert_eq!(blob.len(), 48, "{symbol} recorded launches pad to 16");
+            assert_eq!(expected_kernarg_bytes(symbol), Some(blob.len()));
+            let got = pointer_effects(symbol).expect("mqv2 expanded down pointer contract");
+            assert_eq!(got.len(), expanded_down_effects.len());
+            for (got_effect, want) in got.iter().zip(expanded_down_effects.iter()) {
+                assert_eq!(got_effect.offset, want.offset);
+                assert_eq!(got_effect.mode, want.mode);
+            }
+        }
+
+        // Ninepath fused down+combine: 5 ptr + down_m,down_k = 48.
+        for symbol in [
+            "gemv_mq4g256v2_moe_ninepath_d4",
+            "gemv_mq6g256v2_moe_ninepath_d4",
+        ] {
+            assert_eq!(expected_kernarg_bytes(symbol), Some(48));
+            let got = pointer_effects(symbol).expect("mqv2 ninepath pointer contract");
+            assert_eq!(got.len(), ninepath_effects.len());
+            for (got_effect, want) in got.iter().zip(ninepath_effects.iter()) {
+                assert_eq!(got_effect.offset, want.offset);
+                assert_eq!(got_effect.mode, want.mode);
+            }
+            // Offset 24 is the rotated act (read); out RMW lives at 32.
+            assert_eq!(got[3].mode, RecordedAccessMode::Read);
+            assert_eq!(got[4].offset, 32);
+            assert_eq!(got[4].mode, RecordedAccessMode::Write);
+        }
+
+        // Grouped prefill WMMA: 5 ptr + M,K,x_row_div,m_total = 56 → 64.
+        // gfx11 `_k2` and gfx12 `_gfx12` are distinct symbols, not aliases.
+        for symbol in [
+            "gemm_mq4g256v2_moe_grouped_wmma_k2",
+            "gemm_mq4g256v2_moe_grouped_wmma_gfx12",
+            "gemm_mq6g256v2_moe_grouped_wmma_k2",
+            "gemm_mq6g256v2_moe_grouped_wmma_gfx12",
+        ] {
+            let mut blob = hip_bridge::KernargBlob::new();
+            for _ in 0..5 {
+                blob.push_ptr(std::ptr::null());
+            }
+            for _ in 0..4 {
+                blob.push_i32(0);
+            }
+            assert_eq!(blob.len(), 56, "{symbol} explicit args occupy 56 bytes");
+            blob.pad_to(16);
+            assert_eq!(blob.len(), 64, "{symbol} recorded launches pad to 16");
+            assert_eq!(expected_kernarg_bytes(symbol), Some(blob.len()));
+            let got = pointer_effects(symbol).expect("mqv2 grouped pointer contract");
+            assert_eq!(got.len(), grouped_effects.len());
+            for (got_effect, want) in got.iter().zip(grouped_effects.iter()) {
+                assert_eq!(got_effect.offset, want.offset);
+                assert_eq!(got_effect.mode, want.mode);
+            }
+        }
+
+        // No V1/V2 collapse: MQ4V2/MQ6V2 names are not HFQ4/HFQ6 contracts by alias.
+        assert!(
+            pointer_effects("gemv_mq4g256v2_moe_gate_up_k8_indexed").is_some()
+                && pointer_effects("gemv_hfq4g256_moe_gate_up_k8_indexed").is_some()
+        );
+        assert_ne!(
+            "gemv_mq4g256v2_moe_gate_up_k8_indexed",
+            "gemv_hfq4g256_moe_gate_up_k8_indexed"
+        );
+        assert_ne!(
+            "gemv_mq6g256v2_moe_gate_up_k8_indexed",
+            "gemv_mq4g256v2_moe_gate_up_k8_indexed"
+        );
+        // Unknown V2-looking name still fails closed.
+        assert!(pointer_effects("gemv_mq4g256v2_moe_gate_up_k8_indexed_unknown").is_none());
+        assert!(expected_kernarg_bytes("gemv_mq4g256v2_moe_gate_up_k8_indexed_unknown").is_none());
+    }
+
+    // Table-driven: mixed-precision MoE kernels (tags 0..18, V1/V2 never alias).
+    // Covers every kernel admitted to the mixed grouped/expanded replay path.
+    #[test]
+    fn mixed_moe_symbols_have_resource_contracts() {
+        let mixed_gate_up_effects =
+            vec![read(0), read(8), read(16), read(24), write(32), write(40)];
+        let mixed_down_effects = vec![read(0), read(8), read(16), read(24), write(32)];
+        let mixed_grouped_effects = vec![read(0), read(8), read(16), read(24), read(32), write(40)];
+
+        // Mixed gate_up batched: 6 ptr + M,K,K_TOP = 60 → 64 padded.
+        for symbol in ["gemv_mixed_moe_gate_up_k8_indexed_batched"] {
+            let mut blob = hip_bridge::KernargBlob::new();
+            for _ in 0..6 {
+                blob.push_ptr(std::ptr::null());
+            }
+            for _ in 0..3 {
+                blob.push_i32(0);
+            }
+            assert_eq!(blob.len(), 60, "{symbol} explicit args occupy 60 bytes");
+            blob.pad_to(16);
+            assert_eq!(blob.len(), 64, "{symbol} recorded launches pad to 16");
+            assert_eq!(expected_kernarg_bytes(symbol), Some(blob.len()));
+            let got = pointer_effects(symbol).expect("mixed gate_up pointer contract");
+            assert_eq!(
+                got.len(),
+                mixed_gate_up_effects.len(),
+                "{symbol} effect count"
+            );
+            for (got_effect, want) in got.iter().zip(mixed_gate_up_effects.iter()) {
+                assert_eq!(got_effect.offset, want.offset, "{symbol} offset");
+                assert_eq!(
+                    got_effect.mode, want.mode,
+                    "{symbol} mode at {}",
+                    want.offset
+                );
+            }
+            // Extra pointer is dtype_tags at +8 (read); y_gate/y_up are distinct writes.
+            assert_eq!(got[1].offset, 8);
+            assert_eq!(got[1].mode, RecordedAccessMode::Read);
+            assert_eq!(got[4].mode, RecordedAccessMode::Write);
+            assert_eq!(got[5].mode, RecordedAccessMode::Write);
+        }
+
+        // Mixed down expanded: 5 ptr + M,K,K_TOP = 52 → 64 padded.
+        for symbol in ["gemv_mixed_moe_down_k8_indexed_batched_expanded"] {
+            let mut blob = hip_bridge::KernargBlob::new();
+            for _ in 0..5 {
+                blob.push_ptr(std::ptr::null());
+            }
+            for _ in 0..3 {
+                blob.push_i32(0);
+            }
+            assert_eq!(blob.len(), 52, "{symbol} explicit args occupy 52 bytes");
+            blob.pad_to(16);
+            assert_eq!(blob.len(), 64, "{symbol} recorded launches pad to 16");
+            assert_eq!(expected_kernarg_bytes(symbol), Some(blob.len()));
+            let got = pointer_effects(symbol).expect("mixed down pointer contract");
+            assert_eq!(got.len(), mixed_down_effects.len(), "{symbol} effect count");
+            for (got_effect, want) in got.iter().zip(mixed_down_effects.iter()) {
+                assert_eq!(got_effect.offset, want.offset, "{symbol} offset");
+                assert_eq!(
+                    got_effect.mode, want.mode,
+                    "{symbol} mode at {}",
+                    want.offset
+                );
+            }
+            assert_eq!(got[1].offset, 8);
+            assert_eq!(got[1].mode, RecordedAccessMode::Read);
+            assert_eq!(got[4].mode, RecordedAccessMode::Write);
+        }
+
+        // Mixed grouped WMMA: 6 ptr + M,K,x_row_div,m_total = 64 (already aligned).
+        // gfx11 k2, gfx12, and 4w_k2 tiling variants are distinct symbols.
+        for symbol in [
+            "gemm_mixed_moe_grouped_wmma_k2",
+            "gemm_mixed_moe_grouped_wmma_gfx12",
+            "gemm_mixed_moe_grouped_wmma_4w_k2",
+        ] {
+            let mut blob = hip_bridge::KernargBlob::new();
+            for _ in 0..6 {
+                blob.push_ptr(std::ptr::null());
+            }
+            for _ in 0..4 {
+                blob.push_i32(0);
+            }
+            assert_eq!(blob.len(), 64, "{symbol} explicit args occupy 64 bytes");
+            blob.pad_to(16);
+            assert_eq!(blob.len(), 64, "{symbol} recorded launches pad to 16");
+            assert_eq!(expected_kernarg_bytes(symbol), Some(blob.len()));
+            let got = pointer_effects(symbol).expect("mixed grouped pointer contract");
+            assert_eq!(
+                got.len(),
+                mixed_grouped_effects.len(),
+                "{symbol} effect count"
+            );
+            for (got_effect, want) in got.iter().zip(mixed_grouped_effects.iter()) {
+                assert_eq!(got_effect.offset, want.offset, "{symbol} offset");
+                assert_eq!(
+                    got_effect.mode, want.mode,
+                    "{symbol} mode at {}",
+                    want.offset
+                );
+            }
+            assert_eq!(got[5].offset, 40);
+            assert_eq!(got[5].mode, RecordedAccessMode::Write);
+        }
+
+        // V1/V2 names never alias; unknown mixed name still fails closed.
+        assert!(pointer_effects("gemv_mixed_moe_gate_up_k8_indexed_batched_unknown").is_none());
+        assert!(
+            expected_kernarg_bytes("gemv_mixed_moe_gate_up_k8_indexed_batched_unknown").is_none()
+        );
+        assert_ne!(
+            "gemv_mixed_moe_gate_up_k8_indexed_batched",
+            "gemv_mq4g256v2_moe_gate_up_k8_indexed_batched"
+        );
+    }
+
+    // Table-driven: every reachable dense shared-expert V2 symbol.
+    // Shared experts ride the exact dense V2 GEMV/GEMM ABIs — never V1 aliases.
+    #[test]
+    fn dense_shared_v2_symbols_have_resource_contracts() {
+        let dense_gemv_effects = vec![read(0), read(8), write(16)];
+        let dense_gemm_effects = vec![read(0), read(8), write(16)];
+
+        // Dense GEMV: 3 ptr + M,K = 32 (already 16-aligned). Plain, residual, multirow.
+        for symbol in [
+            "gemv_mq4g256v2",
+            "gemv_mq4g256v2_residual",
+            "gemv_mq6g256v2",
+            "gemv_mq6g256v2_residual",
+            "gemv_mq4g256v2_multirow_r2",
+            "gemv_mq4g256v2_multirow_r4",
+            "gemv_mq4g256v2_multirow_r8",
+            "gemv_mq6g256v2_multirow_r2",
+            "gemv_mq6g256v2_multirow_r4",
+            "gemv_mq6g256v2_multirow_r8",
+        ] {
+            let mut blob = hip_bridge::KernargBlob::new();
+            for _ in 0..3 {
+                blob.push_ptr(std::ptr::null());
+            }
+            blob.push_i32(0);
+            blob.push_i32(0);
+            assert_eq!(blob.len(), 32, "{symbol} explicit args occupy 32 bytes");
+            blob.pad_to(16);
+            assert_eq!(blob.len(), 32, "{symbol} recorded launches pad to 16");
+            assert_eq!(expected_kernarg_bytes(symbol), Some(blob.len()));
+            let got = pointer_effects(symbol).expect("dense gemv pointer contract");
+            assert_eq!(got.len(), dense_gemv_effects.len(), "{symbol} effect count");
+            for (got_effect, want) in got.iter().zip(dense_gemv_effects.iter()) {
+                assert_eq!(got_effect.offset, want.offset, "{symbol} offset");
+                assert_eq!(
+                    got_effect.mode, want.mode,
+                    "{symbol} mode at {}",
+                    want.offset
+                );
+            }
+        }
+
+        // Dense GEMM residual WMMA: 3 ptr + M,K,batch = 36 → 48 padded.
+        // Covers plain and arch-tiled gfx11/gfx12 variants admitted to slots/prefill.
+        for symbol in [
+            "gemm_mq4g256v2_residual_wmma",
+            "gemm_mq4g256v2_residual_wmma_gfx12",
+            "gemm_mq6g256v2_residual_wmma",
+            "gemm_mq6g256v2_residual_wmma_gfx12",
+            "gemm_mq4g256v2_residual_wmma_gfx11_bt4",
+            "gemm_mq4g256v2_residual_wmma_gfx11_bt6",
+            "gemm_mq4g256v2_residual_wmma_gfx11_bt8",
+            "gemm_mq6g256v2_residual_wmma_gfx11_bt4",
+            "gemm_mq6g256v2_residual_wmma_gfx11_bt6",
+            "gemm_mq6g256v2_residual_wmma_gfx11_bt8",
+            "gemm_mq4g256v2_residual_wmma_gfx1100_mw4_lds",
+            "gemm_mq4g256v2_residual_wmma_gfx1100_mw8_lds",
+            "gemm_mq6g256v2_residual_wmma_gfx11_mw4_lds",
+            "gemm_mq6g256v2_residual_wmma_gfx11_mw8_lds",
+        ] {
+            let mut blob = hip_bridge::KernargBlob::new();
+            for _ in 0..3 {
+                blob.push_ptr(std::ptr::null());
+            }
+            for _ in 0..3 {
+                blob.push_i32(0);
+            }
+            assert_eq!(blob.len(), 36, "{symbol} explicit args occupy 36 bytes");
+            blob.pad_to(16);
+            assert_eq!(blob.len(), 48, "{symbol} recorded launches pad to 16");
+            assert_eq!(expected_kernarg_bytes(symbol), Some(blob.len()));
+            let got = pointer_effects(symbol).expect("dense gemm pointer contract");
+            assert_eq!(got.len(), dense_gemm_effects.len(), "{symbol} effect count");
+            for (got_effect, want) in got.iter().zip(dense_gemm_effects.iter()) {
+                assert_eq!(got_effect.offset, want.offset, "{symbol} offset");
+                assert_eq!(
+                    got_effect.mode, want.mode,
+                    "{symbol} mode at {}",
+                    want.offset
+                );
+            }
+        }
+
+        // No V1/V2 collapse for dense; unknown dense V2 name still fails closed.
+        assert!(pointer_effects("gemv_mq4g256v2_unknown").is_none());
+        assert!(expected_kernarg_bytes("gemv_mq4g256v2_unknown").is_none());
+        assert_ne!("gemv_mq4g256v2", "gemv_hfq4g256");
+        assert_ne!("gemm_mq4g256v2_residual_wmma", "gemm_mq4g256_residual_wmma");
+        assert!(pointer_effects("gemv_mq4g256v2").is_some());
+        assert!(pointer_effects("gemv_mq6g256v2").is_some());
     }
 
     #[test]
