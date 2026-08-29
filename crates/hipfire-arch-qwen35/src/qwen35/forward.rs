@@ -3250,6 +3250,411 @@ pub(crate) fn kv_cache_attention_dispatch(
     Ok(fused_epilogue)
 }
 
+fn dense_tp_ffn_partial(
+    gpu: &mut Gpu,
+    ctx: &DispatchCtx,
+    norm: &GpuTensor,
+    gate: &WeightTensor,
+    up: &WeightTensor,
+    down: &WeightTensor,
+    config: &Qwen35Config,
+    s: &Qwen35Scratch,
+) -> HipResult<()> {
+    gate_up_via_execute_steps(
+        gpu,
+        ctx,
+        gate,
+        up,
+        norm,
+        &s.x,
+        &s.tmp,
+        &s.x_rot,
+        &s.gate_ffn,
+        &s.up,
+        config.norm_eps,
+    )?;
+    gpu.silu_mul_f32(&s.gate_ffn, &s.up, &s.ffn_hidden)?;
+    let wr = down.dispatch_ref();
+    execute_steps(
+        gpu,
+        ctx,
+        &[Step::Gemv {
+            w: &wr,
+            input: GemvInput::Raw(&s.ffn_hidden),
+            out: &s.o,
+        }],
+    )
+    .map_err(|e| HipError::new(0, &e.to_string()))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dense_tp_deltanet_partial(
+    gpu: &mut Gpu,
+    layer: &super::weights::DeltaNetLayerWeights,
+    config: &Qwen35Config,
+    delta_layer_idx: usize,
+    dn_state: &mut DeltaNetState,
+    s: &Qwen35Scratch,
+) -> HipResult<()> {
+    let ctx = DispatchCtx::new(gpu);
+    let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
+    let v_dim = config.linear_num_value_heads * config.linear_value_head_dim;
+    let n_v_heads = config.linear_num_value_heads;
+    let hd = config.linear_key_head_dim;
+    qkvza_via_execute_steps(
+        gpu,
+        &ctx,
+        &layer.wqkv,
+        &layer.wz,
+        &layer.w_beta,
+        &layer.w_alpha,
+        &layer.attn_norm,
+        &s.x,
+        &s.tmp,
+        &s.x_rot,
+        &s.dn_qkv,
+        &s.dn_z,
+        &s.dn_beta,
+        &s.dn_alpha,
+        config.norm_eps,
+    )?;
+    gpu.fused_sigmoid_alpha_gate_f32(
+        &s.dn_beta,
+        &s.dn_alpha,
+        &layer.dt_bias,
+        &layer.a_log,
+        n_v_heads,
+    )?;
+    gpu.conv1d_silu_split_f32(
+        &s.dn_q_raw,
+        &s.dn_k_raw,
+        &s.dn_v,
+        &s.dn_qkv,
+        &layer.conv_weight,
+        &dn_state.conv_states[delta_layer_idx],
+        k_dim,
+        v_dim,
+    )?;
+    gpu.fused_qk_l2_norm_scale_f32(
+        &s.dn_q_raw,
+        &s.dn_k_raw,
+        config.linear_num_key_heads,
+        hd,
+        1.0 / (hd as f32).sqrt(),
+        config.norm_eps,
+    )?;
+    if config.linear_num_key_heads < n_v_heads {
+        gpu.repeat_interleave_qk_f32(
+            &s.dn_q_raw,
+            &s.dn_k_raw,
+            &s.dn_q,
+            &s.dn_k,
+            config.linear_num_key_heads,
+            n_v_heads / config.linear_num_key_heads,
+            hd,
+        )?;
+    } else {
+        gpu.memcpy_dtod_auto(&s.dn_q.buf, &s.dn_q_raw.buf, k_dim * 4)?;
+        gpu.memcpy_dtod_auto(&s.dn_k.buf, &s.dn_k_raw.buf, k_dim * 4)?;
+    }
+    match dn_state.quant {
+        StateQuant::FP32 => gpu.gated_delta_net_f32(
+            &s.dn_q,
+            &s.dn_k,
+            &s.dn_v,
+            &s.dn_alpha,
+            &s.dn_beta,
+            &dn_state.s_matrices[delta_layer_idx],
+            &s.dn_attn_out,
+            1,
+            n_v_heads,
+            config.linear_value_head_dim,
+        )?,
+        StateQuant::Q8 => gpu.gated_delta_net_q8(
+            &s.dn_q,
+            &s.dn_k,
+            &s.dn_v,
+            &s.dn_alpha,
+            &s.dn_beta,
+            &dn_state.s_matrices[delta_layer_idx],
+            &dn_state.s_scales[delta_layer_idx],
+            &s.dn_attn_out,
+            1,
+            n_v_heads,
+            config.linear_value_head_dim,
+            dn_state.ef_residual(delta_layer_idx),
+        )?,
+        StateQuant::Q4 => gpu.gated_delta_net_q4(
+            &s.dn_q,
+            &s.dn_k,
+            &s.dn_v,
+            &s.dn_alpha,
+            &s.dn_beta,
+            &dn_state.s_matrices[delta_layer_idx],
+            &dn_state.s_scales[delta_layer_idx],
+            &s.dn_attn_out,
+            1,
+            n_v_heads,
+            config.linear_value_head_dim,
+        )?,
+    }
+    gpu.gated_norm_f32(
+        &s.dn_attn_out,
+        &s.dn_z,
+        &layer.norm_weight,
+        &s.dn_normed,
+        n_v_heads,
+        config.linear_value_head_dim,
+        config.norm_eps,
+    )?;
+    let wr = layer.wo.dispatch_ref();
+    execute_steps(
+        gpu,
+        &ctx,
+        &[Step::Gemv {
+            w: &wr,
+            input: GemvInput::Raw(&s.dn_normed),
+            out: &s.o,
+        }],
+    )
+    .map_err(|e| HipError::new(0, &e.to_string()))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dense_tp_attention_partial(
+    gpu: &mut Gpu,
+    layer: &super::weights::FullAttnLayerWeights,
+    config: &Qwen35Config,
+    kv_layer_idx: usize,
+    pos: usize,
+    kv_cache: &mut llama::KvCache,
+    s: &Qwen35Scratch,
+) -> HipResult<()> {
+    let ctx = DispatchCtx::new(gpu);
+    qkv_via_execute_steps(
+        gpu,
+        &ctx,
+        &layer.wq,
+        &layer.wk,
+        &layer.wv,
+        &layer.attn_norm,
+        &s.x,
+        &s.tmp,
+        &s.x_rot,
+        &s.fa_q_full,
+        &s.fa_k,
+        &s.fa_v,
+        config.norm_eps,
+    )?;
+    gpu.deinterleave_f32(
+        &s.fa_q_full,
+        &s.fa_q,
+        &s.fa_gate,
+        config.n_heads,
+        config.head_dim,
+    )?;
+    gpu.rmsnorm_batched(
+        &s.fa_q,
+        &layer.q_norm,
+        &s.fa_q,
+        config.n_heads,
+        config.head_dim,
+        config.norm_eps,
+    )?;
+    gpu.rmsnorm_batched(
+        &s.fa_k,
+        &layer.k_norm,
+        &s.fa_k,
+        config.n_kv_heads,
+        config.head_dim,
+        config.norm_eps,
+    )?;
+    let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
+    gpu.rope_partial_interleaved_f32(
+        &s.fa_q,
+        &s.fa_k,
+        &s.pos_buf,
+        config.n_heads,
+        config.n_kv_heads,
+        config.head_dim,
+        n_rot,
+        config.rope_theta,
+    )?;
+    let fused_epilogue =
+        kv_cache_attention_dispatch(&ctx, gpu, kv_cache, s, config, &layer.wo, kv_layer_idx, pos)?;
+    if !fused_epilogue {
+        gpu.sigmoid_mul_f32(&s.fa_attn_out, &s.fa_gate)?;
+    }
+    let wr = layer.wo.dispatch_ref();
+    execute_steps(
+        gpu,
+        &ctx,
+        &[Step::Gemv {
+            w: &wr,
+            input: if fused_epilogue {
+                GemvInput::Prerotated(&s.fa_attn_out)
+            } else {
+                GemvInput::Raw(&s.fa_attn_out)
+            },
+            out: &s.o,
+        }],
+    )
+    .map_err(|e| HipError::new(0, &e.to_string()))
+}
+
+fn dense_tp_allreduce_add(
+    gpus: &mut Gpus,
+    scratches: &[Qwen35Scratch],
+    count: usize,
+) -> HipResult<()> {
+    let refs: Vec<_> = scratches.iter().map(|s| &s.o.buf).collect();
+    gpus.all_reduce_sum_f32(&refs, count)?;
+    for (rank, scratch) in scratches.iter().enumerate() {
+        gpus.devices[rank].bind_thread()?;
+        gpus.devices[rank].add_f32(&scratch.x, &scratch.o, &scratch.x)?;
+    }
+    Ok(())
+}
+
+/// Dense Qwen hybrid TP2 single-token decode. Each rank owns local attention,
+/// DeltaNet and FFN projections; row-parallel outputs are reduced before the
+/// residual update. Logits are produced on rank 0.
+#[allow(clippy::too_many_arguments)]
+pub fn forward_scratch_dense_tp(
+    gpus: &mut Gpus,
+    shard: &ShardConfig,
+    weights: &[Qwen35Weights],
+    configs: &[Qwen35Config],
+    token: u32,
+    pos: usize,
+    kv_caches: &mut [llama::KvCache],
+    dn_states: &mut [DeltaNetState],
+    scratches: &[Qwen35Scratch],
+) -> HipResult<()> {
+    let tp = shard.tp_size;
+    if tp != 2
+        || weights.len() != tp
+        || configs.len() != tp
+        || kv_caches.len() != tp
+        || dn_states.len() != tp
+        || scratches.len() != tp
+        || gpus.devices.len() != tp
+    {
+        return Err(HipError::new(
+            0,
+            "dense TP2 requires exactly two devices and two complete rank states",
+        ));
+    }
+    let dim = configs[0].dim;
+    let required_tokens = checked_kv_end(pos, 1, "forward_scratch_dense_tp")?;
+    for rank in 0..tp {
+        gpus.devices[rank].bind_thread()?;
+        kv_caches[rank].ensure_mapped_capacity(&mut gpus.devices[rank], required_tokens)?;
+        prepare_scratch_inputs(
+            &mut gpus.devices[rank],
+            &weights[rank],
+            &configs[rank],
+            token,
+            pos,
+            &scratches[rank],
+        )?;
+    }
+
+    let mut delta_layer_idx = 0usize;
+    let mut kv_layer_idx = 0usize;
+    for layer_idx in 0..configs[0].n_layers {
+        match configs[0].layer_types[layer_idx] {
+            LayerType::LinearAttention => {
+                for rank in 0..tp {
+                    let LayerWeights::DeltaNet(layer) = &weights[rank].layers[layer_idx] else {
+                        return Err(HipError::new(0, "dense TP received a MoE/mismatched layer"));
+                    };
+                    dense_tp_deltanet_partial(
+                        &mut gpus.devices[rank],
+                        layer,
+                        &configs[rank],
+                        delta_layer_idx,
+                        &mut dn_states[rank],
+                        &scratches[rank],
+                    )?;
+                }
+                dense_tp_allreduce_add(gpus, scratches, dim)?;
+                for rank in 0..tp {
+                    let LayerWeights::DeltaNet(layer) = &weights[rank].layers[layer_idx] else {
+                        unreachable!();
+                    };
+                    let ctx = DispatchCtx::new(&gpus.devices[rank]);
+                    dense_tp_ffn_partial(
+                        &mut gpus.devices[rank],
+                        &ctx,
+                        &layer.ffn_norm,
+                        &layer.w_gate,
+                        &layer.w_up,
+                        &layer.w_down,
+                        &configs[rank],
+                        &scratches[rank],
+                    )?;
+                }
+                dense_tp_allreduce_add(gpus, scratches, dim)?;
+                delta_layer_idx += 1;
+            }
+            LayerType::FullAttention => {
+                for rank in 0..tp {
+                    let LayerWeights::FullAttn(layer) = &weights[rank].layers[layer_idx] else {
+                        return Err(HipError::new(0, "dense TP received a MoE/mismatched layer"));
+                    };
+                    dense_tp_attention_partial(
+                        &mut gpus.devices[rank],
+                        layer,
+                        &configs[rank],
+                        kv_layer_idx,
+                        pos,
+                        &mut kv_caches[rank],
+                        &scratches[rank],
+                    )?;
+                }
+                dense_tp_allreduce_add(gpus, scratches, dim)?;
+                for rank in 0..tp {
+                    let LayerWeights::FullAttn(layer) = &weights[rank].layers[layer_idx] else {
+                        unreachable!();
+                    };
+                    let ctx = DispatchCtx::new(&gpus.devices[rank]);
+                    dense_tp_ffn_partial(
+                        &mut gpus.devices[rank],
+                        &ctx,
+                        &layer.ffn_norm,
+                        &layer.w_gate,
+                        &layer.w_up,
+                        &layer.w_down,
+                        &configs[rank],
+                        &scratches[rank],
+                    )?;
+                }
+                dense_tp_allreduce_add(gpus, scratches, dim)?;
+                kv_layer_idx += 1;
+            }
+        }
+    }
+    gpus.devices[0].rmsnorm_f32(
+        &scratches[0].x,
+        &weights[0].output_norm,
+        &scratches[0].tmp,
+        configs[0].norm_eps,
+    )?;
+    let ctx = DispatchCtx::new(&gpus.devices[0]);
+    let output = weights[0].output.dispatch_ref();
+    execute_steps(
+        &mut gpus.devices[0],
+        &ctx,
+        &[Step::Gemv {
+            w: &output,
+            input: GemvInput::Raw(&scratches[0].tmp),
+            out: &scratches[0].logits,
+        }],
+    )
+    .map_err(|e| HipError::new(0, &e.to_string()))
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // #397 Ship 6 — forward-as-pipeline: qwen35 DECODE lowered path (ADDITIVE).
 //

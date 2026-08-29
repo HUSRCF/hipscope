@@ -2739,6 +2739,361 @@ fn load_layer_into(
     crate::layer_driver::load_layer(&mut b, config, layer_idx, moe)
 }
 
+#[derive(Clone, Copy)]
+enum DenseTpSlice<'a> {
+    Rows(usize, usize),
+    RowsMulti(&'a [(usize, usize)]),
+    Cols(usize, usize),
+}
+
+fn load_weight_tensor_dense_tp(
+    hfq: &HfqFile,
+    gpu: &mut Gpu,
+    name: &str,
+    m: usize,
+    k: usize,
+    slice: DenseTpSlice<'_>,
+) -> HipResult<WeightTensor> {
+    use hipfire_runtime::tp_shard::{slice_uniform_group_cols, slice_uniform_rows};
+
+    let mut hit = None;
+    for candidate in qwen35_tensor_name_candidates(name) {
+        if let Some((info, _)) = hfq.tensor_data_pread(&candidate) {
+            hit = Some((candidate, info.quant_type));
+            break;
+        }
+    }
+    let (candidate, quant_type) =
+        hit.ok_or_else(|| HipError::new(0, &format!("TP tensor not found: {name}")))?;
+    if quant_type != 13 {
+        return Err(HipError::new(
+            0,
+            &format!(
+                "dense TP2 currently requires MQ4-G256 (qt=13), {candidate} has qt={quant_type}"
+            ),
+        ));
+    }
+    let (bytes, new_m, new_k) = {
+        let (_, data) = hfq
+            .tensor_data_pread(&candidate)
+            .ok_or_else(|| HipError::new(0, "TP tensor disappeared during load"))?;
+        match slice {
+            DenseTpSlice::Rows(start, end) => (
+                slice_uniform_rows(&data, m, start, end).map_err(|e| HipError::new(0, &e))?,
+                end - start,
+                k,
+            ),
+            DenseTpSlice::RowsMulti(ranges) => {
+                let mut out = Vec::new();
+                for &(start, end) in ranges {
+                    out.extend_from_slice(
+                        &slice_uniform_rows(&data, m, start, end)
+                            .map_err(|e| HipError::new(0, &e))?,
+                    );
+                }
+                (out, ranges.iter().map(|(a, b)| b - a).sum(), k)
+            }
+            DenseTpSlice::Cols(start, end) => (
+                slice_uniform_group_cols(&data, m, k, start, end, 256)
+                    .map_err(|e| HipError::new(0, &e))?,
+                m,
+                end - start,
+            ),
+        }
+    };
+    let mut weight = load_weight_tensor_raw(gpu, quant_type, &bytes, new_m, new_k)?;
+    let stem = candidate.strip_suffix(".weight").unwrap_or(&candidate);
+    let sidecar = format!("{stem}.awq_scale.weight");
+    if let Some((info, data)) = hfq.tensor_data_pread(&sidecar) {
+        if info.quant_type != 1 || data.len() != k * 2 {
+            return Err(HipError::new(0, "invalid TP AWQ sidecar"));
+        }
+        let (start, end) = match slice {
+            DenseTpSlice::Cols(start, end) => (start, end),
+            _ => (0, k),
+        };
+        let scales: Vec<f32> = data[start * 2..end * 2]
+            .chunks_exact(2)
+            .map(|v| f16_to_f32(u16::from_le_bytes([v[0], v[1]])))
+            .collect();
+        weight.awq_scale = Some(gpu.upload_f32(&scales, &[scales.len()])?);
+    }
+    Ok(weight)
+}
+
+fn gather_f32_ranges(
+    gpu: &mut Gpu,
+    source: &GpuTensor,
+    ranges: &[(usize, usize)],
+) -> HipResult<GpuTensor> {
+    let source = gpu.download_f32(source)?;
+    let mut gathered = Vec::new();
+    for &(start, end) in ranges {
+        gathered.extend_from_slice(&source[start..end]);
+    }
+    gpu.upload_f32(&gathered, &[gathered.len()])
+}
+
+/// Load one rank of an arch-5 dense Qwen TP2 model. The first implementation
+/// intentionally admits MQ4-G256 only; other formats fail before dispatch.
+pub fn load_weights_dense_tp_rank(
+    hfq: &mut HfqFile,
+    config: &Qwen35Config,
+    gpu: &mut Gpu,
+    shard: &ShardConfig,
+    rank: usize,
+) -> HipResult<Qwen35Weights> {
+    super::config::validate_dense_tp(config, shard).map_err(|e| HipError::new(0, &e))?;
+    if rank >= shard.tp_size {
+        return Err(HipError::new(0, "dense TP rank is out of range"));
+    }
+    let mut weights = {
+        let mut source = HfqSource::new(hfq, config);
+        load_weights(
+            &mut source,
+            std::slice::from_mut(gpu),
+            &Layout::single(config.n_layers),
+        )?
+    };
+    let dim = config.dim;
+    let head_dim = config.head_dim;
+    let q_rows = shard.wq_row_range(rank, config.n_heads, head_dim);
+    let kv_heads = shard.kv_head_range(rank, config.n_kv_heads);
+    let kv_dim = config.n_kv_heads * head_dim;
+    let kv_rows = kv_heads.start * head_dim..kv_heads.end * head_dim;
+    let attn_cols = shard.wo_col_range(rank, config.n_heads, head_dim);
+    let local_ffn = config.hidden_dim / shard.tp_size;
+    let ffn_rows = rank * local_ffn..(rank + 1) * local_ffn;
+    let key_dim = config.linear_num_key_heads * config.linear_key_head_dim;
+    let value_dim = config.linear_num_value_heads * config.linear_value_head_dim;
+    let dn_rows = 2 * key_dim + value_dim;
+    let key_heads = shard.dn_key_head_range(rank, config.linear_num_key_heads);
+    let value_heads = shard.dn_value_head_range(rank, config.linear_num_value_heads);
+    let key_width = config.linear_key_head_dim;
+    let value_width = config.linear_value_head_dim;
+    let qkv_ranges = [
+        (key_heads.start * key_width, key_heads.end * key_width),
+        (
+            key_dim + key_heads.start * key_width,
+            key_dim + key_heads.end * key_width,
+        ),
+        (
+            2 * key_dim + value_heads.start * value_width,
+            2 * key_dim + value_heads.end * value_width,
+        ),
+    ];
+    let conv = config.conv_kernel_dim;
+    let conv_ranges = [
+        (qkv_ranges[0].0 * conv, qkv_ranges[0].1 * conv),
+        (qkv_ranges[1].0 * conv, qkv_ranges[1].1 * conv),
+        (qkv_ranges[2].0 * conv, qkv_ranges[2].1 * conv),
+    ];
+
+    let result = (|| -> HipResult<()> {
+        for (layer_idx, layer) in weights.layers.iter_mut().enumerate() {
+            let prefix = format!("layers.{layer_idx}");
+            match layer {
+                LayerWeights::FullAttn(layer) => {
+                    let replacements = [
+                        (
+                            &mut layer.wq,
+                            load_weight_tensor_dense_tp(
+                                hfq,
+                                gpu,
+                                &format!("{prefix}.self_attn.q_proj.weight"),
+                                config.n_heads * head_dim * 2,
+                                dim,
+                                DenseTpSlice::Rows(q_rows.start, q_rows.end),
+                            )?,
+                        ),
+                        (
+                            &mut layer.wk,
+                            load_weight_tensor_dense_tp(
+                                hfq,
+                                gpu,
+                                &format!("{prefix}.self_attn.k_proj.weight"),
+                                kv_dim,
+                                dim,
+                                DenseTpSlice::Rows(kv_rows.start, kv_rows.end),
+                            )?,
+                        ),
+                        (
+                            &mut layer.wv,
+                            load_weight_tensor_dense_tp(
+                                hfq,
+                                gpu,
+                                &format!("{prefix}.self_attn.v_proj.weight"),
+                                kv_dim,
+                                dim,
+                                DenseTpSlice::Rows(kv_rows.start, kv_rows.end),
+                            )?,
+                        ),
+                        (
+                            &mut layer.wo,
+                            load_weight_tensor_dense_tp(
+                                hfq,
+                                gpu,
+                                &format!("{prefix}.self_attn.o_proj.weight"),
+                                dim,
+                                config.n_heads * head_dim,
+                                DenseTpSlice::Cols(attn_cols.start, attn_cols.end),
+                            )?,
+                        ),
+                    ];
+                    for (slot, replacement) in replacements {
+                        std::mem::replace(slot, replacement).free_all(gpu);
+                    }
+                    for (slot, name, slice) in [
+                        (
+                            &mut layer.w_gate,
+                            "gate_proj",
+                            DenseTpSlice::Rows(ffn_rows.start, ffn_rows.end),
+                        ),
+                        (
+                            &mut layer.w_up,
+                            "up_proj",
+                            DenseTpSlice::Rows(ffn_rows.start, ffn_rows.end),
+                        ),
+                        (
+                            &mut layer.w_down,
+                            "down_proj",
+                            DenseTpSlice::Cols(ffn_rows.start, ffn_rows.end),
+                        ),
+                    ] {
+                        let replacement = load_weight_tensor_dense_tp(
+                            hfq,
+                            gpu,
+                            &format!("{prefix}.mlp.{name}.weight"),
+                            if name == "down_proj" {
+                                dim
+                            } else {
+                                config.hidden_dim
+                            },
+                            if name == "down_proj" {
+                                config.hidden_dim
+                            } else {
+                                dim
+                            },
+                            slice,
+                        )?;
+                        std::mem::replace(slot, replacement).free_all(gpu);
+                    }
+                }
+                LayerWeights::DeltaNet(layer) => {
+                    for (slot, name, rows) in [
+                        (
+                            &mut layer.wqkv,
+                            "in_proj_qkv",
+                            DenseTpSlice::RowsMulti(&qkv_ranges),
+                        ),
+                        (
+                            &mut layer.wz,
+                            "in_proj_z",
+                            DenseTpSlice::Rows(
+                                value_heads.start * value_width,
+                                value_heads.end * value_width,
+                            ),
+                        ),
+                        (
+                            &mut layer.w_alpha,
+                            "in_proj_a",
+                            DenseTpSlice::Rows(value_heads.start, value_heads.end),
+                        ),
+                        (
+                            &mut layer.w_beta,
+                            "in_proj_b",
+                            DenseTpSlice::Rows(value_heads.start, value_heads.end),
+                        ),
+                    ] {
+                        let m = match name {
+                            "in_proj_qkv" => dn_rows,
+                            "in_proj_z" => value_dim,
+                            _ => config.linear_num_value_heads,
+                        };
+                        let replacement = load_weight_tensor_dense_tp(
+                            hfq,
+                            gpu,
+                            &format!("{prefix}.linear_attn.{name}.weight"),
+                            m,
+                            dim,
+                            rows,
+                        )?;
+                        std::mem::replace(slot, replacement).free_all(gpu);
+                    }
+                    let replacement = load_weight_tensor_dense_tp(
+                        hfq,
+                        gpu,
+                        &format!("{prefix}.linear_attn.out_proj.weight"),
+                        dim,
+                        value_dim,
+                        DenseTpSlice::Cols(
+                            value_heads.start * value_width,
+                            value_heads.end * value_width,
+                        ),
+                    )?;
+                    std::mem::replace(&mut layer.wo, replacement).free_all(gpu);
+                    for (slot, name, slice) in [
+                        (
+                            &mut layer.w_gate,
+                            "gate_proj",
+                            DenseTpSlice::Rows(ffn_rows.start, ffn_rows.end),
+                        ),
+                        (
+                            &mut layer.w_up,
+                            "up_proj",
+                            DenseTpSlice::Rows(ffn_rows.start, ffn_rows.end),
+                        ),
+                        (
+                            &mut layer.w_down,
+                            "down_proj",
+                            DenseTpSlice::Cols(ffn_rows.start, ffn_rows.end),
+                        ),
+                    ] {
+                        let replacement = load_weight_tensor_dense_tp(
+                            hfq,
+                            gpu,
+                            &format!("{prefix}.mlp.{name}.weight"),
+                            if name == "down_proj" {
+                                dim
+                            } else {
+                                config.hidden_dim
+                            },
+                            if name == "down_proj" {
+                                config.hidden_dim
+                            } else {
+                                dim
+                            },
+                            slice,
+                        )?;
+                        std::mem::replace(slot, replacement).free_all(gpu);
+                    }
+                    let new_conv = gather_f32_ranges(gpu, &layer.conv_weight, &conv_ranges)?;
+                    let new_a = gather_f32_ranges(
+                        gpu,
+                        &layer.a_log,
+                        &[(value_heads.start, value_heads.end)],
+                    )?;
+                    let new_dt = gather_f32_ranges(
+                        gpu,
+                        &layer.dt_bias,
+                        &[(value_heads.start, value_heads.end)],
+                    )?;
+                    let _ = gpu.free_tensor(std::mem::replace(&mut layer.conv_weight, new_conv));
+                    let _ = gpu.free_tensor(std::mem::replace(&mut layer.a_log, new_a));
+                    let _ = gpu.free_tensor(std::mem::replace(&mut layer.dt_bias, new_dt));
+                }
+                _ => return Err(HipError::new(0, "dense TP does not admit MoE layers")),
+            }
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        weights.free_gpu(gpu);
+        return Err(error);
+    }
+    Ok(weights)
+}
+
 thread_local! {
     /// Per-thread EP expert-shard context. When `Some((shard, rank))`,
     /// [`load_moe_ffn`] loads ONLY this rank's owned experts (streaming
