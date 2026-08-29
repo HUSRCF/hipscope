@@ -9,6 +9,7 @@ use hip_bridge::HipError;
 use hip_bridge::HipResult;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::model_source::ModelSource;
+use hipfire_runtime::tp_shard::ShardConfig;
 use rdna_compute::GpuTensor;
 use serde::Deserialize;
 
@@ -168,6 +169,56 @@ pub struct Qwen35Config {
     /// no pruning (today's behavior, byte-identical to baseline). Not
     /// (de)serialized — `Qwen35Config` does not derive serde.
     pub reap_keep: Option<std::sync::Arc<hipfire_reap::plan::ReapPlan>>,
+}
+
+/// Validate the shape contract for the dense Qwen hybrid TP path. This is
+/// intentionally version-neutral: Qwen3.6/3.7/3.8 models with the same arch-5
+/// tensor geometry are admitted by capability, not by a model-name allowlist.
+pub fn validate_dense_tp(config: &Qwen35Config, shard: &ShardConfig) -> Result<(), String> {
+    if config.num_experts != 0 {
+        return Err("dense TP requires num_experts=0; use the MoE EP route".to_string());
+    }
+    if shard.tp_size != 2 {
+        return Err(format!(
+            "dense Qwen TP currently admits exactly 2 ranks, got {}",
+            shard.tp_size
+        ));
+    }
+    shard.validate(config.n_heads, config.n_kv_heads)?;
+    shard.validate_deltanet(config.linear_num_value_heads, config.linear_num_key_heads)?;
+    if config.hidden_dim == 0 || config.hidden_dim % shard.tp_size != 0 {
+        return Err(format!(
+            "hidden_dim {} is not divisible by TP{}",
+            config.hidden_dim, shard.tp_size
+        ));
+    }
+    // Row-parallel packed weights are sliced on whole quant groups. G128 and
+    // G256 are both covered by requiring the stricter 256-column alignment.
+    let local_attn = config.n_heads / shard.tp_size * config.head_dim;
+    let local_dn = config.linear_num_value_heads / shard.tp_size * config.linear_value_head_dim;
+    let local_ffn = config.hidden_dim / shard.tp_size;
+    for (name, width) in [
+        ("attention output", local_attn),
+        ("DeltaNet output", local_dn),
+        ("FFN down", local_ffn),
+    ] {
+        if width % 256 != 0 {
+            return Err(format!(
+                "{name} local input width {width} is not aligned to a 256-element quant group"
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub fn local_dense_tp_config(config: &Qwen35Config, shard: &ShardConfig) -> Qwen35Config {
+    let mut local = config.clone();
+    local.n_heads = shard.q_heads_per_rank(config.n_heads);
+    local.n_kv_heads = shard.kv_heads_per_rank(config.n_kv_heads);
+    local.linear_num_value_heads = shard.dn_value_heads_per_rank(config.linear_num_value_heads);
+    local.linear_num_key_heads = shard.dn_key_heads_per_rank(config.linear_num_key_heads);
+    local.hidden_dim = config.hidden_dim / shard.tp_size;
+    local
 }
 /// Expert-parallel reduction mode. Only deterministic left-associated
 /// peer-rooted sum is admitted for the batched EP route.
@@ -989,5 +1040,60 @@ mod tests {
         cfg.num_experts = 0;
         cfg.dim = 2_048;
         assert!(!qwen36_27b_dense_shape(&cfg, 48));
+    }
+
+    #[test]
+    fn dense_tp2_admits_arch5_27b_geometry_without_version_gate() {
+        use hipfire_runtime::tp_shard::{ExpertAssign, ShardConfig};
+
+        let inner = serde_json::json!({
+            "hidden_size": 5120,
+            "intermediate_size": 17408,
+            "num_hidden_layers": 64,
+            "num_attention_heads": 24,
+            "num_key_value_heads": 4,
+            "head_dim": 256,
+            "vocab_size": 248320,
+            "linear_num_key_heads": 16,
+            "linear_num_value_heads": 48,
+            "linear_key_head_dim": 128,
+            "linear_value_head_dim": 128,
+            "layer_types": ["linear_attention", "full_attention"]
+        });
+        let cfg = from_config_value(&inner).expect("arch-5 dense shape");
+        let shard = ShardConfig::new(2, false, 0, ExpertAssign::Stride).unwrap();
+        validate_dense_tp(&cfg, &shard).unwrap();
+
+        let local = local_dense_tp_config(&cfg, &shard);
+        assert_eq!(local.n_heads, 12);
+        assert_eq!(local.n_kv_heads, 2);
+        assert_eq!(local.linear_num_key_heads, 8);
+        assert_eq!(local.linear_num_value_heads, 24);
+        assert_eq!(local.hidden_dim, 8704);
+    }
+
+    #[test]
+    fn dense_tp2_refuses_moe_and_partial_quant_groups() {
+        use hipfire_runtime::tp_shard::{ExpertAssign, ShardConfig};
+
+        let inner = serde_json::json!({
+            "hidden_size": 1024,
+            "intermediate_size": 1000,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 8,
+            "num_key_value_heads": 2,
+            "head_dim": 128,
+            "vocab_size": 1000,
+            "linear_num_key_heads": 4,
+            "linear_num_value_heads": 8,
+            "linear_key_head_dim": 128,
+            "linear_value_head_dim": 128
+        });
+        let mut cfg = from_config_value(&inner).unwrap();
+        let shard = ShardConfig::new(2, false, 0, ExpertAssign::Stride).unwrap();
+        assert!(validate_dense_tp(&cfg, &shard).is_err());
+        cfg.hidden_dim = 1024;
+        cfg.num_experts = 8;
+        assert!(validate_dense_tp(&cfg, &shard).is_err());
     }
 }
