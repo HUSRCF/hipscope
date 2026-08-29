@@ -220,6 +220,7 @@ pub fn generate_ep(
             // None here — read the EP eos carried on LoadedModel (set at load).
             m.minimax_eos_tok
         }
+        hipfire_loader::EpEosRoute::Qwen35 => m.qwen35_eos_tok,
         hipfire_loader::EpEosRoute::Deepseek4 => m.deepseek4_eos_tok,
     };
     match m.arch_id {
@@ -232,6 +233,16 @@ pub fn generate_ep(
             max_tokens,
             stop,
             primed_think,
+            sampling,
+        ),
+        5 | 6 => ep_serve_qwen35_dense_tp(
+            m,
+            stdout,
+            id,
+            &prompt_ids,
+            eos_tok,
+            max_tokens,
+            stop,
             sampling,
         ),
         _ => ep_serve_ds4(
@@ -267,6 +278,246 @@ pub fn ep_emit_token(
     );
     let _ = stdout.flush();
     stop.iter().any(|s| !s.is_empty() && text_acc.ends_with(s))
+}
+
+/// Dense Qwen TP2 serving loop. The prefill seam is intentionally
+/// correctness-first (sequential token replay); batched TP prefill can replace
+/// that implementation without changing loader or daemon ownership.
+#[allow(clippy::too_many_arguments)]
+pub fn ep_serve_qwen35_dense_tp(
+    m: &mut LoadedModel,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    prompt_ids: &[u32],
+    eos_tok: u32,
+    max_tokens: usize,
+    stop: &[String],
+    sampling: EpSampling,
+) {
+    let prompt_n = prompt_ids.len();
+    if prompt_n.saturating_add(max_tokens) > m.physical_cap {
+        emit_active_attempt_error(
+            stdout,
+            Some(id),
+            &format!(
+                "prompt exceeds context capacity: prompt={prompt_n} + max_tokens={max_tokens} > capacity={}",
+                m.physical_cap
+            ),
+            "context_length",
+            false,
+            false,
+        );
+        let _ = stdout.flush();
+        return;
+    }
+
+    // This route replays the complete rendered conversation each request.
+    if let Some(EpState { gpus, inner }) = m.ep.as_mut() {
+        if let EpArch::Qwen35DenseTp { dn_states, .. } = inner {
+            for (rank, state) in dn_states.iter_mut().enumerate() {
+                let gpu = &mut gpus.devices[rank];
+                let _ = gpu.bind_thread();
+                if let Err(e) = state.reset(gpu) {
+                    emit_active_attempt_error(
+                        stdout,
+                        Some(id),
+                        &format!("dense TP state reset rank {rank}: {e:?}"),
+                        "validation",
+                        false,
+                        false,
+                    );
+                    let _ = stdout.flush();
+                    return;
+                }
+                gpu.invalidate_graph_state();
+            }
+        }
+    }
+    m.seq_pos = 0;
+    m.conversation_tokens.clear();
+    emit_gen_start(
+        stdout,
+        id,
+        false,
+        gen_start_contract_version_for_arch(m.arch_id),
+    );
+
+    let t_prefill = Instant::now();
+    for (chunk_index, chunk) in prompt_ids.chunks(32).enumerate() {
+        if check_abort(id) {
+            ep_emit_abort(stdout, id, m, 0);
+            return;
+        }
+        let result = {
+            let Some(EpState { gpus, inner }) = m.ep.as_mut() else {
+                return;
+            };
+            let EpArch::Qwen35DenseTp {
+                shard,
+                configs,
+                weights,
+                kv_caches,
+                dn_states,
+                scratches,
+            } = inner
+            else {
+                emit_active_attempt_error(
+                    stdout,
+                    Some(id),
+                    "EP arch mismatch (expected dense Qwen TP)",
+                    "validation",
+                    false,
+                    false,
+                );
+                return;
+            };
+            qwen35::forward_prefill_dense_tp(
+                gpus,
+                shard,
+                weights,
+                configs,
+                chunk,
+                chunk_index * 32,
+                kv_caches,
+                dn_states,
+                scratches,
+            )
+        };
+        if let Err(e) = result {
+            emit_active_attempt_error(
+                stdout,
+                Some(id),
+                &format!("dense TP prefill: {e:?}"),
+                "validation",
+                false,
+                false,
+            );
+            let _ = stdout.flush();
+            return;
+        }
+    }
+    let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
+    let mut logits = {
+        let Some(EpState { gpus, inner }) = m.ep.as_mut() else {
+            return;
+        };
+        let EpArch::Qwen35DenseTp { scratches, .. } = inner else {
+            return;
+        };
+        let _ = gpus.devices[0].bind_thread();
+        match gpus.devices[0].download_f32(&scratches[0].logits) {
+            Ok(v) => v,
+            Err(e) => {
+                emit_active_attempt_error(
+                    stdout,
+                    Some(id),
+                    &format!("dense TP first-logits download: {e:?}"),
+                    "validation",
+                    false,
+                    false,
+                );
+                return;
+            }
+        }
+    };
+
+    let t_decode = Instant::now();
+    let mut generated = 0usize;
+    let mut pos = prompt_n;
+    let mut text_acc = String::new();
+    while generated < max_tokens {
+        if check_abort(id) {
+            ep_emit_abort(stdout, id, m, generated);
+            return;
+        }
+        let next = llama::sample_full_dist(
+            &logits,
+            sampling.temp,
+            sampling.top_p,
+            sampling.top_k,
+            sampling.min_p,
+        );
+        if next == eos_tok {
+            break;
+        }
+        let piece = m.tokenizer.as_ref().unwrap().decode(&[next]);
+        let stopped = ep_emit_token(stdout, id, &piece, &mut text_acc, stop);
+        emit_committed_event(
+            stdout,
+            id,
+            next,
+            generated,
+            t_decode.elapsed().as_millis() as u64,
+        );
+        generated += 1;
+        if stopped || generated >= max_tokens {
+            break;
+        }
+
+        let forward = {
+            let Some(EpState { gpus, inner }) = m.ep.as_mut() else {
+                return;
+            };
+            let EpArch::Qwen35DenseTp {
+                shard,
+                configs,
+                weights,
+                kv_caches,
+                dn_states,
+                scratches,
+            } = inner
+            else {
+                return;
+            };
+            qwen35::forward_scratch_dense_tp(
+                gpus, shard, weights, configs, next, pos, kv_caches, dn_states, scratches,
+            )
+        };
+        if let Err(e) = forward {
+            emit_active_attempt_error(
+                stdout,
+                Some(id),
+                &format!("dense TP decode: {e:?}"),
+                "validation",
+                false,
+                false,
+            );
+            return;
+        }
+        pos += 1;
+        logits = {
+            let Some(EpState { gpus, inner }) = m.ep.as_mut() else {
+                return;
+            };
+            let EpArch::Qwen35DenseTp { scratches, .. } = inner else {
+                return;
+            };
+            let _ = gpus.devices[0].bind_thread();
+            match gpus.devices[0].download_f32(&scratches[0].logits) {
+                Ok(v) => v,
+                Err(e) => {
+                    emit_active_attempt_error(
+                        stdout,
+                        Some(id),
+                        &format!("dense TP decode logits download: {e:?}"),
+                        "validation",
+                        false,
+                        false,
+                    );
+                    return;
+                }
+            }
+        };
+    }
+    ep_emit_done(
+        stdout,
+        id,
+        m,
+        generated,
+        prompt_n,
+        prefill_ms,
+        t_decode.elapsed().as_secs_f64() * 1000.0,
+    );
 }
 
 pub fn ep_emit_done(
@@ -353,6 +604,26 @@ pub fn ep_reset_after_abort(m: &mut LoadedModel) -> RollbackEpilogue {
                 }
                 for dev in &mut gpus.devices {
                     dev.invalidate_graph_state();
+                }
+            }
+            EpArch::Qwen35DenseTp { dn_states, .. } => {
+                for (rank, state) in dn_states.iter_mut().enumerate() {
+                    let gpu = &mut gpus.devices[rank];
+                    if let Err(e) = gpu.bind_thread() {
+                        push_reset_err(
+                            &mut first_err,
+                            &format!("dense qwen TP rank{rank} bind_thread"),
+                            e,
+                        );
+                    }
+                    if let Err(e) = state.reset(gpu) {
+                        push_reset_err(
+                            &mut first_err,
+                            &format!("dense qwen TP rank{rank} state reset"),
+                            e,
+                        );
+                    }
+                    gpu.invalidate_graph_state();
                 }
             }
         }
