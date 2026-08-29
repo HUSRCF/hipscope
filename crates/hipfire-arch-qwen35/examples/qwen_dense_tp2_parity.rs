@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, HfqSource, Layout, Qwen35Scratch, StateQuant};
+use hipfire_arch_qwen35::qwen35::{
+    self, DeltaNetState, HfqSource, Layout, Qwen35Scratch, StateQuant,
+};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::KvCache;
 use hipfire_runtime::multi_gpu::Gpus;
@@ -26,18 +28,33 @@ fn argmax(xs: &[f32]) -> u32 {
 }
 
 fn prompt(tokenizer: &Tokenizer) -> Vec<u32> {
-    tokenizer.encode("<|im_start|>user\nExplain KV cache briefly.<|im_end|>\n<|im_start|>assistant\n")
+    tokenizer
+        .encode("<|im_start|>user\nExplain KV cache briefly.<|im_end|>\n<|im_start|>assistant\n")
 }
 
-fn load_single(hfq: &mut HfqFile, config: &qwen35::Qwen35Config, gpu: &mut Gpu) -> qwen35::Qwen35Weights {
+fn load_single(
+    hfq: &mut HfqFile,
+    config: &qwen35::Qwen35Config,
+    gpu: &mut Gpu,
+) -> qwen35::Qwen35Weights {
     let mut source = HfqSource::new(hfq, config);
-    qwen35::load_weights(&mut source, std::slice::from_mut(gpu), &Layout::single(config.n_layers))
-        .expect("load single weights")
+    qwen35::load_weights(
+        &mut source,
+        std::slice::from_mut(gpu),
+        &Layout::single(config.n_layers),
+    )
+    .expect("load single weights")
 }
 
 fn make_kv(gpu: &mut Gpu, config: &qwen35::Qwen35Config) -> KvCache {
-    KvCache::new_gpu(gpu, config.n_layers, config.n_kv_heads, config.head_dim, KV_MAX)
-        .expect("fp32 kv")
+    KvCache::new_gpu(
+        gpu,
+        config.n_layers,
+        config.n_kv_heads,
+        config.head_dim,
+        KV_MAX,
+    )
+    .expect("fp32 kv")
 }
 
 fn run_reference(path: &str, seed: &[u32]) -> (Vec<u32>, Vec<Vec<f32>>) {
@@ -50,8 +67,10 @@ fn run_reference(path: &str, seed: &[u32]) -> (Vec<u32>, Vec<Vec<f32>>) {
     let mut kv = make_kv(&mut gpu, &config);
     let mut dn = DeltaNetState::new_with_quant(&mut gpu, &config, StateQuant::FP32).expect("dn");
     for (pos, &token) in seed.iter().enumerate() {
-        qwen35::forward_scratch(&mut gpu, &weights, &config, token, pos, &mut kv, &mut dn, &scratch)
-            .expect("reference prefill");
+        qwen35::forward_scratch(
+            &mut gpu, &weights, &config, token, pos, &mut kv, &mut dn, &scratch,
+        )
+        .expect("reference prefill");
     }
     let mut tokens = Vec::with_capacity(decode);
     let mut logits = Vec::with_capacity(decode);
@@ -61,7 +80,14 @@ fn run_reference(path: &str, seed: &[u32]) -> (Vec<u32>, Vec<Vec<f32>>) {
         logits.push(gpu.download_f32(&scratch.logits).unwrap());
         if step + 1 < decode {
             qwen35::forward_scratch(
-                &mut gpu, &weights, &config, next, seed.len() + step, &mut kv, &mut dn, &scratch,
+                &mut gpu,
+                &weights,
+                &config,
+                next,
+                seed.len() + step,
+                &mut kv,
+                &mut dn,
+                &scratch,
             )
             .expect("reference decode");
             next = argmax(&gpu.download_f32(&scratch.logits).unwrap());
@@ -95,23 +121,29 @@ fn run_tp(path: &str, seed: &[u32], forced: &[u32]) -> (Vec<u32>, Vec<Vec<f32>>)
     for rank in 0..2 {
         weights.push(
             qwen35::load_weights_dense_tp_rank(
-                &mut hfq, &global, &mut gpus.devices[rank], &shard, rank,
+                &mut hfq,
+                &global,
+                &mut gpus.devices[rank],
+                &shard,
+                rank,
             )
             .expect("load TP rank"),
         );
         scratches.push(Qwen35Scratch::new(&mut gpus.devices[rank], &configs[rank], 128).unwrap());
         kvs.push(make_kv(&mut gpus.devices[rank], &configs[rank]));
         dns.push(
-            DeltaNetState::new_with_quant(&mut gpus.devices[rank], &configs[rank], StateQuant::FP32)
-                .unwrap(),
+            DeltaNetState::new_with_quant(
+                &mut gpus.devices[rank],
+                &configs[rank],
+                StateQuant::FP32,
+            )
+            .unwrap(),
         );
     }
-    for (pos, &token) in seed.iter().enumerate() {
-        qwen35::forward_scratch_dense_tp(
-            &mut gpus, &shard, &weights, &configs, token, pos, &mut kvs, &mut dns, &scratches,
-        )
-        .expect("TP prefill");
-    }
+    qwen35::forward_prefill_dense_tp(
+        &mut gpus, &shard, &weights, &configs, seed, 0, &mut kvs, &mut dns, &scratches,
+    )
+    .expect("TP prefill");
     let mut tokens = Vec::new();
     let mut logits = Vec::new();
     for step in 0..decode {
@@ -148,12 +180,26 @@ fn main() {
     let (tp_tokens, tp_logits) = run_tp(&path, &seed, &reference_tokens);
     let mut worst = 0.0f32;
     for (step, (reference, tp)) in reference_logits.iter().zip(&tp_logits).enumerate() {
-        let scale = reference.iter().fold(0.0f32, |m, x| m.max(x.abs())).max(1e-12);
-        let delta = reference.iter().zip(tp).fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
+        let scale = reference
+            .iter()
+            .fold(0.0f32, |m, x| m.max(x.abs()))
+            .max(1e-12);
+        let delta = reference
+            .iter()
+            .zip(tp)
+            .fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
         worst = worst.max(delta / scale);
-        println!("step={step:02} ref={} tp={} rel={:.3e}", reference_tokens[step], tp_tokens[step], delta / scale);
+        println!(
+            "step={step:02} ref={} tp={} rel={:.3e}",
+            reference_tokens[step],
+            tp_tokens[step],
+            delta / scale
+        );
     }
     assert_eq!(reference_tokens, tp_tokens, "TP2 argmax divergence");
     assert!(worst < 1e-4, "TP2 relative logit error {worst:.3e}");
-    println!("PASS tokens={} worst_rel={worst:.3e}", reference_tokens.len());
+    println!(
+        "PASS tokens={} worst_rel={worst:.3e}",
+        reference_tokens.len()
+    );
 }

@@ -3655,6 +3655,37 @@ pub fn forward_scratch_dense_tp(
     .map_err(|e| HipError::new(0, &e.to_string()))
 }
 
+/// Correctness-first dense-TP prefill seam. It deliberately reuses the
+/// certified single-token TP path so serving can land independently of the
+/// later batched TP kernels.
+#[allow(clippy::too_many_arguments)]
+pub fn forward_prefill_dense_tp(
+    gpus: &mut Gpus,
+    shard: &ShardConfig,
+    weights: &[Qwen35Weights],
+    configs: &[Qwen35Config],
+    tokens: &[u32],
+    start_pos: usize,
+    kv_caches: &mut [llama::KvCache],
+    dn_states: &mut [DeltaNetState],
+    scratches: &[Qwen35Scratch],
+) -> HipResult<()> {
+    for (offset, &token) in tokens.iter().enumerate() {
+        forward_scratch_dense_tp(
+            gpus,
+            shard,
+            weights,
+            configs,
+            token,
+            start_pos + offset,
+            kv_caches,
+            dn_states,
+            scratches,
+        )?;
+    }
+    Ok(())
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // #397 Ship 6 — forward-as-pipeline: qwen35 DECODE lowered path (ADDITIVE).
 //
