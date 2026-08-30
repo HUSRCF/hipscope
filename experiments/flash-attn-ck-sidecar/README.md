@@ -22,18 +22,19 @@ Current scope:
 - gfx1100 F32-Q/Q8-K/Q8-V causal GQA at head dimension 256;
 - gfx1100 F32-Q/Asym3-Givens-K/Q8-V causal GQA at head dimension 256;
 - gfx1201 F32-Q/Asym3-Givens-K/Q8-V causal GQA at head dimension 256;
+- gfx1100/gfx1201 F32-Q/Asym3-FWHT-K/Q8-V causal GQA at head dimension 256;
 - raw HIP stream and element-stride inputs.
 
 The Q8 cell vector-decodes both packed caches into F16, invokes the CK D256
-pipeline, and converts output back to F32. It is a correctness-first staged
-adapter; direct quantized CK and asym/FWHT/Lloyd layouts remain future cells.
+pipeline, and converts output back to F32. The Asym3 cells additionally apply
+the selected Givens or FWHT query transform before the same CK pipeline.
 
 ABI v4 gives Givens and FWHT K caches distinct format IDs; Q8 V remains a
 separate format, and callers provide explicit K/V row and head byte strides
-plus both transform tables. The D256 Givens cell rotates Q and decodes packed K
-and Q8 V into caller-owned F16 staging before invoking CK. D512 Givens and both
-FWHT shapes remain `recognized-no-cell`: their layouts are validated but no
-capability is published. This keeps each unimplemented packed loader fail-closed.
+plus both transform tables. The D256 Givens and FWHT cells transform Q and
+decode packed K and Q8 V into caller-owned F16 staging before invoking CK.
+D512 remains `recognized-no-cell`: its layout is validated but no capability
+is published. This keeps each unimplemented packed loader fail-closed.
 Packed staging currently requires contiguous `[row, head, dim]` Q and output;
 the ABI validator rejects non-contiguous element strides rather than ignoring them.
 The Rust loader accepts ABI v3 sidecars for their original dense/Q8 cells by
@@ -96,7 +97,7 @@ HIP_VISIBLE_DEVICES=0 \
 ```
 
 The pure-HIP smoke runs dense FP16 MHA/MQA/GQA, packed Q8 D256 GQA,
-and Asym3-Givens D256 GQA cases against CPU references. Quantized references
+and Asym3-Givens/FWHT D256 GQA cases against CPU references. Quantized references
 use reconstructed values, so they check packed loading and attention
 independently of quantization error.
 
@@ -110,6 +111,7 @@ Validated on Radeon Pro W7900 / gfx1100 with ROCm 7.14:
 | FP16 MQA D64, non-causal, default stream | `4.367530e-05` | `6.348691e-06` |
 | F32/Q8/Q8 GQA D256, causal | `4.766881e-05` | `7.248458e-06` |
 | F32/Asym3-Givens/Q8 GQA D256, causal | `6.110966e-05` | `1.009769e-05` |
+| F32/Asym3-FWHT/Q8 GQA D256, causal | `7.408857e-05` | `1.015317e-05` |
 
 ## Optional Rust loader
 
@@ -147,7 +149,8 @@ workspace produces a one-time route reason and retains native attention. The
 Asym3 D256 cell is attempted only after the Qwen attention family has completed
 its native KV write and resolved a sequential, non-tree, non-windowed prefill;
 decode and graph capture remain native. Use `scripts/bench_ck_q8_prefill_ab.sh`
-with `KV_MODE=q8` or `KV_MODE=asym3` for a reproducible production-path A/B.
+with `KV_MODE=q8`, `KV_MODE=asym3`, or `KV_MODE=fwht3` for a reproducible
+production-path A/B.
 The script also requires native and CK prefill to produce the same next-token ID.
 
 Qwen3.6-27B MQ4, Asym3 KV, W7900/gfx1100, warm process and identical fake prompt:
@@ -164,6 +167,13 @@ The same PP8192 cell was revalidated after porting to current master
 | Native median | CK median | Delta | Next token |
 | ---: | ---: | ---: | ---: |
 | `572.5 tok/s` | `797.4 tok/s` | `+39.28%` | `248046` / `248046` |
+
+The Asym3-FWHT cell was validated independently on the same W7900/gfx1100
+production path with five timed runs after two warmups:
+
+| Native median | CK median | Delta | Next token |
+| ---: | ---: | ---: | ---: |
+| `568.5 tok/s` | `794.0 tok/s` | `+39.67%` | `248046` / `248046` |
 
 A matching rocprof trace bounds further optimization within this CK cell. After
 dividing the warmup-plus-profile dispatch totals by two, CK FMHA took about
