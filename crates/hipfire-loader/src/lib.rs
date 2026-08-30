@@ -225,16 +225,16 @@ pub fn bench_decode_route(arch_id: u32) -> BenchDecodeRoute {
 pub enum VisionRoute {
     DotsOcr,
     QwenVl,
+    Lfm2Vl,
     None,
 }
 pub fn vision_route(arch_id: u32) -> VisionRoute {
     // Declared-capability gate: text-only arches declare `supports_images == false`
     // and must return `None` even if the arch_id table would say otherwise.
     // The table itself cannot be removed: it discriminates *which* vision
-    // implementation to run (QwenVl vs DotsOcr have distinct generate bodies in
-    // `hipfire_generate::vision::{generate_vl, generate_vl_dots_ocr}`), not just
-    // whether vision is present. Consulting caps here makes the gate declarative
-    // without changing behaviour.
+    // implementation to run (QwenVl vs DotsOcr vs Lfm2Vl have distinct generate
+    // bodies in `hipfire_generate::vision`), not just whether vision is present.
+    // Consulting caps here makes the gate declarative without changing behaviour.
     let caps = carrier_for(arch_id).map(|c| c.caps()).unwrap_or_default();
     if !caps.supports_images {
         return VisionRoute::None;
@@ -242,6 +242,7 @@ pub fn vision_route(arch_id: u32) -> VisionRoute {
     match arch_id {
         8 => VisionRoute::DotsOcr,
         5 | 6 => VisionRoute::QwenVl,
+        11 => VisionRoute::Lfm2Vl,
         _ => VisionRoute::None,
     }
 }
@@ -1142,6 +1143,34 @@ impl LoadedModel {
 
     pub fn vision_weights_mut(&mut self) -> Option<&mut qwen35_vl::VisionWeights> {
         self.qwen35_mut().and_then(|b| b.vision_weights.as_mut())
+    }
+
+    /// Declared vision capability across ALL carriers that can carry a
+    /// tower: qwen35-vl (arch 5/6 bundle field), dots-ocr (arch 8), and
+    /// lfm2-vl (arch-11 bundle field). The daemon's image gate consults
+    /// this instead of the qwen-typed accessors above.
+    pub fn has_vision_encoder(&self) -> bool {
+        if self.dots_ocr().is_some() {
+            return true;
+        }
+        if let Some(b) = self.lfm2moe() {
+            if b.vision_config.is_some() {
+                return true;
+            }
+        }
+        self.qwen35().is_some_and(|b| b.vision_config.is_some())
+    }
+
+    /// LFM2-VL (arch 11) projected-vision config + weights, when loaded
+    /// from an artifact quantized with `--include-vision`.
+    pub fn lfm2_vision(
+        &self,
+    ) -> Option<(
+        &hipfire_arch_lfm2_vl::VisionConfig,
+        &hipfire_arch_lfm2_vl::VisionWeights,
+    )> {
+        let b = self.lfm2moe()?;
+        Some((b.vision_config.as_ref()?, b.vision_weights.as_ref()?))
     }
 
     /// DotsOcr bundle if this model is arch_id=8, else None.
@@ -3494,16 +3523,20 @@ mod registry_tests {
         assert_eq!(super::vision_route(5), super::VisionRoute::QwenVl);
         assert_eq!(super::vision_route(6), super::VisionRoute::QwenVl);
         assert_eq!(super::vision_route(8), super::VisionRoute::DotsOcr);
+        assert_eq!(super::vision_route(11), super::VisionRoute::Lfm2Vl);
         assert_eq!(super::vision_route(0), super::VisionRoute::None);
         assert_eq!(super::vision_route(7), super::VisionRoute::None);
         assert_eq!(super::vision_route(9), super::VisionRoute::None);
         // Text-only carriers must stay false.
+        assert!(
+            REGISTRY.iter().find(|c| c.name() == "lfm2moe").unwrap().caps().supports_images,
+            "lfm2moe (arch 11, lfm2_vl artifacts) must declare supports_images —              tower-less checkpoints still refuse images via has_vision_encoder()"
+        );
         for name in [
             "qwen2",
             "llama",
             "deepseek4",
             "minimax",
-            "lfm2moe",
             "cohere2moe",
             "gemma4",
             "muse_glimmer",
@@ -3583,6 +3616,7 @@ mod registry_tests {
             caps_of("lfm2moe"),
             ArchCaps {
                 supports_continuous_batch: true,
+                supports_images: true,
                 ..text_only
             }
         );
@@ -3640,11 +3674,12 @@ mod registry_tests {
             assert_eq!(bench_decode_route(id), want, "bench_decode_route({id})");
         }
 
-        // ── vision_route: 8 -> DotsOcr, 5|6 -> QwenVl, gated by supports_images ──
+        // ── vision_route: 8 -> DotsOcr, 5|6 -> QwenVl, 11 -> Lfm2Vl; gated by supports_images ──
         for id in 0u32..=14 {
             let want = match id {
                 8 => VisionRoute::DotsOcr,
                 5 | 6 => VisionRoute::QwenVl,
+                11 => VisionRoute::Lfm2Vl,
                 _ => VisionRoute::None,
             };
             assert_eq!(vision_route(id), want, "vision_route({id})");

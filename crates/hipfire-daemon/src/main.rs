@@ -2486,7 +2486,9 @@ fn main() {
 
                 let has_image = image_base64.is_some() || image.is_some();
                 let vision_route = hipfire_loader::vision_route(m.arch_id);
-                let has_vl = m.vision_config().is_some() || m.dots_ocr().is_some();
+                // Covers qwen35-vl (arch 5/6 bundle), dots-ocr (arch 8) AND
+                // lfm2-vl (arch-11 bundle) in one declared-capability probe.
+                let has_vl = m.has_vision_encoder();
 
                 if has_image && !has_vl {
                     write_error(&mut stdout, id, "model has no vision encoder");
@@ -2501,9 +2503,10 @@ fn main() {
                     // from a clean KV state.
                     //
                     // Must mirror the "reset" command handler (line ~2098).
-                    // VL only runs on qwen35-vl (arch_id 5|6) and dots-ocr (arch_id 8), so
-                    // deepseek4_state and llama_kv are None — but clear them anyway
-                    // for defense-in-depth in case a future arch adds VL support.
+                    // VL runs on qwen35-vl (arch_id 5|6), dots-ocr (arch_id 8)
+                    // and lfm2-vl (arch_id 11); other arch states are None
+                    // here — but clear them anyway for defense-in-depth in
+                    // case a future arch adds VL support.
                     if m.seq_pos > 0 {
                         eprintln!("[daemon/vl] non-zero seq_pos ({}) at VL dispatch — resetting conversation", m.seq_pos);
                         m.seq_pos = 0;
@@ -2562,6 +2565,25 @@ fn main() {
                         }
                         if let Some(b) = m.deepseek4_mut() {
                             b.state.reset();
+                        }
+                        // lfm2-vl (arch 11): KV + conv state live in the
+                        // lfm2moe bundle. generate_lfm2_vl cold-resets again
+                        // before its own prefill, so this arm is
+                        // defense-in-depth parity with the other VL arches —
+                        // without it a failed dispatch between guard and
+                        // generate body would leave stale state behind.
+                        if let Some(b) = m.lfm2moe_mut() {
+                            if let Err(e) = b.state.reset(&mut gpu) {
+                                hipfire_generate::dense::emit_active_attempt_error(
+                                    &mut stdout,
+                                    Some(id),
+                                    &format!("vision lfm2moe reset failed: {e:?}"),
+                                    "gpu",
+                                    true,
+                                    false,
+                                );
+                                continue;
+                            }
                         }
                         if let Some(ad) = m.kv_adaptive.as_mut() {
                             if let Some(s) = m.state.as_mut() {
@@ -2641,6 +2663,14 @@ fn main() {
                     match vision_route {
                         hipfire_loader::VisionRoute::DotsOcr => {
                             hipfire_generate::vision::generate_vl_dots_ocr(
+                                m,
+                                &mut gpu,
+                                &mut stdout,
+                                &params,
+                            )
+                        }
+                        hipfire_loader::VisionRoute::Lfm2Vl => {
+                            hipfire_generate::vision::generate_lfm2_vl(
                                 m,
                                 &mut gpu,
                                 &mut stdout,

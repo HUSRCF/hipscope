@@ -12831,6 +12831,103 @@ impl Gpu {
         result
     }
 
+    /// Grouped MoE GEMM over MQ6G256V2 (qt=47) routed experts.
+    ///
+    /// Sister of `gemm_mq4g256v2_moe_grouped_wmma_k2`: same gather/tiling/WMMA
+    /// pipeline and kernarg ABI; only the weight decode changes (200 B/group
+    /// dual-half header + 192 B packed 6-bit vs qt44's 136 B nibble layout).
+    ///
+    /// Arch-selects via `kernels::mq6g256v2_moe_grouped_wmma_source`: gfx11
+    /// takes `_k2`, gfx12 takes `_gfx12`. V1 MQ6 (f32 s/z header) MUST NOT
+    /// collapse into this path — wrong header yields fluent corruption.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_mq6g256v2_moe_grouped_wmma_k2(
+        &mut self,
+        expert_weight_ptrs: &GpuTensor, // [E] u64
+        expert_tile_ids: &GpuTensor,    // [m_total / 16] i32
+        sorted_slot_index: &GpuTensor,  // [m_total] i32
+        x_src: &GpuTensor,              // [x_src_rows x K]
+        y_grouped: &GpuTensor,          // [m_total x M] f32
+        m: usize,
+        k: usize,
+        x_row_div: usize,
+        m_total: usize,
+        x_src_rows: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        // Arch-selecting, like the MQ4V2/MQ2/MQ3-Lloyd grouped sisters: gfx11
+        // takes the `_k2` source, gfx12 (RDNA4) the `_gfx12` one. They are
+        // DIFFERENT sources — the gfx12 WMMA intrinsic and operand shape do
+        // not exist on gfx11 and vice versa, so neither JITs on the other's
+        // arch.
+        let is_gfx12 = self.arch_caps.is_rdna4();
+        if !is_gfx12 && !self.arch_caps.has_wmma_w32() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "gemm_mq6g256v2_moe_grouped_wmma_k2: wave32 WMMA required",
+            ));
+        }
+        let (kernel_name, kernel_src) = kernels::mq6g256v2_moe_grouped_wmma_source(is_gfx12);
+        self.ensure_kernel(kernel_name, kernel_src, kernel_name)?;
+        // UNCACHED conversion is mandatory here. `ensure_fp16_x` is pointer-keyed,
+        // and MoE prefill reuses the SAME x_rot_batch tensor for every layer with
+        // different contents each time — so the cached variant hands every layer
+        // after the first the fp16 activations of layer 0.
+        let x_f16_ptr = self.convert_fp16_x_uncached(x_src, x_src_rows * k)?;
+
+        let ep = expert_weight_ptrs.buf.as_ptr();
+        let tp = expert_tile_ids.buf.as_ptr();
+        let sp = sorted_slot_index.buf.as_ptr();
+        let xp = x_f16_ptr;
+        let yp = y_grouped.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let xrd_val = x_row_div as i32;
+        let mt_val = m_total as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &ep as *const _ as *mut c_void,
+            &tp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &xrd_val as *const _ as *mut c_void,
+            &mt_val as *const _ as *mut c_void,
+        ];
+
+        let row_tiles = ((m + 15) / 16) as u32;
+        let slot_tiles = ((m_total + 15) / 16) as u32;
+        let bytes =
+            m_total * k * 2 + (m_total * m) * 4 + (crate::profile::gemv_hfq4g256_bytes(m, k));
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
+        let result = self.launch_maybe_blob(
+            kernel_name,
+            [row_tiles, slot_tiles, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ep);
+                b.push_ptr(tp);
+                b.push_ptr(sp);
+                b.push_ptr(xp);
+                b.push_ptr(yp);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(xrd_val);
+                b.push_i32(mt_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// Run the HFQ4/MQ4 grouped MoE GEMM through the FP16-WMMA route even on
     /// archs where the i8 MMQ shortcut is default-on. Used by mixed MQ6 A3B
     /// prefill, where gfx1151's HFQ4 i8 shortcut is model-level unsafe.
@@ -15951,7 +16048,11 @@ impl Gpu {
             )
         };
         self.ensure_kernel(kernel_name, kernel_src, kernel_name)?;
-        let x_f16_ptr = self.ensure_fp16_x(x_src, x_src_rows * k)?;
+        // UNCACHED conversion is mandatory here. `ensure_fp16_x` is pointer-keyed,
+        // and MoE prefill reuses the SAME x_rot_batch tensor for every layer with
+        // different contents each time — so the cached variant hands every layer
+        // after the first the fp16 activations of layer 0.
+        let x_f16_ptr = self.convert_fp16_x_uncached(x_src, x_src_rows * k)?;
 
         let ep = expert_weight_ptrs.buf.as_ptr();
         let dtp = expert_dtype_tags.buf.as_ptr();

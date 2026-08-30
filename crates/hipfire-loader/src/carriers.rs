@@ -1474,7 +1474,11 @@ impl Carrier for Lfm2MoeCarrier {
             spec_excludes_adaptive: false,
             semantic_contract_version: None,
             has_deltanet: false,
-            supports_images: false,
+            // lfm2_vl artifacts carry the SigLIP2 tower + projector. The
+            // declared-capability model works exactly like qwen35-vl here:
+            // artifacts WITHOUT vision tensors still load fine and refuse
+            // images at the daemon gate via `has_vision_encoder() == false`.
+            supports_images: true,
             reasoning_contract: saddle_core::caps::ReasoningContract::Unsupported,
         }
     }
@@ -1516,7 +1520,62 @@ impl Carrier for Lfm2MoeCarrier {
         }
         dir_diag(&src);
         let meta = resolve_source_meta(&src, ctx.path)?;
-        let bundle = hipfire_arch_lfm2moe::load_lfm2moe_bundle(src, ctx)?;
+
+        // ── LFM2-VL detection + tower/projector upload ────────────────────
+        // Mirrors the qwen35 HFQ arm: HFQ is single-pass, so the vision
+        // stack MUST be read from the same file handle BEFORE
+        // `load_lfm2moe_bundle` consumes it for the text trunk.
+        let mut vision_cfg_out: Option<hipfire_arch_lfm2_vl::VisionConfig> = None;
+        let mut vision_w_out: Option<hipfire_arch_lfm2_vl::VisionWeights> = None;
+        if let ModelSource::Hfq(hfq_file) = &src {
+            if hfq_file
+                .tensor_data("model.vision_tower.vision_model.embeddings.patch_embedding.weight")
+                .is_some()
+            {
+                match hipfire_arch_lfm2_vl::vision_config_from_hfq(hfq_file) {
+                    Some(vc) => {
+                        eprintln!(
+                            "  LFM2-VL model: SigLIP2-NaFlex tower (hidden={}, layers={}) + projector",
+                            vc.hidden_size, vc.num_layers
+                        );
+                        match hipfire_arch_lfm2_vl::load_vision_weights(hfq_file, &vc, ctx.gpu) {
+                            Ok(vw) => {
+                                vision_cfg_out = Some(vc);
+                                vision_w_out = Some(vw);
+                            }
+                            Err(e) => {
+                                return Err(format!(
+                                    "lfm2moe: LFM2-VL vision weight load failed: {e:?}"
+                                ));
+                            }
+                        }
+                    }
+                    None => {
+                        return Err(
+                            "lfm2moe: artifact carries vision tensors but no vision_config \
+                             metadata — requantize with --include-vision"
+                                .into(),
+                        );
+                    }
+                }
+            }
+        }
+
+        let bundle = match hipfire_arch_lfm2moe::load_lfm2moe_bundle(src, ctx) {
+            Ok(mut b) => {
+                b.vision_config = vision_cfg_out;
+                b.vision_weights = vision_w_out;
+                b
+            }
+            Err(e) => {
+                // Trunk failed after the tower is already on-device — reclaim
+                // it or the unload drain will miss these buffers entirely.
+                if let Some(vw) = vision_w_out {
+                    vw.free_gpu(ctx.gpu);
+                }
+                return Err(e);
+            }
+        };
         let speculator = crate::spec_build::build_speculator(
             meta.arch_id,
             None,
