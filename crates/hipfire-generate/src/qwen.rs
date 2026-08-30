@@ -242,7 +242,9 @@ pub fn generate_ep(
             &prompt_ids,
             eos_tok,
             max_tokens,
+            max_think_tokens,
             stop,
+            primed_think,
             sampling,
         ),
         _ => ep_serve_ds4(
@@ -280,9 +282,9 @@ pub fn ep_emit_token(
     stop.iter().any(|s| !s.is_empty() && text_acc.ends_with(s))
 }
 
-/// Dense Qwen TP2 serving loop. The prefill seam is intentionally
-/// correctness-first (sequential token replay); batched TP prefill can replace
-/// that implementation without changing loader or daemon ownership.
+/// Dense Qwen TP2 serving loop with Qwen contract-v2 semantic streaming.
+/// Prefill remains correctness-first (sequential chunk replay); batched TP
+/// prefill can replace that seam later without changing loader ownership.
 #[allow(clippy::too_many_arguments)]
 pub fn ep_serve_qwen35_dense_tp(
     m: &mut LoadedModel,
@@ -291,7 +293,9 @@ pub fn ep_serve_qwen35_dense_tp(
     prompt_ids: &[u32],
     eos_tok: u32,
     max_tokens: usize,
+    max_think_tokens: usize,
     stop: &[String],
+    primed_think: bool,
     sampling: EpSampling,
 ) {
     let prompt_n = prompt_ids.len();
@@ -316,7 +320,18 @@ pub fn ep_serve_qwen35_dense_tp(
         if let EpArch::Qwen35DenseTp { dn_states, .. } = inner {
             for (rank, state) in dn_states.iter_mut().enumerate() {
                 let gpu = &mut gpus.devices[rank];
-                let _ = gpu.bind_thread();
+                if let Err(e) = gpu.bind_thread() {
+                    emit_active_attempt_error(
+                        stdout,
+                        Some(id),
+                        &format!("dense TP bind_thread rank {rank}: {e:?}"),
+                        "validation",
+                        false,
+                        false,
+                    );
+                    let _ = stdout.flush();
+                    return;
+                }
                 if let Err(e) = state.reset(gpu) {
                     emit_active_attempt_error(
                         stdout,
@@ -335,10 +350,12 @@ pub fn ep_serve_qwen35_dense_tp(
     }
     m.seq_pos = 0;
     m.conversation_tokens.clear();
+    // `primed_think` preserves Jinja enable_thinking semantics (render ended on
+    // an open `<think>` primer). Tool requests fail closed before this route.
     emit_gen_start(
         stdout,
         id,
-        false,
+        primed_think,
         gen_start_contract_version_for_arch(m.arch_id),
     );
 
@@ -396,6 +413,10 @@ pub fn ep_serve_qwen35_dense_tp(
             return;
         }
     }
+    // Bookkeeping matches the fully replayed prompt so decode commits extend
+    // the same conversation/stream positions the single-GPU path would.
+    m.conversation_tokens.extend_from_slice(prompt_ids);
+    m.seq_pos = prompt_n;
     let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
     let mut logits = {
         let Some(EpState { gpus, inner }) = m.ep.as_mut() else {
@@ -404,7 +425,18 @@ pub fn ep_serve_qwen35_dense_tp(
         let EpArch::Qwen35DenseTp { scratches, .. } = inner else {
             return;
         };
-        let _ = gpus.devices[0].bind_thread();
+        if let Err(e) = gpus.devices[0].bind_thread() {
+            emit_active_attempt_error(
+                stdout,
+                Some(id),
+                &format!("dense TP first-logits bind_thread: {e:?}"),
+                "validation",
+                false,
+                false,
+            );
+            let _ = stdout.flush();
+            return;
+        }
         match gpus.devices[0].download_f32(&scratches[0].logits) {
             Ok(v) => v,
             Err(e) => {
@@ -422,9 +454,13 @@ pub fn ep_serve_qwen35_dense_tp(
     };
 
     let t_decode = Instant::now();
+    let mut semantic =
+        crate::ar::QwenArSemanticProducer::new_with_tool_protocol(id, primed_think, false);
+    let mut streamed_tokens: Vec<u32> = Vec::new();
+    let mut bytes_fed_to_filter = 0usize;
     let mut generated = 0usize;
-    let mut pos = prompt_n;
-    let mut text_acc = String::new();
+    let mut think_count = 0usize;
+    let mut hit_custom_stop = false;
     while generated < max_tokens {
         if check_abort(id) {
             ep_emit_abort(stdout, id, m, generated);
@@ -437,23 +473,9 @@ pub fn ep_serve_qwen35_dense_tp(
             sampling.top_k,
             sampling.min_p,
         );
-        if next == eos_tok {
-            break;
-        }
-        let piece = m.tokenizer.as_ref().unwrap().decode(&[next]);
-        let stopped = ep_emit_token(stdout, id, &piece, &mut text_acc, stop);
-        emit_committed_event(
-            stdout,
-            id,
-            next,
-            generated,
-            t_decode.elapsed().as_millis() as u64,
-        );
-        generated += 1;
-        if stopped || generated >= max_tokens {
-            break;
-        }
 
+        // KV write before any client-visible classify/emit (same contract as AR).
+        let write_pos = m.seq_pos;
         let forward = {
             let Some(EpState { gpus, inner }) = m.ep.as_mut() else {
                 return;
@@ -470,7 +492,7 @@ pub fn ep_serve_qwen35_dense_tp(
                 return;
             };
             qwen35::forward_scratch_dense_tp(
-                gpus, shard, weights, configs, next, pos, kv_caches, dn_states, scratches,
+                gpus, shard, weights, configs, next, write_pos, kv_caches, dn_states, scratches,
             )
         };
         if let Err(e) = forward {
@@ -484,7 +506,82 @@ pub fn ep_serve_qwen35_dense_tp(
             );
             return;
         }
-        pos += 1;
+
+        let prev_fed = bytes_fed_to_filter;
+        let elapsed_ms = t_decode.elapsed().as_millis() as u64;
+        let filter_stop = match semantic.commit_and_classify(
+            stdout,
+            next,
+            || {
+                let pos = crate::ar::qwen_ar_raw_commit_token(
+                    &mut m.conversation_tokens,
+                    &mut streamed_tokens,
+                    &mut m.seq_pos,
+                    next,
+                    crate::ar::QwenArRawCommitDisposition::ClassifiedVisible,
+                );
+                let all_bytes = m.tokenizer.as_ref().unwrap().decode_bytes(&streamed_tokens);
+                let new_bytes = all_bytes[prev_fed.min(all_bytes.len())..].to_vec();
+                bytes_fed_to_filter = all_bytes.len();
+                (pos, new_bytes)
+            },
+            |pos, out| {
+                emit_committed_event(out, id, next, pos, elapsed_ms);
+            },
+        ) {
+            Ok(stop) => stop,
+            Err(err) => {
+                emit_active_attempt_error(
+                    stdout,
+                    Some(id),
+                    &format!("dense TP semantic classify: {err}"),
+                    "validation",
+                    false,
+                    false,
+                );
+                let _ = stdout.flush();
+                return;
+            }
+        };
+        generated += 1;
+
+        // Custom stops match visible answer text (post EosFilter/think route),
+        // never raw protocol bytes.
+        if stop
+            .iter()
+            .any(|s| !s.is_empty() && semantic.visible().ends_with(s.as_str()))
+        {
+            hit_custom_stop = true;
+            break;
+        }
+
+        // Conservative think-budget: count tokens while the router is inside a
+        // think span. Exceeding a nonzero cap fails closed — no force-close
+        // splice and no partial semantic done.
+        if max_think_tokens > 0 {
+            if semantic.think_router.in_think() {
+                think_count = think_count.saturating_add(1);
+                if think_count >= max_think_tokens {
+                    let ep = ep_reset_after_abort(m);
+                    emit_fail_closed_error(
+                        stdout,
+                        Some(id),
+                        "think token budget exceeded (validation)",
+                        "validation",
+                        false,
+                        &ep,
+                    );
+                    return;
+                }
+            } else {
+                think_count = 0;
+            }
+        }
+
+        if filter_stop || next == eos_tok || generated >= max_tokens {
+            break;
+        }
+
         logits = {
             let Some(EpState { gpus, inner }) = m.ep.as_mut() else {
                 return;
@@ -492,7 +589,18 @@ pub fn ep_serve_qwen35_dense_tp(
             let EpArch::Qwen35DenseTp { scratches, .. } = inner else {
                 return;
             };
-            let _ = gpus.devices[0].bind_thread();
+            if let Err(e) = gpus.devices[0].bind_thread() {
+                emit_active_attempt_error(
+                    stdout,
+                    Some(id),
+                    &format!("dense TP decode logits bind_thread: {e:?}"),
+                    "validation",
+                    false,
+                    false,
+                );
+                let _ = stdout.flush();
+                return;
+            }
             match gpus.devices[0].download_f32(&scratches[0].logits) {
                 Ok(v) => v,
                 Err(e) => {
@@ -509,6 +617,34 @@ pub fn ep_serve_qwen35_dense_tp(
             }
         };
     }
+
+    // Custom stop is a natural/filter-class terminal, not length.
+    let hit_length_cap = generated >= max_tokens && !hit_custom_stop;
+    let (finish, _visible) = match semantic.finish(stdout, hit_length_cap) {
+        Ok(pair) => pair,
+        Err(err) => {
+            emit_active_attempt_error(
+                stdout,
+                Some(id),
+                &format!("dense TP semantic finish: {err}"),
+                "validation",
+                false,
+                false,
+            );
+            let _ = stdout.flush();
+            return;
+        }
+    };
+    if matches!(finish.cause, crate::ar::QwenArTerminalCause::OpenThink) {
+        let ep = ep_reset_after_abort(m);
+        crate::ar::emit_qwen_ar_open_think_terminal(stdout, id, generated, &ep);
+        return;
+    }
+    let finish_reason = match finish.finish_reason {
+        "length" => "length",
+        "error" => "error",
+        _ => "stop",
+    };
     ep_emit_done(
         stdout,
         id,
@@ -517,6 +653,7 @@ pub fn ep_serve_qwen35_dense_tp(
         prompt_n,
         prefill_ms,
         t_decode.elapsed().as_secs_f64() * 1000.0,
+        finish_reason,
     );
 }
 
@@ -528,6 +665,7 @@ pub fn ep_emit_done(
     prompt_n: usize,
     prefill_ms: f64,
     decode_ms: f64,
+    finish_reason: &str,
 ) {
     let decode_tok_s = if decode_ms > 0.0 {
         generated as f64 / (decode_ms / 1000.0)
@@ -546,6 +684,7 @@ pub fn ep_emit_done(
         prefill_ms,
         decode_ms,
         decode_tok_s,
+        finish_reason,
         "expert-parallel generation completed"
     );
     eprintln!("[daemon] EP generate done: {generated} tok, {decode_tok_s:.1} tok/s");
@@ -559,6 +698,7 @@ pub fn ep_emit_done(
         "prefill_tok_s": (prefill_tok_s * 10.0).round() / 10.0,
         "decode_tok_s": (decode_tok_s * 10.0).round() / 10.0,
         "ttft_ms": (prefill_ms * 10.0).round() / 10.0,
+        "finish_reason": finish_reason,
         "attempt_id": active_attempt_id(),
     });
     match await_client_terminal_commit(stdout, id, &pending_done) {
@@ -1392,6 +1532,7 @@ pub fn ep_serve_minimax(
     let mut generated = 0usize;
     let mut pos = prompt_n;
     let mut text_acc = String::new();
+    let mut natural_stop = false;
     while generated < max_tokens {
         // FIX #3 (ep-no-abort): client cancel mid-decode → emit aborted+done,
         // reset EP cursors, stop.
@@ -1411,12 +1552,14 @@ pub fn ep_serve_minimax(
             sampling.min_p,
         );
         if next == eos_tok {
+            natural_stop = true;
             break;
         }
         let piece = m.tokenizer.as_ref().unwrap().decode(&[next]);
         generated += 1;
         m.conversation_tokens.push(next);
         if ep_emit_token(stdout, id, &piece, &mut text_acc, stop) {
+            natural_stop = true;
             break;
         }
         let EpState { gpus, inner } = m.ep.as_mut().unwrap();
@@ -1466,6 +1609,11 @@ pub fn ep_serve_minimax(
             }
         };
     }
+    let finish_reason = if !natural_stop && generated >= max_tokens {
+        "length"
+    } else {
+        "stop"
+    };
     ep_emit_done(
         stdout,
         id,
@@ -1474,6 +1622,7 @@ pub fn ep_serve_minimax(
         prompt_n,
         prefill_ms,
         t_decode.elapsed().as_secs_f64() * 1000.0,
+        finish_reason,
     );
 }
 

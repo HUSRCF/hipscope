@@ -1599,7 +1599,6 @@ fn main() {
                     .and_then(|v| v.as_str())
                     .filter(|s| !s.is_empty())
                     .map(|s| s.to_string());
-
                 let deepseek4_experts_per_token = msg
                     .get("params")
                     .and_then(|p| p.get("deepseek4_experts_per_token"))
@@ -1645,6 +1644,7 @@ fn main() {
                         tp,
                         kv_mode_override.as_deref(),
                         kv_backend_override.as_deref(),
+                        state_quant_override.as_deref(),
                     )
                 } else {
                     hipfire_loader::load_model_with_gemma4_drafter(

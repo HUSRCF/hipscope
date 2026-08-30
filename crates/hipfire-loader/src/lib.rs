@@ -28,8 +28,9 @@ use hipfire_runtime::arch_model::ArchModel;
 use hipfire_runtime::cask::CaskCtx;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::kv_backend::KvBackend;
+use hipfire_runtime::kv_mode;
 use hipfire_runtime::llama;
-use hipfire_runtime::llama::KvCacheExt;
+use hipfire_runtime::llama::{KvCacheExt, KvDims, KvLayers, KvTarget};
 use hipfire_runtime::loader_api::{CaskConfig, LoadCtx, ModelSource, SpecLoadCfg};
 use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_runtime::spec::{SpecEmit, SpecEmitCtx, SpecTargetGuard, Speculator};
@@ -2679,10 +2680,11 @@ pub fn load_model_ep_with_kv_mode(
     tp: usize,
     kv_mode: Option<&str>,
     kv_backend: Option<&str>,
+    state_quant: Option<&str>,
 ) -> Result<LoadedModel, String> {
     let hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
     let kv_backend_raw = kv_backend.unwrap_or("contiguous");
-    let kv_backend: KvBackend = kv_backend_raw.parse().map_err(|err| format!("{err}"))?;
+    let kv_backend_kind: KvBackend = kv_backend_raw.parse().map_err(|err| format!("{err}"))?;
     match hfq.arch_id {
         9 => load_model_ep_ds4(
             path,
@@ -2690,14 +2692,14 @@ pub fn load_model_ep_with_kv_mode(
             tp,
             resolve_deepseek4_compressor_cache_kv_mode(kv_mode)?,
         ),
-        10 if kv_backend == KvBackend::Vmm => {
+        10 if kv_backend_kind == KvBackend::Vmm => {
             Err(format!("KV backend '{kv_backend_raw}' requires tp=1"))
         }
         10 => load_model_ep_minimax(path, max_seq, tp),
-        5 | 6 if kv_backend == KvBackend::Vmm => {
+        5 | 6 if kv_backend_kind == KvBackend::Vmm => {
             Err(format!("KV backend '{kv_backend_raw}' requires tp=1"))
         }
-        5 | 6 => load_model_ep_qwen35(path, max_seq, tp),
+        5 | 6 => load_model_ep_qwen35(path, max_seq, tp, kv_mode, kv_backend, state_quant),
         id => Err(format!(
             "EP not supported for arch_id={id} (expected 5|6 for Qwen3.5, 9 for DeepSeek V4 or 10 for MiniMax)"
         )),
@@ -2721,7 +2723,7 @@ pub fn load_model_ep_with_compressor_cache(
         }
         10 => Err("DeepSeek V4 compressor-cache storage cannot be applied to MiniMax".to_string()),
         5 | 6 if compressor_cache == hipfire_config::Deepseek4CompressorCache::F32 => {
-            load_model_ep_qwen35(path, max_seq, tp)
+            load_model_ep_qwen35(path, max_seq, tp, None, None, None)
         }
         5 | 6 => Err("DeepSeek V4 compressor-cache storage cannot be applied to Qwen3.5".to_string()),
         id => Err(format!(
@@ -3088,7 +3090,14 @@ fn load_model_ep_minimax(path: &str, max_seq: usize, tp: usize) -> Result<Loaded
         )
     })
 }
-fn load_model_ep_qwen35(path: &str, max_seq: usize, tp: usize) -> Result<LoadedModel, String> {
+fn load_model_ep_qwen35(
+    path: &str,
+    max_seq: usize,
+    tp: usize,
+    kv_mode: Option<&str>,
+    kv_backend: Option<&str>,
+    state_quant: Option<&str>,
+) -> Result<LoadedModel, String> {
     use hipfire_runtime::tp_shard::{ExpertAssign, ShardConfig};
 
     let hfq_probe = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
@@ -3104,8 +3113,10 @@ fn load_model_ep_qwen35(path: &str, max_seq: usize, tp: usize) -> Result<LoadedM
     let config = qwen35::config_from_hfq(&hfq_probe).map_err(|e| format!("qwen35 config: {e}"))?;
     if config.num_experts == 0 {
         drop(hfq_probe);
-        return load_model_tp_qwen35_dense(path, max_seq, tp);
+        return load_model_tp_qwen35_dense(path, max_seq, tp, kv_mode, state_quant);
     }
+    // MoE EP: keep existing behavior; dense-only selectors are handled above. Silence unused.
+    let _ = (kv_mode, kv_backend, state_quant);
     if tp != 4 {
         return Err(format!(
             "EP qwen35 MoE requires tp=4, got tp={tp} (only 4×gfx1201 expert-parallel is supported)"
@@ -3201,6 +3212,8 @@ fn load_model_tp_qwen35_dense(
     path: &str,
     max_seq: usize,
     tp: usize,
+    kv_mode: Option<&str>,
+    state_quant: Option<&str>,
 ) -> Result<LoadedModel, String> {
     use hipfire_runtime::tp_shard::{ExpertAssign, ShardConfig};
 
@@ -3211,6 +3224,25 @@ fn load_model_tp_qwen35_dense(
     let shard = ShardConfig::new(tp, false, 0, ExpertAssign::Stride)
         .map_err(|e| format!("dense TP ShardConfig: {e}"))?;
     qwen35::validate_dense_tp(&config, &shard)?;
+    // Resolve state quant via canonical parser; dense TP honors Q8/default, FP32, Q4.
+    let state_quant_resolved = parse_state_quant(state_quant)?;
+    // Resolve KV mode via Qwen policy (contiguous only). Explicit unsupported => fail before GPU init.
+    let kv_raw = kv_mode.unwrap_or("");
+    let kv_trim = kv_raw.trim();
+    let kv_lower = kv_trim.to_ascii_lowercase();
+    let kv_mode_resolved = if kv_lower.is_empty() {
+        kv_mode::resolve("", &kv_mode::QWEN35_HFQ_POLICY, config.head_dim).mode
+    } else {
+        let rr = kv_mode::resolve(&kv_lower, &kv_mode::QWEN35_HFQ_POLICY, config.head_dim);
+        if rr.warning.is_some() {
+            return Err(format!(
+                "unsupported kv_mode '{kv_trim}' (expected q8|asym2|asym3|asym4|fwht2|fwht3|fwht4)"
+            ));
+        }
+        rr.mode
+    };
+    // Preflight weights before GPU allocation (validates qt geometry/blob/sidecar).
+    qwen35::preflight_weights_dense_tp(&hfq, &config, &shard)?;
     let configs = (0..tp)
         .map(|_| qwen35::local_dense_tp_config(&config, &shard))
         .collect::<Vec<_>>();
@@ -3252,19 +3284,30 @@ fn load_model_tp_qwen35_dense(
         staging.weights.push(weights);
 
         let local = &configs[rank];
-        let kv = llama::KvCache::new_gpu(
-            &mut staging.gpus_mut().devices[rank],
-            local.n_layers,
-            local.n_kv_heads,
-            local.head_dim,
+        let is_kv_layer: Vec<bool> = config
+            .layer_types
+            .iter()
+            .map(|t| *t == qwen35::LayerType::FullAttention)
+            .collect();
+        let dims = KvDims {
+            layers: KvLayers::Mask(is_kv_layer),
+            n_kv_heads: local.n_kv_heads,
+            head_dim: local.head_dim,
             max_seq,
+            physical_cap: Some(max_seq),
+        };
+        let kv = <llama::KvCache as KvCacheExt>::from_mode_with_backend(
+            kv_mode_resolved,
+            KvBackend::Contiguous,
+            KvTarget::Single(&mut staging.gpus_mut().devices[rank]),
+            &dims,
         )
         .map_err(|e| format!("dense TP KV rank {rank}: {e:?}"))?;
         staging.kv_caches.push(kv);
         let dn = qwen35::DeltaNetState::new_with_quant(
             &mut staging.gpus_mut().devices[rank],
             local,
-            qwen35::StateQuant::Q8,
+            state_quant_resolved,
         )
         .map_err(|e| format!("dense TP DeltaNet rank {rank}: {e:?}"))?;
         staging.dn_states.push(dn);
