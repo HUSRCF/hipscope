@@ -99,32 +99,49 @@ fn vl_route_decode_text(
     filter: &mut EosFilter,
     think: &mut ThinkOutputRouter,
     new_bytes: &[u8],
-) {
-    let bytes = match filter.observe(new_bytes) {
-        FilterAction::Emit(b) | FilterAction::EmitAndStop(b) => b,
-        FilterAction::Hold | FilterAction::Stop => return,
+) -> bool {
+    let (bytes, is_stop) = match filter.observe(new_bytes) {
+        FilterAction::Emit(b) => (b, false),
+        FilterAction::EmitAndStop(b) => (b, true),
+        FilterAction::Hold => return false,
+        FilterAction::Stop => return true,
     };
-    let Ok(text) = std::str::from_utf8(&bytes) else {
-        return;
-    };
-    let mut routed = Vec::new();
-    think.push_into(text, &mut routed);
-    for ev in routed {
-        match ev {
-            ThinkRouteEvent::Reasoning(t) => emit_reasoning_token(stdout, id, &t),
-            ThinkRouteEvent::Content(t) => emit_visible_token(stdout, id, &t),
+    if let Ok(text) = std::str::from_utf8(&bytes) {
+        if !text.is_empty() {
+            let mut routed = Vec::new();
+            think.push_into(text, &mut routed);
+            for ev in routed {
+                match ev {
+                    ThinkRouteEvent::Reasoning(t) => emit_reasoning_token(stdout, id, &t),
+                    ThinkRouteEvent::Content(t) => emit_visible_token(stdout, id, &t),
+                }
+            }
         }
     }
+    is_stop
 }
 
-/// Flush a trailing partial think marker as ordinary text in its current
-/// channel at end-of-generation — the same finish the text AR producer runs
-/// (`ThinkOutputRouter::finish_into` contract).
 fn vl_finish_think_routing(
     stdout: &mut impl std::io::Write,
     id: &str,
+    filter: &mut EosFilter,
     think: &mut ThinkOutputRouter,
 ) {
+    let pending = filter.flush_pending();
+    if !pending.is_empty() {
+        if let Ok(text) = std::str::from_utf8(&pending) {
+            if !text.is_empty() {
+                let mut routed = Vec::new();
+                think.push_into(text, &mut routed);
+                for ev in routed {
+                    match ev {
+                        ThinkRouteEvent::Reasoning(t) => emit_reasoning_token(stdout, id, &t),
+                        ThinkRouteEvent::Content(t) => emit_visible_token(stdout, id, &t),
+                    }
+                }
+            }
+        }
+    }
     let mut routed = Vec::new();
     think.finish_into(&mut routed);
     for ev in routed {
@@ -982,7 +999,7 @@ pub fn generate_vl(
     let loop_guard =
         hipfire_runtime::loop_guard::LoopGuard::from_config(hipfire_runtime::config::get());
 
-    while generated < max_tokens {
+    'vl_generate: while generated < max_tokens {
         // Decode-side client-cancel poll — same canonical-terminal rule as
         // the prefill poll above; partial per-call state (seq_pos,
         // conversation_tokens) is reclaimed by the next dispatch's
@@ -1072,8 +1089,9 @@ pub fn generate_vl(
         let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
         let new_bytes = &all_bytes[emitted_bytes..];
         emitted_bytes = all_bytes.len();
-        vl_route_decode_text(stdout, id, &mut vl_filter, &mut vl_think, new_bytes);
-
+        if vl_route_decode_text(stdout, id, &mut vl_filter, &mut vl_think, new_bytes) {
+            break;
+        }
         if next_token == config.eos_token {
             break;
         }
@@ -1234,13 +1252,16 @@ pub fn generate_vl(
                         // Same typed routing as the main decode site: the
                         // forced `</think>` closer is consumed by the router
                         // (channel flips to content), never emitted literally.
-                        vl_route_decode_text(
+                        if vl_route_decode_text(
                             stdout,
                             id,
                             &mut vl_filter,
                             &mut vl_think,
                             new_bytes,
-                        );
+                        ) {
+                            generated += 1;
+                            break 'vl_generate;
+                        }
                         generated += 1;
                     }
                     think_count = 0;
@@ -1356,10 +1377,13 @@ pub fn generate_vl(
         }
     }
 
+    if check_abort(id) {
+        emit_qwen_ar_cancelled(stdout, id, generated);
+        return;
+    }
     // Flush any trailing partial think marker as ordinary text in its
     // current channel (text-AR finish parity) before the terminal.
-    vl_finish_think_routing(stdout, id, &mut vl_think);
-
+    vl_finish_think_routing(stdout, id, &mut vl_filter, &mut vl_think);
     let t_end = Instant::now();
     let total_s = t_end.duration_since(t0).as_secs_f64();
     let prefill_s = t_prefill.duration_since(t0).as_secs_f64();
@@ -1393,7 +1417,9 @@ pub fn generate_vl(
     });
     match await_client_terminal_commit(stdout, id, &pending_done) {
         ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
-        ClientTerminalDecision::Abort => {}
+        ClientTerminalDecision::Abort => {
+            emit_qwen_ar_cancelled(stdout, id, generated);
+        }
     }
 }
 
@@ -1494,6 +1520,10 @@ pub fn generate_vl_dots_ocr(
             prompt_ids.len(), max_tokens, max_seq));
         return;
     }
+    if check_abort(id) {
+        emit_qwen_ar_cancelled(stdout, id, 0);
+        return;
+    }
 
     // 4. Vision encoder → merged visual tokens.
     let patch_cols = img.patches.len() / n_patches;
@@ -1511,8 +1541,14 @@ pub fn generate_vl_dots_ocr(
         &patches_gpu,
         img.grid_h,
         img.grid_w,
+        || check_abort(id),
     ) {
-        Ok(t) => t,
+        Ok(Some(t)) => t,
+        Ok(None) => {
+            let _ = gpu.free_tensor(patches_gpu);
+            emit_qwen_ar_cancelled(stdout, id, 0);
+            return;
+        }
         Err(e) => {
             let _ = gpu.free_tensor(patches_gpu);
             write_error(
@@ -1572,6 +1608,11 @@ pub fn generate_vl_dots_ocr(
     let mut visual_idx = 0usize;
     let mut embed_err: Option<String> = None;
     for (pos, &token) in prompt_ids.iter().enumerate() {
+        if check_abort(id) {
+            let _ = gpu.free_tensor(emb_scratch);
+            emit_qwen_ar_cancelled(stdout, id, 0);
+            return;
+        }
         if token == dots_ocr::IMGPAD_ID {
             embeds[pos * dim..(pos + 1) * dim]
                 .copy_from_slice(&merged[visual_idx * dim..(visual_idx + 1) * dim]);
@@ -1605,6 +1646,10 @@ pub fn generate_vl_dots_ocr(
         }
     }
     let _ = gpu.free_tensor(emb_scratch);
+    if check_abort(id) {
+        emit_qwen_ar_cancelled(stdout, id, 0);
+        return;
+    }
     if let Some(e) = embed_err {
         write_error(
             stdout,
@@ -1621,6 +1666,10 @@ pub fn generate_vl_dots_ocr(
             id,
             &format!("dots.ocr batched prefill failed: {e:?}"),
         );
+        return;
+    }
+    if check_abort(id) {
+        emit_qwen_ar_cancelled(stdout, id, 0);
         return;
     }
     let prefill_tokens = prompt_ids.len();
@@ -1685,6 +1734,10 @@ pub fn generate_vl_dots_ocr(
     // straight to EOS without a guard; see DotsOcr::loop_guard_overrides.
 
     while generated < max_tokens {
+        if check_abort(id) {
+            emit_qwen_ar_cancelled(stdout, id, generated);
+            return;
+        }
         if eos_set.contains(&next) {
             break;
         }
@@ -1721,6 +1774,11 @@ pub fn generate_vl_dots_ocr(
         }
     }
 
+    if check_abort(id) {
+        emit_qwen_ar_cancelled(stdout, id, generated);
+        return;
+    }
+
     let decode_s = t_gen.elapsed().as_secs_f64();
     let total_s = t0.elapsed().as_secs_f64();
     let tok_s = if total_s > 0.0 {
@@ -1752,7 +1810,9 @@ pub fn generate_vl_dots_ocr(
     });
     match await_client_terminal_commit(stdout, id, &pending_done) {
         ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
-        ClientTerminalDecision::Abort => {}
+        ClientTerminalDecision::Abort => {
+            emit_qwen_ar_cancelled(stdout, id, generated);
+        }
     }
 }
 
@@ -2177,16 +2237,22 @@ mod tests {
         let mut think = ThinkOutputRouter::new(started_in_think);
         let mut out = Vec::new();
         for chunk in chunks {
-            vl_route_decode_text(&mut out, "t-id", &mut filter, &mut think, chunk);
+            let _ = vl_route_decode_text(&mut out, "t-id", &mut filter, &mut think, chunk);
         }
-        vl_finish_think_routing(&mut out, "t-id", &mut think);
+        vl_finish_think_routing(&mut out, "t-id", &mut filter, &mut think);
         let out = String::from_utf8_lossy(&out);
         out.lines()
             .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
             .map(|v| {
                 (
-                    v.get("type").and_then(|t| t.as_str()).unwrap_or("").to_string(),
-                    v.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string(),
+                    v.get("type")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    v.get("text")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("")
+                        .to_string(),
                 )
             })
             .collect()
@@ -2213,15 +2279,15 @@ mod tests {
                 b"<|im_end|>",
             ],
         );
-        assert_eq!(joined(&events, "reasoning"), "The user wants a description.\n\n");
+        assert_eq!(
+            joined(&events, "reasoning"),
+            "The user wants a description.\n\n"
+        );
         assert_eq!(
             joined(&events, "token"),
             "A Shiba Inu dog naps on its back."
         );
-        let all = events
-            .iter()
-            .map(|(_, s)| s.clone())
-            .collect::<String>();
+        let all = events.iter().map(|(_, s)| s.clone()).collect::<String>();
         assert!(!all.contains("</think>"), "closer leaked: {all:?}");
         assert!(!all.contains("<|im_end|>"), "EOT leaked: {all:?}");
     }
@@ -2240,7 +2306,11 @@ mod tests {
         // assistant_prefix=Plain and the model opens think itself.
         let events = drive(
             false,
-            &[b"<think>private</think>", b"\n\nvisible answer", b"<|im_end|>"],
+            &[
+                b"<think>private</think>",
+                b"\n\nvisible answer",
+                b"<|im_end|>",
+            ],
         );
         assert_eq!(joined(&events, "reasoning"), "private");
         assert_eq!(joined(&events, "token"), "visible answer");
@@ -2260,12 +2330,105 @@ mod tests {
         let mut filter = EosFilter::new(crate::ar::qwen_ar_eos_filter_config());
         let mut think = ThinkOutputRouter::new(false);
         let mut out = Vec::new();
-        vl_route_decode_text(&mut out, "bad\"id\\", &mut filter, &mut think, b"text");
-        vl_finish_think_routing(&mut out, "bad\"id\\", &mut think);
+        let _ = vl_route_decode_text(&mut out, "bad\"id\\", &mut filter, &mut think, b"text");
+        vl_finish_think_routing(&mut out, "bad\"id\\", &mut filter, &mut think);
         let out = String::from_utf8_lossy(&out);
         for line in out.lines() {
-            assert!(serde_json::from_str::<serde_json::Value>(line).is_ok(), "{line}");
+            assert!(
+                serde_json::from_str::<serde_json::Value>(line).is_ok(),
+                "{line}"
+            );
         }
+    }
+
+    #[test]
+    fn ordinary_emit_returns_false() {
+        let mut filter = EosFilter::new(crate::ar::qwen_ar_eos_filter_config());
+        let mut think = ThinkOutputRouter::new(false);
+        let mut out = Vec::new();
+        let stopped = vl_route_decode_text(&mut out, "t-id", &mut filter, &mut think, b"hello");
+        assert!(!stopped, "ordinary emit should return false");
+        vl_finish_think_routing(&mut out, "t-id", &mut filter, &mut think);
+        let out_s = String::from_utf8_lossy(&out);
+        assert!(out_s.contains("hello"), "payload should emit: {out_s:?}");
+    }
+
+    #[test]
+    fn stop_marker_returns_true_and_emits_preceding_text_without_leakage() {
+        let mut filter = EosFilter::new(crate::ar::qwen_ar_eos_filter_config());
+        let mut think = ThinkOutputRouter::new(false);
+        let mut out = Vec::new();
+        let payload = b"visible answer<|im_end|>";
+        let stopped = vl_route_decode_text(&mut out, "t-id", &mut filter, &mut think, payload);
+        assert!(stopped, "EOT marker should signal stop");
+        vl_finish_think_routing(&mut out, "t-id", &mut filter, &mut think);
+        let out_s = String::from_utf8_lossy(&out);
+        assert!(
+            out_s.contains("visible answer"),
+            "preceding text should emit: {out_s:?}"
+        );
+        assert!(
+            !out_s.contains("<|im_end|>"),
+            "marker must not leak: {out_s:?}"
+        );
+    }
+
+    #[test]
+    fn trailing_held_prefix_flushed_at_finish() {
+        // ` <` is a partial prefix of `<|im_end|>`; EosFilter holds it mid-stream
+        // and only at finish should it be treated as ordinary prose and routed
+        // through ThinkOutputRouter.
+        let mut filter = EosFilter::new(crate::ar::qwen_ar_eos_filter_config());
+        let mut think = ThinkOutputRouter::new(false);
+        let mut out = Vec::new();
+        let stopped = vl_route_decode_text(&mut out, "t-id", &mut filter, &mut think, b"hello <");
+        assert!(!stopped);
+        // Before finish, the held `<` should not yet be emitted.
+        let mid = String::from_utf8_lossy(&out).to_string();
+        let mid_events: Vec<(String, String)> = mid
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .map(|v| {
+                (
+                    v.get("type")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    v.get("text")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                )
+            })
+            .collect();
+        let mid_text = joined(&mid_events, "token");
+        assert_eq!(
+            mid_text, "hello ",
+            "partial prefix should be held, not emitted yet: {mid_text:?}"
+        );
+        vl_finish_think_routing(&mut out, "t-id", &mut filter, &mut think);
+        let out_s = String::from_utf8_lossy(&out);
+        let events: Vec<(String, String)> = out_s
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .map(|v| {
+                (
+                    v.get("type")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    v.get("text")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            joined(&events, "token"),
+            "hello <",
+            "held prefix should flush at finish"
+        );
     }
 }
 
