@@ -82,7 +82,10 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen35Bundle, 
     };
 
     // ── Scratch (free dn + kv + weights on fail) ─────────────────────
-    let scratch = match Qwen35Scratch::new_with_kv_max(ctx.gpu, &config, 2048, ctx.max_seq) {
+    // Flash-attention partials address physical KV slots, not the logical
+    // context range.  An eviction-bounded cache can make this cap much smaller
+    // than max_seq, so sizing from max_seq retains memory for unreachable tiles.
+    let scratch = match Qwen35Scratch::new_with_kv_max(ctx.gpu, &config, 2048, kv.physical_cap) {
         Ok(v) => v,
         Err(e) => {
             let cleanup = free_dn_kv_and_weights(dn, kv, weights, ctx.gpu);
