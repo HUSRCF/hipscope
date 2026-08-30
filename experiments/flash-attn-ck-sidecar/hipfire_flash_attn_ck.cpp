@@ -296,8 +296,8 @@ int validate(const hipfire_flash_attn_ck_fwd_params* p, char* error, size_t erro
         return 1;
     }
     if((q8 && !kHasQ8D256) ||
-       (is_asym3_givens_cell(p) && !kHasAsym3GivensD256) ||
-       (is_asym3_fwht_cell(p) && !kHasAsym3FwhtD256))
+       (p->k_format == HIPFIRE_FLASH_ATTN_CK_ASYM3_GIVENS && !kHasAsym3GivensD256) ||
+       (p->k_format == HIPFIRE_FLASH_ATTN_CK_ASYM3_FWHT && !kHasAsym3FwhtD256))
     {
         set_error(error, error_capacity, "selected quantized cell is not published by this artifact");
         return 2;
