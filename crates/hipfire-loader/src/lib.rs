@@ -1158,8 +1158,7 @@ impl LoadedModel {
                 return true;
             }
         }
-        self.qwen35()
-            .is_some_and(|b| b.vision_config.is_some())
+        self.qwen35().is_some_and(|b| b.vision_config.is_some())
     }
 
     /// LFM2-VL (arch 11) projected-vision config + weights, when loaded

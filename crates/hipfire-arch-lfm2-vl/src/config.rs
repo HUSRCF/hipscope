@@ -147,34 +147,76 @@ fn vision_config_from_metadata_json(json: &str) -> Result<Option<VisionConfig>, 
 
     // Tower params (nested object).
     if let Some(o) = vc.as_object() {
-        c.hidden_size = o.get("hidden_size").and_then(|v| v.as_u64()).unwrap_or(c.hidden_size as u64) as usize;
-        c.num_heads = o.get("num_attention_heads").or_else(|| o.get("num_heads")).and_then(|v| v.as_u64()).unwrap_or(c.num_heads as u64) as usize;
-        c.num_layers = o.get("num_hidden_layers").or_else(|| o.get("depth")).and_then(|v| v.as_u64()).unwrap_or(c.num_layers as u64) as usize;
-        c.mlp_dim = o.get("intermediate_size").and_then(|v| v.as_u64()).unwrap_or(c.mlp_dim as u64) as usize;
-        c.patch_size = o.get("patch_size").and_then(|v| v.as_u64()).unwrap_or(c.patch_size as u64) as usize;
-        c.num_channels = o.get("num_channels").and_then(|v| v.as_u64()).unwrap_or(c.num_channels as u64) as usize;
-        c.num_position_embeddings = o.get("num_patches").and_then(|v| v.as_u64()).unwrap_or(c.num_position_embeddings as u64) as usize;
-        c.norm_eps = o.get("layer_norm_eps").and_then(|v| v.as_f64()).map(|v| v as f32).unwrap_or(c.norm_eps);
+        c.hidden_size = o
+            .get("hidden_size")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(c.hidden_size as u64) as usize;
+        c.num_heads = o
+            .get("num_attention_heads")
+            .or_else(|| o.get("num_heads"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(c.num_heads as u64) as usize;
+        c.num_layers = o
+            .get("num_hidden_layers")
+            .or_else(|| o.get("depth"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(c.num_layers as u64) as usize;
+        c.mlp_dim = o
+            .get("intermediate_size")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(c.mlp_dim as u64) as usize;
+        c.patch_size = o
+            .get("patch_size")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(c.patch_size as u64) as usize;
+        c.num_channels = o
+            .get("num_channels")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(c.num_channels as u64) as usize;
+        c.num_position_embeddings =
+            o.get("num_patches")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(c.num_position_embeddings as u64) as usize;
+        c.norm_eps = o
+            .get("layer_norm_eps")
+            .and_then(|v| v.as_f64())
+            .map(|v| v as f32)
+            .unwrap_or(c.norm_eps);
     }
     c.head_dim = c.hidden_size / c.num_heads;
 
     // Projector + splitting live at checkpoint top level. The quantizer's
     // budget merge may also have landed some of them inside vision_config;
     // prefer nested values there, then top level.
-    fn pick_u64<'a>(vc: &'a serde_json::Value, cfg: &'a serde_json::Value, key: &str) -> Option<u64> {
-        vc.get(key).and_then(|v| v.as_u64()).or_else(|| cfg.get(key).and_then(|v| v.as_u64()))
+    fn pick_u64<'a>(
+        vc: &'a serde_json::Value,
+        cfg: &'a serde_json::Value,
+        key: &str,
+    ) -> Option<u64> {
+        vc.get(key)
+            .and_then(|v| v.as_u64())
+            .or_else(|| cfg.get(key).and_then(|v| v.as_u64()))
     }
     fn pick_bool(vc: &serde_json::Value, cfg: &serde_json::Value, key: &str) -> Option<bool> {
-        vc.get(key).and_then(|v| v.as_bool()).or_else(|| cfg.get(key).and_then(|v| v.as_bool()))
+        vc.get(key)
+            .and_then(|v| v.as_bool())
+            .or_else(|| cfg.get(key).and_then(|v| v.as_bool()))
     }
     fn pick_f64(vc: &serde_json::Value, cfg: &serde_json::Value, key: &str) -> Option<f64> {
-        vc.get(key).and_then(|v| v.as_f64()).or_else(|| cfg.get(key).and_then(|v| v.as_f64()))
+        vc.get(key)
+            .and_then(|v| v.as_f64())
+            .or_else(|| cfg.get(key).and_then(|v| v.as_f64()))
     }
-    fn pick<'a>(vc: &'a serde_json::Value, cfg: &'a serde_json::Value, key: &str) -> Option<&'a serde_json::Value> {
+    fn pick<'a>(
+        vc: &'a serde_json::Value,
+        cfg: &'a serde_json::Value,
+        key: &str,
+    ) -> Option<&'a serde_json::Value> {
         vc.get(key).or_else(|| cfg.get(key))
     }
 
-    c.downsample_factor = pick_u64(vc, config, "downsample_factor").unwrap_or(c.downsample_factor as u64) as usize;
+    c.downsample_factor =
+        pick_u64(vc, config, "downsample_factor").unwrap_or(c.downsample_factor as u64) as usize;
     c.projector_hidden_size = pick_u64(vc, config, "projector_hidden_size")
         .unwrap_or(c.projector_hidden_size as u64) as usize;
     c.out_hidden_size = config
@@ -189,12 +231,13 @@ fn vision_config_from_metadata_json(json: &str) -> Result<Option<VisionConfig>, 
     c.min_tiles = pick_u64(vc, config, "min_tiles").unwrap_or(c.min_tiles as u64) as usize;
     c.max_tiles = pick_u64(vc, config, "max_tiles").unwrap_or(c.max_tiles as u64) as usize;
     c.use_thumbnail = pick_bool(vc, config, "use_thumbnail").unwrap_or(c.use_thumbnail);
-    c.min_image_tokens = pick_u64(vc, config, "min_image_tokens")
-        .unwrap_or(c.min_image_tokens as u64) as usize;
-    c.max_image_tokens = pick_u64(vc, config, "max_image_tokens")
-        .unwrap_or(c.max_image_tokens as u64) as usize;
-    c.max_pixels_tolerance =
-        pick_f64(vc, config, "max_pixels_tolerance").map(|v| v as f32).unwrap_or(c.max_pixels_tolerance);
+    c.min_image_tokens =
+        pick_u64(vc, config, "min_image_tokens").unwrap_or(c.min_image_tokens as u64) as usize;
+    c.max_image_tokens =
+        pick_u64(vc, config, "max_image_tokens").unwrap_or(c.max_image_tokens as u64) as usize;
+    c.max_pixels_tolerance = pick_f64(vc, config, "max_pixels_tolerance")
+        .map(|v| v as f32)
+        .unwrap_or(c.max_pixels_tolerance);
 
     if let Some(v) = pick(vc, config, "image_mean") {
         c.image_mean = parse_rgb3(v, "image_mean")?;
@@ -210,9 +253,9 @@ fn vision_config_from_metadata_json(json: &str) -> Result<Option<VisionConfig>, 
 }
 
 fn parse_rgb3(v: &serde_json::Value, key: &str) -> Result<[f32; 3], String> {
-    let arr = v.as_array().ok_or_else(|| {
-        format!("processor {key} must be an array of 3 finite floats, got {v}")
-    })?;
+    let arr = v
+        .as_array()
+        .ok_or_else(|| format!("processor {key} must be an array of 3 finite floats, got {v}"))?;
     if arr.len() != 3 {
         return Err(format!(
             "processor {key} length {} is invalid; expected 3 channels",
@@ -221,9 +264,9 @@ fn parse_rgb3(v: &serde_json::Value, key: &str) -> Result<[f32; 3], String> {
     }
     let mut out = [0.0f32; 3];
     for (i, item) in arr.iter().enumerate() {
-        let x = item.as_f64().ok_or_else(|| {
-            format!("processor {key}[{i}] is not a finite number: {item}")
-        })?;
+        let x = item
+            .as_f64()
+            .ok_or_else(|| format!("processor {key}[{i}] is not a finite number: {item}"))?;
         if !x.is_finite() {
             return Err(format!("processor {key}[{i}] is non-finite ({x})"));
         }

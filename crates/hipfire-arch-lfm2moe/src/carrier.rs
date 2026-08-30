@@ -70,9 +70,8 @@ pub fn load_lfm2moe_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Lfm2Mo
             })
         }
         ModelSource::Dir(source) => {
-            let config = crate::config::config_from_source(&source).ok_or_else(|| {
-                "lfm2moe: failed to parse config from safetensors".to_string()
-            })?;
+            let config = crate::config::config_from_source(&source)
+                .ok_or_else(|| "lfm2moe: failed to parse config from safetensors".to_string())?;
             let weights = crate::lfm2moe::load_weights_from_source(&source, &config, ctx.gpu)?;
             hipfire_runtime::maybe_screen_mmq(&weights, ctx.gpu);
             let state = Lfm2MoeState::new_with_max_seq(ctx.gpu, &config, ctx.max_seq)
@@ -93,4 +92,3 @@ pub fn load_lfm2moe_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Lfm2Mo
         }
     }
 }
-

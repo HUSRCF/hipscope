@@ -1529,9 +1529,7 @@ impl Carrier for Lfm2MoeCarrier {
         let mut vision_w_out: Option<hipfire_arch_lfm2_vl::VisionWeights> = None;
         if let ModelSource::Hfq(hfq_file) = &src {
             if hfq_file
-                .tensor_data(
-                    "model.vision_tower.vision_model.embeddings.patch_embedding.weight",
-                )
+                .tensor_data("model.vision_tower.vision_model.embeddings.patch_embedding.weight")
                 .is_some()
             {
                 match hipfire_arch_lfm2_vl::vision_config_from_hfq(hfq_file) {

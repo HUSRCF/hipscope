@@ -233,7 +233,13 @@ fn patch_weight_rows_from(
     match shape.len() {
         2 => Ok((raw, hidden, patch_in)),
         4 => Ok((
-            fold_conv_patch_rows(&raw, hidden, cfg.num_channels, cfg.patch_size, cfg.patch_size),
+            fold_conv_patch_rows(
+                &raw,
+                hidden,
+                cfg.num_channels,
+                cfg.patch_size,
+                cfg.patch_size,
+            ),
             hidden,
             patch_in,
         )),
@@ -292,7 +298,10 @@ fn load_f16_gpu(
 /// Artifact serializations handled:
 /// - Linear `[1152, 768]`: already aligned with `(dy,dx,c)` — verbatim.
 /// - Conv `[1152, C, kh, kw]`: kernel dims reorder to `(dy,dx,c)`.
-fn patch_weight_rows(hfq: &HfqFile, cfg: &VisionConfig) -> Result<(Vec<f32>, usize, usize), String> {
+fn patch_weight_rows(
+    hfq: &HfqFile,
+    cfg: &VisionConfig,
+) -> Result<(Vec<f32>, usize, usize), String> {
     const NAME: &str = "model.vision_tower.vision_model.embeddings.patch_embedding.weight";
     let (info, data) = lookup(hfq, NAME)?;
     patch_weight_rows_from(NAME, info.quant_type, &info.shape, data, cfg)
@@ -502,12 +511,7 @@ fn load_one_layer(
             &format!("{p}.mlp.fc2.weight"),
             &[h, cfg.mlp_dim],
         )?);
-        g.fc2_b = Some(load_f32_gpu(
-            hfq,
-            gpu,
-            &format!("{p}.mlp.fc2.bias"),
-            &[h],
-        )?);
+        g.fc2_b = Some(load_f32_gpu(hfq, gpu, &format!("{p}.mlp.fc2.bias"), &[h])?);
         Ok(())
     })();
     match result {
@@ -737,7 +741,13 @@ pub fn resize_pos_embed(
 /// replicated verbatim from the pinned HF ops including their swapped dim
 /// naming. `factor` is 2 for every published LFM2-VL checkpoint; other even
 /// factors fall back to a generic strided formulation.
-pub fn pixel_unshuffle_tokens(feat: &[f32], gh: usize, gw: usize, ch: usize, factor: usize) -> Vec<f32> {
+pub fn pixel_unshuffle_tokens(
+    feat: &[f32],
+    gh: usize,
+    gw: usize,
+    ch: usize,
+    factor: usize,
+) -> Vec<f32> {
     let blocks_y = gh / factor;
     let blocks_x = gw / factor;
     let out_ch = ch * factor * factor;
@@ -844,8 +854,7 @@ fn linear_f16(
             free_yt.map_err(ehip("free yt"))?;
         }
         if let Some(b) = bias {
-            gpu.bias_add_f32(&y, b, n, out_dim)
-                .map_err(ehip("bias"))?;
+            gpu.bias_add_f32(&y, b, n, out_dim).map_err(ehip("bias"))?;
         }
         Ok(())
     })();
@@ -914,7 +923,15 @@ fn tower_and_project_sub_image(
 ) -> Result<Vec<f32>, String> {
     let mut scratch = ForwardScratch::default();
     let result = tower_and_project_sub_image_inner(
-        gpu, weights, cfg, sub, h, heads, head_dim, k_side, &mut scratch,
+        gpu,
+        weights,
+        cfg,
+        sub,
+        h,
+        heads,
+        head_dim,
+        k_side,
+        &mut scratch,
     );
     scratch.drop_all(gpu);
     result
@@ -1271,7 +1288,10 @@ mod tests {
     #[test]
     fn validate_dense_accepts_f16_and_f32_exact_layout() {
         assert_eq!(validate_dense("w", QT_F16, &[2, 2], 8, &[2, 2]).unwrap(), 4);
-        assert_eq!(validate_dense("w", QT_F32, &[2, 2], 16, &[2, 2]).unwrap(), 4);
+        assert_eq!(
+            validate_dense("w", QT_F32, &[2, 2], 16, &[2, 2]).unwrap(),
+            4
+        );
         assert_eq!(validate_dense("b", QT_F16, &[3], 6, &[3]).unwrap(), 3);
     }
 
@@ -1301,11 +1321,25 @@ mod tests {
             .flat_map(|&v| f32_to_f16(v).to_le_bytes())
             .collect();
         let mut from_f32 = Vec::new();
-        append_f16_weight(&mut from_f32, "q", QT_F32, &[2, 2], &f32_bytes, &[hidden, hidden])
-            .unwrap();
+        append_f16_weight(
+            &mut from_f32,
+            "q",
+            QT_F32,
+            &[2, 2],
+            &f32_bytes,
+            &[hidden, hidden],
+        )
+        .unwrap();
         let mut from_f16 = Vec::new();
-        append_f16_weight(&mut from_f16, "q", QT_F16, &[2, 2], &f16_bytes, &[hidden, hidden])
-            .unwrap();
+        append_f16_weight(
+            &mut from_f16,
+            "q",
+            QT_F16,
+            &[2, 2],
+            &f16_bytes,
+            &[hidden, hidden],
+        )
+        .unwrap();
         assert_eq!(from_f32, from_f16);
         assert_eq!(from_f32.len(), 8);
     }
@@ -1340,7 +1374,8 @@ mod tests {
         assert_eq!((out2, inn2), (2, 4));
         assert_eq!(folded, lin);
 
-        let bad_rank = patch_weight_rows_from(name, QT_F32, &[2, 4, 1], &lin_bytes, &cfg).unwrap_err();
+        let bad_rank =
+            patch_weight_rows_from(name, QT_F32, &[2, 4, 1], &lin_bytes, &cfg).unwrap_err();
         assert!(bad_rank.contains("rank 3"), "{bad_rank}");
 
         let bad_in = patch_weight_rows_from(name, QT_F32, &[2, 3], &lin_bytes, &cfg).unwrap_err();

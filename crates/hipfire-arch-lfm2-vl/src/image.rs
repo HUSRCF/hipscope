@@ -27,7 +27,6 @@ use std::path::Path;
 /// downstream of this anyway via smart_resize shrinking to ≤262144 px.
 const MAX_DIMENSION_PIXELS: usize = 16_777_216;
 
-
 #[derive(Debug, Clone)]
 pub struct SubImage {
     /// Normalized CHW pixels (`[3][h][w]`, `(x/255 - mean)/std`).
@@ -57,8 +56,8 @@ impl SubImage {
                 for dy in 0..ps {
                     for dx in 0..ps {
                         for c in 0..c_n {
-                            out[(row * ps * ps + dy * ps + dx) * c_n + c] =
-                                self.pixels[c * self.h * self.w + (py * ps + dy) * self.w + px * ps + dx];
+                            out[(row * ps * ps + dy * ps + dx) * c_n + c] = self.pixels
+                                [c * self.h * self.w + (py * ps + dy) * self.w + px * ps + dx];
                         }
                     }
                 }
@@ -80,7 +79,10 @@ pub struct Prepared {
 impl Prepared {
     /// Total number of `<image>` placeholder tokens across all sub-images.
     pub fn total_tokens(&self, cfg: &VisionConfig) -> usize {
-        self.sub_images.iter().map(|s| cfg.tokens_for_grid(s.gh(cfg), s.gw(cfg))).sum()
+        self.sub_images
+            .iter()
+            .map(|s| cfg.tokens_for_grid(s.gh(cfg), s.gw(cfg)))
+            .sum()
     }
 }
 
@@ -126,7 +128,8 @@ pub fn smart_resize(
         (h, w)
     } else if (h_bar as u64) * (w_bar as u64) < min_pixels {
         let beta = (min_pixels as f64 / hw as f64).sqrt();
-        let h = ((height as f64 * beta / total_factor as f64).ceil() * total_factor as f64) as usize;
+        let h =
+            ((height as f64 * beta / total_factor as f64).ceil() * total_factor as f64) as usize;
         let w = ((width as f64 * beta / total_factor as f64).ceil() * total_factor as f64) as usize;
         (h.max(total_factor), w.max(total_factor))
     } else {
@@ -243,9 +246,7 @@ fn sub_from_dynamic(
 }
 
 fn reject_if_too_large(ow: u32, oh: u32) -> Result<(), String> {
-    let pixels = (ow as usize)
-        .checked_mul(oh as usize)
-        .unwrap_or(usize::MAX);
+    let pixels = (ow as usize).checked_mul(oh as usize).unwrap_or(usize::MAX);
     if pixels > MAX_DIMENSION_PIXELS {
         Err(format!(
             "image dimensions ({ow}x{oh}) exceed maximum ({MAX_DIMENSION_PIXELS} pixels)"
@@ -281,8 +282,13 @@ fn preprocess(img: image::DynamicImage, cfg: &VisionConfig) -> Result<Prepared, 
 
     if is_too_large(orig_h, orig_w, cfg) && do_split {
         let ar = orig_w as f64 / orig_h as f64;
-        let (gc, gr) =
-            find_closest_aspect_ratio(ar, &target_ratios(cfg.min_tiles, cfg.max_tiles), orig_w, orig_h, cfg.tile_size);
+        let (gc, gr) = find_closest_aspect_ratio(
+            ar,
+            &target_ratios(cfg.min_tiles, cfg.max_tiles),
+            orig_w,
+            orig_h,
+            cfg.tile_size,
+        );
         let big = img.resize_exact(
             (cfg.tile_size * gc) as u32,
             (cfg.tile_size * gr) as u32,
@@ -291,7 +297,12 @@ fn preprocess(img: image::DynamicImage, cfg: &VisionConfig) -> Result<Prepared, 
         let tw = cfg.tile_size;
         for ry in 0..gr {
             for rx in 0..gc {
-                let tile = image::DynamicImage::from(big.crop_imm((rx * tw) as u32, (ry * tw) as u32, tw as u32, tw as u32));
+                let tile = image::DynamicImage::from(big.crop_imm(
+                    (rx * tw) as u32,
+                    (ry * tw) as u32,
+                    tw as u32,
+                    tw as u32,
+                ));
                 sub_images.push(sub_from_dynamic(tile, tw, tw, cfg, filter));
             }
         }
@@ -306,7 +317,11 @@ fn preprocess(img: image::DynamicImage, cfg: &VisionConfig) -> Result<Prepared, 
         grid_rows = 1;
     }
 
-    Ok(Prepared { sub_images, grid_cols, grid_rows })
+    Ok(Prepared {
+        sub_images,
+        grid_cols,
+        grid_rows,
+    })
 }
 
 /// Load + preprocess an image from a filesystem path.
@@ -396,7 +411,11 @@ mod tests {
     fn tokens_count_single_and_split() {
         let cfg = VisionConfig::default();
         // single sub-image 512×512 → 1024 patches → 256 tokens
-        let s = SubImage { pixels: vec![0.0; 3 * 512 * 512], h: 512, w: 512 };
+        let s = SubImage {
+            pixels: vec![0.0; 3 * 512 * 512],
+            h: 512,
+            w: 512,
+        };
         assert_eq!(cfg.tokens_for_grid(s.gh(&cfg), s.gw(&cfg)), 256);
     }
 
@@ -437,7 +456,10 @@ mod tests {
         let img = image::ImageBuffer::from_pixel(w, h, image::Rgb([r, g, b]));
         let mut bytes = Vec::new();
         image::DynamicImage::ImageRgb8(img)
-            .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png)
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
             .unwrap();
         bytes
     }
@@ -512,7 +534,10 @@ mod tests {
         img.put_pixel(16, 16, image::Rgb([255, 255, 255]));
         let mut bytes = Vec::new();
         image::DynamicImage::ImageRgb8(img)
-            .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png)
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
             .unwrap();
         let a = load_and_preprocess_from_bytes(&bytes, &bicubic).unwrap();
         let b = load_and_preprocess_from_bytes(&bytes, &bilinear).unwrap();

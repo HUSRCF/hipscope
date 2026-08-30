@@ -888,10 +888,16 @@ pub fn dequant_f32(gpu: &mut Gpu, quant_type: u8, data: &[u8], n: usize) -> HipR
             for g in 0..n_groups {
                 let off = g * bytes_per_group;
                 let st = |h: usize| {
-                    f16_to_f32(u16::from_le_bytes([data[off + 4 * h], data[off + 4 * h + 1]]))
+                    f16_to_f32(u16::from_le_bytes([
+                        data[off + 4 * h],
+                        data[off + 4 * h + 1],
+                    ]))
                 };
                 let zz = |h: usize| {
-                    f16_to_f32(u16::from_le_bytes([data[off + 4 * h + 2], data[off + 4 * h + 3]]))
+                    f16_to_f32(u16::from_le_bytes([
+                        data[off + 4 * h + 2],
+                        data[off + 4 * h + 3],
+                    ]))
                 };
                 let start = out.len();
                 for i in 0..group_size {

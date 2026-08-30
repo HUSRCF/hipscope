@@ -1690,8 +1690,7 @@ pub(crate) fn run() {
         // (should_quantize() == false); without it they are skipped with the
         // rest of the module. Towers always behaved this way — the projector
         // is the fix (it used to land on the text-quantize tail).
-        let vision_group =
-            is_vision || name.starts_with("model.multi_modal_projector.");
+        let vision_group = is_vision || name.starts_with("model.multi_modal_projector.");
         if vision_group && !include_vision {
             let (meta, _) = st_files[*file_idx].tensor_data(name).unwrap();
             let n: usize = meta.shape.iter().product();
@@ -3336,7 +3335,9 @@ fn run_qwen3_dspark(args: &QuantizeArgs) {
 /// `processor_config.json` value. Qwen-family processors put fields at the
 /// top level; LFM2/NaFlex nests them under `image_processor`. First-seen
 /// wins so a top-level key is not overwritten by a nested duplicate.
-fn collect_vl_processor_fields(pcv: &serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+fn collect_vl_processor_fields(
+    pcv: &serde_json::Value,
+) -> serde_json::Map<String, serde_json::Value> {
     let mut budget = serde_json::Map::new();
     const BUDGET_KEYS: [&str; 12] = [
         "min_pixels",
@@ -3352,7 +3353,10 @@ fn collect_vl_processor_fields(pcv: &serde_json::Value) -> serde_json::Map<Strin
         "image_std",
         "resample",
     ];
-    for scope in [Some(pcv), pcv.get("image_processor")].into_iter().flatten() {
+    for scope in [Some(pcv), pcv.get("image_processor")]
+        .into_iter()
+        .flatten()
+    {
         for key in BUDGET_KEYS {
             if let Some(v) = scope.get(key) {
                 budget.entry(key.to_string()).or_insert(v.clone());
