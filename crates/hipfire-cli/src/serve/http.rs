@@ -244,9 +244,7 @@ impl hyper::body::Body for AckBody {
     }
 }
 
-/// Streaming SSE body: multiple frames via channel. Dropped receiver closes
-/// sender and callback returns Cancelled. Terminal chunk ack is registered with
-/// the connection tracker when that frame is yielded (not on a later body poll).
+/// One SSE frame: plain bytes, optional terminal ack sender, or fail marker.
 #[derive(Debug)]
 pub(crate) struct ResponseChunk {
     bytes: Vec<u8>,
@@ -271,19 +269,36 @@ impl ResponseChunk {
     }
 }
 
+/// Streaming SSE body: multiple frames via channel. Dropped receiver closes
+/// sender and callback returns Cancelled. Terminal chunk ack is registered with
+/// the connection tracker when that frame is yielded (not on a later body poll).
+/// Owns a clone of the worker cancellation flag; drop (client disconnect after
+/// the response is returned) sets it so long silent towers abort promptly.
 pub(crate) struct ChannelBody {
     rx: tokio::sync::mpsc::Receiver<ResponseChunk>,
     tracker: FlushAcks,
+    cancelled: Arc<AtomicBool>,
     failed: bool,
 }
 
 impl ChannelBody {
-    pub(crate) fn new(rx: tokio::sync::mpsc::Receiver<ResponseChunk>, tracker: FlushAcks) -> Self {
+    pub(crate) fn new(
+        rx: tokio::sync::mpsc::Receiver<ResponseChunk>,
+        tracker: FlushAcks,
+        cancelled: Arc<AtomicBool>,
+    ) -> Self {
         Self {
             rx,
             tracker,
+            cancelled,
             failed: false,
         }
+    }
+}
+
+impl Drop for ChannelBody {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::SeqCst);
     }
 }
 
@@ -650,6 +665,7 @@ async fn handle_streaming(
     let shared_clone = Arc::clone(&shared);
     let id_clone = id.clone();
     let model_clone = model.clone();
+    let body_cancelled = Arc::clone(&cancelled);
     tokio::task::spawn_blocking(move || {
         let result = complete_request_cancellable(
             &shared_clone,
@@ -663,7 +679,7 @@ async fn handle_streaming(
         finish_sse_stream(tx_clone, result);
     });
 
-    let body = ChannelBody::new(rx, acks);
+    let body = ChannelBody::new(rx, acks, body_cancelled);
     let mut resp = Response::builder()
         .status(200)
         .header(header::CONTENT_TYPE, "text/event-stream")
@@ -983,7 +999,8 @@ mod tests {
         .expect("send chunk");
         drop(tx);
 
-        let mut body = ChannelBody::new(rx, acks.clone());
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut body = ChannelBody::new(rx, acks.clone(), Arc::clone(&cancelled));
         let mut cx = noop_cx();
         match Pin::new(&mut body).poll_frame(&mut cx) {
             Poll::Ready(Some(Ok(frame))) => {
@@ -1004,6 +1021,20 @@ mod tests {
         );
         acks.drain_ok();
         assert_eq!(ack_rx.recv_timeout(Duration::from_secs(1)), Ok(Ok(())));
+    }
+
+    #[tokio::test]
+    async fn channel_body_drop_sets_cancelled() {
+        let acks = FlushAcks::new();
+        let (_tx, rx) = tokio::sync::mpsc::channel::<ResponseChunk>(1);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        assert!(!cancelled.load(Ordering::SeqCst), "flag must start false");
+        let body = ChannelBody::new(rx, acks, Arc::clone(&cancelled));
+        drop(body);
+        assert!(
+            cancelled.load(Ordering::SeqCst),
+            "dropping ChannelBody must set cancelled"
+        );
     }
 
     #[tokio::test]

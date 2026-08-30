@@ -1711,6 +1711,15 @@ pub(crate) fn run() {
             skipped_params += n as u64;
             continue;
         }
+        if vision_group {
+            // include_vision is implied here and every name-based skip gate
+            // (include-prefix, gemma4 text-only) is now past: this tensor
+            // genuinely reaches the bottom-of-loop F16 fallback. Only now may
+            // the has_vision metadata flag latch — setting it earlier would
+            // mark gemma4-unified artifacts `has_vision: true` while the
+            // gemma4 gate above silently drops every vision tensor.
+            emitted_vision = true;
+        }
         // MTP (Multi-Token Prediction) head: pre-Phase-5 quants skipped these
         // because no forward path consumed them. deepseek4-q8-mtp is the first format
         // that ingests the MTP layer; v3 spec-decode requires it. For other
@@ -2837,12 +2846,7 @@ pub(crate) fn run() {
     // carried from the source config.json — as additive keys current readers
     // ignore. It does not open a second top-level schema under the same name.
     if emitted_vision {
-        let mut budget = serde_json::Map::new();
-        if let Ok(pc) = std::fs::read_to_string(input_dir.join("processor_config.json")) {
-            if let Ok(pcv) = serde_json::from_str::<serde_json::Value>(&pc) {
-                budget = collect_vl_processor_fields(&pcv);
-            }
-        }
+        let budget = load_vl_processor_budget(input_dir);
         if let Ok(mut meta_val) = serde_json::from_str::<serde_json::Value>(&metadata_json) {
             let mut merged_budget = false;
             if let Some(obj) = meta_val.as_object_mut() {
@@ -3331,10 +3335,10 @@ fn run_qwen3_dspark(args: &QuantizeArgs) {
     eprintln!("Done: {:.1} MB written", file_size as f64 / 1e6);
 }
 
-/// Copy pixel-budget + LFM2 processor contract keys from a
-/// `processor_config.json` value. Qwen-family processors put fields at the
-/// top level; LFM2/NaFlex nests them under `image_processor`. First-seen
-/// wins so a top-level key is not overwritten by a nested duplicate.
+/// Copy pixel-budget + LFM2 processor contract keys from a processor JSON
+/// value. Qwen-family processors put fields at the top level; LFM2/NaFlex
+/// nests them under `image_processor`. First-seen wins so a top-level key
+/// is not overwritten by a nested duplicate.
 fn collect_vl_processor_fields(
     pcv: &serde_json::Value,
 ) -> serde_json::Map<String, serde_json::Value> {
@@ -3361,6 +3365,29 @@ fn collect_vl_processor_fields(
             if let Some(v) = scope.get(key) {
                 budget.entry(key.to_string()).or_insert(v.clone());
             }
+        }
+    }
+    budget
+}
+
+/// Load VL processor fields from the input model dir.
+///
+/// Prefers Qwen-family `preprocessor_config.json` when present, then merges
+/// any still-missing supported fields from LFM2/legacy `processor_config.json`.
+/// First-seen key wins across files; neither file replaces the other wholesale.
+fn load_vl_processor_budget(
+    input_dir: &std::path::Path,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut budget = serde_json::Map::new();
+    for name in ["preprocessor_config.json", "processor_config.json"] {
+        let Ok(pc) = std::fs::read_to_string(input_dir.join(name)) else {
+            continue;
+        };
+        let Ok(pcv) = serde_json::from_str::<serde_json::Value>(&pc) else {
+            continue;
+        };
+        for (k, v) in collect_vl_processor_fields(&pcv) {
+            budget.entry(k).or_insert(v);
         }
     }
     budget
@@ -7206,7 +7233,10 @@ pub(crate) fn hfq_requant_to_bq1_example(
 
 #[cfg(test)]
 mod pipeline_tests {
-    use super::{collect_vl_processor_fields, lfm2_dense_mq_name_matches, moe_expert_3d_applies};
+    use super::{
+        collect_vl_processor_fields, lfm2_dense_mq_name_matches, load_vl_processor_budget,
+        moe_expert_3d_applies,
+    };
 
     /// Regression pin for `d1d172e9c`, which extracted `handle_moe_expert_3d`
     /// and dropped its `shape.len() == 3` precondition at the call site. A 2-D
@@ -7297,6 +7327,96 @@ mod pipeline_tests {
         assert_eq!(budget["min_pixels"], serde_json::json!(3136));
         assert_eq!(budget["merge_size"], serde_json::json!(2));
         assert!(!budget.contains_key("image_mean"));
+    }
+
+    #[test]
+    fn preprocessor_only_qwen_fields_are_collected() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("preprocessor_config.json"),
+            serde_json::json!({
+                "min_pixels": 3136,
+                "max_pixels": 12845056,
+                "patch_size": 16,
+                "merge_size": 2,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let budget = load_vl_processor_budget(dir.path());
+        assert_eq!(budget["min_pixels"], serde_json::json!(3136));
+        assert_eq!(budget["max_pixels"], serde_json::json!(12845056));
+        assert_eq!(budget["patch_size"], serde_json::json!(16));
+        assert_eq!(budget["merge_size"], serde_json::json!(2));
+        assert!(!budget.contains_key("image_mean"));
+    }
+
+    #[test]
+    fn processor_only_lfm2_nested_fields_remain_collected() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("processor_config.json"),
+            serde_json::json!({
+                "image_processor": {
+                    "image_mean": [0.5, 0.5, 0.5],
+                    "image_std": [0.5, 0.5, 0.5],
+                    "resample": 3,
+                    "max_image_tokens": 256,
+                    "downsample_factor": 2,
+                },
+                "processor_class": "Lfm2VlProcessor"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let budget = load_vl_processor_budget(dir.path());
+        assert_eq!(budget["image_mean"], serde_json::json!([0.5, 0.5, 0.5]));
+        assert_eq!(budget["image_std"], serde_json::json!([0.5, 0.5, 0.5]));
+        assert_eq!(budget["resample"], serde_json::json!(3));
+        assert_eq!(budget["max_image_tokens"], serde_json::json!(256));
+        assert_eq!(budget["downsample_factor"], serde_json::json!(2));
+    }
+
+    #[test]
+    fn preprocessor_wins_but_processor_only_fields_are_retained() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("preprocessor_config.json"),
+            serde_json::json!({
+                "min_pixels": 1000,
+                "max_pixels": 2000,
+                "patch_size": 14,
+                "merge_size": 2,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("processor_config.json"),
+            serde_json::json!({
+                "min_pixels": 9999,
+                "max_pixels": 8888,
+                "image_processor": {
+                    "image_mean": [0.5, 0.5, 0.5],
+                    "image_std": [0.5, 0.5, 0.5],
+                    "resample": 3,
+                    "max_image_tokens": 256,
+                },
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let budget = load_vl_processor_budget(dir.path());
+        // preprocessor values win on shared keys
+        assert_eq!(budget["min_pixels"], serde_json::json!(1000));
+        assert_eq!(budget["max_pixels"], serde_json::json!(2000));
+        assert_eq!(budget["patch_size"], serde_json::json!(14));
+        assert_eq!(budget["merge_size"], serde_json::json!(2));
+        // processor-only supported fields are retained
+        assert_eq!(budget["image_mean"], serde_json::json!([0.5, 0.5, 0.5]));
+        assert_eq!(budget["image_std"], serde_json::json!([0.5, 0.5, 0.5]));
+        assert_eq!(budget["resample"], serde_json::json!(3));
+        assert_eq!(budget["max_image_tokens"], serde_json::json!(256));
     }
 
     #[test]
