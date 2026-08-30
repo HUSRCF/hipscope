@@ -1870,7 +1870,8 @@ fn forward_scratch_layers(
                     config.norm_eps,
                 )?;
 
-                gpu.fused_sigmoid_alpha_gate_f32(
+                deltanet_sigmoid_alpha_gate(
+                    gpu,
                     &s.dn_beta,
                     &s.dn_alpha,
                     &layer.dt_bias,
@@ -1889,12 +1890,12 @@ fn forward_scratch_layers(
                     v_dim,
                 )?;
 
-                gpu.fused_qk_l2_norm_scale_f32(
+                deltanet_qk_l2_norm_scale(
+                    gpu,
                     &s.dn_q_raw,
                     &s.dn_k_raw,
                     config.linear_num_key_heads,
                     hd,
-                    1.0 / (hd as f32).sqrt(),
                     config.norm_eps,
                 )?;
 
@@ -3287,6 +3288,35 @@ fn dense_tp_ffn_partial(
     .map_err(|e| HipError::new(0, &e.to_string()))
 }
 
+fn deltanet_sigmoid_alpha_gate(
+    gpu: &mut Gpu,
+    beta: &GpuTensor,
+    alpha: &GpuTensor,
+    dt_bias: &GpuTensor,
+    a_log: &GpuTensor,
+    n_heads: usize,
+) -> HipResult<()> {
+    gpu.fused_sigmoid_alpha_gate_f32(beta, alpha, dt_bias, a_log, n_heads)
+}
+
+fn deltanet_qk_l2_norm_scale(
+    gpu: &mut Gpu,
+    q: &GpuTensor,
+    k: &GpuTensor,
+    n_key_heads: usize,
+    head_dim: usize,
+    eps: f32,
+) -> HipResult<()> {
+    gpu.fused_qk_l2_norm_scale_f32(
+        q,
+        k,
+        n_key_heads,
+        head_dim,
+        1.0 / (head_dim as f32).sqrt(),
+        eps,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn dense_tp_deltanet_partial(
     gpu: &mut Gpu,
@@ -3318,7 +3348,8 @@ fn dense_tp_deltanet_partial(
         &s.dn_alpha,
         config.norm_eps,
     )?;
-    gpu.fused_sigmoid_alpha_gate_f32(
+    deltanet_sigmoid_alpha_gate(
+        gpu,
         &s.dn_beta,
         &s.dn_alpha,
         &layer.dt_bias,
@@ -3335,12 +3366,12 @@ fn dense_tp_deltanet_partial(
         k_dim,
         v_dim,
     )?;
-    gpu.fused_qk_l2_norm_scale_f32(
+    deltanet_qk_l2_norm_scale(
+        gpu,
         &s.dn_q_raw,
         &s.dn_k_raw,
         config.linear_num_key_heads,
         hd,
-        1.0 / (hd as f32).sqrt(),
         config.norm_eps,
     )?;
     if config.linear_num_key_heads < n_v_heads {
