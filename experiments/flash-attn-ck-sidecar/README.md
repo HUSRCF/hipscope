@@ -171,9 +171,13 @@ The same PP8192 cell was revalidated after porting to current master
 The Asym3-FWHT cell was validated independently on the same W7900/gfx1100
 production path with five timed runs after two warmups:
 
-| Native median | CK median | Delta | Next token |
-| ---: | ---: | ---: | ---: |
-| `568.5 tok/s` | `794.0 tok/s` | `+39.67%` | `248046` / `248046` |
+| GPU | Native median | CK median | Delta | Next token |
+| --- | ---: | ---: | ---: | ---: |
+| W7900 / gfx1100 | `568.5 tok/s` | `794.0 tok/s` | `+39.67%` | `248046` / `248046` |
+| R9700 / gfx1201 | `532.8 tok/s` | `863.3 tok/s` | `+62.03%` | `248046` / `248046` |
+
+The larger gfx1201 ratio reflects its slower native FWHT3 path; the CK absolute
+throughput is consistent with the separately validated R9700 CK range.
 
 A matching rocprof trace bounds further optimization within this CK cell. After
 dividing the warmup-plus-profile dispatch totals by two, CK FMHA took about
