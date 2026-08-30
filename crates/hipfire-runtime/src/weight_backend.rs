@@ -874,6 +874,49 @@ pub fn dequant_f32(gpu: &mut Gpu, quant_type: u8, data: &[u8], n: usize) -> HipR
             }
             out
         }
+        44 => {
+            // MQ4G256V2 (qt44, mq4v2): per 256-group 136B — [s0 z0 s1 z1] as
+            // fp16 (per-128 half scales/zeros) + 128B pair-packed nibbles.
+            // Decode mirrors the kernel (level*scale[h]+zero[h]) then applies
+            // the FWHT inverse, exactly like the qt13 MQ4G256 arm below.
+            let group_size: usize = 256;
+            let bytes_per_group: usize = 136;
+            let n_groups = data.len() / bytes_per_group;
+            let signs1 = KvCache::gen_fwht_signs(42, 256);
+            let signs2 = KvCache::gen_fwht_signs(1042, 256);
+            let mut out = Vec::with_capacity(n_groups * group_size);
+            for g in 0..n_groups {
+                let off = g * bytes_per_group;
+                let st = |h: usize| {
+                    f16_to_f32(u16::from_le_bytes([
+                        data[off + 4 * h],
+                        data[off + 4 * h + 1],
+                    ]))
+                };
+                let zz = |h: usize| {
+                    f16_to_f32(u16::from_le_bytes([
+                        data[off + 4 * h + 2],
+                        data[off + 4 * h + 3],
+                    ]))
+                };
+                let start = out.len();
+                for i in 0..group_size {
+                    let h = i / 128;
+                    let byte_val = data[off + 8 + i / 2];
+                    let nibble = if i % 2 == 0 {
+                        byte_val & 0xF
+                    } else {
+                        byte_val >> 4
+                    };
+                    let s = if h == 0 { st(0) } else { st(1) };
+                    let z = if h == 0 { zz(0) } else { zz(1) };
+                    out.push(s * nibble as f32 + z);
+                }
+                let group = &mut out[start..start + 256];
+                fwht256_inplace(group, &signs1, &signs2);
+            }
+            out
+        }
         6 | 7 | 13 | 15 => {
             let is_6bit = quant_type == 15;
             let group_size: usize = if quant_type == 6 || quant_type == 13 || quant_type == 15 {

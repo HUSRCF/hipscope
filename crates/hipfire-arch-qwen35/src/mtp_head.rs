@@ -1221,6 +1221,34 @@ mod packed_dtype_tests {
         assert_eq!(mtp_packed_dtype(47), Some(DType::MQ6G256V2));
         assert_eq!(mtp_packed_dtype(48), None);
     }
+
+    #[test]
+    fn batched_prompt_fill_keeps_q8_mqv2_and_falls_back_elsewhere() {
+        assert!(weight_gemm_batched_supported(DType::MQ4G256V2));
+        assert!(weight_gemm_batched_supported(DType::MQ6G256V2));
+        assert!(weight_gemm_batched_supported(DType::MQ4G256));
+        assert!(weight_gemm_batched_supported(DType::Q8_0));
+        assert!(!weight_gemm_batched_supported(DType::MQ6G256));
+
+        let mqv2 = [
+            DType::MQ4G256V2,
+            DType::MQ4G256V2,
+            DType::MQ6G256V2,
+            DType::MQ6G256V2,
+        ];
+        assert!(mtp_prompt_fill_uses_batched(MtpKvMode::Q8, &mqv2));
+        assert!(!mtp_prompt_fill_uses_batched(MtpKvMode::Asym3, &mqv2));
+        assert!(!mtp_prompt_fill_uses_batched(MtpKvMode::Fwht4, &mqv2));
+        assert!(!mtp_prompt_fill_uses_batched(
+            MtpKvMode::Q8,
+            &[
+                DType::MQ6G256,
+                DType::MQ4G256V2,
+                DType::MQ4G256V2,
+                DType::MQ4G256V2
+            ]
+        ));
+    }
 }
 
 // ─── Forward pass ────────────────────────────────────────────────────────
@@ -2161,6 +2189,36 @@ fn weight_gemm_batched(
             llama::rotate_x_mq_batched_for(gpu, w, x_batched, rot, w.k, n)?;
             gpu.gemm_hfq4g256(&w.buf, rot, y_batched, w.m, w.k, n)
         }
+        DType::MQ4G256V2 => {
+            let rot = rotated_x_scratch.expect("MQ4V2 batched gemm requires rotated_x_scratch");
+            llama::rotate_x_mq_batched_for(gpu, w, x_batched, rot, w.k, n)?;
+            crate::qwen35::prefill::run_plain_gemm_key(
+                gpu,
+                hipfire_dispatch::types::KernelKey::GemmMq4G256V2,
+                &w.buf,
+                w.gpu_dtype,
+                rot,
+                y_batched,
+                w.m,
+                w.k,
+                n,
+            )
+        }
+        DType::MQ6G256V2 => {
+            let rot = rotated_x_scratch.expect("MQ6V2 batched gemm requires rotated_x_scratch");
+            llama::rotate_x_mq_batched_for(gpu, w, x_batched, rot, w.k, n)?;
+            crate::qwen35::prefill::run_plain_gemm_key(
+                gpu,
+                hipfire_dispatch::types::KernelKey::GemmMq6G256V2,
+                &w.buf,
+                w.gpu_dtype,
+                rot,
+                y_batched,
+                w.m,
+                w.k,
+                n,
+            )
+        }
         DType::F32 => {
             // Fallback: per-row gemv (slow but correct). MTP head loaded via
             // load_weight_raw can ship F32 for rare formats — keep functional.
@@ -2173,6 +2231,34 @@ fn weight_gemm_batched(
         }
         other => panic!("weight_gemm_batched: unsupported dtype {:?}", other),
     }
+}
+
+/// True when [`weight_gemm_batched`] has a non-panicking arm for `dtype`.
+/// Published MQ6G256-v1 sidecars have GEMV but no batched GEMM.
+fn weight_gemm_batched_supported(dtype: DType) -> bool {
+    matches!(
+        dtype,
+        DType::Q8_0
+            | DType::HFQ4G256
+            | DType::MQ4G256
+            | DType::MQ4G256V2
+            | DType::MQ6G256V2
+            | DType::F32
+    )
+}
+
+/// Prompt-fill may use the chunked batched path only for Q8 MTP KV and
+/// projections [`weight_gemm_batched`] can represent. Asym3/Fwht4 and
+/// MQ6G256-v1 keep the tokenwise GEMV / KV-write path.
+pub(crate) fn mtp_prompt_fill_uses_batched(
+    kv_mode: MtpKvMode,
+    projection_dtypes: &[DType],
+) -> bool {
+    kv_mode == MtpKvMode::Q8
+        && projection_dtypes
+            .iter()
+            .copied()
+            .all(weight_gemm_batched_supported)
 }
 
 /// Batched MTP head block forward (Task 11b).
@@ -2230,6 +2316,7 @@ pub fn mtp_head_forward_block_batched(
     n: usize,
     trunk_weights: &Qwen35Weights,
     rotated_x_scratch: Option<&GpuTensor>,
+    kv_only: bool,
 ) -> HipResult<()> {
     let cfg = &head.config;
     let w = &head.weights;
@@ -2259,22 +2346,34 @@ pub fn mtp_head_forward_block_batched(
         );
     }
 
-    // Upload positions (i32 stored in F32-typed buffer; aliasing is fine since
-    // the kernels read raw bytes via memcpy_htod into the F32 buffer).
-    {
-        let bytes = unsafe { std::slice::from_raw_parts(positions.as_ptr() as *const u8, n * 4) };
-        gpu.hip.memcpy_htod(&scratch.positions.buf, bytes)?;
+    // Reuse the raw i32 positions buffer for token ids during embedding, then
+    // overwrite it with absolute positions before RoPE/KV writes.
+    let token_bytes =
+        unsafe { std::slice::from_raw_parts(next_tokens.as_ptr() as *const u8, n * 4) };
+    gpu.hip.memcpy_htod(&scratch.positions.buf, token_bytes)?;
+
+    let tok_embd_view = scratch.tok_embd.sub_offset(0, n * dim);
+    if trunk_weights.embd_format == EmbeddingFormat::Q8_0 {
+        gpu.embedding_lookup_q8_batched(
+            &trunk_weights.token_embd,
+            &tok_embd_view,
+            &scratch.positions,
+            n,
+            dim,
+        )?;
+    } else {
+        for (i, &tok) in next_tokens.iter().enumerate() {
+            let dst = scratch.tok_embd.sub_offset(i * dim, dim);
+            embed_lookup_into(gpu, trunk_weights, &dst, tok, dim)?;
+        }
     }
 
-    // ── 1. Per-slot token embeddings into stacked tok_embd ───────────────
-    // No batched embedding-lookup kernel; per-slot dispatch is cheap (n×fast lookups).
-    for (i, &tok) in next_tokens.iter().enumerate() {
-        let dst = scratch.tok_embd.sub_offset(i * dim, dim);
-        embed_lookup_into(gpu, trunk_weights, &dst, tok, dim)?;
-    }
+    let position_bytes =
+        unsafe { std::slice::from_raw_parts(positions.as_ptr() as *const u8, n * 4) };
+    gpu.hip
+        .memcpy_htod(&scratch.positions.buf, position_bytes)?;
 
     // ── 2. Batched RMSNorm both inputs to NextN projection ───────────────
-    let tok_embd_view = scratch.tok_embd.sub_offset(0, n * dim);
     let e_norm_view = scratch.e_norm.sub_offset(0, n * dim);
     let prev_view = prev_hiddens_stacked.sub_offset(0, n * dim);
     let h_norm_view = scratch.h_norm.sub_offset(0, n * dim);
@@ -2394,30 +2493,24 @@ pub fn mtp_head_forward_block_batched(
     // (single-token softmax = 1). We still write K/V to make the KV cache
     // available for future cycles that wire historical reads.
     //
-    // Per-slot K/V writes use the F32 KV cache write helper. Each write is
-    // `kv_dim` floats; positions[i] is the slot. We construct a per-slot
-    // device pos_buf by sub-offsetting `scratch.positions`, but
-    // kv_cache_write expects a separate i32 device buffer per call. To avoid
-    // n separate allocs, we pass sub-offset views of `scratch.positions`
-    // (each one i32-sized), since the kernel reads `*pos` as the slot index.
-    for i in 0..n {
-        let k_row = scratch.k.sub_offset(i * kv_dim, kv_dim);
-        let v_row = scratch.v.sub_offset(i * kv_dim, kv_dim);
-        let pos_slot = scratch.positions.sub_offset(i, 1);
-        gpu.kv_cache_write_q8_0(
-            &kv.inner.k_gpu[0],
-            &k_row,
-            &pos_slot.buf,
-            cfg.n_head_kv,
-            cfg.head_dim,
-        )?;
-        gpu.kv_cache_write_q8_0(
-            &kv.inner.v_gpu[0],
-            &v_row,
-            &pos_slot.buf,
-            cfg.n_head_kv,
-            cfg.head_dim,
-        )?;
+    gpu.kv_cache_write_q8_0_batched(
+        &kv.inner.k_gpu[0],
+        &k_view,
+        &scratch.positions,
+        cfg.n_head_kv,
+        cfg.head_dim,
+        n,
+    )?;
+    gpu.kv_cache_write_q8_0_batched(
+        &kv.inner.v_gpu[0],
+        &v_view,
+        &scratch.positions,
+        cfg.n_head_kv,
+        cfg.head_dim,
+        n,
+    )?;
+    if kv_only {
+        return Ok(());
     }
 
     // attn_out = V (self-only attention with 1 key collapses softmax to 1).
