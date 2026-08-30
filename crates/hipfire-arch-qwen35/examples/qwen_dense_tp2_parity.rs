@@ -4,7 +4,8 @@ use hipfire_arch_qwen35::qwen35::{
     self, DeltaNetState, HfqSource, Layout, Qwen35Scratch, StateQuant,
 };
 use hipfire_runtime::hfq::HfqFile;
-use hipfire_runtime::llama::KvCache;
+use hipfire_runtime::kv_mode::KvMode;
+use hipfire_runtime::llama::{KvCache, KvCacheExt, KvDims, KvLayers, KvTarget};
 use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_runtime::tokenizer::Tokenizer;
 use hipfire_runtime::tp_shard::{ExpertAssign, ShardConfig};
@@ -47,14 +48,23 @@ fn load_single(
 }
 
 fn make_kv(gpu: &mut Gpu, config: &qwen35::Qwen35Config) -> KvCache {
-    KvCache::new_gpu(
-        gpu,
-        config.n_layers,
-        config.n_kv_heads,
-        config.head_dim,
-        KV_MAX,
+    let is_kv_layer = config
+        .layer_types
+        .iter()
+        .map(|layer| *layer == qwen35::LayerType::FullAttention)
+        .collect();
+    <KvCache as KvCacheExt>::from_mode(
+        KvMode::Q8,
+        KvTarget::Single(gpu),
+        &KvDims {
+            layers: KvLayers::Mask(is_kv_layer),
+            n_kv_heads: config.n_kv_heads,
+            head_dim: config.head_dim,
+            max_seq: KV_MAX,
+            physical_cap: Some(KV_MAX),
+        },
     )
-    .expect("fp32 kv")
+    .expect("filtered q8 kv")
 }
 
 fn run_reference(path: &str, seed: &[u32]) -> (Vec<u32>, Vec<Vec<f32>>) {
@@ -197,7 +207,9 @@ fn main() {
         );
     }
     assert_eq!(reference_tokens, tp_tokens, "TP2 argmax divergence");
-    assert!(worst < 1e-4, "TP2 relative logit error {worst:.3e}");
+    // Rank-local QKV reaches Q8 cache quantization with different FP rounding;
+    // argmax must stay exact while bounded logit drift remains below 0.1%.
+    assert!(worst < 1e-3, "TP2 relative logit error {worst:.3e}");
     println!(
         "PASS tokens={} worst_rel={worst:.3e}",
         reference_tokens.len()

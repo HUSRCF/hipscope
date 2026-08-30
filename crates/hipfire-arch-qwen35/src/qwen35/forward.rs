@@ -3592,7 +3592,6 @@ pub fn forward_scratch_dense_tp(
     }
 
     let mut delta_layer_idx = 0usize;
-    let mut kv_layer_idx = 0usize;
     for layer_idx in 0..configs[0].n_layers {
         match configs[0].layer_types[layer_idx] {
             LayerType::LinearAttention => {
@@ -3638,7 +3637,7 @@ pub fn forward_scratch_dense_tp(
                         &mut gpus.devices[rank],
                         layer,
                         &configs[rank],
-                        kv_layer_idx,
+                        layer_idx,
                         pos,
                         &mut kv_caches[rank],
                         &scratches[rank],
@@ -3662,7 +3661,6 @@ pub fn forward_scratch_dense_tp(
                     )?;
                 }
                 dense_tp_allreduce_add(gpus, scratches, dim)?;
-                kv_layer_idx += 1;
             }
         }
     }
