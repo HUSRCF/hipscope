@@ -2203,6 +2203,7 @@ pub fn generate_lfm2_vl(
         top_p,
         max_tokens,
         max_think_tokens,
+        seed,
         ..
     } = *params;
     if m.tokenizer.is_none() {
@@ -2480,11 +2481,10 @@ pub fn generate_lfm2_vl(
     let prefill_ms = prefill_t0.elapsed().as_millis().max(1);
 
     // ── Decode loop (identical sampling/stop semantics to generate_lfm2moe) ──
-    let seed = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0x9E3779B97F4A7C15);
-    let mut rng = hipfire_arch_deepseek4::sampling::Xorshift::new(seed);
+    // Per-request sampler seed from hipfire-engine::request_seed_for (wire
+    // `seed` wins, else attempt key + counter). Matches generate_vl / text
+    // paths — never wall-clock entropy.
+    let mut rng = hipfire_arch_deepseek4::sampling::Xorshift::new(seed as u64);
 
     let mut generated_count: usize = 0;
     let decode_t0 = Instant::now();
