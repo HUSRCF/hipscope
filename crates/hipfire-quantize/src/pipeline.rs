@@ -1626,6 +1626,9 @@ pub(crate) fn run() {
     let mut _n_quant_groups = 0u64;
 
     let include_vision = args.include_vision;
+    // Set when a vision-module tensor is actually emitted (loop-level F16
+    // short-circuit) — spill-safe input for the has_vision metadata flag.
+    let mut emitted_vision = false;
     let vision_quant = args.vision_quant.as_str();
     // --include-prefix <prefix>: when set, ONLY tensors whose name starts
     // with this prefix are ingested; everything else is silently skipped.
@@ -1681,11 +1684,24 @@ pub(crate) fn run() {
             || name.starts_with("model.vision_tower.")
             || name.starts_with("model.vision_adapter.")
             || name.starts_with("model.vision_projection.");
-        if is_vision && !include_vision {
+        // VL artifact contract: the vision group is the tower/adapter/projection
+        // tensors plus the LFM2/Idefics-style multi_modal_projector MLP. With
+        // --include-vision they ride the existing F16 fallback path
+        // (should_quantize() == false); without it they are skipped with the
+        // rest of the module. Towers always behaved this way — the projector
+        // is the fix (it used to land on the text-quantize tail).
+        let vision_group = is_vision || name.starts_with("model.multi_modal_projector.");
+        if vision_group && !include_vision {
             let (meta, _) = st_files[*file_idx].tensor_data(name).unwrap();
             let n: usize = meta.shape.iter().product();
             skipped_params += n as u64;
             continue;
+        }
+        if vision_group {
+            // include_vision is implied here. The tensor reaches the bottom-of-loop
+            // F16 fallback unchanged; this only records that the artifact carries a
+            // vision module, for the has_vision metadata flag (VL contract §4).
+            emitted_vision = true;
         }
         // Gemma4 unified (arch 13): text-only bring-up — skip the vision/audio
         // towers + multimodal projectors; quantize only the text decoder.
@@ -2815,6 +2831,50 @@ pub(crate) fn run() {
         }
     }
 
+    // ── VL artifact contract (docs/qwen35-vl-mq4v2-spec.md §4) ──────────────
+    // has_vision marks artifacts that carry a vision module. The pixel budget
+    // rides in config.vision_config — alongside the tower params already
+    // carried from the source config.json — as additive keys current readers
+    // ignore. It does not open a second top-level schema under the same name.
+    if emitted_vision {
+        let mut budget = serde_json::Map::new();
+        if let Ok(pc) = std::fs::read_to_string(input_dir.join("processor_config.json")) {
+            if let Ok(pcv) = serde_json::from_str::<serde_json::Value>(&pc) {
+                budget = collect_vl_processor_fields(&pcv);
+            }
+        }
+        if let Ok(mut meta_val) = serde_json::from_str::<serde_json::Value>(&metadata_json) {
+            let mut merged_budget = false;
+            if let Some(obj) = meta_val.as_object_mut() {
+                obj.insert("has_vision".to_string(), true.into());
+                if !budget.is_empty() {
+                    // Sources without a config.json object (config: null) keep
+                    // has_vision only; there is no vision_config home to extend.
+                    if let Some(cfg) = obj.get_mut("config").and_then(|c| c.as_object_mut()) {
+                        let vc = cfg
+                            .entry("vision_config".to_string())
+                            .or_insert_with(|| serde_json::json!({}));
+                        if let serde_json::Value::Object(vc_obj) = vc {
+                            for (k, v) in budget {
+                                vc_obj.entry(k).or_insert(v);
+                            }
+                            merged_budget = true;
+                        }
+                    }
+                }
+                metadata_json = serde_json::to_string(&meta_val).unwrap_or(metadata_json);
+            }
+            eprintln!(
+                "  has_vision: true{}",
+                if merged_budget {
+                    " (pixel budget merged into config.vision_config)"
+                } else {
+                    ""
+                }
+            );
+        }
+    }
+
     // ── SP4b: bake prune finalize (rename kept per-expert tensors + patch count) ──
     // kept tensors (ds4 score layers / lfm2 / minimax) recorded during the loop to
     // their compact slots, then patches the output metadata's routed-expert count
@@ -3271,6 +3331,56 @@ fn run_qwen3_dspark(args: &QuantizeArgs) {
     eprintln!("Done: {:.1} MB written", file_size as f64 / 1e6);
 }
 
+/// Copy pixel-budget + LFM2 processor contract keys from a
+/// `processor_config.json` value. Qwen-family processors put fields at the
+/// top level; LFM2/NaFlex nests them under `image_processor`. First-seen
+/// wins so a top-level key is not overwritten by a nested duplicate.
+fn collect_vl_processor_fields(
+    pcv: &serde_json::Value,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut budget = serde_json::Map::new();
+    const BUDGET_KEYS: [&str; 12] = [
+        "min_pixels",
+        "max_pixels",
+        "patch_size",
+        "merge_size",
+        "encoder_patch_size",
+        "downsample_factor",
+        "max_tiles",
+        "max_image_tokens",
+        "max_num_patches",
+        "image_mean",
+        "image_std",
+        "resample",
+    ];
+    for scope in [Some(pcv), pcv.get("image_processor")]
+        .into_iter()
+        .flatten()
+    {
+        for key in BUDGET_KEYS {
+            if let Some(v) = scope.get(key) {
+                budget.entry(key.to_string()).or_insert(v.clone());
+            }
+        }
+    }
+    budget
+}
+
+/// Names claimed by the LFM2 dense MQ bulk branch.
+///
+/// Proj/FFN matrices stay on the bulk path for mq4-v1 / mq4v2 / mq4c.
+/// `embed_tokens` is admitted only under MQ4G256V2 (`use_mq4v2`); mq4-v1
+/// and mq4c keep the historical Q8 embed so the tensor stays loadable.
+fn lfm2_dense_mq_name_matches(name: &str, use_mq4v2: bool) -> bool {
+    if name.ends_with("embed_tokens.weight") {
+        return use_mq4v2;
+    }
+    name.ends_with("_proj.weight")
+        || name.ends_with(".w1.weight")
+        || name.ends_with(".w2.weight")
+        || name.ends_with(".w3.weight")
+}
+
 fn try_handle_lfm2moe(
     is_lfm2moe: bool,
     use_mq4g256: bool,
@@ -3294,6 +3404,20 @@ fn try_handle_lfm2moe(
     // lm_head) → Q8 (qt=3 Q8F16). Dense lfm2 (350M/1.2B) has no experts, so
     // every tensor takes the final Q8 path. The loader's load_f32 dequantizes
     // Q8 norms / conv-filter back to F32 on load.
+    //
+    // Vision-module tensors are DECLINED here: this handler claims every
+    // lfm2moe-named tensor including a catch-all Q8 path, so tower/projector
+    // weights must return unclaimed to reach the bottom-of-loop F16 fallback
+    // (VL artifact contract — vision stays F16; see should_quantize()).
+    if is_lfm2moe
+        && (name.starts_with("model.vision_tower.")
+            || name.starts_with("model.vision_adapter.")
+            || name.starts_with("model.vision_projection.")
+            || name.starts_with("model.multi_modal_projector.")
+            || name.starts_with("model.visual."))
+    {
+        return false;
+    }
     if is_lfm2moe {
         let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
         if name.contains(".feed_forward.experts.")
@@ -3366,19 +3490,18 @@ fn try_handle_lfm2moe(
         // Dense mq4 (--format mq4): route the big 2D proj/FFN weight matrices
         // (conv in/out_proj, attn q/k/v/out_proj, dense w1/w2/w3) → MQ4G256.
         // The loader's weight_gemv / weight_gemv_residual auto-FWHT-rotate
-        // MQ4G256, so no forward change is needed. Keep the tied embed/lm_head
-        // (model.embed_tokens.weight), the router gate, norms, and the depthwise
-        // conv filter at Q8/F32 (small + precision-sensitive). Default (no mq4
-        // format) keeps the full-precision Q8 bring-up recipe.
+        // MQ4G256, so no forward change is needed. Keep the router gate, norms,
+        // and the depthwise conv filter at Q8/F32 (small + precision-sensitive).
+        // `embed_tokens` is MQ4G256V2-only: mq4-v1 / mq4c must not emit an
+        // unloadable embed (legacy formats stay on the Q8 tail). Default (no
+        // mq4 format) keeps the full-precision Q8 bring-up recipe.
         if (use_mq4g256 || use_mq4v2 || use_mq4c)
             && meta.shape.len() == 2
             && meta.shape[1] % 256 == 0
-            && !name.ends_with("embed_tokens.weight")
-            && (name.ends_with("_proj.weight")
-                || name.ends_with(".w1.weight")
-                || name.ends_with(".w2.weight")
-                || name.ends_with(".w3.weight"))
+            && lfm2_dense_mq_name_matches(name, use_mq4v2)
         {
+            // Tied lm_head reuses embed_tokens, so routing embed through mq4v2
+            // also covers the output head (lfm2_vl sets tie_word_embeddings=true).
             let f32_data = tensor_to_f32_with_optional_fp8_scale(
                 name,
                 raw_data,
@@ -7083,7 +7206,7 @@ pub(crate) fn hfq_requant_to_bq1_example(
 
 #[cfg(test)]
 mod pipeline_tests {
-    use super::moe_expert_3d_applies;
+    use super::{collect_vl_processor_fields, lfm2_dense_mq_name_matches, moe_expert_3d_applies};
 
     /// Regression pin for `d1d172e9c`, which extracted `handle_moe_expert_3d`
     /// and dropped its `shape.len() == 3` precondition at the call site. A 2-D
@@ -7141,5 +7264,56 @@ mod pipeline_tests {
             "model.language_model.layers.0.mlp.experts.gate_up_proj",
             &[256, 1024, 2048],
         ));
+    }
+
+    #[test]
+    fn lfm2_processor_config_copies_mean_std_resample() {
+        let pcv = serde_json::json!({
+            "image_processor": {
+                "image_mean": [0.5, 0.5, 0.5],
+                "image_std": [0.5, 0.5, 0.5],
+                "resample": 3,
+                "max_image_tokens": 256,
+                "downsample_factor": 2,
+            },
+            "processor_class": "Lfm2VlProcessor"
+        });
+        let budget = collect_vl_processor_fields(&pcv);
+        assert_eq!(budget["image_mean"], serde_json::json!([0.5, 0.5, 0.5]));
+        assert_eq!(budget["image_std"], serde_json::json!([0.5, 0.5, 0.5]));
+        assert_eq!(budget["resample"], serde_json::json!(3));
+        assert_eq!(budget["max_image_tokens"], serde_json::json!(256));
+    }
+
+    #[test]
+    fn qwen_top_level_processor_keys_still_collect() {
+        let pcv = serde_json::json!({
+            "min_pixels": 3136,
+            "max_pixels": 12845056,
+            "patch_size": 16,
+            "merge_size": 2,
+        });
+        let budget = collect_vl_processor_fields(&pcv);
+        assert_eq!(budget["min_pixels"], serde_json::json!(3136));
+        assert_eq!(budget["merge_size"], serde_json::json!(2));
+        assert!(!budget.contains_key("image_mean"));
+    }
+
+    #[test]
+    fn lfm2_embed_tokens_mq_route_is_v2_only() {
+        let embed = "model.language_model.embed_tokens.weight";
+        assert!(
+            lfm2_dense_mq_name_matches(embed, true),
+            "mq4v2 must claim embed_tokens"
+        );
+        assert!(
+            !lfm2_dense_mq_name_matches(embed, false),
+            "mq4-v1 / mq4c must not claim embed_tokens"
+        );
+        let proj = "model.language_model.layers.0.self_attn.q_proj.weight";
+        assert!(lfm2_dense_mq_name_matches(proj, true));
+        assert!(lfm2_dense_mq_name_matches(proj, false));
+        let w1 = "model.language_model.layers.0.feed_forward.w1.weight";
+        assert!(lfm2_dense_mq_name_matches(w1, false));
     }
 }

@@ -14,7 +14,9 @@ use hipfire_arch_qwen35::qwen35;
 use hipfire_arch_qwen35::speculative;
 use hipfire_arch_qwen35_vl::image;
 use hipfire_arch_qwen35_vl::qwen35_vl;
-use hipfire_engine::emit::{emit_active_attempt_error, emit_qwen_ar_cancelled, write_error};
+use hipfire_engine::emit::{
+    emit_active_attempt_error, emit_gen_start, emit_qwen_ar_cancelled, write_error,
+};
 use hipfire_engine::scheduler::block_attractor_unclosed_cpu;
 use hipfire_engine::terminal::{
     active_attempt_id, await_client_terminal_commit, check_abort, emit_staged_terminal_done,
@@ -319,6 +321,14 @@ pub fn generate_vl(
     stdout: &mut std::io::Stdout,
     params: &GenerateVLParams,
 ) {
+    // Stream-contract opener. MUST be the first event on this request's
+    // stream: the HTTP CLI's StreamContractGate rejects any later event that
+    // arrives without a preceding gen_start for this id — which stranded
+    // image turns after the encoder finished ("no response bytes", wedged
+    // slot; 2026-08-27 ledger finding b). Text-path generate() has emitted
+    // this since the e99583afa-class fixes.
+    let gen_contract = crate::common::gen_start_contract_version_for_arch(m.arch_id);
+    emit_gen_start(stdout, params.id, false, gen_contract);
     // INVARIANT: all early returns before the `vision_forward` call (the
     // first expensive GPU allocation in this function) use `write_error`
     // and return without owning any GPU buffers. If you add a GPU
@@ -1310,6 +1320,13 @@ pub fn generate_vl_dots_ocr(
     params: &GenerateVLParams,
 ) {
     use hipfire_arch_dots_ocr::image as dots_image;
+    // Stream-contract opener — same HTTP-gate rationale as generate_vl above.
+    emit_gen_start(
+        stdout,
+        params.id,
+        false,
+        crate::common::gen_start_contract_version_for_arch(m.arch_id),
+    );
     let t0 = Instant::now();
     let GenerateVLParams {
         id,
@@ -2056,5 +2073,514 @@ pub fn generate_dots_ocr_text(
     match await_client_terminal_commit(stdout, id, &pending_done) {
         ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
         ClientTerminalDecision::Abort => {}
+    }
+}
+
+// ── LFM2-VL (arch 11) ────────────────────────────────────────────────────────
+//
+// SigLIP2-NaFlex tower + projector executed by `hipfire_arch_lfm2_vl`; the
+// text loop, stream contract, sampling, and terminal handshake are copied
+// from `dense::generate_lfm2moe` so an image turn behaves exactly like a
+// long-prompted text turn once the visual features are spliced. See
+// docs/specs/2026-08-27-lfm2-vl-vision-runtime.md.
+
+use hipfire_arch_lfm2_vl as lfm2vl;
+
+/// Expand the single `<image>` id in `prompt_ids` into the marker structure
+/// HF's processor produces (narrow spec §1.5): `<|image_start|>`,
+/// per-tile `<|img_row_R_col_C|>` + 256 placeholders, `<|img_thumbnail|>` +
+/// thumbnail placeholders, `<|image_end|>` (markers only when present in
+/// this tokenizer; multi-tile REQUIRES its markers and fails closed).
+fn expand_image_placeholders(
+    tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
+    prompt_ids: &[u32],
+    image_token_id: u32,
+    prepared: &lfm2vl::Prepared,
+    cfg: &lfm2vl::VisionConfig,
+) -> Result<Vec<u32>, String> {
+    let start_count = prompt_ids.iter().filter(|&&t| t == image_token_id).count();
+    if start_count != 1 {
+        return Err(format!(
+            "expected exactly one <image> token in rendered prompt, found {start_count} — \
+             the artifact tokenizer is missing the VL added-token; requantize or use a \
+             VL-capable tokenizer"
+        ));
+    }
+    let special = |s: &str| -> Option<u32> { tokenizer.special_token_id(s) };
+    let multi_tile = prepared.grid_rows > 1 || prepared.grid_cols > 1;
+
+    let mut body: Vec<u32> = Vec::new();
+    let start_id = special("<|image_start|>");
+    let end_id = special("<|image_end|>");
+
+    let tiles: Vec<(usize, usize, usize)> = if multi_tile {
+        // row-major tile list aligned with Prepared.sub_images ordering.
+        prepared
+            .sub_images
+            .iter()
+            .take(prepared.grid_rows * prepared.grid_cols)
+            .enumerate()
+            .map(|(i, s)| {
+                (
+                    i / prepared.grid_cols + 1,
+                    i % prepared.grid_cols + 1,
+                    cfg.tokens_for_grid(s.gh(cfg), s.gw(cfg)),
+                )
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    // HF's processor ALWAYS wraps the placeholder run in <|image_start|> …
+    // <|image_end|> (single-tile included — pinned source §1.5), so both
+    // markers are unconditionally required from the tokenizer.
+    body.push(start_id.ok_or("tokenizer missing <|image_start|>")?);
+
+    if multi_tile {
+        for &(row, col, ntok) in &tiles {
+            let marker = special(&format!("<|img_row_{row}_col_{col}|>"))
+                .ok_or_else(|| format!("tokenizer missing <|img_row_{row}_col_{col}|>"))?;
+            body.push(marker);
+            for _ in 0..ntok {
+                body.push(image_token_id);
+            }
+        }
+        if cfg.use_thumbnail {
+            let thumb_marker = special("<|img_thumbnail|>")
+                .ok_or("multi-tile image requires <|img_thumbnail|> but tokenizer lacks it")?;
+            body.push(thumb_marker);
+            for _ in 0..cfg.tokens_for_grid(
+                prepared.sub_images.last().unwrap().gh(cfg),
+                prepared.sub_images.last().unwrap().gw(cfg),
+            ) {
+                body.push(image_token_id);
+            }
+        }
+    } else {
+        for _ in 0..cfg.tokens_for_grid(
+            prepared.sub_images[0].gh(cfg),
+            prepared.sub_images[0].gw(cfg),
+        ) {
+            body.push(image_token_id);
+        }
+    }
+    body.push(end_id.ok_or("tokenizer missing <|image_end|>")?);
+
+    // splice over the single <image>
+    let idx = prompt_ids
+        .iter()
+        .position(|&t| t == image_token_id)
+        .expect("position checked above");
+    let mut out = Vec::with_capacity(prompt_ids.len() + body.len() - 1);
+    out.extend_from_slice(&prompt_ids[..idx]);
+    out.extend_from_slice(&body);
+    out.extend_from_slice(&prompt_ids[idx + 1..]);
+
+    let total = out.iter().filter(|&&t| t == image_token_id).count();
+    if total != prepared.total_tokens(cfg) {
+        return Err(format!(
+            "placeholder/feature mismatch after expansion: {total} placeholders vs {} projected tokens",
+            prepared.total_tokens(cfg)
+        ));
+    }
+    Ok(out)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn generate_lfm2_vl(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut std::io::Stdout,
+    params: &GenerateVLParams,
+) {
+    let GenerateVLParams {
+        id,
+        prompt,
+        system_prompt,
+        ref image_source,
+        temp,
+        top_p,
+        max_tokens,
+        max_think_tokens,
+        seed,
+        ..
+    } = *params;
+    if m.tokenizer.is_none() {
+        emit_active_attempt_error(
+            stdout,
+            Some(id),
+            "tokenizer not loaded",
+            "validation",
+            false,
+            false,
+        );
+        return;
+    }
+    let vision_cfg = match m.lfm2_vision() {
+        Some((vc, _)) => vc.clone(),
+        None => {
+            emit_active_attempt_error(
+                stdout,
+                Some(id),
+                "model has no vision encoder",
+                "validation",
+                false,
+                false,
+            );
+            return;
+        }
+    };
+
+    // Stream contract opener BEFORE any GPU work or event emission — the
+    // HTTP gate rejects a `token` that arrives without gen_start first.
+    let gen_contract = crate::common::gen_start_contract_version_for_arch(m.arch_id);
+    emit_gen_start(stdout, id, false, gen_contract);
+
+    // Full-turn clock: preprocess + tower encode + prefill + decode. The
+    // tower dominates image turns (~7–10 s of the ~22 s wall on gfx1101),
+    // so a total that excludes it would misreport the turn.
+    let t_turn = Instant::now();
+
+    // ── Preprocess (CPU decode + resize/split/thumbnail) ──
+    let prepared = match image_source {
+        ImageSource::Path(path) => {
+            lfm2vl::load_and_preprocess(std::path::Path::new(path), &vision_cfg)
+        }
+        ImageSource::Base64(b64) => {
+            let raw_b64 = if let Some(rest) = b64.strip_prefix("data:") {
+                match rest.split_once(',') {
+                    Some((_, after)) => after,
+                    None => {
+                        emit_active_attempt_error(
+                            stdout,
+                            Some(id),
+                            "malformed data URL: missing ',' separator",
+                            "validation",
+                            false,
+                            false,
+                        );
+                        return;
+                    }
+                }
+            } else {
+                b64
+            };
+            match Engine::decode(&base64::engine::general_purpose::STANDARD, raw_b64) {
+                Ok(bytes) => lfm2vl::load_and_preprocess_from_bytes(&bytes, &vision_cfg),
+                Err(e) => Err(format!("failed to decode base64 image data: {e}")),
+            }
+        }
+    };
+    let prepared = match prepared {
+        Ok(p) => p,
+        Err(e) => {
+            emit_active_attempt_error(stdout, Some(id), &e, "validation", false, false);
+            return;
+        }
+    };
+    let n_visual_tokens = prepared.total_tokens(&vision_cfg);
+    eprintln!(
+        "[daemon/vl-lfm2] image preprocessed: {} sub-image(s), {}x{} grid(s), {} visual tokens",
+        prepared.sub_images.len(),
+        prepared.grid_rows,
+        prepared.grid_cols,
+        n_visual_tokens
+    );
+
+    // ── Prompt build: normal ChatML jinja frame with a literal <image> ──
+    let image_token_id = {
+        let tokenizer = m.tokenizer.as_ref().unwrap();
+        match tokenizer.special_token_id("<image>") {
+            Some(t) => t,
+            None => {
+                emit_active_attempt_error(
+                    stdout,
+                    Some(id),
+                    "tokenizer has no <image> token — not a VL tokenizer",
+                    "validation",
+                    false,
+                    false,
+                );
+                return;
+            }
+        }
+    };
+    let prompt_ids: Vec<u32> = {
+        let tokenizer = m.tokenizer.as_ref().unwrap();
+        let template = m.chat_template.as_ref();
+        let user_content = format!("<image>{prompt}");
+        let rendered = match template {
+            Some(template) => hipfire_runtime::prompt_frame::JinjaChatFrame {
+                tokenizer,
+                template,
+                system: system_prompt,
+                user: &user_content,
+                enable_thinking: max_think_tokens != 1,
+                bos_token: None,
+                reasoning_strength: None,
+                reasoning_effort: None,
+            }
+            .render(),
+            None => Err("no chat template embedded in artifact".to_string()),
+        };
+        match rendered {
+            Ok(text) => tokenizer.encode(&text),
+            Err(e) => {
+                emit_active_attempt_error(
+                    stdout,
+                    Some(id),
+                    &format!("vl prompt render failed: {e}"),
+                    "validation",
+                    false,
+                    false,
+                );
+                return;
+            }
+        }
+    };
+    let prompt_ids = match expand_image_placeholders(
+        m.tokenizer.as_ref().unwrap(),
+        &prompt_ids,
+        image_token_id,
+        &prepared,
+        &vision_cfg,
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            emit_active_attempt_error(stdout, Some(id), &e, "validation", false, false);
+            return;
+        }
+    };
+
+    // Capacity guard BEFORE GPU work. VL forces the cold-reset path (below),
+    // so seq_pos is always 0 here.
+    let cap = m.lfm2moe().unwrap().state.max_seq;
+    if prompt_ids.len().saturating_add(max_tokens) > cap {
+        emit_active_attempt_error(
+            stdout,
+            Some(id),
+            &format!(
+                "prompt exceeds context capacity: prompt={} (incl. {} visual) + max_tokens={} > capacity={}",
+                prompt_ids.len(),
+                n_visual_tokens,
+                max_tokens,
+                cap
+            ),
+            "context_length",
+            false,
+            false,
+        );
+        let _ = stdout.flush();
+        return;
+    }
+
+    // Cross-conversation cold reset (mirrors dense::generate_lfm2moe).
+    let _ = m.lfm2moe_mut().unwrap().state.reset(gpu);
+    m.seq_pos = 0;
+    m.conversation_tokens.clear();
+
+    // ── Vision encode → projected [n_visual, hidden] rows ──
+    let visual_tokens = match m.lfm2_vision() {
+        Some((_, vw)) => lfm2vl::vision_forward(gpu, vw, &vision_cfg, &prepared),
+        None => {
+            write_error(stdout, id, "model has no vision encoder");
+            return;
+        }
+    };
+    let visual_tokens = match visual_tokens {
+        Ok(v) => v,
+        Err(e) => {
+            write_error(stdout, id, &e);
+            return;
+        }
+    };
+    // Release-mode fail-closed length check (the narrow spec §2.3 claims
+    // "fails loud BEFORE splicing"): debug_assert compiles out in release,
+    // and a mismatch would otherwise panic the daemon on the emb slice below
+    // instead of erroring the request. Unreachable while the splitter and
+    // the tower share tokens_for_grid, but the splice must not trust that
+    // by accident.
+    if visual_tokens.len() != n_visual_tokens * vision_cfg.out_hidden_size {
+        write_error(
+            stdout,
+            id,
+            &format!(
+                "vision/projector row mismatch: {} floats for {} tokens × {} dims",
+                visual_tokens.len(),
+                n_visual_tokens,
+                vision_cfg.out_hidden_size
+            ),
+        );
+        return;
+    }
+
+    // EOS-class stop set (verbatim rationale lives at the text path copy).
+    let stop_toks: Vec<u32> = {
+        let tk = m.tokenizer.as_ref().unwrap();
+        let eos_tok = m.lfm2moe().unwrap().eos_tok;
+        let mut v = vec![eos_tok];
+        for s in ["<|endoftext|>", "</s>", "<|im_end|>"] {
+            let ids = tk.encode(s);
+            if ids.len() == 1 && !v.contains(&ids[0]) {
+                v.push(ids[0]);
+            }
+        }
+        v
+    };
+
+    // ── Prefill with visual embeddings spliced at placeholder positions ──
+    let mut last_logits: Vec<f32> = Vec::new();
+    let prefill_t0 = Instant::now();
+    {
+        let b = m.lfm2moe_mut().unwrap();
+        let cfg_t = &b.config;
+        let weights = &b.weights;
+        let state = &mut b.state;
+        let dim = vision_cfg.out_hidden_size;
+        let mut vis_idx = 0usize;
+        let mut position = state.n_tokens as u32;
+        for &tok in &prompt_ids {
+            if check_abort(id) {
+                // Client-cancel poll (mirrors the generate_vl hardening on
+                // feat/qwen35-vl): the vision-encode phase before this loop
+                // cannot be interrupted mid-kernel, so prefill is where an
+                // abort signalled during the tower takes effect. Emit the
+                // canonical cancelled pair and return — breaking out here
+                // would fall through to the decode loop relying on its
+                // top-of-loop abort check to avoid sampling empty logits,
+                // and would push the full prompt into conversation_tokens
+                // against a partially-filled KV.
+                emit_qwen_ar_cancelled(stdout, id, 0);
+                return;
+            }
+            let res = if tok == image_token_id && vis_idx < n_visual_tokens {
+                let emb = &visual_tokens[vis_idx * dim..(vis_idx + 1) * dim];
+                vis_idx += 1;
+                hipfire_arch_lfm2moe::forward::prefill_embed_step(
+                    cfg_t, weights, state, gpu, emb, position,
+                )
+            } else {
+                hipfire_arch_lfm2moe::forward::decode_step(
+                    cfg_t, weights, state, gpu, tok, position,
+                )
+            };
+            match res {
+                Ok(logits) => last_logits = logits,
+                Err(e) => {
+                    write_error(stdout, id, &format!("lfm2-vl prefill failed: {e:?}"));
+                    return;
+                }
+            }
+            position += 1;
+        }
+    }
+    for &tok in &prompt_ids {
+        m.conversation_tokens.push(tok);
+    }
+    let prefill_ms = prefill_t0.elapsed().as_millis().max(1);
+
+    // ── Decode loop (identical sampling/stop semantics to generate_lfm2moe) ──
+    // Per-request sampler seed from hipfire-engine::request_seed_for (wire
+    // `seed` wins, else attempt key + counter). Matches generate_vl / text
+    // paths — never wall-clock entropy.
+    let mut rng = hipfire_arch_deepseek4::sampling::Xorshift::new(seed as u64);
+
+    let mut generated_count: usize = 0;
+    let decode_t0 = Instant::now();
+    loop {
+        if check_abort(id) {
+            eprintln!("[daemon/vl-lfm2] aborted mid-decode");
+            break;
+        }
+        if generated_count >= max_tokens {
+            break;
+        }
+        let next_tok =
+            hipfire_arch_deepseek4::sampling::sample_token(&last_logits, temp, 0, top_p, &mut rng);
+        if stop_toks.contains(&next_tok) {
+            break;
+        }
+        let frag = m.tokenizer.as_ref().unwrap().decode(&[next_tok]);
+        if matches!(
+            frag.trim(),
+            "<|endoftext|>" | "</s>" | "<|im_end|>" | "<|startoftext|>"
+        ) {
+            break;
+        }
+        let envelope = serde_json::json!({
+            "type": "token",
+            "id": id,
+            "text": frag,
+            "attempt_id": active_attempt_id(),
+        });
+        let _ = writeln!(stdout, "{}", envelope);
+        let _ = stdout.flush();
+        m.conversation_tokens.push(next_tok);
+        generated_count += 1;
+
+        if check_abort(id) {
+            break;
+        }
+        let step = {
+            let b = m.lfm2moe_mut().unwrap();
+            let position = b.state.n_tokens as u32;
+            hipfire_arch_lfm2moe::forward::decode_step(
+                &b.config,
+                &b.weights,
+                &mut b.state,
+                gpu,
+                next_tok,
+                position,
+            )
+        };
+        match step {
+            Ok(logits) => last_logits = logits,
+            Err(e) => {
+                write_error(stdout, id, &format!("lfm2-vl decode failed: {e:?}"));
+                return;
+            }
+        }
+    }
+    let decode_ms = decode_t0.elapsed().as_millis().max(1);
+
+    // Post-loop abort latch — MANDATORY before the two-phase commit
+    // handshake. If the client cancelled/disconnected mid-decode,
+    // `await_client_terminal_commit` would block forever waiting for a
+    // commit that can never arrive and wedge the single slot (the exact
+    // failure recorded in the 2026-08-27 serve ledger). Emits the CANONICAL
+    // cancelled-terminal pair via `emit_qwen_ar_cancelled` (wire `aborted` +
+    // `aborted_done`) — serve's stream reader only releases an HTTP handler
+    // on the recognized terminal dialect, so a raw custom event here would
+    // hold the admission guard forever.
+    if check_abort(id) {
+        emit_qwen_ar_cancelled(stdout, id, generated_count);
+        return;
+    }
+
+    m.seq_pos = m.lfm2moe().unwrap().state.n_tokens;
+
+    let tok_s: f64 = if generated_count > 0 {
+        (generated_count as f64 * 1000.0) / decode_ms as f64
+    } else {
+        0.0
+    };
+    let pending_done = serde_json::json!({
+        "type": "done",
+        "id": id,
+        "tokens": generated_count,
+        "tok_s": (tok_s * 100.0).round() / 100.0,
+        "prefill_ms": prefill_ms,
+        "total_ms": t_turn.elapsed().as_millis().max(1),
+        "attempt_id": active_attempt_id(),
+    });
+    match await_client_terminal_commit(stdout, id, &pending_done) {
+        ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
+        ClientTerminalDecision::Abort => {
+            // Same release contract as the post-loop latch: the terminal pair
+            // must be the recognized wire dialect or serve holds its
+            // admission guard forever.
+            emit_qwen_ar_cancelled(stdout, id, generated_count);
+        }
     }
 }
