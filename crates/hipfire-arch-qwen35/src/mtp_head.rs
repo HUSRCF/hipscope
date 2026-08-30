@@ -1221,6 +1221,34 @@ mod packed_dtype_tests {
         assert_eq!(mtp_packed_dtype(47), Some(DType::MQ6G256V2));
         assert_eq!(mtp_packed_dtype(48), None);
     }
+
+    #[test]
+    fn batched_prompt_fill_keeps_q8_mqv2_and_falls_back_elsewhere() {
+        assert!(weight_gemm_batched_supported(DType::MQ4G256V2));
+        assert!(weight_gemm_batched_supported(DType::MQ6G256V2));
+        assert!(weight_gemm_batched_supported(DType::MQ4G256));
+        assert!(weight_gemm_batched_supported(DType::Q8_0));
+        assert!(!weight_gemm_batched_supported(DType::MQ6G256));
+
+        let mqv2 = [
+            DType::MQ4G256V2,
+            DType::MQ4G256V2,
+            DType::MQ6G256V2,
+            DType::MQ6G256V2,
+        ];
+        assert!(mtp_prompt_fill_uses_batched(MtpKvMode::Q8, &mqv2));
+        assert!(!mtp_prompt_fill_uses_batched(MtpKvMode::Asym3, &mqv2));
+        assert!(!mtp_prompt_fill_uses_batched(MtpKvMode::Fwht4, &mqv2));
+        assert!(!mtp_prompt_fill_uses_batched(
+            MtpKvMode::Q8,
+            &[
+                DType::MQ6G256,
+                DType::MQ4G256V2,
+                DType::MQ4G256V2,
+                DType::MQ4G256V2
+            ]
+        ));
+    }
 }
 
 // ─── Forward pass ────────────────────────────────────────────────────────
@@ -2183,6 +2211,34 @@ fn weight_gemm_batched(
         }
         other => panic!("weight_gemm_batched: unsupported dtype {:?}", other),
     }
+}
+
+/// True when [`weight_gemm_batched`] has a non-panicking arm for `dtype`.
+/// Published MQ6G256-v1 sidecars have GEMV but no batched GEMM.
+fn weight_gemm_batched_supported(dtype: DType) -> bool {
+    matches!(
+        dtype,
+        DType::Q8_0
+            | DType::HFQ4G256
+            | DType::MQ4G256
+            | DType::MQ4G256V2
+            | DType::MQ6G256V2
+            | DType::F32
+    )
+}
+
+/// Prompt-fill may use the chunked batched path only for Q8 MTP KV and
+/// projections [`weight_gemm_batched`] can represent. Asym3/Fwht4 and
+/// MQ6G256-v1 keep the tokenwise GEMV / KV-write path.
+pub(crate) fn mtp_prompt_fill_uses_batched(
+    kv_mode: MtpKvMode,
+    projection_dtypes: &[DType],
+) -> bool {
+    kv_mode == MtpKvMode::Q8
+        && projection_dtypes
+            .iter()
+            .copied()
+            .all(weight_gemm_batched_supported)
 }
 
 /// Batched MTP head block forward (Task 11b).
