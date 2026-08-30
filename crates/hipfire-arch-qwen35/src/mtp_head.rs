@@ -2192,12 +2192,32 @@ fn weight_gemm_batched(
         DType::MQ4G256V2 => {
             let rot = rotated_x_scratch.expect("MQ4V2 batched gemm requires rotated_x_scratch");
             llama::rotate_x_mq_batched_for(gpu, w, x_batched, rot, w.k, n)?;
-            gpu.gemm_mq4g256v2(&w.buf, rot, y_batched, w.m, w.k, n)
+            crate::qwen35::prefill::run_plain_gemm_key(
+                gpu,
+                hipfire_dispatch::types::KernelKey::GemmMq4G256V2,
+                &w.buf,
+                w.gpu_dtype,
+                rot,
+                y_batched,
+                w.m,
+                w.k,
+                n,
+            )
         }
         DType::MQ6G256V2 => {
             let rot = rotated_x_scratch.expect("MQ6V2 batched gemm requires rotated_x_scratch");
             llama::rotate_x_mq_batched_for(gpu, w, x_batched, rot, w.k, n)?;
-            gpu.gemm_mq6g256v2(&w.buf, rot, y_batched, w.m, w.k, n)
+            crate::qwen35::prefill::run_plain_gemm_key(
+                gpu,
+                hipfire_dispatch::types::KernelKey::GemmMq6G256V2,
+                &w.buf,
+                w.gpu_dtype,
+                rot,
+                y_batched,
+                w.m,
+                w.k,
+                n,
+            )
         }
         DType::F32 => {
             // Fallback: per-row gemv (slow but correct). MTP head loaded via
