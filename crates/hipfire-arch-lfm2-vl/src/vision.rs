@@ -13,14 +13,17 @@
 //! SigLIP2 has separate q/k/v projections; they are concatenated into a
 //! single `[3h, h]` F16 weight + `[3h]` bias at LOAD time so the forward
 //! can emit the packed `[n, 3h]` q|k|v buffer `vit_attention_f32` consumes
-//! (one gemm per layer instead of three, and no strided pack pass).
+//! (one gemm per layer instead of three, and no strided pack pass). F16 and
+//! F32 artifact q/k/v share that path (F32 is narrowed to F16 at concat).
 
 use crate::config::VisionConfig;
 use crate::image::{Prepared, SubImage};
-use hip_bridge::HipResult;
-use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::hfq::{HfqFile, HfqTensorInfo};
 use hipfire_runtime::llama::{f16_to_f32, f32_to_f16};
 use rdna_compute::{DType, Gpu, GpuTensor};
+
+const QT_F16: u8 = 1;
+const QT_F32: u8 = 2;
 
 // ─── GPU-side weights ────────────────────────────────────────────────────────
 
@@ -40,6 +43,27 @@ pub struct VisionLayerWeights {
     pub fc2_b: GpuTensor,
 }
 
+impl VisionLayerWeights {
+    fn free_gpu(self, gpu: &mut Gpu) {
+        for t in [
+            self.norm1_w,
+            self.norm1_b,
+            self.qkv_w,
+            self.qkv_b,
+            self.proj_w,
+            self.proj_b,
+            self.norm2_w,
+            self.norm2_b,
+            self.fc1_w,
+            self.fc1_b,
+            self.fc2_w,
+            self.fc2_b,
+        ] {
+            let _ = gpu.free_tensor(t);
+        }
+    }
+}
+
 pub struct VisionWeights {
     /// Patch embedding Linear rows `[1152, 768]` normalized to `(dy,dx,c)`
     /// input layout. Handles both serializations seen in the wild
@@ -54,7 +78,7 @@ pub struct VisionWeights {
     pub post_ln_b: GpuTensor,
     // ── projector ──
     /// `[2048, 4608]` F16 — input vector is the pixel-unshuffle block from
-    /// [`pixel_unshuffle_token`] (columns-pair-first channel interleave).
+    /// [`pixel_unshuffle_tokens`] (columns-pair-first channel interleave).
     pub proj1_w: GpuTensor,
     pub proj1_b: GpuTensor,
     /// `[2048, 2048]` F16.
@@ -68,12 +92,7 @@ impl VisionWeights {
         let _ = gpu.free_tensor(self.patch_embed_w);
         let _ = gpu.free_tensor(self.patch_embed_b);
         for l in self.layers {
-            for t in [
-                l.norm1_w, l.norm1_b, l.qkv_w, l.qkv_b, l.proj_w, l.proj_b, l.norm2_w, l.norm2_b,
-                l.fc1_w, l.fc1_b, l.fc2_w, l.fc2_b,
-            ] {
-                let _ = gpu.free_tensor(t);
-            }
+            l.free_gpu(gpu);
         }
         let _ = gpu.free_tensor(self.post_ln_w);
         let _ = gpu.free_tensor(self.post_ln_b);
@@ -84,49 +103,186 @@ impl VisionWeights {
     }
 }
 
-// ─── Tensor loading helpers (F16-in-artifact → F32 or F16 GPU) ──────────────
+// ─── Artifact validation (CPU; unit-tested) ─────────────────────────────────
 
-fn load_f32_cpu(hfq: &HfqFile, name: &str, n: usize) -> Vec<f32> {
-    let (info, data) = hfq
-        .tensor_data(name)
-        .unwrap_or_else(|| panic!("vision tensor not found: {name}"));
-    let mut vals: Vec<f32> = match info.quant_type {
-        1 => data
+fn lookup<'a>(hfq: &'a HfqFile, name: &str) -> Result<(&'a HfqTensorInfo, &'a [u8]), String> {
+    hfq.tensor_data(name)
+        .ok_or_else(|| format!("vision tensor not found: {name}"))
+}
+
+/// Validate dtype (F16/F32), rank, exact dims, and element/byte counts.
+/// Returns the element count on success.
+fn validate_dense(
+    name: &str,
+    quant_type: u8,
+    shape: &[u32],
+    nbytes: usize,
+    expected: &[usize],
+) -> Result<usize, String> {
+    if shape.len() != expected.len() {
+        return Err(format!(
+            "{name}: rank {} (want {})",
+            shape.len(),
+            expected.len()
+        ));
+    }
+    for (i, (&got, &want)) in shape.iter().zip(expected.iter()).enumerate() {
+        if got as usize != want {
+            return Err(format!("{name}: dim[{i}]={got} (want {want})"));
+        }
+    }
+    let elems: usize = expected.iter().copied().product();
+    let width = match quant_type {
+        QT_F16 => 2usize,
+        QT_F32 => 4usize,
+        other => {
+            return Err(format!(
+                "{name}: unsupported vision quant_type={other} (expected F16=1 or F32=2)"
+            ));
+        }
+    };
+    let want_bytes = elems
+        .checked_mul(width)
+        .ok_or_else(|| format!("{name}: element/byte count overflow ({elems} × {width})"))?;
+    if nbytes != want_bytes {
+        return Err(format!(
+            "{name}: {nbytes} bytes for {elems} elems (want {want_bytes})"
+        ));
+    }
+    Ok(elems)
+}
+
+fn decode_f32(quant_type: u8, data: &[u8]) -> Vec<f32> {
+    match quant_type {
+        QT_F16 => data
             .chunks_exact(2)
             .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
             .collect(),
-        2 => data
+        QT_F32 => data
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect(),
-        other => panic!("expected F16/F32 for {name}, got qt={other}"),
-    };
-    vals.truncate(n);
-    vals
+        _ => Vec::new(),
+    }
 }
 
-fn load_f32_gpu(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipResult<GpuTensor> {
-    let vals = load_f32_cpu(hfq, name, n);
-    gpu.upload_f32(&vals, &[n])
-}
-
-fn load_f16_gpu(hfq: &HfqFile, gpu: &mut Gpu, name: &str) -> HipResult<GpuTensor> {
-    let (info, data) = hfq
-        .tensor_data(name)
-        .unwrap_or_else(|| panic!("vision tensor not found: {name}"));
-    let n: usize = info.shape.iter().map(|&s| s as usize).product();
-    match info.quant_type {
-        1 => gpu.upload_raw(data, &[n]),
-        2 => {
-            // F32 container → narrow to F16 at load (vision kernels are F16).
-            let f16_bytes: Vec<u8> = data
-                .chunks_exact(4)
-                .take(n)
-                .flat_map(|c| f32_to_f16(f32::from_le_bytes([c[0], c[1], c[2], c[3]])).to_le_bytes())
-                .collect();
-            gpu.upload_raw(&f16_bytes, &[n])
+/// Append one dense matrix as F16 bytes. F32 inputs are narrowed; F16 is copied.
+fn append_f16_weight(
+    dst: &mut Vec<u8>,
+    name: &str,
+    quant_type: u8,
+    shape: &[u32],
+    data: &[u8],
+    expected: &[usize],
+) -> Result<(), String> {
+    let n = validate_dense(name, quant_type, shape, data.len(), expected)?;
+    match quant_type {
+        QT_F16 => dst.extend_from_slice(data),
+        QT_F32 => {
+            for c in data.chunks_exact(4).take(n) {
+                dst.extend_from_slice(
+                    &f32_to_f16(f32::from_le_bytes([c[0], c[1], c[2], c[3]])).to_le_bytes(),
+                );
+            }
         }
-        other => panic!("{name}: unsupported vision quant_type={other} (expected F16=1 or F32=2)"),
+        _ => unreachable!("validate_dense admits only F16/F32"),
+    }
+    Ok(())
+}
+
+fn fold_conv_patch_rows(raw: &[f32], out: usize, c_n: usize, kh: usize, kw: usize) -> Vec<f32> {
+    let in_dim = c_n * kh * kw;
+    let mut folded = vec![0.0f32; raw.len()];
+    for o in 0..out {
+        for dy in 0..kh {
+            for dx in 0..kw {
+                for c in 0..c_n {
+                    folded[o * in_dim + (dy * kw + dx) * c_n + c] =
+                        raw[o * in_dim + c * kh * kw + dy * kw + dx];
+                }
+            }
+        }
+    }
+    folded
+}
+
+fn patch_weight_rows_from(
+    name: &str,
+    quant_type: u8,
+    shape: &[u32],
+    data: &[u8],
+    cfg: &VisionConfig,
+) -> Result<(Vec<f32>, usize, usize), String> {
+    let hidden = cfg.hidden_size;
+    let patch_in = cfg.patch_size * cfg.patch_size * cfg.num_channels;
+    let expected: Vec<usize> = match shape.len() {
+        2 => vec![hidden, patch_in],
+        4 => vec![hidden, cfg.num_channels, cfg.patch_size, cfg.patch_size],
+        other => {
+            return Err(format!(
+                "{name}: unexpected rank {other} (want Linear [out,in] or Conv [out,C,kh,kw]) — \
+                 refusing to guess the layout"
+            ));
+        }
+    };
+    let n = validate_dense(name, quant_type, shape, data.len(), &expected)?;
+    let raw = decode_f32(quant_type, data);
+    if raw.len() != n {
+        return Err(format!("{name}: decoded {} elems, want {n}", raw.len()));
+    }
+    match shape.len() {
+        2 => Ok((raw, hidden, patch_in)),
+        4 => Ok((
+            fold_conv_patch_rows(&raw, hidden, cfg.num_channels, cfg.patch_size, cfg.patch_size),
+            hidden,
+            patch_in,
+        )),
+        _ => unreachable!("rank already validated"),
+    }
+}
+
+// ─── Tensor loading helpers (F16/F32-in-artifact → F32 or F16 GPU) ───────────
+
+fn load_f32_cpu(hfq: &HfqFile, name: &str, expected: &[usize]) -> Result<Vec<f32>, String> {
+    let (info, data) = lookup(hfq, name)?;
+    let n = validate_dense(name, info.quant_type, &info.shape, data.len(), expected)?;
+    let vals = decode_f32(info.quant_type, data);
+    if vals.len() != n {
+        return Err(format!("{name}: decoded {} elems, want {n}", vals.len()));
+    }
+    Ok(vals)
+}
+
+fn load_f32_gpu(
+    hfq: &HfqFile,
+    gpu: &mut Gpu,
+    name: &str,
+    expected: &[usize],
+) -> Result<GpuTensor, String> {
+    let vals = load_f32_cpu(hfq, name, expected)?;
+    gpu.upload_f32(&vals, &[vals.len()])
+        .map_err(|e| format!("lfm2-vl vision upload {name}: {e:?}"))
+}
+
+fn load_f16_gpu(
+    hfq: &HfqFile,
+    gpu: &mut Gpu,
+    name: &str,
+    expected: &[usize],
+) -> Result<GpuTensor, String> {
+    let (info, data) = lookup(hfq, name)?;
+    let n = validate_dense(name, info.quant_type, &info.shape, data.len(), expected)?;
+    match info.quant_type {
+        QT_F16 => gpu
+            .upload_raw(data, &[n])
+            .map_err(|e| format!("lfm2-vl vision upload {name}: {e:?}")),
+        QT_F32 => {
+            let mut f16_bytes = Vec::with_capacity(n * 2);
+            append_f16_weight(&mut f16_bytes, name, QT_F32, &info.shape, data, expected)?;
+            gpu.upload_raw(&f16_bytes, &[n])
+                .map_err(|e| format!("lfm2-vl vision upload {name}: {e:?}"))
+        }
+        _ => unreachable!("validate_dense admits only F16/F32"),
     }
 }
 
@@ -136,76 +292,255 @@ fn load_f16_gpu(hfq: &HfqFile, gpu: &mut Gpu, name: &str) -> HipResult<GpuTensor
 /// Artifact serializations handled:
 /// - Linear `[1152, 768]`: already aligned with `(dy,dx,c)` — verbatim.
 /// - Conv `[1152, C, kh, kw]`: kernel dims reorder to `(dy,dx,c)`.
-fn patch_weight_rows(hfq: &HfqFile) -> (Vec<f32>, usize, usize) {
+fn patch_weight_rows(hfq: &HfqFile, cfg: &VisionConfig) -> Result<(Vec<f32>, usize, usize), String> {
     const NAME: &str = "model.vision_tower.vision_model.embeddings.patch_embedding.weight";
-    let (info, data) = hfq.tensor_data(NAME).unwrap_or_else(|| panic!("missing {NAME}"));
-    let out = info.shape[0] as usize;
-    let raw: Vec<f32> = match info.quant_type {
-        1 => data.chunks_exact(2).map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect(),
-        2 => data.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
-        q => panic!("{NAME}: unsupported quant_type={q}"),
-    };
-    match info.shape.len() {
-        // Linear: [out, ps*ps*C] with rows (dy,dx,c) — HF processors store it
-        // pre-flattened in exactly the pixel-vector order.
-        2 => {
-            assert_eq!(raw.len(), out * info.shape[1] as usize);
-            (raw, out, info.shape[1] as usize)
-        }
-        // Conv: [out, C, kh, kw] → fold to (dy,dx,c).
-        4 => {
-            let c_n = info.shape[1] as usize;
-            let kh = info.shape[2] as usize;
-            let kw = info.shape[3] as usize;
-            let in_dim = c_n * kh * kw;
-            assert_eq!(raw.len(), out * in_dim);
-            let mut folded = vec![0.0f32; raw.len()];
-            for o in 0..out {
-                for dy in 0..kh {
-                    for dx in 0..kw {
-                        for c in 0..c_n {
-                            folded[o * in_dim + (dy * kw + dx) * c_n + c] =
-                                raw[o * in_dim + c * kh * kw + dy * kw + dx];
-                        }
-                    }
-                }
+    let (info, data) = lookup(hfq, NAME)?;
+    patch_weight_rows_from(NAME, info.quant_type, &info.shape, data, cfg)
+}
+
+fn concat_qkv(hfq: &HfqFile, i: usize, hidden: usize) -> Result<(Vec<u8>, Vec<f32>), String> {
+    // Stack independent q/k/v weights into one [3h, h] F16 buffer so the
+    // forward's single fused gemm produces the q|k|v-packed layout
+    // `vit_attention_f32` expects. Biases concatenate likewise. F32 q/k/v
+    // are narrowed to F16 here — same contract as `load_f16_gpu`.
+    let pfx = format!("model.vision_tower.vision_model.encoder.layers.{i}.self_attn");
+    let mut w = Vec::with_capacity(6 * hidden * hidden);
+    let mut b = Vec::with_capacity(3 * hidden);
+    for part in ["q_proj", "k_proj", "v_proj"] {
+        let wname = format!("{pfx}.{part}.weight");
+        let (info, data) = lookup(hfq, &wname)?;
+        append_f16_weight(
+            &mut w,
+            &wname,
+            info.quant_type,
+            &info.shape,
+            data,
+            &[hidden, hidden],
+        )?;
+        let bname = format!("{pfx}.{part}.bias");
+        b.extend(load_f32_cpu(hfq, &bname, &[hidden])?);
+    }
+    Ok((w, b))
+}
+
+#[derive(Default)]
+struct LayerLoadGuard {
+    norm1_w: Option<GpuTensor>,
+    norm1_b: Option<GpuTensor>,
+    qkv_w: Option<GpuTensor>,
+    qkv_b: Option<GpuTensor>,
+    proj_w: Option<GpuTensor>,
+    proj_b: Option<GpuTensor>,
+    norm2_w: Option<GpuTensor>,
+    norm2_b: Option<GpuTensor>,
+    fc1_w: Option<GpuTensor>,
+    fc1_b: Option<GpuTensor>,
+    fc2_w: Option<GpuTensor>,
+    fc2_b: Option<GpuTensor>,
+}
+
+impl LayerLoadGuard {
+    fn cleanup(&mut self, gpu: &mut Gpu) {
+        for slot in [
+            &mut self.norm1_w,
+            &mut self.norm1_b,
+            &mut self.qkv_w,
+            &mut self.qkv_b,
+            &mut self.proj_w,
+            &mut self.proj_b,
+            &mut self.norm2_w,
+            &mut self.norm2_b,
+            &mut self.fc1_w,
+            &mut self.fc1_b,
+            &mut self.fc2_w,
+            &mut self.fc2_b,
+        ] {
+            if let Some(t) = slot.take() {
+                let _ = gpu.free_tensor(t);
             }
-            (folded, out, in_dim)
         }
-        other => panic!(
-            "{NAME}: unexpected rank {other} (want Linear [out,in] or Conv [out,C,kh,kw]) — \
-             refusing to guess the layout"
-        ),
+    }
+
+    fn take(mut self) -> VisionLayerWeights {
+        VisionLayerWeights {
+            norm1_w: self.norm1_w.take().unwrap(),
+            norm1_b: self.norm1_b.take().unwrap(),
+            qkv_w: self.qkv_w.take().unwrap(),
+            qkv_b: self.qkv_b.take().unwrap(),
+            proj_w: self.proj_w.take().unwrap(),
+            proj_b: self.proj_b.take().unwrap(),
+            norm2_w: self.norm2_w.take().unwrap(),
+            norm2_b: self.norm2_b.take().unwrap(),
+            fc1_w: self.fc1_w.take().unwrap(),
+            fc1_b: self.fc1_b.take().unwrap(),
+            fc2_w: self.fc2_w.take().unwrap(),
+            fc2_b: self.fc2_b.take().unwrap(),
+        }
     }
 }
 
-fn concat_qkv(hfq: &HfqFile, i: usize, hidden: usize) -> (Vec<u8>, Vec<f32>) {
-    // Stack independent q/k/v F16 weights into one [3h, h] buffer so the
-    // forward's single fused gemm produces the q|k|v-packed layout
-    // `vit_attention_f32` expects. Biases concatenate likewise.
-    let pfx = format!("model.vision_tower.vision_model.encoder.layers.{i}.self_attn");
-    let mut w = Vec::with_capacity(9 * hidden * hidden);
-    let mut b = Vec::with_capacity(3 * hidden);
-    for part in ["q_proj", "k_proj", "v_proj"] {
-        let (info, data) = hfq
-            .tensor_data(&format!("{pfx}.{part}.weight"))
-            .unwrap_or_else(|| panic!("missing {pfx}.{part}.weight"));
-        assert_eq!(info.shape.len(), 2);
-        assert_eq!(info.shape[0] as usize, hidden);
-        assert_eq!(info.shape[1] as usize, hidden);
-        assert_eq!(info.quant_type, 1, "expect F16 attention weights");
-        w.extend_from_slice(data);
-        b.extend(load_f32_cpu(hfq, &format!("{pfx}.{part}.bias"), hidden));
+#[derive(Default)]
+struct VisionLoadGuard {
+    patch_embed_w: Option<GpuTensor>,
+    patch_embed_b: Option<GpuTensor>,
+    layers: Vec<VisionLayerWeights>,
+    post_ln_w: Option<GpuTensor>,
+    post_ln_b: Option<GpuTensor>,
+    proj1_w: Option<GpuTensor>,
+    proj1_b: Option<GpuTensor>,
+    proj2_w: Option<GpuTensor>,
+    proj2_b: Option<GpuTensor>,
+}
+
+impl VisionLoadGuard {
+    fn cleanup(&mut self, gpu: &mut Gpu) {
+        for slot in [
+            &mut self.patch_embed_w,
+            &mut self.patch_embed_b,
+            &mut self.post_ln_w,
+            &mut self.post_ln_b,
+            &mut self.proj1_w,
+            &mut self.proj1_b,
+            &mut self.proj2_w,
+            &mut self.proj2_b,
+        ] {
+            if let Some(t) = slot.take() {
+                let _ = gpu.free_tensor(t);
+            }
+        }
+        for l in self.layers.drain(..) {
+            l.free_gpu(gpu);
+        }
     }
-    (w, b)
+
+    fn finish(mut self, pos_embed: Vec<f32>) -> VisionWeights {
+        VisionWeights {
+            patch_embed_w: self.patch_embed_w.take().unwrap(),
+            patch_embed_b: self.patch_embed_b.take().unwrap(),
+            pos_embed,
+            layers: std::mem::take(&mut self.layers),
+            post_ln_w: self.post_ln_w.take().unwrap(),
+            post_ln_b: self.post_ln_b.take().unwrap(),
+            proj1_w: self.proj1_w.take().unwrap(),
+            proj1_b: self.proj1_b.take().unwrap(),
+            proj2_w: self.proj2_w.take().unwrap(),
+            proj2_b: self.proj2_b.take().unwrap(),
+        }
+    }
+}
+
+fn load_one_layer(
+    hfq: &HfqFile,
+    gpu: &mut Gpu,
+    cfg: &VisionConfig,
+    i: usize,
+) -> Result<VisionLayerWeights, String> {
+    let h = cfg.hidden_size;
+    let p = format!("model.vision_tower.vision_model.encoder.layers.{i}");
+    let mut g = LayerLoadGuard::default();
+    let result = (|| {
+        let (qkv_w, qkv_b) = concat_qkv(hfq, i, h)?;
+        g.norm1_w = Some(load_f32_gpu(
+            hfq,
+            gpu,
+            &format!("{p}.layer_norm1.weight"),
+            &[h],
+        )?);
+        g.norm1_b = Some(load_f32_gpu(
+            hfq,
+            gpu,
+            &format!("{p}.layer_norm1.bias"),
+            &[h],
+        )?);
+        g.qkv_w = Some(
+            gpu.upload_raw(&qkv_w, &[3 * h * h])
+                .map_err(|e| format!("lfm2-vl vision upload {p} qkv_w: {e:?}"))?,
+        );
+        g.qkv_b = Some(
+            gpu.upload_f32(&qkv_b, &[3 * h])
+                .map_err(|e| format!("lfm2-vl vision upload {p} qkv_b: {e:?}"))?,
+        );
+        g.proj_w = Some(load_f16_gpu(
+            hfq,
+            gpu,
+            &format!("{p}.self_attn.out_proj.weight"),
+            &[h, h],
+        )?);
+        g.proj_b = Some(load_f32_gpu(
+            hfq,
+            gpu,
+            &format!("{p}.self_attn.out_proj.bias"),
+            &[h],
+        )?);
+        g.norm2_w = Some(load_f32_gpu(
+            hfq,
+            gpu,
+            &format!("{p}.layer_norm2.weight"),
+            &[h],
+        )?);
+        g.norm2_b = Some(load_f32_gpu(
+            hfq,
+            gpu,
+            &format!("{p}.layer_norm2.bias"),
+            &[h],
+        )?);
+        g.fc1_w = Some(load_f16_gpu(
+            hfq,
+            gpu,
+            &format!("{p}.mlp.fc1.weight"),
+            &[cfg.mlp_dim, h],
+        )?);
+        g.fc1_b = Some(load_f32_gpu(
+            hfq,
+            gpu,
+            &format!("{p}.mlp.fc1.bias"),
+            &[cfg.mlp_dim],
+        )?);
+        g.fc2_w = Some(load_f16_gpu(
+            hfq,
+            gpu,
+            &format!("{p}.mlp.fc2.weight"),
+            &[h, cfg.mlp_dim],
+        )?);
+        g.fc2_b = Some(load_f32_gpu(
+            hfq,
+            gpu,
+            &format!("{p}.mlp.fc2.bias"),
+            &[h],
+        )?);
+        Ok(())
+    })();
+    match result {
+        Ok(()) => Ok(g.take()),
+        Err(e) => {
+            g.cleanup(gpu);
+            Err(e)
+        }
+    }
 }
 
 pub fn load_vision_weights(
     hfq: &HfqFile,
     cfg: &VisionConfig,
     gpu: &mut Gpu,
-) -> HipResult<VisionWeights> {
+) -> Result<VisionWeights, String> {
     let h = cfg.hidden_size;
+    if cfg.num_heads == 0 || h != cfg.num_heads * cfg.head_dim {
+        return Err(format!(
+            "lfm2-vl vision: hidden_size={h} is not num_heads={} × head_dim={}",
+            cfg.num_heads, cfg.head_dim
+        ));
+    }
+    if cfg.downsample_factor == 0 {
+        return Err("lfm2-vl vision: downsample_factor must be ≥ 1".into());
+    }
+    let k_side = (cfg.num_position_embeddings as f64).sqrt() as usize;
+    if k_side == 0 || k_side * k_side != cfg.num_position_embeddings {
+        return Err(format!(
+            "lfm2-vl vision: num_position_embeddings={} is not a square table side",
+            cfg.num_position_embeddings
+        ));
+    }
 
     match gpu.arch.as_str() {
         "gfx1100" | "gfx1101" | "gfx1102" => {}
@@ -216,58 +551,88 @@ pub fn load_vision_weights(
     }
 
     eprintln!("  loading LFM2-VL vision tower (GPU)...");
-    let (pw_rows, out_rows, in_dim) = patch_weight_rows(hfq);
-    assert_eq!(in_dim, cfg.patch_size * cfg.patch_size * cfg.num_channels);
-    let pw_u16: Vec<u8> = pw_rows.iter().flat_map(|&v| f32_to_f16(v).to_le_bytes()).collect();
-    let patch_embed_w = gpu.upload_raw(&pw_u16, &[out_rows])?;
-    let patch_embed_b = load_f32_gpu(
-        hfq,
-        gpu,
-        "model.vision_tower.vision_model.embeddings.patch_embedding.bias",
-        h,
-    )?;
-    let pos_embed = load_f32_cpu(
-        hfq,
-        "model.vision_tower.vision_model.embeddings.position_embedding.weight",
-        cfg.num_position_embeddings * h,
-    );
+    let mut guard = VisionLoadGuard::default();
+    let loaded = (|| {
+        let (pw_rows, out_rows, _in_dim) = patch_weight_rows(hfq, cfg)?;
+        let pw_u16: Vec<u8> = pw_rows
+            .iter()
+            .flat_map(|&v| f32_to_f16(v).to_le_bytes())
+            .collect();
+        // Upload shape stays `[out_rows]` — GEMM dims are passed explicitly.
+        guard.patch_embed_w = Some(
+            gpu.upload_raw(&pw_u16, &[out_rows])
+                .map_err(|e| format!("lfm2-vl vision upload patch_embed.weight: {e:?}"))?,
+        );
+        guard.patch_embed_b = Some(load_f32_gpu(
+            hfq,
+            gpu,
+            "model.vision_tower.vision_model.embeddings.patch_embedding.bias",
+            &[h],
+        )?);
+        let pos_embed = load_f32_cpu(
+            hfq,
+            "model.vision_tower.vision_model.embeddings.position_embedding.weight",
+            &[cfg.num_position_embeddings, h],
+        )?;
 
-    let mut layers = Vec::with_capacity(cfg.num_layers);
-    for i in 0..cfg.num_layers {
-        if i % 9 == 0 {
-            eprintln!("  loading vision block {i}/{}...", cfg.num_layers);
+        for i in 0..cfg.num_layers {
+            if i % 9 == 0 {
+                eprintln!("  loading vision block {i}/{}...", cfg.num_layers);
+            }
+            match load_one_layer(hfq, gpu, cfg, i) {
+                Ok(layer) => guard.layers.push(layer),
+                Err(e) => return Err(e),
+            }
         }
-        let p = format!("model.vision_tower.vision_model.encoder.layers.{i}");
-        let (qkv_w, qkv_b) = concat_qkv(hfq, i, h);
-        layers.push(VisionLayerWeights {
-            norm1_w: load_f32_gpu(hfq, gpu, &format!("{p}.layer_norm1.weight"), h)?,
-            norm1_b: load_f32_gpu(hfq, gpu, &format!("{p}.layer_norm1.bias"), h)?,
-            qkv_w: gpu.upload_raw(&qkv_w, &[3 * h * h])?,
-            qkv_b: gpu.upload_f32(&qkv_b, &[3 * h])?,
-            proj_w: load_f16_gpu(hfq, gpu, &format!("{p}.self_attn.out_proj.weight"))?,
-            proj_b: load_f32_gpu(hfq, gpu, &format!("{p}.self_attn.out_proj.bias"), h)?,
-            norm2_w: load_f32_gpu(hfq, gpu, &format!("{p}.layer_norm2.weight"), h)?,
-            norm2_b: load_f32_gpu(hfq, gpu, &format!("{p}.layer_norm2.bias"), h)?,
-            fc1_w: load_f16_gpu(hfq, gpu, &format!("{p}.mlp.fc1.weight"))?,
-            fc1_b: load_f32_gpu(hfq, gpu, &format!("{p}.mlp.fc1.bias"), cfg.mlp_dim)?,
-            fc2_w: load_f16_gpu(hfq, gpu, &format!("{p}.mlp.fc2.weight"))?,
-            fc2_b: load_f32_gpu(hfq, gpu, &format!("{p}.mlp.fc2.bias"), h)?,
-        });
-    }
 
-    eprintln!("  loading post_layernorm + projector...");
-    Ok(VisionWeights {
-        patch_embed_w,
-        patch_embed_b,
-        pos_embed,
-        layers,
-        post_ln_w: load_f32_gpu(hfq, gpu, "model.vision_tower.vision_model.post_layernorm.weight", h)?,
-        post_ln_b: load_f32_gpu(hfq, gpu, "model.vision_tower.vision_model.post_layernorm.bias", h)?,
-        proj1_w: load_f16_gpu(hfq, gpu, "model.multi_modal_projector.linear_1.weight")?,
-        proj1_b: load_f32_gpu(hfq, gpu, "model.multi_modal_projector.linear_1.bias", cfg.projector_hidden_size)?,
-        proj2_w: load_f16_gpu(hfq, gpu, "model.multi_modal_projector.linear_2.weight")?,
-        proj2_b: load_f32_gpu(hfq, gpu, "model.multi_modal_projector.linear_2.bias", cfg.out_hidden_size)?,
-    })
+        eprintln!("  loading post_layernorm + projector...");
+        let ds = cfg.downsample_factor;
+        let proj1_in = h * ds * ds;
+        guard.post_ln_w = Some(load_f32_gpu(
+            hfq,
+            gpu,
+            "model.vision_tower.vision_model.post_layernorm.weight",
+            &[h],
+        )?);
+        guard.post_ln_b = Some(load_f32_gpu(
+            hfq,
+            gpu,
+            "model.vision_tower.vision_model.post_layernorm.bias",
+            &[h],
+        )?);
+        guard.proj1_w = Some(load_f16_gpu(
+            hfq,
+            gpu,
+            "model.multi_modal_projector.linear_1.weight",
+            &[cfg.projector_hidden_size, proj1_in],
+        )?);
+        guard.proj1_b = Some(load_f32_gpu(
+            hfq,
+            gpu,
+            "model.multi_modal_projector.linear_1.bias",
+            &[cfg.projector_hidden_size],
+        )?);
+        guard.proj2_w = Some(load_f16_gpu(
+            hfq,
+            gpu,
+            "model.multi_modal_projector.linear_2.weight",
+            &[cfg.out_hidden_size, cfg.projector_hidden_size],
+        )?);
+        guard.proj2_b = Some(load_f32_gpu(
+            hfq,
+            gpu,
+            "model.multi_modal_projector.linear_2.bias",
+            &[cfg.out_hidden_size],
+        )?);
+        Ok(pos_embed)
+    })();
+    match loaded {
+        Ok(pos_embed) => Ok(guard.finish(pos_embed)),
+        Err(e) => {
+            guard.cleanup(gpu);
+            Err(e)
+        }
+    }
 }
 
 // ─── CPU per-image precomputes (exact-index, unit-tested) ───────────────────
@@ -305,7 +670,10 @@ pub fn resize_pos_embed(
                     let frac = center - l0;
                     let lo_i = (l0 as i64).clamp(0, src_len as i64 - 1);
                     let hi_i = ((l0 as i64) + 1).clamp(0, src_len as i64 - 1);
-                    Taps { idx: vec![lo_i as usize, hi_i as usize], w: vec![1.0 - frac, frac] }
+                    Taps {
+                        idx: vec![lo_i as usize, hi_i as usize],
+                        w: vec![1.0 - frac, frac],
+                    }
                 } else {
                     let support = scale;
                     let lo = ((center - support).floor().max(0.0)) as usize;
@@ -407,6 +775,40 @@ pub fn gelu_exact_inplace(v: &mut [f32]) {
 
 // ─── GPU forward ─────────────────────────────────────────────────────────────
 
+#[derive(Default)]
+struct ForwardScratch {
+    live: Vec<Option<GpuTensor>>,
+}
+
+impl ForwardScratch {
+    fn hold(&mut self, t: GpuTensor) -> usize {
+        self.live.push(Some(t));
+        self.live.len() - 1
+    }
+
+    fn t(&self, i: usize) -> Result<&GpuTensor, String> {
+        self.live
+            .get(i)
+            .and_then(|s| s.as_ref())
+            .ok_or_else(|| "lfm2-vl vision: scratch slot empty".to_string())
+    }
+
+    fn release(&mut self, gpu: &mut Gpu, i: usize) -> Result<(), String> {
+        match self.live.get_mut(i).and_then(Option::take) {
+            Some(t) => gpu.free_tensor(t).map_err(ehip("free scratch")),
+            None => Ok(()),
+        }
+    }
+
+    fn drop_all(&mut self, gpu: &mut Gpu) {
+        for slot in &mut self.live {
+            if let Some(t) = slot.take() {
+                let _ = gpu.free_tensor(t);
+            }
+        }
+    }
+}
+
 /// Vision linear Y[n, out] = W_f16[out, in] @ X[n, in]^T + bias.
 /// Same routing as qwen35-vl: WMMA row-major writer on wave32 arches,
 /// naive gemm + transpose elsewhere.
@@ -418,20 +820,42 @@ fn linear_f16(
     out_dim: usize,
     in_dim: usize,
     n: usize,
-) -> HipResult<GpuTensor> {
-    let y = gpu.alloc_tensor(&[n * out_dim], DType::F32)?;
-    if gpu.arch_caps.has_wmma_w32() || gpu.arch_caps.has_wmma_w32_gfx12() {
-        gpu.gemm_f16_wmma_mb8(w, x, &y, out_dim, in_dim, n)?;
-    } else {
-        let yt = gpu.alloc_tensor(&[out_dim * n], DType::F32)?;
-        gpu.gemm_f16(w, x, &yt, out_dim, in_dim, n)?;
-        gpu.transpose_f32(&yt, &y, out_dim, n)?;
-        gpu.free_tensor(yt)?;
+) -> Result<GpuTensor, String> {
+    let y = gpu
+        .alloc_tensor(&[n * out_dim], DType::F32)
+        .map_err(ehip("linear alloc"))?;
+    let inner = (|| -> Result<(), String> {
+        if gpu.arch_caps.has_wmma_w32() || gpu.arch_caps.has_wmma_w32_gfx12() {
+            gpu.gemm_f16_wmma_mb8(w, x, &y, out_dim, in_dim, n)
+                .map_err(ehip("gemm_wmma"))?;
+        } else {
+            let yt = gpu
+                .alloc_tensor(&[out_dim * n], DType::F32)
+                .map_err(ehip("linear yt"))?;
+            let r: Result<(), String> = (|| -> Result<(), String> {
+                gpu.gemm_f16(w, x, &yt, out_dim, in_dim, n)
+                    .map_err(ehip("gemm"))?;
+                gpu.transpose_f32(&yt, &y, out_dim, n)
+                    .map_err(ehip("transpose"))?;
+                Ok(())
+            })();
+            let free_yt = gpu.free_tensor(yt);
+            r?;
+            free_yt.map_err(ehip("free yt"))?;
+        }
+        if let Some(b) = bias {
+            gpu.bias_add_f32(&y, b, n, out_dim)
+                .map_err(ehip("bias"))?;
+        }
+        Ok(())
+    })();
+    match inner {
+        Ok(()) => Ok(y),
+        Err(e) => {
+            let _ = gpu.free_tensor(y);
+            Err(e)
+        }
     }
-    if let Some(b) = bias {
-        gpu.bias_add_f32(&y, b, n, out_dim)?;
-    }
-    Ok(y)
 }
 
 /// Encode one request image into projected text-space tokens, concatenated
@@ -446,15 +870,27 @@ pub fn vision_forward(
     let h = cfg.hidden_size;
     let heads = cfg.num_heads;
     let head_dim = cfg.head_dim;
+    if heads == 0 || h != heads * head_dim {
+        return Err(format!(
+            "lfm2-vl vision: hidden_size={h} is not num_heads={heads} × head_dim={head_dim}"
+        ));
+    }
     let k_side = (cfg.num_position_embeddings as f64).sqrt() as usize;
-    assert_eq!(k_side * k_side, cfg.num_position_embeddings);
+    if k_side == 0 || k_side * k_side != cfg.num_position_embeddings {
+        return Err(format!(
+            "lfm2-vl vision: num_position_embeddings={} is not a square table side",
+            cfg.num_position_embeddings
+        ));
+    }
 
     let all_tokens: usize = prepared.total_tokens(cfg);
     let mut out = Vec::with_capacity(all_tokens * cfg.out_hidden_size);
 
     let t0 = std::time::Instant::now();
     for sub in &prepared.sub_images {
-        out.extend(tower_and_project_sub_image(gpu, weights, cfg, sub, h, heads, head_dim, k_side)?);
+        out.extend(tower_and_project_sub_image(
+            gpu, weights, cfg, sub, h, heads, head_dim, k_side,
+        )?);
     }
     eprintln!(
         "  vision done: {} sub-images, {} tokens × {} dims ({:.2}s)",
@@ -476,97 +912,242 @@ fn tower_and_project_sub_image(
     head_dim: usize,
     k_side: usize,
 ) -> Result<Vec<f32>, String> {
+    let mut scratch = ForwardScratch::default();
+    let result = tower_and_project_sub_image_inner(
+        gpu, weights, cfg, sub, h, heads, head_dim, k_side, &mut scratch,
+    );
+    scratch.drop_all(gpu);
+    result
+}
+
+fn tower_and_project_sub_image_inner(
+    gpu: &mut Gpu,
+    weights: &VisionWeights,
+    cfg: &VisionConfig,
+    sub: &SubImage,
+    h: usize,
+    heads: usize,
+    head_dim: usize,
+    k_side: usize,
+    scratch: &mut ForwardScratch,
+) -> Result<Vec<f32>, String> {
     let patches = sub.patches(cfg);
     let n = sub.gh(cfg) * sub.gw(cfg);
-    let patch_dim = patches.len() / n.max(1);
+    let patch_dim = cfg.patch_size * cfg.patch_size * cfg.num_channels;
+    if n == 0 || patches.len() != n * patch_dim {
+        return Err(format!(
+            "lfm2-vl vision: sub-image patches {} for grid {n} × {patch_dim}",
+            patches.len()
+        ));
+    }
     let eps = cfg.norm_eps;
 
     // patch embed → [n, h]
-    let x_patches = gpu.upload_f32(&patches, &[n * patch_dim]).map_err(ehip("upload patches"))?;
-    let x = linear_f16(gpu, &weights.patch_embed_w, &x_patches, Some(&weights.patch_embed_b), h, patch_dim, n)
-        .map_err(ehip("patch embed"))?;
-    gpu.free_tensor(x_patches).map_err(ehip("free patches"))?;
+    let xp = scratch.hold(
+        gpu.upload_f32(&patches, &[n * patch_dim])
+            .map_err(ehip("upload patches"))?,
+    );
+    let x = scratch.hold(linear_f16(
+        gpu,
+        &weights.patch_embed_w,
+        scratch.t(xp)?,
+        Some(&weights.patch_embed_b),
+        h,
+        patch_dim,
+        n,
+    )?);
+    scratch.release(gpu, xp)?;
 
     // position embed add
     let pos = resize_pos_embed(&weights.pos_embed, k_side, h, sub.gh(cfg), sub.gw(cfg));
-    let pos_gpu = gpu.upload_f32(&pos, &[pos.len()]).map_err(ehip("upload pos"))?;
-    gpu.add_inplace_f32(&x, &pos_gpu).map_err(ehip("pos add"))?;
-    gpu.free_tensor(pos_gpu).map_err(ehip("free pos"))?;
+    let pos_gpu = scratch.hold(
+        gpu.upload_f32(&pos, &[pos.len()])
+            .map_err(ehip("upload pos"))?,
+    );
+    gpu.add_inplace_f32(scratch.t(x)?, scratch.t(pos_gpu)?)
+        .map_err(ehip("pos add"))?;
+    scratch.release(gpu, pos_gpu)?;
 
     // encoder layers: pre-LN attn residual + pre-LN MLP residual
     for lw in &weights.layers {
-        let tmp = gpu.alloc_tensor(&[n * h], DType::F32).map_err(ehip("alloc ln1"))?;
-        gpu.layernorm_batched(&x, &lw.norm1_w, &lw.norm1_b, &tmp, n, h, eps)
-            .map_err(ehip("ln1"))?;
-        let qkv = linear_f16(gpu, &lw.qkv_w, &tmp, Some(&lw.qkv_b), 3 * h, h, n)
-            .map_err(ehip("qkv"))?;
-        gpu.free_tensor(tmp).map_err(ehip("free ln1"))?;
+        let tmp = scratch.hold(
+            gpu.alloc_tensor(&[n * h], DType::F32)
+                .map_err(ehip("alloc ln1"))?,
+        );
+        gpu.layernorm_batched(
+            scratch.t(x)?,
+            &lw.norm1_w,
+            &lw.norm1_b,
+            scratch.t(tmp)?,
+            n,
+            h,
+            eps,
+        )
+        .map_err(ehip("ln1"))?;
+        let qkv = scratch.hold(linear_f16(
+            gpu,
+            &lw.qkv_w,
+            scratch.t(tmp)?,
+            Some(&lw.qkv_b),
+            3 * h,
+            h,
+            n,
+        )?);
+        scratch.release(gpu, tmp)?;
 
-        let attn_out = gpu.alloc_tensor(&[n * h], DType::F32).map_err(ehip("alloc attn"))?;
-        gpu.vit_attention_f32(&qkv, &attn_out, n, h, heads, head_dim)
+        let attn_out = scratch.hold(
+            gpu.alloc_tensor(&[n * h], DType::F32)
+                .map_err(ehip("alloc attn"))?,
+        );
+        gpu.vit_attention_f32(scratch.t(qkv)?, scratch.t(attn_out)?, n, h, heads, head_dim)
             .map_err(ehip("vit_attention"))?;
-        gpu.free_tensor(qkv).map_err(ehip("free qkv"))?;
+        scratch.release(gpu, qkv)?;
 
-        let proj = linear_f16(gpu, &lw.proj_w, &attn_out, Some(&lw.proj_b), h, h, n)
-            .map_err(ehip("attn proj"))?;
-        gpu.free_tensor(attn_out).map_err(ehip("free attn"))?;
-        gpu.add_inplace_f32(&x, &proj).map_err(ehip("resid1"))?;
-        gpu.free_tensor(proj).map_err(ehip("free proj"))?;
+        let proj = scratch.hold(linear_f16(
+            gpu,
+            &lw.proj_w,
+            scratch.t(attn_out)?,
+            Some(&lw.proj_b),
+            h,
+            h,
+            n,
+        )?);
+        scratch.release(gpu, attn_out)?;
+        gpu.add_inplace_f32(scratch.t(x)?, scratch.t(proj)?)
+            .map_err(ehip("resid1"))?;
+        scratch.release(gpu, proj)?;
 
-        let tmp2 = gpu.alloc_tensor(&[n * h], DType::F32).map_err(ehip("alloc ln2"))?;
-        gpu.layernorm_batched(&x, &lw.norm2_w, &lw.norm2_b, &tmp2, n, h, eps)
-            .map_err(ehip("ln2"))?;
-        let fc1 = linear_f16(gpu, &lw.fc1_w, &tmp2, Some(&lw.fc1_b), cfg.mlp_dim, h, n)
-            .map_err(ehip("fc1"))?;
-        gpu.free_tensor(tmp2).map_err(ehip("free ln2"))?;
-        gpu.gelu_tanh_f32(&fc1, &fc1, n * cfg.mlp_dim).map_err(ehip("gelu(tanh)"))?;
-        let fc2 = linear_f16(gpu, &lw.fc2_w, &fc1, Some(&lw.fc2_b), h, cfg.mlp_dim, n)
-            .map_err(ehip("fc2"))?;
-        gpu.free_tensor(fc1).map_err(ehip("free fc1"))?;
-        gpu.add_inplace_f32(&x, &fc2).map_err(ehip("resid2"))?;
-        gpu.free_tensor(fc2).map_err(ehip("free fc2"))?;
+        let tmp2 = scratch.hold(
+            gpu.alloc_tensor(&[n * h], DType::F32)
+                .map_err(ehip("alloc ln2"))?,
+        );
+        gpu.layernorm_batched(
+            scratch.t(x)?,
+            &lw.norm2_w,
+            &lw.norm2_b,
+            scratch.t(tmp2)?,
+            n,
+            h,
+            eps,
+        )
+        .map_err(ehip("ln2"))?;
+        let fc1 = scratch.hold(linear_f16(
+            gpu,
+            &lw.fc1_w,
+            scratch.t(tmp2)?,
+            Some(&lw.fc1_b),
+            cfg.mlp_dim,
+            h,
+            n,
+        )?);
+        scratch.release(gpu, tmp2)?;
+        gpu.gelu_tanh_f32(scratch.t(fc1)?, scratch.t(fc1)?, n * cfg.mlp_dim)
+            .map_err(ehip("gelu(tanh)"))?;
+        let fc2 = scratch.hold(linear_f16(
+            gpu,
+            &lw.fc2_w,
+            scratch.t(fc1)?,
+            Some(&lw.fc2_b),
+            h,
+            cfg.mlp_dim,
+            n,
+        )?);
+        scratch.release(gpu, fc1)?;
+        gpu.add_inplace_f32(scratch.t(x)?, scratch.t(fc2)?)
+            .map_err(ehip("resid2"))?;
+        scratch.release(gpu, fc2)?;
     }
 
     // post_layernorm (final LN — no pooling head)
-    let normed = gpu.alloc_tensor(&[n * h], DType::F32).map_err(ehip("alloc post-ln"))?;
-    gpu.layernorm_batched(&x, &weights.post_ln_w, &weights.post_ln_b, &normed, n, h, eps)
-        .map_err(ehip("post-ln"))?;
-    gpu.free_tensor(x).map_err(ehip("free tower out"))?;
+    let normed = scratch.hold(
+        gpu.alloc_tensor(&[n * h], DType::F32)
+            .map_err(ehip("alloc post-ln"))?,
+    );
+    gpu.layernorm_batched(
+        scratch.t(x)?,
+        &weights.post_ln_w,
+        &weights.post_ln_b,
+        scratch.t(normed)?,
+        n,
+        h,
+        eps,
+    )
+    .map_err(ehip("post-ln"))?;
+    scratch.release(gpu, x)?;
 
     // download for CPU rearranges (small buffers)
-    let feats = gpu.download_f32(&normed).map_err(ehip("download tower"))?;
-    gpu.free_tensor(normed).map_err(ehip("free post-ln"))?;
-    gpu.hip.device_synchronize().map_err(ehip("post-tower sync"))?;
+    let feats = gpu
+        .download_f32(scratch.t(normed)?)
+        .map_err(ehip("download tower"))?;
+    scratch.release(gpu, normed)?;
+    gpu.hip
+        .device_synchronize()
+        .map_err(ehip("post-tower sync"))?;
 
-    // 2×2 pixel-unshuffle merge → [tok, 4608]
+    // 2×2 pixel-unshuffle merge → [tok, h*ds*ds]
     let ds = cfg.downsample_factor;
+    if ds == 0 || sub.gh(cfg) % ds != 0 || sub.gw(cfg) % ds != 0 {
+        return Err(format!(
+            "lfm2-vl vision: grid {}×{} not divisible by downsample_factor={ds}",
+            sub.gh(cfg),
+            sub.gw(cfg)
+        ));
+    }
     let merged = pixel_unshuffle_tokens(&feats, sub.gh(cfg), sub.gw(cfg), h, ds);
-    let tok = merged.len() / (h * ds * ds);
+    let tok = merged.len() / (h * ds * ds).max(1);
+    if tok == 0 || merged.len() != tok * h * ds * ds {
+        return Err(format!(
+            "lfm2-vl vision: unshuffle produced {} floats for hidden={h} ds={ds}",
+            merged.len()
+        ));
+    }
 
     // projector linear_1 → erf-GELU (host, exact) → linear_2
-    let m1_in = gpu.upload_f32(&merged, &[merged.len()]).map_err(ehip("upload merged"))?;
-    let mid_gpu = linear_f16(
+    let m1_in = scratch.hold(
+        gpu.upload_f32(&merged, &[merged.len()])
+            .map_err(ehip("upload merged"))?,
+    );
+    let mid_gpu = scratch.hold(linear_f16(
         gpu,
         &weights.proj1_w,
-        &m1_in,
+        scratch.t(m1_in)?,
         Some(&weights.proj1_b),
         cfg.projector_hidden_size,
         h * ds * ds,
         tok,
-    )
-    .map_err(ehip("proj1"))?;
-    gpu.free_tensor(m1_in).ok();
-    let mut mid = gpu.download_f32(&mid_gpu).map_err(ehip("download proj1"))?;
-    gpu.free_tensor(mid_gpu).ok();
+    )?);
+    scratch.release(gpu, m1_in)?;
+    let mut mid = gpu
+        .download_f32(scratch.t(mid_gpu)?)
+        .map_err(ehip("download proj1"))?;
+    scratch.release(gpu, mid_gpu)?;
     gelu_exact_inplace(&mut mid);
-    let act = gpu.upload_f32(&mid, &[mid.len()]).map_err(ehip("re-upload act"))?;
+    let act = scratch.hold(
+        gpu.upload_f32(&mid, &[mid.len()])
+            .map_err(ehip("re-upload act"))?,
+    );
 
-    let y = linear_f16(gpu, &weights.proj2_w, &act, Some(&weights.proj2_b), cfg.out_hidden_size, cfg.projector_hidden_size, tok)
-        .map_err(ehip("proj2"))?;
-    gpu.free_tensor(act).ok();
-    let result = gpu.download_f32(&y).map_err(ehip("download proj2"))?;
-    gpu.free_tensor(y).ok();
-    debug_assert_eq!(result.len(), tok * cfg.out_hidden_size);
+    let y = scratch.hold(linear_f16(
+        gpu,
+        &weights.proj2_w,
+        scratch.t(act)?,
+        Some(&weights.proj2_b),
+        cfg.out_hidden_size,
+        cfg.projector_hidden_size,
+        tok,
+    )?);
+    scratch.release(gpu, act)?;
+    let result = gpu
+        .download_f32(scratch.t(y)?)
+        .map_err(ehip("download proj2"))?;
+    scratch.release(gpu, y)?;
+    if result.len() != tok * cfg.out_hidden_size {
+        return Err(format!(
+            "lfm2-vl vision: projector produced {} floats for {tok} tokens × {} dims",
+            result.len(),
+            cfg.out_hidden_size
+        ));
+    }
     Ok(result)
 }
 
@@ -668,5 +1249,135 @@ mod tests {
         assert!(v[0].abs() < 1e-6);
         assert!((v[1] - 0.841_344_7).abs() < 1e-5); // Φ(1)=0.841344…
         assert!((v[2] + 0.158_655_2).abs() < 1e-5); // 1−Φ(1), negative input
+    }
+
+    fn tiny_cfg() -> VisionConfig {
+        VisionConfig {
+            hidden_size: 2,
+            num_heads: 1,
+            head_dim: 2,
+            num_layers: 1,
+            mlp_dim: 4,
+            patch_size: 2,
+            num_channels: 1,
+            num_position_embeddings: 4,
+            projector_hidden_size: 4,
+            out_hidden_size: 4,
+            downsample_factor: 2,
+            ..VisionConfig::default()
+        }
+    }
+
+    #[test]
+    fn validate_dense_accepts_f16_and_f32_exact_layout() {
+        assert_eq!(validate_dense("w", QT_F16, &[2, 2], 8, &[2, 2]).unwrap(), 4);
+        assert_eq!(validate_dense("w", QT_F32, &[2, 2], 16, &[2, 2]).unwrap(), 4);
+        assert_eq!(validate_dense("b", QT_F16, &[3], 6, &[3]).unwrap(), 3);
+    }
+
+    #[test]
+    fn validate_dense_rejects_rank_dim_bytes_dtype() {
+        let rank = validate_dense("t", QT_F16, &[2], 8, &[2, 2]).unwrap_err();
+        assert!(rank.contains("t:"), "{rank}");
+        assert!(rank.contains("rank"), "{rank}");
+
+        let dim = validate_dense("t", QT_F16, &[3, 2], 12, &[2, 2]).unwrap_err();
+        assert!(dim.contains("dim[0]=3"), "{dim}");
+
+        let bytes = validate_dense("t", QT_F16, &[2, 2], 7, &[2, 2]).unwrap_err();
+        assert!(bytes.contains("7 bytes"), "{bytes}");
+
+        let qt = validate_dense("t", 6, &[2, 2], 8, &[2, 2]).unwrap_err();
+        assert!(qt.contains("quant_type=6"), "{qt}");
+    }
+
+    #[test]
+    fn qkv_f32_narrows_to_same_f16_bytes() {
+        let hidden = 2;
+        let f32s = [1.0f32, -2.0, 0.5, 3.0];
+        let f32_bytes: Vec<u8> = f32s.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let f16_bytes: Vec<u8> = f32s
+            .iter()
+            .flat_map(|&v| f32_to_f16(v).to_le_bytes())
+            .collect();
+        let mut from_f32 = Vec::new();
+        append_f16_weight(&mut from_f32, "q", QT_F32, &[2, 2], &f32_bytes, &[hidden, hidden])
+            .unwrap();
+        let mut from_f16 = Vec::new();
+        append_f16_weight(&mut from_f16, "q", QT_F16, &[2, 2], &f16_bytes, &[hidden, hidden])
+            .unwrap();
+        assert_eq!(from_f32, from_f16);
+        assert_eq!(from_f32.len(), 8);
+    }
+
+    #[test]
+    fn concat_qkv_weight_path_rejects_f16_assert_equivalent() {
+        // Previously concat_qkv asserted quant_type==1. F32 must be a Result.
+        let mut dst = Vec::new();
+        let err = append_f16_weight(&mut dst, "q_proj.weight", 3, &[2, 2], &[0u8; 8], &[2, 2])
+            .unwrap_err();
+        assert!(err.contains("q_proj.weight"), "{err}");
+        assert!(err.contains("quant_type=3"), "{err}");
+        assert!(dst.is_empty());
+    }
+
+    #[test]
+    fn patch_linear_and_conv_match_config_and_fold() {
+        let cfg = tiny_cfg();
+        let name = "patch";
+        // Linear [2, 4] = hidden × (ps²·C)
+        let lin: Vec<f32> = (0..8).map(|i| i as f32).collect();
+        let lin_bytes: Vec<u8> = lin.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let (rows, out, inn) =
+            patch_weight_rows_from(name, QT_F32, &[2, 4], &lin_bytes, &cfg).unwrap();
+        assert_eq!((out, inn), (2, 4));
+        assert_eq!(rows, lin);
+
+        // Conv [2, 1, 2, 2] — same 8 elems, reorder (c, dy, dx) → (dy, dx, c).
+        // For C=1 the fold is identity.
+        let (folded, out2, inn2) =
+            patch_weight_rows_from(name, QT_F32, &[2, 1, 2, 2], &lin_bytes, &cfg).unwrap();
+        assert_eq!((out2, inn2), (2, 4));
+        assert_eq!(folded, lin);
+
+        let bad_rank = patch_weight_rows_from(name, QT_F32, &[2, 4, 1], &lin_bytes, &cfg).unwrap_err();
+        assert!(bad_rank.contains("rank 3"), "{bad_rank}");
+
+        let bad_in = patch_weight_rows_from(name, QT_F32, &[2, 3], &lin_bytes, &cfg).unwrap_err();
+        assert!(bad_in.contains("dim[1]"), "{bad_in}");
+    }
+
+    #[test]
+    fn conv_patch_fold_reorders_channel_major_kernel() {
+        // out=1, C=2, kh=kw=1 → in_dim=2. Conv store is [C, kh, kw] per out row.
+        let cfg = VisionConfig {
+            hidden_size: 1,
+            patch_size: 1,
+            num_channels: 2,
+            ..tiny_cfg()
+        };
+        // conv[0, c, 0, 0] = c+1 → raw [1, 2]
+        let raw = [1.0f32, 2.0];
+        let bytes: Vec<u8> = raw.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let (folded, out, inn) =
+            patch_weight_rows_from("pe", QT_F32, &[1, 2, 1, 1], &bytes, &cfg).unwrap();
+        assert_eq!((out, inn), (1, 2));
+        assert_eq!(folded, vec![1.0, 2.0]);
+
+        // 2×2 kernel, C=2, out=1. raw layout c-major: for each c, dy, dx.
+        let cfg2 = VisionConfig {
+            hidden_size: 1,
+            patch_size: 2,
+            num_channels: 2,
+            ..tiny_cfg()
+        };
+        // c=0: [10, 11, 12, 13] (dy,dx), c=1: [20, 21, 22, 23]
+        let raw2: Vec<f32> = vec![10., 11., 12., 13., 20., 21., 22., 23.];
+        let bytes2: Vec<u8> = raw2.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let (folded2, _, inn2) =
+            patch_weight_rows_from("pe", QT_F32, &[1, 2, 2, 2], &bytes2, &cfg2).unwrap();
+        assert_eq!(inn2, 8);
+        // folded (dy, dx, c): (0,0)=[10,20], (0,1)=[11,21], (1,0)=[12,22], (1,1)=[13,23]
+        assert_eq!(folded2, vec![10., 20., 11., 21., 12., 22., 13., 23.]);
     }
 }
