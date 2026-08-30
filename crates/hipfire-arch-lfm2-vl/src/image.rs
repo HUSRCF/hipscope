@@ -14,8 +14,9 @@
 //! Differences vs `hipfire-arch-qwen35-vl::image` (do NOT unify):
 //! round-to-factor uses Python semantics (`round()` = banker's rounding),
 //! factor is 32 (= patch 16 × downsample 2), large images split into a
-//! tile grid + thumbnail, normalization is IMAGENET_STANDARD, and patch
-//! vectors flatten as `(dy, dx, channel)`.
+//! tile grid + thumbnail, normalization/resample come from processor
+//! metadata (LFM2.5-VL-3B: mean/std 0.5, Pillow resample 3 = bicubic),
+//! and patch vectors flatten as `(dy, dx, channel)`.
 
 use crate::config::VisionConfig;
 use std::path::Path;
@@ -26,9 +27,6 @@ use std::path::Path;
 /// downstream of this anyway via smart_resize shrinking to ≤262144 px.
 const MAX_DIMENSION_PIXELS: usize = 16_777_216;
 
-// IMAGENET_STANDARD mean/std (HF image_utils), channel order R,G,B.
-const MEAN: [f32; 3] = [0.485, 0.456, 0.406];
-const STD: [f32; 3] = [0.229, 0.224, 0.225];
 
 #[derive(Debug, Clone)]
 pub struct SubImage {
@@ -192,11 +190,28 @@ fn target_ratios(min_tiles: usize, max_tiles: usize) -> Vec<(usize, usize)> {
     ratios
 }
 
-fn resize_chw(img: &image::DynamicImage, new_w: usize, new_h: usize) -> Vec<f32> {
-    // PIL bilinear ≈ image crate Triangle filter (same approximation class
-    // the qwen35-vl preprocessing validated against HF references).
+fn resize_filter(resample: u32) -> Result<image::imageops::FilterType, String> {
+    // Pillow / HF Image.Resampling: 2 = BILINEAR, 3 = BICUBIC.
+    // `CatmullRom` is the `image` crate's bicubic (same mapping qwen35-vl
+    // uses for HF `resample=3`).
+    match resample {
+        2 => Ok(image::imageops::FilterType::Triangle),
+        3 => Ok(image::imageops::FilterType::CatmullRom),
+        other => Err(format!(
+            "unsupported processor resample={other} (Pillow/HF); supported: 2 (bilinear), 3 (bicubic)"
+        )),
+    }
+}
+
+fn resize_chw(
+    img: &image::DynamicImage,
+    new_w: usize,
+    new_h: usize,
+    cfg: &VisionConfig,
+    filter: image::imageops::FilterType,
+) -> Vec<f32> {
     let resized = img
-        .resize_exact(new_w as u32, new_h as u32, image::imageops::FilterType::Triangle)
+        .resize_exact(new_w as u32, new_h as u32, filter)
         .to_rgb8();
     let mut chw = vec![0.0f32; 3 * new_h * new_w];
     let plane = new_h * new_w;
@@ -206,25 +221,49 @@ fn resize_chw(img: &image::DynamicImage, new_w: usize, new_h: usize) -> Vec<f32>
             let idx = y * new_w + x;
             for (c, ch) in p.0.iter().take(3).enumerate() {
                 let v = *ch as f32 / 255.0;
-                chw[c * plane + idx] = (v - MEAN[c]) / STD[c];
+                chw[c * plane + idx] = (v - cfg.image_mean[c]) / cfg.image_std[c];
             }
         }
     }
     chw
 }
 
-fn sub_from_dynamic(img: image::DynamicImage, new_h: usize, new_w: usize) -> SubImage {
-    SubImage { pixels: resize_chw(&img, new_w, new_h), h: new_h, w: new_w }
+fn sub_from_dynamic(
+    img: image::DynamicImage,
+    new_h: usize,
+    new_w: usize,
+    cfg: &VisionConfig,
+    filter: image::imageops::FilterType,
+) -> SubImage {
+    SubImage {
+        pixels: resize_chw(&img, new_w, new_h, cfg, filter),
+        h: new_h,
+        w: new_w,
+    }
+}
+
+fn reject_if_too_large(ow: u32, oh: u32) -> Result<(), String> {
+    let pixels = (ow as usize)
+        .checked_mul(oh as usize)
+        .unwrap_or(usize::MAX);
+    if pixels > MAX_DIMENSION_PIXELS {
+        Err(format!(
+            "image dimensions ({ow}x{oh}) exceed maximum ({MAX_DIMENSION_PIXELS} pixels)"
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 fn preprocess(img: image::DynamicImage, cfg: &VisionConfig) -> Result<Prepared, String> {
     let (orig_w, orig_h) = (img.width() as usize, img.height() as usize);
-    if orig_w.checked_mul(orig_h).unwrap_or(u64::MAX as usize) > MAX_DIMENSION_PIXELS {
+    if orig_w.checked_mul(orig_h).unwrap_or(usize::MAX) > MAX_DIMENSION_PIXELS {
         return Err(format!(
             "image dimensions ({orig_w}x{orig_h}) exceed maximum ({MAX_DIMENSION_PIXELS} pixels)"
         ));
     }
 
+    let filter = resize_filter(cfg.resample)?;
     let total_factor = cfg.patch_size * cfg.downsample_factor;
     let (new_h, new_w) = smart_resize(
         orig_h,
@@ -247,22 +286,22 @@ fn preprocess(img: image::DynamicImage, cfg: &VisionConfig) -> Result<Prepared, 
         let big = img.resize_exact(
             (cfg.tile_size * gc) as u32,
             (cfg.tile_size * gr) as u32,
-            image::imageops::FilterType::Triangle,
+            filter,
         );
         let tw = cfg.tile_size;
         for ry in 0..gr {
             for rx in 0..gc {
                 let tile = image::DynamicImage::from(big.crop_imm((rx * tw) as u32, (ry * tw) as u32, tw as u32, tw as u32));
-                sub_images.push(sub_from_dynamic(tile, tw, tw));
+                sub_images.push(sub_from_dynamic(tile, tw, tw, cfg, filter));
             }
         }
         if cfg.use_thumbnail && !(gc == 1 && gr == 1) {
-            sub_images.push(sub_from_dynamic(img.clone(), new_h, new_w));
+            sub_images.push(sub_from_dynamic(img.clone(), new_h, new_w, cfg, filter));
         }
         grid_cols = gc;
         grid_rows = gr;
     } else {
-        sub_images.push(sub_from_dynamic(img, new_h, new_w));
+        sub_images.push(sub_from_dynamic(img, new_h, new_w, cfg, filter));
         grid_cols = 1;
         grid_rows = 1;
     }
@@ -271,7 +310,17 @@ fn preprocess(img: image::DynamicImage, cfg: &VisionConfig) -> Result<Prepared, 
 }
 
 /// Load + preprocess an image from a filesystem path.
+///
+/// Reads dimensions from the format header BEFORE decoding pixels so a
+/// decompression-bomb image is rejected before allocation — same contract
+/// as [`load_and_preprocess_from_bytes`].
 pub fn load_and_preprocess(path: &Path, cfg: &VisionConfig) -> Result<Prepared, String> {
+    let reader = image::ImageReader::open(path)
+        .map_err(|e| format!("failed to open image {}: {e}", path.display()))?
+        .with_guessed_format()
+        .map_err(|e| format!("failed to read image {}: {e}", path.display()))?;
+    let (ow, oh) = reader.into_dimensions().map_err(map_image_err)?;
+    reject_if_too_large(ow, oh)?;
     let img =
         image::open(path).map_err(|e| format!("failed to open image {}: {e}", path.display()))?;
     preprocess(img, cfg)
@@ -283,11 +332,7 @@ pub fn load_and_preprocess_from_bytes(data: &[u8], cfg: &VisionConfig) -> Result
         .with_guessed_format()
         .map_err(|e| format!("failed to read image: {e}"))?;
     let (ow, oh) = reader.into_dimensions().map_err(map_image_err)?;
-    if ow as usize * oh as usize > MAX_DIMENSION_PIXELS {
-        return Err(format!(
-            "image dimensions ({ow}x{oh}) exceed maximum ({MAX_DIMENSION_PIXELS} pixels)"
-        ));
-    }
+    reject_if_too_large(ow, oh)?;
     let img = image::load_from_memory(data).map_err(map_image_err)?;
     preprocess(img, cfg)
 }
@@ -377,5 +422,135 @@ mod tests {
         assert_eq!(p[(1 * ps * ps + 1 * ps + 0) * 3 + 0], 116.0);
         // patch 0, dy=0,dx=1,c=2 → y=0,x=1 → 20000+0+1
         assert_eq!(p[(0 * ps * ps + 0 * ps + 1) * 3 + 2], 20_001.0);
+    }
+
+    fn tiny_cfg() -> VisionConfig {
+        // Stay at native size for 32×32 / 64×64 fixtures (factor 32).
+        let mut c = VisionConfig::default();
+        c.min_image_tokens = 1;
+        c.max_image_tokens = 65_536;
+        c.do_image_splitting = false;
+        c
+    }
+
+    fn solid_png(r: u8, g: u8, b: u8, w: u32, h: u32) -> Vec<u8> {
+        let img = image::ImageBuffer::from_pixel(w, h, image::Rgb([r, g, b]));
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png)
+            .unwrap();
+        bytes
+    }
+
+    /// 1×1 PNG with IHDR patched to `width`×`height` so `into_dimensions`
+    /// sees the claimed size without allocating a pixel buffer.
+    fn png_claimed_dims(width: u32, height: u32) -> Vec<u8> {
+        fn crc32(data: &[u8]) -> u32 {
+            let mut crc = 0xFFFFFFFFu32;
+            for &b in data {
+                crc ^= u32::from(b);
+                for _ in 0..8 {
+                    crc = if crc & 1 != 0 {
+                        (crc >> 1) ^ 0xEDB88320
+                    } else {
+                        crc >> 1
+                    };
+                }
+            }
+            !crc
+        }
+        let mut bytes = solid_png(0, 0, 0, 1, 1);
+        assert_eq!(&bytes[12..16], b"IHDR");
+        bytes[16..20].copy_from_slice(&width.to_be_bytes());
+        bytes[20..24].copy_from_slice(&height.to_be_bytes());
+        let crc = crc32(&bytes[12..29]);
+        bytes[29..33].copy_from_slice(&crc.to_be_bytes());
+        bytes
+    }
+
+    #[test]
+    fn resample_3_is_bicubic_not_bilinear() {
+        assert_eq!(
+            resize_filter(3).unwrap(),
+            image::imageops::FilterType::CatmullRom
+        );
+        assert_eq!(
+            resize_filter(2).unwrap(),
+            image::imageops::FilterType::Triangle
+        );
+        let err = resize_filter(1).unwrap_err();
+        assert!(err.contains("resample=1"), "{err}");
+    }
+
+    #[test]
+    fn checkpoint_metadata_uses_half_normalization() {
+        let cfg = tiny_cfg();
+        assert_eq!(cfg.image_mean, [0.5, 0.5, 0.5]);
+        assert_eq!(cfg.image_std, [0.5, 0.5, 0.5]);
+        assert_eq!(cfg.resample, 3);
+        // 64×64 is already a multiple of 32, so no resize; a red pixel
+        // becomes (1-0.5)/0.5 = 1, green/blue (0-0.5)/0.5 = -1.
+        let bytes = solid_png(255, 0, 0, 64, 64);
+        let prep = load_and_preprocess_from_bytes(&bytes, &cfg).unwrap();
+        assert_eq!(prep.sub_images.len(), 1);
+        let p = &prep.sub_images[0].pixels;
+        let plane = 64 * 64;
+        assert!((p[0] - 1.0).abs() < 1e-5, "R got {}", p[0]);
+        assert!((p[plane] + 1.0).abs() < 1e-5, "G got {}", p[plane]);
+        assert!((p[2 * plane] + 1.0).abs() < 1e-5, "B got {}", p[2 * plane]);
+    }
+
+    #[test]
+    fn bicubic_and_bilinear_diverge_on_a_point_source() {
+        let mut bicubic = tiny_cfg();
+        bicubic.resample = 3;
+        let mut bilinear = tiny_cfg();
+        bilinear.resample = 2;
+        bicubic.min_image_tokens = 64; // 65536 px → 256×256
+        bilinear.min_image_tokens = 64;
+        let mut img = image::ImageBuffer::from_pixel(32, 32, image::Rgb([0u8, 0, 0]));
+        img.put_pixel(16, 16, image::Rgb([255, 255, 255]));
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png)
+            .unwrap();
+        let a = load_and_preprocess_from_bytes(&bytes, &bicubic).unwrap();
+        let b = load_and_preprocess_from_bytes(&bytes, &bilinear).unwrap();
+        assert_ne!(
+            a.sub_images[0].pixels, b.sub_images[0].pixels,
+            "CatmullRom (resample=3) must not match Triangle (resample=2)"
+        );
+    }
+
+    #[test]
+    fn path_rejects_header_bomb_before_decode() {
+        // 1×1 IDAT with IHDR patched to 50000×50000. Decode would allocate
+        // multi-GB; header inspect must fail first with the dimension error.
+        let bytes = png_claimed_dims(50_000, 50_000);
+        let dir = std::env::temp_dir().join(format!(
+            "hipfire-lfm2-bomb-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bomb.png");
+        std::fs::write(&path, &bytes).unwrap();
+        let err = match load_and_preprocess(&path, &tiny_cfg()) {
+            Err(e) => e,
+            Ok(_) => panic!("expected header dimension error, got Ok"),
+        };
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            err.contains("exceed maximum") && err.contains("50000x50000"),
+            "expected header dimension error, got {err}"
+        );
+        let err_b = match load_and_preprocess_from_bytes(&bytes, &tiny_cfg()) {
+            Err(e) => e,
+            Ok(_) => panic!("expected header dimension error, got Ok"),
+        };
+        assert!(err_b.contains("exceed maximum"), "{err_b}");
     }
 }

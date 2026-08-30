@@ -8,10 +8,13 @@
 //! The quantizer embeds the source `config.json` verbatim under
 //! `metadata.config` (nested `text_config` included — see the arch-11
 //! runtime's `text_config` flatten) and additively merges the processor
-//! pixel-budget keys into `metadata.config.vision_config`. Tower params
-//! come from that `vision_config` object; projector and splitting params
-//! are top-level checkpoint keys with pinned defaults from
-//! LiquidAI/LFM2.5-VL-3B when absent.
+//! pixel-budget keys plus `image_mean` / `image_std` / `resample` into
+//! `metadata.config.vision_config`. Tower params come from that
+//! `vision_config` object; projector and splitting params are top-level
+//! checkpoint keys with pinned defaults from LiquidAI/LFM2.5-VL-3B when
+//! absent. Processor mean/std/resample default to that checkpoint's
+//! `processor_config.json` (`image_processor`) only when the keys are
+//! missing; present values are parsed and rejected if malformed.
 
 use hipfire_runtime::hfq::HfqFile;
 
@@ -44,6 +47,17 @@ pub struct VisionConfig {
     pub min_image_tokens: usize,
     pub max_image_tokens: usize,
     pub max_pixels_tolerance: f32,
+
+    // ── processor pixel contract (HF `processor_config.json`) ────────────
+    /// Per-channel mean after rescale-to-[0,1]. Checkpoint pin is SigLIP2
+    /// `[0.5, 0.5, 0.5]`, not IMAGENET_STANDARD.
+    pub image_mean: [f32; 3],
+    /// Per-channel std after rescale-to-[0,1]. Checkpoint pin `[0.5, 0.5, 0.5]`.
+    pub image_std: [f32; 3],
+    /// Pillow / HF `resample` code. `3` = bicubic (`FilterType::CatmullRom`);
+    /// `2` = bilinear (`FilterType::Triangle`). Other values are rejected
+    /// at parse time.
+    pub resample: u32,
 }
 
 impl VisionConfig {
@@ -66,7 +80,8 @@ impl VisionConfig {
 
 impl Default for VisionConfig {
     fn default() -> Self {
-        // Pinned from LiquidAI/LFM2.5-VL-3B config.json (2026-08-27 fetch).
+        // Pinned from LiquidAI/LFM2.5-VL-3B config.json + processor_config.json
+        // (2026-08-27 fetch; processor re-verified 2026-08-30).
         let (hidden_size, num_heads) = (1152, 16);
         Self {
             hidden_size,
@@ -89,18 +104,44 @@ impl Default for VisionConfig {
             min_image_tokens: 64,
             max_image_tokens: 256,
             max_pixels_tolerance: 2.0,
+            image_mean: [0.5, 0.5, 0.5],
+            image_std: [0.5, 0.5, 0.5],
+            resample: 3,
         }
     }
 }
 
 /// Parse the vision config from HFQ metadata. Returns `None` when the
-/// artifact carries no vision config at all (plain text model).
+/// artifact carries no vision config at all (plain text model). Malformed
+/// processor mean/std/resample values are refused (None after logging) so a
+/// tower-bearing artifact fails closed at the existing loader match rather
+/// than silently applying the wrong normalization.
 pub fn vision_config_from_hfq(hfq: &HfqFile) -> Option<VisionConfig> {
-    let meta: serde_json::Value = serde_json::from_str(&hfq.metadata_json).ok()?;
-    let config = meta.get("config")?;
+    match vision_config_from_metadata_json(&hfq.metadata_json) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("lfm2-vl: refusing vision_config: {e}");
+            None
+        }
+    }
+}
+
+/// Parse HFQ `metadata_json` into a vision config. `Ok(None)` = no vision
+/// object (text-only). `Err` = vision object present but processor fields
+/// are malformed / unsupported.
+fn vision_config_from_metadata_json(json: &str) -> Result<Option<VisionConfig>, String> {
+    let meta: serde_json::Value = match serde_json::from_str(json) {
+        Ok(v) => v,
+        Err(_) => return Ok(None),
+    };
+    let Some(config) = meta.get("config") else {
+        return Ok(None);
+    };
     // Text-only lfm2 checkpoints have a `config` but no vision_config object
     // AND no tower-budget keys at any level — treat as "no vision".
-    let vc = config.get("vision_config")?;
+    let Some(vc) = config.get("vision_config") else {
+        return Ok(None);
+    };
 
     let mut c = VisionConfig::default();
 
@@ -129,6 +170,9 @@ pub fn vision_config_from_hfq(hfq: &HfqFile) -> Option<VisionConfig> {
     fn pick_f64(vc: &serde_json::Value, cfg: &serde_json::Value, key: &str) -> Option<f64> {
         vc.get(key).and_then(|v| v.as_f64()).or_else(|| cfg.get(key).and_then(|v| v.as_f64()))
     }
+    fn pick<'a>(vc: &'a serde_json::Value, cfg: &'a serde_json::Value, key: &str) -> Option<&'a serde_json::Value> {
+        vc.get(key).or_else(|| cfg.get(key))
+    }
 
     c.downsample_factor = pick_u64(vc, config, "downsample_factor").unwrap_or(c.downsample_factor as u64) as usize;
     c.projector_hidden_size = pick_u64(vc, config, "projector_hidden_size")
@@ -152,7 +196,57 @@ pub fn vision_config_from_hfq(hfq: &HfqFile) -> Option<VisionConfig> {
     c.max_pixels_tolerance =
         pick_f64(vc, config, "max_pixels_tolerance").map(|v| v as f32).unwrap_or(c.max_pixels_tolerance);
 
-    Some(c)
+    if let Some(v) = pick(vc, config, "image_mean") {
+        c.image_mean = parse_rgb3(v, "image_mean")?;
+    }
+    if let Some(v) = pick(vc, config, "image_std") {
+        c.image_std = parse_rgb3(v, "image_std")?;
+    }
+    if let Some(v) = pick(vc, config, "resample") {
+        c.resample = parse_resample(v)?;
+    }
+
+    Ok(Some(c))
+}
+
+fn parse_rgb3(v: &serde_json::Value, key: &str) -> Result<[f32; 3], String> {
+    let arr = v.as_array().ok_or_else(|| {
+        format!("processor {key} must be an array of 3 finite floats, got {v}")
+    })?;
+    if arr.len() != 3 {
+        return Err(format!(
+            "processor {key} length {} is invalid; expected 3 channels",
+            arr.len()
+        ));
+    }
+    let mut out = [0.0f32; 3];
+    for (i, item) in arr.iter().enumerate() {
+        let x = item.as_f64().ok_or_else(|| {
+            format!("processor {key}[{i}] is not a finite number: {item}")
+        })?;
+        if !x.is_finite() {
+            return Err(format!("processor {key}[{i}] is non-finite ({x})"));
+        }
+        out[i] = x as f32;
+    }
+    Ok(out)
+}
+
+fn parse_resample(v: &serde_json::Value) -> Result<u32, String> {
+    let n = v
+        .as_u64()
+        .or_else(|| {
+            v.as_f64()
+                .filter(|x| x.is_finite() && *x >= 0.0 && x.fract() == 0.0)
+                .map(|x| x as u64)
+        })
+        .ok_or_else(|| format!("processor resample must be an integer, got {v}"))?;
+    match n {
+        2 | 3 => Ok(n as u32),
+        other => Err(format!(
+            "unsupported processor resample={other} (Pillow/HF); supported: 2 (bilinear), 3 (bicubic)"
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -170,5 +264,87 @@ mod tests {
         assert_eq!(c.tokens_per_tile(), 256); // (512/16/2)^2
         assert_eq!(c.tokens_for_grid(32, 32), 256);
         assert_eq!(c.tokens_for_grid(10, 26), 65);
+        assert_eq!(c.image_mean, [0.5, 0.5, 0.5]);
+        assert_eq!(c.image_std, [0.5, 0.5, 0.5]);
+        assert_eq!(c.resample, 3);
+    }
+
+    fn meta_with_vision(vision: serde_json::Value) -> String {
+        serde_json::json!({ "config": { "vision_config": vision } }).to_string()
+    }
+
+    #[test]
+    fn processor_fields_round_trip_from_checkpoint_processor_config() {
+        // Nested `image_processor` keys as the quantizer copies them into
+        // `config.vision_config` (LiquidAI/LFM2.5-VL-3B processor_config.json).
+        let json = meta_with_vision(serde_json::json!({
+            "hidden_size": 1152,
+            "image_mean": [0.5, 0.5, 0.5],
+            "image_std": [0.5, 0.5, 0.5],
+            "resample": 3,
+            "max_image_tokens": 256,
+        }));
+        let c = vision_config_from_metadata_json(&json)
+            .expect("parse")
+            .expect("vision present");
+        assert_eq!(c.image_mean, [0.5, 0.5, 0.5]);
+        assert_eq!(c.image_std, [0.5, 0.5, 0.5]);
+        assert_eq!(c.resample, 3);
+        assert_eq!(c.max_image_tokens, 256);
+    }
+
+    #[test]
+    fn absent_processor_fields_keep_defaults() {
+        let json = meta_with_vision(serde_json::json!({ "hidden_size": 1152 }));
+        let c = vision_config_from_metadata_json(&json)
+            .expect("parse")
+            .expect("vision present");
+        assert_eq!(c.image_mean, [0.5, 0.5, 0.5]);
+        assert_eq!(c.image_std, [0.5, 0.5, 0.5]);
+        assert_eq!(c.resample, 3);
+    }
+
+    #[test]
+    fn present_processor_fields_override_defaults() {
+        let json = meta_with_vision(serde_json::json!({
+            "image_mean": [0.485, 0.456, 0.406],
+            "image_std": [0.229, 0.224, 0.225],
+            "resample": 2,
+        }));
+        let c = vision_config_from_metadata_json(&json)
+            .expect("parse")
+            .expect("vision present");
+        assert!((c.image_mean[0] - 0.485).abs() < 1e-6);
+        assert!((c.image_std[1] - 0.224).abs() < 1e-6);
+        assert_eq!(c.resample, 2);
+    }
+
+    #[test]
+    fn malformed_mean_length_is_rejected() {
+        let json = meta_with_vision(serde_json::json!({ "image_mean": [0.5, 0.5] }));
+        let err = vision_config_from_metadata_json(&json).unwrap_err();
+        assert!(err.contains("image_mean"), "{err}");
+        assert!(err.contains("length 2"), "{err}");
+    }
+
+    #[test]
+    fn malformed_std_non_number_is_rejected() {
+        let json = meta_with_vision(serde_json::json!({ "image_std": [0.5, 0.5, "nan"] }));
+        let err = vision_config_from_metadata_json(&json).unwrap_err();
+        assert!(err.contains("image_std"), "{err}");
+    }
+
+    #[test]
+    fn unsupported_resample_is_rejected() {
+        let json = meta_with_vision(serde_json::json!({ "resample": 1 }));
+        let err = vision_config_from_metadata_json(&json).unwrap_err();
+        assert!(err.contains("resample=1"), "{err}");
+        assert!(err.contains("bicubic"), "{err}");
+    }
+
+    #[test]
+    fn text_only_metadata_is_none() {
+        let json = serde_json::json!({ "config": { "hidden_size": 2048 } }).to_string();
+        assert!(vision_config_from_metadata_json(&json).unwrap().is_none());
     }
 }

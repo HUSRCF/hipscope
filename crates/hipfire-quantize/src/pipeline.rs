@@ -2841,27 +2841,7 @@ pub(crate) fn run() {
         let mut budget = serde_json::Map::new();
         if let Ok(pc) = std::fs::read_to_string(input_dir.join("processor_config.json")) {
             if let Ok(pcv) = serde_json::from_str::<serde_json::Value>(&pc) {
-                // Qwen-family processors put pixel fields at the top level;
-                // LFM2/NaFlex nests them under "image_processor". Whitelist
-                // both schemas' budget-relevant keys.
-                const BUDGET_KEYS: [&str; 9] = [
-                    "min_pixels",
-                    "max_pixels",
-                    "patch_size",
-                    "merge_size",
-                    "encoder_patch_size",
-                    "downsample_factor",
-                    "max_tiles",
-                    "max_image_tokens",
-                    "max_num_patches",
-                ];
-                for scope in [Some(&pcv), pcv.get("image_processor")].into_iter().flatten() {
-                    for key in BUDGET_KEYS {
-                        if let Some(v) = scope.get(key) {
-                            budget.entry(key.to_string()).or_insert(v.clone());
-                        }
-                    }
-                }
+                budget = collect_vl_processor_fields(&pcv);
             }
         }
         if let Ok(mut meta_val) = serde_json::from_str::<serde_json::Value>(&metadata_json) {
@@ -3352,6 +3332,51 @@ fn run_qwen3_dspark(args: &QuantizeArgs) {
     eprintln!("Done: {:.1} MB written", file_size as f64 / 1e6);
 }
 
+/// Copy pixel-budget + LFM2 processor contract keys from a
+/// `processor_config.json` value. Qwen-family processors put fields at the
+/// top level; LFM2/NaFlex nests them under `image_processor`. First-seen
+/// wins so a top-level key is not overwritten by a nested duplicate.
+fn collect_vl_processor_fields(pcv: &serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+    let mut budget = serde_json::Map::new();
+    const BUDGET_KEYS: [&str; 12] = [
+        "min_pixels",
+        "max_pixels",
+        "patch_size",
+        "merge_size",
+        "encoder_patch_size",
+        "downsample_factor",
+        "max_tiles",
+        "max_image_tokens",
+        "max_num_patches",
+        "image_mean",
+        "image_std",
+        "resample",
+    ];
+    for scope in [Some(pcv), pcv.get("image_processor")].into_iter().flatten() {
+        for key in BUDGET_KEYS {
+            if let Some(v) = scope.get(key) {
+                budget.entry(key.to_string()).or_insert(v.clone());
+            }
+        }
+    }
+    budget
+}
+
+/// Names claimed by the LFM2 dense MQ bulk branch.
+///
+/// Proj/FFN matrices stay on the bulk path for mq4-v1 / mq4v2 / mq4c.
+/// `embed_tokens` is admitted only under MQ4G256V2 (`use_mq4v2`); mq4-v1
+/// and mq4c keep the historical Q8 embed so the tensor stays loadable.
+fn lfm2_dense_mq_name_matches(name: &str, use_mq4v2: bool) -> bool {
+    if name.ends_with("embed_tokens.weight") {
+        return use_mq4v2;
+    }
+    name.ends_with("_proj.weight")
+        || name.ends_with(".w1.weight")
+        || name.ends_with(".w2.weight")
+        || name.ends_with(".w3.weight")
+}
+
 fn try_handle_lfm2moe(
     is_lfm2moe: bool,
     use_mq4g256: bool,
@@ -3461,18 +3486,15 @@ fn try_handle_lfm2moe(
         // Dense mq4 (--format mq4): route the big 2D proj/FFN weight matrices
         // (conv in/out_proj, attn q/k/v/out_proj, dense w1/w2/w3) → MQ4G256.
         // The loader's weight_gemv / weight_gemv_residual auto-FWHT-rotate
-        // MQ4G256, so no forward change is needed. Keep the tied embed/lm_head
-        // (model.embed_tokens.weight), the router gate, norms, and the depthwise
-        // conv filter at Q8/F32 (small + precision-sensitive). Default (no mq4
-        // format) keeps the full-precision Q8 bring-up recipe.
+        // MQ4G256, so no forward change is needed. Keep the router gate, norms,
+        // and the depthwise conv filter at Q8/F32 (small + precision-sensitive).
+        // `embed_tokens` is MQ4G256V2-only: mq4-v1 / mq4c must not emit an
+        // unloadable embed (legacy formats stay on the Q8 tail). Default (no
+        // mq4 format) keeps the full-precision Q8 bring-up recipe.
         if (use_mq4g256 || use_mq4v2 || use_mq4c)
             && meta.shape.len() == 2
             && meta.shape[1] % 256 == 0
-            && (name.ends_with("embed_tokens.weight")
-                || name.ends_with("_proj.weight")
-                || name.ends_with(".w1.weight")
-                || name.ends_with(".w2.weight")
-                || name.ends_with(".w3.weight"))
+            && lfm2_dense_mq_name_matches(name, use_mq4v2)
         {
             // Tied lm_head reuses embed_tokens, so routing embed through mq4v2
             // also covers the output head (lfm2_vl sets tie_word_embeddings=true).
@@ -7180,7 +7202,7 @@ pub(crate) fn hfq_requant_to_bq1_example(
 
 #[cfg(test)]
 mod pipeline_tests {
-    use super::moe_expert_3d_applies;
+    use super::{collect_vl_processor_fields, lfm2_dense_mq_name_matches, moe_expert_3d_applies};
 
     /// Regression pin for `d1d172e9c`, which extracted `handle_moe_expert_3d`
     /// and dropped its `shape.len() == 3` precondition at the call site. A 2-D
@@ -7238,5 +7260,56 @@ mod pipeline_tests {
             "model.language_model.layers.0.mlp.experts.gate_up_proj",
             &[256, 1024, 2048],
         ));
+    }
+
+    #[test]
+    fn lfm2_processor_config_copies_mean_std_resample() {
+        let pcv = serde_json::json!({
+            "image_processor": {
+                "image_mean": [0.5, 0.5, 0.5],
+                "image_std": [0.5, 0.5, 0.5],
+                "resample": 3,
+                "max_image_tokens": 256,
+                "downsample_factor": 2,
+            },
+            "processor_class": "Lfm2VlProcessor"
+        });
+        let budget = collect_vl_processor_fields(&pcv);
+        assert_eq!(budget["image_mean"], serde_json::json!([0.5, 0.5, 0.5]));
+        assert_eq!(budget["image_std"], serde_json::json!([0.5, 0.5, 0.5]));
+        assert_eq!(budget["resample"], serde_json::json!(3));
+        assert_eq!(budget["max_image_tokens"], serde_json::json!(256));
+    }
+
+    #[test]
+    fn qwen_top_level_processor_keys_still_collect() {
+        let pcv = serde_json::json!({
+            "min_pixels": 3136,
+            "max_pixels": 12845056,
+            "patch_size": 16,
+            "merge_size": 2,
+        });
+        let budget = collect_vl_processor_fields(&pcv);
+        assert_eq!(budget["min_pixels"], serde_json::json!(3136));
+        assert_eq!(budget["merge_size"], serde_json::json!(2));
+        assert!(!budget.contains_key("image_mean"));
+    }
+
+    #[test]
+    fn lfm2_embed_tokens_mq_route_is_v2_only() {
+        let embed = "model.language_model.embed_tokens.weight";
+        assert!(
+            lfm2_dense_mq_name_matches(embed, true),
+            "mq4v2 must claim embed_tokens"
+        );
+        assert!(
+            !lfm2_dense_mq_name_matches(embed, false),
+            "mq4-v1 / mq4c must not claim embed_tokens"
+        );
+        let proj = "model.language_model.layers.0.self_attn.q_proj.weight";
+        assert!(lfm2_dense_mq_name_matches(proj, true));
+        assert!(lfm2_dense_mq_name_matches(proj, false));
+        let w1 = "model.language_model.layers.0.feed_forward.w1.weight";
+        assert!(lfm2_dense_mq_name_matches(w1, false));
     }
 }
