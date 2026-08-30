@@ -8,7 +8,7 @@ The official extension is a PyTorch/pybind module and is hundreds of megabytes.
 Its public Python ABI is not usable from hipfire's Rust/raw-HIP runtime. This
 experiment instead compiles a selected CK instance set into a small library and
 exports a versioned C ABI. The library remains an optional runtime artifact.
-ABI v3 enumerates exact-architecture layout capabilities, distinguishes dense
+ABI v4 enumerates exact-architecture layout capabilities, distinguishes dense
 element strides from packed row-byte strides, and exposes a caller-owned
 workspace query. The first quantized cell stages through persistent caller
 scratch without allocating inside a stream-ordered launch.
@@ -20,11 +20,25 @@ Current scope:
 - MHA, MQA, and GQA;
 - dense FP16 head dimension 64;
 - gfx1100 F32-Q/Q8-K/Q8-V causal GQA at head dimension 256;
+- gfx1100 F32-Q/Asym3-Givens-K/Q8-V causal GQA at head dimension 256;
+- gfx1201 F32-Q/Asym3-Givens-K/Q8-V causal GQA at head dimension 256;
 - raw HIP stream and element-stride inputs.
 
 The Q8 cell vector-decodes both packed caches into F16, invokes the CK D256
 pipeline, and converts output back to F32. It is a correctness-first staged
 adapter; direct quantized CK and asym/FWHT/Lloyd layouts remain future cells.
+
+ABI v4 gives Givens and FWHT K caches distinct format IDs; Q8 V remains a
+separate format, and callers provide explicit K/V row and head byte strides
+plus both transform tables. The D256 Givens cell rotates Q and decodes packed K
+and Q8 V into caller-owned F16 staging before invoking CK. D512 Givens and both
+FWHT shapes remain `recognized-no-cell`: their layouts are validated but no
+capability is published. This keeps each unimplemented packed loader fail-closed.
+Packed staging currently requires contiguous `[row, head, dim]` Q and output;
+the ABI validator rejects non-contiguous element strides rather than ignoring them.
+The Rust loader accepts ABI v3 sidecars for their original dense/Q8 cells by
+passing the unchanged v3 struct prefix; v3 quantized format IDs 4+ are rejected
+because their old generic meaning is not the explicit v4 Asym3 contract.
 
 ## Build
 
@@ -58,6 +72,11 @@ GPU_ARCH=gfx1100 \
 The build uses the selected CK sources directly and has no PyTorch dependency.
 No `.so` is copied into or committed to hipfire.
 
+The build script selects CK's `gfx11` generator family for exact gfx1100/gfx1151
+artifacts and the `gfx12` family for exact gfx1201 artifacts. An artifact must
+publish the same exact architecture in its capability table; cross-architecture
+artifacts fail closed in the Rust selector.
+
 The validated local build used ROCm 7.14:
 
 ```text
@@ -76,9 +95,10 @@ HIP_VISIBLE_DEVICES=0 \
   experiments/flash-attn-ck-sidecar/build/smoke_raw_abi
 ```
 
-The pure-HIP smoke runs dense FP16 MHA/MQA/GQA and packed Q8 D256 GQA cases
-against CPU references. The Q8 reference uses reconstructed quantized values,
-so it checks staging and attention independently of quantization error.
+The pure-HIP smoke runs dense FP16 MHA/MQA/GQA, packed Q8 D256 GQA,
+and Asym3-Givens D256 GQA cases against CPU references. Quantized references
+use reconstructed values, so they check packed loading and attention
+independently of quantization error.
 
 Validated on Radeon Pro W7900 / gfx1100 with ROCm 7.14:
 
@@ -89,6 +109,7 @@ Validated on Radeon Pro W7900 / gfx1100 with ROCm 7.14:
 | FP16 MHA D64, non-causal, default stream | `4.062802e-05` | `6.646507e-06` |
 | FP16 MQA D64, non-causal, default stream | `4.367530e-05` | `6.348691e-06` |
 | F32/Q8/Q8 GQA D256, causal | `4.766881e-05` | `7.248458e-06` |
+| F32/Asym3-Givens/Q8 GQA D256, causal | `6.110966e-05` | `1.009769e-05` |
 
 ## Optional Rust loader
 
@@ -122,5 +143,33 @@ HIPFIRE_FLASH_ATTN_CK_WORKSPACE_BYTES=536870912 \
 ```
 
 The workspace is allocated once when `Gpu` is created. Missing or insufficient
-workspace produces a one-time route reason and retains native attention. Use
-`scripts/bench_ck_q8_prefill_ab.sh` for a reproducible production-path A/B.
+workspace produces a one-time route reason and retains native attention. The
+Asym3 D256 cell is attempted only after the Qwen attention family has completed
+its native KV write and resolved a sequential, non-tree, non-windowed prefill;
+decode and graph capture remain native. Use `scripts/bench_ck_q8_prefill_ab.sh`
+with `KV_MODE=q8` or `KV_MODE=asym3` for a reproducible production-path A/B.
+The script also requires native and CK prefill to produce the same next-token ID.
+
+Qwen3.6-27B MQ4, Asym3 KV, W7900/gfx1100, warm process and identical fake prompt:
+
+| Prefill | Runs | Native median | CK median | Delta | Next token |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 512 | 2 | `836.5 tok/s` | `854.8 tok/s` | `+2.18%` | `29` / `29` |
+| 2048 | 3 | `780.9 tok/s` | `846.7 tok/s` | `+8.43%` | not recorded |
+| 8192 | 5 | `569.9 tok/s` | `795.2 tok/s` | `+39.53%` | `248046` / `248046` |
+
+The same PP8192 cell was revalidated after porting to current master
+`aaf5e3211` with ROCm 7.14. Five timed runs followed two warmups in each arm:
+
+| Native median | CK median | Delta | Next token |
+| ---: | ---: | ---: | ---: |
+| `572.5 tok/s` | `797.4 tok/s` | `+39.28%` | `248046` / `248046` |
+
+A matching rocprof trace bounds further optimization within this CK cell. After
+dividing the warmup-plus-profile dispatch totals by two, CK FMHA took about
+`283.6 ms`, Asym3 K decode `28.5 ms`, Q8 V decode `38.2 ms`, output conversion
+`5.2 ms`, and Q rotation `2.6 ms` per PP8192 pass. The complete CK chain is
+therefore about `358 ms`, or `3.3%` of the profiled wall after CK is enabled.
+Even removing that entire chain would project only about `825 tok/s` from the
+steady `797.4 tok/s` baseline. Larger end-to-end gains require independent
+packed-weight GEMM work and are not attributed to this attention change.

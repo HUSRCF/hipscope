@@ -4395,15 +4395,24 @@ pub fn generate_multi(
                 prev_in_think = in_think;
             }
             let budget_hit = max_think_tokens > 0 && think_count >= max_think_tokens;
+            let request_cap_latched_now = latch_request_think_cap(
+                budget_hit,
+                generated,
+                &mut force_answer_latched,
+                &mut latch_gen_mark,
+            );
 
             if in_think && (budget_hit || force_answer_now || force_answer_latched) {
-                if force_answer_now {
+                if request_cap_latched_now {
+                    eprintln!(
+                        "[think-cap] id={} — per-request think cap {} reached; closing <think>",
+                        id, max_think_tokens
+                    );
+                } else if force_answer_now {
                     eprintln!(
                         "[force-answer] id={} — closing <think> mid-turn to commit to the answer",
                         id
                     );
-                } else if force_answer_latched {
-                    eprintln!("[force-answer] id={} — re-closing a re-opened <think> (latched / think-cap)", id);
                 }
                 let close_tokens = tokenizer.encode(&think_continuation());
                 let budget_left = max_tokens.saturating_sub(generated);

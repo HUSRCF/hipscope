@@ -11660,13 +11660,12 @@ impl Gpu {
         // was measured on. gfx12/RDNA4 in particular is unmeasured — whoever has
         // an R9700 can flip it with HIPFIRE_MQ4V2_GATE_UP_TIGHT_GRID=1 and, if
         // it holds, widen this condition.
-        let tight = match hipfire_config::developer_var("HIPFIRE_MQ4V2_GATE_UP_TIGHT_GRID")
-            .as_deref()
-        {
-            Ok("1") => true,
-            Ok("0") => false,
-            _ => self.arch_caps.is_gfx1151(),
-        };
+        let tight =
+            match hipfire_config::developer_var("HIPFIRE_MQ4V2_GATE_UP_TIGHT_GRID").as_deref() {
+                Ok("1") => true,
+                Ok("0") => false,
+                _ => self.arch_caps.is_gfx1151(),
+            };
         let grid_x = if tight { (m as u32) >> 1 } else { m as u32 };
         let result = self.launch_maybe_blob(
             "gemv_mq4g256v2_moe_gate_up_k8_indexed",
@@ -11683,6 +11682,239 @@ impl Gpu {
                 b.push_ptr(yup);
                 b.push_i32(m_val);
                 b.push_i32(k_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// MQ6G256V2 (qt=47) sister of
+    /// [`Self::gemv_mq4g256v2_moe_gate_up_k8_indexed`].
+    ///
+    /// Same dual-stream gate/up kernarg ABI and grid contract as the qt44
+    /// method. Group stride is 200 B (vs 136); dual-half f16 header must never
+    /// collapse with HFQ6/MQ6 V1 f32 scale+zero. No measured arch
+    /// specialisations yet — one kernel, every arch.
+    pub fn gemv_mq6g256v2_moe_gate_up_k8_indexed(
+        &mut self,
+        expert_ptrs: &GpuTensor,  // [n_exp] of u64 device pointers
+        topk_indices: &GpuTensor, // [k_top] i32
+        x: &GpuTensor,
+        y_gate: &GpuTensor,
+        y_up: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_mq6g256v2_moe_gate_up_k8_indexed",
+            kernels::GEMV_MQ6G256V2_MOE_GATE_UP_K8_INDEXED_SRC,
+            "gemv_mq6g256v2_moe_gate_up_k8_indexed",
+        )?;
+        let pp = expert_ptrs.buf.as_ptr();
+        let ip = topk_indices.buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let ygp = y_gate.buf.as_ptr();
+        let yup = y_up.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &ygp as *const _ as *mut c_void,
+            &yup as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        // 200 B/group: mirror the qt44 timer shape with the MQ6V2 weight helper.
+        let bytes = 8 * (crate::profile::gemv_mq6g256v2_bytes(m, k) + m * 4);
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "gemv",
+            "gemv_mq6g256v2_moe_gate_up_k8_indexed",
+            bytes,
+        );
+        // Launch contraction. Dual-stream kernel maps blockIdx.x to one MI row
+        // (gate+up together) and returns for `row >= mi`. Same opt-in tight
+        // grid contract as the qt44 sister; default wide until measured.
+        let tight =
+            match hipfire_config::developer_var("HIPFIRE_MQ6V2_GATE_UP_TIGHT_GRID").as_deref() {
+                Ok("1") => true,
+                Ok("0") => false,
+                _ => false,
+            };
+        let grid_x = if tight { (m as u32) >> 1 } else { m as u32 };
+        let result = self.launch_maybe_blob(
+            "gemv_mq6g256v2_moe_gate_up_k8_indexed",
+            [grid_x, 8, 1],
+            [32u32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp);
+                b.push_ptr(ip);
+                b.push_ptr(xp);
+                b.push_ptr(ygp);
+                b.push_ptr(yup);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// MQ4G256V2 (qt=44) sister of
+    /// [`Self::gemv_hfq4g256_moe_gate_up_k8_indexed_batched`].
+    ///
+    /// Wave32 path only — the qt44 batched HIP kernel has no wave64 twin.
+    /// Same kernarg signature + grid (M, K_TOP, N) + gate/up split as the
+    /// HFQ4 batched method; only the dual-half f16 header decode differs.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_mq4g256v2_moe_gate_up_k8_indexed_batched(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        x: &GpuTensor,
+        y_gate: &GpuTensor,
+        y_up: &GpuTensor,
+        m: usize,
+        k: usize,
+        k_top: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_mq4g256v2_moe_gate_up_k8_indexed_batched",
+            kernels::GEMV_MQ4G256V2_MOE_GATE_UP_K8_INDEXED_BATCHED_SRC,
+            "gemv_mq4g256v2_moe_gate_up_k8_indexed_batched",
+        )?;
+        let pp = expert_ptrs.buf.as_ptr();
+        let ip = topk_indices.buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let ygp = y_gate.buf.as_ptr();
+        let yup = y_up.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let kt_val = k_top as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &ygp as *const _ as *mut c_void,
+            &yup as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &kt_val as *const _ as *mut c_void,
+        ];
+        // Same 136 B/group stride as qt13, so the qt13 byte estimate is exact.
+        let bytes = batch_size * k_top * (crate::profile::gemv_hfq4g256_bytes(m, k) + m * 4);
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "gemv",
+            "gemv_mq4g256v2_moe_gate_up_k8_indexed_batched",
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "gemv_mq4g256v2_moe_gate_up_k8_indexed_batched",
+            [m as u32, k_top as u32, batch_size as u32],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp);
+                b.push_ptr(ip);
+                b.push_ptr(xp);
+                b.push_ptr(ygp);
+                b.push_ptr(yup);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(kt_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// MQ6G256V2 (qt=47) sister of
+    /// [`Self::gemv_hfq6g256_moe_gate_up_k8_indexed_batched`].
+    ///
+    /// Same kernarg signature + grid (M, K_TOP, N) + gate/up output split as
+    /// the HFQ6 batched method; only the dual-half f16 header decode differs
+    /// (200 B/group shared with V1, headers wire-incompatible).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_mq6g256v2_moe_gate_up_k8_indexed_batched(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        x: &GpuTensor,
+        y_gate: &GpuTensor,
+        y_up: &GpuTensor,
+        m: usize,
+        k: usize,
+        k_top: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_mq6g256v2_moe_gate_up_k8_indexed_batched",
+            kernels::GEMV_MQ6G256V2_MOE_GATE_UP_K8_INDEXED_BATCHED_SRC,
+            "gemv_mq6g256v2_moe_gate_up_k8_indexed_batched",
+        )?;
+        let pp = expert_ptrs.buf.as_ptr();
+        let ip = topk_indices.buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let ygp = y_gate.buf.as_ptr();
+        let yup = y_up.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let kt_val = k_top as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &ygp as *const _ as *mut c_void,
+            &yup as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &kt_val as *const _ as *mut c_void,
+        ];
+        // 200 B/group: mirror the HFQ6 batched timer shape with MQ6V2 helper.
+        let bytes = batch_size * k_top * (crate::profile::gemv_mq6g256v2_bytes(m, k) + m * 4);
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "gemv",
+            "gemv_mq6g256v2_moe_gate_up_k8_indexed_batched",
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "gemv_mq6g256v2_moe_gate_up_k8_indexed_batched",
+            [m as u32, k_top as u32, batch_size as u32],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp);
+                b.push_ptr(ip);
+                b.push_ptr(xp);
+                b.push_ptr(ygp);
+                b.push_ptr(yup);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(kt_val);
                 b
             },
         );
@@ -11745,11 +11977,97 @@ impl Gpu {
         // workgroup (`row0 = blockIdx.x * 4`), so m/4 workgroups cover M and
         // the remaining three quarters exit at the row0 guard. Opt-in behind
         // its own measurement.
-        let tight = hipfire_config::developer_var("HIPFIRE_MQ4V2_DOWN_TIGHT_GRID").as_deref()
-            == Ok("1");
-        let grid_x = if tight { (m as u32).div_ceil(4) } else { m as u32 };
+        let tight =
+            hipfire_config::developer_var("HIPFIRE_MQ4V2_DOWN_TIGHT_GRID").as_deref() == Ok("1");
+        let grid_x = if tight {
+            (m as u32).div_ceil(4)
+        } else {
+            m as u32
+        };
         let result = self.launch_maybe_blob(
             "gemv_mq4g256v2_moe_down_k8_indexed_batched_expanded",
+            [grid_x, k_top as u32, batch_size as u32],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp);
+                b.push_ptr(ip);
+                b.push_ptr(rbp);
+                b.push_ptr(eop);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(kt_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// MQ6G256V2 (qt=47) sister of
+    /// [`Self::gemv_mq4g256v2_moe_down_k8_indexed_batched_expanded`].
+    ///
+    /// Grid mirrors the qt44 method's DEFAULT (`m` workgroups). Kernel owns
+    /// four consecutive output rows per workgroup; `tight_grid` contraction
+    /// to `m/4` stays opt-in until measured. 200 B/group dual-half header —
+    /// never collapse with HFQ6/MQ6 V1.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_mq6g256v2_moe_down_k8_indexed_batched_expanded(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        rot_batch: &GpuTensor,
+        expert_outputs: &GpuTensor, // [batch_size × k_top × m] f32
+        m: usize,
+        k: usize,
+        k_top: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_mq6g256v2_moe_down_k8_indexed_batched_expanded",
+            kernels::GEMV_MQ6G256V2_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC,
+            "gemv_mq6g256v2_moe_down_k8_indexed_batched_expanded",
+        )?;
+        let pp = expert_ptrs.buf.as_ptr();
+        let ip = topk_indices.buf.as_ptr();
+        let rbp = rot_batch.buf.as_ptr();
+        let eop = expert_outputs.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let kt_val = k_top as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &rbp as *const _ as *mut c_void,
+            &eop as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &kt_val as *const _ as *mut c_void,
+        ];
+        let bytes = batch_size * k_top * (crate::profile::gemv_mq6g256v2_bytes(m, k) + m * 4);
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "gemv",
+            "gemv_mq6g256v2_moe_down_k8_indexed_batched_expanded",
+            bytes,
+        );
+        // Launch contraction. This kernel owns FOUR consecutive output rows per
+        // workgroup (`row0 = blockIdx.x * 4`), so m/4 workgroups cover M.
+        // Opt-in behind its own measurement.
+        let tight =
+            hipfire_config::developer_var("HIPFIRE_MQ6V2_DOWN_TIGHT_GRID").as_deref() == Ok("1");
+        let grid_x = if tight {
+            (m as u32).div_ceil(4)
+        } else {
+            m as u32
+        };
+        let result = self.launch_maybe_blob(
+            "gemv_mq6g256v2_moe_down_k8_indexed_batched_expanded",
             [grid_x, k_top as u32, batch_size as u32],
             [32, 1, 1],
             0,
@@ -12021,6 +12339,70 @@ impl Gpu {
             crate::profile::begin_timer(&self.hip, "gemv", "gemv_mq4g256v2_moe_ninepath_d4", bytes);
         let result = self.launch_maybe_blob(
             "gemv_mq4g256v2_moe_ninepath_d4",
+            [(down_m as u32) / 16, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp);
+                b.push_ptr(ip);
+                b.push_ptr(wp);
+                b.push_ptr(xp);
+                b.push_ptr(op);
+                b.push_i32(dm_val);
+                b.push_i32(dk_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// MQ6G256V2 (qt=47) sister of [`Self::gemv_mq4g256v2_moe_ninepath_d4`].
+    /// Same launch contract (grid down_m/16, block 256); byte estimate uses
+    /// the 200 B/group MQ6V2 helper. Dual-half f16 header must never collapse
+    /// with HFQ6/MQ6 V1.
+    pub fn gemv_mq6g256v2_moe_ninepath_d4(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        topk_weights: &GpuTensor,
+        rot_batch: &GpuTensor,
+        out: &GpuTensor,
+        down_m: usize,
+        down_k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_mq6g256v2_moe_ninepath_d4",
+            kernels::GEMV_MQ6G256V2_MOE_NINEPATH_D4_SRC,
+            "gemv_mq6g256v2_moe_ninepath_d4",
+        )?;
+        let pp = expert_ptrs.buf.as_ptr();
+        let ip = topk_indices.buf.as_ptr();
+        let wp = topk_weights.buf.as_ptr();
+        let xp = rot_batch.buf.as_ptr();
+        let op = out.buf.as_ptr();
+        let dm_val = down_m as i32;
+        let dk_val = down_k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &dm_val as *const _ as *mut c_void,
+            &dk_val as *const _ as *mut c_void,
+        ];
+        let bytes =
+            8 * crate::profile::gemv_mq6g256v2_bytes(down_m, down_k) + 8 * down_k * 4 + down_m * 4;
+        let timer =
+            crate::profile::begin_timer(&self.hip, "gemv", "gemv_mq6g256v2_moe_ninepath_d4", bytes);
+        let result = self.launch_maybe_blob(
+            "gemv_mq6g256v2_moe_ninepath_d4",
             [(down_m as u32) / 16, 1, 1],
             [256, 1, 1],
             0,

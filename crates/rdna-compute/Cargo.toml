@@ -738,3 +738,7 @@ required-features = ["lab"]
 [[example]]
 name = "mq4v2_moe_parity"
 required-features = ["lab"]
+
+[[example]]
+name = "mq6v2_moe_parity"
+required-features = ["lab"]

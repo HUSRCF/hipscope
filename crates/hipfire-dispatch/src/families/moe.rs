@@ -35,7 +35,17 @@ use crate::types::*;
 /// tier table containing any other DType
 /// cannot be served by the mixed path and is rejected up front with a clear
 /// error rather than failing deep in the per-bucket dispatch.
-pub const MIXED_SUPPORTED_TIERS: [DType; 3] = [DType::MQ4G256, DType::MQ6G256, DType::ParoQ4G128];
+///
+/// Includes V1 affine MQ4/MQ6, Paro, and the dual-half V2 layouts (qt44/qt47)
+/// consumed by mixed kernel branch tags 7..18. V1/V2 must stay distinct —
+/// collapsing either pair silently corrupts scale/zero decode.
+pub const MIXED_SUPPORTED_TIERS: [DType; 5] = [
+    DType::MQ4G256,
+    DType::MQ6G256,
+    DType::ParoQ4G128,
+    DType::MQ4G256V2,
+    DType::MQ6G256V2,
+];
 
 /// Per-layer dtype snapshot the MoE eligibility lattice reads. Built by the
 /// model from its weight structs; kept dtype-only so this stays GPU-free and
@@ -90,7 +100,9 @@ impl MoeDtypes {
             self.routed_down,
         ]
         .iter()
-        .any(|dt| matches!(*dt, DType::MQ6G256))
+        // V1 (qt14) and V2 (qt47) are both 6-bit FWHT projections that trip
+        // the gfx1151 MQ4-i8 grouped fence via `force_mq4_grouped_fp16`.
+        .any(|dt| matches!(*dt, DType::MQ6G256 | DType::MQ6G256V2))
     }
 }
 
@@ -108,6 +120,10 @@ pub struct MoeResolution {
     pub routed_indexable_mq4v2: bool,
     pub routed_indexable_mq5: bool,
     pub routed_indexable_mq6: bool,
+    /// Uniform all-MQ6G256V2 (qt47) routed experts. Gated on BOTH gate_up and
+    /// down being V2 — qt47 dual-f16-grid header is incompatible with V1
+    /// MQ6G256's f32 header; a split pairing must never claim either arm.
+    pub routed_indexable_mq6v2: bool,
     /// Mixed routed experts: gate_up MQ4, down MQ6 (the "mq6-down" lever —
     /// promote only the sensitive residual-write projection to 6-bit while
     /// gate_up stays 4-bit). Indexable on the decode GPU-top-K path: gate_up
@@ -200,6 +216,8 @@ impl MoeResolution {
         let routed_gate_up_mq4c = d.routed_gate_up == MQ4CG256;
         let routed_gate_up_mq5 = d.routed_gate_up == MQ5G256;
         let routed_gate_up_mq6 = d.routed_gate_up == MQ6G256;
+        // qt47. FWHT-G256 dual-half header like qt44 — kernels read rotated x.
+        let routed_gate_up_mq6v2 = d.routed_gate_up == MQ6G256V2;
         let routed_gate_up_paro = d.routed_gate_up == ParoQ4G128 && d.has_paro_shared;
         let routed_gate_up_mq2lloyd = d.routed_gate_up == MQ2G256Lloyd;
         let routed_gate_up_mq3lloyd = d.routed_gate_up == MQ3G256Lloyd;
@@ -215,6 +233,10 @@ impl MoeResolution {
         let routed_indexable_mq4v2 = (d.routed_down == MQ4G256V2) && routed_gate_up_mq4v2;
         let routed_indexable_mq5 = (d.routed_down == MQ5G256) && routed_gate_up_mq5;
         let routed_indexable_mq6 = (d.routed_down == MQ6G256) && routed_gate_up_mq6;
+        // qt47. BOTH sides MQ6G256V2 — same dual-half hazard as mq4v2: V1 MQ6
+        // stores f32 scale/zero while V2 stores two f16 pairs; same 200 B
+        // stride so a mis-pair is silent fluent garbage, not a fault.
+        let routed_indexable_mq6v2 = (d.routed_down == MQ6G256V2) && routed_gate_up_mq6v2;
         let routed_indexable_mixed_gu4_dn6 = routed_gate_up_mq4 && (d.routed_down == MQ6G256);
         let routed_indexable_mq2lloyd = (d.routed_down == MQ2G256Lloyd) && routed_gate_up_mq2lloyd;
         // Both sides must be the UNROTATED dtype. A rotated/unrotated mix has
@@ -262,6 +284,7 @@ impl MoeResolution {
             || routed_indexable_mq4v2
             || routed_indexable_mq5
             || routed_indexable_mq6
+            || routed_indexable_mq6v2
             || routed_indexable_mixed_gu4_dn6
             || routed_indexable_mixed_per_expert
             || routed_indexable_mq2lloyd
@@ -279,6 +302,7 @@ impl MoeResolution {
             || routed_gate_up_mq4c
             || routed_gate_up_mq5
             || routed_gate_up_mq6
+            || routed_gate_up_mq6v2
             || routed_gate_up_mq2lloyd
             || routed_gate_up_mq3lloyd
             // MQ2/MQ3-G256-GL are FWHT-G256 formats: their gate_up kernel reads
@@ -316,6 +340,7 @@ impl MoeResolution {
             routed_indexable_mq4v2,
             routed_indexable_mq5,
             routed_indexable_mq6,
+            routed_indexable_mq6v2,
             routed_indexable_mixed_gu4_dn6,
             routed_indexable_mq2lloyd,
             routed_indexable_mq2lloyd_u,
@@ -334,6 +359,7 @@ impl MoeResolution {
             || self.routed_indexable_mq4v2
             || self.routed_indexable_mq5
             || self.routed_indexable_mq6
+            || self.routed_indexable_mq6v2
             || self.routed_indexable_mixed_gu4_dn6
             || self.routed_indexable_mixed_per_expert
             || self.routed_indexable_mq2lloyd
@@ -809,14 +835,16 @@ impl MoePrefillResolution {
     ) -> Self {
         let paro_mode = d.routed_gate_up == DType::ParoQ4G128 && d.has_paro_shared;
         let use_path2 = flags.moe_grouped_gemm && arch.has_wmma();
-        // MQ6 grouped-WMMA: gfx11 `_k2` kernel now exists (alongside the
-        // gfx12 `_gfx12` kernel). Only suppress Path 2 for MQ6 on archs that
-        // have NEITHER (gfx9*, gfx1010/1030, CDNA) — i.e. no wmma_w32 and not
-        // gfx12. gfx1100/1101/1102/1103/1150/1151/1152 all have wmma_w32.
+        // MQ6 / MQ6V2 grouped-WMMA: gfx11 `_k2` kernel now exists (alongside the
+        // gfx12 `_gfx12` / `mq6g256v2` sisters). Only suppress Path 2 on archs
+        // that have NEITHER (gfx9*, gfx1010/1030, CDNA) — i.e. no wmma_w32 and
+        // not gfx12. gfx1100/1101/1102/1103/1150/1151/1152 all have wmma_w32.
         // (Master's narrower gfx1151-only MQ6 admit (dfed8cc6) is subsumed by
         // this wider gfx11 widen (8d555fc6); master's mixed-checkpoint safety
         // is preserved separately via `force_mq4_grouped_fp16` below.)
-        let mq6_on_non_wmma = d.routed_gate_up == DType::MQ6G256
+        // qt47 (MQ6G256V2) shares the same gfx11/gfx12 grouped availability —
+        // never collapse it onto the V1 MQ6G256 path (dual-half vs f32 header).
+        let mq6_on_non_wmma = matches!(d.routed_gate_up, DType::MQ6G256 | DType::MQ6G256V2)
             && !arch.has_wmma_w32()
             && !(arch.is_gfx1200() || arch.is_gfx1201());
         let use_path2 = use_path2 && !mq6_on_non_wmma;
@@ -1052,5 +1080,118 @@ mod tests {
             !r.mixed,
             "a uniform per-expert table must take the fast uniform path"
         );
+    }
+
+    #[test]
+    fn resolve_mq6v2_uniform_is_indexable() {
+        // qt47 uniform: both projections MQ6G256V2 => indexable, GPU top-K on.
+        let mut d = uniform_mq4();
+        d.routed_gate_up = DType::MQ6G256V2;
+        d.routed_down = DType::MQ6G256V2;
+        d.experts_all_gate_up_mq4 = false;
+        let r = MoeResolution::resolve(&d, 8);
+        assert!(r.routed_indexable_mq6v2);
+        assert!(!r.routed_indexable_mq6, "must not claim the V1 MQ6 arm");
+        assert!(!r.routed_indexable_mq4);
+        assert!(!r.routed_indexable_mq4v2);
+        assert!(r.use_gpu_topk);
+        assert!(r.needs_x_rot_local, "qt47 kernels read ROTATED activations");
+        assert!(r.routed_indexable());
+    }
+
+    #[test]
+    fn resolve_mq6v2_mixed_with_v1_is_not_indexable() {
+        // Same dual-half hazard as mq4v2/qt13: V1 and V2 share the 200 B group
+        // stride and 6-bit packing, differing ONLY in the 8-byte header. A
+        // split pairing must NOT be indexable on either arm.
+        for (gu, dn) in [
+            (DType::MQ6G256V2, DType::MQ6G256),
+            (DType::MQ6G256, DType::MQ6G256V2),
+            (DType::MQ6G256V2, DType::MQ4G256),
+            (DType::MQ4G256V2, DType::MQ6G256V2),
+        ] {
+            let mut d = uniform_mq4();
+            d.routed_gate_up = gu;
+            d.routed_down = dn;
+            d.experts_all_gate_up_mq4 = false;
+            let r = MoeResolution::resolve(&d, 8);
+            assert!(!r.routed_indexable_mq6v2, "{gu:?}/{dn:?}");
+            assert!(!r.routed_indexable_mq6, "{gu:?}/{dn:?}");
+            assert!(
+                !r.use_gpu_topk,
+                "{gu:?}/{dn:?} must fall back, not guess a layout"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_mq6_v1_still_indexable_without_mq6v2() {
+        // Preserve V1: uniform MQ6G256 must keep the V1 arm and never claim V2.
+        let mut d = uniform_mq4();
+        d.routed_gate_up = DType::MQ6G256;
+        d.routed_down = DType::MQ6G256;
+        d.experts_all_gate_up_mq4 = false;
+        let r = MoeResolution::resolve(&d, 8);
+        assert!(r.routed_indexable_mq6);
+        assert!(!r.routed_indexable_mq6v2);
+        assert!(r.use_gpu_topk);
+        assert!(r.needs_x_rot_local);
+    }
+
+    #[test]
+    fn has_mq6_projection_recognizes_v1_and_v2() {
+        let mut d = uniform_mq4();
+        assert!(!d.has_mq6_projection());
+
+        d.routed_down = DType::MQ6G256;
+        assert!(
+            d.has_mq6_projection(),
+            "V1 MQ6 must trip has_mq6_projection"
+        );
+
+        d.routed_down = DType::MQ6G256V2;
+        assert!(
+            d.has_mq6_projection(),
+            "V2 MQ6 must trip has_mq6_projection"
+        );
+
+        d.routed_down = DType::MQ4G256;
+        d.shared_expert_gate = DType::MQ6G256V2;
+        assert!(
+            d.has_mq6_projection(),
+            "shared-expert MQ6V2 must trip has_mq6_projection"
+        );
+
+        d.shared_expert_gate = DType::MQ4G256V2;
+        assert!(
+            !d.has_mq6_projection(),
+            "MQ4V2 must not be treated as an MQ6 projection"
+        );
+    }
+
+    #[test]
+    fn mixed_supported_tiers_include_v1_and_v2_affine() {
+        // Kernel branch tags 7..18 consume MQ4V2/MQ6V2; admission must list
+        // them alongside the preserved V1 tiers. Exact membership — no MQ2/3/5V2.
+        assert!(MIXED_SUPPORTED_TIERS.contains(&DType::MQ4G256));
+        assert!(MIXED_SUPPORTED_TIERS.contains(&DType::MQ6G256));
+        assert!(MIXED_SUPPORTED_TIERS.contains(&DType::ParoQ4G128));
+        assert!(MIXED_SUPPORTED_TIERS.contains(&DType::MQ4G256V2));
+        assert!(MIXED_SUPPORTED_TIERS.contains(&DType::MQ6G256V2));
+        assert_eq!(MIXED_SUPPORTED_TIERS.len(), 5);
+        assert!(!MIXED_SUPPORTED_TIERS.contains(&DType::MQ5G256V2));
+        assert!(!MIXED_SUPPORTED_TIERS.contains(&DType::MQ2G256V2));
+        assert!(!MIXED_SUPPORTED_TIERS.contains(&DType::MQ3G256V2));
+    }
+
+    #[test]
+    fn resolve_mq6v2_k_ne_8_disables_gpu_topk() {
+        let mut d = uniform_mq4();
+        d.routed_gate_up = DType::MQ6G256V2;
+        d.routed_down = DType::MQ6G256V2;
+        d.experts_all_gate_up_mq4 = false;
+        let r = MoeResolution::resolve(&d, 6);
+        assert!(r.routed_indexable_mq6v2);
+        assert!(!r.use_gpu_topk);
     }
 }

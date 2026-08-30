@@ -5985,13 +5985,13 @@ mod tests {
         }]));
         let mut calls = vec![sample_tc(
             "calc",
-            serde_json::json!({ "count": "42", "ratio": "3.14", "already": 7 }),
+            serde_json::json!({ "count": "42", "ratio": "1.25", "already": 7 }),
         )];
         let before_already = calls[0].arguments["already"].clone();
         normalize_tool_calls(&mut calls, &body);
         assert_eq!(calls[0].arguments["count"], serde_json::json!(42));
         assert!(calls[0].arguments["count"].is_number());
-        assert_eq!(calls[0].arguments["ratio"], serde_json::json!(3.14));
+        assert_eq!(calls[0].arguments["ratio"], serde_json::json!(1.25));
         assert_eq!(calls[0].arguments["already"], before_already);
     }
 

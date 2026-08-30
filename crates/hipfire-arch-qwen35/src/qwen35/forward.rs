@@ -346,17 +346,36 @@ pub(crate) fn unsupported_mq3_experts_uniform_from_dtypes(
     !(uniform && routed_codebook_pair_batched_supported(first.0, first.1))
 }
 
+/// True when any MoE FFN projection is MQ6-family (V1 qt=15 or V2 qt=47).
+///
+/// Feeds `Qwen35Weights::moe_has_mq6` → gfx1151 `force_mq4_grouped_fp16` when a
+/// mixed checkpoint carries an MQ6 projection somewhere. V1 and V2 are distinct
+/// wire layouts (f32 vs dual-half fp16 headers) but both trip the same model
+/// flag: both are 200 B/group 6-bit MQ and both need the gfx1151 MQ4-grouped
+/// FP16 consistency path. MQ4V2 must never collapse into this helper.
 fn moe_ffn_has_mq6(ffn: &MoeFfnWeights) -> bool {
-    let is_mq6 = |dt: DType| matches!(dt, DType::MQ6G256);
-    is_mq6(ffn.router.gpu_dtype)
-        || is_mq6(ffn.shared_expert_gate.gpu_dtype)
-        || is_mq6(ffn.shared_expert.gate.gpu_dtype)
-        || is_mq6(ffn.shared_expert.up.gpu_dtype)
-        || is_mq6(ffn.shared_expert.down.gpu_dtype)
-        || ffn
-            .experts
+    moe_ffn_has_mq6_from_dtypes(
+        [
+            ffn.router.gpu_dtype,
+            ffn.shared_expert_gate.gpu_dtype,
+            ffn.shared_expert.gate.gpu_dtype,
+            ffn.shared_expert.up.gpu_dtype,
+            ffn.shared_expert.down.gpu_dtype,
+        ],
+        ffn.experts
             .iter()
-            .any(|e| is_mq6(e.gate_up.gpu_dtype) || is_mq6(e.down.gpu_dtype))
+            .map(|e| (e.gate_up.gpu_dtype, e.down.gpu_dtype)),
+    )
+}
+
+/// Pure core of [`moe_ffn_has_mq6`] for unit tests (no live `MoeFfnWeights`).
+pub(crate) fn moe_ffn_has_mq6_from_dtypes(
+    structural: impl IntoIterator<Item = DType>,
+    experts: impl IntoIterator<Item = (DType, DType)>,
+) -> bool {
+    let is_mq6 = |dt: DType| matches!(dt, DType::MQ6G256 | DType::MQ6G256V2);
+    structural.into_iter().any(is_mq6)
+        || experts.into_iter().any(|(gu, dn)| is_mq6(gu) || is_mq6(dn))
 }
 
 pub(crate) fn layers_have_mq6_moe(layers: &[LayerWeights]) -> bool {
@@ -4704,5 +4723,99 @@ mod tests {
         assert!(!ar_graph_eligible_for_kv(true, 1));
         assert!(!ar_graph_eligible_for_kv(true, 128));
         assert!(!ar_graph_eligible_for_kv(false, 0));
+    }
+
+    // ── MQ6V2 / MQ4V2 FFN dtype recognition ───────────────────────────────
+    // Model-level MQ6 flag must see both V1 (qt=15) and V2 (qt=47) without
+    // collapsing either into MQ4V2 (qt=44). Pure helpers — no GPU tensors.
+
+    #[test]
+    fn moe_ffn_has_mq6_recognizes_v1_and_v2_distinctly() {
+        // Empty structural + empty experts → false.
+        assert!(!moe_ffn_has_mq6_from_dtypes([], []));
+
+        // Legacy MQ6G256 on a structural field.
+        assert!(moe_ffn_has_mq6_from_dtypes(
+            [
+                DType::MQ6G256,
+                DType::MQ4G256,
+                DType::MQ4G256,
+                DType::MQ4G256,
+                DType::MQ4G256
+            ],
+            [(DType::MQ4G256, DType::MQ4G256)],
+        ));
+
+        // MQ6G256V2 on a structural field — must trip the same model flag.
+        assert!(moe_ffn_has_mq6_from_dtypes(
+            [
+                DType::MQ4G256,
+                DType::MQ4G256,
+                DType::MQ6G256V2,
+                DType::MQ4G256,
+                DType::MQ4G256
+            ],
+            [(DType::MQ4G256, DType::MQ4G256)],
+        ));
+
+        // MQ6G256V2 only on a routed expert projection.
+        assert!(moe_ffn_has_mq6_from_dtypes(
+            [DType::MQ4G256; 5],
+            [(DType::MQ6G256V2, DType::MQ4G256)],
+        ));
+        assert!(moe_ffn_has_mq6_from_dtypes(
+            [DType::MQ4G256; 5],
+            [(DType::MQ4G256, DType::MQ6G256V2)],
+        ));
+
+        // Uniform MQ6V2 routed pair.
+        assert!(moe_ffn_has_mq6_from_dtypes(
+            [DType::MQ6G256V2; 5],
+            [(DType::MQ6G256V2, DType::MQ6G256V2)],
+        ));
+    }
+
+    #[test]
+    fn moe_ffn_has_mq6_never_collapses_mq4v2() {
+        // MQ4G256 / MQ4G256V2 only — never MQ6-family.
+        assert!(!moe_ffn_has_mq6_from_dtypes(
+            [DType::MQ4G256; 5],
+            [(DType::MQ4G256, DType::MQ4G256)],
+        ));
+        assert!(!moe_ffn_has_mq6_from_dtypes(
+            [DType::MQ4G256V2; 5],
+            [(DType::MQ4G256V2, DType::MQ4G256V2)],
+        ));
+        // Mixed MQ4 V1/V2 gate-side + routed still not MQ6.
+        assert!(!moe_ffn_has_mq6_from_dtypes(
+            [
+                DType::MQ4G256V2,
+                DType::MQ4G256,
+                DType::MQ4G256V2,
+                DType::MQ4G256,
+                DType::MQ4G256V2,
+            ],
+            [(DType::MQ4G256V2, DType::MQ4G256)],
+        ));
+        // Identity: V1 and V2 MQ6 are distinct enum variants (wire layouts differ).
+        assert_ne!(DType::MQ6G256, DType::MQ6G256V2);
+        assert_ne!(DType::MQ4G256, DType::MQ4G256V2);
+        assert_ne!(DType::MQ4G256V2, DType::MQ6G256V2);
+    }
+
+    #[test]
+    fn mq4_family_gate_side_match_keeps_v1_and_v2() {
+        // Mirrors ffn_gate_side_mq4_for_moe / experts_all_gate_up_mq4 arms:
+        // both V1 and V2 are MQ4-family for prerotate admission; neither is MQ6.
+        let is_mq4 = |dt: DType| matches!(dt, DType::MQ4G256 | DType::MQ4G256V2);
+        let is_mq6 = |dt: DType| matches!(dt, DType::MQ6G256 | DType::MQ6G256V2);
+        assert!(is_mq4(DType::MQ4G256));
+        assert!(is_mq4(DType::MQ4G256V2));
+        assert!(!is_mq4(DType::MQ6G256));
+        assert!(!is_mq4(DType::MQ6G256V2));
+        assert!(is_mq6(DType::MQ6G256));
+        assert!(is_mq6(DType::MQ6G256V2));
+        assert!(!is_mq6(DType::MQ4G256));
+        assert!(!is_mq6(DType::MQ4G256V2));
     }
 }

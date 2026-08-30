@@ -1415,7 +1415,12 @@ pub fn generate(
             // the explicit `max_think_tokens` cap are threaded into the
             // generate path so a user's `reasoning_effort:"none"` or cap is
             // not silently ignored.
-            let _ = (budget_alert_at_tok, budget_alert_text, pflash_state, pflash_cfg);
+            let _ = (
+                budget_alert_at_tok,
+                budget_alert_text,
+                pflash_state,
+                pflash_cfg,
+            );
             let _ = stop;
             crate::dense::generate_maple(
                 m,
@@ -3454,16 +3459,15 @@ pub fn generate(
         // and structured tool_calls on this AR path. Raw token commit stays
         // upstream via `commit_and_observe` (conversation_tokens / streamed /
         // seq_pos advance before classify).
-        let mut semantic = QwenArSemanticProducer::new_with_tool_protocol(id, started_in_think, tools_nonempty);
+        let mut semantic =
+            QwenArSemanticProducer::new_with_tool_protocol(id, started_in_think, tools_nonempty);
         let mut alert_fired = false;
         // max_think_tokens enforcement state. think_count increments only
         // while we observe ourselves to be inside a `<think>...</think>`
         // block via the same decoded-text scan budget_alert uses. When the
         // cap is hit we splice "</think>\n" into the stream (KV write +
-        // stdout emit + advance generated) so the model finishes thinking
-        // and commits to an answer with the remaining max_tokens budget.
-        // Re-armable: if the model later opens another <think> in the same
-        // turn (rare) the counter resets and the cap re-fires.
+        // stdout emit + advance generated), permanently latch force-answer
+        // for any reopened span, and bound the answer tail below.
         let mut think_count: usize = 0;
         let mut prev_in_think: bool = false;
         // Force-answer is a ONE-SHOT signal (check_force_answer clears on read),
@@ -3723,12 +3727,21 @@ pub fn generate(
                     prev_in_think = in_think;
                 }
                 let budget_hit = max_think_tokens > 0 && think_count >= max_think_tokens;
+                let request_cap_latched_now = latch_request_think_cap(
+                    budget_hit,
+                    generated,
+                    &mut force_answer_latched,
+                    &mut latch_gen_mark,
+                );
 
                 if in_think && (budget_hit || force_answer_now || force_answer_latched) {
-                    if force_answer_now {
+                    if request_cap_latched_now {
+                        eprintln!(
+                            "[think-cap] id={} — per-request think cap {} reached; closing <think>",
+                            id, max_think_tokens
+                        );
+                    } else if force_answer_now {
                         eprintln!("[force-answer] id={} — closing <think> mid-turn to commit to the answer", id);
-                    } else if force_answer_latched {
-                        eprintln!("[force-answer] id={} — re-closing a re-opened <think> (latched / think-cap)", id);
                     }
                     // Force-close. Encode the continuation and run each token
                     // through the KV write + emit path the same way a normally-

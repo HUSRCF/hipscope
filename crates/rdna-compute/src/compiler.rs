@@ -919,6 +919,28 @@ impl KernelCompiler {
         p.to_string()
     }
 
+    /// Root-scoped flags passed through hipcc to the device compiler.
+    ///
+    /// `hipcc.bat` re-tokenises its arguments on Windows, so both flags must
+    /// use the same space-free path policy as the explicit include directory.
+    /// Keep the resolver injectable so the Windows-shaped argv contract can be
+    /// tested on hosts without a Windows SDK.
+    fn rocm_root_flags_with(
+        root: &Path,
+        resolve_for_hipcc: impl FnOnce(&str) -> String,
+    ) -> Vec<String> {
+        let root = root.to_string_lossy();
+        let resolved = resolve_for_hipcc(&root);
+        vec![
+            format!("--rocm-path={resolved}"),
+            format!("--hip-path={resolved}"),
+        ]
+    }
+
+    fn rocm_root_flags(root: &Path) -> Vec<String> {
+        Self::rocm_root_flags_with(root, Self::win_short_path_if_needed)
+    }
+
     /// Core hipcc argv: genco/arch/O3, then passthrough, then -o out src.
     fn direct_hipcc_args(
         arch: &str,
@@ -971,10 +993,8 @@ impl KernelCompiler {
         // the same path clang would have found by itself.
         let selected_root = hipfire_config::rocm::root();
         if let Some(root) = selected_root.as_ref() {
-            if hipfire_config::rocm::is_complete_root(&root) {
-                let root = root.to_string_lossy();
-                passthrough.push(format!("--rocm-path={root}"));
-                passthrough.push(format!("--hip-path={root}"));
+            if hipfire_config::rocm::is_complete_root(root) {
+                passthrough.extend(Self::rocm_root_flags(root));
             }
         }
         if let Some(candidate) =
@@ -1705,6 +1725,27 @@ mod tests {
         assert!(
             args.iter().all(|arg| !arg.contains("RADIOWAVE")),
             "the product compiler must not inject Radiowave"
+        );
+    }
+
+    #[test]
+    fn windows_shaped_rocm_root_flags_share_the_short_path_policy() {
+        let long = Path::new(r"C:\Program Files\AMD\ROCm\7.2");
+        let flags = KernelCompiler::rocm_root_flags_with(long, |path| {
+            assert_eq!(path, r"C:\Program Files\AMD\ROCm\7.2");
+            r"C:\PROGRA~1\AMD\ROCm\7.2".to_owned()
+        });
+
+        assert_eq!(
+            flags,
+            vec![
+                r"--rocm-path=C:\PROGRA~1\AMD\ROCm\7.2",
+                r"--hip-path=C:\PROGRA~1\AMD\ROCm\7.2",
+            ]
+        );
+        assert!(
+            flags.iter().all(|arg| !arg.contains(' ')),
+            "hipcc.bat must receive each root-scoped flag without spaces"
         );
     }
 
