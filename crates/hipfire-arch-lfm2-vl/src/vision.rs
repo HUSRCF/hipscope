@@ -1251,12 +1251,12 @@ mod tests {
             }
         }
         let out = pixel_unshuffle_tokens(&feat, gh, gw, ch, 2);
-        assert_eq!(out.len(), 1 * ch * 4);
-        // single block (br=bc=di=dj):
-        assert_eq!(out[(0 * 2 * 2) + (0 * 2) + 0] as usize, 0); // (0,0,c0)
-        assert_eq!(out[(0 * 2 * 2) + (1 * 2) + 0] as usize, 10); // dj=1 → col 1
-        assert_eq!(out[(1 * 2 * 2) + (0 * 2) + 0] as usize, 100); // di=1 → row 1
-        assert_eq!(out[(1 * 2 * 2) + (1 * 2) + 1] as usize, 111);
+        assert_eq!(out.len(), ch * 4);
+        // single block, flattened as [di][dj][channel]:
+        assert_eq!(out[0] as usize, 0); // di=0, dj=0, c=0
+        assert_eq!(out[2] as usize, 10); // di=0, dj=1, c=0
+        assert_eq!(out[4] as usize, 100); // di=1, dj=0, c=0
+        assert_eq!(out[7] as usize, 111); // di=1, dj=1, c=1
     }
 
     #[test]

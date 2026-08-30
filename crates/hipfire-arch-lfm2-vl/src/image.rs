@@ -438,9 +438,9 @@ mod tests {
         let p = s.patches(&cfg);
         assert_eq!(p.len(), 2 * ps * ps * 3);
         // patch 1 (px=1): value at dy=1,dx=0,c=0 → y=1,x=ps → 0+100+16
-        assert_eq!(p[(1 * ps * ps + 1 * ps + 0) * 3 + 0], 116.0);
+        assert_eq!(p[(ps * ps + ps) * 3], 116.0);
         // patch 0, dy=0,dx=1,c=2 → y=0,x=1 → 20000+0+1
-        assert_eq!(p[(0 * ps * ps + 0 * ps + 1) * 3 + 2], 20_001.0);
+        assert_eq!(p[5], 20_001.0);
     }
 
     fn tiny_cfg() -> VisionConfig {
