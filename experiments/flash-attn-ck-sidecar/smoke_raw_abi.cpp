@@ -16,6 +16,71 @@
 
 namespace {
 
+#if defined(HIPFIRE_CK_TARGET_GFX1201)
+constexpr int32_t kExpectedArch = HIPFIRE_FLASH_ATTN_CK_GFX1201;
+constexpr size_t kExpectedCapabilities = 2;
+constexpr bool kExpectedQ8D256 = false;
+constexpr bool kExpectedAsym3GivensD256 = true;
+#elif defined(HIPFIRE_CK_TARGET_GFX1151)
+constexpr int32_t kExpectedArch = HIPFIRE_FLASH_ATTN_CK_GFX1151;
+constexpr size_t kExpectedCapabilities = 1;
+constexpr bool kExpectedQ8D256 = false;
+constexpr bool kExpectedAsym3GivensD256 = false;
+#else
+constexpr int32_t kExpectedArch = HIPFIRE_FLASH_ATTN_CK_GFX1100;
+constexpr size_t kExpectedCapabilities = 3;
+constexpr bool kExpectedQ8D256 = true;
+constexpr bool kExpectedAsym3GivensD256 = true;
+#endif
+
+bool has_capability(int32_t dtype, int32_t k_format, int32_t v_format, int32_t head_dim)
+{
+    const size_t count = hipfire_flash_attn_ck_capabilities(nullptr, 0);
+    std::vector<hipfire_flash_attn_ck_capability> capabilities(count);
+    if(hipfire_flash_attn_ck_capabilities(capabilities.data(), capabilities.size()) != count)
+    {
+        std::fprintf(stderr, "capability table changed while reading\n");
+        std::exit(2);
+    }
+    return std::any_of(capabilities.begin(), capabilities.end(), [&](const auto& capability) {
+        return capability.arch == kExpectedArch && capability.dtype == dtype &&
+               capability.k_format == k_format && capability.v_format == v_format &&
+               capability.head_dim == head_dim;
+    });
+}
+
+void verify_capabilities()
+{
+    const size_t count = hipfire_flash_attn_ck_capabilities(nullptr, 0);
+    const bool has_q8 = has_capability(HIPFIRE_FLASH_ATTN_CK_F32,
+                                       HIPFIRE_FLASH_ATTN_CK_Q8,
+                                       HIPFIRE_FLASH_ATTN_CK_Q8,
+                                       256);
+    const bool has_asym3 = has_capability(HIPFIRE_FLASH_ATTN_CK_F32,
+                                          HIPFIRE_FLASH_ATTN_CK_ASYM3_GIVENS,
+                                          HIPFIRE_FLASH_ATTN_CK_Q8,
+                                          256);
+    if(count != kExpectedCapabilities ||
+       has_q8 != kExpectedQ8D256 || has_asym3 != kExpectedAsym3GivensD256 ||
+       !has_capability(HIPFIRE_FLASH_ATTN_CK_F16,
+                       HIPFIRE_FLASH_ATTN_CK_DENSE_F16,
+                       HIPFIRE_FLASH_ATTN_CK_DENSE_F16,
+                       64))
+    {
+        std::fprintf(stderr,
+                     "unexpected exact-architecture capability table: count=%zu expected=%zu "
+                     "q8=%d expected_q8=%d asym3=%d expected_asym3=%d arch=%d\n",
+                     count,
+                     kExpectedCapabilities,
+                     has_q8,
+                     kExpectedQ8D256,
+                     has_asym3,
+                     kExpectedAsym3GivensD256,
+                     kExpectedArch);
+        std::exit(2);
+    }
+}
+
 void check_hip(hipError_t status, const char* operation)
 {
     if(status != hipSuccess)
@@ -340,6 +405,7 @@ void run_q8_d256_case()
     params.batch_stride_k = params.batch_stride_v = seqlen_k * nhead_k * hdim;
     params.batch_stride_out = params.batch_stride_q;
     params.packed_k_row_stride_bytes = params.packed_v_row_stride_bytes = nhead_k * head_bytes;
+    params.packed_k_head_stride_bytes = params.packed_v_head_stride_bytes = head_bytes;
     params.workspace_bytes = hipfire_flash_attn_ck_fwd_workspace_bytes(&params);
     check_hip(hipMalloc(&workspace, params.workspace_bytes), "hipMalloc(q8 workspace)");
     params.workspace = workspace;
@@ -365,6 +431,235 @@ void run_q8_d256_case()
     check_hip(hipFree(workspace), "hipFree(q8 workspace)");
 }
 
+void run_asym3_contract_case(int format, int hdim, bool artifact_has_cell)
+{
+    int dummy = 0;
+    hipfire_flash_attn_ck_fwd_params params{};
+    params.abi_version = HIPFIRE_FLASH_ATTN_CK_ABI_VERSION;
+    params.struct_size = sizeof(params);
+    params.q = params.k = params.v = &dummy;
+    params.out = &dummy;
+    params.dtype = HIPFIRE_FLASH_ATTN_CK_F32;
+    params.k_format = format;
+    params.v_format = HIPFIRE_FLASH_ATTN_CK_Q8;
+    params.batch = 1;
+    params.seqlen_q = 16;
+    params.seqlen_k = 32;
+    params.nhead_q = 4;
+    params.nhead_k = 2;
+    params.head_dim = hdim;
+    params.causal = 1;
+    params.softmax_scale = 1.0f / std::sqrt(static_cast<float>(hdim));
+    params.stride_q = params.stride_out = 4 * hdim;
+    params.stride_k = params.stride_v = 2 * hdim;
+    params.nhead_stride_q = params.nhead_stride_k = params.nhead_stride_v =
+        params.nhead_stride_out = hdim;
+    params.batch_stride_q = params.batch_stride_out = 16 * 4 * hdim;
+    params.batch_stride_k = params.batch_stride_v = 32 * 2 * hdim;
+    params.packed_k_head_stride_bytes = 4 + (hdim * 3) / 8;
+    params.packed_v_head_stride_bytes = (hdim / 32) * 34;
+    params.packed_k_row_stride_bytes = 2 * params.packed_k_head_stride_bytes;
+    params.packed_v_row_stride_bytes = 2 * params.packed_v_head_stride_bytes;
+    params.k_transform0 = params.k_transform1 = &dummy;
+    const int transform_elements =
+        format == HIPFIRE_FLASH_ATTN_CK_ASYM3_GIVENS ? hdim / 2 : 256;
+    params.k_transform0_elements = params.k_transform1_elements = transform_elements;
+    params.workspace = &dummy;
+    params.workspace_bytes = hipfire_flash_attn_ck_fwd_workspace_bytes(&params);
+
+    char error[1024]{};
+    const int status = hipfire_flash_attn_ck_fwd_supported(&params, error, sizeof(error));
+    const bool has_cell = artifact_has_cell &&
+                          format == HIPFIRE_FLASH_ATTN_CK_ASYM3_GIVENS && hdim == 256;
+    if(!artifact_has_cell)
+    {
+        if(status != 2 || std::strstr(error, "not published") == nullptr)
+        {
+            std::fprintf(stderr, "unpublished asym3 contract status=%d: %s\n", status, error);
+            std::exit(7);
+        }
+        return;
+    }
+    if((has_cell && status != 0) ||
+       (!has_cell && (status != 2 || std::strstr(error, "no CK execution cell") == nullptr)))
+    {
+        std::fprintf(stderr, "asym3 contract status=%d: %s\n", status, error);
+        std::exit(7);
+    }
+    params.packed_k_head_stride_bytes -= 1;
+    if(hipfire_flash_attn_ck_fwd_supported(&params, error, sizeof(error)) != 1)
+    {
+        std::fprintf(stderr, "malformed asym3 layout was accepted\n");
+        std::exit(8);
+    }
+    params.packed_k_head_stride_bytes += 1;
+    params.stride_q += 1;
+    if(hipfire_flash_attn_ck_fwd_supported(&params, error, sizeof(error)) != 1)
+    {
+        std::fprintf(stderr, "non-contiguous asym3 Q was accepted\n");
+        std::exit(9);
+    }
+    params.stride_q -= 1;
+    params.k_transform0 = nullptr;
+    if(hipfire_flash_attn_ck_fwd_supported(&params, error, sizeof(error)) != 1)
+    {
+        std::fprintf(stderr, "null asym3 transform was accepted\n");
+        std::exit(10);
+    }
+    params.k_transform0 = &dummy;
+    params.k_transform1_elements = transform_elements - 1;
+    if(hipfire_flash_attn_ck_fwd_supported(&params, error, sizeof(error)) != 1)
+    {
+        std::fprintf(stderr, "undersized asym3 transform was accepted\n");
+        std::exit(11);
+    }
+    std::printf("case=asym3-contract format=%s head_dim=%d status=%s\n",
+                format == HIPFIRE_FLASH_ATTN_CK_ASYM3_GIVENS ? "givens" : "fwht", hdim,
+                has_cell ? "supported" : "recognized-no-cell");
+}
+
+void run_asym3_givens_case(int hdim)
+{
+    constexpr float centroids[8] = {
+        -0.134860f, -0.083320f, -0.046469f, -0.015176f,
+         0.015176f,  0.046469f,  0.083320f,  0.134860f,
+    };
+    constexpr int seqlen_q = 8;
+    constexpr int seqlen_k = 16;
+    constexpr int nhead_q = 4;
+    constexpr int nhead_k = 2;
+    const int k_head_bytes = 4 + (hdim * 3) / 8;
+    const int v_head_bytes = (hdim / 32) * 34;
+    const float scale = 1.0f / std::sqrt(static_cast<float>(hdim));
+    const size_t q_count = static_cast<size_t>(seqlen_q) * nhead_q * hdim;
+    const size_t kv_count = static_cast<size_t>(seqlen_k) * nhead_k * hdim;
+    std::vector<float> q(q_count), transformed_q(q_count), v(kv_count), decoded_k(kv_count),
+        decoded_v(kv_count), expected(q_count, 0.0f), output(q_count);
+    std::vector<float> cos_theta(hdim / 2), sin_theta(hdim / 2);
+    std::vector<uint8_t> packed_k(static_cast<size_t>(seqlen_k) * nhead_k * k_head_bytes);
+    std::vector<uint8_t> packed_v(static_cast<size_t>(seqlen_k) * nhead_k * v_head_bytes);
+    std::mt19937 rng(29 + hdim);
+    std::uniform_real_distribution<float> distribution(-0.25f, 0.25f);
+    for(float& value : q) value = distribution(rng);
+    for(float& value : v) value = distribution(rng);
+    transformed_q = q;
+    for(int pair = 0; pair < hdim / 2; ++pair)
+    {
+        const float angle = 0.001f * static_cast<float>((pair * 17 + 3) % 97);
+        cos_theta[pair] = std::cos(angle);
+        sin_theta[pair] = std::sin(angle);
+    }
+    for(int row = 0; row < seqlen_q; ++row)
+        for(int head = 0; head < nhead_q; ++head)
+            for(int pair = 0; pair < hdim / 2; ++pair)
+            {
+                const size_t base = (static_cast<size_t>(row) * nhead_q + head) * hdim + pair * 2;
+                const float a = transformed_q[base];
+                const float b = transformed_q[base + 1];
+                transformed_q[base] = a * cos_theta[pair] - b * sin_theta[pair];
+                transformed_q[base + 1] = a * sin_theta[pair] + b * cos_theta[pair];
+            }
+    for(int row = 0; row < seqlen_k; ++row)
+        for(int head = 0; head < nhead_k; ++head)
+        {
+            uint8_t* destination = packed_k.data() +
+                (static_cast<size_t>(row) * nhead_k + head) * k_head_bytes;
+            const float cnorm = 0.5f + 0.01f * static_cast<float>((row + head) % 11);
+            std::memcpy(destination, &cnorm, sizeof(cnorm));
+            for(int chunk = 0; chunk < hdim / 256; ++chunk)
+                for(int lane = 0; lane < 32; ++lane)
+                {
+                    uint32_t codes = 0;
+                    for(int i = 0; i < 8; ++i)
+                    {
+                        const int code = (row * 3 + head * 5 + chunk * 7 + lane + i) & 7;
+                        codes |= static_cast<uint32_t>(code) << (i * 3);
+                        const int dim = chunk * 256 + lane * 8 + i;
+                        decoded_k[(static_cast<size_t>(row) * nhead_k + head) * hdim + dim] =
+                            cnorm * centroids[code];
+                    }
+                    uint8_t* bytes = destination + 4 + chunk * 96 + lane * 3;
+                    bytes[0] = codes & 0xff;
+                    bytes[1] = (codes >> 8) & 0xff;
+                    bytes[2] = (codes >> 16) & 0xff;
+                }
+        }
+    pack_q8(v, packed_v, decoded_v, seqlen_k, nhead_k);
+    const int groups = nhead_q / nhead_k;
+    for(int sq = 0; sq < seqlen_q; ++sq)
+        for(int hq = 0; hq < nhead_q; ++hq)
+        {
+            const int hk = hq / groups;
+            const int last_key = sq + seqlen_k - seqlen_q;
+            std::vector<float> scores(last_key + 1);
+            float maximum = -INFINITY;
+            for(int sk = 0; sk <= last_key; ++sk)
+            {
+                float score = 0.0f;
+                for(int d = 0; d < hdim; ++d)
+                    score += transformed_q[(static_cast<size_t>(sq) * nhead_q + hq) * hdim + d] *
+                             decoded_k[(static_cast<size_t>(sk) * nhead_k + hk) * hdim + d];
+                scores[sk] = score * scale;
+                maximum = std::max(maximum, scores[sk]);
+            }
+            float denominator = 0.0f;
+            for(float& score : scores) { score = std::exp(score - maximum); denominator += score; }
+            for(int d = 0; d < hdim; ++d)
+                for(int sk = 0; sk <= last_key; ++sk)
+                    expected[(static_cast<size_t>(sq) * nhead_q + hq) * hdim + d] +=
+                        scores[sk] / denominator *
+                        decoded_v[(static_cast<size_t>(sk) * nhead_k + hk) * hdim + d];
+        }
+
+    void *dq = nullptr, *dk = nullptr, *dv = nullptr, *dout = nullptr;
+    void *dcos = nullptr, *dsin = nullptr, *workspace = nullptr;
+    check_hip(hipMalloc(&dq, q_count * sizeof(float)), "hipMalloc(asym q)");
+    check_hip(hipMalloc(&dk, packed_k.size()), "hipMalloc(asym k)");
+    check_hip(hipMalloc(&dv, packed_v.size()), "hipMalloc(asym v)");
+    check_hip(hipMalloc(&dout, q_count * sizeof(float)), "hipMalloc(asym out)");
+    check_hip(hipMalloc(&dcos, cos_theta.size() * sizeof(float)), "hipMalloc(asym cos)");
+    check_hip(hipMalloc(&dsin, sin_theta.size() * sizeof(float)), "hipMalloc(asym sin)");
+    check_hip(hipMemcpy(dq, q.data(), q_count * sizeof(float), hipMemcpyHostToDevice), "copy asym q");
+    check_hip(hipMemcpy(dk, packed_k.data(), packed_k.size(), hipMemcpyHostToDevice), "copy asym k");
+    check_hip(hipMemcpy(dv, packed_v.data(), packed_v.size(), hipMemcpyHostToDevice), "copy asym v");
+    check_hip(hipMemcpy(dcos, cos_theta.data(), cos_theta.size() * sizeof(float), hipMemcpyHostToDevice), "copy asym cos");
+    check_hip(hipMemcpy(dsin, sin_theta.data(), sin_theta.size() * sizeof(float), hipMemcpyHostToDevice), "copy asym sin");
+    hipfire_flash_attn_ck_fwd_params params{};
+    params.abi_version = HIPFIRE_FLASH_ATTN_CK_ABI_VERSION; params.struct_size = sizeof(params);
+    params.q = dq; params.k = dk; params.v = dv; params.out = dout;
+    params.dtype = HIPFIRE_FLASH_ATTN_CK_F32;
+    params.k_format = HIPFIRE_FLASH_ATTN_CK_ASYM3_GIVENS;
+    params.v_format = HIPFIRE_FLASH_ATTN_CK_Q8;
+    params.batch = 1; params.seqlen_q = seqlen_q; params.seqlen_k = seqlen_k;
+    params.nhead_q = nhead_q; params.nhead_k = nhead_k; params.head_dim = hdim;
+    params.causal = 1; params.softmax_scale = scale;
+    params.stride_q = params.stride_out = nhead_q * hdim;
+    params.stride_k = params.stride_v = nhead_k * hdim;
+    params.nhead_stride_q = params.nhead_stride_k = params.nhead_stride_v = params.nhead_stride_out = hdim;
+    params.batch_stride_q = params.batch_stride_out = seqlen_q * nhead_q * hdim;
+    params.batch_stride_k = params.batch_stride_v = seqlen_k * nhead_k * hdim;
+    params.packed_k_head_stride_bytes = k_head_bytes;
+    params.packed_v_head_stride_bytes = v_head_bytes;
+    params.packed_k_row_stride_bytes = nhead_k * k_head_bytes;
+    params.packed_v_row_stride_bytes = nhead_k * v_head_bytes;
+    params.k_transform0 = dcos; params.k_transform1 = dsin;
+    params.k_transform0_elements = params.k_transform1_elements = hdim / 2;
+    params.workspace_bytes = hipfire_flash_attn_ck_fwd_workspace_bytes(&params);
+    check_hip(hipMalloc(&workspace, params.workspace_bytes), "hipMalloc(asym workspace)");
+    params.workspace = workspace;
+    char error[1024]{};
+    const int status = hipfire_flash_attn_ck_fwd(&params, error, sizeof(error));
+    if(status != 0) { std::fprintf(stderr, "asym3 sidecar status=%d: %s\n", status, error); std::exit(12); }
+    check_hip(hipMemcpy(output.data(), dout, q_count * sizeof(float), hipMemcpyDeviceToHost), "copy asym out");
+    float max_abs = 0.0f; double mean_abs = 0.0;
+    for(size_t i = 0; i < q_count; ++i) { const float d = std::abs(output[i] - expected[i]); max_abs = std::max(max_abs, d); mean_abs += d; }
+    mean_abs /= q_count;
+    std::printf("case=asym3-givens-d%d-gqa-causal max_abs=%.7g mean_abs=%.7g workspace=%zu\n",
+                hdim, max_abs, mean_abs, params.workspace_bytes);
+    if(max_abs > 0.002f) std::exit(13);
+    for(void* pointer : {dq, dk, dv, dout, dcos, dsin, workspace}) check_hip(hipFree(pointer), "hipFree(asym)");
+}
+
 } // namespace
 
 int main()
@@ -374,10 +669,29 @@ int main()
         std::fprintf(stderr, "sidecar ABI mismatch\n");
         return 1;
     }
+    verify_capabilities();
     run_case("gqa-noncausal", 4, 2, false, false);
     run_case("gqa-causal", 4, 2, true, true);
     run_case("mha-noncausal", 2, 2, false, false);
     run_case("mqa-noncausal", 4, 1, false, false);
-    run_q8_d256_case();
+    if(has_capability(HIPFIRE_FLASH_ATTN_CK_F32,
+                      HIPFIRE_FLASH_ATTN_CK_Q8,
+                      HIPFIRE_FLASH_ATTN_CK_Q8,
+                      256))
+    {
+        run_q8_d256_case();
+    }
+    run_asym3_contract_case(
+        HIPFIRE_FLASH_ATTN_CK_ASYM3_GIVENS, 256, kExpectedAsym3GivensD256);
+    run_asym3_contract_case(
+        HIPFIRE_FLASH_ATTN_CK_ASYM3_GIVENS, 512, kExpectedAsym3GivensD256);
+    run_asym3_contract_case(
+        HIPFIRE_FLASH_ATTN_CK_ASYM3_FWHT, 256, kExpectedAsym3GivensD256);
+    run_asym3_contract_case(
+        HIPFIRE_FLASH_ATTN_CK_ASYM3_FWHT, 512, kExpectedAsym3GivensD256);
+    if(kExpectedAsym3GivensD256)
+    {
+        run_asym3_givens_case(256);
+    }
     return 0;
 }
