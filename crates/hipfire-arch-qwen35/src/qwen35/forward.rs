@@ -51,7 +51,7 @@ use hipfire_runtime::llama::EmbeddingFormat;
 use hipfire_runtime::llama::KvCacheExt;
 use hipfire_runtime::llama::ParoRotation;
 use hipfire_runtime::llama::WeightTensor;
-use hipfire_runtime::multi_gpu::Gpus;
+use hipfire_hardware::Gpus;
 use hipfire_runtime::tp_shard::ShardConfig;
 use rdna_compute::DType;
 use rdna_compute::Gpu;

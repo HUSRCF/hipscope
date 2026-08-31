@@ -32,7 +32,7 @@ use hipfire_runtime::kv_mode;
 use hipfire_runtime::llama;
 use hipfire_runtime::llama::{KvCacheExt, KvDims, KvLayers, KvTarget};
 use hipfire_runtime::loader_api::{CaskConfig, LoadCtx, ModelSource, SpecLoadCfg};
-use hipfire_runtime::multi_gpu::Gpus;
+use hipfire_hardware::Gpus;
 use hipfire_runtime::spec::{SpecEmit, SpecEmitCtx, SpecTargetGuard, Speculator};
 use hipfire_runtime::triattn::{EvictionCtx, TriAttnCenters};
 use rdna_compute::Gpu;

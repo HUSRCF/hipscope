@@ -73,7 +73,7 @@ pub struct RuntimeConfig {
     pub lm_head_f16: String,
     /// Tensor-parallel RCCL all-reduce toggle. `None` (unset) → RCCL is used
     /// (default). `Some(false)` (HIPFIRE_TP_USE_RCCL=0) → opt out of the RCCL
-    /// path. `Some(true)` → force on. Read by `multi_gpu::Gpus::ensure_rccl`.
+    /// path. `Some(true)` → force on. Read by `hipfire_hardware::Gpus::ensure_rccl`.
     pub tp_use_rccl: Option<bool>,
     pub ngram_loop_threshold: usize,
     pub ngram_window: usize,

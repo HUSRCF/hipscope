@@ -1635,7 +1635,7 @@ pub fn forward_batch(
 /// enabled for the fast peer-direct all-reduce.
 #[allow(clippy::too_many_arguments)]
 pub fn forward_ep(
-    gpus: &mut hipfire_runtime::multi_gpu::Gpus,
+    gpus: &mut hipfire_hardware::Gpus,
     weights_per_rank: &[MiniMaxWeights],
     cfg: &MiniMaxConfig,
     state_per_rank: &mut [MiniMaxState],

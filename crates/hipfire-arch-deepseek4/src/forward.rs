@@ -12875,7 +12875,7 @@ pub fn forward_prefill_batch_chunked(
 /// rank enters the next stage with bit-identical residual streams.
 #[allow(clippy::too_many_arguments)]
 pub fn forward_ep_prefill_batch_chunked(
-    gpus: &mut hipfire_runtime::multi_gpu::Gpus,
+    gpus: &mut hipfire_hardware::Gpus,
     weights_per_rank: &[DeepseekV4Weights],
     cfg: &DeepseekV4Config,
     state_per_rank: &mut [DeepseekV4State],

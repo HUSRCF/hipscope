@@ -11,7 +11,7 @@ use crate::kv_backend::{
     KvBackend, KvChunkPlan, DEFAULT_KV_CHUNK_TOKENS, DEFAULT_VMM_PHYSICAL_CHUNK_BYTES,
 };
 use crate::kv_mode::KvMode;
-use crate::multi_gpu::Gpus;
+use hipfire_hardware::Gpus;
 use hip_bridge::HipResult;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -5563,8 +5563,8 @@ pub use saddle_core::kv::{KvCache, KvDims, KvLayers, VMode};
 // `KvMode` and `KvBackend` are re-exported from their canonical modules
 // (`crate::kv_mode`, `crate::kv_backend`) which themselves re-export from
 // `saddle-core`; `llama.rs` does not need to re-export them directly.
-// `KvTarget` stays here because it depends on `crate::multi_gpu::Gpus`,
-// which is runtime-specific and must not leak into `saddle-core`.
+// `KvTarget` stays here because it depends on `hipfire_hardware::Gpus`,
+// which is hardware-specific and must not leak into `saddle-core`.
 
 pub enum KvTarget<'a> {
     /// pp == 1: one GPU. Sites 1–5.

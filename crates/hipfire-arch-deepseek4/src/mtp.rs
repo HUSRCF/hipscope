@@ -526,7 +526,7 @@ fn mtp_head(
 /// all-reduce.
 #[allow(clippy::too_many_arguments)]
 pub fn mtp_forward_ep(
-    gpus: &mut hipfire_runtime::multi_gpu::Gpus,
+    gpus: &mut hipfire_hardware::Gpus,
     weights_per_rank: &[DeepseekV4Weights],
     cfg: &DeepseekV4Config,
     state_per_rank: &mut [DeepseekV4State],

@@ -6,7 +6,7 @@ use hipfire_arch_qwen35::qwen35::{
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::kv_mode::KvMode;
 use hipfire_runtime::llama::{KvCache, KvCacheExt, KvDims, KvLayers, KvTarget};
-use hipfire_runtime::multi_gpu::Gpus;
+use hipfire_hardware::Gpus;
 use hipfire_runtime::tokenizer::Tokenizer;
 use hipfire_runtime::tp_shard::{ExpertAssign, ShardConfig};
 use rdna_compute::Gpu;

@@ -11,7 +11,7 @@
 //! a model-throughput claim.
 
 use hip_bridge::DeviceBuffer;
-use hipfire_runtime::multi_gpu::Gpus;
+use hipfire_hardware::Gpus;
 use std::time::Instant;
 
 const RANKS: usize = 4;

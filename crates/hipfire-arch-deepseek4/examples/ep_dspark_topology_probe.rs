@@ -17,7 +17,7 @@ use hipfire_arch_deepseek4::forward::{
 use hipfire_arch_deepseek4::{DeepseekV4, DeepseekV4State};
 use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::hfq::HfqFile;
-use hipfire_runtime::multi_gpu::Gpus;
+use hipfire_hardware::Gpus;
 use hipfire_runtime::tp_shard::{ExpertAssign, ShardConfig};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::path::{Path, PathBuf};

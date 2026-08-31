@@ -15,7 +15,7 @@
 use hipfire_arch_qwen35::qwen35;
 use hipfire_runtime::llama::KvCacheExt;
 use hipfire_runtime::hfq::HfqFile;
-use hipfire_runtime::multi_gpu::Gpus;
+use hipfire_hardware::Gpus;
 use std::path::Path;
 
 fn main() {

@@ -31,7 +31,7 @@
 //! driver loops layers (advancing each rank's per-layer binding state) the same
 //! way the single-GPU lowered driver loops `run_layer_program`.
 
-use crate::multi_gpu::Gpus;
+use hipfire_hardware::Gpus;
 use hip_bridge::{DeviceBuffer, HipError};
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::pipeline::superop::{
@@ -67,10 +67,13 @@ fn all_reduce_sum_f32_decode(
     let use_peer = *PEER_DECODE.get_or_init(|| {
         hipfire_config::developer_var("HIPFIRE_EP_PEER_ALLREDUCE_DECODE").as_deref() == Ok("1")
     });
+    let group: Vec<usize> = (0..refs.len()).collect();
     if use_peer {
-        gpus.all_reduce_sum_f32_peer(refs, count).map_err(hip_err)
+        gpus
+            .all_reduce_sum_f32_peer(&group, refs, count)
+            .map_err(hip_err)
     } else {
-        gpus.all_reduce_sum_f32(refs, count).map_err(hip_err)
+        gpus.all_reduce_sum_f32(&group, refs, count).map_err(hip_err)
     }
 }
 

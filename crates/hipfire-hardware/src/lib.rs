@@ -21,10 +21,54 @@
 //! 3. Pass the multi-GPU coherence gate.
 
 use hip_bridge::{
-    DeviceBuffer, Event, HipError, HipResult, RcclComms, HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED,
-    HIP_ERROR_PEER_ACCESS_UNSUPPORTED, HIP_EVENT_DISABLE_TIMING, HIP_EVENT_RELEASE_TO_SYSTEM,
+    DeviceBuffer, Event, HipError, HipResult, HipRuntime, RcclComms,
+    HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED, HIP_ERROR_PEER_ACCESS_UNSUPPORTED,
+    HIP_EVENT_DISABLE_TIMING, HIP_EVENT_RELEASE_TO_SYSTEM,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
+
+mod mesh;
+pub use mesh::{Axis, CollectiveHint, DeviceMesh, DimKind, MeshEpoch};
+
+/// Device-resolution knobs used when constructing a [`Gpus`] owner.
+///
+/// The hardware leaf reads the same legacy `HIPFIRE_*` environment variables
+/// as the runtime did, without depending on runtime configuration. Higher
+/// layers may eventually supply an explicit option set; the constructors
+/// below intentionally keep the existing process-environment behavior.
+#[derive(Clone, Debug, Default)]
+pub struct DeviceResolveOpts {
+    pub tp_use_rccl: Option<bool>,
+    pub devices: Option<String>,
+    pub emulate_gpus: Option<usize>,
+    pub allow_mixed_arch: bool,
+    pub uniform_vram_tolerance_gb: Option<f32>,
+}
+
+impl DeviceResolveOpts {
+    pub fn from_env() -> Self {
+        Self {
+            tp_use_rccl: std::env::var("HIPFIRE_TP_USE_RCCL")
+                .ok()
+                .as_deref()
+                .map(|value| value != "0" && !value.eq_ignore_ascii_case("false")),
+            devices: std::env::var("HIPFIRE_DEVICES")
+                .ok()
+                .filter(|value| !value.is_empty()),
+            emulate_gpus: std::env::var("HIPFIRE_EMULATE_GPUS")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .filter(|&count| count >= 2),
+            allow_mixed_arch: std::env::var("HIPFIRE_ALLOW_MIXED_ARCH")
+                .ok()
+                .as_deref()
+                == Some("1"),
+            uniform_vram_tolerance_gb: std::env::var("HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB")
+                .ok()
+                .and_then(|value| value.parse().ok()),
+        }
+    }
+}
 
 /// Stream-event handoff returned by `Gpus::boundary_copy`. When the src
 /// device has an active stream, `completion` holds a HIP event recorded
@@ -871,7 +915,7 @@ impl Gpus {
         if self.rccl_comms.is_some() {
             return Ok(());
         }
-        if matches!(crate::config::get().tp_use_rccl, Some(false)) {
+        if matches!(DeviceResolveOpts::from_env().tp_use_rccl, Some(false)) {
             return Err(HipError::new(
                 0,
                 "ensure_rccl: HIPFIRE_TP_USE_RCCL=0 — RCCL path opted out. \
@@ -896,71 +940,73 @@ impl Gpus {
         Ok(())
     }
 
-    /// All-reduce-sum of f32 buffers across all ranks. `buffers[r]` must
-    /// be a device pointer on `devices[r]` holding `count` f32 elements;
-    /// after this call, each buffer holds the element-wise sum across
-    /// all ranks. In-place (send == recv) — saves a memcpy and matches
-    /// how the TP forward path uses the result.
+    /// All-reduce-sum of f32 buffers across a participating device group.
+    /// `buffers[k]` must be a device pointer on `self.devices[group[k]]`
+    /// holding `count` f32 elements; after this call, every group buffer
+    /// holds the element-wise sum. In-place (send == recv).
     ///
-    /// Requires each device to have an `active_stream` set (the stream
-    /// the collective runs on). Synchronization is the caller's
-    /// responsibility: this call enqueues the collective and returns
-    /// immediately; the buffers are valid only after a subsequent
-    /// `stream_synchronize` (or a downstream dispatch that's already
-    /// ordered behind the same stream).
-    pub fn all_reduce_sum_f32(&mut self, buffers: &[&DeviceBuffer], count: usize) -> HipResult<()> {
-        if buffers.len() != self.devices.len() {
+    /// The RCCL communicator is owned by this entire `Gpus` set, so this
+    /// implementation accepts only the full ordered group `0..n`. Use
+    /// [`Self::all_reduce_sum_f32_peer`] for genuine subgroup reductions.
+    /// Synchronization remains the caller's responsibility.
+    pub fn all_reduce_sum_f32(
+        &mut self,
+        group: &[usize],
+        buffers: &[&DeviceBuffer],
+        count: usize,
+    ) -> HipResult<()> {
+        if buffers.len() != group.len() {
             return Err(HipError::new(
                 0,
                 &format!(
-                    "all_reduce_sum_f32: buffers.len()={} != n_devices={}",
+                    "all_reduce_sum_f32: buffers.len()={} != group.len()={}",
                     buffers.len(),
-                    self.devices.len()
+                    group.len()
                 ),
             ));
         }
-        // Single-rank (TP=1) degenerate case: the all-reduce-sum over one
-        // buffer is the identity — the buffer already holds the only rank's
-        // partial. Short-circuit so the TP=1 EP path is a pure single-GPU
-        // reference that exercises the full EP executor WITHOUT requiring
-        // librccl (a 1-rank communicator would also work, but skipping it
-        // keeps TP=1 dependency-free and the parity baseline trivially exact).
-        if self.devices.len() == 1 {
+        let n = self.devices.len();
+        if group.len() != n || !group.iter().copied().eq(0..n) {
+            return Err(HipError::new(
+                0,
+                "all_reduce_sum_f32 (RCCL): sub-group reduction needs ncclCommSplit \
+                 (Phase 5b); use all_reduce_sum_f32_peer for sub-groups.",
+            ));
+        }
+        // Single-rank (TP=1) all-reduce is the identity and does not require
+        // librccl.
+        if n == 1 {
             return Ok(());
         }
         self.ensure_rccl()?;
 
-        // Borrow-check note: `self.rccl_comms.as_ref()` projects through
-        // a single field, leaving `self.devices` independently
-        // borrow-able for the per-rank stream lookup below.
         let rccl = self.rccl_comms.as_ref().expect("ensure_rccl populated it");
-
         rccl.group_start()
             .map_err(|e| HipError::new(0, &format!("ncclGroupStart: {e}")))?;
-        for (r, buf) in buffers.iter().enumerate() {
-            let dev = &self.devices[r];
+        for (rank, buf) in buffers.iter().enumerate() {
+            let dev = &self.devices[rank];
             dev.bind_thread()?;
             let stream = dev.active_stream.as_ref().ok_or_else(|| {
                 HipError::new(
                     0,
                     &format!(
-                        "all_reduce_sum_f32: device {r} has no active_stream — \
-                         set `gpus.devices[r].active_stream = Some(stream)` before calling.",
+                        "all_reduce_sum_f32: device {rank} has no active_stream — \
+                         set `gpus.devices[{rank}].active_stream = Some(stream)` before calling.",
                     ),
                 )
             })?;
             // SAFETY: `buf` is a live device buffer of `count` f32 on device
-            // `r`, and `stream` is that device's active stream.
+            // `rank`, and `stream` is that device's active stream.
             unsafe {
                 rccl.all_reduce_sum_f32(
-                    r,
+                    rank,
                     buf.as_ptr() as *const f32,
                     buf.as_ptr() as *mut f32,
                     count,
                     stream.raw_ptr(),
                 )
             }
-            .map_err(|e| HipError::new(0, &format!("ncclAllReduce rank={r}: {e}")))?;
+            .map_err(|e| HipError::new(0, &format!("ncclAllReduce rank={rank}: {e}")))?;
         }
         rccl.group_end()
             .map_err(|e| HipError::new(0, &format!("ncclGroupEnd: {e}")))?;
@@ -1435,23 +1481,15 @@ impl Gpus {
         Ok(())
     }
 
-    /// All-reduce-sum of f32 buffers across all ranks via **direct peer copy +
-    /// local add** — bypassing RCCL. On consumer/prosumer RDNA P2P (no xGMI,
-    /// e.g. hiptrx 4× gfx1201), `ncclAllReduce` costs ~40 ms/call for these
-    /// small/medium messages regardless of NCCL_PROTO/CHANNELS/BUFFSIZE/
-    /// SOCKET_IFNAME, while this path is ~1 ms. Used by EP prefill and TP; EP
-    /// decode's tiny per-token reduce stays on RCCL (already fast). PP never
-    /// all-reduces (it uses `boundary_copy` point-to-point).
+    /// All-reduce-sum of f32 buffers across a participating device group via
+    /// direct peer copies and local adds, bypassing RCCL.
     ///
-    /// Algorithm (N-rank, race-free): **phase 1** copies every OTHER rank's
-    /// ORIGINAL buffer into a local temp (all reads, no writes); a barrier
-    /// (`wait_boundary`); **phase 2** adds the peer temps into the local buffer.
-    /// All-reads-before-writes ⇒ no cross-device read/write race. `n==1` is the
-    /// identity (no-op). Requires peer access (caller's `enable_peer_all`) for
-    /// the fast P2P path; without it `boundary_copy` host-stages (slower but
-    /// correct). In-place: `buffers[r]` is both input and output.
+    /// `group` lists global device IDs and `buffers[k]` belongs to
+    /// `self.devices[group[k]]`. Unlike the RCCL path this is genuinely
+    /// subgroup-capable, which is required for composed TP×EP meshes.
     pub fn all_reduce_sum_f32_peer(
         &mut self,
+        group: &[usize],
         buffers: &[&DeviceBuffer],
         count: usize,
     ) -> HipResult<()> {
@@ -1464,56 +1502,75 @@ impl Gpus {
                 "all_reduce_sum_f32_peer: peer scratch is leased — use leased API or release lease",
             ));
         }
+        let g = group.len();
         let n = self.devices.len();
-        if buffers.len() != n {
+        if buffers.len() != g {
             return Err(HipError::new(
                 0,
                 &format!(
-                    "all_reduce_sum_f32_peer: buffers.len()={} != n_devices={n}",
+                    "all_reduce_sum_f32_peer: buffers.len()={} != group.len()={g}",
                     buffers.len()
                 ),
             ));
         }
-        if n == 1 {
+        for (index, &device) in group.iter().enumerate() {
+            if device >= n || group[..index].contains(&device) {
+                return Err(HipError::new(
+                    0,
+                    &format!(
+                        "all_reduce_sum_f32_peer: group contains invalid or duplicate device {device}"
+                    ),
+                ));
+            }
+        }
+        if g <= 1 {
             return Ok(());
         }
-        let bytes = count * 4;
+        let bytes = count
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| HipError::new(0, "all_reduce_sum_f32_peer: count overflow"))?;
         self.ensure_peer_ar_tmp(bytes)?;
+
         // Phase 1: read every peer's ORIGINAL buffer into a local temp.
-        let mut evts = Vec::with_capacity(n * (n - 1));
-        for r in 0..n {
-            let mut slot = 0usize;
-            for j in 0..n {
-                if j == r {
+        let mut events = Vec::with_capacity(g * (g - 1));
+        for (k, &device_k) in group.iter().enumerate() {
+            let mut slot = 0;
+            for (m, &device_m) in group.iter().enumerate() {
+                if m == k {
                     continue;
                 }
-                let evt =
-                    self.boundary_copy(j, r, buffers[j], &self.peer_ar_tmp[r][slot], bytes)?;
-                evts.push(evt);
+                let event = self.boundary_copy(
+                    device_m,
+                    device_k,
+                    buffers[m],
+                    &self.peer_ar_tmp[device_k][slot],
+                    bytes,
+                )?;
+                events.push(event);
                 slot += 1;
             }
         }
-        for evt in evts {
-            self.wait_boundary(evt)?;
+        for event in events {
+            self.wait_boundary(event)?;
         }
 
-        // Phase 2: add the peer temps into each rank's buffer.
-        for r in 0..n {
+        // Phase 2: add peer temps into each rank's buffer.
+        for (k, &device_k) in group.iter().enumerate() {
             let dst = GpuTensor {
-                buf: unsafe { buffers[r].alias() },
+                buf: unsafe { buffers[k].alias() },
                 shape: vec![count],
                 dtype: DType::F32,
             };
-            let srcs: Vec<GpuTensor> = (0..n - 1)
+            let srcs: Vec<GpuTensor> = (0..g - 1)
                 .map(|slot| GpuTensor {
-                    buf: unsafe { self.peer_ar_tmp[r][slot].alias() },
+                    buf: unsafe { self.peer_ar_tmp[device_k][slot].alias() },
                     shape: vec![count],
                     dtype: DType::F32,
                 })
                 .collect();
-            self.devices[r].bind_thread()?;
+            self.devices[device_k].bind_thread()?;
             for src in &srcs {
-                self.devices[r].add_inplace_f32(&dst, src)?;
+                self.devices[device_k].add_inplace_f32(&dst, src)?;
             }
         }
         Ok(())
@@ -1848,27 +1905,50 @@ fn uniform_split_counts(n_devices: usize, n_layers: usize) -> Vec<usize> {
 /// Resolve logical device IDs after the physical `hardware.devices` list has
 /// been installed as `ROCR_VISIBLE_DEVICES` and HIP has received the matching
 /// post-filter logical IDs. When unset, take the first `n_devices` visible IDs.
+/// Map each requested logical device id into the physical range
+/// `[0, real_count)` by euclidean remainder. Used by
+/// `HIPFIRE_EMULATE_GPUS` to alias N logical devices onto fewer physical
+/// devices. A non-positive `real_count` is left untouched so the caller can
+/// surface the underlying HIP error.
+fn alias_ids(ids: &[i32], real_count: i32) -> Vec<i32> {
+    if real_count <= 0 {
+        return ids.to_vec();
+    }
+    ids.iter().map(|&id| id.rem_euclid(real_count)).collect()
+}
+
+/// Resolve logical IDs from `HIPFIRE_DEVICES`, or use the first N visible IDs.
+/// `HIPFIRE_EMULATE_GPUS` optionally aliases those IDs into the physical
+/// runtime device range for debug-only multi-rank emulation.
 fn resolve_device_ids(n_devices: usize) -> HipResult<Vec<i32>> {
-    if let Some(ref s) = crate::config::get().devices {
-        let ids: Vec<i32> = s
+    let opts = DeviceResolveOpts::from_env();
+    let ids: Vec<i32> = if let Some(value) = &opts.devices {
+        let parsed = value
             .split(',')
-            .map(|p| p.trim())
-            .filter(|p| !p.is_empty())
-            .map(|p| p.parse::<i32>())
-            .collect::<Result<_, _>>()
-            .map_err(|e| HipError::new(0, &format!("hardware.devices parse: {e}")))?;
-        if ids.len() < n_devices {
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+            .map(str::parse::<i32>)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| HipError::new(0, &format!("HIPFIRE_DEVICES parse: {error}")))?;
+        if parsed.len() < n_devices {
             return Err(HipError::new(
                 0,
                 &format!(
-                    "hardware.devices exposes {} ids but n_devices = {n_devices}",
-                    ids.len(),
+                    "HIPFIRE_DEVICES has {} ids but n_devices = {n_devices}",
+                    parsed.len()
                 ),
             ));
         }
-        return Ok(ids[..n_devices].to_vec());
+        parsed[..n_devices].to_vec()
+    } else {
+        (0..n_devices as i32).collect()
+    };
+
+    if opts.emulate_gpus.is_some() {
+        let real_count = HipRuntime::load()?.device_count()?;
+        return Ok(alias_ids(&ids, real_count));
     }
-    Ok((0..n_devices as i32).collect())
+    Ok(ids)
 }
 
 fn construct_devices(ids: &[i32]) -> HipResult<Vec<Gpu>> {
@@ -1884,18 +1964,18 @@ fn preflight_vram_with_opts(devices: &[Gpu], check_vram_delta: bool) -> HipResul
         return Ok(());
     }
     let arch0 = devices[0].arch.clone();
-    let allow_mixed = crate::config::get().allow_mixed_arch;
+    let opts = DeviceResolveOpts::from_env();
     let mut frees = Vec::with_capacity(devices.len());
-    for d in devices {
-        if d.arch != arch0 {
-            if allow_mixed {
+    for device in devices {
+        if device.arch != arch0 {
+            if opts.allow_mixed_arch {
                 eprintln!(
                     "preflight_vram: mixed-arch detected — dev 0 is {arch0}, dev {} is {}. \
                      Proceeding because HIPFIRE_ALLOW_MIXED_ARCH=1. \
                      Per-arch JIT cache will be populated on first run; boundary_copy uses \
                      hipMemcpyPeer / hipMemcpyPeerAsync which fall through to host-staging \
                      if peer access is unsupported by the pair (correctness holds either way).",
-                    d.device_id, d.arch,
+                    device.device_id, device.arch,
                 );
             } else {
                 return Err(HipError::new(
@@ -1903,13 +1983,13 @@ fn preflight_vram_with_opts(devices: &[Gpu], check_vram_delta: bool) -> HipResul
                     &format!(
                         "preflight_vram: arch mismatch — dev 0 is {arch0}, dev {} is {}. \
                          Mixed-arch is not supported by default; set HIPFIRE_ALLOW_MIXED_ARCH=1 to override.",
-                        d.device_id, d.arch,
+                        device.device_id, device.arch,
                     ),
                 ));
             }
         }
-        d.bind_thread()?;
-        let (free, _total) = d.hip.get_vram_info()?;
+        device.bind_thread()?;
+        let (free, _total) = device.hip.get_vram_info()?;
         frees.push(free);
     }
     if !check_vram_delta {
@@ -1918,17 +1998,17 @@ fn preflight_vram_with_opts(devices: &[Gpu], check_vram_delta: bool) -> HipResul
     let max_free = *frees.iter().max().unwrap();
     let min_free = *frees.iter().min().unwrap();
     let delta_gb = (max_free - min_free) as f64 / 1e9;
-    let tol_gb = crate::config::get()
+    let tolerance_gb = opts
         .uniform_vram_tolerance_gb
-        .map(|t| t as f64)
+        .map(|value| value as f64)
         .unwrap_or(DEFAULT_VRAM_TOLERANCE_GB);
-    if delta_gb > tol_gb {
+    if delta_gb > tolerance_gb {
         return Err(HipError::new(
             0,
             &format!(
                 "preflight_vram: VRAM delta {:.1} GiB exceeds tolerance {:.1} GiB. \
                  Override via HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB or use init_layers().",
-                delta_gb, tol_gb,
+                delta_gb, tolerance_gb,
             ),
         ));
     }

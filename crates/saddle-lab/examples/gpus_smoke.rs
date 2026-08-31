@@ -7,7 +7,7 @@
 //!
 //! Run: HIP_VISIBLE_DEVICES=0,1 cargo run -p hipfire-runtime --example gpus_smoke
 
-use hipfire_runtime::multi_gpu::Gpus;
+use hipfire_hardware::Gpus;
 use rdna_compute::{DType, Gpu};
 
 fn main() {

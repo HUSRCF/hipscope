@@ -16,7 +16,7 @@ use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35ScratchSet, StateQu
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::KvCache;
 use hipfire_runtime::llama::KvCacheExt;
-use hipfire_runtime::multi_gpu::Gpus;
+use hipfire_hardware::Gpus;
 use std::path::Path;
 
 fn used_gb(gpus: &Gpus, baseline_free: &[(usize, usize)]) -> Vec<f64> {

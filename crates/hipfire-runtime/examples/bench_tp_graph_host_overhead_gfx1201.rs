@@ -4,7 +4,7 @@
 
 use std::time::Instant;
 
-use hipfire_runtime::multi_gpu::Gpus;
+use hipfire_hardware::Gpus;
 
 fn percentile(mut values: Vec<f64>, quantile: f64) -> f64 {
     values.sort_by(f64::total_cmp);

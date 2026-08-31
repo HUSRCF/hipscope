@@ -36,7 +36,7 @@ fn main() {
     use hipfire_arch_minimax::forward;
     use hipfire_arch_minimax::minimax::{MiniMaxConfig, MiniMaxState, MiniMaxWeights};
     use hipfire_runtime::hfq::HfqFile;
-    use hipfire_runtime::multi_gpu::Gpus;
+    use hipfire_hardware::Gpus;
     use hipfire_runtime::tokenizer::Tokenizer;
     use hipfire_runtime::tp_shard::{ExpertAssign, ShardConfig};
     use rdna_compute::{DType, GpuTensor};

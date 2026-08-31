@@ -6,7 +6,7 @@
 //! per-tensor dequant), which `WeightSource::read_layer` calls internally.
 
 use crate::llama::{EmbeddingFormat, WeightTensor};
-use crate::multi_gpu::Gpus;
+use hipfire_hardware::Gpus;
 use hip_bridge::HipResult;
 use rdna_compute::{Gpu, GpuTensor};
 

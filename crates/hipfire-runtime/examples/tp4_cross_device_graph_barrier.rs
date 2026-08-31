@@ -13,7 +13,7 @@
 //! replay rather than passing on a stale record from the prior replay.
 
 use hip_bridge::{DeviceBuffer, Graph, GraphExec};
-use hipfire_runtime::multi_gpu::Gpus;
+use hipfire_hardware::Gpus;
 use rdna_compute::{DType, GpuTensor};
 
 const ELEMS: usize = 4_096;

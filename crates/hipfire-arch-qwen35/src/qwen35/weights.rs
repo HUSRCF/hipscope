@@ -12,7 +12,7 @@ use hip_bridge::HipResult;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::EmbeddingFormat;
 use hipfire_runtime::llama::WeightTensor;
-use hipfire_runtime::multi_gpu::Gpus;
+use hipfire_hardware::Gpus;
 use hipfire_runtime::screen_weight_tensor;
 use hipfire_runtime::MmqScreenable;
 use rdna_compute::DType;
