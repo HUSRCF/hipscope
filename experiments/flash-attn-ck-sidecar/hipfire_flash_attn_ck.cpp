@@ -84,6 +84,14 @@ bool is_asym3_execution_cell(const hipfire_flash_attn_ck_fwd_params* p)
     return is_asym3_givens_cell(p) || is_asym3_fwht_cell(p);
 }
 
+bool is_asym4_contract(const hipfire_flash_attn_ck_fwd_params* p)
+{
+    return p->dtype == HIPFIRE_FLASH_ATTN_CK_F32 &&
+           (p->k_format == HIPFIRE_FLASH_ATTN_CK_ASYM4_GIVENS ||
+            p->k_format == HIPFIRE_FLASH_ATTN_CK_ASYM4_FWHT) &&
+           p->v_format == HIPFIRE_FLASH_ATTN_CK_Q8;
+}
+
 size_t staging_workspace_bytes(const hipfire_flash_attn_ck_fwd_params* p)
 {
     const size_t q = static_cast<size_t>(p->batch) * p->seqlen_q * p->nhead_q * p->head_dim;
@@ -290,7 +298,8 @@ int validate(const hipfire_flash_attn_ck_fwd_params* p, char* error, size_t erro
                        p->v_format == HIPFIRE_FLASH_ATTN_CK_DENSE_F16;
     const bool q8 = is_q8_cell(p);
     const bool asym3 = is_asym3_cell(p);
-    if(!dense && !q8 && !asym3)
+    const bool asym4 = is_asym4_contract(p);
+    if(!dense && !q8 && !asym3 && !asym4)
     {
         set_error(error, error_capacity, "unsupported dtype and K/V format cell");
         return 1;
@@ -315,7 +324,8 @@ int validate(const hipfire_flash_attn_ck_fwd_params* p, char* error, size_t erro
     }
     if((dense && p->head_dim != 64) ||
        (q8 && p->head_dim != 256) ||
-       (asym3 && p->head_dim != 256 && p->head_dim != 512))
+       (asym3 && p->head_dim != 256 && p->head_dim != 512) ||
+       (asym4 && p->head_dim != 256))
     {
         set_error(error, error_capacity, "unsupported head dimension for selected cell");
         return 1;
@@ -357,7 +367,7 @@ int validate(const hipfire_flash_attn_ck_fwd_params* p, char* error, size_t erro
             return 1;
         }
     }
-    if(q8 || asym3)
+    if(q8 || asym3 || asym4)
     {
         const int64_t row_elements = static_cast<int64_t>(p->nhead_q) * p->head_dim;
         const int64_t batch_elements = static_cast<int64_t>(p->seqlen_q) * row_elements;
@@ -420,6 +430,31 @@ int validate(const hipfire_flash_attn_ck_fwd_params* p, char* error, size_t erro
             set_error(error, error_capacity, "caller workspace is too small for Asym3 staging");
             return 1;
         }
+    }
+    if(asym4)
+    {
+        const int64_t k_head_bytes = 4 + p->head_dim / 2;
+        const int64_t v_head_bytes = (p->head_dim / 32) * 34;
+        if(p->batch != 1 || p->causal != 1 ||
+           p->packed_k_head_stride_bytes != k_head_bytes ||
+           p->packed_v_head_stride_bytes != v_head_bytes ||
+           p->packed_k_row_stride_bytes < static_cast<int64_t>(p->nhead_k) * k_head_bytes ||
+           p->packed_v_row_stride_bytes < static_cast<int64_t>(p->nhead_k) * v_head_bytes)
+        {
+            set_error(error, error_capacity, "Asym4 requires batch=1, causal, and exact head strides");
+            return 1;
+        }
+        const int64_t transform_elements =
+            p->k_format == HIPFIRE_FLASH_ATTN_CK_ASYM4_GIVENS ? p->head_dim / 2 : 128;
+        if(p->k_transform0 == nullptr || p->k_transform1 == nullptr ||
+           p->k_transform0_elements < transform_elements ||
+           p->k_transform1_elements < transform_elements)
+        {
+            set_error(error, error_capacity, "Asym4 transform metadata is missing or undersized");
+            return 1;
+        }
+        set_error(error, error_capacity, "Asym4 packed layout is valid but has no CK execution cell");
+        return 2;
     }
     set_error(error, error_capacity, "");
     return 0;

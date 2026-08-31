@@ -528,6 +528,71 @@ void run_asym3_contract_case(int format, int hdim, bool artifact_has_cell)
                 has_cell ? "supported" : "recognized-no-cell");
 }
 
+void run_asym4_contract_case(int format)
+{
+    constexpr int hdim = 256;
+    int dummy = 0;
+    hipfire_flash_attn_ck_fwd_params params{};
+    params.abi_version = HIPFIRE_FLASH_ATTN_CK_ABI_VERSION;
+    params.struct_size = sizeof(params);
+    params.q = params.k = params.v = params.out = &dummy;
+    params.dtype = HIPFIRE_FLASH_ATTN_CK_F32;
+    params.k_format = format;
+    params.v_format = HIPFIRE_FLASH_ATTN_CK_Q8;
+    params.batch = 1;
+    params.seqlen_q = 16;
+    params.seqlen_k = 32;
+    params.nhead_q = 4;
+    params.nhead_k = 2;
+    params.head_dim = hdim;
+    params.causal = 1;
+    params.softmax_scale = 1.0f / std::sqrt(static_cast<float>(hdim));
+    params.stride_q = params.stride_out = 4 * hdim;
+    params.stride_k = params.stride_v = 2 * hdim;
+    params.nhead_stride_q = params.nhead_stride_k = params.nhead_stride_v =
+        params.nhead_stride_out = hdim;
+    params.batch_stride_q = params.batch_stride_out = 16 * 4 * hdim;
+    params.batch_stride_k = params.batch_stride_v = 32 * 2 * hdim;
+    params.packed_k_head_stride_bytes = 4 + hdim / 2;
+    params.packed_v_head_stride_bytes = (hdim / 32) * 34;
+    params.packed_k_row_stride_bytes = 2 * params.packed_k_head_stride_bytes;
+    params.packed_v_row_stride_bytes = 2 * params.packed_v_head_stride_bytes;
+    params.k_transform0 = params.k_transform1 = &dummy;
+    const int transform_elements =
+        format == HIPFIRE_FLASH_ATTN_CK_ASYM4_GIVENS ? hdim / 2 : 128;
+    params.k_transform0_elements = params.k_transform1_elements = transform_elements;
+
+    char error[1024]{};
+    if(hipfire_flash_attn_ck_fwd_supported(&params, error, sizeof(error)) != 2 ||
+       std::strstr(error, "no CK execution cell") == nullptr)
+    {
+        std::fprintf(stderr, "asym4 contract was not recognized: %s\n", error);
+        std::exit(14);
+    }
+    params.packed_k_head_stride_bytes -= 1;
+    if(hipfire_flash_attn_ck_fwd_supported(&params, error, sizeof(error)) != 1)
+    {
+        std::fprintf(stderr, "malformed asym4 layout was accepted\n");
+        std::exit(15);
+    }
+    params.packed_k_head_stride_bytes += 1;
+    params.k_transform0 = nullptr;
+    if(hipfire_flash_attn_ck_fwd_supported(&params, error, sizeof(error)) != 1)
+    {
+        std::fprintf(stderr, "null asym4 transform was accepted\n");
+        std::exit(16);
+    }
+    params.k_transform0 = &dummy;
+    params.k_transform1_elements = transform_elements - 1;
+    if(hipfire_flash_attn_ck_fwd_supported(&params, error, sizeof(error)) != 1)
+    {
+        std::fprintf(stderr, "undersized asym4 transform was accepted\n");
+        std::exit(17);
+    }
+    std::printf("case=asym4-contract format=%s head_dim=256 status=recognized-no-cell\n",
+                format == HIPFIRE_FLASH_ATTN_CK_ASYM4_GIVENS ? "givens" : "fwht");
+}
+
 void run_asym3_case(int format, int hdim)
 {
     constexpr float centroids[8] = {
@@ -742,5 +807,7 @@ int main()
     {
         run_asym3_case(HIPFIRE_FLASH_ATTN_CK_ASYM3_FWHT, 256);
     }
+    run_asym4_contract_case(HIPFIRE_FLASH_ATTN_CK_ASYM4_GIVENS);
+    run_asym4_contract_case(HIPFIRE_FLASH_ATTN_CK_ASYM4_FWHT);
     return 0;
 }

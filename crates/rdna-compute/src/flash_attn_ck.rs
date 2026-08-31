@@ -44,6 +44,8 @@ pub enum FlashAttnCkKvFormat {
     Asym3Givens = 4,
     Asym3Fwht = 5,
     Lloyd = 6,
+    Asym4Givens = 7,
+    Asym4Fwht = 8,
 }
 
 pub const FLASH_ATTN_CK_CAP_CAUSAL: u32 = 1 << 0;
@@ -258,6 +260,8 @@ fn is_known_kv_format(value: i32) -> bool {
         || value == FlashAttnCkKvFormat::Asym3Givens as i32
         || value == FlashAttnCkKvFormat::Asym3Fwht as i32
         || value == FlashAttnCkKvFormat::Lloyd as i32
+        || value == FlashAttnCkKvFormat::Asym4Givens as i32
+        || value == FlashAttnCkKvFormat::Asym4Fwht as i32
 }
 
 fn is_supported_abi(version: u32) -> bool {
@@ -1488,26 +1492,34 @@ mod tests {
     fn capability_validation_rejects_unknown_contract_values() {
         let valid = dense_capability(FlashAttnCkArch::Gfx1151);
         assert!(valid.is_well_formed());
-        assert!(!FlashAttnCkCapability {
-            arch: 9999,
-            ..valid
-        }
-        .is_well_formed());
-        assert!(!FlashAttnCkCapability {
-            k_format: 9999,
-            ..valid
-        }
-        .is_well_formed());
-        assert!(!FlashAttnCkCapability {
-            head_dim: 0,
-            ..valid
-        }
-        .is_well_formed());
-        assert!(!FlashAttnCkCapability {
-            flags: 1 << 31,
-            ..valid
-        }
-        .is_well_formed());
+        assert!(
+            !FlashAttnCkCapability {
+                arch: 9999,
+                ..valid
+            }
+            .is_well_formed()
+        );
+        assert!(
+            !FlashAttnCkCapability {
+                k_format: 9999,
+                ..valid
+            }
+            .is_well_formed()
+        );
+        assert!(
+            !FlashAttnCkCapability {
+                head_dim: 0,
+                ..valid
+            }
+            .is_well_formed()
+        );
+        assert!(
+            !FlashAttnCkCapability {
+                flags: 1 << 31,
+                ..valid
+            }
+            .is_well_formed()
+        );
     }
 
     #[test]
