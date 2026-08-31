@@ -121,6 +121,13 @@ pub fn peer_reduce_scratch_total_bytes(rank_count: usize, requested_bytes: usize
 }
 
 /// Internal active lease record stored inside `Gpus` while a lease is live.
+#[derive(Debug)]
+struct ActivePeerLease {
+    id: u64,
+    bytes: usize,
+    rank_count: usize,
+}
+
 pub struct Gpus {
     /// RCCL communicators (one per rank), lazily initialized on the first
     /// `all_reduce_sum_*` call. Declared BEFORE `devices` so `Drop` tears
