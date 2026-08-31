@@ -6,7 +6,7 @@
   "upstream": {
     "remote": "upstream",
     "branch": "master",
-    "ref": "6163369329d3b076376286a00c13cadbae069ecc"
+    "series_origin_ref": "6163369329d3b076376286a00c13cadbae069ecc"
   },
   "branch_provenance": {
     "common_upstream_base": "78065c084c1c67f64d282bd904b1b28cd94aca42",
@@ -22,7 +22,7 @@
       "084dbebda9c72116fc9b4819f85ec2e15aa31344",
       "bac02a1a22a55922ea057e9a98f68cb3ab93ac02"
     ],
-    "rule": "Treat branch commits as forensic source only. Start every replacement PR at the pinned upstream ref and manually port behavior through current seams."
+    "rule": "G0 starts at series_origin_ref; every later promoted group/campaign records the then-current upstream base and must use a pinned 40-hex commit."
   },
   "authority": {
     "tracker": "docs/device-mesh-port-tracker.json",
@@ -151,7 +151,55 @@
     "one_row_rule": "A PR may advance completion for at most one atomic tracker row. Dependency or evidence metadata may be synchronized without advancing another row.",
     "grouping_rule": "Each domain obligation ID appears exactly once across grouped change sets, evidence campaigns, and final closure. legacy_pr_ids are provenance only.",
     "completion_promotion_rule": "Only current durable evidence with nonempty non-host-local references can promote a group, campaign, or final closure. Historical, semantics-only, emulated, failed, hardware-blocked, and host-local evidence never promotes.",
-    "parallel_lane_rule": "G3 and G4 may develop in parallel after authority; the interface-safe part of G5 may develop after topology while merge waits on its manifest seam. G13-G15 are implementation-only; physical campaigns follow them."
+    "parallel_lane_rule": "G3 and G4 may develop in parallel after authority; the interface-safe part of G5 may develop after authority while merge waits on its manifest seam. G6-G11 fan out after their consumed G5 seams. G13-G15 are implementation-only; physical campaigns follow them.",
+    "can_develop_after": {
+      "G0": [],
+      "G1": [
+        "G0"
+      ],
+      "G2": [
+        "G0"
+      ],
+      "G3": [
+        "G0"
+      ],
+      "G4": [
+        "G0"
+      ],
+      "G5": [
+        "G0"
+      ],
+      "G6": [
+        "G5"
+      ],
+      "G7": [
+        "G5"
+      ],
+      "G8": [
+        "G5"
+      ],
+      "G9": [
+        "G5"
+      ],
+      "G10": [
+        "G5"
+      ],
+      "G11": [
+        "G5"
+      ],
+      "G12": [
+        "G4"
+      ],
+      "G13": [
+        "G12"
+      ],
+      "G14": [
+        "G12"
+      ],
+      "G15": [
+        "G12"
+      ]
+    }
   },
   "obligations": [
     {
@@ -195,7 +243,8 @@
           "docs/device-mesh-port-tracker.json",
           "scripts/check-device-mesh-port-tracker.py",
           "tests/test_device_mesh_port_tracker.py"
-        ]
+        ],
+        "classification": "current"
       },
       "legacy_pr_ids": [
         "PR-00"
@@ -226,7 +275,9 @@
         "kind": "change_set",
         "id": "G0"
       },
-      "depends_on_delivery": []
+      "depends_on_delivery": [],
+      "delivery_kind": "change_set",
+      "campaign_id": null
     },
     {
       "id": "TOPOLOGY",
@@ -268,13 +319,16 @@
         "branch_record": "historical",
         "route": "No-GPU structural hardware route and CPU DeviceMesh contract tests.",
         "fixture_refs": [],
-        "report_refs": []
+        "report_refs": [],
+        "classification": "rerun_required"
       },
       "delivery_owner": {
         "kind": "change_set",
         "id": "G1"
       },
-      "depends_on_delivery": []
+      "depends_on_delivery": [],
+      "delivery_kind": "change_set",
+      "campaign_id": null
     },
     {
       "id": "PAR-001",
@@ -309,7 +363,8 @@
         "branch_record": "historical",
         "route": "CPU policy-table route against current carrier/source namespaces.",
         "fixture_refs": [],
-        "report_refs": []
+        "report_refs": [],
+        "classification": "rerun_required"
       },
       "legacy_pr_ids": [
         "PR-03"
@@ -337,7 +392,9 @@
         "kind": "change_set",
         "id": "G2"
       },
-      "depends_on_delivery": []
+      "depends_on_delivery": [],
+      "delivery_kind": "change_set",
+      "campaign_id": null
     },
     {
       "id": "CAP-001",
@@ -374,7 +431,8 @@
         "branch_record": "historical",
         "route": "CPU/no-allocation loader boundary tests proving classification, normalization, and refusal precede GPU allocation.",
         "fixture_refs": [],
-        "report_refs": []
+        "report_refs": [],
+        "classification": "rerun_required"
       },
       "legacy_pr_ids": [
         "PR-04"
@@ -403,7 +461,9 @@
         "kind": "change_set",
         "id": "G2"
       },
-      "depends_on_delivery": []
+      "depends_on_delivery": [],
+      "delivery_kind": "change_set",
+      "campaign_id": null
     },
     {
       "id": "COMP-001",
@@ -437,7 +497,8 @@
         "branch_record": "historical",
         "route": "Targeted current loader admission tests with zero-allocation assertions for TP×EP and every unsupported composition.",
         "fixture_refs": [],
-        "report_refs": []
+        "report_refs": [],
+        "classification": "rerun_required"
       },
       "legacy_pr_ids": [
         "PR-05"
@@ -465,7 +526,9 @@
         "kind": "change_set",
         "id": "G2"
       },
-      "depends_on_delivery": []
+      "depends_on_delivery": [],
+      "delivery_kind": "change_set",
+      "campaign_id": null
     },
     {
       "id": "MANIFEST-PLANNER",
@@ -508,13 +571,16 @@
         "branch_record": "historical",
         "route": "CPU manifest planner route.",
         "fixture_refs": [],
-        "report_refs": []
+        "report_refs": [],
+        "classification": "rerun_required"
       },
       "delivery_owner": {
         "kind": "change_set",
         "id": "G3"
       },
-      "depends_on_delivery": []
+      "depends_on_delivery": [],
+      "delivery_kind": "change_set",
+      "campaign_id": null
     },
     {
       "id": "WEIGHTSTORE-PILOT",
@@ -554,13 +620,16 @@
         "branch_record": "historical",
         "route": "Current LLaMA load and fault-injection route.",
         "fixture_refs": [],
-        "report_refs": []
+        "report_refs": [],
+        "classification": "rerun_required"
       },
       "delivery_owner": {
         "kind": "change_set",
         "id": "G3"
       },
-      "depends_on_delivery": []
+      "depends_on_delivery": [],
+      "delivery_kind": "change_set",
+      "campaign_id": null
     },
     {
       "id": "COR-006",
@@ -593,7 +662,8 @@
         "branch_record": "historical",
         "route": "Focused current allocation/cap route with exact fixture identity.",
         "fixture_refs": [],
-        "report_refs": []
+        "report_refs": [],
+        "classification": "rerun_required"
       },
       "legacy_pr_ids": [],
       "legacy_task_ids": [
@@ -612,7 +682,9 @@
         "kind": "change_set",
         "id": "G3"
       },
-      "depends_on_delivery": []
+      "depends_on_delivery": [],
+      "delivery_kind": "change_set",
+      "campaign_id": null
     },
     {
       "id": "COR-001",
@@ -650,7 +722,8 @@
         "report_refs": [
           "tests/test_device_mesh_port_tracker.py",
           "scripts/check-device-mesh-port-tracker.py"
-        ]
+        ],
+        "classification": "rerun_required"
       },
       "legacy_pr_ids": [],
       "legacy_task_ids": [
@@ -674,7 +747,9 @@
         "kind": "change_set",
         "id": "G4"
       },
-      "depends_on_delivery": []
+      "depends_on_delivery": [],
+      "delivery_kind": "change_set",
+      "campaign_id": null
     },
     {
       "id": "COR-002",
@@ -714,7 +789,8 @@
         "report_refs": [
           "tests/test_device_mesh_port_tracker.py",
           "scripts/check-device-mesh-port-tracker.py"
-        ]
+        ],
+        "classification": "rerun_required"
       },
       "legacy_pr_ids": [],
       "legacy_task_ids": [
@@ -738,7 +814,9 @@
         "kind": "change_set",
         "id": "G4"
       },
-      "depends_on_delivery": []
+      "depends_on_delivery": [],
+      "delivery_kind": "change_set",
+      "campaign_id": null
     },
     {
       "id": "COR-003",
@@ -772,7 +850,8 @@
           "crates/hipfire-engine/src/terminal.rs",
           "crates/hipfire-engine/src/stream_parser.rs"
         ],
-        "report_refs": []
+        "report_refs": [],
+        "classification": "rerun_required"
       },
       "legacy_pr_ids": [
         "PR-11"
@@ -800,7 +879,9 @@
         "kind": "change_set",
         "id": "G4"
       },
-      "depends_on_delivery": []
+      "depends_on_delivery": [],
+      "delivery_kind": "change_set",
+      "campaign_id": null
     },
     {
       "id": "COR-004",
@@ -839,7 +920,8 @@
         "report_refs": [
           "tests/test_device_mesh_port_tracker.py",
           "scripts/check-device-mesh-port-tracker.py"
-        ]
+        ],
+        "classification": "rerun_required"
       },
       "legacy_pr_ids": [],
       "legacy_task_ids": [
@@ -863,7 +945,9 @@
         "kind": "change_set",
         "id": "G4"
       },
-      "depends_on_delivery": []
+      "depends_on_delivery": [],
+      "delivery_kind": "change_set",
+      "campaign_id": null
     },
     {
       "id": "COR-005",
@@ -902,7 +986,8 @@
         "report_refs": [
           "tests/test_device_mesh_port_tracker.py",
           "scripts/check-device-mesh-port-tracker.py"
-        ]
+        ],
+        "classification": "rerun_required"
       },
       "legacy_pr_ids": [],
       "legacy_task_ids": [
@@ -926,7 +1011,9 @@
         "kind": "change_set",
         "id": "G4"
       },
-      "depends_on_delivery": []
+      "depends_on_delivery": [],
+      "delivery_kind": "change_set",
+      "campaign_id": null
     },
     {
       "id": "STEP-MOE-SUBSTRATE",
@@ -967,13 +1054,16 @@
         "branch_record": "historical",
         "route": "Interface-safe Step contract route; merge consumes the manifest seam.",
         "fixture_refs": [],
-        "report_refs": []
+        "report_refs": [],
+        "classification": "rerun_required"
       },
       "delivery_owner": {
         "kind": "change_set",
         "id": "G5"
       },
-      "depends_on_delivery": []
+      "depends_on_delivery": [],
+      "delivery_kind": "change_set",
+      "campaign_id": null
     },
     {
       "id": "STEP-002",
@@ -1008,7 +1098,8 @@
         "branch_record": "historical",
         "route": "CPU/fault route for sealed expert source and owner invariants.",
         "fixture_refs": [],
-        "report_refs": []
+        "report_refs": [],
+        "classification": "rerun_required"
       },
       "legacy_pr_ids": [
         "PR-13"
@@ -1037,7 +1128,9 @@
         "kind": "change_set",
         "id": "G5"
       },
-      "depends_on_delivery": []
+      "depends_on_delivery": [],
+      "delivery_kind": "change_set",
+      "campaign_id": null
     },
     {
       "id": "STEP-002R",
@@ -1072,7 +1165,8 @@
         "branch_record": "historical",
         "route": "Current CPU/fault/repeated-unload owner route.",
         "fixture_refs": [],
-        "report_refs": []
+        "report_refs": [],
+        "classification": "rerun_required"
       },
       "legacy_pr_ids": [],
       "legacy_task_ids": [
@@ -1099,7 +1193,9 @@
         "kind": "change_set",
         "id": "G5"
       },
-      "depends_on_delivery": []
+      "depends_on_delivery": [],
+      "delivery_kind": "change_set",
+      "campaign_id": null
     },
     {
       "id": "STEP-005-GEMMA",
@@ -1144,7 +1240,8 @@
           "gemma4-e4b-it-pr439-q8.hfq",
           "gemma4-26b-a4b.q8-experts-reference.hfq"
         ],
-        "report_refs": []
+        "report_refs": [],
+        "classification": "rerun_required"
       },
       "legacy_pr_ids": [
         "PR-08",
@@ -1179,7 +1276,9 @@
         "kind": "change_set",
         "id": "G6"
       },
-      "depends_on_delivery": []
+      "depends_on_delivery": [],
+      "delivery_kind": "change_set",
+      "campaign_id": null
     },
     {
       "id": "STEP-005-MINIMAX",
@@ -1219,7 +1318,8 @@
           "MiniMax-M2.7.mq2",
           "benchmarks/prompts/coherence_lloyd_long.txt"
         ],
-        "report_refs": []
+        "report_refs": [],
+        "classification": "rerun_required"
       },
       "legacy_pr_ids": [
         "PR-15",
@@ -1253,7 +1353,9 @@
         "kind": "change_set",
         "id": "G7"
       },
-      "depends_on_delivery": []
+      "depends_on_delivery": [],
+      "delivery_kind": "change_set",
+      "campaign_id": null
     },
     {
       "id": "COR-007",
@@ -1287,7 +1389,8 @@
         "branch_record": "historical",
         "route": "One-gfx1151 current eight-cycle lifecycle probe.",
         "fixture_refs": [],
-        "report_refs": []
+        "report_refs": [],
+        "classification": "rerun_required"
       },
       "legacy_pr_ids": [],
       "legacy_task_ids": [
@@ -1306,7 +1409,9 @@
         "kind": "change_set",
         "id": "G7"
       },
-      "depends_on_delivery": []
+      "depends_on_delivery": [],
+      "delivery_kind": "change_set",
+      "campaign_id": null
     },
     {
       "id": "STEP-001",
@@ -1340,7 +1445,8 @@
         "branch_record": "historical",
         "route": "Current Qwen state route with raw-versus-Step, recurrent multi-token/reset, placement inventory, DFlash/MTP checks, and emulated topology explicitly non-physical.",
         "fixture_refs": [],
-        "report_refs": []
+        "report_refs": [],
+        "classification": "rerun_required"
       },
       "legacy_pr_ids": [
         "PR-14"
@@ -1369,7 +1475,9 @@
         "kind": "change_set",
         "id": "G8"
       },
-      "depends_on_delivery": []
+      "depends_on_delivery": [],
+      "delivery_kind": "change_set",
+      "campaign_id": null
     },
     {
       "id": "STEP-003",
@@ -1406,7 +1514,8 @@
         "branch_record": "historical",
         "route": "Current recurrent multi-token/reset and placement route with non-physical emulation labels.",
         "fixture_refs": [],
-        "report_refs": []
+        "report_refs": [],
+        "classification": "rerun_required"
       },
       "legacy_pr_ids": [],
       "legacy_task_ids": [
@@ -1433,7 +1542,9 @@
         "kind": "change_set",
         "id": "G8"
       },
-      "depends_on_delivery": []
+      "depends_on_delivery": [],
+      "delivery_kind": "change_set",
+      "campaign_id": null
     },
     {
       "id": "STEP-004",
@@ -1472,7 +1583,8 @@
         "branch_record": "historical",
         "route": "Historical inventory review; no current implementation acceptance.",
         "fixture_refs": [],
-        "report_refs": []
+        "report_refs": [],
+        "classification": "historical"
       },
       "legacy_pr_ids": [],
       "legacy_task_ids": [
@@ -1499,7 +1611,9 @@
         "kind": "change_set",
         "id": "G8"
       },
-      "depends_on_delivery": []
+      "depends_on_delivery": [],
+      "delivery_kind": "change_set",
+      "campaign_id": null
     },
     {
       "id": "STEP-005-QWEN35",
@@ -1536,7 +1650,8 @@
         "branch_record": "historical",
         "route": "Pinned Qwen Single/existing-EP numerical/state parity with recurrent reset, MTP/DFlash/slot checks, source inventory, and non-physical emulation labels.",
         "fixture_refs": [],
-        "report_refs": []
+        "report_refs": [],
+        "classification": "rerun_required"
       },
       "legacy_pr_ids": [
         "PR-18"
@@ -1565,7 +1680,9 @@
         "kind": "change_set",
         "id": "G8"
       },
-      "depends_on_delivery": []
+      "depends_on_delivery": [],
+      "delivery_kind": "change_set",
+      "campaign_id": null
     },
     {
       "id": "STEP-005-DEEPSEEK4",
@@ -1603,7 +1720,8 @@
         "fixture_refs": [
           "DeepSeek4-specific pinned model and prompt to be recorded by the implementation PR"
         ],
-        "report_refs": []
+        "report_refs": [],
+        "classification": "rerun_required"
       },
       "legacy_pr_ids": [
         "PR-17"
@@ -1633,7 +1751,9 @@
         "kind": "change_set",
         "id": "G9"
       },
-      "depends_on_delivery": []
+      "depends_on_delivery": [],
+      "delivery_kind": "change_set",
+      "campaign_id": null
     },
     {
       "id": "STEP-005-LFM2",
@@ -1669,7 +1789,8 @@
         "branch_record": "historical",
         "route": "Pinned LFM2 text numerical/conv-KV parity, snapshot reset, batch/serve semantics, source inventory, and LFM2-VL isolation regression.",
         "fixture_refs": [],
-        "report_refs": []
+        "report_refs": [],
+        "classification": "rerun_required"
       },
       "legacy_pr_ids": [
         "PR-19"
@@ -1698,7 +1819,9 @@
         "kind": "change_set",
         "id": "G10"
       },
-      "depends_on_delivery": []
+      "depends_on_delivery": [],
+      "delivery_kind": "change_set",
+      "campaign_id": null
     },
     {
       "id": "STEP-006-MUSE-GLIMMER",
@@ -1735,7 +1858,8 @@
         "branch_record": "historical",
         "route": "Design/inventory checkpoint followed by pinned bespoke-versus-Step parity.",
         "fixture_refs": [],
-        "report_refs": []
+        "report_refs": [],
+        "classification": "historical"
       },
       "legacy_pr_ids": [
         "PR-20",
@@ -1764,7 +1888,9 @@
         "kind": "change_set",
         "id": "G11"
       },
-      "depends_on_delivery": []
+      "depends_on_delivery": [],
+      "delivery_kind": "change_set",
+      "campaign_id": null
     },
     {
       "id": "GEN-002",
@@ -1802,7 +1928,8 @@
         "fixture_refs": [
           "DeepSeek4-specific pinned model and prompt to be recorded by the implementation PR"
         ],
-        "report_refs": []
+        "report_refs": [],
+        "classification": "rerun_required"
       },
       "legacy_pr_ids": [],
       "legacy_task_ids": [
@@ -1830,7 +1957,9 @@
         "kind": "change_set",
         "id": "G12"
       },
-      "depends_on_delivery": []
+      "depends_on_delivery": [],
+      "delivery_kind": "change_set",
+      "campaign_id": null
     },
     {
       "id": "GEN-003",
@@ -1868,7 +1997,8 @@
         "branch_record": "historical",
         "route": "Current generation/terminal route and exact fixture identities; no coherence-gate substitution.",
         "fixture_refs": [],
-        "report_refs": []
+        "report_refs": [],
+        "classification": "rerun_required"
       },
       "legacy_pr_ids": [
         "PR-22",
@@ -1904,7 +2034,9 @@
         "kind": "change_set",
         "id": "G12"
       },
-      "depends_on_delivery": []
+      "depends_on_delivery": [],
+      "delivery_kind": "change_set",
+      "campaign_id": null
     },
     {
       "id": "SPEC-001",
@@ -1939,7 +2071,8 @@
         "branch_record": "historical",
         "route": "Current generation/terminal route and exact fixture identities; no coherence-gate substitution.",
         "fixture_refs": [],
-        "report_refs": []
+        "report_refs": [],
+        "classification": "historical"
       },
       "legacy_pr_ids": [],
       "legacy_task_ids": [
@@ -1970,7 +2103,9 @@
         "kind": "change_set",
         "id": "G12"
       },
-      "depends_on_delivery": []
+      "depends_on_delivery": [],
+      "delivery_kind": "change_set",
+      "campaign_id": null
     },
     {
       "id": "SPEC-002",
@@ -2008,7 +2143,8 @@
           "mtp_mode",
           "mtp_k"
         ],
-        "report_refs": []
+        "report_refs": [],
+        "classification": "rerun_required"
       },
       "legacy_pr_ids": [],
       "legacy_task_ids": [
@@ -2035,7 +2171,9 @@
         "kind": "change_set",
         "id": "G12"
       },
-      "depends_on_delivery": []
+      "depends_on_delivery": [],
+      "delivery_kind": "change_set",
+      "campaign_id": null
     },
     {
       "id": "SPEC-003",
@@ -2072,7 +2210,8 @@
           "mtp_mode=on",
           "K=1..8"
         ],
-        "report_refs": []
+        "report_refs": [],
+        "classification": "rerun_required"
       },
       "legacy_pr_ids": [],
       "legacy_task_ids": [
@@ -2099,7 +2238,9 @@
         "kind": "change_set",
         "id": "G12"
       },
-      "depends_on_delivery": []
+      "depends_on_delivery": [],
+      "delivery_kind": "change_set",
+      "campaign_id": null
     },
     {
       "id": "SPEC-004",
@@ -2140,7 +2281,8 @@
           "PP+MTP fixture",
           "6d86816f"
         ],
-        "report_refs": []
+        "report_refs": [],
+        "classification": "rerun_required"
       },
       "legacy_pr_ids": [],
       "legacy_task_ids": [
@@ -2167,7 +2309,9 @@
         "kind": "change_set",
         "id": "G12"
       },
-      "depends_on_delivery": []
+      "depends_on_delivery": [],
+      "delivery_kind": "change_set",
+      "campaign_id": null
     },
     {
       "id": "GEN-001",
@@ -2208,7 +2352,8 @@
           "qwen3.5-9b.mq4",
           "Qwen35 dense/MoE PP parity fixture"
         ],
-        "report_refs": []
+        "report_refs": [],
+        "classification": "rerun_required"
       },
       "legacy_pr_ids": [
         "PR-26"
@@ -2238,7 +2383,9 @@
         "kind": "change_set",
         "id": "G13"
       },
-      "depends_on_delivery": []
+      "depends_on_delivery": [],
+      "delivery_kind": "change_set",
+      "campaign_id": null
     },
     {
       "id": "AXIS-001",
@@ -2273,7 +2420,8 @@
         "branch_record": "historical",
         "route": "Deterministic Single-versus-emulated PP/TP numerical/state parity, placement/refusal, lifecycle, and unload with explicit non-physical labels.",
         "fixture_refs": [],
-        "report_refs": []
+        "report_refs": [],
+        "classification": "rerun_required"
       },
       "legacy_pr_ids": [
         "PR-26"
@@ -2303,7 +2451,9 @@
         "kind": "change_set",
         "id": "G13"
       },
-      "depends_on_delivery": []
+      "depends_on_delivery": [],
+      "delivery_kind": "change_set",
+      "campaign_id": null
     },
     {
       "id": "AXIS-002-DENSE",
@@ -2340,7 +2490,8 @@
         "fixture_refs": [
           "#662 q38.mq4v2.mq4"
         ],
-        "report_refs": []
+        "report_refs": [],
+        "classification": "rerun_required"
       },
       "legacy_pr_ids": [
         "PR-27"
@@ -2372,7 +2523,9 @@
         "kind": "change_set",
         "id": "G13"
       },
-      "depends_on_delivery": []
+      "depends_on_delivery": [],
+      "delivery_kind": "change_set",
+      "campaign_id": null
     },
     {
       "id": "AXIS-002-MOE-EP",
@@ -2409,7 +2562,8 @@
         "fixture_refs": [
           "#662 q38.mq4v2.mq4"
         ],
-        "report_refs": []
+        "report_refs": [],
+        "classification": "rerun_required"
       },
       "legacy_pr_ids": [
         "PR-27"
@@ -2441,7 +2595,9 @@
         "kind": "change_set",
         "id": "G14"
       },
-      "depends_on_delivery": []
+      "depends_on_delivery": [],
+      "delivery_kind": "change_set",
+      "campaign_id": null
     },
     {
       "id": "AXIS-003-DEEPSEEK4",
@@ -2475,7 +2631,8 @@
         "branch_record": "historical",
         "route": "Current DeepSeek4 emulated expert-axis route.",
         "fixture_refs": [],
-        "report_refs": []
+        "report_refs": [],
+        "classification": "rerun_required"
       },
       "legacy_pr_ids": [
         "PR-28"
@@ -2505,7 +2662,9 @@
         "kind": "change_set",
         "id": "G14"
       },
-      "depends_on_delivery": []
+      "depends_on_delivery": [],
+      "delivery_kind": "change_set",
+      "campaign_id": null
     },
     {
       "id": "AXIS-003-MINIMAX",
@@ -2539,7 +2698,8 @@
         "branch_record": "historical",
         "route": "Current MiniMax emulated expert-axis route.",
         "fixture_refs": [],
-        "report_refs": []
+        "report_refs": [],
+        "classification": "rerun_required"
       },
       "legacy_pr_ids": [
         "PR-29"
@@ -2569,7 +2729,9 @@
         "kind": "change_set",
         "id": "G14"
       },
-      "depends_on_delivery": []
+      "depends_on_delivery": [],
+      "delivery_kind": "change_set",
+      "campaign_id": null
     },
     {
       "id": "AXIS-003-LFM2",
@@ -2604,7 +2766,8 @@
         "branch_record": "historical",
         "route": "Current LFM2 emulated expert-axis route.",
         "fixture_refs": [],
-        "report_refs": []
+        "report_refs": [],
+        "classification": "rerun_required"
       },
       "legacy_pr_ids": [
         "PR-30"
@@ -2634,7 +2797,9 @@
         "kind": "change_set",
         "id": "G14"
       },
-      "depends_on_delivery": []
+      "depends_on_delivery": [],
+      "delivery_kind": "change_set",
+      "campaign_id": null
     },
     {
       "id": "AXIS-003-COHERE",
@@ -2668,7 +2833,8 @@
         "branch_record": "historical",
         "route": "Current Cohere emulated expert-axis route.",
         "fixture_refs": [],
-        "report_refs": []
+        "report_refs": [],
+        "classification": "rerun_required"
       },
       "legacy_pr_ids": [
         "PR-31"
@@ -2698,7 +2864,9 @@
         "kind": "change_set",
         "id": "G14"
       },
-      "depends_on_delivery": []
+      "depends_on_delivery": [],
+      "delivery_kind": "change_set",
+      "campaign_id": null
     },
     {
       "id": "VL-001",
@@ -2732,7 +2900,8 @@
         "branch_record": "historical",
         "route": "Current #654 vision route with committed image/text fixtures, numeric image and text-only parity, cancellation/isolation, and emulated PP/TP parity.",
         "fixture_refs": [],
-        "report_refs": []
+        "report_refs": [],
+        "classification": "rerun_required"
       },
       "legacy_pr_ids": [],
       "legacy_task_ids": [
@@ -2759,7 +2928,9 @@
         "kind": "change_set",
         "id": "G15"
       },
-      "depends_on_delivery": []
+      "depends_on_delivery": [],
+      "delivery_kind": "change_set",
+      "campaign_id": null
     },
     {
       "id": "VL-002",
@@ -2794,7 +2965,8 @@
         "branch_record": "historical",
         "route": "Committed image isolation, canonical numeric oracle where available, stream/reset semantics, and emulated PP/TP parity; keep numeric absence blocked.",
         "fixture_refs": [],
-        "report_refs": []
+        "report_refs": [],
+        "classification": "rerun_required"
       },
       "legacy_pr_ids": [],
       "legacy_task_ids": [
@@ -2821,7 +2993,9 @@
         "kind": "change_set",
         "id": "G15"
       },
-      "depends_on_delivery": []
+      "depends_on_delivery": [],
+      "delivery_kind": "change_set",
+      "campaign_id": null
     },
     {
       "id": "AXIS-004-QWEN35-VL",
@@ -2856,7 +3030,8 @@
         "branch_record": "historical",
         "route": "Current #654 vision numeric/serve/isolation route.",
         "fixture_refs": [],
-        "report_refs": []
+        "report_refs": [],
+        "classification": "rerun_required"
       },
       "legacy_pr_ids": [
         "PR-32"
@@ -2885,7 +3060,9 @@
         "kind": "change_set",
         "id": "G15"
       },
-      "depends_on_delivery": []
+      "depends_on_delivery": [],
+      "delivery_kind": "change_set",
+      "campaign_id": null
     },
     {
       "id": "AXIS-004-DOTS-OCR",
@@ -2920,7 +3097,8 @@
         "branch_record": "historical",
         "route": "Current dots.ocr image lifecycle and numeric/reference route.",
         "fixture_refs": [],
-        "report_refs": []
+        "report_refs": [],
+        "classification": "rerun_required"
       },
       "legacy_pr_ids": [
         "PR-33"
@@ -2949,7 +3127,9 @@
         "kind": "change_set",
         "id": "G15"
       },
-      "depends_on_delivery": []
+      "depends_on_delivery": [],
+      "delivery_kind": "change_set",
+      "campaign_id": null
     },
     {
       "id": "HW-001",
@@ -2981,7 +3161,8 @@
         "branch_record": "historical",
         "route": "Claim-scoped physical route in docs/VALIDATION.md with pinned model/prompt/image/binary/topology/ROCm/RCCL identities.",
         "fixture_refs": [],
-        "report_refs": []
+        "report_refs": [],
+        "classification": "hardware_blocked"
       },
       "legacy_pr_ids": [
         "PR-34A"
@@ -3011,7 +3192,8 @@
         "kind": "evidence_campaign",
         "id": "EC-EP"
       },
-      "depends_on_delivery": []
+      "depends_on_delivery": [],
+      "physical_identity": null
     },
     {
       "id": "HW-002",
@@ -3043,7 +3225,8 @@
         "branch_record": "historical",
         "route": "Claim-scoped physical route in docs/VALIDATION.md with pinned model/prompt/image/binary/topology/ROCm/RCCL identities.",
         "fixture_refs": [],
-        "report_refs": []
+        "report_refs": [],
+        "classification": "hardware_blocked"
       },
       "legacy_pr_ids": [
         "PR-34B"
@@ -3073,7 +3256,8 @@
         "kind": "evidence_campaign",
         "id": "EC-EP"
       },
-      "depends_on_delivery": []
+      "depends_on_delivery": [],
+      "physical_identity": null
     },
     {
       "id": "HW-011",
@@ -3105,7 +3289,8 @@
         "branch_record": "historical",
         "route": "Claim-scoped physical route in docs/VALIDATION.md with pinned model/prompt/image/binary/topology/ROCm/RCCL identities.",
         "fixture_refs": [],
-        "report_refs": []
+        "report_refs": [],
+        "classification": "hardware_blocked"
       },
       "legacy_pr_ids": [
         "PR-34K"
@@ -3135,7 +3320,8 @@
         "kind": "evidence_campaign",
         "id": "EC-EP"
       },
-      "depends_on_delivery": []
+      "depends_on_delivery": [],
+      "physical_identity": null
     },
     {
       "id": "HW-010-LFM2-EP",
@@ -3168,7 +3354,8 @@
         "branch_record": "historical",
         "route": "Claim-scoped physical route in docs/VALIDATION.md with pinned model/prompt/image/binary/topology/ROCm/RCCL identities.",
         "fixture_refs": [],
-        "report_refs": []
+        "report_refs": [],
+        "classification": "hardware_blocked"
       },
       "legacy_pr_ids": [
         "PR-34J"
@@ -3199,7 +3386,8 @@
         "kind": "evidence_campaign",
         "id": "EC-EP"
       },
-      "depends_on_delivery": []
+      "depends_on_delivery": [],
+      "physical_identity": null
     },
     {
       "id": "HW-010-COHERE-EP",
@@ -3232,7 +3420,8 @@
         "branch_record": "historical",
         "route": "Claim-scoped physical route in docs/VALIDATION.md with pinned model/prompt/image/binary/topology/ROCm/RCCL identities.",
         "fixture_refs": [],
-        "report_refs": []
+        "report_refs": [],
+        "classification": "hardware_blocked"
       },
       "legacy_pr_ids": [
         "PR-34J"
@@ -3263,7 +3452,8 @@
         "kind": "evidence_campaign",
         "id": "EC-EP"
       },
-      "depends_on_delivery": []
+      "depends_on_delivery": [],
+      "physical_identity": null
     },
     {
       "id": "HW-003",
@@ -3297,7 +3487,8 @@
         "branch_record": "historical",
         "route": "Claim-scoped physical route in docs/VALIDATION.md with pinned model/prompt/image/binary/topology/ROCm/RCCL identities.",
         "fixture_refs": [],
-        "report_refs": []
+        "report_refs": [],
+        "classification": "hardware_blocked"
       },
       "legacy_pr_ids": [
         "PR-34C"
@@ -3327,7 +3518,8 @@
         "kind": "evidence_campaign",
         "id": "EC-PP"
       },
-      "depends_on_delivery": []
+      "depends_on_delivery": [],
+      "physical_identity": null
     },
     {
       "id": "HW-004",
@@ -3361,7 +3553,8 @@
         "branch_record": "historical",
         "route": "Claim-scoped physical route in docs/VALIDATION.md with pinned model/prompt/image/binary/topology/ROCm/RCCL identities.",
         "fixture_refs": [],
-        "report_refs": []
+        "report_refs": [],
+        "classification": "hardware_blocked"
       },
       "legacy_pr_ids": [
         "PR-34D"
@@ -3391,7 +3584,8 @@
         "kind": "evidence_campaign",
         "id": "EC-PP"
       },
-      "depends_on_delivery": []
+      "depends_on_delivery": [],
+      "physical_identity": null
     },
     {
       "id": "HW-008-DEEPSEEK4-PP",
@@ -3423,7 +3617,8 @@
         "branch_record": "historical",
         "route": "Claim-scoped physical route in docs/VALIDATION.md with pinned model/prompt/image/binary/topology/ROCm/RCCL identities.",
         "fixture_refs": [],
-        "report_refs": []
+        "report_refs": [],
+        "classification": "hardware_blocked"
       },
       "legacy_pr_ids": [
         "PR-34H"
@@ -3453,7 +3648,8 @@
         "kind": "evidence_campaign",
         "id": "EC-PP"
       },
-      "depends_on_delivery": []
+      "depends_on_delivery": [],
+      "physical_identity": null
     },
     {
       "id": "HW-009-MINIMAX-PP",
@@ -3485,7 +3681,8 @@
         "branch_record": "historical",
         "route": "Claim-scoped physical route in docs/VALIDATION.md with pinned model/prompt/image/binary/topology/ROCm/RCCL identities.",
         "fixture_refs": [],
-        "report_refs": []
+        "report_refs": [],
+        "classification": "hardware_blocked"
       },
       "legacy_pr_ids": [
         "PR-34I"
@@ -3515,7 +3712,8 @@
         "kind": "evidence_campaign",
         "id": "EC-PP"
       },
-      "depends_on_delivery": []
+      "depends_on_delivery": [],
+      "physical_identity": null
     },
     {
       "id": "HW-010-LFM2-PP",
@@ -3548,7 +3746,8 @@
         "branch_record": "historical",
         "route": "Claim-scoped physical route in docs/VALIDATION.md with pinned model/prompt/image/binary/topology/ROCm/RCCL identities.",
         "fixture_refs": [],
-        "report_refs": []
+        "report_refs": [],
+        "classification": "hardware_blocked"
       },
       "legacy_pr_ids": [
         "PR-34J"
@@ -3579,7 +3778,8 @@
         "kind": "evidence_campaign",
         "id": "EC-PP"
       },
-      "depends_on_delivery": []
+      "depends_on_delivery": [],
+      "physical_identity": null
     },
     {
       "id": "HW-010-COHERE-PP",
@@ -3612,7 +3812,8 @@
         "branch_record": "historical",
         "route": "Claim-scoped physical route in docs/VALIDATION.md with pinned model/prompt/image/binary/topology/ROCm/RCCL identities.",
         "fixture_refs": [],
-        "report_refs": []
+        "report_refs": [],
+        "classification": "hardware_blocked"
       },
       "legacy_pr_ids": [
         "PR-34J"
@@ -3643,7 +3844,8 @@
         "kind": "evidence_campaign",
         "id": "EC-PP"
       },
-      "depends_on_delivery": []
+      "depends_on_delivery": [],
+      "physical_identity": null
     },
     {
       "id": "HW-005",
@@ -3680,7 +3882,8 @@
         "branch_record": "historical",
         "route": "Claim-scoped physical route in docs/VALIDATION.md with pinned model/prompt/image/binary/topology/ROCm/RCCL identities.",
         "fixture_refs": [],
-        "report_refs": []
+        "report_refs": [],
+        "classification": "hardware_blocked"
       },
       "legacy_pr_ids": [
         "PR-34E"
@@ -3715,7 +3918,8 @@
         "kind": "evidence_campaign",
         "id": "EC-TP"
       },
-      "depends_on_delivery": []
+      "depends_on_delivery": [],
+      "physical_identity": null
     },
     {
       "id": "HW-006",
@@ -3747,7 +3951,8 @@
         "branch_record": "historical",
         "route": "Claim-scoped physical route in docs/VALIDATION.md with pinned model/prompt/image/binary/topology/ROCm/RCCL identities.",
         "fixture_refs": [],
-        "report_refs": []
+        "report_refs": [],
+        "classification": "hardware_blocked"
       },
       "legacy_pr_ids": [
         "PR-34F"
@@ -3777,7 +3982,8 @@
         "kind": "evidence_campaign",
         "id": "EC-TP"
       },
-      "depends_on_delivery": []
+      "depends_on_delivery": [],
+      "physical_identity": null
     },
     {
       "id": "HW-007",
@@ -3812,7 +4018,8 @@
         "fixture_refs": [
           "#662 q38.mq4v2.mq4"
         ],
-        "report_refs": []
+        "report_refs": [],
+        "classification": "hardware_blocked"
       },
       "legacy_pr_ids": [
         "PR-34G"
@@ -3844,7 +4051,8 @@
         "kind": "evidence_campaign",
         "id": "EC-TP"
       },
-      "depends_on_delivery": []
+      "depends_on_delivery": [],
+      "physical_identity": null
     },
     {
       "id": "HW-008-DEEPSEEK4-TP",
@@ -3876,7 +4084,8 @@
         "branch_record": "historical",
         "route": "Claim-scoped physical route in docs/VALIDATION.md with pinned model/prompt/image/binary/topology/ROCm/RCCL identities.",
         "fixture_refs": [],
-        "report_refs": []
+        "report_refs": [],
+        "classification": "hardware_blocked"
       },
       "legacy_pr_ids": [
         "PR-34H"
@@ -3906,7 +4115,8 @@
         "kind": "evidence_campaign",
         "id": "EC-TP"
       },
-      "depends_on_delivery": []
+      "depends_on_delivery": [],
+      "physical_identity": null
     },
     {
       "id": "HW-009-MINIMAX-TP",
@@ -3938,7 +4148,8 @@
         "branch_record": "historical",
         "route": "Claim-scoped physical route in docs/VALIDATION.md with pinned model/prompt/image/binary/topology/ROCm/RCCL identities.",
         "fixture_refs": [],
-        "report_refs": []
+        "report_refs": [],
+        "classification": "hardware_blocked"
       },
       "legacy_pr_ids": [
         "PR-34I"
@@ -3968,7 +4179,8 @@
         "kind": "evidence_campaign",
         "id": "EC-TP"
       },
-      "depends_on_delivery": []
+      "depends_on_delivery": [],
+      "physical_identity": null
     },
     {
       "id": "HW-010-LFM2-TP",
@@ -4001,7 +4213,8 @@
         "branch_record": "historical",
         "route": "Claim-scoped physical route in docs/VALIDATION.md with pinned model/prompt/image/binary/topology/ROCm/RCCL identities.",
         "fixture_refs": [],
-        "report_refs": []
+        "report_refs": [],
+        "classification": "hardware_blocked"
       },
       "legacy_pr_ids": [
         "PR-34J"
@@ -4032,7 +4245,8 @@
         "kind": "evidence_campaign",
         "id": "EC-TP"
       },
-      "depends_on_delivery": []
+      "depends_on_delivery": [],
+      "physical_identity": null
     },
     {
       "id": "HW-010-COHERE-TP",
@@ -4065,7 +4279,8 @@
         "branch_record": "historical",
         "route": "Claim-scoped physical route in docs/VALIDATION.md with pinned model/prompt/image/binary/topology/ROCm/RCCL identities.",
         "fixture_refs": [],
-        "report_refs": []
+        "report_refs": [],
+        "classification": "hardware_blocked"
       },
       "legacy_pr_ids": [
         "PR-34J"
@@ -4096,7 +4311,8 @@
         "kind": "evidence_campaign",
         "id": "EC-TP"
       },
-      "depends_on_delivery": []
+      "depends_on_delivery": [],
+      "physical_identity": null
     },
     {
       "id": "HW-012-QWEN35-VL",
@@ -4129,7 +4345,8 @@
         "branch_record": "historical",
         "route": "Claim-scoped physical route in docs/VALIDATION.md with pinned model/prompt/image/binary/topology/ROCm/RCCL identities.",
         "fixture_refs": [],
-        "report_refs": []
+        "report_refs": [],
+        "classification": "hardware_blocked"
       },
       "legacy_pr_ids": [
         "PR-34L"
@@ -4160,7 +4377,8 @@
         "kind": "evidence_campaign",
         "id": "EC-VISION"
       },
-      "depends_on_delivery": []
+      "depends_on_delivery": [],
+      "physical_identity": null
     },
     {
       "id": "HW-012-DOTS-OCR",
@@ -4193,7 +4411,8 @@
         "branch_record": "historical",
         "route": "Claim-scoped physical route in docs/VALIDATION.md with pinned model/prompt/image/binary/topology/ROCm/RCCL identities.",
         "fixture_refs": [],
-        "report_refs": []
+        "report_refs": [],
+        "classification": "hardware_blocked"
       },
       "legacy_pr_ids": [
         "PR-34L"
@@ -4224,7 +4443,8 @@
         "kind": "evidence_campaign",
         "id": "EC-VISION"
       },
-      "depends_on_delivery": []
+      "depends_on_delivery": [],
+      "physical_identity": null
     },
     {
       "id": "HW-013-QWEN35-VL",
@@ -4257,7 +4477,8 @@
         "branch_record": "historical",
         "route": "Claim-scoped physical route in docs/VALIDATION.md with pinned model/prompt/image/binary/topology/ROCm/RCCL identities.",
         "fixture_refs": [],
-        "report_refs": []
+        "report_refs": [],
+        "classification": "hardware_blocked"
       },
       "legacy_pr_ids": [
         "PR-34M"
@@ -4288,7 +4509,8 @@
         "kind": "evidence_campaign",
         "id": "EC-VISION"
       },
-      "depends_on_delivery": []
+      "depends_on_delivery": [],
+      "physical_identity": null
     },
     {
       "id": "HW-013-DOTS-OCR",
@@ -4321,7 +4543,8 @@
         "branch_record": "historical",
         "route": "Claim-scoped physical route in docs/VALIDATION.md with pinned model/prompt/image/binary/topology/ROCm/RCCL identities.",
         "fixture_refs": [],
-        "report_refs": []
+        "report_refs": [],
+        "classification": "hardware_blocked"
       },
       "legacy_pr_ids": [
         "PR-34M"
@@ -4352,7 +4575,8 @@
         "kind": "evidence_campaign",
         "id": "EC-VISION"
       },
-      "depends_on_delivery": []
+      "depends_on_delivery": [],
+      "physical_identity": null
     },
     {
       "id": "PAR-002",
@@ -4393,7 +4617,8 @@
         "branch_record": "historical",
         "route": "Current tracker, campaign, and schema closure audit.",
         "fixture_refs": [],
-        "report_refs": []
+        "report_refs": [],
+        "classification": "rerun_required"
       },
       "legacy_pr_ids": [
         "PR-35"
@@ -4484,7 +4709,8 @@
         "branch_record": "historical",
         "route": "Final current-tree validation matrix and durable link/schema audit.",
         "fixture_refs": [],
-        "report_refs": []
+        "report_refs": [],
+        "classification": "rerun_required"
       },
       "legacy_pr_ids": [
         "PR-36"
@@ -4528,10 +4754,35 @@
         "G1",
         "G4"
       ],
-      "status": "proposed",
+      "status": "available",
       "contract": "Tracker/schema authority and sole route/admission ownership are explicit.",
-      "evidence_disposition": "rerun_required",
-      "receipt": null
+      "evidence_disposition": "current",
+      "receipt": {
+        "status": "complete",
+        "producer_commit": "4429d7df3dff048522e55c2c0d6081b40bd45976",
+        "evidence_commit": "4429d7df3dff048522e55c2c0d6081b40bd45976",
+        "consumer_commits": {},
+        "route": "python3 scripts/check-device-mesh-port-tracker.py",
+        "evidence_class": "current",
+        "fixture_references": [
+          "docs/device-mesh-port-tracker.json",
+          "tests/fixtures/device-mesh-port-tracker.invalid.json"
+        ],
+        "positive_probe": "pytest -q tests/test_device_mesh_port_tracker.py && python3 scripts/check-device-mesh-port-tracker.py",
+        "negative_probe": "python3 scripts/check-device-mesh-port-tracker.py tests/fixtures/device-mesh-port-tracker.invalid.json (expected non-zero)",
+        "side_effect_assertions": [
+          "No runtime files, loader behavior, or HIPFIRE_* ownership changes are part of G0.",
+          "docs/VALIDATION.md remains the sole validation-route authority and docs/admissions.yml remains the sole admission authority.",
+          "No admission row or external issue/PR mutation is created by G0."
+        ],
+        "sole_owner": "docs/device-mesh-port-tracker.json owns grouped plan state; VALIDATION/admissions retain separate ownership.",
+        "revert_identity": "G0:single-grouped-change-set-revert",
+        "durable_references": [
+          "https://github.com/warpfront/hipfire/issues/666",
+          "https://github.com/warpfront/hipfire/commit/4429d7df3dff048522e55c2c0d6081b40bd45976",
+          "git:4429d7df3dff048522e55c2c0d6081b40bd45976"
+        ]
+      }
     },
     {
       "id": "S-TOPOLOGY",
@@ -4845,13 +5096,14 @@
       "production_route": "Schema/checker/index route only.",
       "positive_evidence": [
         {
-          "classification": "rerun_required",
-          "assertion": "G0 implementation files are prepared; evidence is deliberately unpromoted until commit 2.",
+          "classification": "current",
+          "assertion": "G0 authority artifacts are present in the commit-one tree and pass the focused schema/index contract.",
           "references": [
-            "docs/device-mesh-port-tracker.json",
-            "scripts/check-device-mesh-port-tracker.py"
+            "git:4429d7df3dff048522e55c2c0d6081b40bd45976",
+            "https://github.com/warpfront/hipfire/issues/666",
+            "docs/device-mesh-port-tracker.json"
           ],
-          "qualifies_for_completion": false
+          "qualifies_for_completion": true
         }
       ],
       "negative_evidence": [
@@ -4884,15 +5136,27 @@
       "shared_file_integration_owner": "docs/device-mesh-port-tracker.json owns grouped plan state; VALIDATION/admissions retain separate ownership.",
       "acceptance": "Every domain obligation maps exactly once, G0 authority evidence is current, and no stale checkbox or merge claim exists.",
       "stop_condition": "Stop if another tracker, validation route, or admission owner appears.",
-      "status": "implemented",
+      "status": "in_review",
       "implementation_class": "port",
       "confidence": "high",
-      "evidence_disposition": "rerun_required",
-      "completion_evidence": [],
+      "evidence_disposition": "current",
+      "completion_evidence": [
+        {
+          "classification": "current",
+          "assertion": "G0 authority artifacts are present in the commit-one tree and pass the focused schema/index contract.",
+          "references": [
+            "git:4429d7df3dff048522e55c2c0d6081b40bd45976",
+            "https://github.com/warpfront/hipfire/issues/666",
+            "docs/device-mesh-port-tracker.json"
+          ],
+          "qualifies_for_completion": true
+        }
+      ],
       "delivery_kind": "change_set",
       "upstream_base_commit": "6163369329d3b076376286a00c13cadbae069ecc",
-      "head_commit": null,
-      "merge_commit": null
+      "head_commit": "4429d7df3dff048522e55c2c0d6081b40bd45976",
+      "merge_commit": null,
+      "can_develop_after": []
     },
     {
       "id": "G1",
@@ -4966,7 +5230,10 @@
       "delivery_kind": "change_set",
       "upstream_base_commit": null,
       "head_commit": null,
-      "merge_commit": null
+      "merge_commit": null,
+      "can_develop_after": [
+        "G0"
+      ]
     },
     {
       "id": "G2",
@@ -5031,7 +5298,7 @@
         "name": "admission",
         "integration_mode": "serialized-shared-file-owner",
         "can_develop_after": [
-          "G1"
+          "G0"
         ],
         "merge_waits_on": []
       },
@@ -5046,7 +5313,10 @@
       "delivery_kind": "change_set",
       "upstream_base_commit": null,
       "head_commit": null,
-      "merge_commit": null
+      "merge_commit": null,
+      "can_develop_after": [
+        "G0"
+      ]
     },
     {
       "id": "G3",
@@ -5112,7 +5382,7 @@
         "name": "manifest-loading",
         "integration_mode": "serialized-shared-file-owner",
         "can_develop_after": [
-          "G2"
+          "G0"
         ],
         "merge_waits_on": []
       },
@@ -5127,7 +5397,10 @@
       "delivery_kind": "change_set",
       "upstream_base_commit": null,
       "head_commit": null,
-      "merge_commit": null
+      "merge_commit": null,
+      "can_develop_after": [
+        "G0"
+      ]
     },
     {
       "id": "G4",
@@ -5213,7 +5486,10 @@
       "delivery_kind": "change_set",
       "upstream_base_commit": null,
       "head_commit": null,
-      "merge_commit": null
+      "merge_commit": null,
+      "can_develop_after": [
+        "G0"
+      ]
     },
     {
       "id": "G5",
@@ -5280,7 +5556,7 @@
         "name": "moe-step-interface",
         "integration_mode": "serialized-shared-file-owner",
         "can_develop_after": [
-          "G1"
+          "G0"
         ],
         "merge_waits_on": [
           "G3"
@@ -5297,7 +5573,10 @@
       "delivery_kind": "change_set",
       "upstream_base_commit": null,
       "head_commit": null,
-      "merge_commit": null
+      "merge_commit": null,
+      "can_develop_after": [
+        "G0"
+      ]
     },
     {
       "id": "G6",
@@ -5373,7 +5652,10 @@
       "delivery_kind": "change_set",
       "upstream_base_commit": null,
       "head_commit": null,
-      "merge_commit": null
+      "merge_commit": null,
+      "can_develop_after": [
+        "G5"
+      ]
     },
     {
       "id": "G7",
@@ -5439,7 +5721,7 @@
         "name": "minimax",
         "integration_mode": "serialized-shared-file-owner",
         "can_develop_after": [
-          "G4"
+          "G5"
         ],
         "merge_waits_on": []
       },
@@ -5454,7 +5736,10 @@
       "delivery_kind": "change_set",
       "upstream_base_commit": null,
       "head_commit": null,
-      "merge_commit": null
+      "merge_commit": null,
+      "can_develop_after": [
+        "G5"
+      ]
     },
     {
       "id": "G8",
@@ -5527,7 +5812,7 @@
         "name": "qwen35",
         "integration_mode": "serialized-shared-file-owner",
         "can_develop_after": [
-          "G3"
+          "G5"
         ],
         "merge_waits_on": []
       },
@@ -5542,7 +5827,10 @@
       "delivery_kind": "change_set",
       "upstream_base_commit": null,
       "head_commit": null,
-      "merge_commit": null
+      "merge_commit": null,
+      "can_develop_after": [
+        "G5"
+      ]
     },
     {
       "id": "G9",
@@ -5603,7 +5891,7 @@
         "name": "deepseek4",
         "integration_mode": "serialized-shared-file-owner",
         "can_develop_after": [
-          "G4"
+          "G5"
         ],
         "merge_waits_on": []
       },
@@ -5618,7 +5906,10 @@
       "delivery_kind": "change_set",
       "upstream_base_commit": null,
       "head_commit": null,
-      "merge_commit": null
+      "merge_commit": null,
+      "can_develop_after": [
+        "G5"
+      ]
     },
     {
       "id": "G10",
@@ -5679,7 +5970,7 @@
         "name": "lfm2",
         "integration_mode": "serialized-shared-file-owner",
         "can_develop_after": [
-          "G4"
+          "G5"
         ],
         "merge_waits_on": []
       },
@@ -5694,7 +5985,10 @@
       "delivery_kind": "change_set",
       "upstream_base_commit": null,
       "head_commit": null,
-      "merge_commit": null
+      "merge_commit": null,
+      "can_develop_after": [
+        "G5"
+      ]
     },
     {
       "id": "G11",
@@ -5755,7 +6049,7 @@
         "name": "muse-glimmer",
         "integration_mode": "serialized-shared-file-owner",
         "can_develop_after": [
-          "G4"
+          "G5"
         ],
         "merge_waits_on": []
       },
@@ -5770,7 +6064,10 @@
       "delivery_kind": "change_set",
       "upstream_base_commit": null,
       "head_commit": null,
-      "merge_commit": null
+      "merge_commit": null,
+      "can_develop_after": [
+        "G5"
+      ]
     },
     {
       "id": "G12",
@@ -5871,7 +6168,10 @@
       "delivery_kind": "change_set",
       "upstream_base_commit": null,
       "head_commit": null,
-      "merge_commit": null
+      "merge_commit": null,
+      "can_develop_after": [
+        "G4"
+      ]
     },
     {
       "id": "G13",
@@ -5967,7 +6267,7 @@
         "name": "dense-axes",
         "integration_mode": "serialized-shared-file-owner",
         "can_develop_after": [
-          "G2"
+          "G12"
         ],
         "merge_waits_on": []
       },
@@ -5982,7 +6282,10 @@
       "delivery_kind": "change_set",
       "upstream_base_commit": null,
       "head_commit": null,
-      "merge_commit": null
+      "merge_commit": null,
+      "can_develop_after": [
+        "G12"
+      ]
     },
     {
       "id": "G14",
@@ -6090,7 +6393,7 @@
         "name": "expert-axes",
         "integration_mode": "serialized-shared-file-owner",
         "can_develop_after": [
-          "G2"
+          "G12"
         ],
         "merge_waits_on": []
       },
@@ -6105,7 +6408,10 @@
       "delivery_kind": "change_set",
       "upstream_base_commit": null,
       "head_commit": null,
-      "merge_commit": null
+      "merge_commit": null,
+      "can_develop_after": [
+        "G12"
+      ]
     },
     {
       "id": "G15",
@@ -6202,7 +6508,7 @@
         "name": "vision-axes",
         "integration_mode": "serialized-shared-file-owner",
         "can_develop_after": [
-          "G2"
+          "G12"
         ],
         "merge_waits_on": []
       },
@@ -6217,7 +6523,10 @@
       "delivery_kind": "change_set",
       "upstream_base_commit": null,
       "head_commit": null,
-      "merge_commit": null
+      "merge_commit": null,
+      "can_develop_after": [
+        "G12"
+      ]
     }
   ],
   "evidence_campaigns": [
@@ -6283,7 +6592,8 @@
         "identity": "EC-EP:campaign-revert",
         "strategy": "revert-entire-evidence-campaign",
         "scope": "Revert this evidence campaign as one unit."
-      }
+      },
+      "physical_identity": null
     },
     {
       "id": "EC-PP",
@@ -6350,7 +6660,8 @@
         "identity": "EC-PP:campaign-revert",
         "strategy": "revert-entire-evidence-campaign",
         "scope": "Revert this evidence campaign as one unit."
-      }
+      },
+      "physical_identity": null
     },
     {
       "id": "EC-TP",
@@ -6418,7 +6729,8 @@
         "identity": "EC-TP:campaign-revert",
         "strategy": "revert-entire-evidence-campaign",
         "scope": "Revert this evidence campaign as one unit."
-      }
+      },
+      "physical_identity": null
     },
     {
       "id": "EC-VISION",
@@ -6481,7 +6793,8 @@
         "identity": "EC-VISION:campaign-revert",
         "strategy": "revert-entire-evidence-campaign",
         "scope": "Revert this evidence campaign as one unit."
-      }
+      },
+      "physical_identity": null
     },
     {
       "id": "EC-CLOSE",
@@ -6628,6 +6941,16 @@
       "identity": "FCP-00:single-final-closure-revert",
       "strategy": "revert-entire-final-closure",
       "scope": "Revert FCP-00 as one unit."
-    }
+    },
+    "consumed_seam_gates": [
+      "S-DENSE-AXIS",
+      "S-EXPERT-AXIS",
+      "S-VISION-AXIS",
+      "S-HARDWARE-EP",
+      "S-HARDWARE-PP",
+      "S-HARDWARE-TP",
+      "S-HARDWARE-VISION",
+      "S-CLOSE"
+    ]
   }
 }

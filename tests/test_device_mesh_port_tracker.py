@@ -62,7 +62,7 @@ def _materialize_authority_evidence(document: dict) -> None:
     group = next(item for item in document["change_sets"] if item["id"] == "G0")
     group["status"] = "in_review"
     group["evidence_disposition"] = "current"
-    group["upstream_base_commit"] = document["upstream"]["ref"]
+    group["upstream_base_commit"] = document["upstream"]["series_origin_ref"]
     group["head_commit"] = "a" * 40
     group["merge_commit"] = None
     group["completion_evidence"] = [
@@ -116,6 +116,7 @@ def test_domain_obligations_and_campaigns_are_canonical():
         assert available == []
     else:
         assert available == ["S-AUTHORITY"]
+    assert "after authority" in document["policy"]["parallel_lane_rule"]
 
 
 def test_group_completion_rejects_one_blocked_child(tmp_path: Path):
@@ -189,14 +190,162 @@ def test_qualifying_evidence_requires_durable_reference(tmp_path: Path):
     assert "durable evidence" in output
 
 
+def test_bare_references_cannot_promote_group_or_receipt(tmp_path: Path):
+    cases = (
+        (
+            "group",
+            lambda document: document["change_sets"][0]["completion_evidence"][0].update(
+                references=["x"]
+            ),
+            "qualifying/current evidence requires a durable evidence reference",
+        ),
+        (
+            "receipt",
+            lambda document: next(
+                gate for gate in document["seam_gates"] if gate["id"] == "S-AUTHORITY"
+            )["receipt"].update(durable_references=["x"]),
+            "receipt durable_references require a durable commit or repository artifact",
+        ),
+    )
+    for name, mutation, marker in cases:
+        document = json.loads(TRACKER.read_text(encoding="utf-8"))
+        _materialize_authority_evidence(document)
+        mutation(document)
+        result = _run_checker(_write_document(document, tmp_path / f"bare-{name}.json"))
+        output = result.stdout + result.stderr
+        assert result.returncode != 0
+        assert marker in output, f"missing durable-reference diagnostic {marker!r}:\n{output}"
+
+
+def test_series_origin_and_future_base_identity_rules(tmp_path: Path):
+    cases = (
+        (
+            "origin",
+            lambda document: document["upstream"].update(series_origin_ref="b" * 40),
+            "upstream.series_origin_ref must equal the approved series origin",
+        ),
+        (
+            "g0",
+            lambda document: next(
+                group for group in document["change_sets"] if group["id"] == "G0"
+            ).update(upstream_base_commit="b" * 40),
+            "G0 upstream_base_commit must equal series_origin_ref",
+        ),
+    )
+    for name, mutation, marker in cases:
+        document = json.loads(TRACKER.read_text(encoding="utf-8"))
+        mutation(document)
+        result = _run_checker(_write_document(document, tmp_path / f"base-{name}.json"))
+        output = result.stdout + result.stderr
+        assert result.returncode != 0
+        assert marker in output, f"missing base diagnostic {marker!r}:\n{output}"
+
+    future = json.loads(TRACKER.read_text(encoding="utf-8"))
+    _satisfy_all_prerequisites(future)
+    next(group for group in future["change_sets"] if group["id"] == "G1")[
+        "upstream_base_commit"
+    ] = "c" * 40
+    result = _run_checker(_write_document(future, tmp_path / "base-future.json"))
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+
+def test_exact_seam_maps_reject_bilateral_omission(tmp_path: Path):
+    base = json.loads(TRACKER.read_text(encoding="utf-8"))
+    cases = (
+        (
+            "fcp-close",
+            lambda document: (
+                next(
+                    gate for gate in document["seam_gates"] if gate["id"] == "S-CLOSE"
+                )["consumers"].remove("FCP-00"),
+                next(
+                    packet
+                    for packet in [document["final_closure_packet"]]
+                    if packet["id"] == "FCP-00"
+                )["required_seam_gates"].remove("S-CLOSE"),
+                next(
+                    packet
+                    for packet in [document["final_closure_packet"]]
+                    if packet["id"] == "FCP-00"
+                )["consumed_seam_gates"].remove("S-CLOSE"),
+            ),
+            "final closure packet required_seam_gates must equal the approved map",
+        ),
+        (
+            "campaign-hardware",
+            lambda document: (
+                next(
+                    campaign
+                    for campaign in document["evidence_campaigns"]
+                    if campaign["id"] == "EC-CLOSE"
+                )["consumed_seam_gates"].remove("S-HARDWARE-EP"),
+                next(
+                    gate
+                    for gate in document["seam_gates"]
+                    if gate["id"] == "S-HARDWARE-EP"
+                )["consumers"].remove("EC-CLOSE"),
+            ),
+            "EC-CLOSE consumed_seam_gates must equal the approved map",
+        ),
+    )
+    for name, mutation, marker in cases:
+        document = json.loads(json.dumps(base))
+        mutation(document)
+        result = _run_checker(_write_document(document, tmp_path / f"seam-{name}.json"))
+        output = result.stdout + result.stderr
+        assert result.returncode != 0
+        assert marker in output, f"missing seam-map diagnostic {marker!r}:\n{output}"
+
+
+def test_ready_or_available_seam_requires_current_disposition(tmp_path: Path):
+    for disposition in ("historical", "hardware_blocked"):
+        document = json.loads(TRACKER.read_text(encoding="utf-8"))
+        group = next(item for item in document["change_sets"] if item["id"] == "G1")
+        group["status"] = "ready"
+        gate = next(item for item in document["seam_gates"] if item["id"] == "S-AUTHORITY")
+        gate["evidence_disposition"] = disposition
+        result = _run_checker(_write_document(document, tmp_path / f"ready-{disposition}.json"))
+        output = result.stdout + result.stderr
+        assert result.returncode != 0
+        assert "available/complete seam requires current evidence disposition" in output
+
+def _fake_physical_identity(campaign_id: str, obligation_ids: list[str]) -> dict:
+    artifact = "tests/fixtures/device-mesh-port-tracker.invalid.json"
+    identity = {
+        "model_sha256": "1" * 64,
+        "prompt_md5": "2" * 32,
+        "binary_sha256": "3" * 64,
+        "campaign_id": campaign_id,
+        "gpu_ids": ["fake-gpu-0", "fake-gpu-1"],
+        "topology": "fake-dual-gpu",
+        "rocm_version": "fake-rocm",
+        "rccl_version": "fake-rccl",
+        "report_refs": [artifact],
+        "result_map": {
+            obligation_id: {"status": "pass", "report_refs": [artifact]}
+            for obligation_id in obligation_ids
+        },
+    }
+    if campaign_id == "EC-VISION":
+        identity["image_sha256"] = "4" * 64
+    return identity
+
+
 def _satisfy_all_prerequisites(document: dict) -> None:
-    base_commit = document["upstream"]["ref"]
+    base_commit = document["upstream"]["series_origin_ref"]
+    artifact = "tests/fixtures/device-mesh-port-tracker.invalid.json"
     for obligation in document["obligations"]:
         obligation["status"] = "complete"
         obligation["evidence"]["disposition"] = "current"
+        obligation["evidence"]["classification"] = "current"
         obligation["evidence"]["branch_record"] = "historical"
-        obligation["evidence"]["report_refs"] = ["docs/device-mesh-port-tracker.json"]
+        obligation["evidence"]["report_refs"] = [artifact]
         obligation["advancement"]["completion_rows"] = [obligation["id"]]
+        if obligation["id"].startswith("HW-"):
+            obligation["physical_identity"] = _fake_physical_identity(
+                obligation["campaign_id"], [obligation["id"]]
+            )
     for index, change_set in enumerate(document["change_sets"], start=1):
         change_set["status"] = "in_review" if change_set["id"] == "G0" else "complete"
         change_set["evidence_disposition"] = "current"
@@ -227,10 +376,14 @@ def _satisfy_all_prerequisites(document: dict) -> None:
             {
                 "classification": "current",
                 "assertion": "Current campaign evidence packet.",
-                "references": ["docs/device-mesh-port-tracker.json"],
+                "references": [artifact],
                 "qualifies_for_completion": True,
             }
         ]
+        if campaign["topology_class"] == "physical":
+            campaign["physical_identity"] = _fake_physical_identity(
+                campaign["id"], campaign["obligation_ids"]
+            )
     closure = document["final_closure_packet"]
     closure["status"] = "complete"
     closure["evidence_disposition"] = "current"
@@ -274,14 +427,18 @@ def _satisfy_all_prerequisites(document: dict) -> None:
             "consumer_commits": consumer_commits,
             "route": "Current executable seam route with pinned fixture.",
             "evidence_class": "current",
-            "fixture_references": ["docs/device-mesh-port-tracker.json"],
+            "fixture_references": ["docs/device-mesh-port-tracker.json", artifact],
             "positive_probe": "Current positive seam probe command.",
             "negative_probe": "Current fail-closed seam probe command.",
             "side_effect_assertions": ["No duplicate owner or hidden side effect is permitted."],
             "sole_owner": producer["sole_owner"],
             "revert_identity": producer["revert_identity"]["identity"],
-            "durable_references": ["docs/device-mesh-port-tracker.json"],
+            "durable_references": [artifact],
         }
+        if gate["id"].startswith("S-HARDWARE-"):
+            gate["receipt"]["physical_identity"] = _fake_physical_identity(
+                producer["id"], producer["obligation_ids"]
+            )
 
 
 def test_domain_row_contracts_are_not_copied_placeholders():
@@ -335,6 +492,69 @@ def test_group_merge_wait_declaration_is_exact(tmp_path: Path):
         output = result.stdout + result.stderr
         assert result.returncode != 0
         assert marker in output, f"missing merge-wait diagnostic {marker!r}:\n{output}"
+
+
+def test_development_gate_map_is_exact(tmp_path: Path):
+    base = json.loads(TRACKER.read_text(encoding="utf-8"))
+    expected = {
+        "G0": [],
+        "G1": ["G0"],
+        "G2": ["G0"],
+        "G3": ["G0"],
+        "G4": ["G0"],
+        "G5": ["G0"],
+        "G6": ["G5"],
+        "G7": ["G5"],
+        "G8": ["G5"],
+        "G9": ["G5"],
+        "G10": ["G5"],
+        "G11": ["G5"],
+        "G12": ["G4"],
+        "G13": ["G12"],
+        "G14": ["G12"],
+        "G15": ["G12"],
+    }
+    groups = {group["id"]: group for group in base["change_sets"]}
+    for group_id, can_develop_after in expected.items():
+        assert groups[group_id]["parallel_lane"]["can_develop_after"] == can_develop_after
+        assert groups[group_id]["can_develop_after"] == can_develop_after
+    cases = (
+        (
+            "top-level-drift",
+            lambda group: group.update(can_develop_after=["G2"]),
+            "G3 can_develop_after must equal the approved map",
+        ),
+        (
+            "parallel-drift",
+            lambda group: group["parallel_lane"].update(can_develop_after=["G2"]),
+            "G3 parallel_lane.can_develop_after must match top-level can_develop_after",
+        ),
+    )
+    for name, mutation, marker in cases:
+        document = json.loads(json.dumps(base))
+        group = next(item for item in document["change_sets"] if item["id"] == "G3")
+        mutation(group)
+        result = _run_checker(_write_document(document, tmp_path / f"development-{name}.json"))
+        output = result.stdout + result.stderr
+        assert result.returncode != 0
+        assert marker in output, f"missing development-gate diagnostic {marker!r}:\n{output}"
+
+
+def test_available_current_seam_requires_current_receipt_class(tmp_path: Path):
+    base = json.loads(TRACKER.read_text(encoding="utf-8"))
+    for evidence_class in ("failed", "historical", "emulated", "rerun_required"):
+        document = json.loads(json.dumps(base))
+        _materialize_authority_evidence(document)
+        receipt = next(
+            gate for gate in document["seam_gates"] if gate["id"] == "S-AUTHORITY"
+        )["receipt"]
+        receipt["evidence_class"] = evidence_class
+        result = _run_checker(
+            _write_document(document, tmp_path / f"receipt-{evidence_class}.json")
+        )
+        output = result.stdout + result.stderr
+        assert result.returncode != 0
+        assert "S-AUTHORITY receipt evidence_class must be current" in output
 
 
 def test_change_set_identities_and_current_seam_receipts_are_required(tmp_path: Path):
@@ -405,7 +625,7 @@ def test_commit_identity_and_receipt_mutations_fail_closed(tmp_path: Path):
         (
             "base-producer",
             lambda document: next(gate for gate in document["seam_gates"] if gate["id"] == "S-AUTHORITY")["receipt"].update(
-                producer_commit=document["upstream"]["ref"]
+                producer_commit=document["upstream"]["series_origin_ref"]
             ),
             "S-AUTHORITY receipt producer_commit must not equal upstream_base_commit",
         ),
@@ -500,6 +720,66 @@ def test_campaign_and_fcp_identity_schema_and_owner_receipts(tmp_path: Path):
         assert marker in output, f"missing owner receipt diagnostic {marker!r}:\n{output}"
 
 
+def test_campaign_and_fcp_seam_producer_reciprocity(tmp_path: Path):
+    base = json.loads(TRACKER.read_text(encoding="utf-8"))
+    cases = (
+        (
+            "campaign",
+            "EC-EP",
+            "S-HARDWARE-EP",
+            "campaign",
+            "S-HARDWARE-EP producer EC-EP omits gate",
+        ),
+        (
+            "closure",
+            "EC-CLOSE",
+            "S-CLOSE",
+            "campaign",
+            "S-CLOSE producer EC-CLOSE omits gate",
+        ),
+    )
+    for name, owner_id, gate_id, owner_kind, marker in cases:
+        document = json.loads(json.dumps(base))
+        owner = next(
+            item
+            for item in document["evidence_campaigns"]
+            if item["id"] == owner_id
+        )
+        owner["produced_seam_gates"].remove(gate_id)
+        result = _run_checker(_write_document(document, tmp_path / f"producer-{name}.json"))
+        output = result.stdout + result.stderr
+        assert result.returncode != 0
+        assert marker in output, f"missing producer diagnostic {marker!r}:\n{output}"
+
+
+def test_campaign_and_fcp_complete_heads_require_sha(tmp_path: Path):
+    base = json.loads(TRACKER.read_text(encoding="utf-8"))
+    cases = (
+        (
+            "campaign",
+            lambda document: next(
+                item for item in document["evidence_campaigns"] if item["id"] == "EC-EP"
+            ).update(head_commit="https://github.com/warpfront/hipfire/issues/666"),
+            "EC-EP complete status head_commit must be a 40-hex commit when present",
+        ),
+        (
+            "fcp",
+            lambda document: document["final_closure_packet"].update(
+                head_commit="https://github.com/warpfront/hipfire/issues/666"
+            ),
+            "final closure complete status head_commit must be a 40-hex commit when present",
+        ),
+    )
+    for name, mutation, marker in cases:
+        document = json.loads(json.dumps(base))
+        _satisfy_all_prerequisites(document)
+        mutation(document)
+        result = _run_checker(_write_document(document, tmp_path / f"head-{name}.json"))
+        output = result.stdout + result.stderr
+        assert result.returncode != 0
+        assert marker in output, f"missing head diagnostic {marker!r}:\n{output}"
+
+
 def test_ready_consumer_is_omitted_but_complete_consumer_is_keyed(tmp_path: Path):
     document = json.loads(TRACKER.read_text(encoding="utf-8"))
     _satisfy_all_prerequisites(document)
@@ -567,6 +847,21 @@ def test_final_closure_requires_current_qualifying_evidence(tmp_path: Path):
         assert marker in output, f"missing closure diagnostic {marker!r}:\n{output}"
 
 
+def test_final_closure_requires_positive_and_negative_evidence(tmp_path: Path):
+    base = json.loads(TRACKER.read_text(encoding="utf-8"))
+    for field, marker in (
+        ("positive_evidence", "final closure packet positive_evidence must be non-empty"),
+        ("negative_evidence", "final closure packet negative_evidence must be non-empty"),
+    ):
+        document = json.loads(json.dumps(base))
+        _satisfy_all_prerequisites(document)
+        document["final_closure_packet"][field] = []
+        result = _run_checker(_write_document(document, tmp_path / f"closure-{field}.json"))
+        output = result.stdout + result.stderr
+        assert result.returncode != 0
+        assert marker in output, f"missing final-closure evidence diagnostic {marker!r}:\n{output}"
+
+
 def test_final_closure_required_seams_are_reciprocal(tmp_path: Path):
     document = json.loads(TRACKER.read_text(encoding="utf-8"))
     next(g for g in document["seam_gates"] if g["id"] == "S-DENSE-AXIS")["consumers"].remove("FCP-00")
@@ -587,6 +882,31 @@ def test_legacy_pr_provenance_requires_set_coverage(tmp_path: Path):
     assert result.returncode != 0
     assert "missing legacy PR provenance coverage" in output
 
+
+def test_obligation_delivery_namespace_matches_resolved_owner(tmp_path: Path):
+    base = json.loads(TRACKER.read_text(encoding="utf-8"))
+    cases = (
+        (
+            "domain",
+            "DOC-001",
+            lambda row: row.update(delivery_kind="evidence_campaign", campaign_id="EC-EP"),
+            "DOC-001 delivery_kind disagrees with resolved owner",
+        ),
+        (
+            "physical",
+            "HW-001",
+            lambda row: row.update(delivery_kind="evidence_campaign", campaign_id="EC-PP"),
+            "HW-001 campaign_id disagrees with resolved owner",
+        ),
+    )
+    for name, obligation_id, mutation, marker in cases:
+        document = json.loads(json.dumps(base))
+        row = next(row for row in document["obligations"] if row["id"] == obligation_id)
+        mutation(row)
+        result = _run_checker(_write_document(document, tmp_path / f"delivery-{name}.json"))
+        output = result.stdout + result.stderr
+        assert result.returncode != 0
+        assert marker in output, f"missing delivery diagnostic {marker!r}:\n{output}"
 
 def test_g5_merge_wait_blocks_promotion(tmp_path: Path):
     document = json.loads(TRACKER.read_text(encoding="utf-8"))
@@ -625,3 +945,156 @@ def test_docs_index_links_tracker_without_replacing_authorities():
     assert "[`docs/device-mesh-port-tracker.json`](device-mesh-port-tracker.json)" in body
     assert "[`docs/VALIDATION.md`](VALIDATION.md)" in body
     assert "[`docs/admissions.yml`](admissions.yml)" in body
+def test_completed_obligations_require_current_durable_evidence(tmp_path: Path):
+    cases = (
+        (
+            "not-applicable",
+            lambda row: row["evidence"].update(
+                disposition="not_applicable",
+                classification="current",
+                branch_record="none",
+                report_refs=[],
+            ),
+            "HW-001 complete status requires current evidence",
+        ),
+        (
+            "bare-report",
+            lambda row: row["evidence"].update(
+                disposition="current",
+                classification="current",
+                report_refs=["x"],
+            ),
+            "HW-001 complete current evidence requires a durable report reference",
+        ),
+        (
+            "tracker-report",
+            lambda row: row["evidence"].update(
+                disposition="current",
+                classification="current",
+                report_refs=["docs/device-mesh-port-tracker.json"],
+            ),
+            "HW-001 complete physical evidence requires a durable report artifact",
+        ),
+
+        (
+            "wrong-class",
+            lambda row: row["evidence"].update(
+                disposition="current",
+                classification="historical",
+                report_refs=["docs/VALIDATION.md"],
+            ),
+            "HW-001 complete status requires evidence classification current",
+        ),
+    )
+    for name, mutation, marker in cases:
+        document = json.loads(TRACKER.read_text(encoding="utf-8"))
+        _satisfy_all_prerequisites(document)
+        row = next(row for row in document["obligations"] if row["id"] == "HW-001")
+        row["status"] = "complete"
+        row["advancement"]["completion_rows"] = ["HW-001"]
+        mutation(row)
+        result = _run_checker(
+            _write_document(document, tmp_path / f"obligation-{name}.json")
+        )
+        output = result.stdout + result.stderr
+        assert result.returncode != 0
+        assert marker in output, f"missing obligation evidence diagnostic {marker!r}:\n{output}"
+
+
+def test_physical_identity_contract_is_complete_and_fail_closed(tmp_path: Path):
+    document = json.loads(TRACKER.read_text(encoding="utf-8"))
+    for campaign in document["evidence_campaigns"]:
+        if campaign["id"] in {"EC-EP", "EC-PP", "EC-TP", "EC-VISION"}:
+            assert "physical_identity" in campaign
+    cases = (
+        (
+            "digest",
+            lambda identity: identity.update(model_sha256="x"),
+            "EC-EP physical_identity.model_sha256 must be 64-hex",
+        ),
+        (
+            "gpu-count",
+            lambda identity: identity.update(gpu_ids=["gpu-a"]),
+            "EC-EP physical_identity.gpu_ids must contain at least two distinct GPUs",
+        ),
+        (
+            "result-map",
+            lambda identity: identity.update(result_map={}),
+            "EC-EP physical_identity.result_map must cover every mapped obligation",
+        ),
+        (
+            "rccl",
+            lambda identity: identity.update(rccl_version="not-used"),
+            "EC-EP physical_identity.rccl_version cannot be not-used",
+        ),
+        (
+            "tracker-only",
+            lambda identity: identity.update(report_refs=["docs/device-mesh-port-tracker.json"]),
+            "EC-EP physical_identity requires a durable report beyond tracker/issue references",
+        ),
+    )
+    for name, mutation, marker in cases:
+        mutated = json.loads(json.dumps(document))
+        _satisfy_all_prerequisites(mutated)
+        campaign = next(item for item in mutated["evidence_campaigns"] if item["id"] == "EC-EP")
+        mutation(campaign["physical_identity"])
+        result = _run_checker(_write_document(mutated, tmp_path / f"physical-{name}.json"))
+        output = result.stdout + result.stderr
+        assert result.returncode != 0
+        assert marker in output, f"missing physical identity diagnostic {marker!r}:\n{output}"
+    mutated = json.loads(json.dumps(document))
+    _satisfy_all_prerequisites(mutated)
+    receipt = next(gate for gate in mutated["seam_gates"] if gate["id"] == "S-HARDWARE-EP")["receipt"]
+    receipt["physical_identity"] = None
+    result = _run_checker(_write_document(mutated, tmp_path / "physical-receipt.json"))
+    output = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "S-HARDWARE-EP receipt requires physical identity" in output
+    mutated = json.loads(json.dumps(document))
+    _satisfy_all_prerequisites(mutated)
+    campaign = next(item for item in mutated["evidence_campaigns"] if item["id"] == "EC-EP")
+    campaign["completion_evidence"][0]["references"] = [
+        "docs/device-mesh-port-tracker.json"
+    ]
+    result = _run_checker(_write_document(mutated, tmp_path / "physical-campaign-report.json"))
+    output = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "EC-EP physical completion evidence requires a durable report artifact" in output
+
+    mutated = json.loads(json.dumps(document))
+    _satisfy_all_prerequisites(mutated)
+    receipt = next(gate for gate in mutated["seam_gates"] if gate["id"] == "S-HARDWARE-EP")["receipt"]
+    receipt["durable_references"] = ["docs/device-mesh-port-tracker.json"]
+    result = _run_checker(_write_document(mutated, tmp_path / "physical-seam-report.json"))
+    output = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "S-HARDWARE-EP receipt physical evidence requires a durable report artifact" in output
+
+
+def test_forbidden_boundary_bases_never_promote(tmp_path: Path):
+    forbidden = "bac02a1a22a55922ea057e9a98f68cb3ab93ac02"
+    cases = (
+        (
+            "group",
+            lambda document: next(group for group in document["change_sets"] if group["id"] == "G1").update(upstream_base_commit=forbidden),
+            "G1 upstream_base_commit uses a forbidden boundary",
+        ),
+        (
+            "campaign",
+            lambda document: next(campaign for campaign in document["evidence_campaigns"] if campaign["id"] == "EC-EP").update(upstream_base_commit=forbidden),
+            "EC-EP upstream_base_commit uses a forbidden boundary",
+        ),
+        (
+            "fcp",
+            lambda document: document["final_closure_packet"].update(upstream_base_commit=forbidden),
+            "final closure packet upstream_base_commit uses a forbidden boundary",
+        ),
+    )
+    for name, mutation, marker in cases:
+        document = json.loads(TRACKER.read_text(encoding="utf-8"))
+        _satisfy_all_prerequisites(document)
+        mutation(document)
+        result = _run_checker(_write_document(document, tmp_path / f"forbidden-{name}.json"))
+        output = result.stdout + result.stderr
+        assert result.returncode != 0
+        assert marker in output, f"missing forbidden-boundary diagnostic {marker!r}:\n{output}"

@@ -20,7 +20,16 @@ import json
 import re
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
+SERIES_ORIGIN_REF = "6163369329d3b076376286a00c13cadbae069ecc"
+FORBIDDEN_BOUNDARIES = (
+    "5b95cbd331dfffa2e1df8bad66ac79ec4f4b447f",
+    "1df219dd45cdaa4aa10e876491e6c280354dd3a7",
+    "aa3e5a30746474bff3787c2ff5d3cf733db3ae04",
+    "084dbebda9c72116fc9b4819f85ec2e15aa31344",
+    "bac02a1a22a55922ea057e9a98f68cb3ab93ac02",
+)
 SCHEMA = "hipfire.device_mesh.port_tracker.v2"
 SCHEMA_VERSION = 2
 EXPECTED_OBLIGATION_IDS = [
@@ -84,6 +93,54 @@ EXPECTED_GROUP_DEPS = {
     "G14": ["G2", "G5", "G7", "G8", "G9", "G10", "G12"],
     "G15": ["G2", "G8", "G12"],
 }
+EXPECTED_GROUP_CONSUMED = {
+    "G0": [], "G1": ["S-AUTHORITY"], "G2": ["S-TOPOLOGY"], "G3": ["S-ADMISSION"],
+    "G4": ["S-AUTHORITY"], "G5": ["S-TOPOLOGY"], "G6": ["S-MOE", "S-RESET"],
+    "G7": ["S-MOE", "S-RESET", "S-GEMMA"], "G8": ["S-MANIFEST", "S-LOAD", "S-MOE", "S-RESET"],
+    "G9": ["S-MOE", "S-RESET"], "G10": ["S-MOE", "S-RESET"], "G11": ["S-MOE", "S-RESET"],
+    "G12": ["S-RESET", "S-GEMMA", "S-MINIMAX", "S-QWEN35", "S-DEEPSEEK4", "S-LFM2", "S-MUSE"],
+    "G13": ["S-ADMISSION", "S-MANIFEST", "S-QWEN35", "S-GENERATION"],
+    "G14": ["S-ADMISSION", "S-MOE", "S-MINIMAX", "S-QWEN35", "S-DEEPSEEK4", "S-LFM2", "S-GENERATION"],
+    "G15": ["S-ADMISSION", "S-QWEN35", "S-GENERATION"],
+}
+EXPECTED_GROUP_PRODUCED = {
+    "G0": ["S-AUTHORITY"], "G1": ["S-TOPOLOGY"], "G2": ["S-ADMISSION"],
+    "G3": ["S-MANIFEST", "S-LOAD"], "G4": ["S-RESET"], "G5": ["S-MOE"],
+    "G6": ["S-GEMMA"], "G7": ["S-MINIMAX"], "G8": ["S-QWEN35"],
+    "G9": ["S-DEEPSEEK4"], "G10": ["S-LFM2"], "G11": ["S-MUSE"],
+    "G12": ["S-GENERATION"], "G13": ["S-DENSE-AXIS"], "G14": ["S-EXPERT-AXIS"],
+    "G15": ["S-VISION-AXIS"],
+}
+EXPECTED_CAMPAIGN_CONSUMED = {
+    "EC-EP": ["S-EXPERT-AXIS"], "EC-PP": ["S-DENSE-AXIS", "S-EXPERT-AXIS"],
+    "EC-TP": ["S-DENSE-AXIS", "S-EXPERT-AXIS"], "EC-VISION": ["S-VISION-AXIS"],
+    "EC-CLOSE": ["S-DENSE-AXIS", "S-EXPERT-AXIS", "S-VISION-AXIS", "S-HARDWARE-EP", "S-HARDWARE-PP", "S-HARDWARE-TP", "S-HARDWARE-VISION"],
+}
+EXPECTED_CAMPAIGN_PRODUCED = {
+    "EC-EP": ["S-HARDWARE-EP"], "EC-PP": ["S-HARDWARE-PP"],
+    "EC-TP": ["S-HARDWARE-TP"], "EC-VISION": ["S-HARDWARE-VISION"],
+    "EC-CLOSE": ["S-CLOSE"],
+}
+EXPECTED_FCP_CONSUMED = [
+    "S-DENSE-AXIS", "S-EXPERT-AXIS", "S-VISION-AXIS", "S-HARDWARE-EP",
+    "S-HARDWARE-PP", "S-HARDWARE-TP", "S-HARDWARE-VISION", "S-CLOSE",
+]
+EXPECTED_SEAM_CONSUMERS = {
+    "S-AUTHORITY": ["G1", "G4"], "S-TOPOLOGY": ["G2", "G5"],
+    "S-ADMISSION": ["G3", "G13", "G14", "G15"], "S-MANIFEST": ["G8", "G13"],
+    "S-LOAD": ["G8"], "S-RESET": ["G6", "G7", "G8", "G9", "G10", "G11", "G12"],
+    "S-MOE": ["G6", "G7", "G8", "G9", "G10", "G11", "G14"],
+    "S-GEMMA": ["G7", "G12"], "S-MINIMAX": ["G12", "G14"],
+    "S-QWEN35": ["G12", "G13", "G14", "G15"], "S-DEEPSEEK4": ["G12", "G14"],
+    "S-LFM2": ["G12", "G14"], "S-MUSE": ["G12"],
+    "S-GENERATION": ["G13", "G14", "G15"],
+    "S-DENSE-AXIS": ["EC-PP", "EC-TP", "EC-CLOSE", "FCP-00"],
+    "S-EXPERT-AXIS": ["EC-EP", "EC-PP", "EC-TP", "EC-CLOSE", "FCP-00"],
+    "S-VISION-AXIS": ["EC-VISION", "EC-CLOSE", "FCP-00"],
+    "S-HARDWARE-EP": ["EC-CLOSE", "FCP-00"], "S-HARDWARE-PP": ["EC-CLOSE", "FCP-00"],
+    "S-HARDWARE-TP": ["EC-CLOSE", "FCP-00"], "S-HARDWARE-VISION": ["EC-CLOSE", "FCP-00"],
+    "S-CLOSE": ["FCP-00"],
+}
 EXPECTED_CAMPAIGN_OBLIGATIONS = {
     "EC-EP": ["HW-001", "HW-002", "HW-011", "HW-010-LFM2-EP", "HW-010-COHERE-EP"],
     "EC-PP": ["HW-003", "HW-004", "HW-008-DEEPSEEK4-PP", "HW-009-MINIMAX-PP", "HW-010-LFM2-PP", "HW-010-COHERE-PP"],
@@ -108,6 +165,11 @@ EXPECTED_SEAM_PRODUCERS = {
     "S-HARDWARE-VISION": "EC-VISION", "S-CLOSE": "EC-CLOSE",
 }
 EXPECTED_GROUP_MERGE_WAITS = {group_id: (["G3"] if group_id == "G5" else []) for group_id in EXPECTED_CHANGE_SET_IDS}
+EXPECTED_CAN_DEVELOP_AFTER = {
+    "G0": [], "G1": ["G0"], "G2": ["G0"], "G3": ["G0"], "G4": ["G0"], "G5": ["G0"], "G6": ["G5"],
+    "G7": ["G5"], "G8": ["G5"], "G9": ["G5"], "G10": ["G5"], "G11": ["G5"], "G12": ["G4"],
+    "G13": ["G12"], "G14": ["G12"], "G15": ["G12"],
+}
 ALLOWED_OBLIGATION_STATUSES = frozenset({"complete", "ready", "blocked"})
 ALLOWED_DELIVERY_KINDS = frozenset({"change_set", "evidence_campaign", "final_closure"})
 ALLOWED_CHANGE_SET_STATUSES = frozenset({"implemented", "in_review", "complete", "ready", "blocked"})
@@ -119,6 +181,17 @@ ALLOWED_CONFIDENCE = frozenset({"high", "medium", "low"})
 ALLOWED_GATE_STATUSES = frozenset({"available", "complete", "proposed", "blocked"})
 ALLOWED_CAMPAIGN_CLASSES = frozenset({"physical", "closure"})
 ALLOWED_LEGACY_STATUSES = frozenset({"complete", "ready", "blocked", "in_progress", "deferred", "not_yet_present"})
+APPROVED_REPO_ROOTS = (
+    "docs/",
+    "scripts/",
+    "tests/",
+    "benchmarks/",
+    "tools/",
+    "crates/",
+    ".github/",
+    "Cargo.toml",
+    "Cargo.lock",
+)
 BAD_COMPLETION_CLASSES = frozenset({"historical", "rerun_required", "hardware_blocked", "semantics_only", "emulated", "failed"})
 REQUIRED_CONTENT_TERMS = {
     "COR-001": ("mtp_k", "ModelMeta", "HIPFIRE_MTP_K"),
@@ -143,10 +216,85 @@ def _host_local(value: Any) -> bool:
     return isinstance(value, str) and any(token in value for token in ("/home/", "/tmp/"))
 def _full_commit(value: Any) -> bool:
     return isinstance(value, str) and bool(re.fullmatch(r"[0-9a-fA-F]{40}", value))
+def _forbidden_boundary(value: Any) -> bool:
+    return _full_commit(value) and value.lower() in FORBIDDEN_BOUNDARIES
+
+
 
 
 def _durable_reference(value: Any) -> bool:
-    return _nonempty(value) and not _host_local(value)
+    if not _nonempty(value) or _host_local(value):
+        return False
+    if value.startswith("git:"):
+        return _full_commit(value[4:])
+    parsed = urlparse(value)
+    if parsed.scheme in {"http", "https"}:
+        return (
+            parsed.netloc == "github.com"
+            and parsed.path.startswith("/warpfront/hipfire/")
+            and any(parsed.path.startswith(prefix) for prefix in ("/warpfront/hipfire/issues/", "/warpfront/hipfire/pull/", "/warpfront/hipfire/commit/", "/warpfront/hipfire/blob/"))
+        )
+    if parsed.scheme or value.startswith("/") or "\\" in value:
+        return False
+    parts = value.split("/")
+    return ".." not in parts and any(value == root.rstrip("/") or value.startswith(root) for root in APPROVED_REPO_ROOTS)
+def _artifact_reference(value: Any) -> bool:
+    if not _durable_reference(value):
+        return False
+    if value == "docs/device-mesh-port-tracker.json":
+        return False
+    parsed = urlparse(value)
+    return not (
+        parsed.netloc == "github.com"
+        and parsed.path.startswith(("/warpfront/hipfire/issues/", "/warpfront/hipfire/pull/"))
+    )
+
+
+def _hex_digest(value: Any, length: int) -> bool:
+    return isinstance(value, str) and bool(re.fullmatch(rf"[0-9a-fA-F]{{{length}}}", value))
+
+
+def _check_physical_identity(
+    identity: Any,
+    label: str,
+    obligation_ids: list[str],
+    campaign_id: str,
+    errors: list[str],
+) -> None:
+    if not isinstance(identity, dict):
+        errors.append(f"{label} requires physical identity")
+        return
+    for field, length in (("model_sha256", 64), ("binary_sha256", 64)):
+        if not _hex_digest(identity.get(field), length):
+            errors.append(f"{label} physical_identity.{field} must be {length}-hex")
+    if not _hex_digest(identity.get("prompt_md5"), 32):
+        errors.append(f"{label} physical_identity.prompt_md5 must be 32-hex")
+    if campaign_id == "EC-VISION" and not _hex_digest(identity.get("image_sha256"), 64):
+        errors.append(f"{label} physical_identity.image_sha256 must be 64-hex")
+    if identity.get("campaign_id") != campaign_id:
+        errors.append(f"{label} physical_identity.campaign_id does not match owner")
+    gpu_ids = identity.get("gpu_ids")
+    if not _strings(gpu_ids, nonempty=True) or len(set(gpu_ids)) < 2:
+        errors.append(f"{label} physical_identity.gpu_ids must contain at least two distinct GPUs")
+    for field in ("topology", "rocm_version", "rccl_version"):
+        if not _nonempty(identity.get(field)):
+            errors.append(f"{label} physical_identity.{field} must be non-empty")
+    if campaign_id == "EC-EP" and identity.get("rccl_version") == "not-used":
+        errors.append(f"{label} physical_identity.rccl_version cannot be not-used")
+    report_refs = identity.get("report_refs")
+    if not _strings(report_refs, nonempty=True) or not any(_artifact_reference(ref) for ref in report_refs):
+        errors.append(f"{label} physical_identity requires a durable report beyond tracker/issue references")
+    result_map = identity.get("result_map")
+    if not isinstance(result_map, dict) or set(result_map) != set(obligation_ids):
+        errors.append(f"{label} physical_identity.result_map must cover every mapped obligation")
+    elif any(
+        not isinstance(result, dict)
+        or result.get("status") != "pass"
+        or not _strings(result.get("report_refs"), nonempty=True)
+        or not any(_artifact_reference(ref) for ref in result.get("report_refs", []))
+        for result in result_map.values()
+    ):
+        errors.append(f"{label} physical_identity.result_map entries require pass and durable reports")
 def _concrete_text(value: Any) -> bool:
     if not _nonempty(value):
         return False
@@ -206,7 +354,7 @@ def _check_evidence_entry(entry: Any, label: str, errors: list[str]) -> None:
     qualifies = entry.get("qualifies_for_completion")
     if not isinstance(qualifies, bool):
         errors.append(f"{label} evidence qualifies_for_completion must be boolean")
-    if (qualifies or classification == "current") and not references:
+    if (qualifies or classification == "current") and not any(_durable_reference(ref) for ref in (references or [])):
         errors.append(f"{label} qualifying/current evidence requires a durable evidence reference")
     if qualifies and classification in BAD_COMPLETION_CLASSES:
         errors.append(f"{label} completion promotion from {classification} evidence is forbidden")
@@ -247,14 +395,15 @@ def _validate_tracker(document: Any) -> list[str]:
     serialized = json.dumps(document, ensure_ascii=False)
     if "[x]" in serialized.lower() or "[ ]" in serialized:
         errors.append("stale checkbox claim found in tracker")
-
     upstream = document.get("upstream")
     if not isinstance(upstream, dict):
         errors.append("missing upstream metadata")
     else:
-        for key in ("remote", "branch", "ref"):
+        for key in ("remote", "branch", "series_origin_ref"):
             if not _nonempty(upstream.get(key)):
                 errors.append(f"upstream.{key} must be non-empty")
+        if upstream.get("series_origin_ref") != SERIES_ORIGIN_REF:
+            errors.append("upstream.series_origin_ref must equal the approved series origin")
 
     branch = document.get("branch_provenance")
     if not isinstance(branch, dict):
@@ -263,8 +412,8 @@ def _validate_tracker(document: Any) -> list[str]:
         for key in ("common_upstream_base", "pr_527_head", "reviewed_branch_head", "fork_merge", "fork_parent", "upstream_pr_653", "rule"):
             if not _nonempty(branch.get(key)):
                 errors.append(f"branch provenance {key!r} must be non-empty")
-        if not _strings(branch.get("forbidden_boundaries"), nonempty=True):
-            errors.append("branch provenance forbidden_boundaries must be a non-empty array")
+        if branch.get("forbidden_boundaries") != list(FORBIDDEN_BOUNDARIES):
+            errors.append("branch provenance forbidden_boundaries do not match the pinned set")
 
     authority = document.get("authority")
     if not isinstance(authority, dict):
@@ -316,6 +465,8 @@ def _validate_tracker(document: Any) -> list[str]:
         for key, expected in expected_enums.items():
             if policy.get(key) != expected:
                 errors.append(f"policy {key} does not match the schema enum")
+        if policy.get("can_develop_after") != EXPECTED_CAN_DEVELOP_AFTER:
+            errors.append("policy can_develop_after does not match the approved development-gate map")
         for key in ("grouping_rule", "completion_promotion_rule", "parallel_lane_rule", "branch_evidence_rule", "one_row_rule"):
             if not _nonempty(policy.get(key)):
                 errors.append(f"policy {key} must be non-empty")
@@ -406,8 +557,11 @@ def _validate_tracker(document: Any) -> list[str]:
             errors.append(f"{oid} missing evidence")
         else:
             disposition = evidence.get("disposition")
+            classification = evidence.get("classification")
             if disposition not in ALLOWED_DISPOSITIONS:
                 errors.append(f"{oid} evidence disposition {disposition!r} is not allowed")
+            if classification not in ALLOWED_EVIDENCE_CLASSES:
+                errors.append(f"{oid} evidence classification {classification!r} is not allowed")
             if evidence.get("branch_record") not in ALLOWED_BRANCH_RECORDS:
                 errors.append(f"{oid} evidence branch_record is not allowed")
             if not _nonempty(evidence.get("route")):
@@ -417,19 +571,38 @@ def _validate_tracker(document: Any) -> list[str]:
                     errors.append(f"{oid} evidence.{key} must be an array of strings")
                 if any(_host_local(value) for value in (evidence.get(key) or [])):
                     errors.append(f"{oid} evidence contains a host-local path")
-            if disposition == "not_applicable" and evidence.get("branch_record") != "none":
-                errors.append(f"{oid} not_applicable evidence must have branch_record none")
             if disposition != "not_applicable" and evidence.get("branch_record") != "historical":
-                errors.append(f"{oid} non-applicable evidence must preserve historical branch record")
-            if obligation.get("status") == "complete" and disposition not in {"not_applicable", "current"}:
-                errors.append(f"{oid} complete status requires current or not_applicable evidence")
-            if obligation.get("status") != "complete" and disposition == "current":
+                errors.append(f"{oid} evidence must preserve historical branch record")
+            if obligation.get("status") == "complete":
+                if disposition != "current":
+                    errors.append(f"{oid} complete status requires current evidence")
+                if classification != "current":
+                    errors.append(f"{oid} complete status requires evidence classification current")
+                if not any(_durable_reference(value) for value in (evidence.get("report_refs") or [])):
+                    errors.append(f"{oid} complete current evidence requires a durable report reference")
+                if oid.startswith("HW-") and not any(
+                    _artifact_reference(value) for value in evidence.get("report_refs") or []
+                ):
+                    errors.append(f"{oid} complete physical evidence requires a durable report artifact")
+
+            elif disposition == "current" or classification == "current":
                 errors.append(f"{oid} non-complete status cannot claim current evidence")
-            if obligation.get("status") == "complete" and disposition == "current" and not evidence.get("report_refs"):
-                errors.append(f"{oid} complete current evidence requires a durable evidence reference")
+        if oid.startswith("HW-") and obligation.get("status") == "complete":
+            _check_physical_identity(
+                obligation.get("physical_identity"),
+                oid,
+                [oid],
+                obligation.get("campaign_id") or "",
+                errors,
+            )
         owner = obligation.get("delivery_owner")
         if not isinstance(owner, dict) or owner.get("kind") not in ALLOWED_DELIVERY_KINDS or not _nonempty(owner.get("id")):
             errors.append(f"{oid} delivery_owner must name one delivery owner")
+        if obligation.get("delivery_kind") not in ALLOWED_DELIVERY_KINDS:
+            errors.append(f"{oid} delivery_kind is not allowed")
+        campaign_id = obligation.get("campaign_id")
+        if campaign_id is not None and not _nonempty(campaign_id):
+            errors.append(f"{oid} campaign_id must be a non-empty ID or null")
         advancement = obligation.get("advancement")
         if not isinstance(advancement, dict):
             errors.append(f"{oid} missing advancement metadata")
@@ -519,11 +692,17 @@ def _validate_tracker(document: Any) -> list[str]:
                 errors.append(f"{gate_id} status is not allowed")
             if gate.get("evidence_disposition") not in ALLOWED_DISPOSITIONS:
                 errors.append(f"{gate_id} evidence disposition is not allowed")
+            if gate.get("status") in {"available", "complete"} and gate.get("evidence_disposition") != "current":
+                errors.append(f"{gate_id} available/complete seam requires current evidence disposition")
+            if gate.get("status") in {"proposed", "blocked"} and gate.get("evidence_disposition") == "current":
+                errors.append(f"{gate_id} proposed/blocked seam cannot claim current evidence disposition")
             consumers = gate.get("consumers")
             if not _strings(consumers):
                 errors.append(f"{gate_id} consumers must be an array")
             elif len(consumers) != len(set(consumers)):
                 errors.append(f"{gate_id} has duplicate consumers")
+            if gate_id in EXPECTED_SEAM_CONSUMERS and consumers != EXPECTED_SEAM_CONSUMERS[gate_id]:
+                errors.append(f"{gate_id} consumers must equal the approved map")
             receipt = gate.get("receipt")
             requires_receipt = gate.get("status") in {"available", "complete"} or gate.get("evidence_disposition") == "current"
             if requires_receipt:
@@ -535,11 +714,15 @@ def _validate_tracker(document: Any) -> list[str]:
                             errors.append(f"{gate_id} receipt {field} must be concrete")
                     if receipt.get("evidence_class") not in ALLOWED_EVIDENCE_CLASSES:
                         errors.append(f"{gate_id} receipt evidence class is not allowed")
+                    if receipt.get("evidence_class") != "current":
+                        errors.append(f"{gate_id} receipt evidence_class must be current")
                     for field in ("fixture_references", "durable_references"):
                         if not _strings(receipt.get(field), nonempty=True):
                             errors.append(f"{gate_id} receipt {field} must be non-empty")
                         if any(_host_local(value) for value in (receipt.get(field) or [])):
                             errors.append(f"{gate_id} receipt contains a host-local path")
+                    if not any(_durable_reference(value) for value in (receipt.get("durable_references") or [])):
+                        errors.append(f"{gate_id} receipt durable_references require a durable commit or repository artifact")
                     consumer_commits = receipt.get("consumer_commits")
                     if not isinstance(consumer_commits, dict):
                         errors.append(f"{gate_id} receipt consumer_commits must be an object keyed by consumer ID")
@@ -560,6 +743,29 @@ def _validate_tracker(document: Any) -> list[str]:
                         errors.append(f"{gate_id} receipt side_effect_assertions must be non-empty")
                     if _host_local(receipt.get("producer_commit")):
                         errors.append(f"{gate_id} receipt contains a host-local producer commit")
+                    if gate_id in {
+                        "S-HARDWARE-EP",
+                        "S-HARDWARE-PP",
+                        "S-HARDWARE-TP",
+                        "S-HARDWARE-VISION",
+                    }:
+                        physical_campaign_id = EXPECTED_SEAM_PRODUCERS[gate_id]
+                        _check_physical_identity(
+                            receipt.get("physical_identity"),
+                            f"{gate_id} receipt",
+                            EXPECTED_CAMPAIGN_OBLIGATIONS[physical_campaign_id],
+                            physical_campaign_id,
+                            errors,
+                        )
+                        if not any(
+                            _artifact_reference(value)
+                            for value in receipt.get("durable_references") or []
+                        ):
+                            errors.append(
+                                f"{gate_id} receipt physical evidence requires a durable report artifact"
+                            )
+
+
             elif receipt is not None:
                 errors.append(f"{gate_id} proposed/blocked seam must not carry a receipt")
         if seam_ids != EXPECTED_SEAM_GATE_IDS:
@@ -618,8 +824,17 @@ def _validate_tracker(document: Any) -> list[str]:
                 errors.append(f"{gid} merge_waits_on contains an unknown or self reference")
             if gid in EXPECTED_GROUP_MERGE_WAITS and merge_waits != EXPECTED_GROUP_MERGE_WAITS[gid]:
                 errors.append(f"{gid} merge_waits_on must equal the approved map")
+            can_develop_after = change_set.get("can_develop_after")
+            if not _strings(can_develop_after):
+                errors.append(f"{gid} can_develop_after must be an array")
+            elif can_develop_after != EXPECTED_CAN_DEVELOP_AFTER[gid]:
+                errors.append(f"{gid} can_develop_after must equal the approved map")
             consumed = change_set.get("consumed_seam_gates")
             produced = change_set.get("produced_seam_gates")
+            if gid in EXPECTED_GROUP_CONSUMED and consumed != EXPECTED_GROUP_CONSUMED[gid]:
+                errors.append(f"{gid} consumed_seam_gates must equal the approved map")
+            if gid in EXPECTED_GROUP_PRODUCED and produced != EXPECTED_GROUP_PRODUCED[gid]:
+                errors.append(f"{gid} produced_seam_gates must equal the approved map")
             if not _strings(consumed) or not _strings(produced, nonempty=True):
                 errors.append(f"{gid} consumed/produced seam gates must be arrays")
             else:
@@ -651,9 +866,14 @@ def _validate_tracker(document: Any) -> list[str]:
                     errors.append(f"{gid} missing {identity_field}")
                 elif change_set[identity_field] is not None and not isinstance(change_set[identity_field], str):
                     errors.append(f"{gid} {identity_field} must be a commit or durable reference")
+            if gid == "G0" and change_set.get("upstream_base_commit") != SERIES_ORIGIN_REF:
+                errors.append("G0 upstream_base_commit must equal series_origin_ref")
             if status in {"complete", "in_review"}:
                 if not _full_commit(change_set.get("upstream_base_commit")):
                     errors.append(f"{gid} promoted status requires a pinned upstream_base_commit")
+                elif _forbidden_boundary(change_set.get("upstream_base_commit")):
+                    errors.append(f"{gid} upstream_base_commit uses a forbidden boundary")
+
                 if status == "complete":
                     if not _full_commit(change_set.get("merge_commit")):
                         errors.append(f"{gid} complete status requires a 40-hex merge_commit")
@@ -711,6 +931,8 @@ def _validate_tracker(document: Any) -> list[str]:
             lane = change_set.get("parallel_lane")
             if not isinstance(lane, dict) or not _nonempty(lane.get("name")) or lane.get("integration_mode") != "serialized-shared-file-owner" or not _strings(lane.get("can_develop_after")) or not _strings(lane.get("merge_waits_on")):
                 errors.append(f"{gid} parallel_lane is invalid")
+            elif lane.get("can_develop_after") != can_develop_after:
+                errors.append(f"{gid} parallel_lane.can_develop_after must match top-level can_develop_after")
             elif lane.get("merge_waits_on") != merge_waits:
                 errors.append(f"{gid} parallel_lane.merge_waits_on must match top-level merge_waits_on")
         if change_ids != EXPECTED_CHANGE_SET_IDS:
@@ -791,9 +1013,15 @@ def _validate_tracker(document: Any) -> list[str]:
             if status in {"complete", "in_review"}:
                 if not _full_commit(campaign.get("upstream_base_commit")):
                     errors.append(f"{cid} promoted status requires a pinned upstream_base_commit")
-                if status == "complete" and not _full_commit(campaign.get("merge_commit")):
-                    errors.append(f"{cid} complete status requires a 40-hex merge_commit")
-                if status == "in_review":
+                elif _forbidden_boundary(campaign.get("upstream_base_commit")):
+                    errors.append(f"{cid} upstream_base_commit uses a forbidden boundary")
+
+                if status == "complete":
+                    if not _full_commit(campaign.get("merge_commit")):
+                        errors.append(f"{cid} complete status requires a 40-hex merge_commit")
+                    if campaign.get("head_commit") is not None and not _full_commit(campaign.get("head_commit")):
+                        errors.append(f"{cid} complete status head_commit must be a 40-hex commit when present")
+                else:
                     if not _full_commit(campaign.get("head_commit")):
                         errors.append(f"{cid} in_review status requires a 40-hex head_commit")
                     if campaign.get("merge_commit") is not None:
@@ -817,6 +1045,10 @@ def _validate_tracker(document: Any) -> list[str]:
                 errors.append(f"{cid} must use depends_on_change_sets, not change_set_ids")
             consumed = campaign.get("consumed_seam_gates") or []
             produced = campaign.get("produced_seam_gates") or []
+            if cid in EXPECTED_CAMPAIGN_CONSUMED and consumed != EXPECTED_CAMPAIGN_CONSUMED[cid]:
+                errors.append(f"{cid} consumed_seam_gates must equal the approved map")
+            if cid in EXPECTED_CAMPAIGN_PRODUCED and produced != EXPECTED_CAMPAIGN_PRODUCED[cid]:
+                errors.append(f"{cid} produced_seam_gates must equal the approved map")
             for gate_id in [*consumed, *produced]:
                 if gate_id not in seam_by_id:
                     errors.append(f"{cid} references unknown seam gate {gate_id}")
@@ -872,6 +1104,26 @@ def _validate_tracker(document: Any) -> list[str]:
                     errors.append(f"{cid} ready status has an unavailable consumed seam")
             elif completion:
                 errors.append(f"{cid} non-complete status cannot claim completion evidence")
+            if campaign.get("topology_class") == "physical" and status in {"complete", "in_review"}:
+                _check_physical_identity(
+                    campaign.get("physical_identity"),
+                    cid,
+                    owned or [],
+                    cid,
+                    errors,
+                )
+                if any(
+                    not isinstance(entry, dict)
+                    or not any(
+                        _artifact_reference(value)
+                        for value in entry.get("references") or []
+                    )
+                    for entry in campaign.get("completion_evidence") or []
+                ):
+                    errors.append(
+                        f"{cid} physical completion evidence requires a durable report artifact"
+                    )
+
             if not _strings(campaign.get("side_effect_assertions"), nonempty=True):
                 errors.append(f"{cid} side_effect_assertions must be a non-empty array")
         if campaign_ids != EXPECTED_CAMPAIGN_IDS:
@@ -916,9 +1168,14 @@ def _validate_tracker(document: Any) -> list[str]:
         if closure_status in {"complete", "in_review"}:
             if not _full_commit(closure.get("upstream_base_commit")):
                 errors.append("final closure promoted status requires a pinned upstream_base_commit")
-            if closure_status == "complete" and not _full_commit(closure.get("merge_commit")):
-                errors.append("final closure complete status requires a 40-hex merge_commit")
-            if closure_status == "in_review":
+            elif _forbidden_boundary(closure.get("upstream_base_commit")):
+                errors.append("final closure packet upstream_base_commit uses a forbidden boundary")
+            if closure_status == "complete":
+                if not _full_commit(closure.get("merge_commit")):
+                    errors.append("final closure complete status requires a 40-hex merge_commit")
+                if closure.get("head_commit") is not None and not _full_commit(closure.get("head_commit")):
+                    errors.append("final closure complete status head_commit must be a 40-hex commit when present")
+            else:
                 if not _full_commit(closure.get("head_commit")):
                     errors.append("final closure in_review status requires a 40-hex head_commit")
                 if closure.get("merge_commit") is not None:
@@ -943,6 +1200,10 @@ def _validate_tracker(document: Any) -> list[str]:
             if cid not in campaign_by_id:
                 errors.append(f"final closure packet references unknown campaign {cid}")
         required_gates = closure.get("required_seam_gates") or []
+        if required_gates != EXPECTED_FCP_CONSUMED:
+            errors.append("final closure packet required_seam_gates must equal the approved map")
+        if closure.get("consumed_seam_gates") != EXPECTED_FCP_CONSUMED:
+            errors.append("final closure packet consumed_seam_gates must equal the approved map")
         for gate_id in required_gates:
             if gate_id not in seam_by_id:
                 errors.append(f"final closure packet references unknown seam gate {gate_id}")
@@ -958,6 +1219,10 @@ def _validate_tracker(document: Any) -> list[str]:
                     _check_evidence_entry(entry, "final closure packet", errors)
                     if key == "negative_evidence" and isinstance(entry, dict) and entry.get("qualifies_for_completion"):
                         errors.append("final closure negative evidence cannot qualify for completion")
+        if not closure.get("positive_evidence"):
+            errors.append("final closure packet positive_evidence must be non-empty")
+        if not closure.get("negative_evidence"):
+            errors.append("final closure packet negative_evidence must be non-empty")
         if not _strings(closure.get("side_effect_assertions"), nonempty=True):
             errors.append("final closure packet side_effect_assertions must be a non-empty array")
         if closure.get("status") in {"complete", "in_review"}:
@@ -1009,6 +1274,16 @@ def _validate_tracker(document: Any) -> list[str]:
     for oid in record_by_obligation:
         if oid not in EXPECTED_OBLIGATION_IDS:
             errors.append(f"unexpected delivery obligation {oid}")
+    for oid, owners in record_by_obligation.items():
+        if len(owners) != 1 or oid not in by_id:
+            continue
+        kind, owner_id = owners[0]
+        obligation = by_id[oid]
+        if obligation.get("delivery_kind") != kind:
+            errors.append(f"{oid} delivery_kind disagrees with resolved owner")
+        expected_campaign_id = owner_id if kind == "evidence_campaign" else None
+        if obligation.get("campaign_id") != expected_campaign_id:
+            errors.append(f"{oid} campaign_id disagrees with resolved owner")
     delivery_owner_ids = set(change_by_id) | set(campaign_by_id)
     if isinstance(closure, dict):
         delivery_owner_ids.add(closure.get("id"))
@@ -1071,6 +1346,11 @@ def _validate_tracker(document: Any) -> list[str]:
         for gate_id in consumed_gates:
             if gate_id in seam_by_id and owner_id not in (seam_by_id[gate_id].get("consumers") or []):
                 errors.append(f"{owner_id} consumed seam gate {gate_id} omits this consumer")
+    for gate_id, gate in seam_by_id.items():
+        producer_id = gate.get("producer")
+        producer_owner = _owner_record(producer_id, change_by_id, campaign_by_id, closure)
+        if producer_owner is not None and gate_id not in (producer_owner.get("produced_seam_gates") or []):
+            errors.append(f"{gate_id} producer {producer_id} omits gate")
 
     return errors
 
