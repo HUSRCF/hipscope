@@ -195,6 +195,87 @@ pub fn carrier_for(arch_id: u32) -> Option<&'static dyn Carrier> {
         .find(|c| c.claims_arch_id(arch_id, false))
 }
 
+/// Typed failures returned before a loader can enter any teardown, mesh/GPU
+/// initialization, remap, carrier, or model-owner side effect.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LoadAdmissionError {
+    /// The source could not be opened or parsed as an HFQ/safetensors source.
+    SourceOpen { path: String, reason: String },
+    /// A source opened successfully but could not be classified into one
+    /// disjoint carrier/model variant.
+    Classification { source: SourceKind, reason: String },
+    /// The classified source/variant refused the requested parallel route.
+    Admission(AdmissionError),
+}
+
+impl LoadAdmissionError {
+    /// Stable presentation category for this boundary failure.
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::SourceOpen { .. } => "SRC-001",
+            Self::Classification { .. } => "CLS-001",
+            Self::Admission(error) => error.code(),
+        }
+    }
+
+    /// Return the source namespace when classification reached a source.
+    pub const fn source(&self) -> Option<SourceKind> {
+        match self {
+            Self::SourceOpen { .. } => None,
+            Self::Classification { source, .. } => Some(*source),
+            Self::Admission(error) => error.source(),
+        }
+    }
+
+    /// Preserve the policy error for callers that need to match CAP/COMP
+    /// variants and inspect requested/effective degrees.
+    pub const fn admission(&self) -> Option<&AdmissionError> {
+        match self {
+            Self::Admission(error) => Some(error),
+            Self::SourceOpen { .. } | Self::Classification { .. } => None,
+        }
+    }
+}
+
+impl From<AdmissionError> for LoadAdmissionError {
+    fn from(error: AdmissionError) -> Self {
+        Self::Admission(error)
+    }
+}
+
+impl std::fmt::Display for LoadAdmissionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SourceOpen { path, reason } => {
+                write!(f, "[SRC-001] failed to open model `{path}`: {reason}")
+            }
+            Self::Classification { source, reason } => {
+                write!(f, "[CLS-001] {} source classification failed: {reason}", source.name())
+            }
+            Self::Admission(error) => std::fmt::Display::fmt(error, f),
+        }
+    }
+}
+
+impl std::error::Error for LoadAdmissionError {}
+
+/// Return the source namespace without reopening or probing the source.
+fn source_kind(src: &ModelSource) -> SourceKind {
+    if src.is_dir() {
+        SourceKind::SafetensorsDir
+    } else {
+        SourceKind::Hfq
+    }
+}
+
+/// Open one model source while retaining an explicit source-open failure.
+fn open_source(path: &str) -> Result<ModelSource, LoadAdmissionError> {
+    ModelSource::from_path(path).map_err(|reason| LoadAdmissionError::SourceOpen {
+        path: path.to_owned(),
+        reason,
+    })
+}
+
 /// The result of the sole source-aware loader admission point.
 ///
 /// `mesh` is the effective G1 topology. `source` and `variant` are retained
@@ -212,24 +293,34 @@ pub struct LoadAdmission {
 /// `Carrier::probe` remains the namespace-aware arch-id gate (HFQ versus
 /// safetensors directory). Fine-grained dense/MoE/VL facts are then obtained
 /// from the selected carrier before policy lookup.
-pub fn classify_source(src: &ModelSource) -> Result<(&'static dyn Carrier, ModelVariant), String> {
-    let arch_id = src
-        .arch_id()
-        .ok_or_else(|| format!("no arch_id in source: {}", src.describe()))?;
+pub fn classify_source(
+    src: &ModelSource,
+) -> Result<(&'static dyn Carrier, ModelVariant), LoadAdmissionError> {
+    let source = source_kind(src);
+    let arch_id = src.arch_id().ok_or_else(|| LoadAdmissionError::Classification {
+        source,
+        reason: format!("no arch_id in source: {}", src.describe()),
+    })?;
     let mut matches = REGISTRY.iter().filter(|carrier| carrier.probe(src));
-    let carrier = *matches
-        .next()
-        .ok_or_else(|| format!("no carrier for arch_id {} ({})", arch_id, src.describe()))?;
+    let carrier = *matches.next().ok_or_else(|| LoadAdmissionError::Classification {
+        source,
+        reason: format!("no carrier for arch_id {} ({})", arch_id, src.describe()),
+    })?;
     if let Some(other) = matches.next() {
-        return Err(format!(
-            "ambiguous carrier for arch_id {} ({}): '{}' and '{}' both claim it",
-            arch_id,
-            src.describe(),
-            carrier.name(),
-            other.name()
-        ));
+        return Err(LoadAdmissionError::Classification {
+            source,
+            reason: format!(
+                "ambiguous carrier for arch_id {} ({}): '{}' and '{}' both claim it",
+                arch_id,
+                src.describe(),
+                carrier.name(),
+                other.name()
+            ),
+        });
     }
-    let variant = carrier.classify_parallel_variant(src)?;
+    let variant = carrier
+        .classify_parallel_variant(src)
+        .map_err(|reason| LoadAdmissionError::Classification { source, reason })?;
     Ok((carrier, variant))
 }
 
@@ -250,16 +341,14 @@ fn raw_for_cli_route(variant: ModelVariant, raw: RawParallelism) -> RawParalleli
 
 /// Admit an already-open source after classification. This private helper keeps
 /// regular and axis-specific wrappers on the same source-aware decision.
-
-fn admit_source(src: &ModelSource, raw: RawParallelism) -> Result<LoadAdmission, String> {
-    let source = if src.is_dir() {
-        SourceKind::SafetensorsDir
-    } else {
-        SourceKind::Hfq
-    };
+fn admit_source(
+    src: &ModelSource,
+    raw: RawParallelism,
+) -> Result<LoadAdmission, LoadAdmissionError> {
+    let source = source_kind(src);
     let (_carrier, variant) = classify_source(src)?;
     let raw = raw_for_cli_route(variant, raw);
-    let mesh = resolve(source, variant, raw).map_err(|err| err.to_string())?;
+    let mesh = resolve(source, variant, raw).map_err(LoadAdmissionError::Admission)?;
     Ok(LoadAdmission {
         source,
         variant,
@@ -273,8 +362,11 @@ fn admit_source(src: &ModelSource, raw: RawParallelism) -> Result<LoadAdmission,
 /// remap, mesh binding, or model allocation is touched until this succeeds.
 /// All downstream callers must branch on the returned mesh/variant rather than
 /// on raw CLI degree fields.
-pub fn admit_load(path: &str, raw: RawParallelism) -> Result<LoadAdmission, String> {
-    let src = ModelSource::from_path(path)?;
+pub fn admit_load(
+    path: &str,
+    raw: RawParallelism,
+) -> Result<LoadAdmission, LoadAdmissionError> {
+    let src = open_source(path)?;
     admit_source(&src, raw)
 }
 
@@ -2296,8 +2388,9 @@ pub fn load_model_with_kv_backend(
 ) -> Result<LoadedModel, String> {
     // Source probing and the capability decision are deliberately first:
     // unsupported PP/source combinations must not touch GPU teardown state.
-    let src = ModelSource::from_path(path)?;
-    let admission = admit_source(&src, RawParallelism::new(pp, 1, 1))?;
+    let src = open_source(path).map_err(|error| error.to_string())?;
+    let admission =
+        admit_source(&src, RawParallelism::new(pp, 1, 1)).map_err(|error| error.to_string())?;
     // Retry any arenas left by a prior failed teardown; refuse the load if
     // ownership is still live so a new model cannot stack on pending VMM state.
     ensure_vmm_ready_for_load(gpu)?;
@@ -2402,7 +2495,7 @@ pub fn load_model_with_kv_backend(
 
     // Admission already performed the namespace/variant checks above; resolve
     // the same carrier for the actual load without another policy decision.
-    let (carrier, _) = classify_source(&src)?;
+    let (carrier, _) = classify_source(&src).map_err(|error| error.to_string())?;
     if kv_backend == KvBackend::Vmm
         && !matches!(carrier.name(), "qwen35" | "deepseek4" | "muse_glimmer")
     {
@@ -2467,8 +2560,9 @@ pub fn load_model_with_gemma4_drafter(
     // unsupported PP/source combinations must not touch GPU teardown state.
     let _ = gemma4_eagle_spec_len(Some(gemma4_draft_len as u64))
         .map_err(|e| format!("gemma4 drafter: {e}"))?;
-    let src = ModelSource::from_path(path)?;
-    let admission = admit_source(&src, RawParallelism::new(pp, 1, 1))?;
+    let src = open_source(path).map_err(|error| error.to_string())?;
+    let admission =
+        admit_source(&src, RawParallelism::new(pp, 1, 1)).map_err(|error| error.to_string())?;
     // Retry any arenas left by a prior failed teardown; refuse the load if
     // ownership is still live so a new model cannot stack on pending VMM state.
     ensure_vmm_ready_for_load(gpu)?;
@@ -2518,7 +2612,7 @@ pub fn load_model_with_gemma4_drafter(
         gemma4_drafter_path,
         gemma4_draft_len,
     };
-    let (carrier, _) = classify_source(&src)?;
+    let (carrier, _) = classify_source(&src).map_err(|error| error.to_string())?;
     if kv_backend == KvBackend::Vmm
         && !matches!(carrier.name(), "qwen35" | "deepseek4" | "muse_glimmer")
     {
@@ -2994,7 +3088,8 @@ pub fn load_model_ep_with_kv_mode(
     kv_backend: Option<&str>,
     state_quant: Option<&str>,
 ) -> Result<LoadedModel, String> {
-    let admission = admit_load(path, RawParallelism::new(1, tp, 1))?;
+    let admission =
+        admit_load(path, RawParallelism::new(1, tp, 1)).map_err(|error| error.to_string())?;
     if admission.source != SourceKind::Hfq {
         return Err("parallel EP/TP routes currently require an HFQ source".into());
     }
@@ -3051,7 +3146,8 @@ pub fn load_model_ep_with_compressor_cache(
     tp: usize,
     compressor_cache: hipfire_config::Deepseek4CompressorCache,
 ) -> Result<LoadedModel, String> {
-    let admission = admit_load(path, RawParallelism::new(1, tp, 1))?;
+    let admission =
+        admit_load(path, RawParallelism::new(1, tp, 1)).map_err(|error| error.to_string())?;
     if admission.source != SourceKind::Hfq {
         return Err("parallel EP/TP routes currently require an HFQ source".into());
     }
@@ -4015,7 +4111,214 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
 
 #[cfg(test)]
 mod registry_tests {
-    use super::{resolve_deepseek4_compressor_cache_kv_mode, REGISTRY};
+    use super::{
+        admit_load, load_model_ep_with_compressor_cache, load_model_ep_with_kv_mode,
+        resolve_deepseek4_compressor_cache_kv_mode, AdmissionError, LoadAdmission, LoadAdmissionError,
+        ModelVariant, RawParallelism, SourceKind, REGISTRY,
+    };
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct SideEffects {
+        teardown: usize,
+        mesh_gpu_init: usize,
+        remap: usize,
+        carrier_entry: usize,
+        prior_owner: Option<&'static str>,
+    }
+
+    fn fixture_path(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "hipfire-loader-admission-{label}-{}.hfq",
+            std::process::id()
+        ))
+    }
+
+    fn write_metadata_fixture(path: &std::path::Path, arch_id: u32, metadata: &str) {
+        use std::io::Write;
+
+        let metadata = metadata.as_bytes();
+        let metadata_offset = 32u64;
+        let index_offset = metadata_offset + metadata.len() as u64;
+        let index = 0u32.to_le_bytes();
+        let data_start = index_offset + index.len() as u64;
+        let data_offset = (data_start + 4095) & !4095;
+        let mut file = std::fs::File::create(path).unwrap();
+        file.write_all(b"HFQM").unwrap();
+        file.write_all(&1u32.to_le_bytes()).unwrap();
+        file.write_all(&arch_id.to_le_bytes()).unwrap();
+        file.write_all(&0u32.to_le_bytes()).unwrap();
+        file.write_all(&metadata_offset.to_le_bytes()).unwrap();
+        file.write_all(&data_offset.to_le_bytes()).unwrap();
+        file.write_all(metadata).unwrap();
+        file.write_all(&index).unwrap();
+        file.write_all(&vec![0u8; (data_offset - data_start) as usize])
+            .unwrap();
+        file.flush().unwrap();
+    }
+
+    fn run_after_admission(
+        result: Result<LoadAdmission, LoadAdmissionError>,
+        effects: &mut SideEffects,
+        require_single: bool,
+    ) -> Result<bool, LoadAdmissionError> {
+        let admission = result?;
+        if require_single && admission.mesh.n_devices() != 1 {
+            return Ok(false);
+        }
+        effects.teardown += 1;
+        effects.mesh_gpu_init += admission.mesh.n_devices();
+        effects.remap += 1;
+        effects.carrier_entry += 1;
+        effects.prior_owner = None;
+        Ok(true)
+    }
+
+    #[test]
+    fn admission_boundary_preserves_typed_source_and_policy_errors() {
+        let missing = fixture_path("missing");
+        let _ = std::fs::remove_file(&missing);
+        let source_error = admit_load(
+            missing.to_str().unwrap(),
+            RawParallelism::new(1, 1, 1),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            &source_error,
+            LoadAdmissionError::SourceOpen { path, .. }
+                if path.as_str() == missing.to_str().unwrap()
+        ));
+        assert_eq!(source_error.code(), "SRC-001");
+
+        let path = fixture_path("moe-policy");
+        write_metadata_fixture(&path, 6, r#"{"config":{"num_experts":8}}"#);
+        let policy_error =
+            admit_load(path.to_str().unwrap(), RawParallelism::new(1, 2, 1)).unwrap_err();
+        std::fs::remove_file(&path).unwrap();
+        match policy_error {
+            LoadAdmissionError::Admission(AdmissionError::Unsupported {
+                source,
+                variant,
+                requested,
+                effective,
+                ..
+            }) => {
+                assert_eq!(source, SourceKind::Hfq);
+                assert_eq!(variant, ModelVariant::Qwen35Moe);
+                assert_eq!(requested, RawParallelism::new(1, 1, 2));
+                assert_eq!(effective, RawParallelism::new(1, 1, 2));
+            }
+            other => panic!("expected typed policy refusal, got {other:?}"),
+        }
+
+        let path = fixture_path("classification");
+        write_metadata_fixture(&path, 99, "{}");
+        let classification_error =
+            admit_load(path.to_str().unwrap(), RawParallelism::new(1, 1, 1)).unwrap_err();
+        std::fs::remove_file(&path).unwrap();
+        assert!(matches!(
+            classification_error,
+            LoadAdmissionError::Classification {
+                source: SourceKind::Hfq,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn refused_entrypoints_leave_teardown_and_owners_unchanged() {
+        let dense_path = fixture_path("dense");
+        write_metadata_fixture(&dense_path, 5, r#"{"config":{"num_experts":0}}"#);
+        let moe_path = fixture_path("moe");
+        write_metadata_fixture(&moe_path, 6, r#"{"config":{"num_experts":8}}"#);
+        let gemma_path = fixture_path("gemma");
+        write_metadata_fixture(&gemma_path, 13, "{}");
+
+        let before = SideEffects {
+            teardown: 0,
+            mesh_gpu_init: 0,
+            remap: 0,
+            carrier_entry: 0,
+            prior_owner: Some("prior-model"),
+        };
+        let mut effects = before.clone();
+
+        // Ordinary wrapper: unsupported dense TP degree.
+        assert!(run_after_admission(
+            admit_load(
+                dense_path.to_str().unwrap(),
+                RawParallelism::new(1, 6, 1)
+            ),
+            &mut effects,
+            false,
+        )
+        .is_err());
+        assert_eq!(effects, before);
+
+        // Multi-slot wrapper: generic admission succeeds for PP2, but the
+        // backend-specific single-device guard rejects before side effects.
+        assert_eq!(
+            run_after_admission(
+                admit_load(
+                    dense_path.to_str().unwrap(),
+                    RawParallelism::new(2, 1, 1)
+                ),
+                &mut effects,
+                true,
+            )
+            .unwrap(),
+            false
+        );
+        assert_eq!(effects, before);
+
+        // Regular/Gemma wrapper: Gemma has no current PP route.
+        assert!(run_after_admission(
+            admit_load(
+                gemma_path.to_str().unwrap(),
+                RawParallelism::new(2, 1, 1)
+            ),
+            &mut effects,
+            false,
+        )
+        .is_err());
+        assert_eq!(effects, before);
+
+        // EP/TP wrapper: the Qwen3.5 MoE legacy `tp` spelling maps to EP,
+        // then the unsupported degree is refused by the centralized policy.
+        assert!(run_after_admission(
+            admit_load(
+                moe_path.to_str().unwrap(),
+                RawParallelism::new(1, 2, 1)
+            ),
+            &mut effects,
+            false,
+        )
+        .is_err());
+        assert_eq!(effects, before);
+
+        let ep_error = load_model_ep_with_kv_mode(
+            moe_path.to_str().unwrap(),
+            4096,
+            2,
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(ep_error.contains("Qwen3.5 MoE EP"));
+        let cache_error = load_model_ep_with_compressor_cache(
+            moe_path.to_str().unwrap(),
+            4096,
+            2,
+            hipfire_config::Deepseek4CompressorCache::F32,
+        )
+        .unwrap_err();
+        assert!(cache_error.contains("Qwen3.5 MoE EP"));
+        assert_eq!(effects, before);
+
+        std::fs::remove_file(dense_path).unwrap();
+        std::fs::remove_file(moe_path).unwrap();
+        std::fs::remove_file(gemma_path).unwrap();
+    }
 
     #[test]
     fn deepseek4_kv_mode_is_truthful_and_fail_closed() {

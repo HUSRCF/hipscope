@@ -150,16 +150,35 @@ fn classify_qwen35(src: &ModelSource) -> Result<ModelVariant, String> {
         .ok_or_else(|| "qwen35 source has no architecture id".to_string())?;
     let config = source_config(src)?;
     let text_config = config.get("text_config").unwrap_or(&config);
-    let experts = config_number(text_config, "num_experts");
+    let experts = text_config
+        .get("num_experts")
+        .and_then(serde_json::Value::as_u64)
+        .or_else(|| {
+            config
+                .get("num_experts")
+                .and_then(serde_json::Value::as_u64)
+        })
+        .unwrap_or(0) as usize;
+
+    if !matches!(arch_id, 5 | 6) {
+        return Err(format!("qwen35: unexpected source arch_id {arch_id}"));
+    }
+
+    // Validate the backbone identity before looking at vision markers. A VL
+    // tensor must not hide an arch/config mismatch by taking an early return.
+    let backbone = match (arch_id, experts > 0) {
+        (5, false) => ModelVariant::Qwen35Dense,
+        (6, true) => ModelVariant::Qwen35Moe,
+        (5, true) => return Err("qwen35: arch_id=5 conflicts with num_experts > 0".into()),
+        (6, false) => return Err("qwen35: arch_id=6 requires num_experts > 0".into()),
+        _ => unreachable!("arch_id was checked above"),
+    };
+
     let has_vision_config = config.get("vision_config").is_some();
     let has_vision_tensor = source_has_tensor(src, "model.visual.patch_embed.proj.weight");
     let model_type_is_vl = config_model_type(&config)
         .map(|model_type| model_type.to_ascii_lowercase().contains("vl"))
         .unwrap_or(false);
-
-    if !matches!(arch_id, 5 | 6) {
-        return Err(format!("qwen35: unexpected source arch_id {arch_id}"));
-    }
 
     // Qwen3.5-VL may share arch id 5 or 6 with text checkpoints. A vision
     // marker without the actual tower is malformed and must fail closed
@@ -171,19 +190,14 @@ fn classify_qwen35(src: &ModelSource) -> Result<ModelVariant, String> {
                     .into(),
             );
         }
-        return Ok(ModelVariant::Qwen35Vl);
+        return Ok(match backbone {
+            ModelVariant::Qwen35Dense => ModelVariant::Qwen35DenseVl,
+            ModelVariant::Qwen35Moe => ModelVariant::Qwen35MoeVl,
+            _ => unreachable!("backbone is a Qwen3.5 text variant"),
+        });
     }
 
-    // Expert count is the family fact that separates dense and MoE. The arch
-    // id selects the carrier and is checked for consistency, but never decides
-    // this row by itself.
-    match (arch_id, experts > 0) {
-        (5, false) => Ok(ModelVariant::Qwen35Dense),
-        (6, true) => Ok(ModelVariant::Qwen35Moe),
-        (5, true) => Err("qwen35: arch_id=5 conflicts with num_experts > 0".into()),
-        (6, false) => Err("qwen35: arch_id=6 requires num_experts > 0".into()),
-        _ => unreachable!("arch_id was checked above"),
-    }
+    Ok(backbone)
 }
 
 fn classify_lfm2(src: &ModelSource) -> Result<ModelVariant, String> {
@@ -2694,5 +2708,120 @@ mod gemma4_route_tests {
         assert!(gemma4_validate_drafter_route(true, true).is_err());
         assert!(gemma4_validate_drafter_route(true, false).is_ok());
         assert!(gemma4_validate_drafter_route(false, true).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod qwen35_classification_tests {
+    use super::{classify_qwen35, ModelVariant};
+    use hipfire_runtime::hfq::HfqFile;
+    use hipfire_runtime::loader_api::ModelSource;
+    use std::io::Write;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
+
+    fn write_fixture(path: &Path, arch_id: u32, metadata: &str, vision: bool) {
+        let tensors = if vision {
+            vec![(
+                "model.visual.patch_embed.proj.weight",
+                3u8,
+                vec![1u32, 1],
+                vec![0u8; 4],
+            )]
+        } else {
+            Vec::new()
+        };
+        let metadata = metadata.as_bytes();
+        let metadata_offset = 32u64;
+        let index_offset = metadata_offset + metadata.len() as u64;
+        let mut index = Vec::new();
+        index.extend_from_slice(&(tensors.len() as u32).to_le_bytes());
+        for (name, quant_type, shape, data) in &tensors {
+            index.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            index.extend_from_slice(name.as_bytes());
+            index.push(*quant_type);
+            index.push(shape.len() as u8);
+            for &dim in shape {
+                index.extend_from_slice(&dim.to_le_bytes());
+            }
+            index.extend_from_slice(&0u32.to_le_bytes());
+            index.extend_from_slice(&(data.len() as u64).to_le_bytes());
+        }
+        let data_start = index_offset + index.len() as u64;
+        let data_offset = (data_start + 4095) & !4095;
+        let mut file = std::fs::File::create(path).unwrap();
+        file.write_all(b"HFQM").unwrap();
+        file.write_all(&1u32.to_le_bytes()).unwrap();
+        file.write_all(&arch_id.to_le_bytes()).unwrap();
+        file.write_all(&(tensors.len() as u32).to_le_bytes()).unwrap();
+        file.write_all(&metadata_offset.to_le_bytes()).unwrap();
+        file.write_all(&data_offset.to_le_bytes()).unwrap();
+        file.write_all(metadata).unwrap();
+        file.write_all(&index).unwrap();
+        file.write_all(&vec![0u8; (data_offset - data_start) as usize])
+            .unwrap();
+        for (_, _, _, data) in &tensors {
+            file.write_all(data).unwrap();
+        }
+        file.flush().unwrap();
+    }
+
+    fn classify_fixture(
+        arch_id: u32,
+        metadata: &str,
+        vision: bool,
+    ) -> Result<ModelVariant, String> {
+        let serial = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "hipfire-qwen35-classification-{}-{serial}.hfq",
+            std::process::id()
+        ));
+        write_fixture(&path, arch_id, metadata, vision);
+        let result = {
+            let source = ModelSource::Hfq(HfqFile::open(&path).unwrap());
+            classify_qwen35(&source)
+        };
+        std::fs::remove_file(path).unwrap();
+        result
+    }
+
+    #[test]
+    fn qwen35_vl_keeps_dense_and_moe_backbones_disjoint() {
+        let dense = classify_fixture(
+            5,
+            r#"{"config":{"num_experts":0,"vision_config":{}}}"#,
+            true,
+        )
+        .unwrap();
+        let moe = classify_fixture(
+            6,
+            r#"{"config":{"num_experts":8,"vision_config":{}}}"#,
+            true,
+        )
+        .unwrap();
+        assert_eq!(dense, ModelVariant::Qwen35DenseVl);
+        assert_eq!(moe, ModelVariant::Qwen35MoeVl);
+        assert_ne!(dense, moe);
+    }
+
+    #[test]
+    fn qwen35_vl_validates_arch_expert_pair_before_vision() {
+        let dense_id_with_experts = classify_fixture(
+            5,
+            r#"{"config":{"num_experts":8,"vision_config":{}}}"#,
+            true,
+        )
+        .unwrap_err();
+        assert!(dense_id_with_experts.contains("arch_id=5 conflicts"));
+
+        let moe_id_without_experts = classify_fixture(
+            6,
+            r#"{"config":{"num_experts":0,"vision_config":{}}}"#,
+            true,
+        )
+        .unwrap_err();
+        assert!(moe_id_without_experts.contains("arch_id=6 requires"));
     }
 }

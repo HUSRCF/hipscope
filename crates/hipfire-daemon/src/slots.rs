@@ -918,19 +918,6 @@ pub fn validate_load_caps(msg: &serde_json::Value) -> Option<String> {
             );
         }
     }
-    let tp = msg
-        .get("params")
-        .and_then(|p| p.get("tp"))
-        .and_then(|v| v.as_u64())
-        .unwrap_or(1);
-    let pp = msg
-        .get("params")
-        .and_then(|p| p.get("pp"))
-        .and_then(|v| v.as_u64())
-        .unwrap_or(1);
-    if tp != 1 || pp != 1 {
-        return Some("experimental multi-slot requires pp=tp=1".to_string());
-    }
     // The slot kernels currently own a fixed Q8 KV/state path and no
     // speculative or eviction sidecars. Refuse instead of silently ignoring
     // an ordinary serve configuration that the alternate backend cannot honor.
@@ -1317,13 +1304,19 @@ mod tests {
     }
 
     #[test]
-    fn load_caps_rejects_continuous_and_tp_pp() {
+    fn load_caps_keeps_topology_in_loader_admission() {
+        // PP/TP are source- and variant-aware policy decisions owned by the
+        // loader admission boundary, not this backend-local knob validator.
+        assert_eq!(
+            validate_load_caps(&json!({"params": {"tp": 2}})),
+            None
+        );
+        assert_eq!(
+            validate_load_caps(&json!({"params": {"pp": 2}})),
+            None
+        );
         let m = json!({"params": {"continuous_batch_size": 2}});
         assert!(validate_load_caps(&m).is_some());
-        let m2 = json!({"params": {"tp": 2}});
-        assert!(validate_load_caps(&m2).is_some());
-        let m3 = json!({"params": {"pp": 2}});
-        assert!(validate_load_caps(&m3).is_some());
         let m4 = json!({"params": {"draft": "some.hfq"}});
         assert!(validate_load_caps(&m4).is_some());
         let m5 = json!({"params": {"prefill_compression": "on"}});

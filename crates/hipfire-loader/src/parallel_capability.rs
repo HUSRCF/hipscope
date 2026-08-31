@@ -120,12 +120,12 @@ pub enum ModelVariant {
     Qwen35Dense,
     /// Qwen3.5/3.6 MoE text.
     Qwen35Moe,
-    /// Qwen3.5-VL (vision-bearing text or MoE backbone).
-    Qwen35Vl,
+    /// Qwen3.5 dense vision-language model.
+    Qwen35DenseVl,
+    /// Qwen3.5 MoE vision-language model.
+    Qwen35MoeVl,
     /// Standalone Qwen2 text.
     Qwen2,
-    /// dots.ocr/Qwen2-VL.
-    DotsOcr,
     /// DeepSeek V4 Flash.
     Deepseek4,
     /// MiniMax-M2.
@@ -462,12 +462,17 @@ pub fn cell_info(source: SourceKind, variant: ModelVariant, axis: ParallelAxis) 
         (_, Qwen35Moe, Tp) => Unsupported { owner: "CAP-001", reason: "Qwen3.5 MoE TP has no current loader route" },
         (Hfq, Qwen35Moe, Ep) => Admitted,
         (SafetensorsDir, Qwen35Moe, Ep) => Unsupported { owner: "CAP-001", reason: "Qwen3.5 MoE safetensors EP has no current loader route" },
-        (Hfq, Qwen35Vl, Single) => Admitted,
-        (SafetensorsDir, Qwen35Vl, Single) => Unsupported { owner: "CAP-001", reason: "Qwen3.5-VL safetensors vision load has no current route" },
-        (_, Qwen35Vl, Pp) => Unsupported { owner: "CAP-001", reason: "Qwen3.5-VL PP would skip the vision tower" },
-        (_, Qwen35Vl, Tp) => Unsupported { owner: "CAP-001", reason: "Qwen3.5-VL TP has no current loader route" },
-        (Hfq, Qwen35Vl, Ep) => NormalizeToSingle,
-        (SafetensorsDir, Qwen35Vl, Ep) => Unsupported { owner: "CAP-001", reason: "Qwen3.5-VL safetensors vision load has no current route" },
+        (Hfq, Qwen35DenseVl, Single) => Admitted,
+        (SafetensorsDir, Qwen35DenseVl, Single) => Unsupported { owner: "CAP-001", reason: "Qwen3.5 dense-VL safetensors vision load has no current route" },
+        (_, Qwen35DenseVl, Pp) => Unsupported { owner: "CAP-001", reason: "Qwen3.5 dense-VL PP would skip the vision tower" },
+        (_, Qwen35DenseVl, Tp) => Unsupported { owner: "CAP-001", reason: "Qwen3.5 dense-VL TP has no current loader route" },
+        (Hfq, Qwen35DenseVl, Ep) => NormalizeToSingle,
+        (SafetensorsDir, Qwen35DenseVl, Ep) => Unsupported { owner: "CAP-001", reason: "Qwen3.5 dense-VL safetensors vision load has no current route" },
+        (Hfq, Qwen35MoeVl, Single) => Admitted,
+        (SafetensorsDir, Qwen35MoeVl, Single) => Unsupported { owner: "CAP-001", reason: "Qwen3.5 MoE-VL safetensors vision load has no current route" },
+        (_, Qwen35MoeVl, Pp) => Unsupported { owner: "CAP-001", reason: "Qwen3.5 MoE-VL PP would skip the vision tower" },
+        (_, Qwen35MoeVl, Tp) => Unsupported { owner: "CAP-001", reason: "Qwen3.5 MoE-VL TP has no current loader route" },
+        (_, Qwen35MoeVl, Ep) => Unsupported { owner: "CAP-001", reason: "Qwen3.5 MoE-VL EP has no current loader route" },
 
         // Standalone dense/VL carriers have executable Single routes only.
         (_, Qwen2, Single) => Admitted,
@@ -586,6 +591,43 @@ mod tests {
             cell_info(SourceKind::Hfq, ModelVariant::Gemma4, ParallelAxis::Pp),
             CellPolicy::Unsupported { .. }
         ));
+    }
+
+    #[test]
+    fn dense_and_moe_vl_have_disjoint_ep_policies() {
+        assert_eq!(
+            cell_info(
+                SourceKind::Hfq,
+                ModelVariant::Qwen35DenseVl,
+                ParallelAxis::Ep
+            ),
+            CellPolicy::NormalizeToSingle
+        );
+        assert!(matches!(
+            cell_info(
+                SourceKind::Hfq,
+                ModelVariant::Qwen35MoeVl,
+                ParallelAxis::Ep
+            ),
+            CellPolicy::Unsupported { .. }
+        ));
+
+        let dense = resolve(
+            SourceKind::Hfq,
+            ModelVariant::Qwen35DenseVl,
+            req(1, 1, 4),
+        )
+        .unwrap();
+        assert_eq!(dense.n_devices(), 1);
+        assert!(!dense.has_axis(DimKind::Ep));
+
+        let moe = resolve(
+            SourceKind::Hfq,
+            ModelVariant::Qwen35MoeVl,
+            req(1, 1, 4),
+        )
+        .unwrap_err();
+        assert!(moe.reason().contains("MoE-VL EP"));
     }
 
     #[test]

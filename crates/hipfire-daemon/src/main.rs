@@ -86,7 +86,7 @@ mod slots;
 use hipfire_generate::vision::{GenerateVLParams, ImageSource};
 use hipfire_loader::{
     admit_load, AsstTurnCache, DimKind, EpArch, EpState, Eviction, LoadedModel, ModelVariant,
-    RawParallelism,
+    RawParallelism, SourceKind,
 };
 use hipfire_runtime::spec::{
     ClientEvent, EmitOutcome, EvictRetain, FinishSummary, PrefillOutcome, SpecAdvance, SpecEmit,
@@ -450,6 +450,93 @@ fn ep_deferred_handoff_error_message(prior_err: &str, rollback_err: Option<&str>
 /// occupies `model` — that path tears down after successful new load.
 fn ep_deferred_needs_vmm_preflight(load_tp: usize, model_present: bool) -> bool {
     load_tp > 1 && !model_present
+}
+
+/// Backend-local multi-slot capability checks that consume only the admitted
+/// source/variant/mesh. Raw PP/TP policy remains in loader admission.
+fn validate_multi_slot_admission(admission: &hipfire_loader::LoadAdmission) -> Option<&'static str> {
+    if admission.mesh.n_devices() != 1 {
+        return Some("experimental multi-slot requires a single-device admitted route");
+    }
+    if admission.source != SourceKind::Hfq
+        || !matches!(
+            admission.variant,
+            ModelVariant::Qwen35Dense | ModelVariant::Qwen35Moe
+        )
+    {
+        return Some("experimental multi-slot requires an HFQ text-only Qwen3.5 source");
+    }
+    None
+}
+
+#[cfg(test)]
+mod admission_boundary_tests {
+    use super::{validate_multi_slot_admission, DimKind, ModelVariant, SourceKind};
+    use hipfire_loader::{DeviceMesh, LoadAdmission};
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct SideEffects {
+        teardown: usize,
+        mesh_gpu_init: usize,
+        remap: usize,
+        carrier_entry: usize,
+        prior_owner: Option<&'static str>,
+    }
+
+    fn enter_multi_slot(
+        admission: &LoadAdmission,
+        effects: &mut SideEffects,
+    ) -> bool {
+        if validate_multi_slot_admission(admission).is_some() {
+            return false;
+        }
+        effects.teardown += 1;
+        effects.mesh_gpu_init += admission.mesh.n_devices();
+        effects.remap += 1;
+        effects.carrier_entry += 1;
+        effects.prior_owner = None;
+        true
+    }
+
+    #[test]
+    fn multi_slot_refusal_keeps_prior_owner_and_side_effects_untouched() {
+        let admission = LoadAdmission {
+            source: SourceKind::Hfq,
+            variant: ModelVariant::Qwen35Dense,
+            mesh: DeviceMesh::rect(&[(DimKind::Pp, 2)]),
+        };
+        let before = SideEffects {
+            teardown: 0,
+            mesh_gpu_init: 0,
+            remap: 0,
+            carrier_entry: 0,
+            prior_owner: Some("prior-model"),
+        };
+        let mut after = before.clone();
+
+        assert!(!enter_multi_slot(&admission, &mut after));
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn multi_slot_vl_refusal_keeps_prior_owner_and_side_effects_untouched() {
+        let admission = LoadAdmission {
+            source: SourceKind::Hfq,
+            variant: ModelVariant::Qwen35MoeVl,
+            mesh: DeviceMesh::single(),
+        };
+        let before = SideEffects {
+            teardown: 0,
+            mesh_gpu_init: 0,
+            remap: 0,
+            carrier_entry: 0,
+            prior_owner: Some("prior-model"),
+        };
+        let mut after = before.clone();
+
+        assert!(!enter_multi_slot(&admission, &mut after));
+        assert_eq!(after, before);
+    }
 }
 
 /// Print a friendly, user-actionable message when Gpu::init fails. Matches
@@ -890,6 +977,39 @@ fn main() {
                     .and_then(|p| p.get("experimental_multi_slot"))
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
+                // Every load mode shares this one source-aware admission. A
+                // refusal is presented here, before any slot/model teardown,
+                // mesh/GPU initialization, remap, or carrier entry.
+                let admission = match admit_load(path, RawParallelism::new(pp, tp, 1)) {
+                    Ok(admission) => admission,
+                    Err(error) => {
+                        let message = error.to_string();
+                        emit_uncorrelated_error(
+                            &mut stdout,
+                            None,
+                            &message,
+                            "unsupported",
+                            false,
+                            false,
+                        );
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                };
+                if experimental_multi_slot {
+                    if let Some(err) = validate_multi_slot_admission(&admission) {
+                        emit_uncorrelated_error(
+                            &mut stdout,
+                            None,
+                            err,
+                            "unsupported",
+                            false,
+                            false,
+                        );
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                }
                 if experimental_multi_slot {
                     // Experimental slot backend is an alternate model owner, not a batch-mode switch.
                     // Validate mutually exclusive knobs before any GPU work.
@@ -1050,25 +1170,7 @@ fn main() {
                     }
                     continue;
                 }
-                // Ordinary load: refuse while slot requests active, otherwise checked shutdown
-                let admission = match admit_load(
-                    path,
-                    RawParallelism::new(pp, tp, 1),
-                ) {
-                    Ok(admission) => admission,
-                    Err(error) => {
-                        emit_uncorrelated_error(
-                            &mut stdout,
-                            None,
-                            &error,
-                            "unsupported",
-                            false,
-                            false,
-                        );
-                        let _ = stdout.flush();
-                        continue;
-                    }
-                };
+                // Ordinary load: refuse while slot requests active, otherwise checked shutdown.
                 let load_tp = match admission.variant {
                     ModelVariant::Qwen35Dense => admission.mesh.size_of(DimKind::Tp),
                     ModelVariant::Qwen35Moe
