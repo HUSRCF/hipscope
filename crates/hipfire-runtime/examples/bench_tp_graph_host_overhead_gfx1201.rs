@@ -16,7 +16,8 @@ fn main() {
     const WARMUPS: usize = 32;
     const REPEATS: usize = 512;
 
-    let gpus = Gpus::init_tp(RANKS, 43).expect("init exact gfx1201 TP4");
+    let device_opts = hipfire_runtime::config::get().device_resolve_opts();
+    let gpus = Gpus::init_tp(&device_opts, RANKS, 43).expect("init exact gfx1201 TP4");
     assert!(
         gpus.devices
             .iter()

@@ -61,6 +61,25 @@ pub enum CollectiveHint {
     BandXfer { src: usize, dst: usize },
 }
 
+/// A rectangular topology cannot represent a cardinality larger than the
+/// platform's `usize` range.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum MeshError {
+    CardinalityOverflow,
+}
+
+impl std::fmt::Display for MeshError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CardinalityOverflow => {
+                f.write_str("rectangular device mesh cardinality overflow")
+            }
+        }
+    }
+}
+
+impl std::error::Error for MeshError {}
+
 /// A rectangular named-axis mesh.
 ///
 /// The empty axis list is the single-device topology. Size-one axes remain in
@@ -71,6 +90,7 @@ pub enum CollectiveHint {
 #[derive(Clone, Debug)]
 pub struct DeviceMesh {
     axes: Vec<Axis>,
+    n_devices: usize,
     epoch: MeshEpoch,
 }
 
@@ -90,21 +110,29 @@ impl DeviceMesh {
     /// Axis sizes are normalized to at least one so every mesh has a valid
     /// coordinate space and at least one logical device. Named axes are kept
     /// in caller order; the final axis varies fastest in the flattened ID.
-    pub fn rect(axes: &[(DimKind, usize)]) -> Self {
-        Self {
-            axes: axes
-                .iter()
-                .map(|&(kind, size)| Axis {
-                    kind,
-                    size: size.max(1),
-                })
-                .collect(),
-            epoch: fresh_epoch(),
+    ///
+    /// The cardinality is checked while constructing the mesh. Callers must
+    /// handle [`MeshError::CardinalityOverflow`] instead of observing a
+    /// wrapped device count.
+    pub fn rect(axes: &[(DimKind, usize)]) -> Result<Self, MeshError> {
+        let mut normalized = Vec::with_capacity(axes.len());
+        let mut n_devices = 1usize;
+        for &(kind, size) in axes {
+            let size = size.max(1);
+            n_devices = n_devices
+                .checked_mul(size)
+                .ok_or(MeshError::CardinalityOverflow)?;
+            normalized.push(Axis { kind, size });
         }
+        Ok(Self {
+            axes: normalized,
+            n_devices,
+            epoch: fresh_epoch(),
+        })
     }
 
     /// The single-device topology: one logical device and no named axes.
-    pub fn single() -> Self {
+    pub fn single() -> Result<Self, MeshError> {
         Self::rect(&[])
     }
 
@@ -120,11 +148,7 @@ impl DeviceMesh {
 
     /// Total number of logical devices (one for an empty mesh).
     pub fn n_devices(&self) -> usize {
-        self.axes
-            .iter()
-            .map(|axis| axis.size)
-            .product::<usize>()
-            .max(1)
+        self.n_devices
     }
 
     /// Size of the first axis with `kind`, or one when it is absent.
@@ -243,6 +267,7 @@ impl DeviceMesh {
                 .copied()
                 .filter(|axis| axis.size > 1)
                 .collect(),
+            n_devices: self.n_devices,
             epoch: self.epoch,
         }
     }
@@ -259,7 +284,7 @@ impl DeviceMesh {
 
 impl Default for DeviceMesh {
     fn default() -> Self {
-        Self::single()
+        Self::single().expect("single-device mesh cannot overflow")
     }
 }
 
@@ -287,7 +312,7 @@ mod tests {
 
     #[test]
     fn single_is_one_device_and_identity_collectives_are_noops() {
-        let mesh = DeviceMesh::single();
+        let mesh = DeviceMesh::single().unwrap();
         assert_eq!(mesh.n_devices(), 1);
         assert_eq!(mesh.axes(), &[]);
         assert_eq!(mesh.coord_of(0), Vec::<usize>::new());
@@ -301,8 +326,8 @@ mod tests {
 
     #[test]
     fn single_and_empty_rect_have_same_shape_but_fresh_identity() {
-        let single = DeviceMesh::single();
-        let empty_rect = DeviceMesh::rect(&[]);
+        let single = DeviceMesh::single().unwrap();
+        let empty_rect = DeviceMesh::rect(&[]).unwrap();
         assert_ne!(single, empty_rect);
         assert_eq!(single.axes(), empty_rect.axes());
         assert_eq!(single.n_devices(), empty_rect.n_devices());
@@ -313,11 +338,21 @@ mod tests {
 
     #[test]
     fn pp_bands_and_boundary_hints_are_uniform() {
-        let mesh = DeviceMesh::rect(&[(DimKind::Pp, 3)]);
-        assert_eq!((0..6).map(|l| mesh.stage_for_layer(l, 6)).collect::<Vec<_>>(),
-                   vec![0, 0, 1, 1, 2, 2]);
-        assert_eq!(mesh.band_xfer_after(1, 6), Some(CollectiveHint::BandXfer { src: 0, dst: 1 }));
-        assert_eq!(mesh.band_xfer_after(3, 6), Some(CollectiveHint::BandXfer { src: 1, dst: 2 }));
+        let mesh = DeviceMesh::rect(&[(DimKind::Pp, 3)]).unwrap();
+        assert_eq!(
+            (0..6)
+                .map(|l| mesh.stage_for_layer(l, 6))
+                .collect::<Vec<_>>(),
+            vec![0, 0, 1, 1, 2, 2]
+        );
+        assert_eq!(
+            mesh.band_xfer_after(1, 6),
+            Some(CollectiveHint::BandXfer { src: 0, dst: 1 })
+        );
+        assert_eq!(
+            mesh.band_xfer_after(3, 6),
+            Some(CollectiveHint::BandXfer { src: 1, dst: 2 })
+        );
         assert_eq!(mesh.band_xfer_after(5, 6), None);
         assert_eq!(mesh.stage_devices(&[1]), vec![1]);
     }
@@ -328,20 +363,35 @@ mod tests {
             (DimKind::Pp, 2),
             (DimKind::Tp, 2),
             (DimKind::Ep, 2),
-        ]);
+        ])
+        .unwrap();
         assert_eq!(mesh.n_devices(), 8);
         assert_eq!(mesh.coord_of(0), vec![0, 0, 0]);
         assert_eq!(mesh.coord_of(7), vec![1, 1, 1]);
-        assert_eq!(mesh.device_of(&[1, 0, 1]), 6);
-        assert_eq!(mesh.group_along(DimKind::Tp, &[1, 0, 1]), vec![6, 7]);
-        assert_eq!(mesh.group_along(DimKind::Ep, &[1, 0, 1]), vec![4, 6]);
+
+        // The final (Ep) axis varies fastest in the row-major flattening.
+        let coord = [1, 0, 1];
+        assert_eq!(mesh.device_of(&coord), 5);
+        assert_eq!(mesh.coord_of(5), coord);
+        assert_eq!(mesh.group_along(DimKind::Tp, &coord), vec![5, 7]);
+        assert_eq!(mesh.group_along(DimKind::Ep, &coord), vec![4, 5]);
         assert_eq!(mesh.stage_devices(&[1, 0, 0]), vec![4, 5, 6, 7]);
+
+        for pp in 0..2 {
+            for tp in 0..2 {
+                for ep in 0..2 {
+                    let coord = [pp, tp, ep];
+                    assert_eq!(mesh.coord_of(mesh.device_of(&coord)), coord);
+                }
+            }
+        }
 
         let degenerate = DeviceMesh::rect(&[
             (DimKind::Pp, 2),
             (DimKind::Tp, 1),
             (DimKind::Ep, 2),
-        ]);
+        ])
+        .unwrap();
         assert_eq!(
             degenerate.squeezed().axes(),
             &[
@@ -360,9 +410,17 @@ mod tests {
 
     #[test]
     fn coordinate_round_trip_holds_for_every_device() {
-        let mesh = DeviceMesh::rect(&[(DimKind::Pp, 3), (DimKind::Tp, 2), (DimKind::Ep, 2)]);
+        let mesh =
+            DeviceMesh::rect(&[(DimKind::Pp, 3), (DimKind::Tp, 2), (DimKind::Ep, 2)]).unwrap();
         for device in 0..mesh.n_devices() {
             assert_eq!(mesh.device_of(&mesh.coord_of(device)), device);
         }
+    }
+
+    #[test]
+    fn rectangular_cardinality_overflow_is_rejected() {
+        let error = DeviceMesh::rect(&[(DimKind::Pp, usize::MAX), (DimKind::Tp, 2)])
+            .expect_err("rectangular cardinality must fail closed");
+        assert_eq!(error, MeshError::CardinalityOverflow);
     }
 }

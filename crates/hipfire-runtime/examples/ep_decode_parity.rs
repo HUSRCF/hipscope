@@ -141,7 +141,8 @@ fn main() {
     );
 
     // ── bring up N ranks ────────────────────────────────────────────────────
-    let mut gpus = Gpus::init_tp(tp, config.n_layers).expect("init_tp");
+    let device_opts = hipfire_runtime::config::get().device_resolve_opts();
+    let mut gpus = Gpus::init_tp(&device_opts, tp, config.n_layers).expect("init_tp");
     let n = gpus.devices.len();
     assert_eq!(
         n, tp,

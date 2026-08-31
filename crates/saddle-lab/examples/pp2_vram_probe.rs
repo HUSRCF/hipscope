@@ -60,7 +60,9 @@ fn main() {
         config.head_dim,
     );
 
-    let mut gpus = Gpus::init_uniform(2, config.n_layers).expect("init_uniform");
+    let device_opts = hipfire_runtime::config::get().device_resolve_opts();
+    let mut gpus =
+        Gpus::init_uniform(&device_opts, 2, config.n_layers).expect("init_uniform");
     let baseline_free: Vec<(usize, usize)> = (0..gpus.devices.len())
         .map(|i| gpus.devices[i].hip.get_vram_info().unwrap_or((0, 0)))
         .collect();

@@ -147,8 +147,9 @@ fn run_tp(path: &str, seed: &[u32], forced: &[u32]) -> (Vec<u32>, Vec<Vec<f32>>)
         .iter()
         .map(|l| qwen35::local_dense_tp_config(&global, l))
         .collect();
-    let mut gpus =
-        Gpus::init_tp(tp, global.n_layers).unwrap_or_else(|e| panic!("init tp{tp}: {e:?}"));
+    let device_opts = hipfire_runtime::config::get().device_resolve_opts();
+    let mut gpus = Gpus::init_tp(&device_opts, tp, global.n_layers)
+        .unwrap_or_else(|e| panic!("init tp{tp}: {e:?}"));
     for gpu in &mut gpus.devices {
         gpu.bind_thread().unwrap();
         gpu.active_stream = Some(gpu.hip.stream_create().unwrap());

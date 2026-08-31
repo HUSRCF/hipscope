@@ -182,7 +182,8 @@ fn main() -> Result<(), String> {
         "topology: target=TP3 devices 0,1,2 drafter=device 3 hidden={} layers={} verify_B={} position={}",
         cfg.hidden_size, cfg.num_hidden_layers, args.verify_batch, args.position
     );
-    let mut gpus = Gpus::init_tp(TARGET_RANKS, cfg.num_hidden_layers)
+    let device_opts = hipfire_runtime::config::get().device_resolve_opts();
+    let mut gpus = Gpus::init_tp(&device_opts, TARGET_RANKS, cfg.num_hidden_layers)
         .map_err(|e| format!("initialize TP3 target: {e:?}"))?;
     if gpus.devices.len() != TARGET_RANKS
         || gpus.devices.iter().any(|gpu| !gpu.arch_caps.is_gfx1201())

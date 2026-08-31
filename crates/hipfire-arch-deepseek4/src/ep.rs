@@ -125,6 +125,7 @@ fn forward_ep_tp_graph_body(
     position: u32,
 ) -> Result<(), String> {
     let n = gpus.devices.len();
+    let group: Vec<usize> = (0..n).collect();
     let program = ds4_lower_program();
     let skip_ffn = config_cache::skip_ffn();
     for layer_idx in 0..cfg.num_hidden_layers {
@@ -144,6 +145,7 @@ fn forward_ep_tp_graph_body(
             gpus,
             bindings.as_mut_slice(),
             partials,
+            &group,
             &program,
             cfg.hidden_size,
         )
@@ -381,6 +383,7 @@ fn forward_ep_direct(
         .unwrap_or(false);
     let t_layers = std::time::Instant::now();
     let program = ds4_lower_program();
+    let group: Vec<usize> = (0..n).collect();
     for l in 0..cfg.num_hidden_layers {
         {
             let mut binds: Vec<Deepseek4Bindings> = Vec::with_capacity(n);
@@ -399,6 +402,7 @@ fn forward_ep_direct(
                 gpus,
                 binds.as_mut_slice(),
                 partials,
+                &group,
                 &program,
                 hidden,
             )

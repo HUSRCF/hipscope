@@ -31,7 +31,9 @@ fn main() {
         config.n_layers, config.head_dim, config.n_kv_heads, config.vocab_size,
     );
 
-    let mut gpus = Gpus::init_uniform(2, config.n_layers).expect("init_uniform");
+    let device_opts = hipfire_runtime::config::get().device_resolve_opts();
+    let mut gpus =
+        Gpus::init_uniform(&device_opts, 2, config.n_layers).expect("init_uniform");
     let n_dev = gpus.devices.len();
     let out_dev = gpus.output_device;
     println!(

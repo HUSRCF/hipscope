@@ -550,7 +550,7 @@ pub fn mtp_forward_ep(
     assert_eq!(h_n_per_rank.len(), n, "mtp_forward_ep: h_n_per_rank len");
     let hidden = cfg.hidden_size;
     let mtp_layer_idx = cfg.num_hidden_layers;
-
+    let group: Vec<usize> = (0..n).collect();
     // 1. Per-rank pre-FFN (embed/norm/HC + attention), replicated. attn_stub
     //    reads state.n_tokens for the MTP-layer SWA ring slot → set it to
     //    `position` per rank (matches spec_decode's bookkeeping).
@@ -592,6 +592,7 @@ pub fn mtp_forward_ep(
             gpus,
             binds.as_mut_slice(),
             partials,
+            &group,
             &program,
             hidden,
         )

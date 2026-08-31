@@ -117,7 +117,9 @@ fn run_pp1(path: &str, prompt: &[u32]) -> Vec<u32> {
 fn run_pp2(path: &str, prompt: &[u32]) -> Vec<u32> {
     let mut hfq = HfqFile::open(Path::new(path)).expect("open hfq");
     let config = qwen35::config_from_hfq(&hfq).expect("config");
-    let mut gpus = Gpus::init_uniform(2, config.n_layers).expect("init_uniform");
+    let device_opts = hipfire_runtime::config::get().device_resolve_opts();
+    let mut gpus =
+        Gpus::init_uniform(&device_opts, 2, config.n_layers).expect("init_uniform");
     let layout = qwen35::Layout::from_gpus(&gpus, config.n_layers);
     let mut hfq_source = qwen35::HfqSource::new(&mut hfq, &config);
     let weights = qwen35::load_weights(&mut hfq_source, &mut gpus.devices, &layout)

@@ -8,7 +8,7 @@ use std::path::Path;
 #[test]
 fn hardware_leaf_exposes_owner_and_named_topology() {
     let _owner = std::any::TypeId::of::<Gpus>();
-    let mesh = DeviceMesh::rect(&[(DimKind::Pp, 2), (DimKind::Tp, 2)]);
+    let mesh = DeviceMesh::rect(&[(DimKind::Pp, 2), (DimKind::Tp, 2)]).unwrap();
     assert_eq!(mesh.n_devices(), 4);
     assert_eq!(mesh.group_along(DimKind::Tp, &[1, 0]), vec![2, 3]);
     assert_eq!(

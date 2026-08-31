@@ -2990,8 +2990,9 @@ fn load_model_ep_ds4(
     let chat_template = resolve_chat_template(&hfq, path);
     let rec = hfq.recommended_sampling();
 
-    let gpus =
-        Gpus::init_tp(tp, config.num_hidden_layers).map_err(|e| format!("init_tp: {e:?}"))?;
+    let device_opts = hipfire_runtime::config::get().device_resolve_opts();
+    let gpus = Gpus::init_tp(&device_opts, tp, config.num_hidden_layers)
+        .map_err(|e| format!("init_tp: {e:?}"))?;
     let n = gpus.devices.len();
     if n != tp {
         return Err(format!(
@@ -3218,8 +3219,9 @@ fn load_model_ep_minimax(path: &str, max_seq: usize, tp: usize) -> Result<Loaded
     let chat_template = resolve_chat_template(&hfq, path);
     let rec = hfq.recommended_sampling();
 
-    let gpus =
-        Gpus::init_tp(tp, config.num_hidden_layers).map_err(|e| format!("init_tp: {e:?}"))?;
+    let device_opts = hipfire_runtime::config::get().device_resolve_opts();
+    let gpus = Gpus::init_tp(&device_opts, tp, config.num_hidden_layers)
+        .map_err(|e| format!("init_tp: {e:?}"))?;
     let n = gpus.devices.len();
     if n != tp {
         return Err(format!(
@@ -3358,7 +3360,9 @@ fn load_model_ep_qwen35(
     let n_exp = config.num_experts;
     let chat_template = resolve_chat_template(&hfq_probe, path);
     let rec = hfq_probe.recommended_sampling();
-    let gpus = Gpus::init_tp(tp, config.n_layers).map_err(|e| format!("init_tp: {e:?}"))?;
+    let device_opts = hipfire_runtime::config::get().device_resolve_opts();
+    let gpus = Gpus::init_tp(&device_opts, tp, config.n_layers)
+        .map_err(|e| format!("init_tp: {e:?}"))?;
     let n = gpus.devices.len();
     if n != tp {
         return Err(format!(
@@ -3489,7 +3493,9 @@ fn load_model_tp_qwen35_dense(
     };
     drop(hfq);
 
-    let gpus = Gpus::init_tp(tp, config.n_layers).map_err(|e| format!("init_tp: {e:?}"))?;
+    let device_opts = hipfire_runtime::config::get().device_resolve_opts();
+    let gpus = Gpus::init_tp(&device_opts, tp, config.n_layers)
+        .map_err(|e| format!("init_tp: {e:?}"))?;
     if gpus.devices.len() != tp {
         return Err(format!(
             "init_tp gave {} devices, expected tp={tp}",

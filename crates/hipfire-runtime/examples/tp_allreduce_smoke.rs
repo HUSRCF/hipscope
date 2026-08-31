@@ -37,7 +37,9 @@ fn main() {
 
     // n_layers placeholder — init_uniform requires n_layers >= n_devices.
     // The TP path doesn't care about layer-to-device; we just need devices.
-    let mut gpus = Gpus::init_uniform(n_ranks, n_ranks).expect("init_uniform");
+    let device_opts = hipfire_runtime::config::get().device_resolve_opts();
+    let mut gpus =
+        Gpus::init_uniform(&device_opts, n_ranks, n_ranks).expect("init_uniform");
     let peer_ok = gpus.enable_peer_all().expect("enable_peer_all");
     if !peer_ok {
         eprintln!("WARN: peer access incomplete (host-staging fallback applies)");

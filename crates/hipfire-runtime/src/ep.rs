@@ -58,6 +58,7 @@ pub fn ensure_rank_streams(gpus: &mut Gpus) -> Result<(), DispatchError> {
 
 fn all_reduce_sum_f32_decode(
     gpus: &mut Gpus,
+    group: &[usize],
     refs: &[&DeviceBuffer],
     count: usize,
 ) -> Result<(), DispatchError> {
@@ -67,13 +68,11 @@ fn all_reduce_sum_f32_decode(
     let use_peer = *PEER_DECODE.get_or_init(|| {
         hipfire_config::developer_var("HIPFIRE_EP_PEER_ALLREDUCE_DECODE").as_deref() == Ok("1")
     });
-    let group: Vec<usize> = (0..refs.len()).collect();
     if use_peer {
-        gpus
-            .all_reduce_sum_f32_peer(&group, refs, count)
+        gpus.all_reduce_sum_f32_peer(group, refs, count)
             .map_err(hip_err)
     } else {
-        gpus.all_reduce_sum_f32(&group, refs, count).map_err(hip_err)
+        gpus.all_reduce_sum_f32(group, refs, count).map_err(hip_err)
     }
 }
 
@@ -106,6 +105,8 @@ fn tp_peer_hc3_admitted<B: ForwardBindings>(gpus: &Gpus, bindings: &[B]) -> bool
 ///   buffer of length `residual_dim` on `gpus.devices[r]`. The executor owns the
 ///   zero/all-reduce/add lifecycle; the binding only writes its owned-expert
 ///   contribution into it during `run_moe_ep`.
+/// - `group` is the retained ordered global-device group for this owner. It is
+///   borrowed for every collective and must be `[0, 1, ..., n-1]`.
 /// - `residual_dim` is the residual width (= hidden size) used for the partial
 ///   memset byte size and the all-reduce element count.
 ///
@@ -114,6 +115,7 @@ pub fn run_layer_program_ep<B: ForwardBindings>(
     gpus: &mut Gpus,
     bindings: &mut [B],
     partials: &[GpuTensor],
+    group: &[usize],
     program: &LayerProgram,
     residual_dim: usize,
 ) -> Result<(), DispatchError> {
@@ -127,6 +129,10 @@ pub fn run_layer_program_ep<B: ForwardBindings>(
         partials.len(),
         n,
         "run_layer_program_ep: partials.len() != n_ranks"
+    );
+    assert!(
+        group.len() == n && group.iter().copied().eq(0..n),
+        "run_layer_program_ep: group must be the ordered full device group"
     );
 
     for op in program {
@@ -216,7 +222,7 @@ pub fn run_layer_program_ep<B: ForwardBindings>(
                             })
                     })
                     .collect::<Result<_, _>>()?;
-                all_reduce_sum_f32_decode(gpus, &refs, residual_dim)?;
+                all_reduce_sum_f32_decode(gpus, group, &refs, residual_dim)?;
                 for r in 0..n {
                     gpus.devices[r].bind_thread().map_err(hip_err)?;
                     bindings[r].ep_finish_attend(&mut gpus.devices[r])?;
@@ -269,7 +275,7 @@ pub fn run_layer_program_ep<B: ForwardBindings>(
             } else {
                 // 3. All-reduce-sum the partials across ranks (in-place, RCCL).
                 let refs: Vec<&DeviceBuffer> = partials.iter().map(|p| &p.buf).collect();
-                all_reduce_sum_f32_decode(gpus, &refs, residual_dim)?;
+                all_reduce_sum_f32_decode(gpus, group, &refs, residual_dim)?;
 
                 // 4. Fold the reduced partial into each residual stream.
                 for r in 0..n {

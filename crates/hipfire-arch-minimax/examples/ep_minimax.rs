@@ -71,7 +71,8 @@ fn main() {
     drop(hfq0);
 
     // ── bring up N ranks ────────────────────────────────────────────────────
-    let mut gpus = Gpus::init_tp(tp, cfg.num_hidden_layers).expect("init_tp");
+    let device_opts = hipfire_runtime::config::get().device_resolve_opts();
+    let mut gpus = Gpus::init_tp(&device_opts, tp, cfg.num_hidden_layers).expect("init_tp");
     let n = gpus.devices.len();
     assert_eq!(n, tp, "init_tp gave {n} devices (check HIP_VISIBLE_DEVICES)");
     for (r, d) in gpus.devices.iter().enumerate() {

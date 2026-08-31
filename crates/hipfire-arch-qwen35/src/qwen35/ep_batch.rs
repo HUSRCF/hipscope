@@ -2170,6 +2170,7 @@ pub fn forward_ep(
     let n_v_heads = config.linear_num_value_heads;
     let hd = config.linear_key_head_dim;
     let pos_i32 = pos as i32;
+    let group: Vec<usize> = (0..n).collect();
 
     // 1. Embed token + write pos on each rank (replicated; deterministic, since
     //    weights are byte-identical replicas → s.x is bit-identical per rank).
@@ -2236,6 +2237,7 @@ pub fn forward_ep(
             gpus,
             binds.as_mut_slice(),
             partials,
+            &group,
             &program,
             dim,
         )
@@ -2354,6 +2356,7 @@ pub fn forward_prefill_batch_ep(
         return Ok(());
     }
     let dim = config.dim;
+    let group: Vec<usize> = (0..n_rank).collect();
     // Per-call contract: one window must fit max_batch. Long prompts are driven
     // by calling this repeatedly with advancing start_pos + persistent kv/dn
     // (KV + DeltaNet state accumulate in place across calls, identical to the
@@ -2458,7 +2461,6 @@ pub fn forward_prefill_batch_ep(
             let t_a = std::time::Instant::now();
             let refs: Vec<&hip_bridge::DeviceBuffer> =
                 partials.iter().map(|partial| &partial.buf).collect();
-            let group: Vec<usize> = (0..refs.len()).collect();
             if ep_peer_ar {
                 gpus
                     .all_reduce_sum_f32_peer(&group, &refs, n * dim)

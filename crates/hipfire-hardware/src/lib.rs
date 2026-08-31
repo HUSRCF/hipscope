@@ -21,53 +21,27 @@
 //! 3. Pass the multi-GPU coherence gate.
 
 use hip_bridge::{
-    DeviceBuffer, Event, HipError, HipResult, HipRuntime, RcclComms,
+    DeviceBuffer, Event, HipError, HipResult, RcclComms,
     HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED, HIP_ERROR_PEER_ACCESS_UNSUPPORTED,
     HIP_EVENT_DISABLE_TIMING, HIP_EVENT_RELEASE_TO_SYSTEM,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 mod mesh;
-pub use mesh::{Axis, CollectiveHint, DeviceMesh, DimKind, MeshEpoch};
+pub use mesh::{Axis, CollectiveHint, DeviceMesh, DimKind, MeshEpoch, MeshError};
 
-/// Device-resolution knobs used when constructing a [`Gpus`] owner.
+/// Device-resolution knobs supplied by the resolved process/runtime config
+/// when constructing a [`Gpus`] owner.
 ///
-/// The hardware leaf reads the same legacy `HIPFIRE_*` environment variables
-/// as the runtime did, without depending on runtime configuration. Higher
-/// layers may eventually supply an explicit option set; the constructors
-/// below intentionally keep the existing process-environment behavior.
-#[derive(Clone, Debug, Default)]
+/// `devices` contains the post-visibility logical HIP IDs produced by
+/// `hipfire-config`, not the original physical ROCr selectors. Hardware
+/// consumes this value as-is and never rereads process environment.
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct DeviceResolveOpts {
     pub tp_use_rccl: Option<bool>,
     pub devices: Option<String>,
-    pub emulate_gpus: Option<usize>,
     pub allow_mixed_arch: bool,
     pub uniform_vram_tolerance_gb: Option<f32>,
-}
-
-impl DeviceResolveOpts {
-    pub fn from_env() -> Self {
-        Self {
-            tp_use_rccl: std::env::var("HIPFIRE_TP_USE_RCCL")
-                .ok()
-                .as_deref()
-                .map(|value| value != "0" && !value.eq_ignore_ascii_case("false")),
-            devices: std::env::var("HIPFIRE_DEVICES")
-                .ok()
-                .filter(|value| !value.is_empty()),
-            emulate_gpus: std::env::var("HIPFIRE_EMULATE_GPUS")
-                .ok()
-                .and_then(|value| value.parse::<usize>().ok())
-                .filter(|&count| count >= 2),
-            allow_mixed_arch: std::env::var("HIPFIRE_ALLOW_MIXED_ARCH")
-                .ok()
-                .as_deref()
-                == Some("1"),
-            uniform_vram_tolerance_gb: std::env::var("HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB")
-                .ok()
-                .and_then(|value| value.parse().ok()),
-        }
-    }
 }
 
 /// Stream-event handoff returned by `Gpus::boundary_copy`. When the src
@@ -147,20 +121,16 @@ pub fn peer_reduce_scratch_total_bytes(rank_count: usize, requested_bytes: usize
 }
 
 /// Internal active lease record stored inside `Gpus` while a lease is live.
-#[derive(Debug)]
-struct ActivePeerLease {
-    id: u64,
-    bytes: usize,
-    rank_count: usize,
-}
-
 pub struct Gpus {
     /// RCCL communicators (one per rank), lazily initialized on the first
     /// `all_reduce_sum_*` call. Declared BEFORE `devices` so `Drop` tears
     /// down comms (via `ncclCommDestroy`) before the underlying HIP
-    /// devices, which RCCL relies on. `None` means RCCL hasn't been used
-    /// or `HIPFIRE_TP_USE_RCCL=0` forced the opt-out.
+    /// devices, which RCCL relies on. `None` means RCCL hasn't been used.
     rccl_comms: Option<RcclComms>,
+    /// Resolved at construction from the process/runtime config. Keeping this
+    /// decision on the owner prevents a later environment mutation from
+    /// changing the collective route.
+    use_rccl: bool,
     pub devices: Vec<Gpu>,
     /// Per-layer device id, length = n_layers.
     pub layer_to_device: Vec<u8>,
@@ -214,7 +184,11 @@ impl Gpus {
     /// uniformly: max-min ≤ 1 layer per band. Pre-flight VRAM check enforces
     /// arch match and bounded VRAM delta (override
     /// `HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB`, default 2 GiB).
-    pub fn init_uniform(n_devices: usize, n_layers: usize) -> HipResult<Self> {
+    pub fn init_uniform(
+        opts: &DeviceResolveOpts,
+        n_devices: usize,
+        n_layers: usize,
+    ) -> HipResult<Self> {
         if n_devices == 0 {
             return Err(HipError::new(0, "init_uniform: n_devices must be >= 1"));
         }
@@ -227,18 +201,15 @@ impl Gpus {
                 ),
             ));
         }
-        let device_ids = resolve_device_ids(n_devices)?;
+        let device_ids = resolve_device_ids(n_devices, opts)?;
         let devices = construct_devices(&device_ids)?;
-        preflight_vram_with_opts(&devices, /*check_vram_delta=*/ true)?;
+        preflight_vram_with_opts(&devices, /*check_vram_delta=*/ true, opts)?;
         let per_device = uniform_split_counts(n_devices, n_layers);
-        Self::from_parts(devices, per_device, n_layers)
+        Self::from_parts(devices, per_device, n_layers, opts)
     }
-
-    /// Explicit escape hatch for asymmetric VRAM / hand-tuned splits.
-    /// Keeps arch-mismatch and per-device bind/free pre-flight checks, but
     /// skips the uniform VRAM-delta gate. `per_device` length determines
     /// `n_devices`; sum determines `n_layers`.
-    pub fn init_layers(per_device: &[usize]) -> HipResult<Self> {
+    pub fn init_layers(opts: &DeviceResolveOpts, per_device: &[usize]) -> HipResult<Self> {
         let n_devices = per_device.len();
         if n_devices == 0 {
             return Err(HipError::new(
@@ -253,20 +224,22 @@ impl Gpus {
             ));
         }
         let n_layers: usize = per_device.iter().sum();
-        let device_ids = resolve_device_ids(n_devices)?;
+        let device_ids = resolve_device_ids(n_devices, opts)?;
         let devices = construct_devices(&device_ids)?;
         // init_layers is the documented escape hatch for asymmetric VRAM
         // splits — the caller has declared the per-device counts, so skip
         // the VRAM-delta check (which would otherwise reject 32 GB MI50 +
         // 12 GB 6700 XT pairs out of the box). Arch-mismatch + per-device
         // bind+free probe still run.
-        preflight_vram_with_opts(&devices, /*check_vram_delta=*/ false)?;
-        Self::from_parts(devices, per_device.to_vec(), n_layers)
+        preflight_vram_with_opts(&devices, /*check_vram_delta=*/ false, opts)?;
+        Self::from_parts(devices, per_device.to_vec(), n_layers, opts)
     }
 
-    /// Reserved for v1.1 — automatic VRAM-weighted band assignment. For v1
-    /// use `init_layers(...)` with hand-computed counts.
-    pub fn init_vram_weighted(_n_devices: usize, _n_layers: usize) -> HipResult<Self> {
+    pub fn init_vram_weighted(
+        _opts: &DeviceResolveOpts,
+        _n_devices: usize,
+        _n_layers: usize,
+    ) -> HipResult<Self> {
         Err(HipError::new(
             0,
             "init_vram_weighted: scheduled for v1.1; use init_layers(per_device) instead",
@@ -275,9 +248,10 @@ impl Gpus {
 
     /// PP=1 back-compat path: wrap an existing single `Gpu` into a `Gpus`
     /// with all layers on dev 0. `output_device = 0`.
-    pub fn single(gpu: Gpu, n_layers: usize) -> Self {
+    pub fn single(opts: &DeviceResolveOpts, gpu: Gpu, n_layers: usize) -> Self {
         Self {
             rccl_comms: None,
+            use_rccl: opts.tp_use_rccl.unwrap_or(true),
             devices: vec![gpu],
             layer_to_device: vec![0; n_layers],
             band_starts: vec![0],
@@ -316,16 +290,20 @@ impl Gpus {
     /// only validates the device count. Pre-flight runs the arch-match +
     /// VRAM-delta gate (TP ranks are identical cards, so the uniform delta
     /// check applies).
-    pub fn init_tp(tp_size: usize, n_layers: usize) -> HipResult<Self> {
+    pub fn init_tp(
+        opts: &DeviceResolveOpts,
+        tp_size: usize,
+        n_layers: usize,
+    ) -> HipResult<Self> {
         if tp_size == 0 {
             return Err(HipError::new(0, "init_tp: tp_size must be >= 1"));
         }
         if n_layers == 0 {
             return Err(HipError::new(0, "init_tp: n_layers must be >= 1"));
         }
-        let device_ids = resolve_device_ids(tp_size)?;
+        let device_ids = resolve_device_ids(tp_size, opts)?;
         let devices = construct_devices(&device_ids)?;
-        preflight_vram_with_opts(&devices, /*check_vram_delta=*/ true)?;
+        preflight_vram_with_opts(&devices, /*check_vram_delta=*/ true, opts)?;
         let band_starts = tp_band_starts(tp_size, n_layers);
 
         // PP=1 TP topology: every device runs every layer. Encode the layer
@@ -333,6 +311,7 @@ impl Gpus {
         // owning empty bands.
         Ok(Self {
             rccl_comms: None,
+            use_rccl: opts.tp_use_rccl.unwrap_or(true),
             devices,
             layer_to_device: vec![0u8; n_layers],
             band_starts,
@@ -863,7 +842,12 @@ impl Gpus {
         Ok(())
     }
 
-    fn from_parts(devices: Vec<Gpu>, per_device: Vec<usize>, n_layers: usize) -> HipResult<Self> {
+    fn from_parts(
+        devices: Vec<Gpu>,
+        per_device: Vec<usize>,
+        n_layers: usize,
+        opts: &DeviceResolveOpts,
+    ) -> HipResult<Self> {
         debug_assert_eq!(per_device.iter().sum::<usize>(), n_layers);
         debug_assert_eq!(per_device.len(), devices.len());
         let n_devices = devices.len();
@@ -879,6 +863,7 @@ impl Gpus {
         }
         Ok(Self {
             rccl_comms: None,
+            use_rccl: opts.tp_use_rccl.unwrap_or(true),
             devices,
             layer_to_device,
             band_starts,
@@ -900,22 +885,16 @@ impl Gpus {
         })
     }
 
-    // ──────────────────────────────────────────────────────────────────
-    // Tensor-parallel collectives (RCCL-backed). See
-    // docs/plans/multi-gpu-tp-a3b.md §3.3 and the comm baseline at
-    // docs/investigations/2026-05-28-tp-comm-baseline-hiptrx.md.
-    // ──────────────────────────────────────────────────────────────────
-
     /// Lazily initialize RCCL communicators across all devices owned by
     /// this `Gpus`. Cached for process lifetime; subsequent calls are
-    /// no-ops. `HIPFIRE_TP_USE_RCCL=0` short-circuits with a clear
+    /// no-ops. A resolved `tp_use_rccl=false` short-circuits with a clear
     /// error so callers can fall through to a host-driven path (not
     /// yet implemented — Stage 2 follow-up).
     pub fn ensure_rccl(&mut self) -> HipResult<()> {
         if self.rccl_comms.is_some() {
             return Ok(());
         }
-        if matches!(DeviceResolveOpts::from_env().tp_use_rccl, Some(false)) {
+        if !self.use_rccl {
             return Err(HipError::new(
                 0,
                 "ensure_rccl: HIPFIRE_TP_USE_RCCL=0 — RCCL path opted out. \
@@ -1902,53 +1881,36 @@ fn uniform_split_counts(n_devices: usize, n_layers: usize) -> Vec<usize> {
         .collect()
 }
 
-/// Resolve logical device IDs after the physical `hardware.devices` list has
-/// been installed as `ROCR_VISIBLE_DEVICES` and HIP has received the matching
-/// post-filter logical IDs. When unset, take the first `n_devices` visible IDs.
-/// Map each requested logical device id into the physical range
-/// `[0, real_count)` by euclidean remainder. Used by
-/// `HIPFIRE_EMULATE_GPUS` to alias N logical devices onto fewer physical
-/// devices. A non-positive `real_count` is left untouched so the caller can
-/// surface the underlying HIP error.
-fn alias_ids(ids: &[i32], real_count: i32) -> Vec<i32> {
-    if real_count <= 0 {
-        return ids.to_vec();
-    }
-    ids.iter().map(|&id| id.rem_euclid(real_count)).collect()
-}
-
-/// Resolve logical IDs from `HIPFIRE_DEVICES`, or use the first N visible IDs.
-/// `HIPFIRE_EMULATE_GPUS` optionally aliases those IDs into the physical
-/// runtime device range for debug-only multi-rank emulation.
-fn resolve_device_ids(n_devices: usize) -> HipResult<Vec<i32>> {
-    let opts = DeviceResolveOpts::from_env();
-    let ids: Vec<i32> = if let Some(value) = &opts.devices {
+/// Resolve logical device IDs from the already-resolved `hardware.devices`
+/// value, or use the first `n_devices` visible IDs. The supplied list is
+/// post-visibility logical HIP IDs and is consumed without physical-ID
+/// remapping.
+fn resolve_device_ids(n_devices: usize, opts: &DeviceResolveOpts) -> HipResult<Vec<i32>> {
+    if let Some(value) = &opts.devices {
         let parsed = value
             .split(',')
             .map(str::trim)
             .filter(|part| !part.is_empty())
             .map(str::parse::<i32>)
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| HipError::new(0, &format!("HIPFIRE_DEVICES parse: {error}")))?;
+            .map_err(|error| HipError::new(0, &format!("hardware.devices parse: {error}")))?;
         if parsed.len() < n_devices {
             return Err(HipError::new(
                 0,
                 &format!(
-                    "HIPFIRE_DEVICES has {} ids but n_devices = {n_devices}",
+                    "hardware.devices exposes {} ids but n_devices = {n_devices}",
                     parsed.len()
                 ),
             ));
         }
-        parsed[..n_devices].to_vec()
-    } else {
-        (0..n_devices as i32).collect()
-    };
-
-    if opts.emulate_gpus.is_some() {
-        let real_count = HipRuntime::load()?.device_count()?;
-        return Ok(alias_ids(&ids, real_count));
+        return Ok(parsed[..n_devices].to_vec());
     }
-    Ok(ids)
+    (0..n_devices)
+        .map(|id| {
+            i32::try_from(id)
+                .map_err(|_| HipError::new(0, "hardware.devices logical ID exceeds HIP range"))
+        })
+        .collect()
 }
 
 fn construct_devices(ids: &[i32]) -> HipResult<Vec<Gpu>> {
@@ -1959,12 +1921,15 @@ fn construct_devices(ids: &[i32]) -> HipResult<Vec<Gpu>> {
     Ok(devices)
 }
 
-fn preflight_vram_with_opts(devices: &[Gpu], check_vram_delta: bool) -> HipResult<()> {
+fn preflight_vram_with_opts(
+    devices: &[Gpu],
+    check_vram_delta: bool,
+    opts: &DeviceResolveOpts,
+) -> HipResult<()> {
     if devices.is_empty() {
         return Ok(());
     }
     let arch0 = devices[0].arch.clone();
-    let opts = DeviceResolveOpts::from_env();
     let mut frees = Vec::with_capacity(devices.len());
     for device in devices {
         if device.arch != arch0 {
@@ -2165,4 +2130,13 @@ mod tests {
         Gpus::host_reduce_rows(&mut rows3, 0);
         assert_eq!(rows3[0], vec![5.0, 6.0]);
     }
+    #[test]
+    fn resolver_consumes_post_visibility_logical_ids_without_aliasing() {
+        let opts = DeviceResolveOpts {
+            devices: Some("0,1".into()),
+            ..DeviceResolveOpts::default()
+        };
+        assert_eq!(resolve_device_ids(2, &opts).unwrap(), vec![0, 1]);
+    }
 }
+
