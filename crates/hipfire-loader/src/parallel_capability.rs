@@ -23,7 +23,7 @@
 //! 4. evaluate one source-aware policy cell, normalizing dense EP to Single;
 //! 5. apply the few current-route degree bounds (Qwen dense TP and MoE EP).
 
-use hipfire_hardware::{DeviceMesh, DimKind};
+use hipfire_hardware::{DeviceMesh, DimKind, MeshError};
 
 /// Source namespace used by a model load.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -175,6 +175,15 @@ pub enum AdmissionError {
         axis: ParallelAxis,
         degree: usize,
     },
+    /// The effective parallel shape could not be represented by the device
+    /// mesh without losing cardinality information.
+    Topology {
+        source: SourceKind,
+        variant: ModelVariant,
+        requested: RawParallelism,
+        effective: RawParallelism,
+        error: MeshError,
+    },
     /// A forbidden multi-axis composition. Composition is checked against the
     /// raw request before compatibility remapping or normalization.
     Composition {
@@ -200,6 +209,7 @@ impl AdmissionError {
     pub const fn code(&self) -> &'static str {
         match self {
             Self::InvalidDegree { .. } => "CAP-001",
+            Self::Topology { .. } => "TOPO-001",
             Self::Composition { owner, .. } | Self::Unsupported { owner, .. } => owner,
         }
     }
@@ -207,27 +217,36 @@ impl AdmissionError {
     pub const fn source(&self) -> Option<SourceKind> {
         match self {
             Self::InvalidDegree { .. } => None,
-            Self::Composition { source, .. } | Self::Unsupported { source, .. } => Some(*source),
+            Self::Topology { source, .. }
+            | Self::Composition { source, .. }
+            | Self::Unsupported { source, .. } => Some(*source),
         }
     }
 
     pub const fn variant(&self) -> Option<ModelVariant> {
         match self {
             Self::InvalidDegree { .. } => None,
-            Self::Composition { variant, .. } | Self::Unsupported { variant, .. } => Some(*variant),
+            Self::Topology { variant, .. }
+            | Self::Composition { variant, .. }
+            | Self::Unsupported { variant, .. } => Some(*variant),
         }
     }
 
     pub const fn effective(&self) -> Option<RawParallelism> {
         match self {
             Self::InvalidDegree { .. } | Self::Composition { .. } => None,
-            Self::Unsupported { effective, .. } => Some(*effective),
+            Self::Topology { effective, .. } | Self::Unsupported { effective, .. } => {
+                Some(*effective)
+            }
         }
     }
 
     pub const fn reason(&self) -> &'static str {
         match self {
             Self::InvalidDegree { .. } => "every parallelism degree must be >= 1",
+            Self::Topology { error, .. } => match error {
+                MeshError::CardinalityOverflow => "device mesh cardinality overflow",
+            },
             Self::Composition { reason, .. } | Self::Unsupported { reason, .. } => reason,
         }
     }
@@ -239,6 +258,24 @@ impl std::fmt::Display for AdmissionError {
             Self::InvalidDegree { axis, degree } => {
                 write!(f, "[CAP-001] invalid {} degree {}", axis.name(), degree)
             }
+            Self::Topology {
+                source,
+                variant,
+                requested,
+                effective,
+                error,
+            } => write!(
+                f,
+                "[TOPO-001] {} {:?} topology refused (requested pp={},tp={},ep={}; effective pp={},tp={},ep={}): {error}",
+                source.name(),
+                variant,
+                requested.pp,
+                requested.tp,
+                requested.ep,
+                effective.pp,
+                effective.tp,
+                effective.ep,
+            ),
             Self::Composition {
                 source,
                 variant,
@@ -384,7 +421,13 @@ pub fn resolve(
         });
     }
 
-    Ok(mesh_for(effective))
+    mesh_for(effective).map_err(|error| AdmissionError::Topology {
+        source,
+        variant,
+        requested: raw,
+        effective,
+        error,
+    })
 }
 
 fn current_degree_error(
@@ -406,7 +449,7 @@ fn current_degree_error(
 
 /// Build the effective rectangular G1 topology. Size-one axes are omitted;
 /// [`DeviceMesh::single`] is the canonical one-device representation.
-fn mesh_for(request: RawParallelism) -> DeviceMesh {
+fn mesh_for(request: RawParallelism) -> Result<DeviceMesh, MeshError> {
     if request.axis() == ParallelAxis::Single {
         return DeviceMesh::single();
     }
@@ -723,5 +766,36 @@ mod tests {
         assert_eq!(err.source(), Some(SourceKind::SafetensorsDir));
         assert_eq!(err.variant(), Some(ModelVariant::Deepseek4));
         assert!(err.reason().contains("safetensors EP"));
+    }
+    #[test]
+    fn mesh_for_single_propagates_constructor_result() {
+        let mesh = mesh_for(req(1, 1, 1)).expect("single-device mesh construction must succeed");
+        assert_eq!(mesh.n_devices(), 1);
+        assert_eq!(mesh.axes(), &[]);
+    }
+
+    #[test]
+    fn mesh_for_rectangular_overflow_refuses_without_wrapping() {
+        let error = mesh_for(req(usize::MAX, 2, 1))
+            .expect_err("rectangular cardinality overflow must fail closed");
+        assert_eq!(error, hipfire_hardware::MeshError::CardinalityOverflow);
+    }
+    #[test]
+    fn resolver_refuses_composed_overflow_before_mesh_construction() {
+        let err = resolve(
+            SourceKind::Hfq,
+            ModelVariant::Qwen35Dense,
+            req(usize::MAX, 2, 1),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            &err,
+            AdmissionError::Composition {
+                owner: "CAP-001",
+                requested,
+                ..
+            } if requested.pp == usize::MAX && requested.tp == 2
+        ));
+        assert_ne!(err.code(), "TOPO-001");
     }
 }
