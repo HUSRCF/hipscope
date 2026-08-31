@@ -980,8 +980,16 @@ impl crate::Gpu {
         }) else {
             return Ok(false);
         };
+        let asym4 = matches!(
+            k_format,
+            FlashAttnCkKvFormat::Asym4Givens | FlashAttnCkKvFormat::Asym4Fwht
+        );
         if q.dtype != crate::DType::F32 || output.dtype != crate::DType::F32 {
-            self.report_flash_attn_ck_route("asym3_dtype_miss");
+            self.report_flash_attn_ck_route(if asym4 {
+                "asym4_dtype_miss"
+            } else {
+                "asym3_dtype_miss"
+            });
             return Ok(false);
         }
         if self.replay.is_recording() {
@@ -1067,7 +1075,11 @@ impl crate::Gpu {
             || cos_theta.numel() < transform_elements
             || sin_theta.numel() < transform_elements
         {
-            self.report_flash_attn_ck_route("asym3_buffer_contract_miss");
+            self.report_flash_attn_ck_route(if asym4 {
+                "asym4_buffer_contract_miss"
+            } else {
+                "asym3_buffer_contract_miss"
+            });
             return Ok(false);
         }
 
@@ -1128,20 +1140,24 @@ impl crate::Gpu {
         params.workspace = workspace.as_ptr();
         params.workspace_bytes = workspace.size();
         if let Err(error) = self.flash_attn_ck.as_ref().unwrap().is_supported(&params) {
-            if self
-                .flash_attn_ck_reported_routes
-                .insert("asym3_support_error")
-            {
-                eprintln!("optional CK attention fallback (asym3_support_error): {error}");
+            let reason = if asym4 {
+                "asym4_support_error"
+            } else {
+                "asym3_support_error"
+            };
+            if self.flash_attn_ck_reported_routes.insert(reason) {
+                eprintln!("optional CK attention fallback ({reason}): {error}");
             }
             return Ok(false);
         }
         if let Err(error) = unsafe { self.flash_attn_ck.as_ref().unwrap().forward(&params) } {
-            if self
-                .flash_attn_ck_reported_routes
-                .insert("asym3_launch_error")
-            {
-                eprintln!("optional CK attention fallback (asym3_launch_error): {error}");
+            let reason = if asym4 {
+                "asym4_launch_error"
+            } else {
+                "asym3_launch_error"
+            };
+            if self.flash_attn_ck_reported_routes.insert(reason) {
+                eprintln!("optional CK attention fallback ({reason}): {error}");
             }
             return Ok(false);
         }
@@ -1150,7 +1166,7 @@ impl crate::Gpu {
             FlashAttnCkKvFormat::Asym3Fwht => "selected_asym3_fwht_d256",
             FlashAttnCkKvFormat::Asym4Givens => "selected_asym4_givens_d256",
             FlashAttnCkKvFormat::Asym4Fwht => "selected_asym4_fwht_d256",
-            _ => unreachable!("selector admitted an unsupported Asym3 format"),
+            _ => unreachable!("selector admitted an unsupported transformed format"),
         });
         Ok(true)
     }

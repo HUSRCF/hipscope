@@ -470,6 +470,7 @@ int validate(const hipfire_flash_attn_ck_fwd_params* p, char* error, size_t erro
         if(p->batch != 1 || p->causal != 1 ||
            p->packed_k_head_stride_bytes != k_head_bytes ||
            p->packed_v_head_stride_bytes != v_head_bytes ||
+           p->packed_k_row_stride_bytes % alignof(float) != 0 ||
            p->packed_k_row_stride_bytes < static_cast<int64_t>(p->nhead_k) * k_head_bytes ||
            p->packed_v_row_stride_bytes < static_cast<int64_t>(p->nhead_k) * v_head_bytes)
         {
@@ -503,6 +504,7 @@ int validate(const hipfire_flash_attn_ck_fwd_params* p, char* error, size_t erro
         if(p->batch != 1 || p->causal != 1 ||
            p->packed_k_head_stride_bytes != k_head_bytes ||
            p->packed_v_head_stride_bytes != v_head_bytes ||
+           p->packed_k_row_stride_bytes % alignof(float) != 0 ||
            p->packed_k_row_stride_bytes < static_cast<int64_t>(p->nhead_k) * k_head_bytes ||
            p->packed_v_row_stride_bytes < static_cast<int64_t>(p->nhead_k) * v_head_bytes)
         {

@@ -593,18 +593,25 @@ void run_asym4_contract_case(int format)
         std::exit(15);
     }
     params.packed_k_head_stride_bytes += 1;
+    params.packed_k_row_stride_bytes += 1;
+    if(hipfire_flash_attn_ck_fwd_supported(&params, error, sizeof(error)) != 1)
+    {
+        std::fprintf(stderr, "misaligned asym4 row stride was accepted\n");
+        std::exit(16);
+    }
+    params.packed_k_row_stride_bytes -= 1;
     params.k_transform0 = nullptr;
     if(hipfire_flash_attn_ck_fwd_supported(&params, error, sizeof(error)) != 1)
     {
         std::fprintf(stderr, "null asym4 transform was accepted\n");
-        std::exit(16);
+        std::exit(17);
     }
     params.k_transform0 = &dummy;
     params.k_transform1_elements = transform_elements - 1;
     if(hipfire_flash_attn_ck_fwd_supported(&params, error, sizeof(error)) != 1)
     {
         std::fprintf(stderr, "undersized asym4 transform was accepted\n");
-        std::exit(17);
+        std::exit(18);
     }
     std::printf("case=asym4-contract format=%s head_dim=256 status=supported\n",
                 format == HIPFIRE_FLASH_ATTN_CK_ASYM4_GIVENS ? "givens" : "fwht");
