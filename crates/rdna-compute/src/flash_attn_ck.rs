@@ -1661,34 +1661,26 @@ mod tests {
     fn capability_validation_rejects_unknown_contract_values() {
         let valid = dense_capability(FlashAttnCkArch::Gfx1151);
         assert!(valid.is_well_formed());
-        assert!(
-            !FlashAttnCkCapability {
-                arch: 9999,
-                ..valid
-            }
-            .is_well_formed()
-        );
-        assert!(
-            !FlashAttnCkCapability {
-                k_format: 9999,
-                ..valid
-            }
-            .is_well_formed()
-        );
-        assert!(
-            !FlashAttnCkCapability {
-                head_dim: 0,
-                ..valid
-            }
-            .is_well_formed()
-        );
-        assert!(
-            !FlashAttnCkCapability {
-                flags: 1 << 31,
-                ..valid
-            }
-            .is_well_formed()
-        );
+        assert!(!FlashAttnCkCapability {
+            arch: 9999,
+            ..valid
+        }
+        .is_well_formed());
+        assert!(!FlashAttnCkCapability {
+            k_format: 9999,
+            ..valid
+        }
+        .is_well_formed());
+        assert!(!FlashAttnCkCapability {
+            head_dim: 0,
+            ..valid
+        }
+        .is_well_formed());
+        assert!(!FlashAttnCkCapability {
+            flags: 1 << 31,
+            ..valid
+        }
+        .is_well_formed());
     }
 
     #[test]
