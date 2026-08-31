@@ -92,6 +92,16 @@ bool is_asym4_contract(const hipfire_flash_attn_ck_fwd_params* p)
            p->v_format == HIPFIRE_FLASH_ATTN_CK_Q8;
 }
 
+bool is_asym4_execution_cell(const hipfire_flash_attn_ck_fwd_params* p)
+{
+#if defined(HIPFIRE_CK_TARGET_GFX1100) || defined(HIPFIRE_CK_TARGET_GFX1201)
+    return is_asym4_contract(p) && p->head_dim == 256;
+#else
+    (void)p;
+    return false;
+#endif
+}
+
 size_t staging_workspace_bytes(const hipfire_flash_attn_ck_fwd_params* p)
 {
     const size_t q = static_cast<size_t>(p->batch) * p->seqlen_q * p->nhead_q * p->head_dim;
@@ -204,6 +214,61 @@ __global__ void transform_q_fwht_f32_to_f16(const float* input,
     output[base + 2] = __float2half_rn(v2); output[base + 3] = __float2half_rn(v3);
     output[base + 4] = __float2half_rn(v4); output[base + 5] = __float2half_rn(v5);
     output[base + 6] = __float2half_rn(v6); output[base + 7] = __float2half_rn(v7);
+}
+
+__global__ void transform_q_fwht128x2_f32_to_f16(const float* input,
+                                                  __half* output,
+                                                  int rows,
+                                                  int heads,
+                                                  int head_dim,
+                                                  const float* signs1,
+                                                  const float* signs2)
+{
+    const int row = blockIdx.x;
+    const int head = blockIdx.y;
+    const int lane = threadIdx.x;
+    if(row >= rows || head >= heads || lane >= 32 || head_dim != 256) return;
+    const size_t head_base = (static_cast<size_t>(row) * heads + head) * head_dim;
+    for(int half = 0; half < 2; ++half)
+    {
+        const size_t base = head_base + half * 128 + lane * 4;
+        float v0 = input[base + 0], v1 = input[base + 1];
+        float v2 = input[base + 2], v3 = input[base + 3];
+        fwht_shfl_forward(v0, v1, v2, v3, signs1, signs2, lane);
+        output[base + 0] = __float2half_rn(v0);
+        output[base + 1] = __float2half_rn(v1);
+        output[base + 2] = __float2half_rn(v2);
+        output[base + 3] = __float2half_rn(v3);
+    }
+}
+
+__global__ void decode_asym4_k(const uint8_t* packed,
+                               __half* dense,
+                               int rows,
+                               int heads,
+                               int row_stride_bytes,
+                               int head_stride_bytes,
+                               int head_dim)
+{
+    const int row = blockIdx.x;
+    const int head = blockIdx.y;
+    const int lane = threadIdx.x;
+    if(row >= rows || head >= heads || lane >= 32 || head_dim != 256) return;
+    const uint8_t* source = packed + static_cast<size_t>(row) * row_stride_bytes +
+                            static_cast<size_t>(head) * head_stride_bytes;
+    const float cnorm = *reinterpret_cast<const float*>(source);
+    __half* destination = dense + (static_cast<size_t>(row) * heads + head) * head_dim;
+    for(int half = 0; half < 2; ++half)
+    {
+        const int byte_offset = 4 + half * 64 + lane * 2;
+        const uint8_t packed01 = source[byte_offset];
+        const uint8_t packed23 = source[byte_offset + 1];
+        const int dim = half * 128 + lane * 4;
+        destination[dim + 0] = __float2half_rn(cnorm * TURBO_C4[packed01 & 0xf]);
+        destination[dim + 1] = __float2half_rn(cnorm * TURBO_C4[packed01 >> 4]);
+        destination[dim + 2] = __float2half_rn(cnorm * TURBO_C4[packed23 & 0xf]);
+        destination[dim + 3] = __float2half_rn(cnorm * TURBO_C4[packed23 >> 4]);
+    }
 }
 
 __global__ void decode_asym3_k_givens(const uint8_t* packed,
@@ -453,8 +518,16 @@ int validate(const hipfire_flash_attn_ck_fwd_params* p, char* error, size_t erro
             set_error(error, error_capacity, "Asym4 transform metadata is missing or undersized");
             return 1;
         }
-        set_error(error, error_capacity, "Asym4 packed layout is valid but has no CK execution cell");
-        return 2;
+        if(!is_asym4_execution_cell(p))
+        {
+            set_error(error, error_capacity, "Asym4 packed layout is valid but has no CK execution cell");
+            return 2;
+        }
+        if(p->workspace == nullptr || p->workspace_bytes < staging_workspace_bytes(p))
+        {
+            set_error(error, error_capacity, "caller workspace is too small for Asym4 staging");
+            return 1;
+        }
     }
     set_error(error, error_capacity, "");
     return 0;
@@ -489,6 +562,34 @@ extern "C" size_t hipfire_flash_attn_ck_capabilities(
         HIPFIRE_FLASH_ATTN_CK_CAP_CAUSAL | HIPFIRE_FLASH_ATTN_CK_CAP_GQA,
     },
 #if defined(HIPFIRE_CK_TARGET_GFX1100) || defined(HIPFIRE_CK_TARGET_GFX1201)
+    {
+        HIPFIRE_FLASH_ATTN_CK_ABI_VERSION,
+        sizeof(hipfire_flash_attn_ck_capability),
+#if defined(HIPFIRE_CK_TARGET_GFX1201)
+        HIPFIRE_FLASH_ATTN_CK_GFX1201,
+#else
+        HIPFIRE_FLASH_ATTN_CK_GFX1100,
+#endif
+        HIPFIRE_FLASH_ATTN_CK_F32,
+        HIPFIRE_FLASH_ATTN_CK_ASYM4_GIVENS,
+        HIPFIRE_FLASH_ATTN_CK_Q8,
+        256,
+        HIPFIRE_FLASH_ATTN_CK_CAP_CAUSAL | HIPFIRE_FLASH_ATTN_CK_CAP_GQA,
+    },
+    {
+        HIPFIRE_FLASH_ATTN_CK_ABI_VERSION,
+        sizeof(hipfire_flash_attn_ck_capability),
+#if defined(HIPFIRE_CK_TARGET_GFX1201)
+        HIPFIRE_FLASH_ATTN_CK_GFX1201,
+#else
+        HIPFIRE_FLASH_ATTN_CK_GFX1100,
+#endif
+        HIPFIRE_FLASH_ATTN_CK_F32,
+        HIPFIRE_FLASH_ATTN_CK_ASYM4_FWHT,
+        HIPFIRE_FLASH_ATTN_CK_Q8,
+        256,
+        HIPFIRE_FLASH_ATTN_CK_CAP_CAUSAL | HIPFIRE_FLASH_ATTN_CK_CAP_GQA,
+    },
     {
         HIPFIRE_FLASH_ATTN_CK_ABI_VERSION,
         sizeof(hipfire_flash_attn_ck_capability),
@@ -549,7 +650,8 @@ extern "C" size_t hipfire_flash_attn_ck_fwd_workspace_bytes(
         params != nullptr && kHasAsym3GivensD256 && is_asym3_givens_cell(params);
     const bool asym3_fwht =
         params != nullptr && kHasAsym3FwhtD256 && is_asym3_fwht_cell(params);
-    return q8 || asym3_givens || asym3_fwht
+    const bool asym4 = params != nullptr && is_asym4_execution_cell(params);
+    return q8 || asym3_givens || asym3_fwht || asym4
                ? staging_workspace_bytes(params)
                : 0;
 }
@@ -577,6 +679,10 @@ extern "C" int hipfire_flash_attn_ck_fwd(
         const bool q8 = is_q8_cell(p);
         const bool asym3_givens = is_asym3_givens_cell(p);
         const bool asym3_fwht = is_asym3_fwht_cell(p);
+        const bool asym4_givens =
+            is_asym4_execution_cell(p) && p->k_format == HIPFIRE_FLASH_ATTN_CK_ASYM4_GIVENS;
+        const bool asym4_fwht =
+            is_asym4_execution_cell(p) && p->k_format == HIPFIRE_FLASH_ATTN_CK_ASYM4_FWHT;
         const void* q_ptr = p->q;
         const void* k_ptr = p->k;
         const void* v_ptr = p->v;
@@ -596,7 +702,7 @@ extern "C" int hipfire_flash_attn_ck_fwd(
         __half* staged_out = nullptr;
         hipStream_t stream = reinterpret_cast<hipStream_t>(p->stream);
         const size_t q_count = static_cast<size_t>(p->batch) * p->seqlen_q * p->nhead_q * p->head_dim;
-        if(q8 || asym3_givens || asym3_fwht)
+        if(q8 || asym3_givens || asym3_fwht || asym4_givens || asym4_fwht)
         {
             uint8_t* cursor = static_cast<uint8_t*>(p->workspace);
             __half* staged_q = reinterpret_cast<__half*>(cursor);
@@ -618,7 +724,7 @@ extern "C" int hipfire_flash_attn_ck_fwd(
                     staged_k, staged_v, p->seqlen_k, p->nhead_k,
                     p->packed_k_row_stride_bytes, p->packed_v_row_stride_bytes);
             }
-            else
+            else if(asym3_givens || asym3_fwht)
             {
                 if(asym3_givens)
                 {
@@ -635,6 +741,29 @@ extern "C" int hipfire_flash_attn_ck_fwd(
                         static_cast<const float*>(p->k_transform1));
                 }
                 decode_asym3_k_givens<<<dim3(p->seqlen_k, p->nhead_k), 32, 0, stream>>>(
+                    static_cast<const uint8_t*>(p->k), staged_k, p->seqlen_k, p->nhead_k,
+                    p->packed_k_row_stride_bytes, p->packed_k_head_stride_bytes, p->head_dim);
+                decode_q8<<<dim3(p->seqlen_k, p->nhead_k), 32, 0, stream>>>(
+                    static_cast<const uint8_t*>(p->v), staged_v, p->seqlen_k, p->nhead_k,
+                    p->packed_v_row_stride_bytes, p->packed_v_head_stride_bytes, p->head_dim);
+            }
+            else
+            {
+                if(asym4_givens)
+                {
+                    transform_q_givens_f32_to_f16<<<dim3(p->seqlen_q, p->nhead_q), 32, 0, stream>>>(
+                        static_cast<const float*>(p->q), staged_q, p->seqlen_q, p->nhead_q,
+                        p->head_dim, static_cast<const float*>(p->k_transform0),
+                        static_cast<const float*>(p->k_transform1));
+                }
+                else
+                {
+                    transform_q_fwht128x2_f32_to_f16<<<dim3(p->seqlen_q, p->nhead_q), 32, 0, stream>>>(
+                        static_cast<const float*>(p->q), staged_q, p->seqlen_q, p->nhead_q,
+                        p->head_dim, static_cast<const float*>(p->k_transform0),
+                        static_cast<const float*>(p->k_transform1));
+                }
+                decode_asym4_k<<<dim3(p->seqlen_k, p->nhead_k), 32, 0, stream>>>(
                     static_cast<const uint8_t*>(p->k), staged_k, p->seqlen_k, p->nhead_k,
                     p->packed_k_row_stride_bytes, p->packed_k_head_stride_bytes, p->head_dim);
                 decode_q8<<<dim3(p->seqlen_k, p->nhead_k), 32, 0, stream>>>(
@@ -723,7 +852,7 @@ extern "C" int hipfire_flash_attn_ck_fwd(
             set_error(error, error_capacity, "CK found no matching forward kernel");
             return 2;
         }
-        if(q8 || asym3_givens || asym3_fwht)
+        if(q8 || asym3_givens || asym3_fwht || asym4_givens || asym4_fwht)
         {
             const int threads = 256;
             convert_f16_to_f32<<<(q_count + threads - 1) / threads, threads, 0, stream>>>(
