@@ -37,6 +37,9 @@ stability result, not a performance claim.
 With the CK route absent or forced off, the same production binary fails at
 both PP2048 and PP8192 with `hipError 700` reported by the next H2D copy. A
 binary built without the `flash-attn-ck` feature reproduces the PP2048 failure.
+Launching that binary from `/tmp`, where the worktree's precompiled kernel
+directory cannot be discovered, also reproduces the failure; stale kernel
+blobs are therefore not the cause.
 The CK-enabled PP2048 run completes and logs
 `selected_asym4_givens_d256`, so the failure is outside the optional loader and
 prevents a valid native-versus-CK performance comparison on this revision.
