@@ -282,9 +282,8 @@ pub fn ep_emit_token(
     stop.iter().any(|s| !s.is_empty() && text_acc.ends_with(s))
 }
 
-/// Dense Qwen TP2 serving loop with Qwen contract-v2 semantic streaming.
-/// Prefill remains correctness-first (sequential chunk replay); batched TP
-/// prefill can replace that seam later without changing loader ownership.
+/// Dense Qwen TP2..TP5 serving loop with batched tensor-parallel prefill and
+/// Qwen contract-v2 semantic streaming.
 #[allow(clippy::too_many_arguments)]
 pub fn ep_serve_qwen35_dense_tp(
     m: &mut LoadedModel,

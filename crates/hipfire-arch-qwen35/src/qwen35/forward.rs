@@ -3665,7 +3665,11 @@ fn dense_tp_allreduce_batched(
         .checked_mul(dim)
         .ok_or_else(|| HipError::new(0, "dense_tp batched count overflow"))?;
     let refs: Vec<&hip_bridge::DeviceBuffer> = partials.iter().map(|t| &t.buf).collect();
-    dense_tp_all_reduce_sum_f32(gpus, &refs, count)?;
+    if gpus.peer_access_enabled {
+        gpus.all_reduce_sum_f32_peer_rooted(&refs, count)?;
+    } else {
+        dense_tp_all_reduce_sum_f32(gpus, &refs, count)?;
+    }
     for (rank, (pbs, partial)) in pbs_vec.iter().zip(partials.iter()).enumerate() {
         gpus.devices[rank].bind_thread()?;
         let x_n = pbs.x_batch.sub_offset(0, n * dim);
@@ -4198,8 +4202,8 @@ pub fn forward_scratch_dense_tp(
 
 /// Layer-granular batched dense-TP prefill. Chunks with the existing
 /// gfx1201 bounded prefill batch size, uses one `PrefillBatchScratch`
-/// per rank (no per-token allocation) and exactly two RCCL collectives
-/// per layer per chunk. Only rank 0 produces final logits.
+/// per rank (no per-token allocation) and exactly two deterministic
+/// reductions per layer per chunk. Only rank 0 produces final logits.
 #[allow(clippy::too_many_arguments)]
 pub fn forward_prefill_dense_tp(
     gpus: &mut Gpus,

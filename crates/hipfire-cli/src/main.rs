@@ -575,7 +575,7 @@ pub(crate) struct ServeArgs {
     /// Idle model-unload timeout in seconds; zero disables eviction.
     #[arg(long, value_parser = clap::value_parser!(u64).range(0..=86400))]
     idle_timeout: Option<u64>,
-    /// Expert-parallel degree.
+    /// Tensor/expert-parallel degree.
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..=64))]
     tp: Option<u64>,
     /// Maximum concurrent eligible batched lanes; 1 preserves sequential behavior.
