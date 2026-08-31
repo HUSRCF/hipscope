@@ -214,7 +214,6 @@ impl RuntimeConfig {
             uniform_vram_tolerance_gb: self.uniform_vram_tolerance_gb,
         }
     }
-
 }
 
 #[cfg(test)]

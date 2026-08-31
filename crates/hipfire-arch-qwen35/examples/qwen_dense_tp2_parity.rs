@@ -3,10 +3,10 @@
 use hipfire_arch_qwen35::qwen35::{
     self, DeltaNetState, HfqSource, Layout, Qwen35Scratch, StateQuant,
 };
+use hipfire_hardware::Gpus;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::kv_mode::KvMode;
 use hipfire_runtime::llama::{KvCache, KvCacheExt, KvDims, KvLayers, KvTarget};
-use hipfire_hardware::Gpus;
 use hipfire_runtime::tokenizer::Tokenizer;
 use hipfire_runtime::tp_shard::{ExpertAssign, ShardConfig};
 use rdna_compute::Gpu;

@@ -13,8 +13,7 @@ use rdna_compute::{DType, Gpu};
 fn main() {
     println!("── Gpus::init_uniform(2, 24) ─────────────────────────────");
     let device_opts = hipfire_runtime::config::get().device_resolve_opts();
-    let mut gpus =
-        Gpus::init_uniform(&device_opts, 2, 24).expect("init_uniform");
+    let mut gpus = Gpus::init_uniform(&device_opts, 2, 24).expect("init_uniform");
     assert_eq!(gpus.devices.len(), 2);
     assert_eq!(gpus.layer_to_device.len(), 24);
     assert_eq!(gpus.band_starts, vec![0, 12]);

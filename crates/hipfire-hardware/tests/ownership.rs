@@ -20,7 +20,9 @@ fn hardware_leaf_exposes_owner_and_named_topology() {
 #[test]
 fn runtime_has_no_legacy_owner_or_compatibility_reexport() {
     let crate_root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    assert!(!crate_root.join("../hipfire-runtime/src/multi_gpu.rs").exists());
+    assert!(!crate_root
+        .join("../hipfire-runtime/src/multi_gpu.rs")
+        .exists());
     let runtime_lib = std::fs::read_to_string(crate_root.join("../hipfire-runtime/src/lib.rs"))
         .expect("runtime lib source");
     assert!(!runtime_lib.contains("pub mod multi_gpu"));

@@ -5,14 +5,13 @@
 use crate::config_cache;
 use crate::deepseek4::{DeepseekV4Config, DeepseekV4State, DeepseekV4Weights};
 use crate::forward::{
-    Deepseek4Bindings, OloraSchedule, apply_tail_rope, apply_tail_rope_batched, attn_stub, ds4_superop, ffn_routed, ffn_stub,
-    gemv_auto, hc_attn_mix, hc_ffn_mix, kv_joint, mhc_pre, q_lora,
-    weight_needs_fwht, precompute_attn_state_batched, precompute_positions_batched,
+    apply_tail_rope, apply_tail_rope_batched, attn_stub, ds4_superop, ffn_routed, ffn_stub,
+    gemv_auto, hc_attn_mix, hc_ffn_mix, kv_joint, mhc_pre, precompute_attn_state_batched,
+    precompute_positions_batched, q_lora, weight_needs_fwht, Deepseek4Bindings, OloraSchedule,
 };
 use crate::forward::{
-    attention_block_batched_swa_only, ffn_batched, gemv_auto_batched_wmma,
-    hc_attn_mix_batched, hc_ffn_mix_batched, kv_joint_batched, mhc_pre_batched,
-    q_lora_batched,
+    attention_block_batched_swa_only, ffn_batched, gemv_auto_batched_wmma, hc_attn_mix_batched,
+    hc_ffn_mix_batched, kv_joint_batched, mhc_pre_batched, q_lora_batched,
 };
 use hipfire_dispatch::pipeline::superop::SuperOpKind;
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -915,4 +914,3 @@ pub fn mtp_forward_batched(
 
     Ok(())
 }
-

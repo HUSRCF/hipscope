@@ -359,12 +359,8 @@ mod tests {
 
     #[test]
     fn composed_coordinates_groups_stages_and_squeeze() {
-        let mesh = DeviceMesh::rect(&[
-            (DimKind::Pp, 2),
-            (DimKind::Tp, 2),
-            (DimKind::Ep, 2),
-        ])
-        .unwrap();
+        let mesh =
+            DeviceMesh::rect(&[(DimKind::Pp, 2), (DimKind::Tp, 2), (DimKind::Ep, 2)]).unwrap();
         assert_eq!(mesh.n_devices(), 8);
         assert_eq!(mesh.coord_of(0), vec![0, 0, 0]);
         assert_eq!(mesh.coord_of(7), vec![1, 1, 1]);
@@ -386,12 +382,8 @@ mod tests {
             }
         }
 
-        let degenerate = DeviceMesh::rect(&[
-            (DimKind::Pp, 2),
-            (DimKind::Tp, 1),
-            (DimKind::Ep, 2),
-        ])
-        .unwrap();
+        let degenerate =
+            DeviceMesh::rect(&[(DimKind::Pp, 2), (DimKind::Tp, 1), (DimKind::Ep, 2)]).unwrap();
         assert_eq!(
             degenerate.squeezed().axes(),
             &[

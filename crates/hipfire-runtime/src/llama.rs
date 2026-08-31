@@ -11,8 +11,8 @@ use crate::kv_backend::{
     KvBackend, KvChunkPlan, DEFAULT_KV_CHUNK_TOKENS, DEFAULT_VMM_PHYSICAL_CHUNK_BYTES,
 };
 use crate::kv_mode::KvMode;
-use hipfire_hardware::Gpus;
 use hip_bridge::HipResult;
+use hipfire_hardware::Gpus;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 /// Model architecture type.

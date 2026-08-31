@@ -5,10 +5,13 @@
 use crate::config_cache;
 use crate::deepseek4::{DeepseekV4Config, DeepseekV4State, DeepseekV4Weights};
 use crate::forward::{
-    Deepseek4Bindings, compressor_cache_uses_vmm, ds4_lower_program, final_norm_and_head,
-    init_residual_streams, refresh_compressor_cache_shard_tables,
+    compressor_cache_uses_vmm, ds4_lower_program, final_norm_and_head, init_residual_streams,
+    refresh_compressor_cache_shard_tables, Deepseek4Bindings,
 };
-use crate::forward::{precompute_positions, precompute_token_id, update_attn_state_host, update_pos_array_host, update_token_id_host, ensure_compressor_capacity};
+use crate::forward::{
+    ensure_compressor_capacity, precompute_positions, precompute_token_id, update_attn_state_host,
+    update_pos_array_host, update_token_id_host,
+};
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::pipeline::superop::{self, SuperOpKind};
 use hipfire_hardware::Gpus;
@@ -532,4 +535,3 @@ fn forward_ep_direct(
     }
     Ok(())
 }
-

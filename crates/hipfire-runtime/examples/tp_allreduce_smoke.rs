@@ -38,8 +38,7 @@ fn main() {
     // n_layers placeholder — init_uniform requires n_layers >= n_devices.
     // The TP path doesn't care about layer-to-device; we just need devices.
     let device_opts = hipfire_runtime::config::get().device_resolve_opts();
-    let mut gpus =
-        Gpus::init_uniform(&device_opts, n_ranks, n_ranks).expect("init_uniform");
+    let mut gpus = Gpus::init_uniform(&device_opts, n_ranks, n_ranks).expect("init_uniform");
     let peer_ok = gpus.enable_peer_all().expect("enable_peer_all");
     if !peer_ok {
         eprintln!("WARN: peer access incomplete (host-staging fallback applies)");
@@ -151,8 +150,7 @@ fn main() {
         let mut samples = Vec::with_capacity(iters);
         for _ in 0..iters {
             let t = Instant::now();
-            gpus
-                .all_reduce_sum_f32(&group, &refs, count)
+            gpus.all_reduce_sum_f32(&group, &refs, count)
                 .expect("all_reduce");
             for dev in &gpus.devices {
                 dev.bind_thread().expect("bind");

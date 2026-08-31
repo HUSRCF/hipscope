@@ -6,8 +6,8 @@
 //! per-tensor dequant), which `WeightSource::read_layer` calls internally.
 
 use crate::llama::{EmbeddingFormat, WeightTensor};
-use hipfire_hardware::Gpus;
 use hip_bridge::HipResult;
+use hipfire_hardware::Gpus;
 use rdna_compute::{Gpu, GpuTensor};
 
 /// Where each piece of the model lands across a device slice. `single` = the

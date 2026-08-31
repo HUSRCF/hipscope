@@ -41,8 +41,7 @@ fn main() {
     );
 
     let device_opts = hipfire_runtime::config::get().device_resolve_opts();
-    let mut gpus =
-        Gpus::init_uniform(&device_opts, ranks, ranks).expect("init TP GPUs");
+    let mut gpus = Gpus::init_uniform(&device_opts, ranks, ranks).expect("init TP GPUs");
     assert_eq!(gpus.devices.len(), ranks, "wrong GPU count");
     for (rank, gpu) in gpus.devices.iter().enumerate() {
         assert_eq!(

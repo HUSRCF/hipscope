@@ -121,8 +121,7 @@ fn main() {
     assert!(samples > 0, "samples must be nonzero");
 
     let device_opts = hipfire_runtime::config::get().device_resolve_opts();
-    let mut gpus =
-        Gpus::init_uniform(&device_opts, RANKS, RANKS).expect("init four GPUs");
+    let mut gpus = Gpus::init_uniform(&device_opts, RANKS, RANKS).expect("init four GPUs");
     assert_eq!(gpus.devices.len(), RANKS, "requires exactly four GPUs");
     for (rank, gpu) in gpus.devices.iter().enumerate() {
         assert_eq!(

@@ -31,13 +31,13 @@
 //! driver loops layers (advancing each rank's per-layer binding state) the same
 //! way the single-GPU lowered driver loops `run_layer_program`.
 
-use hipfire_hardware::Gpus;
 use hip_bridge::{DeviceBuffer, HipError};
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::pipeline::superop::{
     dispatch_super_op, ForwardBindings, LayerProgram, SuperOpKind,
 };
 use hipfire_dispatch::types::DispatchError;
+use hipfire_hardware::Gpus;
 use rdna_compute::GpuTensor;
 
 fn hip_err(e: HipError) -> DispatchError {

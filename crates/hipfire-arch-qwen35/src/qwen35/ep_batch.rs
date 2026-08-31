@@ -50,13 +50,13 @@ use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::pipeline::execute_steps;
 use hipfire_dispatch::pipeline::GemvInput;
 use hipfire_dispatch::pipeline::Step;
+use hipfire_hardware::Gpus;
 use hipfire_runtime::llama;
 use hipfire_runtime::llama::fused_rmsnorm_rotate_for_mq;
 use hipfire_runtime::llama::weight_gemv_prerotated;
 use hipfire_runtime::llama::weight_gemv_swiglu_residual;
 use hipfire_runtime::llama::EmbeddingFormat;
 use hipfire_runtime::llama::WeightTensor;
-use hipfire_hardware::Gpus;
 use rdna_compute::DType;
 use rdna_compute::GpuTensor;
 
@@ -2462,12 +2462,10 @@ pub fn forward_prefill_batch_ep(
             let refs: Vec<&hip_bridge::DeviceBuffer> =
                 partials.iter().map(|partial| &partial.buf).collect();
             if ep_peer_ar {
-                gpus
-                    .all_reduce_sum_f32_peer(&group, &refs, n * dim)
+                gpus.all_reduce_sum_f32_peer(&group, &refs, n * dim)
                     .map_err(|e| HipError::new(0, &e.to_string()))?;
             } else {
-                gpus
-                    .all_reduce_sum_f32(&group, &refs, n * dim)
+                gpus.all_reduce_sum_f32(&group, &refs, n * dim)
                     .map_err(|e| HipError::new(0, &e.to_string()))?;
             }
             if ep_timing {
