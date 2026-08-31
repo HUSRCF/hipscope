@@ -36,3 +36,8 @@ required-features = ["deltanet"]
 name = "mtp_head_smoke"
 path = "examples/mtp_head_smoke.rs"
 required-features = ["deltanet"]
+
+[[example]]
+name = "qwen_dense_tp2_parity"
+path = "examples/qwen_dense_tp2_parity.rs"
+required-features = ["deltanet"]

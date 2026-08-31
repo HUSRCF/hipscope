@@ -28,8 +28,9 @@ use hipfire_runtime::arch_model::ArchModel;
 use hipfire_runtime::cask::CaskCtx;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::kv_backend::KvBackend;
+use hipfire_runtime::kv_mode;
 use hipfire_runtime::llama;
-use hipfire_runtime::llama::KvCacheExt;
+use hipfire_runtime::llama::{KvCacheExt, KvDims, KvLayers, KvTarget};
 use hipfire_runtime::loader_api::{CaskConfig, LoadCtx, ModelSource, SpecLoadCfg};
 use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_runtime::spec::{SpecEmit, SpecEmitCtx, SpecTargetGuard, Speculator};
@@ -267,10 +268,12 @@ pub fn ep_prompt_route(arch_id: u32) -> EpPromptRoute {
 pub enum EpEosRoute {
     Deepseek4,
     Minimax,
+    Qwen35,
 }
 pub fn ep_eos_route(arch_id: u32) -> EpEosRoute {
     match arch_id {
         10 => EpEosRoute::Minimax,
+        5 | 6 => EpEosRoute::Qwen35,
         _ => EpEosRoute::Deepseek4,
     }
 }
@@ -1258,6 +1261,16 @@ pub enum EpArch {
         config: hipfire_arch_qwen35::qwen35::Qwen35Config,
         weights: Vec<hipfire_arch_qwen35::qwen35::Qwen35Weights>,
         batch: Option<hipfire_arch_qwen35::qwen35::Qwen35DecodeBatchEpState>,
+    },
+    /// Dense Qwen tensor parallelism. Kept separate from `Qwen35`, whose
+    /// ownership and scheduling contract is four-rank routed-expert EP.
+    Qwen35DenseTp {
+        shard: hipfire_runtime::tp_shard::ShardConfig,
+        configs: Vec<hipfire_arch_qwen35::qwen35::Qwen35Config>,
+        weights: Vec<hipfire_arch_qwen35::qwen35::Qwen35Weights>,
+        kv_caches: Vec<llama::KvCache>,
+        dn_states: Vec<hipfire_arch_qwen35::qwen35::DeltaNetState>,
+        scratches: Vec<hipfire_arch_qwen35::qwen35::Qwen35Scratch>,
     },
 }
 
@@ -2517,6 +2530,94 @@ impl Drop for Qwen35EpStaging {
     }
 }
 
+/// Transactional owner for dense Qwen TP construction. Every vector is kept
+/// rank-aligned; an early return frees only the objects that were published
+/// into the guard, on their owning device.
+struct Qwen35DenseTpStaging {
+    gpus: Option<Gpus>,
+    weights: Vec<qwen35::Qwen35Weights>,
+    kv_caches: Vec<llama::KvCache>,
+    dn_states: Vec<qwen35::DeltaNetState>,
+    scratches: Vec<qwen35::Qwen35Scratch>,
+}
+
+impl Qwen35DenseTpStaging {
+    fn new(gpus: Gpus) -> Self {
+        Self {
+            gpus: Some(gpus),
+            weights: Vec::new(),
+            kv_caches: Vec::new(),
+            dn_states: Vec::new(),
+            scratches: Vec::new(),
+        }
+    }
+
+    fn gpus_mut(&mut self) -> &mut Gpus {
+        self.gpus.as_mut().expect("dense TP staging gpus taken")
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn into_parts(
+        mut self,
+    ) -> (
+        Gpus,
+        Vec<qwen35::Qwen35Weights>,
+        Vec<llama::KvCache>,
+        Vec<qwen35::DeltaNetState>,
+        Vec<qwen35::Qwen35Scratch>,
+    ) {
+        (
+            self.gpus.take().expect("dense TP into_parts called twice"),
+            std::mem::take(&mut self.weights),
+            std::mem::take(&mut self.kv_caches),
+            std::mem::take(&mut self.dn_states),
+            std::mem::take(&mut self.scratches),
+        )
+    }
+}
+
+impl Drop for Qwen35DenseTpStaging {
+    fn drop(&mut self) {
+        let Some(mut gpus) = self.gpus.take() else {
+            return;
+        };
+        for (rank, scratch) in self.scratches.drain(..).enumerate() {
+            if let Some(gpu) = gpus.devices.get_mut(rank) {
+                let _ = gpu.bind_thread();
+                let _ = scratch.free_gpu(gpu);
+            }
+        }
+        for (rank, state) in self.dn_states.drain(..).enumerate() {
+            if let Some(gpu) = gpus.devices.get_mut(rank) {
+                let _ = gpu.bind_thread();
+                state.free_gpu(gpu);
+            }
+        }
+        for (rank, kv) in self.kv_caches.drain(..).enumerate() {
+            if let Some(gpu) = gpus.devices.get_mut(rank) {
+                let _ = gpu.bind_thread();
+                let _ = kv.free_gpu(gpu);
+            }
+        }
+        for (rank, weights) in self.weights.drain(..).enumerate() {
+            if let Some(gpu) = gpus.devices.get_mut(rank) {
+                let _ = gpu.bind_thread();
+                weights.free_gpu(gpu);
+            }
+        }
+        // Best-effort: reclaim peer-rooted reduce scratch reserved pre-enable_peer_all
+        // so a failed dense-TP load cannot strand VRAM after peer mapping.
+        let _ = gpus.free_peer_reduce_scratch();
+        for gpu in &mut gpus.devices {
+            let _ = gpu.bind_thread();
+            gpu.invalidate_weight_caches();
+            gpu.invalidate_graph_state();
+            gpu.drain_pool();
+        }
+        let _ = gpus.free_tp_graph_signals();
+    }
+}
+
 /// Expert-parallel (EP) model load — shards the routed experts across `tp` ranks
 /// (`Gpus::init_tp` + per-arch sharded weight load), wrapped in a staging guard so
 /// a mid-load failure frees every already-loaded rank's VRAM (no leak, prior model
@@ -2582,10 +2683,11 @@ pub fn load_model_ep_with_kv_mode(
     tp: usize,
     kv_mode: Option<&str>,
     kv_backend: Option<&str>,
+    state_quant: Option<&str>,
 ) -> Result<LoadedModel, String> {
     let hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
     let kv_backend_raw = kv_backend.unwrap_or("contiguous");
-    let kv_backend: KvBackend = kv_backend_raw.parse().map_err(|err| format!("{err}"))?;
+    let kv_backend_kind: KvBackend = kv_backend_raw.parse().map_err(|err| format!("{err}"))?;
     match hfq.arch_id {
         9 => load_model_ep_ds4(
             path,
@@ -2593,14 +2695,14 @@ pub fn load_model_ep_with_kv_mode(
             tp,
             resolve_deepseek4_compressor_cache_kv_mode(kv_mode)?,
         ),
-        10 if kv_backend == KvBackend::Vmm => {
+        10 if kv_backend_kind == KvBackend::Vmm => {
             Err(format!("KV backend '{kv_backend_raw}' requires tp=1"))
         }
         10 => load_model_ep_minimax(path, max_seq, tp),
-        5 | 6 if kv_backend == KvBackend::Vmm => {
+        5 | 6 if kv_backend_kind == KvBackend::Vmm => {
             Err(format!("KV backend '{kv_backend_raw}' requires tp=1"))
         }
-        5 | 6 => load_model_ep_qwen35(path, max_seq, tp),
+        5 | 6 => load_model_ep_qwen35(path, max_seq, tp, kv_mode, kv_backend, state_quant),
         id => Err(format!(
             "EP not supported for arch_id={id} (expected 5|6 for Qwen3.5, 9 for DeepSeek V4 or 10 for MiniMax)"
         )),
@@ -2624,7 +2726,7 @@ pub fn load_model_ep_with_compressor_cache(
         }
         10 => Err("DeepSeek V4 compressor-cache storage cannot be applied to MiniMax".to_string()),
         5 | 6 if compressor_cache == hipfire_config::Deepseek4CompressorCache::F32 => {
-            load_model_ep_qwen35(path, max_seq, tp)
+            load_model_ep_qwen35(path, max_seq, tp, None, None, None)
         }
         5 | 6 => Err("DeepSeek V4 compressor-cache storage cannot be applied to Qwen3.5".to_string()),
         id => Err(format!(
@@ -2991,14 +3093,16 @@ fn load_model_ep_minimax(path: &str, max_seq: usize, tp: usize) -> Result<Loaded
         )
     })
 }
-fn load_model_ep_qwen35(path: &str, max_seq: usize, tp: usize) -> Result<LoadedModel, String> {
+fn load_model_ep_qwen35(
+    path: &str,
+    max_seq: usize,
+    tp: usize,
+    kv_mode: Option<&str>,
+    kv_backend: Option<&str>,
+    state_quant: Option<&str>,
+) -> Result<LoadedModel, String> {
     use hipfire_runtime::tp_shard::{ExpertAssign, ShardConfig};
 
-    if tp != 4 {
-        return Err(format!(
-            "EP qwen35 requires tp=4, got tp={tp} (only 4×gfx1201 expert-parallel is supported)"
-        ));
-    }
     let hfq_probe = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
     if hfq_probe.arch_id != 5 && hfq_probe.arch_id != 6 {
         return Err(format!(
@@ -3010,14 +3114,22 @@ fn load_model_ep_qwen35(path: &str, max_seq: usize, tp: usize) -> Result<LoadedM
         hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq_probe.metadata_json)
             .map_err(|e| format!("tokenizer not found: {e}"))?;
     let config = qwen35::config_from_hfq(&hfq_probe).map_err(|e| format!("qwen35 config: {e}"))?;
+    if config.num_experts == 0 {
+        drop(hfq_probe);
+        return load_model_tp_qwen35_dense(path, max_seq, tp, kv_mode, state_quant);
+    }
+    // MoE EP: keep existing behavior; dense-only selectors are handled above. Silence unused.
+    let _ = (kv_mode, kv_backend, state_quant);
+    if tp != 4 {
+        return Err(format!(
+            "EP qwen35 MoE requires tp=4, got tp={tp} (only 4×gfx1201 expert-parallel is supported)"
+        ));
+    }
     if config.paged_experts {
         return Err("EP qwen35: paged_experts must be false".to_string());
     }
     if config.reap_keep.is_some() {
         return Err("EP qwen35: REAP keep-map incompatible with EP".to_string());
-    }
-    if config.num_experts == 0 {
-        return Err("EP qwen35: config has no routed experts".to_string());
     }
     let arch_id = hfq_probe.arch_id;
     let n_exp = config.num_experts;
@@ -3082,6 +3194,176 @@ fn load_model_ep_qwen35(path: &str, max_seq: usize, tp: usize) -> Result<LoadedM
                 config,
                 weights,
                 batch: None,
+            },
+        }),
+        qwen35_eos_tok: eos_tok,
+        rec_temperature: rec.and_then(|r| r.temperature),
+        rec_top_p: rec.and_then(|r| r.top_p),
+        rec_top_k: rec.and_then(|r| r.top_k.map(|k| k as f32)),
+        ..LoadedModel::skeleton(
+            arch_id,
+            tokenizer,
+            max_seq,
+            max_seq,
+            path.to_string(),
+            chat_template,
+        )
+    })
+}
+
+fn load_model_tp_qwen35_dense(
+    path: &str,
+    max_seq: usize,
+    tp: usize,
+    kv_mode: Option<&str>,
+    state_quant: Option<&str>,
+) -> Result<LoadedModel, String> {
+    use hipfire_runtime::tp_shard::{ExpertAssign, ShardConfig};
+
+    let hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
+    let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
+        .map_err(|e| format!("tokenizer not found: {e}"))?;
+    let config = qwen35::config_from_hfq(&hfq).map_err(|e| format!("qwen35 config: {e}"))?;
+    let shard = ShardConfig::new(tp, false, 0, ExpertAssign::Stride)
+        .map_err(|e| format!("dense TP ShardConfig: {e}"))?;
+    // Compute static per-rank whole-unit layouts CPU-only before any GPU allocation.
+    // Validates GQA/G256 geometry, TP range 2..5, and global coverage contiguously.
+    let layouts = qwen35::dense_tp_rank_layouts(&config, &shard)
+        .map_err(|e| format!("dense TP layout: {e}"))?;
+    // Resolve state quant via canonical parser; dense TP honors Q8/default, FP32, Q4.
+    let state_quant_resolved = parse_state_quant(state_quant)?;
+    // Resolve KV mode via Qwen policy (contiguous only). Explicit unsupported => fail before GPU init.
+    let kv_raw = kv_mode.unwrap_or("");
+    let kv_trim = kv_raw.trim();
+    let kv_lower = kv_trim.to_ascii_lowercase();
+    let kv_mode_resolved = if kv_lower.is_empty() {
+        kv_mode::resolve("", &kv_mode::QWEN35_HFQ_POLICY, config.head_dim).mode
+    } else {
+        let rr = kv_mode::resolve(&kv_lower, &kv_mode::QWEN35_HFQ_POLICY, config.head_dim);
+        if rr.warning.is_some() {
+            return Err(format!(
+                "unsupported kv_mode '{kv_trim}' (expected q8|asym2|asym3|asym4|fwht2|fwht3|fwht4)"
+            ));
+        }
+        rr.mode
+    };
+    // Preflight weights before GPU allocation (validates qt geometry/blob/sidecar).
+    qwen35::preflight_weights_dense_tp(&hfq, &config, &shard)?;
+    let configs = layouts
+        .iter()
+        .map(|layout| qwen35::local_dense_tp_config(&config, layout))
+        .collect::<Vec<_>>();
+    let arch_id = hfq.arch_id;
+    let chat_template = resolve_chat_template(&hfq, path);
+    let rec = hfq.recommended_sampling();
+    let eos_tok = {
+        let ids = tokenizer.encode("<|im_end|>");
+        if ids.len() == 1 {
+            ids[0]
+        } else {
+            config.eos_token
+        }
+    };
+    drop(hfq);
+
+    let gpus = Gpus::init_tp(tp, config.n_layers).map_err(|e| format!("init_tp: {e:?}"))?;
+    if gpus.devices.len() != tp {
+        return Err(format!(
+            "init_tp gave {} devices, expected tp={tp}",
+            gpus.devices.len()
+        ));
+    }
+    let mut staging = Qwen35DenseTpStaging::new(gpus);
+    for rank in 0..tp {
+        staging.gpus_mut().devices[rank]
+            .bind_thread()
+            .map_err(|e| format!("dense TP bind rank {rank}: {e:?}"))?;
+        let mut rank_hfq = HfqFile::open(Path::new(path))
+            .map_err(|e| format!("dense TP reopen rank {rank}: {e}"))?;
+        let weights = qwen35::load_weights_dense_tp_rank(
+            &mut rank_hfq,
+            &config,
+            &mut staging.gpus_mut().devices[rank],
+            &layouts[rank],
+        )
+        .map_err(|e| format!("dense TP weight load rank {rank}: {e:?}"))?;
+        staging.weights.push(weights);
+
+        let local = &configs[rank];
+        let is_kv_layer: Vec<bool> = config
+            .layer_types
+            .iter()
+            .map(|t| *t == qwen35::LayerType::FullAttention)
+            .collect();
+        let dims = KvDims {
+            layers: KvLayers::Mask(is_kv_layer),
+            n_kv_heads: local.n_kv_heads,
+            head_dim: local.head_dim,
+            max_seq,
+            physical_cap: Some(max_seq),
+        };
+        let kv = <llama::KvCache as KvCacheExt>::from_mode_with_backend(
+            kv_mode_resolved,
+            KvBackend::Contiguous,
+            KvTarget::Single(&mut staging.gpus_mut().devices[rank]),
+            &dims,
+        )
+        .map_err(|e| format!("dense TP KV rank {rank}: {e:?}"))?;
+        staging.kv_caches.push(kv);
+        let dn = qwen35::DeltaNetState::new_with_quant(
+            &mut staging.gpus_mut().devices[rank],
+            local,
+            state_quant_resolved,
+        )
+        .map_err(|e| format!("dense TP DeltaNet rank {rank}: {e:?}"))?;
+        staging.dn_states.push(dn);
+        let scratch = qwen35::Qwen35Scratch::new_with_kv_max(
+            &mut staging.gpus_mut().devices[rank],
+            local,
+            128,
+            max_seq,
+        )
+        .map_err(|e| format!("dense TP scratch rank {rank}: {e:?}"))?;
+        staging.scratches.push(scratch);
+    }
+    // Probe complete peer topology without mutation. Complete → enable + RCCL;
+    // mixed → host-staged allreduce (no peer enable, no device reduce scratch).
+    let peer = staging
+        .gpus_mut()
+        .can_access_peer_all()
+        .map_err(|e| format!("dense TP can_access_peer_all: {e:?}"))?;
+    if peer {
+        let enabled = staging
+            .gpus_mut()
+            .enable_peer_all()
+            .map_err(|e| format!("dense TP enable_peer_all: {e:?}"))?;
+        if !enabled {
+            return Err(
+                "dense TP enable_peer_all returned false after can_access_peer_all".to_string(),
+            );
+        }
+    } else {
+        // Mixed P2P topology: select host-staged allreduce; do not enable peers
+        // or reserve device reduction scratch.
+        eprintln!(
+            "[loader] dense qwen TP mixed topology: host-staged allreduce (no peer enable/scratch)"
+        );
+    }
+    hipfire_runtime::ep::ensure_rank_streams(staging.gpus_mut())
+        .map_err(|e| format!("dense TP ensure_rank_streams: {e:?}"))?;
+    let (gpus, weights, kv_caches, dn_states, scratches) = staging.into_parts();
+    eprintln!("[loader] dense qwen TP load complete: {tp} ranks, peer_access={peer}");
+
+    Ok(LoadedModel {
+        ep: Some(EpState {
+            gpus,
+            inner: EpArch::Qwen35DenseTp {
+                shard,
+                configs,
+                weights,
+                kv_caches,
+                dn_states,
+                scratches,
             },
         }),
         qwen35_eos_tok: eos_tok,
@@ -3196,7 +3478,54 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
                     }
                 }
             }
+            EpArch::Qwen35DenseTp {
+                weights,
+                kv_caches,
+                dn_states,
+                scratches,
+                ..
+            } => {
+                for (rank, scratch) in scratches.into_iter().enumerate() {
+                    if let Some(dev) = gpus.devices.get_mut(rank) {
+                        let _ = dev.bind_thread();
+                        if let Err(e) = scratch.free_gpu(dev) {
+                            if ep_first_err.is_none() {
+                                ep_first_err = Some(format!(
+                                    "unload dense qwen TP scratch rank {rank}: {e:?}"
+                                ));
+                            }
+                        }
+                    }
+                }
+                for (rank, state) in dn_states.into_iter().enumerate() {
+                    if let Some(dev) = gpus.devices.get_mut(rank) {
+                        let _ = dev.bind_thread();
+                        state.free_gpu(dev);
+                    }
+                }
+                for (rank, kv) in kv_caches.into_iter().enumerate() {
+                    if let Some(dev) = gpus.devices.get_mut(rank) {
+                        let _ = dev.bind_thread();
+                        let _ = kv.free_gpu(dev);
+                    }
+                }
+                for (rank, weights) in weights.into_iter().enumerate() {
+                    if let Some(dev) = gpus.devices.get_mut(rank) {
+                        let _ = dev.bind_thread();
+                        weights.free_gpu(dev);
+                    }
+                }
+            }
         }
+        // Reclaim unleased peer-rooted collective scratch before device pool
+        // teardown. Idempotent across EP variants; fold first error into
+        // ep_first_err so unload reports cleanup failure.
+        if let Err(e) = gpus.free_peer_reduce_scratch() {
+            if ep_first_err.is_none() {
+                ep_first_err = Some(format!("unload dense TP peer reduce scratch: {e:?}"));
+            }
+        }
+
         for dev in gpus.devices.iter_mut() {
             let _ = dev.bind_thread();
             dev.invalidate_weight_caches();
@@ -3695,12 +4024,12 @@ mod registry_tests {
             assert_eq!(ep_prompt_route(id), want, "ep_prompt_route({id})");
         }
 
-        // ── ep_eos_route: 10 -> Minimax, everything else Deepseek4 ──
+        // ── ep_eos_route: Qwen, MiniMax and DeepSeek carry distinct EOS ──
         for id in 0u32..=14 {
-            let want = if id == 10 {
-                EpEosRoute::Minimax
-            } else {
-                EpEosRoute::Deepseek4
+            let want = match id {
+                5 | 6 => EpEosRoute::Qwen35,
+                10 => EpEosRoute::Minimax,
+                _ => EpEosRoute::Deepseek4,
             };
             assert_eq!(ep_eos_route(id), want, "ep_eos_route({id})");
         }

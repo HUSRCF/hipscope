@@ -55,6 +55,240 @@ use hipfire_runtime::llama::WeightTensor;
 use rdna_compute::DType;
 use rdna_compute::Gpu;
 use rdna_compute::GpuTensor;
+/// Row-parallel epilogue for dense-TP batched partials.
+/// `Residual` is byte-identical single-GPU/MoE/EP behavior: GEMM adds into
+/// `pbs.x_batch`. `Partial(out)` writes the N×dim GEMM result into `out`
+/// without touching the residual; the caller all-reduces `out` and then
+/// adds it into each rank's `x_batch`. This avoids duplicating full layer
+/// bodies for the two transports.
+pub(crate) enum BatchEpilogue<'a> {
+    Residual,
+    Partial(&'a GpuTensor),
+}
+#[inline]
+fn zero_partial_for_residual(
+    gpu: &mut Gpu,
+    partial: &GpuTensor,
+    n: usize,
+    m: usize,
+) -> HipResult<()> {
+    let elems = n
+        .checked_mul(m)
+        .ok_or_else(|| HipError::new(0, "zero_partial overflow"))?;
+    let view = partial.sub_offset(0, elems);
+    gpu.hip.memset(&view.buf, 0, view.buf.size())?;
+    Ok(())
+}
+
+/// Shared dispatch for batched `wo` / `w_down` with selectable epilogue.
+/// Preserves every dtype-specific residual kernel path; `Partial` reuses the
+/// same kernels into a zeroed `n×m` slice of `out` instead of `pbs.x_batch`.
+fn dispatch_batched_gemm_epilogue(
+    gpu: &mut Gpu,
+    pbs: &PrefillBatchScratch,
+    w: &WeightTensor,
+    input: &GpuTensor,
+    epilogue: &BatchEpilogue<'_>,
+    n: usize,
+    q8_wmma_arch: bool,
+    _arch_has_wmma: bool,
+) -> HipResult<()> {
+    let m = w.m;
+    let k = w.k;
+    let is_6bit = matches!(w.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
+    let is_mq3_lloyd = matches!(w.gpu_dtype, DType::MQ3G256Lloyd);
+    let is_mq3 = matches!(w.gpu_dtype, DType::MQ3G256);
+    let is_fp4 = matches!(w.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
+    let is_q8 = matches!(w.gpu_dtype, DType::Q8_0);
+    let is_lowbit = matches!(w.gpu_dtype, DType::TQ2G128 | DType::BQ1G128);
+    match epilogue {
+        BatchEpilogue::Residual => {
+            if is_6bit {
+                return run_residual_gemm_key(
+                    gpu,
+                    hipfire_dispatch::types::KernelKey::GemmHfq6G256Residual,
+                    &w.buf,
+                    w.gpu_dtype,
+                    input,
+                    &pbs.x_batch,
+                    m,
+                    k,
+                    n,
+                );
+            } else if is_q8 && q8_wmma_arch {
+                let x_n = pbs.x_batch.sub_offset(0, n * m);
+                return run_residual_gemm_key(
+                    gpu,
+                    hipfire_dispatch::types::KernelKey::GemmQ8_0ResidualWmma,
+                    &w.buf,
+                    w.gpu_dtype,
+                    input,
+                    &x_n,
+                    m,
+                    k,
+                    n,
+                );
+            } else if is_q8 || is_lowbit {
+                let scratch = pbs.x_rot_batch.sub_offset(0, n * m);
+                run_plain_gemm_key(
+                    gpu,
+                    plain_gemm_key_for(w.gpu_dtype),
+                    &w.buf,
+                    w.gpu_dtype,
+                    input,
+                    &scratch,
+                    m,
+                    k,
+                    n,
+                )?;
+                let x_n = pbs.x_batch.sub_offset(0, n * m);
+                return gpu.add_inplace_f32(&x_n, &scratch);
+            } else if is_mq3_lloyd {
+                return run_residual_gemm_key(
+                    gpu,
+                    hipfire_dispatch::types::KernelKey::GemmMq3G256LloydResidual,
+                    &w.buf,
+                    w.gpu_dtype,
+                    input,
+                    &pbs.x_batch,
+                    m,
+                    k,
+                    n,
+                );
+            } else if is_mq3 {
+                return run_residual_gemm_key(
+                    gpu,
+                    hipfire_dispatch::types::KernelKey::GemmHfq3G256Residual,
+                    &w.buf,
+                    w.gpu_dtype,
+                    input,
+                    &pbs.x_batch,
+                    m,
+                    k,
+                    n,
+                );
+            } else if is_fp4 {
+                return run_residual_gemm_key(
+                    gpu,
+                    hipfire_dispatch::types::KernelKey::GemmHfp4G32Residual,
+                    &w.buf,
+                    w.gpu_dtype,
+                    input,
+                    &pbs.x_batch,
+                    m,
+                    k,
+                    n,
+                );
+            } else {
+                return run_residual_gemm_key(
+                    gpu,
+                    crate::forward_slots::residual_gemm_key_for(w.gpu_dtype),
+                    &w.buf,
+                    w.gpu_dtype,
+                    input,
+                    &pbs.x_batch,
+                    m,
+                    k,
+                    n,
+                );
+            }
+        }
+        BatchEpilogue::Partial(out) => {
+            let out_n = out.sub_offset(0, n * m);
+            if is_6bit {
+                zero_partial_for_residual(gpu, out, n, m)?;
+                return run_residual_gemm_key(
+                    gpu,
+                    hipfire_dispatch::types::KernelKey::GemmHfq6G256Residual,
+                    &w.buf,
+                    w.gpu_dtype,
+                    input,
+                    &out_n,
+                    m,
+                    k,
+                    n,
+                );
+            } else if is_q8 && q8_wmma_arch {
+                zero_partial_for_residual(gpu, out, n, m)?;
+                return run_residual_gemm_key(
+                    gpu,
+                    hipfire_dispatch::types::KernelKey::GemmQ8_0ResidualWmma,
+                    &w.buf,
+                    w.gpu_dtype,
+                    input,
+                    &out_n,
+                    m,
+                    k,
+                    n,
+                );
+            } else if is_q8 || is_lowbit {
+                return run_plain_gemm_key(
+                    gpu,
+                    plain_gemm_key_for(w.gpu_dtype),
+                    &w.buf,
+                    w.gpu_dtype,
+                    input,
+                    &out_n,
+                    m,
+                    k,
+                    n,
+                );
+            } else if is_mq3_lloyd {
+                zero_partial_for_residual(gpu, out, n, m)?;
+                return run_residual_gemm_key(
+                    gpu,
+                    hipfire_dispatch::types::KernelKey::GemmMq3G256LloydResidual,
+                    &w.buf,
+                    w.gpu_dtype,
+                    input,
+                    &out_n,
+                    m,
+                    k,
+                    n,
+                );
+            } else if is_mq3 {
+                zero_partial_for_residual(gpu, out, n, m)?;
+                return run_residual_gemm_key(
+                    gpu,
+                    hipfire_dispatch::types::KernelKey::GemmHfq3G256Residual,
+                    &w.buf,
+                    w.gpu_dtype,
+                    input,
+                    &out_n,
+                    m,
+                    k,
+                    n,
+                );
+            } else if is_fp4 {
+                zero_partial_for_residual(gpu, out, n, m)?;
+                return run_residual_gemm_key(
+                    gpu,
+                    hipfire_dispatch::types::KernelKey::GemmHfp4G32Residual,
+                    &w.buf,
+                    w.gpu_dtype,
+                    input,
+                    &out_n,
+                    m,
+                    k,
+                    n,
+                );
+            } else {
+                zero_partial_for_residual(gpu, out, n, m)?;
+                return run_residual_gemm_key(
+                    gpu,
+                    crate::forward_slots::residual_gemm_key_for(w.gpu_dtype),
+                    &w.buf,
+                    w.gpu_dtype,
+                    input,
+                    &out_n,
+                    m,
+                    k,
+                    n,
+                );
+            }
+        }
+    }
+}
 
 /// Batched prefill entry point: processes N prompt tokens in one call,
 /// writing the last token's logits into `scratch.logits` and leaving
@@ -3630,7 +3864,7 @@ fn batch_chunk_validate_independent(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn batch_chunk_embed_tokens(
+pub(crate) fn batch_chunk_embed_tokens(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,
     tokens: &[u32],
@@ -3758,7 +3992,7 @@ fn batch_chunk_embed_tokens(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn batch_chunk_upload_positions(
+pub(crate) fn batch_chunk_upload_positions(
     gpu: &mut Gpu,
     pbs: &PrefillBatchScratch,
     batch_semantics: BatchSemantics<'_>,
@@ -3818,7 +4052,7 @@ fn batch_chunk_upload_positions(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn batch_chunk_delta_net_attn(
+pub(crate) fn batch_chunk_delta_net_attn(
     gpu: &mut Gpu,
     layer: &DeltaNetLayerWeights,
     config: &Qwen35Config,
@@ -3837,6 +4071,7 @@ fn batch_chunk_delta_net_attn(
     delta_layer_idx: usize,
     q8_wmma_arch: bool,
     arch_has_wmma: bool,
+    epilogue: BatchEpilogue<'_>,
 ) -> HipResult<()> {
     // Per-layer dtype branch: MQ4 needs FWHT-rotation on the
     // activation to match its pre-rotated weights; HFQ4 uses
@@ -4418,7 +4653,7 @@ fn batch_chunk_delta_net_attn(
         n,
     )?;
 
-    // Batched wo + residual.
+    // Batched wo + residual/partial.
     //
     // For MQ weights, the decode path's weight_gemv_residual
     // internally FWHT-rotates dn_normed into mq_x_rot before
@@ -4440,18 +4675,7 @@ fn batch_chunk_delta_net_attn(
             | DType::MQ3G256Lloyd
             | DType::MFP4G32
     );
-    let wo_is_6bit = matches!(layer.wo.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
-    let wo_is_mq3 = matches!(layer.wo.gpu_dtype, DType::MQ3G256);
-    let wo_is_mq3_lloyd = matches!(layer.wo.gpu_dtype, DType::MQ3G256Lloyd);
-    let wo_is_fp4 = matches!(layer.wo.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
-    let wo_is_q8 = matches!(layer.wo.gpu_dtype, DType::Q8_0);
-    // TQ2G128/BQ1G128 have no fused qkvza/gate_up/qkv kernel, so they take
-    // the same UNFUSED plain-GEMM strategy as Q8 rather than falling through
-    // to the HFQ4 arm, which would read these packed blocks at the wrong
-    // stride and produce fluent-but-wrong tokens.
-    let wo_is_lowbit = matches!(layer.wo.gpu_dtype, DType::TQ2G128 | DType::BQ1G128);
     let wo_input = if wo_is_mq {
-        // F2: AWQ-aware rotate for linear_attn wo (out_proj) input.
         rotate_x_mq_batched_for(
             gpu,
             &layer.wo,
@@ -4464,118 +4688,22 @@ fn batch_chunk_delta_net_attn(
     } else {
         &pbs.dn_normed_batch
     };
-    if wo_is_6bit {
-        run_residual_gemm_key(
-            gpu,
-            hipfire_dispatch::types::KernelKey::GemmHfq6G256Residual,
-            &layer.wo.buf,
-            layer.wo.gpu_dtype,
-            wo_input,
-            &pbs.x_batch,
-            layer.wo.m,
-            layer.wo.k,
-            n,
-        )?;
-    } else if wo_is_q8 && q8_wmma_arch {
-        let x_n = pbs.x_batch.sub_offset(0, n * layer.wo.m);
-        run_residual_gemm_key(
-            gpu,
-            hipfire_dispatch::types::KernelKey::GemmQ8_0ResidualWmma,
-            &layer.wo.buf,
-            layer.wo.gpu_dtype,
-            wo_input,
-            &x_n,
-            layer.wo.m,
-            layer.wo.k,
-            n,
-        )?;
-    } else if wo_is_q8 || wo_is_lowbit {
-        // Tier 2 fallback (non-WMMA archs): GEMM into x_rot_batch as
-        // scratch (safe — next consumer is the FFN rmsnorm), then
-        // add into residual.
-        let scratch = pbs.x_rot_batch.sub_offset(0, n * layer.wo.m);
-        run_plain_gemm_key(
-            gpu,
-            plain_gemm_key_for(layer.wo.gpu_dtype),
-            &layer.wo.buf,
-            layer.wo.gpu_dtype,
-            wo_input,
-            &scratch,
-            layer.wo.m,
-            layer.wo.k,
-            n,
-        )?;
-        let x_n = pbs.x_batch.sub_offset(0, n * layer.wo.m);
-        gpu.add_inplace_f32(&x_n, &scratch)?;
-    } else if wo_is_mq3_lloyd {
-        run_residual_gemm_key(
-            gpu,
-            hipfire_dispatch::types::KernelKey::GemmMq3G256LloydResidual,
-            &layer.wo.buf,
-            layer.wo.gpu_dtype,
-            wo_input,
-            &pbs.x_batch,
-            layer.wo.m,
-            layer.wo.k,
-            n,
-        )?;
-    } else if wo_is_mq3 {
-        if arch_has_wmma {
-            run_residual_gemm_key(
-                gpu,
-                hipfire_dispatch::types::KernelKey::GemmHfq3G256Residual,
-                &layer.wo.buf,
-                layer.wo.gpu_dtype,
-                wo_input,
-                &pbs.x_batch,
-                layer.wo.m,
-                layer.wo.k,
-                n,
-            )?;
-        } else {
-            run_residual_gemm_key(
-                gpu,
-                hipfire_dispatch::types::KernelKey::GemmHfq3G256Residual,
-                &layer.wo.buf,
-                layer.wo.gpu_dtype,
-                wo_input,
-                &pbs.x_batch,
-                layer.wo.m,
-                layer.wo.k,
-                n,
-            )?;
-        }
-    } else if wo_is_fp4 {
-        run_residual_gemm_key(
-            gpu,
-            hipfire_dispatch::types::KernelKey::GemmHfp4G32Residual,
-            &layer.wo.buf,
-            layer.wo.gpu_dtype,
-            wo_input,
-            &pbs.x_batch,
-            layer.wo.m,
-            layer.wo.k,
-            n,
-        )?;
-    } else {
-        run_residual_gemm_key(
-            gpu,
-            crate::forward_slots::residual_gemm_key_for(layer.wo.gpu_dtype),
-            &layer.wo.buf,
-            layer.wo.gpu_dtype,
-            wo_input,
-            &pbs.x_batch,
-            layer.wo.m,
-            layer.wo.k,
-            n,
-        )?;
-    }
+    dispatch_batched_gemm_epilogue(
+        gpu,
+        pbs,
+        &layer.wo,
+        wo_input,
+        &epilogue,
+        n,
+        q8_wmma_arch,
+        arch_has_wmma,
+    )?;
 
     Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
-fn batch_chunk_delta_net_ffn(
+pub(crate) fn batch_chunk_delta_net_ffn(
     gpu: &mut Gpu,
     layer: &DeltaNetLayerWeights,
     config: &Qwen35Config,
@@ -4585,6 +4713,7 @@ fn batch_chunk_delta_net_ffn(
     hidden_dim: usize,
     q8_wmma_arch: bool,
     arch_has_wmma: bool,
+    epilogue: BatchEpilogue<'_>,
 ) -> HipResult<()> {
     // FFN: rmsnorm (+ rotate for MQ).
     let ffn_is_mq = matches!(
@@ -4774,16 +4903,6 @@ fn batch_chunk_delta_net_ffn(
             | DType::MQ3G256Lloyd
             | DType::MFP4G32
     );
-    let w_down_is_6bit = matches!(layer.w_down.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
-    let w_down_is_mq3 = matches!(layer.w_down.gpu_dtype, DType::MQ3G256);
-    let w_down_is_mq3_lloyd = matches!(layer.w_down.gpu_dtype, DType::MQ3G256Lloyd);
-    let w_down_is_fp4 = matches!(layer.w_down.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
-    let w_down_is_q8 = matches!(layer.w_down.gpu_dtype, DType::Q8_0);
-    // TQ2G128/BQ1G128 have no fused qkvza/gate_up/qkv kernel, so they take
-    // the same UNFUSED plain-GEMM strategy as Q8 rather than falling through
-    // to the HFQ4 arm, which would read these packed blocks at the wrong
-    // stride and produce fluent-but-wrong tokens.
-    let w_down_is_lowbit = matches!(layer.w_down.gpu_dtype, DType::TQ2G128 | DType::BQ1G128);
     if w_down_is_mq {
         // F2: AWQ-aware silu_mul+rotate for w_down input.
         fused_silu_mul_rotate_mq_batched_for(
@@ -4798,117 +4917,23 @@ fn batch_chunk_delta_net_ffn(
     } else {
         gpu.silu_mul_f32(&pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch)?;
     }
-
-    // Batched w_down + residual.
-    if w_down_is_6bit {
-        run_residual_gemm_key(
-            gpu,
-            hipfire_dispatch::types::KernelKey::GemmHfq6G256Residual,
-            &layer.w_down.buf,
-            layer.w_down.gpu_dtype,
-            &pbs.ffn_hidden_batch,
-            &pbs.x_batch,
-            layer.w_down.m,
-            layer.w_down.k,
-            n,
-        )?;
-    } else if w_down_is_q8 && q8_wmma_arch {
-        let x_n = pbs.x_batch.sub_offset(0, n * layer.w_down.m);
-        run_residual_gemm_key(
-            gpu,
-            hipfire_dispatch::types::KernelKey::GemmQ8_0ResidualWmma,
-            &layer.w_down.buf,
-            layer.w_down.gpu_dtype,
-            &pbs.ffn_hidden_batch,
-            &x_n,
-            layer.w_down.m,
-            layer.w_down.k,
-            n,
-        )?;
-    } else if w_down_is_q8 || w_down_is_lowbit {
-        let scratch = pbs.x_rot_batch.sub_offset(0, n * layer.w_down.m);
-        run_plain_gemm_key(
-            gpu,
-            plain_gemm_key_for(layer.w_down.gpu_dtype),
-            &layer.w_down.buf,
-            layer.w_down.gpu_dtype,
-            &pbs.ffn_hidden_batch,
-            &scratch,
-            layer.w_down.m,
-            layer.w_down.k,
-            n,
-        )?;
-        let x_n = pbs.x_batch.sub_offset(0, n * layer.w_down.m);
-        gpu.add_inplace_f32(&x_n, &scratch)?;
-    } else if w_down_is_mq3_lloyd {
-        run_residual_gemm_key(
-            gpu,
-            hipfire_dispatch::types::KernelKey::GemmMq3G256LloydResidual,
-            &layer.w_down.buf,
-            layer.w_down.gpu_dtype,
-            &pbs.ffn_hidden_batch,
-            &pbs.x_batch,
-            layer.w_down.m,
-            layer.w_down.k,
-            n,
-        )?;
-    } else if w_down_is_mq3 {
-        if arch_has_wmma {
-            run_residual_gemm_key(
-                gpu,
-                hipfire_dispatch::types::KernelKey::GemmHfq3G256Residual,
-                &layer.w_down.buf,
-                layer.w_down.gpu_dtype,
-                &pbs.ffn_hidden_batch,
-                &pbs.x_batch,
-                layer.w_down.m,
-                layer.w_down.k,
-                n,
-            )?;
-        } else {
-            run_residual_gemm_key(
-                gpu,
-                hipfire_dispatch::types::KernelKey::GemmHfq3G256Residual,
-                &layer.w_down.buf,
-                layer.w_down.gpu_dtype,
-                &pbs.ffn_hidden_batch,
-                &pbs.x_batch,
-                layer.w_down.m,
-                layer.w_down.k,
-                n,
-            )?;
-        }
-    } else if w_down_is_fp4 {
-        run_residual_gemm_key(
-            gpu,
-            hipfire_dispatch::types::KernelKey::GemmHfp4G32Residual,
-            &layer.w_down.buf,
-            layer.w_down.gpu_dtype,
-            &pbs.ffn_hidden_batch,
-            &pbs.x_batch,
-            layer.w_down.m,
-            layer.w_down.k,
-            n,
-        )?;
-    } else {
-        run_residual_gemm_key(
-            gpu,
-            crate::forward_slots::residual_gemm_key_for(layer.w_down.gpu_dtype),
-            &layer.w_down.buf,
-            layer.w_down.gpu_dtype,
-            &pbs.ffn_hidden_batch,
-            &pbs.x_batch,
-            layer.w_down.m,
-            layer.w_down.k,
-            n,
-        )?;
-    }
+    // Batched w_down + residual/partial.
+    dispatch_batched_gemm_epilogue(
+        gpu,
+        pbs,
+        &layer.w_down,
+        &pbs.ffn_hidden_batch,
+        &epilogue,
+        n,
+        q8_wmma_arch,
+        arch_has_wmma,
+    )?;
 
     Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
-fn batch_chunk_full_attn_attn(
+pub(crate) fn batch_chunk_full_attn_attn(
     gpu: &mut Gpu,
     layer: &FullAttnLayerWeights,
     config: &Qwen35Config,
@@ -4926,6 +4951,7 @@ fn batch_chunk_full_attn_attn(
     arch_has_wmma: bool,
     kv_layer_idx: usize,
     layer_idx: usize,
+    epilogue: BatchEpilogue<'_>,
 ) -> HipResult<()> {
     // Fully batched FA layer. Mirrors the FA branch of
     // forward_scratch_layers kernel-for-kernel, but every
@@ -5330,18 +5356,7 @@ fn batch_chunk_full_attn_attn(
             | DType::MQ3G256Lloyd
             | DType::MFP4G32
     );
-    let fa_wo_is_6bit = matches!(layer.wo.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
-    let fa_wo_is_mq3 = matches!(layer.wo.gpu_dtype, DType::MQ3G256);
-    let fa_wo_is_mq3_lloyd = matches!(layer.wo.gpu_dtype, DType::MQ3G256Lloyd);
-    let fa_wo_is_fp4 = matches!(layer.wo.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
-    let fa_wo_is_q8 = matches!(layer.wo.gpu_dtype, DType::Q8_0);
-    // TQ2G128/BQ1G128 have no fused qkvza/gate_up/qkv kernel, so they take
-    // the same UNFUSED plain-GEMM strategy as Q8 rather than falling through
-    // to the HFQ4 arm, which would read these packed blocks at the wrong
-    // stride and produce fluent-but-wrong tokens.
-    let fa_wo_is_lowbit = matches!(layer.wo.gpu_dtype, DType::TQ2G128 | DType::BQ1G128);
     let fa_wo_input = if fa_wo_is_mq {
-        // F2: AWQ-aware rotate for FullAttention wo (o_proj) input.
         rotate_x_mq_batched_for(
             gpu,
             &layer.wo,
@@ -5354,115 +5369,22 @@ fn batch_chunk_full_attn_attn(
     } else {
         &pbs.fa_attn_out_batch
     };
-    if fa_wo_is_6bit {
-        run_residual_gemm_key(
-            gpu,
-            hipfire_dispatch::types::KernelKey::GemmHfq6G256Residual,
-            &layer.wo.buf,
-            layer.wo.gpu_dtype,
-            fa_wo_input,
-            &pbs.x_batch,
-            layer.wo.m,
-            layer.wo.k,
-            n,
-        )?;
-    } else if fa_wo_is_q8 && q8_wmma_arch {
-        let x_n = pbs.x_batch.sub_offset(0, n * layer.wo.m);
-        run_residual_gemm_key(
-            gpu,
-            hipfire_dispatch::types::KernelKey::GemmQ8_0ResidualWmma,
-            &layer.wo.buf,
-            layer.wo.gpu_dtype,
-            fa_wo_input,
-            &x_n,
-            layer.wo.m,
-            layer.wo.k,
-            n,
-        )?;
-    } else if fa_wo_is_q8 || fa_wo_is_lowbit {
-        let scratch = pbs.x_rot_batch.sub_offset(0, n * layer.wo.m);
-        run_plain_gemm_key(
-            gpu,
-            plain_gemm_key_for(layer.wo.gpu_dtype),
-            &layer.wo.buf,
-            layer.wo.gpu_dtype,
-            fa_wo_input,
-            &scratch,
-            layer.wo.m,
-            layer.wo.k,
-            n,
-        )?;
-        let x_n = pbs.x_batch.sub_offset(0, n * layer.wo.m);
-        gpu.add_inplace_f32(&x_n, &scratch)?;
-    } else if fa_wo_is_mq3_lloyd {
-        run_residual_gemm_key(
-            gpu,
-            hipfire_dispatch::types::KernelKey::GemmMq3G256LloydResidual,
-            &layer.wo.buf,
-            layer.wo.gpu_dtype,
-            fa_wo_input,
-            &pbs.x_batch,
-            layer.wo.m,
-            layer.wo.k,
-            n,
-        )?;
-    } else if fa_wo_is_mq3 {
-        if arch_has_wmma {
-            run_residual_gemm_key(
-                gpu,
-                hipfire_dispatch::types::KernelKey::GemmHfq3G256Residual,
-                &layer.wo.buf,
-                layer.wo.gpu_dtype,
-                fa_wo_input,
-                &pbs.x_batch,
-                layer.wo.m,
-                layer.wo.k,
-                n,
-            )?;
-        } else {
-            run_residual_gemm_key(
-                gpu,
-                hipfire_dispatch::types::KernelKey::GemmHfq3G256Residual,
-                &layer.wo.buf,
-                layer.wo.gpu_dtype,
-                fa_wo_input,
-                &pbs.x_batch,
-                layer.wo.m,
-                layer.wo.k,
-                n,
-            )?;
-        }
-    } else if fa_wo_is_fp4 {
-        run_residual_gemm_key(
-            gpu,
-            hipfire_dispatch::types::KernelKey::GemmHfp4G32Residual,
-            &layer.wo.buf,
-            layer.wo.gpu_dtype,
-            fa_wo_input,
-            &pbs.x_batch,
-            layer.wo.m,
-            layer.wo.k,
-            n,
-        )?;
-    } else {
-        run_residual_gemm_key(
-            gpu,
-            crate::forward_slots::residual_gemm_key_for(layer.wo.gpu_dtype),
-            &layer.wo.buf,
-            layer.wo.gpu_dtype,
-            fa_wo_input,
-            &pbs.x_batch,
-            layer.wo.m,
-            layer.wo.k,
-            n,
-        )?;
-    }
+    dispatch_batched_gemm_epilogue(
+        gpu,
+        pbs,
+        &layer.wo,
+        fa_wo_input,
+        &epilogue,
+        n,
+        q8_wmma_arch,
+        arch_has_wmma,
+    )?;
 
     Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
-fn batch_chunk_full_attn_ffn(
+pub(crate) fn batch_chunk_full_attn_ffn(
     gpu: &mut Gpu,
     layer: &FullAttnLayerWeights,
     config: &Qwen35Config,
@@ -5472,6 +5394,7 @@ fn batch_chunk_full_attn_ffn(
     hidden_dim: usize,
     q8_wmma_arch: bool,
     arch_has_wmma: bool,
+    epilogue: BatchEpilogue<'_>,
 ) -> HipResult<()> {
     // 10. FFN: rmsnorm (+ rotate for MQ), gate+up, silu_mul
     // (+ rotate for MQ), w_down residual.
@@ -5651,18 +5574,7 @@ fn batch_chunk_full_attn_ffn(
             | DType::MQ3G256Lloyd
             | DType::MFP4G32
     );
-    let fa_w_down_is_6bit = matches!(layer.w_down.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
-    let fa_w_down_is_mq3 = matches!(layer.w_down.gpu_dtype, DType::MQ3G256);
-    let fa_w_down_is_mq3_lloyd = matches!(layer.w_down.gpu_dtype, DType::MQ3G256Lloyd);
-    let fa_w_down_is_fp4 = matches!(layer.w_down.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
-    let fa_w_down_is_q8 = matches!(layer.w_down.gpu_dtype, DType::Q8_0);
-    // TQ2G128/BQ1G128 have no fused qkvza/gate_up/qkv kernel, so they take
-    // the same UNFUSED plain-GEMM strategy as Q8 rather than falling through
-    // to the HFQ4 arm, which would read these packed blocks at the wrong
-    // stride and produce fluent-but-wrong tokens.
-    let fa_w_down_is_lowbit = matches!(layer.w_down.gpu_dtype, DType::TQ2G128 | DType::BQ1G128);
     if fa_w_down_is_mq {
-        // F2: AWQ-aware silu_mul+rotate for FullAttention w_down input.
         fused_silu_mul_rotate_mq_batched_for(
             gpu,
             &layer.w_down,
@@ -5675,109 +5587,16 @@ fn batch_chunk_full_attn_ffn(
     } else {
         gpu.silu_mul_f32(&pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch)?;
     }
-    if fa_w_down_is_6bit {
-        run_residual_gemm_key(
-            gpu,
-            hipfire_dispatch::types::KernelKey::GemmHfq6G256Residual,
-            &layer.w_down.buf,
-            layer.w_down.gpu_dtype,
-            &pbs.ffn_hidden_batch,
-            &pbs.x_batch,
-            layer.w_down.m,
-            layer.w_down.k,
-            n,
-        )?;
-    } else if fa_w_down_is_q8 && q8_wmma_arch {
-        let x_n = pbs.x_batch.sub_offset(0, n * layer.w_down.m);
-        run_residual_gemm_key(
-            gpu,
-            hipfire_dispatch::types::KernelKey::GemmQ8_0ResidualWmma,
-            &layer.w_down.buf,
-            layer.w_down.gpu_dtype,
-            &pbs.ffn_hidden_batch,
-            &x_n,
-            layer.w_down.m,
-            layer.w_down.k,
-            n,
-        )?;
-    } else if fa_w_down_is_q8 || fa_w_down_is_lowbit {
-        let scratch = pbs.x_rot_batch.sub_offset(0, n * layer.w_down.m);
-        run_plain_gemm_key(
-            gpu,
-            plain_gemm_key_for(layer.w_down.gpu_dtype),
-            &layer.w_down.buf,
-            layer.w_down.gpu_dtype,
-            &pbs.ffn_hidden_batch,
-            &scratch,
-            layer.w_down.m,
-            layer.w_down.k,
-            n,
-        )?;
-        let x_n = pbs.x_batch.sub_offset(0, n * layer.w_down.m);
-        gpu.add_inplace_f32(&x_n, &scratch)?;
-    } else if fa_w_down_is_mq3_lloyd {
-        run_residual_gemm_key(
-            gpu,
-            hipfire_dispatch::types::KernelKey::GemmMq3G256LloydResidual,
-            &layer.w_down.buf,
-            layer.w_down.gpu_dtype,
-            &pbs.ffn_hidden_batch,
-            &pbs.x_batch,
-            layer.w_down.m,
-            layer.w_down.k,
-            n,
-        )?;
-    } else if fa_w_down_is_mq3 {
-        if arch_has_wmma {
-            run_residual_gemm_key(
-                gpu,
-                hipfire_dispatch::types::KernelKey::GemmHfq3G256Residual,
-                &layer.w_down.buf,
-                layer.w_down.gpu_dtype,
-                &pbs.ffn_hidden_batch,
-                &pbs.x_batch,
-                layer.w_down.m,
-                layer.w_down.k,
-                n,
-            )?;
-        } else {
-            run_residual_gemm_key(
-                gpu,
-                hipfire_dispatch::types::KernelKey::GemmHfq3G256Residual,
-                &layer.w_down.buf,
-                layer.w_down.gpu_dtype,
-                &pbs.ffn_hidden_batch,
-                &pbs.x_batch,
-                layer.w_down.m,
-                layer.w_down.k,
-                n,
-            )?;
-        }
-    } else if fa_w_down_is_fp4 {
-        run_residual_gemm_key(
-            gpu,
-            hipfire_dispatch::types::KernelKey::GemmHfp4G32Residual,
-            &layer.w_down.buf,
-            layer.w_down.gpu_dtype,
-            &pbs.ffn_hidden_batch,
-            &pbs.x_batch,
-            layer.w_down.m,
-            layer.w_down.k,
-            n,
-        )?;
-    } else {
-        run_residual_gemm_key(
-            gpu,
-            crate::forward_slots::residual_gemm_key_for(layer.w_down.gpu_dtype),
-            &layer.w_down.buf,
-            layer.w_down.gpu_dtype,
-            &pbs.ffn_hidden_batch,
-            &pbs.x_batch,
-            layer.w_down.m,
-            layer.w_down.k,
-            n,
-        )?;
-    }
+    dispatch_batched_gemm_epilogue(
+        gpu,
+        pbs,
+        &layer.w_down,
+        &pbs.ffn_hidden_batch,
+        &epilogue,
+        n,
+        q8_wmma_arch,
+        arch_has_wmma,
+    )?;
 
     Ok(())
 }
@@ -7403,6 +7222,7 @@ pub(crate) fn forward_batch_chunk_impl(
                     delta_layer_idx,
                     q8_wmma_arch,
                     arch_has_wmma,
+                    BatchEpilogue::Residual,
                 )?;
                 batch_chunk_delta_net_ffn(
                     gpu,
@@ -7414,6 +7234,7 @@ pub(crate) fn forward_batch_chunk_impl(
                     hidden_dim,
                     q8_wmma_arch,
                     arch_has_wmma,
+                    BatchEpilogue::Residual,
                 )?;
                 if let Some(rb) = hidden_rb {
                     if let Some(slot) = rb.extract_slot(layer_idx) {
@@ -7442,6 +7263,7 @@ pub(crate) fn forward_batch_chunk_impl(
                     arch_has_wmma,
                     kv_layer_idx,
                     layer_idx,
+                    BatchEpilogue::Residual,
                 )?;
                 batch_chunk_full_attn_ffn(
                     gpu,
@@ -7453,6 +7275,7 @@ pub(crate) fn forward_batch_chunk_impl(
                     hidden_dim,
                     q8_wmma_arch,
                     arch_has_wmma,
+                    BatchEpilogue::Residual,
                 )?;
                 if let Some(rb) = hidden_rb {
                     if let Some(slot) = rb.extract_slot(layer_idx) {
