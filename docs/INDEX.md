@@ -67,6 +67,7 @@ Exactly one canonical owner (or explicit `BLOCKED`) per concern.
 | Docs navigation, lifecycle labels, ownership map | [`docs/INDEX.md`](INDEX.md) | shipped / ref-pinned | This file. |
 | Human validation route selection | [`docs/VALIDATION.md`](VALIDATION.md) | shipped / ref-pinned | Sole route selector. |
 | Machine admission registry | [`docs/admissions.yml`](admissions.yml) | shipped / ref-pinned | Schema v2; exactly one earned record (LFM2.5-350M MQ4 gfx1201 retained-PM4). |
+| Upstream device-mesh port tracker | [`docs/device-mesh-port-tracker.json`](device-mesh-port-tracker.json) | branch-implemented | PR-00/G0 authority for 68 domain obligations, G0..G15 grouped change sets, topology-class evidence campaigns, and FCP-00; does not replace VALIDATION or admissions ownership. |
 | Product onboarding | [`docs/GETTING_STARTED.md`](GETTING_STARTED.md) | shipped / ref-pinned | |
 | CLI surface and model lifecycle commands | [`docs/CLI.md`](CLI.md) | shipped / ref-pinned | |
 | Daemon / user config keys | [`docs/CONFIG.md`](CONFIG.md) | shipped / ref-pinned | |
@@ -123,6 +124,7 @@ Every current top-level page, exactly once.
 | [`INDEX.md`](INDEX.md) | shipped / ref-pinned | Navigation, lifecycle, ownership. |
 | [`VALIDATION.md`](VALIDATION.md) | shipped / ref-pinned | Validation route selector. |
 | [`admissions.yml`](admissions.yml) | shipped / ref-pinned | Admission registry (schema v2; exactly one record). |
+| [`device-mesh-port-tracker.json`](device-mesh-port-tracker.json) | branch-implemented | Domain obligations, G0..G15 change sets, evidence campaigns, and final closure authority; statuses do not claim merged GitHub PRs. |
 | [`GETTING_STARTED.md`](GETTING_STARTED.md) | shipped / ref-pinned | Onboarding. |
 | [`CLI.md`](CLI.md) | shipped / ref-pinned | CLI. |
 | [`CONFIG.md`](CONFIG.md) | shipped / ref-pinned | Config keys. |
