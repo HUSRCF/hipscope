@@ -14,11 +14,11 @@ pub use carriers::*;
 pub mod parallel_capability;
 pub mod spec_build;
 
+pub use hipfire_hardware::{DeviceMesh, DimKind};
+use parallel_capability::resolve;
 pub use parallel_capability::{
     AdmissionError, CellPolicy, ModelVariant, ParallelAxis, RawParallelism, SourceKind,
 };
-pub use hipfire_hardware::{DeviceMesh, DimKind};
-use parallel_capability::resolve;
 
 use hipfire_arch_cohere2moe as cohere2moe;
 use hipfire_arch_deepseek4 as deepseek4;
@@ -71,7 +71,6 @@ pub trait Carrier: Send + Sync {
             src.describe()
         ))
     }
-
 
     /// Declared capabilities for this arch. Default is the conservative
     /// “no capability” set — carriers override to declare what they support.
@@ -250,7 +249,11 @@ impl std::fmt::Display for LoadAdmissionError {
                 write!(f, "[SRC-001] failed to open model `{path}`: {reason}")
             }
             Self::Classification { source, reason } => {
-                write!(f, "[CLS-001] {} source classification failed: {reason}", source.name())
+                write!(
+                    f,
+                    "[CLS-001] {} source classification failed: {reason}",
+                    source.name()
+                )
             }
             Self::Admission(error) => std::fmt::Display::fmt(error, f),
         }
@@ -306,7 +309,6 @@ impl AdmittedLoad {
     }
 }
 
-
 /// Classify a source through exactly one carrier and return its family facts.
 ///
 /// `Carrier::probe` remains the namespace-aware arch-id gate (HFQ versus
@@ -316,15 +318,19 @@ pub fn classify_source(
     src: &ModelSource,
 ) -> Result<(&'static dyn Carrier, ModelVariant), LoadAdmissionError> {
     let source = source_kind(src);
-    let arch_id = src.arch_id().ok_or_else(|| LoadAdmissionError::Classification {
-        source,
-        reason: format!("no arch_id in source: {}", src.describe()),
-    })?;
+    let arch_id = src
+        .arch_id()
+        .ok_or_else(|| LoadAdmissionError::Classification {
+            source,
+            reason: format!("no arch_id in source: {}", src.describe()),
+        })?;
     let mut matches = REGISTRY.iter().filter(|carrier| carrier.probe(src));
-    let carrier = *matches.next().ok_or_else(|| LoadAdmissionError::Classification {
-        source,
-        reason: format!("no carrier for arch_id {} ({})", arch_id, src.describe()),
-    })?;
+    let carrier = *matches
+        .next()
+        .ok_or_else(|| LoadAdmissionError::Classification {
+            source,
+            reason: format!("no carrier for arch_id {} ({})", arch_id, src.describe()),
+        })?;
     if let Some(other) = matches.next() {
         return Err(LoadAdmissionError::Classification {
             source,
@@ -348,10 +354,7 @@ pub fn classify_source(
 /// resolver itself only owns the documented DeepSeek4/MiniMax TP→EP mapping,
 /// so this carrier-route adapter lives at the outer loader admission boundary.
 fn raw_for_cli_route(variant: ModelVariant, raw: RawParallelism) -> RawParallelism {
-    if matches!(variant, ModelVariant::Qwen35Moe)
-        && raw.tp > 1
-        && raw.ep == 1
-    {
+    if matches!(variant, ModelVariant::Qwen35Moe) && raw.tp > 1 && raw.ep == 1 {
         RawParallelism::new(raw.pp, 1, raw.tp)
     } else {
         raw
@@ -378,7 +381,6 @@ fn admit_source_with_carrier(
     ))
 }
 
-
 /// Open, classify, and admit one model while retaining the source for the
 /// subsequent execution entrypoint. This is the daemon-facing admission
 /// boundary: callers must move the returned value through teardown instead of
@@ -401,10 +403,7 @@ pub fn admit_load_with_source(
 /// This compatibility/query helper returns only the effective admission.
 /// Daemon execution must use [`admit_load_with_source`] so the already-open
 /// source can be consumed without a second open or admission.
-pub fn admit_load(
-    path: &str,
-    raw: RawParallelism,
-) -> Result<LoadAdmission, LoadAdmissionError> {
+pub fn admit_load(path: &str, raw: RawParallelism) -> Result<LoadAdmission, LoadAdmissionError> {
     Ok(admit_load_with_source(path, raw)?.admission)
 }
 
@@ -2376,11 +2375,7 @@ where
     continue_load(admitted)
 }
 
-fn route_admitted_load<T, C>(
-    path: &str,
-    raw: RawParallelism,
-    continue_load: C,
-) -> Result<T, String>
+fn route_admitted_load<T, C>(path: &str, raw: RawParallelism, continue_load: C) -> Result<T, String>
 where
     C: FnOnce(AdmittedLoad) -> Result<T, String>,
 {
@@ -2457,27 +2452,23 @@ pub fn load_model_with_kv_backend(
     spec: SpecLoadCfg,
     gpu: &mut rdna_compute::Gpu,
 ) -> Result<LoadedModel, String> {
-    route_admitted_load(
-        path,
-        RawParallelism::new(pp, 1, 1),
-        |admitted| {
-            load_model_with_kv_backend_admitted(
-                path,
-                max_seq,
-                deepseek4_experts_per_token,
-                deepseek4_compute_placement,
-                draft_path,
-                kv_mode_override,
-                kv_backend_override,
-                kv_adaptive_override,
-                state_quant_override,
-                cask,
-                spec,
-                gpu,
-                admitted,
-            )
-        },
-    )
+    route_admitted_load(path, RawParallelism::new(pp, 1, 1), |admitted| {
+        load_model_with_kv_backend_admitted(
+            path,
+            max_seq,
+            deepseek4_experts_per_token,
+            deepseek4_compute_placement,
+            draft_path,
+            kv_mode_override,
+            kv_backend_override,
+            kv_adaptive_override,
+            state_quant_override,
+            cask,
+            spec,
+            gpu,
+            admitted,
+        )
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2666,29 +2657,25 @@ pub fn load_model_with_gemma4_drafter(
     spec: SpecLoadCfg,
     gpu: &mut rdna_compute::Gpu,
 ) -> Result<LoadedModel, String> {
-    route_admitted_load(
-        path,
-        RawParallelism::new(pp, 1, 1),
-        |admitted| {
-            load_model_with_gemma4_drafter_admitted(
-                path,
-                max_seq,
-                deepseek4_experts_per_token,
-                deepseek4_compute_placement,
-                draft_path,
-                gemma4_drafter_path,
-                gemma4_draft_len,
-                kv_mode_override,
-                kv_backend_override,
-                kv_adaptive_override,
-                state_quant_override,
-                cask,
-                spec,
-                gpu,
-                admitted,
-            )
-        },
-    )
+    route_admitted_load(path, RawParallelism::new(pp, 1, 1), |admitted| {
+        load_model_with_gemma4_drafter_admitted(
+            path,
+            max_seq,
+            deepseek4_experts_per_token,
+            deepseek4_compute_placement,
+            draft_path,
+            gemma4_drafter_path,
+            gemma4_draft_len,
+            kv_mode_override,
+            kv_backend_override,
+            kv_adaptive_override,
+            state_quant_override,
+            cask,
+            spec,
+            gpu,
+            admitted,
+        )
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3242,20 +3229,16 @@ pub fn load_model_ep_with_kv_mode(
     kv_backend: Option<&str>,
     state_quant: Option<&str>,
 ) -> Result<LoadedModel, String> {
-    route_admitted_load(
-        path,
-        RawParallelism::new(1, tp, 1),
-        |admitted| {
-            load_model_ep_with_kv_mode_admitted(
-                path,
-                max_seq,
-                kv_mode,
-                kv_backend,
-                state_quant,
-                admitted,
-            )
-        },
-    )
+    route_admitted_load(path, RawParallelism::new(1, tp, 1), |admitted| {
+        load_model_ep_with_kv_mode_admitted(
+            path,
+            max_seq,
+            kv_mode,
+            kv_backend,
+            state_quant,
+            admitted,
+        )
+    })
 }
 
 pub fn load_model_ep_with_kv_mode_admitted(
@@ -3300,9 +3283,15 @@ pub fn load_model_ep_with_kv_mode_admitted(
         ModelVariant::Qwen35Moe if kv_backend_kind == KvBackend::Vmm => {
             Err(format!("KV backend '{kv_backend_raw}' requires tp=1"))
         }
-        ModelVariant::Qwen35Moe => {
-            load_model_ep_qwen35(path, source, max_seq, degree, kv_mode, kv_backend, state_quant)
-        }
+        ModelVariant::Qwen35Moe => load_model_ep_qwen35(
+            path,
+            source,
+            max_seq,
+            degree,
+            kv_mode,
+            kv_backend,
+            state_quant,
+        ),
         ModelVariant::Qwen35Dense if kv_backend_kind == KvBackend::Vmm => {
             Err(format!("KV backend '{kv_backend_raw}' requires tp=1"))
         }
@@ -3322,18 +3311,9 @@ pub fn load_model_ep_with_compressor_cache(
     tp: usize,
     compressor_cache: hipfire_config::Deepseek4CompressorCache,
 ) -> Result<LoadedModel, String> {
-    route_admitted_load(
-        path,
-        RawParallelism::new(1, tp, 1),
-        |admitted| {
-            load_model_ep_with_compressor_cache_admitted(
-                path,
-                max_seq,
-                compressor_cache,
-                admitted,
-            )
-        },
-    )
+    route_admitted_load(path, RawParallelism::new(1, tp, 1), |admitted| {
+        load_model_ep_with_compressor_cache_admitted(path, max_seq, compressor_cache, admitted)
+    })
 }
 
 pub fn load_model_ep_with_compressor_cache_admitted(
@@ -3359,7 +3339,9 @@ pub fn load_model_ep_with_compressor_cache_admitted(
         }
     };
     match admission.variant {
-        ModelVariant::Deepseek4 => load_model_ep_ds4(path, source, max_seq, degree, compressor_cache),
+        ModelVariant::Deepseek4 => {
+            load_model_ep_ds4(path, source, max_seq, degree, compressor_cache)
+        }
         ModelVariant::Minimax
             if compressor_cache == hipfire_config::Deepseek4CompressorCache::F32 =>
         {
@@ -3453,9 +3435,8 @@ fn load_model_ep_ds4(
             .bind_thread()
             .map_err(|e| format!("bind {r}: {e:?}"))?;
         let dev = &mut staging.gpus_mut().devices[r];
-        let w =
-            deepseek4::DeepseekV4::load_weights_sharded(&mut hfq, &config, dev, &shard, r)
-                .map_err(|e| format!("shard load rank {r}: {e:?}"))?;
+        let w = deepseek4::DeepseekV4::load_weights_sharded(&mut hfq, &config, dev, &shard, r)
+            .map_err(|e| format!("shard load rank {r}: {e:?}"))?;
         staging.weights.push(w);
         // Deterministic partial-load fault for testing the cleanup path. Fires
         // AFTER ranks 0..=r loaded; the guard's Drop frees them all.
@@ -4321,10 +4302,9 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
 #[cfg(test)]
 mod registry_tests {
     use super::{
-        admit_load, route_admitted_load_with, resolve_deepseek4_compressor_cache_kv_mode,
+        admit_load, resolve_deepseek4_compressor_cache_kv_mode, route_admitted_load_with,
         AdmissionError, LoadAdmissionError, ModelVariant, RawParallelism, SourceKind, REGISTRY,
     };
-
 
     fn fixture_path(label: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
@@ -4356,16 +4336,12 @@ mod registry_tests {
         file.flush().unwrap();
     }
 
-
     #[test]
     fn admission_boundary_preserves_typed_source_and_policy_errors() {
         let missing = fixture_path("missing");
         let _ = std::fs::remove_file(&missing);
-        let source_error = admit_load(
-            missing.to_str().unwrap(),
-            RawParallelism::new(1, 1, 1),
-        )
-        .unwrap_err();
+        let source_error =
+            admit_load(missing.to_str().unwrap(), RawParallelism::new(1, 1, 1)).unwrap_err();
         assert!(matches!(
             &source_error,
             LoadAdmissionError::SourceOpen { path, .. }
@@ -4449,16 +4425,8 @@ mod registry_tests {
                 RawParallelism::new(2, 1, 1),
                 ModelVariant::Gemma4,
             ),
-            (
-                "gemma",
-                RawParallelism::new(2, 1, 1),
-                ModelVariant::Gemma4,
-            ),
-            (
-                "ep",
-                RawParallelism::new(1, 2, 1),
-                ModelVariant::Qwen35Moe,
-            ),
+            ("gemma", RawParallelism::new(2, 1, 1), ModelVariant::Gemma4),
+            ("ep", RawParallelism::new(1, 2, 1), ModelVariant::Qwen35Moe),
             (
                 "tp",
                 RawParallelism::new(1, 6, 1),

@@ -454,7 +454,9 @@ fn ep_deferred_needs_vmm_preflight(load_tp: usize, model_present: bool) -> bool 
 
 /// Backend-local multi-slot capability checks that consume only the admitted
 /// source/variant/mesh. Raw PP/TP policy remains in loader admission.
-fn validate_multi_slot_admission(admission: &hipfire_loader::LoadAdmission) -> Option<&'static str> {
+fn validate_multi_slot_admission(
+    admission: &hipfire_loader::LoadAdmission,
+) -> Option<&'static str> {
     if admission.mesh.n_devices() != 1 {
         return Some("experimental multi-slot requires a single-device admitted route");
     }
@@ -586,7 +588,6 @@ where
 {
     load(admitted)
 }
-
 
 struct DaemonLoadState<'a> {
     gpu: &'a mut rdna_compute::Gpu,
@@ -720,20 +721,15 @@ mod admission_boundary_tests {
         }
     }
 
-    fn refusal(
-        variant: ModelVariant,
-        raw: RawParallelism,
-    ) -> hipfire_loader::LoadAdmissionError {
-        hipfire_loader::LoadAdmissionError::Admission(
-            hipfire_loader::AdmissionError::Unsupported {
-                source: SourceKind::Hfq,
-                variant,
-                requested: raw,
-                effective: raw,
-                owner: "CAP-001",
-                reason: "test-injected admission refusal",
-            },
-        )
+    fn refusal(variant: ModelVariant, raw: RawParallelism) -> hipfire_loader::LoadAdmissionError {
+        hipfire_loader::LoadAdmissionError::Admission(hipfire_loader::AdmissionError::Unsupported {
+            source: SourceKind::Hfq,
+            variant,
+            requested: raw,
+            effective: raw,
+            owner: "CAP-001",
+            reason: "test-injected admission refusal",
+        })
     }
     fn dense_fixture_path(label: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
@@ -811,8 +807,7 @@ mod admission_boundary_tests {
         let path = dense_fixture_path("multi-slot-shape");
         write_dense_fixture(&path);
         let admitted =
-            admit_load_with_source(path.to_str().unwrap(), RawParallelism::new(2, 1, 1))
-                .unwrap();
+            admit_load_with_source(path.to_str().unwrap(), RawParallelism::new(2, 1, 1)).unwrap();
         std::fs::remove_file(&path).unwrap();
         let mut operations = InjectedLoadOperations {
             prior_owner: true,
@@ -839,8 +834,7 @@ mod admission_boundary_tests {
         let path = dense_fixture_path("downstream-refusal");
         write_dense_fixture(&path);
         let admitted =
-            admit_load_with_source(path.to_str().unwrap(), RawParallelism::new(1, 1, 1))
-                .unwrap();
+            admit_load_with_source(path.to_str().unwrap(), RawParallelism::new(1, 1, 1)).unwrap();
         let removed_path = path.clone();
         let admission_calls = Rc::new(Cell::new(0usize));
         let admission_calls_injected = Rc::clone(&admission_calls);
@@ -868,7 +862,7 @@ mod admission_boundary_tests {
 
         let downstream_calls = Rc::new(Cell::new(0usize));
         let downstream_calls_injected = Rc::clone(&downstream_calls);
-        let result = execute_admitted_load_with(admitted, |admitted| {
+        let result: Result<(), String> = execute_admitted_load_with(admitted, |admitted| {
             downstream_calls_injected.set(downstream_calls_injected.get() + 1);
             assert!(!path.exists(), "downstream source mutation was not applied");
             assert_eq!(admitted.source.arch_id(), Some(5));

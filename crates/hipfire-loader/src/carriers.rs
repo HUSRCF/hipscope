@@ -108,12 +108,9 @@ fn source_config(src: &ModelSource) -> Result<serde_json::Value, String> {
         ModelSource::Hfq(hfq) => hfq.metadata_json.as_str(),
         ModelSource::Dir(source) => source.metadata_json(),
     };
-    let meta: serde_json::Value = serde_json::from_str(metadata)
-        .map_err(|e| format!("invalid source metadata JSON: {e}"))?;
-    Ok(meta
-        .get("config")
-        .cloned()
-        .unwrap_or(meta))
+    let meta: serde_json::Value =
+        serde_json::from_str(metadata).map_err(|e| format!("invalid source metadata JSON: {e}"))?;
+    Ok(meta.get("config").cloned().unwrap_or(meta))
 }
 
 fn config_number(config: &serde_json::Value, key: &str) -> usize {
@@ -2055,9 +2052,9 @@ impl Carrier for Gemma4Carrier {
     fn classify_parallel_variant(&self, src: &ModelSource) -> Result<ModelVariant, String> {
         match src.arch_id() {
             Some(13) => Ok(ModelVariant::Gemma4),
-            Some(22) => Err(
-                "gemma4: arch_id=22 is an EAGLE drafter, not a primary load target".into(),
-            ),
+            Some(22) => {
+                Err("gemma4: arch_id=22 is an EAGLE drafter, not a primary load target".into())
+            }
             Some(other) => Err(format!("gemma4: unexpected source arch_id {other}")),
             None => Err("gemma4: source has no architecture id".into()),
         }
@@ -2755,7 +2752,8 @@ mod qwen35_classification_tests {
         file.write_all(b"HFQM").unwrap();
         file.write_all(&1u32.to_le_bytes()).unwrap();
         file.write_all(&arch_id.to_le_bytes()).unwrap();
-        file.write_all(&(tensors.len() as u32).to_le_bytes()).unwrap();
+        file.write_all(&(tensors.len() as u32).to_le_bytes())
+            .unwrap();
         file.write_all(&metadata_offset.to_le_bytes()).unwrap();
         file.write_all(&data_offset.to_le_bytes()).unwrap();
         file.write_all(metadata).unwrap();

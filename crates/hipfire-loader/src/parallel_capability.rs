@@ -171,10 +171,7 @@ pub enum CellPolicy {
 pub enum AdmissionError {
     /// A requested axis has degree zero. The first zero in PP, TP, EP order
     /// wins so diagnostics are deterministic for an all-zero request.
-    InvalidDegree {
-        axis: ParallelAxis,
-        degree: usize,
-    },
+    InvalidDegree { axis: ParallelAxis, degree: usize },
     /// The effective parallel shape could not be represented by the device
     /// mesh without losing cardinality information.
     Topology {
@@ -441,8 +438,9 @@ fn current_degree_error(
         {
             Some("Qwen3.5 dense TP currently supports degrees 2..=5")
         }
-        (SourceKind::Hfq, ModelVariant::Qwen35Moe, ParallelAxis::Ep)
-            if effective.ep != 4 => Some("Qwen3.5 MoE EP currently requires degree 4"),
+        (SourceKind::Hfq, ModelVariant::Qwen35Moe, ParallelAxis::Ep) if effective.ep != 4 => {
+            Some("Qwen3.5 MoE EP currently requires degree 4")
+        }
         _ => None,
     }
 }
@@ -481,104 +479,263 @@ pub fn cell_info(source: SourceKind, variant: ModelVariant, axis: ParallelAxis) 
         // LLaMA-family carriers are single-device in the current upstream
         // loader. Dense EP is a deliberate canonicalization to that route.
         (_, LlamaQkNorm, Single) => Admitted,
-        (_, LlamaQkNorm, Pp) => Unsupported { owner: "CAP-001", reason: "LLaMA PP has no current loader route" },
-        (_, LlamaQkNorm, Tp) => Unsupported { owner: "CAP-001", reason: "LLaMA TP has no current loader route" },
+        (_, LlamaQkNorm, Pp) => Unsupported {
+            owner: "CAP-001",
+            reason: "LLaMA PP has no current loader route",
+        },
+        (_, LlamaQkNorm, Tp) => Unsupported {
+            owner: "CAP-001",
+            reason: "LLaMA TP has no current loader route",
+        },
         (_, LlamaQkNorm, Ep) => NormalizeToSingle,
         (_, LlamaNoQkNorm, Single) => Admitted,
-        (_, LlamaNoQkNorm, Pp) => Unsupported { owner: "CAP-001", reason: "LLaMA PP has no current loader route" },
-        (_, LlamaNoQkNorm, Tp) => Unsupported { owner: "CAP-001", reason: "non-QK-norm LLaMA TP has no current loader route" },
+        (_, LlamaNoQkNorm, Pp) => Unsupported {
+            owner: "CAP-001",
+            reason: "LLaMA PP has no current loader route",
+        },
+        (_, LlamaNoQkNorm, Tp) => Unsupported {
+            owner: "CAP-001",
+            reason: "non-QK-norm LLaMA TP has no current loader route",
+        },
         (_, LlamaNoQkNorm, Ep) => NormalizeToSingle,
         (_, PlainQwen3, Single) => Admitted,
-        (_, PlainQwen3, Pp) => Unsupported { owner: "CAP-001", reason: "plain Qwen3 PP has no current loader route" },
-        (_, PlainQwen3, Tp) => Unsupported { owner: "CAP-001", reason: "plain Qwen3 TP has no current loader route" },
+        (_, PlainQwen3, Pp) => Unsupported {
+            owner: "CAP-001",
+            reason: "plain Qwen3 PP has no current loader route",
+        },
+        (_, PlainQwen3, Tp) => Unsupported {
+            owner: "CAP-001",
+            reason: "plain Qwen3 TP has no current loader route",
+        },
         (_, PlainQwen3, Ep) => NormalizeToSingle,
 
         // Qwen3.5 PP is an HFQ-only current route. The carrier's PP branch
         // intentionally skips the vision tower, so VL must refuse here.
         (_, Qwen35Dense, Single) => Admitted,
         (Hfq, Qwen35Dense, Pp) => Admitted,
-        (SafetensorsDir, Qwen35Dense, Pp) => Unsupported { owner: "CAP-001", reason: "Qwen3.5 safetensors PP has no current loader route" },
+        (SafetensorsDir, Qwen35Dense, Pp) => Unsupported {
+            owner: "CAP-001",
+            reason: "Qwen3.5 safetensors PP has no current loader route",
+        },
         (Hfq, Qwen35Dense, Tp) => Admitted,
-        (SafetensorsDir, Qwen35Dense, Tp) => Unsupported { owner: "CAP-001", reason: "Qwen3.5 safetensors TP has no current loader route" },
+        (SafetensorsDir, Qwen35Dense, Tp) => Unsupported {
+            owner: "CAP-001",
+            reason: "Qwen3.5 safetensors TP has no current loader route",
+        },
         (_, Qwen35Dense, Ep) => NormalizeToSingle,
         (_, Qwen35Moe, Single) => Admitted,
         (Hfq, Qwen35Moe, Pp) => Admitted,
-        (SafetensorsDir, Qwen35Moe, Pp) => Unsupported { owner: "CAP-001", reason: "Qwen3.5 MoE safetensors PP has no current loader route" },
-        (_, Qwen35Moe, Tp) => Unsupported { owner: "CAP-001", reason: "Qwen3.5 MoE TP has no current loader route" },
+        (SafetensorsDir, Qwen35Moe, Pp) => Unsupported {
+            owner: "CAP-001",
+            reason: "Qwen3.5 MoE safetensors PP has no current loader route",
+        },
+        (_, Qwen35Moe, Tp) => Unsupported {
+            owner: "CAP-001",
+            reason: "Qwen3.5 MoE TP has no current loader route",
+        },
         (Hfq, Qwen35Moe, Ep) => Admitted,
-        (SafetensorsDir, Qwen35Moe, Ep) => Unsupported { owner: "CAP-001", reason: "Qwen3.5 MoE safetensors EP has no current loader route" },
+        (SafetensorsDir, Qwen35Moe, Ep) => Unsupported {
+            owner: "CAP-001",
+            reason: "Qwen3.5 MoE safetensors EP has no current loader route",
+        },
         (Hfq, Qwen35DenseVl, Single) => Admitted,
-        (SafetensorsDir, Qwen35DenseVl, Single) => Unsupported { owner: "CAP-001", reason: "Qwen3.5 dense-VL safetensors vision load has no current route" },
-        (_, Qwen35DenseVl, Pp) => Unsupported { owner: "CAP-001", reason: "Qwen3.5 dense-VL PP would skip the vision tower" },
-        (_, Qwen35DenseVl, Tp) => Unsupported { owner: "CAP-001", reason: "Qwen3.5 dense-VL TP has no current loader route" },
+        (SafetensorsDir, Qwen35DenseVl, Single) => Unsupported {
+            owner: "CAP-001",
+            reason: "Qwen3.5 dense-VL safetensors vision load has no current route",
+        },
+        (_, Qwen35DenseVl, Pp) => Unsupported {
+            owner: "CAP-001",
+            reason: "Qwen3.5 dense-VL PP would skip the vision tower",
+        },
+        (_, Qwen35DenseVl, Tp) => Unsupported {
+            owner: "CAP-001",
+            reason: "Qwen3.5 dense-VL TP has no current loader route",
+        },
         (Hfq, Qwen35DenseVl, Ep) => NormalizeToSingle,
-        (SafetensorsDir, Qwen35DenseVl, Ep) => Unsupported { owner: "CAP-001", reason: "Qwen3.5 dense-VL safetensors vision load has no current route" },
+        (SafetensorsDir, Qwen35DenseVl, Ep) => Unsupported {
+            owner: "CAP-001",
+            reason: "Qwen3.5 dense-VL safetensors vision load has no current route",
+        },
         (Hfq, Qwen35MoeVl, Single) => Admitted,
-        (SafetensorsDir, Qwen35MoeVl, Single) => Unsupported { owner: "CAP-001", reason: "Qwen3.5 MoE-VL safetensors vision load has no current route" },
-        (_, Qwen35MoeVl, Pp) => Unsupported { owner: "CAP-001", reason: "Qwen3.5 MoE-VL PP would skip the vision tower" },
-        (_, Qwen35MoeVl, Tp) => Unsupported { owner: "CAP-001", reason: "Qwen3.5 MoE-VL TP has no current loader route" },
-        (_, Qwen35MoeVl, Ep) => Unsupported { owner: "CAP-001", reason: "Qwen3.5 MoE-VL EP has no current loader route" },
+        (SafetensorsDir, Qwen35MoeVl, Single) => Unsupported {
+            owner: "CAP-001",
+            reason: "Qwen3.5 MoE-VL safetensors vision load has no current route",
+        },
+        (_, Qwen35MoeVl, Pp) => Unsupported {
+            owner: "CAP-001",
+            reason: "Qwen3.5 MoE-VL PP would skip the vision tower",
+        },
+        (_, Qwen35MoeVl, Tp) => Unsupported {
+            owner: "CAP-001",
+            reason: "Qwen3.5 MoE-VL TP has no current loader route",
+        },
+        (_, Qwen35MoeVl, Ep) => Unsupported {
+            owner: "CAP-001",
+            reason: "Qwen3.5 MoE-VL EP has no current loader route",
+        },
 
         // Standalone dense/VL carriers have executable Single routes only.
         (_, Qwen2, Single) => Admitted,
-        (_, Qwen2, Pp) => Unsupported { owner: "CAP-001", reason: "Qwen2 PP has no current loader route" },
-        (_, Qwen2, Tp) => Unsupported { owner: "CAP-001", reason: "Qwen2 TP has no current loader route" },
+        (_, Qwen2, Pp) => Unsupported {
+            owner: "CAP-001",
+            reason: "Qwen2 PP has no current loader route",
+        },
+        (_, Qwen2, Tp) => Unsupported {
+            owner: "CAP-001",
+            reason: "Qwen2 TP has no current loader route",
+        },
         (_, Qwen2, Ep) => NormalizeToSingle,
         (_, DotsOcr, Single) => Admitted,
-        (_, DotsOcr, Pp) => Unsupported { owner: "CAP-001", reason: "dots.ocr PP has no current loader route" },
-        (_, DotsOcr, Tp) => Unsupported { owner: "CAP-001", reason: "dots.ocr TP has no current loader route" },
+        (_, DotsOcr, Pp) => Unsupported {
+            owner: "CAP-001",
+            reason: "dots.ocr PP has no current loader route",
+        },
+        (_, DotsOcr, Tp) => Unsupported {
+            owner: "CAP-001",
+            reason: "dots.ocr TP has no current loader route",
+        },
         (_, DotsOcr, Ep) => NormalizeToSingle,
 
         // DeepSeek4/MiniMax EP constructors reopen HFQ per rank. Their
         // compatibility spelling is handled above; directories refuse before
         // that constructor can bind devices.
         (_, Deepseek4, Single) => Admitted,
-        (_, Deepseek4, Pp) => Unsupported { owner: "CAP-001", reason: "DeepSeek4 PP has no current loader route" },
-        (_, Deepseek4, Tp) => Unsupported { owner: "CAP-001", reason: "DeepSeek4 TP has no current loader route" },
+        (_, Deepseek4, Pp) => Unsupported {
+            owner: "CAP-001",
+            reason: "DeepSeek4 PP has no current loader route",
+        },
+        (_, Deepseek4, Tp) => Unsupported {
+            owner: "CAP-001",
+            reason: "DeepSeek4 TP has no current loader route",
+        },
         (Hfq, Deepseek4, Ep) => Admitted,
-        (SafetensorsDir, Deepseek4, Ep) => Unsupported { owner: "CAP-001", reason: "DeepSeek4 safetensors EP has no current loader route" },
+        (SafetensorsDir, Deepseek4, Ep) => Unsupported {
+            owner: "CAP-001",
+            reason: "DeepSeek4 safetensors EP has no current loader route",
+        },
         (_, Minimax, Single) => Admitted,
-        (_, Minimax, Pp) => Unsupported { owner: "CAP-001", reason: "MiniMax PP has no current loader route" },
-        (_, Minimax, Tp) => Unsupported { owner: "CAP-001", reason: "MiniMax TP has no current loader route" },
+        (_, Minimax, Pp) => Unsupported {
+            owner: "CAP-001",
+            reason: "MiniMax PP has no current loader route",
+        },
+        (_, Minimax, Tp) => Unsupported {
+            owner: "CAP-001",
+            reason: "MiniMax TP has no current loader route",
+        },
         (Hfq, Minimax, Ep) => Admitted,
-        (SafetensorsDir, Minimax, Ep) => Unsupported { owner: "CAP-001", reason: "MiniMax safetensors EP has no current loader route" },
+        (SafetensorsDir, Minimax, Ep) => Unsupported {
+            owner: "CAP-001",
+            reason: "MiniMax safetensors EP has no current loader route",
+        },
 
         // LFM2's current carrier executes dense and MoE Single. VL is HFQ
         // only because the directory branch currently loads text only.
         (_, Lfm2Dense, Single) => Admitted,
-        (_, Lfm2Dense, Pp) => Unsupported { owner: "CAP-001", reason: "LFM2 dense PP has no current loader route" },
-        (_, Lfm2Dense, Tp) => Unsupported { owner: "CAP-001", reason: "LFM2 dense TP has no current loader route" },
+        (_, Lfm2Dense, Pp) => Unsupported {
+            owner: "CAP-001",
+            reason: "LFM2 dense PP has no current loader route",
+        },
+        (_, Lfm2Dense, Tp) => Unsupported {
+            owner: "CAP-001",
+            reason: "LFM2 dense TP has no current loader route",
+        },
         (_, Lfm2Dense, Ep) => NormalizeToSingle,
         (_, Lfm2Moe, Single) => Admitted,
-        (_, Lfm2Moe, Pp) => Unsupported { owner: "CAP-001", reason: "LFM2 MoE PP has no current loader route" },
-        (_, Lfm2Moe, Tp) => Unsupported { owner: "CAP-001", reason: "LFM2 MoE TP has no current loader route" },
-        (_, Lfm2Moe, Ep) => Unsupported { owner: "CAP-001", reason: "LFM2 MoE EP has no current loader route" },
+        (_, Lfm2Moe, Pp) => Unsupported {
+            owner: "CAP-001",
+            reason: "LFM2 MoE PP has no current loader route",
+        },
+        (_, Lfm2Moe, Tp) => Unsupported {
+            owner: "CAP-001",
+            reason: "LFM2 MoE TP has no current loader route",
+        },
+        (_, Lfm2Moe, Ep) => Unsupported {
+            owner: "CAP-001",
+            reason: "LFM2 MoE EP has no current loader route",
+        },
         (Hfq, Lfm2Vl, Single) => Admitted,
-        (SafetensorsDir, Lfm2Vl, Single) => Unsupported { owner: "CAP-001", reason: "LFM2-VL safetensors vision load has no current route" },
-        (_, Lfm2Vl, Pp) => Unsupported { owner: "CAP-001", reason: "LFM2-VL PP has no current loader route" },
-        (_, Lfm2Vl, Tp) => Unsupported { owner: "CAP-001", reason: "LFM2-VL TP has no current loader route" },
+        (SafetensorsDir, Lfm2Vl, Single) => Unsupported {
+            owner: "CAP-001",
+            reason: "LFM2-VL safetensors vision load has no current route",
+        },
+        (_, Lfm2Vl, Pp) => Unsupported {
+            owner: "CAP-001",
+            reason: "LFM2-VL PP has no current loader route",
+        },
+        (_, Lfm2Vl, Tp) => Unsupported {
+            owner: "CAP-001",
+            reason: "LFM2-VL TP has no current loader route",
+        },
         (Hfq, Lfm2Vl, Ep) => NormalizeToSingle,
-        (SafetensorsDir, Lfm2Vl, Ep) => Unsupported { owner: "CAP-001", reason: "LFM2-VL safetensors vision load has no current route" },
+        (SafetensorsDir, Lfm2Vl, Ep) => Unsupported {
+            owner: "CAP-001",
+            reason: "LFM2-VL safetensors vision load has no current route",
+        },
 
         (_, Cohere2Moe, Single) => Admitted,
-        (_, Cohere2Moe, Pp) => Unsupported { owner: "CAP-001", reason: "Cohere2-MoE PP has no current loader route" },
-        (_, Cohere2Moe, Tp) => Unsupported { owner: "CAP-001", reason: "Cohere2-MoE TP has no current loader route" },
-        (_, Cohere2Moe, Ep) => Unsupported { owner: "CAP-001", reason: "Cohere2-MoE EP has no current loader route" },
+        (_, Cohere2Moe, Pp) => Unsupported {
+            owner: "CAP-001",
+            reason: "Cohere2-MoE PP has no current loader route",
+        },
+        (_, Cohere2Moe, Tp) => Unsupported {
+            owner: "CAP-001",
+            reason: "Cohere2-MoE TP has no current loader route",
+        },
+        (_, Cohere2Moe, Ep) => Unsupported {
+            owner: "CAP-001",
+            reason: "Cohere2-MoE EP has no current loader route",
+        },
         (Hfq, Maple, Single) => Admitted,
-        (SafetensorsDir, Maple, Single) => Unsupported { owner: "CAP-001", reason: "Maple safetensors load is unsupported; convert to HFQ" },
-        (_, Maple, Pp) => Unsupported { owner: "CAP-001", reason: "Maple PP has no current loader route" },
-        (_, Maple, Tp) => Unsupported { owner: "CAP-001", reason: "Maple TP has no current loader route" },
-        (_, Maple, Ep) => Unsupported { owner: "CAP-001", reason: "Maple EP has no current loader route" },
+        (SafetensorsDir, Maple, Single) => Unsupported {
+            owner: "CAP-001",
+            reason: "Maple safetensors load is unsupported; convert to HFQ",
+        },
+        (_, Maple, Pp) => Unsupported {
+            owner: "CAP-001",
+            reason: "Maple PP has no current loader route",
+        },
+        (_, Maple, Tp) => Unsupported {
+            owner: "CAP-001",
+            reason: "Maple TP has no current loader route",
+        },
+        (_, Maple, Ep) => Unsupported {
+            owner: "CAP-001",
+            reason: "Maple EP has no current loader route",
+        },
         (Hfq, Gemma4, Single) => Admitted,
-        (SafetensorsDir, Gemma4, Single) => Unsupported { owner: "CAP-001", reason: "Gemma4 safetensors load is not wired" },
-        (_, Gemma4, Pp) => Unsupported { owner: "CAP-001", reason: "Gemma4 PP has no current loader route" },
-        (_, Gemma4, Tp) => Unsupported { owner: "CAP-001", reason: "Gemma4 TP has no current loader route" },
-        (_, Gemma4, Ep) => Unsupported { owner: "CAP-001", reason: "Gemma4 EP has no current loader route" },
+        (SafetensorsDir, Gemma4, Single) => Unsupported {
+            owner: "CAP-001",
+            reason: "Gemma4 safetensors load is not wired",
+        },
+        (_, Gemma4, Pp) => Unsupported {
+            owner: "CAP-001",
+            reason: "Gemma4 PP has no current loader route",
+        },
+        (_, Gemma4, Tp) => Unsupported {
+            owner: "CAP-001",
+            reason: "Gemma4 TP has no current loader route",
+        },
+        (_, Gemma4, Ep) => Unsupported {
+            owner: "CAP-001",
+            reason: "Gemma4 EP has no current loader route",
+        },
         (Hfq, MuseGlimmer, Single) => Admitted,
-        (SafetensorsDir, MuseGlimmer, Single) => Unsupported { owner: "CAP-001", reason: "Muse Glimmer safetensors load is not wired" },
-        (_, MuseGlimmer, Pp) => Unsupported { owner: "CAP-001", reason: "Muse Glimmer PP has no current loader route" },
-        (_, MuseGlimmer, Tp) => Unsupported { owner: "CAP-001", reason: "Muse Glimmer TP has no current loader route" },
-        (_, MuseGlimmer, Ep) => Unsupported { owner: "CAP-001", reason: "Muse Glimmer EP has no current loader route" },
+        (SafetensorsDir, MuseGlimmer, Single) => Unsupported {
+            owner: "CAP-001",
+            reason: "Muse Glimmer safetensors load is not wired",
+        },
+        (_, MuseGlimmer, Pp) => Unsupported {
+            owner: "CAP-001",
+            reason: "Muse Glimmer PP has no current loader route",
+        },
+        (_, MuseGlimmer, Tp) => Unsupported {
+            owner: "CAP-001",
+            reason: "Muse Glimmer TP has no current loader route",
+        },
+        (_, MuseGlimmer, Ep) => Unsupported {
+            owner: "CAP-001",
+            reason: "Muse Glimmer EP has no current loader route",
+        },
     }
 }
 
@@ -672,29 +829,15 @@ mod tests {
             CellPolicy::NormalizeToSingle
         );
         assert!(matches!(
-            cell_info(
-                SourceKind::Hfq,
-                ModelVariant::Qwen35MoeVl,
-                ParallelAxis::Ep
-            ),
+            cell_info(SourceKind::Hfq, ModelVariant::Qwen35MoeVl, ParallelAxis::Ep),
             CellPolicy::Unsupported { .. }
         ));
 
-        let dense = resolve(
-            SourceKind::Hfq,
-            ModelVariant::Qwen35DenseVl,
-            req(1, 1, 4),
-        )
-        .unwrap();
+        let dense = resolve(SourceKind::Hfq, ModelVariant::Qwen35DenseVl, req(1, 1, 4)).unwrap();
         assert_eq!(dense.n_devices(), 1);
         assert!(!dense.has_axis(DimKind::Ep));
 
-        let moe = resolve(
-            SourceKind::Hfq,
-            ModelVariant::Qwen35MoeVl,
-            req(1, 1, 4),
-        )
-        .unwrap_err();
+        let moe = resolve(SourceKind::Hfq, ModelVariant::Qwen35MoeVl, req(1, 1, 4)).unwrap_err();
         assert!(moe.reason().contains("MoE-VL EP"));
     }
 
@@ -711,9 +854,21 @@ mod tests {
         ));
 
         let err = resolve(SourceKind::Hfq, ModelVariant::Qwen35Moe, req(2, 0, 2)).unwrap_err();
-        assert!(matches!(err, AdmissionError::InvalidDegree { axis: ParallelAxis::Tp, .. }));
+        assert!(matches!(
+            err,
+            AdmissionError::InvalidDegree {
+                axis: ParallelAxis::Tp,
+                ..
+            }
+        ));
         let err = resolve(SourceKind::Hfq, ModelVariant::Qwen35Moe, req(2, 2, 0)).unwrap_err();
-        assert!(matches!(err, AdmissionError::InvalidDegree { axis: ParallelAxis::Ep, .. }));
+        assert!(matches!(
+            err,
+            AdmissionError::InvalidDegree {
+                axis: ParallelAxis::Ep,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -744,7 +899,12 @@ mod tests {
         assert!(!mesh.has_axis(DimKind::Ep));
         assert_eq!(mesh.axes(), &[]);
 
-        let mesh = resolve(SourceKind::SafetensorsDir, ModelVariant::Lfm2Dense, req(1, 1, 2)).unwrap();
+        let mesh = resolve(
+            SourceKind::SafetensorsDir,
+            ModelVariant::Lfm2Dense,
+            req(1, 1, 2),
+        )
+        .unwrap();
         assert_eq!(mesh.n_devices(), 1);
         assert_eq!(mesh.axes(), &[]);
     }
@@ -761,7 +921,12 @@ mod tests {
 
     #[test]
     fn unsupported_source_refuses_without_mesh_or_executor() {
-        let err = resolve(SourceKind::SafetensorsDir, ModelVariant::Deepseek4, req(1, 1, 2)).unwrap_err();
+        let err = resolve(
+            SourceKind::SafetensorsDir,
+            ModelVariant::Deepseek4,
+            req(1, 1, 2),
+        )
+        .unwrap_err();
         assert_eq!(err.code(), "CAP-001");
         assert_eq!(err.source(), Some(SourceKind::SafetensorsDir));
         assert_eq!(err.variant(), Some(ModelVariant::Deepseek4));

@@ -1340,14 +1340,8 @@ mod tests {
     fn load_caps_keeps_topology_in_loader_admission() {
         // PP/TP are source- and variant-aware policy decisions owned by the
         // loader admission boundary, not this backend-local knob validator.
-        assert_eq!(
-            validate_load_caps(&json!({"params": {"tp": 2}})),
-            None
-        );
-        assert_eq!(
-            validate_load_caps(&json!({"params": {"pp": 2}})),
-            None
-        );
+        assert_eq!(validate_load_caps(&json!({"params": {"tp": 2}})), None);
+        assert_eq!(validate_load_caps(&json!({"params": {"pp": 2}})), None);
         let m = json!({"params": {"continuous_batch_size": 2}});
         assert!(validate_load_caps(&m).is_some());
         let m4 = json!({"params": {"draft": "some.hfq"}});

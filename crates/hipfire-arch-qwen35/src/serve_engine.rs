@@ -129,17 +129,11 @@ impl SlotEngine {
     ///
     /// The worker consumes this source directly; it does not reopen the model
     /// path after daemon teardown.
-    pub fn spawn_with_source(
-        cfg: EngineConfig,
-        source: ModelSource,
-    ) -> Result<SlotEngine, String> {
+    pub fn spawn_with_source(cfg: EngineConfig, source: ModelSource) -> Result<SlotEngine, String> {
         Self::spawn_inner(cfg, Some(source))
     }
 
-    fn spawn_inner(
-        cfg: EngineConfig,
-        source: Option<ModelSource>,
-    ) -> Result<SlotEngine, String> {
+    fn spawn_inner(cfg: EngineConfig, source: Option<ModelSource>) -> Result<SlotEngine, String> {
         let (tx, rx) = channel::<EngineCommand>();
         let (ready_tx, ready_rx) = channel::<Result<(), String>>();
         let stats = Arc::new(Mutex::new(EngineStats::default()));
@@ -257,10 +251,7 @@ impl Rig {
     /// staging, PBS, scratch, logits/out are all owned after `Qwen35Weights`.
     /// On any `?`/error, all completed stages are freed, weights freed,
     /// caches/graph state invalidated and pool drained, so no VRAM leaks.
-    fn build(
-        cfg: &EngineConfig,
-        source: Option<ModelSource>,
-    ) -> Result<Rig, String> {
+    fn build(cfg: &EngineConfig, source: Option<ModelSource>) -> Result<Rig, String> {
         use hipfire_runtime::hfq::HfqFile;
         use hipfire_runtime::tokenizer::Tokenizer;
         use rdna_compute::kv_slots::preflight_alloc;
