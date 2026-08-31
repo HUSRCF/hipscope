@@ -10,9 +10,9 @@
 
     use hipfire_engine::terminal::{
         activate_terminal_control, apply_terminal_control, await_client_terminal_commit,
-        check_abort, clear_terminal_control, mark_terminal_control_ready, set_active_attempt_id,
-        terminal_control, wait_terminal_control_decision, ClientTerminalDecision,
-        TerminalControlDecision,
+        check_abort, claim_terminal, clear_terminal_control, mark_terminal_control_ready,
+        set_active_attempt_id, terminal_control, wait_terminal_control_decision,
+        ClientTerminalDecision, TerminalControlDecision,
     };
     use std::sync::{Mutex, MutexGuard, OnceLock};
     use std::time::Duration;
@@ -244,5 +244,18 @@
         assert!(!check_abort("same"));
         apply_terminal_control("abort", "same", 2);
         assert!(check_abort("same"));
+        reset();
+    }
+    
+    #[test]
+    fn terminal_claim_is_exactly_once_under_race() {
+        let _lock = begin_test();
+        activate_terminal_control("race", 77);
+        set_active_attempt_id(77);
+        let first = std::thread::spawn(|| claim_terminal("race", 77));
+        let second = std::thread::spawn(|| claim_terminal("race", 77));
+        let claimed = [first.join().unwrap(), second.join().unwrap()];
+        assert_eq!(claimed.iter().filter(|&&value| value).count(), 1);
+        assert_eq!(claimed.iter().filter(|&&value| !value).count(), 1);
         reset();
     }

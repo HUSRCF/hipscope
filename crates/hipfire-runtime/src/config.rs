@@ -99,19 +99,6 @@ pub struct RuntimeConfig {
 /// `HIPFIRE_MTP_K` is present.
 pub const DEFAULT_MTP_K: usize = 3;
 
-/// Resolve the legacy DeepSeek-specific width override over model metadata.
-///
-/// The process snapshot owns environment reads. Explicit `mtp_k` from the load
-/// message wins over the process default everywhere; only the documented
-/// `HIPFIRE_DEEPSEEK4_SPEC_K` compatibility override wins for DeepSeek's
-/// bespoke/spec adapter.
-pub fn deepseek4_spec_k(configured: usize) -> usize {
-    developer_var("HIPFIRE_DEEPSEEK4_SPEC_K")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(configured)
-        .clamp(1, 10)
-}
 
 static CONFIG: OnceLock<RuntimeConfig> = OnceLock::new();
 

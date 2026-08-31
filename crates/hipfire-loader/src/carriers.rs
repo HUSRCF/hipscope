@@ -918,6 +918,9 @@ impl Carrier for LlamaCarrier {
                 dspark_weights,
                 stage_norm,
                 lm_head,
+                true,  // sidecar globals moved out of the target bundle
+                false, // stage_norm aliases assets.weights.output_norm
+                false, // lm_head aliases assets.weights.output
                 block,
                 ctx.max_seq,
                 conf_threshold,
@@ -1301,15 +1304,13 @@ impl Carrier for Deepseek4Carrier {
                 .map_err(|e| format!("deepseek4 DSpark speculator build failed: {e}"))?,
             )
         } else if weights.mtp_layer.is_some() {
-            // Resolve the same model-level value used by generation. The
-            // documented DeepSeek compatibility env may override it, but
-            // generic `HIPFIRE_MTP_K` has already been folded into
-            // `ctx.spec.mtp_k` by the load caller.
-            let max_n = hipfire_runtime::config::deepseek4_spec_k(
-                ctx.spec
-                    .mtp_k
-                    .unwrap_or(hipfire_runtime::config::get().mtp_k),
-            );
+            // The loader resolved generic and DeepSeek-specific precedence
+            // before entering the carrier. Construction consumes that
+            // published value and never reads ambient process state again.
+            let max_n = ctx
+                .spec
+                .mtp_k
+                .unwrap_or(hipfire_runtime::config::DEFAULT_MTP_K);
             let ctx_capacity = config.max_position_embeddings;
             eprintln!("  deepseek4 MTP speculator enabled (in-weights, K={max_n})");
             Some(

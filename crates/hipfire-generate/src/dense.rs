@@ -168,23 +168,24 @@ pub fn ds4_ar_client_abort(
     state: &mut deepseek4::DeepseekV4State,
     completion_tokens: usize,
 ) {
-    *seq_pos = 0;
-    conversation_tokens.clear();
-    asst_turn_cache.clear();
-    state.reset();
-    state.zero_decode_caches(gpu);
-    free_checkpoints(prefill_checkpoints, gpu);
-    free_checkpoints(dflash_checkpoints, gpu);
-    let spec_reset = if let Some(s) = speculator.as_mut() {
-        s.reset(gpu).map_err(|e| format!("spec.reset: {e}"))
-    } else {
+    let mut reset_target = |gpu: &mut rdna_compute::Gpu| {
+        state.reset();
+        state.zero_decode_caches(gpu);
         Ok(())
     };
-    fail_closed_invalidate_graphs_and_replay(gpu);
-    let epilogue = fail_closed_epilogue_after_sync(spec_reset, fail_closed_device_sync(gpu));
-    if epilogue.rolled_back {
-        gpu.replay.begin_replay_observation_window();
-    }
+    let spec = speculator
+        .as_deref_mut()
+        .map(|spec| spec as &mut dyn Speculator);
+    let epilogue = production_fail_closed_rollback_live_with_target(
+        seq_pos,
+        conversation_tokens,
+        prefill_checkpoints,
+        dflash_checkpoints,
+        asst_turn_cache,
+        gpu,
+        &mut reset_target,
+        spec,
+    );
     emit_spec_cancel_after_rollback(stdout, id, completion_tokens, &epilogue);
 }
 
@@ -365,8 +366,9 @@ pub fn generate_deepseek4_spec(
     }
 
     // Model metadata is the single load-message source; the legacy
-    // DeepSeek-specific env override is resolved centrally by runtime config.
-    let spec_k = hipfire_runtime::config::deepseek4_spec_k(m.mtp_k);
+    // DeepSeek's compatibility override is folded into LoadedModel::mtp_k at
+    // load time; generation consumes that immutable per-model value.
+    let spec_k = m.mtp_k;
 
     // Prefix-cache plan (ds4 policy: forced-cold on partial, ring-safety length
     // guard, step-back exact). Pure decision; the GPU teardown is applied below.
@@ -2420,24 +2422,45 @@ pub fn generate_gemma4(
         } else {
             0.0
         };
-        let _ = writeln!(
-            stdout,
-            r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.2},"prefill_tokens":{},"prefill_ms":{},"prefill_tok_s":{:.2},"decode_tok_s":{:.2},"ttft_ms":{:.3},"total_ms":{},"spec":"gemma4_eagle","rounds":{},"tau":{:.3},"draft_len":{},"attempt_id":{}}}"#,
-            id,
-            generated_count,
-            tok_s,
-            prompt_ids.len(),
-            prefill_ms,
-            prefill_tok_s,
-            tok_s,
-            ttft_ms,
-            total_ms,
-            rounds,
-            tau,
-            draft_len,
-            active_attempt_id(),
-        );
-        let _ = stdout.flush();
+        let pending_done = serde_json::json!({
+            "type": "done",
+            "id": id,
+            "tokens": generated_count,
+            "tok_s": (tok_s * 100.0).round() / 100.0,
+            "prefill_tokens": prompt_ids.len(),
+            "prefill_ms": prefill_ms,
+            "prefill_tok_s": (prefill_tok_s * 100.0).round() / 100.0,
+            "decode_tok_s": (tok_s * 100.0).round() / 100.0,
+            "ttft_ms": (ttft_ms * 1000.0).round() / 1000.0,
+            "total_ms": total_ms,
+            "spec": "gemma4_eagle",
+            "rounds": rounds,
+            "tau": (tau * 1000.0).round() / 1000.0,
+            "draft_len": draft_len,
+            "attempt_id": active_attempt_id(),
+        });
+        match await_client_terminal_commit(stdout, id, &pending_done) {
+            ClientTerminalDecision::Commit => {
+                emit_staged_terminal_done(stdout, &pending_done);
+            }
+            ClientTerminalDecision::Abort => {
+                let mut reset_target = |_: &mut rdna_compute::Gpu| {
+                    bundle.state.reset();
+                    Ok(())
+                };
+                let epilogue = production_fail_closed_rollback_live_with_target(
+                    &mut m.seq_pos,
+                    &mut m.conversation_tokens,
+                    &mut m.prefill_checkpoints,
+                    &mut m.dflash_checkpoints,
+                    &mut m.asst_turn_cache,
+                    gpu,
+                    &mut reset_target,
+                    None,
+                );
+                emit_spec_cancel_after_rollback(stdout, id, generated_count, &epilogue);
+            }
+        }
         return;
     }
 
@@ -2548,21 +2571,39 @@ pub fn generate_gemma4(
     };
     let prefill_tok_s = prompt_ids.len() as f64 * 1000.0 / prefill_ms.max(1) as f64;
     let ttft_ms = ttft_ms.unwrap_or(total_ms as f64);
-    let _ = writeln!(
-        stdout,
-        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.2},"prefill_tokens":{},"prefill_ms":{},"prefill_tok_s":{:.2},"decode_tok_s":{:.2},"ttft_ms":{:.3},"total_ms":{},"attempt_id":{}}}"#,
-        id,
-        generated_count,
-        tok_s,
-        prompt_ids.len(),
-        prefill_ms,
-        prefill_tok_s,
-        tok_s,
-        ttft_ms,
-        total_ms,
-        active_attempt_id(),
-    );
-    let _ = stdout.flush();
+    let pending_done = serde_json::json!({
+        "type": "done",
+        "id": id,
+        "tokens": generated_count,
+        "tok_s": (tok_s * 100.0).round() / 100.0,
+        "prefill_tokens": prompt_ids.len(),
+        "prefill_ms": prefill_ms,
+        "prefill_tok_s": (prefill_tok_s * 100.0).round() / 100.0,
+        "decode_tok_s": (tok_s * 100.0).round() / 100.0,
+        "ttft_ms": (ttft_ms * 1000.0).round() / 1000.0,
+        "total_ms": total_ms,
+        "attempt_id": active_attempt_id(),
+    });
+    match await_client_terminal_commit(stdout, id, &pending_done) {
+        ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
+        ClientTerminalDecision::Abort => {
+            let mut reset_target = |_: &mut rdna_compute::Gpu| {
+                bundle.state.reset();
+                Ok(())
+            };
+            let epilogue = production_fail_closed_rollback_live_with_target(
+                &mut m.seq_pos,
+                &mut m.conversation_tokens,
+                &mut m.prefill_checkpoints,
+                &mut m.dflash_checkpoints,
+                &mut m.asst_turn_cache,
+                gpu,
+                &mut reset_target,
+                None,
+            );
+            emit_spec_cancel_after_rollback(stdout, id, generated_count, &epilogue);
+        }
+    }
 }
 /// Muse Glimmer dense text (arch_id=14) eager AR path.
 ///

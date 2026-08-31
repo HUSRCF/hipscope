@@ -908,8 +908,10 @@ pub struct LoadedModel {
     // Shared
     pub tokenizer: Option<hipfire_runtime::tokenizer::Tokenizer>,
     pub seq_pos: usize,
-    pub max_seq: usize,
-    pub physical_cap: usize,
+    /// Persistent model-owned eviction policy and GPU scratch. Reset/abort
+    /// paths deliberately retain this object so its configured budget,
+    /// centers, and activation gate survive across turns. Its eviction counter
+    /// is a lifetime diagnostic, not request-local state.
     pub eviction: Option<Eviction>,
     pub kv_adaptive: Option<hipfire_runtime::kv_adaptive::KvAdaptive>,
     pub conversation_tokens: Vec<u32>,
@@ -1884,16 +1886,19 @@ fn finish_qwen35_load(
                                     ) {
                                         Ok(body) => {
                                             Some(hipfire_runtime::dspark_core::build_dspark_speculator(
-                                            body,
-                                            dspark_weights,
-                                            stage_norm,
-                                            lm_head,
-                                            block,
-                                            physical_cap,
-                                            conf_threshold,
-                                            true, // sampled verify (temp>0) supported
-                                            0.5,
-                                        ))
+                                                body,
+                                                dspark_weights,
+                                                stage_norm,
+                                                lm_head,
+                                                true,  // sidecar globals moved out of the target bundle
+                                                false, // stage_norm aliases assets.weights.output_norm
+                                                false, // lm_head aliases assets.weights.output
+                                                block,
+                                                physical_cap,
+                                                conf_threshold,
+                                                true, // sampled verify (temp>0) supported
+                                                0.5,
+                                            ))
                                         }
                                         Err(e) => {
                                             eprintln!(
@@ -2150,9 +2155,43 @@ fn dflash_lm_head_quant_supported(lm_qt: Option<u8>, gpu_arch: &str) -> bool {
 /// omit it inherit `HIPFIRE_MTP_K` through `RuntimeConfig`, whose default is 3.
 /// Generation consumes `LoadedModel::mtp_k` and never re-resolves this policy.
 pub fn resolve_mtp_k(configured: Option<usize>) -> usize {
-    configured
-        .unwrap_or_else(|| hipfire_runtime::config::get().mtp_k)
-        .clamp(1, 10)
+    resolve_mtp_k_from(configured, hipfire_runtime::config::get().mtp_k)
+}
+
+/// Pure precedence step used by tests and the load-time resolver.
+pub fn resolve_mtp_k_from(configured: Option<usize>, process_default: usize) -> usize {
+    configured.unwrap_or(process_default).clamp(1, 10)
+}
+
+/// Resolve generic MTP-K plus the documented DeepSeek compatibility override
+/// before any carrier allocates a speculator. The returned value is the sole
+/// metadata value consumed by both construction and generation.
+pub fn resolve_mtp_k_for_arch(configured: Option<usize>, arch_id: u32) -> usize {
+    let process_default = hipfire_runtime::config::get().mtp_k;
+    let deepseek_override = (arch_id == 9)
+        .then(|| {
+            hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_SPEC_K")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+        })
+        .flatten();
+    resolve_mtp_k_for_arch_from(configured, arch_id, process_default, deepseek_override)
+}
+
+/// Testable pure form of [`resolve_mtp_k_for_arch`].
+pub fn resolve_mtp_k_for_arch_from(
+    configured: Option<usize>,
+    arch_id: u32,
+    process_default: usize,
+    deepseek_override: Option<usize>,
+) -> usize {
+    if arch_id == 9 {
+        deepseek_override
+            .unwrap_or_else(|| resolve_mtp_k_from(configured, process_default))
+            .clamp(1, 10)
+    } else {
+        resolve_mtp_k_from(configured, process_default)
+    }
 }
 
 /// Load a model from an HFQ file (or safetensors directory). This is the
@@ -2208,6 +2247,11 @@ pub fn load_model_with_kv_backend(
     // ownership is still live so a new model cannot stack on pending VMM state.
     ensure_vmm_ready_for_load(gpu)?;
     let src = ModelSource::from_path(path)?;
+    // Resolve the complete MTP precedence before the carrier constructs any
+    // speculator. This snapshots ambient process policy once and makes the
+    // resulting `SpecLoadCfg` the only source used by construction/generation.
+    let mut spec = spec;
+    spec.mtp_k = Some(resolve_mtp_k_for_arch(spec.mtp_k, src.arch_id().unwrap_or(0)));
     let kv_backend_raw = kv_backend_override.unwrap_or("contiguous");
     let kv_backend: KvBackend = kv_backend_raw.parse().map_err(|err| format!("{err}"))?;
 
@@ -2349,7 +2393,9 @@ pub fn load_model_with_kv_backend(
     }
     // Publish the resolved K exactly once on model metadata. Generation reads
     // this field; it does not re-resolve TOML or ambient environment state.
-    result.mtp_k = resolve_mtp_k(spec.mtp_k);
+    result.mtp_k = spec
+        .mtp_k
+        .unwrap_or(hipfire_runtime::config::DEFAULT_MTP_K);
     // Apply the author-recommended sampling extracted pre-allocation (see above).
     // Do NOT reparse the .hfq metadata here: a post-allocation / pre-capture parse
     // is the gfx12 hipGraph-replay regression root-caused above.
@@ -2390,6 +2436,8 @@ pub fn load_model_with_gemma4_drafter(
         .map_err(|e| format!("gemma4 drafter: {e}"))?;
     ensure_vmm_ready_for_load(gpu)?;
     let src = ModelSource::from_path(path)?;
+    let mut spec = spec;
+    spec.mtp_k = Some(resolve_mtp_k_for_arch(spec.mtp_k, src.arch_id().unwrap_or(0)));
     let kv_backend_raw = kv_backend_override.unwrap_or("contiguous");
     let kv_backend: KvBackend = kv_backend_raw.parse().map_err(|err| format!("{err}"))?;
     let rec_sampling = match &src {
@@ -2473,7 +2521,9 @@ pub fn load_model_with_gemma4_drafter(
     if result.pp > 1 && result.pp_gpus.is_none() {
         return Err("pp>1 LoadedModel missing pp_gpus — carrier bug".into());
     }
-    result.mtp_k = resolve_mtp_k(spec.mtp_k);
+    result.mtp_k = spec
+        .mtp_k
+        .unwrap_or(hipfire_runtime::config::DEFAULT_MTP_K);
     if let Some(rec) = rec_sampling {
         result.rec_temperature = rec.temperature;
         result.rec_top_p = rec.top_p;
@@ -3894,6 +3944,26 @@ mod registry_tests {
         assert_eq!(resolve_mtp_k(Some(7)), 7);
         assert_eq!(resolve_mtp_k(Some(0)), 1);
         assert_eq!(resolve_mtp_k(Some(99)), 10);
+    }
+    #[test]
+    fn mtp_k_precedence_covers_default_env_explicit_and_deepseek() {
+        // `process_default` stands in for the immutable HIPFIRE_MTP_K
+        // snapshot; no ambient environment is read by this pure seam.
+        assert_eq!(super::resolve_mtp_k_from(None, 3), 3);
+        assert_eq!(super::resolve_mtp_k_from(None, 6), 6);
+        assert_eq!(super::resolve_mtp_k_from(Some(7), 6), 7);
+        assert_eq!(
+            super::resolve_mtp_k_for_arch_from(Some(7), 9, 6, Some(4)),
+            4
+        );
+        assert_eq!(
+            super::resolve_mtp_k_for_arch_from(Some(7), 5, 6, Some(4)),
+            7
+        );
+        assert_eq!(
+            super::resolve_mtp_k_for_arch_from(Some(0), 9, 6, None),
+            1
+        );
     }
     #[test]
     fn deepseek4_kv_mode_is_truthful_and_fail_closed() {

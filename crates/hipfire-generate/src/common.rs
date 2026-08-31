@@ -23,6 +23,7 @@ use hipfire_runtime::spec::{
     ClientEvent, EvictRetain, FinishSummary, SpecTarget, Speculator, StopReason,
 };
 use std::io::Write;
+use std::any::Any;
 
 /// Permanently latch a per-request think cap once its numeric budget is hit.
 ///
@@ -436,12 +437,9 @@ pub fn production_fail_closed_rollback(
     fail_closed_reset_target_and_spec(m, gpu, slot, spec)
 }
 
-/// Live-slot form used inside `generate_spec` while `spec` is borrowed from
-/// `m.speculator` and `slot` from the RAII guard — host fields only.
-///
-/// Takes the host counters and checkpoint rings as disjoint reborrows so the
-/// RAII target guard's `&mut m.state` can remain live without aliasing
-/// `LoadedModel`. Same reset ordering as [`production_fail_closed_rollback`].
+/// Live-slot adapter used inside `generate_spec` while the target/spec guards
+/// are borrowed from `LoadedModel`. It supplies the architecture target reset
+/// strategy to the one total live-reset algorithm below.
 pub fn production_fail_closed_rollback_live(
     seq_pos: &mut usize,
     conversation_tokens: &mut Vec<u32>,
@@ -452,6 +450,32 @@ pub fn production_fail_closed_rollback_live(
     slot: &mut dyn SpecTarget,
     spec: &mut dyn Speculator,
 ) -> RollbackEpilogue {
+    let mut reset_target = |gpu: &mut rdna_compute::Gpu| slot.reset_recurrent(gpu);
+    production_fail_closed_rollback_live_with_target(
+        seq_pos,
+        conversation_tokens,
+        prefill_checkpoints,
+        dflash_checkpoints,
+        asst_turn_cache,
+        gpu,
+        &mut reset_target,
+        Some(spec),
+    )
+}
+
+/// Total live-reset algorithm. Callers that hold disjoint architecture
+/// borrows provide a thin `target_reset` adapter; every host/checkpoint/spec/
+/// graph/synchronization step remains centralized here.
+pub fn production_fail_closed_rollback_live_with_target(
+    seq_pos: &mut usize,
+    conversation_tokens: &mut Vec<u32>,
+    prefill_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    dflash_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    asst_turn_cache: &mut hipfire_loader::AsstTurnCache,
+    gpu: &mut rdna_compute::Gpu,
+    target_reset: &mut dyn FnMut(&mut rdna_compute::Gpu) -> Result<(), String>,
+    spec: Option<&mut dyn Speculator>,
+) -> RollbackEpilogue {
     *seq_pos = 0;
     conversation_tokens.clear();
     asst_turn_cache.clear();
@@ -459,11 +483,13 @@ pub fn production_fail_closed_rollback_live(
     free_checkpoints(prefill_checkpoints, gpu);
     free_checkpoints(dflash_checkpoints, gpu);
     let mut first_err: Option<String> = None;
-    if let Err(e) = slot.reset_recurrent(gpu) {
+    if let Err(e) = target_reset(gpu) {
         push_reset_err(&mut first_err, "reset_recurrent", e);
     }
-    if let Err(e) = spec.reset(gpu) {
-        push_reset_err(&mut first_err, "spec.reset", e);
+    if let Some(spec) = spec {
+        if let Err(e) = spec.reset(gpu) {
+            push_reset_err(&mut first_err, "spec.reset", e);
+        }
     }
     fail_closed_invalidate_graphs_and_replay(gpu);
     let prior = match first_err {
@@ -895,14 +921,20 @@ pub fn reset_qwen35_recurrent(
         }
         return Ok(());
     }
-
-    let Some(bundle) = m.qwen35_mut() else {
+    let (state, pp_gpus, layer_owner_map) = (
+        &mut m.state,
+        &mut m.pp_gpus,
+        &m.pp_dn_la_to_device,
+    );
+    let Some(bundle) = state.as_deref_mut().and_then(|state| {
+        (state as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
+    }) else {
         return Err("qwen35 pipeline reset: model state is not qwen35".into());
     };
-    let Some(gpus) = m.pp_gpus.as_mut() else {
+    let Some(gpus) = pp_gpus.as_mut() else {
         return Err("qwen35 pipeline reset: pp_gpus is missing".into());
     };
-    let Some(la) = m.pp_dn_la_to_device.as_ref() else {
+    let Some(la) = layer_owner_map.as_ref() else {
         return Err("qwen35 pipeline reset: layer-owner map is missing".into());
     };
 
@@ -1300,10 +1332,12 @@ pub fn fail_closed_reset_target_and_spec(
         }
     }
 
-    // Adaptive KV is model-owned policy with request-local tier/cursor state.
-    // Reset its cache encoding without dropping the persistent policy object.
-    if let Some(adaptive) = m.kv_adaptive.as_mut() {
-        if let Some(kv) = m.as_arch_model_mut().and_then(|model| model.kv_cache_mut()) {
+    let (kv_adaptive, state) = (&mut m.kv_adaptive, &mut m.state);
+    if let Some(adaptive) = kv_adaptive.as_mut() {
+        if let Some(kv) = state
+            .as_deref_mut()
+            .and_then(|model| model.kv_cache_mut())
+        {
             adaptive.reset_with_cache(gpu, kv);
         } else {
             adaptive.reset();

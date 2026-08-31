@@ -97,6 +97,27 @@ pub struct Qwen3DrafterAssets {
     /// Block-parallel prefill scratch (block_size tokens × dim).
     pub pbs: PrefillBatchScratch,
 }
+impl Qwen3DrafterAssets {
+    /// Release every allocation owned by the drafter asset bundle.
+    ///
+    /// The body-construction path can fail after the sidecar has already
+    /// published all of these resources, so teardown lives on the asset owner
+    /// rather than being duplicated in each caller.
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        let Self {
+            config: _,
+            weights,
+            kv,
+            scratch,
+            pbs,
+        } = self;
+        weights.free_gpu(gpu);
+        let _ = kv.free_gpu(gpu);
+        scratch.free_gpu(gpu);
+        pbs.free_gpu(gpu);
+    }
+}
+
 struct DsparkLoadStaging {
     layers: Vec<LayerWeights>,
     token_embd: Option<GpuTensor>,
@@ -1383,17 +1404,7 @@ impl DsparkBody for Qwen3DsparkBody {
 
     fn free(self: Box<Self>, gpu: &mut Gpu) {
         self.scratch.free_gpu(gpu);
-        let Qwen3DrafterAssets {
-            config: _,
-            weights,
-            kv,
-            scratch,
-            pbs,
-        } = self.assets;
-        weights.free_gpu(gpu);
-        let _ = kv.free_gpu(gpu);
-        scratch.free_gpu(gpu);
-        pbs.free_gpu(gpu);
+        self.assets.free_gpu(gpu);
     }
 }
 

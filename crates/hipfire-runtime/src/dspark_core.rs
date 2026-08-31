@@ -1135,12 +1135,17 @@ fn upload_f32(gpu: &mut Gpu, v: &[f32]) -> Result<GpuTensor, String> {
 /// `capture_seed_main_hidden` entirely.
 pub struct DsparkDrafter {
     body: Box<dyn DsparkBody>,
+    /// DSpark sidecar globals. Ownership is explicit because some target
+    /// adapters pass shallow aliases while others transfer the sidecar out of
+    /// the target bundle.
     weights: DsparkWeights,
+    owns_weights: bool,
     /// Per-stage final norm fed to [`run_heads`].
     stage_norm: GpuTensor,
+    owns_stage_norm: bool,
     /// lm-head weight fed to [`run_heads`].
     lm_head: GpuTensor,
-    conf_threshold: f32,
+    owns_lm_head: bool,
     block: usize,
     ctx_capacity: usize,
     /// Whether the target supports distribution-preserving sampled verify
@@ -1718,16 +1723,41 @@ impl MtpDrafter for DsparkDrafter {
     }
 
     fn mtp_free(self: Box<Self>, gpu: &mut Gpu) {
-        if let Some(dev) = self.main_hidden_dev {
+        let DsparkDrafter {
+            body,
+            weights,
+            owns_weights,
+            stage_norm,
+            owns_stage_norm,
+            lm_head,
+            owns_lm_head,
+            main_hidden_dev,
+            verify_capture_dev,
+            verify_scratch,
+            ..
+        } = *self;
+        if let Some(dev) = main_hidden_dev {
             let _ = gpu.free_tensor(dev);
         }
-        if let Some(dev) = self.verify_capture_dev {
+        if let Some(dev) = verify_capture_dev {
             let _ = gpu.free_tensor(dev);
         }
-        if let Some(scratch) = self.verify_scratch {
+        if let Some(scratch) = verify_scratch {
             scratch.free(gpu);
         }
-        self.body.free(gpu);
+        // The body owns any aliased stage norm/lm-head buffers. Free these
+        // explicit transfer owners only when the builder says they are
+        // independent allocations.
+        if owns_stage_norm {
+            let _ = gpu.free_tensor(stage_norm);
+        }
+        if owns_lm_head {
+            let _ = gpu.free_tensor(lm_head);
+        }
+        body.free(gpu);
+        if owns_weights {
+            weights.free_gpu(gpu);
+        }
     }
 
     fn k(&self) -> usize {
@@ -1772,6 +1802,9 @@ pub fn build_dspark_speculator(
     weights: DsparkWeights,
     stage_norm: GpuTensor,
     lm_head: GpuTensor,
+    owns_weights: bool,
+    owns_stage_norm: bool,
+    owns_lm_head: bool,
     block: usize,
     ctx_capacity: usize,
     conf_threshold: f32,
@@ -1801,8 +1834,11 @@ pub fn build_dspark_speculator(
     Box::new(MtpSpeculator::new(DsparkDrafter {
         body,
         weights,
+        owns_weights,
         stage_norm,
+        owns_stage_norm,
         lm_head,
+        owns_lm_head,
         conf_threshold,
         supports_temp,
         temp: 0.0,

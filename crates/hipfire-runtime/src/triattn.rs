@@ -849,7 +849,9 @@ pub struct EvictionCtx {
     pub k_compact: GpuTensor,
     pub v_compact: GpuTensor,
     pub retain_dev: GpuTensor,
-    /// Running count of evictions fired (useful for bench harnesses).
+    /// Running count of evictions fired (useful for bench harnesses). This is
+    /// intentionally model-lifetime telemetry, not request-local state: reset
+    /// and speculative rollback retain the policy/scratch owner.
     pub eviction_count: std::cell::Cell<usize>,
     /// Optional adaptive-KV handoff gate. Closed means the cache is still in
     /// its adaptive phase and must not be scored or compacted yet.

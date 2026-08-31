@@ -71,6 +71,12 @@ pub trait WeightSource {
         can_alias: bool,
     ) -> HipResult<(WeightTensor, bool)>;
     fn read_layer(&mut self, gpu: &mut Gpu, layer_idx: usize) -> HipResult<Self::Layer>;
+    /// Release one successfully loaded layer during whole-model rollback.
+    ///
+    /// Layer ownership is architecture-specific (Qwen3.5 carries MoE
+    /// pointer tables and shared Paro sidecars), so the source supplies the
+    /// exact teardown instead of relying on a generic `Drop`.
+    fn free_layer(&mut self, gpu: &mut Gpu, layer: Self::Layer);
 }
 
 /// Drive a `WeightSource` across a device slice. Single shared copy of the
@@ -83,23 +89,72 @@ pub fn load_weights<S: WeightSource>(
     source.prepare(devices.len())?;
     let out_dev = layout.output_device();
     let can_alias = devices.len() == 1;
-    let (token_embd, embd_format) = source.read_embed(&mut devices[0])?;
-    let output_norm = source.read_final_norm(&mut devices[out_dev])?;
-    let (output, lm_head_aliases_embd) =
-        source.read_output(&mut devices[out_dev], &token_embd, embd_format, can_alias)?;
-    let mut layers = Vec::with_capacity(source.n_layers());
-    for i in 0..source.n_layers() {
-        let d = layout.device_for_layer(i);
-        layers.push(source.read_layer(&mut devices[d], i)?);
+
+    // Every successful allocation is published into one of these staging
+    // owners before the next fallible step. They remain local until the final
+    // `LoadedWeights` move, so a later layer/global/head error drains the
+    // complete prefix rather than orphaning earlier GPU tensors.
+    let mut staged_embd: Option<(GpuTensor, EmbeddingFormat)> = None;
+    let mut staged_output_norm: Option<GpuTensor> = None;
+    let mut staged_output: Option<(WeightTensor, bool)> = None;
+    let mut staged_layers: Vec<S::Layer> = Vec::with_capacity(source.n_layers());
+
+    let result = (|| -> HipResult<LoadedWeights<S::Layer>> {
+        let (token_embd, embd_format) = source.read_embed(&mut devices[0])?;
+        staged_embd = Some((token_embd, embd_format));
+
+        let output_norm = source.read_final_norm(&mut devices[out_dev])?;
+        staged_output_norm = Some(output_norm);
+
+        let (output, lm_head_aliases_embd) = source.read_output(
+            &mut devices[out_dev],
+            &staged_embd.as_ref().expect("embedding staged").0,
+            embd_format,
+            can_alias,
+        )?;
+        staged_output = Some((output, lm_head_aliases_embd));
+
+        for i in 0..source.n_layers() {
+            let d = layout.device_for_layer(i);
+            staged_layers.push(source.read_layer(&mut devices[d], i)?);
+        }
+
+        let (token_embd, embd_format) = staged_embd.take().expect("embedding staged");
+        let output_norm = staged_output_norm.take().expect("output norm staged");
+        let (output, lm_head_aliases_embd) = staged_output.take().expect("output staged");
+        Ok(LoadedWeights {
+            token_embd,
+            embd_format,
+            output_norm,
+            output,
+            layers: std::mem::take(&mut staged_layers),
+            lm_head_aliases_embd,
+        })
+    })();
+
+    if result.is_err() {
+        // Completed layers are architecture-owned and must be drained in
+        // reverse publication order while their device placement is known.
+        for (layer_idx, layer) in staged_layers.drain(..).enumerate().rev() {
+            let device = layout.device_for_layer(layer_idx);
+            source.free_layer(&mut devices[device], layer);
+        }
+        if let Some((output, aliases_embd)) = staged_output.take() {
+            let gpu = &mut devices[out_dev];
+            if aliases_embd {
+                output.free_metadata_only(gpu);
+            } else {
+                output.free_all(gpu);
+            }
+        }
+        if let Some(output_norm) = staged_output_norm.take() {
+            let _ = devices[out_dev].free_tensor(output_norm);
+        }
+        if let Some((token_embd, _)) = staged_embd.take() {
+            let _ = devices[0].free_tensor(token_embd);
+        }
     }
-    Ok(LoadedWeights {
-        token_embd,
-        embd_format,
-        output_norm,
-        output,
-        layers,
-        lm_head_aliases_embd,
-    })
+    result
 }
 
 #[cfg(test)]

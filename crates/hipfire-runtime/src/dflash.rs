@@ -944,44 +944,69 @@ impl DflashWeights {
         let load_codebook = |names: &[&str],
                              vocab: usize,
                              rank: usize|
-         -> Option<SelectorCodebook> {
+         -> HipResult<Option<SelectorCodebook>> {
             for n in names {
                 if let Some((info, data)) = hfq.tensor_data(n) {
                     let expected = vocab * rank;
                     match info.quant_type {
                         1 => {
-                            assert_eq!(data.len(), expected * 2, "codebook {n} F16 size mismatch");
+                            if data.len() != expected * 2 {
+                                return Err(hip_bridge::HipError::new(
+                                    0,
+                                    &format!(
+                                        "selector codebook {n} F16 size mismatch: expected {}, got {}",
+                                        expected * 2,
+                                        data.len()
+                                    ),
+                                ));
+                            }
                             let mut v = Vec::with_capacity(expected);
                             for chunk in data.chunks_exact(2) {
                                 v.push(u16::from_le_bytes([chunk[0], chunk[1]]));
                             }
-                            return Some(SelectorCodebook {
+                            return Ok(Some(SelectorCodebook {
                                 vocab,
                                 rank,
                                 f16_data: Some(v),
                                 f32_data: None,
-                            });
+                            }));
                         }
                         2 => {
-                            assert_eq!(data.len(), expected * 4, "codebook {n} F32 size mismatch");
+                            if data.len() != expected * 4 {
+                                return Err(hip_bridge::HipError::new(
+                                    0,
+                                    &format!(
+                                        "selector codebook {n} F32 size mismatch: expected {}, got {}",
+                                        expected * 4,
+                                        data.len()
+                                    ),
+                                ));
+                            }
                             let mut v = Vec::with_capacity(expected);
                             for chunk in data.chunks_exact(4) {
                                 v.push(f32::from_le_bytes([
                                     chunk[0], chunk[1], chunk[2], chunk[3],
                                 ]));
                             }
-                            return Some(SelectorCodebook {
+                            return Ok(Some(SelectorCodebook {
                                 vocab,
                                 rank,
                                 f16_data: None,
                                 f32_data: Some(v),
-                            });
+                            }));
                         }
-                        q => panic!("selector codebook {n} unsupported quant_type {q}"),
+                        q => {
+                            return Err(hip_bridge::HipError::new(
+                                0,
+                                &format!(
+                                    "selector codebook {n} unsupported quant_type {q}"
+                                ),
+                            ));
+                        }
                     }
                 }
             }
-            None
+            Ok(None)
         };
         let result = (|| -> HipResult<Self> {
             staged.fc = Some(hfq_weight(
@@ -1031,27 +1056,29 @@ impl DflashWeights {
             let (predecessor_codebook, successor_codebook, selector_rank_opt, selector_top_k_opt) =
                 if let Some(rank) = cfg.selector_rank {
                     let vocab = cfg.vocab_size;
+                    let predecessor_codebook = load_codebook(
+                        &[
+                            "candidate_selector.predecessor_codebook",
+                            "selector.predecessor_codebook",
+                            "candidate_selector.predecessor_codebook.weight",
+                            "selector.predecessor.weight",
+                        ],
+                        vocab,
+                        rank,
+                    )?;
+                    let successor_codebook = load_codebook(
+                        &[
+                            "candidate_selector.successor_codebook",
+                            "selector.successor_codebook",
+                            "candidate_selector.successor_codebook.weight",
+                            "selector.successor.weight",
+                        ],
+                        vocab,
+                        rank,
+                    )?;
                     (
-                        load_codebook(
-                            &[
-                                "candidate_selector.predecessor_codebook",
-                                "selector.predecessor_codebook",
-                                "candidate_selector.predecessor_codebook.weight",
-                                "selector.predecessor.weight",
-                            ],
-                            vocab,
-                            rank,
-                        ),
-                        load_codebook(
-                            &[
-                                "candidate_selector.successor_codebook",
-                                "selector.successor_codebook",
-                                "candidate_selector.successor_codebook.weight",
-                                "selector.successor.weight",
-                            ],
-                            vocab,
-                            rank,
-                        ),
+                        predecessor_codebook,
+                        successor_codebook,
                         Some(rank),
                         cfg.selector_top_k,
                     )
@@ -1064,13 +1091,13 @@ impl DflashWeights {
                 .iter()
                 .chain(staged.layers.iter().flat_map(|layer| {
                     let mut weights: Vec<&WeightTensor> = vec![
-                        layer.wq.as_ref().unwrap(),
-                        layer.wk.as_ref().unwrap(),
-                        layer.wv.as_ref().unwrap(),
-                        layer.wo.as_ref().unwrap(),
-                        layer.w_gate.as_ref().unwrap(),
-                        layer.w_up.as_ref().unwrap(),
-                        layer.w_down.as_ref().unwrap(),
+                        &layer.wq,
+                        &layer.wk,
+                        &layer.wv,
+                        &layer.wo,
+                        &layer.w_gate,
+                        &layer.w_up,
+                        &layer.w_down,
                     ];
                     if let Some(weight) = &layer.attn_conv_proj {
                         weights.push(weight);

@@ -1926,59 +1926,17 @@ pub fn generate(
             "[daemon] context full ({}/{}) — resetting conversation",
             m.seq_pos, m.max_seq
         );
-        m.seq_pos = 0;
-        m.conversation_tokens.clear();
-        crate::common::free_checkpoints(&mut m.prefill_checkpoints, gpu);
-        crate::common::free_checkpoints(&mut m.dflash_checkpoints, gpu);
-        // Free the speculator's (relocated) checkpoint ring on reset — this AR
-        // path is reachable by a DFlash-capable model (temp>0 / budgeted-think /
-        // HIPFIRE_DFLASH_CHAT=0), so its drafter state must not survive here.
-        if let Some(s) = m.speculator.as_mut() {
-            if let Err(e) = s.reset(gpu) {
-                crate::dense::emit_active_attempt_error(
-                    stdout,
-                    Some(id),
-                    &format!("context reset failed: {e}"),
-                    "gpu",
-                    true,
-                    false,
-                );
-                return;
-            }
-        }
-        // Zero DeltaNet state on reset. qwen35 recurrent state lives in the
-        // bundle (ModelState::Qwen35), not the always-None m.dn_state/m.kv_cache.
-        // Use the canonical reset so newly added recurrent buffers (notably the
-        // Q8 error-feedback residual) cannot leak across rollover boundaries.
-        if let Some(b) = m.state.as_mut().and_then(|s| {
-            (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
-        }) {
-            if let Err(e) = b.dn_state.reset(gpu) {
-                crate::dense::emit_active_attempt_error(
-                    stdout,
-                    Some(id),
-                    &format!("context reset failed: {e}"),
-                    "gpu",
-                    true,
-                    false,
-                );
-                return;
-            }
-            b.kv_cache.compact_offset = 0;
-        }
-        if let Some(b) = m.state.as_mut().and_then(|s| {
-            (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_llama::LlamaBundle>()
-        }) {
-            b.kv.compact_offset = 0;
-        }
-        if let Some(ad) = m.kv_adaptive.as_mut() {
-            if let Some(b) = m.state.as_mut().and_then(|s| {
-                (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
-            }) {
-                ad.reset_with_cache(gpu, &mut b.kv_cache);
-            } else {
-                ad.reset();
-            }
+        let epilogue = crate::common::production_fail_closed_rollback(m, gpu, None, None);
+        if !epilogue.rolled_back {
+            crate::common::emit_fail_closed_error(
+                stdout,
+                Some(id),
+                "context reset failed before starting the next turn",
+                "gpu",
+                true,
+                &epilogue,
+            );
+            return;
         }
     }
 
