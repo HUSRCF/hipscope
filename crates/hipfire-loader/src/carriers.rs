@@ -4,6 +4,8 @@
 //! Per-arch carrier structs with object-safe [`Carrier`] impls.
 //! Each carrier owns its full load path (HFQ + safetensors-dir).
 
+use crate::parallel_capability::ModelVariant;
+
 use crate::spec_build::Qwen35SlotGuard;
 use crate::Carrier;
 use crate::{
@@ -101,6 +103,117 @@ fn dir_diag(src: &ModelSource) {
     }
 }
 
+fn source_config(src: &ModelSource) -> Result<serde_json::Value, String> {
+    let metadata = match src {
+        ModelSource::Hfq(hfq) => hfq.metadata_json.as_str(),
+        ModelSource::Dir(source) => source.metadata_json(),
+    };
+    let meta: serde_json::Value = serde_json::from_str(metadata)
+        .map_err(|e| format!("invalid source metadata JSON: {e}"))?;
+    Ok(meta
+        .get("config")
+        .cloned()
+        .unwrap_or(meta))
+}
+
+fn config_number(config: &serde_json::Value, key: &str) -> usize {
+    config
+        .get(key)
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0) as usize
+}
+
+fn config_model_type(config: &serde_json::Value) -> Option<&str> {
+    config
+        .get("model_type")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            config
+                .get("text_config")
+                .and_then(|text| text.get("model_type"))
+                .and_then(serde_json::Value::as_str)
+        })
+}
+
+fn source_has_tensor(src: &ModelSource, name: &str) -> bool {
+    match src {
+        // `tensor_data` deliberately checks that indexed data is present,
+        // rather than treating a header-only entry as a valid VL tower.
+        ModelSource::Hfq(hfq) => hfq.tensor_data(name).is_some(),
+        ModelSource::Dir(source) => source.tensor_info(name).is_some(),
+    }
+}
+
+fn classify_qwen35(src: &ModelSource) -> Result<ModelVariant, String> {
+    let arch_id = src
+        .arch_id()
+        .ok_or_else(|| "qwen35 source has no architecture id".to_string())?;
+    let config = source_config(src)?;
+    let text_config = config.get("text_config").unwrap_or(&config);
+    let experts = config_number(text_config, "num_experts");
+    let has_vision_config = config.get("vision_config").is_some();
+    let has_vision_tensor = source_has_tensor(src, "model.visual.patch_embed.proj.weight");
+    let model_type_is_vl = config_model_type(&config)
+        .map(|model_type| model_type.to_ascii_lowercase().contains("vl"))
+        .unwrap_or(false);
+
+    if !matches!(arch_id, 5 | 6) {
+        return Err(format!("qwen35: unexpected source arch_id {arch_id}"));
+    }
+
+    // Qwen3.5-VL may share arch id 5 or 6 with text checkpoints. A vision
+    // marker without the actual tower is malformed and must fail closed
+    // rather than silently turning into a dense text model.
+    if has_vision_config || has_vision_tensor || model_type_is_vl {
+        if !has_vision_tensor {
+            return Err(
+                "qwen35: vision metadata/model type present but the vision tensor is missing"
+                    .into(),
+            );
+        }
+        return Ok(ModelVariant::Qwen35Vl);
+    }
+
+    // Expert count is the family fact that separates dense and MoE. The arch
+    // id selects the carrier and is checked for consistency, but never decides
+    // this row by itself.
+    match (arch_id, experts > 0) {
+        (5, false) => Ok(ModelVariant::Qwen35Dense),
+        (6, true) => Ok(ModelVariant::Qwen35Moe),
+        (5, true) => Err("qwen35: arch_id=5 conflicts with num_experts > 0".into()),
+        (6, false) => Err("qwen35: arch_id=6 requires num_experts > 0".into()),
+        _ => unreachable!("arch_id was checked above"),
+    }
+}
+
+fn classify_lfm2(src: &ModelSource) -> Result<ModelVariant, String> {
+    let config = source_config(src)?;
+    let text_config = config.get("text_config").unwrap_or(&config);
+    let experts = config_number(text_config, "num_experts");
+    let has_vision_config = config.get("vision_config").is_some();
+    let has_vision_tensor = source_has_tensor(
+        src,
+        "model.vision_tower.vision_model.embeddings.patch_embedding.weight",
+    );
+    let model_type_is_vl = config_model_type(&config)
+        .map(|model_type| model_type.to_ascii_lowercase().contains("vl"))
+        .unwrap_or(false);
+    if has_vision_config || has_vision_tensor || model_type_is_vl {
+        if !has_vision_tensor {
+            return Err(
+                "lfm2moe: vision metadata/model type present but the vision tensor is missing"
+                    .into(),
+            );
+        }
+        return Ok(ModelVariant::Lfm2Vl);
+    }
+    Ok(if experts > 0 {
+        ModelVariant::Lfm2Moe
+    } else {
+        ModelVariant::Lfm2Dense
+    })
+}
+
 // ─── Qwen2Carrier ────────────────────────────────────────────────────
 
 pub struct Qwen2Carrier;
@@ -132,6 +245,10 @@ impl Carrier for Qwen2Carrier {
         // llama-family Dir loader drops them).
         arch_id == 7
     }
+    fn classify_parallel_variant(&self, _src: &ModelSource) -> Result<ModelVariant, String> {
+        Ok(ModelVariant::Qwen2)
+    }
+
     fn caps(&self) -> saddle_core::caps::ArchCaps {
         saddle_core::caps::ArchCaps {
             supports_continuous_batch: false,
@@ -386,6 +503,10 @@ impl Carrier for Qwen35Carrier {
         // 5 = dense (+VL), 6 = MoE — same ids in both namespaces.
         matches!(arch_id, 5 | 6)
     }
+    fn classify_parallel_variant(&self, src: &ModelSource) -> Result<ModelVariant, String> {
+        classify_qwen35(src)
+    }
+
     fn caps(&self) -> saddle_core::caps::ArchCaps {
         saddle_core::caps::ArchCaps {
             supports_continuous_batch: true,
@@ -738,6 +859,22 @@ impl Carrier for LlamaCarrier {
         // swallow any future HFQ id in 2..=4 into the llama path).
         matches!(arch_id, 0 | 1)
     }
+    fn classify_parallel_variant(&self, src: &ModelSource) -> Result<ModelVariant, String> {
+        let config = match src {
+            ModelSource::Hfq(hfq) => hipfire_runtime::hfq::config_from_hfq(hfq)?,
+            ModelSource::Dir(source) => {
+                hipfire_runtime::hfq::config_from_safetensors_llama(source)?
+            }
+        };
+        if config.arch == hipfire_runtime::llama::ModelArch::Qwen3 {
+            Ok(ModelVariant::PlainQwen3)
+        } else if config.has_qk_norm {
+            Ok(ModelVariant::LlamaQkNorm)
+        } else {
+            Ok(ModelVariant::LlamaNoQkNorm)
+        }
+    }
+
     fn caps(&self) -> saddle_core::caps::ArchCaps {
         saddle_core::caps::ArchCaps {
             supports_continuous_batch: false,
@@ -1031,6 +1168,10 @@ impl Carrier for DotsOcrCarrier {
     fn claims_arch_id(&self, arch_id: u32, _is_dir: bool) -> bool {
         arch_id == 8
     }
+    fn classify_parallel_variant(&self, _src: &ModelSource) -> Result<ModelVariant, String> {
+        Ok(ModelVariant::DotsOcr)
+    }
+
     fn caps(&self) -> saddle_core::caps::ArchCaps {
         saddle_core::caps::ArchCaps {
             supports_continuous_batch: false,
@@ -1146,6 +1287,9 @@ impl Carrier for Deepseek4Carrier {
     }
     fn claims_arch_id(&self, arch_id: u32, _is_dir: bool) -> bool {
         arch_id == 9
+    }
+    fn classify_parallel_variant(&self, _src: &ModelSource) -> Result<ModelVariant, String> {
+        Ok(ModelVariant::Deepseek4)
     }
     fn caps(&self) -> saddle_core::caps::ArchCaps {
         saddle_core::caps::ArchCaps {
@@ -1359,6 +1503,10 @@ impl Carrier for MinimaxCarrier {
     fn claims_arch_id(&self, arch_id: u32, _is_dir: bool) -> bool {
         arch_id == 10
     }
+    fn classify_parallel_variant(&self, _src: &ModelSource) -> Result<ModelVariant, String> {
+        Ok(ModelVariant::Minimax)
+    }
+
     fn caps(&self) -> saddle_core::caps::ArchCaps {
         saddle_core::caps::ArchCaps {
             supports_continuous_batch: false,
@@ -1467,6 +1615,10 @@ impl Carrier for Lfm2MoeCarrier {
     fn claims_arch_id(&self, arch_id: u32, _is_dir: bool) -> bool {
         arch_id == 11
     }
+    fn classify_parallel_variant(&self, src: &ModelSource) -> Result<ModelVariant, String> {
+        classify_lfm2(src)
+    }
+
     fn caps(&self) -> saddle_core::caps::ArchCaps {
         saddle_core::caps::ArchCaps {
             supports_continuous_batch: true,
@@ -1639,6 +1791,10 @@ impl Carrier for Cohere2MoeCarrier {
         // 12 = Cohere2-MoE in both the HFQ and safetensors-Dir namespaces.
         arch_id == 12
     }
+    fn classify_parallel_variant(&self, _src: &ModelSource) -> Result<ModelVariant, String> {
+        Ok(ModelVariant::Cohere2Moe)
+    }
+
     fn caps(&self) -> saddle_core::caps::ArchCaps {
         saddle_core::caps::ArchCaps {
             supports_continuous_batch: false,
@@ -1748,6 +1904,9 @@ impl Carrier for MapleCarrier {
     }
     fn claims_arch_id(&self, arch_id: u32, _is_dir: bool) -> bool {
         arch_id == 15
+    }
+    fn classify_parallel_variant(&self, _src: &ModelSource) -> Result<ModelVariant, String> {
+        Ok(ModelVariant::Maple)
     }
     fn caps(&self) -> saddle_core::caps::ArchCaps {
         saddle_core::caps::ArchCaps {
@@ -1879,6 +2038,17 @@ impl Carrier for Gemma4Carrier {
         // would still need a target model, so it naturally fails later in generate routing.
         matches!(arch_id, 13 | 22)
     }
+    fn classify_parallel_variant(&self, src: &ModelSource) -> Result<ModelVariant, String> {
+        match src.arch_id() {
+            Some(13) => Ok(ModelVariant::Gemma4),
+            Some(22) => Err(
+                "gemma4: arch_id=22 is an EAGLE drafter, not a primary load target".into(),
+            ),
+            Some(other) => Err(format!("gemma4: unexpected source arch_id {other}")),
+            None => Err("gemma4: source has no architecture id".into()),
+        }
+    }
+
     fn caps(&self) -> saddle_core::caps::ArchCaps {
         saddle_core::caps::ArchCaps {
             supports_continuous_batch: false,
@@ -2120,6 +2290,16 @@ impl Carrier for MuseGlimmerCarrier {
     }
     fn claims_arch_id(&self, arch_id: u32, _is_dir: bool) -> bool {
         arch_id == 14
+    }
+    fn classify_parallel_variant(&self, src: &ModelSource) -> Result<ModelVariant, String> {
+        match src.arch_id() {
+            Some(14) => Ok(ModelVariant::MuseGlimmer),
+            Some(23) => Err(
+                "muse_glimmer: arch_id=23 is a DFlash drafter, not a primary load target".into(),
+            ),
+            Some(other) => Err(format!("muse_glimmer: unexpected source arch_id {other}")),
+            None => Err("muse_glimmer: source has no architecture id".into()),
+        }
     }
     fn caps(&self) -> saddle_core::caps::ArchCaps {
         saddle_core::caps::ArchCaps {

@@ -84,7 +84,10 @@ use hipfire_generate::redline::{
 };
 mod slots;
 use hipfire_generate::vision::{GenerateVLParams, ImageSource};
-use hipfire_loader::{AsstTurnCache, EpArch, EpState, Eviction, LoadedModel};
+use hipfire_loader::{
+    admit_load, AsstTurnCache, DimKind, EpArch, EpState, Eviction, LoadedModel, ModelVariant,
+    RawParallelism,
+};
 use hipfire_runtime::spec::{
     ClientEvent, EmitOutcome, EvictRetain, FinishSummary, PrefillOutcome, SpecAdvance, SpecEmit,
     SpecTarget, Speculator, StopReason,
@@ -854,15 +857,29 @@ fn main() {
                 let _ = stdout.flush();
             }
             "load" => {
-                // FIX #1 (transactional EP load): the unload of the prior model
-                // is deferred for the EP (tp>1) path until AFTER the new load
-                // succeeds, so a partial EP load failure leaves the prior model
-                // intact (and load_model_ep's staging guard frees the partial
-                // ranks). For the single-GPU / pp path the prior model is
-                // unloaded eagerly here as before (load_model uses the daemon's
-                // `gpu` directly, so it can't be deferred without a major
-                // refactor). `tp` is parsed authoritatively below; peek it here.
-                let load_tp = msg
+                // Parse the model and raw axis fields before any prior-model
+                // teardown. The loader admission point owns source
+                // classification, legacy axis interpretation, composition,
+                // and effective mesh creation.
+                let path = msg.get("model").and_then(|v| v.as_str()).unwrap_or("");
+                if path.is_empty() {
+                    emit_uncorrelated_error(
+                        &mut stdout,
+                        None,
+                        "load: missing model path",
+                        "validation",
+                        false,
+                        false,
+                    );
+                    let _ = stdout.flush();
+                    continue;
+                }
+                let pp = msg
+                    .get("params")
+                    .and_then(|p| p.get("pp"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(1) as usize;
+                let tp = msg
                     .get("params")
                     .and_then(|p| p.get("tp"))
                     .and_then(|v| v.as_u64())
@@ -969,19 +986,6 @@ fn main() {
                     continuous_batch_size = 1;
                     batch_poisoned = None;
 
-                    let path = msg.get("model").and_then(|v| v.as_str()).unwrap_or("");
-                    if path.is_empty() {
-                        emit_uncorrelated_error(
-                            &mut stdout,
-                            None,
-                            "load: missing model path",
-                            "validation",
-                            false,
-                            false,
-                        );
-                        let _ = stdout.flush();
-                        continue;
-                    }
                     let requested_max_seq = msg
                         .get("params")
                         .and_then(|p| p.get("max_seq"))
@@ -1047,6 +1051,32 @@ fn main() {
                     continue;
                 }
                 // Ordinary load: refuse while slot requests active, otherwise checked shutdown
+                let admission = match admit_load(
+                    path,
+                    RawParallelism::new(pp, tp, 1),
+                ) {
+                    Ok(admission) => admission,
+                    Err(error) => {
+                        emit_uncorrelated_error(
+                            &mut stdout,
+                            None,
+                            &error,
+                            "unsupported",
+                            false,
+                            false,
+                        );
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                };
+                let load_tp = match admission.variant {
+                    ModelVariant::Qwen35Dense => admission.mesh.size_of(DimKind::Tp),
+                    ModelVariant::Qwen35Moe
+                    | ModelVariant::Deepseek4
+                    | ModelVariant::Minimax => admission.mesh.size_of(DimKind::Ep),
+                    _ => 1,
+                };
+
                 if slot_backend.as_ref().is_some_and(|b| b.active_count() > 0) {
                     emit_uncorrelated_error(
                         &mut stdout,
@@ -1154,7 +1184,6 @@ fn main() {
                     }
                 }
 
-                let path = msg.get("model").and_then(|v| v.as_str()).unwrap_or("");
                 // hunt3 H-D: clamp request-driven max_seq to the config ceiling
                 // (MAX_REQUESTED_SEQ = 1M). Without this an unvalidated 10M
                 // max_seq drives a multi-GB KV allocation and OOMs the daemon at
@@ -1533,40 +1562,21 @@ fn main() {
                         None
                     };
 
-                // Pipeline-parallel degree (Stage 7 of #58). Default 1 =
-                // single-GPU (no behavior change). pp > 1 routes through
-                // Gpus + *_multi paths and refuses VL / DFlash / CASK /
-                // PFlash at load time. v1 supports Qwen3.5 dense + MoE
-                // only — see load_model_pp for the arch_id check.
-                let pp = msg
-                    .get("params")
-                    .and_then(|p| p.get("pp"))
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(1) as usize;
-                // Expert-parallel degree (EP, task #26). tp>1 shards routed
-                // experts across ranks via load_model_ep. Mutually exclusive
-                // with pp; v1 refuses DFlash. See docs/plans/daemon-ep-wiring.md.
-                let tp = msg
-                    .get("params")
-                    .and_then(|p| p.get("tp"))
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(1) as usize;
-                if tp > 1 && pp > 1 {
-                    emit_uncorrelated_error(&mut stdout, None, "tp (expert-parallel) and pp (pipeline-parallel) are mutually exclusive; set only one.", "unsupported", false, false);
-                    let _ = stdout.flush();
-                    continue;
-                }
-                if tp > 1 && draft_path.is_some() {
+                // The source-aware admission above already rejected every
+                // zero degree and forbidden composition. It also selected the
+                // effective PP/TP/EP interpretation; no raw-axis policy branch
+                // is allowed below this boundary.
+                if load_tp > 1 && draft_path.is_some() {
                     emit_uncorrelated_error(&mut stdout, None, "EP serving (tp>1) does not support DFlash drafters in v1; reload without a draft.", "unsupported", false, false);
                     let _ = stdout.flush();
                     continue;
                 }
-                if tp > 1 && gemma4_drafter.is_some() {
+                if load_tp > 1 && gemma4_drafter.is_some() {
                     emit_uncorrelated_error(&mut stdout, None, "EP serving (tp>1) does not support the gemma4 EAGLE drafter; reload without params.drafter.", "unsupported", false, false);
                     let _ = stdout.flush();
                     continue;
                 }
-                if pp > 1 {
+                if admission.mesh.has_axis(DimKind::Pp) {
                     if gemma4_drafter.is_some() {
                         emit_uncorrelated_error(&mut stdout, None, "gemma4 EAGLE spec-decode requires pp=1 (arch_id=13 has no pipeline-parallel path); reload without params.drafter.", "unsupported", false, false);
                         let _ = stdout.flush();
@@ -1625,7 +1635,7 @@ fn main() {
                         continue;
                     }
                 };
-                let loaded = if tp > 1 {
+                let loaded = if load_tp > 1 {
                     if deepseek4_experts_per_token.is_some() {
                         emit_uncorrelated_error(
                             &mut stdout,
@@ -1641,7 +1651,7 @@ fn main() {
                     hipfire_loader::load_model_ep_with_kv_mode(
                         path,
                         max_seq,
-                        tp,
+                        load_tp,
                         kv_mode_override.as_deref(),
                         kv_backend_override.as_deref(),
                         state_quant_override.as_deref(),
@@ -1660,7 +1670,7 @@ fn main() {
                         kv_adaptive_override.as_deref(),
                         state_quant_override.as_deref(),
                         &cask,
-                        pp,
+                        admission.mesh.size_of(DimKind::Pp),
                         spec_cfg,
                         &mut gpu,
                     )

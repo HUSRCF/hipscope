@@ -11,7 +11,14 @@ pub use carriers::*;
 /// Speculative-decode build/glue (RAII slot guard now; `DflashSpeculator` +
 /// `build_speculator` at Stages 1-2). Lives here at the top of the DAG where
 /// both `LoadedModel` and the arch crates are in scope.
+pub mod parallel_capability;
 pub mod spec_build;
+
+pub use parallel_capability::{
+    AdmissionError, CellPolicy, ModelVariant, ParallelAxis, RawParallelism, SourceKind,
+};
+pub use hipfire_hardware::{DeviceMesh, DimKind};
+use parallel_capability::resolve;
 
 use hipfire_arch_cohere2moe as cohere2moe;
 use hipfire_arch_deepseek4 as deepseek4;
@@ -53,6 +60,18 @@ pub trait Carrier: Send + Sync {
         matches!(src.arch_id(), Some(id) if self.claims_arch_id(id, src.is_dir()))
     }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String>;
+
+    /// Classify source facts needed by the loader-owned parallel admission
+    /// table. The default is fail-closed: a carrier must opt in explicitly
+    /// rather than being admitted from an arch id alone.
+    fn classify_parallel_variant(&self, src: &ModelSource) -> Result<ModelVariant, String> {
+        Err(format!(
+            "{}: parallel variant classification unsupported for {}",
+            self.name(),
+            src.describe()
+        ))
+    }
+
 
     /// Declared capabilities for this arch. Default is the conservative
     /// “no capability” set — carriers override to declare what they support.
@@ -174,6 +193,89 @@ pub fn carrier_for(arch_id: u32) -> Option<&'static dyn Carrier> {
         .iter()
         .copied()
         .find(|c| c.claims_arch_id(arch_id, false))
+}
+
+/// The result of the sole source-aware loader admission point.
+///
+/// `mesh` is the effective G1 topology. `source` and `variant` are retained
+/// so downstream dispatch can select the already-admitted route without
+/// reinterpreting raw CLI degrees.
+#[derive(Clone, Debug)]
+pub struct LoadAdmission {
+    pub source: SourceKind,
+    pub variant: ModelVariant,
+    pub mesh: DeviceMesh,
+}
+
+/// Classify a source through exactly one carrier and return its family facts.
+///
+/// `Carrier::probe` remains the namespace-aware arch-id gate (HFQ versus
+/// safetensors directory). Fine-grained dense/MoE/VL facts are then obtained
+/// from the selected carrier before policy lookup.
+pub fn classify_source(src: &ModelSource) -> Result<(&'static dyn Carrier, ModelVariant), String> {
+    let arch_id = src
+        .arch_id()
+        .ok_or_else(|| format!("no arch_id in source: {}", src.describe()))?;
+    let mut matches = REGISTRY.iter().filter(|carrier| carrier.probe(src));
+    let carrier = *matches
+        .next()
+        .ok_or_else(|| format!("no carrier for arch_id {} ({})", arch_id, src.describe()))?;
+    if let Some(other) = matches.next() {
+        return Err(format!(
+            "ambiguous carrier for arch_id {} ({}): '{}' and '{}' both claim it",
+            arch_id,
+            src.describe(),
+            carrier.name(),
+            other.name()
+        ));
+    }
+    let variant = carrier.classify_parallel_variant(src)?;
+    Ok((carrier, variant))
+}
+
+/// Adapt the current two-field CLI spelling into raw axes after the source
+/// variant is known. Qwen3.5 MoE historically calls its EP degree `tp`; the
+/// resolver itself only owns the documented DeepSeek4/MiniMax TP→EP mapping,
+/// so this carrier-route adapter lives at the outer loader admission boundary.
+fn raw_for_cli_route(variant: ModelVariant, raw: RawParallelism) -> RawParallelism {
+    if matches!(variant, ModelVariant::Qwen35Moe)
+        && raw.tp > 1
+        && raw.ep == 1
+    {
+        RawParallelism::new(raw.pp, 1, raw.tp)
+    } else {
+        raw
+    }
+}
+
+/// Admit an already-open source after classification. This private helper keeps
+/// regular and axis-specific wrappers on the same source-aware decision.
+
+fn admit_source(src: &ModelSource, raw: RawParallelism) -> Result<LoadAdmission, String> {
+    let source = if src.is_dir() {
+        SourceKind::SafetensorsDir
+    } else {
+        SourceKind::Hfq
+    };
+    let (_carrier, variant) = classify_source(src)?;
+    let raw = raw_for_cli_route(variant, raw);
+    let mesh = resolve(source, variant, raw).map_err(|err| err.to_string())?;
+    Ok(LoadAdmission {
+        source,
+        variant,
+        mesh,
+    })
+}
+
+/// Open, classify, and admit one model's raw parallel request.
+///
+/// Source probing/file I/O is allowed here. No GPU handle, device owner,
+/// remap, mesh binding, or model allocation is touched until this succeeds.
+/// All downstream callers must branch on the returned mesh/variant rather than
+/// on raw CLI degree fields.
+pub fn admit_load(path: &str, raw: RawParallelism) -> Result<LoadAdmission, String> {
+    let src = ModelSource::from_path(path)?;
+    admit_source(&src, raw)
 }
 
 // ─── Typed routing (replaces stringly `c.name() == "..."` predicates) ──────
@@ -2192,10 +2294,13 @@ pub fn load_model_with_kv_backend(
     spec: SpecLoadCfg,
     gpu: &mut rdna_compute::Gpu,
 ) -> Result<LoadedModel, String> {
+    // Source probing and the capability decision are deliberately first:
+    // unsupported PP/source combinations must not touch GPU teardown state.
+    let src = ModelSource::from_path(path)?;
+    let admission = admit_source(&src, RawParallelism::new(pp, 1, 1))?;
     // Retry any arenas left by a prior failed teardown; refuse the load if
     // ownership is still live so a new model cannot stack on pending VMM state.
     ensure_vmm_ready_for_load(gpu)?;
-    let src = ModelSource::from_path(path)?;
     let kv_backend_raw = kv_backend_override.unwrap_or("contiguous");
     let kv_backend: KvBackend = kv_backend_raw.parse().map_err(|err| format!("{err}"))?;
 
@@ -2288,28 +2393,16 @@ pub fn load_model_with_kv_backend(
         kv_adaptive_override,
         state_quant_override,
         cask,
-        pp,
+        pp: admission.mesh.size_of(hipfire_hardware::DimKind::Pp),
         spec,
         gpu,
         gemma4_drafter_path: None,
         gemma4_draft_len: GEMMA4_EAGLE_DRAFT_LEN,
     };
 
-    // Carrier registry dispatch. Collect all matches so an overlap between
-    // two carriers' `claims_arch_id` fails loudly here instead of silently
-    // resolving to whichever was registered first.
-    let mut matches = REGISTRY.iter().filter(|c| c.probe(&src));
-    let carrier = matches
-        .next()
-        .ok_or_else(|| format!("no carrier for {}", src.describe()))?;
-    if let Some(other) = matches.next() {
-        return Err(format!(
-            "ambiguous carrier dispatch for {}: '{}' and '{}' both claim it",
-            src.describe(),
-            carrier.name(),
-            other.name()
-        ));
-    }
+    // Admission already performed the namespace/variant checks above; resolve
+    // the same carrier for the actual load without another policy decision.
+    let (carrier, _) = classify_source(&src)?;
     if kv_backend == KvBackend::Vmm
         && !matches!(carrier.name(), "qwen35" | "deepseek4" | "muse_glimmer")
     {
@@ -2370,11 +2463,15 @@ pub fn load_model_with_gemma4_drafter(
     spec: SpecLoadCfg,
     gpu: &mut rdna_compute::Gpu,
 ) -> Result<LoadedModel, String> {
-    // Validate draft_len early (refuse-don't-degrade, same rule as daemon).
+    // Source probing and the capability decision are deliberately first:
+    // unsupported PP/source combinations must not touch GPU teardown state.
     let _ = gemma4_eagle_spec_len(Some(gemma4_draft_len as u64))
         .map_err(|e| format!("gemma4 drafter: {e}"))?;
-    ensure_vmm_ready_for_load(gpu)?;
     let src = ModelSource::from_path(path)?;
+    let admission = admit_source(&src, RawParallelism::new(pp, 1, 1))?;
+    // Retry any arenas left by a prior failed teardown; refuse the load if
+    // ownership is still live so a new model cannot stack on pending VMM state.
+    ensure_vmm_ready_for_load(gpu)?;
     let kv_backend_raw = kv_backend_override.unwrap_or("contiguous");
     let kv_backend: KvBackend = kv_backend_raw.parse().map_err(|err| format!("{err}"))?;
     let rec_sampling = match &src {
@@ -2415,24 +2512,13 @@ pub fn load_model_with_gemma4_drafter(
         kv_adaptive_override,
         state_quant_override,
         cask,
-        pp,
+        pp: admission.mesh.size_of(hipfire_hardware::DimKind::Pp),
         spec,
         gpu,
         gemma4_drafter_path,
         gemma4_draft_len,
     };
-    let mut matches = REGISTRY.iter().filter(|c| c.probe(&src));
-    let carrier = matches
-        .next()
-        .ok_or_else(|| format!("no carrier for {}", src.describe()))?;
-    if let Some(other) = matches.next() {
-        return Err(format!(
-            "ambiguous carrier dispatch for {}: '{}' and '{}' both claim it",
-            src.describe(),
-            carrier.name(),
-            other.name()
-        ));
-    }
+    let (carrier, _) = classify_source(&src)?;
     if kv_backend == KvBackend::Vmm
         && !matches!(carrier.name(), "qwen35" | "deepseek4" | "muse_glimmer")
     {
@@ -2908,27 +2994,51 @@ pub fn load_model_ep_with_kv_mode(
     kv_backend: Option<&str>,
     state_quant: Option<&str>,
 ) -> Result<LoadedModel, String> {
-    let hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
+    let admission = admit_load(path, RawParallelism::new(1, tp, 1))?;
+    if admission.source != SourceKind::Hfq {
+        return Err("parallel EP/TP routes currently require an HFQ source".into());
+    }
+    if admission.mesh.n_devices() <= 1 {
+        return Err("parallel EP/TP routes require a degree greater than one".into());
+    }
     let kv_backend_raw = kv_backend.unwrap_or("contiguous");
     let kv_backend_kind: KvBackend = kv_backend_raw.parse().map_err(|err| format!("{err}"))?;
-    match hfq.arch_id {
-        9 => load_model_ep_ds4(
+    let degree = match admission.variant {
+        ModelVariant::Deepseek4 | ModelVariant::Minimax => {
+            admission.mesh.size_of(hipfire_hardware::DimKind::Ep)
+        }
+        ModelVariant::Qwen35Moe => admission.mesh.size_of(hipfire_hardware::DimKind::Ep),
+        ModelVariant::Qwen35Dense => admission.mesh.size_of(hipfire_hardware::DimKind::Tp),
+        other => {
+            return Err(format!(
+                "parallel route not admitted for model variant {other:?}"
+            ));
+        }
+    };
+    match admission.variant {
+        ModelVariant::Deepseek4 => load_model_ep_ds4(
             path,
             max_seq,
-            tp,
+            degree,
             resolve_deepseek4_compressor_cache_kv_mode(kv_mode)?,
         ),
-        10 if kv_backend_kind == KvBackend::Vmm => {
+        ModelVariant::Minimax if kv_backend_kind == KvBackend::Vmm => {
             Err(format!("KV backend '{kv_backend_raw}' requires tp=1"))
         }
-        10 => load_model_ep_minimax(path, max_seq, tp),
-        5 | 6 if kv_backend_kind == KvBackend::Vmm => {
+        ModelVariant::Minimax => load_model_ep_minimax(path, max_seq, degree),
+        ModelVariant::Qwen35Moe if kv_backend_kind == KvBackend::Vmm => {
             Err(format!("KV backend '{kv_backend_raw}' requires tp=1"))
         }
-        5 | 6 => load_model_ep_qwen35(path, max_seq, tp, kv_mode, kv_backend, state_quant),
-        id => Err(format!(
-            "EP not supported for arch_id={id} (expected 5|6 for Qwen3.5, 9 for DeepSeek V4 or 10 for MiniMax)"
-        )),
+        ModelVariant::Qwen35Moe => {
+            load_model_ep_qwen35(path, max_seq, degree, kv_mode, kv_backend, state_quant)
+        }
+        ModelVariant::Qwen35Dense if kv_backend_kind == KvBackend::Vmm => {
+            Err(format!("KV backend '{kv_backend_raw}' requires tp=1"))
+        }
+        ModelVariant::Qwen35Dense => {
+            load_model_tp_qwen35_dense(path, max_seq, degree, kv_mode, state_quant)
+        }
+        _ => unreachable!("unsupported parallel variant was rejected by admission"),
     }
 }
 
@@ -2941,20 +3051,48 @@ pub fn load_model_ep_with_compressor_cache(
     tp: usize,
     compressor_cache: hipfire_config::Deepseek4CompressorCache,
 ) -> Result<LoadedModel, String> {
-    let hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
-    match hfq.arch_id {
-        9 => load_model_ep_ds4(path, max_seq, tp, compressor_cache),
-        10 if compressor_cache == hipfire_config::Deepseek4CompressorCache::F32 => {
-            load_model_ep_minimax(path, max_seq, tp)
+    let admission = admit_load(path, RawParallelism::new(1, tp, 1))?;
+    if admission.source != SourceKind::Hfq {
+        return Err("parallel EP/TP routes currently require an HFQ source".into());
+    }
+    if admission.mesh.n_devices() <= 1 {
+        return Err("parallel EP/TP routes require a degree greater than one".into());
+    }
+    let degree = match admission.variant {
+        ModelVariant::Deepseek4 | ModelVariant::Minimax | ModelVariant::Qwen35Moe => {
+            admission.mesh.size_of(hipfire_hardware::DimKind::Ep)
         }
-        10 => Err("DeepSeek V4 compressor-cache storage cannot be applied to MiniMax".to_string()),
-        5 | 6 if compressor_cache == hipfire_config::Deepseek4CompressorCache::F32 => {
-            load_model_ep_qwen35(path, max_seq, tp, None, None, None)
+        ModelVariant::Qwen35Dense => admission.mesh.size_of(hipfire_hardware::DimKind::Tp),
+        other => {
+            return Err(format!(
+                "parallel route not admitted for model variant {other:?}"
+            ));
         }
-        5 | 6 => Err("DeepSeek V4 compressor-cache storage cannot be applied to Qwen3.5".to_string()),
-        id => Err(format!(
-            "EP not supported for arch_id={id} (expected 5|6 for Qwen3.5, 9 for DeepSeek V4 or 10 for MiniMax)"
-        )),
+    };
+    match admission.variant {
+        ModelVariant::Deepseek4 => load_model_ep_ds4(path, max_seq, degree, compressor_cache),
+        ModelVariant::Minimax
+            if compressor_cache == hipfire_config::Deepseek4CompressorCache::F32 =>
+        {
+            load_model_ep_minimax(path, max_seq, degree)
+        }
+        ModelVariant::Minimax => {
+            Err("DeepSeek V4 compressor-cache storage cannot be applied to MiniMax".to_string())
+        }
+        ModelVariant::Qwen35Moe
+            if compressor_cache == hipfire_config::Deepseek4CompressorCache::F32 =>
+        {
+            load_model_ep_qwen35(path, max_seq, degree, None, None, None)
+        }
+        ModelVariant::Qwen35Dense
+            if compressor_cache == hipfire_config::Deepseek4CompressorCache::F32 =>
+        {
+            load_model_tp_qwen35_dense(path, max_seq, degree, None, None)
+        }
+        ModelVariant::Qwen35Moe | ModelVariant::Qwen35Dense => {
+            Err("DeepSeek V4 compressor-cache storage cannot be applied to Qwen3.5".to_string())
+        }
+        _ => unreachable!("unsupported parallel variant was rejected by admission"),
     }
 }
 
