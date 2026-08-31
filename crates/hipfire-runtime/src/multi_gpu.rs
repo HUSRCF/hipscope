@@ -134,9 +134,14 @@ pub struct Gpus {
     /// Peer-direct all-reduce scratch: `peer_ar_tmp[r][slot]` is a buffer on
     /// device `r` holding one OTHER rank's partial during
     /// [`Gpus::all_reduce_sum_f32_peer`]. Lazily allocated / grown to the largest
-    /// `count` seen. Leaked on teardown (raw `DeviceBuffer`, no Drop-free).
+    /// `count` seen. Explicitly reclaimed via [`Gpus::free_peer_reduce_scratch`].
     peer_ar_tmp: Vec<Vec<DeviceBuffer>>,
     peer_ar_tmp_bytes: usize,
+    /// Persistent pageable host staging for the fallback host all-reduce
+    /// ([`Gpus::all_reduce_sum_f32_host`]). Outer vec is per-rank, inner vec
+    /// is `count` f32 per rank. Grown to the largest `count` seen and reused
+    /// without reallocation on steady state; drops normally.
+    host_ar_tmp: Vec<Vec<f32>>,
     /// Unique peer-rooted scratch lease (TP4 EP). `None` when no lease is
     /// active. When `Some`, `peer_lease_buffers[r]` holds `N-1` buffers per
     /// rank at least `peer_lease.bytes` and leased reduces must use that
@@ -238,6 +243,7 @@ impl Gpus {
             givens_sin_per_dev: Vec::new(),
             peer_ar_tmp: Vec::new(),
             peer_ar_tmp_bytes: 0,
+            host_ar_tmp: Vec::new(),
             active_peer_lease: None,
             peer_lease_buffers: Vec::new(),
             peer_lease_next_id: 0,
@@ -292,6 +298,7 @@ impl Gpus {
             givens_sin_per_dev: Vec::new(),
             peer_ar_tmp: Vec::new(),
             peer_ar_tmp_bytes: 0,
+            host_ar_tmp: Vec::new(),
             active_peer_lease: None,
             peer_lease_buffers: Vec::new(),
             peer_lease_next_id: 0,
@@ -301,6 +308,31 @@ impl Gpus {
             tp_graph_barrier_count: 0,
             tp_graph_capture_epoch: 0,
         })
+    }
+
+    /// Query whether every directed device pair supports peer access.
+    /// Does not enable peer access or mutate peer state. Use when partial
+    /// activation is unsafe (ROCm does not map later allocations).
+    pub fn can_access_peer_all(&self) -> HipResult<bool> {
+        let n = self.devices.len();
+        if n <= 1 {
+            return Ok(true);
+        }
+        for i in 0..n {
+            self.devices[i].bind_thread()?;
+            for j in 0..n {
+                if i == j {
+                    continue;
+                }
+                if !self.devices[i]
+                    .hip
+                    .can_access_peer(self.devices[i].device_id, self.devices[j].device_id)?
+                {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
     }
 
     /// Bidirectional `hipDeviceEnablePeerAccess` between every pair of
@@ -812,6 +844,7 @@ impl Gpus {
             givens_sin_per_dev: Vec::new(),
             peer_ar_tmp: Vec::new(),
             peer_ar_tmp_bytes: 0,
+            host_ar_tmp: Vec::new(),
             active_peer_lease: None,
             peer_lease_buffers: Vec::new(),
             peer_lease_next_id: 0,
@@ -934,6 +967,201 @@ impl Gpus {
         Ok(())
     }
 
+    /// Host-staged all-reduce-sum of f32 buffers across all ranks. No
+    /// cross-device HIP copy or RCCL is used — this is the correctness-first
+    /// fallback for mixed dense TP topologies where peer access is asymmetric
+    /// (e.g. physical GPU2 unreachable). Each rank's `active_stream` is
+    /// explicitly synchronized so the producer's partial is visible, then
+    /// `memcpy_dtoh` downloads each partial into persistent pageable host
+    /// staging (`host_ar_tmp`), an exact left-associated sum
+    /// `rank0+rank1+...` is reduced into row 0, and the resulting bytes are
+    /// synchronously `memcpy_htod`-uploaded to every rank buffer. On steady
+    /// state after the maximum `count` has been seen, no allocation occurs:
+    /// the outer vec is sized to `N` and each row is `resize`-grown only when
+    /// `count` exceeds its current length.
+    pub fn all_reduce_sum_f32_host(
+        &mut self,
+        buffers: &[&DeviceBuffer],
+        count: usize,
+    ) -> HipResult<()> {
+        let n = self.devices.len();
+        if buffers.len() != n {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "all_reduce_sum_f32_host: buffers.len()={} != n_devices={n}",
+                    buffers.len()
+                ),
+            ));
+        }
+        if n == 1 {
+            return Ok(());
+        }
+        let bytes = count
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| HipError::new(0, "all_reduce_sum_f32_host: count overflow"))?;
+        for (rank, buffer) in buffers.iter().enumerate() {
+            if buffer.size() < bytes {
+                return Err(HipError::new(
+                    0,
+                    &format!(
+                        "all_reduce_sum_f32_host: rank {rank} buffer bytes {} < required {bytes}",
+                        buffer.size()
+                    ),
+                ));
+            }
+        }
+        // Persistent pageable host staging: grow outer to N, each row to at
+        // least `count` f32. Steady state after max count does no alloc.
+        if self.host_ar_tmp.len() != n {
+            self.host_ar_tmp.resize_with(n, Vec::new);
+        }
+        for row in &mut self.host_ar_tmp {
+            if row.len() < count {
+                row.resize(count, 0.0);
+            }
+        }
+        if bytes == 0 {
+            return Ok(());
+        }
+        // D2H: synchronize producer stream, then download into row's prefix.
+        // Preserve first error immediately — no partial-success claim.
+        for r in 0..n {
+            let dev = &self.devices[r];
+            dev.bind_thread()?;
+            let stream = dev.active_stream.as_ref().ok_or_else(|| {
+                HipError::new(
+                    0,
+                    &format!(
+                        "all_reduce_sum_f32_host: device {r} has no active_stream — \
+                         set `gpus.devices[r].active_stream = Some(stream)` before calling.",
+                    ),
+                )
+            })?;
+            dev.hip.stream_synchronize(stream)?;
+            // SAFETY: row.len() >= count ensured above, so first `count` f32
+            // (bytes) lie within the Vec's initialized length. The derived
+            // `[u8]` slice is exactly `bytes` and is bounded to that prefix.
+            let dst: &mut [u8] = unsafe {
+                let ptr = self.host_ar_tmp[r].as_mut_ptr() as *mut u8;
+                std::slice::from_raw_parts_mut(ptr, bytes)
+            };
+            dev.hip.memcpy_dtoh(dst, buffers[r])?;
+        }
+        // Exact left-associated reduction into row 0: rank0+rank1+...
+        Self::host_reduce_rows(&mut self.host_ar_tmp, count);
+        // H2D: synchronously upload row0's summed prefix to every rank.
+        // SAFETY: row0.len() >= count, bytes bounded to first count f32.
+        let src: &[u8] = unsafe {
+            let ptr = self.host_ar_tmp[0].as_ptr() as *const u8;
+            std::slice::from_raw_parts(ptr, bytes)
+        };
+        for r in 0..n {
+            let dev = &self.devices[r];
+            dev.bind_thread()?;
+            dev.hip.memcpy_htod(buffers[r], src)?;
+        }
+        Ok(())
+    }
+
+    /// Pure left-associated host reduction for `all_reduce_sum_f32_host`.
+    /// Sums rows 1..N element-wise into row 0 in rank order:
+    /// `row0 = ((row0 + row1) + row2) + ...` over the first `count` f32.
+    /// Tail beyond `count` is untouched (count-prefix behavior). No HIP.
+    fn host_reduce_rows(rows: &mut [Vec<f32>], count: usize) {
+        if rows.len() <= 1 || count == 0 {
+            return;
+        }
+        // Clamp count to each row's actual length (callers guarantee len >= count).
+        let count = count.min(rows[0].len());
+        let (first, rest) = rows.split_at_mut(1);
+        let acc = &mut first[0][..count];
+        for other in rest.iter_mut() {
+            let src = &other[..count];
+            for i in 0..count {
+                // Left-associated: acc accumulates in rank order.
+                acc[i] += src[i];
+            }
+        }
+    }
+
+    /// Allocate unleased peer-rooted all-reduce scratch before enabling peer
+    /// access. ROCm does not retroactively map allocations made after
+    /// `hipDeviceEnablePeerAccess`, so callers that may use this scratch on
+    /// peer-capable links must reserve their maximum reduction size first.
+    pub fn reserve_peer_reduce_scratch(&mut self, bytes: usize) -> HipResult<()> {
+        self.ensure_peer_ar_tmp(bytes)
+    }
+
+    /// Free unleased peer-rooted all-reduce scratch on owning devices.
+    ///
+    /// Idempotent: empty scratch zeroes `peer_ar_tmp_bytes` and returns `Ok`.
+    /// Refuses while a unique peer lease is active or retained lease buffers
+    /// remain.
+    ///
+    /// Safety order: bind + `device_synchronize` every owning device first so
+    /// scratch is not in pending GPU work, then free. A bind/sync failure
+    /// quarantines and returns the first error **without** freeing — residual
+    /// rows and `peer_ar_tmp_bytes` stay intact for a later retry once the
+    /// device is bindable/quiescent again. A free-phase failure also
+    /// quarantines; any row that could not be taken remains nonempty and
+    /// bytes stay nonzero while residual buffers exist.
+    pub fn free_peer_reduce_scratch(&mut self) -> HipResult<()> {
+        if self.active_peer_lease.is_some() || !self.peer_lease_buffers.is_empty() {
+            return Err(HipError::new(
+                0,
+                "free_peer_reduce_scratch: peer scratch is leased — refuse free while a lease lives",
+            ));
+        }
+        if self.peer_ar_tmp.is_empty() {
+            self.peer_ar_tmp_bytes = 0;
+            return Ok(());
+        }
+
+        // Phase 1: drain every owning device before any hipFree.
+        let mut first_err: Option<HipError> = None;
+        let n = self.peer_ar_tmp.len();
+        for r in 0..n {
+            if let Err(error) = self.devices[r].bind_thread() {
+                first_err.get_or_insert(error);
+                continue;
+            }
+            if let Err(error) = self.devices[r].hip.device_synchronize() {
+                first_err.get_or_insert(error);
+            }
+        }
+        if let Some(e) = first_err {
+            self.peer_lease_quarantined = true;
+            // Residual rows + bytes intentionally left for retry.
+            return Err(e);
+        }
+
+        // Phase 2: free only after all owners are known quiescent.
+        for r in 0..n {
+            if let Err(error) = self.devices[r].bind_thread() {
+                first_err.get_or_insert(error);
+                continue;
+            }
+            for buffer in std::mem::take(&mut self.peer_ar_tmp[r]) {
+                if let Err(error) = self.devices[r].hip.free(buffer) {
+                    first_err.get_or_insert(error);
+                }
+            }
+        }
+        if let Some(e) = first_err {
+            self.peer_lease_quarantined = true;
+            if self.peer_ar_tmp.iter().all(|row| row.is_empty()) {
+                self.peer_ar_tmp.clear();
+                self.peer_ar_tmp_bytes = 0;
+            }
+            return Err(e);
+        }
+        self.peer_ar_tmp.clear();
+        self.peer_ar_tmp_bytes = 0;
+        self.peer_lease_quarantined = false;
+        Ok(())
+    }
+
     /// Ensure `peer_ar_tmp[r]` holds `n-1` buffers of at least `bytes` on each
     /// device. Lazily allocates; grows (freeing the old set) if `bytes` exceeds
     /// the current size. No-op for `n <= 1`. Fails while a unique peer lease
@@ -955,29 +1183,12 @@ impl Gpus {
         if !self.peer_ar_tmp.is_empty() && self.peer_ar_tmp_bytes >= bytes {
             return Ok(());
         }
-        // Free the old (too-small) set on its owning devices before regrowing.
+        // Free the old (too-small) set via the drain-before-free path so
+        // hipFree never races pending GPU work on these buffers.
         if !self.peer_ar_tmp.is_empty() {
-            let mut first_err: Option<HipError> = None;
-            for (r, row) in std::mem::take(&mut self.peer_ar_tmp)
-                .into_iter()
-                .enumerate()
-            {
-                if let Err(e) = self.devices[r].bind_thread() {
-                    first_err.get_or_insert(e);
-                    continue;
-                }
-                for buf in row {
-                    if let Err(e) = self.devices[r].hip.free(buf) {
-                        first_err.get_or_insert(e);
-                    }
-                }
-                let _ = self.devices[r].hip.device_synchronize();
-            }
-            self.peer_ar_tmp_bytes = 0;
-            if let Some(e) = first_err {
-                return Err(e);
-            }
+            self.free_peer_reduce_scratch()?;
         }
+
         let mut all = Vec::with_capacity(n);
         for r in 0..n {
             self.devices[r].bind_thread()?;
@@ -1687,7 +1898,13 @@ mod tests {
                     .unwrap_or_else(|| panic!("total None for n={n} req={requested}"));
                 assert_eq!(per, (n - 1).checked_mul(requested).unwrap());
                 assert_eq!(total, n.checked_mul(per).unwrap());
-                assert_eq!(total, n.checked_mul(n - 1).unwrap().checked_mul(requested).unwrap());
+                assert_eq!(
+                    total,
+                    n.checked_mul(n - 1)
+                        .unwrap()
+                        .checked_mul(requested)
+                        .unwrap()
+                );
             }
         }
         // Zero ranks is rejected (not a projection).
@@ -1717,7 +1934,8 @@ mod tests {
         // Ensure 3*req is Some (fits) when possible; if 3*req already overflows, still None.
         if let Some(per) = peer_reduce_scratch_bytes_per_rank(4, req) {
             assert!(
-                4usize.checked_mul(per).is_none() || peer_reduce_scratch_total_bytes(4, req).is_some(),
+                4usize.checked_mul(per).is_none()
+                    || peer_reduce_scratch_total_bytes(4, req).is_some(),
                 "when total fits, helper must agree"
             );
             if 4usize.checked_mul(per).is_none() {
@@ -1739,5 +1957,36 @@ mod tests {
         assert_eq!(peer_reduce_scratch_total_bytes(4, usize::MAX), None);
         assert_eq!(peer_reduce_scratch_bytes_per_rank(usize::MAX, 2), None);
         assert_eq!(peer_reduce_scratch_total_bytes(usize::MAX, 2), None);
+    }
+
+    #[test]
+    fn host_reduce_rows_left_associated_and_count_prefix() {
+        // Rank-ordered left-associated sum: row0 = ((row0+row1)+row2)+...
+        let mut rows = vec![
+            vec![1.0_f32, 2.0, 3.0, 99.0],
+            vec![10.0, 20.0, 30.0, 88.0],
+            vec![100.0, 200.0, 300.0, 77.0],
+        ];
+        Gpus::host_reduce_rows(&mut rows, 3);
+        assert_eq!(rows[0][0], 111.0);
+        assert_eq!(rows[0][1], 222.0);
+        assert_eq!(rows[0][2], 333.0);
+        // Count-prefix: tail beyond count untouched, and other rows unchanged.
+        assert_eq!(rows[0][3], 99.0);
+        assert_eq!(rows[1], vec![10.0, 20.0, 30.0, 88.0]);
+        assert_eq!(rows[2], vec![100.0, 200.0, 300.0, 77.0]);
+
+        // Count smaller than row length: only first `count` elements summed.
+        let mut rows2 = vec![vec![1.0_f32, 2.0, 3.0, 4.0], vec![10.0, 20.0, 30.0, 40.0]];
+        Gpus::host_reduce_rows(&mut rows2, 2);
+        assert_eq!(rows2[0][0], 11.0);
+        assert_eq!(rows2[0][1], 22.0);
+        assert_eq!(rows2[0][2], 3.0);
+        assert_eq!(rows2[0][3], 4.0);
+
+        // Count zero is no-op.
+        let mut rows3 = vec![vec![5.0_f32, 6.0], vec![7.0, 8.0]];
+        Gpus::host_reduce_rows(&mut rows3, 0);
+        assert_eq!(rows3[0], vec![5.0, 6.0]);
     }
 }

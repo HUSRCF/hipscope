@@ -2605,6 +2605,9 @@ impl Drop for Qwen35DenseTpStaging {
                 weights.free_gpu(gpu);
             }
         }
+        // Best-effort: reclaim peer-rooted reduce scratch reserved pre-enable_peer_all
+        // so a failed dense-TP load cannot strand VRAM after peer mapping.
+        let _ = gpus.free_peer_reduce_scratch();
         for gpu in &mut gpus.devices {
             let _ = gpu.bind_thread();
             gpu.invalidate_weight_caches();
@@ -3223,7 +3226,10 @@ fn load_model_tp_qwen35_dense(
     let config = qwen35::config_from_hfq(&hfq).map_err(|e| format!("qwen35 config: {e}"))?;
     let shard = ShardConfig::new(tp, false, 0, ExpertAssign::Stride)
         .map_err(|e| format!("dense TP ShardConfig: {e}"))?;
-    qwen35::validate_dense_tp(&config, &shard)?;
+    // Compute static per-rank whole-unit layouts CPU-only before any GPU allocation.
+    // Validates GQA/G256 geometry, TP range 2..5, and global coverage contiguously.
+    let layouts = qwen35::dense_tp_rank_layouts(&config, &shard)
+        .map_err(|e| format!("dense TP layout: {e}"))?;
     // Resolve state quant via canonical parser; dense TP honors Q8/default, FP32, Q4.
     let state_quant_resolved = parse_state_quant(state_quant)?;
     // Resolve KV mode via Qwen policy (contiguous only). Explicit unsupported => fail before GPU init.
@@ -3243,8 +3249,9 @@ fn load_model_tp_qwen35_dense(
     };
     // Preflight weights before GPU allocation (validates qt geometry/blob/sidecar).
     qwen35::preflight_weights_dense_tp(&hfq, &config, &shard)?;
-    let configs = (0..tp)
-        .map(|_| qwen35::local_dense_tp_config(&config, &shard))
+    let configs = layouts
+        .iter()
+        .map(|layout| qwen35::local_dense_tp_config(&config, layout))
         .collect::<Vec<_>>();
     let arch_id = hfq.arch_id;
     let chat_template = resolve_chat_template(&hfq, path);
@@ -3277,8 +3284,7 @@ fn load_model_tp_qwen35_dense(
             &mut rank_hfq,
             &config,
             &mut staging.gpus_mut().devices[rank],
-            &shard,
-            rank,
+            &layouts[rank],
         )
         .map_err(|e| format!("dense TP weight load rank {rank}: {e:?}"))?;
         staging.weights.push(weights);
@@ -3320,10 +3326,33 @@ fn load_model_tp_qwen35_dense(
         .map_err(|e| format!("dense TP scratch rank {rank}: {e:?}"))?;
         staging.scratches.push(scratch);
     }
+    // Probe complete peer topology without mutation. Complete → enable + RCCL;
+    // mixed → host-staged allreduce (no peer enable, no device reduce scratch).
+    let peer = staging
+        .gpus_mut()
+        .can_access_peer_all()
+        .map_err(|e| format!("dense TP can_access_peer_all: {e:?}"))?;
+    if peer {
+        let enabled = staging
+            .gpus_mut()
+            .enable_peer_all()
+            .map_err(|e| format!("dense TP enable_peer_all: {e:?}"))?;
+        if !enabled {
+            return Err(
+                "dense TP enable_peer_all returned false after can_access_peer_all".to_string(),
+            );
+        }
+    } else {
+        // Mixed P2P topology: select host-staged allreduce; do not enable peers
+        // or reserve device reduction scratch.
+        eprintln!(
+            "[loader] dense qwen TP mixed topology: host-staged allreduce (no peer enable/scratch)"
+        );
+    }
     hipfire_runtime::ep::ensure_rank_streams(staging.gpus_mut())
         .map_err(|e| format!("dense TP ensure_rank_streams: {e:?}"))?;
     let (gpus, weights, kv_caches, dn_states, scratches) = staging.into_parts();
-    eprintln!("[loader] dense qwen TP load complete: {tp} ranks");
+    eprintln!("[loader] dense qwen TP load complete: {tp} ranks, peer_access={peer}");
 
     Ok(LoadedModel {
         ep: Some(EpState {
@@ -3488,6 +3517,15 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
                 }
             }
         }
+        // Reclaim unleased peer-rooted collective scratch before device pool
+        // teardown. Idempotent across EP variants; fold first error into
+        // ep_first_err so unload reports cleanup failure.
+        if let Err(e) = gpus.free_peer_reduce_scratch() {
+            if ep_first_err.is_none() {
+                ep_first_err = Some(format!("unload dense TP peer reduce scratch: {e:?}"));
+            }
+        }
+
         for dev in gpus.devices.iter_mut() {
             let _ = dev.bind_thread();
             dev.invalidate_weight_caches();

@@ -3390,49 +3390,61 @@ impl DenseTpPending {
     }
 }
 
-/// Load one rank of an arch-5 dense Qwen TP2 model. Directly constructs
-/// each rank's `Qwen35Weights` without ever allocating the full model or
-/// any full projection on this rank. Transactional: any allocation not yet
-/// published is freed on error.
+/// Load one rank of a dense Qwen TP model (TP2..5). Directly constructs
+/// each rank's `Qwen35Weights` from the exact `DenseTpRankLayout` ranges
+/// without ever allocating the full model or any full projection on this rank.
+/// Transactional: any allocation not yet published is freed on error. The
+/// layout is the model-lifetime static whole-unit sharding produced by
+/// `dense_tp_rank_layouts`; the loader computes all layouts CPU-only before any
+/// GPU allocation and never recomputes even divisions here.
 pub fn load_weights_dense_tp_rank(
     hfq: &mut HfqFile,
     config: &Qwen35Config,
     gpu: &mut Gpu,
-    shard: &ShardConfig,
-    rank: usize,
+    layout: &crate::qwen35::config::DenseTpRankLayout,
 ) -> HipResult<Qwen35Weights> {
-    crate::qwen35::config::validate_dense_tp(config, shard).map_err(|e| HipError::new(0, &e))?;
-    if rank >= shard.tp_size {
-        return Err(HipError::new(0, "dense TP rank is out of range"));
+    // Production callers construct every layout and run full blob preflight
+    // before GPU initialization. Keep this rank-local guard for direct callers.
+    let valid_range = |range: &std::ops::Range<usize>, limit: usize| {
+        !range.is_empty() && range.start < range.end && range.end <= limit
+    };
+    if !valid_range(&layout.q_head_range, config.n_heads)
+        || !valid_range(&layout.kv_head_range, config.n_kv_heads)
+        || !valid_range(&layout.delta_key_head_range, config.linear_num_key_heads)
+        || !valid_range(
+            &layout.delta_value_head_range,
+            config.linear_num_value_heads,
+        )
+        || !valid_range(&layout.ffn_hidden_range, config.hidden_dim)
+    {
+        return Err(HipError::new(0, "invalid dense TP rank layout"));
     }
-    preflight_weights_dense_tp(hfq, config, shard).map_err(|e| HipError::new(0, &e))?;
-
     let dim = config.dim;
     let head_dim = config.head_dim;
-    let q_rows = shard.wq_row_range(rank, config.n_heads, head_dim);
-    let kv_heads = shard.kv_head_range(rank, config.n_kv_heads);
+    let q_range = layout.q_head_range.clone();
+    let kv_range = layout.kv_head_range.clone();
     let kv_dim = config.n_kv_heads * head_dim;
-    let kv_rows = kv_heads.start * head_dim..kv_heads.end * head_dim;
-    let attn_cols = shard.wo_col_range(rank, config.n_heads, head_dim);
-    let local_ffn = config.hidden_dim / shard.tp_size;
-    let ffn_rows = rank * local_ffn..(rank + 1) * local_ffn;
+    let q_rows = q_range.start * head_dim * 2..q_range.end * head_dim * 2;
+    let kv_rows = kv_range.start * head_dim..kv_range.end * head_dim;
+    let attn_cols = q_range.start * head_dim..q_range.end * head_dim;
+    let ffn_range = layout.ffn_hidden_range.clone();
     let key_dim = config.linear_num_key_heads * config.linear_key_head_dim;
     let value_dim = config.linear_num_value_heads * config.linear_value_head_dim;
     let dn_rows = 2 * key_dim + value_dim;
     let qkv_dim = dn_rows;
-    let key_heads = shard.dn_key_head_range(rank, config.linear_num_key_heads);
-    let value_heads = shard.dn_value_head_range(rank, config.linear_num_value_heads);
+    let dk_range = layout.delta_key_head_range.clone();
+    let dv_range = layout.delta_value_head_range.clone();
     let key_width = config.linear_key_head_dim;
     let value_width = config.linear_value_head_dim;
     let qkv_ranges = [
-        (key_heads.start * key_width, key_heads.end * key_width),
+        (dk_range.start * key_width, dk_range.end * key_width),
         (
-            key_dim + key_heads.start * key_width,
-            key_dim + key_heads.end * key_width,
+            key_dim + dk_range.start * key_width,
+            key_dim + dk_range.end * key_width,
         ),
         (
-            2 * key_dim + value_heads.start * value_width,
-            2 * key_dim + value_heads.end * value_width,
+            2 * key_dim + dv_range.start * value_width,
+            2 * key_dim + dv_range.end * value_width,
         ),
     ];
     let conv = config.conv_kernel_dim;
@@ -3441,7 +3453,6 @@ pub fn load_weights_dense_tp_rank(
         (qkv_ranges[1].0 * conv, qkv_ranges[1].1 * conv),
         (qkv_ranges[2].0 * conv, qkv_ranges[2].1 * conv),
     ];
-
     let mut pending = DenseTpPending::new();
     let res: HipResult<Qwen35Weights> = (|| {
         let (embd_info, embd_data) = qwen35_tensor_data_cow(hfq, "embed_tokens.weight")
@@ -3581,7 +3592,7 @@ pub fn load_weights_dense_tp_rank(
                             &format!("{p}.mlp.gate_proj.weight"),
                             config.hidden_dim,
                             dim,
-                            DenseTpSlice::Rows(ffn_rows.start, ffn_rows.end),
+                            DenseTpSlice::Rows(ffn_range.start, ffn_range.end),
                         )?;
                         w_gate_opt = Some(w_gate);
                         let w_up = load_weight_tensor_dense_tp(
@@ -3590,7 +3601,7 @@ pub fn load_weights_dense_tp_rank(
                             &format!("{p}.mlp.up_proj.weight"),
                             config.hidden_dim,
                             dim,
-                            DenseTpSlice::Rows(ffn_rows.start, ffn_rows.end),
+                            DenseTpSlice::Rows(ffn_range.start, ffn_range.end),
                         )?;
                         w_up_opt = Some(w_up);
                         let w_down = load_weight_tensor_dense_tp(
@@ -3599,7 +3610,7 @@ pub fn load_weights_dense_tp_rank(
                             &format!("{p}.mlp.down_proj.weight"),
                             dim,
                             config.hidden_dim,
-                            DenseTpSlice::Cols(ffn_rows.start, ffn_rows.end),
+                            DenseTpSlice::Cols(ffn_range.start, ffn_range.end),
                         )?;
                         w_down_opt = Some(w_down);
                         Ok(LayerWeights::FullAttn(FullAttnLayerWeights {
@@ -3695,8 +3706,8 @@ pub fn load_weights_dense_tp_rank(
                             value_dim,
                             dim,
                             DenseTpSlice::Rows(
-                                value_heads.start * value_width,
-                                value_heads.end * value_width,
+                                dv_range.start * value_width,
+                                dv_range.end * value_width,
                             ),
                         )?;
                         wz_opt = Some(wz);
@@ -3706,7 +3717,7 @@ pub fn load_weights_dense_tp_rank(
                             &format!("{p}.linear_attn.in_proj_a.weight"),
                             config.linear_num_value_heads,
                             dim,
-                            DenseTpSlice::Rows(value_heads.start, value_heads.end),
+                            DenseTpSlice::Rows(dv_range.start, dv_range.end),
                         )?;
                         w_alpha_opt = Some(w_alpha);
                         let w_beta = load_weight_tensor_dense_tp(
@@ -3715,7 +3726,7 @@ pub fn load_weights_dense_tp_rank(
                             &format!("{p}.linear_attn.in_proj_b.weight"),
                             config.linear_num_value_heads,
                             dim,
-                            DenseTpSlice::Rows(value_heads.start, value_heads.end),
+                            DenseTpSlice::Rows(dv_range.start, dv_range.end),
                         )?;
                         w_beta_opt = Some(w_beta);
                         let a_log = load_raw_f32_sliced(
@@ -3723,7 +3734,7 @@ pub fn load_weights_dense_tp_rank(
                             gpu,
                             &format!("{p}.linear_attn.A_log"),
                             config.linear_num_value_heads,
-                            &[(value_heads.start, value_heads.end)],
+                            &[(dv_range.start, dv_range.end)],
                         )?;
                         a_log_opt = Some(a_log);
                         let dt_bias = load_raw_f32_sliced(
@@ -3731,7 +3742,7 @@ pub fn load_weights_dense_tp_rank(
                             gpu,
                             &format!("{p}.linear_attn.dt_bias"),
                             config.linear_num_value_heads,
-                            &[(value_heads.start, value_heads.end)],
+                            &[(dv_range.start, dv_range.end)],
                         )?;
                         dt_bias_opt = Some(dt_bias);
                         let conv_weight = load_raw_f32_sliced(
@@ -3756,8 +3767,8 @@ pub fn load_weights_dense_tp_rank(
                             dim,
                             value_dim,
                             DenseTpSlice::Cols(
-                                value_heads.start * value_width,
-                                value_heads.end * value_width,
+                                dv_range.start * value_width,
+                                dv_range.end * value_width,
                             ),
                         )?;
                         wo_opt = Some(wo);
@@ -3774,7 +3785,7 @@ pub fn load_weights_dense_tp_rank(
                             &format!("{p}.mlp.gate_proj.weight"),
                             config.hidden_dim,
                             dim,
-                            DenseTpSlice::Rows(ffn_rows.start, ffn_rows.end),
+                            DenseTpSlice::Rows(ffn_range.start, ffn_range.end),
                         )?;
                         w_gate_opt = Some(w_gate);
                         let w_up = load_weight_tensor_dense_tp(
@@ -3783,7 +3794,7 @@ pub fn load_weights_dense_tp_rank(
                             &format!("{p}.mlp.up_proj.weight"),
                             config.hidden_dim,
                             dim,
-                            DenseTpSlice::Rows(ffn_rows.start, ffn_rows.end),
+                            DenseTpSlice::Rows(ffn_range.start, ffn_range.end),
                         )?;
                         w_up_opt = Some(w_up);
                         let w_down = load_weight_tensor_dense_tp(
@@ -3792,7 +3803,7 @@ pub fn load_weights_dense_tp_rank(
                             &format!("{p}.mlp.down_proj.weight"),
                             dim,
                             config.hidden_dim,
-                            DenseTpSlice::Cols(ffn_rows.start, ffn_rows.end),
+                            DenseTpSlice::Cols(ffn_range.start, ffn_range.end),
                         )?;
                         w_down_opt = Some(w_down);
                         Ok(LayerWeights::DeltaNet(DeltaNetLayerWeights {
