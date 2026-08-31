@@ -39,6 +39,7 @@ use hipfire_engine::terminal::{
     CLIENT_TERMINAL_COMMIT_TIMEOUT,
 };
 use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::loader_api::ModelSource;
 use hipfire_runtime::prompt_frame::{
     AssistantPrefix, ChatFrame, JinjaChatFrame, Message, Role, ThinkMode,
 };
@@ -57,17 +58,44 @@ pub struct SlotBackend {
     vocab: usize,
     active: AtomicUsize,
 }
-
 impl SlotBackend {
-    /// CPU preflight then GPU load. Called only when experimental_multi_slot load is requested.
+    /// CPU preflight then GPU load. The path wrapper is retained for callers
+    /// outside the daemon admission boundary; daemon swaps use
+    /// [`Self::load_admitted`] to consume the already-open source.
     pub fn load(
         model_path: &str,
         n_slots: usize,
         cap_tokens: usize,
         prefill_chunk: usize,
     ) -> Result<Self, String> {
-        // CPU preflight: open HFQ, arch, VL, config, tokenizer.
-        let preflight = cpu_preflight(model_path)?;
+        let source = ModelSource::from_path(model_path)?;
+        Self::load_source(model_path, source, n_slots, cap_tokens, prefill_chunk)
+    }
+
+    /// Consume a source admitted by the loader before daemon teardown.
+    ///
+    /// No path-based open, classification, or admission occurs here. The
+    /// source is carried into the slot engine's worker so a model swap has one
+    /// source lifecycle from admission through execution.
+    pub fn load_admitted(
+        model_path: &str,
+        admitted: hipfire_loader::AdmittedLoad,
+        n_slots: usize,
+        cap_tokens: usize,
+        prefill_chunk: usize,
+    ) -> Result<Self, String> {
+        let source = admitted.source;
+        Self::load_source(model_path, source, n_slots, cap_tokens, prefill_chunk)
+    }
+
+    fn load_source(
+        model_path: &str,
+        source: ModelSource,
+        n_slots: usize,
+        cap_tokens: usize,
+        prefill_chunk: usize,
+    ) -> Result<Self, String> {
+        let preflight = cpu_preflight_source(&source)?;
         let arch_str = preflight.arch_str.clone();
         let dim = preflight.dim;
         let layers = preflight.layers;
@@ -79,7 +107,7 @@ impl SlotBackend {
         let cap_tokens = cap_tokens.max(1);
         let prefill_chunk = prefill_chunk.max(1).min(cap_tokens);
 
-        let engine = hipfire_arch_qwen35::serve_engine::SlotEngine::spawn(
+        let engine = hipfire_arch_qwen35::serve_engine::SlotEngine::spawn_with_source(
             hipfire_arch_qwen35::serve_engine::EngineConfig {
                 model_path: PathBuf::from(model_path),
                 n_slots,
@@ -88,6 +116,7 @@ impl SlotBackend {
                 host_budget_bytes: 16 * 1024 * 1024 * 1024,
                 swap_dir: std::env::temp_dir().join("hipfire-serve-swap"),
             },
+            source,
         )
         .map_err(|e| format!("SlotEngine spawn: {e}"))?;
 
@@ -97,8 +126,8 @@ impl SlotBackend {
             arch_str,
             dim,
             chat_template,
-            layers,
             vocab,
+            layers,
             active: AtomicUsize::new(0),
         })
     }
@@ -846,9 +875,13 @@ struct Preflight {
     chat_template: Option<String>,
 }
 
-fn cpu_preflight(model_path: &str) -> Result<Preflight, String> {
-    let hfq =
-        HfqFile::open(std::path::Path::new(model_path)).map_err(|e| format!("open model: {e}"))?;
+fn cpu_preflight_source(source: &ModelSource) -> Result<Preflight, String> {
+    let hfq = match source {
+        ModelSource::Hfq(hfq) => hfq,
+        ModelSource::Dir(_) => {
+            return Err("experimental multi-slot requires an HFQ source".to_string())
+        }
+    };
     validate_arch_id(hfq.arch_id)?;
     if is_vision_hfq(&hfq) {
         return Err("vision model not supported in experimental multi-slot".to_string());

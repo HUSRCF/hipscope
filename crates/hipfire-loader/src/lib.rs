@@ -287,6 +287,25 @@ pub struct LoadAdmission {
     pub variant: ModelVariant,
     pub mesh: DeviceMesh,
 }
+/// A source that has completed classification and parallel admission.
+///
+/// Daemon model swaps carry this value across `DaemonLoadState` teardown into
+/// the execution entrypoint. The source is opened once and the selected
+/// carrier is retained, so execution never needs to reopen or reclassify it.
+pub struct AdmittedLoad {
+    pub source: ModelSource,
+    pub admission: LoadAdmission,
+    pub carrier: &'static dyn Carrier,
+}
+
+impl AdmittedLoad {
+    /// Split the retained source, carrier, and effective topology for an
+    /// admitted execution path.
+    pub fn into_parts(self) -> (ModelSource, LoadAdmission, &'static dyn Carrier) {
+        (self.source, self.admission, self.carrier)
+    }
+}
+
 
 /// Classify a source through exactly one carrier and return its family facts.
 ///
@@ -341,33 +360,52 @@ fn raw_for_cli_route(variant: ModelVariant, raw: RawParallelism) -> RawParalleli
 
 /// Admit an already-open source after classification. This private helper keeps
 /// regular and axis-specific wrappers on the same source-aware decision.
-fn admit_source(
+fn admit_source_with_carrier(
     src: &ModelSource,
     raw: RawParallelism,
-) -> Result<LoadAdmission, LoadAdmissionError> {
+) -> Result<(&'static dyn Carrier, LoadAdmission), LoadAdmissionError> {
     let source = source_kind(src);
-    let (_carrier, variant) = classify_source(src)?;
+    let (carrier, variant) = classify_source(src)?;
     let raw = raw_for_cli_route(variant, raw);
     let mesh = resolve(source, variant, raw).map_err(LoadAdmissionError::Admission)?;
-    Ok(LoadAdmission {
+    Ok((
+        carrier,
+        LoadAdmission {
+            source,
+            variant,
+            mesh,
+        },
+    ))
+}
+
+
+/// Open, classify, and admit one model while retaining the source for the
+/// subsequent execution entrypoint. This is the daemon-facing admission
+/// boundary: callers must move the returned value through teardown instead of
+/// calling a path-based load wrapper.
+pub fn admit_load_with_source(
+    path: &str,
+    raw: RawParallelism,
+) -> Result<AdmittedLoad, LoadAdmissionError> {
+    let source = open_source(path)?;
+    let (carrier, admission) = admit_source_with_carrier(&source, raw)?;
+    Ok(AdmittedLoad {
         source,
-        variant,
-        mesh,
+        admission,
+        carrier,
     })
 }
 
 /// Open, classify, and admit one model's raw parallel request.
 ///
-/// Source probing/file I/O is allowed here. No GPU handle, device owner,
-/// remap, mesh binding, or model allocation is touched until this succeeds.
-/// All downstream callers must branch on the returned mesh/variant rather than
-/// on raw CLI degree fields.
+/// This compatibility/query helper returns only the effective admission.
+/// Daemon execution must use [`admit_load_with_source`] so the already-open
+/// source can be consumed without a second open or admission.
 pub fn admit_load(
     path: &str,
     raw: RawParallelism,
 ) -> Result<LoadAdmission, LoadAdmissionError> {
-    let src = open_source(path)?;
-    admit_source(&src, raw)
+    Ok(admit_load_with_source(path, raw)?.admission)
 }
 
 // ─── Typed routing (replaces stringly `c.name() == "..."` predicates) ──────
@@ -2331,11 +2369,11 @@ fn route_admitted_load_with<T, A, C>(
     continue_load: C,
 ) -> Result<T, String>
 where
-    A: FnOnce(&str, RawParallelism) -> Result<(ModelSource, LoadAdmission), LoadAdmissionError>,
-    C: FnOnce(ModelSource, LoadAdmission) -> Result<T, String>,
+    A: FnOnce(&str, RawParallelism) -> Result<AdmittedLoad, LoadAdmissionError>,
+    C: FnOnce(AdmittedLoad) -> Result<T, String>,
 {
-    let (source, admission) = admit(path, raw).map_err(|error| error.to_string())?;
-    continue_load(source, admission)
+    let admitted = admit(path, raw).map_err(|error| error.to_string())?;
+    continue_load(admitted)
 }
 
 fn route_admitted_load<T, C>(
@@ -2344,18 +2382,9 @@ fn route_admitted_load<T, C>(
     continue_load: C,
 ) -> Result<T, String>
 where
-    C: FnOnce(ModelSource, LoadAdmission) -> Result<T, String>,
+    C: FnOnce(AdmittedLoad) -> Result<T, String>,
 {
-    route_admitted_load_with(
-        path,
-        raw,
-        |path, raw| {
-            let source = open_source(path)?;
-            let admission = admit_source(&source, raw)?;
-            Ok((source, admission))
-        },
-        continue_load,
-    )
+    route_admitted_load_with(path, raw, admit_load_with_source, continue_load)
 }
 
 // ─── Main public API ──────────────────────────────────────────────────
@@ -2428,28 +2457,31 @@ pub fn load_model_with_kv_backend(
     spec: SpecLoadCfg,
     gpu: &mut rdna_compute::Gpu,
 ) -> Result<LoadedModel, String> {
-    route_admitted_load(path, RawParallelism::new(pp, 1, 1), |src, admission| {
-        load_model_with_kv_backend_admitted(
-            path,
-            max_seq,
-            deepseek4_experts_per_token,
-            deepseek4_compute_placement,
-            draft_path,
-            kv_mode_override,
-            kv_backend_override,
-            kv_adaptive_override,
-            state_quant_override,
-            cask,
-            spec,
-            gpu,
-            src,
-            admission,
-        )
-    })
+    route_admitted_load(
+        path,
+        RawParallelism::new(pp, 1, 1),
+        |admitted| {
+            load_model_with_kv_backend_admitted(
+                path,
+                max_seq,
+                deepseek4_experts_per_token,
+                deepseek4_compute_placement,
+                draft_path,
+                kv_mode_override,
+                kv_backend_override,
+                kv_adaptive_override,
+                state_quant_override,
+                cask,
+                spec,
+                gpu,
+                admitted,
+            )
+        },
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
-fn load_model_with_kv_backend_admitted(
+pub fn load_model_with_kv_backend_admitted(
     path: &str,
     max_seq: usize,
     deepseek4_experts_per_token: Option<usize>,
@@ -2462,9 +2494,14 @@ fn load_model_with_kv_backend_admitted(
     cask: &CaskConfig,
     spec: SpecLoadCfg,
     gpu: &mut rdna_compute::Gpu,
-    src: ModelSource,
-    admission: LoadAdmission,
+    admitted: AdmittedLoad,
 ) -> Result<LoadedModel, String> {
+    let AdmittedLoad {
+        source: src,
+        admission,
+        carrier,
+    } = admitted;
+
     // Retry any arenas left by a prior failed teardown; refuse the load if
     // ownership is still live so a new model cannot stack on pending VMM state.
     ensure_vmm_ready_for_load(gpu)?;
@@ -2567,9 +2604,8 @@ fn load_model_with_kv_backend_admitted(
         gemma4_draft_len: GEMMA4_EAGLE_DRAFT_LEN,
     };
 
-    // Admission already performed the namespace/variant checks above; resolve
-    // the same carrier for the actual load without another policy decision.
-    let (carrier, _) = classify_source(&src).map_err(|error| error.to_string())?;
+    // Admission retained the unique carrier selected at the source boundary;
+    // never classify or probe the source again after the daemon handoff.
     if kv_backend == KvBackend::Vmm
         && !matches!(carrier.name(), "qwen35" | "deepseek4" | "muse_glimmer")
     {
@@ -2630,30 +2666,33 @@ pub fn load_model_with_gemma4_drafter(
     spec: SpecLoadCfg,
     gpu: &mut rdna_compute::Gpu,
 ) -> Result<LoadedModel, String> {
-    route_admitted_load(path, RawParallelism::new(pp, 1, 1), |src, admission| {
-        load_model_with_gemma4_drafter_admitted(
-            path,
-            max_seq,
-            deepseek4_experts_per_token,
-            deepseek4_compute_placement,
-            draft_path,
-            gemma4_drafter_path,
-            gemma4_draft_len,
-            kv_mode_override,
-            kv_backend_override,
-            kv_adaptive_override,
-            state_quant_override,
-            cask,
-            spec,
-            gpu,
-            src,
-            admission,
-        )
-    })
+    route_admitted_load(
+        path,
+        RawParallelism::new(pp, 1, 1),
+        |admitted| {
+            load_model_with_gemma4_drafter_admitted(
+                path,
+                max_seq,
+                deepseek4_experts_per_token,
+                deepseek4_compute_placement,
+                draft_path,
+                gemma4_drafter_path,
+                gemma4_draft_len,
+                kv_mode_override,
+                kv_backend_override,
+                kv_adaptive_override,
+                state_quant_override,
+                cask,
+                spec,
+                gpu,
+                admitted,
+            )
+        },
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
-fn load_model_with_gemma4_drafter_admitted(
+pub fn load_model_with_gemma4_drafter_admitted(
     path: &str,
     max_seq: usize,
     deepseek4_experts_per_token: Option<usize>,
@@ -2663,14 +2702,18 @@ fn load_model_with_gemma4_drafter_admitted(
     gemma4_draft_len: usize,
     kv_mode_override: Option<&str>,
     kv_backend_override: Option<&str>,
+    kv_adaptive_override: Option<&str>,
     state_quant_override: Option<&str>,
     cask: &CaskConfig,
-    pp: usize,
     spec: SpecLoadCfg,
     gpu: &mut rdna_compute::Gpu,
-    src: ModelSource,
-    admission: LoadAdmission,
+    admitted: AdmittedLoad,
 ) -> Result<LoadedModel, String> {
+    let AdmittedLoad {
+        source: src,
+        admission,
+        carrier,
+    } = admitted;
     let _ = gemma4_eagle_spec_len(Some(gemma4_draft_len as u64))
         .map_err(|e| format!("gemma4 drafter: {e}"))?;
     // Retry any arenas left by a prior failed teardown; refuse the load if
@@ -2722,7 +2765,8 @@ fn load_model_with_gemma4_drafter_admitted(
         gemma4_drafter_path,
         gemma4_draft_len,
     };
-    let (carrier, _) = classify_source(&src).map_err(|error| error.to_string())?;
+    // Admission retained the unique carrier selected at the source boundary;
+    // never classify or probe the source again after the daemon handoff.
     if kv_backend == KvBackend::Vmm
         && !matches!(carrier.name(), "qwen35" | "deepseek4" | "muse_glimmer")
     {
@@ -3198,26 +3242,35 @@ pub fn load_model_ep_with_kv_mode(
     kv_backend: Option<&str>,
     state_quant: Option<&str>,
 ) -> Result<LoadedModel, String> {
-    route_admitted_load(path, RawParallelism::new(1, tp, 1), |_src, admission| {
-        load_model_ep_with_kv_mode_admitted(
-            path,
-            max_seq,
-            kv_mode,
-            kv_backend,
-            state_quant,
-            admission,
-        )
-    })
+    route_admitted_load(
+        path,
+        RawParallelism::new(1, tp, 1),
+        |admitted| {
+            load_model_ep_with_kv_mode_admitted(
+                path,
+                max_seq,
+                kv_mode,
+                kv_backend,
+                state_quant,
+                admitted,
+            )
+        },
+    )
 }
 
-fn load_model_ep_with_kv_mode_admitted(
+pub fn load_model_ep_with_kv_mode_admitted(
     path: &str,
     max_seq: usize,
     kv_mode: Option<&str>,
     kv_backend: Option<&str>,
     state_quant: Option<&str>,
-    admission: LoadAdmission,
+    admitted: AdmittedLoad,
 ) -> Result<LoadedModel, String> {
+    let AdmittedLoad {
+        source,
+        admission,
+        carrier: _,
+    } = admitted;
     let kv_backend_raw = kv_backend.unwrap_or("contiguous");
     let kv_backend_kind: KvBackend = kv_backend_raw.parse().map_err(|err| format!("{err}"))?;
     let degree = match admission.variant {
@@ -3235,6 +3288,7 @@ fn load_model_ep_with_kv_mode_admitted(
     match admission.variant {
         ModelVariant::Deepseek4 => load_model_ep_ds4(
             path,
+            source,
             max_seq,
             degree,
             resolve_deepseek4_compressor_cache_kv_mode(kv_mode)?,
@@ -3242,18 +3296,18 @@ fn load_model_ep_with_kv_mode_admitted(
         ModelVariant::Minimax if kv_backend_kind == KvBackend::Vmm => {
             Err(format!("KV backend '{kv_backend_raw}' requires tp=1"))
         }
-        ModelVariant::Minimax => load_model_ep_minimax(path, max_seq, degree),
+        ModelVariant::Minimax => load_model_ep_minimax(path, source, max_seq, degree),
         ModelVariant::Qwen35Moe if kv_backend_kind == KvBackend::Vmm => {
             Err(format!("KV backend '{kv_backend_raw}' requires tp=1"))
         }
         ModelVariant::Qwen35Moe => {
-            load_model_ep_qwen35(path, max_seq, degree, kv_mode, kv_backend, state_quant)
+            load_model_ep_qwen35(path, source, max_seq, degree, kv_mode, kv_backend, state_quant)
         }
         ModelVariant::Qwen35Dense if kv_backend_kind == KvBackend::Vmm => {
             Err(format!("KV backend '{kv_backend_raw}' requires tp=1"))
         }
         ModelVariant::Qwen35Dense => {
-            load_model_tp_qwen35_dense(path, max_seq, degree, kv_mode, state_quant)
+            load_model_tp_qwen35_dense(path, source, max_seq, degree, kv_mode, state_quant)
         }
         _ => unreachable!("unsupported parallel variant was rejected by admission"),
     }
@@ -3268,17 +3322,31 @@ pub fn load_model_ep_with_compressor_cache(
     tp: usize,
     compressor_cache: hipfire_config::Deepseek4CompressorCache,
 ) -> Result<LoadedModel, String> {
-    route_admitted_load(path, RawParallelism::new(1, tp, 1), |_src, admission| {
-        load_model_ep_with_compressor_cache_admitted(path, max_seq, compressor_cache, admission)
-    })
+    route_admitted_load(
+        path,
+        RawParallelism::new(1, tp, 1),
+        |admitted| {
+            load_model_ep_with_compressor_cache_admitted(
+                path,
+                max_seq,
+                compressor_cache,
+                admitted,
+            )
+        },
+    )
 }
 
-fn load_model_ep_with_compressor_cache_admitted(
+pub fn load_model_ep_with_compressor_cache_admitted(
     path: &str,
     max_seq: usize,
     compressor_cache: hipfire_config::Deepseek4CompressorCache,
-    admission: LoadAdmission,
+    admitted: AdmittedLoad,
 ) -> Result<LoadedModel, String> {
+    let AdmittedLoad {
+        source,
+        admission,
+        carrier: _,
+    } = admitted;
     let degree = match admission.variant {
         ModelVariant::Deepseek4 | ModelVariant::Minimax | ModelVariant::Qwen35Moe => {
             admission.mesh.size_of(hipfire_hardware::DimKind::Ep)
@@ -3291,11 +3359,11 @@ fn load_model_ep_with_compressor_cache_admitted(
         }
     };
     match admission.variant {
-        ModelVariant::Deepseek4 => load_model_ep_ds4(path, max_seq, degree, compressor_cache),
+        ModelVariant::Deepseek4 => load_model_ep_ds4(path, source, max_seq, degree, compressor_cache),
         ModelVariant::Minimax
             if compressor_cache == hipfire_config::Deepseek4CompressorCache::F32 =>
         {
-            load_model_ep_minimax(path, max_seq, degree)
+            load_model_ep_minimax(path, source, max_seq, degree)
         }
         ModelVariant::Minimax => {
             Err("DeepSeek V4 compressor-cache storage cannot be applied to MiniMax".to_string())
@@ -3303,12 +3371,12 @@ fn load_model_ep_with_compressor_cache_admitted(
         ModelVariant::Qwen35Moe
             if compressor_cache == hipfire_config::Deepseek4CompressorCache::F32 =>
         {
-            load_model_ep_qwen35(path, max_seq, degree, None, None, None)
+            load_model_ep_qwen35(path, source, max_seq, degree, None, None, None)
         }
         ModelVariant::Qwen35Dense
             if compressor_cache == hipfire_config::Deepseek4CompressorCache::F32 =>
         {
-            load_model_tp_qwen35_dense(path, max_seq, degree, None, None)
+            load_model_tp_qwen35_dense(path, source, max_seq, degree, None, None)
         }
         ModelVariant::Qwen35Moe | ModelVariant::Qwen35Dense => {
             Err("DeepSeek V4 compressor-cache storage cannot be applied to Qwen3.5".to_string())
@@ -3317,8 +3385,16 @@ fn load_model_ep_with_compressor_cache_admitted(
     }
 }
 
+fn take_hfq_source(source: ModelSource, route: &str) -> Result<HfqFile, String> {
+    match source {
+        ModelSource::Hfq(hfq) => Ok(hfq),
+        ModelSource::Dir(_) => Err(format!("{route} requires an HFQ source")),
+    }
+}
+
 fn load_model_ep_ds4(
     path: &str,
+    source: ModelSource,
     max_seq: usize,
     tp: usize,
     compressor_cache: hipfire_config::Deepseek4CompressorCache,
@@ -3326,7 +3402,7 @@ fn load_model_ep_ds4(
     use hipfire_runtime::arch::Architecture;
     use hipfire_runtime::tp_shard::{ExpertAssign, ShardConfig};
 
-    let hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
+    let mut hfq = take_hfq_source(source, "DeepSeek V4 EP")?;
     let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .map_err(|e| format!("tokenizer not found: {e}"))?;
     let mut config = <deepseek4::DeepseekV4 as Architecture>::config_from_hfq(&hfq)?;
@@ -3376,10 +3452,10 @@ fn load_model_ep_ds4(
         staging.gpus_mut().devices[r]
             .bind_thread()
             .map_err(|e| format!("bind {r}: {e:?}"))?;
-        let mut h = HfqFile::open(Path::new(path)).map_err(|e| format!("reopen rank {r}: {e}"))?;
         let dev = &mut staging.gpus_mut().devices[r];
-        let w = deepseek4::DeepseekV4::load_weights_sharded(&mut h, &config, dev, &shard, r)
-            .map_err(|e| format!("shard load rank {r}: {e:?}"))?;
+        let w =
+            deepseek4::DeepseekV4::load_weights_sharded(&mut hfq, &config, dev, &shard, r)
+                .map_err(|e| format!("shard load rank {r}: {e:?}"))?;
         staging.weights.push(w);
         // Deterministic partial-load fault for testing the cleanup path. Fires
         // AFTER ranks 0..=r loaded; the guard's Drop frees them all.
@@ -3555,11 +3631,16 @@ fn load_model_ep_ds4(
     })
 }
 
-fn load_model_ep_minimax(path: &str, max_seq: usize, tp: usize) -> Result<LoadedModel, String> {
+fn load_model_ep_minimax(
+    path: &str,
+    source: ModelSource,
+    max_seq: usize,
+    tp: usize,
+) -> Result<LoadedModel, String> {
     use hipfire_runtime::arch::Architecture;
     use hipfire_runtime::tp_shard::{ExpertAssign, ShardConfig};
 
-    let hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
+    let mut hfq = take_hfq_source(source, "MiniMax EP")?;
     let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .map_err(|e| format!("tokenizer not found: {e}"))?;
     let config = <minimax::MiniMaxM2 as Architecture>::config_from_hfq(&hfq)?;
@@ -3602,9 +3683,8 @@ fn load_model_ep_minimax(path: &str, max_seq: usize, tp: usize) -> Result<Loaded
         staging.gpus_mut().devices[r]
             .bind_thread()
             .map_err(|e| format!("bind {r}: {e:?}"))?;
-        let mut h = HfqFile::open(Path::new(path)).map_err(|e| format!("reopen rank {r}: {e}"))?;
         let dev = &mut staging.gpus_mut().devices[r];
-        let w = minimax::MiniMaxWeights::load(&mut h, &config, dev, Some((&shard, r)))
+        let w = minimax::MiniMaxWeights::load(&mut hfq, &config, dev, Some((&shard, r)))
             .map_err(|e| format!("shard load rank {r}: {e:?}"))?;
         staging.weights.push(w);
         if fail_rank == Some(r) {
@@ -3679,6 +3759,7 @@ fn load_model_ep_minimax(path: &str, max_seq: usize, tp: usize) -> Result<Loaded
 }
 fn load_model_ep_qwen35(
     path: &str,
+    source: ModelSource,
     max_seq: usize,
     tp: usize,
     kv_mode: Option<&str>,
@@ -3687,7 +3768,7 @@ fn load_model_ep_qwen35(
 ) -> Result<LoadedModel, String> {
     use hipfire_runtime::tp_shard::{ExpertAssign, ShardConfig};
 
-    let hfq_probe = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
+    let mut hfq_probe = take_hfq_source(source, "Qwen3.5 EP")?;
     if hfq_probe.arch_id != 5 && hfq_probe.arch_id != 6 {
         return Err(format!(
             "EP qwen35 requires arch 5 or 6, got {}",
@@ -3699,8 +3780,14 @@ fn load_model_ep_qwen35(
             .map_err(|e| format!("tokenizer not found: {e}"))?;
     let config = qwen35::config_from_hfq(&hfq_probe).map_err(|e| format!("qwen35 config: {e}"))?;
     if config.num_experts == 0 {
-        drop(hfq_probe);
-        return load_model_tp_qwen35_dense(path, max_seq, tp, kv_mode, state_quant);
+        return load_model_tp_qwen35_dense(
+            path,
+            ModelSource::Hfq(hfq_probe),
+            max_seq,
+            tp,
+            kv_mode,
+            state_quant,
+        );
     }
     // MoE EP: keep existing behavior; dense-only selectors are handled above. Silence unused.
     let _ = (kv_mode, kv_backend, state_quant);
@@ -3748,9 +3835,8 @@ fn load_model_ep_qwen35(
         staging.gpus_mut().devices[r]
             .bind_thread()
             .map_err(|e| format!("bind {r}: {e:?}"))?;
-        let mut h = HfqFile::open(Path::new(path)).map_err(|e| format!("reopen rank {r}: {e}"))?;
         let dev = &mut staging.gpus_mut().devices[r];
-        let w = qwen35::load_weights_ep_rank(&mut h, dev, &config, shard.clone(), r)
+        let w = qwen35::load_weights_ep_rank(&mut hfq_probe, dev, &config, shard.clone(), r)
             .map_err(|e| format!("shard load rank {r}: {e:?}"))?;
         staging.weights.push(w);
         if fail_rank == Some(r) {
@@ -3799,6 +3885,7 @@ fn load_model_ep_qwen35(
 
 fn load_model_tp_qwen35_dense(
     path: &str,
+    source: ModelSource,
     max_seq: usize,
     tp: usize,
     kv_mode: Option<&str>,
@@ -3806,7 +3893,7 @@ fn load_model_tp_qwen35_dense(
 ) -> Result<LoadedModel, String> {
     use hipfire_runtime::tp_shard::{ExpertAssign, ShardConfig};
 
-    let hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
+    let mut hfq = take_hfq_source(source, "Qwen3.5 dense TP")?;
     let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .map_err(|e| format!("tokenizer not found: {e}"))?;
     let config = qwen35::config_from_hfq(&hfq).map_err(|e| format!("qwen35 config: {e}"))?;
@@ -3850,7 +3937,6 @@ fn load_model_tp_qwen35_dense(
             config.eos_token
         }
     };
-    drop(hfq);
 
     let device_opts = hipfire_runtime::config::get().device_resolve_opts();
     let gpus =
@@ -3866,10 +3952,8 @@ fn load_model_tp_qwen35_dense(
         staging.gpus_mut().devices[rank]
             .bind_thread()
             .map_err(|e| format!("dense TP bind rank {rank}: {e:?}"))?;
-        let mut rank_hfq = HfqFile::open(Path::new(path))
-            .map_err(|e| format!("dense TP reopen rank {rank}: {e}"))?;
         let weights = qwen35::load_weights_dense_tp_rank(
-            &mut rank_hfq,
+            &mut hfq,
             &config,
             &mut staging.gpus_mut().devices[rank],
             &layouts[rank],
@@ -4396,12 +4480,8 @@ mod registry_tests {
             let result = route_admitted_load_with(
                 &format!("injected-{name}"),
                 raw,
-                move |_, _| {
-                    Err::<(super::ModelSource, super::LoadAdmission), LoadAdmissionError>(
-                        refusal,
-                    )
-                },
-                move |_, _| {
+                move |_, _| Err::<super::AdmittedLoad, LoadAdmissionError>(refusal),
+                move |_| {
                     continuation_operations.borrow_mut().enter();
                     Ok(())
                 },

@@ -20,6 +20,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use hipfire_runtime::admission::{AdmissionController, ModelFootprint};
+use hipfire_runtime::loader_api::ModelSource;
 use hipfire_runtime::serve::{
     send_event, Continuation, DoneReason, EngineStats, Event, SubmitRequest,
 };
@@ -121,6 +122,24 @@ impl SlotEngine {
     /// Build the rig on a new thread and start serving. Returns once the model
     /// is loaded, so a caller that gets `Ok` can submit immediately.
     pub fn spawn(cfg: EngineConfig) -> Result<SlotEngine, String> {
+        Self::spawn_inner(cfg, None)
+    }
+
+    /// Start serving from a source opened and admitted by the daemon.
+    ///
+    /// The worker consumes this source directly; it does not reopen the model
+    /// path after daemon teardown.
+    pub fn spawn_with_source(
+        cfg: EngineConfig,
+        source: ModelSource,
+    ) -> Result<SlotEngine, String> {
+        Self::spawn_inner(cfg, Some(source))
+    }
+
+    fn spawn_inner(
+        cfg: EngineConfig,
+        source: Option<ModelSource>,
+    ) -> Result<SlotEngine, String> {
         let (tx, rx) = channel::<EngineCommand>();
         let (ready_tx, ready_rx) = channel::<Result<(), String>>();
         let stats = Arc::new(Mutex::new(EngineStats::default()));
@@ -129,7 +148,11 @@ impl SlotEngine {
         let handle = std::thread::Builder::new()
             .name("hipfire-slot-engine".to_string())
             .spawn(move || -> Result<(), String> {
-                match Rig::build(&cfg) {
+                let rig = match source {
+                    Some(source) => Rig::build(&cfg, Some(source)),
+                    None => Rig::build(&cfg, None),
+                };
+                match rig {
                     Ok(rig) => {
                         let _ = ready_tx.send(Ok(()));
                         run_loop(rig, rx, stats_thread)
@@ -223,7 +246,7 @@ fn dn_buffers(dn: &DeltaNetState) -> Vec<&GpuTensor> {
 impl Rig {
     /// Build the GPU rig.
     ///
-    /// CPU arch/tensor preflight precedes this loader — `SlotBackend::cpu_preflight`
+    /// CPU arch/tensor preflight precedes this loader — `SlotBackend::cpu_preflight_source`
     /// opens the HFQ, validates `arch_id` 5|6, rejects vision tensors/models and
     /// parses config/tokenizer before this GPU path. This function assumes that
     /// preflight has passed; its `get_vram_info` + `preflight_alloc` is the
@@ -234,12 +257,21 @@ impl Rig {
     /// staging, PBS, scratch, logits/out are all owned after `Qwen35Weights`.
     /// On any `?`/error, all completed stages are freed, weights freed,
     /// caches/graph state invalidated and pool drained, so no VRAM leaks.
-    fn build(cfg: &EngineConfig) -> Result<Rig, String> {
+    fn build(
+        cfg: &EngineConfig,
+        source: Option<ModelSource>,
+    ) -> Result<Rig, String> {
         use hipfire_runtime::hfq::HfqFile;
         use hipfire_runtime::tokenizer::Tokenizer;
         use rdna_compute::kv_slots::preflight_alloc;
 
-        let mut hfq = HfqFile::open(&cfg.model_path).map_err(|e| format!("open model: {e}"))?;
+        let mut hfq = match source {
+            Some(ModelSource::Hfq(hfq)) => hfq,
+            Some(ModelSource::Dir(_)) => {
+                return Err("SlotEngine requires an HFQ source".to_string())
+            }
+            None => HfqFile::open(&cfg.model_path).map_err(|e| format!("open model: {e}"))?,
+        };
         let config = qwen35::config_from_hfq(&hfq).map_err(|e| format!("config: {e}"))?;
         let tokenizer = Tokenizer::from_hfq_metadata(&hfq.metadata_json)
             .map_err(|e| format!("tokenizer: {e}"))?;

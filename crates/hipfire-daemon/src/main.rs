@@ -85,8 +85,8 @@ use hipfire_generate::redline::{
 mod slots;
 use hipfire_generate::vision::{GenerateVLParams, ImageSource};
 use hipfire_loader::{
-    admit_load, AsstTurnCache, DimKind, EpArch, EpState, Eviction, LoadedModel, ModelVariant,
-    RawParallelism, SourceKind,
+    admit_load_with_source, AsstTurnCache, DimKind, EpArch, EpState, Eviction, LoadedModel,
+    ModelVariant, RawParallelism, SourceKind,
 };
 use hipfire_runtime::spec::{
     ClientEvent, EmitOutcome, EvictRetain, FinishSummary, PrefillOutcome, SpecAdvance, SpecEmit,
@@ -527,17 +527,17 @@ fn prepare_daemon_load_with<A, O>(
     msg: &serde_json::Value,
     admit: A,
     operations: &mut O,
-) -> Result<hipfire_loader::LoadAdmission, DaemonLoadBoundaryError>
+) -> Result<hipfire_loader::AdmittedLoad, DaemonLoadBoundaryError>
 where
     A: FnOnce(
         &str,
         RawParallelism,
-    ) -> Result<hipfire_loader::LoadAdmission, hipfire_loader::LoadAdmissionError>,
+    ) -> Result<hipfire_loader::AdmittedLoad, hipfire_loader::LoadAdmissionError>,
     O: DaemonLoadOperations,
 {
-    let admission = admit(path, raw).map_err(DaemonLoadBoundaryError::Admission)?;
+    let admitted = admit(path, raw).map_err(DaemonLoadBoundaryError::Admission)?;
     if experimental_multi_slot {
-        if let Some(error) = validate_multi_slot_admission(&admission) {
+        if let Some(error) = validate_multi_slot_admission(&admitted.admission) {
             return Err(DaemonLoadBoundaryError::Operation(
                 DaemonLoadOperationError::Unsupported(error.to_string()),
             ));
@@ -552,10 +552,10 @@ where
             .map_err(DaemonLoadBoundaryError::Operation)?;
     } else {
         operations
-            .prepare_ordinary(load_tp_for_admission(&admission))
+            .prepare_ordinary(load_tp_for_admission(&admitted.admission))
             .map_err(DaemonLoadBoundaryError::Operation)?;
     }
-    Ok(admission)
+    Ok(admitted)
 }
 
 fn prepare_daemon_load<O: DaemonLoadOperations>(
@@ -564,16 +564,29 @@ fn prepare_daemon_load<O: DaemonLoadOperations>(
     experimental_multi_slot: bool,
     msg: &serde_json::Value,
     operations: &mut O,
-) -> Result<hipfire_loader::LoadAdmission, DaemonLoadBoundaryError> {
+) -> Result<hipfire_loader::AdmittedLoad, DaemonLoadBoundaryError> {
     prepare_daemon_load_with(
         path,
         raw,
         experimental_multi_slot,
         msg,
-        admit_load,
+        admit_load_with_source,
         operations,
     )
 }
+/// Consume one admitted source at the daemon execution seam. The loader
+/// continuation receives ownership of the source and effective topology; it
+/// must not fall back to a path-based admission wrapper.
+fn execute_admitted_load_with<T, L>(
+    admitted: hipfire_loader::AdmittedLoad,
+    load: L,
+) -> Result<T, String>
+where
+    L: FnOnce(hipfire_loader::AdmittedLoad) -> Result<T, String>,
+{
+    load(admitted)
+}
+
 
 struct DaemonLoadState<'a> {
     gpu: &'a mut rdna_compute::Gpu,
@@ -666,14 +679,13 @@ impl DaemonLoadOperations for DaemonLoadState<'_> {
     }
 }
 
-
 #[cfg(test)]
 mod admission_boundary_tests {
     use super::{
-        prepare_daemon_load_with, DaemonLoadOperationError, DaemonLoadOperations, DimKind,
-        ModelVariant, RawParallelism, SourceKind,
+        execute_admitted_load_with, prepare_daemon_load_with, DaemonLoadOperationError,
+        DaemonLoadOperations, DimKind, ModelVariant, RawParallelism, SourceKind,
     };
-    use hipfire_loader::{DeviceMesh, LoadAdmission};
+    use hipfire_loader::admit_load_with_source;
 
     #[derive(Clone, Debug, Default, PartialEq, Eq)]
     struct InjectedLoadOperations {
@@ -692,7 +704,7 @@ mod admission_boundary_tests {
             self.vmm_gpu_initialization = true;
             self.remap = true;
             self.carrier_entry = true;
-            self.prior_owner = true;
+            self.prior_owner = false;
         }
     }
 
@@ -723,6 +735,35 @@ mod admission_boundary_tests {
             },
         )
     }
+    fn dense_fixture_path(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "hipfire-daemon-admitted-{label}-{}.hfq",
+            std::process::id()
+        ))
+    }
+
+    fn write_dense_fixture(path: &std::path::Path) {
+        use std::io::Write;
+
+        let metadata = br#"{"config":{"num_experts":0}}"#;
+        let metadata_offset = 32u64;
+        let index_offset = metadata_offset + metadata.len() as u64;
+        let index = 0u32.to_le_bytes();
+        let data_start = index_offset + index.len() as u64;
+        let data_offset = (data_start + 4095) & !4095;
+        let mut file = std::fs::File::create(path).unwrap();
+        file.write_all(b"HFQM").unwrap();
+        file.write_all(&1u32.to_le_bytes()).unwrap();
+        file.write_all(&5u32.to_le_bytes()).unwrap();
+        file.write_all(&0u32.to_le_bytes()).unwrap();
+        file.write_all(&metadata_offset.to_le_bytes()).unwrap();
+        file.write_all(&data_offset.to_le_bytes()).unwrap();
+        file.write_all(metadata).unwrap();
+        file.write_all(&index).unwrap();
+        file.write_all(&vec![0u8; (data_offset - data_start) as usize])
+            .unwrap();
+        file.flush().unwrap();
+    }
 
     #[test]
     fn refused_daemon_entrypoints_do_not_enter_production_operations() {
@@ -741,7 +782,11 @@ mod admission_boundary_tests {
                 true,
             ),
         ] {
-            let mut operations = InjectedLoadOperations::default();
+            let mut operations = InjectedLoadOperations {
+                prior_owner: true,
+                ..Default::default()
+            };
+            let before = operations.clone();
             let error = refusal(variant, raw);
             let result = prepare_daemon_load_with(
                 &format!("injected-{name}"),
@@ -755,32 +800,85 @@ mod admission_boundary_tests {
             assert!(result.is_err(), "{name} route unexpectedly admitted");
             assert_eq!(
                 operations,
-                InjectedLoadOperations::default(),
+                before,
                 "{name} route entered teardown, slot shutdown, VMM/GPU initialization, remap, carrier entry, or prior-owner operations before admission"
             );
         }
     }
-
     #[test]
     fn rejected_multi_slot_backend_does_not_enter_production_operations() {
         let msg = serde_json::json!({});
-        let admission = LoadAdmission {
-            source: SourceKind::Hfq,
-            variant: ModelVariant::Qwen35Dense,
-            mesh: DeviceMesh::rect(&[(DimKind::Pp, 2)]),
+        let path = dense_fixture_path("multi-slot-shape");
+        write_dense_fixture(&path);
+        let admitted =
+            admit_load_with_source(path.to_str().unwrap(), RawParallelism::new(2, 1, 1))
+                .unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let mut operations = InjectedLoadOperations {
+            prior_owner: true,
+            ..Default::default()
         };
-        let mut operations = InjectedLoadOperations::default();
+        let before = operations.clone();
         let result = prepare_daemon_load_with(
-            "injected-multi-slot-shape",
+            path.to_str().unwrap(),
             RawParallelism::new(2, 1, 1),
             true,
             &msg,
-            move |_, _| Ok(admission),
+            move |_, _| Ok(admitted),
             &mut operations,
         );
 
         assert!(result.is_err());
-        assert_eq!(operations, InjectedLoadOperations::default());
+        assert_eq!(operations, before);
+    }
+    #[test]
+    fn admitted_daemon_route_consumes_changed_source_without_second_admission() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let path = dense_fixture_path("downstream-refusal");
+        write_dense_fixture(&path);
+        let admitted =
+            admit_load_with_source(path.to_str().unwrap(), RawParallelism::new(1, 1, 1))
+                .unwrap();
+        let removed_path = path.clone();
+        let admission_calls = Rc::new(Cell::new(0usize));
+        let admission_calls_injected = Rc::clone(&admission_calls);
+        let mut operations = InjectedLoadOperations {
+            prior_owner: true,
+            ..Default::default()
+        };
+
+        let admitted = prepare_daemon_load_with(
+            path.to_str().unwrap(),
+            RawParallelism::new(1, 1, 1),
+            false,
+            &serde_json::json!({}),
+            move |_, _| {
+                admission_calls_injected.set(admission_calls_injected.get() + 1);
+                std::fs::remove_file(&removed_path).unwrap();
+                Ok(admitted)
+            },
+            &mut operations,
+        )
+        .unwrap();
+        assert_eq!(admission_calls.get(), 1);
+        assert!(operations.teardown);
+        assert!(!operations.prior_owner);
+
+        let downstream_calls = Rc::new(Cell::new(0usize));
+        let downstream_calls_injected = Rc::clone(&downstream_calls);
+        let result = execute_admitted_load_with(admitted, |admitted| {
+            downstream_calls_injected.set(downstream_calls_injected.get() + 1);
+            assert!(!path.exists(), "downstream source mutation was not applied");
+            assert_eq!(admitted.source.arch_id(), Some(5));
+            Err("injected downstream source refusal".to_string())
+        });
+
+        assert!(result.is_err());
+        assert_eq!(admission_calls.get(), 1);
+        assert_eq!(downstream_calls.get(), 1);
+        assert!(!operations.prior_owner);
     }
 }
 
@@ -1222,7 +1320,7 @@ fn main() {
                     .and_then(|p| p.get("experimental_multi_slot"))
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
-                let admission = {
+                let admitted = {
                     let mut operations = DaemonLoadState {
                         gpu: &mut gpu,
                         model: &mut model,
@@ -1241,7 +1339,7 @@ fn main() {
                         &msg,
                         &mut operations,
                     ) {
-                        Ok(admission) => admission,
+                        Ok(admitted) => admitted,
                         Err(error) => {
                             let message = error.message();
                             emit_uncorrelated_error(
@@ -1280,7 +1378,15 @@ fn main() {
                         .and_then(|p| p.get("experimental_multi_slot_prefill_chunk"))
                         .and_then(|v| v.as_u64())
                         .unwrap_or(1024) as usize;
-                    match slots::SlotBackend::load(path, n_slots, cap_tokens, prefill_chunk) {
+                    match execute_admitted_load_with(admitted, |admitted| {
+                        slots::SlotBackend::load_admitted(
+                            path,
+                            admitted,
+                            n_slots,
+                            cap_tokens,
+                            prefill_chunk,
+                        )
+                    }) {
                         Ok(backend) => {
                             let arch = backend.arch_str().to_string();
                             let dim = backend.dim();
@@ -1322,7 +1428,7 @@ fn main() {
                     }
                     continue;
                 }
-                let load_tp = load_tp_for_admission(&admission);
+                let load_tp = load_tp_for_admission(&admitted.admission);
 
                 // EP path: when no live prior model remains (fresh daemon, or
                 // after deferred prior unload failed and left model=None with
@@ -1730,7 +1836,7 @@ fn main() {
                     let _ = stdout.flush();
                     continue;
                 }
-                if admission.mesh.has_axis(DimKind::Pp) {
+                if admitted.admission.mesh.has_axis(DimKind::Pp) {
                     if gemma4_drafter.is_some() {
                         emit_uncorrelated_error(&mut stdout, None, "gemma4 EAGLE spec-decode requires pp=1 (arch_id=13 has no pipeline-parallel path); reload without params.drafter.", "unsupported", false, false);
                         let _ = stdout.flush();
@@ -1802,32 +1908,36 @@ fn main() {
                         let _ = stdout.flush();
                         continue;
                     }
-                    hipfire_loader::load_model_ep_with_kv_mode(
-                        path,
-                        max_seq,
-                        load_tp,
-                        kv_mode_override.as_deref(),
-                        kv_backend_override.as_deref(),
-                        state_quant_override.as_deref(),
-                    )
+                    execute_admitted_load_with(admitted, |admitted| {
+                        hipfire_loader::load_model_ep_with_kv_mode_admitted(
+                            path,
+                            max_seq,
+                            kv_mode_override.as_deref(),
+                            kv_backend_override.as_deref(),
+                            state_quant_override.as_deref(),
+                            admitted,
+                        )
+                    })
                 } else {
-                    hipfire_loader::load_model_with_gemma4_drafter(
-                        path,
-                        max_seq,
-                        deepseek4_experts_per_token,
-                        deepseek4_compute_placement,
-                        draft_path.as_deref(),
-                        gemma4_drafter.as_deref(),
-                        gemma4_draft_len,
-                        kv_mode_override.as_deref(),
-                        kv_backend_override.as_deref(),
-                        kv_adaptive_override.as_deref(),
-                        state_quant_override.as_deref(),
-                        &cask,
-                        admission.mesh.size_of(DimKind::Pp),
-                        spec_cfg,
-                        &mut gpu,
-                    )
+                    execute_admitted_load_with(admitted, |admitted| {
+                        hipfire_loader::load_model_with_gemma4_drafter_admitted(
+                            path,
+                            max_seq,
+                            deepseek4_experts_per_token,
+                            deepseek4_compute_placement,
+                            draft_path.as_deref(),
+                            gemma4_drafter.as_deref(),
+                            gemma4_draft_len,
+                            kv_mode_override.as_deref(),
+                            kv_backend_override.as_deref(),
+                            kv_adaptive_override.as_deref(),
+                            state_quant_override.as_deref(),
+                            &cask,
+                            spec_cfg,
+                            &mut gpu,
+                            admitted,
+                        )
+                    })
                 };
                 match loaded {
                     Ok(mut m) => {
