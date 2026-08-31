@@ -1532,39 +1532,121 @@ impl Gpus {
         buffers: &[&DeviceBuffer],
         count: usize,
     ) -> HipResult<()> {
-        // Fail closed while a lease owns the scratch — the leased path must be used.
+        self.reduce_sum_f32_peer_rooted_impl(buffers, None, count, "all_reduce_sum_f32_peer_rooted")
+    }
+
+    /// Deterministically reduce rank-local partials, add the completed sum to
+    /// rank 0's residual, then broadcast that completed residual to every rank.
+    ///
+    /// The arithmetic order is `(((partial0 + partial1) + ...) + residual0)`.
+    /// Peer residuals are overwritten by the root result, avoiding one local
+    /// residual-add kernel on every non-root rank.
+    pub fn all_reduce_sum_f32_peer_rooted_add(
+        &mut self,
+        partials: &[&DeviceBuffer],
+        residuals: &[&DeviceBuffer],
+        count: usize,
+    ) -> HipResult<()> {
+        self.reduce_sum_f32_peer_rooted_impl(
+            partials,
+            Some(residuals),
+            count,
+            "all_reduce_sum_f32_peer_rooted_add",
+        )
+    }
+
+    fn reduce_sum_f32_peer_rooted_impl(
+        &mut self,
+        partials: &[&DeviceBuffer],
+        residuals: Option<&[&DeviceBuffer]>,
+        count: usize,
+        operation: &'static str,
+    ) -> HipResult<()> {
         if self.active_peer_lease.is_some()
             || self.peer_lease_quarantined
             || !self.peer_lease_buffers.is_empty()
         {
             return Err(HipError::new(
                 0,
-                "all_reduce_sum_f32_peer_rooted: peer scratch is leased — use all_reduce_sum_f32_peer_rooted_leased",
+                &format!("{operation}: peer scratch is leased — use the leased reduction API"),
             ));
         }
         let n = self.devices.len();
-        if buffers.len() != n {
+        if partials.len() != n {
             return Err(HipError::new(
                 0,
                 &format!(
-                    "all_reduce_sum_f32_peer_rooted: buffers.len()={} != n_devices={n}",
-                    buffers.len()
+                    "{operation}: partials.len()={} != n_devices={n}",
+                    partials.len()
                 ),
             ));
         }
-        if n == 1 {
+        if let Some(outputs) = residuals {
+            if outputs.len() != n {
+                return Err(HipError::new(
+                    0,
+                    &format!(
+                        "{operation}: residuals.len()={} != n_devices={n}",
+                        outputs.len()
+                    ),
+                ));
+            }
+        }
+        if count == 0 {
             return Ok(());
         }
-        let bytes = count * 4;
+        let bytes = count
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| HipError::new(0, &format!("{operation}: byte count overflow")))?;
+        for (rank, buffer) in partials.iter().enumerate() {
+            if buffer.size() < bytes {
+                return Err(HipError::new(
+                    0,
+                    &format!(
+                        "{operation}: partial rank {rank} has {} bytes, needs {bytes}",
+                        buffer.size()
+                    ),
+                ));
+            }
+        }
+        if let Some(outputs) = residuals {
+            for (rank, buffer) in outputs.iter().enumerate() {
+                if buffer.size() < bytes {
+                    return Err(HipError::new(
+                        0,
+                        &format!(
+                            "{operation}: residual rank {rank} has {} bytes, needs {bytes}",
+                            buffer.size()
+                        ),
+                    ));
+                }
+            }
+        }
+        if n == 1 {
+            if let Some(outputs) = residuals {
+                let partial = GpuTensor {
+                    buf: unsafe { partials[0].alias() },
+                    shape: vec![count],
+                    dtype: DType::F32,
+                };
+                let residual = GpuTensor {
+                    buf: unsafe { outputs[0].alias() },
+                    shape: vec![count],
+                    dtype: DType::F32,
+                };
+                self.devices[0].bind_thread()?;
+                self.devices[0].add_f32(&residual, &partial, &residual)?;
+            }
+            return Ok(());
+        }
         self.ensure_peer_ar_tmp(bytes)?;
 
-        // Preserve every non-root input before rank 0 starts writing its sum.
         let mut gather_events = Vec::with_capacity(n - 1);
         for rank in 1..n {
             gather_events.push(self.boundary_copy(
                 rank,
                 0,
-                buffers[rank],
+                partials[rank],
                 &self.peer_ar_tmp[0][rank - 1],
                 bytes,
             )?);
@@ -1573,8 +1655,8 @@ impl Gpus {
             self.wait_boundary(event)?;
         }
 
-        let root = GpuTensor {
-            buf: unsafe { buffers[0].alias() },
+        let root_partial = GpuTensor {
+            buf: unsafe { partials[0].alias() },
             shape: vec![count],
             dtype: DType::F32,
         };
@@ -1585,15 +1667,29 @@ impl Gpus {
                 shape: vec![count],
                 dtype: DType::F32,
             };
-            self.devices[0].add_inplace_f32(&root, &peer)?;
+            self.devices[0].add_inplace_f32(&root_partial, &peer)?;
         }
 
-        // boundary_copy is enqueued on rank 0's active stream, after the
-        // ordered add kernels above. Waiting makes the result visible before
-        // any peer starts its HC mix.
+        let broadcast = if let Some(outputs) = residuals {
+            let root_residual = GpuTensor {
+                buf: unsafe { outputs[0].alias() },
+                shape: vec![count],
+                dtype: DType::F32,
+            };
+            self.devices[0].add_f32(&root_residual, &root_partial, &root_residual)?;
+            outputs
+        } else {
+            partials
+        };
         let mut broadcast_events = Vec::with_capacity(n - 1);
         for rank in 1..n {
-            broadcast_events.push(self.boundary_copy(0, rank, buffers[0], buffers[rank], bytes)?);
+            broadcast_events.push(self.boundary_copy(
+                0,
+                rank,
+                broadcast[0],
+                broadcast[rank],
+                bytes,
+            )?);
         }
         for event in broadcast_events {
             self.wait_boundary(event)?;

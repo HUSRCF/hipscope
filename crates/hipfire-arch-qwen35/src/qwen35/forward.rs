@@ -3626,7 +3626,7 @@ fn dense_tp_all_reduce_sum_f32(
     count: usize,
 ) -> HipResult<()> {
     if gpus.peer_access_enabled {
-        gpus.all_reduce_sum_f32(refs, count)
+        gpus.all_reduce_sum_f32_peer_rooted(refs, count)
     } else {
         gpus.all_reduce_sum_f32_host(refs, count)
     }
@@ -3650,8 +3650,14 @@ fn dense_tp_allreduce_add(
     scratches: &[Qwen35Scratch],
     count: usize,
 ) -> HipResult<()> {
-    dense_tp_allreduce(gpus, scratches, count)?;
-    dense_tp_add_residual(gpus, scratches)
+    if gpus.peer_access_enabled {
+        let partials: Vec<_> = scratches.iter().map(|scratch| &scratch.o.buf).collect();
+        let residuals: Vec<_> = scratches.iter().map(|scratch| &scratch.x.buf).collect();
+        gpus.all_reduce_sum_f32_peer_rooted_add(&partials, &residuals, count)
+    } else {
+        dense_tp_allreduce(gpus, scratches, count)?;
+        dense_tp_add_residual(gpus, scratches)
+    }
 }
 
 fn dense_tp_allreduce_batched(
@@ -3664,16 +3670,20 @@ fn dense_tp_allreduce_batched(
     let count = n
         .checked_mul(dim)
         .ok_or_else(|| HipError::new(0, "dense_tp batched count overflow"))?;
-    let refs: Vec<&hip_bridge::DeviceBuffer> = partials.iter().map(|t| &t.buf).collect();
+    let partial_refs: Vec<_> = partials.iter().map(|tensor| &tensor.buf).collect();
     if gpus.peer_access_enabled {
-        gpus.all_reduce_sum_f32_peer_rooted(&refs, count)?;
-    } else {
-        dense_tp_all_reduce_sum_f32(gpus, &refs, count)?;
+        let residuals: Vec<_> = pbs_vec
+            .iter()
+            .map(|pbs| pbs.x_batch.sub_offset(0, count))
+            .collect();
+        let residual_refs: Vec<_> = residuals.iter().map(|tensor| &tensor.buf).collect();
+        return gpus.all_reduce_sum_f32_peer_rooted_add(&partial_refs, &residual_refs, count);
     }
+    dense_tp_all_reduce_sum_f32(gpus, &partial_refs, count)?;
     for (rank, (pbs, partial)) in pbs_vec.iter().zip(partials.iter()).enumerate() {
         gpus.devices[rank].bind_thread()?;
-        let x_n = pbs.x_batch.sub_offset(0, n * dim);
-        let partial_n = partial.sub_offset(0, n * dim);
+        let x_n = pbs.x_batch.sub_offset(0, count);
+        let partial_n = partial.sub_offset(0, count);
         gpus.devices[rank].add_f32(&x_n, &partial_n, &x_n)?;
     }
     Ok(())
