@@ -136,6 +136,8 @@ pub enum ModelVariant {
     Lfm2Moe,
     /// LFM2-VL.
     Lfm2Vl,
+    /// Standalone Dots.OCR vision/text model.
+    DotsOcr,
     /// Cohere2-MoE/North-Mini-Code.
     Cohere2Moe,
     /// Maple native ternary model.
@@ -591,6 +593,29 @@ mod tests {
             cell_info(SourceKind::Hfq, ModelVariant::Gemma4, ParallelAxis::Pp),
             CellPolicy::Unsupported { .. }
         ));
+    }
+
+    #[test]
+    fn dots_ocr_policy_is_explicit_across_all_axes() {
+        assert_eq!(
+            cell_info(SourceKind::Hfq, ModelVariant::DotsOcr, ParallelAxis::Single),
+            CellPolicy::Admitted
+        );
+        assert!(matches!(
+            cell_info(SourceKind::Hfq, ModelVariant::DotsOcr, ParallelAxis::Pp),
+            CellPolicy::Unsupported { .. }
+        ));
+        assert!(matches!(
+            cell_info(SourceKind::Hfq, ModelVariant::DotsOcr, ParallelAxis::Tp),
+            CellPolicy::Unsupported { .. }
+        ));
+        assert_eq!(
+            cell_info(SourceKind::Hfq, ModelVariant::DotsOcr, ParallelAxis::Ep),
+            CellPolicy::NormalizeToSingle
+        );
+        let mesh = resolve(SourceKind::Hfq, ModelVariant::DotsOcr, req(1, 1, 4)).unwrap();
+        assert_eq!(mesh.n_devices(), 1);
+        assert_eq!(mesh.axes(), &[]);
     }
 
     #[test]

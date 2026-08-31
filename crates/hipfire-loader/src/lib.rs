@@ -2316,6 +2316,48 @@ fn finish_qwen35_load(
     Ok(model)
 }
 
+/// Run the source-aware loader boundary and invoke the continuation only after
+/// source classification and parallel admission succeed.
+///
+/// The continuation is the production operation seam: regular, Gemma4, and
+/// EP/TP wrappers all use [`route_admitted_load`] before touching VMM state,
+/// constructing a device mesh, or entering a carrier. Tests can inject an
+/// admission refusal and observe that the continuation (and therefore every
+/// downstream operation) is not called.
+fn route_admitted_load_with<T, A, C>(
+    path: &str,
+    raw: RawParallelism,
+    admit: A,
+    continue_load: C,
+) -> Result<T, String>
+where
+    A: FnOnce(&str, RawParallelism) -> Result<(ModelSource, LoadAdmission), LoadAdmissionError>,
+    C: FnOnce(ModelSource, LoadAdmission) -> Result<T, String>,
+{
+    let (source, admission) = admit(path, raw).map_err(|error| error.to_string())?;
+    continue_load(source, admission)
+}
+
+fn route_admitted_load<T, C>(
+    path: &str,
+    raw: RawParallelism,
+    continue_load: C,
+) -> Result<T, String>
+where
+    C: FnOnce(ModelSource, LoadAdmission) -> Result<T, String>,
+{
+    route_admitted_load_with(
+        path,
+        raw,
+        |path, raw| {
+            let source = open_source(path)?;
+            let admission = admit_source(&source, raw)?;
+            Ok((source, admission))
+        },
+        continue_load,
+    )
+}
+
 // ─── Main public API ──────────────────────────────────────────────────
 
 /// gfx11 + gfx12 targets with WMMA-backed DFlash batched lm_head GEMM paths.
@@ -2386,11 +2428,43 @@ pub fn load_model_with_kv_backend(
     spec: SpecLoadCfg,
     gpu: &mut rdna_compute::Gpu,
 ) -> Result<LoadedModel, String> {
-    // Source probing and the capability decision are deliberately first:
-    // unsupported PP/source combinations must not touch GPU teardown state.
-    let src = open_source(path).map_err(|error| error.to_string())?;
-    let admission =
-        admit_source(&src, RawParallelism::new(pp, 1, 1)).map_err(|error| error.to_string())?;
+    route_admitted_load(path, RawParallelism::new(pp, 1, 1), |src, admission| {
+        load_model_with_kv_backend_admitted(
+            path,
+            max_seq,
+            deepseek4_experts_per_token,
+            deepseek4_compute_placement,
+            draft_path,
+            kv_mode_override,
+            kv_backend_override,
+            kv_adaptive_override,
+            state_quant_override,
+            cask,
+            spec,
+            gpu,
+            src,
+            admission,
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_model_with_kv_backend_admitted(
+    path: &str,
+    max_seq: usize,
+    deepseek4_experts_per_token: Option<usize>,
+    deepseek4_compute_placement: hipfire_config::Deepseek4ComputePlacement,
+    draft_path: Option<&str>,
+    kv_mode_override: Option<&str>,
+    kv_backend_override: Option<&str>,
+    kv_adaptive_override: Option<&str>,
+    state_quant_override: Option<&str>,
+    cask: &CaskConfig,
+    spec: SpecLoadCfg,
+    gpu: &mut rdna_compute::Gpu,
+    src: ModelSource,
+    admission: LoadAdmission,
+) -> Result<LoadedModel, String> {
     // Retry any arenas left by a prior failed teardown; refuse the load if
     // ownership is still live so a new model cannot stack on pending VMM state.
     ensure_vmm_ready_for_load(gpu)?;
@@ -2556,13 +2630,49 @@ pub fn load_model_with_gemma4_drafter(
     spec: SpecLoadCfg,
     gpu: &mut rdna_compute::Gpu,
 ) -> Result<LoadedModel, String> {
-    // Source probing and the capability decision are deliberately first:
-    // unsupported PP/source combinations must not touch GPU teardown state.
+    route_admitted_load(path, RawParallelism::new(pp, 1, 1), |src, admission| {
+        load_model_with_gemma4_drafter_admitted(
+            path,
+            max_seq,
+            deepseek4_experts_per_token,
+            deepseek4_compute_placement,
+            draft_path,
+            gemma4_drafter_path,
+            gemma4_draft_len,
+            kv_mode_override,
+            kv_backend_override,
+            kv_adaptive_override,
+            state_quant_override,
+            cask,
+            spec,
+            gpu,
+            src,
+            admission,
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_model_with_gemma4_drafter_admitted(
+    path: &str,
+    max_seq: usize,
+    deepseek4_experts_per_token: Option<usize>,
+    deepseek4_compute_placement: hipfire_config::Deepseek4ComputePlacement,
+    draft_path: Option<&str>,
+    gemma4_drafter_path: Option<&str>,
+    gemma4_draft_len: usize,
+    kv_mode_override: Option<&str>,
+    kv_backend_override: Option<&str>,
+    state_quant_override: Option<&str>,
+    cask: &CaskConfig,
+    pp: usize,
+    spec: SpecLoadCfg,
+    gpu: &mut rdna_compute::Gpu,
+    src: ModelSource,
+    admission: LoadAdmission,
+) -> Result<LoadedModel, String> {
     let _ = gemma4_eagle_spec_len(Some(gemma4_draft_len as u64))
         .map_err(|e| format!("gemma4 drafter: {e}"))?;
-    let src = open_source(path).map_err(|error| error.to_string())?;
-    let admission =
-        admit_source(&src, RawParallelism::new(pp, 1, 1)).map_err(|error| error.to_string())?;
     // Retry any arenas left by a prior failed teardown; refuse the load if
     // ownership is still live so a new model cannot stack on pending VMM state.
     ensure_vmm_ready_for_load(gpu)?;
@@ -3088,14 +3198,26 @@ pub fn load_model_ep_with_kv_mode(
     kv_backend: Option<&str>,
     state_quant: Option<&str>,
 ) -> Result<LoadedModel, String> {
-    let admission =
-        admit_load(path, RawParallelism::new(1, tp, 1)).map_err(|error| error.to_string())?;
-    if admission.source != SourceKind::Hfq {
-        return Err("parallel EP/TP routes currently require an HFQ source".into());
-    }
-    if admission.mesh.n_devices() <= 1 {
-        return Err("parallel EP/TP routes require a degree greater than one".into());
-    }
+    route_admitted_load(path, RawParallelism::new(1, tp, 1), |_src, admission| {
+        load_model_ep_with_kv_mode_admitted(
+            path,
+            max_seq,
+            kv_mode,
+            kv_backend,
+            state_quant,
+            admission,
+        )
+    })
+}
+
+fn load_model_ep_with_kv_mode_admitted(
+    path: &str,
+    max_seq: usize,
+    kv_mode: Option<&str>,
+    kv_backend: Option<&str>,
+    state_quant: Option<&str>,
+    admission: LoadAdmission,
+) -> Result<LoadedModel, String> {
     let kv_backend_raw = kv_backend.unwrap_or("contiguous");
     let kv_backend_kind: KvBackend = kv_backend_raw.parse().map_err(|err| format!("{err}"))?;
     let degree = match admission.variant {
@@ -3146,14 +3268,17 @@ pub fn load_model_ep_with_compressor_cache(
     tp: usize,
     compressor_cache: hipfire_config::Deepseek4CompressorCache,
 ) -> Result<LoadedModel, String> {
-    let admission =
-        admit_load(path, RawParallelism::new(1, tp, 1)).map_err(|error| error.to_string())?;
-    if admission.source != SourceKind::Hfq {
-        return Err("parallel EP/TP routes currently require an HFQ source".into());
-    }
-    if admission.mesh.n_devices() <= 1 {
-        return Err("parallel EP/TP routes require a degree greater than one".into());
-    }
+    route_admitted_load(path, RawParallelism::new(1, tp, 1), |_src, admission| {
+        load_model_ep_with_compressor_cache_admitted(path, max_seq, compressor_cache, admission)
+    })
+}
+
+fn load_model_ep_with_compressor_cache_admitted(
+    path: &str,
+    max_seq: usize,
+    compressor_cache: hipfire_config::Deepseek4CompressorCache,
+    admission: LoadAdmission,
+) -> Result<LoadedModel, String> {
     let degree = match admission.variant {
         ModelVariant::Deepseek4 | ModelVariant::Minimax | ModelVariant::Qwen35Moe => {
             admission.mesh.size_of(hipfire_hardware::DimKind::Ep)
@@ -4112,19 +4237,10 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
 #[cfg(test)]
 mod registry_tests {
     use super::{
-        admit_load, load_model_ep_with_compressor_cache, load_model_ep_with_kv_mode,
-        resolve_deepseek4_compressor_cache_kv_mode, AdmissionError, LoadAdmission, LoadAdmissionError,
-        ModelVariant, RawParallelism, SourceKind, REGISTRY,
+        admit_load, route_admitted_load_with, resolve_deepseek4_compressor_cache_kv_mode,
+        AdmissionError, LoadAdmissionError, ModelVariant, RawParallelism, SourceKind, REGISTRY,
     };
 
-    #[derive(Clone, Debug, PartialEq, Eq)]
-    struct SideEffects {
-        teardown: usize,
-        mesh_gpu_init: usize,
-        remap: usize,
-        carrier_entry: usize,
-        prior_owner: Option<&'static str>,
-    }
 
     fn fixture_path(label: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
@@ -4156,22 +4272,6 @@ mod registry_tests {
         file.flush().unwrap();
     }
 
-    fn run_after_admission(
-        result: Result<LoadAdmission, LoadAdmissionError>,
-        effects: &mut SideEffects,
-        require_single: bool,
-    ) -> Result<bool, LoadAdmissionError> {
-        let admission = result?;
-        if require_single && admission.mesh.n_devices() != 1 {
-            return Ok(false);
-        }
-        effects.teardown += 1;
-        effects.mesh_gpu_init += admission.mesh.n_devices();
-        effects.remap += 1;
-        effects.carrier_entry += 1;
-        effects.prior_owner = None;
-        Ok(true)
-    }
 
     #[test]
     fn admission_boundary_preserves_typed_source_and_policy_errors() {
@@ -4225,99 +4325,95 @@ mod registry_tests {
     }
 
     #[test]
-    fn refused_entrypoints_leave_teardown_and_owners_unchanged() {
-        let dense_path = fixture_path("dense");
-        write_metadata_fixture(&dense_path, 5, r#"{"config":{"num_experts":0}}"#);
-        let moe_path = fixture_path("moe");
-        write_metadata_fixture(&moe_path, 6, r#"{"config":{"num_experts":8}}"#);
-        let gemma_path = fixture_path("gemma");
-        write_metadata_fixture(&gemma_path, 13, "{}");
+    fn dots_ocr_classifier_returns_documented_variant() {
+        let path = fixture_path("dots-ocr");
+        write_metadata_fixture(&path, 8, "{}");
+        let admission = admit_load(path.to_str().unwrap(), RawParallelism::new(1, 1, 1)).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(admission.variant, ModelVariant::DotsOcr);
+    }
 
-        let before = SideEffects {
-            teardown: 0,
-            mesh_gpu_init: 0,
-            remap: 0,
-            carrier_entry: 0,
-            prior_owner: Some("prior-model"),
-        };
-        let mut effects = before.clone();
+    #[test]
+    fn refused_loader_entrypoints_do_not_enter_injected_production_operations() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
 
-        // Ordinary wrapper: unsupported dense TP degree.
-        assert!(run_after_admission(
-            admit_load(
-                dense_path.to_str().unwrap(),
-                RawParallelism::new(1, 6, 1)
+        #[derive(Clone, Debug, Default, PartialEq, Eq)]
+        struct InjectedLoadOperations {
+            teardown: bool,
+            slot_shutdown: bool,
+            vmm_gpu_initialization: bool,
+            remap: bool,
+            carrier_entry: bool,
+            prior_owner: bool,
+        }
+
+        impl InjectedLoadOperations {
+            fn enter(&mut self) {
+                self.teardown = true;
+                self.slot_shutdown = true;
+                self.vmm_gpu_initialization = true;
+                self.remap = true;
+                self.carrier_entry = true;
+                self.prior_owner = true;
+            }
+        }
+
+        let cases = [
+            (
+                "regular",
+                RawParallelism::new(2, 1, 1),
+                ModelVariant::Gemma4,
             ),
-            &mut effects,
-            false,
-        )
-        .is_err());
-        assert_eq!(effects, before);
-
-        // Multi-slot wrapper: generic admission succeeds for PP2, but the
-        // backend-specific single-device guard rejects before side effects.
-        assert_eq!(
-            run_after_admission(
-                admit_load(
-                    dense_path.to_str().unwrap(),
-                    RawParallelism::new(2, 1, 1)
-                ),
-                &mut effects,
-                true,
-            )
-            .unwrap(),
-            false
-        );
-        assert_eq!(effects, before);
-
-        // Regular/Gemma wrapper: Gemma has no current PP route.
-        assert!(run_after_admission(
-            admit_load(
-                gemma_path.to_str().unwrap(),
-                RawParallelism::new(2, 1, 1)
+            (
+                "gemma",
+                RawParallelism::new(2, 1, 1),
+                ModelVariant::Gemma4,
             ),
-            &mut effects,
-            false,
-        )
-        .is_err());
-        assert_eq!(effects, before);
-
-        // EP/TP wrapper: the Qwen3.5 MoE legacy `tp` spelling maps to EP,
-        // then the unsupported degree is refused by the centralized policy.
-        assert!(run_after_admission(
-            admit_load(
-                moe_path.to_str().unwrap(),
-                RawParallelism::new(1, 2, 1)
+            (
+                "ep",
+                RawParallelism::new(1, 2, 1),
+                ModelVariant::Qwen35Moe,
             ),
-            &mut effects,
-            false,
-        )
-        .is_err());
-        assert_eq!(effects, before);
+            (
+                "tp",
+                RawParallelism::new(1, 6, 1),
+                ModelVariant::Qwen35Dense,
+            ),
+        ];
 
-        let ep_error = load_model_ep_with_kv_mode(
-            moe_path.to_str().unwrap(),
-            4096,
-            2,
-            None,
-            None,
-            None,
-        )
-        .unwrap_err();
-        assert!(ep_error.contains("Qwen3.5 MoE EP"));
-        let cache_error = load_model_ep_with_compressor_cache(
-            moe_path.to_str().unwrap(),
-            4096,
-            2,
-            hipfire_config::Deepseek4CompressorCache::F32,
-        )
-        .unwrap_err();
-        assert!(cache_error.contains("Qwen3.5 MoE EP"));
-        assert_eq!(effects, before);
+        for (name, raw, variant) in cases {
+            let operations = Rc::new(RefCell::new(InjectedLoadOperations::default()));
+            let continuation_operations = Rc::clone(&operations);
+            let refusal = LoadAdmissionError::Admission(AdmissionError::Unsupported {
+                source: SourceKind::Hfq,
+                variant,
+                requested: raw,
+                effective: raw,
+                owner: "CAP-001",
+                reason: "test-injected admission refusal",
+            });
+            let result = route_admitted_load_with(
+                &format!("injected-{name}"),
+                raw,
+                move |_, _| {
+                    Err::<(super::ModelSource, super::LoadAdmission), LoadAdmissionError>(
+                        refusal,
+                    )
+                },
+                move |_, _| {
+                    continuation_operations.borrow_mut().enter();
+                    Ok(())
+                },
+            );
 
-        std::fs::remove_file(dense_path).unwrap();
-        std::fs::remove_file(moe_path).unwrap();
-        std::fs::remove_file(gemma_path).unwrap();
+            assert!(result.is_err(), "{name} route unexpectedly admitted");
+            assert_eq!(
+                *operations.borrow(),
+                InjectedLoadOperations::default(),
+                "{name} route entered teardown, slot shutdown, VMM/GPU initialization, remap, carrier entry, or prior-owner operations before admission"
+            );
+        }
     }
 
     #[test]
