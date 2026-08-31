@@ -2143,6 +2143,18 @@ fn dflash_lm_head_quant_supported(lm_qt: Option<u8>, gpu_arch: &str) -> bool {
     }
 }
 
+/// Resolve the model's MTP draft width once at load time.
+///
+/// An explicit load-message value (normally projected by the CLI's resolved
+/// TOML/env ladder) wins over the process snapshot. Direct loader users that
+/// omit it inherit `HIPFIRE_MTP_K` through `RuntimeConfig`, whose default is 3.
+/// Generation consumes `LoadedModel::mtp_k` and never re-resolves this policy.
+pub fn resolve_mtp_k(configured: Option<usize>) -> usize {
+    configured
+        .unwrap_or_else(|| hipfire_runtime::config::get().mtp_k)
+        .clamp(1, 10)
+}
+
 /// Load a model from an HFQ file (or safetensors directory). This is the
 /// single arch-dispatch point via the carrier registry.
 #[allow(clippy::too_many_arguments)]
@@ -2335,6 +2347,9 @@ pub fn load_model_with_kv_backend(
     if result.pp > 1 && result.pp_gpus.is_none() {
         return Err("pp>1 LoadedModel missing pp_gpus — carrier bug".into());
     }
+    // Publish the resolved K exactly once on model metadata. Generation reads
+    // this field; it does not re-resolve TOML or ambient environment state.
+    result.mtp_k = resolve_mtp_k(spec.mtp_k);
     // Apply the author-recommended sampling extracted pre-allocation (see above).
     // Do NOT reparse the .hfq metadata here: a post-allocation / pre-capture parse
     // is the gfx12 hipGraph-replay regression root-caused above.
@@ -2458,6 +2473,7 @@ pub fn load_model_with_gemma4_drafter(
     if result.pp > 1 && result.pp_gpus.is_none() {
         return Err("pp>1 LoadedModel missing pp_gpus — carrier bug".into());
     }
+    result.mtp_k = resolve_mtp_k(spec.mtp_k);
     if let Some(rec) = rec_sampling {
         result.rec_temperature = rec.temperature;
         result.rec_top_p = rec.top_p;
@@ -3871,8 +3887,14 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
 
 #[cfg(test)]
 mod registry_tests {
-    use super::{resolve_deepseek4_compressor_cache_kv_mode, REGISTRY};
+    use super::{resolve_deepseek4_compressor_cache_kv_mode, resolve_mtp_k, REGISTRY};
 
+    #[test]
+    fn mtp_k_load_value_is_clamped_and_kept_once() {
+        assert_eq!(resolve_mtp_k(Some(7)), 7);
+        assert_eq!(resolve_mtp_k(Some(0)), 1);
+        assert_eq!(resolve_mtp_k(Some(99)), 10);
+    }
     #[test]
     fn deepseek4_kv_mode_is_truthful_and_fail_closed() {
         use hipfire_config::Deepseek4CompressorCache::{F16, F32};

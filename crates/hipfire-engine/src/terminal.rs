@@ -31,14 +31,17 @@ pub enum TerminalControlDecision {
 /// Active generate terminal-control transaction keyed by exact
 /// `(request id, attempt_id)`. The stdin reader posts matching
 /// `abort` (any time) / `commit` (only after ready); producers wait
-/// via [`await_client_terminal_commit`].
+/// via [`await_client_terminal_commit`]. Terminal writers claim the
+/// transaction before emitting a terminal so an abort/error race cannot
+/// produce a second terminal.
 pub struct ActiveTerminalControl {
     pub id: String,
     pub attempt_id: u64,
     pub ready: bool,
     pub decision: Option<TerminalControlDecision>,
-}
+    pub terminal_claimed: bool,
 
+}
 pub struct TerminalControlState {
     pub active: Option<ActiveTerminalControl>,
 }
@@ -76,6 +79,7 @@ pub fn activate_terminal_control(id: &str, attempt_id: u64) {
         attempt_id,
         ready: false,
         decision: None,
+        terminal_claimed: false,
     });
     cell.cv.notify_all();
 }
@@ -86,6 +90,27 @@ pub fn clear_terminal_control() {
     let mut g = cell.mu.lock().unwrap();
     g.active = None;
     cell.cv.notify_all();
+}
+
+/// Claim the sole terminal slot for a matching active attempt.
+///
+/// Unknown/inactive attempts return `true` so pre-activation validation errors
+/// retain their existing wire behavior. Once an active attempt claims a
+/// terminal, a racing error/abort/done writer becomes a no-op.
+pub fn claim_terminal(id: &str, attempt_id: u64) -> bool {
+    let cell = terminal_control();
+    let mut g = cell.mu.lock().unwrap();
+    let Some(active) = g.active.as_mut() else {
+        return true;
+    };
+    if active.id != id || active.attempt_id != attempt_id {
+        return true;
+    }
+    if active.terminal_claimed {
+        return false;
+    }
+    active.terminal_claimed = true;
+    true
 }
 
 /// Key for multiplexed terminal control and inbox, as required by the
@@ -688,7 +713,19 @@ pub fn await_client_terminal_commit(
 
 /// Emit a previously staged `done` envelope after Commit. Payload must be the
 /// same value passed to [`await_client_terminal_commit`] as `pending_done`.
+/// A matching active attempt may claim only one terminal envelope.
 pub fn emit_staged_terminal_done(stdout: &mut impl std::io::Write, pending_done: &serde_json::Value) {
+    if let Some(obj) = pending_done.as_object() {
+        if let Some(id) = obj.get("id").and_then(|value| value.as_str()) {
+            let attempt_id = obj
+                .get("attempt_id")
+                .and_then(|value| value.as_u64())
+                .unwrap_or_else(active_attempt_id);
+            if !claim_terminal(id, attempt_id) {
+                return;
+            }
+        }
+    }
     let _ = writeln!(stdout, "{}", pending_done);
     let _ = stdout.flush();
 }

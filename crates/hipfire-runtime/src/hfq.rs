@@ -1717,6 +1717,74 @@ pub fn load_weights_hfq(
     })
 }
 
+struct LayerLoadStaging {
+    attn_norm: Option<GpuTensor>,
+    wq: Option<WeightTensor>,
+    wk: Option<WeightTensor>,
+    wv: Option<WeightTensor>,
+    wo: Option<WeightTensor>,
+    q_norm: Option<GpuTensor>,
+    k_norm: Option<GpuTensor>,
+    ffn_norm: Option<GpuTensor>,
+    w_gate: Option<WeightTensor>,
+    w_up: Option<WeightTensor>,
+    w_down: Option<WeightTensor>,
+}
+
+impl LayerLoadStaging {
+    fn free_gpu(&mut self, gpu: &mut Gpu) {
+        if let Some(tensor) = self.attn_norm.take() {
+            let _ = gpu.free_tensor(tensor);
+        }
+        if let Some(weight) = self.wq.take() {
+            weight.free_all(gpu);
+        }
+        if let Some(weight) = self.wk.take() {
+            weight.free_all(gpu);
+        }
+        if let Some(weight) = self.wv.take() {
+            weight.free_all(gpu);
+        }
+        if let Some(weight) = self.wo.take() {
+            weight.free_all(gpu);
+        }
+        if let Some(tensor) = self.q_norm.take() {
+            let _ = gpu.free_tensor(tensor);
+        }
+        if let Some(tensor) = self.k_norm.take() {
+            let _ = gpu.free_tensor(tensor);
+        }
+        if let Some(tensor) = self.ffn_norm.take() {
+            let _ = gpu.free_tensor(tensor);
+        }
+        if let Some(weight) = self.w_gate.take() {
+            weight.free_all(gpu);
+        }
+        if let Some(weight) = self.w_up.take() {
+            weight.free_all(gpu);
+        }
+        if let Some(weight) = self.w_down.take() {
+            weight.free_all(gpu);
+        }
+    }
+
+    fn into_layer(&mut self) -> LayerWeights {
+        LayerWeights {
+            attn_norm: self.attn_norm.take().expect("staged layer attn_norm"),
+            wq: self.wq.take().expect("staged layer wq"),
+            wk: self.wk.take().expect("staged layer wk"),
+            wv: self.wv.take().expect("staged layer wv"),
+            wo: self.wo.take().expect("staged layer wo"),
+            q_norm: self.q_norm.take(),
+            k_norm: self.k_norm.take(),
+            ffn_norm: self.ffn_norm.take().expect("staged layer ffn_norm"),
+            w_gate: self.w_gate.take().expect("staged layer w_gate"),
+            w_up: self.w_up.take().expect("staged layer w_up"),
+            w_down: self.w_down.take().expect("staged layer w_down"),
+        }
+    }
+}
+
 /// Single llama per-layer walk over a `WeightBackend`. Dense-only (no MoE,
 /// no DeltaNet). `q_out_dim`/`kv_dim` are passed in so the caller reuses the
 /// exact dims it already computes.
@@ -1727,28 +1795,40 @@ pub fn load_layer<B: WeightBackend>(
     kv_dim: usize,
     i: usize,
 ) -> HipResult<LayerWeights> {
-    b.set_layer(i);
-    Ok(LayerWeights {
-        attn_norm: b.norm("input_layernorm.weight", &[config.dim])?,
-        wq: b.proj("self_attn.q_proj", q_out_dim, config.dim)?,
-        wk: b.proj("self_attn.k_proj", kv_dim, config.dim)?,
-        wv: b.proj("self_attn.v_proj", kv_dim, config.dim)?,
-        wo: b.proj("self_attn.o_proj", config.dim, q_out_dim)?,
-        q_norm: if config.has_qk_norm {
-            Some(b.norm("self_attn.q_norm.weight", &[config.head_dim])?)
-        } else {
-            None
-        },
-        k_norm: if config.has_qk_norm {
-            Some(b.norm("self_attn.k_norm.weight", &[config.head_dim])?)
-        } else {
-            None
-        },
-        ffn_norm: b.norm("post_attention_layernorm.weight", &[config.dim])?,
-        w_gate: b.proj("mlp.gate_proj", config.hidden_dim, config.dim)?,
-        w_up: b.proj("mlp.up_proj", config.hidden_dim, config.dim)?,
-        w_down: b.proj("mlp.down_proj", config.dim, config.hidden_dim)?,
-    })
+    let mut staged = LayerLoadStaging {
+        attn_norm: None,
+        wq: None,
+        wk: None,
+        wv: None,
+        wo: None,
+        q_norm: None,
+        k_norm: None,
+        ffn_norm: None,
+        w_gate: None,
+        w_up: None,
+        w_down: None,
+    };
+    let result = (|| -> HipResult<LayerWeights> {
+        b.set_layer(i);
+        staged.attn_norm = Some(b.norm("input_layernorm.weight", &[config.dim])?);
+        staged.wq = Some(b.proj("self_attn.q_proj", q_out_dim, config.dim)?);
+        staged.wk = Some(b.proj("self_attn.k_proj", kv_dim, config.dim)?);
+        staged.wv = Some(b.proj("self_attn.v_proj", kv_dim, config.dim)?);
+        staged.wo = Some(b.proj("self_attn.o_proj", config.dim, q_out_dim)?);
+        if config.has_qk_norm {
+            staged.q_norm = Some(b.norm("self_attn.q_norm.weight", &[config.head_dim])?);
+            staged.k_norm = Some(b.norm("self_attn.k_norm.weight", &[config.head_dim])?);
+        }
+        staged.ffn_norm = Some(b.norm("post_attention_layernorm.weight", &[config.dim])?);
+        staged.w_gate = Some(b.proj("mlp.gate_proj", config.hidden_dim, config.dim)?);
+        staged.w_up = Some(b.proj("mlp.up_proj", config.hidden_dim, config.dim)?);
+        staged.w_down = Some(b.proj("mlp.down_proj", config.dim, config.hidden_dim)?);
+        Ok(staged.into_layer())
+    })();
+    if result.is_err() {
+        staged.free_gpu(b.gpu_mut());
+    }
+    result
 }
 
 // ─── ParoQuant safetensors loading (LLaMA / Qwen3 arch) ────────────────────

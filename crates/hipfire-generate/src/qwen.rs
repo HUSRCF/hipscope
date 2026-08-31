@@ -708,96 +708,11 @@ pub fn ep_emit_done(
     }
 }
 
-/// Full EP route-complete abort reset: per-rank bind + cursor reset + decode
-/// cache zero + graph invalidate, then device_synchronize on every rank.
-/// `rolled_back` is true only when every bind/reset and synchronize succeeds.
+/// Full EP route-complete abort reset. The implementation lives in the shared
+/// lifecycle owner so explicit reset, EP cancellation, and generic rollback
+/// cannot diverge on rank visitation or terminal attestation.
 pub fn ep_reset_after_abort(m: &mut LoadedModel) -> RollbackEpilogue {
-    let mut first_err: Option<String> = None;
-    if let Some(ep) = m.ep.as_mut() {
-        let EpState { gpus, inner } = ep;
-        match inner {
-            EpArch::Ds4 { state, .. } => {
-                for (rank, s) in state.iter_mut().enumerate() {
-                    let g = &mut gpus.devices[rank];
-                    if let Err(e) = g.bind_thread() {
-                        push_reset_err(&mut first_err, &format!("ep rank{rank} bind_thread"), e);
-                    }
-                    s.reset();
-                    s.zero_decode_caches(g);
-                    g.invalidate_graph_state();
-                }
-            }
-            EpArch::Minimax { state, .. } => {
-                for (rank, s) in state.iter_mut().enumerate() {
-                    let g = &mut gpus.devices[rank];
-                    if let Err(e) = g.bind_thread() {
-                        push_reset_err(&mut first_err, &format!("ep rank{rank} bind_thread"), e);
-                    }
-                    s.reset();
-                    g.invalidate_graph_state();
-                }
-            }
-            EpArch::Qwen35 { batch, .. } => {
-                if let Some(batch) = batch.as_mut() {
-                    if let Err(e) = batch.reset_all(gpus) {
-                        push_reset_err(&mut first_err, "qwen35 ep batch reset_all", e);
-                    }
-                }
-                for dev in &mut gpus.devices {
-                    dev.invalidate_graph_state();
-                }
-            }
-            EpArch::Qwen35DenseTp { dn_states, .. } => {
-                for (rank, state) in dn_states.iter_mut().enumerate() {
-                    let gpu = &mut gpus.devices[rank];
-                    if let Err(e) = gpu.bind_thread() {
-                        push_reset_err(
-                            &mut first_err,
-                            &format!("dense qwen TP rank{rank} bind_thread"),
-                            e,
-                        );
-                    }
-                    if let Err(e) = state.reset(gpu) {
-                        push_reset_err(
-                            &mut first_err,
-                            &format!("dense qwen TP rank{rank} state reset"),
-                            e,
-                        );
-                    }
-                    gpu.invalidate_graph_state();
-                }
-            }
-        }
-        for (rank, dev) in gpus.devices.iter_mut().enumerate() {
-            if let Err(e) = dev.bind_thread() {
-                push_reset_err(
-                    &mut first_err,
-                    &format!("ep rank{rank} sync bind_thread"),
-                    e,
-                );
-            }
-            if let Err(e) = dev.hip.device_synchronize() {
-                push_reset_err(
-                    &mut first_err,
-                    &format!("ep rank{rank} device_synchronize"),
-                    e,
-                );
-            }
-        }
-    }
-    m.seq_pos = 0;
-    m.conversation_tokens.clear();
-    if first_err.is_none() {
-        RollbackEpilogue {
-            rolled_back: true,
-            context: None,
-        }
-    } else {
-        RollbackEpilogue {
-            rolled_back: false,
-            context: first_err.or_else(|| Some("EP abort reset could not be attested".into())),
-        }
-    }
+    crate::common::ep_reset_after_abort(m)
 }
 
 /// EP cancel terminal: reset/sync first, then emit attempt-correlated
@@ -822,6 +737,9 @@ pub fn ep_emit_abort(
         return;
     }
     let attempt_id = active_attempt_id();
+    if !claim_terminal(id, attempt_id) {
+        return;
+    }
     let (aborted, done) = ds4_ep_abort_wire_events(id, completion_tokens, attempt_id);
     let _ = writeln!(stdout, "{}", aborted);
     let _ = writeln!(stdout, "{}", done);

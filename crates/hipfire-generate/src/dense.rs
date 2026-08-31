@@ -57,6 +57,11 @@ pub fn emit_active_attempt_error(
     retryable: bool,
     rolled_back: bool,
 ) {
+    if let Some(id) = id {
+        if !claim_terminal(id, active_attempt_id()) {
+            return;
+        }
+    }
     write_error_envelope(
         stdout,
         id,
@@ -157,6 +162,7 @@ pub fn ds4_ar_client_abort(
     conversation_tokens: &mut Vec<u32>,
     prefill_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
     dflash_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    asst_turn_cache: &mut AsstTurnCache,
     speculator: &mut Option<Box<dyn Speculator>>,
     gpu: &mut rdna_compute::Gpu,
     state: &mut deepseek4::DeepseekV4State,
@@ -164,6 +170,7 @@ pub fn ds4_ar_client_abort(
 ) {
     *seq_pos = 0;
     conversation_tokens.clear();
+    asst_turn_cache.clear();
     state.reset();
     state.zero_decode_caches(gpu);
     free_checkpoints(prefill_checkpoints, gpu);
@@ -357,12 +364,9 @@ pub fn generate_deepseek4_spec(
         return;
     }
 
-    // spec_k: env chain → 2 (the deepseek4-specific default; see generate_deepseek4).
-    let spec_k: usize = std::env::var("HIPFIRE_DEEPSEEK4_SPEC_K")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .or_else(|| Some(hipfire_runtime::config::get().mtp_k))
-        .unwrap_or(2);
+    // Model metadata is the single load-message source; the legacy
+    // DeepSeek-specific env override is resolved centrally by runtime config.
+    let spec_k = hipfire_runtime::config::deepseek4_spec_k(m.mtp_k);
 
     // Prefix-cache plan (ds4 policy: forced-cold on partial, ring-safety length
     // guard, step-back exact). Pure decision; the GPU teardown is applied below.
@@ -1029,6 +1033,7 @@ pub fn generate_deepseek4(
             &mut m.conversation_tokens,
             &mut m.prefill_checkpoints,
             &mut m.dflash_checkpoints,
+            &mut m.asst_turn_cache,
             &mut m.speculator,
             gpu,
             state,
@@ -1240,6 +1245,7 @@ pub fn generate_deepseek4(
                     &mut m.conversation_tokens,
                     &mut m.prefill_checkpoints,
                     &mut m.dflash_checkpoints,
+                    &mut m.asst_turn_cache,
                     &mut m.speculator,
                     gpu,
                     state,
@@ -1310,6 +1316,7 @@ pub fn generate_deepseek4(
                 &mut m.conversation_tokens,
                 &mut m.prefill_checkpoints,
                 &mut m.dflash_checkpoints,
+                &mut m.asst_turn_cache,
                 &mut m.speculator,
                 gpu,
                 state,
@@ -1382,6 +1389,7 @@ pub fn generate_deepseek4(
                 &mut m.conversation_tokens,
                 &mut m.prefill_checkpoints,
                 &mut m.dflash_checkpoints,
+                &mut m.asst_turn_cache,
                 &mut m.speculator,
                 gpu,
                 state,

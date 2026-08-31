@@ -6,7 +6,7 @@
 //!
 //! Relocated verbatim from `crates/hipfire-daemon/src/main.rs` (wave 3).
 
-use crate::terminal::active_attempt_id;
+use crate::terminal::{active_attempt_id, claim_terminal};
 
 /// Whether the authoritative Jinja generation suffix opens a reasoning span.
 /// This is deliberately tail-only: a literal `<think>` in user content must
@@ -187,6 +187,11 @@ pub fn emit_active_attempt_error(
     retryable: bool,
     rolled_back: bool,
 ) {
+    if let Some(id) = id {
+        if !claim_terminal(id, active_attempt_id()) {
+            return;
+        }
+    }
     write_error_envelope(
         stdout,
         id,
@@ -262,6 +267,9 @@ pub fn emit_qwen_ar_info(stdout: &mut impl std::io::Write, id: &str, message: &s
 }
 
 pub fn emit_qwen_ar_cancelled(stdout: &mut impl std::io::Write, id: &str, completion_tokens: usize) {
+    if !claim_terminal(id, active_attempt_id()) {
+        return;
+    }
     let attempt_id = active_attempt_id();
     let aborted = hipfire_runtime::semantic::wire_aborted(id, "client_cancelled", attempt_id);
     let _ = writeln!(stdout, "{}", aborted);

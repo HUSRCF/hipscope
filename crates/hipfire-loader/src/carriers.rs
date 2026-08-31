@@ -901,12 +901,18 @@ impl Carrier for LlamaCarrier {
                 "  llama DSpark speculator enabled (sidecar, block={}, conf_threshold={:.2})",
                 block, conf_threshold
             );
-            let body = hipfire_arch_llama::dspark_body::build_qwen3_dspark_body(
+            let body = match hipfire_arch_llama::dspark_body::build_qwen3_dspark_body(
                 assets,
                 &dspark_weights.cfg,
                 ctx.gpu,
-            )
-            .map_err(|e| format!("llama DSpark body build failed: {e}"))?;
+            ) {
+                Ok(body) => body,
+                Err(error) => {
+                    dspark_weights.free_gpu(ctx.gpu);
+                    Box::new(bundle).free_gpu(ctx.gpu);
+                    return Err(format!("llama DSpark body build failed: {error}"));
+                }
+            };
             Some(hipfire_runtime::dspark_core::build_dspark_speculator(
                 body,
                 dspark_weights,
@@ -930,31 +936,43 @@ impl Carrier for LlamaCarrier {
                 Ok(draft_hfq) if draft_hfq.arch_id == 20 => {
                     // Parse DflashConfig to validate the cross-attention concat invariant
                     // (review finding L4): the drafter's hidden must equal the target dim.
-                    let draft_cfg = hipfire_runtime::dflash::DflashConfig::from_hfq(&draft_hfq)
-                        .ok_or_else(|| {
-                            format!(
-                                "DFlash draft '{}' has arch_id=20 but missing or malformed \
-                                 'dflash' metadata block",
-                                dp
-                            )
-                        })?;
+                    let draft_cfg =
+                        match hipfire_runtime::dflash::DflashConfig::from_hfq(&draft_hfq) {
+                            Some(config) => config,
+                            None => {
+                                let error = format!(
+                                    "DFlash draft '{}' has arch_id=20 but missing or malformed \
+                                     'dflash' metadata block",
+                                    dp
+                                );
+                                Box::new(bundle).free_gpu(ctx.gpu);
+                                return Err(error);
+                            }
+                        };
                     if bundle.config.dim != draft_cfg.hidden {
-                        return Err(format!(
+                        let error = format!(
                             "DFlash draft '{}' hidden={} != target dim={} \
-                                 (cross-attention concat invariant L4: drafter hidden \
-                                 must equal target residual dim)",
+                             (cross-attention concat invariant L4: drafter hidden \
+                             must equal target residual dim)",
                             dp, draft_cfg.hidden, bundle.config.dim
-                        ));
+                        );
+                        Box::new(bundle).free_gpu(ctx.gpu);
+                        return Err(error);
                     }
                     // Drop the peek handle before the builder reopens it.
                     drop(draft_hfq);
-                    let spec = hipfire_runtime::dflash_generic::build_generic_dflash_speculator(
+                    let spec = match hipfire_runtime::dflash_generic::build_generic_dflash_speculator(
                         ctx.gpu,
                         dp,
                         &mut bundle,
                         ctx.max_seq,
-                    )
-                    .map_err(|e| format!("DFlash generic speculator build failed: {e}"))?;
+                    ) {
+                        Ok(spec) => spec,
+                        Err(error) => {
+                            Box::new(bundle).free_gpu(ctx.gpu);
+                            return Err(format!("DFlash generic speculator build failed: {error}"));
+                        }
+                    };
                     eprintln!(
                         "  DFlash generic speculator loaded for arch {} target: {}",
                         meta.arch_id, dp
@@ -1283,13 +1301,15 @@ impl Carrier for Deepseek4Carrier {
                 .map_err(|e| format!("deepseek4 DSpark speculator build failed: {e}"))?,
             )
         } else if weights.mtp_layer.is_some() {
-            // spec_k resolution MUST mirror daemon.rs:9349 (HIPFIRE_DEEPSEEK4_SPEC_K →
-            // HIPFIRE_MTP_K → default 2) so T4's spec.k() matches the bespoke loop's window.
-            let max_n: usize = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_SPEC_K")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .or_else(|| Some(hipfire_runtime::config::get().mtp_k))
-                .unwrap_or(2);
+            // Resolve the same model-level value used by generation. The
+            // documented DeepSeek compatibility env may override it, but
+            // generic `HIPFIRE_MTP_K` has already been folded into
+            // `ctx.spec.mtp_k` by the load caller.
+            let max_n = hipfire_runtime::config::deepseek4_spec_k(
+                ctx.spec
+                    .mtp_k
+                    .unwrap_or(hipfire_runtime::config::get().mtp_k),
+            );
             let ctx_capacity = config.max_position_embeddings;
             eprintln!("  deepseek4 MTP speculator enabled (in-weights, K={max_n})");
             Some(
