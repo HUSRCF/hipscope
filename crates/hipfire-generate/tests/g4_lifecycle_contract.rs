@@ -19,7 +19,7 @@ use hipfire_engine::terminal::{
 };
 use hipfire_generate::ar::GenerationRoute;
 use hipfire_runtime::llama::{EmbeddingFormat, WeightTensor};
-use hipfire_runtime::loader_api::{CaskConfig, SpecLoadCfg};
+use hipfire_runtime::loader_api::{CaskConfig, LoadFaultStage, SpecLoadCfg};
 use hipfire_runtime::model_load::WeightSource;
 use rdna_compute::{Gpu, GpuTensor};
 
@@ -208,7 +208,14 @@ fn route_adapters_start_first_and_race_one_semantic_terminal() {
         set_active_attempt_id(attempt);
         let mut output = Vec::new();
         adapter.emit_start(&mut output, &id);
+        adapter.emit_start(&mut output, &id);
         let start_lines = parse_json_lines(&output);
+        assert_eq!(
+            start_lines.len(),
+            1,
+            "{} adapter duplicated gen_start",
+            route.name()
+        );
         assert_eq!(
             start_lines.first().and_then(|line| line.get("type")),
             Some(&serde_json::Value::String("gen_start".to_string())),
@@ -516,11 +523,21 @@ fn load_and_unload_model(gpu: &mut Gpu, target: &Path, draft: Option<&Path>, spe
     hipfire_loader::unload_model(model, gpu).expect("model unload");
 }
 
-fn expect_load_failure(gpu: &mut Gpu, target: &Path, draft: Option<&Path>, spec: SpecLoadCfg) {
+fn expect_load_failure(
+    gpu: &mut Gpu,
+    target: &Path,
+    draft: Option<&Path>,
+    spec: SpecLoadCfg,
+    expected_stage: LoadFaultStage,
+) {
     match try_load_model(gpu, target, draft, spec) {
-        Err(error) => assert!(
-            !error.is_empty(),
-            "fault fixture returned an empty failure reason"
+        Err(error) => assert_eq!(
+            error,
+            format!(
+                "{}: target-owner-published; draft-owner-published; injected failure",
+                expected_stage.label()
+            ),
+            "fault did not stop at the requested stage with both owners published"
         ),
         Ok(model) => {
             let _ = hipfire_loader::unload_model(model, gpu);
@@ -530,14 +547,12 @@ fn expect_load_failure(gpu: &mut Gpu, target: &Path, draft: Option<&Path>, spec:
 }
 
 #[test]
-#[ignore = "requires exact gfx1151 HIP device, DFlash/DSpark sidecars, and existing stage-fault fixture hooks via HIPFIRE_G4_*; ignored on CPU"]
+#[ignore = "requires exact gfx1151 HIP device plus valid DFlash/DSpark target+draft fixtures in HIPFIRE_G4_*_TARGET and HIPFIRE_G4_*_DRAFT; ignored on CPU"]
 fn gpu_dflash_dspark_target_verify_and_head_failures_recover_without_double_free() {
     let dflash_target = required_path("HIPFIRE_G4_DFLASH_TARGET");
     let dflash_draft = required_path("HIPFIRE_G4_DFLASH_DRAFT");
     let dspark_target = required_path("HIPFIRE_G4_DSPARK_TARGET");
     let dspark_draft = required_path("HIPFIRE_G4_DSPARK_DRAFT");
-    let dflash_fault = required_path("HIPFIRE_G4_DFLASH_TARGET_VERIFY_FAILURE");
-    let dspark_fault = required_path("HIPFIRE_G4_DSPARK_HEAD_FAILURE");
 
     let mut gpu = Gpu::init().expect("HIP device");
     assert_eq!(
@@ -558,12 +573,14 @@ fn gpu_dflash_dspark_target_verify_and_head_failures_recover_without_double_free
     assert_gpu_baseline(&mut gpu, baseline);
     expect_load_failure(
         &mut gpu,
-        &dflash_fault,
+        &dflash_target,
         Some(&dflash_draft),
         SpecLoadCfg {
             dspark: Some(false),
+            lifecycle_fault: Some(LoadFaultStage::DflashTargetVerifyScratch),
             ..Default::default()
         },
+        LoadFaultStage::DflashTargetVerifyScratch,
     );
     assert_gpu_baseline(&mut gpu, baseline);
     load_and_unload_model(
@@ -578,12 +595,14 @@ fn gpu_dflash_dspark_target_verify_and_head_failures_recover_without_double_free
     assert_gpu_baseline(&mut gpu, baseline);
     expect_load_failure(
         &mut gpu,
-        &dspark_fault,
+        &dspark_target,
         Some(&dspark_draft),
         SpecLoadCfg {
             dspark: Some(true),
+            lifecycle_fault: Some(LoadFaultStage::DsparkHead),
             ..Default::default()
         },
+        LoadFaultStage::DsparkHead,
     );
     assert_gpu_baseline(&mut gpu, baseline);
     load_and_unload_model(

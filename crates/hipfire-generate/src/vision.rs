@@ -14,15 +14,9 @@ use hipfire_arch_qwen35::qwen35;
 use hipfire_arch_qwen35::speculative;
 use hipfire_arch_qwen35_vl::image;
 use hipfire_arch_qwen35_vl::qwen35_vl;
-use hipfire_engine::emit::{
-    emit_active_attempt_error, emit_gen_start, emit_qwen_ar_cancelled, emit_reasoning_token,
-    emit_visible_token, write_error,
-};
+use hipfire_engine::emit::{emit_reasoning_token, emit_visible_token};
 use hipfire_engine::scheduler::block_attractor_unclosed_cpu;
-use hipfire_engine::terminal::{
-    active_attempt_id, await_client_terminal_commit, check_abort, emit_staged_terminal_done,
-    ClientTerminalDecision,
-};
+use hipfire_engine::terminal::{active_attempt_id, await_client_terminal_commit, check_abort, ClientTerminalDecision};
 use hipfire_loader::LoadedModel;
 use hipfire_runtime::emit_text::{ThinkOutputRouter, ThinkRouteEvent};
 use hipfire_runtime::eos_filter::{EosFilter, FilterAction};
@@ -32,6 +26,20 @@ use std::any::Any;
 use std::io::Write;
 use std::path::Path;
 use std::time::Instant;
+use crate::ar::emit_active_route_error;
+fn emit_active_attempt_error(
+    stdout: &mut impl std::io::Write,
+    id: Option<&str>,
+    message: &str,
+    class: &str,
+    retryable: bool,
+    rolled_back: bool,
+) {
+    emit_active_route_error(stdout, id, message, class, retryable, rolled_back);
+}
+fn write_error(stdout: &mut impl std::io::Write, id: &str, message: &str) {
+    crate::ar::emit_active_route_error(stdout, Some(id), message, "internal", false, false);
+}
 
 // ── Local copy of the daemon-shared emission helper ──────────────────────────
 // `emit_committed_event` is shared across all generate paths in the daemon,
@@ -466,7 +474,6 @@ pub fn generate_vl(
     // image turns after the encoder finished ("no response bytes", wedged
     // slot; 2026-08-27 ledger finding b). Text-path generate() has emitted
     // this since the e99583afa-class fixes.
-    let gen_contract = crate::common::gen_start_contract_version_for_arch(m.arch_id);
     // started_in_think mirrors the ChatFrame builder's own conditions: the
     // `<think>` opener lands in the prompt only for AssistantPrefix::OpenThink
     // AND a tokenizer that carries the special token (the builder falls back
@@ -479,7 +486,12 @@ pub fn generate_vl(
         .tokenizer
         .as_ref()
         .is_some_and(|t| t.special_token_id("<think>").is_some());
-    emit_gen_start(stdout, params.id, started_in_think, gen_contract);
+    crate::ar::emit_generation_start(
+        crate::ar::GenerationRoute::QwenAr,
+        stdout,
+        params.id,
+        started_in_think,
+    );
     // INVARIANT: all early returns before the `vision_forward` call (the
     // first expensive GPU allocation in this function) use `write_error`
     // and return without owning any GPU buffers. If you add a GPU
@@ -1540,7 +1552,7 @@ pub fn generate_vl(
         "attempt_id": active_attempt_id(),
     });
     match await_client_terminal_commit(stdout, id, &pending_done) {
-        ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
+            ClientTerminalDecision::Commit => crate::ar::emit_active_route_done(stdout, id, &pending_done),
         ClientTerminalDecision::Abort => {
             let ep = vl_reset_live(
                 gpu,
@@ -1567,11 +1579,11 @@ pub fn generate_vl_dots_ocr(
 ) {
     use hipfire_arch_dots_ocr::image as dots_image;
     // Stream-contract opener — same HTTP-gate rationale as generate_vl above.
-    emit_gen_start(
+    crate::ar::emit_generation_start(
+        crate::ar::GenerationRoute::DotsOcr,
         stdout,
         params.id,
         false,
-        crate::common::gen_start_contract_version_for_arch(m.arch_id),
     );
     let t0 = Instant::now();
     let GenerateVLParams {
@@ -1650,7 +1662,7 @@ pub fn generate_vl_dots_ocr(
         return;
     }
     if check_abort(id) {
-        emit_qwen_ar_cancelled(stdout, id, 0);
+        crate::ar::emit_active_route_cancel(stdout, id, 0);
         return;
     }
     if let Err(error) = m.reset_context(gpu) {
@@ -1702,7 +1714,7 @@ pub fn generate_vl_dots_ocr(
         Ok(Some(t)) => t,
         Ok(None) => {
             let _ = gpu.free_tensor(patches_gpu);
-            emit_qwen_ar_cancelled(stdout, id, 0);
+            crate::ar::emit_active_route_cancel(stdout, id, 0);
             return;
         }
         Err(e) => {
@@ -2074,7 +2086,7 @@ pub fn generate_vl_dots_ocr(
         "attempt_id": active_attempt_id(),
     });
     match await_client_terminal_commit(stdout, id, &pending_done) {
-        ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
+            ClientTerminalDecision::Commit => crate::ar::emit_active_route_done(stdout, id, &pending_done),
         ClientTerminalDecision::Abort => {
             let ep = dots_reset_state_live(
                 state,
@@ -2378,7 +2390,7 @@ pub fn run_dots_ocr_ngram_loop(
         "attempt_id": active_attempt_id(),
     });
     match await_client_terminal_commit(stdout, id, &pending_done) {
-        ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
+            ClientTerminalDecision::Commit => crate::ar::emit_active_route_done(stdout, id, &pending_done),
         ClientTerminalDecision::Abort => {
             let mut reset_target = |gpu: &mut rdna_compute::Gpu| {
                 hipfire_runtime::spec::SpecTarget::reset_recurrent(bundle, gpu)
@@ -2409,11 +2421,11 @@ pub fn generate_dots_ocr_text(
     top_p: f32,
     max_tokens: usize,
 ) {
-    emit_gen_start(
+    crate::ar::emit_generation_start(
+        crate::ar::GenerationRoute::DotsOcr,
         stdout,
         id,
         false,
-        crate::common::gen_start_contract_version_for_arch(m.arch_id),
     );
     let _ = (temp, top_p); // greedy decode for now; sampling left for future work
     let t0 = Instant::now();
@@ -2433,7 +2445,7 @@ pub fn generate_dots_ocr_text(
         return;
     }
     if check_abort(id) {
-        emit_qwen_ar_cancelled(stdout, id, 0);
+        crate::ar::emit_active_route_cancel(stdout, id, 0);
         return;
     }
     if let Err(error) = m.reset_context(gpu) {
@@ -2676,7 +2688,7 @@ pub fn generate_dots_ocr_text(
         "attempt_id": active_attempt_id(),
     });
     match await_client_terminal_commit(stdout, id, &pending_done) {
-        ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
+        ClientTerminalDecision::Commit => crate::ar::emit_active_route_done(stdout, id, &pending_done),
         ClientTerminalDecision::Abort => {
             let ep = dots_reset_state_live(
                 state,
@@ -3031,6 +3043,12 @@ pub fn generate_lfm2_vl(
         seed,
         ..
     } = *params;
+    crate::ar::emit_generation_start(
+        crate::ar::GenerationRoute::LfmAr,
+        stdout,
+        id,
+        false,
+    );
     if m.tokenizer.is_none() {
         emit_active_attempt_error(
             stdout,
@@ -3056,11 +3074,6 @@ pub fn generate_lfm2_vl(
             return;
         }
     };
-
-    // Stream contract opener BEFORE any GPU work or event emission — the
-    // HTTP gate rejects a `token` that arrives without gen_start first.
-    let gen_contract = crate::common::gen_start_contract_version_for_arch(m.arch_id);
-    emit_gen_start(stdout, id, false, gen_contract);
 
     // Full-turn clock: preprocess + tower encode + prefill + decode. The
     // tower dominates image turns (~7–10 s of the ~22 s wall on gfx1101),
@@ -3276,7 +3289,7 @@ pub fn generate_lfm2_vl(
                 // top-of-loop abort check to avoid sampling empty logits,
                 // and would push the full prompt into conversation_tokens
                 // against a partially-filled KV.
-                emit_qwen_ar_cancelled(stdout, id, 0);
+                crate::ar::emit_active_route_cancel(stdout, id, 0);
                 return;
             }
             let res = if tok == image_token_id && vis_idx < n_visual_tokens {
@@ -3379,7 +3392,7 @@ pub fn generate_lfm2_vl(
     // on the recognized terminal dialect, so a raw custom event here would
     // hold the admission guard forever.
     if check_abort(id) {
-        emit_qwen_ar_cancelled(stdout, id, generated_count);
+        crate::ar::emit_active_route_cancel(stdout, id, generated_count);
         return;
     }
 
@@ -3400,12 +3413,12 @@ pub fn generate_lfm2_vl(
         "attempt_id": active_attempt_id(),
     });
     match await_client_terminal_commit(stdout, id, &pending_done) {
-        ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
+        ClientTerminalDecision::Commit => crate::ar::emit_active_route_done(stdout, id, &pending_done),
         ClientTerminalDecision::Abort => {
             // Same release contract as the post-loop latch: the terminal pair
             // must be the recognized wire dialect or serve holds its
             // admission guard forever.
-            emit_qwen_ar_cancelled(stdout, id, generated_count);
+            crate::ar::emit_active_route_cancel(stdout, id, generated_count);
         }
     }
 }

@@ -202,7 +202,7 @@ pub fn emit_spec_cancel_after_rollback(
     epilogue: &RollbackEpilogue,
 ) {
     if epilogue.rolled_back {
-        emit_qwen_ar_cancelled(stdout, id, completion_tokens);
+        crate::ar::emit_active_route_cancel(stdout, id, completion_tokens);
         return;
     }
     emit_fail_closed_error(
@@ -476,7 +476,7 @@ pub fn emit_fail_closed_error(
         Some(ctx) if !epilogue.rolled_back => format!("{message} ({ctx})"),
         _ => message.to_string(),
     };
-    emit_active_attempt_error(stdout, id, &full, class, retryable, epilogue.rolled_back);
+    crate::ar::emit_active_route_error(stdout, id, &full, class, retryable, epilogue.rolled_back);
     let _ = stdout.flush();
 }
 
@@ -761,7 +761,7 @@ pub fn emit_ds4_malformed_action(
     debug_assert!(!action.store_cache);
     debug_assert!(!action.expose_tool_calls);
     debug_assert!(!action.retryable);
-    emit_active_attempt_error(
+    crate::ar::emit_active_route_error(
         stdout,
         Some(id),
         &action.message,

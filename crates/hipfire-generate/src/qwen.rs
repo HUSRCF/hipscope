@@ -51,6 +51,23 @@ use crate::common::*;
 use hipfire_pflash;
 use hipfire_runtime::prompt_frame;
 use rdna_compute;
+fn emit_active_attempt_error(
+    stdout: &mut impl std::io::Write,
+    id: Option<&str>,
+    message: &str,
+    class: &str,
+    retryable: bool,
+    rolled_back: bool,
+) {
+    crate::ar::emit_active_route_error(
+        stdout,
+        id,
+        message,
+        class,
+        retryable,
+        rolled_back,
+    );
+}
 
 /// Expert-parallel streaming generate (task #26, ds4 first). Greedy AR via
 /// `forward_ep` across the EP ranks; logits gathered on rank 0 and sampled on
@@ -87,6 +104,12 @@ pub fn generate_ep(
     enable_thinking: bool,
     reasoning_effort: Option<&str>,
 ) {
+    let ep_route = match m.arch_id {
+        9 => crate::ar::GenerationRoute::Deepseek4Ep,
+        10 => crate::ar::GenerationRoute::MiniMaxEp,
+        _ => crate::ar::GenerationRoute::QwenAr,
+    };
+    crate::ar::set_generation_route(ep_route);
     // ── Canonical multi-turn render via the arch's trained chat_template
     // (ds4/minimax). Mirrors generate_minimax: `messages_history` (the full
     // conversation, live user last) → render_messages with `tools` threaded;
@@ -334,11 +357,11 @@ pub fn ep_serve_qwen35_dense_tp(
     }
     // `primed_think` preserves Jinja enable_thinking semantics (render ended on
     // an open `<think>` primer). Tool requests fail closed before this route.
-    emit_gen_start(
+    crate::ar::emit_generation_start(
+        crate::ar::active_generation_route().unwrap_or(crate::ar::GenerationRoute::QwenAr),
         stdout,
         id,
         primed_think,
-        gen_start_contract_version_for_arch(m.arch_id),
     );
 
     let t_prefill = Instant::now();
@@ -684,7 +707,7 @@ pub fn ep_emit_done(
         "attempt_id": active_attempt_id(),
     });
     match await_client_terminal_commit(stdout, id, &pending_done) {
-        ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
+        ClientTerminalDecision::Commit => crate::ar::emit_active_route_done(stdout, id, &pending_done),
         ClientTerminalDecision::Abort => ep_emit_abort(stdout, id, m, generated),
     }
 }
@@ -844,7 +867,12 @@ pub fn ep_serve_ds4(
     // a bespoke decode loop, so unlike the single-device AR/spec paths it does
     // not inherit their emitter-side latch.  Open it after all early request
     // validation but before prefill/decode can produce a client event.
-    emit_ds4_ep_gen_start(stdout, id, think_mode);
+    crate::ar::emit_generation_start(
+        crate::ar::active_generation_route().unwrap_or(crate::ar::GenerationRoute::Deepseek4Ep),
+        stdout,
+        id,
+        !matches!(think_mode, ThinkMode::NonThink),
+    );
 
     let t_prefill = Instant::now();
     // FIX #1 (ep-prefill-abort): set when check_abort fires inside the prefill
@@ -1202,7 +1230,7 @@ pub fn ep_serve_ds4(
         );
     }
 
-    emit_staged_terminal_done(stdout, &pending_done);
+    crate::ar::emit_active_route_done(stdout, id, &pending_done);
     let _ = stdout.flush();
 }
 
@@ -2190,11 +2218,11 @@ pub fn generate_dflash(
     // Advertise semantic-v2 only when this turn's arch has a correlated
     // router-backed DFlash producer (qwen35 / qwen35-vl). Other arches still
     // use whole-output tool extraction and stay on legacy contract.
-    emit_gen_start(
+    crate::ar::emit_generation_start(
+        crate::ar::active_generation_route().unwrap_or(crate::ar::GenerationRoute::QwenDflash),
         stdout,
         id,
         started_in_think,
-        gen_start_contract_version_for_arch(m.arch_id),
     );
     let run = match generate_spec(
         m,
@@ -2475,7 +2503,7 @@ pub fn generate_dflash(
                         cached_seq,
                     );
                 }
-                emit_staged_terminal_done(stdout, &pending_done);
+                crate::ar::emit_active_route_done(stdout, id, &pending_done);
             }
         }
     } else {
@@ -2624,7 +2652,7 @@ pub fn generate_dflash(
                 },
             );
         }
-        emit_staged_terminal_done(stdout, &pending_done);
+        crate::ar::emit_active_route_done(stdout, id, &pending_done);
     }
     let _ = stdout.flush();
     // Per-request debug summary (stderr → serve.log): active drafter, τ, tok/s.
@@ -3998,6 +4026,12 @@ pub fn generate_multi(
     // byte-identical at temp>0.
     request_seed: u64,
 ) {
+    crate::ar::emit_generation_start(
+        crate::ar::active_generation_route().unwrap_or(crate::ar::GenerationRoute::PipelineParallel),
+        stdout,
+        id,
+        false,
+    );
     let prompt_est = {
         let tokenizer = m.tokenizer.as_ref().unwrap();
         tokenizer.encode(prompt).len() + 20
@@ -5018,7 +5052,7 @@ pub fn generate_multi(
         emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
         return;
     }
-    emit_staged_terminal_done(stdout, &pending_done);
+    crate::ar::emit_active_route_done(stdout, id, &pending_done);
 }
 
 // --- Auto-appended shared helpers (shared-temp, dedup at merge) ---

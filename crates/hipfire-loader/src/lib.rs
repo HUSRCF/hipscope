@@ -949,7 +949,7 @@ pub struct ResetOperations<'a> {
 pub fn reset_lifecycle(
     route: ResetRoute,
     mut state: ResetRequestState<'_>,
-    eviction: Option<&Eviction>,
+    mut eviction: Option<&Eviction>,
     operations: &mut ResetOperations<'_>,
 ) -> Result<(), String> {
     *state.seq_pos = 0;
@@ -963,6 +963,16 @@ pub fn reset_lifecycle(
     if let Some(pending) = state.speculative_pending.as_deref_mut() {
         pending.clear();
     }
+    if let Some(owner) = eviction {
+        owner.reset_request_state(state.compact_offset.as_deref_mut());
+    } else if let Some(offset) = state.compact_offset.as_deref_mut() {
+        *offset = 0;
+    }
+    eviction = None;
+    // The phase callback may own the complete LoadedModel. End every field
+    // and eviction-owner borrow before invoking it so production adapters
+    // never overlap a whole-owner mutable reference with request state.
+    drop(state);
 
     let mut errors = Vec::new();
     for phase in [
@@ -974,13 +984,6 @@ pub fn reset_lifecycle(
         ResetPhase::EvictionRequest,
         ResetPhase::GraphsAndSynchronize,
     ] {
-        if phase == ResetPhase::EvictionRequest {
-            if let Some(owner) = eviction {
-                owner.reset_request_state(state.compact_offset.as_deref_mut());
-            } else if let Some(offset) = state.compact_offset.as_deref_mut() {
-                *offset = 0;
-            }
-        }
         if let Err(error) = (operations.run)(route, phase) {
             errors.push(format!("{}: {error}", phase.label()));
         }
@@ -1365,7 +1368,14 @@ impl LoadedModel {
     /// adapters around this method, but it must not dispatch directly to a
     /// concrete bundle for a total reset.
     pub fn reset_architecture_state(&mut self, gpu: &mut Gpu) -> Result<(), String> {
-        let Some(model) = self.as_arch_model_mut() else {
+        Self::reset_architecture_state_slot(&mut self.state, gpu)
+    }
+
+    fn reset_architecture_state_slot(
+        state: &mut Option<Box<dyn hipfire_runtime::arch_model::ArchModel>>,
+        gpu: &mut Gpu,
+    ) -> Result<(), String> {
+        let Some(model) = state.as_deref_mut() else {
             return Err("model state is missing".to_string());
         };
         let key = model.arch_key();
@@ -1383,37 +1393,41 @@ impl LoadedModel {
             return Err("model has no EP owner".to_string());
         }
         let route = self.reset_route();
-        let model_ptr = self as *mut LoadedModel;
+        let ep = &mut self.ep;
+        let kv_adaptive = &mut self.kv_adaptive;
+        let speculator = &mut self.speculator;
+        let prefill_checkpoints = &mut self.prefill_checkpoints;
+        let dflash_checkpoints = &mut self.dflash_checkpoints;
+        let seq_pos = &mut self.seq_pos;
+        let conversation_tokens = &mut self.conversation_tokens;
+        let asst_turn_cache = &mut self.asst_turn_cache;
+        let eviction = self.eviction.as_ref();
         let mut run = move |phase_route: ResetRoute, phase: ResetPhase| {
             debug_assert_eq!(phase_route, route);
-            // SAFETY: `reset_lifecycle` holds disjoint borrows of only the
-            // host fields and persistent eviction owner while this callback
-            // touches architecture/device fields.
-            let model = unsafe { &mut *model_ptr };
             match phase {
                 ResetPhase::Checkpoints => {
-                    let Some(ep) = model.ep.as_mut() else {
+                    let Some(ep_state) = ep.as_mut() else {
                         return Err("model has no EP owner".to_string());
                     };
-                    let Some(owner) = ep.gpus.devices.first_mut() else {
-                        model.prefill_checkpoints.clear();
-                        model.dflash_checkpoints.clear();
+                    let Some(owner) = ep_state.gpus.devices.first_mut() else {
+                        prefill_checkpoints.clear();
+                        dflash_checkpoints.clear();
                         return Err("EP reset has no device for checkpoint ownership".to_string());
                     };
-                    for (_, snapshot) in model.prefill_checkpoints.drain(..) {
+                    for (_, snapshot) in prefill_checkpoints.drain(..) {
                         snapshot.free_gpu(owner);
                     }
-                    for (_, snapshot) in model.dflash_checkpoints.drain(..) {
+                    for (_, snapshot) in dflash_checkpoints.drain(..) {
                         snapshot.free_gpu(owner);
                     }
                     Ok(())
                 }
                 ResetPhase::Architecture => {
-                    let Some(ep) = model.ep.as_mut() else {
+                    let Some(ep_state) = ep.as_mut() else {
                         return Err("model has no EP owner".to_string());
                     };
                     let mut errors = Vec::new();
-                    reset_ep_architecture_state(ep, &mut errors);
+                    reset_ep_architecture_state(ep_state, &mut errors);
                     if errors.is_empty() {
                         Ok(())
                     } else {
@@ -1421,18 +1435,18 @@ impl LoadedModel {
                     }
                 }
                 ResetPhase::AdaptiveKv => {
-                    if let Some(adaptive) = model.kv_adaptive.as_mut() {
+                    if let Some(adaptive) = kv_adaptive.as_mut() {
                         adaptive.reset();
                     }
                     Ok(())
                 }
                 ResetPhase::Batch => Ok(()),
                 ResetPhase::Speculator => {
-                    let Some(ep) = model.ep.as_mut() else {
+                    let Some(ep_state) = ep.as_mut() else {
                         return Err("model has no EP owner".to_string());
                     };
                     if let (Some(owner), Some(spec)) =
-                        (ep.gpus.devices.first_mut(), model.speculator.as_mut())
+                        (ep_state.gpus.devices.first_mut(), speculator.as_mut())
                     {
                         spec.reset(owner)?;
                     }
@@ -1440,11 +1454,11 @@ impl LoadedModel {
                 }
                 ResetPhase::EvictionRequest => Ok(()),
                 ResetPhase::GraphsAndSynchronize => {
-                    let Some(ep) = model.ep.as_mut() else {
+                    let Some(ep_state) = ep.as_mut() else {
                         return Err("model has no EP owner".to_string());
                     };
                     let mut errors = Vec::new();
-                    for (rank, device) in ep.gpus.devices.iter_mut().enumerate() {
+                    for (rank, device) in ep_state.gpus.devices.iter_mut().enumerate() {
                         device.invalidate_graph_state();
                         device.replay.invalidate_replay_observation_window();
                         if let Err(error) = device.bind_thread() {
@@ -1468,14 +1482,14 @@ impl LoadedModel {
         reset_lifecycle(
             route,
             ResetRequestState {
-                seq_pos: &mut self.seq_pos,
-                conversation_tokens: &mut self.conversation_tokens,
-                asst_turn_cache: Some(&mut self.asst_turn_cache),
+                seq_pos,
+                conversation_tokens,
+                asst_turn_cache: Some(asst_turn_cache),
                 request_tokens: None,
                 compact_offset: None,
                 speculative_pending: None,
             },
-            self.eviction.as_ref(),
+            eviction,
             &mut ResetOperations { run: &mut run },
         )
     }
@@ -1485,34 +1499,39 @@ impl LoadedModel {
     /// only this method's callback supplies the concrete GPU operations.
     pub fn reset_context(&mut self, gpu: &mut Gpu) -> Result<(), String> {
         let route = self.reset_route();
-        let model_ptr = self as *mut LoadedModel;
+        let ep = &mut self.ep;
+        let state = &mut self.state;
+        let kv_adaptive = &mut self.kv_adaptive;
+        let speculator = &mut self.speculator;
+        let prefill_checkpoints = &mut self.prefill_checkpoints;
+        let dflash_checkpoints = &mut self.dflash_checkpoints;
+        let seq_pos = &mut self.seq_pos;
+        let conversation_tokens = &mut self.conversation_tokens;
+        let asst_turn_cache = &mut self.asst_turn_cache;
+        let eviction = self.eviction.as_ref();
         let mut run = move |phase_route: ResetRoute, phase: ResetPhase| {
             debug_assert_eq!(phase_route, route);
-            // SAFETY: `reset_lifecycle` borrows only host fields and the
-            // persistent eviction owner while this callback touches disjoint
-            // architecture/device fields.
-            let model = unsafe { &mut *model_ptr };
             match phase {
                 ResetPhase::Checkpoints => {
-                    if let Some(ep) = model.ep.as_mut() {
-                        let Some(owner) = ep.gpus.devices.first_mut() else {
-                            model.prefill_checkpoints.clear();
-                            model.dflash_checkpoints.clear();
+                    if let Some(ep_state) = ep.as_mut() {
+                        let Some(owner) = ep_state.gpus.devices.first_mut() else {
+                            prefill_checkpoints.clear();
+                            dflash_checkpoints.clear();
                             return Err(
                                 "EP reset has no device for checkpoint ownership".to_string()
                             );
                         };
-                        for (_, snapshot) in model.prefill_checkpoints.drain(..) {
+                        for (_, snapshot) in prefill_checkpoints.drain(..) {
                             snapshot.free_gpu(owner);
                         }
-                        for (_, snapshot) in model.dflash_checkpoints.drain(..) {
+                        for (_, snapshot) in dflash_checkpoints.drain(..) {
                             snapshot.free_gpu(owner);
                         }
                     } else {
-                        for (_, snapshot) in model.prefill_checkpoints.drain(..) {
+                        for (_, snapshot) in prefill_checkpoints.drain(..) {
                             snapshot.free_gpu(gpu);
                         }
-                        for (_, snapshot) in model.dflash_checkpoints.drain(..) {
+                        for (_, snapshot) in dflash_checkpoints.drain(..) {
                             snapshot.free_gpu(gpu);
                         }
                     }
@@ -1520,11 +1539,11 @@ impl LoadedModel {
                 }
                 ResetPhase::Architecture => match phase_route {
                     ResetRoute::ExpertParallel | ResetRoute::TensorParallel => {
-                        let Some(ep) = model.ep.as_mut() else {
+                        let Some(ep_state) = ep.as_mut() else {
                             return Err("model has no EP/TP owner".to_string());
                         };
                         let mut errors = Vec::new();
-                        reset_ep_architecture_state(ep, &mut errors);
+                        reset_ep_architecture_state(ep_state, &mut errors);
                         if errors.is_empty() {
                             Ok(())
                         } else {
@@ -1534,11 +1553,10 @@ impl LoadedModel {
                     ResetRoute::PipelineParallel => {
                         Err("pipeline reset requires the PP lifecycle adapter".to_string())
                     }
-                    ResetRoute::Single => model.reset_architecture_state(gpu),
+                    ResetRoute::Single => Self::reset_architecture_state_slot(state, gpu),
                 },
                 ResetPhase::AdaptiveKv => {
-                    if let Some(adaptive) = model.kv_adaptive.as_mut() {
-                        let state = &mut model.state;
+                    if let Some(adaptive) = kv_adaptive.as_mut() {
                         if let Some(kv) = state.as_deref_mut().and_then(|arch| arch.kv_cache_mut())
                         {
                             adaptive.reset_with_cache(gpu, kv);
@@ -1552,7 +1570,6 @@ impl LoadedModel {
                     if phase_route != ResetRoute::Single {
                         return Ok(());
                     }
-                    let state = &mut model.state;
                     if let Some(bundle) = state.as_deref_mut().and_then(|arch| {
                         (arch as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
                     }) {
@@ -1570,9 +1587,9 @@ impl LoadedModel {
                     Ok(())
                 }
                 ResetPhase::Speculator => {
-                    if let Some(spec) = model.speculator.as_mut() {
-                        if let Some(ep) = model.ep.as_mut() {
-                            if let Some(owner) = ep.gpus.devices.first_mut() {
+                    if let Some(spec) = speculator.as_mut() {
+                        if let Some(ep_state) = ep.as_mut() {
+                            if let Some(owner) = ep_state.gpus.devices.first_mut() {
                                 spec.reset(owner)?;
                             }
                         } else {
@@ -1583,9 +1600,9 @@ impl LoadedModel {
                 }
                 ResetPhase::EvictionRequest => Ok(()),
                 ResetPhase::GraphsAndSynchronize => {
-                    if let Some(ep) = model.ep.as_mut() {
+                    if let Some(ep_state) = ep.as_mut() {
                         let mut errors = Vec::new();
-                        for (rank, device) in ep.gpus.devices.iter_mut().enumerate() {
+                        for (rank, device) in ep_state.gpus.devices.iter_mut().enumerate() {
                             device.invalidate_graph_state();
                             device.replay.invalidate_replay_observation_window();
                             if let Err(error) = device.bind_thread() {
@@ -1617,14 +1634,14 @@ impl LoadedModel {
         reset_lifecycle(
             route,
             ResetRequestState {
-                seq_pos: &mut self.seq_pos,
-                conversation_tokens: &mut self.conversation_tokens,
-                asst_turn_cache: Some(&mut self.asst_turn_cache),
+                seq_pos,
+                conversation_tokens,
+                asst_turn_cache: Some(asst_turn_cache),
                 request_tokens: None,
                 compact_offset: None,
                 speculative_pending: None,
             },
-            self.eviction.as_ref(),
+            eviction,
             &mut ResetOperations { run: &mut run },
         )
     }
