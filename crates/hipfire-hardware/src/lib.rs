@@ -21,9 +21,8 @@
 //! 3. Pass the multi-GPU coherence gate.
 
 use hip_bridge::{
-    DeviceBuffer, Event, HipError, HipResult, RcclComms,
-    HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED, HIP_ERROR_PEER_ACCESS_UNSUPPORTED,
-    HIP_EVENT_DISABLE_TIMING, HIP_EVENT_RELEASE_TO_SYSTEM,
+    DeviceBuffer, Event, HipError, HipResult, RcclComms, HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED,
+    HIP_ERROR_PEER_ACCESS_UNSUPPORTED, HIP_EVENT_DISABLE_TIMING, HIP_EVENT_RELEASE_TO_SYSTEM,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -297,11 +296,7 @@ impl Gpus {
     /// only validates the device count. Pre-flight runs the arch-match +
     /// VRAM-delta gate (TP ranks are identical cards, so the uniform delta
     /// check applies).
-    pub fn init_tp(
-        opts: &DeviceResolveOpts,
-        tp_size: usize,
-        n_layers: usize,
-    ) -> HipResult<Self> {
+    pub fn init_tp(opts: &DeviceResolveOpts, tp_size: usize, n_layers: usize) -> HipResult<Self> {
         if tp_size == 0 {
             return Err(HipError::new(0, "init_tp: tp_size must be >= 1"));
         }
@@ -833,16 +828,15 @@ impl Gpus {
         for rank in 0..n {
             devices[rank].tp_graph_signal_store_gfx1201(&signals[rank], epoch)?;
         }
-        for destination in 0..n {
+        for (destination, device) in devices.iter_mut().enumerate() {
             let peers: Vec<&DeviceBuffer> = (0..n)
                 .filter(|&source| source != destination)
                 .map(|source| &signals[source])
                 .collect();
             if n == 3 {
-                devices[destination].tp_graph_signal_wait2_gfx1201([peers[0], peers[1]], epoch)?;
+                device.tp_graph_signal_wait2_gfx1201([peers[0], peers[1]], epoch)?;
             } else {
-                devices[destination]
-                    .tp_graph_signal_wait3_gfx1201([peers[0], peers[1], peers[2]], epoch)?;
+                device.tp_graph_signal_wait3_gfx1201([peers[0], peers[1], peers[2]], epoch)?;
             }
         }
         self.tp_graph_capture_epoch += 1;
@@ -1058,8 +1052,13 @@ impl Gpus {
         }
         // D2H: synchronize producer stream, then download into row's prefix.
         // Preserve first error immediately — no partial-success claim.
-        for r in 0..n {
-            let dev = &self.devices[r];
+        for (r, ((dev, buffer), row)) in self
+            .devices
+            .iter()
+            .zip(buffers.iter())
+            .zip(self.host_ar_tmp.iter_mut())
+            .enumerate()
+        {
             dev.bind_thread()?;
             let stream = dev.active_stream.as_ref().ok_or_else(|| {
                 HipError::new(
@@ -1075,10 +1074,10 @@ impl Gpus {
             // (bytes) lie within the Vec's initialized length. The derived
             // `[u8]` slice is exactly `bytes` and is bounded to that prefix.
             let dst: &mut [u8] = unsafe {
-                let ptr = self.host_ar_tmp[r].as_mut_ptr() as *mut u8;
+                let ptr = row.as_mut_ptr() as *mut u8;
                 std::slice::from_raw_parts_mut(ptr, bytes)
             };
-            dev.hip.memcpy_dtoh(dst, buffers[r])?;
+            dev.hip.memcpy_dtoh(dst, buffer)?;
         }
         // Exact left-associated reduction into row 0: rank0+rank1+...
         Self::host_reduce_rows(&mut self.host_ar_tmp, count);
@@ -1088,10 +1087,9 @@ impl Gpus {
             let ptr = self.host_ar_tmp[0].as_ptr() as *const u8;
             std::slice::from_raw_parts(ptr, bytes)
         };
-        for r in 0..n {
-            let dev = &self.devices[r];
+        for (dev, buffer) in self.devices.iter().zip(buffers.iter()) {
             dev.bind_thread()?;
-            dev.hip.memcpy_htod(buffers[r], src)?;
+            dev.hip.memcpy_htod(buffer, src)?;
         }
         Ok(())
     }
@@ -1685,11 +1683,11 @@ impl Gpus {
         self.ensure_peer_ar_tmp(bytes)?;
 
         let mut gather_events = Vec::with_capacity(n - 1);
-        for rank in 1..n {
+        for (rank, partial) in partials.iter().enumerate().take(n).skip(1) {
             gather_events.push(self.boundary_copy(
                 rank,
                 0,
-                partials[rank],
+                partial,
                 &self.peer_ar_tmp[0][rank - 1],
                 bytes,
             )?);
@@ -1835,11 +1833,11 @@ impl Gpus {
         }
         // Gather N-1 peers into rank-0 lease scratch, never allocating.
         let mut gather_events = Vec::with_capacity(n - 1);
-        for rank in 1..n {
+        for (rank, buffer) in buffers.iter().enumerate().take(n).skip(1) {
             gather_events.push(self.boundary_copy(
                 rank,
                 0,
-                buffers[rank],
+                buffer,
                 &self.peer_lease_buffers[0][rank - 1],
                 bytes,
             )?);
@@ -2146,4 +2144,3 @@ mod tests {
         assert_eq!(resolve_device_ids(2, &opts).unwrap(), vec![0, 1]);
     }
 }
-
