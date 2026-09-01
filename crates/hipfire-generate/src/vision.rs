@@ -7,6 +7,7 @@
 //! Per-architecture generation bodies lifted verbatim from `crates/hipfire-daemon/src/main.rs`
 //! (wave 5 / D3). See `lib.rs` for layering rationale.
 
+use crate::ar::emit_active_route_error;
 use base64::Engine;
 use hipfire_arch_dots_ocr::dots_ocr;
 use hipfire_arch_qwen2::qwen2;
@@ -16,7 +17,9 @@ use hipfire_arch_qwen35_vl::image;
 use hipfire_arch_qwen35_vl::qwen35_vl;
 use hipfire_engine::emit::{emit_reasoning_token, emit_visible_token};
 use hipfire_engine::scheduler::block_attractor_unclosed_cpu;
-use hipfire_engine::terminal::{active_attempt_id, await_client_terminal_commit, check_abort, ClientTerminalDecision};
+use hipfire_engine::terminal::{
+    active_attempt_id, await_client_terminal_commit, check_abort, ClientTerminalDecision,
+};
 use hipfire_loader::LoadedModel;
 use hipfire_runtime::emit_text::{ThinkOutputRouter, ThinkRouteEvent};
 use hipfire_runtime::eos_filter::{EosFilter, FilterAction};
@@ -26,7 +29,6 @@ use std::any::Any;
 use std::io::Write;
 use std::path::Path;
 use std::time::Instant;
-use crate::ar::emit_active_route_error;
 fn emit_active_attempt_error(
     stdout: &mut impl std::io::Write,
     id: Option<&str>,
@@ -1552,7 +1554,9 @@ pub fn generate_vl(
         "attempt_id": active_attempt_id(),
     });
     match await_client_terminal_commit(stdout, id, &pending_done) {
-            ClientTerminalDecision::Commit => crate::ar::emit_active_route_done(stdout, id, &pending_done),
+        ClientTerminalDecision::Commit => {
+            crate::ar::emit_active_route_done(stdout, id, &pending_done)
+        }
         ClientTerminalDecision::Abort => {
             let ep = vl_reset_live(
                 gpu,
@@ -2086,7 +2090,9 @@ pub fn generate_vl_dots_ocr(
         "attempt_id": active_attempt_id(),
     });
     match await_client_terminal_commit(stdout, id, &pending_done) {
-            ClientTerminalDecision::Commit => crate::ar::emit_active_route_done(stdout, id, &pending_done),
+        ClientTerminalDecision::Commit => {
+            crate::ar::emit_active_route_done(stdout, id, &pending_done)
+        }
         ClientTerminalDecision::Abort => {
             let ep = dots_reset_state_live(
                 state,
@@ -2390,7 +2396,9 @@ pub fn run_dots_ocr_ngram_loop(
         "attempt_id": active_attempt_id(),
     });
     match await_client_terminal_commit(stdout, id, &pending_done) {
-            ClientTerminalDecision::Commit => crate::ar::emit_active_route_done(stdout, id, &pending_done),
+        ClientTerminalDecision::Commit => {
+            crate::ar::emit_active_route_done(stdout, id, &pending_done)
+        }
         ClientTerminalDecision::Abort => {
             let mut reset_target = |gpu: &mut rdna_compute::Gpu| {
                 hipfire_runtime::spec::SpecTarget::reset_recurrent(bundle, gpu)
@@ -2421,12 +2429,7 @@ pub fn generate_dots_ocr_text(
     top_p: f32,
     max_tokens: usize,
 ) {
-    crate::ar::emit_generation_start(
-        crate::ar::GenerationRoute::DotsOcr,
-        stdout,
-        id,
-        false,
-    );
+    crate::ar::emit_generation_start(crate::ar::GenerationRoute::DotsOcr, stdout, id, false);
     let _ = (temp, top_p); // greedy decode for now; sampling left for future work
     let t0 = Instant::now();
 
@@ -2688,7 +2691,9 @@ pub fn generate_dots_ocr_text(
         "attempt_id": active_attempt_id(),
     });
     match await_client_terminal_commit(stdout, id, &pending_done) {
-        ClientTerminalDecision::Commit => crate::ar::emit_active_route_done(stdout, id, &pending_done),
+        ClientTerminalDecision::Commit => {
+            crate::ar::emit_active_route_done(stdout, id, &pending_done)
+        }
         ClientTerminalDecision::Abort => {
             let ep = dots_reset_state_live(
                 state,
@@ -3043,12 +3048,7 @@ pub fn generate_lfm2_vl(
         seed,
         ..
     } = *params;
-    crate::ar::emit_generation_start(
-        crate::ar::GenerationRoute::LfmAr,
-        stdout,
-        id,
-        false,
-    );
+    crate::ar::emit_generation_start(crate::ar::GenerationRoute::LfmAr, stdout, id, false);
     if m.tokenizer.is_none() {
         emit_active_attempt_error(
             stdout,
@@ -3413,7 +3413,9 @@ pub fn generate_lfm2_vl(
         "attempt_id": active_attempt_id(),
     });
     match await_client_terminal_commit(stdout, id, &pending_done) {
-        ClientTerminalDecision::Commit => crate::ar::emit_active_route_done(stdout, id, &pending_done),
+        ClientTerminalDecision::Commit => {
+            crate::ar::emit_active_route_done(stdout, id, &pending_done)
+        }
         ClientTerminalDecision::Abort => {
             // Same release contract as the post-loop latch: the terminal pair
             // must be the recognized wire dialect or serve holds its

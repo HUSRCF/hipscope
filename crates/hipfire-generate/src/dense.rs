@@ -57,20 +57,9 @@ pub fn emit_active_attempt_error(
     retryable: bool,
     rolled_back: bool,
 ) {
-    crate::ar::emit_active_route_error(
-        stdout,
-        id,
-        message,
-        class,
-        retryable,
-        rolled_back,
-    );
+    crate::ar::emit_active_route_error(stdout, id, message, class, retryable, rolled_back);
 }
-fn emit_error_with_id(
-    stdout: &mut impl std::io::Write,
-    id: &str,
-    message: impl std::fmt::Display,
-) {
+fn emit_error_with_id(stdout: &mut impl std::io::Write, id: &str, message: impl std::fmt::Display) {
     let message = message.to_string();
     crate::ar::emit_active_route_error(stdout, Some(id), &message, "internal", false, false);
 }
@@ -6600,7 +6589,9 @@ pub fn generate_lfm2moe(
         "attempt_id": active_attempt_id(),
     });
     match await_client_terminal_commit(stdout, id, &pending_done) {
-        ClientTerminalDecision::Commit => crate::ar::emit_active_route_done(stdout, id, &pending_done),
+        ClientTerminalDecision::Commit => {
+            crate::ar::emit_active_route_done(stdout, id, &pending_done)
+        }
         ClientTerminalDecision::Abort => {
             let ep = production_fail_closed_rollback(m, gpu, None, None);
             emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
@@ -7050,7 +7041,9 @@ pub fn generate_minimax(
         "attempt_id": active_attempt_id(),
     });
     match await_client_terminal_commit(stdout, id, &pending_done) {
-        ClientTerminalDecision::Commit => crate::ar::emit_active_route_done(stdout, id, &pending_done),
+        ClientTerminalDecision::Commit => {
+            crate::ar::emit_active_route_done(stdout, id, &pending_done)
+        }
         ClientTerminalDecision::Abort => {}
     }
 }
@@ -7806,7 +7799,9 @@ pub fn generate_cohere2moe(
     });
     stage_terminal_tool_calls(&mut pending_done, finish_reason, &held_tool_calls);
     match await_client_terminal_commit(stdout, id, &pending_done) {
-        ClientTerminalDecision::Commit => crate::ar::emit_active_route_done(stdout, id, &pending_done),
+        ClientTerminalDecision::Commit => {
+            crate::ar::emit_active_route_done(stdout, id, &pending_done)
+        }
         ClientTerminalDecision::Abort => {}
     }
 }
@@ -7840,12 +7835,7 @@ pub fn generate_qwen2(
     _repeat_penalty: f32,
     _repeat_window: usize,
 ) {
-    crate::ar::emit_generation_start(
-        crate::ar::GenerationRoute::Qwen2Ar,
-        stdout,
-        id,
-        false,
-    );
+    crate::ar::emit_generation_start(crate::ar::GenerationRoute::Qwen2Ar, stdout, id, false);
     if m.tokenizer.is_none() {
         emit_active_attempt_error(
             stdout,
@@ -8052,7 +8042,9 @@ pub fn generate_qwen2(
         "attempt_id": active_attempt_id(),
     });
     match await_client_terminal_commit(stdout, id, &pending_done) {
-        ClientTerminalDecision::Commit => crate::ar::emit_active_route_done(stdout, id, &pending_done),
+        ClientTerminalDecision::Commit => {
+            crate::ar::emit_active_route_done(stdout, id, &pending_done)
+        }
         ClientTerminalDecision::Abort => {}
     }
 }
@@ -8289,12 +8281,7 @@ pub fn generate_maple(
     // Mirrors the gemm_hfq6g256_moe_grouped_wmma guard that previously
     // panicked on gfx1151.
     if !gpu.arch_caps.has_wmma_w32() && !gpu.arch_caps.has_wmma_w32_gfx12() {
-        crate::ar::emit_generation_start(
-            crate::ar::GenerationRoute::MapleAr,
-            stdout,
-            id,
-            false,
-        );
+        crate::ar::emit_generation_start(crate::ar::GenerationRoute::MapleAr, stdout, id, false);
         emit_active_attempt_error(
             stdout,
             Some(id),
@@ -8322,12 +8309,7 @@ pub fn generate_maple(
     // session that prompted this work, invented a `str_replace_editor` call).
     // Refuse instead, with a message that names the fix.
     if tools.is_some_and(|t| !t.is_empty()) && m.chat_template.is_none() {
-        crate::ar::emit_generation_start(
-            crate::ar::GenerationRoute::MapleAr,
-            stdout,
-            id,
-            false,
-        );
+        crate::ar::emit_generation_start(crate::ar::GenerationRoute::MapleAr, stdout, id, false);
         emit_active_attempt_error(
             stdout,
             Some(id),
@@ -8874,7 +8856,9 @@ pub fn generate_maple(
     hipfire_engine::emit::emit_tool_calls_event(stdout, id, &tool_calls);
     let _ = stdout.flush();
     match await_client_terminal_commit(stdout, id, &pending_done) {
-        ClientTerminalDecision::Commit => crate::ar::emit_active_route_done(stdout, id, &pending_done),
+        ClientTerminalDecision::Commit => {
+            crate::ar::emit_active_route_done(stdout, id, &pending_done)
+        }
         ClientTerminalDecision::Abort => {
             let ep = reset_maple_live(
                 state,

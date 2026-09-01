@@ -942,8 +942,7 @@ pub enum RouteTerminalEvent<'a> {
 }
 
 pub type RouteStartAdapter = fn(&mut dyn Write, &str, bool);
-pub type RouteTerminalAdapter =
-    for<'a> fn(&mut dyn Write, &str, u64, RouteTerminalEvent<'a>);
+pub type RouteTerminalAdapter = for<'a> fn(&mut dyn Write, &str, u64, RouteTerminalEvent<'a>);
 
 thread_local! {
     /// A route can fall through from speculative capacity checks into AR.
@@ -1103,7 +1102,9 @@ fn emit_route_terminal(
 ) {
     let mut buffer = Vec::new();
     match event {
-        RouteTerminalEvent::Done { pending: Some(pending) } => {
+        RouteTerminalEvent::Done {
+            pending: Some(pending),
+        } => {
             emit_staged_terminal_done(&mut buffer, pending);
         }
         RouteTerminalEvent::Done { pending: None } => {
@@ -1163,12 +1164,7 @@ macro_rules! define_route_start {
 
 macro_rules! define_route_terminal {
     ($name:ident, $route:expr) => {
-        fn $name(
-            output: &mut dyn Write,
-            id: &str,
-            attempt: u64,
-            event: RouteTerminalEvent<'_>,
-        ) {
+        fn $name(output: &mut dyn Write, id: &str, attempt: u64, event: RouteTerminalEvent<'_>) {
             emit_route_terminal(output, id, attempt, event, $route.name());
         }
     };
@@ -1414,12 +1410,7 @@ pub fn emit_generation_cancel(
     id: &str,
     completion_tokens: usize,
 ) {
-    production_route_adapter(route).emit_cancel(
-        output,
-        id,
-        active_attempt_id(),
-        completion_tokens,
-    );
+    production_route_adapter(route).emit_cancel(output, id, active_attempt_id(), completion_tokens);
 }
 
 /// Route an error through the selected production adapter when a specialised
@@ -1447,11 +1438,7 @@ pub fn emit_active_route_error(
 }
 
 /// Emit a done through the active production route adapter.
-pub fn emit_active_route_done(
-    output: &mut dyn Write,
-    id: &str,
-    pending: &serde_json::Value,
-) {
+pub fn emit_active_route_done(output: &mut dyn Write, id: &str, pending: &serde_json::Value) {
     if let Some(route) = active_generation_route() {
         emit_generation_done(route, output, id, pending);
     } else {
@@ -1460,11 +1447,7 @@ pub fn emit_active_route_done(
 }
 
 /// Emit a cancellation through the active production route adapter.
-pub fn emit_active_route_cancel(
-    output: &mut dyn Write,
-    id: &str,
-    completion_tokens: usize,
-) {
+pub fn emit_active_route_cancel(output: &mut dyn Write, id: &str, completion_tokens: usize) {
     if let Some(route) = active_generation_route() {
         emit_generation_cancel(route, output, id, completion_tokens);
     } else {
@@ -5204,7 +5187,9 @@ pub fn generate(
             }
         }
         match await_client_terminal_commit(stdout, id, &pending_done) {
-            ClientTerminalDecision::Commit => emit_generation_done(selected_route, stdout, id, &pending_done),
+            ClientTerminalDecision::Commit => {
+                emit_generation_done(selected_route, stdout, id, &pending_done)
+            }
             ClientTerminalDecision::Abort => {
                 // Bring-up AR path has no full production rollback attestation;
                 // suppress success done on cancel/disconnect (fail-closed).

@@ -59,14 +59,7 @@ fn emit_active_attempt_error(
     retryable: bool,
     rolled_back: bool,
 ) {
-    crate::ar::emit_active_route_error(
-        stdout,
-        id,
-        message,
-        class,
-        retryable,
-        rolled_back,
-    );
+    crate::ar::emit_active_route_error(stdout, id, message, class, retryable, rolled_back);
 }
 
 /// Expert-parallel streaming generate (task #26, ds4 first). Greedy AR via
@@ -707,7 +700,9 @@ pub fn ep_emit_done(
         "attempt_id": active_attempt_id(),
     });
     match await_client_terminal_commit(stdout, id, &pending_done) {
-        ClientTerminalDecision::Commit => crate::ar::emit_active_route_done(stdout, id, &pending_done),
+        ClientTerminalDecision::Commit => {
+            crate::ar::emit_active_route_done(stdout, id, &pending_done)
+        }
         ClientTerminalDecision::Abort => ep_emit_abort(stdout, id, m, generated),
     }
 }
@@ -4027,7 +4022,8 @@ pub fn generate_multi(
     request_seed: u64,
 ) {
     crate::ar::emit_generation_start(
-        crate::ar::active_generation_route().unwrap_or(crate::ar::GenerationRoute::PipelineParallel),
+        crate::ar::active_generation_route()
+            .unwrap_or(crate::ar::GenerationRoute::PipelineParallel),
         stdout,
         id,
         false,
