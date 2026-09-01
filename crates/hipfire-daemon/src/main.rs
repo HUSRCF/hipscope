@@ -1344,6 +1344,7 @@ fn main() {
                         _ => None, // "auto" → loader default
                     },
                     mtp_k: Some(mtp_k),
+                    lifecycle_fault: None,
                 };
 
                 // 0.1.7-alpha: DFlash tuning knobs forwarded from the CLI.

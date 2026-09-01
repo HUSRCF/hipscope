@@ -149,7 +149,7 @@ pub fn load_dflash_state(
     // True when adaptive KV is engaged for this load (tier-switching cache).
     // Must be false for retained-PM4 admission.
     adaptive_kv: bool,
-    /// Explicit lifecycle fault hook; normal loads pass `None`.
+    // Explicit lifecycle fault hook; normal loads pass `None`.
     lifecycle_fault: Option<LoadFaultStage>,
 ) -> Result<DflashState, String> {
     let requested_ctx = ctx_capacity;

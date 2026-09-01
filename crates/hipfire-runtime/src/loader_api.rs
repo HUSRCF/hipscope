@@ -178,6 +178,9 @@ pub struct SpecLoadCfg {
     /// mechanism selected (skip load + build), `None` = `auto` (load if a
     /// bundled trailer or `.mtp` sidecar exists).
     pub mtp: Option<bool>,
+    /// Resolved MTP draft width. The loader resolves generic and architecture-
+    /// specific precedence once, then generation consumes model metadata only.
+    pub mtp_k: Option<usize>,
     /// Optional deterministic fault stage for lifecycle evidence. Normal
     /// production loads leave this unset.
     #[doc(hidden)]

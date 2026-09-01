@@ -917,6 +917,9 @@ impl EvictionCtx {
         let widest_bpp = q8_bpp.max(asym3_k_bpp).max(asym4_k_bpp).max(asym2_k_bpp);
 
         let scores_buf = gpu.alloc_tensor(&[n_heads * max_seq], DType::F32)?;
+        let k_compact = gpu.zeros(&[(budget * widest_bpp + 3) / 4], DType::F32)?;
+        let v_compact = gpu.zeros(&[(budget * q8_bpp + 3) / 4], DType::F32)?;
+        let retain_dev = gpu.alloc_tensor(&[budget], DType::F32)?;
         Ok(Self {
             centers_dev,
             fa_layer_ids,

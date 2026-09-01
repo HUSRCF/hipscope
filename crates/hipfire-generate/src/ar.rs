@@ -956,6 +956,7 @@ fn emit_route_terminal(
     terminal: RouteTerminal,
     route_name: &'static str,
 ) {
+    let mut buffer = Vec::new();
     match terminal {
         RouteTerminal::Done => {
             let pending = serde_json::json!({
@@ -964,29 +965,32 @@ fn emit_route_terminal(
                 "attempt_id": active_attempt_id(),
                 "finish_reason": "stop",
             });
-            emit_staged_terminal_done(output, &pending);
+            emit_staged_terminal_done(&mut buffer, &pending);
         }
         RouteTerminal::Error => emit_active_attempt_error(
-            output,
+            &mut buffer,
             Some(id),
             &format!("{route_name} terminal error"),
             "internal",
             false,
             true,
         ),
-        RouteTerminal::Cancel => emit_qwen_ar_cancelled(output, id, 0),
+        RouteTerminal::Cancel => emit_qwen_ar_cancelled(&mut buffer, id, 0),
     }
+    let _ = output.write_all(&buffer);
 }
 
 macro_rules! define_route_start {
     ($name:ident, $arch:expr) => {
         fn $name(output: &mut dyn Write, id: &str) {
+            let mut buffer = Vec::new();
             emit_gen_start(
-                output,
+                &mut buffer,
                 id,
                 false,
                 gen_start_contract_version_for_arch($arch),
             );
+            let _ = output.write_all(&buffer);
         }
     };
 }
@@ -1005,7 +1009,9 @@ define_route_start!(qwen2_ar_route_start, 7);
 define_route_start!(qwen2_spec_route_start, 7);
 define_route_start!(deepseek4_ar_route_start, 9);
 fn deepseek4_ep_route_start(output: &mut dyn Write, id: &str) {
-    crate::qwen::emit_ds4_ep_gen_start(output, id, ThinkMode::NonThink);
+    let mut buffer = Vec::new();
+    crate::qwen::emit_ds4_ep_gen_start(&mut buffer, id, ThinkMode::NonThink);
+    let _ = output.write_all(&buffer);
 }
 define_route_start!(deepseek4_spec_route_start, 9);
 define_route_start!(cohere_ar_route_start, 12);

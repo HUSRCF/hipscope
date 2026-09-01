@@ -1557,14 +1557,14 @@ impl LoadedModel {
                         (arch as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
                     }) {
                         if let Some(batch) = bundle.qwen35_decode_batch.as_mut() {
-                            batch.reset(gpu)?;
+                            batch.reset(gpu).map_err(|error| error.to_string())?;
                         }
                     }
                     if let Some(bundle) = state.as_deref_mut().and_then(|arch| {
                         (arch as &mut dyn Any).downcast_mut::<hipfire_arch_lfm2moe::Lfm2MoeBundle>()
                     }) {
                         if let Some(batch) = bundle.lfm2_decode_batch.as_mut() {
-                            batch.reset(gpu)?;
+                            batch.reset(gpu).map_err(|error| error.to_string())?;
                         }
                     }
                     Ok(())
