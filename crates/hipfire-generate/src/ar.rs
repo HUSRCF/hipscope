@@ -1426,14 +1426,16 @@ pub fn emit_active_route_error(
     if let Some(route) = active_generation_route() {
         emit_generation_error(route, output, id, message, class, retryable, rolled_back);
     } else {
+        let mut buffer = Vec::new();
         hipfire_engine::emit::emit_active_attempt_error(
-            output,
+            &mut buffer,
             id,
             message,
             class,
             retryable,
             rolled_back,
         );
+        let _ = output.write_all(&buffer);
     }
 }
 
@@ -1442,7 +1444,9 @@ pub fn emit_active_route_done(output: &mut dyn Write, id: &str, pending: &serde_
     if let Some(route) = active_generation_route() {
         emit_generation_done(route, output, id, pending);
     } else {
-        emit_staged_terminal_done(output, pending);
+        let mut buffer = Vec::new();
+        emit_staged_terminal_done(&mut buffer, pending);
+        let _ = output.write_all(&buffer);
     }
 }
 
@@ -1451,7 +1455,9 @@ pub fn emit_active_route_cancel(output: &mut dyn Write, id: &str, completion_tok
     if let Some(route) = active_generation_route() {
         emit_generation_cancel(route, output, id, completion_tokens);
     } else {
-        emit_qwen_ar_cancelled(output, id, completion_tokens);
+        let mut buffer = Vec::new();
+        emit_qwen_ar_cancelled(&mut buffer, id, completion_tokens);
+        let _ = output.write_all(&buffer);
     }
 }
 
