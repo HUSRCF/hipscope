@@ -147,18 +147,18 @@
       "evidence_campaign",
       "final_closure"
     ],
-    "branch_evidence_rule": "Branch reports and measurements remain historical provenance. A rerun_required row needs a durable current-tree report before completion; hardware_blocked rows require the distinct physical topology named by their contract.",
-    "one_row_rule": "A PR may advance completion for at most one atomic tracker row. Dependency or evidence metadata may be synchronized without advancing another row.",
+    "branch_evidence_rule": "Branch reports and measurements remain historical provenance. A rerun_required row needs a durable current-tree report before completion; hardware_blocked rows require the distinct physical topology named by their contract. Repository report paths must exist and be approved report-like artifacts under docs/, tests/, or benchmarks/ (not Cargo.toml, crates/, or other source/config); GitHub commit/blob URLs must contain an immutable 40-hex commit and valid structure; bogus hashes and local-only .agent-progress paths are rejected.",
+    "one_row_rule": "Enforceable as one-row-per-obligation: each obligation's advancement.completion_rows may contain at most one ID; a PR may advance at most one obligation without a reliable base-diff of the implementation commit. Absent such a base-diff mechanism, group, campaign, and final-closure completion are gated by child obligation status and seam availability, not by PR diff. Dependency or evidence metadata may be synchronized without advancing another row.",
     "grouping_rule": "Each domain obligation ID appears exactly once across grouped change sets, evidence campaigns, and final closure. legacy_pr_ids are provenance only.",
-    "completion_promotion_rule": "Only current durable evidence with nonempty non-host-local references can promote a group, campaign, or final closure. Historical, semantics-only, emulated, failed, hardware-blocked, and host-local evidence never promotes.",
-    "parallel_lane_rule": "G3 and G4 may develop in parallel after authority; the interface-safe part of G5 may develop after authority while merge waits on its manifest seam. G6-G11 fan out after their consumed G5 seams. G13-G15 are implementation-only; physical campaigns follow them.",
+    "completion_promotion_rule": "Only current durable evidence with nonempty non-host-local references can promote a group, campaign, or final closure. Durable references must exist on disk or be immutable GitHub commit/blob URLs with 40-hex objects; nonexistent paths, Cargo.toml-as-report, malformed hash URLs, and host-local/.agent-progress references never promote. Historical, semantics-only, emulated, failed, hardware_blocked, and host-local evidence never promotes.",
+    "parallel_lane_rule": "Canonical landing chain is G1(hipfire-pr-673) -> G3(hipfire-pr-675) -> G5(hipfire-pr-677); G2(hipfire-pr-674) is a sibling after G1 and a semantic prerequisite before complete production multi-device enablement, not a prerequisite for G3. G3 and G4 may develop in parallel after authority; the interface-safe part of G5 may develop after authority (after G1 topology) while merge waits on its manifest seam S-MANIFEST. G6-G11 fan out after their consumed G5 seams. G13-G15 are implementation-only; physical campaigns follow them.",
     "can_develop_after": {
       "G0": [],
       "G1": [
         "G0"
       ],
       "G2": [
-        "G0"
+        "G1"
       ],
       "G3": [
         "G0"
@@ -221,13 +221,11 @@
       },
       "provenance": {
         "branch_commits": [
-          "a1ad8a46",
-          "7115135e"
+          "4429d7df3dff048522e55c2c0d6081b40bd45976"
         ],
         "sources": [
-          ".agent-progress/device-mesh-refactor-tracker.md",
-          "docs/INDEX.md",
           "docs/VALIDATION.md",
+          "docs/INDEX.md",
           "docs/admissions.yml"
         ],
         "upstream_counterpart": "No upstream-native port tracker exists at 616336932; current INDEX, VALIDATION, and admissions owners remain authoritative for their separate concerns."
@@ -349,11 +347,11 @@
       },
       "provenance": {
         "branch_commits": [
-          "4e8bd0a2"
+          "46a469d08c258f01292e287c7fbfc3003e3e8209"
         ],
         "sources": [
           "docs/architecture-ids.md",
-          ".agent-progress/device-mesh-refactor-tracker.md",
+          "docs/VALIDATION.md",
           "crates/hipfire-loader/src/lib.rs"
         ],
         "upstream_counterpart": "Upstream has carrier/source namespaces and generic refusal paths but no single reviewed source-aware parallel policy table."
@@ -416,13 +414,12 @@
       },
       "provenance": {
         "branch_commits": [
-          "3bd90493",
-          "8f7d91a7"
+          "46a469d08c258f01292e287c7fbfc3003e3e8209"
         ],
         "sources": [
           "crates/hipfire-loader/src/parallel_capability.rs",
           "crates/hipfire-loader/src/lib.rs",
-          ".agent-progress/device-mesh-refactor-tracker.md"
+          "docs/VALIDATION.md"
         ],
         "upstream_counterpart": "Upstream has per-carrier refusal branches but no central source-aware effective-mesh admission contract."
       },
@@ -471,7 +468,7 @@
       "depends_on": [
         "CAP-001"
       ],
-      "scope": "Advance COMP-001 only by proving TP×EP and every unplanned composition fail closed at the admission boundary before remap, mesh binding, or allocation.",
+      "scope": "Advance COMP-001 only by proving TP\u00d7EP and every unplanned composition fail closed at the admission boundary before remap, mesh binding, or allocation.",
       "non_goals": "No new composition support and no second validation function.",
       "acceptance": "Targeted loader boundary route with zero-allocation assertions for each forbidden composition and precedence case.",
       "stop_condition": "Stop if the proof requires duplicating the policy table or checking composition downstream.",
@@ -484,18 +481,18 @@
       },
       "provenance": {
         "branch_commits": [
-          "754e68bc"
+          "46a469d08c258f01292e287c7fbfc3003e3e8209"
         ],
         "sources": [
-          ".agent-progress/device-mesh-refactor-tracker.md",
+          "docs/VALIDATION.md",
           "crates/hipfire-loader/src/lib.rs"
         ],
-        "upstream_counterpart": "Upstream has no current-tree proof that TP×EP refusal is centralized before remap and allocation."
+        "upstream_counterpart": "Upstream has no current-tree proof that TP\u00d7EP refusal is centralized before remap and allocation."
       },
       "evidence": {
         "disposition": "rerun_required",
         "branch_record": "historical",
-        "route": "Targeted current loader admission tests with zero-allocation assertions for TP×EP and every unsupported composition.",
+        "route": "Targeted current loader admission tests with zero-allocation assertions for TP\u00d7EP and every unsupported composition.",
         "fixture_refs": [],
         "report_refs": [],
         "classification": "rerun_required"
@@ -518,7 +515,7 @@
       "legacy_evidence": {
         "disposition": "rerun_required",
         "branch_record": "historical",
-        "route": "Targeted current loader admission tests with zero-allocation assertions for TP×EP and every unsupported composition.",
+        "route": "Targeted current loader admission tests with zero-allocation assertions for TP\u00d7EP and every unsupported composition.",
         "fixture_refs": [],
         "report_refs": []
       },
@@ -648,12 +645,12 @@
       },
       "provenance": {
         "branch_commits": [
-          "33ca70d"
+          "04de36cf8249797cb34d2aeb2b303e669342fd8c"
         ],
         "sources": [
           "crates/hipfire-runtime/src/weight_store.rs",
           "crates/hipfire-arch-llama/src/",
-          ".agent-progress/device-mesh-status.md"
+          "docs/VALIDATION.md"
         ],
         "upstream_counterpart": "Upstream has plain LLaMA loading but no verified transactional WeightStore fulfillment under the current ArchModel owner."
       },
@@ -769,13 +766,12 @@
         "reason": "Branch evidence is forensic and no current-tree completion evidence has been accepted."
       },
       "provenance": {
-        "branch_commits": [
-          "68a3c18c"
-        ],
+        "branch_commits": [],
         "sources": [
           "crates/hipfire-engine/src/",
           "crates/hipfire-generate/src/",
-          "crates/hipfire-daemon/src/"
+          "crates/hipfire-daemon/src/",
+          "unavailable: branch-only forensic provenance not promotable - see https://github.com/warpfront/hipfire/issues/666"
         ],
         "upstream_counterpart": "Upstream contains current reset/lifecycle seams, but branch reset completion evidence predates the merged loader/generation topology and must be rerun."
       },
@@ -899,13 +895,12 @@
         "reason": "Branch evidence is forensic and no current-tree completion evidence has been accepted."
       },
       "provenance": {
-        "branch_commits": [
-          "62050f7c"
-        ],
+        "branch_commits": [],
         "sources": [
           "crates/hipfire-loader/src/",
           "crates/hipfire-runtime/src/",
-          "crates/hipfire-arch-qwen35/src/"
+          "crates/hipfire-arch-qwen35/src/",
+          "unavailable: branch-only forensic provenance not promotable - see https://github.com/warpfront/hipfire/issues/666"
         ],
         "upstream_counterpart": "Upstream has eviction/cask/physical-cap fields, but branch owner-ledger and lifecycle evidence are not proven identical at the pinned ref."
       },
@@ -965,13 +960,12 @@
         "reason": "Branch evidence is forensic and no current-tree completion evidence has been accepted."
       },
       "provenance": {
-        "branch_commits": [
-          "688bb42e"
-        ],
+        "branch_commits": [],
         "sources": [
           "crates/hipfire-loader/src/",
           "crates/hipfire-runtime/src/",
-          "crates/hipfire-arch-llama/src/"
+          "crates/hipfire-arch-llama/src/",
+          "unavailable: branch-only forensic provenance not promotable - see https://github.com/warpfront/hipfire/issues/666"
         ],
         "upstream_counterpart": "Upstream has generic DFlash and loader fault seams, but branch transactional evidence is host-local/pre-merge and requires a current rerun."
       },
@@ -1216,17 +1210,12 @@
         "reason": "Branch evidence is forensic and no current-tree completion evidence has been accepted."
       },
       "provenance": {
-        "branch_commits": [
-          "08765f74",
-          "c49a98b0",
-          "da1d32ce",
-          "0ef84ddb",
-          "0cdc84ed"
-        ],
+        "branch_commits": [],
         "sources": [
           "crates/hipfire-arch-gemma4/src/lowered.rs",
           "crates/hipfire-dispatch/src/pipeline/steps.rs",
-          ".agent-progress/step-005-production-inventory.md"
+          "docs/VALIDATION.md",
+          "unavailable: branch-only forensic provenance not promotable - see https://github.com/warpfront/hipfire/issues/666"
         ],
         "upstream_counterpart": "Upstream Gemma4 remains on live SuperOp/ForwardBindings and lacks the branch typed parity oracle."
       },
@@ -1380,7 +1369,7 @@
         "sources": [
           "crates/hipfire-arch-minimax/src/forward.rs",
           "crates/hipfire-dispatch/src/pipeline/superop.rs",
-          ".agent-progress/step-005-production-inventory.md"
+          "docs/VALIDATION.md"
         ],
         "upstream_counterpart": "Upstream MiniMax production route still contains ForwardBindings and SuperOp ownership."
       },
@@ -1429,14 +1418,12 @@
         "reason": "Branch evidence is forensic and no current-tree completion evidence has been accepted."
       },
       "provenance": {
-        "branch_commits": [
-          "1378fd18",
-          "9dcb1862a"
-        ],
+        "branch_commits": [],
         "sources": [
           "crates/hipfire-arch-qwen35/src/",
           "crates/hipfire-dispatch/src/",
-          ".agent-progress/step-004-inventory.md"
+          "docs/VALIDATION.md",
+          "unavailable: branch-only forensic provenance not promotable - see https://github.com/warpfront/hipfire/issues/666"
         ],
         "upstream_counterpart": "Upstream Qwen35 has recurrent/state code but no verified branch manifest-owned placement contract at 616336932."
       },
@@ -1498,14 +1485,12 @@
         "reason": "Branch evidence is forensic and no current-tree completion evidence has been accepted."
       },
       "provenance": {
-        "branch_commits": [
-          "1378fd18",
-          "9dcb1862a"
-        ],
+        "branch_commits": [],
         "sources": [
           "crates/hipfire-arch-qwen35/src/",
           "crates/hipfire-dispatch/src/",
-          ".agent-progress/step-004-inventory.md"
+          "docs/VALIDATION.md",
+          "unavailable: branch-only forensic provenance not promotable - see https://github.com/warpfront/hipfire/issues/666"
         ],
         "upstream_counterpart": "Upstream Qwen35 has recurrent/state code but no verified branch manifest-owned placement contract at 616336932."
       },
@@ -1567,14 +1552,12 @@
         "reason": "Branch evidence is forensic and no current-tree completion evidence has been accepted."
       },
       "provenance": {
-        "branch_commits": [
-          "1378fd18",
-          "9dcb1862a"
-        ],
+        "branch_commits": [],
         "sources": [
           "crates/hipfire-arch-qwen35/src/",
           "crates/hipfire-dispatch/src/pipeline/superop.rs",
-          ".agent-progress/step-005-production-inventory.md"
+          "docs/VALIDATION.md",
+          "unavailable: branch-only forensic provenance not promotable - see https://github.com/warpfront/hipfire/issues/666"
         ],
         "upstream_counterpart": "Upstream Qwen35 retains production SuperOp routes and has no verified branch Step-only Single/existing-EP cutover."
       },
@@ -1634,14 +1617,12 @@
         "reason": "Branch evidence is forensic and no current-tree completion evidence has been accepted."
       },
       "provenance": {
-        "branch_commits": [
-          "1378fd18",
-          "9dcb1862a"
-        ],
+        "branch_commits": [],
         "sources": [
           "crates/hipfire-arch-qwen35/src/",
           "crates/hipfire-dispatch/src/pipeline/superop.rs",
-          ".agent-progress/step-005-production-inventory.md"
+          "docs/VALIDATION.md",
+          "unavailable: branch-only forensic provenance not promotable - see https://github.com/warpfront/hipfire/issues/666"
         ],
         "upstream_counterpart": "Upstream Qwen35 retains production SuperOp routes and has no verified branch Step-only Single/existing-EP cutover."
       },
@@ -1709,7 +1690,7 @@
         "sources": [
           "crates/hipfire-arch-deepseek4/src/forward.rs",
           "crates/hipfire-arch-deepseek4/src/moe_lower.rs",
-          ".agent-progress/device-mesh-refactor-tracker.md"
+          "docs/VALIDATION.md"
         ],
         "upstream_counterpart": "Upstream DeepSeek4 has MLA/EP routes but no verified Step-only Single/EP cutover or family-specific ep_deepseek4 oracle."
       },
@@ -1849,7 +1830,7 @@
         "sources": [
           "crates/hipfire-arch-muse-glimmer/src/forward.rs",
           "crates/hipfire-arch-muse-glimmer/src/forward_batch.rs",
-          ".agent-progress/step-005-production-inventory.md"
+          "docs/VALIDATION.md"
         ],
         "upstream_counterpart": "Upstream contains bespoke Muse/Glimmer decoding but no Step representation or executable operation map."
       },
@@ -1917,7 +1898,7 @@
         "sources": [
           "crates/hipfire-arch-deepseek4/src/forward.rs",
           "crates/hipfire-arch-deepseek4/src/moe_lower.rs",
-          ".agent-progress/device-mesh-refactor-tracker.md"
+          "docs/VALIDATION.md"
         ],
         "upstream_counterpart": "Upstream DeepSeek4 has MLA/EP routes but no verified Step-only Single/EP cutover or family-specific ep_deepseek4 oracle."
       },
@@ -2262,13 +2243,12 @@
         "reason": "Branch evidence is forensic and no current-tree completion evidence has been accepted."
       },
       "provenance": {
-        "branch_commits": [
-          "6d86816f"
-        ],
+        "branch_commits": [],
         "sources": [
           "crates/hipfire-generate/src/",
           "crates/hipfire-loader/src/",
-          "crates/hipfire-runtime/src/"
+          "crates/hipfire-runtime/src/",
+          "unavailable: branch-only forensic provenance not promotable - see https://github.com/warpfront/hipfire/issues/666"
         ],
         "upstream_counterpart": "No current upstream equivalent is verified; the branch intent is retained as a bounded design, not an implementation pass."
       },
@@ -2411,7 +2391,7 @@
         "sources": [
           "crates/hipfire-arch-llama/src/",
           "crates/hipfire-arch-qwen2/src/",
-          ".agent-progress/device-mesh-refactor-tracker.md"
+          "docs/VALIDATION.md"
         ],
         "upstream_counterpart": "Upstream has dense PpModel/DenseDispatch pieces but no current proof of the decomposed standard-attention axis contract."
       },
@@ -2622,7 +2602,7 @@
         "branch_commits": [],
         "sources": [
           "crates/hipfire-arch-deepseek4/src/",
-          ".agent-progress/device-mesh-refactor-tracker.md"
+          "docs/VALIDATION.md"
         ],
         "upstream_counterpart": "Upstream has DeepSeek4 family routes but no decomposed current-tree PP/TP axis contract."
       },
@@ -2689,7 +2669,7 @@
         "branch_commits": [],
         "sources": [
           "crates/hipfire-arch-minimax/src/",
-          ".agent-progress/step-005-production-inventory.md"
+          "docs/VALIDATION.md"
         ],
         "upstream_counterpart": "Upstream has MiniMax Single/EP pieces but no admitted PP/TP axis contract or eight-cycle current probe."
       },
@@ -2824,7 +2804,7 @@
         "branch_commits": [],
         "sources": [
           "crates/hipfire-arch-cohere2moe/src/",
-          ".agent-progress/device-mesh-refactor-tracker.md"
+          "docs/VALIDATION.md"
         ],
         "upstream_counterpart": "Upstream Cohere has family MoE routes but no admitted parallel axis contract through sealed expert/store ownership."
       },
@@ -2956,7 +2936,7 @@
         "sources": [
           "crates/hipfire-arch-dots-ocr/src/",
           "crates/hipfire-generate/src/vision.rs",
-          ".agent-progress/device-mesh-refactor-tracker.md"
+          "docs/VALIDATION.md"
         ],
         "upstream_counterpart": "Upstream has a dots.ocr route but no axis contract or canonical numeric closure."
       },
@@ -3088,7 +3068,7 @@
         "sources": [
           "crates/hipfire-arch-dots-ocr/src/",
           "crates/hipfire-generate/src/vision.rs",
-          ".agent-progress/device-mesh-refactor-tracker.md"
+          "docs/VALIDATION.md"
         ],
         "upstream_counterpart": "Upstream has a dots.ocr route but no axis contract or canonical numeric closure."
       },
@@ -3151,7 +3131,6 @@
       "provenance": {
         "branch_commits": [],
         "sources": [
-          ".agent-progress/device-mesh-refactor-tracker.md",
           "docs/VALIDATION.md"
         ],
         "upstream_counterpart": "No accepted current physical DeepSeek4 RCCL EP report exists at upstream 616336932."
@@ -3215,7 +3194,6 @@
       "provenance": {
         "branch_commits": [],
         "sources": [
-          ".agent-progress/device-mesh-refactor-tracker.md",
           "docs/VALIDATION.md"
         ],
         "upstream_counterpart": "No accepted current physical MiniMax RCCL EP report exists at upstream 616336932."
@@ -3280,7 +3258,7 @@
         "branch_commits": [],
         "sources": [
           "crates/hipfire-arch-qwen35/src/",
-          ".agent-progress/device-mesh-refactor-tracker.md"
+          "docs/VALIDATION.md"
         ],
         "upstream_counterpart": "No accepted current physical Qwen35 MoE EP report exists at upstream 616336932."
       },
@@ -3345,7 +3323,7 @@
         "sources": [
           "crates/hipfire-arch-lfm2moe/src/",
           "crates/hipfire-arch-cohere2moe/src/",
-          ".agent-progress/device-mesh-refactor-tracker.md"
+          "docs/VALIDATION.md"
         ],
         "upstream_counterpart": "No accepted current physical LFM2/Cohere axis report exists at upstream 616336932."
       },
@@ -3411,7 +3389,7 @@
         "sources": [
           "crates/hipfire-arch-lfm2moe/src/",
           "crates/hipfire-arch-cohere2moe/src/",
-          ".agent-progress/device-mesh-refactor-tracker.md"
+          "docs/VALIDATION.md"
         ],
         "upstream_counterpart": "No accepted current physical LFM2/Cohere axis report exists at upstream 616336932."
       },
@@ -3473,12 +3451,10 @@
         "reason": "Branch evidence is forensic and no current-tree completion evidence has been accepted."
       },
       "provenance": {
-        "branch_commits": [
-          "4df03537"
-        ],
+        "branch_commits": [],
         "sources": [
-          ".agent-progress/device-mesh-refactor-tracker.md",
-          "docs/VALIDATION.md"
+          "docs/VALIDATION.md",
+          "unavailable: branch-only forensic provenance not promotable - see https://github.com/warpfront/hipfire/issues/666"
         ],
         "upstream_counterpart": "The prior two-gfx1201 report is preliminary/failing and is not current physical PP acceptance."
       },
@@ -3539,12 +3515,10 @@
         "reason": "Branch evidence is forensic and no current-tree completion evidence has been accepted."
       },
       "provenance": {
-        "branch_commits": [
-          "4df03537"
-        ],
+        "branch_commits": [],
         "sources": [
-          ".agent-progress/device-mesh-refactor-tracker.md",
-          "docs/VALIDATION.md"
+          "docs/VALIDATION.md",
+          "unavailable: branch-only forensic provenance not promotable - see https://github.com/warpfront/hipfire/issues/666"
         ],
         "upstream_counterpart": "The prior Qwen35 token-58 divergence lacks canonical prompt identity and is not physical PP acceptance."
       },
@@ -3608,7 +3582,7 @@
         "branch_commits": [],
         "sources": [
           "crates/hipfire-arch-deepseek4/src/",
-          ".agent-progress/device-mesh-refactor-tracker.md"
+          "docs/VALIDATION.md"
         ],
         "upstream_counterpart": "No accepted current DeepSeek4 physical PP/TP report exists at upstream 616336932."
       },
@@ -3672,7 +3646,7 @@
         "branch_commits": [],
         "sources": [
           "crates/hipfire-arch-minimax/src/",
-          ".agent-progress/device-mesh-refactor-tracker.md"
+          "docs/VALIDATION.md"
         ],
         "upstream_counterpart": "No accepted current MiniMax physical PP/TP report exists at upstream 616336932."
       },
@@ -3737,7 +3711,7 @@
         "sources": [
           "crates/hipfire-arch-lfm2moe/src/",
           "crates/hipfire-arch-cohere2moe/src/",
-          ".agent-progress/device-mesh-refactor-tracker.md"
+          "docs/VALIDATION.md"
         ],
         "upstream_counterpart": "No accepted current physical LFM2/Cohere axis report exists at upstream 616336932."
       },
@@ -3803,7 +3777,7 @@
         "sources": [
           "crates/hipfire-arch-lfm2moe/src/",
           "crates/hipfire-arch-cohere2moe/src/",
-          ".agent-progress/device-mesh-refactor-tracker.md"
+          "docs/VALIDATION.md"
         ],
         "upstream_counterpart": "No accepted current physical LFM2/Cohere axis report exists at upstream 616336932."
       },
@@ -3872,7 +3846,6 @@
       "provenance": {
         "branch_commits": [],
         "sources": [
-          ".agent-progress/device-mesh-refactor-tracker.md",
           "docs/VALIDATION.md"
         ],
         "upstream_counterpart": "No aggregate physical TP teardown authority exists at upstream 616336932."
@@ -3941,7 +3914,6 @@
       "provenance": {
         "branch_commits": [],
         "sources": [
-          ".agent-progress/device-mesh-refactor-tracker.md",
           "docs/VALIDATION.md"
         ],
         "upstream_counterpart": "No accepted current standard physical TP report exists at upstream 616336932."
@@ -4007,7 +3979,7 @@
         "branch_commits": [],
         "sources": [
           "docs/upstream-merge-journal.md",
-          ".agent-progress/device-mesh-refactor-tracker.md"
+          "docs/VALIDATION.md"
         ],
         "upstream_counterpart": "Upstream #662 dense TP is a counterpart, not broad Qwen35 physical TP/MoE evidence."
       },
@@ -4075,7 +4047,7 @@
         "branch_commits": [],
         "sources": [
           "crates/hipfire-arch-deepseek4/src/",
-          ".agent-progress/device-mesh-refactor-tracker.md"
+          "docs/VALIDATION.md"
         ],
         "upstream_counterpart": "No accepted current DeepSeek4 physical PP/TP report exists at upstream 616336932."
       },
@@ -4139,7 +4111,7 @@
         "branch_commits": [],
         "sources": [
           "crates/hipfire-arch-minimax/src/",
-          ".agent-progress/device-mesh-refactor-tracker.md"
+          "docs/VALIDATION.md"
         ],
         "upstream_counterpart": "No accepted current MiniMax physical PP/TP report exists at upstream 616336932."
       },
@@ -4204,7 +4176,7 @@
         "sources": [
           "crates/hipfire-arch-lfm2moe/src/",
           "crates/hipfire-arch-cohere2moe/src/",
-          ".agent-progress/device-mesh-refactor-tracker.md"
+          "docs/VALIDATION.md"
         ],
         "upstream_counterpart": "No accepted current physical LFM2/Cohere axis report exists at upstream 616336932."
       },
@@ -4270,7 +4242,7 @@
         "sources": [
           "crates/hipfire-arch-lfm2moe/src/",
           "crates/hipfire-arch-cohere2moe/src/",
-          ".agent-progress/device-mesh-refactor-tracker.md"
+          "docs/VALIDATION.md"
         ],
         "upstream_counterpart": "No accepted current physical LFM2/Cohere axis report exists at upstream 616336932."
       },
@@ -4606,7 +4578,6 @@
       "provenance": {
         "branch_commits": [],
         "sources": [
-          ".agent-progress/device-mesh-refactor-tracker.md",
           "docs/VALIDATION.md",
           "docs/admissions.yml"
         ],
@@ -4693,14 +4664,12 @@
         "reason": "Branch evidence is forensic and no current-tree completion evidence has been accepted."
       },
       "provenance": {
-        "branch_commits": [
-          "7115135e"
-        ],
+        "branch_commits": [],
         "sources": [
           "docs/INDEX.md",
           "docs/VALIDATION.md",
           "docs/admissions.yml",
-          ".agent-progress/device-mesh-refactor-tracker.md"
+          "unavailable: branch-only forensic provenance not promotable - see https://github.com/warpfront/hipfire/issues/666"
         ],
         "upstream_counterpart": "Upstream has separate current documentation authorities but no synchronized replacement-series closure or PR #527 supersession pointer."
       },
@@ -4790,7 +4759,7 @@
       "producer": "G1",
       "consumers": [
         "G2",
-        "G5"
+        "G3"
       ],
       "status": "proposed",
       "contract": "One hardware owner exposes named DeviceMesh topology.",
@@ -4802,7 +4771,6 @@
       "kind": "admission",
       "producer": "G2",
       "consumers": [
-        "G3",
         "G13",
         "G14",
         "G15"
@@ -4817,6 +4785,7 @@
       "kind": "manifest",
       "producer": "G3",
       "consumers": [
+        "G5",
         "G8",
         "G13"
       ],
@@ -5228,8 +5197,8 @@
       "evidence_disposition": "rerun_required",
       "completion_evidence": [],
       "delivery_kind": "change_set",
-      "upstream_base_commit": null,
-      "head_commit": null,
+      "upstream_base_commit": "6163369329d3b076376286a00c13cadbae069ecc",
+      "head_commit": "573451eaf4e5f51df2ad65abb0ca94cbf14b6fb9",
       "merge_commit": null,
       "can_develop_after": [
         "G0"
@@ -5298,12 +5267,12 @@
         "name": "admission",
         "integration_mode": "serialized-shared-file-owner",
         "can_develop_after": [
-          "G0"
+          "G1"
         ],
         "merge_waits_on": []
       },
       "shared_file_integration_owner": "hipfire-loader admission owner.",
-      "acceptance": "All unsupported cells and TP×EP refusal occur before allocation.",
+      "acceptance": "All unsupported cells and TP\u00d7EP refusal occur before allocation.",
       "stop_condition": "Stop on arch_id-only classification, bypass, or duplicate policy table.",
       "status": "blocked",
       "implementation_class": "port",
@@ -5311,11 +5280,11 @@
       "evidence_disposition": "rerun_required",
       "completion_evidence": [],
       "delivery_kind": "change_set",
-      "upstream_base_commit": null,
-      "head_commit": null,
+      "upstream_base_commit": "6163369329d3b076376286a00c13cadbae069ecc",
+      "head_commit": "f092b92a2db5a8bf6068877d3add7165f9ea89f8",
       "merge_commit": null,
       "can_develop_after": [
-        "G0"
+        "G1"
       ]
     },
     {
@@ -5329,11 +5298,11 @@
         "COR-006"
       ],
       "depends_on": [
-        "G2"
+        "G1"
       ],
       "merge_waits_on": [],
       "consumed_seam_gates": [
-        "S-ADMISSION"
+        "S-TOPOLOGY"
       ],
       "produced_seam_gates": [
         "S-MANIFEST",
@@ -5395,8 +5364,8 @@
       "evidence_disposition": "rerun_required",
       "completion_evidence": [],
       "delivery_kind": "change_set",
-      "upstream_base_commit": null,
-      "head_commit": null,
+      "upstream_base_commit": "6163369329d3b076376286a00c13cadbae069ecc",
+      "head_commit": "2458ef5df258a4ed190ec3b5462ce4caa53df0d6",
       "merge_commit": null,
       "can_develop_after": [
         "G0"
@@ -5484,8 +5453,8 @@
       "evidence_disposition": "rerun_required",
       "completion_evidence": [],
       "delivery_kind": "change_set",
-      "upstream_base_commit": null,
-      "head_commit": null,
+      "upstream_base_commit": "6163369329d3b076376286a00c13cadbae069ecc",
+      "head_commit": "00ad6a4d382f97b6271101f3cdf456555d5d7c4a",
       "merge_commit": null,
       "can_develop_after": [
         "G0"
@@ -5502,13 +5471,13 @@
         "STEP-002R"
       ],
       "depends_on": [
-        "G1"
+        "G3"
       ],
       "merge_waits_on": [
         "G3"
       ],
       "consumed_seam_gates": [
-        "S-TOPOLOGY"
+        "S-MANIFEST"
       ],
       "produced_seam_gates": [
         "S-MOE"
@@ -5571,8 +5540,8 @@
       "evidence_disposition": "rerun_required",
       "completion_evidence": [],
       "delivery_kind": "change_set",
-      "upstream_base_commit": null,
-      "head_commit": null,
+      "upstream_base_commit": "6163369329d3b076376286a00c13cadbae069ecc",
+      "head_commit": "26fe251394499721679ae6a05a221d8f4997e3ab",
       "merge_commit": null,
       "can_develop_after": [
         "G0"
@@ -6247,8 +6216,7 @@
           "classification": "failed",
           "assertion": "Prior illegal access, token divergence, missing identity, and incomplete probes remain hard failures.",
           "references": [
-            "docs/VALIDATION.md",
-            ".agent-progress/device-mesh-refactor-tracker.md"
+            "docs/VALIDATION.md"
           ],
           "qualifies_for_completion": false
         }
@@ -6373,8 +6341,7 @@
           "classification": "failed",
           "assertion": "Prior illegal access, token divergence, missing identity, and incomplete probes remain hard failures.",
           "references": [
-            "docs/VALIDATION.md",
-            ".agent-progress/device-mesh-refactor-tracker.md"
+            "docs/VALIDATION.md"
           ],
           "qualifies_for_completion": false
         }
@@ -6488,8 +6455,7 @@
           "classification": "failed",
           "assertion": "Prior illegal access, token divergence, missing identity, and incomplete probes remain hard failures.",
           "references": [
-            "docs/VALIDATION.md",
-            ".agent-progress/device-mesh-refactor-tracker.md"
+            "docs/VALIDATION.md"
           ],
           "qualifies_for_completion": false
         }
@@ -6570,8 +6536,7 @@
           "classification": "failed",
           "assertion": "A missing identity, divergence, illegal access, drift, or incomplete child is a hard failure and cannot be averaged away.",
           "references": [
-            "docs/VALIDATION.md",
-            ".agent-progress/device-mesh-refactor-tracker.md"
+            "docs/VALIDATION.md"
           ],
           "qualifies_for_completion": false
         }
@@ -6638,8 +6603,7 @@
           "classification": "failed",
           "assertion": "A missing identity, divergence, illegal access, drift, or incomplete child is a hard failure and cannot be averaged away.",
           "references": [
-            "docs/VALIDATION.md",
-            ".agent-progress/device-mesh-refactor-tracker.md"
+            "docs/VALIDATION.md"
           ],
           "qualifies_for_completion": false
         }
@@ -6707,8 +6671,7 @@
           "classification": "failed",
           "assertion": "A missing identity, divergence, illegal access, drift, or incomplete child is a hard failure and cannot be averaged away.",
           "references": [
-            "docs/VALIDATION.md",
-            ".agent-progress/device-mesh-refactor-tracker.md"
+            "docs/VALIDATION.md"
           ],
           "qualifies_for_completion": false
         }
@@ -6771,8 +6734,7 @@
           "classification": "failed",
           "assertion": "A missing identity, divergence, illegal access, drift, or incomplete child is a hard failure and cannot be averaged away.",
           "references": [
-            "docs/VALIDATION.md",
-            ".agent-progress/device-mesh-refactor-tracker.md"
+            "docs/VALIDATION.md"
           ],
           "qualifies_for_completion": false
         }
@@ -6845,8 +6807,7 @@
           "classification": "failed",
           "assertion": "A missing identity, divergence, illegal access, drift, or incomplete child is a hard failure and cannot be averaged away.",
           "references": [
-            "docs/VALIDATION.md",
-            ".agent-progress/device-mesh-refactor-tracker.md"
+            "docs/VALIDATION.md"
           ],
           "qualifies_for_completion": false
         }

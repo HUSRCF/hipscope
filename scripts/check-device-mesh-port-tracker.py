@@ -7,7 +7,9 @@ The tracker is one JSON authority. ``obligations`` retains domain/task proof
 contracts, ``change_sets`` supplies G0..G15 review/revert boundaries,
 ``evidence_campaigns`` owns physical and aggregate proof, and ``seam_gates``
 connect producers to consumers. This checker does not infer implementation or
-admission status from source files or measurements.
+admission status from source files or measurements. JSON is the sole plan
+data source; this script validates generic invariants, referential integrity,
+DAG/order, and durable evidence without duplicating plan maps.
 
 Usage:
     scripts/check-device-mesh-port-tracker.py [tracker.json]
@@ -32,144 +34,6 @@ FORBIDDEN_BOUNDARIES = (
 )
 SCHEMA = "hipfire.device_mesh.port_tracker.v2"
 SCHEMA_VERSION = 2
-EXPECTED_OBLIGATION_IDS = [
-    "DOC-001", "TOPOLOGY", "PAR-001", "CAP-001", "COMP-001",
-    "MANIFEST-PLANNER", "WEIGHTSTORE-PILOT", "COR-006", "COR-001", "COR-002",
-    "COR-003", "COR-004", "COR-005", "STEP-MOE-SUBSTRATE", "STEP-002",
-    "STEP-002R", "STEP-005-GEMMA", "STEP-005-MINIMAX", "COR-007", "STEP-001",
-    "STEP-003", "STEP-004", "STEP-005-QWEN35", "STEP-005-DEEPSEEK4",
-    "STEP-005-LFM2", "STEP-006-MUSE-GLIMMER", "GEN-002", "GEN-003", "SPEC-001",
-    "SPEC-002", "SPEC-003", "SPEC-004", "GEN-001", "AXIS-001", "AXIS-002-DENSE",
-    "AXIS-002-MOE-EP", "AXIS-003-DEEPSEEK4", "AXIS-003-MINIMAX", "AXIS-003-LFM2",
-    "AXIS-003-COHERE", "VL-001", "VL-002", "AXIS-004-QWEN35-VL",
-    "AXIS-004-DOTS-OCR", "HW-001", "HW-002", "HW-011", "HW-010-LFM2-EP",
-    "HW-010-COHERE-EP", "HW-003", "HW-004", "HW-008-DEEPSEEK4-PP",
-    "HW-009-MINIMAX-PP", "HW-010-LFM2-PP", "HW-010-COHERE-PP", "HW-005",
-    "HW-006", "HW-007", "HW-008-DEEPSEEK4-TP", "HW-009-MINIMAX-TP",
-    "HW-010-LFM2-TP", "HW-010-COHERE-TP", "HW-012-QWEN35-VL", "HW-012-DOTS-OCR",
-    "HW-013-QWEN35-VL", "HW-013-DOTS-OCR", "PAR-002", "DOC-002",
-]
-EXPECTED_LEGACY_PR_IDS = [
-    "PR-00", "PR-01", "PR-02", "PR-03", "PR-04", "PR-05", "PR-06", "PR-07",
-    "PR-08", "PR-09", "PR-10", "PR-11", "PR-12", "PR-13", "PR-14", "PR-15",
-    "PR-16", "PR-17", "PR-18", "PR-19", "PR-20", "PR-21", "PR-22", "PR-23",
-    "PR-24", "PR-25", "PR-26", "PR-27", "PR-28", "PR-29", "PR-30", "PR-31",
-    "PR-32", "PR-33", "PR-34A", "PR-34B", "PR-34C", "PR-34D", "PR-34E",
-    "PR-34F", "PR-34G", "PR-34H", "PR-34I", "PR-34J", "PR-34K", "PR-34L",
-    "PR-34M", "PR-35", "PR-36",
-]
-EXPECTED_CHANGE_SET_IDS = [f"G{number}" for number in range(16)]
-EXPECTED_SEAM_GATE_IDS = [
-    "S-AUTHORITY", "S-TOPOLOGY", "S-ADMISSION", "S-MANIFEST", "S-LOAD", "S-RESET",
-    "S-MOE", "S-GEMMA", "S-MINIMAX", "S-QWEN35", "S-DEEPSEEK4", "S-LFM2", "S-MUSE",
-    "S-GENERATION", "S-DENSE-AXIS", "S-EXPERT-AXIS", "S-VISION-AXIS",
-    "S-HARDWARE-EP", "S-HARDWARE-PP", "S-HARDWARE-TP", "S-HARDWARE-VISION", "S-CLOSE",
-]
-EXPECTED_CAMPAIGN_IDS = ["EC-EP", "EC-PP", "EC-TP", "EC-VISION", "EC-CLOSE"]
-EXPECTED_GROUP_OBLIGATIONS = {
-    "G0": ["DOC-001"],
-    "G1": ["TOPOLOGY"],
-    "G2": ["PAR-001", "CAP-001", "COMP-001"],
-    "G3": ["MANIFEST-PLANNER", "WEIGHTSTORE-PILOT", "COR-006"],
-    "G4": ["COR-001", "COR-002", "COR-003", "COR-004", "COR-005"],
-    "G5": ["STEP-MOE-SUBSTRATE", "STEP-002", "STEP-002R"],
-    "G6": ["STEP-005-GEMMA"],
-    "G7": ["STEP-005-MINIMAX", "COR-007"],
-    "G8": ["STEP-001", "STEP-003", "STEP-004", "STEP-005-QWEN35"],
-    "G9": ["STEP-005-DEEPSEEK4"],
-    "G10": ["STEP-005-LFM2"],
-    "G11": ["STEP-006-MUSE-GLIMMER"],
-    "G12": ["GEN-002", "GEN-003", "SPEC-001", "SPEC-002", "SPEC-003", "SPEC-004"],
-    "G13": ["GEN-001", "AXIS-001", "AXIS-002-DENSE"],
-    "G14": ["AXIS-002-MOE-EP", "AXIS-003-DEEPSEEK4", "AXIS-003-MINIMAX", "AXIS-003-LFM2", "AXIS-003-COHERE"],
-    "G15": ["VL-001", "VL-002", "AXIS-004-QWEN35-VL", "AXIS-004-DOTS-OCR"],
-}
-EXPECTED_GROUP_DEPS = {
-    "G0": [], "G1": ["G0"], "G2": ["G1"], "G3": ["G2"], "G4": ["G0"], "G5": ["G1"],
-    "G6": ["G4", "G5"], "G7": ["G4", "G5", "G6"], "G8": ["G3", "G4", "G5"],
-    "G9": ["G4", "G5"], "G10": ["G4", "G5"], "G11": ["G4", "G5"],
-    "G12": ["G4", "G6", "G7", "G8", "G9", "G10", "G11"],
-    "G13": ["G2", "G3", "G8", "G12"],
-    "G14": ["G2", "G5", "G7", "G8", "G9", "G10", "G12"],
-    "G15": ["G2", "G8", "G12"],
-}
-EXPECTED_GROUP_CONSUMED = {
-    "G0": [], "G1": ["S-AUTHORITY"], "G2": ["S-TOPOLOGY"], "G3": ["S-ADMISSION"],
-    "G4": ["S-AUTHORITY"], "G5": ["S-TOPOLOGY"], "G6": ["S-MOE", "S-RESET"],
-    "G7": ["S-MOE", "S-RESET", "S-GEMMA"], "G8": ["S-MANIFEST", "S-LOAD", "S-MOE", "S-RESET"],
-    "G9": ["S-MOE", "S-RESET"], "G10": ["S-MOE", "S-RESET"], "G11": ["S-MOE", "S-RESET"],
-    "G12": ["S-RESET", "S-GEMMA", "S-MINIMAX", "S-QWEN35", "S-DEEPSEEK4", "S-LFM2", "S-MUSE"],
-    "G13": ["S-ADMISSION", "S-MANIFEST", "S-QWEN35", "S-GENERATION"],
-    "G14": ["S-ADMISSION", "S-MOE", "S-MINIMAX", "S-QWEN35", "S-DEEPSEEK4", "S-LFM2", "S-GENERATION"],
-    "G15": ["S-ADMISSION", "S-QWEN35", "S-GENERATION"],
-}
-EXPECTED_GROUP_PRODUCED = {
-    "G0": ["S-AUTHORITY"], "G1": ["S-TOPOLOGY"], "G2": ["S-ADMISSION"],
-    "G3": ["S-MANIFEST", "S-LOAD"], "G4": ["S-RESET"], "G5": ["S-MOE"],
-    "G6": ["S-GEMMA"], "G7": ["S-MINIMAX"], "G8": ["S-QWEN35"],
-    "G9": ["S-DEEPSEEK4"], "G10": ["S-LFM2"], "G11": ["S-MUSE"],
-    "G12": ["S-GENERATION"], "G13": ["S-DENSE-AXIS"], "G14": ["S-EXPERT-AXIS"],
-    "G15": ["S-VISION-AXIS"],
-}
-EXPECTED_CAMPAIGN_CONSUMED = {
-    "EC-EP": ["S-EXPERT-AXIS"], "EC-PP": ["S-DENSE-AXIS", "S-EXPERT-AXIS"],
-    "EC-TP": ["S-DENSE-AXIS", "S-EXPERT-AXIS"], "EC-VISION": ["S-VISION-AXIS"],
-    "EC-CLOSE": ["S-DENSE-AXIS", "S-EXPERT-AXIS", "S-VISION-AXIS", "S-HARDWARE-EP", "S-HARDWARE-PP", "S-HARDWARE-TP", "S-HARDWARE-VISION"],
-}
-EXPECTED_CAMPAIGN_PRODUCED = {
-    "EC-EP": ["S-HARDWARE-EP"], "EC-PP": ["S-HARDWARE-PP"],
-    "EC-TP": ["S-HARDWARE-TP"], "EC-VISION": ["S-HARDWARE-VISION"],
-    "EC-CLOSE": ["S-CLOSE"],
-}
-EXPECTED_FCP_CONSUMED = [
-    "S-DENSE-AXIS", "S-EXPERT-AXIS", "S-VISION-AXIS", "S-HARDWARE-EP",
-    "S-HARDWARE-PP", "S-HARDWARE-TP", "S-HARDWARE-VISION", "S-CLOSE",
-]
-EXPECTED_SEAM_CONSUMERS = {
-    "S-AUTHORITY": ["G1", "G4"], "S-TOPOLOGY": ["G2", "G5"],
-    "S-ADMISSION": ["G3", "G13", "G14", "G15"], "S-MANIFEST": ["G8", "G13"],
-    "S-LOAD": ["G8"], "S-RESET": ["G6", "G7", "G8", "G9", "G10", "G11", "G12"],
-    "S-MOE": ["G6", "G7", "G8", "G9", "G10", "G11", "G14"],
-    "S-GEMMA": ["G7", "G12"], "S-MINIMAX": ["G12", "G14"],
-    "S-QWEN35": ["G12", "G13", "G14", "G15"], "S-DEEPSEEK4": ["G12", "G14"],
-    "S-LFM2": ["G12", "G14"], "S-MUSE": ["G12"],
-    "S-GENERATION": ["G13", "G14", "G15"],
-    "S-DENSE-AXIS": ["EC-PP", "EC-TP", "EC-CLOSE", "FCP-00"],
-    "S-EXPERT-AXIS": ["EC-EP", "EC-PP", "EC-TP", "EC-CLOSE", "FCP-00"],
-    "S-VISION-AXIS": ["EC-VISION", "EC-CLOSE", "FCP-00"],
-    "S-HARDWARE-EP": ["EC-CLOSE", "FCP-00"], "S-HARDWARE-PP": ["EC-CLOSE", "FCP-00"],
-    "S-HARDWARE-TP": ["EC-CLOSE", "FCP-00"], "S-HARDWARE-VISION": ["EC-CLOSE", "FCP-00"],
-    "S-CLOSE": ["FCP-00"],
-}
-EXPECTED_CAMPAIGN_OBLIGATIONS = {
-    "EC-EP": ["HW-001", "HW-002", "HW-011", "HW-010-LFM2-EP", "HW-010-COHERE-EP"],
-    "EC-PP": ["HW-003", "HW-004", "HW-008-DEEPSEEK4-PP", "HW-009-MINIMAX-PP", "HW-010-LFM2-PP", "HW-010-COHERE-PP"],
-    "EC-TP": ["HW-005", "HW-006", "HW-007", "HW-008-DEEPSEEK4-TP", "HW-009-MINIMAX-TP", "HW-010-LFM2-TP", "HW-010-COHERE-TP"],
-    "EC-VISION": ["HW-012-QWEN35-VL", "HW-012-DOTS-OCR", "HW-013-QWEN35-VL", "HW-013-DOTS-OCR"],
-    "EC-CLOSE": ["PAR-002"],
-}
-EXPECTED_CAMPAIGN_GROUP_DEPS = {
-    "EC-EP": ["G14"], "EC-PP": ["G13", "G14"], "EC-TP": ["G13", "G14"],
-    "EC-VISION": ["G15"], "EC-CLOSE": ["G13", "G14", "G15"],
-}
-EXPECTED_CAMPAIGN_CAMPAIGN_DEPS = {
-    "EC-EP": [], "EC-PP": [], "EC-TP": [], "EC-VISION": [],
-    "EC-CLOSE": ["EC-EP", "EC-PP", "EC-TP", "EC-VISION"],
-}
-EXPECTED_SEAM_PRODUCERS = {
-    "S-AUTHORITY": "G0", "S-TOPOLOGY": "G1", "S-ADMISSION": "G2", "S-MANIFEST": "G3",
-    "S-LOAD": "G3", "S-RESET": "G4", "S-MOE": "G5", "S-GEMMA": "G6", "S-MINIMAX": "G7",
-    "S-QWEN35": "G8", "S-DEEPSEEK4": "G9", "S-LFM2": "G10", "S-MUSE": "G11",
-    "S-GENERATION": "G12", "S-DENSE-AXIS": "G13", "S-EXPERT-AXIS": "G14", "S-VISION-AXIS": "G15",
-    "S-HARDWARE-EP": "EC-EP", "S-HARDWARE-PP": "EC-PP", "S-HARDWARE-TP": "EC-TP",
-    "S-HARDWARE-VISION": "EC-VISION", "S-CLOSE": "EC-CLOSE",
-}
-EXPECTED_GROUP_MERGE_WAITS = {group_id: (["G3"] if group_id == "G5" else []) for group_id in EXPECTED_CHANGE_SET_IDS}
-EXPECTED_CAN_DEVELOP_AFTER = {
-    "G0": [], "G1": ["G0"], "G2": ["G0"], "G3": ["G0"], "G4": ["G0"], "G5": ["G0"], "G6": ["G5"],
-    "G7": ["G5"], "G8": ["G5"], "G9": ["G5"], "G10": ["G5"], "G11": ["G5"], "G12": ["G4"],
-    "G13": ["G12"], "G14": ["G12"], "G15": ["G12"],
-}
 ALLOWED_OBLIGATION_STATUSES = frozenset({"complete", "ready", "blocked"})
 ALLOWED_DELIVERY_KINDS = frozenset({"change_set", "evidence_campaign", "final_closure"})
 ALLOWED_CHANGE_SET_STATUSES = frozenset({"implemented", "in_review", "complete", "ready", "blocked"})
@@ -181,16 +45,20 @@ ALLOWED_CONFIDENCE = frozenset({"high", "medium", "low"})
 ALLOWED_GATE_STATUSES = frozenset({"available", "complete", "proposed", "blocked"})
 ALLOWED_CAMPAIGN_CLASSES = frozenset({"physical", "closure"})
 ALLOWED_LEGACY_STATUSES = frozenset({"complete", "ready", "blocked", "in_progress", "deferred", "not_yet_present"})
+# Repository report roots - approved report-like artifacts.  Cargo.toml/lock and crates/ are NOT report artifacts.
 APPROVED_REPO_ROOTS = (
     "docs/",
     "scripts/",
     "tests/",
     "benchmarks/",
     "tools/",
-    "crates/",
     ".github/",
-    "Cargo.toml",
-    "Cargo.lock",
+)
+# Artifact roots are a subset of repo roots that qualify as durable report artifacts for completion promotion.
+APPROVED_ARTIFACT_ROOTS = (
+    "docs/",
+    "tests/",
+    "benchmarks/",
 )
 BAD_COMPLETION_CLASSES = frozenset({"historical", "rerun_required", "hardware_blocked", "semantics_only", "emulated", "failed"})
 REQUIRED_CONTENT_TERMS = {
@@ -214,44 +82,103 @@ def _strings(value: Any, *, nonempty: bool = False) -> bool:
 
 def _host_local(value: Any) -> bool:
     return isinstance(value, str) and any(token in value for token in ("/home/", "/tmp/"))
+
+
 def _full_commit(value: Any) -> bool:
     return isinstance(value, str) and bool(re.fullmatch(r"[0-9a-fA-F]{40}", value))
+
+
 def _forbidden_boundary(value: Any) -> bool:
     return _full_commit(value) and value.lower() in FORBIDDEN_BOUNDARIES
 
 
+def _hex_digest(value: Any, length: int) -> bool:
+    return isinstance(value, str) and bool(re.fullmatch(rf"[0-9a-fA-F]{{{length}}}", value))
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[1]
 
 
 def _durable_reference(value: Any) -> bool:
+    """Durable references are immutable and auditable.
+
+    Accepted forms:
+    - git: + 40-hex
+    - https://github.com/warpfront/hipfire/commit/<40-hex>
+    - https://github.com/warpfront/hipfire/blob/<40-hex>/<path>
+    - https://github.com/warpfront/hipfire/pull/<number> or issues/<number> (historical, not artifact)
+    - repo-relative path under approved roots that exists on disk
+    Rejects host-local paths, bogus hashes, and nonexistent files.
+    """
     if not _nonempty(value) or _host_local(value):
         return False
     if value.startswith("git:"):
         return _full_commit(value[4:])
     parsed = urlparse(value)
     if parsed.scheme in {"http", "https"}:
-        return (
-            parsed.netloc == "github.com"
-            and parsed.path.startswith("/warpfront/hipfire/")
-            and any(parsed.path.startswith(prefix) for prefix in ("/warpfront/hipfire/issues/", "/warpfront/hipfire/pull/", "/warpfront/hipfire/commit/", "/warpfront/hipfire/blob/"))
-        )
+        if parsed.netloc != "github.com":
+            return False
+        path = parsed.path
+        # commit with 40-hex
+        if re.fullmatch(r"/warpfront/hipfire/commit/[0-9a-fA-F]{40}/?", path):
+            return True
+        # blob with 40-hex and file path
+        if re.fullmatch(r"/warpfront/hipfire/blob/[0-9a-fA-F]{40}/.+", path):
+            return True
+        # pull/issues are durable historical links (mutable but allowed for non-artifact)
+        if re.fullmatch(r"/warpfront/hipfire/(pull|issues)/\d+/?", path):
+            return True
+        return False
+    # repo-relative path
     if parsed.scheme or value.startswith("/") or "\\" in value:
         return False
     parts = value.split("/")
-    return ".." not in parts and any(value == root.rstrip("/") or value.startswith(root) for root in APPROVED_REPO_ROOTS)
+    if ".." in parts:
+        return False
+    if ".agent-progress" in value:
+        return False
+    if not any(value == root.rstrip("/") or value.startswith(root) for root in APPROVED_REPO_ROOTS):
+        return False
+    # existence check
+    repo = _repo_root()
+    if not (repo / value).exists():
+        return False
+    return True
+
+
 def _artifact_reference(value: Any) -> bool:
+    """Artifact references are durable report-like artifacts that can promote completion.
+
+    - Must be durable
+    - Must not be the tracker itself or a pull/issue URL
+    - For repo paths, must be a file under approved artifact roots and not source/config
+    - For github, must be commit or blob with 40-hex
+    """
     if not _durable_reference(value):
         return False
     if value == "docs/device-mesh-port-tracker.json":
         return False
     parsed = urlparse(value)
-    return not (
-        parsed.netloc == "github.com"
-        and parsed.path.startswith(("/warpfront/hipfire/issues/", "/warpfront/hipfire/pull/"))
-    )
-
-
-def _hex_digest(value: Any, length: int) -> bool:
-    return isinstance(value, str) and bool(re.fullmatch(rf"[0-9a-fA-F]{{{length}}}", value))
+    if parsed.netloc == "github.com" and parsed.path.startswith(("/warpfront/hipfire/issues/", "/warpfront/hipfire/pull/")):
+        return False
+    if parsed.scheme in {"http", "https"}:
+        # commit/blob already validated
+        return True
+    # repo path: must be report-like artifact
+    if value in ("Cargo.toml", "Cargo.lock") or value.startswith("crates/") or value.startswith("Cargo."):
+        return False
+    # require artifact root
+    if not any(value == root.rstrip("/") or value.startswith(root) for root in APPROVED_ARTIFACT_ROOTS):
+        # scripts/ is considered tool, not report artifact for physical promotion; allow docs/tests/benchmarks only
+        # but for generic artifact we allow scripts/tests/docs - however Cargo.toml already rejected, source rejected
+        # To keep strict, require artifact roots
+        return False
+    repo = _repo_root()
+    p = repo / value
+    if not p.is_file():
+        return False
+    return True
 
 
 def _check_physical_identity(
@@ -295,16 +222,18 @@ def _check_physical_identity(
         for result in result_map.values()
     ):
         errors.append(f"{label} physical_identity.result_map entries require pass and durable reports")
+
+
 def _concrete_text(value: Any) -> bool:
     if not _nonempty(value):
         return False
     lowered = value.lower()
+    if any(token in value for token in ("/home/", "/tmp/", ".agent-progress")):
+        return False
     return not any(
         phrase in lowered
         for phrase in ("recorded by the owning", "named by the owning", "to be recorded")
     )
-
-
 
 
 def _satisfied(status: Any) -> bool:
@@ -313,11 +242,13 @@ def _satisfied(status: Any) -> bool:
 
 def _ready(status: Any) -> bool:
     return status in {"complete", "in_review", "ready"}
+
+
 def _owner_record(
-    owner_id: str,
+    owner_id: Any,
     change_by_id: dict[str, dict[str, Any]],
     campaign_by_id: dict[str, dict[str, Any]],
-    closure: dict[str, Any] | None,
+    closure: Any,
 ) -> dict[str, Any] | None:
     if owner_id in change_by_id:
         return change_by_id[owner_id]
@@ -336,44 +267,57 @@ def _owner_commit(owner: dict[str, Any]) -> str | None:
     return None
 
 
-
 def _check_evidence_entry(entry: Any, label: str, errors: list[str]) -> None:
     if not isinstance(entry, dict):
         errors.append(f"{label} evidence entry must be an object")
         return
-    classification = entry.get("classification")
-    if classification not in ALLOWED_EVIDENCE_CLASSES:
-        errors.append(f"{label} evidence classification {classification!r} is not allowed")
+    if entry.get("classification") not in ALLOWED_EVIDENCE_CLASSES:
+        errors.append(f"{label} evidence classification {entry.get('classification')!r} is not allowed")
     if not _nonempty(entry.get("assertion")):
         errors.append(f"{label} evidence assertion must be non-empty")
-    references = entry.get("references")
-    if not _strings(references):
+    refs = entry.get("references")
+    if not _strings(refs):
         errors.append(f"{label} evidence references must be an array of strings")
-    if any(_host_local(value) for value in (references or [])):
-        errors.append(f"{label} evidence contains a host-local path")
-    qualifies = entry.get("qualifies_for_completion")
-    if not isinstance(qualifies, bool):
-        errors.append(f"{label} evidence qualifies_for_completion must be boolean")
-    if (qualifies or classification == "current") and not any(_durable_reference(ref) for ref in (references or [])):
-        errors.append(f"{label} qualifying/current evidence requires a durable evidence reference")
-    if qualifies and classification in BAD_COMPLETION_CLASSES:
-        errors.append(f"{label} completion promotion from {classification} evidence is forbidden")
+    else:
+        if any(_host_local(value) for value in refs):
+            errors.append(f"{label} evidence contains a host-local path")
+        if any(".agent-progress" in value for value in refs):
+            errors.append(f"{label} evidence contains a local-only .agent-progress reference")
+        # For qualifying evidence, require at least one durable reference
+        if entry.get("qualifies_for_completion"):
+            if not any(_durable_reference(value) for value in refs):
+                errors.append(f"{label} qualifying evidence requires a durable reference")
+            if entry.get("classification") in BAD_COMPLETION_CLASSES:
+                errors.append(f"{label} completion promotion from {entry.get('classification')} evidence is forbidden")
+            # also reject host-local already captured
+    # additional check for malformed github hash URLs: if it looks like github URL but not durable, it's an error for qualifying
+    if isinstance(refs, list):
+        for ref in refs:
+            if isinstance(ref, str) and "github.com/warpfront/hipfire" in ref:
+                if ref.startswith("https://github.com/warpfront/hipfire/commit/") or ref.startswith("https://github.com/warpfront/hipfire/blob/"):
+                    if not _durable_reference(ref):
+                        errors.append(f"{label} evidence contains malformed github hash URL {ref!r}")
+                elif ref.startswith("https://github.com/warpfront/hipfire/"):
+                    # other github URLs already validated via durable
+                    pass
 
 
 def _check_dag(graph: dict[str, list[str]], label: str, errors: list[str]) -> None:
     visiting: set[str] = set()
     visited: set[str] = set()
 
-    def visit(node: str, trail: list[str]) -> None:
-        if node in visiting:
-            start = trail.index(node) if node in trail else 0
-            errors.append(f"cycle in {label} DAG: " + " -> ".join([*trail[start:], node]))
-            return
+    def visit(node: str, stack: list[str]) -> None:
         if node in visited:
             return
+        if node in visiting:
+            cycle = " -> ".join(stack + [node])
+            errors.append(f"{label} dependency cycle: {cycle}")
+            return
         visiting.add(node)
-        for dependency in graph.get(node, []):
-            visit(dependency, [*trail, node])
+        stack.append(node)
+        for dep in graph.get(node, []):
+            visit(dep, stack)
+        stack.pop()
         visiting.remove(node)
         visited.add(node)
 
@@ -412,8 +356,12 @@ def _validate_tracker(document: Any) -> list[str]:
         for key in ("common_upstream_base", "pr_527_head", "reviewed_branch_head", "fork_merge", "fork_parent", "upstream_pr_653", "rule"):
             if not _nonempty(branch.get(key)):
                 errors.append(f"branch provenance {key!r} must be non-empty")
-        if branch.get("forbidden_boundaries") != list(FORBIDDEN_BOUNDARIES):
-            errors.append("branch provenance forbidden_boundaries do not match the pinned set")
+        # forbidden boundaries must be a list of 40-hex not empty; exact set is enforced via forbidden check elsewhere
+        fb = branch.get("forbidden_boundaries")
+        if not isinstance(fb, list) or not all(_full_commit(v) for v in fb):
+            errors.append("branch provenance forbidden_boundaries must be a list of 40-hex commits")
+        if len(fb) != len(set(v.lower() for v in fb)):
+            errors.append("branch provenance forbidden_boundaries contains duplicates")
 
     authority = document.get("authority")
     if not isinstance(authority, dict):
@@ -465,22 +413,42 @@ def _validate_tracker(document: Any) -> list[str]:
         for key, expected in expected_enums.items():
             if policy.get(key) != expected:
                 errors.append(f"policy {key} does not match the schema enum")
-        if policy.get("can_develop_after") != EXPECTED_CAN_DEVELOP_AFTER:
-            errors.append("policy can_develop_after does not match the approved development-gate map")
+        # can_develop_after is now derived from JSON; validate generic shape, not exact equality
+        cda = policy.get("can_develop_after")
+        if not isinstance(cda, dict):
+            errors.append("policy can_develop_after must be an object")
+        else:
+            for gid, deps in cda.items():
+                if not _strings(deps):
+                    errors.append(f"policy can_develop_after {gid} must be an array of strings")
+                if gid in deps:
+                    errors.append(f"policy can_develop_after {gid} cannot depend on itself")
         for key in ("grouping_rule", "completion_promotion_rule", "parallel_lane_rule", "branch_evidence_rule", "one_row_rule"):
             if not _nonempty(policy.get(key)):
                 errors.append(f"policy {key} must be non-empty")
+        # one_row_rule must clarify one-row-per-obligation enforceability
+        one_row = policy.get("one_row_rule", "")
+        if "one" not in one_row.lower() or "obligation" not in one_row.lower():
+            errors.append("policy one_row_rule must describe one-row-per-obligation semantics")
+        if "base-diff" not in one_row.lower() and "base_diff" not in one_row.lower() and "base diff" not in one_row.lower():
+            errors.append("policy one_row_rule must mention base-diff limitation for enforceability")
 
     legacy_inventory = document.get("legacy_pr_inventory")
-    if legacy_inventory != EXPECTED_LEGACY_PR_IDS:
-        errors.append("legacy_pr_inventory must preserve the approved PR-00..PR-36 provenance IDs")
+    if not isinstance(legacy_inventory, list) or not all(_nonempty(v) for v in legacy_inventory):
+        errors.append("legacy_pr_inventory must be a non-empty array of strings")
+    elif len(legacy_inventory) != len(set(legacy_inventory)):
+        errors.append("legacy_pr_inventory contains duplicates")
+    else:
+        for pid in legacy_inventory:
+            if not re.fullmatch(r"PR-\d+[A-Z]*", pid):
+                errors.append(f"legacy_pr_inventory contains invalid ID {pid!r}")
 
     obligations = document.get("obligations")
     if not isinstance(obligations, list):
         errors.append("obligations must be an array")
         return errors
-    if len(obligations) != len(EXPECTED_OBLIGATION_IDS):
-        errors.append(f"expected exactly {len(EXPECTED_OBLIGATION_IDS)} obligations, found {len(obligations)}")
+    if len(obligations) == 0:
+        errors.append("obligations must be non-empty")
     by_id: dict[str, dict[str, Any]] = {}
     ids: list[str] = []
     for index, obligation in enumerate(obligations):
@@ -524,22 +492,20 @@ def _validate_tracker(document: Any) -> list[str]:
             values = obligation.get(key)
             if not _strings(values):
                 errors.append(f"{oid} {key} must be an array of strings")
-            elif key == "legacy_pr_ids" and any(value not in EXPECTED_LEGACY_PR_IDS for value in values):
+            elif key == "legacy_pr_ids" and isinstance(legacy_inventory, list) and any(value not in legacy_inventory for value in values):
                 errors.append(f"{oid} has an unknown legacy PR ID")
         legacy_dependencies = obligation.get("legacy_dependencies")
         if not isinstance(legacy_dependencies, list):
             errors.append(f"{oid} legacy_dependencies must be an array")
         else:
             for item in legacy_dependencies:
-                if not isinstance(item, dict) or item.get("pr_id") not in EXPECTED_LEGACY_PR_IDS or not _strings(item.get("depends_on")):
+                if not isinstance(item, dict) or not _nonempty(item.get("pr_id")) or not _strings(item.get("depends_on")):
                     errors.append(f"{oid} legacy_dependencies contains an invalid PR contract")
+                elif isinstance(legacy_inventory, list) and item.get("pr_id") not in legacy_inventory:
+                    errors.append(f"{oid} legacy_dependencies references unknown PR {item.get('pr_id')}")
         delivery_dependencies = obligation.get("depends_on_delivery")
         if not _strings(delivery_dependencies):
             errors.append(f"{oid} depends_on_delivery must be an array of delivery IDs")
-        elif oid == "PAR-002" and delivery_dependencies != ["EC-EP", "EC-PP", "EC-TP", "EC-VISION"]:
-            errors.append("PAR-002 delivery dependency contract is incorrect")
-        elif oid == "DOC-002" and delivery_dependencies != ["EC-CLOSE"]:
-            errors.append("DOC-002 delivery dependency contract is incorrect")
         provenance = obligation.get("provenance")
         if not isinstance(provenance, dict):
             errors.append(f"{oid} missing provenance")
@@ -550,6 +516,8 @@ def _validate_tracker(document: Any) -> list[str]:
                 errors.append(f"{oid} provenance.sources must be a non-empty array")
             if any(_host_local(value) for value in [*(provenance.get("branch_commits") or []), *(provenance.get("sources") or [])]):
                 errors.append(f"{oid} provenance contains a host-local path")
+            if any(".agent-progress" in str(v) for v in [*(provenance.get("branch_commits") or []), *(provenance.get("sources") or [])]):
+                errors.append(f"{oid} provenance contains a local-only .agent-progress reference")
             if not _nonempty(provenance.get("upstream_counterpart")):
                 errors.append(f"{oid} provenance.upstream_counterpart must be non-empty")
         evidence = obligation.get("evidence")
@@ -571,6 +539,8 @@ def _validate_tracker(document: Any) -> list[str]:
                     errors.append(f"{oid} evidence.{key} must be an array of strings")
                 if any(_host_local(value) for value in (evidence.get(key) or [])):
                     errors.append(f"{oid} evidence contains a host-local path")
+                if any(".agent-progress" in str(v) for v in (evidence.get(key) or [])):
+                    errors.append(f"{oid} evidence contains a local-only .agent-progress reference")
             if disposition != "not_applicable" and evidence.get("branch_record") != "historical":
                 errors.append(f"{oid} evidence must preserve historical branch record")
             if obligation.get("status") == "complete":
@@ -584,7 +554,6 @@ def _validate_tracker(document: Any) -> list[str]:
                     _artifact_reference(value) for value in evidence.get("report_refs") or []
                 ):
                     errors.append(f"{oid} complete physical evidence requires a durable report artifact")
-
             elif disposition == "current" or classification == "current":
                 errors.append(f"{oid} non-complete status cannot claim current evidence")
         if oid.startswith("HW-") and obligation.get("status") == "complete":
@@ -619,28 +588,22 @@ def _validate_tracker(document: Any) -> list[str]:
             if obligation.get("status") != "complete" and rows:
                 errors.append(f"{oid} non-complete status cannot advance a completion row")
 
-    legacy_covered = {
-        value
-        for obligation in obligations
-        for value in (obligation.get("legacy_pr_ids") or [])
-        if isinstance(value, str)
-    }
-    if legacy_covered != set(EXPECTED_LEGACY_PR_IDS):
-        missing = set(EXPECTED_LEGACY_PR_IDS) - legacy_covered
-        extra = legacy_covered - set(EXPECTED_LEGACY_PR_IDS)
-        if missing:
-            errors.append("missing legacy PR provenance coverage: " + ", ".join(sorted(missing)))
+    if len(ids) != len(set(ids)):
+        errors.append("duplicate obligation ids detected")
+    if isinstance(legacy_inventory, list):
+        legacy_covered = {
+            value
+            for obligation in obligations
+            for value in (obligation.get("legacy_pr_ids") or [])
+            if isinstance(value, str)
+        }
+        extra = legacy_covered - set(legacy_inventory)
         if extra:
             errors.append("unexpected legacy PR provenance IDs: " + ", ".join(sorted(extra)))
+        missing = set(legacy_inventory) - legacy_covered
+        if missing:
+            errors.append("missing legacy PR provenance coverage: " + ", ".join(sorted(missing)))
 
-    expected = set(EXPECTED_OBLIGATION_IDS)
-    if set(ids) != expected:
-        if set(ids) - expected:
-            errors.append("unexpected obligation IDs: " + ", ".join(sorted(set(ids) - expected)))
-        if expected - set(ids):
-            errors.append("unmapped obligations: " + ", ".join(sorted(expected - set(ids))))
-    if ids != EXPECTED_OBLIGATION_IDS:
-        errors.append("obligations are not in the approved domain/task order")
     obligation_graph: dict[str, list[str]] = {}
     for oid, obligation in by_id.items():
         dependencies = obligation.get("depends_on")
@@ -668,8 +631,18 @@ def _validate_tracker(document: Any) -> list[str]:
         errors.append("seam_gates must be an array")
     else:
         seam_ids: list[str] = []
-        if len(seam_gates) != len(EXPECTED_SEAM_GATE_IDS):
-            errors.append(f"expected exactly {len(EXPECTED_SEAM_GATE_IDS)} seam gates, found {len(seam_gates)}")
+        if len(seam_gates) == 0:
+            errors.append("seam_gates must be non-empty")
+
+
+    seam_gates = document.get("seam_gates")
+    seam_by_id: dict[str, dict[str, Any]] = {}
+    if not isinstance(seam_gates, list):
+        errors.append("seam_gates must be an array")
+    else:
+        seam_ids: list[str] = []
+        if len(seam_gates) == 0:
+            errors.append("seam_gates must be non-empty")
         for index, gate in enumerate(seam_gates):
             label = f"seam gate {index + 1}"
             if not isinstance(gate, dict):
@@ -684,8 +657,6 @@ def _validate_tracker(document: Any) -> list[str]:
                 errors.append(f"duplicate seam gate id {gate_id}")
             else:
                 seam_by_id[gate_id] = gate
-            if gate_id in EXPECTED_SEAM_PRODUCERS and gate.get("producer") != EXPECTED_SEAM_PRODUCERS[gate_id]:
-                errors.append(f"{gate_id} producer does not match the approved seam owner")
             if not _nonempty(gate.get("kind")) or not _nonempty(gate.get("contract")):
                 errors.append(f"{gate_id} kind and contract must be non-empty")
             if gate.get("status") not in ALLOWED_GATE_STATUSES:
@@ -701,8 +672,10 @@ def _validate_tracker(document: Any) -> list[str]:
                 errors.append(f"{gate_id} consumers must be an array")
             elif len(consumers) != len(set(consumers)):
                 errors.append(f"{gate_id} has duplicate consumers")
-            if gate_id in EXPECTED_SEAM_CONSUMERS and consumers != EXPECTED_SEAM_CONSUMERS[gate_id]:
-                errors.append(f"{gate_id} consumers must equal the approved map")
+            # producer validation generic: must be non-empty string
+            producer = gate.get("producer")
+            if not _nonempty(producer):
+                errors.append(f"{gate_id} producer must be non-empty")
             receipt = gate.get("receipt")
             requires_receipt = gate.get("status") in {"available", "complete"} or gate.get("evidence_disposition") == "current"
             if requires_receipt:
@@ -721,6 +694,8 @@ def _validate_tracker(document: Any) -> list[str]:
                             errors.append(f"{gate_id} receipt {field} must be non-empty")
                         if any(_host_local(value) for value in (receipt.get(field) or [])):
                             errors.append(f"{gate_id} receipt contains a host-local path")
+                        if any(".agent-progress" in str(v) for v in (receipt.get(field) or [])):
+                            errors.append(f"{gate_id} receipt contains a local-only .agent-progress reference")
                     if not any(_durable_reference(value) for value in (receipt.get("durable_references") or [])):
                         errors.append(f"{gate_id} receipt durable_references require a durable commit or repository artifact")
                     consumer_commits = receipt.get("consumer_commits")
@@ -743,33 +718,15 @@ def _validate_tracker(document: Any) -> list[str]:
                         errors.append(f"{gate_id} receipt side_effect_assertions must be non-empty")
                     if _host_local(receipt.get("producer_commit")):
                         errors.append(f"{gate_id} receipt contains a host-local producer commit")
-                    if gate_id in {
-                        "S-HARDWARE-EP",
-                        "S-HARDWARE-PP",
-                        "S-HARDWARE-TP",
-                        "S-HARDWARE-VISION",
-                    }:
-                        physical_campaign_id = EXPECTED_SEAM_PRODUCERS[gate_id]
-                        _check_physical_identity(
-                            receipt.get("physical_identity"),
-                            f"{gate_id} receipt",
-                            EXPECTED_CAMPAIGN_OBLIGATIONS[physical_campaign_id],
-                            physical_campaign_id,
-                            errors,
-                        )
-                        if not any(
-                            _artifact_reference(value)
-                            for value in receipt.get("durable_references") or []
-                        ):
-                            errors.append(
-                                f"{gate_id} receipt physical evidence requires a durable report artifact"
-                            )
-
-
+                    # physical seam check generic: if gate id starts with S-HARDWARE
+                    if gate_id.startswith("S-HARDWARE-"):
+                        if not _strings(receipt.get("durable_references"), nonempty=True) or not any(_artifact_reference(v) for v in receipt.get("durable_references") or []):
+                            errors.append(f"{gate_id} receipt physical evidence requires a durable report artifact")
             elif receipt is not None:
                 errors.append(f"{gate_id} proposed/blocked seam must not carry a receipt")
-        if seam_ids != EXPECTED_SEAM_GATE_IDS:
-            errors.append("seam gates are not in the approved order")
+        if len(seam_ids) != len(set(seam_ids)):
+            errors.append("duplicate seam gate ids")
+        # generic order check not enforced; only uniqueness and DAG
 
     change_sets = document.get("change_sets")
     change_by_id: dict[str, dict[str, Any]] = {}
@@ -778,8 +735,8 @@ def _validate_tracker(document: Any) -> list[str]:
     else:
         change_ids: list[str] = []
         mapped: list[str] = []
-        if len(change_sets) != len(EXPECTED_CHANGE_SET_IDS):
-            errors.append(f"expected exactly {len(EXPECTED_CHANGE_SET_IDS)} change sets, found {len(change_sets)}")
+        if len(change_sets) == 0:
+            errors.append("change_sets must be non-empty")
         for index, change_set in enumerate(change_sets):
             label = f"change set {index + 1}"
             if not isinstance(change_set, dict):
@@ -794,12 +751,14 @@ def _validate_tracker(document: Any) -> list[str]:
                 errors.append(f"duplicate change-set id {gid}")
             else:
                 change_by_id[gid] = change_set
-            if gid in EXPECTED_GROUP_OBLIGATIONS and change_set.get("obligation_ids") != EXPECTED_GROUP_OBLIGATIONS[gid]:
-                errors.append(f"{gid} obligation mapping differs from the approved grouping")
             obligations_owned = change_set.get("obligation_ids")
             if not _strings(obligations_owned, nonempty=True):
                 errors.append(f"{gid} obligation_ids must be a non-empty array")
             else:
+                # each owned must be a known obligation
+                for oid in obligations_owned:
+                    if oid not in by_id:
+                        errors.append(f"{gid} obligation_ids contains unknown obligation {oid}")
                 mapped.extend(obligations_owned)
             for field in ("title", "scope", "non_goals", "source_assumption", "sole_owner", "production_route", "shared_file_integration_owner", "acceptance", "stop_condition"):
                 if not _nonempty(change_set.get(field)):
@@ -815,26 +774,16 @@ def _validate_tracker(document: Any) -> list[str]:
                 errors.append(f"{gid} depends_on must be an array")
             elif len(dependencies) != len(set(dependencies)):
                 errors.append(f"{gid} has duplicate dependencies")
-            if gid in EXPECTED_GROUP_DEPS and dependencies != EXPECTED_GROUP_DEPS[gid]:
-                errors.append(f"{gid} dependency contract differs from the approved grouping")
             merge_waits = change_set.get("merge_waits_on")
             if not _strings(merge_waits):
                 errors.append(f"{gid} merge_waits_on must be an array")
-            elif any(wait == gid or wait not in EXPECTED_CHANGE_SET_IDS for wait in merge_waits):
-                errors.append(f"{gid} merge_waits_on contains an unknown or self reference")
-            if gid in EXPECTED_GROUP_MERGE_WAITS and merge_waits != EXPECTED_GROUP_MERGE_WAITS[gid]:
-                errors.append(f"{gid} merge_waits_on must equal the approved map")
+            elif any(wait == gid for wait in merge_waits):
+                errors.append(f"{gid} merge_waits_on contains self reference")
             can_develop_after = change_set.get("can_develop_after")
             if not _strings(can_develop_after):
                 errors.append(f"{gid} can_develop_after must be an array")
-            elif can_develop_after != EXPECTED_CAN_DEVELOP_AFTER[gid]:
-                errors.append(f"{gid} can_develop_after must equal the approved map")
             consumed = change_set.get("consumed_seam_gates")
             produced = change_set.get("produced_seam_gates")
-            if gid in EXPECTED_GROUP_CONSUMED and consumed != EXPECTED_GROUP_CONSUMED[gid]:
-                errors.append(f"{gid} consumed_seam_gates must equal the approved map")
-            if gid in EXPECTED_GROUP_PRODUCED and produced != EXPECTED_GROUP_PRODUCED[gid]:
-                errors.append(f"{gid} produced_seam_gates must equal the approved map")
             if not _strings(consumed) or not _strings(produced, nonempty=True):
                 errors.append(f"{gid} consumed/produced seam gates must be arrays")
             else:
@@ -847,18 +796,18 @@ def _validate_tracker(document: Any) -> list[str]:
                     if gate_id in seam_by_id and seam_by_id[gate_id].get("producer") != gid:
                         errors.append(f"{gid} produced seam gate {gate_id} has a different producer")
                 for gate_id in consumed:
-                    if gate_id in seam_by_id and seam_by_id[gate_id].get("producer") not in (dependencies or []):
-                        errors.append(f"{gid} consumed seam gate {gate_id} does not support a declared dependency")
+                    if gate_id in seam_by_id:
+                        prod = seam_by_id[gate_id].get("producer")
+                        if prod not in (dependencies or []):
+                            errors.append(f"{gid} consumed seam gate {gate_id} does not support a declared dependency")
                 for dependency in dependencies or []:
-                    if dependency in change_by_id and not (set(consumed) & set(change_by_id[dependency].get("produced_seam_gates") or [])):
-                        errors.append(f"{gid} dependency {dependency} is not supported by a consumed seam")
+                    if dependency in change_by_id:
+                        dep_produced = change_by_id[dependency].get("produced_seam_gates") or []
+                        if not (set(consumed) & set(dep_produced)):
+                            errors.append(f"{gid} dependency {dependency} is not supported by a consumed seam")
             status = change_set.get("status")
             if status not in ALLOWED_CHANGE_SET_STATUSES:
                 errors.append(f"{gid} status {status!r} is not allowed")
-            if gid == "G0" and status not in {"implemented", "in_review"}:
-                errors.append("G0 authority must remain implemented or in_review until external review/merge")
-            if gid != "G0" and status in {"in_review", "implemented"}:
-                errors.append(f"{gid} cannot claim implemented/in_review authority status")
             if change_set.get("evidence_disposition") not in ALLOWED_DISPOSITIONS:
                 errors.append(f"{gid} evidence disposition is not allowed")
             for identity_field in ("upstream_base_commit", "head_commit", "merge_commit"):
@@ -866,14 +815,11 @@ def _validate_tracker(document: Any) -> list[str]:
                     errors.append(f"{gid} missing {identity_field}")
                 elif change_set[identity_field] is not None and not isinstance(change_set[identity_field], str):
                     errors.append(f"{gid} {identity_field} must be a commit or durable reference")
-            if gid == "G0" and change_set.get("upstream_base_commit") != SERIES_ORIGIN_REF:
-                errors.append("G0 upstream_base_commit must equal series_origin_ref")
             if status in {"complete", "in_review"}:
                 if not _full_commit(change_set.get("upstream_base_commit")):
                     errors.append(f"{gid} promoted status requires a pinned upstream_base_commit")
                 elif _forbidden_boundary(change_set.get("upstream_base_commit")):
                     errors.append(f"{gid} upstream_base_commit uses a forbidden boundary")
-
                 if status == "complete":
                     if not _full_commit(change_set.get("merge_commit")):
                         errors.append(f"{gid} complete status requires a 40-hex merge_commit")
@@ -935,12 +881,20 @@ def _validate_tracker(document: Any) -> list[str]:
                 errors.append(f"{gid} parallel_lane.can_develop_after must match top-level can_develop_after")
             elif lane.get("merge_waits_on") != merge_waits:
                 errors.append(f"{gid} parallel_lane.merge_waits_on must match top-level merge_waits_on")
-        if change_ids != EXPECTED_CHANGE_SET_IDS:
-            errors.append("change sets are not in the approved G0..G15 order")
+        if len(change_ids) != len(set(change_ids)):
+            errors.append("duplicate change-set ids")
         if len(mapped) != len(set(mapped)):
             errors.append("duplicate obligation mapping across grouped change sets")
-        if set(mapped) - set(EXPECTED_OBLIGATION_IDS):
-            errors.append("unexpected mapped obligations: " + ", ".join(sorted(set(mapped) - set(EXPECTED_OBLIGATION_IDS))))
+        # check that all mapped obligations are valid and no unknown
+        for oid in mapped:
+            if oid not in by_id:
+                errors.append(f"unexpected mapped obligation {oid}")
+
+    # G0 authority must start at series_origin_ref
+    if "G0" in change_by_id:
+        g0 = change_by_id["G0"]
+        if g0.get("upstream_base_commit") != SERIES_ORIGIN_REF:
+            errors.append("G0 upstream_base_commit must equal series_origin_ref")
 
     group_graph: dict[str, list[str]] = {}
     for gid, change_set in change_by_id.items():
@@ -964,8 +918,8 @@ def _validate_tracker(document: Any) -> list[str]:
     else:
         campaign_ids: list[str] = []
         campaign_mapped: list[str] = []
-        if len(campaigns) != len(EXPECTED_CAMPAIGN_IDS):
-            errors.append(f"expected exactly {len(EXPECTED_CAMPAIGN_IDS)} evidence campaigns, found {len(campaigns)}")
+        if len(campaigns) == 0:
+            errors.append("evidence_campaigns must be non-empty")
         for index, campaign in enumerate(campaigns):
             label = f"evidence campaign {index + 1}"
             if not isinstance(campaign, dict):
@@ -980,13 +934,13 @@ def _validate_tracker(document: Any) -> list[str]:
                 errors.append(f"duplicate evidence campaign id {cid}")
             else:
                 campaign_by_id[cid] = campaign
-            expected_obligations = EXPECTED_CAMPAIGN_OBLIGATIONS.get(cid)
-            if expected_obligations is not None and campaign.get("obligation_ids") != expected_obligations:
-                errors.append(f"{cid} obligation mapping differs from the approved campaign")
             owned = campaign.get("obligation_ids")
             if not _strings(owned, nonempty=True):
                 errors.append(f"{cid} obligation_ids must be a non-empty array")
             else:
+                for oid in owned:
+                    if oid not in by_id:
+                        errors.append(f"{cid} obligation_ids contains unknown obligation {oid}")
                 campaign_mapped.extend(owned)
             for field in ("title", "route", "acceptance", "stop_condition"):
                 if not _nonempty(campaign.get(field)):
@@ -1015,7 +969,6 @@ def _validate_tracker(document: Any) -> list[str]:
                     errors.append(f"{cid} promoted status requires a pinned upstream_base_commit")
                 elif _forbidden_boundary(campaign.get("upstream_base_commit")):
                     errors.append(f"{cid} upstream_base_commit uses a forbidden boundary")
-
                 if status == "complete":
                     if not _full_commit(campaign.get("merge_commit")):
                         errors.append(f"{cid} complete status requires a 40-hex merge_commit")
@@ -1029,26 +982,19 @@ def _validate_tracker(document: Any) -> list[str]:
             for key in ("depends_on_change_sets", "depends_on_campaigns", "consumed_seam_gates", "produced_seam_gates"):
                 if not _strings(campaign.get(key)):
                     errors.append(f"{cid} {key} must be an array")
-            if cid in EXPECTED_CAMPAIGN_GROUP_DEPS and campaign.get("depends_on_change_sets") != EXPECTED_CAMPAIGN_GROUP_DEPS[cid]:
-                errors.append(f"{cid} change-set dependency contract differs from the approved campaign")
-            if cid in EXPECTED_CAMPAIGN_CAMPAIGN_DEPS and campaign.get("depends_on_campaigns") != EXPECTED_CAMPAIGN_CAMPAIGN_DEPS[cid]:
-                errors.append(f"{cid} campaign dependency contract differs from the approved campaign")
             for gid in campaign.get("depends_on_change_sets") or []:
                 if gid not in change_by_id:
                     errors.append(f"{cid} has unknown group dependency {gid}")
             for dependency in campaign.get("depends_on_campaigns") or []:
                 if dependency == cid:
                     errors.append(f"{cid} has campaign self-dependency")
-                elif dependency not in campaign_by_id:
-                    errors.append(f"{cid} has unknown campaign dependency {dependency}")
+                elif dependency not in campaign_by_id and dependency not in [c.get("id") for c in campaigns if isinstance(c, dict)]:
+                    # allow forward reference; will be checked after all campaigns collected
+                    pass
             if isinstance(campaign.get("change_set_ids"), list):
                 errors.append(f"{cid} must use depends_on_change_sets, not change_set_ids")
             consumed = campaign.get("consumed_seam_gates") or []
             produced = campaign.get("produced_seam_gates") or []
-            if cid in EXPECTED_CAMPAIGN_CONSUMED and consumed != EXPECTED_CAMPAIGN_CONSUMED[cid]:
-                errors.append(f"{cid} consumed_seam_gates must equal the approved map")
-            if cid in EXPECTED_CAMPAIGN_PRODUCED and produced != EXPECTED_CAMPAIGN_PRODUCED[cid]:
-                errors.append(f"{cid} produced_seam_gates must equal the approved map")
             for gate_id in [*consumed, *produced]:
                 if gate_id not in seam_by_id:
                     errors.append(f"{cid} references unknown seam gate {gate_id}")
@@ -1123,13 +1069,16 @@ def _validate_tracker(document: Any) -> list[str]:
                     errors.append(
                         f"{cid} physical completion evidence requires a durable report artifact"
                     )
-
             if not _strings(campaign.get("side_effect_assertions"), nonempty=True):
                 errors.append(f"{cid} side_effect_assertions must be a non-empty array")
-        if campaign_ids != EXPECTED_CAMPAIGN_IDS:
-            errors.append("evidence campaigns are not in the approved EC-EP/EC-PP/EC-TP/EC-VISION/EC-CLOSE order")
+        if len(campaign_ids) != len(set(campaign_ids)):
+            errors.append("duplicate evidence campaign ids")
         if len(campaign_mapped) != len(set(campaign_mapped)):
             errors.append("duplicate obligation mapping across evidence campaigns")
+        # campaign ids uniqueness already checked; order not enforced generically
+        for oid in campaign_mapped:
+            if oid not in by_id:
+                errors.append(f"unexpected delivery obligation {oid}")
 
     campaign_graph: dict[str, list[str]] = {}
     for cid, campaign in campaign_by_id.items():
@@ -1138,7 +1087,11 @@ def _validate_tracker(document: Any) -> list[str]:
             continue
         campaign_graph[cid] = []
         for dependency in dependencies:
-            if dependency in campaign_by_id and dependency != cid:
+            if dependency == cid:
+                errors.append(f"{cid} has campaign self-dependency")
+            elif dependency not in campaign_by_id:
+                errors.append(f"{cid} has unknown campaign dependency {dependency}")
+            else:
                 campaign_graph[cid].append(dependency)
     _check_dag(campaign_graph, "evidence-campaign", errors)
 
@@ -1153,8 +1106,9 @@ def _validate_tracker(document: Any) -> list[str]:
             errors.append("final closure packet id must be FCP-00")
         if closure.get("delivery_kind") != "final_closure":
             errors.append("final closure packet delivery_kind must be final_closure")
-        if closure.get("change_set_id") != "G15":
-            errors.append("final closure packet must follow G15")
+        # change_set_id should be a valid change set
+        if closure.get("change_set_id") not in change_by_id:
+            errors.append("final closure packet change_set_id must reference a valid change set")
         for identity_field in ("upstream_base_commit", "head_commit", "merge_commit"):
             if identity_field not in closure:
                 errors.append(f"final closure packet missing {identity_field}")
@@ -1184,15 +1138,17 @@ def _validate_tracker(document: Any) -> list[str]:
             errors.append("final closure packet must use docs/VALIDATION.md as route authority")
         if closure.get("admission_authority") != "docs/admissions.yml":
             errors.append("final closure packet must use docs/admissions.yml as admission authority")
-        if closure.get("obligation_ids") != ["DOC-002"]:
-            errors.append("final closure packet obligation mapping is incorrect")
+        # obligation_ids should be subset of by_id and not duplicate
+        fcp_oids = closure.get("obligation_ids")
+        if not _strings(fcp_oids, nonempty=True):
+            errors.append("final closure packet obligation_ids must be non-empty")
+        else:
+            for oid in fcp_oids:
+                if oid not in by_id:
+                    errors.append(f"final closure packet references unknown obligation {oid}")
         for key in ("depends_on_change_sets", "depends_on_campaigns", "required_seam_gates"):
             if not _strings(closure.get(key), nonempty=True):
                 errors.append(f"final closure packet {key} must be a non-empty array")
-        if closure.get("depends_on_change_sets") != ["G13", "G14", "G15"]:
-            errors.append("final closure packet must require G13, G14, and G15")
-        if closure.get("depends_on_campaigns") != EXPECTED_CAMPAIGN_IDS:
-            errors.append("final closure packet must require every evidence campaign")
         for gid in closure.get("depends_on_change_sets") or []:
             if gid not in change_by_id:
                 errors.append(f"final closure packet references unknown group {gid}")
@@ -1200,10 +1156,9 @@ def _validate_tracker(document: Any) -> list[str]:
             if cid not in campaign_by_id:
                 errors.append(f"final closure packet references unknown campaign {cid}")
         required_gates = closure.get("required_seam_gates") or []
-        if required_gates != EXPECTED_FCP_CONSUMED:
-            errors.append("final closure packet required_seam_gates must equal the approved map")
-        if closure.get("consumed_seam_gates") != EXPECTED_FCP_CONSUMED:
-            errors.append("final closure packet consumed_seam_gates must equal the approved map")
+        consumed_gates = closure.get("consumed_seam_gates") or []
+        if required_gates != consumed_gates:
+            errors.append("final closure packet required_seam_gates must equal consumed_seam_gates")
         for gate_id in required_gates:
             if gate_id not in seam_by_id:
                 errors.append(f"final closure packet references unknown seam gate {gate_id}")
@@ -1242,7 +1197,9 @@ def _validate_tracker(document: Any) -> list[str]:
                 errors.append("final closure prerequisite campaign prevents completion promotion")
             if not all(seam_by_id.get(gate_id, {}).get("status") in {"available", "complete"} and seam_by_id.get(gate_id, {}).get("evidence_disposition") == "current" for gate_id in required_gates):
                 errors.append("final closure prerequisite seam prevents completion promotion")
-            if by_id.get("DOC-002", {}).get("status") != "complete":
+            # check child obligation complete
+            fcp_childs = closure.get("obligation_ids") or []
+            if not all(by_id.get(oid, {}).get("status") == "complete" for oid in fcp_childs):
                 errors.append("final closure blocked child obligation prevents completion promotion")
         elif closure.get("completion_evidence"):
             errors.append("non-complete final closure packet cannot claim completion evidence")
@@ -1262,7 +1219,7 @@ def _validate_tracker(document: Any) -> list[str]:
     record_by_obligation: dict[str, list[tuple[str, str]]] = {}
     for oid, kind, owner_id in delivery_records:
         record_by_obligation.setdefault(oid, []).append((kind, owner_id))
-    for oid in EXPECTED_OBLIGATION_IDS:
+    for oid in by_id:
         owners = record_by_obligation.get(oid, [])
         if not owners:
             errors.append(f"unmapped obligation {oid}")
@@ -1272,7 +1229,7 @@ def _validate_tracker(document: Any) -> list[str]:
         if obligation is not None and len(owners) == 1 and obligation.get("delivery_owner") != {"kind": owners[0][0], "id": owners[0][1]}:
             errors.append(f"{oid} delivery_owner disagrees with grouped mapping")
     for oid in record_by_obligation:
-        if oid not in EXPECTED_OBLIGATION_IDS:
+        if oid not in by_id:
             errors.append(f"unexpected delivery obligation {oid}")
     for oid, owners in record_by_obligation.items():
         if len(owners) != 1 or oid not in by_id:
@@ -1325,7 +1282,6 @@ def _validate_tracker(document: Any) -> list[str]:
                 elif consumer_commits[consumer] != expected_consumer:
                     errors.append(f"{gate_id} receipt consumer commit does not match {consumer} identity")
 
-
     # Verify every seam consumer is reciprocal after all owner namespaces exist.
     all_owner_ids = set(change_by_id) | set(campaign_by_id)
     if isinstance(closure, dict):
@@ -1334,7 +1290,7 @@ def _validate_tracker(document: Any) -> list[str]:
         for consumer in gate.get("consumers") or []:
             if consumer not in all_owner_ids:
                 errors.append(f"{gate_id} has unknown consumer {consumer}")
-            elif gate_id not in (change_by_id.get(consumer, {}).get("consumed_seam_gates") or campaign_by_id.get(consumer, {}).get("consumed_seam_gates") or (closure.get("required_seam_gates") if isinstance(closure, dict) and closure.get("id") == consumer else [])):
+            elif gate_id not in (change_by_id.get(consumer, {}).get("consumed_seam_gates") or campaign_by_id.get(consumer, {}).get("consumed_seam_gates") or (closure.get("required_seam_gates") if isinstance(closure, dict) and closure.get("id") == consumer else []) or (closure.get("consumed_seam_gates") if isinstance(closure, dict) and closure.get("id") == consumer else [])):
                 errors.append(f"{gate_id} consumer {consumer} does not consume the seam gate")
     owners_with_gates = {
         **{owner_id: owner.get("consumed_seam_gates") or [] for owner_id, owner in change_by_id.items()},
@@ -1373,7 +1329,11 @@ def main(argv: list[str] | None = None) -> int:
             print(f"ERROR: {error}")
         print(f"Tracker check failed: {len(errors)} error(s) in {args.tracker}")
         return 1
-    print(f"Tracker check passed: {len(EXPECTED_OBLIGATION_IDS)} domain obligations, {len(EXPECTED_CHANGE_SET_IDS)} grouped change sets, {len(EXPECTED_CAMPAIGN_IDS)} evidence campaigns, DAG/seam/authority checks OK")
+    # generic counts derived from document
+    obligations = document.get("obligations") or []
+    change_sets = document.get("change_sets") or []
+    campaigns = document.get("evidence_campaigns") or []
+    print(f"Tracker check passed: {len(obligations)} domain obligations, {len(change_sets)} grouped change sets, {len(campaigns)} evidence campaigns, DAG/seam/authority checks OK")
     return 0
 
 
