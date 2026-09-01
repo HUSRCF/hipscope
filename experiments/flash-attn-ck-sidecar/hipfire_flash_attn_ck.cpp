@@ -632,7 +632,6 @@ int validate(const hipfire_flash_attn_ck_fwd_params* p, char* error, size_t erro
             if(p->batch != 1 || p->causal != 1 ||
                p->packed_k_head_stride_bytes != k_head_bytes ||
                p->packed_v_head_stride_bytes != v_head_bytes ||
-               p->packed_k_row_stride_bytes % static_cast<int64_t>(alignof(float)) != 0 ||
                p->packed_k_row_stride_bytes < static_cast<int64_t>(p->nhead_k) * k_head_bytes ||
                p->packed_v_row_stride_bytes < static_cast<int64_t>(p->nhead_k) * v_head_bytes)
             {
@@ -655,9 +654,10 @@ int validate(const hipfire_flash_attn_ck_fwd_params* p, char* error, size_t erro
                 set_error(error, error_capacity, "Asym3 V packed base pointer must be 2-byte aligned");
                 return 1;
             }
-            if(p->packed_k_head_stride_bytes % static_cast<int64_t>(alignof(float)) != 0 ||
-               p->packed_v_head_stride_bytes % static_cast<int64_t>(alignof(__half)) != 0 ||
-               p->packed_v_row_stride_bytes % static_cast<int64_t>(alignof(__half)) != 0)
+            if(p->packed_k_row_stride_bytes % static_cast<int64_t>(alignof(float)) != 0 ||
+               p->packed_k_head_stride_bytes % static_cast<int64_t>(alignof(float)) != 0 ||
+               p->packed_v_row_stride_bytes % static_cast<int64_t>(alignof(__half)) != 0 ||
+               p->packed_v_head_stride_bytes % static_cast<int64_t>(alignof(__half)) != 0)
             {
                 set_error(error, error_capacity, "Asym3 packed strides have insufficient alignment");
                 return 1;
@@ -694,7 +694,6 @@ int validate(const hipfire_flash_attn_ck_fwd_params* p, char* error, size_t erro
             if(p->batch != 1 || p->causal != 1 ||
                p->packed_k_head_stride_bytes != k_head_bytes ||
                p->packed_v_head_stride_bytes != v_head_bytes ||
-               p->packed_k_row_stride_bytes % static_cast<int64_t>(alignof(float)) != 0 ||
                p->packed_k_row_stride_bytes < static_cast<int64_t>(p->nhead_k) * k_head_bytes ||
                p->packed_v_row_stride_bytes < static_cast<int64_t>(p->nhead_k) * v_head_bytes)
             {
@@ -717,7 +716,8 @@ int validate(const hipfire_flash_attn_ck_fwd_params* p, char* error, size_t erro
                 set_error(error, error_capacity, "Asym4 V packed base pointer must be 2-byte aligned");
                 return 1;
             }
-            if(p->packed_k_head_stride_bytes % static_cast<int64_t>(alignof(float)) != 0 ||
+            if(p->packed_k_row_stride_bytes % static_cast<int64_t>(alignof(float)) != 0 ||
+               p->packed_k_head_stride_bytes % static_cast<int64_t>(alignof(float)) != 0 ||
                p->packed_v_row_stride_bytes % static_cast<int64_t>(alignof(__half)) != 0 ||
                p->packed_v_head_stride_bytes % static_cast<int64_t>(alignof(__half)) != 0)
             {
