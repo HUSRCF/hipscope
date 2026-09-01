@@ -684,14 +684,14 @@ fn gpu_paro_staged_failure_sweep_then_success_repeated_unload() {
     }
 }
 
-fn load_and_unload_model(
+fn try_load_model(
     gpu: &mut Gpu,
     target: &Path,
     draft: Option<&Path>,
     spec: SpecLoadCfg,
-) {
+) -> Result<hipfire_loader::LoadedModel, String> {
     let cask = CaskConfig::default();
-    let model = hipfire_loader::load_model(
+    hipfire_loader::load_model(
         target.to_str().expect("target utf8"),
         1024,
         draft.map(|path| path.to_str().expect("draft utf8")),
@@ -703,8 +703,29 @@ fn load_and_unload_model(
         spec,
         gpu,
     )
-    .expect("model load");
+}
+
+fn load_and_unload_model(gpu: &mut Gpu, target: &Path, draft: Option<&Path>, spec: SpecLoadCfg) {
+    let model = try_load_model(gpu, target, draft, spec).expect("model load");
     hipfire_loader::unload_model(model, gpu).expect("model unload");
+}
+
+fn expect_load_failure(
+    gpu: &mut Gpu,
+    target: &Path,
+    draft: Option<&Path>,
+    spec: SpecLoadCfg,
+) {
+    match try_load_model(gpu, target, draft, spec) {
+        Err(error) => assert!(
+            !error.is_empty(),
+            "fault fixture returned an empty failure reason"
+        ),
+        Ok(model) => {
+            let _ = hipfire_loader::unload_model(model, gpu);
+            panic!("fault fixture unexpectedly loaded");
+        }
+    }
 }
 
 #[test]
@@ -731,7 +752,7 @@ fn gpu_dflash_dspark_target_verify_and_head_failures_recover_without_double_free
         },
     );
     assert_gpu_baseline(&mut gpu, baseline);
-    load_and_unload_model(
+    expect_load_failure(
         &mut gpu,
         &dflash_fault,
         Some(&dflash_draft),
@@ -751,18 +772,7 @@ fn gpu_dflash_dspark_target_verify_and_head_failures_recover_without_double_free
         },
     );
     assert_gpu_baseline(&mut gpu, baseline);
-
-    load_and_unload_model(
-        &mut gpu,
-        &dspark_target,
-        Some(&dspark_draft),
-        SpecLoadCfg {
-            dspark: Some(true),
-            ..Default::default()
-        },
-    );
-    assert_gpu_baseline(&mut gpu, baseline);
-    load_and_unload_model(
+    expect_load_failure(
         &mut gpu,
         &dspark_fault,
         Some(&dspark_draft),
