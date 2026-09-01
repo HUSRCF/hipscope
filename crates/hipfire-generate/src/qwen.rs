@@ -3926,7 +3926,7 @@ fn qwen35_pp_rollback(
     asst_turn_cache: &mut AsstTurnCache,
     gpu: &mut rdna_compute::Gpu,
     mut bundle: Option<&mut hipfire_arch_qwen35::Qwen35Bundle>,
-    mut gpus: Option<&mut hipfire_runtime::multi_gpu::Gpus>,
+    mut gpus: Option<&mut hipfire_hardware::Gpus>,
     layer_owner_map: Option<&[u8]>,
 ) -> RollbackEpilogue {
     let mut target_reset = |_: &mut rdna_compute::Gpu| {

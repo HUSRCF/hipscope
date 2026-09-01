@@ -903,7 +903,7 @@ pub fn reset_qwen35_recurrent(
 /// here so PP rollback adapters cannot drift or duplicate the reset loops.
 pub fn reset_qwen35_recurrent_pp(
     bundle: &mut hipfire_arch_qwen35::Qwen35Bundle,
-    gpus: &mut hipfire_runtime::multi_gpu::Gpus,
+    gpus: &mut hipfire_hardware::Gpus,
     la: &[u8],
 ) -> Result<(), String> {
     let expected = bundle.dn_state.s_matrices.len();

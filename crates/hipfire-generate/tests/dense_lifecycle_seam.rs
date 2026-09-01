@@ -8,10 +8,12 @@
 #![allow(clippy::all)]
 
 use hipfire_engine::terminal::{
-    activate_terminal_control, apply_terminal_control, check_abort, clear_terminal_control,
-    BatchAttemptScope, claim_terminal,
+    activate_terminal_control, apply_terminal_control, check_abort, claim_terminal,
+    clear_terminal_control, BatchAttemptScope,
 };
-use hipfire_generate::common::{emit_fail_closed_error, emit_spec_cancel_after_rollback, RollbackEpilogue};
+use hipfire_generate::common::{
+    emit_fail_closed_error, emit_spec_cancel_after_rollback, RollbackEpilogue,
+};
 use hipfire_generate::dense::glimmer_commit_terminal;
 use std::sync::{Mutex, MutexGuard};
 
@@ -40,7 +42,10 @@ fn abort_during_prefill_is_exact_attempt_and_clears_via_rollback() {
     assert!(!check_abort(id));
     apply_terminal_control("abort", id, attempt);
     assert!(check_abort(id));
-    let ep = RollbackEpilogue { rolled_back: true, context: None };
+    let ep = RollbackEpilogue {
+        rolled_back: true,
+        context: None,
+    };
     let mut buf = Vec::new();
     emit_spec_cancel_after_rollback(&mut buf, id, 0, &ep);
     let lines = parse_lines(&buf);
@@ -64,7 +69,10 @@ fn abort_during_decode_emits_cancel_after_rollback() {
     activate_terminal_control(id, attempt);
     apply_terminal_control("abort", id, attempt);
     assert!(check_abort(id));
-    let ep = RollbackEpilogue { rolled_back: true, context: None };
+    let ep = RollbackEpilogue {
+        rolled_back: true,
+        context: None,
+    };
     let mut buf = Vec::new();
     emit_spec_cancel_after_rollback(&mut buf, id, 5, &ep);
     let lines = parse_lines(&buf);
@@ -95,11 +103,16 @@ fn handshake_abort_returns_false_and_caller_resets_before_cancel() {
     let lines = parse_lines(&buf);
     assert!(lines.iter().any(|v| v["type"] == "commit_ready"));
     assert!(!lines.iter().any(|v| v["type"] == "aborted"));
-    let ep = RollbackEpilogue { rolled_back: true, context: None };
+    let ep = RollbackEpilogue {
+        rolled_back: true,
+        context: None,
+    };
     emit_spec_cancel_after_rollback(&mut buf, id, 7, &ep);
     let lines2 = parse_lines(&buf);
     assert!(lines2.iter().any(|v| v["type"] == "aborted"));
-    assert!(lines2.iter().any(|v| v["type"] == "done" && v["finish_reason"] == "aborted"));
+    assert!(lines2
+        .iter()
+        .any(|v| v["type"] == "done" && v["finish_reason"] == "aborted"));
     clear_terminal_control();
 }
 
@@ -112,7 +125,10 @@ fn rollback_failure_ordering_emits_fail_closed_not_done() {
     let _scope = BatchAttemptScope::enter(attempt);
     activate_terminal_control(id, attempt);
     apply_terminal_control("abort", id, attempt);
-    let ep = RollbackEpilogue { rolled_back: false, context: Some("gpu sync failed: oom".into()) };
+    let ep = RollbackEpilogue {
+        rolled_back: false,
+        context: Some("gpu sync failed: oom".into()),
+    };
     let mut buf = Vec::new();
     emit_spec_cancel_after_rollback(&mut buf, id, 3, &ep);
     let lines = parse_lines(&buf);
@@ -132,14 +148,27 @@ fn glimmer_error_rollback_failure_surfaces_fail_closed() {
     let attempt = 88u64;
     let _scope = BatchAttemptScope::enter(attempt);
     activate_terminal_control(id, attempt);
-    let ep = RollbackEpilogue { rolled_back: false, context: Some("reset failed".into()) };
+    let ep = RollbackEpilogue {
+        rolled_back: false,
+        context: Some("reset failed".into()),
+    };
     let mut buf = Vec::new();
-    emit_fail_closed_error(&mut buf, Some(id), "muse_glimmer prefill failed: oom", "gpu", true, &ep);
+    emit_fail_closed_error(
+        &mut buf,
+        Some(id),
+        "muse_glimmer prefill failed: oom",
+        "gpu",
+        true,
+        &ep,
+    );
     let lines = parse_lines(&buf);
     assert_eq!(lines.len(), 1);
     assert_eq!(lines[0]["type"], "error");
     assert_eq!(lines[0]["rolled_back"], false);
-    assert!(lines[0]["message"].as_str().unwrap().contains("muse_glimmer prefill failed"));
+    assert!(lines[0]["message"]
+        .as_str()
+        .unwrap()
+        .contains("muse_glimmer prefill failed"));
     clear_terminal_control();
 }
 
