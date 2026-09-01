@@ -317,40 +317,21 @@ pub fn ep_serve_qwen35_dense_tp(
     }
 
     // This route replays the complete rendered conversation each request.
-    if let Some(EpState { gpus, inner }) = m.ep.as_mut() {
-        if let EpArch::Qwen35DenseTp { dn_states, .. } = inner {
-            for (rank, state) in dn_states.iter_mut().enumerate() {
-                let gpu = &mut gpus.devices[rank];
-                if let Err(e) = gpu.bind_thread() {
-                    emit_active_attempt_error(
-                        stdout,
-                        Some(id),
-                        &format!("dense TP bind_thread rank {rank}: {e:?}"),
-                        "validation",
-                        false,
-                        false,
-                    );
-                    let _ = stdout.flush();
-                    return;
-                }
-                if let Err(e) = state.reset(gpu) {
-                    emit_active_attempt_error(
-                        stdout,
-                        Some(id),
-                        &format!("dense TP state reset rank {rank}: {e:?}"),
-                        "validation",
-                        false,
-                        false,
-                    );
-                    let _ = stdout.flush();
-                    return;
-                }
-                gpu.invalidate_graph_state();
-            }
-        }
+    // Reset through the shared EP owner so rank visitation, host history,
+    // adaptive/spec scratch, graph invalidation, and synchronization cannot
+    // drift from the cancellation path.
+    let reset = ep_reset_after_abort(m);
+    if !reset.rolled_back {
+        emit_fail_closed_error(
+            stdout,
+            Some(id),
+            "dense TP turn reset failed before prefill",
+            "gpu",
+            true,
+            &reset,
+        );
+        return;
     }
-    m.seq_pos = 0;
-    m.conversation_tokens.clear();
     // `primed_think` preserves Jinja enable_thinking semantics (render ended on
     // an open `<think>` primer). Tool requests fail closed before this route.
     emit_gen_start(
@@ -725,25 +706,9 @@ pub fn ep_emit_abort(
     completion_tokens: usize,
 ) {
     let epilogue = ep_reset_after_abort(m);
-    if !epilogue.rolled_back {
-        emit_fail_closed_error(
-            stdout,
-            Some(id),
-            "client cancelled; fail-closed EP rollback could not be attested",
-            "validation",
-            false,
-            &epilogue,
-        );
-        return;
-    }
-    let attempt_id = active_attempt_id();
-    if !claim_terminal(id, attempt_id) {
-        return;
-    }
-    let (aborted, done) = ds4_ep_abort_wire_events(id, completion_tokens, attempt_id);
-    let _ = writeln!(stdout, "{}", aborted);
-    let _ = writeln!(stdout, "{}", done);
-    let _ = stdout.flush();
+    // The shared cancellation emitter claims the active attempt exactly once
+    // after the reset attestation; it is the sole writer of the aborted pair.
+    emit_spec_cancel_after_rollback(stdout, id, completion_tokens, &epilogue);
 }
 
 /// ds4 EP prefill + greedy decode.
@@ -786,31 +751,21 @@ pub fn ep_serve_ds4(
     }
 
     // ── Cross-conversation reset (FIX: ds4 EP turn-to-turn contamination) ──
-    // ds4 EP replays the full prompt from position 0 every turn (no LCP reuse —
-    // see the capacity-guard comment above), so a CONTINUING conversation
-    // re-prefills its whole history straight from the prompt; nothing in the EP
-    // state is reusable across turns, so we reset unconditionally here. This is
-    // the EP analogue of the single-GPU cache-miss reset in generate_deepseek4:
-    // `reset()` alone only rewinds n_tokens — the position-indexed decode caches
-    // (SWA ring, compressed/full KV, indexer scratch) retain the PRIOR turn's
-    // residue and bleed into the next conversation (observed: turn 2 echoing
-    // turn 1's answer) unless explicitly zeroed. Do it per rank on its own
-    // device. Without this, ep_serve_ds4 only ever reset on abort (and even that
-    // path, ep_reset_after_abort, omitted zero_decode_caches).
-    if let Some(ep) = m.ep.as_mut() {
-        let EpState { gpus, inner } = ep;
-        if let EpArch::Ds4 { state, .. } = inner {
-            for (rank, s) in state.iter_mut().enumerate() {
-                let g = &mut gpus.devices[rank];
-                let _ = g.bind_thread();
-                s.reset();
-                s.zero_decode_caches(g);
-                g.invalidate_graph_state();
-            }
-        }
+    // DS4 EP replays the full prompt from position 0 on every turn. Use the
+    // same total EP reset as cancellation so compressed/SWA/indexer caches,
+    // host history, graphs, and every rank's device are covered.
+    let reset = ep_reset_after_abort(m);
+    if !reset.rolled_back {
+        emit_fail_closed_error(
+            stdout,
+            Some(id),
+            "DS4 EP turn reset failed before prefill",
+            "gpu",
+            true,
+            &reset,
+        );
+        return;
     }
-    m.seq_pos = 0;
-    m.conversation_tokens.clear();
 
     let mut parser = match think_mode {
         ThinkMode::Low | ThinkMode::High | ThinkMode::Max => {

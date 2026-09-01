@@ -1472,27 +1472,47 @@ pub fn ds4_heterogeneous_client_abort(
 ) {
     *seq_pos = 0;
     conversation_tokens.clear();
-    let reset = model.reset_for_request_attested();
-    match reset {
-        Ok(()) => {
-            eprintln!(
-                "[req {id}] drafter=ar-heterogeneous abort=client rollback=attested post_join=true completion_tokens={completion_tokens}"
-            );
-            let (aborted, done) =
-                ds4_ep_abort_wire_events(id, completion_tokens, active_attempt_id());
-            let _ = writeln!(stdout, "{aborted}");
-            let _ = writeln!(stdout, "{done}");
-            let _ = stdout.flush();
-        }
-        Err(error) => emit_active_attempt_error(
-            stdout,
-            Some(id),
-            &format!("client cancelled; heterogeneous rollback failed: {error}"),
-            "runtime",
-            false,
-            false,
-        ),
+    let epilogue = match model.reset_for_request_attested() {
+        Ok(()) => RollbackEpilogue {
+            rolled_back: true,
+            context: None,
+        },
+        Err(error) => RollbackEpilogue {
+            rolled_back: false,
+            context: Some(format!("heterogeneous rollback failed: {error}")),
+        },
+    };
+    if epilogue.rolled_back {
+        eprintln!(
+            "[req {id}] drafter=ar-heterogeneous abort=client rollback=attested post_join=true completion_tokens={completion_tokens}"
+        );
     }
+    emit_spec_cancel_after_rollback(stdout, id, completion_tokens, &epilogue);
+}
+
+/// Reset a live family bundle through the shared lifecycle owner.  The
+/// architecture bundle is already borrowed by the caller, so host fields are
+/// supplied as disjoint references and the bundle reset is a thin adapter.
+fn reset_live_bundle(
+    bundle_reset: &mut dyn FnMut(&mut rdna_compute::Gpu) -> Result<(), String>,
+    seq_pos: &mut usize,
+    conversation_tokens: &mut Vec<u32>,
+    prefill_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    dflash_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    asst_turn_cache: &mut AsstTurnCache,
+    gpu: &mut rdna_compute::Gpu,
+) -> RollbackEpilogue {
+    production_fail_closed_rollback_live_with_extras(
+        seq_pos,
+        conversation_tokens,
+        prefill_checkpoints,
+        dflash_checkpoints,
+        asst_turn_cache,
+        gpu,
+        bundle_reset,
+        None,
+        ResetExtras::none(),
+    )
 }
 #[allow(clippy::too_many_arguments)]
 pub fn generate_deepseek4_heterogeneous(
@@ -2153,9 +2173,30 @@ pub fn generate_gemma4(
     if overflow {
         let (n, cap) = (bundle.state.n_tokens, bundle.state.max_seq);
         eprintln!("[daemon] arch_id=13 context full ({n}/{cap}) — resetting Gemma4State");
-        bundle.state.reset();
-        m.seq_pos = 0;
-        m.conversation_tokens.clear();
+        let mut reset_target = |_: &mut rdna_compute::Gpu| {
+            bundle.state.reset();
+            Ok(())
+        };
+        let ep = reset_live_bundle(
+            &mut reset_target,
+            &mut m.seq_pos,
+            &mut m.conversation_tokens,
+            &mut m.prefill_checkpoints,
+            &mut m.dflash_checkpoints,
+            &mut m.asst_turn_cache,
+            gpu,
+        );
+        if !ep.rolled_back {
+            emit_fail_closed_error(
+                stdout,
+                Some(id),
+                "Gemma4 context reset failed",
+                "gpu",
+                true,
+                &ep,
+            );
+            return;
+        }
     }
     // Hard refusal: even from a cold cache the prompt alone must fit (KV
     // writes at pos >= max_seq would be out of bounds).
@@ -4490,10 +4531,30 @@ pub fn generate_muse_glimmer(
     if overflow {
         let (n, cap) = (bundle.state.n_tokens, bundle.state.max_seq);
         eprintln!("[daemon] arch_id=14 context full ({n}/{cap}) — resetting GlimmerState");
-        bundle.reset_session_state();
-        m.seq_pos = 0;
-        m.conversation_tokens.clear();
-        m.asst_turn_cache.clear();
+        let mut reset_target = |_: &mut rdna_compute::Gpu| {
+            bundle.reset_session_state();
+            Ok(())
+        };
+        let ep = reset_live_bundle(
+            &mut reset_target,
+            &mut m.seq_pos,
+            &mut m.conversation_tokens,
+            &mut m.prefill_checkpoints,
+            &mut m.dflash_checkpoints,
+            &mut m.asst_turn_cache,
+            gpu,
+        );
+        if !ep.rolled_back {
+            emit_fail_closed_error(
+                stdout,
+                Some(id),
+                "Glimmer context reset failed",
+                "gpu",
+                true,
+                &ep,
+            );
+            return;
+        }
     }
     // Hard refusal: even from a cold cache the prompt alone must fit (KV
     // writes at pos >= max_seq would be out of bounds).
@@ -4527,10 +4588,19 @@ pub fn generate_muse_glimmer(
             // the CLI keeps the session warm. Cold-reset here or the opt-out
             // path becomes the very double-write the cache was added to avoid.
             if bundle.state.n_tokens > 0 || !m.conversation_tokens.is_empty() {
-                bundle.reset_session_state();
-                m.conversation_tokens.clear();
-                m.seq_pos = 0;
-                m.asst_turn_cache.clear();
+                let mut reset_target = |_: &mut rdna_compute::Gpu| {
+                    bundle.reset_session_state();
+                    Ok(())
+                };
+                let _ = reset_live_bundle(
+                    &mut reset_target,
+                    &mut m.seq_pos,
+                    &mut m.conversation_tokens,
+                    &mut m.prefill_checkpoints,
+                    &mut m.dflash_checkpoints,
+                    &mut m.asst_turn_cache,
+                    gpu,
+                );
             }
             (prompt_ids.clone(), 0u32)
         } else {
@@ -4574,10 +4644,30 @@ pub fn generate_muse_glimmer(
                             "[glimmer-cache] rewind_session_to({lcp}) failed: {e} — converting to MISS"
                         );
                     }
-                    bundle.reset_session_state();
-                    m.conversation_tokens.clear();
-                    m.seq_pos = 0;
-                    m.asst_turn_cache.clear();
+                    let mut reset_target = |_: &mut rdna_compute::Gpu| {
+                        bundle.reset_session_state();
+                        Ok(())
+                    };
+                    let ep = reset_live_bundle(
+                        &mut reset_target,
+                        &mut m.seq_pos,
+                        &mut m.conversation_tokens,
+                        &mut m.prefill_checkpoints,
+                        &mut m.dflash_checkpoints,
+                        &mut m.asst_turn_cache,
+                        gpu,
+                    );
+                    if !ep.rolled_back {
+                        emit_fail_closed_error(
+                            stdout,
+                            Some(id),
+                            &format!("Glimmer prompt-cache rewind reset failed: {e}"),
+                            "gpu",
+                            true,
+                            &ep,
+                        );
+                        return;
+                    }
                     (prompt_ids.clone(), 0u32)
                 } else {
                     m.conversation_tokens.truncate(lcp);
@@ -4589,10 +4679,30 @@ pub fn generate_muse_glimmer(
                 // lcp == 0 (fully divergent) and lcp == prompt_ids.len()
                 // (identical prompt re-sent), plus candidate rejected by capture.
                 if bundle.state.n_tokens > 0 || prior_len > 0 {
-                    bundle.reset_session_state();
-                    m.conversation_tokens.clear();
-                    m.seq_pos = 0;
-                    m.asst_turn_cache.clear();
+                    let mut reset_target = |_: &mut rdna_compute::Gpu| {
+                        bundle.reset_session_state();
+                        Ok(())
+                    };
+                    let ep = reset_live_bundle(
+                        &mut reset_target,
+                        &mut m.seq_pos,
+                        &mut m.conversation_tokens,
+                        &mut m.prefill_checkpoints,
+                        &mut m.dflash_checkpoints,
+                        &mut m.asst_turn_cache,
+                        gpu,
+                    );
+                    if !ep.rolled_back {
+                        emit_fail_closed_error(
+                            stdout,
+                            Some(id),
+                            "Glimmer prompt-cache miss reset failed",
+                            "gpu",
+                            true,
+                            &ep,
+                        );
+                        return;
+                    }
                 }
                 (prompt_ids.clone(), 0u32)
             }
@@ -6165,9 +6275,18 @@ pub fn generate_lfm2moe(
     // prompt each turn; it now does so from position 0 with no stale KV. A
     // continuing conversation re-prefills its whole history from the prompt, so
     // multi-turn is preserved (validated: Bjorn/axolotl recall).
-    let _ = m.lfm2moe_mut().unwrap().state.reset(gpu);
-    m.seq_pos = 0;
-    m.conversation_tokens.clear();
+    let ep = production_fail_closed_rollback(m, gpu, None, None);
+    if !ep.rolled_back {
+        emit_fail_closed_error(
+            stdout,
+            Some(id),
+            "LFM2 session reset failed before prefill",
+            "gpu",
+            true,
+            &ep,
+        );
+        return;
+    }
 
     let t0 = Instant::now();
 
@@ -6502,9 +6621,18 @@ pub fn generate_minimax(
             (state.n_tokens, state.max_seq)
         };
         eprintln!("[daemon] arch_id=10 context full ({n}/{cap}) — resetting MiniMaxState",);
-        m.minimax_mut().unwrap().state.reset();
-        m.seq_pos = 0;
-        m.conversation_tokens.clear();
+        let ep = production_fail_closed_rollback(m, gpu, None, None);
+        if !ep.rolled_back {
+            emit_fail_closed_error(
+                stdout,
+                Some(id),
+                "MiniMax context reset failed",
+                "gpu",
+                true,
+                &ep,
+            );
+            return;
+        }
 
         // O2b-2 capacity guard (minimax single): the reset above recovers a
         // grown multi-turn conversation, but a SINGLE prompt larger than the
@@ -6577,9 +6705,18 @@ pub fn generate_minimax(
                 prompt_ids[lcp..].to_vec()
             } else {
                 if prior_len > 0 {
-                    m.minimax_mut().unwrap().state.reset();
-                    m.seq_pos = 0;
-                    m.conversation_tokens.clear();
+                    let ep = production_fail_closed_rollback(m, gpu, None, None);
+                    if !ep.rolled_back {
+                        emit_fail_closed_error(
+                            stdout,
+                            Some(id),
+                            "MiniMax prompt-cache reset failed",
+                            "gpu",
+                            true,
+                            &ep,
+                        );
+                        return;
+                    }
                 }
                 prompt_ids.clone()
             }
@@ -6946,18 +7083,30 @@ pub fn generate_cohere2moe(
             prompt_ids.len(),
             max_seq,
         );
-        emit_error_with_id(
-            stdout,
-            id,
-            format!(
-                "cohere2moe: prompt is {} tokens but KV capacity (max_seq) is {} — load with a larger max_seq or shorten the prompt",
-                prompt_ids.len(),
-                max_seq
-            ),
-        );
-        let _ = m.cohere2moe_mut().unwrap().state.reset(gpu);
-        m.seq_pos = 0;
-        m.conversation_tokens.clear();
+        let ep = production_fail_closed_rollback(m, gpu, None, None);
+        if !ep.rolled_back {
+            emit_fail_closed_error(
+                stdout,
+                Some(id),
+                "Cohere2-MoE prompt reset failed",
+                "gpu",
+                true,
+                &ep,
+            );
+        } else {
+            emit_active_attempt_error(
+                stdout,
+                Some(id),
+                &format!(
+                    "cohere2moe: prompt is {} tokens but KV capacity (max_seq) is {} — load with a larger max_seq or shorten the prompt",
+                    prompt_ids.len(),
+                    max_seq
+                ),
+                "context_length",
+                false,
+                true,
+            );
+        }
         return;
     }
     // Cap generation so prefill(prompt) + decode(max_tokens) never exceeds the
@@ -6985,7 +7134,11 @@ pub fn generate_cohere2moe(
         if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
             eprintln!(
                 "[cohere2moe-cache] prior_len={} rendered_len={} lcp={} hit={} partial={} n_tokens={}",
-                prior_len, prompt_ids.len(), lcp, cache_hit, cache_hit && partial,
+                prior_len,
+                prompt_ids.len(),
+                lcp,
+                cache_hit,
+                cache_hit && partial,
                 m.cohere2moe().unwrap().state.n_tokens,
             );
         }
@@ -7001,9 +7154,18 @@ pub fn generate_cohere2moe(
             prompt_ids[lcp..].to_vec()
         } else {
             if prior_len > 0 {
-                let _ = m.cohere2moe_mut().unwrap().state.reset(gpu);
-                m.seq_pos = 0;
-                m.conversation_tokens.clear();
+                let ep = production_fail_closed_rollback(m, gpu, None, None);
+                if !ep.rolled_back {
+                    emit_fail_closed_error(
+                        stdout,
+                        Some(id),
+                        "Cohere2-MoE prompt-cache reset failed",
+                        "gpu",
+                        true,
+                        &ep,
+                    );
+                    return;
+                }
             }
             prompt_ids.clone()
         }

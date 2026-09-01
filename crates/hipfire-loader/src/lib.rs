@@ -562,6 +562,11 @@ impl hipfire_runtime::arch_model::ArchModel for Gemma4LoweredBundle {
         // one, so expose neither rather than silently picking.
         None
     }
+    fn reset_session_state(&mut self, _gpu: &mut rdna_compute::Gpu) -> Result<(), String> {
+        self.kv_sliding.compact_offset = 0;
+        self.kv_full.compact_offset = 0;
+        Ok(())
+    }
     fn free_gpu(self: Box<Self>, gpu: &mut rdna_compute::Gpu) {
         let b = *self;
         b.scratch.free_gpu(gpu);
@@ -908,6 +913,8 @@ pub struct LoadedModel {
     // Shared
     pub tokenizer: Option<hipfire_runtime::tokenizer::Tokenizer>,
     pub seq_pos: usize,
+    pub max_seq: usize,
+    pub physical_cap: usize,
     /// Persistent model-owned eviction policy and GPU scratch. Reset/abort
     /// paths deliberately retain this object so its configured budget,
     /// centers, and activation gate survive across turns. Its eviction counter
@@ -1213,6 +1220,203 @@ impl LoadedModel {
             .as_deref_mut()
             .map(|b| b as &mut dyn hipfire_runtime::arch_model::ArchModel)
     }
+
+    /// Reset the architecture-owned session surfaces through the loader's
+    /// lifecycle boundary.  Generation code may add host/checkpoint/spec
+    /// adapters around this method, but it must not dispatch directly to a
+    /// concrete bundle for a total reset.
+    pub fn reset_architecture_state(&mut self, gpu: &mut Gpu) -> Result<(), String> {
+        let Some(model) = self.as_arch_model_mut() else {
+            return Err("model state is missing".to_string());
+        };
+        let key = model.arch_key();
+        if !hipfire_runtime::reset_core::has_reset_coverage(key) {
+            return Err(format!("missing reset-core coverage for arch_key={key}"));
+        }
+        model.reset_session_state(gpu)
+    }
+
+    /// Reset all request-owned state for an EP model using its rank-owned
+    /// devices.  This is kept separate from [`Self::reset_context`] because
+    /// EP owns its `Gpu` collection inside `EpState`.
+    pub fn reset_ep_context(&mut self) -> Result<(), String> {
+        let mut errors = Vec::new();
+        self.seq_pos = 0;
+        self.conversation_tokens.clear();
+        self.asst_turn_cache.clear();
+        let Some(ep) = self.ep.as_mut() else {
+            return Err("model has no EP owner".to_string());
+        };
+        if let Some(owner) = ep.gpus.devices.first_mut() {
+            for (_, snapshot) in self.prefill_checkpoints.drain(..) {
+                snapshot.free_gpu(owner);
+            }
+            for (_, snapshot) in self.dflash_checkpoints.drain(..) {
+                snapshot.free_gpu(owner);
+            }
+        } else {
+            self.prefill_checkpoints.clear();
+            self.dflash_checkpoints.clear();
+            errors.push("EP reset has no device for checkpoint ownership".to_string());
+        }
+        reset_ep_architecture_state(ep, &mut errors);
+        if let Some(owner) = ep.gpus.devices.first_mut() {
+            if let Some(spec) = self.speculator.as_mut() {
+                if let Err(error) = spec.reset(owner) {
+                    errors.push(format!("EP spec.reset: {error}"));
+                }
+            }
+        }
+        for (rank, device) in ep.gpus.devices.iter_mut().enumerate() {
+            device.invalidate_graph_state();
+            device.replay.invalidate_replay_observation_window();
+            if let Err(error) = device.bind_thread() {
+                errors.push(format!("EP rank{rank} bind_thread: {error}"));
+                continue;
+            }
+            if let Err(error) = device.hip.device_synchronize() {
+                errors.push(format!("EP rank{rank} device_synchronize: {error}"));
+            } else {
+                device.replay.begin_replay_observation_window();
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
+    }
+
+    /// Reset every model-owned request surface before a new turn or after a
+    /// failed attempt.  This is the loader lifecycle boundary: generation
+    /// adapters only supply the device on which a single-GPU model runs and
+    /// never reimplement host/spec/adaptive/batch/graph cleanup.
+    pub fn reset_context(&mut self, gpu: &mut Gpu) -> Result<(), String> {
+        let mut errors: Vec<String> = Vec::new();
+        self.seq_pos = 0;
+        self.conversation_tokens.clear();
+        self.asst_turn_cache.clear();
+
+        // Checkpoint snapshots are request-owned GPU resources.  EP uses its
+        // first rank as the snapshot owner; single/PP routes use the caller's
+        // device (PP snapshots are empty in production).
+        if let Some(ep) = self.ep.as_mut() {
+            if let Some(owner) = ep.gpus.devices.first_mut() {
+                for (_, snapshot) in self.prefill_checkpoints.drain(..) {
+                    snapshot.free_gpu(owner);
+                }
+                for (_, snapshot) in self.dflash_checkpoints.drain(..) {
+                    snapshot.free_gpu(owner);
+                }
+            } else {
+                self.prefill_checkpoints.clear();
+                self.dflash_checkpoints.clear();
+                errors.push("EP reset has no device for checkpoint ownership".to_string());
+            }
+        } else {
+            for (_, snapshot) in self.prefill_checkpoints.drain(..) {
+                snapshot.free_gpu(gpu);
+            }
+            for (_, snapshot) in self.dflash_checkpoints.drain(..) {
+                snapshot.free_gpu(gpu);
+            }
+        }
+
+        if let Some(ep) = self.ep.as_mut() {
+            reset_ep_architecture_state(ep, &mut errors);
+            if let Some(owner) = ep.gpus.devices.first_mut() {
+                if let Some(spec) = self.speculator.as_mut() {
+                    if let Err(error) = spec.reset(owner) {
+                        errors.push(format!("EP spec.reset: {error}"));
+                    }
+                }
+            }
+            for (rank, device) in ep.gpus.devices.iter_mut().enumerate() {
+                device.invalidate_graph_state();
+                device.replay.invalidate_replay_observation_window();
+                if let Err(error) = device.bind_thread() {
+                    errors.push(format!("EP rank{rank} bind_thread: {error}"));
+                    continue;
+                }
+                if let Err(error) = device.hip.device_synchronize() {
+                    errors.push(format!("EP rank{rank} device_synchronize: {error}"));
+                } else {
+                    device.replay.begin_replay_observation_window();
+                }
+            }
+            return if errors.is_empty() {
+                Ok(())
+            } else {
+                Err(errors.join("; "))
+            };
+        }
+
+        if self.pp > 1 {
+            // Pipeline-parallel Qwen state is distributed by layer ownership;
+            // the generation adapter performs that exhaustive per-device
+            // reset.  Keep this method fail-closed rather than touching only
+            // the caller's first device.
+            errors.push("pipeline reset requires the PP lifecycle adapter".to_string());
+        } else if let Err(error) = self.reset_architecture_state(gpu) {
+            errors.push(format!("architecture reset: {error}"));
+        }
+
+        // Adaptive tier state is request-local.  The policy/floor and sticky
+        // poison remain model-owned; reset_with_cache restores the cache mode
+        // flags and closes any in-flight eviction handoff.
+        {
+            let state = &mut self.state;
+            if let Some(adaptive) = self.kv_adaptive.as_mut() {
+                if let Some(kv) = state.as_deref_mut().and_then(|model| model.kv_cache_mut()) {
+                    adaptive.reset_with_cache(gpu, kv);
+                } else {
+                    adaptive.reset();
+                }
+            }
+        }
+
+        if self.pp <= 1 {
+            let state = &mut self.state;
+            if let Some(bundle) = state.as_deref_mut().and_then(|model| {
+                (model as &mut dyn Any)
+                    .downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
+            }) {
+                if let Some(batch) = bundle.qwen35_decode_batch.as_mut() {
+                    if let Err(error) = batch.reset(gpu) {
+                        errors.push(format!("qwen35_decode_batch.reset: {error}"));
+                    }
+                }
+            }
+            if let Some(bundle) = state.as_deref_mut().and_then(|model| {
+                (model as &mut dyn Any)
+                    .downcast_mut::<hipfire_arch_lfm2moe::Lfm2MoeBundle>()
+            }) {
+                if let Some(batch) = bundle.lfm2_decode_batch.as_mut() {
+                    if let Err(error) = batch.reset(gpu) {
+                        errors.push(format!("lfm2_decode_batch.reset: {error}"));
+                    }
+                }
+            }
+        }
+
+        if let Some(spec) = self.speculator.as_mut() {
+            if let Err(error) = spec.reset(gpu) {
+                errors.push(format!("spec.reset: {error}"));
+            }
+        }
+        gpu.invalidate_graph_state();
+        gpu.replay.invalidate_replay_observation_window();
+        if let Err(error) = gpu.hip.device_synchronize() {
+            errors.push(format!("device_synchronize: {error}"));
+        } else {
+            gpu.replay.begin_replay_observation_window();
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
+    }
     /// pp>1 skeleton — sets the load-bearing multi-GPU fields together so
     /// they cannot be set piecemeal (`pp_gpus`/`pp_dn_la_to_device` are
     /// `.expect()`ed in unload). The per-device `Qwen35ScratchSet` that was
@@ -1245,6 +1449,87 @@ impl LoadedModel {
                 model_path,
                 chat_template,
             )
+        }
+    }
+}
+
+fn reset_ep_architecture_state(ep: &mut EpState, errors: &mut Vec<String>) {
+    let device_len = ep.gpus.devices.len();
+    match &mut ep.inner {
+        EpArch::Ds4 { state, .. } => {
+            if state.len() != device_len {
+                errors.push(format!(
+                    "EP ds4 state/device cardinality mismatch: {} != {device_len}",
+                    state.len()
+                ));
+            } else {
+                for rank in 0..device_len {
+                    let gpu = &mut ep.gpus.devices[rank];
+                    if let Err(error) = gpu.bind_thread() {
+                        errors.push(format!("EP ds4 rank{rank} bind_thread: {error}"));
+                        continue;
+                    }
+                    state[rank].reset();
+                    state[rank].zero_decode_caches(gpu);
+                    gpu.invalidate_graph_state();
+                }
+            }
+        }
+        EpArch::Minimax { state, .. } => {
+            if state.len() != device_len {
+                errors.push(format!(
+                    "EP MiniMax state/device cardinality mismatch: {} != {device_len}",
+                    state.len()
+                ));
+            } else {
+                for rank in 0..device_len {
+                    let gpu = &mut ep.gpus.devices[rank];
+                    if let Err(error) = gpu.bind_thread() {
+                        errors.push(format!("EP MiniMax rank{rank} bind_thread: {error}"));
+                        continue;
+                    }
+                    state[rank].reset();
+                    gpu.invalidate_graph_state();
+                }
+            }
+        }
+        EpArch::Qwen35 { batch, .. } => {
+            if let Some(batch) = batch.as_mut() {
+                if let Err(error) = batch.reset_all(&mut ep.gpus) {
+                    errors.push(format!("EP Qwen35 batch reset_all: {error}"));
+                }
+            }
+            for gpu in &mut ep.gpus.devices {
+                gpu.invalidate_graph_state();
+            }
+        }
+        EpArch::Qwen35DenseTp {
+            kv_caches,
+            dn_states,
+            ..
+        } => {
+            if kv_caches.len() != device_len || dn_states.len() != device_len {
+                errors.push(format!(
+                    "EP dense Qwen TP state/device cardinality mismatch: kv={} dn={} devices={device_len}",
+                    kv_caches.len(),
+                    dn_states.len()
+                ));
+            } else {
+                for rank in 0..device_len {
+                    let gpu = &mut ep.gpus.devices[rank];
+                    if let Err(error) = gpu.bind_thread() {
+                        errors.push(format!("EP dense Qwen rank{rank} bind_thread: {error}"));
+                        continue;
+                    }
+                    if let Err(error) = kv_caches[rank].clear_gpu(gpu) {
+                        errors.push(format!("EP dense Qwen rank{rank} KV reset: {error}"));
+                    }
+                    if let Err(error) = dn_states[rank].reset(gpu) {
+                        errors.push(format!("EP dense Qwen rank{rank} state reset: {error}"));
+                    }
+                    gpu.invalidate_graph_state();
+                }
+            }
         }
     }
 }

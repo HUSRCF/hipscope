@@ -230,6 +230,32 @@ pub struct RollbackEpilogue {
     /// Present when `rolled_back` is false (sync/reset could not be attested).
     pub context: Option<String>,
 }
+/// Request-local reset adapters supplied by a family path that already holds
+/// disjoint architecture borrows.  The production owner invokes every
+/// supplied adapter before attesting the rollback; model policy objects (in
+/// particular [`LoadedModel::eviction`]) are intentionally not reset here.
+pub struct ResetExtras<'a> {
+    /// Restore adaptive-KV controller and any cache mode flags owned by the
+    /// caller's target borrow.  A poisoned controller may keep its poison.
+    pub adaptive: Option<&'a mut dyn FnMut(&mut rdna_compute::Gpu) -> Result<(), String>>,
+    /// Clear architecture batch scratch when it is not part of target_reset.
+    pub batch: Option<&'a mut dyn FnMut(&mut rdna_compute::Gpu) -> Result<(), String>>,
+    /// Clear request-local eviction bookkeeping.  The persistent eviction
+    /// policy/scratch owner is never replaced or reset by this hook.
+    pub eviction: Option<&'a mut dyn FnMut(&mut rdna_compute::Gpu) -> Result<(), String>>,
+}
+
+impl<'a> ResetExtras<'a> {
+    #[inline]
+    pub fn none() -> Self {
+        Self {
+            adaptive: None,
+            batch: None,
+            eviction: None,
+        }
+    }
+}
+
 
 /// Reset all state owned by an expert-parallel model.
 ///
@@ -237,170 +263,18 @@ pub struct RollbackEpilogue {
 /// single-device `ArchModel` hook. This is the one EP adapter used by both the
 /// generic rollback entry point and the EP cancellation wrapper; every rank is
 /// visited, invalidated, and synchronized even after an earlier rank fails.
+/// EP reset adapter.  The complete model-owned reset lives on
+/// [`LoadedModel::reset_context`]; generation only translates its result into
+/// the shared rollback attestation type.
 pub fn ep_reset_after_abort(m: &mut LoadedModel) -> RollbackEpilogue {
-    let mut first_err: Option<String> = None;
-
-    if let Some(ep) = m.ep.as_mut() {
-        let device_len = ep.gpus.devices.len();
-        match &mut ep.inner {
-            EpArch::Ds4 { state, .. } => {
-                if state.len() != device_len {
-                    push_reset_err(
-                        &mut first_err,
-                        "ep ds4 layout",
-                        format!("state/device cardinality mismatch: {} != {device_len}", state.len()),
-                    );
-                } else {
-                    for rank in 0..state.len() {
-                        let gpu = &mut ep.gpus.devices[rank];
-                        if let Err(error) = gpu.bind_thread() {
-                            push_reset_err(&mut first_err, &format!("ep rank{rank} bind_thread"), error);
-                            continue;
-                        }
-                        state[rank].reset();
-                        state[rank].zero_decode_caches(gpu);
-                        gpu.invalidate_graph_state();
-                    }
-                }
-            }
-            EpArch::Minimax { state, .. } => {
-                if state.len() != device_len {
-                    push_reset_err(
-                        &mut first_err,
-                        "ep minimax layout",
-                        format!("state/device cardinality mismatch: {} != {device_len}", state.len()),
-                    );
-                } else {
-                    for rank in 0..state.len() {
-                        let gpu = &mut ep.gpus.devices[rank];
-                        if let Err(error) = gpu.bind_thread() {
-                            push_reset_err(&mut first_err, &format!("ep rank{rank} bind_thread"), error);
-                            continue;
-                        }
-                        state[rank].reset();
-                        gpu.invalidate_graph_state();
-                    }
-                }
-            }
-            EpArch::Qwen35 { batch, .. } => {
-                if let Some(batch) = batch.as_mut() {
-                    if let Err(error) = batch.reset_all(&mut ep.gpus) {
-                        push_reset_err(&mut first_err, "qwen35 EP batch reset_all", error);
-                    }
-                }
-                for gpu in &mut ep.gpus.devices {
-                    gpu.invalidate_graph_state();
-                }
-            }
-            EpArch::Qwen35DenseTp {
-                kv_caches,
-                dn_states,
-                ..
-            } => {
-                if kv_caches.len() != device_len || dn_states.len() != device_len {
-                    push_reset_err(
-                        &mut first_err,
-                        "qwen35 dense TP layout",
-                        format!(
-                            "state/device cardinality mismatch: kv={} dn={} devices={device_len}",
-                            kv_caches.len(),
-                            dn_states.len()
-                        ),
-                    );
-                } else {
-                    for rank in 0..device_len {
-                        let gpu = &mut ep.gpus.devices[rank];
-                        if let Err(error) = gpu.bind_thread() {
-                            push_reset_err(
-                                &mut first_err,
-                                &format!("dense qwen TP rank{rank} bind_thread"),
-                                error,
-                            );
-                            continue;
-                        }
-                        if let Err(error) = kv_caches[rank].clear_gpu(gpu) {
-                            push_reset_err(
-                                &mut first_err,
-                                &format!("dense qwen TP rank{rank} KV reset"),
-                                error,
-                            );
-                        }
-                        if let Err(error) = dn_states[rank].reset(gpu) {
-                            push_reset_err(
-                                &mut first_err,
-                                &format!("dense qwen TP rank{rank} state reset"),
-                                error,
-                            );
-                        }
-                        gpu.invalidate_graph_state();
-                    }
-                }
-            }
-        }
-
-        // Checkpoint snapshots are request-owned even on EP. They are normally
-        // empty, but drain them explicitly before the model can be reused.
-        if let Some(gpu) = ep.gpus.devices.first_mut() {
-            for (_, snapshot) in m.prefill_checkpoints.drain(..) {
-                snapshot.free_gpu(gpu);
-            }
-            for (_, snapshot) in m.dflash_checkpoints.drain(..) {
-                snapshot.free_gpu(gpu);
-            }
-        } else {
-            push_reset_err(&mut first_err, "ep reset", "no EP devices");
-            m.prefill_checkpoints.clear();
-            m.dflash_checkpoints.clear();
-        }
-
-        for (rank, gpu) in ep.gpus.devices.iter_mut().enumerate() {
-            if let Err(error) = gpu.bind_thread() {
-                push_reset_err(
-                    &mut first_err,
-                    &format!("ep rank{rank} sync bind_thread"),
-                    error,
-                );
-            }
-            gpu.invalidate_graph_state();
-            gpu.replay.invalidate_replay_observation_window();
-            if let Err(error) = gpu.hip.device_synchronize() {
-                push_reset_err(
-                    &mut first_err,
-                    &format!("ep rank{rank} device_synchronize"),
-                    error,
-                );
-            } else {
-                gpu.replay.begin_replay_observation_window();
-            }
-        }
-    } else {
-        push_reset_err(&mut first_err, "ep reset", "model has no EP owner");
-    }
-
-    m.seq_pos = 0;
-    m.conversation_tokens.clear();
-    m.asst_turn_cache.clear();
-
-    // EP routes do not normally carry a speculator, but if one is attached
-    // its first rank remains the sole device owner for this reset.
-    if let Some(speculator) = m.speculator.as_mut() {
-        if let Some(ep) = m.ep.as_mut() {
-            if let Some(gpu) = ep.gpus.devices.first_mut() {
-                if let Err(error) = speculator.reset(gpu) {
-                    push_reset_err(&mut first_err, "ep spec.reset", error);
-                }
-            }
-        }
-    }
-
-    match first_err {
-        Some(context) => RollbackEpilogue {
-            rolled_back: false,
-            context: Some(context),
-        },
-        None => RollbackEpilogue {
+    match m.reset_ep_context() {
+        Ok(()) => RollbackEpilogue {
             rolled_back: true,
             context: None,
+        },
+        Err(context) => RollbackEpilogue {
+            rolled_back: false,
+            context: Some(context),
         },
     }
 }
@@ -426,11 +300,20 @@ pub fn production_fail_closed_rollback(
     slot: Option<&mut dyn SpecTarget>,
     spec: Option<&mut dyn Speculator>,
 ) -> RollbackEpilogue {
-    // EP owns its physical devices inside `LoadedModel`; use the same
-    // exhaustive EP adapter as the cancellation path instead of attempting
-    // to reset only the daemon's single-device handle.
     if m.ep.is_some() {
         return ep_reset_after_abort(m);
+    }
+    if slot.is_none() && spec.is_none() && m.pp <= 1 {
+        return match m.reset_context(gpu) {
+            Ok(()) => RollbackEpilogue {
+                rolled_back: true,
+                context: None,
+            },
+            Err(context) => RollbackEpilogue {
+                rolled_back: false,
+                context: Some(context),
+            },
+        };
     }
     m.seq_pos = 0;
     m.conversation_tokens.clear();
@@ -451,7 +334,7 @@ pub fn production_fail_closed_rollback_live(
     spec: &mut dyn Speculator,
 ) -> RollbackEpilogue {
     let mut reset_target = |gpu: &mut rdna_compute::Gpu| slot.reset_recurrent(gpu);
-    production_fail_closed_rollback_live_with_target(
+    production_fail_closed_rollback_live_with_extras(
         seq_pos,
         conversation_tokens,
         prefill_checkpoints,
@@ -460,12 +343,13 @@ pub fn production_fail_closed_rollback_live(
         gpu,
         &mut reset_target,
         Some(spec),
+        ResetExtras::none(),
     )
 }
 
-/// Total live-reset algorithm. Callers that hold disjoint architecture
-/// borrows provide a thin `target_reset` adapter; every host/checkpoint/spec/
-/// graph/synchronization step remains centralized here.
+/// Backward-compatible live adapter for callers that provide a target reset
+/// closure. New callers that hold adaptive/batch/eviction request state should
+/// use [`production_fail_closed_rollback_live_with_extras`].
 pub fn production_fail_closed_rollback_live_with_target(
     seq_pos: &mut usize,
     conversation_tokens: &mut Vec<u32>,
@@ -475,6 +359,34 @@ pub fn production_fail_closed_rollback_live_with_target(
     gpu: &mut rdna_compute::Gpu,
     target_reset: &mut dyn FnMut(&mut rdna_compute::Gpu) -> Result<(), String>,
     spec: Option<&mut dyn Speculator>,
+) -> RollbackEpilogue {
+    production_fail_closed_rollback_live_with_extras(
+        seq_pos,
+        conversation_tokens,
+        prefill_checkpoints,
+        dflash_checkpoints,
+        asst_turn_cache,
+        gpu,
+        target_reset,
+        spec,
+        ResetExtras::none(),
+    )
+}
+
+/// Total live-reset algorithm. Callers that hold disjoint architecture
+/// borrows provide a thin `target_reset` adapter and optional request-local
+/// extras; every host/checkpoint/spec/graph/synchronization step remains
+/// centralized here.
+pub fn production_fail_closed_rollback_live_with_extras(
+    seq_pos: &mut usize,
+    conversation_tokens: &mut Vec<u32>,
+    prefill_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    dflash_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    asst_turn_cache: &mut hipfire_loader::AsstTurnCache,
+    gpu: &mut rdna_compute::Gpu,
+    target_reset: &mut dyn FnMut(&mut rdna_compute::Gpu) -> Result<(), String>,
+    mut spec: Option<&mut dyn Speculator>,
+    mut extras: ResetExtras<'_>,
 ) -> RollbackEpilogue {
     *seq_pos = 0;
     conversation_tokens.clear();
@@ -486,7 +398,22 @@ pub fn production_fail_closed_rollback_live_with_target(
     if let Err(e) = target_reset(gpu) {
         push_reset_err(&mut first_err, "reset_recurrent", e);
     }
-    if let Some(spec) = spec {
+    if let Some(reset) = extras.adaptive.as_mut() {
+        if let Err(e) = reset(gpu) {
+            push_reset_err(&mut first_err, "adaptive.reset", e);
+        }
+    }
+    if let Some(reset) = extras.batch.as_mut() {
+        if let Err(e) = reset(gpu) {
+            push_reset_err(&mut first_err, "batch.reset", e);
+        }
+    }
+    if let Some(reset) = extras.eviction.as_mut() {
+        if let Err(e) = reset(gpu) {
+            push_reset_err(&mut first_err, "eviction.request_reset", e);
+        }
+    }
+    if let Some(spec) = spec.as_deref_mut() {
         if let Err(e) = spec.reset(gpu) {
             push_reset_err(&mut first_err, "spec.reset", e);
         }
@@ -502,6 +429,7 @@ pub fn production_fail_closed_rollback_live_with_target(
     }
     epilogue
 }
+
 
 /// Emit one correlated fail-closed error (no done). Appends epilogue context
 /// when rollback could not be attested.
@@ -1312,49 +1240,44 @@ pub fn fail_closed_reset_target_and_spec(
             push_reset_err(&mut first_err, "qwen35 pipeline reset", error);
         }
     } else {
-        // Every single-GPU architecture implements the same ArchModel reset
-        // hook. The inventory check makes adding a new model key fail closed
-        // instead of silently skipping its recurrent/conv state.
-        match m.as_arch_model_mut() {
-            Some(model) => {
-                let key = model.arch_key();
-                if !hipfire_runtime::reset_core::has_reset_coverage(key) {
-                    push_reset_err(
-                        &mut first_err,
-                        "architecture reset",
-                        format!("missing reset-core coverage for arch_key={key}"),
-                    );
-                } else if let Err(error) = model.reset_session_state(gpu) {
-                    push_reset_err(&mut first_err, "architecture reset", error);
-                }
-            }
-            None => push_reset_err(&mut first_err, "architecture reset", "model state is missing"),
+        // Every single-GPU architecture implements the loader-owned reset
+        // boundary.  The inventory check and concrete downcast remain inside
+        // `LoadedModel`, so generation cannot silently omit a new family.
+        if let Err(error) = m.reset_architecture_state(gpu) {
+            push_reset_err(&mut first_err, "architecture reset", error);
         }
     }
 
-    let (kv_adaptive, state) = (&mut m.kv_adaptive, &mut m.state);
-    if let Some(adaptive) = kv_adaptive.as_mut() {
-        if let Some(kv) = state
-            .as_deref_mut()
-            .and_then(|model| model.kv_cache_mut())
-        {
-            adaptive.reset_with_cache(gpu, kv);
-        } else {
-            adaptive.reset();
+    {
+        let state = &mut m.state;
+        if let Some(adaptive) = m.kv_adaptive.as_mut() {
+            if let Some(kv) = state
+                .as_deref_mut()
+                .and_then(|model| model.kv_cache_mut())
+            {
+                adaptive.reset_with_cache(gpu, kv);
+            } else {
+                adaptive.reset();
+            }
         }
     }
 
     // Batch scratch is owned by its architecture bundle and must be reset
     // before a subsequent scheduler activation. It is absent on PP/EP paths.
     if m.pp <= 1 {
-        if let Some(bundle) = m.qwen35_mut() {
+        let state = &mut m.state;
+        if let Some(bundle) = state.as_deref_mut().and_then(|model| {
+            (model as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
+        }) {
             if let Some(batch) = bundle.qwen35_decode_batch.as_mut() {
                 if let Err(error) = batch.reset(gpu) {
                     push_reset_err(&mut first_err, "qwen35_decode_batch.reset", error);
                 }
             }
         }
-        if let Some(bundle) = m.lfm2moe_mut() {
+        if let Some(bundle) = state.as_deref_mut().and_then(|model| {
+            (model as &mut dyn Any).downcast_mut::<hipfire_arch_lfm2moe::Lfm2MoeBundle>()
+        }) {
             if let Some(batch) = bundle.lfm2_decode_batch.as_mut() {
                 if let Err(error) = batch.reset(gpu) {
                     push_reset_err(&mut first_err, "lfm2_decode_batch.reset", error);

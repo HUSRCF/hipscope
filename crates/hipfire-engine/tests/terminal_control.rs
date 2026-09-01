@@ -8,6 +8,7 @@
 //! `daemon.rs` because it exercises `super::glimmer_longest_marker_suffix`,
 //! a Glimmer-specific helper that is not part of `hipfire-engine`.
 
+    use hipfire_engine::emit::{emit_active_attempt_error, emit_staged_terminal_done};
     use hipfire_engine::terminal::{
         activate_terminal_control, apply_terminal_control, await_client_terminal_commit,
         check_abort, claim_terminal, clear_terminal_control, mark_terminal_control_ready,
@@ -257,5 +258,44 @@
         let claimed = [first.join().unwrap(), second.join().unwrap()];
         assert_eq!(claimed.iter().filter(|&&value| value).count(), 1);
         assert_eq!(claimed.iter().filter(|&&value| !value).count(), 1);
+        reset();
+    }
+
+    #[test]
+    fn active_done_error_race_has_one_wire_terminal() {
+        let _lock = begin_test();
+        activate_terminal_control("semantic-race", 88);
+        let pending = serde_json::json!({
+            "type": "done",
+            "id": "semantic-race",
+            "attempt_id": 88,
+            "finish_reason": "stop",
+        });
+        let done = std::thread::spawn({
+            let pending = pending.clone();
+            move || {
+                set_active_attempt_id(88);
+                let mut sink = Vec::new();
+                emit_staged_terminal_done(&mut sink, &pending);
+                sink
+            }
+        });
+        let error = std::thread::spawn(|| {
+            set_active_attempt_id(88);
+            let mut sink = Vec::new();
+            emit_active_attempt_error(
+                &mut sink,
+                Some("semantic-race"),
+                "racing failure",
+                "runtime",
+                false,
+                true,
+            );
+            sink
+        });
+        let done = done.join().unwrap();
+        let error = error.join().unwrap();
+        let lines = done.iter().chain(error.iter()).filter(|&&b| b == b'\n').count();
+        assert_eq!(lines, 1, "done/error race must claim one terminal writer");
         reset();
     }
