@@ -274,11 +274,14 @@ impl Rig {
         let per_pos_bytes = config.n_kv_heads * (config.head_dim / 32) * 34;
         let prefill_chunk = cfg.prefill_chunk.max(1).min(cfg.cap_tokens.max(1));
         let max_batch = (prefill_chunk * cfg.n_slots).max(cfg.n_slots);
-
-        let weight_bytes = std::fs::metadata(&cfg.model_path)
-            .map_err(|e| format!("stat model: {e}"))?
-            .len();
         let cap_rounded = cfg.cap_tokens.div_ceil(128) * 128;
+
+        // Size from retained file descriptor, not a later path stat (TOCTOU).
+        // When the source was admitted, the file was already opened and its
+        // identity/size captured. Using `hfq.file_len()` describes the retained
+        // inode, so a delete/replace of the path after admission does not change
+        // the planned VRAM budget or read a different file.
+        let weight_bytes = hfq.file_len();
         let kv_bytes = (n_fa_layers as u64)
             * 2
             * (cfg.n_slots as u64)

@@ -69,27 +69,34 @@ impl SlotBackend {
         prefill_chunk: usize,
     ) -> Result<Self, String> {
         let source = ModelSource::from_path(model_path)?;
-        Self::load_source(model_path, source, n_slots, cap_tokens, prefill_chunk)
+        Self::load_source(std::path::Path::new(model_path), source, n_slots, cap_tokens, prefill_chunk)
     }
 
     /// Consume a source admitted by the loader before daemon teardown.
     ///
     /// No path-based open, classification, or admission occurs here. The
     /// source is carried into the slot engine's worker so a model swap has one
-    /// source lifecycle from admission through execution.
+    /// source lifecycle from admission through execution. Carrier, variant,
+    /// mesh, canonical path, identity and size are all derived from the token
+    /// — no separate contradictory raw path is accepted. EP paths must not
+    /// discard carrier authority (verified at loader entry).
     pub fn load_admitted(
-        model_path: &str,
         admitted: hipfire_loader::AdmittedLoad,
         n_slots: usize,
         cap_tokens: usize,
         prefill_chunk: usize,
     ) -> Result<Self, String> {
-        let source = admitted.source;
-        Self::load_source(model_path, source, n_slots, cap_tokens, prefill_chunk)
+        let canonical_path = admitted.canonical_path().to_path_buf();
+        // Verify path-backed auxiliary identity before any prior-owner teardown.
+        // Failure must leave prior owner intact — caller defers teardown until
+        // after this returns Ok.
+        admitted.verify_auxiliary_identity()?;
+        let (source, _admission, _carrier) = admitted.consume();
+        Self::load_source(&canonical_path, source, n_slots, cap_tokens, prefill_chunk)
     }
 
     fn load_source(
-        model_path: &str,
+        model_path: &std::path::Path,
         source: ModelSource,
         n_slots: usize,
         cap_tokens: usize,

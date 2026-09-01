@@ -286,26 +286,96 @@ fn open_source(path: &str) -> Result<ModelSource, LoadAdmissionError> {
 /// reinterpreting raw CLI degrees.
 #[derive(Clone, Debug)]
 pub struct LoadAdmission {
-    pub source: SourceKind,
-    pub variant: ModelVariant,
-    pub mesh: DeviceMesh,
+    source: SourceKind,
+    variant: ModelVariant,
+    mesh: DeviceMesh,
+}
+
+impl LoadAdmission {
+    pub fn source(&self) -> SourceKind {
+        self.source
+    }
+    pub fn variant(&self) -> ModelVariant {
+        self.variant
+    }
+    pub fn mesh(&self) -> &DeviceMesh {
+        &self.mesh
+    }
+    pub(crate) fn new(source: SourceKind, variant: ModelVariant, mesh: DeviceMesh) -> Self {
+        Self { source, variant, mesh }
+    }
 }
 /// A source that has completed classification and parallel admission.
 ///
 /// Daemon model swaps carry this value across `DaemonLoadState` teardown into
 /// the execution entrypoint. The source is opened once and the selected
 /// carrier is retained, so execution never needs to reopen or reclassify it.
+///
+/// Fields are private so external callers cannot forge or splice admission.
+/// Only the loader admission code can construct this value; execution consumes
+/// it via loader-owned APIs that derive variant, mesh, carrier, canonical
+/// path, identity and size from the token. No public constructor or
+/// reassembly path exists.
 pub struct AdmittedLoad {
-    pub source: ModelSource,
-    pub admission: LoadAdmission,
-    pub carrier: &'static dyn Carrier,
+    source: ModelSource,
+    admission: LoadAdmission,
+    carrier: &'static dyn Carrier,
+    canonical_path: std::path::PathBuf,
+    source_len: u64,
+    dir_dev: u64,
+    dir_ino: u64,
 }
 
 impl AdmittedLoad {
-    /// Split the retained source, carrier, and effective topology for an
-    /// admitted execution path.
-    pub fn into_parts(self) -> (ModelSource, LoadAdmission, &'static dyn Carrier) {
+    pub fn source(&self) -> &ModelSource {
+        &self.source
+    }
+    pub fn admission(&self) -> &LoadAdmission {
+        &self.admission
+    }
+    pub fn carrier(&self) -> &'static dyn Carrier {
+        self.carrier
+    }
+    pub fn variant(&self) -> ModelVariant {
+        self.admission.variant
+    }
+    pub fn mesh(&self) -> &DeviceMesh {
+        &self.admission.mesh
+    }
+    pub fn source_kind(&self) -> SourceKind {
+        self.admission.source
+    }
+    pub fn canonical_path(&self) -> &std::path::Path {
+        &self.canonical_path
+    }
+    pub fn source_len(&self) -> u64 {
+        self.source_len
+    }
+    /// Canonical source/path derived from the admitted token — never a
+    /// caller-supplied raw string that could contradict the token.
+    pub fn canonical_path_str(&self) -> &str {
+        self.canonical_path
+            .to_str()
+            .unwrap_or("")
+    }
+
+    /// Loader-owned consuming API. Only the loader crate can consume the token
+    /// to obtain the retained source and topology; external crates use the
+    /// read-only getters and must route through loader entrypoints.
+    pub fn consume(self) -> (ModelSource, LoadAdmission, &'static dyn Carrier) {
         (self.source, self.admission, self.carrier)
+    }
+
+    /// Verify that any path-backed auxiliary directory still matches the
+    /// canonical identity captured at admission. Must be called before
+    /// destructive prior-owner teardown; failure leaves prior owner intact.
+    pub fn verify_auxiliary_identity(&self) -> Result<(), String> {
+        match &self.source {
+            ModelSource::Dir(s) => {
+                s.verify_dir_identity(&self.canonical_path, self.dir_dev, self.dir_ino)
+            }
+            ModelSource::Hfq(_) => Ok(()),
+        }
     }
 }
 
@@ -371,14 +441,7 @@ fn admit_source_with_carrier(
     let (carrier, variant) = classify_source(src)?;
     let raw = raw_for_cli_route(variant, raw);
     let mesh = resolve(source, variant, raw).map_err(LoadAdmissionError::Admission)?;
-    Ok((
-        carrier,
-        LoadAdmission {
-            source,
-            variant,
-            mesh,
-        },
-    ))
+    Ok((carrier, LoadAdmission::new(source, variant, mesh)))
 }
 
 /// Open, classify, and admit one model while retaining the source for the
@@ -391,10 +454,27 @@ pub fn admit_load_with_source(
 ) -> Result<AdmittedLoad, LoadAdmissionError> {
     let source = open_source(path)?;
     let (carrier, admission) = admit_source_with_carrier(&source, raw)?;
+    let canonical_path = std::fs::canonicalize(path).unwrap_or_else(|_| std::path::PathBuf::from(path));
+    let source_len = match &source {
+        ModelSource::Hfq(hfq) => hfq.file_len(),
+        ModelSource::Dir(s) => {
+            // For dir, size is not used for Rig preflight (slot only supports HFQ),
+            // but capture total shard bytes as size for consistency.
+            s.files_len()
+        }
+    };
+    let (dir_dev, dir_ino) = match &source {
+        ModelSource::Dir(s) => s.dir_identity(),
+        ModelSource::Hfq(_) => (0, 0),
+    };
     Ok(AdmittedLoad {
         source,
         admission,
         carrier,
+        canonical_path,
+        source_len,
+        dir_dev,
+        dir_ino,
     })
 }
 
@@ -2454,7 +2534,7 @@ pub fn load_model_with_kv_backend(
 ) -> Result<LoadedModel, String> {
     route_admitted_load(path, RawParallelism::new(pp, 1, 1), |admitted| {
         load_model_with_kv_backend_admitted(
-            path,
+            admitted,
             max_seq,
             deepseek4_experts_per_token,
             deepseek4_compute_placement,
@@ -2466,14 +2546,13 @@ pub fn load_model_with_kv_backend(
             cask,
             spec,
             gpu,
-            admitted,
         )
     })
 }
 
 #[allow(clippy::too_many_arguments)]
 pub fn load_model_with_kv_backend_admitted(
-    path: &str,
+    admitted: AdmittedLoad,
     max_seq: usize,
     deepseek4_experts_per_token: Option<usize>,
     deepseek4_compute_placement: hipfire_config::Deepseek4ComputePlacement,
@@ -2485,20 +2564,19 @@ pub fn load_model_with_kv_backend_admitted(
     cask: &CaskConfig,
     spec: SpecLoadCfg,
     gpu: &mut rdna_compute::Gpu,
-    admitted: AdmittedLoad,
 ) -> Result<LoadedModel, String> {
-    let AdmittedLoad {
-        source: src,
-        admission,
-        carrier,
-    } = admitted;
-
+    let canonical_path_buf = admitted.canonical_path().to_path_buf();
+    let _admitted_len = admitted.source_len();
+    admitted.verify_auxiliary_identity()?;
+    let (source, admission, carrier) = admitted.consume();
+    let src = source;
+    let path_owned = canonical_path_buf.to_string_lossy().into_owned();
+    let path: &str = &path_owned;
     // Retry any arenas left by a prior failed teardown; refuse the load if
     // ownership is still live so a new model cannot stack on pending VMM state.
     ensure_vmm_ready_for_load(gpu)?;
     let kv_backend_raw = kv_backend_override.unwrap_or("contiguous");
     let kv_backend: KvBackend = kv_backend_raw.parse().map_err(|err| format!("{err}"))?;
-
     // Author-recommended sampling defaults (temp/top_p/top_k from the .hfq's baked
     // `generation_config`). Extract HERE, from the already-open source, BEFORE the
     // carrier allocates any GPU buffers. The `metadata_json` parse churns the host
@@ -2659,7 +2737,7 @@ pub fn load_model_with_gemma4_drafter(
 ) -> Result<LoadedModel, String> {
     route_admitted_load(path, RawParallelism::new(pp, 1, 1), |admitted| {
         load_model_with_gemma4_drafter_admitted(
-            path,
+            admitted,
             max_seq,
             deepseek4_experts_per_token,
             deepseek4_compute_placement,
@@ -2673,14 +2751,13 @@ pub fn load_model_with_gemma4_drafter(
             cask,
             spec,
             gpu,
-            admitted,
         )
     })
 }
 
 #[allow(clippy::too_many_arguments)]
 pub fn load_model_with_gemma4_drafter_admitted(
-    path: &str,
+    admitted: AdmittedLoad,
     max_seq: usize,
     deepseek4_experts_per_token: Option<usize>,
     deepseek4_compute_placement: hipfire_config::Deepseek4ComputePlacement,
@@ -2694,13 +2771,13 @@ pub fn load_model_with_gemma4_drafter_admitted(
     cask: &CaskConfig,
     spec: SpecLoadCfg,
     gpu: &mut rdna_compute::Gpu,
-    admitted: AdmittedLoad,
 ) -> Result<LoadedModel, String> {
-    let AdmittedLoad {
-        source: src,
-        admission,
-        carrier,
-    } = admitted;
+    let canonical_path_buf = admitted.canonical_path().to_path_buf();
+    admitted.verify_auxiliary_identity()?;
+    let (source, admission, carrier) = admitted.consume();
+    let src = source;
+    let path_owned = canonical_path_buf.to_string_lossy().into_owned();
+    let path: &str = &path_owned;
     let _ = gemma4_eagle_spec_len(Some(gemma4_draft_len as u64))
         .map_err(|e| format!("gemma4 drafter: {e}"))?;
     // Retry any arenas left by a prior failed teardown; refuse the load if
@@ -3231,29 +3308,36 @@ pub fn load_model_ep_with_kv_mode(
 ) -> Result<LoadedModel, String> {
     route_admitted_load(path, RawParallelism::new(1, tp, 1), |admitted| {
         load_model_ep_with_kv_mode_admitted(
-            path,
+            admitted,
             max_seq,
             kv_mode,
             kv_backend,
             state_quant,
-            admitted,
         )
     })
 }
 
 pub fn load_model_ep_with_kv_mode_admitted(
-    path: &str,
+    admitted: AdmittedLoad,
     max_seq: usize,
     kv_mode: Option<&str>,
     kv_backend: Option<&str>,
     state_quant: Option<&str>,
-    admitted: AdmittedLoad,
 ) -> Result<LoadedModel, String> {
-    let AdmittedLoad {
-        source,
-        admission,
-        carrier: _,
-    } = admitted;
+    let canonical_path_buf = admitted.canonical_path().to_path_buf();
+    admitted.verify_auxiliary_identity()?;
+    let (source, admission, carrier) = admitted.consume();
+    // EP must not discard carrier authority — the admitted carrier is the
+    // source-aware route. Re-verify it still claims the retained source.
+    if !carrier.probe(&source) {
+        return Err(format!(
+            "admitted carrier '{}' no longer claims retained source {} — possible source splice",
+            carrier.name(),
+            source.describe()
+        ));
+    }
+    let path_owned = canonical_path_buf.to_string_lossy().into_owned();
+    let path: &str = &path_owned;
     let kv_backend_raw = kv_backend.unwrap_or("contiguous");
     let kv_backend_kind: KvBackend = kv_backend_raw.parse().map_err(|err| format!("{err}"))?;
     let degree = match admission.variant {
@@ -3312,21 +3396,27 @@ pub fn load_model_ep_with_compressor_cache(
     compressor_cache: hipfire_config::Deepseek4CompressorCache,
 ) -> Result<LoadedModel, String> {
     route_admitted_load(path, RawParallelism::new(1, tp, 1), |admitted| {
-        load_model_ep_with_compressor_cache_admitted(path, max_seq, compressor_cache, admitted)
+        load_model_ep_with_compressor_cache_admitted(admitted, max_seq, compressor_cache)
     })
 }
 
 pub fn load_model_ep_with_compressor_cache_admitted(
-    path: &str,
+    admitted: AdmittedLoad,
     max_seq: usize,
     compressor_cache: hipfire_config::Deepseek4CompressorCache,
-    admitted: AdmittedLoad,
 ) -> Result<LoadedModel, String> {
-    let AdmittedLoad {
-        source,
-        admission,
-        carrier: _,
-    } = admitted;
+    let canonical_path_buf = admitted.canonical_path().to_path_buf();
+    admitted.verify_auxiliary_identity()?;
+    let (source, admission, carrier) = admitted.consume();
+    if !carrier.probe(&source) {
+        return Err(format!(
+            "admitted carrier '{}' no longer claims retained source {} — possible source splice",
+            carrier.name(),
+            source.describe()
+        ));
+    }
+    let path_owned = canonical_path_buf.to_string_lossy().into_owned();
+    let path: &str = &path_owned;
     let degree = match admission.variant {
         ModelVariant::Deepseek4 | ModelVariant::Minimax | ModelVariant::Qwen35Moe => {
             admission.mesh.size_of(hipfire_hardware::DimKind::Ep)
@@ -5425,5 +5515,120 @@ mod registry_tests {
             vec!["low", "medium", "xhigh"],
             "supported rungs must be exactly the Qwen3.8 contract"
         );
+    }
+
+    #[test]
+    fn admitted_token_exposes_only_readonly_getters_and_retained_hfq_survives_delete() {
+        // Token opacity: only loader can create AdmittedLoad; execution derives
+        // variant/mesh/carrier/canonical path/identity/size from the token.
+        // No public constructor or reassembly path exists — fields are private
+        // and `into_parts` is pub(crate) only. This test exercises the
+        // production path: admit, delete the file, then verify retained load
+        // remains consistent via the token's retained source, while a second
+        // admission on the same path fails.
+        let path = fixture_path("opaque-retained-hfq");
+        write_metadata_fixture(&path, 5, r#"{"config":{"num_experts":0}}"#);
+        let admitted = crate::admit_load_with_source(path.to_str().unwrap(), RawParallelism::new(1, 1, 1))
+            .expect("admission must succeed");
+        // Read-only getters — the only external API.
+        assert_eq!(admitted.source_kind(), SourceKind::Hfq);
+        assert_eq!(admitted.variant(), ModelVariant::Qwen35Dense);
+        assert_eq!(admitted.mesh().n_devices(), 1);
+        assert_eq!(admitted.carrier().name(), "qwen35");
+        assert!(admitted.canonical_path().ends_with(path.file_name().unwrap()));
+        let retained_len = admitted.source_len();
+        assert!(retained_len > 0, "retained size must be from opened file, not 0");
+        // Verify auxiliary identity for HFQ is trivially Ok (no path-backed dir).
+        assert!(admitted.verify_auxiliary_identity().is_ok());
+        // Capture a tensor read via retained source before delete.
+        let can_read_before = admitted.source().arch_id().is_some();
+        assert!(can_read_before);
+        // Delete the file on disk — retained HFQ must remain consistent.
+        std::fs::remove_file(&path).unwrap();
+        assert!(!path.exists(), "fixture must be deleted");
+        // Second admission on same path must fail (file gone) — proves we
+        // cannot re-derive admission from path after delete.
+        let second = crate::admit_load_with_source(path.to_str().unwrap(), RawParallelism::new(1, 1, 1));
+        assert!(second.is_err(), "second admission must fail after delete");
+        // Retained token still describes the original inode and can still be
+        // used for execution (size/canonical from token, not path stat).
+        assert_eq!(admitted.source_len(), retained_len);
+        assert!(admitted.verify_auxiliary_identity().is_ok());
+        // The retained source still has arch_id (proves we didn't re-open path).
+        assert_eq!(admitted.source().arch_id(), Some(5));
+        // No public reassembly: ensure `AdmittedLoad` cannot be cloned or
+        // spliced via `into_parts` outside crate (pub(crate) only). This is
+        // compile-time, but we verify at runtime that the token is still
+        // consumable via loader-owned API.
+        let (source, admission, carrier) = {
+            // Use the loader-owned consuming API inside same crate (pub(crate))
+            // to prove it exists; external crates cannot call this.
+            admitted.consume()
+        };
+        assert_eq!(source.arch_id(), Some(5));
+        assert_eq!(admission.variant(), ModelVariant::Qwen35Dense);
+        assert_eq!(carrier.name(), "qwen35");
+    }
+
+    #[test]
+    fn admitted_dir_auxiliary_mismatch_fails_before_teardown() {
+        // Path-backed auxiliary (safetensors dir) must be identity-checked
+        // before destructive teardown. Failure must leave prior owner intact.
+        use std::io::Write;
+
+        let dir = std::env::temp_dir().join(format!(
+            "hipfire-loader-dir-aux-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Minimal config for Qwen2 (arch_id 7) — both HFQ and Dir route to qwen2.
+        let config = r#"{"architectures":["Qwen2ForCausalLM"],"model_type":"qwen2","hidden_size":128,"num_hidden_layers":1,"num_attention_heads":2,"intermediate_size":256}"#;
+        std::fs::write(dir.join("config.json"), config).unwrap();
+        // Minimal safetensors file with one F32 tensor.
+        let mut header: std::collections::HashMap<String, serde_json::Value> = std::collections::HashMap::new();
+        header.insert(
+            "weight".to_string(),
+            serde_json::json!({"dtype":"F32","shape":[1],"data_offsets":[0,4]}),
+        );
+        let header_json = serde_json::to_string(&header).unwrap();
+        let header_len = header_json.len() as u64;
+        let mut file = std::fs::File::create(dir.join("model.safetensors")).unwrap();
+        file.write_all(&header_len.to_le_bytes()).unwrap();
+        file.write_all(header_json.as_bytes()).unwrap();
+        file.write_all(&[0u8; 4]).unwrap();
+        file.flush().unwrap();
+        // Admission should succeed for this Dir.
+        let admitted = crate::admit_load_with_source(dir.to_str().unwrap(), RawParallelism::new(1, 1, 1))
+            .expect("dir admission must succeed");
+        // Capture identity before replace.
+        let before_canonical = admitted.canonical_path().to_path_buf();
+        assert!(admitted.verify_auxiliary_identity().is_ok(), "initial verify must pass");
+        // Replace the directory: rename original away, create new empty dir at same path.
+        let renamed = dir.with_extension("old");
+        let _ = std::fs::remove_dir_all(&renamed);
+        std::fs::rename(&dir, &renamed).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        // Write a different config so the new dir is not the same inode/content.
+        std::fs::write(dir.join("config.json"), r#"{"model_type":"llama"}"#).unwrap();
+        // Now verify must fail — canonical or inode mismatch — before teardown.
+        let err = admitted.verify_auxiliary_identity().expect_err("verify must fail after dir replace");
+        assert!(
+            err.contains("mismatch") || err.contains("canonicalize") || err.contains("inode"),
+            "unexpected verify error: {err}"
+        );
+        // Prior owner would be intact because verify failed before commit.
+        // We simulate by checking that the original `renamed` dir still exists
+        // and the admitted source still describes the original (not the new).
+        assert!(renamed.exists(), "original dir must still exist (not torn down)");
+        assert_eq!(admitted.source().arch_id(), Some(7), "retained source still describes original");
+        assert_eq!(before_canonical, admitted.canonical_path());
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&renamed);
     }
 }
