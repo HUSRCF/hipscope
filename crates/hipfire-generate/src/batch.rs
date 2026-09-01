@@ -225,6 +225,10 @@ pub fn drive_qwen_continuous_batch(
     if batch_size == 0 {
         return Ok(());
     }
+    // `batch_state` below is borrowed from `model.state`; fail_all returns
+    // immediately after this reset, so retain a raw model pointer to invoke
+    // the model-owned reset without extending that borrow across the call.
+    let model_ptr = model as *mut LoadedModel;
     // SAFETY: borrow disjoint fields via raw pointers to avoid &mut aliasing
     // qwen35_decode_batch now lives inside Qwen35Bundle.
     let b_ptr = match model.state.as_mut().and_then(|s| {
@@ -276,7 +280,6 @@ pub fn drive_qwen_continuous_batch(
     let mut positions = vec![0usize; batch_size];
     let fail_all = |sched: &mut ContinuousBatchScheduler,
                     gpu: &mut rdna_compute::Gpu,
-                    batch_state: &mut qwen35::Qwen35DecodeBatchState,
                     stdout: &mut std::io::Stdout,
                     reason: String|
      -> Result<(), BatchDriveError> {
@@ -299,17 +302,18 @@ pub fn drive_qwen_continuous_batch(
                 uniq.push(k);
             }
         }
-        let mut first_err: Option<String> = None;
-        if let Err(e) = batch_state.reset(gpu) {
-            first_err = Some(format!("batch reset: {e}"));
-        }
-        crate::common::fail_closed_invalidate_graphs_and_replay(gpu);
-        let sync = crate::common::fail_closed_device_sync(gpu);
-        let prior = match first_err {
-            Some(e) => Err(e),
-            None => Ok(()),
+        // SAFETY: fail_all is terminal and returns immediately; no borrowed
+        // bundle references are used after reset_context mutably borrows model.
+        let ep = match unsafe { LoadedModel::reset_context(&mut *model_ptr, gpu) } {
+            Ok(()) => crate::common::RollbackEpilogue {
+                rolled_back: true,
+                context: None,
+            },
+            Err(e) => crate::common::RollbackEpilogue {
+                rolled_back: false,
+                context: Some(e),
+            },
         };
-        let ep = crate::common::fail_closed_epilogue_after_sync(prior, sync);
         for key in &uniq {
             let _scope = BatchAttemptScope::enter(key.attempt_id);
             crate::common::emit_fail_closed_error(
@@ -354,7 +358,6 @@ pub fn drive_qwen_continuous_batch(
                 return fail_all(
                     sched,
                     gpu,
-                    batch_state,
                     stdout,
                     format!("reset lane {idx} on abort: {e}"),
                 );
@@ -374,7 +377,6 @@ pub fn drive_qwen_continuous_batch(
                     return fail_all(
                         sched,
                         gpu,
-                        batch_state,
                         stdout,
                         format!("reset lane {idx} on commit: {e}"),
                     );
@@ -435,7 +437,6 @@ pub fn drive_qwen_continuous_batch(
                 return fail_all(
                     sched,
                     gpu,
-                    batch_state,
                     stdout,
                     format!("reset lane {idx} on running abort: {e}"),
                 );
@@ -709,7 +710,6 @@ pub fn drive_qwen_continuous_batch(
                     return fail_all(
                         sched,
                         gpu,
-                        batch_state,
                         stdout,
                         format!("reset lane {lane_idx} on think barrier: {err}"),
                     );
@@ -727,7 +727,6 @@ pub fn drive_qwen_continuous_batch(
                 return fail_all(
                     sched,
                     gpu,
-                    batch_state,
                     stdout,
                     format!("reset lane {lane_idx}: {e}"),
                 );
@@ -738,7 +737,6 @@ pub fn drive_qwen_continuous_batch(
                 return fail_all(
                     sched,
                     gpu,
-                    batch_state,
                     stdout,
                     format!("prefill lane {lane_idx}: {e}"),
                 );
@@ -767,7 +765,6 @@ pub fn drive_qwen_continuous_batch(
                     return fail_all(
                         sched,
                         gpu,
-                        batch_state,
                         stdout,
                         format!("sample lane {lane_idx}: {e}"),
                     )
@@ -857,7 +854,6 @@ pub fn drive_qwen_continuous_batch(
             return fail_all(
                 sched,
                 gpu,
-                batch_state,
                 stdout,
                 format!("forward_decode_batch: {e}"),
             );
@@ -929,7 +925,6 @@ pub fn drive_qwen_continuous_batch(
                         return fail_all(
                             sched,
                             gpu,
-                            batch_state,
                             stdout,
                             format!("semantic classify lane {idx}: {e}"),
                         )
@@ -958,7 +953,6 @@ pub fn drive_qwen_continuous_batch(
                         return fail_all(
                             sched,
                             gpu,
-                            batch_state,
                             stdout,
                             format!("semantic finish lane {idx}: {e}"),
                         )
@@ -972,7 +966,6 @@ pub fn drive_qwen_continuous_batch(
                         return fail_all(
                             sched,
                             gpu,
-                            batch_state,
                             stdout,
                             format!("reset lane {idx} on open think: {e}"),
                         );
@@ -996,7 +989,6 @@ pub fn drive_qwen_continuous_batch(
                     return fail_all(
                         sched,
                         gpu,
-                        batch_state,
                         stdout,
                         format!("semantic finish lane {idx}: unexpected tool calls"),
                     );
@@ -1062,7 +1054,6 @@ pub fn drive_qwen_continuous_batch(
                 return fail_all(
                     sched,
                     gpu,
-                    batch_state,
                     stdout,
                     format!("reset lane {idx} on abort post-forward: {e}"),
                 );
@@ -1135,7 +1126,6 @@ pub fn drive_qwen_continuous_batch(
                 return fail_all(
                     sched,
                     gpu,
-                    batch_state,
                     stdout,
                     format!("sample_product: {e}"),
                 )

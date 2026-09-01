@@ -865,7 +865,20 @@ pub fn reset_qwen35_recurrent(
     let Some(la) = layer_owner_map.as_ref() else {
         return Err("qwen35 pipeline reset: layer-owner map is missing".into());
     };
+    reset_qwen35_recurrent_pp(bundle, gpus, la)
+}
 
+/// Reset the Qwen3.5 pipeline recurrent state through disjoint owners.
+///
+/// The caller owns the live bundle, per-device GPU collection, and
+/// layer-owner map separately from `LoadedModel`'s host/checkpoint fields.
+/// Every layout validation, layer bind/memset, and rank synchronization stays
+/// here so PP rollback adapters cannot drift or duplicate the reset loops.
+pub fn reset_qwen35_recurrent_pp(
+    bundle: &mut hipfire_arch_qwen35::Qwen35Bundle,
+    gpus: &mut hipfire_runtime::multi_gpu::Gpus,
+    la: &[u8],
+) -> Result<(), String> {
     let expected = bundle.dn_state.s_matrices.len();
     if la.len() != expected {
         return Err(format!(

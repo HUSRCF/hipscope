@@ -920,29 +920,34 @@ pub fn generate_deepseek4(
     }
 
     if lcp == 0 {
-        // Cache miss — start a fresh conversation in V4F's state.
-        state.reset();
-        // reset() only rewinds n_tokens; the position-indexed decode caches
-        // (SWA ring, compressed/full KV, indexer scratch) still hold the prior
-        // turn's residue, which bleeds into this fresh conversation's forward
-        // and makes greedy output drift turn-to-turn (the "recall/tool-calls
-        // unreliable" symptom). Zero them so a fresh conversation reproduces a
-        // freshly-launched daemon's clean, deterministic state.
-        state.zero_decode_caches(gpu);
-        m.conversation_tokens.clear();
-        // Tear down the captured V4F decode hipGraph alongside the
-        // state, same rationale as the daemon's `"reset"` handler:
-        // a fresh-context turn invalidates every device-buffer pointer
-        // and host scalar the captured graph baked in at capture time
-        // (state.attn_state_buf slot/n_valid/k_active values derived
-        // from the prior n_tokens, compressor ring/commit slots, etc.).
-        // Without this, the warmup-then-replay state machine fires
-        // warmup on the first decode (because `state.reset()` clears
-        // `ar_forward_warmed_up`), then immediately replays the STALE
-        // graph on the second decode and crashes with the same
-        // "download logits (graph path): illegal memory access" we
-        // saw on multi-turn pi sessions before the explicit-reset fix.
-        gpu.invalidate_graph_state();
+        // Cache miss — use the shared live rollback owner so the DSA state,
+        // host mirror, checkpoint rings, graph, and synchronization move
+        // together. Partial LCP reuse remains the only warm path.
+        let mut reset_target = |gpu: &mut rdna_compute::Gpu| {
+            state.reset();
+            state.zero_decode_caches(gpu);
+            Ok(())
+        };
+        let ep = reset_live_bundle(
+            &mut reset_target,
+            &mut m.seq_pos,
+            &mut m.conversation_tokens,
+            &mut m.prefill_checkpoints,
+            &mut m.dflash_checkpoints,
+            &mut m.asst_turn_cache,
+            gpu,
+        );
+        if !ep.rolled_back {
+            emit_fail_closed_error(
+                stdout,
+                Some(id),
+                "deepseek4 prompt-cache miss reset failed",
+                "gpu",
+                true,
+                &ep,
+            );
+            return;
+        }
     }
     let start_pos: u32 = lcp as u32;
 
@@ -3556,6 +3561,7 @@ pub fn reconcile_glimmer_mirror(
     bundle: &mut hipfire_loader::MuseGlimmerBundle,
     conversation_tokens: &mut Vec<u32>,
     seq_pos: &mut usize,
+    gpu: &mut rdna_compute::Gpu,
 ) -> GlimmerMirrorReconcile {
     let mirror_len = conversation_tokens.len();
     let n_tokens = bundle.state.n_tokens;
@@ -3582,8 +3588,16 @@ pub fn reconcile_glimmer_mirror(
                         n_tokens,
                     }
                 }
-                Err(_) => {
-                    bundle.reset_session_state();
+                Err(error) => {
+                    // LCP rewind is the only partial-reuse path. If it cannot
+                    // land, use the ArchModel lifecycle hook rather than a
+                    // second direct cold-reset body.
+                    eprintln!(
+                        "[glimmer-cache] rewind_session_to({new_len}) failed; resetting via ArchModel: {error}"
+                    );
+                    let _ = hipfire_runtime::arch_model::ArchModel::reset_session_state(
+                        bundle, gpu,
+                    );
                     conversation_tokens.clear();
                     *seq_pos = 0;
                     GlimmerMirrorReconcile::Reset
@@ -3594,6 +3608,33 @@ pub fn reconcile_glimmer_mirror(
     debug_assert_eq!(conversation_tokens.len(), bundle.state.n_tokens);
     debug_assert_eq!(*seq_pos, bundle.state.n_tokens);
     result
+}
+
+/// Reset a live Glimmer turn through the shared rollback owner. The
+/// architecture bundle is already borrowed by the generation loop, so this
+/// thin adapter supplies its ArchModel reset while the host fields remain
+/// disjoint references.
+fn reset_glimmer_live(
+    bundle: &mut hipfire_loader::MuseGlimmerBundle,
+    seq_pos: &mut usize,
+    conversation_tokens: &mut Vec<u32>,
+    prefill_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    dflash_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    asst_turn_cache: &mut AsstTurnCache,
+    gpu: &mut rdna_compute::Gpu,
+) -> RollbackEpilogue {
+    let mut reset_target = |gpu: &mut rdna_compute::Gpu| {
+        hipfire_runtime::arch_model::ArchModel::reset_session_state(bundle, gpu)
+    };
+    reset_live_bundle(
+        &mut reset_target,
+        seq_pos,
+        conversation_tokens,
+        prefill_checkpoints,
+        dflash_checkpoints,
+        asst_turn_cache,
+        gpu,
+    )
 }
 
 pub fn normalize_glimmer_tool_arguments(
@@ -3792,7 +3833,6 @@ pub fn parse_glimmer_atem(
     }
     Ok(calls)
 }
-
 /// Run the engine's two-phase terminal handshake for arch 14 and release the turn.
 ///
 /// The wire contract is `commit_ready` -> client `commit` -> a byte-identical `done`
@@ -3819,18 +3859,9 @@ pub fn glimmer_commit_terminal(
             true
         }
         ClientTerminalDecision::Abort => {
-            let attempt_id = active_attempt_id();
-            let _ = writeln!(
-                stdout,
-                "{}",
-                hipfire_runtime::semantic::wire_aborted(id, "client_cancelled", attempt_id)
-            );
-            let _ = writeln!(
-                stdout,
-                "{}",
-                hipfire_runtime::semantic::wire_aborted_done(id, generated, attempt_id)
-            );
-            let _ = stdout.flush();
+            // Claim through the canonical engine writer so an abort racing
+            // with a late error/done has exactly one terminal owner.
+            emit_qwen_ar_cancelled(stdout, id, generated);
             false
         }
     }
@@ -4531,12 +4562,8 @@ pub fn generate_muse_glimmer(
     if overflow {
         let (n, cap) = (bundle.state.n_tokens, bundle.state.max_seq);
         eprintln!("[daemon] arch_id=14 context full ({n}/{cap}) — resetting GlimmerState");
-        let mut reset_target = |_: &mut rdna_compute::Gpu| {
-            bundle.reset_session_state();
-            Ok(())
-        };
-        let ep = reset_live_bundle(
-            &mut reset_target,
+        let ep = reset_glimmer_live(
+            bundle,
             &mut m.seq_pos,
             &mut m.conversation_tokens,
             &mut m.prefill_checkpoints,
@@ -4588,12 +4615,8 @@ pub fn generate_muse_glimmer(
             // the CLI keeps the session warm. Cold-reset here or the opt-out
             // path becomes the very double-write the cache was added to avoid.
             if bundle.state.n_tokens > 0 || !m.conversation_tokens.is_empty() {
-                let mut reset_target = |_: &mut rdna_compute::Gpu| {
-                    bundle.reset_session_state();
-                    Ok(())
-                };
-                let _ = reset_live_bundle(
-                    &mut reset_target,
+                let _ = reset_glimmer_live(
+                    bundle,
                     &mut m.seq_pos,
                     &mut m.conversation_tokens,
                     &mut m.prefill_checkpoints,
@@ -4644,12 +4667,8 @@ pub fn generate_muse_glimmer(
                             "[glimmer-cache] rewind_session_to({lcp}) failed: {e} — converting to MISS"
                         );
                     }
-                    let mut reset_target = |_: &mut rdna_compute::Gpu| {
-                        bundle.reset_session_state();
-                        Ok(())
-                    };
-                    let ep = reset_live_bundle(
-                        &mut reset_target,
+                    let ep = reset_glimmer_live(
+                        bundle,
                         &mut m.seq_pos,
                         &mut m.conversation_tokens,
                         &mut m.prefill_checkpoints,
@@ -4679,12 +4698,8 @@ pub fn generate_muse_glimmer(
                 // lcp == 0 (fully divergent) and lcp == prompt_ids.len()
                 // (identical prompt re-sent), plus candidate rejected by capture.
                 if bundle.state.n_tokens > 0 || prior_len > 0 {
-                    let mut reset_target = |_: &mut rdna_compute::Gpu| {
-                        bundle.reset_session_state();
-                        Ok(())
-                    };
-                    let ep = reset_live_bundle(
-                        &mut reset_target,
+                    let ep = reset_glimmer_live(
+                        bundle,
                         &mut m.seq_pos,
                         &mut m.conversation_tokens,
                         &mut m.prefill_checkpoints,
@@ -4750,20 +4765,42 @@ pub fn generate_muse_glimmer(
                 if device_capture {
                     // Device prefill mutates target KV + capture transaction; length-only
                     // reconcile is not enough — leave zero reusable session state.
-                    bundle.reset_session_state();
-                    m.conversation_tokens.clear();
-                    m.asst_turn_cache.clear();
-                    m.seq_pos = 0;
-                } else {
-                    let _ = reconcile_glimmer_mirror(
+                    let _ = reset_glimmer_live(
                         bundle,
-                        &mut m.conversation_tokens,
                         &mut m.seq_pos,
+                        &mut m.conversation_tokens,
+                        &mut m.prefill_checkpoints,
+                        &mut m.dflash_checkpoints,
+                        &mut m.asst_turn_cache,
+                        gpu,
+                    );
+                } else {
+                    let _ = reset_glimmer_live(
+                        bundle,
+                        &mut m.seq_pos,
+                        &mut m.conversation_tokens,
+                        &mut m.prefill_checkpoints,
+                        &mut m.dflash_checkpoints,
+                        &mut m.asst_turn_cache,
+                        gpu,
                     );
                 }
                 return;
             }
         }
+    }
+    if check_abort(id) {
+        let ep = reset_glimmer_live(
+            bundle,
+            &mut m.seq_pos,
+            &mut m.conversation_tokens,
+            &mut m.prefill_checkpoints,
+            &mut m.dflash_checkpoints,
+            &mut m.asst_turn_cache,
+            gpu,
+        );
+        emit_spec_cancel_after_rollback(stdout, id, 0, &ep);
+        return;
     }
     for &tok in &prefill_ids {
         m.conversation_tokens.push(tok);
@@ -4937,6 +4974,20 @@ pub fn generate_muse_glimmer(
         let mut windows: usize = 0;
         if !skip_spec_loop {
             loop {
+                if check_abort(id) {
+                    glimmer::forward::abort_device_capture_stage(&mut bundle.state);
+                    let ep = reset_glimmer_live(
+                        bundle,
+                        &mut m.seq_pos,
+                        &mut m.conversation_tokens,
+                        &mut m.prefill_checkpoints,
+                        &mut m.dflash_checkpoints,
+                        &mut m.asst_turn_cache,
+                        gpu,
+                    );
+                    emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
+                    return;
+                }
                 let t_window = std::time::Instant::now();
                 let do_window_timing =
                     std::env::var("HIPFIRE_GLIMMER_TIMING").ok().as_deref() == Some("1");
@@ -4992,10 +5043,14 @@ pub fn generate_muse_glimmer(
                                 id,
                                 format!("glimmer drafter noise embed row {i}: {e}"),
                             );
-                            let _ = reconcile_glimmer_mirror(
+                            let _ = reset_glimmer_live(
                                 bundle,
-                                &mut m.conversation_tokens,
                                 &mut m.seq_pos,
+                                &mut m.conversation_tokens,
+                                &mut m.prefill_checkpoints,
+                                &mut m.dflash_checkpoints,
+                                &mut m.asst_turn_cache,
+                                gpu,
                             );
                             return;
                         }
@@ -5047,10 +5102,15 @@ pub fn generate_muse_glimmer(
                         emit_error_with_id(stdout, id, e.clone());
                         glimmer::forward::abort_device_capture_stage(&mut bundle.state);
                         // Capture/log integrity errors (incl. poisoned transaction) leave no reusable state.
-                        bundle.reset_session_state();
-                        m.conversation_tokens.clear();
-                        m.asst_turn_cache.clear();
-                        m.seq_pos = 0;
+                        let _ = reset_glimmer_live(
+                            bundle,
+                            &mut m.seq_pos,
+                            &mut m.conversation_tokens,
+                            &mut m.prefill_checkpoints,
+                            &mut m.dflash_checkpoints,
+                            &mut m.asst_turn_cache,
+                            gpu,
+                        );
                         return;
                     }
                 };
@@ -5063,10 +5123,15 @@ pub fn generate_muse_glimmer(
                     ),
                 );
                     glimmer::forward::abort_device_capture_stage(&mut bundle.state);
-                    bundle.reset_session_state();
-                    m.conversation_tokens.clear();
-                    m.asst_turn_cache.clear();
-                    m.seq_pos = 0;
+                    let _ = reset_glimmer_live(
+                        bundle,
+                        &mut m.seq_pos,
+                        &mut m.conversation_tokens,
+                        &mut m.prefill_checkpoints,
+                        &mut m.dflash_checkpoints,
+                        &mut m.asst_turn_cache,
+                        gpu,
+                    );
                     return;
                 }
                 let ctx_len = (cur_pos as usize).min(ctx_cap);
@@ -5090,10 +5155,15 @@ pub fn generate_muse_glimmer(
                                 "glimmer-spec: device hidden log missing at draft",
                             );
                             glimmer::forward::abort_device_capture_stage(&mut bundle.state);
-                            bundle.reset_session_state();
-                            m.conversation_tokens.clear();
-                            m.asst_turn_cache.clear();
-                            m.seq_pos = 0;
+                            let _ = reset_glimmer_live(
+                                bundle,
+                                &mut m.seq_pos,
+                                &mut m.conversation_tokens,
+                                &mut m.prefill_checkpoints,
+                                &mut m.dflash_checkpoints,
+                                &mut m.asst_turn_cache,
+                                gpu,
+                            );
                             return;
                         }
                     };
@@ -5144,15 +5214,24 @@ pub fn generate_muse_glimmer(
                         let es = format!("{e}");
                         if es.contains("poisoned") || es.contains("session requires reset") {
                             glimmer::forward::abort_device_capture_stage(&mut bundle.state);
-                            bundle.reset_session_state();
-                            m.conversation_tokens.clear();
-                            m.asst_turn_cache.clear();
-                            m.seq_pos = 0;
-                        } else {
-                            let _ = reconcile_glimmer_mirror(
+                            let _ = reset_glimmer_live(
                                 bundle,
-                                &mut m.conversation_tokens,
                                 &mut m.seq_pos,
+                                &mut m.conversation_tokens,
+                                &mut m.prefill_checkpoints,
+                                &mut m.dflash_checkpoints,
+                                &mut m.asst_turn_cache,
+                                gpu,
+                            );
+                        } else {
+                            let _ = reset_glimmer_live(
+                                bundle,
+                                &mut m.seq_pos,
+                                &mut m.conversation_tokens,
+                                &mut m.prefill_checkpoints,
+                                &mut m.dflash_checkpoints,
+                                &mut m.asst_turn_cache,
+                                gpu,
                             );
                         }
                         return;
@@ -5222,10 +5301,15 @@ pub fn generate_muse_glimmer(
                             );
                             glimmer::forward::abort_device_capture_stage(&mut bundle.state);
                             // Capture-aware: fail closed — no length-only reconcile after target decode failure.
-                            bundle.reset_session_state();
-                            m.conversation_tokens.clear();
-                            m.asst_turn_cache.clear();
-                            m.seq_pos = 0;
+                            let _ = reset_glimmer_live(
+                                bundle,
+                                &mut m.seq_pos,
+                                &mut m.conversation_tokens,
+                                &mut m.prefill_checkpoints,
+                                &mut m.dflash_checkpoints,
+                                &mut m.asst_turn_cache,
+                                gpu,
+                            );
                             return;
                         }
                     }
@@ -5322,10 +5406,14 @@ pub fn generate_muse_glimmer(
                     Err(e) => {
                         gpu.free_tensor(hidden_for_draft).ok();
                         emit_error_with_id(stdout, id, format!("glimmer drafter lm_head: {e}"));
-                        let _ = reconcile_glimmer_mirror(
+                        let _ = reset_glimmer_live(
                             bundle,
-                            &mut m.conversation_tokens,
                             &mut m.seq_pos,
+                            &mut m.conversation_tokens,
+                            &mut m.prefill_checkpoints,
+                            &mut m.dflash_checkpoints,
+                            &mut m.asst_turn_cache,
+                            gpu,
                         );
                         return;
                     }
@@ -5368,10 +5456,15 @@ pub fn generate_muse_glimmer(
                                     format!("muse_glimmer verify failed: {e:?}"),
                                 );
                                 glimmer::forward::abort_device_capture_stage(&mut bundle.state);
-                                bundle.reset_session_state();
-                                m.conversation_tokens.clear();
-                                m.asst_turn_cache.clear();
-                                m.seq_pos = 0;
+                                let _ = reset_glimmer_live(
+                                    bundle,
+                                    &mut m.seq_pos,
+                                    &mut m.conversation_tokens,
+                                    &mut m.prefill_checkpoints,
+                                    &mut m.dflash_checkpoints,
+                                    &mut m.asst_turn_cache,
+                                    gpu,
+                                );
                                 return;
                             }
                         }
@@ -5394,10 +5487,14 @@ pub fn generate_muse_glimmer(
                                     id,
                                     format!("muse_glimmer verify failed: {e:?}"),
                                 );
-                                let _ = reconcile_glimmer_mirror(
+                                let _ = reset_glimmer_live(
                                     bundle,
-                                    &mut m.conversation_tokens,
                                     &mut m.seq_pos,
+                                    &mut m.conversation_tokens,
+                                    &mut m.prefill_checkpoints,
+                                    &mut m.dflash_checkpoints,
+                                    &mut m.asst_turn_cache,
+                                    gpu,
                                 );
                                 return;
                             }
@@ -5421,10 +5518,15 @@ pub fn generate_muse_glimmer(
                                 format!("muse_glimmer verify failed: {e:?}"),
                             );
                             glimmer::forward::abort_device_capture_stage(&mut bundle.state);
-                            bundle.reset_session_state();
-                            m.conversation_tokens.clear();
-                            m.asst_turn_cache.clear();
-                            m.seq_pos = 0;
+                            let _ = reset_glimmer_live(
+                                bundle,
+                                &mut m.seq_pos,
+                                &mut m.conversation_tokens,
+                                &mut m.prefill_checkpoints,
+                                &mut m.dflash_checkpoints,
+                                &mut m.asst_turn_cache,
+                                gpu,
+                            );
                             return;
                         }
                     }
@@ -5447,10 +5549,14 @@ pub fn generate_muse_glimmer(
                                 id,
                                 format!("muse_glimmer verify failed: {e:?}"),
                             );
-                            let _ = reconcile_glimmer_mirror(
+                            let _ = reset_glimmer_live(
                                 bundle,
-                                &mut m.conversation_tokens,
                                 &mut m.seq_pos,
+                                &mut m.conversation_tokens,
+                                &mut m.prefill_checkpoints,
+                                &mut m.dflash_checkpoints,
+                                &mut m.asst_turn_cache,
+                                gpu,
                             );
                             return;
                         }
@@ -5617,10 +5723,15 @@ pub fn generate_muse_glimmer(
                             format!("muse_glimmer commit_device_verify_capture failed: {e}"),
                         );
                         glimmer::forward::abort_device_capture_stage(&mut bundle.state);
-                        bundle.reset_session_state();
-                        m.conversation_tokens.clear();
-                        m.asst_turn_cache.clear();
-                        m.seq_pos = 0;
+                        let _ = reset_glimmer_live(
+                            bundle,
+                            &mut m.seq_pos,
+                            &mut m.conversation_tokens,
+                            &mut m.prefill_checkpoints,
+                            &mut m.dflash_checkpoints,
+                            &mut m.asst_turn_cache,
+                            gpu,
+                        );
                         return;
                     }
                 }
@@ -5634,10 +5745,15 @@ pub fn generate_muse_glimmer(
                         ),
                     );
                     glimmer::forward::abort_device_capture_stage(&mut bundle.state);
-                    bundle.reset_session_state();
-                    m.conversation_tokens.clear();
-                    m.asst_turn_cache.clear();
-                    m.seq_pos = 0;
+                    let _ = reset_glimmer_live(
+                        bundle,
+                        &mut m.seq_pos,
+                        &mut m.conversation_tokens,
+                        &mut m.prefill_checkpoints,
+                        &mut m.dflash_checkpoints,
+                        &mut m.asst_turn_cache,
+                        gpu,
+                    );
                     return;
                 }
                 cur_pos = commit_end as u32;
@@ -5660,10 +5776,15 @@ pub fn generate_muse_glimmer(
                             format!("muse_glimmer profit guard synchronization failed: {e:?}"),
                         );
                         glimmer::forward::abort_device_capture_stage(&mut bundle.state);
-                        bundle.reset_session_state();
-                        m.conversation_tokens.clear();
-                        m.asst_turn_cache.clear();
-                        m.seq_pos = 0;
+                        let _ = reset_glimmer_live(
+                            bundle,
+                            &mut m.seq_pos,
+                            &mut m.conversation_tokens,
+                            &mut m.prefill_checkpoints,
+                            &mut m.dflash_checkpoints,
+                            &mut m.asst_turn_cache,
+                            gpu,
+                        );
                         return;
                     }
                     // t_after_verify covers draft+verify from t_window start.
@@ -5695,10 +5816,15 @@ pub fn generate_muse_glimmer(
                                     ),
                                 );
                                 glimmer::forward::abort_device_capture_stage(&mut bundle.state);
-                                bundle.reset_session_state();
-                                m.conversation_tokens.clear();
-                                m.asst_turn_cache.clear();
-                                m.seq_pos = 0;
+                                let _ = reset_glimmer_live(
+                                    bundle,
+                                    &mut m.seq_pos,
+                                    &mut m.conversation_tokens,
+                                    &mut m.prefill_checkpoints,
+                                    &mut m.dflash_checkpoints,
+                                    &mut m.asst_turn_cache,
+                                    gpu,
+                                );
                                 return;
                             }
                             let probe_ns = probe_t0.elapsed().as_nanos();
@@ -5772,10 +5898,15 @@ pub fn generate_muse_glimmer(
                                 format!("muse_glimmer profit probe decode failed: {e:?}"),
                             );
                             glimmer::forward::abort_device_capture_stage(&mut bundle.state);
-                            bundle.reset_session_state();
-                            m.conversation_tokens.clear();
-                            m.asst_turn_cache.clear();
-                            m.seq_pos = 0;
+                            let _ = reset_glimmer_live(
+                                bundle,
+                                &mut m.seq_pos,
+                                &mut m.conversation_tokens,
+                                &mut m.prefill_checkpoints,
+                                &mut m.dflash_checkpoints,
+                                &mut m.asst_turn_cache,
+                                gpu,
+                            );
                             return;
                         }
                     }
@@ -5831,6 +5962,20 @@ pub fn generate_muse_glimmer(
         };
 
         loop {
+            if check_abort(id) {
+                glimmer::forward::abort_device_capture_stage(&mut bundle.state);
+                let ep = reset_glimmer_live(
+                    bundle,
+                    &mut m.seq_pos,
+                    &mut m.conversation_tokens,
+                    &mut m.prefill_checkpoints,
+                    &mut m.dflash_checkpoints,
+                    &mut m.asst_turn_cache,
+                    gpu,
+                );
+                emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
+                return;
+            }
             if generated_count >= max_tokens {
                 break;
             }
@@ -5909,10 +6054,14 @@ pub fn generate_muse_glimmer(
                 Err(e) => {
                     emit_error_with_id(stdout, id, format!("muse_glimmer decode failed: {e:?}"));
                     glimmer::forward::abort_device_capture_stage(&mut bundle.state);
-                    let _ = reconcile_glimmer_mirror(
+                    let _ = reset_glimmer_live(
                         bundle,
-                        &mut m.conversation_tokens,
                         &mut m.seq_pos,
+                        &mut m.conversation_tokens,
+                        &mut m.prefill_checkpoints,
+                        &mut m.dflash_checkpoints,
+                        &mut m.asst_turn_cache,
+                        gpu,
                     );
                     return;
                 }
@@ -5971,7 +6120,12 @@ pub fn generate_muse_glimmer(
             }
         }
     }
-    let _ = reconcile_glimmer_mirror(bundle, &mut m.conversation_tokens, &mut m.seq_pos);
+    let _ = reconcile_glimmer_mirror(
+        bundle,
+        &mut m.conversation_tokens,
+        &mut m.seq_pos,
+        gpu,
+    );
 
     let decode_ms = decode_t0.elapsed().as_millis().max(1);
     let total_ms = t0.elapsed().as_millis().max(1);
@@ -6062,10 +6216,15 @@ pub fn generate_muse_glimmer(
         }
     } else {
         // Fail closed: the mirror and KV are mid-turn, so no later turn may reuse them.
-        bundle.reset_session_state();
-        m.conversation_tokens.clear();
-        m.asst_turn_cache.clear();
-        m.seq_pos = 0;
+        let _ = reset_glimmer_live(
+            bundle,
+            &mut m.seq_pos,
+            &mut m.conversation_tokens,
+            &mut m.prefill_checkpoints,
+            &mut m.dflash_checkpoints,
+            &mut m.asst_turn_cache,
+            gpu,
+        );
     }
 }
 pub fn generate_lfm2moe(
@@ -8019,6 +8178,30 @@ impl MapleThoughtRouter {
         close_injected
     }
 }
+/// Reset Maple's pure-attention state through the shared rollback owner.
+/// Maple has no speculative or eviction state, but keeping its architecture
+/// reset behind this adapter makes failure/cancel paths clear the same host,
+/// checkpoint, graph, and synchronization surfaces as every other family.
+fn reset_maple_live(
+    state: &mut hipfire_arch_maple::MapleState,
+    seq_pos: &mut usize,
+    conversation_tokens: &mut Vec<u32>,
+    prefill_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    dflash_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    asst_turn_cache: &mut AsstTurnCache,
+    gpu: &mut rdna_compute::Gpu,
+) -> RollbackEpilogue {
+    let mut reset_target = |gpu: &mut rdna_compute::Gpu| state.reset(gpu);
+    reset_live_bundle(
+        &mut reset_target,
+        seq_pos,
+        conversation_tokens,
+        prefill_checkpoints,
+        dflash_checkpoints,
+        asst_turn_cache,
+        gpu,
+    )
+}
 
 #[allow(clippy::too_many_arguments)]
 pub fn generate_maple(
@@ -8042,6 +8225,12 @@ pub fn generate_maple(
     let tokenizer = match m.tokenizer.as_ref() {
         Some(t) => t,
         None => {
+            emit_gen_start(
+                stdout,
+                id,
+                false,
+                crate::common::gen_start_contract_version_for_arch(15),
+            );
             emit_active_attempt_error(
                 stdout,
                 Some(id),
@@ -8059,6 +8248,12 @@ pub fn generate_maple(
     }) {
         Some(b) => b,
         _ => {
+            emit_gen_start(
+                stdout,
+                id,
+                false,
+                crate::common::gen_start_contract_version_for_arch(15),
+            );
             emit_active_attempt_error(
                 stdout,
                 Some(id),
@@ -8082,6 +8277,12 @@ pub fn generate_maple(
     // Mirrors the gemm_hfq6g256_moe_grouped_wmma guard that previously
     // panicked on gfx1151.
     if !gpu.arch_caps.has_wmma_w32() && !gpu.arch_caps.has_wmma_w32_gfx12() {
+        emit_gen_start(
+            stdout,
+            id,
+            false,
+            crate::common::gen_start_contract_version_for_arch(15),
+        );
         emit_active_attempt_error(
             stdout,
             Some(id),
@@ -8109,6 +8310,12 @@ pub fn generate_maple(
     // session that prompted this work, invented a `str_replace_editor` call).
     // Refuse instead, with a message that names the fix.
     if tools.is_some_and(|t| !t.is_empty()) && m.chat_template.is_none() {
+        emit_gen_start(
+            stdout,
+            id,
+            false,
+            crate::common::gen_start_contract_version_for_arch(15),
+        );
         emit_active_attempt_error(
             stdout,
             Some(id),
@@ -8247,6 +8454,12 @@ pub fn generate_maple(
         ))
     };
     if prompt_ids.is_empty() {
+        emit_gen_start(
+            stdout,
+            id,
+            primed_think,
+            crate::common::gen_start_contract_version_for_arch(15),
+        );
         emit_active_attempt_error(
             stdout,
             Some(id),
@@ -8264,13 +8477,25 @@ pub fn generate_maple(
     // it would only let an unrelated request's tokens leak into this one (the
     // "Zebedee" leak in the fn doc). Reset first, then size-check against a
     // known-empty cache so the check is about this turn alone.
-    if let Err(e) = state.reset(gpu) {
-        emit_error_with_id(stdout, id, format!("maple state reset failed: {e}"));
-        let _ = stdout.flush();
+    emit_gen_start(
+        stdout,
+        id,
+        primed_think,
+        crate::common::gen_start_contract_version_for_arch(15),
+    );
+    let ep = reset_maple_live(
+        state,
+        &mut m.seq_pos,
+        &mut m.conversation_tokens,
+        &mut m.prefill_checkpoints,
+        &mut m.dflash_checkpoints,
+        &mut m.asst_turn_cache,
+        gpu,
+    );
+    if !ep.rolled_back {
+        emit_fail_closed_error(stdout, Some(id), "maple state reset failed", "gpu", true, &ep);
         return;
     }
-    m.seq_pos = 0;
-    m.conversation_tokens.clear();
 
     // Capacity guard. No eviction on arch_id=15, and the cache is empty, so a
     // turn that still does not fit cannot be rescued — prefilling it would
@@ -8324,8 +8549,17 @@ pub fn generate_maple(
             ) {
                 Ok(l) => logits = l,
                 Err(e) => {
-                    emit_error_with_id(stdout, id, format!("maple batched prefill failed: {e}"));
-                    let _ = stdout.flush();
+                    let ep = reset_maple_live(
+                        state,
+                        &mut m.seq_pos,
+                        &mut m.conversation_tokens,
+                        &mut m.prefill_checkpoints,
+                        &mut m.dflash_checkpoints,
+                        &mut m.asst_turn_cache,
+                        gpu,
+                    );
+                    let message = format!("maple batched prefill failed: {e}");
+                    emit_fail_closed_error(stdout, Some(id), &message, "gpu", true, &ep);
                     return;
                 }
             }
@@ -8342,8 +8576,17 @@ pub fn generate_maple(
             ) {
                 Ok(l) => logits = l,
                 Err(e) => {
-                    emit_error_with_id(stdout, id, format!("maple prefill failed: {e}"));
-                    let _ = stdout.flush();
+                    let ep = reset_maple_live(
+                        state,
+                        &mut m.seq_pos,
+                        &mut m.conversation_tokens,
+                        &mut m.prefill_checkpoints,
+                        &mut m.dflash_checkpoints,
+                        &mut m.asst_turn_cache,
+                        gpu,
+                    );
+                    let message = format!("maple prefill failed: {e}");
+                    emit_fail_closed_error(stdout, Some(id), &message, "gpu", true, &ep);
                     return;
                 }
             }
@@ -8354,6 +8597,19 @@ pub fn generate_maple(
     }
     let t_prefill = Instant::now();
     let prefill_s = t_prefill.duration_since(t0).as_secs_f64();
+    if check_abort(id) {
+        let ep = reset_maple_live(
+            state,
+            &mut m.seq_pos,
+            &mut m.conversation_tokens,
+            &mut m.prefill_checkpoints,
+            &mut m.dflash_checkpoints,
+            &mut m.asst_turn_cache,
+            gpu,
+        );
+        emit_spec_cancel_after_rollback(stdout, id, 0, &ep);
+        return;
+    }
 
     // Open the wire contract before any token can reach the client. The CLI's
     // stream latch (`StreamContractError::PreStartEvent`) fail-closes on ANY
@@ -8389,12 +8645,6 @@ pub fn generate_maple(
     //     answer text: observed live on the first `.mq2lloydu` run, where the
     //     model's "The user wants me to write a hello world in Zig…" reasoning
     //     was returned as `content` with `reasoning_content` empty.
-    emit_gen_start(
-        stdout,
-        id,
-        primed_think,
-        crate::common::gen_start_contract_version_for_arch(15),
-    );
 
     // Decode. Greedy argmax over the CPU-side logits `forward_batch` /
     // `decode_step` return — there is no `gpu.argmax_f32` step on this path
@@ -8427,6 +8677,19 @@ pub fn generate_maple(
     let mut bytes_emitted: usize = 0;
 
     loop {
+        if check_abort(id) {
+            let ep = reset_maple_live(
+                state,
+                &mut m.seq_pos,
+                &mut m.conversation_tokens,
+                &mut m.prefill_checkpoints,
+                &mut m.dflash_checkpoints,
+                &mut m.asst_turn_cache,
+                gpu,
+            );
+            emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
+            return;
+        }
         if generated_count >= max_tokens {
             break;
         }
@@ -8494,8 +8757,17 @@ pub fn generate_maple(
                 next_tok = maple_argmax(&l, cfg.vocab_size);
             }
             Err(e) => {
-                emit_error_with_id(stdout, id, format!("maple decode_step failed: {e}"));
-                let _ = stdout.flush();
+                let ep = reset_maple_live(
+                    state,
+                    &mut m.seq_pos,
+                    &mut m.conversation_tokens,
+                    &mut m.prefill_checkpoints,
+                    &mut m.dflash_checkpoints,
+                    &mut m.asst_turn_cache,
+                    gpu,
+                );
+                let message = format!("maple decode_step failed: {e}");
+                emit_fail_closed_error(stdout, Some(id), &message, "gpu", true, &ep);
                 return;
             }
         }
@@ -8584,7 +8856,18 @@ pub fn generate_maple(
     let _ = stdout.flush();
     match await_client_terminal_commit(stdout, id, &pending_done) {
         ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
-        ClientTerminalDecision::Abort => {}
+        ClientTerminalDecision::Abort => {
+            let ep = reset_maple_live(
+                state,
+                &mut m.seq_pos,
+                &mut m.conversation_tokens,
+                &mut m.prefill_checkpoints,
+                &mut m.dflash_checkpoints,
+                &mut m.asst_turn_cache,
+                gpu,
+            );
+            emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
+        }
     }
 }
 

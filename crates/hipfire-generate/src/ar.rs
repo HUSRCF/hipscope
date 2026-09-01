@@ -681,6 +681,63 @@ pub fn qwen_ar_forward_fail_action() -> QwenArForwardFailAction {
 pub fn qwen_ar_forward_fail_message(phase: &str, err: impl std::fmt::Display) -> String {
     format!("{phase}: {err}")
 }
+/// Reset Qwen35's non-reversible recurrent state through its canonical
+/// architecture method.  The live rollback adapter below supplies the KV
+/// cursor and request-owned surfaces separately so callers can keep disjoint
+/// bundle borrows alive.
+fn qwen_ar_reset_recurrent(
+    dn: &mut qwen35::DeltaNetState,
+    gpu: &mut rdna_compute::Gpu,
+) -> Result<(), String> {
+    dn.reset(gpu)
+        .map_err(|e| format!("qwen35 reset_recurrent: {e}"))
+}
+
+/// Run the production fail-closed rollback while the Qwen35 bundle is live.
+/// The target adapter owns the non-reversible DeltaNet state; the adaptive
+/// extra owns the KV cursor and restores adaptive cache flags only when its
+/// controller is healthy.  Sticky adaptive poison is deliberately retained.
+fn qwen_ar_reset_live(
+    dn: &mut qwen35::DeltaNetState,
+    kv: &mut hipfire_runtime::llama::KvCache,
+    adaptive: Option<&mut hipfire_runtime::kv_adaptive::KvAdaptive>,
+    seq_pos: &mut usize,
+    conversation_tokens: &mut Vec<u32>,
+    prefill_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    dflash_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    asst_turn_cache: &mut hipfire_loader::AsstTurnCache,
+    gpu: &mut rdna_compute::Gpu,
+    spec: Option<&mut dyn hipfire_runtime::spec::Speculator>,
+) -> RollbackEpilogue {
+    let mut reset_target = |gpu: &mut rdna_compute::Gpu| qwen_ar_reset_recurrent(dn, gpu);
+    let mut reset_adaptive = |gpu: &mut rdna_compute::Gpu| -> Result<(), String> {
+        // The target adapter cannot also borrow `kv` because the production
+        // epilogue receives both closures at once.  Keep the cursor reset in
+        // this disjoint extra alongside adaptive cache-mode restoration.
+        kv.compact_offset = 0;
+        if let Some(ad) = adaptive.as_deref_mut() {
+            if !ad.is_poisoned() {
+                ad.reset_with_cache(gpu, kv);
+            }
+        }
+        Ok(())
+    };
+    crate::common::production_fail_closed_rollback_live_with_extras(
+        seq_pos,
+        conversation_tokens,
+        prefill_checkpoints,
+        dflash_checkpoints,
+        asst_turn_cache,
+        gpu,
+        &mut reset_target,
+        spec,
+        ResetExtras {
+            adaptive: Some(&mut reset_adaptive),
+            batch: None,
+            eviction: None,
+        },
+    )
+}
 
 /// Bound an eviction-enabled Qwen prefill write while an adaptive cache still
 /// owns the layout.  Before the one-way handoff, the eviction window is not a
@@ -2688,12 +2745,10 @@ pub fn generate(
             match resumed {
                 Some(tail) => tail,
                 None => {
-                    // No usable checkpoint — full cold reset. DeltaNet recurrent
-                    // state is non-reversible; treat as a miss. Inlined (not
-                    // `full_reset_cold`) because a `&tokenizer` borrow of `m` is
-                    // live here; these are disjoint field accesses. qwen35 state
-                    // lives in the bundle (ModelState::Qwen35), not the always-None
-                    // m.dn_state/m.kv_cache.
+                    // No usable checkpoint — full cold reset. DeltaNet
+                    // recurrent state is non-reversible; treat as a miss.
+                    // Keep the reset operations field-disjoint because
+                    // `tokenizer` is borrowed above.
                     m.seq_pos = 0;
                     m.conversation_tokens.clear();
                     crate::common::free_checkpoints(&mut m.prefill_checkpoints, gpu);
@@ -2701,24 +2756,7 @@ pub fn generate(
                         (s.as_mut() as &mut dyn Any)
                             .downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
                     }) {
-                        let dn = &b.dn_state;
-                        for s in &dn.s_matrices {
-                            let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-                        }
-                        for s in &dn.s_scales {
-                            let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-                        }
-                        for s in &dn.conv_states {
-                            let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-                        }
-                        for s in &dn.s_ef_residual {
-                            let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-                        }
-                    }
-                    if let Some(b) = m.state.as_mut().and_then(|s| {
-                        (s.as_mut() as &mut dyn Any)
-                            .downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
-                    }) {
+                        let _ = qwen_ar_reset_recurrent(&mut b.dn_state, gpu);
                         b.kv_cache.compact_offset = 0;
                     }
                     if let Some(b) = m.state.as_mut().and_then(|s| {
@@ -2778,28 +2816,13 @@ pub fn generate(
             }
         }
         // qwen35 recurrent state lives in the bundle (ModelState::Qwen35), not
-        // the always-None m.dn_state/m.kv_cache. Inlined (disjoint field access)
-        // because a `&tokenizer` borrow of `m` is live here.
+        // the always-None m.dn_state/m.kv_cache. Use the canonical reset
+        // method while keeping the `tokenizer` borrow and bundle access
+        // field-disjoint.
         if let Some(b) = m.state.as_mut().and_then(|s| {
             (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
         }) {
-            let dn = &b.dn_state;
-            for s in &dn.s_matrices {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for s in &dn.s_scales {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for s in &dn.conv_states {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for s in &dn.s_ef_residual {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-        }
-        if let Some(b) = m.state.as_mut().and_then(|s| {
-            (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
-        }) {
+            let _ = qwen_ar_reset_recurrent(&mut b.dn_state, gpu);
             b.kv_cache.compact_offset = 0;
         }
         if let Some(b) = m.state.as_mut().and_then(|s| {
@@ -2922,37 +2945,6 @@ pub fn generate(
         let scratch = &b.scratch;
         let kv = &mut b.kv_cache;
         let dn = &mut b.dn_state;
-        // Cold-reset after uncommitted AR prefill/decode failure. Mirrors
-        // multi-GPU `reset_pp_uncommitted_state!` and the prefill-abort path:
-        // DN is non-reversible, so partial forward must not poison the next
-        // turn. Adaptive poison stays sticky (`clear_adaptive_poison: false`).
-        macro_rules! reset_ar_uncommitted_state {
-            () => {{
-                debug_assert!(qwen_ar_forward_fail_action().reset_uncommitted_state);
-                debug_assert!(!qwen_ar_forward_fail_action().clear_adaptive_poison);
-                for s in &dn.s_matrices {
-                    let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-                }
-                for s in &dn.s_scales {
-                    let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-                }
-                for s in &dn.conv_states {
-                    let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-                }
-                for s in &dn.s_ef_residual {
-                    let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-                }
-                kv.compact_offset = 0;
-                if let Some(ad) = m.kv_adaptive.as_mut() {
-                    if !ad.is_poisoned() {
-                        ad.reset_with_cache(gpu, kv);
-                    }
-                }
-                m.seq_pos = 0;
-                m.conversation_tokens.clear();
-                crate::common::free_checkpoints(&mut m.prefill_checkpoints, gpu);
-            }};
-        }
 
         // Prefill this turn's tokens via the batched prefill entry point.
         // On gfx11+ for MQ4/HFQ4/MQ6/HFQ6 weights this hits the WMMA GEMM
@@ -3024,16 +3016,30 @@ pub fn generate(
                     qwen35::PREFILL_MAX_BATCH,
                 ) {
                     let action = qwen_ar_forward_fail_action();
-                    if action.reset_uncommitted_state {
-                        reset_ar_uncommitted_state!();
-                    }
-                    if action.emit_request_error {
-                        write_error(
-                            stdout,
-                            id,
-                            &qwen_ar_forward_fail_message("forward_prefill_batch", e),
-                        );
-                    }
+                    debug_assert!(action.reset_uncommitted_state);
+                    debug_assert!(action.emit_request_error);
+                    debug_assert!(!action.emit_failed_token);
+                    debug_assert!(!action.clear_adaptive_poison);
+                    let ep = qwen_ar_reset_live(
+                        dn,
+                        kv,
+                        m.kv_adaptive.as_mut(),
+                        &mut m.seq_pos,
+                        &mut m.conversation_tokens,
+                        &mut m.prefill_checkpoints,
+                        &mut m.dflash_checkpoints,
+                        &mut m.asst_turn_cache,
+                        gpu,
+                        m.speculator.as_deref_mut(),
+                    );
+                    crate::common::emit_fail_closed_error(
+                        stdout,
+                        Some(id),
+                        &qwen_ar_forward_fail_message("forward_prefill_batch", e),
+                        "gpu",
+                        true,
+                        &ep,
+                    );
                     return;
                 }
                 m.seq_pos += chunk_len;
@@ -3057,18 +3063,34 @@ pub fn generate(
                                 "[adaptive-kv] maybe_downshift error @ pos {} (eviction prefill): {:?} — poisoning model",
                                 m.seq_pos, e
                             );
-                            reset_ar_uncommitted_state!();
-                            crate::dense::emit_active_attempt_error(
+                            let action = qwen_ar_forward_fail_action();
+                            debug_assert!(action.reset_uncommitted_state);
+                            debug_assert!(action.emit_request_error);
+                            debug_assert!(!action.emit_failed_token);
+                            debug_assert!(!action.clear_adaptive_poison);
+                            let ep = qwen_ar_reset_live(
+                                dn,
+                                kv,
+                                Some(ad),
+                                &mut m.seq_pos,
+                                &mut m.conversation_tokens,
+                                &mut m.prefill_checkpoints,
+                                &mut m.dflash_checkpoints,
+                                &mut m.asst_turn_cache,
+                                gpu,
+                                m.speculator.as_deref_mut(),
+                            );
+                            crate::common::emit_fail_closed_error(
                                 stdout,
                                 Some(id),
-                                &format!(
-                                    "adaptive KV transition failed during eviction prefill: {e}"
+                                &qwen_ar_forward_fail_message(
+                                    "adaptive KV transition failed during eviction prefill",
+                                    e,
                                 ),
                                 "transient",
                                 true,
-                                false,
+                                &ep,
                             );
-                            let _ = stdout.flush();
                             return;
                         }
                     }
@@ -3106,16 +3128,30 @@ pub fn generate(
                     gpu, weights, config, chunk, m.seq_pos, kv, dn, scratch, None, None, None, None,
                 ) {
                     let action = qwen_ar_forward_fail_action();
-                    if action.reset_uncommitted_state {
-                        reset_ar_uncommitted_state!();
-                    }
-                    if action.emit_request_error {
-                        write_error(
-                            stdout,
-                            id,
-                            &qwen_ar_forward_fail_message("forward_prefill_batch", e),
-                        );
-                    }
+                    debug_assert!(action.reset_uncommitted_state);
+                    debug_assert!(action.emit_request_error);
+                    debug_assert!(!action.emit_failed_token);
+                    debug_assert!(!action.clear_adaptive_poison);
+                    let ep = qwen_ar_reset_live(
+                        dn,
+                        kv,
+                        m.kv_adaptive.as_mut(),
+                        &mut m.seq_pos,
+                        &mut m.conversation_tokens,
+                        &mut m.prefill_checkpoints,
+                        &mut m.dflash_checkpoints,
+                        &mut m.asst_turn_cache,
+                        gpu,
+                        m.speculator.as_deref_mut(),
+                    );
+                    crate::common::emit_fail_closed_error(
+                        stdout,
+                        Some(id),
+                        &qwen_ar_forward_fail_message("forward_prefill_batch", e),
+                        "gpu",
+                        true,
+                        &ep,
+                    );
                     return;
                 }
                 m.seq_pos += chunk.len();
@@ -3141,16 +3177,34 @@ pub fn generate(
                                 "[adaptive-kv] maybe_downshift error @ pos {} (prefill): {:?} — poisoning model",
                                 m.seq_pos, e
                             );
-                            // maybe_downshift already poisons on partial failure; surface hard.
-                            crate::dense::emit_active_attempt_error(
+                            let action = qwen_ar_forward_fail_action();
+                            debug_assert!(action.reset_uncommitted_state);
+                            debug_assert!(action.emit_request_error);
+                            debug_assert!(!action.emit_failed_token);
+                            debug_assert!(!action.clear_adaptive_poison);
+                            let ep = qwen_ar_reset_live(
+                                dn,
+                                kv,
+                                Some(ad),
+                                &mut m.seq_pos,
+                                &mut m.conversation_tokens,
+                                &mut m.prefill_checkpoints,
+                                &mut m.dflash_checkpoints,
+                                &mut m.asst_turn_cache,
+                                gpu,
+                                m.speculator.as_deref_mut(),
+                            );
+                            crate::common::emit_fail_closed_error(
                                 stdout,
                                 Some(id),
-                                &format!("adaptive KV transition failed during prefill: {e}"),
+                                &qwen_ar_forward_fail_message(
+                                    "adaptive KV transition failed during prefill",
+                                    e,
+                                ),
                                 "transient",
                                 true,
-                                false,
+                                &ep,
                             );
-                            let _ = stdout.flush();
                             return;
                         }
                     }
@@ -3199,15 +3253,34 @@ pub fn generate(
                         "[adaptive-kv] maybe_downshift error @ pos {} (post-prefill): {:?} — poisoning model",
                         m.seq_pos, e
                     );
-                    crate::dense::emit_active_attempt_error(
+                    let action = qwen_ar_forward_fail_action();
+                    debug_assert!(action.reset_uncommitted_state);
+                    debug_assert!(action.emit_request_error);
+                    debug_assert!(!action.emit_failed_token);
+                    debug_assert!(!action.clear_adaptive_poison);
+                    let ep = qwen_ar_reset_live(
+                        dn,
+                        kv,
+                        Some(ad),
+                        &mut m.seq_pos,
+                        &mut m.conversation_tokens,
+                        &mut m.prefill_checkpoints,
+                        &mut m.dflash_checkpoints,
+                        &mut m.asst_turn_cache,
+                        gpu,
+                        m.speculator.as_deref_mut(),
+                    );
+                    crate::common::emit_fail_closed_error(
                         stdout,
                         Some(id),
-                        &format!("adaptive KV transition failed after prefill: {e}"),
+                        &qwen_ar_forward_fail_message(
+                            "adaptive KV transition failed after prefill",
+                            e,
+                        ),
                         "transient",
                         true,
-                        false,
+                        &ep,
                     );
-                    let _ = stdout.flush();
                     return;
                 }
             }
@@ -3504,17 +3577,30 @@ pub fn generate(
                 gpu, weights, config, next_token, m.seq_pos, kv, dn, scratch,
             ) {
                 let action = qwen_ar_forward_fail_action();
+                debug_assert!(action.reset_uncommitted_state);
+                debug_assert!(action.emit_request_error);
                 debug_assert!(!action.emit_failed_token);
-                if action.reset_uncommitted_state {
-                    reset_ar_uncommitted_state!();
-                }
-                if action.emit_request_error {
-                    write_error(
-                        stdout,
-                        id,
-                        &qwen_ar_forward_fail_message("forward_scratch decode", e),
-                    );
-                }
+                debug_assert!(!action.clear_adaptive_poison);
+                let ep = qwen_ar_reset_live(
+                    dn,
+                    kv,
+                    m.kv_adaptive.as_mut(),
+                    &mut m.seq_pos,
+                    &mut m.conversation_tokens,
+                    &mut m.prefill_checkpoints,
+                    &mut m.dflash_checkpoints,
+                    &mut m.asst_turn_cache,
+                    gpu,
+                    m.speculator.as_deref_mut(),
+                );
+                crate::common::emit_fail_closed_error(
+                    stdout,
+                    Some(id),
+                    &qwen_ar_forward_fail_message("forward_scratch decode", e),
+                    "gpu",
+                    true,
+                    &ep,
+                );
                 return;
             }
             generated += 1;
@@ -3592,15 +3678,34 @@ pub fn generate(
                             "[adaptive-kv] maybe_downshift error @ pos {} (decode): {:?} — poisoning model",
                             m.seq_pos, e
                         );
-                        crate::dense::emit_active_attempt_error(
+                        let action = qwen_ar_forward_fail_action();
+                        debug_assert!(action.reset_uncommitted_state);
+                        debug_assert!(action.emit_request_error);
+                        debug_assert!(!action.emit_failed_token);
+                        debug_assert!(!action.clear_adaptive_poison);
+                        let ep = qwen_ar_reset_live(
+                            dn,
+                            kv,
+                            Some(ad),
+                            &mut m.seq_pos,
+                            &mut m.conversation_tokens,
+                            &mut m.prefill_checkpoints,
+                            &mut m.dflash_checkpoints,
+                            &mut m.asst_turn_cache,
+                            gpu,
+                            m.speculator.as_deref_mut(),
+                        );
+                        crate::common::emit_fail_closed_error(
                             stdout,
                             Some(id),
-                            &format!("adaptive KV transition failed during decode: {e}"),
+                            &qwen_ar_forward_fail_message(
+                                "adaptive KV transition failed during decode",
+                                e,
+                            ),
                             "transient",
                             true,
-                            false,
+                            &ep,
                         );
-                        let _ = stdout.flush();
                         return;
                     }
                 }
@@ -3721,17 +3826,33 @@ pub fn generate(
                             gpu, weights, config, t, m.seq_pos, kv, dn, scratch,
                         ) {
                             let action = qwen_ar_forward_fail_action();
+                            debug_assert!(action.reset_uncommitted_state);
+                            debug_assert!(action.emit_request_error);
                             debug_assert!(!action.emit_failed_token);
-                            if action.reset_uncommitted_state {
-                                reset_ar_uncommitted_state!();
-                            }
-                            if action.emit_request_error {
-                                write_error(
-                                    stdout,
-                                    id,
-                                    &qwen_ar_forward_fail_message("forward_scratch think_close", e),
-                                );
-                            }
+                            debug_assert!(!action.clear_adaptive_poison);
+                            let ep = qwen_ar_reset_live(
+                                dn,
+                                kv,
+                                m.kv_adaptive.as_mut(),
+                                &mut m.seq_pos,
+                                &mut m.conversation_tokens,
+                                &mut m.prefill_checkpoints,
+                                &mut m.dflash_checkpoints,
+                                &mut m.asst_turn_cache,
+                                gpu,
+                                m.speculator.as_deref_mut(),
+                            );
+                            crate::common::emit_fail_closed_error(
+                                stdout,
+                                Some(id),
+                                &qwen_ar_forward_fail_message(
+                                    "forward_scratch think_close",
+                                    e,
+                                ),
+                                "gpu",
+                                true,
+                                &ep,
+                            );
                             return;
                         }
                         // Keep the grammar matcher in sync over force-closed tokens,
@@ -3916,20 +4037,33 @@ pub fn generate(
                             gpu, weights, config, tok, m.seq_pos, kv, dn, scratch,
                         ) {
                             let action = qwen_ar_forward_fail_action();
+                            debug_assert!(action.reset_uncommitted_state);
+                            debug_assert!(action.emit_request_error);
                             debug_assert!(!action.emit_failed_token);
-                            if action.reset_uncommitted_state {
-                                reset_ar_uncommitted_state!();
-                            }
-                            if action.emit_request_error {
-                                write_error(
-                                    stdout,
-                                    id,
-                                    &qwen_ar_forward_fail_message(
-                                        "forward_scratch budget_alert",
-                                        e,
-                                    ),
-                                );
-                            }
+                            debug_assert!(!action.clear_adaptive_poison);
+                            let ep = qwen_ar_reset_live(
+                                dn,
+                                kv,
+                                m.kv_adaptive.as_mut(),
+                                &mut m.seq_pos,
+                                &mut m.conversation_tokens,
+                                &mut m.prefill_checkpoints,
+                                &mut m.dflash_checkpoints,
+                                &mut m.asst_turn_cache,
+                                gpu,
+                                m.speculator.as_deref_mut(),
+                            );
+                            crate::common::emit_fail_closed_error(
+                                stdout,
+                                Some(id),
+                                &qwen_ar_forward_fail_message(
+                                    "forward_scratch budget_alert",
+                                    e,
+                                ),
+                                "gpu",
+                                true,
+                                &ep,
+                            );
                             return;
                         }
                         let prev_fed = bytes_fed_to_filter;
@@ -4080,16 +4214,30 @@ pub fn generate(
                     qwen35::forward_scratch(gpu, weights, config, t, m.seq_pos, kv, dn, scratch)
                 {
                     let action = qwen_ar_forward_fail_action();
-                    if action.reset_uncommitted_state {
-                        reset_ar_uncommitted_state!();
-                    }
-                    if action.emit_request_error {
-                        write_error(
-                            stdout,
-                            id,
-                            &qwen_ar_forward_fail_message("forward_scratch trailer", e),
-                        );
-                    }
+                    debug_assert!(action.reset_uncommitted_state);
+                    debug_assert!(action.emit_request_error);
+                    debug_assert!(!action.emit_failed_token);
+                    debug_assert!(!action.clear_adaptive_poison);
+                    let ep = qwen_ar_reset_live(
+                        dn,
+                        kv,
+                        m.kv_adaptive.as_mut(),
+                        &mut m.seq_pos,
+                        &mut m.conversation_tokens,
+                        &mut m.prefill_checkpoints,
+                        &mut m.dflash_checkpoints,
+                        &mut m.asst_turn_cache,
+                        gpu,
+                        m.speculator.as_deref_mut(),
+                    );
+                    crate::common::emit_fail_closed_error(
+                        stdout,
+                        Some(id),
+                        &qwen_ar_forward_fail_message("forward_scratch trailer", e),
+                        "gpu",
+                        true,
+                        &ep,
+                    );
                     return;
                 }
                 // Producer-owned hidden commit: physical raw mutation + bookkeeping
