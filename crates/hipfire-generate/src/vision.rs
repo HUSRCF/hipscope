@@ -33,22 +33,10 @@ use std::io::Write;
 use std::path::Path;
 use std::time::Instant;
 
-// ── Local verbatim copies of daemon-shared helpers ───────────────────────────
-// `free_checkpoints` and `emit_committed_event` are shared across all generate
-// paths in the daemon (25 and 18 call sites). They cannot live in
-// `hipfire-engine` (the former touches `hipfire_arch_qwen35::speculative::DeltaNetSnapshot`,
-// an arch type) and the generate crate cannot depend back on the daemon.
-// This local copy keeps the moved VL bodies byte-identical without introducing a
-// circular dependency. The daemon retains its own identical copy.
-
-fn free_checkpoints(
-    cks: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
-    gpu: &mut rdna_compute::Gpu,
-) {
-    for (_, snap) in cks.drain(..) {
-        snap.free_gpu(gpu);
-    }
-}
+// ── Local copy of the daemon-shared emission helper ──────────────────────────
+// `emit_committed_event` is shared across all generate paths in the daemon,
+// but the generate crate cannot depend back on the daemon. Keeping this tiny
+// copy here avoids introducing a circular dependency.
 
 fn emit_committed_event(
     stdout: &mut (impl std::io::Write + ?Sized),
@@ -181,46 +169,57 @@ pub fn vl_no_eviction_kv_cap(physical_cap: usize, max_seq: usize, adaptive_engag
     }
 }
 
-pub(crate) fn vl_cold_reset_uncommitted(
+#[allow(clippy::too_many_arguments)]
+fn vl_reset_live(
     gpu: &mut rdna_compute::Gpu,
-    dn: &qwen35::DeltaNetState,
+    dn: &mut qwen35::DeltaNetState,
     kv: &mut hipfire_runtime::llama::KvCache,
     kv_adaptive: &mut Option<hipfire_runtime::kv_adaptive::KvAdaptive>,
     seq_pos: &mut usize,
     conversation_tokens: &mut Vec<u32>,
     prefill_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
-) {
-    for s in &dn.s_matrices {
-        let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-    }
-    for s in &dn.s_scales {
-        let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-    }
-    for s in &dn.conv_states {
-        let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-    }
-    for s in &dn.s_ef_residual {
-        let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-    }
-    kv.compact_offset = 0;
-    if let Some(ad) = kv_adaptive.as_mut() {
-        if !ad.is_poisoned() {
-            ad.reset_with_cache(gpu, kv);
+    dflash_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    asst_turn_cache: &mut hipfire_loader::AsstTurnCache,
+    speculator: &mut Option<Box<dyn Speculator>>,
+) -> crate::common::RollbackEpilogue {
+    let mut reset_target = |gpu: &mut rdna_compute::Gpu| {
+        dn.reset(gpu)
+            .map_err(|e| format!("VL recurrent reset: {e}"))?;
+        kv.compact_offset = 0;
+        if let Some(ad) = kv_adaptive.as_mut() {
+            if !ad.is_poisoned() {
+                ad.reset_with_cache(gpu, kv);
+            }
         }
-    }
-    *seq_pos = 0;
-    conversation_tokens.clear();
-    free_checkpoints(prefill_checkpoints, gpu);
+        Ok(())
+    };
+    let spec = speculator
+        .as_deref_mut()
+        .map(|spec| spec as &mut dyn Speculator);
+    crate::common::production_fail_closed_rollback_live_with_target(
+        seq_pos,
+        conversation_tokens,
+        prefill_checkpoints,
+        dflash_checkpoints,
+        asst_turn_cache,
+        gpu,
+        &mut reset_target,
+        spec,
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn vl_adaptive_downshift_fail_closed(
     kv_adaptive: &mut Option<hipfire_runtime::kv_adaptive::KvAdaptive>,
     seq_pos: &mut usize,
     gpu: &mut rdna_compute::Gpu,
+    dn: &mut qwen35::DeltaNetState,
     kv: &mut hipfire_runtime::llama::KvCache,
-    dn: &qwen35::DeltaNetState,
     conversation_tokens: &mut Vec<u32>,
     prefill_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    dflash_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    asst_turn_cache: &mut hipfire_loader::AsstTurnCache,
+    speculator: &mut Option<Box<dyn Speculator>>,
     stdout: &mut std::io::Stdout,
     id: &str,
     phase: &str,
@@ -244,9 +243,7 @@ pub(crate) fn vl_adaptive_downshift_fail_closed(
                 "[adaptive-kv] maybe_downshift error @ pos {} ({}): {:?} — poisoning model",
                 committed, phase, e
             );
-            // maybe_downshift already poisons on partial failure; cold-reset
-            // leaves poison sticky (reset_with_cache skipped when poisoned).
-            vl_cold_reset_uncommitted(
+            let ep = vl_reset_live(
                 gpu,
                 dn,
                 kv,
@@ -254,31 +251,42 @@ pub(crate) fn vl_adaptive_downshift_fail_closed(
                 seq_pos,
                 conversation_tokens,
                 prefill_checkpoints,
+                dflash_checkpoints,
+                asst_turn_cache,
+                speculator,
             );
-            write_error(
+            crate::common::emit_fail_closed_error(
                 stdout,
-                id,
+                Some(id),
                 &format!("adaptive KV transition failed during {phase}: {e}"),
+                "gpu",
+                true,
+                &ep,
             );
             true
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn vl_forward_fail(
     stdout: &mut std::io::Stdout,
     id: &str,
     phase: &str,
     err: impl std::fmt::Display,
     gpu: &mut rdna_compute::Gpu,
-    dn: &qwen35::DeltaNetState,
+    dn: &mut qwen35::DeltaNetState,
     kv: &mut hipfire_runtime::llama::KvCache,
     kv_adaptive: &mut Option<hipfire_runtime::kv_adaptive::KvAdaptive>,
     seq_pos: &mut usize,
     conversation_tokens: &mut Vec<u32>,
     prefill_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    dflash_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    asst_turn_cache: &mut hipfire_loader::AsstTurnCache,
+    speculator: &mut Option<Box<dyn Speculator>>,
 ) {
-    vl_cold_reset_uncommitted(
+    let message = format!("VL {phase}: {err}");
+    let ep = vl_reset_live(
         gpu,
         dn,
         kv,
@@ -286,8 +294,11 @@ pub(crate) fn vl_forward_fail(
         seq_pos,
         conversation_tokens,
         prefill_checkpoints,
+        dflash_checkpoints,
+        asst_turn_cache,
+        speculator,
     );
-    write_error(stdout, id, &format!("VL {phase}: {err}"));
+    crate::common::emit_fail_closed_error(stdout, Some(id), &message, "gpu", true, &ep);
 }
 
 pub(crate) fn build_vl_mrope_ctx(
@@ -390,6 +401,57 @@ pub(crate) fn build_vl_mrope_ctx(
         positions,
         built.rope_delta,
     ))
+}
+#[allow(clippy::too_many_arguments)]
+fn dots_reset_live(
+    target_reset: &mut dyn FnMut(&mut rdna_compute::Gpu) -> Result<(), String>,
+    seq_pos: &mut usize,
+    conversation_tokens: &mut Vec<u32>,
+    prefill_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    dflash_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    asst_turn_cache: &mut hipfire_loader::AsstTurnCache,
+    speculator: &mut Option<Box<dyn Speculator>>,
+    gpu: &mut rdna_compute::Gpu,
+) -> crate::common::RollbackEpilogue {
+    let spec = speculator
+        .as_deref_mut()
+        .map(|spec| spec as &mut dyn Speculator);
+    crate::common::production_fail_closed_rollback_live_with_target(
+        seq_pos,
+        conversation_tokens,
+        prefill_checkpoints,
+        dflash_checkpoints,
+        asst_turn_cache,
+        gpu,
+        target_reset,
+        spec,
+    )
+}
+#[allow(clippy::too_many_arguments)]
+fn dots_reset_state_live(
+    state: &mut hipfire_arch_qwen2::qwen2::Qwen2State,
+    seq_pos: &mut usize,
+    conversation_tokens: &mut Vec<u32>,
+    prefill_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    dflash_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    asst_turn_cache: &mut hipfire_loader::AsstTurnCache,
+    speculator: &mut Option<Box<dyn Speculator>>,
+    gpu: &mut rdna_compute::Gpu,
+) -> crate::common::RollbackEpilogue {
+    let mut target_reset = |_: &mut rdna_compute::Gpu| {
+        state.reset();
+        Ok(())
+    };
+    dots_reset_live(
+        &mut target_reset,
+        seq_pos,
+        conversation_tokens,
+        prefill_checkpoints,
+        dflash_checkpoints,
+        asst_turn_cache,
+        speculator,
+        gpu,
+    )
 }
 
 pub fn generate_vl(
@@ -566,58 +628,36 @@ pub fn generate_vl(
             "[daemon/vl] context full ({}/{}) — resetting conversation",
             m.seq_pos, m.max_seq
         );
-        m.seq_pos = 0;
-        m.conversation_tokens.clear();
-        free_checkpoints(&mut m.prefill_checkpoints, gpu);
-        free_checkpoints(&mut m.dflash_checkpoints, gpu);
-        // Free the speculator's (relocated) checkpoint ring on reset.
-        if let Some(s) = m.speculator.as_mut() {
-            if let Err(e) = s.reset(gpu) {
-                emit_active_attempt_error(
-                    stdout,
-                    Some(id),
-                    &format!("vision context reset failed: {e}"),
-                    "gpu",
-                    true,
-                    false,
-                );
-                return;
-            }
-        }
-        // VL is qwen35-vl (arch 5/8); its recurrent state lives in the bundle
-        // (ModelState::Qwen35), not the always-None m.dn_state/m.kv_cache.
-        // Inlined (disjoint field access) because a `&tokenizer` borrow of `m`
-        // is live here.
-        if let Some(b) = m.state.as_mut().and_then(|s| {
+        let reset = match m.state.as_mut().and_then(|s| {
             (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
         }) {
-            let dn = &b.dn_state;
-            for s in &dn.s_matrices {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for s in &dn.s_scales {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for s in &dn.conv_states {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for s in &dn.s_ef_residual {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-        }
-        if let Some(b) = m.state.as_mut().and_then(|s| {
-            (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
-        }) {
-            b.kv_cache.compact_offset = 0;
-        }
-        if let Some(ad) = m.kv_adaptive.as_mut() {
-            if let Some(b) = m.state.as_mut().and_then(|s| {
-                (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
-            }) {
-                ad.reset_with_cache(gpu, &mut b.kv_cache);
-            } else {
-                ad.reset();
-            }
+            Some(bundle) => vl_reset_live(
+                gpu,
+                &mut bundle.dn_state,
+                &mut bundle.kv_cache,
+                &mut m.kv_adaptive,
+                &mut m.seq_pos,
+                &mut m.conversation_tokens,
+                &mut m.prefill_checkpoints,
+                &mut m.dflash_checkpoints,
+                &mut m.asst_turn_cache,
+                &mut m.speculator,
+            ),
+            None => crate::common::RollbackEpilogue {
+                rolled_back: false,
+                context: Some("VL bundle missing during context reset".to_string()),
+            },
+        };
+        if !reset.rolled_back {
+            crate::common::emit_fail_closed_error(
+                stdout,
+                Some(id),
+                "vision context reset failed",
+                "gpu",
+                true,
+                &reset,
+            );
+            return;
         }
     }
 
@@ -747,11 +787,7 @@ pub fn generate_vl(
     ) {
         Ok(v) => v,
         Err(e) => {
-            vl_forward_fail(
-                stdout,
-                id,
-                "vision_forward",
-                e,
+            let ep = vl_reset_live(
                 gpu,
                 dn,
                 kv,
@@ -759,6 +795,17 @@ pub fn generate_vl(
                 &mut m.seq_pos,
                 &mut m.conversation_tokens,
                 &mut m.prefill_checkpoints,
+                &mut m.dflash_checkpoints,
+                &mut m.asst_turn_cache,
+                &mut m.speculator,
+            );
+            crate::common::emit_fail_closed_error(
+                stdout,
+                Some(id),
+                &format!("VL vision_forward: {e}"),
+                "gpu",
+                true,
+                &ep,
             );
             return;
         }
@@ -792,15 +839,22 @@ pub fn generate_vl(
     // transition errors are request-scoped (no panic, no later token emit).
     let mut visual_idx = 0usize;
     for &token in prompt_tokens.iter() {
-        // Client-cancel poll. The encoder phase before this loop cannot be
-        // interrupted mid-kernel, so prefill's first iteration is where an
-        // abort signalled during vision_forward takes effect. The terminal
-        // MUST be the canonical cancelled pair: falling through to the done
-        // handshake on an aborted attempt strands the serve admission guard
-        // permanently (2026-08-27 ledger finding c — slot wedged ≥3 min on
-        // every mid-encode disconnect before these polls existed).
+        // The encoder phase cannot be interrupted mid-kernel.  Poll before
+        // the first token and reset before publishing the cancellation pair.
         if check_abort(id) {
-            emit_qwen_ar_cancelled(stdout, id, 0);
+            let ep = vl_reset_live(
+                gpu,
+                dn,
+                kv,
+                &mut m.kv_adaptive,
+                &mut m.seq_pos,
+                &mut m.conversation_tokens,
+                &mut m.prefill_checkpoints,
+                &mut m.dflash_checkpoints,
+                &mut m.asst_turn_cache,
+                &mut m.speculator,
+            );
+            crate::common::emit_spec_cancel_after_rollback(stdout, id, 0, &ep);
             return;
         }
         if token == image_pad_id && visual_idx < n_visual_tokens {
@@ -820,6 +874,9 @@ pub fn generate_vl(
                     &mut m.seq_pos,
                     &mut m.conversation_tokens,
                     &mut m.prefill_checkpoints,
+                    &mut m.dflash_checkpoints,
+                    &mut m.asst_turn_cache,
+                    &mut m.speculator,
                 );
                 return;
             }
@@ -839,6 +896,9 @@ pub fn generate_vl(
                 &mut m.seq_pos,
                 &mut m.conversation_tokens,
                 &mut m.prefill_checkpoints,
+                &mut m.dflash_checkpoints,
+                &mut m.asst_turn_cache,
+                &mut m.speculator,
             );
             return;
         }
@@ -865,22 +925,25 @@ pub fn generate_vl(
                         &mut m.seq_pos,
                         &mut m.conversation_tokens,
                         &mut m.prefill_checkpoints,
+                        &mut m.dflash_checkpoints,
+                        &mut m.asst_turn_cache,
+                        &mut m.speculator,
                     );
                     return;
                 }
             }
         }
-        // Adaptive KV: downshift BETWEEN prefill tokens the moment the
-        // start-tier buffer fills so a long multi-chunk visual+text prompt
-        // cannot overflow current-stride capacity before decode begins.
         if vl_adaptive_downshift_fail_closed(
             &mut m.kv_adaptive,
             &mut m.seq_pos,
             gpu,
-            kv,
             dn,
+            kv,
             &mut m.conversation_tokens,
             &mut m.prefill_checkpoints,
+            &mut m.dflash_checkpoints,
+            &mut m.asst_turn_cache,
+            &mut m.speculator,
             stdout,
             id,
             "vl-prefill",
@@ -890,16 +953,17 @@ pub fn generate_vl(
     }
 
     m.conversation_tokens.extend_from_slice(&prompt_tokens);
-
-    // Adaptive KV: post-prefill catch-up before first sample/decode write.
     if vl_adaptive_downshift_fail_closed(
         &mut m.kv_adaptive,
         &mut m.seq_pos,
         gpu,
-        kv,
         dn,
+        kv,
         &mut m.conversation_tokens,
         &mut m.prefill_checkpoints,
+        &mut m.dflash_checkpoints,
+        &mut m.asst_turn_cache,
+        &mut m.speculator,
         stdout,
         id,
         "vl-post-prefill",
@@ -942,6 +1006,9 @@ pub fn generate_vl(
                 &mut m.seq_pos,
                 &mut m.conversation_tokens,
                 &mut m.prefill_checkpoints,
+                &mut m.dflash_checkpoints,
+                &mut m.asst_turn_cache,
+                &mut m.speculator,
             );
             return;
         }
@@ -1005,7 +1072,19 @@ pub fn generate_vl(
         // conversation_tokens) is reclaimed by the next dispatch's
         // non-zero-seq_pos reset, matching the dots.ocr cancel path.
         if check_abort(id) {
-            emit_qwen_ar_cancelled(stdout, id, generated);
+            let ep = vl_reset_live(
+                gpu,
+                dn,
+                kv,
+                &mut m.kv_adaptive,
+                &mut m.seq_pos,
+                &mut m.conversation_tokens,
+                &mut m.prefill_checkpoints,
+                &mut m.dflash_checkpoints,
+                &mut m.asst_turn_cache,
+                &mut m.speculator,
+            );
+            crate::common::emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
             return;
         }
         // Commit KV for this sampled token BEFORE any client-visible emit so a
@@ -1029,6 +1108,9 @@ pub fn generate_vl(
                 &mut m.seq_pos,
                 &mut m.conversation_tokens,
                 &mut m.prefill_checkpoints,
+                &mut m.dflash_checkpoints,
+                &mut m.asst_turn_cache,
+                &mut m.speculator,
             );
             return;
         }
@@ -1055,10 +1137,13 @@ pub fn generate_vl(
                         &mut m.seq_pos,
                         &mut m.conversation_tokens,
                         &mut m.prefill_checkpoints,
+                        &mut m.dflash_checkpoints,
+                        &mut m.asst_turn_cache,
+                        &mut m.speculator,
                     );
                     return;
-                }
             }
+        }
         }
         if vl_adaptive_downshift_fail_closed(
             &mut m.kv_adaptive,
@@ -1068,6 +1153,9 @@ pub fn generate_vl(
             dn,
             &mut m.conversation_tokens,
             &mut m.prefill_checkpoints,
+            &mut m.dflash_checkpoints,
+            &mut m.asst_turn_cache,
+            &mut m.speculator,
             stdout,
             id,
             "vl-decode",
@@ -1130,6 +1218,9 @@ pub fn generate_vl(
                     &mut m.seq_pos,
                     &mut m.conversation_tokens,
                     &mut m.prefill_checkpoints,
+                    &mut m.dflash_checkpoints,
+                    &mut m.asst_turn_cache,
+                    &mut m.speculator,
                 );
                 return;
             }
@@ -1185,6 +1276,9 @@ pub fn generate_vl(
                                 &mut m.seq_pos,
                                 &mut m.conversation_tokens,
                                 &mut m.prefill_checkpoints,
+                                &mut m.dflash_checkpoints,
+                                &mut m.asst_turn_cache,
+                                &mut m.speculator,
                             );
                             return;
                         }
@@ -1211,10 +1305,13 @@ pub fn generate_vl(
                                         &mut m.seq_pos,
                                         &mut m.conversation_tokens,
                                         &mut m.prefill_checkpoints,
+                                        &mut m.dflash_checkpoints,
+                                        &mut m.asst_turn_cache,
+                                        &mut m.speculator,
                                     );
                                     return;
-                                }
                             }
+                        }
                         }
                         if vl_adaptive_downshift_fail_closed(
                             &mut m.kv_adaptive,
@@ -1224,6 +1321,9 @@ pub fn generate_vl(
                             dn,
                             &mut m.conversation_tokens,
                             &mut m.prefill_checkpoints,
+                            &mut m.dflash_checkpoints,
+                            &mut m.asst_turn_cache,
+                            &mut m.speculator,
                             stdout,
                             id,
                             "vl-think-close",
@@ -1287,6 +1387,9 @@ pub fn generate_vl(
                                 &mut m.seq_pos,
                                 &mut m.conversation_tokens,
                                 &mut m.prefill_checkpoints,
+                                &mut m.dflash_checkpoints,
+                                &mut m.asst_turn_cache,
+                                &mut m.speculator,
                             );
                             return;
                         }
@@ -1328,6 +1431,9 @@ pub fn generate_vl(
                     &mut m.seq_pos,
                     &mut m.conversation_tokens,
                     &mut m.prefill_checkpoints,
+                    &mut m.dflash_checkpoints,
+                    &mut m.asst_turn_cache,
+                    &mut m.speculator,
                 );
                 return;
             }
@@ -1354,19 +1460,25 @@ pub fn generate_vl(
                             &mut m.seq_pos,
                             &mut m.conversation_tokens,
                             &mut m.prefill_checkpoints,
+                            &mut m.dflash_checkpoints,
+                            &mut m.asst_turn_cache,
+                            &mut m.speculator,
                         );
                         return;
-                    }
                 }
+            }
             }
             if vl_adaptive_downshift_fail_closed(
                 &mut m.kv_adaptive,
                 &mut m.seq_pos,
                 gpu,
-                kv,
                 dn,
+                kv,
                 &mut m.conversation_tokens,
                 &mut m.prefill_checkpoints,
+                &mut m.dflash_checkpoints,
+                &mut m.asst_turn_cache,
+                &mut m.speculator,
                 stdout,
                 id,
                 "vl-trailer",
@@ -1378,7 +1490,19 @@ pub fn generate_vl(
     }
 
     if check_abort(id) {
-        emit_qwen_ar_cancelled(stdout, id, generated);
+        let ep = vl_reset_live(
+            gpu,
+            dn,
+            kv,
+            &mut m.kv_adaptive,
+            &mut m.seq_pos,
+            &mut m.conversation_tokens,
+            &mut m.prefill_checkpoints,
+            &mut m.dflash_checkpoints,
+            &mut m.asst_turn_cache,
+            &mut m.speculator,
+        );
+        crate::common::emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
         return;
     }
     // Flush any trailing partial think marker as ordinary text in its
@@ -1418,7 +1542,19 @@ pub fn generate_vl(
     match await_client_terminal_commit(stdout, id, &pending_done) {
         ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
         ClientTerminalDecision::Abort => {
-            emit_qwen_ar_cancelled(stdout, id, generated);
+            let ep = vl_reset_live(
+                gpu,
+                dn,
+                kv,
+                &mut m.kv_adaptive,
+                &mut m.seq_pos,
+                &mut m.conversation_tokens,
+                &mut m.prefill_checkpoints,
+                &mut m.dflash_checkpoints,
+                &mut m.asst_turn_cache,
+                &mut m.speculator,
+            );
+            crate::common::emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
         }
     }
 }
@@ -1497,23 +1633,16 @@ pub fn generate_vl_dots_ocr(
 
     let max_seq = m.max_seq;
 
-    // 2. Model state (disjoint field borrows of `m`).
-    let tokenizer = m.tokenizer.as_ref().unwrap();
+    // 2. Resolve the text configuration and build the prompt before taking
+    // any mutable model borrow.  The reset below is the loader-owned boundary
+    // for every Dots OCR turn.
     let config = m.dots_ocr().unwrap().config.clone();
     let text_cfg = config.text.clone();
     let dim = text_cfg.hidden_size;
-    // Weights/state via raw pointers to allow owned config while keeping disjoint borrows.
-    let bundle_ptr: *mut hipfire_arch_dots_ocr::DotsOcrBundle =
-        match m.state.as_mut().and_then(|s| {
-            (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_dots_ocr::DotsOcrBundle>()
-        }) {
-            Some(b) => b as *mut _,
-            None => unreachable!(),
-        };
-    let weights = unsafe { &(*bundle_ptr).weights };
-    let state = unsafe { &mut (*bundle_ptr).state };
-    // 3. Build the prompt (HF-exact framing; imgpad count == n_visual by construction).
-    let prompt_ids = dots_ocr::build_prompt_ids(tokenizer, prompt, n_visual);
+    let prompt_ids = {
+        let tokenizer = m.tokenizer.as_ref().unwrap();
+        dots_ocr::build_prompt_ids(tokenizer, prompt, n_visual)
+    };
     if prompt_ids.len().saturating_add(max_tokens) > max_seq {
         write_error(stdout, id, &format!(
             "dots.ocr request ({} prompt + {} gen) exceeds KV budget ({}); reload with a larger --max-seq",
@@ -1524,6 +1653,33 @@ pub fn generate_vl_dots_ocr(
         emit_qwen_ar_cancelled(stdout, id, 0);
         return;
     }
+    if let Err(error) = m.reset_context(gpu) {
+        crate::common::emit_fail_closed_error(
+            stdout,
+            Some(id),
+            "dots.ocr context reset failed",
+            "gpu",
+            true,
+            &crate::common::RollbackEpilogue {
+                rolled_back: false,
+                context: Some(error),
+            },
+        );
+        return;
+    }
+    let tokenizer = m.tokenizer.as_ref().unwrap();
+    // Weights/state via raw pointers to allow owned config while keeping
+    // disjoint borrows.  The loader reset above has already released all
+    // previous request state.
+    let bundle_ptr: *mut hipfire_arch_dots_ocr::DotsOcrBundle =
+        match m.state.as_mut().and_then(|s| {
+            (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_dots_ocr::DotsOcrBundle>()
+        }) {
+            Some(b) => b as *mut _,
+            None => unreachable!(),
+        };
+    let weights = unsafe { &(*bundle_ptr).weights };
+    let state = unsafe { &mut (*bundle_ptr).state };
 
     // 4. Vision encoder → merged visual tokens.
     let patch_cols = img.patches.len() / n_patches;
@@ -1591,7 +1747,6 @@ pub fn generate_vl_dots_ocr(
     // and run it through the batched prefill in one pass. Only the ~215
     // text positions need a GPU embedding lookup; the 4880 visual rows are
     // already host-resident in `merged`.
-    state.reset();
     let t_prefill = Instant::now();
     let mut embeds = vec![0f32; prompt_ids.len() * dim];
     let emb_scratch = match gpu.alloc_tensor(&[dim], rdna_compute::DType::F32) {
@@ -1610,7 +1765,17 @@ pub fn generate_vl_dots_ocr(
     for (pos, &token) in prompt_ids.iter().enumerate() {
         if check_abort(id) {
             let _ = gpu.free_tensor(emb_scratch);
-            emit_qwen_ar_cancelled(stdout, id, 0);
+            let ep = dots_reset_state_live(
+                state,
+                &mut m.seq_pos,
+                &mut m.conversation_tokens,
+                &mut m.prefill_checkpoints,
+                &mut m.dflash_checkpoints,
+                &mut m.asst_turn_cache,
+                &mut m.speculator,
+                gpu,
+            );
+            crate::common::emit_spec_cancel_after_rollback(stdout, id, 0, &ep);
             return;
         }
         if token == dots_ocr::IMGPAD_ID {
@@ -1647,29 +1812,75 @@ pub fn generate_vl_dots_ocr(
     }
     let _ = gpu.free_tensor(emb_scratch);
     if check_abort(id) {
-        emit_qwen_ar_cancelled(stdout, id, 0);
+        let ep = dots_reset_state_live(
+            state,
+            &mut m.seq_pos,
+            &mut m.conversation_tokens,
+            &mut m.prefill_checkpoints,
+            &mut m.dflash_checkpoints,
+            &mut m.asst_turn_cache,
+            &mut m.speculator,
+            gpu,
+        );
+        crate::common::emit_spec_cancel_after_rollback(stdout, id, 0, &ep);
         return;
     }
     if let Some(e) = embed_err {
-        write_error(
+        let ep = dots_reset_state_live(
+            state,
+            &mut m.seq_pos,
+            &mut m.conversation_tokens,
+            &mut m.prefill_checkpoints,
+            &mut m.dflash_checkpoints,
+            &mut m.asst_turn_cache,
+            &mut m.speculator,
+            gpu,
+        );
+        crate::common::emit_fail_closed_error(
             stdout,
-            id,
+            Some(id),
             &format!("dots.ocr prefill embed build failed: {e}"),
+            "gpu",
+            true,
+            &ep,
         );
         return;
     }
     if let Err(e) =
         qwen2::forward_prefill_batch_embeds(gpu, &weights.text, &text_cfg, state, &embeds)
     {
-        write_error(
+        let ep = dots_reset_state_live(
+            state,
+            &mut m.seq_pos,
+            &mut m.conversation_tokens,
+            &mut m.prefill_checkpoints,
+            &mut m.dflash_checkpoints,
+            &mut m.asst_turn_cache,
+            &mut m.speculator,
+            gpu,
+        );
+        crate::common::emit_fail_closed_error(
             stdout,
-            id,
+            Some(id),
             &format!("dots.ocr batched prefill failed: {e:?}"),
+            "gpu",
+            true,
+            &ep,
         );
         return;
     }
     if check_abort(id) {
-        emit_qwen_ar_cancelled(stdout, id, 0);
+        let ep = dots_reset_state_live(
+            state,
+            &mut m.seq_pos,
+            &mut m.conversation_tokens,
+            &mut m.prefill_checkpoints,
+            &mut m.dflash_checkpoints,
+            &mut m.asst_turn_cache,
+            &mut m.speculator,
+            gpu,
+        );
+        crate::common::emit_spec_cancel_after_rollback(stdout, id, 0, &ep);
         return;
     }
     let prefill_tokens = prompt_ids.len();
@@ -1719,7 +1930,24 @@ pub fn generate_vl_dots_ocr(
     let mut next = match gpu.argmax_f32(&state.logits, text_cfg.vocab_size) {
         Ok(t) => t,
         Err(e) => {
-            write_error(stdout, id, &format!("dots.ocr argmax failed: {e:?}"));
+            let ep = dots_reset_state_live(
+                state,
+                &mut m.seq_pos,
+                &mut m.conversation_tokens,
+                &mut m.prefill_checkpoints,
+                &mut m.dflash_checkpoints,
+                &mut m.asst_turn_cache,
+                &mut m.speculator,
+                gpu,
+            );
+            crate::common::emit_fail_closed_error(
+                stdout,
+                Some(id),
+                &format!("dots.ocr argmax failed: {e:?}"),
+                "gpu",
+                true,
+                &ep,
+            );
             return;
         }
     };
@@ -1735,7 +1963,17 @@ pub fn generate_vl_dots_ocr(
 
     while generated < max_tokens {
         if check_abort(id) {
-            emit_qwen_ar_cancelled(stdout, id, generated);
+            let ep = dots_reset_state_live(
+                state,
+                &mut m.seq_pos,
+                &mut m.conversation_tokens,
+                &mut m.prefill_checkpoints,
+                &mut m.dflash_checkpoints,
+                &mut m.asst_turn_cache,
+                &mut m.speculator,
+                gpu,
+            );
+            crate::common::emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
             return;
         }
         if eos_set.contains(&next) {
@@ -1768,14 +2006,41 @@ pub fn generate_vl_dots_ocr(
         match qwen2::forward_step_greedy(gpu, &weights.text, &text_cfg, state, next) {
             Ok(t) => next = t,
             Err(e) => {
-                write_error(stdout, id, &format!("dots.ocr decode failed: {e:?}"));
+                let ep = dots_reset_state_live(
+                    state,
+                    &mut m.seq_pos,
+                    &mut m.conversation_tokens,
+                    &mut m.prefill_checkpoints,
+                    &mut m.dflash_checkpoints,
+                    &mut m.asst_turn_cache,
+                    &mut m.speculator,
+                    gpu,
+                );
+                crate::common::emit_fail_closed_error(
+                    stdout,
+                    Some(id),
+                    &format!("dots.ocr decode failed: {e:?}"),
+                    "gpu",
+                    true,
+                    &ep,
+                );
                 return;
             }
         }
     }
 
     if check_abort(id) {
-        emit_qwen_ar_cancelled(stdout, id, generated);
+        let ep = dots_reset_state_live(
+            state,
+            &mut m.seq_pos,
+            &mut m.conversation_tokens,
+            &mut m.prefill_checkpoints,
+            &mut m.dflash_checkpoints,
+            &mut m.asst_turn_cache,
+            &mut m.speculator,
+            gpu,
+        );
+        crate::common::emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
         return;
     }
 
@@ -1811,7 +2076,17 @@ pub fn generate_vl_dots_ocr(
     match await_client_terminal_commit(stdout, id, &pending_done) {
         ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
         ClientTerminalDecision::Abort => {
-            emit_qwen_ar_cancelled(stdout, id, generated);
+            let ep = dots_reset_state_live(
+                state,
+                &mut m.seq_pos,
+                &mut m.conversation_tokens,
+                &mut m.prefill_checkpoints,
+                &mut m.dflash_checkpoints,
+                &mut m.asst_turn_cache,
+                &mut m.speculator,
+                gpu,
+            );
+            crate::common::emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
         }
     }
 }
@@ -1848,6 +2123,11 @@ pub fn decode_vl_dots_ocr_ngram(
         t0,
         prefill_tokens,
         prefill_s,
+        &mut m.seq_pos,
+        &mut m.conversation_tokens,
+        &mut m.prefill_checkpoints,
+        &mut m.dflash_checkpoints,
+        &mut m.asst_turn_cache,
     );
     m.state = Some(Box::new(bundle));
     m.speculator = Some(spec);
@@ -1864,6 +2144,11 @@ pub fn run_dots_ocr_ngram_loop(
     t0: Instant,
     prefill_tokens: usize,
     prefill_s: f64,
+    seq_pos: &mut usize,
+    conversation_tokens: &mut Vec<u32>,
+    prefill_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    dflash_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    asst_turn_cache: &mut hipfire_loader::AsstTurnCache,
 ) {
     let eos_set: Vec<u32> = if bundle.config.text.eos_token_ids.is_empty() {
         vec![bundle.config.text.eos_token_id]
@@ -1891,13 +2176,44 @@ pub fn run_dots_ocr_ngram_loop(
     ) {
         Ok(PrefillOutcome::Ready { first_token }) => first_token,
         Ok(PrefillOutcome::Aborted) => {
-            // Client cancel during n-gram prefill: cancel lifecycle only
-            // (no success done / commit_ready).
-            emit_qwen_ar_cancelled(stdout, id, 0);
+            let mut reset_target = |gpu: &mut rdna_compute::Gpu| {
+                hipfire_runtime::spec::SpecTarget::reset_recurrent(bundle, gpu)
+            };
+            let ep = crate::common::production_fail_closed_rollback_live_with_target(
+                seq_pos,
+                conversation_tokens,
+                prefill_checkpoints,
+                dflash_checkpoints,
+                asst_turn_cache,
+                gpu,
+                &mut reset_target,
+                Some(spec),
+            );
+            crate::common::emit_spec_cancel_after_rollback(stdout, id, 0, &ep);
             return;
         }
         Err(e) => {
-            write_error(stdout, id, &format!("dots.ocr spec prefill: {e}"));
+            let mut reset_target = |gpu: &mut rdna_compute::Gpu| {
+                hipfire_runtime::spec::SpecTarget::reset_recurrent(bundle, gpu)
+            };
+            let ep = crate::common::production_fail_closed_rollback_live_with_target(
+                seq_pos,
+                conversation_tokens,
+                prefill_checkpoints,
+                dflash_checkpoints,
+                asst_turn_cache,
+                gpu,
+                &mut reset_target,
+                Some(spec),
+            );
+            crate::common::emit_fail_closed_error(
+                stdout,
+                Some(id),
+                &format!("dots.ocr spec prefill: {e}"),
+                "gpu",
+                true,
+                &ep,
+            );
             return;
         }
     };
@@ -1963,7 +2279,20 @@ pub fn run_dots_ocr_ngram_loop(
         // rule as the prefill-cancel site above). The caller restores
         // bundle/spec state on return; the next request resets at prefill.
         if check_abort(id) {
-            emit_qwen_ar_cancelled(stdout, id, generated);
+            let mut reset_target = |gpu: &mut rdna_compute::Gpu| {
+                hipfire_runtime::spec::SpecTarget::reset_recurrent(bundle, gpu)
+            };
+            let ep = crate::common::production_fail_closed_rollback_live_with_target(
+                seq_pos,
+                conversation_tokens,
+                prefill_checkpoints,
+                dflash_checkpoints,
+                asst_turn_cache,
+                gpu,
+                &mut reset_target,
+                Some(spec),
+            );
+            crate::common::emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
             return;
         }
         // Context-overflow guard (matches generate_spec): one window writes up
@@ -1977,8 +2306,28 @@ pub fn run_dots_ocr_ngram_loop(
         ) {
             Ok(s) => s,
             Err(e) => {
-                write_error(stdout, id, &format!("dots.ocr spec_step: {e}"));
-                break;
+                let mut reset_target = |gpu: &mut rdna_compute::Gpu| {
+                    hipfire_runtime::spec::SpecTarget::reset_recurrent(bundle, gpu)
+                };
+                let ep = crate::common::production_fail_closed_rollback_live_with_target(
+                    seq_pos,
+                    conversation_tokens,
+                    prefill_checkpoints,
+                    dflash_checkpoints,
+                    asst_turn_cache,
+                    gpu,
+                    &mut reset_target,
+                    Some(spec),
+                );
+                crate::common::emit_fail_closed_error(
+                    stdout,
+                    Some(id),
+                    &format!("dots.ocr spec_step: {e}"),
+                    "gpu",
+                    true,
+                    &ep,
+                );
+                return;
             }
         };
         spec_cycles += 1;
@@ -2030,7 +2379,22 @@ pub fn run_dots_ocr_ngram_loop(
     });
     match await_client_terminal_commit(stdout, id, &pending_done) {
         ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
-        ClientTerminalDecision::Abort => {}
+        ClientTerminalDecision::Abort => {
+            let mut reset_target = |gpu: &mut rdna_compute::Gpu| {
+                hipfire_runtime::spec::SpecTarget::reset_recurrent(bundle, gpu)
+            };
+            let ep = crate::common::production_fail_closed_rollback_live_with_target(
+                seq_pos,
+                conversation_tokens,
+                prefill_checkpoints,
+                dflash_checkpoints,
+                asst_turn_cache,
+                gpu,
+                &mut reset_target,
+                Some(spec),
+            );
+            crate::common::emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
+        }
     }
 }
 
@@ -2045,17 +2409,48 @@ pub fn generate_dots_ocr_text(
     top_p: f32,
     max_tokens: usize,
 ) {
+    emit_gen_start(
+        stdout,
+        id,
+        false,
+        crate::common::gen_start_contract_version_for_arch(m.arch_id),
+    );
     let _ = (temp, top_p); // greedy decode for now; sampling left for future work
     let t0 = Instant::now();
 
     let max_seq = m.max_seq;
-
-    // Model state (disjoint field borrows of `m`).
-    let tokenizer = m.tokenizer.as_ref().unwrap();
     let config = m.dots_ocr().unwrap().config.clone();
     let text_cfg = config.text.clone();
     let dim = text_cfg.hidden_size;
-    // Weights/state via raw pointers to allow owned config while keeping disjoint borrows.
+    let prompt_ids = {
+        let tokenizer = m.tokenizer.as_ref().unwrap();
+        tokenizer.encode(prompt)
+    };
+    if prompt_ids.len().saturating_add(max_tokens) > max_seq {
+        write_error(stdout, id, &format!(
+            "dots.ocr text request ({} prompt + {} gen) exceeds KV budget ({}); reload with a larger --max-seq",
+            prompt_ids.len(), max_tokens, max_seq));
+        return;
+    }
+    if check_abort(id) {
+        emit_qwen_ar_cancelled(stdout, id, 0);
+        return;
+    }
+    if let Err(error) = m.reset_context(gpu) {
+        crate::common::emit_fail_closed_error(
+            stdout,
+            Some(id),
+            "dots.ocr text context reset failed",
+            "gpu",
+            true,
+            &crate::common::RollbackEpilogue {
+                rolled_back: false,
+                context: Some(error),
+            },
+        );
+        return;
+    }
+    let tokenizer = m.tokenizer.as_ref().unwrap();
     let bundle_ptr: *mut hipfire_arch_dots_ocr::DotsOcrBundle =
         match m.state.as_mut().and_then(|s| {
             (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_dots_ocr::DotsOcrBundle>()
@@ -2065,18 +2460,6 @@ pub fn generate_dots_ocr_text(
         };
     let weights = unsafe { &(*bundle_ptr).weights };
     let state = unsafe { &mut (*bundle_ptr).state };
-    // Tokenize the text prompt directly (no image tokens).
-    let prompt_ids = tokenizer.encode(prompt);
-    if prompt_ids.len().saturating_add(max_tokens) > max_seq {
-        write_error(stdout, id, &format!(
-            "dots.ocr text request ({} prompt + {} gen) exceeds KV budget ({}); reload with a larger --max-seq",
-            prompt_ids.len(), max_tokens, max_seq));
-        return;
-    }
-
-    // Prefill: build the [seq × dim] embedding matrix via per-token
-    // embedding lookup dispatch, then run through batched prefill.
-    state.reset();
     let t_prefill = Instant::now();
     let mut embeds = vec![0f32; prompt_ids.len() * dim];
     let emb_scratch = match gpu.alloc_tensor(&[dim], rdna_compute::DType::F32) {
@@ -2114,20 +2497,46 @@ pub fn generate_dots_ocr_text(
     }
     let _ = gpu.free_tensor(emb_scratch);
     if let Some(e) = embed_err {
-        write_error(
+        let ep = dots_reset_state_live(
+            state,
+            &mut m.seq_pos,
+            &mut m.conversation_tokens,
+            &mut m.prefill_checkpoints,
+            &mut m.dflash_checkpoints,
+            &mut m.asst_turn_cache,
+            &mut m.speculator,
+            gpu,
+        );
+        crate::common::emit_fail_closed_error(
             stdout,
-            id,
+            Some(id),
             &format!("dots.ocr prefill embed build failed: {e}"),
+            "gpu",
+            true,
+            &ep,
         );
         return;
     }
     if let Err(e) =
         qwen2::forward_prefill_batch_embeds(gpu, &weights.text, &text_cfg, state, &embeds)
     {
-        write_error(
+        let ep = dots_reset_state_live(
+            state,
+            &mut m.seq_pos,
+            &mut m.conversation_tokens,
+            &mut m.prefill_checkpoints,
+            &mut m.dflash_checkpoints,
+            &mut m.asst_turn_cache,
+            &mut m.speculator,
+            gpu,
+        );
+        crate::common::emit_fail_closed_error(
             stdout,
-            id,
+            Some(id),
             &format!("dots.ocr batched prefill failed: {e:?}"),
+            "gpu",
+            true,
+            &ep,
         );
         return;
     }
@@ -2143,7 +2552,24 @@ pub fn generate_dots_ocr_text(
     let mut next = match gpu.argmax_f32(&state.logits, text_cfg.vocab_size) {
         Ok(t) => t,
         Err(e) => {
-            write_error(stdout, id, &format!("dots.ocr argmax failed: {e:?}"));
+            let ep = dots_reset_state_live(
+                state,
+                &mut m.seq_pos,
+                &mut m.conversation_tokens,
+                &mut m.prefill_checkpoints,
+                &mut m.dflash_checkpoints,
+                &mut m.asst_turn_cache,
+                &mut m.speculator,
+                gpu,
+            );
+            crate::common::emit_fail_closed_error(
+                stdout,
+                Some(id),
+                &format!("dots.ocr argmax failed: {e:?}"),
+                "gpu",
+                true,
+                &ep,
+            );
             return;
         }
     };
@@ -2153,6 +2579,20 @@ pub fn generate_dots_ocr_text(
     let mut generated = 0usize;
 
     while generated < max_tokens {
+        if check_abort(id) {
+            let ep = dots_reset_state_live(
+                state,
+                &mut m.seq_pos,
+                &mut m.conversation_tokens,
+                &mut m.prefill_checkpoints,
+                &mut m.dflash_checkpoints,
+                &mut m.asst_turn_cache,
+                &mut m.speculator,
+                gpu,
+            );
+            crate::common::emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
+            return;
+        }
         if eos_set.contains(&next) {
             break;
         }
@@ -2183,7 +2623,24 @@ pub fn generate_dots_ocr_text(
         match qwen2::forward_step_greedy(gpu, &weights.text, &text_cfg, state, next) {
             Ok(t) => next = t,
             Err(e) => {
-                write_error(stdout, id, &format!("dots.ocr decode failed: {e:?}"));
+                let ep = dots_reset_state_live(
+                    state,
+                    &mut m.seq_pos,
+                    &mut m.conversation_tokens,
+                    &mut m.prefill_checkpoints,
+                    &mut m.dflash_checkpoints,
+                    &mut m.asst_turn_cache,
+                    &mut m.speculator,
+                    gpu,
+                );
+                crate::common::emit_fail_closed_error(
+                    stdout,
+                    Some(id),
+                    &format!("dots.ocr decode failed: {e:?}"),
+                    "gpu",
+                    true,
+                    &ep,
+                );
                 return;
             }
         }
@@ -2220,7 +2677,19 @@ pub fn generate_dots_ocr_text(
     });
     match await_client_terminal_commit(stdout, id, &pending_done) {
         ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
-        ClientTerminalDecision::Abort => {}
+        ClientTerminalDecision::Abort => {
+            let ep = dots_reset_state_live(
+                state,
+                &mut m.seq_pos,
+                &mut m.conversation_tokens,
+                &mut m.prefill_checkpoints,
+                &mut m.dflash_checkpoints,
+                &mut m.asst_turn_cache,
+                &mut m.speculator,
+                gpu,
+            );
+            crate::common::emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
+        }
     }
 }
 
