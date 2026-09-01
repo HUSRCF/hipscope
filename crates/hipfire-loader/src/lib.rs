@@ -31,7 +31,9 @@ use hipfire_runtime::kv_backend::KvBackend;
 use hipfire_runtime::kv_mode;
 use hipfire_runtime::llama;
 use hipfire_runtime::llama::{KvCacheExt, KvDims, KvLayers, KvTarget};
-use hipfire_runtime::loader_api::{CaskConfig, LoadCtx, ModelSource, SpecLoadCfg};
+use hipfire_runtime::loader_api::{
+    CaskConfig, LoadCtx, LoadFaultStage, ModelSource, SpecLoadCfg,
+};
 use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_runtime::spec::{SpecEmit, SpecEmitCtx, SpecTargetGuard, Speculator};
 use hipfire_runtime::triattn::{EvictionCtx, TriAttnCenters};
@@ -346,6 +348,22 @@ impl Eviction {
         match self {
             Eviction::Plain(c) => c.maybe_evict(gpu, kv, physical),
             Eviction::Cask(c) => c.maybe_evict(gpu, kv, physical),
+        }
+    }
+    /// Reset request-local eviction bookkeeping while retaining the
+    /// model-lifetime policy/scratch owner. `compact_offset` is the mutable
+    /// cursor in the owning KV cache when the caller has a direct borrow.
+    pub fn reset_request_state(&self, compact_offset: Option<&mut i32>) {
+        match self {
+            Self::Plain(ctx) => ctx.reset_request_state(compact_offset),
+            Self::Cask(ctx) => ctx.base.reset_request_state(compact_offset),
+        }
+    }
+
+    pub fn request_reset_count(&self) -> usize {
+        match self {
+            Self::Plain(ctx) => ctx.request_reset_count(),
+            Self::Cask(ctx) => ctx.base.request_reset_count(),
         }
     }
     pub fn budget(&self) -> usize {
@@ -870,6 +888,112 @@ pub fn gemma4_batched_prefill_optin(_gpu: &Gpu) -> bool {
     gemma4::lowered::batched_prefill_enabled() || gemma4::lowered::wmma_prefill_enabled()
 }
 
+/// Reset dispatch selected from the model's actual ownership topology.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResetRoute {
+    Single,
+    PipelineParallel,
+    TensorParallel,
+    ExpertParallel,
+}
+
+/// Production reset phases. Keeping this list in the loader makes every
+/// caller (including live generation adapters) account for the same surfaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResetPhase {
+    Checkpoints,
+    Architecture,
+    AdaptiveKv,
+    Batch,
+    Speculator,
+    EvictionRequest,
+    GraphsAndSynchronize,
+}
+
+impl ResetPhase {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Checkpoints => "checkpoints",
+            Self::Architecture => "architecture",
+            Self::AdaptiveKv => "adaptive-kv",
+            Self::Batch => "batch",
+            Self::Speculator => "speculator",
+            Self::EvictionRequest => "eviction-request",
+            Self::GraphsAndSynchronize => "graphs-and-synchronize",
+        }
+    }
+}
+
+/// Host/request state passed to the resource-neutral reset owner. Production
+/// `LoadedModel` fields and CPU evidence use this exact function; optional
+/// vectors let tests expose request-local state that a concrete architecture
+/// keeps behind its own adapter.
+pub struct ResetRequestState<'a> {
+    pub seq_pos: &'a mut usize,
+    pub conversation_tokens: &'a mut Vec<u32>,
+    pub asst_turn_cache: Option<&'a mut AsstTurnCache>,
+    pub request_tokens: Option<&'a mut Vec<u32>>,
+    pub compact_offset: Option<&'a mut i32>,
+    pub speculative_pending: Option<&'a mut Vec<u32>>,
+}
+
+/// Device/architecture operations supplied by a production owner or a
+/// metadata-only test. The callback is invoked for every phase even after a
+/// prior failure so cleanup remains fail-closed and exhaustive.
+pub struct ResetOperations<'a> {
+    pub run: &'a mut dyn FnMut(ResetRoute, ResetPhase) -> Result<(), String>,
+}
+
+/// Resource-neutral reset algorithm used by `LoadedModel` and live
+/// generation. It clears request state, routes every production phase, and
+/// retains the persistent eviction owner while resetting only its request
+/// cursor.
+pub fn reset_lifecycle(
+    route: ResetRoute,
+    mut state: ResetRequestState<'_>,
+    eviction: Option<&Eviction>,
+    operations: &mut ResetOperations<'_>,
+) -> Result<(), String> {
+    *state.seq_pos = 0;
+    state.conversation_tokens.clear();
+    if let Some(cache) = state.asst_turn_cache.as_deref_mut() {
+        cache.clear();
+    }
+    if let Some(tokens) = state.request_tokens.as_deref_mut() {
+        tokens.clear();
+    }
+    if let Some(pending) = state.speculative_pending.as_deref_mut() {
+        pending.clear();
+    }
+
+    let mut errors = Vec::new();
+    for phase in [
+        ResetPhase::Checkpoints,
+        ResetPhase::Architecture,
+        ResetPhase::AdaptiveKv,
+        ResetPhase::Batch,
+        ResetPhase::Speculator,
+        ResetPhase::EvictionRequest,
+        ResetPhase::GraphsAndSynchronize,
+    ] {
+        if phase == ResetPhase::EvictionRequest {
+            if let Some(owner) = eviction {
+                owner.reset_request_state(state.compact_offset.as_deref_mut());
+            } else if let Some(offset) = state.compact_offset.as_deref_mut() {
+                *offset = 0;
+            }
+        }
+        if let Err(error) = (operations.run)(route, phase) {
+            errors.push(format!("{}: {error}", phase.label()));
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
 // ─── LoadedModel ──────────────────────────────────────────────────────
 
 pub struct LoadedModel {
@@ -1221,6 +1345,23 @@ impl LoadedModel {
             .map(|b| b as &mut dyn hipfire_runtime::arch_model::ArchModel)
     }
 
+    /// Resolve reset dispatch from the model's actual ownership topology.
+    /// Dense TP is stored in `EpArch` but is intentionally distinguished from
+    /// expert-parallel so tests and production cannot collapse the two.
+    pub fn reset_route(&self) -> ResetRoute {
+        if let Some(ep) = self.ep.as_ref() {
+            if matches!(&ep.inner, EpArch::Qwen35DenseTp { .. }) {
+                ResetRoute::TensorParallel
+            } else {
+                ResetRoute::ExpertParallel
+            }
+        } else if self.pp > 1 {
+            ResetRoute::PipelineParallel
+        } else {
+            ResetRoute::Single
+        }
+    }
+
     /// Reset the architecture-owned session surfaces through the loader's
     /// lifecycle boundary.  Generation code may add host/checkpoint/spec
     /// adapters around this method, but it must not dispatch directly to a
@@ -1237,183 +1378,263 @@ impl LoadedModel {
     }
 
     /// Reset all request-owned state for an EP model using its rank-owned
-    /// devices.  This is kept separate from [`Self::reset_context`] because
-    /// EP owns its `Gpu` collection inside `EpState`.
+    /// devices. This is the same resource-neutral lifecycle algorithm used by
+    /// single/PP/TP routes; only the per-phase device adapter differs.
     pub fn reset_ep_context(&mut self) -> Result<(), String> {
-        let mut errors = Vec::new();
-        self.seq_pos = 0;
-        self.conversation_tokens.clear();
-        self.asst_turn_cache.clear();
-        let Some(ep) = self.ep.as_mut() else {
+        if self.ep.is_none() {
             return Err("model has no EP owner".to_string());
-        };
-        if let Some(owner) = ep.gpus.devices.first_mut() {
-            for (_, snapshot) in self.prefill_checkpoints.drain(..) {
-                snapshot.free_gpu(owner);
-            }
-            for (_, snapshot) in self.dflash_checkpoints.drain(..) {
-                snapshot.free_gpu(owner);
-            }
-        } else {
-            self.prefill_checkpoints.clear();
-            self.dflash_checkpoints.clear();
-            errors.push("EP reset has no device for checkpoint ownership".to_string());
         }
-        reset_ep_architecture_state(ep, &mut errors);
-        if let Some(owner) = ep.gpus.devices.first_mut() {
-            if let Some(spec) = self.speculator.as_mut() {
-                if let Err(error) = spec.reset(owner) {
-                    errors.push(format!("EP spec.reset: {error}"));
+        let route = self.reset_route();
+        let model_ptr = self as *mut LoadedModel;
+        let mut run = move |phase_route: ResetRoute, phase: ResetPhase| {
+            debug_assert_eq!(phase_route, route);
+            // SAFETY: `reset_lifecycle` holds disjoint borrows of only the
+            // host fields and persistent eviction owner while this callback
+            // touches architecture/device fields.
+            let model = unsafe { &mut *model_ptr };
+            match phase {
+                ResetPhase::Checkpoints => {
+                    let Some(ep) = model.ep.as_mut() else {
+                        return Err("model has no EP owner".to_string());
+                    };
+                    let Some(owner) = ep.gpus.devices.first_mut() else {
+                        model.prefill_checkpoints.clear();
+                        model.dflash_checkpoints.clear();
+                        return Err(
+                            "EP reset has no device for checkpoint ownership".to_string()
+                        );
+                    };
+                    for (_, snapshot) in model.prefill_checkpoints.drain(..) {
+                        snapshot.free_gpu(owner);
+                    }
+                    for (_, snapshot) in model.dflash_checkpoints.drain(..) {
+                        snapshot.free_gpu(owner);
+                    }
+                    Ok(())
+                }
+                ResetPhase::Architecture => {
+                    let Some(ep) = model.ep.as_mut() else {
+                        return Err("model has no EP owner".to_string());
+                    };
+                    let mut errors = Vec::new();
+                    reset_ep_architecture_state(ep, &mut errors);
+                    if errors.is_empty() {
+                        Ok(())
+                    } else {
+                        Err(errors.join("; "))
+                    }
+                }
+                ResetPhase::AdaptiveKv => {
+                    if let Some(adaptive) = model.kv_adaptive.as_mut() {
+                        adaptive.reset();
+                    }
+                    Ok(())
+                }
+                ResetPhase::Batch => Ok(()),
+                ResetPhase::Speculator => {
+                    let Some(ep) = model.ep.as_mut() else {
+                        return Err("model has no EP owner".to_string());
+                    };
+                    if let (Some(owner), Some(spec)) =
+                        (ep.gpus.devices.first_mut(), model.speculator.as_mut())
+                    {
+                        spec.reset(owner)?;
+                    }
+                    Ok(())
+                }
+                ResetPhase::EvictionRequest => Ok(()),
+                ResetPhase::GraphsAndSynchronize => {
+                    let Some(ep) = model.ep.as_mut() else {
+                        return Err("model has no EP owner".to_string());
+                    };
+                    let mut errors = Vec::new();
+                    for (rank, device) in ep.gpus.devices.iter_mut().enumerate() {
+                        device.invalidate_graph_state();
+                        device.replay.invalidate_replay_observation_window();
+                        if let Err(error) = device.bind_thread() {
+                            errors.push(format!("EP rank{rank} bind_thread: {error}"));
+                            continue;
+                        }
+                        if let Err(error) = device.hip.device_synchronize() {
+                            errors.push(format!("EP rank{rank} device_synchronize: {error}"));
+                        } else {
+                            device.replay.begin_replay_observation_window();
+                        }
+                    }
+                    if errors.is_empty() {
+                        Ok(())
+                    } else {
+                        Err(errors.join("; "))
+                    }
                 }
             }
-        }
-        for (rank, device) in ep.gpus.devices.iter_mut().enumerate() {
-            device.invalidate_graph_state();
-            device.replay.invalidate_replay_observation_window();
-            if let Err(error) = device.bind_thread() {
-                errors.push(format!("EP rank{rank} bind_thread: {error}"));
-                continue;
-            }
-            if let Err(error) = device.hip.device_synchronize() {
-                errors.push(format!("EP rank{rank} device_synchronize: {error}"));
-            } else {
-                device.replay.begin_replay_observation_window();
-            }
-        }
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors.join("; "))
-        }
+        };
+        reset_lifecycle(
+            route,
+            ResetRequestState {
+                seq_pos: &mut self.seq_pos,
+                conversation_tokens: &mut self.conversation_tokens,
+                asst_turn_cache: Some(&mut self.asst_turn_cache),
+                request_tokens: None,
+                compact_offset: None,
+                speculative_pending: None,
+            },
+            self.eviction.as_ref(),
+            &mut ResetOperations { run: &mut run },
+        )
     }
 
+
     /// Reset every model-owned request surface before a new turn or after a
-    /// failed attempt.  This is the loader lifecycle boundary: generation
-    /// adapters only supply the device on which a single-GPU model runs and
-    /// never reimplement host/spec/adaptive/batch/graph cleanup.
+    /// failed attempt. Generation and the loader call the same phase runner;
+    /// only this method's callback supplies the concrete GPU operations.
     pub fn reset_context(&mut self, gpu: &mut Gpu) -> Result<(), String> {
-        let mut errors: Vec<String> = Vec::new();
-        self.seq_pos = 0;
-        self.conversation_tokens.clear();
-        self.asst_turn_cache.clear();
-
-        // Checkpoint snapshots are request-owned GPU resources.  EP uses its
-        // first rank as the snapshot owner; single/PP routes use the caller's
-        // device (PP snapshots are empty in production).
-        if let Some(ep) = self.ep.as_mut() {
-            if let Some(owner) = ep.gpus.devices.first_mut() {
-                for (_, snapshot) in self.prefill_checkpoints.drain(..) {
-                    snapshot.free_gpu(owner);
+        let route = self.reset_route();
+        let model_ptr = self as *mut LoadedModel;
+        let mut run = move |phase_route: ResetRoute, phase: ResetPhase| {
+            debug_assert_eq!(phase_route, route);
+            // SAFETY: `reset_lifecycle` borrows only host fields and the
+            // persistent eviction owner while this callback touches disjoint
+            // architecture/device fields.
+            let model = unsafe { &mut *model_ptr };
+            match phase {
+                ResetPhase::Checkpoints => {
+                    if let Some(ep) = model.ep.as_mut() {
+                        let Some(owner) = ep.gpus.devices.first_mut() else {
+                            model.prefill_checkpoints.clear();
+                            model.dflash_checkpoints.clear();
+                            return Err(
+                                "EP reset has no device for checkpoint ownership".to_string()
+                            );
+                        };
+                        for (_, snapshot) in model.prefill_checkpoints.drain(..) {
+                            snapshot.free_gpu(owner);
+                        }
+                        for (_, snapshot) in model.dflash_checkpoints.drain(..) {
+                            snapshot.free_gpu(owner);
+                        }
+                    } else {
+                        for (_, snapshot) in model.prefill_checkpoints.drain(..) {
+                            snapshot.free_gpu(gpu);
+                        }
+                        for (_, snapshot) in model.dflash_checkpoints.drain(..) {
+                            snapshot.free_gpu(gpu);
+                        }
+                    }
+                    Ok(())
                 }
-                for (_, snapshot) in self.dflash_checkpoints.drain(..) {
-                    snapshot.free_gpu(owner);
+                ResetPhase::Architecture => match phase_route {
+                    ResetRoute::ExpertParallel | ResetRoute::TensorParallel => {
+                        let Some(ep) = model.ep.as_mut() else {
+                            return Err("model has no EP/TP owner".to_string());
+                        };
+                        let mut errors = Vec::new();
+                        reset_ep_architecture_state(ep, &mut errors);
+                        if errors.is_empty() {
+                            Ok(())
+                        } else {
+                            Err(errors.join("; "))
+                        }
+                    }
+                    ResetRoute::PipelineParallel => {
+                        Err("pipeline reset requires the PP lifecycle adapter".to_string())
+                    }
+                    ResetRoute::Single => model.reset_architecture_state(gpu),
+                },
+                ResetPhase::AdaptiveKv => {
+                    if let Some(adaptive) = model.kv_adaptive.as_mut() {
+                        let state = &mut model.state;
+                        if let Some(kv) =
+                            state.as_deref_mut().and_then(|arch| arch.kv_cache_mut())
+                        {
+                            adaptive.reset_with_cache(gpu, kv);
+                        } else {
+                            adaptive.reset();
+                        }
+                    }
+                    Ok(())
                 }
-            } else {
-                self.prefill_checkpoints.clear();
-                self.dflash_checkpoints.clear();
-                errors.push("EP reset has no device for checkpoint ownership".to_string());
-            }
-        } else {
-            for (_, snapshot) in self.prefill_checkpoints.drain(..) {
-                snapshot.free_gpu(gpu);
-            }
-            for (_, snapshot) in self.dflash_checkpoints.drain(..) {
-                snapshot.free_gpu(gpu);
-            }
-        }
-
-        if let Some(ep) = self.ep.as_mut() {
-            reset_ep_architecture_state(ep, &mut errors);
-            if let Some(owner) = ep.gpus.devices.first_mut() {
-                if let Some(spec) = self.speculator.as_mut() {
-                    if let Err(error) = spec.reset(owner) {
-                        errors.push(format!("EP spec.reset: {error}"));
+                ResetPhase::Batch => {
+                    if phase_route != ResetRoute::Single {
+                        return Ok(());
+                    }
+                    let state = &mut model.state;
+                    if let Some(bundle) = state.as_deref_mut().and_then(|arch| {
+                        (arch as &mut dyn Any)
+                            .downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
+                    }) {
+                        if let Some(batch) = bundle.qwen35_decode_batch.as_mut() {
+                            batch.reset(gpu)?;
+                        }
+                    }
+                    if let Some(bundle) = state.as_deref_mut().and_then(|arch| {
+                        (arch as &mut dyn Any)
+                            .downcast_mut::<hipfire_arch_lfm2moe::Lfm2MoeBundle>()
+                    }) {
+                        if let Some(batch) = bundle.lfm2_decode_batch.as_mut() {
+                            batch.reset(gpu)?;
+                        }
+                    }
+                    Ok(())
+                }
+                ResetPhase::Speculator => {
+                    if let Some(spec) = model.speculator.as_mut() {
+                        if let Some(ep) = model.ep.as_mut() {
+                            if let Some(owner) = ep.gpus.devices.first_mut() {
+                                spec.reset(owner)?;
+                            }
+                        } else {
+                            spec.reset(gpu)?;
+                        }
+                    }
+                    Ok(())
+                }
+                ResetPhase::EvictionRequest => Ok(()),
+                ResetPhase::GraphsAndSynchronize => {
+                    if let Some(ep) = model.ep.as_mut() {
+                        let mut errors = Vec::new();
+                        for (rank, device) in ep.gpus.devices.iter_mut().enumerate() {
+                            device.invalidate_graph_state();
+                            device.replay.invalidate_replay_observation_window();
+                            if let Err(error) = device.bind_thread() {
+                                errors.push(format!("EP rank{rank} bind_thread: {error}"));
+                                continue;
+                            }
+                            if let Err(error) = device.hip.device_synchronize() {
+                                errors.push(format!("EP rank{rank} device_synchronize: {error}"));
+                            } else {
+                                device.replay.begin_replay_observation_window();
+                            }
+                        }
+                        if errors.is_empty() {
+                            Ok(())
+                        } else {
+                            Err(errors.join("; "))
+                        }
+                    } else {
+                        gpu.invalidate_graph_state();
+                        gpu.replay.invalidate_replay_observation_window();
+                        gpu.hip
+                            .device_synchronize()
+                            .map_err(|error| format!("device_synchronize: {error}"))
+                            .map(|_| gpu.replay.begin_replay_observation_window())
                     }
                 }
             }
-            for (rank, device) in ep.gpus.devices.iter_mut().enumerate() {
-                device.invalidate_graph_state();
-                device.replay.invalidate_replay_observation_window();
-                if let Err(error) = device.bind_thread() {
-                    errors.push(format!("EP rank{rank} bind_thread: {error}"));
-                    continue;
-                }
-                if let Err(error) = device.hip.device_synchronize() {
-                    errors.push(format!("EP rank{rank} device_synchronize: {error}"));
-                } else {
-                    device.replay.begin_replay_observation_window();
-                }
-            }
-            return if errors.is_empty() {
-                Ok(())
-            } else {
-                Err(errors.join("; "))
-            };
-        }
-
-        if self.pp > 1 {
-            // Pipeline-parallel Qwen state is distributed by layer ownership;
-            // the generation adapter performs that exhaustive per-device
-            // reset.  Keep this method fail-closed rather than touching only
-            // the caller's first device.
-            errors.push("pipeline reset requires the PP lifecycle adapter".to_string());
-        } else if let Err(error) = self.reset_architecture_state(gpu) {
-            errors.push(format!("architecture reset: {error}"));
-        }
-
-        // Adaptive tier state is request-local.  The policy/floor and sticky
-        // poison remain model-owned; reset_with_cache restores the cache mode
-        // flags and closes any in-flight eviction handoff.
-        {
-            let state = &mut self.state;
-            if let Some(adaptive) = self.kv_adaptive.as_mut() {
-                if let Some(kv) = state.as_deref_mut().and_then(|model| model.kv_cache_mut()) {
-                    adaptive.reset_with_cache(gpu, kv);
-                } else {
-                    adaptive.reset();
-                }
-            }
-        }
-
-        if self.pp <= 1 {
-            let state = &mut self.state;
-            if let Some(bundle) = state.as_deref_mut().and_then(|model| {
-                (model as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
-            }) {
-                if let Some(batch) = bundle.qwen35_decode_batch.as_mut() {
-                    if let Err(error) = batch.reset(gpu) {
-                        errors.push(format!("qwen35_decode_batch.reset: {error}"));
-                    }
-                }
-            }
-            if let Some(bundle) = state.as_deref_mut().and_then(|model| {
-                (model as &mut dyn Any).downcast_mut::<hipfire_arch_lfm2moe::Lfm2MoeBundle>()
-            }) {
-                if let Some(batch) = bundle.lfm2_decode_batch.as_mut() {
-                    if let Err(error) = batch.reset(gpu) {
-                        errors.push(format!("lfm2_decode_batch.reset: {error}"));
-                    }
-                }
-            }
-        }
-
-        if let Some(spec) = self.speculator.as_mut() {
-            if let Err(error) = spec.reset(gpu) {
-                errors.push(format!("spec.reset: {error}"));
-            }
-        }
-        gpu.invalidate_graph_state();
-        gpu.replay.invalidate_replay_observation_window();
-        if let Err(error) = gpu.hip.device_synchronize() {
-            errors.push(format!("device_synchronize: {error}"));
-        } else {
-            gpu.replay.begin_replay_observation_window();
-        }
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors.join("; "))
-        }
+        };
+        reset_lifecycle(
+            route,
+            ResetRequestState {
+                seq_pos: &mut self.seq_pos,
+                conversation_tokens: &mut self.conversation_tokens,
+                asst_turn_cache: Some(&mut self.asst_turn_cache),
+                request_tokens: None,
+                compact_offset: None,
+                speculative_pending: None,
+            },
+            self.eviction.as_ref(),
+            &mut ResetOperations { run: &mut run },
+        )
     }
     /// pp>1 skeleton — sets the load-bearing multi-GPU fields together so
     /// they cannot be set piecemeal (`pp_gpus`/`pp_dn_la_to_device` are
@@ -2242,8 +2463,9 @@ fn finish_qwen35_load(
             true,
             // Fail-closed: adaptive KV starts FWHT4 and tier-switches at runtime.
             // Upstream also suppresses DFlash when adaptive is Some; this keeps
-            // admission honest if a future path reaches load_dflash_state.
+            // admission honest if a future load path reaches load_dflash_state.
             bundle.kv_adaptive.is_some(),
+            ctx.spec.lifecycle_fault,
         ) {
             Ok(s) => {
                 eprintln!(
@@ -2253,6 +2475,14 @@ fn finish_qwen35_load(
                 Some(s)
             }
             Err(e) => {
+                if ctx.spec.lifecycle_fault == Some(LoadFaultStage::DflashTargetVerifyScratch) {
+                    return Err(rollback_unfinished_qwen35(
+                        e,
+                        bundle,
+                        vision_weights,
+                        ctx.gpu,
+                    ));
+                }
                 eprintln!(
                     "  DFlash draft load failed ({}): {} — falling back to AR only",
                     dp, e

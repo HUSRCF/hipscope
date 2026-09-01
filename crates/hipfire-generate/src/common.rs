@@ -376,6 +376,9 @@ pub fn production_fail_closed_rollback_live_with_target<'spec, 'object>(
 /// borrows provide a thin `target_reset` adapter and optional request-local
 /// extras; every host/checkpoint/spec/graph/synchronization step remains
 /// centralized here.
+/// Total live-reset algorithm. It delegates phase ordering and host/request
+/// clearing to the loader's resource-neutral lifecycle owner; this function
+/// only supplies the disjoint live target/spec/device callbacks.
 pub fn production_fail_closed_rollback_live_with_extras<'spec, 'object>(
     seq_pos: &mut usize,
     conversation_tokens: &mut Vec<u32>,
@@ -384,45 +387,76 @@ pub fn production_fail_closed_rollback_live_with_extras<'spec, 'object>(
     asst_turn_cache: &mut hipfire_loader::AsstTurnCache,
     gpu: &mut rdna_compute::Gpu,
     target_reset: &mut dyn FnMut(&mut rdna_compute::Gpu) -> Result<(), String>,
-    spec: Option<&'spec mut (dyn Speculator + 'object)>,
+    mut spec: Option<&'spec mut (dyn Speculator + 'object)>,
     mut extras: ResetExtras<'_>,
 ) -> RollbackEpilogue {
-    *seq_pos = 0;
-    conversation_tokens.clear();
-    asst_turn_cache.clear();
-    // Host-side AR/vestigial rings (speculator owns the live DFlash ring).
-    free_checkpoints(prefill_checkpoints, gpu);
-    free_checkpoints(dflash_checkpoints, gpu);
-    let mut first_err: Option<String> = None;
-    if let Err(e) = target_reset(gpu) {
-        push_reset_err(&mut first_err, "reset_recurrent", e);
-    }
-    if let Some(reset) = extras.adaptive.as_mut() {
-        if let Err(e) = reset(gpu) {
-            push_reset_err(&mut first_err, "adaptive.reset", e);
+    let mut run = |_route: hipfire_loader::ResetRoute, phase: hipfire_loader::ResetPhase| {
+        match phase {
+            hipfire_loader::ResetPhase::Checkpoints => {
+                free_checkpoints(prefill_checkpoints, gpu);
+                free_checkpoints(dflash_checkpoints, gpu);
+                Ok(())
+            }
+            hipfire_loader::ResetPhase::Architecture => target_reset(gpu),
+            hipfire_loader::ResetPhase::AdaptiveKv => {
+                if let Some(reset) = extras.adaptive.as_mut() {
+                    reset(gpu)
+                } else {
+                    Ok(())
+                }
+            }
+            hipfire_loader::ResetPhase::Batch => {
+                if let Some(reset) = extras.batch.as_mut() {
+                    reset(gpu)
+                } else {
+                    Ok(())
+                }
+            }
+            hipfire_loader::ResetPhase::Speculator => {
+                if let Some(spec) = spec.as_deref_mut() {
+                    spec.reset(gpu)
+                } else {
+                    Ok(())
+                }
+            }
+            hipfire_loader::ResetPhase::EvictionRequest => {
+                if let Some(reset) = extras.eviction.as_mut() {
+                    reset(gpu)
+                } else {
+                    Ok(())
+                }
+            }
+            hipfire_loader::ResetPhase::GraphsAndSynchronize => {
+                fail_closed_invalidate_graphs_and_replay(gpu);
+                gpu.hip
+                    .device_synchronize()
+                    .map_err(|error| format!("{error:?}"))
+            }
         }
-    }
-    if let Some(reset) = extras.batch.as_mut() {
-        if let Err(e) = reset(gpu) {
-            push_reset_err(&mut first_err, "batch.reset", e);
-        }
-    }
-    if let Some(reset) = extras.eviction.as_mut() {
-        if let Err(e) = reset(gpu) {
-            push_reset_err(&mut first_err, "eviction.request_reset", e);
-        }
-    }
-    if let Some(spec) = spec {
-        if let Err(e) = spec.reset(gpu) {
-            push_reset_err(&mut first_err, "spec.reset", e);
-        }
-    }
-    fail_closed_invalidate_graphs_and_replay(gpu);
-    let prior = match first_err {
-        Some(e) => Err(e),
-        None => Ok(()),
     };
-    let epilogue = fail_closed_epilogue_after_sync(prior, fail_closed_device_sync(gpu));
+    let result = hipfire_loader::reset_lifecycle(
+        hipfire_loader::ResetRoute::Single,
+        hipfire_loader::ResetRequestState {
+            seq_pos,
+            conversation_tokens,
+            asst_turn_cache: Some(asst_turn_cache),
+            request_tokens: None,
+            compact_offset: None,
+            speculative_pending: None,
+        },
+        None,
+        &mut hipfire_loader::ResetOperations { run: &mut run },
+    );
+    let epilogue = match result {
+        Ok(()) => RollbackEpilogue {
+            rolled_back: true,
+            context: None,
+        },
+        Err(context) => RollbackEpilogue {
+            rolled_back: false,
+            context: Some(context),
+        },
+    };
     if epilogue.rolled_back {
         gpu.replay.begin_replay_observation_window();
     }

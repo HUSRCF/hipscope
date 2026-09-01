@@ -104,8 +104,12 @@ pub fn load_bundle(
             let mut config = <DeepseekV4 as Architecture>::config_from_hfq(&hfq)?;
             apply_deepseek4_experts_per_token(&mut config, ctx.deepseek4_experts_per_token)?;
             config.load_dspark = load_dspark;
-            let weights =
-                <DeepseekV4 as Architecture>::load_weights(&mut hfq, &config, ctx.gpu)?;
+            let weights = DeepseekV4::load_weights_with_fault(
+                &mut hfq,
+                &config,
+                ctx.gpu,
+                ctx.spec.lifecycle_fault,
+            )?;
             (config, weights)
         }
         ModelSource::Dir(source) => {

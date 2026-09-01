@@ -11,383 +11,157 @@
 
 #![allow(clippy::all)]
 
-use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{
+    atomic::AtomicBool,
+    Arc, Barrier, Mutex, OnceLock,
+};
 
-use hipfire_engine::emit::{emit_active_attempt_error, emit_gen_start, emit_qwen_ar_cancelled};
 use hipfire_engine::terminal::{
-    activate_terminal_control, clear_terminal_control, emit_staged_terminal_done,
-    set_active_attempt_id,
+    activate_terminal_control, clear_terminal_control, set_active_attempt_id,
 };
 use hipfire_generate::ar::GenerationRoute;
-use hipfire_generate::common::attest_rollback_steps;
-use hipfire_runtime::dflash::TargetHiddenLog;
-use hipfire_runtime::kv_adaptive::{KvAdaptive, Preset};
 use hipfire_runtime::llama::{EmbeddingFormat, WeightTensor};
 use hipfire_runtime::loader_api::{CaskConfig, SpecLoadCfg};
 use hipfire_runtime::model_load::WeightSource;
 use rdna_compute::{Gpu, GpuTensor};
 
-// ── loader-owned reset matrix ──────────────────────────────────────────────
+// ── production reset lifecycle matrix ──────────────────────────────────────
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ResetShape {
-    Single,
-    PipelineParallel,
-    TensorParallel,
-    ExpertParallel,
+fn reset_test_owner() -> hipfire_loader::Eviction {
+    let mut owner = hipfire_runtime::triattn::EvictionCtx::for_test(32, 8);
+    owner.set_activation_gate(Arc::new(AtomicBool::new(false)));
+    hipfire_loader::Eviction::Plain(owner)
 }
 
-impl ResetShape {
-    fn lane_count(self) -> usize {
-        match self {
-            Self::Single => 1,
-            Self::PipelineParallel => 2,
-            Self::TensorParallel | Self::ExpertParallel => 4,
-        }
+fn seeded_reset_state() -> (usize, Vec<u32>, Vec<u32>, i32, Vec<u32>) {
+    (37, vec![1, 2, 3, 4], vec![41, 42], 13, vec![99, 100])
+}
+
+#[test]
+fn production_reset_lifecycle_dispatches_all_topologies_and_preserves_owner() {
+    for route in [
+        hipfire_loader::ResetRoute::Single,
+        hipfire_loader::ResetRoute::PipelineParallel,
+        hipfire_loader::ResetRoute::TensorParallel,
+        hipfire_loader::ResetRoute::ExpertParallel,
+    ] {
+        let (mut seq_pos, mut conversation_tokens, mut request_tokens, mut compact_offset, mut speculative_pending) =
+            seeded_reset_state();
+        let mut owner = reset_test_owner();
+        let owner_ptr = &owner as *const _;
+        let mut phases = Vec::new();
+        let mut run = |seen_route: hipfire_loader::ResetRoute,
+                       phase: hipfire_loader::ResetPhase|
+         -> Result<(), String> {
+            assert_eq!(seen_route, route);
+            phases.push(phase);
+            Ok(())
+        };
+        let result = hipfire_loader::reset_lifecycle(
+            route,
+            hipfire_loader::ResetRequestState {
+                seq_pos: &mut seq_pos,
+                conversation_tokens: &mut conversation_tokens,
+                asst_turn_cache: None,
+                request_tokens: Some(&mut request_tokens),
+                compact_offset: Some(&mut compact_offset),
+                speculative_pending: Some(&mut speculative_pending),
+            },
+            Some(&owner),
+            &mut hipfire_loader::ResetOperations { run: &mut run },
+        );
+        assert!(result.is_ok(), "{route:?} reset: {result:?}");
+        assert_eq!(seq_pos, 0);
+        assert!(conversation_tokens.is_empty());
+        assert!(request_tokens.is_empty());
+        assert_eq!(compact_offset, 0);
+        assert!(speculative_pending.is_empty());
+        assert_eq!(
+            phases,
+            vec![
+                hipfire_loader::ResetPhase::Checkpoints,
+                hipfire_loader::ResetPhase::Architecture,
+                hipfire_loader::ResetPhase::AdaptiveKv,
+                hipfire_loader::ResetPhase::Batch,
+                hipfire_loader::ResetPhase::Speculator,
+                hipfire_loader::ResetPhase::EvictionRequest,
+                hipfire_loader::ResetPhase::GraphsAndSynchronize,
+            ]
+        );
+        assert_eq!(&owner as *const _, owner_ptr, "{route:?} replaced eviction owner");
+        assert_eq!(
+            match &owner {
+                hipfire_loader::Eviction::Plain(ctx) => ctx.request_reset_count(),
+                hipfire_loader::Eviction::Cask(ctx) => ctx.base.request_reset_count(),
+            },
+            1
+        );
+        assert_eq!(owner.budget(), 32);
+        assert_eq!(owner.beta(), 8);
     }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::Single => "single",
-            Self::PipelineParallel => "pp",
-            Self::TensorParallel => "tp",
-            Self::ExpertParallel => "ep",
-        }
-    }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct LaneState {
-    persistent_policy_id: u64,
-    persistent_scratch_id: u64,
-    request_tokens: Vec<u32>,
-}
-
-#[derive(Debug)]
-struct ResetHarness {
-    shape: ResetShape,
-    seq_pos: usize,
-    conversation_tokens: Vec<u32>,
-    lanes: Vec<LaneState>,
-}
-
-impl ResetHarness {
-    fn new(shape: ResetShape) -> Self {
-        let lanes = (0..shape.lane_count())
-            .map(|lane| LaneState {
-                persistent_policy_id: 0xCA5E_0000 + lane as u64,
-                persistent_scratch_id: 0x5C12_0000 + lane as u64,
-                request_tokens: vec![lane as u32, 10, 11],
-            })
-            .collect();
-        Self {
-            shape,
-            seq_pos: 37,
-            conversation_tokens: vec![1, 2, 3, 4],
-            lanes,
-        }
-    }
-
-    /// Model the observable part of the loader-owned adapter matrix. Each lane
-    /// is attempted even after another lane reports an error; successful lanes
-    /// clear request state, while persistent policy/scratch identity remains.
-    fn reset_via_loader_adapter(
-        &mut self,
-        failures: &[usize],
-    ) -> hipfire_generate::common::RollbackEpilogue {
-        self.seq_pos = 0;
-        self.conversation_tokens.clear();
-        let failures: BTreeSet<usize> = failures.iter().copied().collect();
-        let mut steps = Vec::with_capacity(self.lanes.len());
-        for (lane, state) in self.lanes.iter_mut().enumerate() {
-            let result = if failures.contains(&lane) {
-                Err(format!("{} lane {lane} reset failed", self.shape.label()))
+#[test]
+fn production_reset_lifecycle_attempts_all_phases_after_recurrent_failure() {
+    for route in [
+        hipfire_loader::ResetRoute::Single,
+        hipfire_loader::ResetRoute::PipelineParallel,
+        hipfire_loader::ResetRoute::TensorParallel,
+        hipfire_loader::ResetRoute::ExpertParallel,
+    ] {
+        let (mut seq_pos, mut conversation_tokens, mut request_tokens, mut compact_offset, mut speculative_pending) =
+            seeded_reset_state();
+        let mut owner = reset_test_owner();
+        let mut phases = Vec::new();
+        let mut run = |seen_route: hipfire_loader::ResetRoute,
+                       phase: hipfire_loader::ResetPhase|
+         -> Result<(), String> {
+            assert_eq!(seen_route, route);
+            phases.push(phase);
+            if phase == hipfire_loader::ResetPhase::Architecture {
+                Err("injected recurrent reset".to_string())
             } else {
-                state.request_tokens.clear();
                 Ok(())
-            };
-            steps.push((format!("{} lane {lane}", self.shape.label()), result));
-        }
-        let refs: Vec<(&str, Result<(), String>)> = steps
-            .iter()
-            .map(|(name, result)| (name.as_str(), result.clone()))
-            .collect();
-        attest_rollback_steps(&refs, Ok(()))
-    }
-
-    fn cancel_lane(&mut self, lane: usize) {
-        self.lanes[lane].request_tokens.clear();
-    }
-}
-
-#[test]
-fn loader_owned_reset_matrix_clears_all_request_state_and_preserves_policy() {
-    for shape in [
-        ResetShape::Single,
-        ResetShape::PipelineParallel,
-        ResetShape::TensorParallel,
-        ResetShape::ExpertParallel,
-    ] {
-        let mut harness = ResetHarness::new(shape);
-        let persistent_before: Vec<(u64, u64)> = harness
-            .lanes
-            .iter()
-            .map(|lane| (lane.persistent_policy_id, lane.persistent_scratch_id))
-            .collect();
-        let epilogue = harness.reset_via_loader_adapter(&[]);
-        assert!(epilogue.rolled_back, "{} reset must attest", shape.label());
-        assert_eq!(harness.seq_pos, 0);
-        assert!(harness.conversation_tokens.is_empty());
-        assert!(harness
-            .lanes
-            .iter()
-            .all(|lane| lane.request_tokens.is_empty()));
+            }
+        };
+        let result = hipfire_loader::reset_lifecycle(
+            route,
+            hipfire_loader::ResetRequestState {
+                seq_pos: &mut seq_pos,
+                conversation_tokens: &mut conversation_tokens,
+                asst_turn_cache: None,
+                request_tokens: Some(&mut request_tokens),
+                compact_offset: Some(&mut compact_offset),
+                speculative_pending: Some(&mut speculative_pending),
+            },
+            Some(&owner),
+            &mut hipfire_loader::ResetOperations { run: &mut run },
+        );
+        let error = result.expect_err("injected recurrent failure must be reported");
+        assert!(error.contains("architecture: injected recurrent reset"));
+        assert_eq!(phases.len(), 7, "{route:?} reset stopped after failure");
+        assert_eq!(seq_pos, 0);
+        assert!(conversation_tokens.is_empty());
+        assert!(request_tokens.is_empty());
+        assert_eq!(compact_offset, 0);
+        assert!(speculative_pending.is_empty());
         assert_eq!(
-            harness
-                .lanes
-                .iter()
-                .map(|lane| (lane.persistent_policy_id, lane.persistent_scratch_id))
-                .collect::<Vec<_>>(),
-            persistent_before,
-            "{} reset replaced persistent owners",
-            shape.label()
+            match &owner {
+                hipfire_loader::Eviction::Plain(ctx) => ctx.request_reset_count(),
+                hipfire_loader::Eviction::Cask(ctx) => ctx.base.request_reset_count(),
+            },
+            1
         );
     }
 }
 
-#[test]
-fn loader_owned_reset_matrix_aggregates_failures_and_visits_every_lane() {
-    for shape in [
-        ResetShape::Single,
-        ResetShape::PipelineParallel,
-        ResetShape::TensorParallel,
-        ResetShape::ExpertParallel,
-    ] {
-        let failing_lane = shape.lane_count().saturating_sub(1);
-        let mut harness = ResetHarness::new(shape);
-        let epilogue = harness.reset_via_loader_adapter(&[failing_lane]);
-        assert!(
-            !epilogue.rolled_back,
-            "failed {} reset cannot attest",
-            shape.label()
-        );
-        let context = epilogue.context.expect("failure context");
-        assert!(
-            context.contains(&format!("lane {failing_lane}")),
-            "{} reset omitted failing lane: {context}",
-            shape.label()
-        );
-        assert_eq!(
-            harness.lanes[..failing_lane]
-                .iter()
-                .filter(|lane| lane.request_tokens.is_empty())
-                .count(),
-            failing_lane,
-            "{} adapter stopped before later lane failure",
-            shape.label()
-        );
-        assert_eq!(
-            harness.lanes[failing_lane].request_tokens,
-            vec![failing_lane as u32, 10, 11],
-            "failed lane state must remain inspectable for fail-closed recovery"
-        );
-    }
-}
 
-#[test]
-fn loader_owned_reset_is_scoped_to_one_batch_lane() {
-    let mut harness = ResetHarness::new(ResetShape::TensorParallel);
-    let policy_before = harness.lanes[1].persistent_policy_id;
-    let scratch_before = harness.lanes[1].persistent_scratch_id;
-    let peer_request = harness.lanes[1].request_tokens.clone();
-    harness.cancel_lane(0);
-    assert!(harness.lanes[0].request_tokens.is_empty());
-    assert_eq!(harness.lanes[1].request_tokens, peer_request);
-    assert_eq!(harness.lanes[1].persistent_policy_id, policy_before);
-    assert_eq!(harness.lanes[1].persistent_scratch_id, scratch_before);
-}
-
-// ── eviction policy/request state isolation ────────────────────────────────
-
-struct EvictionRequestState {
-    seq_pos: usize,
-    compact_offset: i32,
-    adaptive_step: usize,
-    speculative_pending: Vec<u32>,
-    target_hidden: TargetHiddenLog,
-}
-
-impl EvictionRequestState {
-    fn seeded() -> Self {
-        let mut target_hidden = TargetHiddenLog::new();
-        target_hidden.seed_prompt(3);
-        target_hidden.mark_uploaded(3);
-        target_hidden.mark_proj_cached(3);
-        target_hidden.mark_full_cached(3);
-        Self {
-            seq_pos: 19,
-            compact_offset: 7,
-            adaptive_step: 2,
-            speculative_pending: vec![41, 42],
-            target_hidden,
-        }
-    }
-
-    fn reset(&mut self) {
-        self.seq_pos = 0;
-        self.compact_offset = 0;
-        self.adaptive_step = 0;
-        self.speculative_pending.clear();
-        self.target_hidden.reset();
-    }
-}
-
-#[test]
-fn eviction_policy_scratch_counter_identity_survives_reset() {
-    let mut adaptive = KvAdaptive::from_preset(Preset::Aggressive, 10_000, 4, 256);
-    let floors = (adaptive.k_floor, adaptive.v_floor);
-    let steps = adaptive.steps.clone();
-    let thresholds = adaptive.thresholds.clone();
-    let gate = adaptive.configure_eviction_handoff(128);
-    let policy = Arc::new(String::from("triattn-policy"));
-    let scratch = Arc::new(String::from("triattn-scratch"));
-    let policy_ptr = Arc::as_ptr(&policy);
-    let scratch_ptr = Arc::as_ptr(&scratch);
-    let eviction_count = std::cell::Cell::new(4usize);
-    let mut request = EvictionRequestState::seeded();
-
-    adaptive.cur_k = hipfire_runtime::kv_adaptive::KMode::Fwht2;
-    adaptive.cur_v = hipfire_runtime::llama::VMode::Lloyd2;
-    adaptive.next_step = adaptive.steps.len();
-    request.reset();
-    adaptive.reset();
-
-    assert_eq!((adaptive.k_floor, adaptive.v_floor), floors);
-    assert_eq!(adaptive.steps, steps);
-    assert_eq!(adaptive.thresholds, thresholds);
-    assert!(!gate.load(std::sync::atomic::Ordering::Acquire));
-    assert_eq!(Arc::as_ptr(&policy), policy_ptr);
-    assert_eq!(Arc::as_ptr(&scratch), scratch_ptr);
-    assert_eq!(
-        eviction_count.get(),
-        4,
-        "counter is model-lifetime telemetry"
-    );
-    assert_eq!(request.seq_pos, 0);
-    assert_eq!(request.compact_offset, 0);
-    assert_eq!(request.adaptive_step, 0);
-    assert!(request.speculative_pending.is_empty());
-    assert_eq!(request.target_hidden.uploaded_rows(), 0);
-    assert!(request.target_hidden.abs_positions().is_empty());
-}
-
-#[test]
-fn eviction_request_state_clears_on_normal_reset_and_speculative_rollback() {
-    let mut adaptive = KvAdaptive::from_preset(Preset::Balanced, 10_000, 4, 256);
-    let policy = Arc::new(String::from("persistent-policy"));
-    let scratch = Arc::new(String::from("persistent-scratch"));
-    let policy_ptr = Arc::as_ptr(&policy);
-    let scratch_ptr = Arc::as_ptr(&scratch);
-    let eviction_count = std::cell::Cell::new(9usize);
-    for rollback in [false, true] {
-        let mut request = EvictionRequestState::seeded();
-        request.seq_pos = 41;
-        request.compact_offset = 13;
-        request.adaptive_step = 3;
-        request.speculative_pending.extend([99, 100]);
-        if rollback {
-            // Speculative rollback has the same request-local clearing contract
-            // as a normal reset; it must not replace the persistent owner.
-            request.reset();
-        } else {
-            request.reset();
-        }
-        adaptive.reset();
-        assert_eq!(request.seq_pos, 0);
-        assert_eq!(request.compact_offset, 0);
-        assert_eq!(request.adaptive_step, 0);
-        assert!(request.speculative_pending.is_empty());
-        assert_eq!(request.target_hidden.uploaded_rows(), 0);
-        assert_eq!(Arc::as_ptr(&policy), policy_ptr);
-        assert_eq!(Arc::as_ptr(&scratch), scratch_ptr);
-        assert_eq!(eviction_count.get(), 9);
-    }
-}
-
-// ── concrete writer race/cardinality matrix ───────────────────────────────
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WriterFamily {
-    Single,
-    Batch,
-    Ep,
-    Vl,
-    Glimmer,
-}
-
-impl WriterFamily {
-    fn route(self) -> GenerationRoute {
-        match self {
-            Self::Single | Self::Batch | Self::Vl => GenerationRoute::QwenAr,
-            Self::Ep => GenerationRoute::Deepseek4Ep,
-            Self::Glimmer => GenerationRoute::GlimmerAr,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TerminalWriter {
-    Done,
-    Error,
-    Cancel,
-}
+// ── concrete route adapter race/cardinality matrix ─────────────────────────
 
 fn terminal_test_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
-}
-
-fn emit_family_gen_start(family: WriterFamily, output: &mut Vec<u8>, id: &str) {
-    match family {
-        WriterFamily::Ep => hipfire_generate::qwen::emit_ds4_ep_gen_start(
-            output,
-            id,
-            hipfire_runtime::prompt_frame::ThinkMode::NonThink,
-        ),
-        WriterFamily::Single | WriterFamily::Batch | WriterFamily::Vl | WriterFamily::Glimmer => {
-            let contract = if matches!(family, WriterFamily::Single | WriterFamily::Vl) {
-                Some(2)
-            } else {
-                None
-            };
-            emit_gen_start(output, id, false, contract);
-        }
-    }
-}
-
-fn emit_terminal_writer(writer: TerminalWriter, output: &mut Vec<u8>, id: &str, attempt: u64) {
-    match writer {
-        TerminalWriter::Done => {
-            let pending = serde_json::json!({
-                "type": "done",
-                "id": id,
-                "attempt_id": attempt,
-                "finish_reason": "stop",
-            });
-            emit_staged_terminal_done(output, &pending);
-        }
-        TerminalWriter::Error => emit_active_attempt_error(
-            output,
-            Some(id),
-            "synthetic writer race",
-            "internal",
-            false,
-            true,
-        ),
-        TerminalWriter::Cancel => emit_qwen_ar_cancelled(output, id, 0),
-    }
 }
 
 fn parse_json_lines(bytes: &[u8]) -> Vec<serde_json::Value> {
@@ -399,120 +173,102 @@ fn parse_json_lines(bytes: &[u8]) -> Vec<serde_json::Value> {
 }
 
 #[test]
-fn all_generation_routes_are_named_once_and_writer_families_are_in_all() {
-    let names: BTreeSet<&str> = GenerationRoute::ALL
-        .iter()
-        .map(|route| route.name())
-        .collect();
-    assert_eq!(names.len(), GenerationRoute::ALL.len());
-    for family in [
-        WriterFamily::Single,
-        WriterFamily::Batch,
-        WriterFamily::Ep,
-        WriterFamily::Vl,
-        WriterFamily::Glimmer,
-    ] {
-        assert!(
-            GenerationRoute::ALL.contains(&family.route()),
-            "writer family route {:?} absent from GenerationRoute::ALL",
-            family
-        );
+fn every_generation_route_has_a_concrete_lifecycle_adapter() {
+    for route in GenerationRoute::ALL {
+        let adapter = hipfire_generate::ar::generation_route_adapter(*route)
+            .unwrap_or_else(|| panic!("missing lifecycle adapter for {}", route.name()));
+        assert_eq!(adapter.route, *route);
     }
 }
 
 #[test]
-fn concrete_generation_writers_emit_gen_start_first_and_claim_one_terminal() {
+fn route_adapters_start_first_and_race_one_semantic_terminal() {
     let _lock = terminal_test_lock();
-    let families = [
-        WriterFamily::Single,
-        WriterFamily::Batch,
-        WriterFamily::Ep,
-        WriterFamily::Vl,
-        WriterFamily::Glimmer,
+    let contenders = [
+        hipfire_generate::ar::RouteTerminal::Done,
+        hipfire_generate::ar::RouteTerminal::Error,
+        hipfire_generate::ar::RouteTerminal::Cancel,
     ];
-    let writers = [
-        TerminalWriter::Done,
-        TerminalWriter::Error,
-        TerminalWriter::Cancel,
-    ];
+    for (route_idx, route) in GenerationRoute::ALL.iter().copied().enumerate() {
+        let adapter = hipfire_generate::ar::generation_route_adapter(route)
+            .unwrap_or_else(|| panic!("missing lifecycle adapter for {}", route.name()));
+        let id = format!("g4-{}-{route_idx}", route.name());
+        let attempt = 700 + route_idx as u64;
+        clear_terminal_control();
+        activate_terminal_control(&id, attempt);
+        set_active_attempt_id(attempt);
+        let mut output = Vec::new();
+        adapter.emit_start(&mut output, &id);
+        let start_lines = parse_json_lines(&output);
+        assert_eq!(
+            start_lines.first().and_then(|line| line.get("type")),
+            Some(&serde_json::Value::String("gen_start".to_string())),
+            "{} adapter did not emit gen_start first",
+            route.name()
+        );
 
-    for (family_idx, family) in families.into_iter().enumerate() {
-        for (writer_idx, winner) in writers.into_iter().enumerate() {
-            let id = format!("g4-{:?}-{writer_idx}", family);
-            let attempt = 700 + (family_idx * 10 + writer_idx) as u64;
-            clear_terminal_control();
-            activate_terminal_control(&id, attempt);
-            set_active_attempt_id(attempt);
-            let mut output = Vec::new();
-            emit_family_gen_start(family, &mut output, &id);
-            let start_line_count = parse_json_lines(&output).len();
-
-            // Publish one winner first, then race the other concrete terminal
-            // writers against an already-claimed transaction. This keeps the
-            // expected winner deterministic while still exercising concurrent
-            // loser paths and their claim checks.
-            emit_terminal_writer(winner, &mut output, &id, attempt);
-            let shared = Arc::new(Mutex::new(output));
-            let mut joins = Vec::new();
-            for contender in writers.iter().copied().filter(|c| *c != winner) {
-                let shared = Arc::clone(&shared);
-                let id = id.clone();
-                joins.push(std::thread::spawn(move || {
-                    set_active_attempt_id(attempt);
-                    let mut out = shared.lock().unwrap();
-                    emit_terminal_writer(contender, &mut out, &id, attempt);
-                }));
-            }
-            for join in joins {
-                join.join().expect("terminal writer thread");
-            }
-            output = Arc::try_unwrap(shared)
-                .expect("writer output owner")
-                .into_inner()
-                .unwrap();
-            let lines = parse_json_lines(&output);
-            assert!(
-                lines.len() >= start_line_count,
-                "terminal writer removed gen_start"
-            );
-            assert_eq!(
-                lines
-                    .first()
-                    .and_then(|v| v.get("type"))
-                    .and_then(|v| v.as_str()),
-                Some("gen_start")
-            );
-            let terminal_types: Vec<&str> = lines[start_line_count..]
-                .iter()
-                .filter_map(|value| value.get("type").and_then(|v| v.as_str()))
-                .collect();
-            match winner {
-                TerminalWriter::Done => {
-                    assert_eq!(terminal_types.iter().filter(|t| **t == "done").count(), 1)
-                }
-                TerminalWriter::Error => {
-                    assert_eq!(terminal_types.iter().filter(|t| **t == "error").count(), 1)
-                }
-                TerminalWriter::Cancel => {
-                    assert_eq!(
-                        terminal_types.iter().filter(|t| **t == "aborted").count(),
-                        1
-                    );
-                    assert_eq!(terminal_types.iter().filter(|t| **t == "done").count(), 1);
-                }
-            }
-
-            // Late writers after the race are also no-ops.
-            let before_late = output.clone();
-            for contender in writers {
-                emit_terminal_writer(contender, &mut output, &id, attempt);
-            }
-            assert_eq!(output, before_late, "terminal claim leaked a late writer");
-            clear_terminal_control();
-            set_active_attempt_id(0);
+        let barrier = Arc::new(Barrier::new(contenders.len() + 1));
+        let mut joins = Vec::new();
+        for contender in contenders {
+            let barrier = Arc::clone(&barrier);
+            let adapter = adapter;
+            let id = id.clone();
+            joins.push(std::thread::spawn(move || {
+                set_active_attempt_id(attempt);
+                barrier.wait();
+                let mut local = Vec::new();
+                adapter.emit_terminal(&mut local, &id, attempt, contender);
+                local
+            }));
         }
+        barrier.wait();
+        for join in joins {
+            output.extend(join.join().expect("route terminal writer thread"));
+        }
+
+        let lines = parse_json_lines(&output);
+        assert_eq!(
+            lines.first().and_then(|line| line.get("type")),
+            Some(&serde_json::Value::String("gen_start".to_string())),
+            "{} terminal race removed gen_start",
+            route.name()
+        );
+        let tail = &lines[start_lines.len()..];
+        let done = tail
+            .iter()
+            .filter(|line| line.get("type").and_then(|v| v.as_str()) == Some("done"))
+            .count();
+        let error = tail
+            .iter()
+            .filter(|line| line.get("type").and_then(|v| v.as_str()) == Some("error"))
+            .count();
+        let aborted = tail
+            .iter()
+            .filter(|line| line.get("type").and_then(|v| v.as_str()) == Some("aborted"))
+            .count();
+        assert!(aborted <= 1, "{} emitted multiple cancel terminals", route.name());
+        let semantic_owners = done + error + aborted - aborted.min(done);
+        assert_eq!(
+            semantic_owners,
+            1,
+            "{} terminal race emitted {semantic_owners} semantic owners",
+            route.name()
+        );
+
+        let before_late = output.clone();
+        for contender in contenders {
+            adapter.emit_terminal(&mut output, &id, attempt, contender);
+        }
+        assert_eq!(
+            output, before_late,
+            "{} terminal claim leaked a late writer",
+            route.name()
+        );
+        clear_terminal_control();
+        set_active_attempt_id(0);
     }
 }
+
 
 // ── ignored live-GPU ownership tests ───────────────────────────────────────
 

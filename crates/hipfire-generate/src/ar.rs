@@ -701,6 +701,7 @@ fn qwen_ar_reset_live<'spec, 'object>(
     dn: &mut qwen35::DeltaNetState,
     kv: &mut hipfire_runtime::llama::KvCache,
     mut adaptive: Option<&mut hipfire_runtime::kv_adaptive::KvAdaptive>,
+    eviction: Option<&hipfire_loader::Eviction>,
     seq_pos: &mut usize,
     conversation_tokens: &mut Vec<u32>,
     prefill_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
@@ -712,13 +713,19 @@ fn qwen_ar_reset_live<'spec, 'object>(
     let mut reset_target = |gpu: &mut rdna_compute::Gpu| qwen_ar_reset_recurrent(dn, gpu);
     let mut reset_adaptive = |gpu: &mut rdna_compute::Gpu| -> Result<(), String> {
         // The target adapter cannot also borrow `kv` because the production
-        // epilogue receives both closures at once.  Keep the cursor reset in
+        // epilogue receives both closures at once. Keep the cursor reset in
         // this disjoint extra alongside adaptive cache-mode restoration.
         kv.compact_offset = 0;
         if let Some(ad) = adaptive.as_deref_mut() {
             if !ad.is_poisoned() {
                 ad.reset_with_cache(gpu, kv);
             }
+        }
+        Ok(())
+    };
+    let mut reset_eviction = |_gpu: &mut rdna_compute::Gpu| -> Result<(), String> {
+        if let Some(owner) = eviction {
+            owner.reset_request_state(None);
         }
         Ok(())
     };
@@ -734,7 +741,7 @@ fn qwen_ar_reset_live<'spec, 'object>(
         ResetExtras {
             adaptive: Some(&mut reset_adaptive),
             batch: None,
-            eviction: None,
+            eviction: Some(&mut reset_eviction),
         },
     )
 }
@@ -903,6 +910,260 @@ impl GenerationRoute {
             Self::Unknown => "unknown",
         }
     }
+}
+
+/// Terminal kind used by the production route adapter registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteTerminal {
+    Done,
+    Error,
+    Cancel,
+}
+
+pub type RouteStartAdapter = fn(&mut dyn Write, &str);
+pub type RouteTerminalAdapter = fn(&mut dyn Write, &str, u64, RouteTerminal);
+
+/// Concrete start/terminal pair for one selected generation route. The
+/// registry is intentionally exhaustive: route evidence must fail closed when
+/// a new `GenerationRoute` is added without a producer adapter.
+#[derive(Clone, Copy)]
+pub struct GenerationRouteAdapter {
+    pub route: GenerationRoute,
+    pub start: RouteStartAdapter,
+    pub terminal: RouteTerminalAdapter,
+}
+
+impl GenerationRouteAdapter {
+    pub fn emit_start(self, output: &mut dyn Write, id: &str) {
+        (self.start)(output, id);
+    }
+
+    pub fn emit_terminal(
+        self,
+        output: &mut dyn Write,
+        id: &str,
+        attempt: u64,
+        terminal: RouteTerminal,
+    ) {
+        (self.terminal)(output, id, attempt, terminal);
+    }
+}
+
+fn emit_route_terminal(
+    output: &mut dyn Write,
+    id: &str,
+    _attempt: u64,
+    terminal: RouteTerminal,
+    route_name: &'static str,
+) {
+    match terminal {
+        RouteTerminal::Done => {
+            let pending = serde_json::json!({
+                "type": "done",
+                "id": id,
+                "attempt_id": active_attempt_id(),
+                "finish_reason": "stop",
+            });
+            emit_staged_terminal_done(output, &pending);
+        }
+        RouteTerminal::Error => emit_active_attempt_error(
+            output,
+            Some(id),
+            &format!("{route_name} terminal error"),
+            "internal",
+            false,
+            true,
+        ),
+        RouteTerminal::Cancel => emit_qwen_ar_cancelled(output, id, 0),
+    }
+}
+
+macro_rules! define_route_start {
+    ($name:ident, $arch:expr) => {
+        fn $name(output: &mut dyn Write, id: &str) {
+            emit_gen_start(output, id, false, gen_start_contract_version_for_arch($arch));
+        }
+    };
+}
+
+macro_rules! define_route_terminal {
+    ($name:ident, $route:expr) => {
+        fn $name(
+            output: &mut dyn Write,
+            id: &str,
+            attempt: u64,
+            terminal: RouteTerminal,
+        ) {
+            emit_route_terminal(output, id, attempt, terminal, $route.name());
+        }
+    };
+}
+
+define_route_start!(qwen_ar_route_start, 5);
+define_route_start!(qwen_dflash_route_start, 5);
+define_route_start!(qwen2_ar_route_start, 7);
+define_route_start!(qwen2_spec_route_start, 7);
+define_route_start!(deepseek4_ar_route_start, 9);
+fn deepseek4_ep_route_start(output: &mut dyn Write, id: &str) {
+    crate::qwen::emit_ds4_ep_gen_start(output, id, ThinkMode::NonThink);
+}
+define_route_start!(deepseek4_spec_route_start, 9);
+define_route_start!(cohere_ar_route_start, 12);
+define_route_start!(cohere_spec_route_start, 12);
+define_route_start!(maple_ar_route_start, 15);
+define_route_start!(minimax_ar_route_start, 10);
+define_route_start!(minimax_ep_route_start, 10);
+define_route_start!(minimax_spec_route_start, 10);
+define_route_start!(lfm_ar_route_start, 11);
+define_route_start!(lfm_spec_route_start, 11);
+define_route_start!(llama_ar_route_start, 0);
+define_route_start!(llama_spec_route_start, 0);
+define_route_start!(glimmer_ar_route_start, 14);
+define_route_start!(glimmer_spec_route_start, 14);
+define_route_start!(pipeline_parallel_route_start, 5);
+define_route_start!(dots_ocr_route_start, 8);
+define_route_start!(unknown_route_start, 255);
+
+define_route_terminal!(qwen_ar_route_terminal, GenerationRoute::QwenAr);
+define_route_terminal!(qwen_dflash_route_terminal, GenerationRoute::QwenDflash);
+define_route_terminal!(qwen2_ar_route_terminal, GenerationRoute::Qwen2Ar);
+define_route_terminal!(qwen2_spec_route_terminal, GenerationRoute::Qwen2Spec);
+define_route_terminal!(deepseek4_ar_route_terminal, GenerationRoute::Deepseek4Ar);
+define_route_terminal!(deepseek4_ep_route_terminal, GenerationRoute::Deepseek4Ep);
+define_route_terminal!(deepseek4_spec_route_terminal, GenerationRoute::Deepseek4Spec);
+define_route_terminal!(cohere_ar_route_terminal, GenerationRoute::CohereAr);
+define_route_terminal!(cohere_spec_route_terminal, GenerationRoute::CohereSpec);
+define_route_terminal!(maple_ar_route_terminal, GenerationRoute::MapleAr);
+define_route_terminal!(minimax_ar_route_terminal, GenerationRoute::MiniMaxAr);
+define_route_terminal!(minimax_ep_route_terminal, GenerationRoute::MiniMaxEp);
+define_route_terminal!(minimax_spec_route_terminal, GenerationRoute::MiniMaxSpec);
+define_route_terminal!(lfm_ar_route_terminal, GenerationRoute::LfmAr);
+define_route_terminal!(lfm_spec_route_terminal, GenerationRoute::LfmSpec);
+define_route_terminal!(llama_ar_route_terminal, GenerationRoute::LlamaAr);
+define_route_terminal!(llama_spec_route_terminal, GenerationRoute::LlamaSpec);
+define_route_terminal!(glimmer_ar_route_terminal, GenerationRoute::GlimmerAr);
+define_route_terminal!(glimmer_spec_route_terminal, GenerationRoute::GlimmerSpec);
+define_route_terminal!(pipeline_parallel_route_terminal, GenerationRoute::PipelineParallel);
+define_route_terminal!(dots_ocr_route_terminal, GenerationRoute::DotsOcr);
+define_route_terminal!(unknown_route_terminal, GenerationRoute::Unknown);
+
+/// Return the concrete lifecycle producer adapter for every route in
+/// `GenerationRoute::ALL`. `None` is reserved for future variants and makes
+/// coverage tests fail rather than silently falling back to a label alias.
+pub fn generation_route_adapter(route: GenerationRoute) -> Option<GenerationRouteAdapter> {
+    let adapter = match route {
+        GenerationRoute::QwenAr => GenerationRouteAdapter {
+            route,
+            start: qwen_ar_route_start,
+            terminal: qwen_ar_route_terminal,
+        },
+        GenerationRoute::QwenDflash => GenerationRouteAdapter {
+            route,
+            start: qwen_dflash_route_start,
+            terminal: qwen_dflash_route_terminal,
+        },
+        GenerationRoute::Qwen2Ar => GenerationRouteAdapter {
+            route,
+            start: qwen2_ar_route_start,
+            terminal: qwen2_ar_route_terminal,
+        },
+        GenerationRoute::Qwen2Spec => GenerationRouteAdapter {
+            route,
+            start: qwen2_spec_route_start,
+            terminal: qwen2_spec_route_terminal,
+        },
+        GenerationRoute::Deepseek4Ar => GenerationRouteAdapter {
+            route,
+            start: deepseek4_ar_route_start,
+            terminal: deepseek4_ar_route_terminal,
+        },
+        GenerationRoute::Deepseek4Ep => GenerationRouteAdapter {
+            route,
+            start: deepseek4_ep_route_start,
+            terminal: deepseek4_ep_route_terminal,
+        },
+        GenerationRoute::Deepseek4Spec => GenerationRouteAdapter {
+            route,
+            start: deepseek4_spec_route_start,
+            terminal: deepseek4_spec_route_terminal,
+        },
+        GenerationRoute::CohereAr => GenerationRouteAdapter {
+            route,
+            start: cohere_ar_route_start,
+            terminal: cohere_ar_route_terminal,
+        },
+        GenerationRoute::CohereSpec => GenerationRouteAdapter {
+            route,
+            start: cohere_spec_route_start,
+            terminal: cohere_spec_route_terminal,
+        },
+        GenerationRoute::MapleAr => GenerationRouteAdapter {
+            route,
+            start: maple_ar_route_start,
+            terminal: maple_ar_route_terminal,
+        },
+        GenerationRoute::MiniMaxAr => GenerationRouteAdapter {
+            route,
+            start: minimax_ar_route_start,
+            terminal: minimax_ar_route_terminal,
+        },
+        GenerationRoute::MiniMaxEp => GenerationRouteAdapter {
+            route,
+            start: minimax_ep_route_start,
+            terminal: minimax_ep_route_terminal,
+        },
+        GenerationRoute::MiniMaxSpec => GenerationRouteAdapter {
+            route,
+            start: minimax_spec_route_start,
+            terminal: minimax_spec_route_terminal,
+        },
+        GenerationRoute::LfmAr => GenerationRouteAdapter {
+            route,
+            start: lfm_ar_route_start,
+            terminal: lfm_ar_route_terminal,
+        },
+        GenerationRoute::LfmSpec => GenerationRouteAdapter {
+            route,
+            start: lfm_spec_route_start,
+            terminal: lfm_spec_route_terminal,
+        },
+        GenerationRoute::LlamaAr => GenerationRouteAdapter {
+            route,
+            start: llama_ar_route_start,
+            terminal: llama_ar_route_terminal,
+        },
+        GenerationRoute::LlamaSpec => GenerationRouteAdapter {
+            route,
+            start: llama_spec_route_start,
+            terminal: llama_spec_route_terminal,
+        },
+        GenerationRoute::GlimmerAr => GenerationRouteAdapter {
+            route,
+            start: glimmer_ar_route_start,
+            terminal: glimmer_ar_route_terminal,
+        },
+        GenerationRoute::GlimmerSpec => GenerationRouteAdapter {
+            route,
+            start: glimmer_spec_route_start,
+            terminal: glimmer_spec_route_terminal,
+        },
+        GenerationRoute::PipelineParallel => GenerationRouteAdapter {
+            route,
+            start: pipeline_parallel_route_start,
+            terminal: pipeline_parallel_route_terminal,
+        },
+        GenerationRoute::DotsOcr => GenerationRouteAdapter {
+            route,
+            start: dots_ocr_route_start,
+            terminal: dots_ocr_route_terminal,
+        },
+        GenerationRoute::Unknown => GenerationRouteAdapter {
+            route,
+            start: unknown_route_start,
+            terminal: unknown_route_terminal,
+        },
+    };
+    Some(adapter)
 }
 
 /// Pure inputs for [`select_generation_route`]. No GPU/env side effects.
@@ -3024,6 +3285,7 @@ pub fn generate(
                         dn,
                         kv,
                         m.kv_adaptive.as_mut(),
+                        m.eviction.as_ref(),
                         &mut m.seq_pos,
                         &mut m.conversation_tokens,
                         &mut m.prefill_checkpoints,
@@ -3072,6 +3334,7 @@ pub fn generate(
                                 dn,
                                 kv,
                                 Some(ad),
+                                m.eviction.as_ref(),
                                 &mut m.seq_pos,
                                 &mut m.conversation_tokens,
                                 &mut m.prefill_checkpoints,
@@ -3136,6 +3399,7 @@ pub fn generate(
                         dn,
                         kv,
                         m.kv_adaptive.as_mut(),
+                        m.eviction.as_ref(),
                         &mut m.seq_pos,
                         &mut m.conversation_tokens,
                         &mut m.prefill_checkpoints,
@@ -3186,6 +3450,7 @@ pub fn generate(
                                 dn,
                                 kv,
                                 Some(ad),
+                                m.eviction.as_ref(),
                                 &mut m.seq_pos,
                                 &mut m.conversation_tokens,
                                 &mut m.prefill_checkpoints,
@@ -3262,6 +3527,7 @@ pub fn generate(
                         dn,
                         kv,
                         Some(ad),
+                        m.eviction.as_ref(),
                         &mut m.seq_pos,
                         &mut m.conversation_tokens,
                         &mut m.prefill_checkpoints,
@@ -3585,6 +3851,7 @@ pub fn generate(
                     dn,
                     kv,
                     m.kv_adaptive.as_mut(),
+                    m.eviction.as_ref(),
                     &mut m.seq_pos,
                     &mut m.conversation_tokens,
                     &mut m.prefill_checkpoints,
@@ -3687,6 +3954,7 @@ pub fn generate(
                             dn,
                             kv,
                             Some(ad),
+                            m.eviction.as_ref(),
                             &mut m.seq_pos,
                             &mut m.conversation_tokens,
                             &mut m.prefill_checkpoints,
@@ -3834,6 +4102,7 @@ pub fn generate(
                                 dn,
                                 kv,
                                 m.kv_adaptive.as_mut(),
+                                m.eviction.as_ref(),
                                 &mut m.seq_pos,
                                 &mut m.conversation_tokens,
                                 &mut m.prefill_checkpoints,
@@ -4042,6 +4311,7 @@ pub fn generate(
                                 dn,
                                 kv,
                                 m.kv_adaptive.as_mut(),
+                                m.eviction.as_ref(),
                                 &mut m.seq_pos,
                                 &mut m.conversation_tokens,
                                 &mut m.prefill_checkpoints,
@@ -4216,6 +4486,7 @@ pub fn generate(
                         dn,
                         kv,
                         m.kv_adaptive.as_mut(),
+                        m.eviction.as_ref(),
                         &mut m.seq_pos,
                         &mut m.conversation_tokens,
                         &mut m.prefill_checkpoints,
