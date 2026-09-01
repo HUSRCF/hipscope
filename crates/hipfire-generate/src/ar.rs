@@ -981,19 +981,19 @@ fn emit_route_terminal(
 macro_rules! define_route_start {
     ($name:ident, $arch:expr) => {
         fn $name(output: &mut dyn Write, id: &str) {
-            emit_gen_start(output, id, false, gen_start_contract_version_for_arch($arch));
+            emit_gen_start(
+                output,
+                id,
+                false,
+                gen_start_contract_version_for_arch($arch),
+            );
         }
     };
 }
 
 macro_rules! define_route_terminal {
     ($name:ident, $route:expr) => {
-        fn $name(
-            output: &mut dyn Write,
-            id: &str,
-            attempt: u64,
-            terminal: RouteTerminal,
-        ) {
+        fn $name(output: &mut dyn Write, id: &str, attempt: u64, terminal: RouteTerminal) {
             emit_route_terminal(output, id, attempt, terminal, $route.name());
         }
     };
@@ -1030,7 +1030,10 @@ define_route_terminal!(qwen2_ar_route_terminal, GenerationRoute::Qwen2Ar);
 define_route_terminal!(qwen2_spec_route_terminal, GenerationRoute::Qwen2Spec);
 define_route_terminal!(deepseek4_ar_route_terminal, GenerationRoute::Deepseek4Ar);
 define_route_terminal!(deepseek4_ep_route_terminal, GenerationRoute::Deepseek4Ep);
-define_route_terminal!(deepseek4_spec_route_terminal, GenerationRoute::Deepseek4Spec);
+define_route_terminal!(
+    deepseek4_spec_route_terminal,
+    GenerationRoute::Deepseek4Spec
+);
 define_route_terminal!(cohere_ar_route_terminal, GenerationRoute::CohereAr);
 define_route_terminal!(cohere_spec_route_terminal, GenerationRoute::CohereSpec);
 define_route_terminal!(maple_ar_route_terminal, GenerationRoute::MapleAr);
@@ -1043,7 +1046,10 @@ define_route_terminal!(llama_ar_route_terminal, GenerationRoute::LlamaAr);
 define_route_terminal!(llama_spec_route_terminal, GenerationRoute::LlamaSpec);
 define_route_terminal!(glimmer_ar_route_terminal, GenerationRoute::GlimmerAr);
 define_route_terminal!(glimmer_spec_route_terminal, GenerationRoute::GlimmerSpec);
-define_route_terminal!(pipeline_parallel_route_terminal, GenerationRoute::PipelineParallel);
+define_route_terminal!(
+    pipeline_parallel_route_terminal,
+    GenerationRoute::PipelineParallel
+);
 define_route_terminal!(dots_ocr_route_terminal, GenerationRoute::DotsOcr);
 define_route_terminal!(unknown_route_terminal, GenerationRoute::Unknown);
 

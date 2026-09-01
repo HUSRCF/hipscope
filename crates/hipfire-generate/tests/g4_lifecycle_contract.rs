@@ -12,10 +12,7 @@
 #![allow(clippy::all)]
 
 use std::path::{Path, PathBuf};
-use std::sync::{
-    atomic::AtomicBool,
-    Arc, Barrier, Mutex, OnceLock,
-};
+use std::sync::{atomic::AtomicBool, Arc, Barrier, Mutex, OnceLock};
 
 use hipfire_engine::terminal::{
     activate_terminal_control, clear_terminal_control, set_active_attempt_id,
@@ -46,8 +43,13 @@ fn production_reset_lifecycle_dispatches_all_topologies_and_preserves_owner() {
         hipfire_loader::ResetRoute::TensorParallel,
         hipfire_loader::ResetRoute::ExpertParallel,
     ] {
-        let (mut seq_pos, mut conversation_tokens, mut request_tokens, mut compact_offset, mut speculative_pending) =
-            seeded_reset_state();
+        let (
+            mut seq_pos,
+            mut conversation_tokens,
+            mut request_tokens,
+            mut compact_offset,
+            mut speculative_pending,
+        ) = seeded_reset_state();
         let mut owner = reset_test_owner();
         let owner_ptr = &owner as *const _;
         let mut phases = Vec::new();
@@ -89,7 +91,10 @@ fn production_reset_lifecycle_dispatches_all_topologies_and_preserves_owner() {
                 hipfire_loader::ResetPhase::GraphsAndSynchronize,
             ]
         );
-        assert_eq!(&owner as *const _, owner_ptr, "{route:?} replaced eviction owner");
+        assert_eq!(
+            &owner as *const _, owner_ptr,
+            "{route:?} replaced eviction owner"
+        );
         assert_eq!(
             match &owner {
                 hipfire_loader::Eviction::Plain(ctx) => ctx.request_reset_count(),
@@ -110,8 +115,13 @@ fn production_reset_lifecycle_attempts_all_phases_after_recurrent_failure() {
         hipfire_loader::ResetRoute::TensorParallel,
         hipfire_loader::ResetRoute::ExpertParallel,
     ] {
-        let (mut seq_pos, mut conversation_tokens, mut request_tokens, mut compact_offset, mut speculative_pending) =
-            seeded_reset_state();
+        let (
+            mut seq_pos,
+            mut conversation_tokens,
+            mut request_tokens,
+            mut compact_offset,
+            mut speculative_pending,
+        ) = seeded_reset_state();
         let mut owner = reset_test_owner();
         let mut phases = Vec::new();
         let mut run = |seen_route: hipfire_loader::ResetRoute,
@@ -155,7 +165,6 @@ fn production_reset_lifecycle_attempts_all_phases_after_recurrent_failure() {
         );
     }
 }
-
 
 // ── concrete route adapter race/cardinality matrix ─────────────────────────
 
@@ -246,7 +255,11 @@ fn route_adapters_start_first_and_race_one_semantic_terminal() {
             .iter()
             .filter(|line| line.get("type").and_then(|v| v.as_str()) == Some("aborted"))
             .count();
-        assert!(aborted <= 1, "{} emitted multiple cancel terminals", route.name());
+        assert!(
+            aborted <= 1,
+            "{} emitted multiple cancel terminals",
+            route.name()
+        );
         let semantic_owners = done + error + aborted - aborted.min(done);
         assert_eq!(
             semantic_owners,
@@ -260,7 +273,8 @@ fn route_adapters_start_first_and_race_one_semantic_terminal() {
             adapter.emit_terminal(&mut output, &id, attempt, contender);
         }
         assert_eq!(
-            output, before_late,
+            output,
+            before_late,
             "{} terminal claim leaked a late writer",
             route.name()
         );
@@ -268,7 +282,6 @@ fn route_adapters_start_first_and_race_one_semantic_terminal() {
         set_active_attempt_id(0);
     }
 }
-
 
 // ── ignored live-GPU ownership tests ───────────────────────────────────────
 

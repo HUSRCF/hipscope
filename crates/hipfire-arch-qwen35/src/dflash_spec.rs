@@ -382,11 +382,9 @@ pub fn load_dflash_state(
         hidden_rb.free_gpu(gpu);
         draft_scratch.free_gpu(gpu);
         draft_weights.free_gpu(gpu);
-        return Err(
-            "DFlash target verify scratch: target-owner-published; \
+        return Err("DFlash target verify scratch: target-owner-published; \
              draft-owner-published; injected failure"
-                .to_string(),
-        );
+            .to_string());
     }
     let target_snap = or_free!(
         DeltaNetSnapshot::new_for(gpu, target_dn),

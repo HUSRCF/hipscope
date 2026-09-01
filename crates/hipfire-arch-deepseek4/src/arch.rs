@@ -1095,8 +1095,10 @@ impl DeepseekV4 {
         gpu: &mut Gpu,
         lifecycle_fault: Option<LoadFaultStage>,
     ) -> Result<DeepseekV4Weights, String> {
-        Ok(Self::load_weights_inner(hfq, cfg, gpu, None, None, None, lifecycle_fault)?
-            .into_single())
+        Ok(
+            Self::load_weights_inner(hfq, cfg, gpu, None, None, None, lifecycle_fault)?
+                .into_single(),
+        )
     }
 
     /// Exact byte projection for the base MQ2R split before either device is
@@ -1482,8 +1484,10 @@ impl DeepseekV4 {
         shard: &hipfire_runtime::tp_shard::ShardConfig,
         rank: usize,
     ) -> Result<DeepseekV4Weights, String> {
-        Ok(Self::load_weights_inner(hfq, cfg, gpu, Some((shard, rank)), None, None, None)?
-            .into_single())
+        Ok(
+            Self::load_weights_inner(hfq, cfg, gpu, Some((shard, rank)), None, None, None)?
+                .into_single(),
+        )
     }
 
     /// Load the fixed MQ2R artifact directly onto its two exact device owners:

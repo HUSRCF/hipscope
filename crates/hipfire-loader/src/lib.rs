@@ -31,9 +31,7 @@ use hipfire_runtime::kv_backend::KvBackend;
 use hipfire_runtime::kv_mode;
 use hipfire_runtime::llama;
 use hipfire_runtime::llama::{KvCacheExt, KvDims, KvLayers, KvTarget};
-use hipfire_runtime::loader_api::{
-    CaskConfig, LoadCtx, LoadFaultStage, ModelSource, SpecLoadCfg,
-};
+use hipfire_runtime::loader_api::{CaskConfig, LoadCtx, LoadFaultStage, ModelSource, SpecLoadCfg};
 use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_runtime::spec::{SpecEmit, SpecEmitCtx, SpecTargetGuard, Speculator};
 use hipfire_runtime::triattn::{EvictionCtx, TriAttnCenters};
@@ -1400,9 +1398,7 @@ impl LoadedModel {
                     let Some(owner) = ep.gpus.devices.first_mut() else {
                         model.prefill_checkpoints.clear();
                         model.dflash_checkpoints.clear();
-                        return Err(
-                            "EP reset has no device for checkpoint ownership".to_string()
-                        );
+                        return Err("EP reset has no device for checkpoint ownership".to_string());
                     };
                     for (_, snapshot) in model.prefill_checkpoints.drain(..) {
                         snapshot.free_gpu(owner);
@@ -1484,7 +1480,6 @@ impl LoadedModel {
         )
     }
 
-
     /// Reset every model-owned request surface before a new turn or after a
     /// failed attempt. Generation and the loader call the same phase runner;
     /// only this method's callback supplies the concrete GPU operations.
@@ -1544,8 +1539,7 @@ impl LoadedModel {
                 ResetPhase::AdaptiveKv => {
                     if let Some(adaptive) = model.kv_adaptive.as_mut() {
                         let state = &mut model.state;
-                        if let Some(kv) =
-                            state.as_deref_mut().and_then(|arch| arch.kv_cache_mut())
+                        if let Some(kv) = state.as_deref_mut().and_then(|arch| arch.kv_cache_mut())
                         {
                             adaptive.reset_with_cache(gpu, kv);
                         } else {
@@ -1560,16 +1554,14 @@ impl LoadedModel {
                     }
                     let state = &mut model.state;
                     if let Some(bundle) = state.as_deref_mut().and_then(|arch| {
-                        (arch as &mut dyn Any)
-                            .downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
+                        (arch as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
                     }) {
                         if let Some(batch) = bundle.qwen35_decode_batch.as_mut() {
                             batch.reset(gpu)?;
                         }
                     }
                     if let Some(bundle) = state.as_deref_mut().and_then(|arch| {
-                        (arch as &mut dyn Any)
-                            .downcast_mut::<hipfire_arch_lfm2moe::Lfm2MoeBundle>()
+                        (arch as &mut dyn Any).downcast_mut::<hipfire_arch_lfm2moe::Lfm2MoeBundle>()
                     }) {
                         if let Some(batch) = bundle.lfm2_decode_batch.as_mut() {
                             batch.reset(gpu)?;

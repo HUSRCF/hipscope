@@ -390,8 +390,8 @@ pub fn production_fail_closed_rollback_live_with_extras<'spec, 'object>(
     mut spec: Option<&'spec mut (dyn Speculator + 'object)>,
     mut extras: ResetExtras<'_>,
 ) -> RollbackEpilogue {
-    let mut run = |_route: hipfire_loader::ResetRoute, phase: hipfire_loader::ResetPhase| {
-        match phase {
+    let mut run =
+        |_route: hipfire_loader::ResetRoute, phase: hipfire_loader::ResetPhase| match phase {
             hipfire_loader::ResetPhase::Checkpoints => {
                 free_checkpoints(prefill_checkpoints, gpu);
                 free_checkpoints(dflash_checkpoints, gpu);
@@ -432,8 +432,7 @@ pub fn production_fail_closed_rollback_live_with_extras<'spec, 'object>(
                     .device_synchronize()
                     .map_err(|error| format!("{error:?}"))
             }
-        }
-    };
+        };
     let result = hipfire_loader::reset_lifecycle(
         hipfire_loader::ResetRoute::Single,
         hipfire_loader::ResetRequestState {
