@@ -1136,6 +1136,18 @@ impl LoadedModel {
         self.qwen35().and_then(|b| b.vision_config.as_ref())
     }
 
+    pub fn ack_dims(&self) -> (usize, usize, usize) {
+        if let Some(st) = self.state.as_ref() {
+            let arch = st.as_ref() as &dyn hipfire_runtime::arch_model::ArchModel;
+            return (arch.dim(), arch.n_layers(), arch.vocab_size());
+        }
+        // EP and dense-TP loads keep the model in `ep`, leaving `state` empty.
+        self.ep
+            .as_ref()
+            .map(|ep| ep.inner.model_dims())
+            .unwrap_or((0, 0, 0))
+    }
+
     pub fn vision_weights(&self) -> Option<&qwen35_vl::VisionWeights> {
         self.qwen35().and_then(|b| b.vision_weights.as_ref())
     }
@@ -1272,6 +1284,29 @@ pub enum EpArch {
         dn_states: Vec<hipfire_arch_qwen35::qwen35::DeltaNetState>,
         scratches: Vec<hipfire_arch_qwen35::qwen35::Qwen35Scratch>,
     },
+}
+
+impl EpArch {
+    // A dense-TP rank config keeps global dim/n_layers/vocab: `local_dense_tp_config` narrows only head counts and `hidden_dim`.
+    pub fn model_dims(&self) -> (usize, usize, usize) {
+        match self {
+            EpArch::Ds4 { config, .. } => (
+                config.hidden_size,
+                config.num_hidden_layers,
+                config.vocab_size,
+            ),
+            EpArch::Minimax { config, .. } => (
+                config.hidden_size,
+                config.num_hidden_layers,
+                config.vocab_size,
+            ),
+            EpArch::Qwen35 { config, .. } => (config.dim, config.n_layers, config.vocab_size),
+            EpArch::Qwen35DenseTp { configs, .. } => configs
+                .first()
+                .map(|c| (c.dim, c.n_layers, c.vocab_size))
+                .unwrap_or((0, 0, 0)),
+        }
+    }
 }
 
 // ─── Helper functions ─────────────────────────────────────────────────
