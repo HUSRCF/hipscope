@@ -3843,22 +3843,17 @@ pub fn parse_glimmer_atem(
 /// (assistant-turn cache store). On abort the caller MUST fail-closed reset, because the mirror
 /// and KV are mid-turn and no later turn may reuse them.
 pub fn glimmer_commit_terminal(
-    stdout: &mut std::io::Stdout,
+    stdout: &mut impl std::io::Write,
     id: &str,
     pending_done: &serde_json::Value,
-    generated: usize,
+    _generated: usize,
 ) -> bool {
     match await_client_terminal_commit(stdout, id, pending_done) {
         ClientTerminalDecision::Commit => {
             crate::ar::emit_active_route_done(stdout, id, pending_done);
             true
         }
-        ClientTerminalDecision::Abort => {
-            // Claim through the canonical engine writer so an abort racing
-            // with a late error/done has exactly one terminal owner.
-            crate::ar::emit_active_route_cancel(stdout, id, generated);
-            false
-        }
+        ClientTerminalDecision::Abort => false,
     }
 }
 
@@ -4325,7 +4320,9 @@ pub fn generate_muse_glimmer(
     );
 
     if m.tokenizer.is_none() {
-        emit_error_with_id(stdout, id, "tokenizer not loaded");
+        let message = "tokenizer not loaded";
+        let ep = production_fail_closed_rollback(m, gpu, None, None);
+        emit_fail_closed_error(stdout, Some(id), &message, "validation", false, &ep);
         return;
     }
     // Contract: MuseGlimmerBundle(bundle) — see cross-agent contract.
@@ -4334,11 +4331,10 @@ pub fn generate_muse_glimmer(
     let Some(bundle) = m.state.as_mut().and_then(|s| {
         (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_loader::MuseGlimmerBundle>()
     }) else {
-        emit_error_with_id(
-            stdout,
-            id,
-            "muse_glimmer bundle missing on arch_id=14 generate (expected MuseGlimmerBundle)",
-        );
+        let message =
+            "muse_glimmer bundle missing on arch_id=14 generate (expected MuseGlimmerBundle)";
+        let ep = production_fail_closed_rollback(m, gpu, None, None);
+        emit_fail_closed_error(stdout, Some(id), &message, "validation", false, &ep);
         return;
     };
 
@@ -4406,7 +4402,24 @@ pub fn generate_muse_glimmer(
                 let prepared = match prepare_glimmer_onyx_history(raw_slice) {
                     Ok(p) => p,
                     Err(e) => {
-                        emit_error_with_id(stdout, id, format!("glimmer history prep failed: {e}"));
+                        let message = format!("glimmer history prep failed: {e}");
+                        let ep = reset_glimmer_live(
+                            bundle,
+                            &mut m.seq_pos,
+                            &mut m.conversation_tokens,
+                            &mut m.prefill_checkpoints,
+                            &mut m.dflash_checkpoints,
+                            &mut m.asst_turn_cache,
+                            gpu,
+                        );
+                        emit_fail_closed_error(
+                            stdout,
+                            Some(id),
+                            &message,
+                            "validation",
+                            false,
+                            &ep,
+                        );
                         return;
                     }
                 };
@@ -4503,7 +4516,17 @@ pub fn generate_muse_glimmer(
     };
 
     if prompt_ids.is_empty() {
-        emit_error_with_id(stdout, id, "empty prompt after tokenize");
+        let message = "empty prompt after tokenize";
+        let ep = reset_glimmer_live(
+            bundle,
+            &mut m.seq_pos,
+            &mut m.conversation_tokens,
+            &mut m.prefill_checkpoints,
+            &mut m.dflash_checkpoints,
+            &mut m.asst_turn_cache,
+            gpu,
+        );
+        emit_fail_closed_error(stdout, Some(id), &message, "validation", false, &ep);
         return;
     }
 
@@ -4586,14 +4609,20 @@ pub fn generate_muse_glimmer(
     // writes at pos >= max_seq would be out of bounds).
     let cache_cap = bundle.state.max_seq;
     if prompt_ids.len() >= cache_cap {
-        emit_error_with_id(
-            stdout,
-            id,
-            format!(
-                "muse_glimmer prompt is {} tokens but max_seq is {cache_cap}",
-                prompt_ids.len()
-            ),
+        let message = format!(
+            "muse_glimmer prompt is {} tokens but max_seq is {cache_cap}",
+            prompt_ids.len()
         );
+        let ep = reset_glimmer_live(
+            bundle,
+            &mut m.seq_pos,
+            &mut m.conversation_tokens,
+            &mut m.prefill_checkpoints,
+            &mut m.dflash_checkpoints,
+            &mut m.asst_turn_cache,
+            gpu,
+        );
+        emit_fail_closed_error(stdout, Some(id), &message, "validation", false, &ep);
         return;
     }
 
@@ -4759,31 +4788,18 @@ pub fn generate_muse_glimmer(
         match prefill_result {
             Ok(logits) => last_logits = logits,
             Err(e) => {
-                emit_error_with_id(stdout, id, format!("muse_glimmer prefill failed: {e:?}"));
+                let message = format!("muse_glimmer prefill failed: {e:?}");
                 glimmer::forward::abort_device_capture_stage(&mut bundle.state);
-                if device_capture {
-                    // Device prefill mutates target KV + capture transaction; length-only
-                    // reconcile is not enough — leave zero reusable session state.
-                    let _ = reset_glimmer_live(
-                        bundle,
-                        &mut m.seq_pos,
-                        &mut m.conversation_tokens,
-                        &mut m.prefill_checkpoints,
-                        &mut m.dflash_checkpoints,
-                        &mut m.asst_turn_cache,
-                        gpu,
-                    );
-                } else {
-                    let _ = reset_glimmer_live(
-                        bundle,
-                        &mut m.seq_pos,
-                        &mut m.conversation_tokens,
-                        &mut m.prefill_checkpoints,
-                        &mut m.dflash_checkpoints,
-                        &mut m.asst_turn_cache,
-                        gpu,
-                    );
-                }
+                let ep = reset_glimmer_live(
+                    bundle,
+                    &mut m.seq_pos,
+                    &mut m.conversation_tokens,
+                    &mut m.prefill_checkpoints,
+                    &mut m.dflash_checkpoints,
+                    &mut m.asst_turn_cache,
+                    gpu,
+                );
+                emit_fail_closed_error(stdout, Some(id), &message, "gpu", true, &ep);
                 return;
             }
         }
@@ -5037,12 +5053,8 @@ pub fn generate_muse_glimmer(
                                 .copy_from_slice(&v[..hidden]);
                         }
                         Err(e) => {
-                            emit_error_with_id(
-                                stdout,
-                                id,
-                                format!("glimmer drafter noise embed row {i}: {e}"),
-                            );
-                            let _ = reset_glimmer_live(
+                            let message = format!("glimmer drafter noise embed row {i}: {e}");
+                            let ep = reset_glimmer_live(
                                 bundle,
                                 &mut m.seq_pos,
                                 &mut m.conversation_tokens,
@@ -5051,6 +5063,7 @@ pub fn generate_muse_glimmer(
                                 &mut m.asst_turn_cache,
                                 gpu,
                             );
+                            emit_fail_closed_error(stdout, Some(id), &message, "gpu", true, &ep);
                             return;
                         }
                     }
@@ -5098,10 +5111,9 @@ pub fn generate_muse_glimmer(
                 let history_end = match history_end {
                     Ok(h) => h,
                     Err(e) => {
-                        emit_error_with_id(stdout, id, e.clone());
+                        let message = e.clone();
                         glimmer::forward::abort_device_capture_stage(&mut bundle.state);
-                        // Capture/log integrity errors (incl. poisoned transaction) leave no reusable state.
-                        let _ = reset_glimmer_live(
+                        let ep = reset_glimmer_live(
                             bundle,
                             &mut m.seq_pos,
                             &mut m.conversation_tokens,
@@ -5110,19 +5122,16 @@ pub fn generate_muse_glimmer(
                             &mut m.asst_turn_cache,
                             gpu,
                         );
+                        emit_fail_closed_error(stdout, Some(id), &message, "gpu", true, &ep);
                         return;
                     }
                 };
                 if history_end != cur_pos as usize {
-                    emit_error_with_id(
-                    stdout,
-                    id,
-                    format!(
+                    let message = format!(
                         "glimmer-spec: target history end {history_end} != cur_pos {cur_pos} (capture hole)"
-                    ),
-                );
+                    );
                     glimmer::forward::abort_device_capture_stage(&mut bundle.state);
-                    let _ = reset_glimmer_live(
+                    let ep = reset_glimmer_live(
                         bundle,
                         &mut m.seq_pos,
                         &mut m.conversation_tokens,
@@ -5131,6 +5140,7 @@ pub fn generate_muse_glimmer(
                         &mut m.asst_turn_cache,
                         gpu,
                     );
+                    emit_fail_closed_error(stdout, Some(id), &message, "gpu", true, &ep);
                     return;
                 }
                 let ctx_len = (cur_pos as usize).min(ctx_cap);
@@ -5148,13 +5158,9 @@ pub fn generate_muse_glimmer(
                     let log = match bundle.state.target_hidden_log() {
                         Some(l) => l,
                         None => {
-                            emit_error_with_id(
-                                stdout,
-                                id,
-                                "glimmer-spec: device hidden log missing at draft",
-                            );
+                            let message = "glimmer-spec: device hidden log missing at draft";
                             glimmer::forward::abort_device_capture_stage(&mut bundle.state);
-                            let _ = reset_glimmer_live(
+                            let ep = reset_glimmer_live(
                                 bundle,
                                 &mut m.seq_pos,
                                 &mut m.conversation_tokens,
@@ -5163,6 +5169,7 @@ pub fn generate_muse_glimmer(
                                 &mut m.asst_turn_cache,
                                 gpu,
                             );
+                            emit_fail_closed_error(stdout, Some(id), &message, "gpu", true, &ep);
                             return;
                         }
                     };
@@ -5209,30 +5216,18 @@ pub fn generate_muse_glimmer(
                         .as_deref()
                         != Some("1");
                     if fatal {
-                        emit_error_with_id(stdout, id, format!("glimmer drafter forward failed (requested via HIPFIRE_DFLASH_DRAFT): {e}"));
-                        let es = format!("{e}");
-                        if es.contains("poisoned") || es.contains("session requires reset") {
-                            glimmer::forward::abort_device_capture_stage(&mut bundle.state);
-                            let _ = reset_glimmer_live(
-                                bundle,
-                                &mut m.seq_pos,
-                                &mut m.conversation_tokens,
-                                &mut m.prefill_checkpoints,
-                                &mut m.dflash_checkpoints,
-                                &mut m.asst_turn_cache,
-                                gpu,
-                            );
-                        } else {
-                            let _ = reset_glimmer_live(
-                                bundle,
-                                &mut m.seq_pos,
-                                &mut m.conversation_tokens,
-                                &mut m.prefill_checkpoints,
-                                &mut m.dflash_checkpoints,
-                                &mut m.asst_turn_cache,
-                                gpu,
-                            );
-                        }
+                        let message = format!("glimmer drafter forward failed (requested via HIPFIRE_DFLASH_DRAFT): {e}");
+                        glimmer::forward::abort_device_capture_stage(&mut bundle.state);
+                        let ep = reset_glimmer_live(
+                            bundle,
+                            &mut m.seq_pos,
+                            &mut m.conversation_tokens,
+                            &mut m.prefill_checkpoints,
+                            &mut m.dflash_checkpoints,
+                            &mut m.asst_turn_cache,
+                            gpu,
+                        );
+                        emit_fail_closed_error(stdout, Some(id), &message, "gpu", true, &ep);
                         return;
                     }
                     eprintln!("[glimmer-spec] drafter forward failed: {e} — falling back to AR for this window (HIPFIRE_GLIMMER_SPEC_FALLBACK=1)");
@@ -5293,14 +5288,9 @@ pub fn generate_muse_glimmer(
                             }
                         }
                         Err(e) => {
-                            emit_error_with_id(
-                                stdout,
-                                id,
-                                format!("muse_glimmer decode failed: {e:?}"),
-                            );
+                            let message = format!("muse_glimmer decode failed: {e:?}");
                             glimmer::forward::abort_device_capture_stage(&mut bundle.state);
-                            // Capture-aware: fail closed — no length-only reconcile after target decode failure.
-                            let _ = reset_glimmer_live(
+                            let ep = reset_glimmer_live(
                                 bundle,
                                 &mut m.seq_pos,
                                 &mut m.conversation_tokens,
@@ -5309,6 +5299,7 @@ pub fn generate_muse_glimmer(
                                 &mut m.asst_turn_cache,
                                 gpu,
                             );
+                            emit_fail_closed_error(stdout, Some(id), &message, "gpu", true, &ep);
                             return;
                         }
                     }
@@ -5404,8 +5395,8 @@ pub fn generate_muse_glimmer(
                     Ok(p) => p,
                     Err(e) => {
                         gpu.free_tensor(hidden_for_draft).ok();
-                        emit_error_with_id(stdout, id, format!("glimmer drafter lm_head: {e}"));
-                        let _ = reset_glimmer_live(
+                        let message = format!("glimmer drafter lm_head: {e}");
+                        let ep = reset_glimmer_live(
                             bundle,
                             &mut m.seq_pos,
                             &mut m.conversation_tokens,
@@ -5414,6 +5405,7 @@ pub fn generate_muse_glimmer(
                             &mut m.asst_turn_cache,
                             gpu,
                         );
+                        emit_fail_closed_error(stdout, Some(id), &message, "gpu", true, &ep);
                         return;
                     }
                 };
@@ -5449,13 +5441,9 @@ pub fn generate_muse_glimmer(
                         ) {
                             Ok(p) => p,
                             Err(e) => {
-                                emit_error_with_id(
-                                    stdout,
-                                    id,
-                                    format!("muse_glimmer verify failed: {e:?}"),
-                                );
+                                let message = format!("muse_glimmer verify failed: {e:?}");
                                 glimmer::forward::abort_device_capture_stage(&mut bundle.state);
-                                let _ = reset_glimmer_live(
+                                let ep = reset_glimmer_live(
                                     bundle,
                                     &mut m.seq_pos,
                                     &mut m.conversation_tokens,
@@ -5463,6 +5451,14 @@ pub fn generate_muse_glimmer(
                                     &mut m.dflash_checkpoints,
                                     &mut m.asst_turn_cache,
                                     gpu,
+                                );
+                                emit_fail_closed_error(
+                                    stdout,
+                                    Some(id),
+                                    &message,
+                                    "gpu",
+                                    true,
+                                    &ep,
                                 );
                                 return;
                             }
@@ -5481,12 +5477,8 @@ pub fn generate_muse_glimmer(
                         ) {
                             Ok(p) => p,
                             Err(e) => {
-                                emit_error_with_id(
-                                    stdout,
-                                    id,
-                                    format!("muse_glimmer verify failed: {e:?}"),
-                                );
-                                let _ = reset_glimmer_live(
+                                let message = format!("muse_glimmer verify failed: {e:?}");
+                                let ep = reset_glimmer_live(
                                     bundle,
                                     &mut m.seq_pos,
                                     &mut m.conversation_tokens,
@@ -5494,6 +5486,14 @@ pub fn generate_muse_glimmer(
                                     &mut m.dflash_checkpoints,
                                     &mut m.asst_turn_cache,
                                     gpu,
+                                );
+                                emit_fail_closed_error(
+                                    stdout,
+                                    Some(id),
+                                    &message,
+                                    "gpu",
+                                    true,
+                                    &ep,
                                 );
                                 return;
                             }
@@ -5511,13 +5511,9 @@ pub fn generate_muse_glimmer(
                     ) {
                         Ok(p) => p,
                         Err(e) => {
-                            emit_error_with_id(
-                                stdout,
-                                id,
-                                format!("muse_glimmer verify failed: {e:?}"),
-                            );
+                            let message = format!("muse_glimmer verify failed: {e:?}");
                             glimmer::forward::abort_device_capture_stage(&mut bundle.state);
-                            let _ = reset_glimmer_live(
+                            let ep = reset_glimmer_live(
                                 bundle,
                                 &mut m.seq_pos,
                                 &mut m.conversation_tokens,
@@ -5526,6 +5522,7 @@ pub fn generate_muse_glimmer(
                                 &mut m.asst_turn_cache,
                                 gpu,
                             );
+                            emit_fail_closed_error(stdout, Some(id), &message, "gpu", true, &ep);
                             return;
                         }
                     }
@@ -5543,12 +5540,8 @@ pub fn generate_muse_glimmer(
                     ) {
                         Ok(p) => p,
                         Err(e) => {
-                            emit_error_with_id(
-                                stdout,
-                                id,
-                                format!("muse_glimmer verify failed: {e:?}"),
-                            );
-                            let _ = reset_glimmer_live(
+                            let message = format!("muse_glimmer verify failed: {e:?}");
+                            let ep = reset_glimmer_live(
                                 bundle,
                                 &mut m.seq_pos,
                                 &mut m.conversation_tokens,
@@ -5557,6 +5550,7 @@ pub fn generate_muse_glimmer(
                                 &mut m.asst_turn_cache,
                                 gpu,
                             );
+                            emit_fail_closed_error(stdout, Some(id), &message, "gpu", true, &ep);
                             return;
                         }
                     }
@@ -5716,13 +5710,10 @@ pub fn generate_muse_glimmer(
                         gpu,
                         keep_rows,
                     ) {
-                        emit_error_with_id(
-                            stdout,
-                            id,
-                            format!("muse_glimmer commit_device_verify_capture failed: {e}"),
-                        );
+                        let message =
+                            format!("muse_glimmer commit_device_verify_capture failed: {e}");
                         glimmer::forward::abort_device_capture_stage(&mut bundle.state);
-                        let _ = reset_glimmer_live(
+                        let ep = reset_glimmer_live(
                             bundle,
                             &mut m.seq_pos,
                             &mut m.conversation_tokens,
@@ -5731,20 +5722,17 @@ pub fn generate_muse_glimmer(
                             &mut m.asst_turn_cache,
                             gpu,
                         );
+                        emit_fail_closed_error(stdout, Some(id), &message, "gpu", true, &ep);
                         return;
                     }
                 }
                 let commit_end = window_start_cur_pos + keep_rows;
                 if let Err(e) = bundle.rewind_session_to(commit_end) {
-                    emit_error_with_id(
-                        stdout,
-                        id,
-                        format!(
-                            "muse_glimmer rewind_session_to({commit_end}) after verify failed: {e}"
-                        ),
+                    let message = format!(
+                        "muse_glimmer rewind_session_to({commit_end}) after verify failed: {e}"
                     );
                     glimmer::forward::abort_device_capture_stage(&mut bundle.state);
-                    let _ = reset_glimmer_live(
+                    let ep = reset_glimmer_live(
                         bundle,
                         &mut m.seq_pos,
                         &mut m.conversation_tokens,
@@ -5753,6 +5741,7 @@ pub fn generate_muse_glimmer(
                         &mut m.asst_turn_cache,
                         gpu,
                     );
+                    emit_fail_closed_error(stdout, Some(id), &message, "gpu", true, &ep);
                     return;
                 }
                 cur_pos = commit_end as u32;
@@ -5769,13 +5758,10 @@ pub fn generate_muse_glimmer(
                 let mut probe_kind = GlimmerProfitProbeKind::None;
                 if full_window && profit_guard.enabled() && !profit_guard.is_retired() {
                     if let Err(e) = gpu.hip.device_synchronize() {
-                        emit_error_with_id(
-                            stdout,
-                            id,
-                            format!("muse_glimmer profit guard synchronization failed: {e:?}"),
-                        );
+                        let message =
+                            format!("muse_glimmer profit guard synchronization failed: {e:?}");
                         glimmer::forward::abort_device_capture_stage(&mut bundle.state);
-                        let _ = reset_glimmer_live(
+                        let ep = reset_glimmer_live(
                             bundle,
                             &mut m.seq_pos,
                             &mut m.conversation_tokens,
@@ -5784,6 +5770,7 @@ pub fn generate_muse_glimmer(
                             &mut m.asst_turn_cache,
                             gpu,
                         );
+                        emit_fail_closed_error(stdout, Some(id), &message, "gpu", true, &ep);
                         return;
                     }
                     // t_after_verify covers draft+verify from t_window start.
@@ -5807,15 +5794,11 @@ pub fn generate_muse_glimmer(
                         Ok((pred, new_rng)) => {
                             gpu_rng = new_rng;
                             if let Err(e) = gpu.hip.device_synchronize() {
-                                emit_error_with_id(
-                                    stdout,
-                                    id,
-                                    format!(
-                                        "muse_glimmer profit probe synchronization failed: {e:?}"
-                                    ),
+                                let message = format!(
+                                    "muse_glimmer profit probe synchronization failed: {e:?}"
                                 );
                                 glimmer::forward::abort_device_capture_stage(&mut bundle.state);
-                                let _ = reset_glimmer_live(
+                                let ep = reset_glimmer_live(
                                     bundle,
                                     &mut m.seq_pos,
                                     &mut m.conversation_tokens,
@@ -5823,6 +5806,14 @@ pub fn generate_muse_glimmer(
                                     &mut m.dflash_checkpoints,
                                     &mut m.asst_turn_cache,
                                     gpu,
+                                );
+                                emit_fail_closed_error(
+                                    stdout,
+                                    Some(id),
+                                    &message,
+                                    "gpu",
+                                    true,
+                                    &ep,
                                 );
                                 return;
                             }
@@ -5891,13 +5882,9 @@ pub fn generate_muse_glimmer(
                             }
                         }
                         Err(e) => {
-                            emit_error_with_id(
-                                stdout,
-                                id,
-                                format!("muse_glimmer profit probe decode failed: {e:?}"),
-                            );
+                            let message = format!("muse_glimmer profit probe decode failed: {e:?}");
                             glimmer::forward::abort_device_capture_stage(&mut bundle.state);
-                            let _ = reset_glimmer_live(
+                            let ep = reset_glimmer_live(
                                 bundle,
                                 &mut m.seq_pos,
                                 &mut m.conversation_tokens,
@@ -5906,6 +5893,7 @@ pub fn generate_muse_glimmer(
                                 &mut m.asst_turn_cache,
                                 gpu,
                             );
+                            emit_fail_closed_error(stdout, Some(id), &message, "gpu", true, &ep);
                             return;
                         }
                     }
@@ -6051,9 +6039,9 @@ pub fn generate_muse_glimmer(
                     next_tok = sampled;
                 }
                 Err(e) => {
-                    emit_error_with_id(stdout, id, format!("muse_glimmer decode failed: {e:?}"));
+                    let message = format!("muse_glimmer decode failed: {e:?}");
                     glimmer::forward::abort_device_capture_stage(&mut bundle.state);
-                    let _ = reset_glimmer_live(
+                    let ep = reset_glimmer_live(
                         bundle,
                         &mut m.seq_pos,
                         &mut m.conversation_tokens,
@@ -6062,6 +6050,7 @@ pub fn generate_muse_glimmer(
                         &mut m.asst_turn_cache,
                         gpu,
                     );
+                    emit_fail_closed_error(stdout, Some(id), &message, "gpu", true, &ep);
                     return;
                 }
             }
@@ -6209,8 +6198,8 @@ pub fn generate_muse_glimmer(
             );
         }
     } else {
-        // Fail closed: the mirror and KV are mid-turn, so no later turn may reuse them.
-        let _ = reset_glimmer_live(
+        // Abort: reset first, then emit cancellation after attestation (fail-closed if reset fails).
+        let ep = reset_glimmer_live(
             bundle,
             &mut m.seq_pos,
             &mut m.conversation_tokens,
@@ -6219,6 +6208,7 @@ pub fn generate_muse_glimmer(
             &mut m.asst_turn_cache,
             gpu,
         );
+        emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
     }
 }
 pub fn generate_lfm2moe(
@@ -6888,6 +6878,8 @@ pub fn generate_minimax(
     // push to `m.conversation_tokens` in the same scope. The LAST forward's
     // logits are the predictions for the first generated token. ──
     let mut last_logits: Vec<f32> = Vec::new();
+    let mut prefill_aborted = false;
+    let mut prefill_err: Option<String> = None;
     {
         let b = m.minimax_mut().unwrap();
         let cfg = &b.config;
@@ -6911,15 +6903,15 @@ pub fn generate_minimax(
             // MiniMax-M2 (256 experts/top-8). Shorter prompts fall to the
             // indexed path inside forward_batch (below the grouped gate).
             for chunk in prefill_ids.chunks(512) {
+                if check_abort(id) {
+                    prefill_aborted = true;
+                    break;
+                }
                 match minimax::forward::forward_batch(cfg, weights, state, gpu, chunk, pos) {
                     Ok(logits) => last_logits = logits,
                     Err(e) => {
-                        emit_error_with_id(
-                            stdout,
-                            id,
-                            format!("minimax batch prefill failed: {e:?}"),
-                        );
-                        return;
+                        prefill_err = Some(format!("minimax batch prefill failed: {e:?}"));
+                        break;
                     }
                 }
                 pos += chunk.len();
@@ -6927,16 +6919,30 @@ pub fn generate_minimax(
         } else {
             let mut position = state.n_tokens as u32;
             for &tok in &prefill_ids {
+                if check_abort(id) {
+                    prefill_aborted = true;
+                    break;
+                }
                 match minimax::forward::decode_step(cfg, weights, state, gpu, tok, position) {
                     Ok(logits) => last_logits = logits,
                     Err(e) => {
-                        emit_error_with_id(stdout, id, format!("minimax prefill failed: {e:?}"));
-                        return;
+                        prefill_err = Some(format!("minimax prefill failed: {e:?}"));
+                        break;
                     }
                 }
                 position += 1;
             }
         }
+    }
+    if let Some(message) = prefill_err {
+        let ep = production_fail_closed_rollback(m, gpu, None, None);
+        emit_fail_closed_error(stdout, Some(id), &message, "gpu", true, &ep);
+        return;
+    }
+    if prefill_aborted || check_abort(id) {
+        let ep = production_fail_closed_rollback(m, gpu, None, None);
+        emit_spec_cancel_after_rollback(stdout, id, 0, &ep);
+        return;
     }
     for &tok in &prefill_ids {
         m.conversation_tokens.push(tok);
@@ -6975,6 +6981,11 @@ pub fn generate_minimax(
     let mut generated_count: usize = 0;
     let decode_t0 = Instant::now();
     loop {
+        if check_abort(id) {
+            let ep = production_fail_closed_rollback(m, gpu, None, None);
+            emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
+            return;
+        }
         if generated_count >= max_tokens {
             break;
         }
@@ -7001,6 +7012,12 @@ pub fn generate_minimax(
         m.conversation_tokens.push(next_tok);
         generated_count += 1;
 
+        if check_abort(id) {
+            let ep = production_fail_closed_rollback(m, gpu, None, None);
+            emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
+            return;
+        }
+
         // Advance one step on the freshly sampled token.
         let step = {
             let b = m.minimax_mut().unwrap();
@@ -7016,10 +7033,19 @@ pub fn generate_minimax(
         match step {
             Ok(logits) => last_logits = logits,
             Err(e) => {
-                emit_error_with_id(stdout, id, format!("minimax decode failed: {e:?}"));
+                let message = format!("minimax decode failed: {e:?}");
+                let ep = production_fail_closed_rollback(m, gpu, None, None);
+                emit_fail_closed_error(stdout, Some(id), &message, "gpu", true, &ep);
                 return;
             }
         }
+    }
+
+    // Abort latched between loop exit and commit must not proceed to handshake.
+    if check_abort(id) {
+        let ep = production_fail_closed_rollback(m, gpu, None, None);
+        emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
+        return;
     }
 
     m.seq_pos = m.minimax().unwrap().state.n_tokens;
@@ -7044,7 +7070,10 @@ pub fn generate_minimax(
         ClientTerminalDecision::Commit => {
             crate::ar::emit_active_route_done(stdout, id, &pending_done)
         }
-        ClientTerminalDecision::Abort => {}
+        ClientTerminalDecision::Abort => {
+            let ep = production_fail_closed_rollback(m, gpu, None, None);
+            emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
+        }
     }
 }
 /// Cohere2-MoE / North-Mini-Code (arch_id=12) generate path. Mirrors
@@ -7342,6 +7371,8 @@ pub fn generate_cohere2moe(
     // Q8/F16 expert tiers (no indexed kernel) fall back to per-token decode_step.
     // The LAST forward's logits predict the first generated token. ──
     let mut last_logits: Vec<f32> = Vec::new();
+    let mut prefill_aborted = false;
+    let mut prefill_err: Option<String> = None;
     {
         let b = m.cohere2moe_mut().unwrap();
         let cfg = &b.config;
@@ -7350,6 +7381,10 @@ pub fn generate_cohere2moe(
         if cohere2moe::forward::forward_batch_supported(weights) && prefill_ids.len() > 1 {
             let mut i = 0;
             while i < prefill_ids.len() {
+                if check_abort(id) {
+                    prefill_aborted = true;
+                    break;
+                }
                 let end = (i + 256).min(prefill_ids.len());
                 let start_pos = state.n_tokens;
                 match cohere2moe::forward::forward_batch(
@@ -7362,12 +7397,8 @@ pub fn generate_cohere2moe(
                 ) {
                     Ok(logits) => last_logits = logits,
                     Err(e) => {
-                        emit_error_with_id(
-                            stdout,
-                            id,
-                            format!("cohere2moe batched prefill failed: {e:?}"),
-                        );
-                        return;
+                        prefill_err = Some(format!("cohere2moe batched prefill failed: {e:?}"));
+                        break;
                     }
                 }
                 i = end;
@@ -7375,16 +7406,30 @@ pub fn generate_cohere2moe(
         } else {
             let mut position = state.n_tokens as u32;
             for &tok in &prefill_ids {
+                if check_abort(id) {
+                    prefill_aborted = true;
+                    break;
+                }
                 match cohere2moe::forward::decode_step(cfg, weights, state, gpu, tok, position) {
                     Ok(logits) => last_logits = logits,
                     Err(e) => {
-                        emit_error_with_id(stdout, id, format!("cohere2moe prefill failed: {e:?}"));
-                        return;
+                        prefill_err = Some(format!("cohere2moe prefill failed: {e:?}"));
+                        break;
                     }
                 }
                 position += 1;
             }
         }
+    }
+    if let Some(message) = prefill_err {
+        let ep = production_fail_closed_rollback(m, gpu, None, None);
+        emit_fail_closed_error(stdout, Some(id), &message, "gpu", true, &ep);
+        return;
+    }
+    if prefill_aborted || check_abort(id) {
+        let ep = production_fail_closed_rollback(m, gpu, None, None);
+        emit_spec_cancel_after_rollback(stdout, id, 0, &ep);
+        return;
     }
     for &tok in &prefill_ids {
         m.conversation_tokens.push(tok);
@@ -7527,6 +7572,11 @@ pub fn generate_cohere2moe(
     let mut generated_count: usize = 0;
     let decode_t0 = Instant::now();
     loop {
+        if check_abort(id) {
+            let ep = production_fail_closed_rollback(m, gpu, None, None);
+            emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
+            return;
+        }
         if generated_count >= max_tokens {
             break;
         }
@@ -7702,6 +7752,12 @@ pub fn generate_cohere2moe(
             }
         }
 
+        if check_abort(id) {
+            let ep = production_fail_closed_rollback(m, gpu, None, None);
+            emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
+            return;
+        }
+
         // Advance one step on the freshly sampled token (plain eager decode —
         // no hipGraph variant on this arch yet).
         let step = {
@@ -7715,10 +7771,18 @@ pub fn generate_cohere2moe(
         match step {
             Ok(logits) => last_logits = logits,
             Err(e) => {
-                emit_error_with_id(stdout, id, format!("cohere2moe decode failed: {e:?}"));
+                let message = format!("cohere2moe decode failed: {e:?}");
+                let ep = production_fail_closed_rollback(m, gpu, None, None);
+                emit_fail_closed_error(stdout, Some(id), &message, "gpu", true, &ep);
                 return;
             }
         }
+    }
+
+    if check_abort(id) {
+        let ep = production_fail_closed_rollback(m, gpu, None, None);
+        emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
+        return;
     }
 
     m.seq_pos = m.cohere2moe().unwrap().state.n_tokens;
@@ -7802,7 +7866,10 @@ pub fn generate_cohere2moe(
         ClientTerminalDecision::Commit => {
             crate::ar::emit_active_route_done(stdout, id, &pending_done)
         }
-        ClientTerminalDecision::Abort => {}
+        ClientTerminalDecision::Abort => {
+            let ep = production_fail_closed_rollback(m, gpu, None, None);
+            emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
+        }
     }
 }
 /// Qwen2 generate path (arch_id=7, hipfire-arch-qwen2).
@@ -7945,29 +8012,41 @@ pub fn generate_qwen2(
         }
     }
 
-    let state_ref = match m.state.as_mut().and_then(|s| {
-        (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen2::Qwen2Bundle>()
-    }) {
-        Some(b) => b,
-        _ => unreachable!("qwen2 state disappeared after capacity validation"),
-    };
-    let cfg = &state_ref.config;
-    let weights = &state_ref.weights;
-    let state = &mut state_ref.state;
-    let tokenizer = m.tokenizer.as_ref().unwrap();
-
     let t0 = Instant::now();
 
-    // Prefill: forward_step per prompt token. The last call leaves
-    // logits in state.logits — these are the predictions for the
-    // first generated token.
-    for &tok in &prompt_ids {
-        if let Err(e) = qwen2::forward_step(gpu, weights, cfg, state, tok) {
-            emit_error_with_id(stdout, id, format!("qwen2 prefill failed: {e:?}"));
-            let _ = stdout.flush();
-            return;
+    let mut prefill_aborted = false;
+    let mut prefill_err: Option<String> = None;
+    {
+        let state_ref = match m.state.as_mut().and_then(|s| {
+            (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen2::Qwen2Bundle>()
+        }) {
+            Some(b) => b,
+            _ => unreachable!("qwen2 state disappeared after capacity validation"),
+        };
+        let cfg = &state_ref.config;
+        let weights = &state_ref.weights;
+        let state = &mut state_ref.state;
+        for &tok in &prompt_ids {
+            if check_abort(id) {
+                prefill_aborted = true;
+                break;
+            }
+            if let Err(e) = qwen2::forward_step(gpu, weights, cfg, state, tok) {
+                prefill_err = Some(format!("qwen2 prefill failed: {e:?}"));
+                break;
+            }
+            m.conversation_tokens.push(tok);
         }
-        m.conversation_tokens.push(tok);
+    }
+    if let Some(message) = prefill_err {
+        let ep = production_fail_closed_rollback(m, gpu, None, None);
+        emit_fail_closed_error(stdout, Some(id), &message, "gpu", true, &ep);
+        return;
+    }
+    if prefill_aborted || check_abort(id) {
+        let ep = production_fail_closed_rollback(m, gpu, None, None);
+        emit_spec_cancel_after_rollback(stdout, id, 0, &ep);
+        return;
     }
     let prefill_ms = t0.elapsed().as_millis();
 
@@ -7976,54 +8055,101 @@ pub fn generate_qwen2(
     // final logits; each subsequent token requires another
     // forward_step.
     let mut generated_count: usize = 0;
-    let eos_set: &[u32] = &cfg.eos_token_ids;
+    let mut decode_err: Option<String> = None;
+    let mut decode_aborted = false;
     let decode_t0 = Instant::now();
-    let mut next_tok = match gpu.argmax_f32(&state.logits, cfg.vocab_size) {
-        Ok(t) => t,
-        Err(e) => {
-            emit_error_with_id(stdout, id, format!("argmax failed: {e:?}"));
-            let _ = stdout.flush();
-            return;
-        }
-    };
-
-    loop {
-        if generated_count >= max_tokens {
-            break;
-        }
-        if eos_set.contains(&next_tok) {
-            break;
-        }
-        // Emit text fragment for this token. Tokenizer.decode handles
-        // BPE byte-fragment reassembly; for special tokens that decode
-        // to an empty string we still advance the loop. Build through
-        // serde_json so `id` (user-supplied) and `frag` (arbitrary
-        // UTF-8 with possible `"` / `\` / control chars) can't corrupt
-        // the JSONL line.
-        let frag = tokenizer.decode(&[next_tok]);
-        let envelope = serde_json::json!({
-            "type": "token",
-            "id": id,
-            "text": frag,
-            "attempt_id": active_attempt_id(),
-        });
-        let _ = writeln!(stdout, "{}", envelope);
-        let _ = stdout.flush();
-        m.conversation_tokens.push(next_tok);
-        generated_count += 1;
-
-        match qwen2::forward_step_greedy(gpu, weights, cfg, state, next_tok) {
+    let mut next_tok: u32 = 0;
+    let mut decode_eos: Vec<u32> = Vec::new();
+    let mut decode_vocab: usize = 0;
+    {
+        let state_ref = match m.state.as_mut().and_then(|s| {
+            (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen2::Qwen2Bundle>()
+        }) {
+            Some(b) => b,
+            _ => unreachable!("qwen2 state disappeared before decode"),
+        };
+        let cfg = &state_ref.config;
+        let weights = &state_ref.weights;
+        decode_eos = cfg.eos_token_ids.clone();
+        decode_vocab = cfg.vocab_size;
+        let state = &mut state_ref.state;
+        match gpu.argmax_f32(&state.logits, cfg.vocab_size) {
             Ok(t) => next_tok = t,
             Err(e) => {
-                emit_error_with_id(stdout, id, format!("forward_step_greedy failed: {e:?}"));
-                let _ = stdout.flush();
-                return;
+                decode_err = Some(format!("argmax failed: {e:?}"));
             }
         }
-    }
+        if decode_err.is_none() {
+            let tokenizer = m.tokenizer.as_ref().unwrap();
+            loop {
+                if check_abort(id) {
+                    decode_aborted = true;
+                    break;
+                }
+                if generated_count >= max_tokens {
+                    break;
+                }
+                if decode_eos.contains(&next_tok) {
+                    break;
+                }
+                // Emit text fragment for this token. Tokenizer.decode handles
+                // BPE byte-fragment reassembly; for special tokens that decode
+                // to an empty string we still advance the loop. Build through
+                // serde_json so `id` (user-supplied) and `frag` (arbitrary
+                // UTF-8 with possible `"` / `\` / control chars) can't corrupt
+                // the JSONL line.
+                let frag = tokenizer.decode(&[next_tok]);
+                let envelope = serde_json::json!({
+                    "type": "token",
+                    "id": id,
+                    "text": frag,
+                    "attempt_id": active_attempt_id(),
+                });
+                let _ = writeln!(stdout, "{}", envelope);
+                let _ = stdout.flush();
+                m.conversation_tokens.push(next_tok);
+                generated_count += 1;
 
+                if check_abort(id) {
+                    decode_aborted = true;
+                    break;
+                }
+
+                match qwen2::forward_step_greedy(gpu, weights, cfg, state, next_tok) {
+                    Ok(t) => next_tok = t,
+                    Err(e) => {
+                        decode_err = Some(format!("forward_step_greedy failed: {e:?}"));
+                        break;
+                    }
+                }
+            }
+            // Capture final next_pos while still borrowed
+            let _final_pos = state.next_pos;
+            // work around borrow checker: need to move final_pos out
+            // We'll set m.seq_pos after block via re-borrow
+        }
+    }
+    // Handle decode errors/aborts after releasing live borrow
+    if let Some(message) = decode_err {
+        let ep = production_fail_closed_rollback(m, gpu, None, None);
+        emit_fail_closed_error(stdout, Some(id), &message, "gpu", true, &ep);
+        return;
+    }
+    if decode_aborted || check_abort(id) {
+        let ep = production_fail_closed_rollback(m, gpu, None, None);
+        emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
+        return;
+    }
     // Daemon bookkeeping: seq_pos matches Qwen2State's internal cursor.
-    m.seq_pos = state.next_pos;
+    {
+        let state_ref = match m.state.as_ref().and_then(|s| {
+            (s.as_ref() as &dyn Any).downcast_ref::<hipfire_arch_qwen2::Qwen2Bundle>()
+        }) {
+            Some(b) => b,
+            _ => unreachable!("qwen2 state disappeared after decode"),
+        };
+        m.seq_pos = state_ref.state.next_pos;
+    }
 
     let decode_ms = decode_t0.elapsed().as_millis().max(1);
     let total_ms = t0.elapsed().as_millis().max(1);
@@ -8041,11 +8167,19 @@ pub fn generate_qwen2(
         "total_ms": total_ms,
         "attempt_id": active_attempt_id(),
     });
+    if check_abort(id) {
+        let ep = production_fail_closed_rollback(m, gpu, None, None);
+        emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
+        return;
+    }
     match await_client_terminal_commit(stdout, id, &pending_done) {
         ClientTerminalDecision::Commit => {
             crate::ar::emit_active_route_done(stdout, id, &pending_done)
         }
-        ClientTerminalDecision::Abort => {}
+        ClientTerminalDecision::Abort => {
+            let ep = production_fail_closed_rollback(m, gpu, None, None);
+            emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
+        }
     }
 }
 

@@ -303,3 +303,100 @@ fn active_done_error_race_has_one_wire_terminal() {
     assert_eq!(lines, 1, "done/error race must claim one terminal writer");
     reset();
 }
+
+#[test]
+fn stale_attempt_cannot_claim_terminal() {
+    let _lock = begin_test();
+    activate_terminal_control("req-a", 10);
+    // Stale attempt_id (same id, different attempt) must not claim.
+    assert!(
+        !claim_terminal("req-a", 11),
+        "stale attempt must not claim terminal while active"
+    );
+    // Stale writer via active-attempt error path must produce no wire output.
+    set_active_attempt_id(11);
+    let mut buf = Vec::new();
+    emit_active_attempt_error(
+        &mut buf,
+        Some("req-a"),
+        "stale attempt failure",
+        "internal",
+        false,
+        false,
+    );
+    assert!(
+        buf.is_empty(),
+        "stale attempt error writer must not claim terminal"
+    );
+    // Stale staged done (envelope carries attempt_id 11) must not emit.
+    let pending = serde_json::json!({
+        "type": "done",
+        "id": "req-a",
+        "attempt_id": 11,
+        "finish_reason": "stop",
+    });
+    let mut buf2 = Vec::new();
+    emit_staged_terminal_done(&mut buf2, &pending);
+    assert!(buf2.is_empty(), "stale staged done must not emit terminal");
+    // Exact active key must still be able to claim after rejected stale attempts.
+    set_active_attempt_id(10);
+    assert!(
+        claim_terminal("req-a", 10),
+        "exact active key must still claim after stale was rejected"
+    );
+    // Second claim by exact key must now fail (exactly-once).
+    assert!(
+        !claim_terminal("req-a", 10),
+        "second exact claim must be no-op"
+    );
+    reset();
+}
+
+#[test]
+fn wrong_request_id_cannot_claim_terminal() {
+    let _lock = begin_test();
+    activate_terminal_control("req-a", 10);
+    set_active_attempt_id(10);
+    // Wrong request id (different id, same attempt) must not claim.
+    assert!(
+        !claim_terminal("req-b", 10),
+        "wrong request id must not claim terminal while active is req-a"
+    );
+    // Wrong-id writer must produce no wire output.
+    let mut buf = Vec::new();
+    emit_active_attempt_error(
+        &mut buf,
+        Some("req-b"),
+        "wrong id failure",
+        "internal",
+        false,
+        false,
+    );
+    assert!(
+        buf.is_empty(),
+        "wrong request error writer must not claim terminal"
+    );
+    // Wrong-id staged done must not emit.
+    let pending = serde_json::json!({
+        "type": "done",
+        "id": "req-b",
+        "attempt_id": 10,
+        "finish_reason": "stop",
+    });
+    let mut buf2 = Vec::new();
+    emit_staged_terminal_done(&mut buf2, &pending);
+    assert!(
+        buf2.is_empty(),
+        "wrong request staged done must not emit terminal"
+    );
+    // Exact active key must still claim.
+    assert!(
+        claim_terminal("req-a", 10),
+        "exact active key must still claim after wrong-id was rejected"
+    );
+    assert!(
+        !claim_terminal("req-a", 10),
+        "second exact claim must be no-op"
+    );
+    reset();
+}

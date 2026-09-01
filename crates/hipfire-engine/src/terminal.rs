@@ -93,9 +93,13 @@ pub fn clear_terminal_control() {
 
 /// Claim the sole terminal slot for a matching active attempt.
 ///
-/// Unknown/inactive attempts return `true` so pre-activation validation errors
-/// retain their existing wire behavior. Once an active attempt claims a
-/// terminal, a racing error/abort/done writer becomes a no-op.
+/// When no active transaction exists, returns `true` so pre-activation
+/// validation errors retain their existing wire behavior (the explicit
+/// uncorrelated writer `emit_uncorrelated_error` bypasses this entirely
+/// with `attempt_id: 0`). When an active transaction exists, only the
+/// exact `(id, attempt_id)` may claim; stale/mismatched keys return
+/// `false` and do not consume the slot. Once the active exact key claims,
+/// any further claim (even exact) returns `false`.
 pub fn claim_terminal(id: &str, attempt_id: u64) -> bool {
     let cell = terminal_control();
     let mut g = cell.mu.lock().unwrap();
@@ -103,7 +107,7 @@ pub fn claim_terminal(id: &str, attempt_id: u64) -> bool {
         return true;
     };
     if active.id != id || active.attempt_id != attempt_id {
-        return true;
+        return false;
     }
     if active.terminal_claimed {
         return false;
