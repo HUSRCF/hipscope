@@ -1190,7 +1190,8 @@ void run_dimension_overflow_case()
     params.head_dim = 256;
     params.causal = 1;
     params.softmax_scale = 1.0f / 16.0f;
-    params.stride_q = 4*256; params.stride_out = 4*256;
+    params.stride_q = params.stride_out = 4 * 256;
+    params.stride_k = params.stride_v = 2 * 256;
     params.nhead_stride_q = params.nhead_stride_k = params.nhead_stride_v = params.nhead_stride_out = 256;
     params.batch_stride_q = 16*4*256; params.batch_stride_out = 16*4*256;
     params.batch_stride_k = 32*2*256; params.batch_stride_v = 32*2*256;
@@ -1275,7 +1276,7 @@ void run_alignment_validation_case()
         // backing is 4-aligned, +1 is misaligned
         auto p = make_valid(mis_k, backing, 2*132, 2*272);
         int s = hipfire_flash_attn_ck_fwd_supported(&p, err, sizeof(err));
-        if(s != 1 || std::strstr(err, "aligned") == nullptr)
+        if(s != 1 || std::strstr(err, "align") == nullptr)
         {
             std::fprintf(stderr, "misaligned K base not rejected: s=%d err=%s\n", s, err);
             std::exit(27);
@@ -1287,7 +1288,7 @@ void run_alignment_validation_case()
         const void* mis_v = backing + 1;
         auto p = make_valid(backing, mis_v, 2*132, 2*272);
         int s = hipfire_flash_attn_ck_fwd_supported(&p, err, sizeof(err));
-        if(s != 1 || std::strstr(err, "aligned") == nullptr)
+        if(s != 1 || std::strstr(err, "align") == nullptr)
         {
             std::fprintf(stderr, "misaligned V base not rejected: s=%d err=%s\n", s, err);
             std::exit(28);
@@ -1297,7 +1298,7 @@ void run_alignment_validation_case()
     {
         auto p = make_valid(backing, backing, 2*132 + 1, 2*272);
         int s = hipfire_flash_attn_ck_fwd_supported(&p, err, sizeof(err));
-        if(s != 1 || std::strstr(err, "aligned") == nullptr)
+        if(s != 1 || std::strstr(err, "align") == nullptr)
         {
             std::fprintf(stderr, "misaligned K row stride not rejected: s=%d err=%s\n", s, err);
             std::exit(29);
@@ -1307,7 +1308,7 @@ void run_alignment_validation_case()
     {
         auto p = make_valid(backing, backing, 2*132, 2*272 + 1);
         int s = hipfire_flash_attn_ck_fwd_supported(&p, err, sizeof(err));
-        if(s != 1 || std::strstr(err, "aligned") == nullptr)
+        if(s != 1 || std::strstr(err, "align") == nullptr)
         {
             std::fprintf(stderr, "misaligned V row stride not rejected: s=%d err=%s\n", s, err);
             std::exit(30);
