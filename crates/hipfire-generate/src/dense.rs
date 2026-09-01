@@ -7672,46 +7672,31 @@ pub fn generate_qwen2(
     _repeat_penalty: f32,
     _repeat_window: usize,
 ) {
-    let tokenizer = match m.tokenizer.as_ref() {
-        Some(t) => t,
-        None => {
-            emit_active_attempt_error(
-                stdout,
-                Some(id),
-                "tokenizer not loaded",
-                "validation",
-                false,
-                false,
-            );
-            let _ = stdout.flush();
-            return;
-        }
-    };
-    let state_ref = match m.state.as_mut().and_then(|s| {
-        (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen2::Qwen2Bundle>()
-    }) {
-        Some(b) => b,
-        _ => {
-            emit_active_attempt_error(
-                stdout,
-                Some(id),
-                "qwen2 state missing on arch_id=7 generate",
-                "validation",
-                false,
-                false,
-            );
-            let _ = stdout.flush();
-            return;
-        }
-    };
-    let cfg = &state_ref.config;
-    let weights = &state_ref.weights;
-    let state = &mut state_ref.state;
+    emit_gen_start(
+        stdout,
+        id,
+        false,
+        gen_start_contract_version_for_arch(m.arch_id),
+    );
+    if m.tokenizer.is_none() {
+        emit_active_attempt_error(
+            stdout,
+            Some(id),
+            "tokenizer not loaded",
+            "validation",
+            false,
+            false,
+        );
+        let _ = stdout.flush();
+        return;
+    }
 
     // Apply the model's chat template (if present) so instruct-tuned qwen2
     // models receive properly-framed ChatML input. Falls back to raw encoding
     // when no template is loaded (e.g. base/pre-train weights).
-    let prompt_ids = if let Some(template) = m.chat_template.as_ref() {
+    let prompt_ids = {
+        let tokenizer = m.tokenizer.as_ref().unwrap();
+        if let Some(template) = m.chat_template.as_ref() {
         let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
             tokenizer,
             template,
@@ -7729,8 +7714,9 @@ pub fn generate_qwen2(
                 tokenizer.encode(prompt)
             }
         }
-    } else {
-        tokenizer.encode(prompt)
+        } else {
+            tokenizer.encode(prompt)
+        }
     };
     if prompt_ids.is_empty() {
         emit_active_attempt_error(
@@ -7747,19 +7733,35 @@ pub fn generate_qwen2(
 
     // Capacity guard. No eviction on arch_id=7 yet — reset state when
     // the requested run would overflow the KV budget.
-    if state
-        .next_pos
+    let (next_pos, state_max_seq) = match m.state.as_ref().and_then(|s| {
+        (s.as_ref() as &dyn Any).downcast_ref::<hipfire_arch_qwen2::Qwen2Bundle>()
+    }) {
+        Some(b) => (b.state.next_pos, b.state.max_seq),
+        None => unreachable!("qwen2 state disappeared during capacity validation"),
+    };
+    if next_pos
         .saturating_add(prompt_ids.len())
         .saturating_add(max_tokens)
-        > state.max_seq
+        > state_max_seq
     {
         eprintln!(
-            "[daemon] arch_id=7 context full ({}/{}) — resetting Qwen2State.next_pos",
-            state.next_pos, state.max_seq,
+            "[daemon] arch_id=7 context full ({next_pos}/{state_max_seq}) — resetting Qwen2 state",
         );
-        state.reset();
-        m.seq_pos = 0;
-        m.conversation_tokens.clear();
+        let reset = m.reset_context(gpu);
+        if let Err(error) = reset {
+            emit_fail_closed_error(
+                stdout,
+                Some(id),
+                "qwen2 context reset failed",
+                "gpu",
+                true,
+                &RollbackEpilogue {
+                    rolled_back: false,
+                    context: Some(error),
+                },
+            );
+            return;
+        }
 
         // O2b-2 capacity guard (qwen2 single): the reset above (next_pos=0)
         // recovers a grown multi-turn conversation, but a SINGLE prompt larger
@@ -7768,20 +7770,30 @@ pub fn generate_qwen2(
         // the reset, if prompt + generation still overflows, emit a clean error.
         // saturating_add: an adversarially huge max_tokens must not wrap usize
         // and slip under the cap.
-        if prompt_ids.len().saturating_add(max_tokens) > state.max_seq {
-            let cap = state.max_seq;
+        if prompt_ids.len().saturating_add(max_tokens) > state_max_seq {
             emit_active_attempt_error(
                 stdout,
                 Some(id),
-                &format!("prompt exceeds context capacity: prompt={} + max_tokens={} > capacity={} — reload model with a larger max_seq", prompt_ids.len(), max_tokens, cap),
+                &format!("prompt exceeds context capacity: prompt={} + max_tokens={} > capacity={} — reload model with a larger max_seq", prompt_ids.len(), max_tokens, state_max_seq),
                 "context_length",
                 false,
-                false
+                true,
             );
             let _ = stdout.flush();
             return;
         }
     }
+
+    let state_ref = match m.state.as_mut().and_then(|s| {
+        (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen2::Qwen2Bundle>()
+    }) {
+        Some(b) => b,
+        _ => unreachable!("qwen2 state disappeared after capacity validation"),
+    };
+    let cfg = &state_ref.config;
+    let weights = &state_ref.weights;
+    let state = &mut state_ref.state;
+    let tokenizer = m.tokenizer.as_ref().unwrap();
 
     let t0 = Instant::now();
 
