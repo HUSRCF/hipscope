@@ -302,7 +302,11 @@ impl LoadAdmission {
         &self.mesh
     }
     pub(crate) fn new(source: SourceKind, variant: ModelVariant, mesh: DeviceMesh) -> Self {
-        Self { source, variant, mesh }
+        Self {
+            source,
+            variant,
+            mesh,
+        }
     }
 }
 /// A source that has completed classification and parallel admission.
@@ -354,9 +358,7 @@ impl AdmittedLoad {
     /// Canonical source/path derived from the admitted token — never a
     /// caller-supplied raw string that could contradict the token.
     pub fn canonical_path_str(&self) -> &str {
-        self.canonical_path
-            .to_str()
-            .unwrap_or("")
+        self.canonical_path.to_str().unwrap_or("")
     }
 
     /// Loader-owned consuming API. Only the loader crate can consume the token
@@ -454,7 +456,8 @@ pub fn admit_load_with_source(
 ) -> Result<AdmittedLoad, LoadAdmissionError> {
     let source = open_source(path)?;
     let (carrier, admission) = admit_source_with_carrier(&source, raw)?;
-    let canonical_path = std::fs::canonicalize(path).unwrap_or_else(|_| std::path::PathBuf::from(path));
+    let canonical_path =
+        std::fs::canonicalize(path).unwrap_or_else(|_| std::path::PathBuf::from(path));
     let source_len = match &source {
         ModelSource::Hfq(hfq) => hfq.file_len(),
         ModelSource::Dir(s) => {
@@ -3307,13 +3310,7 @@ pub fn load_model_ep_with_kv_mode(
     state_quant: Option<&str>,
 ) -> Result<LoadedModel, String> {
     route_admitted_load(path, RawParallelism::new(1, tp, 1), |admitted| {
-        load_model_ep_with_kv_mode_admitted(
-            admitted,
-            max_seq,
-            kv_mode,
-            kv_backend,
-            state_quant,
-        )
+        load_model_ep_with_kv_mode_admitted(admitted, max_seq, kv_mode, kv_backend, state_quant)
     })
 }
 
@@ -5528,16 +5525,22 @@ mod registry_tests {
         // admission on the same path fails.
         let path = fixture_path("opaque-retained-hfq");
         write_metadata_fixture(&path, 5, r#"{"config":{"num_experts":0}}"#);
-        let admitted = crate::admit_load_with_source(path.to_str().unwrap(), RawParallelism::new(1, 1, 1))
-            .expect("admission must succeed");
+        let admitted =
+            crate::admit_load_with_source(path.to_str().unwrap(), RawParallelism::new(1, 1, 1))
+                .expect("admission must succeed");
         // Read-only getters — the only external API.
         assert_eq!(admitted.source_kind(), SourceKind::Hfq);
         assert_eq!(admitted.variant(), ModelVariant::Qwen35Dense);
         assert_eq!(admitted.mesh().n_devices(), 1);
         assert_eq!(admitted.carrier().name(), "qwen35");
-        assert!(admitted.canonical_path().ends_with(path.file_name().unwrap()));
+        assert!(admitted
+            .canonical_path()
+            .ends_with(path.file_name().unwrap()));
         let retained_len = admitted.source_len();
-        assert!(retained_len > 0, "retained size must be from opened file, not 0");
+        assert!(
+            retained_len > 0,
+            "retained size must be from opened file, not 0"
+        );
         // Verify auxiliary identity for HFQ is trivially Ok (no path-backed dir).
         assert!(admitted.verify_auxiliary_identity().is_ok());
         // Capture a tensor read via retained source before delete.
@@ -5548,7 +5551,8 @@ mod registry_tests {
         assert!(!path.exists(), "fixture must be deleted");
         // Second admission on same path must fail (file gone) — proves we
         // cannot re-derive admission from path after delete.
-        let second = crate::admit_load_with_source(path.to_str().unwrap(), RawParallelism::new(1, 1, 1));
+        let second =
+            crate::admit_load_with_source(path.to_str().unwrap(), RawParallelism::new(1, 1, 1));
         assert!(second.is_err(), "second admission must fail after delete");
         // Retained token still describes the original inode and can still be
         // used for execution (size/canonical from token, not path stat).
@@ -5590,7 +5594,8 @@ mod registry_tests {
         let config = r#"{"architectures":["Qwen2ForCausalLM"],"model_type":"qwen2","hidden_size":128,"num_hidden_layers":1,"num_attention_heads":2,"intermediate_size":256}"#;
         std::fs::write(dir.join("config.json"), config).unwrap();
         // Minimal safetensors file with one F32 tensor.
-        let mut header: std::collections::HashMap<String, serde_json::Value> = std::collections::HashMap::new();
+        let mut header: std::collections::HashMap<String, serde_json::Value> =
+            std::collections::HashMap::new();
         header.insert(
             "weight".to_string(),
             serde_json::json!({"dtype":"F32","shape":[1],"data_offsets":[0,4]}),
@@ -5603,11 +5608,15 @@ mod registry_tests {
         file.write_all(&[0u8; 4]).unwrap();
         file.flush().unwrap();
         // Admission should succeed for this Dir.
-        let admitted = crate::admit_load_with_source(dir.to_str().unwrap(), RawParallelism::new(1, 1, 1))
-            .expect("dir admission must succeed");
+        let admitted =
+            crate::admit_load_with_source(dir.to_str().unwrap(), RawParallelism::new(1, 1, 1))
+                .expect("dir admission must succeed");
         // Capture identity before replace.
         let before_canonical = admitted.canonical_path().to_path_buf();
-        assert!(admitted.verify_auxiliary_identity().is_ok(), "initial verify must pass");
+        assert!(
+            admitted.verify_auxiliary_identity().is_ok(),
+            "initial verify must pass"
+        );
         // Replace the directory: rename original away, create new empty dir at same path.
         let renamed = dir.with_extension("old");
         let _ = std::fs::remove_dir_all(&renamed);
@@ -5616,7 +5625,9 @@ mod registry_tests {
         // Write a different config so the new dir is not the same inode/content.
         std::fs::write(dir.join("config.json"), r#"{"model_type":"llama"}"#).unwrap();
         // Now verify must fail — canonical or inode mismatch — before teardown.
-        let err = admitted.verify_auxiliary_identity().expect_err("verify must fail after dir replace");
+        let err = admitted
+            .verify_auxiliary_identity()
+            .expect_err("verify must fail after dir replace");
         assert!(
             err.contains("mismatch") || err.contains("canonicalize") || err.contains("inode"),
             "unexpected verify error: {err}"
@@ -5624,8 +5635,15 @@ mod registry_tests {
         // Prior owner would be intact because verify failed before commit.
         // We simulate by checking that the original `renamed` dir still exists
         // and the admitted source still describes the original (not the new).
-        assert!(renamed.exists(), "original dir must still exist (not torn down)");
-        assert_eq!(admitted.source().arch_id(), Some(7), "retained source still describes original");
+        assert!(
+            renamed.exists(),
+            "original dir must still exist (not torn down)"
+        );
+        assert_eq!(
+            admitted.source().arch_id(),
+            Some(7),
+            "retained source still describes original"
+        );
         assert_eq!(before_canonical, admitted.canonical_path());
         // Cleanup
         let _ = std::fs::remove_dir_all(&dir);

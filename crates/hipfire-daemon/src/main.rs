@@ -2062,7 +2062,11 @@ fn main() {
                             };
                             if let Err(e) = slot_commit {
                                 let _ = hipfire_loader::unload_model(m, &mut gpu);
-                                write_error(&mut stdout, "", &format!("load failed during slot teardown: {e:?}"));
+                                write_error(
+                                    &mut stdout,
+                                    "",
+                                    &format!("load failed during slot teardown: {e:?}"),
+                                );
                                 continue;
                             }
                             if let Some(mut pf) = pflash_state.take() {
@@ -2119,7 +2123,11 @@ fn main() {
                             };
                             if let Err(e) = commit_result {
                                 let _ = hipfire_loader::unload_model(m, &mut gpu);
-                                write_error(&mut stdout, "", &format!("load failed during commit: {e:?}"));
+                                write_error(
+                                    &mut stdout,
+                                    "",
+                                    &format!("load failed during commit: {e:?}"),
+                                );
                                 continue;
                             }
                         }

@@ -69,7 +69,13 @@ impl SlotBackend {
         prefill_chunk: usize,
     ) -> Result<Self, String> {
         let source = ModelSource::from_path(model_path)?;
-        Self::load_source(std::path::Path::new(model_path), source, n_slots, cap_tokens, prefill_chunk)
+        Self::load_source(
+            std::path::Path::new(model_path),
+            source,
+            n_slots,
+            cap_tokens,
+            prefill_chunk,
+        )
     }
 
     /// Consume a source admitted by the loader before daemon teardown.

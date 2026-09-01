@@ -243,6 +243,12 @@ impl AdmissionError {
             Self::InvalidDegree { .. } => "every parallelism degree must be >= 1",
             Self::Topology { error, .. } => match error {
                 MeshError::CardinalityOverflow => "device mesh cardinality overflow",
+                MeshError::DuplicateAxis(_) => "device mesh axis repeated",
+                MeshError::InvalidDevice { .. } => "device is not present in the mesh",
+                MeshError::RankMismatch { .. } => "device mesh coordinate rank mismatch",
+                MeshError::CoordinateOutOfBounds { .. } => {
+                    "device mesh coordinate is out of bounds"
+                }
             },
             Self::Composition { reason, .. } | Self::Unsupported { reason, .. } => reason,
         }

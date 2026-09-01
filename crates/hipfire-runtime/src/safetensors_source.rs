@@ -159,8 +159,9 @@ impl SafetensorsSource {
         expected_dev: u64,
         expected_ino: u64,
     ) -> Result<(), String> {
-        let current_canonical = std::fs::canonicalize(&self.dir)
-            .map_err(|e| format!("safetensors dir canonicalize failed (possible delete/replace): {e}"))?;
+        let current_canonical = std::fs::canonicalize(&self.dir).map_err(|e| {
+            format!("safetensors dir canonicalize failed (possible delete/replace): {e}")
+        })?;
         if current_canonical != expected_canonical {
             return Err(format!(
                 "safetensors dir identity mismatch: expected canonical {:?}, got {:?} — directory was replaced",
