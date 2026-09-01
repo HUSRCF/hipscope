@@ -972,6 +972,28 @@ pub fn set_generation_route(route: GenerationRoute) {
     ACTIVE_GENERATION_ROUTE.with(|active| active.set(Some(route)));
 }
 
+struct GenerationRouteScope {
+    id: String,
+    attempt: u64,
+}
+
+impl GenerationRouteScope {
+    fn enter(route: GenerationRoute, id: &str) -> Self {
+        set_generation_route(route);
+        Self {
+            id: id.to_owned(),
+            attempt: active_attempt_id(),
+        }
+    }
+}
+
+impl Drop for GenerationRouteScope {
+    fn drop(&mut self) {
+        release_route_start(&self.id, self.attempt);
+        ACTIVE_GENERATION_ROUTE.with(|active| active.set(None));
+    }
+}
+
 pub fn active_generation_route() -> Option<GenerationRoute> {
     ACTIVE_GENERATION_ROUTE.with(std::cell::Cell::get)
 }
@@ -1766,7 +1788,7 @@ pub fn generate(
         let _ = stdout.flush();
         return;
     }
-    set_generation_route(selected_route);
+    let _route_scope = GenerationRouteScope::enter(selected_route, id);
 
     match hipfire_loader::generation_early_route(m.arch_id) {
         Some(hipfire_loader::GenerationEarlyRoute::Gemma4) => {
@@ -2231,6 +2253,7 @@ pub fn generate(
                 think_mode,
             );
             let _ = (repeat_penalty, repeat_window);
+            emit_generation_start(selected_route, stdout, id, false);
             crate::dense::generate_cohere2moe(
                 m,
                 gpu,
@@ -2257,6 +2280,7 @@ pub fn generate(
                 think_mode,
             );
             let _ = (repeat_penalty, repeat_window);
+            emit_generation_start(selected_route, stdout, id, false);
             crate::dense::generate_cohere2moe(
                 m,
                 gpu,
@@ -2309,6 +2333,7 @@ pub fn generate(
                 think_mode,
             );
             let _ = (repeat_penalty, repeat_window);
+            emit_generation_start(selected_route, stdout, id, false);
             crate::dense::generate_minimax(
                 m,
                 gpu,
@@ -2335,6 +2360,7 @@ pub fn generate(
                 think_mode,
             );
             let _ = (repeat_penalty, repeat_window);
+            emit_generation_start(selected_route, stdout, id, false);
             crate::dense::generate_minimax(
                 m,
                 gpu,
