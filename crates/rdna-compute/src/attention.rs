@@ -6415,7 +6415,13 @@ impl Gpu {
         tile_size: usize,
         max_tiles: usize,
     ) -> HipResult<()> {
-        let (module, src, kernel) = if self.arch_caps.is_gfx1151() {
+        let (module, src, kernel) = if self.arch_caps.is_gfx1201() {
+            (
+                "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1201",
+                kernels::ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_GFX1201_SRC,
+                "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1201",
+            )
+        } else if self.arch_caps.is_gfx1151() {
             (
                 "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1151",
                 kernels::ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_GFX1151_SRC,
@@ -8349,7 +8355,10 @@ impl Gpu {
             n_heads > 0 && n_kv_heads > 0,
             "attention_dflash_sliding_f32: n_heads/n_kv_heads must be > 0"
         );
-        assert!(head_dim > 0, "attention_dflash_sliding_f32: head_dim must be > 0");
+        assert!(
+            head_dim > 0,
+            "attention_dflash_sliding_f32: head_dim must be > 0"
+        );
         assert!(
             sliding_window > 0,
             "attention_dflash_sliding_f32: sliding_window must be > 0"
@@ -8474,7 +8483,17 @@ impl Gpu {
         sliding_window: usize,
     ) -> HipResult<()> {
         self.attention_dflash_sliding_f32(
-            q, k, v, out, b, l, n_heads, n_kv_heads, head_dim, ctx_span, sliding_window,
+            q,
+            k,
+            v,
+            out,
+            b,
+            l,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            ctx_span,
+            sliding_window,
         )
     }
 
