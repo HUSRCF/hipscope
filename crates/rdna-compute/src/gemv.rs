@@ -3027,6 +3027,151 @@ impl Gpu {
         result
     }
 
+    /// gfx11 production probe: fuse SwiGLU, FWHT rotation, and group128 Q8
+    /// packing into the MMQ activation scratch. The returned pointer is valid
+    /// until the next MMQ activation producer reuses that scratch buffer.
+    pub fn fused_silu_mul_rotate_mq_q8_group128_batched(
+        &mut self,
+        gate: &GpuTensor,
+        up: &GpuTensor,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<*mut c_void> {
+        self.bind_thread()?;
+        if !self.arch_caps.is_rdna3_dgpu() || k % 256 != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "fused group128 SwiGLU pack requires gfx11 dGPU and K%256=0",
+            ));
+        }
+        self.ensure_mq_signs()?;
+        const MODULE: &str = "fused_silu_mul_mq_rotate_q8_group128";
+        self.ensure_kernel(
+            MODULE,
+            kernels::FUSED_SILU_MUL_MQ_ROTATE_Q8_GROUP128_SRC,
+            MODULE,
+        )?;
+
+        let out_ptr = self
+            .scratch
+            .ensure_q8_1_mmq_x_scratch(&self.hip, batch_size, k)?;
+        let mut gate_ptr = gate.buf.as_ptr();
+        let mut up_ptr = up.buf.as_ptr();
+        let mut signs1_ptr = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let mut signs2_ptr = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let mut q8_ptr = out_ptr;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut gate_ptr as *mut _ as *mut c_void,
+            &mut up_ptr as *mut _ as *mut c_void,
+            &mut signs1_ptr as *mut _ as *mut c_void,
+            &mut signs2_ptr as *mut _ as *mut c_void,
+            &mut q8_ptr as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+        let bytes = batch_size * (2 * k * 4 + (k / 128) * 144);
+        let timer = crate::profile::begin_timer_shape(
+            &self.hip,
+            "fused",
+            MODULE,
+            [k, batch_size, 0],
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            MODULE,
+            [(k / 256) as u32, batch_size as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(gate_ptr);
+                b.push_ptr(up_ptr);
+                b.push_ptr(signs1_ptr);
+                b.push_ptr(signs2_ptr);
+                b.push_ptr(q8_ptr);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result.map(|_| out_ptr)
+    }
+
+    /// Standalone FFN dataflow probe using FP16 gate/up intermediates. This is
+    /// intentionally not selected by serving dispatch.
+    pub fn fused_silu_mul_rotate_mq_q8_group128_f16_batched(
+        &mut self,
+        gate: &GpuTensor,
+        up: &GpuTensor,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<*mut c_void> {
+        self.bind_thread()?;
+        if !self.arch_caps.is_rdna3_dgpu()
+            || gate.dtype != DType::F16
+            || up.dtype != DType::F16
+            || k % 256 != 0
+        {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "fused FP16 group128 SwiGLU pack requires gfx11 dGPU, FP16 inputs, and K%256=0",
+            ));
+        }
+        self.ensure_mq_signs()?;
+        const MODULE: &str = "fused_silu_mul_mq_rotate_q8_group128";
+        const KERNEL: &str = "fused_silu_mul_mq_rotate_q8_group128_f16";
+        self.ensure_kernel(
+            MODULE,
+            kernels::FUSED_SILU_MUL_MQ_ROTATE_Q8_GROUP128_SRC,
+            KERNEL,
+        )?;
+
+        let out_ptr = self
+            .scratch
+            .ensure_q8_1_mmq_x_scratch(&self.hip, batch_size, k)?;
+        let mut gate_ptr = gate.buf.as_ptr();
+        let mut up_ptr = up.buf.as_ptr();
+        let mut signs1_ptr = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let mut signs2_ptr = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let mut q8_ptr = out_ptr;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut gate_ptr as *mut _ as *mut c_void,
+            &mut up_ptr as *mut _ as *mut c_void,
+            &mut signs1_ptr as *mut _ as *mut c_void,
+            &mut signs2_ptr as *mut _ as *mut c_void,
+            &mut q8_ptr as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            KERNEL,
+            [(k / 256) as u32, batch_size as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(gate_ptr);
+                b.push_ptr(up_ptr);
+                b.push_ptr(signs1_ptr);
+                b.push_ptr(signs2_ptr);
+                b.push_ptr(q8_ptr);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b
+            },
+        )?;
+        Ok(out_ptr)
+    }
+
     /// Phase A Stage A — F2 AWQ-aware variant of `fused_silu_mul_rotate_mq`.
     ///
     /// After computing silu(gate)*up, divides element-wise by `awq_scale[i]`
@@ -3357,6 +3502,121 @@ impl Gpu {
         let result = self.launch_maybe_blob(
             kernel,
             [(n_heads / 2) as u32, 1, 1],
+            [64, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(xp);
+                b.push_ptr(zp);
+                b.push_ptr(wp);
+                b.push_ptr(s1);
+                b.push_ptr(s2);
+                b.push_ptr(xrp);
+                b.push_i32(nh);
+                b.push_i32(hd);
+                b.push_f32(ep);
+                b
+            },
+        );
+        if let Some(timer) = timer {
+            timer.finish(&self.hip);
+        }
+        self.invalidate_x_caches_for(xrp);
+        result
+    }
+
+    /// Batched sibling of `gated_norm_rotate_mq_gfx1100`. Grid.y selects the
+    /// token row while each workgroup retains the decode kernel's exact
+    /// two-head normalization and 256-value MQ rotation order.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gated_norm_rotate_mq_batched_gfx1100(
+        &mut self,
+        x: &GpuTensor,
+        z: &GpuTensor,
+        weight: &GpuTensor,
+        x_rot: &GpuTensor,
+        n_heads: usize,
+        head_dim: usize,
+        eps: f32,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let row = n_heads.checked_mul(head_dim).ok_or_else(|| {
+            hip_bridge::HipError::new(1, "gated_norm_rotate_mq_batched_gfx1100: row overflow")
+        })?;
+        let total = row.checked_mul(batch_size).ok_or_else(|| {
+            hip_bridge::HipError::new(1, "gated_norm_rotate_mq_batched_gfx1100: size overflow")
+        })?;
+        if n_heads % 2 != 0 || head_dim != 128 {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "gated_norm_rotate_mq_batched_gfx1100: expected an even head count with head_dim=128",
+            ));
+        }
+        if x.numel() < total
+            || z.numel() < total
+            || weight.numel() < head_dim
+            || x_rot.numel() < total
+        {
+            return Err(hip_bridge::HipError::new(
+                1,
+                &format!(
+                    "gated_norm_rotate_mq_batched_gfx1100: undersized tensor (x={}, z={}, weight={}, x_rot={}, required x/z/x_rot={}, weight={})",
+                    x.numel(),
+                    z.numel(),
+                    weight.numel(),
+                    x_rot.numel(),
+                    total,
+                    head_dim,
+                ),
+            ));
+        }
+        if batch_size == 0 {
+            return Ok(());
+        }
+        self.ensure_mq_signs()?;
+        let (module, src, kernel) = if self.arch_caps.is_gfx1151() {
+            (
+                "gated_norm_mq_rotate_gfx1151",
+                kernels::GATED_NORM_MQ_ROTATE_GFX1151_SRC,
+                "gated_norm_mq_rotate_gfx1151",
+            )
+        } else {
+            (
+                "gated_norm_mq_rotate_gfx1100",
+                kernels::GATED_NORM_MQ_ROTATE_GFX1100_SRC,
+                "gated_norm_mq_rotate_gfx1100",
+            )
+        };
+        self.ensure_kernel(module, src, kernel)?;
+
+        let xp = x.buf.as_ptr();
+        let zp = z.buf.as_ptr();
+        let wp = weight.buf.as_ptr();
+        let s1 = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2 = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let xrp = x_rot.buf.as_ptr();
+        let nh = n_heads as i32;
+        let hd = head_dim as i32;
+        let ep = eps;
+        let mut params: Vec<*mut c_void> = vec![
+            &xp as *const _ as *mut c_void,
+            &zp as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &s1 as *const _ as *mut c_void,
+            &s2 as *const _ as *mut c_void,
+            &xrp as *const _ as *mut c_void,
+            &nh as *const _ as *mut c_void,
+            &hd as *const _ as *mut c_void,
+            &ep as *const _ as *mut c_void,
+        ];
+        let bytes =
+            crate::profile::gated_norm_bytes(total) + crate::profile::mq_rotate_bytes(total);
+        let timer = crate::profile::begin_timer(&self.hip, "fused", kernel, bytes);
+        let result = self.launch_maybe_blob(
+            kernel,
+            [(n_heads / 2) as u32, batch_size as u32, 1],
             [64, 1, 1],
             0,
             &mut params,

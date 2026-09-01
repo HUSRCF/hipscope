@@ -40,6 +40,78 @@ pub struct FeatureFlags {
     pub hfq3_dp4a: Option<bool>,
     pub hfq3_mmq: Option<bool>,
     pub hfq4_mmq_rdna2: Option<bool>,
+    /// Wider gfx11 gate/up prefill tile. Kept opt-in until full-model A/B
+    /// confirms the standalone M17408/K5120/N2048 result.
+    pub rdna3_hfq4_gate_up_x256y64: bool,
+    /// Large-M W4A16 gate/up probe using a 128-token x 64-output gfx11 tile.
+    /// Strictly opt-in until full-model prefill A/B validates conversion cost.
+    pub rdna3_hfq4_gate_up_a16_k32: bool,
+    /// Extend the audited W4A16 K32 topology to aligned QKV/QKVZA set
+    /// projections. Kept separate from the gate/up-only production probe.
+    pub rdna3_hfq4_set_a16_k32: bool,
+    /// Large-M W4A16 K32 residual-add probe for the two Qwen3.6 projection
+    /// shapes validated by the standalone benchmark.
+    pub rdna3_hfq4_residual_a16_k32: bool,
+    /// Wider gfx11 FFN-down residual tile. Separate from gate/up so its
+    /// smaller model-level contribution can be validated independently.
+    pub rdna3_hfq4_residual_x256y64: bool,
+    /// Wider gfx11 tile for the remaining PP2048 shapes certified by the
+    /// full-shape probe. Kept separate from gate/up and FFN-down A/B gates.
+    pub rdna3_hfq4_aux_x256y64: bool,
+    /// Use gfx11 `v_perm_b32` nibble widening inside certified X256/Y64
+    /// shapes. Independent so production A/B can isolate decode changes.
+    pub rdna3_hfq4_perm_nibble: bool,
+    /// Let one lane load each repeated HFQ4 scale/zero pair for the gfx11
+    /// X256/Y64 permutation path. Opt-in pending full-model prefill A/B.
+    pub rdna3_hfq4_meta_single_loader: bool,
+    /// Quantize each 128-value activation group with one shared scale while
+    /// retaining four independent sums. Only the matching gfx11 X256/Y64
+    /// kernels exploit the reduced scale work; default dispatch is unchanged.
+    pub rdna3_q8_group128: bool,
+    /// Split each 64-row group128 MMQ tile across two row fragments and four
+    /// column groups, reducing duplicate activation-fragment loads on gfx11.
+    pub rdna3_q8_group128_row2: bool,
+    /// Stage two packed-weight rows per wave for the gfx1100 X256/Y64 row2
+    /// kernel. Opt-in while full-model A/B validates the higher VGPR footprint.
+    pub rdna3_q8_group128_dual_row_weight: bool,
+    /// Stage four packed-weight rows per wave for the gfx1100 X256/Y64 row2
+    /// kernel. Separate opt-in for production A/B against the retained path.
+    pub rdna3_q8_group128_quad_row_weight: bool,
+    /// Use the 128-token x 64-output K128 cooperative WMMA kernel for the
+    /// certified group128 prefill shapes. Opt-in pending CK-on model A/B.
+    pub rdna3_q8_group128_k128: bool,
+    /// Read group128 Q8 activations directly from prequantized scratch instead
+    /// of staging the full activation tile in LDS. gfx1100 opt-in.
+    pub rdna3_q8_group128_direct: bool,
+    /// Gate/up-only X512 direct-Q8 probe. Sixteen waves share one expanded
+    /// weight tile across twice as many prefill tokens.
+    pub rdna3_q8_group128_direct_x512: bool,
+    /// Share one activation scale across adjacent 128-value Q8 blocks and
+    /// consume the group256 layout with the spill-free serial-row gfx1100 MMQ.
+    pub rdna3_q8_group256_serial_row: bool,
+    /// Apply the group256 serial-row path only to the Qwen3.6 dense FFN
+    /// gate/up pair. This isolates its quality and performance from QKV and
+    /// residual projections before considering wider production routing.
+    pub rdna3_q8_group256_gate_up: bool,
+    /// Approximate signed-A4 activation path using native packed IU4 WMMA for
+    /// the validated gfx1100 Qwen3.6 gate/up N=2048 prefill shape. Opt-in.
+    pub rdna3_hfq4_gate_up_iu4_a4: bool,
+    /// Parallelize the causal depthwise-conv token axis for long sequential
+    /// Qwen GDN prefill. gfx1100 opt-in pending model-level A/B.
+    pub rdna3_gdn_conv_token_parallel: bool,
+    /// Fuse dense FFN SwiGLU, FWHT rotation, and group128 Q8 packing directly
+    /// into MMQ scratch. Requires rdna3_q8_group128 and remains opt-in.
+    pub rdna3_fused_swiglu_q8_group128: bool,
+    /// Store the validated gfx1100 Qwen dense-FFN gate/up intermediates as
+    /// FP16 and consume them directly in the fused SwiGLU/Q8 producer.
+    pub rdna3_ffn_f16_intermediate: bool,
+    /// Fuse batched GDN output normalization with the following MQ rotation
+    /// for even collections of 128-value heads. Certified default on gfx1100.
+    pub rdna3_gdn_norm_rotate_batched: bool,
+    /// Use gfx1100 DPP/permlane reductions in sequential GDN prefill. The
+    /// reduction order matches the certified shuffle tree; explicit `0`
+    /// retains the portable shuffle implementation.
+    pub rdna3_gdn_dpp_prefill: bool,
     pub fp8_wmma: bool,
     pub dot2_gemv: bool,
     pub gcn5_wave64_hybrid: Option<bool>,
@@ -394,6 +466,52 @@ impl FeatureFlags {
             hfq3_dp4a: parse_bool("HIPFIRE_HFQ3_DP4A"),
             hfq3_mmq: parse_bool("HIPFIRE_HFQ3_MMQ"),
             hfq4_mmq_rdna2: parse_bool("HIPFIRE_HFQ4_MMQ_RDNA2"),
+            rdna3_hfq4_gate_up_x256y64: value("HIPFIRE_RDNA3_HFQ4_GATE_UP_X256Y64").as_deref()
+                == Ok("1"),
+            rdna3_hfq4_gate_up_a16_k32: value("HIPFIRE_RDNA3_HFQ4_GATE_UP_A16_K32").as_deref()
+                == Ok("1"),
+            rdna3_hfq4_set_a16_k32: value("HIPFIRE_RDNA3_HFQ4_SET_A16_K32").as_deref() == Ok("1"),
+            rdna3_hfq4_residual_a16_k32: value("HIPFIRE_RDNA3_HFQ4_RESIDUAL_A16_K32").as_deref()
+                == Ok("1"),
+            rdna3_hfq4_residual_x256y64: value("HIPFIRE_RDNA3_HFQ4_RESIDUAL_X256Y64").as_deref()
+                == Ok("1"),
+            rdna3_hfq4_aux_x256y64: value("HIPFIRE_RDNA3_HFQ4_AUX_X256Y64").as_deref() == Ok("1"),
+            rdna3_hfq4_perm_nibble: value("HIPFIRE_RDNA3_HFQ4_PERM_NIBBLE").as_deref() == Ok("1"),
+            rdna3_hfq4_meta_single_loader: value("HIPFIRE_RDNA3_HFQ4_META_SINGLE_LOADER")
+                .as_deref()
+                == Ok("1"),
+            rdna3_q8_group128: value("HIPFIRE_RDNA3_Q8_GROUP128").as_deref() == Ok("1"),
+            rdna3_q8_group128_row2: value("HIPFIRE_RDNA3_Q8_GROUP128_ROW2").as_deref() == Ok("1"),
+            rdna3_q8_group128_dual_row_weight: value("HIPFIRE_RDNA3_Q8_GROUP128_DUAL_ROW_WEIGHT")
+                .as_deref()
+                == Ok("1"),
+            rdna3_q8_group128_quad_row_weight: value("HIPFIRE_RDNA3_Q8_GROUP128_QUAD_ROW_WEIGHT")
+                .as_deref()
+                == Ok("1"),
+            rdna3_q8_group128_k128: value("HIPFIRE_RDNA3_Q8_GROUP128_K128").as_deref() == Ok("1"),
+            rdna3_q8_group128_direct: value("HIPFIRE_RDNA3_Q8_GROUP128_DIRECT").as_deref()
+                == Ok("1"),
+            rdna3_q8_group128_direct_x512: value("HIPFIRE_RDNA3_Q8_GROUP128_DIRECT_X512")
+                .as_deref()
+                == Ok("1"),
+            rdna3_q8_group256_serial_row: value("HIPFIRE_RDNA3_Q8_GROUP256_SERIAL_ROW").as_deref()
+                == Ok("1"),
+            rdna3_q8_group256_gate_up: value("HIPFIRE_RDNA3_Q8_GROUP256_GATE_UP").as_deref()
+                == Ok("1"),
+            rdna3_hfq4_gate_up_iu4_a4: value("HIPFIRE_RDNA3_HFQ4_GATE_UP_IU4_A4").as_deref()
+                == Ok("1"),
+            rdna3_gdn_conv_token_parallel: value("HIPFIRE_RDNA3_GDN_CONV_TOKEN_PARALLEL")
+                .as_deref()
+                == Ok("1"),
+            rdna3_fused_swiglu_q8_group128: value("HIPFIRE_RDNA3_FUSED_SWIGLU_Q8_GROUP128")
+                .as_deref()
+                == Ok("1"),
+            rdna3_ffn_f16_intermediate: value("HIPFIRE_RDNA3_FFN_F16_INTERMEDIATE").as_deref()
+                == Ok("1"),
+            rdna3_gdn_norm_rotate_batched: parse_bool("HIPFIRE_GATED_NORM_MQ_ROTATE_BATCHED")
+                .unwrap_or(arch == "gfx1100"),
+            rdna3_gdn_dpp_prefill: parse_bool("HIPFIRE_GFX1100_GDN_DPP")
+                .unwrap_or(arch == "gfx1100"),
             fp8_wmma: value("HIPFIRE_FP8_WMMA").map_or(false, |v| v == "1"),
             dot2_gemv: value("HIPFIRE_DOT2_GEMV").map_or(false, |v| v == "1"),
             gcn5_wave64_hybrid: parse_bool("HIPFIRE_GCN5_WAVE64_HYBRID"),
@@ -677,6 +795,29 @@ impl FeatureFlags {
             hfq3_dp4a: None,
             hfq3_mmq: None,
             hfq4_mmq_rdna2: None,
+            rdna3_hfq4_gate_up_x256y64: false,
+            rdna3_hfq4_gate_up_a16_k32: false,
+            rdna3_hfq4_set_a16_k32: false,
+            rdna3_hfq4_residual_a16_k32: false,
+            rdna3_hfq4_residual_x256y64: false,
+            rdna3_hfq4_aux_x256y64: false,
+            rdna3_hfq4_perm_nibble: false,
+            rdna3_hfq4_meta_single_loader: false,
+            rdna3_q8_group128: false,
+            rdna3_q8_group128_row2: false,
+            rdna3_q8_group128_dual_row_weight: false,
+            rdna3_q8_group128_quad_row_weight: false,
+            rdna3_q8_group128_k128: false,
+            rdna3_q8_group128_direct: false,
+            rdna3_q8_group128_direct_x512: false,
+            rdna3_q8_group256_serial_row: false,
+            rdna3_q8_group256_gate_up: false,
+            rdna3_hfq4_gate_up_iu4_a4: false,
+            rdna3_gdn_conv_token_parallel: false,
+            rdna3_fused_swiglu_q8_group128: false,
+            rdna3_ffn_f16_intermediate: false,
+            rdna3_gdn_norm_rotate_batched: false,
+            rdna3_gdn_dpp_prefill: false,
             fp8_wmma: false,
             dot2_gemv: false,
             gcn5_wave64_hybrid: None,
@@ -863,6 +1004,46 @@ mod tests {
             assert!(!flags.gemma4_ple_branch_batched_prefill, "arch={arch}");
             assert!(!flags.gemma4_ple_activation_fused_prefill, "arch={arch}");
         }
+    }
+
+    #[test]
+    fn batched_gdn_norm_rotate_defaults_only_on_gfx1100() {
+        let gfx1100 = FeatureFlags::from_lookup("gfx1100", |_| Err(()));
+        let gfx1201 = FeatureFlags::from_lookup("gfx1201", |_| Err(()));
+        assert!(gfx1100.rdna3_gdn_norm_rotate_batched);
+        assert!(!gfx1201.rdna3_gdn_norm_rotate_batched);
+    }
+
+    #[test]
+    fn batched_gdn_norm_rotate_accepts_explicit_disable() {
+        let flags = FeatureFlags::from_lookup("gfx1100", |name| {
+            if name == "HIPFIRE_GATED_NORM_MQ_ROTATE_BATCHED" {
+                Ok("0".to_owned())
+            } else {
+                Err(())
+            }
+        });
+        assert!(!flags.rdna3_gdn_norm_rotate_batched);
+    }
+
+    #[test]
+    fn gdn_dpp_prefill_defaults_only_on_gfx1100() {
+        let gfx1100 = FeatureFlags::from_lookup("gfx1100", |_| Err(()));
+        let gfx1201 = FeatureFlags::from_lookup("gfx1201", |_| Err(()));
+        assert!(gfx1100.rdna3_gdn_dpp_prefill);
+        assert!(!gfx1201.rdna3_gdn_dpp_prefill);
+    }
+
+    #[test]
+    fn gdn_dpp_prefill_accepts_explicit_disable() {
+        let flags = FeatureFlags::from_lookup("gfx1100", |name| {
+            if name == "HIPFIRE_GFX1100_GDN_DPP" {
+                Ok("0".to_owned())
+            } else {
+                Err(())
+            }
+        });
+        assert!(!flags.rdna3_gdn_dpp_prefill);
     }
 
     #[test]

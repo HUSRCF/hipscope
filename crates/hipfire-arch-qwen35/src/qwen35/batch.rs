@@ -61,6 +61,8 @@ pub struct PrefillBatchScratch {
     // FFN intermediates [N × hidden_dim]
     pub gate_ffn_batch: GpuTensor,
     pub up_batch: GpuTensor,
+    pub gate_ffn_f16_batch: Option<GpuTensor>,
+    pub up_f16_batch: Option<GpuTensor>,
     // SwiGLU output (FWHT-rotated for MQ4) feeding w_down.
     pub ffn_hidden_batch: GpuTensor,
 
@@ -242,6 +244,17 @@ impl PrefillBatchScratch {
         let grouped_m_total_max =
             moe_grouped_m_total_max(max_batch, config.num_experts_per_tok, config.num_experts);
         let grouped_total_slots_max = max_batch * config.num_experts_per_tok;
+        let use_f16_ffn_scratch = gpu.flags.rdna3_ffn_f16_intermediate
+            && gpu.arch_caps.is_gfx1100()
+            && gpu.flags.rdna3_hfq4_gate_up_x256y64
+            && gpu.flags.rdna3_hfq4_residual_x256y64
+            && gpu.flags.rdna3_hfq4_perm_nibble
+            && gpu.flags.rdna3_q8_group128
+            && gpu.flags.rdna3_q8_group128_quad_row_weight
+            && gpu.flags.rdna3_fused_swiglu_q8_group128
+            && dim == 5_120
+            && hidden_dim == 17_408
+            && max_batch % 256 == 0;
 
         Ok(Self {
             max_batch,
@@ -261,6 +274,12 @@ impl PrefillBatchScratch {
             dn_normed_batch: alloc!(&[max_batch * v_dim], DType::F32),
             gate_ffn_batch: alloc!(&[max_batch * hidden_dim], DType::F32),
             up_batch: alloc!(&[max_batch * hidden_dim], DType::F32),
+            gate_ffn_f16_batch: alloc_opt!(
+                use_f16_ffn_scratch,
+                &[max_batch * hidden_dim],
+                DType::F16
+            ),
+            up_f16_batch: alloc_opt!(use_f16_ffn_scratch, &[max_batch * hidden_dim], DType::F16),
             ffn_hidden_batch: alloc!(&[max_batch * hidden_dim], DType::F32),
             dn_normed_rot_batch: alloc!(&[max_batch * v_dim], DType::F32),
             // F32 dtype = 4 bytes/element, same layout as i32. The rope /
@@ -439,6 +458,8 @@ impl PrefillBatchScratch {
             note(gpu.free_tensor(t));
         }
         for t in [
+            self.gate_ffn_f16_batch,
+            self.up_f16_batch,
             self.moe_router_logits_batch,
             self.moe_shared_scalar_batch,
             self.moe_shared_gate_batch,

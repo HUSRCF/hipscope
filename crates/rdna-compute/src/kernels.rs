@@ -1105,6 +1105,8 @@ pub const GEMM_HFQ4G256_RESIDUAL_MFMA_V4_GFX942_SRC: &str =
     include_str!("../../../kernels/src/gemm_hfq4g256_residual_mfma_v4.gfx942.hip");
 pub const FUSED_SILU_MUL_MQ_ROTATE_SRC: &str =
     include_str!("../../../kernels/src/fused_silu_mul_mq_rotate.hip");
+pub const FUSED_SILU_MUL_MQ_ROTATE_Q8_GROUP128_SRC: &str =
+    include_str!("../../../kernels/src/fused_silu_mul_mq_rotate_q8_group128.hip");
 pub const GATED_NORM_MQ_ROTATE_GFX1100_SRC: &str =
     include_str!("../../../kernels/src/gated_norm_mq_rotate.gfx1100.hip");
 pub fn gated_norm_mq_rotate_k6144_gfx1100_src() -> &'static str {
@@ -3052,6 +3054,10 @@ pub const GEMM_HFQ4G256_RESIDUAL_WMMA_KSPLIT_SRC: &str =
     include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma_ksplit.hip");
 pub const GEMM_HFQ4G256_RESIDUAL_WMMA_KSPLIT_DET_SRC: &str =
     include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma_ksplit_det.hip");
+pub const GEMM_HFQ4G256_A16_WMMA_128X64_SRC: &str =
+    include_str!("../../../kernels/src/gemm_hfq4g256_a16_wmma_128x64.hip");
+pub const GEMM_HFQ4G256_Q8_WMMA_128X64_K32_SRC: &str =
+    include_str!("../../../kernels/src/gemm_hfq4g256_q8_wmma_128x64_k32.hip");
 pub const GEMM_KSPLIT_DET_FINALIZE_SRC: &str =
     include_str!("../../../kernels/src/gemm_ksplit_det_finalize.hip");
 // gfx12 (RDNA4) sister of GEMM_HFQ4G256_RESIDUAL_WMMA_K2_SRC. Same recipe
@@ -3214,6 +3220,10 @@ pub const GEMM_HFQ4G256_RESIDUAL_MMQ_SRC: &str =
 // unchanged; metadata loads select the dual fp16 header per 128-weight half.
 pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq.hip");
+/// Gfx11 packed-MQ4 x signed-A4 IU4-WMMA experiment. Production dispatch can
+/// select it only through the shape-specific, default-off A4 feature flag.
+pub const GEMM_HFQ4G256_MMQ_IU4_A4_SRC: &str =
+    include_str!("../../../kernels/src/gemm_hfq4g256_mmq_iu4_a4.hip");
 // gfx12 (RDNA4) i8-WMMA MMQ port (single-wave 16-row tile, [32,1,1], LDS 0).
 // RDNA3's #if guard excludes gfx12, so RDNA4 needs this separate source.
 pub const GEMM_HFQ4G256_RESIDUAL_MMQ_GFX12_SRC: &str =
@@ -5782,6 +5792,13 @@ pub const GATED_DELTA_NET_Q8_SRC: &str =
 /// requant outside the loop. Supports EF residual. Lower VGPR pressure.
 pub const GATED_DELTA_NET_Q8_FAST_SRC: &str =
     include_str!("../../../kernels/src/gated_delta_net_q8_fast.hip");
+
+/// gfx1100 prefill experiment: preserve the fast GDN geometry and arithmetic
+/// while lowering the two wave reductions to DPP/permlane instructions.
+pub const GATED_DELTA_NET_Q8_FAST_DPP_GFX1100_SRC: &str = concat!(
+    "#define HIPFIRE_GFX1100_GDN_DPP_REDUCE 1\n#define HIPFIRE_GDN_KERNEL gated_delta_net_q8_fast_dpp_gfx1100\n",
+    include_str!("../../../kernels/src/gated_delta_net_q8_fast.hip")
+);
 
 /// Decode-only compact-QK variants for Qwen3.5 DeltaNet GQA (16 Q/K heads,
 /// 32 value/state heads). Each pair of state heads reads one normalized Q/K

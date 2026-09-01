@@ -55,6 +55,25 @@ use hipfire_runtime::llama::WeightTensor;
 use rdna_compute::DType;
 use rdna_compute::Gpu;
 use rdna_compute::GpuTensor;
+
+#[inline]
+fn gated_norm_mq_rotate_batched_enabled(
+    gpu: &Gpu,
+    n_v_heads: usize,
+    head_dim: usize,
+    wo: &WeightTensor,
+    batch_size: usize,
+) -> bool {
+    gpu.flags.rdna3_gdn_norm_rotate_batched
+        && gpu.arch_caps.is_gfx1100()
+        && batch_size > 1
+        && n_v_heads % 2 == 0
+        && head_dim == 128
+        && wo.k == n_v_heads * head_dim
+        && wo.gpu_dtype == DType::MQ4G256
+        && wo.awq_scale.is_none()
+}
+
 /// Row-parallel epilogue for dense-TP batched partials.
 /// `Residual` is byte-identical single-GPU/MoE/EP behavior: GEMM adds into
 /// `pbs.x_batch`. `Partial(out)` writes the N×dim GEMM result into `out`
@@ -2729,6 +2748,78 @@ pub(crate) fn run_residual_gemm_key(
         .map_err(HipError::from)
 }
 
+/// Execute the verified gfx11 group128 SwiGLU producer and prequantized
+/// residual down projection. Unsupported contracts have no side effects.
+#[inline]
+fn try_run_hfq4_group128_swiglu_down(
+    gpu: &mut Gpu,
+    w_down: &WeightTensor,
+    gate: &GpuTensor,
+    up: &GpuTensor,
+    residual: &GpuTensor,
+    n: usize,
+) -> HipResult<bool> {
+    if !gpu.flags.rdna3_q8_group128
+        || !gpu.flags.rdna3_fused_swiglu_q8_group128
+        || !gpu.flags.rdna3_hfq4_residual_x256y64
+        || !gpu.flags.rdna3_hfq4_perm_nibble
+        || !gpu.arch_caps.is_rdna3_dgpu()
+        || w_down.gpu_dtype != DType::MQ4G256
+        || w_down.awq_scale.is_some()
+        || w_down.m != 5_120
+        || w_down.k != 17_408
+        || n % 256 != 0
+        || gate.dtype != up.dtype
+        || !matches!(gate.dtype, DType::F32 | DType::F16)
+    {
+        return Ok(false);
+    }
+
+    let xq = if gate.dtype == DType::F16 {
+        gpu.fused_silu_mul_rotate_mq_q8_group128_f16_batched(gate, up, w_down.k, n)?
+    } else {
+        gpu.fused_silu_mul_rotate_mq_q8_group128_batched(gate, up, w_down.k, n)?
+    };
+    gpu.gemm_hfq4g256_mmq_add_prequant_x256y64_perm_group128(
+        &w_down.buf,
+        xq,
+        residual,
+        w_down.m,
+        w_down.k,
+        n,
+    )?;
+    Ok(true)
+}
+
+#[inline]
+fn use_f16_ffn_intermediate(
+    gpu: &Gpu,
+    pbs: &PrefillBatchScratch,
+    w_gate: &WeightTensor,
+    w_up: &WeightTensor,
+    w_down: &WeightTensor,
+    n: usize,
+) -> bool {
+    gpu.arch_caps.is_rdna3_dgpu()
+        && gpu.flags.rdna3_q8_group128
+        && gpu.flags.rdna3_fused_swiglu_q8_group128
+        && gpu.flags.rdna3_hfq4_residual_x256y64
+        && gpu.flags.rdna3_hfq4_perm_nibble
+        && pbs.gate_ffn_f16_batch.is_some()
+        && pbs.up_f16_batch.is_some()
+        && n % 256 == 0
+        && w_gate.gpu_dtype == DType::MQ4G256
+        && w_up.gpu_dtype == DType::MQ4G256
+        && w_down.gpu_dtype == DType::MQ4G256
+        && w_gate.m == 17_408
+        && w_up.m == 17_408
+        && w_gate.k == 5_120
+        && w_up.k == 5_120
+        && w_down.m == 5_120
+        && w_down.k == 17_408
+        && w_down.awq_scale.is_none()
+}
+
 /// #397 Ship 5.2 slice 2: route a single BATCHED-prefill FUSED gate+up GEMM
 /// through [`FusedQkvFamily`] against an explicit `FusedGateUp*` [`KernelKey`].
 ///
@@ -4425,17 +4516,35 @@ pub(crate) fn batch_chunk_delta_net_attn(
             )?;
         }
     } else {
-        gpu.conv1d_silu_split_f32_n(
-            &pbs.dn_q_raw_batch,
-            &pbs.dn_k_raw_batch,
-            &pbs.dn_v_batch,
-            &pbs.dn_qkv_batch,
-            &layer.conv_weight,
-            &dn_state.conv_states[delta_layer_idx],
-            k_dim,
-            v_dim,
-            n,
-        )?;
+        if gpu.flags.rdna3_gdn_conv_token_parallel
+            && gpu.arch_caps.is_gfx1100()
+            && !gpu.graphs.capture_mode
+            && n >= 128
+        {
+            gpu.conv1d_silu_split_f32_n_parallel(
+                &pbs.dn_q_raw_batch,
+                &pbs.dn_k_raw_batch,
+                &pbs.dn_v_batch,
+                &pbs.dn_qkv_batch,
+                &layer.conv_weight,
+                &dn_state.conv_states[delta_layer_idx],
+                k_dim,
+                v_dim,
+                n,
+            )?;
+        } else {
+            gpu.conv1d_silu_split_f32_n(
+                &pbs.dn_q_raw_batch,
+                &pbs.dn_k_raw_batch,
+                &pbs.dn_v_batch,
+                &pbs.dn_qkv_batch,
+                &layer.conv_weight,
+                &dn_state.conv_states[delta_layer_idx],
+                k_dim,
+                v_dim,
+                n,
+            )?;
+        }
     }
 
     // Fused L2-norm(Q) + scale(Q) + L2-norm(K) + repeat-interleave
@@ -4641,17 +4750,36 @@ pub(crate) fn batch_chunk_delta_net_attn(
         }
     }
 
-    // Batched gated output norm.
-    gpu.gated_norm_f32_batched(
-        &pbs.dn_attn_out_batch,
-        &pbs.dn_z_batch,
-        &layer.norm_weight,
-        &pbs.dn_normed_batch,
+    let wo_has_fused_norm_rotate = gated_norm_mq_rotate_batched_enabled(
+        gpu,
         n_v_heads,
         config.linear_value_head_dim,
-        config.norm_eps,
+        &layer.wo,
         n,
-    )?;
+    );
+    if wo_has_fused_norm_rotate {
+        gpu.gated_norm_rotate_mq_batched_gfx1100(
+            &pbs.dn_attn_out_batch,
+            &pbs.dn_z_batch,
+            &layer.norm_weight,
+            &pbs.dn_normed_rot_batch,
+            n_v_heads,
+            config.linear_value_head_dim,
+            config.norm_eps,
+            n,
+        )?;
+    } else {
+        gpu.gated_norm_f32_batched(
+            &pbs.dn_attn_out_batch,
+            &pbs.dn_z_batch,
+            &layer.norm_weight,
+            &pbs.dn_normed_batch,
+            n_v_heads,
+            config.linear_value_head_dim,
+            config.norm_eps,
+            n,
+        )?;
+    }
 
     // Batched wo + residual/partial.
     //
@@ -4676,14 +4804,16 @@ pub(crate) fn batch_chunk_delta_net_attn(
             | DType::MFP4G32
     );
     let wo_input = if wo_is_mq {
-        rotate_x_mq_batched_for(
-            gpu,
-            &layer.wo,
-            &pbs.dn_normed_batch,
-            &pbs.dn_normed_rot_batch,
-            layer.wo.k,
-            n,
-        )?;
+        if !wo_has_fused_norm_rotate {
+            rotate_x_mq_batched_for(
+                gpu,
+                &layer.wo,
+                &pbs.dn_normed_batch,
+                &pbs.dn_normed_rot_batch,
+                layer.wo.k,
+                n,
+            )?;
+        }
         &pbs.dn_normed_rot_batch
     } else {
         &pbs.dn_normed_batch
@@ -4762,6 +4892,9 @@ pub(crate) fn batch_chunk_delta_net_ffn(
             config.norm_eps,
         )?;
     }
+
+    let use_f16_ffn = matches!(&epilogue, BatchEpilogue::Residual)
+        && use_f16_ffn_intermediate(gpu, pbs, &layer.w_gate, &layer.w_up, &layer.w_down, n);
 
     // Batched gate+up projection.
     // #397 Ship 5.2 slice 2: fused gate+up dtypes → FusedQkvFamily
@@ -4867,6 +5000,17 @@ pub(crate) fn batch_chunk_delta_net_ffn(
             layer.w_gate.k,
             n,
         )?;
+    } else if use_f16_ffn {
+        gpu.gemm_gate_up_hfq4g256_group128_f16_intermediate(
+            &layer.w_gate.buf,
+            &layer.w_up.buf,
+            &pbs.x_rot_batch,
+            pbs.gate_ffn_f16_batch.as_ref().unwrap(),
+            pbs.up_f16_batch.as_ref().unwrap(),
+            layer.w_gate.m,
+            layer.w_gate.k,
+            n,
+        )?;
     } else {
         run_fused_gate_up_key(
             gpu,
@@ -4903,31 +5047,46 @@ pub(crate) fn batch_chunk_delta_net_ffn(
             | DType::MQ3G256Lloyd
             | DType::MFP4G32
     );
-    if w_down_is_mq {
+    let (gate, up) = if use_f16_ffn {
+        (
+            pbs.gate_ffn_f16_batch.as_ref().unwrap(),
+            pbs.up_f16_batch.as_ref().unwrap(),
+        )
+    } else {
+        (&pbs.gate_ffn_batch, &pbs.up_batch)
+    };
+    let direct_group128_down = if matches!(&epilogue, BatchEpilogue::Residual) {
+        try_run_hfq4_group128_swiglu_down(gpu, &layer.w_down, gate, up, &pbs.x_batch, n)?
+    } else {
+        false
+    };
+    if !direct_group128_down && w_down_is_mq {
         // F2: AWQ-aware silu_mul+rotate for w_down input.
         fused_silu_mul_rotate_mq_batched_for(
             gpu,
             &layer.w_down,
-            &pbs.gate_ffn_batch,
-            &pbs.up_batch,
+            gate,
+            up,
             &pbs.ffn_hidden_batch,
             hidden_dim,
             n,
         )?;
-    } else {
-        gpu.silu_mul_f32(&pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch)?;
+    } else if !direct_group128_down {
+        gpu.silu_mul_f32(gate, up, &pbs.ffn_hidden_batch)?;
     }
     // Batched w_down + residual/partial.
-    dispatch_batched_gemm_epilogue(
-        gpu,
-        pbs,
-        &layer.w_down,
-        &pbs.ffn_hidden_batch,
-        &epilogue,
-        n,
-        q8_wmma_arch,
-        arch_has_wmma,
-    )?;
+    if !direct_group128_down {
+        dispatch_batched_gemm_epilogue(
+            gpu,
+            pbs,
+            &layer.w_down,
+            &pbs.ffn_hidden_batch,
+            &epilogue,
+            n,
+            q8_wmma_arch,
+            arch_has_wmma,
+        )?;
+    }
 
     Ok(())
 }
@@ -5444,6 +5603,8 @@ pub(crate) fn batch_chunk_full_attn_ffn(
             config.norm_eps,
         )?;
     }
+    let use_f16_ffn = matches!(&epilogue, BatchEpilogue::Residual)
+        && use_f16_ffn_intermediate(gpu, pbs, &layer.w_gate, &layer.w_up, &layer.w_down, n);
     // #397 Ship 5.2 slice 2: FA-FFN fused gate+up → FusedQkvFamily
     // (batched-prefill gate+up variant), mirroring the LA-FFN block
     // above. Q8-non-WMMA stays as two plain GEMMs; HFQ3 WMMA-vs-base
@@ -5545,6 +5706,17 @@ pub(crate) fn batch_chunk_full_attn_ffn(
             layer.w_gate.k,
             n,
         )?;
+    } else if use_f16_ffn {
+        gpu.gemm_gate_up_hfq4g256_group128_f16_intermediate(
+            &layer.w_gate.buf,
+            &layer.w_up.buf,
+            &pbs.x_rot_batch,
+            pbs.gate_ffn_f16_batch.as_ref().unwrap(),
+            pbs.up_f16_batch.as_ref().unwrap(),
+            layer.w_gate.m,
+            layer.w_gate.k,
+            n,
+        )?;
     } else {
         run_fused_gate_up_key(
             gpu,
@@ -5574,29 +5746,44 @@ pub(crate) fn batch_chunk_full_attn_ffn(
             | DType::MQ3G256Lloyd
             | DType::MFP4G32
     );
-    if fa_w_down_is_mq {
+    let (gate, up) = if use_f16_ffn {
+        (
+            pbs.gate_ffn_f16_batch.as_ref().unwrap(),
+            pbs.up_f16_batch.as_ref().unwrap(),
+        )
+    } else {
+        (&pbs.gate_ffn_batch, &pbs.up_batch)
+    };
+    let direct_group128_down = if matches!(&epilogue, BatchEpilogue::Residual) {
+        try_run_hfq4_group128_swiglu_down(gpu, &layer.w_down, gate, up, &pbs.x_batch, n)?
+    } else {
+        false
+    };
+    if !direct_group128_down && fa_w_down_is_mq {
         fused_silu_mul_rotate_mq_batched_for(
             gpu,
             &layer.w_down,
-            &pbs.gate_ffn_batch,
-            &pbs.up_batch,
+            gate,
+            up,
             &pbs.ffn_hidden_batch,
             hidden_dim,
             n,
         )?;
-    } else {
-        gpu.silu_mul_f32(&pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch)?;
+    } else if !direct_group128_down {
+        gpu.silu_mul_f32(gate, up, &pbs.ffn_hidden_batch)?;
     }
-    dispatch_batched_gemm_epilogue(
-        gpu,
-        pbs,
-        &layer.w_down,
-        &pbs.ffn_hidden_batch,
-        &epilogue,
-        n,
-        q8_wmma_arch,
-        arch_has_wmma,
-    )?;
+    if !direct_group128_down {
+        dispatch_batched_gemm_epilogue(
+            gpu,
+            pbs,
+            &layer.w_down,
+            &pbs.ffn_hidden_batch,
+            &epilogue,
+            n,
+            q8_wmma_arch,
+            arch_has_wmma,
+        )?;
+    }
 
     Ok(())
 }

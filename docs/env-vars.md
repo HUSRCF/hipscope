@@ -140,6 +140,30 @@ Values and defaults below match `hipfire-config`, the native CLI, and/or `Runtim
 | `HIPFIRE_FLASH_PREFILL` | Developer override for Q8 WMMA flash prefill: `0` forces off, `1` forces on; unset uses the architecture/workload envelope. |
 | `HIPFIRE_FLASH_PREFILL_FIXED_HD` | Developer ablation: fixed-head-dimension specialization is on unless `0`. |
 | `HIPFIRE_FLASH_PREFILL_PREFETCH_V` | Developer ablation: gfx12 V prefetch is on unless `0`. |
+| `HIPFIRE_ASYM4_WMMA` | Developer correctness fallback: set to `0` to route gfx11 Asym4 prefill through the scalar tile implementation. |
+
+The prebuilt gfx1100 CK preview launcher sets the following validated Qwen
+hybrid-model combination. These are execution-format controls for that bundle,
+not general defaults for other GPUs or model families. Explicit user values are
+preserved.
+
+| Variable | Bundle default | Notes |
+|---|---:|---|
+| `HIPFIRE_FLASH_ATTN_CK_QUANTIZED_LIB` | bundled `.so` path | Loads the optional staged Asym3-K/Q8-V CK prefill sidecar. |
+| `HIPFIRE_FLASH_PARTIALS_BATCH` | `64` | Provides reusable staging capacity for the validated Asym3/Asym4 CK D256 prefill routes. |
+| `HIPFIRE_GFX1100_GDN_DPP` | `1` | Uses exact DPP/permlane reductions for sequential GDN prefill on gfx1100; set to `0` to retain the portable shuffle path. |
+| `HIPFIRE_RDNA3_HFQ4_GATE_UP_X256Y64` | `1` | Uses the validated X256/Y64 gate/up packed-MQ4 route. |
+| `HIPFIRE_RDNA3_HFQ4_RESIDUAL_X256Y64` | `1` | Uses the validated X256/Y64 residual/down route. |
+| `HIPFIRE_RDNA3_HFQ4_AUX_X256Y64` | `1` | Uses the corresponding auxiliary projection route. |
+| `HIPFIRE_RDNA3_HFQ4_PERM_NIBBLE` | `1` | Selects the gfx11 execution-oriented packed-nibble layout. |
+| `HIPFIRE_RDNA3_Q8_GROUP128` | `1` | Enables the group-128 Q8 activation contract. |
+| `HIPFIRE_RDNA3_Q8_GROUP128_ROW2` | `1` | Enables its two-row staging specialization. |
+| `HIPFIRE_RDNA3_Q8_GROUP128_QUAD_ROW_WEIGHT` | `1` | Enables the matching quad-row weight layout. |
+| `HIPFIRE_RDNA3_FUSED_SWIGLU_Q8_GROUP128` | `1` | Enables the validated fused SwiGLU consumer. |
+| `HIPFIRE_RDNA3_FFN_F16_INTERMEDIATE` | `1` | Stores the FFN intermediate in FP16 on this route. |
+| `HIPFIRE_RDNA3_GDN_CONV_TOKEN_PARALLEL` | `1` | Parallelizes long eager sequential GDN prefill across tokens; graph, decode, and independent/tree paths are unchanged. |
+| `HIPFIRE_RDNA3_Q8_GROUP256_SERIAL_ROW` | `1` | Enables the validated serial-row group-256 fallback. |
+| `HIPFIRE_RDNA3_Q8_GROUP256_GATE_UP` | `0` | Keeps the slower experimental group-256 gate/up route disabled. |
 
 ### LFM (arch 11) — branch-scoped optimized prefill
 
@@ -531,6 +555,7 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_FUSE_QKV_BIAS` | crates/hipfire-dispatch/src/pipeline/steps.rs, crates/rdna-compute/examples/test_fused_qkv_bias_parity.rs |
 | `HIPFIRE_FUSE_QKV_BIAS_DEBUG` | crates/hipfire-dispatch/src/pipeline/steps.rs, crates/rdna-compute/src/feature_flags.rs |
 | `HIPFIRE_GATED_NORM_MQ_ROTATE` | crates/hipfire-arch-qwen35/src/qwen35.rs |
+| `HIPFIRE_GATED_NORM_MQ_ROTATE_BATCHED` | crates/rdna-compute/src/feature_flags.rs, crates/hipfire-arch-qwen35/src/qwen35.rs |
 | `HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL` | crates/rdna-compute/src/kernels.rs |
 | `HIPFIRE_GATE_KV_MODE` | scripts/coherence-gate-dflash.sh |
 | `HIPFIRE_GATE_MODEL` | scripts/gates.sh |

@@ -2618,7 +2618,38 @@ impl Gpu {
             x,
             batch_size,
             k,
+            false,
         )
+    }
+
+    /// Quantize a fresh activation matrix into the experimental group256 Q8
+    /// wire layout. The shared MMQ scratch is overwritten on every call.
+    pub fn ensure_q8_1_mmq_group256_x(
+        &mut self,
+        x: &GpuTensor,
+        batch_size: usize,
+        k: usize,
+    ) -> HipResult<*mut c_void> {
+        let out = self
+            .scratch
+            .ensure_q8_1_mmq_x_scratch(&self.hip, batch_size, k)?;
+        self.quantize_q8_1_mmq_group256_into(x, out, batch_size, k)?;
+        Ok(out)
+    }
+
+    /// Quantize one activation matrix into the signed-A4 group128 layout.
+    /// Callers must consume it before another MMQ conversion reuses scratch.
+    pub fn ensure_q4_1_group128_x(
+        &mut self,
+        x: &GpuTensor,
+        batch_size: usize,
+        k: usize,
+    ) -> HipResult<*mut c_void> {
+        let out = self
+            .scratch
+            .ensure_q8_1_mmq_x_scratch(&self.hip, batch_size, k)?;
+        self.quantize_q4_1_group128_into(x, out, batch_size, k)?;
+        Ok(out)
     }
     /// Returns the number of launches recorded by the `ReplayController`.
     /// Together with `self.graphs.capture_blobs.len()`, this must agree for

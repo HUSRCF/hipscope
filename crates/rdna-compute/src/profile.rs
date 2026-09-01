@@ -24,6 +24,7 @@ use std::cell::RefCell;
 pub struct ProfileEntry {
     pub category: &'static str,
     pub kernel: &'static str,
+    pub shape: Option<[usize; 3]>,
     pub time_us: f64,
     pub bytes: usize,
 }
@@ -64,6 +65,7 @@ fn record(entry: ProfileEntry) {
 pub struct Timer {
     category: &'static str,
     kernel: &'static str,
+    shape: Option<[usize; 3]>,
     bytes: usize,
     start: Event,
     stop: Event,
@@ -81,6 +83,7 @@ impl Timer {
         record(ProfileEntry {
             category: self.category,
             kernel: self.kernel,
+            shape: self.shape,
             time_us: ms as f64 * 1000.0,
             bytes: self.bytes,
         });
@@ -117,10 +120,26 @@ pub fn begin_timer(
     Some(Timer {
         category,
         kernel,
+        shape: None,
         bytes,
         start,
         stop,
     })
+}
+
+/// Profile a kernel while retaining its logical matrix shape as `(M, K, N)`.
+/// This is intended for attribution when one symbol serves several projection
+/// families. It has no effect while profiling is disabled.
+pub fn begin_timer_shape(
+    hip: &HipRuntime,
+    category: &'static str,
+    kernel: &'static str,
+    shape: [usize; 3],
+    bytes: usize,
+) -> Option<Timer> {
+    let mut timer = begin_timer(hip, category, kernel, bytes)?;
+    timer.shape = Some(shape);
+    Some(timer)
 }
 
 /// Helper that finalizes the timer if present. Convenience wrapper for the
