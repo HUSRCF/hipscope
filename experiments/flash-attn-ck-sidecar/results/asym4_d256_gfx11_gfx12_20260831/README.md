@@ -19,23 +19,41 @@ run with `smoke_raw_abi`.
 Both targets reported a 65,536-byte workspace for the smoke shape. Existing
 dense, Q8, and Asym3 cells also passed in the same runs.
 
-## Production-path smoke
+## Production-path validation
 
-Configuration: Radeon Pro W7900 (`gfx1100`), Qwen3.6-27B MQ4, Asym4 KV,
-caller-owned 512 MiB transient workspace, CK sidecar enabled.
+Configuration: Qwen3.6-27B MQ4, Asym4 KV, caller-owned 512 MiB transient
+workspace, CK sidecar enabled. Speculative decoding, DSpark, MTP, and n-gram
+drafting were disabled.
 
-| Prompt | Runs | Prefill throughput | Result |
-| ---: | ---: | --- | --- |
-| 2048 | 1 | `860.0 tok/s` | CK route selected; prefill and decode completed |
-| 8192 | 5 | `833.8, 825.1, 816.2, 808.2, 801.1 tok/s` | all prefill runs completed |
+| Target | Prompt | Runs | Prefill median | Long decode | Result |
+| --- | ---: | ---: | ---: | ---: | --- |
+| W7900 `gfx1100` | 8192 | 5 | `778.8 tok/s` | `34.3 tok/s` over 4096 tokens | next token `248046` |
+| R9700 `gfx1201` | 8192 | 5 | `868.8 tok/s` | `32.3 tok/s` over 4096 tokens | next token `248046` |
 
-The PP8192 median was `816.2 tok/s`. The monotonic drift makes this a
-stability result, not a performance claim.
+The decode phase remains on the native path; these measurements establish that
+the CK prefill handoff leaves a valid cache for long autoregressive decode.
+
+## LongBench hard30
+
+Both exact-architecture sidecars ran the same LongBench-v2 hard30 sample with
+20K--30K-token inputs, `max_seq=65536`, and `max_tokens=16384`. All cases
+terminated naturally before the output limit.
+
+| Target | Completed | Errors | Scored | Accuracy | Prefill median | Decode median | Maximum output |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| W7900 `gfx1100` | 30/30 | 0 | 30/30 | 13/30 (`43.33%`) | `730.6 tok/s` | `29.9 tok/s` | 4061 tokens |
+| R9700 `gfx1201` | 30/30 | 0 | 30/30 | 13/30 (`43.33%`) | `774.45 tok/s` | `28.7 tok/s` | 2971 tokens |
+
+The per-case correctness decisions agree on all 30 cases. Full generated text
+is byte-identical on 14/30 cases; the remaining generations differ across
+architectures without changing any of the 30 task-level correctness outcomes.
 
 ## Native baseline blocker
 
 With the CK route absent or forced off, the same production binary fails at
-both PP2048 and PP8192 with `hipError 700` reported by the next H2D copy. A
+PP8192 on both gfx1100 and gfx1201 with `hipError 700` reported by the next H2D
+copy. The gfx1201 runtime identifies the faulting kernel as
+`attention_flash_asym4_wmma_tile_batched_gfx12`. A
 binary built without the `flash-attn-ck` feature reproduces the PP2048 failure.
 Launching that binary from `/tmp`, where the worktree's precompiled kernel
 directory cannot be discovered, also reproduces the failure; stale kernel
