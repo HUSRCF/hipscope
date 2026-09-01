@@ -753,11 +753,14 @@ mod tests {
         assert_eq!(f.flush_pending(), b"<".to_vec());
         assert!(f.flush_pending().is_empty());
     }
- 
+
     #[test]
     fn finish_is_idempotent_and_rejects_late_bytes() {
         let mut f = EosFilter::new(cfg_qwen_ar(false));
-        assert_eq!(f.observe(b"answer <"), FilterAction::Emit(b"answer ".to_vec()));
+        assert_eq!(
+            f.observe(b"answer <"),
+            FilterAction::Emit(b"answer ".to_vec())
+        );
         assert_eq!(f.finish(), b"<".to_vec());
         assert!(f.finish().is_empty());
         assert_eq!(f.observe(b"late"), FilterAction::Hold);

@@ -99,7 +99,6 @@ pub struct RuntimeConfig {
 /// `HIPFIRE_MTP_K` is present.
 pub const DEFAULT_MTP_K: usize = 3;
 
-
 static CONFIG: OnceLock<RuntimeConfig> = OnceLock::new();
 
 pub fn get() -> &'static RuntimeConfig {

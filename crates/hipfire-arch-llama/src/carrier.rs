@@ -6,8 +6,10 @@ use crate::dspark_body::Qwen3DrafterAssets;
 use crate::Llama;
 use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::dspark_core::DsparkWeights;
-use hipfire_runtime::llama::{ForwardScratch, KvCache, KvDims, KvLayers, KvTarget, LlamaConfig, LlamaWeights};
 use hipfire_runtime::llama::KvCacheExt;
+use hipfire_runtime::llama::{
+    ForwardScratch, KvCache, KvDims, KvLayers, KvTarget, LlamaConfig, LlamaWeights,
+};
 use hipfire_runtime::loader_api::{LoadCtx, ModelSource};
 
 pub struct LlamaBundle {
@@ -82,10 +84,8 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<LlamaBundle, S
             (config, weights, kv, scratch)
         }
         ModelSource::Dir(source) => {
-            let config =
-                hipfire_runtime::hfq::config_from_safetensors_llama(&source).map_err(|e| {
-                    format!("failed to parse LLaMA/Qwen3 config from config.json: {e}")
-                })?;
+            let config = hipfire_runtime::hfq::config_from_safetensors_llama(&source)
+                .map_err(|e| format!("failed to parse LLaMA/Qwen3 config from config.json: {e}"))?;
             let weights =
                 hipfire_runtime::hfq::load_weights_paroquant_llama(&source, &config, ctx.gpu)
                     .map_err(|e| format!("load_weights_paroquant_llama: {e:?}"))?;
@@ -114,17 +114,15 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<LlamaBundle, S
                 max_seq: ctx.max_seq,
                 physical_cap: Some(ctx.max_seq),
             };
-            let kv = match <KvCache as KvCacheExt>::from_mode(
-                rr.mode,
-                KvTarget::Single(ctx.gpu),
-                &dims,
-            ) {
-                Ok(kv) => kv,
-                Err(error) => {
-                    weights.free_gpu(ctx.gpu);
-                    return Err(format!("KvCache: {error}"));
-                }
-            };
+            let kv =
+                match <KvCache as KvCacheExt>::from_mode(rr.mode, KvTarget::Single(ctx.gpu), &dims)
+                {
+                    Ok(kv) => kv,
+                    Err(error) => {
+                        weights.free_gpu(ctx.gpu);
+                        return Err(format!("KvCache: {error}"));
+                    }
+                };
             let scratch = match ForwardScratch::new_with_max_seq(ctx.gpu, &config, ctx.max_seq) {
                 Ok(scratch) => scratch,
                 Err(error) => {

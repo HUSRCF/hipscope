@@ -697,17 +697,17 @@ fn qwen_ar_reset_recurrent(
 /// The target adapter owns the non-reversible DeltaNet state; the adaptive
 /// extra owns the KV cursor and restores adaptive cache flags only when its
 /// controller is healthy.  Sticky adaptive poison is deliberately retained.
-fn qwen_ar_reset_live(
+fn qwen_ar_reset_live<'spec, 'object>(
     dn: &mut qwen35::DeltaNetState,
     kv: &mut hipfire_runtime::llama::KvCache,
-    adaptive: Option<&mut hipfire_runtime::kv_adaptive::KvAdaptive>,
+    mut adaptive: Option<&mut hipfire_runtime::kv_adaptive::KvAdaptive>,
     seq_pos: &mut usize,
     conversation_tokens: &mut Vec<u32>,
     prefill_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
     dflash_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
     asst_turn_cache: &mut hipfire_loader::AsstTurnCache,
     gpu: &mut rdna_compute::Gpu,
-    spec: Option<&mut dyn hipfire_runtime::spec::Speculator>,
+    spec: Option<&'spec mut (dyn hipfire_runtime::spec::Speculator + 'object)>,
 ) -> RollbackEpilogue {
     let mut reset_target = |gpu: &mut rdna_compute::Gpu| qwen_ar_reset_recurrent(dn, gpu);
     let mut reset_adaptive = |gpu: &mut rdna_compute::Gpu| -> Result<(), String> {
@@ -1964,8 +1964,7 @@ pub fn generate(
     // budget+beta+safety regardless of conversation length, so reset never
     // needs to fire — eviction reclaims slots after each token. When eviction
     // is OFF, physical grows unbounded up to max_seq; reset when we'd overrun.
-    let tokenizer = m.tokenizer.as_ref().unwrap();
-    let prompt_est = tokenizer.encode(prompt).len() + 20;
+    let prompt_est = m.tokenizer.as_ref().unwrap().encode(prompt).len() + 20;
     if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
         eprintln!(
             "[qwen-cache GEN-ENTRY] conv_tok={} seq_pos={}",
@@ -1996,6 +1995,7 @@ pub fn generate(
             return;
         }
     }
+    let tokenizer = m.tokenizer.as_ref().unwrap();
 
     // `nl` is needed for the trailer write after natural <|im_end|>
     // termination; `im_end` derives the EOS-check token id. Other
@@ -3845,10 +3845,7 @@ pub fn generate(
                             crate::common::emit_fail_closed_error(
                                 stdout,
                                 Some(id),
-                                &qwen_ar_forward_fail_message(
-                                    "forward_scratch think_close",
-                                    e,
-                                ),
+                                &qwen_ar_forward_fail_message("forward_scratch think_close", e),
                                 "gpu",
                                 true,
                                 &ep,
@@ -4056,10 +4053,7 @@ pub fn generate(
                             crate::common::emit_fail_closed_error(
                                 stdout,
                                 Some(id),
-                                &qwen_ar_forward_fail_message(
-                                    "forward_scratch budget_alert",
-                                    e,
-                                ),
+                                &qwen_ar_forward_fail_message("forward_scratch budget_alert", e),
                                 "gpu",
                                 true,
                                 &ep,

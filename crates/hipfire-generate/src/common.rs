@@ -17,13 +17,13 @@ use hipfire_engine::redline::*;
 use hipfire_engine::scheduler::*;
 use hipfire_engine::terminal::*;
 use hipfire_loader::{AsstTurnCache, EpArch, LoadedModel};
-use hipfire_runtime::prompt_frame::ThinkMode;
 use hipfire_runtime::arch_model::ArchModel;
+use hipfire_runtime::prompt_frame::ThinkMode;
 use hipfire_runtime::spec::{
     ClientEvent, EvictRetain, FinishSummary, SpecTarget, Speculator, StopReason,
 };
-use std::io::Write;
 use std::any::Any;
+use std::io::Write;
 
 /// Permanently latch a per-request think cap once its numeric budget is hit.
 ///
@@ -256,7 +256,6 @@ impl<'a> ResetExtras<'a> {
     }
 }
 
-
 /// Reset all state owned by an expert-parallel model.
 ///
 /// EP keeps its architecture state in `LoadedModel.ep`, so it cannot use the
@@ -350,7 +349,7 @@ pub fn production_fail_closed_rollback_live(
 /// Backward-compatible live adapter for callers that provide a target reset
 /// closure. New callers that hold adaptive/batch/eviction request state should
 /// use [`production_fail_closed_rollback_live_with_extras`].
-pub fn production_fail_closed_rollback_live_with_target(
+pub fn production_fail_closed_rollback_live_with_target<'spec, 'object>(
     seq_pos: &mut usize,
     conversation_tokens: &mut Vec<u32>,
     prefill_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
@@ -358,7 +357,7 @@ pub fn production_fail_closed_rollback_live_with_target(
     asst_turn_cache: &mut hipfire_loader::AsstTurnCache,
     gpu: &mut rdna_compute::Gpu,
     target_reset: &mut dyn FnMut(&mut rdna_compute::Gpu) -> Result<(), String>,
-    spec: Option<&mut dyn Speculator>,
+    spec: Option<&'spec mut (dyn Speculator + 'object)>,
 ) -> RollbackEpilogue {
     production_fail_closed_rollback_live_with_extras(
         seq_pos,
@@ -377,7 +376,7 @@ pub fn production_fail_closed_rollback_live_with_target(
 /// borrows provide a thin `target_reset` adapter and optional request-local
 /// extras; every host/checkpoint/spec/graph/synchronization step remains
 /// centralized here.
-pub fn production_fail_closed_rollback_live_with_extras(
+pub fn production_fail_closed_rollback_live_with_extras<'spec, 'object>(
     seq_pos: &mut usize,
     conversation_tokens: &mut Vec<u32>,
     prefill_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
@@ -385,7 +384,7 @@ pub fn production_fail_closed_rollback_live_with_extras(
     asst_turn_cache: &mut hipfire_loader::AsstTurnCache,
     gpu: &mut rdna_compute::Gpu,
     target_reset: &mut dyn FnMut(&mut rdna_compute::Gpu) -> Result<(), String>,
-    mut spec: Option<&mut dyn Speculator>,
+    spec: Option<&'spec mut (dyn Speculator + 'object)>,
     mut extras: ResetExtras<'_>,
 ) -> RollbackEpilogue {
     *seq_pos = 0;
@@ -413,7 +412,7 @@ pub fn production_fail_closed_rollback_live_with_extras(
             push_reset_err(&mut first_err, "eviction.request_reset", e);
         }
     }
-    if let Some(spec) = spec.as_deref_mut() {
+    if let Some(spec) = spec {
         if let Err(e) = spec.reset(gpu) {
             push_reset_err(&mut first_err, "spec.reset", e);
         }
@@ -429,7 +428,6 @@ pub fn production_fail_closed_rollback_live_with_extras(
     }
     epilogue
 }
-
 
 /// Emit one correlated fail-closed error (no done). Appends epilogue context
 /// when rollback could not be attested.
@@ -849,11 +847,7 @@ pub fn reset_qwen35_recurrent(
         }
         return Ok(());
     }
-    let (state, pp_gpus, layer_owner_map) = (
-        &mut m.state,
-        &mut m.pp_gpus,
-        &m.pp_dn_la_to_device,
-    );
+    let (state, pp_gpus, layer_owner_map) = (&mut m.state, &mut m.pp_gpus, &m.pp_dn_la_to_device);
     let Some(bundle) = state.as_deref_mut().and_then(|state| {
         (state as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
     }) else {
@@ -912,15 +906,25 @@ pub fn reset_qwen35_recurrent_pp(
             let device = la[layer] as usize;
             let g = &mut gpus.devices[device];
             if let Err(error) = g.bind_thread() {
-                push_reset_err(&mut first_err, &format!("{name} bind device {device}"), error);
+                push_reset_err(
+                    &mut first_err,
+                    &format!("{name} bind device {device}"),
+                    error,
+                );
                 continue;
             }
             let result = match g.active_stream.as_ref() {
-                Some(stream) => g.hip.memset_async(&buffer.buf, 0, buffer.buf.size(), stream),
+                Some(stream) => g
+                    .hip
+                    .memset_async(&buffer.buf, 0, buffer.buf.size(), stream),
                 None => g.hip.memset(&buffer.buf, 0, buffer.buf.size()),
             };
             if let Err(error) = result {
-                push_reset_err(&mut first_err, &format!("{name} memset layer {layer}"), error);
+                push_reset_err(
+                    &mut first_err,
+                    &format!("{name} memset layer {layer}"),
+                    error,
+                );
             }
         }
     };
@@ -934,7 +938,11 @@ pub fn reset_qwen35_recurrent_pp(
         g.invalidate_graph_state();
         g.replay.invalidate_replay_observation_window();
         if let Err(error) = g.bind_thread() {
-            push_reset_err(&mut first_err, &format!("pp device {device} sync bind"), error);
+            push_reset_err(
+                &mut first_err,
+                &format!("pp device {device} sync bind"),
+                error,
+            );
             continue;
         }
         if let Err(error) = g.hip.device_synchronize() {
@@ -1264,10 +1272,7 @@ pub fn fail_closed_reset_target_and_spec(
     {
         let state = &mut m.state;
         if let Some(adaptive) = m.kv_adaptive.as_mut() {
-            if let Some(kv) = state
-                .as_deref_mut()
-                .and_then(|model| model.kv_cache_mut())
-            {
+            if let Some(kv) = state.as_deref_mut().and_then(|model| model.kv_cache_mut()) {
                 adaptive.reset_with_cache(gpu, kv);
             } else {
                 adaptive.reset();

@@ -130,10 +130,7 @@ fn run_staged_load<O: StagedLoadOps>(
     ops: &mut O,
     n_devices: usize,
     can_alias: bool,
-) -> Result<
-    StagedWeights<O::Embedding, O::Norm, O::Output, O::Layer>,
-    O::Error,
-> {
+) -> Result<StagedWeights<O::Embedding, O::Norm, O::Output, O::Layer>, O::Error> {
     ops.prepare(n_devices)?;
     let mut staged_embedding = None;
     let mut staged_norm = None;
@@ -428,10 +425,7 @@ mod tests {
             let aliases_embedding = can_alias && self.alias_output;
             let primary = (!aliases_embedding).then(|| self.allocator.alloc("output"));
             let metadata = self.allocator.alloc("output-metadata");
-            Ok((
-                OutputAllocation { primary, metadata },
-                aliases_embedding,
-            ))
+            Ok((OutputAllocation { primary, metadata }, aliases_embedding))
         }
 
         fn read_layer(&mut self, layer_idx: usize) -> Result<Self::Layer, Self::Error> {
@@ -474,10 +468,7 @@ mod tests {
             (FailAt::Prepare, &[][..]),
             (FailAt::Embed, &[][..]),
             (FailAt::FinalNorm, &["free embedding"][..]),
-            (
-                FailAt::Output,
-                &["free final-norm", "free embedding"][..],
-            ),
+            (FailAt::Output, &["free final-norm", "free embedding"][..]),
             (
                 FailAt::Layer(0),
                 &[

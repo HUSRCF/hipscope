@@ -2051,15 +2051,16 @@ impl WeightSource for LlamaParoSource<'_> {
                 }
             },
             |gpu| {
-                let (info, data) = source.tensor_data("model.embed_tokens.weight").ok_or_else(|| {
-                    HipError::new(0, "PARO tensor not found: embed_tokens for lm_head")
-                })?;
-                let f32_data = crate::safetensors_source::source_bytes_to_f32_vec(&info.dtype, data);
+                let (info, data) =
+                    source
+                        .tensor_data("model.embed_tokens.weight")
+                        .ok_or_else(|| {
+                            HipError::new(0, "PARO tensor not found: embed_tokens for lm_head")
+                        })?;
+                let f32_data =
+                    crate::safetensors_source::source_bytes_to_f32_vec(&info.dtype, data);
                 let bytes: &[u8] = unsafe {
-                    std::slice::from_raw_parts(
-                        f32_data.as_ptr() as *const u8,
-                        f32_data.len() * 4,
-                    )
+                    std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
                 };
                 let buf = gpu.upload_raw(bytes, &[cfg.vocab_size, cfg.dim])?;
                 Ok(WeightTensor {
@@ -2079,7 +2080,10 @@ impl WeightSource for LlamaParoSource<'_> {
         let cfg = self.cfg;
         let q_out_dim = cfg.n_heads * cfg.head_dim;
         let kv_dim = cfg.n_kv_heads * cfg.head_dim;
-        eprintln!("  loading layer {layer_idx}/{} (ParoQuant LLaMA/Qwen3)...", cfg.n_layers);
+        eprintln!(
+            "  loading layer {layer_idx}/{} (ParoQuant LLaMA/Qwen3)...",
+            cfg.n_layers
+        );
         let mut b = crate::weight_backend::ParoBackend {
             source: self.source,
             gpu,

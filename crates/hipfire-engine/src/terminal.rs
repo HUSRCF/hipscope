@@ -40,7 +40,6 @@ pub struct ActiveTerminalControl {
     pub ready: bool,
     pub decision: Option<TerminalControlDecision>,
     pub terminal_claimed: bool,
-
 }
 pub struct TerminalControlState {
     pub active: Option<ActiveTerminalControl>,
@@ -448,7 +447,11 @@ pub fn batch_lane_at_capacity(seq_pos: usize, lane_capacity: usize) -> bool {
 /// `lane_capacity`. Uses `saturating_add` so `u64::MAX` never wraps under the cap.
 /// Returns `true` when the request exceeds capacity (must be rejected before
 /// `gen_start`/GPU).
-pub fn batch_lfm_exceeds_capacity(prompt_len: usize, max_tokens: usize, lane_capacity: usize) -> bool {
+pub fn batch_lfm_exceeds_capacity(
+    prompt_len: usize,
+    max_tokens: usize,
+    lane_capacity: usize,
+) -> bool {
     prompt_len.saturating_add(max_tokens) > lane_capacity
 }
 
@@ -714,7 +717,10 @@ pub fn await_client_terminal_commit(
 /// Emit a previously staged `done` envelope after Commit. Payload must be the
 /// same value passed to [`await_client_terminal_commit`] as `pending_done`.
 /// A matching active attempt may claim only one terminal envelope.
-pub fn emit_staged_terminal_done(stdout: &mut impl std::io::Write, pending_done: &serde_json::Value) {
+pub fn emit_staged_terminal_done(
+    stdout: &mut impl std::io::Write,
+    pending_done: &serde_json::Value,
+) {
     if let Some(obj) = pending_done.as_object() {
         if let Some(id) = obj.get("id").and_then(|value| value.as_str()) {
             let attempt_id = obj

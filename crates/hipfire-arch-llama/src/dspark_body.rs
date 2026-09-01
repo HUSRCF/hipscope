@@ -210,7 +210,6 @@ impl DsparkLoadStaging {
     }
 }
 
-
 // ── Public loader ─────────────────────────────────────────────────────────────
 
 /// Load the Qwen3-8B DSpark sidecar into `(DsparkWeights, Qwen3DrafterAssets)`.
@@ -317,9 +316,7 @@ pub fn load_qwen3_dspark(
             )?);
             let (info, data) = source
                 .tensor_data_pread("confidence_head.proj.bias")
-                .ok_or_else(|| {
-                    "qwen3_dspark: confidence_head.proj.bias missing".to_string()
-                })?;
+                .ok_or_else(|| "qwen3_dspark: confidence_head.proj.bias missing".to_string())?;
             staged.globals.confidence_bias = Some(
                 dequant_f32(gpu, info.quant_type, &data, 1)
                     .map_err(|e| format!("qwen3_dspark: confidence_head.proj.bias: {e:?}"))?,
@@ -332,13 +329,8 @@ pub fn load_qwen3_dspark(
             let (info, data) = source
                 .tensor_data_pread("d2t")
                 .ok_or_else(|| "qwen3_dspark: d2t missing but draft_vocab_size>0".to_string())?;
-            let dev = dequant_f32(
-                gpu,
-                info.quant_type,
-                &data,
-                dspark_cfg.draft_vocab_size,
-            )
-            .map_err(|e| format!("qwen3_dspark: d2t dequant: {e:?}"))?;
+            let dev = dequant_f32(gpu, info.quant_type, &data, dspark_cfg.draft_vocab_size)
+                .map_err(|e| format!("qwen3_dspark: d2t dequant: {e:?}"))?;
             let host = match gpu.download_f32(&dev) {
                 Ok(host) => host,
                 Err(error) => {
@@ -685,15 +677,9 @@ impl Qwen3DsparkScratch {
                 pbs: pbs.take().expect("staged DSpark PBS"),
                 all_k: allocations.next().expect("staged DSpark all_k"),
                 all_v: allocations.next().expect("staged DSpark all_v"),
-                positions_kv_all: allocations
-                    .next()
-                    .expect("staged DSpark positions_kv_all"),
-                positions_q_block: allocations
-                    .next()
-                    .expect("staged DSpark positions_q_block"),
-                positions_compact: allocations
-                    .next()
-                    .expect("staged DSpark positions_compact"),
+                positions_kv_all: allocations.next().expect("staged DSpark positions_kv_all"),
+                positions_q_block: allocations.next().expect("staged DSpark positions_q_block"),
+                positions_compact: allocations.next().expect("staged DSpark positions_compact"),
                 bias: allocations.next().expect("staged DSpark bias"),
             })
         })();
@@ -1424,13 +1410,12 @@ pub fn build_qwen3_dspark_body(
     gpu: &mut Gpu,
 ) -> Result<Box<dyn DsparkBody>, String> {
     let max_ctx_len = cfg.block_size + 1;
-    let scratch =
-        match Qwen3DsparkScratch::new(gpu, &assets.config, cfg.block_size, max_ctx_len) {
-            Ok(scratch) => scratch,
-            Err(error) => {
-                assets.free_gpu(gpu);
-                return Err(format!("build_qwen3_dspark_body: scratch: {error}"));
-            }
-        };
+    let scratch = match Qwen3DsparkScratch::new(gpu, &assets.config, cfg.block_size, max_ctx_len) {
+        Ok(scratch) => scratch,
+        Err(error) => {
+            assets.free_gpu(gpu);
+            return Err(format!("build_qwen3_dspark_body: scratch: {error}"));
+        }
+    };
     Ok(Box::new(Qwen3DsparkBody { assets, scratch }))
 }

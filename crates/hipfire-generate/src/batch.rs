@@ -724,22 +724,12 @@ pub fn drive_qwen_continuous_batch(
             }
 
             if let Err(e) = batch_state.reset_lane(gpu, &config, lane_idx) {
-                return fail_all(
-                    sched,
-                    gpu,
-                    stdout,
-                    format!("reset lane {lane_idx}: {e}"),
-                );
+                return fail_all(sched, gpu, stdout, format!("reset lane {lane_idx}: {e}"));
             }
             if let Err(e) =
                 batch_state.prefill_lane(gpu, &weights, &config, &scratch, lane_idx, &prompt_tokens)
             {
-                return fail_all(
-                    sched,
-                    gpu,
-                    stdout,
-                    format!("prefill lane {lane_idx}: {e}"),
-                );
+                return fail_all(sched, gpu, stdout, format!("prefill lane {lane_idx}: {e}"));
             }
             let hist: &[u32] = &[];
             let lane_rng = match &sched.lanes[lane_idx] {
@@ -762,12 +752,7 @@ pub fn drive_qwen_continuous_batch(
             ) {
                 Ok(v) => v,
                 Err(e) => {
-                    return fail_all(
-                        sched,
-                        gpu,
-                        stdout,
-                        format!("sample lane {lane_idx}: {e}"),
-                    )
+                    return fail_all(sched, gpu, stdout, format!("sample lane {lane_idx}: {e}"))
                 }
             };
             if let BatchLane::Running(lane) = &mut sched.lanes[lane_idx] {
@@ -851,12 +836,7 @@ pub fn drive_qwen_continuous_batch(
             batch_state,
             &scratch,
         ) {
-            return fail_all(
-                sched,
-                gpu,
-                stdout,
-                format!("forward_decode_batch: {e}"),
-            );
+            return fail_all(sched, gpu, stdout, format!("forward_decode_batch: {e}"));
         }
         let mut repeat_tokens: Vec<u32> = vec![0; batch_size * batch_state.sample_repeat_capacity];
         let mut repeat_lengths: Vec<u32> = vec![0; batch_size];
@@ -1122,14 +1102,7 @@ pub fn drive_qwen_continuous_batch(
             sampling.frequency_penalty,
         ) {
             Ok(v) => v,
-            Err(e) => {
-                return fail_all(
-                    sched,
-                    gpu,
-                    stdout,
-                    format!("sample_product: {e}"),
-                )
-            }
+            Err(e) => return fail_all(sched, gpu, stdout, format!("sample_product: {e}")),
         };
         for lane_idx in survivors.iter() {
             let (tok, rng) = sampled[*lane_idx];

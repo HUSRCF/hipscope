@@ -1142,15 +1142,15 @@ pub fn generate_vl(
                         &mut m.speculator,
                     );
                     return;
+                }
             }
-        }
         }
         if vl_adaptive_downshift_fail_closed(
             &mut m.kv_adaptive,
             &mut m.seq_pos,
             gpu,
-            kv,
             dn,
+            kv,
             &mut m.conversation_tokens,
             &mut m.prefill_checkpoints,
             &mut m.dflash_checkpoints,
@@ -1310,15 +1310,15 @@ pub fn generate_vl(
                                         &mut m.speculator,
                                     );
                                     return;
+                                }
                             }
-                        }
                         }
                         if vl_adaptive_downshift_fail_closed(
                             &mut m.kv_adaptive,
                             &mut m.seq_pos,
                             gpu,
-                            kv,
                             dn,
+                            kv,
                             &mut m.conversation_tokens,
                             &mut m.prefill_checkpoints,
                             &mut m.dflash_checkpoints,
@@ -1465,8 +1465,8 @@ pub fn generate_vl(
                             &mut m.speculator,
                         );
                         return;
+                    }
                 }
-            }
             }
             if vl_adaptive_downshift_fail_closed(
                 &mut m.kv_adaptive,

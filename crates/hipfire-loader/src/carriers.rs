@@ -10,6 +10,7 @@ use crate::{
     finish_qwen35_load, resolve_chat_template, resolve_chat_template_overrides, LoadedModel,
 };
 use hipfire_arch_minimax::{config_from_safetensors, load_weights_from_safetensors, MiniMaxState};
+use hipfire_runtime::arch_model::ArchModel;
 use hipfire_runtime::kv_backend::KvBackend;
 use hipfire_runtime::llama::KvCacheExt;
 use hipfire_runtime::loader_api::{LoadCtx, ModelSource};
@@ -964,18 +965,21 @@ impl Carrier for LlamaCarrier {
                     }
                     // Drop the peek handle before the builder reopens it.
                     drop(draft_hfq);
-                    let spec = match hipfire_runtime::dflash_generic::build_generic_dflash_speculator(
-                        ctx.gpu,
-                        dp,
-                        &mut bundle,
-                        ctx.max_seq,
-                    ) {
-                        Ok(spec) => spec,
-                        Err(error) => {
-                            Box::new(bundle).free_gpu(ctx.gpu);
-                            return Err(format!("DFlash generic speculator build failed: {error}"));
-                        }
-                    };
+                    let spec =
+                        match hipfire_runtime::dflash_generic::build_generic_dflash_speculator(
+                            ctx.gpu,
+                            dp,
+                            &mut bundle,
+                            ctx.max_seq,
+                        ) {
+                            Ok(spec) => spec,
+                            Err(error) => {
+                                Box::new(bundle).free_gpu(ctx.gpu);
+                                return Err(format!(
+                                    "DFlash generic speculator build failed: {error}"
+                                ));
+                            }
+                        };
                     eprintln!(
                         "  DFlash generic speculator loaded for arch {} target: {}",
                         meta.arch_id, dp

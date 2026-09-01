@@ -1036,15 +1036,8 @@ pub fn run_heads(
             if let (Some(chain), Some(argmax_scratch)) =
                 (staged.chain.as_ref(), staged.argmax_scratch.as_ref())
             {
-                gpu.argmax_token_chain_f32(
-                    &row,
-                    argmax_scratch,
-                    chain,
-                    None,
-                    vocab,
-                    i + 1,
-                )
-                .map_err(|e| format!("run_heads markov argmax chain {i}: {e:?}"))?;
+                gpu.argmax_token_chain_f32(&row, argmax_scratch, chain, None, vocab, i + 1)
+                    .map_err(|e| format!("run_heads markov argmax chain {i}: {e:?}"))?;
             } else {
                 let draft_id = gpu
                     .argmax_f32(&row, vocab)
@@ -1148,6 +1141,7 @@ pub struct DsparkDrafter {
     owns_lm_head: bool,
     block: usize,
     ctx_capacity: usize,
+    conf_threshold: f32,
     /// Whether the target supports distribution-preserving sampled verify
     /// ([`SpecTarget::verify_block_sampled_capture_gpu`]). Set per-arch at build
     /// time (llama/qwen3: true; deepseek4: false until its sampled head lands).

@@ -1044,9 +1044,10 @@ pub fn build_generic_dflash_speculator(
     let draft_hfq = HfqFile::open(Path::new(draft_hfq_path)).map_err(|e| format!("{e}"))?;
     let config = DflashConfig::from_hfq(&draft_hfq)
         .ok_or_else(|| "draft: failed to parse DflashConfig from HFQ metadata".to_string())?;
-    let mut weights = Some(DflashWeights::load(gpu, &draft_hfq, &config).map_err(|error| {
-        format!("draft weights: {error}")
-    })?);
+    let mut weights = Some(
+        DflashWeights::load(gpu, &draft_hfq, &config)
+            .map_err(|error| format!("draft weights: {error}"))?,
+    );
     let block_size = config.block_size;
     // L3: F16 drafts (dflash_convert) → has_mq=false → DflashScratch::new.
     // new_with_mq only for an MQ-quantized draft. Keep the loaded weights in

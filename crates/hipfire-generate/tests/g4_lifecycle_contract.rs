@@ -24,8 +24,8 @@ use hipfire_generate::ar::GenerationRoute;
 use hipfire_generate::common::attest_rollback_steps;
 use hipfire_runtime::dflash::TargetHiddenLog;
 use hipfire_runtime::kv_adaptive::{KvAdaptive, Preset};
-use hipfire_runtime::loader_api::{CaskConfig, SpecLoadCfg};
 use hipfire_runtime::llama::{EmbeddingFormat, WeightTensor};
+use hipfire_runtime::loader_api::{CaskConfig, SpecLoadCfg};
 use hipfire_runtime::model_load::WeightSource;
 use rdna_compute::{Gpu, GpuTensor};
 
@@ -93,7 +93,10 @@ impl ResetHarness {
     /// Model the observable part of the loader-owned adapter matrix. Each lane
     /// is attempted even after another lane reports an error; successful lanes
     /// clear request state, while persistent policy/scratch identity remains.
-    fn reset_via_loader_adapter(&mut self, failures: &[usize]) -> hipfire_generate::common::RollbackEpilogue {
+    fn reset_via_loader_adapter(
+        &mut self,
+        failures: &[usize],
+    ) -> hipfire_generate::common::RollbackEpilogue {
         self.seq_pos = 0;
         self.conversation_tokens.clear();
         let failures: BTreeSet<usize> = failures.iter().copied().collect();
@@ -165,7 +168,11 @@ fn loader_owned_reset_matrix_aggregates_failures_and_visits_every_lane() {
         let failing_lane = shape.lane_count().saturating_sub(1);
         let mut harness = ResetHarness::new(shape);
         let epilogue = harness.reset_via_loader_adapter(&[failing_lane]);
-        assert!(!epilogue.rolled_back, "failed {} reset cannot attest", shape.label());
+        assert!(
+            !epilogue.rolled_back,
+            "failed {} reset cannot attest",
+            shape.label()
+        );
         let context = epilogue.context.expect("failure context");
         assert!(
             context.contains(&format!("lane {failing_lane}")),
@@ -204,7 +211,6 @@ fn loader_owned_reset_is_scoped_to_one_batch_lane() {
 
 // ── eviction policy/request state isolation ────────────────────────────────
 
-#[derive(Debug)]
 struct EvictionRequestState {
     seq_pos: usize,
     compact_offset: i32,
@@ -253,7 +259,7 @@ fn eviction_policy_scratch_counter_identity_survives_reset() {
     let mut request = EvictionRequestState::seeded();
 
     adaptive.cur_k = hipfire_runtime::kv_adaptive::KMode::Fwht2;
-    adaptive.cur_v = hipfire_runtime::kv_adaptive::VMode::Lloyd2;
+    adaptive.cur_v = hipfire_runtime::llama::VMode::Lloyd2;
     adaptive.next_step = adaptive.steps.len();
     request.reset();
     adaptive.reset();
@@ -264,7 +270,11 @@ fn eviction_policy_scratch_counter_identity_survives_reset() {
     assert!(!gate.load(std::sync::atomic::Ordering::Acquire));
     assert_eq!(Arc::as_ptr(&policy), policy_ptr);
     assert_eq!(Arc::as_ptr(&scratch), scratch_ptr);
-    assert_eq!(eviction_count.get(), 4, "counter is model-lifetime telemetry");
+    assert_eq!(
+        eviction_count.get(),
+        4,
+        "counter is model-lifetime telemetry"
+    );
     assert_eq!(request.seq_pos, 0);
     assert_eq!(request.compact_offset, 0);
     assert_eq!(request.adaptive_step, 0);
@@ -346,10 +356,7 @@ fn emit_family_gen_start(family: WriterFamily, output: &mut Vec<u8>, id: &str) {
             id,
             hipfire_runtime::prompt_frame::ThinkMode::NonThink,
         ),
-        WriterFamily::Single
-        | WriterFamily::Batch
-        | WriterFamily::Vl
-        | WriterFamily::Glimmer => {
+        WriterFamily::Single | WriterFamily::Batch | WriterFamily::Vl | WriterFamily::Glimmer => {
             let contract = if matches!(family, WriterFamily::Single | WriterFamily::Vl) {
                 Some(2)
             } else {
@@ -393,7 +400,10 @@ fn parse_json_lines(bytes: &[u8]) -> Vec<serde_json::Value> {
 
 #[test]
 fn all_generation_routes_are_named_once_and_writer_families_are_in_all() {
-    let names: BTreeSet<&str> = GenerationRoute::ALL.iter().map(|route| route.name()).collect();
+    let names: BTreeSet<&str> = GenerationRoute::ALL
+        .iter()
+        .map(|route| route.name())
+        .collect();
     assert_eq!(names.len(), GenerationRoute::ALL.len());
     for family in [
         WriterFamily::Single,
@@ -420,7 +430,11 @@ fn concrete_generation_writers_emit_gen_start_first_and_claim_one_terminal() {
         WriterFamily::Vl,
         WriterFamily::Glimmer,
     ];
-    let writers = [TerminalWriter::Done, TerminalWriter::Error, TerminalWriter::Cancel];
+    let writers = [
+        TerminalWriter::Done,
+        TerminalWriter::Error,
+        TerminalWriter::Cancel,
+    ];
 
     for (family_idx, family) in families.into_iter().enumerate() {
         for (writer_idx, winner) in writers.into_iter().enumerate() {
@@ -480,7 +494,10 @@ fn concrete_generation_writers_emit_gen_start_first_and_claim_one_terminal() {
                     assert_eq!(terminal_types.iter().filter(|t| **t == "error").count(), 1)
                 }
                 TerminalWriter::Cancel => {
-                    assert_eq!(terminal_types.iter().filter(|t| **t == "aborted").count(), 1);
+                    assert_eq!(
+                        terminal_types.iter().filter(|t| **t == "aborted").count(),
+                        1
+                    );
                     assert_eq!(terminal_types.iter().filter(|t| **t == "done").count(), 1);
                 }
             }
@@ -519,7 +536,10 @@ impl<S> FaultingSource<S> {
 
     fn fail(&self, stage: WeightFaultStage) -> hip_bridge::HipResult<()> {
         if self.stage == stage {
-            Err(hip_bridge::HipError::new(0x4734, &format!("G4 fault at {stage:?}")))
+            Err(hip_bridge::HipError::new(
+                0x4734,
+                &format!("G4 fault at {stage:?}"),
+            ))
         } else {
             Ok(())
         }
@@ -558,7 +578,11 @@ impl<S: WeightSource> WeightSource for FaultingSource<S> {
         self.inner.read_output(gpu, embd, embd_fmt, can_alias)
     }
 
-    fn read_layer(&mut self, gpu: &mut Gpu, layer_idx: usize) -> hip_bridge::HipResult<Self::Layer> {
+    fn read_layer(
+        &mut self,
+        gpu: &mut Gpu,
+        layer_idx: usize,
+    ) -> hip_bridge::HipResult<Self::Layer> {
         self.fail(WeightFaultStage::Layer(layer_idx))?;
         self.inner.read_layer(gpu, layer_idx)
     }
@@ -569,13 +593,20 @@ impl<S: WeightSource> WeightSource for FaultingSource<S> {
 }
 
 fn required_path(var: &str) -> PathBuf {
-    PathBuf::from(std::env::var(var).unwrap_or_else(|_| panic!("set {var} for ignored G4 GPU test")))
+    PathBuf::from(
+        std::env::var(var).unwrap_or_else(|_| panic!("set {var} for ignored G4 GPU test")),
+    )
 }
 
 fn assert_gpu_baseline(gpu: &mut Gpu, baseline: usize) {
-    gpu.ensure_vmm_cleaned().expect("VMM cleanup after lifecycle attempt");
+    gpu.ensure_vmm_cleaned()
+        .expect("VMM cleanup after lifecycle attempt");
     gpu.drain_pool();
-    assert_eq!(gpu.vmm_allocation_count(), baseline, "VMM owner leaked across lifecycle attempt");
+    assert_eq!(
+        gpu.vmm_allocation_count(),
+        baseline,
+        "VMM owner leaked across lifecycle attempt"
+    );
 }
 
 #[test]
@@ -583,7 +614,10 @@ fn assert_gpu_baseline(gpu: &mut Gpu, baseline: usize) {
 fn gpu_hfq_staged_failure_sweep_then_success_repeated_unload() {
     let path = required_path("HIPFIRE_G4_HFQ_FIXTURE");
     let mut gpu = Gpu::init().expect("HIP device");
-    assert_eq!(gpu.arch, "gfx1151", "G4 fixture is certified only on gfx1151");
+    assert_eq!(
+        gpu.arch, "gfx1151",
+        "G4 fixture is certified only on gfx1151"
+    );
     let baseline = gpu.vmm_allocation_count();
 
     // Warm baseline and two complete unload cycles prove publication ownership,
@@ -642,7 +676,10 @@ fn gpu_hfq_staged_failure_sweep_then_success_repeated_unload() {
 fn gpu_paro_staged_failure_sweep_then_success_repeated_unload() {
     let path = required_path("HIPFIRE_G4_PARO_DIR");
     let mut gpu = Gpu::init().expect("HIP device");
-    assert_eq!(gpu.arch, "gfx1151", "G4 fixture is certified only on gfx1151");
+    assert_eq!(
+        gpu.arch, "gfx1151",
+        "G4 fixture is certified only on gfx1151"
+    );
     let baseline = gpu.vmm_allocation_count();
 
     for stage in [
@@ -656,8 +693,8 @@ fn gpu_paro_staged_failure_sweep_then_success_repeated_unload() {
             .expect("ParoQuant fixture");
         let cfg = hipfire_arch_qwen35::qwen35::config_from_safetensors(&source_file)
             .expect("Paro config");
-        let source = hipfire_arch_qwen35::qwen35::ParoSource::new(&source_file, &cfg)
-            .expect("Paro source");
+        let source =
+            hipfire_arch_qwen35::qwen35::ParoSource::new(&source_file, &cfg).expect("Paro source");
         let mut source = FaultingSource::new(source, stage);
         let result = hipfire_arch_qwen35::qwen35::load_weights(
             &mut source,
@@ -671,8 +708,8 @@ fn gpu_paro_staged_failure_sweep_then_success_repeated_unload() {
             .expect("ParoQuant fixture");
         let cfg = hipfire_arch_qwen35::qwen35::config_from_safetensors(&source_file)
             .expect("Paro config");
-        let mut source = hipfire_arch_qwen35::qwen35::ParoSource::new(&source_file, &cfg)
-            .expect("Paro source");
+        let mut source =
+            hipfire_arch_qwen35::qwen35::ParoSource::new(&source_file, &cfg).expect("Paro source");
         let weights = hipfire_arch_qwen35::qwen35::load_weights(
             &mut source,
             std::slice::from_mut(&mut gpu),
@@ -710,12 +747,7 @@ fn load_and_unload_model(gpu: &mut Gpu, target: &Path, draft: Option<&Path>, spe
     hipfire_loader::unload_model(model, gpu).expect("model unload");
 }
 
-fn expect_load_failure(
-    gpu: &mut Gpu,
-    target: &Path,
-    draft: Option<&Path>,
-    spec: SpecLoadCfg,
-) {
+fn expect_load_failure(gpu: &mut Gpu, target: &Path, draft: Option<&Path>, spec: SpecLoadCfg) {
     match try_load_model(gpu, target, draft, spec) {
         Err(error) => assert!(
             !error.is_empty(),
@@ -739,7 +771,10 @@ fn gpu_dflash_dspark_target_verify_and_head_failures_recover_without_double_free
     let dspark_fault = required_path("HIPFIRE_G4_DSPARK_HEAD_FAILURE");
 
     let mut gpu = Gpu::init().expect("HIP device");
-    assert_eq!(gpu.arch, "gfx1151", "G4 fixtures are certified only on gfx1151");
+    assert_eq!(
+        gpu.arch, "gfx1151",
+        "G4 fixtures are certified only on gfx1151"
+    );
     let baseline = gpu.vmm_allocation_count();
 
     load_and_unload_model(

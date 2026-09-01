@@ -3902,16 +3902,14 @@ fn qwen35_pp_rollback(
     dflash_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
     asst_turn_cache: &mut AsstTurnCache,
     gpu: &mut rdna_compute::Gpu,
-    bundle: Option<&mut hipfire_arch_qwen35::Qwen35Bundle>,
-    gpus: Option<&mut hipfire_runtime::multi_gpu::Gpus>,
+    mut bundle: Option<&mut hipfire_arch_qwen35::Qwen35Bundle>,
+    mut gpus: Option<&mut hipfire_runtime::multi_gpu::Gpus>,
     layer_owner_map: Option<&[u8]>,
 ) -> RollbackEpilogue {
     let mut target_reset = |_: &mut rdna_compute::Gpu| {
-        let (Some(bundle), Some(gpus), Some(layer_owner_map)) = (
-            bundle.as_deref_mut(),
-            gpus.as_deref_mut(),
-            layer_owner_map,
-        ) else {
+        let (Some(bundle), Some(gpus), Some(layer_owner_map)) =
+            (bundle.as_deref_mut(), gpus.as_deref_mut(), layer_owner_map)
+        else {
             return Err("qwen35 PP rollback owners are incomplete".to_string());
         };
         reset_qwen35_recurrent_pp(bundle, gpus, layer_owner_map)
@@ -4236,8 +4234,7 @@ pub fn generate_multi(
     // same PP adapter used by all fail-closed paths.
     if try_jinja && m.seq_pos > 0 {
         let bundle = m.state.as_mut().and_then(|state| {
-            (state.as_mut() as &mut dyn Any)
-                .downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
+            (state.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
         });
         let gpus = m.pp_gpus.as_mut();
         let layer_owner_map = m.pp_dn_la_to_device.as_deref();
@@ -4319,7 +4316,6 @@ pub fn generate_multi(
     let dn = &mut b.dn_state;
     let gpus = m.pp_gpus.as_mut().unwrap();
     let dn_la_to_device = m.pp_dn_la_to_device.as_ref().unwrap();
-
 
     let dev_last = gpus.output_device;
     let vocab_size = config.vocab_size;

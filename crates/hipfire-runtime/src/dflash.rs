@@ -998,9 +998,7 @@ impl DflashWeights {
                         q => {
                             return Err(hip_bridge::HipError::new(
                                 0,
-                                &format!(
-                                    "selector codebook {n} unsupported quant_type {q}"
-                                ),
+                                &format!("selector codebook {n} unsupported quant_type {q}"),
                             ));
                         }
                     }
@@ -1022,12 +1020,7 @@ impl DflashWeights {
                 "hidden_norm.weight",
                 vec![cfg.hidden],
             )?);
-            staged.norm = Some(hfq_tensor_f32(
-                hfq,
-                gpu,
-                "norm.weight",
-                vec![cfg.hidden],
-            )?);
+            staged.norm = Some(hfq_tensor_f32(hfq, gpu, "norm.weight", vec![cfg.hidden])?);
 
             let conv_k = cfg.conv_kernel_size.unwrap_or(2);
             let conv_g = cfg.conv_group_size.unwrap_or(16);
@@ -1129,7 +1122,10 @@ impl DflashWeights {
 
             Ok(DflashWeights {
                 fc: staged.fc.take().expect("staged DFlash fc"),
-                hidden_norm: staged.hidden_norm.take().expect("staged DFlash hidden_norm"),
+                hidden_norm: staged
+                    .hidden_norm
+                    .take()
+                    .expect("staged DFlash hidden_norm"),
                 norm: staged.norm.take().expect("staged DFlash norm"),
                 layers: std::mem::take(&mut staged.layers),
                 has_mq,

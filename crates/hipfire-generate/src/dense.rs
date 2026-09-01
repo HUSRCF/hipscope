@@ -3595,9 +3595,8 @@ pub fn reconcile_glimmer_mirror(
                     eprintln!(
                         "[glimmer-cache] rewind_session_to({new_len}) failed; resetting via ArchModel: {error}"
                     );
-                    let _ = hipfire_runtime::arch_model::ArchModel::reset_session_state(
-                        bundle, gpu,
-                    );
+                    let _ =
+                        hipfire_runtime::arch_model::ArchModel::reset_session_state(bundle, gpu);
                     conversation_tokens.clear();
                     *seq_pos = 0;
                     GlimmerMirrorReconcile::Reset
@@ -6120,12 +6119,7 @@ pub fn generate_muse_glimmer(
             }
         }
     }
-    let _ = reconcile_glimmer_mirror(
-        bundle,
-        &mut m.conversation_tokens,
-        &mut m.seq_pos,
-        gpu,
-    );
+    let _ = reconcile_glimmer_mirror(bundle, &mut m.conversation_tokens, &mut m.seq_pos, gpu);
 
     let decode_ms = decode_t0.elapsed().as_millis().max(1);
     let total_ms = t0.elapsed().as_millis().max(1);
@@ -7856,23 +7850,25 @@ pub fn generate_qwen2(
     let prompt_ids = {
         let tokenizer = m.tokenizer.as_ref().unwrap();
         if let Some(template) = m.chat_template.as_ref() {
-        let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
-            tokenizer,
-            template,
-            system: _system_prompt,
-            user: prompt,
-            enable_thinking: true,
-            bos_token: None,
-            reasoning_strength: None,
-            reasoning_effort: None,
-        };
-        match frame.render() {
-            Ok(rendered) => tokenizer.encode(&rendered),
-            Err(e) => {
-                eprintln!("[daemon] qwen2 jinja render failed ({e}) — falling back to raw encode");
-                tokenizer.encode(prompt)
+            let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
+                tokenizer,
+                template,
+                system: _system_prompt,
+                user: prompt,
+                enable_thinking: true,
+                bos_token: None,
+                reasoning_strength: None,
+                reasoning_effort: None,
+            };
+            match frame.render() {
+                Ok(rendered) => tokenizer.encode(&rendered),
+                Err(e) => {
+                    eprintln!(
+                        "[daemon] qwen2 jinja render failed ({e}) — falling back to raw encode"
+                    );
+                    tokenizer.encode(prompt)
+                }
             }
-        }
         } else {
             tokenizer.encode(prompt)
         }
@@ -7892,12 +7888,13 @@ pub fn generate_qwen2(
 
     // Capacity guard. No eviction on arch_id=7 yet — reset state when
     // the requested run would overflow the KV budget.
-    let (next_pos, state_max_seq) = match m.state.as_ref().and_then(|s| {
-        (s.as_ref() as &dyn Any).downcast_ref::<hipfire_arch_qwen2::Qwen2Bundle>()
-    }) {
-        Some(b) => (b.state.next_pos, b.state.max_seq),
-        None => unreachable!("qwen2 state disappeared during capacity validation"),
-    };
+    let (next_pos, state_max_seq) =
+        match m.state.as_ref().and_then(|s| {
+            (s.as_ref() as &dyn Any).downcast_ref::<hipfire_arch_qwen2::Qwen2Bundle>()
+        }) {
+            Some(b) => (b.state.next_pos, b.state.max_seq),
+            None => unreachable!("qwen2 state disappeared during capacity validation"),
+        };
     if next_pos
         .saturating_add(prompt_ids.len())
         .saturating_add(max_tokens)
@@ -8493,7 +8490,14 @@ pub fn generate_maple(
         gpu,
     );
     if !ep.rolled_back {
-        emit_fail_closed_error(stdout, Some(id), "maple state reset failed", "gpu", true, &ep);
+        emit_fail_closed_error(
+            stdout,
+            Some(id),
+            "maple state reset failed",
+            "gpu",
+            true,
+            &ep,
+        );
         return;
     }
 

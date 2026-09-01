@@ -10,9 +10,9 @@ use crate::qwen35::{
     DeltaNetLayerWeights, DeltaNetMoeLayerWeights, FullAttnLayerWeights, FullAttnMoeLayerWeights,
     LayerType, LayerWeights, MoeFfnWeights, Qwen35Config,
 };
+use hip_bridge::HipResult;
 use hipfire_runtime::llama::WeightTensor;
 use hipfire_runtime::weight_backend::WeightBackend;
-use hip_bridge::HipResult;
 use rdna_compute::{Gpu, GpuTensor};
 
 #[derive(Default)]
@@ -103,11 +103,7 @@ pub(crate) fn load_layer<B: WeightBackend>(
         match (config.layer_types[layer_idx], is_moe) {
             (LayerType::LinearAttention, false) => {
                 staged.attn_norm = Some(b.norm("input_layernorm.weight", &[config.dim])?);
-                staged.wqkv = Some(b.proj(
-                    "linear_attn.in_proj_qkv",
-                    qkv_dim,
-                    config.dim,
-                )?);
+                staged.wqkv = Some(b.proj("linear_attn.in_proj_qkv", qkv_dim, config.dim)?);
                 staged.wz = Some(b.proj("linear_attn.in_proj_z", d_inner, config.dim)?);
                 staged.w_alpha = Some(b.proj(
                     "linear_attn.in_proj_a",
@@ -119,22 +115,15 @@ pub(crate) fn load_layer<B: WeightBackend>(
                     config.linear_num_value_heads,
                     config.dim,
                 )?);
-                staged.a_log = Some(b.raw_f32(
-                    "linear_attn.A_log",
-                    config.linear_num_value_heads,
-                )?);
-                staged.dt_bias = Some(b.raw_f32(
-                    "linear_attn.dt_bias",
-                    config.linear_num_value_heads,
-                )?);
+                staged.a_log = Some(b.raw_f32("linear_attn.A_log", config.linear_num_value_heads)?);
+                staged.dt_bias =
+                    Some(b.raw_f32("linear_attn.dt_bias", config.linear_num_value_heads)?);
                 staged.conv_weight = Some(b.raw_f32(
                     "linear_attn.conv1d.weight",
                     qkv_dim * config.conv_kernel_dim,
                 )?);
-                staged.norm_weight = Some(b.raw_f32(
-                    "linear_attn.norm.weight",
-                    config.linear_value_head_dim,
-                )?);
+                staged.norm_weight =
+                    Some(b.raw_f32("linear_attn.norm.weight", config.linear_value_head_dim)?);
                 staged.wo = Some(b.proj("linear_attn.out_proj", config.dim, d_inner)?);
                 staged.ffn_norm = Some(b.norm("post_attention_layernorm.weight", &[config.dim])?);
                 staged.w_gate = Some(b.proj("mlp.gate_proj", config.hidden_dim, config.dim)?);
@@ -185,11 +174,7 @@ pub(crate) fn load_layer<B: WeightBackend>(
             }
             (LayerType::LinearAttention, true) => {
                 staged.attn_norm = Some(b.norm("input_layernorm.weight", &[config.dim])?);
-                staged.wqkv = Some(b.proj(
-                    "linear_attn.in_proj_qkv",
-                    qkv_dim,
-                    config.dim,
-                )?);
+                staged.wqkv = Some(b.proj("linear_attn.in_proj_qkv", qkv_dim, config.dim)?);
                 staged.wz = Some(b.proj("linear_attn.in_proj_z", d_inner, config.dim)?);
                 staged.w_alpha = Some(b.proj(
                     "linear_attn.in_proj_a",
@@ -201,22 +186,15 @@ pub(crate) fn load_layer<B: WeightBackend>(
                     config.linear_num_value_heads,
                     config.dim,
                 )?);
-                staged.a_log = Some(b.raw_f32(
-                    "linear_attn.A_log",
-                    config.linear_num_value_heads,
-                )?);
-                staged.dt_bias = Some(b.raw_f32(
-                    "linear_attn.dt_bias",
-                    config.linear_num_value_heads,
-                )?);
+                staged.a_log = Some(b.raw_f32("linear_attn.A_log", config.linear_num_value_heads)?);
+                staged.dt_bias =
+                    Some(b.raw_f32("linear_attn.dt_bias", config.linear_num_value_heads)?);
                 staged.conv_weight = Some(b.raw_f32(
                     "linear_attn.conv1d.weight",
                     qkv_dim * config.conv_kernel_dim,
                 )?);
-                staged.norm_weight = Some(b.raw_f32(
-                    "linear_attn.norm.weight",
-                    config.linear_value_head_dim,
-                )?);
+                staged.norm_weight =
+                    Some(b.raw_f32("linear_attn.norm.weight", config.linear_value_head_dim)?);
                 staged.wo = Some(b.proj("linear_attn.out_proj", config.dim, d_inner)?);
                 staged.ffn_norm = Some(b.norm("post_attention_layernorm.weight", &[config.dim])?);
                 staged.ffn = Some(load_moe(b, config, layer_idx)?);
