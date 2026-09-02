@@ -21,25 +21,24 @@
 - [ ] `./scripts/no-gpu-ci.sh` passes, or equivalent CI job is green
 - [ ] `cargo build --release --workspace --features deltanet` clean
 - [ ] `cargo test --lib --workspace --features deltanet` passes
-- [ ] **Change gate run and telemetry pasted below.** `python3 -m tools.change_gate plan --base beta`
-      shows what your diff actually owes and what it costs; `run --md gate.md` executes it and emits the
-      report. The gate selects routes from the diff, so an unrelated change does not owe a model battery.
+- [ ] **hw-gate** runs automatically once a maintainer applies the `hw-run` label (required CI check; see [`docs/VALIDATION.md`](../docs/VALIDATION.md) § hw-gate)
+- [ ] I read the decoded text in the hw-gate evidence comment
+- [ ] **Loader / daemon / runtime-load changes:** I ran `hipfire run <flagship tag>` locally on hardware and pasted the decoded output below
 - [ ] If perf-relevant: `./scripts/speed-gate.sh` within ±2% of locked baselines
-- [ ] Any route reported `blocked` (absent model, wrong arch) is **acknowledged below**, not ignored —
-      a blocked route makes the gate verdict `incomplete`, which is not a pass.
 
-<details><summary>change_gate telemetry</summary>
+<details><summary>local hipfire run decoded output (loader/daemon/runtime-load)</summary>
 
 ```
-paste `python3 -m tools.change_gate run --base beta --md -` output here
+paste decoded assistant text from a local `hipfire run <flagship tag>` here
 ```
 
 </details>
 
-Route selection is defined in [`tools/change_gate/routes.py`](../tools/change_gate/routes.py) and route
-policy in [`docs/VALIDATION.md`](../docs/VALIDATION.md). The retired `scripts/coherence-gate*.sh`
-batteries are **not** acceptance evidence and no longer exist in-tree. Adding coverage means adding a
-`Route` + `Rule` there, not resurrecting a fixed battery.
+Route policy lives in [`docs/VALIDATION.md`](../docs/VALIDATION.md). The required
+CI evidence is **hw-gate** (`.github/workflows/hw-gate.yml` + `scripts/hw-gate/`).
+`python3 -m tools.change_gate` is optional local planning only and is **not** CI
+evidence. The retired `scripts/coherence-gate*.sh` batteries are **not**
+acceptance evidence and no longer exist in-tree.
 
 ## Architecture-trait change?
 

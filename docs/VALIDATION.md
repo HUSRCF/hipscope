@@ -1,9 +1,12 @@
 # Validation routes
 
-Sole human **route selector** for hipfire validation evidence.
-Executable behavior lives in the scripts and workflows named below — this
-file only maps claim class → route. Methodology numbers and Redline
-certification prose live in their owners ([`INDEX.md`](INDEX.md)).
+Maps claim class → validation route. **CI merge authority for hardware-relevant
+diffs is [`hw-gate`](../.github/workflows/hw-gate.yml)** (see below). Executable
+behavior lives in the scripts and workflows named in each route. Methodology
+numbers and Redline certification prose live in their owners
+([`INDEX.md`](INDEX.md)). Local `python3 -m tools.change_gate` remains available
+as optional offline route planning; it is **not** CI evidence and is superseded
+by hw-gate for the required check.
 
 | Field | Value |
 |---|---|
@@ -24,21 +27,90 @@ certification prose live in their owners ([`INDEX.md`](INDEX.md)).
 6. **Admissions** are recorded only in [`admissions.yml`](admissions.yml).
    A passing route does not create an admission row.
 
+## hw-gate (CI, required)
+
+[`hw-gate`](../.github/workflows/hw-gate.yml) is the **required** CI check for
+every PR. Diffs that touch no hardware-relevant surface pass the select job
+immediately. Otherwise the PR is built and exercised on a self-hosted gfx1201
+runner, and an independent reviewer model (via omp) posts prelim / evidence /
+verdict comments. Script-enforced floor rules in
+[`scripts/hw-gate/review.py`](../scripts/hw-gate/review.py) bound what the model
+may greenlight.
+
+### Bucket selection (`scripts/hw-gate/select.py`)
+
+Changed paths → buckets `load` / `serve` / `kernel` (first match wins per path;
+`serve` and `kernel` also imply `load`):
+
+| Bucket | Path rules (summary) |
+|---|---|
+| **kernel** | `kernels/**`, `crates/rdna-compute/**`, `crates/hipfire-dispatch/**`, `crates/hip-bridge/**`, `crates/saddle-core/**` |
+| **serve** | `crates/hipfire-engine/**`, `crates/hipfire-generate/**`, daemon `slots.rs` / `serve*.rs`, runtime emit/eos/dflash/spec/reset/triattn surfaces, arch `serve`/`generate`/`spec` sources |
+| **load** | loader/daemon/runtime load+config surfaces, arch `load*`/`weights*`/`carrier.rs`, `crates/hipfire-config/**`, `crates/hipfire-registry/**`, `registry/**`, workspace/`crates/*/Cargo.toml` and lockfile |
+| **none** | everything else (docs, benchmarks, most scripts, tests, markdown, …) |
+
+Touching **policy** paths (`.github/workflows/**`, `.github/CODEOWNERS`,
+`scripts/hw-gate/**`, leanup/ratchet scripts, `registry/**`, …) populates
+`policy_paths` and can never be bot-greenlit.
+
+### Fixtures and harnesses
+
+Registry fixture tags are pinned by sha256 in
+[`scripts/hw-gate/fixtures.json`](../scripts/hw-gate/fixtures.json). A missing
+or mismatched fixture **fails the gate** (no downgrade to warning).
+
+- **`serve` bucket** runs [`scripts/serve_harness.py`](../scripts/serve_harness.py)
+  (battery + chain) — same maintained serve harness as the manual route below.
+- **`kernel` bucket** runs
+  [`scripts/redline_daemon_harness.py`](../scripts/redline_daemon_harness.py) —
+  same Redline harness as the manual route below.
+- **`load` bucket** runs pinned tags through `hipfire run` and
+  `hipfire-detect` on decoded text.
+
+Decoded assistant text is posted **verbatim** in the evidence comment. Reading
+it is part of review — do not treat a green check alone as having read the
+outputs.
+
+### Fork PRs and the `hw-run` label
+
+Fork PRs (and any hardware-relevant PR) run on maintainer hardware only after a
+maintainer applies the **`hw-run`** label. That label is removed after every
+run so the next push needs a fresh authorization.
+
+### Reviewer floor (`scripts/hw-gate/review.py`)
+
+The model proposes; the script decides. Strictest applicable outcome wins:
+
+| Outcome | When |
+|---|---|
+| **block** | `hw_run_result != success`; or evidence missing / `verdict != pass`; or `kernel` bucket selected and kernel status not `pass`; or model decided `block` |
+| **needs-human** | any `policy_paths`; any `RATCHET-RAISE:` commit in `base..head`; verdict coverage gaps; confidence &lt; 0.8; model `needs-human` or unparseable verdict |
+| **greenlight** | only when none of the above fired **and** the model decided `greenlight` |
+
+**Policy-file and `RATCHET-RAISE` PRs always need a human.** Bot approval cannot
+clear them.
+
+Workflow, fixtures, select/run/review scripts, and the reviewer system prompt
+live under [`.github/workflows/hw-gate.yml`](../.github/workflows/hw-gate.yml)
+and [`scripts/hw-gate/`](../scripts/hw-gate/).
+
 ## Automatic checks vs manual evidence
 
 | Class | When it runs | Authority |
 |---|---|---|
+| **Automatic (hw-gate, required)** | PR via [`.github/workflows/hw-gate.yml`](../.github/workflows/hw-gate.yml); hardware run after `hw-run` label when buckets need it | **Required** CI check for every PR. Select may pass with no HW surface; otherwise load/serve/kernel evidence + bounded reviewer floor. |
 | **Automatic (no GPU CI)** | PR / push via the no-GPU workflow only | Merge bar for compile, native control-plane/unit tests, CPU tests, and env/docs reference coverage. **Not** model coherence, serve semantics, or perf admission. |
 | **Automatic (path-gated hooks)** | Local `pre-commit` on matching staged runtime paths | Runs the hotspot guards selected by the staged path set. Documentation-only staged sets do not trigger a separate docs hook. **Not** a full product matrix. |
 | **Manual local no-GPU equivalent** | Human/agent invokes `scripts/no-gpu-ci.sh` outside CI | Same checks as the workflow script body; still **manual invocation**, not automatic CI. |
-| **Manual (GPU / model)** | Human or agent on hardware with an explicit model path | Required for kernel, dispatch, forward, quant, serve-behavior, Redline, and perf claims. |
+| **Manual (GPU / model)** | Human or agent on hardware with an explicit model path | Still required for claim classes hw-gate does not cover (parity oracles, perf protocol, Redline promotion ladder, admissions). |
 
-Automatic CI green never substitutes for a required manual route. Running the no-GPU script locally is convenient parity with CI, not an automatic check.
+No-GPU CI green never substitutes for hw-gate or for a required manual route. hw-gate green does not create an admission or skip claim-specific oracles named below.
 
 ### Automatic entrypoints
 
 | Route | Path | Role |
 |---|---|---|
+| **hw-gate (required)** | [`.github/workflows/hw-gate.yml`](../.github/workflows/hw-gate.yml) + [`scripts/hw-gate/`](../scripts/hw-gate/) | **Automatic** required CI: path → buckets, pinned fixtures, hardware run, reviewer floor. See [§ hw-gate](#hw-gate-ci-required). |
 | No-GPU CI workflow | [`.github/workflows/no-gpu-ci.yml`](../.github/workflows/no-gpu-ci.yml) | **Automatic** CI entry that invokes the no-GPU script on PR/push. |
 | Pre-commit hooks | [`.githooks/pre-commit`](../.githooks/pre-commit) | **Automatic** when hooks are installed (`scripts/install-hooks.sh`). Selects HOTSPOT / SERVE_HOTSPOT / PP_HOTSPOT runtime guards from staged paths; documentation-only staged sets exit without a separate docs gate. |
 | Dispatch `bind_thread` invariant | [`scripts/verify-bind-thread.sh`](../scripts/verify-bind-thread.sh) (via pre-commit on matching paths) | **Automatic** when hooked: every public `dispatch.rs` entry must bind the HIP thread. Not a kernel numeric test. |

@@ -1,0 +1,205 @@
+# hw-gate — the last rung of CI.
+#
+# Every PR gets one required check, `hw-gate`. It passes immediately when the
+# diff touches no hardware-relevant surface. Otherwise the PR's code is built
+# and exercised against pinned registry fixtures on a self-hosted gfx1201
+# runner, and an independent reviewer model reads the diff plus the evidence
+# and returns greenlight / needs-human / block.
+#
+# Trust boundary. Fork PRs execute on a maintainer's machine, so nothing runs
+# on the runner until a maintainer applies the `hw-run` label — that label is
+# the human "I read this diff". `pull_request_target` means this workflow and
+# every script under scripts/hw-gate come from the BASE branch; the PR cannot
+# edit its own gate. The PR head is checked out by explicit SHA into a
+# separate directory, never onto the base checkout.
+#
+# Greenlight authority is bounded by scripts/hw-gate/review.py, not by the
+# model: fixture failures, policy-file changes, RATCHET-RAISE, and coverage
+# gaps can never be approved by the bot.
+
+name: hw-gate
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: Pull request number
+        required: true
+        type: number
+
+permissions:
+  contents: read
+  pull-requests: write
+  statuses: write
+
+concurrency:
+  group: hw-gate-${{ github.event.pull_request.number || inputs.pr }}
+  cancel-in-progress: true
+
+env:
+  PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr }}
+
+jobs:
+  select:
+    name: select buckets
+    runs-on: ubuntu-latest
+    outputs:
+      needs_hw: ${{ steps.sel.outputs.needs_hw }}
+      buckets: ${{ steps.sel.outputs.buckets }}
+      policy: ${{ steps.sel.outputs.policy }}
+      base_sha: ${{ steps.pr.outputs.base_sha }}
+      head_sha: ${{ steps.pr.outputs.head_sha }}
+      authorized: ${{ steps.pr.outputs.authorized }}
+    steps:
+      - name: Base checkout (gate scripts come from the base branch)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Resolve PR head and authorization label
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          json=$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json baseRefOid,headRefOid,labels,isDraft)
+          echo "base_sha=$(jq -r .baseRefOid <<<"$json")" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$(jq -r .headRefOid <<<"$json")" >> "$GITHUB_OUTPUT"
+          if jq -e '.labels[] | select(.name=="hw-run")' <<<"$json" >/dev/null; then
+            echo "authorized=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "authorized=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Fetch PR head
+        run: git fetch --no-tags origin "${{ steps.pr.outputs.head_sha }}"
+      - name: Select buckets from the diff
+        id: sel
+        run: |
+          set -euo pipefail
+          git diff --name-only "${{ steps.pr.outputs.base_sha }}...${{ steps.pr.outputs.head_sha }}" \
+            | python3 scripts/hw-gate/select.py --github-output "$GITHUB_OUTPUT" --json select.json
+          cat select.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hw-gate-select
+          path: select.json
+
+  hw-run:
+    name: hardware run (gfx1201)
+    needs: select
+    if: needs.select.outputs.needs_hw == 'true' && needs.select.outputs.authorized == 'true'
+    runs-on: [self-hosted, hiptrx, gfx1201]
+    timeout-minutes: 45
+    env:
+      # One GPU for the gate; the other four stay interactive.
+      HIPFIRE_HOME: ${{ github.workspace }}/.hw-gate-home
+      HIPFIRE_MODELS_DIR: /home/kaden/.hipfire/models
+      HW_GATE_DEVICE: "3"
+      CARGO_TARGET_DIR: /home/kaden/actions-runner/_cache/hw-gate-target
+    steps:
+      - name: Base checkout (gate scripts)
+        uses: actions/checkout@v4
+        with:
+          path: base
+      - name: PR head checkout (code under test, by SHA)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.select.outputs.head_sha }}
+          path: pr
+          fetch-depth: 0
+      - name: Run buckets
+        run: |
+          set -euo pipefail
+          python3 base/scripts/hw-gate/run.py \
+            --repo pr \
+            --fixtures base/scripts/hw-gate/fixtures.json \
+            --base "${{ needs.select.outputs.base_sha }}" \
+            --head "${{ needs.select.outputs.head_sha }}" \
+            --buckets "${{ needs.select.outputs.buckets }}" \
+            --device "$HW_GATE_DEVICE" \
+            --out hw-gate.json --md hw-gate.md
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: hw-gate-evidence
+          path: |
+            hw-gate.json
+            hw-gate.md
+            hw-gate-logs/
+
+  hw-review:
+    name: reviewer (omp / reviewer role)
+    needs: [select, hw-run]
+    if: always() && needs.select.outputs.needs_hw == 'true' && needs.select.outputs.authorized == 'true'
+    runs-on: [self-hosted, hiptrx, gfx1201]
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ secrets.HW_GATE_TOKEN || github.token }}
+    steps:
+      - name: Base checkout (gate scripts)
+        uses: actions/checkout@v4
+        with:
+          path: base
+          fetch-depth: 0
+      - name: PR head checkout (read-only for the reviewer)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.select.outputs.head_sha }}
+          path: pr
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          name: hw-gate-evidence
+          path: evidence
+      - uses: actions/download-artifact@v4
+        with:
+          name: hw-gate-select
+          path: evidence
+      - name: Review and decide
+        run: |
+          set -euo pipefail
+          python3 base/scripts/hw-gate/review.py \
+            --repo "$GITHUB_REPOSITORY" --pr "$PR_NUMBER" \
+            --base "${{ needs.select.outputs.base_sha }}" \
+            --head "${{ needs.select.outputs.head_sha }}" \
+            --checkout pr \
+            --evidence evidence/hw-gate.json \
+            --select evidence/select.json \
+            --hw-run-result "${{ needs.hw-run.result }}" \
+            --system-prompt base/scripts/hw-gate/review.md \
+            --out verdict.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: hw-gate-verdict
+          path: verdict.json
+
+  hw-gate:
+    # The one required status check. Deterministic: it never consults the model.
+    name: hw-gate
+    needs: [select, hw-run, hw-review]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Decide
+        run: |
+          set -euo pipefail
+          echo "needs_hw=${{ needs.select.outputs.needs_hw }} authorized=${{ needs.select.outputs.authorized }}"
+          echo "hw-run=${{ needs.hw-run.result }} hw-review=${{ needs.hw-review.result }}"
+          if [ "${{ needs.select.result }}" != "success" ]; then
+            echo "::error::bucket selection failed"; exit 1
+          fi
+          if [ "${{ needs.select.outputs.needs_hw }}" != "true" ]; then
+            echo "no hardware-relevant surface touched"; exit 0
+          fi
+          if [ "${{ needs.select.outputs.authorized }}" != "true" ]; then
+            echo "::error::hardware-relevant diff; a maintainer must apply the 'hw-run' label"; exit 1
+          fi
+          if [ "${{ needs.hw-run.result }}" != "success" ]; then
+            echo "::error::hardware run did not pass"; exit 1
+          fi
+          if [ "${{ needs.hw-review.result }}" != "success" ]; then
+            echo "::error::reviewer did not complete"; exit 1
+          fi
+          echo "hardware evidence and review recorded; merge authority is the review, not this check"

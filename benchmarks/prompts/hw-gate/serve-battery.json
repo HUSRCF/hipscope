@@ -1,0 +1,27 @@
+[
+  {
+    "genre": "code",
+    "prompt": "Write a Python function that returns the longest substring of a string without repeating characters. Reply with only the code.",
+    "expect": ["def "]
+  },
+  {
+    "genre": "prose",
+    "prompt": "In three sentences, explain why the sky is blue during the day and red at sunset.",
+    "expect": ["scatter"]
+  },
+  {
+    "genre": "factual",
+    "prompt": "What is the capital of France? Answer with one word.",
+    "expect": ["Paris"]
+  },
+  {
+    "genre": "tool-call",
+    "prompt": "You have a tool `get_weather(city: str)`. The user asks: what's the weather in Tokyo right now? Call the tool.",
+    "expect": ["get_weather", "Tokyo"]
+  },
+  {
+    "genre": "reason",
+    "prompt": "A farmer has 17 sheep. All but 9 run away. How many sheep are left? Explain briefly, then give the number.",
+    "expect": ["9"]
+  }
+]
