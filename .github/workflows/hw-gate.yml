@@ -208,9 +208,10 @@ jobs:
     #   needs-human -> red until a maintainer who has read the evidence applies
     #                  `human-reviewed` (a logged signature; cleared on every push)
     #   block       -> red; no label clears it, only a new commit
-    # With enforce_admins on this binds every merger. The emergency path is
-    # explicit and audited: DELETE /branches/master/protection/enforce_admins,
-    # push, POST it back.
+    # Binds every maintainer except repository admins (enforce_admins is off by
+    # decision: the admin's judgment is the emergency path). An admin merging
+    # past a red hw-gate is expected to have read the evidence; `human-reviewed`
+    # records that.
     name: hw-gate
     needs: [select, hw-run, hw-review]
     if: always()

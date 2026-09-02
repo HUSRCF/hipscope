@@ -87,8 +87,10 @@ The model proposes; the script decides. Strictest applicable outcome wins:
 | **needs-human** | any `policy_paths`; any `RATCHET-RAISE:` commit in `base..head`; verdict coverage gaps; confidence &lt; 0.8; model `needs-human` or unparseable verdict |
 | **greenlight** | only when none of the above fired **and** the model decided `greenlight` |
 
-The required `hw-gate` status carries the decision and binds every merger,
-admins included (`enforce_admins` is on):
+The required `hw-gate` status carries the decision. Branch protection binds
+every maintainer except repository admins (`enforce_admins` is off, on
+purpose: the admin's judgment is the emergency path, as with the `a0fca0d6d`
+revert). For everyone else:
 
 - `greenlight` — green.
 - `needs-human` — red until a maintainer who has read the evidence and verdict
@@ -97,10 +99,9 @@ admins included (`enforce_admins` is on):
   verdict already recorded for that commit without re-running hardware.
 - `block` — red; no label clears it, only a new commit.
 
-The reviewer's approve / request-changes review is informational. The
-emergency path for master is explicit and audited, not a click:
-`gh api -X DELETE repos/warpfront/hipfire/branches/master/protection/enforce_admins`,
-push, then `-X POST` it back.
+The reviewer's approve / request-changes review is informational. An admin
+merging past a red `hw-gate` is expected to have read the evidence and verdict
+comments first; applying `human-reviewed` records that.
 
 **Policy-file and `RATCHET-RAISE` PRs always need a human.** Bot approval cannot
 clear them.
