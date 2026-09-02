@@ -31,9 +31,11 @@ by hw-gate for the required check.
 
 [`hw-gate`](../.github/workflows/hw-gate.yml) is the **required** CI check for
 every PR. Diffs that touch no hardware-relevant surface pass the select job
-immediately. Otherwise the PR is built and exercised on a self-hosted gfx1201
-runner, and an independent reviewer model (via omp) posts prelim / evidence /
-verdict comments. Script-enforced floor rules in
+immediately. Otherwise an independent reviewer model (via omp, read-only
+tools) first posts a **prelim** on the diff alone — before any hardware, so a
+maintainer reads it when deciding to apply `hw-run` — then the PR is built and
+exercised on a self-hosted gfx1201 runner, the **evidence** is posted, and the
+reviewer returns its **verdict** on diff plus evidence. Script-enforced floor rules in
 [`scripts/hw-gate/review.py`](../scripts/hw-gate/review.py) bound what the model
 may greenlight.
 

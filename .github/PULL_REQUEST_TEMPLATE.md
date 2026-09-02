@@ -36,13 +36,14 @@ paste the harness --out JSON here (per-turn rows with assistant_content, attract
 
 `hw-gate` is the required CI check. Docs-only diffs pass immediately. Anything touching a hardware surface follows this flow:
 
-1. **A maintainer applies `hw-run`.** Nothing executes on hardware before that — it is the maintainer's "I read this diff". The label is removed after every run and cleared on every push; a new commit needs a fresh `hw-run`.
-2. **The runner builds this PR and drives every pinned fixture** (`scripts/hw-gate/fixtures.json`) through `serve_harness.py` — battery for load changes, battery + chain for serve changes, plus Redline parity for kernel changes. Every turn's decoded text is posted verbatim in the **evidence** comment. A missing or mismatched fixture, an attractor, an empty or runaway turn, or a missed expect-substring fails the gate.
-3. **The reviewer model posts a prelim and a verdict** (`greenlight` / `needs-human` / `block`) inside a script-enforced floor (`scripts/hw-gate/review.py`). Its review is informational; the `hw-gate` status carries the decision:
+1. **The reviewer model reads the diff first** (read-only, no execution) and posts a **prelim** comment: surfaces, suspected regressions, extra routes it wants. Skipped on drafts.
+2. **A maintainer applies `hw-run`.** Nothing executes on hardware before that — it is the maintainer's "I read this diff and the prelim". The label is removed after every run and cleared on every push; a new commit needs a fresh `hw-run`.
+3. **The runner builds this PR and drives every pinned fixture** (`scripts/hw-gate/fixtures.json`) through `serve_harness.py` — battery for load changes, battery + chain for serve changes, plus Redline parity for kernel changes. Every turn's decoded text is posted verbatim in the **evidence** comment. A missing or mismatched fixture, an attractor, an empty or runaway turn, or a missed expect-substring fails the gate.
+4. **The reviewer model posts its verdict** (`greenlight` / `needs-human` / `block`) inside a script-enforced floor (`scripts/hw-gate/review.py`). Its review is informational; the `hw-gate` status carries the decision:
    - `greenlight` → check green.
    - `needs-human` → check red until a maintainer who has **read the evidence and verdict** applies `human-reviewed`. Cleared on every push.
    - `block` → check red; only a new commit clears it.
-4. **Everyone reads the decoded text.** A green check alone is not review. Numbers never prove coherence.
+5. **Everyone reads the decoded text.** A green check alone is not review. Numbers never prove coherence.
 
 Route policy: [`docs/VALIDATION.md`](../docs/VALIDATION.md) § hw-gate. `python3 -m tools.change_gate` is optional local planning and is **not** CI evidence; the retired `scripts/coherence-gate*.sh` batteries no longer exist.
 

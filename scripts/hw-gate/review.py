@@ -660,6 +660,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--hw-run-result", required=True)
     ap.add_argument("--system-prompt", required=True)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--phase", choices=("prelim", "verdict", "all"), default="all",
+                    help="prelim: read the diff before hardware runs and write --out {phase, prelim}; "
+                         "verdict: read --prelim (from the prelim phase) plus evidence and decide; all: both")
+    ap.add_argument("--prelim", help="prelim-phase output to consume in the verdict phase")
     args = ap.parse_args(argv)
 
     model = os.environ.get("HW_GATE_REVIEW_MODEL", "gpt-5.6-sol")
@@ -742,24 +746,45 @@ def main(argv: list[str] | None = None) -> int:
     posted = {"prelim_comment": None, "evidence_comment": None, "verdict_comment": None, "review": None, "labels_added": [], "labels_removed": []}
 
     try:
-        # prelim prompt build
+        # The prelim prompt is deterministic from the checkout, so both phases rebuild it.
         prelim_prompt = build_prelim_prompt(select, args.checkout, args.base, args.head, args.repo, args.pr)
 
-        # prelim omp
-        try:
-            prelim = omp_review("prelim", prelim_prompt, args.system_prompt, args.checkout, model)
-        except ReviewError as e:
-            # Post needs-human via _fail
-            return _fail(f"prelim failed: {e}")
-        _prelim_cache = prelim  # for _fail closure
-
-        # Post prelim comment
-        prelim_body = f"<!-- hw-gate:prelim -->\n# hw-gate prelim\n\n```json\n{json.dumps(prelim, indent=2, sort_keys=True)}\n```\n"
-        try:
-            prelim_comment_url = upsert_comment(args.repo, args.pr, "<!-- hw-gate:prelim -->", prelim_body)
-            posted["prelim_comment"] = prelim_comment_url
-        except Exception as e:
-            return _fail(f"prelim comment post failed: {e}")
+        if args.phase in ("prelim", "all"):
+            # Prelim runs BEFORE any hardware: it is read-only and needs no hw-run
+            # authorization. A prelim failure must not block the hardware run, so
+            # it is recorded as absent rather than failing the pipeline closed.
+            try:
+                prelim = omp_review("prelim", prelim_prompt, args.system_prompt, args.checkout, model)
+            except ReviewError as e:
+                prelim = None
+                prelim_body = f"<!-- hw-gate:prelim -->\n# hw-gate prelim\n\nPrelim review unavailable: {e}\n"
+            else:
+                prelim_body = f"<!-- hw-gate:prelim -->\n# hw-gate prelim\n\n```json\n{json.dumps(prelim, indent=2, sort_keys=True)}\n```\n"
+            _prelim_cache = prelim  # for _fail closure
+            try:
+                prelim_comment_url = upsert_comment(args.repo, args.pr, "<!-- hw-gate:prelim -->", prelim_body)
+                posted["prelim_comment"] = prelim_comment_url
+            except Exception as e:
+                if args.phase == "prelim":
+                    sys.stderr.write(f"prelim comment post failed: {e}\n")
+                else:
+                    return _fail(f"prelim comment post failed: {e}")
+            if args.phase == "prelim":
+                with open(args.out, "w", encoding="utf-8") as f:
+                    json.dump({"schema": "hipfire.hw-gate.prelim", "version": 1, "model": model,
+                               "prelim": prelim, "posted": {"prelim_comment": prelim_comment_url}},
+                              f, indent=2, sort_keys=True)
+                    f.write("\n")
+                return 0
+        else:
+            prelim = None
+            if args.prelim and Path(args.prelim).is_file():
+                try:
+                    with open(args.prelim, "r", encoding="utf-8") as f:
+                        prelim = json.load(f).get("prelim")
+                except Exception:
+                    prelim = None
+            _prelim_cache = prelim
 
         # Evidence comment
         if evidence_md_path.is_file():
@@ -855,7 +880,10 @@ def main(argv: list[str] | None = None) -> int:
         with open(args.out, "w", encoding="utf-8") as f:
             json.dump(out_obj, f, indent=2, sort_keys=True)
             f.write("\n")
-        return 0
+        # CONTRACT: an unparseable verdict is a failed review — needs-human is
+        # posted and recorded above, and the exit code says the model never
+        # produced a decision.
+        return 1 if verdict_parse_failed else 0
 
     except ReviewError as e:
         return _fail(str(e))

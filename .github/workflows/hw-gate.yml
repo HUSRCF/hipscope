@@ -64,6 +64,7 @@ jobs:
       # every code event, plus the `hw-run` label itself. Other label events
       # (e.g. `human-reviewed`) only re-evaluate the recorded verdict.
       run_hw: ${{ steps.pr.outputs.run_hw }}
+      draft: ${{ steps.pr.outputs.draft }}
     steps:
       - name: Base checkout (gate scripts come from the base branch)
         uses: actions/checkout@v4
@@ -90,6 +91,7 @@ jobs:
           has() { jq -e --arg n "$1" '.labels[] | select(.name==$n)' <<<"$json" >/dev/null; }
           echo "authorized=$(has hw-run && echo true || echo false)" >> "$GITHUB_OUTPUT"
           echo "human_reviewed=$(has human-reviewed && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          echo "draft=$(jq -r .isDraft <<<"$json")" >> "$GITHUB_OUTPUT"
           action='${{ github.event.action }}'
           label='${{ github.event.label.name }}'
           if [ "$action" = "labeled" ] && [ "$label" != "hw-run" ]; then
@@ -111,10 +113,57 @@ jobs:
           name: hw-gate-select
           path: select.json
 
+  prelim:
+    # First rung: the reviewer reads the diff BEFORE any hardware runs. Read-only
+    # tools in a PR checkout, no code execution, so it needs no hw-run label;
+    # its comment is what a maintainer reads when deciding whether to authorize
+    # hardware. Skipped on drafts and on label-only events.
+    name: reviewer prelim (diff only)
+    needs: select
+    if: needs.select.outputs.needs_hw == 'true' && needs.select.outputs.run_hw == 'true' && needs.select.outputs.draft != 'true'
+    runs-on: [self-hosted, hiptrx, gfx1201]
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Base checkout (gate scripts)
+        uses: actions/checkout@v4
+        with:
+          path: base
+          fetch-depth: 0
+      - name: PR head checkout (read-only for the reviewer)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.select.outputs.head_sha }}
+          path: pr
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          name: hw-gate-select
+          path: evidence
+      - name: Prelim review
+        run: |
+          set -euo pipefail
+          python3 base/scripts/hw-gate/review.py --phase prelim \
+            --repo "$GITHUB_REPOSITORY" --pr "$PR_NUMBER" \
+            --base "${{ needs.select.outputs.base_sha }}" \
+            --head "${{ needs.select.outputs.head_sha }}" \
+            --checkout pr \
+            --evidence evidence/hw-gate.json \
+            --select evidence/select.json \
+            --hw-run-result pending \
+            --system-prompt base/scripts/hw-gate/review.md \
+            --out prelim.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: hw-gate-prelim
+          path: prelim.json
+
   hw-run:
     name: hardware run (gfx1201)
-    needs: select
-    if: needs.select.outputs.needs_hw == 'true' && needs.select.outputs.authorized == 'true' && needs.select.outputs.run_hw == 'true'
+    needs: [select, prelim]
+    if: always() && needs.select.result == 'success' && needs.select.outputs.needs_hw == 'true' && needs.select.outputs.authorized == 'true' && needs.select.outputs.run_hw == 'true'
     runs-on: [self-hosted, hiptrx, gfx1201]
     timeout-minutes: 45
     env:
@@ -155,9 +204,9 @@ jobs:
             hw-gate-logs/
 
   hw-review:
-    name: reviewer (omp / reviewer role)
-    needs: [select, hw-run]
-    if: always() && needs.select.outputs.needs_hw == 'true' && needs.select.outputs.authorized == 'true' && needs.select.outputs.run_hw == 'true'
+    name: reviewer verdict (diff + evidence)
+    needs: [select, prelim, hw-run]
+    if: always() && needs.select.result == 'success' && needs.select.outputs.needs_hw == 'true' && needs.select.outputs.authorized == 'true' && needs.select.outputs.run_hw == 'true'
     runs-on: [self-hosted, hiptrx, gfx1201]
     timeout-minutes: 30
     env:
@@ -182,10 +231,15 @@ jobs:
         with:
           name: hw-gate-select
           path: evidence
-      - name: Review and decide
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: hw-gate-prelim
+          path: evidence
+      - name: Verdict
         run: |
           set -euo pipefail
-          python3 base/scripts/hw-gate/review.py \
+          python3 base/scripts/hw-gate/review.py --phase verdict --prelim evidence/prelim.json \
             --repo "$GITHUB_REPOSITORY" --pr "$PR_NUMBER" \
             --base "${{ needs.select.outputs.base_sha }}" \
             --head "${{ needs.select.outputs.head_sha }}" \
