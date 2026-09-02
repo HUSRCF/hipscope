@@ -473,8 +473,15 @@ def _run_harness_mode(repo, fixture, env_base, logs_dir, device, mode, harness_c
     model_path = Path(models_dir).expanduser() / file_name if file_name else Path(models_dir) / tag
     harness = repo_p / "scripts" / "serve_harness.py"
     # harness cfg
+    # The battery prompts are gate policy: they resolve against the GATE
+    # checkout (the directory tree holding fixtures.json), never against the
+    # PR under test, which may predate or omit them.
     battery_prompts_rel = harness_cfg.get("battery_prompts", "benchmarks/prompts/hw-gate/serve-battery.json")
-    battery_prompts_path = (repo_p / battery_prompts_rel) if battery_prompts_rel else None
+    gate_root = Path(harness_cfg.get("_gate_root") or repo_p)
+    battery_prompts_path = (gate_root / battery_prompts_rel) if battery_prompts_rel else None
+    if battery_prompts_path is not None and not battery_prompts_path.is_file():
+        return {"exit": 2, "seconds": 0.0, "rows": [], "status": "fail",
+                "reason": f"battery prompts missing at {battery_prompts_path} (gate policy file)"}
     max_tokens = harness_cfg.get("max_tokens", 256)
     # per-fixture home: subdirectory of gate home
     gate_home = env_base.get("HIPFIRE_HOME") or str(Path.home() / ".hipfire")
@@ -1028,6 +1035,9 @@ def main(argv: list[str] | None = None) -> int:
         harness_cfg["battery_prompts"] = "benchmarks/prompts/hw-gate/serve-battery.json"
     if "max_tokens" not in harness_cfg:
         harness_cfg["max_tokens"] = 256
+    # fixtures.json lives at <gate_root>/scripts/hw-gate/fixtures.json; policy
+    # files (prompts) are addressed relative to that gate root.
+    harness_cfg["_gate_root"] = str(Path(args.fixtures).resolve().parent.parent.parent)
 
     # --- Routes handling -------------------------------------------------
     use_routes = args.routes is not None

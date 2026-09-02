@@ -311,7 +311,11 @@ def test_main_exit_2_missing_fixture_no_build(tmp_path, monkeypatch):
             "kernel": {"modes": ["battery"], "redline": {"model_tag": "qwen3.6:27b", "harness_args": ["--pm4"]}}
         }
     }
-    fixtures_path = tmp_path / "fixtures.json"
+    fixtures_path = tmp_path / "scripts" / "hw-gate" / "fixtures.json"
+    fixtures_path.parent.mkdir(parents=True, exist_ok=True)
+    _prompts = tmp_path / "benchmarks" / "prompts" / "hw-gate"
+    _prompts.mkdir(parents=True, exist_ok=True)
+    (_prompts / "serve-battery.json").write_text("[]")
     fixtures_path.write_text(json.dumps(fixtures_data))
     out = tmp_path / "hw-gate.json"
     md = tmp_path / "hw-gate.md"
@@ -367,7 +371,11 @@ def test_main_harness_success_and_failure(tmp_path, monkeypatch):
             "kernel": {"modes": ["battery"], "redline": {"model_tag": "qwen3.6:27b", "harness_args": []}}
         }
     }
-    fixtures_path = tmp_path / "fixtures.json"
+    fixtures_path = tmp_path / "scripts" / "hw-gate" / "fixtures.json"
+    fixtures_path.parent.mkdir(parents=True, exist_ok=True)
+    _prompts = tmp_path / "benchmarks" / "prompts" / "hw-gate"
+    _prompts.mkdir(parents=True, exist_ok=True)
+    (_prompts / "serve-battery.json").write_text("[]")
     fixtures_path.write_text(json.dumps(fixtures_data))
     out = tmp_path / "hw-gate.json"
     md = tmp_path / "hw-gate.md"
@@ -525,7 +533,11 @@ def test_routes_unknown_tag_unavailable(tmp_path, monkeypatch):
         "fixtures": [{"tag": "qwen3.6:27b", "file": "qwen3.6-27b.mq4", "sha256": sha, "size_bytes": len(content), "arch_id": 5}],
         "buckets": {"load": {"modes": ["battery"]}, "serve": {"modes": ["battery", "chain"]}, "kernel": {"modes": ["battery"], "redline": {"model_tag": "qwen3.6:27b", "harness_args": []}}}
     }
-    fixtures_path = tmp_path / "fixtures.json"
+    fixtures_path = tmp_path / "scripts" / "hw-gate" / "fixtures.json"
+    fixtures_path.parent.mkdir(parents=True, exist_ok=True)
+    _prompts = tmp_path / "benchmarks" / "prompts" / "hw-gate"
+    _prompts.mkdir(parents=True, exist_ok=True)
+    (_prompts / "serve-battery.json").write_text("[]")
     fixtures_path.write_text(json.dumps(fixtures_data))
     registry_data = {"models": {}, "aliases": {}}
     registry_path = tmp_path / "registry.json"
@@ -588,7 +600,11 @@ def test_routes_absent_file_unavailable_still_pass(tmp_path, monkeypatch):
         "fixtures": [{"tag": "qwen3.6:27b", "file": "qwen3.6-27b.mq4", "sha256": sha_present, "size_bytes": len(content), "arch_id": 5}],
         "buckets": {"load": {"modes": ["battery"]}, "serve": {"modes": ["battery", "chain"]}, "kernel": {"modes": ["battery"], "redline": {"model_tag": "qwen3.6:27b", "harness_args": []}}}
     }
-    fixtures_path = tmp_path / "fixtures.json"
+    fixtures_path = tmp_path / "scripts" / "hw-gate" / "fixtures.json"
+    fixtures_path.parent.mkdir(parents=True, exist_ok=True)
+    _prompts = tmp_path / "benchmarks" / "prompts" / "hw-gate"
+    _prompts.mkdir(parents=True, exist_ok=True)
+    (_prompts / "serve-battery.json").write_text("[]")
     fixtures_path.write_text(json.dumps(fixtures_data))
     # registry with an extra model whose file is NOT present
     reg_content = b"registrydata"
@@ -666,7 +682,11 @@ def test_routes_mismatched_mandatory_still_exit2(tmp_path, monkeypatch):
         "fixtures": [{"tag": "qwen3.6:27b", "file": "qwen3.6-27b.mq4", "sha256": sha_good, "size_bytes": len(content), "arch_id": 5}],
         "buckets": {"load": {"modes": ["battery"]}, "serve": {"modes": ["battery", "chain"]}, "kernel": {"modes": ["battery"], "redline": {"model_tag": "qwen3.6:27b", "harness_args": []}}}
     }
-    fixtures_path = tmp_path / "fixtures.json"
+    fixtures_path = tmp_path / "scripts" / "hw-gate" / "fixtures.json"
+    fixtures_path.parent.mkdir(parents=True, exist_ok=True)
+    _prompts = tmp_path / "benchmarks" / "prompts" / "hw-gate"
+    _prompts.mkdir(parents=True, exist_ok=True)
+    (_prompts / "serve-battery.json").write_text("[]")
     fixtures_path.write_text(json.dumps(fixtures_data))
     registry_path = tmp_path / "registry.json"
     registry_path.write_text(json.dumps({"models": {}, "aliases": {}}))
@@ -733,7 +753,11 @@ def test_routes_modes_per_fixture(tmp_path, monkeypatch):
         "fixtures": [{"tag": "qwen3.6:27b", "file": "qwen3.6-27b.mq4", "sha256": sha1, "size_bytes": len(c1), "arch_id": 5}],
         "buckets": {"load": {"modes": ["battery"]}, "serve": {"modes": ["battery", "chain"]}, "kernel": {"modes": ["battery"], "redline": {"model_tag": "qwen3.6:27b", "harness_args": []}}}
     }
-    fixtures_path = tmp_path / "fixtures.json"
+    fixtures_path = tmp_path / "scripts" / "hw-gate" / "fixtures.json"
+    fixtures_path.parent.mkdir(parents=True, exist_ok=True)
+    _prompts = tmp_path / "benchmarks" / "prompts" / "hw-gate"
+    _prompts.mkdir(parents=True, exist_ok=True)
+    (_prompts / "serve-battery.json").write_text("[]")
     fixtures_path.write_text(json.dumps(fixtures_data))
     registry_data = {"models": {"qwen3.8:27b": {"file": "qwen3.8-27b.mq4", "sha256": sha2, "size_bytes": len(c2), "arch_id": 5}}, "aliases": {}}
     registry_path = tmp_path / "registry.json"
@@ -787,3 +811,28 @@ def test_routes_modes_per_fixture(tmp_path, monkeypatch):
     # ensure harness called with correct modes
     assert "battery" in captured_modes["qwen3.6:27b"] and "chain" not in captured_modes["qwen3.6:27b"]
     assert set(captured_modes["qwen3.8:27b"]) == {"battery", "chain"}
+
+
+def test_battery_prompts_resolve_against_gate_root_not_pr(tmp_path, monkeypatch):
+    """Prompts are gate policy: resolved from the fixtures.json tree, never the PR checkout."""
+    gate = tmp_path / "gate"; (gate / "scripts" / "hw-gate").mkdir(parents=True)
+    (gate / "benchmarks" / "prompts" / "hw-gate").mkdir(parents=True)
+    (gate / "benchmarks" / "prompts" / "hw-gate" / "serve-battery.json").write_text("[]")
+    pr = tmp_path / "pr"; (pr / "scripts").mkdir(parents=True)
+    (pr / "scripts" / "serve_harness.py").write_text("")
+    seen = {}
+    def fake_run_cmd(argv, **kw):
+        seen["argv"] = argv
+        class R: returncode, stdout, stderr = 0, "", ""
+        return R()
+    monkeypatch.setattr(run_mod, "run_cmd", fake_run_cmd)
+    (tmp_path / "out.json").write_text("[]")
+    cfg = {"battery_prompts": "benchmarks/prompts/hw-gate/serve-battery.json", "max_tokens": 8, "_gate_root": str(gate)}
+    env = {"HIPFIRE_HOME": str(tmp_path / "home")}
+    run_mod._run_harness_mode(str(pr), {"tag": "t:x", "file": "x.mq4"}, env, str(tmp_path / "logs"), "0", "battery", cfg, str(tmp_path))
+    i = seen["argv"].index("--prompts-file")
+    assert seen["argv"][i + 1] == str(gate / "benchmarks" / "prompts" / "hw-gate" / "serve-battery.json")
+    # and a PR-less gate root without the file fails closed instead of running a partial battery
+    cfg["_gate_root"] = str(pr)
+    res = run_mod._run_harness_mode(str(pr), {"tag": "t:x", "file": "x.mq4"}, env, str(tmp_path / "logs"), "0", "battery", cfg, str(tmp_path))
+    assert res["status"] == "fail" and "gate policy" in res["reason"]
