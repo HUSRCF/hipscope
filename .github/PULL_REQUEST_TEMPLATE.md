@@ -20,7 +20,7 @@ hw-gate selects hardware routes from the diff (`scripts/hw-gate/select.py`); tic
 - [ ] `./scripts/no-gpu-ci.sh` passes, or the CI jobs are green
 - [ ] `cargo build --release` clean
 - [ ] `cargo test --lib --workspace` passes
-- [ ] **load / serve / kernel changes:** I ran `python3 scripts/serve_harness.py --model <flagship artifact> --mode battery --out battery.json` on hardware myself and attached `battery.json` below — before asking for `hw-run`. A `hipfire run` transcript is not evidence.
+- [ ] **load / serve / kernel changes:** I ran `python3 scripts/serve_harness.py --model <flagship artifact> --mode battery --out battery.json` on hardware myself and attached `battery.json` below. A `hipfire run` transcript is not evidence.
 - [ ] If perf-relevant: `./scripts/speed-gate.sh` within ±2% of locked baselines
 - [ ] If this raises a ceiling in `scripts/leanup-thresholds.txt`: the commit message carries `RATCHET-RAISE: <metric> <old> -> <new>, traded for <reason>` **and** the PR carries the `ratchet-raise` label (CI fails without both)
 
@@ -37,7 +37,7 @@ paste the harness --out JSON here (per-turn rows with assistant_content, attract
 `hw-gate` is the required CI check. Docs-only diffs pass immediately. Anything touching a hardware surface follows this flow:
 
 1. **The reviewer model reads the diff first** (read-only, no execution) and posts a **prelim** comment: surfaces, suspected regressions, extra routes it wants. Skipped on drafts.
-2. **A maintainer applies `hw-run`.** Nothing executes on hardware before that — it is the maintainer's "I read this diff and the prelim". The label is removed after every run and cleared on every push; a new commit needs a fresh `hw-run`.
+2. **Hardware is authorized automatically** when the author is a repo member, or when the diff touches no build script / manifest / shell / python / CI path and the prelim judged `execution_risk: none`. Otherwise a maintainer applies **`hw-run`** (the label always authorizes; it is removed after every run and cleared on every push).
 3. **The runner builds this PR and drives every pinned fixture** (`scripts/hw-gate/fixtures.json`) through `serve_harness.py` — battery for load changes, battery + chain for serve changes, plus Redline parity for kernel changes. Every turn's decoded text is posted verbatim in the **evidence** comment. A missing or mismatched fixture, an attractor, an empty or runaway turn, or a missed expect-substring fails the gate.
 4. **The reviewer model posts its verdict** (`greenlight` / `needs-human` / `block`) inside a script-enforced floor (`scripts/hw-gate/review.py`). Its review is informational; the `hw-gate` status carries the decision:
    - `greenlight` → check green.

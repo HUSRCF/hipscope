@@ -19,9 +19,12 @@ Read the diff against base. Return:
   "extra_routes": [
     {"kind": "load", "tag": "registry:tag", "why": "..."}
   ],
+  "execution_risk": {"level": "none" | "review" | "block", "reasons": ["..."]},
   "questions_for_author": ["..."]
 }
 ```
+
+`execution_risk` decides whether this PR's code may run on the maintainer's hardware without a human authorizing it. The hardware job builds the PR and runs its daemon as the maintainer's user on their workstation. Say `none` only when the diff is ordinary hipfire Rust/HIP/config/docs work with nothing that reaches outside the process: no network access, no filesystem access outside model/cache/temp paths, no reading of environment variables or credentials, no process spawning, no new or changed build scripts, dependencies, toolchains, CI, or harness scripts, no encoded/obfuscated blobs, no `unsafe` blocks whose purpose is not evident from the surrounding code. Say `review` when something is unusual but plausibly legitimate; say `block` when the diff appears designed to exfiltrate, persist, or escape. `review` and `block` hold hardware until a maintainer applies `hw-run`. The deterministic path check already holds build/manifests/scripts/CI regardless of what you say here; your judgment covers what a path check cannot see.
 
 `extra_routes` may only add work; the mandatory buckets run regardless. Name only registry tags. Ask for a route when the diff touches a path whose correctness depends on a real artifact's contents (headers, quant types, tokenizer/template, topology admission).
 

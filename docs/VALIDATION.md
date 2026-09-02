@@ -81,11 +81,18 @@ timings (HTTP streaming, sampling) and run well under `hipfire bench`; they are
 context, never a performance claim. Perf claims go through
 [`docs/methodology/perf-benchmarking.md`](methodology/perf-benchmarking.md).
 
-### Fork PRs and the `hw-run` label
+### Hardware authorization and the `hw-run` label
 
-Fork PRs (and any hardware-relevant PR) run on maintainer hardware only after a
-maintainer applies the **`hw-run`** label. That label is removed after every
-run so the next push needs a fresh authorization.
+The gate authorizes hardware on its own in two cases: the author is a
+repository member/collaborator, or the diff touches no exec-sensitive path
+(`build.rs`, `.cargo/`, Cargo manifests/lockfile, toolchain, `.github/`,
+`scripts/`, `tools/`, any `*.sh`/`*.py`, Dockerfiles, nix) **and** the
+reviewer's prelim judged `execution_risk` = `none` (no network, no filesystem
+outside model/cache/temp, no env/credential reads, no process spawning, no
+obfuscated blobs, no unexplained `unsafe`). Every other PR waits for a
+maintainer's **`hw-run`** label, which always authorizes and is removed after
+every run and on every push. The reason is stated in the job summary and in
+the red `hw-gate` status.
 
 ### Reviewer floor (`scripts/hw-gate/review.py`)
 

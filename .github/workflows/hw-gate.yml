@@ -6,9 +6,12 @@
 # runner, and an independent reviewer model reads the diff plus the evidence
 # and returns greenlight / needs-human / block.
 #
-# Trust boundary. Fork PRs execute on a maintainer's machine, so nothing runs
-# on the runner until a maintainer applies the `hw-run` label — that label is
-# the human "I read this diff". `pull_request_target` means this workflow and
+# Trust boundary. PR code executes on a maintainer's machine. Hardware runs
+# when the author is a repository member/collaborator, or when the diff touches
+# no exec-sensitive path (build scripts, manifests, shell/python, CI) AND the
+# reviewer's prelim judged execution_risk == none. Everything else waits for a
+# maintainer's `hw-run` label, which always authorizes. `pull_request_target`
+# means this workflow and
 # every script under scripts/hw-gate come from the BASE branch; the PR cannot
 # edit its own gate. The PR head is checked out by explicit SHA into a
 # separate directory, never onto the base checkout.
@@ -65,6 +68,8 @@ jobs:
       # (e.g. `human-reviewed`) only re-evaluate the recorded verdict.
       run_hw: ${{ steps.pr.outputs.run_hw }}
       draft: ${{ steps.pr.outputs.draft }}
+      exec_sensitive: ${{ steps.sel.outputs.exec_sensitive }}
+      member: ${{ steps.pr.outputs.member }}
     steps:
       - name: Base checkout (gate scripts come from the base branch)
         uses: actions/checkout@v4
@@ -92,6 +97,10 @@ jobs:
           echo "authorized=$(has hw-run && echo true || echo false)" >> "$GITHUB_OUTPUT"
           echo "human_reviewed=$(has human-reviewed && echo true || echo false)" >> "$GITHUB_OUTPUT"
           echo "draft=$(jq -r .isDraft <<<"$json")" >> "$GITHUB_OUTPUT"
+          case '${{ github.event.pull_request.author_association }}' in
+            OWNER|MEMBER|COLLABORATOR) echo "member=true" >> "$GITHUB_OUTPUT" ;;
+            *) echo "member=false" >> "$GITHUB_OUTPUT" ;;
+          esac
           action='${{ github.event.action }}'
           label='${{ github.event.label.name }}'
           if [ "$action" = "labeled" ] && [ "$label" != "hw-run" ]; then
@@ -125,6 +134,13 @@ jobs:
     timeout-minutes: 20
     env:
       GH_TOKEN: ${{ github.token }}
+    outputs:
+      # Hardware authorization without a human label. Granted when the author
+      # is a repo member/collaborator, or when the diff touches no
+      # exec-sensitive path AND the reviewer judged execution_risk == none.
+      # Anything else waits for a maintainer's `hw-run`, which always wins.
+      auto_authorize: ${{ steps.auth.outputs.auto_authorize }}
+      auth_reason: ${{ steps.auth.outputs.reason }}
     steps:
       - name: Base checkout (gate scripts)
         uses: actions/checkout@v4
@@ -154,6 +170,22 @@ jobs:
             --hw-run-result pending \
             --system-prompt base/scripts/hw-gate/review.md \
             --out prelim.json
+      - name: Decide hardware authorization
+        id: auth
+        if: always()
+        run: |
+          set -euo pipefail
+          level=$(jq -r '.prelim.execution_risk.level // "unknown"' prelim.json 2>/dev/null || echo unknown)
+          exec_sensitive='${{ needs.select.outputs.exec_sensitive }}'
+          member='${{ needs.select.outputs.member }}'
+          if [ "$member" = "true" ]; then
+            echo "auto_authorize=true" >> "$GITHUB_OUTPUT"; echo "reason=author is a repository member/collaborator" >> "$GITHUB_OUTPUT"
+          elif [ -z "$exec_sensitive" ] && [ "$level" = "none" ]; then
+            echo "auto_authorize=true" >> "$GITHUB_OUTPUT"; echo "reason=no exec-sensitive paths and reviewer execution_risk=none" >> "$GITHUB_OUTPUT"
+          else
+            echo "auto_authorize=false" >> "$GITHUB_OUTPUT"; echo "reason=exec-sensitive paths [$exec_sensitive] or reviewer execution_risk=$level; a maintainer must apply hw-run" >> "$GITHUB_OUTPUT"
+          fi
+          echo "hardware authorization: $(tail -1 "$GITHUB_OUTPUT")" >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -163,7 +195,7 @@ jobs:
   hw-run:
     name: hardware run (gfx1201)
     needs: [select, prelim]
-    if: always() && needs.select.result == 'success' && needs.select.outputs.needs_hw == 'true' && needs.select.outputs.authorized == 'true' && needs.select.outputs.run_hw == 'true'
+    if: always() && needs.select.result == 'success' && needs.select.outputs.needs_hw == 'true' && needs.select.outputs.run_hw == 'true' && (needs.select.outputs.authorized == 'true' || needs.prelim.outputs.auto_authorize == 'true')
     runs-on: [self-hosted, hiptrx, gfx1201]
     timeout-minutes: 45
     env:
@@ -206,7 +238,7 @@ jobs:
   hw-review:
     name: reviewer verdict (diff + evidence)
     needs: [select, prelim, hw-run]
-    if: always() && needs.select.result == 'success' && needs.select.outputs.needs_hw == 'true' && needs.select.outputs.authorized == 'true' && needs.select.outputs.run_hw == 'true'
+    if: always() && needs.select.result == 'success' && needs.select.outputs.needs_hw == 'true' && needs.select.outputs.run_hw == 'true' && (needs.select.outputs.authorized == 'true' || needs.prelim.outputs.auto_authorize == 'true')
     runs-on: [self-hosted, hiptrx, gfx1201]
     timeout-minutes: 30
     env:
@@ -267,7 +299,7 @@ jobs:
     # past a red hw-gate is expected to have read the evidence; `human-reviewed`
     # records that.
     name: hw-gate
-    needs: [select, hw-run, hw-review]
+    needs: [select, prelim, hw-run, hw-review]
     if: always()
     runs-on: ubuntu-latest
     env:
@@ -286,8 +318,8 @@ jobs:
           fi
           if [ "${{ needs.select.outputs.run_hw }}" = "true" ]; then
             # This event ran the hardware + reviewer jobs: their results are authoritative.
-            if [ "${{ needs.select.outputs.authorized }}" != "true" ]; then
-              echo "::error::hardware-relevant diff; a maintainer must apply the 'hw-run' label"; exit 1
+            if [ "${{ needs.select.outputs.authorized }}" != "true" ] && [ "${{ needs.prelim.outputs.auto_authorize }}" != "true" ]; then
+              echo "::error::hardware not authorized: ${{ needs.prelim.outputs.auth_reason }}"; exit 1
             fi
             if [ "${{ needs.hw-run.result }}" != "success" ]; then
               echo "::error::hardware run did not pass"; exit 1

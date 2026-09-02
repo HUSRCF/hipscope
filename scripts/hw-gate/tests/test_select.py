@@ -112,7 +112,7 @@ def test_empty_stdin_via_main():
     assert data["needs_hw"] is False
 
 
-def test_github_output_writes_three_lines(tmp_path=None):
+def test_github_output_writes_four_lines(tmp_path=None):
     # use tempfile for github output
     import tempfile
     with tempfile.NamedTemporaryFile(mode="w+", delete=False) as tf:
@@ -125,7 +125,7 @@ def test_github_output_writes_three_lines(tmp_path=None):
     # github-output file should have three lines
     text = Path(out_path).read_text()
     lines = text.strip().splitlines()
-    assert len(lines) == 3
+    assert len(lines) == 4
     assert lines[0].startswith("needs_hw=")
     assert lines[1].startswith("buckets=")
     assert lines[2].startswith("policy=")
@@ -491,3 +491,30 @@ def test_main_multiple_buckets_csv():
         assert "buckets=kernel,load,serve" in gh_text
     finally:
         Path(gh).unlink(missing_ok=True)
+
+
+
+def test_exec_sensitive_paths_are_reported_separately():
+    res = classify([
+        "crates/hipfire-loader/src/carriers.rs",   # load, not exec-sensitive
+        "crates/hipfire-loader/build.rs",          # exec-sensitive
+        "crates/hipfire-runtime/Cargo.toml",       # exec-sensitive (and load)
+        "scripts/serve_harness.py",                # exec-sensitive
+        "kernels/attn.hip",                        # kernel, not exec-sensitive
+        "docs/x.md",
+    ])
+    assert res["exec_sensitive_paths"] == [
+        "crates/hipfire-loader/build.rs",
+        "crates/hipfire-runtime/Cargo.toml",
+        "scripts/serve_harness.py",
+    ]
+    assert res["needs_hw"] is True
+    # a pure Rust/HIP diff carries no exec-sensitive paths
+    assert classify(["crates/hipfire-loader/src/carriers.rs", "kernels/attn.hip"])["exec_sensitive_paths"] == []
+
+
+def test_github_output_includes_exec_sensitive(tmp_path):
+    out = tmp_path / "gh.out"
+    run_select("crates/hipfire-loader/build.rs\n", "--github-output", str(out))
+    text = out.read_text()
+    assert "exec_sensitive=crates/hipfire-loader/build.rs" in text

@@ -17,9 +17,10 @@ CONTRACT
           "needs_hw": bool,                 # any bucket other than none
           "buckets": ["load", "serve", "kernel"],   # sorted, deduplicated, may be []
           "policy_paths": ["..."],          # touched paths matching POLICY (never bot-approvable)
+          "exec_sensitive_paths": ["..."],  # build scripts, manifests, shell/python, CI: hardware needs a human label
           "surfaces": {"load": ["path", ...], "serve": [...], "kernel": [...], "policy": [...], "other": [...]}
         }
-    --github-output FILE : append `needs_hw=`, `buckets=` (comma-joined), `policy=` (comma-joined) lines
+    --github-output FILE : append `needs_hw=`, `buckets=`, `policy=`, `exec_sensitive=` (comma-joined) lines
     exit 0 always on well-formed input; exit 2 on usage error
 
 BUCKET RULES (first match wins per path; a path may hit `policy` in addition)
@@ -36,6 +37,11 @@ BUCKET RULES (first match wins per path; a path may hit `policy` in addition)
     none   : everything else (docs/**, benchmarks/**, scripts/** except hw-gate, tests/**, *.md, ...)
 
     `serve` and `kernel` imply `load` (the fixtures must still load through the user route).
+
+EXEC-SENSITIVE (touching any of these => hardware runs only after a maintainer applies `hw-run`;
+    otherwise the reviewer's prelim `execution_risk.level == "none"` authorizes hardware on its own)
+    **/build.rs, .cargo/**, Cargo.toml, Cargo.lock, crates/*/Cargo.toml, rust-toolchain*, .github/**,
+    scripts/**, tools/**, **/*.sh, **/*.py, Makefile, justfile, Dockerfile*, flake.nix, nix/**
 
 POLICY (touching any of these => policy_paths non-empty => review.py may never greenlight)
     .github/workflows/**, .github/CODEOWNERS, scripts/hw-gate/**, scripts/leanup-thresholds.txt,
@@ -103,6 +109,30 @@ _LOAD_PATTERNS: list[str] = [
     "crates/*/Cargo.toml",
 ]
 
+# Paths whose change alters what the hardware job EXECUTES beyond the crate's
+# own Rust/HIP: build scripts, dependency manifests, shell/python that the
+# harnesses run, CI. A diff touching none of these, judged low-risk by the
+# reviewer's prelim, is authorized for hardware without a human label.
+_EXEC_SENSITIVE_PATTERNS: list[str] = [
+    "**/build.rs",
+    "build.rs",
+    ".cargo/**",
+    "Cargo.toml",
+    "Cargo.lock",
+    "crates/*/Cargo.toml",
+    "rust-toolchain*",
+    ".github/**",
+    "scripts/**",
+    "tools/**",
+    "**/*.sh",
+    "**/*.py",
+    "Makefile",
+    "justfile",
+    "Dockerfile*",
+    "flake.nix",
+    "nix/**",
+]
+
 _POLICY_PATTERNS: list[str] = [
     ".github/workflows/**",
     ".github/CODEOWNERS",
@@ -136,6 +166,7 @@ def classify(paths: list[str]) -> dict:
     buckets: set[str] = set()
     policy_paths: list[str] = []
     seen_policy: set[str] = set()
+    exec_sensitive_paths: list[str] = []
     surfaces: dict[str, list[str]] = {
         "load": [],
         "serve": [],
@@ -159,6 +190,9 @@ def classify(paths: list[str]) -> dict:
         if is_policy and p not in seen_surfaces["policy"]:
             surfaces["policy"].append(p)
             seen_surfaces["policy"].add(p)
+
+        if _matches(p, _EXEC_SENSITIVE_PATTERNS) and p not in exec_sensitive_paths:
+            exec_sensitive_paths.append(p)
 
         # bucket: first match wins
         bucket: str | None = None
@@ -220,6 +254,7 @@ def classify(paths: list[str]) -> dict:
         "needs_hw": needs_hw,
         "buckets": sorted_buckets,
         "policy_paths": policy_paths,
+        "exec_sensitive_paths": exec_sensitive_paths,
         "surfaces": surfaces,
     }
 
@@ -241,6 +276,7 @@ def main(argv: list[str] | None = None) -> int:
             fh.write(f"needs_hw={'true' if result['needs_hw'] else 'false'}\n")
             fh.write(f"buckets={','.join(result['buckets'])}\n")
             fh.write(f"policy={','.join(result['policy_paths'])}\n")
+            fh.write(f"exec_sensitive={','.join(result['exec_sensitive_paths'])}\n")
     return 0
 
 
