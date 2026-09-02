@@ -23,12 +23,14 @@
   },
   {
     "genre": "format",
-    "prompt": "Reply with exactly this JSON object and nothing else: {\"tool\": \"get_weather\", \"city\": \"Tokyo\"}",
+    "prompt": "Convert this to a JSON object with keys \"name\", \"age\", and \"city\", and reply with only the JSON: Alice is 34 and lives in Lisbon.",
     "expect": [
-      "\"tool\"",
-      "\"get_weather\"",
+      "\"name\"",
+      "Alice",
+      "\"age\"",
+      "34",
       "\"city\"",
-      "\"Tokyo\""
+      "Lisbon"
     ]
   },
   {
