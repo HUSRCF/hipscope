@@ -15,7 +15,7 @@ CONTRACT
     stdout: JSON (also written to --json PATH when given)
         {
           "schema": "hipfire.hw-gate.select", "version": 1,
-          "needs_hw": bool,                 # any bucket other than none
+          "needs_hw": bool,                 # any bucket, OR any policy path (the seats must review those)
           "buckets": ["load", "serve", "kernel"],   # sorted, deduplicated, may be []
           "policy_paths": ["..."],          # touched paths matching POLICY (never bot-approvable)
           "exec_sensitive_paths": ["..."],  # informational input to the reviewer (not a gate)
@@ -318,7 +318,10 @@ def classify(paths: list[str]) -> dict:
             # and we do NOT record in other (policy only semantics).
 
     sorted_buckets = sorted(buckets)
-    needs_hw = bool(sorted_buckets)
+    # Policy-file changes have no fixtures of their own but must go through
+    # the seats and the hard floor; a policy-only diff must never pass the
+    # required status by skipping the gate.
+    needs_hw = bool(sorted_buckets) or bool(policy_paths)
 
     return {
         "schema": "hipfire.hw-gate.select",

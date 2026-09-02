@@ -22,18 +22,20 @@
     ]
   },
   {
-    "genre": "tool-call",
-    "prompt": "You have a tool `get_weather(city: str)`. The user asks: what's the weather in Tokyo right now? Call the tool.",
+    "genre": "format",
+    "prompt": "Reply with exactly this JSON object and nothing else: {\"tool\": \"get_weather\", \"city\": \"Tokyo\"}",
     "expect": [
-      "get_weather",
-      "Tokyo"
+      "\"tool\"",
+      "\"get_weather\"",
+      "\"city\"",
+      "\"Tokyo\""
     ]
   },
   {
     "genre": "reason",
-    "prompt": "A farmer has 17 sheep. All but 9 run away. How many sheep are left? Explain briefly, then give the number.",
+    "prompt": "What is 17 + 26? Think briefly if you need to, then give the final answer on its own line in exactly the form 'Answer: N'.",
     "expect": [
-      "9"
+      "Answer: 43"
     ]
   }
 ]

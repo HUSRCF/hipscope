@@ -76,7 +76,9 @@ def test_docs_none():
 def test_leanup_thresholds_policy_only():
     res = classify(["scripts/leanup-thresholds.txt"])
     assert res["buckets"] == []
-    assert res["needs_hw"] is False
+    # policy-only diffs have no fixtures but MUST go through the seats and the
+    # hard floor; a policy-only diff never passes the status by skipping the gate
+    assert res["needs_hw"] is True
     assert "scripts/leanup-thresholds.txt" in res["policy_paths"]
     assert "scripts/leanup-thresholds.txt" in res["surfaces"]["policy"]
     # policy-only should not appear in other
@@ -422,13 +424,15 @@ def test_buckets_sorted():
     assert res["needs_hw"] is True
 
 
-def test_needs_hw_false_when_only_policy_or_other():
+def test_needs_hw_true_for_policy_false_for_other_only():
     res = classify(["docs/x.md", "scripts/leanup-thresholds.txt"])
-    # policy-only plus other => buckets still []
+    # policy plus other => no buckets, but the seats must review the policy change
     assert res["buckets"] == []
-    assert res["needs_hw"] is False
-    # but policy_paths non-empty
+    assert res["needs_hw"] is True
     assert "scripts/leanup-thresholds.txt" in res["policy_paths"]
+    # other-only => nothing for the gate to do
+    res = classify(["docs/x.md", "benchmarks/prompts/foo.txt"])
+    assert res["buckets"] == [] and res["policy_paths"] == [] and res["needs_hw"] is False
 
 
 def test_surfaces_lists_every_path():

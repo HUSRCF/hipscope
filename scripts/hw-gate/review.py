@@ -1181,17 +1181,18 @@ def _run_decide(args) -> int:
             merged = {"base": staging, "head": args.head, "merge_sha": merge_sha}
         except ReviewError as e:
             err_msg = str(e)
-            # Check for 409
+            # Nothing merged, so the decision cannot stay merge-staging: the
+            # required status would go green with the head still un-staged.
+            # A 409 (conflict / already merged) or any other failure becomes a
+            # hold for a human to resolve; the intended decision is recorded.
+            merged = {"base": staging, "head": args.head, "merge_sha": None, "error": err_msg}
             is_409 = "409" in err_msg or "already" in err_msg.lower() or "conflict" in err_msg.lower()
-            # For fake gh, we may need to check fake behavior: it may return 409 via special handling
-            # We'll treat any error containing 409 as conflict
-            if is_409:
-                merged = {"base": staging, "head": args.head, "merge_sha": None, "error": err_msg}
-                announcement_extra = f" Merge conflict (409): {err_msg} — needs-human label applied instead."
-                # decision_final stays merge-staging but label will be needs-human
-            else:
-                merged = {"base": staging, "head": args.head, "merge_sha": None, "error": err_msg}
-                announcement_extra = f" Merge failed: {err_msg}"
+            decision_final = "hold"
+            hard.append("staging_merge_failed" if not is_409 else "staging_merge_conflict")
+            announcement_extra = (
+                f" Fable decided merge-staging, but merging into `{staging}` failed"
+                f"{' with a conflict (409)' if is_409 else ''}: {err_msg}. Holding for a human."
+            )
 
     # Determine labels/reviews
     # For decide, labels: merge-staging->merged-staging (+ approve), hold->needs-human (+ comment), block->hw-gate-blocked (+ request-changes)

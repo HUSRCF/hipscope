@@ -609,7 +609,10 @@ def test_decide_409_conflict():
     tmp = Path(tempfile.mkdtemp())
     result, out_path, gh_log, gh_comments, omp_log, *_ = _run_decide(tmp, sol_final="needs-human", fable_response={"phase":"decide","decision":"merge-staging","agrees_with_sol":False,"override":{"of":"needs-human","why":"override"},"regressions":[],"further_evidence_wanted":[],"rationale":"r","announcement":"merge"}, merge_409=True)
     data = json.loads(out_path.read_text())
-    assert data["decision_final"] == "merge-staging"
+    # nothing merged => the decision cannot stay merge-staging (the status would
+    # go green with the head un-staged); it becomes a hold with the reason recorded
+    assert data["decision_final"] == "hold"
+    assert "staging_merge_conflict" in data["floor"]["hard"]
     assert data["merged"] is not None
     assert "error" in data["merged"]
     assert "409" in data["merged"]["error"] or "409" in str(data["merged"])
