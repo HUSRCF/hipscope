@@ -2514,7 +2514,7 @@ impl WeightSource for HfqSource<'_> {
             );
         }
         let (embd_meta, embd_data) = qwen35_tensor_data_cow(self.hfq, "embed_tokens.weight")
-            .ok_or_else(|| HipError::new(0, "qwen35: embed_tokens.weight missing"))?;
+            .expect("embed_tokens not found");
         let out = load_embedding(gpu, embd_meta.quant_type, &embd_data, c.vocab_size, c.dim)?;
         drop(embd_data);
         Ok(out)
@@ -2546,13 +2546,13 @@ impl WeightSource for HfqSource<'_> {
             c.vocab_size,
             c.dim,
             |gpu| {
-                let (lm_info, lm_data) = qwen35_tensor_data_cow(hfq, "lm_head.weight")
-                    .ok_or_else(|| HipError::new(0, "qwen35: lm_head.weight missing"))?;
+                let (lm_info, lm_data) =
+                    qwen35_tensor_data_cow(hfq, "lm_head.weight").expect("lm_head present");
                 load_weight_tensor_raw(gpu, lm_info.quant_type, &lm_data, c.vocab_size, c.dim)
             },
             |gpu| {
                 let (embd_meta, embd_data) = qwen35_tensor_data_cow(hfq, "embed_tokens.weight")
-                    .ok_or_else(|| HipError::new(0, "qwen35: embed_tokens.weight missing"))?;
+                    .expect("embed_tokens not found");
                 dequant_weight_raw(gpu, embd_meta.quant_type, &embd_data, c.vocab_size, c.dim)
             },
         )?;
@@ -2576,9 +2576,6 @@ impl WeightSource for HfqSource<'_> {
             self.hfq.drop_pages_range(start, end - start);
         }
         Ok(lw)
-    }
-    fn free_layer(&mut self, gpu: &mut Gpu, layer: LayerWeights) {
-        layer.free_gpu(gpu);
     }
 }
 
@@ -2692,9 +2689,6 @@ impl WeightSource for ParoSource<'_> {
             )
         };
         crate::layer_driver::load_layer(&mut b, c, layer_idx, moe)
-    }
-    fn free_layer(&mut self, gpu: &mut Gpu, layer: LayerWeights) {
-        layer.free_gpu(gpu);
     }
 }
 

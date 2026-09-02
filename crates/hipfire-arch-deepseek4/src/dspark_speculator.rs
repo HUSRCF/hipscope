@@ -316,9 +316,6 @@ pub fn build_deepseek4_dspark_speculator(
         core_weights,
         stage_norm.shallow_clone(),
         lm_head.shallow_clone(),
-        false, // core_weights aliases weights.dspark in the target bundle
-        false, // stage_norm aliases the target's MTP final norm
-        false, // lm_head aliases the target's main head
         block,
         ctx_capacity,
         conf_threshold,
@@ -490,9 +487,6 @@ mod tests {
             core_weights,
             stage_norm,
             lm_head,
-            true,
-            true,
-            true,
             2,
             8,
             0.3,

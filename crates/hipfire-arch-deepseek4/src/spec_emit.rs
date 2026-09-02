@@ -200,7 +200,8 @@ impl<'a> SpecEmit for Deepseek4Emit<'a> {
         // held finish events for the wrapper — the generic generate_spec core
         // must NOT render them before length/malformed is known.
         let mut events = Vec::new();
-        for ev in self.deferred.absorb_all(self.parser.finish()) {
+        let parser = std::mem::replace(&mut self.parser, dsml::StreamParser::new());
+        for ev in self.deferred.absorb_all(parser.finish()) {
             if let Some(ce) = visible_client_event(ev) {
                 if let ClientEvent::Token(ref t) = ce {
                     self.visible_acc.push_str(t);

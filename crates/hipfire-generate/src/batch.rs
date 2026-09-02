@@ -221,13 +221,10 @@ pub fn drive_qwen_continuous_batch(
     stdout: &mut std::io::Stdout,
     inbox: &mut DaemonInbox,
 ) -> Result<(), BatchDriveError> {
-    crate::ar::set_generation_route(crate::ar::GenerationRoute::QwenAr);
     let batch_size = sched.max_batch;
     if batch_size == 0 {
         return Ok(());
     }
-    // The batch-state view is retained for the decode loop; the failure
-    // callback receives the model only at a return boundary.
     // SAFETY: borrow disjoint fields via raw pointers to avoid &mut aliasing
     // qwen35_decode_batch now lives inside Qwen35Bundle.
     let b_ptr = match model.state.as_mut().and_then(|s| {
@@ -279,8 +276,8 @@ pub fn drive_qwen_continuous_batch(
     let mut positions = vec![0usize; batch_size];
     let fail_all = |sched: &mut ContinuousBatchScheduler,
                     gpu: &mut rdna_compute::Gpu,
+                    batch_state: &mut qwen35::Qwen35DecodeBatchState,
                     stdout: &mut std::io::Stdout,
-                    model: &mut LoadedModel,
                     reason: String|
      -> Result<(), BatchDriveError> {
         let mut uniq_set = std::collections::HashSet::new();
@@ -302,17 +299,17 @@ pub fn drive_qwen_continuous_batch(
                 uniq.push(k);
             }
         }
-        // The callback is terminal and all subfield views are dead on return.
-        let ep = match model.reset_context(gpu) {
-            Ok(()) => crate::common::RollbackEpilogue {
-                rolled_back: true,
-                context: None,
-            },
-            Err(e) => crate::common::RollbackEpilogue {
-                rolled_back: false,
-                context: Some(e),
-            },
+        let mut first_err: Option<String> = None;
+        if let Err(e) = batch_state.reset(gpu) {
+            first_err = Some(format!("batch reset: {e}"));
+        }
+        crate::common::fail_closed_invalidate_graphs_and_replay(gpu);
+        let sync = crate::common::fail_closed_device_sync(gpu);
+        let prior = match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
         };
+        let ep = crate::common::fail_closed_epilogue_after_sync(prior, sync);
         for key in &uniq {
             let _scope = BatchAttemptScope::enter(key.attempt_id);
             crate::common::emit_fail_closed_error(
@@ -357,13 +354,13 @@ pub fn drive_qwen_continuous_batch(
                 return fail_all(
                     sched,
                     gpu,
+                    batch_state,
                     stdout,
-                    model,
                     format!("reset lane {idx} on abort: {e}"),
                 );
             }
             let _scope = BatchAttemptScope::enter(key.attempt_id);
-            crate::ar::emit_active_route_cancel(stdout, &key.id, 0);
+            emit_qwen_ar_cancelled(stdout, &key.id, 0);
             let _ = sched.abort_lane(idx, &key);
             producers[idx] = None;
         }
@@ -377,8 +374,8 @@ pub fn drive_qwen_continuous_batch(
                     return fail_all(
                         sched,
                         gpu,
+                        batch_state,
                         stdout,
-                        model,
                         format!("reset lane {idx} on commit: {e}"),
                     );
                 }
@@ -405,7 +402,7 @@ pub fn drive_qwen_continuous_batch(
                     producers[idx] = None;
                 }
                 BatchCommitTeardownClass::EmitDone => {
-                    crate::ar::emit_active_route_done(stdout, &key.id, &pending_done);
+                    emit_staged_terminal_done(stdout, &pending_done);
                     producers[idx] = None;
                 }
             }
@@ -418,7 +415,7 @@ pub fn drive_qwen_continuous_batch(
         }
         for k in queued_abort {
             let _scope = BatchAttemptScope::enter(k.attempt_id);
-            crate::ar::emit_active_route_cancel(stdout, &k.id, 0);
+            emit_qwen_ar_cancelled(stdout, &k.id, 0);
             let _ = sched.abort_queued(&k);
         }
         let mut running_abort: Vec<(usize, AttemptKey)> = Vec::new();
@@ -438,13 +435,13 @@ pub fn drive_qwen_continuous_batch(
                 return fail_all(
                     sched,
                     gpu,
+                    batch_state,
                     stdout,
-                    model,
                     format!("reset lane {idx} on running abort: {e}"),
                 );
             }
             let _scope = BatchAttemptScope::enter(key.attempt_id);
-            crate::ar::emit_active_route_cancel(stdout, &key.id, 0);
+            emit_qwen_ar_cancelled(stdout, &key.id, 0);
             let _ = sched.abort_lane(idx, &key);
             producers[idx] = None;
         }
@@ -492,13 +489,13 @@ pub fn drive_qwen_continuous_batch(
                         batch_announce_terminal(&id, attempt_id);
                         if batch_check_abort(&id, attempt_id) {
                             let _scope = BatchAttemptScope::enter(attempt_id);
-                            crate::ar::emit_generation_start(
-                                crate::ar::GenerationRoute::QwenAr,
+                            emit_gen_start(
                                 stdout,
                                 &id,
                                 false,
+                                Some(QWEN_AR_SEMANTIC_CONTRACT_VERSION),
                             );
-                            crate::ar::emit_active_route_cancel(stdout, &id, 0);
+                            emit_qwen_ar_cancelled(stdout, &id, 0);
                             batch_clear_terminal(&id, attempt_id);
                             continue;
                         }
@@ -663,11 +660,11 @@ pub fn drive_qwen_continuous_batch(
                         }
                         {
                             let _scope = BatchAttemptScope::enter(attempt_id);
-                            crate::ar::emit_generation_start(
-                                crate::ar::GenerationRoute::QwenAr,
+                            emit_gen_start(
                                 stdout,
                                 &id,
                                 started_in_think,
+                                Some(QWEN_AR_SEMANTIC_CONTRACT_VERSION),
                             );
                         }
                     } else if t == "abort" || t == "commit" {
@@ -712,8 +709,8 @@ pub fn drive_qwen_continuous_batch(
                     return fail_all(
                         sched,
                         gpu,
+                        batch_state,
                         stdout,
-                        model,
                         format!("reset lane {lane_idx} on think barrier: {err}"),
                     );
                 }
@@ -730,8 +727,8 @@ pub fn drive_qwen_continuous_batch(
                 return fail_all(
                     sched,
                     gpu,
+                    batch_state,
                     stdout,
-                    model,
                     format!("reset lane {lane_idx}: {e}"),
                 );
             }
@@ -741,8 +738,8 @@ pub fn drive_qwen_continuous_batch(
                 return fail_all(
                     sched,
                     gpu,
+                    batch_state,
                     stdout,
-                    model,
                     format!("prefill lane {lane_idx}: {e}"),
                 );
             }
@@ -770,8 +767,8 @@ pub fn drive_qwen_continuous_batch(
                     return fail_all(
                         sched,
                         gpu,
+                        batch_state,
                         stdout,
-                        model,
                         format!("sample lane {lane_idx}: {e}"),
                     )
                 }
@@ -860,8 +857,8 @@ pub fn drive_qwen_continuous_batch(
             return fail_all(
                 sched,
                 gpu,
+                batch_state,
                 stdout,
-                model,
                 format!("forward_decode_batch: {e}"),
             );
         }
@@ -932,8 +929,8 @@ pub fn drive_qwen_continuous_batch(
                         return fail_all(
                             sched,
                             gpu,
+                            batch_state,
                             stdout,
-                            model,
                             format!("semantic classify lane {idx}: {e}"),
                         )
                     }
@@ -961,8 +958,8 @@ pub fn drive_qwen_continuous_batch(
                         return fail_all(
                             sched,
                             gpu,
+                            batch_state,
                             stdout,
-                            model,
                             format!("semantic finish lane {idx}: {e}"),
                         )
                     }
@@ -975,8 +972,8 @@ pub fn drive_qwen_continuous_batch(
                         return fail_all(
                             sched,
                             gpu,
+                            batch_state,
                             stdout,
-                            model,
                             format!("reset lane {idx} on open think: {e}"),
                         );
                     }
@@ -999,8 +996,8 @@ pub fn drive_qwen_continuous_batch(
                     return fail_all(
                         sched,
                         gpu,
+                        batch_state,
                         stdout,
-                        model,
                         format!("semantic finish lane {idx}: unexpected tool calls"),
                     );
                 }
@@ -1065,13 +1062,13 @@ pub fn drive_qwen_continuous_batch(
                 return fail_all(
                     sched,
                     gpu,
+                    batch_state,
                     stdout,
-                    model,
                     format!("reset lane {idx} on abort post-forward: {e}"),
                 );
             }
             let _scope = BatchAttemptScope::enter(key.attempt_id);
-            crate::ar::emit_active_route_cancel(stdout, &key.id, 0);
+            emit_qwen_ar_cancelled(stdout, &key.id, 0);
             let _ = sched.abort_lane(idx, &key);
             producers[idx] = None;
         }
@@ -1134,7 +1131,15 @@ pub fn drive_qwen_continuous_batch(
             sampling.frequency_penalty,
         ) {
             Ok(v) => v,
-            Err(e) => return fail_all(sched, gpu, stdout, model, format!("sample_product: {e}")),
+            Err(e) => {
+                return fail_all(
+                    sched,
+                    gpu,
+                    batch_state,
+                    stdout,
+                    format!("sample_product: {e}"),
+                )
+            }
         };
         for lane_idx in survivors.iter() {
             let (tok, rng) = sampled[*lane_idx];
@@ -1153,7 +1158,6 @@ pub fn drive_lfm_continuous_batch(
     stdout: &mut std::io::Stdout,
     inbox: &mut DaemonInbox,
 ) -> Result<(), BatchDriveError> {
-    crate::ar::set_generation_route(crate::ar::GenerationRoute::LfmAr);
     let batch_size = sched.max_batch;
     if batch_size == 0 {
         return Ok(());
@@ -1293,7 +1297,7 @@ pub fn drive_lfm_continuous_batch(
                 );
             }
             let _scope = BatchAttemptScope::enter(key.attempt_id);
-            crate::ar::emit_active_route_cancel(stdout, &key.id, 0);
+            emit_qwen_ar_cancelled(stdout, &key.id, 0);
             let _ = sched.abort_lane(idx, &key);
         }
         for (idx, key, pending_done) in to_commit {
@@ -1329,7 +1333,7 @@ pub fn drive_lfm_continuous_batch(
                     let _ = sched.abort_lane(idx, &key);
                 }
                 BatchCommitTeardownClass::EmitDone => {
-                    crate::ar::emit_active_route_done(stdout, &key.id, &pending_done);
+                    emit_staged_terminal_done(stdout, &pending_done);
                 }
             }
         }
@@ -1341,7 +1345,7 @@ pub fn drive_lfm_continuous_batch(
         }
         for k in queued_abort {
             let _scope = BatchAttemptScope::enter(k.attempt_id);
-            crate::ar::emit_active_route_cancel(stdout, &k.id, 0);
+            emit_qwen_ar_cancelled(stdout, &k.id, 0);
             let _ = sched.abort_queued(&k);
         }
         let mut running_abort: Vec<(usize, AttemptKey)> = Vec::new();
@@ -1367,7 +1371,7 @@ pub fn drive_lfm_continuous_batch(
                 );
             }
             let _scope = BatchAttemptScope::enter(key.attempt_id);
-            crate::ar::emit_active_route_cancel(stdout, &key.id, 0);
+            emit_qwen_ar_cancelled(stdout, &key.id, 0);
             let _ = sched.abort_lane(idx, &key);
         }
         let mut barrier: Option<DaemonMsg> = None;
@@ -1442,13 +1446,8 @@ pub fn drive_lfm_continuous_batch(
                         batch_announce_terminal(&id, attempt_id);
                         if batch_check_abort(&id, attempt_id) {
                             let _scope = BatchAttemptScope::enter(attempt_id);
-                            crate::ar::emit_generation_start(
-                                crate::ar::GenerationRoute::LfmAr,
-                                stdout,
-                                &id,
-                                false,
-                            );
-                            crate::ar::emit_active_route_cancel(stdout, &id, 0);
+                            emit_gen_start(stdout, &id, false, None);
+                            emit_qwen_ar_cancelled(stdout, &id, 0);
                             batch_clear_terminal(&id, attempt_id);
                             continue;
                         }
@@ -1622,12 +1621,7 @@ pub fn drive_lfm_continuous_batch(
                         }
                         {
                             let _scope = BatchAttemptScope::enter(attempt_id);
-                            crate::ar::emit_generation_start(
-                                crate::ar::GenerationRoute::LfmAr,
-                                stdout,
-                                &id,
-                                started_in_think,
-                            );
+                            emit_gen_start(stdout, &id, started_in_think, None);
                         }
                     } else if t == "abort" || t == "commit" {
                         if let (Some(id), Some(aid), Some(kind)) = (
@@ -2536,7 +2530,6 @@ pub fn drive_qwen35_ep_continuous_batch(
     stdout: &mut std::io::Stdout,
     inbox: &mut DaemonInbox,
 ) -> Result<(), BatchDriveError> {
-    crate::ar::set_generation_route(crate::ar::GenerationRoute::QwenAr);
     let batch_size = sched.max_batch;
     if batch_size == 0 {
         return Ok(());
@@ -2563,7 +2556,7 @@ pub fn drive_qwen35_ep_continuous_batch(
                     }
                 };
                 (
-                    &mut ep.gpus as *mut hipfire_hardware::Gpus,
+                    &mut ep.gpus as *mut hipfire_runtime::multi_gpu::Gpus,
                     config as *const qwen35::Qwen35Config,
                     weights as *const Vec<qwen35::Qwen35Weights>,
                     b,
@@ -2578,7 +2571,7 @@ pub fn drive_qwen35_ep_continuous_batch(
             _ => return Err(BatchDriveError::Gpu("EP batch: not Qwen35 EP".to_string())),
         }
     };
-    let gpus: &mut hipfire_hardware::Gpus = unsafe { &mut *gpus_ptr };
+    let gpus: &mut hipfire_runtime::multi_gpu::Gpus = unsafe { &mut *gpus_ptr };
     let config: &qwen35::Qwen35Config = unsafe { &*config_ptr };
     let weights: &Vec<qwen35::Qwen35Weights> = unsafe { &*weights_ptr };
     let batch_state: &mut qwen35::Qwen35DecodeBatchEpState = unsafe { &mut *batch_ptr };
@@ -2598,7 +2591,7 @@ pub fn drive_qwen35_ep_continuous_batch(
     // Track last attested receipt for evidence; must be from runtime, never load logs.
     let mut last_receipt: Option<qwen35::Qwen35EpBatchReceipt> = None;
     let fail_all = |sched: &mut ContinuousBatchScheduler,
-                    gpus: &mut hipfire_hardware::Gpus,
+                    gpus: &mut hipfire_runtime::multi_gpu::Gpus,
                     batch_state: &mut qwen35::Qwen35DecodeBatchEpState,
                     stdout: &mut std::io::Stdout,
                     reason: String|
@@ -2678,7 +2671,7 @@ pub fn drive_qwen35_ep_continuous_batch(
                 );
             }
             let _scope = BatchAttemptScope::enter(key.attempt_id);
-            crate::ar::emit_active_route_cancel(stdout, &key.id, 0);
+            emit_qwen_ar_cancelled(stdout, &key.id, 0);
             let _ = sched.abort_lane(idx, &key);
             producers[idx] = None;
         }
@@ -2716,7 +2709,7 @@ pub fn drive_qwen35_ep_continuous_batch(
                     producers[idx] = None;
                 }
                 BatchCommitTeardownClass::EmitDone => {
-                    crate::ar::emit_active_route_done(stdout, &key.id, &pending_done);
+                    emit_staged_terminal_done(stdout, &pending_done);
                     producers[idx] = None;
                 }
             }
@@ -2729,7 +2722,7 @@ pub fn drive_qwen35_ep_continuous_batch(
         }
         for k in queued_abort {
             let _scope = BatchAttemptScope::enter(k.attempt_id);
-            crate::ar::emit_active_route_cancel(stdout, &k.id, 0);
+            emit_qwen_ar_cancelled(stdout, &k.id, 0);
             let _ = sched.abort_queued(&k);
         }
         let mut running_abort: Vec<(usize, AttemptKey)> = Vec::new();
@@ -2755,7 +2748,7 @@ pub fn drive_qwen35_ep_continuous_batch(
                 );
             }
             let _scope = BatchAttemptScope::enter(key.attempt_id);
-            crate::ar::emit_active_route_cancel(stdout, &key.id, 0);
+            emit_qwen_ar_cancelled(stdout, &key.id, 0);
             let _ = sched.abort_lane(idx, &key);
             producers[idx] = None;
         }
@@ -2803,13 +2796,13 @@ pub fn drive_qwen35_ep_continuous_batch(
                         batch_announce_terminal(&id, attempt_id);
                         if batch_check_abort(&id, attempt_id) {
                             let _scope = BatchAttemptScope::enter(attempt_id);
-                            crate::ar::emit_generation_start(
-                                crate::ar::GenerationRoute::QwenAr,
+                            emit_gen_start(
                                 stdout,
                                 &id,
                                 false,
+                                Some(QWEN_AR_SEMANTIC_CONTRACT_VERSION),
                             );
-                            crate::ar::emit_active_route_cancel(stdout, &id, 0);
+                            emit_qwen_ar_cancelled(stdout, &id, 0);
                             batch_clear_terminal(&id, attempt_id);
                             continue;
                         }
@@ -2967,11 +2960,11 @@ pub fn drive_qwen35_ep_continuous_batch(
                         }
                         {
                             let _scope = BatchAttemptScope::enter(attempt_id);
-                            crate::ar::emit_generation_start(
-                                crate::ar::GenerationRoute::QwenAr,
+                            emit_gen_start(
                                 stdout,
                                 &id,
                                 false,
+                                Some(QWEN_AR_SEMANTIC_CONTRACT_VERSION),
                             );
                         }
                     } else if t == "abort" || t == "commit" {
@@ -3359,7 +3352,7 @@ pub fn drive_qwen35_ep_continuous_batch(
                 );
             }
             let _scope = BatchAttemptScope::enter(key.attempt_id);
-            crate::ar::emit_active_route_cancel(stdout, &key.id, 0);
+            emit_qwen_ar_cancelled(stdout, &key.id, 0);
             let _ = sched.abort_lane(idx, &key);
             producers[idx] = None;
         }

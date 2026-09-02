@@ -34,10 +34,9 @@ use hipfire_dispatch::pipeline::superop::{
 };
 use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
 use hipfire_dispatch::types::{dtype_rotation_plan, DispatchError};
-use hipfire_runtime::llama::KvCacheExt;
 use hipfire_runtime::llama::{
-    fused_silu_mul_rotate_mq_batched_for, rotate_x_mq_batched_for, rotate_x_mq_for, weight_gemv,
-};
+    fused_silu_mul_rotate_mq_batched_for, rotate_x_mq_batched_for, rotate_x_mq_for, weight_gemv};
+use hipfire_runtime::llama::KvCacheExt;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 /// Decode one token (eager); returns the full logits vector. Used for prefill,
@@ -1636,7 +1635,7 @@ pub fn forward_batch(
 /// enabled for the fast peer-direct all-reduce.
 #[allow(clippy::too_many_arguments)]
 pub fn forward_ep(
-    gpus: &mut hipfire_hardware::Gpus,
+    gpus: &mut hipfire_runtime::multi_gpu::Gpus,
     weights_per_rank: &[MiniMaxWeights],
     cfg: &MiniMaxConfig,
     state_per_rank: &mut [MiniMaxState],
@@ -1654,7 +1653,7 @@ pub fn forward_ep(
     assert_eq!(partials.len(), n, "forward_ep: partials len");
     let hidden = cfg.hidden_size;
     let eps = cfg.rms_norm_eps;
-    let group: Vec<usize> = (0..n).collect();
+
     // 1. Embed + stage pos per rank (replicated, deterministic).
     for r in 0..n {
         gpus.devices[r]
@@ -1696,7 +1695,6 @@ pub fn forward_ep(
             gpus,
             binds.as_mut_slice(),
             partials,
-            &group,
             &program,
             hidden,
         )
