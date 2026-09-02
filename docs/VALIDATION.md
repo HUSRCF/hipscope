@@ -74,7 +74,10 @@ nothing about turn-to-turn state. The bucket decides the modes:
 
 Decoded assistant text is posted **verbatim** in the evidence comment. Reading
 it is part of review — do not treat a green check alone as having read the
-outputs.
+outputs. The per-turn prefill/decode rates in that table are harness-side
+timings (HTTP streaming, sampling) and run well under `hipfire bench`; they are
+context, never a performance claim. Perf claims go through
+[`docs/methodology/perf-benchmarking.md`](methodology/perf-benchmarking.md).
 
 ### Fork PRs and the `hw-run` label
 
