@@ -30,14 +30,10 @@ by hw-gate for the required check.
 ## hw-gate (CI, required)
 
 [`hw-gate`](../.github/workflows/hw-gate.yml) is the **required** CI check for
-every PR. Diffs that touch no hardware-relevant surface pass the select job
-immediately. Otherwise an independent reviewer model (via omp, read-only
-tools) first posts a **prelim** on the diff alone — before any hardware, so a
-maintainer reads it when deciding to apply `hw-run` — then the PR is built and
-exercised on a self-hosted gfx1201 runner, the **evidence** is posted, and the
-reviewer returns its **verdict** on diff plus evidence. Script-enforced floor rules in
-[`scripts/hw-gate/review.py`](../scripts/hw-gate/review.py) bound what the model
-may greenlight.
+every PR and the repository's autonomous review rung: two model seats decide,
+one human owns `master`. Diffs that touch no hardware-relevant surface pass
+immediately. Every decision is announced on the PR under the seat's own
+identity (`hipfire-sol[bot]`, `hipfire-fable[bot]`).
 
 ### Bucket selection (`scripts/hw-gate/select.py`)
 
@@ -52,80 +48,98 @@ Changed paths → buckets `load` / `serve` / `kernel` (first match wins per path
 | **none** | everything else (docs, benchmarks, most scripts, tests, markdown, …) |
 
 Touching **policy** paths (`.github/workflows/**`, `.github/CODEOWNERS`,
-`scripts/hw-gate/**`, leanup/ratchet scripts, `registry/**`, …) populates
-`policy_paths` and can never be bot-greenlit.
+`scripts/hw-gate/**`, leanup/ratchet scripts, `registry/**`) is part of the
+hard floor: no seat can merge those; a human does. Exec-sensitive paths (build
+scripts, manifests, toolchain, CI, shell/python) are reported to Sol as input
+to its execution-risk judgment; they are not a gate by themselves.
+
+### The author's request (`<!-- hw-gate-request -->`)
+
+A PR body may carry a fenced JSON block after the marker:
+`{"routes":[{"mode":"battery"|"chain","tag":"registry:tag"}],"claim":"..."}`.
+Sol treats the claim as a claim, runs the requested routes when the tag exists
+on the runner, reports unknown or absent tags as unavailable (not failed), and
+states in its verdict whether the claim was proven, disproven, or not
+exercised. The PR template ships the skeleton.
+
+### Seat 1 — Sol decides hardware and delivers the verdict
+
+Sol (`openai-codex/gpt-5.6-sol`, read-only tools in a PR checkout) reads the
+diff before anything runs and decides `run_hardware`: the hardware job builds
+the PR and runs its daemon as the maintainer's user on their workstation, so
+Sol refuses diffs that reach outside the process (network, filesystem beyond
+model/cache/temp, env or credential reads, process spawning, unexplained build
+or dependency changes, obfuscated blobs, unexplained `unsafe`). Nothing else
+gates hardware; a maintainer's **`hw-run`** label only ever forces a run and
+is removed after each run and on every push. Sol also composes the route list:
+the mandatory fixtures for the touched buckets, the author's requested routes,
+and its own additions.
+
+After hardware, Sol reads every decoded turn and returns `greenlight` /
+`needs-human` / `block` with regressions cited by `file:line` and fixture. Sol
+never merges and never approves; its review is a comment.
 
 ### Fixtures and harnesses
 
-Registry fixture tags are pinned by sha256 in
-[`scripts/hw-gate/fixtures.json`](../scripts/hw-gate/fixtures.json). A missing
-or mismatched fixture **fails the gate** (no downgrade to warning).
-
 Every fixture runs through [`scripts/serve_harness.py`](../scripts/serve_harness.py)
-— the same maintained serve harness as the manual route below — never through
-a single `hipfire run`, which is one request against a fresh daemon and proves
-nothing about turn-to-turn state. The bucket decides the modes:
+— never a single `hipfire run`, which is one request against a fresh daemon
+and proves nothing about turn-to-turn state — with reasoning off. Mandatory
+fixtures are registry tags pinned by sha256 in
+[`scripts/hw-gate/fixtures.json`](../scripts/hw-gate/fixtures.json); a
+missing or mismatched pinned fixture **fails the gate**. Requested extra tags
+resolve through `registry/v1.json`; one absent from the runner is reported as
+unavailable.
 
 - **`load` bucket** — `battery` on every fixture (varied prompts, expect
-  substrings, attractor / runaway / empty detection, reasoning off).
-- **`serve` bucket** — `battery` + `chain` on every fixture (related turns
-  through the prefix cache: reset, cache, and terminal semantics).
-- **`kernel` bucket** — `battery` on every fixture plus
+  substrings, attractor / runaway / empty detection).
+- **`serve` bucket** — `battery` + `chain` (related turns through the prefix
+  cache: reset, cache, and terminal semantics).
+- **`kernel` bucket** — `battery` plus
   [`scripts/redline_daemon_harness.py`](../scripts/redline_daemon_harness.py)
   capture + HIP/PM4 parity on the dense trunk.
 
 Decoded assistant text is posted **verbatim** in the evidence comment. Reading
-it is part of review — do not treat a green check alone as having read the
-outputs. The per-turn prefill/decode rates in that table are harness-side
-timings (HTTP streaming, sampling) and run well under `hipfire bench`; they are
-context, never a performance claim. Perf claims go through
-[`docs/methodology/perf-benchmarking.md`](methodology/perf-benchmarking.md).
+it is part of review. The per-turn prefill/decode rates in that table are
+harness-side timings (HTTP streaming, sampling) and run well under
+`hipfire bench`; they are context, never a performance claim. Perf claims go
+through [`docs/methodology/perf-benchmarking.md`](methodology/perf-benchmarking.md).
 
-### Hardware authorization and the `hw-run` label
+### Seat 2 — Fable decides the merge
 
-The gate authorizes hardware on its own in two cases: the author is a
-repository member/collaborator, or the diff touches no exec-sensitive path
-(`build.rs`, `.cargo/`, Cargo manifests/lockfile, toolchain, `.github/`,
-`scripts/`, `tools/`, any `*.sh`/`*.py`, Dockerfiles, nix) **and** the
-reviewer's prelim judged `execution_risk` = `none` (no network, no filesystem
-outside model/cache/temp, no env/credential reads, no process spawning, no
-obfuscated blobs, no unexplained `unsafe`). Every other PR waits for a
-maintainer's **`hw-run`** label, which always authorizes and is removed after
-every run and on every push. The reason is stated in the job summary and in
-the red `hw-gate` status.
+Fable (`anthropic/claude-fable-5`) reads the diff, the evidence, and Sol's
+verdict and returns `merge-staging` / `hold` / `block`, with an announcement
+written for the author. Fable may veto Sol's greenlight or override Sol's
+needs-human, and must say why; overrides are recorded in the decision so the
+maintainer can audit both seats against outcomes.
 
-### Reviewer floor (`scripts/hw-gate/review.py`)
+**Probation.** While the two-seat rung is on probation, `merge-staging` means
+Fable merges the PR head into **`beta`** (the staging branch) under its own
+identity and announces the merge SHA on the PR. `master` is promoted from
+`beta` by the maintainer; GitHub marks the staged PRs merged when that
+happens. The record of prelims, verdicts, decisions, and overrides is the
+dataset for lifting probation.
 
-The model proposes; the script decides. Strictest applicable outcome wins:
+### The floor (`scripts/hw-gate/review.py`)
 
-| Outcome | When |
-|---|---|
-| **block** | `hw_run_result != success`; or evidence missing / `verdict != pass`; or `kernel` bucket selected and kernel status not `pass`; or model decided `block` |
-| **needs-human** | any `policy_paths`; any `RATCHET-RAISE:` commit in `base..head`; verdict coverage gaps; confidence &lt; 0.8; model `needs-human` or unparseable verdict |
-| **greenlight** | only when none of the above fired **and** the model decided `greenlight` |
+The floor is the workflow's own rule, split in two:
 
-The required `hw-gate` status carries the decision. Branch protection binds
-every maintainer except repository admins (`enforce_admins` is off, on
-purpose: the admin's judgment is the emergency path, as with the `a0fca0d6d`
-revert). For everyone else:
+| Tier | Fires on | Who can override |
+|---|---|---|
+| **hard** | a failed fixture or harness, an attractor, a policy-file change, a `RATCHET-RAISE:` commit without the `ratchet-raise` label | nobody — `block` (evidence) or `hold` (policy/ratchet) regardless of either seat |
+| **soft** | coverage gaps, confidence < 0.8, Sol's `needs-human`, an unparseable verdict | Fable, with a stated reason |
 
-- `greenlight` — green.
-- `needs-human` — red until a maintainer who has read the evidence and verdict
-  comments applies the **`human-reviewed`** label. The label is the logged
-  signature; it is cleared on every push, and a label event re-evaluates the
-  verdict already recorded for that commit without re-running hardware.
-- `block` — red; no label clears it, only a new commit.
+### The `hw-gate` status
 
-The reviewer's approve / request-changes review is informational. An admin
-merging past a red `hw-gate` is expected to have read the evidence and verdict
-comments first; applying `human-reviewed` records that.
+- `merge-staging` — green.
+- `hold` — red until a maintainer who has read the seats' comments applies
+  **`human-reviewed`** (a logged signature, cleared on every push; a label
+  event re-evaluates the recorded decision without re-running hardware).
+- `block` — red; only a new commit clears it.
 
-**Policy-file and `RATCHET-RAISE` PRs always need a human.** Bot approval cannot
-clear them.
-
-Workflow, fixtures, select/run/review scripts, and the reviewer system prompt
-live under [`.github/workflows/hw-gate.yml`](../.github/workflows/hw-gate.yml)
-and [`scripts/hw-gate/`](../scripts/hw-gate/).
+Branch protection binds every maintainer except repository admins
+(`enforce_admins` is off on purpose: the admin's judgment is the emergency
+path). An admin merging past a red status is expected to have read the
+comments first.
 
 ## Automatic checks vs manual evidence
 

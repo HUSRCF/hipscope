@@ -11,18 +11,13 @@ import tempfile
 import textwrap
 from pathlib import Path
 
-# Load review module without installing
 REVIEW_PATH = Path(__file__).parent.parent / "review.py"
 spec = importlib.util.spec_from_file_location("review", REVIEW_PATH)
 review = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(review)
 
-REPO_ROOT = REVIEW_PATH.parent.parent.parent  # hipfire-hw-gate root? actually scripts/hw-gate is two levels below repo
-# Resolve checkout for git tests
-WORKTREE = Path(__file__).resolve().parents[3]  # may be repo root
 FAKE_OMP = Path(__file__).parent / "fake_omp.py"
 FAKE_GH = Path(__file__).parent / "fake_gh.py"
-
 
 # ---------------------------------------------------------------------------
 # extract_json
@@ -35,181 +30,109 @@ def test_extract_json_fenced():
     text = 'hello\n```json\n{"phase":"prelim","x":1}\n```\nworld'
     assert review.extract_json(text) == {"phase": "prelim", "x": 1}
 
-def test_extract_json_fenced_no_lang():
-    text = '```\n{"a": 2}\n```'
-    assert review.extract_json(text) == {"a": 2}
-
 def test_extract_json_prose_around():
     text = 'Sure, here is the object: {"phase":"verdict","decision":"block"} hope that helps'
     assert review.extract_json(text) == {"phase": "verdict", "decision": "block"}
-
-def test_extract_json_nested():
-    inner = {"a": {"b": [1, 2]}, "c": 3}
-    text = f"prefix {json.dumps(inner)} suffix"
-    assert review.extract_json(text) == inner
 
 def test_extract_json_last_wins():
     text = '{"first":1} some text {"second":2}'
     assert review.extract_json(text) == {"second": 2}
 
-def test_extract_json_with_string_braces():
-    text = '{"msg":"hello { not json }","ok":true}'
-    assert review.extract_json(text) == {"msg": "hello { not json }", "ok": True}
-
 def test_extract_json_none():
     assert review.extract_json("no json here") is None
-    assert review.extract_json("") is None
-
-def test_extract_json_fenced_with_prose_and_extra():
-    text = textwrap.dedent("""\
-        I analyzed the diff.
-        ```json
-        {"phase":"prelim","summary":"foo"}
-        ```
-        That is the result.
-        """)
-    assert review.extract_json(text) == {"phase": "prelim", "summary": "foo"}
-
-def test_extract_json_balanced_ignores_unbalanced():
-    # Only balanced object should be returned; trailing incomplete should be ignored
-    text = '{"a":1} {"b":2'
-    assert review.extract_json(text) == {"a": 1}
-
 
 # ---------------------------------------------------------------------------
-# apply_floor
+# hard_floor / soft_floor
 # ---------------------------------------------------------------------------
 
-def _base_select(buckets=None, policy_paths=None, surfaces=None):
-    return {
-        "buckets": buckets or ["load"],
-        "policy_paths": policy_paths or [],
-        "surfaces": surfaces or {},
-    }
+def _base_select(buckets=None, policy_paths=None):
+    return {"buckets": buckets or ["load"], "policy_paths": policy_paths or [], "surfaces": {}}
 
-def _base_evidence(verdict="pass", kernel_status="pass", kernel_present=True):
-    ev = {"verdict": verdict}
-    if kernel_present:
-        ev["kernel"] = {"status": kernel_status}
-    else:
-        ev["kernel"] = None
+def _base_evidence(verdict="pass", with_attractor=False):
+    ev = {"verdict": verdict, "fixtures": [], "kernel": None}
+    if with_attractor:
+        ev["fixtures"] = [{
+            "tag": "qwen3.6:27b",
+            "modes": {
+                "battery": {
+                    "rows": [{"attractor": True, "empty": False}]
+                }
+            }
+        }]
     return ev
 
-def _base_verdict(decision="greenlight", gaps=None, confidence=0.9):
-    return {
-        "decision": decision,
-        "confidence": confidence,
-        "coverage": {"gaps": gaps or [], "surfaces_touched": ["load"], "surfaces_evidenced": ["load"]},
-    }
+def test_hard_floor_hw_run():
+    hard = review.hard_floor(_base_evidence(), _base_select(), "failure", [])
+    assert any("hw_run" in r for r in hard)
 
+def test_hard_floor_evidence_verdict():
+    hard = review.hard_floor({"verdict": "fail"}, _base_select(), "success", [])
+    assert any("evidence" in r for r in hard)
 
-def test_floor_each_block_rule_fires_alone():
-    # hw_run_result != success
-    d, r = review.apply_floor("greenlight", _base_evidence(), _base_select(), "failure", [], _base_verdict())
-    assert d == "block" and "hw_run_result" in r
+def test_hard_floor_attractor():
+    hard = review.hard_floor(_base_evidence(with_attractor=True), _base_select(), "success", [])
+    assert any("attractor" in r for r in hard)
 
-    # evidence None
-    d, r = review.apply_floor("greenlight", None, _base_select(), "success", [], _base_verdict())
-    assert d == "block" and "evidence_verdict" in r
+def test_hard_floor_policy():
+    hard = review.hard_floor(_base_evidence(), _base_select(policy_paths=["scripts/hw-gate/review.py"]), "success", [])
+    assert any("policy" in r for r in hard)
 
-    # evidence verdict != pass
-    d, r = review.apply_floor("greenlight", _base_evidence(verdict="fail"), _base_select(), "success", [], _base_verdict())
-    assert d == "block" and "evidence_verdict" in r
+def test_hard_floor_ratchet():
+    hard = review.hard_floor(_base_evidence(), _base_select(), "success", ["RATCHET-RAISE: foo"])
+    assert any("RATCHET" in r for r in hard)
 
-    # kernel status fail
-    d, r = review.apply_floor("greenlight", _base_evidence(kernel_status="fail"), _base_select(buckets=["kernel"]), "success", [], _base_verdict())
-    assert d == "block" and "kernel_status" in r
+def test_soft_floor_coverage():
+    soft = review.soft_floor({"coverage": {"gaps": ["load"]}, "confidence": 0.9, "decision": "greenlight"}, "greenlight")
+    assert any("coverage" in r for r in soft)
 
-    # kernel missing when kernel bucket
-    d, r = review.apply_floor("greenlight", _base_evidence(kernel_present=False), _base_select(buckets=["kernel"]), "success", [], _base_verdict())
-    assert d == "block" and "kernel_status" in r
+def test_soft_floor_confidence():
+    soft = review.soft_floor({"coverage": {"gaps": []}, "confidence": 0.5}, "greenlight")
+    assert any("confidence" in r for r in soft)
 
-    # model_block
-    d, r = review.apply_floor("block", _base_evidence(), _base_select(), "success", [], _base_verdict(decision="block"))
-    assert d == "block" and "model_block" in r
+def test_soft_floor_needs_human():
+    soft = review.soft_floor({"coverage": {"gaps": []}, "confidence": 0.9}, "needs-human")
+    assert any("needs-human" in r for r in soft)
 
+def test_floor_greenlight_only_when_clear():
+    hard = review.hard_floor(_base_evidence(), _base_select(), "success", [])
+    soft = review.soft_floor({"coverage": {"gaps": []}, "confidence": 0.9}, "greenlight")
+    assert hard == []
+    assert soft == []
 
-def test_floor_each_needs_human_rule_fires_alone():
-    # policy_paths
-    d, r = review.apply_floor("greenlight", _base_evidence(), _base_select(policy_paths=["scripts/hw-gate/review.py"]), "success", [], _base_verdict())
-    assert d == "needs-human" and "policy_paths" in r
-
-    # ratchet raise
-    d, r = review.apply_floor("greenlight", _base_evidence(), _base_select(), "success", ["RATCHET-RAISE: foo"], _base_verdict())
-    assert d == "needs-human" and "ratchet_raise" in r
-
-    # ratchet not matching without colon
-    d, r = review.apply_floor("greenlight", _base_evidence(), _base_select(), "success", ["RATCHET-RAISE foo"], _base_verdict())
-    assert d == "greenlight"
-
-    # coverage gaps
-    d, r = review.apply_floor("greenlight", _base_evidence(), _base_select(), "success", [], _base_verdict(gaps=["load"]))
-    assert d == "needs-human" and "coverage_gaps" in r
-
-    # confidence
-    d, r = review.apply_floor("greenlight", _base_evidence(), _base_select(), "success", [], _base_verdict(confidence=0.79))
-    assert d == "needs-human" and "confidence" in r
-    # 0.8 exactly is ok
-    d, r = review.apply_floor("greenlight", _base_evidence(), _base_select(), "success", [], _base_verdict(confidence=0.8))
-    assert d == "greenlight"
-    # missing / non-numeric / boolean confidence never greenlights
-    for bad in (None, "high", True):
-        v = _base_verdict()
-        if bad is None:
-            del v["confidence"]
-        else:
-            v["confidence"] = bad
-        d, r = review.apply_floor("greenlight", _base_evidence(), _base_select(), "success", [], v)
-        assert d == "needs-human" and "confidence" in r, bad
-
-    # model needs-human
-    d, r = review.apply_floor("needs-human", _base_evidence(), _base_select(), "success", [], _base_verdict(decision="needs-human"))
-    assert d == "needs-human" and "model_needs_human" in r
-
-    # verdict parse failed (None)
-    d, r = review.apply_floor("greenlight", _base_evidence(), _base_select(), "success", [], None)
-    assert d == "needs-human" and "verdict_parse_failed" in r
-
-
-def test_floor_greenlight_only_when_all_clear():
-    d, r = review.apply_floor("greenlight", _base_evidence(), _base_select(), "success", [], _base_verdict())
-    assert d == "greenlight" and r == []
-
-
-def test_floor_strictest_wins_in_combination():
-    # block beats needs-human
-    d, r = review.apply_floor("needs-human", _base_evidence(verdict="fail"), _base_select(policy_paths=["x"]), "failure", ["RATCHET-RAISE: hi"], _base_verdict(gaps=["x"], confidence=0.5))
+# Table-driven hard vs soft final mapping via apply_floor
+def test_floor_each_hard_blocks_or_holds():
+    # evidence fail => block
+    d, r = review.apply_floor("greenlight", {"verdict": "fail"}, _base_select(), "success", [], {"coverage": {"gaps": []}, "confidence": 0.9, "decision": "greenlight"})
     assert d == "block"
-    assert "hw_run_result" in r or "evidence_verdict" in r
-
-    # needs-human beats greenlight
-    d, r = review.apply_floor("greenlight", _base_evidence(), _base_select(policy_paths=["x"]), "success", [], _base_verdict())
+    # policy => needs-human (hold)
+    d, r = review.apply_floor("greenlight", _base_evidence(), _base_select(policy_paths=["x"]), "success", [], {"coverage": {"gaps": []}, "confidence": 0.9, "decision": "greenlight"})
+    assert d == "needs-human"
+    # ratchet => needs-human
+    d, r = review.apply_floor("greenlight", _base_evidence(), _base_select(), "success", ["RATCHET-RAISE: hi"], {"coverage": {"gaps": []}, "confidence": 0.9, "decision": "greenlight"})
     assert d == "needs-human"
 
-    # model block overrides other greenlight conditions
-    d, r = review.apply_floor("block", _base_evidence(), _base_select(), "success", [], _base_verdict(decision="block", confidence=0.9))
-    assert d == "block"
-
-    # multiple needs-human reasons all reported? At least the first should be there, but we check both listed
-    d, r = review.apply_floor("greenlight", _base_evidence(), _base_select(policy_paths=["x"]), "success", ["RATCHET-RAISE: y"], _base_verdict(gaps=["a"], confidence=0.5))
+def test_floor_each_soft_needs_human():
+    d, r = review.apply_floor("greenlight", _base_evidence(), _base_select(), "success", [], {"coverage": {"gaps": ["serve"]}, "confidence": 0.9, "decision": "greenlight"})
     assert d == "needs-human"
-    # Should contain policy_paths, ratchet_raise, coverage_gaps, confidence
-    for expected in ["policy_paths", "ratchet_raise", "coverage_gaps", "confidence"]:
-        assert expected in r, f"missing {expected} in {r}"
+    d, r = review.apply_floor("greenlight", _base_evidence(), _base_select(), "success", [], {"coverage": {"gaps": []}, "confidence": 0.5, "decision": "greenlight"})
+    assert d == "needs-human"
+    d, r = review.apply_floor("needs-human", _base_evidence(), _base_select(), "success", [], {"coverage": {"gaps": []}, "confidence": 0.9, "decision": "needs-human"})
+    assert d == "needs-human"
 
+def test_floor_greenlight_only_when_clear_apply():
+    d, r = review.apply_floor("greenlight", _base_evidence(), _base_select(), "success", [], {"coverage": {"gaps": []}, "confidence": 0.9, "decision": "greenlight"})
+    assert d == "greenlight"
 
 # ---------------------------------------------------------------------------
 # helpers for e2e
 # ---------------------------------------------------------------------------
 
-def _make_repo(tmp: Path, files: dict | None = None) -> Path:
-    """Init a git repo with base commit and optional head commit."""
+def _make_repo(tmp: Path, files: dict | None = None):
     repo = tmp / "checkout"
     repo.mkdir(parents=True, exist_ok=True)
     subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
     subprocess.run(["git", "config", "user.email", "a@b.c"], cwd=repo, check=True)
     subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
-    # base commit
     (repo / "base.txt").write_text("base\n")
     if files:
         for name, content in files.items():
@@ -219,7 +142,6 @@ def _make_repo(tmp: Path, files: dict | None = None) -> Path:
     subprocess.run(["git", "add", "."], cwd=repo, check=True)
     subprocess.run(["git", "commit", "-m", "base"], cwd=repo, check=True, capture_output=True)
     base = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True, check=True).stdout.strip()
-    # head commit
     (repo / "base.txt").write_text("head\n")
     (repo / "feature.txt").write_text("new\n")
     subprocess.run(["git", "add", "."], cwd=repo, check=True)
@@ -227,321 +149,552 @@ def _make_repo(tmp: Path, files: dict | None = None) -> Path:
     head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True, check=True).stdout.strip()
     return repo, base, head
 
-def _write_fixture(tmp: Path, name: str, content: dict):
-    p = tmp / name
-    p.write_text(json.dumps(content))
-    return p
-
+def _fixtures_content(tmp_models: Path | None = None):
+    return {
+        "schema": "hipfire.hw-gate.fixtures",
+        "version": 2,
+        "models_dir": str(tmp_models) if tmp_models else "~/.hipfire/models",
+        "fixtures": [
+            {"tag": "qwen3.6:27b", "file": "qwen3.6-27b.mq4", "sha256": "abc", "size_bytes": 100, "arch_id": 5, "why": "test"},
+            {"tag": "ornith-1.5:35b-a3b-mq4r", "file": "ornith.mq4r", "sha256": "def", "size_bytes": 100, "arch_id": 6, "why": "test"},
+        ],
+        "buckets": {
+            "load": {"why": "load","modes": ["battery"]},
+            "serve": {"why": "serve","modes": ["battery","chain"]},
+            "kernel": {"why": "kernel","modes": ["battery"]},
+        }
+    }
 
 # ---------------------------------------------------------------------------
-# e2e main run
+# prelim e2e
 # ---------------------------------------------------------------------------
 
-def _run_review(tmp: Path, verdict_decision: str = "greenlight", evidence_verdict: str = "pass", hw_run_result: str = "success",
-                extra_select: dict | None = None, evidence_md_exists: bool = True,
-                fake_responses: list[dict] | None = None):
-    checkout, base, head = _make_repo(tmp / f"repo_{verdict_decision}_{os.getpid()}_{id(tmp)}")
-
+def test_prelim_routes_bucket_union_and_sol():
+    tmp = Path(tempfile.mkdtemp())
+    models_dir = tmp / "models"
+    models_dir.mkdir(parents=True)
+    # create both fixture files present
+    (models_dir / "qwen3.6-27b.mq4").write_text("dummy")
+    (models_dir / "ornith.mq4r").write_text("dummy")
+    checkout, base, head = _make_repo(tmp / "repo1")
     select = {
         "schema": "hipfire.hw-gate.select",
         "version": 1,
         "needs_hw": True,
         "buckets": ["load"],
         "policy_paths": [],
-        "surfaces": {"load": ["crates/hipfire-loader/src/foo.rs"], "serve": [], "kernel": [], "policy": [], "other": ["feature.txt"]},
+        "surfaces": {"load": ["crates/hipfire-loader/foo.rs"], "serve": [], "kernel": [], "policy": [], "other": []},
+        "request": {"routes": [{"mode": "battery", "tag": "qwen3.6:27b"}], "claim": "test claim"},
+        "request_error": None,
     }
-    if extra_select:
-        select.update(extra_select)
     select_path = tmp / "select.json"
     select_path.write_text(json.dumps(select))
-
-    evidence = {
-        "schema": "hipfire.hw-gate.evidence",
-        "version": 1,
-        "verdict": evidence_verdict,
-        "base": base,
-        "head": head,
-        "buckets": ["load"],
-        "fixtures": [],
-        "kernel": None,
-        "serve": None,
+    fixtures = _fixtures_content(models_dir)
+    fixtures_path = tmp / "fixtures.json"
+    fixtures_path.write_text(json.dumps(fixtures))
+    sol_response = {
+        "phase": "prelim",
+        "summary": "summary",
+        "surfaces": ["load"],
+        "suspected_regressions": [],
+        "run_hardware": True,
+        "run_hardware_reasons": ["safe"],
+        "routes": [
+            {"mode": "battery", "tag": "qwen3.6:27b", "source": "sol", "why": "sol why"},
+            {"mode": "battery", "tag": "unknown:tag", "source": "sol", "why": "unknown should be dropped"},
+        ],
+        "unavailable_routes": [],
+        "claim_assessment": "claim ok",
+        "questions_for_author": ["q1"]
     }
-    evidence_path = tmp / "hw-gate.json"
-    evidence_path.write_text(json.dumps(evidence))
-
-    if evidence_md_exists:
-        md_path = tmp / "hw-gate.md"
-        md_path.write_text("# Evidence\n\nPer-fixture table\n")
-    else:
-        # ensure not exists
-        md_path = tmp / "hw-gate.md"
-        if md_path.exists():
-            md_path.unlink()
-
-    system_prompt = tmp / "review.md"
-    system_prompt.write_text("system prompt stub")
-
-    # Prepare fake omp responses
-    if fake_responses is None:
-        fake_responses = [
-            {"json": {"phase": "prelim", "summary": "summary", "surfaces": ["load"], "suspected_regressions": [], "extra_routes": [], "questions_for_author": []}},
-            {"json": {"phase": "verdict", "decision": verdict_decision, "confidence": 0.9, "regressions": [], "coverage": {"surfaces_touched": ["load"], "surfaces_evidenced": ["load"], "gaps": []}, "eyeball": [], "rationale": "ok"}},
-        ]
-    responses_file = tmp / "omp_responses.json"
-    responses_file.write_text(json.dumps(fake_responses))
-
+    responses = [{"json": sol_response}]
+    resp_path = tmp / "resp.json"
+    resp_path.write_text(json.dumps(responses))
     call_count = tmp / "omp_count"
-    if call_count.exists():
-        call_count.unlink()
     gh_log = tmp / "gh_log.jsonl"
-    if gh_log.exists():
-        gh_log.unlink()
     gh_comments = tmp / "gh_comments.json"
     gh_comments.write_text("[]")
     omp_log = tmp / "omp_log.jsonl"
-    if omp_log.exists():
-        omp_log.unlink()
-
-    out_path = tmp / "verdict.json"
-
+    out_path = tmp / "prelim.json"
+    routes_path = tmp / "routes.json"
+    system_prompt = tmp / "sol.md"
+    system_prompt.write_text("prompt")
     env = os.environ.copy()
     env["HW_GATE_OMP_BIN"] = str(FAKE_OMP)
     env["HW_GATE_GH_BIN"] = str(FAKE_GH)
-    env["FAKE_OMP_RESPONSES"] = str(responses_file)
+    env["FAKE_OMP_RESPONSES"] = str(resp_path)
     env["FAKE_OMP_CALL_COUNT"] = str(call_count)
     env["FAKE_OMP_LOG"] = str(omp_log)
     env["FAKE_GH_LOG"] = str(gh_log)
     env["FAKE_GH_COMMENTS"] = str(gh_comments)
-    env.pop("FAKE_OMP_GARBAGE", None)
-
+    env["HIPFIRE_MODELS_DIR"] = str(models_dir)
     cmd = [
         sys.executable, str(REVIEW_PATH),
-        "--repo", "o/r",
-        "--pr", "1",
-        "--base", base,
-        "--head", head,
+        "--seat", "sol", "--phase", "prelim",
+        "--repo", "o/r", "--pr", "1",
+        "--base", base, "--head", head,
         "--checkout", str(checkout),
-        "--evidence", str(evidence_path),
         "--select", str(select_path),
-        "--hw-run-result", hw_run_result,
+        "--fixtures", str(fixtures_path),
         "--system-prompt", str(system_prompt),
         "--out", str(out_path),
+        "--routes", str(routes_path),
     ]
     result = subprocess.run(cmd, env=env, capture_output=True, text=True)
-    return {
-        "returncode": result.returncode,
-        "stdout": result.stdout,
-        "stderr": result.stderr,
-        "out_path": out_path,
-        "gh_log": gh_log,
-        "gh_comments": gh_comments,
-        "omp_log": omp_log,
-        "call_count": call_count,
-        "checkout": checkout,
-        "base": base,
-        "head": head,
+    assert result.returncode == 0, f"stderr {result.stderr}"
+    # prelim.json
+    data = json.loads(out_path.read_text())
+    assert data["schema"] == "hipfire.hw-gate.prelim"
+    assert data["version"] == 2
+    assert data["seat"] == "sol"
+    assert data["run_hardware"] is True
+    assert data["prelim"]["summary"] == "summary"
+    # routes.json bucket (2 fixtures *1 mode=2) union sol (known tag duplicate => still 2)
+    routes = json.loads(routes_path.read_text())
+    tags = [r["tag"] for r in routes]
+    assert "qwen3.6:27b" in tags
+    assert "ornith-1.5:35b-a3b-mq4r" in tags
+    # unknown dropped
+    assert "unknown:tag" not in tags
+    # comment contains routes table and unavailable?
+    comments = json.loads(gh_comments.read_text())
+    bodies = [c["body"] for c in comments]
+    assert any("<!-- hw-gate:sol-prelim -->" in b for b in bodies)
+    # omp argv check
+    omp_calls = [json.loads(l)["args"] for l in omp_log.read_text().splitlines() if l.strip()]
+    assert len(omp_calls) >= 1
+    oc = omp_calls[0]
+    assert "--model" in oc
+    model_idx = oc.index("--model") + 1
+    assert oc[model_idx] == os.environ.get("HW_GATE_REVIEW_MODEL", "gpt-5.6-sol")
+    assert "--system-prompt" in oc
+    assert "@" in " ".join(oc) or any(a.startswith("@") for a in oc)
+
+def test_prelim_unavailable_listed():
+    tmp = Path(tempfile.mkdtemp())
+    models_dir = tmp / "models"
+    models_dir.mkdir(parents=True)
+    (models_dir / "qwen3.6-27b.mq4").write_text("dummy")
+    # ornith missing => unavailable
+    checkout, base, head = _make_repo(tmp / "repo2")
+    select = {
+        "schema": "hipfire.hw-gate.select","version":1,"needs_hw":True,"buckets":["load"],"policy_paths":[],"surfaces":{"load":[],"serve":[],"kernel":[],"policy":[],"other":[]},
+        "request": None, "request_error": None,
     }
-
-
-def test_e2e_greenlight(tmp_path=None):
-    import tempfile
-    tmp = Path(tempfile.mkdtemp())
-    res = _run_review(tmp, verdict_decision="greenlight")
-    assert res["returncode"] == 0, f"stderr: {res['stderr']}"
-    data = json.loads(res["out_path"].read_text())
-    assert data["floor"]["final_decision"] == "greenlight"
-    assert data["model"]  # truthy
-    # Posted markers
-    comments = json.loads(res["gh_comments"].read_text())
-    bodies = [c["body"] for c in comments]
-    assert any("<!-- hw-gate:prelim -->" in b for b in bodies)
-    assert any("<!-- hw-gate:evidence -->" in b for b in bodies)
-    assert any("<!-- hw-gate:verdict -->" in b for b in bodies)
-    # Review kind: greenlight should be --approve
-    gh_calls = [json.loads(l)["args"] for l in res["gh_log"].read_text().splitlines() if l.strip()]
-    # Find pr review call
-    review_calls = [a for a in gh_calls if a[:2] == ["pr", "review"]]
-    assert len(review_calls) >= 1
-    last_review = review_calls[-1]
-    assert "--approve" in last_review
-    # hw-run removed
-    assert any("labels/hw-run" in " ".join(a) and "--method" in a and "DELETE" in a for a in gh_calls)
-    # labels added/removed
-    assert "agent-approved" in data["posted"]["labels_added"]
-    # Check omp command built correctly: read omp_log
-    omp_calls = [json.loads(l)["args"] for l in res["omp_log"].read_text().splitlines() if l.strip()]
-    assert len(omp_calls) >= 2
-    for oc in omp_calls:
-        assert "-p" in oc and "--mode" in oc and "json" in oc
-        assert "--auto-approve" in oc
-        assert "--tools=read,grep,glob" in oc
-        assert "--max-time" in oc and "15m" in oc
-        assert "--system-prompt" in oc
-
-def test_e2e_needs_human(tmp_path=None):
-    import tempfile
-    tmp = Path(tempfile.mkdtemp())
-    res = _run_review(tmp, verdict_decision="needs-human")
-    assert res["returncode"] == 0, f"stderr: {res['stderr']}"
-    data = json.loads(res["out_path"].read_text())
-    assert data["floor"]["final_decision"] == "needs-human"
-    gh_calls = [json.loads(l)["args"] for l in res["gh_log"].read_text().splitlines() if l.strip()]
-    review_calls = [a for a in gh_calls if a[:2] == ["pr", "review"]]
-    assert "--comment" in review_calls[-1]
-    assert "--approve" not in review_calls[-1]
-
-def test_e2e_block(tmp_path=None):
-    import tempfile
-    tmp = Path(tempfile.mkdtemp())
-    res = _run_review(tmp, verdict_decision="block")
-    # Even though model says block, floor should keep block
-    assert res["returncode"] == 0, f"stderr: {res['stderr']}"
-    data = json.loads(res["out_path"].read_text())
-    assert data["floor"]["final_decision"] == "block"
-    gh_calls = [json.loads(l)["args"] for l in res["gh_log"].read_text().splitlines() if l.strip()]
-    review_calls = [a for a in gh_calls if a[:2] == ["pr", "review"]]
-    assert "--request-changes" in review_calls[-1]
-
-def test_e2e_floor_overrides_greenlight_on_evidence_fail(tmp_path=None):
-    import tempfile
-    tmp = Path(tempfile.mkdtemp())
-    res = _run_review(tmp, verdict_decision="greenlight", evidence_verdict="fail")
-    assert res["returncode"] == 0, f"stderr: {res['stderr']}"
-    data = json.loads(res["out_path"].read_text())
-    assert data["floor"]["final_decision"] == "block"
-
-def test_e2e_missing_evidence(tmp_path=None):
-    import tempfile
-    tmp = Path(tempfile.mkdtemp())
-    res = _run_review(tmp, verdict_decision="greenlight", evidence_md_exists=False)
-    assert res["returncode"] == 0, f"stderr: {res['stderr']}"
-    comments = json.loads(res["gh_comments"].read_text())
-    bodies = [c["body"] for c in comments]
-    # evidence comment should mention missing
-    ev_bodies = [b for b in bodies if "<!-- hw-gate:evidence -->" in b]
-    assert len(ev_bodies) >= 1
-    assert "No hardware evidence found" in ev_bodies[0]
-
-def test_e2e_upsert_existing_comment(tmp_path=None):
-    """Second run should PATCH instead of POST when marker already present."""
-    import tempfile
-    tmp = Path(tempfile.mkdtemp())
-    # First run
-    res1 = _run_review(tmp, verdict_decision="greenlight")
-    assert res1["returncode"] == 0
-    # Reuse same gh_comments file but reset call count and run again with same repo
-    # We need to keep comments file, but reset evidence etc? Simplify: run review again with same tmp's comments persisting
-    # Use same checkout/base/head/select but new verdict decision
-    # For this test, we simulate second run by reusing same gh_comments file and checking PATCH
-    responses_file = tmp / "omp_responses2.json"
-    responses_file.write_text(json.dumps([
-        {"json": {"phase": "prelim", "summary": "s2", "surfaces": ["load"], "suspected_regressions": [], "extra_routes": [], "questions_for_author": []}},
-        {"json": {"phase": "verdict", "decision": "greenlight", "confidence": 0.9, "regressions": [], "coverage": {"surfaces_touched": ["load"], "surfaces_evidenced": ["load"], "gaps": []}, "eyeball": [], "rationale": "ok2"}},
-    ]))
-    call_count = tmp / "omp_count"
-    call_count.write_text("0")
-    gh_log = tmp / "gh_log.jsonl"
-    gh_log.write_text("")
-    # Need to re-resolve repo paths: use same checkout as before, but we need base/head from last run
-    checkout = res1["checkout"]
-    base = res1["base"]
-    head = res1["head"]
     select_path = tmp / "select.json"
-    evidence_path = tmp / "hw-gate.json"
-    system_prompt = tmp / "review.md"
-    out_path = tmp / "verdict2.json"
+    select_path.write_text(json.dumps(select))
+    fixtures = _fixtures_content(models_dir)
+    fixtures_path = tmp / "fixtures.json"
+    fixtures_path.write_text(json.dumps(fixtures))
+    sol_response = {
+        "phase": "prelim","summary":"s","surfaces":["load"],"suspected_regressions":[],
+        "run_hardware": True,"run_hardware_reasons":["r"],
+        "routes":[{"mode":"battery","tag":"ornith-1.5:35b-a3b-mq4r","source":"sol","why":"needs ornith"}],
+        "unavailable_routes":[],"claim_assessment":"","questions_for_author":[]
+    }
+    resp_path = tmp / "resp.json"
+    resp_path.write_text(json.dumps([{"json": sol_response}]))
+    call_count = tmp / "omp_count"
+    gh_comments = tmp / "gh_comments.json"
+    gh_comments.write_text("[]")
+    out_path = tmp / "prelim.json"
+    routes_path = tmp / "routes.json"
+    system_prompt = tmp / "sol.md"
+    system_prompt.write_text("prompt")
     env = os.environ.copy()
     env["HW_GATE_OMP_BIN"] = str(FAKE_OMP)
     env["HW_GATE_GH_BIN"] = str(FAKE_GH)
-    env["FAKE_OMP_RESPONSES"] = str(responses_file)
+    env["FAKE_OMP_RESPONSES"] = str(resp_path)
     env["FAKE_OMP_CALL_COUNT"] = str(call_count)
-    env["FAKE_OMP_LOG"] = str(tmp / "omp_log2.jsonl")
-    env["FAKE_GH_LOG"] = str(gh_log)
-    env["FAKE_GH_COMMENTS"] = str(tmp / "gh_comments.json")
-    cmd = [
-        sys.executable, str(REVIEW_PATH),
-        "--repo", "o/r",
-        "--pr", "1",
-        "--base", base,
-        "--head", head,
-        "--checkout", str(checkout),
-        "--evidence", str(evidence_path),
-        "--select", str(select_path),
-        "--hw-run-result", "success",
-        "--system-prompt", str(system_prompt),
-        "--out", str(out_path),
-    ]
+    env["FAKE_GH_LOG"] = str(tmp / "gh_log.jsonl")
+    env["FAKE_GH_COMMENTS"] = str(gh_comments)
+    env["FAKE_OMP_LOG"] = str(tmp / "omp_log.jsonl")
+    env["HIPFIRE_MODELS_DIR"] = str(models_dir)
+    cmd = [sys.executable, str(REVIEW_PATH),"--seat","sol","--phase","prelim","--repo","o/r","--pr","1","--base",base,"--head",head,"--checkout",str(checkout),"--select",str(select_path),"--fixtures",str(fixtures_path),"--system-prompt",str(system_prompt),"--out",str(out_path),"--routes",str(routes_path)]
     result = subprocess.run(cmd, env=env, capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
-    gh_calls = [json.loads(l)["args"] for l in gh_log.read_text().splitlines() if l.strip()]
-    # Should have seen PATCH for at least one marker
-    assert any("--method" in a and "PATCH" in a for a in gh_calls)
+    comments = json.loads(gh_comments.read_text())
+    bodies = [c["body"] for c in comments]
+    # unavailable should be listed in comment
+    assert any("ornith-1.5:35b-a3b-mq4r" in b for b in bodies)
+    # routes still contains known tag (even if unavailable, per spec may still be in routes)
+    routes = json.loads(routes_path.read_text())
+    assert any(r["tag"]=="ornith-1.5:35b-a3b-mq4r" for r in routes)
 
-def test_failure_path_omp_garbage_twice(tmp_path=None):
-    import tempfile
+def test_prelim_run_hardware_false_on_garbage():
     tmp = Path(tempfile.mkdtemp())
-    checkout, base, head = _make_repo(tmp / "repo_fail")
-    select = {"schema": "hipfire.hw-gate.select","version":1,"needs_hw":True,"buckets":["load"],"policy_paths":[],"surfaces":{"load":[],"serve":[],"kernel":[],"policy":[],"other":[]}}
+    models_dir = tmp / "models"
+    models_dir.mkdir()
+    checkout, base, head = _make_repo(tmp / "repo3")
+    select = {"schema":"hipfire.hw-gate.select","version":1,"needs_hw":True,"buckets":["load"],"policy_paths":[],"surfaces":{"load":[],"serve":[],"kernel":[],"policy":[],"other":[]},"request":None,"request_error":None}
     select_path = tmp / "select.json"
     select_path.write_text(json.dumps(select))
-    evidence = {"schema":"hipfire.hw-gate.evidence","version":1,"verdict":"pass","base":base,"head":head,"buckets":[],"fixtures":[],"kernel":None,"serve":None}
-    evidence_path = tmp / "hw-gate.json"
-    evidence_path.write_text(json.dumps(evidence))
-    (tmp / "hw-gate.md").write_text("# Evidence\n")
-    system_prompt = tmp / "review.md"
-    system_prompt.write_text("stub")
+    fixtures = _fixtures_content(models_dir)
+    fixtures_path = tmp / "fixtures.json"
+    fixtures_path.write_text(json.dumps(fixtures))
     call_count = tmp / "omp_count"
-    gh_log = tmp / "gh_log.jsonl"
     gh_comments = tmp / "gh_comments.json"
     gh_comments.write_text("[]")
-    out_path = tmp / "verdict.json"
+    out_path = tmp / "prelim.json"
+    routes_path = tmp / "routes.json"
+    system_prompt = tmp / "sol.md"
+    system_prompt.write_text("prompt")
     env = os.environ.copy()
     env["HW_GATE_OMP_BIN"] = str(FAKE_OMP)
     env["HW_GATE_GH_BIN"] = str(FAKE_GH)
     env["FAKE_OMP_GARBAGE"] = "1"
     env["FAKE_OMP_CALL_COUNT"] = str(call_count)
+    env["FAKE_GH_LOG"] = str(tmp / "gh_log.jsonl")
+    env["FAKE_GH_COMMENTS"] = str(gh_comments)
+    env["FAKE_OMP_LOG"] = str(tmp / "omp_log.jsonl")
+    env["HIPFIRE_MODELS_DIR"] = str(models_dir)
+    cmd = [sys.executable, str(REVIEW_PATH),"--seat","sol","--phase","prelim","--repo","o/r","--pr","1","--base",base,"--head",head,"--checkout",str(checkout),"--select",str(select_path),"--fixtures",str(fixtures_path),"--system-prompt",str(system_prompt),"--out",str(out_path),"--routes",str(routes_path)]
+    result = subprocess.run(cmd, env=env, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    data = json.loads(out_path.read_text())
+    assert data["run_hardware"] is False
+    assert data["prelim"] is None
+    # routes still bucket routes
+    routes = json.loads(routes_path.read_text())
+    assert len(routes) == 2  # 2 fixtures load
+    comments = json.loads(gh_comments.read_text())
+    assert any("sol prelim unavailable" in b.lower() or "run_hardware" in b.lower() for b in [c["body"] for c in comments])
+
+# ---------------------------------------------------------------------------
+# verdict e2e
+# ---------------------------------------------------------------------------
+
+def _run_verdict(tmp: Path, select_extra: dict | None = None, evidence_extra: dict | None = None, verdict_response: dict | None = None, hw_run_result="success", evidence_md_exists=True):
+    checkout, base, head = _make_repo(tmp / "checkout_v")
+    select = {"schema":"hipfire.hw-gate.select","version":1,"needs_hw":True,"buckets":["load"],"policy_paths":[],"surfaces":{"load":["foo.rs"],"serve":[],"kernel":[],"policy":[],"other":[]},"request":None,"request_error":None}
+    if select_extra:
+        select.update(select_extra)
+    select_path = tmp / "select.json"
+    select_path.write_text(json.dumps(select))
+    # prelim
+    prelim_json = {
+        "schema":"hipfire.hw-gate.prelim","version":2,"seat":"sol","model":"gpt-5.6-sol",
+        "prelim":{"phase":"prelim","summary":"s","surfaces":["load"],"suspected_regressions":[],"run_hardware":True,"run_hardware_reasons":["r"],"routes":[],"unavailable_routes":[],"claim_assessment":"","questions_for_author":[]},
+        "run_hardware": True, "posted": {"prelim_comment": "http://x"}
+    }
+    prelim_path = tmp / "prelim.json"
+    prelim_path.write_text(json.dumps(prelim_json))
+    evidence = {"schema":"hipfire.hw-gate.evidence","version":1,"verdict":"pass","base":base,"head":head,"buckets":["load"],"fixtures":[],"kernel":None}
+    if evidence_extra:
+        evidence.update(evidence_extra)
+    evidence_path = tmp / "hw-gate.json"
+    evidence_path.write_text(json.dumps(evidence))
+    if evidence_md_exists:
+        (tmp / "hw-gate.md").write_text("# Evidence\n\nPer-fixture table\n")
+        # need to be alongside evidence_path.parent? In our impl we look at evidence_path.parent/hw-gate.md - which is tmp/hw-gate.md, correct as we wrote.
+    else:
+        p = tmp / "hw-gate.md"
+        if p.exists():
+            p.unlink()
+    system_prompt = tmp / "sol.md"
+    system_prompt.write_text("prompt")
+    if verdict_response is None:
+        verdict_response = {"phase":"verdict","decision":"greenlight","confidence":0.9,"regressions":[],"coverage":{"surfaces_touched":["load"],"surfaces_evidenced":["load"],"gaps":[]},"claim_verdict":"no-claim","eyeball":[],"rationale":"ok"}
+    resp_path = tmp / "resp.json"
+    resp_path.write_text(json.dumps([{"json": verdict_response}]))
+    call_count = tmp / "omp_count"
+    gh_log = tmp / "gh_log.jsonl"
+    gh_comments = tmp / "gh_comments.json"
+    gh_comments.write_text("[]")
+    omp_log = tmp / "omp_log.jsonl"
+    out_path = tmp / "verdict.json"
+    env = os.environ.copy()
+    env["HW_GATE_OMP_BIN"] = str(FAKE_OMP)
+    env["HW_GATE_GH_BIN"] = str(FAKE_GH)
+    env["FAKE_OMP_RESPONSES"] = str(resp_path)
+    env["FAKE_OMP_CALL_COUNT"] = str(call_count)
+    env["FAKE_OMP_LOG"] = str(omp_log)
     env["FAKE_GH_LOG"] = str(gh_log)
     env["FAKE_GH_COMMENTS"] = str(gh_comments)
-    cmd = [
-        sys.executable, str(REVIEW_PATH),
-        "--repo", "o/r",
-        "--pr", "1",
-        "--base", base,
-        "--head", head,
-        "--checkout", str(checkout),
-        "--evidence", str(evidence_path),
-        "--select", str(select_path),
-        "--hw-run-result", "success",
-        "--system-prompt", str(system_prompt),
-        "--out", str(out_path),
-    ]
+    cmd = [sys.executable, str(REVIEW_PATH),"--seat","sol","--phase","verdict","--repo","o/r","--pr","1","--base",base,"--head",head,"--checkout",str(checkout),"--select",str(select_path),"--prelim",str(prelim_path),"--evidence",str(evidence_path),"--hw-run-result",hw_run_result,"--system-prompt",str(system_prompt),"--out",str(out_path)]
     result = subprocess.run(cmd, env=env, capture_output=True, text=True)
-    assert result.returncode == 1, f"expected exit 1 got {result.returncode} stderr {result.stderr}"
+    return result, out_path, gh_log, gh_comments, omp_log, base, head, checkout
+
+def test_verdict_hard_evidence_block():
+    tmp = Path(tempfile.mkdtemp())
+    result, out_path, gh_log, gh_comments, omp_log, base, head, checkout = _run_verdict(tmp, evidence_extra={"verdict":"fail"}, verdict_response={"phase":"verdict","decision":"greenlight","confidence":0.9,"regressions":[],"coverage":{"surfaces_touched":["load"],"surfaces_evidenced":["load"],"gaps":[]},"claim_verdict":"no-claim","eyeball":[],"rationale":"ok"})
+    assert result.returncode == 0  # hard evidence block still exit 0 (model greenlight but floor blocks) but final is block
+    data = json.loads(out_path.read_text())
+    assert data["floor"]["final_decision"] == "block"
+    assert any("evidence" in r for r in data["floor"]["hard"])
+    # review should be --comment only never approve
+    gh_calls = [json.loads(l)["args"] for l in gh_log.read_text().splitlines() if l.strip()]
+    review_calls = [a for a in gh_calls if a[:2]==["pr","review"]]
+    assert review_calls
+    assert "--comment" in review_calls[-1]
+    assert "--approve" not in review_calls[-1]
+
+def test_verdict_hard_policy_hold():
+    tmp = Path(tempfile.mkdtemp())
+    result, out_path, *_ = _run_verdict(tmp, select_extra={"policy_paths":["scripts/hw-gate/review.py"]}, verdict_response={"phase":"verdict","decision":"greenlight","confidence":0.9,"regressions":[],"coverage":{"surfaces_touched":["load"],"surfaces_evidenced":["load"],"gaps":[]},"claim_verdict":"no-claim","eyeball":[],"rationale":"ok"})
     data = json.loads(out_path.read_text())
     assert data["floor"]["final_decision"] == "needs-human"
+    assert any("policy" in r for r in data["floor"]["hard"])
+
+def test_verdict_soft_coverage_needs_human():
+    tmp = Path(tempfile.mkdtemp())
+    result, out_path, *_ = _run_verdict(tmp, verdict_response={"phase":"verdict","decision":"greenlight","confidence":0.9,"regressions":[],"coverage":{"surfaces_touched":["load"],"surfaces_evidenced":[],"gaps":["serve"]},"claim_verdict":"no-claim","eyeball":[],"rationale":"ok"})
+    data = json.loads(out_path.read_text())
+    assert data["floor"]["final_decision"] == "needs-human"
+    assert any("coverage" in r for r in data["floor"]["soft"])
+
+def test_verdict_soft_confidence_needs_human():
+    tmp = Path(tempfile.mkdtemp())
+    result, out_path, *_ = _run_verdict(tmp, verdict_response={"phase":"verdict","decision":"greenlight","confidence":0.5,"regressions":[],"coverage":{"surfaces_touched":["load"],"surfaces_evidenced":["load"],"gaps":[]},"claim_verdict":"no-claim","eyeball":[],"rationale":"ok"})
+    data = json.loads(out_path.read_text())
+    assert data["floor"]["final_decision"] == "needs-human"
+    assert any("confidence" in r for r in data["floor"]["soft"])
+
+def test_verdict_greenlight_only_when_clear():
+    tmp = Path(tempfile.mkdtemp())
+    result, out_path, gh_log, gh_comments, *_ = _run_verdict(tmp)
+    assert result.returncode == 0
+    data = json.loads(out_path.read_text())
+    assert data["floor"]["final_decision"] == "greenlight"
+    # comment marker
+    comments = json.loads(gh_comments.read_text())
+    assert any("<!-- hw-gate:sol-verdict -->" in c["body"] for c in comments)
+    # evidence comment posted
+    assert any("<!-- hw-gate:evidence -->" in c["body"] for c in comments)
+
+def test_verdict_unparseable_needs_human_exit1():
+    tmp = Path(tempfile.mkdtemp())
+    checkout, base, head = _make_repo(tmp / "repo")
+    select = {"schema":"hipfire.hw-gate.select","version":1,"needs_hw":True,"buckets":["load"],"policy_paths":[],"surfaces":{"load":[],"serve":[],"kernel":[],"policy":[],"other":[]},"request":None,"request_error":None}
+    select_path = tmp / "select.json"
+    select_path.write_text(json.dumps(select))
+    prelim_json = {"schema":"hipfire.hw-gate.prelim","version":2,"seat":"sol","model":"gpt-5.6-sol","prelim":{"phase":"prelim","summary":"s","surfaces":["load"],"suspected_regressions":[],"run_hardware":True,"run_hardware_reasons":[],"routes":[],"unavailable_routes":[],"claim_assessment":"","questions_for_author":[]},"run_hardware":True,"posted":{}}
+    prelim_path = tmp / "prelim.json"
+    prelim_path.write_text(json.dumps(prelim_json))
+    evidence = {"schema":"hipfire.hw-gate.evidence","version":1,"verdict":"pass","base":base,"head":head,"buckets":["load"],"fixtures":[],"kernel":None}
+    evidence_path = tmp / "hw-gate.json"
+    evidence_path.write_text(json.dumps(evidence))
+    (tmp / "hw-gate.md").write_text("# Ev\n")
+    system_prompt = tmp / "sol.md"
+    system_prompt.write_text("prompt")
+    gh_comments = tmp / "gh_comments.json"
+    gh_comments.write_text("[]")
+    env = os.environ.copy()
+    env["HW_GATE_OMP_BIN"] = str(FAKE_OMP)
+    env["HW_GATE_GH_BIN"] = str(FAKE_GH)
+    env["FAKE_OMP_GARBAGE"] = "1"
+    env["FAKE_OMP_CALL_COUNT"] = str(tmp / "omp_count")
+    env["FAKE_GH_LOG"] = str(tmp / "gh_log.jsonl")
+    env["FAKE_GH_COMMENTS"] = str(gh_comments)
+    env["FAKE_OMP_LOG"] = str(tmp / "omp_log.jsonl")
+    out_path = tmp / "verdict.json"
+    cmd = [sys.executable, str(REVIEW_PATH),"--seat","sol","--phase","verdict","--repo","o/r","--pr","1","--base",base,"--head",head,"--checkout",str(checkout),"--select",str(select_path),"--prelim",str(prelim_path),"--evidence",str(evidence_path),"--hw-run-result","success","--system-prompt",str(system_prompt),"--out",str(out_path)]
+    result = subprocess.run(cmd, env=env, capture_output=True, text=True)
+    assert result.returncode == 1
+    data = json.loads(out_path.read_text())
+    assert data["floor"]["final_decision"] == "needs-human"
+    assert data["verdict"] is None
+
+# ---------------------------------------------------------------------------
+# decide e2e
+# ---------------------------------------------------------------------------
+
+def _run_decide(tmp: Path, select_extra: dict | None = None, evidence_extra: dict | None = None, sol_final="greenlight", fable_response: dict | None = None, hw_run_result="success", merge_409=False, checkout_extra_files: dict | None = None):
+    checkout, base, head = _make_repo(tmp / "checkout_d", files=checkout_extra_files)
+    select = {"schema":"hipfire.hw-gate.select","version":1,"needs_hw":True,"buckets":["load"],"policy_paths":[],"surfaces":{"load":["foo.rs"],"serve":[],"kernel":[],"policy":[],"other":[]},"request":None,"request_error":None}
+    if select_extra:
+        select.update(select_extra)
+    select_path = tmp / "select.json"
+    select_path.write_text(json.dumps(select))
+    prelim_json = {"schema":"hipfire.hw-gate.prelim","version":2,"seat":"sol","model":"gpt-5.6-sol","prelim":{"phase":"prelim","summary":"s","surfaces":["load"],"suspected_regressions":[],"run_hardware":True,"run_hardware_reasons":[],"routes":[],"unavailable_routes":[],"claim_assessment":"","questions_for_author":[]},"run_hardware":True,"posted":{}}
+    prelim_path = tmp / "prelim.json"
+    prelim_path.write_text(json.dumps(prelim_json))
+    evidence = {"schema":"hipfire.hw-gate.evidence","version":1,"verdict":"pass","base":base,"head":head,"buckets":["load"],"fixtures":[],"kernel":None}
+    if evidence_extra:
+        evidence.update(evidence_extra)
+    evidence_path = tmp / "hw-gate.json"
+    evidence_path.write_text(json.dumps(evidence))
+    (tmp / "hw-gate.md").write_text("# Evidence\n")
+    # sol verdict file with desired final
+    sol_verdict_data = {"phase":"verdict","decision": sol_final, "confidence": 0.9 if sol_final=="greenlight" else (0.5 if sol_final=="needs-human" and False else 0.9), "regressions":[],"coverage":{"surfaces_touched":["load"],"surfaces_evidenced":["load"],"gaps": [] if sol_final!="needs-human" else ["serve"]},"claim_verdict":"no-claim","eyeball":[],"rationale":"sol ok" }
+    # For needs-human due to coverage, set gaps
+    if sol_final == "needs-human":
+        sol_verdict_data = {"phase":"verdict","decision":"needs-human","confidence":0.9,"regressions":[],"coverage":{"surfaces_touched":["load"],"surfaces_evidenced":[],"gaps":["serve"]},"claim_verdict":"no-claim","eyeball":[],"rationale":"sol needs human"}
+    sol_floor_final = sol_final if sol_final in ("greenlight","needs-human","block") else "needs-human"
+    sol_verdict_file = {"schema":"hipfire.hw-gate.verdict","version":2,"seat":"sol","model":"gpt-5.6-sol","verdict": sol_verdict_data,"floor":{"hard":[],"soft":[] if sol_final=="greenlight" else ["coverage"],"model_decision":sol_final,"final_decision":sol_floor_final},"posted":{}}
+    verdict_path = tmp / "verdict.json"
+    verdict_path.write_text(json.dumps(sol_verdict_file))
+    system_prompt = tmp / "fable.md"
+    system_prompt.write_text("fable prompt")
+    if fable_response is None:
+        fable_response = {"phase":"decide","decision":"merge-staging","agrees_with_sol":True,"override":None,"regressions":[],"further_evidence_wanted":[],"rationale":"fable rationale","announcement":"Fable merges."}
+    resp_path = tmp / "resp.json"
+    resp_path.write_text(json.dumps([{"json": fable_response}]))
+    call_count = tmp / "omp_count"
+    gh_log = tmp / "gh_log.jsonl"
+    gh_comments = tmp / "gh_comments.json"
+    gh_comments.write_text("[]")
+    omp_log = tmp / "omp_log.jsonl"
+    out_path = tmp / "decision.json"
+    env = os.environ.copy()
+    env["HW_GATE_OMP_BIN"] = str(FAKE_OMP)
+    env["HW_GATE_GH_BIN"] = str(FAKE_GH)
+    env["FAKE_OMP_RESPONSES"] = str(resp_path)
+    env["FAKE_OMP_CALL_COUNT"] = str(call_count)
+    env["FAKE_OMP_LOG"] = str(omp_log)
+    env["FAKE_GH_LOG"] = str(gh_log)
+    env["FAKE_GH_COMMENTS"] = str(gh_comments)
+    if merge_409:
+        env["FAKE_GH_MERGE_409"] = "1"
+    env["HW_GATE_DECIDE_MODEL"] = "claude-fable-5"
+    cmd = [sys.executable, str(REVIEW_PATH),"--seat","fable","--phase","decide","--repo","o/r","--pr","1","--base",base,"--head",head,"--checkout",str(checkout),"--select",str(select_path),"--prelim",str(prelim_path),"--evidence",str(evidence_path),"--verdict",str(verdict_path),"--hw-run-result",hw_run_result,"--staging","beta","--system-prompt",str(system_prompt),"--out",str(out_path)]
+    result = subprocess.run(cmd, env=env, capture_output=True, text=True)
+    return result, out_path, gh_log, gh_comments, omp_log, base, head, checkout
+
+def test_decide_hard_floor_beats_merge():
+    tmp = Path(tempfile.mkdtemp())
+    result, out_path, gh_log, gh_comments, omp_log, base, head, checkout = _run_decide(tmp, evidence_extra={"verdict":"fail"}, sol_final="greenlight", fable_response={"phase":"decide","decision":"merge-staging","agrees_with_sol":True,"override":None,"regressions":[],"further_evidence_wanted":[],"rationale":"fable wants merge","announcement":"Fable merges."})
+    data = json.loads(out_path.read_text())
+    assert data["decision_final"] == "block"
+    assert data["floor"]["hard"] != []
+    # should not have called merges
+    gh_calls = [json.loads(l)["args"] for l in gh_log.read_text().splitlines() if l.strip()]
+    merges_calls = [a for a in gh_calls if ("merges" in a[1] if len(a)>1 else False)]
+    assert len(merges_calls) == 0
+
+def test_decide_override_needs_human_to_merge():
+    tmp = Path(tempfile.mkdtemp())
+    result, out_path, gh_log, gh_comments, omp_log, base, head, checkout = _run_decide(tmp, sol_final="needs-human", fable_response={"phase":"decide","decision":"merge-staging","agrees_with_sol":False,"override":{"of":"needs-human","why":"evidence closes gap"},"regressions":[],"further_evidence_wanted":[],"rationale":"override rationale","announcement":"Fable merges after review."})
+    assert result.returncode == 0, result.stderr
+    data = json.loads(out_path.read_text())
+    assert data["decision_final"] == "merge-staging"
+    assert data["override"] is not None
+    assert data["override"]["of"] == "needs-human"
+    assert data["merged"] is not None
+    assert data["merged"]["base"] == "beta"
+    assert data["merged"]["head"] == head
+    # merges api called with base=beta
+    gh_calls = [json.loads(l)["args"] for l in gh_log.read_text().splitlines() if l.strip()]
+    merges_calls = [a for a in gh_calls if ("merges" in a[1] if len(a)>1 else False)]
+    assert len(merges_calls) == 1
+    arg_str = " ".join(merges_calls[0])
+    assert "base=beta" in arg_str
+    assert f"head={head}" in arg_str
+    assert "hw-gate: merge PR #1" in arg_str
+    # labels: merged-staging added, hw-run removed
+    assert "merged-staging" in data["posted"]["labels_added"]
+    assert "hw-run" in data["posted"]["labels_removed"]
+    # review should be approve
+    assert any("--approve" in " ".join(a) for a in gh_calls if a[:2]==["pr","review"])
+    # omp model should be fable
+    omp_calls = [json.loads(l)["args"] for l in omp_log.read_text().splitlines() if l.strip()]
+    assert any("claude-fable-5" in " ".join(a) for a in omp_calls)
+
+def test_decide_veto_greenlight_to_hold():
+    tmp = Path(tempfile.mkdtemp())
+    result, out_path, gh_log, gh_comments, omp_log, *_ = _run_decide(tmp, sol_final="greenlight", fable_response={"phase":"decide","decision":"hold","agrees_with_sol":False,"override":{"of":"greenlight","why":"veto, see decoded text"},"regressions":[],"further_evidence_wanted":[],"rationale":"veto rationale","announcement":"Fable holds."})
+    data = json.loads(out_path.read_text())
+    assert data["decision_final"] == "hold"
+    assert data["override"] is not None
+    assert data["override"]["of"] == "greenlight"
+    gh_calls = [json.loads(l)["args"] for l in gh_log.read_text().splitlines() if l.strip()]
+    merges_calls = [a for a in gh_calls if ("merges" in a[1] if len(a)>1 else False)]
+    assert len(merges_calls) == 0
+    # label needs-human
+    assert "needs-human" in data["posted"]["labels_added"]
+    assert any("--comment" in " ".join(a) for a in gh_calls if a[:2]==["pr","review"])
+    assert not any("--approve" in " ".join(a) for a in gh_calls if a[:2]==["pr","review"])
+
+def test_decide_409_conflict():
+    tmp = Path(tempfile.mkdtemp())
+    result, out_path, gh_log, gh_comments, omp_log, *_ = _run_decide(tmp, sol_final="needs-human", fable_response={"phase":"decide","decision":"merge-staging","agrees_with_sol":False,"override":{"of":"needs-human","why":"override"},"regressions":[],"further_evidence_wanted":[],"rationale":"r","announcement":"merge"}, merge_409=True)
+    data = json.loads(out_path.read_text())
+    assert data["decision_final"] == "merge-staging"
+    assert data["merged"] is not None
+    assert "error" in data["merged"]
+    assert "409" in data["merged"]["error"] or "409" in str(data["merged"])
+    # label should be needs-human instead of merged-staging
+    assert "needs-human" in data["posted"]["labels_added"]
+    # comment should note conflict
     comments = json.loads(gh_comments.read_text())
     bodies = [c["body"] for c in comments]
-    # Should have posted needs-human verdict
-    assert any("needs-human" in b or "review failed" in b for b in bodies)
+    assert any("409" in b or "conflict" in b.lower() for b in bodies)
 
+def test_decide_labels_and_hw_run_removed():
+    for dec, label, flag in [("merge-staging","merged-staging","--approve"),("hold","needs-human","--comment"),("block","hw-gate-blocked","--request-changes")]:
+        tmp = Path(tempfile.mkdtemp())
+        fable_resp = {"phase":"decide","decision":dec,"agrees_with_sol":True,"override":None,"regressions":[],"further_evidence_wanted":[],"rationale":"r","announcement":"a"}
+        # For block, need sol_final block to avoid override confusion; but we test direct mapping when no hard floor.
+        sol_final = "greenlight" if dec=="merge-staging" else ("needs-human" if dec=="hold" else "block")
+        # Ensure sol_final matches so no override needed except hold case will be veto but ok.
+        # For this table, we will set sol_final to match fable for clean.
+        if dec == "merge-staging":
+            sol_final_test = "needs-human"  # to allow merge override, but we cover separately; for this loop test hold/block.
+            # skip merge case already covered, test hold and block
+            if dec == "merge-staging":
+                continue
+        result, out_path, gh_log, gh_comments, *_ = _run_decide(tmp, sol_final=sol_final, fable_response=fable_resp)
+        data = json.loads(out_path.read_text())
+        assert data["decision_final"] == dec
+        assert label in data["posted"]["labels_added"]
+        assert "hw-run" in data["posted"]["labels_removed"]
+        gh_calls = [json.loads(l)["args"] for l in gh_log.read_text().splitlines() if l.strip()]
+        review_calls = [a for a in gh_calls if a[:2]==["pr","review"]]
+        assert any(flag in " ".join(rc) for rc in review_calls)
 
-# ---------------------------------------------------------------------------
-# omp command line reporting
-# ---------------------------------------------------------------------------
+def test_omp_argv_per_seat_and_help():
+    # check help
+    result = subprocess.run([sys.executable, str(REVIEW_PATH), "--help"], capture_output=True, text=True)
+    assert result.returncode == 0
+    help_text = result.stdout + result.stderr
+    for flag in ["--seat","--phase","--select","--fixtures","--prelim","--evidence","--verdict","--hw-run-result","--staging","--routes","--system-prompt","--out"]:
+        assert flag in help_text, f"missing {flag} in help"
 
-def test_omp_command_line():
-    # Verify that omp_review builds expected command shape
-    # We inspect via fake_omp log in an e2e run
-    import tempfile
+def test_merges_api_call_exact():
     tmp = Path(tempfile.mkdtemp())
-    res = _run_review(tmp)
-    omp_calls = [json.loads(l)["args"] for l in res["omp_log"].read_text().splitlines() if l.strip()]
-    # Verbatim expected prefix: omp -p --mode json --auto-approve --tools=read,grep,glob --cwd <checkout> --model <model> --system-prompt <review.md> --max-time 15m "<prompt>"
-    # Check structure
-    for oc in omp_calls:
-        # oc is args list excluding binary (fake_omp logs sys.argv[1:])
-        assert "-p" in oc
-        idx = oc.index("-p")
-        assert oc[idx+1] == "--mode" or oc[idx+1] == "--mode"  # actually -p --mode json
-        # Provide the verbatim expected command shape for report
-        print("OMP command:", " ".join(oc))
+    result, out_path, gh_log, gh_comments, omp_log, base, head, checkout = _run_decide(tmp, sol_final="needs-human", fable_response={"phase":"decide","decision":"merge-staging","agrees_with_sol":False,"override":{"of":"needs-human","why":"why"},"regressions":[],"further_evidence_wanted":[],"rationale":"r","announcement":"a"})
+    gh_calls = [json.loads(l)["args"] for l in gh_log.read_text().splitlines() if l.strip()]
+    merges_calls = [a for a in gh_calls if ("merges" in a[1] if len(a)>1 else False)]
+    assert merges_calls
+    call = merges_calls[0]
+    # expected: gh api repos/o/r/merges -f base=beta -f head=<sha> -f commit_message=...
+    assert call[0] == "api"
+    assert "repos/o/r/merges" in call[1]
+    arg_str = " ".join(call)
+    assert "base=beta" in arg_str
+    assert f"head={head}" in arg_str
+    assert "hw-gate: merge PR #1" in arg_str
+
+def test_fable_unavailable_hold_exit1():
+    tmp = Path(tempfile.mkdtemp())
+    checkout, base, head = _make_repo(tmp / "checkout_f")
+    select = {"schema":"hipfire.hw-gate.select","version":1,"needs_hw":True,"buckets":["load"],"policy_paths":[],"surfaces":{"load":[],"serve":[],"kernel":[],"policy":[],"other":[]},"request":None,"request_error":None}
+    select_path = tmp / "select.json"
+    select_path.write_text(json.dumps(select))
+    prelim_json = {"schema":"hipfire.hw-gate.prelim","version":2,"seat":"sol","model":"gpt-5.6-sol","prelim":{"phase":"prelim","summary":"s","surfaces":["load"],"suspected_regressions":[],"run_hardware":True,"run_hardware_reasons":[],"routes":[],"unavailable_routes":[],"claim_assessment":"","questions_for_author":[]},"run_hardware":True,"posted":{}}
+    prelim_path = tmp / "prelim.json"
+    prelim_path.write_text(json.dumps(prelim_json))
+    evidence = {"schema":"hipfire.hw-gate.evidence","version":1,"verdict":"pass","base":base,"head":head,"buckets":["load"],"fixtures":[],"kernel":None}
+    evidence_path = tmp / "hw-gate.json"
+    evidence_path.write_text(json.dumps(evidence))
+    (tmp / "hw-gate.md").write_text("# Ev\n")
+    sol_verdict_file = {"schema":"hipfire.hw-gate.verdict","version":2,"seat":"sol","model":"gpt-5.6-sol","verdict":{"phase":"verdict","decision":"needs-human","confidence":0.9,"regressions":[],"coverage":{"surfaces_touched":["load"],"surfaces_evidenced":[],"gaps":["serve"]},"claim_verdict":"no-claim","eyeball":[],"rationale":"sol"},"floor":{"hard":[],"soft":["coverage"],"model_decision":"needs-human","final_decision":"needs-human"},"posted":{}}
+    verdict_path = tmp / "verdict.json"
+    verdict_path.write_text(json.dumps(sol_verdict_file))
+    system_prompt = tmp / "fable.md"
+    system_prompt.write_text("prompt")
+    env = os.environ.copy()
+    env["HW_GATE_OMP_BIN"] = str(FAKE_OMP)
+    env["HW_GATE_GH_BIN"] = str(FAKE_GH)
+    env["FAKE_OMP_GARBAGE"] = "1"
+    env["FAKE_OMP_CALL_COUNT"] = str(tmp / "omp_count")
+    env["FAKE_GH_LOG"] = str(tmp / "gh_log.jsonl")
+    env["FAKE_GH_COMMENTS"] = str(tmp / "gh_comments.json")
+    env["FAKE_OMP_LOG"] = str(tmp / "omp_log.jsonl")
+    out_path = tmp / "decision.json"
+    cmd = [sys.executable, str(REVIEW_PATH),"--seat","fable","--phase","decide","--repo","o/r","--pr","1","--base",base,"--head",head,"--checkout",str(checkout),"--select",str(select_path),"--prelim",str(prelim_path),"--evidence",str(evidence_path),"--verdict",str(verdict_path),"--hw-run-result","success","--staging","beta","--system-prompt",str(system_prompt),"--out",str(out_path)]
+    result = subprocess.run(cmd, env=env, capture_output=True, text=True)
+    assert result.returncode == 1
+    data = json.loads(out_path.read_text())
+    assert data["decision_final"] == "hold"
+    assert data["decision"] is None

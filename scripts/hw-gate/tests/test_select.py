@@ -112,7 +112,7 @@ def test_empty_stdin_via_main():
     assert data["needs_hw"] is False
 
 
-def test_github_output_writes_four_lines(tmp_path=None):
+def test_github_output_writes_five_lines(tmp_path=None):
     # use tempfile for github output
     import tempfile
     with tempfile.NamedTemporaryFile(mode="w+", delete=False) as tf:
@@ -122,13 +122,16 @@ def test_github_output_writes_four_lines(tmp_path=None):
     assert proc.returncode == 0
     data = json.loads(proc.stdout.decode())
     assert data["buckets"] == ["load"]
-    # github-output file should have three lines
+    assert data["request"] is None
+    assert data["request_error"] is None
     text = Path(out_path).read_text()
     lines = text.strip().splitlines()
-    assert len(lines) == 4
+    assert len(lines) == 5
     assert lines[0].startswith("needs_hw=")
     assert lines[1].startswith("buckets=")
     assert lines[2].startswith("policy=")
+    assert lines[3].startswith("exec_sensitive=")
+    assert lines[4] == "request_present=false"
     assert "needs_hw=true" in lines[0]
     assert "load" in lines[1]
     # policy empty => "policy=" line with empty value
@@ -518,3 +521,193 @@ def test_github_output_includes_exec_sensitive(tmp_path):
     run_select("crates/hipfire-loader/build.rs\n", "--github-output", str(out))
     text = out.read_text()
     assert "exec_sensitive=crates/hipfire-loader/build.rs" in text
+
+
+# ---------------------------------------------------------------------------
+# PR body hw-gate-request parsing
+# ---------------------------------------------------------------------------
+
+def _write_body(tmp_path, text: str, name: str = "pr-body.md") -> Path:
+    p = tmp_path / name
+    p.write_text(text, encoding="utf-8")
+    return p
+
+
+def test_pr_body_no_marker(tmp_path):
+    body = _write_body(tmp_path, "Just a normal PR description.\n")
+    proc = run_select("crates/hipfire-loader/src/lib.rs\n", "--pr-body", str(body))
+    assert proc.returncode == 0
+    data = json.loads(proc.stdout.decode())
+    assert data["request"] is None
+    assert data["request_error"] is None
+
+
+def test_pr_body_valid_block_normalized(tmp_path):
+    body_text = (
+        "Summary\n\n"
+        "<!-- hw-gate-request -->\n"
+        "```json\n"
+        '{"routes":[{"mode":"battery","tag":"registry:smoke"},'
+        '{"mode":"chain","tag":"registry:long"}],"claim":"covers loader"}\n'
+        "```\n"
+    )
+    body = _write_body(tmp_path, body_text)
+    gh = tmp_path / "gh.out"
+    proc = run_select(
+        "crates/hipfire-loader/src/lib.rs\n",
+        "--pr-body", str(body),
+        "--github-output", str(gh),
+    )
+    assert proc.returncode == 0
+    data = json.loads(proc.stdout.decode())
+    assert data["request"] == {
+        "routes": [
+            {"mode": "battery", "tag": "registry:smoke"},
+            {"mode": "chain", "tag": "registry:long"},
+        ],
+        "claim": "covers loader",
+    }
+    assert data["request_error"] is None
+    assert "request_present=true" in gh.read_text()
+
+
+def test_pr_body_claim_defaults_empty(tmp_path):
+    body_text = (
+        "<!-- hw-gate-request -->\n"
+        "```json\n"
+        '{"routes":[{"mode":"battery","tag":"registry:a"}]}\n'
+        "```\n"
+    )
+    body = _write_body(tmp_path, body_text)
+    proc = run_select("docs/x.md\n", "--pr-body", str(body))
+    data = json.loads(proc.stdout.decode())
+    assert data["request"] == {"routes": [{"mode": "battery", "tag": "registry:a"}], "claim": ""}
+    assert data["request_error"] is None
+
+
+def test_pr_body_missing_fence(tmp_path):
+    body = _write_body(tmp_path, "<!-- hw-gate-request -->\nnot a fence\n")
+    proc = run_select("", "--pr-body", str(body))
+    assert proc.returncode == 0
+    data = json.loads(proc.stdout.decode())
+    assert data["request"] is None
+    assert data["request_error"]
+    assert "fence" in data["request_error"].lower()
+
+
+def test_pr_body_invalid_json(tmp_path):
+    body_text = (
+        "<!-- hw-gate-request -->\n"
+        "```json\n"
+        "{not-json\n"
+        "```\n"
+    )
+    body = _write_body(tmp_path, body_text)
+    proc = run_select("", "--pr-body", str(body))
+    data = json.loads(proc.stdout.decode())
+    assert data["request"] is None
+    assert data["request_error"]
+    assert "invalid JSON" in data["request_error"]
+
+
+def test_pr_body_bad_mode(tmp_path):
+    body_text = (
+        "<!-- hw-gate-request -->\n"
+        "```json\n"
+        '{"routes":[{"mode":"sprint","tag":"registry:a"}]}\n'
+        "```\n"
+    )
+    body = _write_body(tmp_path, body_text)
+    proc = run_select("", "--pr-body", str(body))
+    data = json.loads(proc.stdout.decode())
+    assert data["request"] is None
+    assert data["request_error"]
+    assert "mode" in data["request_error"]
+
+
+def test_pr_body_missing_tag(tmp_path):
+    body_text = (
+        "<!-- hw-gate-request -->\n"
+        "```json\n"
+        '{"routes":[{"mode":"battery"}]}\n'
+        "```\n"
+    )
+    body = _write_body(tmp_path, body_text)
+    proc = run_select("", "--pr-body", str(body))
+    data = json.loads(proc.stdout.decode())
+    assert data["request"] is None
+    assert data["request_error"]
+    assert "tag" in data["request_error"]
+
+
+def test_pr_body_empty_tag(tmp_path):
+    body_text = (
+        "<!-- hw-gate-request -->\n"
+        "```json\n"
+        '{"routes":[{"mode":"battery","tag":"  "}]}\n'
+        "```\n"
+    )
+    body = _write_body(tmp_path, body_text)
+    proc = run_select("", "--pr-body", str(body))
+    data = json.loads(proc.stdout.decode())
+    assert data["request"] is None
+    assert data["request_error"]
+    assert "tag" in data["request_error"]
+
+
+def test_pr_body_marker_twice_first_wins(tmp_path):
+    body_text = (
+        "intro\n"
+        "<!-- hw-gate-request -->\n"
+        "```json\n"
+        '{"routes":[{"mode":"battery","tag":"registry:first"}],"claim":"one"}\n'
+        "```\n"
+        "more text\n"
+        "<!-- hw-gate-request -->\n"
+        "```json\n"
+        '{"routes":[{"mode":"chain","tag":"registry:second"}],"claim":"two"}\n'
+        "```\n"
+    )
+    body = _write_body(tmp_path, body_text)
+    proc = run_select("", "--pr-body", str(body))
+    data = json.loads(proc.stdout.decode())
+    assert data["request"] == {
+        "routes": [{"mode": "battery", "tag": "registry:first"}],
+        "claim": "one",
+    }
+    assert data["request_error"] is None
+
+
+def test_pr_body_crlf_line_endings(tmp_path):
+    body_text = (
+        "Summary\r\n"
+        "<!-- hw-gate-request -->\r\n"
+        "```json\r\n"
+        '{"routes":[{"mode":"chain","tag":"registry:crlf"}],"claim":"win"}\r\n'
+        "```\r\n"
+    )
+    # write bytes to preserve CRLF exactly
+    p = tmp_path / "pr-body.md"
+    p.write_bytes(body_text.encode("utf-8"))
+    proc = run_select("crates/hipfire-loader/src/lib.rs\n", "--pr-body", str(p))
+    assert proc.returncode == 0
+    data = json.loads(proc.stdout.decode())
+    assert data["request"] == {
+        "routes": [{"mode": "chain", "tag": "registry:crlf"}],
+        "claim": "win",
+    }
+    assert data["request_error"] is None
+
+
+def test_pr_body_whitespace_between_marker_and_fence(tmp_path):
+    body_text = (
+        "<!-- hw-gate-request -->   \n\n"
+        "```json\n"
+        '{"routes":[{"mode":"battery","tag":"registry:ws"}]}\n'
+        "```\n"
+    )
+    body = _write_body(tmp_path, body_text)
+    proc = run_select("", "--pr-body", str(body))
+    data = json.loads(proc.stdout.decode())
+    assert data["request"]["routes"][0]["tag"] == "registry:ws"
+    assert data["request_error"] is None

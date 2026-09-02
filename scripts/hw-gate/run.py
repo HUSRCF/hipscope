@@ -571,6 +571,109 @@ def _run_fixture_harness(repo, fixture, env_base, logs_dir, device, modes, harne
     }
 
 
+def _load_registry(registry_path: str | None) -> dict | None:
+    if not registry_path:
+        return None
+    p = Path(registry_path)
+    if not p.is_file():
+        return None
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+    return None
+
+
+def _resolve_registry_entry(tag: str, registry: dict | None) -> dict | None:
+    if not registry or not isinstance(registry, dict):
+        return None
+    models = registry.get("models", {})
+    aliases = registry.get("aliases", {})
+    if not isinstance(models, dict):
+        models = {}
+    if not isinstance(aliases, dict):
+        aliases = {}
+    cur = tag
+    seen: set[str] = set()
+    while isinstance(cur, str) and cur in aliases:
+        if cur in seen:
+            break
+        seen.add(cur)
+        nxt = aliases[cur]
+        if not isinstance(nxt, str) or not nxt:
+            break
+        cur = nxt
+    if cur in models and isinstance(models[cur], dict):
+        m = models[cur]
+        return {
+            "tag": tag,
+            "file": m.get("file", ""),
+            "sha256": m.get("sha256", ""),
+            "size_bytes": m.get("size_bytes"),
+            "arch_id": m.get("arch_id"),
+        }
+    if tag in models and isinstance(models[tag], dict):
+        m = models[tag]
+        return {
+            "tag": tag,
+            "file": m.get("file", ""),
+            "sha256": m.get("sha256", ""),
+            "size_bytes": m.get("size_bytes"),
+            "arch_id": m.get("arch_id"),
+        }
+    return None
+
+
+def _build_routes_map(routes_data) -> tuple[list[str], dict[str, list[str]], dict[str, str]]:
+    """Parse routes list per Contract. Returns (distinct_tags, per_tag_modes, per_tag_source)."""
+    if not isinstance(routes_data, list):
+        return [], {}, {}
+    tag_to_modes: dict[str, set[str]] = {}
+    tag_to_sources: dict[str, set[str]] = {}
+    order: list[str] = []
+    for entry in routes_data:
+        if not isinstance(entry, dict):
+            continue
+        tag = entry.get("tag")
+        mode = entry.get("mode")
+        source = entry.get("source") or "bucket"
+        if not isinstance(tag, str) or not tag:
+            continue
+        if not isinstance(mode, str) or not mode:
+            continue
+        if not isinstance(source, str) or not source:
+            source = "bucket"
+        if tag not in tag_to_modes:
+            tag_to_modes[tag] = set()
+            tag_to_sources[tag] = set()
+            order.append(tag)
+        tag_to_modes[tag].add(mode)
+        tag_to_sources[tag].add(source)
+    per_tag_modes: dict[str, list[str]] = {}
+    per_tag_source: dict[str, str] = {}
+    for tag in order:
+        modes_set = tag_to_modes[tag]
+        ordered: list[str] = []
+        for pref in ("battery", "chain"):
+            if pref in modes_set:
+                ordered.append(pref)
+        for m in sorted(modes_set):
+            if m not in ordered:
+                ordered.append(m)
+        per_tag_modes[tag] = ordered
+        sources = tag_to_sources[tag]
+        if "bucket" in sources:
+            per_tag_source[tag] = "bucket"
+        elif "author" in sources:
+            per_tag_source[tag] = "author"
+        elif "sol" in sources:
+            per_tag_source[tag] = "sol"
+        else:
+            per_tag_source[tag] = next(iter(sources)) if sources else "bucket"
+    return order, per_tag_modes, per_tag_source
+
 def _find_file_for_tag(tag: str, manifest: dict):
     # top-level fixtures first
     for f in manifest.get("fixtures", []) if isinstance(manifest.get("fixtures"), list) else []:
@@ -713,10 +816,20 @@ def render_md(evidence: dict) -> str:
             size_ok_str = "✅" if size_ok is True else ("❌" if size_ok is False else str(size_ok))
             status = fx.get("status", "")
             reason = (fx.get("reason", "") or "").replace("|", "\\|").replace("\n", " ")
+            source = fx.get("source", "")
             lines.append(f"### {tag}")
             lines.append("")
-            lines.append(f"sha256_ok: {sha_ok_str} size_ok: {size_ok_str} status: {status} reason: {reason}")
+            # include source if present
+            if source:
+                lines.append(f"source: {source} sha256_ok: {sha_ok_str} size_ok: {size_ok_str} status: {status} reason: {reason}")
+            else:
+                lines.append(f"sha256_ok: {sha_ok_str} size_ok: {size_ok_str} status: {status} reason: {reason}")
             lines.append("")
+            # unavailable fixtures have no turn table
+            if status == "unavailable":
+                # already showed reason, no modes table
+                lines.append("")
+                continue
             modes = fx.get("modes", {})
             if not modes:
                 lines.append("no modes")
@@ -809,6 +922,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--out", required=True)
     ap.add_argument("--md", required=True)
     ap.add_argument("--only-tag", action="append", default=[])
+    ap.add_argument("--routes", default=None, help="JSON list per Contract")
+    ap.add_argument("--registry", default=None, help="registry/v1.json file")
     ap.add_argument("--skip-build", action="store_true")
     args = ap.parse_args(argv)
 
@@ -914,6 +1029,347 @@ def main(argv: list[str] | None = None) -> int:
     if "max_tokens" not in harness_cfg:
         harness_cfg["max_tokens"] = 256
 
+    # --- Routes handling -------------------------------------------------
+    use_routes = args.routes is not None
+    routes_order: list[str] = []
+    per_tag_modes: dict[str, list[str]] = {}
+    per_tag_source: dict[str, str] = {}
+    registry_data = None
+    routes_data = None
+    if use_routes:
+        # Load routes file; if missing, treat as no routes? But contract says always written even when run_hardware false, so file should exist.
+        try:
+            routes_raw = Path(args.routes).read_text(encoding="utf-8")
+            routes_data = json.loads(routes_raw)
+        except Exception as e:
+            print(f"failed to load routes {args.routes}: {e}", file=sys.stderr)
+            evidence_fail = {
+                "schema": "hipfire.hw-gate.evidence",
+                "version": 1,
+                "verdict": "fail",
+                "base": args.base,
+                "head": args.head,
+                "buckets": buckets,
+                "host": {"gfx": _get_host_gfx(), "rocm": _get_host_rocm(), "device": args.device, "runner": socket.gethostname()},
+                "binaries": {"daemon_md5": None, "hipfire_md5": None, "build_seconds": 0.0},
+                "fixtures": [],
+                "kernel": None,
+                "logs_dir": "hw-gate-logs",
+                "error": f"routes load failed: {e}",
+            }
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text(json.dumps(evidence_fail, indent=2) + "\n", encoding="utf-8")
+            md_path.write_text(render_md(evidence_fail), encoding="utf-8")
+            return 2
+        routes_order, per_tag_modes, per_tag_source = _build_routes_map(routes_data)
+        # Apply --only-tag filtering if specified (keep consistency with non-routes behavior)
+        if args.only_tag:
+            filtered = [t for t in routes_order if t in args.only_tag]
+            # keep only filtered
+            routes_order = filtered
+            per_tag_modes = {k: v for k, v in per_tag_modes.items() if k in routes_order}
+            per_tag_source = {k: v for k, v in per_tag_source.items() if k in routes_order}
+        registry_data = _load_registry(args.registry)
+        # Quick handling for empty routes? Still need to handle kernel maybe
+    # ---------------------------------------------------------------------
+
+    host_info = {"gfx": _get_host_gfx(), "rocm": _get_host_rocm(), "device": args.device, "runner": socket.gethostname()}
+
+    if use_routes:
+        # Routed mode: fixture set = distinct tags in routes
+        fixtures_by_tag: dict[str, dict] = {}
+        for f in fixtures_all:
+            t = f.get("tag")
+            if isinstance(t, str) and t:
+                fixtures_by_tag[t] = f
+
+        # Prepare verification / unavailable handling
+        unavailable_entries: list[dict] = []
+        runnable: list[tuple[str, dict, dict, list[str], str]] = []  # tag, fixture_def, vr, modes, source
+        routed_precondition_failures: list[tuple[dict, dict]] = []
+        precondition_failed = False
+        precondition_reason = ""
+
+        for tag in routes_order:
+            source = per_tag_source.get(tag, "bucket")
+            modes = per_tag_modes.get(tag, [])
+            # Resolve fixture definition
+            fixture_def = None
+            is_mandatory = False
+            if tag in fixtures_by_tag:
+                fixture_def = fixtures_by_tag[tag]
+                is_mandatory = True
+            else:
+                fixture_def = _resolve_registry_entry(tag, registry_data)
+                is_mandatory = False
+            if fixture_def is None:
+                # unknown tag
+                unavailable_entries.append({
+                    "tag": tag,
+                    "file": "",
+                    "sha256": "",
+                    "sha256_ok": False,
+                    "size_ok": False,
+                    "source": source,
+                    "modes": {},
+                    "status": "unavailable",
+                    "reason": "unknown tag",
+                })
+                continue
+            file_name = fixture_def.get("file", "")
+            # Normalize file_name: if empty, skip check? treat as missing -> unavailable/mismatch
+            file_path = (Path(models_dir) / file_name) if file_name else (Path(models_dir) / tag)
+            if not file_path.is_file():
+                if is_mandatory:
+                    vr = {
+                        "tag": tag,
+                        "file": file_name,
+                        "exists": False,
+                        "size_ok": False,
+                        "sha256_ok": False,
+                        "actual_size": None,
+                        "actual_sha256": None,
+                        "reason": f"missing {file_path}",
+                    }
+                    precondition_failed = True
+                    precondition_reason = vr["reason"]
+                    routed_precondition_failures.append((fixture_def, vr))
+                else:
+                    unavailable_entries.append({
+                        "tag": tag,
+                        "file": file_name,
+                        "sha256": fixture_def.get("sha256", ""),
+                        "sha256_ok": False,
+                        "size_ok": False,
+                        "source": source,
+                        "modes": {},
+                        "status": "unavailable",
+                        "reason": f"fixture not present on runner: {file_name}",
+                    })
+                continue
+            # file exists, verify sha/size
+            vr = verify_fixture(str(models_dir), fixture_def, str(cache_path))
+            if not vr.get("size_ok") or not vr.get("sha256_ok") or not vr.get("exists"):
+                precondition_failed = True
+                precondition_reason = vr.get("reason", "precondition failed")
+                routed_precondition_failures.append((fixture_def, vr))
+            else:
+                runnable.append((tag, fixture_def, vr, modes, source))
+
+        # harness scripts existence (serve only if any runnable needs modes)
+        need_serve = any(len(modes) > 0 for _, _, _, modes, _ in runnable)
+        # Also if only unavailable/unknown routes, still need not fail on missing harness? But keep check for consistency: if routes non-empty but none runnable, we don't need harness.
+        if need_serve:
+            if not (repo_p / "scripts" / "serve_harness.py").is_file():
+                precondition_failed = True
+                precondition_reason = "missing scripts/serve_harness.py"
+        if "kernel" in buckets:
+            if not (repo_p / "scripts" / "redline_daemon_harness.py").is_file():
+                precondition_failed = True
+                precondition_reason = "missing scripts/redline_daemon_harness.py"
+
+        if precondition_failed:
+            fixtures_evidence: list[dict] = []
+            for fx, vr in routed_precondition_failures:
+                tag = fx.get("tag", "")
+                source = per_tag_source.get(tag, "bucket")
+                fixtures_evidence.append({
+                    "tag": tag,
+                    "file": fx.get("file", ""),
+                    "sha256": fx.get("sha256", ""),
+                    "sha256_ok": vr.get("sha256_ok", False),
+                    "size_ok": vr.get("size_ok", False),
+                    "source": source,
+                    "modes": {},
+                    "status": "fail",
+                    "reason": vr.get("reason", precondition_reason) if vr.get("reason") else precondition_reason,
+                })
+            # add unavailable entries as well (not failures)
+            for ue in unavailable_entries:
+                fixtures_evidence.append(ue)
+            # If precondition due to missing harness and no fixture failures, keep harness reason
+            if not fixtures_evidence and precondition_reason.startswith("missing"):
+                pass
+            evidence = {
+                "schema": "hipfire.hw-gate.evidence",
+                "version": 1,
+                "verdict": "fail",
+                "base": args.base,
+                "head": args.head,
+                "buckets": buckets,
+                "host": host_info,
+                "binaries": {"daemon_md5": None, "hipfire_md5": None, "build_seconds": 0.0},
+                "fixtures": fixtures_evidence,
+                "kernel": None,
+                "logs_dir": "hw-gate-logs",
+                "precondition_error": precondition_reason,
+            }
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text(json.dumps(evidence, indent=2) + "\n", encoding="utf-8")
+            md_path.parent.mkdir(parents=True, exist_ok=True)
+            md_path.write_text(render_md(evidence), encoding="utf-8")
+            print(f"precondition failed: {precondition_reason}", file=sys.stderr)
+            return 2
+
+        # Build
+        bin_dir = _resolve_bin_dir(repo_p)
+        daemon_path = bin_dir / "daemon"
+        hipfire_path = bin_dir / "hipfire"
+        build_seconds = 0.0
+        daemon_md5 = None
+        hipfire_md5 = None
+        if not args.skip_build:
+            start_build = time.time()
+            try:
+                res = run_cmd(["cargo", "build", "--release"], cwd=str(repo_p), capture_output=True, text=True, timeout=1200)
+                build_seconds = time.time() - start_build
+                if res.returncode != 0:
+                    evidence = {
+                        "schema": "hipfire.hw-gate.evidence",
+                        "version": 1,
+                        "verdict": "fail",
+                        "base": args.base,
+                        "head": args.head,
+                        "buckets": buckets,
+                        "host": host_info,
+                        "binaries": {"daemon_md5": None, "hipfire_md5": None, "build_seconds": build_seconds},
+                        "fixtures": [],
+                        "kernel": None,
+                        "logs_dir": "hw-gate-logs",
+                        "build_error": (res.stderr or "")[-2000:],
+                    }
+                    out_path.parent.mkdir(parents=True, exist_ok=True)
+                    out_path.write_text(json.dumps(evidence, indent=2) + "\n", encoding="utf-8")
+                    md_path.write_text(render_md(evidence), encoding="utf-8")
+                    print(f"build failed: {res.stderr}", file=sys.stderr)
+                    return 2
+            except Exception as e:
+                build_seconds = time.time() - start_build
+                evidence = {
+                    "schema": "hipfire.hw-gate.evidence",
+                    "version": 1,
+                    "verdict": "fail",
+                    "base": args.base,
+                    "head": args.head,
+                    "buckets": buckets,
+                    "host": host_info,
+                    "binaries": {"daemon_md5": None, "hipfire_md5": None, "build_seconds": build_seconds},
+                    "fixtures": [],
+                    "kernel": None,
+                    "logs_dir": "hw-gate-logs",
+                    "build_error": str(e),
+                }
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                out_path.write_text(json.dumps(evidence, indent=2) + "\n", encoding="utf-8")
+                md_path.write_text(render_md(evidence), encoding="utf-8")
+                print(f"build exception: {e}", file=sys.stderr)
+                return 2
+            daemon_md5 = _md5_file(daemon_path)
+            hipfire_md5 = _md5_file(hipfire_path)
+        else:
+            daemon_md5 = _md5_file(daemon_path)
+            hipfire_md5 = _md5_file(hipfire_path)
+            build_seconds = 0.0
+
+        # Isolated home
+        try:
+            host_info["config_toml"] = write_isolated_home(str(hipfire_home_p), args.device, str(models_dir))
+        except Exception as e:
+            print(f"write_isolated_home failed: {e}", file=sys.stderr)
+            evidence = {
+                "schema": "hipfire.hw-gate.evidence",
+                "version": 1,
+                "verdict": "fail",
+                "base": args.base,
+                "head": args.head,
+                "buckets": buckets,
+                "host": host_info,
+                "binaries": {"daemon_md5": daemon_md5, "hipfire_md5": hipfire_md5, "build_seconds": build_seconds},
+                "fixtures": [],
+                "kernel": None,
+                "logs_dir": "hw-gate-logs",
+                "error": f"isolated home failed: {e}",
+            }
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text(json.dumps(evidence, indent=2) + "\n", encoding="utf-8")
+            md_path.write_text(render_md(evidence), encoding="utf-8")
+            return 2
+
+        # Run buckets (per-tag modes)
+        env_base = dict(os.environ)
+        env_base["HIPFIRE_HOME"] = str(hipfire_home_p)
+        env_base["HIPFIRE_MODELS_DIR"] = str(models_dir)
+
+        fixtures_evidence = []
+        overall_pass = True
+
+        # Add unavailable first (preserve order)
+        for ue in unavailable_entries:
+            fixtures_evidence.append(ue)
+
+        # Run each runnable fixture
+        for tag, fx, vr, modes, source in runnable:
+            if not modes:
+                # no modes requested -> still record fixture with empty modes? But should be pass (no runs)
+                fixtures_evidence.append({
+                    "tag": tag,
+                    "file": fx.get("file", ""),
+                    "sha256": fx.get("sha256", ""),
+                    "sha256_ok": vr.get("sha256_ok", False),
+                    "size_ok": vr.get("size_ok", False),
+                    "source": source,
+                    "modes": {},
+                    "status": "pass",
+                    "reason": "",
+                })
+                continue
+            res = _run_fixture_harness(str(repo_p), fx, env_base, str(logs_dir), args.device, modes, harness_cfg, str(models_dir))
+            # enrich with verification info and source
+            res["sha256_ok"] = vr.get("sha256_ok", False)
+            res["size_ok"] = vr.get("size_ok", False)
+            res["sha256"] = fx.get("sha256", "")
+            res["source"] = source
+            # ensure modes only for requested modes (already)
+            fixtures_evidence.append(res)
+            if res.get("status") != "pass":
+                overall_pass = False
+
+        kernel_result = None
+        if "kernel" in buckets:
+            kernel_bucket_cfg = fixtures_manifest.get("buckets", {}).get("kernel", {}) if isinstance(fixtures_manifest.get("buckets"), dict) else {}
+            redline_cfg = kernel_bucket_cfg.get("redline", kernel_bucket_cfg) if isinstance(kernel_bucket_cfg.get("redline"), dict) else kernel_bucket_cfg
+            if not isinstance(redline_cfg, dict):
+                redline_cfg = {}
+            kernel_result = run_kernel(str(repo_p), str(models_dir), redline_cfg, fixtures_manifest, env_base, str(logs_dir))
+            if kernel_result.get("status") != "pass":
+                overall_pass = False
+
+        # Preserve original order of routes_order: fixtures_evidence currently is unavailable + runnable in order of routes_order, but runnable preserves order, unavailable also in order. However interleaving may be lost if unavailable and runnable alternate. We already appended unavailable first; better sort by routes_order.
+        # Re-sort fixtures_evidence to follow routes_order sequence
+        order_index = {tag: i for i, tag in enumerate(routes_order)}
+        fixtures_evidence.sort(key=lambda fx: order_index.get(fx.get("tag",""), 999))
+
+        verdict = "pass" if overall_pass else "fail"
+        evidence = {
+            "schema": "hipfire.hw-gate.evidence",
+            "version": 1,
+            "verdict": verdict,
+            "base": args.base,
+            "head": args.head,
+            "buckets": buckets,
+            "host": host_info,
+            "binaries": {"daemon_md5": daemon_md5, "hipfire_md5": hipfire_md5, "build_seconds": float(build_seconds)},
+            "fixtures": fixtures_evidence,
+            "kernel": kernel_result,
+            "logs_dir": "hw-gate-logs",
+        }
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(evidence, indent=2) + "\n", encoding="utf-8")
+        md_path.parent.mkdir(parents=True, exist_ok=True)
+        md_path.write_text(render_md(evidence), encoding="utf-8")
+        return 0 if overall_pass else 1
+
+    # Non-routed path: keep today's bucket-derived behavior, but add source
     # Determine which fixtures to verify/run
     fixtures_to_verify: list[dict] = []
     for f in fixtures_all:
@@ -959,8 +1415,6 @@ def main(argv: list[str] | None = None) -> int:
             precondition_failed = True
             precondition_reason = "missing scripts/redline_daemon_harness.py"
 
-    host_info = {"gfx": _get_host_gfx(), "rocm": _get_host_rocm(), "device": args.device, "runner": socket.gethostname()}
-
     if precondition_failed:
         fixtures_evidence = []
         for fx, vr in zip(all_checks, verify_results):
@@ -971,6 +1425,7 @@ def main(argv: list[str] | None = None) -> int:
                     "sha256": fx.get("sha256", ""),
                     "sha256_ok": vr.get("sha256_ok", False),
                     "size_ok": vr.get("size_ok", False),
+                    "source": "bucket",
                     "modes": {},
                     "status": "fail",
                     "reason": vr.get("reason", precondition_reason) if vr.get("reason") else precondition_reason,
@@ -1089,7 +1544,7 @@ def main(argv: list[str] | None = None) -> int:
     env_base["HIPFIRE_HOME"] = str(hipfire_home_p)
     env_base["HIPFIRE_MODELS_DIR"] = str(models_dir)
 
-    fixtures_evidence: list[dict] = []
+    fixtures_evidence = []
     overall_pass = True
 
     if modes_union:
@@ -1105,6 +1560,7 @@ def main(argv: list[str] | None = None) -> int:
                     vr_reason = vr.get("reason", "")
                     if vr_reason:
                         res["reason"] = vr_reason + ("; " + res["reason"] if res["reason"] else "")
+            res["source"] = "bucket"
             fixtures_evidence.append(res)
             if res.get("status") != "pass":
                 overall_pass = False
@@ -1140,6 +1596,7 @@ def main(argv: list[str] | None = None) -> int:
     md_path.parent.mkdir(parents=True, exist_ok=True)
     md_path.write_text(render_md(evidence), encoding="utf-8")
     return 0 if overall_pass else 1
+
 
 
 if __name__ == "__main__":

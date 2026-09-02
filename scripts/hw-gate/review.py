@@ -2,70 +2,29 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 Kaden Schutt
 # hipfire — see LICENSE and NOTICE in the project root.
-"""hw-gate reviewer driver: prelim review, verdict, and bounded merge authority.
+"""hw-gate reviewer driver: Sol prelim/verdict and Fable decide with staging merges.
 
-Drives one independent reviewer model through omp's non-interactive mode
-(`omp -p --mode json`) in two phases (see review.md), posts the results to
-the PR, and applies the decision. The model proposes; THIS FILE decides what
-the model is allowed to decide. The floor in `apply_floor` is the merge
-authority boundary and is unit-tested without omp or GitHub.
+Two seats, one hardware gate, one human owner.
+- Sol (reviewer seat) reads diff and DECIDES whether PR code runs on hardware (run_hardware) and which routes run.
+- Sol verdict after hardware: greenlight | needs-human | block (never merges).
+- Fable (deciding seat) reads everything inc Sol verdict and returns merge-staging | hold | block, may veto/override Sol,
+  and on merge-staging merges PR head into staging branch (beta) via GitHub merges API. master stays human-owned.
+
+Hard floor (no seat overrides): failed fixture/harness, attractor, policy-file change, RATCHET-RAISE without label.
+Soft floor (Fable may override): coverage gaps, confidence <0.8, Sol needs-human.
 
 CONTRACT
-    review.py --repo OWNER/REPO --pr N --base SHA --head SHA --checkout DIR
-              --evidence hw-gate.json --select select.json --hw-run-result success|failure|cancelled|skipped
-              --system-prompt review.md --out verdict.json
-    env: GH_TOKEN (posting/approval), HW_GATE_REVIEW_MODEL (default "gpt-5.6-sol"),
-         HW_GATE_OMP_BIN (default "omp"), HW_GATE_GH_BIN (default "gh") — the last two exist for tests.
-    exit 0 : review completed and posted (whatever the decision)
-    exit 1 : review could not complete (omp failure, unparseable output twice, gh failure) — after posting
-             a `needs-human` comment saying so. Never fail open.
-
-    verdict.json
-        {"schema": "hipfire.hw-gate.verdict", "version": 1,
-         "model": "...", "prelim": {...phase prelim JSON...}, "verdict": {...phase verdict JSON...},
-         "floor": {"applied": ["..."], "model_decision": "...", "final_decision": "..."},
-         "posted": {"prelim_comment": url, "evidence_comment": url, "verdict_comment": url, "review": url|null,
-                    "labels_added": [...], "labels_removed": [...]}}
-
-PHASES
-    prelim  : prompt = PR title/body (quoted as claims), select.json, `git diff --stat base...head`, and the
-              full diff base...head (cap 400 KiB; when larger, include all diff for files in select.surfaces
-              load/serve/kernel/policy first, then the rest until the cap, and say what was omitted).
-              omp invocation (read-only tools, cwd = --checkout):
-                  omp -p --mode json --auto-approve --tools=read,grep,glob --cwd <checkout> \
-                      --model $HW_GATE_REVIEW_MODEL --system-prompt <review.md> --max-time 15m "<prompt>"
-              Parse the final assistant message; extract the single JSON object (tolerate ``` fences).
-              On parse failure retry once with an appended "Return only the JSON object." Post as the
-              `<!-- hw-gate:prelim -->` comment (upsert by marker).
-    evidence: post hw-gate.md from the evidence artifact as `<!-- hw-gate:evidence -->` (upsert; if > 60 KiB,
-              keep the header + per-fixture tables + decoded text, truncate stderr tails, and link the artifact).
-    verdict : prompt = prelim prompt + prelim JSON + hw-gate.json + hw-run result. Same invocation.
-              Post as `<!-- hw-gate:verdict -->` (upsert), including the floor decisions verbatim.
-
-FLOOR (apply_floor(model_decision, evidence, select, hw_run_result, commit_messages) -> (decision, reasons))
-    Order matters; the strictest applicable outcome wins:
-      block        if hw_run_result != "success"
-      block        if evidence is None or evidence.verdict != "pass"
-      block        if "kernel" in buckets and (evidence.kernel is None or evidence.kernel.status != "pass")
-      block        if model_decision == "block"
-      needs-human  if select.policy_paths non-empty
-      needs-human  if any commit message in base..head matches ^RATCHET-RAISE:
-      needs-human  if verdict.coverage.gaps non-empty
-      needs-human  if verdict.confidence < 0.8
-      needs-human  if model_decision == "needs-human" or the verdict phase failed to parse
-      greenlight   only when none of the above fired and model_decision == "greenlight"
-
-APPLY
-    The merge authority is the required `hw-gate` status, which the workflow derives from
-    verdict.json `floor.final_decision` (green only on greenlight). The reviews below are the
-    human-visible record and are informational.
-    greenlight  : `gh pr review N --approve --body <verdict summary + evidence link>`; add label `agent-approved`
-    needs-human : `gh pr review N --comment --body ...`; add label `needs-human`
-    block       : `gh pr review N --request-changes --body ...`; add label `hw-gate-blocked`
-    Always: remove whichever of {agent-approved, needs-human, hw-gate-blocked} no longer applies, and remove
-    `hw-run` so the next push needs a fresh maintainer authorization.
-    Labels are created on first use (gh label create --force) with fixed colors.
+    prelim: review.py --seat sol --phase prelim --repo R --pr N --base SHA --head SHA --checkout DIR --select select.json --fixtures fixtures.json --system-prompt sol.md --out prelim.json --routes routes.json
+    verdict: review.py --seat sol --phase verdict --repo R --pr N --base SHA --head SHA --checkout DIR --select select.json --prelim prelim.json --evidence hw-gate.json --hw-run-result success|failure|... --system-prompt sol.md --out verdict.json
+    decide: review.py --seat fable --phase decide --repo R --pr N --base SHA --head SHA --checkout DIR --select select.json --prelim prelim.json --evidence hw-gate.json --verdict verdict.json --hw-run-result ... --staging beta --system-prompt fable.md --out decision.json
+    env: HW_GATE_REVIEW_MODEL (default gpt-5.6-sol) for sol, HW_GATE_DECIDE_MODEL (default claude-fable-5) for fable,
+         HIPFIRE_MODELS_DIR, HW_GATE_OMP_BIN, HW_GATE_GH_BIN.
+    prelim.json: {"schema":"hipfire.hw-gate.prelim","version":2,"seat":"sol","model":..,"prelim":{...}|null,"run_hardware":bool,"posted":{...}}
+    routes.json: [{"mode":"battery"|"chain","tag":"registry:tag","source":"bucket"|"author"|"sol","why":".."}]
+    verdict.json: {"schema":"hipfire.hw-gate.verdict","version":2,"seat":"sol","model":..,"verdict":{...}|null,"floor":{"hard":[..],"soft":[..],"model_decision":..,"final_decision":..},"posted":{...}}
+    decision.json: {"schema":"hipfire.hw-gate.decision","version":1,"seat":"fable","model":..,"decision":{...}|null,"floor":{"hard":[..],"soft":[..]},"decision_final":"merge-staging|hold|block","override":null|{...},"merged":null|{...},"posted":{...}}
 """
+
 from __future__ import annotations
 
 import argparse
@@ -83,116 +42,14 @@ class ReviewError(Exception):
 
 
 # ---------------------------------------------------------------------------
-# apply_floor
-# ---------------------------------------------------------------------------
-
-def apply_floor(
-    model_decision: str | None,
-    evidence: dict | None,
-    select: dict,
-    hw_run_result: str,
-    commit_messages: list[str],
-    verdict: dict | None,
-) -> tuple[str, list[str]]:
-    """Pure. Returns (final_decision, reasons). See FLOOR in the module docstring."""
-    block_reasons: list[str] = []
-    needs_human_reasons: list[str] = []
-
-    # --- block tier ---
-    if hw_run_result != "success":
-        block_reasons.append("hw_run_result")
-    # evidence None or verdict != pass
-    if evidence is None or evidence.get("verdict") != "pass":
-        block_reasons.append("evidence_verdict")
-    # kernel bucket check
-    buckets = select.get("buckets", []) if isinstance(select, dict) else []
-    if "kernel" in buckets:
-        kernel = None
-        if isinstance(evidence, dict):
-            kernel = evidence.get("kernel")
-        if kernel is None or (isinstance(kernel, dict) and kernel.get("status") != "pass"):
-            # only append if not already covered by evidence verdict? But strictest still block.
-            # We deduplicate reasons for evidence_verdict vs kernel_status; both can fire.
-            block_reasons.append("kernel_status")
-    if model_decision == "block":
-        block_reasons.append("model_block")
-
-    if block_reasons:
-        return ("block", block_reasons)
-
-    # --- needs-human tier ---
-    policy_paths = select.get("policy_paths", []) if isinstance(select, dict) else []
-    if policy_paths:
-        needs_human_reasons.append("policy_paths")
-    # RATCHET-RAISE:
-    for msg in commit_messages or []:
-        if re.match(r"^RATCHET-RAISE:", msg):
-            needs_human_reasons.append("ratchet_raise")
-            break
-    # verdict coverage gaps
-    if isinstance(verdict, dict):
-        coverage = verdict.get("coverage", {})
-        if isinstance(coverage, dict):
-            gaps = coverage.get("gaps", [])
-            if gaps:
-                needs_human_reasons.append("coverage_gaps")
-        # confidence: missing or non-numeric is treated as below threshold
-        conf = verdict.get("confidence")
-        if not isinstance(conf, (int, float)) or isinstance(conf, bool) or conf < 0.8:
-            needs_human_reasons.append("confidence")
-    else:
-        # verdict is None means parse failed -> needs-human via last rule; but also
-        # coverage_gaps/confidence not applicable
-        pass
-
-    if model_decision == "needs-human" or verdict is None:
-        # Distinguish: verdict None => parse failure, model needs-human => model decision
-        if verdict is None:
-            needs_human_reasons.append("verdict_parse_failed")
-        if model_decision == "needs-human":
-            needs_human_reasons.append("model_needs_human")
-
-    if needs_human_reasons:
-        return ("needs-human", needs_human_reasons)
-
-    # --- greenlight tier ---
-    if model_decision == "greenlight":
-        return ("greenlight", [])
-
-    # Fallback: if no rule fired and model_decision is not greenlight,
-    # treat as needs-human (should not happen with valid inputs but fail closed)
-    if model_decision is None:
-        return ("needs-human", ["verdict_parse_failed"] if verdict is None else ["model_decision_none"])
-    return ("needs-human", ["model_decision_not_greenlight"])
-
-
-# ---------------------------------------------------------------------------
 # extract_json
 # ---------------------------------------------------------------------------
 
 def extract_json(text: str) -> dict | None:
-    """Return the last balanced top-level JSON object in assistant text, or None.
-
-    Tolerates ``` fences and prose around the object. Finds the last
-    balanced {...} with proper string handling and attempts json.loads on each
-    candidate from last to first.
-    """
+    """Return the last balanced top-level JSON object in assistant text, or None."""
     if not text:
         return None
-    # Remove ``` fences but keep interior — replace fences with newlines so
-    # brace matching still works. Handle ```json ... ``` and ``` ... ```
-    # We keep content inside fences; fences themselves are not braces.
-    # Simplest: just search over the raw text, ignoring fence markers' effect.
     candidates: list[str] = []
-    # Scan for balanced brace objects
-    i = 0
-    n = len(text)
-    stack: list[int] = []  # positions of '{' start
-    in_string = False
-    escape = False
-    start_idx: int | None = None
-    # We find every balanced top-level object
-    # Walk character by character with string awareness
     depth = 0
     current_start: int | None = None
     in_str = False
@@ -220,8 +77,6 @@ def extract_json(text: str) -> dict | None:
                     if depth == 0 and current_start is not None:
                         candidates.append(text[current_start: idx + 1])
                         current_start = None
-
-    # Try candidates from last to first (last balanced object wins)
     for cand in reversed(candidates):
         try:
             obj = json.loads(cand)
@@ -233,11 +88,138 @@ def extract_json(text: str) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
+# hard_floor / soft_floor
+# ---------------------------------------------------------------------------
+
+def hard_floor(
+    evidence: dict | None,
+    select: dict,
+    hw_run_result: str,
+    commit_messages: list[str],
+) -> list[str]:
+    """Hard floor: non-overridable. Returns list of reason strings."""
+    reasons: list[str] = []
+    # hw_run_result
+    if hw_run_result != "success":
+        reasons.append(f"hw_run_result={hw_run_result}")
+    # evidence missing or verdict != pass (failed fixture/harness)
+    if evidence is None:
+        reasons.append("evidence missing")
+    elif evidence.get("verdict") != "pass":
+        reasons.append(f"evidence verdict={evidence.get('verdict')!r}")
+    # kernel bucket check
+    buckets = select.get("buckets", []) if isinstance(select, dict) else []
+    if "kernel" in buckets:
+        kernel = None
+        if isinstance(evidence, dict):
+            kernel = evidence.get("kernel")
+        if kernel is None or (isinstance(kernel, dict) and kernel.get("status") != "pass"):
+            reasons.append("kernel status != pass")
+    # attractor detection
+    if isinstance(evidence, dict):
+        fixtures = evidence.get("fixtures", [])
+        if isinstance(fixtures, list):
+            for fx in fixtures:
+                if not isinstance(fx, dict):
+                    continue
+                modes = fx.get("modes", {})
+                if not isinstance(modes, dict):
+                    continue
+                for mode_data in modes.values():
+                    if not isinstance(mode_data, dict):
+                        continue
+                    rows = mode_data.get("rows", [])
+                    if not isinstance(rows, list):
+                        continue
+                    for row in rows:
+                        if isinstance(row, dict) and row.get("attractor"):
+                            reasons.append("attractor detected")
+                            break
+                    if "attractor detected" in reasons:
+                        break
+                if "attractor detected" in reasons:
+                    break
+    # policy
+    policy_paths = select.get("policy_paths", []) if isinstance(select, dict) else []
+    if policy_paths:
+        reasons.append(f"policy_paths: {','.join(policy_paths)}")
+    # RATCHET-RAISE
+    for msg in commit_messages or []:
+        if re.match(r"^RATCHET-RAISE:", msg):
+            reasons.append("RATCHET-RAISE without ratchet-raise label")
+            break
+    return reasons
+
+
+def soft_floor(
+    verdict: dict | None,
+    model_decision: str | None,
+) -> list[str]:
+    """Soft floor: Fable may override."""
+    reasons: list[str] = []
+    if isinstance(verdict, dict):
+        coverage = verdict.get("coverage", {})
+        if isinstance(coverage, dict):
+            gaps = coverage.get("gaps", [])
+            if gaps:
+                reasons.append(f"coverage_gaps: {gaps}")
+        conf = verdict.get("confidence")
+        if not isinstance(conf, (int, float)) or isinstance(conf, bool) or conf < 0.8:
+            reasons.append(f"confidence {conf!r} < 0.8")
+    # model needs-human is soft
+    if model_decision == "needs-human":
+        reasons.append("model needs-human")
+    # verdict parse failure counted elsewhere? but treat as soft
+    if verdict is None and model_decision is None:
+        # will be handled as needs-human
+        pass
+    return reasons
+
+
+def apply_floor(
+    model_decision: str | None,
+    evidence: dict | None,
+    select: dict,
+    hw_run_result: str,
+    commit_messages: list[str],
+    verdict: dict | None,
+) -> tuple[str, list[str]]:
+    """Legacy wrapper: combines hard+soft for old tests. Returns (final, reasons)."""
+    hard = hard_floor(evidence, select, hw_run_result, commit_messages)
+    # Determine if hard contains evidence-type vs policy
+    def _is_hold_reason(r: str) -> bool:
+        return "policy_paths" in r or "RATCHET-RAISE" in r
+    hard_has_block = any(not _is_hold_reason(r) for r in hard)
+    hard_has_hold = any(_is_hold_reason(r) for r in hard)
+    soft = soft_floor(verdict, model_decision)
+    # verdict parse failure
+    if verdict is None and model_decision is None:
+        # treat as needs-human reason
+        soft.append("verdict_parse_failed") if "verdict_parse_failed" not in soft else None
+    if model_decision == "needs-human" and "model needs-human" not in soft and verdict is not None:
+        # already covered
+        pass
+    if hard:
+        if hard_has_block:
+            return ("block", hard + soft)
+        else:
+            return ("needs-human", hard + soft)
+    if soft:
+        return ("needs-human", soft)
+    if model_decision == "greenlight":
+        return ("greenlight", [])
+    if model_decision == "block":
+        return ("block", ["model_block"])
+    if verdict is None:
+        return ("needs-human", ["verdict_parse_failed"])
+    return ("needs-human", ["model_decision_not_greenlight"])
+
+
+# ---------------------------------------------------------------------------
 # helpers: gh seam and omp
 # ---------------------------------------------------------------------------
 
 def _gh(args: list[str]) -> str:
-    """Run gh with given args (without the binary prefix). Return stdout."""
     gh_bin = os.environ.get("HW_GATE_GH_BIN", "gh")
     cmd = [gh_bin] + args
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -247,18 +229,11 @@ def _gh(args: list[str]) -> str:
 
 
 def omp_review(phase: str, prompt: str, system_prompt: str, checkout: str, model: str) -> dict:
-    """Run omp for a phase and return the extracted JSON object.
-
-    Raises ReviewError on failure after one retry.
-    """
+    """Run omp for a phase and return the extracted JSON object."""
     omp_bin = os.environ.get("HW_GATE_OMP_BIN", "omp")
     last_error: str | None = None
     for attempt in range(2):
         cur_prompt = prompt if attempt == 0 else prompt + "\n\nReturn only the JSON object."
-        # The prompt carries up to 400 KiB of diff: far beyond argv limits, so it
-        # goes through omp's `@file` prompt reference. The file lives outside
-        # the checkout so the reviewer's read-only tools cannot mistake it for
-        # repository content.
         with tempfile.NamedTemporaryFile("w", suffix=f"-hw-gate-{phase}.md", delete=False, encoding="utf-8") as fh:
             fh.write(cur_prompt)
             prompt_path = fh.name
@@ -283,7 +258,6 @@ def omp_review(phase: str, prompt: str, system_prompt: str, checkout: str, model
             if attempt == 0:
                 continue
             raise ReviewError(last_error)
-        # Parse JSONL: find last message_end with role assistant, concat text parts
         stdout = result.stdout
         last_text: str | None = None
         for line in stdout.splitlines():
@@ -302,7 +276,6 @@ def omp_review(phase: str, prompt: str, system_prompt: str, checkout: str, model
                     for p in parts:
                         if isinstance(p, dict) and p.get("type") == "text":
                             texts.append(p.get("text", ""))
-                        # thinking blocks ignored
                     last_text = "".join(texts)
         if last_text is None:
             last_error = f"omp {phase}: no assistant message_end in output"
@@ -320,16 +293,74 @@ def omp_review(phase: str, prompt: str, system_prompt: str, checkout: str, model
 
 
 def _git(args: list[str], checkout: str) -> str:
-    """Run git args in checkout directory."""
     result = subprocess.run(["git"] + args, capture_output=True, text=True, cwd=checkout)
     if result.returncode != 0:
         raise ReviewError(f"git {' '.join(args)} failed ({result.returncode}): {result.stderr.strip()}")
     return result.stdout
 
 
-def build_prelim_prompt(select: dict, checkout: str, base: str, head: str, repo: str, pr: int) -> str:
-    """Build the prelim prompt per PHASES."""
-    # PR metadata via gh
+# ---------------------------------------------------------------------------
+# fixtures helpers
+# ---------------------------------------------------------------------------
+
+def _get_models_dir(fixtures_manifest: dict) -> Path:
+    env_dir = os.environ.get("HIPFIRE_MODELS_DIR")
+    if env_dir:
+        return Path(env_dir).expanduser()
+    manifest_dir = fixtures_manifest.get("models_dir", "~/.hipfire/models") if isinstance(fixtures_manifest, dict) else "~/.hipfire/models"
+    return Path(manifest_dir).expanduser()
+
+
+def _available_fixtures(fixtures_manifest: dict) -> tuple[dict, Path]:
+    models_dir = _get_models_dir(fixtures_manifest)
+    available: dict[str, dict] = {}
+    for fx in fixtures_manifest.get("fixtures", []) if isinstance(fixtures_manifest.get("fixtures"), list) else []:
+        tag = fx.get("tag")
+        file = fx.get("file")
+        if not tag or not file:
+            continue
+        p = models_dir / file
+        if p.is_file():
+            available[tag] = fx
+    return available, models_dir
+
+
+def _modes_for_buckets(buckets: list[str], manifest: dict) -> list[str]:
+    modes_set: set[str] = set()
+    for b in buckets:
+        cfg = manifest.get("buckets", {}).get(b, {}) if isinstance(manifest.get("buckets"), dict) else {}
+        if isinstance(cfg, dict):
+            modes = cfg.get("modes", [])
+            if isinstance(modes, list):
+                for m in modes:
+                    modes_set.add(m)
+    ordered: list[str] = []
+    for m in ["battery", "chain"]:
+        if m in modes_set:
+            ordered.append(m)
+    for m in sorted(modes_set):
+        if m not in ordered:
+            ordered.append(m)
+    return ordered
+
+
+def _bucket_routes(manifest: dict, buckets: list[str]) -> list[dict]:
+    modes = _modes_for_buckets(buckets, manifest)
+    routes: list[dict] = []
+    for fx in manifest.get("fixtures", []) if isinstance(manifest.get("fixtures"), list) else []:
+        tag = fx.get("tag")
+        if not tag:
+            continue
+        for mode in modes:
+            routes.append({"mode": mode, "tag": tag, "source": "bucket", "why": f"bucket {','.join(buckets)}"})
+    return routes
+
+
+# ---------------------------------------------------------------------------
+# prompts
+# ---------------------------------------------------------------------------
+
+def build_prelim_prompt(select: dict, checkout: str, base: str, head: str, repo: str, pr: int, fixtures_manifest: dict | None = None, available_tags: list[str] | None = None) -> str:
     pr_json_text = _gh(["pr", "view", str(pr), "--repo", repo, "--json", "title,body,author,url"])
     pr_info = json.loads(pr_json_text)
     title = pr_info.get("title", "")
@@ -337,25 +368,19 @@ def build_prelim_prompt(select: dict, checkout: str, base: str, head: str, repo:
     author = pr_info.get("author", {})
     url = pr_info.get("url", "")
 
-    # git diff --stat and diff
     diff_stat = _git(["diff", "--stat", f"{base}...{head}"], checkout)
-    # Surfaces bucket-first ordering: priority for files in select surfaces
     surfaces = select.get("surfaces", {}) if isinstance(select, dict) else {}
-    # Collect prioritized paths
     priority_paths: list[str] = []
     for bucket in ("load", "serve", "kernel", "policy"):
         paths = surfaces.get(bucket, []) if isinstance(surfaces, dict) else []
         priority_paths.extend(paths)
 
     diff_text = _git(["diff", f"{base}...{head}"], checkout)
-    cap = 400 * 1024  # 400 KiB
+    cap = 400 * 1024
     if len(diff_text.encode("utf-8")) > cap:
-        # Include prioritized files first
-        # We need per-file diffs for priority paths, then fill rest until cap
         included_parts: list[str] = []
         included_size = 0
         emitted_files: set[str] = set()
-        # Try per-file diff for priority paths
         for fpath in priority_paths:
             if fpath in emitted_files:
                 continue
@@ -371,52 +396,24 @@ def build_prelim_prompt(select: dict, checkout: str, base: str, head: str, repo:
             included_parts.append(part)
             included_size += part_bytes
             emitted_files.add(fpath)
-        # Fill with remaining diff until cap
-        # For simplicity, if priority diffs already near cap, note omission.
-        # Otherwise, slice the full diff to fit remaining budget.
-        remaining = cap - included_size
-        # Determine which portion of full diff is already covered; for truncation estimate,
-        # we just note that remainder was omitted beyond cap.
         if included_parts:
-            full_consumed_estimate = sum(len(p.encode("utf-8")) for p in included_parts)
-            if remaining > 0:
-                # Append remaining slice of full diff beyond what we've included, but avoid duplicating.
-                # Simplistic: append truncated tail of overall diff that wasn't from priority files.
-                # We just truncate the full diff to the cap and note priority was included first.
-                # Instead, include included_parts plus a truncated portion of the rest.
-                rest = diff_text
-                # Avoid double-counting: just use first `remaining` bytes of rest not already counted would be complex.
-                # Simpler: if we used per-file diffs, report that we prioritized and cap the rest.
-                pass
             truncated_note = f"\n\n[diff truncated: {len(diff_text.encode('utf-8'))} bytes total, showing {included_size} bytes prioritized for {len(emitted_files)} surface files; omitted rest]"
-            # Build prioritized diff text
-            # If included size is far below cap, append slice of full diff to fill
             if included_size < cap:
-                # Append part of full diff beyond priority files up to cap
-                # To avoid duplication, just append full diff truncated to fit
                 needed = cap - included_size - len(truncated_note.encode("utf-8"))
-                # Estimate slice
                 full_bytes = diff_text.encode("utf-8")
-                # Find how much of full we haven't accounted for: just take first needed bytes as filler
-                # This may duplicate but ensures bucket-first ordering is satisfied contractually
-                filler = full_bytes[:needed].decode("utf-8", errors="ignore")
-                # Use included_parts + filler
+                filler = full_bytes[:needed].decode("utf-8", errors="ignore") if needed > 0 else ""
                 combined = "\n".join(included_parts) + "\n" + filler if filler else "\n".join(included_parts)
                 diff_text = combined + truncated_note
             else:
                 diff_text = "\n".join(included_parts) + truncated_note
         else:
-            # No priority files produced output; just cap the full diff
             eb = diff_text.encode("utf-8")
             truncated = eb[:cap].decode("utf-8", errors="ignore")
             omitted = len(eb) - cap
             diff_text = truncated + f"\n\n[diff truncated: {omitted} bytes omitted]"
-    else:
-        pass  # diff fits within cap
 
-    # Compose prompt
     select_json = json.dumps(select, indent=2, sort_keys=True)
-    parts = []
+    parts: list[str] = []
     parts.append(f"PR #{pr} {title}")
     if url:
         parts.append(f"URL: {url}")
@@ -428,6 +425,26 @@ def build_prelim_prompt(select: dict, checkout: str, base: str, head: str, repo:
     parts.append("PR body (author's claims, not evidence)")
     parts.append(body)
     parts.append("")
+    # select.request as claim
+    req = select.get("request") if isinstance(select, dict) else None
+    req_err = select.get("request_error") if isinstance(select, dict) else None
+    if req is not None:
+        parts.append("Author's hw-gate-request (quoted as a claim, not evidence):")
+        parts.append(json.dumps(req, indent=2, sort_keys=True))
+        parts.append("")
+    if req_err:
+        parts.append(f"hw-gate-request parse error (malformed block): {req_err}")
+        parts.append("")
+    buckets = select.get("buckets", []) if isinstance(select, dict) else []
+    parts.append(f"Mandatory buckets: {', '.join(buckets) if buckets else '(none)'}")
+    parts.append("")
+    if fixtures_manifest is not None:
+        fixtures_list = fixtures_manifest.get("fixtures", []) if isinstance(fixtures_manifest.get("fixtures"), list) else []
+        all_tags = [f.get("tag") for f in fixtures_list if f.get("tag")]
+        parts.append(f"All fixture tags: {', '.join(all_tags)}")
+        if available_tags is not None:
+            parts.append(f"Available fixture tags on runner: {', '.join(available_tags) if available_tags else '(none)'}")
+        parts.append("")
     parts.append("select.json:")
     parts.append(select_json)
     parts.append("")
@@ -439,13 +456,12 @@ def build_prelim_prompt(select: dict, checkout: str, base: str, head: str, repo:
     return "\n".join(parts)
 
 
-def build_verdict_prompt(prelim_prompt: str, prelim: dict, evidence: dict | None, select: dict, hw_run_result: str) -> str:
-    """Build verdict prompt per PHASES."""
-    parts = []
+def build_verdict_prompt(prelim_prompt: str, prelim: dict | None, evidence: dict | None, select: dict, hw_run_result: str) -> str:
+    parts: list[str] = []
     parts.append(prelim_prompt)
     parts.append("")
     parts.append("Prelim JSON:")
-    parts.append(json.dumps(prelim, indent=2, sort_keys=True))
+    parts.append(json.dumps(prelim, indent=2, sort_keys=True) if prelim is not None else "null")
     parts.append("")
     parts.append(f"hw-run result: {hw_run_result}")
     parts.append("")
@@ -457,24 +473,74 @@ def build_verdict_prompt(prelim_prompt: str, prelim: dict, evidence: dict | None
     return "\n".join(parts)
 
 
+def build_decide_prompt(select: dict, prelim: dict | None, evidence: dict | None, sol_verdict_obj: dict | None, hard_reasons: list[str], checkout: str, base: str, head: str, repo: str, pr: int) -> str:
+    # PR metadata
+    try:
+        pr_json_text = _gh(["pr", "view", str(pr), "--repo", repo, "--json", "title,body,author,url"])
+        pr_info = json.loads(pr_json_text)
+        title = pr_info.get("title", "")
+        body = pr_info.get("body", "") or ""
+    except Exception:
+        title = ""
+        body = ""
+    diff_stat = ""
+    diff_text = ""
+    try:
+        diff_stat = _git(["diff", "--stat", f"{base}...{head}"], checkout)
+        diff_text = _git(["diff", f"{base}...{head}"], checkout)
+        cap = 400 * 1024
+        if len(diff_text.encode("utf-8")) > cap:
+            diff_text = diff_text.encode("utf-8")[:cap].decode("utf-8", errors="ignore") + f"\n\n[diff truncated]"
+    except Exception:
+        pass
+
+    parts: list[str] = []
+    parts.append(f"PR #{pr} {title}")
+    parts.append(body)
+    parts.append("")
+    parts.append("Hard floor result (non-overridable):")
+    if hard_reasons:
+        parts.append("HARD FLOOR FIRED: " + "; ".join(hard_reasons) + " — you cannot override this; decision must be block (evidence failure) or hold (policy/ratchet)")
+    else:
+        parts.append("Hard floor: no hard reasons (you may decide merge-staging/hold/block on merits)")
+    parts.append("")
+    parts.append("select.json:")
+    parts.append(json.dumps(select, indent=2, sort_keys=True))
+    parts.append("")
+    parts.append("Sol prelim (prelim.json prelim field):")
+    parts.append(json.dumps(prelim, indent=2, sort_keys=True) if prelim is not None else "null")
+    parts.append("")
+    if evidence is not None:
+        parts.append("hw-gate.json evidence:")
+        parts.append(json.dumps(evidence, indent=2, sort_keys=True))
+    else:
+        parts.append("hw-gate.json: missing")
+    parts.append("")
+    parts.append("Sol verdict (verdict.json verdict+floor):")
+    parts.append(json.dumps(sol_verdict_obj, indent=2, sort_keys=True) if sol_verdict_obj is not None else "null")
+    parts.append("")
+    parts.append("git diff --stat:")
+    parts.append(diff_stat)
+    parts.append("")
+    parts.append("Full diff:")
+    parts.append(diff_text)
+    return "\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# comments
+# ---------------------------------------------------------------------------
+
 def upsert_comment(repo: str, pr: int, marker: str, body: str) -> str:
-    """Upsert a PR comment identified by marker HTML comment. Return URL."""
-    # Truncate if over 60 KiB per PHASES (truncate bodies over 60 KiB)
     cap = 60 * 1024
     if len(body.encode("utf-8")) > cap:
-        # For evidence phase spec: keep header + per-fixture tables + decoded text, truncate stderr tails.
-        # Generic fallback: truncate end and link artifact.
         body = body.encode("utf-8")[:cap].decode("utf-8", errors="ignore") + "\n\n...[truncated; see artifact]..."
-    # List comments
     stdout = _gh(["api", f"repos/{repo}/issues/{pr}/comments", "--paginate"])
     try:
         comments = json.loads(stdout) if stdout.strip() else []
-        # gh api with --paginate may return concatenated arrays? Assume single JSON array or newline-delimited
         if isinstance(comments, dict):
-            # wrapped object
             comments = comments.get("comments", [comments])
     except json.JSONDecodeError:
-        # Try to parse as JSONL arrays
         comments = []
         for line in stdout.splitlines():
             line=line.strip()
@@ -488,10 +554,8 @@ def upsert_comment(repo: str, pr: int, marker: str, body: str) -> str:
                     comments.append(val)
             except Exception:
                 continue
-    # Some gh implementations return paginated JSON array directly
     if not isinstance(comments, list):
         comments = [comments] if isinstance(comments, dict) else []
-
     existing_id = None
     existing_url = None
     for c in comments:
@@ -502,16 +566,11 @@ def upsert_comment(repo: str, pr: int, marker: str, body: str) -> str:
             existing_id = c.get("id")
             existing_url = c.get("html_url", "")
             break
-
     payload_body = body
-    # Ensure marker present: caller should include it; if not, prepend
     if marker not in payload_body:
         payload_body = marker + "\n" + payload_body
-
     if existing_id is not None:
-        # PATCH
         out = _gh(["api", f"repos/{repo}/issues/comments/{existing_id}", "--method", "PATCH", "-f", f"body={payload_body}"])
-        # Try to extract url from response
         try:
             resp = json.loads(out)
             if isinstance(resp, dict) and "html_url" in resp:
@@ -530,112 +589,18 @@ def upsert_comment(repo: str, pr: int, marker: str, body: str) -> str:
         return out.strip() or f"https://github.com/{repo}/pull/{pr}#issuecomment-new"
 
 
-# Label colors per contract
 _LABEL_COLORS = {
     "agent-approved": "0e8a16",
     "needs-human": "fbca04",
     "hw-gate-blocked": "b60205",
     "hw-run": "5319e7",
     "ratchet-raise": "d93f0b",
+    "merged-staging": "0e8a16",
 }
 
 
-def apply_decision(repo: str, pr: int, decision: str, verdict_summary: str, evidence_link: str = "") -> dict:
-    """Apply the decision: review + labels. Returns posted dict with labels info.
-
-    Shared gh seam only: every gh call via _gh.
-    """
-    labels_added: list[str] = []
-    labels_removed: list[str] = []
-    review_url = None
-
-    # Compose review body
-    body = verdict_summary
-    if evidence_link:
-        body += f"\n\nEvidence: {evidence_link}"
-
-    # Ensure label exists (create-on-first-use)
-    decision_label_map = {
-        "greenlight": "agent-approved",
-        "needs-human": "needs-human",
-        "block": "hw-gate-blocked",
-    }
-    target_label = decision_label_map.get(decision, "needs-human")
-    # Create label --force with color (idempotent)
-    color = _LABEL_COLORS.get(target_label, "ededed")
-    try:
-        _gh(["label", "create", target_label, "--repo", repo, "--color", color, "--force"])
-    except ReviewError:
-        # label create may not be supported in fake; ignore?
-        pass
-
-    # Also ensure other labels exist for removal tracking? Not needed.
-
-    if decision == "greenlight":
-        try:
-            out = _gh(["pr", "review", str(pr), "--repo", repo, "--approve", "--body", body])
-            review_url = out.strip() or None
-        except ReviewError as e:
-            raise
-        labels_added.append(target_label)
-    elif decision == "block":
-        try:
-            out = _gh(["pr", "review", str(pr), "--repo", repo, "--request-changes", "--body", body])
-            review_url = out.strip() or None
-        except ReviewError as e:
-            raise
-        labels_added.append(target_label)
-    else:  # needs-human
-        try:
-            out = _gh(["pr", "review", str(pr), "--repo", repo, "--comment", "--body", body])
-            review_url = out.strip() or None
-        except ReviewError as e:
-            raise
-        labels_added.append(target_label)
-
-    # Add target label to issue
-    try:
-        _gh(["api", f"repos/{repo}/issues/{pr}/labels", "--method", "POST", "-f", f"labels[]={target_label}"])
-    except ReviewError:
-        pass
-
-    # Remove whichever of {agent-approved, needs-human, hw-gate-blocked} no longer applies
-    for lbl in ["agent-approved", "needs-human", "hw-gate-blocked"]:
-        if lbl != target_label:
-            try:
-                _gh(["api", f"repos/{repo}/issues/{pr}/labels/{lbl}", "--method", "DELETE"])
-                labels_removed.append(lbl)
-            except ReviewError:
-                # label not present is not an error for our purposes; gh may return 404
-                # Fake gh may error; ignore if not found
-                pass
-
-    # Remove hw-run so next push needs fresh authorization
-    try:
-        _gh(["api", f"repos/{repo}/issues/{pr}/labels/hw-run", "--method", "DELETE"])
-        labels_removed.append("hw-run")
-    except ReviewError:
-        pass
-
-    return {
-        "review": review_url,
-        "labels_added": labels_added,
-        "labels_removed": labels_removed,
-    }
-
-
 def _load_commit_messages(checkout: str, base: str, head: str) -> list[str]:
-    """Load commit messages in base..head."""
     try:
-        out = subprocess.run(
-            ["git", "log", "--format=%B", f"{base}..{head}"],
-            capture_output=True, text=True, cwd=checkout
-        )
-        if out.returncode != 0:
-            return []
-        # Split by commit boundaries: git log separates commits with blank? Use raw: split on \n but messages may contain newlines.
-        # Instead use a delimiter: use NUL or custom. Fallback: get subject lines?
-        # Better: use git log with custom delimiter
         out2 = subprocess.run(
             ["git", "log", "--format=%s%n%b%x00", f"{base}..{head}"],
             capture_output=True, text=True, cwd=checkout
@@ -648,26 +613,11 @@ def _load_commit_messages(checkout: str, base: str, head: str) -> list[str]:
         return []
 
 
-def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
-    ap.add_argument("--repo", required=True)
-    ap.add_argument("--pr", required=True, type=int)
-    ap.add_argument("--base", required=True)
-    ap.add_argument("--head", required=True)
-    ap.add_argument("--checkout", required=True)
-    ap.add_argument("--evidence", required=True)
-    ap.add_argument("--select", required=True)
-    ap.add_argument("--hw-run-result", required=True)
-    ap.add_argument("--system-prompt", required=True)
-    ap.add_argument("--out", required=True)
-    ap.add_argument("--phase", choices=("prelim", "verdict", "all"), default="all",
-                    help="prelim: read the diff before hardware runs and write --out {phase, prelim}; "
-                         "verdict: read --prelim (from the prelim phase) plus evidence and decide; all: both")
-    ap.add_argument("--prelim", help="prelim-phase output to consume in the verdict phase")
-    args = ap.parse_args(argv)
+# ---------------------------------------------------------------------------
+# prelim phase
+# ---------------------------------------------------------------------------
 
-    model = os.environ.get("HW_GATE_REVIEW_MODEL", "gpt-5.6-sol")
-
+def _run_prelim(args) -> int:
     # Load select
     try:
         with open(args.select, "r", encoding="utf-8") as f:
@@ -675,220 +625,778 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as e:
         sys.stderr.write(f"failed to load select: {e}\n")
         return 1
-
-    # Load evidence (may be missing if hw-run failed)
-    evidence = None
-    evidence_path = Path(args.evidence)
-    if evidence_path.is_file():
+    # Load fixtures manifest
+    fixtures_manifest: dict = {}
+    fixtures_path = args.fixtures
+    if fixtures_path and Path(fixtures_path).is_file():
         try:
-            with open(evidence_path, "r", encoding="utf-8") as f:
-                evidence = json.load(f)
-        except Exception:
-            evidence = None
-    # evidence.md next to evidence json
-    evidence_md_path = evidence_path.parent / "hw-gate.md"
+            with open(fixtures_path, "r", encoding="utf-8") as f:
+                fixtures_manifest = json.load(f)
+        except Exception as e:
+            sys.stderr.write(f"failed to load fixtures: {e}\n")
+            fixtures_manifest = {}
+    else:
+        # try default location relative to script? Not needed
+        fixtures_manifest = {"fixtures": [], "buckets": {}}
 
-    # Load commit messages
-    commit_messages = _load_commit_messages(args.checkout, args.base, args.head)
+    available_map, models_dir = _available_fixtures(fixtures_manifest)
+    available_tags = sorted(available_map.keys())
+    known_tags = set(f.get("tag") for f in fixtures_manifest.get("fixtures", []) if f.get("tag"))
 
-    # For error handling: helper to post needs-human and write verdict
-    def _fail(err_msg: str) -> int:
-        # Try to post needs-human comment
+    # Bucket routes (always)
+    buckets = select.get("buckets", []) if isinstance(select, dict) else []
+    bucket_routes = _bucket_routes(fixtures_manifest, buckets)
+
+    model = os.environ.get("HW_GATE_REVIEW_MODEL", "gpt-5.6-sol")
+
+    # Build prompt
+    try:
+        prelim_prompt = build_prelim_prompt(select, args.checkout, args.base, args.head, args.repo, args.pr, fixtures_manifest, available_tags)
+    except Exception as e:
+        # still need to write prelim with failure?
+        prelim_prompt = f"failed to build prelim prompt: {e}"
+
+    prelim = None
+    run_hardware = False
+    posted: dict = {}
+    prelim_comment_url = None
+    # Try omp
+    try:
+        prelim = omp_review("prelim", prelim_prompt, args.system_prompt, args.checkout, model)
+        # Validate prelim has run_hardware
+        if isinstance(prelim, dict) and "run_hardware" in prelim:
+            run_hardware = bool(prelim.get("run_hardware"))
+        else:
+            # If missing, treat as false
+            run_hardware = False
+    except ReviewError as e:
+        prelim = None
+        run_hardware = False
+        # comment says so
         try:
-            body = f"<!-- hw-gate:verdict -->\nhw-gate review failed: {err_msg}\n\nDecision: needs-human (fail-closed)\n"
-            # Also try to apply decision as needs-human (labels)
-            # Post verdict marker comment
-            try:
-                upsert_comment(args.repo, args.pr, "<!-- hw-gate:verdict -->", body)
-            except Exception:
-                pass
-            # Try to apply labels via apply_decision (will create review)
-            try:
-                apply_decision(args.repo, args.pr, "needs-human", f"hw-gate review failed: {err_msg}")
-            except Exception:
-                pass
+            body = f"<!-- hw-gate:sol-prelim -->\n# hw-gate sol prelim\n\nSol prelim unavailable: {e}\n\nrun_hardware: false (sol unavailable, label hw-run may force)\n"
+            prelim_comment_url = upsert_comment(args.repo, args.pr, "<!-- hw-gate:sol-prelim -->", body)
+            posted["prelim_comment"] = prelim_comment_url
         except Exception:
-            pass
-        # Write verdict.json
+            posted["prelim_comment"] = None
+        # Write prelim.json and routes.json
         out_obj = {
-            "schema": "hipfire.hw-gate.verdict",
-            "version": 1,
+            "schema": "hipfire.hw-gate.prelim",
+            "version": 2,
+            "seat": "sol",
             "model": model,
             "prelim": None,
-            "verdict": None,
-            "floor": {"applied": ["review_error"], "model_decision": None, "final_decision": "needs-human"},
-            "posted": {"prelim_comment": None, "evidence_comment": None, "verdict_comment": None, "review": None,
-                       "labels_added": [], "labels_removed": []},
-            "error": err_msg,
+            "run_hardware": False,
+            "posted": posted,
         }
-        # If prelim was obtained earlier but verdict failed, include prelim
-        try:
-            if "_prelim_cache" in locals() and locals()["_prelim_cache"] is not None:
-                out_obj["prelim"] = locals()["_prelim_cache"]
-        except Exception:
-            pass
         try:
             with open(args.out, "w", encoding="utf-8") as f:
                 json.dump(out_obj, f, indent=2, sort_keys=True)
                 f.write("\n")
         except Exception:
             pass
-        sys.stderr.write(f"hw-gate review error: {err_msg}\n")
-        return 1
-
-    # Sequence: prelim -> evidence comment -> verdict -> floor -> apply
-    prelim = None
-    verdict = None
-    prelim_comment_url = None
-    evidence_comment_url = None
-    verdict_comment_url = None
-    applied_info = {}
-    posted = {"prelim_comment": None, "evidence_comment": None, "verdict_comment": None, "review": None, "labels_added": [], "labels_removed": []}
-
-    try:
-        # The prelim prompt is deterministic from the checkout, so both phases rebuild it.
-        prelim_prompt = build_prelim_prompt(select, args.checkout, args.base, args.head, args.repo, args.pr)
-
-        if args.phase in ("prelim", "all"):
-            # Prelim runs BEFORE any hardware: it is read-only and needs no hw-run
-            # authorization. A prelim failure must not block the hardware run, so
-            # it is recorded as absent rather than failing the pipeline closed.
+        # routes.json = bucket routes only (unknown dropped, but no sol routes)
+        routes_to_write = bucket_routes
+        # Always write routes.json even on failure
+        routes_path = args.routes
+        if routes_path:
             try:
-                prelim = omp_review("prelim", prelim_prompt, args.system_prompt, args.checkout, model)
-            except ReviewError as e:
-                prelim = None
-                prelim_body = f"<!-- hw-gate:prelim -->\n# hw-gate prelim\n\nPrelim review unavailable: {e}\n"
-            else:
-                prelim_body = f"<!-- hw-gate:prelim -->\n# hw-gate prelim\n\n```json\n{json.dumps(prelim, indent=2, sort_keys=True)}\n```\n"
-            _prelim_cache = prelim  # for _fail closure
-            try:
-                prelim_comment_url = upsert_comment(args.repo, args.pr, "<!-- hw-gate:prelim -->", prelim_body)
-                posted["prelim_comment"] = prelim_comment_url
-            except Exception as e:
-                if args.phase == "prelim":
-                    sys.stderr.write(f"prelim comment post failed: {e}\n")
-                else:
-                    return _fail(f"prelim comment post failed: {e}")
-            if args.phase == "prelim":
-                with open(args.out, "w", encoding="utf-8") as f:
-                    json.dump({"schema": "hipfire.hw-gate.prelim", "version": 1, "model": model,
-                               "prelim": prelim, "posted": {"prelim_comment": prelim_comment_url}},
-                              f, indent=2, sort_keys=True)
+                Path(routes_path).parent.mkdir(parents=True, exist_ok=True)
+                with open(routes_path, "w", encoding="utf-8") as f:
+                    json.dump(routes_to_write, f, indent=2, sort_keys=True)
                     f.write("\n")
-                return 0
-        else:
-            prelim = None
-            if args.prelim and Path(args.prelim).is_file():
-                try:
-                    with open(args.prelim, "r", encoding="utf-8") as f:
-                        prelim = json.load(f).get("prelim")
-                except Exception:
-                    prelim = None
-            _prelim_cache = prelim
+            except Exception as ee:
+                sys.stderr.write(f"failed to write routes: {ee}\n")
+        return 0
 
-        # Evidence comment
-        if evidence_md_path.is_file():
-            try:
-                ev_md = evidence_md_path.read_text(encoding="utf-8")
-            except Exception as e:
-                ev_md = f"(failed to read hw-gate.md: {e})"
-            ev_body = f"<!-- hw-gate:evidence -->\n{ev_md}\n"
-            # Truncation handled inside upsert_comment (60 KiB)
-        else:
-            ev_body = "<!-- hw-gate:evidence -->\nNo hardware evidence found — hw-run did not produce hw-gate.md (hw-run result: " + args.hw_run_result + ").\n"
-        try:
-            evidence_comment_url = upsert_comment(args.repo, args.pr, "<!-- hw-gate:evidence -->", ev_body)
-            posted["evidence_comment"] = evidence_comment_url
-        except Exception as e:
-            return _fail(f"evidence comment post failed: {e}")
+    # Success path: compute routes.json filtering
+    sol_routes_raw = prelim.get("routes", []) if isinstance(prelim, dict) else []
+    sol_filtered: list[dict] = []
+    sol_unavailable: list[dict] = []
+    # keep track of known for unavailable
+    for r in sol_routes_raw if isinstance(sol_routes_raw, list) else []:
+        if not isinstance(r, dict):
+            continue
+        tag = r.get("tag")
+        mode = r.get("mode")
+        if tag not in known_tags:
+            continue  # dropped unknown
+        if mode not in ("battery", "chain"):
+            continue
+        entry = {"mode": mode, "tag": tag, "source": r.get("source", "sol"), "why": r.get("why", "")}
+        sol_filtered.append(entry)
+        if tag not in available_map:
+            sol_unavailable.append({"tag": tag, "why": entry.get("why","") + " (not present on runner)"})
 
-        # Verdict phase
-        verdict_prompt = build_verdict_prompt(prelim_prompt, prelim, evidence, select, args.hw_run_result)
-        verdict_parse_failed = False
-        try:
-            verdict = omp_review("verdict", verdict_prompt, args.system_prompt, args.checkout, model)
-        except ReviewError as e:
-            # Verdict parse failure -> treat as needs-human via floor, but still need to post verdict comment?
-            # Per spec: verdict phase failed to parse -> floor makes it needs-human.
-            # We set verdict None and continue to floor.
-            verdict_parse_failed = True
-            # Log but continue; floor will handle
-            # Still post a verdict comment indicating parse failure
-            try:
-                fail_body = f"<!-- hw-gate:verdict -->\n# hw-gate verdict\n\nVerdict parsing failed: {e}\n\nPrelim:\n```json\n{json.dumps(prelim, indent=2, sort_keys=True)}\n```\n\nDecision will be needs-human (fail-closed).\n"
-                verdict_comment_url = upsert_comment(args.repo, args.pr, "<!-- hw-gate:verdict -->", fail_body)
-                posted["verdict_comment"] = verdict_comment_url
-            except Exception:
-                pass
-            # Do not return _fail yet; go through floor as needs-human
-            verdict = None
+    # Merge bucket + sol (dedup by tag+mode)
+    route_map: dict[tuple[str,str], dict] = {}
+    for r in bucket_routes:
+        key = (r["tag"], r["mode"])
+        route_map[key] = r
+    for r in sol_filtered:
+        key = (r["tag"], r["mode"])
+        if key not in route_map:
+            route_map[key] = r
+    routes_combined = list(route_map.values())
 
-        if not verdict_parse_failed:
-            # Post verdict comment including floor yet? Floor not yet computed but include verdict JSON
-            # We will update verdict comment after floor; for now post initial
-            verdict_body = f"<!-- hw-gate:verdict -->\n# hw-gate verdict\n\n```json\n{json.dumps(verdict, indent=2, sort_keys=True)}\n```\n"
-            try:
-                verdict_comment_url = upsert_comment(args.repo, args.pr, "<!-- hw-gate:verdict -->", verdict_body)
-                posted["verdict_comment"] = verdict_comment_url
-            except Exception as e:
-                return _fail(f"verdict comment post failed: {e}")
+    # Build comment body
+    summary = prelim.get("summary", "") if isinstance(prelim, dict) else ""
+    run_hw_reasons = prelim.get("run_hardware_reasons", []) if isinstance(prelim, dict) else []
+    claim_assessment = prelim.get("claim_assessment", "") if isinstance(prelim, dict) else ""
+    questions = prelim.get("questions_for_author", []) if isinstance(prelim, dict) else []
+    # Also include unavailable_routes from prelim plus our computed unavailable
+    prelim_unavail = prelim.get("unavailable_routes", []) if isinstance(prelim, dict) else []
+    # Merge with computed unavailable that not already present
+    all_unavail = list(prelim_unavail) if isinstance(prelim_unavail, list) else []
+    existing_unavail_tags = set(u.get("tag") for u in all_unavail if isinstance(u, dict))
+    for u in sol_unavailable:
+        if u["tag"] not in existing_unavail_tags:
+            all_unavail.append(u)
 
-        # Floor
-        model_decision = None
-        if isinstance(verdict, dict):
-            model_decision = verdict.get("decision")
-        # If verdict parse failed, model_decision stays None
-        final_decision, reasons = apply_floor(model_decision, evidence, select, args.hw_run_result, commit_messages, verdict)
+    lines: list[str] = []
+    lines.append("<!-- hw-gate:sol-prelim -->")
+    lines.append("# hw-gate sol prelim")
+    lines.append("")
+    if summary:
+        lines.append(f"**summary:** {summary}")
+        lines.append("")
+    lines.append(f"**run_hardware:** {str(run_hardware).lower()}")
+    if run_hw_reasons:
+        lines.append(f"**run_hardware_reasons:** {'; '.join(str(x) for x in run_hw_reasons)}")
+    lines.append("")
+    # routes table
+    lines.append("**routes:**")
+    lines.append("")
+    lines.append("| mode | tag | source | why |")
+    lines.append("|---|---|---|---|")
+    if routes_combined:
+        for r in routes_combined:
+            lines.append(f"| {r.get('mode','')} | {r.get('tag','')} | {r.get('source','')} | {r.get('why','').replace('|','\\|')} |")
+    else:
+        lines.append("| — | — | — | no routes |")
+    lines.append("")
+    lines.append("**unavailable_routes:**")
+    lines.append("")
+    if all_unavail:
+        lines.append("| tag | why |")
+        lines.append("|---|---|")
+        for u in all_unavail:
+            lines.append(f"| {u.get('tag','')} | {u.get('why','').replace('|','\\|')} |")
+    else:
+        lines.append("(none)")
+    lines.append("")
+    if claim_assessment:
+        lines.append(f"**claim_assessment:** {claim_assessment}")
+        lines.append("")
+    if questions:
+        lines.append("**questions_for_author:**")
+        for q in questions:
+            lines.append(f"- {q}")
+        lines.append("")
+    body = "\n".join(lines)
+    try:
+        prelim_comment_url = upsert_comment(args.repo, args.pr, "<!-- hw-gate:sol-prelim -->", body)
+        posted["prelim_comment"] = prelim_comment_url
+    except Exception as e:
+        sys.stderr.write(f"prelim comment failed: {e}\n")
+        posted["prelim_comment"] = None
 
-        # Re-post verdict comment with floor decisions verbatim (update)
-        floor_text = f"Floor applied: {', '.join(reasons) if reasons else 'none'} -> {final_decision} (model proposed: {model_decision})\n"
-        if isinstance(verdict, dict):
-            full_verdict_body = f"<!-- hw-gate:verdict -->\n# hw-gate verdict\n\n```json\n{json.dumps(verdict, indent=2, sort_keys=True)}\n```\n\n{floor_text}\n"
-        else:
-            full_verdict_body = f"<!-- hw-gate:verdict -->\n# hw-gate verdict\n\nVerdict parsing failed; floor forces needs-human.\n\n{floor_text}\n```json\n{json.dumps(prelim, indent=2, sort_keys=True)}\n```\n"
-        try:
-            # Upsert again to include floor verbatim
-            verdict_comment_url = upsert_comment(args.repo, args.pr, "<!-- hw-gate:verdict -->", full_verdict_body)
-            posted["verdict_comment"] = verdict_comment_url
-        except Exception as e:
-            return _fail(f"verdict floor comment post failed: {e}")
-
-        # Apply decision (labels + review)
-        if isinstance(verdict, dict):
-            rationale = verdict.get("rationale", "")
-            summary = f"hw-gate {final_decision}: {rationale}" if rationale else f"hw-gate {final_decision}"
-        else:
-            summary = f"hw-gate {final_decision}: verdict parse failed, fail-closed to needs-human"
-        try:
-            applied = apply_decision(args.repo, args.pr, final_decision, summary)
-            posted["review"] = applied.get("review")
-            posted["labels_added"] = applied.get("labels_added", [])
-            posted["labels_removed"] = applied.get("labels_removed", [])
-        except Exception as e:
-            return _fail(f"apply decision failed: {e}")
-
-        # Write verdict.json
-        out_obj = {
-            "schema": "hipfire.hw-gate.verdict",
-            "version": 1,
-            "model": model,
-            "prelim": prelim,
-            "verdict": verdict,
-            "floor": {"applied": reasons, "model_decision": model_decision, "final_decision": final_decision},
-            "posted": posted,
-        }
+    # Write prelim.json
+    out_obj = {
+        "schema": "hipfire.hw-gate.prelim",
+        "version": 2,
+        "seat": "sol",
+        "model": model,
+        "prelim": prelim,
+        "run_hardware": run_hardware,
+        "posted": posted,
+    }
+    try:
+        Path(args.out).parent.mkdir(parents=True, exist_ok=True)
         with open(args.out, "w", encoding="utf-8") as f:
             json.dump(out_obj, f, indent=2, sort_keys=True)
             f.write("\n")
-        # CONTRACT: an unparseable verdict is a failed review — needs-human is
-        # posted and recorded above, and the exit code says the model never
-        # produced a decision.
-        return 1 if verdict_parse_failed else 0
-
-    except ReviewError as e:
-        return _fail(str(e))
     except Exception as e:
-        return _fail(f"unexpected error: {e}")
+        sys.stderr.write(f"failed to write prelim.json: {e}\n")
+        return 1
+
+    # Write routes.json
+    routes_path = args.routes
+    if not routes_path:
+        # Derive from out's dir? For workflow, --routes routes.json is explicit. If missing, skip
+        sys.stderr.write("no --routes path for prelim\n")
+    else:
+        try:
+            Path(routes_path).parent.mkdir(parents=True, exist_ok=True)
+            with open(routes_path, "w", encoding="utf-8") as f:
+                json.dump(routes_combined, f, indent=2, sort_keys=True)
+                f.write("\n")
+        except Exception as e:
+            sys.stderr.write(f"failed to write routes.json: {e}\n")
+            return 1
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# verdict phase (sol)
+# ---------------------------------------------------------------------------
+
+def _run_verdict(args) -> int:
+    # Load select
+    try:
+        with open(args.select, "r", encoding="utf-8") as f:
+            select = json.load(f)
+    except Exception as e:
+        sys.stderr.write(f"failed to load select: {e}\n")
+        return 1
+    # Load prelim
+    prelim_obj: dict | None = None
+    prelim_data: dict | None = None
+    if args.prelim and Path(args.prelim).is_file():
+        try:
+            with open(args.prelim, "r", encoding="utf-8") as f:
+                prelim_obj = json.load(f)
+                # prelim file is prelim.json with schema; its "prelim" field is the model JSON
+                if isinstance(prelim_obj, dict) and "prelim" in prelim_obj:
+                    prelim_data = prelim_obj.get("prelim")
+                else:
+                    prelim_data = prelim_obj
+        except Exception:
+            prelim_data = None
+    # Load evidence
+    evidence = None
+    evidence_path = Path(args.evidence) if args.evidence else None
+    if evidence_path and evidence_path.is_file():
+        try:
+            with open(evidence_path, "r", encoding="utf-8") as f:
+                evidence = json.load(f)
+        except Exception:
+            evidence = None
+    # evidence md
+    evidence_md_path = None
+    if evidence_path:
+        candidate = evidence_path.parent / "hw-gate.md"
+        if candidate.is_file():
+            evidence_md_path = candidate
+        else:
+            # try alongside evidence path's dir with same name but .md
+            alt = evidence_path.with_suffix(".md")
+            if alt.is_file():
+                evidence_md_path = alt
+    # hw-run result and commit messages
+    hw_run_result = args.hw_run_result if args.hw_run_result else "success"
+    commit_messages = _load_commit_messages(args.checkout, args.base, args.head)
+
+    model = os.environ.get("HW_GATE_REVIEW_MODEL", "gpt-5.6-sol")
+
+    # Post evidence comment first (as per spec: verdict phase posts evidence comment)
+    evidence_comment_url = None
+    if evidence_md_path and evidence_md_path.is_file():
+        try:
+            ev_md = evidence_md_path.read_text(encoding="utf-8")
+        except Exception as e:
+            ev_md = f"(failed to read hw-gate.md: {e})"
+        ev_body = f"<!-- hw-gate:evidence -->\n{ev_md}\n"
+    else:
+        ev_body = f"<!-- hw-gate:evidence -->\nNo hardware evidence found — hw-run did not produce hw-gate.md (hw-run result: {hw_run_result}).\n"
+    try:
+        evidence_comment_url = upsert_comment(args.repo, args.pr, "<!-- hw-gate:evidence -->", ev_body)
+    except Exception as e:
+        sys.stderr.write(f"evidence comment failed: {e}\n")
+        evidence_comment_url = None
+
+    # Build prelim_prompt for verdict prompt (reuse prelim prompt generation with fixtures?)
+    # Need fixtures for prelim prompt generation; try to load via --fixtures if provided? Verdict doesn't have fixtures arg, so skip.
+    try:
+        prelim_prompt = build_prelim_prompt(select, args.checkout, args.base, args.head, args.repo, args.pr, None, None)
+    except Exception as e:
+        prelim_prompt = f"failed to build prelim prompt: {e}"
+
+    verdict_prompt = build_verdict_prompt(prelim_prompt, prelim_data, evidence, select, hw_run_result)
+
+    verdict = None
+    verdict_parse_failed = False
+    try:
+        verdict = omp_review("verdict", verdict_prompt, args.system_prompt, args.checkout, model)
+    except ReviewError as e:
+        verdict_parse_failed = True
+        verdict = None
+        sys.stderr.write(f"verdict omp failed: {e}\n")
+
+    # Compute floor
+    model_decision = None
+    if isinstance(verdict, dict):
+        model_decision = verdict.get("decision")
+
+    hard = hard_floor(evidence, select, hw_run_result, commit_messages)
+    soft = soft_floor(verdict, model_decision)
+    # If verdict parse failed, add reason to hard/soft? It should be soft/hard? We'll add to hard or soft via later logic.
+    # For floor display, hard and soft as computed. Parse failure will be reflected in final decision.
+
+    # Determine final decision per spec
+    def _has_hold(r: str) -> bool:
+        return "policy_paths" in r or "RATCHET" in r
+    hard_has_block = any(not _has_hold(r) for r in hard) if hard else False
+    hard_has_hold = any(_has_hold(r) for r in hard) if hard else False
+
+    if hard:
+        if hard_has_block:
+            final_decision = "block"
+        else:
+            final_decision = "needs-human"
+    elif soft:
+        final_decision = "needs-human"
+    else:
+        if verdict_parse_failed:
+            final_decision = "needs-human"
+        elif model_decision == "greenlight":
+            final_decision = "greenlight"
+        elif model_decision == "block":
+            final_decision = "block"
+        elif model_decision == "needs-human":
+            final_decision = "needs-human"
+        else:
+            final_decision = "needs-human"
+
+    # If verdict parse failed, ensure soft includes note? For floor display, hard stays as is, soft may include parse failure
+    if verdict_parse_failed:
+        if "verdict_parse_failed" not in soft:
+            # add to soft for visibility
+            pass
+
+    # Post verdict comment with marker sol-verdict
+    # Include verdict JSON + floor lines
+    verdict_comment_url = None
+    # Build body per spec: verdict JSON + floor lines
+    if not verdict_parse_failed:
+        floor_text = f"Floor: hard={hard} soft={soft} model_decision={model_decision} final={final_decision}"
+        verdict_body = f"<!-- hw-gate:sol-verdict -->\n# hw-gate sol verdict\n\n```json\n{json.dumps(verdict, indent=2, sort_keys=True)}\n```\n\n{floor_text}\n"
+    else:
+        floor_text = f"Floor: hard={hard} soft={soft} model_decision={model_decision} final={final_decision} (verdict parse failed)"
+        verdict_body = f"<!-- hw-gate:sol-verdict -->\n# hw-gate sol verdict\n\nVerdict parsing failed; floor forces {final_decision}.\n\n{floor_text}\n```json\n{json.dumps(prelim_data, indent=2, sort_keys=True) if prelim_data else 'null'}\n```\n"
+    try:
+        verdict_comment_url = upsert_comment(args.repo, args.pr, "<!-- hw-gate:sol-verdict -->", verdict_body)
+    except Exception as e:
+        sys.stderr.write(f"verdict comment failed: {e}\n")
+        verdict_comment_url = None
+
+    # gh pr review --comment only (never approve)
+    review_url = None
+    # Build summary for review
+    if isinstance(verdict, dict):
+        rationale = verdict.get("rationale", "")
+        summary = f"hw-gate sol verdict {final_decision}: {rationale}" if rationale else f"hw-gate sol verdict {final_decision} floor hard={hard} soft={soft}"
+    else:
+        summary = f"hw-gate sol verdict {final_decision}: verdict parse failed, fail-closed to needs-human"
+    try:
+        out = _gh(["pr", "review", str(args.pr), "--repo", args.repo, "--comment", "--body", summary])
+        review_url = out.strip() or None
+    except Exception as e:
+        sys.stderr.write(f"review comment failed: {e}\n")
+        review_url = None
+
+    # Write verdict.json version 2
+    out_obj = {
+        "schema": "hipfire.hw-gate.verdict",
+        "version": 2,
+        "seat": "sol",
+        "model": model,
+        "verdict": verdict,
+        "floor": {"hard": hard, "soft": soft, "model_decision": model_decision, "final_decision": final_decision},
+        "posted": {"evidence_comment": evidence_comment_url, "verdict_comment": verdict_comment_url, "review": review_url},
+    }
+    try:
+        Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+        with open(args.out, "w", encoding="utf-8") as f:
+            json.dump(out_obj, f, indent=2, sort_keys=True)
+            f.write("\n")
+    except Exception as e:
+        sys.stderr.write(f"failed to write verdict.json: {e}\n")
+        return 1
+
+    return 1 if verdict_parse_failed else 0
+
+
+# ---------------------------------------------------------------------------
+# decide phase (fable)
+# ---------------------------------------------------------------------------
+
+def _run_decide(args) -> int:
+    # Load select
+    try:
+        with open(args.select, "r", encoding="utf-8") as f:
+            select = json.load(f)
+    except Exception as e:
+        sys.stderr.write(f"failed to load select: {e}\n")
+        return 1
+    # Load prelim
+    prelim_obj = None
+    prelim_data = None
+    if args.prelim and Path(args.prelim).is_file():
+        try:
+            with open(args.prelim, "r", encoding="utf-8") as f:
+                prelim_obj = json.load(f)
+                prelim_data = prelim_obj.get("prelim") if isinstance(prelim_obj, dict) and "prelim" in prelim_obj else prelim_obj
+        except Exception:
+            prelim_data = None
+    else:
+        prelim_data = None
+    # Load evidence
+    evidence = None
+    if args.evidence and Path(args.evidence).is_file():
+        try:
+            with open(args.evidence, "r", encoding="utf-8") as f:
+                evidence = json.load(f)
+        except Exception:
+            evidence = None
+    # Load verdict (sol verdict json)
+    sol_verdict_file = None
+    sol_verdict_data = None
+    sol_floor = None
+    sol_final = None
+    if args.verdict and Path(args.verdict).is_file():
+        try:
+            with open(args.verdict, "r", encoding="utf-8") as f:
+                sol_verdict_file = json.load(f)
+                # sol_verdict_file has "verdict" and "floor"
+                sol_verdict_data = sol_verdict_file.get("verdict")
+                sol_floor = sol_verdict_file.get("floor", {})
+                sol_final = sol_floor.get("final_decision") if isinstance(sol_floor, dict) else None
+                # fallback: if sol_verdict_data has decision
+                if sol_final is None and isinstance(sol_verdict_data, dict):
+                    # map decision to final? But use model decision
+                    sol_final = sol_verdict_data.get("decision")
+                    # map greenlight->greenlight etc. but keep as is for override detection
+                    if sol_final == "greenlight":
+                        sol_final = "greenlight"
+                    elif sol_final == "needs-human":
+                        sol_final = "needs-human"
+                    elif sol_final == "block":
+                        sol_final = "block"
+        except Exception:
+            sol_verdict_data = None
+            sol_final = None
+    # hw_run_result, staging, commit messages
+    hw_run_result = args.hw_run_result if args.hw_run_result else "success"
+    staging = args.staging if args.staging else "beta"
+    commit_messages = _load_commit_messages(args.checkout, args.base, args.head)
+
+    model = os.environ.get("HW_GATE_DECIDE_MODEL", "claude-fable-5")
+
+    # Compute hard/soft floor first
+    hard = hard_floor(evidence, select, hw_run_result, commit_messages)
+    # soft from sol verdict
+    soft_model_decision = None
+    if isinstance(sol_verdict_data, dict):
+        soft_model_decision = sol_verdict_data.get("decision")
+    else:
+        # try sol_floor model_decision
+        if isinstance(sol_floor, dict):
+            soft_model_decision = sol_floor.get("model_decision")
+    soft = soft_floor(sol_verdict_data, soft_model_decision)
+
+    # Also include Sol's final needs-human? If sol_final == needs-human, that's already soft via model_needs_human, but soft already includes.
+    # Build decide prompt
+    try:
+        decide_prompt = build_decide_prompt(select, prelim_data, evidence, sol_verdict_file, hard, args.checkout, args.base, args.head, args.repo, args.pr)
+    except Exception as e:
+        decide_prompt = f"failed to build decide prompt: {e}"
+
+    decision = None
+    fable_unavailable = False
+    try:
+        decision = omp_review("decide", decide_prompt, args.system_prompt, args.checkout, model)
+    except ReviewError as e:
+        decision = None
+        fable_unavailable = True
+        sys.stderr.write(f"fable omp failed: {e}\n")
+
+    # Determine decision_final with hard floor precedence
+    def _has_hold(r: str) -> bool:
+        return "policy_paths" in r or "RATCHET" in r
+    hard_has_block = any(not _has_hold(r) for r in hard) if hard else False
+    hard_has_hold = any(_has_hold(r) for r in hard) if hard else False
+
+    if hard:
+        if hard_has_block:
+            decision_final = "block"
+        else:
+            decision_final = "hold"
+    else:
+        if fable_unavailable or decision is None:
+            decision_final = "hold"
+        else:
+            fable_dec = decision.get("decision")
+            if fable_dec in ("merge-staging", "hold", "block"):
+                decision_final = fable_dec
+            else:
+                decision_final = "hold"
+
+    # Override detection
+    override = None
+    sol_to_fable = {"greenlight": "merge-staging", "needs-human": "hold", "block": "block"}
+    if sol_final and decision and not hard:
+        sol_fable_equiv = sol_to_fable.get(sol_final)
+        fable_dec = decision.get("decision")
+        if sol_fable_equiv and fable_dec != sol_fable_equiv:
+            # Determine override why
+            why = None
+            # decision may have override field
+            ov = decision.get("override")
+            if isinstance(ov, dict) and ov.get("why"):
+                why = ov.get("why")
+            elif decision.get("rationale"):
+                why = decision.get("rationale")
+            else:
+                why = f"Fable {fable_dec} overrides Sol {sol_final}"
+            override = {"of": sol_final, "why": why}
+            # Also mark veto vs override distinction but keep same shape
+    # If hard fired, no override (even if disagreement)
+
+    # Handle staging merge if decision_final == merge-staging
+    merged = None
+    merged_error = None
+    announcement_extra = ""
+    # Need PR title for commit message
+    pr_title = ""
+    try:
+        pr_json_text = _gh(["pr", "view", str(args.pr), "--repo", args.repo, "--json", "title"])
+        pr_info = json.loads(pr_json_text)
+        pr_title = pr_info.get("title", "")
+    except Exception:
+        pr_title = ""
+    if decision_final == "merge-staging":
+        # Attempt merge via gh api merges
+        commit_msg = f"hw-gate: merge PR #{args.pr} ({pr_title}) to staging"
+        try:
+            out = _gh(["api", f"repos/{args.repo}/merges", "-f", f"base={staging}", "-f", f"head={args.head}", "-f", f"commit_message={commit_msg}"])
+            # Try parse response for sha
+            try:
+                resp = json.loads(out) if out.strip() else {}
+                merge_sha = resp.get("sha") if isinstance(resp, dict) else None
+                if not merge_sha:
+                    merge_sha = out.strip() or None
+            except Exception:
+                merge_sha = out.strip() or None
+            merged = {"base": staging, "head": args.head, "merge_sha": merge_sha}
+        except ReviewError as e:
+            err_msg = str(e)
+            # Check for 409
+            is_409 = "409" in err_msg or "already" in err_msg.lower() or "conflict" in err_msg.lower()
+            # For fake gh, we may need to check fake behavior: it may return 409 via special handling
+            # We'll treat any error containing 409 as conflict
+            if is_409:
+                merged = {"base": staging, "head": args.head, "merge_sha": None, "error": err_msg}
+                announcement_extra = f" Merge conflict (409): {err_msg} — needs-human label applied instead."
+                # decision_final stays merge-staging but label will be needs-human
+            else:
+                merged = {"base": staging, "head": args.head, "merge_sha": None, "error": err_msg}
+                announcement_extra = f" Merge failed: {err_msg}"
+
+    # Determine labels/reviews
+    # For decide, labels: merge-staging->merged-staging (+ approve), hold->needs-human (+ comment), block->hw-gate-blocked (+ request-changes)
+    # But 409 conflict => needs-human instead.
+
+    target_label = None
+    review_args = None
+    # Decide body for review and comment
+    # Build announcement + rationale + override note + merge info
+    announcement = ""
+    if isinstance(decision, dict):
+        announcement = decision.get("announcement", "")
+    if not announcement:
+        if fable_unavailable:
+            announcement = "Fable unavailable; holding for human review."
+        elif decision_final == "merge-staging":
+            announcement = "Fable merges to staging."
+        elif decision_final == "hold":
+            announcement = "Fable holds for human review."
+        else:
+            announcement = "Fable blocks."
+
+    rationale = ""
+    if isinstance(decision, dict):
+        rationale = decision.get("rationale", "")
+
+    override_note = ""
+    if override:
+        override_note = f"Override Sol {override['of']}: {override['why']}"
+
+    # Construct fable-decision comment body
+    comment_lines: list[str] = []
+    comment_lines.append("<!-- hw-gate:fable-decision -->")
+    comment_lines.append(f"**announcement:** {announcement}")
+    if announcement_extra:
+        comment_lines.append(announcement_extra)
+    if override_note:
+        comment_lines.append(f"**override:** {override_note}")
+    if rationale:
+        comment_lines.append(f"**rationale:** {rationale}")
+    if merged:
+        if merged.get("merge_sha"):
+            comment_lines.append(f"**merged:** {merged['base']} {merged['merge_sha']}")
+        elif merged.get("error"):
+            comment_lines.append(f"**merge error:** {merged['error']}")
+    if hard:
+        comment_lines.append(f"**hard floor:** {hard}")
+    if soft:
+        comment_lines.append(f"**soft floor:** {soft}")
+    fable_body = "\n\n".join(comment_lines)
+
+    # Upsert comment
+    fable_comment_url = None
+    try:
+        fable_comment_url = upsert_comment(args.repo, args.pr, "<!-- hw-gate:fable-decision -->", fable_body)
+    except Exception as e:
+        sys.stderr.write(f"fable comment failed: {e}\n")
+        fable_comment_url = None
+
+    # Determine label and review
+    # Default mapping
+    if decision_final == "merge-staging" and merged and merged.get("error") and "409" in str(merged.get("error", "")):
+        # 409 case: needs-human label + comment review
+        target_label = "needs-human"
+        review_flag = "--comment"
+        review_body = f"{announcement} {override_note} {rationale} {announcement_extra}".strip()
+    elif decision_final == "merge-staging":
+        target_label = "merged-staging"
+        review_flag = "--approve"
+        review_body = f"{announcement} {rationale} {override_note}".strip()
+    elif decision_final == "hold":
+        target_label = "needs-human"
+        review_flag = "--comment"
+        review_body = f"{announcement} {rationale} {override_note}".strip()
+    else:  # block
+        target_label = "hw-gate-blocked"
+        review_flag = "--request-changes"
+        review_body = f"{announcement} {rationale} {override_note}".strip()
+
+    # Apply decision labels/reviews
+    labels_added: list[str] = []
+    labels_removed: list[str] = []
+    review_url = None
+
+    # Ensure label exists
+    color = _LABEL_COLORS.get(target_label, "ededed")
+    try:
+        _gh(["label", "create", target_label, "--repo", args.repo, "--color", color, "--force"])
+    except ReviewError:
+        pass
+
+    # Review
+    try:
+        out = _gh(["pr", "review", str(args.pr), "--repo", args.repo, review_flag, "--body", review_body])
+        review_url = out.strip() or None
+    except ReviewError as e:
+        sys.stderr.write(f"pr review failed: {e}\n")
+        review_url = None
+
+    # Add label
+    try:
+        _gh(["api", f"repos/{args.repo}/issues/{args.pr}/labels", "--method", "POST", "-f", f"labels[]={target_label}"])
+        labels_added.append(target_label)
+    except ReviewError:
+        pass
+
+    # Remove others among {merged-staging, needs-human, hw-gate-blocked, agent-approved}
+    for lbl in ["merged-staging", "needs-human", "hw-gate-blocked", "agent-approved"]:
+        if lbl != target_label:
+            try:
+                _gh(["api", f"repos/{args.repo}/issues/{args.pr}/labels/{lbl}", "--method", "DELETE"])
+                labels_removed.append(lbl)
+            except ReviewError:
+                pass
+    # Remove hw-run
+    try:
+        _gh(["api", f"repos/{args.repo}/issues/{args.pr}/labels/hw-run", "--method", "DELETE"])
+        labels_removed.append("hw-run")
+    except ReviewError:
+        pass
+
+    # If 409, also add needs-human even though target was merged-staging? Already handled target=needs-human case. So no extra.
+
+    posted = {
+        "fable_comment": fable_comment_url,
+        "review": review_url,
+        "labels_added": labels_added,
+        "labels_removed": labels_removed,
+    }
+
+    out_obj = {
+        "schema": "hipfire.hw-gate.decision",
+        "version": 1,
+        "seat": "fable",
+        "model": model,
+        "decision": decision,
+        "floor": {"hard": hard, "soft": soft},
+        "decision_final": decision_final,
+        "override": override,
+        "merged": merged,
+        "posted": posted,
+    }
+    try:
+        Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+        with open(args.out, "w", encoding="utf-8") as f:
+            json.dump(out_obj, f, indent=2, sort_keys=True)
+            f.write("\n")
+    except Exception as e:
+        sys.stderr.write(f"failed to write decision.json: {e}\n")
+        return 1
+
+    return 1 if fable_unavailable else 0
+
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description="hw-gate reviewer driver: sol prelim/verdict and fable decide")
+    ap.add_argument("--seat", choices=("sol", "fable"), required=True, help="reviewer seat")
+    ap.add_argument("--phase", choices=("prelim", "verdict", "decide"), required=True, help="phase")
+    ap.add_argument("--repo", required=True)
+    ap.add_argument("--pr", required=True, type=int)
+    ap.add_argument("--base", required=True)
+    ap.add_argument("--head", required=True)
+    ap.add_argument("--checkout", required=True)
+    ap.add_argument("--select", required=True, help="select.json path")
+    ap.add_argument("--fixtures", help="fixtures.json path (prelim only)")
+    ap.add_argument("--prelim", help="prelim.json path (verdict/decide)")
+    ap.add_argument("--evidence", help="hw-gate.json path (verdict/decide)")
+    ap.add_argument("--verdict", help="verdict.json path (decide only)")
+    ap.add_argument("--hw-run-result", help="hw-run result string")
+    ap.add_argument("--staging", help="staging branch name (decide only)")
+    ap.add_argument("--routes", help="routes.json output path (prelim only)")
+    ap.add_argument("--system-prompt", required=True)
+    ap.add_argument("--out", required=True, help="output JSON path")
+    args = ap.parse_args(argv)
+
+    # Validate seat/phase combo per authority model
+    if args.seat == "fable" and args.phase in ("prelim", "verdict"):
+        sys.stderr.write("fable seat only supports decide phase\n")
+        return 2
+    if args.seat == "sol" and args.phase == "decide":
+        sys.stderr.write("sol seat does not support decide\n")
+        return 2
+
+    try:
+        if args.phase == "prelim":
+            return _run_prelim(args)
+        elif args.phase == "verdict":
+            return _run_verdict(args)
+        elif args.phase == "decide":
+            return _run_decide(args)
+        else:
+            sys.stderr.write(f"unknown phase {args.phase}\n")
+            return 2
+    except ReviewError as e:
+        sys.stderr.write(f"review error: {e}\n")
+        return 1
+    except Exception as e:
+        sys.stderr.write(f"unexpected error: {e}\n")
+        import traceback
+        traceback.print_exc()
+        return 1
 
 
 if __name__ == "__main__":

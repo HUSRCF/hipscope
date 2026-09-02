@@ -9,16 +9,7 @@ import os
 import sys
 from pathlib import Path
 
-# Env controls:
-#   FAKE_OMP_LOG: path to append JSON lines of invocation (args)
-#   FAKE_OMP_RESPONSES: path to JSON file containing list of responses to return sequentially
-#       Each entry: {"phase": "prelim"|"verdict"|"probe", "json": {...}} or {"text": "raw text not JSON"}
-#       If not set, returns default canned prelim/verdict based on call count.
-#   FAKE_OMP_GARBAGE: if "1", always return garbage text that fails extract_json
-#   FAKE_OMP_CALL_COUNT: file to track call count across invocations
-
 def _emit(assistant_text: str):
-    # Emit minimal realistic JSONL matching /tmp/omp-probe.out shape
     events = [
         {"type": "session", "version": 3, "id": "test-session", "timestamp": "2026-09-02T00:00:00Z", "cwd": "/tmp"},
         {"type": "agent_start"},
@@ -35,7 +26,6 @@ def _emit(assistant_text: str):
 
 def main():
     args = sys.argv[1:]
-    # Log invocation
     log_path = os.environ.get("FAKE_OMP_LOG")
     if log_path:
         try:
@@ -61,7 +51,6 @@ def main():
             pass
 
     if os.environ.get("FAKE_OMP_GARBAGE") == "1":
-        # Return garbage that is not JSON, both attempts
         _emit("this is not json at all — garbage !@#")
         sys.exit(0)
 
@@ -75,7 +64,6 @@ def main():
                 entry = responses[-1] if responses else {}
             if "json" in entry:
                 text = json.dumps(entry["json"])
-                # Optionally wrap in fences if entry says
                 if entry.get("fenced"):
                     text = "Here is the result:\n```json\n" + text + "\n```\n"
                 elif entry.get("prose"):
@@ -88,15 +76,35 @@ def main():
         except Exception as e:
             sys.stderr.write(f"fake_omp response load failed: {e}\n")
 
-    # Default canned responses: first call prelim, second verdict
-    if call_idx == 0:
-        # prelim
+    # Default canned responses: determine phase by call_idx and model arg
+    # Try to infer model from args
+    model = ""
+    for i, a in enumerate(args):
+        if a == "--model" and i+1 < len(args):
+            model = args[i+1]
+    if "fable" in model or "decide" in " ".join(args):
+        # fable decide default
+        text = json.dumps({
+            "phase": "decide",
+            "decision": "merge-staging",
+            "agrees_with_sol": True,
+            "override": None,
+            "regressions": [],
+            "further_evidence_wanted": [],
+            "rationale": "fable rationale",
+            "announcement": "Fable merges to staging."
+        })
+    elif call_idx == 0:
         text = json.dumps({
             "phase": "prelim",
             "summary": "test change",
             "surfaces": ["load"],
             "suspected_regressions": [],
-            "extra_routes": [],
+            "run_hardware": True,
+            "run_hardware_reasons": ["safe"],
+            "routes": [{"mode": "battery", "tag": "qwen3.6:27b", "source": "sol", "why": "test"}],
+            "unavailable_routes": [],
+            "claim_assessment": "no claim",
             "questions_for_author": []
         })
     else:
@@ -106,10 +114,10 @@ def main():
             "confidence": 0.9,
             "regressions": [],
             "coverage": {"surfaces_touched": ["load"], "surfaces_evidenced": ["load"], "gaps": []},
+            "claim_verdict": "no-claim",
             "eyeball": [],
             "rationale": "all evidenced"
         })
-        # Check if prompt indicates verdict should be block/needs-human via env override
         override = os.environ.get("FAKE_OMP_VERDICT_DECISION")
         if override:
             obj = json.loads(text)

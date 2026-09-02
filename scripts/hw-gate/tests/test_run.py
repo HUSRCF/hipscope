@@ -468,3 +468,322 @@ def test_kernel_redline_config_source(tmp_path, monkeypatch):
     res = run_mod.run_kernel(str(repo), str(models_dir), kernel_cfg, manifest, {}, str(tmp_path / "logs"))
     assert res["status"] == "pass"
     assert "--pm4" in captured["argv"]
+
+def test_routes_union_and_mode_selection():
+    routes = [
+        {"mode": "battery", "tag": "qwen3.6:27b", "source": "bucket", "why": "x"},
+        {"mode": "chain", "tag": "qwen3.6:27b", "source": "sol", "why": "y"},
+        {"mode": "battery", "tag": "qwen3.6:27b", "source": "author", "why": "z"},
+        {"mode": "battery", "tag": "ornith-1.5:35b-a3b-mq4r", "source": "author", "why": "a"},
+    ]
+    order, per_modes, per_source = run_mod._build_routes_map(routes)
+    assert order == ["qwen3.6:27b", "ornith-1.5:35b-a3b-mq4r"]
+    assert per_modes["qwen3.6:27b"] == ["battery", "chain"]
+    assert per_modes["ornith-1.5:35b-a3b-mq4r"] == ["battery"]
+    # bucket priority over author/sol
+    assert per_source["qwen3.6:27b"] == "bucket"
+    assert per_source["ornith-1.5:35b-a3b-mq4r"] == "author"
+
+
+def test_registry_resolution_alias(tmp_path):
+    registry = {
+        "models": {
+            "qwen3.8:27b": {"file": "qwen3.8-27b.mq4", "sha256": "a"*64, "size_bytes": 123, "arch_id": 5},
+            "qwen3.8:27b-mq4-xt": {"file": "qwen3.8-27b.mq4-xt", "sha256": "b"*64, "size_bytes": 456, "arch_id": 5},
+        },
+        "aliases": {
+            "qwen3.8:fast": "qwen3.8:27b-mq4-xt",
+            "qwen3.8": "qwen3.8:27b",
+        }
+    }
+    r = run_mod._resolve_registry_entry("qwen3.8:fast", registry)
+    assert r is not None and r["file"] == "qwen3.8-27b.mq4-xt" and r["tag"] == "qwen3.8:fast"
+    r2 = run_mod._resolve_registry_entry("qwen3.8", registry)
+    assert r2 is not None and r2["file"] == "qwen3.8-27b.mq4"
+    r3 = run_mod._resolve_registry_entry("unknown:tag", registry)
+    assert r3 is None
+    # direct without alias
+    r4 = run_mod._resolve_registry_entry("qwen3.8:27b", registry)
+    assert r4 is not None and r4["file"] == "qwen3.8-27b.mq4"
+
+
+def test_routes_unknown_tag_unavailable(tmp_path, monkeypatch):
+    models_dir = tmp_path / "models"
+    models_dir.mkdir()
+    content = b"modeldata"
+    sha = hashlib.sha256(content).hexdigest()
+    (models_dir / "qwen3.6-27b.mq4").write_bytes(content)
+    home = tmp_path / "home"
+    home.mkdir()
+    repo = _make_repo_with_harness(tmp_path)
+    prompt_file = repo / "benchmarks" / "prompts" / "hw-gate" / "serve-battery.json"
+    prompt_file.parent.mkdir(parents=True)
+    prompt_file.write_text("[]")
+    fixtures_data = {
+        "schema": "hipfire.hw-gate.fixtures", "version": 2, "models_dir": str(models_dir),
+        "harness": {"battery_prompts": "benchmarks/prompts/hw-gate/serve-battery.json", "max_tokens": 256},
+        "fixtures": [{"tag": "qwen3.6:27b", "file": "qwen3.6-27b.mq4", "sha256": sha, "size_bytes": len(content), "arch_id": 5}],
+        "buckets": {"load": {"modes": ["battery"]}, "serve": {"modes": ["battery", "chain"]}, "kernel": {"modes": ["battery"], "redline": {"model_tag": "qwen3.6:27b", "harness_args": []}}}
+    }
+    fixtures_path = tmp_path / "fixtures.json"
+    fixtures_path.write_text(json.dumps(fixtures_data))
+    registry_data = {"models": {}, "aliases": {}}
+    registry_path = tmp_path / "registry.json"
+    registry_path.write_text(json.dumps(registry_data))
+    routes = [
+        {"mode": "battery", "tag": "qwen3.6:27b", "source": "bucket", "why": "mandatory"},
+        {"mode": "battery", "tag": "unknown:tag", "source": "sol", "why": "sol request"},
+    ]
+    routes_path = tmp_path / "routes.json"
+    routes_path.write_text(json.dumps(routes))
+    out = tmp_path / "hw-gate.json"
+    md = tmp_path / "hw-gate.md"
+    monkeypatch.setenv("HIPFIRE_HOME", str(home))
+    monkeypatch.setenv("HIPFIRE_MODELS_DIR", str(models_dir))
+    def fake_pass(argv, **kwargs):
+        if argv[0] == "cargo":
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+        if "serve_harness.py" in " ".join(argv):
+            if "--out" in argv:
+                out_p = Path(argv[argv.index("--out")+1])
+                out_p.parent.mkdir(parents=True, exist_ok=True)
+                out_p.write_text(json.dumps([{"assistant_content": "hello", "expected_substrings": [], "attractor": False, "empty": False, "finish": "stop", "genre": "x", "ctx": 10, "cached": 0, "gen": 10, "ans_words": 1, "prefill_tok_s": 1.0, "decode_tok_s": 1.0}]))
+            if "--serve-log" in argv:
+                Path(argv[argv.index("--serve-log")+1]).parent.mkdir(parents=True, exist_ok=True)
+                Path(argv[argv.index("--serve-log")+1]).write_text("log")
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+        return subprocess.CompletedProcess(argv, 0, stdout="unknown", stderr="")
+    monkeypatch.setattr(run_mod, "run_cmd", fake_pass)
+    rc = run_mod.main(["--repo", str(repo), "--fixtures", str(fixtures_path), "--base", "a", "--head", "b", "--buckets", "load", "--device", "3", "--out", str(out), "--md", str(md), "--routes", str(routes_path), "--registry", str(registry_path), "--skip-build"])
+    assert rc == 0
+    data = json.loads(out.read_text())
+    assert data["verdict"] == "pass"
+    # unknown tag should be unavailable
+    unknown = next(f for f in data["fixtures"] if f["tag"] == "unknown:tag")
+    assert unknown["status"] == "unavailable"
+    assert unknown["reason"] == "unknown tag"
+    assert unknown["modes"] == {}
+    # mandatory should be pass
+    mandatory = next(f for f in data["fixtures"] if f["tag"] == "qwen3.6:27b")
+    assert mandatory["status"] == "pass"
+    assert mandatory["source"] == "bucket"
+    assert unknown["source"] == "sol"
+
+
+def test_routes_absent_file_unavailable_still_pass(tmp_path, monkeypatch):
+    models_dir = tmp_path / "models"
+    models_dir.mkdir()
+    content = b"presentdata"
+    sha_present = hashlib.sha256(content).hexdigest()
+    (models_dir / "qwen3.6-27b.mq4").write_bytes(content)
+    home = tmp_path / "home"
+    home.mkdir()
+    repo = _make_repo_with_harness(tmp_path)
+    prompt_file = repo / "benchmarks" / "prompts" / "hw-gate" / "serve-battery.json"
+    prompt_file.parent.mkdir(parents=True)
+    prompt_file.write_text("[]")
+    fixtures_data = {
+        "schema": "hipfire.hw-gate.fixtures", "version": 2, "models_dir": str(models_dir),
+        "harness": {"battery_prompts": "benchmarks/prompts/hw-gate/serve-battery.json", "max_tokens": 256},
+        "fixtures": [{"tag": "qwen3.6:27b", "file": "qwen3.6-27b.mq4", "sha256": sha_present, "size_bytes": len(content), "arch_id": 5}],
+        "buckets": {"load": {"modes": ["battery"]}, "serve": {"modes": ["battery", "chain"]}, "kernel": {"modes": ["battery"], "redline": {"model_tag": "qwen3.6:27b", "harness_args": []}}}
+    }
+    fixtures_path = tmp_path / "fixtures.json"
+    fixtures_path.write_text(json.dumps(fixtures_data))
+    # registry with an extra model whose file is NOT present
+    reg_content = b"registrydata"
+    reg_sha = hashlib.sha256(reg_content).hexdigest()
+    registry_data = {
+        "models": {
+            "qwen3.8:27b": {"file": "qwen3.8-27b.mq4", "sha256": reg_sha, "size_bytes": len(reg_content), "arch_id": 5},
+        },
+        "aliases": {}
+    }
+    registry_path = tmp_path / "registry.json"
+    registry_path.write_text(json.dumps(registry_data))
+    routes = [
+        {"mode": "battery", "tag": "qwen3.6:27b", "source": "bucket", "why": "mandatory"},
+        {"mode": "chain", "tag": "qwen3.8:27b", "source": "author", "why": "author request"},
+    ]
+    routes_path = tmp_path / "routes.json"
+    routes_path.write_text(json.dumps(routes))
+    out = tmp_path / "hw-gate.json"
+    md = tmp_path / "hw-gate.md"
+    monkeypatch.setenv("HIPFIRE_HOME", str(home))
+    monkeypatch.setenv("HIPFIRE_MODELS_DIR", str(models_dir))
+    def fake_pass(argv, **kwargs):
+        if argv[0] == "cargo":
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+        if "serve_harness.py" in " ".join(argv):
+            if "--out" in argv:
+                out_p = Path(argv[argv.index("--out")+1])
+                out_p.parent.mkdir(parents=True, exist_ok=True)
+                out_p.write_text(json.dumps([{"assistant_content": "ok", "expected_substrings": [], "attractor": False, "empty": False, "finish": "stop", "genre": "x", "ctx": 10, "cached": 0, "gen": 10, "ans_words": 1, "prefill_tok_s": 1.0, "decode_tok_s": 1.0}]))
+            if "--serve-log" in argv:
+                Path(argv[argv.index("--serve-log")+1]).parent.mkdir(parents=True, exist_ok=True)
+                Path(argv[argv.index("--serve-log")+1]).write_text("log")
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+        return subprocess.CompletedProcess(argv, 0, stdout="unknown", stderr="")
+    monkeypatch.setattr(run_mod, "run_cmd", fake_pass)
+    rc = run_mod.main(["--repo", str(repo), "--fixtures", str(fixtures_path), "--base", "a", "--head", "b", "--buckets", "load", "--device", "3", "--out", str(out), "--md", str(md), "--routes", str(routes_path), "--registry", str(registry_path), "--skip-build"])
+    assert rc == 0
+    data = json.loads(out.read_text())
+    assert data["verdict"] == "pass"
+    routed_missing = next(f for f in data["fixtures"] if f["tag"] == "qwen3.8:27b")
+    assert routed_missing["status"] == "unavailable"
+    assert "fixture not present on runner" in routed_missing["reason"]
+    assert "qwen3.8-27b.mq4" in routed_missing["reason"]
+    # ensure it did not cause overall fail
+    assert routed_missing["source"] == "author"
+    # modes should be empty for unavailable
+    assert routed_missing["modes"] == {}
+    # md should contain unavailable row and not contain turn table for that tag's chain
+    md_text = md.read_text()
+    assert "qwen3.8:27b" in md_text
+    assert "fixture not present on runner" in md_text
+    # there should be no turn table rows for the unavailable fixture's mode
+    # check that the unavailable fixture section does not contain "| mode | idx |"
+    # we look after the header for that tag until next header
+
+
+def test_routes_mismatched_mandatory_still_exit2(tmp_path, monkeypatch):
+    models_dir = tmp_path / "models"
+    models_dir.mkdir()
+    content = b"gooddata"
+    bad_content = b"baddata12345"
+    # write bad file content but fixtures expects good sha
+    (models_dir / "qwen3.6-27b.mq4").write_bytes(bad_content)
+    sha_good = hashlib.sha256(content).hexdigest()
+    home = tmp_path / "home"
+    home.mkdir()
+    repo = _make_repo_with_harness(tmp_path)
+    prompt_file = repo / "benchmarks" / "prompts" / "hw-gate" / "serve-battery.json"
+    prompt_file.parent.mkdir(parents=True)
+    prompt_file.write_text("[]")
+    fixtures_data = {
+        "schema": "hipfire.hw-gate.fixtures", "version": 2, "models_dir": str(models_dir),
+        "harness": {"battery_prompts": "benchmarks/prompts/hw-gate/serve-battery.json", "max_tokens": 256},
+        "fixtures": [{"tag": "qwen3.6:27b", "file": "qwen3.6-27b.mq4", "sha256": sha_good, "size_bytes": len(content), "arch_id": 5}],
+        "buckets": {"load": {"modes": ["battery"]}, "serve": {"modes": ["battery", "chain"]}, "kernel": {"modes": ["battery"], "redline": {"model_tag": "qwen3.6:27b", "harness_args": []}}}
+    }
+    fixtures_path = tmp_path / "fixtures.json"
+    fixtures_path.write_text(json.dumps(fixtures_data))
+    registry_path = tmp_path / "registry.json"
+    registry_path.write_text(json.dumps({"models": {}, "aliases": {}}))
+    routes = [{"mode": "battery", "tag": "qwen3.6:27b", "source": "bucket", "why": "mandatory"}]
+    routes_path = tmp_path / "routes.json"
+    routes_path.write_text(json.dumps(routes))
+    out = tmp_path / "hw-gate.json"
+    md = tmp_path / "hw-gate.md"
+    monkeypatch.setenv("HIPFIRE_HOME", str(home))
+    monkeypatch.setenv("HIPFIRE_MODELS_DIR", str(models_dir))
+    monkeypatch.setattr(run_mod, "run_cmd", lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, stdout="", stderr=""))
+    rc = run_mod.main(["--repo", str(repo), "--fixtures", str(fixtures_path), "--base", "a", "--head", "b", "--buckets", "load", "--device", "3", "--out", str(out), "--md", str(md), "--routes", str(routes_path), "--registry", str(registry_path), "--skip-build"])
+    assert rc == 2
+    data = json.loads(out.read_text())
+    assert data["verdict"] == "fail"
+    assert "precondition_error" in data
+
+
+def test_render_md_unavailable_rows(tmp_path):
+    evidence = {
+        "schema": "hipfire.hw-gate.evidence", "version": 1, "verdict": "pass", "base": "a", "head": "b", "buckets": ["load"],
+        "host": {"gfx": "gfx1201", "rocm": "6.2", "device": "3", "runner": "hiptrx"},
+        "binaries": {"daemon_md5": "d1", "hipfire_md5": "h1", "build_seconds": 42.5},
+        "fixtures": [
+            {"tag": "qwen3.6:27b", "file": "qwen3.6-27b.mq4", "sha256": "abc", "sha256_ok": True, "size_ok": True, "source": "bucket", "modes": {"battery": {"exit": 0, "seconds": 1.0, "rows": [{"genre": "x", "finish": "stop", "ctx": 10, "cached": 0, "gen": 10, "ans_words": 1, "prefill_tok_s": 1.0, "decode_tok_s": 1.0, "attractor": False, "empty": False, "runaway": False, "recall_ok": True, "expected_substrings": [], "assistant_content": "ok", "prompt_md5": ""}], "status": "pass", "reason": ""}}, "status": "pass", "reason": ""},
+            {"tag": "qwen3.8:27b", "file": "qwen3.8-27b.mq4", "sha256": "def", "sha256_ok": False, "size_ok": False, "source": "author", "modes": {}, "status": "unavailable", "reason": "fixture not present on runner: qwen3.8-27b.mq4"},
+            {"tag": "unknown:tag", "file": "", "sha256": "", "sha256_ok": False, "size_ok": False, "source": "sol", "modes": {}, "status": "unavailable", "reason": "unknown tag"},
+        ],
+        "kernel": None, "logs_dir": "hw-gate-logs",
+    }
+    md = run_mod.render_md(evidence)
+    assert "qwen3.8:27b" in md
+    assert "fixture not present on runner" in md
+    assert "unknown tag" in md
+    # unavailable should not have turn tables
+    # ensure that the number of "| mode | idx |" tables equals number of run fixtures (1)
+    # Count turn tables occurrences
+    count = md.lower().count("| mode | idx |")
+    # only the first fixture has battery mode with rows, so count ==1
+    assert count == 1
+    # source should appear
+    assert "source:" in md.lower() or "bucket" in md
+
+
+def test_routes_modes_per_fixture(tmp_path, monkeypatch):
+    models_dir = tmp_path / "models"
+    models_dir.mkdir()
+    # two fixtures both present
+    c1 = b"data1"
+    c2 = b"data2!!"
+    sha1 = hashlib.sha256(c1).hexdigest()
+    sha2 = hashlib.sha256(c2).hexdigest()
+    (models_dir / "qwen3.6-27b.mq4").write_bytes(c1)
+    (models_dir / "qwen3.8-27b.mq4").write_bytes(c2)
+    home = tmp_path / "home"
+    home.mkdir()
+    repo = _make_repo_with_harness(tmp_path)
+    prompt_file = repo / "benchmarks" / "prompts" / "hw-gate" / "serve-battery.json"
+    prompt_file.parent.mkdir(parents=True)
+    prompt_file.write_text("[]")
+    fixtures_data = {
+        "schema": "hipfire.hw-gate.fixtures", "version": 2, "models_dir": str(models_dir),
+        "harness": {"battery_prompts": "benchmarks/prompts/hw-gate/serve-battery.json", "max_tokens": 256},
+        "fixtures": [{"tag": "qwen3.6:27b", "file": "qwen3.6-27b.mq4", "sha256": sha1, "size_bytes": len(c1), "arch_id": 5}],
+        "buckets": {"load": {"modes": ["battery"]}, "serve": {"modes": ["battery", "chain"]}, "kernel": {"modes": ["battery"], "redline": {"model_tag": "qwen3.6:27b", "harness_args": []}}}
+    }
+    fixtures_path = tmp_path / "fixtures.json"
+    fixtures_path.write_text(json.dumps(fixtures_data))
+    registry_data = {"models": {"qwen3.8:27b": {"file": "qwen3.8-27b.mq4", "sha256": sha2, "size_bytes": len(c2), "arch_id": 5}}, "aliases": {}}
+    registry_path = tmp_path / "registry.json"
+    registry_path.write_text(json.dumps(registry_data))
+    routes = [
+        {"mode": "battery", "tag": "qwen3.6:27b", "source": "bucket", "why": "mandatory"},
+        {"mode": "battery", "tag": "qwen3.8:27b", "source": "author", "why": "x"},
+        {"mode": "chain", "tag": "qwen3.8:27b", "source": "author", "why": "x"},
+    ]
+    routes_path = tmp_path / "routes.json"
+    routes_path.write_text(json.dumps(routes))
+    out = tmp_path / "hw-gate.json"
+    md = tmp_path / "hw-gate.md"
+    monkeypatch.setenv("HIPFIRE_HOME", str(home))
+    monkeypatch.setenv("HIPFIRE_MODELS_DIR", str(models_dir))
+    captured_modes = {}
+    def fake_harness(argv, **kwargs):
+        if argv[0] == "cargo":
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+        if "serve_harness.py" in " ".join(argv):
+            # extract tag via file name in argv
+            model_idx = argv.index("--model")
+            model_path = argv[model_idx+1]
+            tag = "unknown"
+            if "qwen3.6" in model_path:
+                tag = "qwen3.6:27b"
+            elif "qwen3.8" in model_path:
+                tag = "qwen3.8:27b"
+            mode_idx = argv.index("--mode")
+            mode = argv[mode_idx+1]
+            captured_modes.setdefault(tag, []).append(mode)
+            if "--out" in argv:
+                out_p = Path(argv[argv.index("--out")+1])
+                out_p.parent.mkdir(parents=True, exist_ok=True)
+                out_p.write_text(json.dumps([{"assistant_content": "ok", "expected_substrings": [], "attractor": False, "empty": False, "finish": "stop", "genre": "x", "ctx": 10, "cached": 0, "gen": 10, "ans_words": 1, "prefill_tok_s": 1.0, "decode_tok_s": 1.0}]))
+            if "--serve-log" in argv:
+                Path(argv[argv.index("--serve-log")+1]).parent.mkdir(parents=True, exist_ok=True)
+                Path(argv[argv.index("--serve-log")+1]).write_text("log")
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+        return subprocess.CompletedProcess(argv, 0, stdout="unknown", stderr="")
+    monkeypatch.setattr(run_mod, "run_cmd", fake_harness)
+    rc = run_mod.main(["--repo", str(repo), "--fixtures", str(fixtures_path), "--base", "a", "--head", "b", "--buckets", "load", "--device", "3", "--out", str(out), "--md", str(md), "--routes", str(routes_path), "--registry", str(registry_path), "--skip-build"])
+    assert rc == 0
+    data = json.loads(out.read_text())
+    # qwen3.6 should have only battery
+    q1 = next(f for f in data["fixtures"] if f["tag"] == "qwen3.6:27b")
+    assert set(q1["modes"].keys()) == {"battery"}
+    # qwen3.8 should have battery and chain
+    q2 = next(f for f in data["fixtures"] if f["tag"] == "qwen3.8:27b")
+    assert set(q2["modes"].keys()) == {"battery", "chain"}
+    # ensure harness called with correct modes
+    assert "battery" in captured_modes["qwen3.6:27b"] and "chain" not in captured_modes["qwen3.6:27b"]
+    assert set(captured_modes["qwen3.8:27b"]) == {"battery", "chain"}

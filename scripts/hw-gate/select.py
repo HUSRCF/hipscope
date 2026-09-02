@@ -7,7 +7,8 @@
 Pure and deterministic. No git, no network, no GPU. Reads changed paths from
 stdin (one per line, as `git diff --name-only BASE...HEAD` prints them) and
 classifies them by prefix/glob. The tables below are the whole policy; there
-is no rule engine and no per-route table.
+is no rule engine and no per-route table. Optionally parses an author's
+`<!-- hw-gate-request -->` block from `--pr-body`.
 
 CONTRACT
     stdin : changed paths, one per line
@@ -17,10 +18,14 @@ CONTRACT
           "needs_hw": bool,                 # any bucket other than none
           "buckets": ["load", "serve", "kernel"],   # sorted, deduplicated, may be []
           "policy_paths": ["..."],          # touched paths matching POLICY (never bot-approvable)
-          "exec_sensitive_paths": ["..."],  # build scripts, manifests, shell/python, CI: hardware needs a human label
+          "exec_sensitive_paths": ["..."],  # informational input to the reviewer (not a gate)
+          "request": {"routes":[{"mode":"battery"|"chain","tag":"..."}], "claim":"..."} | null,
+          "request_error": "..." | null,   # set when marker present but body malformed
           "surfaces": {"load": ["path", ...], "serve": [...], "kernel": [...], "policy": [...], "other": [...]}
         }
-    --github-output FILE : append `needs_hw=`, `buckets=`, `policy=`, `exec_sensitive=` (comma-joined) lines
+    --pr-body FILE : parse the first hw-gate-request JSON fence from the PR body
+    --github-output FILE : append `needs_hw=`, `buckets=`, `policy=`, `exec_sensitive=`,
+                           `request_present=` (true|false) lines
     exit 0 always on well-formed input; exit 2 on usage error
 
 BUCKET RULES (first match wins per path; a path may hit `policy` in addition)
@@ -38,8 +43,8 @@ BUCKET RULES (first match wins per path; a path may hit `policy` in addition)
 
     `serve` and `kernel` imply `load` (the fixtures must still load through the user route).
 
-EXEC-SENSITIVE (touching any of these => hardware runs only after a maintainer applies `hw-run`;
-    otherwise the reviewer's prelim `execution_risk.level == "none"` authorizes hardware on its own)
+EXEC-SENSITIVE (informational input to the reviewer seat; not a hardware gate —
+    Sol decides run_hardware; a maintainer's `hw-run` label only forces a run)
     **/build.rs, .cargo/**, Cargo.toml, Cargo.lock, crates/*/Cargo.toml, rust-toolchain*, .github/**,
     scripts/**, tools/**, **/*.sh, **/*.py, Makefile, justfile, Dockerfile*, flake.nix, nix/**
 
@@ -111,8 +116,8 @@ _LOAD_PATTERNS: list[str] = [
 
 # Paths whose change alters what the hardware job EXECUTES beyond the crate's
 # own Rust/HIP: build scripts, dependency manifests, shell/python that the
-# harnesses run, CI. A diff touching none of these, judged low-risk by the
-# reviewer's prelim, is authorized for hardware without a human label.
+# harnesses run, CI. Reported as informational input to the reviewer; not a
+# hardware gate on their own.
 _EXEC_SENSITIVE_PATTERNS: list[str] = [
     "**/build.rs",
     "build.rs",
@@ -155,6 +160,73 @@ def _normalize(p: str) -> str:
     if p == ".":
         return ""
     return p
+
+_REQUEST_MARKER = "<!-- hw-gate-request -->"
+_VALID_MODES = frozenset({"battery", "chain"})
+
+
+def parse_pr_request(body: str) -> tuple[dict | None, str | None]:
+    """Parse the first hw-gate-request block from a PR body.
+
+    Returns (request, request_error). Never raises on body content.
+    No marker => (None, None). Malformed => (None, reason).
+    """
+    if not body:
+        return None, None
+    # Normalize newlines so CRLF bodies match the same rules.
+    text = body.replace("\r\n", "\n").replace("\r", "\n")
+    idx = text.find(_REQUEST_MARKER)
+    if idx < 0:
+        return None, None
+    rest = text[idx + len(_REQUEST_MARKER) :]
+    # optional whitespace after the marker
+    rest = rest.lstrip(" \t\n")
+    fence = "```json"
+    if not rest.startswith(fence):
+        return None, "missing json fence after hw-gate-request marker"
+    rest = rest[len(fence) :]
+    # optional space on the opening fence line, then content until closing fence
+    if rest.startswith("\n"):
+        rest = rest[1:]
+    elif rest[:1].isspace() and "\n" in rest:
+        # ```json extra\n...
+        rest = rest.split("\n", 1)[1]
+    close = rest.find("```")
+    if close < 0:
+        return None, "unclosed json fence"
+    raw = rest[:close].strip()
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        return None, f"invalid JSON: {exc.msg}"
+    return _normalize_request(data)
+
+
+def _normalize_request(data: object) -> tuple[dict | None, str | None]:
+    if not isinstance(data, dict):
+        return None, "request must be a JSON object"
+    routes = data.get("routes")
+    if not isinstance(routes, list):
+        return None, "routes must be a list"
+    normalized: list[dict] = []
+    for i, item in enumerate(routes):
+        if not isinstance(item, dict):
+            return None, f"routes[{i}] must be an object"
+        mode = item.get("mode")
+        tag = item.get("tag")
+        if mode not in _VALID_MODES:
+            return None, f"routes[{i}].mode must be 'battery' or 'chain'"
+        if not isinstance(tag, str) or not tag.strip():
+            return None, f"routes[{i}].tag must be a non-empty string"
+        normalized.append({"mode": mode, "tag": tag})
+    if "claim" not in data:
+        claim = ""
+    else:
+        claim = data["claim"]
+        if not isinstance(claim, str):
+            return None, "claim must be a string"
+    return {"routes": normalized, "claim": claim}, None
+
 
 
 def _matches(path: str, patterns: list[str]) -> bool:
@@ -255,17 +327,30 @@ def classify(paths: list[str]) -> dict:
         "buckets": sorted_buckets,
         "policy_paths": policy_paths,
         "exec_sensitive_paths": exec_sensitive_paths,
+        "request": None,
+        "request_error": None,
         "surfaces": surfaces,
     }
-
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     ap.add_argument("--json", help="also write the result here")
-    ap.add_argument("--github-output", help="append needs_hw=/buckets=/policy= lines here")
+    ap.add_argument("--github-output", help="append needs_hw=/buckets=/policy=/request_present= lines here")
+    ap.add_argument("--pr-body", help="PR body file; parse first hw-gate-request JSON fence")
     args = ap.parse_args(argv)
     paths = [line.strip() for line in sys.stdin if line.strip()]
     result = classify(paths)
+    if args.pr_body is not None:
+        try:
+            with open(args.pr_body, encoding="utf-8") as fh:
+                body = fh.read()
+        except OSError as exc:
+            # File access is a usage/runtime issue; body content never raises.
+            print(f"select.py: cannot read --pr-body: {exc}", file=sys.stderr)
+            return 2
+        request, request_error = parse_pr_request(body)
+        result["request"] = request
+        result["request_error"] = request_error
     text = json.dumps(result, indent=2, sort_keys=True)
     print(text)
     if args.json:
@@ -277,6 +362,8 @@ def main(argv: list[str] | None = None) -> int:
             fh.write(f"buckets={','.join(result['buckets'])}\n")
             fh.write(f"policy={','.join(result['policy_paths'])}\n")
             fh.write(f"exec_sensitive={','.join(result['exec_sensitive_paths'])}\n")
+            present = "true" if result.get("request") is not None else "false"
+            fh.write(f"request_present={present}\n")
     return 0
 
 

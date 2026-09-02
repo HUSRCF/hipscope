@@ -13,7 +13,7 @@ hw-gate selects hardware routes from the diff (`scripts/hw-gate/select.py`); tic
 - [ ] `crates/hipfire-quantize` / quant formats (update `docs/quant-formats/qt-register.txt`)
 - [ ] control plane — `hipfire-cli`, `hipfire-client`, `hipfire-tui`
 - [ ] docs / CI / scripts only (no hardware route)
-- [ ] **policy files** — `.github/workflows/`, `CODEOWNERS`, `scripts/hw-gate/`, `leanup-thresholds.txt`, `layering.txt`, `registry/` (always needs a human; the bot can never greenlight these)
+- [ ] **policy files** — `.github/workflows/`, `CODEOWNERS`, `scripts/hw-gate/`, `leanup-thresholds.txt`, `layering.txt`, `registry/` (hard floor: no seat can merge these; a human does)
 
 ## Test plan
 
@@ -32,20 +32,32 @@ paste the harness --out JSON here (per-turn rows with assistant_content, attract
 
 </details>
 
+## Hardware validation request (optional)
+
+Tell the gate which registry artifacts prove your change, and what you claim. Sol reads the claim as a claim and runs the routes you name (tags must exist on the runner; unknown or absent tags are reported, not failed). Leave the block out and the gate runs the mandatory fixtures for the surfaces you touched.
+
+<!-- hw-gate-request -->
+```json
+{
+  "routes": [
+    {"mode": "battery", "tag": "qwen3.6:27b"},
+    {"mode": "chain",   "tag": "ornith-1.5:35b-a3b-mq4r"}
+  ],
+  "claim": "loads the Qwen3.5-family text artifacts; no regression on the load path"
+}
+```
+
 ## How this merges (hw-gate)
 
-`hw-gate` is the required CI check. Docs-only diffs pass immediately. Anything touching a hardware surface follows this flow:
+Two model seats, one human owner. Every decision is announced on the PR.
 
-1. **The reviewer model reads the diff first** (read-only, no execution) and posts a **prelim** comment: surfaces, suspected regressions, extra routes it wants. Skipped on drafts.
-2. **Hardware is authorized automatically** when the author is a repo member, or when the diff touches no build script / manifest / shell / python / CI path and the prelim judged `execution_risk: none`. Otherwise a maintainer applies **`hw-run`** (the label always authorizes; it is removed after every run and cleared on every push).
-3. **The runner builds this PR and drives every pinned fixture** (`scripts/hw-gate/fixtures.json`) through `serve_harness.py` — battery for load changes, battery + chain for serve changes, plus Redline parity for kernel changes. Every turn's decoded text is posted verbatim in the **evidence** comment. A missing or mismatched fixture, an attractor, an empty or runaway turn, or a missed expect-substring fails the gate.
-4. **The reviewer model posts its verdict** (`greenlight` / `needs-human` / `block`) inside a script-enforced floor (`scripts/hw-gate/review.py`). Its review is informational; the `hw-gate` status carries the decision:
-   - `greenlight` → check green.
-   - `needs-human` → check red until a maintainer who has **read the evidence and verdict** applies `human-reviewed`. Cleared on every push.
-   - `block` → check red; only a new commit clears it.
-5. **Everyone reads the decoded text.** A green check alone is not review. Numbers never prove coherence.
+1. **Sol reads the diff** (read-only) and decides whether your code runs on the maintainer's hardware and which routes run — the mandatory fixtures for the surfaces you touched, plus the routes you requested, plus any Sol adds. Only Sol decides this; a maintainer's `hw-run` label can force a run, nothing can silently block one. Skipped on drafts.
+2. **Hardware runs**: the PR is built and every route is driven through `serve_harness.py` on gfx1201. Every turn's decoded text is posted verbatim in the evidence comment. A missing or mismatched pinned fixture, an attractor, an empty turn, or a missed expect-substring is a failure.
+3. **Sol's verdict**: `greenlight` / `needs-human` / `block` on diff + evidence, with regressions cited by `file:line` and fixture. Sol never merges.
+4. **Fable decides**: `merge-staging` / `hold` / `block`. Fable may veto a greenlight or override a needs-human, and says why. On `merge-staging` Fable merges your head into **`beta`** (staging); `master` is promoted by the maintainer. Neither seat can override the hard floor: a failed fixture, an attractor, a policy-file change, or an unlabelled `RATCHET-RAISE`.
+5. **The `hw-gate` status** is green only on `merge-staging`; `hold` turns green when a maintainer applies `human-reviewed`; `block` clears only with a new commit.
 
-Route policy: [`docs/VALIDATION.md`](../docs/VALIDATION.md) § hw-gate. `python3 -m tools.change_gate` is optional local planning and is **not** CI evidence; the retired `scripts/coherence-gate*.sh` batteries no longer exist.
+The seats act as `hipfire-sol[bot]` and `hipfire-fable[bot]`. Route policy: [`docs/VALIDATION.md`](../docs/VALIDATION.md) § hw-gate. `python3 -m tools.change_gate` is optional local planning and is **not** CI evidence; the retired `scripts/coherence-gate*.sh` batteries no longer exist.
 
 ## Architecture-trait change?
 
