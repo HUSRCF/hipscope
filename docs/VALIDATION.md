@@ -104,13 +104,30 @@ harness-side timings (HTTP streaming, sampling) and run well under
 `hipfire bench`; they are context, never a performance claim. Perf claims go
 through [`docs/methodology/perf-benchmarking.md`](methodology/perf-benchmarking.md).
 
-### Seat 2 — Fable decides the merge
+### Seat 2 — Fable investigates and decides the merge
 
-Fable (`anthropic/claude-fable-5`) reads the diff, the evidence, and Sol's
-verdict and returns `merge-staging` / `hold` / `block`, with an announcement
-written for the author. Fable may veto Sol's greenlight or override Sol's
-needs-human, and must say why; overrides are recorded in the decision so the
-maintainer can audit both seats against outcomes.
+Fable (`anthropic/claude-fable-5-1`, thinking `xhigh`) reads the diff, the
+evidence, and Sol's verdict — and then, when that evidence does not prove the
+change, goes and gets the evidence itself. It runs with a real shell in a
+sandboxed checkout of the PR head on the hardware host: every hiptrx GPU is
+reserved for the session (a host-level lock serializes Fable sessions and
+excludes the lane runs), the PR and the base branch are both built for A/B,
+every registry artifact on the host is available read-only, and everything
+Fable writes to `$HW_GATE_EVIDENCE` is uploaded with its decision. There is
+no fixed route vocabulary: Fable chooses what proves the change — a
+multi-GPU load for new topology code, a refused-load-then-generate sequence
+for a moved refusal, Redline parity for a kernel, a base-vs-PR A/B for a
+"no behavior change" refactor. The sandbox bounds reach, not judgment: no
+network, no writes outside its home/evidence/build tree, no other GPUs, no
+credentials, no `gh` (the script posts), a wall-clock budget
+(`HW_GATE_MAX_MINUTES`, default 45), and only registry artifacts.
+
+Fable returns `merge-staging` / `hold` / `block` with an `investigation`
+table (question → route run → evidence file → result), an `unproven` list for
+what this host could not exercise, and an announcement written for the
+author. It may veto Sol's greenlight or override Sol's needs-human — expected
+when it closed the gap itself — and must say why; overrides are recorded so
+the maintainer can audit both seats against outcomes.
 
 **Probation.** While the two-seat rung is on probation, `merge-staging` means
 Fable merges the PR head into **`beta`** (the staging branch) under its own

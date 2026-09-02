@@ -9,9 +9,11 @@
 #                the self-hosted gfx1201 runner, post every decoded turn
 #   sol-verdict  Sol reads diff + evidence: greenlight / needs-human / block.
 #                Sol never merges.
-#   fable-decide Fable reads everything including Sol's verdict and decides:
-#                merge-staging / hold / block. May veto or override Sol with a
-#                stated reason. During probation "merge" means the `beta`
+#   fable-decide Fable reads everything including Sol's verdict, then runs
+#                whatever routes it judges necessary in a sandboxed PR
+#                worktree on the hardware (all hiptrx GPUs reserved, base
+#                branch built for A/B), and decides: merge-staging / hold /
+#                block. May veto or override Sol with a stated reason. During probation "merge" means the `beta`
 #                staging branch; `master` stays human-owned.
 #   hw-gate      the required status: green only on merge-staging.
 #
@@ -222,11 +224,13 @@ jobs:
         with:
           name: hw-gate-prelim
           path: prelim
-      - name: Run routes
+      - name: "Run routes (shared GPU lock: coexists with other lanes, excludes a Fable session)"
         run: |
           set -euo pipefail
           routes=""
           [ -f prelim/routes.json ] && routes="--routes prelim/routes.json"
+          exec 9>/home/kaden/actions-runner/_cache/hw-gate-gpu.lock
+          flock --shared --timeout 3600 9
           python3 base/scripts/hw-gate/run.py \
             --repo pr \
             --fixtures base/scripts/hw-gate/fixtures.json \
@@ -314,11 +318,22 @@ jobs:
           path: verdict.json
 
   fable-decide:
-    name: fable · decide
+    # Fable investigates on the hardware host with a real shell in a sandboxed
+    # PR worktree: every hiptrx GPU is reserved for it (a host-level lock
+    # serializes Fable sessions), the base branch is built alongside for A/B,
+    # and everything it writes to $HW_GATE_EVIDENCE is uploaded. It cannot
+    # reach GitHub or credentials from inside the session; review.py posts.
+    name: fable · investigate + decide
     needs: [select, sol-prelim, hw-run, sol-verdict]
     if: always() && needs.select.result == 'success' && needs.select.outputs.needs_hw == 'true' && needs.select.outputs.run_hw == 'true' && (needs.sol-prelim.outputs.run_hardware == 'true' || needs.select.outputs.forced == 'true')
     runs-on: [self-hosted, hiptrx, gfx1201]
-    timeout-minutes: 30
+    timeout-minutes: 75
+    env:
+      HIPFIRE_MODELS_DIR: /home/kaden/.hipfire/models
+      CARGO_TARGET_DIR: /home/kaden/actions-runner/_cache/hw-gate-target
+      CARGO_TARGET_DIR_BASE: /home/kaden/actions-runner/_cache/hw-gate-target-base
+      HW_GATE_DEVICES: "0,1,2,3,4"
+      HW_GATE_MAX_MINUTES: "45"
     steps:
       - uses: actions/create-github-app-token@v1
         id: token
@@ -331,12 +346,17 @@ jobs:
         with:
           path: base
           fetch-depth: 0
-      - name: PR head checkout (read-only for the decider)
+      - name: PR head checkout (Fable's sandbox)
         uses: actions/checkout@v4
         with:
           ref: ${{ needs.select.outputs.head_sha }}
           path: pr
           fetch-depth: 0
+      - name: Build PR head and base branch
+        run: |
+          set -euo pipefail
+          (cd pr && cargo build --release 2>&1 | tail -2)
+          (cd base && CARGO_TARGET_DIR="$CARGO_TARGET_DIR_BASE" cargo build --release 2>&1 | tail -2)
       - uses: actions/download-artifact@v4
         continue-on-error: true
         with:
@@ -363,12 +383,15 @@ jobs:
         with:
           name: hw-gate-verdict
           path: evidence
-      - name: Fable decides
+      - name: "Fable investigates and decides (exclusive GPU lock: all five devices)"
         env:
           GH_TOKEN: ${{ steps.token.outputs.token || github.token }}
         run: |
           set -euo pipefail
-          python3 base/scripts/hw-gate/review.py --phase decide --seat fable \
+          mkdir -p fable-evidence fable-home
+          exec 9>/home/kaden/actions-runner/_cache/hw-gate-gpu.lock
+          flock --exclusive --timeout 3600 9
+          python3 base/scripts/hw-gate/review.py --phase decide --seat fable --investigate \
             --repo "$GITHUB_REPOSITORY" --pr "$PR_NUMBER" \
             --base "${{ needs.select.outputs.base_sha }}" \
             --head "${{ needs.select.outputs.head_sha }}" \
@@ -379,13 +402,20 @@ jobs:
             --verdict evidence/verdict.json \
             --hw-run-result "${{ needs.hw-run.result }}" \
             --staging "$HW_GATE_STAGING" \
+            --devices "$HW_GATE_DEVICES" \
+            --home "$PWD/fable-home" \
+            --evidence-dir "$PWD/fable-evidence" \
+            --bin "$CARGO_TARGET_DIR/release" \
+            --base-bin "$CARGO_TARGET_DIR_BASE/release" \
             --system-prompt base/scripts/hw-gate/fable.md \
             --out decision.json
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: hw-gate-decision
-          path: decision.json
+          path: |
+            decision.json
+            fable-evidence/
 
   hw-gate:
     # The required status. Deterministic: it reads the recorded decision for

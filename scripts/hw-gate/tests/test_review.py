@@ -4,6 +4,7 @@
 
 import importlib.util
 import json
+import pytest
 import os
 import subprocess
 import sys
@@ -546,7 +547,7 @@ def _run_decide(tmp: Path, select_extra: dict | None = None, evidence_extra: dic
     env["FAKE_GH_COMMENTS"] = str(gh_comments)
     if merge_409:
         env["FAKE_GH_MERGE_409"] = "1"
-    env["HW_GATE_DECIDE_MODEL"] = "claude-fable-5"
+    env["HW_GATE_DECIDE_MODEL"] = "claude-fable-5-1"
     cmd = [sys.executable, str(REVIEW_PATH),"--seat","fable","--phase","decide","--repo","o/r","--pr","1","--base",base,"--head",head,"--checkout",str(checkout),"--select",str(select_path),"--prelim",str(prelim_path),"--evidence",str(evidence_path),"--verdict",str(verdict_path),"--hw-run-result",hw_run_result,"--staging","beta","--system-prompt",str(system_prompt),"--out",str(out_path)]
     result = subprocess.run(cmd, env=env, capture_output=True, text=True)
     return result, out_path, gh_log, gh_comments, omp_log, base, head, checkout
@@ -588,7 +589,7 @@ def test_decide_override_needs_human_to_merge():
     assert any("--approve" in " ".join(a) for a in gh_calls if a[:2]==["pr","review"])
     # omp model should be fable
     omp_calls = [json.loads(l)["args"] for l in omp_log.read_text().splitlines() if l.strip()]
-    assert any("claude-fable-5" in " ".join(a) for a in omp_calls)
+    assert any("claude-fable-5-1" in " ".join(a) for a in omp_calls)
 
 def test_decide_veto_greenlight_to_hold():
     tmp = Path(tempfile.mkdtemp())
@@ -701,3 +702,79 @@ def test_fable_unavailable_hold_exit1():
     data = json.loads(out_path.read_text())
     assert data["decision_final"] == "hold"
     assert data["decision"] is None
+
+
+# ---------------------------------------------------------------------------
+# investigate mode: the sandbox env is the security boundary
+# ---------------------------------------------------------------------------
+
+def _investigate_args(tmp, **over):
+    class A: pass
+    a = A()
+    a.devices = over.get("devices", "0,1,2,3,4")
+    a.home = str(tmp / "home")
+    a.evidence_dir = str(tmp / "ev")
+    a.bin = str(tmp / "bin")
+    a.base_bin = over.get("base_bin", str(tmp / "base-bin"))
+    a.round = over.get("round", 1)
+    a.base = "basesha"
+    return a
+
+
+def test_investigate_env_is_an_allow_list_and_strips_credentials(monkeypatch, tmp_path):
+    monkeypatch.setenv("HIPFIRE_MODELS_DIR", str(tmp_path / "models"))
+    monkeypatch.setenv("GH_TOKEN", "ghs_secret")
+    monkeypatch.setenv("GITHUB_TOKEN", "ghs_secret2")
+    monkeypatch.setenv("HW_GATE_SOL_PRIVATE_KEY", "-----BEGIN")
+    monkeypatch.setenv("HW_GATE_FABLE_APP_ID", "123")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-x")
+    monkeypatch.setenv("SOME_SECRET", "x")
+    monkeypatch.setenv("AWS_SESSION_TOKEN", "x")
+    monkeypatch.setenv("RANDOM_UNRELATED_VAR", "x")
+    monkeypatch.setenv("HSA_OVERRIDE_GFX_VERSION", "12.0.1")
+    monkeypatch.setenv("HW_GATE_MAX_MINUTES", "7")
+    env, minutes = review._build_investigate_env(_investigate_args(tmp_path))
+    for forbidden in ("GH_TOKEN", "GITHUB_TOKEN", "HW_GATE_SOL_PRIVATE_KEY", "HW_GATE_FABLE_APP_ID",
+                      "OPENAI_API_KEY", "SOME_SECRET", "AWS_SESSION_TOKEN", "RANDOM_UNRELATED_VAR"):
+        assert forbidden not in env, forbidden
+    assert env["HW_GATE_DEVICES"] == "0,1,2,3,4" and env["HIP_VISIBLE_DEVICES"] == "0,1,2,3,4"
+    assert env["HIPFIRE_MODELS_DIR"] == str(tmp_path / "models")
+    assert env["HIPFIRE_HOME"] == str(tmp_path / "home") and (tmp_path / "home").is_dir()
+    assert env["HW_GATE_EVIDENCE"] == str(tmp_path / "ev") and (tmp_path / "ev").is_dir()
+    assert env["HW_GATE_BIN"] == str(tmp_path / "bin") and env["HW_GATE_BASE_BIN"] == str(tmp_path / "base-bin")
+    assert env["HW_GATE_BASE_SHA"] == "basesha" and env["HW_GATE_ROUND"] == "1" and env["HW_GATE_MAX_MINUTES"] == "7"
+    assert env["HSA_OVERRIDE_GFX_VERSION"] == "12.0.1"
+    assert minutes == "7"
+
+
+def test_investigate_env_requires_models_dir_and_devices(monkeypatch, tmp_path):
+    monkeypatch.delenv("HIPFIRE_MODELS_DIR", raising=False)
+    with pytest.raises(review.ReviewError, match="HIPFIRE_MODELS_DIR"):
+        review._build_investigate_env(_investigate_args(tmp_path))
+    monkeypatch.setenv("HIPFIRE_MODELS_DIR", str(tmp_path))
+    with pytest.raises(review.ReviewError, match="devices"):
+        review._build_investigate_env(_investigate_args(tmp_path, devices=""))
+    env, _ = review._build_investigate_env(_investigate_args(tmp_path, base_bin=None))
+    assert "HW_GATE_BASE_BIN" not in env
+
+
+def test_investigate_omp_argv_has_full_tools_and_xhigh(monkeypatch, tmp_path):
+    """The investigate invocation must not restrict tools and must run at xhigh with the budget."""
+    captured = {}
+    def fake_run(cmd, **kw):
+        captured["cmd"] = cmd; captured["env"] = kw.get("env")
+        class R: returncode, stdout, stderr = 0, "", ""
+        return R()
+    monkeypatch.setattr(review.subprocess, "run", fake_run)
+    monkeypatch.setenv("HIPFIRE_MODELS_DIR", str(tmp_path))
+    monkeypatch.setenv("GH_TOKEN", "ghs_secret")
+    env, minutes = review._build_investigate_env(_investigate_args(tmp_path))
+    try:
+        review.omp_investigate("prompt text", str(tmp_path / "fable.md"), str(tmp_path), "claude-fable-5-1", env, minutes)
+    except review.ReviewError:
+        pass  # empty stdout => no decision; we only inspect the invocation here
+    cmd = captured["cmd"]
+    assert not any(a.startswith("--tools") for a in cmd), cmd
+    assert "--thinking" in cmd and cmd[cmd.index("--thinking") + 1] == "xhigh"
+    assert cmd[cmd.index("--max-time") + 1] == f"{minutes}m"
+    assert "GH_TOKEN" not in captured["env"] and captured["env"]["HW_GATE_DEVICES"] == "0,1,2,3,4"

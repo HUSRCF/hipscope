@@ -7,6 +7,7 @@
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 def _emit(assistant_text: str):
@@ -26,6 +27,22 @@ def _emit(assistant_text: str):
 
 def main():
     args = sys.argv[1:]
+    # Dump env keys if requested (for investigate mode tests)
+    env_dump_path = os.environ.get("FAKE_OMP_ENV_DUMP")
+    if env_dump_path:
+        try:
+            Path(env_dump_path).parent.mkdir(parents=True, exist_ok=True)
+            with open(env_dump_path, "w", encoding="utf-8") as f:
+                json.dump({"keys": sorted(os.environ.keys()), "env": dict(os.environ)}, f, indent=2, sort_keys=True)
+        except Exception:
+            pass
+    # Simulate sleep for timeout tests
+    sleep_val = os.environ.get("FAKE_OMP_SLEEP")
+    if sleep_val:
+        try:
+            time.sleep(float(sleep_val))
+        except Exception:
+            pass
     log_path = os.environ.get("FAKE_OMP_LOG")
     if log_path:
         try:
@@ -69,9 +86,21 @@ def main():
                 elif entry.get("prose"):
                     text = "Sure, here it is: " + text + " hope that helps."
                 _emit(text)
+                exit_code_val2 = os.environ.get("FAKE_OMP_EXIT_CODE")
+                if exit_code_val2 not in (None, ""):
+                    try:
+                        sys.exit(int(exit_code_val2))
+                    except ValueError:
+                        sys.exit(1)
                 sys.exit(0)
             elif "text" in entry:
                 _emit(entry["text"])
+                exit_code_val2 = os.environ.get("FAKE_OMP_EXIT_CODE")
+                if exit_code_val2 not in (None, ""):
+                    try:
+                        sys.exit(int(exit_code_val2))
+                    except ValueError:
+                        sys.exit(1)
                 sys.exit(0)
         except Exception as e:
             sys.stderr.write(f"fake_omp response load failed: {e}\n")
@@ -124,6 +153,13 @@ def main():
             obj["decision"] = override
             text = json.dumps(obj)
     _emit(text)
+    # Honor explicit exit code after emitting (so investigation can be parsed even on failure)
+    exit_code_val = os.environ.get("FAKE_OMP_EXIT_CODE")
+    if exit_code_val not in (None, ""):
+        try:
+            sys.exit(int(exit_code_val))
+        except ValueError:
+            sys.exit(1)
     sys.exit(0)
 
 if __name__ == "__main__":

@@ -17,7 +17,7 @@ CONTRACT
     prelim: review.py --seat sol --phase prelim --repo R --pr N --base SHA --head SHA --checkout DIR --select select.json --fixtures fixtures.json --system-prompt sol.md --out prelim.json --routes routes.json
     verdict: review.py --seat sol --phase verdict --repo R --pr N --base SHA --head SHA --checkout DIR --select select.json --prelim prelim.json --evidence hw-gate.json --hw-run-result success|failure|... --system-prompt sol.md --out verdict.json
     decide: review.py --seat fable --phase decide --repo R --pr N --base SHA --head SHA --checkout DIR --select select.json --prelim prelim.json --evidence hw-gate.json --verdict verdict.json --hw-run-result ... --staging beta --system-prompt fable.md --out decision.json
-    env: HW_GATE_REVIEW_MODEL (default gpt-5.6-sol) for sol, HW_GATE_DECIDE_MODEL (default claude-fable-5) for fable,
+    env: HW_GATE_REVIEW_MODEL (default gpt-5.6-sol) for sol, HW_GATE_DECIDE_MODEL (default claude-fable-5-1) for fable,
          HIPFIRE_MODELS_DIR, HW_GATE_OMP_BIN, HW_GATE_GH_BIN.
     prelim.json: {"schema":"hipfire.hw-gate.prelim","version":2,"seat":"sol","model":..,"prelim":{...}|null,"run_hardware":bool,"posted":{...}}
     routes.json: [{"mode":"battery"|"chain","tag":"registry:tag","source":"bucket"|"author"|"sol","why":".."}]
@@ -290,6 +290,198 @@ def omp_review(phase: str, prompt: str, system_prompt: str, checkout: str, model
             raise ReviewError(last_error)
         return obj
     raise ReviewError(last_error or f"omp {phase} failed after retry")
+def _is_credential_env_key(key: str) -> bool:
+    """Whether env key looks like a credential and must be stripped."""
+    if key in ("GH_TOKEN", "GITHUB_TOKEN"):
+        return True
+    if key.endswith("_TOKEN") or key.endswith("_KEY") or key.endswith("_SECRET"):
+        return True
+    # HW_GATE_*_PRIVATE_KEY and HW_GATE_*_APP_ID are already covered by _KEY / _APP_ID,
+    # but be explicit for APP_ID which ends with _APP_ID not _ID.
+    if key.startswith("HW_GATE_") and (key.endswith("_PRIVATE_KEY") or key.endswith("_APP_ID")):
+        return True
+    return False
+
+
+def _build_investigate_env(args) -> tuple[dict, str]:
+    """Build sandboxed env for omp investigate mode. Returns (env_dict, max_minutes_str)."""
+    devices = getattr(args, "devices", None)
+    if not devices:
+        raise ReviewError("missing --devices for --investigate (HW_GATE_DEVICES)")
+    home = getattr(args, "home", None)
+    if not home:
+        raise ReviewError("missing --home for --investigate (HIPFIRE_HOME)")
+    evidence_dir = getattr(args, "evidence_dir", None)
+    if not evidence_dir:
+        raise ReviewError("missing --evidence-dir for --investigate (HW_GATE_EVIDENCE)")
+    bin_path = getattr(args, "bin", None)
+    if not bin_path:
+        raise ReviewError("missing --bin for --investigate (HW_GATE_BIN)")
+    models_dir = os.environ.get("HIPFIRE_MODELS_DIR")
+    if not models_dir:
+        raise ReviewError("missing HIPFIRE_MODELS_DIR for --investigate")
+    base_bin = getattr(args, "base_bin", None)
+    round_val = getattr(args, "round", 1)
+    if round_val is None:
+        round_val = 1
+    max_minutes = os.environ.get("HW_GATE_MAX_MINUTES", "45")
+    # create dirs
+    try:
+        Path(home).mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        raise ReviewError(f"failed to create HIPFIRE_HOME {home}: {e}")
+    try:
+        Path(evidence_dir).mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        raise ReviewError(f"failed to create HW_GATE_EVIDENCE {evidence_dir}: {e}")
+    child: dict[str, str] = {}
+    # allow-list: PATH, HOME, LANG, TERM, USER, ROCM_PATH
+    for k in ("PATH", "HOME", "LANG", "TERM", "USER", "ROCM_PATH"):
+        if k in os.environ:
+            child[k] = os.environ[k]
+    # ROCm/HIP vars
+    for k, v in os.environ.items():
+        if k.startswith("HSA_") or k.startswith("HIP_"):
+            child[k] = v
+    # HW_GATE_* and HIPFIRE_*
+    for k, v in os.environ.items():
+        if k.startswith("HW_GATE_") or k.startswith("HIPFIRE_"):
+            child[k] = v
+    # Propagate FAKE_OMP_* / FAKE_GH_* for test harness (not part of allow-list but needed for tests)
+    for k, v in os.environ.items():
+        if k.startswith("FAKE_OMP_") or k.startswith("FAKE_GH_"):
+            child[k] = v
+    # required overrides
+    child["HW_GATE_DEVICES"] = devices
+    child["HIP_VISIBLE_DEVICES"] = devices
+    child["HIPFIRE_MODELS_DIR"] = models_dir
+    child["HIPFIRE_HOME"] = home
+    child["HW_GATE_EVIDENCE"] = evidence_dir
+    child["HW_GATE_BIN"] = bin_path
+    if base_bin:
+        child["HW_GATE_BASE_BIN"] = base_bin
+    else:
+        child.pop("HW_GATE_BASE_BIN", None)
+    child["HW_GATE_BASE_SHA"] = args.base
+    child["HW_GATE_ROUND"] = str(round_val)
+    child["HW_GATE_MAX_MINUTES"] = str(max_minutes)
+    # strip credentials
+    for k in list(child.keys()):
+        if _is_credential_env_key(k):
+            child.pop(k, None)
+    return child, str(max_minutes)
+
+
+def omp_investigate(prompt: str, system_prompt: str, checkout: str, model: str, child_env: dict, max_minutes: str):
+    """Run Fable's investigation session: full tool set (no --tools), thinking xhigh,
+    a wall-clock budget, and ONLY the sandboxed env. Returns the CompletedProcess;
+    raises subprocess.TimeoutExpired past the budget (plus a grace minute)."""
+    omp_bin = os.environ.get("HW_GATE_OMP_BIN", "omp")
+    with tempfile.NamedTemporaryFile("w", suffix="-hw-gate-decide.md", delete=False, encoding="utf-8") as fh:
+        fh.write(prompt)
+        prompt_path = fh.name
+    cmd = [
+        omp_bin, "-p", "--mode", "json", "--auto-approve",
+        "--cwd", checkout,
+        "--model", model,
+        "--system-prompt", system_prompt,
+        "--max-time", f"{max_minutes}m",
+        "--thinking", "xhigh",
+        f"@{prompt_path}",
+    ]
+    try:
+        minutes = int(str(max_minutes).strip().rstrip("m"))
+    except ValueError:
+        minutes = 45
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, cwd=checkout, env=child_env, timeout=max(1, minutes + 1) * 60)
+    finally:
+        try:
+            os.unlink(prompt_path)
+        except OSError:
+            pass
+
+
+def _parse_omp_stdout(stdout: str) -> tuple[str | None, dict | None]:
+    """Extract last assistant text and parsed JSON object from omp JSONL stdout."""
+    last_text: str | None = None
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            evt = json.loads(line)
+        except Exception:
+            continue
+        if evt.get("type") == "message_end":
+            msg = evt.get("message", {})
+            if msg.get("role") == "assistant":
+                parts = msg.get("content", [])
+                texts: list[str] = []
+                for p in parts:
+                    if isinstance(p, dict) and p.get("type") == "text":
+                        texts.append(p.get("text", ""))
+                last_text = "".join(texts)
+    if last_text is None:
+        return None, None
+    obj = extract_json(last_text)
+    return last_text, obj
+
+
+def _list_registry_fixtures(checkout: str, models_dir: str) -> list[tuple[str, str]]:
+    """List (tag, file) for registry models present under models_dir."""
+    registry_path = Path(checkout) / "registry" / "v1.json"
+    if not registry_path.is_file():
+        return []
+    try:
+        data = json.loads(registry_path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    models = data.get("models", {}) if isinstance(data, dict) else {}
+    if not isinstance(models, dict):
+        return []
+    present: list[tuple[str, str]] = []
+    base = Path(models_dir).expanduser()
+    for tag, info in models.items():
+        if not isinstance(info, dict):
+            continue
+        f = info.get("file")
+        if not f:
+            continue
+        p = base / f
+        try:
+            if p.is_file():
+                present.append((tag, f))
+        except Exception:
+            continue
+    # also handle aliases? spec says tag -> file, so models keys already tags.
+    present.sort(key=lambda x: x[0])
+    return present
+
+
+def _build_investigate_prompt_addon(checkout: str, child_env: dict, registry_present: list[tuple[str, str]]) -> str:
+    """Build prompt addon that tells Fable sandbox values and available fixtures."""
+    lines: list[str] = []
+    lines.append("Sandbox for this investigation (exact env values for this session):")
+    # order per spec
+    for key in ("HW_GATE_DEVICES", "HIP_VISIBLE_DEVICES", "HIPFIRE_MODELS_DIR", "HIPFIRE_HOME", "HW_GATE_EVIDENCE", "HW_GATE_BIN", "HW_GATE_BASE_BIN", "HW_GATE_BASE_SHA", "HW_GATE_ROUND", "HW_GATE_MAX_MINUTES"):
+        if key in child_env:
+            lines.append(f"- {key}={child_env[key]}")
+        elif key == "HW_GATE_BASE_BIN":
+            lines.append(f"- {key}=(not set)")
+        else:
+            lines.append(f"- {key}=(missing)")
+    lines.append(f"- checkout cwd={checkout}")
+    lines.append("")
+    lines.append("Available registry fixtures present under $HIPFIRE_MODELS_DIR (tag -> file):")
+    if registry_present:
+        for tag, f in registry_present:
+            lines.append(f"- {tag} -> {f}")
+    else:
+        lines.append("(none present)")
+    return "\n".join(lines)
+
+
 
 
 def _git(args: list[str], checkout: str) -> str:
@@ -1058,15 +1250,11 @@ def _run_decide(args) -> int:
         try:
             with open(args.verdict, "r", encoding="utf-8") as f:
                 sol_verdict_file = json.load(f)
-                # sol_verdict_file has "verdict" and "floor"
                 sol_verdict_data = sol_verdict_file.get("verdict")
                 sol_floor = sol_verdict_file.get("floor", {})
                 sol_final = sol_floor.get("final_decision") if isinstance(sol_floor, dict) else None
-                # fallback: if sol_verdict_data has decision
                 if sol_final is None and isinstance(sol_verdict_data, dict):
-                    # map decision to final? But use model decision
                     sol_final = sol_verdict_data.get("decision")
-                    # map greenlight->greenlight etc. but keep as is for override detection
                     if sol_final == "greenlight":
                         sol_final = "greenlight"
                     elif sol_final == "needs-human":
@@ -1076,47 +1264,161 @@ def _run_decide(args) -> int:
         except Exception:
             sol_verdict_data = None
             sol_final = None
-    # hw_run_result, staging, commit messages
     hw_run_result = args.hw_run_result if args.hw_run_result else "success"
     staging = args.staging if args.staging else "beta"
     commit_messages = _load_commit_messages(args.checkout, args.base, args.head)
-
-    model = os.environ.get("HW_GATE_DECIDE_MODEL", "claude-fable-5")
-
-    # Compute hard/soft floor first
+    model = os.environ.get("HW_GATE_DECIDE_MODEL", "claude-fable-5-1")
     hard = hard_floor(evidence, select, hw_run_result, commit_messages)
-    # soft from sol verdict
     soft_model_decision = None
     if isinstance(sol_verdict_data, dict):
         soft_model_decision = sol_verdict_data.get("decision")
     else:
-        # try sol_floor model_decision
         if isinstance(sol_floor, dict):
             soft_model_decision = sol_floor.get("model_decision")
     soft = soft_floor(sol_verdict_data, soft_model_decision)
-
-    # Also include Sol's final needs-human? If sol_final == needs-human, that's already soft via model_needs_human, but soft already includes.
-    # Build decide prompt
     try:
         decide_prompt = build_decide_prompt(select, prelim_data, evidence, sol_verdict_file, hard, args.checkout, args.base, args.head, args.repo, args.pr)
     except Exception as e:
         decide_prompt = f"failed to build decide prompt: {e}"
-
+    # --- investigate mode handling ---
+    investigate = bool(getattr(args, "investigate", False))
+    child_env: dict | None = None
+    max_minutes_str = os.environ.get("HW_GATE_MAX_MINUTES", "45")
+    evidence_dir_val: str | None = getattr(args, "evidence_dir", None)
     decision = None
     fable_unavailable = False
-    try:
-        decision = omp_review("decide", decide_prompt, args.system_prompt, args.checkout, model)
-    except ReviewError as e:
-        decision = None
-        fable_unavailable = True
-        sys.stderr.write(f"fable omp failed: {e}\n")
-
+    fable_error_reason: str | None = None
+    investigation: list = []
+    unproven: list = []
+    if investigate:
+        # Validate and build sandboxed env
+        try:
+            child_env, max_minutes_str = _build_investigate_env(args)
+            evidence_dir_val = child_env.get("HW_GATE_EVIDENCE")
+        except ReviewError as e:
+            sys.stderr.write(f"investigate env failed: {e}\n")
+            fable_unavailable = True
+            fable_error_reason = str(e)
+            decision = None
+            investigation = []
+            unproven = []
+            child_env = None
+        if not fable_unavailable:
+            # Augment prompt with sandbox values and registry listing
+            try:
+                registry_present = _list_registry_fixtures(args.checkout, child_env["HIPFIRE_MODELS_DIR"]) if child_env else []
+                addon = _build_investigate_prompt_addon(args.checkout, child_env, registry_present) if child_env else ""
+                decide_prompt = decide_prompt + "\n\n" + addon
+            except Exception as e:
+                sys.stderr.write(f"failed to build investigate prompt addon: {e}\n")
+            stdout_text = ""
+            stderr_text = ""
+            try:
+                result = omp_investigate(decide_prompt, args.system_prompt, args.checkout, model, child_env, max_minutes_str)
+                stdout_text = result.stdout or ""
+                stderr_text = result.stderr or ""
+                if result.returncode != 0:
+                    fable_unavailable = True
+                    fable_error_reason = f"omp decide failed ({result.returncode}): {stderr_text.strip()}"
+                    sys.stderr.write(f"fable omp failed: {fable_error_reason}\n")
+                    # best effort parse investigation from stdout
+                    last_text, obj = _parse_omp_stdout(stdout_text)
+                    if obj is not None and isinstance(obj, dict):
+                        decision = obj
+                        inv = obj.get("investigation")
+                        if isinstance(inv, list):
+                            investigation = inv
+                        else:
+                            investigation = []
+                        up = obj.get("unproven")
+                        if isinstance(up, list):
+                            unproven = up
+                        else:
+                            unproven = []
+                    else:
+                        # try to extract investigation even if not full json? parse last_text
+                        investigation = []
+                        unproven = []
+                        decision = None
+                else:
+                    last_text, obj = _parse_omp_stdout(stdout_text)
+                    if obj is None:
+                        fable_unavailable = True
+                        fable_error_reason = "omp decide: no JSON object in assistant text"
+                        sys.stderr.write(f"fable omp failed: {fable_error_reason}\n")
+                        investigation = []
+                        unproven = []
+                        decision = None
+                    else:
+                        decision = obj
+                        inv = obj.get("investigation")
+                        investigation = inv if isinstance(inv, list) else []
+                        up = obj.get("unproven")
+                        unproven = up if isinstance(up, list) else []
+            except subprocess.TimeoutExpired as te:
+                # capture stdout if any
+                try:
+                    if isinstance(te.stdout, str):
+                        stdout_text = te.stdout
+                    elif te.stdout:
+                        stdout_text = te.stdout.decode("utf-8", errors="ignore")
+                    else:
+                        stdout_text = ""
+                except Exception:
+                    stdout_text = ""
+                fable_unavailable = True
+                fable_error_reason = f"omp decide timed out after {max_minutes_str}m"
+                sys.stderr.write(f"fable omp timeout: {fable_error_reason}\n")
+                last_text, obj = _parse_omp_stdout(stdout_text) if stdout_text else (None, None)
+                if obj is not None and isinstance(obj, dict):
+                    decision = obj
+                    inv = obj.get("investigation")
+                    investigation = inv if isinstance(inv, list) else []
+                    up = obj.get("unproven")
+                    unproven = up if isinstance(up, list) else []
+                else:
+                    investigation = []
+                    unproven = []
+                    decision = None
+            except Exception as e:
+                fable_unavailable = True
+                fable_error_reason = str(e)
+                sys.stderr.write(f"fable omp failed: {e}\n")
+                investigation = []
+                unproven = []
+                decision = None
+    else:
+        # non-investigate: read-only behavior unchanged
+        try:
+            decision = omp_review("decide", decide_prompt, args.system_prompt, args.checkout, model)
+            # extract investigation/unproven if present (for decision.json completeness)
+            if isinstance(decision, dict):
+                inv = decision.get("investigation")
+                investigation = inv if isinstance(inv, list) else []
+                up = decision.get("unproven")
+                unproven = up if isinstance(up, list) else []
+                # also keep evidence_dir for completeness: may be None
+                if evidence_dir_val is None:
+                    # no investigate, but try to get from decision or args?
+                    evidence_dir_val = getattr(args, "evidence_dir", None)
+            else:
+                investigation = []
+                unproven = []
+        except ReviewError as e:
+            decision = None
+            fable_unavailable = True
+            fable_error_reason = str(e)
+            sys.stderr.write(f"fable omp failed: {e}\n")
+            investigation = []
+            unproven = []
+            # evidence_dir_val remains as arg value if any
+    # Ensure evidence_dir_val is set for decision.json even in non-investigate case
+    if investigate and child_env and not evidence_dir_val:
+        evidence_dir_val = child_env.get("HW_GATE_EVIDENCE")
     # Determine decision_final with hard floor precedence
     def _has_hold(r: str) -> bool:
         return "policy_paths" in r or "RATCHET" in r
     hard_has_block = any(not _has_hold(r) for r in hard) if hard else False
-    hard_has_hold = any(_has_hold(r) for r in hard) if hard else False
-
     if hard:
         if hard_has_block:
             decision_final = "block"
@@ -1131,7 +1433,6 @@ def _run_decide(args) -> int:
                 decision_final = fable_dec
             else:
                 decision_final = "hold"
-
     # Override detection
     override = None
     sol_to_fable = {"greenlight": "merge-staging", "needs-human": "hold", "block": "block"}
@@ -1139,9 +1440,7 @@ def _run_decide(args) -> int:
         sol_fable_equiv = sol_to_fable.get(sol_final)
         fable_dec = decision.get("decision")
         if sol_fable_equiv and fable_dec != sol_fable_equiv:
-            # Determine override why
             why = None
-            # decision may have override field
             ov = decision.get("override")
             if isinstance(ov, dict) and ov.get("why"):
                 why = ov.get("why")
@@ -1150,14 +1449,8 @@ def _run_decide(args) -> int:
             else:
                 why = f"Fable {fable_dec} overrides Sol {sol_final}"
             override = {"of": sol_final, "why": why}
-            # Also mark veto vs override distinction but keep same shape
-    # If hard fired, no override (even if disagreement)
-
-    # Handle staging merge if decision_final == merge-staging
     merged = None
-    merged_error = None
     announcement_extra = ""
-    # Need PR title for commit message
     pr_title = ""
     try:
         pr_json_text = _gh(["pr", "view", str(args.pr), "--repo", args.repo, "--json", "title"])
@@ -1166,11 +1459,9 @@ def _run_decide(args) -> int:
     except Exception:
         pr_title = ""
     if decision_final == "merge-staging":
-        # Attempt merge via gh api merges
         commit_msg = f"hw-gate: merge PR #{args.pr} ({pr_title}) to staging"
         try:
             out = _gh(["api", f"repos/{args.repo}/merges", "-f", f"base={staging}", "-f", f"head={args.head}", "-f", f"commit_message={commit_msg}"])
-            # Try parse response for sha
             try:
                 resp = json.loads(out) if out.strip() else {}
                 merge_sha = resp.get("sha") if isinstance(resp, dict) else None
@@ -1181,10 +1472,6 @@ def _run_decide(args) -> int:
             merged = {"base": staging, "head": args.head, "merge_sha": merge_sha}
         except ReviewError as e:
             err_msg = str(e)
-            # Nothing merged, so the decision cannot stay merge-staging: the
-            # required status would go green with the head still un-staged.
-            # A 409 (conflict / already merged) or any other failure becomes a
-            # hold for a human to resolve; the intended decision is recorded.
             merged = {"base": staging, "head": args.head, "merge_sha": None, "error": err_msg}
             is_409 = "409" in err_msg or "already" in err_msg.lower() or "conflict" in err_msg.lower()
             decision_final = "hold"
@@ -1193,37 +1480,26 @@ def _run_decide(args) -> int:
                 f" Fable decided merge-staging, but merging into `{staging}` failed"
                 f"{' with a conflict (409)' if is_409 else ''}: {err_msg}. Holding for a human."
             )
-
-    # Determine labels/reviews
-    # For decide, labels: merge-staging->merged-staging (+ approve), hold->needs-human (+ comment), block->hw-gate-blocked (+ request-changes)
-    # But 409 conflict => needs-human instead.
-
-    target_label = None
-    review_args = None
-    # Decide body for review and comment
-    # Build announcement + rationale + override note + merge info
     announcement = ""
     if isinstance(decision, dict):
         announcement = decision.get("announcement", "")
     if not announcement:
         if fable_unavailable:
-            announcement = "Fable unavailable; holding for human review."
+            # include reason if available
+            reason = f" {fable_error_reason}" if fable_error_reason else ""
+            announcement = f"Fable unavailable; holding for human review.{reason}".strip()
         elif decision_final == "merge-staging":
             announcement = "Fable merges to staging."
         elif decision_final == "hold":
             announcement = "Fable holds for human review."
         else:
             announcement = "Fable blocks."
-
     rationale = ""
     if isinstance(decision, dict):
         rationale = decision.get("rationale", "")
-
     override_note = ""
     if override:
         override_note = f"Override Sol {override['of']}: {override['why']}"
-
-    # Construct fable-decision comment body
     comment_lines: list[str] = []
     comment_lines.append("<!-- hw-gate:fable-decision -->")
     comment_lines.append(f"**announcement:** {announcement}")
@@ -1231,6 +1507,36 @@ def _run_decide(args) -> int:
         comment_lines.append(announcement_extra)
     if override_note:
         comment_lines.append(f"**override:** {override_note}")
+    # investigation table above rationale
+    if investigation:
+        comment_lines.append("**investigation:**")
+        comment_lines.append("")
+        comment_lines.append("| question | route | result | evidence |")
+        comment_lines.append("|---|---|---|---|")
+        for inv in investigation:
+            if not isinstance(inv, dict):
+                continue
+            q = str(inv.get("question", ""))
+            route = str(inv.get("route", ""))
+            res = str(inv.get("result", ""))
+            ev = str(inv.get("evidence", ""))
+            # show evidence file name (basename) but keep full if not path
+            ev_disp = Path(ev).name if ev else ev
+            # escape pipes
+            q = q.replace("|", "\\|").replace("\n", " ")
+            route = route.replace("|", "\\|").replace("\n", " ")
+            res = res.replace("|", "\\|").replace("\n", " ")
+            ev_disp = ev_disp.replace("|", "\\|").replace("\n", " ")
+            comment_lines.append(f"| {q} | {route} | {res} | {ev_disp} |")
+        comment_lines.append("")
+    if unproven:
+        comment_lines.append("**unproven:**")
+        for u in unproven:
+            if isinstance(u, str):
+                comment_lines.append(f"- {u}")
+            else:
+                comment_lines.append(f"- {json.dumps(u)}")
+        comment_lines.append("")
     if rationale:
         comment_lines.append(f"**rationale:** {rationale}")
     if merged:
@@ -1242,20 +1548,17 @@ def _run_decide(args) -> int:
         comment_lines.append(f"**hard floor:** {hard}")
     if soft:
         comment_lines.append(f"**soft floor:** {soft}")
+    # include fable error reason if unavailable and not already in announcement
+    if fable_unavailable and fable_error_reason and fable_error_reason not in announcement:
+        comment_lines.append(f"**fable unavailable:** {fable_error_reason}")
     fable_body = "\n\n".join(comment_lines)
-
-    # Upsert comment
     fable_comment_url = None
     try:
         fable_comment_url = upsert_comment(args.repo, args.pr, "<!-- hw-gate:fable-decision -->", fable_body)
     except Exception as e:
         sys.stderr.write(f"fable comment failed: {e}\n")
         fable_comment_url = None
-
-    # Determine label and review
-    # Default mapping
     if decision_final == "merge-staging" and merged and merged.get("error") and "409" in str(merged.get("error", "")):
-        # 409 case: needs-human label + comment review
         target_label = "needs-human"
         review_flag = "--comment"
         review_body = f"{announcement} {override_note} {rationale} {announcement_extra}".strip()
@@ -1267,39 +1570,29 @@ def _run_decide(args) -> int:
         target_label = "needs-human"
         review_flag = "--comment"
         review_body = f"{announcement} {rationale} {override_note}".strip()
-    else:  # block
+    else:
         target_label = "hw-gate-blocked"
         review_flag = "--request-changes"
         review_body = f"{announcement} {rationale} {override_note}".strip()
-
-    # Apply decision labels/reviews
     labels_added: list[str] = []
     labels_removed: list[str] = []
     review_url = None
-
-    # Ensure label exists
     color = _LABEL_COLORS.get(target_label, "ededed")
     try:
         _gh(["label", "create", target_label, "--repo", args.repo, "--color", color, "--force"])
     except ReviewError:
         pass
-
-    # Review
     try:
         out = _gh(["pr", "review", str(args.pr), "--repo", args.repo, review_flag, "--body", review_body])
         review_url = out.strip() or None
     except ReviewError as e:
         sys.stderr.write(f"pr review failed: {e}\n")
         review_url = None
-
-    # Add label
     try:
         _gh(["api", f"repos/{args.repo}/issues/{args.pr}/labels", "--method", "POST", "-f", f"labels[]={target_label}"])
         labels_added.append(target_label)
     except ReviewError:
         pass
-
-    # Remove others among {merged-staging, needs-human, hw-gate-blocked, agent-approved}
     for lbl in ["merged-staging", "needs-human", "hw-gate-blocked", "agent-approved"]:
         if lbl != target_label:
             try:
@@ -1307,22 +1600,17 @@ def _run_decide(args) -> int:
                 labels_removed.append(lbl)
             except ReviewError:
                 pass
-    # Remove hw-run
     try:
         _gh(["api", f"repos/{args.repo}/issues/{args.pr}/labels/hw-run", "--method", "DELETE"])
         labels_removed.append("hw-run")
     except ReviewError:
         pass
-
-    # If 409, also add needs-human even though target was merged-staging? Already handled target=needs-human case. So no extra.
-
     posted = {
         "fable_comment": fable_comment_url,
         "review": review_url,
         "labels_added": labels_added,
         "labels_removed": labels_removed,
     }
-
     out_obj = {
         "schema": "hipfire.hw-gate.decision",
         "version": 1,
@@ -1334,6 +1622,9 @@ def _run_decide(args) -> int:
         "override": override,
         "merged": merged,
         "posted": posted,
+        "investigation": investigation,
+        "unproven": unproven,
+        "evidence_dir": evidence_dir_val,
     }
     try:
         Path(args.out).parent.mkdir(parents=True, exist_ok=True)
@@ -1343,7 +1634,6 @@ def _run_decide(args) -> int:
     except Exception as e:
         sys.stderr.write(f"failed to write decision.json: {e}\n")
         return 1
-
     return 1 if fable_unavailable else 0
 
 
@@ -1370,6 +1660,13 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--routes", help="routes.json output path (prelim only)")
     ap.add_argument("--system-prompt", required=True)
     ap.add_argument("--out", required=True, help="output JSON path")
+    ap.add_argument("--investigate", action="store_true", help="run Fable with full tools (investigation mode)")
+    ap.add_argument("--devices", help="HW_GATE_DEVICES for investigate")
+    ap.add_argument("--home", help="HIPFIRE_HOME for investigate")
+    ap.add_argument("--evidence-dir", dest="evidence_dir", help="HW_GATE_EVIDENCE directory for investigate")
+    ap.add_argument("--bin", help="HW_GATE_BIN for investigate")
+    ap.add_argument("--base-bin", dest="base_bin", help="HW_GATE_BASE_BIN for investigate (optional)")
+    ap.add_argument("--round", type=int, default=1, help="HW_GATE_ROUND for investigate (default 1)")
     args = ap.parse_args(argv)
 
     # Validate seat/phase combo per authority model
