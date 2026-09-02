@@ -25,22 +25,21 @@ CONTRACT
           "binaries": {"daemon_md5": ..., "hipfire_md5": ..., "build_seconds": float},
           "fixtures": [
             {"tag": ..., "file": ..., "sha256": ..., "sha256_ok": bool, "size_ok": bool,
-             "bucket": "load", "prompt": path, "prompt_md5": ...,
-             "exit": int, "seconds": float,
-             "stdout": "... verbatim ...", "stderr_tail": "... last 60 lines ...",
-             "decoded": "... assistant text only ...",
-             "detector": {"exit": int, "report": {...}},          # hipfire-detect output
+             "modes": {
+               "battery": {"exit": int, "seconds": float, "rows": [...], "status": "pass"|"fail", "reason": "..."},
+               "chain":   {"exit": int, "seconds": float, "rows": [...], "status": "pass"|"fail", "reason": "..."}
+             },
              "status": "pass" | "fail", "reason": "..."}
           ],
-          "serve": {"battery": {...harness JSON...}, "chain": {...}, "status": ..., "reason": ...} | null,
           "kernel": {"report": {...redline harness JSON...}, "status": ..., "reason": ...} | null,
           "logs_dir": "hw-gate-logs"
         }
+    Row shape (enriched from harness --out JSON, which is a list of per-turn rows):
+        {"genre":..., "finish": "stop"|"length"|None, "ctx":..., "cached":..., "gen":..., "ans_words":..., "prefill_tok_s":..., "decode_tok_s":..., "attractor":bool, "empty":bool, "runaway":bool, "recall_ok":bool, "expected_substrings":[...], "assistant_content":"...verbatim...", "prompt_md5":...}
+        runaway is finish=="length"; recall_ok is every expected_substrings case-insensitively in assistant_content.
 
     hw-gate.md  : the same evidence rendered for a PR comment. Header table (host, binaries,
-                  base..head, buckets); per-fixture table (tag, sha256 ok, exit, seconds, detector,
-                  status); then one <details> block per fixture with the decoded text VERBATIM;
-                  then serve/kernel sections. review.py posts this file as the evidence comment.
+                  base..head, buckets); per-fixture turn table (mode, genre, finish, ctx, cached, gen, ans_words, prefill/decode tok/s, attractor/empty/runaway/recall flags) followed by one <details> per turn with assistant_content verbatim inside a fence from _fence(); then kernel section. review.py posts this file as the evidence comment.
 
 BEHAVIOR
     1. Preconditions (exit 2 on any failure):
@@ -55,22 +54,30 @@ BEHAVIOR
     3. Isolated home: create $HIPFIRE_HOME (env, required) with config.toml:
            [hardware]\ndevices = "<--device>"\n
        and symlink $HIPFIRE_HOME/models -> models_dir. Nothing from ~/.hipfire/config.toml leaks in.
-    4. load bucket, per fixture: 
-           HIPFIRE_LOCAL=1 HIPFIRE_DAEMON_BIN=<repo>/target/release/daemon <repo>/target/release/hipfire run <tag>
-               --max-tokens <n> --no-stream "<prompt file contents>"
-       capture stdout and stderr separately (logs to hw-gate-logs/<tag>.{out,err}), timeout 600 s.
-       `hipfire run` prints the assistant text on stdout and every daemon progress/diagnostic line on
-       stderr, so `decoded` = stdout verbatim (never filtered: code answers are indented). Pipe `decoded`
-       into `target/release/hipfire-detect`; status=pass iff exit==0 and decoded non-empty and detector exit==0.
-    5. serve bucket: python3 scripts/serve_harness.py --model <models_dir/file> --mode battery
-       --prompts-file <battery_prompts> --max-tokens <n> --home $HIPFIRE_HOME --out hw-gate-logs/serve-battery.json,
-       then --mode chain (built-in chain battery). Pass the resolved daemon/hipfire binaries the way the harness
-       expects (HIPFIRE_DAEMON_BIN env). status=pass iff both harness runs exit 0 and every battery row's
-       `expect` substrings appear.
-    6. kernel bucket: python3 scripts/redline_daemon_harness.py --model <models_dir/file> --daemon <daemon>
-       <harness_args...> --out hw-gate-logs/redline.json; status=pass iff exit 0 and the report's parity fields
-       are all true (read the harness's own summary keys; do not invent thresholds).
-    7. Write JSON + MD, exit per verdict.
+    4. For each fixture, run the harness modes which are the union of `buckets.<bucket>.modes` across the
+       selected buckets (e.g. load→battery, serve→battery+chain, kernel→battery; load+serve→battery+chain).
+       Each mode is one invocation of `scripts/serve_harness.py`:
+           HIP_VISIBLE_DEVICES=<device> HIPFIRE_MODELS_DIR=<models_dir> HIPFIRE_DAEMON_BIN=<bin>/daemon HIPFIRE_CLI_BIN=<bin>/hipfire \
+           python3 scripts/serve_harness.py --model <models_dir>/<file> --mode <battery|chain> \
+             --prompts-file <harness.battery_prompts> --max-tokens <harness.max_tokens> \
+             --thinking off --thinking-effort none --max-think-tokens 0 \
+             --home <HIPFIRE_HOME>/<tag>-<mode> --out <logs>/<tag>-<mode>.json --serve-log <logs>/<tag>-<mode>.serve.log
+       where `--prompts-file` is only for battery, chain uses its built-in chain battery. The three thinking
+       flags are all required together: --thinking off alone loses to the registry's reasoning_effort=xhigh
+       for qwen3.8 (turns think and answer nothing); --thinking-effort none alone trips the harness
+       preflight "max_tokens <= thinking cap"; --max-think-tokens 0 clears that. HIP_VISIBLE_DEVICES must
+       be the gate device — the harness defaults it to "0" and does NOT honour a --devices flag. Do not pass
+       --devices. The harness writes its own <home>/.hipfire/config.toml and symlinks models; it takes
+       --home DIR (not HIPFIRE_HOME). A per-fixture subdirectory of the gate home is used so runs never
+       share state. stdout+stderr are captured to <logs>/<tag>-<mode>.out for evidence but status is derived
+       from the exit code and the --out JSON only: exit 0 = pass (exit 1 on attractor or preflight is fatal),
+       and any row with attractor, empty, or recall miss (expected_substrings not all case-insensitively in
+       assistant_content) makes that mode fail. runaway (finish=="length") is recorded and shown but not
+       fatal by itself: a coherent answer cut by the cap is not a defect; a loop-to-cap sets attractor.
+    5. kernel bucket: python3 scripts/redline_daemon_harness.py --model <models_dir/file> --daemon <daemon>
+       <harness_args...> --out hw-gate-logs/redline.json; harness_args come from buckets.kernel.redline.harness_args.
+       status=pass iff exit 0 and the report's parity fields are all true (read the harness's own summary keys; do not invent thresholds).
+    6. Write JSON + MD, exit per verdict.
 
 Nothing here may consult a model. Nothing here may skip a fixture because it is slow.
 """
@@ -299,44 +306,197 @@ def _fence(text: str) -> str:
     return "`" * max(3, longest + 1)
 
 
-def run_fixture(repo, fixture, env, logs_dir, timeout=600) -> dict:
-    """Run one load fixture via hipfire run and hipfire-detect.
+def _sanitize_tag(tag: str) -> str:
+    sanitized = re.sub(r"[^A-Za-z0-9._-]+", "-", tag)
+    return sanitized or "fixture"
 
-    Returns dict matching hw-gate.json fixtures[] entry.
+
+def _modes_for_buckets(buckets: list[str], manifest: dict) -> list[str]:
+    """Union of `buckets.<bucket>.modes` across selected buckets, ordered battery then chain."""
+    buckets_cfg = manifest.get("buckets", {}) if isinstance(manifest.get("buckets"), dict) else {}
+    union: set[str] = set()
+    for b in buckets:
+        cfg = buckets_cfg.get(b, {})
+        if isinstance(cfg, dict):
+            modes = cfg.get("modes", [])
+            if isinstance(modes, list):
+                for m in modes:
+                    if isinstance(m, str) and m:
+                        union.add(m)
+    # fallback for old manifest where no modes field but bucket implicitly exists?
+    # Keep empty to avoid inventing.
+    ordered: list[str] = []
+    for pref in ("battery", "chain"):
+        if pref in union:
+            ordered.append(pref)
+    for m in sorted(union):
+        if m not in ordered:
+            ordered.append(m)
+    return ordered
+
+
+def _enrich_row(raw: dict) -> dict:
+    """Enrich a raw harness row into the evidence row shape, computing runaway/recall_ok."""
+    if not isinstance(raw, dict):
+        raw = {}
+    attractor = bool(raw.get("attractor"))
+    empty = bool(raw.get("empty"))
+    finish = raw.get("finish")
+    runaway = (finish == "length")
+    expected = raw.get("expected_substrings")
+    if expected is None:
+        expected = []
+    if not isinstance(expected, list):
+        expected = [expected] if expected else []
+    # filter to strings
+    expected_strs: list[str] = []
+    for e in expected:
+        if isinstance(e, str):
+            expected_strs.append(e)
+        elif e is not None:
+            expected_strs.append(str(e))
+    assistant = raw.get("assistant_content")
+    if assistant is None:
+        assistant = raw.get("content", "")
+    if not isinstance(assistant, str):
+        assistant = str(assistant) if assistant is not None else ""
+    # recall_ok case-insensitive
+    if expected_strs:
+        low = assistant.lower()
+        recall_ok = all(es.lower() in low for es in expected_strs)
+    else:
+        recall_ok = True
+    return {
+        "genre": raw.get("genre"),
+        "finish": finish,
+        "ctx": raw.get("ctx"),
+        "cached": raw.get("cached"),
+        "gen": raw.get("gen"),
+        "ans_words": raw.get("ans_words"),
+        "prefill_tok_s": raw.get("prefill_tok_s"),
+        "decode_tok_s": raw.get("decode_tok_s"),
+        "prefill_ms": raw.get("prefill_ms"),
+        "attractor": attractor,
+        "empty": empty,
+        "runaway": runaway,
+        "recall_ok": recall_ok,
+        "expected_substrings": expected_strs,
+        "assistant_content": assistant,
+        "prompt_md5": raw.get("prompt_md5"),
+        "ans_preview": raw.get("ans_preview"),
+        "reasoning_content": raw.get("reasoning_content"),
+        "content": raw.get("content"),
+    }
+
+
+def _evaluate_mode(exit_code: int, raw_rows) -> tuple[str, str, list[dict]]:
+    """Evaluate mode status from exit code and raw rows.
+
+    Returns (status, reason, enriched_rows).
     """
+    enriched: list[dict] = []
+    if isinstance(raw_rows, list):
+        for r in raw_rows:
+            if isinstance(r, dict):
+                enriched.append(_enrich_row(r))
+    # status logic
+    if exit_code != 0:
+        return "fail", f"harness exit {exit_code}", enriched
+    # check rows
+    fails: list[str] = []
+    for idx, row in enumerate(enriched):
+        if row.get("attractor"):
+            fails.append(f"row {idx} attractor")
+        if row.get("empty"):
+            fails.append(f"row {idx} empty")
+        # runaway (finish=="length") is reported in the evidence table but is not
+        # fatal on its own: a coherent long answer cut by the token cap is not a
+        # defect, and a loop-to-cap is caught by the harness's `attractor` flag.
+        if not row.get("recall_ok"):
+            # missing substrings
+            assistant = row.get("assistant_content", "")
+            missing = [e for e in row.get("expected_substrings", []) if e.lower() not in assistant.lower()]
+            fails.append(f"row {idx} recall miss {missing}")
+    if fails:
+        return "fail", "; ".join(fails), enriched
+    # also if raw_rows was not a list but exit 0, still fail closed if no rows? treat as pass (empty battery not typical but not failure)
+    return "pass", "", enriched
+
+
+def _build_harness_argv(repo: Path, model_path: Path, mode: str, max_tokens: int, battery_prompts_path: Path | None, per_home: Path, out_path: Path, serve_log_path: Path) -> list[str]:
+    """Build argv for serve_harness.py. Never includes --devices."""
+    harness = Path(repo) / "scripts" / "serve_harness.py"
+    argv = [
+        sys.executable,
+        str(harness),
+        "--model",
+        str(model_path),
+        "--mode",
+        mode,
+        "--max-tokens",
+        str(max_tokens),
+        "--thinking",
+        "off",
+        "--thinking-effort",
+        "none",
+        "--max-think-tokens",
+        "0",
+        "--home",
+        str(per_home),
+        "--out",
+        str(out_path),
+        "--serve-log",
+        str(serve_log_path),
+    ]
+    if mode == "battery" and battery_prompts_path is not None:
+        argv.extend(["--prompts-file", str(battery_prompts_path)])
+    return argv
+
+
+def _env_for_harness(env_base: dict, device: str, models_dir: str, daemon_bin: Path, hipfire_bin: Path) -> dict:
+    env = dict(env_base)
+    env["HIP_VISIBLE_DEVICES"] = str(device)
+    env["HIPFIRE_MODELS_DIR"] = str(models_dir)
+    env["HIPFIRE_DAEMON_BIN"] = str(daemon_bin)
+    env["HIPFIRE_CLI_BIN"] = str(hipfire_bin)
+    return env
+
+
+def _run_harness_mode(repo, fixture, env_base, logs_dir, device, mode, harness_cfg, models_dir) -> dict:
+    """Run one harness mode for a fixture and return mode evidence dict."""
     repo_p = Path(repo)
     logs_dir_p = Path(logs_dir)
     logs_dir_p.mkdir(parents=True, exist_ok=True)
     tag = fixture.get("tag", "")
-    safe_tag = re.sub(r"[^A-Za-z0-9._-]+", "-", tag) or "fixture"
-    # Prompt
-    prompt_rel = fixture.get("prompt", "")
-    prompt_path = repo_p / prompt_rel if prompt_rel else None
-    try:
-        prompt_text = prompt_path.read_text(encoding="utf-8") if prompt_path and prompt_path.is_file() else ""
-    except Exception:
-        prompt_text = ""
-    prompt_md5 = hashlib.md5(prompt_text.encode("utf-8")).hexdigest() if prompt_text else hashlib.md5(b"").hexdigest()
-    # Binaries
+    safe_tag = _sanitize_tag(tag)
+    file_name = fixture.get("file", "")
+    model_path = Path(models_dir).expanduser() / file_name if file_name else Path(models_dir) / tag
+    harness = repo_p / "scripts" / "serve_harness.py"
+    # harness cfg
+    battery_prompts_rel = harness_cfg.get("battery_prompts", "benchmarks/prompts/hw-gate/serve-battery.json")
+    battery_prompts_path = (repo_p / battery_prompts_rel) if battery_prompts_rel else None
+    max_tokens = harness_cfg.get("max_tokens", 256)
+    # per-fixture home: subdirectory of gate home
+    gate_home = env_base.get("HIPFIRE_HOME") or str(Path.home() / ".hipfire")
+    per_home = Path(gate_home) / f"{safe_tag}-{mode}"
+    # ensure no --devices leakage: we never add it
     bin_dir = _resolve_bin_dir(repo_p)
     daemon_bin = bin_dir / "daemon"
     hipfire_bin = bin_dir / "hipfire"
-    detect_bin = bin_dir / "hipfire-detect"
-    # Fallback if CARGO_TARGET_DIR not honoured but file actually at repo/target/release
-    env2 = dict(env)
-    env2["HIPFIRE_LOCAL"] = "1"
-    env2["HIPFIRE_DAEMON_BIN"] = str(daemon_bin)
-    max_tokens = fixture.get("max_tokens", 128)
-    cmd = [str(hipfire_bin), "run", tag, "--max-tokens", str(max_tokens), "--no-stream", prompt_text]
+    env = _env_for_harness(env_base, device, models_dir, daemon_bin, hipfire_bin)
+    out_path = logs_dir_p / f"{safe_tag}-{mode}.json"
+    serve_log_path = logs_dir_p / f"{safe_tag}-{mode}.serve.log"
+    out_combined_path = logs_dir_p / f"{safe_tag}-{mode}.out"
+    argv = _build_harness_argv(repo_p, model_path, mode, max_tokens, battery_prompts_path, per_home, out_path, serve_log_path)
     start = time.time()
+    exit_code = 1
     stdout = ""
     stderr = ""
-    exit_code = 127
     try:
-        res = run_cmd(cmd, env=env2, cwd=str(repo_p), capture_output=True, text=True, timeout=timeout)
+        res = run_cmd(argv, env=env, capture_output=True, text=True, timeout=900)
+        exit_code = res.returncode if res.returncode is not None else 1
         stdout = res.stdout if res.stdout is not None else ""
         stderr = res.stderr if res.stderr is not None else ""
-        exit_code = res.returncode
     except subprocess.TimeoutExpired as e:
         stdout = e.stdout.decode("utf-8", errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
         stderr = e.stderr.decode("utf-8", errors="replace") if isinstance(e.stderr, bytes) else (e.stderr or "")
@@ -349,221 +509,84 @@ def run_fixture(repo, fixture, env, logs_dir, timeout=600) -> dict:
         stderr = str(e)
         exit_code = 1
     seconds = time.time() - start
-    # logs
+    # capture stdout+stderr to .out for evidence (derive status from exit+JSON only)
     try:
-        (logs_dir_p / f"{safe_tag}.out").write_text(stdout, encoding="utf-8")
-        (logs_dir_p / f"{safe_tag}.err").write_text(stderr, encoding="utf-8")
+        combined = ""
+        if stdout:
+            combined += stdout
+            if not combined.endswith("\n"):
+                combined += "\n"
+        if stderr:
+            combined += stderr
+        out_combined_path.write_text(combined, encoding="utf-8")
     except Exception:
         pass
-    # `hipfire run` writes the assistant text to stdout and every daemon
-    # progress/diagnostic line to stderr, so stdout IS the decoded text.
-    # Never filter it: code answers are indented and would be destroyed.
-    decoded = stdout.strip("\n")
-    stderr_tail = "\n".join(stderr.splitlines()[-60:])
-    # detector
-    detector_exit = 1
-    detector_report: dict = {}
-    detector_raw = ""
-    try:
-        d_res = run_cmd([str(detect_bin)], input=decoded, capture_output=True, text=True, timeout=30)
-        detector_exit = d_res.returncode
-        detector_raw = d_res.stdout if d_res.stdout is not None else ""
-        if detector_raw.strip():
-            try:
-                detector_report = json.loads(detector_raw)
-            except Exception:
-                detector_report = {"raw": detector_raw[:2000]}
-        else:
-            # also check stderr for report?
-            detector_report = {}
-    except FileNotFoundError as e:
-        detector_exit = 127
-        detector_report = {"error": str(e)}
-    except subprocess.TimeoutExpired:
-        detector_exit = 124
-        detector_report = {"error": "detect timeout"}
-    except Exception as e:
-        detector_exit = 1
-        detector_report = {"error": str(e)}
-    # status
-    if exit_code != 0:
+    # also ensure serve log dir exists? harness writes serve-log itself
+    raw_rows = None
+    if out_path.is_file():
+        try:
+            raw_rows = json.loads(out_path.read_text(encoding="utf-8"))
+        except Exception:
+            raw_rows = None
+    status, reason, enriched = _evaluate_mode(exit_code, raw_rows)
+    # If exit 0 but raw_rows None -> treat as fail closed? _evaluate_mode returns pass for that case currently;
+    # we want fail closed if harness succeeded but no rows written.
+    if exit_code == 0 and raw_rows is None:
+        # No rows but exit 0 -> still fail closed to surface missing output
+        # However if harness legitimately writes empty list, that's file exists -> raw_rows = []
+        # So None indicates missing or parse error.
         status = "fail"
-        reason = f"hipfire run exit {exit_code}"
-    elif not decoded.strip():
-        status = "fail"
-        reason = "empty decoded text"
-    elif detector_exit != 0:
-        status = "fail"
-        reason = f"detector exit {detector_exit}"
-    else:
-        status = "pass"
-        reason = ""
-    # sha/size from fixture manifest for evidence
+        reason = "missing --out JSON"
+        enriched = []
+    # Build return dict
+    return {"exit": exit_code, "seconds": float(seconds), "rows": enriched, "status": status, "reason": reason}
+
+
+def _run_fixture_harness(repo, fixture, env_base, logs_dir, device, modes, harness_cfg, models_dir) -> dict:
+    """Run all modes for one fixture."""
+    modes_result: dict = {}
+    for mode in modes:
+        res = _run_harness_mode(repo, fixture, env_base, logs_dir, device, mode, harness_cfg, models_dir)
+        modes_result[mode] = res
+    # overall fixture status
+    overall = "pass" if all(m.get("status") == "pass" for m in modes_result.values()) else ("pass" if not modes_result else "fail")
+    # if no modes (should not happen) treat as pass
+    reasons: list[str] = []
+    for m, r in modes_result.items():
+        if r.get("status") != "pass" and r.get("reason"):
+            reasons.append(f"{m}: {r.get('reason')}")
+        elif r.get("status") != "pass":
+            reasons.append(f"{m}: fail")
+    reason = "; ".join(reasons) if reasons else ""
+    tag = fixture.get("tag", "")
     return {
         "tag": tag,
         "file": fixture.get("file", ""),
         "sha256": fixture.get("sha256", ""),
         "sha256_ok": True,
         "size_ok": True,
-        "bucket": "load",
-        "prompt": prompt_rel,
-        "prompt_md5": prompt_md5,
-        "exit": exit_code,
-        "seconds": float(seconds),
-        "stdout": stdout,
-        "stderr_tail": stderr_tail,
-        "decoded": decoded,
-        "detector": {"exit": detector_exit, "report": detector_report},
-        "status": status,
+        "modes": modes_result,
+        "status": overall,
         "reason": reason,
     }
 
 
-def run_serve(repo, models_dir, serve_cfg, fixtures_manifest, env, logs_dir) -> dict:
-    """Run serve battery + chain harnesses.
-
-    Uses only real flags from serve_harness.py argparse:
-      --model, --mode, --prompts-file, --max-tokens, --home, --out
-
-    Daemon binary passed via HIPFIRE_DAEMON_BIN env.
-    Returns dict with battery, chain, status, reason.
-    """
-    repo_p = Path(repo)
-    logs_dir_p = Path(logs_dir)
-    logs_dir_p.mkdir(parents=True, exist_ok=True)
-    # Resolve model file for serve
-    model_tag = serve_cfg.get("model_tag", "")
-    model_file = None
-    if fixtures_manifest and "buckets" in fixtures_manifest:
-        for f in fixtures_manifest["buckets"].get("load", {}).get("fixtures", []):
-            if f.get("tag") == model_tag:
-                model_file = f.get("file")
-                break
-    if not model_file:
-        # fallback: tag mangling? use model_tag itself?
-        model_file = f"{model_tag}.mq4"
-    model_path = Path(models_dir).expanduser() / model_file if model_file else Path(models_dir) / model_tag
-    # Battery config
-    battery_prompts_rel = serve_cfg.get("battery_prompts", "benchmarks/prompts/hw-gate/serve-battery.json")
-    battery_prompts_path = repo_p / battery_prompts_rel
-    max_tokens = serve_cfg.get("max_tokens", 256)
-    home = env.get("HIPFIRE_HOME") or str(Path.home() / ".hipfire")
-    bin_dir = _resolve_bin_dir(repo_p)
-    daemon_bin = bin_dir / "daemon"
-    serve_env = dict(env)
-    serve_env["HIPFIRE_DAEMON_BIN"] = str(daemon_bin)
-    # keep HIPFIRE_HOME, HIPFIRE_MODELS_DIR already in env
-    harness = repo_p / "scripts" / "serve_harness.py"
-    battery_out = logs_dir_p / "serve-battery.json"
-    chain_out = logs_dir_p / "serve-chain.json"
-    # Battery
-    battery_exit = 1
-    battery_rows = None
-    battery_stderr = ""
-    try:
-        cmd_bat = [
-            sys.executable,
-            str(harness),
-            "--model",
-            str(model_path),
-            "--mode",
-            "battery",
-            "--prompts-file",
-            str(battery_prompts_path),
-            "--max-tokens",
-            str(max_tokens),
-            "--home",
-            str(home),
-            "--out",
-            str(battery_out),
-        ]
-        res = run_cmd(cmd_bat, env=serve_env, capture_output=True, text=True, timeout=900)
-        battery_exit = res.returncode
-        battery_stderr = (res.stderr or "") + (res.stdout or "")
-        # try read rows
-        if battery_out.is_file():
-            try:
-                battery_rows = json.loads(battery_out.read_text(encoding="utf-8"))
-            except Exception:
-                battery_rows = None
-    except Exception as e:
-        battery_exit = 1
-        battery_stderr = str(e)
-    # Chain: built-in battery, no prompts-file
-    chain_exit = 1
-    chain_rows = None
-    chain_stderr = ""
-    try:
-        cmd_chain = [
-            sys.executable,
-            str(harness),
-            "--model",
-            str(model_path),
-            "--mode",
-            "chain",
-            "--max-tokens",
-            str(max_tokens),
-            "--home",
-            str(home),
-            "--out",
-            str(chain_out),
-        ]
-        res2 = run_cmd(cmd_chain, env=serve_env, capture_output=True, text=True, timeout=900)
-        chain_exit = res2.returncode
-        chain_stderr = (res2.stderr or "") + (res2.stdout or "")
-        if chain_out.is_file():
-            try:
-                chain_rows = json.loads(chain_out.read_text(encoding="utf-8"))
-            except Exception:
-                chain_rows = None
-    except Exception as e:
-        chain_exit = 1
-        chain_stderr = str(e)
-    # Evaluate pass criteria:
-    # battery: exit 0 and every row's expect substrings appear in assistant_content
-    # chain: exit 0 is criterion (spec says for chain, exit 0 is criterion)
-    battery_ok = battery_exit == 0
-    reason_parts: list[str] = []
-    if battery_exit != 0:
-        reason_parts.append(f"battery exit {battery_exit}")
-        battery_ok = False
-    else:
-        # check expect substrings if rows available
-        if isinstance(battery_rows, list):
-            for idx, row in enumerate(battery_rows):
-                expected = row.get("expected_substrings") or row.get("expect") or []
-                assistant = row.get("assistant_content") or row.get("content") or ""
-                # harness stores lower-case check; we do case-insensitive
-                lower_assistant = assistant.lower() if isinstance(assistant, str) else ""
-                for exp in expected:
-                    if exp.lower() not in lower_assistant:
-                        battery_ok = False
-                        reason_parts.append(f"battery row {idx} missing expect {exp!r}")
-                        break
-                # also check harness's retrieval_missing if present
-                if row.get("retrieval_missing"):
-                    missing = row.get("retrieval_missing")
-                    if missing:
-                        battery_ok = False
-                        reason_parts.append(f"battery row {idx} retrieval_missing {missing}")
-        elif battery_rows is None and battery_exit == 0:
-            # no rows but exit 0 -> treat as fail closed? but spec says exit 0 is enough?
-            # If harness didn't write out, we cannot verify expects; fail closed
-            pass
-    chain_ok = chain_exit == 0
-    if chain_exit != 0:
-        reason_parts.append(f"chain exit {chain_exit}")
-    status = "pass" if (battery_ok and chain_ok) else "fail"
-    reason = "; ".join(reason_parts) if reason_parts else ("" if status == "pass" else "serve failed")
-    # Build battery/chain objects for JSON: include exit, rows, stderr tail
-    battery_obj = {"exit": battery_exit, "rows": battery_rows, "stderr_tail": battery_stderr[-2000:] if battery_stderr else ""}
-    chain_obj = {"exit": chain_exit, "rows": chain_rows, "stderr_tail": chain_stderr[-2000:] if chain_stderr else ""}
-    return {"battery": battery_obj, "chain": chain_obj, "status": status, "reason": reason}
+def _find_file_for_tag(tag: str, manifest: dict):
+    # top-level fixtures first
+    for f in manifest.get("fixtures", []) if isinstance(manifest.get("fixtures"), list) else []:
+        if f.get("tag") == tag:
+            return f.get("file")
+    # old shape fallback
+    for f in manifest.get("buckets", {}).get("load", {}).get("fixtures", []) if isinstance(manifest.get("buckets"), dict) else []:
+        if f.get("tag") == tag:
+            return f.get("file")
+    return None
 
 
 def run_kernel(repo, models_dir, kernel_cfg, fixtures_manifest, env, logs_dir) -> dict:
     """Run redline daemon harness.
 
+    kernel_cfg is buckets.kernel.redline (model_tag + harness_args).
     Flags are only real ones from redline_daemon_harness.py argparse:
       --model, --daemon, --out, plus harness_args from fixtures manifest.
 
@@ -573,22 +596,16 @@ def run_kernel(repo, models_dir, kernel_cfg, fixtures_manifest, env, logs_dir) -
     repo_p = Path(repo)
     logs_dir_p = Path(logs_dir)
     logs_dir_p.mkdir(parents=True, exist_ok=True)
-    model_tag = kernel_cfg.get("model_tag", "")
-    model_file = None
-    if fixtures_manifest:
-        for f in fixtures_manifest["buckets"].get("load", {}).get("fixtures", []):
-            if f.get("tag") == model_tag:
-                model_file = f.get("file")
-                break
+    model_tag = kernel_cfg.get("model_tag", "") if isinstance(kernel_cfg, dict) else ""
+    model_file = _find_file_for_tag(model_tag, fixtures_manifest) if model_tag else None
     if not model_file:
-        model_file = f"{model_tag}.mq4"
-    model_path = Path(models_dir).expanduser() / model_file
+        model_file = f"{model_tag}.mq4" if model_tag else ""
+    model_path = Path(models_dir).expanduser() / model_file if model_file else Path(models_dir) / (model_tag or "")
     bin_dir = _resolve_bin_dir(repo_p)
     daemon_bin = bin_dir / "daemon"
     harness = repo_p / "scripts" / "redline_daemon_harness.py"
     redline_out = logs_dir_p / "redline.json"
-    harness_args = kernel_cfg.get("harness_args", [])
-    # Ensure args are strings
+    harness_args = kernel_cfg.get("harness_args", []) if isinstance(kernel_cfg, dict) else []
     harness_args = [str(a) for a in harness_args]
     cmd = [
         sys.executable,
@@ -620,7 +637,6 @@ def run_kernel(repo, models_dir, kernel_cfg, fixtures_manifest, env, logs_dir) -
         exit_code = 1
         report = {"error": str(e)}
         stderr = str(e)
-    # Determine status: exit 0 and report parity true
     status = "fail"
     reason = ""
     if exit_code != 0:
@@ -636,14 +652,12 @@ def run_kernel(repo, models_dir, kernel_cfg, fixtures_manifest, env, logs_dir) -
                 reason = ""
             else:
                 status = "fail"
-                # collect failures if available
                 failures = report.get("dflash_verify_failures") or report.get("failures") or []
                 if failures:
                     reason = f"parity fail: {failures}"
                 else:
                     reason = "report pass is false"
         elif "bit_exact" in report or "aql_shadow" in report or "prefix_shadow" in report:
-            # fallback: try to infer parity from known keys; but spec says fail closed if no boolean summary
             reason = "no boolean parity summary (fail closed)"
             status = "fail"
         else:
@@ -653,11 +667,10 @@ def run_kernel(repo, models_dir, kernel_cfg, fixtures_manifest, env, logs_dir) -
 
 
 def render_md(evidence: dict) -> str:
-    """Render hw-gate.md per CONTRACT: header table, per-fixture table, details blocks, serve/kernel."""
+    """Render hw-gate.md per CONTRACT: header table, per-fixture turn tables, details blocks, kernel."""
     lines: list[str] = []
     lines.append("# hw-gate evidence")
     lines.append("")
-    # Header table
     host = evidence.get("host", {})
     binaries = evidence.get("binaries", {})
     lines.append("| field | value |")
@@ -676,70 +689,95 @@ def render_md(evidence: dict) -> str:
     lines.append(f"| build_seconds | {binaries.get('build_seconds','')} |")
     lines.append(f"| verdict | {evidence.get('verdict','')} |")
     lines.append(f"| logs_dir | {evidence.get('logs_dir','')} |")
+    # optional error fields
+    if evidence.get("precondition_error"):
+        lines.append(f"| precondition_error | {evidence.get('precondition_error')} |")
+    if evidence.get("build_error"):
+        lines.append(f"| build_error | {str(evidence.get('build_error'))[:500]} |")
+    if evidence.get("error"):
+        lines.append(f"| error | {str(evidence.get('error'))[:500]} |")
     lines.append("")
-    # Per-fixture table
+    # Per-fixture sections
     lines.append("## fixtures")
     lines.append("")
-    lines.append("| tag | sha256 ok | size ok | exit | seconds | detector | status | reason |")
-    lines.append("|---|---|---|---|---|---|---|---|")
-    for fx in evidence.get("fixtures", []):
-        tag = fx.get("tag", "")
-        sha_ok = fx.get("sha256_ok", "")
-        # render bool as check
-        sha_ok_str = "✅" if sha_ok is True else ("❌" if sha_ok is False else str(sha_ok))
-        size_ok = fx.get("size_ok", "")
-        size_ok_str = "✅" if size_ok is True else ("❌" if size_ok is False else str(size_ok))
-        exit_code = fx.get("exit", "")
-        seconds = fx.get("seconds", "")
-        try:
-            seconds_str = f"{float(seconds):.1f}" if isinstance(seconds, (int, float)) else str(seconds)
-        except:
-            seconds_str = str(seconds)
-        det = fx.get("detector", {})
-        det_exit = det.get("exit", "") if isinstance(det, dict) else ""
-        status = fx.get("status", "")
-        reason = (fx.get("reason", "") or "").replace("|", "\\|").replace("\n", " ")
-        lines.append(f"| {tag} | {sha_ok_str} | {size_ok_str} | {exit_code} | {seconds_str} | {det_exit} | {status} | {reason} |")
-    lines.append("")
-    # Details blocks verbatim
-    for fx in evidence.get("fixtures", []):
-        tag = fx.get("tag", "")
-        decoded = fx.get("decoded", "")
-        lines.append(f"<details><summary>{tag}</summary>")
-        lines.append("")
-        fence = _fence(decoded)
-        lines.append(fence)
-        lines.append(decoded)
-        lines.append(fence)
-        lines.append("")
-        lines.append("</details>")
-        lines.append("")
-    # serve
-    lines.append("## serve")
-    lines.append("")
-    serve = evidence.get("serve")
-    if serve is None:
-        lines.append("not run")
+    fixtures = evidence.get("fixtures", [])
+    if not fixtures:
+        lines.append("no fixtures")
         lines.append("")
     else:
-        lines.append(f"status: {serve.get('status','')} ")
-        if serve.get("reason"):
-            lines.append(f"reason: {serve.get('reason')}")
-        lines.append("")
-        # battery/chain summary
-        battery = serve.get("battery", {})
-        chain = serve.get("chain", {})
-        if isinstance(battery, dict):
-            lines.append(f"battery exit: {battery.get('exit','')}")
-            rows = battery.get("rows")
-            if isinstance(rows, list):
-                lines.append(f"battery rows: {len(rows)}")
-        if isinstance(chain, dict):
-            lines.append(f"chain exit: {chain.get('exit','')}")
-            rows = chain.get("rows")
-            if isinstance(rows, list):
-                lines.append(f"chain rows: {len(rows)}")
-        lines.append("")
+        for fx in fixtures:
+            tag = fx.get("tag", "")
+            sha_ok = fx.get("sha256_ok", "")
+            sha_ok_str = "✅" if sha_ok is True else ("❌" if sha_ok is False else str(sha_ok))
+            size_ok = fx.get("size_ok", "")
+            size_ok_str = "✅" if size_ok is True else ("❌" if size_ok is False else str(size_ok))
+            status = fx.get("status", "")
+            reason = (fx.get("reason", "") or "").replace("|", "\\|").replace("\n", " ")
+            lines.append(f"### {tag}")
+            lines.append("")
+            lines.append(f"sha256_ok: {sha_ok_str} size_ok: {size_ok_str} status: {status} reason: {reason}")
+            lines.append("")
+            modes = fx.get("modes", {})
+            if not modes:
+                lines.append("no modes")
+                lines.append("")
+            else:
+                for mode_name, mode_data in modes.items():
+                    exit_code = mode_data.get("exit", "")
+                    seconds = mode_data.get("seconds", "")
+                    try:
+                        seconds_str = f"{float(seconds):.1f}" if isinstance(seconds, (int, float)) else str(seconds)
+                    except Exception:
+                        seconds_str = str(seconds)
+                    m_status = mode_data.get("status", "")
+                    m_reason = (mode_data.get("reason", "") or "").replace("|", "\\|").replace("\n", " ")
+                    lines.append(f"#### {mode_name} — exit {exit_code} seconds {seconds_str} status {m_status}")
+                    if m_reason:
+                        lines.append(f"reason: {m_reason}")
+                    lines.append("")
+                    rows = mode_data.get("rows", [])
+                    if not rows:
+                        lines.append("no rows")
+                        lines.append("")
+                    else:
+                        lines.append("| mode | idx | genre | finish | ctx | cached | gen | ans_words | prefill_tok_s | decode_tok_s | attractor | empty | runaway | recall_ok |")
+                        lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+                        for idx, row in enumerate(rows):
+                            genre = row.get("genre", "")
+                            finish = row.get("finish", "")
+                            ctx = row.get("ctx", "")
+                            cached = row.get("cached", "")
+                            gen = row.get("gen", "")
+                            ans_words = row.get("ans_words", "")
+                            prefill = row.get("prefill_tok_s", "")
+                            decode = row.get("decode_tok_s", "")
+                            attractor_s = str(row.get("attractor", ""))
+                            empty_s = str(row.get("empty", ""))
+                            runaway_s = str(row.get("runaway", ""))
+                            recall_s = str(row.get("recall_ok", ""))
+                            # sanitize pipe
+                            genre_s = str(genre).replace("|", "\\|") if genre is not None else ""
+                            finish_s = str(finish).replace("|", "\\|") if finish is not None else ""
+                            lines.append(
+                                f"| {mode_name} | {idx} | {genre_s} | {finish_s} | {ctx} | {cached} | {gen} | {ans_words} | {prefill} | {decode} | {attractor_s} | {empty_s} | {runaway_s} | {recall_s} |"
+                            )
+                        lines.append("")
+                    # details per turn verbatim
+                    for idx, row in enumerate(rows):
+                        assistant = row.get("assistant_content", "") or ""
+                        genre = row.get("genre", "")
+                        # summary includes tag mode and idx for uniqueness
+                        safe_genre = str(genre) if genre else ""
+                        lines.append(f"<details><summary>{tag} {mode_name} turn {idx} {safe_genre}</summary>")
+                        lines.append("")
+                        fence = _fence(assistant)
+                        lines.append(fence)
+                        lines.append(assistant)
+                        lines.append(fence)
+                        lines.append("")
+                        lines.append("</details>")
+                        lines.append("")
+            lines.append("")
     # kernel
     lines.append("## kernel")
     lines.append("")
@@ -754,13 +792,9 @@ def render_md(evidence: dict) -> str:
         lines.append("")
         report = kernel.get("report", {})
         if isinstance(report, dict):
-            # show pass key
             if "pass" in report:
                 lines.append(f"report pass: {report.get('pass')}")
             lines.append("")
-            # dump truncated report?
-            # keep brief
-        lines.append("")
     return "\n".join(lines)
 
 
@@ -795,13 +829,10 @@ def main(argv: list[str] | None = None) -> int:
         logs_dir = out_path.parent / "hw-gate-logs"
     else:
         logs_dir = Path.cwd() / "hw-gate-logs"
-        # if cwd not desired, use out_path parent if exists
         try:
-            # if out is hw-gate.json in cwd, logs_dir is hw-gate-logs
             if out_path.is_absolute():
                 logs_dir = out_path.parent / "hw-gate-logs"
             else:
-                # respect relative out's parent
                 logs_dir = Path(out_path.parent) / "hw-gate-logs" if str(out_path.parent) != "." else Path("hw-gate-logs")
         except Exception:
             logs_dir = Path("hw-gate-logs")
@@ -812,7 +843,6 @@ def main(argv: list[str] | None = None) -> int:
         fixtures_manifest = json.loads(fixtures_path.read_text(encoding="utf-8"))
     except Exception as e:
         print(f"failed to load fixtures {fixtures_path}: {e}", file=sys.stderr)
-        # write minimal evidence?
         evidence_fail = {
             "schema": "hipfire.hw-gate.evidence",
             "version": 1,
@@ -823,7 +853,6 @@ def main(argv: list[str] | None = None) -> int:
             "host": {"gfx": "unknown", "rocm": "unknown", "device": args.device, "runner": socket.gethostname()},
             "binaries": {"daemon_md5": None, "hipfire_md5": None, "build_seconds": 0.0},
             "fixtures": [],
-            "serve": None,
             "kernel": None,
             "logs_dir": "hw-gate-logs",
             "error": f"fixtures load failed: {e}",
@@ -851,7 +880,6 @@ def main(argv: list[str] | None = None) -> int:
             "host": {"gfx": _get_host_gfx(), "rocm": _get_host_rocm(), "device": args.device, "runner": socket.gethostname()},
             "binaries": {"daemon_md5": None, "hipfire_md5": None, "build_seconds": 0.0},
             "fixtures": [],
-            "serve": None,
             "kernel": None,
             "logs_dir": "hw-gate-logs",
             "error": "HIPFIRE_HOME not set",
@@ -863,50 +891,53 @@ def main(argv: list[str] | None = None) -> int:
     hipfire_home_p = Path(hipfire_home)
     cache_path = hipfire_home_p / "hw-gate-sha.json"
 
-    # Determine which fixtures to verify
-    fixtures_to_verify: list[dict] = []
-    # load bucket fixtures
-    if "load" in buckets:
-        for f in fixtures_manifest.get("buckets", {}).get("load", {}).get("fixtures", []):
-            if args.only_tag and f.get("tag") not in args.only_tag:
-                continue
-            fixtures_to_verify.append(f)
-    # serve/kernel model verification (if not already covered by load)
-    def _model_file_for_tag(tag: str) -> str | None:
-        for f in fixtures_manifest.get("buckets", {}).get("load", {}).get("fixtures", []):
-            if f.get("tag") == tag:
-                return f.get("file")
-        return None
+    # Determine fixtures list (new shape top-level `fixtures`, fallback old shape)
+    fixtures_all: list[dict] = []
+    if isinstance(fixtures_manifest.get("fixtures"), list):
+        fixtures_all = fixtures_manifest.get("fixtures", [])
+    else:
+        # fallback old shape
+        fixtures_all = fixtures_manifest.get("buckets", {}).get("load", {}).get("fixtures", []) if isinstance(fixtures_manifest.get("buckets"), dict) else []
+    # harness cfg
+    harness_cfg: dict
+    if isinstance(fixtures_manifest.get("harness"), dict):
+        harness_cfg = fixtures_manifest.get("harness", {})
+    else:
+        serve_cfg_fallback = fixtures_manifest.get("buckets", {}).get("serve", {}) if isinstance(fixtures_manifest.get("buckets"), dict) else {}
+        harness_cfg = {
+            "battery_prompts": serve_cfg_fallback.get("battery_prompts", "benchmarks/prompts/hw-gate/serve-battery.json"),
+            "max_tokens": serve_cfg_fallback.get("max_tokens", 256),
+        }
+    # ensure defaults
+    if "battery_prompts" not in harness_cfg:
+        harness_cfg["battery_prompts"] = "benchmarks/prompts/hw-gate/serve-battery.json"
+    if "max_tokens" not in harness_cfg:
+        harness_cfg["max_tokens"] = 256
 
+    # Determine which fixtures to verify/run
+    fixtures_to_verify: list[dict] = []
+    for f in fixtures_all:
+        if args.only_tag and f.get("tag") not in args.only_tag:
+            continue
+        fixtures_to_verify.append(f)
+
+    # extra check for kernel redline model if filtered out (to keep file verification)
     extra_checks: list[dict] = []
-    if "serve" in buckets:
-        serve_cfg = fixtures_manifest.get("buckets", {}).get("serve", {})
-        model_tag = serve_cfg.get("model_tag")
-        if model_tag:
-            # if not already in fixtures_to_verify
-            if not any(f.get("tag") == model_tag for f in fixtures_to_verify):
-                fname = _model_file_for_tag(model_tag)
-                if fname:
-                    # find full fixture for that tag to get sha/size
-                    for f in fixtures_manifest.get("buckets", {}).get("load", {}).get("fixtures", []):
+    if "kernel" in buckets:
+        kernel_bucket_cfg = fixtures_manifest.get("buckets", {}).get("kernel", {}) if isinstance(fixtures_manifest.get("buckets"), dict) else {}
+        redline_cfg = kernel_bucket_cfg.get("redline", kernel_bucket_cfg) if isinstance(kernel_bucket_cfg.get("redline"), dict) else kernel_bucket_cfg
+        if isinstance(redline_cfg, dict):
+            model_tag = redline_cfg.get("model_tag")
+            if model_tag:
+                if not any(f.get("tag") == model_tag for f in fixtures_to_verify) and not any(f.get("tag") == model_tag for f in extra_checks):
+                    for f in fixtures_all:
                         if f.get("tag") == model_tag:
                             extra_checks.append(f)
                             break
-                else:
-                    # create minimal fixture check for existence only? treat as missing -> fail
-                    extra_checks.append({"tag": model_tag, "file": f"{model_tag}.mq4", "sha256": "", "size_bytes": 0})
-    if "kernel" in buckets:
-        kernel_cfg = fixtures_manifest.get("buckets", {}).get("kernel", {})
-        model_tag = kernel_cfg.get("model_tag")
-        if model_tag:
-            if not any(f.get("tag") == model_tag for f in fixtures_to_verify) and not any(f.get("tag") == model_tag for f in extra_checks):
-                for f in fixtures_manifest.get("buckets", {}).get("load", {}).get("fixtures", []):
-                    if f.get("tag") == model_tag:
-                        extra_checks.append(f)
-                        break
-
     all_checks = fixtures_to_verify + extra_checks
 
+    # Modes union for harness
+    modes_union = _modes_for_buckets(buckets, fixtures_manifest)
     # Preconditions: verify each fixture file
     verify_results: list[dict] = []
     precondition_failed = False
@@ -919,7 +950,7 @@ def main(argv: list[str] | None = None) -> int:
             precondition_reason = vr.get("reason", "precondition failed")
 
     # harness scripts existence
-    if "serve" in buckets:
+    if modes_union:
         if not (repo_p / "scripts" / "serve_harness.py").is_file():
             precondition_failed = True
             precondition_reason = "missing scripts/serve_harness.py"
@@ -931,7 +962,6 @@ def main(argv: list[str] | None = None) -> int:
     host_info = {"gfx": _get_host_gfx(), "rocm": _get_host_rocm(), "device": args.device, "runner": socket.gethostname()}
 
     if precondition_failed:
-        # build not attempted
         fixtures_evidence = []
         for fx, vr in zip(all_checks, verify_results):
             fixtures_evidence.append(
@@ -941,19 +971,15 @@ def main(argv: list[str] | None = None) -> int:
                     "sha256": fx.get("sha256", ""),
                     "sha256_ok": vr.get("sha256_ok", False),
                     "size_ok": vr.get("size_ok", False),
-                    "bucket": "load",
-                    "prompt": fx.get("prompt", ""),
-                    "prompt_md5": "",
-                    "exit": 0,
-                    "seconds": 0.0,
-                    "stdout": "",
-                    "stderr_tail": "",
-                    "decoded": "",
-                    "detector": {"exit": 0, "report": {}},
+                    "modes": {},
                     "status": "fail",
-                    "reason": vr.get("reason", precondition_reason),
+                    "reason": vr.get("reason", precondition_reason) if vr.get("reason") else precondition_reason,
                 }
             )
+        # If precondition due to missing harness, fixtures_evidence may already have entries; keep reason
+        if not fixtures_evidence and precondition_reason.startswith("missing"):
+            # still report harness missing
+            pass
         evidence = {
             "schema": "hipfire.hw-gate.evidence",
             "version": 1,
@@ -964,7 +990,6 @@ def main(argv: list[str] | None = None) -> int:
             "host": host_info,
             "binaries": {"daemon_md5": None, "hipfire_md5": None, "build_seconds": 0.0},
             "fixtures": fixtures_evidence,
-            "serve": None,
             "kernel": None,
             "logs_dir": "hw-gate-logs",
             "precondition_error": precondition_reason,
@@ -998,7 +1023,6 @@ def main(argv: list[str] | None = None) -> int:
                     "host": host_info,
                     "binaries": {"daemon_md5": None, "hipfire_md5": None, "build_seconds": build_seconds},
                     "fixtures": [],
-                    "serve": None,
                     "kernel": None,
                     "logs_dir": "hw-gate-logs",
                     "build_error": (res.stderr or "")[-2000:],
@@ -1020,7 +1044,6 @@ def main(argv: list[str] | None = None) -> int:
                 "host": host_info,
                 "binaries": {"daemon_md5": None, "hipfire_md5": None, "build_seconds": build_seconds},
                 "fixtures": [],
-                "serve": None,
                 "kernel": None,
                 "logs_dir": "hw-gate-logs",
                 "build_error": str(e),
@@ -1033,7 +1056,6 @@ def main(argv: list[str] | None = None) -> int:
         daemon_md5 = _md5_file(daemon_path)
         hipfire_md5 = _md5_file(hipfire_path)
     else:
-        # reuse existing binaries
         daemon_md5 = _md5_file(daemon_path)
         hipfire_md5 = _md5_file(hipfire_path)
         build_seconds = 0.0
@@ -1053,7 +1075,6 @@ def main(argv: list[str] | None = None) -> int:
             "host": host_info,
             "binaries": {"daemon_md5": daemon_md5, "hipfire_md5": hipfire_md5, "build_seconds": build_seconds},
             "fixtures": [],
-            "serve": None,
             "kernel": None,
             "logs_dir": "hw-gate-logs",
             "error": f"isolated home failed: {e}",
@@ -1071,37 +1092,32 @@ def main(argv: list[str] | None = None) -> int:
     fixtures_evidence: list[dict] = []
     overall_pass = True
 
-    if "load" in buckets:
+    if modes_union:
         for fx in fixtures_to_verify:
-            # merge verify result sha/size ok into evidence? run_fixture returns with sha_ok true placeholder, override
             vr = next((v for v in verify_results if v.get("tag") == fx.get("tag")), None)
-            res = run_fixture(str(repo_p), fx, env_base, str(logs_dir))
-            # overlay sha/size verification
+            res = _run_fixture_harness(str(repo_p), fx, env_base, str(logs_dir), args.device, modes_union, harness_cfg, str(models_dir))
             if vr is not None:
                 res["sha256_ok"] = vr.get("sha256_ok", False)
                 res["size_ok"] = vr.get("size_ok", False)
                 res["sha256"] = fx.get("sha256", "")
-                # if verify failed, status should be fail regardless of run result
-                if not vr.get("sha256_ok") or not vr.get("size_ok"):
+                if not vr.get("sha256_ok") or not vr.get("size_ok") or not vr.get("exists"):
                     res["status"] = "fail"
-                    res["reason"] = vr.get("reason", res.get("reason", ""))
+                    vr_reason = vr.get("reason", "")
+                    if vr_reason:
+                        res["reason"] = vr_reason + ("; " + res["reason"] if res["reason"] else "")
             fixtures_evidence.append(res)
             if res.get("status") != "pass":
                 overall_pass = False
     else:
         fixtures_evidence = []
 
-    serve_result = None
-    if "serve" in buckets:
-        serve_cfg = fixtures_manifest.get("buckets", {}).get("serve", {})
-        serve_result = run_serve(str(repo_p), str(models_dir), serve_cfg, fixtures_manifest, env_base, str(logs_dir))
-        if serve_result.get("status") != "pass":
-            overall_pass = False
-
     kernel_result = None
     if "kernel" in buckets:
-        kernel_cfg = fixtures_manifest.get("buckets", {}).get("kernel", {})
-        kernel_result = run_kernel(str(repo_p), str(models_dir), kernel_cfg, fixtures_manifest, env_base, str(logs_dir))
+        kernel_bucket_cfg = fixtures_manifest.get("buckets", {}).get("kernel", {}) if isinstance(fixtures_manifest.get("buckets"), dict) else {}
+        redline_cfg = kernel_bucket_cfg.get("redline", kernel_bucket_cfg) if isinstance(kernel_bucket_cfg.get("redline"), dict) else kernel_bucket_cfg
+        if not isinstance(redline_cfg, dict):
+            redline_cfg = {}
+        kernel_result = run_kernel(str(repo_p), str(models_dir), redline_cfg, fixtures_manifest, env_base, str(logs_dir))
         if kernel_result.get("status") != "pass":
             overall_pass = False
 
@@ -1116,7 +1132,6 @@ def main(argv: list[str] | None = None) -> int:
         "host": host_info,
         "binaries": {"daemon_md5": daemon_md5, "hipfire_md5": hipfire_md5, "build_seconds": float(build_seconds)},
         "fixtures": fixtures_evidence,
-        "serve": serve_result,
         "kernel": kernel_result,
         "logs_dir": "hw-gate-logs",
     }

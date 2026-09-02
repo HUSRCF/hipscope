@@ -59,13 +59,18 @@ Registry fixture tags are pinned by sha256 in
 [`scripts/hw-gate/fixtures.json`](../scripts/hw-gate/fixtures.json). A missing
 or mismatched fixture **fails the gate** (no downgrade to warning).
 
-- **`serve` bucket** runs [`scripts/serve_harness.py`](../scripts/serve_harness.py)
-  (battery + chain) — same maintained serve harness as the manual route below.
-- **`kernel` bucket** runs
-  [`scripts/redline_daemon_harness.py`](../scripts/redline_daemon_harness.py) —
-  same Redline harness as the manual route below.
-- **`load` bucket** runs pinned tags through `hipfire run` and
-  `hipfire-detect` on decoded text.
+Every fixture runs through [`scripts/serve_harness.py`](../scripts/serve_harness.py)
+— the same maintained serve harness as the manual route below — never through
+a single `hipfire run`, which is one request against a fresh daemon and proves
+nothing about turn-to-turn state. The bucket decides the modes:
+
+- **`load` bucket** — `battery` on every fixture (varied prompts, expect
+  substrings, attractor / runaway / empty detection, reasoning off).
+- **`serve` bucket** — `battery` + `chain` on every fixture (related turns
+  through the prefix cache: reset, cache, and terminal semantics).
+- **`kernel` bucket** — `battery` on every fixture plus
+  [`scripts/redline_daemon_harness.py`](../scripts/redline_daemon_harness.py)
+  capture + HIP/PM4 parity on the dense trunk.
 
 Decoded assistant text is posted **verbatim** in the evidence comment. Reading
 it is part of review — do not treat a green check alone as having read the
