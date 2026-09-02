@@ -176,13 +176,17 @@ jobs:
           path: verdict.json
 
   hw-gate:
-    # The one required status check. Deterministic: it never consults the model.
+    # The one required status check, and the merge authority: green only on a
+    # floor-approved greenlight. `needs-human` and `block` are red; a repo admin
+    # who has read the evidence may still merge a red `needs-human` (branch
+    # protection does not bind admins), every other maintainer cannot.
+    # Deterministic: it reads verdict.json, never the model directly.
     name: hw-gate
     needs: [select, hw-run, hw-review]
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - name: Decide
+      - name: Preconditions
         run: |
           set -euo pipefail
           echo "needs_hw=${{ needs.select.outputs.needs_hw }} authorized=${{ needs.select.outputs.authorized }}"
@@ -191,7 +195,7 @@ jobs:
             echo "::error::bucket selection failed"; exit 1
           fi
           if [ "${{ needs.select.outputs.needs_hw }}" != "true" ]; then
-            echo "no hardware-relevant surface touched"; exit 0
+            echo "no hardware-relevant surface touched"; echo "skip=true" >> "$GITHUB_ENV"; exit 0
           fi
           if [ "${{ needs.select.outputs.authorized }}" != "true" ]; then
             echo "::error::hardware-relevant diff; a maintainer must apply the 'hw-run' label"; exit 1
@@ -202,4 +206,20 @@ jobs:
           if [ "${{ needs.hw-review.result }}" != "success" ]; then
             echo "::error::reviewer did not complete"; exit 1
           fi
-          echo "hardware evidence and review recorded; merge authority is the review, not this check"
+      - uses: actions/download-artifact@v4
+        if: env.skip != 'true'
+        with:
+          name: hw-gate-verdict
+          path: verdict
+      - name: Decide
+        if: env.skip != 'true'
+        run: |
+          set -euo pipefail
+          decision=$(jq -r '.floor.final_decision // "needs-human"' verdict/verdict.json)
+          reasons=$(jq -r '.floor.applied | join(", ")' verdict/verdict.json)
+          echo "final_decision=$decision floor=[$reasons]"
+          case "$decision" in
+            greenlight) echo "floor-approved greenlight; hardware evidence and review recorded"; exit 0 ;;
+            needs-human) echo "::error::hw-gate needs a human: read the evidence and verdict comments; an admin may merge after reading ($reasons)"; exit 1 ;;
+            *) echo "::error::hw-gate blocked ($reasons)"; exit 1 ;;
+          esac

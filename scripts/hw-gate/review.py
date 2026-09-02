@@ -56,6 +56,9 @@ FLOOR (apply_floor(model_decision, evidence, select, hw_run_result, commit_messa
       greenlight   only when none of the above fired and model_decision == "greenlight"
 
 APPLY
+    The merge authority is the required `hw-gate` status, which the workflow derives from
+    verdict.json `floor.final_decision` (green only on greenlight). The reviews below are the
+    human-visible record and are informational.
     greenlight  : `gh pr review N --approve --body <verdict summary + evidence link>`; add label `agent-approved`
     needs-human : `gh pr review N --comment --body ...`; add label `needs-human`
     block       : `gh pr review N --request-changes --body ...`; add label `hw-gate-blocked`
