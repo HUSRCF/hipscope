@@ -71,6 +71,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 
@@ -248,20 +249,16 @@ def omp_review(phase: str, prompt: str, system_prompt: str, checkout: str, model
     Raises ReviewError on failure after one retry.
     """
     omp_bin = os.environ.get("HW_GATE_OMP_BIN", "omp")
-    base_cmd = [
-        omp_bin, "-p", "--mode", "json", "--auto-approve",
-        "--tools=read,grep,glob",
-        "--cwd", checkout,
-        "--model", model,
-        "--system-prompt", system_prompt,
-        "--max-time", "15m",
-        prompt,
-    ]
     last_error: str | None = None
     for attempt in range(2):
         cur_prompt = prompt if attempt == 0 else prompt + "\n\nReturn only the JSON object."
-        cmd = base_cmd[:-1] + [cur_prompt]
-        # Re-build with updated prompt
+        # The prompt carries up to 400 KiB of diff: far beyond argv limits, so it
+        # goes through omp's `@file` prompt reference. The file lives outside
+        # the checkout so the reviewer's read-only tools cannot mistake it for
+        # repository content.
+        with tempfile.NamedTemporaryFile("w", suffix=f"-hw-gate-{phase}.md", delete=False, encoding="utf-8") as fh:
+            fh.write(cur_prompt)
+            prompt_path = fh.name
         cmd = [
             omp_bin, "-p", "--mode", "json", "--auto-approve",
             "--tools=read,grep,glob",
@@ -269,9 +266,15 @@ def omp_review(phase: str, prompt: str, system_prompt: str, checkout: str, model
             "--model", model,
             "--system-prompt", system_prompt,
             "--max-time", "15m",
-            cur_prompt,
+            f"@{prompt_path}",
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True, cwd=checkout)
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, cwd=checkout)
+        finally:
+            try:
+                os.unlink(prompt_path)
+            except OSError:
+                pass
         if result.returncode != 0:
             last_error = f"omp {phase} failed ({result.returncode}): {result.stderr.strip()}"
             if attempt == 0:
