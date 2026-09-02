@@ -20,12 +20,12 @@
 //! 2. Run debug builds to catch silent mis-binds via the bind_thread invariant.
 //! 3. Pass the multi-GPU coherence gate.
 
+use crate::device_mesh::{DeviceMesh, DimKind};
 use hip_bridge::{
     DeviceBuffer, Event, HipError, HipResult, RcclComms, HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED,
     HIP_ERROR_PEER_ACCESS_UNSUPPORTED, HIP_EVENT_DISABLE_TIMING, HIP_EVENT_RELEASE_TO_SYSTEM,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
-use crate::device_mesh::{DeviceMesh, DimKind};
 
 /// Stream-event handoff returned by `Gpus::boundary_copy`. When the src
 /// device has an active stream, `completion` holds a HIP event recorded
