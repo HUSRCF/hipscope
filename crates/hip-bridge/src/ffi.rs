@@ -229,6 +229,7 @@ pub struct HipRuntime {
     fn_set_device: unsafe extern "C" fn(c_int) -> u32,
     fn_set_device_flags: unsafe extern "C" fn(c_uint) -> u32,
     fn_get_device: unsafe extern "C" fn(*mut c_int) -> u32,
+    fn_device_get_pci_bus_id: Option<unsafe extern "C" fn(*mut c_char, c_int, c_int) -> u32>,
 
     // Multi-device / peer access
     fn_device_can_access_peer: unsafe extern "C" fn(*mut c_int, c_int, c_int) -> u32,
@@ -632,6 +633,11 @@ impl HipRuntime {
                     unsafe extern "C" fn(u32) -> *const i8
                 ),
                 fn_get_last_error: load_fn!(lib, "hipGetLastError", unsafe extern "C" fn() -> u32),
+                fn_device_get_pci_bus_id: load_optional_fn!(
+                    lib,
+                    "hipDeviceGetPCIBusId",
+                    unsafe extern "C" fn(*mut c_char, c_int, c_int) -> u32
+                ),
                 fn_stream_begin_capture: load_fn!(
                     lib,
                     "hipStreamBeginCapture",
@@ -1711,6 +1717,24 @@ impl HipRuntime {
                 Ok("unknown".to_string())
             }
         }
+    }
+
+    /// Return the stable PCI identity for a HIP logical device. Unlike the
+    /// logical ordinal, this remains valid when visibility variables remap the
+    /// device list and can therefore be matched against independently
+    /// enumerated ROCr/HSA agents.
+    pub fn get_pci_bus_id(&self, device_id: i32) -> HipResult<String> {
+        let get_pci_bus_id = self.fn_device_get_pci_bus_id.ok_or_else(|| {
+            HipError::new(0, "hipDeviceGetPCIBusId is unavailable in this HIP runtime")
+        })?;
+        let mut bytes = [0_i8; 32];
+        let code =
+            unsafe { get_pci_bus_id(bytes.as_mut_ptr(), bytes.len() as c_int, device_id as c_int) };
+        self.check(code, "hipDeviceGetPCIBusId")?;
+        let value = unsafe { std::ffi::CStr::from_ptr(bytes.as_ptr()) }
+            .to_str()
+            .map_err(|error| HipError::new(0, &format!("hipDeviceGetPCIBusId UTF-8: {error}")))?;
+        Ok(value.to_ascii_lowercase())
     }
 
     /// Query a HIP device attribute by enum ID. See `hipDeviceAttribute_t` in

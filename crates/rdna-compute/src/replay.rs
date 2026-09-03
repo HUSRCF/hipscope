@@ -25,7 +25,7 @@ use redline_dispatch::aql::{
     load_symbols, BatchFencePolicy, Executable, Gfx10DispatchInitiatorPolicy,
     Gfx10Pm4CommandBuffer, Gfx10SetShRegRecord, Gfx11ComputeResourceLimitsPolicy,
     Gfx11DispatchInterleave, Gfx12Pm4CommandBuffer, GpuBatchTiming, GpuDevice, GpuMultiQueueTiming,
-    GpuSelector, HeaderPolicy, KernargBuffer, KernargPool, Kernel, LaunchGeometry,
+    GpuSelector, HeaderPolicy, KernargBuffer, KernargPool, Kernel, LaunchGeometry, PciBusId,
     PhasedMultiQueuePm4Ib, QueuePolicy, Quiescence, RecordedDispatch, Runtime,
     SingleQueueBatchGraph, SingleQueuePm4Ib,
 };
@@ -3901,6 +3901,8 @@ pub struct ReplayController {
     prepared_max_position: Option<usize>,
     synthesized_position_bindings: Vec<(usize, ReplayKernargBinding)>,
     position_bindings_calibrated: bool,
+    target_pci_bus_id: Option<PciBusId>,
+    target_pci_bus_id_error: Option<String>,
 }
 
 impl ReplayController {
@@ -3954,7 +3956,41 @@ impl ReplayController {
             prepared_max_position: None,
             synthesized_position_bindings: Vec::new(),
             position_bindings_calibrated: false,
+            target_pci_bus_id: None,
+            target_pci_bus_id_error: None,
         }
+    }
+
+    /// Bind independently enumerated ROCr queues to the same physical device
+    /// selected by HIP, even when visibility variables remap HIP ordinals.
+    pub fn set_target_pci_bus_id(&mut self, value: &str) -> Result<(), String> {
+        self.target_pci_bus_id = Some(
+            value
+                .parse::<PciBusId>()
+                .map_err(|error| error.to_string())?,
+        );
+        self.target_pci_bus_id_error = None;
+        Ok(())
+    }
+
+    pub fn set_target_pci_bus_id_error(&mut self, error: impl Into<String>) {
+        self.target_pci_bus_id = None;
+        self.target_pci_bus_id_error = Some(error.into());
+    }
+
+    fn select_gpu(&self, runtime: &Runtime, fallback_ordinal: usize) -> Result<GpuDevice, String> {
+        if let Some(error) = &self.target_pci_bus_id_error {
+            return Err(format!(
+                "Redline physical-device identity unavailable: {error}"
+            ));
+        }
+        let selector = self.target_pci_bus_id.map_or(
+            GpuSelector::Ordinal(fallback_ordinal),
+            GpuSelector::PciBusId,
+        );
+        runtime
+            .select_gpu(selector)
+            .map_err(|error| error.to_string())
     }
 
     pub fn new_armed(request: ReplayBackendRequest) -> Self {
@@ -4223,9 +4259,7 @@ impl ReplayController {
     ) -> Result<Vec<AqlContractProbe>, String> {
         let runtime = Runtime::initialize(load_symbols().map_err(|error| error.to_string())?)
             .map_err(|error| error.to_string())?;
-        let device = runtime
-            .select_gpu(GpuSelector::Ordinal(device_ordinal))
-            .map_err(|error| error.to_string())?;
+        let device = self.select_gpu(&runtime, device_ordinal)?;
         let mut seen = BTreeSet::new();
         let mut probes = Vec::new();
         for launch in &self.recorded {
@@ -4286,9 +4320,7 @@ impl ReplayController {
         }
         let runtime = Runtime::initialize(load_symbols().map_err(|error| error.to_string())?)
             .map_err(|error| error.to_string())?;
-        let device = runtime
-            .select_gpu(GpuSelector::Ordinal(device_ordinal))
-            .map_err(|error| error.to_string())?;
+        let device = self.select_gpu(&runtime, device_ordinal)?;
         let pool = KernargPool::discover(&device).map_err(|error| error.to_string())?;
         let mut executables = BTreeMap::<PathBuf, Executable>::new();
         let mut kernels = BTreeMap::<(PathBuf, String), Kernel>::new();
@@ -4501,9 +4533,7 @@ impl ReplayController {
         }
         let runtime = Runtime::initialize(load_symbols().map_err(|error| error.to_string())?)
             .map_err(|error| error.to_string())?;
-        let device = runtime
-            .select_gpu(GpuSelector::Ordinal(device_ordinal))
-            .map_err(|error| error.to_string())?;
+        let device = self.select_gpu(&runtime, device_ordinal)?;
         let pm4_architecture = Pm4Architecture::from_device(&device)?;
         if dispatch_profile && pm4_architecture != Pm4Architecture::Gfx12 {
             return Err("per-dispatch PM4 profiling currently requires gfx12".to_owned());
@@ -5862,6 +5892,47 @@ fn put_u32(bytes: &mut [u8], offset: usize, value: u32) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_reset_preserves_target_pci_identity() {
+        let mut controller = ReplayController::new_armed(ReplayBackendRequest::Auto);
+        controller.set_target_pci_bus_id("0000:43:00.0").unwrap();
+
+        controller.apply_model_default(true, ReplayTransport::Pm4Ib);
+        assert_eq!(
+            controller.target_pci_bus_id.map(|value| value.to_string()),
+            Some("0000:43:00.0".to_owned())
+        );
+
+        controller.rearm_after_layout_growth();
+        assert_eq!(
+            controller.target_pci_bus_id.map(|value| value.to_string()),
+            Some("0000:43:00.0".to_owned())
+        );
+
+        controller.set_target_pci_bus_id_error("PCI identity unavailable");
+        controller.rearm_after_layout_growth();
+        assert_eq!(
+            controller.target_pci_bus_id_error.as_deref(),
+            Some("PCI identity unavailable")
+        );
+    }
+
+    #[test]
+    fn live_hip_and_rocr_device_identity_match_when_enabled() {
+        if std::env::var_os("REDLINE_TEST_DEVICE_IDENTITY").is_none() {
+            return;
+        }
+
+        let hip = HipRuntime::load().unwrap();
+        let hip_pci = hip.get_pci_bus_id(0).unwrap();
+        let runtime = Runtime::initialize(load_symbols().unwrap()).unwrap();
+        let expected = hip_pci.parse::<PciBusId>().unwrap();
+        let hsa_device = runtime.select_gpu(GpuSelector::PciBusId(expected)).unwrap();
+
+        assert_eq!(hsa_device.pci_bus_id(), expected);
+        eprintln!("HIP logical device 0 and ROCr selected device both map to {expected}");
+    }
 
     #[test]
     fn pm4_architecture_fails_closed_for_unknown_gfx12_devices() {

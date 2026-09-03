@@ -114,6 +114,18 @@ impl Runtime {
                         needle: needle.to_owned(),
                     })
             }
+            GpuSelector::PciBusId(expected) => {
+                let mut matches = devices
+                    .into_iter()
+                    .filter(|device| device.pci_bus_id() == expected);
+                let device = matches
+                    .next()
+                    .ok_or(RuntimeError::GpuPciBusIdNotFound { expected })?;
+                if matches.next().is_some() {
+                    return Err(RuntimeError::GpuPciBusIdAmbiguous { expected });
+                }
+                Ok(device)
+            }
         }
     }
 
@@ -481,6 +493,7 @@ impl std::str::FromStr for PciBusId {
 pub enum GpuSelector<'a> {
     Ordinal(usize),
     NameContains(&'a str),
+    PciBusId(PciBusId),
 }
 
 #[derive(Clone)]
@@ -2627,6 +2640,12 @@ pub enum RuntimeError {
     GpuNameNotFound {
         needle: String,
     },
+    GpuPciBusIdNotFound {
+        expected: PciBusId,
+    },
+    GpuPciBusIdAmbiguous {
+        expected: PciBusId,
+    },
     InvalidQueueSize {
         requested: u32,
         min: u32,
@@ -2701,6 +2720,12 @@ impl fmt::Display for RuntimeError {
             }
             Self::GpuNameNotFound { needle } => {
                 write!(f, "no HSA GPU name contains {needle:?}")
+            }
+            Self::GpuPciBusIdNotFound { expected } => {
+                write!(f, "no HSA GPU has PCI identity {expected}")
+            }
+            Self::GpuPciBusIdAmbiguous { expected } => {
+                write!(f, "multiple HSA GPUs have PCI identity {expected}")
             }
             Self::InvalidQueueSize {
                 requested,

@@ -1148,6 +1148,15 @@ impl Gpu {
         let arch_caps = crate::arch_caps::ArchCaps::new(&arch, flags.clone());
 
         let compiler = KernelCompiler::new(&arch, flags.hipcc_extra_flags.clone())?;
+        let mut replay = crate::replay::ReplayController::from_config();
+        match hip.get_pci_bus_id(id) {
+            Ok(pci_bus_id) => {
+                if let Err(error) = replay.set_target_pci_bus_id(&pci_bus_id) {
+                    replay.set_target_pci_bus_id_error(error);
+                }
+            }
+            Err(error) => replay.set_target_pci_bus_id_error(error.to_string()),
+        }
 
         crate::graph::LAST_BOUND_DEVICE.with(|c| c.set(id));
 
@@ -1238,7 +1247,7 @@ impl Gpu {
                 sample_partials: None,
                 sample_partials_bytes: 0,
             },
-            replay: crate::replay::ReplayController::from_config(),
+            replay,
             #[cfg(feature = "flash-attn-ck")]
             flash_attn_ck,
             #[cfg(feature = "flash-attn-ck")]
