@@ -1346,7 +1346,15 @@ def _run_decide(args) -> int:
     fable_raw: dict | None = None
     investigation: list = []
     unproven: list = []
-    if investigate:
+    # Preflight already proved the seat cannot answer, so there is nothing to
+    # call and no reason to hold the exclusive GPU lock its phase normally
+    # takes: record the hold and let the floors + comment run as usual.
+    unavailable_reason = (getattr(args, "decider_unavailable", None) or "").strip()
+    if unavailable_reason:
+        fable_unavailable = True
+        fable_error_reason = unavailable_reason
+        sys.stderr.write(f"decide skipped: {unavailable_reason}\n")
+    elif investigate:
         # Validate and build sandboxed env
         try:
             child_env, max_minutes_str = _build_investigate_env(args)
@@ -1725,6 +1733,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--verdict", help="verdict.json path (decide only)")
     ap.add_argument("--hw-run-result", help="hw-run result string")
     ap.add_argument("--staging", help="staging branch name (decide only)")
+    ap.add_argument("--decider-unavailable", dest="decider_unavailable", help="decide only: record the seat as unavailable with this reason, without calling the model")
     ap.add_argument("--routes", help="routes.json output path (prelim only)")
     ap.add_argument("--system-prompt", required=True)
     ap.add_argument("--out", required=True, help="output JSON path")
