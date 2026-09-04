@@ -148,6 +148,46 @@ impl DeviceBuffer {
             ownership: DeviceBufferOwnership::Borrowed,
         }
     }
+
+    /// Non-owning byte-range view into this allocation: bytes
+    /// `[byte_offset, byte_offset + byte_len)`.
+    ///
+    /// This is the single home of the device-pointer reinterpretation that
+    /// used to be hand-rolled at every callsite (`as_ptr() as *mut u8`
+    /// + `add` + `DeviceBuffer::from_raw`). The range is validated against
+    /// the allocation size with checked arithmetic before any pointer
+    /// arithmetic runs, so the `add` below is always in-bounds.
+    ///
+    /// Like [`DeviceBuffer::alias`], the view is `Borrowed`: it must NOT be
+    /// freed, and it must not outlive the buffer it was cut from.
+    ///
+    /// # Safety
+    ///
+    /// The invariant that holds: `byte_offset + byte_len <= self.size()`,
+    /// enforced by the checked range test below, so the derived pointer
+    /// addresses only bytes of this live device allocation (`u8` has
+    /// alignment 1, so there is no alignment precondition beyond the
+    /// allocation itself). The caller must still ensure the view does not
+    /// outlive the owning buffer and is never passed to a free path.
+    pub fn byte_view(&self, byte_offset: usize, byte_len: usize) -> DeviceBuffer {
+        let end = byte_offset
+            .checked_add(byte_len)
+            .expect("DeviceBuffer::byte_view range overflow");
+        assert!(
+            end <= self.size,
+            "DeviceBuffer::byte_view [{byte_offset}, {end}) exceeds allocation of {} bytes",
+            self.size,
+        );
+        // SAFETY: `end <= self.size` (checked above), so `add(byte_offset)`
+        // stays in-bounds of the same allocation and names only live device
+        // bytes. The wrapper is Borrowed, so drop never frees it.
+        let ptr = unsafe { (self.ptr as *mut u8).add(byte_offset) as *mut std::ffi::c_void };
+        DeviceBuffer {
+            ptr,
+            size: byte_len,
+            ownership: DeviceBufferOwnership::Borrowed,
+        }
+    }
 }
 
 // DeviceBuffer is Send — GPU pointers can be sent between threads.
