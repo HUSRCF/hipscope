@@ -361,6 +361,54 @@ def test_prelim_run_hardware_false_on_garbage():
     comments = json.loads(gh_comments.read_text())
     assert any("sol prelim unavailable" in b.lower() or "run_hardware" in b.lower() for b in [c["body"] for c in comments])
 
+def test_prelim_relative_checkout_reaches_the_seat():
+    # The workflow runs `review.py --checkout pr` from the job workspace. The
+    # first live run on #686 died before Sol read anything: omp was launched
+    # with cwd=pr and `--cwd pr`, resolved `pr/pr`, and exited 1.
+    tmp = Path(tempfile.mkdtemp())
+    models_dir = tmp / "models"
+    models_dir.mkdir()
+    checkout, base, head = _make_repo(tmp / "pr")
+    select = {"schema":"hipfire.hw-gate.select","version":1,"needs_hw":True,"buckets":["load"],"policy_paths":[],"surfaces":{"load":[],"serve":[],"kernel":[],"policy":[],"other":[]},"request":None,"request_error":None}
+    select_path = tmp / "select.json"
+    select_path.write_text(json.dumps(select))
+    fixtures_path = tmp / "fixtures.json"
+    fixtures_path.write_text(json.dumps(_fixtures_content(models_dir)))
+    sol_response = {
+        "phase": "prelim","summary":"s","surfaces":["load"],"suspected_regressions":[],
+        "run_hardware": True,"run_hardware_reasons":["touches the loader"],
+        "routes":[],"unavailable_routes":[],"claim_assessment":"","questions_for_author":[]
+    }
+    resp_path = tmp / "resp.json"
+    resp_path.write_text(json.dumps([{"json": sol_response}]))
+    gh_comments = tmp / "gh_comments.json"
+    gh_comments.write_text("[]")
+    out_path = tmp / "prelim.json"
+    routes_path = tmp / "routes.json"
+    system_prompt = tmp / "sol.md"
+    system_prompt.write_text("prompt")
+    omp_log = tmp / "omp_log.jsonl"
+    env = os.environ.copy()
+    env["HW_GATE_OMP_BIN"] = str(FAKE_OMP)
+    env["HW_GATE_GH_BIN"] = str(FAKE_GH)
+    env["FAKE_OMP_RESPONSES"] = str(resp_path)
+    env["FAKE_OMP_CALL_COUNT"] = str(tmp / "omp_count")
+    env["FAKE_GH_LOG"] = str(tmp / "gh_log.jsonl")
+    env["FAKE_GH_COMMENTS"] = str(gh_comments)
+    env["FAKE_OMP_LOG"] = str(omp_log)
+    env["HIPFIRE_MODELS_DIR"] = str(models_dir)
+    rel_checkout = os.path.relpath(checkout, tmp)  # "pr/checkout", as the workflow's "pr"
+    cmd = [sys.executable, str(REVIEW_PATH),"--seat","sol","--phase","prelim","--repo","o/r","--pr","1","--base",base,"--head",head,"--checkout",rel_checkout,"--select",str(select_path),"--fixtures",str(fixtures_path),"--system-prompt",str(system_prompt),"--out",str(out_path),"--routes",str(routes_path)]
+    result = subprocess.run(cmd, env=env, capture_output=True, text=True, cwd=tmp)
+    assert result.returncode == 0, result.stderr
+    data = json.loads(out_path.read_text())
+    assert data["prelim"] is not None, gh_comments.read_text()
+    assert data["run_hardware"] is True
+    launches = [json.loads(l) for l in omp_log.read_text().splitlines() if l.strip()]
+    assert launches, "seat was never launched"
+    cwd_arg = launches[0]["args"][launches[0]["args"].index("--cwd") + 1]
+    assert os.path.isabs(cwd_arg) and Path(cwd_arg) == checkout.resolve()
+
 # ---------------------------------------------------------------------------
 # verdict e2e
 # ---------------------------------------------------------------------------
