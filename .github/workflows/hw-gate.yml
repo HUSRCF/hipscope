@@ -402,6 +402,11 @@ jobs:
           GH_TOKEN: ${{ steps.token.outputs.token || github.token }}
         run: |
           set -euo pipefail
+          # The runner reuses its workspace: without the rm, Fable inherits the
+          # previous PR's evidence files and home (run 33866758629 on #702
+          # carried #700's fable-summary.md and #686's route outputs) and can
+          # cite them as its own. Every session starts empty.
+          rm -rf fable-evidence fable-home
           mkdir -p fable-evidence fable-home
           exec 9>/home/kaden/actions-runner/_cache/hw-gate-gpu.lock
           flock --exclusive --timeout 3600 9
