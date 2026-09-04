@@ -1154,6 +1154,7 @@ name = "hipfire-arch-gemma4"
 version = "0.3.0"
 dependencies = [
  "hip-bridge",
+ "hipfire-config",
  "hipfire-dispatch",
  "hipfire-runtime",
  "rdna-compute",
@@ -1231,6 +1232,7 @@ name = "hipfire-arch-muse-glimmer"
 version = "0.3.0"
 dependencies = [
  "hip-bridge",
+ "hipfire-config",
  "hipfire-dispatch",
  "hipfire-runtime",
  "rdna-compute",
@@ -1272,6 +1274,7 @@ name = "hipfire-arch-qwen35-vl"
 version = "0.3.0"
 dependencies = [
  "hip-bridge",
+ "hipfire-config",
  "hipfire-runtime",
  "image",
  "rdna-compute",

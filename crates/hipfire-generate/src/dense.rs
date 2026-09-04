@@ -358,7 +358,7 @@ pub fn generate_deepseek4_spec(
     }
 
     // spec_k: env chain → 2 (the deepseek4-specific default; see generate_deepseek4).
-    let spec_k: usize = std::env::var("HIPFIRE_DEEPSEEK4_SPEC_K")
+    let spec_k: usize = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_SPEC_K")
         .ok()
         .and_then(|s| s.parse().ok())
         .or_else(|| Some(hipfire_runtime::config::get().mtp_k))
@@ -630,7 +630,7 @@ pub fn generate_deepseek4_spec(
             };
             let action = ds4_cache_action(&terminal, &run.finish, run.finish.visible_text.as_str());
             if action.store {
-                if std::env::var("HIPFIRE_DEEPSEEK4_CACHE_TRACE")
+                if hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_CACHE_TRACE")
                     .ok()
                     .as_deref()
                     == Some("1")
@@ -644,7 +644,7 @@ pub fn generate_deepseek4_spec(
                 }
                 let _ = ds4_apply_cache_action(
                     |fp, seq| {
-                        if std::env::var("HIPFIRE_DEEPSEEK4_CACHE_TRACE")
+                        if hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_CACHE_TRACE")
                             .ok()
                             .as_deref()
                             == Some("1")
@@ -772,7 +772,7 @@ pub fn generate_deepseek4(
         return;
     }
 
-    if std::env::var("HIPFIRE_DEEPSEEK4_DUMP_PROMPT")
+    if hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_DUMP_PROMPT")
         .ok()
         .as_deref()
         == Some("1")
@@ -1045,11 +1045,11 @@ pub fn generate_deepseek4(
     // for local deployment; we honor that as the default. Pure greedy
     // (temp <= 1e-6) is supported but enters block-level attractors on
     // structured prompts.
-    let top_k: usize = std::env::var("HIPFIRE_DEEPSEEK4_TOP_K")
+    let top_k: usize = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_TOP_K")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
-    let seed: u64 = std::env::var("HIPFIRE_DEEPSEEK4_SEED")
+    let seed: u64 = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_SEED")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or_else(|| {
@@ -1407,7 +1407,7 @@ pub fn generate_deepseek4(
             && m.conversation_tokens.len() > decode_start_tokens_idx
         {
             let cached_seq: Vec<u32> = m.conversation_tokens[decode_start_tokens_idx..].to_vec();
-            if std::env::var("HIPFIRE_DEEPSEEK4_CACHE_TRACE")
+            if hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_CACHE_TRACE")
                 .ok()
                 .as_deref()
                 == Some("1")
@@ -1421,7 +1421,7 @@ pub fn generate_deepseek4(
             }
             let _ = ds4_apply_cache_action(
                 |fp, seq| {
-                    if std::env::var("HIPFIRE_DEEPSEEK4_CACHE_TRACE")
+                    if hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_CACHE_TRACE")
                         .ok()
                         .as_deref()
                         == Some("1")
@@ -1610,7 +1610,7 @@ pub fn generate_deepseek4_heterogeneous(
         !matches!(think_mode, ThinkMode::NonThink),
         ds4_gen_start_contract_version(),
     );
-    let top_k = std::env::var("HIPFIRE_DEEPSEEK4_TOP_K")
+    let top_k = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_TOP_K")
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(0);
@@ -1815,17 +1815,17 @@ fn gemma4_logit_trace_config() -> Option<&'static Gemma4LogitTraceConfig> {
     static CONFIG: OnceLock<Option<Gemma4LogitTraceConfig>> = OnceLock::new();
     CONFIG
         .get_or_init(|| {
-            let dir = std::env::var_os("HIPFIRE_GEMMA4_LOGIT_TRACE_DIR")?;
-            let top_k = std::env::var("HIPFIRE_GEMMA4_LOGIT_TRACE_TOPK")
+            let dir = hipfire_config::developer_var_os("HIPFIRE_GEMMA4_LOGIT_TRACE_DIR")?;
+            let top_k = hipfire_config::developer_var("HIPFIRE_GEMMA4_LOGIT_TRACE_TOPK")
                 .ok()
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(16)
                 .clamp(1, 128);
-            let max_steps = std::env::var("HIPFIRE_GEMMA4_LOGIT_TRACE_MAX_STEPS")
+            let max_steps = hipfire_config::developer_var("HIPFIRE_GEMMA4_LOGIT_TRACE_MAX_STEPS")
                 .ok()
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(8192);
-            let full_steps = std::env::var("HIPFIRE_GEMMA4_LOGIT_TRACE_FULL_STEPS")
+            let full_steps = hipfire_config::developer_var("HIPFIRE_GEMMA4_LOGIT_TRACE_FULL_STEPS")
                 .unwrap_or_default()
                 .split(',')
                 .filter_map(|value| value.trim().parse().ok())
@@ -2051,7 +2051,7 @@ pub fn generate_gemma4(
     // ── Prompt build (same two-path branch as the lfm2moe AR path) ──
     let prompt_ids: Vec<u32> = {
         let tokenizer = m.tokenizer.as_ref().unwrap();
-        let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
+        let jinja_enabled = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
         let try_jinja = jinja_enabled && m.chat_template.is_some();
         let mut ids: Vec<u32> = if try_jinja {
             let template = m.chat_template.as_ref().unwrap();
@@ -2169,7 +2169,7 @@ pub fn generate_gemma4(
     // opt-in until long-context parity is certified on each supported board.
     let mut last_logits: Vec<f32> = Vec::new();
     {
-        let requested_prefill_batch = std::env::var("HIPFIRE_GEMMA4_PREFILL_BATCH")
+        let requested_prefill_batch = hipfire_config::developer_var("HIPFIRE_GEMMA4_PREFILL_BATCH")
             .ok()
             .and_then(|value| value.parse::<usize>().ok());
         let resolved_prefill_batch =
@@ -2262,7 +2262,7 @@ pub fn generate_gemma4(
     // avoids that, which is how the numbers above were taken.
     let eagle_active = bundle.eagle.is_some()
         && temp <= 1e-6
-        && std::env::var("HIPFIRE_GEMMA4_EAGLE").ok().as_deref() == Some("1");
+        && hipfire_config::developer_var("HIPFIRE_GEMMA4_EAGLE").ok().as_deref() == Some("1");
     if eagle_active {
         let draft_len = bundle.eagle.as_ref().unwrap().draft_len;
         // Seed hidden = post-`model.norm` hidden of the last prompt position
@@ -2591,7 +2591,7 @@ pub fn generate_gemma4(
 /// `HIPFIRE_GLIMMER_TAP_LAYERS=0,12,24,36,48` selects the other convention so
 /// the two can be compared on hardware instead of argued about.
 pub fn glimmer_tap_layers(n_layers: usize) -> Vec<usize> {
-    match std::env::var("HIPFIRE_GLIMMER_TAP_LAYERS") {
+    match hipfire_config::developer_var("HIPFIRE_GLIMMER_TAP_LAYERS") {
         Ok(v) if !v.trim().is_empty() => v
             .split(',')
             .filter_map(|t| t.trim().parse::<usize>().ok())
@@ -4234,7 +4234,7 @@ pub fn generate_muse_glimmer(
     // ── Prompt build (same two-path branch as the gemma4 AR path) ──
     let prompt_ids: Vec<u32> = {
         let tokenizer = m.tokenizer.as_ref().unwrap();
-        let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
+        let jinja_enabled = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
         let try_jinja = jinja_enabled && m.chat_template.is_some();
         let mut ids: Vec<u32> = if try_jinja {
             let template = m.chat_template.as_ref().unwrap();
@@ -4467,11 +4467,11 @@ pub fn generate_muse_glimmer(
     // On hit: rewind_session_to(lcp) BEFORE mirror/seq truncation.
     // On miss / cache-disabled / rewind error: reset_session_state + full prefill at 0.
     let (prefill_ids, prefill_start_pos): (Vec<u32>, u32) = {
-        let cache_disabled = std::env::var("HIPFIRE_GLIMMER_PROMPT_CACHE")
+        let cache_disabled = hipfire_config::developer_var("HIPFIRE_GLIMMER_PROMPT_CACHE")
             .ok()
             .as_deref()
             == Some("0");
-        let trace = std::env::var("HIPFIRE_GLIMMER_CACHE_TRACE").ok().as_deref() == Some("1");
+        let trace = hipfire_config::developer_var("HIPFIRE_GLIMMER_CACHE_TRACE").ok().as_deref() == Some("1");
         if cache_disabled {
             // Opting out of the cache does NOT restore the CLI's per-request
             // reset — arch 14 is in the cache_capable allowlist either way, so
@@ -4638,7 +4638,7 @@ pub fn generate_muse_glimmer(
             &bundle.weights,
         );
     let fast_sample_on = hipfire_runtime::config::get().dflash_fast_sample;
-    let temp_spec_env_off = std::env::var("HIPFIRE_DFLASH_TEMP_SPEC").ok().as_deref() == Some("0");
+    let temp_spec_env_off = hipfire_config::developer_var("HIPFIRE_DFLASH_TEMP_SPEC").ok().as_deref() == Some("0");
     let spec_mode = glimmer_spec_admission(
         bundle.drafter.is_some(),
         max_tokens,
@@ -4657,7 +4657,7 @@ pub fn generate_muse_glimmer(
     // Shared by native AR, profit probes, and post-retirement AR tail.
     let top_k_opt = if top_k > 0 { Some(top_k as u32) } else { None };
     let gpu_sample = !matches!(
-        std::env::var("HIPFIRE_GLIMMER_GPU_SAMPLE").ok().as_deref(),
+        hipfire_config::developer_var("HIPFIRE_GLIMMER_GPU_SAMPLE").ok().as_deref(),
         Some("0")
     );
     let mut gpu_rng: u32 = (rng.next_u64() as u32) | 1;
@@ -4673,13 +4673,13 @@ pub fn generate_muse_glimmer(
     let mut spec_accepted: usize = 0;
     // Request-local profit guard: default on for greedy spec; kill-switch or
     // timing-distorting diag/audit modes disable it for this request only.
-    let profit_guard_env_off = std::env::var("HIPFIRE_GLIMMER_SPEC_PROFIT_GUARD")
+    let profit_guard_env_off = hipfire_config::developer_var("HIPFIRE_GLIMMER_SPEC_PROFIT_GUARD")
         .ok()
         .as_deref()
         == Some("0");
-    let profit_guard_diag_off = std::env::var("HIPFIRE_GLIMMER_SPEC_DIAG").ok().as_deref()
+    let profit_guard_diag_off = hipfire_config::developer_var("HIPFIRE_GLIMMER_SPEC_DIAG").ok().as_deref()
         == Some("1")
-        || std::env::var("HIPFIRE_GLIMMER_DEVICE_CAPTURE_AUDIT")
+        || hipfire_config::developer_var("HIPFIRE_GLIMMER_DEVICE_CAPTURE_AUDIT")
             .ok()
             .as_deref()
             == Some("1");
@@ -4780,7 +4780,7 @@ pub fn generate_muse_glimmer(
             loop {
                 let t_window = std::time::Instant::now();
                 let do_window_timing =
-                    std::env::var("HIPFIRE_GLIMMER_TIMING").ok().as_deref() == Some("1");
+                    hipfire_config::developer_var("HIPFIRE_GLIMMER_TIMING").ok().as_deref() == Some("1");
                 if generated_count >= max_tokens {
                     break;
                 }
@@ -4845,7 +4845,7 @@ pub fn generate_muse_glimmer(
                 let t_after_noise = t_window.elapsed();
                 let device_capture = bundle.device_hidden_capture_enabled();
                 // Freeze effective ctx_cap to min(configured, drafter scratch, device log).
-                let configured_ctx_cap = std::env::var("HIPFIRE_GLIMMER_CTX_CAP")
+                let configured_ctx_cap = hipfire_config::developer_var("HIPFIRE_GLIMMER_CTX_CAP")
                     .ok()
                     .and_then(|v| v.trim().parse::<usize>().ok())
                     .filter(|v| *v > 0)
@@ -4976,7 +4976,7 @@ pub fn generate_muse_glimmer(
                 };
                 if let Err(e) = drafter_ok {
                     // Bring-up: requested drafter must be loud and fatal, not silent fallback
-                    let fatal = std::env::var("HIPFIRE_GLIMMER_SPEC_FALLBACK")
+                    let fatal = hipfire_config::developer_var("HIPFIRE_GLIMMER_SPEC_FALLBACK")
                         .ok()
                         .as_deref()
                         != Some("1");
@@ -5075,7 +5075,7 @@ pub fn generate_muse_glimmer(
                 let t_after_drafter = t_window.elapsed();
                 // Bring-up diagnostic: HIPFIRE_GLIMMER_SPEC_DIAG=1 — device mode
                 // does not require/download host hidden; print backend + logical length.
-                if std::env::var("HIPFIRE_GLIMMER_SPEC_DIAG").ok().as_deref() == Some("1")
+                if hipfire_config::developer_var("HIPFIRE_GLIMMER_SPEC_DIAG").ok().as_deref() == Some("1")
                     && windows < 2
                 {
                     let l2 = |v: &[f32]| -> f32 { v.iter().map(|x| x * x).sum::<f32>().sqrt() };
@@ -5360,7 +5360,7 @@ pub fn generate_muse_glimmer(
                 // accept_greedy_prefix). Gate so sampled does not emit a spurious
                 // FAILED when the greedy comparison is not in use.
                 if spec_mode == GlimmerSpecMode::Greedy
-                    && std::env::var("HIPFIRE_GLIMMER_SPEC_PERTURB")
+                    && hipfire_config::developer_var("HIPFIRE_GLIMMER_SPEC_PERTURB")
                         .ok()
                         .as_deref()
                         == Some("1")
@@ -5958,7 +5958,7 @@ pub fn generate_lfm2moe(
         // Jinja default-ON (flipped 2026-06-09): render through the model's chat
         // template for ALL arches; opt out with HIPFIRE_JINJA_CHAT=0 (hand-rolled
         // ChatML/Plain). Falls back to Plain automatically when no template resolves.
-        let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
+        let jinja_enabled = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
         let try_jinja = jinja_enabled && m.chat_template.is_some();
         if try_jinja {
             let template = m.chat_template.as_ref().unwrap();
@@ -6345,7 +6345,7 @@ pub fn generate_minimax(
         // jinja on for both (falls back to Plain only when the .hfq carries no
         // template).
         // Jinja default-ON (flipped 2026-06-09); opt out with HIPFIRE_JINJA_CHAT=0.
-        let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
+        let jinja_enabled = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
         let try_jinja = jinja_enabled && m.chat_template.is_some();
         if try_jinja {
             let template = m.chat_template.as_ref().unwrap();
@@ -6509,7 +6509,7 @@ pub fn generate_minimax(
             // the degenerate pure-extension case (rewind is then a no-op).
             let cache_hit = lcp > 0 && lcp < prompt_ids.len();
             let partial = lcp < prior_len;
-            if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
+            if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
                 eprintln!(
                 "[minimax-cache] prior_len={} rendered_len={} lcp={} hit={} partial={} n_tokens={}",
                 prior_len, prompt_ids.len(), lcp, cache_hit, cache_hit && partial,
@@ -6555,7 +6555,7 @@ pub fn generate_minimax(
         // dtypes have batched kernels; the pre-check routes unsupported tiers
         // (MQ3-Lloyd etc.) to the sequential path to avoid a mid-pass error.
         // Force off with HIPFIRE_MINIMAX_BATCH_PREFILL=0.
-        let batch_prefill = std::env::var_os("HIPFIRE_MINIMAX_BATCH_PREFILL")
+        let batch_prefill = hipfire_config::developer_var_os("HIPFIRE_MINIMAX_BATCH_PREFILL")
             .map_or(true, |v| v != "0")
             && minimax::forward::forward_batch_supported(weights);
         if batch_prefill && !prefill_ids.is_empty() {
@@ -6768,7 +6768,7 @@ pub fn generate_cohere2moe(
         // (b) never matches across turns so the LCP prompt-cache is dead. Force
         // jinja on (falls back to Plain only when the .hfq carries no template).
         // Jinja default-ON; opt out with HIPFIRE_JINJA_CHAT=0.
-        let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
+        let jinja_enabled = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
         let try_jinja = jinja_enabled && m.chat_template.is_some();
         if try_jinja {
             let template = m.chat_template.as_ref().unwrap();
@@ -6822,7 +6822,7 @@ pub fn generate_cohere2moe(
             match render_result {
                 Ok(rendered) => {
                     primed_think = rendered.trim_end().ends_with("<think>");
-                    if std::env::var("HIPFIRE_C2M_DUMP_PROMPT").ok().as_deref() == Some("1") {
+                    if hipfire_config::developer_var("HIPFIRE_C2M_DUMP_PROMPT").ok().as_deref() == Some("1") {
                         let ids = tokenizer.encode(&rendered);
                         eprintln!(
                             "[c2m prompt dump] rendered chars={} tokens={}\n>>> HEAD(400):\n{}\n>>> TAIL(800):\n{}\n<<< end",
@@ -6933,7 +6933,7 @@ pub fn generate_cohere2moe(
         // the degenerate pure-extension case (rewind is then a no-op).
         let cache_hit = lcp > 0 && lcp < prompt_ids.len();
         let partial = lcp < prior_len;
-        if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
+        if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
             eprintln!(
                 "[cohere2moe-cache] prior_len={} rendered_len={} lcp={} hit={} partial={} n_tokens={}",
                 prior_len, prompt_ids.len(), lcp, cache_hit, cache_hit && partial,
@@ -7089,7 +7089,7 @@ pub fn generate_cohere2moe(
     // or a tool_call) was produced; if EOS arrives before that, mask it and
     // re-sample so the model is forced into <|START_TEXT|>/<|START_ACTION|> and
     // actually returns content. Opt out with HIPFIRE_C2M_EMPTY_TURN_GUARD=0.
-    let empty_turn_guard = std::env::var("HIPFIRE_C2M_EMPTY_TURN_GUARD")
+    let empty_turn_guard = hipfire_config::developer_var("HIPFIRE_C2M_EMPTY_TURN_GUARD")
         .ok()
         .as_deref()
         != Some("0");

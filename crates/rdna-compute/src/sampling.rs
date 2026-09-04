@@ -13,15 +13,9 @@ use hip_bridge::{HipError, HipResult};
 
 /// Whether the multi-workgroup parallel sampler is enabled (default ON).
 /// `HIPFIRE_SAMPLE_PARALLEL=0` forces the legacy single-block kernel (for
-/// byte-exact A/B and as a fallback). Read once, cached.
+/// byte-exact A/B and as a fallback). Snapshot-backed, no per-flag cache.
 fn sample_parallel_enabled() -> bool {
-    use std::sync::OnceLock;
-    static EN: OnceLock<bool> = OnceLock::new();
-    *EN.get_or_init(|| {
-        hipfire_config::developer_var("HIPFIRE_SAMPLE_PARALLEL")
-            .map(|v| v != "0")
-            .unwrap_or(true)
-    })
+    hipfire_config::developer_bool("HIPFIRE_SAMPLE_PARALLEL", true)
 }
 
 /// Whether the tie-safe fast reducer is enabled (default ON). This keeps the
@@ -29,13 +23,7 @@ fn sample_parallel_enabled() -> bool {
 /// performance control without falling all the way back to the single-block
 /// sampler.
 fn sample_fast_stable_enabled() -> bool {
-    use std::sync::OnceLock;
-    static EN: OnceLock<bool> = OnceLock::new();
-    *EN.get_or_init(|| {
-        hipfire_config::developer_var("HIPFIRE_SAMPLE_FAST")
-            .map(|v| v != "0")
-            .unwrap_or(true)
-    })
+    hipfire_config::developer_bool("HIPFIRE_SAMPLE_FAST", true)
 }
 
 /// HIP source for the default parallel sampler module (`sample_top_p_parallel`,

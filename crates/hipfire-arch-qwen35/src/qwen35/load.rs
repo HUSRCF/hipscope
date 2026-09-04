@@ -4266,7 +4266,7 @@ fn try_load_packed_mq4_experts(
             HostBlob::Owned(results.next().expect("two packed MQ4 jobs").data),
         )
     };
-    let trace = std::env::var_os("HIPFIRE_LOAD_TRACE").is_some();
+    let trace = hipfire_config::developer_var_os("HIPFIRE_LOAD_TRACE").is_some();
     let zero_copy =
         matches!(gate_up_host, HostBlob::Borrowed(_)) && matches!(down_host, HostBlob::Borrowed(_));
     let t_upload = Instant::now();

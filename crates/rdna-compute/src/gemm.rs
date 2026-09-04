@@ -211,12 +211,8 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<bool> {
-        static ENABLED: OnceLock<bool> = OnceLock::new();
         static ADMISSION_LOGGED: OnceLock<()> = OnceLock::new();
-        let enabled = *ENABLED.get_or_init(|| {
-            hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_GFX942_E8_ROCBLAS").as_deref()
-                == Ok("1")
-        });
+        let enabled = hipfire_config::developer_bool("HIPFIRE_DEEPSEEK4_GFX942_E8_ROCBLAS", false);
         if self.arch != "gfx942"
             || !enabled
             || weight.dtype != DType::MFP4G32E8SOA
@@ -2659,29 +2655,20 @@ impl Gpu {
             return self.fused_qkv_hfq4g256_dp4a(a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k);
         }
 
-        static GFX1151_QKVZA_WAVE64: OnceLock<bool> = OnceLock::new();
         let gfx1151_wave64 = self.arch_caps.is_gfx1151()
-            && *GFX1151_QKVZA_WAVE64.get_or_init(|| {
-                hipfire_config::developer_var("HIPFIRE_GFX1151_QKVZA_WAVE64").as_deref() == Ok("1")
-            });
-        static GFX1151_QKV_ALL_BUFFER_CPOL: OnceLock<String> = OnceLock::new();
+            && hipfire_config::developer_bool("HIPFIRE_GFX1151_QKVZA_WAVE64", false);
+        let gfx1151_all_buffer_cpol_owned: String =
+            hipfire_config::developer_var("HIPFIRE_GFX1151_QKV_ALL_BUFFER_CPOL")
+                .unwrap_or_default()
+                .to_ascii_lowercase();
         let gfx1151_all_buffer_cpol = if self.arch_caps.is_gfx1151() && k == 2_048 {
-            GFX1151_QKV_ALL_BUFFER_CPOL
-                .get_or_init(|| {
-                    hipfire_config::developer_var("HIPFIRE_GFX1151_QKV_ALL_BUFFER_CPOL")
-                        .unwrap_or_default()
-                        .to_ascii_lowercase()
-                })
-                .as_str()
+            gfx1151_all_buffer_cpol_owned.as_str()
         } else {
             ""
         };
-        static GFX1151_QKV_X_BUFFER: OnceLock<bool> = OnceLock::new();
         let gfx1151_x_buffer = self.arch_caps.is_gfx1151()
             && k == 2_048
-            && *GFX1151_QKV_X_BUFFER.get_or_init(|| {
-                hipfire_config::developer_var("HIPFIRE_GFX1151_QKV_X_BUFFER").as_deref() == Ok("1")
-            });
+            && hipfire_config::developer_bool("HIPFIRE_GFX1151_QKV_X_BUFFER", false);
         let cdna_wave64 = self.arch_caps.is_wave64_native()
             || (self.arch_caps.is_rdna3_dgpu() && self.flags.rdna3_hfq4_qkv_wave64)
             || gfx1151_wave64;
@@ -3066,74 +3053,41 @@ impl Gpu {
             self.arch_caps.is_gfx1100() && self.flags.rdna3_hfq4_qkvza_reduce_chain;
         let rdna3_k2048 =
             self.arch_caps.is_gfx1100() && self.flags.rdna3_hfq4_qkvza_k2048 && k == 2_048;
-        static GFX1151_WEIGHT_BUFFER_LOADS: OnceLock<bool> = OnceLock::new();
         let gfx1151_k2048_buffer = self.arch_caps.is_gfx1151()
             && k == 2_048
-            && *GFX1151_WEIGHT_BUFFER_LOADS.get_or_init(|| {
-                hipfire_config::developer_var("HIPFIRE_GFX1151_WEIGHT_BUFFER_LOADS").as_deref()
-                    == Ok("1")
-                    || hipfire_config::developer_var("HIPFIRE_GFX1151_WEIGHT_BUFFER_QKVZA")
-                        .as_deref()
-                        == Ok("1")
-            });
+            && (hipfire_config::developer_bool("HIPFIRE_GFX1151_WEIGHT_BUFFER_LOADS", false)
+                || hipfire_config::developer_bool("HIPFIRE_GFX1151_WEIGHT_BUFFER_QKVZA", false));
         let gfx1151_k2048_all_buffer = self.arch_caps.is_gfx1151() && k == 2_048;
         let gfx1151_k2048_hybrid_buffer =
             self.arch_caps.is_gfx1151() && k == 2_048 && total_m == 1_281;
-        static GFX1151_QKVZA_X_BUFFER_LARGE: OnceLock<bool> = OnceLock::new();
         let gfx1151_k2048_x_buffer_large = self.arch_caps.is_gfx1151()
             && k == 2_048
             && total_m > 2_048
-            && *GFX1151_QKVZA_X_BUFFER_LARGE.get_or_init(|| {
-                hipfire_config::developer_var("HIPFIRE_GFX1151_QKVZA_X_BUFFER_LARGE").as_deref()
-                    == Ok("1")
-            });
-        static GFX1151_QKVZA_ALL_BUFFER_CPOL: OnceLock<String> = OnceLock::new();
+            && hipfire_config::developer_bool("HIPFIRE_GFX1151_QKVZA_X_BUFFER_LARGE", false);
+        let gfx1151_k2048_all_buffer_cpol_owned: String =
+            hipfire_config::developer_var("HIPFIRE_GFX1151_QKVZA_ALL_BUFFER_CPOL")
+                .unwrap_or_default()
+                .to_ascii_lowercase();
         let gfx1151_k2048_all_buffer_cpol = if self.arch_caps.is_gfx1151() && k == 2_048 {
-            GFX1151_QKVZA_ALL_BUFFER_CPOL
-                .get_or_init(|| {
-                    hipfire_config::developer_var("HIPFIRE_GFX1151_QKVZA_ALL_BUFFER_CPOL")
-                        .unwrap_or_default()
-                        .to_ascii_lowercase()
-                })
-                .as_str()
+            gfx1151_k2048_all_buffer_cpol_owned.as_str()
         } else {
             ""
         };
-        static GFX1151_QKVZA_LDSX8_BUFFER: OnceLock<bool> = OnceLock::new();
         let gfx1151_k2048_ldsx8_buffer = self.arch_caps.is_gfx1151()
             && k == 2_048
-            && *GFX1151_QKVZA_LDSX8_BUFFER.get_or_init(|| {
-                hipfire_config::developer_var("HIPFIRE_GFX1151_QKVZA_LDSX8_BUFFER").as_deref()
-                    == Ok("1")
-            });
-        static GFX1151_QKVZA_PAIR_BUFFER: OnceLock<bool> = OnceLock::new();
+            && hipfire_config::developer_bool("HIPFIRE_GFX1151_QKVZA_LDSX8_BUFFER", false);
         let gfx1151_k2048_pair_buffer = self.arch_caps.is_gfx1151()
             && k == 2_048
-            && *GFX1151_QKVZA_PAIR_BUFFER.get_or_init(|| {
-                hipfire_config::developer_var("HIPFIRE_GFX1151_QKVZA_PAIR_BUFFER").as_deref()
-                    == Ok("1")
-            });
-        static GFX1151_QKVZA_K2048_HOIST: OnceLock<bool> = OnceLock::new();
+            && hipfire_config::developer_bool("HIPFIRE_GFX1151_QKVZA_PAIR_BUFFER", false);
         let gfx1151_k2048_hoist = self.arch_caps.is_gfx1151()
             && k == 2_048
-            && *GFX1151_QKVZA_K2048_HOIST.get_or_init(|| {
-                hipfire_config::developer_var("HIPFIRE_GFX1151_QKVZA_K2048_HOIST").as_deref()
-                    == Ok("1")
-            });
-        static GFX1151_QKVZA_R2: OnceLock<bool> = OnceLock::new();
+            && hipfire_config::developer_bool("HIPFIRE_GFX1151_QKVZA_K2048_HOIST", false);
         let gfx1151_k2048_r2 = self.arch_caps.is_gfx1151()
             && k == 2_048
-            && *GFX1151_QKVZA_R2.get_or_init(|| {
-                hipfire_config::developer_var("HIPFIRE_GFX1151_QKVZA_R2").as_deref() == Ok("1")
-            });
-        static GFX1151_QKVZA_R2_BUFFER: OnceLock<bool> = OnceLock::new();
+            && hipfire_config::developer_bool("HIPFIRE_GFX1151_QKVZA_R2", false);
         let gfx1151_k2048_r2_buffer = self.arch_caps.is_gfx1151()
             && k == 2_048
-            && *GFX1151_QKVZA_R2_BUFFER.get_or_init(|| {
-                hipfire_config::developer_var("HIPFIRE_GFX1151_QKVZA_R2_BUFFER").as_deref()
-                    == Ok("1")
-            });
-        static GFX1151_QKVZA_R4_STREAM: OnceLock<bool> = OnceLock::new();
+            && hipfire_config::developer_bool("HIPFIRE_GFX1151_QKVZA_R2_BUFFER", false);
         let gfx1151_k2048_r4_stream = self.arch_caps.is_gfx1151()
             && k == 2_048
             && total_m > 2_048
@@ -3141,27 +3095,14 @@ impl Gpu {
             && z_m.is_multiple_of(4)
             && beta_m.is_multiple_of(4)
             && alpha_m.is_multiple_of(4)
-            && *GFX1151_QKVZA_R4_STREAM.get_or_init(|| {
-                hipfire_config::developer_var("HIPFIRE_GFX1151_QKVZA_R4_STREAM").as_deref()
-                    == Ok("1")
-            });
-        static GFX1151_QKVZA_WAVE64_SHARE_X: OnceLock<bool> = OnceLock::new();
+            && hipfire_config::developer_bool("HIPFIRE_GFX1151_QKVZA_R4_STREAM", false);
         let gfx1151_wave64_share_x = self.arch_caps.is_gfx1151()
             && k == 2_048
-            && *GFX1151_QKVZA_WAVE64_SHARE_X.get_or_init(|| {
-                hipfire_config::developer_var("HIPFIRE_GFX1151_QKVZA_WAVE64_SHARE_X").as_deref()
-                    == Ok("1")
-            });
-        static QKVZA_R2: OnceLock<bool> = OnceLock::new();
+            && hipfire_config::developer_bool("HIPFIRE_GFX1151_QKVZA_WAVE64_SHARE_X", false);
         let rdna3_k2048_r2 = rdna3_k2048
-            && *QKVZA_R2.get_or_init(|| {
-                hipfire_config::developer_var("HIPFIRE_RDNA3_QKVZA_R2").as_deref() == Ok("1")
-            });
-        static QKVZA_CPOL_SLC: OnceLock<bool> = OnceLock::new();
+            && hipfire_config::developer_bool("HIPFIRE_RDNA3_QKVZA_R2", false);
         let rdna3_k2048_cpol_slc = rdna3_k2048
-            && *QKVZA_CPOL_SLC.get_or_init(|| {
-                hipfire_config::developer_var("HIPFIRE_QKVZA_CPOL").as_deref() == Ok("slc")
-            });
+            && hipfire_config::developer_var("HIPFIRE_QKVZA_CPOL").as_deref() == Ok("slc");
         let cdna_wave64 = self.arch_caps.is_wave64_native()
             || (self.arch_caps.is_rdna3_dgpu() && self.flags.rdna3_hfq4_qkv_wave64);
         let glimmer_qkvg_k6656_gfx1100 = self.arch_caps.is_gfx1100()
@@ -18093,11 +18034,10 @@ impl Gpu {
         // scratch + fixed-order finalize → deterministic at perf parity
         // (benched 16..1024 batch on gfx1100), so it is now the default.
         // HIPFIRE_DETERMINISTIC=1 still forces k2 (single-block K reduction)
-        // for the strictest single-kernel byte-parity escape hatch.
-        // Cached — getenv on every decode token would re-parse 6× per layer
-        // × N layers per step. Read once at first dispatch.
-        static FORCE_DET: OnceLock<bool> = OnceLock::new();
-        let force_det = *FORCE_DET.get_or_init(|| self.flags.deterministic);
+        // for the strictest single-kernel byte-parity escape hatch. Read from
+        // `FeatureFlags` (resolved once at GPU startup from the process
+        // snapshot), so this is a single bool load per call.
+        let force_det = self.flags.deterministic;
         let auto_variant = if force_det {
             "k2"
         } else if is_gfx115x && batch_size <= 16 {
@@ -18190,8 +18130,8 @@ impl Gpu {
         // Synchronously times only the ksplit kernel launch (not memset / convert).
         // Measures actual GPU execution time via device_synchronize pre+post —
         // costs latency vs async pipelining but gives shape-accurate µs.
-        static DUMP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let dump = *DUMP.get_or_init(|| self.flags.gemm_dump);
+        // (`gemm_dump` is a resolved `FeatureFlags` bool; no per-call cache.)
+        let dump = self.flags.gemm_dump;
         if dump {
             self.hip.device_synchronize()?;
         }
@@ -22108,8 +22048,7 @@ impl Gpu {
         n: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        static USE_LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let use_legacy = *USE_LEGACY.get_or_init(|| self.flags.q8_batched_legacy);
+        let use_legacy = self.flags.q8_batched_legacy;
         // Route to WMMA on ALL wave32-WMMA arches (gfx11 RDNA3, gfx1151
         // RDNA3.5, gfx12 RDNA4), not just RDNA4. `gemm_q8_0_wmma` selects the
         // RDNA3 vs RDNA4 kernel internally and asserts `has_wmma()`, so this is
@@ -23129,34 +23068,21 @@ impl Gpu {
         // Host-gated identity; reuses fused_gate_up_hfq4g256 arithmetic template.
         let glimmer_gate_up_k6656_gfx1100 =
             self.arch_caps.is_gfx1100() && gate_m == 19_968 && up_m == 19_968 && k == 6_656;
-        static GFX1100_DENSE_GATE_UP_STAGE_X32: OnceLock<bool> = OnceLock::new();
         let dense_gate_up_stage_x32_gfx1100 = self.arch_caps.is_gfx1100()
             && gate_m == 17_408
             && up_m == 17_408
             && k == 5_120
-            && *GFX1100_DENSE_GATE_UP_STAGE_X32.get_or_init(|| {
-                hipfire_config::developer_var("HIPFIRE_GFX1100_DENSE_GATE_UP_STAGE_X32")
-                    .map_or(true, |value| value != "0")
-            });
-        static GFX1100_DENSE_GATE_UP_PAIR: OnceLock<bool> = OnceLock::new();
+            && hipfire_config::developer_bool("HIPFIRE_GFX1100_DENSE_GATE_UP_STAGE_X32", true);
         let dense_gate_up_pair_gfx1100 = self.arch_caps.is_gfx1100()
             && gate_m == 17_408
             && up_m == 17_408
             && k == 5_120
-            && *GFX1100_DENSE_GATE_UP_PAIR.get_or_init(|| {
-                hipfire_config::developer_var("HIPFIRE_GFX1100_DENSE_GATE_UP_PAIR").as_deref()
-                    == Ok("1")
-            });
-        static GFX1100_DENSE_GATE_UP_PAIR2: OnceLock<bool> = OnceLock::new();
+            && hipfire_config::developer_bool("HIPFIRE_GFX1100_DENSE_GATE_UP_PAIR", false);
         let dense_gate_up_pair2_gfx1100 = self.arch_caps.is_gfx1100()
             && gate_m == 17_408
             && up_m == 17_408
             && k == 5_120
-            && *GFX1100_DENSE_GATE_UP_PAIR2.get_or_init(|| {
-                hipfire_config::developer_var("HIPFIRE_GFX1100_DENSE_GATE_UP_PAIR2").as_deref()
-                    == Ok("1")
-            });
-        static GFX1100_DENSE_GATE_UP_DOT_REFORM: OnceLock<bool> = OnceLock::new();
+            && hipfire_config::developer_bool("HIPFIRE_GFX1100_DENSE_GATE_UP_PAIR2", false);
         // Qwen3.6-27B MQ4, W7900/gfx1100: two fresh-process alternating
         // campaigns measured +0.42% and +0.49% decode throughput. Keep this
         // explicit because the algebraic rewrite changes FP association even
@@ -23165,11 +23091,7 @@ impl Gpu {
             && gate_m == 17_408
             && up_m == 17_408
             && k == 5_120
-            && *GFX1100_DENSE_GATE_UP_DOT_REFORM.get_or_init(|| {
-                hipfire_config::developer_var("HIPFIRE_GFX1100_DENSE_GATE_UP_DOT_REFORM").as_deref()
-                    == Ok("1")
-            });
-        static GFX1100_DENSE_GATE_UP_QUAD_PREFETCH: OnceLock<bool> = OnceLock::new();
+            && hipfire_config::developer_bool("HIPFIRE_GFX1100_DENSE_GATE_UP_DOT_REFORM", false);
         // Qwen3.6-27B MQ4, W7900/gfx1100: a fresh-process 128-token
         // A/B/B/A measured +0.42% throughput and -0.42% p50 latency. Keep
         // opt-in: 92 VGPR remains spill-free, but the gain is too small to
@@ -23178,30 +23100,17 @@ impl Gpu {
             && gate_m == 17_408
             && up_m == 17_408
             && k == 5_120
-            && *GFX1100_DENSE_GATE_UP_QUAD_PREFETCH.get_or_init(|| {
-                hipfire_config::developer_var("HIPFIRE_GFX1100_DENSE_GATE_UP_QUAD_PREFETCH")
-                    .as_deref()
-                    == Ok("1")
-            });
-        static GFX1100_DENSE_GATE_UP_SETPRIO: OnceLock<bool> = OnceLock::new();
+            && hipfire_config::developer_bool("HIPFIRE_GFX1100_DENSE_GATE_UP_QUAD_PREFETCH", false);
         let dense_gate_up_setprio_gfx1100 = self.arch_caps.is_gfx1100()
             && gate_m == 17_408
             && up_m == 17_408
             && k == 5_120
-            && *GFX1100_DENSE_GATE_UP_SETPRIO.get_or_init(|| {
-                hipfire_config::developer_var("HIPFIRE_GFX1100_DENSE_GATE_UP_SETPRIO").as_deref()
-                    == Ok("1")
-            });
-        static GFX1100_DENSE_GATE_UP_LANE0_HEADERS: OnceLock<bool> = OnceLock::new();
+            && hipfire_config::developer_bool("HIPFIRE_GFX1100_DENSE_GATE_UP_SETPRIO", false);
         let dense_gate_up_lane0_headers_gfx1100 = self.arch_caps.is_gfx1100()
             && gate_m == 17_408
             && up_m == 17_408
             && k == 5_120
-            && *GFX1100_DENSE_GATE_UP_LANE0_HEADERS.get_or_init(|| {
-                hipfire_config::developer_var("HIPFIRE_GFX1100_DENSE_GATE_UP_LANE0_HEADERS")
-                    .as_deref()
-                    == Ok("1")
-            });
+            && hipfire_config::developer_bool("HIPFIRE_GFX1100_DENSE_GATE_UP_LANE0_HEADERS", false);
         let dense_gate_up_dot_prefetch_gfx1100 =
             dense_gate_up_dot_reform_gfx1100 && dense_gate_up_quad_prefetch_gfx1100;
         let (func_name, block, grid_x) = if dense_gate_up_pair2_gfx1100 {

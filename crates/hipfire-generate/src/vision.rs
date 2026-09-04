@@ -57,10 +57,7 @@ fn emit_committed_event(
     pos: usize,
     t_ms: u64,
 ) {
-    use std::sync::LazyLock;
-    static ENABLED: LazyLock<bool> =
-        LazyLock::new(|| std::env::var("HIPFIRE_EMIT_TOKEN_IDS").ok().as_deref() == Some("1"));
-    if !*ENABLED {
+    if !hipfire_config::developer_bool("HIPFIRE_EMIT_TOKEN_IDS", false) {
         return;
     }
     // Build through `serde_json::json!` for the same reason
