@@ -15,8 +15,9 @@ mod rocsolver;
 mod vmm;
 
 pub use error::{
-    HipError, HipResult, HIP_ERROR_INVALID_IMAGE, HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED,
-    HIP_ERROR_PEER_ACCESS_NOT_ENABLED, HIP_ERROR_PEER_ACCESS_UNSUPPORTED,
+    HipError, HipErrorCode, HipResult, LaunchContext, HIP_ERROR_INVALID_IMAGE,
+    HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED, HIP_ERROR_PEER_ACCESS_NOT_ENABLED,
+    HIP_ERROR_PEER_ACCESS_UNSUPPORTED,
 };
 pub use ffi::launch_counters;
 pub use ffi::{

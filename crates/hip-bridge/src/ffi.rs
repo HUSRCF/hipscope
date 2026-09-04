@@ -1302,8 +1302,19 @@ impl HipRuntime {
     }
 
     pub fn stream_synchronize(&self, stream: &Stream) -> HipResult<()> {
+        self.stream_synchronize_raw(stream.as_raw())
+    }
+
+    /// Synchronize a stream given as a raw handle.
+    ///
+    /// Same call as [`Self::stream_synchronize`]; the raw form exists for
+    /// bounded-sync helpers that must move the handle across threads (`Stream`
+    /// is `Send` but not `Sync`, so `&Stream` cannot be shared into a scoped
+    /// thread — callers pass the handle as a `usize` and cast back here).
+    /// The handle must be a live `hipStream_t`.
+    pub fn stream_synchronize_raw(&self, stream: *mut c_void) -> HipResult<()> {
         let t = std::time::Instant::now();
-        let code = unsafe { (self.fn_stream_synchronize)(stream.0) };
+        let code = unsafe { (self.fn_stream_synchronize)(stream) };
         crate::ffi::launch_counters::stream_sync::record(t.elapsed().as_nanos() as u64);
         self.check(code, "hipStreamSynchronize")
     }
