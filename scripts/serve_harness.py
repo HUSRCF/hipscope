@@ -1951,14 +1951,7 @@ def spawn_serve(cfg, home, log):
     # Honor a caller-provided per-GPU daemon binary (a renamed copy → distinct
     # process comm → the CLI's reapOrphans `pkill -x <name>` stays scoped to THIS
     # instance). HIPFIRE_DAEMON_NAME/ID pass through from os.environ untouched.
-    # The isolated home MUST be what the daemon resolves. ConfigPaths::discover
-    # prefers HIPFIRE_HOME over $HOME/.hipfire, so an inherited HIPFIRE_HOME
-    # (hw-gate exports one per lane) silently replaced this run's config.toml
-    # with the parent's: [speculation] mtp="off" never reached the daemon, the
-    # schema default `auto` auto-attached a sibling .mtp head, and the two gate
-    # lanes diverged on host state (hw-gate run 33900101473, #691).
-    env = dict(os.environ, HOME=home, HIPFIRE_HOME=os.path.join(home, ".hipfire"),
-               HIP_VISIBLE_DEVICES=os.environ.get("HIP_VISIBLE_DEVICES","0"),
+    env = dict(os.environ, HOME=home, HIP_VISIBLE_DEVICES=os.environ.get("HIP_VISIBLE_DEVICES","0"),
                HIPFIRE_DAEMON_BIN=os.environ.get(
                    "HIPFIRE_DAEMON_BIN",
                    os.path.join(REPO, "target", "release", "daemon" + (".exe" if os.name == "nt" else ""))),
