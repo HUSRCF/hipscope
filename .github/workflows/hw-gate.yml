@@ -62,6 +62,11 @@ env:
 jobs:
   select:
     name: select
+    # A merged or closed PR must never re-enter the gate. Label churn on a
+    # closed PR is still a pull_request_target event, and run 33915818350
+    # (2026-09-04) re-ran the whole gate on #711 five minutes after it merged,
+    # taking the runner and the exclusive GPU lock away from live rungs.
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.merged != true
     runs-on: ubuntu-latest
     outputs:
       needs_hw: ${{ steps.sel.outputs.needs_hw }}
@@ -397,7 +402,53 @@ jobs:
         with:
           name: hw-gate-verdict
           path: evidence
+      - name: "Seat preflight (no GPU lock)"
+        id: seat
+        env:
+          HOME: ${{ github.workspace }}/fable-home-probe
+        run: |
+          set -uo pipefail
+          # The decide step holds the EXCLUSIVE lock on all five GPUs for its
+          # whole budget. A seat that cannot answer at all — provider credits,
+          # auth, retired model — used to hold that lock for the full 45 min
+          # and starve every queued rung's hardware lane (observed 2026-09-04:
+          # #711's dead decide phase blocked #687 and #688 for ~20 min).
+          # One 90 s toolless probe, before the lock, tells us whether the seat
+          # can reply. It costs one token and never touches a GPU.
+          rm -rf fable-home-probe && mkdir -p fable-home-probe
+          if timeout 90 omp -p --mode json --model "$HW_GATE_DECIDE_MODEL" \
+               --max-time 1m 'Reply with the single word READY.' >probe.json 2>probe.err; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+            echo "seat $HW_GATE_DECIDE_MODEL replied"
+          else
+            rc=$?
+            reason="$(tail -c 400 probe.err | tr '\n' ' ' | sed 's/"/'"'"'/g')"
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            echo "reason=seat $HW_GATE_DECIDE_MODEL unavailable (rc=$rc): $reason" >> "$GITHUB_OUTPUT"
+            echo "::warning::decide seat unavailable (rc=$rc); skipping the GPU-locked phase: $reason"
+          fi
+      - name: "Decider unavailable: record hold without taking the GPU lock"
+        if: steps.seat.outputs.ok != 'true'
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token || github.token }}
+        run: |
+          set -euo pipefail
+          python3 base/scripts/hw-gate/review.py --phase decide --seat fable \
+            --repo "$GITHUB_REPOSITORY" --pr "$PR_NUMBER" \
+            --base "${{ needs.select.outputs.base_sha }}" \
+            --head "${{ needs.select.outputs.head_sha }}" \
+            --checkout pr \
+            --select evidence/select.json \
+            --prelim evidence/prelim.json \
+            --evidence evidence/hw-gate.json \
+            --verdict evidence/verdict.json \
+            --hw-run-result "${{ needs.hw-run.result }}" \
+            --staging "$HW_GATE_STAGING" \
+            --decider-unavailable "${{ steps.seat.outputs.reason }}" \
+            --system-prompt base/scripts/hw-gate/fable.md \
+            --out decision.json
       - name: "Fable investigates and decides (exclusive GPU lock: all five devices)"
+        if: steps.seat.outputs.ok == 'true'
         env:
           GH_TOKEN: ${{ steps.token.outputs.token || github.token }}
         run: |

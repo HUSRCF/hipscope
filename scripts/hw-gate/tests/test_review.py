@@ -548,7 +548,7 @@ def test_verdict_unparseable_needs_human_exit1():
 # decide e2e
 # ---------------------------------------------------------------------------
 
-def _run_decide(tmp: Path, select_extra: dict | None = None, evidence_extra: dict | None = None, sol_final="greenlight", fable_response: dict | None = None, hw_run_result="success", merge_409=False, checkout_extra_files: dict | None = None, fable_text: str | None = None):
+def _run_decide(tmp: Path, select_extra: dict | None = None, evidence_extra: dict | None = None, sol_final="greenlight", fable_response: dict | None = None, hw_run_result="success", merge_409=False, checkout_extra_files: dict | None = None, fable_text: str | None = None, extra_args: list | None = None):
     checkout, base, head = _make_repo(tmp / "checkout_d", files=checkout_extra_files)
     select = {"schema":"hipfire.hw-gate.select","version":1,"needs_hw":True,"buckets":["load"],"policy_paths":[],"surfaces":{"load":["foo.rs"],"serve":[],"kernel":[],"policy":[],"other":[]},"request":None,"request_error":None}
     if select_extra:
@@ -595,8 +595,33 @@ def _run_decide(tmp: Path, select_extra: dict | None = None, evidence_extra: dic
         env["FAKE_GH_MERGE_409"] = "1"
     env["HW_GATE_DECIDE_MODEL"] = "claude-fable-5-1"
     cmd = [sys.executable, str(REVIEW_PATH),"--seat","fable","--phase","decide","--repo","o/r","--pr","1","--base",base,"--head",head,"--checkout",str(checkout),"--select",str(select_path),"--prelim",str(prelim_path),"--evidence",str(evidence_path),"--verdict",str(verdict_path),"--hw-run-result",hw_run_result,"--staging","beta","--system-prompt",str(system_prompt),"--out",str(out_path)]
+    if extra_args:
+        cmd.extend(extra_args)
     result = subprocess.run(cmd, env=env, capture_output=True, text=True)
     return result, out_path, gh_log, gh_comments, omp_log, base, head, checkout
+
+def test_decide_unavailable_seat_holds_without_calling_the_model():
+    """The preflight already proved the seat cannot answer.
+
+    review.py must then reach a hold on the floors alone, without spending a
+    model call — and above all without the workflow taking the exclusive GPU
+    lock, which on 2026-09-04 a dead #711 decide phase held for ~20 min while
+    #687 and #688 waited for a hardware lane.
+    """
+    tmp = Path(tempfile.mkdtemp())
+    result, out_path, gh_log, gh_comments, omp_log, base, head, checkout = _run_decide(
+        tmp, sol_final="greenlight", extra_args=["--decider-unavailable", "seat claude-fable-5-1 unavailable (rc=1): credit balance too low"],
+    )
+    data = json.loads(out_path.read_text())
+    assert data["decision"] is None
+    assert data["decision_final"] == "hold", data
+    assert "credit balance too low" in (data["fable_error"] or "")
+    # no model call at all: the fake never ran, so it never opened its log
+    assert not omp_log.exists() or omp_log.read_text().strip() == ""
+    # and no merge
+    gh_calls = [json.loads(l)["args"] for l in gh_log.read_text().splitlines() if l.strip()]
+    assert not [a for a in gh_calls if len(a) > 1 and "merges" in a[1]]
+
 
 def test_decide_hard_floor_beats_merge():
     tmp = Path(tempfile.mkdtemp())
