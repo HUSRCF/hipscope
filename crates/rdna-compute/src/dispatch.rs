@@ -643,6 +643,12 @@ pub struct Gpu {
     orphan_vmm_arenas: Vec<VmmArena>,
     /// When set, all kernel launches go to this stream instead of null stream.
     pub active_stream: Option<hip_bridge::Stream>,
+    /// Name of the most recently launched kernel on this `Gpu`'s stream.
+    /// Recorded in `launch_maybe_blob_bound` (the shared dispatch funnel) on
+    /// every successful launch so `sync_with_deadline` can name the suspect
+    /// when a sync times out. Scratch-helper converts and the optional CK
+    /// path bypass this funnel and are deliberately not tracked here.
+    last_kernel: Option<String>,
     /// Scratch buffers for FWHT rotation, FP16/FP8 activation conversion, etc.
     pub scratch: crate::scratch::ScratchState,
     /// Model-scoped Redline warmup recorder and fail-closed backend gate.
@@ -1013,6 +1019,93 @@ impl Gpu {
         self.active_stream.as_ref()
     }
 
+    /// Default bound for [`Self::sync_with_deadline`]: five minutes. Long
+    /// enough that a healthy prefill/decode sync never trips it, short enough
+    /// that a hung GPU becomes a reportable error in one operator shift.
+    pub const GPU_SYNC_DEADLINE: std::time::Duration = std::time::Duration::from_secs(300);
+
+    /// Name of the kernel most recently launched through the dispatch funnel,
+    /// if any. Used to attribute a timed-out sync to the suspect kernel.
+    pub fn last_launched_kernel(&self) -> Option<&str> {
+        self.last_kernel.as_deref()
+    }
+
+    /// Build the timeout error directly (no device call). Split out so the
+    /// message is unit-testable on CPU-only hosts where the blocking-sync
+    /// path cannot be driven.
+    pub fn deadline_exceeded(
+        last_kernel: Option<&str>,
+        deadline: std::time::Duration,
+    ) -> hip_bridge::HipError {
+        match last_kernel {
+            Some(kernel) => hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "GPU sync exceeded deadline of {deadline:?}: \
+                     last kernel launched on this stream was '{kernel}' — \
+                     suspect a hang in '{kernel}' (stream still busy; \
+                     state was NOT reset)"
+                ),
+            )
+            .with_kernel(kernel),
+            None => hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "GPU sync exceeded deadline of {deadline:?} with no kernel \
+                     recorded on this stream (stream still busy; state was NOT reset)"
+                ),
+            ),
+        }
+    }
+
+    /// Bounded stream sync: like `hipStreamSynchronize` (or
+    /// `hipDeviceSynchronize` on the null stream) but returns a reportable
+    /// error naming the last-launched kernel instead of blocking forever when
+    /// the GPU hangs.
+    ///
+    /// The blocking HIP call runs on a scoped thread and the caller waits at
+    /// most `deadline`; on timeout the error names `last_launched_kernel`.
+    /// The timed-out sync thread is left parked inside HIP — the stream is
+    /// still busy and nothing here resets device state, so the caller must
+    /// treat the device as suspect after this error.
+    ///
+    /// Existing `sync()` callers keep their unbounded semantics; use this
+    /// where a deadline is already meaningful (collective rendezvous,
+    /// watchdog paths) rather than migrating every sync.
+    pub fn sync_with_deadline(&self, deadline: std::time::Duration) -> HipResult<()> {
+        self.bind_thread()?;
+        // `Stream` is Send but not Sync, so `&Stream` cannot be shared into
+        // the scoped waiter — the raw handle crosses as a `usize` instead.
+        let stream_raw: Option<usize> =
+            self.active_stream.as_ref().map(|s| s.as_raw() as usize);
+        let last_kernel = self.last_kernel.clone();
+        // Share `&HipRuntime` (Sync), never `&Gpu`/`&Stream` (both !Sync),
+        // into the scoped waiter. The handle crosses as a `usize` (Send);
+        // it is the live `hipStream_t` of `self.active_stream`, borrowed by
+        // the enclosing `&self` for the whole scope.
+        let hip = &self.hip;
+        let device_id = self.device_id;
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                // HIP device affinity is per-thread: bind the waiter to the
+                // same device before syncing its stream.
+                let result = hip.set_device(device_id).and_then(|()| match stream_raw {
+                    // SAFETY: `stream_raw` is the live handle of
+                    // `self.active_stream` for the whole scope; only
+                    // synchronize is issued on it.
+                    Some(raw) => hip.stream_synchronize_raw(raw as *mut std::ffi::c_void),
+                    None => hip.device_synchronize(),
+                });
+                let _ = tx.send(result);
+            });
+            match rx.recv_timeout(deadline) {
+                Ok(result) => result,
+                Err(_) => Err(Self::deadline_exceeded(last_kernel.as_deref(), deadline)),
+            }
+        })
+    }
+
     /// Bind this `Gpu`'s device on the calling thread. Delegates to
     /// `crate::graph::bind_thread`.
     #[inline]
@@ -1210,6 +1303,7 @@ impl Gpu {
             vmm_arenas: HashMap::new(),
             orphan_vmm_arenas: Vec::new(),
             active_stream: None,
+            last_kernel: None,
             scratch: crate::scratch::ScratchState {
                 mq_signs1: None,
                 mq_signs2: None,
@@ -2232,7 +2326,7 @@ impl Gpu {
         blob_builder: impl FnOnce() -> hip_bridge::KernargBlob,
     ) -> HipResult<()> {
         let record = self.replay.is_recording();
-        if record || self.graphs.capture_mode || self.flags.force_blob_path {
+        let result: HipResult<()> = if record || self.graphs.capture_mode || self.flags.force_blob_path {
             let mut blob = blob_builder();
             blob.pad_to(16);
             if record {
@@ -2337,7 +2431,11 @@ impl Gpu {
                     params,
                 )
             }
+        };
+        if result.is_ok() {
+            self.last_kernel = Some(func_name.to_string());
         }
+        result.map_err(|e| e.with_kernel(func_name))
     }
 
     /// Diagnostic oracle for Redline prefix localization: relaunch the exact
@@ -2484,6 +2582,7 @@ impl Gpu {
             self.hip
                 .launch_kernel_blob(func, grid, block, shared_mem, self.stream_ref(), kernargs)
         }
+        .map_err(|e| e.with_kernel(func_name))
     }
 
     /// Compile and load a kernel, caching the result.
@@ -4727,6 +4826,7 @@ mod tests {
     use super::MQ3G256V2_GROUP_BYTES;
     use super::MQ5G256V2_GROUP_BYTES;
     use super::MQ6G256V2_GROUP_BYTES;
+    use super::Gpu;
 
     #[test]
     fn q8hfq_row_stride_matches_legacy_formula() {
@@ -5206,5 +5306,30 @@ mod tests {
         use crate::replay::{ReplayBackendRequest, ReplayController};
         let ctrl = ReplayController::new(ReplayBackendRequest::Hip);
         assert_eq!(ctrl.recorded_launches().len(), 0);
+    }
+
+    #[test]
+    fn deadline_error_names_last_kernel() {
+        // The blocking-sync timeout path cannot be driven without a GPU
+        // (and must not be: no GPU work in unit tests), so the error is
+        // constructed directly — the same constructor `sync_with_deadline`
+        // uses on timeout.
+        let e = Gpu::deadline_exceeded(
+            Some("gemv_hfq4g256"),
+            std::time::Duration::from_secs(5),
+        );
+        let s = e.to_string();
+        assert!(s.contains("gemv_hfq4g256"), "names the kernel: {s}");
+        assert!(s.contains("5s"), "names the deadline: {s}");
+        let ctx = e.context.expect("timeout carries launch context");
+        assert_eq!(ctx.kernel, "gemv_hfq4g256");
+    }
+
+    #[test]
+    fn deadline_error_without_kernel_says_so() {
+        let e = Gpu::deadline_exceeded(None, std::time::Duration::from_secs(5));
+        let s = e.to_string();
+        assert!(s.contains("no kernel"), "states nothing was recorded: {s}");
+        assert!(e.context.is_none());
     }
 }
