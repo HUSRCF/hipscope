@@ -224,6 +224,15 @@ jobs:
         with:
           name: hw-gate-prelim
           path: prelim
+      - name: Login-shell toolchain (the runner service PATH has neither cargo nor ROCm)
+        # Both runners are systemd services: PATH is the distro default, so
+        # `cargo` and `hipcc` are not found (run 33849478193 failed both lanes in
+        # 40 s with "[Errno 2] No such file or directory: 'cargo'"). The runner
+        # user's login shell has the toolchain; import it for the steps below.
+        run: |
+          set -euo pipefail
+          bash -lc 'echo "$PATH"' | tr ':' '\n' >> "$GITHUB_PATH"
+          bash -lc 'env' | grep -E '^(ROCM_PATH|HIP_PATH|HSA_PATH|HIP_PLATFORM|LD_LIBRARY_PATH)=' >> "$GITHUB_ENV" || true
       - name: "Run routes (shared GPU lock: coexists with other lanes, excludes a Fable session)"
         run: |
           set -euo pipefail
@@ -352,6 +361,11 @@ jobs:
           ref: ${{ needs.select.outputs.head_sha }}
           path: pr
           fetch-depth: 0
+      - name: Login-shell toolchain (the runner service PATH has neither cargo nor ROCm)
+        run: |
+          set -euo pipefail
+          bash -lc 'echo "$PATH"' | tr ':' '\n' >> "$GITHUB_PATH"
+          bash -lc 'env' | grep -E '^(ROCM_PATH|HIP_PATH|HSA_PATH|HIP_PLATFORM|LD_LIBRARY_PATH)=' >> "$GITHUB_ENV" || true
       - name: Build PR head and base branch
         run: |
           set -euo pipefail
