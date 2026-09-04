@@ -3235,6 +3235,29 @@ pub fn developer_var(name: &str) -> std::result::Result<String, std::env::VarErr
 pub fn developer_var_os(name: &str) -> Option<std::ffi::OsString> {
     process_value(name).map(Into::into)
 }
+/// Strict process-snapshot boolean for the `HIPFIRE_*` long tail.
+/// Reads exactly one snapshot value: `"1"` is true, `"0"` is false, and
+/// anything else (absent, empty, or any other spelling) falls back to
+/// `default`. The strict table matters: it exactly preserves both ambient
+/// idioms it replaces — `var == "1"` (default off) and `var != "0"`
+/// (default on) — while routing the read through the versioned
+/// [`ProcessConfig`] snapshot so TOML `[developer]` overrides and the
+/// env-beats-config-beats-default precedence apply. Deliberately narrower
+/// than `FeatureFlags::from_lookup`'s `parse_bool`, which also accepts
+/// `true`/`on`/`yes`: call sites that accept those spellings keep their
+/// own predicate.
+pub fn developer_bool(name: &str, default: bool) -> bool {
+    parse_developer_bool(process_value(name).as_deref(), default)
+}
+/// Pure truth table behind [`developer_bool`], split out so unit tests can
+/// pin the contract without touching the process-global snapshot.
+fn parse_developer_bool(raw: Option<&str>, default: bool) -> bool {
+    match raw {
+        Some("1") => true,
+        Some("0") => false,
+        _ => default,
+    }
+}
 
 fn render_compat_value(value: &ConfigValue) -> Option<String> {
     Some(match value {
@@ -4443,6 +4466,32 @@ mod tests {
 
     fn temp_root(name: &str) -> PathBuf {
         env::temp_dir().join(format!("hipfire-config-{name}-{}", std::process::id()))
+    }
+
+    #[test]
+    fn developer_bool_truth_table_is_strict() {
+        // "1" is true and "0" is false regardless of the default; every
+        // other spelling (including "true"/"on"/empty) falls back to it,
+        // which is what makes the helper an exact replacement for both
+        // `var == "1"` (default off) and `var != "0"` (default on).
+        for default in [false, true] {
+            assert!(parse_developer_bool(Some("1"), default));
+            assert!(!parse_developer_bool(Some("0"), default));
+            assert_eq!(parse_developer_bool(None, default), default);
+            assert_eq!(parse_developer_bool(Some("true"), default), default);
+            assert_eq!(parse_developer_bool(Some("on"), default), default);
+            assert_eq!(parse_developer_bool(Some("yes"), default), default);
+            assert_eq!(parse_developer_bool(Some(""), default), default);
+            assert_eq!(parse_developer_bool(Some("2"), default), default);
+        }
+    }
+
+    #[test]
+    fn developer_bool_defaults_when_unset() {
+        // A probe name nothing sets must resolve to the caller's default
+        // through the live snapshot (no install, no TOML, no env).
+        assert!(!developer_bool("HIPFIRE_S4_FLAG_PROBE_UNSET_OFF", false));
+        assert!(developer_bool("HIPFIRE_S4_FLAG_PROBE_UNSET_ON", true));
     }
 
     #[test]
