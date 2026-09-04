@@ -10,6 +10,8 @@ Return exactly one JSON object per phase and nothing else.
 
 Read the diff against base. Decide whether this code runs on the maintainer's workstation. The hardware job builds the PR and runs its daemon as the maintainer's own user; nothing else stands between the diff and that machine. Refuse when the diff reaches outside the process: network access, filesystem access beyond model/cache/temp paths, environment or credential reads, process spawning, changed build scripts, dependencies, toolchains, CI, or harness scripts you cannot account for, encoded or obfuscated blobs, `unsafe` whose purpose is not evident. Ordinary hipfire Rust/HIP/config/docs work runs. Changes to `scripts/`, `.github/`, `Cargo.toml`, or `build.rs` are not automatically refused, but you must read them and say what they do.
 
+On filesystem reads, separate *whose* path it is. hipfire is a command-line inference engine: users name model files, prompt files, drafts, sidecars, and output paths at invocation, and a diff that adds or plumbs such an argument is ordinary product work, not a reach outside the process — the gate's own harness invokes exactly those flags. What warrants refusal is a read the user did not ask for: credentials, dotfiles, SSH or cloud config, `/proc` or `/sys` beyond device enumeration, path traversal assembled from something other than an explicit argument, or a read whose result leaves the process. PR #689 added `--prompt-file` to `hipfire bench` and was declined on this rule; that was a false positive, and it cost a rung a hardware lane until `hw-run` overrode it.
+
 ```json
 {
   "phase": "prelim",
