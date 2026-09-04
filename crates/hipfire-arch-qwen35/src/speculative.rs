@@ -208,10 +208,10 @@ fn dflash_moe_draft_ffn_graph_eligible(
 /// `verify_graph_ok` shares that eligibility via `prefill_batch_pbs_eligible`.
 /// Graph-off direct and forced-blob direct full-model V2 fixtures pass on
 /// gfx1100, but two graph-on V2 campaigns lost the endpoint. This is a
-/// default-off graph capability quarantine for exact gfx1100 + V2 only;
-/// direct batched WMMA remains on. `HIPFIRE_VERIFY_GRAPH=1` opts back in
-/// diagnostically; `=0` force-offs everywhere; gfx1151/gfx12 and non-V2
-/// gfx1100 stay default-on.
+/// default-off graph capability quarantine for gfx1100 + V2 and the measured
+/// gfx1201 legacy MQ4 workload; direct batched HIP remains on.
+/// `HIPFIRE_VERIFY_GRAPH=1` opts back in diagnostically; `=0` force-offs
+/// everywhere; other gfx12 shapes stay default-on.
 fn dflash_verify_graph_env_eligible(
     arch: &str,
     output_dtype: rdna_compute::DType,
@@ -234,6 +234,11 @@ fn dflash_verify_graph_env_eligible(
     if arch == "gfx1100" && output_dtype == rdna_compute::DType::MQ4G256 {
         // Direct batched HIP is faster for the measured Qwen MQ4 workload;
         // keep graph available as an explicit diagnostic opt-in.
+        return env_value == Some("1");
+    }
+    if arch == "gfx1201" && output_dtype == rdna_compute::DType::MQ4G256 {
+        // Paired 11.5K DFlash runs on R9700 show graph replay slower than the
+        // direct tiled-flash path; keep it available as an explicit diagnostic.
         return env_value == Some("1");
     }
     true
@@ -7636,6 +7641,16 @@ mod tests {
             "gfx1201",
             DType::MQ3G256V2,
             None
+        ));
+        assert!(!dflash_verify_graph_env_eligible(
+            "gfx1201",
+            DType::MQ4G256,
+            None
+        ));
+        assert!(dflash_verify_graph_env_eligible(
+            "gfx1201",
+            DType::MQ4G256,
+            Some("1")
         ));
     }
 
