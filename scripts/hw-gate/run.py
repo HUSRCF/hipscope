@@ -423,9 +423,22 @@ def _evaluate_mode(exit_code: int, raw_rows) -> tuple[str, str, list[dict]]:
     return "pass", "", enriched
 
 
-def _build_harness_argv(repo: Path, model_path: Path, mode: str, max_tokens: int, battery_prompts_path: Path | None, per_home: Path, out_path: Path, serve_log_path: Path) -> list[str]:
-    """Build argv for serve_harness.py. Never includes --devices."""
-    harness = Path(repo) / "scripts" / "serve_harness.py"
+# The gate's own checkout, for when no fixtures-derived `_gate_root` is at hand:
+# this file lives at <gate>/scripts/hw-gate/run.py.
+GATE_REPO = Path(__file__).resolve().parents[2]
+
+
+def _build_harness_argv(gate_root: Path, model_path: Path, mode: str, max_tokens: int, battery_prompts_path: Path | None, per_home: Path, out_path: Path, serve_log_path: Path) -> list[str]:
+    """Build argv for serve_harness.py. Never includes --devices.
+
+    The harness is the oracle, so it comes from the gate checkout and never
+    from the PR under test, which supplies only the binaries. A PR older than
+    a harness fix used to run the buggy harness against its own binaries: #682,
+    based on master from before #703, false-flagged a 3-token `Answer: 43` turn
+    as a token attractor on BOTH lanes (run 33921475093) and hard-floored on
+    evidence that was correct.
+    """
+    harness = Path(gate_root) / "scripts" / "serve_harness.py"
     argv = [
         sys.executable,
         str(harness),
@@ -471,7 +484,7 @@ def _run_harness_mode(repo, fixture, env_base, logs_dir, device, mode, harness_c
     safe_tag = _sanitize_tag(tag)
     file_name = fixture.get("file", "")
     model_path = Path(models_dir).expanduser() / file_name if file_name else Path(models_dir) / tag
-    harness = repo_p / "scripts" / "serve_harness.py"
+    harness = Path(harness_cfg.get("_gate_root") or repo_p) / "scripts" / "serve_harness.py"
     # harness cfg
     # The battery prompts are gate policy: they resolve against the GATE
     # checkout (the directory tree holding fixtures.json), never against the
@@ -494,7 +507,7 @@ def _run_harness_mode(repo, fixture, env_base, logs_dir, device, mode, harness_c
     out_path = logs_dir_p / f"{safe_tag}-{mode}.json"
     serve_log_path = logs_dir_p / f"{safe_tag}-{mode}.serve.log"
     out_combined_path = logs_dir_p / f"{safe_tag}-{mode}.out"
-    argv = _build_harness_argv(repo_p, model_path, mode, max_tokens, battery_prompts_path, per_home, out_path, serve_log_path)
+    argv = _build_harness_argv(gate_root, model_path, mode, max_tokens, battery_prompts_path, per_home, out_path, serve_log_path)
     start = time.time()
     exit_code = 1
     stdout = ""
@@ -713,7 +726,8 @@ def run_kernel(repo, models_dir, kernel_cfg, fixtures_manifest, env, logs_dir) -
     model_path = Path(models_dir).expanduser() / model_file if model_file else Path(models_dir) / (model_tag or "")
     bin_dir = _resolve_bin_dir(repo_p)
     daemon_bin = bin_dir / "daemon"
-    harness = repo_p / "scripts" / "redline_daemon_harness.py"
+    # Same rule as serve_harness: the instrument is the gate's, not the PR's.
+    harness = GATE_REPO / "scripts" / "redline_daemon_harness.py"
     redline_out = logs_dir_p / "redline.json"
     harness_args = kernel_cfg.get("harness_args", []) if isinstance(kernel_cfg, dict) else []
     harness_args = [str(a) for a in harness_args]
@@ -1199,14 +1213,13 @@ def main(argv: list[str] | None = None) -> int:
         need_serve = any(len(modes) > 0 for _, _, _, modes, _ in runnable)
         # Also if only unavailable/unknown routes, still need not fail on missing harness? But keep check for consistency: if routes non-empty but none runnable, we don't need harness.
         if need_serve:
-            if not (repo_p / "scripts" / "serve_harness.py").is_file():
+            if not (GATE_REPO / "scripts" / "serve_harness.py").is_file():
                 precondition_failed = True
                 precondition_reason = "missing scripts/serve_harness.py"
         if "kernel" in buckets:
-            if not (repo_p / "scripts" / "redline_daemon_harness.py").is_file():
+            if not (GATE_REPO / "scripts" / "redline_daemon_harness.py").is_file():
                 precondition_failed = True
                 precondition_reason = "missing scripts/redline_daemon_harness.py"
-
         if precondition_failed:
             fixtures_evidence: list[dict] = []
             for fx, vr in routed_precondition_failures:

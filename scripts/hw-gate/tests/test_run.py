@@ -836,3 +836,33 @@ def test_battery_prompts_resolve_against_gate_root_not_pr(tmp_path, monkeypatch)
     cfg["_gate_root"] = str(pr)
     res = run_mod._run_harness_mode(str(pr), {"tag": "t:x", "file": "x.mq4"}, env, str(tmp_path / "logs"), "0", "battery", cfg, str(tmp_path))
     assert res["status"] == "fail" and "gate policy" in res["reason"]
+
+
+def test_serve_harness_runs_from_gate_root_not_pr(tmp_path, monkeypatch):
+    """The oracle is the gate's, not the branch's.
+
+    #682 is based on master from before #703, so its serve_harness.py has no
+    ATTRACTOR_MIN_WINDOW guard; run 33921475093 executed that copy and flagged
+    a 3-token `Answer: 43` turn as a token attractor on BOTH lanes, failing a
+    PR on evidence its own rows show as correct. A branch supplies binaries,
+    never the instrument that measures them.
+    """
+    gate = tmp_path / "gate"; (gate / "scripts" / "hw-gate").mkdir(parents=True)
+    (gate / "scripts" / "serve_harness.py").write_text("# the good harness\n")
+    (gate / "benchmarks" / "prompts" / "hw-gate").mkdir(parents=True)
+    (gate / "benchmarks" / "prompts" / "hw-gate" / "serve-battery.json").write_text("[]")
+    pr = tmp_path / "pr"; (pr / "scripts").mkdir(parents=True)
+    (pr / "scripts" / "serve_harness.py").write_text("# the stale harness\n")
+    seen = {}
+    def fake_run_cmd(argv, **kw):
+        seen["argv"] = argv
+        class R: returncode, stdout, stderr = 0, "", ""
+        return R()
+    monkeypatch.setattr(run_mod, "run_cmd", fake_run_cmd)
+    (tmp_path / "out.json").write_text("[]")
+    cfg = {"battery_prompts": "benchmarks/prompts/hw-gate/serve-battery.json", "max_tokens": 8, "_gate_root": str(gate)}
+    env = {"HIPFIRE_HOME": str(tmp_path / "home")}
+    run_mod._run_harness_mode(str(pr), {"tag": "t:x", "file": "x.mq4"}, env, str(tmp_path / "logs"), "0", "battery", cfg, str(tmp_path))
+    script = seen["argv"][1]
+    assert script == str(gate / "scripts" / "serve_harness.py"), script
+    assert str(pr) not in script
