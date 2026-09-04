@@ -27,6 +27,16 @@ def _emit(assistant_text: str):
 
 def main():
     args = sys.argv[1:]
+    # Real omp chdirs to `--cwd` relative to its own working directory and exits 1
+    # if the target does not exist. Mirror that so a doubled relative path
+    # (`pr/pr`) fails here exactly as it failed on the runner.
+    if "--cwd" in args:
+        target = args[args.index("--cwd") + 1]
+        try:
+            os.chdir(target)
+        except OSError as e:
+            sys.stderr.write(f"Error: Cannot change working directory to {target}: {e.strerror}: chdir '{os.getcwd()}' -> '{os.path.join(os.getcwd(), target)}'\n")
+            sys.exit(1)
     # Dump env keys if requested (for investigate mode tests)
     env_dump_path = os.environ.get("FAKE_OMP_ENV_DUMP")
     if env_dump_path:

@@ -1668,6 +1668,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--base-bin", dest="base_bin", help="HW_GATE_BASE_BIN for investigate (optional)")
     ap.add_argument("--round", type=int, default=1, help="HW_GATE_ROUND for investigate (default 1)")
     args = ap.parse_args(argv)
+    # The workflow passes `--checkout pr` relative to the job workspace. Every seat
+    # launch runs omp with cwd=checkout AND `--cwd checkout`; a relative path is
+    # resolved twice (`pr/pr`) and omp exits 1 before the seat ever reads the diff.
+    args.checkout = os.path.abspath(args.checkout)
 
     # Validate seat/phase combo per authority model
     if args.seat == "fable" and args.phase in ("prelim", "verdict"):
