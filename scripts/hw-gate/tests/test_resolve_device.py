@@ -104,3 +104,66 @@ def test_cli_fails_nonzero_on_absent_card(tmp_path, capsys):
 def test_missing_topology_is_an_error_not_index_zero(tmp_path):
     with pytest.raises(FileNotFoundError):
         resolve_device.resolve("0000:c3:00.0", str(tmp_path / "absent"))
+
+
+# gfx_target_version -> arch name, and the arch assertion that makes a pin
+# self-checking. Values verified on both gate hosts.
+HIPX = [(0, None), (1, "66:00.0", 110000), (2, "bf:00.0", 110501), (3, "6e:00.0", 100300), (4, "99:00.0", 100100)]
+
+
+def _topology_gfx(tmp_path, nodes):
+    """nodes = [(node_number, addr|None, gfx_target_version)] for GPU nodes."""
+    root = tmp_path / "nodes"
+    root.mkdir(parents=True)
+    for entry in nodes:
+        number, addr = entry[0], entry[1]
+        node = root / str(number)
+        node.mkdir()
+        if addr is None:
+            (node / "properties").write_text("cpu_cores_count 64\nsimd_count 0\n")
+            continue
+        gfx = entry[2]
+        bus, rest = addr.split(":")
+        dev = rest.split(".")[0]
+        location = (int(bus, 16) << 8) | int(dev, 16)
+        (node / "properties").write_text(f"simd_count 128\nlocation_id {location}\ngfx_target_version {gfx}\n")
+    return str(root)
+
+
+def test_gfx_name_matches_both_hosts():
+    assert resolve_device.gfx_name(120001) == "gfx1201"   # hiptrx R9700
+    assert resolve_device.gfx_name(110000) == "gfx1100"   # hipx 7900 XTX
+    assert resolve_device.gfx_name(110501) == "gfx1151"   # hipx 8060S
+    assert resolve_device.gfx_name(100300) == "gfx1030"   # hipx 6950 XT
+
+
+def test_expect_gfx_accepts_the_right_card(tmp_path):
+    root = _topology_gfx(tmp_path, HIPX)
+    assert resolve_device.resolve("0000:66:00.0", root, "gfx1100") == 0
+
+
+def test_expect_gfx_rejects_a_swapped_card(tmp_path):
+    """A re-slotted or replaced card at the pinned address must fail loudly."""
+    root = _topology_gfx(tmp_path, HIPX)
+    with pytest.raises(LookupError) as exc:
+        resolve_device.resolve("0000:6e:00.0", root, "gfx1100")
+    assert "is gfx1030, not the expected gfx1100" in str(exc.value)
+
+
+def test_a_hiptrx_address_on_hipx_is_an_error(tmp_path):
+    """The real mistake this caught: the hipx lane was first pinned to
+    0000:03:00.0, which is a hiptrx address. hipx's gfx1100 is 0000:66:00.0."""
+    root = _topology_gfx(tmp_path, HIPX)
+    with pytest.raises(LookupError) as exc:
+        resolve_device.resolve("0000:03:00.0", root, "gfx1100")
+    assert "not among" in str(exc.value)
+    assert "66:00.0(gfx1100)" in str(exc.value)  # the error names the right one
+
+
+def test_cli_expect_gfx_mismatch_exits_nonzero(tmp_path, capsys):
+    root = _topology_gfx(tmp_path, HIPX)
+    rc = resolve_device.main(["--pci", "0000:bf:00.0", "--expect-gfx", "gfx1100", "--topology-root", root])
+    assert rc == 2
+    out = capsys.readouterr()
+    assert out.out == ""
+    assert "gfx1151" in out.err

@@ -46,9 +46,21 @@ def parse_pci(addr: str) -> int:
     return (int(m.group(2), 16) << 8) | int(m.group(3), 16)
 
 
-def gpu_nodes(root: str = TOPOLOGY_ROOT) -> list[tuple[int, int]]:
-    """[(hip_index, location_id)] in KFD-node order, CPU nodes skipped."""
-    out: list[tuple[int, int]] = []
+def gfx_name(target_version: int) -> str:
+    """KFD `gfx_target_version` -> arch name.
+
+    `major * 10000 + minor * 100 + step`, printed with hex digits for minor and
+    step so the CDNA `gfx90a`-style names come out right. Verified against both
+    gate hosts: 120001 -> gfx1201, 110000 -> gfx1100, 110501 -> gfx1151,
+    100300 -> gfx1030.
+    """
+    major, minor, step = target_version // 10000, (target_version // 100) % 100, target_version % 100
+    return f"gfx{major}{minor:x}{step:x}"
+
+
+def gpu_nodes(root: str = TOPOLOGY_ROOT) -> list[tuple[int, int, str]]:
+    """[(hip_index, location_id, gfx)] in KFD-node order, CPU nodes skipped."""
+    out: list[tuple[int, int, str]] = []
     paths = glob.glob(os.path.join(root, "*", "properties"))
     if not paths:
         raise FileNotFoundError(f"no KFD topology under {root} (is amdgpu loaded?)")
@@ -68,7 +80,11 @@ def gpu_nodes(root: str = TOPOLOGY_ROOT) -> list[tuple[int, int]]:
                     fields[key.strip()] = value.strip()
         if int(fields.get("simd_count", "0") or 0) == 0:
             continue
-        out.append((len(out), int(fields.get("location_id", "0") or 0)))
+        out.append((
+            len(out),
+            int(fields.get("location_id", "0") or 0),
+            gfx_name(int(fields.get("gfx_target_version", "0") or 0)),
+        ))
     return out
 
 
@@ -76,13 +92,27 @@ def fmt_location(location_id: int) -> str:
     return f"{location_id >> 8:02x}:{location_id & 0xFF:02x}.0"
 
 
-def resolve(addr: str, root: str = TOPOLOGY_ROOT) -> int:
+def resolve(addr: str, root: str = TOPOLOGY_ROOT, expect_gfx: str | None = None) -> int:
+    """PCI address -> HIP index, optionally asserting the card's arch.
+
+    `expect_gfx` makes the pin self-checking: a wrong address and a swapped or
+    re-slotted card both fail loudly instead of benchmarking the wrong GPU.
+    It caught a real error while this was being written -- the hipx lane was
+    first pinned to 0000:03:00.0, which is a hiptrx address; hipx's gfx1100 is
+    at 0000:66:00.0.
+    """
     want = parse_pci(addr)
     nodes = gpu_nodes(root)
-    for index, location_id in nodes:
-        if location_id == want:
-            return index
-    have = ", ".join(f"{i}={fmt_location(loc)}" for i, loc in nodes)
+    have = ", ".join(f"{i}={fmt_location(loc)}({gfx})" for i, loc, gfx in nodes)
+    for index, location_id, gfx in nodes:
+        if location_id != want:
+            continue
+        if expect_gfx and gfx != expect_gfx:
+            raise LookupError(
+                f"pinned card {addr} is {gfx}, not the expected {expect_gfx} "
+                f"(cards: {have}) -- the card at that address changed"
+            )
+        return index
     raise LookupError(f"pinned card {addr} is not among the {len(nodes)} GPU node(s): {have}")
 
 
@@ -91,13 +121,14 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--pci", required=True, help="PCI address to pin, e.g. 0000:c3:00.0")
     ap.add_argument("--topology-root", default=TOPOLOGY_ROOT, help="KFD topology nodes dir")
     ap.add_argument("--list", action="store_true", help="also print the full index map to stderr")
+    ap.add_argument("--expect-gfx", default=None, help="assert the pinned card's arch, e.g. gfx1201")
     args = ap.parse_args(argv)
     try:
-        index = resolve(args.pci, args.topology_root)
+        index = resolve(args.pci, args.topology_root, args.expect_gfx)
         if args.list:
             nodes = gpu_nodes(args.topology_root)
             sys.stderr.write(
-                "HIP index map: " + ", ".join(f"{i}={fmt_location(loc)}" for i, loc in nodes) + "\n"
+                "HIP index map: " + ", ".join(f"{i}={fmt_location(loc)}({gfx})" for i, loc, gfx in nodes) + "\n"
             )
     except (ValueError, LookupError, FileNotFoundError) as exc:
         sys.stderr.write(f"resolve_device: {exc}\n")

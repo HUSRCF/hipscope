@@ -211,14 +211,19 @@ jobs:
           # `pci` is stable across boots and re-enumeration; the lane resolves it
           # to an index at runtime.
           - {name: hiptrx, gfx: gfx1201, labels: [self-hosted, hiptrx, gfx1201], pci: "0000:c3:00.0"}
-          # hipx: the RX 7900 XTX (gfx1100); the 6950/5700/8060S are not gate lanes yet.
-          - {name: hipx, gfx: gfx1100, labels: [self-hosted, gfx1100], pci: "0000:03:00.0"}
+          # hipx: the RX 7900 XTX (gfx1100) is 0000:66:00.0. Its other three
+          # cards — bf:00.0 gfx1151, 6e:00.0 gfx1030, 99:00.0 gfx1010 — are not
+          # gate lanes. Note hipx and hiptrx share no addresses, which is why
+          # `--expect-gfx` below is not decoration: pinning this lane to a
+          # hiptrx address is exactly the mistake it caught during review.
+          - {name: hipx, gfx: gfx1100, labels: [self-hosted, gfx1100], pci: "0000:66:00.0"}
     runs-on: ${{ matrix.lane.labels }}
     timeout-minutes: 60
     env:
       HIPFIRE_HOME: ${{ github.workspace }}/.hw-gate-home
       HIPFIRE_MODELS_DIR: /home/kaden/.hipfire/models
       HW_GATE_PCI: ${{ matrix.lane.pci }}
+      HW_GATE_GFX: ${{ matrix.lane.gfx }}
       CARGO_TARGET_DIR: /home/kaden/actions-runner/_cache/hw-gate-target
     steps:
       - name: Base checkout (gate scripts)
@@ -251,7 +256,7 @@ jobs:
         # per boot. See scripts/hw-gate/resolve_device.py for why (the eGPU).
         run: |
           set -euo pipefail
-          python3 base/scripts/hw-gate/resolve_device.py --pci "$HW_GATE_PCI" --list | tee -a "$GITHUB_ENV"
+          python3 base/scripts/hw-gate/resolve_device.py --pci "$HW_GATE_PCI" --expect-gfx "$HW_GATE_GFX" --list | tee -a "$GITHUB_ENV"
       - name: "Run routes (shared GPU lock: coexists with other lanes, excludes a Fable session)"
         run: |
           set -euo pipefail
