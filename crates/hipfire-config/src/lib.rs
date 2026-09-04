@@ -1594,6 +1594,15 @@ pub static FIELDS: &[ConfigField] = &[
         Some("HIPFIRE_DEFAULT_CHATML"),
         "Allow the fallback ChatML frame when no template resolves."
     ),
+    process_bool_field!(
+        "prompt.jinja_chat",
+        "jinja_chat",
+        Prompt,
+        true,
+        false,
+        "HIPFIRE_JINJA_CHAT",
+        "Render chat prompts through the model Jinja template; set HIPFIRE_JINJA_CHAT=0 for the hand-rolled ChatScaffold path."
+    ),
     process_field!(
         "hardware.devices",
         "devices",
@@ -2209,6 +2218,15 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         "HIPFIRE_GATE_UP_NOSYNC",
         "Enable the no-sync gate/up experiment."
+    ),
+    process_bool_field!(
+        "kernel.calib_force_bf16",
+        "calib_force_bf16",
+        Kernel,
+        false,
+        true,
+        "HIPFIRE_CALIB_BF16",
+        "Keep native-BF16 calibration teachers in BF16 instead of widening to F32 (calibration only; shipped inference is unaffected)."
     ),
     process_bool_field!(
         "kernel.qkvza_split_tail",
