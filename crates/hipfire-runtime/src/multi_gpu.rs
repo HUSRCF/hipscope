@@ -1033,19 +1033,23 @@ impl Gpus {
         }
         // D2H: synchronize producer stream, then download into row's prefix.
         // Preserve first error immediately — no partial-success claim.
+        // Bounded sync: a hung producer stream becomes a reportable error
+        // naming the last kernel launched on that device instead of hanging
+        // the collective forever. Every other sync in this file keeps its
+        // existing unbounded semantics.
         for r in 0..n {
             let dev = &self.devices[r];
             dev.bind_thread()?;
-            let stream = dev.active_stream.as_ref().ok_or_else(|| {
-                HipError::new(
+            if dev.active_stream.is_none() {
+                return Err(HipError::new(
                     0,
                     &format!(
                         "all_reduce_sum_f32_host: device {r} has no active_stream — \
                          set `gpus.devices[r].active_stream = Some(stream)` before calling.",
                     ),
-                )
-            })?;
-            dev.hip.stream_synchronize(stream)?;
+                ));
+            }
+            dev.sync_with_deadline(Gpu::GPU_SYNC_DEADLINE)?;
             // SAFETY: row.len() >= count ensured above, so first `count` f32
             // (bytes) lie within the Vec's initialized length. The derived
             // `[u8]` slice is exactly `bytes` and is bounded to that prefix.
