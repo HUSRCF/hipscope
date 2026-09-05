@@ -14,11 +14,7 @@
       "sha256": "86a5f80fd29d545abb1093dead242725ced6d68b8607c6d566d897b1a82442dc",
       "size_bytes": 14984158208,
       "arch_id": 5,
-      "why": "Canonical dense trunk (AGENTS.md pinned fixture); Qwen3.5-family text artifact whose embedded config carries vision_config with no vision tower.",
-      "dflash_draft": [
-        "qwen36-27b-dflash-mq4.hfq",
-        "qwen38-27b-dflash-mq4.hfq"
-      ]
+      "why": "Canonical dense trunk (AGENTS.md pinned fixture); Qwen3.5-family text artifact whose embedded config carries vision_config with no vision tower."
     },
     {
       "tag": "ornith-1.5:35b-a3b-mq4r",
@@ -44,9 +40,10 @@
       "arch_id": 5,
       "why": "MQ4V2 xt tier \u2014 the neutral-header v2 quant family (537a292df) that the device-mesh series refused.",
       "dflash_draft": [
-        "qwen38-27b-dflash-mq4.hfq",
-        "qwen36-27b-dflash-mq4.hfq"
-      ]
+        "~/qcal/ladder-v2/drafts/qwen3.8-27b-dflash.mq4v2.hfq"
+      ],
+      "dflash_draft_sha256": "d0a74a232a0e2166d889f823e91e0fbf778d21dd9668d7de055cdecb065401bc",
+      "dflash_draft_why": "The draft the canonical fixture identity was measured with (md5 013395583cd0 alongside target e45d15bfe0c9): 157 tokens / 11 cycles / tau 13.1818 / accept 0.8788. Present and byte-identical on both gate hosts under ~/qcal/ladder-v2/drafts."
     }
   ],
   "buckets": {
