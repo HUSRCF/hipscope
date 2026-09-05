@@ -643,6 +643,12 @@ pub struct Gpu {
     orphan_vmm_arenas: Vec<VmmArena>,
     /// When set, all kernel launches go to this stream instead of null stream.
     pub active_stream: Option<hip_bridge::Stream>,
+    /// Name of the most recently launched kernel on this `Gpu`'s stream.
+    /// Recorded in `launch_maybe_blob_bound` (the shared dispatch funnel) on
+    /// every successful launch so `sync_with_deadline` can name the suspect
+    /// when a sync times out. Scratch-helper converts and the optional CK
+    /// path bypass this funnel and are deliberately not tracked here.
+    last_kernel: Option<String>,
     /// Scratch buffers for FWHT rotation, FP16/FP8 activation conversion, etc.
     pub scratch: crate::scratch::ScratchState,
     /// Model-scoped Redline warmup recorder and fail-closed backend gate.
@@ -1013,6 +1019,107 @@ impl Gpu {
         self.active_stream.as_ref()
     }
 
+    /// Default bound for [`Self::sync_with_deadline`]: five minutes. Long
+    /// enough that a healthy prefill/decode sync never trips it, short enough
+    /// that a hung GPU becomes a reportable error in one operator shift.
+    pub const GPU_SYNC_DEADLINE: std::time::Duration = std::time::Duration::from_secs(300);
+
+    /// Name of the kernel most recently launched through the dispatch funnel,
+    /// if any. Used to attribute a timed-out sync to the suspect kernel.
+    pub fn last_launched_kernel(&self) -> Option<&str> {
+        self.last_kernel.as_deref()
+    }
+
+    /// Build the timeout error directly (no device call). Split out so the
+    /// message is unit-testable on CPU-only hosts where the blocking-sync
+    /// path cannot be driven.
+    pub fn deadline_exceeded(
+        last_kernel: Option<&str>,
+        deadline: std::time::Duration,
+    ) -> hip_bridge::HipError {
+        match last_kernel {
+            Some(kernel) => hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "GPU sync exceeded deadline of {deadline:?}: \
+                     last kernel launched on this stream was '{kernel}' — \
+                     suspect a hang in '{kernel}' (stream still busy; \
+                     state was NOT reset)"
+                ),
+            )
+            .with_kernel(kernel),
+            None => hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "GPU sync exceeded deadline of {deadline:?} with no kernel \
+                     recorded on this stream (stream still busy; state was NOT reset)"
+                ),
+            ),
+        }
+    }
+
+    /// Poll interval for [`Self::sync_with_deadline`]: 2 ms. Coarse enough
+    /// never to spin a core, fine-grained enough for a deadline measured in
+    /// seconds.
+    pub(crate) const SYNC_POLL_INTERVAL: std::time::Duration =
+        std::time::Duration::from_millis(2);
+
+    /// Bounded stream sync: record a completion event on this `Gpu`'s stream
+    /// (or the null stream) and poll `hipEventQuery` until it completes or
+    /// `deadline` elapses.
+    ///
+    /// No helper thread: the query is non-blocking, so the deadline is real —
+    /// on timeout this returns `Err` naming `last_launched_kernel` while the
+    /// GPU work is still outstanding.
+    ///
+    /// Returning `Err` does NOT cancel the outstanding work. The contract is
+    /// "I stopped waiting", not "the GPU stopped": the stream is still busy
+    /// and nothing here resets device state, so the caller must treat the
+    /// device as suspect and must not touch buffers the outstanding work may
+    /// still write.
+    ///
+    /// Existing `sync()` callers keep their unbounded semantics; use this
+    /// where a deadline is already meaningful (collective rendezvous,
+    /// watchdog paths) rather than migrating every sync.
+    pub fn sync_with_deadline(&self, deadline: std::time::Duration) -> HipResult<()> {
+        self.bind_thread()?;
+        // Timing-disabled event: a pure completion probe, no profiling state.
+        let event = self
+            .hip
+            .event_create_with_flags(hip_bridge::HIP_EVENT_DISABLE_TIMING)?;
+        self.hip.event_record(&event, self.active_stream.as_ref())?;
+        let last_kernel = self.last_kernel.clone();
+        let result = Self::poll_until_ready(deadline, last_kernel.as_deref(), || {
+            self.hip.event_query(&event)
+        });
+        // Best-effort teardown. On timeout the outstanding GPU work is NOT
+        // cancelled — this call only stopped waiting. Never shadow the poll
+        // result with a destroy error.
+        let _ = self.hip.event_destroy(event);
+        result
+    }
+
+    /// Poll `query` until it reports ready or `deadline` elapses. Query
+    /// errors propagate immediately; only `hipErrorNotReady` keeps polling.
+    /// Split from [`Self::sync_with_deadline`] so the timeout path is
+    /// unit-testable on CPU with a stubbed query.
+    pub(crate) fn poll_until_ready(
+        deadline: std::time::Duration,
+        last_kernel: Option<&str>,
+        mut query: impl FnMut() -> HipResult<bool>,
+    ) -> HipResult<()> {
+        let start = std::time::Instant::now();
+        loop {
+            if query()? {
+                return Ok(());
+            }
+            if start.elapsed() >= deadline {
+                return Err(Self::deadline_exceeded(last_kernel, deadline));
+            }
+            std::thread::sleep(Self::SYNC_POLL_INTERVAL);
+        }
+    }
+
     /// Bind this `Gpu`'s device on the calling thread. Delegates to
     /// `crate::graph::bind_thread`.
     #[inline]
@@ -1210,6 +1317,7 @@ impl Gpu {
             vmm_arenas: HashMap::new(),
             orphan_vmm_arenas: Vec::new(),
             active_stream: None,
+            last_kernel: None,
             scratch: crate::scratch::ScratchState {
                 mq_signs1: None,
                 mq_signs2: None,
@@ -2232,7 +2340,7 @@ impl Gpu {
         blob_builder: impl FnOnce() -> hip_bridge::KernargBlob,
     ) -> HipResult<()> {
         let record = self.replay.is_recording();
-        if record || self.graphs.capture_mode || self.flags.force_blob_path {
+        let result: HipResult<()> = if record || self.graphs.capture_mode || self.flags.force_blob_path {
             let mut blob = blob_builder();
             blob.pad_to(16);
             if record {
@@ -2337,7 +2445,11 @@ impl Gpu {
                     params,
                 )
             }
+        };
+        if result.is_ok() {
+            self.last_kernel = Some(func_name.to_string());
         }
+        result.map_err(|e| e.with_kernel(func_name))
     }
 
     /// Diagnostic oracle for Redline prefix localization: relaunch the exact
@@ -2484,6 +2596,7 @@ impl Gpu {
             self.hip
                 .launch_kernel_blob(func, grid, block, shared_mem, self.stream_ref(), kernargs)
         }
+        .map_err(|e| e.with_kernel(func_name))
     }
 
     /// Compile and load a kernel, caching the result.
@@ -4727,6 +4840,7 @@ mod tests {
     use super::MQ3G256V2_GROUP_BYTES;
     use super::MQ5G256V2_GROUP_BYTES;
     use super::MQ6G256V2_GROUP_BYTES;
+    use super::Gpu;
 
     #[test]
     fn q8hfq_row_stride_matches_legacy_formula() {
@@ -5206,5 +5320,69 @@ mod tests {
         use crate::replay::{ReplayBackendRequest, ReplayController};
         let ctrl = ReplayController::new(ReplayBackendRequest::Hip);
         assert_eq!(ctrl.recorded_launches().len(), 0);
+    }
+
+    #[test]
+    fn deadline_error_names_last_kernel() {
+        // Constructor-level pin; the timeout path itself is driven below
+        // through `poll_until_ready` with a stubbed query.
+        let e = Gpu::deadline_exceeded(
+            Some("gemv_hfq4g256"),
+            std::time::Duration::from_secs(5),
+        );
+        let s = e.to_string();
+        assert!(s.contains("gemv_hfq4g256"), "names the kernel: {s}");
+        assert!(s.contains("5s"), "names the deadline: {s}");
+        let ctx = e.context.expect("timeout carries launch context");
+        assert_eq!(ctx.kernel, "gemv_hfq4g256");
+    }
+
+    #[test]
+    fn deadline_error_without_kernel_says_so() {
+        let e = Gpu::deadline_exceeded(None, std::time::Duration::from_secs(5));
+        let s = e.to_string();
+        assert!(s.contains("no kernel"), "states nothing was recorded: {s}");
+        assert!(e.context.is_none());
+    }
+
+    #[test]
+    fn sync_timeout_returns_in_bounded_wall_time() {
+        // The test review asked for: a query that never reports ready (a
+        // hung GPU) must produce `Err` within bounded wall-clock time. The
+        // old scoped-thread design would block forever here on the join;
+        // the event poll returns. No GPU needed — the query is stubbed.
+        let deadline = std::time::Duration::from_millis(50);
+        let start = std::time::Instant::now();
+        let err = Gpu::poll_until_ready(deadline, Some("hung_kernel"), || Ok(false))
+            .expect_err("a never-ready query must time out");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "deadline escaped its bound: {elapsed:?}"
+        );
+        assert!(
+            elapsed >= deadline,
+            "returned before the deadline elapsed: {elapsed:?}"
+        );
+        let s = err.to_string();
+        assert!(s.contains("hung_kernel"), "timeout names the kernel: {s}");
+    }
+
+    #[test]
+    fn poll_ready_immediately_returns_ok() {
+        let result = Gpu::poll_until_ready(std::time::Duration::from_secs(5), None, || Ok(true));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn poll_propagates_query_errors() {
+        // A real query failure (bad handle, lost device) is not "not ready".
+        let err = Gpu::poll_until_ready(
+            std::time::Duration::from_secs(5),
+            Some("k"),
+            || Err(hip_bridge::HipError::new(999, "boom")),
+        )
+        .expect_err("query errors must propagate");
+        assert!(err.to_string().contains("boom"), "{err}");
     }
 }
