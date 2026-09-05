@@ -476,7 +476,13 @@ jobs:
           # previous PR's evidence files and home (run 33866758629 on #702
           # carried #700's fable-summary.md and #686's route outputs) and can
           # cite them as its own. Every session starts empty.
-          rm -rf fable-evidence fable-home
+          # decision.json is the same hazard, one level worse: upload-artifact
+          # runs `if: always()`, so a decide phase that dies before writing its
+          # own file publishes the PREVIOUS run's verdict as this run's. #702's
+          # decide job failed and the run published #682's decision -- "six
+          # refused loads ... master says 'no model loaded'" -- blocking a PR
+          # whose own lanes were 8/8 pass.
+          rm -rf fable-evidence fable-home decision.json
           mkdir -p fable-evidence fable-home
           exec 9>/home/kaden/actions-runner/_cache/hw-gate-gpu.lock
           flock --exclusive --timeout 3600 9
@@ -575,6 +581,21 @@ jobs:
           # floor-applied verdict under `.decision_final`; `.decision` is a JSON
           # object, so the old jq yielded "[object]" and every run — including
           # a successful merge-staging (#689, run 33889229683) — went red.
+          # A decision is only this PR's if it names this PR's head. The runner
+          # workspace is reused and upload-artifact runs `if: always()`, so a
+          # decide phase that dies can publish the previous run's verdict:
+          # #702 was blocked on #682's decision while its own lanes were 8/8
+          # pass. An artifact from another commit is a gate malfunction, not a
+          # verdict, so it fails as one rather than being obeyed.
+          want_head="${{ needs.select.outputs.head_sha }}"
+          got_head=$(jq -r '.head // ""' decision/decision.json)
+          if [ -n "$got_head" ] && [ "$got_head" != "$want_head" ]; then
+            echo "::error::decision artifact is for $got_head but this run is $want_head — stale decision.json from a reused workspace; re-run the gate"
+            exit 1
+          fi
+          if [ -z "$got_head" ]; then
+            echo "::warning::decision artifact predates head attribution; cannot verify it belongs to $want_head"
+          fi
           decision=$(jq -r '.decision_final // .decision.decision // "hold"' decision/decision.json)
           hard=$(jq -r '(.floor.hard // []) | join(", ")' decision/decision.json)
           echo "decision=$decision hard_floor=[$hard] human_reviewed=${{ needs.select.outputs.human_reviewed }}"

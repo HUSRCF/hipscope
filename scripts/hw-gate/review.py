@@ -1690,6 +1690,17 @@ def _run_decide(args) -> int:
         "version": 1,
         "seat": "fable",
         "model": model,
+        # The decision must be attributable to the commit it judged. The
+        # runner workspace is reused, so a decide phase that dies before
+        # writing its own decision.json leaves the PREVIOUS run's file in
+        # place, and `upload-artifact: if: always()` publishes it as this
+        # run's decision. That happened on 2026-09-04: #702's decide job
+        # failed and the run published #682's verdict -- "six refused loads
+        # ... master says 'no model loaded'" -- blocking a PR whose own lanes
+        # were 8/8 pass. The status job cross-checks these against the run's
+        # head, so a stale artifact is caught instead of obeyed.
+        "base": args.base,
+        "head": args.head,
         "decision": decision,
         "floor": {"hard": hard, "soft": soft},
         "decision_final": decision_final,
