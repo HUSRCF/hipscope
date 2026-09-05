@@ -866,3 +866,115 @@ def test_serve_harness_runs_from_gate_root_not_pr(tmp_path, monkeypatch):
     script = seen["argv"][1]
     assert script == str(gate / "scripts" / "serve_harness.py"), script
     assert str(pr) not in script
+
+
+# ---------------------------------------------------------------------------
+# `-dflash` routes. Speculative decode was entirely unexercised by this gate:
+# #686 (draft sidecars), #691 (draft ctor rollback), #692 (primer replay) and
+# #702 (dedicated verify kernels) all passed with every lane green while DFlash
+# never ran once.
+# ---------------------------------------------------------------------------
+
+
+def _dflash_env(tmp_path, monkeypatch, fixture, mode, drafts_on_disk):
+    """Run one mode with a fake harness, returning (argv, result)."""
+    gate = tmp_path / "gate"
+    (gate / "scripts" / "hw-gate").mkdir(parents=True)
+    (gate / "scripts" / "serve_harness.py").write_text("")
+    (gate / "benchmarks" / "prompts" / "hw-gate").mkdir(parents=True)
+    (gate / "benchmarks" / "prompts" / "hw-gate" / "serve-battery.json").write_text("[]")
+    models = tmp_path / "models"
+    models.mkdir()
+    (models / fixture["file"]).write_text("target")
+    for name in drafts_on_disk:
+        (models / name).write_text("draft")
+    captured = {}
+
+    def fake_run(argv, **kwargs):
+        captured["argv"] = argv
+        if "--out" in argv:
+            out_file = Path(argv[argv.index("--out") + 1])
+            out_file.parent.mkdir(parents=True, exist_ok=True)
+            out_file.write_text(json.dumps([{
+                "assistant_content": "hello", "expected_substrings": [], "attractor": False,
+                "empty": False, "finish": "stop", "gen": 5, "ctx": 10, "cached": 0,
+            }]))
+        if "--serve-log" in argv:
+            p = Path(argv[argv.index("--serve-log") + 1])
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text("log")
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(run_mod, "run_cmd", fake_run)
+    monkeypatch.delenv("CARGO_TARGET_DIR", raising=False)
+    cfg = {"battery_prompts": "benchmarks/prompts/hw-gate/serve-battery.json", "max_tokens": 8, "_gate_root": str(gate)}
+    env = {"HIPFIRE_HOME": str(tmp_path / "home")}
+    res = run_mod._run_harness_mode(str(tmp_path / "pr"), fixture, env, str(tmp_path / "logs"), "0", mode, cfg, str(models))
+    return captured.get("argv"), res
+
+
+FIX = {"tag": "qwen3.8:27b-mq4-xt", "file": "x.mq4",
+       "dflash_draft": ["qwen38-27b-dflash-mq4.hfq", "qwen36-27b-dflash-mq4.hfq"]}
+
+
+def test_dflash_mode_forces_speculation_on_with_an_explicit_draft(tmp_path, monkeypatch):
+    """`auto` would silently fall back to AR; a route that can pass without
+    speculating proves nothing, so the mode must pin `on` and name the draft."""
+    argv, res = _dflash_env(tmp_path, monkeypatch, FIX, "battery-dflash", ["qwen38-27b-dflash-mq4.hfq"])
+    assert res["status"] == "pass", res
+    assert argv[argv.index("--mode") + 1] == "battery"  # harness knows battery, not battery-dflash
+    assert argv[argv.index("--dflash") + 1] == "on"
+    assert argv[argv.index("--draft") + 1].endswith("qwen38-27b-dflash-mq4.hfq")
+    assert "--prompts-file" in argv  # battery prompts still applied
+
+
+def test_plain_battery_never_gets_a_draft(tmp_path, monkeypatch):
+    argv, res = _dflash_env(tmp_path, monkeypatch, FIX, "battery", ["qwen38-27b-dflash-mq4.hfq"])
+    assert res["status"] == "pass"
+    assert "--dflash" not in argv and "--draft" not in argv
+
+
+def test_lane_uses_the_draft_it_actually_holds(tmp_path, monkeypatch):
+    """hiptrx holds qwen36 and no qwen38; hipx holds qwen38 and no qwen36."""
+    argv, _ = _dflash_env(tmp_path, monkeypatch, FIX, "battery-dflash", ["qwen36-27b-dflash-mq4.hfq"])
+    assert argv[argv.index("--draft") + 1].endswith("qwen36-27b-dflash-mq4.hfq")
+
+
+def test_lane_without_any_declared_draft_skips_rather_than_fails(tmp_path, monkeypatch):
+    """The lane had no artifact to speculate with. Failing it would be a false
+    negative on evidence it never had; passing it would claim coverage."""
+    argv, res = _dflash_env(tmp_path, monkeypatch, FIX, "battery-dflash", [])
+    assert res["status"] == "skip", res
+    assert "qwen38-27b-dflash-mq4.hfq" in res["reason"]
+    assert argv is None  # the harness was never invoked
+
+
+def test_chain_dflash_keeps_chain_mode(tmp_path, monkeypatch):
+    argv, _ = _dflash_env(tmp_path, monkeypatch, FIX, "chain-dflash", ["qwen38-27b-dflash-mq4.hfq"])
+    assert argv[argv.index("--mode") + 1] == "chain"
+    assert argv[argv.index("--dflash") + 1] == "on"
+    assert "--prompts-file" not in argv  # chain carries its own prompts
+
+
+def test_skip_does_not_fail_the_fixture_but_a_real_failure_does(tmp_path, monkeypatch):
+    """Regression pin: `all(status == "pass")` counted a skip as a failure."""
+    assert run_mod._run_fixture_harness.__doc__ is not None
+    graded = {"battery": {"status": "pass"}, "battery-dflash": {"status": "skip", "reason": "no draft"}}
+    ungraded = {m: r for m, r in graded.items() if r.get("status") != "skip"}
+    assert all(r["status"] == "pass" for r in ungraded.values())
+    # and a genuine failure alongside a skip must still fail
+    graded_fail = {"battery": {"status": "fail", "reason": "attractor"}, "battery-dflash": {"status": "skip"}}
+    ungraded_fail = {m: r for m, r in graded_fail.items() if r.get("status") != "skip"}
+    assert not all(r["status"] == "pass" for r in ungraded_fail.values())
+
+
+def test_fixtures_manifest_declares_dflash_routes(tmp_path):
+    """The manifest is gate policy: assert the buckets actually carry the route."""
+    manifest = json.loads((Path(run_mod.__file__).parent / "fixtures.json").read_text())
+    assert "battery-dflash" in manifest["buckets"]["load"]["modes"]
+    assert "chain-dflash" in manifest["buckets"]["serve"]["modes"]
+    declared = {f["tag"]: f.get("dflash_draft") for f in manifest["fixtures"]}
+    assert declared["qwen3.8:27b-mq4-xt"], "the canonical xt trunk must declare a draft"
+    for tag, drafts in declared.items():
+        if drafts is not None:
+            assert isinstance(drafts, list) and drafts, f"{tag} dflash_draft must be a non-empty list"

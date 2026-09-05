@@ -1,7 +1,7 @@
 {
   "schema": "hipfire.hw-gate.fixtures",
   "version": 2,
-  "_comment": "Every fixture is a registry tag pinned by sha256 (registry/v1.json is the source of truth). A missing or mismatched fixture FAILS the gate. Every fixture runs in every selected bucket; the bucket decides which serve_harness modes run (union across buckets). battery = varied prompts with expect-substrings and attractor/runaway/empty detection; chain = related multi-turn prompts through the prefix cache. No fixture is ever exercised with a single `hipfire run`: one request against a fresh daemon proves nothing about turn-to-turn state.",
+  "_comment": "Every fixture is a registry tag pinned by sha256 (registry/v1.json is the source of truth). A missing or mismatched fixture FAILS the gate. Every fixture runs in every selected bucket; the bucket decides which serve_harness modes run (union across buckets). battery = varied prompts with expect-substrings and attractor/runaway/empty detection; chain = related multi-turn prompts through the prefix cache. No fixture is ever exercised with a single `hipfire run`: one request against a fresh daemon proves nothing about turn-to-turn state. Modes ending in `-dflash` run the same prompts with `--dflash on` and an explicit `--draft`: `dflash_draft` lists candidates and the lane uses the first it holds, recording `skip` when it holds none, because the two lanes carry different drafts.",
   "models_dir": "~/.hipfire/models",
   "harness": {
     "battery_prompts": "benchmarks/prompts/hw-gate/serve-battery.json",
@@ -14,7 +14,11 @@
       "sha256": "86a5f80fd29d545abb1093dead242725ced6d68b8607c6d566d897b1a82442dc",
       "size_bytes": 14984158208,
       "arch_id": 5,
-      "why": "Canonical dense trunk (AGENTS.md pinned fixture); Qwen3.5-family text artifact whose embedded config carries vision_config with no vision tower."
+      "why": "Canonical dense trunk (AGENTS.md pinned fixture); Qwen3.5-family text artifact whose embedded config carries vision_config with no vision tower.",
+      "dflash_draft": [
+        "qwen36-27b-dflash-mq4.hfq",
+        "qwen38-27b-dflash-mq4.hfq"
+      ]
     },
     {
       "tag": "ornith-1.5:35b-a3b-mq4r",
@@ -38,21 +42,27 @@
       "sha256": "9f91556f7e0431a077d03756a7102d0154108757289e6e5fe9a2d204c0c9eeb7",
       "size_bytes": 14980361216,
       "arch_id": 5,
-      "why": "MQ4V2 xt tier \u2014 the neutral-header v2 quant family (537a292df) that the device-mesh series refused."
+      "why": "MQ4V2 xt tier \u2014 the neutral-header v2 quant family (537a292df) that the device-mesh series refused.",
+      "dflash_draft": [
+        "qwen38-27b-dflash-mq4.hfq",
+        "qwen36-27b-dflash-mq4.hfq"
+      ]
     }
   ],
   "buckets": {
     "load": {
-      "why": "Loader / daemon / runtime load path / arch load changed.",
+      "why": "Loader / daemon / runtime load path / arch load changed. battery-dflash additionally drives the speculative arm: draft pairing, ctx-cap fallback and primer replay all live behind a draft load, and #686/#691/#692/#702 each passed this gate with DFlash never once running.",
       "modes": [
-        "battery"
+        "battery",
+        "battery-dflash"
       ]
     },
     "serve": {
-      "why": "Engine / generate / daemon serve semantics changed: add the multi-turn chain so reset, prefix cache, and terminal semantics are exercised.",
+      "why": "Engine / generate / daemon serve semantics changed: add the multi-turn chain so reset, prefix cache, and terminal semantics are exercised, and chain-dflash so turn-to-turn state is exercised with speculation on \u2014 the arm where primer replay asymmetry hides.",
       "modes": [
         "battery",
-        "chain"
+        "chain",
+        "chain-dflash"
       ]
     },
     "kernel": {

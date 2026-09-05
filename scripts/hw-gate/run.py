@@ -428,7 +428,31 @@ def _evaluate_mode(exit_code: int, raw_rows) -> tuple[str, str, list[dict]]:
 GATE_REPO = Path(__file__).resolve().parents[2]
 
 
-def _build_harness_argv(gate_root: Path, model_path: Path, mode: str, max_tokens: int, battery_prompts_path: Path | None, per_home: Path, out_path: Path, serve_log_path: Path) -> list[str]:
+# Gate modes -> (serve_harness --mode, extra flags).
+#
+# `-dflash` variants exist because speculative decode was entirely unexercised:
+# #686 (draft sidecars), #691 (draft ctor rollback), #692 (primer replay) and
+# #702 (dedicated verify kernels) all went through this gate with every lane
+# green while never once running DFlash. A DFlash-arm defect could only be
+# found by a seat that thought to drive it by hand, which is not a gate.
+#
+# `--dflash on` rather than `auto`: `auto` silently falls back to AR when the
+# draft is missing, and a fixture route that can pass by not speculating proves
+# nothing. `on` fails the load instead, which is the behaviour a gate wants.
+HARNESS_MODES: dict[str, tuple[str, list[str]]] = {
+    "battery": ("battery", []),
+    "chain": ("chain", []),
+    "battery-dflash": ("battery", ["--dflash", "on"]),
+    "chain-dflash": ("chain", ["--dflash", "on"]),
+}
+
+
+def harness_mode_spec(mode: str) -> tuple[str, list[str]]:
+    """Resolve a gate mode name; unknown modes pass through unchanged."""
+    return HARNESS_MODES.get(mode, (mode, []))
+
+
+def _build_harness_argv(gate_root: Path, model_path: Path, mode: str, max_tokens: int, battery_prompts_path: Path | None, per_home: Path, out_path: Path, serve_log_path: Path, draft_path: Path | None = None) -> list[str]:
     """Build argv for serve_harness.py. Never includes --devices.
 
     The harness is the oracle, so it comes from the gate checkout and never
@@ -439,13 +463,14 @@ def _build_harness_argv(gate_root: Path, model_path: Path, mode: str, max_tokens
     evidence that was correct.
     """
     harness = Path(gate_root) / "scripts" / "serve_harness.py"
+    harness_mode, mode_flags = harness_mode_spec(mode)
     argv = [
         sys.executable,
         str(harness),
         "--model",
         str(model_path),
         "--mode",
-        mode,
+        harness_mode,
         "--max-tokens",
         str(max_tokens),
         "--thinking",
@@ -461,7 +486,10 @@ def _build_harness_argv(gate_root: Path, model_path: Path, mode: str, max_tokens
         "--serve-log",
         str(serve_log_path),
     ]
-    if mode == "battery" and battery_prompts_path is not None:
+    argv.extend(mode_flags)
+    if draft_path is not None:
+        argv.extend(["--draft", str(draft_path)])
+    if harness_mode == "battery" and battery_prompts_path is not None:
         argv.extend(["--prompts-file", str(battery_prompts_path)])
     return argv
 
@@ -496,6 +524,31 @@ def _run_harness_mode(repo, fixture, env_base, logs_dir, device, mode, harness_c
         return {"exit": 2, "seconds": 0.0, "rows": [], "status": "fail",
                 "reason": f"battery prompts missing at {battery_prompts_path} (gate policy file)"}
     max_tokens = harness_cfg.get("max_tokens", 256)
+    # A `-dflash` mode needs a paired draft, named explicitly by the fixture:
+    # the daemon's filename auto-match cannot find one for the canonical xt
+    # trunk, which is a symlink out of the models dir, and would silently run
+    # AR instead — a DFlash route that passes without speculating is worse
+    # than no route.
+    #
+    # `dflash_draft` may be a list, because the two lanes hold different
+    # drafts: hiptrx has qwen36-27b-dflash-mq4.hfq and no qwen38, hipx has
+    # qwen38-27b-dflash-mq4.hfq and no qwen36. The lane speculates with the
+    # first candidate it actually has; a lane holding none records `skip`, so
+    # the evidence says "not covered here" rather than inventing a pass or a
+    # failure on evidence the host never had.
+    draft_path: Path | None = None
+    if mode.endswith("-dflash"):
+        declared = fixture.get("dflash_draft")
+        candidates = [declared] if isinstance(declared, str) else list(declared or [])
+        models_root = Path(models_dir).expanduser()
+        present = [models_root / c for c in candidates if (models_root / c).is_file()]
+        if not candidates:
+            return {"exit": 0, "seconds": 0.0, "rows": [], "status": "skip",
+                    "reason": f"fixture {tag} declares no dflash_draft"}
+        if not present:
+            return {"exit": 0, "seconds": 0.0, "rows": [], "status": "skip",
+                    "reason": f"none of {candidates} present under {models_root} for fixture {tag}"}
+        draft_path = present[0]
     # per-fixture home: subdirectory of gate home
     gate_home = env_base.get("HIPFIRE_HOME") or str(Path.home() / ".hipfire")
     per_home = Path(gate_home) / f"{safe_tag}-{mode}"
@@ -507,7 +560,7 @@ def _run_harness_mode(repo, fixture, env_base, logs_dir, device, mode, harness_c
     out_path = logs_dir_p / f"{safe_tag}-{mode}.json"
     serve_log_path = logs_dir_p / f"{safe_tag}-{mode}.serve.log"
     out_combined_path = logs_dir_p / f"{safe_tag}-{mode}.out"
-    argv = _build_harness_argv(gate_root, model_path, mode, max_tokens, battery_prompts_path, per_home, out_path, serve_log_path)
+    argv = _build_harness_argv(gate_root, model_path, mode, max_tokens, battery_prompts_path, per_home, out_path, serve_log_path, draft_path)
     start = time.time()
     exit_code = 1
     stdout = ""
@@ -568,15 +621,22 @@ def _run_fixture_harness(repo, fixture, env_base, logs_dir, device, modes, harne
     for mode in modes:
         res = _run_harness_mode(repo, fixture, env_base, logs_dir, device, mode, harness_cfg, models_dir)
         modes_result[mode] = res
-    # overall fixture status
-    overall = "pass" if all(m.get("status") == "pass" for m in modes_result.values()) else ("pass" if not modes_result else "fail")
-    # if no modes (should not happen) treat as pass
+    # A mode can legitimately not run: the two lanes hold different drafts, so
+    # a `-dflash` mode has no artifact to speculate with on one of them.
+    # Failing that lane would be a false negative on evidence it never had, and
+    # counting it as a pass would claim coverage that did not happen. `skip`
+    # is therefore neither: it is recorded, reported, and excluded from the
+    # verdict. It must never be produced for a missing artifact the fixture
+    # DECLARED — that stays a hard fail.
+    graded = {m: r for m, r in modes_result.items() if r.get("status") != "skip"}
+    overall = "pass" if all(r.get("status") == "pass" for r in graded.values()) else ("pass" if not graded else "fail")
     reasons: list[str] = []
     for m, r in modes_result.items():
-        if r.get("status") != "pass" and r.get("reason"):
-            reasons.append(f"{m}: {r.get('reason')}")
-        elif r.get("status") != "pass":
-            reasons.append(f"{m}: fail")
+        status = r.get("status")
+        if status == "skip":
+            reasons.append(f"{m}: skipped ({r.get('reason') or 'no reason given'})")
+        elif status != "pass":
+            reasons.append(f"{m}: {r.get('reason') or 'fail'}")
     reason = "; ".join(reasons) if reasons else ""
     tag = fixture.get("tag", "")
     return {
