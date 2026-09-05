@@ -80,7 +80,10 @@ jobs:
       # true when this event should (re)run the seats and hardware: every code
       # event, plus the `hw-run` label. Other label events only re-evaluate
       # the recorded decision.
-      run_hw: ${{ steps.pr.outputs.run_hw }}
+      # `false` when the head is already on the staging branch, so a rung that
+      # merged to `beta` (and stays OPEN until the maintainer promotes) does
+      # not re-gate itself on every later touch of its branch.
+      run_hw: ${{ steps.staged.outputs.staged == 'true' && 'false' || steps.pr.outputs.run_hw }}
     steps:
       - name: Base checkout (gate scripts come from the base branch)
         uses: actions/checkout@v4
@@ -118,6 +121,24 @@ jobs:
           fi
       - name: Fetch PR head
         run: git fetch --no-tags origin "${{ steps.pr.outputs.head_sha }}"
+      - name: Skip a head already merged to staging
+        id: staged
+        # A rung that merged to `beta` stays OPEN by design: promoting
+        # beta -> master is the maintainer's call, so the PR is not closed and
+        # `pull_request.merged` is false. Every later touch of its branch then
+        # re-gates work that is already staged -- #692 and #723 both re-ran
+        # within minutes of their staging merges on 2026-09-04, taking the
+        # runner from live rungs. If the head is an ancestor of the staging
+        # branch, the evidence exists and the hardware has nothing to add.
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --quiet origin "$HW_GATE_STAGING"
+          if git merge-base --is-ancestor "${{ steps.pr.outputs.head_sha }}" "origin/$HW_GATE_STAGING"; then
+            echo "staged=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::head ${{ steps.pr.outputs.head_sha }} is already on $HW_GATE_STAGING; skipping hardware"
+          else
+            echo "staged=false" >> "$GITHUB_OUTPUT"
+          fi
       - name: Select buckets and parse the author's request
         id: sel
         run: |
