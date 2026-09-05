@@ -1058,52 +1058,66 @@ impl Gpu {
         }
     }
 
-    /// Bounded stream sync: like `hipStreamSynchronize` (or
-    /// `hipDeviceSynchronize` on the null stream) but returns a reportable
-    /// error naming the last-launched kernel instead of blocking forever when
-    /// the GPU hangs.
+    /// Poll interval for [`Self::sync_with_deadline`]: 2 ms. Coarse enough
+    /// never to spin a core, fine-grained enough for a deadline measured in
+    /// seconds.
+    pub(crate) const SYNC_POLL_INTERVAL: std::time::Duration =
+        std::time::Duration::from_millis(2);
+
+    /// Bounded stream sync: record a completion event on this `Gpu`'s stream
+    /// (or the null stream) and poll `hipEventQuery` until it completes or
+    /// `deadline` elapses.
     ///
-    /// The blocking HIP call runs on a scoped thread and the caller waits at
-    /// most `deadline`; on timeout the error names `last_launched_kernel`.
-    /// The timed-out sync thread is left parked inside HIP — the stream is
-    /// still busy and nothing here resets device state, so the caller must
-    /// treat the device as suspect after this error.
+    /// No helper thread: the query is non-blocking, so the deadline is real —
+    /// on timeout this returns `Err` naming `last_launched_kernel` while the
+    /// GPU work is still outstanding.
+    ///
+    /// Returning `Err` does NOT cancel the outstanding work. The contract is
+    /// "I stopped waiting", not "the GPU stopped": the stream is still busy
+    /// and nothing here resets device state, so the caller must treat the
+    /// device as suspect and must not touch buffers the outstanding work may
+    /// still write.
     ///
     /// Existing `sync()` callers keep their unbounded semantics; use this
     /// where a deadline is already meaningful (collective rendezvous,
     /// watchdog paths) rather than migrating every sync.
     pub fn sync_with_deadline(&self, deadline: std::time::Duration) -> HipResult<()> {
         self.bind_thread()?;
-        // `Stream` is Send but not Sync, so `&Stream` cannot be shared into
-        // the scoped waiter — the raw handle crosses as a `usize` instead.
-        let stream_raw: Option<usize> =
-            self.active_stream.as_ref().map(|s| s.as_raw() as usize);
+        // Timing-disabled event: a pure completion probe, no profiling state.
+        let event = self
+            .hip
+            .event_create_with_flags(hip_bridge::HIP_EVENT_DISABLE_TIMING)?;
+        self.hip.event_record(&event, self.active_stream.as_ref())?;
         let last_kernel = self.last_kernel.clone();
-        // Share `&HipRuntime` (Sync), never `&Gpu`/`&Stream` (both !Sync),
-        // into the scoped waiter. The handle crosses as a `usize` (Send);
-        // it is the live `hipStream_t` of `self.active_stream`, borrowed by
-        // the enclosing `&self` for the whole scope.
-        let hip = &self.hip;
-        let device_id = self.device_id;
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::scope(|scope| {
-            scope.spawn(move || {
-                // HIP device affinity is per-thread: bind the waiter to the
-                // same device before syncing its stream.
-                let result = hip.set_device(device_id).and_then(|()| match stream_raw {
-                    // SAFETY: `stream_raw` is the live handle of
-                    // `self.active_stream` for the whole scope; only
-                    // synchronize is issued on it.
-                    Some(raw) => hip.stream_synchronize_raw(raw as *mut std::ffi::c_void),
-                    None => hip.device_synchronize(),
-                });
-                let _ = tx.send(result);
-            });
-            match rx.recv_timeout(deadline) {
-                Ok(result) => result,
-                Err(_) => Err(Self::deadline_exceeded(last_kernel.as_deref(), deadline)),
+        let result = Self::poll_until_ready(deadline, last_kernel.as_deref(), || {
+            self.hip.event_query(&event)
+        });
+        // Best-effort teardown. On timeout the outstanding GPU work is NOT
+        // cancelled — this call only stopped waiting. Never shadow the poll
+        // result with a destroy error.
+        let _ = self.hip.event_destroy(event);
+        result
+    }
+
+    /// Poll `query` until it reports ready or `deadline` elapses. Query
+    /// errors propagate immediately; only `hipErrorNotReady` keeps polling.
+    /// Split from [`Self::sync_with_deadline`] so the timeout path is
+    /// unit-testable on CPU with a stubbed query.
+    pub(crate) fn poll_until_ready(
+        deadline: std::time::Duration,
+        last_kernel: Option<&str>,
+        mut query: impl FnMut() -> HipResult<bool>,
+    ) -> HipResult<()> {
+        let start = std::time::Instant::now();
+        loop {
+            if query()? {
+                return Ok(());
             }
-        })
+            if start.elapsed() >= deadline {
+                return Err(Self::deadline_exceeded(last_kernel, deadline));
+            }
+            std::thread::sleep(Self::SYNC_POLL_INTERVAL);
+        }
     }
 
     /// Bind this `Gpu`'s device on the calling thread. Delegates to
@@ -5310,10 +5324,8 @@ mod tests {
 
     #[test]
     fn deadline_error_names_last_kernel() {
-        // The blocking-sync timeout path cannot be driven without a GPU
-        // (and must not be: no GPU work in unit tests), so the error is
-        // constructed directly — the same constructor `sync_with_deadline`
-        // uses on timeout.
+        // Constructor-level pin; the timeout path itself is driven below
+        // through `poll_until_ready` with a stubbed query.
         let e = Gpu::deadline_exceeded(
             Some("gemv_hfq4g256"),
             std::time::Duration::from_secs(5),
@@ -5331,5 +5343,46 @@ mod tests {
         let s = e.to_string();
         assert!(s.contains("no kernel"), "states nothing was recorded: {s}");
         assert!(e.context.is_none());
+    }
+
+    #[test]
+    fn sync_timeout_returns_in_bounded_wall_time() {
+        // The test review asked for: a query that never reports ready (a
+        // hung GPU) must produce `Err` within bounded wall-clock time. The
+        // old scoped-thread design would block forever here on the join;
+        // the event poll returns. No GPU needed — the query is stubbed.
+        let deadline = std::time::Duration::from_millis(50);
+        let start = std::time::Instant::now();
+        let err = Gpu::poll_until_ready(deadline, Some("hung_kernel"), || Ok(false))
+            .expect_err("a never-ready query must time out");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "deadline escaped its bound: {elapsed:?}"
+        );
+        assert!(
+            elapsed >= deadline,
+            "returned before the deadline elapsed: {elapsed:?}"
+        );
+        let s = err.to_string();
+        assert!(s.contains("hung_kernel"), "timeout names the kernel: {s}");
+    }
+
+    #[test]
+    fn poll_ready_immediately_returns_ok() {
+        let result = Gpu::poll_until_ready(std::time::Duration::from_secs(5), None, || Ok(true));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn poll_propagates_query_errors() {
+        // A real query failure (bad handle, lost device) is not "not ready".
+        let err = Gpu::poll_until_ready(
+            std::time::Duration::from_secs(5),
+            Some("k"),
+            || Err(hip_bridge::HipError::new(999, "boom")),
+        )
+        .expect_err("query errors must propagate");
+        assert!(err.to_string().contains("boom"), "{err}");
     }
 }

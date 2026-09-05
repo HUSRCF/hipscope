@@ -1037,6 +1037,11 @@ impl Gpus {
         // naming the last kernel launched on that device instead of hanging
         // the collective forever. Every other sync in this file keeps its
         // existing unbounded semantics.
+        // On `Err` the producer work is STILL OUTSTANDING (the deadline only
+        // stops waiting, it never cancels the GPU): `?` aborts the collective
+        // here, skipping the download below, so we never read a buffer its
+        // kernel may still be writing. The device must be treated as suspect
+        // by the caller — no retry on this stream without a reset path.
         for r in 0..n {
             let dev = &self.devices[r];
             dev.bind_thread()?;
