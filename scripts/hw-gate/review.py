@@ -1265,6 +1265,67 @@ def _run_verdict(args) -> int:
 # decide phase (fable)
 # ---------------------------------------------------------------------------
 
+def _resolve_generated_map_conflict(repo: str, checkout: str, staging: str, head: str, commit_msg: str) -> tuple[str | None, str]:
+    """Retry a 409 staging merge when the only conflicts are generated maps.
+
+    Every rung on the 2026-09-04 ladder hit the same 409: `crates/*/map.md`
+    carries a `<!-- crate-map:generated -->` block that both branches
+    regenerate, so any two PRs touching the same crate conflict there while
+    their real code merges cleanly. Six merges were unblocked by hand with
+    exactly the steps below.
+
+    The retry is deliberately narrow. It merges locally, and if ANY conflicted
+    path is not a `map.md`, it gives up and leaves the hold in place: a real
+    code conflict must reach a human. For the generated files it re-runs
+    scripts/check-crate-maps.py rather than picking a side, so the committed
+    block is what the tree actually generates.
+
+    Returns (merge_sha, note). `merge_sha` is None when the caller should hold.
+    """
+    def git(*args: str, check: bool = True) -> str:
+        r = subprocess.run(["git", "-C", checkout, *args], capture_output=True, text=True, timeout=300)
+        if check and r.returncode != 0:
+            raise ReviewError(f"git {' '.join(args)}: {r.stderr.strip() or r.stdout.strip()}")
+        return r.stdout
+
+    try:
+        git("fetch", "--quiet", "origin", staging, head)
+        git("checkout", "--quiet", "--detach", head)
+        merge = subprocess.run(
+            ["git", "-C", checkout, "merge", "--no-edit", "-m", f"Merge {staging} into PR head for staging", f"origin/{staging}"],
+            capture_output=True, text=True, timeout=600,
+        )
+        if merge.returncode != 0:
+            conflicts = [p for p in git("diff", "--name-only", "--diff-filter=U").split() if p]
+            if not conflicts:
+                return None, f"local merge failed with no conflicted paths: {merge.stderr.strip()[:300]}"
+            non_generated = [p for p in conflicts if not p.endswith("/map.md")]
+            if non_generated:
+                return None, f"real code conflicts, not just generated maps: {', '.join(non_generated[:6])}"
+            crates = sorted({p.split("/")[1] for p in conflicts if p.startswith("crates/")})
+            git("checkout", "--ours", "--", *conflicts)
+            regen = subprocess.run(
+                [sys.executable, "scripts/check-crate-maps.py", *crates],
+                cwd=checkout, capture_output=True, text=True, timeout=600,
+            )
+            if regen.returncode not in (0, 1):
+                return None, f"check-crate-maps.py failed for {crates}: {regen.stderr.strip()[:200]}"
+            git("add", "--", *conflicts)
+            git("commit", "--quiet", "--no-edit")
+        merged_head = git("rev-parse", "HEAD").strip()
+        git("push", "--quiet", "origin", f"HEAD:refs/heads/{head[:12]}-staging-merge")
+        out = _gh(["api", f"repos/{repo}/merges", "-f", f"base={staging}", "-f", f"head={merged_head}",
+                   "-f", f"commit_message={commit_msg} (generated crate maps regenerated)"])
+        try:
+            resp = json.loads(out) if out.strip() else {}
+            sha = resp.get("sha") if isinstance(resp, dict) else None
+        except Exception:
+            sha = out.strip() or None
+        return (sha or merged_head), f"generated maps regenerated for {', '.join(crates) if merge.returncode != 0 else 'none'}"
+    except (ReviewError, subprocess.TimeoutExpired, OSError) as exc:
+        return None, f"generated-map retry failed: {exc}"
+
+
 def _run_decide(args) -> int:
     # Load select
     try:
@@ -1546,14 +1607,28 @@ def _run_decide(args) -> int:
             merged = {"base": staging, "head": args.head, "merge_sha": merge_sha}
         except ReviewError as e:
             err_msg = str(e)
-            merged = {"base": staging, "head": args.head, "merge_sha": None, "error": err_msg}
             is_409 = "409" in err_msg or "already" in err_msg.lower() or "conflict" in err_msg.lower()
-            decision_final = "hold"
-            hard.append("staging_merge_failed" if not is_409 else "staging_merge_conflict")
-            announcement_extra = (
-                f" Fable decided merge-staging, but merging into `{staging}` failed"
-                f"{' with a conflict (409)' if is_409 else ''}: {err_msg}. Holding for a human."
-            )
+            retry_sha, retry_note = (None, "")
+            if is_409:
+                retry_sha, retry_note = _resolve_generated_map_conflict(
+                    args.repo, args.checkout, staging, args.head, commit_msg
+                )
+            if retry_sha:
+                merged = {"base": staging, "head": args.head, "merge_sha": retry_sha, "retry": retry_note}
+                announcement_extra = (
+                    f" The first merge into `{staging}` hit a 409 on generated crate maps only;"
+                    f" merged after regenerating them ({retry_note})."
+                )
+            else:
+                merged = {"base": staging, "head": args.head, "merge_sha": None, "error": err_msg,
+                          "retry": retry_note or None}
+                decision_final = "hold"
+                hard.append("staging_merge_failed" if not is_409 else "staging_merge_conflict")
+                announcement_extra = (
+                    f" Fable decided merge-staging, but merging into `{staging}` failed"
+                    f"{' with a conflict (409)' if is_409 else ''}: {err_msg}."
+                    f"{' Retry: ' + retry_note + '.' if retry_note else ''} Holding for a human."
+                )
     announcement = ""
     if isinstance(decision, dict):
         announcement = decision.get("announcement", "")

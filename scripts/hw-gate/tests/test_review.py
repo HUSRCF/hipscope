@@ -897,3 +897,36 @@ def test_decision_records_the_commit_it_judged():
     assert data["base"] == base, data.get("base")
 
 
+
+
+def test_generated_map_retry_refuses_real_code_conflicts(tmp_path):
+    """The 409 retry must be narrow.
+
+    Every rung on the 2026-09-04 ladder hit a 409 on `crates/*/map.md`, whose
+    `<!-- crate-map:generated -->` block both branches regenerate; six merges
+    were unblocked by hand. Automating that is only safe if a genuine code
+    conflict still stops at a human, so this asserts the guard rather than the
+    happy path: a conflicted .rs makes the retry decline.
+    """
+    import subprocess as sp
+    repo = tmp_path / "r"
+    repo.mkdir()
+    sp.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+    sp.run(["git", "-C", str(repo), "config", "user.email", "t@t"], check=True)
+    sp.run(["git", "-C", str(repo), "config", "user.name", "t"], check=True)
+    (repo / "a.rs").write_text("fn main() {}\n")
+    sp.run(["git", "-C", str(repo), "add", "-A"], check=True)
+    sp.run(["git", "-C", str(repo), "commit", "-qm", "base"], check=True)
+    base = sp.run(["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    sp.run(["git", "-C", str(repo), "checkout", "-q", "-b", "other"], check=True)
+    (repo / "a.rs").write_text("fn main() { other() }\n")
+    sp.run(["git", "-C", str(repo), "commit", "-aqm", "other"], check=True)
+    sp.run(["git", "-C", str(repo), "checkout", "-q", base], check=True)
+    sp.run(["git", "-C", str(repo), "checkout", "-q", "-b", "head"], check=True)
+    (repo / "a.rs").write_text("fn main() { head() }\n")
+    sp.run(["git", "-C", str(repo), "commit", "-aqm", "head"], check=True)
+    # `origin` points at itself so the helper's fetch resolves without a network
+    sp.run(["git", "-C", str(repo), "remote", "add", "origin", str(repo)], check=True)
+    sha, note = review._resolve_generated_map_conflict("o/r", str(repo), "other", "head", "msg")
+    assert sha is None, "a conflicted .rs must not be auto-merged"
+    assert "a.rs" in note or "real code conflicts" in note, note
