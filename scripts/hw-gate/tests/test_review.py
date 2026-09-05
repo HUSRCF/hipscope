@@ -874,3 +874,26 @@ def test_investigate_omp_argv_has_full_tools_and_xhigh(monkeypatch, tmp_path):
     assert "--thinking" in cmd and cmd[cmd.index("--thinking") + 1] == "xhigh"
     assert cmd[cmd.index("--max-time") + 1] == f"{minutes}m"
     assert "GH_TOKEN" not in captured["env"] and captured["env"]["HW_GATE_DEVICES"] == "0,1,2,3,4"
+
+
+def test_decision_records_the_commit_it_judged():
+    """A decision is only usable if it names the commit it judged.
+
+    The runner workspace is reused and upload-artifact runs `if: always()`, so a
+    decide phase that dies publishes the previous run's decision.json as this
+    run's. On 2026-09-04 #702 was blocked by #682's verdict -- announcement and
+    all -- while #702's own lanes were 8/8 pass. The status job cross-checks
+    `.head`, which only works if review.py records it.
+    """
+    tmp = Path(tempfile.mkdtemp())
+    result, out_path, gh_log, gh_comments, omp_log, base, head, checkout = _run_decide(
+        tmp, sol_final="greenlight",
+        fable_response={"phase": "decide", "decision": "merge-staging", "agrees_with_sol": True,
+                        "override": None, "regressions": [], "further_evidence_wanted": [],
+                        "rationale": "r", "announcement": "a"},
+    )
+    data = json.loads(out_path.read_text())
+    assert data["head"] == head, data.get("head")
+    assert data["base"] == base, data.get("base")
+
+
