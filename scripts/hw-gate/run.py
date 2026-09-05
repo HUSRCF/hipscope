@@ -541,14 +541,39 @@ def _run_harness_mode(repo, fixture, env_base, logs_dir, device, mode, harness_c
         declared = fixture.get("dflash_draft")
         candidates = [declared] if isinstance(declared, str) else list(declared or [])
         models_root = Path(models_dir).expanduser()
-        present = [models_root / c for c in candidates if (models_root / c).is_file()]
+
+        def resolve_candidate(c: str) -> Path:
+            """A bare filename lives in the models dir; anything path-shaped is
+            taken as given. The 3.8 V2 ladder's drafts live under
+            ~/qcal/ladder-v2/drafts on BOTH hosts, outside the models dir, and
+            they are the drafts the canonical fixture identity was measured
+            with -- so the manifest has to be able to name them."""
+            p = Path(c).expanduser()
+            return p if ("/" in c or c.startswith("~")) else models_root / c
+
+        resolved = [resolve_candidate(c) for c in candidates]
+        present = [p for p in resolved if p.is_file()]
         if not candidates:
             return {"exit": 0, "seconds": 0.0, "rows": [], "status": "skip",
                     "reason": f"fixture {tag} declares no dflash_draft"}
         if not present:
             return {"exit": 0, "seconds": 0.0, "rows": [], "status": "skip",
-                    "reason": f"none of {candidates} present under {models_root} for fixture {tag}"}
+                    "reason": f"none of {[str(p) for p in resolved]} present for fixture {tag}"}
         draft_path = present[0]
+        # A wrong draft does not fail loudly, it silently changes tau -- which
+        # is exactly the kind of number that then gets quoted. So the draft is
+        # pinned like the target: mismatch is a hard fail, not a skip.
+        expected_draft_sha = fixture.get("dflash_draft_sha256", "")
+        if expected_draft_sha:
+            h = hashlib.sha256()
+            with open(draft_path, "rb") as fh:
+                for chunk in iter(lambda: fh.read(8 * 1024 * 1024), b""):
+                    h.update(chunk)
+            actual_draft_sha = h.hexdigest()
+            if actual_draft_sha != expected_draft_sha:
+                return {"exit": 2, "seconds": 0.0, "rows": [], "status": "fail",
+                        "reason": (f"dflash_draft {draft_path} sha256 mismatch: expected "
+                                   f"{expected_draft_sha[:16]}…, got {actual_draft_sha[:16]}…")}
     # per-fixture home: subdirectory of gate home
     gate_home = env_base.get("HIPFIRE_HOME") or str(Path.home() / ".hipfire")
     per_home = Path(gate_home) / f"{safe_tag}-{mode}"

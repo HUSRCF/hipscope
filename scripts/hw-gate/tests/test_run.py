@@ -978,3 +978,40 @@ def test_fixtures_manifest_declares_dflash_routes(tmp_path):
     for tag, drafts in declared.items():
         if drafts is not None:
             assert isinstance(drafts, list) and drafts, f"{tag} dflash_draft must be a non-empty list"
+
+
+def test_dflash_draft_can_live_outside_the_models_dir(tmp_path, monkeypatch):
+    """The 3.8 V2 ladder's drafts live under ~/qcal/ladder-v2/drafts on both
+    hosts, not in the models dir, and they are the drafts the canonical
+    identity was measured with (draft md5 013395583cd0 / target e45d15bfe0c9).
+    A manifest that can only name files inside the models dir cannot pin them.
+    """
+    outside = tmp_path / "qcal" / "drafts"
+    outside.mkdir(parents=True)
+    draft = outside / "qwen3.8-27b-dflash.mq4v2.hfq"
+    draft.write_text("draft")
+    fix = {"tag": "qwen3.8:27b-mq4-xt", "file": "x.mq4", "dflash_draft": [str(draft)]}
+    argv, res = _dflash_env(tmp_path, monkeypatch, fix, "battery-dflash", [])
+    assert res["status"] == "pass", res
+    assert argv[argv.index("--draft") + 1] == str(draft)
+
+
+def test_a_mismatched_draft_fails_rather_than_skewing_tau(tmp_path, monkeypatch):
+    """A wrong draft does not fail loudly, it silently changes tau. Pin it."""
+    outside = tmp_path / "qcal"
+    outside.mkdir(parents=True)
+    draft = outside / "d.hfq"
+    draft.write_text("not the pinned draft")
+    fix = {"tag": "qwen3.8:27b-mq4-xt", "file": "x.mq4", "dflash_draft": [str(draft)],
+           "dflash_draft_sha256": "0" * 64}
+    argv, res = _dflash_env(tmp_path, monkeypatch, fix, "battery-dflash", [])
+    assert res["status"] == "fail", res
+    assert "sha256 mismatch" in res["reason"]
+    assert argv is None  # never speculated with the wrong draft
+
+
+def test_manifest_pins_the_canonical_xt_draft():
+    manifest = json.loads((Path(run_mod.__file__).parent / "fixtures.json").read_text())
+    xt = [f for f in manifest["fixtures"] if f["tag"] == "qwen3.8:27b-mq4-xt"][0]
+    assert xt["dflash_draft"] == ["~/qcal/ladder-v2/drafts/qwen3.8-27b-dflash.mq4v2.hfq"]
+    assert xt["dflash_draft_sha256"] == "d0a74a232a0e2166d889f823e91e0fbf778d21dd9668d7de055cdecb065401bc"
