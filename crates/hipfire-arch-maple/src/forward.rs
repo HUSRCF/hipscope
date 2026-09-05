@@ -287,7 +287,7 @@ fn decode_step_body(
 /// per (layer, token) on the hot path and the disabled case must not allocate.
 fn router_dump_prefix() -> Option<&'static str> {
     static P: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    P.get_or_init(|| std::env::var("HIPFIRE_MAPLE_DUMP_ROUTER").ok())
+    P.get_or_init(|| hipfire_config::developer_var("HIPFIRE_MAPLE_DUMP_ROUTER").ok())
         .as_deref()
 }
 
@@ -368,7 +368,7 @@ fn dump_router_records(
 /// Destination for the per-layer residual dump, or `None` when disabled.
 fn dump_hidden_path() -> Option<String> {
     static P: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    P.get_or_init(|| std::env::var("HIPFIRE_MAPLE_DUMP_HIDDEN").ok())
+    P.get_or_init(|| hipfire_config::developer_var("HIPFIRE_MAPLE_DUMP_HIDDEN").ok())
         .clone()
 }
 
@@ -609,7 +609,7 @@ enum DownMode {
 fn down_mode() -> DownMode {
     static M: std::sync::OnceLock<DownMode> = std::sync::OnceLock::new();
     *M.get_or_init(
-        || match std::env::var("HIPFIRE_MAPLE_DOWN").ok().as_deref() {
+        || match hipfire_config::developer_var("HIPFIRE_MAPLE_DOWN").ok().as_deref() {
             Some("atomic") => DownMode::Atomic,
             Some("expanded-nocombine") => DownMode::ExpandedNoCombine,
             _ => DownMode::Expanded,

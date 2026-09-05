@@ -661,7 +661,7 @@ pub fn emit_committed_event(
 ) {
     use std::sync::LazyLock;
     static ENABLED: LazyLock<bool> =
-        LazyLock::new(|| std::env::var("HIPFIRE_EMIT_TOKEN_IDS").ok().as_deref() == Some("1"));
+        LazyLock::new(|| hipfire_config::developer_var("HIPFIRE_EMIT_TOKEN_IDS").ok().as_deref() == Some("1"));
     if !*ENABLED {
         return;
     }
@@ -963,7 +963,7 @@ pub fn build_deepseek4_dsml_prompt(
                     let normalized =
                         hipfire_runtime::tokenizer::maybe_normalize_prompt(&stripped).into_owned();
                     let fp = asst_turn_fingerprint(&normalized, &msg.tool_calls);
-                    if std::env::var("HIPFIRE_DEEPSEEK4_CACHE_TRACE")
+                    if hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_CACHE_TRACE")
                         .ok()
                         .as_deref()
                         == Some("1")

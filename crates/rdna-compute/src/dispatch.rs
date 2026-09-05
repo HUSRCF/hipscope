@@ -15,7 +15,7 @@ use hip_bridge::{
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::atomic::AtomicUsize;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 /// Per-group byte size of the MQ3-Lloyd quantization layout.
 ///
@@ -158,11 +158,10 @@ pub const GL_CB3: [f32; 8] = [
 pub static MMQ_CURRENT_LAYER: AtomicUsize = AtomicUsize::new(0);
 
 fn pm4_dynamic_grid_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        hipfire_config::process_value("HIPFIRE_REPLAY_PM4_DYNAMIC_GRID")
-            .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
-    })
+    // Multi-spelling ("1"/"true"/"yes"/"on") predicate preserved verbatim;
+    // only the process-global cache is gone (the snapshot is the cache now).
+    hipfire_config::process_value("HIPFIRE_REPLAY_PM4_DYNAMIC_GRID")
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
 }
 
 /// Minimum batch size at which the FP8 WMMA prefill path is enabled.
@@ -2079,13 +2078,7 @@ impl Gpu {
         size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        static DUMP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let dump = *DUMP.get_or_init(|| {
-            hipfire_config::developer_var("HIPFIRE_DTOD_DUMP")
-                .ok()
-                .as_deref()
-                == Some("1")
-        });
+        let dump = hipfire_config::developer_bool("HIPFIRE_DTOD_DUMP", false);
         if dump {
             let loc = std::panic::Location::caller();
             eprintln!("dtod bytes={} at {}:{}", size, loc.file(), loc.line());
@@ -2811,8 +2804,7 @@ impl Gpu {
     /// runs fine there (uses WMMA backends on RDNA3, not MFMA) so this is
     /// a useful smoke-path in the absence of an MI300.
     pub(crate) fn rocblas_arch_eligible(&self) -> bool {
-        static CACHE: OnceLock<bool> = OnceLock::new();
-        let all_archs = *CACHE.get_or_init(|| self.flags.rocblas_all_archs);
+        let all_archs = self.flags.rocblas_all_archs;
         if all_archs {
             return self.rocblas.is_some();
         }
@@ -2827,13 +2819,10 @@ impl Gpu {
     /// which disables the rocBLAS path entirely for A/B benchmarking against
     /// the hand-rolled GEMV baseline.
     pub(crate) fn rocblas_min_batch(&self) -> usize {
-        static CACHE: OnceLock<usize> = OnceLock::new();
-        *CACHE.get_or_init(|| {
-            if self.flags.rocblas_off {
-                return usize::MAX;
-            }
-            self.flags.rocblas_min_batch.unwrap_or(4)
-        })
+        if self.flags.rocblas_off {
+            return usize::MAX;
+        }
+        self.flags.rocblas_min_batch.unwrap_or(4)
     }
 
     /// Batched-attention tile size, from `HIPFIRE_ATTN_TILE_SIZE`.
@@ -2848,13 +2837,10 @@ impl Gpu {
     /// needs, which can exceed buffers sized elsewhere against the 128 default.
     pub fn attn_tile_size(&self) -> usize {
         // bind_thread: skip — pure flag read, touches no device state.
-        static CACHE: OnceLock<usize> = OnceLock::new();
-        *CACHE.get_or_init(|| {
-            self.flags
-                .attn_tile_size
-                .filter(|&t| t > 0 && t % 32 == 0)
-                .unwrap_or(128)
-        })
+        self.flags
+            .attn_tile_size
+            .filter(|&t| t > 0 && t % 32 == 0)
+            .unwrap_or(128)
     }
 
     /// Multi-slot attention flash-vs-scalar crossover override, in tokens.

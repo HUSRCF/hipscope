@@ -29,15 +29,15 @@ use rdna_compute::Gpu;
 /// Env `HIPFIRE_NGRAM_MOD_{N_MATCH,N_MIN,N_MAX}` with production defaults.
 /// `None` when the triple is invalid (max>64, zero match/max, or min>max).
 fn ngram_mod_env_config() -> Option<NgramModConfig> {
-    let n_match: usize = std::env::var("HIPFIRE_NGRAM_MOD_N_MATCH")
+    let n_match: usize = hipfire_config::developer_var("HIPFIRE_NGRAM_MOD_N_MATCH")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(24);
-    let n_min: usize = std::env::var("HIPFIRE_NGRAM_MOD_N_MIN")
+    let n_min: usize = hipfire_config::developer_var("HIPFIRE_NGRAM_MOD_N_MIN")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(48);
-    let n_max: usize = std::env::var("HIPFIRE_NGRAM_MOD_N_MAX")
+    let n_max: usize = hipfire_config::developer_var("HIPFIRE_NGRAM_MOD_N_MAX")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(64);
@@ -165,7 +165,7 @@ impl Qwen35MtpDrafter {
     fn ensure_state(&mut self, gpu: &mut Gpu, slot: &ModelSlot) -> Result<(), String> {
         if self.state.is_none() {
             let verify_capacity =
-                if std::env::var("HIPFIRE_MTP_NGRAM").ok().as_deref() == Some("1") {
+                if hipfire_config::developer_var("HIPFIRE_MTP_NGRAM").ok().as_deref() == Some("1") {
                     ngram_mod_env_config()
                         .map(|cfg| self.max_n.max(cfg.n_max))
                         .unwrap_or(self.max_n)
