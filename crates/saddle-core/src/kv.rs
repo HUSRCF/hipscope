@@ -943,10 +943,8 @@ impl KvCache {
                     "q8_lane_view lane byte range exceeds parent buffer",
                 ));
             }
-            let ptr =
-                unsafe { (t.buf.as_ptr() as *mut u8).add(byte_offset) as *mut std::ffi::c_void };
             Ok(GpuTensor {
-                buf: unsafe { hip_bridge::DeviceBuffer::from_raw(ptr, lane_bytes) },
+                buf: t.buf.byte_view(byte_offset, lane_bytes),
                 shape: vec![lane_elems],
                 dtype: DType::F32,
             })

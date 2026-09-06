@@ -1724,7 +1724,7 @@ mod tests {
 
     #[test]
     fn explicit_test_sidecar_loads_and_rejects_invalid_params() {
-        let Ok(path) = std::env::var("HIPFIRE_FLASH_ATTN_CK_TEST_LIB") else {
+        let Ok(path) = hipfire_config::developer_var("HIPFIRE_FLASH_ATTN_CK_TEST_LIB") else {
             return;
         };
         let sidecar = unsafe { FlashAttnCk::load(path) }.expect("load explicit test sidecar");

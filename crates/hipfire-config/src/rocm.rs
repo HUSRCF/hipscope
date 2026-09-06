@@ -190,7 +190,7 @@ pub fn has_configured_root() -> bool {
 /// override never silently falls through to autodetection — that silent
 /// mismatch is the bug class this module exists to prevent.
 pub fn configured_compiler() -> Option<(&'static str, PathBuf)> {
-    std::env::var_os("HIPFIRE_HIPCC")
+    crate::developer_var_os("HIPFIRE_HIPCC")
         .filter(|v| !v.is_empty())
         .map(|value| ("HIPFIRE_HIPCC", PathBuf::from(value)))
 }
@@ -211,7 +211,7 @@ pub fn configured_compiler_from(value: Option<&str>) -> Option<(&'static str, Pa
 /// When `HIPFIRE_ROCM_STRICT=1` the cross-root compiler fallback is disabled
 /// and a runtime-headers-only root that lacks a compiler hard-fails as before.
 pub fn is_strict_rocm() -> bool {
-    strict_from(std::env::var_os("HIPFIRE_ROCM_STRICT").as_ref())
+    crate::developer_bool("HIPFIRE_ROCM_STRICT", false)
 }
 
 /// Pure predicate for strict mode without reading process-global env.

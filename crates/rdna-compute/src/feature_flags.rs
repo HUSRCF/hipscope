@@ -101,6 +101,11 @@ pub struct FeatureFlags {
     pub wo_mmq: bool,
     pub lm_head_wmma_disabled: bool,
     pub lm_head_overwrite: bool,
+    /// Calibration-only override keeping native-BF16 teachers in BF16
+    /// (`HIPFIRE_CALIB_BF16=1`). Mirrors the `calib_force_bf16` snapshot
+    /// read so fresh `Gpu` code can take the flag from `self.flags`
+    /// instead of a process-global cache.
+    pub calib_force_bf16: bool,
 
     // ── MMQ screening ─────────────────────────────────────────────
     pub mmq_screen: bool,
@@ -436,6 +441,7 @@ impl FeatureFlags {
             wo_mmq: value("HIPFIRE_WO_MMQ").ok().as_deref() == Some("1"),
             lm_head_wmma_disabled: value("HIPFIRE_LM_HEAD_WMMA").map_or(false, |v| v == "0"),
             lm_head_overwrite: value("HIPFIRE_LM_HEAD_OVERWRITE").as_deref() == Ok("1"),
+            calib_force_bf16: value("HIPFIRE_CALIB_BF16").as_deref() == Ok("1"),
 
             // MMQ screening
             mmq_screen: value("HIPFIRE_MMQ_SCREEN")
@@ -702,6 +708,7 @@ impl FeatureFlags {
             wo_mmq: false,
             lm_head_wmma_disabled: false,
             lm_head_overwrite: false,
+            calib_force_bf16: false,
             mmq_screen: false,
             mmq_screen_threshold: if is_gfx906 { 0.50 } else { 0.10 },
             mmq_diag_quantize_only: false,

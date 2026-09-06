@@ -994,12 +994,9 @@ pub fn vision_forward(
     let n = grid_h * grid_w;
     let patch_dim = 3 * config.temporal_patch_size * config.patch_size * config.patch_size;
     let t0 = std::time::Instant::now();
-    let dump_dir = std::env::var_os("HIPFIRE_VL_DUMP_DIR").map(std::path::PathBuf::from);
-    let dump_dir = dump_dir.as_deref();
-
     // Diagnostic stage dumps (env-gated; see `vl_dump_slice`).
     let dump_dir: Option<std::path::PathBuf> =
-        std::env::var("HIPFIRE_VL_DUMP_DIR").ok().map(Into::into);
+        hipfire_config::developer_var("HIPFIRE_VL_DUMP_DIR").ok().map(Into::into);
     let dd = dump_dir.as_deref();
     if dd.is_some() {
         eprintln!(

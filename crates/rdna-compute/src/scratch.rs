@@ -152,7 +152,7 @@ pub(crate) fn launch_maybe_blob(
     blob_builder: impl FnOnce() -> KernargBlob,
 ) -> HipResult<()> {
     let record = replay.as_ref().map_or(false, |r| r.is_recording());
-    if record || capture_mode || force_blob_path {
+    let result: HipResult<()> = if record || capture_mode || force_blob_path {
         let mut blob = blob_builder();
         blob.pad_to(16);
         if record {
@@ -226,7 +226,11 @@ pub(crate) fn launch_maybe_blob(
     } else {
         let func = &functions[func_name];
         unsafe { hip.launch_kernel(func, grid, block, shared_mem, stream, params) }
-    }
+    };
+    // Scratch converts share the dispatch stream: a failure here names the
+    // kernel the same way the dispatch funnel does. Deliberately no
+    // last-kernel recording — this helper has no `Gpu` to record into.
+    result.map_err(|e| e.with_kernel(func_name))
 }
 
 /// Predicate for the FP16/FP8 scratch fast path. The convert kernel must run

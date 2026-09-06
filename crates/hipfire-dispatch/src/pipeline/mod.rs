@@ -149,12 +149,18 @@ fn find_fused(
 }
 
 /// Slice a subrange of a flat F32 GpuTensor by element offset + length.
-/// Mirrors qwen35::slice_f32_view — unsafe because it aliases device memory.
-unsafe fn slice_moe_f32_view(src: &GpuTensor, offset_elems: usize, len_elems: usize) -> GpuTensor {
-    let base = src.buf.as_ptr() as *mut u8;
-    let ptr = base.add(offset_elems * 4);
+/// The view aliases device memory owned by the source tensor: do NOT free
+/// it, and do NOT let it outlive the source. Out-of-range slices panic via
+/// the [`hip_bridge::DeviceBuffer::byte_view`] range check.
+fn slice_moe_f32_view(src: &GpuTensor, offset_elems: usize, len_elems: usize) -> GpuTensor {
+    let byte_offset = offset_elems
+        .checked_mul(4)
+        .expect("slice_moe_f32_view offset overflow");
+    let byte_len = len_elems
+        .checked_mul(4)
+        .expect("slice_moe_f32_view length overflow");
     GpuTensor {
-        buf: hip_bridge::DeviceBuffer::from_raw(ptr as *mut _, len_elems * 4),
+        buf: src.buf.byte_view(byte_offset, byte_len),
         shape: vec![len_elems],
         dtype: DType::F32,
     }
@@ -676,9 +682,9 @@ pub fn run_moe_decode(
     };
 
     // ── Gate-side GEMV ───────────────────────────────────────────────────────
-    // SAFETY: all slice views alias device memory owned by MoEParams' scratch tensors.
-    let shared_gate = unsafe { slice_moe_f32_view(p.gate_buf, 0, p.smi) };
-    let shared_up = unsafe { slice_moe_f32_view(p.up_buf, 0, p.smi) };
+    // NOTE: all slice views alias device memory owned by MoEParams' scratch tensors.
+    let shared_gate = slice_moe_f32_view(p.gate_buf, 0, p.smi);
+    let shared_up = slice_moe_f32_view(p.up_buf, 0, p.smi);
     if res.gate_fusable {
         let xr = x_rot_local.expect("gate_fusable implies x_rot_local (needs_x_rot_local)");
         // Exact-uniform V1 MQ4G256 gate quartet → one fused launch.
@@ -1081,7 +1087,7 @@ pub fn run_moe_decode(
             #[cfg(feature = "deltanet")]
             {
                 hip!(gpu.sigmoid_f32(p.scalar_buf))?;
-                let shared_hid = unsafe { slice_moe_f32_view(p.ffn_hidden, 0, p.smi) };
+                let shared_hid = slice_moe_f32_view(p.ffn_hidden, 0, p.smi);
                 hip!(gpu.silu_mul_f32(&shared_gate, &shared_up, &shared_hid))?;
                 static GEMV_DOWN: OnceLock<GemvFamily> = OnceLock::new();
                 let gemv = GEMV_DOWN.get_or_init(GemvFamily::new);
@@ -2021,7 +2027,7 @@ fn run_moe_decode_cpu_fallback(
         #[cfg(feature = "deltanet")]
         {
             hip!(gpu.sigmoid_f32(p.scalar_buf))?;
-            let shared_hid = unsafe { slice_moe_f32_view(p.ffn_hidden, 0, p.smi) };
+            let shared_hid = slice_moe_f32_view(p.ffn_hidden, 0, p.smi);
             hip!(gpu.silu_mul_f32(shared_gate, shared_up, &shared_hid))?;
             static GEMV_DOWN_FB: OnceLock<GemvFamily> = OnceLock::new();
             let gemv = GEMV_DOWN_FB.get_or_init(GemvFamily::new);
@@ -2076,11 +2082,11 @@ fn run_moe_decode_cpu_fallback(
         {
             gemv.run_auto(ctx, gpu, gate_up_w, p.x_norm, p.gate_up_buf)?;
         }
-        let gate_view = unsafe { slice_moe_f32_view(p.gate_up_buf, 0, mi) };
-        let up_view = unsafe { slice_moe_f32_view(p.gate_up_buf, mi, mi) };
+        let gate_view = slice_moe_f32_view(p.gate_up_buf, 0, mi);
+        let up_view = slice_moe_f32_view(p.gate_up_buf, mi, mi);
 
         // silu(gate)·up → ffn_hidden, then down GEMV, then weighted residual add.
-        let hid_view = unsafe { slice_moe_f32_view(p.ffn_hidden, 0, mi) };
+        let hid_view = slice_moe_f32_view(p.ffn_hidden, 0, mi);
         hip!(gpu.silu_mul_f32(&gate_view, &up_view, &hid_view))?;
         // GPTQ-on-E8 Hessian capture: hid_view = silu(g)*u is the RAW
         // PRE-rotation down input (run_auto below applies the FWHT internally),
