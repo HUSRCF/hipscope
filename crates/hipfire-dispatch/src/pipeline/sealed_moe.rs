@@ -490,6 +490,257 @@ impl ExpertMetadata {
     }
 }
 
+/// Canonical execution string for expert-parallel decode whose root combine
+/// folds selected slots in slot order. Only an EP plan carrying this execution
+/// string together with its EP collective schedule may authorize the sealed
+/// canonical slot combine owned by a later slice.
+pub const CANONICAL_EP_EXECUTION: &str = "indexed-decode-slot-order";
+
+/// Dispatch-owned mirror of the runtime parallelism axis. This crate never
+/// depends on the runtime planner; the runtime maps its own enum onto this
+/// one when adapting a sealed plan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ContractParallelism {
+    Single,
+    TensorParallel,
+    ExpertParallel,
+}
+
+/// Dispatch-owned mirror of the runtime expert assignment policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ContractAssignment {
+    Stride,
+    Contiguous,
+}
+
+/// Dispatch-owned mirror of the mesh axis named by a collective row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ContractAxis {
+    Pp,
+    Tp,
+    Ep,
+}
+
+/// Dispatch-owned mirror of one collective schedule row hint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ContractCollectiveHint {
+    AllReduce { kind: ContractAxis },
+    BandXfer { src: usize, dst: usize },
+}
+
+/// One ordered collective row carried by the execution contract.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContractCollectiveRow {
+    pub name: String,
+    pub layer: usize,
+    pub hint: ContractCollectiveHint,
+}
+
+/// Deterministic execution contract adapted from one sealed runtime plan.
+///
+/// The contract is pure CPU metadata: group/layer identity, source
+/// fingerprint, mesh epoch, the physical rank list, parallelism, assignment,
+/// the per-global-expert owner/local-slot map, the execution string, and the
+/// ordered collective rows. It contains no pointer, so two ranks (or two
+/// processes) holding the same sealed plan render the same fingerprint.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExpertExecutionContract {
+    group: String,
+    layer: Option<usize>,
+    source_fingerprint: String,
+    mesh_epoch: u64,
+    physical_devices: Vec<i32>,
+    parallelism: ContractParallelism,
+    assignment: ContractAssignment,
+    owner_ranks: Vec<usize>,
+    local_slots: Vec<usize>,
+    execution: String,
+    collective_rows: Vec<ContractCollectiveRow>,
+}
+
+impl ExpertExecutionContract {
+    /// Build a contract over every global expert. `owner_ranks` and
+    /// `local_slots` are indexed by global expert id and must agree in
+    /// length; the table cross-checks them against its own records on
+    /// attach.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        group: impl Into<String>,
+        layer: Option<usize>,
+        source_fingerprint: impl Into<String>,
+        mesh_epoch: u64,
+        physical_devices: Vec<i32>,
+        parallelism: ContractParallelism,
+        assignment: ContractAssignment,
+        owner_ranks: Vec<usize>,
+        local_slots: Vec<usize>,
+        execution: impl Into<String>,
+        collective_rows: Vec<ContractCollectiveRow>,
+    ) -> Result<Self, DispatchError> {
+        if owner_ranks.len() != local_slots.len() {
+            return Err(invalid(format!(
+                "execution contract owner/slot length mismatch: {} owners vs {} slots",
+                owner_ranks.len(),
+                local_slots.len()
+            )));
+        }
+        if owner_ranks.is_empty() {
+            return Err(invalid("execution contract covers no experts"));
+        }
+        Ok(Self {
+            group: group.into(),
+            layer,
+            source_fingerprint: source_fingerprint.into(),
+            mesh_epoch,
+            physical_devices,
+            parallelism,
+            assignment,
+            owner_ranks,
+            local_slots,
+            execution: execution.into(),
+            collective_rows,
+        })
+    }
+
+    pub fn group(&self) -> &str {
+        &self.group
+    }
+
+    pub fn layer(&self) -> Option<usize> {
+        self.layer
+    }
+
+    pub fn source_fingerprint(&self) -> &str {
+        &self.source_fingerprint
+    }
+
+    pub fn mesh_epoch(&self) -> u64 {
+        self.mesh_epoch
+    }
+
+    pub fn physical_devices(&self) -> &[i32] {
+        &self.physical_devices
+    }
+
+    pub fn parallelism(&self) -> ContractParallelism {
+        self.parallelism
+    }
+
+    pub fn assignment(&self) -> ContractAssignment {
+        self.assignment
+    }
+
+    pub fn owner_ranks(&self) -> &[usize] {
+        &self.owner_ranks
+    }
+
+    pub fn local_slots(&self) -> &[usize] {
+        &self.local_slots
+    }
+
+    pub fn execution(&self) -> &str {
+        &self.execution
+    }
+
+    pub fn collective_rows(&self) -> &[ContractCollectiveRow] {
+        &self.collective_rows
+    }
+
+    pub fn owner_rank(&self, global_id: usize) -> Option<usize> {
+        self.owner_ranks.get(global_id).copied()
+    }
+
+    pub fn local_slot(&self, global_id: usize) -> Option<usize> {
+        self.local_slots.get(global_id).copied()
+    }
+
+    /// Deterministic canonical rendering of the whole contract. Same sealed
+    /// plan in, same string out, on every rank and in every process.
+    pub fn fingerprint(&self) -> String {
+        fn join(values: &[usize]) -> String {
+            values
+                .iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        }
+        let phys = self
+            .physical_devices
+            .iter()
+            .map(|device| device.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut rows = String::new();
+        for row in &self.collective_rows {
+            let hint = match row.hint {
+                ContractCollectiveHint::AllReduce { kind } => match kind {
+                    ContractAxis::Pp => "AR:Pp",
+                    ContractAxis::Tp => "AR:Tp",
+                    ContractAxis::Ep => "AR:Ep",
+                },
+                ContractCollectiveHint::BandXfer { src, dst } => {
+                    rows.push_str(&format!("{}:{}:BX:{src}>{dst};", row.name, row.layer));
+                    continue;
+                }
+            };
+            rows.push_str(&format!("{}:{}:{hint};", row.name, row.layer));
+        }
+        let mut out = String::from("sealed-ep/v1");
+        out.push_str("|group|");
+        out.push_str(&self.group);
+        out.push_str("|layer|");
+        match self.layer {
+            Some(layer) => out.push_str(&layer.to_string()),
+            None => out.push_str("none"),
+        }
+        out.push_str("|src|");
+        out.push_str(&self.source_fingerprint);
+        out.push_str("|epoch|");
+        out.push_str(&self.mesh_epoch.to_string());
+        out.push_str("|phys|");
+        out.push_str(&phys);
+        out.push_str("|par|");
+        out.push_str(match self.parallelism {
+            ContractParallelism::Single => "single",
+            ContractParallelism::TensorParallel => "tp",
+            ContractParallelism::ExpertParallel => "ep",
+        });
+        out.push_str("|assign|");
+        out.push_str(match self.assignment {
+            ContractAssignment::Stride => "stride",
+            ContractAssignment::Contiguous => "contiguous",
+        });
+        out.push_str("|owners|");
+        out.push_str(&join(&self.owner_ranks));
+        out.push_str("|slots|");
+        out.push_str(&join(&self.local_slots));
+        out.push_str("|exec|");
+        out.push_str(&self.execution);
+        out.push_str("|rows|");
+        out.push_str(&rows);
+        out
+    }
+
+    /// Whether this contract authorizes the canonical EP slot combine: EP
+    /// parallelism, the canonical indexed-slot execution string, and a
+    /// nonempty schedule consisting only of EP all-reduce rows. The sealed
+    /// combine owned by a later slice performs its own preflight on top of
+    /// this; this predicate alone does not launch anything.
+    pub fn is_canonical_ep(&self) -> bool {
+        self.parallelism == ContractParallelism::ExpertParallel
+            && self.execution == CANONICAL_EP_EXECUTION
+            && !self.collective_rows.is_empty()
+            && self.collective_rows.iter().all(|row| {
+                matches!(
+                    row.hint,
+                    ContractCollectiveHint::AllReduce {
+                        kind: ContractAxis::Ep
+                    }
+                )
+            })
+    }
+}
+
 /// Immutable, fully validated expert table. It owns CPU metadata only.
 ///
 /// A process-local generation is part of the identity. It prevents an old
@@ -499,13 +750,56 @@ impl ExpertMetadata {
 pub struct ExpertTable {
     identity: u64,
     experts: Vec<ExpertMetadata>,
+    contract: Option<ExpertExecutionContract>,
 }
 
 impl ExpertTable {
     pub fn new(experts: Vec<ExpertMetadata>) -> Result<Self, DispatchError> {
         validate_expert_records(&experts)?;
         let identity = NEXT_TABLE_ID.fetch_add(1, Ordering::Relaxed);
-        Ok(Self { identity, experts })
+        Ok(Self {
+            identity,
+            experts,
+            contract: None,
+        })
+    }
+
+    /// Attach the deterministic execution contract adapted from the sealed
+    /// runtime plan. The contract's per-expert owner/slot map must agree
+    /// with the table records exactly; a contract from another plan (or
+    /// another group/layer) is rejected here, before any rank binds.
+    pub fn with_execution_contract(
+        self,
+        contract: ExpertExecutionContract,
+    ) -> Result<Self, DispatchError> {
+        if contract.owner_ranks().len() != self.experts.len()
+            || contract.local_slots().len() != self.experts.len()
+        {
+            return Err(invalid(format!(
+                "execution contract covers {} experts, table holds {}",
+                contract.owner_ranks().len(),
+                self.experts.len()
+            )));
+        }
+        for (index, record) in self.experts.iter().enumerate() {
+            if contract.owner_ranks()[index] != record.owner_rank()
+                || contract.local_slots()[index] != record.local_slot()
+            {
+                return Err(invalid(format!(
+                    "execution contract owner/slot disagrees with expert {index}"
+                )));
+            }
+        }
+        Ok(Self {
+            contract: Some(contract),
+            ..self
+        })
+    }
+
+    /// The adapted execution contract, if the runtime sealer attached one.
+    /// Tables built without a sealed plan carry no contract.
+    pub fn execution_contract(&self) -> Option<&ExpertExecutionContract> {
+        self.contract.as_ref()
     }
 
     pub fn n_experts(&self) -> usize {
@@ -627,6 +921,12 @@ impl LiveWeightIdentity {
 }
 
 /// Checked identities for all live resources published by one MoE owner.
+///
+/// `mapping_fingerprint` retains a deterministic hex digest of the exact
+/// global-entry-to-buffer mapping proven at bind time (owned entries plus
+/// zero-dummy entries, table identities, and AWQ/tag presence). It travels
+/// with the tensor identities so a later slice can prove which mapping a
+/// sealed call was authorized under.
 #[derive(Debug, PartialEq, Eq)]
 struct LiveMoeBinding {
     table_identity: u64,
@@ -637,6 +937,45 @@ struct LiveMoeBinding {
     down_ptrs: LiveTensorIdentity,
     down_awq_ptrs: Option<LiveTensorIdentity>,
     dtype_tags: Option<LiveTensorIdentity>,
+    mapping_fingerprint: String,
+}
+
+/// One live expert projection pair borrowed for a compact bind: either an
+/// owned local expert (in local-slot order) or an owned zero dummy backing
+/// non-owned global entries. The struct borrows the caller's tensors; the
+/// bind retains identities only, never the tensors themselves.
+pub struct CompactLiveWeight<'a> {
+    pub gate_up: crate::families::gemv::WeightRef<'a>,
+    pub down: crate::families::gemv::WeightRef<'a>,
+}
+
+/// Reject a cache/table generation mismatch before any bind work.
+fn check_cache_table(cache: &ExpertBindingCache, table: &ExpertTable) -> Result<(), DispatchError> {
+    if cache.table_identity != table.identity
+        || cache.table_ptr != table.experts.as_ptr() as usize
+        || cache.table_len != table.experts.len()
+    {
+        return Err(invalid(
+            "expert binding cache belongs to a different expert table",
+        ));
+    }
+    Ok(())
+}
+
+/// FNV-1a hex digest over one canonical rendering. The rendering (not this
+/// hash) carries the determinism; the hash only compacts it for retention.
+fn fingerprint_hex(canonical: &str) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in canonical.bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+/// Device address of the buffer behind a borrowed live weight.
+fn weight_buf_ptr(weight: &crate::families::gemv::WeightRef<'_>) -> usize {
+    weight.buf.buf.as_ptr() as usize
 }
 
 /// Owned, immutable load-time binding proof for one logical rank.
@@ -680,7 +1019,7 @@ impl ExpertBindingCache {
         }
 
         let mut global_to_local = vec![None; table.experts.len()];
-        let mut local_expert_ids = Vec::new();
+        let mut slot_ordered: Vec<(usize, usize)> = Vec::new();
         for record in &table.experts {
             if record.owner_rank() >= rank_count {
                 return Err(invalid(format!(
@@ -691,19 +1030,25 @@ impl ExpertBindingCache {
             }
             if record.owner_rank() == local_rank {
                 global_to_local[record.global_id()] = Some(record.local_slot());
-                local_expert_ids.push(record.global_id());
+                slot_ordered.push((record.local_slot(), record.global_id()));
             }
         }
-        local_expert_ids.sort_unstable();
-        for (expected, global_id) in local_expert_ids.iter().copied().enumerate() {
-            let local = global_to_local[global_id]
-                .ok_or_else(|| invalid("local expert lookup lost an owned record"))?;
-            if local != expected {
+        // Local experts are ordered by the sealed `local_slot`, never by
+        // inferred global id order. The slots must still be compact
+        // (`0..owned`), so a plan-mapped local tensor always sits at its
+        // slot index.
+        slot_ordered.sort();
+        for (expected, (slot, global_id)) in slot_ordered.iter().copied().enumerate() {
+            if slot != expected {
                 return Err(invalid(format!(
-                    "local expert slots must be compact and ordered: expert {global_id} has slot {local}, expected {expected}"
+                    "local expert slots must be compact and ordered: expert {global_id} has slot {slot}, expected {expected}"
                 )));
             }
         }
+        let local_expert_ids: Vec<usize> = slot_ordered
+            .into_iter()
+            .map(|(_, global_id)| global_id)
+            .collect();
 
         Ok(Self {
             table_identity: table.identity,
@@ -733,14 +1078,7 @@ impl ExpertBindingCache {
         down_awq_ptrs: Option<&GpuTensor>,
         dtype_tags: Option<&GpuTensor>,
     ) -> Result<(), DispatchError> {
-        if self.table_identity != table.identity
-            || self.table_ptr != table.experts.as_ptr() as usize
-            || self.table_len != table.experts.len()
-        {
-            return Err(invalid(
-                "expert binding cache belongs to a different expert table",
-            ));
-        }
+        check_cache_table(self, table)?;
         if self.live.is_some() {
             return Err(invalid("expert live resources are already bound"));
         }
@@ -756,9 +1094,85 @@ impl ExpertBindingCache {
         Ok(())
     }
 
+    /// Bind the compact expert-parallel resources owned by this rank.
+    ///
+    /// This sits alongside (never replaces) [`ExpertBindingCache::bind_live`],
+    /// which remains the Single-owner API. The caller passes the owned local
+    /// experts **in local-slot order**, the exact host pointer entries that
+    /// were uploaded to each global `[n_experts]` pointer table, descriptors
+    /// for the owned zero dummies backing non-owned entries, and the GPU
+    /// table tensors themselves.
+    ///
+    /// The bind verifies, before anything is retained:
+    /// * every owned global entry points to its plan-mapped local tensor
+    ///   (slot order included: local expert `i` must own the global id at
+    ///   local slot `i`);
+    /// * every non-owned global entry points to an owned zero dummy whose
+    ///   gate/up (respectively down) geometry is layout-compatible with
+    ///   that expert's sealed metadata;
+    /// * AWQ/tag table presence and capacity match the sealed mixed-dtype
+    ///   policy, and the GPU table tensors have exact identity/capacity;
+    /// * the executing device equals the cache's sealed physical device.
+    ///
+    /// Like [`ExpertBindingCache::bind_live`] this is one-shot and stores
+    /// identities only. The mapping fingerprint is retained alongside the
+    /// tensor identities. This is the residency proof a later slice uses to
+    /// replace the Single-rank refusal; it does not itself admit EP
+    /// execution.
+    #[allow(clippy::too_many_arguments)]
+    pub fn bind_live_compact(
+        &mut self,
+        table: &ExpertTable,
+        local_experts: &[CompactLiveWeight<'_>],
+        gate_up_ptr_entries: &[usize],
+        down_ptr_entries: &[usize],
+        down_awq_ptr_entries: Option<&[usize]>,
+        gate_up_ptrs: &GpuTensor,
+        down_ptrs: &GpuTensor,
+        down_awq_ptrs: Option<&GpuTensor>,
+        dtype_tags: Option<&GpuTensor>,
+        zero_dummies: &[CompactLiveWeight<'_>],
+        device_id: i32,
+    ) -> Result<(), DispatchError> {
+        check_cache_table(self, table)?;
+        if self.live.is_some() {
+            return Err(invalid("expert live resources are already bound"));
+        }
+        if device_id != self.physical_device {
+            return Err(invalid(format!(
+                "compact bind executing device {device_id} differs from sealed physical device {}",
+                self.physical_device
+            )));
+        }
+        let live = build_compact_live_binding(
+            table,
+            self.local_rank,
+            &self.local_expert_ids,
+            local_experts,
+            gate_up_ptr_entries,
+            down_ptr_entries,
+            down_awq_ptr_entries,
+            gate_up_ptrs,
+            down_ptrs,
+            down_awq_ptrs,
+            dtype_tags,
+            zero_dummies,
+        )?;
+        self.live = Some(live);
+        Ok(())
+    }
+
     /// Whether this cache has passed the post-allocation live-resource bind.
     pub fn is_live_bound(&self) -> bool {
         self.live.is_some()
+    }
+
+    /// The retained mapping fingerprint from the live bind, if bound. See
+    /// [`ExpertBindingCache::bind_live_compact`].
+    pub fn mapping_fingerprint(&self) -> Option<&str> {
+        self.live
+            .as_ref()
+            .map(|live| live.mapping_fingerprint.as_str())
     }
 
     pub fn local_rank(&self) -> usize {
@@ -838,6 +1252,13 @@ impl<'a> BoundMoeExperts<'a> {
 
     pub fn records(&self) -> &[ExpertMetadata] {
         &self.table.experts
+    }
+
+    /// The deterministic execution contract adapted from the sealed plan, if
+    /// the runtime sealer attached one. Read-only: a later slice preflights
+    /// the canonical EP combine against this without mutating the binding.
+    pub fn execution_contract(&self) -> Option<&ExpertExecutionContract> {
+        self.table.execution_contract()
     }
 
     pub fn local_expert_ids(&self) -> &[usize] {
@@ -1738,9 +2159,40 @@ fn build_live_binding(
                 "live routed expert table is missing expert {index}"
             ))
         })?;
-        let gate_up = bind_live_weight(metadata, gate_up, true, index, "gate/up")?;
-        let down = bind_live_weight(metadata, down, false, index, "down")?;
+        let gate_up = bind_live_weight(metadata, &gate_up, true, index, "gate/up")?;
+        let down = bind_live_weight(metadata, &down, false, index, "down")?;
         live_experts.push((gate_up, down));
+    }
+
+    let mut canonical = format!("single-live/v1|n|{n_experts}|experts|");
+    for (index, (gate_up, down)) in live_experts.iter().enumerate() {
+        canonical.push_str(&format!(
+            "{index}:{:x}:{}:{:x}:{};",
+            gate_up.buffer.ptr,
+            gate_up.buffer.byte_capacity,
+            down.buffer.ptr,
+            down.buffer.byte_capacity
+        ));
+    }
+    canonical.push_str(&format!(
+        "|tables|{:x}:{}:{:x}:{}|awq|",
+        gate_up_identity.ptr,
+        gate_up_identity.byte_capacity,
+        down_identity.ptr,
+        down_identity.byte_capacity
+    ));
+    match &down_awq_identity {
+        Some(identity) => {
+            canonical.push_str(&format!("{:x}:{};", identity.ptr, identity.byte_capacity))
+        }
+        None => canonical.push_str("none;"),
+    }
+    canonical.push_str("|tags|");
+    match &dtype_tag_identity {
+        Some(identity) => {
+            canonical.push_str(&format!("{:x}:{};", identity.ptr, identity.byte_capacity))
+        }
+        None => canonical.push_str("none;"),
     }
 
     Ok(LiveMoeBinding {
@@ -1752,12 +2204,242 @@ fn build_live_binding(
         down_ptrs: down_identity,
         down_awq_ptrs: down_awq_identity,
         dtype_tags: dtype_tag_identity,
+        mapping_fingerprint: fingerprint_hex(&canonical),
+    })
+}
+
+/// Build the compact live binding proven by
+/// [`ExpertBindingCache::bind_live_compact`]. `local_slot_order` holds this
+/// rank's owned global ids in local-slot order; `local_experts[i]` is the
+/// live tensor pair for the global id at slot `i`. Host pointer entries are
+/// the exact values uploaded to the global `[n_experts]` tables. Every
+/// non-owned entry must name an owned zero dummy whose matching half is
+/// layout-compatible with that expert; AWQ host entries and tag tables are
+/// presence/capacity checked like the Single path (scale storage itself is
+/// not mapped here).
+#[allow(clippy::too_many_arguments)]
+fn build_compact_live_binding(
+    table: &ExpertTable,
+    local_rank: usize,
+    local_slot_order: &[usize],
+    local_experts: &[CompactLiveWeight<'_>],
+    gate_up_ptr_entries: &[usize],
+    down_ptr_entries: &[usize],
+    down_awq_ptr_entries: Option<&[usize]>,
+    gate_up_ptrs: &GpuTensor,
+    down_ptrs: &GpuTensor,
+    down_awq_ptrs: Option<&GpuTensor>,
+    dtype_tags: Option<&GpuTensor>,
+    zero_dummies: &[CompactLiveWeight<'_>],
+) -> Result<LiveMoeBinding, DispatchError> {
+    let n_experts = table.n_experts();
+    if gate_up_ptr_entries.len() != n_experts {
+        return Err(invalid(format!(
+            "compact gate/up host entries cover {} experts, expected {n_experts}",
+            gate_up_ptr_entries.len()
+        )));
+    }
+    if down_ptr_entries.len() != n_experts {
+        return Err(invalid(format!(
+            "compact down host entries cover {} experts, expected {n_experts}",
+            down_ptr_entries.len()
+        )));
+    }
+    if local_experts.len() != local_slot_order.len() {
+        return Err(invalid(format!(
+            "compact local experts cover {} slots, rank {local_rank} owns {}",
+            local_experts.len(),
+            local_slot_order.len()
+        )));
+    }
+    match (down_awq_ptr_entries, down_awq_ptrs) {
+        (Some(entries), Some(_)) => {
+            if entries.len() != n_experts {
+                return Err(invalid(format!(
+                    "compact down AWQ host entries cover {} experts, expected {n_experts}",
+                    entries.len()
+                )));
+            }
+        }
+        (None, None) => {}
+        (Some(_), None) => {
+            return Err(invalid(
+                "compact down AWQ host entries supplied without a down AWQ pointer table",
+            ));
+        }
+        (None, Some(_)) => {
+            return Err(invalid(
+                "compact down AWQ pointer table supplied without down AWQ host entries",
+            ));
+        }
+    }
+    validate_pointer_table(gate_up_ptrs, n_experts, "compact gate/up")?;
+    validate_pointer_table(down_ptrs, n_experts, "compact down")?;
+    if let Some(tensor) = down_awq_ptrs {
+        validate_pointer_table(tensor, n_experts, "compact down AWQ")?;
+    }
+    validate_dtype_tag_table(dtype_tags, n_experts, table_has_mixed_dtypes(table)?)?;
+
+    let gate_up_identity = LiveTensorIdentity::capture(gate_up_ptrs, "compact gate/up")?;
+    let down_identity = LiveTensorIdentity::capture(down_ptrs, "compact down")?;
+    let down_awq_identity = down_awq_ptrs
+        .map(|tensor| LiveTensorIdentity::capture(tensor, "compact down AWQ"))
+        .transpose()?;
+    let dtype_tag_identity = dtype_tags
+        .map(|tensor| LiveTensorIdentity::capture(tensor, "compact dtype tags"))
+        .transpose()?;
+
+    // Owned globals must point at their plan-mapped local tensor: slot `i`
+    // of `local_experts` backs the owned global id at slot `i`.
+    let mut live_experts: Vec<Option<(LiveWeightIdentity, LiveWeightIdentity)>> =
+        (0..n_experts).map(|_| None).collect();
+    for (slot, &global_id) in local_slot_order.iter().enumerate() {
+        let metadata = table.experts().get(global_id).ok_or_else(|| {
+            invalid(format!(
+                "compact local slot {slot} names missing expert {global_id}"
+            ))
+        })?;
+        if metadata.owner_rank() != local_rank || metadata.local_slot() != slot {
+            return Err(invalid(format!(
+                "compact local slot {slot} names expert {global_id} owned by rank {} at slot {}",
+                metadata.owner_rank(),
+                metadata.local_slot()
+            )));
+        }
+        let local = local_experts
+            .get(slot)
+            .ok_or_else(|| invalid(format!("compact local experts are missing slot {slot}")))?;
+        let gate_ptr = weight_buf_ptr(&local.gate_up);
+        let down_ptr = weight_buf_ptr(&local.down);
+        if gate_up_ptr_entries[global_id] != gate_ptr {
+            return Err(invalid(format!(
+                "compact owned expert {global_id} gate/up entry {:x} does not point at its local tensor {:x}",
+                gate_up_ptr_entries[global_id], gate_ptr
+            )));
+        }
+        if down_ptr_entries[global_id] != down_ptr {
+            return Err(invalid(format!(
+                "compact owned expert {global_id} down entry {:x} does not point at its local tensor {:x}",
+                down_ptr_entries[global_id], down_ptr
+            )));
+        }
+        let gate_up = bind_live_weight(metadata, &local.gate_up, true, global_id, "gate/up")?;
+        let down = bind_live_weight(metadata, &local.down, false, global_id, "down")?;
+        live_experts[global_id] = Some((gate_up, down));
+    }
+    // Non-owned globals must point at an owned zero dummy whose matching
+    // half satisfies the expert's sealed geometry. Each table is matched
+    // independently: one dummy pair may back the whole table, or several
+    // dummies may cover mixed layouts.
+    for (global_id, metadata) in table.experts().iter().enumerate() {
+        if metadata.owner_rank() == local_rank {
+            continue;
+        }
+        let dummy_gate = zero_dummies.iter().find(|dummy| {
+            weight_buf_ptr(&dummy.gate_up) == gate_up_ptr_entries[global_id]
+                && bind_live_weight(metadata, &dummy.gate_up, true, global_id, "gate/up").is_ok()
+        });
+        let Some(dummy_gate) = dummy_gate else {
+            return Err(invalid(format!(
+                "compact non-owned expert {global_id} gate/up entry {:x} names no layout-compatible zero dummy",
+                gate_up_ptr_entries[global_id]
+            )));
+        };
+        let dummy_down = zero_dummies.iter().find(|dummy| {
+            weight_buf_ptr(&dummy.down) == down_ptr_entries[global_id]
+                && bind_live_weight(metadata, &dummy.down, false, global_id, "down").is_ok()
+        });
+        let Some(dummy_down) = dummy_down else {
+            return Err(invalid(format!(
+                "compact non-owned expert {global_id} down entry {:x} names no layout-compatible zero dummy",
+                down_ptr_entries[global_id]
+            )));
+        };
+        let gate_up = bind_live_weight(metadata, &dummy_gate.gate_up, true, global_id, "gate/up")?;
+        let down = bind_live_weight(metadata, &dummy_down.down, false, global_id, "down")?;
+        live_experts[global_id] = Some((gate_up, down));
+    }
+    let live_experts: Vec<(LiveWeightIdentity, LiveWeightIdentity)> = live_experts
+        .into_iter()
+        .enumerate()
+        .map(|(global_id, entry)| {
+            entry.ok_or_else(|| {
+                invalid(format!(
+                    "compact bind left expert {global_id} without a live identity"
+                ))
+            })
+        })
+        .collect::<Result<_, _>>()?;
+
+    let contract_part = match table.execution_contract() {
+        Some(contract) => contract.fingerprint(),
+        None => format!("nocontract|n|{n_experts}"),
+    };
+    let mut canonical =
+        format!("compact-live/v1|rank|{local_rank}|contract|{contract_part}|entries|");
+    for global_id in 0..n_experts {
+        let metadata = &table.experts()[global_id];
+        canonical.push_str(&format!(
+            "{global_id}:{}:{}:{:x}:{:x};",
+            metadata.owner_rank(),
+            metadata.local_slot(),
+            gate_up_ptr_entries[global_id],
+            down_ptr_entries[global_id]
+        ));
+    }
+    canonical.push_str("|dummies|");
+    for dummy in zero_dummies {
+        canonical.push_str(&format!(
+            "{:x}:{:x};",
+            weight_buf_ptr(&dummy.gate_up),
+            weight_buf_ptr(&dummy.down)
+        ));
+    }
+    canonical.push_str(&format!(
+        "|tables|{:x}:{}:{:x}:{}|awq|",
+        gate_up_identity.ptr,
+        gate_up_identity.byte_capacity,
+        down_identity.ptr,
+        down_identity.byte_capacity
+    ));
+    match (&down_awq_identity, down_awq_ptr_entries) {
+        (Some(identity), Some(entries)) => canonical.push_str(&format!(
+            "{:x}:{}:{};",
+            identity.ptr,
+            identity.byte_capacity,
+            fingerprint_hex(&format!("{entries:x?}"))
+        )),
+        (None, None) => canonical.push_str("none;"),
+        _ => {
+            return Err(invalid(
+                "compact down AWQ host entries and pointer table disagree",
+            ));
+        }
+    }
+    canonical.push_str("|tags|");
+    match &dtype_tag_identity {
+        Some(identity) => {
+            canonical.push_str(&format!("{:x}:{};", identity.ptr, identity.byte_capacity))
+        }
+        None => canonical.push_str("none;"),
+    }
+
+    Ok(LiveMoeBinding {
+        table_identity: table.identity,
+        table_ptr: table.experts.as_ptr() as usize,
+        table_len: table.experts.len(),
+        experts: live_experts.into_boxed_slice(),
+        gate_up_ptrs: gate_up_identity,
+        down_ptrs: down_identity,
+        down_awq_ptrs: down_awq_identity,
+        dtype_tags: dtype_tag_identity,
+        mapping_fingerprint: fingerprint_hex(&canonical),
     })
 }
 
 fn bind_live_weight(
     metadata: &ExpertMetadata,
-    weight: crate::families::gemv::WeightRef<'_>,
+    weight: &crate::families::gemv::WeightRef<'_>,
     gate_up: bool,
     index: usize,
     role: &str,
@@ -1816,7 +2498,7 @@ fn bind_live_weight(
             "expert {index} live {role} byte capacity {capacity} does not equal {bytes}"
         )));
     }
-    LiveWeightIdentity::capture(&weight, &format!("expert {index} live {role}"))
+    LiveWeightIdentity::capture(weight, &format!("expert {index} live {role}"))
 }
 
 fn resource_dims(
@@ -2658,5 +3340,521 @@ mod tests {
             weights: expected.weights,
         };
         assert!(validate_route_receipt_pair(&expected, &other_invocation).is_err());
+    }
+
+    fn ep_table(n: usize, rank_count: usize, dtype: DType) -> ExpertTable {
+        let mut owned_so_far = vec![0usize; rank_count];
+        let records = (0..n)
+            .map(|id| {
+                let owner = id % rank_count;
+                let slot = owned_so_far[owner];
+                owned_so_far[owner] += 1;
+                ExpertMetadata::new(
+                    id,
+                    owner,
+                    slot,
+                    ExpertResources::fused(
+                        resource(&format!("gate_up_{id}"), dtype, &[8, 4]),
+                        resource(&format!("down_{id}"), dtype, &[4, 4]),
+                    )
+                    .unwrap(),
+                )
+                .unwrap()
+            })
+            .collect();
+        ExpertTable::new(records).unwrap()
+    }
+
+    fn compact_weight(
+        buf: &GpuTensor,
+        dtype: DType,
+        m: usize,
+        k: usize,
+    ) -> crate::families::gemv::WeightRef<'_> {
+        crate::families::gemv::WeightRef {
+            buf,
+            dtype,
+            m,
+            k,
+            row_stride: 0,
+            rotation: None,
+            awq_scale: None,
+        }
+    }
+
+    struct CompactFixture {
+        local_gate_up: Vec<GpuTensor>,
+        local_down: Vec<GpuTensor>,
+        dummy_gate_up: GpuTensor,
+        dummy_down: GpuTensor,
+        gate_entries: Vec<usize>,
+        down_entries: Vec<usize>,
+        gate_up_ptrs: GpuTensor,
+        down_ptrs: GpuTensor,
+    }
+
+    /// Fixture for one rank of a stride EP table: owned globals in slot
+    /// order get distinct local tensors, every other global entry names the
+    /// shared zero dummy pair.
+    fn compact_fixture(
+        table: &ExpertTable,
+        rank: usize,
+        base: usize,
+        dtype: DType,
+    ) -> CompactFixture {
+        let owned: Vec<usize> = table
+            .experts()
+            .iter()
+            .filter(|record| record.owner_rank() == rank)
+            .map(|record| record.global_id())
+            .collect();
+        assert!(!owned.is_empty());
+        let local_gate_up = owned
+            .iter()
+            .enumerate()
+            .map(|(slot, _)| live_tensor(base + slot * 0x1000, 32, &[32], DType::Raw))
+            .collect::<Vec<_>>();
+        let local_down = owned
+            .iter()
+            .enumerate()
+            .map(|(slot, _)| live_tensor(base + 0x800 + slot * 0x1000, 16, &[16], DType::Raw))
+            .collect::<Vec<_>>();
+        let dummy_gate_up = live_tensor(base + 0x9000, 32, &[32], DType::Raw);
+        let dummy_down = live_tensor(base + 0x9800, 16, &[16], DType::Raw);
+        let _ = dtype;
+        let gate_entries = (0..table.n_experts())
+            .map(|global| {
+                table
+                    .experts()
+                    .iter()
+                    .find(|record| record.global_id() == global)
+                    .and_then(|record| {
+                        (record.owner_rank() == rank).then(|| {
+                            owned
+                                .iter()
+                                .position(|&id| id == global)
+                                .map(|slot| local_gate_up[slot].buf.as_ptr() as usize)
+                        })?
+                    })
+                    .unwrap_or_else(|| dummy_gate_up.buf.as_ptr() as usize)
+            })
+            .collect::<Vec<_>>();
+        let down_entries = (0..table.n_experts())
+            .map(|global| {
+                table
+                    .experts()
+                    .iter()
+                    .find(|record| record.global_id() == global)
+                    .and_then(|record| {
+                        (record.owner_rank() == rank).then(|| {
+                            owned
+                                .iter()
+                                .position(|&id| id == global)
+                                .map(|slot| local_down[slot].buf.as_ptr() as usize)
+                        })?
+                    })
+                    .unwrap_or_else(|| dummy_down.buf.as_ptr() as usize)
+            })
+            .collect::<Vec<_>>();
+        let n = table.n_experts();
+        CompactFixture {
+            local_gate_up,
+            local_down,
+            dummy_gate_up,
+            dummy_down,
+            gate_entries,
+            down_entries,
+            gate_up_ptrs: live_tensor(
+                base + 0x100000,
+                n * DEVICE_POINTER_BYTES,
+                &[2 * n],
+                DType::F32,
+            ),
+            down_ptrs: live_tensor(
+                base + 0x101000,
+                n * DEVICE_POINTER_BYTES,
+                &[2 * n],
+                DType::F32,
+            ),
+        }
+    }
+
+    fn compact_locals<'a>(fixture: &'a CompactFixture, dtype: DType) -> Vec<CompactLiveWeight<'a>> {
+        fixture
+            .local_gate_up
+            .iter()
+            .zip(fixture.local_down.iter())
+            .map(|(gate_up, down)| CompactLiveWeight {
+                gate_up: compact_weight(gate_up, dtype, 8, 4),
+                down: compact_weight(down, dtype, 4, 4),
+            })
+            .collect()
+    }
+
+    fn compact_dummies<'a>(
+        fixture: &'a CompactFixture,
+        dtype: DType,
+    ) -> Vec<CompactLiveWeight<'a>> {
+        vec![CompactLiveWeight {
+            gate_up: compact_weight(&fixture.dummy_gate_up, dtype, 8, 4),
+            down: compact_weight(&fixture.dummy_down, dtype, 4, 4),
+        }]
+    }
+
+    fn bind_compact_ok(
+        table: &ExpertTable,
+        cache: &mut ExpertBindingCache,
+        fixture: &CompactFixture,
+        dtype: DType,
+        device: i32,
+    ) {
+        let locals = compact_locals(fixture, dtype);
+        let dummies = compact_dummies(fixture, dtype);
+        cache
+            .bind_live_compact(
+                table,
+                &locals,
+                &fixture.gate_entries,
+                &fixture.down_entries,
+                None,
+                &fixture.gate_up_ptrs,
+                &fixture.down_ptrs,
+                None,
+                None,
+                &dummies,
+                device,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn compact_bind_rank0_and_rank1_succeed_with_slot_ordered_lists() {
+        let dtype = DType::MQ4G256;
+        let table = ep_table(4, 2, dtype);
+        let mut cache0 = table.prepare_binding(0, 2, 3).unwrap();
+        let mut cache1 = table.prepare_binding(1, 2, 5).unwrap();
+        assert_eq!(cache0.local_expert_ids(), &[0, 2]);
+        assert_eq!(cache1.local_expert_ids(), &[1, 3]);
+        let fix0 = compact_fixture(&table, 0, 0xA0_0000, dtype);
+        let fix1 = compact_fixture(&table, 1, 0xB0_0000, dtype);
+        bind_compact_ok(&table, &mut cache0, &fix0, dtype, 3);
+        bind_compact_ok(&table, &mut cache1, &fix1, dtype, 5);
+        assert!(cache0.is_live_bound() && cache1.is_live_bound());
+        // Same uploaded mapping shape on both ranks retains the same
+        // fingerprint only when the entries agree; here the local bases
+        // differ per rank, so the fingerprints must differ.
+        assert_ne!(cache0.mapping_fingerprint(), cache1.mapping_fingerprint());
+        assert!(cache0.mapping_fingerprint().is_some());
+        BoundMoeExperts::from_cache(&table, &cache0).unwrap();
+        BoundMoeExperts::from_cache(&table, &cache1).unwrap();
+    }
+
+    #[test]
+    fn compact_bind_same_mapping_retains_same_fingerprint() {
+        let dtype = DType::MQ4G256;
+        let table = ep_table(4, 2, dtype);
+        let mut first = table.prepare_binding(0, 2, 3).unwrap();
+        let mut second = table.prepare_binding(0, 2, 3).unwrap();
+        let fixture = compact_fixture(&table, 0, 0xC0_0000, dtype);
+        bind_compact_ok(&table, &mut first, &fixture, dtype, 3);
+        bind_compact_ok(&table, &mut second, &fixture, dtype, 3);
+        assert_eq!(first.mapping_fingerprint(), second.mapping_fingerprint());
+    }
+
+    #[test]
+    fn compact_bind_rejects_missing_local_expert() {
+        let dtype = DType::MQ4G256;
+        let table = ep_table(4, 2, dtype);
+        let mut cache = table.prepare_binding(0, 2, 3).unwrap();
+        let fixture = compact_fixture(&table, 0, 0xD0_0000, dtype);
+        let locals = compact_locals(&fixture, dtype);
+        let dummies = compact_dummies(&fixture, dtype);
+        let error = cache
+            .bind_live_compact(
+                &table,
+                &locals[..1],
+                &fixture.gate_entries,
+                &fixture.down_entries,
+                None,
+                &fixture.gate_up_ptrs,
+                &fixture.down_ptrs,
+                None,
+                None,
+                &dummies,
+                3,
+            )
+            .unwrap_err();
+        assert!(format!("{error:?}").contains("slots"), "{error:?}");
+        assert!(!cache.is_live_bound());
+    }
+
+    #[test]
+    fn compact_bind_rejects_misordered_local_experts() {
+        let dtype = DType::MQ4G256;
+        let table = ep_table(4, 2, dtype);
+        let mut cache = table.prepare_binding(0, 2, 3).unwrap();
+        let fixture = compact_fixture(&table, 0, 0xE0_0000, dtype);
+        let mut locals = compact_locals(&fixture, dtype);
+        locals.swap(0, 1);
+        let dummies = compact_dummies(&fixture, dtype);
+        let error = cache
+            .bind_live_compact(
+                &table,
+                &locals,
+                &fixture.gate_entries,
+                &fixture.down_entries,
+                None,
+                &fixture.gate_up_ptrs,
+                &fixture.down_ptrs,
+                None,
+                None,
+                &dummies,
+                3,
+            )
+            .unwrap_err();
+        assert!(format!("{error:?}").contains("does not point"), "{error:?}");
+        assert!(!cache.is_live_bound());
+    }
+
+    #[test]
+    fn compact_bind_rejects_owned_pointer_mismatch() {
+        let dtype = DType::MQ4G256;
+        let table = ep_table(4, 2, dtype);
+        let mut cache = table.prepare_binding(0, 2, 3).unwrap();
+        let fixture = compact_fixture(&table, 0, 0xF0_0000, dtype);
+        let locals = compact_locals(&fixture, dtype);
+        let dummies = compact_dummies(&fixture, dtype);
+        let mut gate_entries = fixture.gate_entries.clone();
+        gate_entries[0] = gate_entries[0].wrapping_add(0x40);
+        let error = cache
+            .bind_live_compact(
+                &table,
+                &locals,
+                &gate_entries,
+                &fixture.down_entries,
+                None,
+                &fixture.gate_up_ptrs,
+                &fixture.down_ptrs,
+                None,
+                None,
+                &dummies,
+                3,
+            )
+            .unwrap_err();
+        assert!(format!("{error:?}").contains("owned expert 0"), "{error:?}");
+        assert!(!cache.is_live_bound());
+    }
+
+    #[test]
+    fn compact_bind_rejects_non_owned_non_dummy_pointer() {
+        let dtype = DType::MQ4G256;
+        let table = ep_table(4, 2, dtype);
+        let mut cache = table.prepare_binding(0, 2, 3).unwrap();
+        let fixture = compact_fixture(&table, 0, 0x1_0000, dtype);
+        let locals = compact_locals(&fixture, dtype);
+        let dummies = compact_dummies(&fixture, dtype);
+        let mut down_entries = fixture.down_entries.clone();
+        down_entries[1] = 0xdead_beef;
+        let error = cache
+            .bind_live_compact(
+                &table,
+                &locals,
+                &fixture.gate_entries,
+                &down_entries,
+                None,
+                &fixture.gate_up_ptrs,
+                &fixture.down_ptrs,
+                None,
+                None,
+                &dummies,
+                3,
+            )
+            .unwrap_err();
+        assert!(format!("{error:?}").contains("zero dummy"), "{error:?}");
+        assert!(!cache.is_live_bound());
+    }
+
+    #[test]
+    fn compact_bind_rejects_wrong_dummy_layout() {
+        let dtype = DType::MQ4G256;
+        let table = ep_table(4, 2, dtype);
+        let mut cache = table.prepare_binding(0, 2, 3).unwrap();
+        let fixture = compact_fixture(&table, 0, 0x2_0000, dtype);
+        let locals = compact_locals(&fixture, dtype);
+        let bad_dummy = CompactLiveWeight {
+            gate_up: compact_weight(&fixture.dummy_gate_up, dtype, 7, 4),
+            down: compact_weight(&fixture.dummy_down, dtype, 4, 4),
+        };
+        let error = cache
+            .bind_live_compact(
+                &table,
+                &locals,
+                &fixture.gate_entries,
+                &fixture.down_entries,
+                None,
+                &fixture.gate_up_ptrs,
+                &fixture.down_ptrs,
+                None,
+                None,
+                &[bad_dummy],
+                3,
+            )
+            .unwrap_err();
+        assert!(format!("{error:?}").contains("zero dummy"), "{error:?}");
+        assert!(!cache.is_live_bound());
+    }
+
+    #[test]
+    fn compact_bind_rejects_wrong_device_and_stale_table() {
+        let dtype = DType::MQ4G256;
+        let table = ep_table(4, 2, dtype);
+        let mut cache = table.prepare_binding(0, 2, 3).unwrap();
+        let fixture = compact_fixture(&table, 0, 0x3_0000, dtype);
+        let locals = compact_locals(&fixture, dtype);
+        let dummies = compact_dummies(&fixture, dtype);
+        let error = cache
+            .bind_live_compact(
+                &table,
+                &locals,
+                &fixture.gate_entries,
+                &fixture.down_entries,
+                None,
+                &fixture.gate_up_ptrs,
+                &fixture.down_ptrs,
+                None,
+                None,
+                &dummies,
+                9,
+            )
+            .unwrap_err();
+        assert!(format!("{error:?}").contains("device"), "{error:?}");
+        let other = ep_table(4, 2, dtype);
+        let error = cache
+            .bind_live_compact(
+                &other,
+                &locals,
+                &fixture.gate_entries,
+                &fixture.down_entries,
+                None,
+                &fixture.gate_up_ptrs,
+                &fixture.down_ptrs,
+                None,
+                None,
+                &dummies,
+                3,
+            )
+            .unwrap_err();
+        assert!(
+            format!("{error:?}").contains("different expert table"),
+            "{error:?}"
+        );
+        assert!(!cache.is_live_bound());
+    }
+
+    #[test]
+    fn local_expert_ids_follow_local_slot_order_not_global_order() {
+        let records = vec![
+            ExpertMetadata::new(
+                0,
+                0,
+                1,
+                ExpertResources::fused(
+                    resource("gu0", DType::MQ4G256, &[8, 4]),
+                    resource("dn0", DType::MQ4G256, &[4, 4]),
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+            ExpertMetadata::new(
+                1,
+                0,
+                0,
+                ExpertResources::fused(
+                    resource("gu1", DType::MQ4G256, &[8, 4]),
+                    resource("dn1", DType::MQ4G256, &[4, 4]),
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        ];
+        let table = ExpertTable::new(records).unwrap();
+        let cache = table.prepare_binding(0, 1, 0).unwrap();
+        assert_eq!(cache.local_expert_ids(), &[1, 0]);
+        assert_eq!(cache.local_slot(0), Some(1));
+        assert_eq!(cache.local_slot(1), Some(0));
+    }
+
+    #[test]
+    fn execution_contract_fingerprint_and_canonical_predicate() {
+        let rows = ["gate", "up", "down"]
+            .into_iter()
+            .map(|name| ContractCollectiveRow {
+                name: name.into(),
+                layer: 0,
+                hint: ContractCollectiveHint::AllReduce {
+                    kind: ContractAxis::Ep,
+                },
+            })
+            .collect::<Vec<_>>();
+        let contract = ExpertExecutionContract::new(
+            "ffn",
+            Some(0),
+            "fp-v1",
+            7,
+            vec![3, 5],
+            ContractParallelism::ExpertParallel,
+            ContractAssignment::Stride,
+            vec![0, 1, 0, 1],
+            vec![0, 0, 1, 1],
+            CANONICAL_EP_EXECUTION,
+            rows,
+        )
+        .unwrap();
+        let fingerprint = contract.fingerprint();
+        assert!(fingerprint.contains("sealed-ep/v1"));
+        assert!(fingerprint.contains(CANONICAL_EP_EXECUTION));
+        assert!(fingerprint.contains("owners|0,1,0,1"));
+        assert!(contract.is_canonical_ep());
+        let table = ep_table(4, 2, DType::MQ4G256);
+        let table = table.with_execution_contract(contract.clone()).unwrap();
+        assert_eq!(table.execution_contract(), Some(&contract));
+        let mut cache = table.prepare_binding(0, 2, 3).unwrap();
+        let fixture = compact_fixture(&table, 0, 0x4_0000, DType::MQ4G256);
+        bind_compact_ok(&table, &mut cache, &fixture, DType::MQ4G256, 3);
+        let viewed = BoundMoeExperts::from_cache(&table, &cache).unwrap();
+        assert_eq!(viewed.execution_contract(), Some(&contract));
+        // Mismatched owner/slot maps are rejected at attach time.
+        let bad = ExpertExecutionContract::new(
+            "ffn",
+            Some(0),
+            "fp-v1",
+            7,
+            vec![3, 5],
+            ContractParallelism::ExpertParallel,
+            ContractAssignment::Stride,
+            vec![1, 0, 1, 0],
+            vec![0, 0, 1, 1],
+            CANONICAL_EP_EXECUTION,
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(!bad.is_canonical_ep());
+        assert!(table.with_execution_contract(bad).is_err());
+        // A Single-style contract never authorizes the canonical combine.
+        let single = ExpertExecutionContract::new(
+            "ffn",
+            Some(0),
+            "fp-v1",
+            7,
+            vec![3],
+            ContractParallelism::Single,
+            ContractAssignment::Stride,
+            vec![0, 0],
+            vec![0, 1],
+            "indexed-single",
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(!single.is_canonical_ep());
     }
 }

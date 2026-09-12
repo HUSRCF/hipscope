@@ -246,6 +246,17 @@ impl ExpertExecutionPlan {
         &self.collective_rows
     }
 
+    /// Deterministic execution fingerprint of the whole sealed plan. Same
+    /// plan on any rank or process renders the same string; any change to
+    /// ownership, devices, epoch, sources, execution, or schedule changes
+    /// it. Ranks compare this (never pointers) to prove they decode the
+    /// same sealed generation.
+    pub fn execution_fingerprint(&self) -> String {
+        execution_contract_for_plan(self)
+            .map(|contract| contract.fingerprint())
+            .unwrap_or_else(|_| "sealed-ep/invalid".to_string())
+    }
+
     pub fn owner_rank(&self, global_expert_id: usize) -> Option<usize> {
         self.experts
             .get(global_expert_id)
@@ -1373,14 +1384,22 @@ fn adapt_projection(
     Ok(resource)
 }
 
-/// Adapt one validated runtime plan into the dispatch-owned metadata pair.
+/// Adapt one validated runtime plan into the dispatch-owned metadata pair for
+/// one logical rank.
 ///
 /// This is the only production bridge from runtime source/placement metadata
 /// to dispatch tables.  It performs no inference: every source shape, byte
 /// range, rotation basis, sidecar identity, alias range, owner rank, and local
-/// slot comes from the already validated [`ExpertExecutionPlan`].
+/// slot comes from the already validated [`ExpertExecutionPlan`].  The caller
+/// names the rank it is adapting for; the adapter selects
+/// `plan.rank_ownership()[local_rank]`, verifies the logical rank, the
+/// `global_to_local` map, the mesh device list, the physical device, and the
+/// compact local slots, then prepares that rank's cache.  A tampered or
+/// stale plan (renumbered ranks, remapped slots, swapped devices) fails here,
+/// before any table is published.
 pub fn adapt_expert_execution_plan(
     plan: &ExpertExecutionPlan,
+    local_rank: usize,
 ) -> Result<
     (
         hipfire_dispatch::pipeline::sealed_moe::ExpertTable,
@@ -1391,13 +1410,82 @@ pub fn adapt_expert_execution_plan(
     use hipfire_dispatch::pipeline::sealed_moe::{ExpertResources, ExpertTable};
 
     let rank_count = plan.rank_ownership.len();
-    if rank_count == 0 || plan.rank_devices.is_empty() {
+    if rank_count == 0 || plan.rank_devices.is_empty() || plan.rank_devices.len() != rank_count {
         return Err("sealed expert plan has no rank ownership".to_string());
     }
+    if local_rank >= rank_count {
+        return Err(format!(
+            "sealed expert local rank {local_rank} is outside rank count {rank_count}"
+        ));
+    }
+    let ownership = &plan.rank_ownership[local_rank];
+    if ownership.logical_rank != local_rank {
+        return Err(format!(
+            "sealed expert ownership entry {local_rank} names logical rank {}",
+            ownership.logical_rank
+        ));
+    }
+    let mesh_device = *plan
+        .rank_devices
+        .get(local_rank)
+        .ok_or_else(|| format!("sealed expert plan has no mesh device for rank {local_rank}"))?;
     let physical_device = *plan
         .physical_devices
-        .get(plan.rank_devices[0])
+        .get(mesh_device)
         .ok_or_else(|| "sealed expert plan rank device is out of range".to_string())?;
+    if ownership.physical_device != physical_device {
+        return Err(format!(
+            "sealed expert rank {local_rank} physical device {} disagrees with mesh device {physical_device}",
+            ownership.physical_device
+        ));
+    }
+    if plan.global_to_local.len() != rank_count {
+        return Err(format!(
+            "sealed expert plan maps {} ranks, expected {rank_count}",
+            plan.global_to_local.len()
+        ));
+    }
+    for (rank, row) in plan.global_to_local.iter().enumerate() {
+        if row.len() != plan.n_experts {
+            return Err(format!(
+                "sealed expert rank {rank} maps {} experts, expected {}",
+                row.len(),
+                plan.n_experts
+            ));
+        }
+    }
+    // Every record's sealed owner/slot must agree with the rank map, on all
+    // ranks, not just the adapted one: a stale global table is rejected even
+    // when the local row happens to look intact.
+    for record in &plan.experts {
+        let mapped = plan
+            .global_to_local
+            .get(record.owner_rank)
+            .and_then(|row| row.get(record.global_expert_id))
+            .copied()
+            .flatten();
+        if mapped != Some(record.local_slot) {
+            return Err(format!(
+                "sealed expert {} owner/slot ({}/{}) disagrees with the rank map",
+                record.global_expert_id, record.owner_rank, record.local_slot
+            ));
+        }
+    }
+    let local_row = &plan.global_to_local[local_rank];
+    let owned_count = local_row.iter().flatten().count();
+    if owned_count != ownership.global_expert_ids.len() {
+        return Err(format!(
+            "sealed expert rank {local_rank} maps {owned_count} slots but owns {} experts",
+            ownership.global_expert_ids.len()
+        ));
+    }
+    for (slot, &expert) in ownership.global_expert_ids.iter().enumerate() {
+        if local_row.get(expert).copied().flatten() != Some(slot) {
+            return Err(format!(
+                "sealed expert rank {local_rank} slot {slot} disagrees on expert {expert}"
+            ));
+        }
+    }
     let mut records = Vec::with_capacity(plan.experts.len());
     for record in &plan.experts {
         let gate = &record.gate;
@@ -1504,14 +1592,81 @@ pub fn adapt_expert_execution_plan(
     }
     let table = ExpertTable::new(records)
         .map_err(|error| format!("sealed expert table adaptation: {error:?}"))?;
+    let contract = execution_contract_for_plan(plan)?;
+    let table = table
+        .with_execution_contract(contract)
+        .map_err(|error| format!("sealed expert contract adaptation: {error:?}"))?;
     let cache = table
-        .prepare_binding(0, rank_count, physical_device)
+        .prepare_binding(local_rank, rank_count, physical_device)
         .map_err(|error| format!("sealed expert cache adaptation: {error:?}"))?;
     Ok((table, cache))
 }
 
 fn down_shape(projection: &ExpertProjectionBinding) -> Vec<usize> {
     projection.logical_shape.clone()
+}
+
+/// Build the deterministic dispatch execution contract from one sealed plan.
+/// Every field (group/layer, source fingerprint, mesh epoch, physical rank
+/// list, parallelism, assignment, owner/slot map, execution string, ordered
+/// collective rows) is copied from the attested plan; nothing is inferred.
+pub fn execution_contract_for_plan(
+    plan: &ExpertExecutionPlan,
+) -> Result<hipfire_dispatch::pipeline::sealed_moe::ExpertExecutionContract, String> {
+    use hipfire_dispatch::pipeline::sealed_moe::{
+        ContractAssignment, ContractAxis, ContractCollectiveHint, ContractCollectiveRow,
+        ContractParallelism, ExpertExecutionContract,
+    };
+    let parallelism = match plan.parallelism {
+        ExpertParallelism::Single => ContractParallelism::Single,
+        ExpertParallelism::TensorParallel => ContractParallelism::TensorParallel,
+        ExpertParallelism::ExpertParallel => ContractParallelism::ExpertParallel,
+    };
+    let assignment = match plan.assignment {
+        ExpertAssign::Stride => ContractAssignment::Stride,
+        ExpertAssign::Contiguous => ContractAssignment::Contiguous,
+    };
+    let map_axis = |kind: DimKind| match kind {
+        DimKind::Pp => ContractAxis::Pp,
+        DimKind::Tp => ContractAxis::Tp,
+        DimKind::Ep => ContractAxis::Ep,
+    };
+    let collective_rows = plan
+        .collective_rows
+        .iter()
+        .map(|row| ContractCollectiveRow {
+            name: row.name.clone(),
+            layer: row.layer,
+            hint: match row.hint {
+                CollectiveHint::AllReduce { kind } => ContractCollectiveHint::AllReduce {
+                    kind: map_axis(kind),
+                },
+                CollectiveHint::BandXfer { src, dst } => {
+                    ContractCollectiveHint::BandXfer { src, dst }
+                }
+            },
+        })
+        .collect::<Vec<_>>();
+    ExpertExecutionContract::new(
+        plan.group.clone(),
+        plan.layer,
+        plan.source_fingerprint.clone(),
+        plan.mesh_epoch.as_u64(),
+        plan.physical_devices.clone(),
+        parallelism,
+        assignment,
+        plan.experts
+            .iter()
+            .map(|record| record.owner_rank)
+            .collect(),
+        plan.experts
+            .iter()
+            .map(|record| record.local_slot)
+            .collect(),
+        plan.execution.clone(),
+        collective_rows,
+    )
+    .map_err(|error| format!("sealed expert contract: {error:?}"))
 }
 
 /// Build and adapt a Single-device expert plan from loader-attested metadata.
@@ -1552,8 +1707,356 @@ pub fn plan_single_expert_execution(
     let execution = plans
         .pop()
         .ok_or_else(|| "single expert planner returned no execution plan".to_string())?;
-    let (table, cache) = adapt_expert_execution_plan(&execution)?;
+    let (table, cache) = adapt_expert_execution_plan(&execution, 0)?;
     Ok((execution, table, cache))
+}
+
+/// Repartition an already sealed Single expert plan into an expert-parallel
+/// plan on `mesh` with `assignment` and `execution`.
+///
+/// This is the only sanctioned Single -> EP transition, and it is used for
+/// post-load sharding. It accepts nothing but a sealed Single plan, rebuilds
+/// ordinary planner input (manifest entries, group spec, source metadata)
+/// from that plan's attested source/resource metadata, and reruns the same
+/// manifest planner plus [`plan_expert_execution`] every fresh EP plan goes
+/// through. Ownership, local slots, and collective rows therefore come from
+/// the planner, never from a hand-built `e % N` table, and the EP collective
+/// schedule is never omitted.
+///
+/// Source reconstruction mirrors the sealed layout: a base whose experts
+/// share projection names rebuilds packed sources (with the total encoded
+/// bytes recovered as per-expert bytes times `n_experts`); a base with
+/// per-expert names rebuilds per-expert sources. Fused gate/up carriers are
+/// detected per expert and must be uniform. Sidecars and aliases are carried
+/// with their attested identities; an alias whose owner has no attested
+/// metadata of its own cannot be repartitioned and fails here.
+pub fn repartition_expert_execution_plan(
+    base: &ExpertExecutionPlan,
+    mesh: &DeviceMesh,
+    physical_devices: &[i32],
+    assignment: ExpertAssign,
+    execution: impl Into<String>,
+) -> Result<ExpertExecutionPlan, String> {
+    use crate::weight_manifest::{
+        ExpertGroupSpec, ExpertParallelism, ExpertSourceLayout, ShardPolicy,
+    };
+    if base.parallelism != ExpertParallelism::Single {
+        return Err(format!(
+            "repartition requires a sealed Single expert plan, got {:?}",
+            base.parallelism
+        ));
+    }
+    let n_experts = base.n_experts;
+    if n_experts == 0 || base.experts.len() != n_experts {
+        return Err("repartition requires a sealed plan covering nonzero experts".to_string());
+    }
+    if mesh.size_of(DimKind::Ep) == 0 {
+        return Err("repartition requires a mesh with an expert-parallel axis".to_string());
+    }
+    let fused = base.experts[0].gate.source_name == base.experts[0].up.source_name;
+    for record in &base.experts {
+        if (record.gate.source_name == record.up.source_name) != fused {
+            return Err(format!(
+                "repartition refuses expert {} with mixed fused/separate gate/up identity",
+                record.global_expert_id
+            ));
+        }
+    }
+    let packed = ["gate", "up", "down"].iter().all(|role| {
+        let first = projection_source_name(&base.experts[0], role);
+        base.experts
+            .iter()
+            .all(|record| projection_source_name(record, role) == first)
+    });
+    if !packed {
+        // Per-expert layouts need distinct source names per expert within
+        // each projection role; anything else is not a planner-admissible
+        // layout and fails here instead of deep inside validation.
+        for role in ["gate", "up", "down"] {
+            let mut seen = HashSet::new();
+            for record in &base.experts {
+                let name = match role {
+                    "gate" => record.gate.source_name.as_str(),
+                    "up" => record.up.source_name.as_str(),
+                    _ => record.down.source_name.as_str(),
+                };
+                if !seen.insert(name) {
+                    return Err(format!(
+                        "repartition refuses non-packed expert {role} source '{name}' shared across experts"
+                    ));
+                }
+            }
+        }
+    }
+    let reference_sidecars: Vec<String> = base.experts[0]
+        .sidecars
+        .iter()
+        .map(|sidecar| sidecar.source_name.clone())
+        .collect();
+    for record in &base.experts {
+        let names = record
+            .sidecars
+            .iter()
+            .map(|sidecar| sidecar.source_name.clone())
+            .collect::<Vec<_>>();
+        if names != reference_sidecars {
+            return Err(format!(
+                "repartition refuses expert {} with non-uniform sidecar set",
+                record.global_expert_id
+            ));
+        }
+    }
+    // Rebuild one source per distinct attested name. Packed sources recover
+    // their full extent (`[n_experts, ..storage]`, per-expert bytes times
+    // `n_experts`); per-expert sources keep the attested per-expert extent.
+    let mut sources = Vec::new();
+    let mut seen_sources = HashSet::new();
+    let mut push_source = |binding: &ExpertProjectionBinding,
+                           storage_shape: Vec<usize>,
+                           context: &str|
+     -> Result<(), String> {
+        if !seen_sources.insert(binding.source_name.clone()) {
+            let previous = sources
+                .iter()
+                .find(|source: &&ExpertSourceMetadata| source.name == binding.source_name)
+                .expect("repartition source bookkeeping lost a source");
+            let rebuilt = rebuilt_source(binding, &storage_shape, n_experts, packed)?;
+            if *previous != rebuilt {
+                return Err(format!(
+                    "repartition refuses attested source '{}' with divergent {context} metadata",
+                    binding.source_name
+                ));
+            }
+            return Ok(());
+        }
+        sources.push(rebuilt_source(binding, &storage_shape, n_experts, packed)?);
+        Ok(())
+    };
+    for record in &base.experts {
+        let gate_storage = fused_storage(&record.gate.logical_shape, fused);
+        let up_storage = fused_storage(&record.up.logical_shape, fused);
+        let down_storage = record.down.logical_shape.clone();
+        push_source(&record.gate, gate_storage, "gate")?;
+        if record.up.source_name != record.gate.source_name {
+            push_source(&record.up, up_storage, "up")?;
+        }
+        push_source(&record.down, down_storage, "down")?;
+        for sidecar in &record.sidecars {
+            push_source(sidecar, sidecar.logical_shape.clone(), "sidecar")?;
+        }
+    }
+    for source in &sources {
+        if let Some(owner) = source.alias_owner.as_deref() {
+            if !sources.iter().any(|candidate| candidate.name == owner) {
+                return Err(format!(
+                    "repartition refuses alias '{}' whose owner '{owner}' has no attested metadata",
+                    source.name
+                ));
+            }
+        }
+    }
+    // Synthesize the manifest the planner expects: expert projections are
+    // expert-sharded with the requested assignment, sidecars and the router
+    // replicate. Entry shapes lead with `n_experts`, which the expert-shard
+    // policy requires; dtypes and layer match the attested plan.
+    let mut manifest = Vec::new();
+    let layer = base.layer;
+    let mut push_entry = |name: &str, shape: Vec<usize>, dtype: DType, policy: ShardPolicy| {
+        let entry = match layer {
+            Some(layer) => WeightEntry::layer(name, layer, shape, dtype, policy),
+            None => WeightEntry::model(name, shape, dtype, policy),
+        };
+        manifest.push(entry);
+    };
+    let expert_policy = ShardPolicy::ExpertSharded {
+        n_experts,
+        assign: assignment,
+    };
+    let mut seen_entries = HashSet::new();
+    for record in &base.experts {
+        let projections = [
+            (
+                &record.gate,
+                fused_storage(&record.gate.logical_shape, fused),
+            ),
+            (&record.up, fused_storage(&record.up.logical_shape, fused)),
+            (&record.down, record.down.logical_shape.clone()),
+        ];
+        for (binding, storage) in projections {
+            if seen_entries.insert(binding.source_name.clone()) {
+                let mut shape = vec![n_experts];
+                shape.extend_from_slice(&storage);
+                push_entry(
+                    &binding.source_name,
+                    shape,
+                    binding.dtype,
+                    expert_policy.clone(),
+                );
+            }
+        }
+        for sidecar in &record.sidecars {
+            if seen_entries.insert(sidecar.source_name.clone()) {
+                push_entry(
+                    &sidecar.source_name,
+                    sidecar.logical_shape.clone(),
+                    sidecar.dtype,
+                    ShardPolicy::Replicate,
+                );
+            }
+        }
+    }
+    push_entry(
+        &base.router,
+        vec![n_experts],
+        DType::F32,
+        ShardPolicy::Replicate,
+    );
+    let source_layout = if packed {
+        let first = &base.experts[0];
+        if fused {
+            ExpertSourceLayout::PackedFused {
+                gate_up: first.gate.source_name.clone(),
+                down: first.down.source_name.clone(),
+                sidecars: reference_sidecars.clone(),
+            }
+        } else {
+            ExpertSourceLayout::PackedSeparate {
+                gate: first.gate.source_name.clone(),
+                up: first.up.source_name.clone(),
+                down: first.down.source_name.clone(),
+                sidecars: reference_sidecars.clone(),
+            }
+        }
+    } else if fused {
+        ExpertSourceLayout::PerExpertFused {
+            gate_up: base
+                .experts
+                .iter()
+                .map(|record| record.gate.source_name.clone())
+                .collect(),
+            down: base
+                .experts
+                .iter()
+                .map(|record| record.down.source_name.clone())
+                .collect(),
+            sidecars: reference_sidecars.clone(),
+        }
+    } else {
+        ExpertSourceLayout::PerExpertSeparate {
+            gate: base
+                .experts
+                .iter()
+                .map(|record| record.gate.source_name.clone())
+                .collect(),
+            up: base
+                .experts
+                .iter()
+                .map(|record| record.up.source_name.clone())
+                .collect(),
+            down: base
+                .experts
+                .iter()
+                .map(|record| record.down.source_name.clone())
+                .collect(),
+            sidecars: reference_sidecars.clone(),
+        }
+    };
+    let n_layers = layer.map(|layer| layer + 1).unwrap_or(1);
+    let manifest_plan = crate::weight_manifest::plan_manifest(&manifest, &[], mesh, n_layers)
+        .map_err(|error| format!("repartition manifest planning: {error}"))?;
+    let spec = ExpertGroupSpec {
+        group: base.group.clone(),
+        layer,
+        n_experts,
+        parallelism: ExpertParallelism::ExpertParallel,
+        assignment,
+        source_layout,
+        resources: base.resources.clone(),
+        router: base.router.clone(),
+        execution: execution.into(),
+    };
+    let router_metadata = ExpertSourceMetadata::new(
+        base.router.clone(),
+        base.source_fingerprint.clone(),
+        vec![n_experts],
+        DType::F32,
+        4 * n_experts,
+        4,
+        4,
+        "f32",
+        "natural",
+    );
+    sources.push(router_metadata);
+    let mut plans = plan_expert_execution(
+        &manifest,
+        &manifest_plan,
+        std::slice::from_ref(&spec),
+        &sources,
+        mesh,
+        physical_devices,
+    )
+    .map_err(|error| format!("repartition expert planning: {error}"))?;
+    plans
+        .pop()
+        .ok_or_else(|| "repartition planner returned no execution plan".to_string())
+}
+
+/// Per-expert storage rows behind one attested logical shape. Fused gate/up
+/// records store one logical half; the carrier holds both halves.
+fn fused_storage(logical_shape: &[usize], fused: bool) -> Vec<usize> {
+    if !fused || logical_shape.len() != 2 {
+        return logical_shape.to_vec();
+    }
+    vec![logical_shape[0] * 2, logical_shape[1]]
+}
+
+/// Rebuild one planner source from its attested per-expert binding.
+fn rebuilt_source(
+    binding: &ExpertProjectionBinding,
+    storage_shape: &[usize],
+    n_experts: usize,
+    packed: bool,
+) -> Result<ExpertSourceMetadata, String> {
+    let (logical_shape, encoded_bytes) = if packed {
+        let mut shape = vec![n_experts];
+        shape.extend_from_slice(storage_shape);
+        let bytes = binding
+            .encoded_bytes
+            .checked_mul(n_experts)
+            .ok_or_else(|| {
+                format!(
+                    "repartition source '{}' packed bytes overflow",
+                    binding.source_name
+                )
+            })?;
+        (shape, bytes)
+    } else {
+        (storage_shape.to_vec(), binding.encoded_bytes)
+    };
+    let mut source = ExpertSourceMetadata::new(
+        binding.source_name.clone(),
+        binding.fingerprint.clone(),
+        logical_shape,
+        binding.dtype,
+        encoded_bytes,
+        binding.row_stride,
+        binding.alignment,
+        binding.quant_tag.clone(),
+        binding.basis.clone(),
+    );
+    source.sidecar_source_names = binding.sidecar_source_names.clone();
+    source.alias_owner = binding.alias_owner.clone();
+    source.alias_byte_offset = binding.alias_byte_offset;
+    Ok(source)
+}
+
+/// Attested source name behind one projection role of one sealed record.
+fn projection_source_name<'a>(record: &'a ExpertRecord, role: &str) -> &'a str {
+    match role {
+        "gate" => record.gate.source_name.as_str(),
+        "up" => record.up.source_name.as_str(),
+        _ => record.down.source_name.as_str(),
+    }
 }
 
 /// Tiny arithmetic expert matrices used by the CPU mesh conformance driver.
@@ -1678,9 +2181,46 @@ fn validate_cpu_programs(
     Ok(())
 }
 
+/// Evaluate one expert's raw (unweighted) down row for the CPU mesh driver.
+fn cpu_expert_row(matrices: &CpuExpertMatrices, input: &[f32]) -> Result<Vec<f32>, String> {
+    let gate = matrix_vector(&matrices.gate, input)?;
+    let up = matrix_vector(&matrices.up, input)?;
+    let activated: Vec<f32> = gate.iter().zip(up).map(|(gate, up)| gate * up).collect();
+    matrix_vector(&matrices.down, &activated)
+}
+
+/// Look up the sealed owner and matrices behind one routed expert.
+fn cpu_owner_matrices<'a>(
+    plan: &ExpertExecutionPlan,
+    ranks: &'a [CpuRankProgram],
+    expert: usize,
+) -> Result<(usize, &'a CpuExpertMatrices), String> {
+    let owner = plan
+        .owner_rank(expert)
+        .ok_or_else(|| format!("route expert {expert} has no owner"))?;
+    let matrices = ranks
+        .get(owner)
+        .and_then(|program| {
+            program
+                .experts
+                .iter()
+                .find(|(id, _)| *id == expert)
+                .map(|(_, matrices)| matrices)
+        })
+        .ok_or_else(|| format!("owner rank {owner} lacks expert {expert}"))?;
+    Ok((owner, matrices))
+}
+
 /// Execute a tiny CPU MoE through the same rank ownership and one-reduction
 /// semantics as the sealed mesh route.  `launches` is appended only after the
 /// complete preflight succeeds, so an invalid later rank proves zero launches.
+///
+/// Each owning rank materializes its raw selected down rows; the single
+/// canonical fold then accumulates `weight[i] * row[i]` in flat slot order
+/// and adds the total to the residual once. Rank count never enters the
+/// arithmetic: sharded EP computes exactly the Single association. (A
+/// per-rank partial-sum association is kept only as a tests-only legacy
+/// diagnostic next to the adversarial test below.)
 pub fn execute_cpu_mesh(
     plan: &ExpertExecutionPlan,
     ranks: &[CpuRankProgram],
@@ -1690,35 +2230,25 @@ pub fn execute_cpu_mesh(
     launches: &mut Vec<CpuLaunch>,
 ) -> Result<CpuMeshResult, String> {
     validate_cpu_programs(plan, ranks, input, residual, routes)?;
-    let mut partials = vec![vec![0.0f32; plan.dimensions.hidden]; ranks.len()];
-    for &(expert, weight) in routes {
-        let owner = plan
-            .owner_rank(expert)
-            .ok_or_else(|| format!("route expert {expert} has no owner"))?;
-        let matrices = ranks[owner]
-            .experts
-            .iter()
-            .find(|(id, _)| *id == expert)
-            .map(|(_, matrices)| matrices)
-            .ok_or_else(|| format!("owner rank {owner} lacks expert {expert}"))?;
-        let gate = matrix_vector(&matrices.gate, input)?;
-        let up = matrix_vector(&matrices.up, input)?;
-        let activated: Vec<f32> = gate.iter().zip(up).map(|(gate, up)| gate * up).collect();
-        let down = matrix_vector(&matrices.down, &activated)?;
-        for (slot, value) in partials[owner].iter_mut().zip(down) {
-            *slot += weight * value;
-        }
+    let mut rows = Vec::with_capacity(routes.len());
+    for &(expert, _) in routes {
+        let (owner, matrices) = cpu_owner_matrices(plan, ranks, expert)?;
+        rows.push(cpu_expert_row(matrices, input)?);
         launches.push(CpuLaunch {
             logical_rank: owner,
             physical_device: ranks[owner].physical_device,
             global_expert_id: expert,
         });
     }
-    let mut output = residual.to_vec();
-    for partial in partials {
-        for (out, value) in output.iter_mut().zip(partial) {
-            *out += value;
+    let mut folded = vec![0.0f32; plan.dimensions.hidden];
+    for (row, &(_, weight)) in rows.iter().zip(routes.iter()) {
+        for (slot, value) in folded.iter_mut().zip(row.iter()) {
+            *slot += weight * value;
         }
+    }
+    let mut output = residual.to_vec();
+    for (out, value) in output.iter_mut().zip(folded) {
+        *out += value;
     }
     Ok(CpuMeshResult {
         output,
@@ -2579,7 +3109,7 @@ mod tests {
         let valid_plan =
             plan_expert_execution(&manifest, &manifest_plan, &specs, &valid, &mesh, &physical)
                 .unwrap();
-        let (table, cache) = adapt_expert_execution_plan(&valid_plan[0]).unwrap();
+        let (table, cache) = adapt_expert_execution_plan(&valid_plan[0], 0).unwrap();
         let gate = table.experts()[1].resources().gate().unwrap();
         assert_eq!(gate.sidecars(), &["router"]);
         assert_eq!(gate.alias().unwrap().owner(), "gate0");
@@ -2753,12 +3283,558 @@ mod tests {
         assert_eq!(record.up.projection_bytes, 16);
         assert_eq!(record.gate.encoded_bytes, 32);
         assert_eq!(record.up.encoded_bytes, 32);
-        let (table, cache) = adapt_expert_execution_plan(plan).unwrap();
+        let (table, cache) = adapt_expert_execution_plan(plan, 0).unwrap();
         let gate_up = table.experts()[0].resources().gate_up().unwrap();
         assert_eq!(gate_up.source_name(), "gate_up");
         assert_eq!(gate_up.shape(), &[4, 2]);
         assert_eq!(gate_up.encoded_bytes(), 32);
         assert_eq!(gate_up.sidecars(), &["rotation"]);
         assert_eq!(cache.physical_device(), 9);
+    }
+
+    fn ep_mesh_fixture(
+        n_experts: usize,
+        ranks: usize,
+        assign: ExpertAssign,
+        execution: &str,
+    ) -> (
+        Vec<WeightEntry>,
+        ManifestPlan,
+        Vec<ExpertGroupSpec>,
+        Vec<ExpertSourceMetadata>,
+        DeviceMesh,
+    ) {
+        let mesh = DeviceMesh::rect(&[(DimKind::Ep, ranks)]).unwrap();
+        let expert_policy = ShardPolicy::ExpertSharded { n_experts, assign };
+        let manifest = vec![
+            WeightEntry::layer(
+                "router",
+                0,
+                vec![n_experts, 2],
+                DType::F32,
+                ShardPolicy::Replicate,
+            ),
+            WeightEntry::layer(
+                "gate",
+                0,
+                vec![n_experts, 2, 2],
+                DType::F32,
+                expert_policy.clone(),
+            ),
+            WeightEntry::layer(
+                "up",
+                0,
+                vec![n_experts, 2, 2],
+                DType::F32,
+                expert_policy.clone(),
+            ),
+            WeightEntry::layer("down", 0, vec![n_experts, 2, 2], DType::F32, expert_policy),
+        ];
+        let plan = crate::weight_manifest::plan_manifest(&manifest, &[], &mesh, 1).unwrap();
+        let resources = ExpertResourceRequirements {
+            experts: vec![
+                ExpertProjectionResources {
+                    gate_bytes: 16,
+                    up_bytes: 16,
+                    down_bytes: 16,
+                    alignment: 4,
+                };
+                n_experts
+            ],
+        };
+        let spec = ExpertGroupSpec {
+            group: "ffn".into(),
+            layer: Some(0),
+            n_experts,
+            parallelism: ExpertParallelism::ExpertParallel,
+            assignment: assign,
+            source_layout: ExpertSourceLayout::PackedSeparate {
+                gate: "gate".into(),
+                up: "up".into(),
+                down: "down".into(),
+                sidecars: Vec::new(),
+            },
+            resources,
+            router: "router".into(),
+            execution: execution.into(),
+        };
+        let source = |name: &str| {
+            ExpertSourceMetadata::new(
+                name,
+                "fixture-v1",
+                vec![n_experts, 2, 2],
+                DType::F32,
+                16 * n_experts,
+                8,
+                4,
+                "f32",
+                "natural",
+            )
+        };
+        (
+            manifest,
+            plan,
+            vec![spec],
+            vec![
+                source("gate"),
+                source("up"),
+                source("down"),
+                ExpertSourceMetadata::new(
+                    "router",
+                    "fixture-v1",
+                    vec![n_experts, 2],
+                    DType::F32,
+                    16 * n_experts,
+                    16,
+                    4,
+                    "f32",
+                    "natural",
+                ),
+            ],
+            mesh,
+        )
+    }
+
+    fn single_mesh_fixture(
+        n_experts: usize,
+    ) -> (
+        Vec<WeightEntry>,
+        ManifestPlan,
+        Vec<ExpertGroupSpec>,
+        Vec<ExpertSourceMetadata>,
+        DeviceMesh,
+    ) {
+        let mesh = DeviceMesh::single().unwrap();
+        let manifest = vec![
+            WeightEntry::layer(
+                "router",
+                0,
+                vec![n_experts, 2],
+                DType::F32,
+                ShardPolicy::Replicate,
+            ),
+            WeightEntry::layer(
+                "gate",
+                0,
+                vec![n_experts, 2, 2],
+                DType::F32,
+                ShardPolicy::Replicate,
+            ),
+            WeightEntry::layer(
+                "up",
+                0,
+                vec![n_experts, 2, 2],
+                DType::F32,
+                ShardPolicy::Replicate,
+            ),
+            WeightEntry::layer(
+                "down",
+                0,
+                vec![n_experts, 2, 2],
+                DType::F32,
+                ShardPolicy::Replicate,
+            ),
+        ];
+        let plan = crate::weight_manifest::plan_manifest(&manifest, &[], &mesh, 1).unwrap();
+        let resources = ExpertResourceRequirements {
+            experts: vec![
+                ExpertProjectionResources {
+                    gate_bytes: 16,
+                    up_bytes: 16,
+                    down_bytes: 16,
+                    alignment: 4,
+                };
+                n_experts
+            ],
+        };
+        let spec = ExpertGroupSpec {
+            group: "ffn".into(),
+            layer: Some(0),
+            n_experts,
+            parallelism: ExpertParallelism::Single,
+            assignment: ExpertAssign::Stride,
+            source_layout: ExpertSourceLayout::PackedSeparate {
+                gate: "gate".into(),
+                up: "up".into(),
+                down: "down".into(),
+                sidecars: Vec::new(),
+            },
+            resources,
+            router: "router".into(),
+            execution: "indexed-single".into(),
+        };
+        let source = |name: &str| {
+            ExpertSourceMetadata::new(
+                name,
+                "fixture-v1",
+                vec![n_experts, 2, 2],
+                DType::F32,
+                16 * n_experts,
+                8,
+                4,
+                "f32",
+                "natural",
+            )
+        };
+        (
+            manifest,
+            plan,
+            vec![spec],
+            vec![
+                source("gate"),
+                source("up"),
+                source("down"),
+                ExpertSourceMetadata::new(
+                    "router",
+                    "fixture-v1",
+                    vec![n_experts, 2],
+                    DType::F32,
+                    16 * n_experts,
+                    16,
+                    4,
+                    "f32",
+                    "natural",
+                ),
+            ],
+            mesh,
+        )
+    }
+
+    fn seal_ep(
+        n_experts: usize,
+        ranks: usize,
+        assign: ExpertAssign,
+        physical: &[i32],
+    ) -> (ExpertExecutionPlan, DeviceMesh) {
+        let (manifest, manifest_plan, specs, sources, mesh) =
+            ep_mesh_fixture(n_experts, ranks, assign, "indexed-decode-slot-order");
+        let plan =
+            plan_expert_execution(&manifest, &manifest_plan, &specs, &sources, &mesh, physical)
+                .unwrap()
+                .pop()
+                .unwrap();
+        (plan, mesh)
+    }
+
+    #[test]
+    fn ep2_ep4_stride_and_contiguous_ownership_are_planner_derived() {
+        for (ranks, assign) in [
+            (2, ExpertAssign::Stride),
+            (2, ExpertAssign::Contiguous),
+            (4, ExpertAssign::Stride),
+            (4, ExpertAssign::Contiguous),
+        ] {
+            let physical = vec![7, 2, 11, 5][..ranks].to_vec();
+            let (plan, _) = seal_ep(8, ranks, assign, &physical);
+            assert_eq!(plan.parallelism(), ExpertParallelism::ExpertParallel);
+            assert_eq!(plan.assignment(), assign);
+            let owner = |expert: usize| match assign {
+                ExpertAssign::Stride => expert % ranks,
+                ExpertAssign::Contiguous => expert / (8 / ranks),
+            };
+            let expected: Vec<Vec<usize>> = (0..ranks)
+                .map(|rank| (0..8).filter(|&expert| owner(expert) == rank).collect())
+                .collect();
+            let actual: Vec<Vec<usize>> = plan
+                .rank_ownership()
+                .iter()
+                .map(|ownership| ownership.global_expert_ids.clone())
+                .collect();
+            assert_eq!(actual, expected, "ranks={ranks} assign={assign:?}");
+            for (rank, ownership) in plan.rank_ownership().iter().enumerate() {
+                assert_eq!(ownership.logical_rank, rank);
+                assert_eq!(ownership.physical_device, physical[rank]);
+                for (slot, &expert) in ownership.global_expert_ids.iter().enumerate() {
+                    assert_eq!(plan.owner_rank(expert), Some(rank));
+                    assert_eq!(plan.local_slot(rank, expert), Some(slot));
+                }
+            }
+            for rank in 0..ranks {
+                let (table, cache) = adapt_expert_execution_plan(&plan, rank).unwrap();
+                assert_eq!(cache.local_rank(), rank);
+                assert_eq!(cache.rank_count(), ranks);
+                assert_eq!(cache.physical_device(), physical[rank]);
+                assert_eq!(cache.local_expert_ids(), &expected[rank]);
+                let contract = table
+                    .execution_contract()
+                    .expect("adapted table carries a contract");
+                assert_eq!(contract.owner_ranks(), &expected_owner_ranks(&plan));
+                assert!(contract.fingerprint().contains("indexed-decode-slot-order"));
+            }
+        }
+    }
+
+    fn expected_owner_ranks(plan: &ExpertExecutionPlan) -> Vec<usize> {
+        (0..plan.n_experts())
+            .map(|expert| plan.owner_rank(expert).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn adapt_for_rank_rejects_stale_identity_slots_and_devices() {
+        let physical = [7, 2];
+        let (plan, _) = seal_ep(8, 2, ExpertAssign::Stride, &physical);
+        assert!(adapt_expert_execution_plan(&plan, 2).is_err());
+        let mut bad = plan.clone();
+        bad.rank_ownership[1].physical_device = 999;
+        let error = adapt_expert_execution_plan(&bad, 1).unwrap_err();
+        assert!(error.contains("physical device"), "got: {error}");
+        let mut bad = plan.clone();
+        bad.rank_ownership[1].logical_rank = 0;
+        let error = adapt_expert_execution_plan(&bad, 1).unwrap_err();
+        assert!(error.contains("logical rank"), "got: {error}");
+        let mut bad = plan.clone();
+        bad.global_to_local[1][1] = Some(7);
+        let error = adapt_expert_execution_plan(&bad, 1).unwrap_err();
+        assert!(error.contains("rank map"), "got: {error}");
+        // A phantom slot for an expert owned elsewhere passes the record
+        // cross-check but breaks the owned-count agreement.
+        let mut bad = plan.clone();
+        bad.global_to_local[1][0] = Some(0);
+        let error = adapt_expert_execution_plan(&bad, 1).unwrap_err();
+        assert!(error.contains("owns"), "got: {error}");
+    }
+
+    #[test]
+    fn stale_mesh_epoch_and_physical_topology_fail_before_ownership() {
+        let (manifest, manifest_plan, specs, sources, mesh) =
+            ep_mesh_fixture(8, 2, ExpertAssign::Stride, "indexed-decode-slot-order");
+        let other_mesh = DeviceMesh::rect(&[(DimKind::Ep, 2)]).unwrap();
+        let error = plan_expert_execution(
+            &manifest,
+            &manifest_plan,
+            &specs,
+            &sources,
+            &other_mesh,
+            &[7, 2],
+        )
+        .unwrap_err();
+        assert!(error.contains("mesh epoch"), "got: {error}");
+        let error = plan_expert_execution(
+            &manifest,
+            &manifest_plan,
+            &specs,
+            &sources,
+            &mesh,
+            &[7, 2, 11],
+        )
+        .unwrap_err();
+        assert!(error.contains("physical device count"), "got: {error}");
+        let error =
+            plan_expert_execution(&manifest, &manifest_plan, &specs, &sources, &mesh, &[7, 7])
+                .unwrap_err();
+        assert!(error.contains("duplicate or invalid"), "got: {error}");
+    }
+
+    #[test]
+    fn collective_rows_cover_ep_schedules_but_not_single() {
+        let (plan, _) = seal_ep(8, 2, ExpertAssign::Stride, &[7, 2]);
+        let rows = plan.collective_rows();
+        assert_eq!(rows.len(), 3);
+        for row in rows {
+            assert!(
+                matches!(
+                    row.hint,
+                    crate::device_mesh::CollectiveHint::AllReduce { kind: DimKind::Ep }
+                ),
+                "unexpected collective row {row:?}"
+            );
+        }
+        let names = rows.iter().map(|row| row.name.as_str()).collect::<Vec<_>>();
+        assert_eq!(names, vec!["gate", "up", "down"]);
+        let (s_manifest, s_plan, s_specs, s_sources, s_mesh) = single_mesh_fixture(8);
+        let single =
+            plan_expert_execution(&s_manifest, &s_plan, &s_specs, &s_sources, &s_mesh, &[7])
+                .unwrap()
+                .pop()
+                .unwrap();
+        assert!(single.collective_rows().is_empty());
+    }
+
+    #[test]
+    fn repartition_single_to_ep_matches_a_fresh_ep_plan() {
+        for (ranks, assign) in [
+            (2, ExpertAssign::Stride),
+            (2, ExpertAssign::Contiguous),
+            (4, ExpertAssign::Stride),
+            (4, ExpertAssign::Contiguous),
+        ] {
+            let (s_manifest, s_plan, s_specs, sources, s_mesh) = single_mesh_fixture(8);
+            let single =
+                plan_expert_execution(&s_manifest, &s_plan, &s_specs, &sources, &s_mesh, &[7])
+                    .unwrap()
+                    .pop()
+                    .unwrap();
+            assert_eq!(single.parallelism(), ExpertParallelism::Single);
+            let (e_manifest, e_plan, e_specs, _, e_mesh) =
+                ep_mesh_fixture(8, ranks, assign, "indexed-decode-slot-order");
+            let physical = vec![7, 2, 11, 5][..ranks].to_vec();
+            let fresh =
+                plan_expert_execution(&e_manifest, &e_plan, &e_specs, &sources, &e_mesh, &physical)
+                    .unwrap()
+                    .pop()
+                    .unwrap();
+            let repart = repartition_expert_execution_plan(
+                &single,
+                &e_mesh,
+                &physical,
+                assign,
+                "indexed-decode-slot-order",
+            )
+            .unwrap();
+            assert_eq!(fresh, repart, "ranks={ranks} assign={assign:?}");
+            assert_eq!(repart.execution(), "indexed-decode-slot-order");
+            for rank in 0..ranks {
+                let (_, cache) = adapt_expert_execution_plan(&repart, rank).unwrap();
+                assert_eq!(cache.physical_device(), physical[rank]);
+            }
+        }
+        // Only sealed Single plans enter the transition.
+        let (plan, mesh) = seal_ep(8, 2, ExpertAssign::Stride, &[7, 2]);
+        let error =
+            repartition_expert_execution_plan(&plan, &mesh, &[7, 2], ExpertAssign::Stride, "x")
+                .unwrap_err();
+        assert!(error.contains("Single"), "got: {error}");
+    }
+
+    #[test]
+    fn execution_fingerprint_is_deterministic_and_topology_sensitive() {
+        let (plan, _) = seal_ep(8, 2, ExpertAssign::Stride, &[7, 2]);
+        assert_eq!(plan.execution_fingerprint(), plan.execution_fingerprint());
+        let baseline = plan.execution_fingerprint();
+        assert!(baseline.contains("sealed-ep/v1"));
+        let mut bad = plan.clone();
+        bad.physical_devices[0] = 999;
+        assert_ne!(bad.execution_fingerprint(), baseline);
+        let mut bad = plan.clone();
+        bad.experts[0].owner_rank = 1;
+        assert_ne!(bad.execution_fingerprint(), baseline);
+        let mut bad = plan.clone();
+        bad.execution = "other-execution".into();
+        assert_ne!(bad.execution_fingerprint(), baseline);
+        // A twin plan sealed on a fresh same-shape mesh carries a fresh
+        // epoch, so its fingerprint differs even though ownership matches.
+        let (twin, _) = seal_ep(8, 2, ExpertAssign::Stride, &[7, 2]);
+        assert_ne!(twin.execution_fingerprint(), baseline);
+        assert_eq!(
+            twin.rank_ownership(),
+            plan.rank_ownership(),
+            "twin ownership must still match"
+        );
+    }
+
+    /// Legacy per-parity partial-sum association. Diagnostic only: this is
+    /// the association a sharded EP reduction used before the canonical
+    /// slot-order fold. It must never return to production; it exists here
+    /// solely to prove the adversarial test below is non-vacuous.
+    fn legacy_even_odd_partial_output(
+        plan: &ExpertExecutionPlan,
+        ranks: &[CpuRankProgram],
+        input: &[f32],
+        residual: &[f32],
+        routes: &[(usize, f32)],
+    ) -> Result<Vec<f32>, String> {
+        validate_cpu_programs(plan, ranks, input, residual, routes)?;
+        let mut even = vec![0.0f32; plan.dimensions.hidden];
+        let mut odd = vec![0.0f32; plan.dimensions.hidden];
+        for &(expert, weight) in routes {
+            let (owner, matrices) = cpu_owner_matrices(plan, ranks, expert)?;
+            let row = cpu_expert_row(matrices, input)?;
+            let partial = if owner % 2 == 0 { &mut even } else { &mut odd };
+            for (slot, value) in partial.iter_mut().zip(row.iter()) {
+                *slot += weight * value;
+            }
+        }
+        let mut output = residual.to_vec();
+        for (out, value) in output.iter_mut().zip(even.iter()) {
+            *out += *value;
+        }
+        for (out, value) in output.iter_mut().zip(odd.iter()) {
+            *out += *value;
+        }
+        Ok(output)
+    }
+
+    fn cancel_programs(plan: &ExpertExecutionPlan) -> Vec<CpuRankProgram> {
+        const SCALES: [f32; 8] = [16777216.0, 1.0, -16777216.0, 1.0, 0.0, 0.0, 0.0, 0.0];
+        plan.rank_ownership()
+            .iter()
+            .map(|ownership| CpuRankProgram {
+                logical_rank: ownership.logical_rank,
+                physical_device: ownership.physical_device,
+                experts: ownership
+                    .global_expert_ids
+                    .iter()
+                    .map(|&expert| {
+                        let scale = SCALES[expert];
+                        let diagonal = vec![vec![scale, 0.0], vec![0.0, scale]];
+                        let identity = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
+                        (
+                            expert,
+                            CpuExpertMatrices {
+                                gate: diagonal,
+                                up: identity.clone(),
+                                down: identity,
+                            },
+                        )
+                    })
+                    .collect(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn canonical_slot_fold_matches_single_for_ep2_and_ep4_while_legacy_differs() {
+        // Slot terms: 2^24, 1, -(2^24), 1, 0, 0, 0, 0. The flat slot-order
+        // fold keeps 1.0 (2^24 + 1 rounds back to 2^24 in f32); the
+        // even/odd partial association folds 2.0 instead.
+        let routes: Vec<(usize, f32)> = (0..8).map(|expert| (expert, 1.0)).collect();
+        let (s_manifest, s_plan, s_specs, sources, s_mesh) = single_mesh_fixture(8);
+        let single = plan_expert_execution(&s_manifest, &s_plan, &s_specs, &sources, &s_mesh, &[7])
+            .unwrap()
+            .pop()
+            .unwrap();
+        let single_ranks = cancel_programs(&single);
+        let mut launches = Vec::new();
+        let single_out = execute_cpu_mesh(
+            &single,
+            &single_ranks,
+            &[1.0, 0.0],
+            &[0.0, 0.0],
+            &routes,
+            &mut launches,
+        )
+        .unwrap();
+        assert_eq!(single_out.output, vec![1.0, 0.0]);
+        assert_eq!(single_out.collective_count, 1);
+        for (ranks, assign) in [(2, ExpertAssign::Stride), (4, ExpertAssign::Stride)] {
+            let physical = vec![7, 2, 11, 5][..ranks].to_vec();
+            let (plan, _) = seal_ep(8, ranks, assign, &physical);
+            let ep_ranks = cancel_programs(&plan);
+            let mut launches = Vec::new();
+            let ep_out = execute_cpu_mesh(
+                &plan,
+                &ep_ranks,
+                &[1.0, 0.0],
+                &[0.0, 0.0],
+                &routes,
+                &mut launches,
+            )
+            .unwrap();
+            assert_eq!(launches.len(), 8);
+            assert_eq!(
+                ep_out.output, single_out.output,
+                "canonical EP{ranks} must equal Single exactly"
+            );
+            let legacy =
+                legacy_even_odd_partial_output(&plan, &ep_ranks, &[1.0, 0.0], &[0.0, 0.0], &routes)
+                    .unwrap();
+            assert_eq!(legacy, vec![2.0, 0.0]);
+            let gap = (legacy[0] - single_out.output[0]).abs();
+            assert!(
+                gap > 0.0,
+                "adversarial association must differ, got gap {gap}"
+            );
+        }
     }
 }
