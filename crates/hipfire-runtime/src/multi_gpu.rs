@@ -1883,6 +1883,206 @@ impl Gpus {
         }
         Ok(())
     }
+    /// Copy-only EP gather of raw per-slot MoE down rows into rank 0.
+    ///
+    /// `root_slots` holds `slot_owner.len()` contiguous f32 rows of
+    /// `row_floats` on rank 0; `slots_for_rank(r)` holds the same layout on
+    /// rank `r`. Slot `s` is copied from rank `slot_owner[s]` into the same
+    /// slot offset of `root_slots`. Owners come from the caller-provided
+    /// sealed mapping — no stride or ownership logic lives here.
+    ///
+    /// Copy-only: performs no arithmetic on row values and allocates no peer
+    /// scratch (destination rows already exist). Adjacent slots with the same
+    /// owner move as one `boundary_copy` span via `DeviceBuffer::byte_view`;
+    /// root-owned slots skip the self-copy. Every rank, owner, checked byte
+    /// count, and capacity is preflighted BEFORE the first copy; `n == 1`
+    /// with all-root owners is a no-op.
+    pub fn gather_slots_to_root_f32<'a>(
+        &self,
+        root_slots: &DeviceBuffer,
+        slots_for_rank: impl Fn(usize) -> &'a DeviceBuffer,
+        slot_owner: &[usize],
+        row_floats: usize,
+    ) -> HipResult<()> {
+        let n = self.devices.len();
+        if n == 0 {
+            return Err(HipError::new(0, "gather_slots_to_root_f32: no devices"));
+        }
+        let mut rank_bytes = Vec::with_capacity(n);
+        for rank in 0..n {
+            rank_bytes.push(slots_for_rank(rank).size());
+        }
+        let spans =
+            check_ep_gather_slots(n, slot_owner, row_floats, &rank_bytes, root_slots.size())
+                .map_err(|e| HipError::new(0, &format!("gather_slots_to_root_f32: {e}")))?;
+        let row_bytes = row_floats
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| HipError::new(0, "gather_slots_to_root_f32: row byte count overflow"))?;
+        if n == 1 || row_bytes == 0 || spans.is_empty() {
+            return Ok(());
+        }
+        let mut events = Vec::with_capacity(spans.len());
+        for (owner, start_slot, len_slots) in spans {
+            if owner == 0 {
+                continue;
+            }
+            let byte_offset = start_slot.checked_mul(row_bytes).ok_or_else(|| {
+                HipError::new(0, "gather_slots_to_root_f32: span offset overflow")
+            })?;
+            let byte_len = len_slots.checked_mul(row_bytes).ok_or_else(|| {
+                HipError::new(0, "gather_slots_to_root_f32: span length overflow")
+            })?;
+            let src = slots_for_rank(owner).byte_view(byte_offset, byte_len);
+            let dst = root_slots.byte_view(byte_offset, byte_len);
+            events.push(self.boundary_copy(owner, 0, &src, &dst, byte_len)?);
+        }
+        for event in events {
+            self.wait_boundary(event)?;
+        }
+        Ok(())
+    }
+
+    /// Copy-only EP broadcast of the finalized root residual row (overwrite).
+    ///
+    /// `root_row` holds `row_floats` f32 on rank 0; `row_for_rank(r)` holds
+    /// at least one such row on rank `r`. Every non-root destination is
+    /// overwritten with the root bytes — never added into. Copy-only: no
+    /// arithmetic, no scratch. Full preflight BEFORE the first copy;
+    /// `n == 1` is a no-op.
+    pub fn broadcast_root_row_f32<'a>(
+        &self,
+        root_row: &DeviceBuffer,
+        row_for_rank: impl Fn(usize) -> &'a DeviceBuffer,
+        row_floats: usize,
+    ) -> HipResult<()> {
+        let n = self.devices.len();
+        if n == 0 {
+            return Err(HipError::new(0, "broadcast_root_row_f32: no devices"));
+        }
+        let mut rank_bytes = Vec::with_capacity(n);
+        for rank in 0..n {
+            rank_bytes.push(row_for_rank(rank).size());
+        }
+        let row_bytes = check_ep_broadcast_row(n, row_floats, &rank_bytes, root_row.size())
+            .map_err(|e| HipError::new(0, &format!("broadcast_root_row_f32: {e}")))?;
+        if n == 1 || row_bytes == 0 {
+            return Ok(());
+        }
+        let src = root_row.byte_view(0, row_bytes);
+        let mut events = Vec::with_capacity(n - 1);
+        for rank in 1..n {
+            let dst = row_for_rank(rank).byte_view(0, row_bytes);
+            events.push(self.boundary_copy(0, rank, &src, &dst, row_bytes)?);
+        }
+        for event in events {
+            self.wait_boundary(event)?;
+        }
+        Ok(())
+    }
+}
+
+/// Pure preflight for [`Gpus::gather_slots_to_root_f32`]: validates rank
+/// count, owner range, checked f32 byte counts, and slot-buffer capacities,
+/// and groups adjacent same-owner slots into `(owner, start_slot, len_slots)`
+/// spans in slot order. No GPU access, no allocation beyond the span list.
+/// `rank_bytes[r]` is rank `r`'s slot-buffer size in bytes; `root_bytes` is
+/// rank 0's. Empty owners or zero `row_floats` plan no copies (`Ok(vec![])`).
+pub fn check_ep_gather_slots(
+    n_ranks: usize,
+    slot_owner: &[usize],
+    row_floats: usize,
+    rank_bytes: &[usize],
+    root_bytes: usize,
+) -> Result<Vec<(usize, usize, usize)>, String> {
+    if n_ranks == 0 {
+        return Err("n_ranks must be >= 1".to_string());
+    }
+    if rank_bytes.len() != n_ranks {
+        return Err(format!(
+            "rank_bytes.len()={} != n_ranks={n_ranks}",
+            rank_bytes.len()
+        ));
+    }
+    let row_bytes = row_floats
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| "row_floats*4 byte count overflow".to_string())?;
+    for (slot, &owner) in slot_owner.iter().enumerate() {
+        if owner >= n_ranks {
+            return Err(format!(
+                "slot {slot} owner {owner} out of range (n_ranks={n_ranks})"
+            ));
+        }
+    }
+    if slot_owner.is_empty() || row_bytes == 0 {
+        return Ok(Vec::new());
+    }
+    let total_bytes = slot_owner
+        .len()
+        .checked_mul(row_bytes)
+        .ok_or_else(|| "slots*row_bytes byte count overflow".to_string())?;
+    if root_bytes < total_bytes {
+        return Err(format!(
+            "root slot buffer has {root_bytes} bytes, needs {total_bytes}"
+        ));
+    }
+    for (rank, &bytes) in rank_bytes.iter().enumerate() {
+        if bytes < total_bytes {
+            return Err(format!(
+                "rank {rank} slot buffer has {bytes} bytes, needs {total_bytes}"
+            ));
+        }
+    }
+    let mut spans: Vec<(usize, usize, usize)> = Vec::new();
+    let mut start = 0;
+    while start < slot_owner.len() {
+        let owner = slot_owner[start];
+        let mut end = start + 1;
+        while end < slot_owner.len() && slot_owner[end] == owner {
+            end += 1;
+        }
+        spans.push((owner, start, end - start));
+        start = end;
+    }
+    Ok(spans)
+}
+
+/// Pure preflight for [`Gpus::broadcast_root_row_f32`]: validates rank count,
+/// the checked f32 row byte count, and per-rank row capacities. Returns the
+/// row byte count. Zero `row_floats` plans no copy (`Ok(0)`).
+pub fn check_ep_broadcast_row(
+    n_ranks: usize,
+    row_floats: usize,
+    rank_bytes: &[usize],
+    root_bytes: usize,
+) -> Result<usize, String> {
+    if n_ranks == 0 {
+        return Err("n_ranks must be >= 1".to_string());
+    }
+    if rank_bytes.len() != n_ranks {
+        return Err(format!(
+            "rank_bytes.len()={} != n_ranks={n_ranks}",
+            rank_bytes.len()
+        ));
+    }
+    let row_bytes = row_floats
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| "row_floats*4 byte count overflow".to_string())?;
+    if row_bytes == 0 {
+        return Ok(0);
+    }
+    if root_bytes < row_bytes {
+        return Err(format!(
+            "root row buffer has {root_bytes} bytes, needs {row_bytes}"
+        ));
+    }
+    for (rank, &bytes) in rank_bytes.iter().enumerate() {
+        if bytes < row_bytes {
+            return Err(format!(
+                "rank {rank} row buffer has {bytes} bytes, needs {row_bytes}"
+            ));
+        }
+    }
+    Ok(row_bytes)
 }
 
 /// Pure-TP PP band metadata: length `tp_size`, rank 0 owns every layer and
@@ -2203,5 +2403,275 @@ mod tests {
         let tp = DeviceMesh::rect(&[(DimKind::Tp, 4)]).unwrap();
         assert_eq!(tp.size_of(DimKind::Tp), 4);
         assert_eq!(tp.size_of(DimKind::Ep), 1);
+    }
+
+    #[test]
+    fn ep_gather_spans_group_adjacent_same_owner_ep2() {
+        // Arbitrary owner array (NOT stride-derived): adjacent same-owner
+        // slots merge into one copy span. row_floats=4 -> row_bytes=16,
+        // 8 slots -> total 128 bytes.
+        let spans = check_ep_gather_slots(2, &[0, 1, 1, 0, 0, 1, 0, 1], 4, &[128, 128], 128)
+            .expect("valid EP2 gather");
+        assert_eq!(
+            spans,
+            vec![
+                (0, 0, 1),
+                (1, 1, 2),
+                (0, 3, 2),
+                (1, 5, 1),
+                (0, 6, 1),
+                (1, 7, 1)
+            ]
+        );
+    }
+
+    #[test]
+    fn ep_gather_spans_group_adjacent_same_owner_ep4() {
+        // Arbitrary 4-owner array: maximal same-owner runs only.
+        let spans =
+            check_ep_gather_slots(4, &[3, 3, 1, 1, 1, 0, 2, 2], 4, &[128, 128, 128, 128], 128)
+                .expect("valid EP4 gather");
+        assert_eq!(spans, vec![(3, 0, 2), (1, 2, 3), (0, 5, 1), (2, 6, 2)]);
+    }
+
+    #[test]
+    fn ep_gather_spans_degenerate_groupings() {
+        // All slots one owner -> a single span (one boundary_copy).
+        let spans =
+            check_ep_gather_slots(2, &[1, 1, 1, 1], 4, &[64, 64], 64).expect("single-owner gather");
+        assert_eq!(spans, vec![(1, 0, 4)]);
+        // Fully alternating owners -> one span per slot.
+        let owners: Vec<usize> = (0..8).map(|s| s % 2).collect();
+        let spans =
+            check_ep_gather_slots(2, &owners, 4, &[128, 128], 128).expect("alternating gather");
+        assert_eq!(spans.len(), 8);
+        for (s, (owner, start, len)) in spans.iter().enumerate() {
+            assert_eq!((*owner, *start, *len), (s % 2, s, 1));
+        }
+        // Empty owners / zero row_floats plan no copies.
+        assert_eq!(
+            check_ep_gather_slots(2, &[], 4, &[128, 128], 128).expect("empty owners"),
+            Vec::new()
+        );
+        assert_eq!(
+            check_ep_gather_slots(2, &[0, 1], 0, &[128, 128], 128).expect("zero rows"),
+            Vec::new()
+        );
+    }
+
+    #[test]
+    fn ep_gather_n1_plans_root_only_spans() {
+        // N=1: every span is root-owned, so `gather_slots_to_root_f32`
+        // skips all self-copies and performs zero copies (no-op).
+        let spans = check_ep_gather_slots(1, &[0, 0, 0], 4, &[48], 48).expect("N=1 gather");
+        assert_eq!(spans, vec![(0, 0, 3)]);
+        assert!(spans.iter().all(|(owner, _, _)| *owner == 0));
+        // Broadcast N=1 validates and returns the row bytes; the method
+        // short-circuits before any copy.
+        assert_eq!(
+            check_ep_broadcast_row(1, 16, &[64], 64).expect("N=1 bcast"),
+            64
+        );
+    }
+
+    #[test]
+    fn ep_gather_rejects_bad_owner_rank_and_capacity() {
+        // Zero ranks rejected.
+        assert!(check_ep_gather_slots(0, &[0], 4, &[], 16).is_err());
+        // rank_bytes length must match n_ranks.
+        assert!(check_ep_gather_slots(2, &[0, 1], 4, &[32], 32).is_err());
+        // Owner out of range (including huge) rejected.
+        assert!(check_ep_gather_slots(2, &[0, 2], 4, &[32, 32], 32).is_err());
+        assert!(check_ep_gather_slots(2, &[usize::MAX], 4, &[32, 32], 32).is_err());
+        // Root buffer too small rejected.
+        assert!(check_ep_gather_slots(2, &[0, 1], 4, &[32, 32], 31).is_err());
+        // Any rank buffer too small rejected (all ranks hold full k rows).
+        assert!(check_ep_gather_slots(2, &[0, 1], 4, &[32, 31], 32).is_err());
+        assert!(check_ep_gather_slots(2, &[0, 1], 4, &[31, 32], 32).is_err());
+    }
+
+    #[test]
+    fn ep_transport_checked_byte_math() {
+        // Exact: hidden 2048 -> 8192 row bytes; k=8 slots -> 64 KiB total.
+        let row_bytes =
+            check_ep_broadcast_row(2, 2048, &[8192, 8192], 8192).expect("2048-float row");
+        assert_eq!(row_bytes, 8192);
+        let spans =
+            check_ep_gather_slots(2, &[0, 1, 0, 1, 0, 1, 0, 1], 2048, &[65536, 65536], 65536)
+                .expect("8x2048 gather");
+        assert_eq!(spans.len(), 8);
+        // row_floats*4 overflow rejected on both paths.
+        assert!(check_ep_gather_slots(2, &[0], usize::MAX, &[16, 16], 16).is_err());
+        assert!(check_ep_broadcast_row(2, usize::MAX, &[16, 16], 16).is_err());
+        // slots*row_bytes overflow rejected: row_bytes fits, total does not.
+        let big_row = usize::MAX / 4;
+        assert!(check_ep_gather_slots(2, &[0, 1], big_row, &[16, 16], 16).is_err());
+        // Broadcast capacity rejection incl. zero ranks and len mismatch.
+        assert!(check_ep_broadcast_row(2, 4, &[16, 15], 16).is_err());
+        assert!(check_ep_broadcast_row(2, 4, &[16, 16], 15).is_err());
+        assert!(check_ep_broadcast_row(0, 4, &[], 16).is_err());
+        assert!(check_ep_broadcast_row(2, 4, &[16], 16).is_err());
+        // Zero row_floats is a no-op plan.
+        assert_eq!(
+            check_ep_broadcast_row(2, 0, &[16, 16], 16).expect("zero row"),
+            0
+        );
+    }
+
+    /// 2-GPU EP slot-row transport round-trip: gather + broadcast.
+    ///
+    /// This test proves TRANSPORT ONLY (copy plumbing), not model parity:
+    /// it writes distinguishable raw f32 rows on each rank, gathers a mixed
+    /// owner pattern into rank 0, verifies the root rows byte-for-byte,
+    /// broadcasts a root residual row, and verifies the overwrite
+    /// byte-for-byte. No weights are applied and no kernel folds slots here.
+    ///
+    /// Run serialized under the GPU lock:
+    /// ```sh
+    /// HIP_VISIBLE_DEVICES=0,1 flock -w 3600 /tmp/hipfire-gpu.lock \
+    /// cargo test -p hipfire-runtime --locked --lib multi_gpu -- \
+    /// --ignored --exact --test-threads=1 multi_gpu::tests::ep_slot_row_transport_2gpu
+    /// ```
+    #[test]
+    #[ignore]
+    fn ep_slot_row_transport_2gpu() {
+        const ROW_FLOATS: usize = 16;
+        const ROW_BYTES: usize = ROW_FLOATS * 4;
+        const K: usize = 8;
+        const OWNERS: [usize; K] = [0, 1, 1, 0, 1, 0, 0, 1];
+
+        fn slot_row_bytes(rank: usize, slot: usize) -> Vec<u8> {
+            let mut out = Vec::with_capacity(ROW_BYTES);
+            for lane in 0..ROW_FLOATS {
+                let v = (rank * 1000 + slot * ROW_FLOATS + lane) as f32;
+                out.extend_from_slice(&v.to_ne_bytes());
+            }
+            out
+        }
+
+        let gpus = Gpus::init_ep(2, 1).expect("init_ep(2,1) — run with HIP_VISIBLE_DEVICES=0,1");
+        assert_eq!(gpus.devices.len(), 2);
+
+        // Per-rank k-slot row buffers plus one residual row buffer per rank.
+        let mut slot_bufs = Vec::with_capacity(2);
+        let mut row_bufs = Vec::with_capacity(2);
+        for rank in 0..2 {
+            gpus.devices[rank].bind_thread().expect("bind alloc");
+            slot_bufs.push(
+                gpus.devices[rank]
+                    .hip
+                    .malloc(K * ROW_BYTES)
+                    .expect("malloc slots"),
+            );
+            row_bufs.push(
+                gpus.devices[rank]
+                    .hip
+                    .malloc(ROW_BYTES)
+                    .expect("malloc row"),
+            );
+        }
+
+        // Rank buffers hold their own distinguishable rows for every slot.
+        for rank in 0..2 {
+            let mut host = Vec::with_capacity(K * ROW_BYTES);
+            for slot in 0..K {
+                host.extend_from_slice(&slot_row_bytes(rank, slot));
+            }
+            gpus.devices[rank].bind_thread().expect("bind htod slots");
+            gpus.devices[rank]
+                .hip
+                .memcpy_htod(&slot_bufs[rank], &host)
+                .expect("htod slots");
+        }
+        // Root starts with sentinel rows where remote-owned rows will land,
+        // proving only those rows are overwritten (root-owned rows already
+        // match because the self-copy is skipped, never re-copied).
+        {
+            let mut host = Vec::with_capacity(K * ROW_BYTES);
+            for slot in 0..K {
+                if OWNERS[slot] == 0 {
+                    host.extend_from_slice(&slot_row_bytes(0, slot));
+                } else {
+                    for _ in 0..ROW_FLOATS {
+                        host.extend_from_slice(&(-999.0f32).to_ne_bytes());
+                    }
+                }
+            }
+            gpus.devices[0].bind_thread().expect("bind htod root");
+            gpus.devices[0]
+                .hip
+                .memcpy_htod(&slot_bufs[0], &host)
+                .expect("htod root");
+        }
+
+        gpus.gather_slots_to_root_f32(&slot_bufs[0], |r| &slot_bufs[r], &OWNERS, ROW_FLOATS)
+            .expect("gather_slots_to_root_f32");
+        for rank in 0..2 {
+            gpus.devices[rank].bind_thread().expect("bind sync");
+            gpus.devices[rank]
+                .hip
+                .device_synchronize()
+                .expect("sync after gather");
+        }
+        let mut got = vec![0u8; K * ROW_BYTES];
+        gpus.devices[0].bind_thread().expect("bind dtoh root");
+        gpus.devices[0]
+            .hip
+            .memcpy_dtoh(&mut got, &slot_bufs[0])
+            .expect("dtoh root");
+        let mut want = Vec::with_capacity(K * ROW_BYTES);
+        for slot in 0..K {
+            want.extend_from_slice(&slot_row_bytes(OWNERS[slot], slot));
+        }
+        assert_eq!(got, want, "root rows must equal owner rows byte-for-byte");
+
+        // Broadcast: root residual overwrites the non-root row byte-for-byte.
+        let mut residual = Vec::with_capacity(ROW_BYTES);
+        for lane in 0..ROW_FLOATS {
+            residual.extend_from_slice(&((10000 + lane) as f32).to_ne_bytes());
+        }
+        let sentinel = (-777.0f32).to_ne_bytes();
+        let mut sentinel_row = Vec::with_capacity(ROW_BYTES);
+        for _ in 0..ROW_FLOATS {
+            sentinel_row.extend_from_slice(&sentinel);
+        }
+        gpus.devices[0].bind_thread().expect("bind htod residual");
+        gpus.devices[0]
+            .hip
+            .memcpy_htod(&row_bufs[0], &residual)
+            .expect("htod residual");
+        gpus.devices[1].bind_thread().expect("bind htod sentinel");
+        gpus.devices[1]
+            .hip
+            .memcpy_htod(&row_bufs[1], &sentinel_row)
+            .expect("htod sentinel");
+        gpus.broadcast_root_row_f32(&row_bufs[0], |r| &row_bufs[r], ROW_FLOATS)
+            .expect("broadcast_root_row_f32");
+        for rank in 0..2 {
+            gpus.devices[rank].bind_thread().expect("bind sync bcast");
+            gpus.devices[rank]
+                .hip
+                .device_synchronize()
+                .expect("sync after broadcast");
+        }
+        let mut got_row = vec![0u8; ROW_BYTES];
+        gpus.devices[1].bind_thread().expect("bind dtoh bcast");
+        gpus.devices[1]
+            .hip
+            .memcpy_dtoh(&mut got_row, &row_bufs[1])
+            .expect("dtoh bcast");
+        assert_eq!(
+            got_row, residual,
+            "non-root row must equal root bytes exactly"
+        );
+
+        for (rank, buf) in slot_bufs.into_iter().enumerate() {
+            gpus.devices[rank].bind_thread().expect("bind free slots");
+            let _ = gpus.devices[rank].hip.free(buf);
+        }
+        for (rank, buf) in row_bufs.into_iter().enumerate() {
+            gpus.devices[rank].bind_thread().expect("bind free row");
+            let _ = gpus.devices[rank].hip.free(buf);
+        }
     }
 }
