@@ -9,11 +9,13 @@ use super::config::LayerType;
 use super::config::Qwen35Config;
 use hip_bridge::HipError;
 use hip_bridge::HipResult;
+use hipfire_runtime::device_mesh::DeviceMesh;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::EmbeddingFormat;
 use hipfire_runtime::llama::WeightTensor;
 use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_runtime::screen_weight_tensor;
+use hipfire_runtime::tp_shard::ExpertAssign;
 use hipfire_runtime::MmqScreenable;
 use rdna_compute::DType;
 use rdna_compute::Gpu;
@@ -356,26 +358,50 @@ fn source_bytes(source: &MoeProjectionSource, fused_half: bool) -> HipResult<usi
     Ok(half)
 }
 
-/// Construct the one runtime-owned Single plan and dispatch metadata pair for
-/// a loaded routed expert set.  All source names, shapes, bytes, tags, bases,
-/// and sidecars are captured before any expert buffer is uploaded.
+/// Planning target for [`build_expert_binding`]: replicated Single owners or
+/// sealed expert-parallel owners on an explicit mesh. The EP variant carries
+/// the mesh, the full physical device list, the loading rank, and the planner
+/// assignment — ownership always comes back out of the sealed planner, never
+/// from a hand-built expert map.
+pub(crate) enum ExpertBindingTarget<'a> {
+    Single {
+        physical_device: i32,
+    },
+    ExpertParallel {
+        mesh: &'a DeviceMesh,
+        physical_devices: &'a [i32],
+        local_rank: usize,
+        assignment: ExpertAssign,
+    },
+}
+
+/// Construct the runtime-owned sealed plan and dispatch metadata pair for a
+/// loaded routed expert set. All source names, shapes, bytes, tags, bases,
+/// and sidecars are captured before any expert buffer is uploaded. Single
+/// keeps replicated policies and `indexed-single`; EP emits `ExpertSharded`
+/// policies, `ExpertParallelism::ExpertParallel`, and the canonical
+/// indexed-slot execution, then runs the ordinary planner plus the C1
+/// rank-aware adapter.
 pub(crate) fn build_expert_binding(
     records: Box<[MoeExpertSourceRecord]>,
     router: MoeProjectionSource,
     sidecars: Vec<MoeProjectionSource>,
     layer_idx: usize,
     n_layers: usize,
-    physical_device: i32,
+    target: ExpertBindingTarget<'_>,
 ) -> HipResult<(
     hipfire_runtime::sealed_moe::ExpertExecutionPlan,
     hipfire_dispatch::pipeline::sealed_moe::ExpertTable,
     hipfire_dispatch::pipeline::sealed_moe::ExpertBindingCache,
 )> {
-    use hipfire_runtime::sealed_moe::{plan_single_expert_execution, ExpertSourceMetadata};
-    use hipfire_runtime::tp_shard::ExpertAssign;
+    use hipfire_dispatch::pipeline::sealed_moe::CANONICAL_EP_EXECUTION;
+    use hipfire_runtime::sealed_moe::{
+        adapt_expert_execution_plan, plan_expert_execution, plan_single_expert_execution,
+        ExpertSourceMetadata,
+    };
     use hipfire_runtime::weight_manifest::{
-        ExpertGroupSpec, ExpertParallelism, ExpertProjectionResources, ExpertResourceRequirements,
-        ExpertSourceLayout, ShardPolicy, WeightEntry,
+        plan_manifest, ExpertGroupSpec, ExpertParallelism, ExpertProjectionResources,
+        ExpertResourceRequirements, ExpertSourceLayout, ShardPolicy, WeightEntry,
     };
     if records.is_empty() {
         return Err(HipError::new(0, "cannot bind an empty expert source set"));
@@ -507,6 +533,15 @@ pub(crate) fn build_expert_binding(
             .ok_or_else(|| HipError::new(0, "expert gate source has no rows"))?
     };
     let manifest_dtype = first_gate.dtype;
+    // Expert projections replicate on Single and shard on EP; the router and
+    // every sidecar replicate on both targets.
+    let expert_policy = match &target {
+        ExpertBindingTarget::Single { .. } => ShardPolicy::Replicate,
+        ExpertBindingTarget::ExpertParallel { assignment, .. } => ShardPolicy::ExpertSharded {
+            n_experts,
+            assign: *assignment,
+        },
+    };
     let mut manifest = Vec::with_capacity(4 + source_by_name.len());
     manifest.push(WeightEntry::layer(
         router.name.clone(),
@@ -521,7 +556,7 @@ pub(crate) fn build_expert_binding(
             layer_idx,
             vec![n_experts, first_gate.shape[0], hidden],
             manifest_dtype,
-            ShardPolicy::Replicate,
+            expert_policy.clone(),
         ));
     }
     if !fused {
@@ -531,7 +566,7 @@ pub(crate) fn build_expert_binding(
                 layer_idx,
                 vec![n_experts, first_up.shape[0], hidden],
                 manifest_dtype,
-                ShardPolicy::Replicate,
+                expert_policy.clone(),
             ));
         }
     }
@@ -542,7 +577,7 @@ pub(crate) fn build_expert_binding(
             layer_idx,
             vec![n_experts, down_shape[0], down_shape[1]],
             records[0].down.dtype,
-            ShardPolicy::Replicate,
+            expert_policy.clone(),
         )
     }));
     for name in &sidecar_names {
@@ -557,12 +592,24 @@ pub(crate) fn build_expert_binding(
             ShardPolicy::Replicate,
         ));
     }
+    let (parallelism, spec_assignment, execution) = match &target {
+        ExpertBindingTarget::Single { .. } => (
+            ExpertParallelism::Single,
+            ExpertAssign::Stride,
+            "indexed-single".to_string(),
+        ),
+        ExpertBindingTarget::ExpertParallel { assignment, .. } => (
+            ExpertParallelism::ExpertParallel,
+            *assignment,
+            CANONICAL_EP_EXECUTION.to_string(),
+        ),
+    };
     let spec = ExpertGroupSpec {
         group: format!("qwen35.moe.layer.{layer_idx}"),
         layer: Some(layer_idx),
         n_experts,
-        parallelism: ExpertParallelism::Single,
-        assignment: ExpertAssign::Stride,
+        parallelism: parallelism,
+        assignment: spec_assignment,
         source_layout: if fused {
             ExpertSourceLayout::PerExpertFused {
                 gate_up: gate_names,
@@ -579,12 +626,49 @@ pub(crate) fn build_expert_binding(
         },
         resources: ExpertResourceRequirements::new(resources),
         router: router.name,
-        execution: "indexed-single".to_string(),
+        execution: execution,
     };
     let sources: Vec<ExpertSourceMetadata> = source_by_name.into_values().collect();
-    let (plan, table, cache) =
-        plan_single_expert_execution(&manifest, &spec, &sources, n_layers, physical_device)
+    let (plan, table, cache) = match &target {
+        ExpertBindingTarget::Single { physical_device } => {
+            plan_single_expert_execution(&manifest, &spec, &sources, n_layers, *physical_device)
+                .map_err(|error| HipError::new(0, &error))?
+        }
+        ExpertBindingTarget::ExpertParallel {
+            mesh,
+            physical_devices,
+            local_rank,
+            ..
+        } => {
+            // The ordinary manifest + expert planners: ownership, local slots,
+            // and the collective schedule come from the sealed plan, never
+            // from a hand-built expert map.
+            let manifest_plan = plan_manifest(&manifest, &[], mesh, n_layers)
+                .map_err(|error| HipError::new(0, &error))?;
+            let mut plans = plan_expert_execution(
+                &manifest,
+                &manifest_plan,
+                std::slice::from_ref(&spec),
+                &sources,
+                mesh,
+                physical_devices,
+            )
             .map_err(|error| HipError::new(0, &error))?;
+            if plans.len() != 1 {
+                return Err(HipError::new(
+                    0,
+                    &format!(
+                        "qwen35: EP expert planner returned {} plans, expected exactly one",
+                        plans.len()
+                    ),
+                ));
+            }
+            let plan = plans.pop().expect("exactly one EP expert plan");
+            let (table, cache) = adapt_expert_execution_plan(&plan, *local_rank)
+                .map_err(|error| HipError::new(0, &error))?;
+            (plan, table, cache)
+        }
+    };
     Ok((plan, table, cache))
 }
 
@@ -620,8 +704,482 @@ pub(crate) fn test_expert_binding() -> HipResult<(
         Vec::new(),
         0,
         1,
-        0,
+        ExpertBindingTarget::Single { physical_device: 0 },
     )
+}
+#[cfg(test)]
+mod sealed_ep_owner_tests {
+    use super::*;
+    use hipfire_runtime::device_mesh::DimKind;
+    use hipfire_runtime::tp_shard::ShardConfig;
+
+    fn test_source(name: &str, shape: Vec<usize>, encoded_bytes: usize) -> MoeProjectionSource {
+        MoeProjectionSource {
+            name: name.to_string(),
+            fingerprint: "test-owner".to_string(),
+            shape,
+            dtype: DType::F32,
+            encoded_bytes,
+            row_stride: 4,
+            alignment: 1,
+            quant_tag: "test-f32".to_string(),
+            basis: "None".to_string(),
+            sidecars: Box::new([]),
+        }
+    }
+
+    fn test_records(n_experts: usize) -> Box<[MoeExpertSourceRecord]> {
+        (0..n_experts)
+            .map(|expert| MoeExpertSourceRecord {
+                gate_up: Some(test_source(
+                    &format!("test.expert.{expert}.gate_up"),
+                    vec![2, 1],
+                    8,
+                )),
+                gate: None,
+                up: None,
+                down: test_source(&format!("test.expert.{expert}.down"), vec![1, 1], 4),
+            })
+            .collect()
+    }
+    fn ep_mesh(n_ranks: usize) -> DeviceMesh {
+        DeviceMesh::rect(&[(DimKind::Ep, n_ranks)]).expect("test EP mesh")
+    }
+    /// Build one layer's sealed EP binding for `local_rank` and assert the
+    /// frozen ownership invariants: the rank's local expert sequence equals
+    /// `rank_ownership.global_expert_ids`, every global entry matches
+    /// `global_to_local`, and the cache names the sealed physical device.
+    fn exercise_ep_binding(
+        n_experts: usize,
+        n_ranks: usize,
+        assignment: ExpertAssign,
+        expected_owned: &[Vec<usize>],
+    ) {
+        let mesh = ep_mesh(n_ranks);
+        let physical_devices: Vec<i32> = (0..n_ranks as i32).collect();
+        // The EP planner requires the router source to lead with n_experts
+        // rows (production builds `[n_exp, dim]`); the Single unit path
+        // tolerates the degenerate `[1, 1]` carrier.
+        let router = test_source("test.router", vec![n_experts, 1], n_experts * 4);
+        for (rank, expected) in expected_owned.iter().enumerate() {
+            let (plan, table, cache) = build_expert_binding(
+                test_records(n_experts),
+                router.clone(),
+                Vec::new(),
+                0,
+                1,
+                ExpertBindingTarget::ExpertParallel {
+                    mesh: &mesh,
+                    physical_devices: &physical_devices,
+                    local_rank: rank,
+                    assignment,
+                },
+            )
+            .unwrap_or_else(|e| panic!("EP binding rank {rank}: {e:?}"));
+            assert_eq!(
+                plan.rank_ownership()[rank].global_expert_ids,
+                *expected,
+                "rank {rank} local expert sequence"
+            );
+            assert_eq!(plan.rank_ownership()[rank].logical_rank, rank);
+            assert_eq!(
+                plan.rank_ownership()[rank].physical_device,
+                physical_devices[rank]
+            );
+            for (slot, &global) in expected.iter().enumerate() {
+                assert_eq!(
+                    plan.global_to_local()[rank][global],
+                    Some(slot),
+                    "rank {rank} slot {slot} global {global}"
+                );
+            }
+            // Every global has exactly one owner across all ranks.
+            for global in 0..n_experts {
+                let owners = (0..n_ranks)
+                    .filter(|&r| plan.global_to_local()[r][global].is_some())
+                    .collect::<Vec<_>>();
+                assert_eq!(owners, vec![plan.owner_rank(global).expect("owner")]);
+            }
+            assert_eq!(cache.local_rank(), rank);
+            assert_eq!(cache.physical_device(), physical_devices[rank]);
+            assert_eq!(cache.local_expert_ids(), expected.as_slice());
+            let contract = table
+                .execution_contract()
+                .expect("sealed EP table carries a contract");
+            assert!(contract.is_canonical_ep(), "canonical EP execution");
+            assert_eq!(
+                plan_expert_to_rank(&plan),
+                (0..n_experts)
+                    .map(|global| plan.owner_rank(global).expect("owner") as u8)
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn ep_stride_ownership_is_plan_derived() {
+        exercise_ep_binding(4, 2, ExpertAssign::Stride, &[vec![0, 2], vec![1, 3]]);
+    }
+
+    #[test]
+    fn ep_contiguous_ownership_is_plan_derived() {
+        exercise_ep_binding(4, 2, ExpertAssign::Contiguous, &[vec![0, 1], vec![2, 3]]);
+    }
+
+    #[test]
+    fn ep4_stride_local_slots_are_compact() {
+        exercise_ep_binding(
+            8,
+            4,
+            ExpertAssign::Stride,
+            &[vec![0, 4], vec![1, 5], vec![2, 6], vec![3, 7]],
+        );
+    }
+
+    #[test]
+    fn ep_assignment_inference_rejects_arbitrary_maps() {
+        let stride = ShardConfig::new(2, true, 4, ExpertAssign::Stride).expect("stride");
+        assert_eq!(
+            infer_ep_assignment(&stride, 4).expect("stride"),
+            ExpertAssign::Stride
+        );
+        let contiguous =
+            ShardConfig::new(2, true, 4, ExpertAssign::Contiguous).expect("contiguous");
+        assert_eq!(
+            infer_ep_assignment(&contiguous, 4).expect("contiguous"),
+            ExpertAssign::Contiguous
+        );
+        let arbitrary = ShardConfig {
+            tp_size: 2,
+            tp_kv_replicate: true,
+            expert_to_rank: vec![0, 0, 0, 1],
+        };
+        assert!(
+            infer_ep_assignment(&arbitrary, 4).is_err(),
+            "arbitrary expert maps are rejected"
+        );
+        let short = ShardConfig {
+            tp_size: 2,
+            tp_kv_replicate: true,
+            expert_to_rank: vec![0, 1, 0],
+        };
+        assert!(infer_ep_assignment(&short, 4).is_err(), "short maps fail");
+        // Balanced-contiguous over 2 experts on 4 ranks strands ranks 2-3.
+        let stranded = ShardConfig {
+            tp_size: 4,
+            tp_kv_replicate: true,
+            expert_to_rank: vec![0, 1],
+        };
+        assert!(
+            infer_ep_assignment(&stranded, 2).is_err(),
+            "zero-owner ranks are rejected"
+        );
+    }
+}
+
+// ─── Sealed EP owner helpers ────────────────────────────────────────────────
+//
+// Shared by the streaming EP loader (`load::load_weights_ep_rank`) and the
+// two-phase post-load shard (`forward::shard_moe_experts`). Every helper
+// derives ownership, geometry, and tags from a sealed
+// [`hipfire_runtime::sealed_moe::ExpertExecutionPlan`]; nothing here
+// reconstructs `e % N` or consults a caller map after the plan exists.
+
+/// Infer the planner assignment a `ShardConfig` map encodes, rejecting
+/// everything else before any GPU allocation. Only exact Stride
+/// (`expert_to_rank[e] == e % tp`) and exact Contiguous (balanced ranges)
+/// maps are admitted; arbitrary expert maps, short/long maps, out-of-range
+/// ranks, and ranks left with zero owners all fail here.
+pub(crate) fn infer_ep_assignment(
+    shard: &hipfire_runtime::tp_shard::ShardConfig,
+    n_experts: usize,
+) -> HipResult<ExpertAssign> {
+    use hipfire_runtime::tp_shard::ShardConfig;
+    let tp = shard.tp_size;
+    if tp == 0 {
+        return Err(HipError::new(0, "qwen35: EP shard has no ranks"));
+    }
+    if n_experts == 0 {
+        return Err(HipError::new(0, "qwen35: EP sharding needs routed experts"));
+    }
+    if shard.expert_to_rank.len() != n_experts {
+        return Err(HipError::new(
+            0,
+            &format!(
+                "qwen35: EP shard map covers {} experts, expected {n_experts}",
+                shard.expert_to_rank.len()
+            ),
+        ));
+    }
+    let stride = (0..n_experts).all(|expert| shard.expert_to_rank[expert] as usize == expert % tp);
+    let contiguous = (0..tp).all(|rank| {
+        ShardConfig::balanced_range(rank, tp, n_experts)
+            .all(|expert| shard.expert_to_rank[expert] as usize == rank)
+    });
+    let assignment = if stride {
+        ExpertAssign::Stride
+    } else if contiguous {
+        ExpertAssign::Contiguous
+    } else {
+        return Err(HipError::new(
+            0,
+            "qwen35: EP shard map is neither Stride nor Contiguous; arbitrary expert maps are rejected",
+        ));
+    };
+    for rank in 0..tp {
+        if !shard
+            .expert_to_rank
+            .iter()
+            .any(|&owner| owner as usize == rank)
+        {
+            return Err(HipError::new(
+                0,
+                &format!("qwen35: EP shard leaves rank {rank} with zero owners"),
+            ));
+        }
+    }
+    Ok(assignment)
+}
+
+/// Global expert → owning rank map derived from a sealed plan, in global-id
+/// order. This is the ONLY sanctioned source of `Qwen35EpShardInfo` ownership.
+pub(crate) fn plan_expert_to_rank(
+    plan: &hipfire_runtime::sealed_moe::ExpertExecutionPlan,
+) -> Vec<u8> {
+    plan.experts()
+        .iter()
+        .map(|record| record.owner_rank as u8)
+        .collect()
+}
+
+/// Global (gate_up, down) dtype pairs from a sealed plan, in global-id order.
+pub(crate) fn global_dtype_pairs_from_plan(
+    plan: &hipfire_runtime::sealed_moe::ExpertExecutionPlan,
+) -> Vec<(DType, DType)> {
+    plan.experts()
+        .iter()
+        .map(|record| (record.gate.dtype, record.down.dtype))
+        .collect()
+}
+
+/// Global (gate_up, down) dtype pairs from loader source records, in
+/// global-id order.
+pub(crate) fn global_dtype_pairs_from_records(
+    records: &[MoeExpertSourceRecord],
+) -> Vec<(DType, DType)> {
+    records
+        .iter()
+        .map(|record| {
+            let gate_dtype = record
+                .gate_up
+                .as_ref()
+                .or(record.gate.as_ref())
+                .map(|source| source.dtype)
+                .unwrap_or(DType::F32);
+            (gate_dtype, record.down.dtype)
+        })
+        .collect()
+}
+
+/// Validate every global dtype pair against the frozen graded-tag registry
+/// (rejecting GL and unknown pairs) and return the per-global tag bytes.
+/// CPU-only: runs before any dummy, table, or expert allocation.
+pub(crate) fn validate_ep_global_tags(pairs: &[(DType, DType)]) -> HipResult<Vec<u8>> {
+    pairs
+        .iter()
+        .enumerate()
+        .map(|(expert, &(gate_dtype, down_dtype))| {
+            mixed_expert_tag(gate_dtype, down_dtype).map_err(|error| {
+                HipError::new(
+                    0,
+                    &format!("qwen35: EP global expert {expert} {}", error.message),
+                )
+            })
+        })
+        .collect()
+}
+
+/// One distinct non-owned storage layout needing an owned zero dummy pair.
+/// Geometry comes from sealed source metadata (never from a resident tensor
+/// that a later failure might free out from under the bind).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct EpDummySpec {
+    pub gate_dtype: DType,
+    pub gate_m: usize,
+    pub gate_k: usize,
+    pub gate_bytes: usize,
+    pub gate_stride: usize,
+    pub down_dtype: DType,
+    pub down_m: usize,
+    pub down_k: usize,
+    pub down_bytes: usize,
+    pub down_stride: usize,
+}
+
+/// Allocate one owned zero buffer per dummy spec and build the borrowed
+/// [`ExpertWeights`] views the compact bind matches non-owned globals
+/// against. Returns `(owners, views)`; the views alias the owners via
+/// `shallow_clone` and must be freed metadata-only. A mid-loop allocation
+/// error frees every owner acquired so far.
+pub(crate) fn alloc_ep_dummies(
+    gpu: &mut Gpu,
+    specs: &[EpDummySpec],
+) -> HipResult<(Vec<GpuTensor>, Vec<ExpertWeights>)> {
+    fn zero_buf(gpu: &Gpu, bytes: usize, role: &str) -> HipResult<GpuTensor> {
+        if bytes == 0 {
+            return Err(HipError::new(
+                0,
+                &format!("qwen35: EP dummy {role} has zero bytes"),
+            ));
+        }
+        gpu.upload_raw(&vec![0u8; bytes], &[bytes])
+    }
+    let mut owners = Vec::with_capacity(specs.len() * 2);
+    let mut views = Vec::with_capacity(specs.len());
+    for spec in specs {
+        let gate_owner = match zero_buf(gpu, spec.gate_bytes, "gate/up") {
+            Ok(tensor) => tensor,
+            Err(error) => {
+                for owner in owners.drain(..) {
+                    let _ = gpu.free_tensor(owner);
+                }
+                return Err(error);
+            }
+        };
+        let down_owner = match zero_buf(gpu, spec.down_bytes, "down") {
+            Ok(tensor) => tensor,
+            Err(error) => {
+                let _ = gpu.free_tensor(gate_owner);
+                for owner in owners.drain(..) {
+                    let _ = gpu.free_tensor(owner);
+                }
+                return Err(error);
+            }
+        };
+        let gate_up = WeightTensor {
+            buf: gate_owner.shallow_clone(),
+            gpu_dtype: spec.gate_dtype,
+            m: spec.gate_m,
+            k: spec.gate_k,
+            row_stride: spec.gate_stride,
+            paro: None,
+            awq_scale: None,
+        };
+        let down = WeightTensor {
+            buf: down_owner.shallow_clone(),
+            gpu_dtype: spec.down_dtype,
+            m: spec.down_m,
+            k: spec.down_k,
+            row_stride: spec.down_stride,
+            paro: None,
+            awq_scale: None,
+        };
+        owners.push(gate_owner);
+        owners.push(down_owner);
+        views.push(ExpertWeights { gate_up, down });
+    }
+    Ok((owners, views))
+}
+
+/// Upload the global `[n_exp]` pointer tables (plus the optional global
+/// dtype-tag table) for one sealed EP owner. A mid-sequence failure frees
+/// every table acquired so far.
+pub(crate) fn upload_ep_tables(
+    gpu: &mut Gpu,
+    gate_up_entries: &[u64],
+    down_entries: &[u64],
+    dtype_tags: Option<&[u8]>,
+) -> HipResult<(GpuTensor, GpuTensor, Option<GpuTensor>)> {
+    let table_len = gate_up_entries
+        .len()
+        .checked_mul(2)
+        .ok_or_else(|| HipError::new(0, "qwen35: EP pointer table size overflows"))?;
+    if down_entries.len() != gate_up_entries.len() {
+        return Err(HipError::new(
+            0,
+            "qwen35: EP gate/up and down pointer entries disagree",
+        ));
+    }
+    let gate_up_table = gpu.alloc_tensor(&[table_len], DType::F32)?;
+    let gate_up_bytes: Vec<u8> = gate_up_entries
+        .iter()
+        .flat_map(|ptr| ptr.to_ne_bytes())
+        .collect();
+    if let Err(error) = gpu.hip.memcpy_htod(&gate_up_table.buf, &gate_up_bytes) {
+        let _ = gpu.free_tensor(gate_up_table);
+        return Err(error);
+    }
+    let down_table = match gpu.alloc_tensor(&[table_len], DType::F32) {
+        Ok(tensor) => tensor,
+        Err(error) => {
+            let _ = gpu.free_tensor(gate_up_table);
+            return Err(error);
+        }
+    };
+    let down_bytes: Vec<u8> = down_entries
+        .iter()
+        .flat_map(|ptr| ptr.to_ne_bytes())
+        .collect();
+    if let Err(error) = gpu.hip.memcpy_htod(&down_table.buf, &down_bytes) {
+        let _ = gpu.free_tensor(gate_up_table);
+        let _ = gpu.free_tensor(down_table);
+        return Err(error);
+    }
+    let tag_table = match dtype_tags {
+        None => None,
+        Some(tags) => {
+            let tensor = match gpu.alloc_tensor(&[tags.len()], DType::Raw) {
+                Ok(tensor) => tensor,
+                Err(error) => {
+                    let _ = gpu.free_tensor(gate_up_table);
+                    let _ = gpu.free_tensor(down_table);
+                    return Err(error);
+                }
+            };
+            if let Err(error) = gpu.hip.memcpy_htod(&tensor.buf, tags) {
+                let _ = gpu.free_tensor(gate_up_table);
+                let _ = gpu.free_tensor(down_table);
+                let _ = gpu.free_tensor(tensor);
+                return Err(error);
+            }
+            Some(tensor)
+        }
+    };
+    Ok((gate_up_table, down_table, tag_table))
+}
+
+/// Run the C1 compact live bind for one sealed EP owner: every owned global
+/// entry must point at its plan-mapped local tensor, every non-owned entry
+/// at an owned layout-compatible zero dummy, on the sealed physical device.
+/// AWQ is never admitted on EP owners (`None`/`None`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn bind_compact_ep_cache(
+    cache: &mut hipfire_dispatch::pipeline::sealed_moe::ExpertBindingCache,
+    table: &hipfire_dispatch::pipeline::sealed_moe::ExpertTable,
+    local_experts: &[hipfire_dispatch::pipeline::sealed_moe::CompactLiveWeight<'_>],
+    gate_up_entries: &[usize],
+    down_entries: &[usize],
+    gate_up_ptrs: &GpuTensor,
+    down_ptrs: &GpuTensor,
+    dtype_tags: Option<&GpuTensor>,
+    zero_dummies: &[hipfire_dispatch::pipeline::sealed_moe::CompactLiveWeight<'_>],
+    device_id: i32,
+) -> HipResult<()> {
+    cache
+        .bind_live_compact(
+            table,
+            local_experts,
+            gate_up_entries,
+            down_entries,
+            None,
+            gate_up_ptrs,
+            down_ptrs,
+            None,
+            dtype_tags,
+            zero_dummies,
+            device_id,
+        )
+        .map_err(HipError::from)
 }
 
 pub struct MoeFfnWeights {
@@ -697,8 +1255,25 @@ pub struct MoeFfnWeights {
 
     /// EP streaming dummies: one owned zero buffer per distinct
     /// non-owned storage layout. Non-owned global slots alias into the
-    /// matching entry. Owned so `free_moe_ffn` can reclaim them.
+    /// matching entry. Owned so `free_moe_ffn` can reclaim them. Each entry
+    /// is one projection buffer (gate/up and down layouts are separate
+    /// entries); the borrowed [`ExpertWeights`] views in
+    /// `ep_dummy_experts` alias these buffers and must never be freed
+    /// directly.
     pub(crate) ep_dummy_buffers: Vec<GpuTensor>,
+    /// Borrowed [`ExpertWeights`] views into `ep_dummy_buffers`, one pair per
+    /// distinct non-owned layout. Built once at commit so the compact bind
+    /// and every later sealed call can borrow layout-compatible zero dummies
+    /// without allocating. Freed metadata-only; the buffers die with
+    /// `ep_dummy_buffers`.
+    pub(crate) ep_dummy_experts: Vec<ExpertWeights>,
+    /// Displaced experts retired by post-load [`super::forward::shard_moe_experts`]:
+    /// formerly owned tensors that no longer belong to this rank. Retained
+    /// (never read) until teardown so a committed two-phase shard cannot
+    /// turn cleanup into a reported failure, and so no buffer is released
+    /// while a pre-swap capture might still reference it. Empty on every
+    /// load path.
+    pub(crate) retired_expert_weights: Vec<ExpertWeights>,
     /// Immutable runtime execution plan from the source manifest.  The
     /// dispatch table/cache below are adapted exclusively from this plan.
     pub(crate) expert_execution_plan: hipfire_runtime::sealed_moe::ExpertExecutionPlan,
@@ -1735,8 +2310,9 @@ where
 }
 
 /// Free a [`WeightTensor`]'s owning sidecars without freeing its weight buffer.
-/// Used only for non-owning views into [`PackedExpertOwners`].
-fn free_weight_metadata_with<F>(weight: WeightTensor, free: &mut F)
+/// Used for non-owning views into [`PackedExpertOwners`] and into the EP
+/// dummy owner buffers (`ep_dummy_buffers`).
+pub(crate) fn free_weight_metadata_with<F>(weight: WeightTensor, free: &mut F)
 where
     F: FnMut(GpuTensor),
 {
@@ -1779,7 +2355,9 @@ pub(crate) fn free_moe_ffn_with(ffn: MoeFfnWeights, free: &mut impl FnMut(GpuTen
     if let Some(owners) = ffn.packed_expert_owners {
         // Packed expert WeightTensors are non-owning views. Free only metadata
         // that remains individually owned, then return each layer blob once.
-        for e in ffn.experts {
+        // Shard-retired views alias the same blobs, so they are metadata-only
+        // here as well.
+        for e in ffn.experts.into_iter().chain(ffn.retired_expert_weights) {
             free_weight_metadata_with(e.gate_up, free);
             free_weight_metadata_with(e.down, free);
         }
@@ -1790,6 +2368,18 @@ pub(crate) fn free_moe_ffn_with(ffn: MoeFfnWeights, free: &mut impl FnMut(GpuTen
             free_weight_with(e.gate_up, free);
             free_weight_with(e.down, free);
         }
+        // Retired owners are only populated by post-load sharding of a
+        // literal (non-packed) model, so each holds its own buffers.
+        for e in ffn.retired_expert_weights {
+            free_weight_with(e.gate_up, free);
+            free_weight_with(e.down, free);
+        }
+    }
+    // EP dummy views borrow `ep_dummy_buffers`; release their (empty)
+    // metadata only, then return each owning zero buffer once.
+    for e in ffn.ep_dummy_experts {
+        free_weight_metadata_with(e.gate_up, free);
+        free_weight_metadata_with(e.down, free);
     }
     // ParoQuant MoE: free the owning shared sidecars (per-expert `paro` fields
     // alias these and must NOT be freed separately — they're non-owning views).

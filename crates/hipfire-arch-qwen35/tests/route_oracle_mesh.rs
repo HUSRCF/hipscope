@@ -66,9 +66,9 @@
 //! Loader note: `load_model_ep` (loader `lib.rs`) has NO MoE serve path —
 //! `qwen35_ep_moe_refusal` refuses `num_experts > 0` ("use TP or single-GPU")
 //! and the MoE branch additionally requires `tp == 4`. The EP tests therefore
-//! drive the retained qwen35-level EP substrate directly (replicated
-//! `load_weights` under the `set_ep_expert_shard` TLS context +
-//! `forward_ep`), which is the exact pattern of the in-tree
+//! drive the retained qwen35-level EP substrate directly (sealed per-rank
+//! `load_weights_ep_rank` over the `init_ep` mesh + `forward_ep`), which is
+//! the exact pattern of the in-tree
 //! `hipfire-runtime/examples/ep_decode_parity.rs` validation. No `pub` seam
 //! is missing: every symbol used here is already `pub`. Nothing is NOT WIRED.
 //!
@@ -1192,24 +1192,25 @@ fn load_ep_mesh(test: &str, path: &str, tp: usize) -> Option<EpMesh> {
         config.num_experts > 0,
         "{test}: EP oracle expects a MoE (A3B) fixture"
     );
-    let mut gpus = match Gpus::init_tp(tp, config.n_layers) {
+    let mut gpus = match Gpus::init_ep(tp, config.n_layers) {
         Ok(g) if g.devices.len() == tp => g,
         Ok(g) => {
             eprintln!(
-                "skip: {test} init_tp({tp}) gave {} devices",
+                "skip: {test} init_ep({tp}) gave {} devices",
                 g.devices.len()
             );
             return None;
         }
         Err(e) => {
-            eprintln!("skip: {test} init_tp({tp}) failed: {e:?}");
+            eprintln!("skip: {test} init_ep({tp}) failed: {e:?}");
             return None;
         }
     };
-    // Replicated load with per-rank expert sharding via the TLS context, then
-    // stride assignment (rank r owns experts e%tp==r) — the
-    // `ep_decode_parity.rs` pattern. Non-owned experts read load-time
-    // zero-dummies and contribute 0 to the routed partial.
+    // Sealed per-rank streaming load: each rank owns its plan-derived compact
+    // experts with layout-specific zero dummies elsewhere. The cloned mesh +
+    // physical list keep the plan mesh and the runtime topology in agreement.
+    let mesh = gpus.mesh.clone();
+    let physical_devices: Vec<i32> = gpus.devices.iter().map(|dev| dev.device_id).collect();
     let shard = ShardConfig::new(tp, true, config.num_experts, ExpertAssign::Stride)
         .expect("ep ShardConfig");
     let mask = kv_mask(&config);
@@ -1222,17 +1223,15 @@ fn load_ep_mesh(test: &str, path: &str, tp: usize) -> Option<EpMesh> {
         gpus.devices[r].bind_thread().expect("ep bind");
         let mut hfq =
             HfqFile::open(Path::new(path)).unwrap_or_else(|e| panic!("reopen rank {r}: {e}"));
-        qwen35::set_ep_expert_shard(Some((shard.clone(), r)));
-        let w = {
-            let mut src = HfqSource::new(&mut hfq, &config);
-            let layout = Layout::single(config.n_layers);
-            qwen35::load_weights(
-                &mut src,
-                std::slice::from_mut(&mut gpus.devices[r]),
-                &layout,
-            )
-        };
-        qwen35::set_ep_expert_shard(None);
+        let w = qwen35::load_weights_ep_rank(
+            &mut hfq,
+            &mut gpus.devices[r],
+            &config,
+            &mesh,
+            &physical_devices,
+            shard.clone(),
+            r,
+        );
         weights.push(w.unwrap_or_else(|e| panic!("ep load rank {r}: {e:?}")));
         kvs.push(
             KvCache::new_gpu_fwht3_filtered(

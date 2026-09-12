@@ -37,13 +37,13 @@ pub use forward::{
     dump_expert_stats, forward, forward_gpu, forward_prefill_dense_tp, forward_scratch,
     forward_scratch_dense_tp, forward_scratch_embed, forward_scratch_embed_mrope,
     forward_scratch_mrope, forward_scratch_with_hidden, forward_with_embedding,
-    prepare_scratch_inputs, shard_all_moe_layers, shard_moe_experts, Qwen35Scratch,
-    Qwen35ScratchSet,
+    prepare_scratch_inputs, shard_all_moe_layers, shard_all_moe_layers_with_fault,
+    shard_moe_experts, Qwen35Scratch, Qwen35ScratchSet,
 };
 pub use load::{
-    load_weights, load_weights_dense_tp_rank, load_weights_ep_rank, load_weights_with_fault,
-    preflight_weights_dense_tp, set_ep_expert_shard, EpShardGuard, HfqSource, Layout, ParoSource,
-    StagedLoadFault,
+    load_weights, load_weights_dense_tp_rank, load_weights_ep_rank,
+    load_weights_ep_rank_with_fault, load_weights_with_fault, preflight_weights_dense_tp, EpFault,
+    EpLoadStage, HfqSource, Layout, ParoSource, StagedLoadFault,
 };
 pub use prefill::{
     forward_prefill_batch, forward_prefill_batch_capped,

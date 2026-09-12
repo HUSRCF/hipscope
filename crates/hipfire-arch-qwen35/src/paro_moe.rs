@@ -306,7 +306,9 @@ pub(crate) fn paro_load_moe_ffn(
             sidecar_sources,
             layer_idx as usize,
             config.n_layers,
-            gpu.device_id,
+            crate::qwen35::weights::ExpertBindingTarget::Single {
+                physical_device: gpu.device_id,
+            },
         )?;
 
     // All allocations after this point are owned by `pending`; every error

@@ -433,6 +433,8 @@ mod tests {
                 paro_shared: None,
                 global_expert_dtypes: None,
                 ep_dummy_buffers: Vec::new(),
+                ep_dummy_experts: Vec::new(),
+                retired_expert_weights: Vec::new(),
                 mixed_expert_gate_up_tiers: None,
                 mixed_expert_down_tiers: None,
                 expert_execution_plan,

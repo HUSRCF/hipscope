@@ -3598,14 +3598,33 @@ fn load_model_ep_qwen35(
     let fail_rank = ep_fail_rank();
     let _ = fail_rank;
     let mut staging = Qwen35EpStaging::new(gpus);
+    // The sealed loader needs the same mesh + physical topology the runtime
+    // holds: clone both up front so each rank load agrees with `init_ep`.
+    // (Unreachable while `qwen35_ep_moe_refusal` above admits nothing; kept
+    // compiling with the sealed signature only.)
+    let ep_mesh = staging.gpus_mut().mesh.clone();
+    let ep_physical_devices: Vec<i32> = staging
+        .gpus_mut()
+        .devices
+        .iter()
+        .map(|dev| dev.device_id)
+        .collect();
     for r in 0..n {
         staging.gpus_mut().devices[r]
             .bind_thread()
             .map_err(|e| format!("bind {r}: {e:?}"))?;
         let mut h = HfqFile::open(Path::new(path)).map_err(|e| format!("reopen rank {r}: {e}"))?;
         let dev = &mut staging.gpus_mut().devices[r];
-        let w = qwen35::load_weights_ep_rank(&mut h, dev, &config, shard.clone(), r)
-            .map_err(|e| format!("shard load rank {r}: {e:?}"))?;
+        let w = qwen35::load_weights_ep_rank(
+            &mut h,
+            dev,
+            &config,
+            &ep_mesh,
+            &ep_physical_devices,
+            shard.clone(),
+            r,
+        )
+        .map_err(|e| format!("shard load rank {r}: {e:?}"))?;
         staging.weights.push(w);
         if fail_rank == Some(r) {
             return Err(format!(

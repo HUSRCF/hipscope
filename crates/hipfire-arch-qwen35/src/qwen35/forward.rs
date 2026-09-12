@@ -45,6 +45,7 @@ use hipfire_dispatch::pipeline::Step;
 use hipfire_dispatch::types::dtype_rotation_plan;
 use hipfire_dispatch::types::DispatchError;
 use hipfire_dispatch::types::RotationPlan;
+use hipfire_runtime::device_mesh::DeviceMesh;
 use hipfire_runtime::llama;
 use hipfire_runtime::llama::fused_rmsnorm_rotate_for_mq;
 use hipfire_runtime::llama::EmbeddingFormat;
@@ -52,6 +53,9 @@ use hipfire_runtime::llama::KvCacheExt;
 use hipfire_runtime::llama::ParoRotation;
 use hipfire_runtime::llama::WeightTensor;
 use hipfire_runtime::multi_gpu::Gpus;
+use hipfire_runtime::sealed_moe::repartition_expert_execution_plan;
+use hipfire_runtime::sealed_moe::ExpertExecutionPlan;
+use hipfire_runtime::tp_shard::ExpertAssign;
 use hipfire_runtime::tp_shard::ShardConfig;
 use rdna_compute::DType;
 use rdna_compute::Gpu;
@@ -3146,36 +3150,604 @@ fn moe_ffn_dispatch_ep(
     ))
 }
 
-/// Qwen3.5 sealed MoE owners are currently single-device only.
-///
-/// Compact EP owners cannot prove global expert residency, so sharding is
-/// rejected before any tensor ownership or pointer table is mutated.
-pub fn shard_moe_experts(
-    _gpu: &mut Gpu,
-    _ffn: &mut MoeFfnWeights,
-    _shard: &ShardConfig,
-    _rank: usize,
-    _n_exp: usize,
-) -> HipResult<()> {
-    Err(HipError::new(
-        0,
-        "qwen35: sealed MoE EP execution is unsupported; refusing compact EP owner",
-    ))
+/// Validate the topology half of a post-load shard (rank/mesh/device
+/// identity plus the supported assignment). Plan and residency checks live
+/// in [`PreparedMoeShard::prepare`], which runs before any mutation.
+fn validate_shard_topology(
+    shard: &ShardConfig,
+    rank: usize,
+    n_exp: usize,
+    mesh: &DeviceMesh,
+    physical_devices: &[i32],
+    gpu: &Gpu,
+) -> HipResult<ExpertAssign> {
+    let tp = shard.tp_size;
+    if tp == 0 {
+        return Err(HipError::new(0, "qwen35: EP shard has no ranks"));
+    }
+    if rank >= tp {
+        return Err(HipError::new(
+            0,
+            &format!("qwen35: EP rank {rank} is outside rank count {tp}"),
+        ));
+    }
+    if mesh.n_devices() != tp || physical_devices.len() != tp {
+        return Err(HipError::new(
+            0,
+            &format!(
+                "qwen35: EP shard topology (mesh devices={}, physical={}) disagrees with rank count {tp}",
+                mesh.n_devices(),
+                physical_devices.len()
+            ),
+        ));
+    }
+    if physical_devices[rank] != gpu.device_id {
+        return Err(HipError::new(
+            0,
+            &format!(
+                "qwen35: EP rank {rank} names physical device {}, but the sharding GPU is {}",
+                physical_devices[rank], gpu.device_id
+            ),
+        ));
+    }
+    if n_exp == 0 {
+        return Err(HipError::new(0, "qwen35: EP sharding needs routed experts"));
+    }
+    super::weights::infer_ep_assignment(shard, n_exp)
 }
 
-/// Reject whole-model EP sharding before any layer owner is mutated.
-pub fn shard_all_moe_layers(
-    _gpu: &mut Gpu,
-    _weights: &mut Qwen35Weights,
-    _shard: &ShardConfig,
-    _rank: usize,
-    _n_exp: usize,
-    _reap_active: bool,
+/// Phase-one owner for a post-load EP shard. Holds the repartitioned sealed
+/// plan, the rank-adapted table, the compact-bound cache, replacement
+/// pointer/tag tables, zero dummies, and global dtype metadata — everything
+/// EXCEPT the experts themselves, which stay in the old owner until
+/// [`Self::commit`]. Dropping via [`Self::free`] after a later-layer failure
+/// therefore leaves the old model untouched.
+struct PreparedMoeShard {
+    rank: usize,
+    plan: ExpertExecutionPlan,
+    table: hipfire_dispatch::pipeline::sealed_moe::ExpertTable,
+    cache: hipfire_dispatch::pipeline::sealed_moe::ExpertBindingCache,
+    dummy_buffers: Vec<GpuTensor>,
+    dummy_views: Vec<ExpertWeights>,
+    gate_up_table: GpuTensor,
+    down_table: GpuTensor,
+    tag_table: Option<GpuTensor>,
+    global_pairs: Vec<(DType, DType)>,
+    tier_gate_up: Option<Box<[DType]>>,
+    tier_down: Option<Box<[DType]>>,
+}
+
+impl PreparedMoeShard {
+    /// Prepare one layer's EP shard without mutating `ffn`: repartition the
+    /// sealed Single plan through the ordinary planner, adapt for `rank`,
+    /// allocate dummies/tables from sealed metadata, and compact-bind against
+    /// the still-resident full expert set. Any error frees the prepared
+    /// artifacts and leaves `ffn` bit-identical.
+    fn prepare(
+        gpu: &mut Gpu,
+        ffn: &MoeFfnWeights,
+        mesh: &DeviceMesh,
+        physical_devices: &[i32],
+        assignment: ExpertAssign,
+        rank: usize,
+        shard: &ShardConfig,
+    ) -> HipResult<Self> {
+        use hipfire_dispatch::pipeline::sealed_moe::CompactLiveWeight;
+        use hipfire_dispatch::pipeline::sealed_moe::CANONICAL_EP_EXECUTION;
+        use hipfire_runtime::sealed_moe::adapt_expert_execution_plan;
+        use hipfire_runtime::weight_manifest::ExpertParallelism;
+        let base = &ffn.expert_execution_plan;
+        if base.parallelism() != ExpertParallelism::Single {
+            return Err(HipError::new(
+                0,
+                "qwen35: post-load EP shard requires a sealed Single plan (already sharded?)",
+            ));
+        }
+        let n_exp = base.n_experts();
+        if ffn.experts.len() != n_exp {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "qwen35: post-load EP shard needs all {n_exp} experts resident, found {}",
+                    ffn.experts.len()
+                ),
+            ));
+        }
+        if ffn.expert_down_awq_ptrs.is_some() {
+            return Err(HipError::new(
+                0,
+                "qwen35: post-load EP shard refuses AWQ pointer tables",
+            ));
+        }
+        if ffn.paro_shared.is_some() {
+            return Err(HipError::new(
+                0,
+                "qwen35: post-load EP shard refuses ParoQuant rotation sidecars",
+            ));
+        }
+        // The only sanctioned Single -> EP transition: rebuild planner input
+        // from the attested plan and rerun the ordinary manifest/expert
+        // planners. Ownership comes from the planner, never from `e % N`.
+        let plan = repartition_expert_execution_plan(
+            base,
+            mesh,
+            physical_devices,
+            assignment,
+            CANONICAL_EP_EXECUTION,
+        )
+        .map_err(|error| HipError::new(0, &error))?;
+        let (table, mut cache) =
+            adapt_expert_execution_plan(&plan, rank).map_err(|error| HipError::new(0, &error))?;
+        // The caller's shard map selected the assignment; the sealed plan is
+        // authoritative. Fail closed on any skew between the two.
+        let planned = super::weights::plan_expert_to_rank(&plan);
+        if planned.as_slice() != shard.expert_to_rank.as_slice() {
+            return Err(HipError::new(
+                0,
+                "qwen35: sealed EP repartition ownership disagrees with the shard map",
+            ));
+        }
+        let owned_globals: Vec<usize> = plan
+            .rank_ownership()
+            .get(rank)
+            .ok_or_else(|| {
+                HipError::new(
+                    0,
+                    &format!("qwen35: sealed EP plan has no ownership for rank {rank}"),
+                )
+            })?
+            .global_expert_ids
+            .clone();
+        let slot_row = plan.global_to_local().get(rank).ok_or_else(|| {
+            HipError::new(
+                0,
+                &format!("qwen35: sealed EP plan has no slot map for rank {rank}"),
+            )
+        })?;
+        for (slot, &global) in owned_globals.iter().enumerate() {
+            if slot_row.get(global).copied().flatten() != Some(slot) {
+                return Err(HipError::new(
+                    0,
+                    &format!(
+                        "qwen35: sealed EP rank {rank} slot {slot} disagrees on expert {global}"
+                    ),
+                ));
+            }
+        }
+        let global_pairs = super::weights::global_dtype_pairs_from_plan(&plan);
+        let global_tags = super::weights::validate_ep_global_tags(&global_pairs)?;
+        // Dummy layouts from sealed plan records. Strides sample the resident
+        // full set (every global is resident pre-swap), so every layout has
+        // an exact sample. Dtype-keyed samples are a handful of entries, so
+        // a linear scan replaces a map (DType is not Hash).
+        let mut gate_stride_by_dtype: Vec<(DType, usize)> = Vec::new();
+        let mut down_stride_by_dtype: Vec<(DType, usize)> = Vec::new();
+        for expert in &ffn.experts {
+            if !gate_stride_by_dtype
+                .iter()
+                .any(|&(dtype, _)| dtype == expert.gate_up.gpu_dtype)
+            {
+                gate_stride_by_dtype.push((expert.gate_up.gpu_dtype, expert.gate_up.row_stride));
+            }
+            if !down_stride_by_dtype
+                .iter()
+                .any(|&(dtype, _)| dtype == expert.down.gpu_dtype)
+            {
+                down_stride_by_dtype.push((expert.down.gpu_dtype, expert.down.row_stride));
+            }
+        }
+        let sample_stride = |samples: &[(DType, usize)], dtype: DType| {
+            samples
+                .iter()
+                .find(|&&(sample, _)| sample == dtype)
+                .map(|&(_, stride)| stride)
+                .unwrap_or(0)
+        };
+        let mut specs: Vec<super::weights::EpDummySpec> = Vec::new();
+        let mut dummy_for_global: Vec<Option<usize>> = vec![None; n_exp];
+        for (global, record) in plan.experts().iter().enumerate() {
+            if record.owner_rank == rank {
+                continue;
+            }
+            let fused = record.gate.source_name == record.up.source_name;
+            let gate_rows = record.gate.logical_shape.first().copied().unwrap_or(0)
+                + record.up.logical_shape.first().copied().unwrap_or(0);
+            let gate_cols = record.gate.logical_shape.get(1).copied().unwrap_or(0);
+            let gate_bytes = if fused {
+                record.gate.encoded_bytes
+            } else {
+                record
+                    .gate
+                    .encoded_bytes
+                    .saturating_add(record.up.encoded_bytes)
+            };
+            let spec = super::weights::EpDummySpec {
+                gate_dtype: record.gate.dtype,
+                gate_m: gate_rows,
+                gate_k: gate_cols,
+                gate_bytes,
+                gate_stride: sample_stride(&gate_stride_by_dtype, record.gate.dtype),
+                down_dtype: record.down.dtype,
+                down_m: record.down.logical_shape.first().copied().unwrap_or(0),
+                down_k: record.down.logical_shape.get(1).copied().unwrap_or(0),
+                down_bytes: record.down.encoded_bytes,
+                down_stride: sample_stride(&down_stride_by_dtype, record.down.dtype),
+            };
+            if let Some(index) = specs.iter().position(|other| other == &spec) {
+                dummy_for_global[global] = Some(index);
+            } else {
+                dummy_for_global[global] = Some(specs.len());
+                specs.push(spec);
+            }
+        }
+        let cleanup = |gpu: &mut Gpu,
+                       buffers: Vec<GpuTensor>,
+                       views: Vec<ExpertWeights>,
+                       tables: Vec<GpuTensor>| {
+            for view in views {
+                view.gate_up.free_metadata_only(gpu);
+                view.down.free_metadata_only(gpu);
+            }
+            for buffer in buffers {
+                let _ = gpu.free_tensor(buffer);
+            }
+            for table in tables {
+                let _ = gpu.free_tensor(table);
+            }
+        };
+        let (dummy_buffers, dummy_views) = match super::weights::alloc_ep_dummies(gpu, &specs) {
+            Ok(owners) => owners,
+            Err(error) => return Err(error),
+        };
+        let expert_at = |global: usize| {
+            ffn.experts.get(global).ok_or_else(|| {
+                HipError::new(
+                    0,
+                    &format!("qwen35: sealed EP shard is missing resident expert {global}"),
+                )
+            })
+        };
+        let mut gate_up_entries = vec![0usize; n_exp];
+        let mut down_entries = vec![0usize; n_exp];
+        for (slot, &global) in owned_globals.iter().enumerate() {
+            let _ = slot;
+            let expert = expert_at(global)?;
+            gate_up_entries[global] = expert.gate_up.buf.buf.as_ptr() as usize;
+            down_entries[global] = expert.down.buf.buf.as_ptr() as usize;
+        }
+        for (global, slot) in dummy_for_global.iter().enumerate() {
+            let Some(index) = slot else { continue };
+            let dummy = &dummy_views[*index];
+            gate_up_entries[global] = dummy.gate_up.buf.buf.as_ptr() as usize;
+            down_entries[global] = dummy.down.buf.buf.as_ptr() as usize;
+        }
+        let mixed = global_pairs
+            .iter()
+            .skip(1)
+            .any(|&pair| Some(pair) != global_pairs.first().copied());
+        let tag_bytes: Option<Vec<u8>> = mixed.then(|| global_tags.clone());
+        let gate_up_words: Vec<u64> = gate_up_entries.iter().map(|&ptr| ptr as u64).collect();
+        let down_words: Vec<u64> = down_entries.iter().map(|&ptr| ptr as u64).collect();
+        let (gate_up_table, down_table, tag_table) = match super::weights::upload_ep_tables(
+            gpu,
+            &gate_up_words,
+            &down_words,
+            tag_bytes.as_deref(),
+        ) {
+            Ok(tables) => tables,
+            Err(error) => {
+                cleanup(gpu, dummy_buffers, dummy_views, Vec::new());
+                return Err(error);
+            }
+        };
+        let local_refs: Vec<CompactLiveWeight<'_>> = owned_globals
+            .iter()
+            .map(|&global| {
+                expert_at(global).map(|expert| CompactLiveWeight {
+                    gate_up: expert.gate_up.dispatch_ref(),
+                    down: expert.down.dispatch_ref(),
+                })
+            })
+            .collect::<HipResult<_>>()?;
+        let dummy_refs: Vec<CompactLiveWeight<'_>> = dummy_views
+            .iter()
+            .map(|dummy| CompactLiveWeight {
+                gate_up: dummy.gate_up.dispatch_ref(),
+                down: dummy.down.dispatch_ref(),
+            })
+            .collect();
+        if let Err(error) = super::weights::bind_compact_ep_cache(
+            &mut cache,
+            &table,
+            &local_refs,
+            &gate_up_entries,
+            &down_entries,
+            &gate_up_table,
+            &down_table,
+            tag_table.as_ref(),
+            &dummy_refs,
+            gpu.device_id,
+        ) {
+            cleanup(
+                gpu,
+                dummy_buffers,
+                dummy_views,
+                [gate_up_table, down_table]
+                    .into_iter()
+                    .chain(tag_table)
+                    .collect(),
+            );
+            return Err(error);
+        }
+        let (tier_gate_up, tier_down) =
+            super::weights::cached_expert_tier_tables(Some(&global_pairs), &[]);
+        Ok(Self {
+            rank,
+            plan,
+            table,
+            cache,
+            dummy_buffers,
+            dummy_views,
+            gate_up_table,
+            down_table,
+            tag_table,
+            global_pairs,
+            tier_gate_up,
+            tier_down,
+        })
+    }
+
+    /// Free a prepared-but-uncommitted shard (later-layer failure path).
+    /// The old owner was never touched, so this only releases the prepared
+    /// artifacts.
+    fn free(self, gpu: &mut Gpu) {
+        let _ = gpu.free_tensor(self.gate_up_table);
+        let _ = gpu.free_tensor(self.down_table);
+        if let Some(table) = self.tag_table {
+            let _ = gpu.free_tensor(table);
+        }
+        for view in self.dummy_views {
+            view.gate_up.free_metadata_only(gpu);
+            view.down.free_metadata_only(gpu);
+        }
+        for buffer in self.dummy_buffers {
+            let _ = gpu.free_tensor(buffer);
+        }
+    }
+
+    /// Commit a fully prepared shard: partition the resident experts into
+    /// owned (local-slot order) and retired, then swap every field. Field
+    /// swaps are infallible; replaced tables are released (errors ignored —
+    /// teardown accounting, never a reported failure).
+    fn commit(self, gpu: &mut Gpu, ffn: &mut MoeFfnWeights) {
+        let owned_globals = self.plan.rank_ownership()[self.rank]
+            .global_expert_ids
+            .clone();
+        let slot_of = |global: usize| {
+            self.plan.global_to_local()[self.rank][global].expect("prepared EP slot map")
+        };
+        let mut owned: Vec<(usize, ExpertWeights)> = Vec::with_capacity(owned_globals.len());
+        let mut retired: Vec<ExpertWeights> = Vec::new();
+        let is_owned = {
+            let mut owned_set = vec![false; ffn.experts.len()];
+            for &global in &owned_globals {
+                owned_set[global] = true;
+            }
+            owned_set
+        };
+        for (global, expert) in std::mem::take(&mut ffn.experts).into_iter().enumerate() {
+            if is_owned[global] {
+                owned.push((slot_of(global), expert));
+            } else {
+                retired.push(expert);
+            }
+        }
+        owned.sort_by_key(|&(slot, _)| slot);
+        ffn.experts = owned.into_iter().map(|(_, expert)| expert).collect();
+        ffn.retired_expert_weights = retired;
+        ffn.expert_execution_plan = self.plan;
+        ffn.expert_table = self.table;
+        ffn.expert_binding = self.cache;
+        let old_gate_up = std::mem::replace(&mut ffn.expert_gate_up_ptrs, self.gate_up_table);
+        let old_down = std::mem::replace(&mut ffn.expert_down_ptrs, self.down_table);
+        let _ = gpu.free_tensor(old_gate_up);
+        let _ = gpu.free_tensor(old_down);
+        if let Some(old_awq) = ffn.expert_down_awq_ptrs.take() {
+            let _ = gpu.free_tensor(old_awq);
+        }
+        if let Some(old_tags) = ffn.expert_dtype_tags.take() {
+            let _ = gpu.free_tensor(old_tags);
+        }
+        ffn.expert_dtype_tags = self.tag_table;
+        ffn.global_expert_dtypes = Some(self.global_pairs.into_boxed_slice());
+        ffn.ep_dummy_buffers = self.dummy_buffers;
+        ffn.ep_dummy_experts = self.dummy_views;
+        ffn.mixed_expert_gate_up_tiers = self.tier_gate_up;
+        ffn.mixed_expert_down_tiers = self.tier_down;
+    }
+}
+
+/// Shard one loaded MoE FFN's routed experts to this rank's sealed compact
+/// owners: two-phase prepare (repartition + adapt + dummies + tables +
+/// compact bind against the untouched resident set), then an infallible
+/// swap that retires displaced tensors in an explicit owner field until
+/// teardown.
+///
+/// Signature (frozen for C4): `shard_moe_experts(gpu, ffn, shard, rank,
+/// n_exp, mesh, physical_devices)`.
+pub fn shard_moe_experts(
+    gpu: &mut Gpu,
+    ffn: &mut MoeFfnWeights,
+    shard: &ShardConfig,
+    rank: usize,
+    n_exp: usize,
+    mesh: &DeviceMesh,
+    physical_devices: &[i32],
 ) -> HipResult<()> {
-    Err(HipError::new(
-        0,
-        "qwen35: sealed MoE EP execution is unsupported; refusing compact EP owner",
-    ))
+    let assignment = validate_shard_topology(shard, rank, n_exp, mesh, physical_devices, gpu)?;
+    if ffn.expert_execution_plan.n_experts() != n_exp {
+        return Err(HipError::new(
+            0,
+            &format!(
+                "qwen35: EP shard layer covers {} experts, expected {n_exp}",
+                ffn.expert_execution_plan.n_experts()
+            ),
+        ));
+    }
+    let prepared =
+        PreparedMoeShard::prepare(gpu, ffn, mesh, physical_devices, assignment, rank, shard)?;
+    prepared.commit(gpu, ffn);
+    Ok(())
+}
+
+/// Shard every MoE layer's routed experts to this rank's sealed compact
+/// owners. Two-phase across layers: every layer prepares while the old
+/// model is untouched; only after ALL succeed does the infallible swap run.
+/// A later-layer prepare failure frees the prepared artifacts and leaves
+/// every old owner bit-identical. Displaced tensors retire per layer until
+/// teardown. REAP and paged models are refused before any work.
+///
+/// Signature (frozen for C4): `shard_all_moe_layers(gpu, weights, shard,
+/// rank, n_exp, reap_active, mesh, physical_devices)`.
+pub fn shard_all_moe_layers(
+    gpu: &mut Gpu,
+    weights: &mut Qwen35Weights,
+    shard: &ShardConfig,
+    rank: usize,
+    n_exp: usize,
+    reap_active: bool,
+    mesh: &DeviceMesh,
+    physical_devices: &[i32],
+) -> HipResult<()> {
+    shard_all_moe_layers_inner(
+        gpu,
+        weights,
+        shard,
+        rank,
+        n_exp,
+        reap_active,
+        mesh,
+        physical_devices,
+        None,
+    )
+}
+
+/// Fault-injecting seam for [`shard_all_moe_layers`] (tests only).
+#[doc(hidden)]
+pub fn shard_all_moe_layers_with_fault(
+    gpu: &mut Gpu,
+    weights: &mut Qwen35Weights,
+    shard: &ShardConfig,
+    rank: usize,
+    n_exp: usize,
+    reap_active: bool,
+    mesh: &DeviceMesh,
+    physical_devices: &[i32],
+    fault: super::load::EpFault,
+) -> HipResult<()> {
+    shard_all_moe_layers_inner(
+        gpu,
+        weights,
+        shard,
+        rank,
+        n_exp,
+        reap_active,
+        mesh,
+        physical_devices,
+        Some(fault),
+    )
+}
+
+fn shard_all_moe_layers_inner(
+    gpu: &mut Gpu,
+    weights: &mut Qwen35Weights,
+    shard: &ShardConfig,
+    rank: usize,
+    n_exp: usize,
+    reap_active: bool,
+    mesh: &DeviceMesh,
+    physical_devices: &[i32],
+    fault: Option<super::load::EpFault>,
+) -> HipResult<()> {
+    if reap_active {
+        return Err(HipError::new(
+            0,
+            "qwen35: post-load EP shard refuses REAP keep-maps",
+        ));
+    }
+    if weights.pager.is_some() {
+        return Err(HipError::new(
+            0,
+            "qwen35: post-load EP shard refuses paged models",
+        ));
+    }
+    let assignment = validate_shard_topology(shard, rank, n_exp, mesh, physical_devices, gpu)?;
+    // Admission pass over every layer before any mutation: all MoE, all
+    // sealed Single, all fully resident.
+    let mut moe_layers: Vec<usize> = Vec::new();
+    for (index, layer) in weights.layers.iter().enumerate() {
+        let ffn = match layer {
+            LayerWeights::DeltaNetMoe(weights) => Some(&weights.ffn),
+            LayerWeights::FullAttnMoe(weights) => Some(&weights.ffn),
+            _ => None,
+        };
+        let Some(ffn) = ffn else {
+            return Err(HipError::new(
+                0,
+                &format!("qwen35: EP shard refuses non-MoE layer {index}"),
+            ));
+        };
+        if ffn.expert_execution_plan.n_experts() != n_exp || ffn.experts.len() != n_exp {
+            return Err(HipError::new(
+                0,
+                &format!("qwen35: EP shard layer {index} is not fully resident"),
+            ));
+        }
+        moe_layers.push(index);
+    }
+    if moe_layers.is_empty() {
+        return Err(HipError::new(0, "qwen35: EP shard found no MoE layers"));
+    }
+    // Prepare every layer while the old model is untouched.
+    let mut prepared: Vec<(usize, PreparedMoeShard)> = Vec::with_capacity(moe_layers.len());
+    for &index in &moe_layers {
+        if matches!(
+            fault,
+            Some(super::load::EpFault::ShardPrepare { layer }) if layer == index
+        ) {
+            for (_, shard) in prepared.drain(..) {
+                shard.free(gpu);
+            }
+            return Err(HipError::new(
+                0,
+                &format!("qwen35: EP fault injection at ShardPrepare (layer {index})"),
+            ));
+        }
+        let ffn = match &weights.layers[index] {
+            LayerWeights::DeltaNetMoe(weights) => &weights.ffn,
+            LayerWeights::FullAttnMoe(weights) => &weights.ffn,
+            _ => unreachable!("EP shard admission passed layer {index}"),
+        };
+        match PreparedMoeShard::prepare(gpu, ffn, mesh, physical_devices, assignment, rank, shard) {
+            Ok(shard) => prepared.push((index, shard)),
+            Err(error) => {
+                for (_, shard) in prepared.drain(..) {
+                    shard.free(gpu);
+                }
+                return Err(error);
+            }
+        }
+    }
+    // All prepared: infallible swap.
+    for (index, shard) in prepared {
+        let ffn = match &mut weights.layers[index] {
+            LayerWeights::DeltaNetMoe(weights) => &mut weights.ffn,
+            LayerWeights::FullAttnMoe(weights) => &mut weights.ffn,
+            _ => unreachable!("EP shard admission passed layer {index}"),
+        };
+        shard.commit(gpu, ffn);
+    }
+    Ok(())
 }
 
 /// TriAttention tap helper (inline from original forward).
