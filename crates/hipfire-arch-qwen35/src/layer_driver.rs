@@ -411,6 +411,9 @@ mod tests {
                     awq_scale: None,
                 }
             }
+            let (expert_execution_plan, expert_table, expert_binding) =
+                crate::qwen35::weights::test_expert_binding().expect("test owner expert metadata");
+
             Ok(MoeFfnWeights {
                 router: weight_from(&mut buffers),
                 experts: Vec::new(),
@@ -430,6 +433,11 @@ mod tests {
                 paro_shared: None,
                 global_expert_dtypes: None,
                 ep_dummy_buffers: Vec::new(),
+                mixed_expert_gate_up_tiers: None,
+                mixed_expert_down_tiers: None,
+                expert_execution_plan,
+                expert_table,
+                expert_binding,
             })
         }
 

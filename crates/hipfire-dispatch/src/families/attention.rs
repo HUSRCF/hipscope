@@ -675,8 +675,9 @@ fn dispatch_kv_write(
             // arithmetic and legacy single-arena addressing); every failed
             // predicate and HIPFIRE_FA_BATCH_FUSE_OFF=1 keep the old path.
             let pos = io.positions();
+            #[cfg(feature = "deltanet")]
             if gpu.arch_caps.is_gfx1100() && !gpu.flags.fa_batch_fuse_off {
-                hip!(gpu.kv_cache_write_q8_0_pair_batched(
+                return hip!(gpu.kv_cache_write_q8_0_pair_batched(
                     io.k_cache,
                     io.v_cache,
                     io.k,
@@ -685,25 +686,24 @@ fn dispatch_kv_write(
                     io.n_kv_heads,
                     io.head_dim,
                     io.batch_size,
-                ))
-            } else {
-                hip!(gpu.kv_cache_write_q8_0_batched(
-                    io.k_cache,
-                    io.k,
-                    pos,
-                    io.n_kv_heads,
-                    io.head_dim,
-                    io.batch_size,
-                ))?;
-                hip!(gpu.kv_cache_write_q8_0_batched(
-                    io.v_cache,
-                    io.v,
-                    pos,
-                    io.n_kv_heads,
-                    io.head_dim,
-                    io.batch_size,
-                ))
+                ));
             }
+            hip!(gpu.kv_cache_write_q8_0_batched(
+                io.k_cache,
+                io.k,
+                pos,
+                io.n_kv_heads,
+                io.head_dim,
+                io.batch_size,
+            ))?;
+            hip!(gpu.kv_cache_write_q8_0_batched(
+                io.v_cache,
+                io.v,
+                pos,
+                io.n_kv_heads,
+                io.head_dim,
+                io.batch_size,
+            ))
         }
         KernelKey::KvWriteBf16Batched => {
             // Called twice (K, then V), like the Q8 batched write. Legacy

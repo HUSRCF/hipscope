@@ -89,11 +89,14 @@ fn qwen_single_prefill_fail_error_shape_unattested() {
         .iter()
         .filter(|event| event["type"] == "error")
         .collect();
-    assert_eq!(errors.len(), 1, "S1 must emit exactly one error: {events:?}");
+    assert_eq!(
+        errors.len(),
+        1,
+        "S1 must emit exactly one error: {events:?}"
+    );
     assert_eq!(errors[0]["id"], id);
     assert_eq!(
-        errors[0]["message"],
-        "forward_prefill_batch: injected",
+        errors[0]["message"], "forward_prefill_batch: injected",
         "S1 message shape: {events:?}"
     );
     assert_eq!(errors[0]["class"], "internal");
@@ -130,7 +133,11 @@ fn qwen_single_decode_fail_error_shape_unattested() {
         .iter()
         .filter(|event| event["type"] == "error")
         .collect();
-    assert_eq!(errors.len(), 1, "S2 must emit exactly one error: {events:?}");
+    assert_eq!(
+        errors.len(),
+        1,
+        "S2 must emit exactly one error: {events:?}"
+    );
     assert_eq!(errors[0]["message"], "forward_scratch decode: injected");
     assert_eq!(errors[0]["class"], "internal");
     assert_eq!(errors[0]["retryable"], false);
@@ -170,7 +177,11 @@ fn qwen_single_downshift_fail_error_shape_unattested() {
         .iter()
         .filter(|event| event["type"] == "error")
         .collect();
-    assert_eq!(errors.len(), 1, "S4 must emit exactly one error: {events:?}");
+    assert_eq!(
+        errors.len(),
+        1,
+        "S4 must emit exactly one error: {events:?}"
+    );
     assert_eq!(errors[0]["class"], "transient");
     assert_eq!(errors[0]["retryable"], true);
     assert_eq!(
@@ -214,14 +225,18 @@ fn pp_prefill_fail_error_shape_attested() {
         .iter()
         .filter(|event| event["type"] == "error")
         .collect();
-    assert_eq!(errors.len(), 1, "P2 must emit exactly one error: {events:?}");
-    assert_eq!(errors[0]["message"], "forward_prefill_batch_multi: injected");
+    assert_eq!(
+        errors.len(),
+        1,
+        "P2 must emit exactly one error: {events:?}"
+    );
+    assert_eq!(
+        errors[0]["message"],
+        "forward_prefill_batch_multi: injected"
+    );
     assert_eq!(errors[0]["class"], "validation");
     assert_eq!(errors[0]["retryable"], false);
-    assert_eq!(
-        errors[0]["rolled_back"], true,
-        "P2 is attested since E2"
-    );
+    assert_eq!(errors[0]["rolled_back"], true, "P2 is attested since E2");
     assert!(
         events.iter().all(|event| event["type"] != "done"),
         "P2 must not emit done: {events:?}"
@@ -258,8 +273,15 @@ fn pp_decode_fail_error_shape_attested() {
         .iter()
         .filter(|event| event["type"] == "error")
         .collect();
-    assert_eq!(errors.len(), 1, "P2 must emit exactly one error: {events:?}");
-    assert_eq!(errors[0]["message"], "forward_scratch_multi decode: injected");
+    assert_eq!(
+        errors.len(),
+        1,
+        "P2 must emit exactly one error: {events:?}"
+    );
+    assert_eq!(
+        errors[0]["message"],
+        "forward_scratch_multi decode: injected"
+    );
     assert_eq!(errors[0]["rolled_back"], true);
     assert!(
         events.iter().all(|event| event["type"] != "done"),
@@ -287,7 +309,10 @@ fn pp_abort_attested_cancel_shape_stable() {
         "attested abort must not emit error: {events:?}"
     );
     assert_eq!(
-        events.iter().filter(|event| event["type"] == "aborted").count(),
+        events
+            .iter()
+            .filter(|event| event["type"] == "aborted")
+            .count(),
         1
     );
     let done: Vec<&serde_json::Value> = events
@@ -468,7 +493,11 @@ fn qwen_single_prefill_fail_error_shape_attested() {
         .iter()
         .filter(|event| event["type"] == "error")
         .collect();
-    assert_eq!(errors.len(), 1, "S1 must emit exactly one error: {events:?}");
+    assert_eq!(
+        errors.len(),
+        1,
+        "S1 must emit exactly one error: {events:?}"
+    );
     assert_eq!(errors[0]["message"], "forward_prefill_batch: injected");
     assert_eq!(errors[0]["class"], "internal");
     assert_eq!(errors[0]["retryable"], false);
@@ -509,7 +538,11 @@ fn qwen_single_downshift_fail_error_shape_attested() {
         .iter()
         .filter(|event| event["type"] == "error")
         .collect();
-    assert_eq!(errors.len(), 1, "S4 must emit exactly one error: {events:?}");
+    assert_eq!(
+        errors.len(),
+        1,
+        "S4 must emit exactly one error: {events:?}"
+    );
     assert_eq!(errors[0]["class"], "transient");
     assert_eq!(errors[0]["retryable"], true);
     assert_eq!(errors[0]["rolled_back"], true);
@@ -604,6 +637,63 @@ fn pp_fail_closed_writer_wire_shape() {
         events.len(),
         2,
         "PP fail-closed writer must emit only gen_start and error: {events:?}"
+    );
+    assert_eq!(events[0]["type"], "gen_start");
+    assert_eq!(events[1]["type"], "error");
+    teardown();
+}
+
+/// Sealed Single-MoE expert mutation failure is one attested error terminal.
+/// The routed expert has already written its private result, but publication
+/// into the residual is faulted before any token or commit visibility.
+#[test]
+fn qwen_single_sealed_expert_mutation_fail_error_shape_attested() {
+    let _guard = lock();
+    let id = "g5-sealed-expert-mutation";
+    fresh_controlled_attempt(id, 75_001);
+    let mut sink = Vec::new();
+    {
+        let _scope = GenerationRouteScope::enter(GenerationRoute::QwenAr, id);
+        emit_generation_start(GenerationRoute::QwenAr, &mut sink, id, false);
+        let ep = RollbackEpilogue {
+            rolled_back: true,
+            context: None,
+        };
+        emit_fail_closed_error(
+            &mut sink,
+            Some(id),
+            "sealed MoE expert mutation before combine publication: injected",
+            "gpu",
+            true,
+            &ep,
+        );
+    }
+    let events = parse_lines(&sink);
+    let errors: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|event| event["type"] == "error")
+        .collect();
+    assert_eq!(
+        errors.len(),
+        1,
+        "sealed expert fault must emit one error: {events:?}"
+    );
+    assert_eq!(errors[0]["rolled_back"], true);
+    assert_eq!(errors[0]["class"], "gpu");
+    assert_eq!(errors[0]["retryable"], true);
+    assert!(
+        errors[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("sealed MoE expert mutation before combine publication"),
+        "fault message must identify the sealed boundary: {events:?}"
+    );
+    assert!(
+        events.iter().all(|event| !matches!(
+            event["type"].as_str(),
+            Some("token" | "committed" | "done" | "aborted")
+        )),
+        "sealed expert fault must publish no post-error events: {events:?}"
     );
     assert_eq!(events[0]["type"], "gen_start");
     assert_eq!(events[1]["type"], "error");

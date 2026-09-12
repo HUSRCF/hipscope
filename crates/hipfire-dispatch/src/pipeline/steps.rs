@@ -11,6 +11,7 @@ use crate::context::DispatchCtx;
 use crate::families::fused_qkv::{FusedQkvBiasParams, FusedQkvFamily, FusedQkvParams};
 use crate::families::gemv::{GemvFamily, GemvParams, RotateInputs, WeightRef};
 use crate::families::rotation::{RotationFamily, RotationParams};
+use crate::pipeline::sealed_moe;
 use crate::types::GemvVariant;
 use crate::types::{DispatchError, KernelKey, PipelineOp, RotationPlan, RotationVariant};
 
@@ -81,6 +82,9 @@ pub enum Step<'a> {
         bias: &'a GpuTensor,
         dim: usize,
     },
+    /// Complete validated MoE program. The call owns the bound expert view and
+    /// raw operands privately; callers can only obtain it through `seal_*`.
+    Moe(sealed_moe::SealedMoeCall<'a>),
 }
 
 /// Op-kind for fusion matching. Total over Step variants.
@@ -93,6 +97,10 @@ fn op_kind(step: &Step) -> PipelineOp {
         Step::Rope { .. } => PipelineOp::Rope,
         Step::QkNorm { .. } => PipelineOp::QkNorm,
         Step::BiasAdd { .. } => PipelineOp::BiasAdd,
+        // MoE is already a complete grammar, so it must never be considered
+        // a projection fusion prefix.  `MoeCombine` is the existing pipeline
+        // marker and lowers to the dedicated `SuperOpKind::Moe`.
+        Step::Moe(_) => PipelineOp::MoeCombine,
     }
 }
 
@@ -651,16 +659,24 @@ pub fn execute_steps(
     ctx: &DispatchCtx,
     steps: &[Step],
 ) -> Result<(), DispatchError> {
+    // Validate every sealed call before issuing even the first non-MoE launch.
+    // This is intentionally a separate pass: a malformed later call must not
+    // leave an earlier step partially executed.
+    for step in steps {
+        if let Step::Moe(call) = step {
+            call.validate_for_gpu(gpu)?;
+        }
+    }
+
     let mut i = 0;
     while i < steps.len() {
         if let Some((key, len)) = match_prefix(FUSED_TABLE, &steps[i..], ctx) {
             // ── QKV bias fold (HIPFIRE_FUSE_QKV_BIAS) ────────────────────────
             // When the flag is on, the matched window is a per-row 3-way QKV
             // decode key whose kernel supports the fold, and the 3 steps right
-            // after the window are `BiasAdd` on the q/k/v outputs in order, fold
-            // the bias into the kernel's lane-0 store and skip those 3 steps.
-            // The fold is `acc + bias[row]` (fp32, same operand order as the
-            // separate `bias_add`) → byte-identical to the unfused path.
+            // after the window are `BiasAdd` on the q/k/v outputs in order,
+            // fold the bias into the kernel's lane-0 store and skip those 3
+            // steps.
             if ctx.flags.fuse_qkv_bias && len == QKV3.len() && qkv_bias_fold_supported(key, ctx) {
                 if let Some(biases) = match_trailing_qkv_bias(&steps[i..], len) {
                     launch_fused_qkv_with_bias(gpu, ctx, key, &steps[i..i + len], biases)?;
@@ -668,7 +684,6 @@ pub fn execute_steps(
                     continue;
                 }
             }
-            // ─────────────────────────────────────────────────────────────────
             launch_fused(gpu, ctx, key, &steps[i..i + len])?;
             i += len;
         } else {
@@ -1002,6 +1017,7 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
         Step::BiasAdd { x, bias, dim } => gpu
             .bias_add_f32(x, bias, 1, *dim)
             .map_err(|e| DispatchError::Hip(e.to_string())),
+        Step::Moe(call) => sealed_moe::execute_sealed(gpu, ctx, call),
     }
 }
 

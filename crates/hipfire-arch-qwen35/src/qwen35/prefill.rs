@@ -21,7 +21,6 @@ use super::forward::moe_ffn_has_mq3_experts_uniform;
 use super::forward::moe_ffn_has_mq3_structural;
 use super::forward::moe_ffn_has_unsupported_mq3_experts_uniform;
 use super::forward::Qwen35Scratch;
-use super::weights::per_expert_tier_tables;
 use super::weights::DeltaNetLayerWeights;
 use super::weights::DeltaNetMoeLayerWeights;
 use super::weights::DeltaNetState;
@@ -771,6 +770,8 @@ pub fn forward_prefill_batch_single_chunk_captured_opts(
     // which routes max_ctx_len > 8192 to the tiled attention_flash_q8_0_tile_batched
     // (O(1) LDS, no per-position malloc). The former physical_cap > 15000 guard
     // predated that crossover (landed 2026-06-09) and is now obsolete.
+    #[cfg(feature = "moe-oracle")]
+    crate::qwen35::oracle::set_prefill_start(start_pos).map_err(|e| HipError::new(0, &e))?;
     forward_prefill_chunk(
         gpu,
         weights,
@@ -1330,6 +1331,9 @@ fn forward_prefill_batch_with_pbs_opts_inner(
                     n,
                 );
             }
+            #[cfg(feature = "moe-oracle")]
+            crate::qwen35::oracle::set_prefill_start(start_pos + chunk_start)
+                .map_err(|e| hip_bridge::HipError::new(0, &e))?;
             forward_prefill_chunk(
                 gpu,
                 weights,
@@ -2944,6 +2948,16 @@ pub(crate) fn prefill_moe_ffn_body_batched(
     let rot_batch = pbs.moe_rot_batch.as_ref().expect("moe scratch");
     let down_expanded = pbs.moe_down_expanded_batch.as_ref().expect("moe scratch");
 
+    #[cfg(feature = "moe-oracle")]
+    crate::qwen35::oracle::prefill_before(
+        gpu,
+        ffn,
+        config,
+        &pbs.x_batch,
+        n,
+        crate::qwen35::oracle::prefill_start().map_err(|e| hip_bridge::HipError::new(0, &e))?,
+    )
+    .map_err(|e| hip_bridge::HipError::new(0, &e))?;
     // ── 1. Split rmsnorm vs FWHT rotate ──
     //
     // A3B (and every other MoE here) leaves router + shared_expert_gate
@@ -3267,28 +3281,6 @@ pub(crate) fn prefill_moe_ffn_body_batched(
         ),
     }
 
-    // ── 3. GPU softmax + top-K + renorm, batched over N tokens ──
-    //
-    // Same Path B split as the decode call site: split the fused
-    // softmax+topk+renorm into gpu.softmax_f32 + moe_topk_renorm_k8_batched
-    // so prefill activations match the CPU-reference softmax math
-    // exactly. router_logits is allocated 1D as [n × n_exp]; alias it
-    // into a 2D view so gpu.softmax_f32 takes rows = n.
-    let router_logits_2d = GpuTensor {
-        buf: unsafe { router_logits.buf.alias() },
-        shape: vec![n, n_exp],
-        dtype: DType::F32,
-    };
-    gpu.softmax_f32(&router_logits_2d)?;
-    gpu.moe_topk_renorm_k8_batched(
-        router_logits,
-        topk_indices,
-        topk_weights,
-        n_exp,
-        config.norm_topk_prob,
-        n,
-    )?;
-
     // ── 4. Shared-expert SwiGLU + FWHT, batched over N tokens ──
     //
     // fused_silu_mul_rotate_mq_batched expects [batch × k] gate/up with
@@ -3495,10 +3487,9 @@ pub(crate) fn prefill_moe_ffn_body_batched(
     let total_slots = n * k_top;
     let m_total_max = moe_grouped_m_total_bound(total_slots, n_exp);
 
-    // SP2: per-expert tier tables for intra-layer mixed-tier dispatch (same
-    // semantics as the decode builder). Uniform layer ⇒ None ⇒ uniform fast
-    // path. This prefill site always has ≥1 expert (indexed [0] above).
-    let (per_expert_gate_up, per_expert_down) = per_expert_tier_tables(ffn);
+    // The load-time owner caches only genuinely mixed tier arrays. Borrowing
+    // these slices keeps prefill allocation-free and preserves uniform None.
+    let (per_expert_gate_up, per_expert_down) = ffn.per_expert_tier_tables();
     let moe_dtypes = hipfire_dispatch::families::moe::MoeDtypes {
         router: ffn.router.gpu_dtype,
         shared_gate: ffn.shared_expert_gate.gpu_dtype,
@@ -3524,9 +3515,9 @@ pub(crate) fn prefill_moe_ffn_body_batched(
         } else {
             ffn.experts[0].down.gpu_dtype
         },
-        // Prefill never fires the merged decode kernel (decode-only), but the
-        // shared MoeDtypes struct still requires the flag; carry it honestly.
-        routed_has_mixed_experts: ffn.expert_dtype_tags.is_some(),
+        // The cached mixed-only tier slices are the source of truth for both
+        // projections; borrowing their presence avoids any per-call scan.
+        routed_has_mixed_experts: per_expert_gate_up.is_some() || per_expert_down.is_some(),
         has_paro_shared: ffn.paro_shared.is_some(),
         per_expert_gate_up,
         per_expert_down,
@@ -3577,6 +3568,7 @@ pub(crate) fn prefill_moe_ffn_body_batched(
         x_rot_batch: &pbs.x_rot_batch,
         expert_gate_up_ptrs: &ffn.expert_gate_up_ptrs,
         expert_down_ptrs: &ffn.expert_down_ptrs,
+        routed_experts: ffn,
         expert_down_awq_ptrs: ffn.expert_down_awq_ptrs.as_ref(),
         expert_dtype_tags: ffn.expert_dtype_tags.as_ref(),
         gate_batch,
@@ -3595,9 +3587,55 @@ pub(crate) fn prefill_moe_ffn_body_batched(
         down_awq_scale,
         routed_out,
     };
-    hipfire_runtime::llama::moe_family()
-        .run_prefill(ctx, gpu, &moe_prefill_params)
+    let bound = ffn.bound_experts()?;
+    let mut sealed =
+        hipfire_dispatch::pipeline::sealed_moe::seal_prefill(bound, ctx, moe_prefill_params)
+            .map_err(HipError::from)?;
+    // The producer requires an exact [N × num_experts] score shape. Select
+    // the preallocated non-owning view for this chunk instead of constructing
+    // a shape Vec for every MoE layer.
+    let router_scores = pbs
+        .moe_router_score_views_batch
+        .as_ref()
+        .and_then(|views| n.checked_sub(1).and_then(|index| views.get(index)))
+        .ok_or_else(|| HipError::new(0, "moe router score scratch view is unavailable"))?;
+    let receipt = hipfire_dispatch::pipeline::sealed_moe::produce_prefill_route(
+        &sealed,
+        gpu,
+        router_scores,
+        config.norm_topk_prob,
+    )
+    .map_err(HipError::from)?;
+    sealed
+        .attach_route_receipt(receipt)
         .map_err(HipError::from)?;
+    hipfire_dispatch::pipeline::execute_steps(
+        gpu,
+        ctx,
+        &[hipfire_dispatch::pipeline::Step::Moe(sealed)],
+    )
+    .map_err(HipError::from)?;
+    #[cfg(feature = "moe-oracle")]
+    {
+        let oracle_start =
+            crate::qwen35::oracle::prefill_start().map_err(|e| hip_bridge::HipError::new(0, &e))?;
+        crate::qwen35::oracle::prefill_after(
+            gpu,
+            ffn,
+            config,
+            &pbs.x_batch,
+            router_logits,
+            topk_indices,
+            topk_weights,
+            gate_batch,
+            up_batch,
+            rot_batch,
+            down_expanded,
+            n,
+            oracle_start,
+        )
+        .map_err(|e| hip_bridge::HipError::new(0, &e))?;
+    }
 
     Ok(())
 }

@@ -56,6 +56,7 @@ pub mod prefix;
 pub mod reset_core;
 pub mod safetensors_source;
 pub mod sampler;
+pub mod sealed_moe;
 pub mod serve;
 pub mod spec;
 

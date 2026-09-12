@@ -10,6 +10,14 @@ use hip_bridge;
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::sync::{LazyLock, OnceLock};
 
+pub mod sealed_moe;
+pub use sealed_moe::{
+    checked_grouped_m_total_bound, checked_tp_local_shapes, produce_prefill_route, seal_decode,
+    seal_decode_with_router, seal_prefill, seal_prefill_with_router, ActivationIdentity,
+    ActivationInput, BoundMoeExperts, ExpertBindingCache, ExpertMetadata, ExpertResource,
+    ExpertResources, ExpertTable, MoeContribution, MoeProtocol, MoeRouteReceipt, MoeRouterInput,
+    MoeSharedContribution, ResourceAlias, SealedMoeCall,
+};
 pub(crate) mod steps;
 pub use steps::{execute_steps, FusedPattern, GemvInput, Step};
 
@@ -44,7 +52,6 @@ pub struct LinearParams<'a> {
 
 pub enum PipelineParams<'a> {
     Linear(LinearParams<'a>),
-    Moe(crate::families::moe::MoeParams<'a>),
 }
 
 pub fn execute_pipeline(
@@ -55,16 +62,10 @@ pub fn execute_pipeline(
     dtype: rdna_compute::DType,
     registry: &KernelRegistry,
 ) -> Result<(), DispatchError> {
-    if let PipelineParams::Moe(p) = params {
-        return run_moe_decode(ctx, gpu, p);
-    }
     if let Some(key) = find_fused(registry, ctx, dtype, steps) {
         return dispatch_fused(ctx, gpu, key, params);
     }
-    let params = match params {
-        PipelineParams::Linear(p) => p,
-        PipelineParams::Moe(_) => unreachable!(),
-    };
+    let PipelineParams::Linear(params) = params;
     for &step in steps {
         match step {
             PipelineOp::RotateFwht => {
@@ -582,16 +583,18 @@ pub fn run_uniform_moe_down_expanded(
     }
 }
 
-/// MoE decode executor. Ports the body of `moe_ffn_decode_impl` verbatim,
-/// substituting `ffn.*`/`config.*`/`s.*` references with `MoeParams` fields.
-/// Resolution is owned here (computed from `MoeDtypes` + k), and `ctx` is
-/// threaded to every inner GEMV so the call site builds one `DispatchCtx`.
-pub fn run_moe_decode(
+/// Sealed indexed-decode executor.  Raw `MoeParams` never reaches this helper
+/// directly; only a `SealedMoeCall` produced by `seal_decode` can enter.
+pub(super) fn run_moe_decode(
     ctx: &DispatchCtx,
     gpu: &mut Gpu,
-    p: &crate::families::moe::MoeParams,
+    call: &SealedMoeCall<'_>,
 ) -> Result<(), DispatchError> {
     use crate::families::moe::MoeResolution;
+
+    let p = call.decode_params().ok_or_else(|| {
+        DispatchError::Hip("sealed moe: decode call has no decode operands".into())
+    })?;
 
     // Runtime guard matching the bias-aware decode guard (not debug_assert —
     // that would be stripped in release). batch_size=1 is the only valid
@@ -1672,6 +1675,13 @@ pub fn run_moe_decode(
         }
     } // end routed-expert dispatch block
 
+    #[cfg(feature = "serve-fault-inject")]
+    if crate::pipeline::sealed_moe::take_fault_after_expert_mutation() {
+        return Err(DispatchError::Hip(
+            "injected fault after sealed MoE expert mutation before combine publication".into(),
+        ));
+    }
+
     // FIXME(Step 8): replace hardcoded 1 with p.batch_size when grouped prefill lands
     // EP: routed combine accumulates into `out_target` (the zeroed partial when
     // `routed_out` is set, else `x_residual`). Under EP each rank's non-owned
@@ -2065,11 +2075,19 @@ fn run_moe_decode_cpu_fallback(
     };
 
     for (&expert_idx, &weight) in topk_indices.iter().zip(topk_weights.iter()) {
-        let (gate_up_w, down_w) = &p.routed_experts[expert_idx];
+        let (gate_up_w, down_w) =
+            p.routed_experts
+                .get(expert_idx)
+                .ok_or(DispatchError::UnsupportedVariant {
+                    family: "moe",
+                    variant: "cpu-topk-expert-not-resident",
+                    arch: "",
+                    quant: "",
+                })?;
 
         // gate_up: y = W·x  (run_auto auto-rotates for MQ/Paro dtypes).
         {
-            gemv.run_auto(ctx, gpu, gate_up_w, p.x_norm, p.gate_up_buf)?;
+            gemv.run_auto(ctx, gpu, &gate_up_w, p.x_norm, p.gate_up_buf)?;
         }
         let gate_view = slice_moe_f32_view(p.gate_up_buf, 0, mi);
         let up_view = slice_moe_f32_view(p.gate_up_buf, mi, mi);
@@ -2095,7 +2113,7 @@ fn run_moe_decode_cpu_fallback(
             ));
         }
         {
-            gemv.run_auto(ctx, gpu, down_w, &hid_view, p.ffn_out)?;
+            gemv.run_auto(ctx, gpu, &down_w, &hid_view, p.ffn_out)?;
         }
         hip!(gpu.scaled_add_inplace_cpu_scalar_f32(p.x_residual, p.ffn_out, weight))?;
     }
@@ -3063,21 +3081,18 @@ fn dispatch_grouped_gemm(
     }
 }
 
-/// Qwen3.5 batched MoE prefill routed-expert executor. Verbatim transcription
-/// of the routed block from `prefill_moe_ffn_body_batched` (qwen35.rs:7281).
-///
-/// Sequence: scatter → gate_up (Path 2 grouped / Path 1 indexed) → unscatter →
-/// SwiGLU+rotate → down (Path 2 / Path 1 / Path 0) → combine into `x_batch`.
-///
-/// `ctx` is decision-only (arch/env) — resolution is computed from
-/// `MoeDtypes` + `ArchCaps` + `FeatureFlags` once at entry. The raw
-/// `gpu.gemm_*`/`gpu.gemv_*` kernel calls do not take `ctx`.
-pub fn run_moe_prefill(
+/// Sealed grouped-prefill executor.  The raw prefill parameter bundle is
+/// retained only as private operands of a validated call.
+pub(super) fn run_moe_prefill(
     ctx: &DispatchCtx,
     gpu: &mut Gpu,
-    p: &crate::families::moe::MoePrefillParams,
+    call: &SealedMoeCall<'_>,
 ) -> Result<(), DispatchError> {
     use crate::families::moe::MoePrefillResolution;
+
+    let p = call.prefill_params().ok_or_else(|| {
+        DispatchError::Hip("sealed moe: prefill call has no prefill operands".into())
+    })?;
 
     let res = MoePrefillResolution::resolve(&p.dtypes, &ctx.arch, &ctx.flags);
     let force_mq4_grouped_fp16 = res.force_mq4_grouped_fp16 || p.force_mq4_grouped_fp16;
@@ -3540,6 +3555,12 @@ pub fn run_moe_prefill(
             res.use_paro_i8,
             res.use_paro_i8_k8,
         )?;
+        #[cfg(feature = "serve-fault-inject")]
+        if crate::pipeline::sealed_moe::take_fault_after_expert_mutation() {
+            return Err(DispatchError::Hip(
+                "injected fault after sealed MoE expert mutation before combine publication".into(),
+            ));
+        }
         hip!(gpu.moe_down_combine_grouped_k8(
             p.y_down_grouped,
             p.inverse_perm,
@@ -3576,6 +3597,12 @@ pub fn run_moe_prefill(
             }
         };
         down_result?;
+        #[cfg(feature = "serve-fault-inject")]
+        if crate::pipeline::sealed_moe::take_fault_after_expert_mutation() {
+            return Err(DispatchError::Hip(
+                "injected fault after sealed MoE expert mutation before combine publication".into(),
+            ));
+        }
     } else {
         // Path 1: atomic-free expanded GEMV write + combine.
         // Mixed Path1 (issue 2): when `expert_dtype_tags` exists, use the
@@ -3677,6 +3704,12 @@ pub fn run_moe_prefill(
             };
             down_result?;
         }
+        #[cfg(feature = "serve-fault-inject")]
+        if crate::pipeline::sealed_moe::take_fault_after_expert_mutation() {
+            return Err(DispatchError::Hip(
+                "injected fault after sealed MoE expert mutation before combine publication".into(),
+            ));
+        }
         hip!(gpu.moe_down_combine_k8_batched(
             p.down_expanded,
             p.topk_weights,
@@ -3696,10 +3729,7 @@ pub fn dispatch_fused(
     key: KernelKey,
     params: &PipelineParams,
 ) -> Result<(), DispatchError> {
-    let params = match params {
-        PipelineParams::Linear(p) => p,
-        PipelineParams::Moe(p) => return run_moe_decode(ctx, gpu, p),
-    };
+    let PipelineParams::Linear(params) = params;
     match key {
         KernelKey::GemvMfp4G32Fused => {
             gpu.ensure_mq_signs()

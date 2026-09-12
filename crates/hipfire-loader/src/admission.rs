@@ -508,6 +508,20 @@ pub fn admit_source(
         if let Some(refusal) = tp_geometry_refusal(tp, visible_device_count()) {
             return Err(refusal);
         }
+        // Qwen3.5 MoE has no EP serve path. Parse the retained source's
+        // actual config before any caller can tear down its active model or
+        // enter `Gpus::init_ep`; this must reuse the loader's established
+        // refusal predicate and exact error text.
+        if matches!(arch_id, 5 | 6) {
+            let ModelSource::Hfq(hfq) = &source else {
+                return Err("EP qwen35 requires an HFQ source".to_string());
+            };
+            let config = hipfire_arch_qwen35::qwen35::config_from_hfq(hfq)
+                .map_err(|e| format!("qwen35 config: {e}"))?;
+            if let Some(refusal) = crate::qwen35_ep_moe_refusal(arch_id, config.num_experts) {
+                return Err(refusal);
+            }
+        }
         (EffectiveTopology::Expert(tp), None)
     } else {
         // Single / pipeline-parallel via the carrier registry.

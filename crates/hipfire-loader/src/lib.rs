@@ -4088,7 +4088,9 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
 
 #[cfg(test)]
 mod ep_admission_tests {
-    use super::{ep_admission, qwen35_ep_moe_refusal};
+    use super::{admission, ep_admission, qwen35_ep_moe_refusal};
+    use hipfire_runtime::hfq::{write_hfqm_package_mem, HfqMemTensor};
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn qwen35_moe_ep_refuses_before_load_but_dense_admits() {
@@ -4123,6 +4125,118 @@ mod ep_admission_tests {
         for arch in [5u32, 6, 9, 10] {
             assert!(ep_admission(arch).is_ok(), "arch {arch} + EP must admit");
         }
+    }
+
+    /// Tiny consumer-facing load owner used to exercise the admission boundary:
+    /// a successful candidate would tear down and replace the active model, while
+    /// a refusal must leave its identity and observable response untouched.
+    #[derive(Debug, PartialEq, Eq)]
+    struct ActiveModel {
+        identity: &'static str,
+        response: Vec<u8>,
+    }
+
+    impl ActiveModel {
+        fn request(&self) -> Vec<u8> {
+            self.response.clone()
+        }
+    }
+
+    #[derive(Debug, Default, PartialEq, Eq)]
+    struct LoadEffects {
+        teardowns: usize,
+        allocations: usize,
+        publications: usize,
+    }
+
+    fn qwen35_moe_fixture() -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "hipfire-loader-qwen35-moe-admission-{}.hfq",
+            std::process::id()
+        ));
+        let metadata = serde_json::json!({
+            "config": {
+                "hidden_size": 4,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 1,
+                "vocab_size": 8,
+                "num_experts": 4,
+                "num_experts_per_tok": 1,
+                "moe_intermediate_size": 2,
+                "shared_expert_intermediate_size": 2
+            }
+        })
+        .to_string();
+        write_hfqm_package_mem(
+            &path,
+            6,
+            &metadata,
+            &[HfqMemTensor {
+                name: "model.embed_tokens.weight".into(),
+                quant_type: 1,
+                shape: vec![8, 4],
+                group_size: 0,
+                data: vec![0; 32],
+            }],
+        )
+        .expect("write qwen35 MoE admission fixture");
+        path
+    }
+
+    /// Mirror the daemon's source-admission boundary without touching a GPU:
+    /// destructive effects are reachable only after `admit_source` succeeds.
+    fn attempt_candidate_swap(
+        candidate: &Path,
+        active: &mut ActiveModel,
+        effects: &mut LoadEffects,
+    ) -> Result<(), String> {
+        let admitted = admission::admit_source(
+            candidate.to_str().expect("fixture path is UTF-8"),
+            4,
+            1,
+            None,
+            None,
+            "gfx1201",
+            None,
+            None,
+            4096,
+        )?;
+
+        // These represent the externally observable transaction stages in the
+        // daemon: prior-model teardown, candidate allocation, publication.
+        effects.teardowns += 1;
+        active.response.clear();
+        effects.allocations += 1;
+        effects.publications += 1;
+        drop(admitted);
+        Ok(())
+    }
+
+    /// A routed Qwen3.5 candidate is refused by the pure loader preflight while
+    /// an earlier model is active. No teardown/allocation/publication occurs,
+    /// and the active model remains identifiable and usable.
+    #[test]
+    fn qwen35_moe_ep_refusal_preserves_active_model() {
+        let candidate = qwen35_moe_fixture();
+        let mut active = ActiveModel {
+            identity: "qwen3.6:27b-a3b-active",
+            response: b"active-model-response".to_vec(),
+        };
+        let before_identity = active.identity;
+        let before_response = active.request();
+        let mut effects = LoadEffects::default();
+
+        let err = attempt_candidate_swap(&candidate, &mut active, &mut effects)
+            .expect_err("Qwen3.5 MoE EP candidate must refuse before teardown");
+        assert_eq!(
+            err,
+            qwen35_ep_moe_refusal(6, 4).expect("MoE refusal text must be defined")
+        );
+        assert_eq!(effects, LoadEffects::default());
+        assert_eq!(active.identity, before_identity);
+        assert_eq!(active.request(), before_response);
+
+        let _ = std::fs::remove_file(candidate);
     }
 }
 

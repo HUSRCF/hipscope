@@ -313,6 +313,9 @@ pub struct ManifestPlan {
     pub collective_schedule: Vec<CollectiveScheduleEntry>,
     /// PP boundary hints in ascending after-layer order.
     pub band_xfers: Vec<(usize, CollectiveHint)>,
+    /// Mesh generation used to compile this plan.  Executors must reject a
+    /// plan presented with a different mesh, even when the shape is equal.
+    pub mesh_epoch: crate::device_mesh::MeshEpoch,
 }
 
 fn base_coord_for(entry: &WeightEntry, mesh: &DeviceMesh, n_layers: usize) -> Vec<usize> {
@@ -622,6 +625,7 @@ pub fn plan_manifest(
         layer_collectives,
         collective_schedule: schedule,
         band_xfers,
+        mesh_epoch: mesh.epoch(),
     })
 }
 
@@ -665,10 +669,111 @@ pub enum ExpertSourceLayout {
     },
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct ExpertResourceRequirements {
-    pub bytes_per_expert: usize,
+/// Exact resource requirements for one expert's three projections.
+///
+/// `gate_bytes` and `up_bytes` are kept separate even when the carrier stores
+/// them in one fused blob.  The sealed planner checks their checked sum against
+/// the encoded fused source instead of pretending every expert has the same
+/// aggregate size.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ExpertProjectionResources {
+    pub gate_bytes: usize,
+    pub up_bytes: usize,
+    pub down_bytes: usize,
     pub alignment: usize,
+}
+
+impl ExpertProjectionResources {
+    /// Checked total of the three projection allocations.
+    pub fn total_bytes(&self) -> Result<usize, String> {
+        self.gate_bytes
+            .checked_add(self.up_bytes)
+            .and_then(|total| total.checked_add(self.down_bytes))
+            .ok_or_else(|| "expert projection byte total overflows usize".to_string())
+    }
+
+    pub fn validate(&self, context: &str, expert: usize) -> Result<(), String> {
+        if self.gate_bytes == 0 || self.up_bytes == 0 || self.down_bytes == 0 {
+            return Err(format!(
+                "{context}: expert {expert} projection byte counts must be non-zero"
+            ));
+        }
+        if self.alignment == 0 || !self.alignment.is_power_of_two() {
+            return Err(format!(
+                "{context}: expert {expert} alignment must be a non-zero power of two"
+            ));
+        }
+        for (label, bytes) in [
+            ("gate", self.gate_bytes),
+            ("up", self.up_bytes),
+            ("down", self.down_bytes),
+        ] {
+            if bytes % self.alignment != 0 {
+                return Err(format!(
+                    "{context}: expert {expert} {label} bytes {bytes} are not aligned to {}",
+                    self.alignment
+                ));
+            }
+        }
+        self.total_bytes()
+            .map_err(|error| format!("{context}: expert {expert} {error}"))?;
+        Ok(())
+    }
+}
+
+/// Ordered per-expert resources.  The index in `experts` is the global expert
+/// ID; no representative expert is allowed to stand in for later entries.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ExpertResourceRequirements {
+    pub experts: Vec<ExpertProjectionResources>,
+}
+
+impl ExpertResourceRequirements {
+    pub fn new(experts: Vec<ExpertProjectionResources>) -> Self {
+        Self { experts }
+    }
+
+    pub fn total_bytes(&self) -> Result<usize, String> {
+        self.experts
+            .iter()
+            .enumerate()
+            .try_fold(0usize, |total, (expert, resource)| {
+                let expert_total = resource
+                    .total_bytes()
+                    .map_err(|error| format!("expert {expert} {error}"))?;
+                total
+                    .checked_add(expert_total)
+                    .ok_or_else(|| "total expert projection bytes overflow usize".to_string())
+            })
+    }
+
+    /// Maximum checked allocation size of any one expert's projections.
+    pub fn max_bytes(&self) -> Result<usize, String> {
+        self.experts
+            .iter()
+            .enumerate()
+            .try_fold(0usize, |maximum, (expert, resource)| {
+                let expert_total = resource
+                    .total_bytes()
+                    .map_err(|error| format!("expert {expert} {error}"))?;
+                Ok(maximum.max(expert_total))
+            })
+    }
+
+    pub fn validate(&self, n_experts: usize, context: &str) -> Result<(), String> {
+        if self.experts.len() != n_experts {
+            return Err(format!(
+                "{context}: resource record count={} != n_experts={n_experts}",
+                self.experts.len()
+            ));
+        }
+        for (expert, resource) in self.experts.iter().enumerate() {
+            resource.validate(context, expert)?;
+        }
+        self.total_bytes()
+            .map_err(|error| format!("{context}: {error}"))?;
+        Ok(())
+    }
 }
 
 /// Architecture-declared identity and source description of one expert group.
@@ -793,6 +898,15 @@ fn source_shape_matches(
             entry.name, entry.policy
         ));
     }
+    if label == "sidecar" {
+        if entry.logical_shape.is_empty() || entry.logical_shape.contains(&0) {
+            return Err(format!(
+                "{context}: sidecar source '{}' shape {:?} is empty or zero-sized",
+                entry.name, entry.logical_shape
+            ));
+        }
+        return Ok(());
+    }
     if entry.logical_shape.len() < 2 {
         return Err(format!(
             "{context}: {label} source '{}' shape {:?} is too short",
@@ -811,11 +925,14 @@ fn source_shape_matches(
 fn validate_expert_sources(spec: &ExpertGroupSpec, manifest: &[WeightEntry]) -> Result<(), String> {
     let context = expert_context(spec);
     let router = manifest_entry(spec, manifest, "router", &spec.router)?;
-    if !matches!(router.logical_shape.len(), 1 | 2)
-        || router.logical_shape.last() != Some(&spec.n_experts)
-    {
+    let router_shape_matches = match router.logical_shape.as_slice() {
+        [n_experts] => *n_experts == spec.n_experts,
+        [n_experts, _hidden] => *n_experts == spec.n_experts,
+        _ => false,
+    };
+    if !router_shape_matches {
         return Err(format!(
-            "{context}: router '{}' shape {:?} must end in n_experts={}",
+            "{context}: router '{}' shape {:?} must start with n_experts={}",
             router.name, router.logical_shape, spec.n_experts
         ));
     }
@@ -832,22 +949,18 @@ fn validate_expert_sources(spec: &ExpertGroupSpec, manifest: &[WeightEntry]) -> 
         spec.source_layout,
         ExpertSourceLayout::PerExpertFused { .. } | ExpertSourceLayout::PerExpertSeparate { .. }
     );
-    if per_expert && spec.parallelism != ExpertParallelism::Single {
-        return Err(format!(
-            "{context}: per-expert source layout is only admitted for Single"
-        ));
-    }
 
     for (label, names) in source_names(&spec.source_layout) {
-        if names.is_empty() {
+        if per_expert && label != "sidecar" {
+            if names.len() != spec.n_experts {
+                return Err(format!(
+                    "{context}: {label} source count={} != n_experts={}",
+                    names.len(),
+                    spec.n_experts
+                ));
+            }
+        } else if names.is_empty() {
             continue;
-        }
-        if per_expert && label != "sidecar" && names.len() != spec.n_experts {
-            return Err(format!(
-                "{context}: {label} source count={} != n_experts={}",
-                names.len(),
-                spec.n_experts
-            ));
         }
         let mut seen = HashSet::new();
         let mut shape: Option<Vec<usize>> = None;
@@ -899,16 +1012,10 @@ pub fn validate_expert_group_specs(
                 "{context}: group/router/execution identities must be non-empty"
             ));
         }
-        if spec.n_experts == 0 || spec.resources.bytes_per_expert == 0 {
-            return Err(format!(
-                "{context}: n_experts and bytes_per_expert must be non-zero"
-            ));
+        if spec.n_experts == 0 {
+            return Err(format!("{context}: n_experts must be non-zero"));
         }
-        if spec.resources.alignment == 0 || !spec.resources.alignment.is_power_of_two() {
-            return Err(format!(
-                "{context}: alignment must be a non-zero power of two"
-            ));
-        }
+        spec.resources.validate(spec.n_experts, &context)?;
         if !groups.insert((&spec.group, spec.layer)) {
             return Err(format!("{context}: duplicate group/layer identity"));
         }
@@ -1019,7 +1126,7 @@ mod tests {
     #[test]
     fn expert_source_identity_and_shape_are_checked() {
         let manifest = vec![
-            WeightEntry::layer("router", 0, vec![8, 4], DType::F16, ShardPolicy::Replicate),
+            WeightEntry::layer("router", 0, vec![4, 8], DType::F16, ShardPolicy::Replicate),
             WeightEntry::layer(
                 "gate_up",
                 0,
@@ -1053,8 +1160,15 @@ mod tests {
                 sidecars: Vec::new(),
             },
             resources: ExpertResourceRequirements {
-                bytes_per_expert: 1024,
-                alignment: 256,
+                experts: vec![
+                    ExpertProjectionResources {
+                        gate_bytes: 256,
+                        up_bytes: 256,
+                        down_bytes: 256,
+                        alignment: 256,
+                    };
+                    4
+                ],
             },
             router: "router".into(),
             execution: "moe.ffn".into(),
@@ -1078,8 +1192,15 @@ mod tests {
                     sidecars: Vec::new(),
                 },
                 resources: ExpertResourceRequirements {
-                    bytes_per_expert: 1024,
-                    alignment: 256,
+                    experts: vec![
+                        ExpertProjectionResources {
+                            gate_bytes: 256,
+                            up_bytes: 256,
+                            down_bytes: 256,
+                            alignment: 256,
+                        };
+                        4
+                    ],
                 },
                 router: "router".into(),
                 execution: "moe.ffn".into(),
@@ -1191,5 +1312,224 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("source dtype contract"));
+    }
+    #[test]
+    fn expert_resources_have_exact_checked_totals() {
+        let first = ExpertProjectionResources {
+            gate_bytes: 256,
+            up_bytes: 512,
+            down_bytes: 768,
+            alignment: 256,
+        };
+        let second = ExpertProjectionResources {
+            gate_bytes: 512,
+            up_bytes: 256,
+            down_bytes: 256,
+            alignment: 256,
+        };
+        assert_eq!(first.total_bytes(), Ok(1536));
+        let resources = ExpertResourceRequirements::new(vec![first, second]);
+        assert_eq!(resources.total_bytes(), Ok(2560));
+        assert_eq!(resources.max_bytes(), Ok(1536));
+        assert!(resources.validate(2, "exact").is_ok());
+    }
+
+    #[test]
+    fn expert_resources_reject_count_mismatch() {
+        let resources = ExpertResourceRequirements::new(vec![ExpertProjectionResources {
+            gate_bytes: 256,
+            up_bytes: 256,
+            down_bytes: 256,
+            alignment: 256,
+        }]);
+        let error = resources.validate(2, "count").unwrap_err();
+        assert!(error.contains("resource record count=1"));
+        assert!(error.contains("n_experts=2"));
+    }
+
+    #[test]
+    fn expert_resources_reject_zero_projection_or_alignment() {
+        let zero_projection = ExpertResourceRequirements::new(vec![ExpertProjectionResources {
+            gate_bytes: 0,
+            up_bytes: 256,
+            down_bytes: 256,
+            alignment: 256,
+        }]);
+        assert!(zero_projection.validate(1, "zero-gate").is_err());
+
+        let zero_alignment = ExpertResourceRequirements::new(vec![ExpertProjectionResources {
+            gate_bytes: 256,
+            up_bytes: 256,
+            down_bytes: 256,
+            alignment: 0,
+        }]);
+        assert!(zero_alignment.validate(1, "zero-alignment").is_err());
+    }
+
+    #[test]
+    fn expert_resources_reject_checked_total_overflow() {
+        let resource = ExpertProjectionResources {
+            gate_bytes: usize::MAX - 2,
+            up_bytes: 1,
+            down_bytes: 1,
+            alignment: 1,
+        };
+        assert_eq!(resource.total_bytes(), Ok(usize::MAX));
+        let resources = ExpertResourceRequirements::new(vec![resource.clone(), resource]);
+        assert_eq!(
+            resources.total_bytes(),
+            Err("total expert projection bytes overflow usize".to_string())
+        );
+        assert_eq!(resources.max_bytes(), Ok(usize::MAX));
+        let error = resources.validate(2, "overflow").unwrap_err();
+        assert!(error.contains("total expert projection bytes overflow"));
+        let overflowing = ExpertResourceRequirements::new(vec![ExpertProjectionResources {
+            gate_bytes: usize::MAX,
+            up_bytes: 1,
+            down_bytes: 1,
+            alignment: 1,
+        }]);
+        assert!(overflowing.total_bytes().is_err());
+        assert!(overflowing.max_bytes().is_err());
+    }
+
+    #[test]
+    fn per_expert_fused_and_separate_source_lists_must_match_expert_count() {
+        let mut manifest = vec![WeightEntry::layer(
+            "router",
+            0,
+            vec![4, 8],
+            DType::F16,
+            ShardPolicy::Replicate,
+        )];
+        for index in 0..4 {
+            manifest.push(WeightEntry::layer(
+                &format!("gate{index}"),
+                0,
+                vec![8, 8],
+                DType::F16,
+                ShardPolicy::Replicate,
+            ));
+        }
+        let resources = ExpertResourceRequirements::new(vec![
+            ExpertProjectionResources {
+                gate_bytes: 256,
+                up_bytes: 256,
+                down_bytes: 256,
+                alignment: 256,
+            };
+            4
+        ]);
+        let fused = ExpertGroupSpec {
+            group: "fused".into(),
+            layer: Some(0),
+            n_experts: 4,
+            parallelism: ExpertParallelism::Single,
+            assignment: ExpertAssign::Stride,
+            source_layout: ExpertSourceLayout::PerExpertFused {
+                gate_up: Vec::new(),
+                down: vec!["down0".into(); 4],
+                sidecars: Vec::new(),
+            },
+            resources: resources.clone(),
+            router: "router".into(),
+            execution: "moe.ffn".into(),
+        };
+        let fused_error = validate_expert_group_specs(&[fused], &manifest).unwrap_err();
+        assert!(fused_error.contains("gate_up source count=0"));
+
+        let separate = ExpertGroupSpec {
+            group: "separate".into(),
+            layer: Some(0),
+            n_experts: 4,
+            parallelism: ExpertParallelism::Single,
+            assignment: ExpertAssign::Stride,
+            source_layout: ExpertSourceLayout::PerExpertSeparate {
+                gate: vec![
+                    "gate0".into(),
+                    "gate1".into(),
+                    "gate2".into(),
+                    "gate3".into(),
+                ],
+                up: vec!["up0".into(); 3],
+                down: vec!["down0".into(); 4],
+                sidecars: Vec::new(),
+            },
+            resources,
+            router: "router".into(),
+            execution: "moe.ffn".into(),
+        };
+        let separate_error = validate_expert_group_specs(&[separate], &manifest).unwrap_err();
+        assert!(separate_error.contains("up source count=3"));
+    }
+    #[test]
+    fn duplicate_manifest_and_expert_alias_records_are_rejected() {
+        let duplicate_manifest = vec![
+            WeightEntry::layer(
+                "duplicate",
+                0,
+                vec![2, 2],
+                DType::F16,
+                ShardPolicy::Replicate,
+            ),
+            WeightEntry::layer(
+                "duplicate",
+                0,
+                vec![2, 2],
+                DType::F16,
+                ShardPolicy::Replicate,
+            ),
+        ];
+        let duplicate_error = validate_expert_group_specs(&[], &duplicate_manifest).unwrap_err();
+        assert!(duplicate_error.contains("duplicate manifest identity"));
+
+        let policy = ShardPolicy::Replicate;
+        let mut manifest = vec![WeightEntry::layer(
+            "router",
+            0,
+            vec![2, 2],
+            DType::F16,
+            policy.clone(),
+        )];
+        for name in ["gate0", "gate1", "up0", "up1", "down0", "down1"] {
+            manifest.push(WeightEntry::layer(
+                name,
+                0,
+                vec![2, 2],
+                DType::F16,
+                policy.clone(),
+            ));
+        }
+        let spec = |gate: Vec<&str>| ExpertGroupSpec {
+            group: "alias-records".into(),
+            layer: Some(0),
+            n_experts: 2,
+            parallelism: ExpertParallelism::Single,
+            assignment: ExpertAssign::Stride,
+            source_layout: ExpertSourceLayout::PerExpertSeparate {
+                gate: gate.into_iter().map(str::to_owned).collect(),
+                up: vec!["up0".into(), "up1".into()],
+                down: vec!["down0".into(), "down1".into()],
+                sidecars: Vec::new(),
+            },
+            resources: ExpertResourceRequirements::new(vec![
+                ExpertProjectionResources {
+                    gate_bytes: 16,
+                    up_bytes: 16,
+                    down_bytes: 16,
+                    alignment: 8,
+                };
+                2
+            ]),
+            router: "router".into(),
+            execution: "test.alias".into(),
+        };
+        let duplicate_source =
+            validate_expert_group_specs(&[spec(vec!["gate0", "gate0"])], &manifest).unwrap_err();
+        assert!(duplicate_source.contains("duplicate gate source"));
+
+        let missing_source =
+            validate_expert_group_specs(&[spec(vec!["gate0", "missing"])], &manifest).unwrap_err();
+        assert!(missing_source.contains("not found"));
     }
 }

@@ -14,7 +14,7 @@ default = ["deltanet"]
 # Mirrors hipfire-arch-minimax: the shared MoE rotate/silu helpers in
 # hipfire-runtime::llama are deltanet-gated. Cohere2-MoE uses full
 # rotate_half RoPE (not partial), but keeps the gate for kernel-family parity.
-deltanet = ["hipfire-runtime/deltanet", "rdna-compute/deltanet"]
+deltanet = ["hipfire-runtime/deltanet", "hipfire-dispatch/deltanet", "rdna-compute/deltanet"]
 
 [dependencies]
 hipfire-config = { path = "../hipfire-config" }

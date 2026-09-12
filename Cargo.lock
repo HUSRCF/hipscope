@@ -1310,6 +1310,7 @@ dependencies = [
  "saddle-core",
  "serde",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -1487,6 +1488,7 @@ dependencies = [
  "hipfire-arch-qwen35",
  "hipfire-arch-qwen35-vl",
  "hipfire-config",
+ "hipfire-dispatch",
  "hipfire-engine",
  "hipfire-loader",
  "hipfire-pflash",

@@ -52,11 +52,10 @@ pub const MIXED_SUPPORTED_TIERS: [DType; 5] = [
 /// the dispatch crate needs no dependency on any arch crate.
 ///
 /// `experts_all_gate_up_mq4` mirrors the `ffn.experts.iter().all(..)` clause
-/// the original `gate_side_mq4` check used (qwen35.rs:4598-4605); the routed
-/// fields use experts[0] as representative (the loader builds all experts in a
-/// layer with matching dtype, so [0] == all — same invariant the original
-/// routed_* checks relied on).
-pub struct MoeDtypes {
+/// the original `gate_side_mq4` check used (qwen35.rs:4598-4605). The routed
+/// fields use experts[0] as the representative only for uniform dispatch;
+/// genuinely mixed layers carry their load-time per-expert slices below.
+pub struct MoeDtypes<'a> {
     pub router: DType,
     pub shared_gate: DType,        // ffn.shared_expert_gate
     pub shared_expert_gate: DType, // ffn.shared_expert.gate
@@ -68,9 +67,8 @@ pub struct MoeDtypes {
     /// Per-expert mixed routed dtype: experts in one layer carry DIFFERENT
     /// gate_up and/or down dtypes (N-tier graded: MQ6 hot / MQ4 mid / MQ2L
     /// or MQ3L or E8-family cold), so `routed_gate_up` / `routed_down`
-    /// (= experts[0]) are NOT representative. Built by the model as
-    /// `ffn.expert_dtype_tags.is_some()` — the tag table is built iff any
-    /// expert's gate_up or down dtype differs from experts[0]. Tags:
+    /// (= experts[0]) are NOT representative. The model borrows the
+    /// load-time mixed-only slices below; no token-time table is rebuilt.
     ///   0 = MQ6G256       (200 B/grp affine)
     ///   1 = MQ2G256Lloyd  ( 72 B/grp codebook)
     ///   2 = MQ4G256       (136 B/grp affine)
@@ -85,12 +83,14 @@ pub struct MoeDtypes {
     /// (default) ⇒ today's uniform path (representative `routed_gate_up` drives
     /// resolution). `Some(table)` with >1 distinct DType marks the layer
     /// `mixed`; a `Some` table that is all-equal collapses to the uniform path.
-    pub per_expert_gate_up: Option<Vec<DType>>,
+    /// The slice is borrowed from immutable load-time metadata; decode and
+    /// prefill must not rebuild or allocate this table.
+    pub per_expert_gate_up: Option<&'a [DType]>,
     /// Per-expert down tiers (parallel to `per_expert_gate_up`). Same semantics.
-    pub per_expert_down: Option<Vec<DType>>,
+    pub per_expert_down: Option<&'a [DType]>,
 }
 
-impl MoeDtypes {
+impl MoeDtypes<'_> {
     pub fn has_mq6_projection(&self) -> bool {
         [
             self.shared_expert_gate,
@@ -193,11 +193,11 @@ impl MoeResolution {
     /// Arch-agnostic entry. The E8 indexed/grouped kernels exist on the RDNA3
     /// wave32-WMMA family (gfx11; `arch_has_e8_wmma`); passing `false` here routes
     /// E8 to the CPU-top-K fallback — preserving every existing caller + test.
-    pub fn resolve(d: &MoeDtypes, k: usize) -> Self {
+    pub fn resolve(d: &MoeDtypes<'_>, k: usize) -> Self {
         Self::resolve_arch(d, k, false)
     }
 
-    pub fn resolve_arch(d: &MoeDtypes, k: usize, arch_has_e8_wmma: bool) -> Self {
+    pub fn resolve_arch(d: &MoeDtypes<'_>, k: usize, arch_has_e8_wmma: bool) -> Self {
         use DType::*;
         // The fused four-weight gate kernel is admitted only for the exact
         // MQ4G256 V1 quartet. The exact MQ4G256V2 quartet is admitted on a
@@ -337,7 +337,7 @@ impl MoeResolution {
         // than one distinct DType. A Some table that is all-equal collapses to
         // the uniform fast path (mixed = false), so existing arches — which pass
         // None for both tables — are always uniform and byte-identical to today.
-        let table_varies = |t: &Option<Vec<DType>>| {
+        let table_varies = |t: &Option<&[DType]>| {
             t.as_ref()
                 .and_then(|v| v.split_first())
                 .map(|(first, rest)| rest.iter().any(|dt| dt != first))
@@ -384,12 +384,26 @@ impl MoeResolution {
 
 // ── Dispatch parameters ────────────────────────────────
 
+/// Host-resident routed weights used only by the generic CPU-top-K fallback.
+///
+/// Implementations return borrowed dispatch views on demand so model hot paths
+/// do not rebuild an expert-reference vector for every token.
+pub trait RoutedExpertWeights {
+    fn len(&self) -> usize;
+
+    fn get(&self, expert_idx: usize) -> Option<(WeightRef<'_>, WeightRef<'_>)>;
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
 /// Everything the MoE decode executor arm reads, marshaled by the model from
 /// its weight/config/scratch structs. Resolution is owned by the family
 /// (the model passes only the dtype snapshot + k); the executor computes
 /// [`MoeResolution`] from [`MoeDtypes`] on entry.
 pub struct MoeParams<'a> {
-    pub dtypes: MoeDtypes,
+    pub dtypes: MoeDtypes<'a>,
     /// Token-batch width. Decode = 1. >1 must route to grouped prefill (Step 8).
     /// Guarded at runtime matching the bias-aware decode guard.
     pub batch_size: usize,
@@ -451,16 +465,10 @@ pub struct MoeParams<'a> {
     pub routed_gate_up_k: usize,
     pub routed_down_m: usize,
     pub routed_down_k: usize,
-    /// Per-expert (gate_up, down) weight refs for the generic CPU-top-K
-    /// fallback (`!use_gpu_topk`: k != 8 OR routed dtype not indexable).
-    /// Master's `moe_ffn_decode_impl` indexed `ffn.experts[expert_idx]` in a
-    /// host loop; the indexed-kernel pointer tables above can't drive that
-    /// path (they assume k=8 + an indexable routed dtype). One ref pair per
-    /// expert, length `n_exp`. **Empty** when the layer is paged (the indexed
-    /// GPU-top-K path is the only mode in paged residency) — the fallback
-    /// asserts non-empty before use, matching master's `ffn.experts[..]`
-    /// indexing (which also required resident experts).
-    pub routed_experts: &'a [(WeightRef<'a>, WeightRef<'a>)],
+    /// Allocation-free access to resident per-expert weights for the generic
+    /// CPU-top-K fallback (`!use_gpu_topk`). Empty under paged residency, where
+    /// the indexed GPU-top-K path is the only supported mode.
+    pub routed_experts: &'a dyn RoutedExpertWeights,
     // paro sidecars
     pub routed_gate_up_paro: Option<GivensRef<'a>>,
     pub routed_down_paro: Option<GivensRef<'a>>,
@@ -741,7 +749,7 @@ pub struct MoeBiasAwarePrefillParams<'a> {
 /// Scratch tensors are model-owned; the family holds only references.
 pub struct MoePrefillParams<'a> {
     // dtype snapshot
-    pub dtypes: MoeDtypes,
+    pub dtypes: MoeDtypes<'a>,
     // dims
     pub batch_size: usize,
     pub mi: usize,
@@ -770,6 +778,8 @@ pub struct MoePrefillParams<'a> {
     // routed gate_up/down pointer tables
     pub expert_gate_up_ptrs: &'a GpuTensor,
     pub expert_down_ptrs: &'a GpuTensor,
+    /// Exact live expert owners bound to the sealed load-time identity.
+    pub routed_experts: &'a dyn RoutedExpertWeights,
     /// Route A MoE-AWQ: per-routed-expert down `awq_scale` pointer table (see
     /// [`MoeParams::expert_down_awq_ptrs`]). When `Some`, the prefill silu+rotate
     /// uses the indexed AWQ kernel (per-slot scale via `topk_indices`),
@@ -842,7 +852,7 @@ impl MoePrefillResolution {
     /// Reads MoE prefill env levers from `flags` (parsed once at `Gpu::init`),
     /// not `std::env` — mid-prefill env mutation is not honored.
     pub fn resolve(
-        d: &MoeDtypes,
+        d: &MoeDtypes<'_>,
         arch: &rdna_compute::arch_caps::ArchCaps,
         flags: &rdna_compute::feature_flags::FeatureFlags,
     ) -> Self {
@@ -947,24 +957,6 @@ impl MoeFamily {
         self.registry.resolve(key, ctx, shape)
     }
 
-    /// Run a single-token MoE decode step through the centralized executor.
-    ///
-    /// Delegates to [`crate::pipeline::run_moe_decode`], which dispatches the
-    /// GPU top-K fast path (k=8 with an indexable routed dtype ∈ {MQ4G256,
-    /// MQ6G256, ParoQ4G128}) or the generic CPU-top-K fallback (k != 8 or a
-    /// non-indexable routed dtype). Resolution is owned here (the family
-    /// resolves [`MoeDtypes`] → [`MoeResolution`]), and `ctx` is threaded
-    /// through every inner GEMV so the call site builds one `DispatchCtx`
-    /// per token (not 6+). Scratch stays model-owned.
-    pub fn run(
-        &self,
-        ctx: &DispatchCtx,
-        gpu: &mut rdna_compute::Gpu,
-        params: &MoeParams,
-    ) -> Result<(), DispatchError> {
-        crate::pipeline::run_moe_decode(ctx, gpu, params)
-    }
-
     /// Run a single-token deepseek4 bias-aware MoE decode step (k=6, MQ2-Lloyd
     /// routed experts). Delegates to [`crate::pipeline::run_moe_decode_bias_aware`].
     ///
@@ -1009,24 +1001,6 @@ impl MoeFamily {
     ) -> Result<(), DispatchError> {
         crate::pipeline::run_moe_prefill_bias_aware(gpu, params)
     }
-
-    /// Run a batched/prefill qwen35 MoE routed-expert block (k=8, softmax
-    /// top-k, MQ4/MQ6/Paro routed experts): scatter → gate_up → unscatter →
-    /// SwiGLU+rotate → down → combine, accumulating into `params.x_batch`.
-    ///
-    /// The model owns RMSNorm, the router GEMV + softmax top-k, and the
-    /// shared expert. Family owns resolution (`MoeDtypes` + arch + flags →
-    /// [`MoePrefillResolution`]) and the full routed pipeline. `ctx` is
-    /// decision-only (arch/env) — threaded once per chunk, not per layer.
-    /// Delegates to [`crate::pipeline::run_moe_prefill`].
-    pub fn run_prefill(
-        &self,
-        ctx: &DispatchCtx,
-        gpu: &mut rdna_compute::Gpu,
-        params: &MoePrefillParams,
-    ) -> Result<(), DispatchError> {
-        crate::pipeline::run_moe_prefill(ctx, gpu, params)
-    }
 }
 
 impl KernelFamily for MoeFamily {
@@ -1039,7 +1013,7 @@ impl KernelFamily for MoeFamily {
 mod tests {
     use super::*;
 
-    fn uniform_mq4() -> MoeDtypes {
+    fn uniform_mq4() -> MoeDtypes<'static> {
         MoeDtypes {
             router: DType::MQ4G256,
             shared_gate: DType::MQ4G256,
@@ -1066,8 +1040,8 @@ mod tests {
     #[test]
     fn resolve_some_per_expert_with_varied_tiers_is_mixed() {
         let mut d = uniform_mq4();
-        d.per_expert_gate_up = Some(vec![DType::MQ4G256, DType::MQ6G256]); // varies
-        d.per_expert_down = Some(vec![DType::MQ4G256, DType::MQ6G256]);
+        d.per_expert_gate_up = Some(&[DType::MQ4G256, DType::MQ6G256]); // varies
+        d.per_expert_down = Some(&[DType::MQ4G256, DType::MQ6G256]);
         let r = MoeResolution::resolve(&d, 8);
         assert!(r.mixed);
     }
@@ -1076,8 +1050,8 @@ mod tests {
     fn resolve_empty_per_expert_table_is_not_mixed_and_does_not_panic() {
         // A degenerate empty table must not index v[0]; it collapses to uniform.
         let mut d = uniform_mq4();
-        d.per_expert_gate_up = Some(vec![]);
-        d.per_expert_down = Some(vec![]);
+        d.per_expert_gate_up = Some(&[]);
+        d.per_expert_down = Some(&[]);
         let r = MoeResolution::resolve(&d, 8);
         assert!(!r.mixed);
     }
@@ -1086,8 +1060,8 @@ mod tests {
     fn resolve_some_per_expert_all_same_is_not_mixed() {
         // a per-expert table that is uniform should NOT trigger the mixed path
         let mut d = uniform_mq4();
-        d.per_expert_gate_up = Some(vec![DType::MQ4G256, DType::MQ4G256]);
-        d.per_expert_down = Some(vec![DType::MQ4G256, DType::MQ4G256]);
+        d.per_expert_gate_up = Some(&[DType::MQ4G256, DType::MQ4G256]);
+        d.per_expert_down = Some(&[DType::MQ4G256, DType::MQ4G256]);
         let r = MoeResolution::resolve(&d, 8);
         assert!(
             !r.mixed,

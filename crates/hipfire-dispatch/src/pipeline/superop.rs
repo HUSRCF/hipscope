@@ -260,6 +260,7 @@ pub fn lower_layer(steps: &[Step], ctx: &DispatchCtx) -> LayerProgram {
             PipelineOp::GemvResidual => SuperOpKind::ResidualGemv,
             PipelineOp::RmsnormAutomatic => SuperOpKind::Norm,
             PipelineOp::Attend => SuperOpKind::Attend,
+            PipelineOp::MoeCombine => SuperOpKind::Moe,
             // Rope/QkNorm/BiasAdd are per-op-only Step vocabulary: never fused,
             // never lowered via superop. Emitting them into a lowered program
             // is a bug (no SuperOpKind exists for them).
