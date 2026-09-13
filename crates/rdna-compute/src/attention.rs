@@ -3901,6 +3901,9 @@ impl Gpu {
         batch_size: usize,
         partials: &GpuTensor,
     ) -> HipResult<bool> {
+        if self.replay.is_recording() {
+            return Ok(false);
+        }
         if !(self.arch_caps.is_gfx1100() || self.arch_caps.is_gfx1201()) {
             return Ok(false);
         }

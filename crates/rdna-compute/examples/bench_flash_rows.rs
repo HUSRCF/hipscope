@@ -106,6 +106,9 @@ fn main() {
     };
     if !run_rows(&mut gpu) {
         eprintln!("multi-row kernel refused this shape");
+        if check {
+            std::process::exit(1);
+        }
         return;
     }
     gpu.hip.device_synchronize().unwrap();
@@ -156,6 +159,21 @@ fn main() {
 
     let rows_out = gpu.download_f32(&d_out).unwrap();
     let batched_out = gpu.download_f32(&d_out_batched).unwrap();
+    let expected = batch * q_dim;
+    if check {
+        if rows_out.len() != expected || batched_out.len() != expected {
+            eprintln!(
+                "FAIL: output length mismatch (rows={}, batched={}, expected={expected})",
+                rows_out.len(),
+                batched_out.len()
+            );
+            std::process::exit(1);
+        }
+        if rows_out.iter().any(|x| !x.is_finite()) || batched_out.iter().any(|x| !x.is_finite()) {
+            eprintln!("FAIL: non-finite values in multi-row or batched output");
+            std::process::exit(1);
+        }
+    }
     let scale = batched_out
         .iter()
         .fold(0.0f32, |m, x| m.max(x.abs()))

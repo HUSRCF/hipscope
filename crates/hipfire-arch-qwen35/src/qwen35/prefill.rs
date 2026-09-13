@@ -5917,6 +5917,7 @@ fn q8_multirow_attn_admitted(
     is_tree: bool,
     is_independent: bool,
     capture_mode: bool,
+    replay_recording: bool,
 ) -> bool {
     matches!(arch, "gfx1100" | "gfx1201")
         && quant_q8
@@ -5926,6 +5927,7 @@ fn q8_multirow_attn_admitted(
         && !is_tree
         && !is_independent
         && !capture_mode
+        && !replay_recording
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7985,6 +7987,7 @@ pub(crate) fn forward_batch_chunk_impl(
         tree_verify.is_some(),
         batch_semantics.is_independent(),
         gpu.graphs.capture_mode,
+        gpu.replay.is_recording(),
     );
     let logical_max_ctx = match batch_semantics {
         BatchSemantics::Sequential => start_pos + n,
@@ -8821,6 +8824,7 @@ mod tests {
                         false,
                         false,
                         false,
+                        false,
                     ));
                 }
             }
@@ -8837,7 +8841,8 @@ mod tests {
                         min_ctx,
                         is_tree,
                         is_independent,
-                        capture_mode| {
+                        capture_mode,
+                        replay_recording| {
             q8_multirow_attn_admitted(
                 arch,
                 quant_q8,
@@ -8848,6 +8853,7 @@ mod tests {
                 is_tree,
                 is_independent,
                 capture_mode,
+                replay_recording,
             )
         };
         assert!(!admitted(
@@ -8857,6 +8863,7 @@ mod tests {
             8,
             8192,
             Some(4096),
+            false,
             false,
             false,
             false,
@@ -8871,6 +8878,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         ));
         for head_dim in [64, 320] {
             assert!(!admitted(
@@ -8880,6 +8888,7 @@ mod tests {
                 8,
                 8192,
                 Some(4096),
+                false,
                 false,
                 false,
                 false,
@@ -8896,6 +8905,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
             ));
         }
         assert!(!admitted(
@@ -8908,20 +8918,10 @@ mod tests {
             false,
             false,
             false,
+            false,
         ));
         assert!(!admitted(
-            "gfx1100", true, 256, 8, 8192, None, false, false, false,
-        ));
-        assert!(!admitted(
-            "gfx1100",
-            true,
-            256,
-            8,
-            8192,
-            Some(4096),
-            true,
-            false,
-            false,
+            "gfx1100", true, 256, 8, 8192, None, false, false, false, false,
         ));
         assert!(!admitted(
             "gfx1100",
@@ -8930,8 +8930,9 @@ mod tests {
             8,
             8192,
             Some(4096),
-            false,
             true,
+            false,
+            false,
             false,
         ));
         assert!(!admitted(
@@ -8942,9 +8943,34 @@ mod tests {
             8192,
             Some(4096),
             false,
+            true,
+            false,
+            false,
+        ));
+        assert!(!admitted(
+            "gfx1100",
+            true,
+            256,
+            8,
+            8192,
+            Some(4096),
+            false,
             false,
             true,
+            false,
         ));
+    }
+
+    #[test]
+    fn q8_multirow_attn_rejects_replay_recording_on_supported_arches() {
+        for arch in ["gfx1100", "gfx1201"] {
+            assert!(q8_multirow_attn_admitted(
+                arch, true, 256, 8, 8192, Some(4096), false, false, false, false,
+            ));
+            assert!(!q8_multirow_attn_admitted(
+                arch, true, 256, 8, 8192, Some(4096), false, false, false, true,
+            ));
+        }
     }
 
     #[test]
