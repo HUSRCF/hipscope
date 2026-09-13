@@ -281,52 +281,51 @@ pub fn lower_layer(steps: &[Step], ctx: &DispatchCtx) -> LayerProgram {
 /// error, never a fallback).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum EpMoeCombineMode {
-    /// Legacy rank-partial flow: per-rank zeroed partials, all-reduce-sum,
-    /// residual add. The only mode DeepSeek4/MiniMax (and the explicit
-    /// Qwen `HIPFIRE_EP_SLOT_COMBINE=0` diagnostic) ever select.
+    /// Rank-partial flow: per-rank zeroed partials, all-reduce-sum,
+    /// residual add. The mode DeepSeek4/MiniMax always select.
     RankPartial,
-    /// Canonical sealed slot order: per-rank raw expanded rows, row-granular
-    /// gather of remote-owned rows to the root, one sealed
-    /// `Step::MoeSlotCombine` on the root, broadcast-overwrite to the rest.
-    CanonicalSlotOrder,
+    /// Root-routed partial flow (Qwen plan-bound compact EP): the root
+    /// routes on-GPU and seals a route-producer proof, folding owned
+    /// experts plus the shared expert once into its zeroed partial; the
+    /// driver broadcasts the root IDs+weights device-to-device, non-roots
+    /// seal the routed contrib against the proof (zero dummies read 0),
+    /// then the existing all-reduce-sum plus residual add completes it.
+    RootRoutedPartial,
 }
 
-/// Borrowed canonical slot-combine view for one EP rank. Every buffer is
-/// borrowed from the arch binding (`Qwen35Bindings`); the view owns nothing
-/// and performs no copy. The execution fingerprint is NOT rendered here
-/// (rendering allocates); the sealer reads the contract through `experts`
-/// and the gather receipt carries the owned fingerprint string.
+/// Borrowed root-routed view for one EP rank. Every buffer is borrowed from
+/// the arch binding; the view owns nothing and performs no copy. The static
+/// contract identity is cached at load binding and read here as a u64 —
+/// never re-rendered (rendering allocates) and never hashed per token.
 #[derive(Clone, Copy)]
-pub struct EpMoeSlotView<'a> {
+pub struct EpMoeRouteView<'a> {
     /// Plan-bound experts for this rank (table + rank-local cache).
     pub experts: super::sealed_moe::BoundMoeExperts<'a>,
     /// Safetensors layer index (== `MoeFfnWeights.layer_idx`).
     pub layer: usize,
     /// Residual width (== hidden size).
     pub hidden: usize,
-    /// Route width (top-k; canonical requires 8).
+    /// Route width (top-k; root-routed requires 8).
     pub k: usize,
     /// Global expert count.
     pub n_exp: usize,
-    /// Raw per-slot down rows (`moe_down_expanded`, `[k × hidden]` f32
-    /// payload; owned selected slots hold raw `v[i]`, the rest dummies).
-    pub raw_slots: &'a GpuTensor,
-    /// Selected expert IDs (`moe_topk_indices`, `[k]` i32-as-f32).
+    /// Selected expert IDs (`moe_topk_indices`, `[k]` i32).
     pub topk_ids: &'a GpuTensor,
     /// Selected expert weights (`moe_topk_weights`, `[k]` f32).
     pub topk_weights: &'a GpuTensor,
-    /// Post-attention residual stream (root: `x0+s` after the per-rank MoE;
-    /// non-root: `x0`). The sealed combine folds into the root's in place;
-    /// broadcast overwrites the rest (never adds).
-    pub residual: &'a GpuTensor,
 }
 
-impl EpMoeSlotView<'_> {
+impl EpMoeRouteView<'_> {
     /// The adapted execution contract, if the runtime sealer attached one.
     /// `None` means this rank is not plan-bound and can never authorize a
-    /// canonical combine.
+    /// root-routed combine.
     pub fn execution_contract(&self) -> Option<&super::sealed_moe::ExpertExecutionContract> {
         self.experts.execution_contract()
+    }
+    /// Load-bound static identity of the adapted execution contract, if
+    /// plan-bound. Compared as u64 on the hot path; no per-token hashing.
+    pub fn contract_id(&self) -> Option<u64> {
+        self.experts.contract_id()
     }
 }
 
@@ -418,27 +417,96 @@ pub trait ForwardBindings {
         })
     }
 
-    /// Canonical non-root experts-only compute: norm/rotate plus the indexed
-    /// experts over the root-authoritative route IDs already resident in the
-    /// rank's top-k buffers (distributed by the EP driver before this call).
-    /// No router runs here — per-rank re-routing is the divergence this
-    /// removes. `skip_shared` is always true on this path (the root folded
-    /// the shared expert once); routed output stays expanded for the sealed
-    /// root continuation. Unsupported by default; Qwen overrides it.
-    /// The driver calls this only after every rank reported
-    /// [`EpMoeCombineMode::CanonicalSlotOrder`] and the root IDs were
-    /// distributed with proper stream ordering.
-    fn ep_run_moe_experts(
+    /// Root half of the root-routed EP MoE: seal the SoftmaxTopK route on
+    /// this (root) rank, run the router + owned experts + the shared expert
+    /// once into `partial` (a **zeroed** per-rank buffer the EP executor
+    /// all-reduces across ranks), and return the sealer-issued
+    /// [`MoeRouteProducerProof`](super::sealed_moe::MoeRouteProducerProof)
+    /// only after successful enqueue. Unsupported by default; Qwen
+    /// overrides it. The driver calls this only after every rank reported
+    /// [`EpMoeCombineMode::RootRoutedPartial`].
+    fn ep_run_moe_root(
         &mut self,
         _gpu: &mut Gpu,
         _ctx: &DispatchCtx,
         _op: &OpBinding,
-        _receipt: &super::sealed_moe::MoeRootRouteReceipt,
-        _route_ids: &[u8; 32],
+        _partial: &GpuTensor,
+    ) -> Result<super::sealed_moe::MoeRouteProducerProof, DispatchError> {
+        Err(DispatchError::UnsupportedVariant {
+            family: "ep",
+            variant: "ep_run_moe_root-not-implemented-for-arch",
+            arch: "",
+            quant: "",
+        })
+    }
+    /// Non-root half of the root-routed EP MoE: seal the routed contrib
+    /// against `proof` (matching static contract/layer/k/n_exp plus the
+    /// non-root compact role, all checked before any launch) and run the
+    /// owned experts over the broadcast root route IDs already resident in
+    /// the rank's top-k buffers into `partial`. No router runs here —
+    /// per-rank re-routing is the divergence this removes. Unsupported by
+    /// default; Qwen overrides it.
+    fn ep_run_moe_contrib(
+        &mut self,
+        _gpu: &mut Gpu,
+        _ctx: &DispatchCtx,
+        _op: &OpBinding,
+        _proof: &super::sealed_moe::MoeRouteProducerProof,
+        _partial: &GpuTensor,
     ) -> Result<(), DispatchError> {
         Err(DispatchError::UnsupportedVariant {
             family: "ep",
-            variant: "ep_run_moe_experts-not-implemented-for-arch",
+            variant: "ep_run_moe_contrib-not-implemented-for-arch",
+            arch: "",
+            quant: "",
+        })
+    }
+    /// Pure preflight for the root half of the root-routed EP MoE: build and
+    /// validate the actual bound experts, params, seal, and route-producer
+    /// proof from the same tensor/params builders as
+    /// [`ep_run_moe_root`](Self::ep_run_moe_root), but enqueue NOTHING.
+    /// Returns the opaque
+    /// [`MoeRouteProducerProof`](super::sealed_moe::MoeRouteProducerProof)
+    /// as validation capability (static load-bound metadata), not a claim
+    /// that device bytes are already produced. The runtime EP driver calls
+    /// this on rank 0 after metadata/capacity checks but BEFORE zeroing any
+    /// partial; the normal root-compute → broadcast → non-root-compute flow
+    /// still follows. Unsupported by default; Qwen overrides it.
+    fn ep_preflight_moe_root(
+        &self,
+        _gpu: &Gpu,
+        _ctx: &DispatchCtx,
+        _op: &OpBinding,
+        _partial: &GpuTensor,
+    ) -> Result<super::sealed_moe::MoeRouteProducerProof, DispatchError> {
+        Err(DispatchError::UnsupportedVariant {
+            family: "ep",
+            variant: "ep_preflight_moe_root-not-implemented-for-arch",
+            arch: "",
+            quant: "",
+        })
+    }
+
+    /// Pure preflight for the non-root half of the root-routed EP MoE:
+    /// validate the actual bound experts, params, and proof adoption from
+    /// the same builders as
+    /// [`ep_run_moe_contrib`](Self::ep_run_moe_contrib), but enqueue
+    /// NOTHING. The runtime EP driver calls this on every non-root rank
+    /// against the root preflight proof after metadata/capacity checks but
+    /// BEFORE zeroing any partial; the normal broadcast →
+    /// non-root-compute flow still follows. Unsupported by default; Qwen
+    /// overrides it.
+    fn ep_preflight_moe_contrib(
+        &self,
+        _gpu: &Gpu,
+        _ctx: &DispatchCtx,
+        _op: &OpBinding,
+        _proof: &super::sealed_moe::MoeRouteProducerProof,
+        _partial: &GpuTensor,
+    ) -> Result<(), DispatchError> {
+        Err(DispatchError::UnsupportedVariant {
+            family: "ep",
+            variant: "ep_preflight_moe_contrib-not-implemented-for-arch",
             arch: "",
             quant: "",
         })
@@ -464,39 +532,19 @@ pub trait ForwardBindings {
     /// driver reaches a `Moe` super-op. Defaults to [`EpMoeCombineMode::RankPartial`],
     /// so DeepSeek4/MiniMax (and every existing EP route) stay byte-for-byte
     /// on the rank-partial all-reduce flow without touching their impls.
-    /// Qwen overrides this: canonical sealed slot order for plan-bound
-    /// compact EP bindings, rank-partial only under the explicit
-    /// `HIPFIRE_EP_SLOT_COMBINE=0` legacy diagnostic.
+    /// Qwen overrides this: root-routed partials for plan-bound compact EP
+    /// bindings.
     fn ep_moe_combine_mode(&self) -> EpMoeCombineMode {
         EpMoeCombineMode::RankPartial
     }
 
-    /// Borrow this rank's canonical slot-combine view (plan-bound experts,
-    /// raw expanded rows, route buffers, residual). `None` by default and
-    /// for any non-canonical binding; the runtime EP driver calls this only
-    /// after every rank reported [`EpMoeCombineMode::CanonicalSlotOrder`],
-    /// and a missing view there is a fail-stop error, never a fallback.
-    fn ep_moe_slot_view(&self) -> Option<EpMoeSlotView<'_>> {
+    /// Borrow this rank's root-routed view (plan-bound experts plus the
+    /// resident route buffers). `None` by default and for any non-root-routed
+    /// binding; the runtime EP driver calls this only after every rank
+    /// reported [`EpMoeCombineMode::RootRoutedPartial`], and a missing view
+    /// there is a fail-stop error, never a fallback.
+    fn ep_moe_route_view(&self) -> Option<EpMoeRouteView<'_>> {
         None
-    }
-
-    /// Arch seam for finishing a canonical slot combine. Unsupported by
-    /// default; Qwen intentionally does NOT override it — the runtime EP
-    /// driver seals the root `Step::MoeSlotCombine` and runs it through
-    /// `execute_steps` itself (the slot view borrows the binding, so the
-    /// driver must hold the view while advancing only the GPU; routing the
-    /// finish through `&mut self` would collide with that borrow).
-    fn ep_finish_moe_slot_combine(
-        &mut self,
-        _gpu: &mut Gpu,
-        _view: &EpMoeSlotView<'_>,
-    ) -> Result<(), DispatchError> {
-        Err(DispatchError::UnsupportedVariant {
-            family: "ep",
-            variant: "ep_finish_moe_slot_combine-not-implemented-for-arch",
-            arch: "",
-            quant: "",
-        })
     }
 
     /// Whether this rank replaces replicated `Attend` with a rank-local

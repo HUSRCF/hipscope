@@ -688,6 +688,71 @@ impl Gpus {
         wait_result.and(destroy_result)
     }
 
+    /// Ensure process-lifetime `rank_barrier_events` covers every device.
+    ///
+    /// Creates the full pool with system-release + disable-timing flags, or
+    /// validates an existing pool length. Partial create/bind failures keep
+    /// every successfully created handle reachable, drain active streams, bind
+    /// each owner, destroy the partial set, and never install a truncated pool.
+    fn ensure_rank_barrier_events(&mut self) -> HipResult<()> {
+        let n = self.devices.len();
+        if !self.rank_barrier_events.is_empty() {
+            if self.rank_barrier_events.len() != n {
+                return Err(HipError::new(
+                    0,
+                    &format!(
+                        "ensure_rank_barrier_events: event count {} != device count {n}",
+                        self.rank_barrier_events.len()
+                    ),
+                ));
+            }
+            return Ok(());
+        }
+
+        let mut events = Vec::with_capacity(n);
+        let mut init_error: Option<HipError> = None;
+        for rank in 0..n {
+            let gpu = &self.devices[rank];
+            if let Err(error) = gpu.bind_thread() {
+                init_error = Some(error);
+                break;
+            }
+            match gpu
+                .hip
+                .event_create_with_flags(HIP_EVENT_DISABLE_TIMING | HIP_EVENT_RELEASE_TO_SYSTEM)
+            {
+                Ok(event) => events.push(event),
+                Err(error) => {
+                    init_error = Some(error);
+                    break;
+                }
+            }
+        }
+
+        if let Some(error) = init_error {
+            // Quiesce before destroy so any in-flight work cannot race teardown.
+            for rank in 0..n {
+                let gpu = &self.devices[rank];
+                let _ = gpu.bind_thread();
+                if let Some(stream) = gpu.active_stream.as_ref() {
+                    let _ = gpu.hip.stream_synchronize(stream);
+                }
+            }
+            for (owner, event) in events.drain(..).enumerate() {
+                let _ = self.devices[owner].bind_thread();
+                let _ = self.devices[owner].hip.event_destroy(event);
+            }
+            debug_assert!(
+                self.rank_barrier_events.is_empty(),
+                "failed ensure_rank_barrier_events must not install a partial pool"
+            );
+            return Err(error);
+        }
+
+        self.rank_barrier_events = events;
+        Ok(())
+    }
+
     /// Enqueue an all-rank producer barrier using process-lifetime events.
     ///
     /// Each rank records its event after producing a peer-visible tensor, then
@@ -704,34 +769,7 @@ impl Gpus {
         }
 
         let n = self.devices.len();
-        if self.rank_barrier_events.is_empty() {
-            let mut events = Vec::with_capacity(n);
-            for rank in 0..n {
-                let gpu = &self.devices[rank];
-                gpu.bind_thread()?;
-                match gpu
-                    .hip
-                    .event_create_with_flags(HIP_EVENT_DISABLE_TIMING | HIP_EVENT_RELEASE_TO_SYSTEM)
-                {
-                    Ok(event) => events.push(event),
-                    Err(error) => {
-                        for (owner, event) in events.drain(..).enumerate() {
-                            let _ = self.devices[owner].hip.event_destroy(event);
-                        }
-                        return Err(error);
-                    }
-                }
-            }
-            self.rank_barrier_events = events;
-        } else if self.rank_barrier_events.len() != n {
-            return Err(HipError::new(
-                0,
-                &format!(
-                    "barrier_rank_streams_reuse: event count {} != device count {n}",
-                    self.rank_barrier_events.len()
-                ),
-            ));
-        }
+        self.ensure_rank_barrier_events()?;
 
         for rank in 0..n {
             let gpu = &self.devices[rank];
@@ -776,34 +814,7 @@ impl Gpus {
                 &format!("handoff_rank_stream_reuse: source={source} out of range (n_devices={n})"),
             ));
         }
-        if self.rank_barrier_events.is_empty() {
-            let mut events = Vec::with_capacity(n);
-            for rank in 0..n {
-                let gpu = &self.devices[rank];
-                gpu.bind_thread()?;
-                match gpu
-                    .hip
-                    .event_create_with_flags(HIP_EVENT_DISABLE_TIMING | HIP_EVENT_RELEASE_TO_SYSTEM)
-                {
-                    Ok(event) => events.push(event),
-                    Err(error) => {
-                        for (owner, event) in events.drain(..).enumerate() {
-                            let _ = self.devices[owner].hip.event_destroy(event);
-                        }
-                        return Err(error);
-                    }
-                }
-            }
-            self.rank_barrier_events = events;
-        } else if self.rank_barrier_events.len() != n {
-            return Err(HipError::new(
-                0,
-                &format!(
-                    "handoff_rank_stream_reuse: event count {} != device count {n}",
-                    self.rank_barrier_events.len()
-                ),
-            ));
-        }
+        self.ensure_rank_barrier_events()?;
 
         let producer = &self.devices[source];
         producer.bind_thread()?;
@@ -1822,60 +1833,210 @@ impl Gpus {
             }
             return Ok(());
         }
-        self.ensure_peer_ar_tmp(bytes)?;
+        // Null-stream / mixed-stream fallback keeps the existing transient
+        // boundary_copy path. The active fast path requires every rank stream.
+        let all_active = self.devices.iter().all(|d| d.active_stream.is_some());
+        if !all_active {
+            self.ensure_peer_ar_tmp(bytes)?;
 
-        let mut gather_events = Vec::with_capacity(n - 1);
-        for rank in 1..n {
-            gather_events.push(self.boundary_copy(
-                rank,
-                0,
-                partials[rank],
-                &self.peer_ar_tmp[0][rank - 1],
-                bytes,
-            )?);
-        }
-        for event in gather_events {
-            self.wait_boundary(event)?;
-        }
+            let mut gather_events = Vec::with_capacity(n - 1);
+            for rank in 1..n {
+                gather_events.push(self.boundary_copy(
+                    rank,
+                    0,
+                    partials[rank],
+                    &self.peer_ar_tmp[0][rank - 1],
+                    bytes,
+                )?);
+            }
+            for event in gather_events {
+                self.wait_boundary(event)?;
+            }
 
-        let root_partial = GpuTensor {
-            buf: unsafe { partials[0].alias() },
-            shape: vec![count],
-            dtype: DType::F32,
-        };
-        self.devices[0].bind_thread()?;
-        for slot in 0..n - 1 {
-            let peer = GpuTensor {
-                buf: unsafe { self.peer_ar_tmp[0][slot].alias() },
+            let root_partial = GpuTensor {
+                buf: unsafe { partials[0].alias() },
                 shape: vec![count],
                 dtype: DType::F32,
             };
-            self.devices[0].add_inplace_f32(&root_partial, &peer)?;
+            self.devices[0].bind_thread()?;
+            for slot in 0..n - 1 {
+                let peer = GpuTensor {
+                    buf: unsafe { self.peer_ar_tmp[0][slot].alias() },
+                    shape: vec![count],
+                    dtype: DType::F32,
+                };
+                self.devices[0].add_inplace_f32(&root_partial, &peer)?;
+            }
+
+            let broadcast = if let Some(outputs) = residuals {
+                let root_residual = GpuTensor {
+                    buf: unsafe { outputs[0].alias() },
+                    shape: vec![count],
+                    dtype: DType::F32,
+                };
+                self.devices[0].add_f32(&root_residual, &root_partial, &root_residual)?;
+                outputs
+            } else {
+                partials
+            };
+            let mut broadcast_events = Vec::with_capacity(n - 1);
+            for rank in 1..n {
+                broadcast_events.push(self.boundary_copy(
+                    0,
+                    rank,
+                    broadcast[0],
+                    broadcast[rank],
+                    bytes,
+                )?);
+            }
+            for event in broadcast_events {
+                self.wait_boundary(event)?;
+            }
+            return Ok(());
         }
 
-        let broadcast = if let Some(outputs) = residuals {
-            let root_residual = GpuTensor {
-                buf: unsafe { outputs[0].alias() },
+        // Active-stream fast path: reuse rank_barrier_events, destination-owned
+        // peer copies, no per-call event create/destroy and no gather/broadcast Vecs.
+        let result = (|| -> HipResult<()> {
+            // Scratch + full lifetime event pool before any partial mutation.
+            self.ensure_peer_ar_tmp(bytes)?;
+            self.ensure_rank_barrier_events()?;
+
+            // 1. Record each non-root E[r] after its local producer.
+            //    Root FIFO already orders its own producer work.
+            for rank in 1..n {
+                let gpu = &self.devices[rank];
+                gpu.bind_thread()?;
+                let stream = gpu.active_stream.as_ref().ok_or_else(|| {
+                    HipError::new(
+                        0,
+                        &format!("{operation}: device {rank} lost its active_stream"),
+                    )
+                })?;
+                gpu.hip
+                    .event_record(&self.rank_barrier_events[rank], Some(stream))?;
+            }
+
+            // 2. Root waits each CURRENT E[r], then destination-owned gather
+            //    peer copies onto the ROOT stream into peer_ar_tmp[0][r-1].
+            let root_dev_id = self.devices[0].device_id;
+            for rank in 1..n {
+                let src_dev_id = self.devices[rank].device_id;
+                self.devices[0].bind_thread()?;
+                let root_stream = self.devices[0].active_stream.as_ref().ok_or_else(|| {
+                    HipError::new(0, &format!("{operation}: rank 0 lost its active_stream"))
+                })?;
+                self.devices[0]
+                    .hip
+                    .stream_wait_event(root_stream, &self.rank_barrier_events[rank])?;
+                self.devices[0].hip.memcpy_peer_async(
+                    &self.peer_ar_tmp[0][rank - 1],
+                    root_dev_id,
+                    partials[rank],
+                    src_dev_id,
+                    bytes,
+                    root_stream,
+                )?;
+            }
+
+            // 3. Unchanged rank-order left fold on root, optional residual-add.
+            let root_partial = GpuTensor {
+                buf: unsafe { partials[0].alias() },
                 shape: vec![count],
                 dtype: DType::F32,
             };
-            self.devices[0].add_f32(&root_residual, &root_partial, &root_residual)?;
-            outputs
-        } else {
-            partials
-        };
-        let mut broadcast_events = Vec::with_capacity(n - 1);
-        for rank in 1..n {
-            broadcast_events.push(self.boundary_copy(
-                0,
-                rank,
-                broadcast[0],
-                broadcast[rank],
-                bytes,
-            )?);
-        }
-        for event in broadcast_events {
-            self.wait_boundary(event)?;
+            self.devices[0].bind_thread()?;
+            for slot in 0..n - 1 {
+                let peer = GpuTensor {
+                    buf: unsafe { self.peer_ar_tmp[0][slot].alias() },
+                    shape: vec![count],
+                    dtype: DType::F32,
+                };
+                self.devices[0].add_inplace_f32(&root_partial, &peer)?;
+            }
+
+            let broadcast = if let Some(outputs) = residuals {
+                let root_residual = GpuTensor {
+                    buf: unsafe { outputs[0].alias() },
+                    shape: vec![count],
+                    dtype: DType::F32,
+                };
+                self.devices[0].add_f32(&root_residual, &root_partial, &root_residual)?;
+                outputs
+            } else {
+                partials
+            };
+
+            // Root-ready: record E[0] after sum/residual production.
+            {
+                self.devices[0].bind_thread()?;
+                let root_stream = self.devices[0].active_stream.as_ref().ok_or_else(|| {
+                    HipError::new(0, &format!("{operation}: rank 0 lost its active_stream"))
+                })?;
+                self.devices[0]
+                    .hip
+                    .event_record(&self.rank_barrier_events[0], Some(root_stream))?;
+            }
+
+            // 4. Each destination waits CURRENT E[0], peer-copies root result
+            //    ON the destination stream, then records E[r] after the copy.
+            //    Failures exit before reverse waits so we never wait an
+            //    unrecorded broadcast generation.
+            let root_dev_id = self.devices[0].device_id;
+            for rank in 1..n {
+                let dst_gpu = &self.devices[rank];
+                let dst_dev_id = dst_gpu.device_id;
+                dst_gpu.bind_thread()?;
+                let dst_stream = dst_gpu.active_stream.as_ref().ok_or_else(|| {
+                    HipError::new(
+                        0,
+                        &format!("{operation}: device {rank} lost its active_stream"),
+                    )
+                })?;
+                dst_gpu
+                    .hip
+                    .stream_wait_event(dst_stream, &self.rank_barrier_events[0])?;
+                dst_gpu.hip.memcpy_peer_async(
+                    broadcast[rank],
+                    dst_dev_id,
+                    broadcast[0],
+                    root_dev_id,
+                    bytes,
+                    dst_stream,
+                )?;
+                dst_gpu
+                    .hip
+                    .event_record(&self.rank_barrier_events[rank], Some(dst_stream))?;
+            }
+
+            // 5. Reverse source-reuse: root waits each CURRENT E[r] so later
+            //    root overwrites cannot race destination peer reads.
+            {
+                self.devices[0].bind_thread()?;
+                let root_stream = self.devices[0].active_stream.as_ref().ok_or_else(|| {
+                    HipError::new(0, &format!("{operation}: rank 0 lost its active_stream"))
+                })?;
+                for rank in 1..n {
+                    self.devices[0]
+                        .hip
+                        .stream_wait_event(root_stream, &self.rank_barrier_events[rank])?;
+                }
+            }
+
+            Ok(())
+        })();
+
+        if let Err(error) = result {
+            // Best-effort drain every active rank stream (caller may already
+            // have producer work queued). Never wait unrecorded generations.
+            for rank in 0..n {
+                let gpu = &self.devices[rank];
+                let _ = gpu.bind_thread();
+                if let Some(stream) = gpu.active_stream.as_ref() {
+                    let _ = gpu.hip.stream_synchronize(stream);
+                }
+            }
+            return Err(error);
         }
         Ok(())
     }
@@ -2010,254 +2171,196 @@ impl Gpus {
         }
         Ok(())
     }
-    /// Copy-only EP gather of raw per-slot MoE down rows into rank 0.
+    /// Broadcast root-authoritative EP top-k IDs and weights to every non-root rank.
     ///
-    /// `root_slots` holds `slot_owner.len()` contiguous f32 rows of
-    /// `row_floats` on rank 0; `slots_for_rank(r)` holds the same layout on
-    /// rank `r`. Slot `s` is copied from rank `slot_owner[s]` into the same
-    /// slot offset of `root_slots`. Owners come from the caller-provided
-    /// sealed mapping — no stride or ownership logic lives here.
+    /// `root_ids` / `root_weights` hold `k` i32/f32 values on rank 0 (both stored
+    /// in f32-width buffers: `bytes = k * 4`). `bufs_for_rank(r)` returns the
+    /// matching pair on rank `r`. Root is authoritative — non-root destination
+    /// buffers are overwritten, never merged.
     ///
-    /// Copy-only: performs no arithmetic on row values and allocates no peer
-    /// scratch (destination rows already exist). Adjacent slots with the same
-    /// owner move as one `boundary_copy` span via `DeviceBuffer::byte_view`;
-    /// root-owned slots skip the self-copy. Every rank, owner, checked byte
-    /// count, and capacity is preflighted BEFORE the first copy; `n == 1`
-    /// with all-root owners is a no-op.
-    pub fn gather_slots_to_root_f32<'a>(
-        &self,
-        root_slots: &DeviceBuffer,
-        slots_for_rank: impl Fn(usize) -> &'a DeviceBuffer,
-        slot_owner: &[usize],
-        row_floats: usize,
-    ) -> HipResult<()> {
+    /// Uses process-lifetime [`Self::rank_barrier_events`] for an acyclic
+    /// dependency chain (no per-copy event churn):
+    /// 1. Record `E[0]` with system-release on the **root** stream after the
+    ///    producer (root-ready).
+    /// 2. For each destination `d`: wait current `E[0]` on **dst** stream,
+    ///    enqueue ID then weight `memcpy_peer_async` on **dst** stream, record
+    ///    `E[d]` after both.
+    /// 3. After every destination completion record succeeds, enqueue waits for
+    ///    each current `E[d]` on the **root** stream (reverse source-reuse).
+    ///
+    /// Consumers queued after this helper on a destination FIFO see the route.
+    /// No source-stream copies, no all-to-all completion waits, no host sync on
+    /// the normal path. HIP waits capture the current event-record generation,
+    /// so reuse alongside existing barrier/handoff is safe under strict host
+    /// phase order (record before wait).
+    ///
+    /// Full preflight (`n`, streams, capacities, `k*4` overflow, event pool)
+    /// runs before any GPU mutation of destinations. Any failure — including
+    /// preflight, pool create/bind, root-ready record, or post-submission
+    /// enqueue — returns only after a best-effort drain of every active rank
+    /// stream: the caller may already have root-producer work in flight.
+    /// Partial event-pool handles are destroyed only after that quiescence.
+    /// Fail-stop never waits an unrecorded `E[d]` (stale prior generation);
+    /// the first error is preserved.
+    pub fn broadcast_ep_route<'a, F>(
+        &mut self,
+        root_ids: &'a DeviceBuffer,
+        root_weights: &'a DeviceBuffer,
+        bufs_for_rank: F,
+        k: usize,
+    ) -> HipResult<()>
+    where
+        F: Fn(usize) -> (&'a DeviceBuffer, &'a DeviceBuffer),
+    {
         let n = self.devices.len();
         if n == 0 {
-            return Err(HipError::new(0, "gather_slots_to_root_f32: no devices"));
+            return Err(HipError::new(0, "broadcast_ep_route: no devices"));
         }
-        let mut rank_bytes = Vec::with_capacity(n);
-        for rank in 0..n {
-            rank_bytes.push(slots_for_rank(rank).size());
-        }
-        let spans =
-            check_ep_gather_slots(n, slot_owner, row_floats, &rank_bytes, root_slots.size())
-                .map_err(|e| HipError::new(0, &format!("gather_slots_to_root_f32: {e}")))?;
-        let row_bytes = row_floats
-            .checked_mul(std::mem::size_of::<f32>())
-            .ok_or_else(|| HipError::new(0, "gather_slots_to_root_f32: row byte count overflow"))?;
-        if n == 1 || row_bytes == 0 || spans.is_empty() {
-            return Ok(());
-        }
-        let mut events = Vec::with_capacity(spans.len());
-        let mut first_error: Option<HipError> = None;
-        for (owner, start_slot, len_slots) in spans {
-            if owner == 0 {
-                continue;
+        // Pool init failures are cleaned inside ensure_rank_barrier_events
+        // (drain + owner-bound destroy, never install partial). Outer drain
+        // still covers post-install enqueue failures.
+
+        let result = (|| -> HipResult<()> {
+            let bytes = k
+                .checked_mul(std::mem::size_of::<f32>())
+                .ok_or_else(|| HipError::new(0, "broadcast_ep_route: k*4 byte count overflow"))?;
+            if n == 1 || bytes == 0 {
+                return Ok(());
             }
-            let byte_offset = match start_slot.checked_mul(row_bytes) {
-                Some(v) => v,
-                None => {
-                    first_error = Some(HipError::new(
+
+            // ---- Preflight: no destination mutation until every check passes. ----
+            if root_ids.size() < bytes {
+                return Err(HipError::new(
+                    0,
+                    &format!(
+                        "broadcast_ep_route: root ids have {} bytes, need {bytes}",
+                        root_ids.size()
+                    ),
+                ));
+            }
+            if root_weights.size() < bytes {
+                return Err(HipError::new(
+                    0,
+                    &format!(
+                        "broadcast_ep_route: root weights have {} bytes, need {bytes}",
+                        root_weights.size()
+                    ),
+                ));
+            }
+            for rank in 0..n {
+                if self.devices[rank].active_stream.is_none() {
+                    return Err(HipError::new(
                         0,
-                        "gather_slots_to_root_f32: span offset overflow",
+                        &format!("broadcast_ep_route: device {rank} has no active_stream"),
                     ));
-                    break;
                 }
-            };
-            let byte_len = match len_slots.checked_mul(row_bytes) {
-                Some(v) => v,
-                None => {
-                    first_error = Some(HipError::new(
+                if rank == 0 {
+                    continue;
+                }
+                let (dst_ids, dst_weights) = bufs_for_rank(rank);
+                if dst_ids.size() < bytes {
+                    return Err(HipError::new(
                         0,
-                        "gather_slots_to_root_f32: span length overflow",
+                        &format!(
+                            "broadcast_ep_route: rank {rank} ids have {} bytes, need {bytes}",
+                            dst_ids.size()
+                        ),
                     ));
-                    break;
                 }
-            };
-            let src = slots_for_rank(owner).byte_view(byte_offset, byte_len);
-            let dst = root_slots.byte_view(byte_offset, byte_len);
-            match self.boundary_copy(owner, 0, &src, &dst, byte_len) {
-                Ok(event) => events.push(event),
-                Err(error) => {
-                    first_error = Some(error);
-                    break;
-                }
-            }
-        }
-        // Drain every enqueued receipt before reporting: each wait consumes
-        // its event (no leaked handles, no detached in-flight copies) and
-        // the first error wins.
-        for event in events {
-            if let Err(error) = self.wait_boundary(event) {
-                if first_error.is_none() {
-                    first_error = Some(error);
+                if dst_weights.size() < bytes {
+                    return Err(HipError::new(
+                        0,
+                        &format!(
+                            "broadcast_ep_route: rank {rank} weights have {} bytes, need {bytes}",
+                            dst_weights.size()
+                        ),
+                    ));
                 }
             }
-        }
-        if let Some(error) = first_error {
+            self.ensure_rank_barrier_events()?;
+
+            let root_dev_id = self.devices[0].device_id;
+
+            // ---- Root-ready: record E[0] on the root stream (system-release). ----
+            {
+                let root = &self.devices[0];
+                root.bind_thread()?;
+                let root_stream = root.active_stream.as_ref().ok_or_else(|| {
+                    HipError::new(0, "broadcast_ep_route: rank 0 lost its active_stream")
+                })?;
+                root.hip
+                    .event_record(&self.rank_barrier_events[0], Some(root_stream))?;
+            }
+
+            // ---- Destination-owned copies: wait E[0] -> ID + weight peer async -> E[d]. ----
+            // On failure we never wait an unrecorded E[d] (stale prior generation).
+            for dst in 1..n {
+                let dst_gpu = &self.devices[dst];
+                let dst_dev_id = dst_gpu.device_id;
+                dst_gpu.bind_thread()?;
+                let dst_stream = dst_gpu.active_stream.as_ref().ok_or_else(|| {
+                    HipError::new(
+                        0,
+                        &format!("broadcast_ep_route: device {dst} lost its active_stream"),
+                    )
+                })?;
+                dst_gpu
+                    .hip
+                    .stream_wait_event(dst_stream, &self.rank_barrier_events[0])?;
+                let (dst_ids, dst_weights) = bufs_for_rank(dst);
+                dst_gpu.hip.memcpy_peer_async(
+                    dst_ids,
+                    dst_dev_id,
+                    root_ids,
+                    root_dev_id,
+                    bytes,
+                    dst_stream,
+                )?;
+                dst_gpu.hip.memcpy_peer_async(
+                    dst_weights,
+                    dst_dev_id,
+                    root_weights,
+                    root_dev_id,
+                    bytes,
+                    dst_stream,
+                )?;
+                dst_gpu
+                    .hip
+                    .event_record(&self.rank_barrier_events[dst], Some(dst_stream))?;
+            }
+
+            // ---- Reverse source-reuse: root waits every current E[d]. ----
+            {
+                let root = &self.devices[0];
+                root.bind_thread()?;
+                let root_stream = root.active_stream.as_ref().ok_or_else(|| {
+                    HipError::new(0, "broadcast_ep_route: rank 0 lost its active_stream")
+                })?;
+                for dst in 1..n {
+                    root.hip
+                        .stream_wait_event(root_stream, &self.rank_barrier_events[dst])?;
+                }
+            }
+
+            Ok(())
+        })();
+
+        if let Err(error) = result {
+            // One outer fail-stop boundary: quiesce every active rank stream
+            // (root producer may already be queued). Pool init failures are
+            // cleaned inside ensure_rank_barrier_events. Never wait unrecorded E[d].
+            for rank in 0..n {
+                let gpu = &self.devices[rank];
+                let _ = gpu.bind_thread();
+                if let Some(stream) = gpu.active_stream.as_ref() {
+                    let _ = gpu.hip.stream_synchronize(stream);
+                }
+            }
             return Err(error);
         }
+
         Ok(())
     }
-
-    /// Copy-only EP broadcast of the finalized root residual row (overwrite).
-    ///
-    /// `root_row` holds `row_floats` f32 on rank 0; `row_for_rank(r)` holds
-    /// at least one such row on rank `r`. Every non-root destination is
-    /// overwritten with the root bytes — never added into. Copy-only: no
-    /// arithmetic, no scratch. Full preflight BEFORE the first copy;
-    /// `n == 1` is a no-op.
-    pub fn broadcast_root_row_f32<'a>(
-        &self,
-        root_row: &DeviceBuffer,
-        row_for_rank: impl Fn(usize) -> &'a DeviceBuffer,
-        row_floats: usize,
-    ) -> HipResult<()> {
-        let n = self.devices.len();
-        if n == 0 {
-            return Err(HipError::new(0, "broadcast_root_row_f32: no devices"));
-        }
-        let mut rank_bytes = Vec::with_capacity(n);
-        for rank in 0..n {
-            rank_bytes.push(row_for_rank(rank).size());
-        }
-        let row_bytes = check_ep_broadcast_row(n, row_floats, &rank_bytes, root_row.size())
-            .map_err(|e| HipError::new(0, &format!("broadcast_root_row_f32: {e}")))?;
-        if n == 1 || row_bytes == 0 {
-            return Ok(());
-        }
-        let src = root_row.byte_view(0, row_bytes);
-        let mut events = Vec::with_capacity(n - 1);
-        let mut first_error: Option<HipError> = None;
-        for rank in 1..n {
-            let dst = row_for_rank(rank).byte_view(0, row_bytes);
-            match self.boundary_copy(0, rank, &src, &dst, row_bytes) {
-                Ok(event) => events.push(event),
-                Err(error) => {
-                    first_error = Some(error);
-                    break;
-                }
-            }
-        }
-        // Drain every enqueued receipt before reporting: each wait consumes
-        // its event (no leaked handles, no detached in-flight copies) and
-        // the first error wins.
-        for event in events {
-            if let Err(error) = self.wait_boundary(event) {
-                if first_error.is_none() {
-                    first_error = Some(error);
-                }
-            }
-        }
-        if let Some(error) = first_error {
-            return Err(error);
-        }
-        Ok(())
-    }
-}
-
-/// Pure preflight for [`Gpus::gather_slots_to_root_f32`]: validates rank
-/// count, owner range, checked f32 byte counts, and slot-buffer capacities,
-/// and groups adjacent same-owner slots into `(owner, start_slot, len_slots)`
-/// spans in slot order. No GPU access, no allocation beyond the span list.
-/// `rank_bytes[r]` is rank `r`'s slot-buffer size in bytes; `root_bytes` is
-/// rank 0's. Empty owners or zero `row_floats` plan no copies (`Ok(vec![])`).
-pub fn check_ep_gather_slots(
-    n_ranks: usize,
-    slot_owner: &[usize],
-    row_floats: usize,
-    rank_bytes: &[usize],
-    root_bytes: usize,
-) -> Result<Vec<(usize, usize, usize)>, String> {
-    if n_ranks == 0 {
-        return Err("n_ranks must be >= 1".to_string());
-    }
-    if rank_bytes.len() != n_ranks {
-        return Err(format!(
-            "rank_bytes.len()={} != n_ranks={n_ranks}",
-            rank_bytes.len()
-        ));
-    }
-    let row_bytes = row_floats
-        .checked_mul(std::mem::size_of::<f32>())
-        .ok_or_else(|| "row_floats*4 byte count overflow".to_string())?;
-    for (slot, &owner) in slot_owner.iter().enumerate() {
-        if owner >= n_ranks {
-            return Err(format!(
-                "slot {slot} owner {owner} out of range (n_ranks={n_ranks})"
-            ));
-        }
-    }
-    if slot_owner.is_empty() || row_bytes == 0 {
-        return Ok(Vec::new());
-    }
-    let total_bytes = slot_owner
-        .len()
-        .checked_mul(row_bytes)
-        .ok_or_else(|| "slots*row_bytes byte count overflow".to_string())?;
-    if root_bytes < total_bytes {
-        return Err(format!(
-            "root slot buffer has {root_bytes} bytes, needs {total_bytes}"
-        ));
-    }
-    for (rank, &bytes) in rank_bytes.iter().enumerate() {
-        if bytes < total_bytes {
-            return Err(format!(
-                "rank {rank} slot buffer has {bytes} bytes, needs {total_bytes}"
-            ));
-        }
-    }
-    let mut spans: Vec<(usize, usize, usize)> = Vec::new();
-    let mut start = 0;
-    while start < slot_owner.len() {
-        let owner = slot_owner[start];
-        let mut end = start + 1;
-        while end < slot_owner.len() && slot_owner[end] == owner {
-            end += 1;
-        }
-        spans.push((owner, start, end - start));
-        start = end;
-    }
-    Ok(spans)
-}
-
-/// Pure preflight for [`Gpus::broadcast_root_row_f32`]: validates rank count,
-/// the checked f32 row byte count, and per-rank row capacities. Returns the
-/// row byte count. Zero `row_floats` plans no copy (`Ok(0)`).
-pub fn check_ep_broadcast_row(
-    n_ranks: usize,
-    row_floats: usize,
-    rank_bytes: &[usize],
-    root_bytes: usize,
-) -> Result<usize, String> {
-    if n_ranks == 0 {
-        return Err("n_ranks must be >= 1".to_string());
-    }
-    if rank_bytes.len() != n_ranks {
-        return Err(format!(
-            "rank_bytes.len()={} != n_ranks={n_ranks}",
-            rank_bytes.len()
-        ));
-    }
-    let row_bytes = row_floats
-        .checked_mul(std::mem::size_of::<f32>())
-        .ok_or_else(|| "row_floats*4 byte count overflow".to_string())?;
-    if row_bytes == 0 {
-        return Ok(0);
-    }
-    if root_bytes < row_bytes {
-        return Err(format!(
-            "root row buffer has {root_bytes} bytes, needs {row_bytes}"
-        ));
-    }
-    for (rank, &bytes) in rank_bytes.iter().enumerate() {
-        if bytes < row_bytes {
-            return Err(format!(
-                "rank {rank} row buffer has {bytes} bytes, needs {row_bytes}"
-            ));
-        }
-    }
-    Ok(row_bytes)
 }
 
 /// Pure-TP PP band metadata: length `tp_size`, rank 0 owns every layer and
@@ -2580,157 +2683,27 @@ mod tests {
         assert_eq!(tp.size_of(DimKind::Ep), 1);
     }
 
-    #[test]
-    fn ep_gather_spans_group_adjacent_same_owner_ep2() {
-        // Arbitrary owner array (NOT stride-derived): adjacent same-owner
-        // slots merge into one copy span. row_floats=4 -> row_bytes=16,
-        // 8 slots -> total 128 bytes.
-        let spans = check_ep_gather_slots(2, &[0, 1, 1, 0, 0, 1, 0, 1], 4, &[128, 128], 128)
-            .expect("valid EP2 gather");
-        assert_eq!(
-            spans,
-            vec![
-                (0, 0, 1),
-                (1, 1, 2),
-                (0, 3, 2),
-                (1, 5, 1),
-                (0, 6, 1),
-                (1, 7, 1)
-            ]
-        );
-    }
-
-    #[test]
-    fn ep_gather_spans_group_adjacent_same_owner_ep4() {
-        // Arbitrary 4-owner array: maximal same-owner runs only.
-        let spans =
-            check_ep_gather_slots(4, &[3, 3, 1, 1, 1, 0, 2, 2], 4, &[128, 128, 128, 128], 128)
-                .expect("valid EP4 gather");
-        assert_eq!(spans, vec![(3, 0, 2), (1, 2, 3), (0, 5, 1), (2, 6, 2)]);
-    }
-
-    #[test]
-    fn ep_gather_spans_degenerate_groupings() {
-        // All slots one owner -> a single span (one boundary_copy).
-        let spans =
-            check_ep_gather_slots(2, &[1, 1, 1, 1], 4, &[64, 64], 64).expect("single-owner gather");
-        assert_eq!(spans, vec![(1, 0, 4)]);
-        // Fully alternating owners -> one span per slot.
-        let owners: Vec<usize> = (0..8).map(|s| s % 2).collect();
-        let spans =
-            check_ep_gather_slots(2, &owners, 4, &[128, 128], 128).expect("alternating gather");
-        assert_eq!(spans.len(), 8);
-        for (s, (owner, start, len)) in spans.iter().enumerate() {
-            assert_eq!((*owner, *start, *len), (s % 2, s, 1));
-        }
-        // Empty owners / zero row_floats plan no copies.
-        assert_eq!(
-            check_ep_gather_slots(2, &[], 4, &[128, 128], 128).expect("empty owners"),
-            Vec::new()
-        );
-        assert_eq!(
-            check_ep_gather_slots(2, &[0, 1], 0, &[128, 128], 128).expect("zero rows"),
-            Vec::new()
-        );
-    }
-
-    #[test]
-    fn ep_gather_n1_plans_root_only_spans() {
-        // N=1: every span is root-owned, so `gather_slots_to_root_f32`
-        // skips all self-copies and performs zero copies (no-op).
-        let spans = check_ep_gather_slots(1, &[0, 0, 0], 4, &[48], 48).expect("N=1 gather");
-        assert_eq!(spans, vec![(0, 0, 3)]);
-        assert!(spans.iter().all(|(owner, _, _)| *owner == 0));
-        // Broadcast N=1 validates and returns the row bytes; the method
-        // short-circuits before any copy.
-        assert_eq!(
-            check_ep_broadcast_row(1, 16, &[64], 64).expect("N=1 bcast"),
-            64
-        );
-    }
-
-    #[test]
-    fn ep_gather_rejects_bad_owner_rank_and_capacity() {
-        // Zero ranks rejected.
-        assert!(check_ep_gather_slots(0, &[0], 4, &[], 16).is_err());
-        // rank_bytes length must match n_ranks.
-        assert!(check_ep_gather_slots(2, &[0, 1], 4, &[32], 32).is_err());
-        // Owner out of range (including huge) rejected.
-        assert!(check_ep_gather_slots(2, &[0, 2], 4, &[32, 32], 32).is_err());
-        assert!(check_ep_gather_slots(2, &[usize::MAX], 4, &[32, 32], 32).is_err());
-        // Root buffer too small rejected.
-        assert!(check_ep_gather_slots(2, &[0, 1], 4, &[32, 32], 31).is_err());
-        // Any rank buffer too small rejected (all ranks hold full k rows).
-        assert!(check_ep_gather_slots(2, &[0, 1], 4, &[32, 31], 32).is_err());
-        assert!(check_ep_gather_slots(2, &[0, 1], 4, &[31, 32], 32).is_err());
-    }
-
-    #[test]
-    fn ep_transport_checked_byte_math() {
-        // Exact: hidden 2048 -> 8192 row bytes; k=8 slots -> 64 KiB total.
-        let row_bytes =
-            check_ep_broadcast_row(2, 2048, &[8192, 8192], 8192).expect("2048-float row");
-        assert_eq!(row_bytes, 8192);
-        let spans =
-            check_ep_gather_slots(2, &[0, 1, 0, 1, 0, 1, 0, 1], 2048, &[65536, 65536], 65536)
-                .expect("8x2048 gather");
-        assert_eq!(spans.len(), 8);
-        // row_floats*4 overflow rejected on both paths.
-        assert!(check_ep_gather_slots(2, &[0], usize::MAX, &[16, 16], 16).is_err());
-        assert!(check_ep_broadcast_row(2, usize::MAX, &[16, 16], 16).is_err());
-        // slots*row_bytes overflow rejected: row_bytes fits, total does not.
-        let big_row = usize::MAX / 4;
-        assert!(check_ep_gather_slots(2, &[0, 1], big_row, &[16, 16], 16).is_err());
-        // Broadcast capacity rejection incl. zero ranks and len mismatch.
-        assert!(check_ep_broadcast_row(2, 4, &[16, 15], 16).is_err());
-        assert!(check_ep_broadcast_row(2, 4, &[16, 16], 15).is_err());
-        assert!(check_ep_broadcast_row(0, 4, &[], 16).is_err());
-        assert!(check_ep_broadcast_row(2, 4, &[16], 16).is_err());
-        // Zero row_floats is a no-op plan.
-        assert_eq!(
-            check_ep_broadcast_row(2, 0, &[16, 16], 16).expect("zero row"),
-            0
-        );
-    }
-
-    /// 2-GPU EP slot-row transport round-trip: gather + broadcast.
-    ///
-    /// This test proves TRANSPORT ONLY (copy plumbing), not model parity:
-    /// it writes distinguishable raw f32 rows on each rank, gathers a mixed
-    /// owner pattern into rank 0, verifies the root rows byte-for-byte,
-    /// broadcasts a root residual row, and verifies the overwrite
-    /// byte-for-byte. No weights are applied and no kernel folds slots here.
+    /// 2-GPU `boundary_copy` source-reuse race: large peer copy still in flight
+    /// when a tiny source overwrite is enqueued on the source stream with no
+    /// host sync. Without the completion wait queued back onto the source
+    /// stream, the poison would land before the peer read finishes.
     ///
     /// Run serialized under the GPU lock:
     /// ```sh
     /// HIP_VISIBLE_DEVICES=0,1 flock -w 3600 /tmp/hipfire-gpu.lock \
     /// cargo test -p hipfire-runtime --locked --lib multi_gpu -- \
-    /// --ignored --exact --test-threads=1 multi_gpu::tests::ep_slot_row_transport_2gpu
+    /// --ignored --exact --test-threads=1 multi_gpu::tests::boundary_copy_source_reuse_race_2gpu
     /// ```
     #[test]
     #[ignore]
-    fn ep_slot_row_transport_2gpu() {
-        const ROW_FLOATS: usize = 16;
-        const ROW_BYTES: usize = ROW_FLOATS * 4;
-        const K: usize = 8;
-        const OWNERS: [usize; K] = [0, 1, 1, 0, 1, 0, 0, 1];
-
-        fn slot_row_bytes(rank: usize, slot: usize) -> Vec<u8> {
-            let mut out = Vec::with_capacity(ROW_BYTES);
-            for lane in 0..ROW_FLOATS {
-                let v = (rank * 1000 + slot * ROW_FLOATS + lane) as f32;
-                out.extend_from_slice(&v.to_ne_bytes());
-            }
-            out
-        }
+    fn boundary_copy_source_reuse_race_2gpu() {
+        const RACE_BYTES: usize = 64 << 20;
+        const POISON_BYTES: usize = 4096;
 
         let mut gpus =
             Gpus::init_ep(2, 1).expect("init_ep(2,1) — run with HIP_VISIBLE_DEVICES=0,1");
         assert_eq!(gpus.devices.len(), 2);
 
-        // Active streams on both ranks: without these, every copy below
-        // would take the synchronous host-blocked fallback and never
-        // exercise the both-streams event handoff under test.
         for rank in 0..2 {
             gpus.devices[rank].bind_thread().expect("bind stream");
             let stream = gpus.devices[rank]
@@ -2740,141 +2713,6 @@ mod tests {
             gpus.devices[rank].active_stream = Some(stream);
         }
 
-        // Per-rank k-slot row buffers plus one residual row buffer per rank.
-        let mut slot_bufs = Vec::with_capacity(2);
-        let mut row_bufs = Vec::with_capacity(2);
-        for rank in 0..2 {
-            gpus.devices[rank].bind_thread().expect("bind alloc");
-            slot_bufs.push(
-                gpus.devices[rank]
-                    .hip
-                    .malloc(K * ROW_BYTES)
-                    .expect("malloc slots"),
-            );
-            row_bufs.push(
-                gpus.devices[rank]
-                    .hip
-                    .malloc(ROW_BYTES)
-                    .expect("malloc row"),
-            );
-        }
-
-        // Rank buffers hold their own distinguishable rows for every slot.
-        for rank in 0..2 {
-            let mut host = Vec::with_capacity(K * ROW_BYTES);
-            for slot in 0..K {
-                host.extend_from_slice(&slot_row_bytes(rank, slot));
-            }
-            gpus.devices[rank].bind_thread().expect("bind htod slots");
-            gpus.devices[rank]
-                .hip
-                .memcpy_htod(&slot_bufs[rank], &host)
-                .expect("htod slots");
-        }
-        // Root starts with sentinel rows where remote-owned rows will land,
-        // proving only those rows are overwritten (root-owned rows already
-        // match because the self-copy is skipped, never re-copied).
-        {
-            let mut host = Vec::with_capacity(K * ROW_BYTES);
-            for slot in 0..K {
-                if OWNERS[slot] == 0 {
-                    host.extend_from_slice(&slot_row_bytes(0, slot));
-                } else {
-                    for _ in 0..ROW_FLOATS {
-                        host.extend_from_slice(&(-999.0f32).to_ne_bytes());
-                    }
-                }
-            }
-            gpus.devices[0].bind_thread().expect("bind htod root");
-            gpus.devices[0]
-                .hip
-                .memcpy_htod(&slot_bufs[0], &host)
-                .expect("htod root");
-        }
-
-        gpus.gather_slots_to_root_f32(&slot_bufs[0], |r| &slot_bufs[r], &OWNERS, ROW_FLOATS)
-            .expect("gather_slots_to_root_f32");
-        // Immediate source reuse: poison rank 1's slot buffer on its own
-        // stream with no host sync in between. The completion dependency
-        // `boundary_copy` queues back onto the source stream must order this
-        // overwrite after the in-flight destination-owned reads; without it
-        // the root rows below would race with the poison.
-        let poison_slots = vec![0xA5u8; K * ROW_BYTES];
-        gpus.devices[1].bind_thread().expect("bind poison slots");
-        {
-            let dev1 = &gpus.devices[1];
-            let stream = dev1.active_stream.as_ref().expect("rank 1 stream");
-            dev1.hip
-                .memcpy_htod_async(&slot_bufs[1], &poison_slots, stream)
-                .expect("poison src slots");
-        }
-
-        for rank in 0..2 {
-            gpus.devices[rank].bind_thread().expect("bind sync");
-            gpus.devices[rank]
-                .hip
-                .device_synchronize()
-                .expect("sync after gather");
-        }
-        let mut got = vec![0u8; K * ROW_BYTES];
-        gpus.devices[0].bind_thread().expect("bind dtoh root");
-        gpus.devices[0]
-            .hip
-            .memcpy_dtoh(&mut got, &slot_bufs[0])
-            .expect("dtoh root");
-        let mut want = Vec::with_capacity(K * ROW_BYTES);
-        for slot in 0..K {
-            want.extend_from_slice(&slot_row_bytes(OWNERS[slot], slot));
-        }
-        assert_eq!(got, want, "root rows must equal owner rows byte-for-byte");
-
-        // Broadcast: root residual overwrites the non-root row byte-for-byte.
-        let mut residual = Vec::with_capacity(ROW_BYTES);
-        for lane in 0..ROW_FLOATS {
-            residual.extend_from_slice(&((10000 + lane) as f32).to_ne_bytes());
-        }
-        let sentinel = (-777.0f32).to_ne_bytes();
-        let mut sentinel_row = Vec::with_capacity(ROW_BYTES);
-        for _ in 0..ROW_FLOATS {
-            sentinel_row.extend_from_slice(&sentinel);
-        }
-        gpus.devices[0].bind_thread().expect("bind htod residual");
-        gpus.devices[0]
-            .hip
-            .memcpy_htod(&row_bufs[0], &residual)
-            .expect("htod residual");
-        gpus.devices[1].bind_thread().expect("bind htod sentinel");
-        gpus.devices[1]
-            .hip
-            .memcpy_htod(&row_bufs[1], &sentinel_row)
-            .expect("htod sentinel");
-        gpus.broadcast_root_row_f32(&row_bufs[0], |r| &row_bufs[r], ROW_FLOATS)
-            .expect("broadcast_root_row_f32");
-        for rank in 0..2 {
-            gpus.devices[rank].bind_thread().expect("bind sync bcast");
-            gpus.devices[rank]
-                .hip
-                .device_synchronize()
-                .expect("sync after broadcast");
-        }
-        let mut got_row = vec![0u8; ROW_BYTES];
-        gpus.devices[1].bind_thread().expect("bind dtoh bcast");
-        gpus.devices[1]
-            .hip
-            .memcpy_dtoh(&mut got_row, &row_bufs[1])
-            .expect("dtoh bcast");
-        assert_eq!(
-            got_row, residual,
-            "non-root row must equal root bytes exactly"
-        );
-        // Directed source-reuse race: a large destination-owned copy is still
-        // in flight when a tiny source overwrite is enqueued on the source
-        // stream with no host sync in between. Without the completion wait
-        // queued back onto the source stream, the microsecond-scale poison
-        // would land before the multi-millisecond peer read finishes and the
-        // destination head would come back poisoned instead of patterned.
-        const RACE_BYTES: usize = 64 << 20;
-        const POISON_BYTES: usize = 4096;
         gpus.devices[1].bind_thread().expect("bind race alloc");
         let race_src = gpus.devices[1]
             .hip
@@ -2927,15 +2765,617 @@ mod tests {
         gpus.devices[0].bind_thread().expect("bind free race dst");
         let _ = gpus.devices[0].hip.free(race_dst);
 
-        for (rank, buf) in slot_bufs.into_iter().enumerate() {
-            gpus.devices[rank].bind_thread().expect("bind free slots");
+        for rank in 0..2 {
+            gpus.devices[rank]
+                .bind_thread()
+                .expect("bind stream destroy");
+            if let Some(stream) = gpus.devices[rank].active_stream.take() {
+                gpus.devices[rank]
+                    .hip
+                    .stream_destroy(stream)
+                    .expect("stream_destroy");
+            }
+        }
+    }
+
+    /// 2-GPU root-authoritative EP route broadcast: IDs + weights.
+    ///
+    /// Observes the real contract of [`Gpus::broadcast_ep_route`]:
+    /// - both route buffers land on the non-root rank byte-for-byte;
+    /// - process-lifetime `rank_barrier_events` are shared with
+    ///   [`Gpus::handoff_rank_stream_reuse`] / [`Gpus::barrier_rank_streams_reuse`]
+    ///   across repeated broadcasts (no per-copy event churn);
+    /// - immediate root source-overwrite on the root stream after each
+    ///   broadcast cannot race the destination-owned peer reads (reverse
+    ///   source-reuse waits);
+    /// - destination GPU-stream D2D snapshot (not host readback) is the
+    ///   first consumer, so a cache-visibility miss cannot hide behind a
+    ///   CPU-side flush.
+    ///
+    /// Run serialized under the GPU lock:
+    /// ```sh
+    /// HIP_VISIBLE_DEVICES=0,1 flock -w 3600 /tmp/hipfire-gpu.lock \
+    /// cargo test -p hipfire-runtime --locked --lib multi_gpu -- \
+    /// --ignored --exact --test-threads=1 multi_gpu::tests::ep_route_broadcast_2gpu
+    /// ```
+    #[test]
+    #[ignore]
+    fn ep_route_broadcast_2gpu() {
+        // Large enough that a root poison after enqueue can win a race if the
+        // reverse source-reuse wait is missing (same idea as the 64 MiB race
+        // in `boundary_copy_source_reuse_race_2gpu`).
+        const K: usize = 1 << 20; // 4 MiB of f32-width slots
+        const BYTES: usize = K * 4;
+
+        fn pattern_bytes(tag: u32, kind: u8) -> Vec<u8> {
+            let mut out = vec![0u8; BYTES];
+            for i in 0..K {
+                let v = tag
+                    .wrapping_mul(1_000_003)
+                    .wrapping_add(i as u32)
+                    .wrapping_add(u32::from(kind) << 24);
+                out[i * 4..i * 4 + 4].copy_from_slice(&v.to_ne_bytes());
+            }
+            out
+        }
+
+        let mut gpus =
+            Gpus::init_ep(2, 1).expect("init_ep(2,1) — run with HIP_VISIBLE_DEVICES=0,1");
+        assert_eq!(gpus.devices.len(), 2);
+
+        for rank in 0..2 {
+            gpus.devices[rank].bind_thread().expect("bind stream");
+            let stream = gpus.devices[rank]
+                .hip
+                .stream_create()
+                .expect("stream_create");
+            gpus.devices[rank].active_stream = Some(stream);
+        }
+
+        // Seed the process-lifetime event pool via the existing handoff
+        // helper so later broadcasts must reuse (not re-create) it.
+        gpus.handoff_rank_stream_reuse(0)
+            .expect("seed rank_barrier_events via handoff");
+        assert_eq!(gpus.rank_barrier_events.len(), 2);
+
+        let mut id_bufs = Vec::with_capacity(2);
+        let mut weight_bufs = Vec::with_capacity(2);
+        let mut snap_ids = Vec::with_capacity(2);
+        let mut snap_weights = Vec::with_capacity(2);
+        for rank in 0..2 {
+            gpus.devices[rank].bind_thread().expect("bind alloc");
+            id_bufs.push(gpus.devices[rank].hip.malloc(BYTES).expect("malloc ids"));
+            weight_bufs.push(
+                gpus.devices[rank]
+                    .hip
+                    .malloc(BYTES)
+                    .expect("malloc weights"),
+            );
+            snap_ids.push(
+                gpus.devices[rank]
+                    .hip
+                    .malloc(BYTES)
+                    .expect("malloc snap ids"),
+            );
+            snap_weights.push(
+                gpus.devices[rank]
+                    .hip
+                    .malloc(BYTES)
+                    .expect("malloc snap weights"),
+            );
+        }
+
+        let sentinel = vec![0x3Cu8; BYTES];
+        let poison = vec![0xA5u8; BYTES];
+
+        // Two rounds with distinct patterns: proves event-record generation
+        // reuse across broadcasts interleaved with barrier/handoff.
+        for round in 0u32..2 {
+            let want_ids = pattern_bytes(round + 1, 1);
+            let want_weights = pattern_bytes(round + 1, 2);
+
+            gpus.devices[0].bind_thread().expect("bind htod root");
+            gpus.devices[0]
+                .hip
+                .memcpy_htod(&id_bufs[0], &want_ids)
+                .expect("htod root ids");
+            gpus.devices[0]
+                .hip
+                .memcpy_htod(&weight_bufs[0], &want_weights)
+                .expect("htod root weights");
+            gpus.devices[1].bind_thread().expect("bind htod sentinel");
+            gpus.devices[1]
+                .hip
+                .memcpy_htod(&id_bufs[1], &sentinel)
+                .expect("htod dst id sentinel");
+            gpus.devices[1]
+                .hip
+                .memcpy_htod(&weight_bufs[1], &sentinel)
+                .expect("htod dst weight sentinel");
+
+            let events_before = gpus.rank_barrier_events.len();
+            gpus.broadcast_ep_route(
+                &id_bufs[0],
+                &weight_bufs[0],
+                |r| (&id_bufs[r], &weight_bufs[r]),
+                K,
+            )
+            .unwrap_or_else(|e| panic!("broadcast_ep_route round {round}: {e}"));
+            assert_eq!(
+                gpus.rank_barrier_events.len(),
+                events_before,
+                "broadcast must reuse process-lifetime events, not grow them"
+            );
+
+            // Immediate ROOT source overwrite on the root stream — ordered
+            // after the helper's reverse source-reuse waits. Without those
+            // waits the destination-owned peer read can observe poison.
+            gpus.devices[0].bind_thread().expect("bind root poison");
+            {
+                let root = &gpus.devices[0];
+                let stream = root.active_stream.as_ref().expect("root stream");
+                root.hip
+                    .memcpy_htod_async(&id_bufs[0], &poison, stream)
+                    .expect("poison root ids");
+                root.hip
+                    .memcpy_htod_async(&weight_bufs[0], &poison, stream)
+                    .expect("poison root weights");
+            }
+
+            // Destination GPU-stream consume BEFORE any host sync: D2D
+            // snapshot on the same FIFO that received the peer copies. A
+            // cache-visibility hole would snapshot stale sentinels; a
+            // source-reuse race would snapshot poison.
+            gpus.devices[1].bind_thread().expect("bind dst snap");
+            {
+                let dst = &gpus.devices[1];
+                let stream = dst.active_stream.as_ref().expect("dst stream");
+                dst.hip
+                    .memcpy_dtod_async_at(&snap_ids[1], 0, &id_bufs[1], 0, BYTES, stream)
+                    .expect("dst snap ids");
+                dst.hip
+                    .memcpy_dtod_async_at(&snap_weights[1], 0, &weight_bufs[1], 0, BYTES, stream)
+                    .expect("dst snap weights");
+            }
+
+            for rank in 0..2 {
+                gpus.devices[rank].bind_thread().expect("bind sync");
+                gpus.devices[rank]
+                    .hip
+                    .device_synchronize()
+                    .expect("sync after route broadcast");
+            }
+
+            let mut got_ids = vec![0u8; BYTES];
+            let mut got_weights = vec![0u8; BYTES];
+            gpus.devices[1].bind_thread().expect("bind dtoh snap");
+            gpus.devices[1]
+                .hip
+                .memcpy_dtoh(&mut got_ids, &snap_ids[1])
+                .expect("dtoh snap ids");
+            gpus.devices[1]
+                .hip
+                .memcpy_dtoh(&mut got_weights, &snap_weights[1])
+                .expect("dtoh snap weights");
+            assert_eq!(
+                got_ids, want_ids,
+                "round {round}: dst ID snapshot must equal pre-poison root IDs"
+            );
+            assert_eq!(
+                got_weights, want_weights,
+                "round {round}: dst weight snapshot must equal pre-poison root weights"
+            );
+            assert_ne!(
+                got_ids, poison,
+                "round {round}: dst IDs must not observe root poison"
+            );
+            assert_ne!(
+                got_weights, poison,
+                "round {round}: dst weights must not observe root poison"
+            );
+            assert_ne!(
+                got_ids, sentinel,
+                "round {round}: dst IDs must not remain sentinel"
+            );
+
+            // Interleave the full-rank barrier so the next broadcast shares
+            // the same event generation machinery under a different producer
+            // pattern (all ranks record, then cross-wait).
+            gpus.barrier_rank_streams_reuse()
+                .expect("barrier between route broadcasts");
+            assert_eq!(
+                gpus.rank_barrier_events.len(),
+                2,
+                "barrier must keep the same process-lifetime event pool"
+            );
+        }
+
+        for (rank, buf) in id_bufs.into_iter().enumerate() {
+            gpus.devices[rank].bind_thread().expect("bind free ids");
             let _ = gpus.devices[rank].hip.free(buf);
         }
-        for (rank, buf) in row_bufs.into_iter().enumerate() {
-            gpus.devices[rank].bind_thread().expect("bind free row");
+        for (rank, buf) in weight_bufs.into_iter().enumerate() {
+            gpus.devices[rank].bind_thread().expect("bind free weights");
+            let _ = gpus.devices[rank].hip.free(buf);
+        }
+        for (rank, buf) in snap_ids.into_iter().enumerate() {
+            gpus.devices[rank]
+                .bind_thread()
+                .expect("bind free snap ids");
+            let _ = gpus.devices[rank].hip.free(buf);
+        }
+        for (rank, buf) in snap_weights.into_iter().enumerate() {
+            gpus.devices[rank]
+                .bind_thread()
+                .expect("bind free snap weights");
             let _ = gpus.devices[rank].hip.free(buf);
         }
         for rank in 0..2 {
+            gpus.devices[rank]
+                .bind_thread()
+                .expect("bind stream destroy");
+            if let Some(stream) = gpus.devices[rank].active_stream.take() {
+                gpus.devices[rank]
+                    .hip
+                    .stream_destroy(stream)
+                    .expect("stream_destroy");
+            }
+        }
+    }
+
+    /// 4-GPU rooted peer reduce reuse: left-fold, residual-add, source reuse,
+    /// and shared `rank_barrier_events` interleaving with `broadcast_ep_route`.
+    ///
+    /// Fixture partials `[1e20, -1e20, 3, 4]` distinguish the contracted left
+    /// fold `(((a+b)+c)+d) = 7` from alternate associations that lose the
+    /// small terms into the large cancelling pair.
+    ///
+    /// Run serialized under the GPU lock:
+    /// ```sh
+    /// HIP_VISIBLE_DEVICES=0,1,2,3 flock -w 3600 /tmp/hipfire-gpu.lock \
+    /// cargo test -p hipfire-runtime --locked --lib multi_gpu -- \
+    /// --ignored --exact --test-threads=1 multi_gpu::tests::peer_rooted_reduce_reuse_4gpu
+    /// ```
+    #[test]
+    #[ignore]
+    fn peer_rooted_reduce_reuse_4gpu() {
+        const N: usize = 4;
+        const COUNT: usize = 4;
+        const BYTES: usize = COUNT * 4;
+        // Left fold: ((1e20 + -1e20) + 3) + 4 = 7. Alternate orders drop 3/4.
+        const PARTIALS: [f32; N] = [1.0e20, -1.0e20, 3.0, 4.0];
+        const EXPECT_SUM: f32 = 7.0;
+        const RESIDUAL0: f32 = 10.0;
+        const EXPECT_RESIDUAL: f32 = 17.0;
+        const ROUTE_K: usize = 1024;
+        const ROUTE_BYTES: usize = ROUTE_K * 4;
+
+        let mut gpus =
+            Gpus::init_ep(N, 1).expect("init_ep(4,1) — run with HIP_VISIBLE_DEVICES=0,1,2,3");
+        assert_eq!(gpus.devices.len(), N);
+
+        for rank in 0..N {
+            gpus.devices[rank].bind_thread().expect("bind stream");
+            let stream = gpus.devices[rank]
+                .hip
+                .stream_create()
+                .expect("stream_create");
+            gpus.devices[rank].active_stream = Some(stream);
+        }
+
+        // Seed the process-lifetime event pool so later reduce/route must reuse it.
+        gpus.handoff_rank_stream_reuse(0)
+            .expect("seed rank_barrier_events via handoff");
+        assert_eq!(gpus.rank_barrier_events.len(), N);
+        let pool_len = gpus.rank_barrier_events.len();
+
+        let mut partial_bufs = Vec::with_capacity(N);
+        let mut residual_bufs = Vec::with_capacity(N);
+        let mut snap_bufs = Vec::with_capacity(N);
+        let mut route_ids = Vec::with_capacity(N);
+        let mut route_weights = Vec::with_capacity(N);
+        for rank in 0..N {
+            gpus.devices[rank].bind_thread().expect("bind alloc");
+            partial_bufs.push(
+                gpus.devices[rank]
+                    .hip
+                    .malloc(BYTES)
+                    .expect("malloc partial"),
+            );
+            residual_bufs.push(
+                gpus.devices[rank]
+                    .hip
+                    .malloc(BYTES)
+                    .expect("malloc residual"),
+            );
+            snap_bufs.push(gpus.devices[rank].hip.malloc(BYTES).expect("malloc snap"));
+            route_ids.push(
+                gpus.devices[rank]
+                    .hip
+                    .malloc(ROUTE_BYTES)
+                    .expect("malloc route ids"),
+            );
+            route_weights.push(
+                gpus.devices[rank]
+                    .hip
+                    .malloc(ROUTE_BYTES)
+                    .expect("malloc route weights"),
+            );
+        }
+
+        let poison = vec![f32::NAN; COUNT];
+        let poison_bytes: Vec<u8> = poison.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        let residual_seed: Vec<f32> = (0..COUNT).map(|i| RESIDUAL0 + i as f32).collect();
+        let residual_seed_bytes: Vec<u8> =
+            residual_seed.iter().flat_map(|v| v.to_ne_bytes()).collect();
+
+        // Two full cycles: reduce → dest snap → root poison → residual-add
+        // → route broadcast (same event pool) → barrier. Pool length stays fixed.
+        for round in 0u32..2 {
+            for rank in 0..N {
+                let row = vec![PARTIALS[rank]; COUNT];
+                let bytes: Vec<u8> = row.iter().flat_map(|v| v.to_ne_bytes()).collect();
+                gpus.devices[rank].bind_thread().expect("bind htod partial");
+                gpus.devices[rank]
+                    .hip
+                    .memcpy_htod(&partial_bufs[rank], &bytes)
+                    .expect("htod partial");
+                gpus.devices[rank]
+                    .hip
+                    .memcpy_htod(&residual_bufs[rank], &residual_seed_bytes)
+                    .expect("htod residual seed");
+            }
+
+            let events_before = gpus.rank_barrier_events.len();
+            {
+                let refs: Vec<&DeviceBuffer> = partial_bufs.iter().collect();
+                gpus.all_reduce_sum_f32_peer_rooted(&refs, COUNT)
+                    .unwrap_or_else(|e| panic!("rooted reduce round {round}: {e}"));
+            }
+            assert_eq!(
+                gpus.rank_barrier_events.len(),
+                events_before,
+                "round {round}: rooted reduce must reuse process-lifetime events"
+            );
+            assert_eq!(gpus.rank_barrier_events.len(), pool_len);
+
+            // Destination GPU-stream consume BEFORE host sync, still holding the
+            // reduced rows. Then poison the root source on the root stream —
+            // ordered after the helper's reverse source-reuse waits.
+            for rank in 0..N {
+                gpus.devices[rank].bind_thread().expect("bind snap");
+                let stream = gpus.devices[rank]
+                    .active_stream
+                    .as_ref()
+                    .expect("active stream");
+                gpus.devices[rank]
+                    .hip
+                    .memcpy_dtod_async_at(
+                        &snap_bufs[rank],
+                        0,
+                        &partial_bufs[rank],
+                        0,
+                        BYTES,
+                        stream,
+                    )
+                    .expect("snap reduced row");
+            }
+            gpus.devices[0].bind_thread().expect("bind root poison");
+            {
+                let root = &gpus.devices[0];
+                let stream = root.active_stream.as_ref().expect("root stream");
+                root.hip
+                    .memcpy_htod_async(&partial_bufs[0], &poison_bytes, stream)
+                    .expect("poison root partial after reverse waits");
+            }
+
+            for rank in 0..N {
+                gpus.devices[rank].bind_thread().expect("bind sync");
+                gpus.devices[rank]
+                    .hip
+                    .device_synchronize()
+                    .expect("sync after reduce snap");
+            }
+
+            for rank in 0..N {
+                let mut got = vec![0u8; BYTES];
+                gpus.devices[rank].bind_thread().expect("bind dtoh snap");
+                gpus.devices[rank]
+                    .hip
+                    .memcpy_dtoh(&mut got, &snap_bufs[rank])
+                    .expect("dtoh snap");
+                let mut vals = [0.0f32; COUNT];
+                for i in 0..COUNT {
+                    vals[i] = f32::from_ne_bytes(got[i * 4..i * 4 + 4].try_into().unwrap());
+                }
+                for (i, v) in vals.iter().enumerate() {
+                    assert_eq!(
+                        *v, EXPECT_SUM,
+                        "round {round} rank {rank} elem {i}: left-fold sum must be {EXPECT_SUM}, got {v}"
+                    );
+                }
+            }
+
+            // Residual-add path: root residual absorbs the completed sum, then
+            // every rank observes residual0 + left-fold sum.
+            for rank in 0..N {
+                let row = vec![PARTIALS[rank]; COUNT];
+                let bytes: Vec<u8> = row.iter().flat_map(|v| v.to_ne_bytes()).collect();
+                gpus.devices[rank]
+                    .bind_thread()
+                    .expect("bind htod residual cycle");
+                gpus.devices[rank]
+                    .hip
+                    .memcpy_htod(&partial_bufs[rank], &bytes)
+                    .expect("htod partial for residual-add");
+                gpus.devices[rank]
+                    .hip
+                    .memcpy_htod(&residual_bufs[rank], &residual_seed_bytes)
+                    .expect("htod residual for residual-add");
+            }
+            {
+                let partial_refs: Vec<&DeviceBuffer> = partial_bufs.iter().collect();
+                let residual_refs: Vec<&DeviceBuffer> = residual_bufs.iter().collect();
+                gpus.all_reduce_sum_f32_peer_rooted_add(&partial_refs, &residual_refs, COUNT)
+                    .unwrap_or_else(|e| panic!("rooted residual-add round {round}: {e}"));
+            }
+            assert_eq!(
+                gpus.rank_barrier_events.len(),
+                pool_len,
+                "round {round}: residual-add must keep the same event pool"
+            );
+
+            for rank in 0..N {
+                gpus.devices[rank]
+                    .bind_thread()
+                    .expect("bind residual snap");
+                let stream = gpus.devices[rank]
+                    .active_stream
+                    .as_ref()
+                    .expect("active stream");
+                gpus.devices[rank]
+                    .hip
+                    .memcpy_dtod_async_at(
+                        &snap_bufs[rank],
+                        0,
+                        &residual_bufs[rank],
+                        0,
+                        BYTES,
+                        stream,
+                    )
+                    .expect("snap residual row");
+            }
+            for rank in 0..N {
+                gpus.devices[rank]
+                    .bind_thread()
+                    .expect("bind sync residual");
+                gpus.devices[rank]
+                    .hip
+                    .device_synchronize()
+                    .expect("sync residual");
+            }
+            for rank in 0..N {
+                let mut got = vec![0u8; BYTES];
+                gpus.devices[rank]
+                    .bind_thread()
+                    .expect("bind dtoh residual");
+                gpus.devices[rank]
+                    .hip
+                    .memcpy_dtoh(&mut got, &snap_bufs[rank])
+                    .expect("dtoh residual snap");
+                for i in 0..COUNT {
+                    let v = f32::from_ne_bytes(got[i * 4..i * 4 + 4].try_into().unwrap());
+                    let want = EXPECT_RESIDUAL + i as f32;
+                    assert_eq!(
+                        v, want,
+                        "round {round} rank {rank} residual elem {i}: want {want}, got {v}"
+                    );
+                }
+            }
+
+            // Interleave EP route broadcast on the same event pool.
+            let route_tag = (round + 1) * 17;
+            let mut want_ids = vec![0u8; ROUTE_BYTES];
+            let mut want_weights = vec![0u8; ROUTE_BYTES];
+            for i in 0..ROUTE_K {
+                let id = route_tag.wrapping_mul(1_000_003).wrapping_add(i as u32);
+                let wt = route_tag.wrapping_mul(7).wrapping_add((i as u32) << 8);
+                want_ids[i * 4..i * 4 + 4].copy_from_slice(&id.to_ne_bytes());
+                want_weights[i * 4..i * 4 + 4].copy_from_slice(&wt.to_ne_bytes());
+            }
+            gpus.devices[0].bind_thread().expect("bind route htod");
+            gpus.devices[0]
+                .hip
+                .memcpy_htod(&route_ids[0], &want_ids)
+                .expect("htod route ids");
+            gpus.devices[0]
+                .hip
+                .memcpy_htod(&route_weights[0], &want_weights)
+                .expect("htod route weights");
+            let sentinel = vec![0x3Cu8; ROUTE_BYTES];
+            for rank in 1..N {
+                gpus.devices[rank]
+                    .bind_thread()
+                    .expect("bind route sentinel");
+                gpus.devices[rank]
+                    .hip
+                    .memcpy_htod(&route_ids[rank], &sentinel)
+                    .expect("htod id sentinel");
+                gpus.devices[rank]
+                    .hip
+                    .memcpy_htod(&route_weights[rank], &sentinel)
+                    .expect("htod weight sentinel");
+            }
+
+            gpus.broadcast_ep_route(
+                &route_ids[0],
+                &route_weights[0],
+                |r| (&route_ids[r], &route_weights[r]),
+                ROUTE_K,
+            )
+            .unwrap_or_else(|e| panic!("broadcast_ep_route round {round}: {e}"));
+            assert_eq!(
+                gpus.rank_barrier_events.len(),
+                pool_len,
+                "round {round}: route broadcast must share the reduce event pool"
+            );
+
+            for rank in 1..N {
+                let mut got_ids = vec![0u8; ROUTE_BYTES];
+                let mut got_wts = vec![0u8; ROUTE_BYTES];
+                gpus.devices[rank].bind_thread().expect("bind route dtoh");
+                gpus.devices[rank]
+                    .hip
+                    .device_synchronize()
+                    .expect("sync route dst");
+                gpus.devices[rank]
+                    .hip
+                    .memcpy_dtoh(&mut got_ids, &route_ids[rank])
+                    .expect("dtoh route ids");
+                gpus.devices[rank]
+                    .hip
+                    .memcpy_dtoh(&mut got_wts, &route_weights[rank])
+                    .expect("dtoh route weights");
+                assert_eq!(got_ids, want_ids, "round {round} rank {rank} route ids");
+                assert_eq!(
+                    got_wts, want_weights,
+                    "round {round} rank {rank} route weights"
+                );
+            }
+
+            gpus.barrier_rank_streams_reuse()
+                .expect("barrier between reuse cycles");
+            assert_eq!(
+                gpus.rank_barrier_events.len(),
+                pool_len,
+                "round {round}: barrier must keep the same process-lifetime event pool"
+            );
+        }
+
+        for (rank, buf) in partial_bufs.into_iter().enumerate() {
+            gpus.devices[rank].bind_thread().expect("free partial");
+            let _ = gpus.devices[rank].hip.free(buf);
+        }
+        for (rank, buf) in residual_bufs.into_iter().enumerate() {
+            gpus.devices[rank].bind_thread().expect("free residual");
+            let _ = gpus.devices[rank].hip.free(buf);
+        }
+        for (rank, buf) in snap_bufs.into_iter().enumerate() {
+            gpus.devices[rank].bind_thread().expect("free snap");
+            let _ = gpus.devices[rank].hip.free(buf);
+        }
+        for (rank, buf) in route_ids.into_iter().enumerate() {
+            gpus.devices[rank].bind_thread().expect("free route ids");
+            let _ = gpus.devices[rank].hip.free(buf);
+        }
+        for (rank, buf) in route_weights.into_iter().enumerate() {
+            gpus.devices[rank]
+                .bind_thread()
+                .expect("free route weights");
+            let _ = gpus.devices[rank].hip.free(buf);
+        }
+        let _ = gpus.free_peer_reduce_scratch();
+        for rank in 0..N {
             gpus.devices[rank]
                 .bind_thread()
                 .expect("bind stream destroy");

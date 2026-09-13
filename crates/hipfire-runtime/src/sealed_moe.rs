@@ -3507,7 +3507,7 @@ mod tests {
         physical: &[i32],
     ) -> (ExpertExecutionPlan, DeviceMesh) {
         let (manifest, manifest_plan, specs, sources, mesh) =
-            ep_mesh_fixture(n_experts, ranks, assign, "indexed-decode-slot-order");
+            ep_mesh_fixture(n_experts, ranks, assign, "indexed-decode-routed-partial");
         let plan =
             plan_expert_execution(&manifest, &manifest_plan, &specs, &sources, &mesh, physical)
                 .unwrap()
@@ -3559,7 +3559,13 @@ mod tests {
                     .execution_contract()
                     .expect("adapted table carries a contract");
                 assert_eq!(contract.owner_ranks(), &expected_owner_ranks(&plan));
-                assert!(contract.fingerprint().contains("indexed-decode-slot-order"));
+                assert!(contract
+                    .fingerprint()
+                    .contains("indexed-decode-routed-partial"));
+                assert!(
+                    contract.is_root_routed_ep(),
+                    "plan-bound EP contract must authorize RootRoutedPartial"
+                );
             }
         }
     }
@@ -3598,7 +3604,7 @@ mod tests {
     #[test]
     fn stale_mesh_epoch_and_physical_topology_fail_before_ownership() {
         let (manifest, manifest_plan, specs, sources, mesh) =
-            ep_mesh_fixture(8, 2, ExpertAssign::Stride, "indexed-decode-slot-order");
+            ep_mesh_fixture(8, 2, ExpertAssign::Stride, "indexed-decode-routed-partial");
         let other_mesh = DeviceMesh::rect(&[(DimKind::Ep, 2)]).unwrap();
         let error = plan_expert_execution(
             &manifest,
@@ -3667,7 +3673,7 @@ mod tests {
                     .unwrap();
             assert_eq!(single.parallelism(), ExpertParallelism::Single);
             let (e_manifest, e_plan, e_specs, _, e_mesh) =
-                ep_mesh_fixture(8, ranks, assign, "indexed-decode-slot-order");
+                ep_mesh_fixture(8, ranks, assign, "indexed-decode-routed-partial");
             let physical = vec![7, 2, 11, 5][..ranks].to_vec();
             let fresh =
                 plan_expert_execution(&e_manifest, &e_plan, &e_specs, &sources, &e_mesh, &physical)
@@ -3679,11 +3685,11 @@ mod tests {
                 &e_mesh,
                 &physical,
                 assign,
-                "indexed-decode-slot-order",
+                "indexed-decode-routed-partial",
             )
             .unwrap();
             assert_eq!(fresh, repart, "ranks={ranks} assign={assign:?}");
-            assert_eq!(repart.execution(), "indexed-decode-slot-order");
+            assert_eq!(repart.execution(), "indexed-decode-routed-partial");
             for rank in 0..ranks {
                 let (_, cache) = adapt_expert_execution_plan(&repart, rank).unwrap();
                 assert_eq!(cache.physical_device(), physical[rank]);
@@ -3709,6 +3715,14 @@ mod tests {
         let mut bad = plan.clone();
         bad.experts[0].owner_rank = 1;
         assert_ne!(bad.execution_fingerprint(), baseline);
+        let mut bad = plan.clone();
+        bad.execution = "indexed-decode-slot-order".into();
+        assert_ne!(bad.execution_fingerprint(), baseline);
+        let stale = execution_contract_for_plan(&bad).unwrap();
+        assert!(
+            !stale.is_root_routed_ep(),
+            "cutover negative: old indexed-decode-slot-order must not authorize root-routed EP"
+        );
         let mut bad = plan.clone();
         bad.execution = "other-execution".into();
         assert_ne!(bad.execution_fingerprint(), baseline);

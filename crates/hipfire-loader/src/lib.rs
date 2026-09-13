@@ -1363,6 +1363,17 @@ pub enum EpArch {
         scratches: Vec<hipfire_arch_qwen35::qwen35::Qwen35Scratch>,
         partials: Vec<rdna_compute::GpuTensor>,
         batch: Option<hipfire_arch_qwen35::qwen35::Qwen35DecodeBatchEpState>,
+        /// Load-owned sequential prefill scratch, one entry per rank on its
+        /// owning device: `prefill_pbs[r]` is a `PrefillBatchScratch` sized
+        /// `[chunk x dim]` with `chunk = min(max_seq, 512)` and
+        /// `cap_gdn_tape = false`, and `prefill_partials[r]` is its zeroed
+        /// `[chunk*dim]` F32 routed partial. Always nonempty after load;
+        /// drained (empty) once the optional batch owner is staged, because
+        /// batch mode serves prefill from its own `seed_pbs`/`seed_partials`.
+        /// Serve branch: `batch.is_some()` borrows the seeds,
+        /// `batch.is_none()` borrows these; serve never constructs either.
+        prefill_pbs: Vec<hipfire_arch_qwen35::qwen35::PrefillBatchScratch>,
+        prefill_partials: Vec<rdna_compute::GpuTensor>,
     },
     /// Dense Qwen tensor parallelism. Kept separate from `Qwen35`, whose
     /// ownership and scheduling contract is four-rank routed-expert EP.
@@ -2837,6 +2848,8 @@ struct Qwen35EpStaging {
     dn_states: Vec<qwen35::DeltaNetState>,
     scratches: Vec<qwen35::Qwen35Scratch>,
     partials: Vec<rdna_compute::GpuTensor>,
+    prefill_pbs: Vec<qwen35::PrefillBatchScratch>,
+    prefill_partials: Vec<rdna_compute::GpuTensor>,
 }
 
 impl Qwen35EpStaging {
@@ -2848,6 +2861,8 @@ impl Qwen35EpStaging {
             dn_states: Vec::new(),
             scratches: Vec::new(),
             partials: Vec::new(),
+            prefill_pbs: Vec::new(),
+            prefill_partials: Vec::new(),
         }
     }
     fn gpus_mut(&mut self) -> &mut Gpus {
@@ -2863,6 +2878,8 @@ impl Qwen35EpStaging {
         Vec<qwen35::DeltaNetState>,
         Vec<qwen35::Qwen35Scratch>,
         Vec<rdna_compute::GpuTensor>,
+        Vec<qwen35::PrefillBatchScratch>,
+        Vec<rdna_compute::GpuTensor>,
     ) {
         let gpus = self.gpus.take().expect("into_parts called twice");
         let weights = std::mem::take(&mut self.weights);
@@ -2870,7 +2887,18 @@ impl Qwen35EpStaging {
         let dn_states = std::mem::take(&mut self.dn_states);
         let scratches = std::mem::take(&mut self.scratches);
         let partials = std::mem::take(&mut self.partials);
-        (gpus, weights, kv_caches, dn_states, scratches, partials)
+        let prefill_pbs = std::mem::take(&mut self.prefill_pbs);
+        let prefill_partials = std::mem::take(&mut self.prefill_partials);
+        (
+            gpus,
+            weights,
+            kv_caches,
+            dn_states,
+            scratches,
+            partials,
+            prefill_pbs,
+            prefill_partials,
+        )
     }
 }
 
@@ -2901,16 +2929,28 @@ impl Drop for Qwen35EpStaging {
                 let _ = kv.free_gpu(dev);
             }
         }
-        for (r, w) in self.weights.drain(..).enumerate() {
-            if let Some(dev) = gpus.devices.get_mut(r) {
-                let _ = dev.bind_thread();
-                w.free_gpu(dev);
-            }
-        }
         for (r, p) in self.partials.drain(..).enumerate() {
             if let Some(dev) = gpus.devices.get_mut(r) {
                 let _ = dev.bind_thread();
                 let _ = dev.free_tensor(p);
+            }
+        }
+        for (r, pbs) in self.prefill_pbs.drain(..).enumerate() {
+            if let Some(dev) = gpus.devices.get_mut(r) {
+                let _ = dev.bind_thread();
+                let _ = pbs.free_gpu(dev);
+            }
+        }
+        for (r, p) in self.prefill_partials.drain(..).enumerate() {
+            if let Some(dev) = gpus.devices.get_mut(r) {
+                let _ = dev.bind_thread();
+                let _ = dev.free_tensor(p);
+            }
+        }
+        for (r, w) in self.weights.drain(..).enumerate() {
+            if let Some(dev) = gpus.devices.get_mut(r) {
+                let _ = dev.bind_thread();
+                w.free_gpu(dev);
             }
         }
         for dev in gpus.devices.iter_mut() {
@@ -3766,10 +3806,43 @@ fn load_model_ep_qwen35(
     }
     hipfire_runtime::ep::ensure_rank_streams(staging.gpus_mut())
         .map_err(|e| format!("ensure_rank_streams: {e:?}"))?;
+    // Sequential prefill scratch, one full chunk per rank on its owning
+    // device: a `PrefillBatchScratch` with the DeltaNet S-tape omitted (plain
+    // prefill never reads `dn_s_tape`; `cap_gdn_tape = false`) plus a zeroed
+    // `[chunk*dim]` F32 routed partial. `chunk = min(max_seq, prefill_max_batch_ep())`
+    // matches the shared EP batch `prefill_chunk` policy (`HIPFIRE_PREFILL_MAX_BATCH`); serve windows are `<= chunk`.
+    // Staged in the guard so a mid-loop failure frees every published rank
+    // via `Drop`, and allocated BEFORE any `enable_peer_all` (ROCm cannot
+    // retroactively map late peer-visible allocs).
+    let prefill_chunk = max_seq.min(qwen35::prefill_max_batch_ep());
+    if prefill_chunk == 0 {
+        return Err("EP qwen35: max_seq must be nonzero for prefill scratch".to_string());
+    }
+    let prefill_partial_len = prefill_chunk
+        .checked_mul(config.dim)
+        .ok_or_else(|| "EP qwen35: prefill partial length overflow".to_string())?;
+    for r in 0..n {
+        staging.gpus_mut().devices[r]
+            .bind_thread()
+            .map_err(|e| format!("EP qwen35 prefill bind rank {r}: {e:?}"))?;
+        let pbs = qwen35::PrefillBatchScratch::new_opt(
+            &mut staging.gpus_mut().devices[r],
+            &config,
+            prefill_chunk,
+            false,
+        )
+        .map_err(|e| format!("EP qwen35 prefill PBS rank {r}: {e:?}"))?;
+        staging.prefill_pbs.push(pbs);
+        let pre_partial = staging.gpus_mut().devices[r]
+            .zeros(&[prefill_partial_len], rdna_compute::DType::F32)
+            .map_err(|e| format!("EP qwen35 prefill partial rank {r}: {e:?}"))?;
+        staging.prefill_partials.push(pre_partial);
+    }
     eprintln!(
         "[loader] EP load complete: {n} ranks, peer access deferred until post-batch allocation"
     );
-    let (gpus, weights, kv_caches, dn_states, scratches, partials) = staging.into_parts();
+    let (gpus, weights, kv_caches, dn_states, scratches, partials, prefill_pbs, prefill_partials) =
+        staging.into_parts();
     let eos_tok: u32 = {
         let ids = tokenizer.encode("<|im_end|>");
         if ids.len() == 1 {
@@ -3789,6 +3862,8 @@ fn load_model_ep_qwen35(
                 scratches,
                 partials,
                 batch: None,
+                prefill_pbs,
+                prefill_partials,
             },
         }),
         qwen35_eos_tok: eos_tok,
@@ -4063,13 +4138,47 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
                 scratches,
                 partials,
                 batch,
+                prefill_pbs,
+                prefill_partials,
                 ..
             } => {
+                // Quiesce every rank before any free: in-flight prefill/decode
+                // kernels must retire before their scratch is reclaimed
+                // (mirrors the bind+sync prologue of `free_gpu`).
+                for dev in gpus.devices.iter_mut() {
+                    let _ = dev.bind_thread();
+                    let _ = dev.hip.device_synchronize();
+                }
+                // Tear down captured HIP graphs before reclaiming any tensors they
+                // may still reference. Shared post-match invalidate stays for
+                // other EP arches and remains idempotent here.
+                for dev in gpus.devices.iter_mut() {
+                    let _ = dev.bind_thread();
+                    dev.invalidate_graph_state();
+                }
+
                 if let Some(b) = batch {
                     if let Err(e) = b.free_gpu(&mut gpus) {
                         if ep_first_err.is_none() {
                             ep_first_err = Some(e.to_string());
                         }
+                    }
+                }
+                for (r, pbs) in prefill_pbs.into_iter().enumerate() {
+                    if let Some(dev) = gpus.devices.get_mut(r) {
+                        let _ = dev.bind_thread();
+                        if let Err(e) = pbs.free_gpu(dev) {
+                            if ep_first_err.is_none() {
+                                ep_first_err =
+                                    Some(format!("unload qwen35 EP prefill PBS rank {r}: {e:?}"));
+                            }
+                        }
+                    }
+                }
+                for (r, p) in prefill_partials.into_iter().enumerate() {
+                    if let Some(dev) = gpus.devices.get_mut(r) {
+                        let _ = dev.bind_thread();
+                        let _ = dev.free_tensor(p);
                     }
                 }
                 for (rank, scratch) in scratches.into_iter().enumerate() {

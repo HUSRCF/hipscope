@@ -33,7 +33,9 @@ use super::prefill::forward_batch_chunk_impl;
 use super::prefill::forward_prefill_chunk;
 use super::prefill::is_batchable_la;
 use super::prefill::qwen35_layer_batch_admissible;
+use super::prefill::upload_prefill_batch_inputs;
 use super::prefill::PrefillBandCtx;
+use super::prefill::PrefillRouteMode;
 use super::prefill::PREFILL_MAX_BATCH;
 use super::weights::mixed_expert_tag;
 use super::weights::DeltaNetState;
@@ -1086,6 +1088,42 @@ impl Qwen35DecodeBatchEpState {
     pub fn max_batch(&self) -> usize {
         self.max_batch
     }
+    /// Borrow the load-owned seed prefill scratch for the sequential EP
+    /// prefill fallback (`forward_prefill_batch_ep`): `(&mut seed_pbs,
+    /// &seed_partials, batch peer lease)`.
+    ///
+    /// Ownership contract: the seed scratch is live ONLY for the duration of
+    /// a `prefill_lane` call (scratch, never lane KV/state). The `&mut self`
+    /// borrow statically excludes concurrent `prefill_lane`/`forward_tick`
+    /// use; `Seeding` never persists past a `prefill_lane` return and
+    /// Ready-lane KV lives in the rank lane views, not here, so reuse cannot
+    /// corrupt lanes. No extra scratch pool.
+    ///
+    /// The lease is the SAME live owner the batch-state prefill/decode paths
+    /// reduce under: the fallback passes it into `forward_prefill_batch_ep`
+    /// so the MoE partial sum uses the leased rooted API instead of the
+    /// unleased one the lease guard forbids. All three borrows are disjoint
+    /// fields, so no aliasing. `None` only on the test seam (no live lease).
+    pub fn sequential_prefill_scratch_mut(
+        &mut self,
+    ) -> (
+        &mut [PrefillBatchScratch],
+        &[GpuTensor],
+        Option<&hipfire_runtime::multi_gpu::PeerReduceScratchLease>,
+    ) {
+        (
+            self.seed_pbs.as_mut_slice(),
+            self.seed_partials.as_slice(),
+            self.peer_lease.as_ref(),
+        )
+    }
+    /// Borrow the batch-owned peer reduce lease for sequential EP decode
+    /// fallback (`forward_ep`). Same live owner `prefill_lane`/`forward_tick`
+    /// and the sequential prefill fallback reduce under — no re-acquire.
+    /// `None` only when no lease is held (test seams / non-batch paths).
+    pub fn peer_reduce_lease(&self) -> Option<&hipfire_runtime::multi_gpu::PeerReduceScratchLease> {
+        self.peer_lease.as_ref()
+    }
     pub fn lane_capacity(&self) -> usize {
         self.lane_capacity
     }
@@ -1470,9 +1508,23 @@ impl Qwen35DecodeBatchEpState {
                 dn_lanes.push(dn);
             }
             let mut observed: u32 = 0;
+            let k_top = config.num_experts_per_tok;
             for (chunk_idx, chunk) in chunks.iter().enumerate() {
                 let chunk_n = chunk.len();
                 let start_pos = chunk_idx * self.prefill_chunk;
+                // Hoisted per-chunk uploads: token ids + positions go to each
+                // rank's seed PBS once per chunk (not once per layer). Band
+                // calls below run with `pre_uploaded=true`; the embedding
+                // lookup still runs on the first band.
+                for rank in 0..n {
+                    gpus.devices[rank].bind_thread()?;
+                    upload_prefill_batch_inputs(
+                        &mut gpus.devices[rank],
+                        &self.seed_pbs[rank],
+                        chunk,
+                        start_pos,
+                    )?;
+                }
                 let mut delta_off: usize = 0;
                 let mut fa_off: usize = 0;
                 for layer_idx in 0..config.n_layers {
@@ -1480,6 +1532,20 @@ impl Qwen35DecodeBatchEpState {
                         &weights_per_rank[0].layers[layer_idx],
                         LayerWeights::DeltaNetMoe(_) | LayerWeights::FullAttnMoe(_)
                     );
+                    // Root-authoritative EP routing only on compact bindings
+                    // (same rule as `forward_prefill_batch_ep`); legacy
+                    // replicated loop otherwise.
+                    let compact_ep = if is_moe {
+                        layer_moe_ffn(&weights_per_rank[0].layers[layer_idx])
+                            .map(|ffn| {
+                                ffn.bound_experts()
+                                    .map(|bound| bound.rank_count() != 1)
+                                    .unwrap_or(false)
+                            })
+                            .unwrap_or(false)
+                    } else {
+                        false
+                    };
                     if is_moe {
                         for rank in 0..n {
                             gpus.devices[rank].bind_thread()?;
@@ -1497,52 +1563,198 @@ impl Qwen35DecodeBatchEpState {
                             }
                         }
                     }
-                    for rank in 0..n {
-                        gpus.devices[rank].bind_thread()?;
-                        let band = PrefillBandCtx {
-                            layer_start: layer_idx,
-                            layer_end: layer_idx + 1,
-                            delta_layer_offset: delta_off,
-                            kv_layer_offset: fa_off,
-                            is_first_band: layer_idx == 0,
-                            is_last_band: false,
-                            givens_cos: None,
-                            givens_sin: None,
-                        };
-                        let routed_out = if is_moe {
-                            Some(self.seed_partials[rank].sub_offset(0, chunk_n * dim))
-                        } else {
-                            None
-                        };
-                        let rank_scratch = &self.scratches[rank];
-                        let rank_pbs = &self.seed_pbs[rank];
-                        let rank_kv = &mut kv_lanes[rank];
-                        let rank_dn = &mut dn_lanes[rank];
-                        forward_batch_chunk_impl(
-                            &mut gpus.devices[rank],
-                            &weights_per_rank[rank],
-                            config,
-                            chunk,
-                            start_pos,
-                            rank_kv,
-                            rank_dn,
-                            rank_scratch,
-                            rank_pbs,
-                            None,
-                            None,
-                            None,
-                            0,
-                            None,
-                            false,
-                            false,
-                            Some(&band),
-                            None,
-                            false,
-                            None,
-                            routed_out.as_ref(),
-                            BatchSemantics::Sequential,
-                            DflashFusionCtx::Off,
-                        )?;
+                    if is_moe && compact_ep {
+                        // Root produces the route (router GEMM + softmax/topk
+                        // ONLY on rank 0); the proof is captured through the
+                        // band-carried stack cell, no heap allocation.
+                        let proof_slot: std::cell::Cell<
+                            Option<
+                                hipfire_dispatch::pipeline::sealed_moe::MoePrefillRouteProducerProof,
+                            >,
+                        > = std::cell::Cell::new(None);
+                        {
+                            gpus.devices[0].bind_thread()?;
+                            let band = PrefillBandCtx {
+                                layer_start: layer_idx,
+                                layer_end: layer_idx + 1,
+                                delta_layer_offset: delta_off,
+                                kv_layer_offset: fa_off,
+                                is_first_band: layer_idx == 0,
+                                is_last_band: false,
+                                givens_cos: None,
+                                givens_sin: None,
+                                route: PrefillRouteMode::ProduceRoot { slot: &proof_slot },
+                            };
+                            let routed_out =
+                                Some(self.seed_partials[0].sub_offset(0, chunk_n * dim));
+                            let rank_scratch = &self.scratches[0];
+                            let rank_pbs = &self.seed_pbs[0];
+                            let rank_kv = &mut kv_lanes[0];
+                            let rank_dn = &mut dn_lanes[0];
+                            forward_batch_chunk_impl(
+                                &mut gpus.devices[0],
+                                &weights_per_rank[0],
+                                config,
+                                chunk,
+                                start_pos,
+                                rank_kv,
+                                rank_dn,
+                                rank_scratch,
+                                rank_pbs,
+                                None,
+                                None,
+                                None,
+                                0,
+                                None,
+                                true,
+                                false,
+                                Some(&band),
+                                None,
+                                false,
+                                None,
+                                routed_out.as_ref(),
+                                BatchSemantics::Sequential,
+                                DflashFusionCtx::Off,
+                            )?;
+                        }
+                        let root_proof = proof_slot.get().ok_or_else(|| {
+                            HipError::new(0, "prefill_lane: root produced no route proof")
+                        })?;
+                        // Broadcast the root's first N*k route entries to the
+                        // other ranks (device-to-device, no host bytes; `k`
+                        // is the FLAT element count).
+                        {
+                            let k_flat = chunk_n.checked_mul(k_top).ok_or_else(|| {
+                                HipError::new(0, "prefill_lane: route count overflow")
+                            })?;
+                            let root_ids = self.seed_pbs[0]
+                                .moe_topk_indices_batch
+                                .as_ref()
+                                .expect("moe scratch");
+                            let root_weights = self.seed_pbs[0]
+                                .moe_topk_weights_batch
+                                .as_ref()
+                                .expect("moe scratch");
+                            gpus.broadcast_ep_route(
+                                &root_ids.buf,
+                                &root_weights.buf,
+                                |r| {
+                                    let pbs = &self.seed_pbs[r];
+                                    (
+                                        &pbs.moe_topk_indices_batch
+                                            .as_ref()
+                                            .expect("moe scratch")
+                                            .buf,
+                                        &pbs.moe_topk_weights_batch
+                                            .as_ref()
+                                            .expect("moe scratch")
+                                            .buf,
+                                    )
+                                },
+                                k_flat,
+                            )
+                            .map_err(|e| HipError::new(0, &e.to_string()))?;
+                        }
+                        // Non-roots adopt the proof and execute the grouped
+                        // MoE over the broadcast bytes. Shared stays
+                        // replicated; routed partials reduce once below.
+                        for rank in 1..n {
+                            gpus.devices[rank].bind_thread()?;
+                            let band = PrefillBandCtx {
+                                layer_start: layer_idx,
+                                layer_end: layer_idx + 1,
+                                delta_layer_offset: delta_off,
+                                kv_layer_offset: fa_off,
+                                is_first_band: layer_idx == 0,
+                                is_last_band: false,
+                                givens_cos: None,
+                                givens_sin: None,
+                                route: PrefillRouteMode::AdoptRoot { proof: &root_proof },
+                            };
+                            let routed_out = if is_moe {
+                                Some(self.seed_partials[rank].sub_offset(0, chunk_n * dim))
+                            } else {
+                                None
+                            };
+                            let rank_scratch = &self.scratches[rank];
+                            let rank_pbs = &self.seed_pbs[rank];
+                            let rank_kv = &mut kv_lanes[rank];
+                            let rank_dn = &mut dn_lanes[rank];
+                            forward_batch_chunk_impl(
+                                &mut gpus.devices[rank],
+                                &weights_per_rank[rank],
+                                config,
+                                chunk,
+                                start_pos,
+                                rank_kv,
+                                rank_dn,
+                                rank_scratch,
+                                rank_pbs,
+                                None,
+                                None,
+                                None,
+                                0,
+                                None,
+                                true,
+                                false,
+                                Some(&band),
+                                None,
+                                false,
+                                None,
+                                routed_out.as_ref(),
+                                BatchSemantics::Sequential,
+                                DflashFusionCtx::Off,
+                            )?;
+                        }
+                    } else {
+                        for rank in 0..n {
+                            gpus.devices[rank].bind_thread()?;
+                            let band = PrefillBandCtx {
+                                layer_start: layer_idx,
+                                layer_end: layer_idx + 1,
+                                delta_layer_offset: delta_off,
+                                kv_layer_offset: fa_off,
+                                is_first_band: layer_idx == 0,
+                                is_last_band: false,
+                                givens_cos: None,
+                                givens_sin: None,
+                                route: PrefillRouteMode::Replicated,
+                            };
+                            let routed_out = if is_moe {
+                                Some(self.seed_partials[rank].sub_offset(0, chunk_n * dim))
+                            } else {
+                                None
+                            };
+                            let rank_scratch = &self.scratches[rank];
+                            let rank_pbs = &self.seed_pbs[rank];
+                            let rank_kv = &mut kv_lanes[rank];
+                            let rank_dn = &mut dn_lanes[rank];
+                            forward_batch_chunk_impl(
+                                &mut gpus.devices[rank],
+                                &weights_per_rank[rank],
+                                config,
+                                chunk,
+                                start_pos,
+                                rank_kv,
+                                rank_dn,
+                                rank_scratch,
+                                rank_pbs,
+                                None,
+                                None,
+                                None,
+                                0,
+                                None,
+                                true,
+                                false,
+                                Some(&band),
+                                None,
+                                false,
+                                None,
+                                routed_out.as_ref(),
+                                BatchSemantics::Sequential,
+                                DflashFusionCtx::Off,
+                            )?;
+                        }
                     }
                     if is_moe {
                         let count = chunk_n * dim;
@@ -1707,6 +1919,7 @@ impl Qwen35DecodeBatchEpState {
             .map_err(|_| HipError::new(0, "forward_tick: moe_layer_count overflow u32"))?;
         let b = self.max_batch;
         let dim = config.dim;
+        let k_top = config.num_experts_per_tok;
         let elem_count = b
             .checked_mul(dim)
             .ok_or_else(|| HipError::new(0, "forward_tick: elem count overflow"))?;
@@ -1735,6 +1948,37 @@ impl Qwen35DecodeBatchEpState {
                     &weights_per_rank[0].layers[layer_idx],
                     LayerWeights::DeltaNetMoe(_) | LayerWeights::FullAttnMoe(_)
                 );
+                // Root-authoritative EP routing only on compact bindings
+                // (same rule as `prefill_lane`): the probe below is pure
+                // (`bound_experts` performs only identity checks, no
+                // allocation, no launches).
+                let compact_ep = if is_moe {
+                    layer_moe_ffn(&weights_per_rank[0].layers[layer_idx])
+                        .map(|ffn| {
+                            ffn.bound_experts()
+                                .map(|bound| bound.rank_count() != 1)
+                                .unwrap_or(false)
+                        })
+                        .unwrap_or(false)
+                } else {
+                    false
+                };
+                // Driver preflight: validate every rank's live binding before
+                // any rank mutates (pure, launches nothing). Each rank's full
+                // seal/proof validation still runs inside its chunk before its
+                // own mutation.
+                if is_moe && compact_ep {
+                    for rank in 0..n {
+                        let ffn = layer_moe_ffn(&weights_per_rank[rank].layers[layer_idx])
+                            .ok_or_else(|| {
+                                HipError::new(
+                                    0,
+                                    &format!("forward_tick: MoE FFN missing on rank {rank}"),
+                                )
+                            })?;
+                        ffn.bound_experts()?;
+                    }
+                }
                 if is_moe {
                     for rank in 0..n {
                         gpus.devices[rank].bind_thread()?;
@@ -1750,62 +1994,217 @@ impl Qwen35DecodeBatchEpState {
                     }
                 }
                 // Invariant: decode `pbs` per rank and `seed_pbs` are separate
-                // allocations; `prefill_lane` correctly uses `seed_pbs` with
-                // `false,false`, while `forward_tick` has no external
+                // allocations; `prefill_lane` hoists uploads per chunk and uses
+                // `seed_pbs` with `true,false`, while `forward_tick` has no external
                 // `prepare_decode_batch_inputs` and no peer-copy. Only band 0
                 // on every rank owns staging of host token/position/embedding
                 // inputs; later bands must reuse the transformed residual in
                 // `pbs.x_batch` and must not re-upload or re-embed.
                 let inputs_prepared = ep_tick_inputs_prepared(layer_idx);
-                for rank in 0..n {
-                    gpus.devices[rank].bind_thread()?;
-                    let band = PrefillBandCtx {
-                        layer_start: layer_idx,
-                        layer_end: layer_idx + 1,
-                        delta_layer_offset: delta_off,
-                        kv_layer_offset: fa_off,
-                        is_first_band: layer_idx == 0,
-                        is_last_band: false,
-                        givens_cos: None,
-                        givens_sin: None,
-                    };
-                    let routed_out = if is_moe {
-                        Some(self.decode_partials[rank].sub_offset(0, b * dim))
-                    } else {
-                        None
-                    };
-                    let rank_state = &mut self.ranks[rank];
-                    let rank_scratch = &self.scratches[rank];
-                    let rank_pbs = &rank_state.pbs;
-                    forward_batch_chunk_impl(
-                        &mut gpus.devices[rank],
-                        &weights_per_rank[rank],
-                        config,
-                        tokens,
-                        0,
-                        &mut rank_state.kv_cache,
-                        &mut rank_state.dn_state,
-                        rank_scratch,
-                        rank_pbs,
-                        None,
-                        None,
-                        None,
-                        0,
-                        None,
-                        inputs_prepared,
-                        inputs_prepared,
-                        Some(&band),
-                        None,
-                        false,
-                        None,
-                        routed_out.as_ref(),
-                        BatchSemantics::Independent {
-                            positions,
-                            lane_capacity: self.lane_capacity,
-                            active_mask,
-                        },
-                        DflashFusionCtx::Off,
-                    )?;
+                // Compact EP MoE layers run the same root-produced GPU
+                // route/proof + broadcast + non-root-adopt discipline as
+                // `prefill_lane`. Independent-slot semantics are preserved:
+                // every rank's chunk still runs with
+                // `BatchSemantics::Independent` over the fixed slots — no
+                // token-sequential dependency, no per-token fallback.
+                if is_moe && compact_ep {
+                    // Root produces the route (router GEMM + softmax/topk
+                    // ONLY on rank 0); the proof is captured through the
+                    // band-carried stack cell, no heap allocation.
+                    let proof_slot: std::cell::Cell<
+                        Option<
+                            hipfire_dispatch::pipeline::sealed_moe::MoePrefillRouteProducerProof,
+                        >,
+                    > = std::cell::Cell::new(None);
+                    {
+                        gpus.devices[0].bind_thread()?;
+                        let band = PrefillBandCtx {
+                            layer_start: layer_idx,
+                            layer_end: layer_idx + 1,
+                            delta_layer_offset: delta_off,
+                            kv_layer_offset: fa_off,
+                            is_first_band: layer_idx == 0,
+                            is_last_band: false,
+                            givens_cos: None,
+                            givens_sin: None,
+                            route: PrefillRouteMode::ProduceRoot { slot: &proof_slot },
+                        };
+                        let routed_out = Some(self.decode_partials[0].sub_offset(0, b * dim));
+                        let rank_state = &mut self.ranks[0];
+                        let rank_scratch = &self.scratches[0];
+                        let rank_pbs = &rank_state.pbs;
+                        forward_batch_chunk_impl(
+                            &mut gpus.devices[0],
+                            &weights_per_rank[0],
+                            config,
+                            tokens,
+                            0,
+                            &mut rank_state.kv_cache,
+                            &mut rank_state.dn_state,
+                            rank_scratch,
+                            rank_pbs,
+                            None,
+                            None,
+                            None,
+                            0,
+                            None,
+                            inputs_prepared,
+                            inputs_prepared,
+                            Some(&band),
+                            None,
+                            false,
+                            None,
+                            routed_out.as_ref(),
+                            BatchSemantics::Independent {
+                                positions,
+                                lane_capacity: self.lane_capacity,
+                                active_mask,
+                            },
+                            DflashFusionCtx::Off,
+                        )?;
+                    }
+                    let root_proof = proof_slot.get().ok_or_else(|| {
+                        HipError::new(0, "forward_tick: root produced no route proof")
+                    })?;
+                    // Broadcast the root's first N*k route entries to the
+                    // other ranks (device-to-device, no host bytes; `k`
+                    // is the FLAT element count).
+                    {
+                        let k_flat = b.checked_mul(k_top).ok_or_else(|| {
+                            HipError::new(0, "forward_tick: route count overflow")
+                        })?;
+                        let root_ids = self.ranks[0]
+                            .pbs
+                            .moe_topk_indices_batch
+                            .as_ref()
+                            .expect("moe scratch");
+                        let root_weights = self.ranks[0]
+                            .pbs
+                            .moe_topk_weights_batch
+                            .as_ref()
+                            .expect("moe scratch");
+                        gpus.broadcast_ep_route(
+                            &root_ids.buf,
+                            &root_weights.buf,
+                            |r| {
+                                let pbs = &self.ranks[r].pbs;
+                                (
+                                    &pbs.moe_topk_indices_batch
+                                        .as_ref()
+                                        .expect("moe scratch")
+                                        .buf,
+                                    &pbs.moe_topk_weights_batch
+                                        .as_ref()
+                                        .expect("moe scratch")
+                                        .buf,
+                                )
+                            },
+                            k_flat,
+                        )
+                        .map_err(|e| HipError::new(0, &e.to_string()))?;
+                    }
+                    // Non-roots adopt the proof and execute the grouped
+                    // MoE over the broadcast bytes. Shared stays
+                    // replicated; routed partials reduce once below.
+                    for rank in 1..n {
+                        gpus.devices[rank].bind_thread()?;
+                        let band = PrefillBandCtx {
+                            layer_start: layer_idx,
+                            layer_end: layer_idx + 1,
+                            delta_layer_offset: delta_off,
+                            kv_layer_offset: fa_off,
+                            is_first_band: layer_idx == 0,
+                            is_last_band: false,
+                            givens_cos: None,
+                            givens_sin: None,
+                            route: PrefillRouteMode::AdoptRoot { proof: &root_proof },
+                        };
+                        let routed_out = Some(self.decode_partials[rank].sub_offset(0, b * dim));
+                        let rank_state = &mut self.ranks[rank];
+                        let rank_scratch = &self.scratches[rank];
+                        let rank_pbs = &rank_state.pbs;
+                        forward_batch_chunk_impl(
+                            &mut gpus.devices[rank],
+                            &weights_per_rank[rank],
+                            config,
+                            tokens,
+                            0,
+                            &mut rank_state.kv_cache,
+                            &mut rank_state.dn_state,
+                            rank_scratch,
+                            rank_pbs,
+                            None,
+                            None,
+                            None,
+                            0,
+                            None,
+                            inputs_prepared,
+                            inputs_prepared,
+                            Some(&band),
+                            None,
+                            false,
+                            None,
+                            routed_out.as_ref(),
+                            BatchSemantics::Independent {
+                                positions,
+                                lane_capacity: self.lane_capacity,
+                                active_mask,
+                            },
+                            DflashFusionCtx::Off,
+                        )?;
+                    }
+                } else {
+                    for rank in 0..n {
+                        gpus.devices[rank].bind_thread()?;
+                        let band = PrefillBandCtx {
+                            layer_start: layer_idx,
+                            layer_end: layer_idx + 1,
+                            delta_layer_offset: delta_off,
+                            kv_layer_offset: fa_off,
+                            is_first_band: layer_idx == 0,
+                            is_last_band: false,
+                            givens_cos: None,
+                            givens_sin: None,
+                            route: PrefillRouteMode::Replicated,
+                        };
+                        let routed_out = if is_moe {
+                            Some(self.decode_partials[rank].sub_offset(0, b * dim))
+                        } else {
+                            None
+                        };
+                        let rank_state = &mut self.ranks[rank];
+                        let rank_scratch = &self.scratches[rank];
+                        let rank_pbs = &rank_state.pbs;
+                        forward_batch_chunk_impl(
+                            &mut gpus.devices[rank],
+                            &weights_per_rank[rank],
+                            config,
+                            tokens,
+                            0,
+                            &mut rank_state.kv_cache,
+                            &mut rank_state.dn_state,
+                            rank_scratch,
+                            rank_pbs,
+                            None,
+                            None,
+                            None,
+                            0,
+                            None,
+                            inputs_prepared,
+                            inputs_prepared,
+                            Some(&band),
+                            None,
+                            false,
+                            None,
+                            routed_out.as_ref(),
+                            BatchSemantics::Independent {
+                                positions,
+                                lane_capacity: self.lane_capacity,
+                                active_mask,
+                            },
+                            DflashFusionCtx::Off,
+                        )?;
+                    }
                 }
                 if is_moe {
                     // Zero inactive rows before the leased reduce so they contribute +0.0f32 in rooted order.
@@ -2129,6 +2528,10 @@ impl Qwen35DecodeBatchEpState {
 /// element `r` allocated on `gpus.devices[r]`. Every device must have an
 /// `active_stream` set ([`hipfire_runtime::ep::ensure_rank_streams`]).
 ///
+/// `peer_lease = None` preserves the exact plain-sequential path. `Some` is the
+/// batch owner's live lease (same owner `prefill_lane`/`forward_tick` reduce
+/// under); the order and arithmetic are identical, only the scratch owner differs.
+///
 /// TP=1 is the degenerate reference: one rank owns all experts (no zero-dummy),
 /// the all-reduce short-circuits to identity, and the result is the same as the
 /// single-GPU lowered decode (validated byte-/argmax-identical on the fleet).
@@ -2143,6 +2546,7 @@ pub fn forward_ep(
     dn_per_rank: &[DeltaNetState],
     scratch_per_rank: &[Qwen35Scratch],
     partials: &[GpuTensor],
+    peer_lease: Option<&hipfire_runtime::multi_gpu::PeerReduceScratchLease>,
 ) -> HipResult<()> {
     let n = gpus.devices.len();
     assert_eq!(
@@ -2241,6 +2645,7 @@ pub fn forward_ep(
             partials,
             &program,
             dim,
+            peer_lease,
         )
         .map_err(|e| HipError::new(0, &e.to_string()))?;
         if matches!(
@@ -2288,14 +2693,24 @@ pub fn forward_ep(
 /// next layer's replicated attention must read the FULL (cross-rank-summed)
 /// residual. For each layer:
 ///   1. (MoE only) zero each rank's `[n × dim]` routed partial,
-///   2. run the layer's batched chunk on every rank — the **shared** expert
-///      accumulates into `pbs.x_batch` (replicated, added once per rank), the
-///      **routed** combine into the zeroed partial (owned experts only; non-owned
-///      read load-time zero-dummy → 0),
-///   3. (MoE only) canonically (`all_reduce_sum_f32_peer_rooted`) sum the
-///      `[n × dim]` partials across ranks and add into each rank's `pbs.x_batch`.
+///   2. run the layer's batched chunk — on compact MoE bindings rank 0 alone
+///      runs router/softmax/topk (root-authoritative route), the root's first
+///      `N*k` route entries broadcast D2D into the other ranks, and non-roots
+///      adopt the root proof; on Single bindings every rank routes locally —
+///      the **shared** expert accumulates into `pbs.x_batch` (replicated,
+///      added once per rank), the **routed** combine into the zeroed partial
+///      (owned experts only; non-owned read load-time zero-dummy → 0),
+///   3. (MoE only) canonically (fixed left fold over ranks in index order) sum
+///      the `[n × dim]` partials across ranks and add into each rank's
+///      `pbs.x_batch`: the leased rooted API under `peer_lease` (batch-staged
+///      sequential fallback, whose live owner holds the lease), else the
+///      unleased rooted/RCCL selection below.
 /// Non-MoE (dense DeltaNet / FullAttn) layers run replicated, no partial, no
 /// all-reduce. Final norm + lm_head (last token) run on rank 0 → `scratch_per_rank[0].logits`.
+///
+/// `peer_lease = None` preserves the exact plain-sequential path. `Some` is the
+/// batch owner's live lease (same owner `prefill_lane`/`forward_tick` reduce
+/// under); the order and arithmetic are identical, only the scratch owner differs.
 ///
 /// **v1 constraints:** the whole prompt must fit one batch (`tokens.len() <=
 /// pbs.max_batch`; no chunk loop yet) and KV must be a non-asym mode (q8/q4/…)
@@ -2319,6 +2734,7 @@ pub fn forward_prefill_batch_ep(
     scratch_per_rank: &[Qwen35Scratch],
     pbs_per_rank: &[PrefillBatchScratch],
     partials: &[GpuTensor],
+    peer_lease: Option<&hipfire_runtime::multi_gpu::PeerReduceScratchLease>,
 ) -> HipResult<()> {
     let n_rank = gpus.devices.len();
     assert_eq!(
@@ -2394,11 +2810,35 @@ pub fn forward_prefill_batch_ep(
     let mut t_chunk = 0.0f64;
     let mut t_ar = 0.0f64;
     let mut t_add = 0.0f64;
+    // Hoisted per-chunk uploads: token ids + positions go to each rank's PBS
+    // once per chunk (not once per layer). The per-layer band calls below run
+    // with `pre_uploaded=true`; the embedding lookup itself still runs on the
+    // first band (it reads the uploaded `pbs.tokens`).
+    for r in 0..n_rank {
+        gpus.devices[r].bind_thread()?;
+        upload_prefill_batch_inputs(&mut gpus.devices[r], &pbs_per_rank[r], tokens, start_pos)?;
+    }
+    let k_top = config.num_experts_per_tok;
     for layer_idx in 0..config.n_layers {
         let is_moe = matches!(
             &weights_per_rank[0].layers[layer_idx],
             LayerWeights::DeltaNetMoe(_) | LayerWeights::FullAttnMoe(_)
         );
+        // Root-authoritative EP routing is active only on compact (multi-rank)
+        // MoE bindings. `bound_experts` performs only identity checks (no
+        // allocation); an error here degrades to the legacy replicated loop,
+        // whose seal site surfaces the error exactly as today.
+        let compact_ep = if is_moe {
+            layer_moe_ffn(&weights_per_rank[0].layers[layer_idx])
+                .map(|ffn| {
+                    ffn.bound_experts()
+                        .map(|bound| bound.rank_count() != 1)
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false)
+        } else {
+            false
+        };
 
         // 1. Zero each rank's routed partial (on its active_stream, so it's
         //    ordered before the chunk's routed combine that writes into it).
@@ -2417,45 +2857,184 @@ pub fn forward_prefill_batch_ep(
             }
         }
 
-        // 2. Run the layer's batched chunk on every rank (single-layer band).
+        // 2. Run the layer's batched chunk (single-layer bands).
         let t_c = std::time::Instant::now();
-        for r in 0..n_rank {
-            gpus.devices[r].bind_thread()?;
-            let band = PrefillBandCtx {
-                layer_start: layer_idx,
-                layer_end: layer_idx + 1,
-                delta_layer_offset: delta_off,
-                kv_layer_offset: fa_off,
-                is_first_band: layer_idx == 0,
-                is_last_band: false, // final norm + lm_head done explicitly below
-                // v1 EP prefill is q8/non-asym KV → no per-rank Givens replicas.
-                givens_cos: None,
-                givens_sin: None,
-            };
-            let routed_out = if is_moe { Some(&partials[r]) } else { None };
-            forward_prefill_chunk(
-                &mut gpus.devices[r],
-                &weights_per_rank[r],
-                config,
-                tokens,
-                start_pos,
-                &mut kv_per_rank[r],
-                &mut dn_per_rank[r],
-                &scratch_per_rank[r],
-                &pbs_per_rank[r],
-                None,  // hidden_rb
-                None,  // per_token_hidden_out
-                None,  // gdn_tape
-                0,     // tape_offset
-                None,  // tree_verify
-                false, // pre_uploaded
-                Some(&band),
-                None,  // mask_override
-                false, // needs_last_token_logits (no lm_head in band)
-                None,  // max_layer
-                routed_out,
-                DflashFusionCtx::Off,
-            )?;
+        if is_moe && compact_ep {
+            // 2a. Root produces the route: router GEMM + softmax/topk run
+            // ONLY on rank 0; the opaque producer proof is captured through
+            // the band-carried cell (caller-owned stack slot, no heap
+            // allocation). Shared-expert output stays replicated in rank 0's
+            // x_batch here, exactly like every other rank's below.
+            let proof_slot: std::cell::Cell<
+                Option<hipfire_dispatch::pipeline::sealed_moe::MoePrefillRouteProducerProof>,
+            > = std::cell::Cell::new(None);
+            {
+                gpus.devices[0].bind_thread()?;
+                let band = PrefillBandCtx {
+                    layer_start: layer_idx,
+                    layer_end: layer_idx + 1,
+                    delta_layer_offset: delta_off,
+                    kv_layer_offset: fa_off,
+                    is_first_band: layer_idx == 0,
+                    is_last_band: false, // final norm + lm_head done explicitly below
+                    // v1 EP prefill is q8/non-asym KV → no per-rank Givens replicas.
+                    givens_cos: None,
+                    givens_sin: None,
+                    route: PrefillRouteMode::ProduceRoot { slot: &proof_slot },
+                };
+                forward_prefill_chunk(
+                    &mut gpus.devices[0],
+                    &weights_per_rank[0],
+                    config,
+                    tokens,
+                    start_pos,
+                    &mut kv_per_rank[0],
+                    &mut dn_per_rank[0],
+                    &scratch_per_rank[0],
+                    &pbs_per_rank[0],
+                    None, // hidden_rb
+                    None, // per_token_hidden_out
+                    None, // gdn_tape
+                    0,    // tape_offset
+                    None, // tree_verify
+                    true, // pre_uploaded (hoisted above)
+                    Some(&band),
+                    None,  // mask_override
+                    false, // needs_last_token_logits (no lm_head in band)
+                    None,  // max_layer
+                    Some(&partials[0]),
+                    DflashFusionCtx::Off,
+                )?;
+            }
+            let root_proof = proof_slot.get().ok_or_else(|| {
+                HipError::new(0, "forward_prefill_batch_ep: root produced no route proof")
+            })?;
+            // 2b. Broadcast the root's first N*k route entries to every other
+            // rank (device-to-device, no host bytes). `k` here is the FLAT
+            // element count (`N*k_top`); bytes per array = `k*4`. The
+            // destination-owned FIFO transport (root-ready event, per-dst
+            // copies, reverse source-reuse) orders the adopting ranks'
+            // expert kernels — enqueued after, on their own streams — behind
+            // the copy by same-stream FIFO.
+            {
+                let k_flat = n.checked_mul(k_top).ok_or_else(|| {
+                    HipError::new(0, "forward_prefill_batch_ep: route count overflow")
+                })?;
+                let root_ids = pbs_per_rank[0]
+                    .moe_topk_indices_batch
+                    .as_ref()
+                    .expect("moe scratch");
+                let root_weights = pbs_per_rank[0]
+                    .moe_topk_weights_batch
+                    .as_ref()
+                    .expect("moe scratch");
+                gpus.broadcast_ep_route(
+                    &root_ids.buf,
+                    &root_weights.buf,
+                    |r| {
+                        let pbs = &pbs_per_rank[r];
+                        (
+                            &pbs.moe_topk_indices_batch
+                                .as_ref()
+                                .expect("moe scratch")
+                                .buf,
+                            &pbs.moe_topk_weights_batch
+                                .as_ref()
+                                .expect("moe scratch")
+                                .buf,
+                        )
+                    },
+                    k_flat,
+                )
+                .map_err(|e| HipError::new(0, &e.to_string()))?;
+            }
+            // 2c. Non-roots adopt: skip router GEMM + softmax/topk + produce,
+            // execute the grouped MoE over the broadcast bytes into their own
+            // zeroed partials. Shared-expert output stays replicated in each
+            // rank's x_batch (never reduced); the routed partials are
+            // all-reduced once below and added once per rank (step 3).
+            for r in 1..n_rank {
+                gpus.devices[r].bind_thread()?;
+                let band = PrefillBandCtx {
+                    layer_start: layer_idx,
+                    layer_end: layer_idx + 1,
+                    delta_layer_offset: delta_off,
+                    kv_layer_offset: fa_off,
+                    is_first_band: layer_idx == 0,
+                    is_last_band: false, // final norm + lm_head done explicitly below
+                    // v1 EP prefill is q8/non-asym KV → no per-rank Givens replicas.
+                    givens_cos: None,
+                    givens_sin: None,
+                    route: PrefillRouteMode::AdoptRoot { proof: &root_proof },
+                };
+                forward_prefill_chunk(
+                    &mut gpus.devices[r],
+                    &weights_per_rank[r],
+                    config,
+                    tokens,
+                    start_pos,
+                    &mut kv_per_rank[r],
+                    &mut dn_per_rank[r],
+                    &scratch_per_rank[r],
+                    &pbs_per_rank[r],
+                    None, // hidden_rb
+                    None, // per_token_hidden_out
+                    None, // gdn_tape
+                    0,    // tape_offset
+                    None, // tree_verify
+                    true, // pre_uploaded (hoisted above)
+                    Some(&band),
+                    None,  // mask_override
+                    false, // needs_last_token_logits (no lm_head in band)
+                    None,  // max_layer
+                    Some(&partials[r]),
+                    DflashFusionCtx::Off,
+                )?;
+            }
+        } else {
+            // Legacy replicated path: every rank routes locally. This covers
+            // all non-MoE layers on every binding plus MoE layers on Single
+            // bindings (byte-identical seal behavior; only the host uploads
+            // are hoisted out of the per-layer loop).
+            for r in 0..n_rank {
+                gpus.devices[r].bind_thread()?;
+                let band = PrefillBandCtx {
+                    layer_start: layer_idx,
+                    layer_end: layer_idx + 1,
+                    delta_layer_offset: delta_off,
+                    kv_layer_offset: fa_off,
+                    is_first_band: layer_idx == 0,
+                    is_last_band: false, // final norm + lm_head done explicitly below
+                    // v1 EP prefill is q8/non-asym KV → no per-rank Givens replicas.
+                    givens_cos: None,
+                    givens_sin: None,
+                    route: PrefillRouteMode::Replicated,
+                };
+                let routed_out = if is_moe { Some(&partials[r]) } else { None };
+                forward_prefill_chunk(
+                    &mut gpus.devices[r],
+                    &weights_per_rank[r],
+                    config,
+                    tokens,
+                    start_pos,
+                    &mut kv_per_rank[r],
+                    &mut dn_per_rank[r],
+                    &scratch_per_rank[r],
+                    &pbs_per_rank[r],
+                    None, // hidden_rb
+                    None, // per_token_hidden_out
+                    None, // gdn_tape
+                    0,    // tape_offset
+                    None, // tree_verify
+                    true, // pre_uploaded (hoisted above)
+                    Some(&band),
+                    None,  // mask_override
+                    false, // needs_last_token_logits (no lm_head in band)
+                    None,  // max_layer
+                    routed_out,
+                    DflashFusionCtx::Off,
+                )?;
+            }
         }
 
         if ep_timing {
@@ -2467,14 +3046,18 @@ pub fn forward_prefill_batch_ep(
             let t_a = std::time::Instant::now();
             let refs: Vec<&hip_bridge::DeviceBuffer> = partials.iter().map(|p| &p.buf).collect();
             // Selection log line: names the active path (once per process). The
-            // rooted and unrooted peer paths share the same lease guard and the
-            // same lazily-grown Gpus scratch, so error paths release nothing new:
-            // every failure propagates with `?` and the scratch stays owned by
-            // Gpus for reuse.
+            // unleased rooted and unrooted peer paths share the same lease guard
+            // and the same lazily-grown Gpus scratch, so error paths release
+            // nothing new: every failure propagates with `?` and the scratch
+            // stays owned by Gpus for reuse. Under a batch-owned lease the
+            // guard forbids those unleased paths, so the leased rooted API
+            // (same fixed left fold over ranks) is selected instead.
             static PREFILL_AR_LOG: std::sync::OnceLock<()> = std::sync::OnceLock::new();
             let use_rooted = ep_ar_canonical && gpus.peer_access_enabled;
             PREFILL_AR_LOG.get_or_init(|| {
-                let path = if use_rooted {
+                let path = if peer_lease.is_some() {
+                    "leased rooted-peer under batch lease (fixed left fold over ranks)"
+                } else if use_rooted {
                     "canonical rooted-peer (fixed left fold over ranks)"
                 } else if ep_ar_canonical {
                     "RCCL (canonical rooted-peer unavailable: peer access disabled)"
@@ -2485,7 +3068,10 @@ pub fn forward_prefill_batch_ep(
                 };
                 eprintln!("EP prefill all-reduce: {path}");
             });
-            if use_rooted {
+            if let Some(lease) = peer_lease {
+                gpus.all_reduce_sum_f32_peer_rooted_leased(lease, &refs, n * dim)
+                    .map_err(|e| HipError::new(0, &e.to_string()))?;
+            } else if use_rooted {
                 gpus.all_reduce_sum_f32_peer_rooted(&refs, n * dim)
                     .map_err(|e| HipError::new(0, &e.to_string()))?;
             } else if ep_ar_canonical || ep_peer_ar == Ok("0") {
@@ -4334,6 +4920,7 @@ pub fn forward_prefill_batch_multi(
                     is_last_band: b + 1 == n_bands,
                     givens_cos,
                     givens_sin,
+                    route: PrefillRouteMode::Replicated,
                 };
                 {
                     let pbs_b: &PrefillBatchScratch = &pbs_per_band[b];

@@ -287,6 +287,7 @@ fn main() {
                 &scratch_per_rank,
                 &pbs_per_rank,
                 &prefill_partials,
+                None,
             )
             .expect("forward_prefill_batch_ep chunk");
             offset += chunk_n;
@@ -306,6 +307,7 @@ fn main() {
                 &dn_per_rank,
                 &scratch_per_rank,
                 &partials,
+                None,
             )
             .expect("forward_ep prefill");
         }
@@ -336,6 +338,7 @@ fn main() {
             &dn_per_rank,
             &scratch_per_rank,
             &partials,
+            None,
         )
         .expect("forward_ep decode");
         gpus.devices[0].bind_thread().expect("bind 0");

@@ -859,7 +859,15 @@ pub fn ep_serve_qwen35_moe(
 
     let t_prefill = Instant::now();
     let mut aborted_in_prefill = false;
-    for (pos, &tok) in prompt_ids.iter().enumerate() {
+    // Batched EP prefill: windows of <= common prefill scratch max_batch.
+    // Absolute start_pos is the chunk offset (request already reset KV/DN above).
+    // Scratch source: load-owned prefill_pbs/prefill_partials when batch is
+    // None; when batch is staged the loader drains those and sequential
+    // fallthrough (daemon !ep_batch_eligible) reuses batch seed scratch via
+    // sequential_prefill_scratch_mut. Missing/empty scratch fails closed
+    // before GPU mutation. No token fallback.
+    let mut off = 0usize;
+    while off < prompt_n {
         if check_abort(id) {
             aborted_in_prefill = true;
             break;
@@ -882,7 +890,9 @@ pub fn ep_serve_qwen35_moe(
                 kv_caches,
                 dn_states,
                 scratches,
-                partials,
+                batch,
+                prefill_pbs,
+                prefill_partials,
                 ..
             } = inner
             else {
@@ -896,15 +906,85 @@ pub fn ep_serve_qwen35_moe(
                 );
                 return;
             };
-            qwen35::forward_ep(
-                gpus, weights, config, tok, pos, kv_caches, dn_states, scratches, partials,
-            )
-            .map_err(|e| format!("qwen35 MoE EP prefill: {e:?}"))
+            let n_rank = gpus.devices.len();
+            // Select prefill scratch once per window: seed when batch staged,
+            // else load-owned sequential buffers.
+            if let Some(batch_state) = batch.as_mut() {
+                // Disjoint borrow from the concrete batch owner: seed scratch plus
+                // the SAME live lease `prefill_lane`/`forward_tick` reduce under,
+                // so the MoE partial sum uses the leased rooted API the lease
+                // guard requires. No new pool, no re-acquire, no release.
+                let (pbs, parts, peer_lease) = batch_state.sequential_prefill_scratch_mut();
+                if pbs.is_empty()
+                    || parts.is_empty()
+                    || pbs.len() != n_rank
+                    || parts.len() != n_rank
+                {
+                    Err("qwen35 MoE EP prefill missing batch seed scratch".to_string())
+                } else {
+                    let max_batch = pbs[0].max_batch;
+                    if max_batch == 0 {
+                        Err("qwen35 MoE EP prefill seed max_batch is zero".to_string())
+                    } else {
+                        let end = (off + max_batch).min(prompt_n);
+                        let start_pos = off;
+                        qwen35::forward_prefill_batch_ep(
+                            gpus,
+                            weights,
+                            config,
+                            &prompt_ids[start_pos..end],
+                            start_pos,
+                            kv_caches,
+                            dn_states,
+                            scratches,
+                            pbs,
+                            parts,
+                            peer_lease,
+                        )
+                        .map(|_| end)
+                        .map_err(|e| format!("qwen35 MoE EP prefill: {e:?}"))
+                    }
+                }
+            } else if prefill_pbs.is_empty()
+                || prefill_partials.is_empty()
+                || prefill_pbs.len() != n_rank
+                || prefill_partials.len() != n_rank
+            {
+                Err("qwen35 MoE EP prefill missing load-owned prefill scratch".to_string())
+            } else {
+                let max_batch = prefill_pbs[0].max_batch;
+                if max_batch == 0 {
+                    Err("qwen35 MoE EP prefill scratch max_batch is zero".to_string())
+                } else {
+                    let end = (off + max_batch).min(prompt_n);
+                    let start_pos = off;
+                    // Plain sequential without batch: no live lease, so the
+                    // unleased selection inside is unchanged.
+                    qwen35::forward_prefill_batch_ep(
+                        gpus,
+                        weights,
+                        config,
+                        &prompt_ids[start_pos..end],
+                        start_pos,
+                        kv_caches,
+                        dn_states,
+                        scratches,
+                        prefill_pbs,
+                        prefill_partials,
+                        None,
+                    )
+                    .map(|_| end)
+                    .map_err(|e| format!("qwen35 MoE EP prefill: {e:?}"))
+                }
+            }
         };
-        if let Err(message) = result {
-            qwen35_moe_fail_closed_error(m, stdout, id, &message, "validation", false);
-            let _ = stdout.flush();
-            return;
+        match result {
+            Ok(end) => off = end,
+            Err(message) => {
+                qwen35_moe_fail_closed_error(m, stdout, id, &message, "validation", false);
+                let _ = stdout.flush();
+                return;
+            }
         }
     }
     if aborted_in_prefill || check_abort(id) {
@@ -985,13 +1065,18 @@ pub fn ep_serve_qwen35_moe(
                 dn_states,
                 scratches,
                 partials,
+                batch,
                 ..
             } = inner
             else {
                 return Err("EP arch mismatch (expected qwen35 MoE EP)".to_string());
             };
+            // Batch-staged sequential fallback borrows the SAME live lease the
+            // batch owner reduces under; ordinary sequential keeps None.
+            let peer_lease = batch.as_ref().and_then(|b| b.peer_reduce_lease());
             qwen35::forward_ep(
                 gpus, weights, config, next, write_pos, kv_caches, dn_states, scratches, partials,
+                peer_lease,
             )
             .map_err(|e| format!("qwen35 MoE EP decode: {e:?}"))
         })();

@@ -4874,6 +4874,25 @@ impl Gpu {
                         .replace("#include \"kv_slot_desc.h\"", "");
                     format!("{}\n{}", kernels::KV_SLOT_DESC_H, stripped)
                 }));
+                specs.push(("kv_cache_write_q8_0_independent", {
+                    // Shares KV_CACHE_WRITE_Q8_0_BATCHED_SRC with the entry
+                    // above, so it needs the identical strip-and-prepend:
+                    // that source #includes kv_slot_desc.h and this
+                    // precompile path has no -I to kernels/src. Warms the
+                    // module the continuous-batch decode path JITs first.
+                    let stripped = kernels::KV_CACHE_WRITE_Q8_0_BATCHED_SRC
+                        .replace("#include \"kv_slot_desc.h\"", "");
+                    format!("{}\n{}", kernels::KV_SLOT_DESC_H, stripped)
+                }));
+                specs.push(("kv_cache_write_q8_0_independent_masked", {
+                    // Shares KV_CACHE_WRITE_Q8_0_BATCHED_SRC with the entries
+                    // above, so it needs the identical strip-and-prepend.
+                    // Warms the module forward_tick JITs first on a
+                    // partially-active batch.
+                    let stripped = kernels::KV_CACHE_WRITE_Q8_0_BATCHED_SRC
+                        .replace("#include \"kv_slot_desc.h\"", "");
+                    format!("{}\n{}", kernels::KV_SLOT_DESC_H, stripped)
+                }));
                 specs.push((
                     "attention_flash_q8_0_tile",
                     kernels::ATTENTION_FLASH_Q8_0_TILE_SRC.to_string(),

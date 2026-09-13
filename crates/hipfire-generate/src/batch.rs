@@ -2823,13 +2823,7 @@ pub fn is_qwen_ep_batch_request_eligible(
     let Some(ep) = m.ep.as_ref() else {
         return false;
     };
-    let EpArch::Qwen35 {
-        config,
-        weights,
-        batch,
-        ..
-    } = &ep.inner
-    else {
+    let EpArch::Qwen35 { batch, .. } = &ep.inner else {
         return false;
     };
     if batch.is_none() {
@@ -2845,10 +2839,8 @@ pub fn is_qwen_ep_batch_request_eligible(
     {
         return false;
     }
-    // EP batch is pure TP=4 gfx1201; validate via existing weight format gate.
-    if !hipfire_loader::batch_staging::qwen_ep_batch_weight_formats_supported(&weights[0]) {
-        return false;
-    }
+    // Staged `batch` above is the admission: staging already passed the full
+    // `validate_ep_batch_compatibility` (embd/lm_head/all-global-experts).
     let has_image = msg.get("image").is_some() || msg.get("image_base64").is_some();
     let has_tools = msg
         .get("tools")

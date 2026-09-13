@@ -85,13 +85,6 @@ pub enum Step<'a> {
     /// Complete validated MoE program. The call owns the bound expert view and
     /// raw operands privately; callers can only obtain it through `seal_*`.
     Moe(sealed_moe::SealedMoeCall<'a>),
-    /// Sealed canonical EP root continuation: fold the gathered raw slot
-    /// rows into the root residual with the existing
-    /// `moe_down_combine_k8_batched` fold. The call owns the root-bound
-    /// expert view, the gather receipt, and the raw operands privately;
-    /// callers can only obtain it through `seal_slot_combine`. Runs only on
-    /// the root rank, only through `execute_steps`.
-    MoeSlotCombine(sealed_moe::SealedMoeSlotCombine<'a>),
 }
 
 /// Op-kind for fusion matching. Total over Step variants.
@@ -108,11 +101,6 @@ fn op_kind(step: &Step) -> PipelineOp {
         // a projection fusion prefix.  `MoeCombine` is the existing pipeline
         // marker and lowers to the dedicated `SuperOpKind::Moe`.
         Step::Moe(_) => PipelineOp::MoeCombine,
-        // The slot combine is likewise a complete grammar (one fold, no
-        // fusible prefix). It shares the `MoeCombine` marker: fusion
-        // matching only fires on RmsnormAutomatic-led windows, so a
-        // standalone slot combine never fuses either way.
-        Step::MoeSlotCombine(_) => PipelineOp::MoeCombine,
     }
 }
 
@@ -677,7 +665,6 @@ pub fn execute_steps(
     for step in steps {
         match step {
             Step::Moe(call) => call.validate_for_gpu(gpu)?,
-            Step::MoeSlotCombine(call) => call.validate_for_gpu(gpu)?,
             _ => {}
         }
     }
@@ -1032,7 +1019,6 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
             .bias_add_f32(x, bias, 1, *dim)
             .map_err(|e| DispatchError::Hip(e.to_string())),
         Step::Moe(call) => sealed_moe::execute_sealed(gpu, ctx, call),
-        Step::MoeSlotCombine(call) => sealed_moe::execute_slot_combine(gpu, call),
     }
 }
 

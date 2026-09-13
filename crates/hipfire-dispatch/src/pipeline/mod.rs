@@ -12,12 +12,12 @@ use std::sync::{LazyLock, OnceLock};
 
 pub mod sealed_moe;
 pub use sealed_moe::{
-    checked_grouped_m_total_bound, checked_tp_local_shapes, produce_prefill_route, seal_decode,
-    seal_decode_with_router, seal_experts_only, seal_prefill, seal_prefill_with_router,
-    seal_slot_combine, ActivationIdentity, ActivationInput, BoundMoeExperts, ExpertBindingCache,
-    ExpertMetadata, ExpertResource, ExpertResources, ExpertTable, MoeContribution, MoeProtocol,
-    MoeRootRouteReceipt, MoeRouteReceipt, MoeRouterInput, MoeSharedContribution,
-    MoeSlotGatherReceipt, ResourceAlias, SealedMoeCall, SealedMoeSlotCombine,
+    adopt_prefill_route, checked_grouped_m_total_bound, checked_tp_local_shapes,
+    produce_prefill_route, seal_decode, seal_decode_with_router, seal_ep_routed_contrib,
+    seal_prefill, seal_prefill_ep, seal_prefill_with_router, ActivationIdentity, ActivationInput,
+    BoundMoeExperts, ExpertBindingCache, ExpertMetadata, ExpertResource, ExpertResources,
+    ExpertTable, MoeContribution, MoePrefillRouteProducerProof, MoeProtocol, MoeRouteProducerProof,
+    MoeRouteReceipt, MoeRouterInput, MoeSharedContribution, ResourceAlias, SealedMoeCall,
 };
 pub(crate) mod steps;
 pub use steps::{execute_steps, FusedPattern, GemvInput, Step};
@@ -641,30 +641,31 @@ pub(super) fn run_moe_decode(
         && *DOWN_LAST_COMBINE.get_or_init(|| {
             hipfire_config::developer_var("HIPFIRE_MOE_DOWN_LAST_COMBINE").as_deref() == Ok("1")
         });
-    // Canonical EP (sealed slot order): the per-rank call must leave raw
-    // expanded rows behind for the root continuation, so every route that
-    // cannot materialize them is rejected here, before the first launch.
-    // (The sealer preflights the same conditions launch-free; this is
-    // defense in depth at the executor boundary.) Ninepath needs no check:
-    // it structurally requires `!defer_routed_combine` below, and canonical
-    // always defers. Full routing calls run the router replicated; pre-routed
-    // experts-only calls (root-authoritative IDs already resident) skip
-    // routing below via `skip_routing` — per-rank re-ranking is never assumed.
-    if p.ep_mode == crate::families::moe::MoeEpMode::CanonicalSlotOrder {
+    // Root-routed EP (sealed partials): the per-rank call folds the weighted
+    // combine straight into the zeroed partial, so every route that cannot
+    // route on-GPU is rejected here, before the first launch. (The sealer
+    // preflights the same conditions launch-free; this is defense in depth
+    // at the executor boundary.) The partial path needs neither expanded
+    // rows nor the down-last gate — both fold into the partial correctly.
+    // Full routing calls run the router replicated; routed-contrib calls
+    // (root-authoritative IDs already resident) skip routing below via
+    // `skip_routing` — per-rank re-ranking is never assumed.
+    if p.ep_mode == crate::families::moe::MoeEpMode::RootRoutedPartial {
         if !res.use_gpu_topk {
             return Err(DispatchError::Hip(
-                "canonical EP decode requires the GPU top-K path; the CPU-top-K fallback is rejected"
+                "root-routed EP decode requires the GPU top-K path; the CPU-top-K fallback is rejected"
                     .into(),
             ));
         }
-        if down_last_combine
-            || !crate::families::moe::moe_down_writes_expanded(
-                p.dtypes.routed_down,
-                p.expert_dtype_tags.is_some(),
-            )
-        {
+        if p.defer_routed_combine {
             return Err(DispatchError::Hip(
-                "canonical EP decode requires an expanded-writing routed-down route".into(),
+                "root-routed EP decode requires defer_routed_combine=false (weighted combine into the partial)"
+                    .into(),
+            ));
+        }
+        if p.routed_out.is_none() {
+            return Err(DispatchError::Hip(
+                "root-routed EP decode requires routed_out=Some (the zeroed partial)".into(),
             ));
         }
     }
@@ -1777,28 +1778,6 @@ pub(super) fn run_moe_decode(
         ))?;
     }
 
-    Ok(())
-}
-
-/// Sealed canonical EP root continuation. Runs the EXISTING
-/// `moe_down_combine_k8_batched` fold once on the root: `residual +=
-/// sum_i weights[i]*raw_slots[i]` in slot order, with the launcher's
-/// ordinary arch/flag variant selection. Only a `SealedMoeSlotCombine`
-/// produced by `seal_slot_combine` can enter (validated again on entry);
-/// the root launcher is never called directly from runtime or model code.
-pub(super) fn run_moe_slot_combine(
-    gpu: &mut Gpu,
-    call: &sealed_moe::SealedMoeSlotCombine<'_>,
-) -> Result<(), DispatchError> {
-    call.validate_for_gpu(gpu)?;
-    hip!(gpu.moe_down_combine_k8_batched(
-        call.raw_slots(),
-        call.weights(),
-        call.residual(),
-        call.hidden(),
-        call.k(),
-        1
-    ))?;
     Ok(())
 }
 

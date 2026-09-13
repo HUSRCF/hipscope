@@ -391,19 +391,17 @@ pub enum MoeEpMode {
     /// Single-GPU (or Single-owner) decode, including the existing
     /// next-layer deferred-combine experiment. Requires `routed_out=None`.
     None,
-    /// Canonical expert-parallel decode: per-rank raw slot rows stay
-    /// expanded (`routed_out=None`, `defer_routed_combine=true`), the root
-    /// runs the shared expert first (`skip_shared=false`) while non-root
-    /// ranks skip it, and the root finishes through the sealed
-    /// `Step::MoeSlotCombine` continuation. Requires a plan-bound compact
-    /// table carrying the canonical execution contract.
-    CanonicalSlotOrder,
-    /// Rank-partial diagnostic: per-rank zeroed partials (`routed_out=Some`,
-    /// `defer_routed_combine=false`) reduced by the legacy all-reduce, with
-    /// the root partial including the shared expert once and non-root
-    /// partials omitting it. Reachable only under
-    /// `HIPFIRE_EP_SLOT_COMBINE=0`; any other setting selects canonical.
-    LegacyRankPartialDiagnostic,
+    /// Root-routed expert-parallel decode: per-rank zeroed partials
+    /// (`routed_out=Some`, `defer_routed_combine=false`).
+    /// The root routes on-GPU (SoftmaxTopK), seals the route-producer
+    /// proof, and folds owned experts plus the shared expert once into
+    /// its partial (`skip_shared=false`); non-root ranks skip the shared
+    /// expert (`skip_shared=true`), adopt the broadcast root route, and
+    /// fold owned experts (zero dummies read 0) into their partials.
+    /// The driver then all-reduce-sums the partials and adds the result
+    /// into each rank's residual once. Requires a plan-bound compact
+    /// table carrying the root-routed execution contract.
+    RootRoutedPartial,
 }
 
 /// True when the routed-down GEMV for `routed_down` materializes per-slot
@@ -471,12 +469,10 @@ pub struct MoeParams<'a> {
     /// residual while producing the next layer's normalized activation.
     pub defer_routed_combine: bool,
     /// Sealed decode mode (see [`MoeEpMode`]). `None` = Single (with or
-    /// without the deferred-combine experiment); `CanonicalSlotOrder` =
-    /// canonical EP (requires `routed_out=None`, `defer_routed_combine=true`,
-    /// root `skip_shared=false`, non-root `skip_shared=true`);
-    /// `LegacyRankPartialDiagnostic` = rank-partial diagnostic (requires
-    /// `routed_out=Some`, `defer_routed_combine=false`, reachable only under
-    /// `HIPFIRE_EP_SLOT_COMBINE=0`). The sealer rejects any other
+    /// without the deferred-combine experiment, still `routed_out=None`);
+    /// `RootRoutedPartial` = root-routed EP (requires `routed_out=Some`,
+    /// `defer_routed_combine=false`, root `skip_shared=false`, non-root
+    /// `skip_shared=true`). The sealer rejects any other
     /// mode/parameter combination before launch.
     pub ep_mode: MoeEpMode,
     /// Safetensors layer index (== `MoeFfnWeights.layer_idx`). Only used

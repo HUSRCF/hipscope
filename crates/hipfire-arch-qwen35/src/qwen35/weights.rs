@@ -394,7 +394,7 @@ pub(crate) fn build_expert_binding(
     hipfire_dispatch::pipeline::sealed_moe::ExpertTable,
     hipfire_dispatch::pipeline::sealed_moe::ExpertBindingCache,
 )> {
-    use hipfire_dispatch::pipeline::sealed_moe::CANONICAL_EP_EXECUTION;
+    use hipfire_dispatch::pipeline::sealed_moe::ROOT_ROUTED_EP_EXECUTION;
     use hipfire_runtime::sealed_moe::{
         adapt_expert_execution_plan, plan_expert_execution, plan_single_expert_execution,
         ExpertSourceMetadata,
@@ -601,7 +601,7 @@ pub(crate) fn build_expert_binding(
         ExpertBindingTarget::ExpertParallel { assignment, .. } => (
             ExpertParallelism::ExpertParallel,
             *assignment,
-            CANONICAL_EP_EXECUTION.to_string(),
+            ROOT_ROUTED_EP_EXECUTION.to_string(),
         ),
     };
     let spec = ExpertGroupSpec {
@@ -806,7 +806,7 @@ mod sealed_ep_owner_tests {
             let contract = table
                 .execution_contract()
                 .expect("sealed EP table carries a contract");
-            assert!(contract.is_canonical_ep(), "canonical EP execution");
+            assert!(contract.is_root_routed_ep(), "root-routed EP execution");
             assert_eq!(
                 plan_expert_to_rank(&plan),
                 (0..n_experts)

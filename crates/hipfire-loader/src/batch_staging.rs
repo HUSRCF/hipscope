@@ -64,19 +64,20 @@ pub fn qwen_batch_weight_formats_supported(
     embd_ok && lm_ok
 }
 
-/// EP uses the same admission rule as single-GPU.
-pub fn qwen_ep_batch_weight_formats_supported(
-    weights: &hipfire_arch_qwen35::qwen35::Qwen35Weights,
-) -> bool {
-    qwen_batch_weight_formats_supported(weights)
-}
-
 /// Stage continuous batching for `m`, returning what the caller must publish.
+///
+/// Returns `Err` when staging leaves no usable pool behind: any device-sync
+/// or GPU-free failure during batch publication/cleanup is fatal (the batch
+/// is unpublished and the sequential PBS/partial pool is drained or
+/// untrusted). The caller must roll back the whole staged model and never
+/// emit a `loaded` ack. `Ok` preserves the safe sequential fallback: failed
+/// optional allocation, or a failed peer-enable whose cleanup succeeds with
+/// the sequential pool intact, simply reports `capable == false`.
 pub fn stage_continuous_batch(
     m: &mut LoadedModel,
     gpu: &mut Gpu,
     requested: usize,
-) -> BatchStaging {
+) -> Result<BatchStaging, String> {
     let mut out = BatchStaging::default();
     // ── Continuous batch staging (must be before `loaded` ack) ──
     // Stage Qwen35DecodeBatchState / hipfire_arch_lfm2moe::batch::Lfm2DecodeBatchState (single-GPU) or
@@ -252,80 +253,180 @@ pub fn stage_continuous_batch(
                 config,
                 weights,
                 batch,
+                prefill_pbs,
+                prefill_partials,
                 ..
             } = &mut ep.inner
             {
-                if !qwen_ep_batch_weight_formats_supported(&weights[0]) {
-                    eprintln!(
-                        "[daemon][EP] continuous batch weight formats unsupported — fail closed"
-                    );
+                // Format admission lives solely in
+                // `validate_ep_batch_compatibility` below (single authority).
+                // Derive capacities similar to single-GPU but via EP Gpus handle when possible.
+                let max_attention_lane = ep.gpus.devices[0]
+                    .attention_q8_0_kv_independent_max_lane_capacity(config.head_dim);
+                let batch_lane_capacity = m.max_seq.min(max_attention_lane).max(1);
+                let repeat_cap = 128usize.max(1);
+                let prefill_chunk = hipfire_arch_qwen35::qwen35::prefill_max_batch_ep();
+                if batch_lane_capacity == 0 || batch_lane_capacity >= m.max_seq + 1 {
+                    eprintln!("[daemon][EP] continuous batch lane capacity invalid — fail closed");
                 } else {
-                    // Derive capacities similar to single-GPU but via EP Gpus handle when possible.
-                    let max_attention_lane = ep.gpus.devices[0]
-                        .attention_q8_0_kv_independent_max_lane_capacity(config.head_dim);
-                    let batch_lane_capacity = m.max_seq.min(max_attention_lane).max(1);
-                    let repeat_cap = 128usize.max(1);
-                    let prefill_chunk = 512usize;
-                    if batch_lane_capacity == 0 || batch_lane_capacity >= m.max_seq + 1 {
-                        eprintln!(
-                            "[daemon][EP] continuous batch lane capacity invalid — fail closed"
-                        );
-                    } else {
-                        let load_cfg = hipfire_arch_qwen35::qwen35::Qwen35BatchLoadConfig::new(
-                            requested,
-                            batch_lane_capacity,
-                            repeat_cap,
-                            prefill_chunk,
-                        );
-                        // Fail-closed validation before allocation.
-                        match hipfire_arch_qwen35::qwen35::validate_ep_batch_compatibility(
-                            &ep.gpus, weights, config, &load_cfg,
-                        ) {
-                            Ok(compat) => {
-                                // Enforce frozen invariants.
-                                if compat.rank_count() != 4 || compat.rank_mask() != 0x0f || compat.reduce() != hipfire_arch_qwen35::qwen35::Qwen35EpReduce::PeerRootedF32 || compat.topology() != hipfire_arch_qwen35::qwen35::Qwen35EpTopology::ExpertParallel {
-                                                        eprintln!("[daemon][EP] compat invariants violated — fail closed: rank_count={} mask={:#x} reduce={:?} topo={:?}", compat.rank_count(), compat.rank_mask(), compat.reduce(), compat.topology());
-                                                    } else {
-                                                        match hipfire_arch_qwen35::qwen35::Qwen35DecodeBatchEpState::new(&mut ep.gpus, weights, config, &load_cfg) {
-                                                            Ok(ep_batch) => {
-                                                                // Attest receipt getters work before publishing.
-                                                                let _ = ep_batch.max_batch();
-                                                                let _ = ep_batch.lane_capacity();
-                                                                // Peer access MUST follow every peer-visible batch
-                                                                // allocation (partials + leased scratch); ROCm may
-                                                                // not retroactively map late allocs.
-                                                                match ep.gpus.enable_peer_all() {
-                                                                    Ok(peer_access) => {
-                                                                        *batch = Some(ep_batch);
-                                                                        out.slots = requested;
- out.lane_capacity = batch_lane_capacity;
-                                                                        out.capable = true;
-                                                                        out.ep = true;
-                                                                        out.ep_slots = requested;
-                                                                        out.ep_lane_cap = batch_lane_capacity;
-                                                                        eprintln!("[daemon][EP] expert-parallel batch staged: slots={} lane_cap={} repeat_cap={} prefill_chunk={} reduce=peer_rooted_f32 rank_count=4 peer_access={}", requested, batch_lane_capacity, repeat_cap, prefill_chunk, peer_access);
-                                                                    }
-                                                                    Err(enable_err) => {
-                                                                        match ep_batch.free_gpu(&mut ep.gpus) {
-                                                                            Ok(()) => {
-                                                                                eprintln!("[daemon][EP] enable_peer_all failed after batch alloc: {enable_err:?} — fail closed (batch freed)");
-                                                                            }
-                                                                            Err(cleanup_err) => {
-                                                                                eprintln!("[daemon][EP] enable_peer_all failed after batch alloc: {enable_err:?}; cleanup also failed: {cleanup_err:?} — fail closed");
-                                                                            }
-                                                                        }
-                                                                    }
-                                                                }
+                    let load_cfg = hipfire_arch_qwen35::qwen35::Qwen35BatchLoadConfig::new(
+                        requested,
+                        batch_lane_capacity,
+                        repeat_cap,
+                        prefill_chunk,
+                    );
+                    // Fail-closed validation before allocation.
+                    match hipfire_arch_qwen35::qwen35::validate_ep_batch_compatibility(
+                        &ep.gpus, weights, config, &load_cfg,
+                    ) {
+                        Ok(compat) => {
+                            // Enforce frozen invariants.
+                            if compat.rank_count() != 4
+                                || compat.rank_mask() != 0x0f
+                                || compat.reduce()
+                                    != hipfire_arch_qwen35::qwen35::Qwen35EpReduce::PeerRootedF32
+                                || compat.topology()
+                                    != hipfire_arch_qwen35::qwen35::Qwen35EpTopology::ExpertParallel
+                            {
+                                eprintln!("[daemon][EP] compat invariants violated — fail closed: rank_count={} mask={:#x} reduce={:?} topo={:?}", compat.rank_count(), compat.rank_mask(), compat.reduce(), compat.topology());
+                            } else {
+                                // Keep load-owned sequential PBS/partials intact through
+                                // batch construction and peer enable so allocation or
+                                // enable_peer_all failure can still fall back to them.
+                                // Free them only at the publication boundary after both
+                                // succeed (post-sync), retaining only the batch seed pool.
+                                match hipfire_arch_qwen35::qwen35::Qwen35DecodeBatchEpState::new(
+                                    &mut ep.gpus,
+                                    weights,
+                                    config,
+                                    &load_cfg,
+                                ) {
+                                    Ok(ep_batch) => {
+                                        // Attest receipt getters work before publishing.
+                                        let _ = ep_batch.max_batch();
+                                        let _ = ep_batch.lane_capacity();
+                                        // Peer access MUST follow every peer-visible batch
+                                        // allocation (partials + leased scratch); ROCm may
+                                        // not retroactively map late allocs.
+                                        match ep.gpus.enable_peer_all() {
+                                            Ok(peer_access) => {
+                                                // Publication transaction: sync, free unused
+                                                // sequential owners, then publish batch. Any
+                                                // cleanup failure must not leave batch=None
+                                                // with empty PBS as a silent sequential path.
+                                                let mut first_cleanup_err = None;
+                                                for dev in ep.gpus.devices.iter_mut() {
+                                                    if let Err(e) = dev.bind_thread() {
+                                                        first_cleanup_err.get_or_insert(e);
+                                                        continue;
+                                                    }
+                                                    if let Err(e) = dev.hip.device_synchronize() {
+                                                        first_cleanup_err.get_or_insert(e);
+                                                    }
+                                                }
+                                                if let Some(sync_err) = first_cleanup_err.take() {
+                                                    // A failed device sync leaves neither pool
+                                                    // trustworthy: free the batch best-effort
+                                                    // and fail the whole load (never `loaded`
+                                                    // ack on an unusable resident).
+                                                    let cleanup_note = match ep_batch
+                                                        .free_gpu(&mut ep.gpus)
+                                                    {
+                                                        Ok(()) => {
+                                                            eprintln!("[daemon][EP] device sync failed after peer enable before sequential free: {sync_err:?} — fail closed (batch freed)");
+                                                            String::new()
+                                                        }
+                                                        Err(cleanup_err) => {
+                                                            eprintln!("[daemon][EP] device sync failed after peer enable before sequential free: {sync_err:?}; batch cleanup also failed: {cleanup_err:?} — fail closed");
+                                                            format!("; batch cleanup also failed: {cleanup_err:?}")
+                                                        }
+                                                    };
+                                                    return Err(format!("device sync failed after peer enable before sequential free: {sync_err:?}{cleanup_note}"));
+                                                } else {
+                                                    for (r, pbs) in
+                                                        prefill_pbs.drain(..).enumerate()
+                                                    {
+                                                        if let Some(dev) =
+                                                            ep.gpus.devices.get_mut(r)
+                                                        {
+                                                            if let Err(e) = dev.bind_thread() {
+                                                                first_cleanup_err.get_or_insert(e);
                                                             }
-                                                            Err(e) => {
-                                                                eprintln!("[daemon][EP] expert-parallel batch allocation failed: {e} — fail closed");
+                                                            if let Err(e) = pbs.free_gpu(dev) {
+                                                                first_cleanup_err.get_or_insert(e);
                                                             }
                                                         }
                                                     }
+                                                    for (r, p) in
+                                                        prefill_partials.drain(..).enumerate()
+                                                    {
+                                                        if let Some(dev) =
+                                                            ep.gpus.devices.get_mut(r)
+                                                        {
+                                                            if let Err(e) = dev.bind_thread() {
+                                                                first_cleanup_err.get_or_insert(e);
+                                                            }
+                                                            if let Err(e) = dev.free_tensor(p) {
+                                                                first_cleanup_err.get_or_insert(e);
+                                                            }
+                                                        }
+                                                    }
+                                                    if let Some(free_err) = first_cleanup_err {
+                                                        // Sequential pool already drained — do not
+                                                        // publish batch, free it, and fail the
+                                                        // load as unusable (no silent empty-PBS
+                                                        // sequential fallback).
+                                                        let cleanup_note = match ep_batch
+                                                            .free_gpu(&mut ep.gpus)
+                                                        {
+                                                            Ok(()) => {
+                                                                eprintln!("[daemon][EP] sequential scratch free failed after peer enable: {free_err:?} — fail closed (batch freed; sequential pool unusable)");
+                                                                String::new()
+                                                            }
+                                                            Err(cleanup_err) => {
+                                                                eprintln!("[daemon][EP] sequential scratch free failed after peer enable: {free_err:?}; batch cleanup also failed: {cleanup_err:?} — fail closed (sequential pool unusable)");
+                                                                format!("; batch cleanup also failed: {cleanup_err:?}")
+                                                            }
+                                                        };
+                                                        return Err(format!("sequential scratch free failed after peer enable: {free_err:?}{cleanup_note}"));
+                                                    } else {
+                                                        *batch = Some(ep_batch);
+                                                        out.slots = requested;
+                                                        out.lane_capacity = batch_lane_capacity;
+                                                        out.capable = true;
+                                                        out.ep = true;
+                                                        out.ep_slots = requested;
+                                                        out.ep_lane_cap = batch_lane_capacity;
+                                                        eprintln!("[daemon][EP] expert-parallel batch staged: slots={} lane_cap={} repeat_cap={} prefill_chunk={} reduce=peer_rooted_f32 rank_count=4 peer_access={}", requested, batch_lane_capacity, repeat_cap, prefill_chunk, peer_access);
+                                                    }
+                                                }
+                                            }
+                                            Err(enable_err) => {
+                                                // Sequential owners untouched: a successful
+                                                // batch free keeps the sequential fallback
+                                                // usable. A failed free leaves neither pool
+                                                // trustworthy — fail the whole load.
+                                                match ep_batch.free_gpu(&mut ep.gpus) {
+                                                    Ok(()) => {
+                                                        eprintln!("[daemon][EP] enable_peer_all failed after batch alloc: {enable_err:?} — fail closed (batch freed; sequential pool preserved)");
+                                                    }
+                                                    Err(cleanup_err) => {
+                                                        eprintln!("[daemon][EP] enable_peer_all failed after batch alloc: {enable_err:?}; cleanup also failed: {cleanup_err:?} — fail closed");
+                                                        return Err(format!("enable_peer_all failed after batch alloc: {enable_err:?}; batch cleanup also failed: {cleanup_err:?}"));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        // Sequential owners untouched — sequential fallback remains usable.
+                                        eprintln!("[daemon][EP] expert-parallel batch allocation failed: {e} — fail closed (sequential pool preserved)");
+                                    }
+                                }
                             }
-                            Err(e) => {
-                                eprintln!("[daemon][EP] expert-parallel batch compatibility failed: {e} — fail closed");
-                            }
+                        }
+                        Err(e) => {
+                            eprintln!("[daemon][EP] expert-parallel batch compatibility failed: {e} — fail closed");
                         }
                     }
                 }
@@ -338,5 +439,28 @@ pub fn stage_continuous_batch(
     } else if requested > 1 {
         eprintln!("[daemon] continuous batch requested but not capable (arch_id={} pp={} ep={:?}) — fallback to sequential", m.arch_id, m.pp, m.ep.is_some());
     }
-    out
+    // Qwen EP peer finalization after every optional batch alloc/cleanup path.
+    // Load defers enable_peer_all so late batch scratch is peer-mapped; sequential
+    // (requested<=1) never hits the batch success enable, so without this the flag
+    // stays false and EP falls through to RCCL / HIP host-staging allreduce.
+    // Batch success already enabled → skip. Err/false: report truthfully; do not
+    // claim peer-rooted when unavailable (sequential owners stay usable).
+    if let Some(ep) = m.ep.as_mut() {
+        if matches!(&ep.inner, crate::EpArch::Qwen35 { .. }) && !ep.gpus.peer_access_enabled {
+            match ep.gpus.enable_peer_all() {
+                Ok(true) => {
+                    eprintln!(
+                        "[daemon][EP] peer access enabled after staging (sequential/fallback path)"
+                    );
+                }
+                Ok(false) => {
+                    eprintln!("[daemon][EP] peer access incomplete after staging — peer-rooted path unavailable");
+                }
+                Err(e) => {
+                    eprintln!("[daemon][EP] enable_peer_all failed after staging: {e:?} — peer-rooted path unavailable");
+                }
+            }
+        }
+    }
+    Ok(out)
 }
