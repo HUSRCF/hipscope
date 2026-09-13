@@ -1567,8 +1567,12 @@ pub(crate) fn include_reasoning_content(arch: Option<&str>) -> bool {
         || lower == "qwen35-vl"
         || lower.starts_with("qwen35")
         || lower.starts_with("qwen36")
+        || lower.starts_with("qwen3_5")
+        || lower.starts_with("qwen3_6")
         || lower.contains("qwen3.5")
         || lower.contains("qwen3.6")
+        || lower.contains("qwen3_5")
+        || lower.contains("qwen3_6")
 }
 
 pub(crate) fn project_request_contract(
@@ -3359,6 +3363,15 @@ mod tests {
             normalized_on[2]["tool_plan"]
         );
         assert_eq!(normalized_on[2]["tool_calls"][0]["id"], "call_1");
+    }
+
+    #[test]
+    fn reasoning_recogniser_accepts_slot_daemon_arch_spellings() {
+        // Slot backend (`slots.rs`) and non-slot daemon (`main.rs` arch match)
+        // both publish `qwen3_5` / `qwen3_5_moe` for the same models.
+        assert!(include_reasoning_content(Some("qwen3_5")));
+        assert!(include_reasoning_content(Some("qwen3_5_moe")));
+        assert!(!include_reasoning_content(Some("qwen3")));
     }
 
     #[test]
