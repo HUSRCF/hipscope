@@ -133,6 +133,12 @@ fn load_session(
 }
 
 fn free_session(gpu: &mut Gpu, slot: ModelSlot, drafter: Qwen35MtpDrafter) {
+    // Mirror the daemon's unload_model: invalidate the weight-pointer-keyed
+    // caches (mmq_screen, fp16 shadows own device tensors) and captured
+    // graphs BEFORE freeing the weights they point into; otherwise every
+    // session leaks device memory and the third load OOMs.
+    gpu.invalidate_weight_caches();
+    gpu.invalidate_graph_state();
     // `mtp_free` releases the drafter's MTP state AND its owned head.
     Box::new(drafter).mtp_free(gpu);
     slot.kv_cache.free_gpu(gpu).expect("free kv");
@@ -229,6 +235,35 @@ fn chatml_wrap(tok: &hipfire_runtime::tokenizer::Tokenizer, body: &str) -> Vec<u
     t.extend_from_slice(&asst);
     t.extend_from_slice(&nl);
     t
+}
+/// First differing row index between two packed buffers, or `None` when the
+/// compared extents are identical. Row granularity keeps the report in token
+/// positions for KV families.
+fn first_diff_row(a: &[u8], b: &[u8], row_bytes: usize) -> Option<usize> {
+    let n = a.len().min(b.len()) / row_bytes;
+    for r in 0..n {
+        if a[r * row_bytes..(r + 1) * row_bytes] != b[r * row_bytes..(r + 1) * row_bytes] {
+            return Some(r);
+        }
+    }
+    if a.len() != b.len() {
+        return Some(n);
+    }
+    None
+}
+/// First differing DeltaNet layer index within one concatenated family, or
+/// `None` when identical. Layers are equal-sized contiguous splits.
+fn first_diff_layer(a: &[u8], b: &[u8], n_layers: usize) -> Option<usize> {
+    if n_layers == 0 || a.len() != b.len() || a.len() % n_layers != 0 {
+        return None;
+    }
+    let per = a.len() / n_layers;
+    for l in 0..n_layers {
+        if a[l * per..(l + 1) * per] != b[l * per..(l + 1) * per] {
+            return Some(l);
+        }
+    }
+    None
 }
 
 fn report_fams(tag: &str, arm: &str, dn: &[Vec<u8>], kv: &[u8], mtp_kv: &[u8], prev: &[u8]) {
@@ -362,6 +397,31 @@ fn mtp_recurrent_state_byte_identity() {
         let kv_b = kv_prefix_bytes(&gpu, &slot_b, p1);
         let (prev_b, mtp_kv_b) = mtp_bytes(&gpu, &drafter_b, p1);
         report_fams("repair", "B(cold)", &dn_b, &kv_b, &mtp_kv_b, &prev_b);
+        // NOTE: the stepped-no-repair control (arm D) lives in the separate
+        // `mtp_step_oracle` test binary: a third full 35B session does not fit
+        // sequentially in one process (residue OOMs the third load), while two
+        // sessions fit. Each binary is its own process; cross-process
+        // determinism is proven (identical fnv across runs), so fnv equality
+        // across the two logs decides the oracle.
+        // First-divergence diagnostics for A-vs-B (cold vs repaired).
+        let kv_row = kv_row_bytes(slot_b.kv_cache.n_kv_heads, slot_b.kv_cache.head_dim);
+        eprintln!(
+            "[byte-id repair] A-vs-B trunk_kv_prefix first_diff_row={:?} (prompt_len=20, wpos={wpos})",
+            first_diff_row(&kv_a, &kv_b, kv_row)
+        );
+        let mtp_row = {
+            let st = drafter_b.mtp_live_state().expect("mtp state");
+            kv_row_bytes(st.mtp_kv.n_head_kv, st.mtp_kv.head_dim)
+        };
+        eprintln!(
+            "[byte-id repair] A-vs-B mtp_kv_prefix first_diff_row={:?}",
+            first_diff_row(&mtp_kv_a, &mtp_kv_b, mtp_row)
+        );
+        let n_dn = slot_b.dn_state.s_matrices.len();
+        eprintln!(
+            "[byte-id repair] A-vs-B dn_s first_diff_layer={:?} (of {n_dn} layers)",
+            first_diff_layer(&dn_a[0], &dn_b[0], n_dn)
+        );
 
         for (i, (a, b)) in dn_a.iter().zip(dn_b.iter()).enumerate() {
             assert_eq!(a.len(), b.len(), "repair dn family {i} length");
