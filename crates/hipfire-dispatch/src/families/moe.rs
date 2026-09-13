@@ -382,6 +382,57 @@ impl MoeResolution {
     }
 }
 
+/// Sealed decode mode for one indexed-MoE call. This is the model-declared
+/// intent; the sealer (`pipeline::sealed_moe`) cross-checks it against the
+/// bound expert table, the execution contract, and the process environment
+/// before any launch, and invalid combinations fail there — never silently.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MoeEpMode {
+    /// Single-GPU (or Single-owner) decode, including the existing
+    /// next-layer deferred-combine experiment. Requires `routed_out=None`.
+    None,
+    /// Canonical expert-parallel decode: per-rank raw slot rows stay
+    /// expanded (`routed_out=None`, `defer_routed_combine=true`), the root
+    /// runs the shared expert first (`skip_shared=false`) while non-root
+    /// ranks skip it, and the root finishes through the sealed
+    /// `Step::MoeSlotCombine` continuation. Requires a plan-bound compact
+    /// table carrying the canonical execution contract.
+    CanonicalSlotOrder,
+    /// Rank-partial diagnostic: per-rank zeroed partials (`routed_out=Some`,
+    /// `defer_routed_combine=false`) reduced by the legacy all-reduce, with
+    /// the root partial including the shared expert once and non-root
+    /// partials omitting it. Reachable only under
+    /// `HIPFIRE_EP_SLOT_COMBINE=0`; any other setting selects canonical.
+    LegacyRankPartialDiagnostic,
+}
+
+/// True when the routed-down GEMV for `routed_down` materializes per-slot
+/// rows into `down_expanded` (so a later fold can combine them).
+///
+/// The whole codebook family (`MQ2/MQ3-Lloyd` and their global-codebook
+/// siblings `MQ2/MQ3-GL`) self-combines via atomic adds straight into the
+/// residual target and writes NO expanded buffer — folding `down_expanded`
+/// afterwards would double-count (or fold stale rows). Per-expert mixed
+/// mode writes the expanded buffer for every tier, so it always returns
+/// true here.
+///
+/// This is the single home of the predicate `run_moe_decode` inlines as
+/// `routed_down_self_combines` (negated, ORed with the gfx1100 down-last
+/// experiment) and the sealed canonical preflight requires. Keep them in
+/// lockstep: miss a dtype here and a route silently zeroes out or
+/// double-counts.
+pub fn moe_down_writes_expanded(routed_down: DType, has_dtype_tags: bool) -> bool {
+    has_dtype_tags
+        || !matches!(
+            routed_down,
+            DType::MQ2G256Lloyd
+                | DType::MQ2G256LloydU
+                | DType::MQ3G256Lloyd
+                | DType::MQ2G256GL
+                | DType::MQ3G256GL
+        )
+}
+
 // ── Dispatch parameters ────────────────────────────────
 
 /// Host-resident routed weights used only by the generic CPU-top-K fallback.
@@ -419,6 +470,15 @@ pub struct MoeParams<'a> {
     /// output expanded so the architecture layer can combine it into the
     /// residual while producing the next layer's normalized activation.
     pub defer_routed_combine: bool,
+    /// Sealed decode mode (see [`MoeEpMode`]). `None` = Single (with or
+    /// without the deferred-combine experiment); `CanonicalSlotOrder` =
+    /// canonical EP (requires `routed_out=None`, `defer_routed_combine=true`,
+    /// root `skip_shared=false`, non-root `skip_shared=true`);
+    /// `LegacyRankPartialDiagnostic` = rank-partial diagnostic (requires
+    /// `routed_out=Some`, `defer_routed_combine=false`, reachable only under
+    /// `HIPFIRE_EP_SLOT_COMBINE=0`). The sealer rejects any other
+    /// mode/parameter combination before launch.
+    pub ep_mode: MoeEpMode,
     /// Safetensors layer index (== `MoeFfnWeights.layer_idx`). Only used
     /// by native GPTQ-on-E8 Hessian capture in the CPU-top-K fallback to
     /// build the per-(tensor,expert) key; ignored on the hot path.

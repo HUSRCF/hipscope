@@ -252,6 +252,7 @@ pub fn stage_continuous_batch(
                 config,
                 weights,
                 batch,
+                ..
             } = &mut ep.inner
             {
                 if !qwen_ep_batch_weight_formats_supported(&weights[0]) {

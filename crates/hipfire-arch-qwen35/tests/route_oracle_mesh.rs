@@ -40,37 +40,33 @@
 //!   (3.0 with `HIPFIRE_DN_STATE_EF=0`). Bound 1.0 is 2x measured worst;
 //!   tokens exact throughout (3 runs). Precedent: `qwen_dense_tp2_parity.rs`
 //!   claims argmax-exact + relative error < 3e-3, never bit-exact.
-//! * EP2-vs-single (MoE) — MEASURING-BUT-RED (bound 1e-3 asserted, test fails
-//!   honestly). Snapshot lockstep pins KV + DeltaNet + the FULL scratch (30
-//!   fixed + 14 MoE-opt incl. top-k indices/weights and `moe_down_expanded` +
-//!   pos_bufs, all by true `DeviceBuffer::size`) yet the run holds ~1e-5 for
-//!   17 positions then trips a deterministic 3.599e-2 cliff at pos 17 —
-//!   bit-identical to the earlier KV/DN-only snapshot run, so the carrier
-//!   lives OUTSIDE the snapshot set (suspects: `EpMesh.partials`, RCCL/peer
-//!   staging, rank streams, per-rank expert shard/dummy state, or a
-//!   routing-dependent dropped/duplicated expert; top-k is discrete and
-//!   1e-5-scale grouping noise flips experts under interleaved forcing —
-//!   measured 6.5e-2 cliff at pos 2, token flip at pos 5 — so lockstep, not
-//!   interleaving, is the design). The bound is NOT widened to hide it.
-//! * EP4-vs-EP2 (MoE) — MEASURING-BUT-RED (bound 1e-3 asserted, test fails
-//!   honestly). Same snapshot-lockstep design (EP2 rank-0 bytes are the
-//!   reference); pos 0–1 hold ~1e-5, then a deterministic 2.695e-3 cliff at
-//!   pos 2 — a DIFFERENT position and magnitude than EP2-vs-single's
-//!   pos-17/3.6e-2, so the trip is route-pair-specific (stride `e%4` vs `e%2`
-//!   partial contents + RCCL summation order), not a universal step counter.
-//!   Same out-of-snapshot suspect set as EP2. The rooted-peer order
-//!   (`multi_gpu.rs:1759`) is NOT the decode path — opt-in via
-//!   `HIPFIRE_EP_PEER_ALLREDUCE_DECODE=1` only — so `assert_eq` is unwarranted
-//!   and the bound is NOT widened to hide the trip.
+//! * EP2-vs-single (MoE) — BOUNDED (tokens `assert_eq`, max abs logit diff
+//!   <= 1e-3). Production decode is canonical sealed slot order: the root
+//!   authorizes a `MoeRootRouteReceipt` + 32-byte route IDs; non-roots install
+//!   those IDs (no local router authority), each rank fills owned expanded
+//!   slots, then the driver gathers slots to root, runs the sealed combine
+//!   into the root residual, and broadcasts the finished residual. Snapshot
+//!   lockstep pins KV + DeltaNet + the FULL scratch (30 fixed + 14 MoE-opt
+//!   incl. top-k indices/weights and `moe_down_expanded` + pos_bufs, all by
+//!   true `DeviceBuffer::size`) so the discrete router sees identical inputs.
+//!   Lockstep (not interleaving) is the design: top-k is discrete and small
+//!   grouping noise under interleaved forcing can flip experts. The bound is
+//!   NOT widened.
+//! * EP4-vs-EP2 (MoE) — BOUNDED (tokens `assert_eq`, max abs logit diff
+//!   <= 1e-3). Same canonical root-route / slot-gather / sealed-combine path
+//!   as EP2-vs-single; expert-to-rank stride differs (`e%4` vs `e%2`) so the
+//!   owned-slot residency map differs while the root-authorized route and
+//!   sealed combine stay the same. Same snapshot-lockstep design (EP2 rank-0
+//!   bytes are the reference). The bound is NOT widened.
 //!
-//! Loader note: `load_model_ep` (loader `lib.rs`) has NO MoE serve path —
-//! `qwen35_ep_moe_refusal` refuses `num_experts > 0` ("use TP or single-GPU")
-//! and the MoE branch additionally requires `tp == 4`. The EP tests therefore
-//! drive the retained qwen35-level EP substrate directly (sealed per-rank
-//! `load_weights_ep_rank` over the `init_ep` mesh + `forward_ep`), which is
-//! the exact pattern of the in-tree
-//! `hipfire-runtime/examples/ep_decode_parity.rs` validation. No `pub` seam
-//! is missing: every symbol used here is already `pub`. Nothing is NOT WIRED.
+//! Loader note: `load_model_ep` (loader `lib.rs`) has no MoE serve path for
+//! `num_experts > 0` (and the MoE branch additionally requires `tp == 4`).
+//! The EP tests therefore drive the retained qwen35-level EP substrate
+//! directly (sealed per-rank `load_weights_ep_rank` over the `init_ep` mesh +
+//! `forward_ep` canonical root-route/slot-gather driver), which is the exact
+//! pattern of the in-tree `hipfire-runtime/examples/ep_decode_parity.rs`
+//! validation. No `pub` seam is missing: every symbol used here is already
+//! `pub`.
 //!
 //! Run (EVERY GPU command flock-wrapped):
 //! ```sh
@@ -1316,31 +1312,21 @@ impl EpMesh {
     }
 }
 
-// ── 3. EP2 vs single (MoE, MEASURING-BUT-RED) ───────────────────────────────────
+// ── 3. EP2 vs single (MoE, BOUNDED) ─────────────────────────────────────────────
 
 /// `qwen35_ep2_vs_single_oracle` — MoE A3B (256 experts, top_k=8),
 /// expert-parallel EP=2 vs single.
 ///
-/// Relationship: MEASURING-BUT-RED (tokens `assert_eq`, max abs logit diff
-/// <= 1e-3, asserted and FAILING honestly — do not widen). Router/top-k run
-/// replicated on every rank (`run_moe_ep` contract), but each rank accumulates
-/// only its owned experts into a zeroed partial and the partials are summed by
-/// RCCL `ncclAllReduce` (the `all_reduce_sum_f32_decode` default path).
-/// Comparison is snapshot lockstep: the reference single route's KV + DeltaNet
-/// + FULL scratch (30 fixed + 14 MoE-opt + pos_bufs, true `DeviceBuffer::size`)
-/// are snapshotted pre-step and restored into both ranks, so the discrete
-/// router sees identical inputs and only grouping rounding (~1e-5) remains.
-/// MEASURED: pos 0–16 hold 3e-6..2e-5, then a deterministic 3.599e-2 cliff at
-/// pos 17 — bit-identical to the earlier KV/DN-only snapshot run, so the full-
-/// scratch extension changed NOTHING and the carrier lives OUTSIDE the
-/// snapshot set. Out-of-snapshot state (maintainer suspect list): per-rank
-/// `EpMesh.partials` routed accumulators, RCCL/peer-reduce staging and rank
-/// streams, per-rank expert shard/zero-dummy weights (a routing-dependent
-/// dropped/duplicated expert fits: deterministic, snapshot-immune, trips when
-/// first selected). Token-exactness past pos 16 is UNPROVEN (the bound fires
-/// first). Also observed: solo EP=2 greedy (the EP4 reference run) flips off
-/// the single trajectory at pos 5 (78937 vs 325) — unpinned recurrence
-/// amplifies the ~1e-5 per-step route math within 5 steps.
+/// Relationship: BOUNDED (tokens `assert_eq`, max abs logit diff <= 1e-3,
+/// asserted — do not widen). Production MoE EP decode is canonical sealed
+/// slot order: root issues `MoeRootRouteReceipt` + route IDs; non-roots
+/// install those IDs; each rank fills owned expanded slots; the runtime
+/// gathers slots to root, sealed-combines into the root residual, and
+/// broadcasts the finished residual (not a rank-partial RCCL reduce).
+/// Comparison is snapshot lockstep: the reference single route's KV +
+/// DeltaNet + FULL scratch (30 fixed + 14 MoE-opt + pos_bufs, true
+/// `DeviceBuffer::size`) are snapshotted pre-step and restored into both
+/// ranks, so the discrete router sees identical inputs.
 #[test]
 #[ignore]
 fn qwen35_ep2_vs_single_oracle() {
@@ -1536,30 +1522,23 @@ fn qwen35_ep2_vs_single_oracle() {
         worst,
         Some(BOUND_EP_ABS),
         "bounded",
-        "router/top-k replicated but per-rank owned-expert partials summed via RCCL all-reduce (stride e%2 grouping differs from direct accumulation); snapshot lockstep isolates route math from discrete top-k chaos",
+        "canonical root-route receipt + slot gather/sealed combine (stride e%2 owned-slot map); snapshot lockstep isolates route math from discrete top-k chaos",
     );
     eprintln!("{TEST}: PASS — {total} committed positions, worst logit diff {worst:.3e}");
 
     mesh.free();
 }
 
-// ── 4. EP4 vs EP2 (MoE, MEASURING-BUT-RED) ──────────────────────────────────────
+// ── 4. EP4 vs EP2 (MoE, BOUNDED) ────────────────────────────────────────────────
 
 /// `qwen35_ep4_vs_ep2_oracle` — MoE A3B, expert-parallel EP=4 vs EP=2.
 ///
-/// Relationship: MEASURING-BUT-RED (tokens `assert_eq`, max abs logit diff
-/// <= 1e-3, asserted and FAILING honestly — do not widen). Both sides run the
-/// same replicated router/top-k and the same RCCL decode reduce, but the
-/// expert-to-rank groupings differ (stride `e%4` vs `e%2`), so the partial
-/// contents and the RCCL summation order differ. MEASURED: pos 0–1 hold
-/// ~1e-5, then a deterministic 2.695e-3 cliff at pos 2 — a DIFFERENT position
-/// and magnitude than EP2-vs-single's pos-17/3.6e-2, so the trip is
-/// route-pair-specific, not a universal step counter. Same out-of-snapshot
-/// suspect set as EP2 (partials, RCCL/peer staging, streams, shard/dummy
-/// state, routing-dependent dropped/duplicated expert). The rooted-peer order
-/// (`multi_gpu.rs:1759`) would fix the reduction order, but it is NOT the
-/// decode path — opt-in via `HIPFIRE_EP_PEER_ALLREDUCE_DECODE=1` only — so
-/// `assert_eq` on these logits is unwarranted under the production default.
+/// Relationship: BOUNDED (tokens `assert_eq`, max abs logit diff <= 1e-3,
+/// asserted — do not widen). Both sides run the same canonical root-route /
+/// slot-gather / sealed-combine path; expert-to-rank stride differs
+/// (`e%4` vs `e%2`), so the owned-slot residency map differs while the
+/// root-authorized route and sealed combine stay the same. Snapshot
+/// lockstep uses EP2 rank-0 pre-step bytes as the reference.
 #[test]
 #[ignore]
 fn qwen35_ep4_vs_ep2_oracle() {
@@ -1710,7 +1689,7 @@ fn qwen35_ep4_vs_ep2_oracle() {
         worst,
         Some(BOUND_EP_ABS),
         "bounded",
-        "same replicated router/top-k and same RCCL decode reduce, but stride e%4 vs e%2 groupings change partial contents and RCCL summation order; rooted-peer order is opt-in only, not the production decode path; snapshot lockstep isolates route math from discrete top-k chaos",
+        "canonical root-route receipt + slot gather/sealed combine on both sides; stride e%4 vs e%2 changes owned-slot residency only; snapshot lockstep isolates route math from discrete top-k chaos",
     );
     eprintln!("{TEST}: PASS — {total} committed positions, worst logit diff {worst:.3e}");
 

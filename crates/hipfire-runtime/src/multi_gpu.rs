@@ -27,12 +27,15 @@ use hip_bridge::{
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 
-/// Stream-event handoff returned by `Gpus::boundary_copy`. When the src
-/// device has an active stream, `completion` holds a HIP event recorded
-/// after the async peer copy; `Gpus::wait_boundary` makes the dst stream
-/// wait on it. When the src device has no active stream, the sync
-/// `memcpy_peer` already serializes the copy on the host and `completion`
-/// is `None` — `wait_boundary` returns immediately in that case.
+/// Stream-event handoff returned by `Gpus::boundary_copy`. On the both-active-
+/// streams path, `completion` holds a HIP event recorded on the destination
+/// stream after the async peer copy; `Gpus::wait_boundary` makes the dst stream
+/// wait on it. When only the source has an active stream, `completion` is still
+/// recorded after the async peer copy (on the source stream) and
+/// `wait_boundary` host-synchronizes when the destination has no stream. When
+/// the source has no active stream, the sync `memcpy_peer` already serializes
+/// the copy on the host and `completion` is `None` — `wait_boundary` returns
+/// immediately in that case.
 ///
 /// The `Option` is consumed (set to `None`) by `wait_boundary`; if a
 /// `BoundaryEvent` with `completion: Some` is dropped without going through
@@ -463,11 +466,16 @@ impl Gpus {
         self.output_device
     }
 
-    /// Async cross-device copy. Enqueues `hipMemcpyPeerAsync` on the src
-    /// device's active stream (or null if unset) and records a completion
-    /// event the caller awaits via `wait_boundary` before issuing the next
-    /// dispatch on `dst_dev`. HIP transparently host-stages when peer
-    /// access is unavailable; correctness holds either way.
+    /// Async cross-device copy. Enqueues `hipMemcpyPeerAsync` and records a
+    /// completion event the caller awaits via `wait_boundary` before issuing
+    /// the next dispatch on `dst_dev`. HIP transparently host-stages when peer
+    /// access is unavailable; correctness holds either way. On the
+    /// both-active-streams path the copy is destination-owned (the dst stream
+    /// waits on a source-ready event, then copies) and a completion wait is
+    /// queued back onto the source stream before returning, so later
+    /// source-stream work cannot reuse/overwrite the source while the copy is
+    /// still reading it. Post-submit failures synchronize the affected queue
+    /// and preserve the first error; the normal path never host-synchronizes.
     pub fn boundary_copy(
         &self,
         src_dev: usize,
@@ -492,32 +500,151 @@ impl Gpus {
                 ),
             ));
         }
+        if n_bytes > src.size() || n_bytes > dst.size() {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "boundary_copy: n_bytes={n_bytes} exceeds buffer capacity \
+                     (src={}, dst={})",
+                    src.size(),
+                    dst.size(),
+                ),
+            ));
+        }
+        if n_bytes == 0 {
+            return Ok(BoundaryEvent {
+                dst_dev,
+                completion: None,
+            });
+        }
+
         let src_gpu = &self.devices[src_dev];
-        src_gpu.bind_thread()?;
+        let dst_gpu = &self.devices[dst_dev];
         let src_dev_id = src_gpu.device_id;
-        let dst_dev_id = self.devices[dst_dev].device_id;
-        match src_gpu.active_stream.as_ref() {
-            Some(stream) => {
-                src_gpu
-                    .hip
-                    .memcpy_peer_async(dst, dst_dev_id, src, src_dev_id, n_bytes, stream)?;
-                let event = src_gpu.hip.event_create()?;
-                match src_gpu.hip.event_record(&event, Some(stream)) {
-                    Ok(()) => Ok(BoundaryEvent {
-                        dst_dev,
-                        completion: Some(event),
-                    }),
-                    Err(e) => {
-                        let _ = src_gpu.hip.event_destroy(event);
-                        Err(e)
-                    }
+        let dst_dev_id = dst_gpu.device_id;
+
+        match (
+            src_gpu.active_stream.as_ref(),
+            dst_gpu.active_stream.as_ref(),
+        ) {
+            (Some(src_stream), Some(dst_stream)) => {
+                // Destination-owned peer copy: source system-release ready
+                // event -> dst wait -> peer copy on dst stream -> dst completion.
+                src_gpu.bind_thread()?;
+                let source_ready = src_gpu.hip.event_create_with_flags(
+                    HIP_EVENT_DISABLE_TIMING | HIP_EVENT_RELEASE_TO_SYSTEM,
+                )?;
+                if let Err(e) = src_gpu.hip.event_record(&source_ready, Some(src_stream)) {
+                    let _ = src_gpu.hip.event_destroy(source_ready);
+                    return Err(e);
                 }
+
+                dst_gpu.bind_thread()?;
+                let dest_completion = match dst_gpu
+                    .hip
+                    .event_create_with_flags(HIP_EVENT_DISABLE_TIMING)
+                {
+                    Ok(ev) => ev,
+                    Err(e) => {
+                        let _ = src_gpu.bind_thread();
+                        let _ = src_gpu.hip.event_destroy(source_ready);
+                        return Err(e);
+                    }
+                };
+
+                // Both event handles allocated before any copy submission.
+                if let Err(e) = dst_gpu.hip.stream_wait_event(dst_stream, &source_ready) {
+                    let _ = dst_gpu.hip.event_destroy(dest_completion);
+                    let _ = src_gpu.bind_thread();
+                    let _ = src_gpu.hip.event_destroy(source_ready);
+                    return Err(e);
+                }
+
+                if let Err(e) = dst_gpu
+                    .hip
+                    .memcpy_peer_async(dst, dst_dev_id, src, src_dev_id, n_bytes, dst_stream)
+                {
+                    let _ = dst_gpu.hip.event_destroy(dest_completion);
+                    let _ = src_gpu.bind_thread();
+                    let _ = src_gpu.hip.event_destroy(source_ready);
+                    return Err(e);
+                }
+
+                if let Err(e) = dst_gpu.hip.event_record(&dest_completion, Some(dst_stream)) {
+                    // Post-submit failure: the peer copy is already queued on
+                    // the destination stream. Drain that queue before dropping
+                    // resources so no in-flight copy outlives this call; the
+                    // record error is preserved as the first error.
+                    let _ = dst_gpu.hip.stream_synchronize(dst_stream);
+                    let _ = dst_gpu.hip.event_destroy(dest_completion);
+                    let _ = src_gpu.bind_thread();
+                    let _ = src_gpu.hip.event_destroy(source_ready);
+                    return Err(e);
+                }
+
+                // Completion dependency back onto the source stream: later
+                // source-stream work (buffer reuse/overwrite) must not run
+                // until the destination-owned peer copy has finished reading
+                // the source. Enqueued before returning so any subsequently
+                // enqueued source work is ordered after the copy. Destination
+                // FIFO order is untouched (record-after-copy above).
+                if let Err(e) = src_gpu
+                    .bind_thread()
+                    .and_then(|()| src_gpu.hip.stream_wait_event(src_stream, &dest_completion))
+                {
+                    // Post-submit failure: same drain as above; the bind/wait
+                    // error is preserved as the first error.
+                    let _ = dst_gpu.bind_thread();
+                    let _ = dst_gpu.hip.stream_synchronize(dst_stream);
+                    let _ = dst_gpu.hip.event_destroy(dest_completion);
+                    let _ = src_gpu.bind_thread();
+                    let _ = src_gpu.hip.event_destroy(source_ready);
+                    return Err(e);
+                }
+
+                // Both waits already enqueued; HIP retains the underlying
+                // dependency past event destruction.
+                let _ = src_gpu.bind_thread();
+                let _ = src_gpu.hip.event_destroy(source_ready);
+
+                Ok(BoundaryEvent {
+                    dst_dev,
+                    completion: Some(dest_completion),
+                })
             }
-            None => {
+            (Some(stream), None) => {
+                // Source-stream async + host wait when dst has no active stream.
+                // The completion event is preallocated BEFORE submission so a
+                // post-submit record failure can drain the affected queue
+                // without leaking the handle.
+                src_gpu.bind_thread()?;
+                let event = src_gpu.hip.event_create()?;
+                if let Err(e) = src_gpu
+                    .hip
+                    .memcpy_peer_async(dst, dst_dev_id, src, src_dev_id, n_bytes, stream)
+                {
+                    let _ = src_gpu.hip.event_destroy(event);
+                    return Err(e);
+                }
+                if let Err(e) = src_gpu.hip.event_record(&event, Some(stream)) {
+                    // Post-submit failure: the copy is already queued on the
+                    // source stream. Drain that queue before dropping the
+                    // event; the record error is preserved as the first error.
+                    let _ = src_gpu.hip.stream_synchronize(stream);
+                    let _ = src_gpu.hip.event_destroy(event);
+                    return Err(e);
+                }
+                Ok(BoundaryEvent {
+                    dst_dev,
+                    completion: Some(event),
+                })
+            }
+            (None, _) => {
                 // Sync path: memcpy_peer blocks on host until the copy
                 // lands. No event needed — recording into the HIP null
                 // stream is fragile across ROCm versions; skip it and
                 // signal "already done" via completion: None.
+                src_gpu.bind_thread()?;
                 src_gpu
                     .hip
                     .memcpy_peer(dst, dst_dev_id, src, src_dev_id, n_bytes)?;
@@ -1922,22 +2049,53 @@ impl Gpus {
             return Ok(());
         }
         let mut events = Vec::with_capacity(spans.len());
+        let mut first_error: Option<HipError> = None;
         for (owner, start_slot, len_slots) in spans {
             if owner == 0 {
                 continue;
             }
-            let byte_offset = start_slot.checked_mul(row_bytes).ok_or_else(|| {
-                HipError::new(0, "gather_slots_to_root_f32: span offset overflow")
-            })?;
-            let byte_len = len_slots.checked_mul(row_bytes).ok_or_else(|| {
-                HipError::new(0, "gather_slots_to_root_f32: span length overflow")
-            })?;
+            let byte_offset = match start_slot.checked_mul(row_bytes) {
+                Some(v) => v,
+                None => {
+                    first_error = Some(HipError::new(
+                        0,
+                        "gather_slots_to_root_f32: span offset overflow",
+                    ));
+                    break;
+                }
+            };
+            let byte_len = match len_slots.checked_mul(row_bytes) {
+                Some(v) => v,
+                None => {
+                    first_error = Some(HipError::new(
+                        0,
+                        "gather_slots_to_root_f32: span length overflow",
+                    ));
+                    break;
+                }
+            };
             let src = slots_for_rank(owner).byte_view(byte_offset, byte_len);
             let dst = root_slots.byte_view(byte_offset, byte_len);
-            events.push(self.boundary_copy(owner, 0, &src, &dst, byte_len)?);
+            match self.boundary_copy(owner, 0, &src, &dst, byte_len) {
+                Ok(event) => events.push(event),
+                Err(error) => {
+                    first_error = Some(error);
+                    break;
+                }
+            }
         }
+        // Drain every enqueued receipt before reporting: each wait consumes
+        // its event (no leaked handles, no detached in-flight copies) and
+        // the first error wins.
         for event in events {
-            self.wait_boundary(event)?;
+            if let Err(error) = self.wait_boundary(event) {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
         }
         Ok(())
     }
@@ -1970,12 +2128,29 @@ impl Gpus {
         }
         let src = root_row.byte_view(0, row_bytes);
         let mut events = Vec::with_capacity(n - 1);
+        let mut first_error: Option<HipError> = None;
         for rank in 1..n {
             let dst = row_for_rank(rank).byte_view(0, row_bytes);
-            events.push(self.boundary_copy(0, rank, &src, &dst, row_bytes)?);
+            match self.boundary_copy(0, rank, &src, &dst, row_bytes) {
+                Ok(event) => events.push(event),
+                Err(error) => {
+                    first_error = Some(error);
+                    break;
+                }
+            }
         }
+        // Drain every enqueued receipt before reporting: each wait consumes
+        // its event (no leaked handles, no detached in-flight copies) and
+        // the first error wins.
         for event in events {
-            self.wait_boundary(event)?;
+            if let Err(error) = self.wait_boundary(event) {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
         }
         Ok(())
     }
@@ -2549,8 +2724,21 @@ mod tests {
             out
         }
 
-        let gpus = Gpus::init_ep(2, 1).expect("init_ep(2,1) — run with HIP_VISIBLE_DEVICES=0,1");
+        let mut gpus =
+            Gpus::init_ep(2, 1).expect("init_ep(2,1) — run with HIP_VISIBLE_DEVICES=0,1");
         assert_eq!(gpus.devices.len(), 2);
+
+        // Active streams on both ranks: without these, every copy below
+        // would take the synchronous host-blocked fallback and never
+        // exercise the both-streams event handoff under test.
+        for rank in 0..2 {
+            gpus.devices[rank].bind_thread().expect("bind stream");
+            let stream = gpus.devices[rank]
+                .hip
+                .stream_create()
+                .expect("stream_create");
+            gpus.devices[rank].active_stream = Some(stream);
+        }
 
         // Per-rank k-slot row buffers plus one residual row buffer per rank.
         let mut slot_bufs = Vec::with_capacity(2);
@@ -2606,6 +2794,21 @@ mod tests {
 
         gpus.gather_slots_to_root_f32(&slot_bufs[0], |r| &slot_bufs[r], &OWNERS, ROW_FLOATS)
             .expect("gather_slots_to_root_f32");
+        // Immediate source reuse: poison rank 1's slot buffer on its own
+        // stream with no host sync in between. The completion dependency
+        // `boundary_copy` queues back onto the source stream must order this
+        // overwrite after the in-flight destination-owned reads; without it
+        // the root rows below would race with the poison.
+        let poison_slots = vec![0xA5u8; K * ROW_BYTES];
+        gpus.devices[1].bind_thread().expect("bind poison slots");
+        {
+            let dev1 = &gpus.devices[1];
+            let stream = dev1.active_stream.as_ref().expect("rank 1 stream");
+            dev1.hip
+                .memcpy_htod_async(&slot_bufs[1], &poison_slots, stream)
+                .expect("poison src slots");
+        }
+
         for rank in 0..2 {
             gpus.devices[rank].bind_thread().expect("bind sync");
             gpus.devices[rank]
@@ -2664,6 +2867,65 @@ mod tests {
             got_row, residual,
             "non-root row must equal root bytes exactly"
         );
+        // Directed source-reuse race: a large destination-owned copy is still
+        // in flight when a tiny source overwrite is enqueued on the source
+        // stream with no host sync in between. Without the completion wait
+        // queued back onto the source stream, the microsecond-scale poison
+        // would land before the multi-millisecond peer read finishes and the
+        // destination head would come back poisoned instead of patterned.
+        const RACE_BYTES: usize = 64 << 20;
+        const POISON_BYTES: usize = 4096;
+        gpus.devices[1].bind_thread().expect("bind race alloc");
+        let race_src = gpus.devices[1]
+            .hip
+            .malloc(RACE_BYTES)
+            .expect("malloc race src");
+        gpus.devices[0].bind_thread().expect("bind race dst alloc");
+        let race_dst = gpus.devices[0]
+            .hip
+            .malloc(RACE_BYTES)
+            .expect("malloc race dst");
+        let pattern: Vec<u8> = (0..RACE_BYTES).map(|i| (i & 0xFF) as u8).collect();
+        gpus.devices[1].bind_thread().expect("bind race htod");
+        gpus.devices[1]
+            .hip
+            .memcpy_htod(&race_src, &pattern)
+            .expect("htod race src");
+        let race_evt = gpus
+            .boundary_copy(1, 0, &race_src, &race_dst, RACE_BYTES)
+            .expect("race boundary_copy");
+        let poison_head = vec![0x5Au8; POISON_BYTES];
+        gpus.devices[1].bind_thread().expect("bind race poison");
+        {
+            let dev1 = &gpus.devices[1];
+            let stream = dev1.active_stream.as_ref().expect("rank 1 stream");
+            let poison_view = race_src.byte_view(0, poison_head.len());
+            dev1.hip
+                .memcpy_htod_async(&poison_view, &poison_head, stream)
+                .expect("race poison src head");
+        }
+        gpus.wait_boundary(race_evt).expect("race wait");
+        for rank in 0..2 {
+            gpus.devices[rank].bind_thread().expect("bind sync race");
+            gpus.devices[rank]
+                .hip
+                .device_synchronize()
+                .expect("sync after race");
+        }
+        let mut race_got = vec![0u8; RACE_BYTES];
+        gpus.devices[0].bind_thread().expect("bind dtoh race");
+        gpus.devices[0]
+            .hip
+            .memcpy_dtoh(&mut race_got, &race_dst)
+            .expect("dtoh race");
+        assert_eq!(
+            race_got, pattern,
+            "dst must hold pre-overwrite source bytes: source reuse overtook the copy"
+        );
+        gpus.devices[1].bind_thread().expect("bind free race src");
+        let _ = gpus.devices[1].hip.free(race_src);
+        gpus.devices[0].bind_thread().expect("bind free race dst");
+        let _ = gpus.devices[0].hip.free(race_dst);
 
         for (rank, buf) in slot_bufs.into_iter().enumerate() {
             gpus.devices[rank].bind_thread().expect("bind free slots");
@@ -2672,6 +2934,17 @@ mod tests {
         for (rank, buf) in row_bufs.into_iter().enumerate() {
             gpus.devices[rank].bind_thread().expect("bind free row");
             let _ = gpus.devices[rank].hip.free(buf);
+        }
+        for rank in 0..2 {
+            gpus.devices[rank]
+                .bind_thread()
+                .expect("bind stream destroy");
+            if let Some(stream) = gpus.devices[rank].active_stream.take() {
+                gpus.devices[rank]
+                    .hip
+                    .stream_destroy(stream)
+                    .expect("stream_destroy");
+            }
         }
     }
 }

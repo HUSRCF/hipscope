@@ -31,8 +31,11 @@ use hipfire_dispatch::families::gemv::GivensRef;
 use hipfire_dispatch::families::gemv::WeightRef;
 use hipfire_dispatch::families::kv_tier::KvTierInputs;
 use hipfire_dispatch::families::kv_tier::KvTierPlan;
+use hipfire_dispatch::families::moe::MoeEpMode;
 use hipfire_dispatch::pipeline::execute_steps;
 use hipfire_dispatch::pipeline::superop;
+use hipfire_dispatch::pipeline::superop::EpMoeCombineMode;
+use hipfire_dispatch::pipeline::superop::EpMoeSlotView;
 use hipfire_dispatch::pipeline::superop::ForwardBindings;
 use hipfire_dispatch::pipeline::superop::LayerProgram;
 use hipfire_dispatch::pipeline::superop::OpBinding;
@@ -186,7 +189,17 @@ fn moe_ffn_decode(
         down_expanded: &down_expanded,
     };
     let result = moe_ffn_decode_impl(
-        gpu, ffn, x_norm, x_residual, config, &refs, false, None, false, false,
+        gpu,
+        ffn,
+        x_norm,
+        x_residual,
+        config,
+        &refs,
+        false,
+        None,
+        false,
+        false,
+        MoeEpMode::None,
     );
 
     for t in [
@@ -449,7 +462,17 @@ pub(crate) fn moe_ffn_decode_with_scratch(
 ) -> HipResult<()> {
     let refs = MoeScratchRef::from_scratch(scratch);
     moe_ffn_decode_impl(
-        gpu, ffn, x_norm, x_residual, config, &refs, false, None, false, false,
+        gpu,
+        ffn,
+        x_norm,
+        x_residual,
+        config,
+        &refs,
+        false,
+        None,
+        false,
+        false,
+        MoeEpMode::None,
     )
 }
 
@@ -468,7 +491,17 @@ pub(crate) fn moe_ffn_decode_with_scratch_prerotated(
 ) -> HipResult<()> {
     let refs = MoeScratchRef::from_scratch(scratch);
     moe_ffn_decode_impl(
-        gpu, ffn, x_norm, x_residual, config, &refs, true, None, false, false,
+        gpu,
+        ffn,
+        x_norm,
+        x_residual,
+        config,
+        &refs,
+        true,
+        None,
+        false,
+        false,
+        MoeEpMode::None,
     )
 }
 
@@ -563,7 +596,15 @@ pub fn dump_expert_stats(path: &str) {
 
 impl hipfire_dispatch::families::moe::RoutedExpertWeights for MoeFfnWeights {
     fn len(&self) -> usize {
-        self.experts.len()
+        // Plan-bound compact EP layers present the GLOBAL expert count: the
+        // per-call live validation and any expert-indexed path resolve every
+        // global id (owned or dummy) through `get`. Single layers keep the
+        // resident list length (== global count there).
+        if self.expert_table.execution_contract().is_some() {
+            self.expert_table.n_experts()
+        } else {
+            self.experts.len()
+        }
     }
 
     fn get(
@@ -573,29 +614,54 @@ impl hipfire_dispatch::families::moe::RoutedExpertWeights for MoeFfnWeights {
         hipfire_dispatch::families::gemv::WeightRef<'_>,
         hipfire_dispatch::families::gemv::WeightRef<'_>,
     )> {
-        self.experts
-            .get(expert_idx)
-            .map(|expert| (expert.gate_up.dispatch_ref(), expert.down.dispatch_ref()))
+        if self.expert_table.execution_contract().is_none() {
+            // Single: the resident list IS the global table.
+            return self
+                .experts
+                .get(expert_idx)
+                .map(|expert| (expert.gate_up.dispatch_ref(), expert.down.dispatch_ref()));
+        }
+        // Compact EP: owned globals resolve to the slot-ordered local tensor;
+        // non-owned globals resolve to the layout-compatible zero dummy. The
+        // dummy choice uses the same first-match rule as the compact bind
+        // (`build_compact_live_binding`), which is exact because load keeps
+        // one dummy pair per distinct non-owned layout — so the sealed
+        // per-call validation observes the bound identities, and the indexed
+        // kernels keep reading through the global pointer tables either way.
+        if let Some(slot) = self.expert_binding.local_slot(expert_idx) {
+            return self
+                .experts
+                .get(slot)
+                .map(|expert| (expert.gate_up.dispatch_ref(), expert.down.dispatch_ref()));
+        }
+        let metadata = self.expert_table.experts().get(expert_idx)?;
+        self.ep_dummy_experts.iter().find_map(|dummy| {
+            let gate_up = dummy.gate_up.dispatch_ref();
+            let down = dummy.down.dispatch_ref();
+            hipfire_dispatch::pipeline::sealed_moe::expert_weights_match_metadata(
+                metadata, &gate_up, &down, expert_idx,
+            )
+            .then_some((gate_up, down))
+        })
     }
 }
 
-fn moe_ffn_decode_impl(
-    gpu: &mut Gpu,
-    ffn: &MoeFfnWeights,
-    x_norm: &GpuTensor,
-    x_residual: &GpuTensor,
+/// Build the sealed MoE parameter record shared by the full decode and the
+/// canonical non-root experts-only path. Pure motion out of
+/// `moe_ffn_decode_impl`; the record is identical for identical inputs.
+#[allow(clippy::too_many_arguments)]
+fn moe_params_for_decode<'a>(
+    ffn: &'a MoeFfnWeights,
+    x_norm: &'a GpuTensor,
+    x_residual: &'a GpuTensor,
     config: &Qwen35Config,
-    s: &MoeScratchRef<'_>,
+    s: &MoeScratchRef<'a>,
     x_rot_prerotated: bool,
-    // EP (Ship 6 substrate-EP). `ep_routed_out = Some(partial)` redirects the
-    // routed combine + shared-down into a zeroed partial (the EP executor
-    // all-reduces it and adds into x_residual once); `None` = single-GPU into
-    // x_residual (byte-identical). `ep_skip_shared` skips the shared-expert
-    // down on rank>0 so the replicated shared expert is summed once.
-    ep_routed_out: Option<&GpuTensor>,
+    ep_routed_out: Option<&'a GpuTensor>,
     ep_skip_shared: bool,
     defer_routed_combine: bool,
-) -> HipResult<()> {
+    ep_mode: MoeEpMode,
+) -> hipfire_dispatch::families::moe::MoeParams<'a> {
     let hidden = config.dim;
     let mi = config.moe_intermediate_size;
     let smi = config.shared_expert_intermediate_size;
@@ -650,7 +716,7 @@ fn moe_ffn_decode_impl(
     // `MoeFfnWeights` directly. This keeps the decode hot path allocation-free;
     // paged layers expose an empty resolver and are rejected before fallback.
 
-    let moe_params = hipfire_dispatch::families::moe::MoeParams {
+    hipfire_dispatch::families::moe::MoeParams {
         dtypes: moe_dtypes,
         batch_size: 1,
         hidden,
@@ -661,6 +727,10 @@ fn moe_ffn_decode_impl(
         norm_topk_prob: config.norm_topk_prob,
         x_rot_prerotated,
         defer_routed_combine,
+        // Sealed decode mode, threaded from moe_ffn_decode_impl: None =
+        // Single (byte-identical); Canonical/Legacy come from
+        // moe_ffn_dispatch_ep via run_layer_program_ep.
+        ep_mode,
         layer_idx: ffn.layer_idx,
         x_norm,
         x_residual,
@@ -724,7 +794,46 @@ fn moe_ffn_decode_impl(
         topk_indices: s.topk_indices,
         topk_weights: s.topk_weights,
         down_expanded: s.down_expanded,
-    };
+    }
+}
+
+fn moe_ffn_decode_impl(
+    gpu: &mut Gpu,
+    ffn: &MoeFfnWeights,
+    x_norm: &GpuTensor,
+    x_residual: &GpuTensor,
+    config: &Qwen35Config,
+    s: &MoeScratchRef<'_>,
+    x_rot_prerotated: bool,
+    // Sealed decode mode (see `MoeEpMode`). `None` = Single (classic or the
+    // deferred-combine experiment). `CanonicalSlotOrder` = canonical EP:
+    // `ep_routed_out=None`, `defer_routed_combine=true`, root
+    // `ep_skip_shared=false`, non-root `ep_skip_shared=true`. Only the
+    // legacy `HIPFIRE_EP_SLOT_COMBINE=0` diagnostic passes
+    // `LegacyRankPartialDiagnostic` with `ep_routed_out=Some(partial)`,
+    // `defer_routed_combine=false`. Invalid combinations fail in the sealer
+    // before any launch.
+    ep_routed_out: Option<&GpuTensor>,
+    ep_skip_shared: bool,
+    defer_routed_combine: bool,
+    ep_mode: MoeEpMode,
+) -> HipResult<()> {
+    let moe_params = moe_params_for_decode(
+        ffn,
+        x_norm,
+        x_residual,
+        config,
+        s,
+        x_rot_prerotated,
+        ep_routed_out,
+        ep_skip_shared,
+        defer_routed_combine,
+        ep_mode,
+    );
+    // Dims for the expert-stats probe below (the record builder above owns
+    // the canonical copies; these two are re-derived, not redefined).
+    let hidden = config.dim;
+    let k = config.num_experts_per_tok;
     // Bind the live owner tables to the immutable per-layer contract, then
     // execute only through the sealed Step boundary.
     #[cfg(feature = "moe-oracle")]
@@ -3096,58 +3205,252 @@ fn moe_ffn_dispatch(
     s: &Qwen35Scratch,
     defer_routed_combine: bool,
 ) -> HipResult<()> {
+    moe_ffn_dispatch_inner(
+        gpu,
+        ffn,
+        x,
+        ffn_norm,
+        config,
+        s,
+        None,
+        false,
+        defer_routed_combine,
+        MoeEpMode::None,
+    )
+}
+
+/// Pick the decode `x_norm` buffer and prerotate flag without launching.
+/// Same decision as [`moe_ffn_norm_ep`]; experts-only seals against these
+/// borrows before any RMSNorm/rotation or route upload mutates GPU state.
+fn moe_ffn_norm_ep_select<'a>(
+    gpu: &Gpu,
+    ffn: &MoeFfnWeights,
+    x: &'a GpuTensor,
+    s: &'a Qwen35Scratch,
+) -> (&'a GpuTensor, bool) {
     let exact_v2_prerotated = (gpu.arch_caps.is_gfx1100() || gpu.arch_caps.is_gfx1201())
         && ffn_gate_side_mq4v2_prerotated_for_moe(ffn);
-    let r = if ffn_gate_side_mq4_for_moe(ffn) || exact_v2_prerotated {
+    if ffn_gate_side_mq4_for_moe(ffn) || exact_v2_prerotated {
+        (x, true)
+    } else {
+        (&s.tmp, false)
+    }
+}
+
+/// Launch the norm/rotate chosen by [`moe_ffn_norm_ep_select`].
+fn moe_ffn_norm_ep_launch(
+    gpu: &mut Gpu,
+    x: &GpuTensor,
+    ffn_norm: &GpuTensor,
+    config: &Qwen35Config,
+    s: &Qwen35Scratch,
+    x_rot_prerotated: bool,
+) -> HipResult<()> {
+    if x_rot_prerotated {
         gpu.fused_rmsnorm_rotate_mq(
             x,
             ffn_norm,
             s.moe_x_rot.as_ref().expect("MoE scratch"),
             config.dim,
             config.norm_eps,
-        )?;
-        let refs = MoeScratchRef::from_scratch(s);
-        moe_ffn_decode_impl(
-            gpu,
-            ffn,
-            x,
-            x,
-            config,
-            &refs,
-            true,
-            None,
-            false,
-            defer_routed_combine,
         )
     } else {
-        gpu.rmsnorm_f32(x, ffn_norm, &s.tmp, config.norm_eps)?;
-        moe_ffn_decode_with_scratch(gpu, ffn, &s.tmp, x, config, s)
-    };
-    r?;
+        gpu.rmsnorm_f32(x, ffn_norm, &s.tmp, config.norm_eps)
+    }
+}
+
+/// Shared EP/Single norm front-end: select buffers then launch. Callers that
+/// must validate a sealed call before GPU work use select + launch split.
+/// Pure motion out of `moe_ffn_dispatch_inner`; behavior identical on every path.
+fn moe_ffn_norm_ep<'a>(
+    gpu: &mut Gpu,
+    ffn: &MoeFfnWeights,
+    x: &'a GpuTensor,
+    ffn_norm: &GpuTensor,
+    config: &Qwen35Config,
+    s: &'a Qwen35Scratch,
+) -> HipResult<(&'a GpuTensor, bool)> {
+    let (x_norm, x_rot_prerotated) = moe_ffn_norm_ep_select(gpu, ffn, x, s);
+    moe_ffn_norm_ep_launch(gpu, x, ffn_norm, config, s, x_rot_prerotated)?;
+    Ok((x_norm, x_rot_prerotated))
+}
+
+/// Shared norm/router/expert front end for Single and EP decode. The two-path
+/// norm logic (fused MQ rotate vs plain rmsnorm) is identical on every path —
+/// only the sealed mode, the routed target, and the shared/defer flags differ.
+#[allow(clippy::too_many_arguments)]
+fn moe_ffn_dispatch_inner(
+    gpu: &mut Gpu,
+    ffn: &MoeFfnWeights,
+    x: &GpuTensor,
+    ffn_norm: &GpuTensor,
+    config: &Qwen35Config,
+    s: &Qwen35Scratch,
+    ep_routed_out: Option<&GpuTensor>,
+    ep_skip_shared: bool,
+    defer_routed_combine: bool,
+    ep_mode: MoeEpMode,
+) -> HipResult<()> {
+    let (x_norm, x_rot_prerotated) = moe_ffn_norm_ep(gpu, ffn, x, ffn_norm, config, s)?;
+    let refs = MoeScratchRef::from_scratch(s);
+    moe_ffn_decode_impl(
+        gpu,
+        ffn,
+        x_norm,
+        x,
+        config,
+        &refs,
+        x_rot_prerotated,
+        ep_routed_out,
+        ep_skip_shared,
+        defer_routed_combine,
+        ep_mode,
+    )?;
     trace_finite_if_enabled(gpu, "moe_ffn", x)?;
     Ok(())
 }
 
-/// EP (Ship 6 substrate-EP) variant of `moe_ffn_dispatch`: same rmsnorm/rotate +
-/// MoE decode, but the routed combine + shared-down accumulate into `routed_out`
-/// (a zeroed per-rank partial the EP executor all-reduces), and `skip_shared`
-/// gates the shared-expert down to rank 0. Calls `moe_ffn_decode_impl` directly
-/// (the `with_scratch` wrappers don't carry EP params). The residual `x` is left
-/// untouched — the executor adds the all-reduced partial into it afterward.
+/// Which EP combine this rank's MoE will execute. Plan-bound compact EP
+/// bindings (an execution contract is present) run the canonical sealed slot
+/// order — except under the explicit `HIPFIRE_EP_SLOT_COMBINE=0` legacy
+/// rank-partial diagnostic. Anything else is not an EP binding, and
+/// `moe_ffn_dispatch_ep` on it is a fail-stop error (the single-GPU path
+/// never calls that function). The selection is logged once per process.
+fn qwen_ep_moe_mode(ffn: &MoeFfnWeights) -> Result<EpMoeCombineMode, HipError> {
+    if ffn.expert_table.execution_contract().is_none() {
+        return Err(HipError::new(
+            0,
+            "qwen35: moe_ffn_dispatch_ep on a binding without a sealed EP execution contract",
+        ));
+    }
+    static LOG_ONCE: std::sync::Once = std::sync::Once::new();
+    if hipfire_config::developer_var("HIPFIRE_EP_SLOT_COMBINE").as_deref() == Ok("0") {
+        LOG_ONCE.call_once(|| {
+            eprintln!(
+                "qwen35 EP MoE combine: legacy rank-partial diagnostic (HIPFIRE_EP_SLOT_COMBINE=0)"
+            );
+        });
+        Ok(EpMoeCombineMode::RankPartial)
+    } else {
+        LOG_ONCE.call_once(|| {
+            eprintln!("qwen35 EP MoE combine: canonical sealed slot order");
+        });
+        Ok(EpMoeCombineMode::CanonicalSlotOrder)
+    }
+}
+
+/// EP (Ship 6 substrate-EP) variant of `moe_ffn_dispatch`: the same
+/// norm/router/expert kernels as Single, with the sealed EP mode threaded
+/// through:
+/// - canonical: `routed_out=None`, deferred combine, root shared first
+///   (`skip_shared=false`), non-root shared skipped. The residual `x` keeps
+///   `x0+s` on the root and `x0` elsewhere until the driver's gather, sealed
+///   root combine, and broadcast-overwrite finish the layer.
+/// - legacy diagnostic: `routed_out=Some(partial)`, immediate combine, the
+///   root partial including shared once — the old rank-partial flow.
+/// Calls `moe_ffn_decode_impl` directly (the `with_scratch` wrappers don't
+/// carry EP params or modes).
 fn moe_ffn_dispatch_ep(
-    _gpu: &mut Gpu,
-    _ffn: &MoeFfnWeights,
-    _x: &GpuTensor,
-    _ffn_norm: &GpuTensor,
-    _config: &Qwen35Config,
-    _s: &Qwen35Scratch,
-    _routed_out: &GpuTensor,
-    _skip_shared: bool,
+    gpu: &mut Gpu,
+    ffn: &MoeFfnWeights,
+    x: &GpuTensor,
+    ffn_norm: &GpuTensor,
+    config: &Qwen35Config,
+    s: &Qwen35Scratch,
+    routed_out: &GpuTensor,
+    skip_shared: bool,
 ) -> HipResult<()> {
-    Err(HipError::new(
-        0,
-        "qwen35: sealed MoE EP execution is unsupported; refusing compact EP launch",
-    ))
+    match qwen_ep_moe_mode(ffn)? {
+        EpMoeCombineMode::CanonicalSlotOrder => moe_ffn_dispatch_inner(
+            gpu,
+            ffn,
+            x,
+            ffn_norm,
+            config,
+            s,
+            None,
+            skip_shared,
+            true,
+            MoeEpMode::CanonicalSlotOrder,
+        ),
+        EpMoeCombineMode::RankPartial => moe_ffn_dispatch_inner(
+            gpu,
+            ffn,
+            x,
+            ffn_norm,
+            config,
+            s,
+            Some(routed_out),
+            skip_shared,
+            false,
+            MoeEpMode::LegacyRankPartialDiagnostic,
+        ),
+    }
+}
+
+/// Canonical non-root experts-only dispatch: seal the receipt-bound call
+/// first (validation only — no GPU mutation), then norm/rotate, install the
+/// root-authoritative route IDs into this rank's top-k buffers, and execute
+/// the same sealed experts call. No router runs here; `receipt` proves this
+/// token's root route for this layer and plan (the seal rejects anything
+/// else — buffers alone are never routing authority). An invalid receipt
+/// therefore never mutates GPU state.
+/// `skip_shared` is always true on this path (the root folded shared once);
+/// routed output stays expanded for the sealed root continuation.
+fn moe_ffn_dispatch_experts_ep(
+    gpu: &mut Gpu,
+    ffn: &MoeFfnWeights,
+    x: &GpuTensor,
+    ffn_norm: &GpuTensor,
+    config: &Qwen35Config,
+    s: &Qwen35Scratch,
+    receipt: &hipfire_dispatch::pipeline::sealed_moe::MoeRootRouteReceipt,
+    route_ids: &[u8; 32],
+) -> HipResult<()> {
+    // Borrow the post-norm buffers and seal before any launch/upload so a
+    // rejected receipt cannot touch GPU state. Norm writes the same buffers
+    // the sealed call already holds.
+    let (x_norm, x_rot_prerotated) = moe_ffn_norm_ep_select(gpu, ffn, x, s);
+    let refs = MoeScratchRef::from_scratch(s);
+    let moe_params = moe_params_for_decode(
+        ffn,
+        x_norm,
+        x,
+        config,
+        &refs,
+        x_rot_prerotated,
+        None,
+        true,
+        true,
+        MoeEpMode::CanonicalSlotOrder,
+    );
+    let ctx = hipfire_dispatch::context::DispatchCtx::new(gpu);
+    let bound = ffn.bound_experts()?;
+    let sealed = hipfire_dispatch::pipeline::sealed_moe::seal_experts_only(
+        bound, &ctx, moe_params, receipt, route_ids,
+    )
+    .map_err(HipError::from)?;
+
+    moe_ffn_norm_ep_launch(gpu, x, ffn_norm, config, s, x_rot_prerotated)?;
+    // Install the distributed IDs on this rank's stream, FIFO ahead of the
+    // expert kernels below. Same-stream ordering is the whole contract: no
+    // cross-rank waits, no host syncs.
+    let topk = s.moe_topk_indices.as_ref().expect("MoE scratch");
+    let stream = gpu.active_stream.as_ref().ok_or_else(|| {
+        HipError::new(
+            0,
+            "qwen35: experts-only decode needs an active stream (call ensure_rank_streams)",
+        )
+    })?;
+    gpu.hip.memcpy_htod_async(&topk.buf, route_ids, stream)?;
+    hipfire_dispatch::pipeline::execute_steps(
+        gpu,
+        &ctx,
+        &[hipfire_dispatch::pipeline::Step::Moe(sealed)],
+    )
+    .map_err(HipError::from)?;
+    trace_finite_if_enabled(gpu, "moe_ffn", x)?;
+    Ok(())
 }
 
 /// Validate the topology half of a post-load shard (rank/mesh/device
@@ -5882,10 +6185,35 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
             LayerWeights::FullAttnMoe(l) => (&l.ffn, &l.ffn_norm),
             _ => return Err(DispatchError::Hip("MOE on dense layer".into())),
         };
-        // Routed combine + shared-down (rank 0 only) accumulate into `routed_out`
-        // (zeroed by the EP executor); s.x (the replicated attention residual) is
-        // untouched until ep_add_into_residual after the all-reduce.
+        // Sealed EP dispatch (canonical slot order, or the explicit legacy
+        // rank-partial diagnostic): canonical leaves raw rows expanded and
+        // folds shared first on the root only — `s.x` keeps `x0+s` (root)
+        // or `x0` (non-root) until the driver's gather, sealed root
+        // combine, and broadcast-overwrite; legacy accumulates the routed
+        // combine + shared-down (rank 0 only) into `routed_out` (zeroed by
+        // the EP executor, added into `s.x` after the all-reduce).
         moe_ffn_dispatch_ep(gpu, ffn, &s.x, ffn_norm, config, s, routed_out, skip_shared)
+            .map_err(|e| DispatchError::Hip(e.to_string()))
+    }
+    fn ep_run_moe_experts(
+        &mut self,
+        gpu: &mut Gpu,
+        _ctx: &DispatchCtx,
+        _op: &OpBinding,
+        receipt: &hipfire_dispatch::pipeline::sealed_moe::MoeRootRouteReceipt,
+        route_ids: &[u8; 32],
+    ) -> Result<(), DispatchError> {
+        let s = self.s;
+        let config = self.config;
+        let (ffn, ffn_norm) = match self.layer {
+            LayerWeights::DeltaNetMoe(l) => (&l.ffn, &l.ffn_norm),
+            LayerWeights::FullAttnMoe(l) => (&l.ffn, &l.ffn_norm),
+            _ => return Err(DispatchError::Hip("MOE on dense layer".into())),
+        };
+        // Canonical non-root only: norm/rotate plus indexed experts over the
+        // root-authoritative IDs in this rank's top-k buffers. Dense layers
+        // fail here (a stray EP MoE op on dense), never silently.
+        moe_ffn_dispatch_experts_ep(gpu, ffn, &s.x, ffn_norm, config, s, receipt, route_ids)
             .map_err(|e| DispatchError::Hip(e.to_string()))
     }
 
@@ -5899,6 +6227,48 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
         let s = self.s;
         gpu.add_inplace_f32(&s.x, partial)
             .map_err(|e| DispatchError::Hip(e.to_string()))
+    }
+
+    fn ep_moe_combine_mode(&self) -> EpMoeCombineMode {
+        // Dense layers never serve MoE: report the default so a stray EP
+        // MoE op fails later at `run_moe_ep` ("MOE on dense layer"), not
+        // here. MoE layers report the sealed selection (canonical, or the
+        // explicit legacy diagnostic); an unsealed binding errors there.
+        match self.layer {
+            LayerWeights::DeltaNetMoe(l) => {
+                qwen_ep_moe_mode(&l.ffn).unwrap_or(EpMoeCombineMode::RankPartial)
+            }
+            LayerWeights::FullAttnMoe(l) => {
+                qwen_ep_moe_mode(&l.ffn).unwrap_or(EpMoeCombineMode::RankPartial)
+            }
+            _ => EpMoeCombineMode::RankPartial,
+        }
+    }
+
+    fn ep_moe_slot_view(&self) -> Option<EpMoeSlotView<'_>> {
+        // Canonical-only: the runtime EP driver calls this after every rank
+        // reported canonical. Any missing piece (dense layer, unsealed
+        // binding, absent scratch) is None → the driver fail-stops.
+        let ffn = match self.layer {
+            LayerWeights::DeltaNetMoe(l) => &l.ffn,
+            LayerWeights::FullAttnMoe(l) => &l.ffn,
+            _ => return None,
+        };
+        if qwen_ep_moe_mode(ffn).ok()? != EpMoeCombineMode::CanonicalSlotOrder {
+            return None;
+        }
+        let s = self.s;
+        Some(EpMoeSlotView {
+            experts: ffn.bound_experts().ok()?,
+            layer: ffn.layer_idx as usize,
+            hidden: self.config.dim,
+            k: self.config.num_experts_per_tok,
+            n_exp: self.config.num_experts,
+            raw_slots: s.moe_down_expanded.as_ref()?,
+            topk_ids: s.moe_topk_indices.as_ref()?,
+            topk_weights: s.moe_topk_weights.as_ref()?,
+            residual: &s.x,
+        })
     }
 
     fn run_recurrent(

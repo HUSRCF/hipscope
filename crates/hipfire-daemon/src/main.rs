@@ -88,7 +88,7 @@ mod slots;
 pub(crate) static TERMINAL_TEST_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
 use hipfire_generate::vision::{GenerateVLParams, ImageSource};
-use hipfire_loader::{AsstTurnCache, EpArch, EpState, Eviction, LoadedModel};
+use hipfire_loader::{AsstTurnCache, Eviction, LoadedModel};
 use hipfire_runtime::spec::{
     ClientEvent, EmitOutcome, EvictRetain, FinishSummary, PrefillOutcome, SpecAdvance, SpecEmit,
     SpecTarget, Speculator, StopReason,
@@ -2123,8 +2123,8 @@ fn main() {
                         // the entire session.
                         //
                         // EP guard (load_tp > 1): the EP path serves through
-                        // `hipfire_generate::qwen::generate_ep`, which bypasses PFlash entirely (the
-                        // EP archs ds4/minimax refuse/ignore PFlash drafters).
+                        // `hipfire_generate::qwen::generate_ep`, which bypasses PFlash entirely (no
+                        // EP server reads PFlash drafters).
                         // Loading a drafter here would just pin GPU memory it
                         // never reads until unload, so skip the load outright.
                         // Warn once if the operator actually supplied a drafter
@@ -3082,8 +3082,10 @@ fn main() {
                         continue;
                     }
                     // ── Continuous batch admission (tightened to actual route) ──
-                    // EP Qwen35 expert-parallel is batch-only, TP=4, 4×gfx1201; fail closed otherwise.
-                    // Check EP eligibility first so batch-only enforcement fires before single-GPU fallback.
+                    // EP Qwen35 expert-parallel continuous batch is TP=4, 4×gfx1201;
+                    // sequential EP (tp=2|4) serves every request that is not
+                    // batch-eligible. Check EP eligibility first so the batch
+                    // route wins when staged and requested.
                     let serve_continuous_batch = parse_serve_continuous_batch(&msg);
                     let pflash_active = pf_cfg_owned.as_ref().is_some_and(|c| {
                         !matches!(c.mode, hipfire_pflash::pflash::PflashMode::Off)
@@ -3239,30 +3241,11 @@ fn main() {
                             continue;
                         }
                     }
-                    // Enforce batch-only for EP: if EP batch is staged, non-eligible must fail closed, not silently fall back.
-                    let ep_batch_staged = !singleton_handoff
-                        && batch_scheduler.is_some()
-                        && m.ep
-                            .as_ref()
-                            .is_some_and(|ep| matches!(ep.inner, EpArch::Qwen35 { .. }));
-                    if ep_batch_staged {
-                        // EP requests without serve_continuous_batch or with excluded features must error.
-                        if !ep_batch_eligible {
-                            let _scope = BatchAttemptScope::enter_for_generation(
-                                id,
-                                gen_attempt_id,
-                                admission,
-                            );
-                            let ep = hipfire_generate::common::RollbackEpilogue {
-                                rolled_back: true,
-                                context: None,
-                            };
-                            // Reset the specific lane if any (best-effort), else poison not needed; just fail this request.
-                            hipfire_generate::common::emit_fail_closed_error(&mut stdout, Some(id), "EP qwen35 batch-only: request must set serve_continuous_batch=true with TP=4 expert_parallel and no excluded features (image/tools/stop/spec)", "validation", false, &ep);
-                            batch_clear_terminal_at_generation(id, gen_attempt_id, admission);
-                            continue;
-                        }
-                    }
+                    // Sequential EP now serves Qwen35-MoE (tp=2|4) via
+                    // `generate_ep`: a request that is not batch-eligible
+                    // falls through to the sequential path below instead of
+                    // failing closed. The batch route above still wins when
+                    // staged and requested with `serve_continuous_batch`.
                     let batch_eligible = if !singleton_handoff && batch_scheduler.is_some() {
                         is_batch_request_eligible(
                             &msg,
@@ -3670,9 +3653,25 @@ fn main() {
                     if developer_var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
                         eprintln!("[qwen-cache RESET] daemon received reset — clearing conversation_tokens (was {})", m.conversation_tokens.len());
                     }
-                    let ep = hipfire_generate::common::production_fail_closed_rollback(
-                        m, &mut gpu, None, None,
-                    );
+                    // Attested reset ownership: EP models reset through the
+                    // shared mesh epilogue (`ep_reset_after_abort`, which owns
+                    // every EpArch variant incl. Qwen35 sequential + batch),
+                    // single-GPU through the production rollback. No separate
+                    // algorithm either way — the full per-rank reset happens
+                    // here at request time, never deferred to a later cold
+                    // reset. The mesh EP arm leaves the host semantic cache,
+                    // so a daemon reset (full cold reset) drops it explicitly
+                    // — the single-GPU path already clears it inside its
+                    // rollback.
+                    let ep = if m.ep.is_some() {
+                        let ep = hipfire_generate::common::reset_mesh_request_state(m, None);
+                        m.asst_turn_cache.clear();
+                        ep
+                    } else {
+                        hipfire_generate::common::production_fail_closed_rollback(
+                            m, &mut gpu, None, None,
+                        )
+                    };
                     if !ep.rolled_back {
                         let detail = ep
                             .context
