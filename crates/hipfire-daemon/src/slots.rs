@@ -223,7 +223,9 @@ impl SlotBackend {
         let vocab = preflight.vocab;
         let tokenizer = preflight.tokenizer;
         let tool_grammar = qwen35_grammar_on(
-            std::env::var("HIPFIRE_TOOL_GRAMMAR").ok().as_deref(),
+            hipfire_config::developer_var("HIPFIRE_QWEN35_GRAMMAR")
+                .ok()
+                .as_deref(),
             model_path,
         );
 
