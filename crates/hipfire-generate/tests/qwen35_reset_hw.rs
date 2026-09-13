@@ -580,7 +580,7 @@ fn sealed_expert_mutation_fault_round(
     assert_clean_state_snapshot(&snapshot, context);
 
     let retry = session_generate(&mut s, "retry", 7103, false, false, false, context);
-    assert_done_stop(&retry, context, "post-expert-fault retry", false);
+    assert_done_stop(&retry, context, "post-expert-fault retry", false, false);
     let retry_text = token_text(&events_for_id(&retry, "retry"));
     assert_eq!(
         retry_text, baseline,
@@ -612,7 +612,7 @@ fn single_qwen35_sealed_moe_expert_mutation_rolls_back_and_recovers() {
     let extra_env: &[(&str, &str)] = &[];
     for round in 0..rounds() {
         let ctx = format!("single sealed MoE round {round}");
-        let baseline = clean_bytes(&model, None, extra_env, &ctx);
+        let baseline = clean_bytes(&model, None, extra_env, &ctx, false);
         sealed_expert_mutation_fault_round(&model, extra_env, &baseline, &ctx);
     }
     let mut fp = HashMap::new();
