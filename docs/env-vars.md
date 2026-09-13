@@ -1017,7 +1017,7 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_SMOKE_STEPS` | crates/hipfire-arch-qwen35/src/qwen35.rs, crates/hipfire-runtime/examples/a3b_smoke_forward.rs |
 | `HIPFIRE_SPECULATION` | crates/hipfire-config/src/lib.rs |
 | `HIPFIRE_SPEC_PHASES` | crates/hipfire-arch-qwen35/src/speculative.rs |
-| `HIPFIRE_SPEC_WINDOW_ROLLBACK` | crates/hipfire-arch-qwen35/src/mtp_speculator.rs |
+| `HIPFIRE_SPEC_WINDOW_ROLLBACK` | crates/hipfire-config/src/lib.rs, crates/hipfire-arch-qwen35/src/mtp_speculator.rs |
 | `HIPFIRE_SPILL_DIR` | crates/hipfire-quantize/src/main.rs |
 | `HIPFIRE_SWEEP_MAX` | scripts/ddtree_budget_sweep.sh |
 | `HIPFIRE_SWEEP_OUT` | scripts/mq3-mq2-sweep.sh, scripts/spec_decode_genre_sweep.sh |

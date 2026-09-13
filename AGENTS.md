@@ -674,7 +674,7 @@ If you want to actively contribute findings, these are open:
 
 ---
 
-*Last updated: 2026-09-07 (v0.3.1 fixture pin: Qwen3.8-27B MQ4XT). When this
+*Last updated: 2026-09-13 (v0.3.1 cut; fixture pin: Qwen3.8-27B MQ4XT). When this
 doc gets stale (more than 1-2 releases behind HEAD), update it as part of the release PR.*
 
 
