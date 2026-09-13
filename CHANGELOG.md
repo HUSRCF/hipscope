@@ -2,6 +2,9 @@
 
 ## v0.3.1 — DFlash cache repair, admission hardening, image gen
 
+- Sealed MoE execution contracts (#755, fivetide; G5 constituent): manifest-derived expert plans bound transactionally to Qwen3.6-A3B / Ornith and Cohere MoE decode and prefill; raw MoE escape hatches removed; rank-local sealed EP with root-authoritative routes and owned reduction leases, verified on 4× R9700. EP cross-route logit equivalence is diagnostic, not an acceptance gate — G5 acceptance and PM4 admission remain open on #666.
+- gfx1201 admits the AlpineQ R4/R8 Q8 multi-row verifier for long-context DFlash (#748, HUSRCF). Measured on Qwen3.8-27B XT at 21,550 tokens: AR 32.6 → DFlash 39.3 tok/s (+20.6% over AR); the previous batched route was a 19% loss vs AR at that context. The route is excluded under HIP graph capture and retained/PM4 recording.
+- Daemon slots restore tool turns (#753, alpineQ): daemon-owned canonical tool-call ids survive parsing and OpenAI lowering, pending tool results are brokered per session/call and published only after Commit, Jinja tool-history projection. Slot grammar honours the documented `HIPFIRE_QWEN35_GRAMMAR` switch; rich history keeps `reasoning_content` for the `qwen3_5`/`qwen3_5_moe` arch spellings the daemon emits.
 - Source-aware admission and refusal-before-teardown (#682, #687).
 - Registry-declared DFlash draft sidecars: `pull` fetches them, `auto`/`on` semantics, shared-sidecar-aware `rm` (#686).
 - DFlash prompt-cache repair on terminal overshoot (`RepairForTerminal`) (#695).
