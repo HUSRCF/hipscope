@@ -10,6 +10,15 @@ use hip_bridge;
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::sync::{LazyLock, OnceLock};
 
+pub mod sealed_moe;
+pub use sealed_moe::{
+    adopt_prefill_route, checked_grouped_m_total_bound, checked_tp_local_shapes,
+    produce_prefill_route, seal_decode, seal_decode_with_router, seal_ep_routed_contrib,
+    seal_prefill, seal_prefill_ep, seal_prefill_with_router, ActivationIdentity, ActivationInput,
+    BoundMoeExperts, ExpertBindingCache, ExpertMetadata, ExpertResource, ExpertResources,
+    ExpertTable, MoeContribution, MoePrefillRouteProducerProof, MoeProtocol, MoeRouteProducerProof,
+    MoeRouteReceipt, MoeRouterInput, MoeSharedContribution, ResourceAlias, SealedMoeCall,
+};
 pub(crate) mod steps;
 pub use steps::{execute_steps, FusedPattern, GemvInput, Step};
 
@@ -44,7 +53,6 @@ pub struct LinearParams<'a> {
 
 pub enum PipelineParams<'a> {
     Linear(LinearParams<'a>),
-    Moe(crate::families::moe::MoeParams<'a>),
 }
 
 pub fn execute_pipeline(
@@ -55,16 +63,10 @@ pub fn execute_pipeline(
     dtype: rdna_compute::DType,
     registry: &KernelRegistry,
 ) -> Result<(), DispatchError> {
-    if let PipelineParams::Moe(p) = params {
-        return run_moe_decode(ctx, gpu, p);
-    }
     if let Some(key) = find_fused(registry, ctx, dtype, steps) {
         return dispatch_fused(ctx, gpu, key, params);
     }
-    let params = match params {
-        PipelineParams::Linear(p) => p,
-        PipelineParams::Moe(_) => unreachable!(),
-    };
+    let PipelineParams::Linear(params) = params;
     for &step in steps {
         match step {
             PipelineOp::RotateFwht => {
@@ -582,16 +584,18 @@ pub fn run_uniform_moe_down_expanded(
     }
 }
 
-/// MoE decode executor. Ports the body of `moe_ffn_decode_impl` verbatim,
-/// substituting `ffn.*`/`config.*`/`s.*` references with `MoeParams` fields.
-/// Resolution is owned here (computed from `MoeDtypes` + k), and `ctx` is
-/// threaded to every inner GEMV so the call site builds one `DispatchCtx`.
-pub fn run_moe_decode(
+/// Sealed indexed-decode executor.  Raw `MoeParams` never reaches this helper
+/// directly; only a `SealedMoeCall` produced by `seal_decode` can enter.
+pub(super) fn run_moe_decode(
     ctx: &DispatchCtx,
     gpu: &mut Gpu,
-    p: &crate::families::moe::MoeParams,
+    call: &SealedMoeCall<'_>,
 ) -> Result<(), DispatchError> {
     use crate::families::moe::MoeResolution;
+
+    let p = call.decode_params().ok_or_else(|| {
+        DispatchError::Hip("sealed moe: decode call has no decode operands".into())
+    })?;
 
     // Runtime guard matching the bias-aware decode guard (not debug_assert —
     // that would be stripped in release). batch_size=1 is the only valid
@@ -637,6 +641,34 @@ pub fn run_moe_decode(
         && *DOWN_LAST_COMBINE.get_or_init(|| {
             hipfire_config::developer_var("HIPFIRE_MOE_DOWN_LAST_COMBINE").as_deref() == Ok("1")
         });
+    // Root-routed EP (sealed partials): the per-rank call folds the weighted
+    // combine straight into the zeroed partial, so every route that cannot
+    // route on-GPU is rejected here, before the first launch. (The sealer
+    // preflights the same conditions launch-free; this is defense in depth
+    // at the executor boundary.) The partial path needs neither expanded
+    // rows nor the down-last gate — both fold into the partial correctly.
+    // Full routing calls run the router replicated; routed-contrib calls
+    // (root-authoritative IDs already resident) skip routing below via
+    // `skip_routing` — per-rank re-ranking is never assumed.
+    if p.ep_mode == crate::families::moe::MoeEpMode::RootRoutedPartial {
+        if !res.use_gpu_topk {
+            return Err(DispatchError::Hip(
+                "root-routed EP decode requires the GPU top-K path; the CPU-top-K fallback is rejected"
+                    .into(),
+            ));
+        }
+        if p.defer_routed_combine {
+            return Err(DispatchError::Hip(
+                "root-routed EP decode requires defer_routed_combine=false (weighted combine into the partial)"
+                    .into(),
+            ));
+        }
+        if p.routed_out.is_none() {
+            return Err(DispatchError::Hip(
+                "root-routed EP decode requires routed_out=Some (the zeroed partial)".into(),
+            ));
+        }
+    }
 
     // ── Activation rotation (mirrors qwen35.rs x_rot_local block) ──────────
     let x_rot_local: Option<&GpuTensor> = if res.needs_x_rot_local {
@@ -680,126 +712,134 @@ pub fn run_moe_decode(
     // NOTE: all slice views alias device memory owned by MoEParams' scratch tensors.
     let shared_gate = slice_moe_f32_view(p.gate_buf, 0, p.smi);
     let shared_up = slice_moe_f32_view(p.up_buf, 0, p.smi);
-    if res.gate_fusable {
-        let xr = x_rot_local.expect("gate_fusable implies x_rot_local (needs_x_rot_local)");
-        // Exact-uniform V1 MQ4G256 gate quartet → one fused launch.
-        hip!(gpu.fused_qkvza_hfq4g256(
-            &p.router.buf,
-            &p.shared_expert_gate.buf,
-            &p.shared_gate_w.buf,
-            &p.shared_up_w.buf,
-            xr,
-            p.router_logits,
-            p.scalar_buf,
-            &shared_gate,
-            &shared_up,
-            p.router.m,
-            p.shared_expert_gate.m,
-            p.shared_gate_w.m,
-            p.shared_up_w.m,
-            p.router.k,
-        ))?;
-    } else if res.gate_fusable_mq4v2
-        && (ctx.arch.is_gfx1100() || ctx.arch.is_gfx1201())
-        && p.batch_size == 1
-        && p.router.awq_scale.is_none()
-        && p.shared_expert_gate.awq_scale.is_none()
-        && p.shared_gate_w.awq_scale.is_none()
-        && p.shared_up_w.awq_scale.is_none()
-        && p.router.k == 2048
-        && p.shared_expert_gate.k == 2048
-        && p.shared_gate_w.k == 2048
-        && p.shared_up_w.k == 2048
-        && p.router.m == 256
-        && p.shared_expert_gate.m == 1
-        && p.shared_gate_w.m == 512
-        && p.shared_up_w.m == 512
-    {
-        let xr = x_rot_local.expect("gate_fusable_mq4v2 implies x_rot_local (needs_x_rot_local)");
-        // Exact official Ornith qt44 gate quartet on gfx1100/gfx1201 only →
-        // one V2 fused launch. Any miss (arch/AWQ/shape/batch) falls through
-        // to the generic four-GEMV branch below — never errors.
-        hip!(gpu.fused_qkvza_hfq4g256_mq4v2(
-            &p.router.buf,
-            &p.shared_expert_gate.buf,
-            &p.shared_gate_w.buf,
-            &p.shared_up_w.buf,
-            xr,
-            p.router_logits,
-            p.scalar_buf,
-            &shared_gate,
-            &shared_up,
-            p.router.m,
-            p.shared_expert_gate.m,
-            p.shared_gate_w.m,
-            p.shared_up_w.m,
-            p.router.k,
-        ))?;
-    } else {
-        static GEMV_GATE: OnceLock<GemvFamily> = OnceLock::new();
-        let gemv = GEMV_GATE.get_or_init(GemvFamily::new);
-        // Reuse the single normalized FWHT activation for structural MQ
-        // router/scalar weights when the fused quartet is not admitted
-        // (mixed dtype, non-MQ4 gate side, AWQ, etc.).
-        let router_prerot = x_rot_local.is_some()
+    // Pre-routed experts-only (canonical non-root): the rank's top-k buffers
+    // already hold the root-authoritative IDs, so in-call routing (gate-side
+    // GEMV, CPU fallback, DIAG dump, top-k) is skipped and only rotation plus
+    // the indexed experts run below. Single/legacy calls always route here
+    // (byte-identical: this flag is false for every non-pre-routed seal).
+    let skip_routing = call.router_input() == MoeRouterInput::PrecomputedSoftmaxTopK;
+    if !skip_routing {
+        if res.gate_fusable {
+            let xr = x_rot_local.expect("gate_fusable implies x_rot_local (needs_x_rot_local)");
+            // Exact-uniform V1 MQ4G256 gate quartet → one fused launch.
+            hip!(gpu.fused_qkvza_hfq4g256(
+                &p.router.buf,
+                &p.shared_expert_gate.buf,
+                &p.shared_gate_w.buf,
+                &p.shared_up_w.buf,
+                xr,
+                p.router_logits,
+                p.scalar_buf,
+                &shared_gate,
+                &shared_up,
+                p.router.m,
+                p.shared_expert_gate.m,
+                p.shared_gate_w.m,
+                p.shared_up_w.m,
+                p.router.k,
+            ))?;
+        } else if res.gate_fusable_mq4v2
+            && (ctx.arch.is_gfx1100() || ctx.arch.is_gfx1201())
+            && p.batch_size == 1
             && p.router.awq_scale.is_none()
             && p.shared_expert_gate.awq_scale.is_none()
-            && matches!(
-                crate::types::dtype_post_rotation_variant(p.router.dtype),
-                crate::types::GemvVariant::Prerotated
-            )
-            && matches!(
-                crate::types::dtype_post_rotation_variant(p.shared_expert_gate.dtype),
-                crate::types::GemvVariant::Prerotated
-            )
-            && crate::types::KernelKey::dtype_arch_predicate(p.router.dtype).eval_arch(ctx)
-            && crate::types::KernelKey::dtype_arch_predicate(p.shared_expert_gate.dtype)
-                .eval_arch(ctx);
-        if router_prerot {
-            let xr = x_rot_local.expect("router_prerot implies x_rot_local");
-            gemv.run(
-                ctx,
-                gpu,
-                &crate::families::gemv::GemvParams {
-                    w: &p.router,
-                    x: xr,
-                    y: p.router_logits,
-                    variant: crate::types::GemvVariant::Prerotated,
-                    residual: None,
-                    gate: None,
-                    up: None,
-                },
-            )
-            .map_err(|e| DispatchError::Hip(e.to_string()))?;
-            gemv.run(
-                ctx,
-                gpu,
-                &crate::families::gemv::GemvParams {
-                    w: &p.shared_expert_gate,
-                    x: xr,
-                    y: p.scalar_buf,
-                    variant: crate::types::GemvVariant::Prerotated,
-                    residual: None,
-                    gate: None,
-                    up: None,
-                },
-            )
-            .map_err(|e| DispatchError::Hip(e.to_string()))?;
+            && p.shared_gate_w.awq_scale.is_none()
+            && p.shared_up_w.awq_scale.is_none()
+            && p.router.k == 2048
+            && p.shared_expert_gate.k == 2048
+            && p.shared_gate_w.k == 2048
+            && p.shared_up_w.k == 2048
+            && p.router.m == 256
+            && p.shared_expert_gate.m == 1
+            && p.shared_gate_w.m == 512
+            && p.shared_up_w.m == 512
+        {
+            let xr =
+                x_rot_local.expect("gate_fusable_mq4v2 implies x_rot_local (needs_x_rot_local)");
+            // Exact official Ornith qt44 gate quartet on gfx1100/gfx1201 only →
+            // one V2 fused launch. Any miss (arch/AWQ/shape/batch) falls through
+            // to the generic four-GEMV branch below — never errors.
+            hip!(gpu.fused_qkvza_hfq4g256_mq4v2(
+                &p.router.buf,
+                &p.shared_expert_gate.buf,
+                &p.shared_gate_w.buf,
+                &p.shared_up_w.buf,
+                xr,
+                p.router_logits,
+                p.scalar_buf,
+                &shared_gate,
+                &shared_up,
+                p.router.m,
+                p.shared_expert_gate.m,
+                p.shared_gate_w.m,
+                p.shared_up_w.m,
+                p.router.k,
+            ))?;
         } else {
-            gemv.run_auto(ctx, gpu, &p.router, p.x_norm, p.router_logits)
+            static GEMV_GATE: OnceLock<GemvFamily> = OnceLock::new();
+            let gemv = GEMV_GATE.get_or_init(GemvFamily::new);
+            // Reuse the single normalized FWHT activation for structural MQ
+            // router/scalar weights when the fused quartet is not admitted
+            // (mixed dtype, non-MQ4 gate side, AWQ, etc.).
+            let router_prerot = x_rot_local.is_some()
+                && p.router.awq_scale.is_none()
+                && p.shared_expert_gate.awq_scale.is_none()
+                && matches!(
+                    crate::types::dtype_post_rotation_variant(p.router.dtype),
+                    crate::types::GemvVariant::Prerotated
+                )
+                && matches!(
+                    crate::types::dtype_post_rotation_variant(p.shared_expert_gate.dtype),
+                    crate::types::GemvVariant::Prerotated
+                )
+                && crate::types::KernelKey::dtype_arch_predicate(p.router.dtype).eval_arch(ctx)
+                && crate::types::KernelKey::dtype_arch_predicate(p.shared_expert_gate.dtype)
+                    .eval_arch(ctx);
+            if router_prerot {
+                let xr = x_rot_local.expect("router_prerot implies x_rot_local");
+                gemv.run(
+                    ctx,
+                    gpu,
+                    &crate::families::gemv::GemvParams {
+                        w: &p.router,
+                        x: xr,
+                        y: p.router_logits,
+                        variant: crate::types::GemvVariant::Prerotated,
+                        residual: None,
+                        gate: None,
+                        up: None,
+                    },
+                )
                 .map_err(|e| DispatchError::Hip(e.to_string()))?;
-            gemv.run_auto(ctx, gpu, &p.shared_expert_gate, p.x_norm, p.scalar_buf)
+                gemv.run(
+                    ctx,
+                    gpu,
+                    &crate::families::gemv::GemvParams {
+                        w: &p.shared_expert_gate,
+                        x: xr,
+                        y: p.scalar_buf,
+                        variant: crate::types::GemvVariant::Prerotated,
+                        residual: None,
+                        gate: None,
+                        up: None,
+                    },
+                )
                 .map_err(|e| DispatchError::Hip(e.to_string()))?;
-        }
-        // Shared-expert gate/up: on a graded file the all-MQ4 fused gate path
-        // (fused_qkvza_hfq4g256 on the single rotated `xr`) doesn't apply because
-        // the router is Q8. But the dense shared gate/up are still MQ-family, and
-        // `x_rot_local` has ALREADY been FWHT-rotated once for the routed experts.
-        // `run_auto` here would re-rotate x_norm per call (+2 mq_rotate_x/layer);
-        // instead reuse the existing rotation via the Prerotated path. Numerically
-        // identical (same rotated activation). Q8/HFQ shared weights (no rotation)
-        // or AWQ-scaled shared weights fall through to run_auto unchanged.
-        let shared_prerot = x_rot_local.is_some()
+            } else {
+                gemv.run_auto(ctx, gpu, &p.router, p.x_norm, p.router_logits)
+                    .map_err(|e| DispatchError::Hip(e.to_string()))?;
+                gemv.run_auto(ctx, gpu, &p.shared_expert_gate, p.x_norm, p.scalar_buf)
+                    .map_err(|e| DispatchError::Hip(e.to_string()))?;
+            }
+            // Shared-expert gate/up: on a graded file the all-MQ4 fused gate path
+            // (fused_qkvza_hfq4g256 on the single rotated `xr`) doesn't apply because
+            // the router is Q8. But the dense shared gate/up are still MQ-family, and
+            // `x_rot_local` has ALREADY been FWHT-rotated once for the routed experts.
+            // `run_auto` here would re-rotate x_norm per call (+2 mq_rotate_x/layer);
+            // instead reuse the existing rotation via the Prerotated path. Numerically
+            // identical (same rotated activation). Q8/HFQ shared weights (no rotation)
+            // or AWQ-scaled shared weights fall through to run_auto unchanged.
+            let shared_prerot = x_rot_local.is_some()
             && p.shared_gate_w.awq_scale.is_none()
             && p.shared_up_w.awq_scale.is_none()
             && matches!(crate::types::dtype_post_rotation_variant(p.shared_gate_w.dtype), crate::types::GemvVariant::Prerotated)
@@ -810,43 +850,44 @@ pub fn run_moe_decode(
             // through to run_auto (the pre-2f38a16e gfx942 path that worked).
             && crate::types::KernelKey::dtype_arch_predicate(p.shared_gate_w.dtype).eval_arch(ctx)
             && crate::types::KernelKey::dtype_arch_predicate(p.shared_up_w.dtype).eval_arch(ctx);
-        if shared_prerot {
-            let xr = x_rot_local.expect("shared_prerot implies x_rot_local");
-            gemv.run(
-                ctx,
-                gpu,
-                &crate::families::gemv::GemvParams {
-                    w: &p.shared_gate_w,
-                    x: xr,
-                    y: &shared_gate,
-                    variant: crate::types::GemvVariant::Prerotated,
-                    residual: None,
-                    gate: None,
-                    up: None,
-                },
-            )
-            .map_err(|e| DispatchError::Hip(e.to_string()))?;
-            gemv.run(
-                ctx,
-                gpu,
-                &crate::families::gemv::GemvParams {
-                    w: &p.shared_up_w,
-                    x: xr,
-                    y: &shared_up,
-                    variant: crate::types::GemvVariant::Prerotated,
-                    residual: None,
-                    gate: None,
-                    up: None,
-                },
-            )
-            .map_err(|e| DispatchError::Hip(e.to_string()))?;
-        } else {
-            gemv.run_auto(ctx, gpu, &p.shared_gate_w, p.x_norm, &shared_gate)
+            if shared_prerot {
+                let xr = x_rot_local.expect("shared_prerot implies x_rot_local");
+                gemv.run(
+                    ctx,
+                    gpu,
+                    &crate::families::gemv::GemvParams {
+                        w: &p.shared_gate_w,
+                        x: xr,
+                        y: &shared_gate,
+                        variant: crate::types::GemvVariant::Prerotated,
+                        residual: None,
+                        gate: None,
+                        up: None,
+                    },
+                )
                 .map_err(|e| DispatchError::Hip(e.to_string()))?;
-            gemv.run_auto(ctx, gpu, &p.shared_up_w, p.x_norm, &shared_up)
+                gemv.run(
+                    ctx,
+                    gpu,
+                    &crate::families::gemv::GemvParams {
+                        w: &p.shared_up_w,
+                        x: xr,
+                        y: &shared_up,
+                        variant: crate::types::GemvVariant::Prerotated,
+                        residual: None,
+                        gate: None,
+                        up: None,
+                    },
+                )
                 .map_err(|e| DispatchError::Hip(e.to_string()))?;
+            } else {
+                gemv.run_auto(ctx, gpu, &p.shared_gate_w, p.x_norm, &shared_gate)
+                    .map_err(|e| DispatchError::Hip(e.to_string()))?;
+                gemv.run_auto(ctx, gpu, &p.shared_up_w, p.x_norm, &shared_up)
+                    .map_err(|e| DispatchError::Hip(e.to_string()))?;
+            }
         }
-    }
+    } // end `if !skip_routing` (gate-side GEMV)
 
     // ── Top-K + routed experts: CPU-top-K generic fallback ───────────────────
     // Fires when `!use_gpu_topk` (k != 8 OR routed dtype not indexable). This
@@ -861,27 +902,39 @@ pub fn run_moe_decode(
     // does NOT fall through to the indexed GPU-top-K path below (which assumes
     // k=8 + an indexable routed dtype).
     if !res.use_gpu_topk {
+        // Experts-only has no in-call routing to fall back from: the indexed
+        // arms below are the only admissible experts path (fail-stop, never
+        // the CPU loop, which would re-route on host).
+        if skip_routing {
+            return Err(DispatchError::Hip(
+                "experts-only decode requires the indexed GPU route; the CPU-top-K fallback is rejected".into(),
+            ));
+        }
         return run_moe_decode_cpu_fallback(ctx, gpu, p, &shared_gate, &shared_up);
     }
     // DIAG: dump router logits before softmax (mirrors qwen35 HIPFIRE_DUMP_HIDDEN)
-    if let Ok(dump_path) = hipfire_config::developer_var("HIPFIRE_DUMP_HIDDEN") {
-        if gpu.hip.device_synchronize().is_ok() {
-            if let Ok(all) = gpu.download_f32(p.router_logits) {
-                use std::io::Write;
-                let path = format!("{dump_path}.router_raw_p");
-                if let Ok(mut f) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&path)
-                {
-                    let _ = f.write_all(&(0u32).to_le_bytes());
-                    for v in &all[..all.len().min(p.n_exp * 4 / 4)] {
-                        let _ = f.write_all(&v.to_le_bytes());
+    // Skipped for experts-only: no router ran, so the buffer holds
+    // root-distributed IDs' stale logits, not this call's routing.
+    if !skip_routing {
+        if let Ok(dump_path) = hipfire_config::developer_var("HIPFIRE_DUMP_HIDDEN") {
+            if gpu.hip.device_synchronize().is_ok() {
+                if let Ok(all) = gpu.download_f32(p.router_logits) {
+                    use std::io::Write;
+                    let path = format!("{dump_path}.router_raw_p");
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&path)
+                    {
+                        let _ = f.write_all(&(0u32).to_le_bytes());
+                        for v in &all[..all.len().min(p.n_exp * 4 / 4)] {
+                            let _ = f.write_all(&v.to_le_bytes());
+                        }
                     }
                 }
             }
         }
-    }
+    } // end `if !skip_routing` (DIAG dump)
     let gfx1100_router_mode = hipfire_config::developer_var("HIPFIRE_GFX1100_ROUTER_W64").ok();
     let gfx1151_radiowave_fusions = ctx.arch.is_gfx1151();
     let exact_wave64_router = p.n_exp == 256
@@ -909,53 +962,58 @@ pub fn run_moe_decode(
             // Research-only: faster on gfx1100, but its routing drift can
             // change greedy trajectories and trigger an attractor.
             && gfx1100_router_mode.as_deref() == Some("approx"));
-    if router_shared_fuse {
-        let shared_x_rot = unsafe {
-            GpuTensor {
-                buf: gpu.scratch.mq_x_rot.as_ref().unwrap().buf.alias(),
-                shape: vec![gpu.scratch.mq_x_rot.as_ref().unwrap().buf.size() / 4],
-                dtype: DType::F32,
-            }
-        };
-        hip!(
-            gpu.moe_router_softmax_topk_k8_wave64_exact_shared_silu_mq_rotate(
+    // Pre-routed experts-only skips top-k production: the buffers already hold
+    // the root-authoritative IDs (a per-rank re-ranking is exactly the
+    // divergence this removes).
+    if !skip_routing {
+        if router_shared_fuse {
+            let shared_x_rot = unsafe {
+                GpuTensor {
+                    buf: gpu.scratch.mq_x_rot.as_ref().unwrap().buf.alias(),
+                    shape: vec![gpu.scratch.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+                    dtype: DType::F32,
+                }
+            };
+            hip!(
+                gpu.moe_router_softmax_topk_k8_wave64_exact_shared_silu_mq_rotate(
+                    p.router_logits,
+                    p.topk_indices,
+                    p.topk_weights,
+                    p.n_exp,
+                    p.norm_topk_prob,
+                    &shared_gate,
+                    &shared_up,
+                    &shared_x_rot,
+                    p.smi,
+                )
+            )?;
+        } else if exact_wave64_router {
+            hip!(gpu.moe_router_softmax_topk_k8_wave64_exact(
                 p.router_logits,
                 p.topk_indices,
                 p.topk_weights,
                 p.n_exp,
-                p.norm_topk_prob,
-                &shared_gate,
-                &shared_up,
-                &shared_x_rot,
-                p.smi,
-            )
-        )?;
-    } else if exact_wave64_router {
-        hip!(gpu.moe_router_softmax_topk_k8_wave64_exact(
-            p.router_logits,
-            p.topk_indices,
-            p.topk_weights,
-            p.n_exp,
-            p.norm_topk_prob
-        ))?;
-    } else if wave64_router {
-        hip!(gpu.moe_router_softmax_topk_k8_wave64(
-            p.router_logits,
-            p.topk_indices,
-            p.topk_weights,
-            p.n_exp,
-            p.norm_topk_prob
-        ))?;
-    } else {
-        hip!(gpu.softmax_f32(p.router_logits))?;
-        hip!(gpu.moe_topk_renorm_k8(
-            p.router_logits,
-            p.topk_indices,
-            p.topk_weights,
-            p.n_exp,
-            p.norm_topk_prob
-        ))?;
-    }
+                p.norm_topk_prob
+            ))?;
+        } else if wave64_router {
+            hip!(gpu.moe_router_softmax_topk_k8_wave64(
+                p.router_logits,
+                p.topk_indices,
+                p.topk_weights,
+                p.n_exp,
+                p.norm_topk_prob
+            ))?;
+        } else {
+            hip!(gpu.softmax_f32(p.router_logits))?;
+            hip!(gpu.moe_topk_renorm_k8(
+                p.router_logits,
+                p.topk_indices,
+                p.topk_weights,
+                p.n_exp,
+                p.norm_topk_prob
+            ))?;
+        }
+    } // end `if !skip_routing` (top-k)
 
     // ── Shared expert down ───────────────────────────────────────────────────
     // EP: on rank>0 `skip_shared` is set so the replicated shared expert is
@@ -1672,6 +1730,13 @@ pub fn run_moe_decode(
         }
     } // end routed-expert dispatch block
 
+    #[cfg(feature = "serve-fault-inject")]
+    if crate::pipeline::sealed_moe::take_fault_after_expert_mutation() {
+        return Err(DispatchError::Hip(
+            "injected fault after sealed MoE expert mutation before combine publication".into(),
+        ));
+    }
+
     // FIXME(Step 8): replace hardcoded 1 with p.batch_size when grouped prefill lands
     // EP: routed combine accumulates into `out_target` (the zeroed partial when
     // `routed_out` is set, else `x_residual`). Under EP each rank's non-owned
@@ -1698,15 +1763,10 @@ pub fn run_moe_decode(
     // branch in the merged dtype-tag kernel at all — graded files carrying a GL
     // tier are rejected at load in `hipfire-arch-qwen35::load_moe_ffn`.)
     let routed_down_self_combines = down_last_combine
-        || (p.expert_dtype_tags.is_none()
-            && matches!(
-                p.dtypes.routed_down,
-                DType::MQ2G256Lloyd
-                    | DType::MQ2G256LloydU
-                    | DType::MQ3G256Lloyd
-                    | DType::MQ2G256GL
-                    | DType::MQ3G256GL
-            ));
+        || !crate::families::moe::moe_down_writes_expanded(
+            p.dtypes.routed_down,
+            p.expert_dtype_tags.is_some(),
+        );
     if !ninepath_d4 && !routed_down_self_combines && !p.defer_routed_combine {
         hip!(gpu.moe_down_combine_k8_batched(
             p.down_expanded,
@@ -2065,11 +2125,19 @@ fn run_moe_decode_cpu_fallback(
     };
 
     for (&expert_idx, &weight) in topk_indices.iter().zip(topk_weights.iter()) {
-        let (gate_up_w, down_w) = &p.routed_experts[expert_idx];
+        let (gate_up_w, down_w) =
+            p.routed_experts
+                .get(expert_idx)
+                .ok_or(DispatchError::UnsupportedVariant {
+                    family: "moe",
+                    variant: "cpu-topk-expert-not-resident",
+                    arch: "",
+                    quant: "",
+                })?;
 
         // gate_up: y = W·x  (run_auto auto-rotates for MQ/Paro dtypes).
         {
-            gemv.run_auto(ctx, gpu, gate_up_w, p.x_norm, p.gate_up_buf)?;
+            gemv.run_auto(ctx, gpu, &gate_up_w, p.x_norm, p.gate_up_buf)?;
         }
         let gate_view = slice_moe_f32_view(p.gate_up_buf, 0, mi);
         let up_view = slice_moe_f32_view(p.gate_up_buf, mi, mi);
@@ -2095,7 +2163,7 @@ fn run_moe_decode_cpu_fallback(
             ));
         }
         {
-            gemv.run_auto(ctx, gpu, down_w, &hid_view, p.ffn_out)?;
+            gemv.run_auto(ctx, gpu, &down_w, &hid_view, p.ffn_out)?;
         }
         hip!(gpu.scaled_add_inplace_cpu_scalar_f32(p.x_residual, p.ffn_out, weight))?;
     }
@@ -3063,21 +3131,18 @@ fn dispatch_grouped_gemm(
     }
 }
 
-/// Qwen3.5 batched MoE prefill routed-expert executor. Verbatim transcription
-/// of the routed block from `prefill_moe_ffn_body_batched` (qwen35.rs:7281).
-///
-/// Sequence: scatter → gate_up (Path 2 grouped / Path 1 indexed) → unscatter →
-/// SwiGLU+rotate → down (Path 2 / Path 1 / Path 0) → combine into `x_batch`.
-///
-/// `ctx` is decision-only (arch/env) — resolution is computed from
-/// `MoeDtypes` + `ArchCaps` + `FeatureFlags` once at entry. The raw
-/// `gpu.gemm_*`/`gpu.gemv_*` kernel calls do not take `ctx`.
-pub fn run_moe_prefill(
+/// Sealed grouped-prefill executor.  The raw prefill parameter bundle is
+/// retained only as private operands of a validated call.
+pub(super) fn run_moe_prefill(
     ctx: &DispatchCtx,
     gpu: &mut Gpu,
-    p: &crate::families::moe::MoePrefillParams,
+    call: &SealedMoeCall<'_>,
 ) -> Result<(), DispatchError> {
     use crate::families::moe::MoePrefillResolution;
+
+    let p = call.prefill_params().ok_or_else(|| {
+        DispatchError::Hip("sealed moe: prefill call has no prefill operands".into())
+    })?;
 
     let res = MoePrefillResolution::resolve(&p.dtypes, &ctx.arch, &ctx.flags);
     let force_mq4_grouped_fp16 = res.force_mq4_grouped_fp16 || p.force_mq4_grouped_fp16;
@@ -3540,6 +3605,12 @@ pub fn run_moe_prefill(
             res.use_paro_i8,
             res.use_paro_i8_k8,
         )?;
+        #[cfg(feature = "serve-fault-inject")]
+        if crate::pipeline::sealed_moe::take_fault_after_expert_mutation() {
+            return Err(DispatchError::Hip(
+                "injected fault after sealed MoE expert mutation before combine publication".into(),
+            ));
+        }
         hip!(gpu.moe_down_combine_grouped_k8(
             p.y_down_grouped,
             p.inverse_perm,
@@ -3576,6 +3647,12 @@ pub fn run_moe_prefill(
             }
         };
         down_result?;
+        #[cfg(feature = "serve-fault-inject")]
+        if crate::pipeline::sealed_moe::take_fault_after_expert_mutation() {
+            return Err(DispatchError::Hip(
+                "injected fault after sealed MoE expert mutation before combine publication".into(),
+            ));
+        }
     } else {
         // Path 1: atomic-free expanded GEMV write + combine.
         // Mixed Path1 (issue 2): when `expert_dtype_tags` exists, use the
@@ -3677,6 +3754,12 @@ pub fn run_moe_prefill(
             };
             down_result?;
         }
+        #[cfg(feature = "serve-fault-inject")]
+        if crate::pipeline::sealed_moe::take_fault_after_expert_mutation() {
+            return Err(DispatchError::Hip(
+                "injected fault after sealed MoE expert mutation before combine publication".into(),
+            ));
+        }
         hip!(gpu.moe_down_combine_k8_batched(
             p.down_expanded,
             p.topk_weights,
@@ -3696,10 +3779,7 @@ pub fn dispatch_fused(
     key: KernelKey,
     params: &PipelineParams,
 ) -> Result<(), DispatchError> {
-    let params = match params {
-        PipelineParams::Linear(p) => p,
-        PipelineParams::Moe(p) => return run_moe_decode(ctx, gpu, p),
-    };
+    let PipelineParams::Linear(params) = params;
     match key {
         KernelKey::GemvMfp4G32Fused => {
             gpu.ensure_mq_signs()

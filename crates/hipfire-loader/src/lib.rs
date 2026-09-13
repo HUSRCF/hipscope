@@ -1353,7 +1353,27 @@ pub enum EpArch {
     Qwen35 {
         config: hipfire_arch_qwen35::qwen35::Qwen35Config,
         weights: Vec<hipfire_arch_qwen35::qwen35::Qwen35Weights>,
+        /// Sequential EP decode state, one entry per rank: replicated KV +
+        /// DeltaNet + scratch plus the rank's routed-output partial scratch.
+        /// Present for every admitted MoE EP load (tp=2|4); the optional
+        /// continuous-batch `batch` below stays an independent opt-in that
+        /// remains tp=4-only via `validate_ep_batch_compatibility`.
+        kv_caches: Vec<llama::KvCache>,
+        dn_states: Vec<hipfire_arch_qwen35::qwen35::DeltaNetState>,
+        scratches: Vec<hipfire_arch_qwen35::qwen35::Qwen35Scratch>,
+        partials: Vec<rdna_compute::GpuTensor>,
         batch: Option<hipfire_arch_qwen35::qwen35::Qwen35DecodeBatchEpState>,
+        /// Load-owned sequential prefill scratch, one entry per rank on its
+        /// owning device: `prefill_pbs[r]` is a `PrefillBatchScratch` sized
+        /// `[chunk x dim]` with `chunk = min(max_seq, 512)` and
+        /// `cap_gdn_tape = false`, and `prefill_partials[r]` is its zeroed
+        /// `[chunk*dim]` F32 routed partial. Always nonempty after load;
+        /// drained (empty) once the optional batch owner is staged, because
+        /// batch mode serves prefill from its own `seed_pbs`/`seed_partials`.
+        /// Serve branch: `batch.is_some()` borrows the seeds,
+        /// `batch.is_none()` borrows these; serve never constructs either.
+        prefill_pbs: Vec<hipfire_arch_qwen35::qwen35::PrefillBatchScratch>,
+        prefill_partials: Vec<rdna_compute::GpuTensor>,
     },
     /// Dense Qwen tensor parallelism. Kept separate from `Qwen35`, whose
     /// ownership and scheduling contract is four-rank routed-expert EP.
@@ -2813,15 +2833,23 @@ impl Drop for MinimaxEpStaging {
     }
 }
 /// Staging guard for the Qwen3.5 EP load — mirror of `MinimaxEpStaging` with
-/// the Qwen weight types. Owns the `Gpus` orchestrator plus per-rank weights
-/// as they are built up. If the load fails mid-way (`?` early return, or the
-/// `HIPFIRE_EP_FAIL_RANK` fault), `Drop` explicitly frees every rank's VRAM
-/// on its owning device and drains each device's pool, so a failed EP load
-/// leaks NO VRAM and publishes NO partial object. On success the caller calls
-/// `into_parts()` to disarm the guard and move ownership into the `LoadedModel`.
+/// the Qwen weight types plus the sequential per-rank decode state (KV,
+/// DeltaNet, scratch, partials). Owns the `Gpus` orchestrator plus per-rank
+/// weights / state as they are built up. If the load fails mid-way (`?`
+/// early return, or the `HIPFIRE_EP_FAIL_RANK` fault), `Drop` explicitly
+/// frees every rank's VRAM on its owning device and drains each device's
+/// pool, so a failed EP load leaks NO VRAM and publishes NO partial object.
+/// On success the caller calls `into_parts()` to disarm the guard and move
+/// ownership into the `LoadedModel`.
 struct Qwen35EpStaging {
     gpus: Option<Gpus>,
     weights: Vec<qwen35::Qwen35Weights>,
+    kv_caches: Vec<llama::KvCache>,
+    dn_states: Vec<qwen35::DeltaNetState>,
+    scratches: Vec<qwen35::Qwen35Scratch>,
+    partials: Vec<rdna_compute::GpuTensor>,
+    prefill_pbs: Vec<qwen35::PrefillBatchScratch>,
+    prefill_partials: Vec<rdna_compute::GpuTensor>,
 }
 
 impl Qwen35EpStaging {
@@ -2829,15 +2857,48 @@ impl Qwen35EpStaging {
         Self {
             gpus: Some(gpus),
             weights: Vec::new(),
+            kv_caches: Vec::new(),
+            dn_states: Vec::new(),
+            scratches: Vec::new(),
+            partials: Vec::new(),
+            prefill_pbs: Vec::new(),
+            prefill_partials: Vec::new(),
         }
     }
     fn gpus_mut(&mut self) -> &mut Gpus {
         self.gpus.as_mut().expect("staging gpus taken")
     }
-    fn into_parts(mut self) -> (Gpus, Vec<qwen35::Qwen35Weights>) {
+    #[allow(clippy::type_complexity)]
+    fn into_parts(
+        mut self,
+    ) -> (
+        Gpus,
+        Vec<qwen35::Qwen35Weights>,
+        Vec<llama::KvCache>,
+        Vec<qwen35::DeltaNetState>,
+        Vec<qwen35::Qwen35Scratch>,
+        Vec<rdna_compute::GpuTensor>,
+        Vec<qwen35::PrefillBatchScratch>,
+        Vec<rdna_compute::GpuTensor>,
+    ) {
         let gpus = self.gpus.take().expect("into_parts called twice");
         let weights = std::mem::take(&mut self.weights);
-        (gpus, weights)
+        let kv_caches = std::mem::take(&mut self.kv_caches);
+        let dn_states = std::mem::take(&mut self.dn_states);
+        let scratches = std::mem::take(&mut self.scratches);
+        let partials = std::mem::take(&mut self.partials);
+        let prefill_pbs = std::mem::take(&mut self.prefill_pbs);
+        let prefill_partials = std::mem::take(&mut self.prefill_partials);
+        (
+            gpus,
+            weights,
+            kv_caches,
+            dn_states,
+            scratches,
+            partials,
+            prefill_pbs,
+            prefill_partials,
+        )
     }
 }
 
@@ -2850,6 +2911,42 @@ impl Drop for Qwen35EpStaging {
             "[loader] EP qwen35 load failed — freeing {} partially-loaded rank(s) (no VRAM leak)",
             self.weights.len()
         );
+        for (r, s) in self.scratches.drain(..).enumerate() {
+            if let Some(dev) = gpus.devices.get_mut(r) {
+                let _ = dev.bind_thread();
+                let _ = s.free_gpu(dev);
+            }
+        }
+        for (r, s) in self.dn_states.drain(..).enumerate() {
+            if let Some(dev) = gpus.devices.get_mut(r) {
+                let _ = dev.bind_thread();
+                s.free_gpu(dev);
+            }
+        }
+        for (r, kv) in self.kv_caches.drain(..).enumerate() {
+            if let Some(dev) = gpus.devices.get_mut(r) {
+                let _ = dev.bind_thread();
+                let _ = kv.free_gpu(dev);
+            }
+        }
+        for (r, p) in self.partials.drain(..).enumerate() {
+            if let Some(dev) = gpus.devices.get_mut(r) {
+                let _ = dev.bind_thread();
+                let _ = dev.free_tensor(p);
+            }
+        }
+        for (r, pbs) in self.prefill_pbs.drain(..).enumerate() {
+            if let Some(dev) = gpus.devices.get_mut(r) {
+                let _ = dev.bind_thread();
+                let _ = pbs.free_gpu(dev);
+            }
+        }
+        for (r, p) in self.prefill_partials.drain(..).enumerate() {
+            if let Some(dev) = gpus.devices.get_mut(r) {
+                let _ = dev.bind_thread();
+                let _ = dev.free_tensor(p);
+            }
+        }
         for (r, w) in self.weights.drain(..).enumerate() {
             if let Some(dev) = gpus.devices.get_mut(r) {
                 let _ = dev.bind_thread();
@@ -2954,21 +3051,34 @@ impl Drop for Qwen35DenseTpStaging {
     }
 }
 
-/// Admission refusal for Qwen3.5-MoE under expert-parallel load (#683 family).
-/// Pure so the contract is unit-testable: any Qwen3.5 config with routed
-/// experts (`num_experts > 0`, i.e. arch 6 and any mis-stamped arch 5) has no
-/// EP serve path — `generate_ep` routes arch 6 at the dense-TP server, which
-/// only accepts `EpArch::Qwen35DenseTp`. Refuse here, before `Gpus::init_tp`
-/// and the per-rank weight upload, instead of after a full 4-rank load.
-/// Dense Qwen3.5 (`num_experts == 0`) is unaffected and keeps its EP path.
-pub fn qwen35_ep_moe_refusal(arch_id: u32, num_experts: usize) -> Option<String> {
-    if num_experts > 0 {
-        Some(format!(
-            "Qwen3.5-MoE (arch_id={arch_id}) has no EP serve path; use TP or single-GPU"
-        ))
-    } else {
-        None
+/// Supported-topology validation for Qwen3.5-MoE under expert-parallel load.
+/// Pure so the contract is unit-testable. Sequential EP serves tp=2|4 where
+/// the sealed per-rank loader admits: the rank count must divide `num_experts`
+/// (else `ShardConfig` cannot build the Stride map and `forward_ep` has no
+/// owner for every expert). Dense Qwen3.5 (`num_experts == 0`) is unaffected
+/// and keeps its dense-TP path. Refuse here, before `Gpus::init_ep` and the
+/// per-rank weight upload, instead of after a full multi-rank load — the same
+/// predicate gates both admission (before teardown) and load (backstop), so
+/// the text cannot drift between the two.
+pub fn qwen35_ep_moe_topology_refusal(
+    arch_id: u32,
+    num_experts: usize,
+    tp: usize,
+) -> Option<String> {
+    if num_experts == 0 {
+        return None;
     }
+    if tp != 2 && tp != 4 {
+        return Some(format!(
+            "Qwen3.5-MoE (arch_id={arch_id}) EP supports tp=2|4, got tp={tp}"
+        ));
+    }
+    if num_experts % tp != 0 {
+        return Some(format!(
+            "Qwen3.5-MoE (arch_id={arch_id}) EP tp={tp} does not divide num_experts={num_experts}"
+        ));
+    }
+    None
 }
 
 /// Message constructor shared by [`ep_admission`] and the per-entry match
@@ -3542,18 +3652,34 @@ fn load_model_ep_qwen35(
         drop(hfq_probe);
         return load_model_tp_qwen35_dense(path, max_seq, tp, kv_mode, state_quant);
     }
-    // MoE EP: keep existing behavior; dense-only selectors are handled above. Silence unused.
-    let _ = (kv_mode, kv_backend, state_quant);
-    // Admission (#683): MoE has no EP serve path — refuse before `Gpus::init_tp`
+    // Supported-topology gate (mirrors admission): refuse before `Gpus::init_ep`
     // (first device init) and the per-rank weight upload, not after a full load.
-    if let Some(reason) = qwen35_ep_moe_refusal(hfq_probe.arch_id, config.num_experts) {
+    if let Some(reason) = qwen35_ep_moe_topology_refusal(hfq_probe.arch_id, config.num_experts, tp)
+    {
         return Err(reason);
     }
-    if tp != 4 {
-        return Err(format!(
-            "EP qwen35 MoE requires tp=4, got tp={tp} (only 4×gfx1201 expert-parallel is supported)"
-        ));
-    }
+    // Resolve the per-rank decode selectors before any GPU allocation, mirroring
+    // the dense-TP path: Qwen KV policy (contiguous only; admission already
+    // refused VMM for 5|6) and the canonical state-quant parser. Explicit
+    // unsupported selectors fail here, before `init_ep`.
+    let state_quant_resolved = parse_state_quant(state_quant)?;
+    let kv_raw = kv_mode.unwrap_or("");
+    let kv_trim = kv_raw.trim();
+    let kv_lower = kv_trim.to_ascii_lowercase();
+    let kv_mode_resolved = if kv_lower.is_empty() {
+        kv_mode::resolve("", &kv_mode::QWEN35_HFQ_POLICY).mode
+    } else {
+        let rr = kv_mode::resolve(&kv_lower, &kv_mode::QWEN35_HFQ_POLICY);
+        if rr.warning.is_some() {
+            return Err(format!(
+                "unsupported kv_mode '{kv_trim}' (expected q8|asym2|asym3|asym4|fwht2|fwht3|fwht4)"
+            ));
+        }
+        rr.mode
+    };
+    // `kv_backend` is admission-only for MoE EP: VMM is refused there (no EP
+    // VMM path), so the per-rank caches below are always Contiguous.
+    let _ = kv_backend;
     if config.paged_experts {
         return Err("EP qwen35: paged_experts must be false".to_string());
     }
@@ -3585,7 +3711,7 @@ fn load_model_ep_qwen35(
     for (idx, dev) in gpus.devices.iter().enumerate() {
         if !dev.arch_caps.is_gfx1201() {
             return Err(format!(
-                "EP qwen35 requires all 4×gfx1201, rank {idx} is {}",
+                "EP qwen35 requires all {tp}×gfx1201, rank {idx} is {}",
                 dev.arch.as_str()
             ));
         }
@@ -3598,14 +3724,31 @@ fn load_model_ep_qwen35(
     let fail_rank = ep_fail_rank();
     let _ = fail_rank;
     let mut staging = Qwen35EpStaging::new(gpus);
+    // The sealed loader needs the same mesh + physical topology the runtime
+    // holds: clone both up front so each rank load agrees with `init_ep`.
+    let ep_mesh = staging.gpus_mut().mesh.clone();
+    let ep_physical_devices: Vec<i32> = staging
+        .gpus_mut()
+        .devices
+        .iter()
+        .map(|dev| dev.device_id)
+        .collect();
     for r in 0..n {
         staging.gpus_mut().devices[r]
             .bind_thread()
             .map_err(|e| format!("bind {r}: {e:?}"))?;
         let mut h = HfqFile::open(Path::new(path)).map_err(|e| format!("reopen rank {r}: {e}"))?;
         let dev = &mut staging.gpus_mut().devices[r];
-        let w = qwen35::load_weights_ep_rank(&mut h, dev, &config, shard.clone(), r)
-            .map_err(|e| format!("shard load rank {r}: {e:?}"))?;
+        let w = qwen35::load_weights_ep_rank(
+            &mut h,
+            dev,
+            &config,
+            &ep_mesh,
+            &ep_physical_devices,
+            shard.clone(),
+            r,
+        )
+        .map_err(|e| format!("shard load rank {r}: {e:?}"))?;
         staging.weights.push(w);
         if fail_rank == Some(r) {
             return Err(format!(
@@ -3613,12 +3756,93 @@ fn load_model_ep_qwen35(
             ));
         }
     }
+    // Sequential decode state, one replica per rank: EP shards routed experts
+    // only, so KV/DeltaNet/scratch use the full (unsharded) config exactly as
+    // the sealed loader's replicated-KV contract requires. Staged into the
+    // guard, so a mid-loop failure frees every published rank via `Drop`.
+    let is_kv_layer: Vec<bool> = config
+        .layer_types
+        .iter()
+        .map(|t| *t == qwen35::LayerType::FullAttention)
+        .collect();
+    for r in 0..n {
+        staging.gpus_mut().devices[r]
+            .bind_thread()
+            .map_err(|e| format!("EP qwen35 state bind rank {r}: {e:?}"))?;
+        let dims = KvDims {
+            layers: KvLayers::Mask(is_kv_layer.clone()),
+            n_kv_heads: config.n_kv_heads,
+            head_dim: config.head_dim,
+            max_seq,
+            physical_cap: Some(max_seq),
+        };
+        let kv = <llama::KvCache as KvCacheExt>::from_mode_with_backend(
+            kv_mode_resolved,
+            KvBackend::Contiguous,
+            KvTarget::Single(&mut staging.gpus_mut().devices[r]),
+            &dims,
+        )
+        .map_err(|e| format!("EP qwen35 KV rank {r}: {e:?}"))?;
+        staging.kv_caches.push(kv);
+        let dn = qwen35::DeltaNetState::new_with_quant(
+            &mut staging.gpus_mut().devices[r],
+            &config,
+            state_quant_resolved,
+        )
+        .map_err(|e| format!("EP qwen35 DeltaNet rank {r}: {e:?}"))?;
+        staging.dn_states.push(dn);
+        let scratch = qwen35::Qwen35Scratch::new_with_kv_max(
+            &mut staging.gpus_mut().devices[r],
+            &config,
+            128,
+            max_seq,
+        )
+        .map_err(|e| format!("EP qwen35 scratch rank {r}: {e:?}"))?;
+        staging.scratches.push(scratch);
+        let partial = staging.gpus_mut().devices[r]
+            .zeros(&[config.dim], rdna_compute::DType::F32)
+            .map_err(|e| format!("EP qwen35 partial rank {r}: {e:?}"))?;
+        staging.partials.push(partial);
+    }
     hipfire_runtime::ep::ensure_rank_streams(staging.gpus_mut())
         .map_err(|e| format!("ensure_rank_streams: {e:?}"))?;
+    // Sequential prefill scratch, one full chunk per rank on its owning
+    // device: a `PrefillBatchScratch` with the DeltaNet S-tape omitted (plain
+    // prefill never reads `dn_s_tape`; `cap_gdn_tape = false`) plus a zeroed
+    // `[chunk*dim]` F32 routed partial. `chunk = min(max_seq, prefill_max_batch_ep())`
+    // matches the shared EP batch `prefill_chunk` policy (`HIPFIRE_PREFILL_MAX_BATCH`); serve windows are `<= chunk`.
+    // Staged in the guard so a mid-loop failure frees every published rank
+    // via `Drop`, and allocated BEFORE any `enable_peer_all` (ROCm cannot
+    // retroactively map late peer-visible allocs).
+    let prefill_chunk = max_seq.min(qwen35::prefill_max_batch_ep());
+    if prefill_chunk == 0 {
+        return Err("EP qwen35: max_seq must be nonzero for prefill scratch".to_string());
+    }
+    let prefill_partial_len = prefill_chunk
+        .checked_mul(config.dim)
+        .ok_or_else(|| "EP qwen35: prefill partial length overflow".to_string())?;
+    for r in 0..n {
+        staging.gpus_mut().devices[r]
+            .bind_thread()
+            .map_err(|e| format!("EP qwen35 prefill bind rank {r}: {e:?}"))?;
+        let pbs = qwen35::PrefillBatchScratch::new_opt(
+            &mut staging.gpus_mut().devices[r],
+            &config,
+            prefill_chunk,
+            false,
+        )
+        .map_err(|e| format!("EP qwen35 prefill PBS rank {r}: {e:?}"))?;
+        staging.prefill_pbs.push(pbs);
+        let pre_partial = staging.gpus_mut().devices[r]
+            .zeros(&[prefill_partial_len], rdna_compute::DType::F32)
+            .map_err(|e| format!("EP qwen35 prefill partial rank {r}: {e:?}"))?;
+        staging.prefill_partials.push(pre_partial);
+    }
     eprintln!(
         "[loader] EP load complete: {n} ranks, peer access deferred until post-batch allocation"
     );
-    let (gpus, weights) = staging.into_parts();
+    let (gpus, weights, kv_caches, dn_states, scratches, partials, prefill_pbs, prefill_partials) =
+        staging.into_parts();
     let eos_tok: u32 = {
         let ids = tokenizer.encode("<|im_end|>");
         if ids.len() == 1 {
@@ -3633,7 +3857,13 @@ fn load_model_ep_qwen35(
             inner: EpArch::Qwen35 {
                 config,
                 weights,
+                kv_caches,
+                dn_states,
+                scratches,
+                partials,
                 batch: None,
+                prefill_pbs,
+                prefill_partials,
             },
         }),
         qwen35_eos_tok: eos_tok,
@@ -3901,12 +4131,77 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
                     }
                 }
             }
-            EpArch::Qwen35 { weights, batch, .. } => {
+            EpArch::Qwen35 {
+                weights,
+                kv_caches,
+                dn_states,
+                scratches,
+                partials,
+                batch,
+                prefill_pbs,
+                prefill_partials,
+                ..
+            } => {
+                // Quiesce every rank before any free: in-flight prefill/decode
+                // kernels must retire before their scratch is reclaimed
+                // (mirrors the bind+sync prologue of `free_gpu`).
+                for dev in gpus.devices.iter_mut() {
+                    let _ = dev.bind_thread();
+                    let _ = dev.hip.device_synchronize();
+                }
+                // Tear down captured HIP graphs before reclaiming any tensors they
+                // may still reference. Shared post-match invalidate stays for
+                // other EP arches and remains idempotent here.
+                for dev in gpus.devices.iter_mut() {
+                    let _ = dev.bind_thread();
+                    dev.invalidate_graph_state();
+                }
+
                 if let Some(b) = batch {
                     if let Err(e) = b.free_gpu(&mut gpus) {
                         if ep_first_err.is_none() {
                             ep_first_err = Some(e.to_string());
                         }
+                    }
+                }
+                for (r, pbs) in prefill_pbs.into_iter().enumerate() {
+                    if let Some(dev) = gpus.devices.get_mut(r) {
+                        let _ = dev.bind_thread();
+                        if let Err(e) = pbs.free_gpu(dev) {
+                            if ep_first_err.is_none() {
+                                ep_first_err =
+                                    Some(format!("unload qwen35 EP prefill PBS rank {r}: {e:?}"));
+                            }
+                        }
+                    }
+                }
+                for (r, p) in prefill_partials.into_iter().enumerate() {
+                    if let Some(dev) = gpus.devices.get_mut(r) {
+                        let _ = dev.bind_thread();
+                        let _ = dev.free_tensor(p);
+                    }
+                }
+                for (rank, scratch) in scratches.into_iter().enumerate() {
+                    if let Some(dev) = gpus.devices.get_mut(rank) {
+                        let _ = dev.bind_thread();
+                        if let Err(e) = scratch.free_gpu(dev) {
+                            if ep_first_err.is_none() {
+                                ep_first_err =
+                                    Some(format!("unload qwen35 EP scratch rank {rank}: {e:?}"));
+                            }
+                        }
+                    }
+                }
+                for (rank, state) in dn_states.into_iter().enumerate() {
+                    if let Some(dev) = gpus.devices.get_mut(rank) {
+                        let _ = dev.bind_thread();
+                        state.free_gpu(dev);
+                    }
+                }
+                for (rank, kv) in kv_caches.into_iter().enumerate() {
+                    if let Some(dev) = gpus.devices.get_mut(rank) {
+                        let _ = dev.bind_thread();
+                        let _ = kv.free_gpu(dev);
                     }
                 }
                 for (r, w) in weights.into_iter().enumerate() {
@@ -3915,6 +4210,12 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
                         w.free_gpu(dev);
                     } else if ep_first_err.is_none() {
                         ep_first_err = Some(format!("unload qwen35: missing device for rank {r}"));
+                    }
+                }
+                for (r, p) in partials.into_iter().enumerate() {
+                    if let Some(dev) = gpus.devices.get_mut(r) {
+                        let _ = dev.bind_thread();
+                        let _ = dev.free_tensor(p);
                     }
                 }
             }
@@ -4088,21 +4389,29 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
 
 #[cfg(test)]
 mod ep_admission_tests {
-    use super::{ep_admission, qwen35_ep_moe_refusal};
+    use super::{admission, ep_admission, qwen35_ep_moe_topology_refusal};
+    use hipfire_runtime::hfq::{write_hfqm_package_mem, HfqMemTensor};
+    use std::path::{Path, PathBuf};
 
     #[test]
-    fn qwen35_moe_ep_refuses_before_load_but_dense_admits() {
-        // Arch 6 MoE under EP: refused with the combination named.
-        let err =
-            qwen35_ep_moe_refusal(6, 128).expect("arch-6 MoE + EP must be refused at admission");
+    fn qwen35_moe_ep_topology_gate_admits_2_and_4_where_sealed_loader_can() {
+        // Supported: tp=2|4 dividing the expert count (arch 6 and mis-stamped 5).
+        assert_eq!(qwen35_ep_moe_topology_refusal(6, 128, 2), None);
+        assert_eq!(qwen35_ep_moe_topology_refusal(6, 128, 4), None);
+        assert_eq!(qwen35_ep_moe_topology_refusal(5, 128, 4), None);
+        // Adjacent supported: dense Qwen3.5 (either arch id) keeps its EP path
+        // at any degree — the dense branch never reaches this gate.
+        assert_eq!(qwen35_ep_moe_topology_refusal(5, 0, 4), None);
+        assert_eq!(qwen35_ep_moe_topology_refusal(6, 0, 3), None);
+        // Unsupported degree refuses naming the supported set.
+        let err = qwen35_ep_moe_topology_refusal(6, 128, 3).expect("tp=3 MoE EP must refuse");
         assert!(err.contains("Qwen3.5-MoE"), "reason names the model: {err}");
-        assert!(err.contains("no EP serve path"), "reason: {err}");
+        assert!(err.contains("tp=2|4"), "reason names the set: {err}");
         assert!(err.contains('6'), "reason names the arch: {err}");
-        // Mis-stamped arch 5 with routed experts: same missing serve path.
-        assert!(qwen35_ep_moe_refusal(5, 128).is_some());
-        // Adjacent supported: dense Qwen3.5 (either arch id) keeps its EP path.
-        assert_eq!(qwen35_ep_moe_refusal(5, 0), None);
-        assert_eq!(qwen35_ep_moe_refusal(6, 0), None);
+        // Indivisible expert count refuses naming both sides.
+        let err = qwen35_ep_moe_topology_refusal(6, 6, 4).expect("indivisible experts must refuse");
+        assert!(err.contains("num_experts=6"), "reason: {err}");
+        assert!(err.contains("tp=4"), "reason: {err}");
     }
 
     #[test]
@@ -4123,6 +4432,121 @@ mod ep_admission_tests {
         for arch in [5u32, 6, 9, 10] {
             assert!(ep_admission(arch).is_ok(), "arch {arch} + EP must admit");
         }
+    }
+
+    /// Tiny consumer-facing load owner used to exercise the admission boundary:
+    /// a successful candidate would tear down and replace the active model, while
+    /// a refusal must leave its identity and observable response untouched.
+    #[derive(Debug, PartialEq, Eq)]
+    struct ActiveModel {
+        identity: &'static str,
+        response: Vec<u8>,
+    }
+
+    impl ActiveModel {
+        fn request(&self) -> Vec<u8> {
+            self.response.clone()
+        }
+    }
+
+    #[derive(Debug, Default, PartialEq, Eq)]
+    struct LoadEffects {
+        teardowns: usize,
+        allocations: usize,
+        publications: usize,
+    }
+
+    fn qwen35_moe_fixture() -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "hipfire-loader-qwen35-moe-admission-{}.hfq",
+            std::process::id()
+        ));
+        let metadata = serde_json::json!({
+            "config": {
+                "hidden_size": 4,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 1,
+                "vocab_size": 8,
+                "num_experts": 4,
+                "num_experts_per_tok": 1,
+                "moe_intermediate_size": 2,
+                "shared_expert_intermediate_size": 2
+            }
+        })
+        .to_string();
+        write_hfqm_package_mem(
+            &path,
+            6,
+            &metadata,
+            &[HfqMemTensor {
+                name: "model.embed_tokens.weight".into(),
+                quant_type: 1,
+                shape: vec![8, 4],
+                group_size: 0,
+                data: vec![0; 32],
+            }],
+        )
+        .expect("write qwen35 MoE admission fixture");
+        path
+    }
+
+    /// Mirror the daemon's source-admission boundary without touching a GPU:
+    /// destructive effects are reachable only after `admit_source` succeeds.
+    /// `tp` is threaded so the unsupported-degree refusal is exercised through
+    /// the same entry the daemon uses.
+    fn attempt_candidate_swap(
+        candidate: &Path,
+        tp: usize,
+        active: &mut ActiveModel,
+        effects: &mut LoadEffects,
+    ) -> Result<(), String> {
+        let admitted = admission::admit_source(
+            candidate.to_str().expect("fixture path is UTF-8"),
+            tp,
+            1,
+            None,
+            None,
+            "gfx1201",
+            None,
+            None,
+            4096,
+        )?;
+
+        // These represent the externally observable transaction stages in the
+        // daemon: prior-model teardown, candidate allocation, publication.
+        effects.teardowns += 1;
+        active.response.clear();
+        effects.allocations += 1;
+        effects.publications += 1;
+        drop(admitted);
+        Ok(())
+    }
+
+    /// An unsupported EP degree for a routed Qwen3.5 candidate is refused
+    /// before teardown while an earlier model is active. No
+    /// teardown/allocation/publication occurs, and the active model remains
+    /// identifiable and usable. The exact refusal text is pinned by the pure
+    /// `qwen35_ep_moe_topology_refusal` test above; here only the boundary
+    /// matters (on GPU boxes the device-count gate may fire first, which is
+    /// equally before-teardown).
+    #[test]
+    fn qwen35_moe_ep_unsupported_degree_preserves_active_model() {
+        let candidate = qwen35_moe_fixture();
+        let mut active = ActiveModel {
+            identity: "qwen3.6:27b-a3b-active",
+            response: b"active-model-response".to_vec(),
+        };
+        let before_identity = active.identity;
+        let before_response = active.request();
+        let mut effects = LoadEffects::default();
+
+        attempt_candidate_swap(&candidate, 3, &mut active, &mut effects)
+            .expect_err("Qwen3.5 MoE EP tp=3 candidate must refuse before teardown");
+        assert_eq!(effects, LoadEffects::default());
+        assert_eq!(active.identity, before_identity);
+        assert_eq!(active.request(), before_response);
+
+        let _ = std::fs::remove_file(candidate);
     }
 }
 

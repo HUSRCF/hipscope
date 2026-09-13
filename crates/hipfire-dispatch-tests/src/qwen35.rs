@@ -130,7 +130,7 @@ fn qwen35_moe_mq3_refused_at_load_time() {
 
 use hipfire_dispatch::families::moe::{MoeDtypes, MoeResolution};
 
-fn mq4_dtypes() -> MoeDtypes {
+fn mq4_dtypes() -> MoeDtypes<'static> {
     MoeDtypes {
         router: DType::MQ4G256,
         shared_gate: DType::MQ4G256,

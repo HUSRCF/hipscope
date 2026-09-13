@@ -21,7 +21,6 @@ use super::forward::moe_ffn_has_mq3_experts_uniform;
 use super::forward::moe_ffn_has_mq3_structural;
 use super::forward::moe_ffn_has_unsupported_mq3_experts_uniform;
 use super::forward::Qwen35Scratch;
-use super::weights::per_expert_tier_tables;
 use super::weights::DeltaNetLayerWeights;
 use super::weights::DeltaNetMoeLayerWeights;
 use super::weights::DeltaNetState;
@@ -443,6 +442,14 @@ pub fn prefill_max_batch_tp(gpu: &Gpu, tp: usize) -> usize {
     base.saturating_mul(tp.max(1)).min(PREFILL_TP_BATCH_CAP)
 }
 
+/// Prefill chunk ceiling for EP sequential load/serve staging.
+///
+/// Honors explicit `HIPFIRE_PREFILL_MAX_BATCH` when set (`>= MIN_BATCH`);
+/// otherwise the EP shared default of 512 (not arch-scaled TP compensation).
+pub fn prefill_max_batch_ep() -> usize {
+    explicit_prefill_max_batch().unwrap_or(512)
+}
+
 /// Effective per-chunk capacity for one prefill call.
 ///
 /// Never form a chunk larger than the configured/capped max, the PBS
@@ -771,6 +778,8 @@ pub fn forward_prefill_batch_single_chunk_captured_opts(
     // which routes max_ctx_len > 8192 to the tiled attention_flash_q8_0_tile_batched
     // (O(1) LDS, no per-position malloc). The former physical_cap > 15000 guard
     // predated that crossover (landed 2026-06-09) and is now obsolete.
+    #[cfg(feature = "moe-oracle")]
+    crate::qwen35::oracle::set_prefill_start(start_pos).map_err(|e| HipError::new(0, &e))?;
     forward_prefill_chunk(
         gpu,
         weights,
@@ -1330,6 +1339,9 @@ fn forward_prefill_batch_with_pbs_opts_inner(
                     n,
                 );
             }
+            #[cfg(feature = "moe-oracle")]
+            crate::qwen35::oracle::set_prefill_start(start_pos + chunk_start)
+                .map_err(|e| hip_bridge::HipError::new(0, &e))?;
             forward_prefill_chunk(
                 gpu,
                 weights,
@@ -2926,6 +2938,41 @@ pub(crate) fn prefill_moe_ffn_body_batched(
     // redirected. `None` = byte-identical single-GPU behavior.
     routed_out: Option<&GpuTensor>,
 ) -> HipResult<()> {
+    // Historical entry point: replicated local routing (Single seal path).
+    // Byte-identical to before; the slot-aware forward_slots.rs callers and
+    // all single-GPU paths keep calling this unchanged.
+    prefill_moe_ffn_body_batched_with_route(
+        gpu,
+        ffn,
+        ffn_norm,
+        config,
+        pbs,
+        n,
+        ctx,
+        model_has_mq6_moe,
+        routed_out,
+        PrefillRouteMode::Replicated,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prefill_moe_ffn_body_batched_with_route(
+    gpu: &mut Gpu,
+    ffn: &MoeFfnWeights,
+    ffn_norm: &GpuTensor,
+    config: &Qwen35Config,
+    pbs: &PrefillBatchScratch,
+    n: usize,
+    ctx: &DispatchCtx,
+    model_has_mq6_moe: bool,
+    // EP (Ship 6 substrate-EP prefill): when `Some`, the routed combine writes
+    // into this zeroed `[n × dim]` partial instead of `pbs.x_batch` (the EP
+    // driver all-reduce-sums it across ranks and adds into x_batch). The shared
+    // expert (step 5) stays in `pbs.x_batch` — replicated per rank, not
+    // redirected. `None` = byte-identical single-GPU behavior.
+    routed_out: Option<&GpuTensor>,
+    route: PrefillRouteMode<'_>,
+) -> HipResult<()> {
     let dim = config.dim;
     let mi = config.moe_intermediate_size;
     let smi = config.shared_expert_intermediate_size;
@@ -2943,7 +2990,167 @@ pub(crate) fn prefill_moe_ffn_body_batched(
     let up_batch = pbs.moe_up_batch.as_ref().expect("moe scratch");
     let rot_batch = pbs.moe_rot_batch.as_ref().expect("moe scratch");
     let down_expanded = pbs.moe_down_expanded_batch.as_ref().expect("moe scratch");
+    // ── 0. Preflight: bind, build params, seal, adopt — before any launch ──
+    //
+    // Actual (not static-metadata) validation BEFORE any GPU mutation. The
+    // seal checks the live binding, the preexisting PBS tensor descriptors,
+    // the zeroed routed partial, and (on non-root ranks) the root proof —
+    // all pure, launching nothing. Sealing needs only descriptors, never
+    // contents, so it may run before norm/rotate/shared/router produce any.
+    // Mode resolution is the historical seal-site rule: Single bindings
+    // ignore the band mode; compact bindings follow it, with legacy
+    // `Replicated` keeping today's fail-closed sealer error — only earlier.
+    // The root route is still produced (and its receipt attached) after the
+    // router kernels at step 6, before the experts execute; the producer
+    // proof still only exports from that actual produced+attached receipt,
+    // never fabricated. No re-sealing: the late block reuses this seal.
+    let bound = ffn.bound_experts()?;
+    let single = bound.rank_count() == 1;
+    let produce_root = matches!(route, PrefillRouteMode::ProduceRoot { .. }) && !single;
+    let adopt_root = matches!(route, PrefillRouteMode::AdoptRoot { .. }) && !single;
+    // Non-root EP ranks skip the router GEMM + softmax/topk + produce below:
+    // their route arrays already hold the root's D2D-copied bytes. The
+    // shared-expert GEMMs still run (shared stays replicated per rank).
+    let skip_router_produce = adopt_root;
+    let down_m = ffn.experts[0].down.m;
+    let down_k = ffn.experts[0].down.k;
+    let gate_up_k = ffn.experts[0].gate_up.k;
+    let total_slots = n * k_top;
+    let m_total_max = moe_grouped_m_total_bound(total_slots, n_exp);
+    // The load-time owner caches only genuinely mixed tier arrays. Borrowing
+    // these slices keeps prefill allocation-free and preserves uniform None.
+    let (per_expert_gate_up, per_expert_down) = ffn.per_expert_tier_tables();
+    let moe_dtypes = hipfire_dispatch::families::moe::MoeDtypes {
+        router: ffn.router.gpu_dtype,
+        shared_gate: ffn.shared_expert_gate.gpu_dtype,
+        shared_expert_gate: ffn.shared_expert.gate.gpu_dtype,
+        shared_expert_up: ffn.shared_expert.up.gpu_dtype,
+        shared_expert_down: ffn.shared_expert.down.gpu_dtype,
+        experts_all_gate_up_mq4: if let Some(global) = ffn.global_expert_dtypes.as_ref() {
+            global
+                .iter()
+                .all(|(g, _)| matches!(*g, DType::MQ4G256 | DType::MQ4G256V2))
+        } else {
+            ffn.experts
+                .iter()
+                .all(|e| matches!(e.gate_up.gpu_dtype, DType::MQ4G256 | DType::MQ4G256V2))
+        },
+        routed_gate_up: if let Some(global) = ffn.global_expert_dtypes.as_ref() {
+            global[0].0
+        } else {
+            ffn.experts[0].gate_up.gpu_dtype
+        },
+        routed_down: if let Some(global) = ffn.global_expert_dtypes.as_ref() {
+            global[0].1
+        } else {
+            ffn.experts[0].down.gpu_dtype
+        },
+        // The cached mixed-only tier slices are the source of truth for both
+        // projections; borrowing their presence avoids any per-call scan.
+        routed_has_mixed_experts: per_expert_gate_up.is_some() || per_expert_down.is_some(),
+        has_paro_shared: ffn.paro_shared.is_some(),
+        per_expert_gate_up,
+        per_expert_down,
+    };
+    let paro_gate_up =
+        ffn.paro_shared
+            .as_ref()
+            .map(|paro| hipfire_dispatch::families::gemv::GivensRef {
+                pairs: &paro.gate_up_pairs,
+                theta: &paro.gate_up_theta,
+                scales: &paro.gate_up_channel_scales,
+                krot: paro.krot as usize,
+            });
+    let paro_down =
+        ffn.paro_shared
+            .as_ref()
+            .map(|paro| hipfire_dispatch::families::gemv::GivensRef {
+                pairs: &paro.down_pairs,
+                theta: &paro.down_theta,
+                scales: &paro.down_channel_scales,
+                krot: paro.krot as usize,
+            });
+    // Route A MoE-AWQ: the per-expert indexed table (built at load) supersedes
+    // the Ship 4.2 single-scale `down_awq_scale` stub for routed experts — that
+    // stub applied experts[0]'s scale to every routed slot, which is wrong once
+    // experts actually carry per-expert AWQ. Pass `None` for the single scale;
+    // `expert_down_awq_ptrs` drives the correct per-slot path in run_moe_prefill.
+    let down_awq_scale: Option<&GpuTensor> = None;
+    let moe_prefill_params = hipfire_dispatch::families::moe::MoePrefillParams {
+        dtypes: moe_dtypes,
+        batch_size: n,
+        mi,
+        down_m,
+        down_k,
+        gate_up_k,
+        k_top,
+        n_exp,
+        m_total_max,
+        force_mq4_grouped_fp16: model_has_mq6_moe
+            && gpu.arch_caps.is_gfx1151()
+            && gpu.flags.moe_grouped_i8.is_none(),
+        topk_indices,
+        topk_weights,
+        x_batch: &pbs.x_batch,
+        x_norm_batch: &pbs.x_norm_batch,
+        x_rot_batch: &pbs.x_rot_batch,
+        expert_gate_up_ptrs: &ffn.expert_gate_up_ptrs,
+        expert_down_ptrs: &ffn.expert_down_ptrs,
+        routed_experts: ffn,
+        expert_down_awq_ptrs: ffn.expert_down_awq_ptrs.as_ref(),
+        expert_dtype_tags: ffn.expert_dtype_tags.as_ref(),
+        gate_batch,
+        up_batch,
+        rot_batch,
+        down_expanded,
+        expert_token_counts: pbs.moe_expert_token_counts.as_ref().expect("moe scratch"),
+        expert_offsets: pbs.moe_expert_offsets.as_ref().expect("moe scratch"),
+        sorted_slot_index: pbs.moe_sorted_slot_index.as_ref().expect("moe scratch"),
+        expert_tile_ids: pbs.moe_expert_tile_ids.as_ref().expect("moe scratch"),
+        inverse_perm: pbs.moe_inverse_perm.as_ref().expect("moe scratch"),
+        y_gate_up_grouped: pbs.moe_y_gate_up_grouped.as_ref().expect("moe scratch"),
+        y_down_grouped: pbs.moe_y_down_grouped.as_ref().expect("moe scratch"),
+        paro_gate_up,
+        paro_down,
+        down_awq_scale,
+        routed_out,
+    };
+    let mut sealed = if adopt_root {
+        // Non-root EP rank: seal compact, adopt the root proof (launches
+        // nothing — the receipt binds this call's own invocation over this
+        // rank's own topk buffers), attach now so a proof mismatch rejects
+        // before this rank mutates anything.
+        let proof = match route {
+            PrefillRouteMode::AdoptRoot { proof } => proof,
+            _ => unreachable!("adopt_root without AdoptRoot mode"),
+        };
+        let mut sealed =
+            hipfire_dispatch::pipeline::sealed_moe::seal_prefill_ep(bound, ctx, moe_prefill_params)
+                .map_err(HipError::from)?;
+        let receipt = hipfire_dispatch::pipeline::sealed_moe::adopt_prefill_route(&sealed, proof)
+            .map_err(HipError::from)?;
+        sealed
+            .attach_route_receipt(receipt)
+            .map_err(HipError::from)?;
+        sealed
+    } else if produce_root {
+        hipfire_dispatch::pipeline::sealed_moe::seal_prefill_ep(bound, ctx, moe_prefill_params)
+            .map_err(HipError::from)?
+    } else {
+        hipfire_dispatch::pipeline::sealed_moe::seal_prefill(bound, ctx, moe_prefill_params)
+            .map_err(HipError::from)?
+    };
 
+    #[cfg(feature = "moe-oracle")]
+    crate::qwen35::oracle::prefill_before(
+        gpu,
+        ffn,
+        config,
+        &pbs.x_batch,
+        n,
+        crate::qwen35::oracle::prefill_start().map_err(|e| hip_bridge::HipError::new(0, &e))?,
+    )
+    .map_err(|e| hip_bridge::HipError::new(0, &e))?;
     // ── 1. Split rmsnorm vs FWHT rotate ──
     //
     // A3B (and every other MoE here) leaves router + shared_expert_gate
@@ -3003,7 +3210,11 @@ pub(crate) fn prefill_moe_ffn_body_batched(
     // byte-for-byte. The x input still differs per dtype (Q8/F32 read
     // x_norm_batch; MQ4 reads x_rot_batch), exactly as before. The three keys
     // are registered ArchPredicate::Always, so run_key never rejects.
-    {
+    // Non-root EP ranks skip the router GEMM (and the logits dump below):
+    // their route arrays already hold the root's D2D-copied bytes. The
+    // shared-expert-gate GEMM after the dump still runs (shared stays
+    // replicated per rank).
+    if !skip_router_produce {
         use hipfire_dispatch::families::gemm::GemmParams;
         let ctx = DispatchCtx::new(gpu);
         let (key, x_in): (hipfire_dispatch::types::KernelKey, &GpuTensor) =
@@ -3047,9 +3258,9 @@ pub(crate) fn prefill_moe_ffn_body_batched(
         hipfire_runtime::llama::gemm_family()
             .run_key(key, &ctx, gpu, &params)
             .map_err(HipError::from)?;
+        // DIAG: dump MoE router logits (batched)
+        dump_hidden_localize(gpu, router_logits, n, 0, ffn.router.m, 0, "router_b");
     }
-    // DIAG: dump MoE router logits (batched)
-    dump_hidden_localize(gpu, router_logits, n, 0, ffn.router.m, 0, "router_b");
     // #397 Ship 5.2 slice1: route the shared-expert-gate GEMM through
     // GemmFamily::run_key. Same dtype-routed dispatcher-entry keys as the router
     // match above (Q8/F32 read x_norm_batch, MQ4 reads x_rot_batch) → identical
@@ -3267,28 +3478,6 @@ pub(crate) fn prefill_moe_ffn_body_batched(
         ),
     }
 
-    // ── 3. GPU softmax + top-K + renorm, batched over N tokens ──
-    //
-    // Same Path B split as the decode call site: split the fused
-    // softmax+topk+renorm into gpu.softmax_f32 + moe_topk_renorm_k8_batched
-    // so prefill activations match the CPU-reference softmax math
-    // exactly. router_logits is allocated 1D as [n × n_exp]; alias it
-    // into a 2D view so gpu.softmax_f32 takes rows = n.
-    let router_logits_2d = GpuTensor {
-        buf: unsafe { router_logits.buf.alias() },
-        shape: vec![n, n_exp],
-        dtype: DType::F32,
-    };
-    gpu.softmax_f32(&router_logits_2d)?;
-    gpu.moe_topk_renorm_k8_batched(
-        router_logits,
-        topk_indices,
-        topk_weights,
-        n_exp,
-        config.norm_topk_prob,
-        n,
-    )?;
-
     // ── 4. Shared-expert SwiGLU + FWHT, batched over N tokens ──
     //
     // fused_silu_mul_rotate_mq_batched expects [batch × k] gate/up with
@@ -3489,115 +3678,70 @@ pub(crate) fn prefill_moe_ffn_body_batched(
     }
 
     // ── 6. Routed experts: delegated to MoeFamily::run_prefill (Ship 4.2) ──
-    let down_m = ffn.experts[0].down.m;
-    let down_k = ffn.experts[0].down.k;
-    let gate_up_k = ffn.experts[0].gate_up.k;
-    let total_slots = n * k_top;
-    let m_total_max = moe_grouped_m_total_bound(total_slots, n_exp);
-
-    // SP2: per-expert tier tables for intra-layer mixed-tier dispatch (same
-    // semantics as the decode builder). Uniform layer ⇒ None ⇒ uniform fast
-    // path. This prefill site always has ≥1 expert (indexed [0] above).
-    let (per_expert_gate_up, per_expert_down) = per_expert_tier_tables(ffn);
-    let moe_dtypes = hipfire_dispatch::families::moe::MoeDtypes {
-        router: ffn.router.gpu_dtype,
-        shared_gate: ffn.shared_expert_gate.gpu_dtype,
-        shared_expert_gate: ffn.shared_expert.gate.gpu_dtype,
-        shared_expert_up: ffn.shared_expert.up.gpu_dtype,
-        shared_expert_down: ffn.shared_expert.down.gpu_dtype,
-        experts_all_gate_up_mq4: if let Some(global) = ffn.global_expert_dtypes.as_ref() {
-            global
-                .iter()
-                .all(|(g, _)| matches!(*g, DType::MQ4G256 | DType::MQ4G256V2))
-        } else {
-            ffn.experts
-                .iter()
-                .all(|e| matches!(e.gate_up.gpu_dtype, DType::MQ4G256 | DType::MQ4G256V2))
-        },
-        routed_gate_up: if let Some(global) = ffn.global_expert_dtypes.as_ref() {
-            global[0].0
-        } else {
-            ffn.experts[0].gate_up.gpu_dtype
-        },
-        routed_down: if let Some(global) = ffn.global_expert_dtypes.as_ref() {
-            global[0].1
-        } else {
-            ffn.experts[0].down.gpu_dtype
-        },
-        // Prefill never fires the merged decode kernel (decode-only), but the
-        // shared MoeDtypes struct still requires the flag; carry it honestly.
-        routed_has_mixed_experts: ffn.expert_dtype_tags.is_some(),
-        has_paro_shared: ffn.paro_shared.is_some(),
-        per_expert_gate_up,
-        per_expert_down,
-    };
-
-    let paro_gate_up =
-        ffn.paro_shared
+    //
+    // The call was sealed (and, on non-root ranks, adopted + attached) before
+    // the launches above; only the route production stays here because it
+    // must run after the router GEMM filled the score contents — still before
+    // the experts execute. No re-sealing: the preflight seal is reused.
+    if !adopt_root {
+        // The producer requires an exact [N × num_experts] score shape. Select
+        // the preallocated non-owning view for this chunk instead of constructing
+        // a shape Vec for every MoE layer.
+        let router_scores = pbs
+            .moe_router_score_views_batch
             .as_ref()
-            .map(|paro| hipfire_dispatch::families::gemv::GivensRef {
-                pairs: &paro.gate_up_pairs,
-                theta: &paro.gate_up_theta,
-                scales: &paro.gate_up_channel_scales,
-                krot: paro.krot as usize,
-            });
-    let paro_down =
-        ffn.paro_shared
-            .as_ref()
-            .map(|paro| hipfire_dispatch::families::gemv::GivensRef {
-                pairs: &paro.down_pairs,
-                theta: &paro.down_theta,
-                scales: &paro.down_channel_scales,
-                krot: paro.krot as usize,
-            });
-    // Route A MoE-AWQ: the per-expert indexed table (built at load) supersedes
-    // the Ship 4.2 single-scale `down_awq_scale` stub for routed experts — that
-    // stub applied experts[0]'s scale to every routed slot, which is wrong once
-    // experts actually carry per-expert AWQ. Pass `None` for the single scale;
-    // `expert_down_awq_ptrs` drives the correct per-slot path in run_moe_prefill.
-    let down_awq_scale: Option<&GpuTensor> = None;
-
-    let moe_prefill_params = hipfire_dispatch::families::moe::MoePrefillParams {
-        dtypes: moe_dtypes,
-        batch_size: n,
-        mi,
-        down_m,
-        down_k,
-        gate_up_k,
-        k_top,
-        n_exp,
-        m_total_max,
-        force_mq4_grouped_fp16: model_has_mq6_moe
-            && gpu.arch_caps.is_gfx1151()
-            && gpu.flags.moe_grouped_i8.is_none(),
-        topk_indices,
-        topk_weights,
-        x_batch: &pbs.x_batch,
-        x_norm_batch: &pbs.x_norm_batch,
-        x_rot_batch: &pbs.x_rot_batch,
-        expert_gate_up_ptrs: &ffn.expert_gate_up_ptrs,
-        expert_down_ptrs: &ffn.expert_down_ptrs,
-        expert_down_awq_ptrs: ffn.expert_down_awq_ptrs.as_ref(),
-        expert_dtype_tags: ffn.expert_dtype_tags.as_ref(),
-        gate_batch,
-        up_batch,
-        rot_batch,
-        down_expanded,
-        expert_token_counts: pbs.moe_expert_token_counts.as_ref().expect("moe scratch"),
-        expert_offsets: pbs.moe_expert_offsets.as_ref().expect("moe scratch"),
-        sorted_slot_index: pbs.moe_sorted_slot_index.as_ref().expect("moe scratch"),
-        expert_tile_ids: pbs.moe_expert_tile_ids.as_ref().expect("moe scratch"),
-        inverse_perm: pbs.moe_inverse_perm.as_ref().expect("moe scratch"),
-        y_gate_up_grouped: pbs.moe_y_gate_up_grouped.as_ref().expect("moe scratch"),
-        y_down_grouped: pbs.moe_y_down_grouped.as_ref().expect("moe scratch"),
-        paro_gate_up,
-        paro_down,
-        down_awq_scale,
-        routed_out,
-    };
-    hipfire_runtime::llama::moe_family()
-        .run_prefill(ctx, gpu, &moe_prefill_params)
+            .and_then(|views| n.checked_sub(1).and_then(|index| views.get(index)))
+            .ok_or_else(|| HipError::new(0, "moe router score scratch view is unavailable"))?;
+        let receipt = hipfire_dispatch::pipeline::sealed_moe::produce_prefill_route(
+            &sealed,
+            gpu,
+            router_scores,
+            config.norm_topk_prob,
+        )
         .map_err(HipError::from)?;
+        sealed
+            .attach_route_receipt(receipt)
+            .map_err(HipError::from)?;
+        if produce_root {
+            // Publish the opaque producer proof through the band-carried slot.
+            // It is issued from this actual successful root-produced receipt
+            // (produced + attached + validated above), never fabricated.
+            let proof = sealed
+                .prefill_route_producer_proof()
+                .map_err(HipError::from)?;
+            match route {
+                PrefillRouteMode::ProduceRoot { slot } => slot.set(Some(proof)),
+                _ => unreachable!("produce_root without ProduceRoot mode"),
+            }
+        }
+    }
+    hipfire_dispatch::pipeline::execute_steps(
+        gpu,
+        ctx,
+        &[hipfire_dispatch::pipeline::Step::Moe(sealed)],
+    )
+    .map_err(HipError::from)?;
+    #[cfg(feature = "moe-oracle")]
+    {
+        let oracle_start =
+            crate::qwen35::oracle::prefill_start().map_err(|e| hip_bridge::HipError::new(0, &e))?;
+        crate::qwen35::oracle::prefill_after(
+            gpu,
+            ffn,
+            config,
+            &pbs.x_batch,
+            router_logits,
+            topk_indices,
+            topk_weights,
+            gate_batch,
+            up_batch,
+            rot_batch,
+            down_expanded,
+            n,
+            oracle_start,
+        )
+        .map_err(|e| hip_bridge::HipError::new(0, &e))?;
+    }
 
     Ok(())
 }
@@ -3626,6 +3770,39 @@ pub(crate) struct PrefillBandCtx<'a> {
     /// own copy of the rotation tables).
     pub givens_cos: Option<&'a GpuTensor>,
     pub givens_sin: Option<&'a GpuTensor>,
+    /// EP prefill route authority for single-layer MoE bands. `Replicated`
+    /// everywhere else (whole-stack and multi-layer bands, decode ticks, PP).
+    pub route: PrefillRouteMode<'a>,
+}
+
+/// EP prefill route authority for one single-layer MoE band execution.
+///
+/// Carried inside [`PrefillBandCtx`] so the per-layer band plumbing needs no
+/// new parameters, no heap allocation, and no signature churn for the
+/// single-GPU callers (which always use `Replicated`). All variants are
+/// `Copy` (shared borrows only).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum PrefillRouteMode<'a> {
+    /// Local/replicated routing: run router GEMM + softmax/topk + produce on
+    /// this rank. This is the historical single-GPU behavior, byte-identical.
+    Replicated,
+    /// EP root rank (rank 0): run router GEMM + produce locally, then publish
+    /// the opaque producer proof through `slot` — a caller-owned stack
+    /// [`std::cell::Cell`]. The cell gives write-through under the shared
+    /// `&PrefillBandCtx` borrow without heap allocation (the proof is
+    /// `Copy`); the driver reads it back after the call returns.
+    ProduceRoot {
+        slot: &'a std::cell::Cell<
+            Option<hipfire_dispatch::pipeline::sealed_moe::MoePrefillRouteProducerProof>,
+        >,
+    },
+    /// EP non-root rank: skip router GEMM + softmax/topk + produce entirely;
+    /// the driver D2D-copies the root's first `N*k` route entries into this
+    /// rank's PBS arrays first, then this mode adopts the root's proof
+    /// (launching nothing) and executes the grouped MoE over those bytes.
+    AdoptRoot {
+        proof: &'a hipfire_dispatch::pipeline::sealed_moe::MoePrefillRouteProducerProof,
+    },
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6515,6 +6692,7 @@ fn batch_chunk_delta_net_moe(
     ctx: &DispatchCtx,
     weights: &Qwen35Weights,
     routed_out: Option<&GpuTensor>,
+    route: PrefillRouteMode<'_>,
 ) -> HipResult<()> {
     // Batched MoE LA layer. LA body is the same as DeltaNet
     // (rmsnorm + qkvza + sigmoid_alpha + conv1d + L2norm +
@@ -7244,7 +7422,7 @@ fn batch_chunk_delta_net_moe(
     // silu_mul + w_down) block. Takes pbs.x_batch as input AND
     // accumulates the FFN output residual back into it via the
     // batched indexed down kernel's atomicAdd path.
-    prefill_moe_ffn_body_batched(
+    prefill_moe_ffn_body_batched_with_route(
         gpu,
         &layer.ffn,
         &layer.ffn_norm,
@@ -7254,6 +7432,7 @@ fn batch_chunk_delta_net_moe(
         &ctx,
         weights.moe_has_mq6,
         routed_out,
+        route,
     )?;
 
     Ok(())
@@ -7281,6 +7460,7 @@ fn batch_chunk_full_attn_moe(
     layer_idx: usize,
     routed_out: Option<&GpuTensor>,
     weights: &Qwen35Weights,
+    route: PrefillRouteMode<'_>,
 ) -> HipResult<()> {
     // Batched MoE FA layer. FA body is the same as FullAttn
     // (rmsnorm + qkv + deinterleave + q/k norm + RoPE +
@@ -7760,7 +7940,7 @@ fn batch_chunk_full_attn_moe(
     }
 
     // Batched MoE FFN.
-    prefill_moe_ffn_body_batched(
+    prefill_moe_ffn_body_batched_with_route(
         gpu,
         &layer.ffn,
         &layer.ffn_norm,
@@ -7770,6 +7950,7 @@ fn batch_chunk_full_attn_moe(
         &ctx,
         weights.moe_has_mq6,
         routed_out,
+        route,
     )?;
 
     Ok(())
@@ -7923,6 +8104,12 @@ pub(crate) fn forward_batch_chunk_impl(
         .unwrap_or(config.n_layers)
         .min(max_layer.unwrap_or(usize::MAX));
     let do_lm_head = band.map(|b| b.is_last_band).unwrap_or(true) && max_layer.is_none();
+    // EP prefill route authority for single-layer MoE bands. `None` (whole
+    // stack) and every non-EP caller resolve to `Replicated`: the historical
+    // seal_prefill + local produce path, unchanged.
+    let route = band
+        .map(|b| b.route)
+        .unwrap_or(PrefillRouteMode::Replicated);
     macro_rules! givens_cos_view {
         () => {
             band.and_then(|b| b.givens_cos)
@@ -8148,6 +8335,7 @@ pub(crate) fn forward_batch_chunk_impl(
                     &ctx,
                     weights,
                     routed_out,
+                    route,
                 )?;
                 if let Some(rb) = hidden_rb {
                     if let Some(slot) = rb.extract_slot(layer_idx) {
@@ -8179,6 +8367,7 @@ pub(crate) fn forward_batch_chunk_impl(
                     layer_idx,
                     routed_out,
                     weights,
+                    route,
                 )?;
                 if let Some(rb) = hidden_rb {
                     if let Some(slot) = rb.extract_slot(layer_idx) {

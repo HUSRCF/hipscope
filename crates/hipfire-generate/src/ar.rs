@@ -740,7 +740,8 @@ pub fn truncate_checkpoints(
 ///
 /// Selected once at the top of [`generate`] and is the sole authority for
 /// dispatch branch choice and tools capability. Precedence matches production:
-/// EP → Qwen dense TP semantic AR / arch short-circuits (Qwen2, DeepSeek4, LFM,
+/// EP (Qwen 5|6 → QwenAr semantic AR over `generate_ep`, which refines MoE vs
+/// dense-TP by loaded `EpArch`) / arch short-circuits (Qwen2, DeepSeek4, LFM,
 /// Cohere, MiniMax, dots) → pp>1 → Qwen/LLaMA DFlash/spec (MTP uses the generic
 /// wrapper) → default AR/unknown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -5129,10 +5130,7 @@ pub fn generate(
                 }
             }
             let mut out_bytes = [0u8; 8];
-            if let Err(e) = gpu
-                .hip
-                .memcpy_dtoh(&mut out_bytes, &scratch.sample_buf.buf)
-            {
+            if let Err(e) = gpu.hip.memcpy_dtoh(&mut out_bytes, &scratch.sample_buf.buf) {
                 let _ = (config, weights, scratch, kv);
                 crate::dense::dense_fail_closed_error(
                     m,
@@ -5158,7 +5156,13 @@ pub fn generate(
         // as the dense family loops.
         if take_generation_fault_after_prefill() {
             let _ = (config, weights, scratch, kv);
-            crate::dense::dense_fail_closed_error(m, gpu, stdout, id, "injected fault after prefill");
+            crate::dense::dense_fail_closed_error(
+                m,
+                gpu,
+                stdout,
+                id,
+                "injected fault after prefill",
+            );
             return;
         }
         // Prefill ends here: prompt is processed AND first token is ready (D2H
@@ -5218,10 +5222,7 @@ pub fn generate(
                 ngram_scope_start_llama.max(m.conversation_tokens.len().saturating_sub(rw));
             let hist_slice = &m.conversation_tokens[scope_start..];
             let hist_bytes: Vec<u8> = hist_slice.iter().flat_map(|t| t.to_ne_bytes()).collect();
-            if let Err(e) = gpu
-                .hip
-                .memcpy_htod(&scratch.repeat_buf.buf, &hist_bytes)
-            {
+            if let Err(e) = gpu.hip.memcpy_htod(&scratch.repeat_buf.buf, &hist_bytes) {
                 let _ = (config, weights, scratch, kv);
                 crate::dense::dense_fail_closed_error(
                     m,
@@ -5280,7 +5281,13 @@ pub fn generate(
             // step's GPU/KV mutation. Same production fail-closed terminal.
             if generated == 1 && take_generation_fault_after_first_decode() {
                 let _ = (config, weights, scratch, kv);
-                crate::dense::dense_fail_closed_error(m, gpu, stdout, id, "injected fault after first decode");
+                crate::dense::dense_fail_closed_error(
+                    m,
+                    gpu,
+                    stdout,
+                    id,
+                    "injected fault after first decode",
+                );
                 return;
             }
             next_token = tok;

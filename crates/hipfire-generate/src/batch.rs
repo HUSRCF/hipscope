@@ -551,13 +551,15 @@ pub fn drive_qwen_continuous_batch(
                     format!("reset lane {idx} on abort: {e}"),
                 );
             }
-            let _scope = BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, admission);
+            let _scope =
+                BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, admission);
             crate::ar::emit_generation_cancel(route, stdout, &key.id, 0);
             let _ = sched.abort_lane(idx, &key, admission);
             producers[idx] = None;
         }
         for (idx, key, admission, pending_done) in to_commit {
-            let _scope = BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, admission);
+            let _scope =
+                BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, admission);
             // Transactional commit: reset GPU first, then host commit_lane,
             // and only then emit the staged done. Never done+error.
             let reset_ok = match batch_state.reset_lane(gpu, &config, idx) {
@@ -610,7 +612,8 @@ pub fn drive_qwen_continuous_batch(
             }
         }
         for (key, admission) in queued_abort {
-            let _scope = BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, admission);
+            let _scope =
+                BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, admission);
             crate::ar::emit_generation_cancel(route, stdout, &key.id, 0);
             let _ = sched.abort_queued(&key, admission);
         }
@@ -640,7 +643,8 @@ pub fn drive_qwen_continuous_batch(
                     format!("reset lane {idx} on running abort: {e}"),
                 );
             }
-            let _scope = BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, admission);
+            let _scope =
+                BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, admission);
             crate::ar::emit_generation_cancel(route, stdout, &key.id, 0);
             let _ = sched.abort_lane(idx, &key, admission);
             producers[idx] = None;
@@ -899,11 +903,8 @@ pub fn drive_qwen_continuous_batch(
                             continue;
                         }
                         {
-                            let _scope = BatchAttemptScope::enter_for_generation(
-                                &id,
-                                attempt_id,
-                                admission,
-                            );
+                            let _scope =
+                                BatchAttemptScope::enter_for_generation(&id, attempt_id, admission);
                             crate::ar::emit_generation_start(
                                 crate::ar::GenerationRoute::QwenAr,
                                 stdout,
@@ -1114,8 +1115,7 @@ pub fn drive_qwen_continuous_batch(
         let mut repeat_lengths: Vec<u32> = vec![0; batch_size];
         let mut rng_states: Vec<u32> = vec![0; batch_size];
         let mut survivors: Vec<usize> = Vec::new();
-        let mut to_await: Vec<(usize, AttemptKey, BatchGeneration, serde_json::Value)> =
-            Vec::new();
+        let mut to_await: Vec<(usize, AttemptKey, BatchGeneration, serde_json::Value)> = Vec::new();
         let mut to_abort_running: Vec<(usize, AttemptKey, BatchGeneration)> = Vec::new();
         for idx in running.clone() {
             let key = match sched.lanes[idx].key().cloned() {
@@ -1332,7 +1332,15 @@ pub fn drive_qwen_continuous_batch(
                     key.id
                 );
                 if let Err(e) = batch_state.reset_lane(gpu, &config, idx) {
-                    retire_lane_after_reset_failure(sched, stdout, &key, admission, idx, "mark_awaiting_commit", &e);
+                    retire_lane_after_reset_failure(
+                        sched,
+                        stdout,
+                        &key,
+                        admission,
+                        idx,
+                        "mark_awaiting_commit",
+                        &e,
+                    );
                 } else {
                     let _ = sched.abort_lane(idx, &key, admission);
                 }
@@ -1346,7 +1354,15 @@ pub fn drive_qwen_continuous_batch(
             };
             if !write_ok {
                 if let Err(e) = batch_state.reset_lane(gpu, &config, idx) {
-                    retire_lane_after_reset_failure(sched, stdout, &key, admission, idx, "commit_ready publish", &e);
+                    retire_lane_after_reset_failure(
+                        sched,
+                        stdout,
+                        &key,
+                        admission,
+                        idx,
+                        "commit_ready publish",
+                        &e,
+                    );
                 } else {
                     let _ = sched.abort_lane(idx, &key, admission);
                 }
@@ -1946,11 +1962,8 @@ pub fn drive_lfm_continuous_batch(
                             continue;
                         }
                         {
-                            let _scope = BatchAttemptScope::enter_for_generation(
-                                &id,
-                                attempt_id,
-                                admission,
-                            );
+                            let _scope =
+                                BatchAttemptScope::enter_for_generation(&id, attempt_id, admission);
                             crate::ar::emit_generation_start(
                                 crate::ar::GenerationRoute::LfmAr,
                                 stdout,
@@ -2097,7 +2110,15 @@ pub fn drive_lfm_continuous_batch(
                     // Partial assign failure: rollback any already-assigned lanes.
                     for (k, t) in assigned_keys.iter().zip(assigned_tickets.iter()) {
                         if let Err(e) = batch_state.reset_lane(gpu, config, t.lane) {
-                            retire_lane_after_reset_failure(sched, stdout, k, t.admission, t.lane, "partial assign rollback", &e);
+                            retire_lane_after_reset_failure(
+                                sched,
+                                stdout,
+                                k,
+                                t.admission,
+                                t.lane,
+                                "partial assign rollback",
+                                &e,
+                            );
                         } else {
                             let _ = sched.abort_lane(t.lane, k, t.admission);
                         }
@@ -2228,7 +2249,15 @@ pub fn drive_lfm_continuous_batch(
                 if !marked {
                     // Failed to mark — rollback lane without publishing.
                     if let Err(e) = batch_state.reset_lane(gpu, config, lane_idx) {
-                        retire_lane_after_reset_failure(sched, stdout, &key, admission, lane_idx, "mark_awaiting_commit", &e);
+                        retire_lane_after_reset_failure(
+                            sched,
+                            stdout,
+                            &key,
+                            admission,
+                            lane_idx,
+                            "mark_awaiting_commit",
+                            &e,
+                        );
                     } else {
                         let _ = sched.abort_lane(lane_idx, &key, admission);
                     }
@@ -2242,7 +2271,15 @@ pub fn drive_lfm_continuous_batch(
                 if !write_ok {
                     // Publication failed — rollback attested reset and free lane.
                     if let Err(e) = batch_state.reset_lane(gpu, config, lane_idx) {
-                        retire_lane_after_reset_failure(sched, stdout, &key, admission, lane_idx, "commit_ready publish", &e);
+                        retire_lane_after_reset_failure(
+                            sched,
+                            stdout,
+                            &key,
+                            admission,
+                            lane_idx,
+                            "commit_ready publish",
+                            &e,
+                        );
                     } else {
                         let _ = sched.abort_lane(lane_idx, &key, admission);
                     }
@@ -2432,8 +2469,7 @@ pub fn drive_lfm_continuous_batch(
         let mut repeat_lengths: Vec<u32> = vec![0; batch_size];
         let mut rng_states: Vec<u32> = vec![0; batch_size];
         let mut survivors: Vec<usize> = Vec::new();
-        let mut to_await: Vec<(usize, AttemptKey, BatchGeneration, serde_json::Value)> =
-            Vec::new();
+        let mut to_await: Vec<(usize, AttemptKey, BatchGeneration, serde_json::Value)> = Vec::new();
         let mut to_abort_running: Vec<(usize, AttemptKey, BatchGeneration)> = Vec::new();
         for idx in running.clone() {
             let key = match sched.lanes[idx].key().cloned() {
@@ -2642,7 +2678,15 @@ pub fn drive_lfm_continuous_batch(
                     key.id
                 );
                 if let Err(e) = batch_state.reset_lane(gpu, config, idx) {
-                    retire_lane_after_reset_failure(sched, stdout, &key, admission, idx, "mark_awaiting_commit", &e);
+                    retire_lane_after_reset_failure(
+                        sched,
+                        stdout,
+                        &key,
+                        admission,
+                        idx,
+                        "mark_awaiting_commit",
+                        &e,
+                    );
                 } else {
                     let _ = sched.abort_lane(idx, &key, admission);
                 }
@@ -2655,7 +2699,15 @@ pub fn drive_lfm_continuous_batch(
             };
             if !write_ok {
                 if let Err(e) = batch_state.reset_lane(gpu, config, idx) {
-                    retire_lane_after_reset_failure(sched, stdout, &key, admission, idx, "commit_ready publish", &e);
+                    retire_lane_after_reset_failure(
+                        sched,
+                        stdout,
+                        &key,
+                        admission,
+                        idx,
+                        "commit_ready publish",
+                        &e,
+                    );
                 } else {
                     let _ = sched.abort_lane(idx, &key, admission);
                 }
@@ -2771,12 +2823,7 @@ pub fn is_qwen_ep_batch_request_eligible(
     let Some(ep) = m.ep.as_ref() else {
         return false;
     };
-    let EpArch::Qwen35 {
-        config,
-        weights,
-        batch,
-    } = &ep.inner
-    else {
+    let EpArch::Qwen35 { batch, .. } = &ep.inner else {
         return false;
     };
     if batch.is_none() {
@@ -2792,10 +2839,8 @@ pub fn is_qwen_ep_batch_request_eligible(
     {
         return false;
     }
-    // EP batch is pure TP=4 gfx1201; validate via existing weight format gate.
-    if !hipfire_loader::batch_staging::qwen_ep_batch_weight_formats_supported(&weights[0]) {
-        return false;
-    }
+    // Staged `batch` above is the admission: staging already passed the full
+    // `validate_ep_batch_compatibility` (embd/lm_head/all-global-experts).
     let has_image = msg.get("image").is_some() || msg.get("image_base64").is_some();
     let has_tools = msg
         .get("tools")
@@ -2904,6 +2949,7 @@ pub fn drive_qwen35_ep_continuous_batch(
                 config,
                 weights,
                 batch,
+                ..
             } => {
                 let b = match batch.as_mut() {
                     Some(b) => b as *mut qwen35::Qwen35DecodeBatchEpState,
@@ -3223,8 +3269,7 @@ pub fn drive_qwen35_ep_continuous_batch(
                             parse_serve_continuous_batch(&json),
                             false,
                         ) {
-                            barrier =
-                                Some(daemon_regular_with_admission(json, Some(admission)));
+                            barrier = Some(daemon_regular_with_admission(json, Some(admission)));
                             break;
                         }
                         let prompt_str = batch_single_user_content(&json).unwrap_or_else(|| {
@@ -3386,11 +3431,8 @@ pub fn drive_qwen35_ep_continuous_batch(
                             continue;
                         }
                         {
-                            let _scope = BatchAttemptScope::enter_for_generation(
-                                &id,
-                                attempt_id,
-                                admission,
-                            );
+                            let _scope =
+                                BatchAttemptScope::enter_for_generation(&id, attempt_id, admission);
                             crate::ar::emit_generation_start(
                                 crate::ar::GenerationRoute::QwenAr,
                                 stdout,
@@ -3596,8 +3638,7 @@ pub fn drive_qwen35_ep_continuous_batch(
                 }
             };
         last_receipt = Some(receipt);
-        let mut to_await: Vec<(usize, AttemptKey, BatchGeneration, serde_json::Value)> =
-            Vec::new();
+        let mut to_await: Vec<(usize, AttemptKey, BatchGeneration, serde_json::Value)> = Vec::new();
         let mut to_abort_running: Vec<(usize, AttemptKey, BatchGeneration)> = Vec::new();
         let mut survivors: Vec<usize> = Vec::new();
         for idx in running.clone() {
@@ -3817,7 +3858,15 @@ pub fn drive_qwen35_ep_continuous_batch(
                     key.id
                 );
                 if let Err(e) = batch_state.reset_lane(gpus, config, idx) {
-                    retire_lane_after_reset_failure(sched, stdout, &key, admission, idx, "mark_awaiting_commit", &e);
+                    retire_lane_after_reset_failure(
+                        sched,
+                        stdout,
+                        &key,
+                        admission,
+                        idx,
+                        "mark_awaiting_commit",
+                        &e,
+                    );
                 } else {
                     let _ = sched.abort_lane(idx, &key, admission);
                 }
@@ -3831,7 +3880,15 @@ pub fn drive_qwen35_ep_continuous_batch(
             };
             if !write_ok {
                 if let Err(e) = batch_state.reset_lane(gpus, config, idx) {
-                    retire_lane_after_reset_failure(sched, stdout, &key, admission, idx, "commit_ready publish", &e);
+                    retire_lane_after_reset_failure(
+                        sched,
+                        stdout,
+                        &key,
+                        admission,
+                        idx,
+                        "commit_ready publish",
+                        &e,
+                    );
                 } else {
                     let _ = sched.abort_lane(idx, &key, admission);
                 }
@@ -4199,12 +4256,7 @@ mod tests {
         };
         for &(id, attempt_id, admission) in &done_lanes {
             let _scope = BatchAttemptScope::enter_for_generation(id, attempt_id, admission);
-            crate::ar::emit_generation_start(
-                GenerationRoute::QwenAr,
-                &mut output,
-                id,
-                false,
-            );
+            crate::ar::emit_generation_start(GenerationRoute::QwenAr, &mut output, id, false);
             output.flush().expect("start flush");
         }
         for (done_index, &(id, attempt_id, admission)) in done_lanes.iter().enumerate() {
@@ -4229,11 +4281,12 @@ mod tests {
                 1,
                 "route done {done_index} must be visible after route emission"
             );
-            assert!(batch_clear_terminal_at_generation(id, attempt_id, admission));
+            assert!(batch_clear_terminal_at_generation(
+                id, attempt_id, admission
+            ));
         }
 
-        let error_admission =
-            batch_announce_terminal("flush-error", 703).expect("error admission");
+        let error_admission = batch_announce_terminal("flush-error", 703).expect("error admission");
         {
             let _scope =
                 BatchAttemptScope::enter_for_generation("flush-error", 703, error_admission);
@@ -4341,11 +4394,7 @@ mod tests {
             });
             let before = output.visible.len();
             let _scope = BatchAttemptScope::enter_for(id, attempt_id);
-            crate::ar::emit_generation_done_value(
-                GenerationRoute::QwenAr,
-                &mut output,
-                &pending,
-            );
+            crate::ar::emit_generation_done_value(GenerationRoute::QwenAr, &mut output, &pending);
             assert_eq!(output.visible.len(), before);
         }
 
@@ -4510,8 +4559,7 @@ mod tests {
                 "validation",
             ),
         ] {
-            let admission =
-                batch_announce_terminal(id, attempt_id).expect("{driver} announce");
+            let admission = batch_announce_terminal(id, attempt_id).expect("{driver} announce");
 
             let mut output = Vec::new();
             emit_batch_admission_error(
@@ -4867,7 +4915,10 @@ mod tests {
             clear_terminal_control();
         }
 
-        assert_ne!(admissions[0], admissions[1], "same key received fresh admissions");
+        assert_ne!(
+            admissions[0], admissions[1],
+            "same key received fresh admissions"
+        );
         assert_ne!(
             singleton_generations[0], singleton_generations[1],
             "same key received fresh singleton lifecycles"
@@ -5137,7 +5188,9 @@ mod tests {
             assert_eq!(event["retryable"], serde_json::json!(false));
             assert_eq!(event["rolled_back"], serde_json::json!(false));
             assert!(
-                event["message"].as_str().is_some_and(|m| m.contains("lane retired")),
+                event["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("lane retired")),
                 "reset failure stays visible: {}",
                 event["message"]
             );

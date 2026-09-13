@@ -260,6 +260,7 @@ pub fn lower_layer(steps: &[Step], ctx: &DispatchCtx) -> LayerProgram {
             PipelineOp::GemvResidual => SuperOpKind::ResidualGemv,
             PipelineOp::RmsnormAutomatic => SuperOpKind::Norm,
             PipelineOp::Attend => SuperOpKind::Attend,
+            PipelineOp::MoeCombine => SuperOpKind::Moe,
             // Rope/QkNorm/BiasAdd are per-op-only Step vocabulary: never fused,
             // never lowered via superop. Emitting them into a lowered program
             // is a bug (no SuperOpKind exists for them).
@@ -274,6 +275,59 @@ pub fn lower_layer(steps: &[Step], ctx: &DispatchCtx) -> LayerProgram {
 }
 
 // ── Step 1c: the LayerProgram executor ─────────────────────────────────────
+
+/// Which EP MoE combine the runtime driver must run for one `Moe` super-op.
+/// Queried per rank; all ranks must agree (mixed modes are a fail-stop
+/// error, never a fallback).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum EpMoeCombineMode {
+    /// Rank-partial flow: per-rank zeroed partials, all-reduce-sum,
+    /// residual add. The mode DeepSeek4/MiniMax always select.
+    RankPartial,
+    /// Root-routed partial flow (Qwen plan-bound compact EP): the root
+    /// routes on-GPU and seals a route-producer proof, folding owned
+    /// experts plus the shared expert once into its zeroed partial; the
+    /// driver broadcasts the root IDs+weights device-to-device, non-roots
+    /// seal the routed contrib against the proof (zero dummies read 0),
+    /// then the existing all-reduce-sum plus residual add completes it.
+    RootRoutedPartial,
+}
+
+/// Borrowed root-routed view for one EP rank. Every buffer is borrowed from
+/// the arch binding; the view owns nothing and performs no copy. The static
+/// contract identity is cached at load binding and read here as a u64 —
+/// never re-rendered (rendering allocates) and never hashed per token.
+#[derive(Clone, Copy)]
+pub struct EpMoeRouteView<'a> {
+    /// Plan-bound experts for this rank (table + rank-local cache).
+    pub experts: super::sealed_moe::BoundMoeExperts<'a>,
+    /// Safetensors layer index (== `MoeFfnWeights.layer_idx`).
+    pub layer: usize,
+    /// Residual width (== hidden size).
+    pub hidden: usize,
+    /// Route width (top-k; root-routed requires 8).
+    pub k: usize,
+    /// Global expert count.
+    pub n_exp: usize,
+    /// Selected expert IDs (`moe_topk_indices`, `[k]` i32).
+    pub topk_ids: &'a GpuTensor,
+    /// Selected expert weights (`moe_topk_weights`, `[k]` f32).
+    pub topk_weights: &'a GpuTensor,
+}
+
+impl EpMoeRouteView<'_> {
+    /// The adapted execution contract, if the runtime sealer attached one.
+    /// `None` means this rank is not plan-bound and can never authorize a
+    /// root-routed combine.
+    pub fn execution_contract(&self) -> Option<&super::sealed_moe::ExpertExecutionContract> {
+        self.experts.execution_contract()
+    }
+    /// Load-bound static identity of the adapted execution contract, if
+    /// plan-bound. Compared as u64 on the hot path; no per-token hashing.
+    pub fn contract_id(&self) -> Option<u64> {
+        self.experts.contract_id()
+    }
+}
 
 /// Per-kind handlers the executor calls, implemented ARCH-SIDE (where the live
 /// weight/scratch/state tensors live). This keeps `run_layer_program` itself
@@ -363,6 +417,101 @@ pub trait ForwardBindings {
         })
     }
 
+    /// Root half of the root-routed EP MoE: seal the SoftmaxTopK route on
+    /// this (root) rank, run the router + owned experts + the shared expert
+    /// once into `partial` (a **zeroed** per-rank buffer the EP executor
+    /// all-reduces across ranks), and return the sealer-issued
+    /// [`MoeRouteProducerProof`](super::sealed_moe::MoeRouteProducerProof)
+    /// only after successful enqueue. Unsupported by default; Qwen
+    /// overrides it. The driver calls this only after every rank reported
+    /// [`EpMoeCombineMode::RootRoutedPartial`].
+    fn ep_run_moe_root(
+        &mut self,
+        _gpu: &mut Gpu,
+        _ctx: &DispatchCtx,
+        _op: &OpBinding,
+        _partial: &GpuTensor,
+    ) -> Result<super::sealed_moe::MoeRouteProducerProof, DispatchError> {
+        Err(DispatchError::UnsupportedVariant {
+            family: "ep",
+            variant: "ep_run_moe_root-not-implemented-for-arch",
+            arch: "",
+            quant: "",
+        })
+    }
+    /// Non-root half of the root-routed EP MoE: seal the routed contrib
+    /// against `proof` (matching static contract/layer/k/n_exp plus the
+    /// non-root compact role, all checked before any launch) and run the
+    /// owned experts over the broadcast root route IDs already resident in
+    /// the rank's top-k buffers into `partial`. No router runs here —
+    /// per-rank re-routing is the divergence this removes. Unsupported by
+    /// default; Qwen overrides it.
+    fn ep_run_moe_contrib(
+        &mut self,
+        _gpu: &mut Gpu,
+        _ctx: &DispatchCtx,
+        _op: &OpBinding,
+        _proof: &super::sealed_moe::MoeRouteProducerProof,
+        _partial: &GpuTensor,
+    ) -> Result<(), DispatchError> {
+        Err(DispatchError::UnsupportedVariant {
+            family: "ep",
+            variant: "ep_run_moe_contrib-not-implemented-for-arch",
+            arch: "",
+            quant: "",
+        })
+    }
+    /// Pure preflight for the root half of the root-routed EP MoE: build and
+    /// validate the actual bound experts, params, seal, and route-producer
+    /// proof from the same tensor/params builders as
+    /// [`ep_run_moe_root`](Self::ep_run_moe_root), but enqueue NOTHING.
+    /// Returns the opaque
+    /// [`MoeRouteProducerProof`](super::sealed_moe::MoeRouteProducerProof)
+    /// as validation capability (static load-bound metadata), not a claim
+    /// that device bytes are already produced. The runtime EP driver calls
+    /// this on rank 0 after metadata/capacity checks but BEFORE zeroing any
+    /// partial; the normal root-compute → broadcast → non-root-compute flow
+    /// still follows. Unsupported by default; Qwen overrides it.
+    fn ep_preflight_moe_root(
+        &self,
+        _gpu: &Gpu,
+        _ctx: &DispatchCtx,
+        _op: &OpBinding,
+        _partial: &GpuTensor,
+    ) -> Result<super::sealed_moe::MoeRouteProducerProof, DispatchError> {
+        Err(DispatchError::UnsupportedVariant {
+            family: "ep",
+            variant: "ep_preflight_moe_root-not-implemented-for-arch",
+            arch: "",
+            quant: "",
+        })
+    }
+
+    /// Pure preflight for the non-root half of the root-routed EP MoE:
+    /// validate the actual bound experts, params, and proof adoption from
+    /// the same builders as
+    /// [`ep_run_moe_contrib`](Self::ep_run_moe_contrib), but enqueue
+    /// NOTHING. The runtime EP driver calls this on every non-root rank
+    /// against the root preflight proof after metadata/capacity checks but
+    /// BEFORE zeroing any partial; the normal broadcast →
+    /// non-root-compute flow still follows. Unsupported by default; Qwen
+    /// overrides it.
+    fn ep_preflight_moe_contrib(
+        &self,
+        _gpu: &Gpu,
+        _ctx: &DispatchCtx,
+        _op: &OpBinding,
+        _proof: &super::sealed_moe::MoeRouteProducerProof,
+        _partial: &GpuTensor,
+    ) -> Result<(), DispatchError> {
+        Err(DispatchError::UnsupportedVariant {
+            family: "ep",
+            variant: "ep_preflight_moe_contrib-not-implemented-for-arch",
+            arch: "",
+            quant: "",
+        })
+    }
+
     /// EP: add the all-reduced routed partial into this rank's residual stream
     /// (the arch-specific buffer that holds the post-attention residual). Called
     /// by the EP executor once, after the MoE all-reduce.
@@ -377,6 +526,25 @@ pub trait ForwardBindings {
             arch: "",
             quant: "",
         })
+    }
+
+    /// Which EP MoE combine this binding will execute when the runtime EP
+    /// driver reaches a `Moe` super-op. Defaults to [`EpMoeCombineMode::RankPartial`],
+    /// so DeepSeek4/MiniMax (and every existing EP route) stay byte-for-byte
+    /// on the rank-partial all-reduce flow without touching their impls.
+    /// Qwen overrides this: root-routed partials for plan-bound compact EP
+    /// bindings.
+    fn ep_moe_combine_mode(&self) -> EpMoeCombineMode {
+        EpMoeCombineMode::RankPartial
+    }
+
+    /// Borrow this rank's root-routed view (plan-bound experts plus the
+    /// resident route buffers). `None` by default and for any non-root-routed
+    /// binding; the runtime EP driver calls this only after every rank
+    /// reported [`EpMoeCombineMode::RootRoutedPartial`], and a missing view
+    /// there is a fail-stop error, never a fallback.
+    fn ep_moe_route_view(&self) -> Option<EpMoeRouteView<'_>> {
+        None
     }
 
     /// Whether this rank replaces replicated `Attend` with a rank-local

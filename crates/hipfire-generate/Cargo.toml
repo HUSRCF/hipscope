@@ -26,6 +26,7 @@ hip-bridge = { path = "../hip-bridge" }
 rdna-compute = { path = "../rdna-compute" }
 saddle-core = { path = "../saddle-core" }
 hipfire-runtime = { path = "../hipfire-runtime" }
+hipfire-dispatch = { path = "../hipfire-dispatch" }
 # Re-added: S4 (#719) introduced hipfire_config readers in this crate after the
 # machete pass that removed it, so the "unused" finding is no longer true.
 hipfire-config = { path = "../hipfire-config" }
@@ -51,7 +52,10 @@ serde_json = { workspace = true, features = ["preserve_order"] }
 tracing = "0.1"
 
 [features]
-serve-fault-inject = ["hipfire-runtime/serve-fault-inject"]
+serve-fault-inject = [
+    "hipfire-runtime/serve-fault-inject",
+    "hipfire-dispatch/serve-fault-inject",
+]
 # VCN JPEG decode for VL images (`image.decode = vcn|auto`): pooled libva
 # decode straight to device patches, skipping CPU decode and upload.
 # Default off; the CPU path below is unchanged when disabled.

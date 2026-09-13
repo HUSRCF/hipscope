@@ -245,14 +245,25 @@ fn token_text(events: &[&Value]) -> String {
 }
 
 fn load_req(model: &str, pp: Option<u64>) -> Value {
-    let mut params = serde_json::json!({ "max_seq": 2048 });
+    let mut params = serde_json::json!({
+        "max_seq": 2048,
+        "dflash_mode": "off",
+        "mtp_mode": "off",
+        "ngram_draft": false,
+    });
     if let Some(pp) = pp {
         params["pp"] = pp.into();
     }
     serde_json::json!({ "type": "load", "model": model, "params": params })
 }
 
-fn gen_req(id: &str, attempt: u64, fault_prefill: bool, fault_decode: bool) -> Value {
+fn gen_req(
+    id: &str,
+    attempt: u64,
+    fault_prefill: bool,
+    fault_decode: bool,
+    fault_expert_mutation: bool,
+) -> Value {
     let mut req = serde_json::json!({
         "type": "generate",
         "id": id,
@@ -268,6 +279,9 @@ fn gen_req(id: &str, attempt: u64, fault_prefill: bool, fault_decode: bool) -> V
     }
     if fault_decode {
         req["test_fault_after_first_decode"] = true.into();
+    }
+    if fault_expert_mutation {
+        req["test_fault_after_expert_mutation"] = true.into();
     }
     req
 }
@@ -346,9 +360,16 @@ fn session_generate(
     attempt: u64,
     fault_prefill: bool,
     fault_decode: bool,
+    fault_expert_mutation: bool,
     context: &str,
 ) -> Vec<Value> {
-    s.send(&gen_req(id, attempt, fault_prefill, fault_decode));
+    s.send(&gen_req(
+        id,
+        attempt,
+        fault_prefill,
+        fault_decode,
+        fault_expert_mutation,
+    ));
     let mut scoped = Vec::new();
     loop {
         let e = s.recv(context);
@@ -368,6 +389,44 @@ fn session_generate(
         if terminal {
             return scoped;
         }
+    }
+}
+/// Request the feature-gated synchronized-state attestation after a rollback.
+fn state_snapshot(s: &mut Session, context: &str) -> Value {
+    s.send(&serde_json::json!({ "type": "test_state_snapshot" }));
+    loop {
+        let e = s.recv(context);
+        if e.get("type").and_then(|v| v.as_str()) == Some("test_state_snapshot") {
+            return e;
+        }
+    }
+}
+
+fn assert_clean_state_snapshot(snapshot: &Value, context: &str) {
+    assert_eq!(
+        snapshot.get("seq_pos").and_then(Value::as_u64),
+        Some(0),
+        "{context}: rollback must reset sequence position: {snapshot}"
+    );
+    assert_eq!(
+        snapshot.get("conversation_len").and_then(Value::as_u64),
+        Some(0),
+        "{context}: rollback must reset conversation tokens: {snapshot}"
+    );
+    for field in [
+        "graph_clean",
+        "replay_clean",
+        "drafter_reset",
+        "checkpoint_empty",
+        "adaptive_clean",
+        "asst_cache_empty",
+        "prefix_cache_clean",
+    ] {
+        assert_eq!(
+            snapshot.get(field).and_then(Value::as_bool),
+            Some(true),
+            "{context}: rollback state field {field} was not clean: {snapshot}"
+        );
     }
 }
 
@@ -433,7 +492,7 @@ fn clean_bytes(
     let id = "fresh";
     let mut s = Session::spawn(extra_env);
     session_load(&mut s, model, pp, context);
-    let events = session_generate(&mut s, id, 7001, false, false, context);
+    let events = session_generate(&mut s, id, 7001, false, false, false, context);
     assert_done_stop(
         &events,
         context,
@@ -464,11 +523,11 @@ fn fault_round(
     let mut s = Session::spawn(extra_env);
     session_load(&mut s, model, pp, context);
     let tail = s.stderr_tail();
-    let prefill = session_generate(&mut s, "fault-prefill", 7002, true, false, context);
+    let prefill = session_generate(&mut s, "fault-prefill", 7002, true, false, false, context);
     assert_fault_terminal(&prefill, "fault-prefill", context, &tail);
-    let decode = session_generate(&mut s, "fault-decode", 7003, false, true, context);
+    let decode = session_generate(&mut s, "fault-decode", 7003, false, true, false, context);
     assert_fault_terminal(&decode, "fault-decode", context, &tail);
-    let retry = session_generate(&mut s, "retry", 7004, false, false, context);
+    let retry = session_generate(&mut s, "retry", 7004, false, false, false, context);
     assert_done_stop(
         &retry,
         context,
@@ -484,6 +543,82 @@ fn fault_round(
     );
     session_unload(&mut s, context);
     s.close(context);
+}
+
+/// Exercise the sealed Single-MoE route's post-expert-mutation fault. The
+/// synchronized state attestation is intentionally checked before the retry,
+/// so a clean token stream alone cannot hide stale request state.
+fn sealed_expert_mutation_fault_round(
+    model: &str,
+    extra_env: &[(&str, &str)],
+    baseline: &str,
+    context: &str,
+) {
+    let mut s = Session::spawn(extra_env);
+    session_load(&mut s, model, None, context);
+    let tail = s.stderr_tail();
+    let fault = session_generate(
+        &mut s,
+        "fault-expert-mutation",
+        7102,
+        false,
+        false,
+        true,
+        context,
+    );
+    assert_fault_terminal(&fault, "fault-expert-mutation", context, &tail);
+    let error_message = events_for_id(&fault, "fault-expert-mutation")
+        .into_iter()
+        .find(|e| e.get("type").and_then(|v| v.as_str()) == Some("error"))
+        .and_then(|e| e.get("message").and_then(|v| v.as_str()))
+        .unwrap_or_default();
+    assert!(
+        error_message.contains("sealed MoE expert mutation"),
+        "{context}: fault must be raised by the sealed MoE boundary, got {error_message:?}"
+    );
+    let snapshot = state_snapshot(&mut s, context);
+    assert_clean_state_snapshot(&snapshot, context);
+
+    let retry = session_generate(&mut s, "retry", 7103, false, false, false, context);
+    assert_done_stop(&retry, context, "post-expert-fault retry", false);
+    let retry_text = token_text(&events_for_id(&retry, "retry"));
+    assert_eq!(
+        retry_text, baseline,
+        "{context}: post-expert-fault retry bytes must equal the fresh-daemon baseline"
+    );
+    session_unload(&mut s, context);
+    s.close(context);
+}
+
+#[test]
+#[ignore = "requires real HIP GPU + HIPFIRE_QWEN35_A3B_RESET_MODEL (qwen3.6:35b-a3b) + daemon built with --features serve-fault-inject"]
+fn single_qwen35_sealed_moe_expert_mutation_rolls_back_and_recovers() {
+    let _guard = lock();
+    if !has_gpu() {
+        eprintln!("skip: no GPU (/dev/kfd and /dev/dri absent)");
+        return;
+    }
+    let Some(model) = std::env::var_os("HIPFIRE_QWEN35_A3B_RESET_MODEL") else {
+        eprintln!("skip: HIPFIRE_QWEN35_A3B_RESET_MODEL unset");
+        return;
+    };
+    let model = PathBuf::from(model);
+    assert!(
+        model.is_file(),
+        "HIPFIRE_QWEN35_A3B_RESET_MODEL={} is not a readable file",
+        model.display()
+    );
+    let model = model.display().to_string();
+    let extra_env: &[(&str, &str)] = &[];
+    for round in 0..rounds() {
+        let ctx = format!("single sealed MoE round {round}");
+        let baseline = clean_bytes(&model, None, extra_env, &ctx);
+        sealed_expert_mutation_fault_round(&model, extra_env, &baseline, &ctx);
+    }
+    let mut fp = HashMap::new();
+    fp.insert("model", model);
+    fp.insert("prompt", PROMPT.to_string());
+    eprintln!("single_qwen35_sealed_moe_expert_mutation_rolls_back_and_recovers ok: {fp:?}");
 }
 
 #[test]

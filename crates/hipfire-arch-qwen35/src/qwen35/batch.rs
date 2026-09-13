@@ -111,6 +111,11 @@ pub struct PrefillBatchScratch {
     // per-token routed-expert gate/up/rot buffers consumed by the N-batched
     // indexed MoE kernels. Sized as [max_batch × {n_exp, smi, k_top×mi}].
     pub moe_router_logits_batch: Option<GpuTensor>, // [N × num_experts]
+    // Non-owning 2-D aliases of the router allocation for each active batch
+    // size. The producer requires an exact [N × num_experts] shape; cache the
+    // metadata views once so MoE layers do not allocate a shape Vec per call.
+    // These aliases must never be passed to `free_tensor`.
+    pub moe_router_score_views_batch: Option<Box<[GpuTensor]>>,
     pub moe_shared_scalar_batch: Option<GpuTensor>, // [N × 1] — raw shared_expert_gate logit
     pub moe_shared_gate_batch: Option<GpuTensor>,   // [N × smi]
     pub moe_shared_up_batch: Option<GpuTensor>,     // [N × smi]
@@ -411,6 +416,17 @@ impl PrefillBatchScratch {
             DType::F32
         );
 
+        let moe_router_logits_batch = i_moe_router_logits_batch.map(|i| take!(i));
+        let moe_router_score_views_batch = moe_router_logits_batch.as_ref().map(|router_logits| {
+            (1..=max_batch)
+                .map(|batch_size| GpuTensor {
+                    buf: unsafe { router_logits.buf.alias() },
+                    shape: vec![batch_size, config.num_experts],
+                    dtype: router_logits.dtype,
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice()
+        });
         Ok(Self {
             max_batch,
             x_batch: take!(i_x_batch),
@@ -446,7 +462,8 @@ impl PrefillBatchScratch {
             ffn_hidden_f16_batch: take!(i_ffn_hidden_f16_batch),
             fa_attn_out_rot_f16_batch: take!(i_fa_attn_out_rot_f16_batch),
             mq_prologue_ctrl: take!(i_mq_prologue_ctrl),
-            moe_router_logits_batch: i_moe_router_logits_batch.map(|i| take!(i)),
+            moe_router_logits_batch,
+            moe_router_score_views_batch,
             moe_shared_scalar_batch: i_moe_shared_scalar_batch.map(|i| take!(i)),
             moe_shared_gate_batch: i_moe_shared_gate_batch.map(|i| take!(i)),
             moe_shared_up_batch: i_moe_shared_up_batch.map(|i| take!(i)),
@@ -516,6 +533,8 @@ impl PrefillBatchScratch {
         ] {
             note(gpu.free_tensor(t));
         }
+        // `moe_router_score_views_batch` contains non-owning aliases of
+        // `moe_router_logits_batch`; only the owner is released below.
         for t in [
             self.moe_router_logits_batch,
             self.moe_shared_scalar_batch,

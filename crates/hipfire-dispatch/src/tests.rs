@@ -955,7 +955,7 @@ fn pipeline_single_op_self_satisfies() {
 // ── MoeResolution eligibility lattice (mirrors qwen35.rs:4598-4671) ──
 use crate::families::moe::{MoeDtypes, MoeResolution};
 
-fn dtypes_all_mq4() -> MoeDtypes {
+fn dtypes_all_mq4() -> MoeDtypes<'static> {
     MoeDtypes {
         router: DType::MQ4G256,
         shared_gate: DType::MQ4G256,
@@ -2180,7 +2180,7 @@ fn match_fused_prefix_rejects_mq4g256v2_on_unsupported_arch() {
 use crate::families::moe::MoePrefillResolution;
 
 /// Helper: default MoeDtypes for MQ4 routed experts (the common A3B case).
-fn moe_dtypes_mq4() -> MoeDtypes {
+fn moe_dtypes_mq4() -> MoeDtypes<'static> {
     MoeDtypes {
         router: DType::Q8_0,
         shared_gate: DType::Q8_0,
@@ -2197,7 +2197,7 @@ fn moe_dtypes_mq4() -> MoeDtypes {
     }
 }
 
-fn moe_dtypes_mq6() -> MoeDtypes {
+fn moe_dtypes_mq6() -> MoeDtypes<'static> {
     let mut d = moe_dtypes_mq4();
     d.routed_gate_up = DType::MQ6G256;
     d.routed_down = DType::MQ6G256;
@@ -2205,7 +2205,7 @@ fn moe_dtypes_mq6() -> MoeDtypes {
     d
 }
 
-fn moe_dtypes_paro() -> MoeDtypes {
+fn moe_dtypes_paro() -> MoeDtypes<'static> {
     let mut d = moe_dtypes_mq4();
     d.routed_gate_up = DType::ParoQ4G128;
     d.routed_down = DType::ParoQ4G128;
@@ -2383,7 +2383,7 @@ fn moe_prefill_resolution_mq4_gfx11_still_path2() {
 
 /// The antirez asymmetric routed pair: gate_up MQ2-Lloyd, down MQ3-Lloyd,
 /// MQ4 shared expert, no tag table.
-fn moe_dtypes_codebook_pair() -> MoeDtypes {
+fn moe_dtypes_codebook_pair() -> MoeDtypes<'static> {
     let mut d = moe_dtypes_mq4();
     d.routed_gate_up = DType::MQ2G256Lloyd;
     d.routed_down = DType::MQ3G256Lloyd;

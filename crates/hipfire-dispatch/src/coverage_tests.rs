@@ -1362,7 +1362,7 @@ fn w4_mq3_lloyd_still_rejected_on_cdna_wave64() {
 //   * fused/GEMM keys resolve on gfx11 + gfx12
 // GPU-free; no product logic.
 
-fn moe_dtypes_uniform(gate_up: DType, down: DType) -> MoeDtypes {
+fn moe_dtypes_uniform(gate_up: DType, down: DType) -> MoeDtypes<'static> {
     MoeDtypes {
         router: Q8_0,
         shared_gate: Q8_0,

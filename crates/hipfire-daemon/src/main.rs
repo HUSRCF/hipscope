@@ -88,7 +88,7 @@ mod slots;
 pub(crate) static TERMINAL_TEST_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
 use hipfire_generate::vision::{GenerateVLParams, ImageSource};
-use hipfire_loader::{AsstTurnCache, EpArch, EpState, Eviction, LoadedModel};
+use hipfire_loader::{AsstTurnCache, Eviction, LoadedModel};
 use hipfire_runtime::spec::{
     ClientEvent, EmitOutcome, EvictRetain, FinishSummary, PrefillOutcome, SpecAdvance, SpecEmit,
     SpecTarget, Speculator, StopReason,
@@ -1868,61 +1868,11 @@ fn main() {
                 };
                 match loaded {
                     Ok(mut m) => {
-                        // FIX #1 (deferred EP unload): the new EP model loaded
-                        // successfully — NOW unload the prior model before
-                        // publishing (single-GPU/pp models were already unloaded
-                        // eagerly above; this branch only fires for deferred
-                        // tp>1). Prior PFlash drafter is part of that prior
-                        // model, so tear it down first in the same
-                        // drafter-before-unload order used elsewhere.
-                        //
-                        // Transactional: if prior unload fails, do NOT install
-                        // or emit `loaded` for the new model. Explicitly unload
-                        // the newly built EP model, clear associated fresh
-                        // state, and emit a hard error covering prior failure
-                        // and any rollback failure.
-                        if load_tp > 1 {
-                            if let Some(mut pf) = pflash_state.take() {
-                                if let Some(mut dg) = pflash_drafter_gpu.take() {
-                                    dg.bind_thread_or_warn();
-                                    pf.unload_drafter(&mut dg); // sibling-device drafter: free on its own handle, then drop
-                                    gpu.bind_thread_or_warn();
-                                } else {
-                                    pf.unload_drafter(&mut gpu);
-                                }
-                            }
-                            pflash_cfg = None;
-                            let prior_unload = if let Some(old) = model.take() {
-                                hipfire_loader::unload_model(old, &mut gpu)
-                            } else {
-                                Ok(())
-                            };
-                            if !ep_deferred_may_publish(&prior_unload) {
-                                let prior_err = prior_unload
-                                    .err()
-                                    .unwrap_or_else(|| "prior unload failed".to_string());
-                                // Roll back the newly built EP model — GpuTensor
-                                // has no Drop; must free explicitly.
-                                let rollback_err = match hipfire_loader::unload_model(m, &mut gpu) {
-                                    Ok(()) => None,
-                                    Err(e) => Some(e),
-                                };
-                                // model stays None; pflash already cleared above.
-                                let msg = ep_deferred_handoff_error_message(
-                                    &prior_err,
-                                    rollback_err.as_deref(),
-                                );
-                                emit_uncorrelated_error(
-                                    &mut stdout,
-                                    None,
-                                    &msg,
-                                    "gpu",
-                                    false,
-                                    false,
-                                );
-                                continue;
-                            }
-                        }
+                        // Deferred EP retirement lives AFTER continuous-batch
+                        // staging below: the prior resident in `model` (and
+                        // its PFlash drafter) must survive every fallible
+                        // stage of the new model so a staging failure rolls
+                        // back only `m` and keeps the prior usable.
                         let arch = match m.arch_id {
                             5 => "qwen3_5",
                             6 => "qwen3_5_moe",
@@ -2025,11 +1975,102 @@ fn main() {
                         // the typed fields it writes; only the construction leaked.
                         // The scheduler is built here because it lives in
                         // `hipfire-engine`, above the loader.
-                        let staging = hipfire_loader::batch_staging::stage_continuous_batch(
+                        let staging = match hipfire_loader::batch_staging::stage_continuous_batch(
                             &mut m,
                             &mut gpu,
                             parsed_continuous_batch_size,
-                        );
+                        ) {
+                            Ok(staging) => staging,
+                            Err(stage_err) => {
+                                // Staging left no usable pool (batch unpublished,
+                                // sequential drained or untrusted): roll back the
+                                // whole staged model and never emit `loaded`.
+                                // For the deferred tp>1 path the prior model is
+                                // still intact in `model`; only `m` is torn down.
+                                let (vram_free, vram_total) =
+                                    gpu.hip.get_vram_info().unwrap_or((0, 0));
+                                let free_mb = vram_free / (1024 * 1024);
+                                let total_mb = vram_total / (1024 * 1024);
+                                let rollback_err = match hipfire_loader::unload_model(m, &mut gpu) {
+                                    Ok(()) => None,
+                                    Err(e) => Some(e),
+                                };
+                                let mut msg = format!(
+                                    "load failed: continuous batch staging failed: {stage_err}. GPU: {} ({free_mb} MB free / {total_mb} MB total)",
+                                    gpu.arch
+                                );
+                                if let Some(rb) = rollback_err {
+                                    msg.push_str(&format!(
+                                        "; staged-model rollback also failed: {rb}"
+                                    ));
+                                }
+                                emit_uncorrelated_error(
+                                    &mut stdout,
+                                    None,
+                                    &msg,
+                                    "gpu",
+                                    false,
+                                    false,
+                                );
+                                let _ = stdout.flush();
+                                continue;
+                            }
+                        };
+                        // FIX #1 (deferred EP unload, after staging): the new
+                        // model is fully staged — NOW retire the prior model
+                        // before publishing (single-GPU/pp models were already
+                        // unloaded eagerly above; this branch only fires for
+                        // deferred tp>1). Prior PFlash drafter is part of that
+                        // prior model, so tear it down first in the same
+                        // drafter-before-unload order used elsewhere.
+                        //
+                        // Transactional: if prior unload fails, do NOT install
+                        // or emit `loaded` for the new model. Explicitly unload
+                        // the newly built EP model, clear associated fresh
+                        // state, and emit a hard error covering prior failure
+                        // and any rollback failure.
+                        if load_tp > 1 {
+                            if let Some(mut pf) = pflash_state.take() {
+                                if let Some(mut dg) = pflash_drafter_gpu.take() {
+                                    dg.bind_thread_or_warn();
+                                    pf.unload_drafter(&mut dg); // sibling-device drafter: free on its own handle, then drop
+                                    gpu.bind_thread_or_warn();
+                                } else {
+                                    pf.unload_drafter(&mut gpu);
+                                }
+                            }
+                            pflash_cfg = None;
+                            let prior_unload = if let Some(old) = model.take() {
+                                hipfire_loader::unload_model(old, &mut gpu)
+                            } else {
+                                Ok(())
+                            };
+                            if !ep_deferred_may_publish(&prior_unload) {
+                                let prior_err = prior_unload
+                                    .err()
+                                    .unwrap_or_else(|| "prior unload failed".to_string());
+                                // Roll back the newly built EP model — GpuTensor
+                                // has no Drop; must free explicitly.
+                                let rollback_err = match hipfire_loader::unload_model(m, &mut gpu) {
+                                    Ok(()) => None,
+                                    Err(e) => Some(e),
+                                };
+                                // model stays None; pflash already cleared above.
+                                let msg = ep_deferred_handoff_error_message(
+                                    &prior_err,
+                                    rollback_err.as_deref(),
+                                );
+                                emit_uncorrelated_error(
+                                    &mut stdout,
+                                    None,
+                                    &msg,
+                                    "gpu",
+                                    false,
+                                    false,
+                                );
+                                continue;
+                            }
+                        }
                         let staged_batch_capable = staging.capable;
                         let staged_batch_scheduler = staging.capable.then(|| {
                             ContinuousBatchScheduler::new(staging.slots, staging.lane_capacity)
@@ -2123,8 +2164,8 @@ fn main() {
                         // the entire session.
                         //
                         // EP guard (load_tp > 1): the EP path serves through
-                        // `hipfire_generate::qwen::generate_ep`, which bypasses PFlash entirely (the
-                        // EP archs ds4/minimax refuse/ignore PFlash drafters).
+                        // `hipfire_generate::qwen::generate_ep`, which bypasses PFlash entirely (no
+                        // EP server reads PFlash drafters).
                         // Loading a drafter here would just pin GPU memory it
                         // never reads until unload, so skip the load outright.
                         // Warn once if the operator actually supplied a drafter
@@ -3082,8 +3123,10 @@ fn main() {
                         continue;
                     }
                     // ── Continuous batch admission (tightened to actual route) ──
-                    // EP Qwen35 expert-parallel is batch-only, TP=4, 4×gfx1201; fail closed otherwise.
-                    // Check EP eligibility first so batch-only enforcement fires before single-GPU fallback.
+                    // EP Qwen35 expert-parallel continuous batch is TP=4, 4×gfx1201;
+                    // sequential EP (tp=2|4) serves every request that is not
+                    // batch-eligible. Check EP eligibility first so the batch
+                    // route wins when staged and requested.
                     let serve_continuous_batch = parse_serve_continuous_batch(&msg);
                     let pflash_active = pf_cfg_owned.as_ref().is_some_and(|c| {
                         !matches!(c.mode, hipfire_pflash::pflash::PflashMode::Off)
@@ -3239,30 +3282,11 @@ fn main() {
                             continue;
                         }
                     }
-                    // Enforce batch-only for EP: if EP batch is staged, non-eligible must fail closed, not silently fall back.
-                    let ep_batch_staged = !singleton_handoff
-                        && batch_scheduler.is_some()
-                        && m.ep
-                            .as_ref()
-                            .is_some_and(|ep| matches!(ep.inner, EpArch::Qwen35 { .. }));
-                    if ep_batch_staged {
-                        // EP requests without serve_continuous_batch or with excluded features must error.
-                        if !ep_batch_eligible {
-                            let _scope = BatchAttemptScope::enter_for_generation(
-                                id,
-                                gen_attempt_id,
-                                admission,
-                            );
-                            let ep = hipfire_generate::common::RollbackEpilogue {
-                                rolled_back: true,
-                                context: None,
-                            };
-                            // Reset the specific lane if any (best-effort), else poison not needed; just fail this request.
-                            hipfire_generate::common::emit_fail_closed_error(&mut stdout, Some(id), "EP qwen35 batch-only: request must set serve_continuous_batch=true with TP=4 expert_parallel and no excluded features (image/tools/stop/spec)", "validation", false, &ep);
-                            batch_clear_terminal_at_generation(id, gen_attempt_id, admission);
-                            continue;
-                        }
-                    }
+                    // Sequential EP now serves Qwen35-MoE (tp=2|4) via
+                    // `generate_ep`: a request that is not batch-eligible
+                    // falls through to the sequential path below instead of
+                    // failing closed. The batch route above still wins when
+                    // staged and requested with `serve_continuous_batch`.
                     let batch_eligible = if !singleton_handoff && batch_scheduler.is_some() {
                         is_batch_request_eligible(
                             &msg,
@@ -3670,9 +3694,25 @@ fn main() {
                     if developer_var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
                         eprintln!("[qwen-cache RESET] daemon received reset — clearing conversation_tokens (was {})", m.conversation_tokens.len());
                     }
-                    let ep = hipfire_generate::common::production_fail_closed_rollback(
-                        m, &mut gpu, None, None,
-                    );
+                    // Attested reset ownership: EP models reset through the
+                    // shared mesh epilogue (`ep_reset_after_abort`, which owns
+                    // every EpArch variant incl. Qwen35 sequential + batch),
+                    // single-GPU through the production rollback. No separate
+                    // algorithm either way — the full per-rank reset happens
+                    // here at request time, never deferred to a later cold
+                    // reset. The mesh EP arm leaves the host semantic cache,
+                    // so a daemon reset (full cold reset) drops it explicitly
+                    // — the single-GPU path already clears it inside its
+                    // rollback.
+                    let ep = if m.ep.is_some() {
+                        let ep = hipfire_generate::common::reset_mesh_request_state(m, None);
+                        m.asst_turn_cache.clear();
+                        ep
+                    } else {
+                        hipfire_generate::common::production_fail_closed_rollback(
+                            m, &mut gpu, None, None,
+                        )
+                    };
                     if !ep.rolled_back {
                         let detail = ep
                             .context

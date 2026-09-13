@@ -33,11 +33,16 @@
 use crate::cohere2moe::{Cohere2MoeState, Cohere2MoeWeights, Ffn};
 use crate::config::{AttnKind, Cohere2MoeConfig};
 use hipfire_dispatch::context::DispatchCtx;
+use hipfire_dispatch::families::gemv::GivensRef;
 use hipfire_dispatch::families::moe::{MoeDtypes, MoePrefillParams};
+use hipfire_dispatch::pipeline::sealed_moe::{
+    produce_prefill_route, seal_prefill_with_router, BoundMoeExperts, MoeRouterInput,
+};
+use hipfire_dispatch::pipeline::{execute_steps, Step};
 use hipfire_runtime::llama::{
-    fused_silu_mul_rotate_mq_batched_for, moe_family, rotate_x_mq_batched_for, rotate_x_mq_for,
-    weight_gemv, weight_gemv_residual};
-use hipfire_runtime::llama::KvCacheExt;
+    fused_silu_mul_rotate_mq_batched_for, rotate_x_mq_batched_for, rotate_x_mq_for, weight_gemv,
+    weight_gemv_residual, KvCacheExt,
+};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 /// Grouped-MoE prefill tiling constant — must match `run_moe_prefill`'s
@@ -615,7 +620,9 @@ pub fn forward_batch(
     let attn_out = alloc(gpu, b * q_dim, "attn_out")?;
     let o = alloc(gpu, b * hidden, "o")?;
     let ffn_x_rot = alloc(gpu, b * hidden, "ffn_x_rot")?;
-    let router_logits = alloc(gpu, b * n_exp, "router_logits")?;
+    let router_logits = gpu
+        .alloc_tensor(&[b, n_exp], DType::F32)
+        .map_err(|e| format!("forward_batch alloc router_logits: {e:?}"))?;
     let topk_idx = alloc(gpu, b * k_top, "topk_idx")?;
     let topk_w = alloc(gpu, b * k_top, "topk_w")?;
     let gate = alloc(gpu, b * k_top * moe_inter, "gate")?;
@@ -816,45 +823,60 @@ pub fn forward_batch(
                     &x_f16,
                 )
                 .map_err(|e| format!("cohere2moe L{l} batch router: {e:?}"))?;
-                gpu.sigmoid_f32(&router_logits)
-                    .map_err(|e| format!("cohere2moe L{l} batch sigmoid: {e:?}"))?;
-                gpu.moe_topk_renorm_k8_batched(
-                    &router_logits,
-                    &topk_idx,
-                    &topk_w,
-                    n_exp,
-                    cfg.norm_topk_prob,
-                    b,
-                )
-                .map_err(|e| format!("cohere2moe L{l} batch topk: {e:?}"))?;
-                // `ffn_x_rot` ← FWHT(normed): run_moe_prefill's MQ4/MQ6 path
-                // requires the activations pre-rotated by the model (it rotates
-                // only in the paro path). Dropping this was the bug behind the
-                // earlier garbage output on both paths.
-                rotate_x_mq_batched_for(gpu, &m.experts[0].gate_up, &normed, &ffn_x_rot, hidden, b)
-                    .map_err(|e| format!("cohere2moe L{l} batch rot: {e}"))?;
-                // Shared dispatch executor: Path 1 (indexed batched GEMV, the
-                // default — identical to the hand-rolled loop this replaced) or
-                // Path 2 (scatter-by-expert → grouped-WMMA GEMM, under
-                // HIPFIRE_MOE_GROUPED_GEMM=1). Routed expert outputs accumulate
-                // into `x`, which IS the parallel-block residual add. No shared
-                // expert in Cohere2-MoE → shared_* dtypes are inert placeholders.
+
+                // The table/cache pair was validated once at load and is the
+                // only authority for expert ownership and source metadata.
+                // Pairing it here is allocation-free; a missing/invalid owner
+                // can never fall back to raw pointer execution.
                 let ctx = DispatchCtx::new(gpu);
-                let edt = m.experts[0].gate_up.gpu_dtype;
+                let bound = BoundMoeExperts::from_cache(&m.sealed.table, &m.sealed.cache)
+                    .map_err(|e| format!("cohere2moe L{l} bind experts: {e:?}"))?;
+                // Dtype tiers are cached in the immutable load-time binding.
+                // Borrowing them here keeps the prefill call allocation-free
+                // while avoiding the old expert-zero assumption for mixed
+                // layers.
+                let gate_up_dtypes = m.sealed.gate_up_dtypes.as_ref();
+                let down_dtypes = m.sealed.down_dtypes.as_ref();
+                let tier_varies = |tiers: &[DType]| {
+                    tiers
+                        .first()
+                        .is_some_and(|&first| tiers.iter().skip(1).any(|&dtype| dtype != first))
+                };
+                let gate_up_mixed = tier_varies(gate_up_dtypes);
+                let down_mixed = tier_varies(down_dtypes);
+                let edt = gate_up_dtypes.first().copied().unwrap_or(DType::F32);
+                let routed_down = down_dtypes.first().copied().unwrap_or(DType::F32);
+                let experts_all_gate_up_mq4 = !gate_up_dtypes.is_empty()
+                    && gate_up_dtypes.iter().all(|&dtype| dtype == DType::MQ4G256);
+                let params_gate_paro = m.experts[0].gate_up.paro.as_ref().map(|paro| GivensRef {
+                    pairs: &paro.pairs,
+                    theta: &paro.theta,
+                    scales: &paro.channel_scales,
+                    krot: paro.krot as usize,
+                });
+                let params_down_paro = m.experts[0].down.paro.as_ref().map(|paro| GivensRef {
+                    pairs: &paro.pairs,
+                    theta: &paro.theta,
+                    scales: &paro.channel_scales,
+                    krot: paro.krot as usize,
+                });
                 let params = MoePrefillParams {
                     dtypes: MoeDtypes {
-                        router: DType::Q8_0,
+                        router: m.router.gpu_dtype,
+                        // Cohere has no shared expert. These inert values keep
+                        // the existing family parameter shape while the sealed
+                        // call records `MoeSharedContribution::PerRankResidual`.
                         shared_gate: DType::Q8_0,
                         shared_expert_gate: DType::Q8_0,
                         shared_expert_up: DType::Q8_0,
                         shared_expert_down: DType::Q8_0,
-                        experts_all_gate_up_mq4: edt == DType::MQ4G256,
+                        experts_all_gate_up_mq4,
                         routed_gate_up: edt,
-                        routed_down: m.experts[0].down.gpu_dtype,
-                        routed_has_mixed_experts: false,
-                        per_expert_gate_up: None,
-                        per_expert_down: None,
-                        has_paro_shared: false,
+                        routed_down,
+                        routed_has_mixed_experts: gate_up_mixed || down_mixed,
+                        per_expert_gate_up: gate_up_mixed.then_some(gate_up_dtypes),
+                        per_expert_down: down_mixed.then_some(down_dtypes),
+                        has_paro_shared: m.paro_shared.is_some(),
                     },
                     batch_size: b,
                     mi: moe_inter,
@@ -872,6 +894,7 @@ pub fn forward_batch(
                     x_rot_batch: &ffn_x_rot,
                     expert_gate_up_ptrs: &m.expert_gate_up_ptrs,
                     expert_down_ptrs: &m.expert_down_ptrs,
+                    routed_experts: m,
                     expert_down_awq_ptrs: None,
                     expert_dtype_tags: None,
                     gate_batch: &gate,
@@ -885,14 +908,30 @@ pub fn forward_batch(
                     inverse_perm: &inverse_perm,
                     y_gate_up_grouped: &y_gate_up_grouped,
                     y_down_grouped: &y_down_grouped,
-                    paro_gate_up: None,
-                    paro_down: None,
+                    paro_gate_up: params_gate_paro,
+                    paro_down: params_down_paro,
                     down_awq_scale: None,
                     routed_out: None,
                 };
-                moe_family()
-                    .run_prefill(&ctx, gpu, &params)
-                    .map_err(|e| format!("cohere2moe L{l} run_prefill: {e:?}"))?;
+                let mut call = seal_prefill_with_router(
+                    bound,
+                    &ctx,
+                    params,
+                    MoeRouterInput::PrecomputedSigmoidTopK,
+                )
+                .map_err(|e| format!("cohere2moe L{l} seal prefill: {e:?}"))?;
+                let receipt = produce_prefill_route(&call, gpu, &router_logits, cfg.norm_topk_prob)
+                    .map_err(|e| format!("cohere2moe L{l} route producer: {e:?}"))?;
+                call.attach_route_receipt(receipt)
+                    .map_err(|e| format!("cohere2moe L{l} route receipt: {e:?}"))?;
+
+                // `ffn_x_rot` is the model-owned activation basis required by
+                // the Paro/MQ indexed kernels. Keep this transform before the
+                // sealed route executor, exactly as in the previous path.
+                rotate_x_mq_batched_for(gpu, &m.experts[0].gate_up, &normed, &ffn_x_rot, hidden, b)
+                    .map_err(|e| format!("cohere2moe L{l} batch rot: {e}"))?;
+                execute_steps(gpu, &ctx, &[Step::Moe(call)])
+                    .map_err(|e| format!("cohere2moe L{l} sealed prefill: {e:?}"))?;
             }
         }
         if normdump {

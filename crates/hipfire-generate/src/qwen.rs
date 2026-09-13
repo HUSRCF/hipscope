@@ -58,10 +58,7 @@ use rdna_compute;
 /// exposing their synthetic token. Keeping this sequencing in one inline gate
 /// makes the no-failure-publication contract explicit and testable without HIP.
 #[inline]
-fn publish_after_forward<E>(
-    forward: Result<(), E>,
-    publish: impl FnOnce(),
-) -> Result<(), E> {
+fn publish_after_forward<E>(forward: Result<(), E>, publish: impl FnOnce()) -> Result<(), E> {
     forward?;
     publish();
     Ok(())
@@ -86,24 +83,28 @@ pub struct EpSampling {
     pub min_p: Option<f32>,
 }
 
-/// Which EP serve body owns an arch_id. Pure so the dispatch contract is
-/// unit-testable. Archs without an `EpArch` (LFM2, Cohere2, anything new) must
-/// NOT reach a serve body: the old `_ => ep_serve_ds4` fallthrough ran the
-/// DeepSeek4 EP protocol against foreign weights instead of refusing.
+/// Which EP serve body owns a loaded EP model. Pure so the dispatch contract
+/// is unit-testable. Archs without an `EpArch` (LFM2, Cohere2, anything new)
+/// must NOT reach a serve body: the old `_ => ep_serve_ds4` fallthrough ran
+/// the DeepSeek4 EP protocol against foreign weights instead of refusing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EpServeTarget {
     Minimax,
+    Qwen35Moe,
     Qwen35DenseTp,
     Deepseek4,
     UnsupportedArch(u32),
 }
 
-/// EP serve dispatch by arch_id. 9/10/5|6 keep their existing servers;
-/// anything else is an explicit refusal, never a wrong-server fallthrough.
+/// EP serve dispatch by arch_id: the arch-level default. 5|6 default to the
+/// MoE server; a dense-TP load (`EpArch::Qwen35DenseTp`) is refined to its own
+/// server by the `EpArch` match in [`generate_ep`] — arch_id alone cannot
+/// distinguish them, and a MoE model must never enter the dense-TP server.
+/// Anything else is an explicit refusal, never a wrong-server fallthrough.
 pub fn ep_serve_target(arch_id: u32) -> EpServeTarget {
     match arch_id {
         10 => EpServeTarget::Minimax,
-        5 | 6 => EpServeTarget::Qwen35DenseTp,
+        5 | 6 => EpServeTarget::Qwen35Moe,
         9 => EpServeTarget::Deepseek4,
         other => EpServeTarget::UnsupportedArch(other),
     }
@@ -263,7 +264,19 @@ pub fn generate_ep(
         hipfire_loader::EpEosRoute::Qwen35 => m.qwen35_eos_tok,
         hipfire_loader::EpEosRoute::Deepseek4 => m.deepseek4_eos_tok,
     };
-    match ep_serve_target(m.arch_id) {
+    // Route by the loaded `EpArch`, never by arch_id alone: arch 5|6 covers
+    // both the MoE server (`EpArch::Qwen35`) and the dense-TP server
+    // (`EpArch::Qwen35DenseTp`), and a MoE model must never enter the
+    // dense-TP server (nor vice versa). `ep_serve_target` above is the
+    // arch-level default used when no EP state is loaded.
+    let serve_target = match m.ep.as_ref().map(|ep| &ep.inner) {
+        Some(EpArch::Minimax { .. }) => EpServeTarget::Minimax,
+        Some(EpArch::Qwen35 { .. }) => EpServeTarget::Qwen35Moe,
+        Some(EpArch::Qwen35DenseTp { .. }) => EpServeTarget::Qwen35DenseTp,
+        Some(EpArch::Ds4 { .. }) => EpServeTarget::Deepseek4,
+        None => ep_serve_target(m.arch_id),
+    };
+    match serve_target {
         EpServeTarget::Minimax => ep_serve_minimax(
             m,
             stdout,
@@ -271,6 +284,18 @@ pub fn generate_ep(
             &prompt_ids,
             eos_tok,
             max_tokens,
+            stop,
+            primed_think,
+            sampling,
+        ),
+        EpServeTarget::Qwen35Moe => ep_serve_qwen35_moe(
+            m,
+            stdout,
+            id,
+            &prompt_ids,
+            eos_tok,
+            max_tokens,
+            max_think_tokens,
             stop,
             primed_think,
             sampling,
@@ -309,7 +334,7 @@ pub fn generate_ep(
                 Some(id),
                 &format!(
                     "EP generate not supported for arch_id={arch} \
-                     (only 9/DeepSeek4, 10/MiniMax and dense 5|6 Qwen3.5 \
+                     (only 9/DeepSeek4, 10/MiniMax and 5|6 Qwen3.5 \
                      have an EP serve path)"
                 ),
                 "unsupported",
@@ -575,15 +600,7 @@ pub fn ep_serve_qwen35_dense_tp(
                 return Err("EP arch mismatch (expected dense Qwen TP)".to_string());
             };
             qwen35::forward_scratch_dense_tp(
-                gpus,
-                shard,
-                weights,
-                configs,
-                next,
-                write_pos,
-                kv_caches,
-                dn_states,
-                scratches,
+                gpus, shard, weights, configs, next, write_pos, kv_caches, dn_states, scratches,
             )
             .map_err(|e| format!("dense TP decode: {e:?}"))
         })();
@@ -728,6 +745,482 @@ pub fn ep_serve_qwen35_dense_tp(
     );
 }
 
+/// Reset MoE-EP sequential state on every rank before publishing one
+/// fail-closed error. Same attested all-rank epilogue as the dense-TP path
+/// (via the shared mesh reset, which owns `ep_reset_after_abort`), without
+/// requiring a separate daemon GPU handle.
+fn qwen35_moe_fail_closed_error(
+    m: &mut LoadedModel,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    message: &str,
+    class: &str,
+    retryable: bool,
+) {
+    let ep = crate::common::reset_mesh_request_state(m, None);
+    emit_fail_closed_error(stdout, Some(id), message, class, retryable, &ep);
+}
+
+/// Qwen3.5-MoE sequential expert-parallel serving loop (tp=2|4).
+///
+/// Greedy/sampled AR via the canonical `qwen35::forward_ep` across the EP
+/// ranks (per-token prefill replayed from position 0 every turn, exactly as
+/// the ds4 EP server does); logits gathered on rank 0 and sampled host-side
+/// with the request-resolved `EpSampling`. Qwen contract-v2 semantic
+/// streaming matches the dense-TP server, so think/stop/EOS handling is
+/// identical and only the forward + state types differ.
+#[allow(clippy::too_many_arguments)]
+pub fn ep_serve_qwen35_moe(
+    m: &mut LoadedModel,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    prompt_ids: &[u32],
+    eos_tok: u32,
+    max_tokens: usize,
+    max_think_tokens: usize,
+    stop: &[String],
+    primed_think: bool,
+    sampling: EpSampling,
+) {
+    let prompt_n = prompt_ids.len();
+    if prompt_n.saturating_add(max_tokens) > m.physical_cap {
+        emit_active_attempt_error(
+            stdout,
+            Some(id),
+            &format!(
+                "prompt exceeds context capacity: prompt={prompt_n} + max_tokens={max_tokens} > capacity={}",
+                m.physical_cap
+            ),
+            "context_length",
+            false,
+            false,
+        );
+        let _ = stdout.flush();
+        return;
+    }
+
+    // This route replays the complete rendered conversation each request, so
+    // no per-rank state is reusable across turns: reset DeltaNet + clear KV
+    // on every rank (on its own device) before prefill. Any pre-request
+    // reset failure is terminal via the attested EP epilogue below.
+    let reset_error = {
+        let mut error = None;
+        if let Some(EpState { gpus, inner }) = m.ep.as_mut() {
+            if let EpArch::Qwen35 {
+                kv_caches,
+                dn_states,
+                ..
+            } = inner
+            {
+                let rank_count = gpus.devices.len();
+                if kv_caches.len() != rank_count || dn_states.len() != rank_count {
+                    error = Some(format!(
+                        "qwen35 MoE EP state rank mismatch: kv={} dn={} ranks={rank_count}",
+                        kv_caches.len(),
+                        dn_states.len()
+                    ));
+                } else {
+                    for rank in 0..rank_count {
+                        let gpu = &mut gpus.devices[rank];
+                        if let Err(e) = gpu.bind_thread() {
+                            error = Some(format!("qwen35 MoE EP bind_thread rank {rank}: {e:?}"));
+                            break;
+                        }
+                        if let Err(e) = dn_states[rank].reset(gpu) {
+                            error = Some(format!("qwen35 MoE EP state reset rank {rank}: {e:?}"));
+                            break;
+                        }
+                        if let Err(e) = kv_caches[rank].clear_gpu(gpu) {
+                            error = Some(format!("qwen35 MoE EP KV clear rank {rank}: {e:?}"));
+                            break;
+                        }
+                        gpu.invalidate_graph_state();
+                    }
+                }
+            }
+        }
+        error
+    };
+    if let Some(error) = reset_error {
+        qwen35_moe_fail_closed_error(m, stdout, id, &error, "validation", false);
+        let _ = stdout.flush();
+        return;
+    }
+    m.seq_pos = 0;
+    m.conversation_tokens.clear();
+    // `primed_think` preserves Jinja enable_thinking semantics (render ended on
+    // an open `<think>` primer). Tool requests fail closed before this route.
+    crate::ar::emit_generation_start(
+        crate::ar::active_generation_route().unwrap_or(crate::ar::GenerationRoute::QwenAr),
+        stdout,
+        id,
+        primed_think,
+    );
+
+    let t_prefill = Instant::now();
+    let mut aborted_in_prefill = false;
+    // Batched EP prefill: windows of <= common prefill scratch max_batch.
+    // Absolute start_pos is the chunk offset (request already reset KV/DN above).
+    // Scratch source: load-owned prefill_pbs/prefill_partials when batch is
+    // None; when batch is staged the loader drains those and sequential
+    // fallthrough (daemon !ep_batch_eligible) reuses batch seed scratch via
+    // sequential_prefill_scratch_mut. Missing/empty scratch fails closed
+    // before GPU mutation. No token fallback.
+    let mut off = 0usize;
+    while off < prompt_n {
+        if check_abort(id) {
+            aborted_in_prefill = true;
+            break;
+        }
+        let result = {
+            let Some(EpState { gpus, inner }) = m.ep.as_mut() else {
+                qwen35_moe_fail_closed_error(
+                    m,
+                    stdout,
+                    id,
+                    "qwen35 MoE EP prefill without EP state",
+                    "validation",
+                    false,
+                );
+                return;
+            };
+            let EpArch::Qwen35 {
+                config,
+                weights,
+                kv_caches,
+                dn_states,
+                scratches,
+                batch,
+                prefill_pbs,
+                prefill_partials,
+                ..
+            } = inner
+            else {
+                qwen35_moe_fail_closed_error(
+                    m,
+                    stdout,
+                    id,
+                    "EP arch mismatch (expected qwen35 MoE EP)",
+                    "validation",
+                    false,
+                );
+                return;
+            };
+            let n_rank = gpus.devices.len();
+            // Select prefill scratch once per window: seed when batch staged,
+            // else load-owned sequential buffers.
+            if let Some(batch_state) = batch.as_mut() {
+                // Disjoint borrow from the concrete batch owner: seed scratch plus
+                // the SAME live lease `prefill_lane`/`forward_tick` reduce under,
+                // so the MoE partial sum uses the leased rooted API the lease
+                // guard requires. No new pool, no re-acquire, no release.
+                let (pbs, parts, peer_lease) = batch_state.sequential_prefill_scratch_mut();
+                if pbs.is_empty()
+                    || parts.is_empty()
+                    || pbs.len() != n_rank
+                    || parts.len() != n_rank
+                {
+                    Err("qwen35 MoE EP prefill missing batch seed scratch".to_string())
+                } else {
+                    let max_batch = pbs[0].max_batch;
+                    if max_batch == 0 {
+                        Err("qwen35 MoE EP prefill seed max_batch is zero".to_string())
+                    } else {
+                        let end = (off + max_batch).min(prompt_n);
+                        let start_pos = off;
+                        qwen35::forward_prefill_batch_ep(
+                            gpus,
+                            weights,
+                            config,
+                            &prompt_ids[start_pos..end],
+                            start_pos,
+                            kv_caches,
+                            dn_states,
+                            scratches,
+                            pbs,
+                            parts,
+                            peer_lease,
+                        )
+                        .map(|_| end)
+                        .map_err(|e| format!("qwen35 MoE EP prefill: {e:?}"))
+                    }
+                }
+            } else if prefill_pbs.is_empty()
+                || prefill_partials.is_empty()
+                || prefill_pbs.len() != n_rank
+                || prefill_partials.len() != n_rank
+            {
+                Err("qwen35 MoE EP prefill missing load-owned prefill scratch".to_string())
+            } else {
+                let max_batch = prefill_pbs[0].max_batch;
+                if max_batch == 0 {
+                    Err("qwen35 MoE EP prefill scratch max_batch is zero".to_string())
+                } else {
+                    let end = (off + max_batch).min(prompt_n);
+                    let start_pos = off;
+                    // Plain sequential without batch: no live lease, so the
+                    // unleased selection inside is unchanged.
+                    qwen35::forward_prefill_batch_ep(
+                        gpus,
+                        weights,
+                        config,
+                        &prompt_ids[start_pos..end],
+                        start_pos,
+                        kv_caches,
+                        dn_states,
+                        scratches,
+                        prefill_pbs,
+                        prefill_partials,
+                        None,
+                    )
+                    .map(|_| end)
+                    .map_err(|e| format!("qwen35 MoE EP prefill: {e:?}"))
+                }
+            }
+        };
+        match result {
+            Ok(end) => off = end,
+            Err(message) => {
+                qwen35_moe_fail_closed_error(m, stdout, id, &message, "validation", false);
+                let _ = stdout.flush();
+                return;
+            }
+        }
+    }
+    if aborted_in_prefill || check_abort(id) {
+        ep_emit_abort(
+            crate::ar::active_generation_route().unwrap_or(crate::ar::GenerationRoute::QwenAr),
+            stdout,
+            id,
+            m,
+            0,
+        );
+        return;
+    }
+    // Bookkeeping matches the fully replayed prompt so decode commits extend
+    // the same conversation/stream positions the single-GPU path would.
+    m.conversation_tokens.extend_from_slice(prompt_ids);
+    m.seq_pos = prompt_n;
+    let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
+    let logits_result: Result<Vec<f32>, String> = (|| {
+        let Some(EpState { gpus, inner }) = m.ep.as_mut() else {
+            return Err("qwen35 MoE EP first-logits without EP state".to_string());
+        };
+        let EpArch::Qwen35 { scratches, .. } = inner else {
+            return Err("EP arch mismatch (expected qwen35 MoE EP)".to_string());
+        };
+        if let Err(e) = gpus.devices[0].bind_thread() {
+            return Err(format!("qwen35 MoE EP first-logits bind_thread: {e:?}"));
+        }
+        gpus.devices[0]
+            .download_f32(&scratches[0].logits)
+            .map_err(|e| format!("qwen35 MoE EP first-logits download: {e:?}"))
+    })();
+    let mut logits = match logits_result {
+        Ok(logits) => logits,
+        Err(message) => {
+            qwen35_moe_fail_closed_error(m, stdout, id, &message, "validation", false);
+            let _ = stdout.flush();
+            return;
+        }
+    };
+
+    let t_decode = Instant::now();
+    let mut semantic =
+        crate::ar::QwenArSemanticProducer::new_with_tool_protocol(id, primed_think, false);
+    let mut streamed_tokens: Vec<u32> = Vec::new();
+    let mut bytes_fed_to_filter = 0usize;
+    let mut generated = 0usize;
+    let mut think_count = 0usize;
+    let mut hit_custom_stop = false;
+    while generated < max_tokens {
+        if check_abort(id) {
+            ep_emit_abort(
+                crate::ar::active_generation_route().unwrap_or(crate::ar::GenerationRoute::QwenAr),
+                stdout,
+                id,
+                m,
+                generated,
+            );
+            return;
+        }
+        let next = llama::sample_full_dist(
+            &logits,
+            sampling.temp,
+            sampling.top_p,
+            sampling.top_k,
+            sampling.min_p,
+        );
+
+        // KV write before any client-visible classify/emit (same contract as AR).
+        let write_pos = m.seq_pos;
+        let forward_result: Result<(), String> = (|| {
+            let Some(EpState { gpus, inner }) = m.ep.as_mut() else {
+                return Err("qwen35 MoE EP decode without EP state".to_string());
+            };
+            let EpArch::Qwen35 {
+                config,
+                weights,
+                kv_caches,
+                dn_states,
+                scratches,
+                partials,
+                batch,
+                ..
+            } = inner
+            else {
+                return Err("EP arch mismatch (expected qwen35 MoE EP)".to_string());
+            };
+            // Batch-staged sequential fallback borrows the SAME live lease the
+            // batch owner reduces under; ordinary sequential keeps None.
+            let peer_lease = batch.as_ref().and_then(|b| b.peer_reduce_lease());
+            qwen35::forward_ep(
+                gpus, weights, config, next, write_pos, kv_caches, dn_states, scratches, partials,
+                peer_lease,
+            )
+            .map_err(|e| format!("qwen35 MoE EP decode: {e:?}"))
+        })();
+        if let Err(message) = forward_result {
+            qwen35_moe_fail_closed_error(m, stdout, id, &message, "validation", false);
+            return;
+        }
+
+        let prev_fed = bytes_fed_to_filter;
+        let elapsed_ms = t_decode.elapsed().as_millis() as u64;
+        let filter_stop = match semantic.commit_and_classify(
+            stdout,
+            next,
+            || {
+                let pos = crate::ar::qwen_ar_raw_commit_token(
+                    &mut m.conversation_tokens,
+                    &mut streamed_tokens,
+                    &mut m.seq_pos,
+                    next,
+                    crate::ar::QwenArRawCommitDisposition::ClassifiedVisible,
+                );
+                let all_bytes = m.tokenizer.as_ref().unwrap().decode_bytes(&streamed_tokens);
+                let new_bytes = all_bytes[prev_fed.min(all_bytes.len())..].to_vec();
+                bytes_fed_to_filter = all_bytes.len();
+                (pos, new_bytes)
+            },
+            |pos, out| {
+                emit_committed_event(out, id, next, pos, elapsed_ms);
+            },
+        ) {
+            Ok(stop) => stop,
+            Err(err) => {
+                qwen35_moe_fail_closed_error(
+                    m,
+                    stdout,
+                    id,
+                    &format!("qwen35 MoE EP semantic classify: {err}"),
+                    "validation",
+                    false,
+                );
+                return;
+            }
+        };
+        generated += 1;
+
+        // Custom stops match visible answer text (post EosFilter/think route),
+        // never raw protocol bytes.
+        if stop
+            .iter()
+            .any(|s| !s.is_empty() && semantic.visible().ends_with(s.as_str()))
+        {
+            hit_custom_stop = true;
+            break;
+        }
+
+        // Conservative think-budget: count tokens while the router is inside a
+        // think span. Exceeding a nonzero cap fails closed — no force-close
+        // splice and no partial semantic done.
+        if max_think_tokens > 0 {
+            if semantic.think_router.in_think() {
+                think_count = think_count.saturating_add(1);
+                if think_count >= max_think_tokens {
+                    let ep = ep_reset_after_abort(m);
+                    emit_fail_closed_error(
+                        stdout,
+                        Some(id),
+                        "think token budget exceeded (validation)",
+                        "validation",
+                        false,
+                        &ep,
+                    );
+                    return;
+                }
+            } else {
+                think_count = 0;
+            }
+        }
+
+        if filter_stop || next == eos_tok || generated >= max_tokens {
+            break;
+        }
+
+        let logits_result: Result<Vec<f32>, String> = (|| {
+            let Some(EpState { gpus, inner }) = m.ep.as_mut() else {
+                return Err("qwen35 MoE EP decode logits without EP state".to_string());
+            };
+            let EpArch::Qwen35 { scratches, .. } = inner else {
+                return Err("EP arch mismatch (expected qwen35 MoE EP)".to_string());
+            };
+            if let Err(e) = gpus.devices[0].bind_thread() {
+                return Err(format!("qwen35 MoE EP decode logits bind_thread: {e:?}"));
+            }
+            gpus.devices[0]
+                .download_f32(&scratches[0].logits)
+                .map_err(|e| format!("qwen35 MoE EP decode logits download: {e:?}"))
+        })();
+        logits = match logits_result {
+            Ok(logits) => logits,
+            Err(message) => {
+                qwen35_moe_fail_closed_error(m, stdout, id, &message, "validation", false);
+                return;
+            }
+        };
+    }
+
+    // Custom stop is a natural/filter-class terminal, not length.
+    let hit_length_cap = generated >= max_tokens && !hit_custom_stop;
+    let (finish, _visible) = match semantic.finish(stdout, hit_length_cap) {
+        Ok(pair) => pair,
+        Err(err) => {
+            qwen35_moe_fail_closed_error(
+                m,
+                stdout,
+                id,
+                &format!("qwen35 MoE EP semantic finish: {err}"),
+                "validation",
+                false,
+            );
+            return;
+        }
+    };
+    if matches!(finish.cause, crate::ar::QwenArTerminalCause::OpenThink) {
+        let ep = ep_reset_after_abort(m);
+        crate::ar::emit_qwen_ar_open_think_terminal(stdout, id, generated, &ep);
+        return;
+    }
+    let finish_reason = match finish.finish_reason {
+        "length" => "length",
+        "error" => "error",
+        _ => "stop",
+    };
+    ep_emit_done(
+        crate::ar::active_generation_route().unwrap_or(crate::ar::GenerationRoute::QwenAr),
+        stdout,
+        id,
+        m,
+        generated,
+        prompt_n,
+        prefill_ms,
+        t_decode.elapsed().as_secs_f64() * 1000.0,
+        finish_reason,
+    );
+}
+
 pub fn ep_emit_done(
     route: crate::ar::GenerationRoute,
     stdout: &mut std::io::Stdout,
@@ -810,14 +1303,76 @@ pub fn ep_reset_after_abort(m: &mut LoadedModel) -> RollbackEpilogue {
                     g.invalidate_graph_state();
                 }
             }
-            EpArch::Qwen35 { batch, .. } => {
+            EpArch::Qwen35 {
+                kv_caches,
+                dn_states,
+                batch,
+                ..
+            } => {
                 if let Some(batch) = batch.as_mut() {
                     if let Err(e) = batch.reset_all(gpus) {
                         push_reset_err(&mut first_err, "qwen35 ep batch reset_all", e);
                     }
                 }
-                for dev in &mut gpus.devices {
-                    dev.invalidate_graph_state();
+                // Sequential per-rank decode state: reset DeltaNet + clear KV
+                // on each owning device so the next request replays from a
+                // cold cursor (cancel/reuse correctness). Mirrors the dense-TP
+                // arm with the MoE-EP field names.
+                let rank_count = gpus.devices.len();
+                if dn_states.len() != rank_count {
+                    push_reset_err(
+                        &mut first_err,
+                        "qwen35 MoE EP DN state rank count",
+                        format!("got {}, expected {rank_count}", dn_states.len()),
+                    );
+                }
+                if kv_caches.len() != rank_count {
+                    push_reset_err(
+                        &mut first_err,
+                        "qwen35 MoE EP KV cache rank count",
+                        format!("got {}, expected {rank_count}", kv_caches.len()),
+                    );
+                }
+                for rank in 0..rank_count {
+                    let gpu = &mut gpus.devices[rank];
+                    if let Err(e) = gpu.bind_thread() {
+                        push_reset_err(
+                            &mut first_err,
+                            &format!("qwen35 MoE EP rank{rank} bind_thread"),
+                            e,
+                        );
+                    }
+                    if let Some(state) = dn_states.get_mut(rank) {
+                        if let Err(e) = state.reset(gpu) {
+                            push_reset_err(
+                                &mut first_err,
+                                &format!("qwen35 MoE EP rank{rank} state reset"),
+                                e,
+                            );
+                        }
+                    } else {
+                        push_reset_err(
+                            &mut first_err,
+                            &format!("qwen35 MoE EP rank{rank} state"),
+                            "missing",
+                        );
+                    }
+                    if let Some(kv) = kv_caches.get_mut(rank) {
+                        if let Err(e) = kv.clear_gpu(gpu) {
+                            push_reset_err(
+                                &mut first_err,
+                                &format!("qwen35 MoE EP rank{rank} KV clear"),
+                                e,
+                            );
+                        }
+                    } else {
+                        push_reset_err(
+                            &mut first_err,
+                            &format!("qwen35 MoE EP rank{rank} KV cache"),
+                            "missing",
+                        );
+                    }
+                    gpu.invalidate_graph_state();
                 }
             }
             EpArch::Qwen35DenseTp {
@@ -5703,7 +6258,6 @@ pub fn generate_mesh_carrier(
     );
 }
 
-
 // --- Auto-appended shared helpers (shared-temp, dedup at merge) ---
 
 /// Walk a [`serde_json::Value`] and produce a canonical-key
@@ -6859,11 +7413,14 @@ mod ep_serve_target_tests {
 
     #[test]
     fn known_ep_archs_keep_their_servers_but_all_others_refuse() {
-        // Adjacent supported: DS4, MiniMax and dense Qwen3.5 keep their servers.
+        // Adjacent supported: DS4, MiniMax and Qwen3.5-MoE keep their servers.
+        // (A dense-TP load refines 5|6 to `Qwen35DenseTp` via its `EpArch` in
+        // `generate_ep`; arch_id alone defaults to the MoE server so MoE
+        // never enters the dense-TP server.)
         assert_eq!(ep_serve_target(9), EpServeTarget::Deepseek4);
         assert_eq!(ep_serve_target(10), EpServeTarget::Minimax);
-        assert_eq!(ep_serve_target(5), EpServeTarget::Qwen35DenseTp);
-        assert_eq!(ep_serve_target(6), EpServeTarget::Qwen35DenseTp);
+        assert_eq!(ep_serve_target(5), EpServeTarget::Qwen35Moe);
+        assert_eq!(ep_serve_target(6), EpServeTarget::Qwen35Moe);
         // No EpArch exists for these: explicit refusal naming the arch,
         // never the old wrong-server DS4 fallthrough.
         assert_eq!(ep_serve_target(11), EpServeTarget::UnsupportedArch(11));

@@ -34,9 +34,10 @@ use hipfire_dispatch::pipeline::superop::{
 };
 use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
 use hipfire_dispatch::types::{dtype_rotation_plan, DispatchError};
-use hipfire_runtime::llama::{
-    fused_silu_mul_rotate_mq_batched_for, rotate_x_mq_batched_for, rotate_x_mq_for, weight_gemv};
 use hipfire_runtime::llama::KvCacheExt;
+use hipfire_runtime::llama::{
+    fused_silu_mul_rotate_mq_batched_for, rotate_x_mq_batched_for, rotate_x_mq_for, weight_gemv,
+};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 /// Decode one token (eager); returns the full logits vector. Used for prefill,
@@ -1697,6 +1698,7 @@ pub fn forward_ep(
             partials,
             &program,
             hidden,
+            None,
         )
         .map_err(|e| format!("forward_ep run_layer_program_ep L{l}: {e}"))?;
     }
