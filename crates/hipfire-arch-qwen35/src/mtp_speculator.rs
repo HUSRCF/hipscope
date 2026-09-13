@@ -27,21 +27,12 @@ use hipfire_runtime::spec::{
 };
 use rdna_compute::Gpu;
 
-/// Env `HIPFIRE_NGRAM_MOD_{N_MATCH,N_MIN,N_MAX}` with production defaults.
+/// `HIPFIRE_NGRAM_MOD_{N_MATCH,N_MIN,N_MAX}` with production defaults.
 /// `None` when the triple is invalid (max>64, zero match/max, or min>max).
+/// Values resolve through the config-owned snapshot
+/// ([`hipfire_config::ngram_mod_triple`]); validation stays here.
 fn ngram_mod_env_config() -> Option<NgramModConfig> {
-    let n_match: usize = hipfire_config::developer_var("HIPFIRE_NGRAM_MOD_N_MATCH")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(24);
-    let n_min: usize = hipfire_config::developer_var("HIPFIRE_NGRAM_MOD_N_MIN")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(48);
-    let n_max: usize = hipfire_config::developer_var("HIPFIRE_NGRAM_MOD_N_MAX")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(64);
+    let (n_match, n_min, n_max) = hipfire_config::ngram_mod_triple();
     if n_max <= 64 && n_max >= 1 && n_match >= 1 && n_min <= n_max {
         Some(NgramModConfig {
             capacity: 1 << 22,
@@ -83,10 +74,19 @@ pub struct Qwen35MtpDrafter {
     checkpoint_resume: bool,
     checkpoint_interval: usize,
     checkpoint_cap: usize,
+    /// Strict-prefix terminal-repair enablement, resolved once at construction
+    /// from [`hipfire_config::mtp_cache_policy`] (config-owned). The repair
+    /// path performs no policy reads of its own.
+    window_rollback: bool,
 }
 
 impl Qwen35MtpDrafter {
     pub fn new(head: Qwen35MtpHead, max_n: usize, ctx_capacity: usize) -> Self {
+        // Cache policy is config-owned: resolved once here from the process
+        // snapshot via [`hipfire_config::mtp_cache_policy`] (never per-repair
+        // or per-step), mirroring `build_dflash_speculator`'s one-shot
+        // resolution for the DFlash ring.
+        let policy = hipfire_config::mtp_cache_policy();
         Self {
             head,
             state: None,
@@ -102,21 +102,18 @@ impl Qwen35MtpDrafter {
             stats: MtpRequestStats::default(),
             last_window: None,
             checkpoints: Vec::new(),
-            checkpoint_resume: hipfire_config::developer_var("HIPFIRE_DFLASH_CKPT_RESUME")
-                .ok()
-                .as_deref()
-                != Some("0"),
-            checkpoint_interval: hipfire_config::developer_var("HIPFIRE_CACHE_CKPT_INTERVAL")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(2048usize)
-                .max(256),
-            checkpoint_cap: hipfire_config::developer_var("HIPFIRE_CACHE_CKPT_MAX")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(8usize)
-                .max(1),
+            checkpoint_resume: policy.checkpoint_resume,
+            checkpoint_interval: policy.checkpoint_interval,
+            checkpoint_cap: policy.checkpoint_cap,
+            window_rollback: policy.window_rollback,
         }
+    }
+    /// Borrow the live MTP spec state (`None` before the first `mtp_prefill`
+    /// allocates it). Attestation hook for hardware byte-identity proofs:
+    /// lets a test fingerprint the MTP-head KV / `prev_hidden` resident in
+    /// the drafter without re-implementing the prefill/step/repair paths.
+    pub fn mtp_live_state(&self) -> Option<&MtpSpecState> {
+        self.state.as_ref()
     }
 
     /// Downcast the generic target to a qwen35 `ModelSlot` (same as DflashSpeculator).
@@ -192,11 +189,7 @@ impl Qwen35MtpDrafter {
     /// n-gram-mod without reallocating/destroying warm prefix state.
     fn ensure_state(&mut self, gpu: &mut Gpu, slot: &ModelSlot) -> Result<(), String> {
         if self.state.is_none() {
-            let verify_capacity = if hipfire_config::developer_var("HIPFIRE_MTP_NGRAM")
-                .ok()
-                .as_deref()
-                == Some("1")
-            {
+            let verify_capacity = if hipfire_config::mtp_ngram_enabled() {
                 ngram_mod_env_config()
                     .map(|cfg| self.max_n.max(cfg.n_max))
                     .unwrap_or(self.max_n)
@@ -487,11 +480,7 @@ impl MtpDrafter for Qwen35MtpDrafter {
         window_seed: u32,
         consumed: &[u32],
     ) -> Result<bool, String> {
-        if hipfire_config::developer_var("HIPFIRE_SPEC_WINDOW_ROLLBACK")
-            .ok()
-            .as_deref()
-            == Some("0")
-        {
+        if !self.window_rollback {
             return Ok(false);
         }
         let Some((saved_start, saved_seed)) = self.last_window.take() else {

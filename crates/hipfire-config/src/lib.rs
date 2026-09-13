@@ -3461,6 +3461,68 @@ fn parse_developer_bool(raw: Option<&str>, default: bool) -> bool {
         _ => default,
     }
 }
+/// MTP divergent-render checkpoint + strict-prefix terminal-repair policy.
+///
+/// Resolved once at drafter construction from the documented process-snapshot
+/// keys (see `docs/env-vars.md`): `HIPFIRE_DFLASH_CKPT_RESUME` (shared with the
+/// DFlash divergent-render path — there is no MTP-only twin),
+/// `HIPFIRE_CACHE_CKPT_INTERVAL` / `HIPFIRE_CACHE_CKPT_MAX`, and
+/// `HIPFIRE_SPEC_WINDOW_ROLLBACK`. Defaults match the MTP PRs that introduced
+/// the consumers: resume on, rollback on, interval 2048 (floor 256), cap 8
+/// (floor 1). Reads go through the versioned [`ProcessConfig`] snapshot so
+/// TOML `[developer]` overrides and the env-beats-config-beats-default
+/// precedence apply; arch crates receive these resolved values and perform
+/// no policy reads of their own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MtpCachePolicy {
+    pub checkpoint_resume: bool,
+    pub checkpoint_interval: usize,
+    pub checkpoint_cap: usize,
+    pub window_rollback: bool,
+}
+/// Resolve the [`MtpCachePolicy`] from the process snapshot. Called once at
+/// load (mirrors `build_dflash_speculator`'s one-shot resolution); never
+/// per-repair or per-step.
+pub fn mtp_cache_policy() -> MtpCachePolicy {
+    MtpCachePolicy {
+        checkpoint_resume: developer_bool("HIPFIRE_DFLASH_CKPT_RESUME", true),
+        checkpoint_interval: developer_var("HIPFIRE_CACHE_CKPT_INTERVAL")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2048usize)
+            .max(256),
+        checkpoint_cap: developer_var("HIPFIRE_CACHE_CKPT_MAX")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8usize)
+            .max(1),
+        window_rollback: developer_bool("HIPFIRE_SPEC_WINDOW_ROLLBACK", true),
+    }
+}
+/// MTP n-gram-modifier arm enablement (`HIPFIRE_MTP_NGRAM=1`). Strict
+/// snapshot boolean, default off — identical to the former
+/// `developer_var(..) == Some("1")` call sites.
+pub fn mtp_ngram_enabled() -> bool {
+    developer_bool("HIPFIRE_MTP_NGRAM", false)
+}
+/// Raw `HIPFIRE_NGRAM_MOD_{N_MATCH,N_MIN,N_MAX}` triple with production
+/// defaults (24/48/64). Validation (max <= 64, min <= max, …) stays with the
+/// arch consumer; this only resolves the snapshot values.
+pub fn ngram_mod_triple() -> (usize, usize, usize) {
+    let n_match: usize = developer_var("HIPFIRE_NGRAM_MOD_N_MATCH")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(24);
+    let n_min: usize = developer_var("HIPFIRE_NGRAM_MOD_N_MIN")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(48);
+    let n_max: usize = developer_var("HIPFIRE_NGRAM_MOD_N_MAX")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(64);
+    (n_match, n_min, n_max)
+}
 
 fn render_compat_value(value: &ConfigValue) -> Option<String> {
     Some(match value {
