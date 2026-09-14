@@ -3249,7 +3249,7 @@ impl Gpu {
             && n_heads == 24
             && n_kv_heads == 4
             && head_dim == 256
-            && (64..=384).contains(&batch_size)
+            && (64..=512).contains(&batch_size)
             && batch_size % 16 == 0
             && (64..=32768).contains(&max_ctx_len)
         {
@@ -3541,11 +3541,11 @@ impl Gpu {
                 ),
             ));
         }
-        if batch_size == 0 || batch_size > 384 {
+        if batch_size == 0 || batch_size > 512 {
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
-                    "attention_q8_0_fa2_gqa_gfx1201 requires 1 <= batch <= 384, got {batch_size}"
+                    "attention_q8_0_fa2_gqa_gfx1201 requires 1 <= batch <= 512, got {batch_size}"
                 ),
             ));
         }
