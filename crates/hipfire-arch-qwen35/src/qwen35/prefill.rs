@@ -9301,21 +9301,27 @@ fn batch_chunk_full_attn_output_projection(
     Ok(())
 }
 
-/// Context length past which an admitted gfx1100/gfx1201 Q8 small-batch attend step
-/// leaves the batched masked FA kernel for the multi-row tile. Measured with
-/// the Qwen3.8-27B verify shape (`bench_flash_rows`, tile 128). The conservative
-/// 4k boundary is retained across both measured architectures.
+/// Context length past which an admitted Q8 small-batch attend step leaves
+/// the batched masked FA kernel for the multi-row tile. Measured with the
+/// Qwen3.8-27B verify shape (`bench_flash_rows`, tile 128); gfx1100 and
+/// gfx1201 keep the conservative 4k boundary by default. gfx1151 is opt-in:
+/// it takes the route only when `HIPFIRE_FA_PERTOKEN_MIN_CTX` is set.
 /// `HIPFIRE_FA_PERTOKEN_MIN_CTX` overrides; `0` disables the route.
-pub(crate) fn fa_pertoken_min_ctx() -> Option<usize> {
-    use std::sync::OnceLock;
-    static MIN_CTX: OnceLock<Option<usize>> = OnceLock::new();
-    *MIN_CTX.get_or_init(|| {
-        let v = hipfire_config::developer_var("HIPFIRE_FA_PERTOKEN_MIN_CTX")
+pub(crate) fn fa_pertoken_min_ctx(arch: &str) -> Option<usize> {
+    static EXPLICIT: std::sync::LazyLock<Option<usize>> = std::sync::LazyLock::new(|| {
+        hipfire_config::developer_var("HIPFIRE_FA_PERTOKEN_MIN_CTX")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(4_096);
-        (v > 0).then_some(v)
-    })
+    });
+    fa_pertoken_min_ctx_for(arch, *EXPLICIT)
+}
+
+fn fa_pertoken_min_ctx_for(arch: &str, explicit: Option<usize>) -> Option<usize> {
+    match explicit {
+        Some(v) => (v > 0).then_some(v),
+        None if arch == "gfx1151" => None,
+        None => Some(4_096),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -9331,7 +9337,7 @@ fn q8_multirow_attn_admitted(
     capture_mode: bool,
     replay_recording: bool,
 ) -> bool {
-    matches!(arch, "gfx1100" | "gfx1201")
+    matches!(arch, "gfx1100" | "gfx1151" | "gfx1201")
         && quant_q8
         && matches!(head_dim, 128 | 256)
         && (4..=32).contains(&n)
@@ -9530,7 +9536,9 @@ fn batch_chunk_fa_attend(
         );
     }
     if multirow {
-        debug_assert!(gpu.arch_caps.is_gfx1100() || gpu.arch_caps.is_gfx1201());
+        debug_assert!(
+            gpu.arch_caps.is_gfx1100() || gpu.arch_caps.is_gfx1151() || gpu.arch_caps.is_gfx1201()
+        );
         debug_assert!(kv_cache.quant_q8);
         debug_assert!(matches!(config.head_dim, 128 | 256));
         gpu.kv_cache_write_q8_0_batched(
@@ -12548,13 +12556,13 @@ fn forward_prefill_chunk_pair(
             _ => true,
         });
     // Merge only when both halves take the plain dispatch route. Multirow
-    // is never admitted on gfx1151 (arch gate above it); the per-half
+    // never admits a 512-row half (its window is 4..=32 rows); the per-half
     // fallback below keeps this fail-closed if that ever changes.
     let multirow_common = (
         gpu.arch_caps.arch(),
         kv_cache.quant_q8,
         config.head_dim,
-        fa_pertoken_min_ctx(),
+        fa_pertoken_min_ctx(gpu.arch_caps.arch()),
         gpu.graphs.capture_mode,
         gpu.replay.is_recording(),
     );
@@ -13199,7 +13207,7 @@ pub(crate) fn forward_batch_chunk_impl(
         config.head_dim,
         n,
         start_pos + n,
-        fa_pertoken_min_ctx(),
+        fa_pertoken_min_ctx(gpu.arch_caps.arch()),
         tree_verify.is_some(),
         batch_semantics.is_independent(),
         gpu.graphs.capture_mode,
@@ -14101,8 +14109,8 @@ mod tests {
     use rdna_compute::DType;
 
     #[test]
-    fn q8_multirow_attn_admits_only_measured_arch_shapes() {
-        for arch in ["gfx1100", "gfx1201"] {
+    fn q8_multirow_attn_admits_only_explicit_arch_shapes() {
+        for arch in ["gfx1100", "gfx1151", "gfx1201"] {
             for head_dim in [128, 256] {
                 for n in [4, 8, 32] {
                     assert!(q8_multirow_attn_admitted(
@@ -14254,31 +14262,25 @@ mod tests {
 
     #[test]
     fn q8_multirow_attn_rejects_replay_recording_on_supported_arches() {
-        for arch in ["gfx1100", "gfx1201"] {
+        for arch in ["gfx1100", "gfx1151", "gfx1201"] {
             assert!(q8_multirow_attn_admitted(
-                arch,
-                true,
-                256,
-                8,
-                8192,
-                Some(4096),
-                false,
-                false,
-                false,
-                false,
+                arch, true, 256, 8, 8192, Some(4096), false, false, false, false,
             ));
             assert!(!q8_multirow_attn_admitted(
-                arch,
-                true,
-                256,
-                8,
-                8192,
-                Some(4096),
-                false,
-                false,
-                false,
-                true,
+                arch, true, 256, 8, 8192, Some(4096), false, false, false, true,
             ));
+        }
+    }
+
+    #[test]
+    fn fa_pertoken_min_ctx_is_opt_in_on_gfx1151_only() {
+        for arch in ["gfx1100", "gfx1201"] {
+            assert_eq!(fa_pertoken_min_ctx_for(arch, None), Some(4096));
+        }
+        assert_eq!(fa_pertoken_min_ctx_for("gfx1151", None), None);
+        for arch in ["gfx1100", "gfx1151", "gfx1201"] {
+            assert_eq!(fa_pertoken_min_ctx_for(arch, Some(8192)), Some(8192));
+            assert_eq!(fa_pertoken_min_ctx_for(arch, Some(0)), None);
         }
     }
 
