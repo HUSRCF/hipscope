@@ -55,6 +55,323 @@ fn main() {
     eprintln!("build with --features deltanet");
 }
 
+/// Dense-TP (TP=2) DFlash2 demo path. Loads the target sharded across two
+/// GPUs plus one full DFlash2 draft replica per rank, then drives the mesh
+/// prefill/step API with the same SpecStats/reporting shape as the TP=1 path
+/// (including the exact `DFlash tokens: [...]` line). Eager, greedy, B=16
+/// only; every non-goal flag is rejected before any GPU is touched.
+#[cfg(feature = "deltanet")]
+struct Tp2RunArgs {
+    target_path: String,
+    draft_path: String,
+    prompt_text: String,
+    max_tokens: usize,
+    ctx_capacity: usize,
+    block_size_override: Option<usize>,
+    chatml: bool,
+    debug_cycles: usize,
+}
+
+#[cfg(feature = "deltanet")]
+fn run_tp2_demo(a: Tp2RunArgs) {
+    use hipfire_arch_qwen35::dflash_spec::load_dflash_speculator_dense_tp2;
+    use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch, StateQuant};
+    use hipfire_arch_qwen35::speculative::{DenseTpTargetView, SpecStats};
+    use hipfire_runtime::dflash::DflashConfig;
+    use hipfire_runtime::hfq::HfqFile;
+    use hipfire_runtime::kv_mode::KvMode;
+    use hipfire_runtime::llama::{KvCacheExt, KvDims, KvLayers, KvTarget};
+    use hipfire_runtime::multi_gpu::Gpus;
+    use hipfire_runtime::tokenizer::Tokenizer;
+    use hipfire_runtime::tp_shard::{ExpertAssign, ShardConfig};
+    use std::path::Path;
+    use std::time::Instant;
+
+    eprintln!("=== dflash_spec_demo (tp=2 mesh) ===");
+    eprintln!("target: {}", a.target_path);
+    eprintln!("draft:  {}", a.draft_path);
+    // ── Load draft config (CPU only) ──
+    let draft_hfq = HfqFile::open(Path::new(&a.draft_path)).expect("open draft");
+    let draft_cfg = DflashConfig::from_hfq(&draft_hfq).expect("parse DflashConfig");
+    if let Some(b) = a.block_size_override {
+        if b != 16 {
+            eprintln!("--tp 2 requires fixed B=16 (--block-size {b} rejected)");
+            std::process::exit(1);
+        }
+    }
+    if draft_cfg.runtime_block_size() != 16 {
+        eprintln!(
+            "--tp 2 requires a B=16 runtime draft (runtime {})",
+            draft_cfg.runtime_block_size()
+        );
+        std::process::exit(1);
+    }
+    eprintln!(
+        "draft: layers={} hidden={} block=16 target_layers={:?} all_sliding={}",
+        draft_cfg.n_layers,
+        draft_cfg.hidden,
+        draft_cfg.target_layer_ids,
+        draft_cfg.all_layers_sliding,
+    );
+    // ── Target config + dense sharding (CPU only) ──
+    let mut target_hfq = HfqFile::open(Path::new(&a.target_path)).expect("open target");
+    let global = qwen35::config_from_hfq(&target_hfq).expect("target config");
+    if global.num_experts != 0 {
+        eprintln!(
+            "--tp 2 supports dense targets only (num_experts={})",
+            global.num_experts
+        );
+        std::process::exit(1);
+    }
+    let shard = ShardConfig::new(2, false, 0, ExpertAssign::Stride).expect("tp2 shard");
+    let layouts = qwen35::dense_tp_rank_layouts(&global, &shard).expect("dense TP layout");
+    qwen35::preflight_weights_dense_tp(&target_hfq, &global, &shard).expect("dense TP preflight");
+    let configs: Vec<_> = layouts
+        .iter()
+        .map(|l| qwen35::local_dense_tp_config(&global, l))
+        .collect();
+    assert_eq!(
+        configs[0].vocab_size, draft_cfg.vocab_size,
+        "target vocab ({}) != draft vocab ({})",
+        configs[0].vocab_size, draft_cfg.vocab_size
+    );
+    // ── GPUs + per-rank state ──
+    let mut gpus = Gpus::init_tp(2, global.n_layers).expect("init tp2");
+    for gpu in &mut gpus.devices {
+        gpu.bind_thread().expect("bind");
+        gpu.active_stream = Some(gpu.hip.stream_create().expect("stream"));
+    }
+    let mut weights = Vec::with_capacity(2);
+    let mut scratches = Vec::with_capacity(2);
+    let mut kvs = Vec::with_capacity(2);
+    let mut dns = Vec::with_capacity(2);
+    let kv_max = a.ctx_capacity + 16 + 16;
+    for rank in 0..2 {
+        weights.push(
+            qwen35::load_weights_dense_tp_rank(
+                &mut target_hfq,
+                &global,
+                &mut gpus.devices[rank],
+                &layouts[rank],
+            )
+            .unwrap_or_else(|e| panic!("load TP rank {rank}: {e:?}")),
+        );
+        scratches.push(
+            Qwen35Scratch::new(&mut gpus.devices[rank], &configs[rank], 128).expect("scratch"),
+        );
+        let is_kv_layer = configs[rank]
+            .layer_types
+            .iter()
+            .map(|t| *t == qwen35::LayerType::FullAttention)
+            .collect();
+        kvs.push(
+            <hipfire_runtime::llama::KvCache as KvCacheExt>::from_mode(
+                KvMode::Q8,
+                KvTarget::Single(&mut gpus.devices[rank]),
+                &KvDims {
+                    layers: KvLayers::Mask(is_kv_layer),
+                    n_kv_heads: configs[rank].n_kv_heads,
+                    head_dim: configs[rank].head_dim,
+                    max_seq: kv_max,
+                    physical_cap: Some(kv_max),
+                },
+            )
+            .expect("rank kv"),
+        );
+        dns.push(
+            DeltaNetState::new_with_quant(&mut gpus.devices[rank], &configs[rank], StateQuant::Q8)
+                .expect("rank dn"),
+        );
+    }
+    let peer = gpus.can_access_peer_all().expect("can_access_peer_all");
+    if peer {
+        assert!(
+            gpus.enable_peer_all().expect("enable_peer_all"),
+            "TP2 complete topology must enable_peer_all"
+        );
+    }
+    eprintln!(
+        "tp2 peer_access={peer} allreduce={}",
+        if peer { "rccl" } else { "host-staged" }
+    );
+    let tokenizer =
+        Tokenizer::from_hfq_metadata(&target_hfq.metadata_json).expect("target tokenizer");
+    // ── Tokenize + ChatML wrap (mirrors the TP=1 row path) ──
+    let prompt_normalized =
+        hipfire_runtime::tokenizer::maybe_normalize_prompt(&a.prompt_text).into_owned();
+    let mut prompt_tokens = tokenizer.encode(&prompt_normalized);
+    if a.chatml {
+        let im_start = tokenizer.encode("<|im_start|>");
+        let im_end = tokenizer.encode("<|im_end|>");
+        let user = tokenizer.encode("user");
+        let asst = tokenizer.encode("assistant");
+        let nl = tokenizer.encode("\n");
+        let mut chat = Vec::new();
+        chat.extend_from_slice(&im_start);
+        chat.extend_from_slice(&user);
+        chat.extend_from_slice(&nl);
+        chat.extend_from_slice(&prompt_tokens);
+        chat.extend_from_slice(&im_end);
+        chat.extend_from_slice(&nl);
+        chat.extend_from_slice(&im_start);
+        chat.extend_from_slice(&asst);
+        chat.extend_from_slice(&nl);
+        prompt_tokens = chat;
+    }
+    eprintln!("prompt tokens ({}): {}", prompt_tokens.len(), if prompt_tokens.len() < 64 { format!("{prompt_tokens:?}") } else { format!("[{} tokens]", prompt_tokens.len()) });
+    // ── Mesh draft owner ──
+    let mut spec = load_dflash_speculator_dense_tp2(
+        &a.draft_path,
+        &mut gpus,
+        DenseTpTargetView {
+            shard: &shard,
+            weights: &weights,
+            configs: &configs,
+            kv_caches: &mut kvs,
+            dn_states: &mut dns,
+            scratches: &scratches,
+        },
+        a.ctx_capacity,
+        16,
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("tp2 draft load: {e}");
+        std::process::exit(1);
+    });
+    // ── Prefill ──
+    eprintln!(
+        "seeding target_hidden from prompt ({} tokens)...",
+        prompt_tokens.len()
+    );
+    let t2 = Instant::now();
+    let first_token = spec
+        .prefill(
+            &mut gpus,
+            DenseTpTargetView {
+                shard: &shard,
+                weights: &weights,
+                configs: &configs,
+                kv_caches: &mut kvs,
+                dn_states: &mut dns,
+                scratches: &scratches,
+            },
+            &prompt_tokens,
+        )
+        .unwrap_or_else(|e| {
+            eprintln!("tp2 prefill: {e}");
+            std::process::exit(1);
+        });
+    let prefill_secs = t2.elapsed().as_secs_f64();
+    let prefill_tok_s = prompt_tokens.len() as f64 / prefill_secs.max(1e-9);
+    eprintln!("prefill in {prefill_secs:.2}s ({prefill_tok_s:.1} tok/s)");
+    // ── Decode loop (greedy mesh) ──
+    let mut emitted: Vec<u32> = vec![first_token];
+    let mut position: usize = prompt_tokens.len();
+    let mut seed_token: u32 = first_token;
+    let mut stats = SpecStats::new(16);
+    let mut ttft_ms: Option<f64> = None;
+    let mut accepts: Vec<usize> = Vec::new();
+    eprintln!("decoding (max {} tokens, tp=2 mesh block_size 16)...", a.max_tokens);
+    let t_decode = Instant::now();
+    while emitted.len() < a.max_tokens {
+        if position >= a.ctx_capacity {
+            eprintln!("hit ctx_capacity {}; stopping", a.ctx_capacity);
+            break;
+        }
+        let step = spec
+            .step_traced(
+                &mut gpus,
+                DenseTpTargetView {
+                    shard: &shard,
+                    weights: &weights,
+                    configs: &configs,
+                    kv_caches: &mut kvs,
+                    dn_states: &mut dns,
+                    scratches: &scratches,
+                },
+                position,
+                seed_token,
+            )
+            .unwrap_or_else(|e| {
+                eprintln!("tp2 spec step: {e}");
+                std::process::exit(1);
+            });
+        if stats.cycles < a.debug_cycles {
+            eprintln!(
+                "[tp2-cycle {}] pos={} seed={} committed={:?} bonus={} accepted={} drafted={:?}",
+                stats.cycles,
+                position,
+                seed_token,
+                step.committed.iter().skip(1).collect::<Vec<_>>(),
+                step.bonus_token,
+                step.accepted,
+                step.drafted,
+            );
+        }
+        stats.record(&step);
+        accepts.push(step.accepted);
+        for &tok in step.committed.iter().skip(1) {
+            emitted.push(tok);
+        }
+        if ttft_ms.is_none() && step.committed.len() > 1 {
+            ttft_ms = Some(prefill_secs * 1000.0 + t_decode.elapsed().as_secs_f64() * 1000.0);
+        }
+        position += step.accepted + 1;
+        seed_token = step.bonus_token;
+        if step.committed.iter().skip(1).any(|&t| tokenizer.is_terminator(t)) {
+            eprintln!("eos");
+            break;
+        }
+    }
+    let elapsed = t_decode.elapsed().as_secs_f64();
+    let tok_s = emitted.len() as f64 / elapsed;
+    // ── Report (same machine-readable shape as TP=1, plus tp=) ──
+    let text = tokenizer.decode(&emitted);
+    eprintln!("--- OUTPUT ---");
+    println!("{text}");
+    eprintln!("--------------");
+    eprintln!("emitted: {} tokens in {elapsed:.2}s  ({tok_s:.2} tok/s)", emitted.len());
+    eprintln!(
+        "cycles: {}  committed: {}  accepted: {}  τ={:.3}  mean_committed={:.3}",
+        stats.cycles,
+        stats.committed_tokens,
+        stats.accepted_tokens,
+        stats.tau(),
+        stats.mean_committed(),
+    );
+    let accept_rate = if stats.cycles > 0 {
+        stats.accepted_tokens as f32 / (stats.cycles * 15) as f32
+    } else {
+        0.0
+    };
+    let (vram_free_bytes, vram_total_bytes) =
+        gpus.devices[0].hip.get_vram_info().unwrap_or((0, 0));
+    let vram_used_mb =
+        ((vram_total_bytes.saturating_sub(vram_free_bytes)) as f64 / (1024.0 * 1024.0)) as u64;
+    let vram_total_mb = (vram_total_bytes as f64 / (1024.0 * 1024.0)) as u64;
+    eprintln!("=== BENCH METRICS ===");
+    eprintln!("tp: 2");
+    eprintln!("prompt_tokens: {}", prompt_tokens.len());
+    eprintln!("prefill_secs: {prefill_secs:.4}");
+    eprintln!("prefill_tok_s: {prefill_tok_s:.2}");
+    eprintln!("ttft_ms: {:.2}", ttft_ms.unwrap_or(0.0));
+    eprintln!("decode_tokens_emitted: {}", emitted.len());
+    eprintln!("decode_secs: {elapsed:.4}");
+    eprintln!("decode_tok_s: {tok_s:.2}");
+    eprintln!("decode_tau: {:.4}", stats.tau());
+    eprintln!("decode_accept_rate: {accept_rate:.4}");
+    eprintln!("vram_used_mb: {vram_used_mb}");
+    eprintln!("vram_total_mb: {vram_total_mb}");
+    eprintln!("=====================");
+    eprintln!("tp2_accepts: {accepts:?}");
+    eprintln!(
+        "histogram: {:?}",
+        stats.acceptance_hist.iter().enumerate().collect::<Vec<_>>()
+    );
+    eprintln!("DFlash tokens: {emitted:?}");
+    spec.free_gpu(&mut gpus);
+}
+
 #[cfg(feature = "deltanet")]
 fn main() {
     use hipfire_arch_qwen35::qwen35::LayerType;
@@ -106,6 +423,7 @@ fn main() {
     let mut prompt: Option<String> = None;
     let mut prompts_file: Option<String> = None;
     let mut prompt_file: Option<String> = None;
+    let mut tp: usize = 1;
     let mut pflash_path: Option<String> = None;
     let mut pflash_keep_ratio: f32 = 0.30;
     let mut pflash_block_size: usize = 64;
@@ -397,6 +715,14 @@ fn main() {
             "--no-tape" => {
                 no_tape = true;
                 i += 1;
+            }
+            "--tp" => {
+                tp = args[i + 1].parse().expect("--tp expects 1 or 2");
+                if tp != 1 && tp != 2 {
+                    eprintln!("--tp must be 1 or 2 (got {tp})");
+                    std::process::exit(1);
+                }
+                i += 2;
             }
             "--cask-sidecar" => {
                 cask_sidecar = Some(args[i + 1].clone());
@@ -1372,6 +1698,85 @@ fn main() {
                 eprintln!("@@@ ROW {row_idx} END @@@");
             }
         }
+        return;
+    }
+
+    // ── Dense-TP (TP=2) DFlash2 branch ──────────────────────────────
+    // Eager, greedy, B=16 only. Every non-goal flag fails before any GPU is
+    // touched; the TP=1 path below is byte-for-byte the historical code.
+    if tp == 2 {
+        if ngram {
+            eprintln!("--tp 2 rejects --ngram (greedy DFlash2 mesh only)");
+            std::process::exit(1);
+        }
+        if pld_enabled {
+            eprintln!("--tp 2 rejects --pld");
+            std::process::exit(1);
+        }
+        if ddtree_enabled || ddtree_batched {
+            eprintln!("--tp 2 rejects --ddtree*");
+            std::process::exit(1);
+        }
+        if pflash_path.is_some() {
+            eprintln!("--tp 2 rejects --pflash");
+            std::process::exit(1);
+        }
+        if cask_sidecar.is_some() || use_cask {
+            eprintln!("--tp 2 rejects --cask*");
+            std::process::exit(1);
+        }
+        if ctx_slice.is_some() {
+            eprintln!("--tp 2 rejects --ctx-slice");
+            std::process::exit(1);
+        }
+        if ar_baseline {
+            eprintln!("--tp 2 rejects --ar-baseline");
+            std::process::exit(1);
+        }
+        if temp > 1e-6 {
+            eprintln!("--tp 2 is greedy-only (temp {temp} rejected)");
+            std::process::exit(1);
+        }
+        if adaptive_b {
+            eprintln!("--tp 2 requires --no-adaptive-b (fixed B=16)");
+            std::process::exit(1);
+        }
+        if repeat_penalty != 1.0 {
+            eprintln!("--tp 2 rejects --repeat-penalty");
+            std::process::exit(1);
+        }
+        if cactus_delta != 0.0 {
+            eprintln!("--tp 2 rejects --cactus-delta");
+            std::process::exit(1);
+        }
+        if kv_mode_str != "q8" {
+            eprintln!("--tp 2 requires --kv-mode q8 (got {kv_mode_str})");
+            std::process::exit(1);
+        }
+        if state_quant_str != "q8" {
+            eprintln!("--tp 2 requires --state-quant q8 (got {state_quant_str})");
+            std::process::exit(1);
+        }
+        if no_tape {
+            eprintln!("--tp 2 requires the GDN tape (rejects --no-tape)");
+            std::process::exit(1);
+        }
+        if multi_row {
+            eprintln!("--tp 2 supports a single prompt only (rejects --prompts-file)");
+            std::process::exit(1);
+        }
+        let (row_label, row_raw_prompt, row_max) = prompts[0].clone();
+        let _ = row_label;
+        run_tp2_demo(Tp2RunArgs {
+            target_path,
+            draft_path,
+            prompt_text: row_raw_prompt,
+            max_tokens: row_max,
+            ctx_capacity,
+            block_size_override,
+            chatml,
+            debug_cycles,
+        });
         return;
     }
 
