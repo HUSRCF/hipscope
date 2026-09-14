@@ -9399,6 +9399,8 @@ impl Gpu {
         // selects the single-slab symbols (see gate_up launcher).
         let slabs2 = hipfire_config::developer_var("HIPFIRE_GFX12_MQ4V2_FP8_SLABS").as_deref() != Ok("1")
             && batch_size % 128 == 0;
+        // Batch tile by N: S2BT8 under SLABS=2, else BT12 when exact or masked
+        // past N=256 (masked BT12 beats exact BT8/BT4 there; see gate_up).
         let (func_name, ksrc, bv): (&str, &str, usize) = if slabs2 {
             (
                 "gemm_qkvza_mq4g256v2_wmma_fp8_gfx12_s2bt8",
@@ -9411,17 +9413,24 @@ impl Gpu {
                 kernels::GEMM_QKVZA_MQ4G256V2_WMMA_FP8_GFX12_BT12_SRC,
                 12,
             )
-        } else if batch_size % 128 == 0 {
+        } else if batch_size % 128 == 0 && batch_size <= 256 {
             (
                 "gemm_qkvza_mq4g256v2_wmma_fp8_gfx12_bt8",
                 kernels::GEMM_QKVZA_MQ4G256V2_WMMA_FP8_GFX12_BT8_SRC,
                 8,
             )
-        } else {
+        } else if batch_size <= 256 {
             (
                 "gemm_qkvza_mq4g256v2_wmma_fp8_gfx12_bt4",
                 kernels::GEMM_QKVZA_MQ4G256V2_WMMA_FP8_GFX12_BT4_SRC,
                 4,
+            )
+        } else {
+            // Masked BT12 tail: measured faster than the exact-divisor BT8/BT4.
+            (
+                "gemm_qkvza_mq4g256v2_wmma_fp8_gfx12_bt12",
+                kernels::GEMM_QKVZA_MQ4G256V2_WMMA_FP8_GFX12_BT12_SRC,
+                12,
             )
         };
         self.ensure_kernel(func_name, ksrc, func_name)?;
@@ -9539,6 +9548,8 @@ impl Gpu {
         // selects the single-slab symbols (see gate_up launcher).
         let slabs2 = hipfire_config::developer_var("HIPFIRE_GFX12_MQ4V2_FP8_SLABS").as_deref() != Ok("1")
             && batch_size % 128 == 0;
+        // Batch tile by N: S2BT8 under SLABS=2, else BT12 when exact or masked
+        // past N=256 (masked BT12 beats exact BT8/BT4 there; see gate_up).
         let (func_name, ksrc, bv): (&str, &str, usize) = if slabs2 {
             (
                 "gemm_qkv_mq4g256v2_wmma_fp8_gfx12_s2bt8",
@@ -9551,17 +9562,24 @@ impl Gpu {
                 kernels::GEMM_QKV_MQ4G256V2_WMMA_FP8_GFX12_BT12_SRC,
                 12,
             )
-        } else if batch_size % 128 == 0 {
+        } else if batch_size % 128 == 0 && batch_size <= 256 {
             (
                 "gemm_qkv_mq4g256v2_wmma_fp8_gfx12_bt8",
                 kernels::GEMM_QKV_MQ4G256V2_WMMA_FP8_GFX12_BT8_SRC,
                 8,
             )
-        } else {
+        } else if batch_size <= 256 {
             (
                 "gemm_qkv_mq4g256v2_wmma_fp8_gfx12_bt4",
                 kernels::GEMM_QKV_MQ4G256V2_WMMA_FP8_GFX12_BT4_SRC,
                 4,
+            )
+        } else {
+            // Masked BT12 tail: measured faster than the exact-divisor BT8/BT4.
+            (
+                "gemm_qkv_mq4g256v2_wmma_fp8_gfx12_bt12",
+                kernels::GEMM_QKV_MQ4G256V2_WMMA_FP8_GFX12_BT12_SRC,
+                12,
             )
         };
         self.ensure_kernel(func_name, ksrc, func_name)?;
@@ -28908,7 +28926,12 @@ impl Gpu {
         // the row grid. One env read per call.
         let slabs2 = hipfire_config::developer_var("HIPFIRE_GFX12_MQ4V2_FP8_SLABS").as_deref() != Ok("1")
             && batch_size % 128 == 0;
-        // Batch tile by N, mirroring the F16 incumbent's selector.
+        // Batch tile by N: S2BT8 under SLABS=2, else BT12 when exact or masked
+        // past N=256. A masked BT12 tail beats the exact-divisor BT8/BT4 there
+        // (gfx1201 FP8-WMMA at gate_m=up_m=17408, K=5120: +26% at N=512, +25%
+        // at N=640, +38% at N=768 over BT8; at N<=256 the mask waste flips the
+        // ranking so BT8/BT4 keep their exact ranges). Grid ceil-divides
+        // batch_tiles and the kernels guard `oc < N`, so any tile covers N%64.
         let (func_name, ksrc, bv): (&str, &str, usize) = if slabs2 {
             (
                 "gemm_gate_up_mq4g256v2_wmma_fp8_gfx12_s2bt8",
@@ -28921,17 +28944,24 @@ impl Gpu {
                 kernels::GEMM_GATE_UP_MQ4G256V2_WMMA_FP8_GFX12_BT_SRC,
                 12,
             )
-        } else if batch_size % 128 == 0 {
+        } else if batch_size % 128 == 0 && batch_size <= 256 {
             (
                 "gemm_gate_up_mq4g256v2_wmma_fp8_gfx12_bt8",
                 kernels::GEMM_GATE_UP_MQ4G256V2_WMMA_FP8_GFX12_BT8_SRC,
                 8,
             )
-        } else {
+        } else if batch_size <= 256 {
             (
                 "gemm_gate_up_mq4g256v2_wmma_fp8_gfx12_bt4",
                 kernels::GEMM_GATE_UP_MQ4G256V2_WMMA_FP8_GFX12_BT4_SRC,
                 4,
+            )
+        } else {
+            // Masked BT12 tail: measured faster than the exact-divisor BT8/BT4.
+            (
+                "gemm_gate_up_mq4g256v2_wmma_fp8_gfx12_bt12",
+                kernels::GEMM_GATE_UP_MQ4G256V2_WMMA_FP8_GFX12_BT_SRC,
+                12,
             )
         };
         self.ensure_kernel(func_name, ksrc, func_name)?;
@@ -29506,6 +29536,8 @@ impl Gpu {
         // selects the single-slab symbols (see gate_up launcher).
         let slabs2 = hipfire_config::developer_var("HIPFIRE_GFX12_MQ4V2_FP8_SLABS").as_deref() != Ok("1")
             && batch_size % 128 == 0;
+        // Batch tile by N: S2BT8 under SLABS=2, else BT12 when exact or masked
+        // past N=256 (masked BT12 beats exact BT8/BT4 there; see gate_up).
         let (func_name, ksrc, bv): (&str, &str, usize) = if slabs2 {
             (
                 "gemm_mq4g256v2_residual_wmma_fp8_gfx12_s2bt8",
@@ -29518,17 +29550,24 @@ impl Gpu {
                 kernels::GEMM_MQ4G256V2_RESIDUAL_WMMA_FP8_GFX12_BT12_SRC,
                 12,
             )
-        } else if batch_size % 128 == 0 {
+        } else if batch_size % 128 == 0 && batch_size <= 256 {
             (
                 "gemm_mq4g256v2_residual_wmma_fp8_gfx12_bt8",
                 kernels::GEMM_MQ4G256V2_RESIDUAL_WMMA_FP8_GFX12_BT8_SRC,
                 8,
             )
-        } else {
+        } else if batch_size <= 256 {
             (
                 "gemm_mq4g256v2_residual_wmma_fp8_gfx12_bt4",
                 kernels::GEMM_MQ4G256V2_RESIDUAL_WMMA_FP8_GFX12_BT4_SRC,
                 4,
+            )
+        } else {
+            // Masked BT12 tail: measured faster than the exact-divisor BT8/BT4.
+            (
+                "gemm_mq4g256v2_residual_wmma_fp8_gfx12_bt12",
+                kernels::GEMM_MQ4G256V2_RESIDUAL_WMMA_FP8_GFX12_BT12_SRC,
+                12,
             )
         };
         self.ensure_kernel(func_name, ksrc, func_name)?;
