@@ -5474,6 +5474,15 @@ pub const ATTENTION_Q8_0_FLASH_PREFILL_WMMA_SRC: &str =
 pub const ATTENTION_Q8_0_FLASH_PREFILL_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/attention_q8_0_flash_prefill_wmma.gfx12.hip");
 
+/// gfx1201-only GQA-fused FA2 prefill (research opt-in). One workgroup per
+/// KV head x 8 positions; K/V dequantized once per KT64 tile into 64 KiB
+/// swizzled LDS. Three symbols: `attention_q8_0_fa2_gqa_gfx1201` (direct),
+/// `attention_q8_0_fa2_gqa_partial_gfx1201` (split-KV records, stride 258),
+/// `attention_q8_0_fa2_gqa_merge_gfx1201` (stable LSE merge). JIT-only via
+/// the `attention_q8_0_fa2_gqa_gfx1201*` launchers; never on a default path.
+pub const ATTENTION_Q8_0_FA2_GQA_GFX1201_SRC: &str =
+    include_str!("../../../kernels/src/attention_q8_0_fa2_gqa.gfx1201.hip");
+
 /// Benchmark-only gfx1201 LongSpec partition WMMA flash: same arithmetic as
 /// `ATTENTION_Q8_0_FLASH_PREFILL_WMMA_GFX12_SRC` but writes retained online-
 /// softmax state `[m,l,O_unnormalized]` per query/head instead of normalized O.
