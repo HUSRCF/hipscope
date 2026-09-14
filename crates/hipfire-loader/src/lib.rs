@@ -3650,7 +3650,7 @@ fn load_model_ep_qwen35(
     let config = qwen35::config_from_hfq(&hfq_probe).map_err(|e| format!("qwen35 config: {e}"))?;
     if config.num_experts == 0 {
         drop(hfq_probe);
-        return load_model_tp_qwen35_dense(path, max_seq, tp, kv_mode, state_quant);
+        return load_model_tp_qwen35_dense(path, max_seq, tp, kv_mode, kv_backend, state_quant);
     }
     // Supported-topology gate (mirrors admission): refuse before `Gpus::init_ep`
     // (first device init) and the per-rank weight upload, not after a full load.
@@ -3886,6 +3886,7 @@ fn load_model_tp_qwen35_dense(
     max_seq: usize,
     tp: usize,
     kv_mode: Option<&str>,
+    kv_backend: Option<&str>,
     state_quant: Option<&str>,
 ) -> Result<LoadedModel, String> {
     use hipfire_runtime::tp_shard::{ExpertAssign, ShardConfig};
@@ -3904,6 +3905,12 @@ fn load_model_tp_qwen35_dense(
     let state_quant_resolved = parse_state_quant(state_quant)?;
     // Resolve KV mode via Qwen policy (contiguous only). Explicit unsupported => fail before GPU init.
     let kv_raw = kv_mode.unwrap_or("");
+    // Resolve the KV backend exactly as the single-GPU path does
+    // (`load_model_with_kv_backend`): VMM reserves one arena per rank device
+    // (`alloc_k_v_vmm_filtered` scopes each reserve to its owning device),
+    // so per-rank `KvTarget::Single` construction below is device-correct.
+    let kv_backend_raw = kv_backend.unwrap_or("contiguous");
+    let kv_backend_resolved: KvBackend = kv_backend_raw.parse().map_err(|err| format!("{err}"))?;
     let kv_trim = kv_raw.trim();
     let kv_lower = kv_trim.to_ascii_lowercase();
     let kv_mode_resolved = if kv_lower.is_empty() {
@@ -3944,6 +3951,15 @@ fn load_model_tp_qwen35_dense(
         ));
     }
     let mut staging = Qwen35DenseTpStaging::new(gpus);
+    // Per-rank VMM preflight (mirrors the single-GPU `ensure_vmm_ready_for_load`
+    // gate at the top of `load_model_with_kv_backend`): refuse the load while
+    // any rank device reports pending teardown. Fresh `init_tp` devices are
+    // idle, so this is a no-op success today; it keeps load/unload symmetric
+    // if devices are ever reused across loads.
+    for rank in 0..tp {
+        ensure_vmm_ready_for_load(&mut staging.gpus_mut().devices[rank])
+            .map_err(|err| format!("dense TP VMM preflight rank {rank}: {err}"))?;
+    }
     for rank in 0..tp {
         staging.gpus_mut().devices[rank]
             .bind_thread()
@@ -3974,7 +3990,7 @@ fn load_model_tp_qwen35_dense(
         };
         let kv = <llama::KvCache as KvCacheExt>::from_mode_with_backend(
             kv_mode_resolved,
-            KvBackend::Contiguous,
+            kv_backend_resolved,
             KvTarget::Single(&mut staging.gpus_mut().devices[rank]),
             &dims,
         )
@@ -4247,7 +4263,24 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
                 for (rank, kv) in kv_caches.into_iter().enumerate() {
                     if let Some(dev) = gpus.devices.get_mut(rank) {
                         let _ = dev.bind_thread();
-                        let _ = kv.free_gpu(dev);
+                        if let Err(e) = kv.free_gpu(dev) {
+                            if ep_first_err.is_none() {
+                                ep_first_err = Some(format!(
+                                    "unload dense qwen TP KV rank {rank}: {e:?}"
+                                ));
+                            }
+                        }
+                        // Per-rank VMM teardown gate (mirrors the single-GPU
+                        // unload tail): retry arenas retained by a failed free
+                        // and refuse a clean handoff while any remain. No-op
+                        // success for contiguous (no arenas registered).
+                        if let Err(e) = dev.ensure_vmm_cleaned() {
+                            if ep_first_err.is_none() {
+                                ep_first_err = Some(format!(
+                                    "unload dense qwen TP VMM rank {rank}: {e:?}"
+                                ));
+                            }
+                        }
                     }
                 }
                 for (rank, weights) in weights.into_iter().enumerate() {

@@ -260,9 +260,13 @@ fn df_lash_lm_head_admission(
 }
 
 /// Expert-parallel VMM refusal, mirroring `load_model_ep_with_kv_mode`'s
-/// per-arch dispatch: VMM is single-device, so the EP arches whose loaders
-/// have no VMM path (Qwen3.5 5|6, MiniMax 10) refuse it. DeepSeek V4 (9) is
-/// the one EP arch that serves vmm by design and stays vmm-capable here.
+/// per-arch dispatch: VMM is one arena per device, so the EP arches whose
+/// loaders have no VMM path (Qwen3.5-MoE 5|6, MiniMax 10) refuse it. DeepSeek
+/// V4 (9) is the one EP arch that serves vmm by design and stays vmm-capable
+/// here. Dense Qwen3.5 (5|6, `num_experts == 0`) is exempt at the call site —
+/// it runs the dense-TP path with one arena per rank device — so this
+/// per-arch predicate intentionally still fires for 5|6 (the density probe
+/// in `admit_source` decides whether to apply it).
 fn ep_vmm_refusal(arch_id: u32, kv_backend: KvBackend) -> Option<String> {
     (kv_backend == KvBackend::Vmm && matches!(arch_id, 5 | 6 | 10))
         .then(|| format!("KV backend '{}' requires tp=1", kv_backend.as_str()))
@@ -486,8 +490,8 @@ pub fn admit_source(
     let (topology, carrier) = if tp > 1 {
         // Expert-parallel admission (HFQ-only). Mirrors
         // `load_model_ep_with_kv_mode`'s arch_id dispatch + per-arch VMM
-        // refusal: DeepSeek V4 (9) serves vmm by design; Qwen3.5 (5|6) and
-        // MiniMax (10) refuse it (single-device backend, no EP VMM path).
+        // refusal: DeepSeek V4 (9) serves vmm by design; Qwen3.5-MoE (5|6)
+        // and MiniMax (10) refuse it (replicated-KV EP has no VMM path).
         if is_dir {
             return Err(
                 "EP not supported for safetensors directory sources (load as a single HFQ file)"
@@ -499,8 +503,30 @@ pub fn admit_source(
                 "EP not supported for arch_id={arch_id} (expected 5|6 for Qwen3.5, 9 for DeepSeek V4 or 10 for MiniMax)"
             ));
         }
-        if let Some(refusal) = ep_vmm_refusal(arch_id, kv_backend) {
-            return Err(refusal);
+        // Qwen3.5 density probe (HFQ-only past the `is_dir` refusal above, so
+        // the destructure is infallible): dense (`num_experts == 0`) runs the
+        // dense-TP path with one VMM arena per rank device, so the MoE/EP VMM
+        // refusal below does not apply to it. Parsed once here; the MoE
+        // topology gate below reuses it instead of re-opening the source.
+        let qwen35_num_experts: Option<usize> = if matches!(arch_id, 5 | 6) {
+            let ModelSource::Hfq(hfq) = &source else {
+                return Err("EP qwen35 requires an HFQ source".to_string());
+            };
+            Some(
+                hipfire_arch_qwen35::qwen35::config_from_hfq(hfq)
+                    .map_err(|e| format!("qwen35 config: {e}"))?
+                    .num_experts,
+            )
+        } else {
+            None
+        };
+        // VMM is one arena per device: the replicated-KV MoE/EP path has no
+        // VMM support (5|6 MoE, MiniMax 10) and refuses it; dense Qwen3.5 is
+        // exempt (per-rank arenas under `load_model_tp_qwen35_dense`).
+        if qwen35_num_experts != Some(0) {
+            if let Some(refusal) = ep_vmm_refusal(arch_id, kv_backend) {
+                return Err(refusal);
+            }
         }
         // #666 G2: refuse an unsatisfiable rank count before any teardown or
         // GPU init (`init_ep` needs one device per rank). Runs after the
@@ -514,14 +540,9 @@ pub fn admit_source(
         // arch/VMM/geometry refusals above so their messages are unchanged.
         // Dense Qwen3.5 (num_experts == 0) is unaffected. Must stay paired
         // with the loader backstop text.
-        if matches!(arch_id, 5 | 6) {
-            let ModelSource::Hfq(hfq) = &source else {
-                return Err("EP qwen35 requires an HFQ source".to_string());
-            };
-            let config = hipfire_arch_qwen35::qwen35::config_from_hfq(hfq)
-                .map_err(|e| format!("qwen35 config: {e}"))?;
+        if let Some(num_experts) = qwen35_num_experts {
             if let Some(refusal) =
-                crate::qwen35_ep_moe_topology_refusal(arch_id, config.num_experts, tp)
+                crate::qwen35_ep_moe_topology_refusal(arch_id, num_experts, tp)
             {
                 return Err(refusal);
             }
