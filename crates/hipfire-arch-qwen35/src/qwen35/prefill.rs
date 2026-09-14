@@ -347,22 +347,51 @@ pub const PREFILL_MAX_BATCH: usize = 256;
 /// Exact `gfx1100` only — not gfx1101/1102/1151 or other gfx11 variants.
 const PREFILL_DEFAULT_BATCH_GFX1100: usize = 512;
 
+/// gfx1201-measured FP8 chunk size (Qwen3.8 FP8-WMMA MQ4v2 prefill path).
+/// Applies only when all three FP8 projection flags are set (see
+/// [`fp8_chunk512_for_gpu`]); explicit `HIPFIRE_PREFILL_MAX_BATCH` still wins.
+const PREFILL_DEFAULT_BATCH_GFX1201_FP8: usize = 512;
+
+/// True when the FP8 prefill path is fully admitted on exact gfx1201: all
+/// three FP8 projection flags set. The chunk default then rises 384 -> 512
+/// (measured sweet spot under FP8-WMMA). The 256-row hidden-ring staging,
+/// adaptive-KV outer-chunk, and eviction internal-chunk caps are enforced
+/// downstream (`prefill_effective_chunk_batch` mins with PBS/ring staging;
+/// `forward_prefill_batch_capped` mins with the caller cap), exactly as they
+/// already absorb the 384 default — a larger default only widens the
+/// configured ceiling, never a staging write.
+#[inline]
+fn fp8_chunk512_for_gpu(gpu: &Gpu) -> bool {
+    gpu.arch == "gfx1201"
+        && gpu.flags.gfx12_mq4v2_fp8_gateup
+        && gpu.flags.gfx12_mq4v2_fp8_resid
+        && gpu.flags.gfx12_mq4v2_fp8_qkvza
+}
+
 /// gfx1201-measured default prefill chunk size (Qwen3.8 prefill sweet spot).
 /// Exact `gfx1201` only — not gfx1200 or other gfx12 variants.
 const PREFILL_DEFAULT_BATCH_GFX1201: usize = 384;
 
 /// Architecture default for prefill chunk size when
-/// `HIPFIRE_PREFILL_MAX_BATCH` is unset or invalid.
+/// `HIPFIRE_PREFILL_MAX_BATCH` is unset or invalid. `fp8_chunk512` lifts
+/// exact gfx1201 384 -> 512 when the full FP8 path is admitted (see
+/// [`fp8_chunk512_for_gpu`]); every other arch ignores it, so the F16
+/// default path is unchanged.
 #[inline]
-fn prefill_max_batch_for_arch(arch: &str) -> usize {
+fn prefill_max_batch_for_arch(arch: &str, fp8_chunk512: bool) -> usize {
     if arch == "gfx1100" {
         PREFILL_DEFAULT_BATCH_GFX1100
     } else if arch == "gfx1201" {
-        PREFILL_DEFAULT_BATCH_GFX1201
+        if fp8_chunk512 {
+            PREFILL_DEFAULT_BATCH_GFX1201_FP8
+        } else {
+            PREFILL_DEFAULT_BATCH_GFX1201
+        }
     } else {
         PREFILL_MAX_BATCH
     }
 }
+
 
 fn explicit_prefill_max_batch() -> Option<usize> {
     hipfire_config::developer_var("HIPFIRE_PREFILL_MAX_BATCH")
@@ -406,7 +435,7 @@ fn prefill_max_batch_for_model(gpu: &Gpu, weights: &Qwen35Weights) -> usize {
         if gpu.arch == "gfx1151" && dense_layers_are_all_mq4v2(weights) {
             512
         } else {
-            prefill_max_batch_for_arch(gpu.arch.as_str())
+            prefill_max_batch_for_arch(gpu.arch.as_str(), fp8_chunk512_for_gpu(gpu))
         }
     })
 }
@@ -415,11 +444,13 @@ fn prefill_max_batch_for_model(gpu: &Gpu, weights: &Qwen35Weights) -> usize {
 ///
 /// Honors explicit `HIPFIRE_PREFILL_MAX_BATCH` when it parses as an integer
 /// `>= MIN_BATCH` (2); otherwise returns the arch default — 512 on exact
-/// gfx1100, 384 on exact gfx1201, [`PREFILL_MAX_BATCH`] (256) on every other
+/// gfx1100, 384 on exact gfx1201 (512 when the full FP8 path is admitted,
+/// see [`fp8_chunk512_for_gpu`]), [`PREFILL_MAX_BATCH`] (256) on every other
 /// arch string. Capped entry points further min with an explicit caller
 /// ceiling via `prefill_max_batch(gpu).min(max_batch_cap)`.
 pub fn prefill_max_batch(gpu: &Gpu) -> usize {
-    explicit_prefill_max_batch().unwrap_or_else(|| prefill_max_batch_for_arch(gpu.arch.as_str()))
+    explicit_prefill_max_batch()
+        .unwrap_or_else(|| prefill_max_batch_for_arch(gpu.arch.as_str(), fp8_chunk512_for_gpu(gpu)))
 }
 
 /// Ceiling on the TP compensation below; beyond it the prefill kernels stop
@@ -438,7 +469,7 @@ pub fn prefill_max_batch_tp(gpu: &Gpu, tp: usize) -> usize {
     if let Some(explicit) = explicit_prefill_max_batch() {
         return explicit;
     }
-    let base = prefill_max_batch_for_arch(gpu.arch.as_str());
+    let base = prefill_max_batch_for_arch(gpu.arch.as_str(), fp8_chunk512_for_gpu(gpu));
     base.saturating_mul(tp.max(1)).min(PREFILL_TP_BATCH_CAP)
 }
 
@@ -9179,21 +9210,36 @@ mod tests {
         // Exact gfx1100 / gfx1201 alone get the measured defaults; every other
         // string keeps the conservative PREFILL_MAX_BATCH=256 ceiling.
         // Pure helper — no process env mutation.
-        assert_eq!(prefill_max_batch_for_arch("gfx1100"), 512);
+        assert_eq!(prefill_max_batch_for_arch("gfx1100", false), 512);
         assert_eq!(
-            prefill_max_batch_for_arch("gfx1100"),
-            PREFILL_DEFAULT_BATCH_GFX1100
+            prefill_max_batch_for_arch("gfx1100", true),
+            PREFILL_DEFAULT_BATCH_GFX1100,
+            "fp8 arm must not move the gfx1100 default"
         );
-        assert_eq!(prefill_max_batch_for_arch("gfx1201"), 384);
+        assert_eq!(prefill_max_batch_for_arch("gfx1201", false), 384);
         assert_eq!(
-            prefill_max_batch_for_arch("gfx1201"),
+            prefill_max_batch_for_arch("gfx1201", false),
             PREFILL_DEFAULT_BATCH_GFX1201
+        );
+        assert_eq!(
+            prefill_max_batch_for_arch("gfx1201", true),
+            512,
+            "full-FP8 gfx1201 default must be 512"
+        );
+        assert_eq!(
+            prefill_max_batch_for_arch("gfx1201", true),
+            PREFILL_DEFAULT_BATCH_GFX1201_FP8
         );
         for arch in ["gfx1200", "gfx1151", "gfx942", "unknown"] {
             assert_eq!(
-                prefill_max_batch_for_arch(arch),
+                prefill_max_batch_for_arch(arch, false),
                 PREFILL_MAX_BATCH,
                 "arch default must stay {PREFILL_MAX_BATCH} on {arch}"
+            );
+            assert_eq!(
+                prefill_max_batch_for_arch(arch, true),
+                PREFILL_MAX_BATCH,
+                "fp8 arm must not move non-gfx1201 defaults ({arch})"
             );
         }
     }
