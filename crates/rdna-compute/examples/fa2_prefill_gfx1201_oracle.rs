@@ -236,16 +236,19 @@ fn upload_i32_as_raw(gpu: &Gpu, data: &[i32]) -> rdna_compute::HipResult<rdna_co
 
 fn main() {
     let mode = env_str("MODE", "oracle");
+    let kmode = env_usize("KMODE", 0);
     let mut gpu = Gpu::init().expect("gpu init");
     if gpu.arch != "gfx1201" {
         eprintln!("SKIP: fa2 oracle/bench requires gfx1201, got {}", gpu.arch);
         std::process::exit(2);
     }
-    match mode.as_str() {
-        "oracle" => oracle(&mut gpu),
-        "bench" => bench(&mut gpu),
+    match (mode.as_str(), kmode) {
+        ("oracle", 0) => oracle(&mut gpu),
+        ("bench", 0) => bench(&mut gpu),
+        ("oracle", 3) => oracle_fwht3(&mut gpu),
+        ("bench", 3) => bench_fwht3(&mut gpu),
         _ => {
-            eprintln!("unknown MODE={mode} (want oracle|bench)");
+            eprintln!("unknown MODE={mode} KMODE={kmode} (want oracle|bench x 0|3)");
             std::process::exit(2);
         }
     }
@@ -493,6 +496,379 @@ fn bench(gpu: &mut Gpu) {
         "RESULT verdict best={best_name} ratio_vs_incumbent={ratio:.3} \
          best_tflops={best_tf:.2} kill_gate_3x={pass}"
     );
+    if !pass {
+        std::process::exit(1);
+    }
+    println!("PASS");
+}
+
+// ── KMODE=3 (fwht3 K, V Q8_0) oracle/bench arm ──
+//
+// K bytes are produced by the production write kernel
+// (`kv_cache_write_fwht3_vec_batched`), so they are byte-exact by
+// construction; the CPU-f64 reference dequantizes those bytes
+// (cnorm * TURBO_C3_256[code], f16-rounded like the kernel) in rotated space
+// and rotates Q with the same signed FWHT-256 in f64. Gates: candidate vs
+// f64 AND candidate vs the incumbent `attention_flash_fwht3_tile_batched`
+// output, both rel_l2 <= 1e-3, plus the causal sentinel.
+// NOTE: the candidate rotates its Q buffer in place — every candidate launch
+// needs a freshly uploaded Q (timing loops re-launch on the same buffer only
+// because the work is identical; agreement is always checked after a
+// fresh-Q run).
+
+const K_BPH_FWHT3: usize = 100; // 4 B cnorm + 96 B of 3-bit codes at hd 256
+const K_BPP_FWHT3: usize = NKV * K_BPH_FWHT3; // 400
+
+const TURBO_C3_256: [f32; 8] = [
+    -0.134860, -0.083320, -0.046469, -0.015176,
+    0.015176, 0.046469, 0.083320, 0.134860,
+];
+
+/// Deterministic FWHT sign tables (same LCG as ScratchState::ensure_mq_signs:
+/// seeds 42 / 1042, 256 floats each). Self-consistent within this harness:
+/// the same tables feed the K-write, the candidate, the incumbent, and the
+/// CPU reference.
+fn gen_fwht_signs(seed: u32, n: usize) -> Vec<f32> {
+    let mut state = seed;
+    (0..n)
+        .map(|_| {
+            state = state.wrapping_mul(1103515245).wrapping_add(12345) & 0x7fffffff;
+            if (state >> 16) & 1 == 1 {
+                1.0f32
+            } else {
+                -1.0f32
+            }
+        })
+        .collect()
+}
+
+/// f64 mirror of fwht_shfl_forward_256 (signs → butterfly → 1/16 → signs).
+fn fwht_forward_256_f64(x: &mut [f64; 256], s1: &[f32], s2: &[f32]) {
+    for i in 0..256 {
+        x[i] *= s1[i] as f64;
+    }
+    let mut stride = 1;
+    while stride < 256 {
+        let mut i = 0;
+        while i < 256 {
+            for j in 0..stride {
+                let a = x[i + j];
+                let b = x[i + j + stride];
+                x[i + j] = a + b;
+                x[i + j + stride] = a - b;
+            }
+            i += stride * 2;
+        }
+        stride <<= 1;
+    }
+    for i in 0..256 {
+        x[i] *= (1.0 / 16.0) * s2[i] as f64;
+    }
+}
+
+/// Deterministic f32 K source, [ctx, NKV, HD] contiguous.
+fn build_k_src(ctx: usize) -> Vec<f32> {
+    (0..ctx * NKV * HD)
+        .map(|i| (((i * 53) % 101) as f32 - 50.0) * 0.01)
+        .collect()
+}
+
+/// Decode one fwht3 K value exactly as the kernel does: f16(cnorm * C3[code]).
+fn decode_fwht3k(cache: &[u8], pos: usize, kv_h: usize, d: usize) -> f64 {
+    let off = pos * K_BPP_FWHT3 + kv_h * K_BPH_FWHT3;
+    let cn = f32::from_ne_bytes([cache[off], cache[off + 1], cache[off + 2], cache[off + 3]]);
+    let lane = d / 8;
+    let j = d % 8;
+    let b0 = cache[off + 4 + lane * 3] as u32;
+    let b1 = cache[off + 4 + lane * 3 + 1] as u32;
+    let b2 = cache[off + 4 + lane * 3 + 2] as u32;
+    let packed = b0 | (b1 << 8) | (b2 << 16);
+    let code = ((packed >> (3 * j)) & 7) as usize;
+    half_bits_to_f32(f32_to_half_bits(cn * TURBO_C3_256[code])) as f64
+}
+
+/// CPU-f64 causal reference for fwht3 K / Q8 V. Q is rotated with the same
+/// signed FWHT in f64 then rounded through f16 (kernel: f32 rotate, f16 cast
+/// per chunk); K/V decode each payload then round through f16.
+fn cpu_reference_fwht3k(
+    q: &[f32],
+    k: &[u8],
+    v: &[u8],
+    pos: &[i32],
+    s1: &[f32],
+    s2: &[f32],
+    n: usize,
+) -> Vec<f32> {
+    let mut out = vec![0.0f32; n * NH * HD];
+    let scale = SCALE_ATTN_F32 as f64;
+    for b in 0..n {
+        let pb = pos[b] as usize;
+        for h in 0..NH {
+            let kv_h = h / (NH / NKV);
+            let mut qq = [0.0f64; HD];
+            for d in 0..HD {
+                qq[d] = q[(b * NH + h) * HD + d] as f64;
+            }
+            fwht_forward_256_f64(&mut qq, s1, s2);
+            for d in 0..HD {
+                qq[d] = half_bits_to_f32(f32_to_half_bits(qq[d] as f32)) as f64;
+            }
+            let mut scores = vec![f64::NEG_INFINITY; pb + 1];
+            for kk in 0..=pb {
+                let mut dot = 0.0f64;
+                for d in 0..HD {
+                    dot += qq[d] * decode_fwht3k(k, kk, kv_h, d);
+                }
+                scores[kk] = dot * scale;
+            }
+            let m = scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            let mut den = 0.0f64;
+            let mut probs = vec![0.0f64; pb + 1];
+            if m.is_finite() {
+                for kk in 0..=pb {
+                    let e = (scores[kk] - m).exp();
+                    probs[kk] = e;
+                    den += e;
+                }
+            }
+            for d in 0..HD {
+                let mut acc = 0.0f64;
+                for kk in 0..=pb {
+                    acc += probs[kk] * decode_q8(v, kk, kv_h, d);
+                }
+                out[(b * NH + h) * HD + d] = if den > 0.0 { (acc / den) as f32 } else { 0.0 };
+            }
+        }
+    }
+    out
+}
+
+fn download_bytes(gpu: &Gpu, t: &rdna_compute::GpuTensor, len: usize) -> Vec<u8> {
+    gpu.hip.device_synchronize().unwrap();
+    let mut data = vec![0u8; len];
+    gpu.hip.memcpy_dtoh(&mut data, &t.buf).unwrap();
+    data
+}
+
+fn check_case_fwht3(gpu: &mut Gpu, n: usize, ctx: usize, ragged: bool) -> bool {
+    let tag = if ragged { "ragged" } else { "tail" };
+    let s1 = gen_fwht_signs(42, 256);
+    let s2 = gen_fwht_signs(1042, 256);
+    // Byte-exact fwht3 K via the production write kernel over 0..ctx.
+    let k_src = build_k_src(ctx);
+    let wpos: Vec<i32> = (0..ctx as i32).collect();
+    let ks_g = gpu.upload_f32(&k_src, &[ctx * NKV * HD]).expect("ksrc upload");
+    let wp_g = upload_i32_as_raw(gpu, &wpos).expect("wpos upload");
+    let s1_g = gpu.upload_f32(&s1, &[256]).expect("s1 upload");
+    let s2_g = gpu.upload_f32(&s2, &[256]).expect("s2 upload");
+    let k_g = gpu
+        .upload_raw(&vec![0u8; ctx * K_BPP_FWHT3], &[ctx * K_BPP_FWHT3])
+        .expect("k upload");
+    gpu.kv_cache_write_fwht3_vec_batched(&k_g, &ks_g, &wp_g, &s1_g, &s2_g, NKV, HD, ctx)
+        .expect("k write");
+    let k = download_bytes(gpu, &k_g, ctx * K_BPP_FWHT3);
+
+    let v = build_cache(ctx, 7);
+    let qd = build_q(n);
+    let pos = build_positions(n, ctx, ragged);
+    let v_g = gpu.upload_raw(&v, &[v.len()]).expect("v upload");
+    // Two Q uploads: the candidate rotates its buffer in place.
+    let qi_g = gpu.upload_f32(&qd, &[n * NH * HD]).expect("qi upload");
+    let qc_g = gpu.upload_f32(&qd, &[n * NH * HD]).expect("qc upload");
+    let p_g = upload_i32_as_raw(gpu, &pos).expect("pos upload");
+    let out_inc = gpu.zeros(&[n * NH * HD], DType::F32).expect("out");
+    let out_cand = gpu.zeros(&[n * NH * HD], DType::F32).expect("out");
+    let partials = gpu
+        .zeros(&[2 * n * NH * (HD + 2)], DType::F32)
+        .expect("partials");
+
+    gpu.attention_flash_fwht3_batched_masked(
+        &qi_g, &k_g, &v_g, &out_inc, &p_g, &s1_g, &s2_g, NH, NKV, HD, ctx, ctx, n,
+        &partials, None, 0, 0, 8,
+    )
+    .expect("incumbent launch");
+    gpu.attention_q8_0_fa2_gqa_fwht3k_gfx1201(
+        &qc_g, &k_g, &v_g, &out_cand, &p_g, &s1_g, &s2_g, NH, NKV, HD, ctx, n,
+    )
+    .expect("candidate launch");
+
+    let ri = gpu.download_f32(&out_inc).expect("dl inc");
+    let rc = gpu.download_f32(&out_cand).expect("dl cand");
+    let reference = cpu_reference_fwht3k(&qd, &k, &v, &pos, &s1, &s2, n);
+
+    let mi = metrics(&reference, &ri, n);
+    let mc = metrics(&reference, &rc, n);
+    let mx = metrics(&ri, &rc, n);
+    let ok_arm = |m: &Metrics| {
+        m.finite && m.degenerate == 0 && m.compared == n * NH && m.rel_l2 <= 1e-3 && m.min_cos >= 1.0 - 1e-6
+    };
+    let pass = ok_arm(&mi) && ok_arm(&mc) && ok_arm(&mx);
+    println!(
+        "RESULT oracle_fwht3 n={n} ctx={ctx} pos={tag} inc_rel_l2={:.3e} inc_cos={:.9} \
+         cand_rel_l2={:.3e} cand_cos={:.9} cand_vs_inc_rel_l2={:.3e} cand_vs_inc_cos={:.9} pass={pass}",
+        mi.rel_l2, mi.min_cos, mc.rel_l2, mc.min_cos, mx.rel_l2, mx.min_cos
+    );
+    if !pass {
+        eprintln!(
+            "FAIL oracle_fwht3 n={n} ctx={ctx} pos={tag}: inc finite={} deg={} cmp={} | \
+             cand finite={} deg={} cmp={} | x finite={} deg={} cmp={}",
+            mi.finite, mi.degenerate, mi.compared,
+            mc.finite, mc.degenerate, mc.compared,
+            mx.finite, mx.degenerate, mx.compared
+        );
+        return false;
+    }
+
+    // Causal sentinel: perturb K codes strictly after row 0's position (plus
+    // V code bytes like the Q8 arm); row 0 must come back bit-identical.
+    // Fresh Q upload: the candidate rotated the earlier buffer in place.
+    let p0 = pos[0] as usize;
+    if p0 + 1 < ctx {
+        let mut k2 = k.clone();
+        for kk in (p0 + 1)..ctx {
+            for kvh in 0..NKV {
+                let base = kk * K_BPP_FWHT3 + kvh * K_BPH_FWHT3 + 4;
+                for j in 0..(K_BPH_FWHT3 - 4) {
+                    k2[base + j] = k2[base + j].wrapping_add(13);
+                }
+            }
+        }
+        let mut v2 = v.clone();
+        for kk in (p0 + 1)..ctx {
+            for blk in 0..(NKV * BPH) {
+                let off = kk * ROW_STRIDE + blk * 34;
+                for j in 2..34 {
+                    v2[off + j] = v2[off + j].wrapping_add(29);
+                }
+            }
+        }
+        let k2_g = gpu.upload_raw(&k2, &[k2.len()]).expect("k2 upload");
+        let v2_g = gpu.upload_raw(&v2, &[v2.len()]).expect("v2 upload");
+        let qs_g = gpu.upload_f32(&qd, &[n * NH * HD]).expect("qs upload");
+        let out_s = gpu.zeros(&[n * NH * HD], DType::F32).expect("out");
+        gpu.attention_q8_0_fa2_gqa_fwht3k_gfx1201(
+            &qs_g, &k2_g, &v2_g, &out_s, &p_g, &s1_g, &s2_g, NH, NKV, HD, ctx, n,
+        )
+        .expect("sentinel launch");
+        let rs = gpu.download_f32(&out_s).expect("dl sentinel");
+        let row0_same = rc[..NH * HD] == rs[..NH * HD];
+        println!("RESULT sentinel_fwht3 n={n} ctx={ctx} pos={tag} row0_bitidentical={row0_same}");
+        if !row0_same {
+            eprintln!("FAIL sentinel_fwht3 n={n} ctx={ctx} pos={tag}: row 0 changed");
+            return false;
+        }
+    } else {
+        println!("RESULT sentinel_fwht3 n={n} ctx={ctx} pos={tag} row0_bitidentical=skip");
+    }
+    true
+}
+
+fn oracle_fwht3(gpu: &mut Gpu) {
+    let shapes: &[(usize, usize)] = &[(1, 1), (7, 63), (8, 64), (9, 65), (17, 257), (16, 4096)];
+    let mut all_pass = true;
+    for &(n, ctx) in shapes {
+        for &ragged in &[false, true] {
+            if !check_case_fwht3(gpu, n, ctx, ragged) {
+                all_pass = false;
+            }
+        }
+    }
+    println!("RESULT oracle_fwht3_verdict pass={all_pass}");
+    if !all_pass {
+        std::process::exit(1);
+    }
+    println!("PASS");
+}
+
+fn bench_fwht3(gpu: &mut Gpu) {
+    let n = env_usize("N", 384);
+    let ctx = env_usize("CTX", 7936);
+    let warmups = env_usize("WARMUPS", 10);
+    let runs = env_usize("RUNS", 21);
+    assert!(n >= 1 && n <= 384, "bench N must be 1..=384");
+
+    let s1 = gen_fwht_signs(42, 256);
+    let s2 = gen_fwht_signs(1042, 256);
+    let k_src = build_k_src(ctx);
+    let wpos: Vec<i32> = (0..ctx as i32).collect();
+    let ks_g = gpu.upload_f32(&k_src, &[ctx * NKV * HD]).expect("ksrc upload");
+    let wp_g = upload_i32_as_raw(gpu, &wpos).expect("wpos upload");
+    let s1_g = gpu.upload_f32(&s1, &[256]).expect("s1 upload");
+    let s2_g = gpu.upload_f32(&s2, &[256]).expect("s2 upload");
+    let k_g = gpu
+        .upload_raw(&vec![0u8; ctx * K_BPP_FWHT3], &[ctx * K_BPP_FWHT3])
+        .expect("k upload");
+    gpu.kv_cache_write_fwht3_vec_batched(&k_g, &ks_g, &wp_g, &s1_g, &s2_g, NKV, HD, ctx)
+        .expect("k write");
+
+    let v = build_cache(ctx, 7);
+    let qd = build_q(n);
+    let pos = build_positions(n, ctx, false);
+    let v_g = gpu.upload_raw(&v, &[v.len()]).expect("v upload");
+    let qi_g = gpu.upload_f32(&qd, &[n * NH * HD]).expect("qi upload");
+    let qc_g = gpu.upload_f32(&qd, &[n * NH * HD]).expect("qc upload");
+    let p_g = upload_i32_as_raw(gpu, &pos).expect("pos upload");
+    let out_inc = gpu.zeros(&[n * NH * HD], DType::F32).expect("out");
+    let out_cand = gpu.zeros(&[n * NH * HD], DType::F32).expect("out");
+    let partials = gpu
+        .zeros(&[2 * n * NH * (HD + 2)], DType::F32)
+        .expect("partials");
+
+    let t_inc = event_times(gpu, warmups, runs, &|g: &mut Gpu| {
+        g.attention_flash_fwht3_batched_masked(
+            &qi_g, &k_g, &v_g, &out_inc, &p_g, &s1_g, &s2_g, NH, NKV, HD, ctx, ctx, n,
+            &partials, None, 0, 0, 8,
+        )
+        .expect("incumbent");
+    });
+    // Same-buffer re-launches rotate Q again, but the work (FLOPs, traffic)
+    // is identical every call, so timing stays valid; agreement is checked
+    // below after a fresh-Q run.
+    let t_cand = event_times(gpu, warmups, runs, &|g: &mut Gpu| {
+        g.attention_q8_0_fa2_gqa_fwht3k_gfx1201(
+            &qc_g, &k_g, &v_g, &out_cand, &p_g, &s1_g, &s2_g, NH, NKV, HD, ctx, n,
+        )
+        .expect("candidate");
+    });
+
+    let mut flop = 0u64;
+    for b in 0..n {
+        flop += 4 * NH as u64 * HD as u64 * (pos[b] as u64 + 1);
+    }
+    let report = |name: &str, ts: &[f64]| {
+        let med = ts[ts.len() / 2];
+        let p10 = ts[ts.len() / 10];
+        let p90 = ts[(ts.len() * 9) / 10];
+        let tflops = flop as f64 / 1e12 / (med / 1e3);
+        println!(
+            "RESULT bench_fwht3 arm={name} n={n} ctx={ctx} runs={runs} \
+             median_ms={med:.4} p10_ms={p10:.4} p90_ms={p90:.4} \
+             gflop={:.3} tflops={tflops:.2}",
+            flop as f64 / 1e9
+        );
+        med
+    };
+    let m_inc = report("incumbent", &t_inc);
+    let m_cand = report("fa2_fwht3k", &t_cand);
+
+    // Agreement after a fresh-Q candidate run (timing loop rotated qc_g).
+    let qf_g = gpu.upload_f32(&qd, &[n * NH * HD]).expect("qf upload");
+    let out_f = gpu.zeros(&[n * NH * HD], DType::F32).expect("out");
+    gpu.attention_q8_0_fa2_gqa_fwht3k_gfx1201(
+        &qf_g, &k_g, &v_g, &out_f, &p_g, &s1_g, &s2_g, NH, NKV, HD, ctx, n,
+    )
+    .expect("agree launch");
+    let rf = gpu.download_f32(&out_f).expect("dl agree");
+    let ri = gpu.download_f32(&out_inc).expect("dl inc");
+    let m = metrics(&ri, &rf, n);
+    println!(
+        "RESULT bench_fwht3_agree cand_vs_inc_rel_l2={:.3e} min_cos={:.9} finite={}",
+        m.rel_l2, m.min_cos, m.finite
+    );
+
+    let ratio = m_inc / m_cand;
+    let pass = m.finite && m.rel_l2 <= 1e-3;
+    println!("RESULT bench_fwht3_verdict ratio_vs_incumbent={ratio:.3} agree_gate_1e3={pass}");
     if !pass {
         std::process::exit(1);
     }

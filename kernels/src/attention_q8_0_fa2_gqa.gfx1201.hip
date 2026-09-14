@@ -178,38 +178,43 @@ __device__ __forceinline__ void fa2_gqa_body(
         // fwht3 K: per (position, kv head) record = [f32 cnorm][96 B codes]
         // (k_bytes_per_head = 100, k_bytes_per_pos = 4*100 = 400, head offset
         // kv_h*100 — the same contract as attention_flash_fwht3_tile_batched
-        // and kv_cache_write_asym_k_fwht3*). Lane l of 32 owns dims l*8..+8
+        // and kv_cache_write_asym_k_fwht3*). 512 slots (k*8+b, like the Q8
+        // path); slot (k, b) owns lanes b*4..b*4+3 (lane l owns dims l*8..+8
         // via 3 bytes at +4+l*3, code (packed >> 3*i) & 7, value cnorm *
-        // TURBO_C3_256[code]. 64 keys x 32 lanes = 2048 slots over 4 rounds;
-        // each slot dequantizes 8 dims = 4 dwords straight into the swizzled
-        // dword plane (pair p for key k at K[k][(p + S(k&15)) & 127] —
-        // identical layout downstream). V fill below is unchanged (Q8_0).
+        // TURBO_C3_256[code]) and dequantizes 32 dims = 16 dwords straight
+        // into the swizzled dword plane (pair p for key k at
+        // K[k][(p + S(k&15)) & 127] — identical layout downstream, so block
+        // b covers pairs b*16..b*16+15 exactly as in the Q8 path). V fill
+        // below is unchanged (Q8_0).
         for (int t = 0; t < 4; ++t) {
-            const int slot = tid + t * 128;
-            const int k = slot >> 5;
-            const int l = slot & 31;
+            const int s = tid + t * 128;
+            const int k = s >> 3;
+            const int b = s & 7;
             const int gk = ktile + k;
             const unsigned char* rec = (gk < seq_len)
                 ? k_cache + (unsigned long long)gk * 400ULL
                     + (unsigned long long)(kv_h * 100)
                 : nullptr;
             float cnorm = 0.0f;
-            uint32_t packed = 0;
-            if (rec != nullptr) {
+            if (rec != nullptr)
                 __builtin_memcpy(&cnorm, rec, 4);
-                __builtin_memcpy(&packed, rec + 4 + l * 3, 3);
-            }
             const int rot = fa2_swiz(k & 15);
             const int base = k * 128;
-            const int p0 = l * 4;
+#pragma unroll 1
+            for (int m = 0; m < 4; ++m) {
+                uint32_t packed = 0;
+                if (rec != nullptr)
+                    __builtin_memcpy(&packed, rec + 4 + (b * 4 + m) * 3, 3);
+                const int p0 = (b * 4 + m) * 4;
 #pragma unroll
-            for (int i = 0; i < 4; ++i) {
-                const int code0 = (packed >> (6 * i)) & 7;
-                const int code1 = (packed >> (6 * i + 3)) & 7;
-                fa2_dw_t dw;
-                dw.h[0] = (_Float16)(cnorm * TURBO_C3_256[code0]);
-                dw.h[1] = (_Float16)(cnorm * TURBO_C3_256[code1]);
-                Kdw[base + ((p0 + i + rot) & 127)] = dw.u;
+                for (int i = 0; i < 4; ++i) {
+                    const int code0 = (packed >> (6 * i)) & 7;
+                    const int code1 = (packed >> (6 * i + 3)) & 7;
+                    fa2_dw_t dw;
+                    dw.h[0] = (_Float16)(cnorm * TURBO_C3_256[code0]);
+                    dw.h[1] = (_Float16)(cnorm * TURBO_C3_256[code1]);
+                    Kdw[base + ((p0 + i + rot) & 127)] = dw.u;
+                }
             }
         }
 #else
