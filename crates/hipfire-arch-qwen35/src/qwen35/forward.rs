@@ -4609,8 +4609,8 @@ fn dense_tp_allreduce_add(
 
 fn dense_tp_allreduce_batched(
     gpus: &mut Gpus,
-    pbs_vec: &[PrefillBatchScratch],
-    partials: &[GpuTensor],
+    pbs_vec: &[&PrefillBatchScratch],
+    partials: &[&GpuTensor],
     n: usize,
     dim: usize,
 ) -> HipResult<()> {
@@ -5186,8 +5186,8 @@ pub(crate) fn forward_prefill_dense_tp_with_pbs_capture(
     kv_caches: &mut [llama::KvCache],
     dn_states: &mut [DeltaNetState],
     scratches: &[Qwen35Scratch],
-    pbs: &[PrefillBatchScratch],
-    partials: &[GpuTensor],
+    pbs: &[&PrefillBatchScratch],
+    partials: &[&GpuTensor],
     captures: &mut [DenseTpDflashCapture<'_>],
     rank0_final_hidden: &GpuTensor,
 ) -> HipResult<()> {
@@ -5274,8 +5274,8 @@ fn forward_prefill_dense_tp_batched(
     kv_caches: &mut [llama::KvCache],
     dn_states: &mut [DeltaNetState],
     scratches: &[Qwen35Scratch],
-    pbs_vec: &[PrefillBatchScratch],
-    partials: &[GpuTensor],
+    pbs_vec: &[&PrefillBatchScratch],
+    partials: &[&GpuTensor],
     mut captures: Option<&mut [DenseTpDflashCapture<'_>]>,
 ) -> HipResult<usize> {
     if tokens.is_empty() {
@@ -5363,7 +5363,7 @@ fn forward_prefill_dense_tp_batched(
                         &weights[rank],
                         chunk,
                         &scratches[rank],
-                        &pbs_vec[rank],
+                        pbs_vec[rank],
                         n,
                         dim,
                         dim * 4,
@@ -5374,7 +5374,7 @@ fn forward_prefill_dense_tp_batched(
                     )?;
                     crate::qwen35::prefill::batch_chunk_upload_positions(
                         &mut gpus.devices[rank],
-                        &pbs_vec[rank],
+                        pbs_vec[rank],
                         BatchSemantics::Sequential,
                         chunk_start,
                         n,
@@ -5418,7 +5418,7 @@ fn forward_prefill_dense_tp_batched(
                                 &mut gpus.devices[rank],
                                 layer,
                                 cfg,
-                                &pbs_vec[rank],
+                                pbs_vec[rank],
                                 &mut dn_states[rank],
                                 n,
                                 dim,
@@ -5433,7 +5433,7 @@ fn forward_prefill_dense_tp_batched(
                                 delta_layer_idx,
                                 q8_flags[rank],
                                 q8_flags[rank],
-                                BatchEpilogue::Partial(&partials[rank]),
+                                BatchEpilogue::Partial(partials[rank]),
                                 DflashFusionCtx::Off,
                             ) {
                                 process_res = Err(e);
@@ -5444,7 +5444,7 @@ fn forward_prefill_dense_tp_batched(
                             break;
                         }
                         if let Err(e) =
-                            dense_tp_allreduce_batched(gpus, &pbs_vec, &partials, n, dim)
+                            dense_tp_allreduce_batched(gpus, pbs_vec, partials, n, dim)
                         {
                             process_res = Err(e);
                             break;
@@ -5487,13 +5487,13 @@ fn forward_prefill_dense_tp_batched(
                                 &mut gpus.devices[rank],
                                 layer,
                                 &configs[rank],
-                                &pbs_vec[rank],
+                                pbs_vec[rank],
                                 n,
                                 dim,
                                 configs[rank].hidden_dim,
                                 q8_flags[rank],
                                 q8_flags[rank],
-                                BatchEpilogue::Partial(&partials[rank]),
+                                BatchEpilogue::Partial(partials[rank]),
                                 DflashFusionCtx::Off,
                             ) {
                                 process_res = Err(e);
@@ -5504,7 +5504,7 @@ fn forward_prefill_dense_tp_batched(
                             break;
                         }
                         if let Err(e) =
-                            dense_tp_allreduce_batched(gpus, &pbs_vec, &partials, n, dim)
+                            dense_tp_allreduce_batched(gpus, pbs_vec, partials, n, dim)
                         {
                             process_res = Err(e);
                             break;
@@ -5557,7 +5557,7 @@ fn forward_prefill_dense_tp_batched(
                                 false,
                                 layer,
                                 &configs[rank],
-                                &pbs_vec[rank],
+                                pbs_vec[rank],
                                 &scratches[rank],
                                 &mut kv_caches[rank],
                                 n,
@@ -5571,7 +5571,7 @@ fn forward_prefill_dense_tp_batched(
                                 q8_flags[rank],
                                 kv_layer_idx,
                                 layer_idx,
-                                BatchEpilogue::Partial(&partials[rank]),
+                                BatchEpilogue::Partial(partials[rank]),
                                 DflashFusionCtx::Off,
                             ) {
                                 process_res = Err(e);
@@ -5582,7 +5582,7 @@ fn forward_prefill_dense_tp_batched(
                             break;
                         }
                         if let Err(e) =
-                            dense_tp_allreduce_batched(gpus, &pbs_vec, &partials, n, dim)
+                            dense_tp_allreduce_batched(gpus, pbs_vec, partials, n, dim)
                         {
                             process_res = Err(e);
                             break;
@@ -5625,13 +5625,13 @@ fn forward_prefill_dense_tp_batched(
                                 &mut gpus.devices[rank],
                                 layer,
                                 &configs[rank],
-                                &pbs_vec[rank],
+                                pbs_vec[rank],
                                 n,
                                 dim,
                                 configs[rank].hidden_dim,
                                 q8_flags[rank],
                                 q8_flags[rank],
-                                BatchEpilogue::Partial(&partials[rank]),
+                                BatchEpilogue::Partial(partials[rank]),
                                 DflashFusionCtx::Off,
                             ) {
                                 process_res = Err(e);
@@ -5642,7 +5642,7 @@ fn forward_prefill_dense_tp_batched(
                             break;
                         }
                         if let Err(e) =
-                            dense_tp_allreduce_batched(gpus, &pbs_vec, &partials, n, dim)
+                            dense_tp_allreduce_batched(gpus, pbs_vec, partials, n, dim)
                         {
                             process_res = Err(e);
                             break;
@@ -5780,9 +5780,11 @@ pub fn forward_prefill_dense_tp(
         partials.push(partial);
     }
     // ── Shared chunked layer loop (no capture) ──
+    let pbs_refs: Vec<&PrefillBatchScratch> = pbs_vec.iter().collect();
+    let partial_refs: Vec<&GpuTensor> = partials.iter().collect();
     let last_chunk_n = match forward_prefill_dense_tp_batched(
-        gpus, shard, weights, configs, tokens, start_pos, kv_caches, dn_states, scratches, &pbs_vec,
-        &partials, None,
+        gpus, shard, weights, configs, tokens, start_pos, kv_caches, dn_states, scratches, &pbs_refs,
+        &partial_refs, None,
     ) {
         Ok(n) => n,
         Err(e) => {
