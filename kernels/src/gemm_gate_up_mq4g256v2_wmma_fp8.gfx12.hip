@@ -124,6 +124,14 @@ __device__ static inline v2i_t mq4_qpk_to_e4m3(unsigned int pk) {
 #define HIPFIRE_FP8_QKVZA 0
 #endif
 
+// HIPFIRE_FP8_QKV=1 compiles the 3-way fused full-attention projection form
+// (A_q/A_k/A_v -> Y_q/Y_k/Y_v, overwrite) with the incumbent QKV ABI
+// (3 weights, 3 outputs, 3 row counts q_m/k_m/v_m); routing mirrors the
+// F16 gfx1201 BT kernel (kernels/src/gemm_qkv_mq4g256v2_wmma_gfx1201_bt.hip).
+#ifndef HIPFIRE_FP8_QKV
+#define HIPFIRE_FP8_QKV 0
+#endif
+
 // Two-slab form: HIPFIRE_FP8_SLABS=2 gives each wave32 two 16-row slabs
 // (rows [rs, rs+32)) so one 16 B X fragment feeds four WMMAs (two slabs x
 // two K fragments) instead of two. acc[s][b], per-slab headers/scales and
@@ -166,6 +174,23 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
     int K,
     int N) {
     const int tm = res_m;
+#elif HIPFIRE_FP8_QKV
+void HIPFIRE_FP8_GATEUP_KERNEL(
+    const char* A_q,
+    const char* A_k,
+    const char* A_v,
+    const unsigned char* X_fp8,
+    const float* X_half_sums,
+    const float* X_row_scales,
+    float* Y_q,
+    float* Y_k,
+    float* Y_v,
+    int q_m,
+    int k_m,
+    int v_m,
+    int K,
+    int N) {
+    const int tm = q_m + k_m + v_m;
 #else
 void HIPFIRE_FP8_GATEUP_KERNEL(
     const char* A_gate,
@@ -212,6 +237,10 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
 #elif HIPFIRE_FP8_RESIDUAL
         Ax[s] = A_w;
         lrx[s] = srs;
+#elif HIPFIRE_FP8_QKV
+        if (srs < q_m) { Ax[s] = A_q; lrx[s] = srs; }
+        else if (srs < q_m + k_m) { Ax[s] = A_k; lrx[s] = srs - q_m; }
+        else { Ax[s] = A_v; lrx[s] = srs - (q_m + k_m); }
 #else
         if (srs < gate_m) { Ax[s] = A_gate; lrx[s] = srs; } else { Ax[s] = A_up; lrx[s] = srs - gate_m; }
 #endif
@@ -230,6 +259,12 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
 #elif HIPFIRE_FP8_RESIDUAL
     const char* A = A_w;
     const int lr = sr;
+#elif HIPFIRE_FP8_QKV
+    const char* A;
+    int lr;
+    if (sr < q_m) { A = A_q; lr = sr; }
+    else if (sr < q_m + k_m) { A = A_k; lr = sr - q_m; }
+    else { A = A_v; lr = sr - (q_m + k_m); }
 #else
     const char* A;
     int lr;
@@ -473,6 +508,13 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
                     Y0[(unsigned int)oc * (unsigned int)os0 + (unsigned int)pr0] = an * s_finx[0][j] * acc[0][b][j];
 #elif HIPFIRE_FP8_RESIDUAL
                     Y_res[(unsigned int)oc * (unsigned int)res_m + (unsigned int)orow0] += an * s_finx[0][j] * acc[0][b][j];
+#elif HIPFIRE_FP8_QKV
+                    float* Y0;
+                    int pr0, os0;
+                    if (orow0 < q_m) { Y0 = Y_q; pr0 = orow0; os0 = q_m; }
+                    else if (orow0 < q_m + k_m) { Y0 = Y_k; pr0 = orow0 - q_m; os0 = k_m; }
+                    else { Y0 = Y_v; pr0 = orow0 - (q_m + k_m); os0 = v_m; }
+                    Y0[(unsigned int)oc * (unsigned int)os0 + (unsigned int)pr0] = an * s_finx[0][j] * acc[0][b][j];
 #else
                     float* Y0;
                     int pr0, os0;
@@ -493,6 +535,13 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
                     Y1[(unsigned int)oc * (unsigned int)os1 + (unsigned int)pr1] = an * s_finx[1][j] * acc[1][b][j];
 #elif HIPFIRE_FP8_RESIDUAL
                     Y_res[(unsigned int)oc * (unsigned int)res_m + (unsigned int)orow1] += an * s_finx[1][j] * acc[1][b][j];
+#elif HIPFIRE_FP8_QKV
+                    float* Y1;
+                    int pr1, os1;
+                    if (orow1 < q_m) { Y1 = Y_q; pr1 = orow1; os1 = q_m; }
+                    else if (orow1 < q_m + k_m) { Y1 = Y_k; pr1 = orow1 - q_m; os1 = k_m; }
+                    else { Y1 = Y_v; pr1 = orow1 - (q_m + k_m); os1 = v_m; }
+                    Y1[(unsigned int)oc * (unsigned int)os1 + (unsigned int)pr1] = an * s_finx[1][j] * acc[1][b][j];
 #else
                     float* Y1;
                     int pr1, os1;
@@ -531,6 +580,13 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
                     Y[(unsigned int)oc * (unsigned int)os + (unsigned int)pr] = an * s_fin[j] * acc[b][j];
 #elif HIPFIRE_FP8_RESIDUAL
                     Y_res[(unsigned int)oc * (unsigned int)res_m + (unsigned int)orow] += an * s_fin[j] * acc[b][j];
+#elif HIPFIRE_FP8_QKV
+                    float* Y;
+                    int pr, os;
+                    if (orow < q_m) { Y = Y_q; pr = orow; os = q_m; }
+                    else if (orow < q_m + k_m) { Y = Y_k; pr = orow - q_m; os = k_m; }
+                    else { Y = Y_v; pr = orow - (q_m + k_m); os = v_m; }
+                    Y[(unsigned int)oc * (unsigned int)os + (unsigned int)pr] = an * s_fin[j] * acc[b][j];
 #else
                     float* Y;
                     int pr, os;

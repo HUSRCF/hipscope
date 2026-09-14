@@ -9498,6 +9498,136 @@ impl Gpu {
         }
         result
     }
+    /// MQ4 v2 (qt 44) — gfx1201 FP8-WMMA 3-way fused QKV (full-attention)
+    /// candidate, default-OFF behind `HIPFIRE_GFX12_MQ4V2_FP8_QKV`; eager-only,
+    /// exact gfx1201, K%256, N%64. Shares the FP8 X preparation with gate/up.
+    /// ABI mirrors the F16 gfx1201 BT kernel (3 weights, 3 outputs, 3 row
+    /// counts); overwrite semantics.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_qkv_hfq4g256_wmma_gfx12_mq4v2_fp8(
+        &mut self,
+        a_q: &GpuTensor,
+        a_k: &GpuTensor,
+        a_v: &GpuTensor,
+        x: &GpuTensor,
+        y_q: &GpuTensor,
+        y_k: &GpuTensor,
+        y_v: &GpuTensor,
+        q_m: usize,
+        k_m: usize,
+        v_m: usize,
+        k: usize,
+        batch_size: usize,
+        scale_mode: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if self.arch != "gfx1201" || self.replay.is_recording() || self.graphs.capture_mode {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "gemm_qkv_mq4g256v2_wmma_fp8_gfx12: exact gfx1201 eager-only",
+            ));
+        }
+        if batch_size == 0 || k % 256 != 0 || batch_size % 64 != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "gemm_qkv_mq4g256v2_wmma_fp8_gfx12: need N%64==0, K%256==0",
+            ));
+        }
+        let prepared = self.prepare_mq4v2_fp8_x(x, batch_size, k, scale_mode)?;
+        // Two-slab S2BT8 form, developer-only (see gate_up launcher).
+        let slabs2 = hipfire_config::developer_var("HIPFIRE_GFX12_MQ4V2_FP8_SLABS").as_deref() == Ok("2")
+            && batch_size % 128 == 0;
+        let (func_name, ksrc, bv): (&str, &str, usize) = if slabs2 {
+            (
+                "gemm_qkv_mq4g256v2_wmma_fp8_gfx12_s2bt8",
+                kernels::GEMM_QKV_MQ4G256V2_WMMA_FP8_GFX12_S2BT8_SRC,
+                8,
+            )
+        } else if batch_size % 192 == 0 {
+            (
+                "gemm_qkv_mq4g256v2_wmma_fp8_gfx12_bt12",
+                kernels::GEMM_QKV_MQ4G256V2_WMMA_FP8_GFX12_BT12_SRC,
+                12,
+            )
+        } else if batch_size % 128 == 0 {
+            (
+                "gemm_qkv_mq4g256v2_wmma_fp8_gfx12_bt8",
+                kernels::GEMM_QKV_MQ4G256V2_WMMA_FP8_GFX12_BT8_SRC,
+                8,
+            )
+        } else {
+            (
+                "gemm_qkv_mq4g256v2_wmma_fp8_gfx12_bt4",
+                kernels::GEMM_QKV_MQ4G256V2_WMMA_FP8_GFX12_BT4_SRC,
+                4,
+            )
+        };
+        self.ensure_kernel(func_name, ksrc, func_name)?;
+        let mut aq = a_q.buf.as_ptr();
+        let mut ak = a_k.buf.as_ptr();
+        let mut av = a_v.buf.as_ptr();
+        let mut xf = prepared.x_fp8;
+        let mut hs = prepared.half_sums;
+        let mut rsc = prepared.row_scales;
+        let mut yq = y_q.buf.as_ptr();
+        let mut yk = y_k.buf.as_ptr();
+        let mut yv = y_v.buf.as_ptr();
+        let mut q_m_val = q_m as i32;
+        let mut k_m_val = k_m as i32;
+        let mut v_m_val = v_m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut aq as *mut _ as *mut c_void,
+            &mut ak as *mut _ as *mut c_void,
+            &mut av as *mut _ as *mut c_void,
+            &mut xf as *mut _ as *mut c_void,
+            &mut hs as *mut _ as *mut c_void,
+            &mut rsc as *mut _ as *mut c_void,
+            &mut yq as *mut _ as *mut c_void,
+            &mut yk as *mut _ as *mut c_void,
+            &mut yv as *mut _ as *mut c_void,
+            &mut q_m_val as *mut _ as *mut c_void,
+            &mut k_m_val as *mut _ as *mut c_void,
+            &mut v_m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+        let total_m = q_m + k_m + v_m;
+        let row_tiles = if slabs2 { (total_m + 31) / 32 } else { (total_m + 15) / 16 };
+        let batch_tiles = (batch_size + 16 * bv - 1) / (16 * bv);
+        let bytes = crate::profile::gemv_hfq4g256_bytes(total_m, k) + batch_size * k + batch_size * total_m * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", func_name, bytes);
+        let result = self.launch_maybe_blob(
+            func_name,
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(aq);
+                b.push_ptr(ak);
+                b.push_ptr(av);
+                b.push_ptr(xf);
+                b.push_ptr(hs);
+                b.push_ptr(rsc);
+                b.push_ptr(yq);
+                b.push_ptr(yk);
+                b.push_ptr(yv);
+                b.push_i32(q_m_val);
+                b.push_i32(k_m_val);
+                b.push_i32(v_m_val);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
 
     /// Module = v1 + `_mq4v2`, func = v2 symbol `gemm_qkvza_mq4g256v2_*`.
     pub fn gemm_qkvza_hfq4g256_wmma_gfx12_mq4v2(
@@ -27960,6 +28090,21 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        // FP8-WMMA MQ4v2 QKV candidate (opt-in): intercepts before the
+        // production F16 BT path. Eager HIP on exact gfx1201 only, K%256,
+        // N%64 (mirrors the qkvza fp8 guard).
+        if self.flags.gfx12_mq4v2_fp8_qkv
+            && self.arch == "gfx1201"
+            && !self.replay.is_recording()
+            && !self.graphs.capture_mode
+            && k % 256 == 0
+            && batch_size >= 64
+            && batch_size % 64 == 0
+        {
+            return self.gemm_qkv_hfq4g256_wmma_gfx12_mq4v2_fp8(
+                a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size, 1,
+            );
+        }
         // Production MQ4V2 weight-reuse tile (gfx1201 QKV BT8 @ N>=96).
         // Capture/replay always keep the historical base launch contract.
         if !self.replay.is_recording() && !self.graphs.capture_mode {

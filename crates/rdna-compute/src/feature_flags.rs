@@ -204,6 +204,8 @@ pub struct FeatureFlags {
     pub gfx12_mq4v2_fp8_resid: bool,
     /// FP8-WMMA MQ4v2 4-way QKVZA prefill candidate. Default OFF.
     pub gfx12_mq4v2_fp8_qkvza: bool,
+    /// FP8-WMMA MQ4v2 3-way QKV (full-attention) prefill candidate. Default OFF.
+    pub gfx12_mq4v2_fp8_qkv: bool,
     pub gemm_dump: bool,
     pub deterministic: bool,
     pub mw16: bool,
@@ -558,6 +560,7 @@ impl FeatureFlags {
             gfx12_mq4v2_fp8_gateup: value("HIPFIRE_GFX12_MQ4V2_FP8_GATEUP").as_deref() == Ok("1"),
             gfx12_mq4v2_fp8_resid: value("HIPFIRE_GFX12_MQ4V2_FP8_RESID").as_deref() == Ok("1"),
             gfx12_mq4v2_fp8_qkvza: value("HIPFIRE_GFX12_MQ4V2_FP8_QKVZA").as_deref() == Ok("1"),
+            gfx12_mq4v2_fp8_qkv: value("HIPFIRE_GFX12_MQ4V2_FP8_QKV").as_deref() == Ok("1"),
             gemm_dump: value("HIPFIRE_GEMM_DUMP").ok().as_deref() == Some("1"),
             deterministic: value("HIPFIRE_DETERMINISTIC").ok().as_deref() == Some("1"),
             mw16: value("HIPFIRE_MW16").map_or(false, |v| v == "1"),
@@ -823,6 +826,7 @@ impl FeatureFlags {
             gfx12_mq4v2_fp8_gateup: false,
             gfx12_mq4v2_fp8_resid: false,
             gfx12_mq4v2_fp8_qkvza: false,
+            gfx12_mq4v2_fp8_qkv: false,
             gemm_dump: false,
             deterministic: false,
             mw16: false,
