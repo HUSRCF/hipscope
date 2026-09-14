@@ -6488,6 +6488,27 @@ pub fn spec_step_dflash_dense_tp2(
     let mask_token = states[0].dflash.draft_config.mask_token_id;
     let mut block: Vec<u32> = vec![mask_token; b];
     block[0] = seed_token;
+    // HIPFIRE_SPEC_PHASES=1: mesh phase breakdown (diagnostic; device-sync per
+    // boundary so wall time reflects GPU completion, like the single-GPU path).
+    static MESH_PHASE_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let mesh_phase_on = *MESH_PHASE_ON.get_or_init(|| {
+        hipfire_config::developer_var("HIPFIRE_SPEC_PHASES")
+            .ok()
+            .as_deref()
+            == Some("1")
+    });
+    macro_rules! mesh_sync {
+        () => {
+            if mesh_phase_on {
+                for gpu in gpus.devices.iter() {
+                    gpu.bind_thread()?;
+                    gpu.hip.device_synchronize()?;
+                }
+            }
+        };
+    }
+    mesh_sync!();
+    let t_mesh_start = std::time::Instant::now();
     // ── Draft on both ranks (no target mutation yet) ──
     let mut drafted_per_rank: Vec<Vec<u32>> = Vec::with_capacity(2);
     for rank in 0..2 {
@@ -6527,6 +6548,8 @@ pub fn spec_step_dflash_dense_tp2(
     for i in 1..b {
         block[i] = drafted[i];
     }
+    mesh_sync!();
+    let t_mesh_draft = std::time::Instant::now();
     // ── VMM preflight on both ranks before snapshot/verify ──
     let required = position
         .checked_add(b)
@@ -6560,6 +6583,8 @@ pub fn spec_step_dflash_dense_tp2(
         position,
         generation,
     )?;
+    mesh_sync!();
+    let t_mesh_verify = std::time::Instant::now();
     // ── Accept on rank-0 picks (shared greedy math, no fork) ──
     let acc = hipfire_runtime::spec::accept_greedy_prefix(&block[1..b], &argmax_per_pos, None);
     let accept_len = acc.accepted;
@@ -6570,6 +6595,7 @@ pub fn spec_step_dflash_dense_tp2(
         committed.push(drafted[i + 1]);
     }
     committed.push(bonus_token);
+    let t_mesh_accept = std::time::Instant::now();
     // ── Commit a+1 hidden rows into each rank's own draft cache ──
     let rows_to_keep = accept_len + 1;
     for rank in 0..2 {
@@ -6590,6 +6616,8 @@ pub fn spec_step_dflash_dense_tp2(
             .thlog
             .append_committed(position, rows_to_keep, co);
     }
+    mesh_sync!();
+    let t_mesh_scatter = std::time::Instant::now();
     // ── Restore + replay both ranks to P+a+1 ──
     // Tape replay needs the same PBS-eligibility the single-GPU path gates
     // on; without it, fall back to the shared dense-TP re-forward over the
@@ -6630,6 +6658,8 @@ pub fn spec_step_dflash_dense_tp2(
             )?;
         }
     }
+    mesh_sync!();
+    let t_mesh_restore = std::time::Instant::now();
     if !use_tape {
         let replay_tokens = committed[..accept_len + 1].to_vec();
         forward_prefill_dense_tp(
@@ -6643,6 +6673,27 @@ pub fn spec_step_dflash_dense_tp2(
             &mut *target.dn_states,
             target.scratches,
         )?;
+    }
+    mesh_sync!();
+    let t_mesh_replay = std::time::Instant::now();
+    if mesh_phase_on {
+        for gpu in gpus.devices.iter() {
+            gpu.bind_thread()?;
+            gpu.hip.device_synchronize()?;
+        }
+        let t_mesh_end = std::time::Instant::now();
+        eprintln!(
+            "[phase-tp2] B={} accept={} draft={}µs verify={}µs accept={}µs scatter={}µs restore={}µs replay={}µs | total={}µs",
+            b,
+            accept_len,
+            t_mesh_draft.duration_since(t_mesh_start).as_micros(),
+            t_mesh_verify.duration_since(t_mesh_draft).as_micros(),
+            t_mesh_accept.duration_since(t_mesh_verify).as_micros(),
+            t_mesh_scatter.duration_since(t_mesh_accept).as_micros(),
+            t_mesh_restore.duration_since(t_mesh_scatter).as_micros(),
+            t_mesh_replay.duration_since(t_mesh_restore).as_micros(),
+            t_mesh_end.duration_since(t_mesh_start).as_micros(),
+        );
     }
     // ── Matched commit receipts gate publication ──
     for rank in 0..2 {
