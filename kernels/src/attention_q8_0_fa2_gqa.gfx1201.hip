@@ -180,15 +180,23 @@ __device__ __forceinline__ void fa2_gqa_body(
             const int base = k * 128;
             const int pb = b * 16;
 #pragma unroll 1
-            for (int i = 0; i < 16; ++i) {
-                const float c0 =
-                    (blk != nullptr) ? (float)(int8_t)blk[2 + 2 * i] : 0.0f;
-                const float c1 =
-                    (blk != nullptr) ? (float)(int8_t)blk[2 + 2 * i + 1] : 0.0f;
-                fa2_dw_t dw;
-                dw.h[0] = (_Float16)(sf * c0);
-                dw.h[1] = (_Float16)(sf * c1);
-                Kdw[base + ((pb + i + rot) & 127)] = dw.u;
+            // 8 dwords cover the 32 codes (blk+2 may be 2-mod-4;
+            // memcpy emits a correct unaligned load either way).
+            for (int w = 0; w < 8; ++w) {
+                uint32_t u = 0;
+                if (blk != nullptr)
+                    __builtin_memcpy(&u, blk + 2 + w * 4, 4);
+                const float c0 = (float)(int8_t)u;
+                const float c1 = (float)(int8_t)(u >> 8);
+                const float c2 = (float)(int8_t)(u >> 16);
+                const float c3 = (float)(int8_t)(u >> 24);
+                fa2_dw_t d0, d1;
+                d0.h[0] = (_Float16)(sf * c0);
+                d0.h[1] = (_Float16)(sf * c1);
+                d1.h[0] = (_Float16)(sf * c2);
+                d1.h[1] = (_Float16)(sf * c3);
+                Kdw[base + ((pb + w * 2 + rot) & 127)] = d0.u;
+                Kdw[base + ((pb + w * 2 + 1 + rot) & 127)] = d1.u;
             }
         }
         // V: 256 key-pairs (m*8+b); each slot reads the even and odd block
@@ -218,16 +226,22 @@ __device__ __forceinline__ void fa2_gqa_body(
             const float sf0 = (float)s0;
             const float sf1 = (float)s1;
 #pragma unroll 1
-            for (int i = 0; i < 32; ++i) {
-                const int d = b * 32 + i;
-                const float c0 =
-                    (blk0 != nullptr) ? (float)(int8_t)blk0[2 + i] : 0.0f;
-                const float c1 =
-                    (blk1 != nullptr) ? (float)(int8_t)blk1[2 + i] : 0.0f;
-                fa2_dw_t dw;
-                dw.h[0] = (_Float16)(sf0 * c0);
-                dw.h[1] = (_Float16)(sf1 * c1);
-                Vdw[d * 32 + ((m + fa2_swiz(d & 15)) & 31)] = dw.u;
+            for (int w = 0; w < 8; ++w) {
+                uint32_t u0 = 0, u1 = 0;
+                if (blk0 != nullptr)
+                    __builtin_memcpy(&u0, blk0 + 2 + w * 4, 4);
+                if (blk1 != nullptr)
+                    __builtin_memcpy(&u1, blk1 + 2 + w * 4, 4);
+#pragma unroll
+                for (int c = 0; c < 4; ++c) {
+                    const int d = b * 32 + w * 4 + c;
+                    const float c0 = (float)(int8_t)(u0 >> (c * 8));
+                    const float c1 = (float)(int8_t)(u1 >> (c * 8));
+                    fa2_dw_t dw;
+                    dw.h[0] = (_Float16)(sf0 * c0);
+                    dw.h[1] = (_Float16)(sf1 * c1);
+                    Vdw[d * 32 + ((m + fa2_swiz(d & 15)) & 31)] = dw.u;
+                }
             }
         }
         __syncthreads();
@@ -254,40 +268,50 @@ __device__ __forceinline__ void fa2_gqa_body(
                     const int key = sub * 16 + ml;
                     const int rot = fa2_swiz(key & 15);
                     const int base = key * 128;
+                    const unsigned qb = qq_base + (unsigned)(kg * 8);
+                    // Unrolled by 4: each group's K/Q loads issue before
+                    // its WMMAs (software pipelining for LDS/L1 latency).
+                    // One scheduling barrier per group bounds the in-flight
+                    // fragments to 4 chunks (the 66 free VGPR are spent on
+                    // in-flight loads, not on hoisted-all-16 pileups).
 #pragma unroll
-                    for (int dc = 0; dc < 16; ++dc) {
-                        // Q B-fragment reloaded per chunk as two 16 B
-                        // float4 loads from L1-resident Q (16 B aligned:
-                        // qq_base is 4-B based and dc*16+kg*8 is a
-                        // multiple of 8 floats).
-                        half8_t qf;
-                        {
-                            const float* qb =
-                                q + qq_base + (unsigned)(dc * 16 + kg * 8);
-                            const float4_t lo = *(const float4_t*)qb;
-                            const float4_t hi = *(const float4_t*)(qb + 4);
-                            qf[0] = (_Float16)lo[0];
-                            qf[1] = (_Float16)lo[1];
-                            qf[2] = (_Float16)lo[2];
-                            qf[3] = (_Float16)lo[3];
-                            qf[4] = (_Float16)hi[0];
-                            qf[5] = (_Float16)hi[1];
-                            qf[6] = (_Float16)hi[2];
-                            qf[7] = (_Float16)hi[3];
-                        }
-                        half8_t kf;
+                    for (int dg = 0; dg < 4; ++dg) {
+                        half8_t kfa[4];
+                        half8_t qfa[4];
 #pragma unroll
-                        for (int i = 0; i < 4; ++i) {
-                            fa2_dw_t dw;
-                            dw.u = Kdw[base
-                                + ((dc * 8 + kg * 4 + i + rot) & 127)];
-                            kf[2 * i] = dw.h[0];
-                            kf[2 * i + 1] = dw.h[1];
+                        for (int u = 0; u < 4; ++u) {
+                            const int dc = dg * 4 + u;
+                            float4_t lo = {0.f, 0.f, 0.f, 0.f};
+                            float4_t hi = {0.f, 0.f, 0.f, 0.f};
+                            if (qok_ml) {
+                                const float* qd =
+                                    q + qb + (unsigned)(dc * 16);
+                                lo = *(const float4_t*)qd;
+                                hi = *(const float4_t*)(qd + 4);
+                            }
+                            qfa[u][0] = (_Float16)lo[0];
+                            qfa[u][1] = (_Float16)lo[1];
+                            qfa[u][2] = (_Float16)lo[2];
+                            qfa[u][3] = (_Float16)lo[3];
+                            qfa[u][4] = (_Float16)hi[0];
+                            qfa[u][5] = (_Float16)hi[1];
+                            qfa[u][6] = (_Float16)hi[2];
+                            qfa[u][7] = (_Float16)hi[3];
+                            half8_t kf;
+#pragma unroll
+                            for (int i = 0; i < 4; ++i) {
+                                fa2_dw_t dw;
+                                dw.u = Kdw[base
+                                    + ((dc * 8 + kg * 4 + i + rot) & 127)];
+                                kf[2 * i] = dw.h[0];
+                                kf[2 * i + 1] = dw.h[1];
+                            }
+                            kfa[u] = kf;
                         }
-                        sacc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(
-                            kf, qf, sacc);
-                        // Bound load hoisting to this chunk: without it
-                        // all 16 iterations' loads pile up in VGPRs.
+#pragma unroll
+                        for (int u = 0; u < 4; ++u)
+                            sacc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(
+                                kfa[u], qfa[u], sacc);
                         asm volatile("" ::: "memory");
                     }
                 }
