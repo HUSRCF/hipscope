@@ -4253,7 +4253,7 @@ pub(crate) fn batch_chunk_upload_positions(
 #[inline]
 fn mq_f16_projection_fast_route(gpu: &Gpu, fusion: DflashFusionCtx, n: usize, dim: usize) -> bool {
     matches!(fusion, DflashFusionCtx::ChainVerify)
-        && gpu.arch_caps.is_gfx1100()
+        && gpu.arch_caps.supports_dflash_f16_projection_fusions()
         && !gpu.flags.mq_f16_projection_off
         && n >= 1
         && n <= 16
