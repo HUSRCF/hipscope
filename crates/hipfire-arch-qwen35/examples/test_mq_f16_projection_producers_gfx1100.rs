@@ -353,7 +353,7 @@ fn main() {
                     {
                         fill_f32_quiet_nan(&mut gpu, o, s);
                     }
-                    gpu.gemm_qkvza_mq4g256v2_wmma(
+                    gpu.gemm_qkvza_hfq4g256_mq4v2(
                         &w_qkv,
                         &w_z,
                         &w_b,
@@ -431,7 +431,7 @@ fn main() {
                     for o in outs_old.iter().chain(outs_new.iter()) {
                         fill_f32_quiet_nan(&mut gpu, o, 0x7fc0_0021);
                     }
-                    gpu.gemm_qkv_mq4g256v2_wmma(
+                    gpu.gemm_qkv_hfq4g256_mq4v2(
                         &w_q,
                         &w_k,
                         &w_v,
@@ -502,7 +502,7 @@ fn main() {
                     for o in outs_old.iter().chain(outs_new.iter()) {
                         fill_f32_quiet_nan(&mut gpu, o, 0x7fc0_0031);
                     }
-                    gpu.gemm_gate_up_mq4g256v2_wmma(
+                    gpu.gemm_gate_up_hfq4g256_mq4v2(
                         &w_g,
                         &w_u,
                         &d_rot_f32,
