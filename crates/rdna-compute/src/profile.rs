@@ -400,6 +400,33 @@ pub fn attention_q8_0_kv_bytes(
     let out_bytes = n_heads * head_dim * 4;
     q_bytes + kv_bytes + out_bytes
 }
+/// Q8_0 flash-prefill attention: read Q, re-read K+V caches, write output.
+/// `batch` = query rows in this launch; `ctx` = max(positions)+1 (NOT the
+/// batch size — under chunked prefill each row re-reads its full causal
+/// prefix, so K/V traffic scales with absolute context).
+///
+/// Bytes estimate (bandwidth attribution only; the profile share % is
+/// time-based and exact regardless):
+/// - Q:   `batch * n_heads * head_dim * 4` (f32 Q in both the scalar and
+///   WMMA kernels).
+/// - K/V: `batch * ctx * n_kv_heads * (head_dim + 4)`. Per query row the
+///   kernel streams its causal K prefix and V prefix; the x2 for the two
+///   streams and the /2 for the causal-triangle average fold to x1. The `+4`
+///   folds in the Q8_0 scales (one scale per 32-elem block — same convention
+///   as `attention_q8_0_kv_bytes`).
+/// - out: `batch * n_heads * head_dim * 4` (f32).
+pub fn attention_q8_0_flash_prefill_bytes(
+    batch: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    ctx: usize,
+) -> usize {
+    let q_bytes = batch * n_heads * head_dim * 4;
+    let kv_bytes = batch * ctx * n_kv_heads * (head_dim + 4);
+    let out_bytes = batch * n_heads * head_dim * 4;
+    q_bytes + kv_bytes + out_bytes
+}
 
 /// RoPE (partial interleaved): read Q, read K, write both back.
 pub fn rope_bytes(n_heads: usize, n_kv_heads: usize, head_dim: usize) -> usize {

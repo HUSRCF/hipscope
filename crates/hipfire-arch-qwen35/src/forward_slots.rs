@@ -1463,7 +1463,8 @@ fn q8_attend_slots(
             let k_view = k_cache.sub_offset(k_base as usize, slab_bytes);
             let v_view = v_cache.sub_offset(k_base as usize, slab_bytes);
             return gpu.attention_q8_0_flash_prefill_wmma(
-                q, &k_view, &v_view, out, positions, n_heads, n_kv_heads, head_dim, batch_size,
+                q, &k_view, &v_view, out, positions, n_heads, n_kv_heads, head_dim, max_ctx_len,
+                batch_size,
             );
         }
     } else if let Some((tile_slot_dev, tile_row0_dev, tile_qbase_dev, n_tiles)) = multi_slot_tiles {
@@ -1489,6 +1490,7 @@ fn q8_attend_slots(
                 n_heads,
                 n_kv_heads,
                 head_dim,
+                max_ctx_len,
                 batch_size,
                 Some(descs_dev),
                 Some(&tile_slot_view),

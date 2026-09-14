@@ -404,6 +404,7 @@ impl Scratch {
                     H,
                     KVH,
                     HD,
+                    ctx,
                     B,
                 )
                 .expect("wmma_full");

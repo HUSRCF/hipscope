@@ -118,7 +118,7 @@ fn main() {
     match kernel.as_str() {
         "wmma" => gpu
             .attention_q8_0_flash_prefill_wmma(
-                &q_cand, &k_cache, &v_cache, &out_new, &positions, nh, nkv, hd, n,
+                &q_cand, &k_cache, &v_cache, &out_new, &positions, nh, nkv, hd, ctx, n,
             )
             .expect("wmma flash prefill kernel"),
         _ => gpu

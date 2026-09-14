@@ -2501,7 +2501,8 @@ fn verify_block_capture_impl(
             if wmma_full {
                 if window == 0 {
                     gpu.attention_q8_0_flash_prefill_wmma(
-                        &q, &k_cache_t, &v_cache_t, &attn_out, &pos_array, n_heads, n_kv, hd, b,
+                        &q, &k_cache_t, &v_cache_t, &attn_out, &pos_array, n_heads, n_kv, hd,
+                        seq_len, b,
                     )
                     .map_err(|e| format!("glimmer batch L{layer_idx} wmma full: {e:?}"))?;
                     wmma_done = true;
@@ -3432,7 +3433,8 @@ fn prefill_chunk_batched(
                 if wmma_full {
                     if window == 0 {
                         gpu.attention_q8_0_flash_prefill_wmma(
-                            &q, &k_cache_t, &v_cache_t, &attn_out, &pos_array, n_heads, n_kv, hd, b,
+                            &q, &k_cache_t, &v_cache_t, &attn_out, &pos_array, n_heads, n_kv, hd,
+                            seq_len, b,
                         )
                         .map_err(|e| format!("glimmer prefill L{layer_idx} wmma full: {e:?}"))?;
                         wmma_done = true;

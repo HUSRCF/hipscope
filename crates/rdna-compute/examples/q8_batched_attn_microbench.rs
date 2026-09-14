@@ -214,7 +214,7 @@ fn main() {
     // WMMA (matrix-core) variant of the query-tiled kernel. Fixed 16x16 tiles.
     let wmma_ms = time(&mut gpu, &|g: &mut Gpu| {
         g.attention_q8_0_flash_prefill_wmma(
-            &q, &k_cache, &v_cache, &out, &positions, nh, nkv, hd, n,
+            &q, &k_cache, &v_cache, &out, &positions, nh, nkv, hd, ctx, n,
         )
         .expect("wmma flash prefill");
     });

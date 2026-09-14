@@ -1893,6 +1893,7 @@ fn dispatch_attend(
                             io.n_heads,
                             io.n_kv_heads,
                             io.head_dim,
+                            io.max_ctx_len,
                             io.batch_size,
                         ));
                     }

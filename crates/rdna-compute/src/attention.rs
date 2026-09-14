@@ -3141,7 +3141,6 @@ impl Gpu {
         let mut hd = head_dim as i32;
         let mut bs = batch_size as i32;
         let mut sc = scale;
-        let _ = max_ctx_len; // cache stride derives from n_kv_heads/head_dim
         let mut desc_ptr: *mut std::ffi::c_void = match slot_descs {
             Some(t) => t.buf.as_ptr(),
             None => std::ptr::null_mut(),
@@ -3179,7 +3178,14 @@ impl Gpu {
         } else {
             batch_size.div_ceil(br) as u32
         };
-        self.launch_maybe_blob(
+        // Profile bytes: f32 Q + K/V re-read over the causal prefix (ctx =
+        // max_ctx_len; see `attention_q8_0_flash_prefill_bytes`) + f32 out.
+        let bytes = crate::profile::attention_q8_0_flash_prefill_bytes(
+            batch_size, n_heads, n_kv_heads, head_dim, max_ctx_len,
+        );
+        let timer =
+            crate::profile::begin_timer(&self.hip, "attention", "attention_q8_0_flash_prefill", bytes);
+        let result = self.launch_maybe_blob(
             "attention_q8_0_flash_prefill",
             [grid_x, n_heads as u32, 1],
             [NTHREADS as u32, 1, 1],
@@ -3203,7 +3209,11 @@ impl Gpu {
                 b.push_ptr(tile_qbase_ptr);
                 b
             },
-        )
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
     }
 
     /// WMMA (matrix-core) variant of `attention_q8_0_flash_prefill`.
@@ -3222,11 +3232,12 @@ impl Gpu {
         n_heads: usize,
         n_kv_heads: usize,
         head_dim: usize,
+        max_ctx_len: usize,
         batch_size: usize,
     ) -> HipResult<()> {
         self.attention_q8_0_flash_prefill_wmma_slots(
-            q, k_cache, v_cache, out, positions, n_heads, n_kv_heads, head_dim, batch_size, None,
-            None, None, None,
+            q, k_cache, v_cache, out, positions, n_heads, n_kv_heads, head_dim, max_ctx_len,
+            batch_size, None, None, None, None,
         )
     }
 
@@ -3240,10 +3251,14 @@ impl Gpu {
     /// fixed at `M_TILE = 16` rows (the WMMA fragment shape) rather than the
     /// scalar kernel's tunable `BR` — build the tile arrays with
     /// `kv_slots::build_tiles(slot_query_counts, 16)`.
-    ///
     /// `slot_descs` / `tile_slot` / `tile_row0` / `tile_qbase` MUST be all
     /// `Some` or all `None`. When all `None` this is byte-identical to
     /// [`attention_q8_0_flash_prefill_wmma`].
+    ///
+    /// `max_ctx_len` is max(positions)+1 across the batch. The kernel never
+    /// reads it (causal bounds come from `positions[]`); it exists only for
+    /// profile byte attribution (K/V re-read volume scales with context, not
+    /// batch — see `attention_q8_0_flash_prefill_bytes`).
     #[allow(clippy::too_many_arguments)]
     pub fn attention_q8_0_flash_prefill_wmma_slots(
         &mut self,
@@ -3255,6 +3270,7 @@ impl Gpu {
         n_heads: usize,
         n_kv_heads: usize,
         head_dim: usize,
+        max_ctx_len: usize,
         batch_size: usize,
         slot_descs: Option<&GpuTensor>,
         tile_slot: Option<&GpuTensor>,
@@ -3417,7 +3433,18 @@ impl Gpu {
         } else {
             batch_size.div_ceil(M_TILE) as u32
         };
-        self.launch_maybe_blob(
+        // Profile bytes: f32 Q + K/V re-read over the causal prefix (ctx =
+        // max_ctx_len; see `attention_q8_0_flash_prefill_bytes`) + f32 out.
+        let bytes = crate::profile::attention_q8_0_flash_prefill_bytes(
+            batch_size, n_heads, n_kv_heads, head_dim, max_ctx_len,
+        );
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "attention",
+            "attention_q8_0_flash_prefill_wmma",
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
             "attention_q8_0_flash_prefill_wmma",
             [grid_x, n_heads as u32, 1],
             [32, 1, 1],
@@ -3441,7 +3468,11 @@ impl Gpu {
                 b.push_ptr(tile_qbase_ptr);
                 b
             },
-        )
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
     }
 
     /// Muse Glimmer-owned sliding-window Q8 WMMA flash prefill (gfx11 + gfx12).
