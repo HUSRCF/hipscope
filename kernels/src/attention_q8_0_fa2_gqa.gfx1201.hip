@@ -43,6 +43,21 @@
 
 #include <hip/hip_runtime.h>
 
+// K-cache mode, selected at JIT time (kernels.rs concat define):
+//   0 = standard Q8 K (34 B blocks, f16 scale + 32 int8 codes).
+//   3 = fwht3 K (100 B/head: f32 cnorm + 96 B of 3-bit codes, K stored
+//       FWHT-rotated; V stays Q8_0). KMODE=3 additionally rotates this WG's
+//       Q rows in place (signed FWHT-256, fwht_shfl_forward_256 from
+//       turbo_common.h — prepended by the launcher, NOT #included here: the
+//       runtime compile has no -I to kernels/src) before the main body, and
+//       dequantizes fwht3 K into the K plane. Everything downstream of the K
+//       plane (layout, swizzle, QK/PV, softmax, epilogue) is untouched.
+// KMODE=0 preprocessing output is token-identical to the pre-KMODE source
+// (verify: disassembly diff of the existing symbols before/after).
+#ifndef HIPFIRE_FA2_KMODE
+#define HIPFIRE_FA2_KMODE 0
+#endif
+
 typedef _Float16 __attribute__((ext_vector_type(8))) half8_t;
 typedef float __attribute__((ext_vector_type(8))) float8_t;
 
@@ -159,6 +174,45 @@ __device__ __forceinline__ void fa2_gqa_body(
             break;
 
         // ---- Transition 2: cooperative KT64 fill (all four waves) ----
+#if HIPFIRE_FA2_KMODE == 3
+        // fwht3 K: per (position, kv head) record = [f32 cnorm][96 B codes]
+        // (k_bytes_per_head = 100, k_bytes_per_pos = 4*100 = 400, head offset
+        // kv_h*100 — the same contract as attention_flash_fwht3_tile_batched
+        // and kv_cache_write_asym_k_fwht3*). Lane l of 32 owns dims l*8..+8
+        // via 3 bytes at +4+l*3, code (packed >> 3*i) & 7, value cnorm *
+        // TURBO_C3_256[code]. 64 keys x 32 lanes = 2048 slots over 4 rounds;
+        // each slot dequantizes 8 dims = 4 dwords straight into the swizzled
+        // dword plane (pair p for key k at K[k][(p + S(k&15)) & 127] —
+        // identical layout downstream). V fill below is unchanged (Q8_0).
+        for (int t = 0; t < 4; ++t) {
+            const int slot = tid + t * 128;
+            const int k = slot >> 5;
+            const int l = slot & 31;
+            const int gk = ktile + k;
+            const unsigned char* rec = (gk < seq_len)
+                ? k_cache + (unsigned long long)gk * 400ULL
+                    + (unsigned long long)(kv_h * 100)
+                : nullptr;
+            float cnorm = 0.0f;
+            uint32_t packed = 0;
+            if (rec != nullptr) {
+                __builtin_memcpy(&cnorm, rec, 4);
+                __builtin_memcpy(&packed, rec + 4 + l * 3, 3);
+            }
+            const int rot = fa2_swiz(k & 15);
+            const int base = k * 128;
+            const int p0 = l * 4;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const int code0 = (packed >> (6 * i)) & 7;
+                const int code1 = (packed >> (6 * i + 3)) & 7;
+                fa2_dw_t dw;
+                dw.h[0] = (_Float16)(cnorm * TURBO_C3_256[code0]);
+                dw.h[1] = (_Float16)(cnorm * TURBO_C3_256[code1]);
+                Kdw[base + ((p0 + i + rot) & 127)] = dw.u;
+            }
+        }
+#else
         // K: 512 blocks (k*8+b), one block per slot. Codes are loaded on
         // demand per pair (no staging array) and dequantized straight
         // into the swizzled dword plane.
@@ -199,6 +253,7 @@ __device__ __forceinline__ void fa2_gqa_body(
                 Kdw[base + ((pb + w * 2 + 1 + rot) & 127)] = d1.u;
             }
         }
+#endif
         // V: 256 key-pairs (m*8+b); each slot reads the even and odd block
         // and packs (V[2m][d], V[2m+1][d]) per output dim. Codes are loaded
         // on demand per dim (no staging array).
@@ -465,6 +520,83 @@ extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_gfx1
     fa2_gqa_body<false>(q, k_cache, v_cache, out, positions, batch_size,
                         scale_attn, kv_h, q_base, 0, 0x3fffffff, 0, 1);
 }
+
+#if HIPFIRE_FA2_KMODE == 3
+// ---- KMODE=3 prologue: in-place signed-FWHT-256 of this WG's Q rows ----
+// K is stored FWHT-rotated, so Q must be rotated before QK (orthogonal
+// transform: dot products preserved; fwht_shfl_forward_256 is normalized
+// 1/sqrt(256) = 1/16 and scale_attn applies downstream exactly as in the
+// Q8 path — no scale change). One wave32 per row: lane `lane` owns dims
+// lane*8..+8, register-only + ds_swizzle, no LDS, one __syncthreads at the
+// end. This WG owns 8 positions x 6 heads = 48 rows; 4 waves cover 4 rows
+// per step x 12 steps. Rows/heads are disjoint across (blockIdx.x,
+// blockIdx.y), so the in-place update is race-free; tail rows
+// (q_base + r >= batch_size) are never read downstream and are skipped.
+// NOT replay-idempotent (a second launch would rotate twice): the launcher
+// rejects capture/replay and dispatch gates tree-verify off, so the
+// single-use prefill Q buffer is consumed exactly once.
+__device__ __forceinline__ void fa2_gqa_rotate_q_256(
+    float* __restrict__ q,
+    const float* __restrict__ signs1,
+    const float* __restrict__ signs2,
+    int kv_h,
+    int q_base,
+    int batch_size)
+{
+    const int tid = (int)threadIdx.x;
+    const int wave = tid >> 5;
+    const int lane = tid & 31;
+    for (int step = 0; step < 12; ++step) {
+        const int row = step * 4 + wave;
+        const int qr = q_base + row / 6;
+        // Uniform across the wave (depends only on wave/step): every lane
+        // of the wave takes the same branch, so the ds_swizzle group stays
+        // intact.
+        if (qr < batch_size) {
+            float* rp = q + (unsigned)qr * 6144u
+                + (unsigned)(6 * kv_h + (row % 6)) * 256u;
+            float v0 = rp[lane * 8 + 0], v1 = rp[lane * 8 + 1];
+            float v2 = rp[lane * 8 + 2], v3 = rp[lane * 8 + 3];
+            float v4 = rp[lane * 8 + 4], v5 = rp[lane * 8 + 5];
+            float v6 = rp[lane * 8 + 6], v7 = rp[lane * 8 + 7];
+            fwht_shfl_forward_256(v0, v1, v2, v3, v4, v5, v6, v7,
+                                  signs1, signs2, lane);
+            rp[lane * 8 + 0] = v0; rp[lane * 8 + 1] = v1;
+            rp[lane * 8 + 2] = v2; rp[lane * 8 + 3] = v3;
+            rp[lane * 8 + 4] = v4; rp[lane * 8 + 5] = v5;
+            rp[lane * 8 + 6] = v6; rp[lane * 8 + 7] = v7;
+        }
+    }
+    __syncthreads();
+}
+
+extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_fwht3k_gfx1201(
+    float* __restrict__ q,
+    const unsigned char* __restrict__ k_cache,
+    const unsigned char* __restrict__ v_cache,
+    float* __restrict__ out,
+    const int* __restrict__ positions,
+    const float* __restrict__ signs1,
+    const float* __restrict__ signs2,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int batch_size,
+    float scale_attn)
+{
+    if (n_heads != 24 || n_kv_heads != 4 || head_dim != 256)
+        return;
+    const int kv_h = blockIdx.y;
+    if (kv_h >= 4)
+        return;
+    const int q_base = blockIdx.x * 8;
+    if (q_base >= batch_size)
+        return;
+    fa2_gqa_rotate_q_256(q, signs1, signs2, kv_h, q_base, batch_size);
+    fa2_gqa_body<false>(q, k_cache, v_cache, out, positions, batch_size,
+                        scale_attn, kv_h, q_base, 0, 0x3fffffff, 0, 1);
+}
+#endif
 
 extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_partial_gfx1201(
     const float* __restrict__ q,
