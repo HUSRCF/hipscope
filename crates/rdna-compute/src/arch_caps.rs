@@ -417,6 +417,10 @@ impl ArchCaps {
     pub fn supports_dflash_f16_residual_fusions(&self) -> bool {
         self.is_gfx1100 || self.is_gfx1201
     }
+    /// DFlash GDN pre/tape fusion admission.
+    pub fn supports_dflash_gdn_pre_fusions(&self) -> bool {
+        self.is_gfx1100 || self.is_gfx1201
+    }
     pub fn is_rdna4(&self) -> bool {
         self.is_rdna4
     }
@@ -639,6 +643,18 @@ mod tests {
                 !make_caps(arch).supports_dflash_f16_residual_fusions(),
                 "{arch}"
             );
+        }
+    }
+
+    #[test]
+    fn dflash_gdn_pre_fusions_cover_validated_fleet_only() {
+        for arch in ["gfx1100", "gfx1201"] {
+            assert!(make_caps(arch).supports_dflash_gdn_pre_fusions(), "{arch}");
+        }
+        for arch in [
+            "gfx1030", "gfx1101", "gfx1150", "gfx1151", "gfx1200", "gfx942",
+        ] {
+            assert!(!make_caps(arch).supports_dflash_gdn_pre_fusions(), "{arch}");
         }
     }
 
