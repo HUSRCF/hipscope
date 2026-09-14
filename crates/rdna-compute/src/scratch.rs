@@ -822,7 +822,8 @@ impl ScratchState {
     /// caching (see `invalidate_x_caches_for`): a stable source pointer with
     /// changed contents would otherwise return stale prepared extents.
     ///
-    /// Geometry: grid `[N,1,1]`, block `[64,1,1]`. Preconditions `n>0`,
+    /// Geometry: grid `[N,1,1]`, block `[256,1,1]` (eight wave32s per row).
+    /// Preconditions `n>0`,
     /// `k>0`, `k % 256 == 0` are caller-owned; sizes are
     /// X8=`n*k` bytes, half_sums=`n*(k/256)*2` f32, row_scales=`n` f32.
     pub(crate) fn prepare_mq4v2_fp8_x(
@@ -957,7 +958,25 @@ impl ScratchState {
             &mut n_val as *mut _ as *mut c_void,
             &mut scale_mode_m as *mut _ as *mut c_void,
         ];
-        launch_maybe_blob(
+        // Profile bytes: input row read (F16×2 B or F32×4 B per elem) + FP8
+        // bytes, half-sums and row-scales writes. Bandwidth attribution only;
+        // the timer is what makes this launch visible in HIPFIRE_PROFILE.
+        let bytes = x_fp8_bytes
+            + half_sums_bytes
+            + row_scales_bytes
+            + n * k
+                * if symbol == "pack_f32_to_fp8_mq4v2_gfx12" {
+                    4
+                } else {
+                    2
+                };
+        let timer_name: &'static str = if symbol == "pack_f32_to_fp8_mq4v2_gfx12" {
+            "pack_f32_to_fp8_mq4v2_gfx12"
+        } else {
+            "pack_f16_to_fp8_mq4v2_gfx12"
+        };
+        let timer = crate::profile::begin_timer(hip, "gemm", timer_name, bytes);
+        let result = launch_maybe_blob(
             hip,
             Some(&*compiler),
             functions,
@@ -968,7 +987,7 @@ impl ScratchState {
             Some(replay),
             symbol,
             [n as u32, 1, 1],
-            [64, 1, 1],
+            [256, 1, 1],
             0,
             &mut params,
             || {
@@ -982,7 +1001,11 @@ impl ScratchState {
                 b.push_i32(scale_mode);
                 b
             },
-        )?;
+        );
+        if let Some(t) = timer {
+            t.finish(hip);
+        }
+        result?;
 
         Ok(Mq4v2Fp8Prepared {
             x_fp8: out_x,

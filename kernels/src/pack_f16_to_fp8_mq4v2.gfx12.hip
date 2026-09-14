@@ -11,22 +11,27 @@
 // decoded row sums for the zero-point correction identity, and an optional
 // per-row power-of-two scale a_n (unit scale when scale_mode==0).
 //
-// Geometry (frozen design §3.1):
+// Geometry (rev 2: 8 waves/row for occupancy — same outputs bit-for-bit):
 //   grid  [N, 1, 1]
-//   block [64, 1, 1]  — two wave32s own one activation row
-//   LDS   8 B         — two wave maxima (reused to publish a_n)
+//   block [256, 1, 1] — eight wave32s own one activation row
+//   LDS   32 B        — eight wave maxima (reused to publish a_n)
 // Preconditions (host-enforced): N>0, K>0, K % 256 == 0.
 //
 // scale_mode:
 //   0 — a_n = 1 for every row (measurement / unit-scale arm)
 //   1 — a_n = 2^{clamp(ceil(log2(absmax/224)), -31, 9)}; zero row → 1
 //
-// Half layout inside each 256-K group g:
-//   half 0 (wave 0): K[g*256 + 0   .. g*256 + 128)
-//   half 1 (wave 1): K[g*256 + 128 .. g*256 + 256)
+// Half layout: half h covers group g = h/2, side h%2 —
+//   K[g*256 + side*128 .. g*256 + side*128 + 128).
 // Each lane owns four consecutive F16 values and emits one FP8 dword via
 // __builtin_amdgcn_cvt_pk_fp8_f32. Half sums are reduced from the DECODED
 // emitted bytes (not the pre-round F16 values).
+//
+// Why this is output-identical to the block-64 form: phase 1 is an fmax
+// reduction (order-independent over finite inputs); phase 2 keeps the same
+// (half, lane) -> four-consecutive-K ownership (half h = group h/2, side
+// h%2, lane L at half_base + 4*L), so the packed bytes, the per-lane
+// decoded-value sums and the wave-shuffle reduction tree are unchanged.
 
 __device__ __forceinline__ int mq4v2_fast_log2_ceil(float x) {
     unsigned b = __builtin_bit_cast(unsigned, x);
@@ -81,7 +86,7 @@ __device__ __forceinline__ float mq4v2_row_scale_from_absmax(float amax) {
     return mq4v2_fast_pow2(exp);
 }
 
-extern "C" __launch_bounds__(64, 1) __global__
+extern "C" __launch_bounds__(256, 1) __global__
 void pack_f16_to_fp8_mq4v2_gfx12(
     const _Float16* x_f16,       // [N,K]
     unsigned char* x_fp8,        // [N,K], E4M3 bytes
@@ -91,15 +96,15 @@ void pack_f16_to_fp8_mq4v2_gfx12(
     int N,
     int scale_mode)             // 0=unit, 1=pow2-to-224
 {
-    // 8 B static LDS: two wave maxima, then republished a_n in slot 0.
-    __shared__ float smem[2];
+    // 32 B static LDS: eight wave maxima, then republished a_n in slot 0.
+    __shared__ float smem[8];
 
     const int n = (int)blockIdx.x;
     if (n >= N || K <= 0) return;
 
     const int tid = (int)threadIdx.x;
     const int lane = tid & 31;
-    const int wave = tid >> 5; // 0 or 1
+    const int wave = tid >> 5; // 0..7
     const int gpr = K >> 8;    // K / 256
 
     const _Float16* x_row = x_f16 + (long long)n * K;
@@ -108,9 +113,9 @@ void pack_f16_to_fp8_mq4v2_gfx12(
     float a_n = 1.0f;
 
     if (scale_mode == 1) {
-        // 1) Strided F16 absmax over the full row (64-thread stride).
+        // 1) Strided F16 absmax over the full row (256-thread stride).
         float local_max = 0.0f;
-        for (int k = tid; k < K; k += 64) {
+        for (int k = tid; k < K; k += 256) {
             const float v = (float)x_row[k];
             local_max = fmaxf(local_max, fabsf(v));
         }
@@ -121,7 +126,10 @@ void pack_f16_to_fp8_mq4v2_gfx12(
         __syncthreads();
         // Wave 0 resolves a_n and publishes it; all threads re-read.
         if (wave == 0 && lane == 0) {
-            const float amax = fmaxf(smem[0], smem[1]);
+            float amax = smem[0];
+            #pragma unroll
+            for (int w = 1; w < 8; ++w)
+                amax = fmaxf(amax, smem[w]);
             a_n = mq4v2_row_scale_from_absmax(amax);
             smem[0] = a_n;
             row_scales[n] = a_n;
@@ -137,11 +145,15 @@ void pack_f16_to_fp8_mq4v2_gfx12(
 
     const float inv_a = 1.0f / a_n;
 
-    // 3) Pack each 256-K group: wave h owns half h of 128 K.
-    //    Lane L owns four consecutive F16 at half_base + 4*L.
-    for (int g = 0; g < gpr; g++) {
-        const int half_base = g * 256 + wave * 128;
-        const int k0 = half_base + lane * 4;
+    // 3) Pack each 128-K half: wave-strided over the K/128 halves
+    //    (h = wave, wave+8, ...; g = h/2, side = h%2). Lane L owns four
+    //    consecutive values at half_base + 4*L — the same ownership as the
+    //    block-64 form, so bytes and half sums match bit-for-bit.
+    const int halves = K >> 7; // K / 128
+    for (int h = wave; h < halves; h += 8) {
+        const int g = h >> 1;
+        const int half = h & 1;
+        const int k0 = g * 256 + half * 128 + lane * 4;
 
         const float v0 = (float)x_row[k0 + 0] * inv_a;
         const float v1 = (float)x_row[k0 + 1] * inv_a;
@@ -161,8 +173,8 @@ void pack_f16_to_fp8_mq4v2_gfx12(
         float half_sum = mq4v2_wave_sum(s0 + s1 + s2 + s3);
 
         if (lane == 0) {
-            // half_sums[(n * gpr + g) * 2 + h], h == wave
-            half_sums[((long long)n * gpr + g) * 2 + wave] = half_sum;
+            // half_sums[(n * gpr + g) * 2 + half]
+            half_sums[((long long)n * gpr + g) * 2 + half] = half_sum;
         }
     }
 }
@@ -177,7 +189,7 @@ void pack_f16_to_fp8_mq4v2_gfx12(
 // variant rounds F32->E4M3 once, directly. Outputs are therefore identical
 // except possibly in the last E4M3 ulp for values near a rounding boundary.
 // That is expected and accepted; quality is covered by the WT2 KLD gate.
-extern "C" __launch_bounds__(64, 1) __global__
+extern "C" __launch_bounds__(256, 1) __global__
 void pack_f32_to_fp8_mq4v2_gfx12(
     const float* x_f32,          // [N,K]
     unsigned char* x_fp8,        // [N,K], E4M3 bytes
@@ -187,15 +199,15 @@ void pack_f32_to_fp8_mq4v2_gfx12(
     int N,
     int scale_mode)             // 0=unit, 1=pow2-to-224
 {
-    // 8 B static LDS: two wave maxima, then republished a_n in slot 0.
-    __shared__ float smem[2];
+    // 32 B static LDS: eight wave maxima, then republished a_n in slot 0.
+    __shared__ float smem[8];
 
     const int n = (int)blockIdx.x;
     if (n >= N || K <= 0) return;
 
     const int tid = (int)threadIdx.x;
     const int lane = tid & 31;
-    const int wave = tid >> 5; // 0 or 1
+    const int wave = tid >> 5; // 0..7
     const int gpr = K >> 8;    // K / 256
 
     const float* x_row = x_f32 + (long long)n * K;
@@ -204,9 +216,9 @@ void pack_f32_to_fp8_mq4v2_gfx12(
     float a_n = 1.0f;
 
     if (scale_mode == 1) {
-        // 1) Strided F32 absmax over the full row (64-thread stride).
+        // 1) Strided F32 absmax over the full row (256-thread stride).
         float local_max = 0.0f;
-        for (int k = tid; k < K; k += 64) {
+        for (int k = tid; k < K; k += 256) {
             const float v = x_row[k];
             local_max = fmaxf(local_max, fabsf(v));
         }
@@ -217,7 +229,10 @@ void pack_f32_to_fp8_mq4v2_gfx12(
         __syncthreads();
         // Wave 0 resolves a_n and publishes it; all threads re-read.
         if (wave == 0 && lane == 0) {
-            const float amax = fmaxf(smem[0], smem[1]);
+            float amax = smem[0];
+            #pragma unroll
+            for (int w = 1; w < 8; ++w)
+                amax = fmaxf(amax, smem[w]);
             a_n = mq4v2_row_scale_from_absmax(amax);
             smem[0] = a_n;
             row_scales[n] = a_n;
@@ -233,11 +248,15 @@ void pack_f32_to_fp8_mq4v2_gfx12(
 
     const float inv_a = 1.0f / a_n;
 
-    // 3) Pack each 256-K group: wave h owns half h of 128 K.
-    //    Lane L owns four consecutive F32 at half_base + 4*L.
-    for (int g = 0; g < gpr; g++) {
-        const int half_base = g * 256 + wave * 128;
-        const int k0 = half_base + lane * 4;
+    // 3) Pack each 128-K half: wave-strided over the K/128 halves
+    //    (h = wave, wave+8, ...; g = h/2, side = h%2). Lane L owns four
+    //    consecutive values at half_base + 4*L — the same ownership as the
+    //    block-64 form, so bytes and half sums match bit-for-bit.
+    const int halves = K >> 7; // K / 128
+    for (int h = wave; h < halves; h += 8) {
+        const int g = h >> 1;
+        const int half = h & 1;
+        const int k0 = g * 256 + half * 128 + lane * 4;
 
         const float v0 = x_row[k0 + 0] * inv_a;
         const float v1 = x_row[k0 + 1] * inv_a;
@@ -257,8 +276,8 @@ void pack_f32_to_fp8_mq4v2_gfx12(
         float half_sum = mq4v2_wave_sum(s0 + s1 + s2 + s3);
 
         if (lane == 0) {
-            // half_sums[(n * gpr + g) * 2 + h], h == wave
-            half_sums[((long long)n * gpr + g) * 2 + wave] = half_sum;
+            // half_sums[(n * gpr + g) * 2 + half]
+            half_sums[((long long)n * gpr + g) * 2 + half] = half_sum;
         }
     }
 }
