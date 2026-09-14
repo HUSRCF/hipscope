@@ -17,6 +17,22 @@ use std::ffi::c_void;
 
 // ── ScratchState ─────────────────────────────────────────────────────────
 
+/// Device pointers and extents produced by `ScratchState::prepare_mq4v2_fp8_x`.
+/// Pointer views belong to the originating `Gpu` and remain valid only until
+/// its next `prepare_mq4v2_fp8_x` call or teardown.
+pub struct Mq4v2Fp8Prepared {
+    pub x_fp8: *mut c_void,
+    pub half_sums: *mut c_void,
+    pub row_scales: *mut c_void,
+    pub x_fp8_bytes: usize,
+    pub half_sums_bytes: usize,
+    pub row_scales_bytes: usize,
+    pub n: usize,
+    pub k: usize,
+    pub scale_mode: i32,
+}
+
+
 pub struct ScratchState {
     pub mq_signs1: Option<GpuTensor>,
     pub mq_signs2: Option<GpuTensor>,
@@ -50,6 +66,16 @@ pub struct ScratchState {
     pub fp8_x_source_ptr: *mut c_void,
     pub q8_1_mmq_x_scratch: Option<DeviceBuffer>,
     pub q8_1_mmq_x_scratch_bytes: usize,
+    /// Dedicated MQ4v2 FP8 pre-pass X buffer (E4M3 bytes, [N,K]). Not shared
+    /// with `fp8_x_scratch` and never pointer-cached — always overwritten.
+    pub mq4v2_fp8_x_scratch: Option<DeviceBuffer>,
+    pub mq4v2_fp8_x_scratch_bytes: usize,
+    /// Half-row sums [N, K/256, 2] f32 for the MQ4v2 FP8 zero-point correction.
+    pub mq4v2_fp8_half_sums_scratch: Option<DeviceBuffer>,
+    pub mq4v2_fp8_half_sums_scratch_bytes: usize,
+    /// Per-row power-of-two (or unit) scales [N] f32 for MQ4v2 FP8 activations.
+    pub mq4v2_fp8_row_scales_scratch: Option<DeviceBuffer>,
+    pub mq4v2_fp8_row_scales_scratch_bytes: usize,
     /// Partials buffer for the deterministic K-split GEMM (ksplit_det):
     /// [K_SPLITS][batch_size][M] fp32, grows-never-shrinks.
     pub ksplit_det_partials: Option<DeviceBuffer>,
@@ -790,6 +816,131 @@ impl ScratchState {
 
         Ok(self.fp8_x_scratch.as_ref().unwrap().as_ptr())
     }
+
+    /// Grow dedicated MQ4v2 FP8 pre-pass buffers and always pack F16 X into
+    /// E4M3 with half-row sums and row scales. Deliberately omits pointer
+    /// caching (see `invalidate_x_caches_for`): a stable source pointer with
+    /// changed contents would otherwise return stale prepared extents.
+    ///
+    /// Geometry: grid `[N,1,1]`, block `[64,1,1]`. Preconditions `n>0`,
+    /// `k>0`, `k % 256 == 0` are caller-owned; sizes are
+    /// X8=`n*k` bytes, half_sums=`n*(k/256)*2` f32, row_scales=`n` f32.
+    pub(crate) fn prepare_mq4v2_fp8_x(
+        &mut self,
+        hip: &HipRuntime,
+        compiler: &mut crate::compiler::KernelCompiler,
+        modules: &mut HashMap<String, Module>,
+        functions: &mut HashMap<String, Function>,
+        stream: Option<&Stream>,
+        capture_blobs: &mut Vec<Vec<u8>>,
+        capture_mode: bool,
+        force_blob_path: bool,
+        replay: &mut crate::replay::ReplayController,
+        x_f16: *mut c_void,
+        n: usize,
+        k: usize,
+        scale_mode: i32,
+    ) -> HipResult<Mq4v2Fp8Prepared> {
+        compile_and_load_kernel(
+            compiler,
+            hip,
+            modules,
+            functions,
+            "pack_f16_to_fp8_mq4v2_gfx12",
+            kernels::PACK_F16_TO_FP8_MQ4V2_GFX12_SRC,
+            "pack_f16_to_fp8_mq4v2_gfx12",
+        )?;
+
+        let x_fp8_bytes = n.checked_mul(k).expect("mq4v2 fp8 x extent overflow");
+        let groups = k / 256;
+        let half_sums_bytes = n
+            .checked_mul(groups)
+            .and_then(|v| v.checked_mul(2))
+            .and_then(|v| v.checked_mul(std::mem::size_of::<f32>()))
+            .expect("mq4v2 fp8 half_sums extent overflow");
+        let row_scales_bytes = n
+            .checked_mul(std::mem::size_of::<f32>())
+            .expect("mq4v2 fp8 row_scales extent overflow");
+
+        grow_scratch_buffer(
+            hip,
+            &mut self.mq4v2_fp8_x_scratch,
+            &mut self.mq4v2_fp8_x_scratch_bytes,
+            x_fp8_bytes,
+        )?;
+        grow_scratch_buffer(
+            hip,
+            &mut self.mq4v2_fp8_half_sums_scratch,
+            &mut self.mq4v2_fp8_half_sums_scratch_bytes,
+            half_sums_bytes,
+        )?;
+        grow_scratch_buffer(
+            hip,
+            &mut self.mq4v2_fp8_row_scales_scratch,
+            &mut self.mq4v2_fp8_row_scales_scratch_bytes,
+            row_scales_bytes,
+        )?;
+
+        // Always overwrite valid extents — no source_ptr cache.
+        let out_x = self.mq4v2_fp8_x_scratch.as_ref().unwrap().as_ptr();
+        let out_sums = self.mq4v2_fp8_half_sums_scratch.as_ref().unwrap().as_ptr();
+        let out_scales = self.mq4v2_fp8_row_scales_scratch.as_ref().unwrap().as_ptr();
+        let mut in_ptr_m = x_f16;
+        let mut out_x_m = out_x;
+        let mut out_sums_m = out_sums;
+        let mut out_scales_m = out_scales;
+        let mut k_val = k as i32;
+        let mut n_val = n as i32;
+        let mut scale_mode_m = scale_mode;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut in_ptr_m as *mut _ as *mut c_void,
+            &mut out_x_m as *mut _ as *mut c_void,
+            &mut out_sums_m as *mut _ as *mut c_void,
+            &mut out_scales_m as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+            &mut scale_mode_m as *mut _ as *mut c_void,
+        ];
+        launch_maybe_blob(
+            hip,
+            Some(&*compiler),
+            functions,
+            stream,
+            capture_blobs,
+            capture_mode,
+            force_blob_path,
+            Some(replay),
+            "pack_f16_to_fp8_mq4v2_gfx12",
+            [n as u32, 1, 1],
+            [64, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = KernargBlob::new();
+                b.push_ptr(x_f16);
+                b.push_ptr(out_x);
+                b.push_ptr(out_sums);
+                b.push_ptr(out_scales);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b.push_i32(scale_mode);
+                b
+            },
+        )?;
+
+        Ok(Mq4v2Fp8Prepared {
+            x_fp8: out_x,
+            half_sums: out_sums,
+            row_scales: out_scales,
+            x_fp8_bytes,
+            half_sums_bytes,
+            row_scales_bytes,
+            n,
+            k,
+            scale_mode,
+        })
+    }
+
 
     /// Ensure prefill activations are quantized into a llama.cpp-style
     /// `block_q8_1_mmq` layout. The scratch is ordered by [K/128 block, batch]

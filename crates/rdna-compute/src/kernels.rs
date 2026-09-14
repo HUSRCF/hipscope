@@ -3505,6 +3505,40 @@ pub const GEMM_GATE_UP_HFQ4G256_WMMA_GFX12_BT_SRC: &str =
     include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_wmma_gfx12_bt.hip");
 pub const GEMM_GATE_UP_MQ4G256V2_WMMA_GFX12_BT_SRC: &str =
     include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma_gfx12_bt.hip");
+pub const GEMM_GATE_UP_MQ4G256V2_WMMA_FP8_GFX12_BT_SRC: &str =
+    include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip");
+pub const GEMM_GATE_UP_MQ4G256V2_WMMA_FP8_GFX12_BT8_SRC: &str = concat!(
+    "#define HIPFIRE_FP8_BV 8\n#define HIPFIRE_FP8_GATEUP_KERNEL gemm_gate_up_mq4g256v2_wmma_fp8_gfx12_bt8\n",
+    include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip")
+);
+pub const GEMM_GATE_UP_MQ4G256V2_WMMA_FP8_GFX12_BT4_SRC: &str = concat!(
+    "#define HIPFIRE_FP8_BV 4\n#define HIPFIRE_FP8_GATEUP_KERNEL gemm_gate_up_mq4g256v2_wmma_fp8_gfx12_bt4\n",
+    include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip")
+);
+pub const GEMM_MQ4G256V2_RESIDUAL_WMMA_FP8_GFX12_BT12_SRC: &str = concat!(
+    "#define HIPFIRE_FP8_RESIDUAL 1\n#define HIPFIRE_FP8_BV 12\n#define HIPFIRE_FP8_GATEUP_KERNEL gemm_mq4g256v2_residual_wmma_fp8_gfx12_bt12\n",
+    include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip")
+);
+pub const GEMM_MQ4G256V2_RESIDUAL_WMMA_FP8_GFX12_BT8_SRC: &str = concat!(
+    "#define HIPFIRE_FP8_RESIDUAL 1\n#define HIPFIRE_FP8_BV 8\n#define HIPFIRE_FP8_GATEUP_KERNEL gemm_mq4g256v2_residual_wmma_fp8_gfx12_bt8\n",
+    include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip")
+);
+pub const GEMM_MQ4G256V2_RESIDUAL_WMMA_FP8_GFX12_BT4_SRC: &str = concat!(
+    "#define HIPFIRE_FP8_RESIDUAL 1\n#define HIPFIRE_FP8_BV 4\n#define HIPFIRE_FP8_GATEUP_KERNEL gemm_mq4g256v2_residual_wmma_fp8_gfx12_bt4\n",
+    include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip")
+);
+pub const GEMM_QKVZA_MQ4G256V2_WMMA_FP8_GFX12_BT12_SRC: &str = concat!(
+    "#define HIPFIRE_FP8_QKVZA 1\n#define HIPFIRE_FP8_BV 12\n#define HIPFIRE_FP8_GATEUP_KERNEL gemm_qkvza_mq4g256v2_wmma_fp8_gfx12_bt12\n",
+    include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip")
+);
+pub const GEMM_QKVZA_MQ4G256V2_WMMA_FP8_GFX12_BT8_SRC: &str = concat!(
+    "#define HIPFIRE_FP8_QKVZA 1\n#define HIPFIRE_FP8_BV 8\n#define HIPFIRE_FP8_GATEUP_KERNEL gemm_qkvza_mq4g256v2_wmma_fp8_gfx12_bt8\n",
+    include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip")
+);
+pub const GEMM_QKVZA_MQ4G256V2_WMMA_FP8_GFX12_BT4_SRC: &str = concat!(
+    "#define HIPFIRE_FP8_QKVZA 1\n#define HIPFIRE_FP8_BV 4\n#define HIPFIRE_FP8_GATEUP_KERNEL gemm_qkvza_mq4g256v2_wmma_fp8_gfx12_bt4\n",
+    include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip")
+);
 pub const GEMM_GATE_UP_MQ5G256V2_WMMA_GFX12_BT_SRC: &str =
     include_str!("../../../kernels/src/gemm_gate_up_mq5g256v2_wmma_gfx12_bt.hip");
 pub const GEMM_GATE_UP_MQ6G256V2_WMMA_GFX12_BT_SRC: &str =
@@ -3684,6 +3718,8 @@ pub const GEMM_QKV_HFP4G32_WMMA_FP8_GFX12_SRC: &str =
 // parity by moving the cvt out of the WMMA inner loop.
 pub const PACK_F32_TO_FP8_GFX12_SRC: &str =
     include_str!("../../../kernels/src/pack_f32_to_fp8.gfx12.hip");
+pub const PACK_F16_TO_FP8_MQ4V2_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/pack_f16_to_fp8_mq4v2.gfx12.hip");
 // Fused MagnumQuant FWHT rotation + FP8 (E4M3) pack — gfx12 only.
 // Writes both F32 (for legacy consumers) and FP8 outputs in one launch.
 // Replaces the standalone mq_rotate_x + pack_f32_to_fp8 sequence on the

@@ -197,6 +197,13 @@ pub struct FeatureFlags {
     /// exact-gfx1100-only. Capture/replay keep the historical base. Set
     /// `HIPFIRE_GATEUP_LDSSTAGE=0` to restore the historical base symbol/block32.
     pub gate_up_ldsstage: bool,
+    /// `HIPFIRE_GFX12_MQ4V2_FP8_GATEUP=1` admits the gfx1201 FP8-WMMA MQ4v2
+    /// gate_up prefill candidate (N=384, eager HIP only). Default OFF.
+    pub gfx12_mq4v2_fp8_gateup: bool,
+    /// FP8-WMMA MQ4v2 residual (down/out-proj) prefill candidate. Default OFF.
+    pub gfx12_mq4v2_fp8_resid: bool,
+    /// FP8-WMMA MQ4v2 4-way QKVZA prefill candidate. Default OFF.
+    pub gfx12_mq4v2_fp8_qkvza: bool,
     pub gemm_dump: bool,
     pub deterministic: bool,
     pub mw16: bool,
@@ -548,6 +555,9 @@ impl FeatureFlags {
             residual_ksplit_off: value("HIPFIRE_RESIDUAL_KSPLIT_OFF").ok().as_deref() == Some("1"),
             residual_ldsstage: parse_bool("HIPFIRE_RESIDUAL_LDSSTAGE").unwrap_or(arch == "gfx1100"),
             gate_up_ldsstage: parse_bool("HIPFIRE_GATEUP_LDSSTAGE").unwrap_or(arch == "gfx1100"),
+            gfx12_mq4v2_fp8_gateup: value("HIPFIRE_GFX12_MQ4V2_FP8_GATEUP").as_deref() == Ok("1"),
+            gfx12_mq4v2_fp8_resid: value("HIPFIRE_GFX12_MQ4V2_FP8_RESID").as_deref() == Ok("1"),
+            gfx12_mq4v2_fp8_qkvza: value("HIPFIRE_GFX12_MQ4V2_FP8_QKVZA").as_deref() == Ok("1"),
             gemm_dump: value("HIPFIRE_GEMM_DUMP").ok().as_deref() == Some("1"),
             deterministic: value("HIPFIRE_DETERMINISTIC").ok().as_deref() == Some("1"),
             mw16: value("HIPFIRE_MW16").map_or(false, |v| v == "1"),
@@ -810,6 +820,9 @@ impl FeatureFlags {
             residual_ksplit_off: false,
             residual_ldsstage: false,
             gate_up_ldsstage: false,
+            gfx12_mq4v2_fp8_gateup: false,
+            gfx12_mq4v2_fp8_resid: false,
+            gfx12_mq4v2_fp8_qkvza: false,
             gemm_dump: false,
             deterministic: false,
             mw16: false,

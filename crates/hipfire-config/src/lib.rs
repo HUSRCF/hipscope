@@ -2085,6 +2085,15 @@ pub static FIELDS: &[ConfigField] = &[
         "Enable the experimental FP8 WMMA route."
     ),
     process_bool_field!(
+        "kernel.gfx12_mq4v2_fp8_gateup",
+        "gfx12_mq4v2_fp8_gateup",
+        Kernel,
+        false,
+        true,
+        "HIPFIRE_GFX12_MQ4V2_FP8_GATEUP",
+        "Enable the experimental gfx1201 MQ4v2 FP8 WMMA gate/up prefill route."
+    ),
+    process_bool_field!(
         "kernel.dot2_gemv",
         "dot2_gemv",
         Kernel,
