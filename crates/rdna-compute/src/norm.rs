@@ -380,6 +380,70 @@ impl Gpu {
         result
     }
 
+    /// Symmetric direct-peer-read residual add: `x[i] = x[i] + (p_local[i] + p_peer[i])`.
+    ///
+    /// `p_local` is a same-device buffer; `peer_ptr` is a raw device pointer to
+    /// the peer rank's partial, dereferenceable via P2P mapping (the caller
+    /// must have waited on the peer's producer event). The caller passes the
+    /// lower rank's partial as `p_local` so both ranks evaluate `p0 + p1` in
+    /// rank order — bit-identical to the rooted fold. `count` is an element
+    /// count, not bytes.
+    pub fn add_peer_residual_f32(
+        &mut self,
+        x: &GpuTensor,
+        p_local: &GpuTensor,
+        peer_ptr: *const c_void,
+        count: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "add_peer_residual",
+            kernels::ADD_PEER_RESIDUAL_SRC,
+            "add_peer_residual_f32",
+        )?;
+
+        let x_ptr = x.buf.as_ptr();
+        let local_ptr = p_local.buf.as_ptr();
+        let count_val = count as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &x_ptr as *const _ as *mut c_void,
+            &local_ptr as *const _ as *mut c_void,
+            &peer_ptr as *const _ as *mut c_void,
+            &count_val as *const _ as *mut c_void,
+        ];
+
+        // The kernel vectorizes over count/4 float4s; the grid covers the
+        // vector part and the grid-stride tail covers count%4 (and all of
+        // count when count < 4, hence at least one block).
+        let vec = count / 4;
+        let block = 256u32;
+        let grid = (((vec as u32) + block - 1) / block).max(1);
+        // 3 reads (x, p_local, p_peer) + 1 write per element.
+        let bytes = count * 4 * 4;
+        let timer =
+            crate::profile::begin_timer(&self.hip, "elementwise", "add_peer_residual_f32", bytes);
+        let result = self.launch_maybe_blob(
+            "add_peer_residual_f32",
+            [grid, 1, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut bb = hip_bridge::KernargBlob::new();
+                bb.push_ptr(x_ptr);
+                bb.push_ptr(local_ptr);
+                bb.push_ptr(peer_ptr);
+                bb.push_i32(count_val);
+                bb
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     pub fn zero_f32(&mut self, x: &GpuTensor) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel("zero_f32", kernels::ZERO_F32_SRC, "zero_f32")?;

@@ -5030,6 +5030,12 @@ pub const ADD_SRC: &str = include_str!("../../../kernels/src/add.hip");
 /// Element-wise in-place add: a[i] += b[i]
 pub const ADD_INPLACE_SRC: &str = include_str!("../../../kernels/src/add_inplace.hip");
 
+/// Symmetric direct-peer-read allreduce residual add:
+/// `x[i] = x[i] + (p_first[i] + p_second[i])`, one partial P2P-mapped.
+/// See `kernels/src/add_peer_residual_f32.hip` for the rank-order contract.
+pub const ADD_PEER_RESIDUAL_SRC: &str =
+    include_str!("../../../kernels/src/add_peer_residual_f32.hip");
+
 /// Scaled in-place add: y[i] += c * x[i] — one kernel for both
 /// CPU-scalar (c via kernarg) and GPU-scalar (c via device buffer)
 /// variants. Used in the MoE FFN accumulator to fuse the old

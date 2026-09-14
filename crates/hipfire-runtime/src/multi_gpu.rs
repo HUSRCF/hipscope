@@ -20,6 +20,8 @@
 //! 2. Run debug builds to catch silent mis-binds via the bind_thread invariant.
 //! 3. Pass the multi-GPU coherence gate.
 
+use std::ffi::c_void;
+
 use crate::device_mesh::{DeviceMesh, DimKind};
 use hip_bridge::{
     DeviceBuffer, Event, HipError, HipResult, RcclComms, HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED,
@@ -161,6 +163,14 @@ pub struct Gpus {
     /// One process-lifetime dependency event per rank for peer-consumer
     /// collectives. Re-recording avoids 86 create/destroy pairs per DS4 token.
     rank_barrier_events: Vec<Event>,
+    /// Second process-lifetime dependency event per rank, owned by the
+    /// symmetric direct-peer-read allreduce
+    /// ([`Gpus::all_reduce_sum_f32_peer_direct_add`]): `E_done[r]` is recorded
+    /// after rank r's peer-read consumer, and each rank waits the peer's
+    /// `E_done` before overwriting its own partial on the next layer.
+    /// Separate pool from `rank_barrier_events` (the producer events) so the
+    /// two generations never alias.
+    rank_done_events: Vec<Event>,
     /// One 8-byte system-visible epoch per rank for the exact-gated gfx1201
     /// TP3/TP4 graph route. Each captured barrier advances the epoch.
     tp_graph_signals: Vec<DeviceBuffer>,
@@ -248,6 +258,7 @@ impl Gpus {
             peer_lease_next_id: 0,
             peer_lease_quarantined: false,
             rank_barrier_events: Vec::new(),
+            rank_done_events: Vec::new(),
             tp_graph_signals: Vec::new(),
             tp_graph_barrier_count: 0,
             tp_graph_capture_epoch: 0,
@@ -304,6 +315,7 @@ impl Gpus {
             peer_lease_next_id: 0,
             peer_lease_quarantined: false,
             rank_barrier_events: Vec::new(),
+            rank_done_events: Vec::new(),
             tp_graph_signals: Vec::new(),
             tp_graph_barrier_count: 0,
             tp_graph_capture_epoch: 0,
@@ -353,6 +365,7 @@ impl Gpus {
             peer_lease_next_id: 0,
             peer_lease_quarantined: false,
             rank_barrier_events: Vec::new(),
+            rank_done_events: Vec::new(),
             tp_graph_signals: Vec::new(),
             tp_graph_barrier_count: 0,
             tp_graph_capture_epoch: 0,
@@ -753,6 +766,72 @@ impl Gpus {
         Ok(())
     }
 
+    /// Ensure process-lifetime `rank_done_events` covers every device.
+    ///
+    /// Same lifetime-pool contract as [`Self::ensure_rank_barrier_events`]:
+    /// creates the full pool with system-release + disable-timing flags, or
+    /// validates an existing pool length. Partial create/bind failures keep
+    /// every successfully created handle reachable, drain active streams, bind
+    /// each owner, destroy the partial set, and never install a truncated pool.
+    fn ensure_rank_done_events(&mut self) -> HipResult<()> {
+        let n = self.devices.len();
+        if !self.rank_done_events.is_empty() {
+            if self.rank_done_events.len() != n {
+                return Err(HipError::new(
+                    0,
+                    &format!(
+                        "ensure_rank_done_events: event count {} != device count {n}",
+                        self.rank_done_events.len()
+                    ),
+                ));
+            }
+            return Ok(());
+        }
+
+        let mut events = Vec::with_capacity(n);
+        let mut init_error: Option<HipError> = None;
+        for rank in 0..n {
+            let gpu = &self.devices[rank];
+            if let Err(error) = gpu.bind_thread() {
+                init_error = Some(error);
+                break;
+            }
+            match gpu
+                .hip
+                .event_create_with_flags(HIP_EVENT_DISABLE_TIMING | HIP_EVENT_RELEASE_TO_SYSTEM)
+            {
+                Ok(event) => events.push(event),
+                Err(error) => {
+                    init_error = Some(error);
+                    break;
+                }
+            }
+        }
+
+        if let Some(error) = init_error {
+            // Quiesce before destroy so any in-flight work cannot race teardown.
+            for rank in 0..n {
+                let gpu = &self.devices[rank];
+                let _ = gpu.bind_thread();
+                if let Some(stream) = gpu.active_stream.as_ref() {
+                    let _ = gpu.hip.stream_synchronize(stream);
+                }
+            }
+            for (owner, event) in events.drain(..).enumerate() {
+                let _ = self.devices[owner].bind_thread();
+                let _ = self.devices[owner].hip.event_destroy(event);
+            }
+            debug_assert!(
+                self.rank_done_events.is_empty(),
+                "failed ensure_rank_done_events must not install a partial pool"
+            );
+            return Err(error);
+        }
+
+        self.rank_done_events = events;
+        Ok(())
+    }
+
     /// Enqueue an all-rank producer barrier using process-lifetime events.
     ///
     /// Each rank records its event after producing a peer-visible tensor, then
@@ -1035,6 +1114,7 @@ impl Gpus {
             peer_lease_next_id: 0,
             peer_lease_quarantined: false,
             rank_barrier_events: Vec::new(),
+            rank_done_events: Vec::new(),
             tp_graph_signals: Vec::new(),
             tp_graph_barrier_count: 0,
             tp_graph_capture_epoch: 0,
@@ -2021,6 +2101,208 @@ impl Gpus {
                         .hip
                         .stream_wait_event(root_stream, &self.rank_barrier_events[rank])?;
                 }
+            }
+
+            Ok(())
+        })();
+
+        if let Err(error) = result {
+            // Best-effort drain every active rank stream (caller may already
+            // have producer work queued). Never wait unrecorded generations.
+            for rank in 0..n {
+                let gpu = &self.devices[rank];
+                let _ = gpu.bind_thread();
+                if let Some(stream) = gpu.active_stream.as_ref() {
+                    let _ = gpu.hip.stream_synchronize(stream);
+                }
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Symmetric direct-peer-read all-reduce with fused residual add.
+    ///
+    /// Replaces the rooted gather/fold/broadcast for dense TP=2: every rank
+    /// reads the peer's partial directly via P2P mapping inside
+    /// `add_peer_residual_f32` (`x += p_first + p_second`), so there are no
+    /// full-size memcpys, no root bottleneck, and no idle ranks. Designed for
+    /// n ranks reading n-1 peers but only enabled for n == 2; anything else,
+    /// or any rank without an `active_stream`, falls back to
+    /// `reduce_sum_f32_peer_rooted_impl`. The EP leased path is untouched.
+    ///
+    /// Protocol per rank r (peer q), all on each rank's own `active_stream`:
+    /// (a) record `E_prod[r]` after the producer (the caller has already
+    ///     enqueued the partial-producing GEMM);
+    /// (b) `stream_wait_event(E_prod[q])` so the peer's partial is ready;
+    /// (c) launch `add_peer_residual_f32(x_r, p_first, p_second)` where
+    ///     p_first is always rank 0's partial and p_second rank 1's, so both
+    ///     ranks evaluate `p0 + p1` in rank order — bit-identical to the
+    ///     rooted fold and to each other;
+    /// (d) record `E_done[r]` after the consumer;
+    /// (e) `stream_wait_event(E_done[q])` so rank r does not overwrite `p_r`
+    ///     on the next layer while the peer may still be reading it.
+    /// No host waits, no memcpy, no root. Validation and error shape match
+    /// the rooted impl.
+    pub fn all_reduce_sum_f32_peer_direct_add(
+        &mut self,
+        partials: &[&DeviceBuffer],
+        residuals: &[&DeviceBuffer],
+        count: usize,
+    ) -> HipResult<()> {
+        const OPERATION: &str = "all_reduce_sum_f32_peer_direct_add";
+        if self.active_peer_lease.is_some()
+            || self.peer_lease_quarantined
+            || !self.peer_lease_buffers.is_empty()
+        {
+            return Err(HipError::new(
+                0,
+                &format!("{OPERATION}: peer scratch is leased — use the leased reduction API"),
+            ));
+        }
+        let n = self.devices.len();
+        if partials.len() != n {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "{OPERATION}: partials.len()={} != n_devices={n}",
+                    partials.len()
+                ),
+            ));
+        }
+        if residuals.len() != n {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "{OPERATION}: residuals.len()={} != n_devices={n}",
+                    residuals.len()
+                ),
+            ));
+        }
+        if count == 0 {
+            return Ok(());
+        }
+        let bytes = count
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| HipError::new(0, &format!("{OPERATION}: byte count overflow")))?;
+        for (rank, buffer) in partials.iter().enumerate() {
+            if buffer.size() < bytes {
+                return Err(HipError::new(
+                    0,
+                    &format!(
+                        "{OPERATION}: partial rank {rank} has {} bytes, needs {bytes}",
+                        buffer.size()
+                    ),
+                ));
+            }
+        }
+        for (rank, buffer) in residuals.iter().enumerate() {
+            if buffer.size() < bytes {
+                return Err(HipError::new(
+                    0,
+                    &format!(
+                        "{OPERATION}: residual rank {rank} has {} bytes, needs {bytes}",
+                        buffer.size()
+                    ),
+                ));
+            }
+        }
+        // Only the n == 2 all-active fast path is enabled. The rooted impl
+        // covers n == 1, the null/mixed-stream path, and any future n.
+        let all_active = self.devices.iter().all(|d| d.active_stream.is_some());
+        if n != 2 || !all_active {
+            return self.reduce_sum_f32_peer_rooted_impl(
+                partials,
+                Some(residuals),
+                count,
+                OPERATION,
+            );
+        }
+
+        let result = (|| -> HipResult<()> {
+            // Both lifetime event pools before any partial mutation.
+            self.ensure_rank_barrier_events()?;
+            self.ensure_rank_done_events()?;
+
+            // (a) Record each rank's producer event after its local GEMM.
+            for rank in 0..n {
+                let gpu = &self.devices[rank];
+                gpu.bind_thread()?;
+                let stream = gpu.active_stream.as_ref().ok_or_else(|| {
+                    HipError::new(
+                        0,
+                        &format!("{OPERATION}: device {rank} lost its active_stream"),
+                    )
+                })?;
+                gpu.hip
+                    .event_record(&self.rank_barrier_events[rank], Some(stream))?;
+            }
+
+            // Rank-order operands: p_first is always rank 0's partial and
+            // p_second rank 1's, so both ranks evaluate `p0 + p1` exactly as
+            // the rooted left fold does. On rank 1 the tensor operand is the
+            // P2P-mapped peer buffer and the raw pointer the local partial;
+            // peer access is symmetric, so the same two operands serve both
+            // ranks with only `x` differing.
+            let p_first = GpuTensor {
+                buf: unsafe { partials[0].alias() },
+                shape: vec![count],
+                dtype: DType::F32,
+            };
+            let p_second_ptr = partials[1].as_ptr() as *const c_void;
+            for rank in 0..n {
+                let peer = 1 - rank;
+                self.devices[rank].bind_thread()?;
+                // Scoped immutable borrows: the fused launch below needs
+                // `&mut`, so no stream borrow may be live across it.
+                {
+                    let gpu = &self.devices[rank];
+                    let stream = gpu.active_stream.as_ref().ok_or_else(|| {
+                        HipError::new(
+                            0,
+                            &format!("{OPERATION}: device {rank} lost its active_stream"),
+                        )
+                    })?;
+                    gpu.hip
+                        .stream_wait_event(stream, &self.rank_barrier_events[peer])?;
+                }
+                {
+                    let x = GpuTensor {
+                        buf: unsafe { residuals[rank].alias() },
+                        shape: vec![count],
+                        dtype: DType::F32,
+                    };
+                    self.devices[rank]
+                        .add_peer_residual_f32(&x, &p_first, p_second_ptr, count)?;
+                }
+                {
+                    let gpu = &self.devices[rank];
+                    let stream = gpu.active_stream.as_ref().ok_or_else(|| {
+                        HipError::new(
+                            0,
+                            &format!("{OPERATION}: device {rank} lost its active_stream"),
+                        )
+                    })?;
+                    gpu.hip
+                        .event_record(&self.rank_done_events[rank], Some(stream))?;
+                }
+            }
+
+            // (e) Reverse source-reuse: each rank waits the peer's done event
+            // so the next layer's producer cannot overwrite the partial the
+            // peer may still be reading.
+            for rank in 0..n {
+                let peer = 1 - rank;
+                let gpu = &self.devices[rank];
+                gpu.bind_thread()?;
+                let stream = gpu.active_stream.as_ref().ok_or_else(|| {
+                    HipError::new(
+                        0,
+                        &format!("{OPERATION}: device {rank} lost its active_stream"),
+                    )
+                })?;
+                gpu.hip
+                    .stream_wait_event(stream, &self.rank_done_events[peer])?;
             }
 
             Ok(())

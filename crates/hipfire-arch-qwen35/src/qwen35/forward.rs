@@ -4566,6 +4566,31 @@ fn dense_tp_add_residual(gpus: &mut Gpus, scratches: &[Qwen35Scratch]) -> HipRes
     Ok(())
 }
 
+/// Kill switch for the symmetric direct-peer-read TP allreduce:
+/// `HIPFIRE_TP_PEER_DIRECT=0` restores the rooted gather/fold/broadcast.
+/// Default ON for the n == 2 peer-access fast path.
+fn tp_peer_direct_enabled() -> bool {
+    hipfire_config::developer_var("HIPFIRE_TP_PEER_DIRECT")
+        .ok()
+        .as_deref()
+        != Some("0")
+}
+
+/// Dense TP allreduce routing: symmetric direct peer-read when exactly two
+/// ranks share peer access (and the kill switch is off), else the rooted path.
+fn dense_tp_allreduce_add_route(
+    gpus: &mut Gpus,
+    partials: &[&hip_bridge::DeviceBuffer],
+    residuals: &[&hip_bridge::DeviceBuffer],
+    count: usize,
+) -> HipResult<()> {
+    if gpus.devices.len() == 2 && gpus.peer_access_enabled && tp_peer_direct_enabled() {
+        gpus.all_reduce_sum_f32_peer_direct_add(partials, residuals, count)
+    } else {
+        gpus.all_reduce_sum_f32_peer_rooted_add(partials, residuals, count)
+    }
+}
+
 fn dense_tp_allreduce_add(
     gpus: &mut Gpus,
     scratches: &[Qwen35Scratch],
@@ -4574,7 +4599,7 @@ fn dense_tp_allreduce_add(
     if gpus.peer_access_enabled {
         let partials: Vec<_> = scratches.iter().map(|scratch| &scratch.o.buf).collect();
         let residuals: Vec<_> = scratches.iter().map(|scratch| &scratch.x.buf).collect();
-        gpus.all_reduce_sum_f32_peer_rooted_add(&partials, &residuals, count)
+        dense_tp_allreduce_add_route(gpus, &partials, &residuals, count)
     } else {
         dense_tp_allreduce(gpus, scratches, count)?;
         dense_tp_add_residual(gpus, scratches)
@@ -4598,7 +4623,7 @@ fn dense_tp_allreduce_batched(
             .map(|pbs| pbs.x_batch.sub_offset(0, count))
             .collect();
         let residual_refs: Vec<_> = residuals.iter().map(|tensor| &tensor.buf).collect();
-        return gpus.all_reduce_sum_f32_peer_rooted_add(&partial_refs, &residual_refs, count);
+        return dense_tp_allreduce_add_route(gpus, &partial_refs, &residual_refs, count);
     }
     dense_tp_all_reduce_sum_f32(gpus, &partial_refs, count)?;
     for (rank, (pbs, partial)) in pbs_vec.iter().zip(partials.iter()).enumerate() {
