@@ -4802,7 +4802,7 @@ fn s4_residual_fast(
 ) -> bool {
     fusion == DflashFusionCtx::ChainVerify
         && !gpu.flags.mq_f16_residual_off
-        && gpu.arch_caps.is_gfx1100()
+        && gpu.arch_caps.supports_dflash_f16_residual_fusions()
         && w_dtype == DType::MQ4G256V2
         && matches!(epilogue, BatchEpilogue::Residual)
         && (1..=16).contains(&n)
