@@ -14,18 +14,20 @@ use crate::dflash_verify_pm4::{DflashVerifyPm4, DFLASH_VERIFY_PM4_BLOCK};
 use crate::qwen35::{self, DeltaNetState, Qwen35Config, Qwen35Weights, StateQuant};
 use crate::speculative::{
     apply_eviction_retain_to_draft, apply_host_nucleus, apply_host_topk, sample_categorical,
-    scatter_hidden_block_to_interleaved, seed_target_hidden_from_prompt_abortable,
-    seed_target_hidden_suffix_abortable, softmax_temp_into, spec_step_ddtree_batched,
-    spec_step_dflash, xorshift_next_unit, DdtreeScratch, DeltaNetSnapshot, GdnTape,
-    HiddenStateRingBuffer, ModelSlot, SpecStepResult, VerifyScratch,
+    scatter_hidden_block_to_interleaved, seed_target_hidden_dense_tp2_abortable,
+    seed_target_hidden_from_prompt_abortable, seed_target_hidden_suffix_abortable, softmax_temp_into,
+    spec_step_ddtree_batched, spec_step_dflash, spec_step_dflash_dense_tp2, xorshift_next_unit,
+    DdtreeScratch, DeltaNetSnapshot, DenseTpTargetView, GdnTape, HiddenStateRingBuffer, ModelSlot,
+    SpecStepResult, VerifyScratch,
 };
 use hipfire_runtime::dflash::{DflashConfig, DflashScratch, DflashWeights, TargetHiddenLogMark};
 use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_runtime::spec::{
     request_rng_state, terminal_prefix_replay, EvictRetain, PrefillOutcome, SpecGrammar,
     SpecRequestConfig, SpecStep, SpecTarget, Speculator,
 };
-use rdna_compute::Gpu;
+use rdna_compute::{Gpu, GpuTensor};
 use std::path::Path;
 
 /// Extract layers the retained B=16 DFlash2 verify route admits.
@@ -1284,6 +1286,376 @@ pub fn admit_dflash_verify_pm4(
         ));
     }
     Ok(())
+}
+
+// ─── Dense-TP (TP=2) DFlash2 mesh owner ───────────────────────────────
+//
+// Transactional owner of one full DFlash2 draft replica per target rank plus
+// each rank's persistent `[B,H]` TP partial. No draft collective exists: the
+// target's post-reduction hidden is already full-width and bit-identical on
+// both ranks, so each replica consumes local data and the mesh gate requires
+// byte-identical drafted IDs before the target may mutate. Eager-only and
+// greedy-only; retained PM4 and HipGraph verify stay disarmed on this path.
+
+/// One rank's draft replica + mesh bookkeeping. `dflash` mirrors the
+/// single-GPU `DflashState` layout (chain-only: `ddtree` is always `None`,
+/// `verify_pm4` always disabled); `tp_partial` is the persistent `[B,H]`
+/// reduction staging for that rank's device.
+pub struct DenseTpDflashRankState {
+    pub dflash: DflashState,
+    pub tp_partial: GpuTensor,
+    pub logical_pos: usize,
+    pub receipt_generation: u64,
+}
+
+/// Two draft replicas (rank order) + the next window generation tag.
+pub struct DenseTpDflashSpeculator {
+    pub ranks: Vec<DenseTpDflashRankState>,
+    pub next_generation: u64,
+}
+
+/// Transactionally build both draft replicas. Every rank binds its own device
+/// and runs the single-rank load logic under a `DenseTp2EagerGreedy` posture:
+/// fixed B=16, DFlash2 all-sliding selector draft, no DDTree/PFlash/CASK/
+/// adaptive-KV state, PM4/graph never armed. A later rank's failure frees all
+/// earlier ranks' draft + partial state; borrowed target state is untouched.
+/// Returns the mesh owner; target rank configs must already exist.
+pub fn load_dflash_speculator_dense_tp2(
+    draft_path: &str,
+    gpus: &mut Gpus,
+    target: DenseTpTargetView<'_>,
+    ctx_capacity: usize,
+    block_size: usize,
+) -> Result<DenseTpDflashSpeculator, String> {
+    if gpus.devices.len() != 2 || target.configs.len() != 2 || target.dn_states.len() != 2 {
+        return Err("dense TP DFlash needs exactly 2 target ranks".into());
+    }
+    if block_size != 16 {
+        return Err(format!(
+            "dense TP DFlash requires fixed B=16 (requested block_size={block_size})"
+        ));
+    }
+    for cfg in target.configs.iter() {
+        if cfg.num_experts != 0 {
+            return Err("dense TP DFlash requires num_experts == 0 (dense target)".into());
+        }
+    }
+    if target.configs[0].dim != target.configs[1].dim
+        || target.configs[0].n_layers != target.configs[1].n_layers
+    {
+        return Err("dense TP DFlash rank configs diverge".into());
+    }
+    let dim = target.configs[0].dim;
+    let vocab = target.configs[0].vocab_size;
+    let hidden_k = dim.next_power_of_two();
+    let draft_hfq =
+        HfqFile::open(Path::new(draft_path)).map_err(|e| format!("draft open: {e}"))?;
+    let draft_config = DflashConfig::from_hfq(&draft_hfq)
+        .ok_or_else(|| "draft: failed to parse DflashConfig from HFQ metadata".to_string())?;
+    if !draft_config.all_layers_sliding {
+        return Err("dense TP DFlash requires a DFlash2 all-sliding draft".into());
+    }
+    if draft_config.runtime_block_size() != 16 {
+        return Err(format!(
+            "dense TP DFlash requires runtime B=16 (draft runtime {})",
+            draft_config.runtime_block_size()
+        ));
+    }
+    // Window posture mirrors `load_dflash_state` (declared window by default,
+    // explicit override or Legacy opt-out via HIPFIRE_DFLASH_WINDOW). Mesh
+    // loads never enable eviction, so no ring-aware refusal applies here.
+    let window = match hipfire_config::developer_var("HIPFIRE_DFLASH_WINDOW")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+    {
+        Some(0) => None,
+        Some(w) => {
+            if let Some(declared) = draft_config.declared_window {
+                if declared != w {
+                    eprintln!(
+                        "  DFlash-TP2 window override {w} != draft-declared sliding_window \
+                         {declared} — acceptance may degrade (output stays verify-exact)"
+                    );
+                }
+            }
+            Some(w)
+        }
+        None => draft_config.declared_window,
+    };
+    let requested_ctx = ctx_capacity;
+    let ctx_capacity = match window {
+        Some(_) => requested_ctx,
+        None => match hipfire_config::developer_var("HIPFIRE_DFLASH_CTX_CAP")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+        {
+            Some(0) => ctx_capacity,
+            Some(cap) => ctx_capacity.min(cap),
+            None => ctx_capacity.min(DEFAULT_DFLASH_CTX_CAP),
+        },
+    };
+    let mut ranks: Vec<DenseTpDflashRankState> = Vec::with_capacity(2);
+    // Free helper for the transactional unwind: every rank state fully built
+    // so far is freed on its own device; the borrowed target is untouched.
+    let unwind = |gpus: &mut Gpus, ranks: Vec<DenseTpDflashRankState>| {
+        for (rank, s) in ranks.into_iter().enumerate() {
+            let _ = gpus.devices[rank].bind_thread();
+            let DenseTpDflashRankState {
+                dflash,
+                tp_partial,
+                logical_pos: _,
+                receipt_generation: _,
+            } = s;
+            dflash.free_gpu(&mut gpus.devices[rank]);
+            let _ = gpus.devices[rank].free_tensor(tp_partial);
+        }
+    };
+    for rank in 0..2 {
+        let gpu = &mut gpus.devices[rank];
+        if let Err(e) = gpu.bind_thread() {
+            let e = format!("dense TP DFlash rank {rank} bind: {e}");
+            unwind(gpus, ranks);
+            return Err(e);
+        }
+        macro_rules! or_unwind {
+            ($e:expr, $ctx:expr) => {
+                match $e {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let ctx: &str = $ctx;
+                        let e = if ctx.is_empty() {
+                            format!("{e}")
+                        } else {
+                            format!("{ctx}: {e}")
+                        };
+                        unwind(gpus, ranks);
+                        return Err(format!("dense TP DFlash rank {rank}: {e}"));
+                    }
+                }
+            };
+        }
+        let draft_weights = or_unwind!(DflashWeights::load(gpu, &draft_hfq, &draft_config), "");
+        if !draft_weights.has_candidate_selector() {
+            draft_weights.free_gpu(gpu);
+            unwind(gpus, ranks);
+            return Err(format!(
+                "dense TP DFlash rank {rank}: draft has no candidate selector (DFlash2 required)"
+            ));
+        }
+        let draft_scratch = or_unwind!(
+            match window {
+                Some(w) => DflashScratch::new_windowed(
+                    gpu,
+                    &draft_config,
+                    block_size,
+                    w,
+                    requested_ctx,
+                    requested_ctx,
+                    draft_weights.has_mq,
+                ),
+                None => DflashScratch::new_with_mq(
+                    gpu,
+                    &draft_config,
+                    block_size,
+                    ctx_capacity,
+                    draft_weights.has_mq,
+                ),
+            },
+            ""
+        );
+        // or_unwind! above consumes partially-owned GPU state on failure the
+        // same way load_dflash_state's or_free! does; mirror its discipline
+        // for the remaining fallible builds by freeing the two owned values
+        // before unwinding earlier ranks.
+        macro_rules! or_unwind_owned {
+            ($e:expr, $ctx:expr) => {
+                match $e {
+                    Ok(v) => v,
+                    Err(e) => {
+                        draft_scratch.free_gpu(gpu);
+                        draft_weights.free_gpu(gpu);
+                        unwind(gpus, ranks);
+                        return Err(format!("dense TP DFlash rank {rank}: {}: {e}", $ctx));
+                    }
+                }
+            };
+        }
+        for lid in draft_config.target_layer_ids.iter() {
+            if *lid >= target.configs[rank].n_layers {
+                draft_scratch.free_gpu(gpu);
+                draft_weights.free_gpu(gpu);
+                unwind(gpus, ranks);
+                return Err(format!(
+                    "dense TP DFlash rank {rank}: draft target_layer_ids contains {lid} >= num_target_layers {}",
+                    target.configs[rank].n_layers
+                ));
+            }
+        }
+        let hidden_rb = or_unwind_owned!(
+            HiddenStateRingBuffer::new_for_layers(
+                gpu,
+                &draft_config.target_layer_ids,
+                dim,
+                ctx_capacity + block_size,
+                block_size,
+            ),
+            "HiddenStateRingBuffer::new_for_layers"
+        );
+        let verify_scratch = or_unwind_owned!(
+            VerifyScratch::with_prefill(gpu, block_size, dim, vocab, hidden_k, &target.configs[rank]),
+            "VerifyScratch::with_prefill"
+        );
+        let target_snap = or_unwind_owned!(
+            DeltaNetSnapshot::new_for(gpu, &target.dn_states[rank]),
+            "DeltaNetSnapshot::new_for"
+        );
+        let gdn_tape = or_unwind_owned!(
+            GdnTape::new_for_config(gpu, &target.configs[rank], block_size),
+            "GdnTape::new_for_config"
+        );
+        let tp_partial = or_unwind_owned!(
+            gpu.alloc_tensor(&[block_size * dim], rdna_compute::DType::F32),
+            "tp_partial alloc"
+        );
+        let target_hidden_host = vec![0.0f32; ctx_capacity * dim];
+        ranks.push(DenseTpDflashRankState {
+            dflash: DflashState {
+                draft_config: draft_config.clone(),
+                draft_weights,
+                draft_scratch,
+                hidden_rb,
+                verify_scratch,
+                target_snap,
+                gdn_tape,
+                target_hidden_host,
+                ctx_capacity: if window.is_some() {
+                    requested_ctx
+                } else {
+                    ctx_capacity
+                },
+                block_size,
+                ddtree: None,
+                verify_pm4: DflashVerifyPm4::disabled("dense TP mesh is eager-only"),
+            },
+            tp_partial,
+            logical_pos: 0,
+            receipt_generation: u64::MAX,
+        });
+    }
+    Ok(DenseTpDflashSpeculator {
+        ranks,
+        next_generation: 0,
+    })
+}
+
+impl DenseTpDflashSpeculator {
+    /// Cold prompt prefill on both ranks; returns the greedy first token from
+    /// rank-0 target logits. Never aborts (pass-through `false` guard).
+    pub fn prefill(
+        &mut self,
+        gpus: &mut Gpus,
+        target: DenseTpTargetView<'_>,
+        prompt: &[u32],
+    ) -> Result<u32, String> {
+        seed_target_hidden_dense_tp2_abortable(gpus, target, &mut self.ranks, prompt, &|| false)
+    }
+
+    /// One traced mesh window: full `SpecStepResult` (seed/drafted/accepted/
+    /// bonus/committed) for diagnostics and parity diffing.
+    pub fn step_traced(
+        &mut self,
+        gpus: &mut Gpus,
+        target: DenseTpTargetView<'_>,
+        position: usize,
+        seed: u32,
+    ) -> hip_bridge::HipResult<SpecStepResult> {
+        let generation = self.next_generation;
+        self.next_generation = self.next_generation.wrapping_add(1);
+        spec_step_dflash_dense_tp2(gpus, target, &mut self.ranks, position, seed, generation)
+    }
+
+    /// Consumer-visible step: the existing `SpecStep` contract (emit =
+    /// `committed[1..]`, `next_seed` = bonus). Same lowering as the
+    /// single-GPU speculator, without the cross-architecture trait migration.
+    pub fn step(
+        &mut self,
+        gpus: &mut Gpus,
+        target: DenseTpTargetView<'_>,
+        position: usize,
+        seed: u32,
+    ) -> Result<SpecStep, String> {
+        self.step_traced(gpus, target, position, seed)
+            .map(|r| {
+                SpecStep::new(
+                    r.committed[1..].iter().copied(),
+                    r.bonus_token,
+                    r.drafted.len(),
+                    r.accepted,
+                )
+            })
+            .map_err(|e| e.to_string())
+    }
+
+    /// Cold reset between requests: ring/thlog/host/receipt state cleared on
+    /// both ranks (target KV/DN ownership stays with the caller). Drains both
+    /// rank streams so no window work leaks across the reset.
+    pub fn reset_all(&mut self, gpus: &mut Gpus) {
+        for (rank, s) in self.ranks.iter_mut().enumerate() {
+            if gpus.devices.get(rank).is_none() {
+                continue;
+            }
+            let _ = gpus.devices[rank].bind_thread();
+            s.dflash.hidden_rb.reset();
+            s.dflash.draft_scratch.reset_upload_tracking();
+            s.dflash.target_hidden_host.clear();
+            s.logical_pos = 0;
+            s.receipt_generation = u64::MAX;
+        }
+        for gpu in gpus.devices.iter() {
+            let _ = gpu.bind_thread();
+            let _ = gpu.hip.device_synchronize();
+        }
+    }
+
+    /// Drain both rank streams without mutating mesh state.
+    pub fn quiesce_all(&self, gpus: &mut Gpus) -> Result<(), String> {
+        for (rank, gpu) in gpus.devices.iter().enumerate() {
+            gpu.bind_thread()
+                .map_err(|e| format!("dense TP DFlash quiesce rank {rank}: {e}"))?;
+            if let Some(stream) = gpu.active_stream.as_ref() {
+                gpu.hip
+                    .stream_synchronize(stream)
+                    .map_err(|e| format!("dense TP DFlash quiesce rank {rank}: {e}"))?;
+            } else {
+                gpu.hip
+                    .device_synchronize()
+                    .map_err(|e| format!("dense TP DFlash quiesce rank {rank}: {e}"))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Destructured without `..` on purpose (same rule as
+    /// `DflashState::free_gpu`): a later GPU-owning field becomes a compile
+    /// error here instead of a leak. Frees rank `r` only while device `r` is
+    /// bound; target state is borrowed and untouched.
+    pub fn free_gpu(self, gpus: &mut Gpus) {
+        let DenseTpDflashSpeculator {
+            ranks,
+            next_generation: _,
+        } = self;
+        for (rank, s) in ranks.into_iter().enumerate() {
+            let _ = gpus.devices[rank].bind_thread();
+            let DenseTpDflashRankState {
+                dflash,
+                tp_partial,
+                logical_pos: _,
+                receipt_generation: _,
+            } = s;
+            dflash.free_gpu(&mut gpus.devices[rank]);
+            let _ = gpus.devices[rank].free_tensor(tp_partial);
+        }
+    }
 }
 
 #[cfg(test)]
