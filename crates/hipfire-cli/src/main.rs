@@ -485,6 +485,9 @@ pub(crate) struct BenchArgs {
     model: String,
     #[arg(long, default_value_t = 5)]
     runs: usize,
+    /// Tensor/expert-parallel degree for the benchmark daemon (same admission as `serve --tp`).
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=64))]
+    tp: Option<u64>,
     #[arg(short = 'j', long)]
     json: bool,
     /// Compare the five RDNA2 kernel variants in isolated daemon processes.
@@ -4817,6 +4820,9 @@ fn open_bench_engine(
             params["continuous_batch_size"] = serde_json::json!(n);
         }
     }
+    if let Some(tp) = args.tp.filter(|&tp| tp > 1) {
+        params["tp"] = serde_json::json!(tp);
+    }
     let loaded = engine.load(&path, params)?;
     let post_diag = engine.request(&serde_json::json!({ "type": "diag" }))?;
     Ok((engine, loaded, pre_diag, post_diag))
@@ -5070,6 +5076,7 @@ fn profile_command(paths: &Paths, args: ProfileArgs) -> Result<()> {
         let bench = BenchArgs {
             model: model.to_owned(),
             runs: 1,
+            tp: None,
             json: false,
             exp: false,
             matrix: false,
