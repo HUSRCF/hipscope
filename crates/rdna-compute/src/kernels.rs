@@ -3515,6 +3515,10 @@ pub const GEMM_GATE_UP_MQ4G256V2_WMMA_FP8_GFX12_BT4_SRC: &str = concat!(
     "#define HIPFIRE_FP8_BV 4\n#define HIPFIRE_FP8_GATEUP_KERNEL gemm_gate_up_mq4g256v2_wmma_fp8_gfx12_bt4\n",
     include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip")
 );
+pub const GEMM_GATE_UP_MQ4G256V2_WMMA_FP8_GFX12_S2BT8_SRC: &str = concat!(
+    "#define HIPFIRE_FP8_SLABS 2\n#define HIPFIRE_FP8_BV 8\n#define HIPFIRE_FP8_GATEUP_KERNEL gemm_gate_up_mq4g256v2_wmma_fp8_gfx12_s2bt8\n",
+    include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip")
+);
 pub const GEMM_MQ4G256V2_RESIDUAL_WMMA_FP8_GFX12_BT12_SRC: &str = concat!(
     "#define HIPFIRE_FP8_RESIDUAL 1\n#define HIPFIRE_FP8_BV 12\n#define HIPFIRE_FP8_GATEUP_KERNEL gemm_mq4g256v2_residual_wmma_fp8_gfx12_bt12\n",
     include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip")
@@ -3527,6 +3531,10 @@ pub const GEMM_MQ4G256V2_RESIDUAL_WMMA_FP8_GFX12_BT4_SRC: &str = concat!(
     "#define HIPFIRE_FP8_RESIDUAL 1\n#define HIPFIRE_FP8_BV 4\n#define HIPFIRE_FP8_GATEUP_KERNEL gemm_mq4g256v2_residual_wmma_fp8_gfx12_bt4\n",
     include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip")
 );
+pub const GEMM_MQ4G256V2_RESIDUAL_WMMA_FP8_GFX12_S2BT8_SRC: &str = concat!(
+    "#define HIPFIRE_FP8_SLABS 2\n#define HIPFIRE_FP8_RESIDUAL 1\n#define HIPFIRE_FP8_BV 8\n#define HIPFIRE_FP8_GATEUP_KERNEL gemm_mq4g256v2_residual_wmma_fp8_gfx12_s2bt8\n",
+    include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip")
+);
 pub const GEMM_QKVZA_MQ4G256V2_WMMA_FP8_GFX12_BT12_SRC: &str = concat!(
     "#define HIPFIRE_FP8_QKVZA 1\n#define HIPFIRE_FP8_BV 12\n#define HIPFIRE_FP8_GATEUP_KERNEL gemm_qkvza_mq4g256v2_wmma_fp8_gfx12_bt12\n",
     include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip")
@@ -3537,6 +3545,10 @@ pub const GEMM_QKVZA_MQ4G256V2_WMMA_FP8_GFX12_BT8_SRC: &str = concat!(
 );
 pub const GEMM_QKVZA_MQ4G256V2_WMMA_FP8_GFX12_BT4_SRC: &str = concat!(
     "#define HIPFIRE_FP8_QKVZA 1\n#define HIPFIRE_FP8_BV 4\n#define HIPFIRE_FP8_GATEUP_KERNEL gemm_qkvza_mq4g256v2_wmma_fp8_gfx12_bt4\n",
+    include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip")
+);
+pub const GEMM_QKVZA_MQ4G256V2_WMMA_FP8_GFX12_S2BT8_SRC: &str = concat!(
+    "#define HIPFIRE_FP8_SLABS 2\n#define HIPFIRE_FP8_QKVZA 1\n#define HIPFIRE_FP8_BV 8\n#define HIPFIRE_FP8_GATEUP_KERNEL gemm_qkvza_mq4g256v2_wmma_fp8_gfx12_s2bt8\n",
     include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip")
 );
 pub const GEMM_GATE_UP_MQ5G256V2_WMMA_GFX12_BT_SRC: &str =

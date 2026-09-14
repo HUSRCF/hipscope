@@ -9395,7 +9395,16 @@ impl Gpu {
             ));
         }
         let prepared = self.prepare_mq4v2_fp8_x(x, batch_size, k, scale_mode)?;
-        let (func_name, ksrc, bv): (&str, &str, usize) = if batch_size % 192 == 0 {
+        // Two-slab S2BT8 form, developer-only (see gate_up launcher).
+        let slabs2 = hipfire_config::developer_var("HIPFIRE_GFX12_MQ4V2_FP8_SLABS").as_deref() == Ok("2")
+            && batch_size % 128 == 0;
+        let (func_name, ksrc, bv): (&str, &str, usize) = if slabs2 {
+            (
+                "gemm_qkvza_mq4g256v2_wmma_fp8_gfx12_s2bt8",
+                kernels::GEMM_QKVZA_MQ4G256V2_WMMA_FP8_GFX12_S2BT8_SRC,
+                8,
+            )
+        } else if batch_size % 192 == 0 {
             (
                 "gemm_qkvza_mq4g256v2_wmma_fp8_gfx12_bt12",
                 kernels::GEMM_QKVZA_MQ4G256V2_WMMA_FP8_GFX12_BT12_SRC,
@@ -9452,7 +9461,7 @@ impl Gpu {
             &mut n_val as *mut _ as *mut c_void,
         ];
         let total_m = qkv_m + z_m + beta_m + alpha_m;
-        let row_tiles = (total_m + 15) / 16;
+        let row_tiles = if slabs2 { (total_m + 31) / 32 } else { (total_m + 15) / 16 };
         let batch_tiles = (batch_size + 16 * bv - 1) / (16 * bv);
         let bytes = crate::profile::gemv_hfq4g256_bytes(total_m, k) + batch_size * k + batch_size * total_m * 4;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", func_name, bytes);
@@ -28747,8 +28756,18 @@ impl Gpu {
                 "gemm_gate_up_mq4g256v2_wmma_fp8_gfx12_bt12: prepared (n,k) mismatch",
             ));
         }
+        // Two-slab S2BT8 form (developer-only `HIPFIRE_GFX12_MQ4V2_FP8_SLABS=2`):
+        // each wave covers 32 rows, halving the row grid. One env read per call.
+        let slabs2 = hipfire_config::developer_var("HIPFIRE_GFX12_MQ4V2_FP8_SLABS").as_deref() == Ok("2")
+            && batch_size % 128 == 0;
         // Batch tile by N, mirroring the F16 incumbent's selector.
-        let (func_name, ksrc, bv): (&str, &str, usize) = if batch_size % 192 == 0 {
+        let (func_name, ksrc, bv): (&str, &str, usize) = if slabs2 {
+            (
+                "gemm_gate_up_mq4g256v2_wmma_fp8_gfx12_s2bt8",
+                kernels::GEMM_GATE_UP_MQ4G256V2_WMMA_FP8_GFX12_S2BT8_SRC,
+                8,
+            )
+        } else if batch_size % 192 == 0 {
             (
                 "gemm_gate_up_mq4g256v2_wmma_fp8_gfx12_bt12",
                 kernels::GEMM_GATE_UP_MQ4G256V2_WMMA_FP8_GFX12_BT_SRC,
@@ -28793,7 +28812,7 @@ impl Gpu {
             &mut n_val as *mut _ as *mut c_void,
         ];
         let total_m = gate_m + up_m;
-        let row_tiles = (total_m + 15) / 16;
+        let row_tiles = if slabs2 { (total_m + 31) / 32 } else { (total_m + 15) / 16 };
         let batch_tiles = (batch_size + 16 * bv - 1) / (16 * bv);
         let bytes = crate::profile::gemv_hfq4g256_bytes(gate_m, k)
             + crate::profile::gemv_hfq4g256_bytes(up_m, k)
@@ -29335,7 +29354,16 @@ impl Gpu {
             ));
         }
         let prepared = self.prepare_mq4v2_fp8_x(x, batch_size, k, scale_mode)?;
-        let (func_name, ksrc, bv): (&str, &str, usize) = if batch_size % 192 == 0 {
+        // Two-slab S2BT8 form, developer-only (see gate_up launcher).
+        let slabs2 = hipfire_config::developer_var("HIPFIRE_GFX12_MQ4V2_FP8_SLABS").as_deref() == Ok("2")
+            && batch_size % 128 == 0;
+        let (func_name, ksrc, bv): (&str, &str, usize) = if slabs2 {
+            (
+                "gemm_mq4g256v2_residual_wmma_fp8_gfx12_s2bt8",
+                kernels::GEMM_MQ4G256V2_RESIDUAL_WMMA_FP8_GFX12_S2BT8_SRC,
+                8,
+            )
+        } else if batch_size % 192 == 0 {
             (
                 "gemm_mq4g256v2_residual_wmma_fp8_gfx12_bt12",
                 kernels::GEMM_MQ4G256V2_RESIDUAL_WMMA_FP8_GFX12_BT12_SRC,
@@ -29373,7 +29401,7 @@ impl Gpu {
             &mut k_val as *mut _ as *mut c_void,
             &mut n_val as *mut _ as *mut c_void,
         ];
-        let row_tiles = (m + 15) / 16;
+        let row_tiles = if slabs2 { (m + 31) / 32 } else { (m + 15) / 16 };
         let batch_tiles = (batch_size + 16 * bv - 1) / (16 * bv);
         let bytes = crate::profile::gemv_hfq4g256_bytes(m, k) + batch_size * k + batch_size * m * 8;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", func_name, bytes);

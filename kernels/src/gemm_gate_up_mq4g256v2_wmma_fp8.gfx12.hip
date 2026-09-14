@@ -124,6 +124,16 @@ __device__ static inline v2i_t mq4_qpk_to_e4m3(unsigned int pk) {
 #define HIPFIRE_FP8_QKVZA 0
 #endif
 
+// Two-slab form: HIPFIRE_FP8_SLABS=2 gives each wave32 two 16-row slabs
+// (rows [rs, rs+32)) so one 16 B X fragment feeds four WMMAs (two slabs x
+// two K fragments) instead of two. acc[s][b], per-slab headers/scales and
+// per-slab boundary correction; batch columns (sb, X, half-sums) shared.
+// Grid becomes [ceil(M/32), ceil(N/(16*BV)), 1]. SLABS=1 is the current
+// single-slab kernel, kept textually identical in the #else branches.
+#ifndef HIPFIRE_FP8_SLABS
+#define HIPFIRE_FP8_SLABS 1
+#endif
+
 extern "C" __launch_bounds__(32, 2) __global__
 #if HIPFIRE_FP8_QKVZA
 void HIPFIRE_FP8_GATEUP_KERNEL(
@@ -171,7 +181,12 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
     int N) {
     const int tm = gate_m + up_m;
 #endif
+    // SLABS=2 waves own two 16-row slabs; SLABS=1 keeps the current grid.
+#if HIPFIRE_FP8_SLABS == 2
+    const int rs = blockIdx.x * 32;
+#else
     const int rs = blockIdx.x * 16;
+#endif
     const int bs = blockIdx.y * (16 * HIPFIRE_FP8_BV);
     const int tid = threadIdx.x;
     if (rs >= tm || bs >= N) return;
@@ -179,6 +194,29 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
     const int ml = tid & 15;
     const int kg = tid >> 4;
 
+#if HIPFIRE_FP8_SLABS == 2
+    // Two-slab routing: one A-row per slab (own header source each).
+    const int sr0 = ((rs + ml) < tm) ? (rs + ml) : (tm - 1);
+    const int sr1 = ((rs + 16 + ml) < tm) ? (rs + 16 + ml) : (tm - 1);
+    const int srx[2] = { sr0, sr1 };
+    const char* Ax[2];
+    int lrx[2];
+    #pragma unroll
+    for (int s = 0; s < 2; s++) {
+        const int srs = srx[s];
+#if HIPFIRE_FP8_QKVZA
+        if (srs < qkv_m) { Ax[s] = A_qkv; lrx[s] = srs; }
+        else if (srs < qkv_m + z_m) { Ax[s] = A_z; lrx[s] = srs - qkv_m; }
+        else if (srs < qkv_m + z_m + beta_m) { Ax[s] = A_beta; lrx[s] = srs - (qkv_m + z_m); }
+        else { Ax[s] = A_alpha; lrx[s] = srs - (qkv_m + z_m + beta_m); }
+#elif HIPFIRE_FP8_RESIDUAL
+        Ax[s] = A_w;
+        lrx[s] = srs;
+#else
+        if (srs < gate_m) { Ax[s] = A_gate; lrx[s] = srs; } else { Ax[s] = A_up; lrx[s] = srs - gate_m; }
+#endif
+    }
+#else
     // Route this lane's A-row (own header source).
     const int mr = rs + ml;
     const int sr = (mr < tm) ? mr : (tm - 1);
@@ -197,13 +235,20 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
     int lr;
     if (sr < gate_m) { A = A_gate; lr = sr; } else { A = A_up; lr = sr - gate_m; }
 #endif
+#endif
 
     const int gpr = K / 256;
+#if HIPFIRE_FP8_SLABS == 2
+    // Per-slab weight-row bases; 32-bit offsets per the note below.
+    const char* rbx[2] = { Ax[0] + (unsigned int)lrx[0] * (unsigned int)gpr * 136u,
+                           Ax[1] + (unsigned int)lrx[1] * (unsigned int)gpr * 136u };
+#else
     // All byte offsets below fit in 32 bits: X holds N*K bytes with
     // N*K < 2^32, each weight row holds gpr*136 bytes, and Y indices stay
     // far below 2^32 at admitted shapes. This keeps hoisted per-chain
     // products to one VGPR each instead of 64-bit pairs.
     const char* rb = A + (unsigned int)lr * (unsigned int)gpr * 136u;
+#endif
 
     // Batch rows for the 12 chains; out-of-range rows alias row 0 for
     // safe loads, stores stay guarded.
@@ -214,6 +259,18 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
         sb[b] = (t < N) ? t : 0;
     }
 
+#if HIPFIRE_FP8_SLABS == 2
+    // Two long-lived accumulators per chain (one per slab), each in units
+    // of its slab's current half scale; per-slab current scale below.
+    v8f_t acc[2][HIPFIRE_FP8_BV];
+    #pragma unroll
+    for (int s = 0; s < 2; s++)
+        #pragma unroll
+        for (int b = 0; b < HIPFIRE_FP8_BV; b++)
+            acc[s][b] = v8f_t{0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    // Lane-owned (row ml) current scale per slab; 0 until first nonzero half.
+    float s_cur_x[2] = { 0.0f, 0.0f };
+#else
     // Single long-lived accumulator per chain, kept in units of the
     // CURRENT half's per-row scale s_cur (row = 8*kg+j for element j).
     // At each half boundary: acc *= s_prev/s_new, then the zero-point term
@@ -227,10 +284,100 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
         acc[b] = v8f_t{0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
     // Lane-owned (row ml) current scale; 0 until the first nonzero half.
     float s_cur_self = 0.0f;
+#endif
     const unsigned char* xb_base[HIPFIRE_FP8_BV];
     #pragma unroll
     for (int b = 0; b < HIPFIRE_FP8_BV; b++) xb_base[b] = X_fp8 + (unsigned int)sb[b] * (unsigned int)K;
 
+#if HIPFIRE_FP8_SLABS == 2
+    // Two-slab K loop: per-slab headers from rbx[s], shared half-sums S0/S1
+    // and X base. Per (group, half): per-slab boundary correction into
+    // acc[s][b], then per 32-K pair decode one weight fragment per slab
+    // (same kt) and issue 4 WMMAs per chain off ONE X fragment pair.
+    #pragma nounroll
+    for (int g = 0; g < gpr; g++) {
+        float sc0x[2], zp0x[2], sc1x[2], zp1x[2];
+        const char* payx[2];
+        #pragma unroll
+        for (int s = 0; s < 2; s++) {
+            const char* gpx = rbx[s] + (unsigned int)g * 136u;
+            const unsigned int hAx = *(const unsigned int*)(gpx);
+            const unsigned int hBx = *(const unsigned int*)(gpx + 4);
+            sc0x[s] = __half2float(__ushort_as_half((unsigned short)(hAx & 0xFFFFu)));
+            zp0x[s] = __half2float(__ushort_as_half((unsigned short)(hAx >> 16)));
+            sc1x[s] = __half2float(__ushort_as_half((unsigned short)(hBx & 0xFFFFu)));
+            zp1x[s] = __half2float(__ushort_as_half((unsigned short)(hBx >> 16)));
+            payx[s] = gpx + 8;
+        }
+
+        // Half-sums for both halves of this group (shared by both slabs).
+        float S0[HIPFIRE_FP8_BV], S1[HIPFIRE_FP8_BV];
+        #pragma unroll
+        for (int b = 0; b < HIPFIRE_FP8_BV; b++) {
+            const float2 s2 = *(const float2*)(X_half_sums + ((unsigned int)sb[b] * (unsigned int)gpr + (unsigned int)g) * 2u);
+            S0[b] = s2.x; S1[b] = s2.y;
+        }
+
+        #pragma nounroll
+        for (int h = 0; h < 2; h++) {
+            // Per-slab boundary state; a zero scale zeroes that slab's
+            // weight operand below while keeping its previous units.
+            float rx[2], zqx[2];
+            bool livex[2];
+            #pragma unroll
+            for (int s = 0; s < 2; s++) {
+                const float s_new = (h == 0) ? sc0x[s] : sc1x[s];
+                const float zx = (h == 0) ? zp0x[s] : zp1x[s];
+                const bool live = (s_new != 0.0f);
+                const float s_next = live ? s_new : s_cur_x[s];
+                rx[s] = (live && s_cur_x[s] != 0.0f) ? (s_cur_x[s] / s_next) : 1.0f;
+                zqx[s] = (s_next != 0.0f) ? (zx / s_next) : 0.0f;
+                s_cur_x[s] = s_next;
+                livex[s] = live;
+            }
+
+            // Rescale into the new half's units and add the zero-point term
+            // in those units, per slab.
+            #pragma unroll
+            for (int j = 0; j < 8; j++) {
+                const float r0 = __shfl(rx[0], 8 * kg + j);
+                const float r1 = __shfl(rx[1], 8 * kg + j);
+                const float z0 = __shfl(zqx[0], 8 * kg + j);
+                const float z1 = __shfl(zqx[1], 8 * kg + j);
+                #pragma unroll
+                for (int b = 0; b < HIPFIRE_FP8_BV; b++) {
+                    const float Sb = (h == 0) ? S0[b] : S1[b];
+                    acc[0][b][j] = fmaf(z0, Sb, acc[0][b][j] * r0);
+                    acc[1][b][j] = fmaf(z1, Sb, acc[1][b][j] * r1);
+                }
+            }
+
+            // Same K re-slicing as SLABS=1, decoded once per slab; one 16 B
+            // X load per chain feeds four WMMAs (two slabs x two fragments).
+            #pragma unroll
+            for (int u = 0; u < 4; u++) {
+                const uint2 pk0 = *(const uint2*)(payx[0] + h * 64 + u * 16 + kg * 8);
+                const uint2 pk1 = *(const uint2*)(payx[1] + h * 64 + u * 16 + kg * 8);
+                v2i_t q0a = mq4_qpk_to_e4m3(pk0.x);
+                v2i_t q0b = mq4_qpk_to_e4m3(pk0.y);
+                v2i_t q1a = mq4_qpk_to_e4m3(pk1.x);
+                v2i_t q1b = mq4_qpk_to_e4m3(pk1.y);
+                if (!livex[0]) { q0a[0] = 0; q0a[1] = 0; q0b[0] = 0; q0b[1] = 0; }
+                if (!livex[1]) { q1a[0] = 0; q1a[1] = 0; q1b[0] = 0; q1b[1] = 0; }
+                const unsigned int x_off = (unsigned int)g * 256u + (unsigned int)h * 128u + (unsigned int)u * 32u + (unsigned int)kg * 16u;
+                #pragma unroll
+                for (int b = 0; b < HIPFIRE_FP8_BV; b++) {
+                    const v2i_t xa = *(const v2i_t*)(xb_base[b] + x_off);
+                    const v2i_t xb = *(const v2i_t*)(xb_base[b] + x_off + 8u);
+                    acc[0][b] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(q0a, xa, acc[0][b]);
+                    acc[0][b] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(q0b, xb, acc[0][b]);
+                    acc[1][b] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(q1a, xa, acc[1][b]);
+                    acc[1][b] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(q1b, xb, acc[1][b]);
+                }
+            }
+        }
+    }
+#else
     #pragma nounroll
     for (int g = 0; g < gpr; g++) {
         const char* gp = rb + (unsigned int)g * 136u;
@@ -295,7 +442,69 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
             }
         }
     }
+#endif
 
+#if HIPFIRE_FP8_SLABS == 2
+    // Per-slab final scales, gathered from the lane owning row 8*kg+j of
+    // each slab.
+    float s_finx[2][8];
+    #pragma unroll
+    for (int s = 0; s < 2; s++)
+        #pragma unroll
+        for (int j = 0; j < 8; j++) s_finx[s][j] = __shfl(s_cur_x[s], 8 * kg + j);
+
+    // Final store per slab with the incumbent output mapping.
+    #pragma unroll
+    for (int b = 0; b < HIPFIRE_FP8_BV; b++) {
+        const int oc = bs + b * 16 + ml;
+        if (oc < N) {
+            const float an = X_row_scales[oc];
+            #pragma unroll
+            for (int j = 0; j < 8; j++) {
+                const int orow0 = rs + 8 * kg + j;
+                if (orow0 < tm) {
+#if HIPFIRE_FP8_QKVZA
+                    float* Y0;
+                    int pr0, os0;
+                    if (orow0 < qkv_m) { Y0 = Y_qkv; pr0 = orow0; os0 = qkv_m; }
+                    else if (orow0 < qkv_m + z_m) { Y0 = Y_z; pr0 = orow0 - qkv_m; os0 = z_m; }
+                    else if (orow0 < qkv_m + z_m + beta_m) { Y0 = Y_beta; pr0 = orow0 - (qkv_m + z_m); os0 = beta_m; }
+                    else { Y0 = Y_alpha; pr0 = orow0 - (qkv_m + z_m + beta_m); os0 = alpha_m; }
+                    Y0[(unsigned int)oc * (unsigned int)os0 + (unsigned int)pr0] = an * s_finx[0][j] * acc[0][b][j];
+#elif HIPFIRE_FP8_RESIDUAL
+                    Y_res[(unsigned int)oc * (unsigned int)res_m + (unsigned int)orow0] += an * s_finx[0][j] * acc[0][b][j];
+#else
+                    float* Y0;
+                    int pr0, os0;
+                    if (orow0 < gate_m) { Y0 = Y_gate; pr0 = orow0; os0 = gate_m; }
+                    else { Y0 = Y_up; pr0 = orow0 - gate_m; os0 = up_m; }
+                    Y0[(unsigned int)oc * (unsigned int)os0 + (unsigned int)pr0] = an * s_finx[0][j] * acc[0][b][j];
+#endif
+                }
+                const int orow1 = rs + 16 + 8 * kg + j;
+                if (orow1 < tm) {
+#if HIPFIRE_FP8_QKVZA
+                    float* Y1;
+                    int pr1, os1;
+                    if (orow1 < qkv_m) { Y1 = Y_qkv; pr1 = orow1; os1 = qkv_m; }
+                    else if (orow1 < qkv_m + z_m) { Y1 = Y_z; pr1 = orow1 - qkv_m; os1 = z_m; }
+                    else if (orow1 < qkv_m + z_m + beta_m) { Y1 = Y_beta; pr1 = orow1 - (qkv_m + z_m); os1 = beta_m; }
+                    else { Y1 = Y_alpha; pr1 = orow1 - (qkv_m + z_m + beta_m); os1 = alpha_m; }
+                    Y1[(unsigned int)oc * (unsigned int)os1 + (unsigned int)pr1] = an * s_finx[1][j] * acc[1][b][j];
+#elif HIPFIRE_FP8_RESIDUAL
+                    Y_res[(unsigned int)oc * (unsigned int)res_m + (unsigned int)orow1] += an * s_finx[1][j] * acc[1][b][j];
+#else
+                    float* Y1;
+                    int pr1, os1;
+                    if (orow1 < gate_m) { Y1 = Y_gate; pr1 = orow1; os1 = gate_m; }
+                    else { Y1 = Y_up; pr1 = orow1 - gate_m; os1 = up_m; }
+                    Y1[(unsigned int)oc * (unsigned int)os1 + (unsigned int)pr1] = an * s_finx[1][j] * acc[1][b][j];
+#endif
+                }
+            }
+        }
+    }
+#else
     // Leave accumulator units (final per-row scale) and add the zero-point
     // term, both gathered from the lane owning row 8*kg+j.
     float s_fin[8];
@@ -333,4 +542,5 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
             }
         }
     }
+#endif
 }
