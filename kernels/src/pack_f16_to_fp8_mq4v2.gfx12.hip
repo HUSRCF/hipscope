@@ -166,3 +166,99 @@ void pack_f16_to_fp8_mq4v2_gfx12(
         }
     }
 }
+
+// F32-input variant of the pre-pass above: same ABI except `const float* X`,
+// same grid/block/LDS/geometry, same scale_mode contract, same rounding
+// instruction (`__builtin_amdgcn_cvt_pk_fp8_f32`, round-to-nearest-even).
+//
+// Rounding note: the F16 path casts F32->F16 on the host side
+// (`convert_f32_to_f16`, one rn rounding) and this TU casts F16->F32 on load
+// (exact) before the e4m3 cvt (second rn rounding) — two roundings. This
+// variant rounds F32->E4M3 once, directly. Outputs are therefore identical
+// except possibly in the last E4M3 ulp for values near a rounding boundary.
+// That is expected and accepted; quality is covered by the WT2 KLD gate.
+extern "C" __launch_bounds__(64, 1) __global__
+void pack_f32_to_fp8_mq4v2_gfx12(
+    const float* x_f32,          // [N,K]
+    unsigned char* x_fp8,        // [N,K], E4M3 bytes
+    float* half_sums,            // [N,K/256,2]
+    float* row_scales,           // [N]
+    int K,
+    int N,
+    int scale_mode)             // 0=unit, 1=pow2-to-224
+{
+    // 8 B static LDS: two wave maxima, then republished a_n in slot 0.
+    __shared__ float smem[2];
+
+    const int n = (int)blockIdx.x;
+    if (n >= N || K <= 0) return;
+
+    const int tid = (int)threadIdx.x;
+    const int lane = tid & 31;
+    const int wave = tid >> 5; // 0 or 1
+    const int gpr = K >> 8;    // K / 256
+
+    const float* x_row = x_f32 + (long long)n * K;
+    unsigned char* out_row = x_fp8 + (long long)n * K;
+
+    float a_n = 1.0f;
+
+    if (scale_mode == 1) {
+        // 1) Strided F32 absmax over the full row (64-thread stride).
+        float local_max = 0.0f;
+        for (int k = tid; k < K; k += 64) {
+            const float v = x_row[k];
+            local_max = fmaxf(local_max, fabsf(v));
+        }
+        // 2) Per-wave reduce; lane 0 of each wave writes one LDS float.
+        local_max = mq4v2_wave_max(local_max);
+        if (lane == 0)
+            smem[wave] = local_max;
+        __syncthreads();
+        // Wave 0 resolves a_n and publishes it; all threads re-read.
+        if (wave == 0 && lane == 0) {
+            const float amax = fmaxf(smem[0], smem[1]);
+            a_n = mq4v2_row_scale_from_absmax(amax);
+            smem[0] = a_n;
+            row_scales[n] = a_n;
+        }
+        __syncthreads();
+        a_n = smem[0];
+    } else {
+        // scale_mode == 0: unit scale, no absmax scan / barrier.
+        if (tid == 0)
+            row_scales[n] = 1.0f;
+        a_n = 1.0f;
+    }
+
+    const float inv_a = 1.0f / a_n;
+
+    // 3) Pack each 256-K group: wave h owns half h of 128 K.
+    //    Lane L owns four consecutive F32 at half_base + 4*L.
+    for (int g = 0; g < gpr; g++) {
+        const int half_base = g * 256 + wave * 128;
+        const int k0 = half_base + lane * 4;
+
+        const float v0 = x_row[k0 + 0] * inv_a;
+        const float v1 = x_row[k0 + 1] * inv_a;
+        const float v2 = x_row[k0 + 2] * inv_a;
+        const float v3 = x_row[k0 + 3] * inv_a;
+
+        unsigned int pack = 0u;
+        pack = __builtin_amdgcn_cvt_pk_fp8_f32(v0, v1, pack, false);
+        pack = __builtin_amdgcn_cvt_pk_fp8_f32(v2, v3, pack, true);
+        *reinterpret_cast<unsigned int*>(out_row + k0) = pack;
+
+        // Half sum from DECODED emitted bytes (operand-exact for WMMA path).
+        const float s0 = mq4v2_e4m3_to_f32((unsigned char)(pack & 0xFFu));
+        const float s1 = mq4v2_e4m3_to_f32((unsigned char)((pack >> 8) & 0xFFu));
+        const float s2 = mq4v2_e4m3_to_f32((unsigned char)((pack >> 16) & 0xFFu));
+        const float s3 = mq4v2_e4m3_to_f32((unsigned char)((pack >> 24) & 0xFFu));
+        float half_sum = mq4v2_wave_sum(s0 + s1 + s2 + s3);
+
+        if (lane == 0) {
+            // half_sums[(n * gpr + g) * 2 + h], h == wave
+            half_sums[((long long)n * gpr + g) * 2 + wave] = half_sum;
+        }
+    }
+}

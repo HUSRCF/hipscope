@@ -841,15 +841,71 @@ impl ScratchState {
         k: usize,
         scale_mode: i32,
     ) -> HipResult<Mq4v2Fp8Prepared> {
-        compile_and_load_kernel(
-            compiler,
-            hip,
-            modules,
-            functions,
+        self.prepare_mq4v2_fp8_x_impl(
+            hip, compiler, modules, functions, stream, capture_blobs, capture_mode,
+            force_blob_path, replay,
             "pack_f16_to_fp8_mq4v2_gfx12",
             kernels::PACK_F16_TO_FP8_MQ4V2_GFX12_SRC,
             "pack_f16_to_fp8_mq4v2_gfx12",
-        )?;
+            x_f16, n, k, scale_mode,
+        )
+    }
+
+    /// F32-input MQ4v2 FP8 pre-pass: same outputs/geometry as
+    /// [`Self::prepare_mq4v2_fp8_x`] but packs F32 `x` directly, skipping the
+    /// `convert_f32_to_f16` hop. Single F32->E4M3 rounding instead of the
+    /// F16 path's double rounding — last-ulp differences accepted (see the
+    /// kernel comment; quality covered by the WT2 KLD gate).
+    pub(crate) fn prepare_mq4v2_fp8_x_f32(
+        &mut self,
+        hip: &HipRuntime,
+        compiler: &mut crate::compiler::KernelCompiler,
+        modules: &mut HashMap<String, Module>,
+        functions: &mut HashMap<String, Function>,
+        stream: Option<&Stream>,
+        capture_blobs: &mut Vec<Vec<u8>>,
+        capture_mode: bool,
+        force_blob_path: bool,
+        replay: &mut crate::replay::ReplayController,
+        x_f32: *mut c_void,
+        n: usize,
+        k: usize,
+        scale_mode: i32,
+    ) -> HipResult<Mq4v2Fp8Prepared> {
+        self.prepare_mq4v2_fp8_x_impl(
+            hip, compiler, modules, functions, stream, capture_blobs, capture_mode,
+            force_blob_path, replay,
+            "pack_f32_to_fp8_mq4v2_gfx12",
+            kernels::PACK_F32_TO_FP8_MQ4V2_GFX12_SRC,
+            "pack_f32_to_fp8_mq4v2_gfx12",
+            x_f32, n, k, scale_mode,
+        )
+    }
+
+    /// Shared pre-pass body behind [`Self::prepare_mq4v2_fp8_x`] (F16 input)
+    /// and [`Self::prepare_mq4v2_fp8_x_f32`] (F32 input). `module`/`symbol`
+    /// select the pack entry; `x_ptr` is that entry's input pointer.
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_mq4v2_fp8_x_impl(
+        &mut self,
+        hip: &HipRuntime,
+        compiler: &mut crate::compiler::KernelCompiler,
+        modules: &mut HashMap<String, Module>,
+        functions: &mut HashMap<String, Function>,
+        stream: Option<&Stream>,
+        capture_blobs: &mut Vec<Vec<u8>>,
+        capture_mode: bool,
+        force_blob_path: bool,
+        replay: &mut crate::replay::ReplayController,
+        module: &str,
+        ksrc: &str,
+        symbol: &str,
+        x_ptr: *mut c_void,
+        n: usize,
+        k: usize,
+        scale_mode: i32,
+    ) -> HipResult<Mq4v2Fp8Prepared> {
+        compile_and_load_kernel(compiler, hip, modules, functions, module, ksrc, symbol)?;
 
         let x_fp8_bytes = n.checked_mul(k).expect("mq4v2 fp8 x extent overflow");
         let groups = k / 256;
@@ -885,7 +941,7 @@ impl ScratchState {
         let out_x = self.mq4v2_fp8_x_scratch.as_ref().unwrap().as_ptr();
         let out_sums = self.mq4v2_fp8_half_sums_scratch.as_ref().unwrap().as_ptr();
         let out_scales = self.mq4v2_fp8_row_scales_scratch.as_ref().unwrap().as_ptr();
-        let mut in_ptr_m = x_f16;
+        let mut in_ptr_m = x_ptr;
         let mut out_x_m = out_x;
         let mut out_sums_m = out_sums;
         let mut out_scales_m = out_scales;
@@ -910,14 +966,14 @@ impl ScratchState {
             capture_mode,
             force_blob_path,
             Some(replay),
-            "pack_f16_to_fp8_mq4v2_gfx12",
+            symbol,
             [n as u32, 1, 1],
             [64, 1, 1],
             0,
             &mut params,
             || {
                 let mut b = KernargBlob::new();
-                b.push_ptr(x_f16);
+                b.push_ptr(x_ptr);
                 b.push_ptr(out_x);
                 b.push_ptr(out_sums);
                 b.push_ptr(out_scales);

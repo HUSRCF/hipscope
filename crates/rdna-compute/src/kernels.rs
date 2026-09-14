@@ -3732,6 +3732,12 @@ pub const PACK_F32_TO_FP8_GFX12_SRC: &str =
     include_str!("../../../kernels/src/pack_f32_to_fp8.gfx12.hip");
 pub const PACK_F16_TO_FP8_MQ4V2_GFX12_SRC: &str =
     include_str!("../../../kernels/src/pack_f16_to_fp8_mq4v2.gfx12.hip");
+// F32-input MQ4v2 FP8 pre-pass entry (`pack_f32_to_fp8_mq4v2_gfx12`) living in
+// the same TU as PACK_F16_TO_FP8_MQ4V2_GFX12_SRC. Skips the F32->F16 hop for
+// F32 producers; single F32->E4M3 rounding (see the kernel comment for the
+// accepted last-ulp note).
+pub const PACK_F32_TO_FP8_MQ4V2_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/pack_f16_to_fp8_mq4v2.gfx12.hip");
 // Fused MagnumQuant FWHT rotation + FP8 (E4M3) pack — gfx12 only.
 // Writes both F32 (for legacy consumers) and FP8 outputs in one launch.
 // Replaces the standalone mq_rotate_x + pack_f32_to_fp8 sequence on the
