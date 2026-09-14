@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (c) 2026 Nick Woolmer
-// Copyright (c) 2026 HUSRCF
+// Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 //
 // gfx1201-only GQA-fused FA2 prefill attention (research opt-in).
@@ -29,10 +28,9 @@
 //     Each lane owns one query row; the other key half sits in lane ml^16,
 //     combined with one shfl_xor(16). m, l, alpha are per-lane scalars.
 //   PV computes O^T = V^T*P^T: A = V^T fragment (row ml = dim 0..15 of the
-//     dc tile), B = the packed P half8, Ofr[dc][j] = O[query][dim].
-//     The P half8 from softmax feeds PV directly: zero shuffles.
-//   O rescale/normalization fetch per-query alpha/l from the owner lane
-//     (8 shuffles per subtile / 8 once in the epilogue).
+//     dc tile), B = the packed P half8, Ofr[dc][j] = O[query=ml][dim].
+//     O rows are the lane's OWN softmax query, so rescale/normalization
+//     use the lane's own alpha/l scalars: zero shuffles anywhere.
 //
 // LDS swizzle (f16 pairs as dwords, S(c) = 8*(c>>2) + (c&3)):
 //   K store/read: dword pair p for key k at K[k][(p + S(k&15)) & 127].
@@ -330,15 +328,11 @@ __device__ __forceinline__ void fa2_gqa_body(
                 sum += __shfl_xor(sum, 16, 32);
                 l_val = l_val * alpha + sum;
 
-                // O rescale with per-query alpha fetched from the owner
-                // lane (ml=q, kg=0), i.e. lane 8*kg+j for O-query 8*kg+j.
+                // O rescale with the lane's OWN alpha: Ofr rows are the
+                // lane's own softmax query (O[query=ml][dim]).
 #pragma unroll
-                for (int j = 0; j < 8; ++j) {
-                    const float a_j = __shfl(alpha, 8 * kg + j, 32);
-#pragma unroll
-                    for (int dc = 0; dc < 16; ++dc)
-                        Ofr[dc][j] *= a_j;
-                }
+                for (int dc = 0; dc < 16; ++dc)
+                    Ofr[dc] *= alpha;
 
                 // PV as O^T = V^T*P^T: A = V^T fragment (row ml = dim of
                 // the dc tile), B = prow. Ofr[dc][j] = O[query][dim].
@@ -369,31 +363,27 @@ __device__ __forceinline__ void fa2_gqa_body(
     }
 
     // ---- Transition 4: completion ----
-    // Ofr[dc][j] at lane (ml,kg) = O[query=8*kg+j][dim=dc*16+ml].
+    // Ofr[dc][j] at lane (ml,kg) = O[query=ml][dim=dc*16+8*kg+j]: own
+    // query rows, 8 consecutive dims per dc. Own l_val normalizes.
     if (compute) {
         if (!PARTIAL) {
+            if (qok_ml) {
+                const float inv = l_val > 0.0f ? 1.0f / l_val : 0.0f;
+                // 32-bit row base (whole O tensor < 10 MiB).
+                const unsigned bo =
+                    (unsigned)qr_ml * 6144u + (unsigned)h_ml * 256u;
 #pragma unroll
-            for (int j = 0; j < 8; ++j) {
-                const int qf2 = 8 * kg + j;
-                const int qr = q_base + (qf2 & 7);
-                if (qr < batch_size) {
-                    const int h = 6 * kv_h + (wave << 1) + (qf2 >> 3);
-                    // Owner lane (ml=qf2, kg=0) holds this query's l.
-                    const float lq = __shfl(l_val, qf2, 32);
-                    const float inv = lq > 0.0f ? 1.0f / lq : 0.0f;
-                    // 32-bit row base (whole O tensor < 10 MiB), hoisted
-                    // out of the dc loop so the unrolled stores share it.
-                    const unsigned bo =
-                        (unsigned)qr * 6144u + (unsigned)h * 256u;
+                for (int dc = 0; dc < 16; ++dc) {
+                    const unsigned bd = bo + (unsigned)(dc * 16 + kg * 8);
 #pragma unroll
-                    for (int dc = 0; dc < 16; ++dc) {
-                        out[bo + (unsigned)(dc * 16 + ml)] =
-                            Ofr[dc][j] * inv;
-                    }
+                    for (int j = 0; j < 8; ++j)
+                        out[bd + (unsigned)j] = Ofr[dc][j] * inv;
                 }
             }
         } else {
-            // m/l owner per query is lane (ml=query, kg=0).
+            // Caller-owned partial records: [m, l, O_unnormalized[256]],
+            // stride 258, layout [((qr*H + h)*S + split)]. Every lane owns
+            // its query ml; lanes (ml, 0) write m/l once.
             if (kg == 0) {
                 if (qok_ml) {
                     // 32-bit record base (partials < 64 MiB even at S=8).
@@ -406,20 +396,20 @@ __device__ __forceinline__ void fa2_gqa_body(
                     rec[1] = l_val;
                 }
             }
-#pragma unroll
-            for (int j = 0; j < 8; ++j) {
-                const int qf2 = 8 * kg + j;
-                const int qr = q_base + (qf2 & 7);
-                if (qr < batch_size) {
-                    const int h = 6 * kv_h + (wave << 1) + (qf2 >> 3);
-                    const unsigned rb =
-                        (((unsigned)qr * 24u + (unsigned)h)
-                             * (unsigned)n_splits + (unsigned)split)
+            if (qok_ml) {
+                const unsigned rb =
+                    (((unsigned)qr_ml * 24u + (unsigned)h_ml)
+                         * (unsigned)n_splits + (unsigned)split)
                         * 258u;
-                    float* rec = out + rb;
+                float* rec = out + rb;
+                // j-outer/dc-inner, matching the direct epilogue's proven
+                // structure: j selects this lane's 8 dims per chunk.
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const unsigned rj = rb + 2u + (unsigned)(kg * 8 + j);
 #pragma unroll
                     for (int dc = 0; dc < 16; ++dc)
-                        rec[2 + dc * 16 + ml] = Ofr[dc][j];
+                        rec[rj + (unsigned)(dc * 16)] = Ofr[dc][j];
                 }
             }
         }
