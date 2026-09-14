@@ -9395,8 +9395,9 @@ impl Gpu {
             ));
         }
         let prepared = self.prepare_mq4v2_fp8_x(x, batch_size, k, scale_mode)?;
-        // Two-slab S2BT8 form, developer-only (see gate_up launcher).
-        let slabs2 = hipfire_config::developer_var("HIPFIRE_GFX12_MQ4V2_FP8_SLABS").as_deref() == Ok("2")
+        // Two-slab S2BT8 form by default; `HIPFIRE_GFX12_MQ4V2_FP8_SLABS=1`
+        // selects the single-slab symbols (see gate_up launcher).
+        let slabs2 = hipfire_config::developer_var("HIPFIRE_GFX12_MQ4V2_FP8_SLABS").as_deref() != Ok("1")
             && batch_size % 128 == 0;
         let (func_name, ksrc, bv): (&str, &str, usize) = if slabs2 {
             (
@@ -9534,8 +9535,9 @@ impl Gpu {
             ));
         }
         let prepared = self.prepare_mq4v2_fp8_x(x, batch_size, k, scale_mode)?;
-        // Two-slab S2BT8 form, developer-only (see gate_up launcher).
-        let slabs2 = hipfire_config::developer_var("HIPFIRE_GFX12_MQ4V2_FP8_SLABS").as_deref() == Ok("2")
+        // Two-slab S2BT8 form by default; `HIPFIRE_GFX12_MQ4V2_FP8_SLABS=1`
+        // selects the single-slab symbols (see gate_up launcher).
+        let slabs2 = hipfire_config::developer_var("HIPFIRE_GFX12_MQ4V2_FP8_SLABS").as_deref() != Ok("1")
             && batch_size % 128 == 0;
         let (func_name, ksrc, bv): (&str, &str, usize) = if slabs2 {
             (
@@ -28901,9 +28903,10 @@ impl Gpu {
                 "gemm_gate_up_mq4g256v2_wmma_fp8_gfx12_bt12: prepared (n,k) mismatch",
             ));
         }
-        // Two-slab S2BT8 form (developer-only `HIPFIRE_GFX12_MQ4V2_FP8_SLABS=2`):
-        // each wave covers 32 rows, halving the row grid. One env read per call.
-        let slabs2 = hipfire_config::developer_var("HIPFIRE_GFX12_MQ4V2_FP8_SLABS").as_deref() == Ok("2")
+        // Two-slab S2BT8 form by default (`HIPFIRE_GFX12_MQ4V2_FP8_SLABS=1`
+        // selects the single-slab symbols): each wave covers 32 rows, halving
+        // the row grid. One env read per call.
+        let slabs2 = hipfire_config::developer_var("HIPFIRE_GFX12_MQ4V2_FP8_SLABS").as_deref() != Ok("1")
             && batch_size % 128 == 0;
         // Batch tile by N, mirroring the F16 incumbent's selector.
         let (func_name, ksrc, bv): (&str, &str, usize) = if slabs2 {
@@ -29499,8 +29502,9 @@ impl Gpu {
             ));
         }
         let prepared = self.prepare_mq4v2_fp8_x(x, batch_size, k, scale_mode)?;
-        // Two-slab S2BT8 form, developer-only (see gate_up launcher).
-        let slabs2 = hipfire_config::developer_var("HIPFIRE_GFX12_MQ4V2_FP8_SLABS").as_deref() == Ok("2")
+        // Two-slab S2BT8 form by default; `HIPFIRE_GFX12_MQ4V2_FP8_SLABS=1`
+        // selects the single-slab symbols (see gate_up launcher).
+        let slabs2 = hipfire_config::developer_var("HIPFIRE_GFX12_MQ4V2_FP8_SLABS").as_deref() != Ok("1")
             && batch_size % 128 == 0;
         let (func_name, ksrc, bv): (&str, &str, usize) = if slabs2 {
             (

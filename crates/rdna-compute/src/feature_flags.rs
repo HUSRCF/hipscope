@@ -197,14 +197,18 @@ pub struct FeatureFlags {
     /// exact-gfx1100-only. Capture/replay keep the historical base. Set
     /// `HIPFIRE_GATEUP_LDSSTAGE=0` to restore the historical base symbol/block32.
     pub gate_up_ldsstage: bool,
-    /// `HIPFIRE_GFX12_MQ4V2_FP8_GATEUP=1` admits the gfx1201 FP8-WMMA MQ4v2
-    /// gate_up prefill candidate (N=384, eager HIP only). Default OFF.
+    /// `HIPFIRE_GFX12_MQ4V2_FP8_GATEUP=0` opts out of the gfx1201 FP8-WMMA MQ4v2
+    /// gate_up prefill candidate (N=384, eager HIP only). Default ON on exact
+    /// gfx1201; `=1` forces it on other arches (launchers stay gfx1201-only).
     pub gfx12_mq4v2_fp8_gateup: bool,
-    /// FP8-WMMA MQ4v2 residual (down/out-proj) prefill candidate. Default OFF.
+    /// FP8-WMMA MQ4v2 residual (down/out-proj) prefill candidate. Default ON on
+    /// exact gfx1201; `=0` opts out.
     pub gfx12_mq4v2_fp8_resid: bool,
-    /// FP8-WMMA MQ4v2 4-way QKVZA prefill candidate. Default OFF.
+    /// FP8-WMMA MQ4v2 4-way QKVZA prefill candidate. Default ON on exact
+    /// gfx1201; `=0` opts out.
     pub gfx12_mq4v2_fp8_qkvza: bool,
-    /// FP8-WMMA MQ4v2 3-way QKV (full-attention) prefill candidate. Default OFF.
+    /// FP8-WMMA MQ4v2 3-way QKV (full-attention) prefill candidate. Default ON
+    /// on exact gfx1201; `=0` opts out.
     pub gfx12_mq4v2_fp8_qkv: bool,
     pub gemm_dump: bool,
     pub deterministic: bool,
@@ -557,10 +561,14 @@ impl FeatureFlags {
             residual_ksplit_off: value("HIPFIRE_RESIDUAL_KSPLIT_OFF").ok().as_deref() == Some("1"),
             residual_ldsstage: parse_bool("HIPFIRE_RESIDUAL_LDSSTAGE").unwrap_or(arch == "gfx1100"),
             gate_up_ldsstage: parse_bool("HIPFIRE_GATEUP_LDSSTAGE").unwrap_or(arch == "gfx1100"),
-            gfx12_mq4v2_fp8_gateup: value("HIPFIRE_GFX12_MQ4V2_FP8_GATEUP").as_deref() == Ok("1"),
-            gfx12_mq4v2_fp8_resid: value("HIPFIRE_GFX12_MQ4V2_FP8_RESID").as_deref() == Ok("1"),
-            gfx12_mq4v2_fp8_qkvza: value("HIPFIRE_GFX12_MQ4V2_FP8_QKVZA").as_deref() == Ok("1"),
-            gfx12_mq4v2_fp8_qkv: value("HIPFIRE_GFX12_MQ4V2_FP8_QKV").as_deref() == Ok("1"),
+            gfx12_mq4v2_fp8_gateup: parse_bool("HIPFIRE_GFX12_MQ4V2_FP8_GATEUP")
+                .unwrap_or(arch == "gfx1201"),
+            gfx12_mq4v2_fp8_resid: parse_bool("HIPFIRE_GFX12_MQ4V2_FP8_RESID")
+                .unwrap_or(arch == "gfx1201"),
+            gfx12_mq4v2_fp8_qkvza: parse_bool("HIPFIRE_GFX12_MQ4V2_FP8_QKVZA")
+                .unwrap_or(arch == "gfx1201"),
+            gfx12_mq4v2_fp8_qkv: parse_bool("HIPFIRE_GFX12_MQ4V2_FP8_QKV")
+                .unwrap_or(arch == "gfx1201"),
             gemm_dump: value("HIPFIRE_GEMM_DUMP").ok().as_deref() == Some("1"),
             deterministic: value("HIPFIRE_DETERMINISTIC").ok().as_deref() == Some("1"),
             mw16: value("HIPFIRE_MW16").map_or(false, |v| v == "1"),
@@ -891,6 +899,49 @@ mod tests {
     fn fuse_qkv_bias_defaults_on_in_test_ctor() {
         let f = FeatureFlags::for_test("gfx1151");
         assert!(f.fuse_qkv_bias);
+    }
+
+    #[test]
+    fn gfx12_mq4v2_fp8_defaults_on_gfx1201_with_opt_out() {
+        // Default process policy: all four FP8 prefill flags admit on exact
+        // gfx1201 (chunk-512 path); explicit `=0` restores the F16 route.
+        let resolved = resolve([]).unwrap();
+        let process = ProcessConfig::from_resolved(&resolved).unwrap();
+        let gfx1201 = FeatureFlags::from_process_config("gfx1201", &process);
+        assert!(gfx1201.gfx12_mq4v2_fp8_gateup);
+        assert!(gfx1201.gfx12_mq4v2_fp8_resid);
+        assert!(gfx1201.gfx12_mq4v2_fp8_qkvza);
+        assert!(gfx1201.gfx12_mq4v2_fp8_qkv);
+
+        let mut layer = ConfigLayer::default();
+        for key in [
+            "kernel.gfx12_mq4v2_fp8_gateup",
+            "kernel.gfx12_mq4v2_fp8_resid",
+            "kernel.gfx12_mq4v2_fp8_qkvza",
+            "kernel.gfx12_mq4v2_fp8_qkv",
+        ] {
+            layer.set_cli(key, "false").unwrap();
+        }
+        let resolved = resolve([NamedLayer {
+            source: ConfigSource::GlobalUser {
+                path: "config.toml".into(),
+            },
+            layer,
+        }])
+        .unwrap();
+        let process = ProcessConfig::from_resolved(&resolved).unwrap();
+        let opted_out = FeatureFlags::from_process_config("gfx1201", &process);
+        assert!(!opted_out.gfx12_mq4v2_fp8_gateup);
+        assert!(!opted_out.gfx12_mq4v2_fp8_resid);
+        assert!(!opted_out.gfx12_mq4v2_fp8_qkvza);
+        assert!(!opted_out.gfx12_mq4v2_fp8_qkv);
+
+        // The unit-test constructor stays fully off (deterministic baseline).
+        let test_flags = FeatureFlags::for_test("gfx1201");
+        assert!(!test_flags.gfx12_mq4v2_fp8_gateup);
+        assert!(!test_flags.gfx12_mq4v2_fp8_resid);
+        assert!(!test_flags.gfx12_mq4v2_fp8_qkvza);
+        assert!(!test_flags.gfx12_mq4v2_fp8_qkv);
     }
 
     #[test]

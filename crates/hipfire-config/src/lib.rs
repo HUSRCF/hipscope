@@ -2088,10 +2088,37 @@ pub static FIELDS: &[ConfigField] = &[
         "kernel.gfx12_mq4v2_fp8_gateup",
         "gfx12_mq4v2_fp8_gateup",
         Kernel,
-        false,
         true,
+        false,
         "HIPFIRE_GFX12_MQ4V2_FP8_GATEUP",
-        "Enable the experimental gfx1201 MQ4v2 FP8 WMMA gate/up prefill route."
+        "Enable the gfx1201 MQ4v2 FP8 WMMA gate/up prefill route (default on exact gfx1201; set to false or HIPFIRE_GFX12_MQ4V2_FP8_GATEUP=0 to opt out)."
+    ),
+    process_bool_field!(
+        "kernel.gfx12_mq4v2_fp8_resid",
+        "gfx12_mq4v2_fp8_resid",
+        Kernel,
+        true,
+        false,
+        "HIPFIRE_GFX12_MQ4V2_FP8_RESID",
+        "Enable the gfx1201 MQ4v2 FP8 WMMA residual prefill route (default on exact gfx1201; set to false or HIPFIRE_GFX12_MQ4V2_FP8_RESID=0 to opt out)."
+    ),
+    process_bool_field!(
+        "kernel.gfx12_mq4v2_fp8_qkvza",
+        "gfx12_mq4v2_fp8_qkvza",
+        Kernel,
+        true,
+        false,
+        "HIPFIRE_GFX12_MQ4V2_FP8_QKVZA",
+        "Enable the gfx1201 MQ4v2 FP8 WMMA 4-way QKVZA prefill route (default on exact gfx1201; set to false or HIPFIRE_GFX12_MQ4V2_FP8_QKVZA=0 to opt out)."
+    ),
+    process_bool_field!(
+        "kernel.gfx12_mq4v2_fp8_qkv",
+        "gfx12_mq4v2_fp8_qkv",
+        Kernel,
+        true,
+        false,
+        "HIPFIRE_GFX12_MQ4V2_FP8_QKV",
+        "Enable the gfx1201 MQ4v2 FP8 WMMA 3-way QKV prefill route (default on exact gfx1201; set to false or HIPFIRE_GFX12_MQ4V2_FP8_QKV=0 to opt out)."
     ),
     process_bool_field!(
         "kernel.dot2_gemv",

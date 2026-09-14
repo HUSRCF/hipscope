@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- gfx1201 FP8-WMMA MQ4v2 prefill is now the default (opt-out): `HIPFIRE_GFX12_MQ4V2_FP8_{GATEUP,RESID,QKVZA,QKV}` default ON on exact gfx1201 (`=0` on any one restores the F16 route), the two-slab S2BT8 symbols are the default (`HIPFIRE_GFX12_MQ4V2_FP8_SLABS=1` selects single-slab), and the admitted path sizes the prefill chunk at 512 instead of 384. Measured on Qwen3.8-27B XT (`qwen3.8-27b.mq4-xt`, GPU 0): pp512 1387 vs 841 tok/s opt-out, pp2048 1218 vs 812 tok/s, tg1@128 unchanged (~36.5 tok/s). Quality delta is nil on the evidence run: greedy (`-t 0 -n 1200`, `benchmarks/prompts/humaneval_3_below_zero.txt`) is byte-identical between the default FP8 path and the all-flags-`=0` F16 path, and the serve battery reports 5/5 coherent turns (runaway=0 empty=0 attractor=0).
+
 ## v0.3.1 — DFlash cache repair, admission hardening, image gen
 
 - Sealed MoE execution contracts (#755, fivetide; G5 constituent): manifest-derived expert plans bound transactionally to Qwen3.6-A3B / Ornith and Cohere MoE decode and prefill; raw MoE escape hatches removed; rank-local sealed EP with root-authoritative routes and owned reduction leases, verified on 4× R9700. EP cross-route logit equivalence is diagnostic, not an acceptance gate — G5 acceptance and PM4 admission remain open on #666.
