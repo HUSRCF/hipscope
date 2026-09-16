@@ -9557,12 +9557,23 @@ fn fa_pertoken_min_ctx_for(arch: &str, explicit: Option<usize>) -> Option<usize>
     }
 }
 
+/// Smallest attend block the single-GPU chunk path hands the multi-row tile.
+/// The tile runs 2..=3 rows as one masked ROWS=4 group, which is not
+/// bit-identical to the batched kernel (rel ~4e-7) and is unmeasured on
+/// gfx1201, so only dense TP admits them (its MTP verify blocks are 2..=3
+/// rows).
+pub(crate) const Q8_MULTIROW_MIN_ROWS: usize = 4;
+/// Dense-TP floor (MTP verify, #769): measured on gfx1100 at 33k against the
+/// batched tile, 1.26x at 2 rows and 1.59x at 3.
+pub(crate) const Q8_MULTIROW_MIN_ROWS_DENSE_TP: usize = 2;
+
 #[allow(clippy::too_many_arguments)]
-fn q8_multirow_attn_admitted(
+pub(crate) fn q8_multirow_attn_admitted(
     arch: &str,
     quant_q8: bool,
     head_dim: usize,
     n: usize,
+    min_rows: usize,
     logical_ctx: usize,
     min_ctx: Option<usize>,
     is_tree: bool,
@@ -9573,7 +9584,7 @@ fn q8_multirow_attn_admitted(
     matches!(arch, "gfx1100" | "gfx1151" | "gfx1201")
         && quant_q8
         && matches!(head_dim, 128 | 256)
-        && (4..=32).contains(&n)
+        && (min_rows..=32).contains(&n)
         && min_ctx.is_some_and(|threshold| logical_ctx > threshold)
         && !is_tree
         && !is_independent
@@ -12813,6 +12824,7 @@ fn forward_prefill_chunk_pair(
             multirow_common.1,
             multirow_common.2,
             n,
+            Q8_MULTIROW_MIN_ROWS,
             max_ctx,
             multirow_common.3,
             false,
@@ -13447,6 +13459,7 @@ pub(crate) fn forward_batch_chunk_impl(
         kv_cache.quant_q8,
         config.head_dim,
         n,
+        Q8_MULTIROW_MIN_ROWS,
         start_pos + n,
         fa_pertoken_min_ctx(gpu.arch_caps.arch()),
         tree_verify.is_some(),
@@ -14405,6 +14418,7 @@ mod tests {
                         true,
                         head_dim,
                         n,
+                        Q8_MULTIROW_MIN_ROWS,
                         4097,
                         Some(4096),
                         false,
@@ -14414,6 +14428,26 @@ mod tests {
                     ));
                 }
             }
+        }
+    }
+
+    #[test]
+    fn q8_multirow_attn_two_and_three_rows_are_dense_tp_only() {
+        let admitted = |n, min_rows| {
+            q8_multirow_attn_admitted(
+                "gfx1201", true, 256, n, min_rows, 8192, Some(4096), false, false, false, false,
+            )
+        };
+        for n in [2, 3] {
+            assert!(!admitted(n, Q8_MULTIROW_MIN_ROWS), "single-GPU n={n}");
+            assert!(admitted(n, Q8_MULTIROW_MIN_ROWS_DENSE_TP), "dense TP n={n}");
+        }
+        for n in [4, 8, 32] {
+            assert!(admitted(n, Q8_MULTIROW_MIN_ROWS));
+            assert!(admitted(n, Q8_MULTIROW_MIN_ROWS_DENSE_TP));
+        }
+        for n in [0, 1, 33] {
+            assert!(!admitted(n, Q8_MULTIROW_MIN_ROWS_DENSE_TP));
         }
     }
 
@@ -14434,6 +14468,7 @@ mod tests {
                 quant_q8,
                 head_dim,
                 n,
+                Q8_MULTIROW_MIN_ROWS,
                 logical_ctx,
                 min_ctx,
                 is_tree,
@@ -14480,7 +14515,7 @@ mod tests {
                 false,
             ));
         }
-        for n in [1, 3, 33] {
+        for n in [0, 1, 2, 3, 33, 64] {
             assert!(!admitted(
                 "gfx1100",
                 true,
@@ -14551,10 +14586,10 @@ mod tests {
     fn q8_multirow_attn_rejects_replay_recording_on_supported_arches() {
         for arch in ["gfx1100", "gfx1151", "gfx1201"] {
             assert!(q8_multirow_attn_admitted(
-                arch, true, 256, 8, 8192, Some(4096), false, false, false, false,
+                arch, true, 256, 8, 4, 8192, Some(4096), false, false, false, false,
             ));
             assert!(!q8_multirow_attn_admitted(
-                arch, true, 256, 8, 8192, Some(4096), false, false, false, true,
+                arch, true, 256, 8, 4, 8192, Some(4096), false, false, false, true,
             ));
         }
     }

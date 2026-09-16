@@ -117,6 +117,7 @@ pub trait Carrier: Send + Sync {
     fn spec_target_guard<'m>(
         &self,
         _state: &'m mut Option<Box<dyn hipfire_runtime::arch_model::ArchModel>>,
+        _ep: &'m mut Option<EpState>,
         _model_path: &str,
     ) -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
         Err(format!("{}: spec-decode target unsupported", self.name()))
@@ -1890,6 +1891,67 @@ fn build_qwen35_eviction(
     }
 }
 
+/// Bundled `.mq4-mtp` trailer first, then the sidecar (`sidecar`, else the
+/// trunk's sibling `.mtp`). A head whose hidden size or vocab differs from the
+/// trunk is refused before upload. Returns the head, or the errors explaining
+/// why none loaded (empty when no head exists); the caller decides whether a
+/// missing head is fatal (`mtp=on`) or an AR fallback. `device` names the
+/// device in the log line when the head does not live on the daemon's own GPU.
+fn resolve_qwen35_mtp_head(
+    trunk_path: &Path,
+    sidecar: Option<std::path::PathBuf>,
+    (trunk_dim, trunk_vocab): (usize, usize),
+    gpu: &mut rdna_compute::Gpu,
+    physical_cap: usize,
+    device: Option<&str>,
+) -> (Option<hipfire_arch_qwen35::mtp_head::Qwen35MtpHead>, Vec<String>) {
+    use hipfire_arch_qwen35::mtp_head;
+    let tag = device.map(|d| format!(", {d}")).unwrap_or_default();
+    let sidecar = sidecar.unwrap_or_else(|| trunk_path.with_extension("mtp"));
+    let mut load = |path: &Path, offset: u64| {
+        mtp_head::check_mtp_head_for_trunk(path, offset, trunk_dim, trunk_vocab)?;
+        mtp_head::load_mtp_head_at_offset(path, gpu, physical_cap, offset)
+            .map_err(|e| format!("{}: load failed: {e}", path.display()))
+    };
+    let mut head_opt: Option<mtp_head::Qwen35MtpHead> = None;
+    let mut errors: Vec<String> = Vec::new();
+    match mtp_head::detect_bundled_mtp_offset(trunk_path) {
+        Ok(Some(offset)) => match load(trunk_path, offset) {
+            Ok(h) => {
+                eprintln!(
+                    "  MTP head loaded (bundled .mq4-mtp{tag}): n_embd={} vocab={}",
+                    h.config.n_embd, h.config.vocab_size
+                );
+                head_opt = Some(h);
+            }
+            Err(e) => errors.push(format!("bundled trailer: {e}")),
+        },
+        Ok(None) => {}
+        Err(e) => errors.push(format!("bundled trailer unreadable: {e}")),
+    }
+    if head_opt.is_none() && sidecar.exists() {
+        match load(&sidecar, 0) {
+            Ok(h) => {
+                let after = if errors.is_empty() {
+                    ""
+                } else {
+                    " after bundled error"
+                };
+                eprintln!(
+                    "  MTP head loaded (sidecar {}{after}{tag}): n_embd={} vocab={}",
+                    sidecar.display(),
+                    h.config.n_embd,
+                    h.config.vocab_size
+                );
+                head_opt = Some(h);
+                errors.clear();
+            }
+            Err(e) => errors.push(format!("sidecar {e}")),
+        }
+    }
+    (head_opt, errors)
+}
+
 /// Build a `LoadedModel` from a carrier `Bundle`, shared fields, and
 /// eviction/DFlash state. This is the common body for qwen35 dispatch
 /// where eviction and DFlash need per-arch type info.
@@ -2115,58 +2177,17 @@ fn finish_qwen35_load(
     {
         None
     } else {
-        use hipfire_arch_qwen35::mtp_head;
-        let trunk_path = Path::new(ctx.path);
         // `ctx.path` is canonical, so a sidecar beside a symlinked trunk is not
         // its sibling; the CLI resolves that case into `ctx.mtp_path`. Direct
         // daemon clients keep the canonical-sibling lookup.
-        let sidecar = ctx
-            .mtp_path
-            .clone()
-            .unwrap_or_else(|| trunk_path.with_extension("mtp"));
-        let (trunk_dim, trunk_vocab) = (config.dim, config.vocab_size);
-        let gpu = &mut *ctx.gpu;
-        let mut load = |path: &Path, offset: u64| {
-            mtp_head::check_mtp_head_for_trunk(path, offset, trunk_dim, trunk_vocab)?;
-            mtp_head::load_mtp_head_at_offset(path, gpu, physical_cap, offset)
-                .map_err(|e| format!("{}: load failed: {e}", path.display()))
-        };
-        let mut head_opt: Option<mtp_head::Qwen35MtpHead> = None;
-        let mut errors: Vec<String> = Vec::new();
-        match mtp_head::detect_bundled_mtp_offset(trunk_path) {
-            Ok(Some(offset)) => match load(trunk_path, offset) {
-                Ok(h) => {
-                    eprintln!(
-                        "  MTP head loaded (bundled .mq4-mtp): n_embd={} vocab={}",
-                        h.config.n_embd, h.config.vocab_size
-                    );
-                    head_opt = Some(h);
-                }
-                Err(e) => errors.push(format!("bundled trailer: {e}")),
-            },
-            Ok(None) => {}
-            Err(e) => errors.push(format!("bundled trailer unreadable: {e}")),
-        }
-        if head_opt.is_none() && sidecar.exists() {
-            match load(&sidecar, 0) {
-                Ok(h) => {
-                    let after = if errors.is_empty() {
-                        ""
-                    } else {
-                        " after bundled error"
-                    };
-                    eprintln!(
-                        "  MTP head loaded (sidecar {}{after}): n_embd={} vocab={}",
-                        sidecar.display(),
-                        h.config.n_embd,
-                        h.config.vocab_size
-                    );
-                    head_opt = Some(h);
-                    errors.clear();
-                }
-                Err(e) => errors.push(format!("sidecar {e}")),
-            }
-        }
+        let (head_opt, errors) = resolve_qwen35_mtp_head(
+            Path::new(ctx.path),
+            ctx.mtp_path.clone(),
+            (config.dim, config.vocab_size),
+            &mut *ctx.gpu,
+            physical_cap,
+            None,
+        );
         if head_opt.is_none() {
             if ctx.spec.mtp == Some(true) {
                 let reason = if errors.is_empty() {
@@ -3096,7 +3117,10 @@ pub fn load_model_ep_with_kv_mode(
     let warning = crate::admission::legacy_warning(
         admission.kv_backend, admission.kv_backend_reason.as_deref()
     );
-    let loaded = load_model_ep_admitted(admission, path, max_seq, tp, kv_mode, None, None, state_quant);
+    let loaded = load_model_ep_admitted(
+        admission, path, max_seq, tp, kv_mode, None, None, state_quant,
+        hipfire_runtime::loader_api::SpecLoadCfg::default(),
+    );
     if loaded.is_ok() {
         if let Some(warning) = warning {
             eprintln!("{warning}");
@@ -3119,6 +3143,7 @@ pub fn load_model_ep_admitted(
     kv_k: Option<&str>,
     kv_v: Option<&str>,
     state_quant: Option<&str>,
+    spec: hipfire_runtime::loader_api::SpecLoadCfg,
 ) -> Result<LoadedModel, String> {
     let kv_backend = admission.kv_backend;
     let qwen_default_q8 = admission.qwen_default_q8;
@@ -3132,7 +3157,7 @@ pub fn load_model_ep_admitted(
             kv_backend,
         ),
         10 => load_model_ep_minimax(path, max_seq, tp),
-        5 | 6 => load_model_ep_qwen35(path, max_seq, tp, kv_mode, kv_k, kv_v, qwen_default_q8, Some(kv_backend.as_str()), state_quant),
+        5 | 6 => load_model_ep_qwen35(path, max_seq, tp, kv_mode, kv_k, kv_v, qwen_default_q8, Some(kv_backend.as_str()), state_quant, spec),
         // Backstop: `admit_source` above already refused every other arch_id.
         // Route through the shared constructor (not `unreachable!`) so the
         // refusal survives a future edit that drops the early classification,
@@ -3554,6 +3579,7 @@ fn load_model_ep_minimax(path: &str, max_seq: usize, tp: usize) -> Result<Loaded
         )
     })
 }
+#[allow(clippy::too_many_arguments)]
 fn load_model_ep_qwen35(
     path: &str,
     max_seq: usize,
@@ -3564,6 +3590,7 @@ fn load_model_ep_qwen35(
     qwen_default_q8: bool,
     kv_backend: Option<&str>,
     state_quant: Option<&str>,
+    spec: hipfire_runtime::loader_api::SpecLoadCfg,
 ) -> Result<LoadedModel, String> {
     use hipfire_runtime::tp_shard::{ExpertAssign, ShardConfig};
     let hfq_probe = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
@@ -3579,7 +3606,9 @@ fn load_model_ep_qwen35(
     let config = qwen35::config_from_hfq(&hfq_probe).map_err(|e| format!("qwen35 config: {e}"))?;
     if config.num_experts == 0 {
         drop(hfq_probe);
-        return load_model_tp_qwen35_dense(path, max_seq, tp, kv_mode, kv_k, kv_v, qwen_default_q8, kv_backend, state_quant);
+        return load_model_tp_qwen35_dense(
+            path, max_seq, tp, kv_mode, kv_k, kv_v, qwen_default_q8, kv_backend, state_quant, spec,
+        );
     }
     if let Some(reason) = qwen35_ep_moe_topology_refusal(hfq_probe.arch_id, config.num_experts, tp) {
         return Err(reason);
@@ -3805,6 +3834,7 @@ fn load_model_ep_qwen35(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn load_model_tp_qwen35_dense(
     path: &str,
     max_seq: usize,
@@ -3815,6 +3845,7 @@ fn load_model_tp_qwen35_dense(
     qwen_default_q8: bool,
     kv_backend: Option<&str>,
     state_quant: Option<&str>,
+    spec: hipfire_runtime::loader_api::SpecLoadCfg,
 ) -> Result<LoadedModel, String> {
     use hipfire_runtime::tp_shard::{ExpertAssign, ShardConfig};
 
@@ -3959,10 +3990,59 @@ fn load_model_tp_qwen35_dense(
     }
     hipfire_runtime::ep::ensure_rank_streams(staging.gpus_mut())
         .map_err(|e| format!("dense TP ensure_rank_streams: {e:?}"))?;
-    let (gpus, weights, kv_caches, dn_states, scratches) = staging.into_parts();
+    // The MTP head is replicated on rank 0 (the trunk stays sharded), under the
+    // same typed `spec.mtp` policy the single-GPU loader honors. Resolved while
+    // `staging` still owns the ranks: a required-but-missing head returns
+    // through its `Drop`, which frees every rank's weights, KV, DeltaNet state
+    // and scratch instead of stranding the sharded trunk in a live daemon.
+    let mtp_head = if spec.mtp == Some(false) {
+        None
+    } else {
+        let (head, errors) = resolve_qwen35_mtp_head(
+            Path::new(path),
+            None,
+            (config.dim, config.vocab_size),
+            &mut staging.gpus_mut().devices[0],
+            max_seq,
+            Some("dense TP rank 0"),
+        );
+        if head.is_none() {
+            if spec.mtp == Some(true) {
+                let reason = if errors.is_empty() {
+                    "no bundled trailer or .mtp sidecar found".to_string()
+                } else {
+                    errors.join("; ")
+                };
+                return Err(format!("MTP head required (mtp=on) but not loaded: {reason}"));
+            }
+            if !errors.is_empty() {
+                eprintln!(
+                    "  dense TP MTP head not loaded: {} — falling back to AR",
+                    errors.join("; ")
+                );
+            }
+        }
+        head
+    };
+    let (mut gpus, weights, kv_caches, dn_states, scratches) = staging.into_parts();
     eprintln!("[loader] dense qwen TP load complete: {tp} ranks, peer_access={peer}");
+    let mtp_present = mtp_head.is_some();
+    // Block-verify drafters cannot run on the mesh (`Qwen35DenseTpTarget`
+    // refuses `verify_block`), so an `ngram=on` request must not build one
+    // here: it would sit inert behind the AR route and lie in the load log.
+    let mesh_spec = hipfire_runtime::loader_api::SpecLoadCfg {
+        ngram_draft: Some(false),
+        ..spec
+    };
+    if spec.ngram_draft == Some(true) {
+        eprintln!("  dense TP: n-gram drafter refused (block verify is not wired on the mesh)");
+    }
+    let speculator =
+        crate::spec_build::build_speculator(arch_id, None, mtp_head, true, max_seq, mesh_spec);
 
     Ok(LoadedModel {
+        speculator,
+        mtp_weights_present: mtp_present,
         ep: Some(EpState {
             gpus,
             inner: EpArch::Qwen35DenseTp {
@@ -4212,6 +4292,12 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
                     }
                 }
             }
+        }
+        // Ahead of the pool teardown: the EP arm returns before the single-GPU
+        // `spec.free(gpu)` below, and a mesh drafter's per-rank buffers are not
+        // reachable from the daemon's `gpu`.
+        if let Some(spec) = m.speculator.take() {
+            spec.free_multi(&mut gpus);
         }
         // Reclaim unleased peer-rooted collective scratch before device pool
         // teardown. Idempotent across EP variants; fold first error into

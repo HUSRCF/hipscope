@@ -318,15 +318,18 @@ fn wmma_fa_min_batch() -> usize {
 }
 
 /// Query rows one multi-row flash block owns. 8 is the register budget of the
-/// kernel (ROWS x (Q, accumulator) per lane at head_dim 256). Measured on
-/// gfx1100 at 33k context against the batched tile: 1.91x at 8 rows, 1.66x
-/// at 4, 0.85x at 2 — so a block never takes fewer than 4 rows and the caller
-/// keeps batches under 4 on the batched kernel.
+/// kernel (ROWS x (Q, accumulator) per lane at head_dim 256). Below four rows
+/// the ROWS=4 body runs one partially masked group (`rows_valid` guards the
+/// reads and the partial writes). Measured on gfx1100 at 33k context against
+/// the batched tile (`bench_flash_rows`): 2.40x at 8 rows, 1.94x at 4, 1.59x
+/// at 3, 1.26x at 2, 0.83x at 1 — so a single row stays on the batched kernel.
+/// Only the dense-TP callers admit 2..=3 rows (qwen35 `Q8_MULTIROW_MIN_ROWS`).
 fn flash_rows_per_block(batch_size: usize) -> usize {
-    [8usize, 4]
-        .into_iter()
-        .find(|&r| r <= batch_size)
-        .unwrap_or(0)
+    match batch_size {
+        0 | 1 => 0,
+        2..=7 => 4,
+        _ => 8,
+    }
 }
 
 #[inline]
@@ -20216,13 +20219,26 @@ fn pack_attention_q8_0_fa2_gqa_gfx11_kernarg(
 #[cfg(test)]
 mod tests {
     use super::{
-        flux_attn_dtype_error, flux_attn_dtype_suffix, flux_attn_route_dtypes,
-        flux_attn_route_name, pack_attention_q8_0_fa2_gqa_gfx11_kernarg,
+        flash_rows_per_block, flux_attn_dtype_error, flux_attn_dtype_suffix,
+        flux_attn_route_dtypes, flux_attn_route_name, pack_attention_q8_0_fa2_gqa_gfx11_kernarg,
         q8_flash_default_tile_size, q8_flash_reduce_safe_tile_size, q8_multirow_arch_supported,
         replay_stable_tile_count,
     };
+
     use crate::DType;
     use std::ffi::c_void;
+
+    #[test]
+    fn flash_rows_per_block_serves_short_verify_blocks_with_one_masked_group() {
+        assert_eq!(flash_rows_per_block(0), 0);
+        assert_eq!(flash_rows_per_block(1), 0);
+        for n in 2..=7 {
+            assert_eq!(flash_rows_per_block(n), 4, "batch {n}");
+        }
+        for n in [8, 9, 32] {
+            assert_eq!(flash_rows_per_block(n), 8, "batch {n}");
+        }
+    }
 
 
     /// C0: FA2 gfx11 blob must match the pointer-array ABI (q,k,v,out,positions,
