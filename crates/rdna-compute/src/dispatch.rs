@@ -1712,6 +1712,10 @@ pub struct Gpu {
     pub qwen4_trunk_iu4: bool,
     /// Armed only by the noncompact Qwen4 eager prefill wrapper.
     pub qwen4_trunk_iu4_prefill_scope: bool,
+    /// Artifact-level MQ3V2 (qt49) symmetric grid contract. Set by the model
+    /// loader from HFQ `mq3v2.symmetric` metadata after group validation;
+    /// false for legacy/asymmetric artifacts.
+    pub mq3v2_symmetric: bool,
     /// ADD-epilogue fold (gfx1151 V2B, `HIPFIRE_V2B_ADDEPI`): delta buffer
     /// armed by the caller for the next residual GEMM, and the deferred add
     /// that GEMM left for the following IU4 RMSNorm. See
@@ -3011,6 +3015,7 @@ impl Gpu {
             iu4_verify_load: false,
             qwen4_trunk_iu4: false,
             qwen4_trunk_iu4_prefill_scope: false,
+            mq3v2_symmetric: false,
             residual_fold_arm: None,
             residual_fold_pending: None,
             #[cfg(feature = "flash-attn-ck")]
