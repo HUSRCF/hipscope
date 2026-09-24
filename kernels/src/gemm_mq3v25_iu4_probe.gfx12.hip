@@ -208,11 +208,22 @@ static __device__ __forceinline__ u32x2_t iu4_qt49_load_word(const char* p) {
     return (u32x2_t){lo, (unsigned)hi};
 }
 static __device__ __forceinline__ unsigned iu4_qt49_expand_octet(unsigned v) {
-    // Spread eight little-endian 3-bit codes to unsigned nibbles, then map
-    // u -> (u+4)^8 == (u-4)&15. +4 cannot carry across nibble boundaries.
+#if defined(IU4_UNPACK_STAGED)
+    // Insert the missing bit per code in three parallel stages: 12->16,
+    // 6->8, 3->4. Every mask is immediate, with no variable shifts.
+    unsigned n = (v & 0x00000fffu) | ((v & 0x00fff000u) << 4);
+    n = (n & 0x003f003fu) | ((n & 0x0fc00fc0u) << 2);
+    n = (n & 0x07070707u) | ((n & 0x38383838u) << 1);
+#elif defined(IU4_UNPACK_DIRECT)
+    unsigned n = (v & 0x00000007u) | ((v << 1) & 0x00000070u)
+        | ((v << 2) & 0x00000700u) | ((v << 3) & 0x00007000u)
+        | ((v << 4) & 0x00070000u) | ((v << 5) & 0x00700000u)
+        | ((v << 6) & 0x07000000u) | ((v << 7) & 0x70000000u);
+#else
     unsigned n = 0;
     #pragma unroll
     for (int i = 0; i < 8; ++i) n |= ((v >> (3 * i)) & 7u) << (4 * i);
+#endif
     return (n + 0x44444444u) ^ 0x88888888u;
 }
 static __device__ __forceinline__ u32x2_t iu4_qt49_expand_word(u32x2_t raw) {
@@ -778,7 +789,7 @@ static __device__ __forceinline__ void gemm_mq3v25_probe_iu4_gfx12_body(
         // into a [32 tok][68] f32 tile (8704 B), then 16 lanes per token
         // column write its 64 h rows (256 contiguous B) as b128 stores.
         // Same IU4_SILU_MUL values; only the store shape changes.
-        if (full_cols && (M & 3) == 0 && (reinterpret_cast<uintptr_t>(Y) & 15u) == 0) {
+        if (hs + 64 <= M && full_cols && (M & 3) == 0 && (reinterpret_cast<uintptr_t>(Y) & 15u) == 0) {
             const unsigned dump_tok = (unsigned)(tok_half * 16 + m_lane);
             const unsigned wide_h_off =
                 ((unsigned)(tid >> 4) * (unsigned)M + (unsigned)(tid & 15) * 4u) * sizeof(float);
@@ -823,15 +834,16 @@ static __device__ __forceinline__ void gemm_mq3v25_probe_iu4_gfx12_body(
                 const int h = k & 1;
                 const int owner = (p << 1) | h;
                 const float v = slots[(unsigned)(owner * 320 + store_i * 20 + store_x)];
-                if (full_cols) {
+                if (full_cols && hs + 64 <= M) {
                     const unsigned phase_off =
                         ((unsigned)(h * 64 + nb * 16) * (unsigned)M + (unsigned)(p * 16))
                         * sizeof(float);
                     __builtin_amdgcn_raw_buffer_store_b32(
                         __builtin_bit_cast(unsigned, v), h_rsrc, h_lane_off, phase_off, 0);
                 } else {
+                    const int row = hs + p * 16 + store_i;
                     const int col = bs + h * 64 + nb * 16 + store_x;
-                    if (col < N) Y[(long long)col * M + hs + p * 16 + store_i] = v;
+                    if (row < M && col < N) Y[(long long)col * M + row] = v;
                 }
             }
             __syncthreads();
@@ -967,6 +979,7 @@ static __device__ __forceinline__ void gemm_mq3v25_probe_iu4_gfx12_body(
 // residual: += (the `add` kernarg picks += vs = at runtime).
 extern "C" __global__ __launch_bounds__(IU4_NTHREADS, 2)
 void gemm_mq3v25_probe_iu4(
+
     const char* __restrict__ A,
     const block_i4_128* __restrict__ Xq,
     float* __restrict__ Y,
@@ -979,6 +992,18 @@ void gemm_mq3v25_probe_iu4(
     }
 }
 
+// Same gate/up interleave and default expf SiLU epilogue as production MQ4.
+extern "C" __global__ __launch_bounds__(IU4_NTHREADS, 2)
+void gemm_mq3v25_gate_up_silu_mmq_iu4(
+    const char* __restrict__ G,
+    const char* __restrict__ U,
+    const block_i4_128* __restrict__ Xq,
+    float* __restrict__ H,
+    int M, int K, int N
+) {
+    gemm_mq3v25_probe_iu4_gfx12_body<IU4_EPI_SILU>(G, U, Xq, H, M, K, N);
+}
+
 #undef IU4_SILU_MUL
 
 #else
@@ -986,6 +1011,9 @@ void gemm_mq3v25_probe_iu4(
 // This probe deliberately has no active implementation off exact gfx1201.
 extern "C" __global__ void gemm_mq3v25_probe_iu4(
     const char*, const void*, float*, int, int, int, int
+) {}
+extern "C" __global__ void gemm_mq3v25_gate_up_silu_mmq_iu4(
+    const char*, const char*, const void*, float*, int, int, int
 ) {}
 
 #endif
