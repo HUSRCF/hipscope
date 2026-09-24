@@ -1,17 +1,19 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-// gfx1201 standalone A8 producer + symmetric qt49 IU8 WMMA benchmark.
-// Inputs are already in the rotated/AWQ-adjusted domain (as for A4 producer).
-// HIPFIRE_IU4_PREFILL=0 control: production MQ4v2 fp8 V2 symfold residual.
+// gfx1201 symmetric qt49 A8 iu8/fp8 GEMM, production fp8 MQ4 and old f16.
+// Synthetic inputs stand in for the already-rotated activation domain;
+// actual captured-site activation quality is measured separately on CPU.
 use hip_bridge::KernargBlob;
 use rdna_compute::kv_slots::half_from_f32;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 const PRELUDE: &str = include_str!("../../../kernels/src/block_i8_128_quant.hip");
 const IU8: &str = include_str!("../../../kernels/src/gemm_mq3v25_residual_mmq_iu8.gfx12.hip");
+const FP8_SYM3: &str = include_str!("../../../kernels/src/gemm_mq3v25_residual_fp8.gfx12.hip");
 const FP8_PACK: &str = include_str!("../../../kernels/src/pack_f16_to_fp8_mq4v2.gfx12.hip");
 const FP8: &str = include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip");
 const F16: &str = include_str!("../../../kernels/src/gemm_mq3g256v2_residual_wmma.gfx12.hip");
 const I8_NAME: &str = "gemm_mq3v25_residual_mmq_iu8";
+const FP8_SYM3_NAME: &str = "gemm_mq3v25_residual_fp8";
 const FP8_NAME: &str = "gemm_mq4g256v2_residual_wmma_fp8_v2_b128x128_gfx1201_symfold";
 const F16_NAME: &str = "gemm_mq3g256v2_residual_wmma_gfx12";
 const SHAPES: &[(&str, usize, usize)] = &[
@@ -96,8 +98,8 @@ fn args_fp8(a: &GpuTensor, x: &GpuTensor, sums: &GpuTensor, scales: &GpuTensor,
 }
 fn launch(gpu: &Gpu, name: &str, arg: &mut [u8], m: usize, n: usize) {
     let (rm, rn, threads, lds) = match name {
-        I8_NAME => (64, 64, 128, 16896),
-        FP8_NAME => (128, 128, 256, 18944),
+        I8_NAME => (128, 128, 256, 19456),
+        FP8_NAME | FP8_SYM3_NAME => (128, 128, 256, 18944),
         _ => (16, 16, 32, 0),
     };
     gpu.launch_kernel_blob(name, [m.div_ceil(rm) as u32, n.div_ceil(rn) as u32, 1],
@@ -143,6 +145,82 @@ fn oracle(gpu: &Gpu, y: &GpuTensor, m: usize, k: usize, n: usize, salt: usize,
     }
     println!("CPU i32-dot + K128 fold parity sampled={} max_abs={max_abs:.3e}", rows.len() * cols.len());
 }
+fn e4m3(b: u8) -> f32 {
+    let v = if b & 0x78 == 0 {
+        (b & 7) as f32 * 2f32.powi(-9)
+    } else {
+        (1.0 + (b & 7) as f32 / 8.0) * 2f32.powi(((b >> 3) & 15) as i32 - 7)
+    };
+    if b & 0x80 != 0 { -v } else { v }
+}
+fn cpu_e4m3(v: f32) -> u8 {
+    let sign = if v.is_sign_negative() { 0x80 } else { 0 };
+    let a = v.abs();
+    let (mut low, mut high) = (0u8, 126u8);
+    while high - low > 1 {
+        let mid = low + (high - low) / 2;
+        if e4m3(mid) <= a { low = mid; } else { high = mid; }
+    }
+    let dlow = a - e4m3(low);
+    let dhigh = e4m3(high) - a;
+    sign | if dhigh < dlow || (dhigh == dlow && low & 1 != 0) { high } else { low }
+}
+fn fp8_oracle(gpu: &Gpu, y: &GpuTensor, fp: &GpuTensor, scales: &GpuTensor,
+              m: usize, k: usize, n: usize, salt: usize) {
+    let got = gpu.download_f32(y).unwrap();
+    let mut bytes = vec![0u8; n * k];
+    gpu.hip.memcpy_dtoh(&mut bytes, &fp.buf).unwrap();
+    let row_scales = gpu.download_f32(scales).unwrap();
+    assert!(bytes.iter().any(|&v| v & 0x7f != 0), "fp8 producer emitted only zeroes");
+    assert!(row_scales.iter().all(|&v| v > 0.0 && v.is_finite()), "fp8 row scales invalid");
+    let rows = [0, 1, 15, 16, 63, 64, 127, 128, m / 2, m - 1];
+    let cols = [0, 1, 15, 16, 63, 64, 127, 128, n / 2, n - 1];
+    // Independently reproduce production f16 -> scaled e4m3 (RN-even).
+    let mut cpu_rows = Vec::with_capacity(cols.len());
+    for &col in &cols {
+        if col >= n { cpu_rows.push(Vec::new()); continue; }
+        let half: Vec<f32> = (0..k).map(|i| {
+            let h = half_from_f32(input(col, i));
+            if h & 0x7fff == 0 { 0.0 } else { f16(h) }
+        }).collect();
+        let amax = half.iter().map(|v| v.abs()).fold(0f32, f32::max);
+        let a = if amax == 0.0 { 1.0 }
+            else { 2f32.powi(((amax / 224.0).log2().ceil() as i32).clamp(-31, 9)) };
+        assert_eq!(row_scales[col].to_bits(), a.to_bits(), "fp8 producer row scale");
+        let mut decoded = Vec::with_capacity(k);
+        for (i, &v) in half.iter().enumerate() {
+            let b = cpu_e4m3(v / a);
+            assert_eq!(bytes[col * k + i], b, "fp8 producer RN-even token={col} k={i}");
+            decoded.push(e4m3(b));
+        }
+        cpu_rows.push(decoded);
+    }
+    let mut max_abs = 0f32;
+    let mut max_reference = 0f32;
+    for &r in &rows {
+        for (ci, &col) in cols.iter().enumerate() {
+            if col >= n { continue; }
+            let mut expected = 0f32;
+            for kb in 0..k / 128 {
+                let mut dot = 0f32;
+                for i in 0..128 {
+                    let a = cpu_rows[ci][kb * 128 + i];
+                    dot += (code(r, kb / 2, (kb & 1) * 128 + i, salt) as i32 - 4) as f32 * a;
+                }
+                expected = f16(scale(r, kb / 2, kb & 1)).mul_add(dot, expected);
+            }
+            expected *= row_scales[col];
+            max_reference = max_reference.max(expected.abs());
+            let value = got[col * m + r];
+            let err = (value - expected).abs();
+            max_abs = max_abs.max(err);
+            assert!(err <= 0.001 * expected.abs().max(1.0),
+                "FP8 sym3 row={r} token={col} GPU={value} CPU={expected} diff={err}");
+        }
+    }
+    assert!(max_reference > 0.01 && max_abs.is_finite(), "fp8 CPU oracle was degenerate");
+    println!("CPU e4m3 sym3 fold sampled={} max_abs={max_abs:.3e} max_reference={max_reference:.3e}", rows.len() * cols.len());
+}
 fn producer_boundaries(gpu: &mut Gpu) {
     const K: usize = 256;
     const N: usize = 3;
@@ -186,8 +264,8 @@ fn exact_i32_oracle(gpu: &mut Gpu) {
     // WMMA dot (including both independently folded K128 groups). Exercise
     // the two CTA tails, SET and ADD, rather than inferring dot parity from
     // a tolerant floating-point comparison.
-    const M: usize = 65;
-    const N: usize = 65;
+    const M: usize = 129;
+    const N: usize = 129;
     const K: usize = 256;
     let (mut w, _) = weights(M, K, 0);
     for row in 0..M {
@@ -258,16 +336,18 @@ fn main() {
     assert_eq!(gpu.arch, "gfx1201");
     gpu.ensure_kernel_public("mqv25_a8_producer", PRELUDE, "quantize_block_i8_128").unwrap();
     gpu.ensure_kernel_public("mqv25_iu8", &format!("{PRELUDE}\n{IU8}"), I8_NAME).unwrap();
+    gpu.ensure_kernel_public("mqv25_fp8_sym3", FP8_SYM3, FP8_SYM3_NAME).unwrap();
     gpu.ensure_kernel_public("mqv25_fp8_pack", FP8_PACK, "pack_f16_to_fp8_mq4v2_gfx12").unwrap();
     let fp8_src = format!("#define HIPFIRE_FP8_SYMFOLD 1\n#define HIPFIRE_FP8_V2_TILE 1\n#define HIPFIRE_FP8_V2_BM 128\n#define HIPFIRE_FP8_V2_BN 128\n#define HIPFIRE_FP8_V2_BK 64\n#define HIPFIRE_FP8_V2_WAVES 8\n#define HIPFIRE_FP8_RESIDUAL 1\n#define HIPFIRE_FP8_GATEUP_KERNEL {FP8_NAME}\n{FP8}");
     gpu.ensure_kernel_public("mqv25_fp8_prod", &fp8_src, FP8_NAME).unwrap();
     gpu.ensure_kernel_public("mqv25_old_f16", F16, F16_NAME).unwrap();
-    println!("arch={} A8_tile=64x64 threads=128 LDS=16896 occupancy={} fp8_control={FP8_NAME} fp8_occupancy={} f16={F16_NAME}",
-        gpu.arch, gpu.occupancy_max_active_blocks(I8_NAME, [128,1,1], 16896).unwrap(),
+    println!("arch={} IU8=128x128/8w/19456B occ={} FP8-sym3=128x128x64/8w/18944B occ={} FP8-MQ4 occ={} f16={F16_NAME}",
+        gpu.arch, gpu.occupancy_max_active_blocks(I8_NAME, [256,1,1], 19456).unwrap(),
+        gpu.occupancy_max_active_blocks(FP8_SYM3_NAME, [256,1,1], 18944).unwrap(),
         gpu.occupancy_max_active_blocks(FP8_NAME, [256,1,1], 18944).unwrap());
     producer_boundaries(&mut gpu);
     exact_i32_oracle(&mut gpu);
-    println!("family,M,K,N,iu8_ms,fp8_mq4_ms,mq3_f16_ms,iu8/fp8,iu8/f16");
+    println!("family,M,K,N,iu8_ms,fp8_sym3_ms,fp8_mq4_ms,mq3_f16_ms,iu8/mq4,sym3/mq4,iu8/sym3");
     for &(label, m, k) in SHAPES {
         if family != "all" && family != label { continue; }
         let salt = if label == "up" { 3 } else { 0 };
@@ -288,6 +368,7 @@ fn main() {
         let sums = gpu.zeros(&[n*(k/128)], DType::F32).unwrap();
         let scales = gpu.zeros(&[n], DType::F32).unwrap();
         let yi = gpu.zeros(&[n,m], DType::F32).unwrap();
+        let ys = gpu.zeros(&[n,m], DType::F32).unwrap();
         let yf = gpu.zeros(&[n,m], DType::F32).unwrap();
         let yh = gpu.zeros(&[n,m], DType::F32).unwrap();
         let mut quant = KernargBlob::new();
@@ -312,32 +393,44 @@ fn main() {
         pack.push_i32(k as i32); pack.push_i32(n as i32); pack.push_i32(1);
         gpu.launch_kernel_blob("pack_f16_to_fp8_mq4v2_gfx12",[n as u32,1,1],[256,1,1],0,&mut pack.into_vec()).unwrap();
         let mut ai = args3(&tw3,&q,&yi,m,k,n);
+        let mut as3 = args_fp8(&tw3,&fp,&sums,&scales,&ys,m,k,n);
         let mut af = args_fp8(&tw4,&fp,&sums,&scales,&yf,m,k,n);
         let mut ah = args_f16(&tw3,&txh,&yh,m,k,n);
         launch(&gpu,I8_NAME,&mut ai,m,n);
         gpu.hip.device_synchronize().unwrap();
         oracle(&gpu,&yi,m,k,n,salt,&blocks);
-        // The f16 and fp8 kernels have += epilogues; zeroes precede timing.
-        for round in 0..30 {
-            match round % 3 {
-                0 => { launch(&gpu,I8_NAME,&mut ai,m,n); launch(&gpu,FP8_NAME,&mut af,m,n); launch(&gpu,F16_NAME,&mut ah,m,n); },
-                1 => { launch(&gpu,F16_NAME,&mut ah,m,n); launch(&gpu,I8_NAME,&mut ai,m,n); launch(&gpu,FP8_NAME,&mut af,m,n); },
-                _ => { launch(&gpu,FP8_NAME,&mut af,m,n); launch(&gpu,F16_NAME,&mut ah,m,n); launch(&gpu,I8_NAME,&mut ai,m,n); },
+        launch(&gpu,FP8_SYM3_NAME,&mut as3,m,n);
+        gpu.hip.device_synchronize().unwrap();
+        fp8_oracle(&gpu,&ys,&fp,&scales,m,k,n,salt);
+        // All four arms time GEMM only; each has a distinct output buffer.
+        for round in 0..24 {
+            for arm in [round % 4, (round+1)%4, (round+2)%4, (round+3)%4] {
+                let (name,arg) = match arm {
+                    0 => (I8_NAME,&mut ai),
+                    1 => (FP8_SYM3_NAME,&mut as3),
+                    2 => (FP8_NAME,&mut af),
+                    _ => (F16_NAME,&mut ah),
+                };
+                launch(&gpu,name,arg,m,n);
             }
         }
         gpu.hip.device_synchronize().unwrap();
-        let mut times = [Vec::new(), Vec::new(), Vec::new()];
-        for round in 0..5 {
-            for arm in [round % 3, (round+1)%3, (round+2)%3] {
+        let mut times = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+        for round in 0..7 {
+            for arm in [round % 4, (round+1)%4, (round+2)%4, (round+3)%4] {
                 let (name,arg) = match arm {
-                    0 => (I8_NAME,&mut ai), 1 => (FP8_NAME,&mut af), _ => (F16_NAME,&mut ah),
+                    0 => (I8_NAME,&mut ai),
+                    1 => (FP8_SYM3_NAME,&mut as3),
+                    2 => (FP8_NAME,&mut af),
+                    _ => (F16_NAME,&mut ah),
                 };
                 times[arm].push(measure(&gpu,name,arg,m,n));
             }
         }
         for samples in &mut times { samples.sort_by(|a,b|a.total_cmp(b)); }
-        let (i,f,h) = (times[0][2],times[1][2],times[2][2]);
-        println!("{label},{m},{k},{n},{i:.5},{f:.5},{h:.5},{:.4},{:.4}",i/f,i/h);
-        eprintln!("samples {label}: IU8={:?} FP8={:?} F16={:?}",times[0],times[1],times[2]);
+        let (i,s,f,h) = (times[0][3],times[1][3],times[2][3],times[3][3]);
+        println!("{label},{m},{k},{n},{i:.5},{s:.5},{f:.5},{h:.5},{:.4},{:.4},{:.4}",i/f,s/f,i/s);
+        eprintln!("samples {label}: IU8={:?} SYM3={:?} MQ4={:?} F16={:?}",
+            times[0],times[1],times[2],times[3]);
     }
 }

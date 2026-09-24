@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
-// gfx1201 symmetric qt49 A8: [d0,z0,d1,z1] f16 + 32 LE 24-bit octets
-// per K256. u=0..7 widens to signed byte u-4 BEFORE LDS publication.
-// Xq is block_i8_128 from the concatenated block_i8_128_quant.hip;
-// activations AND weights have undergone the same upstream FWHT256 rotation.
-// Tile 64 rows x 64 tokens, four wave32s, 128 threads. Per K128, 8
-// fragment-order K16 slabs of 64*16 bytes per operand, 8192 B each.
-// LDS: A 0..8192, W 8192..16384, row scales 16384..16640,
-// token scales 16640..16896. Reuse 0..16384 for the 64x64 f32 epilogue.
-// Grid [ceil(M/64),ceil(N/64)], block [128,1,1], dynamic LDS 16896 B.
+// gfx1201 symmetric qt49 A8, 128 weight rows x 128 tokens, eight waves.
+// K64 single-buffer slabs in fragment order (288-byte skew per K16);
+// W is widened from 3-bit q=u-4 to signed int8 at LDS publication.
+// Dynamic LDS: A 9216 B, W 9216 B, row scales 512 B, token scales
+// 512 B = 19456 B. Epilogue reuses LDS for eight 512-float wave tiles.
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <stdint.h>
@@ -18,128 +14,165 @@ typedef int32_t __attribute__((ext_vector_type(2))) i32x2;
 typedef int32_t __attribute__((ext_vector_type(8))) i32x8;
 typedef float __attribute__((ext_vector_type(8))) f32x8;
 
-extern "C" __global__ __launch_bounds__(128, 2)
+__device__ __forceinline__ i32x2 mq3v25_widen_i8(unsigned bits) {
+    const unsigned c0 = 0xFFFEFDFCu, c1 = 0x03020100u;
+    i32x2 wide;
+    #pragma unroll
+    for (int half = 0; half < 2; ++half) {
+        unsigned sel = 0;
+        #pragma unroll
+        for (int j = 0; j < 4; ++j)
+            sel |= ((bits >> (3 * (half * 4 + j))) & 7u) << (8 * j);
+        wide[half] = (int)__builtin_amdgcn_perm(c1, c0, sel);
+    }
+    return wide;
+}
+
+extern "C" __global__ __launch_bounds__(256, 2)
 void gemm_mq3v25_residual_mmq_iu8(
     const char* __restrict__ A, const block_i8_128* __restrict__ Xq,
     float* __restrict__ Y, int M, int K, int N, int add
 ) {
     const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
-    const int rs = blockIdx.x * 64, bs = blockIdx.y * 64;
-    const int row_pair = wave >> 1, token_half = wave & 1;
-    const int m_lane = lane & 15, k_half = lane >> 4;
+    const int rs = blockIdx.x * 128, bs = blockIdx.y * 128;
+    const int row_part = wave & 3, token_part = wave >> 2;
+    const int wave_row = row_part * 32, wave_token = token_part * 64;
+    const int ml = lane & 15, kh = lane >> 4;
     const int gpr = K / 256;
     extern __shared__ __align__(16) unsigned char smem[];
     unsigned char* const a_lds = smem;
-    unsigned char* const w_lds = smem + 8192;
-    float* const scales_w = (float*)(smem + 16384);
-    float* const scales_x = (float*)(smem + 16640);
-    f32x8 acc[2][2];
+    unsigned char* const w_lds = smem + 9216;
+    float* const scales_w = (float*)(smem + 18432);
+    float* const scales_x = (float*)(smem + 18944);
+    const unsigned char* const ar = a_lds + (wave_token >> 4) * 4 * 288 + lane * 8;
+    const unsigned char* const wr = w_lds + (wave_row >> 4) * 4 * 288 + lane * 8;
+    const int st_row = tid >> 2, quad = tid & 3;
+    f32x8 acc[4][2];
+    const f32x8 zero_f = {0,0,0,0,0,0,0,0};
     #pragma unroll
-    for (int nb = 0; nb < 2; ++nb)
-        #pragma unroll
-        for (int rg = 0; rg < 2; ++rg)
-            acc[nb][rg] = (f32x8){0,0,0,0,0,0,0,0};
-
-    // Each CTA stages every K128 activation/weight byte once. The old S0
-    // probe's fragment-order map is retained; K16 doubles the bytes per
-    // fragment (8 B/lane) and doubles the count of fragments per K128.
+    for (int nb = 0; nb < 4; ++nb) {
+        acc[nb][0] = zero_f;
+        acc[nb][1] = zero_f;
+    }
     for (int kb = 0; kb < K / 128; ++kb) {
-        if (tid < 64) {
+        if (tid < 128) {
             const int row = rs + tid;
             const int safe = row < M ? row : M - 1;
             const unsigned short d = *(const unsigned short*)(A +
                 (long long)safe * gpr * 104 + (kb / 2) * 104 + (kb & 1) * 4);
             scales_w[tid] = row < M ? __half2float(__ushort_as_half(d)) : 0.0f;
         } else {
-            const int col = bs + tid - 64;
-            scales_x[tid - 64] = col < N ? Xq[(long long)kb * N + col].d : 0.0f;
+            const int col = bs + tid - 128;
+            scales_x[tid - 128] = col < N ? Xq[(long long)kb * N + col].d : 0.0f;
         }
-        // 128 threads = 64 rows/tokens x two 8-byte K halves. The same
-        // fragment-order address works for W and X; lane L = row-in-16 +
-        // 16*(K-half), fragment group=(row/16)*8 + K16 step.
-        const int r = tid >> 1, kh = tid & 1;
-        const int wr = rs + r, xr = bs + r;
-        const int safe_wr = wr < M ? wr : M - 1;
-        const int safe_xr = xr < N ? xr : N - 1;
-        const char* const wg = A + (long long)safe_wr * gpr * 104
-            + (kb / 2) * 104 + 8 + (kb & 1) * 48;
-        const block_i8_128* const xb = Xq + (long long)kb * N + safe_xr;
+        i32x8 c[4][2];
+        const i32x8 zero_i = {0,0,0,0,0,0,0,0};
+        // Keep slab 1's raw global data live while slab 0 runs its WMMAs.
+        unsigned pref_w0[2], pref_w1[2];
+        unsigned long long pref_x[2][2];
         #pragma unroll
-        for (int step = 0; step < 8; ++step) {
-            const int k8 = step * 16 + kh * 8;
-            const unsigned char* p = (const unsigned char*)wg + (k8 / 8) * 3;
-            const unsigned bits = (unsigned)p[0] | ((unsigned)p[1] << 8) | ((unsigned)p[2] << 16);
-            unsigned long long wide = 0;
+        for (int slab = 0; slab < 2; ++slab) {
             #pragma unroll
-            for (int j = 0; j < 8; ++j)
-                wide |= (unsigned long long)(unsigned char)(int8_t)(((bits >> (3*j)) & 7u) - 4u) << (8*j);
-            const int offset = ((r >> 4) * 8 + step) * 256 + ((r & 15) + 16 * kh) * 8;
-            *(unsigned long long*)(w_lds + offset) = wide;
-            const unsigned long long xv = *(const unsigned long long*)(xb->qs + k8);
-            *(unsigned long long*)(a_lds + offset) = xr < N ? xv : 0ull;
-        }
-        __syncthreads();
-        i32x8 c[2][2];
-        const i32x8 zero = {0,0,0,0,0,0,0,0};
-        #pragma unroll
-        for (int step = 0; step < 8; ++step) {
-            i32x2 wf[2], xf[2];
-            #pragma unroll
-            for (int rg = 0; rg < 2; ++rg) {
-                const int off = ((row_pair * 2 + rg) * 8 + step) * 256 + lane * 8;
-                wf[rg] = *(const i32x2*)(w_lds + off);
-            }
-            #pragma unroll
-            for (int nb = 0; nb < 2; ++nb) {
-                const int off = ((token_half * 2 + nb) * 8 + step) * 256 + lane * 8;
-                xf[nb] = *(const i32x2*)(a_lds + off);
-            }
-            #pragma unroll
-            for (int nb = 0; nb < 2; ++nb)
+            for (int rr = 0; rr < 2; ++rr) {
+                const int local_row = rr * 64 + st_row;
+                const int row = rs + local_row, col = bs + local_row;
+                const int safe_row = row < M ? row : M - 1;
+                const int safe_col = col < N ? col : N - 1;
+                const char* wg = A + (long long)safe_row * gpr * 104
+                    + (kb / 2) * 104 + 8 + (kb & 1) * 48 + slab * 24;
+                const block_i8_128* xb = Xq + (long long)kb * N + safe_col;
+                const int frag = ((local_row >> 4) * 4 + quad) * 288 + (local_row & 15) * 8;
+                const unsigned char* const p = (const unsigned char*)wg + quad * 6;
+                const unsigned packed = slab ? pref_w0[rr] : *(const unsigned*)p;
+                const unsigned tail = slab ? pref_w1[rr] : *(const unsigned short*)(p + 4);
                 #pragma unroll
-                for (int rg = 0; rg < 2; ++rg)
-                    c[nb][rg] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(
-                        true, wf[rg], true, xf[nb], step == 0 ? zero : c[nb][rg], false);
-        }
-        // Exact signed i32 dot per K128; RN(d_w*d_x), RN(product), RN(sum).
-        // No affine zero/sum correction and no cross-block i32 accumulation.
-        #pragma unroll
-        for (int nb = 0; nb < 2; ++nb) {
-            const float dx = scales_x[token_half * 32 + nb * 16 + m_lane];
-            #pragma unroll
-            for (int rg = 0; rg < 2; ++rg) {
-                #pragma unroll
-                for (int j = 0; j < 8; ++j) {
-                    const int ri = row_pair * 32 + rg * 16 + 8 * k_half + j;
-                    const float ds = __fmul_rn(scales_w[ri], dx);
-                    const float value = __fmul_rn(ds, (float)c[nb][rg][j]);
-                    acc[nb][rg][j] = __fadd_rn(acc[nb][rg][j], value);
+                for (int half = 0; half < 2; ++half) {
+                    const int k8 = slab * 64 + quad * 16 + half * 8;
+                    const unsigned bits = half ? ((packed >> 24) | (tail << 8)) : (packed & 0xffffffu);
+                    const i32x2 w = row < M ? mq3v25_widen_i8(bits) : i32x2{0,0};
+                    const unsigned long long raw = slab ? pref_x[rr][half] : *(const unsigned long long*)(xb->qs + k8);
+                    const unsigned long long x = col < N ? raw : 0ull;
+                    *(i32x2*)(w_lds + frag + half * 128) = w;
+                    *(unsigned long long*)(a_lds + frag + half * 128) = x;
                 }
             }
+            __syncthreads();
+            if (slab == 0) {
+                #pragma unroll
+                for (int rr = 0; rr < 2; ++rr) {
+                    const int local_row = rr * 64 + st_row;
+                    const int row = rs + local_row, col = bs + local_row;
+                    const int safe_row = row < M ? row : M - 1;
+                    const int safe_col = col < N ? col : N - 1;
+                    const char* wg = A + (long long)safe_row * gpr * 104
+                        + (kb / 2) * 104 + 8 + (kb & 1) * 48 + 24;
+                    const unsigned char* p = (const unsigned char*)wg + quad * 6;
+                    const block_i8_128* xb = Xq + (long long)kb * N + safe_col;
+                    pref_w0[rr] = *(const unsigned*)p;
+                    pref_w1[rr] = *(const unsigned short*)(p + 4);
+                    #pragma unroll
+                    for (int half = 0; half < 2; ++half)
+                        pref_x[rr][half] = *(const unsigned long long*)(xb->qs + 64 + quad * 16 + half * 8);
+                }
+            }
+            #pragma unroll
+            for (int step = 0; step < 4; ++step) {
+                i32x2 wf[2], xf[4];
+                #pragma unroll
+                for (int rg = 0; rg < 2; ++rg)
+                    wf[rg] = *(const i32x2*)(wr + (rg * 4 + step) * 288);
+                #pragma unroll
+                for (int nb = 0; nb < 4; ++nb)
+                    xf[nb] = *(const i32x2*)(ar + (nb * 4 + step) * 288);
+                #pragma unroll
+                for (int nb = 0; nb < 4; ++nb)
+                    #pragma unroll
+                    for (int rg = 0; rg < 2; ++rg)
+                        c[nb][rg] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(
+                            true, wf[rg], true, xf[nb], slab == 0 && step == 0 ? zero_i : c[nb][rg], false);
+                __builtin_amdgcn_sched_barrier(0);
+            }
+            if (slab == 0) __syncthreads(); // only the next slab reuses A/W LDS
+        }
+        // Integer dot is complete over exactly K128; fold before next block.
+        #pragma unroll
+        for (int nb = 0; nb < 4; ++nb) {
+            const float dx = scales_x[wave_token + nb * 16 + ml];
+            #pragma unroll
+            for (int rg = 0; rg < 2; ++rg)
+                #pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const int row = wave_row + rg * 16 + 8 * kh + j;
+                    const float ds = __fmul_rn(scales_w[row], dx);
+                    acc[nb][rg][j] = __fmaf_rn(ds, (float)c[nb][rg][j], acc[nb][rg][j]);
+                }
         }
         __syncthreads();
     }
-    // CTA-wide transpose: one row-contiguous float stream per token.
+    // Wave-local skewed transpose for contiguous global output stores.
     float* const slots = (float*)smem;
     #pragma unroll
-    for (int nb = 0; nb < 2; ++nb)
+    for (int nb = 0; nb < 4; ++nb) {
         #pragma unroll
         for (int rg = 0; rg < 2; ++rg)
             #pragma unroll
             for (int j = 0; j < 8; ++j) {
-                const int col = token_half * 32 + nb * 16 + m_lane;
-                const int row = row_pair * 32 + rg * 16 + 8 * k_half + j;
-                slots[col * 64 + row] = acc[nb][rg][j];
+                const int col = (rg * 16 + 8 * kh + j + ml) & 31;
+                slots[wave * 512 + ml * 32 + col] = acc[nb][rg][j];
             }
-    __syncthreads();
-    for (int i = tid; i < 64 * 64; i += 128) {
-        const int col = i >> 6, row = i & 63;
-        if (bs + col < N && rs + row < M) {
-            float* out = Y + (long long)(bs + col) * M + rs + row;
-            const float v = slots[i];
-            if (add) *out = __fadd_rn(*out, v);
-            else *out = v;
+        __syncthreads();
+        #pragma unroll
+        for (int t = 0; t < 16; ++t) {
+            const int col = bs + wave_token + nb * 16 + t;
+            const int row = rs + wave_row + lane;
+            if (col < N && row < M) {
+                float* out = Y + (long long)col * M + row;
+                const float v = slots[wave * 512 + t * 32 + ((lane + t) & 31)];
+                if (add) *out = __fadd_rn(*out, v);
+                else *out = v;
+            }
         }
+        __syncthreads();
     }
 }
 #endif
