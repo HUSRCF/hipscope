@@ -1045,6 +1045,28 @@ mod c5_tests {
             assert!(blamed, "finding at {consumer:?} names no ds_store_2addr_b64 source");
         }
     }
+    /// Path-sensitivity pin: layout positions 956/957/973/974 are
+    /// obligations (feasible first-iteration paths via the 915 jump that
+    /// skip the 928-949 waits), while 917/925 are not (reachable only from
+    /// a later block; the 915->916 layout fall-through never executes).
+    #[test]
+    fn kt48_path_sensitive_sites() {
+        let body = kt48_body();
+        let replay = replay(&body, Arch::Gfx1201).unwrap();
+        let positions: Vec<usize> = replay
+            .obligations
+            .iter()
+            .map(|obligation| {
+                body.layout.iter().position(|id| *id == obligation.insts[0]).unwrap()
+            })
+            .collect();
+        for expected in [956, 957, 973, 974] {
+            assert!(positions.contains(&expected), "missing feasible-path site {expected}");
+        }
+        for infeasible in [917, 925] {
+            assert!(!positions.contains(&infeasible), "infeasible-path site {infeasible} flagged");
+        }
+    }
 
     #[test]
     fn kt48_kmcnt_units_and_retirement() {
