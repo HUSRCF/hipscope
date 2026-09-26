@@ -1047,7 +1047,7 @@ extern "C" __global__ __launch_bounds__(256, 1) void hyper_read_up_fused_f32(
         }
     }
 }
-extern "C" __global__ void gated_delta_conv_bf16_f32(
+static __device__ __forceinline__ void gated_delta_conv_channel(
     const float* input,
     const __hip_bfloat16* kernel,
     const float* history,
@@ -1056,9 +1056,8 @@ extern "C" __global__ void gated_delta_conv_bf16_f32(
     int channels,
     int history_rows,
     int kernel_size,
-    int cursor) {
-    int channel = (int)(blockIdx.x * blockDim.x + threadIdx.x);
-    if (channel >= channels) return;
+    int cursor,
+    int channel) {
     const float current = bf16_to_f32(bf16_round(input[channel]));
     float value = bf16_to_f32(kernel[channel * kernel_size + history_rows]) * current;
     // causal_conv1d uses the raw HF weight order: oldest history first,
@@ -1077,6 +1076,22 @@ extern "C" __global__ void gated_delta_conv_bf16_f32(
     if (history_rows > 0) {
         next_history[cursor * channels + channel] = current;
     }
+}
+
+extern "C" __global__ void gated_delta_conv_bf16_f32(
+    const float* input,
+    const __hip_bfloat16* kernel,
+    const float* history,
+    float* output,
+    float* next_history,
+    int channels,
+    int history_rows,
+    int kernel_size,
+    int cursor) {
+    int channel = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (channel >= channels) return;
+    gated_delta_conv_channel(input, kernel, history, output, next_history, channels,
+                             history_rows, kernel_size, cursor, channel);
 }
 // K=4 causal convolution over row-major [rows, channels]: the per-row
 // kernel's ring, unrolled.  Row r reads x(r-3), x(r-2), x(r-1) (oldest
@@ -1179,6 +1194,22 @@ extern "C" __global__ void gated_delta_params_bf16_f32_batched(
     beta[flat] = 1.0f / (1.0f + expf(-bf16_to_f32(bf16_round(b[flat]))));
 }
 
+static __device__ __forceinline__ void gated_delta_params_head(
+    const float* a,
+    const float* b,
+    const __hip_bfloat16* a_log,
+    const __hip_bfloat16* dt_bias,
+    float* gate,
+    float* beta,
+    int head) {
+    float al = bf16_to_f32(a_log[head]);
+    float dt = bf16_to_f32(dt_bias[head]);
+    float value = bf16_to_f32(bf16_round(a[head])) + dt;
+    float softplus = value > 20.0f ? value : (value < -20.0f ? expf(value) : log1pf(expf(value)));
+    gate[head] = -expf(al) * softplus;
+    beta[head] = 1.0f / (1.0f + expf(-bf16_to_f32(bf16_round(b[head]))));
+}
+
 extern "C" __global__ void gated_delta_params_bf16_f32(
     const float* a,
     const float* b,
@@ -1189,12 +1220,41 @@ extern "C" __global__ void gated_delta_params_bf16_f32(
     int heads) {
     int head = (int)(blockIdx.x * blockDim.x + threadIdx.x);
     if (head >= heads) return;
-    float al = bf16_to_f32(a_log[head]);
-    float dt = bf16_to_f32(dt_bias[head]);
-    float value = bf16_to_f32(bf16_round(a[head])) + dt;
-    float softplus = value > 20.0f ? value : (value < -20.0f ? expf(value) : log1pf(expf(value)));
-    gate[head] = -expf(al) * softplus;
-    beta[head] = 1.0f / (1.0f + expf(-bf16_to_f32(bf16_round(b[head]))));
+    gated_delta_params_head(a, b, a_log, dt_bias, gate, beta, head);
+}
+
+// One decode row's convolution and gate parameters in one launch: blocks
+// [0, conv_blocks) run gated_delta_conv_bf16_f32, block conv_blocks runs
+// gated_delta_params_bf16_f32 (heads <= blockDim.x). Same per-element bodies,
+// so both outputs are bitwise the two launches.
+extern "C" __global__ void gated_delta_conv_params_bf16_f32(
+    const float* input,
+    const __hip_bfloat16* kernel,
+    const float* history,
+    float* output,
+    float* next_history,
+    int channels,
+    int history_rows,
+    int kernel_size,
+    int cursor,
+    const float* a,
+    const float* b,
+    const __hip_bfloat16* a_log,
+    const __hip_bfloat16* dt_bias,
+    float* gate,
+    float* beta,
+    int heads,
+    int conv_blocks) {
+    if ((int)blockIdx.x < conv_blocks) {
+        int channel = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+        if (channel >= channels) return;
+        gated_delta_conv_channel(input, kernel, history, output, next_history, channels,
+                                 history_rows, kernel_size, cursor, channel);
+    } else {
+        int head = (int)threadIdx.x;
+        if (head >= heads) return;
+        gated_delta_params_head(a, b, a_log, dt_bias, gate, beta, head);
+    }
 }
 
 extern "C" __global__ void gated_delta_params_f32(

@@ -16,8 +16,8 @@
 use crate::families::gemv::WeightRef;
 use crate::types::DispatchError;
 use rdna_compute::tensor_ops::{
-    argmax_f32, bf16_roundtrip_f32, gated_delta_chunk_route, gated_delta_conv,
-    gated_delta_conv_batched, gated_delta_gate, gated_delta_gate_batched, gated_delta_params,
+    argmax_f32, bf16_roundtrip_f32, gated_delta_chunk_route, gated_delta_conv_params,
+    gated_delta_conv_batched, gated_delta_gate, gated_delta_gate_batched,
     gated_delta_params_batched, gated_delta_step, gated_delta_step_batched,
     gated_delta_step_gate_wmma, hc_activation_fused_f32, hc_state_bf16_add_f32,
     hc_state_bf16_to_f32, hyper_norm, hyper_norm_f16, hyper_norm_gate, hyper_read_projected,
@@ -1024,7 +1024,12 @@ pub fn execute_gated_delta_net(
             };
             let projection_row = view(&projection, row * qkv, qkv);
             let projection2_row = view(&projection2, row * qkv, qkv);
-            hip(gated_delta_conv(
+            let a_row = view(&a, row * op.value_heads, op.value_heads);
+            let b_row = view(&b, row * op.value_heads, op.value_heads);
+            let gate_row = view(op.gate, row * op.value_heads, op.value_heads);
+            let beta_row = view(op.beta, row * op.value_heads, op.value_heads);
+            // Convolution and gate parameters of the row in one launch.
+            hip(gated_delta_conv_params(
                 gpu,
                 &GatedDeltaConv {
                     input: &projection_row,
@@ -1038,13 +1043,6 @@ pub fn execute_gated_delta_net(
                     cursor,
                     row_index: row,
                 },
-            ))?;
-            let a_row = view(&a, row * op.value_heads, op.value_heads);
-            let b_row = view(&b, row * op.value_heads, op.value_heads);
-            let gate_row = view(op.gate, row * op.value_heads, op.value_heads);
-            let beta_row = view(op.beta, row * op.value_heads, op.value_heads);
-            hip(gated_delta_params(
-                gpu,
                 &GatedDeltaParams {
                     a: &a_row,
                     b: &b_row,

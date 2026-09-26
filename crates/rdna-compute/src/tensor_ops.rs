@@ -1046,6 +1046,25 @@ pub struct GatedDeltaConv<'a> {
 }
 
 pub fn gated_delta_conv(gpu: &mut Gpu, p: &GatedDeltaConv<'_>) -> HipResult<()> {
+    gated_delta_conv_launch(gpu, p, None)
+}
+
+/// [`gated_delta_conv`] and [`gated_delta_params`] of one decode row in one
+/// launch (`heads <= 256`); both outputs are bitwise the two launches.
+pub fn gated_delta_conv_params(
+    gpu: &mut Gpu,
+    p: &GatedDeltaConv<'_>,
+    params: &GatedDeltaParams<'_>,
+    heads: usize,
+) -> HipResult<()> {
+    gated_delta_conv_launch(gpu, p, Some((params, heads)))
+}
+
+fn gated_delta_conv_launch(
+    gpu: &mut Gpu,
+    p: &GatedDeltaConv<'_>,
+    params: Option<(&GatedDeltaParams<'_>, usize)>,
+) -> HipResult<()> {
     for tensor in [p.input, p.history, p.output, p.next_history] {
         ensure_f32(tensor)?;
     }
@@ -1074,8 +1093,12 @@ pub fn gated_delta_conv(gpu: &mut Gpu, p: &GatedDeltaConv<'_>) -> HipResult<()> 
     let history_rows = checked_i32(expected_history_rows, "GDN convolution history rows")?;
     let kernel_size = checked_i32(p.kernel_size, "GDN convolution kernel width")?;
     let cursor = checked_i32(p.cursor, "GDN convolution cursor")?;
-    let grid = blocks(p.channels)?;
-    gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, "gated_delta_conv_bf16_f32")?;
+    let conv_blocks = blocks(p.channels)?;
+    let (kernel_name, grid) = match params {
+        None => ("gated_delta_conv_bf16_f32", conv_blocks),
+        Some(_) => ("gated_delta_conv_params_bf16_f32", conv_blocks + 1),
+    };
+    gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel_name)?;
     let mut args = KernargBlob::new();
     for tensor in [p.input, p.kernel, p.history, p.output, p.next_history] {
         args.push_ptr(tensor.buf.as_ptr());
@@ -1087,6 +1110,17 @@ pub fn gated_delta_conv(gpu: &mut Gpu, p: &GatedDeltaConv<'_>) -> HipResult<()> 
     // The offset the scalar actually landed at, not a hand-counted layout
     // constant: a changed argument list cannot silently move the binding.
     let cursor_offset = args.len() - 4;
+    if let Some((params, heads)) = params {
+        let heads_i = validate_gated_delta_params(params, heads)?;
+        if heads > 256 {
+            return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
+        }
+        for tensor in [params.a, params.b, params.a_log, params.dt_bias, params.gate, params.beta] {
+            args.push_ptr(tensor.buf.as_ptr());
+        }
+        args.push_i32(heads_i);
+        args.push_i32(checked_i32(conv_blocks as usize, "GDN convolution blocks")?);
+    }
     args.pad_to(16);
     // The cursor is `(start_position + row_index) % history_rows` by
     // construction, so it is a declared dynamic field rather than an unexplained
@@ -1110,7 +1144,7 @@ pub fn gated_delta_conv(gpu: &mut Gpu, p: &GatedDeltaConv<'_>) -> HipResult<()> 
         &[]
     };
     gpu.launch_blob_recorded(
-        "gated_delta_conv_bf16_f32",
+        kernel_name,
         [grid, 1, 1],
         [256, 1, 1],
         0,
@@ -1229,22 +1263,7 @@ pub struct GatedDeltaParams<'a> {
 }
 
 pub fn gated_delta_params(gpu: &mut Gpu, p: &GatedDeltaParams<'_>, heads: usize) -> HipResult<()> {
-    for tensor in [p.a, p.b, p.gate, p.beta] {
-        ensure_f32(tensor)?;
-    }
-    if heads == 0
-        || p.a_log.dtype != DType::BF16
-        || p.dt_bias.dtype != DType::BF16
-        || p.a.numel() != heads
-        || p.b.numel() != heads
-        || p.a_log.numel() != heads
-        || p.dt_bias.numel() != heads
-        || p.gate.numel() != heads
-        || p.beta.numel() != heads
-    {
-        return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
-    }
-    let heads_i = checked_i32(heads, "GDN parameter head count")?;
+    let heads_i = validate_gated_delta_params(p, heads)?;
     let grid = blocks(heads)?;
     gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, "gated_delta_params_bf16_f32")?;
     let mut args = KernargBlob::new();
@@ -1261,6 +1280,25 @@ pub fn gated_delta_params(gpu: &mut Gpu, p: &GatedDeltaParams<'_>, heads: usize)
         args.as_mut_slice(),
         crate::dispatch::ReplayLaunchBindings::NONE,
     )
+}
+
+fn validate_gated_delta_params(p: &GatedDeltaParams<'_>, heads: usize) -> HipResult<i32> {
+    for tensor in [p.a, p.b, p.gate, p.beta] {
+        ensure_f32(tensor)?;
+    }
+    if heads == 0
+        || p.a_log.dtype != DType::BF16
+        || p.dt_bias.dtype != DType::BF16
+        || p.a.numel() != heads
+        || p.b.numel() != heads
+        || p.a_log.numel() != heads
+        || p.dt_bias.numel() != heads
+        || p.gate.numel() != heads
+        || p.beta.numel() != heads
+    {
+        return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
+    }
+    checked_i32(heads, "GDN parameter head count")
 }
 /// Row-batched parameter expansion for the exact Qwen4 prefill route.
 pub struct GatedDeltaParamsBatched<'a> {
