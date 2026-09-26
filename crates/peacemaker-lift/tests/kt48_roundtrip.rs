@@ -659,3 +659,56 @@ fn assembler_parity_where_syntax_is_lossless() {
     assert_eq!((back.op, back.form, &back.operands, &back.mods, back.literal), (synth.op, synth.form, &synth.operands, &synth.mods, synth.literal));
     assert_ne!(back.fields, synth.fields, "reported: the don't-care differs, the semantics do not");
 }
+
+/// T10: the profiler entry script — kernarg extension 328 → 352 with three appended args,
+/// the `.__pm_profile` rename, and an entry `Insert` that loads the extension and copies
+/// the record pointer into claimed `s[28:29]` — as one transaction on the lifted program,
+/// then its inverse: stream and module identity hold again. The inserted instructions are
+/// decoded from pinned `llvm-mc -mcpu=gfx1201` words, so they carry the codec's own fields.
+#[test]
+fn edit_inverse_restores_bytes() {
+    use peacemaker_ir::edit::{analyze, Cursor, DescriptorChange, Edit, MetaChange};
+    use peacemaker_ir::inst::SymbolId;
+    use peacemaker_ir::metadata::Kernarg;
+    use peacemaker_ir::reg::{ClaimOwner, Kind, RegClaim, RegRef, Scope};
+    let co = kt48_co();
+    let lifted = lift(&co, Frontend::Hipcc);
+    let symbol = SymbolId(SELECTED.into());
+    let base = analyze(lifted.program, &symbol).unwrap();
+    let original = emit::bytes(selected(&base.program)).unwrap();
+    // s_load_b128 s[4:7], s[0:1], 0x148; s_load_b64 s[8:9], s[0:1], 0x158;
+    // s_wait_kmcnt 0x0; s_mov_b32 s28, s4; s_mov_b32 s29, s5.
+    let words: [&[u32]; 5] = [&[0xf400_4100, 0xf800_0148], &[0xf400_2200, 0xf800_0158], &[0xbfc7_0000], &[0xbe9c_0004], &[0xbe9d_0005]];
+    let header: Vec<Inst> = words.iter().map(|w| gfx12::decode(w).unwrap().0).collect();
+    let header_bytes: Vec<u8> = words.concat().iter().flat_map(|w| w.to_le_bytes()).collect();
+    let arg = |name: &str, offset| Kernarg { name: name.into(), size: 8, offset, value_kind: "by_value".into() };
+    let args = vec![arg("pm_profile_records", 328), arg("pm_profile_stride", 336), arg("pm_profile_grid", 344)];
+    let claims = vec![RegClaim { name: "pm_pointer".into(), reg: RegRef { kind: Kind::S, base: 28, len: 2 }, scope: Scope::Whole, owner: ClaimOwner::Builder }];
+    let profiled = format!("{SELECTED}__pm_profile");
+    let entry = selected(&base.program).body.layout[0];
+    let script = Edit::Batch(vec![
+        Edit::Descriptor { kernel: symbol.clone(), change: DescriptorChange::KernargSize(352) },
+        Edit::Metadata { kernel: symbol.clone(), change: MetaChange::AppendArgs(args.clone()) },
+        Edit::Insert { at: Cursor::before(BlockId(0), entry), insts: header.clone(), claims: claims.clone() },
+        Edit::Metadata { kernel: symbol.clone(), change: MetaChange::Rename(profiled.clone()) },
+    ]);
+    // Without `.sgpr_count` 30 -> 32 (s29 + VCC) the resource check opens an obligation.
+    let (short, _) = base.edit(&symbol, script.clone()).unwrap();
+    assert!(short.obligations.iter().any(|o| o.rule_id == "resource-sgpr-metadata"), "claimed s[28:29] exceed .sgpr_count 30");
+    let Edit::Batch(mut steps) = script else { unreachable!() };
+    steps.insert(2, Edit::Metadata { kernel: symbol.clone(), change: MetaChange::SetSgprCount(32) });
+    let script = Edit::Batch(steps);
+    let (edited, delta) = base.edit(&symbol, script).unwrap();
+    assert_eq!(delta.kernel.0, profiled);
+    let kernel = edited.program.kernels.iter().find(|k| k.symbol.0 == profiled).expect("renamed kernel");
+    assert_eq!(emit::bytes(kernel).unwrap(), [header_bytes, original.clone()].concat(), "the original stream follows the header unchanged");
+    let Abi::Hsa { descriptor, metadata } = &kernel.abi else { unreachable!() };
+    assert_eq!((descriptor.kernarg_size, metadata.parsed.args.len(), metadata.parsed.sgpr_count), (352, 28, 32));
+    assert_eq!(&metadata.parsed.args[25..], args.as_slice());
+    let count = |a: &peacemaker_ir::state::Analyzed<Program>| a.obligations.len();
+    assert_eq!(count(&edited), count(&base), "the script opens no obligation");
+
+    let (restored, _) = edited.undo(&delta).unwrap();
+    assert_eq!(emit::bytes(selected(&restored.program)).unwrap(), original, "stream identity after the inverse");
+    assert_eq!(emit::module(&restored.program).unwrap(), co, "module identity after the inverse");
+}

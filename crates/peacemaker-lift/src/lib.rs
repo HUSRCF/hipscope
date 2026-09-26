@@ -356,11 +356,9 @@ pub fn lift_raw(_bytes: &[u8], _abi: Abi, _arch: Arch) -> Result<Lifted<Program>
 /// Emission from typed fields: branch labels are lowered against the current layout and
 /// every instruction is re-encoded by the codec; `prov.bytes` is never read.
 pub mod emit {
-    use peacemaker_ir::cfg::BlockId;
     use peacemaker_ir::codec::gfx12;
+    use peacemaker_ir::edit::{lower_labels, EditError};
     use peacemaker_ir::inst::{Abi, Arch, Inst, Kernel, Program};
-    use peacemaker_ir::operand::{ImmField, Operand};
-    use peacemaker_ir::passes::cfg::dwords_of;
 
     use crate::bundle::{SourceCodec, SourceError};
     use crate::elf::KernelParts;
@@ -368,12 +366,8 @@ pub mod emit {
 
     #[derive(Debug, thiserror::Error)]
     pub enum EmitError {
-        #[error("{kernel}: layout index {index} refers to a missing instruction")]
-        Dangling { kernel: String, index: usize },
-        #[error("{kernel}: branch at layout index {index} names block {} which does not exist", .target.0)]
-        MissingBlock { kernel: String, index: usize, target: BlockId },
-        #[error("{kernel}: branch at layout index {index} needs {offset} dwords, outside simm16")]
-        BranchRange { kernel: String, index: usize, offset: i64 },
+        #[error("{kernel}: {error}")]
+        Lower { kernel: String, #[source] error: EditError },
         #[error("{kernel}: layout index {index}: {reason}")]
         Encode { kernel: String, index: usize, reason: String },
         #[error("kernel {0} has a raw ABI and cannot be packaged without an adapter")]
@@ -389,30 +383,7 @@ pub mod emit {
     /// The kernel's instructions in layout order with every `Label` lowered to its SOPP
     /// offset (signed dwords from the next PC) under the current layout.
     pub fn insts(kernel: &Kernel) -> Result<Vec<Inst>, EmitError> {
-        let body = &kernel.body;
-        let name = || kernel.symbol.0.clone();
-        let mut out = Vec::with_capacity(body.layout.len());
-        let mut pcs = Vec::with_capacity(body.layout.len());
-        let mut pc = 0i64;
-        for (index, &id) in body.layout.iter().enumerate() {
-            let inst = body.insts.get(id).ok_or_else(|| EmitError::Dangling { kernel: name(), index })?;
-            pcs.push(pc);
-            pc += dwords_of(inst) as i64;
-            out.push(inst.clone());
-        }
-        for (index, inst) in out.iter_mut().enumerate() {
-            let next = pcs[index] + dwords_of(inst) as i64;
-            for operand in inst.operands.iter_mut() {
-                let Operand::Label(target) = *operand else { continue };
-                let start = body.blocks.get(target.0).filter(|block| block.id == target)
-                    .map(|block| block.range.0)
-                    .ok_or_else(|| EmitError::MissingBlock { kernel: name(), index, target })?;
-                let offset = pcs[start] - next;
-                let simm = i16::try_from(offset).map_err(|_| EmitError::BranchRange { kernel: name(), index, offset })?;
-                *operand = Operand::Imm(ImmField::Sopp(simm));
-            }
-        }
-        Ok(out)
+        lower_labels(&kernel.body).map_err(|error| EmitError::Lower { kernel: kernel.symbol.0.clone(), error })
     }
 
     /// Encoded words of the kernel stream.
