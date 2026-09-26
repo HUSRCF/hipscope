@@ -184,61 +184,95 @@ pub fn project_weights(
             }
         }
     }
-    for (i, &(weight, output)) in projections.iter().enumerate() {
-        if !done[i] {
-            project_one(gpu, weight, input, output, rows, rotation)?;
+    // Quantized weights of one FWHT basis and K read the same rotated input:
+    // rotate it once for the whole group instead of once per weight.
+    for i in 0..projections.len() {
+        if done[i] {
+            continue;
+        }
+        let (weight, _) = projections[i];
+        let rotated = rotate_input(gpu, weight, input, rows, rotation)?;
+        let x = rotated.as_ref().unwrap_or(input);
+        for j in i..projections.len() {
+            let (w, out) = projections[j];
+            let same_input = j == i
+                || (rotated.is_some()
+                    && w.k == weight.k
+                    && rotation_basis(w.dtype) == rotation_basis(weight.dtype));
+            if !done[j] && same_input {
+                project_rotated(gpu, w, x, out, rows)?;
+                done[j] = true;
+            }
         }
     }
     Ok(())
 }
 
-fn project_one(
+/// FWHT basis a quantized projection payload reads: the aligned-K 256-wide
+/// one (MQ4G256V2, MQ6G256V2, MFP4G32E8SOA) or MQ4G128V2's row-local 128-wide
+/// one. `None` for payloads that read the natural activation.
+#[derive(PartialEq)]
+enum RotationBasis {
+    Aligned256,
+    RowLocal128,
+}
+
+fn rotation_basis(dtype: DType) -> Option<RotationBasis> {
+    match dtype {
+        DType::MQ4G256V2 | DType::MQ6G256V2 | DType::MFP4G32E8SOA => Some(RotationBasis::Aligned256),
+        DType::MQ4G128V2 => Some(RotationBasis::RowLocal128),
+        _ => None,
+    }
+}
+
+/// Rotate `input` into `weight`'s FWHT basis in the rotation scratch, or
+/// `None` when the payload reads the natural activation.
+fn rotate_input(
     gpu: &mut Gpu,
     weight: &WeightRef<'_>,
     input: &GpuTensor,
-    output: &GpuTensor,
     rows: usize,
     rotation: Option<&GpuTensor>,
-) -> Result<(), DispatchError> {
-    let rotated = match weight.dtype {
+) -> Result<Option<GpuTensor>, DispatchError> {
+    let basis = match weight.dtype {
         // BF16 and Q8F16 read the natural activation: neither carries an FWHT
         // basis, so no rotation is owed and the scratch stays untouched.
-        DType::BF16 | DType::Q8_0 => None,
-        // MQ4G256V2 and MQ6G256V2 share the aligned-K 256-wide FWHT basis;
-        // MQ4G128V2 carries the row-local 128-wide one.
-        DType::MQ4G256V2 | DType::MQ4G128V2 | DType::MQ6G256V2 | DType::MFP4G32E8SOA => {
-            let rotation = rotation.ok_or(DispatchError::UnsupportedVariant {
-                family: "layer-operations",
-                variant: "rotation-scratch-absent",
-                arch: "",
-                quant: "quantized",
-            })?;
-            let elements = checked_mul(rows, weight.k, "rotation scratch")?;
-            let scratch = view(rotation, 0, elements);
-            if matches!(
-                weight.dtype,
-                DType::MQ4G256V2 | DType::MQ6G256V2 | DType::MFP4G32E8SOA
-            ) {
-                if rows > 1 {
-                    hip(gpu.rotate_x_mq_batched(input, &scratch, weight.k, rows))?;
-                } else {
-                    hip(gpu.rotate_x_mq(input, &scratch, weight.k))?;
-                }
-            } else {
-                hip(gpu.rotate_x_mq_128_v2(input, &scratch, weight.k, rows))?;
-            }
-            Some(scratch)
-        }
-        _ => {
-            return Err(DispatchError::UnsupportedVariant {
-                family: "layer-operations",
-                variant: "unprojectable-payload",
-                arch: "",
-                quant: "unsupported",
-            })
-        }
+        DType::BF16 | DType::Q8_0 => return Ok(None),
+        dtype => rotation_basis(dtype).ok_or(DispatchError::UnsupportedVariant {
+            family: "layer-operations",
+            variant: "unprojectable-payload",
+            arch: "",
+            quant: "unsupported",
+        })?,
     };
-    let x = rotated.as_ref().unwrap_or(input);
+    let rotation = rotation.ok_or(DispatchError::UnsupportedVariant {
+        family: "layer-operations",
+        variant: "rotation-scratch-absent",
+        arch: "",
+        quant: "quantized",
+    })?;
+    let elements = checked_mul(rows, weight.k, "rotation scratch")?;
+    let scratch = view(rotation, 0, elements);
+    match basis {
+        RotationBasis::Aligned256 if rows > 1 => {
+            hip(gpu.rotate_x_mq_batched(input, &scratch, weight.k, rows))?
+        }
+        RotationBasis::Aligned256 => hip(gpu.rotate_x_mq(input, &scratch, weight.k))?,
+        RotationBasis::RowLocal128 => {
+            hip(gpu.rotate_x_mq_128_v2(input, &scratch, weight.k, rows))?
+        }
+    }
+    Ok(Some(scratch))
+}
+
+/// Run one projection on an input already in the weight's basis.
+fn project_rotated(
+    gpu: &mut Gpu,
+    weight: &WeightRef<'_>,
+    x: &GpuTensor,
+    output: &GpuTensor,
+    rows: usize,
+) -> Result<(), DispatchError> {
     if weight.dtype == DType::MQ6G256V2 && (2..=4).contains(&rows) {
         return hip(gpu.gemm_mq6g256v2_f32_rows(weight.buf, x, output, weight.m, weight.k, rows));
     }
