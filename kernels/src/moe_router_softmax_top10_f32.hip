@@ -13,21 +13,42 @@
 // topk_idx is an i32 bit-pattern stored in the project's F32-typed scratch
 // convention.  `normalize_topk_prob != 0` applies the Qwen4 selected-probability
 // renormalization after the float32 softmax.
-__device__ __forceinline__ bool router_better(
-    float lhs_value,
-    int lhs_index,
-    float rhs_value,
-    int rhs_index
-) {
-    return lhs_value > rhs_value ||
-        (lhs_value == rhs_value && lhs_index < rhs_index);
-}
 
 // bf16_round_trip_f32's rounding (RNE; non-finite values unchanged).
 __device__ __forceinline__ float router_bf16_rt(float v) {
     if (!isfinite(v)) return v;
     const unsigned int u = __float_as_uint(v);
     return __uint_as_float((u + 0x7FFFu + ((u >> 16) & 1u)) & 0xFFFF0000u);
+}
+
+// Wave32 max / min, the result in every lane. Max and min are exact and
+// order-independent, so the reduction shape does not matter; gfx11/gfx12 use
+// row_xmask DPP and permlanex16 instead of LDS-crossbar shuffles.
+__device__ __forceinline__ float router_wave_max(float v) {
+#if defined(__GFX11__) || defined(__GFX12__)
+    v = fmaxf(v, __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(v), 0x161, 0xf, 0xf, false)));
+    v = fmaxf(v, __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(v), 0x162, 0xf, 0xf, false)));
+    v = fmaxf(v, __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(v), 0x164, 0xf, 0xf, false)));
+    v = fmaxf(v, __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(v), 0x168, 0xf, 0xf, false)));
+    v = fmaxf(v, __int_as_float(__builtin_amdgcn_permlanex16(
+        __float_as_int(v), __float_as_int(v), 0x76543210u, 0xfedcba98u, false, false)));
+#else
+    for (int offset = 16; offset > 0; offset >>= 1) v = fmaxf(v, __shfl_xor(v, offset, 32));
+#endif
+    return v;
+}
+
+__device__ __forceinline__ int router_wave_min(int v) {
+#if defined(__GFX11__) || defined(__GFX12__)
+    v = min(v, __builtin_amdgcn_update_dpp(0, v, 0x161, 0xf, 0xf, false));
+    v = min(v, __builtin_amdgcn_update_dpp(0, v, 0x162, 0xf, 0xf, false));
+    v = min(v, __builtin_amdgcn_update_dpp(0, v, 0x164, 0xf, 0xf, false));
+    v = min(v, __builtin_amdgcn_update_dpp(0, v, 0x168, 0xf, 0xf, false));
+    v = min(v, __builtin_amdgcn_permlanex16(v, v, 0x76543210u, 0xfedcba98u, false, false));
+#else
+    for (int offset = 16; offset > 0; offset >>= 1) v = min(v, __shfl_xor(v, offset, 32));
+#endif
+    return v;
 }
 
 // `round_logits != 0` reads every logit through that BF16 round trip, the
@@ -67,25 +88,14 @@ extern "C" __global__ void moe_router_softmax_top10_f32(
     const int first_index = thread;
     const int second_index = thread + 256;
 
-    // The global top ten must be among each wave's local top ten.  Select those
-    // with register state and wave shuffles; no block barrier is needed here.
+    // The global top ten must be among each wave's local top ten. Each rank
+    // takes the wave max, then the lowest index holding it: the
+    // stable (value desc, index asc) order.
     for (int rank = 0; rank < 10; ++rank) {
-        float best_value = first_value;
-        int best_index = first_index;
-        if (router_better(second_value, second_index, best_value, best_index)) {
-            best_value = second_value;
-            best_index = second_index;
-        }
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            const float other_value = __shfl_down(best_value, offset, 32);
-            const int other_index = __shfl_down(best_index, offset, 32);
-            if (router_better(other_value, other_index, best_value, best_index)) {
-                best_value = other_value;
-                best_index = other_index;
-            }
-        }
-        best_value = __shfl(best_value, 0, 32);
-        best_index = __shfl(best_index, 0, 32);
+        const float best_value = router_wave_max(fmaxf(first_value, second_value));
+        const int candidate = first_value == best_value ? first_index
+            : second_value == best_value ? second_index : 0x7fffffff;
+        const int best_index = router_wave_min(candidate);
         if (lane == 0) {
             wave_values[wave * 10 + rank] = best_value;
             wave_indices[wave * 10 + rank] = best_index;
@@ -95,8 +105,8 @@ extern "C" __global__ void moe_router_softmax_top10_f32(
     }
     __syncthreads();
 
-    // Wave 0 merges the 80 wave-local candidates.  Each lane owns at most
-    // three values and participates in the same stable wave reduction.
+    // Wave 0 merges the 80 wave-local candidates the same way; each lane owns
+    // at most three.
     if (wave == 0) {
         const int slot0 = lane;
         const int slot1 = lane + 32;
@@ -109,26 +119,12 @@ extern "C" __global__ void moe_router_softmax_top10_f32(
         const int index2 = slot2 < 80 ? wave_indices[slot2] : 0x7fffffff;
 
         for (int rank = 0; rank < top_k; ++rank) {
-            float best_value = value0;
-            int best_index = index0;
-            if (router_better(value1, index1, best_value, best_index)) {
-                best_value = value1;
-                best_index = index1;
-            }
-            if (router_better(value2, index2, best_value, best_index)) {
-                best_value = value2;
-                best_index = index2;
-            }
-            for (int offset = 16; offset > 0; offset >>= 1) {
-                const float other_value = __shfl_down(best_value, offset, 32);
-                const int other_index = __shfl_down(best_index, offset, 32);
-                if (router_better(other_value, other_index, best_value, best_index)) {
-                    best_value = other_value;
-                    best_index = other_index;
-                }
-            }
-            best_value = __shfl(best_value, 0, 32);
-            best_index = __shfl(best_index, 0, 32);
+            const float best_value = router_wave_max(fmaxf(fmaxf(value0, value1), value2));
+            int candidate = 0x7fffffff;
+            if (value0 == best_value) candidate = min(candidate, index0);
+            if (value1 == best_value) candidate = min(candidate, index1);
+            if (value2 == best_value) candidate = min(candidate, index2);
+            const int best_index = router_wave_min(candidate);
             if (lane == 0) {
                 topk_idx[(size_t)token * 10 + rank] = best_index;
                 selected_values[rank] = best_value;
