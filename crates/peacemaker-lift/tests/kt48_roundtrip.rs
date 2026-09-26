@@ -431,9 +431,19 @@ fn wait_facts_and_obligations() {
     let mut mutated = co.clone();
     mutated[at..at + 4].copy_from_slice(&0xbfc7_0001u32.to_le_bytes());
     let weakened = lift(&mutated, Frontend::Hipcc);
-    let facts = replay(&selected(&weakened.program).body, ARCH).unwrap();
-    assert!(facts.obligations.iter().any(|o| o.kind == ObligationKind::Hazard && o.rule_id == "wait-raw-smem-load"),
-        "kmcnt 0x1 leaves the s_load_b128 destination pending at its use");
+    let body = &selected(&weakened.program).body;
+    let facts = replay(body, ARCH).unwrap();
+    let load = body.insts.get(smem[0].inst).unwrap();
+    assert_eq!(name(load), "s_load_b128");
+    let stranded: Vec<_> = facts.obligations.iter()
+        .filter(|o| o.kind == ObligationKind::Hazard && o.rule_id == "wait-raw-smem-load")
+        .collect();
+    assert!(!stranded.is_empty(), "kmcnt 0x1 leaves the s_load_b128 destination pending at its use");
+    for obligation in stranded {
+        let effects = &body.insts.get(obligation.insts[0]).unwrap().effects;
+        let touched = effects.uses.iter().chain(&effects.defs).any(|r| load.effects.defs.iter().any(|d| d.overlaps(*r)));
+        assert!(touched, "{} names no access to the s_load_b128 destination", obligation.text);
+    }
 }
 
 /// Path-sensitivity pin (C5 erratum): the first-iteration sites 956/957/973/974 are
@@ -629,7 +639,7 @@ fn assembler_parity_where_syntax_is_lossless() {
     assert_eq!(synth_text, lines[index], "the unused src2 is invisible in canonical text");
     let synth_words = gfx12::encode(&synth).unwrap();
     let Some(tools) = toolchain() else {
-        eprintln!("T9: no pinned toolchain (PEACEMAKER_ROCM unset); assembler parity not run");
+        eprintln!("T9: no pinned toolchain; assembler parity not run");
         return;
     };
     let assembled = mc(&tools, &lines);
