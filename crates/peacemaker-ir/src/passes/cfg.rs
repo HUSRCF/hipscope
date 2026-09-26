@@ -53,11 +53,14 @@ pub fn dwords_of(inst: &Inst) -> usize {
 
 /// Dword PCs per layout position plus per-instruction widths, as computed by
 /// [`build_blocks`]. PCs are relative to the start of `layout` (branch
-/// offsets are PC-relative, so no VA is needed).
+/// offsets are PC-relative, so no VA is needed). `entry_target_leaders` is
+/// the sorted entry-plus-branch-target subset of leaders (fall-through-only
+/// leaders excluded); on KT48 it must be hipcc's 57 labels plus the entry.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LayoutInfo {
     pub pcs: Vec<u32>,
     pub dwords: Vec<usize>,
+    pub entry_target_leaders: Vec<usize>,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -172,22 +175,22 @@ pub fn build_blocks(body: &mut Body) -> Result<LayoutInfo, CfgError> {
         }
     }
 
-    // Leaders, grounded in hipcc's own `.s`: entry, every branch target, and
-    // the fall-through after an unconditional jump or terminator. Conditional
-    // branches do NOT split: their fall-through continues the block, so a
-    // block may hold interior conditional branches (KT48: 14 of 58 blocks).
-    // (Halt/Trap terminate the path like s_endpgm; see the Terminator mapping
-    // below.) A jump or terminator is therefore always block-final; only
-    // conditional branches occur in block interiors.
+    // Leaders: true basic blocks. Every branch (conditional or not) ends its
+    // block, so leaders are the entry, every branch target, and the
+    // fall-through after every branch, jump, or terminator. (Halt/Trap
+    // terminate the path like s_endpgm; see the Terminator mapping below.)
+    // `entry_target_leaders` records the entry-plus-target subset separately:
+    // on KT48 it must equal hipcc's 57 labels plus the unlabeled entry (the
+    // T4 sub-assertion; C7 owns the full T4).
     let mut leaders = BTreeSet::new();
     leaders.insert(0usize);
+    let mut entry_target_leaders = BTreeSet::new();
+    entry_target_leaders.insert(0usize);
     for (i, end) in ends.iter().enumerate() {
         match end {
-            Some(End::Branch { target_pos }) => {
+            Some(End::Branch { target_pos } | End::Jump { target_pos }) => {
                 leaders.insert(*target_pos);
-            }
-            Some(End::Jump { target_pos }) => {
-                leaders.insert(*target_pos);
+                entry_target_leaders.insert(*target_pos);
                 if i + 1 < n {
                     leaders.insert(i + 1);
                 }
@@ -217,14 +220,12 @@ pub fn build_blocks(body: &mut Body) -> Result<LayoutInfo, CfgError> {
     let block_count = leader_list.len();
 
     // Stage terms and edges locally; commit to `body` only on success so a
-    // MissingEndPgm never leaves a half-built CFG behind. Every conditional
-    // branch in the block contributes its taken edge; the term names the
-    // final control instruction, or the first interior branch when the final
-    // instruction falls through (representative for multi-branch blocks; the
-    // full edge set is always in succs/preds).
+    // MissingEndPgm never leaves a half-built CFG behind. Leaders guarantee
+    // the only control instruction in a block is its final one, so the term
+    // names it directly and each block has at most two successors.
     #[derive(Clone)]
     enum Term {
-        Branch { taken: usize, cond_pos: usize },
+        Branch { taken: usize },
         Jump { taken: usize },
         EndPgm,
         FallThrough { next: Option<usize> },
@@ -233,33 +234,24 @@ pub fn build_blocks(body: &mut Body) -> Result<LayoutInfo, CfgError> {
     let mut succs: Vec<Vec<usize>> = vec![Vec::new(); block_count];
     for (block_idx, &start) in leader_list.iter().enumerate() {
         let end = if block_idx + 1 < block_count { leader_list[block_idx + 1] } else { n };
-        let mut taken_blocks: Vec<usize> = (start..end)
-            .filter_map(|pos| match &ends[pos] {
-                Some(End::Branch { target_pos }) => Some(pos_block[*target_pos]),
-                _ => None,
-            })
-            .collect();
         let next = if block_idx + 1 < block_count { Some(block_idx + 1) } else { None };
         match &ends[end - 1] {
             Some(End::Jump { target_pos }) => {
                 let taken = pos_block[*target_pos];
                 terms[block_idx] = Term::Jump { taken };
                 succs[block_idx].push(taken);
-                succs[block_idx].extend(taken_blocks.drain(..));
             }
             Some(End::Terminating) => {
                 terms[block_idx] = Term::EndPgm;
-                succs[block_idx].extend(taken_blocks.drain(..));
             }
             Some(End::Branch { target_pos }) => {
                 let taken = pos_block[*target_pos];
                 let Some(next) = next else {
                     return Err(CfgError::MissingEndPgm);
                 };
-                terms[block_idx] = Term::Branch { taken, cond_pos: end - 1 };
+                terms[block_idx] = Term::Branch { taken };
                 succs[block_idx].push(taken);
                 succs[block_idx].push(next);
-                succs[block_idx].extend(taken_blocks.drain(..));
             }
             None => {
                 // Last-block fall-through is tentative: endpgm padding stays
@@ -267,25 +259,10 @@ pub fn build_blocks(body: &mut Body) -> Result<LayoutInfo, CfgError> {
                 // (checked after reachability below).
                 let Some(next) = next else {
                     terms[block_idx] = Term::FallThrough { next: None };
-                    succs[block_idx].sort_unstable();
-                    succs[block_idx].dedup();
                     continue;
                 };
-                match taken_blocks.first() {
-                    Some(&first) => {
-                        let cond_pos = (start..end)
-                            .find(|&pos| {
-                                matches!(ends[pos], Some(End::Branch { .. }))
-                            })
-                            .expect("first taken has a source position");
-                        terms[block_idx] = Term::Branch { taken: first, cond_pos };
-                    }
-                    None => {
-                        terms[block_idx] = Term::FallThrough { next: Some(next) };
-                    }
-                }
+                terms[block_idx] = Term::FallThrough { next: Some(next) };
                 succs[block_idx].push(next);
-                succs[block_idx].extend(taken_blocks.drain(..));
             }
         }
         succs[block_idx].sort_unstable();
@@ -316,8 +293,8 @@ pub fn build_blocks(body: &mut Body) -> Result<LayoutInfo, CfgError> {
             Terminator::Unreachable
         } else {
             match &terms[block_idx] {
-                Term::Branch { taken, cond_pos } => {
-                    let cond = match body.insts.get(body.layout[*cond_pos]).and_then(
+                Term::Branch { taken } => {
+                    let cond = match body.insts.get(body.layout[end - 1]).and_then(
                         |inst| match inst.effects.control {
                             Control::Branch { cond } => Some(cond),
                             _ => None,
@@ -325,7 +302,7 @@ pub fn build_blocks(body: &mut Body) -> Result<LayoutInfo, CfgError> {
                     ) {
                         Some(cond) => cond,
                         None => {
-                            return Err(CfgError::MissingOffset { index: *cond_pos });
+                            return Err(CfgError::MissingOffset { index: end - 1 });
                         }
                     };
                     Terminator::Branch {
@@ -379,7 +356,28 @@ pub fn build_blocks(body: &mut Body) -> Result<LayoutInfo, CfgError> {
         }
     }
     body.blocks = blocks;
-    Ok(LayoutInfo { pcs, dwords })
+    Ok(LayoutInfo {
+        pcs,
+        dwords,
+        entry_target_leaders: entry_target_leaders.into_iter().collect(),
+    })
+}
+
+/// Layout positions that are branch targets, derived from rewritten
+/// `Operand::Label` operands (call after [`build_blocks`]). Used by the
+/// window passes to distinguish a branch-target crossing (reject) from a
+/// mere fall-through split (straight-line, allowed).
+pub fn branch_target_positions(body: &Body) -> BTreeSet<usize> {
+    let mut out = BTreeSet::new();
+    for id in &body.layout {
+        let Some(inst) = body.insts.get(*id) else { continue };
+        for op in &inst.operands {
+            if let Operand::Label(target) = op {
+                out.insert(body.blocks[target.0].range.0);
+            }
+        }
+    }
+    out
 }
 
 /// CFG analysis over built blocks: dominators, post-dominators, loop nesting.
@@ -671,9 +669,9 @@ mod tests {
     }
 
     #[test]
-    fn diamond_merges_conditional_fallthrough() {
-        // Leaders are entry + targets + post-jump only: the conditional
-        // fall-through stays in-block.
+    fn diamond_splits_four_true_blocks_with_typed_targets() {
+        // True basic blocks: every branch ends its block, so the conditional
+        // fall-through starts a new one. Leaders {0,2,4,5}.
         // mov@0 cbr@1(taken mul@4) add@2 jmp@3(to sub@5) mul@4 sub@5 endpgm@6
         let mut body = body_of(vec![
             plain("v_mov_b32_e32", Form::Vop1),
@@ -684,29 +682,32 @@ mod tests {
             plain("v_sub_nc_u32_e32", Form::Vop2),
             inst("s_endpgm", Form::Sopp, Control::EndPgm, Vec::new()),
         ]);
-        build_blocks(&mut body).unwrap();
-        assert_eq!(body.blocks.len(), 3);
+        let info = build_blocks(&mut body).unwrap();
+        // Entry-plus-target leaders exclude the fall-through-only leader @2.
+        assert_eq!(info.entry_target_leaders, vec![0, 4, 5]);
+        assert_eq!(body.blocks.len(), 4);
         let terms: Vec<_> = body.blocks.iter().map(|b| &b.term).collect();
-        // Entry block holds the interior conditional plus the final jump;
-        // the term names the final control instruction.
-        assert!(matches!(terms[0], Terminator::Jump(t) if *t == BlockId(2)));
-        assert!(matches!(terms[1], Terminator::FallThrough));
-        assert!(matches!(terms[2], Terminator::EndPgm));
-        // Both exits of the entry block are edges, including the interior one.
-        assert_eq!(body.blocks[0].succs.len(), 2);
-        assert!(body.blocks[0].succs.contains(&BlockId(1)));
+        assert!(matches!(
+            terms[0],
+            Terminator::Branch { cond: Cond::Scc1, taken, fallthrough }
+            if *taken == BlockId(2) && *fallthrough == BlockId(1)
+        ));
+        assert!(matches!(terms[1], Terminator::Jump(t) if *t == BlockId(3)));
+        assert!(matches!(terms[2], Terminator::FallThrough));
+        assert!(matches!(terms[3], Terminator::EndPgm));
         // Offsets are rewritten to labels.
         for id in &body.layout {
             for op in &body.insts.get(*id).unwrap().operands {
                 assert!(!matches!(op, Operand::Imm(ImmField::Sopp(_))), "offset survived");
             }
         }
-        assert_eq!(body.blocks[2].preds.len(), 2);
+        assert_eq!(body.blocks[3].preds.len(), 2);
         let cfg = Cfg::build(&body).unwrap();
-        assert!(cfg.dominates(BlockId(0), BlockId(2)));
-        assert!(!cfg.dominates(BlockId(1), BlockId(2)));
-        assert!(cfg.post_dominates(BlockId(2), BlockId(0)));
-        assert!(cfg.post_dominates(BlockId(2), BlockId(1)));
+        assert!(cfg.dominates(BlockId(0), BlockId(3)));
+        assert!(!cfg.dominates(BlockId(1), BlockId(3)));
+        assert!(!cfg.dominates(BlockId(2), BlockId(3)));
+        assert!(cfg.post_dominates(BlockId(3), BlockId(0)));
+        assert!(cfg.post_dominates(BlockId(3), BlockId(1)));
         assert!(!cfg.post_dominates(BlockId(1), BlockId(0)));
         assert!(cfg.loops().is_empty());
         assert_eq!(cfg.loop_depth(BlockId(1)), 0);
@@ -714,8 +715,7 @@ mod tests {
 
     #[test]
     fn loop_backedge_forms_one_loop_with_signed_offset() {
-        // The loop body merges into one block: the conditional fall-through
-        // is not a leader. Leaders {0,2,6}.
+        // True blocks split at the conditional fall-through. Leaders {0,2,4,6}.
         // mov@0 jmp@1(->H@2) add@2 cbr@3(taken exit@6) mul@4 jmp@5(->H@2, off -4) endpgm@6
         let mut body = body_of(vec![
             plain("v_mov_b32_e32", Form::Vop1),
@@ -727,23 +727,21 @@ mod tests {
             inst("s_endpgm", Form::Sopp, Control::EndPgm, Vec::new()),
         ]);
         build_blocks(&mut body).unwrap();
-        assert_eq!(body.blocks.len(), 3);
-        // Loop block holds the interior conditional plus the back-edge jump.
-        assert!(matches!(body.blocks[1].term, Terminator::Jump(t) if t == BlockId(1)));
-        assert!(body.blocks[1].succs.contains(&BlockId(2)));
+        assert_eq!(body.blocks.len(), 4);
+        assert!(matches!(body.blocks[2].term, Terminator::Jump(t) if t == BlockId(1)));
         let cfg = Cfg::build(&body).unwrap();
         assert_eq!(cfg.loops().len(), 1);
         assert_eq!(cfg.loops()[0].header, BlockId(1));
-        assert_eq!(cfg.loops()[0].members, vec![BlockId(1)]);
-        assert_eq!(cfg.loop_depth(BlockId(1)), 1);
-        assert_eq!(cfg.loop_depth(BlockId(2)), 0);
-        assert!(cfg.dominates(BlockId(0), BlockId(1)));
+        assert_eq!(cfg.loops()[0].members, vec![BlockId(1), BlockId(2)]);
+        assert_eq!(cfg.loop_depth(BlockId(2)), 1);
+        assert_eq!(cfg.loop_depth(BlockId(3)), 0);
+        assert!(cfg.dominates(BlockId(1), BlockId(2)));
     }
 
     #[test]
     fn multi_block_loop_nests_header_and_body() {
-        // A jump into the loop body splits it into its own block, so the SCC
-        // spans two blocks with the header dominating the body.
+        // Leaders {0,1,2,3,5}: the conditional fall-through splits the header
+        // from the body entry, so the SCC spans three blocks.
         // jmp@0(->H@1) H:cbr@1(taken exit@5) jmp@2(->body@3) mul@3 jmp@4(->H@1) endpgm@5
         let mut body = body_of(vec![
             sopp_branch("s_branch", None, 0),
@@ -754,13 +752,13 @@ mod tests {
             inst("s_endpgm", Form::Sopp, Control::EndPgm, Vec::new()),
         ]);
         build_blocks(&mut body).unwrap();
-        assert_eq!(body.blocks.len(), 4);
+        assert_eq!(body.blocks.len(), 5);
         let cfg = Cfg::build(&body).unwrap();
         assert_eq!(cfg.loops().len(), 1);
         assert_eq!(cfg.loops()[0].header, BlockId(1));
-        assert_eq!(cfg.loops()[0].members, vec![BlockId(1), BlockId(2)]);
-        assert!(cfg.dominates(BlockId(1), BlockId(2)));
-        assert!(!cfg.dominates(BlockId(2), BlockId(1)));
+        assert_eq!(cfg.loops()[0].members, vec![BlockId(1), BlockId(2), BlockId(3)]);
+        assert!(cfg.dominates(BlockId(1), BlockId(3)));
+        assert!(!cfg.dominates(BlockId(3), BlockId(1)));
     }
 
     #[test]

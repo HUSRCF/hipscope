@@ -460,7 +460,7 @@ mod tests {
 
     #[test]
     fn def_reaches_use_across_diamond_join() {
-        // b0: def v5 + interior cbr; b1: plain (branch target); b2: use v5.
+        // True blocks: b0 def+branch, b1 plain, b2 plain (target), b3 join+use.
         let mut body = body_of(vec![
             vdef(5),
             branch(2),
@@ -471,17 +471,18 @@ mod tests {
             endpgm(),
         ]);
         build_blocks(&mut body).unwrap();
-        assert_eq!(body.blocks.len(), 3);
+        assert_eq!(body.blocks.len(), 4);
         let live = Liveness::analyze(&body);
         // v5 is live-in at the join and along both paths (may-analysis).
-        assert!(live.live_in(BlockId(2)).contains(&Loc::V(5)));
+        assert!(live.live_in(BlockId(3)).contains(&Loc::V(5)));
         assert!(live.live_in(BlockId(1)).contains(&Loc::V(5)));
+        assert!(live.live_in(BlockId(2)).contains(&Loc::V(5)));
         assert!(live.live_out(BlockId(0)).contains(&Loc::V(5)));
         assert!(!live.live_in(BlockId(0)).contains(&Loc::V(5)));
         // SCC is live-in at entry: the branch reads it.
         assert!(live.live_in(BlockId(0)).contains(&Loc::Scc));
         let cfg = Cfg::build(&body).unwrap();
-        assert!(cfg.dominates(BlockId(0), BlockId(2)));
+        assert!(cfg.dominates(BlockId(0), BlockId(3)));
     }
 
     #[test]
@@ -489,8 +490,7 @@ mod tests {
         // Spec §6.2 scenario at the liveness level: one path defines v200,
         // the other does not; the join's live-in still holds v200 (may), so a
         // later definite-assignment check (C6) must refuse unguarded uses.
-        // b0 holds the interior branch, the def, and the final jump; b1 is
-        // the path that never defines v200; b2 is the join.
+        // b0 branch, b1 defines v200, b2 never defines it, b3 is the join.
         let mut def = mk("v_mov_b32_e32", Form::Vop1);
         def.effects.defs.push(RegRef { kind: Kind::V, base: 200, len: 1 });
         let mut body = body_of(vec![
@@ -502,20 +502,20 @@ mod tests {
             endpgm(),
         ]);
         build_blocks(&mut body).unwrap();
-        assert_eq!(body.blocks.len(), 3);
+        assert_eq!(body.blocks.len(), 4);
         let live = Liveness::analyze(&body);
-        assert!(live.live_in(BlockId(2)).contains(&Loc::V(200)));
+        assert!(live.live_in(BlockId(3)).contains(&Loc::V(200)));
         // May-merge: v200 is live-out of BOTH predecessors, including the one
         // that never defined it. Liveness cannot tell initialised from live,
         // which is exactly why C6 needs definite assignment on top.
-        assert!(live.live_out(BlockId(0)).contains(&Loc::V(200)));
         assert!(live.live_out(BlockId(1)).contains(&Loc::V(200)));
+        assert!(live.live_out(BlockId(2)).contains(&Loc::V(200)));
     }
 
     #[test]
     fn loop_carried_value_stays_live() {
-        // b0: def; b1: use (no leader splits the fall-through); b2: interior
-        // cbr plus the back-edge jump. Leaders {0,2,3,6}.
+        // True blocks: b0 def+jump, b1 use, b2 branch, b3 body+jump-back.
+        // Leaders {0,2,3,4,6}.
         let mut use5 = mk("v_add_nc_u32_e32", Form::Vop2);
         use5.effects.uses.push(RegRef { kind: Kind::V, base: 5, len: 1 });
         use5.effects.defs.push(RegRef { kind: Kind::V, base: 6, len: 1 });
@@ -529,7 +529,7 @@ mod tests {
             endpgm(),
         ]);
         build_blocks(&mut body).unwrap();
-        assert_eq!(body.blocks.len(), 4);
+        assert_eq!(body.blocks.len(), 5);
         let live = Liveness::analyze(&body);
         assert!(live.live_in(BlockId(1)).contains(&Loc::V(5)));
         assert!(live.live_in(BlockId(2)).contains(&Loc::V(5)));
