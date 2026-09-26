@@ -2461,7 +2461,8 @@ fn indexed_attention_attention_batch_impl(
             Some(bytes)
                 if gpu.arch_caps.has_gfx11_plus_simt()
                     && shape_selected > 0
-                    && bytes <= QSA_ATTENTION_DYNAMIC_LDS_LIMIT_BYTES
+                    // The kernel adds 32 bytes of static LDS (per-wave maxes).
+                    && bytes + 32 <= QSA_ATTENTION_DYNAMIC_LDS_LIMIT_BYTES
                     && bytes <= u32::MAX as usize =>
             {
                 (

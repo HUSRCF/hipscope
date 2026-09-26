@@ -1879,7 +1879,14 @@ extern "C" __global__ void indexed_attention_attention_f32_batched_serial(
         denominator > 0.0f ? numerator / denominator / (1.0f + expf(-gate)) : 0.0f;
 }
 
-extern "C" __global__ void indexed_attention_attention_f32_batched(
+// Bitwise-equal to indexed_attention_attention_f32_batched_serial: every score
+// is the same serial d-order dot, fmaxf is exact and order-independent, each
+// row's weight is the same expf, and every channel sums its weights and
+// products in selected-row order.  Weights are exponentiated once per row
+// (not per channel), and the value loads of UNROLL rows are issued before
+// their in-order accumulation.  Invalid rows keep weight 0 and select value
+// 0, adding +0.0 to sums that are never -0.0.
+extern "C" __global__ __launch_bounds__(256) void indexed_attention_attention_f32_batched(
     const float* q_with_gate,
     const float* full_keys,
     const float* full_values,
@@ -1903,48 +1910,99 @@ extern "C" __global__ void indexed_attention_attention_f32_batched(
     if (selected_len > capacity) selected_len = capacity;
     extern __shared__ float row_scores[];
     int* row_tokens = reinterpret_cast<int*>(row_scores + selected_len);
+    __shared__ float wave_max[8];
+    const int tid = (int)threadIdx.x;
     const int* row_selected = selected_indices + row * capacity;
-    int q_row_stride = 2 * n_heads * head_dim;
-    int q_head_offset = row * q_row_stride + (int)blockIdx.x * head_dim * 2;
-    for (int selected_row = (int)threadIdx.x;
-         selected_row < selected_len;
-         selected_row += (int)blockDim.x) {
+    const int head = (int)blockIdx.x;
+    const int kv_head = head / (n_heads / n_kv_heads);
+    const int kv_stride = n_kv_heads * head_dim;
+    const float* keys = full_keys + kv_head * head_dim;
+    const float* __restrict__ q = q_with_gate + row * 2 * n_heads * head_dim + head * head_dim * 2;
+    float partial_max = -3.402823466e+38f;
+    for (int selected_row = tid; selected_row < selected_len; selected_row += (int)blockDim.x) {
         int token = row_selected[selected_row];
-        row_tokens[selected_row] = token;
+        bool ok = token >= 0 && token < full_capacity && token < visible;
+        row_tokens[selected_row] = ok ? token : -1;
         float score = 0.0f;
-        if (token >= 0 && token < full_capacity && token < visible) {
-            int kv_head = (int)blockIdx.x / (n_heads / n_kv_heads);
-            for (int d = 0; d < head_dim; ++d) {
-                score += q_with_gate[q_head_offset + d]
-                    * full_keys[token * n_kv_heads * head_dim + kv_head * head_dim + d];
+        if (ok) {
+            const float* key = keys + token * kv_stride;
+            if (head_dim == 256) {
+                // Sixteen key float4 loads in flight per batch; the FMAs still
+                // run in serial d order.
+                const float4* key4 = reinterpret_cast<const float4*>(key);
+                const float4* q4 = reinterpret_cast<const float4*>(q);
+                for (int c = 0; c < 64; c += 16) {
+                    float4 k4[16];
+#pragma unroll
+                    for (int u = 0; u < 16; ++u) k4[u] = key4[c + u];
+#pragma unroll
+                    for (int u = 0; u < 16; ++u) {
+                        const float4 qv = q4[c + u];
+                        score += qv.x * k4[u].x;
+                        score += qv.y * k4[u].y;
+                        score += qv.z * k4[u].z;
+                        score += qv.w * k4[u].w;
+                    }
+                }
+            } else if ((head_dim & 3) == 0) {
+                for (int d = 0; d < head_dim; d += 4) {
+                    const float4 k4 = *reinterpret_cast<const float4*>(key + d);
+                    score += q[d] * k4.x;
+                    score += q[d + 1] * k4.y;
+                    score += q[d + 2] * k4.z;
+                    score += q[d + 3] * k4.w;
+                }
+            } else {
+                for (int d = 0; d < head_dim; ++d) score += q[d] * key[d];
             }
             score /= sqrtf((float)head_dim);
+            partial_max = fmaxf(partial_max, score);
         }
         row_scores[selected_row] = score;
     }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        partial_max = fmaxf(partial_max, __shfl_xor(partial_max, offset, 32));
+    }
+    if ((tid & 31) == 0) wave_max[tid >> 5] = partial_max;
     __syncthreads();
-    int head = (int)blockIdx.x;
+    float max_score = wave_max[0];
+    for (int w = 1; w < ((int)blockDim.x + 31) / 32; ++w) max_score = fmaxf(max_score, wave_max[w]);
+    for (int selected_row = tid; selected_row < selected_len; selected_row += (int)blockDim.x) {
+        row_scores[selected_row] = row_tokens[selected_row] >= 0
+            ? expf(row_scores[selected_row] - max_score)
+            : 0.0f;
+    }
+    __syncthreads();
     int channel = (int)(blockIdx.y * blockDim.x + threadIdx.x);
     if (head >= n_heads || channel >= head_dim) return;
-    int kv_head = head / (n_heads / n_kv_heads);
-    float max_score = -3.402823466e+38f;
-    for (int selected_row = 0; selected_row < selected_len; ++selected_row) {
-        int token = row_tokens[selected_row];
-        if (token < 0 || token >= full_capacity || token >= visible) continue;
-        max_score = fmaxf(max_score, row_scores[selected_row]);
-    }
+    const float* values = full_values + kv_head * head_dim + channel;
     float denominator = 0.0f;
     float numerator = 0.0f;
-    for (int selected_row = 0; selected_row < selected_len; ++selected_row) {
-        int token = row_tokens[selected_row];
-        if (token < 0 || token >= full_capacity || token >= visible) continue;
-        float weight = expf(row_scores[selected_row] - max_score);
+    constexpr int UNROLL = 32;
+    int i = 0;
+    for (; i + UNROLL <= selected_len; i += UNROLL) {
+        float value[UNROLL];
+#pragma unroll
+        for (int u = 0; u < UNROLL; ++u) {
+            const int token = row_tokens[i + u];
+            value[u] = values[(token < 0 ? 0 : token) * kv_stride];
+        }
+#pragma unroll
+        for (int u = 0; u < UNROLL; ++u) {
+            const float weight = row_scores[i + u];
+            denominator += weight;
+            numerator += weight * (row_tokens[i + u] < 0 ? 0.0f : value[u]);
+        }
+    }
+    for (; i < selected_len; ++i) {
+        const int token = row_tokens[i];
+        const float weight = row_scores[i];
+        const float value = token < 0 ? 0.0f : values[token * kv_stride];
         denominator += weight;
-        numerator += weight
-            * full_values[token * n_kv_heads * head_dim + kv_head * head_dim + channel];
+        numerator += weight * value;
     }
     int output_offset = row * n_heads * head_dim + head * head_dim + channel;
-    float gate = q_with_gate[q_head_offset + head_dim + channel];
+    float gate = q[head_dim + channel];
     output[output_offset] =
         denominator > 0.0f ? numerator / denominator / (1.0f + expf(-gate)) : 0.0f;
 }
