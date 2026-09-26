@@ -37,7 +37,29 @@ extern "C" __global__ void gemv_mq4g128v2_moe_down_top10_indexed_batched_expande
         const long long row_stride = (long long)groups * 68;
         const char* row_ptr = A + (long long)row * row_stride;
         const float* x = rot_batch + (long long)flat * K;
-        for (int group = 0; group < groups; ++group) {
+        // Whole groups (the Qwen4 K = 640 shape): unguarded x loads, so the
+        // unrolled groups' loads issue together instead of one guarded load
+        // (branch + wait) at a time. Same arithmetic.
+        if ((K & 127) == 0) {
+#pragma unroll 5
+            for (int group = 0; group < groups; ++group) {
+                const char* gp = row_ptr + (long long)group * 68;
+                const float scale = __half2float(__ushort_as_half(*(const unsigned short*)gp));
+                const float zero = __half2float(__ushort_as_half(*(const unsigned short*)(gp + 2)));
+                const unsigned char* payload = (const unsigned char*)(gp + 4);
+                const unsigned char b0 = payload[tid * 2];
+                const unsigned char b1 = payload[tid * 2 + 1];
+                const float* xg = x + group * 128 + tid * 4;
+                const float x0 = xg[0];
+                const float x1 = xg[1];
+                const float x2 = xg[2];
+                const float x3 = xg[3];
+                acc += (scale * (float)(b0 & 0xF) + zero) * x0
+                    + (scale * (float)(b0 >> 4) + zero) * x1
+                    + (scale * (float)(b1 & 0xF) + zero) * x2
+                    + (scale * (float)(b1 >> 4) + zero) * x3;
+            }
+        } else for (int group = 0; group < groups; ++group) {
             const char* gp = row_ptr + (long long)group * 68;
             const unsigned short scale_bits = *(const unsigned short*)(gp + 0);
             const unsigned short zero_bits = *(const unsigned short*)(gp + 2);
