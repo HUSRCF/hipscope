@@ -1132,6 +1132,20 @@ struct LiveMoeBinding {
     mapping_fingerprint: String,
     /// [`RoutedExpertWeights::immutable_identity`] of the bound expert set.
     source_identity: Option<u64>,
+    /// `experts[i].0/.1.buffer.ptr`, contiguous: the per-call host pointer
+    /// entry check compares whole slices.
+    gate_up_entries: Box<[usize]>,
+    down_entries: Box<[usize]>,
+}
+
+/// The live gate/up and down buffer pointers of `experts`, in order.
+fn live_entry_ptrs(
+    experts: &[(LiveWeightIdentity, LiveWeightIdentity)],
+) -> (Box<[usize]>, Box<[usize]>) {
+    (
+        experts.iter().map(|(gate_up, _)| gate_up.buffer.ptr).collect(),
+        experts.iter().map(|(_, down)| down.buffer.ptr).collect(),
+    )
 }
 
 /// One live expert projection pair borrowed for a compact bind: either an
@@ -3649,6 +3663,7 @@ fn build_live_binding(
         None => canonical.push_str("none;"),
     }
 
+    let (gate_up_entries, down_entries) = live_entry_ptrs(&live_experts);
     Ok(LiveMoeBinding {
         table_identity: table.identity,
         table_ptr: table.experts.as_ptr() as usize,
@@ -3660,6 +3675,8 @@ fn build_live_binding(
         dtype_tags: dtype_tag_identity,
         mapping_fingerprint: fingerprint_hex(&canonical),
         source_identity: routed_experts.immutable_identity(),
+        gate_up_entries,
+        down_entries,
     })
 }
 
@@ -3885,6 +3902,7 @@ fn build_compact_live_binding(
         None => canonical.push_str("none;"),
     }
 
+    let (gate_up_entries, down_entries) = live_entry_ptrs(&live_experts);
     Ok(LiveMoeBinding {
         table_identity: table.identity,
         table_ptr: table.experts.as_ptr() as usize,
@@ -3896,6 +3914,8 @@ fn build_compact_live_binding(
         dtype_tags: dtype_tag_identity,
         mapping_fingerprint: fingerprint_hex(&canonical),
         source_identity: None,
+        gate_up_entries,
+        down_entries,
     })
 }
 
@@ -4120,18 +4140,23 @@ fn validate_live_binding(
                 live.experts.len()
             )));
         }
-        for (index, (expected_gate_up, expected_down)) in live.experts.iter().enumerate() {
-            if entries.gate_up[index] != expected_gate_up.buffer.ptr {
-                return Err(invalid(format!(
-                    "expert {index} gate/up table entry {:x} does not point at its live tensor {:x}",
-                    entries.gate_up[index], expected_gate_up.buffer.ptr
-                )));
-            }
-            if entries.down[index] != expected_down.buffer.ptr {
-                return Err(invalid(format!(
-                    "expert {index} down table entry {:x} does not point at its live tensor {:x}",
-                    entries.down[index], expected_down.buffer.ptr
-                )));
+        // Contiguous per-binding copies of the live pointers: one slice
+        // compare instead of a walk over every expert identity. The walk only
+        // runs to name the first mismatch.
+        if entries.gate_up != &live.gate_up_entries[..] || entries.down != &live.down_entries[..] {
+            for (index, (expected_gate_up, expected_down)) in live.experts.iter().enumerate() {
+                if entries.gate_up[index] != expected_gate_up.buffer.ptr {
+                    return Err(invalid(format!(
+                        "expert {index} gate/up table entry {:x} does not point at its live tensor {:x}",
+                        entries.gate_up[index], expected_gate_up.buffer.ptr
+                    )));
+                }
+                if entries.down[index] != expected_down.buffer.ptr {
+                    return Err(invalid(format!(
+                        "expert {index} down table entry {:x} does not point at its live tensor {:x}",
+                        entries.down[index], expected_down.buffer.ptr
+                    )));
+                }
             }
         }
     }
@@ -4422,7 +4447,7 @@ fn validate_pointer_table(
 }
 
 fn require_elements(tensor: &GpuTensor, required: usize, name: &str) -> Result<(), DispatchError> {
-    let capacity = checked_product(&tensor.shape, &format!("{name} shape"))?;
+    let capacity = checked_product(&tensor.shape, format_args!("{name} shape"))?;
     if capacity < required {
         return Err(invalid(format!(
             "{name} capacity {capacity} is below required {required}"
