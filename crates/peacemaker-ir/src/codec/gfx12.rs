@@ -284,7 +284,11 @@ pub fn decode(words: &[u32]) -> Result<(Inst, usize), DecodeError> {
         let count = operands.len() as u8;
         for (name,bits) in grammars(y) {
             let mapped=match name { "VDSTX"=>"VDSTY", "SRCX0"=>"SRCY0", "VSRCX1"=>"VSRCY1", _=>name };
-            operands.push(operand(mapped,bits,field_value(mapped,y,words),literal,y,words)?);
+            let raw = field_value(mapped,y,words);
+            let code = if mapped=="VDSTY" {
+                (raw << 1) | ((!field_value("VDSTX",row,words)) & 1)
+            } else { raw };
+            operands.push(operand(mapped,bits,code,literal,y,words)?);
             let f=forms::field(row.form,mapped).expect("VOPD Y field");
             consumed[usize::from(f.bit/32)] |= f.mask();
         }
@@ -351,7 +355,14 @@ pub fn encode(inst: &Inst) -> Result<SmallVec<[u32; 3]>, DecodeError> {
             for (name,bits) in grammars(y) {
                 let mapped=match name { "VDSTX"=>"VDSTY", "SRCX0"=>"SRCY0", "VSRCX1"=>"VSRCY1", _=>name };
                 let op=operands.next().ok_or_else(||reject(format!("missing Y {mapped} operand")))?;
-                encode_field(mapped,y,&mut words,encoded_operand(mapped,bits,op,y.form)?)?;
+                let value=encoded_operand(mapped,bits,op,y.form)?;
+                if mapped=="VDSTY" {
+                    let x=field_value("VDSTX",row,&words);
+                    if (value ^ x) & 1 == 0 { return Err(reject("VOPD Y destination parity collides with X")); }
+                    encode_field(mapped,y,&mut words,value >> 1)?;
+                } else {
+                    encode_field(mapped,y,&mut words,value)?;
+                }
             }
         } else { return Err(reject("missing VOPD Y half")); }
     }
@@ -573,6 +584,43 @@ mod tests {
         assert_eq!(&encode(&inst).unwrap()[..],wait);
     }
 
+    #[test]
+    fn kt48_vopd_y_dest_agrees_with_objdump() {
+        const IMAGE: &[u8] = include_bytes!("../../../peacemaker-lift/tests/fixtures/kt48/hipcc.co");
+        const OBJDUMP: &str = include_str!("../../../peacemaker-lift/tests/fixtures/kt48/hipcc.objdump.txt");
+        let kernel = &IMAGE[0x6f00..0x6f00 + 10_604];
+        let words: Vec<_> = kernel.chunks_exact(4)
+            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap())).collect();
+        let mut count = 0;
+        for line in OBJDUMP.lines().filter(|line| line.contains(" :: ")) {
+            let (text,location) = line.split_once("//").expect("objdump instruction comment");
+            let (address,_) = location.split_once(':').expect("objdump PC");
+            let address = usize::from_str_radix(address.trim(),16).expect("hex objdump PC");
+            if !(0x7f00..0x7f00+10_604).contains(&address) { continue; }
+            let y_half = text.split_once(" :: ").expect("VOPD Y half").1;
+            let y_dest = y_half.split_whitespace().nth(1).expect("Y destination")
+                .trim_end_matches(',').strip_prefix('v').expect("VGPR destination")
+                .parse::<u16>().expect("VGPR index");
+            let offset = (address-0x7f00)/4;
+            let (inst,width) = decode(&words[offset..]).expect("decode VOPD packet");
+            assert!((2..=3).contains(&width),"PC {address:#x}");
+            let FormFields::Vopd { x_operands, .. } = inst.fields else { panic!("PC {address:#x} not VOPD"); };
+            let Operand::Reg(y) = &inst.operands[usize::from(x_operands)] else { panic!("PC {address:#x} Y not VGPR"); };
+            assert_eq!(y.base,y_dest,"PC {address:#x}: {text}");
+            count += 1;
+        }
+        assert_eq!(count,342,"all KT48 dual-issue packets compared to pinned objdump");
+    }
+
+    #[test]
+    fn vopd_rejects_destination_parity_collision() {
+        let (mut inst,_) = decode(&[0xca1000ff,0x010200c1,0x0000c300]).unwrap();
+        let FormFields::Vopd { x_operands, .. } = inst.fields else { panic!("not VOPD"); };
+        let Operand::Reg(y) = &mut inst.operands[usize::from(x_operands)] else { panic!("Y not VGPR"); };
+        y.base ^= 1;
+        assert!(encode(&inst).unwrap_err().to_string().contains("parity collides"));
+    }
+
     proptest::proptest! {
         #![proptest_config(proptest::test_runner::Config::with_cases(512))]
         #[test]
@@ -590,8 +638,12 @@ mod tests {
                     let bank_limit=if inst.form==Form::Vopd {128} else {256};
                     r.base=u16::from(seed) % (bank_limit+1-u16::from(r.len));
                 }
-                inst=Inst::from_parts(Arch::Gfx1201,inst.op,inst.form,inst.fields.clone(),
-                    inst.operands.clone(),inst.mods.clone(),inst.literal,Provenance::default()).unwrap();
+            }
+            if let FormFields::Vopd { x_operands, .. } = inst.fields {
+                let Operand::Reg(x) = &inst.operands[0] else { panic!("X destination not VGPR"); };
+                let x_parity = x.base & 1;
+                let Operand::Reg(y) = &mut inst.operands[usize::from(x_operands)] else { panic!("Y destination not VGPR"); };
+                y.base = (y.base & !1) | (x_parity ^ 1);
             }
             if let Some(literal)=&mut inst.literal {
                 let replacement=*literal ^ (u32::from(seed)*0x0101_0101);
@@ -603,6 +655,8 @@ mod tests {
             if let FormFields::Vop3b { src2_unused }=&mut inst.fields {
                 *src2_unused=if seed&1==0 {0} else {128};
             }
+            inst=Inst::from_parts(Arch::Gfx1201,inst.op,inst.form,inst.fields.clone(),
+                inst.operands.clone(),inst.mods.clone(),inst.literal,Provenance::default()).unwrap();
             let encoded=encode(&inst).unwrap();
             let (decoded,count)=decode(&encoded).unwrap();
             proptest::prop_assert_eq!(count,encoded.len());

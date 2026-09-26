@@ -30,6 +30,7 @@ const VOP2: &[Field] = &[f!("VDST",17,8),f!("SRC0",0,9),f!("VSRC1",9,8)];
 const VOPC: &[Field] = &[f!("SRC0",0,9),f!("VSRC1",9,8)];
 const VOP3: &[Field] = &[f!("VDST",0,8),f!("SRC0",32,9),f!("SRC1",41,9),f!("SRC2",50,9),f!("ABS",8,3),f!("OPSEL",11,4),f!("CLAMP",15,1),f!("OMOD",59,2),f!("NEG",61,3)];
 const VOP3P: &[Field] = &[f!("VDST",0,8),f!("SRC0",32,9),f!("SRC1",41,9),f!("SRC2",50,9),f!("NEG_HI",8,3),f!("OPSEL",11,3),f!("OPSEL_HI_LO",59,2),f!("OPSEL_HI_2",14,1),f!("CLAMP",15,1),f!("NEG",61,3)];
+// VOPD VDSTY stores bits [7:1]; bit 0 is implicit and opposite VDSTX bit 0.
 const VOPD: &[Field] = &[f!("VDSTX",56,8),f!("SRCX0",0,9),f!("VSRCX1",9,8),f!("VDSTY",49,7),f!("SRCY0",32,9),f!("VSRCY1",41,8)];
 const DS: &[Field] = &[f!("VDST",56,8),f!("ADDR",32,8),f!("DATA0",40,8),f!("DATA1",48,8),f!("OFFSET0",0,8),f!("OFFSET1",8,8)];
 const GLOBAL: &[Field] = &[f!("VDST",32,8),f!("VSRC",55,8),f!("VADDR",64,8),f!("SADDR",0,7),f!("IOFFSET",72,24),f!("NV",7,1),f!("SVE",49,1),f!("SCOPE",50,2),f!("TH",52,3)];
