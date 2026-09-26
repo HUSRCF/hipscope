@@ -194,3 +194,66 @@ fn parse_rejects_garbage() {
     }
     assert!(parse_line("s_nop 0", Arch::Gfx1201).is_ok());
 }
+
+/// C7 lift_text regressions on hipcc's own `.s`: quoted `//` inside
+/// `.ident`, the `.amdgpu_metadata` YAML region, and the hidden-EXEC
+/// cmpx shape (two visible operands).
+#[test]
+fn source_parser_handles_hipcc_s_constructs() {
+    let src = "\
+\t.ident\t\"AMD clang version 20.1.0 (https://github.com/rocm/llvm-project.git)\"
+\t.amdgpu_metadata
+---
+amdhsa.version: [ 1, 2 ]
+# a yaml comment
+  - .args:
+...
+\t.end_amdgpu_metadata
+my_kernel:
+\ts_nop 0
+";
+    let file = parse_source(src).expect("hipcc constructs parse");
+    let directives: Vec<&str> = file
+        .lines
+        .iter()
+        .filter_map(|l| match &l.kind {
+            SourceKind::Directive(t) => Some(t.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        directives.iter().any(|d| d.starts_with(".ident")
+            && d.contains("https://github.com/rocm/llvm-project.git")),
+        "quoted // must not start a comment: {directives:?}"
+    );
+    for marker in [
+        ".amdgpu_metadata",
+        "amdhsa.version: [ 1, 2 ]",
+        "# a yaml comment",
+        "- .args:",
+        "...",
+        ".end_amdgpu_metadata",
+    ] {
+        assert!(
+            directives.iter().any(|d| d.trim() == marker),
+            "metadata region kept verbatim, missing {marker:?}: {directives:?}"
+        );
+    }
+    assert_eq!(file.labels, vec![("my_kernel".to_owned(), 0)]);
+    assert_eq!(file.inst_len(), 1);
+}
+
+/// `v_cmpx*` VOP3 canonical text has two visible operands; the hidden
+/// exec VDST is fixed 0x7e in the encoding and absent from the type.
+#[test]
+fn cmpx_parses_two_visible_operands() {
+    let inst = parse_line("v_cmpx_gt_i32_e64 s7, v4", Arch::Gfx1201)
+        .expect("cmpx parses");
+    assert_eq!(inst.operands.len(), 2);
+    let enc = gfx12::encode(&inst).expect("cmpx encodes");
+    assert_eq!(enc.len(), 2);
+    let (back, n) = gfx12::decode(&enc).expect("cmpx re-decodes");
+    assert_eq!(n, 2);
+    assert_eq!(back.operands, inst.operands);
+    assert_eq!(back.mods, inst.mods);
+}

@@ -65,17 +65,18 @@ pub fn canonical(inst: &Inst, arch: Arch) -> Result<String, PrintError> {
     } else {
         0
     };
-    // `v_cmpx*` omits its implicit exec destination (first operand).
-    let drop_cmpx_dest = row.name.starts_with("v_cmpx")
-        && inst.form == Form::Vop3
-        && matches!(
-            inst.operands.first(),
-            Some(
-                Operand::Special(
-                    Special::Exec | Special::ExecLo | Special::ExecHi
-                )
-            )
-        );
+    // `v_cmpx*` VOP3 rows carry a hidden exec VDST (fixed encoding 0x7e)
+    // that canonical text omits; the two visible operands map to the
+    // SRC0/SRC1 slots.
+    let cmpx_offset =
+        usize::from(row.name.starts_with("v_cmpx") && inst.form == Form::Vop3);
+    if cmpx_offset == 1 && inst.operands.len() + 1 != slots.len() {
+        return Err(PrintError::Unspellable(format!(
+            "{} needs two visible operands, have {}",
+            row.name,
+            inst.operands.len()
+        )));
+    }
     let mut parts: Vec<String> = Vec::new();
     // VOPC compares carry a synthetic vcc destination that objdump prints.
     if skew == 1 {
@@ -91,16 +92,16 @@ pub fn canonical(inst: &Inst, arch: Arch) -> Result<String, PrintError> {
         parts.push(operand_text(first, None, row, inst)?);
     }
     for (slot_index, (slot_name, _)) in slots.iter().enumerate() {
-        let op_index = slot_index + skew;
+        if slot_index < cmpx_offset {
+            continue;
+        }
+        let op_index = slot_index + skew - cmpx_offset;
         let operand = inst.operands.get(op_index).ok_or_else(|| {
             PrintError::Unspellable(format!(
                 "{} is missing its {slot_name} operand",
                 row.name
             ))
         })?;
-        if drop_cmpx_dest && slot_index == 0 {
-            continue;
-        }
         let mut text = operand_text(operand, Some(slot_name), row, inst)?;
         if inst.form == Form::Vop3 {
             text = apply_vop3_src_mods(&text, operand, slot_name, &inst.mods)?;
@@ -110,7 +111,9 @@ pub fn canonical(inst: &Inst, arch: Arch) -> Result<String, PrintError> {
     // Trailing operands the grammar does not declare (DS offsets, VMEM
     // offset/offen/scope) join with a space, exactly as objdump does.
     let mut tail: Vec<String> = Vec::new();
-    for operand in inst.operands.iter().skip(slots.len() + skew) {
+    for operand in
+        inst.operands.iter().skip(slots.len() + skew - cmpx_offset)
+    {
         tail.push(operand_text(operand, None, row, inst)?);
     }
     let mut text = row.name.to_owned();

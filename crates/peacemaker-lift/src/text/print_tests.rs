@@ -7,7 +7,7 @@ use super::{canonical, kernel_lines};
 use crate::text::support::{self, Parity, classify, lossy_mask};
 use peacemaker_ir::{
 codec::gfx12,
-inst::{Arch, Form, FormFields, Inst},
+inst::{Arch, FormFields, Inst},
 isa, operand::Operand,
 };
 use smallvec::SmallVec;

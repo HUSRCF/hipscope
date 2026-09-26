@@ -224,17 +224,17 @@ fn parse_single(row: &'static OpRow, rest: &str) -> Result<Inst, ParseError> {
             ));
         }
     }
-    // `v_cmpx*` omits its implicit exec destination in canonical text.
+    // `v_cmpx*` VOP3 rows carry a hidden exec VDST (fixed encoding 0x7e)
+    // that canonical text omits; the visible operands map to SRC0/SRC1.
     let mut slot_offset = 0usize;
     if row.form == Form::Vop3 && row.name.starts_with("v_cmpx") {
-        if operand_texts.len() + 1 != slots.len() {
+        if operand_texts.len() + 1 != slots.len() || slots.is_empty() {
             return Err(ParseError::Count {
                 name: row.name.into(),
                 have: operand_texts.len(),
-                need: slots.len() - 1,
+                need: slots.len().saturating_sub(1),
             });
         }
-        parsed.operands.push(Operand::Special(Special::ExecLo));
         slot_offset = 1;
     }
     // VOPC compares carry a synthetic vcc destination that objdump prints.
@@ -1325,20 +1325,61 @@ impl SourceFile {
 fn is_label_char(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'.' || byte == b'_' || byte == b'$'
 }
+/// Strip a trailing `//`, `#` or `;` comment, ignoring markers inside
+/// double-quoted strings (e.g. `.ident` version strings holding URLs).
+fn strip_source_comment(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    let mut in_string = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                in_string = !in_string;
+                i += 1;
+            }
+            b'\\' if in_string && i + 1 < bytes.len() => i += 2,
+            b'/' if !in_string
+                && i + 1 < bytes.len()
+                && bytes[i + 1] == b'/' =>
+            {
+                return line[..i].trim_end();
+            }
+            b'#' | b';' if !in_string => return line[..i].trim_end(),
+            _ => i += 1,
+        }
+    }
+    line
+}
 
 /// Parse `.s` structure: labels, directives, instruction lines.
 pub fn parse_source(src: &str) -> Result<SourceFile, ParseError> {
     let mut file = SourceFile::default();
     let mut insts = 0usize;
+    let mut in_metadata = false;
     for (index, raw) in src.lines().enumerate() {
         let line_no = index + 1;
         let mut line = raw.trim();
-        // Comments: `//`, `#`, `;` (none occur inside operands).
-        for marker in ["//", "#", ";"] {
-            if let Some(i) = line.find(marker) {
-                line = line[..i].trim_end();
-            }
+        // `.amdgpu_metadata` … `.end_amdgpu_metadata` is a YAML region,
+        // not code: keep every line verbatim as a directive (its `#`
+        // comments and `- key:` lines must not be reclassified).
+        if line == ".amdgpu_metadata" {
+            in_metadata = true;
         }
+        if in_metadata {
+            if !line.is_empty() {
+                file.lines.push(SourceLine {
+                    line_no,
+                    kind: SourceKind::Directive(line.to_owned()),
+                });
+            }
+            if line == ".end_amdgpu_metadata" {
+                in_metadata = false;
+            }
+            continue;
+        }
+        // Comments (`//`, `#`, `;`) end the line, unless quoted
+        // (e.g. `.ident "… (https://…)"`).
+        line = strip_source_comment(line);
         if line.is_empty() {
             continue;
         }
