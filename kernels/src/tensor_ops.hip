@@ -186,26 +186,29 @@ static __device__ __forceinline__ bool gated_delta_step_norm128_body(
     const float decay = expf(gate[value_head]);
     const float beta_value = beta[value_head];
     const int state_base = value_head * 128 * 128;
-    for (int kd = 0; kd < 128; ++kd) {
-        state[state_base + kd * 128 + value_index] *= decay;
-    }
+    float* column = state + state_base + value_index;
+    // Two passes over the state column (read; read + write) instead of four
+    // reads and two writes: the decayed value is recomputed, not stored, and
+    // the update and output share a pass. Same per-element operations.
     float kv_mem = 0.0f;
     for (int kd = 0; kd < 128; ++kd) {
         const float kv = bf16_to_f32(k_norm[kd]);
-        kv_mem += state[state_base + kd * 128 + value_index] * kv;
+        const float decayed = column[kd * 128] * decay;
+        kv_mem += decayed * kv;
     }
     const __hip_bfloat16 v_value = bf16_round(
         v[value_head * 128 + value_index]);
     const float delta = (bf16_to_f32(v_value) - kv_mem) * beta_value;
-    for (int kd = 0; kd < 128; ++kd) {
-        const float kv = bf16_to_f32(k_norm[kd]);
-        state[state_base + kd * 128 + value_index] += kv * delta;
-    }
     float out = 0.0f;
     for (int kd = 0; kd < 128; ++kd) {
+        const float kv = bf16_to_f32(k_norm[kd]);
+        // Explicit fma: the decayed value (stored, then reloaded, in the
+        // four-pass form) must not contract into fma(state, decay, kv * delta).
+        const float decayed = fmaf(kv, delta, column[kd * 128] * decay);
+        column[kd * 128] = decayed;
         float qv = bf16_to_f32(q_norm[kd]);
         qv *= query_scale;
-        out += state[state_base + kd * 128 + value_index] * qv;
+        out += decayed * qv;
     }
     *out_value = out;
     return true;
