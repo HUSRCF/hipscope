@@ -115,6 +115,38 @@ mod tests {
     }
 
     #[test]
+    fn partial_writes_and_hidden_compare_destination_have_real_dependencies() {
+        use effects::{Effects, ImplicitSet};
+        use operand::{Half, Operand};
+        use reg::{Kind, RegRef};
+        fn v(base: u16, len: u8) -> RegRef { RegRef { kind: Kind::V, base, len } }
+        fn s(base: u16) -> RegRef { RegRef { kind: Kind::S, base, len: 1 } }
+        fn effect(name: &str, operands: &[Operand]) -> Effects {
+            let row = isa::gfx12().iter().find(|r| r.name == name).unwrap();
+            Effects::from_table(Arch::Gfx1201, row.op, row.form, operands).unwrap()
+        }
+        let d16 = effect("global_load_d16_hi_u8",
+            &[Operand::Reg(v(139, 1)), Operand::Reg(v(2, 2)), Operand::Vmem(operand::VmemToken::Off)]);
+        assert_eq!(d16.defs.as_slice(), &[v(139, 1)]);
+        assert!(d16.uses.contains(&v(139, 1)), "partial load preserves the other destination half");
+
+        let mov = effect("v_mov_b16_e32",
+            &[Operand::Half(v(5, 1), Half::Hi), Operand::Inline(operand::InlineConst::Integer(0))]);
+        assert_eq!(mov.defs.as_slice(), &[v(5, 1)]);
+        assert!(mov.uses.contains(&v(5, 1)), "high-half write preserves the low half");
+
+        let fmac = effect("s_fmac_f32",
+            &[Operand::Reg(s(6)), Operand::Reg(s(0)), Operand::Reg(s(4))]);
+        assert!(fmac.defs.contains(&s(6)));
+        assert!(fmac.uses.contains(&s(6)), "accumulator reads its previous destination");
+
+        let cmpx = effect("v_cmpx_gt_i32_e64", &[Operand::Reg(s(7)), Operand::Reg(v(4, 1))]);
+        assert!(cmpx.defs.is_empty(), "the encoded EXEC destination is not a printed operand");
+        assert_eq!(cmpx.uses.as_slice(), &[s(7), v(4, 1)]);
+        assert_ne!(cmpx.implicit.writes & ImplicitSet::EXEC, 0);
+    }
+
+    #[test]
     fn opcode_examples_match_pinned_llvm_mc_for_every_declared_form() {
         let mc = "/opt/rocm/core-10.0/lib/llvm/bin/llvm-mc";
         assert!(std::path::Path::new(mc).exists(), "pinned llvm-mc required for the table gate");
