@@ -1845,7 +1845,18 @@ extern "C" __global__ void indexed_attention_select_f32_batched(
          block += (int)blockDim.x) {
         float score = scores[block];
         int rank = 0;
-        for (int other = 0; other < row_block_count; ++other) {
+        // Four LDS scores per read (the dynamic LDS base is 16-byte aligned),
+        // several reads in flight; the count is order-independent.
+        int other = 0;
+#pragma unroll 4
+        for (; other + 4 <= row_block_count; other += 4) {
+            const float4 v = *reinterpret_cast<const float4*>(scores + other);
+            rank += (v.x > score || (v.x == score && other < block));
+            rank += (v.y > score || (v.y == score && other + 1 < block));
+            rank += (v.z > score || (v.z == score && other + 2 < block));
+            rank += (v.w > score || (v.w == score && other + 3 < block));
+        }
+        for (; other < row_block_count; ++other) {
             float value = scores[other];
             if (value > score || (value == score && other < block)) ++rank;
         }
