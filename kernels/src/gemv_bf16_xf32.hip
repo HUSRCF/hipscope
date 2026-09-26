@@ -34,9 +34,9 @@
 static __device__ __forceinline__ float gemv_bf16_xf32_row(
     const unsigned short* __restrict__ w_row,
     const float*          __restrict__ x,
-    int K
+    int K,
+    int tid
 ) {
-    const int tid = threadIdx.x;
 
     float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
 
@@ -109,32 +109,45 @@ extern "C" __global__ void gemv_bf16_xf32(
 ) {
     const int row = blockIdx.x;
     if (row >= M) return;
-    const float sum = gemv_bf16_xf32_row(W + (size_t)row * K, x, K);
+    const float sum = gemv_bf16_xf32_row(W + (size_t)row * K, x, K, threadIdx.x);
     if (threadIdx.x == 0) y[row] = sum;
 }
 
-// gemv_bf16_xf32 with hc_activation_fused_f32 applied to each output (the HC
-// read's low-rank down projection): source BF16 round trip, `scale`, round
-// trip, SiLU, round trip — the same expression per element, so the result is
-// bitwise the two-launch sequence.
-__launch_bounds__(32, 20)
-extern "C" __global__ void gemv_bf16_xf32_hc_act(
+// Long-K rows (decode HC projections, K = 4 * 2560): four waves split each
+// row's K into quarters, each running gemv_bf16_xf32_row on its quarter, and
+// the quarter sums fold as (q0 + q1) + (q2 + q3). A different summation order
+// than gemv_bf16_xf32 (not bitwise equal to it); four times the waves for
+// the few-row, long-K shapes that one wave per row leaves latency-bound.
+// `hc_act` applies hc_activation_fused_f32 (BF16 round trip, `scale`, round
+// trip, SiLU, round trip) to each output. Grid [M], block 128, K % 32 == 0.
+__launch_bounds__(128)
+extern "C" __global__ void gemv_bf16_xf32_k4(
     const unsigned short* __restrict__ W,  // [M, K] bf16 (raw u16)
     const float*          __restrict__ x,  // [K] F32
     float*                __restrict__ y,  // [M] F32
     int M, int K,
-    float scale
+    float scale,
+    int hc_act
 ) {
+    __shared__ float quarter[4];
     const int row = blockIdx.x;
     if (row >= M) return;
-    const float sum = gemv_bf16_xf32_row(W + (size_t)row * K, x, K);
-    if (threadIdx.x == 0) {
-        float value = static_cast<float>(static_cast<hip_bfloat16>(sum));
+    const int wave = threadIdx.x >> 5;
+    const int part = K / 4;
+    const float s = gemv_bf16_xf32_row(
+        W + (size_t)row * K + wave * part, x + wave * part, part, threadIdx.x & 31);
+    if ((threadIdx.x & 31) == 0) quarter[wave] = s;
+    __syncthreads();
+    if (threadIdx.x != 0) return;
+    float value = (quarter[0] + quarter[1]) + (quarter[2] + quarter[3]);
+    if (hc_act) {
+        value = static_cast<float>(static_cast<hip_bfloat16>(value));
         value *= scale;
         value = static_cast<float>(static_cast<hip_bfloat16>(value));
         value = value / (1.0f + expf(-value));
-        y[row] = static_cast<float>(static_cast<hip_bfloat16>(value));
+        value = static_cast<float>(static_cast<hip_bfloat16>(value));
     }
+    y[row] = value;
 }
 
 // Four BF16 matrices reading the same x (same K) in one launch: blocks
@@ -166,6 +179,6 @@ extern "C" __global__ void gemv_bf16_xf32_x4(
             }
         }
     }
-    const float sum = gemv_bf16_xf32_row(W + (size_t)row * K, x, K);
+    const float sum = gemv_bf16_xf32_row(W + (size_t)row * K, x, K, threadIdx.x);
     if (threadIdx.x == 0) y[row] = sum;
 }

@@ -480,16 +480,18 @@ pub fn execute_hyper_read(gpu: &mut Gpu, op: &HyperReadOp<'_>) -> Result<(), Dis
     } else if op.rows == 1
         && gpu.arch_caps.has_gfx11_plus_simt()
         && op.input_mix_down.dtype == DType::BF16
+        && op.input_mix_down.k % 32 == 0
     {
-        // Decode: the down GEMV applies the activation below in its epilogue.
+        // Decode: the long-K down GEMV splits each row across four waves and
+        // applies the activation below in its epilogue.
         hip(hyper_norm(gpu, &norm))?;
-        hip(gpu.gemv_bf16_xf32_hc_act(
+        hip(gpu.gemv_bf16_xf32_k4(
             op.input_mix_down.buf,
             &normalized,
             &low,
             op.input_mix_down.m,
             op.input_mix_down.k,
-            1.0 / op.branches as f32,
+            Some(1.0 / op.branches as f32),
         ))?;
         activated = true;
     } else {
@@ -714,14 +716,31 @@ pub fn execute_hyper_write(gpu: &mut Gpu, op: &HyperWriteOp<'_>) -> Result<(), D
                 state_bf16: op.state_bf16,
             },
         ))?;
-        project_weight(
-            gpu,
-            &op.block_inject,
-            &normalized,
-            &gates,
-            op.rows,
-            Some(op.rotation),
-        )?;
+        if op.rows == 1
+            && gpu.arch_caps.has_gfx11_plus_simt()
+            && op.block_inject.dtype == DType::BF16
+            && op.block_inject.k % 32 == 0
+        {
+            // Decode: four gate rows of K = branches * hidden; four waves per
+            // row instead of one.
+            hip(gpu.gemv_bf16_xf32_k4(
+                op.block_inject.buf,
+                &normalized,
+                &gates,
+                op.block_inject.m,
+                op.block_inject.k,
+                None,
+            ))?;
+        } else {
+            project_weight(
+                gpu,
+                &op.block_inject,
+                &normalized,
+                &gates,
+                op.rows,
+                Some(op.rotation),
+            )?;
+        }
     }
     hip(hyper_write(
         gpu,

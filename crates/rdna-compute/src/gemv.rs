@@ -14184,29 +14184,31 @@ impl Gpu {
         )
     }
 
-    /// [`Gpu::gemv_bf16_xf32`] followed by the HC read activation
-    /// (`hc_activation_fused_f32` with `scale`, F32 output) in one launch;
-    /// bitwise the two-launch sequence.
-    pub fn gemv_bf16_xf32_hc_act(
+    /// Long-K BF16 GEMV with each row's K split across four waves (quarter
+    /// sums folded `(q0 + q1) + (q2 + q3)`; not bitwise [`Gpu::gemv_bf16_xf32`]).
+    /// `hc_act_scale` applies the HC read activation (`hc_activation_fused_f32`
+    /// with that scale) to each output. Requires `k % 32 == 0`.
+    pub fn gemv_bf16_xf32_k4(
         &mut self,
         weight: &GpuTensor,
         x: &GpuTensor,
         y: &GpuTensor,
         m: usize,
         k: usize,
-        scale: f32,
+        hc_act_scale: Option<f32>,
     ) -> HipResult<()> {
+        if k % 32 != 0 {
+            return Err(hip_bridge::HipError::new(1, "gemv_bf16_xf32_k4 needs K % 32 == 0"));
+        }
         self.bind_thread()?;
-        self.ensure_kernel(
-            "gemv_bf16_xf32",
-            kernels::GEMV_BF16_XF32_SRC,
-            "gemv_bf16_xf32_hc_act",
-        )?;
+        self.ensure_kernel("gemv_bf16_xf32", kernels::GEMV_BF16_XF32_SRC, "gemv_bf16_xf32_k4")?;
         let w_ptr = weight.buf.as_ptr();
         let x_ptr = x.buf.as_ptr();
         let y_ptr = y.buf.as_ptr();
         let m_val = m as i32;
         let k_val = k as i32;
+        let scale = hc_act_scale.unwrap_or(1.0);
+        let hc_act = i32::from(hc_act_scale.is_some());
         let mut params: Vec<*mut c_void> = vec![
             &w_ptr as *const _ as *mut c_void,
             &x_ptr as *const _ as *mut c_void,
@@ -14214,11 +14216,12 @@ impl Gpu {
             &m_val as *const _ as *mut c_void,
             &k_val as *const _ as *mut c_void,
             &scale as *const _ as *mut c_void,
+            &hc_act as *const _ as *mut c_void,
         ];
         self.launch_maybe_blob(
-            "gemv_bf16_xf32_hc_act",
+            "gemv_bf16_xf32_k4",
             [m as u32, 1, 1],
-            [32, 1, 1],
+            [128, 1, 1],
             0,
             &mut params,
             || {
@@ -14229,6 +14232,7 @@ impl Gpu {
                 b.push_i32(m_val);
                 b.push_i32(k_val);
                 b.push_f32(scale);
+                b.push_i32(hc_act);
                 b
             },
         )
