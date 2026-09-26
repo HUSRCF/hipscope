@@ -1,0 +1,8 @@
+{
+  "file": "hipcc.co",
+  "sha256": "f876e2ce520ba8d97358b34c903a48dafc5cff2e4cc552d7ffc775361cbcb6bc",
+  "bytes": 42208,
+  "source_path": "/home/kaden/qcal/peacemaker/profile/attn/hipcc.co",
+  "recipe": "hipcc --genco -O3 --offload-arch=gfx1201 --no-offload-compress (+ the three -D defines in /home/kaden/qcal/peacemaker/profile/report.md:158)",
+  "notes": "KT48 FA2 prefill attention (fp8/q8 KV). Selected kernel .text range 0x6f00..0x986c per M1-C3. Committed as a fixture; tests never invoke hipcc (core.md §8)."
+}
