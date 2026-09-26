@@ -3638,6 +3638,54 @@ impl Gpu {
         Ok(out)
     }
 
+    /// `silu_mul_bf16_rt_f32(gate, up)` then [`Gpu::rotate_x_mq_128_v2`] into
+    /// `x_rot`, one launch (bitwise the two launches). `gate`, `up` and
+    /// `x_rot` are `[batch_size, k]`.
+    pub fn silu_mul_bf16_rt_rotate_x_mq_128_v2(
+        &mut self,
+        gate: &GpuTensor,
+        up: &GpuTensor,
+        x_rot: &GpuTensor,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        const FUNC: &str = "mq_rotate_x_128_v2_silu_bf16";
+        self.ensure_kernel("mq_rotate_x_128_v2", kernels::MQ_ROTATE_X_128_V2_SRC, FUNC)?;
+        self.ensure_mq_signs_128()?;
+        let gp = gate.buf.as_ptr();
+        let up_ptr = up.buf.as_ptr();
+        let op = x_rot.buf.as_ptr();
+        let s1 = self.scratch.mq_signs1_128.as_ref().unwrap().buf.as_ptr();
+        let s2 = self.scratch.mq_signs2_128.as_ref().unwrap().buf.as_ptr();
+        let kv = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &gp as *const _ as *mut c_void,
+            &up_ptr as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &s1 as *const _ as *mut c_void,
+            &s2 as *const _ as *mut c_void,
+            &kv as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            FUNC,
+            [k.div_ceil(128) as u32, batch_size as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(gp);
+                b.push_ptr(up_ptr);
+                b.push_ptr(op);
+                b.push_ptr(s1);
+                b.push_ptr(s2);
+                b.push_i32(kv);
+                b
+            },
+        )
+    }
+
     pub fn rotate_x_mq_128_v2(
         &mut self,
         x: &GpuTensor,

@@ -3630,11 +3630,18 @@ fn decode_activation_stage(
         let up_batch = slice_moe_f32_view(p.up_batch, 0, routed_slots);
         let rot_batch = slice_moe_f32_view(p.rot_batch, 0, routed_slots);
         if p.recipe.bf16_round_trip() {
-            hip!(gpu.silu_mul_bf16_rt_f32(&gate_batch, &up_batch, &rot_batch))?;
+            // Activation and the down projection's 128-wide rotation, one pass.
+            hip!(gpu.silu_mul_bf16_rt_rotate_x_mq_128_v2(
+                &gate_batch,
+                &up_batch,
+                &rot_batch,
+                p.mi,
+                p.k
+            ))?;
         } else {
             hip!(gpu.silu_mul_f32(&gate_batch, &up_batch, &rot_batch))?;
+            hip!(gpu.rotate_x_mq_128_v2(&rot_batch, &rot_batch, p.mi, p.k))?;
         }
-        hip!(gpu.rotate_x_mq_128_v2(&rot_batch, &rot_batch, p.mi, p.k))?;
         return Ok(());
     }
     // Gate→down: fused silu+mul+rotate
