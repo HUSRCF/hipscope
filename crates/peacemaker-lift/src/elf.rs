@@ -21,10 +21,14 @@ use object::endian::{LittleEndian as LE, U16, U32, U64};
 use object::pod;
 use object::read::elf::{FileHeader as _, NoteIterator};
 use peacemaker_ir::descriptor::{DescriptorError, KernelDescriptor};
+use peacemaker_ir::envelope::{
+    Dyn, Envelope, Fill, FileHeader, Gap, KernelSlot, MetadataDoc, Note, NoteDesc, ProgramHeader, Section, SectionData,
+    SectionHeader, Symbol,
+};
 use peacemaker_ir::metadata::HsaKernelMetadata;
 
 use crate::kd::{DescriptorCodec, KD_SIZE};
-use crate::metadata::{MetadataDoc, MetadataError};
+use crate::metadata::{MetadataDocCodec, MetadataError};
 
 /// `NT_AMDGPU_METADATA`: the code object V3+ msgpack metadata note.
 pub const NT_AMDGPU_METADATA: u32 = 32;
@@ -56,148 +60,13 @@ pub enum ElfError {
     SizeChanged { what: String, original: u64, new: u64 },
 }
 
-/// ELF header fields that are not derived from the rest of the envelope (`e_phnum`/`e_shnum`
-/// come from `segments`/`sections`; magic, class and data encoding are fixed).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct FileHeader {
-    pub ident_version: u8,
-    pub os_abi: u8,
-    pub abi_version: u8,
-    pub ident_padding: [u8; 7],
-    pub e_type: u16,
-    pub e_machine: u16,
-    pub e_version: u32,
-    pub e_entry: u64,
-    pub e_phoff: u64,
-    pub e_shoff: u64,
-    pub e_flags: u32,
-    pub e_ehsize: u16,
-    pub e_phentsize: u16,
-    pub e_shentsize: u16,
-    pub e_shstrndx: u16,
-}
+fn has_file_bytes(h: &SectionHeader) -> bool { h.sh_type != E::SHT_NOBITS && h.sh_size != 0 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ProgramHeader {
-    pub p_type: u32,
-    pub p_flags: u32,
-    pub p_offset: u64,
-    pub p_vaddr: u64,
-    pub p_paddr: u64,
-    pub p_filesz: u64,
-    pub p_memsz: u64,
-    pub p_align: u64,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct SectionHeader {
-    pub sh_name: u32,
-    pub sh_type: u32,
-    pub sh_flags: u64,
-    pub sh_addr: u64,
-    pub sh_offset: u64,
-    pub sh_size: u64,
-    pub sh_link: u32,
-    pub sh_info: u32,
-    pub sh_addralign: u64,
-    pub sh_entsize: u64,
-}
-
-impl SectionHeader {
-    fn has_file_bytes(&self) -> bool { self.sh_type != E::SHT_NOBITS && self.sh_size != 0 }
-    fn contains_va(&self, va: u64, len: u64) -> bool {
-        self.sh_flags & u64::from(E::SHF_ALLOC) != 0
-            && self.sh_type != E::SHT_NOBITS
-            && va >= self.sh_addr
-            && va.checked_add(len).is_some_and(|end| end <= self.sh_addr + self.sh_size)
-    }
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct Section {
-    pub header: SectionHeader,
-    pub data: SectionData,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum SectionData {
-    /// `SHT_NOBITS`: no file bytes.
-    NoBits,
-    /// Payload retained as bytes; kernel code and descriptor holes are zero here.
-    Bytes(Vec<u8>),
-    /// `SHT_SYMTAB` / `SHT_DYNSYM`.
-    Symbols(Vec<Symbol>),
-    /// `SHT_DYNAMIC`.
-    Dynamic(Vec<Dyn>),
-    /// `SHT_NOTE`.
-    Notes(Vec<Note>),
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Symbol {
-    pub st_name: u32,
-    pub st_info: u8,
-    pub st_other: u8,
-    pub st_shndx: u16,
-    pub st_value: u64,
-    pub st_size: u64,
-}
-
-impl Symbol {
-    pub fn kind(&self) -> u8 { self.st_info & 0xf }
-    pub fn binding(&self) -> u8 { self.st_info >> 4 }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Dyn {
-    pub d_tag: u64,
-    pub d_val: u64,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct Note {
-    /// Owner name exactly as stored (`n_namesz` bytes, trailing NULs included).
-    pub name: Vec<u8>,
-    pub n_type: u32,
-    pub desc: NoteDesc,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum NoteDesc {
-    Bytes(Vec<u8>),
-    /// `NT_AMDGPU_METADATA`; the kernel maps are holes filled from `KernelParts`.
-    AmdgpuMetadata(MetadataDoc),
-}
-
-/// Bytes between the regions the envelope models (headers, header tables, section payloads).
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Gap {
-    pub offset: u64,
-    pub fill: Fill,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum Fill {
-    Zero(u64),
-    Bytes(Vec<u8>),
-}
-
-impl Fill {
-    pub fn len(&self) -> u64 { match self { Fill::Zero(n) => *n, Fill::Bytes(b) => b.len() as u64 } }
-    pub fn is_empty(&self) -> bool { self.len() == 0 }
-}
-
-/// A kernel-owned hole in the envelope.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct KernelSlot {
-    /// `STT_FUNC` symbol name; the descriptor symbol is `<name>.kd`.
-    pub name: String,
-    pub entry_va: u64,
-    /// Code bytes owned by the kernel (`STT_FUNC` size).
-    pub size: u64,
-    pub kd_va: u64,
-    /// Position of this kernel's map in the metadata note's `amdhsa.kernels` array.
-    pub metadata_index: usize,
+fn contains_va(h: &SectionHeader, va: u64, len: u64) -> bool {
+    h.sh_flags & u64::from(E::SHF_ALLOC) != 0
+        && h.sh_type != E::SHT_NOBITS
+        && va >= h.sh_addr
+        && va.checked_add(len).is_some_and(|end| end <= h.sh_addr + h.sh_size)
 }
 
 /// What `read` hands the lifter for one kernel.
@@ -224,19 +93,23 @@ pub struct KernelParts<'a> {
     pub metadata: &'a HsaKernelMetadata,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct Envelope {
-    pub header: FileHeader,
-    pub segments: Vec<ProgramHeader>,
-    pub sections: Vec<Section>,
-    pub gaps: Vec<Gap>,
-    /// Kernel holes in entry-address order; `read`'s images and `write`'s parts use this order.
-    pub kernels: Vec<KernelSlot>,
+/// Envelope read/write (`Envelope::read(..)` with this trait in scope).
+pub trait EnvelopeCodec: Sized {
+    /// Parses a code object into its envelope and kernel images.
+    fn read(bytes: &[u8]) -> Result<(Self, Vec<KernelImage>), ElfError>;
+    /// Emits the module: the envelope with each kernel slot filled from `parts` (same order
+    /// as `kernels`): code spliced, descriptor and metadata map re-serialised.
+    fn write(&self, parts: &[KernelParts<'_>]) -> Result<Vec<u8>, ElfError>;
+    /// Section name from the section header string table.
+    fn section_name(&self, index: usize) -> Option<&str>;
+    /// Symbol name from the string table linked by symbol table section `table`.
+    fn symbol_name(&self, table: usize, symbol: &Symbol) -> Option<&str>;
+    /// File offset of `[va, va + len)` inside one allocated section with file bytes.
+    fn file_offset(&self, va: u64, len: u64) -> Option<usize>;
 }
 
-impl Envelope {
-    /// Parses a code object into its envelope and kernel images.
-    pub fn read(bytes: &[u8]) -> Result<(Envelope, Vec<KernelImage>), ElfError> {
+impl EnvelopeCodec for Envelope {
+    fn read(bytes: &[u8]) -> Result<(Envelope, Vec<KernelImage>), ElfError> {
         let format = |e: object::read::Error| ElfError::Format(e.to_string());
         let fh = FileHeader64::<LE>::parse(bytes).map_err(format)?;
         let ident = fh.e_ident;
@@ -306,7 +179,7 @@ impl Envelope {
         if !headers.is_empty() {
             regions.push(Region::new("section headers", header.e_shoff, headers.len() as u64 * SHDR_SIZE));
         }
-        let shstrtab = headers.get(usize::from(header.e_shstrndx)).filter(|h| h.has_file_bytes())
+        let shstrtab = headers.get(usize::from(header.e_shstrndx)).filter(|h| has_file_bytes(h))
             .and_then(|h| bytes.get(h.sh_offset as usize..(h.sh_offset + h.sh_size) as usize));
         let name_of = |h: &SectionHeader| shstrtab.and_then(|t| cstr(t, h.sh_name)).unwrap_or("?").to_owned();
         let mut sections = Vec::with_capacity(headers.len());
@@ -374,13 +247,11 @@ impl Envelope {
         }
         let gaps = find_gaps(bytes, regions).map_err(ElfError::from)?;
         let mut envelope = Envelope { header, segments, sections, gaps, kernels: Vec::new() };
-        let images = envelope.cut_kernels(metadata)?;
+        let images = cut_kernels(&mut envelope, metadata)?;
         Ok((envelope, images))
     }
 
-    /// Emits the module: the envelope with each kernel slot filled from `parts` (same order
-    /// as `kernels`): code spliced, descriptor and metadata map re-serialised.
-    pub fn write(&self, parts: &[KernelParts<'_>]) -> Result<Vec<u8>, ElfError> {
+    fn write(&self, parts: &[KernelParts<'_>]) -> Result<Vec<u8>, ElfError> {
         if parts.len() != self.kernels.len() {
             return Err(ElfError::PartCount { expected: self.kernels.len(), got: parts.len() });
         }
@@ -401,7 +272,7 @@ impl Envelope {
         let metadata = metadata.into_iter().collect::<Option<Vec<_>>>()
             .ok_or_else(|| ElfError::Format("kernel slots do not cover the metadata array".into()))?;
 
-        let mut chunks = vec![Chunk::bytes("ELF header", 0, self.header_bytes()?)];
+        let mut chunks = vec![Chunk::bytes("ELF header", 0, header_bytes(self)?)];
         if !self.segments.is_empty() {
             let mut table = Vec::with_capacity(self.segments.len() * PHDR_SIZE as usize);
             for p in &self.segments {
@@ -476,157 +347,155 @@ impl Envelope {
         Ok(out)
     }
 
-    /// Section name from the section header string table.
-    pub fn section_name(&self, index: usize) -> Option<&str> {
+    fn section_name(&self, index: usize) -> Option<&str> {
         let table = self.sections.get(usize::from(self.header.e_shstrndx))?;
         let SectionData::Bytes(strings) = &table.data else { return None };
         cstr(strings, self.sections.get(index)?.header.sh_name)
     }
 
-    /// Symbol name from the string table linked by symbol table section `table`.
-    pub fn symbol_name(&self, table: usize, symbol: &Symbol) -> Option<&str> {
+    fn symbol_name(&self, table: usize, symbol: &Symbol) -> Option<&str> {
         let link = self.sections.get(table)?.header.sh_link as usize;
         let SectionData::Bytes(strings) = &self.sections.get(link)?.data else { return None };
         cstr(strings, symbol.st_name)
     }
 
-    /// File offset of `[va, va + len)` inside one allocated section with file bytes.
-    pub fn file_offset(&self, va: u64, len: u64) -> Option<usize> {
-        self.section_at(va, len).map(|i| {
+    fn file_offset(&self, va: u64, len: u64) -> Option<usize> {
+        section_at(self, va, len).map(|i| {
             let h = &self.sections[i].header;
             (h.sh_offset + (va - h.sh_addr)) as usize
         })
     }
 
-    fn section_at(&self, va: u64, len: u64) -> Option<usize> {
-        self.sections.iter().position(|s| s.header.contains_va(va, len))
-    }
+}
 
-    fn header_bytes(&self) -> Result<Vec<u8>, ElfError> {
-        let h = &self.header;
-        let count = |n: usize, what: &str| u16::try_from(n).ok().filter(|&n| n != E::PN_XNUM)
-            .ok_or_else(|| ElfError::Format(format!("{n} {what} need extended numbering")));
-        let fh = FileHeader64::<LE> {
-            e_ident: Ident {
-                magic: E::ELFMAG,
-                class: E::ELFCLASS64,
-                data: E::ELFDATA2LSB,
-                version: h.ident_version,
-                os_abi: h.os_abi,
-                abi_version: h.abi_version,
-                padding: h.ident_padding,
-            },
-            e_type: U16::new(LE, h.e_type),
-            e_machine: U16::new(LE, h.e_machine),
-            e_version: U32::new(LE, h.e_version),
-            e_entry: U64::new(LE, h.e_entry),
-            e_phoff: U64::new(LE, h.e_phoff),
-            e_shoff: U64::new(LE, h.e_shoff),
-            e_flags: U32::new(LE, h.e_flags),
-            e_ehsize: U16::new(LE, h.e_ehsize),
-            e_phentsize: U16::new(LE, h.e_phentsize),
-            e_phnum: U16::new(LE, count(self.segments.len(), "program headers")?),
-            e_shentsize: U16::new(LE, h.e_shentsize),
-            e_shnum: U16::new(LE, count(self.sections.len(), "sections")?),
-            e_shstrndx: U16::new(LE, h.e_shstrndx),
-        };
-        Ok(pod::bytes_of(&fh).to_vec())
-    }
+fn section_at(env: &Envelope, va: u64, len: u64) -> Option<usize> {
+    env.sections.iter().position(|s| contains_va(&s.header, va, len))
+}
 
-    /// Finds kernels (`STT_FUNC` + `<name>.kd` `STT_OBJECT`, core.md §5.2), pairs them with
-    /// their metadata maps, and cuts code and descriptor bytes out of the envelope.
-    fn cut_kernels(&mut self, metadata: Option<Vec<HsaKernelMetadata>>) -> Result<Vec<KernelImage>, ElfError> {
-        let table = self.sections.iter().position(|s| s.header.sh_type == E::SHT_SYMTAB)
-            .or_else(|| self.sections.iter().position(|s| s.header.sh_type == E::SHT_DYNSYM));
-        let mut found = Vec::new();
-        if let Some(table) = table {
-            let SectionData::Symbols(symbols) = &self.sections[table].data else { unreachable!("symbol tables parse as symbols") };
-            let named = symbols.iter().map(|s| {
-                self.symbol_name(table, s).map(|n| (n, s)).ok_or_else(|| ElfError::Section {
-                    index: table,
-                    name: self.section_name(table).unwrap_or("?").into(),
-                    reason: format!("symbol name offset {} does not resolve to a UTF-8 string", s.st_name),
-                })
-            }).collect::<Result<Vec<_>, _>>()?;
-            let mut descriptors: HashMap<&str, &Symbol> = HashMap::new();
-            for &(name, s) in &named {
-                if s.kind() == E::STT_OBJECT && name.ends_with(".kd") && descriptors.insert(name, s).is_some() {
-                    return Err(ElfError::Kernel { kernel: name.into(), reason: "descriptor symbol is defined twice".into() });
-                }
-            }
-            for &(name, s) in &named {
-                if s.kind() != E::STT_FUNC {
-                    continue;
-                }
-                if let Some(kd) = descriptors.remove(format!("{name}.kd").as_str()) {
-                    found.push((name.to_owned(), *s, *kd));
-                } else if found.iter().any(|(n, _, _)| n == name) {
-                    return Err(ElfError::Kernel { kernel: name.into(), reason: "kernel symbol is defined twice".into() });
-                }
-            }
-            if let Some(orphan) = descriptors.keys().next() {
-                return Err(ElfError::Kernel { kernel: (*orphan).into(), reason: "descriptor symbol has no STT_FUNC kernel".into() });
+fn header_bytes(env: &Envelope) -> Result<Vec<u8>, ElfError> {
+    let h = &env.header;
+    let count = |n: usize, what: &str| u16::try_from(n).ok().filter(|&n| n != E::PN_XNUM)
+        .ok_or_else(|| ElfError::Format(format!("{n} {what} need extended numbering")));
+    let fh = FileHeader64::<LE> {
+        e_ident: Ident {
+            magic: E::ELFMAG,
+            class: E::ELFCLASS64,
+            data: E::ELFDATA2LSB,
+            version: h.ident_version,
+            os_abi: h.os_abi,
+            abi_version: h.abi_version,
+            padding: h.ident_padding,
+        },
+        e_type: U16::new(LE, h.e_type),
+        e_machine: U16::new(LE, h.e_machine),
+        e_version: U32::new(LE, h.e_version),
+        e_entry: U64::new(LE, h.e_entry),
+        e_phoff: U64::new(LE, h.e_phoff),
+        e_shoff: U64::new(LE, h.e_shoff),
+        e_flags: U32::new(LE, h.e_flags),
+        e_ehsize: U16::new(LE, h.e_ehsize),
+        e_phentsize: U16::new(LE, h.e_phentsize),
+        e_phnum: U16::new(LE, count(env.segments.len(), "program headers")?),
+        e_shentsize: U16::new(LE, h.e_shentsize),
+        e_shnum: U16::new(LE, count(env.sections.len(), "sections")?),
+        e_shstrndx: U16::new(LE, h.e_shstrndx),
+    };
+    Ok(pod::bytes_of(&fh).to_vec())
+}
+
+/// Finds kernels (`STT_FUNC` + `<name>.kd` `STT_OBJECT`, core.md §5.2), pairs them with
+/// their metadata maps, and cuts code and descriptor bytes out of the envelope.
+fn cut_kernels(env: &mut Envelope, metadata: Option<Vec<HsaKernelMetadata>>) -> Result<Vec<KernelImage>, ElfError> {
+    let table = env.sections.iter().position(|s| s.header.sh_type == E::SHT_SYMTAB)
+        .or_else(|| env.sections.iter().position(|s| s.header.sh_type == E::SHT_DYNSYM));
+    let mut found = Vec::new();
+    if let Some(table) = table {
+        let SectionData::Symbols(symbols) = &env.sections[table].data else { unreachable!("symbol tables parse as symbols") };
+        let named = symbols.iter().map(|s| {
+            env.symbol_name(table, s).map(|n| (n, s)).ok_or_else(|| ElfError::Section {
+                index: table,
+                name: env.section_name(table).unwrap_or("?").into(),
+                reason: format!("symbol name offset {} does not resolve to a UTF-8 string", s.st_name),
+            })
+        }).collect::<Result<Vec<_>, _>>()?;
+        let mut descriptors: HashMap<&str, &Symbol> = HashMap::new();
+        for &(name, s) in &named {
+            if s.kind() == E::STT_OBJECT && name.ends_with(".kd") && descriptors.insert(name, s).is_some() {
+                return Err(ElfError::Kernel { kernel: name.into(), reason: "descriptor symbol is defined twice".into() });
             }
         }
-        found.sort_by_key(|(_, f, _)| f.st_value);
-
-        let mut metadata: Vec<Option<HsaKernelMetadata>> = metadata.unwrap_or_default().into_iter().map(Some).collect();
-        let mut images = Vec::with_capacity(found.len());
-        for (name, func, kd) in found {
-            let fail = |reason: String| ElfError::Kernel { kernel: name.clone(), reason };
-            if func.st_size == 0 {
-                return Err(fail("kernel symbol size is 0".into()));
+        for &(name, s) in &named {
+            if s.kind() != E::STT_FUNC {
+                continue;
             }
-            if kd.st_size != KD_SIZE as u64 {
-                return Err(fail(format!("descriptor symbol size {} is not {KD_SIZE}", kd.st_size)));
+            if let Some(kd) = descriptors.remove(format!("{name}.kd").as_str()) {
+                found.push((name.to_owned(), *s, *kd));
+            } else if found.iter().any(|(n, _, _)| n == name) {
+                return Err(ElfError::Kernel { kernel: name.into(), reason: "kernel symbol is defined twice".into() });
             }
-            let kd_section = self.section_at(kd.st_value, KD_SIZE as u64)
-                .ok_or_else(|| fail(format!("descriptor at {:#x} is not inside an allocated section", kd.st_value)))?;
-            let code_section = self.section_at(func.st_value, func.st_size)
-                .filter(|&i| self.sections[i].header.sh_flags & u64::from(E::SHF_EXECINSTR) != 0)
-                .ok_or_else(|| fail(format!("code [{:#x}, +{:#x}) is not inside an executable section", func.st_value, func.st_size)))?;
-            if let Some(prev) = self.kernels.last() {
-                if prev.entry_va + prev.size > func.st_value {
-                    return Err(fail(format!("code overlaps kernel {}", prev.name)));
-                }
-            }
-            if self.kernels.iter().any(|k| k.kd_va < kd.st_value + KD_SIZE as u64 && kd.st_value < k.kd_va + KD_SIZE as u64) {
-                return Err(fail("descriptor overlaps another kernel's descriptor".into()));
-            }
-            let kd_bytes = self.bytes_mut(kd_section, kd.st_value, KD_SIZE as u64).ok_or_else(|| fail("descriptor section holds no bytes".into()))?;
-            let descriptor = KernelDescriptor::from_bytes(kd_bytes).map_err(|error| ElfError::Descriptor { kernel: name.clone(), error })?;
-            if kd.st_value.checked_add_signed(descriptor.kernel_code_entry_byte_offset) != Some(func.st_value) {
-                return Err(fail(format!("descriptor entry offset {} does not reach the symbol at {:#x}", descriptor.kernel_code_entry_byte_offset, func.st_value)));
-            }
-            if func.st_value % 256 != 0 {
-                return Err(fail(format!("entry {:#x} is not 256-byte aligned", func.st_value)));
-            }
-            let symbol = format!("{name}.kd");
-            let mut matches = metadata.iter().enumerate().filter(|(_, m)| m.as_ref().is_some_and(|m| m.parsed.symbol == symbol)).map(|(i, _)| i);
-            let metadata_index = matches.next().ok_or_else(|| fail(format!("no metadata map has .symbol {symbol}")))?;
-            if matches.next().is_some() {
-                return Err(fail(format!("several metadata maps have .symbol {symbol}")));
-            }
-            let meta = metadata[metadata_index].take().expect("matched metadata is present");
-            kd_bytes.fill(0);
-            let code_bytes = self.bytes_mut(code_section, func.st_value, func.st_size).ok_or_else(|| fail("code section holds no bytes".into()))?;
-            let code = code_bytes.to_vec();
-            code_bytes.fill(0);
-            self.kernels.push(KernelSlot { name: name.clone(), entry_va: func.st_value, size: func.st_size, kd_va: kd.st_value, metadata_index });
-            images.push(KernelImage { name, entry_va: func.st_value, code, descriptor, metadata: meta });
         }
-        if let Some(extra) = metadata.into_iter().flatten().next() {
-            return Err(ElfError::Kernel { kernel: extra.parsed.name, reason: format!("metadata map for {} has no kernel symbol pair", extra.parsed.symbol) });
+        if let Some(orphan) = descriptors.keys().next() {
+            return Err(ElfError::Kernel { kernel: (*orphan).into(), reason: "descriptor symbol has no STT_FUNC kernel".into() });
         }
-        Ok(images)
     }
+    found.sort_by_key(|(_, f, _)| f.st_value);
 
-    fn bytes_mut(&mut self, section: usize, va: u64, len: u64) -> Option<&mut [u8]> {
-        let h = self.sections[section].header;
-        let SectionData::Bytes(data) = &mut self.sections[section].data else { return None };
-        let start = (va - h.sh_addr) as usize;
-        data.get_mut(start..start + len as usize)
+    let mut metadata: Vec<Option<HsaKernelMetadata>> = metadata.unwrap_or_default().into_iter().map(Some).collect();
+    let mut images = Vec::with_capacity(found.len());
+    for (name, func, kd) in found {
+        let fail = |reason: String| ElfError::Kernel { kernel: name.clone(), reason };
+        if func.st_size == 0 {
+            return Err(fail("kernel symbol size is 0".into()));
+        }
+        if kd.st_size != KD_SIZE as u64 {
+            return Err(fail(format!("descriptor symbol size {} is not {KD_SIZE}", kd.st_size)));
+        }
+        let kd_section = section_at(env, kd.st_value, KD_SIZE as u64)
+            .ok_or_else(|| fail(format!("descriptor at {:#x} is not inside an allocated section", kd.st_value)))?;
+        let code_section = section_at(env, func.st_value, func.st_size)
+            .filter(|&i| env.sections[i].header.sh_flags & u64::from(E::SHF_EXECINSTR) != 0)
+            .ok_or_else(|| fail(format!("code [{:#x}, +{:#x}) is not inside an executable section", func.st_value, func.st_size)))?;
+        if let Some(prev) = env.kernels.last() {
+            if prev.entry_va + prev.size > func.st_value {
+                return Err(fail(format!("code overlaps kernel {}", prev.name)));
+            }
+        }
+        if env.kernels.iter().any(|k| k.kd_va < kd.st_value + KD_SIZE as u64 && kd.st_value < k.kd_va + KD_SIZE as u64) {
+            return Err(fail("descriptor overlaps another kernel's descriptor".into()));
+        }
+        let kd_bytes = bytes_mut(env, kd_section, kd.st_value, KD_SIZE as u64).ok_or_else(|| fail("descriptor section holds no bytes".into()))?;
+        let descriptor = KernelDescriptor::from_bytes(kd_bytes).map_err(|error| ElfError::Descriptor { kernel: name.clone(), error })?;
+        if kd.st_value.checked_add_signed(descriptor.kernel_code_entry_byte_offset) != Some(func.st_value) {
+            return Err(fail(format!("descriptor entry offset {} does not reach the symbol at {:#x}", descriptor.kernel_code_entry_byte_offset, func.st_value)));
+        }
+        if func.st_value % 256 != 0 {
+            return Err(fail(format!("entry {:#x} is not 256-byte aligned", func.st_value)));
+        }
+        let symbol = format!("{name}.kd");
+        let mut matches = metadata.iter().enumerate().filter(|(_, m)| m.as_ref().is_some_and(|m| m.parsed.symbol == symbol)).map(|(i, _)| i);
+        let metadata_index = matches.next().ok_or_else(|| fail(format!("no metadata map has .symbol {symbol}")))?;
+        if matches.next().is_some() {
+            return Err(fail(format!("several metadata maps have .symbol {symbol}")));
+        }
+        let meta = metadata[metadata_index].take().expect("matched metadata is present");
+        kd_bytes.fill(0);
+        let code_bytes = bytes_mut(env, code_section, func.st_value, func.st_size).ok_or_else(|| fail("code section holds no bytes".into()))?;
+        let code = code_bytes.to_vec();
+        code_bytes.fill(0);
+        env.kernels.push(KernelSlot { name: name.clone(), entry_va: func.st_value, size: func.st_size, kd_va: kd.st_value, metadata_index });
+        images.push(KernelImage { name, entry_va: func.st_value, code, descriptor, metadata: meta });
     }
+    if let Some(extra) = metadata.into_iter().flatten().next() {
+        return Err(ElfError::Kernel { kernel: extra.parsed.name, reason: format!("metadata map for {} has no kernel symbol pair", extra.parsed.symbol) });
+    }
+    Ok(images)
+}
+
+fn bytes_mut(env: &mut Envelope, section: usize, va: u64, len: u64) -> Option<&mut [u8]> {
+    let h = env.sections[section].header;
+    let SectionData::Bytes(data) = &mut env.sections[section].data else { return None };
+    let start = (va - h.sh_addr) as usize;
+    data.get_mut(start..start + len as usize)
 }
 
 fn write_notes(notes: &[Note], align: u64, metadata: &[&HsaKernelMetadata]) -> Result<Vec<u8>, ElfError> {
@@ -775,22 +644,18 @@ pub(crate) mod fixtures {
 mod tests {
     use super::fixtures::{f2_hxaco, kt48_co, KT48_SELECTED};
     use super::*;
-    use crate::bundle::Bundle;
+    use crate::bundle::SourceCodec;
+    use peacemaker_ir::envelope::Source;
     use peacemaker_ir::inst::Arch;
 
-    fn emit(envelope: &Envelope, images: &[KernelImage]) -> Vec<u8> {
-        envelope.write(&images.iter().map(KernelImage::parts).collect::<Vec<_>>()).unwrap()
-    }
+    fn parts(images: &[KernelImage]) -> Vec<KernelParts<'_>> { images.iter().map(KernelImage::parts).collect() }
 
-    /// Bundle → device ELF → envelope + kernels → ELF → bundle.
-    fn bundle_round_trip(input: &[u8]) -> (Vec<u8>, Envelope, Vec<KernelImage>) {
-        let (bundle, payloads) = Bundle::read(input).unwrap();
-        let device = bundle.device_entry(Arch::Gfx1201).unwrap();
-        let (envelope, images) = Envelope::read(payloads[device]).unwrap();
-        let elf = emit(&envelope, &images);
-        let mut out = payloads.clone();
-        out[device] = &elf;
-        (bundle.write(&out).unwrap(), envelope, images)
+    fn emit(envelope: &Envelope, images: &[KernelImage]) -> Vec<u8> { envelope.write(&parts(images)).unwrap() }
+
+    /// Input → `Source` + kernel images → emitted bytes (bundle and plain-ELF paths alike).
+    fn source_round_trip(input: &[u8]) -> (Vec<u8>, Source, Vec<KernelImage>) {
+        let (source, images) = Source::read(input, Arch::Gfx1201).unwrap();
+        (source.write(&parts(&images)).unwrap(), source, images)
     }
 
     fn section(envelope: &Envelope, name: &str) -> usize {
@@ -800,8 +665,10 @@ mod tests {
     #[test]
     fn kt48_module_identity() {
         let co = kt48_co();
-        let (envelope, images) = Envelope::read(&co).unwrap();
-        assert_eq!(emit(&envelope, &images), co);
+        let (out, source, images) = source_round_trip(&co);
+        assert_eq!(out, co);
+        assert!(source.bundle.is_none());
+        let envelope = source.elf;
 
         assert_eq!((envelope.segments.len(), envelope.sections.len(), images.len()), (9, 18, 6));
         let text = &envelope.sections[section(&envelope, ".text")].header;
@@ -815,10 +682,11 @@ mod tests {
     #[test]
     fn f2_bundle_module_identity() {
         let hxaco = f2_hxaco();
-        let (out, envelope, images) = bundle_round_trip(&hxaco);
+        let (out, source, images) = source_round_trip(&hxaco);
         assert_eq!(out, hxaco);
+        assert!(source.bundle.is_some());
         assert_eq!(images.len(), 11);
-        assert!(envelope.gaps.iter().all(|g| matches!(g.fill, Fill::Zero(_))), "{:?}", envelope.gaps);
+        assert!(source.elf.gaps.iter().all(|g| matches!(g.fill, Fill::Zero(_))), "{:?}", source.elf.gaps);
     }
 
     /// The envelope holds no kernel-owned bytes: each kernel part lands at its own place and

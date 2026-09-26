@@ -1,4 +1,4 @@
-//! C2: HIP offload bundle read/write.
+//! C2: HIP offload bundle read/write, and the `Source` (ELF or bundled ELF) codec.
 //!
 //! Uncompressed `clang-offload-bundler` format: the 24-byte magic, a little-endian `u64`
 //! entry count, then per entry `u64` offset (absolute), `u64` size, `u64` triple length and
@@ -6,9 +6,10 @@
 //! input and `write` takes them back (the device payload is the re-emitted ELF), so a bundle
 //! round trip is header + payloads + the retained padding `Gap`s.
 
+use peacemaker_ir::envelope::{Bundle, BundleEntry, Envelope, Source};
 use peacemaker_ir::inst::Arch;
 
-use crate::elf::{assemble, find_gaps, Chunk, Gap, Overlap, Region};
+use crate::elf::{assemble, find_gaps, Chunk, ElfError, EnvelopeCodec, KernelImage, KernelParts, Overlap, Region};
 
 pub const MAGIC: &[u8; 24] = b"__CLANG_OFFLOAD_BUNDLE__";
 /// Magic of the compressed bundle format (`--offload-compress`), which is not handled.
@@ -42,25 +43,22 @@ impl From<Overlap> for BundleError {
     fn from(o: Overlap) -> Self { BundleError::Overlap { first: o.first, second: o.second, offset: o.offset } }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BundleEntry {
-    pub triple: String,
-    /// Absolute file offset of the payload (kept for empty payloads too: the host entry).
-    pub offset: u64,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Bundle {
-    pub entries: Vec<BundleEntry>,
-    /// Bytes outside the header and the payloads (the bundler's alignment padding).
-    pub gaps: Vec<Gap>,
-}
-
-impl Bundle {
-    pub fn is_bundle(bytes: &[u8]) -> bool { bytes.starts_with(MAGIC) }
-
+/// Bundle read/write (`Bundle::read(..)` with this trait in scope).
+pub trait BundleCodec: Sized {
+    fn is_bundle(bytes: &[u8]) -> bool;
     /// Splits a bundle into its structure and its payloads (one per entry, in header order).
-    pub fn read(bytes: &[u8]) -> Result<(Bundle, Vec<&[u8]>), BundleError> {
+    fn read(bytes: &[u8]) -> Result<(Self, Vec<&[u8]>), BundleError>;
+    /// Emits the bundle with `payloads` (header order); entry sizes come from the payloads.
+    fn write(&self, payloads: &[&[u8]]) -> Result<Vec<u8>, BundleError>;
+    /// Index of the single HIP device entry for `arch` (`hipv4-amdgcn-amd-amdhsa--<arch>`,
+    /// optionally followed by `:feature` suffixes).
+    fn device_entry(&self, arch: Arch) -> Result<usize, BundleError>;
+}
+
+impl BundleCodec for Bundle {
+    fn is_bundle(bytes: &[u8]) -> bool { bytes.starts_with(MAGIC) }
+
+    fn read(bytes: &[u8]) -> Result<(Bundle, Vec<&[u8]>), BundleError> {
         if bytes.starts_with(COMPRESSED_MAGIC) {
             return Err(BundleError::Compressed);
         }
@@ -100,8 +98,7 @@ impl Bundle {
         Ok((Bundle { entries, gaps }, payloads))
     }
 
-    /// Emits the bundle with `payloads` (header order); entry sizes come from the payloads.
-    pub fn write(&self, payloads: &[&[u8]]) -> Result<Vec<u8>, BundleError> {
+    fn write(&self, payloads: &[&[u8]]) -> Result<Vec<u8>, BundleError> {
         if payloads.len() != self.entries.len() {
             return Err(BundleError::PayloadCount { expected: self.entries.len(), got: payloads.len() });
         }
@@ -119,9 +116,7 @@ impl Bundle {
         Ok(assemble(chunks)?)
     }
 
-    /// Index of the single HIP device entry for `arch` (`hipv4-amdgcn-amd-amdhsa--<arch>`,
-    /// optionally followed by `:feature` suffixes).
-    pub fn device_entry(&self, arch: Arch) -> Result<usize, BundleError> {
+    fn device_entry(&self, arch: Arch) -> Result<usize, BundleError> {
         let triple = format!("{HIP_DEVICE_TRIPLE_PREFIX}{}", arch_name(arch));
         let matches: Vec<usize> = self.entries.iter().enumerate()
             .filter(|(_, e)| e.triple.strip_prefix(triple.as_str()).is_some_and(|rest| rest.is_empty() || rest.starts_with(':')))
@@ -132,6 +127,65 @@ impl Bundle {
             [] => Err(BundleError::NoEntry(triple)),
             _ => Err(BundleError::Ambiguous { count: matches.len(), triple }),
         }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SourceError {
+    #[error(transparent)]
+    Bundle(#[from] BundleError),
+    #[error(transparent)]
+    Elf(#[from] ElfError),
+    #[error("bundle entry {triple} carries a {len}-byte payload that `Source` cannot hold; only the device ELF may be non-empty")]
+    ForeignPayload { triple: String, len: usize },
+}
+
+/// Reads and writes a lifter input: a code object ELF, or a HIP bundle whose `arch` device
+/// entry is that ELF (`Source::read(..)` with this trait in scope).
+pub trait SourceCodec: Sized {
+    fn read(bytes: &[u8], arch: Arch) -> Result<(Self, Vec<KernelImage>), SourceError>;
+    fn write(&self, parts: &[KernelParts<'_>]) -> Result<Vec<u8>, SourceError>;
+}
+
+impl SourceCodec for Source {
+    fn read(bytes: &[u8], arch: Arch) -> Result<(Source, Vec<KernelImage>), SourceError> {
+        if !Bundle::is_bundle(bytes) && !bytes.starts_with(COMPRESSED_MAGIC) {
+            let (elf, images) = Envelope::read(bytes)?;
+            return Ok((Source { elf, bundle: None }, images));
+        }
+        let (bundle, payloads) = Bundle::read(bytes)?;
+        let device = bundle.device_entry(arch)?;
+        sole_device_entry(&bundle)?;
+        if let Some((entry, payload)) = bundle.entries.iter().zip(&payloads).enumerate()
+            .find_map(|(i, pair)| (i != device && !pair.1.is_empty()).then_some(pair))
+        {
+            return Err(SourceError::ForeignPayload { triple: entry.triple.clone(), len: payload.len() });
+        }
+        let (elf, images) = Envelope::read(payloads[device])?;
+        Ok((Source { elf, bundle: Some(bundle) }, images))
+    }
+
+    fn write(&self, parts: &[KernelParts<'_>]) -> Result<Vec<u8>, SourceError> {
+        let elf = self.elf.write(parts)?;
+        let Some(bundle) = &self.bundle else { return Ok(elf) };
+        let device = sole_device_entry(bundle)?;
+        let mut payloads: Vec<&[u8]> = vec![&[]; bundle.entries.len()];
+        payloads[device] = &elf;
+        Ok(bundle.write(&payloads)?)
+    }
+}
+
+/// `Source` keeps no payloads, so its bundle must have exactly one HIP device entry: the one
+/// the ELF is written back into.
+fn sole_device_entry(bundle: &Bundle) -> Result<usize, BundleError> {
+    let devices: Vec<usize> = bundle.entries.iter().enumerate()
+        .filter(|(_, e)| e.triple.starts_with(HIP_DEVICE_TRIPLE_PREFIX))
+        .map(|(i, _)| i)
+        .collect();
+    match devices[..] {
+        [index] => Ok(index),
+        [] => Err(BundleError::NoEntry(HIP_DEVICE_TRIPLE_PREFIX.into())),
+        _ => Err(BundleError::Ambiguous { count: devices.len(), triple: HIP_DEVICE_TRIPLE_PREFIX.into() }),
     }
 }
 
@@ -208,5 +262,25 @@ mod tests {
         let hxaco = f2_hxaco();
         let (bundle, payloads) = Bundle::read(&hxaco).unwrap();
         assert_eq!(bundle.write(&payloads[..1]).unwrap_err(), BundleError::PayloadCount { expected: 2, got: 1 });
+    }
+
+    /// `Source` keeps only the device ELF, so bundles carrying anything else are rejected
+    /// rather than silently losing bytes on re-emission.
+    #[test]
+    fn source_rejects_bundles_it_cannot_re_emit() {
+        let hxaco = f2_hxaco();
+        let (_, payloads) = Bundle::read(&hxaco).unwrap();
+        let elf = payloads[1];
+        let entry = |triple: &str, offset| BundleEntry { triple: triple.into(), offset };
+        let host = entry("host-x86_64-unknown-linux-gnu-", 0x100);
+        let device = entry("hipv4-amdgcn-amd-amdhsa--gfx1201", 0x1000);
+
+        let with_host = Bundle { entries: vec![host.clone(), device.clone()], gaps: Vec::new() }.write(&[b"host", elf]).unwrap();
+        assert!(matches!(Source::read(&with_host, Arch::Gfx1201),
+            Err(SourceError::ForeignPayload { triple, len: 4 }) if triple.starts_with("host-")));
+
+        let second = entry("hipv4-amdgcn-amd-amdhsa--gfx1100", 0x100);
+        let two_devices = Bundle { entries: vec![second, device], gaps: Vec::new() }.write(&[&[], elf]).unwrap();
+        assert!(matches!(Source::read(&two_devices, Arch::Gfx1201), Err(SourceError::Bundle(BundleError::Ambiguous { count: 2, .. }))));
     }
 }

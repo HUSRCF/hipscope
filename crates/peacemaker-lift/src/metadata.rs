@@ -9,6 +9,7 @@
 //! re-encoding differs, so that byte identity holds for every accepted input.
 
 use peacemaker_ir::descriptor::KernelDescriptor;
+use peacemaker_ir::envelope::{DocEntry, MetadataDoc};
 use peacemaker_ir::metadata::{HsaKernelMetadata, Kernarg, KernelMeta};
 use rmpv::Value;
 
@@ -41,30 +42,27 @@ pub enum MetadataError {
     Inconsistent { kernel: String, reason: String },
 }
 
-/// One entry of the top-level metadata map, in encoded order.
-#[derive(Clone, Debug, PartialEq)]
-pub enum DocEntry {
-    /// The `amdhsa.kernels` array: its length; the maps themselves are owned by the kernels.
-    Kernels(usize),
-    /// Any other top-level value (`amdhsa.target`, `amdhsa.version`, …), retained as decoded.
-    Value(Value),
-}
-
-/// The metadata note payload with the per-kernel maps cut out.
-#[derive(Clone, Debug, PartialEq)]
-pub struct MetadataDoc {
-    pub entries: Vec<(Value, DocEntry)>,
-}
-
-impl MetadataDoc {
+/// Codec for the metadata note payload (`MetadataDoc::parse(..)` with this trait in scope).
+/// The skeleton keeps every non-kernel top-level key and value as its own msgpack bytes;
+/// the kernel maps are holes filled from typed `HsaKernelMetadata` on write.
+pub trait MetadataDocCodec: Sized {
     /// Splits a note payload into the document skeleton and the kernels' metadata in array
     /// order. Fails unless `write` of the result reproduces `desc` exactly.
-    pub fn parse(desc: &[u8]) -> Result<(MetadataDoc, Vec<HsaKernelMetadata>), MetadataError> {
+    fn parse(desc: &[u8]) -> Result<(Self, Vec<HsaKernelMetadata>), MetadataError>;
+    /// Number of kernel maps the document holds.
+    fn kernel_count(&self) -> usize;
+    /// Re-encodes the document, serialising each kernel (array order) from its typed metadata.
+    fn write(&self, kernels: &[&HsaKernelMetadata]) -> Result<Vec<u8>, MetadataError>;
+}
+
+impl MetadataDocCodec for MetadataDoc {
+    fn parse(desc: &[u8]) -> Result<(MetadataDoc, Vec<HsaKernelMetadata>), MetadataError> {
         let mut pos = 0;
         let count = read_container_len(desc, &mut pos, Container::Map, "metadata document")?;
         let mut entries = Vec::with_capacity(count);
         let mut kernels = None;
         for _ in 0..count {
+            let key_start = pos;
             let key = read_value_at(desc, &mut pos)?;
             if key.as_str() == Some(KERNELS_KEY) {
                 if kernels.is_some() {
@@ -77,14 +75,16 @@ impl MetadataDoc {
                     read_value_at(desc, &mut pos)?;
                     list.push(parse_kernel(&desc[start..pos])?);
                 }
-                entries.push((key, DocEntry::Kernels(n)));
+                entries.push(DocEntry::Kernels(n));
                 kernels = Some(list);
             } else {
-                if entries.iter().any(|(k, _)| *k == key) {
+                let key_bytes = &desc[key_start..pos];
+                if entries.iter().any(|e| matches!(e, DocEntry::Raw { key, .. } if key == key_bytes)) {
                     return Err(MetadataError::Duplicate { key: key.to_string() });
                 }
-                let value = read_value_at(desc, &mut pos)?;
-                entries.push((key, DocEntry::Value(value)));
+                let value_start = pos;
+                read_value_at(desc, &mut pos)?;
+                entries.push(DocEntry::Raw { key: key_bytes.to_vec(), value: desc[value_start..pos].to_vec() });
             }
         }
         if pos != desc.len() {
@@ -98,29 +98,30 @@ impl MetadataDoc {
         Ok((doc, kernels))
     }
 
-    /// Number of kernel maps the document holds.
-    pub fn kernel_count(&self) -> usize {
-        self.entries.iter().find_map(|(_, e)| match e { DocEntry::Kernels(n) => Some(*n), DocEntry::Value(_) => None }).unwrap_or(0)
+    fn kernel_count(&self) -> usize {
+        self.entries.iter().find_map(|e| match e { DocEntry::Kernels(n) => Some(*n), DocEntry::Raw { .. } => None }).unwrap_or(0)
     }
 
-    /// Re-encodes the document, serialising each kernel (array order) from its typed metadata.
-    pub fn write(&self, kernels: &[&HsaKernelMetadata]) -> Result<Vec<u8>, MetadataError> {
+    fn write(&self, kernels: &[&HsaKernelMetadata]) -> Result<Vec<u8>, MetadataError> {
         let expected = self.kernel_count();
         if kernels.len() != expected {
             return Err(MetadataError::KernelCount { expected, got: kernels.len() });
         }
         let mut out = Vec::new();
         write_container_len(&mut out, self.entries.len(), Container::Map);
-        for (key, entry) in &self.entries {
-            encode_into(&mut out, key);
+        for entry in &self.entries {
             match entry {
                 DocEntry::Kernels(n) => {
+                    encode_into(&mut out, &Value::from(KERNELS_KEY));
                     write_container_len(&mut out, *n, Container::Array);
                     for kernel in kernels {
                         out.extend(serialize_kernel(kernel)?);
                     }
                 }
-                DocEntry::Value(value) => encode_into(&mut out, value),
+                DocEntry::Raw { key, value } => {
+                    out.extend_from_slice(key);
+                    out.extend_from_slice(value);
+                }
             }
         }
         Ok(out)
@@ -405,9 +406,10 @@ fn write_container_len(out: &mut Vec<u8>, len: usize, kind: Container) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bundle::Bundle;
+    use crate::bundle::SourceCodec;
     use crate::elf::fixtures::{f2_hxaco, kt48_co, KT48_SELECTED};
-    use crate::elf::{Envelope, KernelImage};
+    use crate::elf::{EnvelopeCodec, KernelImage};
+    use peacemaker_ir::envelope::{Envelope, Source};
     use peacemaker_ir::inst::Arch;
 
     fn kt48_images() -> Vec<KernelImage> { Envelope::read(&kt48_co()).unwrap().1 }
@@ -436,9 +438,7 @@ mod tests {
 
     #[test]
     fn every_fixture_kernel_metadata_matches_its_descriptor() {
-        let hxaco = f2_hxaco();
-        let (bundle, payloads) = Bundle::read(&hxaco).unwrap();
-        let f2 = Envelope::read(payloads[bundle.device_entry(Arch::Gfx1201).unwrap()]).unwrap().1;
+        let f2 = Source::read(&f2_hxaco(), Arch::Gfx1201).unwrap().1;
         for image in kt48_images().iter().chain(&f2) {
             check(&image.metadata.parsed, &image.name, &image.descriptor).unwrap_or_else(|e| panic!("{e}"));
         }
