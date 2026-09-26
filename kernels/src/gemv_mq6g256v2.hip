@@ -19,15 +19,14 @@
 // Half 0 governs q[0..128), half 1 q[128..256); reconstruction q*f32(s[h])+f32(z[h]).
 // K%256 required. Same 4-accumulator interleaving as gemv_mq4g256v2 for byte-exact.
 
-__launch_bounds__(32, 16)
-extern "C" __global__ void HIPFIRE_MQ6G256V2_KERNEL(
+// One output row. Every entry point below runs this body, so a row's value
+// does not depend on which launch computed it.
+static __device__ __forceinline__ void mq6g256v2_row(
     const char* __restrict__ A,
     const float* __restrict__ x,
     float* __restrict__ y,
-    int M, int K
+    int row, int K
 ) {
-    const int row = blockIdx.x;
-    if (row >= M) return;
     const int tid = threadIdx.x;
 
 #if defined(HIPFIRE_MQ6G256V2_K2048)
@@ -185,6 +184,52 @@ extern "C" __global__ void HIPFIRE_MQ6G256V2_KERNEL(
 
     if (tid == 0) y[row] = acc;
 }
+
+__launch_bounds__(32, 16)
+extern "C" __global__ void HIPFIRE_MQ6G256V2_KERNEL(
+    const char* __restrict__ A,
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    int M, int K
+) {
+    const int row = blockIdx.x;
+    if (row >= M) return;
+    mq6g256v2_row(A, x, y, row, K);
+}
+
+#if !defined(HIPFIRE_MQ6G256V2_K2048)
+// Four MQ6G256V2 matrices reading the same x (same K) in one launch: blocks
+// [0, M0) are rows of A0, the next M1 rows of A1, and so on. Each row is the
+// same computation the single-matrix kernel does for it.
+__launch_bounds__(32, 16)
+extern "C" __global__ void gemv_mq6g256v2_x4(
+    const char* __restrict__ A0,
+    const char* __restrict__ A1,
+    const char* __restrict__ A2,
+    const char* __restrict__ A3,
+    const float* __restrict__ x,
+    float* __restrict__ y0,
+    float* __restrict__ y1,
+    float* __restrict__ y2,
+    float* __restrict__ y3,
+    int M0, int M1, int M2, int M3, int K
+) {
+    int row = blockIdx.x;
+    const char* A = A0;
+    float* y = y0;
+    if (row >= M0) {
+        row -= M0; A = A1; y = y1;
+        if (row >= M1) {
+            row -= M1; A = A2; y = y2;
+            if (row >= M2) {
+                row -= M2; A = A3; y = y3;
+                if (row >= M3) return;
+            }
+        }
+    }
+    mq6g256v2_row(A, x, y, row, K);
+}
+#endif
 
 // ─────────────────────────────────────────────────────────────────────────
 // x-batched variant: one weight row decoded ONCE per launch and dotted

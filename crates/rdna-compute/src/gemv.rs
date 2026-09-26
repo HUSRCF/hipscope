@@ -15946,6 +15946,63 @@ impl Gpu {
         result
     }
 
+    /// [`Gpu::gemv_mq6g256v2`] for up to four `(weight, y, m)` matrices that
+    /// read the same pre-rotated `x` (width `k`), in one launch; unused slots
+    /// carry `m = 0`. Every output row is the value the single-matrix launch
+    /// computes.
+    pub fn gemv_mq6g256v2_x4(
+        &mut self,
+        parts: [(&GpuTensor, &GpuTensor, usize); 4],
+        x: &GpuTensor,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let (v2_src, v2_module) =
+            kernels::gemv_mq6g256v2_for_arch(&self.arch_caps, self.flags.rdna2_variant);
+        let module_v2 = format!("{}_mq6v2", v2_module);
+        self.ensure_kernel(&module_v2, v2_src, "gemv_mq6g256v2_x4")?;
+        let a = parts.map(|(w, _, _)| w.buf.as_ptr());
+        let y = parts.map(|(_, y, _)| y.buf.as_ptr());
+        let m = parts.map(|(_, _, m)| m as i32);
+        let x_ptr = x.buf.as_ptr();
+        let k_val = k as i32;
+        let rows: usize = parts.iter().map(|(_, _, m)| m).sum();
+        let mut params: Vec<*mut std::ffi::c_void> = Vec::with_capacity(13);
+        for p in &a {
+            params.push(p as *const _ as *mut std::ffi::c_void);
+        }
+        params.push(&x_ptr as *const _ as *mut std::ffi::c_void);
+        for p in &y {
+            params.push(p as *const _ as *mut std::ffi::c_void);
+        }
+        for v in &m {
+            params.push(v as *const _ as *mut std::ffi::c_void);
+        }
+        params.push(&k_val as *const _ as *mut std::ffi::c_void);
+        self.launch_maybe_blob(
+            "gemv_mq6g256v2_x4",
+            [rows as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                for p in a {
+                    b.push_ptr(p);
+                }
+                b.push_ptr(x_ptr);
+                for p in y {
+                    b.push_ptr(p);
+                }
+                for v in m {
+                    b.push_i32(v);
+                }
+                b.push_i32(k_val);
+                b
+            },
+        )
+    }
+
     /// Shared-weight F32 MQ6G256V2 for 2–4 pre-rotated activation rows.
     /// `x` is contiguous [rows, k]; `y` is contiguous [rows, m].
     /// Each warp owns one weight row and computes every activation row in

@@ -193,16 +193,38 @@ pub fn project_weights(
         let (weight, _) = projections[i];
         let rotated = rotate_input(gpu, weight, input, rows, rotation)?;
         let x = rotated.as_ref().unwrap_or(input);
+        let mut group: SmallVec<[usize; 4]> = SmallVec::new();
         for j in i..projections.len() {
-            let (w, out) = projections[j];
+            let (w, _) = projections[j];
             let same_input = j == i
                 || (rotated.is_some()
                     && w.k == weight.k
                     && rotation_basis(w.dtype) == rotation_basis(weight.dtype));
             if !done[j] && same_input {
-                project_rotated(gpu, w, x, out, rows)?;
+                group.push(j);
                 done[j] = true;
             }
+        }
+        // Decode: two or more MQ6 GEMVs of the group share one launch, four
+        // at a time; each row is the single-matrix kernel's value.
+        let mut mq6: SmallVec<[usize; 4]> = group
+            .iter()
+            .copied()
+            .filter(|&j| rows == 1 && projections[j].0.dtype == DType::MQ6G256V2)
+            .collect();
+        if mq6.len() < 2 {
+            mq6.clear();
+        }
+        for chunk in mq6.chunks(4) {
+            let part = |n: usize| {
+                let (w, y) = projections[chunk[n.min(chunk.len() - 1)]];
+                (w.buf, y, if n < chunk.len() { w.m } else { 0 })
+            };
+            hip(gpu.gemv_mq6g256v2_x4([part(0), part(1), part(2), part(3)], x, weight.k))?;
+        }
+        for &j in group.iter().filter(|j| !mq6.contains(j)) {
+            let (w, out) = projections[j];
+            project_rotated(gpu, w, x, out, rows)?;
         }
     }
     Ok(())
