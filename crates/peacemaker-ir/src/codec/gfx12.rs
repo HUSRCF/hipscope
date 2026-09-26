@@ -99,7 +99,11 @@ fn operand(name: &str, bits: u16, code: u32, literal: Option<u32>, row: &OpRow, 
     }
     let src=select(code, width, false, literal)?;
     if bits == 16 {
-        if let Operand::Reg(r) = src { return Ok(Operand::Half(r, if field_value("OPSEL",row,words) & 1 != 0 { Half::Hi } else { Half::Lo })); }
+        if let Operand::Reg(r) = &src {
+            if r.kind == Kind::V {
+                return Ok(Operand::Half(*r, if field_value("OPSEL",row,words) & 1 != 0 { Half::Hi } else { Half::Lo }));
+            }
+        }
     }
     Ok(src)
 }
@@ -594,6 +598,12 @@ mod tests {
         assert_eq!(inst.operands[0],Operand::Half(RegRef { kind:Kind::V,base:12,len:1 },Half::Hi));
         assert_eq!(inst.operands[1],Operand::Half(RegRef { kind:Kind::V,base:13,len:1 },Half::Hi));
         assert_eq!(&encode(&inst).unwrap()[..],true16);
+
+        let scalar=[0x7f0a3800]; // v_mov_b16_e32 v5.h, s0
+        let (inst,_) = decode(&scalar).unwrap();
+        assert_eq!(inst.operands[0],Operand::Half(RegRef { kind:Kind::V,base:5,len:1 },Half::Hi));
+        assert_eq!(inst.operands[1],Operand::Reg(RegRef { kind:Kind::S,base:0,len:1 }));
+        assert_eq!(&encode(&inst).unwrap()[..],scalar);
 
         let convert=[0x7e061702]; // v_cvt_f32_f16_e32 v3, v2.l
         let (inst,_) = decode(&convert).unwrap();
