@@ -1930,16 +1930,16 @@ extern "C" __global__ __launch_bounds__(256) void indexed_attention_attention_f3
         if (ok) {
             const float* key = keys + token * kv_stride;
             if (head_dim == 256) {
-                // Sixteen key float4 loads in flight per batch; the FMAs still
+                // Thirty-two key float4 loads in flight per batch; the FMAs still
                 // run in serial d order.
                 const float4* key4 = reinterpret_cast<const float4*>(key);
                 const float4* q4 = reinterpret_cast<const float4*>(q);
-                for (int c = 0; c < 64; c += 16) {
-                    float4 k4[16];
+                for (int c = 0; c < 64; c += 32) {
+                    float4 k4[32];
 #pragma unroll
-                    for (int u = 0; u < 16; ++u) k4[u] = key4[c + u];
+                    for (int u = 0; u < 32; ++u) k4[u] = key4[c + u];
 #pragma unroll
-                    for (int u = 0; u < 16; ++u) {
+                    for (int u = 0; u < 32; ++u) {
                         const float4 qv = q4[c + u];
                         score += qv.x * k4[u].x;
                         score += qv.y * k4[u].y;
