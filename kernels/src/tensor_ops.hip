@@ -666,10 +666,17 @@ static __device__ __forceinline__ float hc_bf16_square_partial(
     float partial = 0.0f;
     for (int base = tid; base < n; base += 10 * 256) {
         float raw[10];
+        // A full batch loads unconditionally: guarded loads compile to one
+        // branch + wait per element, serializing ten memory latencies.
+        if (base + 9 * 256 < n) {
 #pragma unroll
-        for (int u = 0; u < 10; ++u) {
-            const int j = base + u * 256;
-            raw[u] = j < n ? hc_stream_value(values[j]) : 0.0f;
+            for (int u = 0; u < 10; ++u) raw[u] = hc_stream_value(values[base + u * 256]);
+        } else {
+#pragma unroll
+            for (int u = 0; u < 10; ++u) {
+                const int j = base + u * 256;
+                raw[u] = j < n ? hc_stream_value(values[j]) : 0.0f;
+            }
         }
 #pragma unroll
         for (int u = 0; u < 10; ++u) {
@@ -777,18 +784,38 @@ static __device__ __forceinline__ void hyper_norm_rows(
         __syncthreads();
     }
     const float inv = rsqrtf(rms_sum[0] / (float)hidden + 1.0e-6f);
-#pragma unroll 10
-    for (int j = tid; j < hidden; j += 256) {
-        const int column = offset + j;
-        const float value = bf16_to_f32(bf16_round(
-            bf16_to_f32(bf16_round(hc_stream_value(input[column])))
-            * inv * (1.0f + bf16_to_f32(norm_weight[weight_offset + j]))));
-        if (normalized16) {
-            normalized16[column] = (_Float16)value;
-            if (normalized)
-                ((unsigned short*)normalized)[column] = (unsigned short)(__float_as_uint(value) >> 16);
+    for (int base = tid; base < hidden; base += 10 * 256) {
+        float raw[10], weight[10];
+        // Batched loads as in hc_bf16_square_partial.
+        if (base + 9 * 256 < hidden) {
+#pragma unroll
+            for (int u = 0; u < 10; ++u) {
+                raw[u] = hc_stream_value(input[offset + base + u * 256]);
+                weight[u] = bf16_to_f32(norm_weight[weight_offset + base + u * 256]);
+            }
         } else {
-            normalized[column] = value;
+#pragma unroll
+            for (int u = 0; u < 10; ++u) {
+                const int j = base + u * 256;
+                raw[u] = j < hidden ? hc_stream_value(input[offset + j]) : 0.0f;
+                weight[u] = j < hidden ? bf16_to_f32(norm_weight[weight_offset + j]) : 0.0f;
+            }
+        }
+#pragma unroll
+        for (int u = 0; u < 10; ++u) {
+            const int j = base + u * 256;
+            if (j >= hidden) break;
+            const int column = offset + j;
+            const float value = bf16_to_f32(bf16_round(
+                bf16_to_f32(bf16_round(raw[u])) * inv * (1.0f + weight[u])));
+            if (normalized16) {
+                normalized16[column] = (_Float16)value;
+                if (normalized)
+                    ((unsigned short*)normalized)[column] =
+                        (unsigned short)(__float_as_uint(value) >> 16);
+            } else {
+                normalized[column] = value;
+            }
         }
     }
 }
