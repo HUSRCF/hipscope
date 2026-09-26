@@ -68,6 +68,37 @@ pub(crate) mod support {
             .collect();
         (words, VA)
     }
+    /// All six KT48 kernel symbols as `(name, base VA, byte size)`, in VA
+    /// order. Same constants as the C3 codec six-stream test and the ELF
+    /// `STT_FUNC` sizes (fixture pinned by provenance.json); `.text` starts
+    /// at VA 0x3400, file offset 0x2400.
+    pub(crate) const KT48_SYMBOLS: [(&str, u32, usize); 6] = [
+        ("attention_fp8_e4m3_fa2_gqa_gfx1201", 0x3400, 7996),
+        ("attention_fp8_e4m3_fa2_q_preconvert_f16_gfx1201", 0x5400, 388),
+        ("attention_fp8_e4m3_fa2_q_preconvert_fp8_gfx1201", 0x5600, 1484),
+        ("attention_fp8_e4m3_fa2_gqa_partial_gfx1201", 0x5c00, 8148),
+        ("attention_fp8_e4m3_fa2_gqa_merge_gfx1201", 0x7c00, 728),
+        ("attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_gfx1201", 0x7f00, 10_604),
+    ];
+
+    /// Every KT48 kernel stream as little-endian words: `(name, base VA,
+    /// words)` in VA order.
+    pub(crate) fn kt48_all_streams() -> Vec<(&'static str, u32, Vec<u32>)> {
+        const IMAGE: &[u8] =
+            include_bytes!("../../tests/fixtures/kt48/hipcc.co");
+        KT48_SYMBOLS
+            .iter()
+            .map(|(name, va, size)| {
+                const BASE: usize = 0x2400;
+                let start = BASE + (*va - 0x3400) as usize;
+                let words = IMAGE[start..start + size]
+                    .chunks_exact(4)
+                    .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                    .collect();
+                (*name, *va, words)
+            })
+            .collect()
+    }
 
     /// One parsed objdump disassembly line.
     pub(crate) struct ObjdumpLine {
@@ -135,6 +166,15 @@ pub(crate) mod support {
     pub(crate) fn pinned_objdump_fixture() -> Vec<ObjdumpLine> {
         const FIXTURE: &str =
             include_str!("../../tests/fixtures/kt48/hipcc.objdump.txt");
+        parse_objdump_stdout(FIXTURE)
+    }
+
+    /// Committed pinned objdump of all six KT48 symbols (fallback when no
+    /// toolchain is present). Tests filter lines to each symbol's
+    /// `[va, va + size)` range; padding outside the ranges is ignored.
+    pub(crate) fn pinned_all_objdump_fixture() -> Vec<ObjdumpLine> {
+        const FIXTURE: &str =
+            include_str!("../../tests/fixtures/kt48/hipcc.all.objdump.txt");
         parse_objdump_stdout(FIXTURE)
     }
 

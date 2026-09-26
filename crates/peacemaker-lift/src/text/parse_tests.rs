@@ -39,75 +39,126 @@ fn kt48_texts() -> Vec<(u32, Vec<u32>, String)> {
         .collect()
 }
 
-/// The parser agrees with the codec on all 1,696 instructions: same op,
-/// form, operands, modifiers and literal — and the parsed instruction
-/// re-encodes to the original words, proving the canonical don't-care
-/// defaults. Any semantic disagreement is a test failure.
+/// All six KT48 kernels as `(symbol, base VA, byte size, decoded)`.
+fn decode_all() -> Vec<(&'static str, u32, usize, Vec<(u32, Vec<u32>, Inst)>)> {
+    support::kt48_all_streams()
+        .into_iter()
+        .map(|(name, va, stream)| {
+            let mut out = Vec::new();
+            let mut index = 0usize;
+            while index < stream.len() {
+                let (inst, n) = gfx12::decode(&stream[index..])
+                    .unwrap_or_else(|e| panic!("{name} word {index}: {e}"));
+                out.push((
+                    va + (index as u32) * 4,
+                    stream[index..index + n].to_vec(),
+                    inst,
+                ));
+                index += n;
+            }
+            let size = stream.len() * 4;
+            assert_eq!(index * 4, size, "{name} size");
+            (name, va, size, out)
+        })
+        .collect()
+}
+
+/// The all-symbols pinned fixture; tests filter to each kernel range.
+fn texts_all() -> Vec<support::ObjdumpLine> {
+    support::pinned_all_objdump_fixture()
+}
+
+/// The parser agrees with the codec on all 4,780 instructions across the
+/// six KT48 kernels: same op, form, operands, modifiers and literal — and
+/// the parsed instruction re-encodes to the original words, proving the
+/// canonical don't-care defaults. Any semantic disagreement is a test
+/// failure.
 #[test]
 fn parser_matches_codec_on_kt48() {
-    let decoded = decode_kt48();
-    let texts = kt48_texts();
-    assert_eq!(decoded.len(), 1696);
-    assert_eq!(texts.len(), 1696);
+    const INSTS: [(&str, usize); 6] = [
+        ("attention_fp8_e4m3_fa2_gqa_gfx1201", 1297),
+        ("attention_fp8_e4m3_fa2_q_preconvert_f16_gfx1201", 70),
+        ("attention_fp8_e4m3_fa2_q_preconvert_fp8_gfx1201", 253),
+        ("attention_fp8_e4m3_fa2_gqa_partial_gfx1201", 1334),
+        ("attention_fp8_e4m3_fa2_gqa_merge_gfx1201", 130),
+        ("attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_gfx1201", 1696),
+    ];
+    let kernels = decode_all();
+    let texts = texts_all();
+    assert_eq!(kernels.len(), INSTS.len(), "six-kernel census");
+    let mut total = 0usize;
     let mut failures = Vec::new();
-    for ((addr, words, inst), (taddr, _, text)) in
-        decoded.iter().zip(texts.iter())
+    for ((name, va, size, decoded), (want_name, want_insts)) in
+        kernels.iter().zip(INSTS.iter())
     {
-        assert_eq!(addr, taddr);
-        // Sanity: the test parses the canonical printing, which T3 proves
-        // equals the pinned text.
-        let printed =
-            canonical(inst, Arch::Gfx1201).expect("canonical prints");
-        if &printed != text {
-            failures.push(format!("{addr:#x}: T3 drift for {text}"));
-            continue;
-        }
-        let parsed = match parse_line(text, Arch::Gfx1201) {
-            Ok(inst) => inst,
-            Err(e) => {
-                failures.push(format!("{addr:#x}: parse {text:?}: {e}"));
+        assert_eq!(name, want_name, "kernel order");
+        assert_eq!(decoded.len(), *want_insts, "{name} census");
+        let range = *va..*va + *size as u32;
+        let ktexts: Vec<&support::ObjdumpLine> = texts
+            .iter()
+            .filter(|l| range.contains(&l.addr))
+            .collect();
+        assert_eq!(ktexts.len(), decoded.len(), "{name} fixture lines");
+        for ((addr, words, inst), line) in decoded.iter().zip(ktexts.iter()) {
+            let (taddr, text) = (line.addr, &line.text);
+            assert_eq!(addr, &taddr, "{name} boundary");
+            // Sanity: the test parses the canonical printing, which T3 proves
+            // equals the pinned text.
+            let printed =
+                canonical(inst, Arch::Gfx1201).expect("canonical prints");
+            if &printed != text {
+                failures.push(format!("{name} {addr:#x}: T3 drift for {text}"));
                 continue;
             }
-        };
-        // Modifiers compare with textually invisible bits cleared (the
-        // same lossiness the T9 harness defines: e.g. WMMA op_sel_hi).
-        if parsed.op != inst.op
-            || parsed.form != inst.form
-            || parsed.operands != inst.operands
-            || support::masked_mods(&parsed) != support::masked_mods(inst)
-            || parsed.literal != inst.literal
-        {
-            failures.push(format!(
-                "{addr:#x}: semantic drift on {text}\n  codec: {:?} {:?} {:?} {:?}\n  parse: {:?} {:?} {:?} {:?}",
-                inst.op,
-                inst.form,
-                inst.operands,
-                inst.mods,
-                parsed.op,
-                parsed.form,
-                parsed.operands,
-                parsed.mods
-            ));
-            continue;
+            let parsed = match parse_line(text, Arch::Gfx1201) {
+                Ok(inst) => inst,
+                Err(e) => {
+                    failures.push(format!("{name} {addr:#x}: parse {text:?}: {e}"));
+                    continue;
+                }
+            };
+            // Modifiers compare with textually invisible bits cleared (the
+            // same lossiness the T9 harness defines: e.g. WMMA op_sel_hi).
+            if parsed.op != inst.op
+                || parsed.form != inst.form
+                || parsed.operands != inst.operands
+                || support::masked_mods(&parsed) != support::masked_mods(inst)
+                || parsed.literal != inst.literal
+            {
+                failures.push(format!(
+                    "{name} {addr:#x}: semantic drift on {text}\n  codec: {:?} {:?} {:?} {:?}\n  parse: {:?} {:?} {:?} {:?}",
+                    inst.op,
+                    inst.form,
+                    inst.operands,
+                    inst.mods,
+                    parsed.op,
+                    parsed.form,
+                    parsed.operands,
+                    parsed.mods
+                ));
+                continue;
+            }
+            // Re-encoding matches modulo the same unspellable bits.
+            let mask = support::lossy_mask(inst);
+            match gfx12::encode(&parsed) {
+                Ok(enc)
+                    if enc.len() == words.len()
+                        && enc.iter().zip(words.iter()).enumerate().all(
+                            |(i, (a, b))| {
+                                (a ^ b) & !mask.get(i).copied().unwrap_or(0) == 0
+                            },
+                        ) => {}
+                Ok(enc) => failures.push(format!(
+                    "{name} {addr:#x}: re-encode drift on {text}: {enc:08X?} != {words:08X?}"
+                )),
+                Err(e) => failures.push(format!(
+                    "{name} {addr:#x}: re-encode {text:?}: {e}"
+                )),
+            }
         }
-        // Re-encoding matches modulo the same unspellable bits.
-        let mask = support::lossy_mask(inst);
-        match gfx12::encode(&parsed) {
-            Ok(enc)
-                if enc.len() == words.len()
-                    && enc.iter().zip(words.iter()).enumerate().all(
-                        |(i, (a, b))| {
-                            (a ^ b) & !mask.get(i).copied().unwrap_or(0) == 0
-                        },
-                    ) => {}
-            Ok(enc) => failures.push(format!(
-                "{addr:#x}: re-encode drift on {text}: {enc:08X?} != {words:08X?}"
-            )),
-            Err(e) => failures.push(format!(
-                "{addr:#x}: re-encode {text:?}: {e}"
-            )),
-        }
+        total += decoded.len();
     }
+    assert_eq!(total, 4780, "all six kernels census");
     assert!(
         failures.is_empty(),
         "{} parser mismatches:\n{}",
