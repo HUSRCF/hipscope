@@ -10,8 +10,8 @@ object = { version = "0.38", features = ["write"] }
 smallvec = "1"
 rmpv = "1"
 thiserror.workspace = true
+sha2 = "0.10"
 
 [dev-dependencies]
 proptest.workspace = true
 insta = "1"
-sha2 = "0.10"
