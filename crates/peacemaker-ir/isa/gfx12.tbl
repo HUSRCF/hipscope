@@ -1,4 +1,6 @@
 # gfx1201, RDNA4 XML SHA-256 f8a290c8471e26a1071b08b61a33e4d9efa46ec6cedcdb8e5ba57d7969b60692; AMD LLVM 23.0.0git.
+# Census: KT48 first-op spellings, builder GFX1201 goldens, every symbol in
+# gemm_mq4g256v2_wmma_fp8_gfx12_b1.hxaco and gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1.hxaco.
 # name	form	opcode(hex)	XML operand grammar	defs	uses	implicit	counter:weight	objdump/llvm-mc example	LE dwords(hex)	field rules
 buffer_load_b64	buffer	0x15	VDATA:64,VADDR:64,RSRC:128,SOFFSET:32	VDATA	VADDR,RSRC,SOFFSET	-	Load:1	buffer_load_b64 v[0:1], v2, s[4:7], s8 offen	C4054008 40800800 00000002	w0_extra:ignored:0x3803f00:0x0,w1_extra:ignored:0x100:0x0,vbuffer_format:honored:0x3f800000:0x800000,vbuffer_offen:honored:0x40000000:0x0/0x40000000,vbuffer_idxen:honored:0x80000000:0x0,vbuffer_tfe:honored:0x400000:0x0,vbuffer_scope:honored:0xc0000:0x0,vbuffer_th:honored:0x700000:0x0,vbuffer_nv:honored:0x80:0x0
 ds_min_i32	ds	0x5	ADDR:32,DATA0:32	-	ADDR,DATA0	-	Ds:1	ds_min_i32 v1, v2 offset:49924	D814C304 00000201	w0_extra:ignored:0x30000:0x0
