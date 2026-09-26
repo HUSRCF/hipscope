@@ -1813,7 +1813,7 @@ extern "C" __global__ void indexed_attention_select_f32_batched(
     int capacity) {
     int row = (int)blockIdx.x;
     if (row >= rows) return;
-    extern __shared__ float scores[];
+    extern __shared__ __align__(16) float scores[];
     int visible = position_start + row + 1;
     int row_block_count = visible / compress;
     if (row_block_count > block_count) row_block_count = block_count;
@@ -1845,10 +1845,10 @@ extern "C" __global__ void indexed_attention_select_f32_batched(
          block += (int)blockDim.x) {
         float score = scores[block];
         int rank = 0;
-        // Four LDS scores per read (the dynamic LDS base is 16-byte aligned),
+        // Four LDS scores per read (`scores` is 16-byte aligned),
         // several reads in flight; the count is order-independent.
         int other = 0;
-#pragma unroll 4
+#pragma unroll 8
         for (; other + 4 <= row_block_count; other += 4) {
             const float4 v = *reinterpret_cast<const float4*>(scores + other);
             rank += (v.x > score || (v.x == score && other < block));
