@@ -778,7 +778,26 @@ static __device__ __forceinline__ void hyper_norm_rows(
     const int offset = (row * branches + branch) * hidden;
     const int weight_offset = branch * hidden;
     __shared__ float rms_sum[256];
-    rms_sum[tid] = hc_bf16_square_partial(input + offset, tid, hidden);
+    // One 2560-wide batch (the Qwen4 decode shape): the second pass reuses
+    // the first pass's loads, and the weights load alongside them.
+    const bool single = hidden == 10 * 256;
+    float raw[10], weight[10];
+    if (single) {
+        float partial = 0.0f;
+#pragma unroll
+        for (int u = 0; u < 10; ++u) {
+            raw[u] = hc_stream_value(input[offset + tid + u * 256]);
+            weight[u] = bf16_to_f32(norm_weight[weight_offset + tid + u * 256]);
+        }
+#pragma unroll
+        for (int u = 0; u < 10; ++u) {
+            const float value = bf16_to_f32(bf16_round(raw[u]));
+            partial += value * value;
+        }
+        rms_sum[tid] = partial;
+    } else {
+        rms_sum[tid] = hc_bf16_square_partial(input + offset, tid, hidden);
+    }
     __syncthreads();
     for (int stride = (int)blockDim.x / 2; stride > 0; stride >>= 1) {
         if (tid < stride) {
@@ -788,20 +807,21 @@ static __device__ __forceinline__ void hyper_norm_rows(
     }
     const float inv = rsqrtf(rms_sum[0] / (float)hidden + 1.0e-6f);
     for (int base = tid; base < hidden; base += 10 * 256) {
-        float raw[10], weight[10];
         // Batched loads as in hc_bf16_square_partial.
-        if (base + 9 * 256 < hidden) {
+        if (!single) {
+            if (base + 9 * 256 < hidden) {
 #pragma unroll
-            for (int u = 0; u < 10; ++u) {
-                raw[u] = hc_stream_value(input[offset + base + u * 256]);
-                weight[u] = bf16_to_f32(norm_weight[weight_offset + base + u * 256]);
-            }
-        } else {
+                for (int u = 0; u < 10; ++u) {
+                    raw[u] = hc_stream_value(input[offset + base + u * 256]);
+                    weight[u] = bf16_to_f32(norm_weight[weight_offset + base + u * 256]);
+                }
+            } else {
 #pragma unroll
-            for (int u = 0; u < 10; ++u) {
-                const int j = base + u * 256;
-                raw[u] = j < hidden ? hc_stream_value(input[offset + j]) : 0.0f;
-                weight[u] = j < hidden ? bf16_to_f32(norm_weight[weight_offset + j]) : 0.0f;
+                for (int u = 0; u < 10; ++u) {
+                    const int j = base + u * 256;
+                    raw[u] = j < hidden ? hc_stream_value(input[offset + j]) : 0.0f;
+                    weight[u] = j < hidden ? bf16_to_f32(norm_weight[weight_offset + j]) : 0.0f;
+                }
             }
         }
 #pragma unroll
