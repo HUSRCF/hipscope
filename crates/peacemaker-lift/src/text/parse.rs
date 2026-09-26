@@ -285,6 +285,15 @@ fn parse_single(row: &'static OpRow, rest: &str) -> Result<Inst, ParseError> {
         parsed.operands.push(parse_extra(row, text)?);
     }
     parse_suffixes(row, &suffixes, &mut parsed.mods)?;
+    imply_op_sel(row, &suffixes, &mut parsed.mods, &parsed.operands)?;
+    // The assembler defaults an omitted WMMA op_sel_hi to all-ones
+    // (verified: omitted text re-encodes to 7); explicit spellings win.
+    if row.name.starts_with("v_wmma_")
+        && !suffixes.iter().any(|s| s.starts_with("op_sel_hi:["))
+        && parsed.mods.op_sel_hi == 0
+    {
+        parsed.mods.op_sel_hi = 7;
+    }
     parse_wait_clause(row, &mut parsed)?;
     finish(row, parsed)
 }
@@ -917,29 +926,40 @@ fn parse_extra(row: &OpRow, text: &str) -> Result<Operand, ParseError> {
         return Ok(Operand::Scope(scope));
     }
     if let Some((kind, value)) = text.split_once(':') {
-        let value: u32 = if let Some(hex) = value.strip_prefix("0x") {
-            u32::from_str_radix(hex, 16).map_err(|_| {
-                bad_operand(row.name, text, "bad offset")
-            })?
+        // VMEM offsets are signed 24-bit (`offset:-48` occurs in hipcc's
+        // own `.s`); DS offsets are unsigned.
+        let signed: Option<i32> = if let Some(hex) = value.strip_prefix("0x")
+        {
+            u32::from_str_radix(hex, 16).ok().map(|v| v as i32)
+        } else if let Some(hex) = value.strip_prefix("-0x") {
+            u32::from_str_radix(hex, 16).ok().map(|v| -(v as i32))
         } else {
-            value.parse().map_err(|_| {
-                bad_operand(row.name, text, "bad offset")
-            })?
+            value.parse().ok()
         };
+        let unsigned: Option<u32> = signed.and_then(|v| u32::try_from(v).ok());
+        let bad = || bad_operand(row.name, text, "bad offset");
         match kind {
             "offset0" => {
-                return Ok(Operand::Imm(ImmField::DsOffset0(value as u8)));
+                return Ok(Operand::Imm(ImmField::DsOffset0(
+                    unsigned.ok_or_else(bad)? as u8,
+                )));
             }
             "offset1" => {
-                return Ok(Operand::Imm(ImmField::DsOffset1(value as u8)));
+                return Ok(Operand::Imm(ImmField::DsOffset1(
+                    unsigned.ok_or_else(bad)? as u8,
+                )));
             }
             "offset" => {
                 if matches!(row.form, Form::Vmem(_)) {
+                    // Signed 24-bit, as the codec decodes it; the
+                    // encoder masks to the field.
                     return Ok(Operand::Imm(ImmField::VmemOffset(
-                        (value & 0x00ff_ffff) as i32,
+                        signed.ok_or_else(bad)?,
                     )));
                 }
-                return Ok(Operand::Imm(ImmField::DsOffset(value as u16)));
+                return Ok(Operand::Imm(ImmField::DsOffset(
+                    unsigned.ok_or_else(bad)? as u16,
+                )));
             }
             _ => {}
         }
@@ -1430,3 +1450,49 @@ pub fn label_block_ids(file: &SourceFile) -> Vec<(String, BlockId)> {
 #[cfg(test)]
 #[path = "parse_tests.rs"]
 mod tests;
+
+/// True16 `op_sel` is redundant with the `.h`/`.l` halves: hipcc's own
+/// `.s` omits the suffix while objdump prints it, and both assemble to
+/// the same bytes (core.md §0). When the suffix is absent, derive it
+/// from the halves (sources to bits 0.., destination half to bit 3);
+/// when present, it must agree with them.
+fn imply_op_sel(
+    row: &OpRow,
+    suffixes: &[String],
+    mods: &mut Modifiers,
+    operands: &[Operand],
+) -> Result<(), ParseError> {
+    if !matches!(row.form, Form::Vop3 | Form::Vop3p) {
+        return Ok(());
+    }
+    let slots = grammar_slots(row);
+    if !slots.iter().any(|(_, bits)| *bits == 16) {
+        return Ok(());
+    }
+    if operands.len() != slots.len() {
+        return Ok(());
+    }
+    let mut implied = 0u8;
+    for ((slot, _), operand) in slots.iter().zip(operands.iter()) {
+        let half_hi = matches!(operand, Operand::Half(_, Half::Hi));
+        match *slot {
+            "SRC0" => implied |= u8::from(half_hi),
+            "SRC1" => implied |= u8::from(half_hi) << 1,
+            "SRC2" => implied |= u8::from(half_hi) << 2,
+            "VDST" => implied |= u8::from(half_hi) << 3,
+            _ => {}
+        }
+    }
+    if suffixes.iter().any(|s| s.starts_with("op_sel:[")) {
+        if mods.op_sel != implied {
+            return Err(ParseError::BadModifier {
+                name: row.name.into(),
+                modifier: format!("op_sel vs halves {implied:#x}"),
+                reason: "op_sel suffix contradicts the .h/.l halves".into(),
+            });
+        }
+        return Ok(());
+    }
+    mods.op_sel = implied;
+    Ok(())
+}

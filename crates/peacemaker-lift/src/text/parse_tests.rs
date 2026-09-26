@@ -257,3 +257,49 @@ fn cmpx_parses_two_visible_operands() {
     assert_eq!(back.operands, inst.operands);
     assert_eq!(back.mods, inst.mods);
 }
+
+/// C7 lift_text census: hipcc's own `.s` omits redundant `op_sel`, uses
+/// negative VMEM offsets, and relies on assembler defaults. parse_line
+/// types exactly what llvm-mc encodes: op_sel implied by `.h`/`.l`,
+/// assembler defaults for unspelled bits.
+#[test]
+fn hipcc_spellings_match_codec() {
+    // op_sel implied by halves (redundant suffix omitted by hipcc).
+    for (text, op_sel) in [
+        ("v_mov_b16_e64 v139.l, v5.h", 1),
+        ("v_cvt_f32_f16_e64 v12, v198.h", 1),
+        ("v_cvt_pk_fp8_f32 v141.h, v140, v139", 8),
+    ] {
+        let inst =
+            parse_line(text, Arch::Gfx1201).expect("hipcc spelling parses");
+        assert_eq!(inst.mods.op_sel, op_sel, "{text}");
+        // Re-prints with the redundant suffix objdump shows.
+        let canon = canonical(&inst, Arch::Gfx1201).expect("prints");
+        assert!(
+            canon.contains("op_sel:["),
+            "canonical restores suffix: {canon}"
+        );
+        gfx12::encode(&inst).expect("encodes");
+    }
+    // Negative VMEM offsets.
+    let inst = parse_line(
+        "global_load_b64 v[173:174], v[2:3], off offset:-48",
+        Arch::Gfx1201,
+    )
+    .expect("negative vmem offset parses");
+    assert!(matches!(
+        inst.operands.last(),
+        Some(peacemaker_ir::operand::Operand::Imm(
+            peacemaker_ir::operand::ImmField::VmemOffset(-48)
+        ))
+    ));
+    gfx12::encode(&inst).expect("encodes");
+    // Omitted WMMA op_sel_hi takes the assembler default.
+    let inst = parse_line(
+        "v_wmma_f32_16x16x16_fp8_fp8 v[129:136], v[7:8], v[141:142], v[129:136]",
+        Arch::Gfx1201,
+    )
+    .expect("wmma parses");
+    assert_eq!(inst.mods.op_sel_hi, 7);
+    gfx12::encode(&inst).expect("encodes");
+}
