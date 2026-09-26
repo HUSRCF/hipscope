@@ -21,7 +21,7 @@ use rdna_compute::tensor_ops::{
     gated_delta_params_batched, gated_delta_step_batched, gated_delta_step_gated,
     gated_delta_step_gate_wmma, hc_activation_fused_f32, hc_state_bf16_add_f32,
     hc_state_bf16_to_f32, hyper_norm, hyper_norm_f16, hyper_norm_gate, hyper_read_projected,
-    hyper_read_up_fused, hyper_read_up_wmma, hyper_write, indexed_attention_attention_batch,
+    hyper_read_up_fused, hyper_read_up_wmma, hyper_write, hyper_write_norm, indexed_attention_attention_batch,
     indexed_attention_cache_append_batch, indexed_attention_norm_rope_batch,
     indexed_attention_pool_rope, indexed_attention_select_batch, scale_f32, ArgmaxF32,
     Bf16Roundtrip, GatedDeltaConv, GatedDeltaConvBatched, GatedDeltaGate, GatedDeltaGateBatched,
@@ -431,6 +431,16 @@ impl HyperReadOp<'_> {
 }
 
 pub fn execute_hyper_read(gpu: &mut Gpu, op: &HyperReadOp<'_>) -> Result<(), DispatchError> {
+    execute_hyper_read_inner(gpu, op, false)
+}
+
+/// `normalized_ready`: a preceding fused launch already wrote this read's
+/// single-row `normalized` (see [`execute_hyper_write_then_read`]).
+fn execute_hyper_read_inner(
+    gpu: &mut Gpu,
+    op: &HyperReadOp<'_>,
+    normalized_ready: bool,
+) -> Result<(), DispatchError> {
     let wide = checked_mul(op.branches, op.hidden, "hyper read wide")?;
     let input = view(op.input, 0, op.rows * wide);
     let normalized = view(op.normalized, 0, op.rows * wide);
@@ -484,7 +494,9 @@ pub fn execute_hyper_read(gpu: &mut Gpu, op: &HyperReadOp<'_>) -> Result<(), Dis
     {
         // Decode: the long-K down GEMV splits each row across four waves and
         // applies the activation below in its epilogue.
-        hip(hyper_norm(gpu, &norm))?;
+        if !normalized_ready {
+            hip(hyper_norm(gpu, &norm))?;
+        }
         hip(gpu.gemv_bf16_xf32_k4(
             op.input_mix_down.buf,
             &normalized,
@@ -495,7 +507,9 @@ pub fn execute_hyper_read(gpu: &mut Gpu, op: &HyperReadOp<'_>) -> Result<(), Dis
         ))?;
         activated = true;
     } else {
-        hip(hyper_norm(gpu, &norm))?;
+        if !normalized_ready {
+            hip(hyper_norm(gpu, &norm))?;
+        }
         project_weight(
             gpu,
             &op.input_mix_down,
@@ -675,6 +689,41 @@ impl HyperWriteOp<'_> {
 }
 
 pub fn execute_hyper_write(gpu: &mut Gpu, op: &HyperWriteOp<'_>) -> Result<(), DispatchError> {
+    execute_hyper_write_inner(gpu, op, None)
+}
+
+/// A single-row F32 hyper write immediately followed by the hyper read of the
+/// streams it writes: the write's final launch also runs the read's norm
+/// (`hyper_write_norm`, bitwise the separate launches). Returns `false`,
+/// having launched nothing, when the pair does not have that shape.
+pub fn execute_hyper_write_then_read(
+    gpu: &mut Gpu,
+    write: &HyperWriteOp<'_>,
+    read: &HyperReadOp<'_>,
+) -> Result<bool, DispatchError> {
+    let fusable = write.rows == 1
+        && read.rows == 1
+        && !write.state_bf16
+        && !read.state_bf16
+        && write.hidden == 2560
+        && read.hidden == write.hidden
+        && read.branches == write.branches
+        && read.input.buf.as_ptr() == write.output.buf.as_ptr();
+    if !fusable {
+        return Ok(false);
+    }
+    let wide = checked_mul(read.branches, read.hidden, "hyper read wide")?;
+    let normalized = view(read.normalized, 0, wide);
+    execute_hyper_write_inner(gpu, write, Some((read.norm_weight, &normalized)))?;
+    execute_hyper_read_inner(gpu, read, true)?;
+    Ok(true)
+}
+
+fn execute_hyper_write_inner(
+    gpu: &mut Gpu,
+    op: &HyperWriteOp<'_>,
+    next_norm: Option<(&GpuTensor, &GpuTensor)>,
+) -> Result<(), DispatchError> {
     let wide = checked_mul(op.branches, op.hidden, "hyper write wide")?;
     let input = view(op.input, 0, op.rows * wide);
     let normalized = view(op.normalized, 0, op.rows * wide);
@@ -742,19 +791,22 @@ pub fn execute_hyper_write(gpu: &mut Gpu, op: &HyperWriteOp<'_>) -> Result<(), D
             )?;
         }
     }
-    hip(hyper_write(
-        gpu,
-        &HyperWrite {
-            input: &input,
-            normalized: &normalized,
-            mixed: &mixed,
-            gates: &gates,
-            output: &output,
-            branches: op.branches,
-            hidden: op.hidden,
-            state_bf16: op.state_bf16,
-        },
-    ))
+    let write = HyperWrite {
+        input: &input,
+        normalized: &normalized,
+        mixed: &mixed,
+        gates: &gates,
+        output: &output,
+        branches: op.branches,
+        hidden: op.hidden,
+        state_bf16: op.state_bf16,
+    };
+    match next_norm {
+        Some((norm_weight, next_normalized)) => {
+            hip(hyper_write_norm(gpu, &write, norm_weight, next_normalized))
+        }
+        None => hip(hyper_write(gpu, &write)),
+    }
 }
 
 /// Gated DeltaNet recurrence with explicit convolution and projection order.

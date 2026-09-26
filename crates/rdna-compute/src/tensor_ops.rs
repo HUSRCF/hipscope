@@ -807,6 +807,49 @@ pub fn hyper_write(gpu: &mut Gpu, p: &HyperWrite<'_>) -> HipResult<()> {
     )
 }
 
+/// [`hyper_write`] of one F32 decode row (`hidden == 2560`) followed by
+/// [`hyper_norm`] of the written streams with `norm_weight` into
+/// `normalized`, one launch; bitwise the two launches.
+pub fn hyper_write_norm(
+    gpu: &mut Gpu,
+    p: &HyperWrite<'_>,
+    norm_weight: &GpuTensor,
+    normalized: &GpuTensor,
+) -> HipResult<()> {
+    for tensor in [p.input, p.mixed, p.gates, p.output, normalized] {
+        ensure_f32(tensor)?;
+    }
+    let wide = checked_product(p.branches, p.hidden, "HC write width")?;
+    if p.state_bf16
+        || p.hidden != 2560
+        || norm_weight.dtype != DType::BF16
+        || p.input.numel() != wide
+        || p.output.numel() != wide
+        || normalized.numel() != wide
+        || norm_weight.numel() != wide
+        || p.mixed.numel() != p.hidden
+        || p.gates.numel() != p.branches
+    {
+        return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
+    }
+    gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, "hyper_write_norm_f32")?;
+    let mut args = KernargBlob::new();
+    for tensor in [p.input, p.mixed, p.gates, p.output, norm_weight, normalized] {
+        args.push_ptr(tensor.buf.as_ptr());
+    }
+    args.push_i32(checked_i32(p.branches, "HC write branch count")?);
+    args.push_i32(checked_i32(p.hidden, "HC write hidden width")?);
+    args.pad_to(16);
+    gpu.launch_blob_recorded(
+        "hyper_write_norm_f32",
+        [checked_u32(p.branches, "HC write branch grid")?, 1, 1],
+        [256, 1, 1],
+        0,
+        args.as_mut_slice(),
+        crate::dispatch::ReplayLaunchBindings::NONE,
+    )
+}
+
 pub struct HyperNorm<'a> {
     pub input: &'a GpuTensor,
     pub norm_weight: &'a GpuTensor,

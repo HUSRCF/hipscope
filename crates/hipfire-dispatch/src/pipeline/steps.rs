@@ -734,6 +734,14 @@ pub fn execute_validated_steps<'a>(
             launch_fused(gpu, ctx, key, &steps[i..i + len])?;
             i += len;
         } else {
+            if let (Step::HyperWrite(write), Some(Step::HyperRead(read))) =
+                (&steps[i], steps.get(i + 1))
+            {
+                if crate::pipeline::layer_ops::execute_hyper_write_then_read(gpu, write, read)? {
+                    i += 2;
+                    continue;
+                }
+            }
             launch_op(gpu, ctx, &steps[i])?;
             i += 1;
         }
