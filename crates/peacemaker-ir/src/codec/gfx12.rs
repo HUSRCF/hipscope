@@ -458,6 +458,37 @@ mod tests {
         assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
+    #[test]
+    fn declared_dont_care_combinations_roundtrip() {
+        for row in isa::gfx12() {
+            let example: Vec<u32> = row.encoding.split_whitespace()
+                .map(|w| u32::from_str_radix(w,16).unwrap()).collect();
+            let mut cases = vec![example];
+            for rule in row.fields.iter().filter(|rule| rule.class == FieldClass::Ignored) {
+                let (index,shift,mask) = match rule.name {
+                    "src1_unused" => (1,9,rule.mask << 9),
+                    "src2_unused" => (1,18,rule.mask << 18),
+                    "omod" => (1,27,rule.mask << 27),
+                    "w0_extra" | "wait_unused" => (0,0,rule.mask),
+                    "w1_extra" | "vsrc_unused" => (1,0,rule.mask),
+                    other => panic!("unexpected ignored field {other} on {}",row.name),
+                };
+                cases = cases.into_iter().flat_map(|words| {
+                    rule.allowed.iter().map(move |value| {
+                        let mut variant = words.clone();
+                        variant[index] = (variant[index] & !mask) | (*value << shift);
+                        variant
+                    })
+                }).collect();
+            }
+            for words in cases {
+                let (inst,len) = decode(&words).unwrap_or_else(|e| panic!("{} {words:08x?}: {e}",row.name));
+                assert_eq!(len,words.len(),"{}",row.name);
+                assert_eq!(&encode(&inst).unwrap()[..],words,"{}",row.name);
+            }
+        }
+    }
+
     fn kt48_typed_insts() -> Vec<Inst> {
         const IMAGE: &[u8] = include_bytes!("../../../peacemaker-lift/tests/fixtures/kt48/hipcc.co");
         const START: usize = 0x6f00; // .text file offset 0x2400 + (kernel VA 0x7f00 - .text VA 0x3400)
@@ -561,6 +592,13 @@ mod tests {
                 }
                 inst=Inst::from_parts(Arch::Gfx1201,inst.op,inst.form,inst.fields.clone(),
                     inst.operands.clone(),inst.mods.clone(),inst.literal,Provenance::default()).unwrap();
+            }
+            if let Some(literal)=&mut inst.literal {
+                let replacement=*literal ^ (u32::from(seed)*0x0101_0101);
+                *literal=replacement;
+                for op in &mut inst.operands {
+                    if let Operand::Literal(value)=op { *value=replacement; }
+                }
             }
             if let FormFields::Vop3b { src2_unused }=&mut inst.fields {
                 *src2_unused=if seed&1==0 {0} else {128};
