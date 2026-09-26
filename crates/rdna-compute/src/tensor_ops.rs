@@ -116,6 +116,32 @@ pub struct GatedDeltaStep<'a> {
 }
 
 pub fn gated_delta_step(gpu: &mut Gpu, p: &GatedDeltaStep<'_>) -> HipResult<()> {
+    gated_delta_step_launch(gpu, p, None)
+}
+
+/// [`gated_delta_step`] followed by [`gated_delta_gate`] of its output
+/// (`g.recurrent_output` must be `p.output`). On the gfx11+ 128x128 route one
+/// launch keeps the recurrent output in LDS (bitwise the two launches; the
+/// recurrent output is then not stored); elsewhere the two launches run.
+pub fn gated_delta_step_gated(
+    gpu: &mut Gpu,
+    p: &GatedDeltaStep<'_>,
+    g: &GatedDeltaGate<'_>,
+) -> HipResult<()> {
+    let fused = gpu.arch_caps.has_gfx11_plus_simt() && p.key_dim == 128 && p.value_dim == 128;
+    if !fused || g.recurrent_output.buf.as_ptr() != p.output.buf.as_ptr() {
+        gated_delta_step(gpu, p)?;
+        return gated_delta_gate(gpu, g);
+    }
+    validate_gated_delta_gate(g)?;
+    gated_delta_step_launch(gpu, p, Some(g))
+}
+
+fn gated_delta_step_launch(
+    gpu: &mut Gpu,
+    p: &GatedDeltaStep<'_>,
+    gated: Option<&GatedDeltaGate<'_>>,
+) -> HipResult<()> {
     for tensor in [p.q, p.k, p.v, p.gate, p.beta, p.state, p.output] {
         ensure_f32(tensor)?;
     }
@@ -148,10 +174,10 @@ pub fn gated_delta_step(gpu: &mut Gpu, p: &GatedDeltaStep<'_>) -> HipResult<()> 
     let value_dim_grid = blocks(p.value_dim)?;
     let shared_norm128 =
         gpu.arch_caps.has_gfx11_plus_simt() && p.key_dim == 128 && p.value_dim == 128;
-    let kernel = if shared_norm128 {
-        "gated_delta_step_shared_norm128_gfx1151"
-    } else {
-        "gated_delta_step_f32"
+    let kernel = match (gated, shared_norm128) {
+        (Some(_), true) => "gated_delta_step_gate_norm128_gfx1151",
+        (None, true) => "gated_delta_step_shared_norm128_gfx1151",
+        _ => "gated_delta_step_f32",
     };
     let block_x = if shared_norm128 { 128 } else { 256 };
     gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel)?;
@@ -162,7 +188,14 @@ pub fn gated_delta_step(gpu: &mut Gpu, p: &GatedDeltaStep<'_>) -> HipResult<()> 
     args.push_ptr(p.gate.buf.as_ptr());
     args.push_ptr(p.beta.buf.as_ptr());
     args.push_ptr(p.state.buf.as_ptr());
-    args.push_ptr(p.output.buf.as_ptr());
+    match gated {
+        Some(g) => {
+            args.push_ptr(g.z.buf.as_ptr());
+            args.push_ptr(g.norm.buf.as_ptr());
+            args.push_ptr(g.output.buf.as_ptr());
+        }
+        None => args.push_ptr(p.output.buf.as_ptr()),
+    }
     args.push_i32(key_heads);
     args.push_i32(value_heads);
     args.push_i32(key_dim);
@@ -1402,22 +1435,7 @@ pub struct GatedDeltaGate<'a> {
 }
 
 pub fn gated_delta_gate(gpu: &mut Gpu, p: &GatedDeltaGate<'_>) -> HipResult<()> {
-    for tensor in [p.recurrent_output, p.z, p.output] {
-        ensure_f32(tensor)?;
-    }
-    if p.norm.dtype != DType::BF16 || p.value_heads == 0 || p.value_dim == 0 {
-        return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
-    }
-    let elements = checked_product(p.value_heads, p.value_dim, "GDN gate extent")?;
-    if p.recurrent_output.numel() != elements
-        || p.z.numel() != elements
-        || p.norm.numel() != p.value_dim
-        || p.output.numel() != elements
-    {
-        return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
-    }
-    let value_heads = checked_i32(p.value_heads, "GDN gate head count")?;
-    let value_dim = checked_i32(p.value_dim, "GDN gate width")?;
+    let (value_heads, value_dim) = validate_gated_delta_gate(p)?;
     let value_heads_grid = checked_u32(p.value_heads, "GDN gate head grid")?;
     let value_dim_grid = blocks(p.value_dim)?;
     gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, "gated_delta_gate_bf16_f32")?;
@@ -1436,6 +1454,27 @@ pub fn gated_delta_gate(gpu: &mut Gpu, p: &GatedDeltaGate<'_>) -> HipResult<()> 
         args.as_mut_slice(),
         crate::dispatch::ReplayLaunchBindings::NONE,
     )
+}
+
+fn validate_gated_delta_gate(p: &GatedDeltaGate<'_>) -> HipResult<(i32, i32)> {
+    for tensor in [p.recurrent_output, p.z, p.output] {
+        ensure_f32(tensor)?;
+    }
+    if p.norm.dtype != DType::BF16 || p.value_heads == 0 || p.value_dim == 0 {
+        return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
+    }
+    let elements = checked_product(p.value_heads, p.value_dim, "GDN gate extent")?;
+    if p.recurrent_output.numel() != elements
+        || p.z.numel() != elements
+        || p.norm.numel() != p.value_dim
+        || p.output.numel() != elements
+    {
+        return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
+    }
+    Ok((
+        checked_i32(p.value_heads, "GDN gate head count")?,
+        checked_i32(p.value_dim, "GDN gate width")?,
+    ))
 }
 /// Row-batched gated RMSNorm with the exact BF16 recurrent boundary folded
 /// into the kernel.

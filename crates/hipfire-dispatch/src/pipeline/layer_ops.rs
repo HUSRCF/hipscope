@@ -17,8 +17,8 @@ use crate::families::gemv::WeightRef;
 use crate::types::DispatchError;
 use rdna_compute::tensor_ops::{
     argmax_f32, bf16_roundtrip_f32, gated_delta_chunk_route, gated_delta_conv_params,
-    gated_delta_conv_batched, gated_delta_gate, gated_delta_gate_batched,
-    gated_delta_params_batched, gated_delta_step, gated_delta_step_batched,
+    gated_delta_conv_batched, gated_delta_gate_batched,
+    gated_delta_params_batched, gated_delta_step_batched, gated_delta_step_gated,
     gated_delta_step_gate_wmma, hc_activation_fused_f32, hc_state_bf16_add_f32,
     hc_state_bf16_to_f32, hyper_norm, hyper_norm_f16, hyper_norm_gate, hyper_read_projected,
     hyper_read_up_fused, hyper_read_up_wmma, hyper_write, indexed_attention_attention_batch,
@@ -1076,7 +1076,11 @@ pub fn execute_gated_delta_net(
             let k = view(&projection2_row, qk, qk);
             let v = view(&projection2_row, 2 * qk, value);
             let recurrent_output = view(op.recurrent_output, row * value, value);
-            hip(gated_delta_step(
+            // `gated_delta_gate` reads the recurrent output through its BF16
+            // boundary itself; no round-trip pass precedes it.
+            let z_row = view(&z, row * value, value);
+            let gdn_output = view(op.output_scratch, row * value, value);
+            hip(gated_delta_step_gated(
                 gpu,
                 &GatedDeltaStep {
                     q: &q,
@@ -1091,13 +1095,6 @@ pub fn execute_gated_delta_net(
                     key_dim: op.key_dim,
                     value_dim: op.value_dim,
                 },
-            ))?;
-            // `gated_delta_gate` reads the recurrent output through its BF16
-            // boundary itself; no round-trip pass precedes it.
-            let z_row = view(&z, row * value, value);
-            let gdn_output = view(op.output_scratch, row * value, value);
-            hip(gated_delta_gate(
-                gpu,
                 &GatedDeltaGate {
                     recurrent_output: &recurrent_output,
                     z: &z_row,

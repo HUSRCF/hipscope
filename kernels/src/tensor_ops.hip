@@ -109,19 +109,23 @@ extern "C" __global__ void gated_delta_step_f32(
 // channel in the block, but the recurrence remains one independent row per
 // value channel and keeps the original decay -> kv_mem -> delta -> update ->
 // output order.
-extern "C" __global__ void gated_delta_step_shared_norm128_gfx1151(
+// One decode step of the 128x128 recurrence for block `value_head`; returns
+// false for threads outside the exact shape, else writes the thread's
+// channel output to `*out`. Shared by the step kernel and the fused
+// step + gated-norm kernel below.
+static __device__ __forceinline__ bool gated_delta_step_norm128_body(
     const float* q,
     const float* k,
     const float* v,
     const float* gate,
     const float* beta,
     float* state,
-    float* output,
     int key_heads,
     int value_heads,
     int key_dim,
     int value_dim,
-    float query_scale) {
+    float query_scale,
+    float* out_value) {
     const int value_head = (int)blockIdx.x;
     const int value_index = (int)(blockIdx.y * blockDim.x + threadIdx.x);
     const bool exact_shape = key_dim == 128 && value_dim == 128;
@@ -175,7 +179,7 @@ extern "C" __global__ void gated_delta_step_shared_norm128_gfx1151(
             bf16_to_f32(k_norm[threadIdx.x]) * bf16_to_f32(k_inv));
     }
     __syncthreads();
-    if (!active) return;
+    if (!active) return false;
 
     const int repeat = value_heads / key_heads;
     const int key_head = value_head / repeat;
@@ -203,7 +207,27 @@ extern "C" __global__ void gated_delta_step_shared_norm128_gfx1151(
         qv *= query_scale;
         out += state[state_base + kd * 128 + value_index] * qv;
     }
-    output[value_head * 128 + value_index] = out;
+    *out_value = out;
+    return true;
+}
+
+extern "C" __global__ void gated_delta_step_shared_norm128_gfx1151(
+    const float* q,
+    const float* k,
+    const float* v,
+    const float* gate,
+    const float* beta,
+    float* state,
+    float* output,
+    int key_heads,
+    int value_heads,
+    int key_dim,
+    int value_dim,
+    float query_scale) {
+    float out;
+    if (gated_delta_step_norm128_body(q, k, v, gate, beta, state, key_heads, value_heads,
+                                      key_dim, value_dim, query_scale, &out))
+        output[blockIdx.x * 128 + (blockIdx.y * blockDim.x + threadIdx.x)] = out;
 }
 // Wave-size-independent persistent row-batched path for exact 128x128 geometry.
 // A block owns one value head and 256 threads.  tid%128 is the output channel
@@ -1275,6 +1299,31 @@ extern "C" __global__ void gated_delta_params_f32(
     beta[head] = 1.0f / (1.0f + expf(-b[head]));
 }
 
+// Gated RMSNorm of one channel: `head_values` is the head's recurrent
+// output (value_dim values), `z_head` / `out_head` the head's slices.
+static __device__ __forceinline__ void gated_delta_gate_channel(
+    const float* head_values,
+    const float* z_head,
+    const __hip_bfloat16* norm,
+    float* out_head,
+    int channel,
+    int value_dim) {
+    float sum = 0.0f;
+    for (int i = 0; i < value_dim; ++i) {
+        float value = bf16_to_f32(bf16_round(head_values[i]));
+        sum += value * value;
+    }
+    float inv = rsqrtf(sum / (float)value_dim + 1.0e-6f);
+    // The recurrent output is read through its source BF16 boundary here too,
+    // so callers need no separate round trip (a pre-rounded input is unchanged).
+    float normalized = bf16_to_f32(bf16_round(
+        bf16_to_f32(bf16_round(head_values[channel])) * inv
+        * bf16_to_f32(norm[channel])));
+    float gate = bf16_to_f32(bf16_round(z_head[channel]));
+    out_head[channel] = bf16_to_f32(bf16_round(
+        normalized / (1.0f + expf(-gate))));
+}
+
 extern "C" __global__ void gated_delta_gate_bf16_f32(
     const float* recurrent,
     const float* z,
@@ -1285,23 +1334,39 @@ extern "C" __global__ void gated_delta_gate_bf16_f32(
     int head = (int)blockIdx.x;
     int channel = (int)(blockIdx.y * blockDim.x + threadIdx.x);
     if (head >= value_heads || channel >= value_dim) return;
-    int width = value_heads * value_dim;
     int start = head * value_dim;
-    float sum = 0.0f;
-    for (int i = 0; i < value_dim; ++i) {
-        float value = bf16_to_f32(bf16_round(recurrent[start + i]));
-        sum += value * value;
-    }
-    float inv = rsqrtf(sum / (float)value_dim + 1.0e-6f);
-    // The recurrent output is read through its source BF16 boundary here too,
-    // so callers need no separate round trip (a pre-rounded input is unchanged).
-    float normalized = bf16_to_f32(bf16_round(
-        bf16_to_f32(bf16_round(recurrent[start + channel])) * inv
-        * bf16_to_f32(norm[channel])));
-    float gate = bf16_to_f32(bf16_round(z[start + channel]));
-    output[start + channel] = bf16_to_f32(bf16_round(
-        normalized / (1.0f + expf(-gate))));
-    (void)width;
+    gated_delta_gate_channel(recurrent + start, z + start, norm, output + start, channel,
+                             value_dim);
+}
+
+// The decode step and its gated RMSNorm in one launch: the head's recurrent
+// output stays in LDS for the norm (same values the separate launches pass
+// through memory, so bitwise equal). The recurrent output is not stored.
+extern "C" __global__ void gated_delta_step_gate_norm128_gfx1151(
+    const float* q,
+    const float* k,
+    const float* v,
+    const float* gate,
+    const float* beta,
+    float* state,
+    const float* z,
+    const __hip_bfloat16* norm,
+    float* output,
+    int key_heads,
+    int value_heads,
+    int key_dim,
+    int value_dim,
+    float query_scale) {
+    __shared__ float head_values[128];
+    float out;
+    if (!gated_delta_step_norm128_body(q, k, v, gate, beta, state, key_heads, value_heads,
+                                       key_dim, value_dim, query_scale, &out))
+        return;
+    const int channel = (int)threadIdx.x;
+    head_values[channel] = out;
+    __syncthreads();
+    const int start = (int)blockIdx.x * 128;
+    gated_delta_gate_channel(head_values, z + start, norm, output + start, channel, 128);
 }
 // Row-batched gated RMSNorm. The recurrent output is rounded in place before
 // the norm reduction, matching the scalar BF16 boundary.  One wave owns one
