@@ -76,6 +76,13 @@ fn operand(name: &str, bits: u16, code: u32, literal: Option<u32>, row: &OpRow, 
     if name == "SBASE" { return Ok(reg(Kind::S, code * 2, bits)); }
     if name == "RSRC" { return Ok(reg(Kind::S, code, bits)); }
     if name == "SADDR" && code == 124 { return Ok(Operand::Vmem(VmemToken::Off)); }
+    // True16 e32 encodes the half in bit 7 of the VGPR selector. The source
+    // selector additionally has bit 8 set to select the VGPR bank.
+    if bits == 16 && matches!(form, Form::Vop1 | Form::Vop2 | Form::Vopc)
+        && (name == "VDST" || name == "VSRC1" || name == "SRC0" && code >= 256) {
+        let r = RegRef { kind: Kind::V, base: (code & 0x7f) as u16, len: 1 };
+        return Ok(Operand::Half(r, if code & 0x80 != 0 { Half::Hi } else { Half::Lo }));
+    }
     let scalar_dest = name == "SDST" || name == "SDATA"
         || name == "VDST" && (row.name.starts_with("v_cmp") || row.name.starts_with("v_s_")
             || row.name == "v_readlane_b32" || row.name == "v_readfirstlane_b32");
@@ -104,6 +111,14 @@ fn encoded_operand(name: &str, bits: u16, op: &Operand, form: Form) -> Result<u3
         ("SBASE", Operand::Reg(r)) if r.kind == Kind::S && r.base % 2 == 0 => Ok(u32::from(r.base / 2)),
         ("SADDR", Operand::Vmem(VmemToken::Off)) => Ok(124),
         ("RSRC", Operand::Reg(r)) if r.kind == Kind::S => Ok(u32::from(r.base)),
+        ("VDST" | "VSRC1" | "SRC0", Operand::Half(r,half))
+            if bits == 16 && matches!(form, Form::Vop1 | Form::Vop2 | Form::Vopc) => {
+            if r.kind != Kind::V || r.base >= 128 || r.len != 1 {
+                return Err(reject("true16 e32 half requires a VGPR below v128"));
+            }
+            Ok(u32::from(r.base) + u32::from(name=="SRC0")*256
+                + u32::from(*half==Half::Hi)*128)
+        }
         (_, Operand::Reg(r)) if name.starts_with('V') || name.starts_with("DATA") || name == "ADDR" => {
             if r.kind != Kind::V && !(name == "VDST" && (form == Form::Vop1 || form == Form::Vop3)) { return Err(reject("vector operand has wrong register bank")); }
             if r.len != (bits / 32).max(1) as u8 && !(name=="VADDR" && form==Form::Vmem(crate::inst::VmemForm::Buffer) && r.len==1) { return Err(reject(format!("{name} register width mismatch"))); }
@@ -247,6 +262,10 @@ pub fn decode(words: &[u32]) -> Result<(Inst, usize), DecodeError> {
     }
     for (name,bits) in grammars(row) {
         let v = field_value(name,row,words);
+        if row.form==Form::Vop3 && name=="VDST" && row.name.starts_with("v_cmpx_") {
+            if v!=126 { return Err(reject("VOP3 cmpx requires implicit EXEC destination")); }
+            continue;
+        }
         if forms::field(row.form,name).is_none() && name != "SDST" { return Err(reject(format!("no {} bitfield for {name}",row.name))); }
         if name == "SRC2" && v==255 && literal.is_none() { return Err(reject("literal selector without literal word")); }
         let parsed=operand(name,bits,v,literal,row,words)?;
@@ -339,6 +358,10 @@ pub fn encode(inst: &Inst) -> Result<SmallVec<[u32; 3]>, DecodeError> {
         return Err(reject("VOPC compare destination must be vcc_lo"));
     }
     for (name,bits) in grammars(row) {
+        if row.form==Form::Vop3 && name=="VDST" && row.name.starts_with("v_cmpx_") {
+            encode_field(name,row,&mut words,126)?;
+            continue;
+        }
         let op=operands.next().ok_or_else(|| reject(format!("missing {name} operand")))?;
         encode_field(name,row,&mut words,encoded_operand(name,bits,op,row.form)?)?;
         if name=="SOFFSET" && row.form==Form::Smem {
@@ -526,10 +549,73 @@ mod tests {
     }
 
     #[test]
+    fn kt48_all_six_kernel_streams_reencode_exactly() {
+        const IMAGE: &[u8] = include_bytes!("../../../peacemaker-lift/tests/fixtures/kt48/hipcc.co");
+        // .text starts at VA 0x3400, file offset 0x2400. Each range is an ELF STT_FUNC.
+        const SYMBOLS: [(usize,usize);6] = [
+            (0x3400,7996),(0x5400,388),(0x5600,1484),
+            (0x5c00,8148),(0x7c00,728),(0x7f00,10604),
+        ];
+        let mut counts = Vec::new();
+        for (va,size) in SYMBOLS {
+            let start=0x2400+(va-0x3400);
+            let words:Vec<u32>=IMAGE[start..start+size].chunks_exact(4)
+                .map(|chunk|u32::from_le_bytes(chunk.try_into().unwrap())).collect();
+            let mut offset=0;
+            let mut count=0;
+            while offset<words.len() {
+                let (inst,n)=decode(&words[offset..])
+                    .unwrap_or_else(|e|panic!("KT48 symbol {va:#x}, byte {:#x}: {e}",offset*4));
+                let output=encode(&inst).unwrap();
+                assert_eq!(&output[..],&words[offset..offset+n],
+                    "KT48 symbol {va:#x}, byte {:#x}",offset*4);
+                offset+=n;
+                count+=1;
+            }
+            assert_eq!(offset*4,size,"KT48 symbol {va:#x} length");
+            counts.push(count);
+        }
+        assert_eq!(counts.len(),6);
+        assert_eq!(counts[5],1696,"selected KT48 kernel census");
+        println!("KT48 six symbol instruction counts: {counts:?}");
+    }
+
+    #[test]
     fn kt48_inst_snapshot_is_typed() {
         let insts = kt48_typed_insts();
         let typed = insts.iter().map(|inst| format!("{inst:?}")).collect::<Vec<_>>().join("\n");
         insta::assert_snapshot!("kt48_typed_insts", typed);
+    }
+
+    #[test]
+    fn true16_e32_halves_and_implicit_cmpx_exec_are_typed() {
+        let true16=[0x7f18398d]; // v_mov_b16_e32 v12.h, v13.h
+        let (inst,_) = decode(&true16).unwrap();
+        assert_eq!(inst.operands[0],Operand::Half(RegRef { kind:Kind::V,base:12,len:1 },Half::Hi));
+        assert_eq!(inst.operands[1],Operand::Half(RegRef { kind:Kind::V,base:13,len:1 },Half::Hi));
+        assert_eq!(&encode(&inst).unwrap()[..],true16);
+
+        let convert=[0x7e061702]; // v_cvt_f32_f16_e32 v3, v2.l
+        let (inst,_) = decode(&convert).unwrap();
+        assert_eq!(inst.operands[1],Operand::Half(RegRef { kind:Kind::V,base:2,len:1 },Half::Lo));
+        assert_eq!(&encode(&inst).unwrap()[..],convert);
+
+        let cmpx=[0xd4c4007e,0x02020807]; // implicit EXEC destination
+        let (inst,_) = decode(&cmpx).unwrap();
+        assert_eq!(inst.operands.len(),2);
+        assert_eq!(inst.text(Arch::Gfx1201).unwrap(),"v_cmpx_gt_i32_e64 s7, v4");
+        assert_eq!(&encode(&inst).unwrap()[..],cmpx);
+        assert!(decode(&[cmpx[0]^1,cmpx[1]]).unwrap_err().to_string().contains("implicit EXEC"));
+    }
+
+    #[test]
+    fn d16_load_preserves_partial_vgpr_write_dependency() {
+        let load=[0xee08407c,0x0000008b,0x00183002]; // global_load_d16_hi_u8 v139, v[2:3], off offset:6192
+        let (inst,_) = decode(&load).unwrap();
+        let dest=RegRef { kind:Kind::V,base:139,len:1 };
+        assert!(inst.effects.defs.contains(&dest));
+        assert!(inst.effects.uses.contains(&dest),"upper/lower half must be read before partial write");
+        assert_eq!(&encode(&inst).unwrap()[..],load);
     }
 
     #[test]
