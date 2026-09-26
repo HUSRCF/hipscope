@@ -1034,16 +1034,8 @@ pub fn execute_gated_delta_net(
                     value_dim: op.value_dim,
                 },
             ))?;
-            let bf16 = view(op.bf16_scratch, 0, value);
-            hip(bf16_roundtrip_f32(
-                gpu,
-                &Bf16Roundtrip {
-                    input: &recurrent_output,
-                    scratch: &bf16,
-                    output: &recurrent_output,
-                    elements: value,
-                },
-            ))?;
+            // `gated_delta_gate` reads the recurrent output through its BF16
+            // boundary itself; no round-trip pass precedes it.
             let z_row = view(&z, row * value, value);
             let gdn_output = view(op.output_scratch, row * value, value);
             hip(gated_delta_gate(

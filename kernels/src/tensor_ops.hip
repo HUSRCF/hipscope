@@ -1233,8 +1233,11 @@ extern "C" __global__ void gated_delta_gate_bf16_f32(
         sum += value * value;
     }
     float inv = rsqrtf(sum / (float)value_dim + 1.0e-6f);
+    // The recurrent output is read through its source BF16 boundary here too,
+    // so callers need no separate round trip (a pre-rounded input is unchanged).
     float normalized = bf16_to_f32(bf16_round(
-        recurrent[start + channel] * inv * bf16_to_f32(norm[channel])));
+        bf16_to_f32(bf16_round(recurrent[start + channel])) * inv
+        * bf16_to_f32(norm[channel])));
     float gate = bf16_to_f32(bf16_round(z[start + channel]));
     output[start + channel] = bf16_to_f32(bf16_round(
         normalized / (1.0f + expf(-gate))));
