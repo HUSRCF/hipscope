@@ -699,6 +699,15 @@ pub trait RoutedExpertWeights {
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// `Some(id)` promises that every value reporting `id` returns the same
+    /// weights from `get` for as long as it lives (a set built once and never
+    /// mutated, with `id` unique to that construction).  A live binding
+    /// captured from such a set then re-checks the id per call instead of
+    /// every expert.  `None` (the default) keeps the per-expert check.
+    fn immutable_identity(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// Everything the MoE decode executor arm reads, marshaled by the model from

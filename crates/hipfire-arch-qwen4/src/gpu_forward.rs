@@ -461,6 +461,7 @@ pub(crate) struct Qwen4ExpertView {
 
 struct ExpertViewSet<'a> {
     experts: &'a [Qwen4ExpertView],
+    identity: u64,
 }
 
 impl RoutedExpertWeights for ExpertViewSet<'_> {
@@ -473,7 +474,14 @@ impl RoutedExpertWeights for ExpertViewSet<'_> {
             .get(expert_idx)
             .map(|expert| (expert.gate_up.dispatch_ref(), expert.down.dispatch_ref()))
     }
+
+    fn immutable_identity(&self) -> Option<u64> {
+        Some(self.identity)
+    }
 }
+
+/// Source of [`Qwen4MoeLayerRuntime::identity`].
+static NEXT_EXPERT_SET_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// Architecture-owned sealed-MoE resources.  Pointer tables and expert views
 /// are built once with the assembled resident weights and reused for every
@@ -486,7 +494,10 @@ pub(crate) struct Qwen4MoeLayerRuntime {
     shared_gate: ProjectionView,
     shared_up: ProjectionView,
     shared_down: ProjectionView,
+    /// `experts` is built once in `from_moe` and never mutated, so this
+    /// construction-unique id is its [`RoutedExpertWeights::immutable_identity`].
     experts: Vec<Qwen4ExpertView>,
+    identity: u64,
     experts_all_gate_up_mq4: bool,
     expert_gate_up_ptrs: GpuTensor,
     expert_down_ptrs: GpuTensor,
@@ -506,6 +517,10 @@ impl RoutedExpertWeights for Qwen4MoeLayerRuntime {
         self.experts
             .get(expert_idx)
             .map(|expert| (expert.gate_up.dispatch_ref(), expert.down.dispatch_ref()))
+    }
+
+    fn immutable_identity(&self) -> Option<u64> {
+        Some(self.identity)
     }
 }
 
@@ -692,7 +707,11 @@ impl Qwen4MoeLayerRuntime {
             let _ = gpu.free_tensor(expert_down_ptrs);
             return Err(error.into());
         }
-        let expert_views = ExpertViewSet { experts: &experts };
+        let identity = NEXT_EXPERT_SET_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let expert_views = ExpertViewSet {
+            experts: &experts,
+            identity,
+        };
         if let Err(error) = cache.bind_live(
             &table,
             &expert_views,
@@ -717,6 +736,7 @@ impl Qwen4MoeLayerRuntime {
             shared_down,
             experts_all_gate_up_mq4: gate_up_dtype == DType::MQ4G256V2,
             experts,
+            identity,
             expert_gate_up_ptrs,
             expert_down_ptrs,
             expert_gate_up_entries: gate_entries,

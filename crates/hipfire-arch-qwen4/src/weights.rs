@@ -24,7 +24,7 @@ use hipfire_runtime::weight_manifest::{
 };
 use hipfire_runtime::weight_store::{TakenWeight, WeightHandle, WeightLoadTransaction};
 use rdna_compute::{DType, Gpu, GpuTensor};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 
 /// The routed experts' declared targets: gate/up at the aligned-K group width
@@ -1313,6 +1313,9 @@ pub struct Qwen4RootWeights {
 pub struct Qwen4Weights {
     pub manifest: Qwen4Manifest,
     pub taken: Vec<TakenWeight>,
+    /// `taken` slots by tensor name: `resident` runs ~1000 times per forward,
+    /// and a linear scan over every taken weight cost ~3 ms per decode token.
+    taken_by_name: HashMap<String, Vec<usize>>,
     pub root: Qwen4RootWeights,
     pub layer_refs: Vec<Qwen4LayerWeights>,
     pub mtp: Qwen4MtpWeights,
@@ -1353,12 +1356,20 @@ impl Qwen4Weights {
             }
         }
         let taken = assembly.commit().finalize();
+        let mut taken_by_name: HashMap<String, Vec<usize>> = HashMap::new();
+        for (slot, weight) in taken.iter().enumerate() {
+            taken_by_name
+                .entry(weight.key.name.clone())
+                .or_default()
+                .push(slot);
+        }
         let root = build_root_refs(config)?;
         let layer_refs = build_layer_refs(config)?;
         let mtp = build_mtp_refs(config)?;
         Ok(Self {
             manifest,
             taken,
+            taken_by_name,
             root,
             layer_refs,
             mtp,
@@ -1386,9 +1397,14 @@ impl Qwen4Weights {
                 "{name}: resident alias cycle"
             )));
         }
-        let Some(taken) = self.taken.iter().find(|taken| {
-            taken.key.name == name && taken.key.layer == layer && taken.key.device == device
-        }) else {
+        let Some(taken) = self
+            .taken_by_name
+            .get(name)
+            .into_iter()
+            .flatten()
+            .map(|&slot| &self.taken[slot])
+            .find(|taken| taken.key.layer == layer && taken.key.device == device)
+        else {
             return Err(WeightError::MissingResident {
                 name: name.to_string(),
                 layer,

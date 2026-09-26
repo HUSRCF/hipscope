@@ -918,16 +918,32 @@ pub struct ExpertTable {
     identity: u64,
     experts: Vec<ExpertMetadata>,
     contract: Option<ExpertExecutionContract>,
+    /// Every record has the same projection layout (dtype, basis and shape of
+    /// each gate/up/down source), so a per-call shape/dtype check of record 0
+    /// decides it for all of them.
+    uniform_layout: bool,
 }
 
 impl ExpertTable {
     pub fn new(experts: Vec<ExpertMetadata>) -> Result<Self, DispatchError> {
         validate_expert_records(&experts)?;
         let identity = NEXT_TABLE_ID.fetch_add(1, Ordering::Relaxed);
+        type Layout<'r> = Option<(DType, RotationPlan, &'r [usize])>;
+        fn key(s: Option<&ExpertResource>) -> Layout<'_> {
+            s.map(|s| (s.dtype(), s.basis(), s.shape()))
+        }
+        fn layout(record: &ExpertMetadata) -> [Layout<'_>; 4] {
+            let r = record.resources();
+            [key(r.gate_up()), key(r.gate()), key(r.up()), key(Some(r.down()))]
+        }
+        let uniform_layout = experts
+            .first()
+            .is_some_and(|first| experts.iter().all(|record| layout(record) == layout(first)));
         Ok(Self {
             identity,
             experts,
             contract: None,
+            uniform_layout,
         })
     }
 
@@ -1114,6 +1130,8 @@ struct LiveMoeBinding {
     down_awq_ptrs: Option<LiveTensorIdentity>,
     dtype_tags: Option<LiveTensorIdentity>,
     mapping_fingerprint: String,
+    /// [`RoutedExpertWeights::immutable_identity`] of the bound expert set.
+    source_identity: Option<u64>,
 }
 
 /// One live expert projection pair borrowed for a compact bind: either an
@@ -1434,6 +1452,18 @@ impl<'a> BoundMoeExperts<'a> {
 
     pub fn records(&self) -> &[ExpertMetadata] {
         &self.table.experts
+    }
+
+    /// Records that decide a layout-only check (dtype, basis, shape against
+    /// expectations shared by every expert): record 0 of a uniform table,
+    /// otherwise all of them.
+    fn layout_records(&self) -> &[ExpertMetadata] {
+        let records = &self.table.experts;
+        if self.table.uniform_layout {
+            &records[..records.len().min(1)]
+        } else {
+            records
+        }
     }
 
     /// The deterministic execution contract adapted from the sealed plan, if
@@ -3448,7 +3478,14 @@ fn validate_expert_shape_and_dtype(
         )));
     }
     let separate_gate_up_rows = gate_up_rows / 2;
-    for (index, expert) in experts.records().iter().enumerate() {
+    // Without per-expert dtype tables every record is checked against the same
+    // expectations, so a uniform table's record 0 decides every record.
+    let records = if per_gate_up.is_none() && per_down.is_none() {
+        experts.layout_records()
+    } else {
+        experts.records()
+    };
+    for (index, expert) in records.iter().enumerate() {
         let resources = expert.resources();
         let expected_gate_up = per_gate_up.map_or(representative_gate_up, |values| values[index]);
         let gate_up_dtype = if let Some(gate_up) = resources.gate_up() {
@@ -3621,6 +3658,7 @@ fn build_live_binding(
         down_awq_ptrs: down_awq_identity,
         dtype_tags: dtype_tag_identity,
         mapping_fingerprint: fingerprint_hex(&canonical),
+        source_identity: routed_experts.immutable_identity(),
     })
 }
 
@@ -3856,6 +3894,7 @@ fn build_compact_live_binding(
         down_awq_ptrs: down_awq_identity,
         dtype_tags: dtype_tag_identity,
         mapping_fingerprint: fingerprint_hex(&canonical),
+        source_identity: None,
     })
 }
 
@@ -4050,14 +4089,20 @@ fn validate_live_binding(
             live.experts.len()
         )));
     }
-    for (index, (expected_gate_up, expected_down)) in live.experts.iter().enumerate() {
-        let (gate_up, down) = routed_experts.get(index).ok_or_else(|| {
-            invalid(format!(
-                "live routed expert table is missing expert {index}"
-            ))
-        })?;
-        expected_gate_up.matches(&gate_up, "live gate/up")?;
-        expected_down.matches(&down, "live down")?;
+    // The set this binding was captured from promised immutability: its id
+    // stands for every expert identity checked at bind time.
+    let bound_source = live.source_identity.is_some()
+        && routed_experts.immutable_identity() == live.source_identity;
+    if !bound_source {
+        for (index, (expected_gate_up, expected_down)) in live.experts.iter().enumerate() {
+            let (gate_up, down) = routed_experts.get(index).ok_or_else(|| {
+                invalid(format!(
+                    "live routed expert table is missing expert {index}"
+                ))
+            })?;
+            expected_gate_up.matches(&gate_up, "live gate/up")?;
+            expected_down.matches(&down, "live down")?;
+        }
     }
     live.gate_up_ptrs
         .matches(gate_up_ptrs, "gate/up pointer table")?;
@@ -4137,7 +4182,7 @@ fn expected_basis(
     representative: DType,
 ) -> Result<RotationPlan, DispatchError> {
     let basis = dtype_rotation_plan(representative);
-    for (index, expert) in experts.records().iter().enumerate() {
+    for (index, expert) in experts.layout_records().iter().enumerate() {
         let resource = expert
             .resources()
             .gate_up()
