@@ -464,6 +464,7 @@ pub fn execute_hyper_read(gpu: &mut Gpu, op: &HyperReadOp<'_>) -> Result<(), Dis
         && gpu.qwen4_f16_wmma_applies(op.input_mix_down.buf, op.input_mix_down.k, op.rows);
     let wmma_read = f16 && op.low_rank % 16 == 0 && op.low_rank <= 504 && op.hidden % 16 == 0;
     let mut normalized_f16 = None;
+    let mut activated = false;
     if f16 {
         let x16 = hip(gpu.qwen4_f16_x_scratch(op.rows * wide))?;
         hip(hyper_norm_f16(gpu, &norm, &x16, !wmma_read))?;
@@ -476,6 +477,21 @@ pub fn execute_hyper_read(gpu: &mut Gpu, op: &HyperReadOp<'_>) -> Result<(), Dis
             op.rows,
         ))?;
         normalized_f16 = Some(x16);
+    } else if op.rows == 1
+        && gpu.arch_caps.has_gfx11_plus_simt()
+        && op.input_mix_down.dtype == DType::BF16
+    {
+        // Decode: the down GEMV applies the activation below in its epilogue.
+        hip(hyper_norm(gpu, &norm))?;
+        hip(gpu.gemv_bf16_xf32_hc_act(
+            op.input_mix_down.buf,
+            &normalized,
+            &low,
+            op.input_mix_down.m,
+            op.input_mix_down.k,
+            1.0 / op.branches as f32,
+        ))?;
+        activated = true;
     } else {
         hip(hyper_norm(gpu, &norm))?;
         project_weight(
@@ -494,15 +510,18 @@ pub fn execute_hyper_read(gpu: &mut Gpu, op: &HyperReadOp<'_>) -> Result<(), Dis
         packed.dtype = DType::BF16;
         packed
     });
+    // `activated` implies the gfx11+ route: the down GEMV already applied it.
     if gpu.arch_caps.has_gfx11_plus_simt() {
-        hip(hc_activation_fused_f32(
-            gpu,
-            &HcActivationFused {
-                values: &low,
-                scale: 1.0 / op.branches as f32,
-                bf16_out: low_bf16.as_ref(),
-            },
-        ))?;
+        if !activated {
+            hip(hc_activation_fused_f32(
+                gpu,
+                &HcActivationFused {
+                    values: &low,
+                    scale: 1.0 / op.branches as f32,
+                    bf16_out: low_bf16.as_ref(),
+                },
+            ))?;
+        }
     } else {
         for row in 0..op.rows {
             let low_row = view(&low, row * op.low_rank, op.low_rank);

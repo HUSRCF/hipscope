@@ -14184,6 +14184,56 @@ impl Gpu {
         )
     }
 
+    /// [`Gpu::gemv_bf16_xf32`] followed by the HC read activation
+    /// (`hc_activation_fused_f32` with `scale`, F32 output) in one launch;
+    /// bitwise the two-launch sequence.
+    pub fn gemv_bf16_xf32_hc_act(
+        &mut self,
+        weight: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        scale: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_bf16_xf32",
+            kernels::GEMV_BF16_XF32_SRC,
+            "gemv_bf16_xf32_hc_act",
+        )?;
+        let w_ptr = weight.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &w_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &scale as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "gemv_bf16_xf32_hc_act",
+            [m as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(w_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_f32(scale);
+                b
+            },
+        )
+    }
+
     /// [`Gpu::gemv_bf16_xf32`] for four `(weight, y, m)` BF16 matrices that
     /// read the same `x` (width `k`), in one launch. Every output row is the
     /// value the single-matrix launch computes.

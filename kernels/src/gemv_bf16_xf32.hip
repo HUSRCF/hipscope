@@ -3,6 +3,7 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 #include <hip/hip_runtime.h>
+#include <hip/hip_bfloat16.h>
 
 // BF16-weight × F32-input GEMV: y[m] = W_bf16[m, k] @ x_f32[k].
 //
@@ -27,12 +28,12 @@
 #define HF_BF16_LO(u) __uint_as_float((u) << 16)
 #define HF_BF16_HI(u) __uint_as_float((u) & 0xFFFF0000u)
 
-// One output row: y_row = dot(w_row, x). Every entry point below runs this
-// same body, so a row's value does not depend on which launch computed it.
-static __device__ __forceinline__ void gemv_bf16_xf32_row(
+// One output row: dot(w_row, x), valid in lane 0. Every entry point below
+// runs this same body, so a row's value does not depend on which launch
+// computed it.
+static __device__ __forceinline__ float gemv_bf16_xf32_row(
     const unsigned short* __restrict__ w_row,
     const float*          __restrict__ x,
-    float*                __restrict__ y_row,
     int K
 ) {
     const int tid = threadIdx.x;
@@ -96,7 +97,7 @@ static __device__ __forceinline__ void gemv_bf16_xf32_row(
     for (int offset = 16; offset > 0; offset >>= 1) {
         sum += __shfl_down(sum, offset);
     }
-    if (tid == 0) *y_row = sum;
+    return sum;
 }
 
 __launch_bounds__(32, 20)
@@ -108,7 +109,32 @@ extern "C" __global__ void gemv_bf16_xf32(
 ) {
     const int row = blockIdx.x;
     if (row >= M) return;
-    gemv_bf16_xf32_row(W + (size_t)row * K, x, y + row, K);
+    const float sum = gemv_bf16_xf32_row(W + (size_t)row * K, x, K);
+    if (threadIdx.x == 0) y[row] = sum;
+}
+
+// gemv_bf16_xf32 with hc_activation_fused_f32 applied to each output (the HC
+// read's low-rank down projection): source BF16 round trip, `scale`, round
+// trip, SiLU, round trip — the same expression per element, so the result is
+// bitwise the two-launch sequence.
+__launch_bounds__(32, 20)
+extern "C" __global__ void gemv_bf16_xf32_hc_act(
+    const unsigned short* __restrict__ W,  // [M, K] bf16 (raw u16)
+    const float*          __restrict__ x,  // [K] F32
+    float*                __restrict__ y,  // [M] F32
+    int M, int K,
+    float scale
+) {
+    const int row = blockIdx.x;
+    if (row >= M) return;
+    const float sum = gemv_bf16_xf32_row(W + (size_t)row * K, x, K);
+    if (threadIdx.x == 0) {
+        float value = static_cast<float>(static_cast<hip_bfloat16>(sum));
+        value *= scale;
+        value = static_cast<float>(static_cast<hip_bfloat16>(value));
+        value = value / (1.0f + expf(-value));
+        y[row] = static_cast<float>(static_cast<hip_bfloat16>(value));
+    }
 }
 
 // Four BF16 matrices reading the same x (same K) in one launch: blocks
@@ -140,5 +166,6 @@ extern "C" __global__ void gemv_bf16_xf32_x4(
             }
         }
     }
-    gemv_bf16_xf32_row(W + (size_t)row * K, x, y + row, K);
+    const float sum = gemv_bf16_xf32_row(W + (size_t)row * K, x, K);
+    if (threadIdx.x == 0) y[row] = sum;
 }
