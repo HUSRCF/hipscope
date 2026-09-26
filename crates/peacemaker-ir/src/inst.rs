@@ -2,7 +2,7 @@ use std::fmt::Write as _;
 use smallvec::SmallVec;
 use thiserror::Error;
 
-use crate::{cfg::{Body, Terminator}, descriptor::KernelDescriptor, effects::Effects, metadata::HsaKernelMetadata, operand::{Modifiers, Operand}, provenance::Provenance};
+use crate::{cfg::{Body, Terminator}, descriptor::KernelDescriptor, effects::Effects, envelope::Source, metadata::HsaKernelMetadata, operand::{Modifiers, Operand}, provenance::Provenance};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum Arch { Gfx1010, Gfx1030, Gfx1100, Gfx1151, Gfx1201 }
@@ -155,7 +155,7 @@ impl FormFields {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Program { pub target: Target, pub kernels: Vec<Kernel>, pub envelope: Envelope }
+pub struct Program { pub target: Target, pub kernels: Vec<Kernel>, pub source: Option<Source> }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Kernel { pub symbol: SymbolId, pub wave: Wave, pub abi: Abi, pub body: Body, pub origin: KernelOrigin }
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -172,8 +172,6 @@ pub enum KernelOrigin {
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Frontend { Hipcc, Triton, Aco, Builder, Ctor }
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct Envelope { pub image: Vec<u8>, pub bundled: bool }
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum ValidateError {
     #[error("unknown opcode {op:?} / encoding form {form:?}")]
@@ -197,9 +195,25 @@ pub enum ValidateError {
 }
 impl Program {
     pub fn validate(&self) -> Result<(), ValidateError> {
+        if let Some(source) = &self.source {
+            if source.elf.kernels.len() != self.kernels.len() {
+                return Err(ValidateError::Layout("source ELF kernel slots disagree with program kernels".into()));
+            }
+        }
         for (index, kernel) in self.kernels.iter().enumerate() {
             if self.kernels[..index].iter().any(|previous| previous.symbol == kernel.symbol) {
                 return Err(ValidateError::Layout("two kernels share a symbol".into()));
+            }
+            if let Some(source) = &self.source {
+                let slot = &source.elf.kernels[index];
+                if slot.name != kernel.symbol.0 {
+                    return Err(ValidateError::Layout("source ELF kernel slot symbol disagrees with program kernel".into()));
+                }
+                if let KernelOrigin::Frontend { entry_va, size, .. } = &kernel.origin {
+                    if slot.entry_va != *entry_va || slot.size != *size {
+                        return Err(ValidateError::Layout("source ELF kernel slot range disagrees with origin".into()));
+                    }
+                }
             }
             match &kernel.abi {
                 Abi::Hsa { descriptor, metadata } => {

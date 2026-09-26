@@ -4,6 +4,7 @@ pub mod codec;
 pub mod descriptor;
 pub mod edit;
 pub mod effects;
+pub mod envelope;
 pub mod inst;
 pub mod isa;
 pub mod lds;
@@ -73,7 +74,7 @@ mod tests {
     #[test]
     fn program_rejects_reachable_path_without_endpgm_and_wave_mismatch() {
         use cfg::{Block, BlockId, Terminator};
-        use inst::{Abi, Envelope, KernelOrigin, Setting, SymbolId, Wave};
+        use inst::{Abi, KernelOrigin, Setting, SymbolId, Wave};
         let row = isa::gfx12().iter().find(|row| row.name == "s_endpgm").unwrap();
         let end = Inst::from_parts(Arch::Gfx1201, row.op, row.form, FormFields::None,
             Default::default(), Default::default(), None, Default::default()).unwrap();
@@ -87,7 +88,7 @@ mod tests {
             kernels: vec![Kernel { symbol: SymbolId("test".into()), wave: Wave::Wave32,
                 abi: Abi::Raw { user_sgprs: vec![], wave: Wave::Wave32, lds_bytes: 0, sidecar_sha256: [0; 32] },
                 body, origin: KernelOrigin::Authored { builder_crate: "test".into(), version: "1".into(), git: "0".into() } }],
-            envelope: Envelope::default(),
+            source: None,
         };
         program.validate().unwrap();
         program.kernels[0].body.blocks[0].term = Terminator::FallThrough;
