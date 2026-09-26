@@ -92,7 +92,36 @@ extern "C" __global__ void gemv_mq4g256v2_moe_gate_up_k8_indexed_batched(
     const int quads = groups_per_row >> 2;
     const int tail = groups_per_row & 3;
 
-    for (int q = 0; q < quads; q++) {
+    // Qwen4 K = 2560 (ten groups): every header and payload load issues up
+    // front instead of one quad (then the tail) per memory round trip.
+    // Group g accumulates into acc[g & 3] in the loop's order.
+    if (groups_per_row == 10) {
+        unsigned int h[10], pk[10];
+#pragma unroll
+        for (int g = 0; g < 10; ++g) {
+            h[g] = *(const unsigned int*)(row_ptr + g * 136 + hoff);
+            pk[g] = *(const unsigned int*)(row_ptr + g * 136 + 8 + boff);
+        }
+        float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+        for (int g = 0; g < 10; ++g) {
+            const float sc = __half2float(__ushort_as_half((unsigned short)(h[g] & 0xFFFFu)));
+            const float zp = __half2float(__ushort_as_half((unsigned short)(h[g] >> 16)));
+            const int b = g * 256 + tid * 8;
+            acc[g & 3] += (sc * (float)(pk[g] & 0xFu)        + zp) * x_row[b]
+                        + (sc * (float)((pk[g] >> 4) & 0xFu)  + zp) * x_row[b + 1]
+                        + (sc * (float)((pk[g] >> 8) & 0xFu)  + zp) * x_row[b + 2]
+                        + (sc * (float)((pk[g] >> 12) & 0xFu) + zp) * x_row[b + 3]
+                        + (sc * (float)((pk[g] >> 16) & 0xFu) + zp) * x_row[b + 4]
+                        + (sc * (float)((pk[g] >> 20) & 0xFu) + zp) * x_row[b + 5]
+                        + (sc * (float)((pk[g] >> 24) & 0xFu) + zp) * x_row[b + 6]
+                        + (sc * (float)((pk[g] >> 28) & 0xFu) + zp) * x_row[b + 7];
+        }
+        acc0 = acc[0];
+        acc1 = acc[1];
+        acc2 = acc[2];
+        acc3 = acc[3];
+    } else for (int q = 0; q < quads; q++) {
         const int g = q << 2;
         const char* gp0 = row_ptr + g * 136;
         const char* gp1 = gp0 + 136;
@@ -146,7 +175,7 @@ extern "C" __global__ void gemv_mq4g256v2_moe_gate_up_k8_indexed_batched(
              + (sc * (float)(((pk) >> 24) & 0xFu) + zp) * x_row[(b) + 6] \
              + (sc * (float)(((pk) >> 28) & 0xFu) + zp) * x_row[(b) + 7]
 
-    if (tail >= 1) {
+    if (groups_per_row != 10 && tail >= 1) {
         const int g = quads << 2;
         const char* gp = row_ptr + g * 136;
         unsigned int h = *(const unsigned int*)(gp + hoff);
@@ -156,7 +185,7 @@ extern "C" __global__ void gemv_mq4g256v2_moe_gate_up_k8_indexed_batched(
         int base = g * 256 + tid * 8;
         TAIL_DOG(pk, sc, zp, base, acc0);
     }
-    if (tail >= 2) {
+    if (groups_per_row != 10 && tail >= 2) {
         const int g = (quads << 2) + 1;
         const char* gp = row_ptr + g * 136;
         unsigned int h = *(const unsigned int*)(gp + hoff);
