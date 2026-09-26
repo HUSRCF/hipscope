@@ -3030,8 +3030,8 @@ fn decode_gate_side_stage(
       // BF16-source recipes round F32 projection scratch at their storage
       // boundary before the router and shared nonlinearities consume it. The
       // grouped route's consumers round what they read themselves (the top-10
-      // router its logits, `sigmoid_bf16_in_f32` the selector,
-      // `silu_mul_bf16_rt_f32` the shared gate/up), so no pass is owed here.
+      // router its logits, `shared_expert_activation_bf16_f32` the selector
+      // and the shared gate/up), so no pass is owed here.
     if p.recipe.bf16_round_trip() && route != Some(MoeRouteCapability::Qt44Qt53Grouped) {
         // The decode step program is single-row (`build_moe_decode` binds
         // `batch_size: 1`), but every scratch buffer is sized for the prefill
@@ -3193,8 +3193,12 @@ fn decode_shared_down_stage(
             let scalar_live = slice_moe_f32_view(scalar_buf, 0, 1);
             let shared_hid = slice_moe_f32_view(p.ffn_hidden, 0, smi);
             if p.recipe.bf16_round_trip() {
-                hip!(gpu.sigmoid_bf16_in_f32(&scalar_live))?;
-                hip!(gpu.silu_mul_bf16_rt_f32(shared_gate, shared_up, &shared_hid))?;
+                hip!(gpu.shared_expert_activation_bf16_f32(
+                    shared_gate,
+                    shared_up,
+                    &shared_hid,
+                    &scalar_live,
+                ))?;
             } else {
                 hip!(gpu.sigmoid_f32(&scalar_live))?;
                 hip!(gpu.silu_mul_f32(shared_gate, shared_up, &shared_hid))?;

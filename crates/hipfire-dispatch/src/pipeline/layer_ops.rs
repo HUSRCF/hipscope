@@ -1101,9 +1101,8 @@ pub fn execute_gated_delta_net(
         op.rows,
         Some(op.rotation),
     )?;
-    // One elementwise launch over all rows; identical to the per-row scratch
-    // round trip for every non-NaN value.
-    hip(gpu.bf16_round_trip_f32(&output_batch))?;
+    // The output stays the F32 projection: its reader, the HC write, rounds
+    // it to BF16 as it reads it, so no round-trip pass is owed here.
     Ok(())
 }
 

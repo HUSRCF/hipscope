@@ -640,6 +640,44 @@ impl Gpu {
         result
     }
 
+    /// [`Gpu::silu_mul_bf16_rt_f32`] of the shared expert's gate/up plus the
+    /// selector gate `selector[0] = sigmoid(bf16_round_trip(selector[0]))`, in
+    /// one launch (bitwise the round trip / sigmoid / silu_mul launches).
+    pub fn shared_expert_activation_bf16_f32(
+        &mut self,
+        gate: &GpuTensor,
+        up: &GpuTensor,
+        out: &GpuTensor,
+        selector: &GpuTensor,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        const KERNEL: &str = "shared_expert_activation_bf16_f32";
+        self.ensure_kernel("silu_mul", kernels::SILU_MUL_SRC, KERNEL)?;
+        let n = gate.numel() as i32;
+        let gate_ptr = gate.buf.as_ptr();
+        let up_ptr = up.buf.as_ptr();
+        let out_ptr = out.buf.as_ptr();
+        let selector_ptr = selector.buf.as_ptr();
+        let mut params: Vec<*mut c_void> = vec![
+            &gate_ptr as *const _ as *mut c_void,
+            &up_ptr as *const _ as *mut c_void,
+            &out_ptr as *const _ as *mut c_void,
+            &selector_ptr as *const _ as *mut c_void,
+            &n as *const _ as *mut c_void,
+        ];
+        let block = 256u32;
+        let grid = ((n as u32).max(1) + block - 1) / block;
+        self.launch_maybe_blob(KERNEL, [grid, 1, 1], [block, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(gate_ptr);
+            b.push_ptr(up_ptr);
+            b.push_ptr(out_ptr);
+            b.push_ptr(selector_ptr);
+            b.push_i32(n);
+            b
+        })
+    }
+
     /// In-place softmax over last dimension
     pub fn softmax_f32(&mut self, x: &GpuTensor) -> HipResult<()> {
         self.bind_thread()?;
@@ -2212,20 +2250,8 @@ impl Gpu {
 
     #[cfg(feature = "deltanet")]
     pub fn sigmoid_f32(&mut self, x: &GpuTensor) -> HipResult<()> {
-        self.sigmoid_launch("sigmoid_f32", x)
-    }
-
-    /// [`Gpu::sigmoid_f32`] of `x` round-tripped through BF16 first
-    /// ([`Gpu::bf16_round_trip_f32`]'s rounding): the pair in one pass.
-    #[cfg(feature = "deltanet")]
-    pub fn sigmoid_bf16_in_f32(&mut self, x: &GpuTensor) -> HipResult<()> {
-        self.sigmoid_launch("sigmoid_bf16_in_f32", x)
-    }
-
-    #[cfg(feature = "deltanet")]
-    fn sigmoid_launch(&mut self, kernel: &'static str, x: &GpuTensor) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel("sigmoid", kernels::SIGMOID_SRC, kernel)?;
+        self.ensure_kernel("sigmoid", kernels::SIGMOID_SRC, "sigmoid_f32")?;
         let xp = x.buf.as_ptr();
         let n = x.numel() as i32;
         let mut params: Vec<*mut c_void> = vec![
@@ -2235,9 +2261,9 @@ impl Gpu {
         let block = 256u32;
         let grid = ((n as u32) + block - 1) / block;
         let bytes = crate::profile::elementwise1_bytes(n as usize);
-        let timer = crate::profile::begin_timer(&self.hip, "elementwise", kernel, bytes);
+        let timer = crate::profile::begin_timer(&self.hip, "elementwise", "sigmoid_f32", bytes);
         let result = self.launch_maybe_blob(
-            kernel,
+            "sigmoid_f32",
             [grid, 1, 1],
             [block, 1, 1],
             0,
