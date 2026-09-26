@@ -14,8 +14,11 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-flock -w 3600 /tmp/hipfire-build.lock cargo build --release -q -p hipfire-daemon -p hipfire-arch-qwen4 \
-    --features hipfire-arch-qwen4/lab --example qwen4_kld >/tmp/autoresearch-build.log 2>&1 \
+# Two invocations: `--example` restricts target selection, so a combined
+# `-p hipfire-daemon --example qwen4_kld` never relinks the daemon binary.
+{ flock -w 3600 /tmp/hipfire-build.lock cargo build --release -q -p hipfire-daemon \
+    && flock -w 3600 /tmp/hipfire-build.lock cargo build --release -q -p hipfire-arch-qwen4 \
+        --features lab --example qwen4_kld; } >/tmp/autoresearch-build.log 2>&1 \
     || { tail -40 /tmp/autoresearch-build.log; exit 1; }
 
 exec flock -w 3600 /tmp/hipfire-gpu.lock python3 - <<'PY'
