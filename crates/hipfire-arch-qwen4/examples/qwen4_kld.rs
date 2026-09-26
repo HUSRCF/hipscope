@@ -22,7 +22,9 @@
 //!   qwen4_kld import --logits TEACHER.logits --ref TEMPLATE.kldref \
 //!                    --teacher ID_FILE --output REF.kldref [--top-k 256]
 //!   qwen4_kld eval   --model CANDIDATE.hfq --ref REF.kldref --output OUT.kldseq \
-//!                    [--max-chunks N]
+//!                    [--max-chunks N] [--decode]
+//! `--decode` scores the autoregressive route instead: each chunk prefills the
+//! unscored prefix, then runs one `forward_token` per scored position.
 //! Reduce with `saddle-quant reduce DIR`.
 
 use hipfire_arch_qwen4::admit_hfqm_artifact;
@@ -42,7 +44,7 @@ use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-const USAGE: &str = "usage:\n  qwen4_kld ref    --model TEACHER.hfq --slice TEXT --output REF.kldref [--n-ctx 512] [--top-k 256] [--max-chunks N]\n  qwen4_kld import --logits TEACHER.logits --ref TEMPLATE.kldref --teacher ID_FILE --output REF.kldref [--top-k 256]\n  qwen4_kld eval   --model CANDIDATE.hfq --ref REF.kldref --output OUT.kldseq [--max-chunks N]";
+const USAGE: &str = "usage:\n  qwen4_kld ref    --model TEACHER.hfq --slice TEXT --output REF.kldref [--n-ctx 512] [--top-k 256] [--max-chunks N]\n  qwen4_kld import --logits TEACHER.logits --ref TEMPLATE.kldref --teacher ID_FILE --output REF.kldref [--top-k 256]\n  qwen4_kld eval   --model CANDIDATE.hfq --ref REF.kldref --output OUT.kldseq [--max-chunks N] [--decode]";
 
 struct Model {
     gpu: Gpu,
@@ -127,6 +129,29 @@ impl Model {
             .gpu
             .download_f32(&self.logits)
             .map_err(|e| e.to_string())?;
+        if rows.iter().any(|v| !v.is_finite()) {
+            return Err("non-finite logits".into());
+        }
+        Ok(rows)
+    }
+
+    /// Logits rows `from..to` of one chunk through the decode route: prefill
+    /// `chunk[..from]` from a fresh state, then one `forward_token` per row.
+    fn decode_rows(&mut self, chunk: &[u32], from: usize, to: usize) -> Result<Vec<f32>, String> {
+        let row = self.logits.sub_offset(0, self.vocab);
+        self.bundle
+            .reset(&mut self.gpu)
+            .map_err(|e| e.to_string())?;
+        self.bundle
+            .forward_chunk_final(&mut self.gpu, &chunk[..from], &row, None)
+            .map_err(|e| e.to_string())?;
+        let mut rows = Vec::with_capacity((to - from) * self.vocab);
+        for &token in &chunk[from..to] {
+            self.bundle
+                .forward_token(&mut self.gpu, token, &row, None)
+                .map_err(|e| e.to_string())?;
+            rows.extend(self.gpu.download_f32(&row).map_err(|e| e.to_string())?);
+        }
         if rows.iter().any(|v| !v.is_finite()) {
             return Err("non-finite logits".into());
         }
@@ -373,6 +398,7 @@ fn score(
     ref_path: &Path,
     output: &Path,
     max_chunks: Option<usize>,
+    decode: bool,
 ) -> Result<(), String> {
     let reference = KldRef::open(ref_path).map_err(|e| e.to_string())?;
     let file = std::fs::File::open(ref_path).map_err(|e| e.to_string())?;
@@ -390,20 +416,35 @@ fn score(
         ));
     }
     eprintln!(
-        "qwen4_kld eval: {n_chunk} chunks x {n_ctx}; teacher PPL {:.4} ({})",
-        h.oracle.ppl, h.teacher.path
+        "qwen4_kld eval: {n_chunk} chunks x {n_ctx} ({} route); teacher PPL {:.4} ({})",
+        if decode { "decode" } else { "all-row" },
+        h.oracle.ppl,
+        h.teacher.path
     );
 
     let started = Instant::now();
     let mut chunks = Vec::with_capacity(n_chunk);
     let (mut kld_sum, mut nll_sum, mut top1_hits, mut scored) = (0.0f64, 0.0f64, 0usize, 0usize);
+    // Digest of every scored logits row: equal digests mean bit-identical numerics.
+    let mut digest = Sha256::new();
+    let (from, to) = (window.score_from, window.score_to);
     for c in 0..n_chunk {
         let chunk = &tokens[c * n_ctx..(c + 1) * n_ctx];
-        let rows = m.chunk_logits(chunk)?;
+        let rows = if decode {
+            m.decode_rows(chunk, from, to)?
+        } else {
+            let mut rows = m.chunk_logits(chunk)?;
+            rows.truncate(to * m.vocab);
+            rows.drain(..from * m.vocab);
+            rows
+        };
+        for v in &rows {
+            digest.update(v.to_le_bytes());
+        }
         let mut klds = Vec::with_capacity(window.scored_per_chunk());
         let mut chunk_nll = 0.0f64;
-        for (i, pos) in (window.score_from..window.score_to).enumerate() {
-            let row = &rows[pos * m.vocab..(pos + 1) * m.vocab];
+        for (i, pos) in (from..to).enumerate() {
+            let row = &rows[i * m.vocab..(i + 1) * m.vocab];
             let block = reference.block(&mmap, c, i).map_err(|e| e.to_string())?;
             let block = TopKBlock {
                 residual_logprob: block.residual_logprob,
@@ -440,10 +481,11 @@ fn score(
     kldseq::write(output, &chunks).map_err(|e| e.to_string())?;
     let mean_nll = nll_sum / scored as f64;
     eprintln!(
-        "qwen4_kld eval: mean KLD = {:.6}  mean NLL = {mean_nll:.6}  PPL = {:.4}  top1 = {:.4}  ({scored} tokens) -> {}",
+        "qwen4_kld eval: mean KLD = {:.6}  mean NLL = {mean_nll:.6}  PPL = {:.4}  top1 = {:.4}  ({scored} tokens)  logits sha256 {:x} -> {}",
         kld_sum / scored as f64,
         mean_nll.exp(),
         top1_hits as f64 / scored as f64,
+        digest.finalize(),
         output.display()
     );
     Ok(())
@@ -454,7 +496,7 @@ fn run() -> Result<(), String> {
     let mode = args.next().ok_or(USAGE)?;
     let (mut model, mut slice, mut ref_path, mut output) = (None, None, None, None);
     let (mut logits, mut teacher) = (None, None);
-    let (mut n_ctx, mut top_k, mut max_chunks) = (512usize, 256usize, None);
+    let (mut n_ctx, mut top_k, mut max_chunks, mut decode) = (512usize, 256usize, None, false);
     while let Some(flag) = args.next() {
         let mut value = || args.next().ok_or_else(|| format!("{flag} needs a value"));
         let number = |v: String| v.parse::<usize>().map_err(|e| format!("{flag}: {e}"));
@@ -468,6 +510,7 @@ fn run() -> Result<(), String> {
             "--n-ctx" => n_ctx = number(value()?)?,
             "--top-k" => top_k = number(value()?)?,
             "--max-chunks" => max_chunks = Some(number(value()?)?),
+            "--decode" => decode = true,
             _ => return Err(format!("unknown argument {flag}\n{USAGE}")),
         }
     }
@@ -476,7 +519,7 @@ fn run() -> Result<(), String> {
             build_ref(&model, &slice, &output, n_ctx, top_k, max_chunks)
         }
         ("eval", Some(model), None, Some(ref_path), Some(output)) => {
-            score(&model, &ref_path, &output, max_chunks)
+            score(&model, &ref_path, &output, max_chunks, decode)
         }
         ("import", None, None, Some(template), Some(output)) => match (logits, teacher) {
             (Some(logits), Some(teacher)) => {
