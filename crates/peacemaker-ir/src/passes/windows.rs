@@ -19,13 +19,16 @@
 //! stores those raw field values in `DelayAluHint { instid0, instskip,
 //! instid1 }` (C3 confirmed the bit ranges).
 //!
-//! Resolution is exact inside one straight-line block. Anything needing a
-//! cross-block walk (producer or consumer past the block edge) yields
-//! `DelayStatus::Ambiguous`, never a rejection: hints are performance-only
-//! and `NO_DEP` is always sound, so downstream edits touching the reach must
-//! rewrite the hint to `NO_DEP` (core.md §2.8). Per-path enumeration across
-//! joins is intentionally not attempted: the two paths into a hint may
-//! disagree on producer distance, and `Ambiguous` is the honest fact.
+//! Resolution is exact along the unique reaching path: straight-line within
+//! the block, continued across single-predecessor edges. A consumer past the
+//! block end rejects (`DelayCrossesLeader`): the skip would count across
+//! control flow, which the window model cannot preserve. A producer past a
+//! join, a loop revisit, or an invalid id yields `DelayStatus::Ambiguous`,
+//! never a rejection: hints are performance-only and `NO_DEP` is always
+//! sound, so downstream edits touching the reach must rewrite the hint to
+//! `NO_DEP` (core.md §2.8). Per-path enumeration across joins is
+//! intentionally not attempted: the two paths into a hint may disagree on
+//! producer distance, and `Ambiguous` is the honest fact.
 
 use thiserror::Error;
 
@@ -116,6 +119,8 @@ pub enum WindowError {
     EndPgmInsideClause { index: usize },
     #[error("s_delay_alu at layout index {index} has no decoded hint fields")]
     HintMissing { index: usize },
+    #[error("s_delay_alu at layout index {index} has its consumer past its block")]
+    DelayCrossesLeader { index: usize },
 }
 
 /// VALU-issuing forms for INSTID lookback. Comparisons issue on the vector
@@ -171,13 +176,12 @@ fn clause_length(mods: &Modifiers) -> Option<usize> {
 }
 
 /// Validate every clause window and resolve every delay hint. Requires built
-/// blocks. Clause violations reject; delay over-reach goes ambiguous.
+/// blocks. Clause violations and delay consumers past the block end reject;
+/// backward producer over-reach across joins goes ambiguous (never rejects).
 pub fn check_windows(body: &Body) -> Result<WindowFacts, WindowError> {
     if body.blocks.is_empty() {
         return Err(WindowError::BlocksNotBuilt);
     }
-    let pos_of: std::collections::HashMap<InstId, usize> =
-        body.layout.iter().enumerate().map(|(pos, &id)| (id, pos)).collect();
     let mut facts = WindowFacts::default();
     for (pos, &id) in body.layout.iter().enumerate() {
         let inst = body.insts.get(id).expect("layout references live insts");
@@ -226,7 +230,7 @@ pub fn check_windows(body: &Body) -> Result<WindowFacts, WindowError> {
             Control::Delay => {
                 let hint = inst.mods.delay.ok_or(WindowError::HintMissing { index: pos })?;
                 let block = containing_block(body, id).expect("inst is laid out in a block");
-                facts.delays.push(resolve_delay(body, &pos_of, id, block, pos, hint));
+                facts.delays.push(resolve_delay(body, id, block, pos, hint)?);
             }
             _ => {}
         }
@@ -236,87 +240,101 @@ pub fn check_windows(body: &Body) -> Result<WindowFacts, WindowError> {
 
 fn resolve_delay(
     body: &Body,
-    pos_of: &std::collections::HashMap<InstId, usize>,
     hint: InstId,
     block: BlockId,
     pos: usize,
     raw: crate::operand::DelayAluHint,
-) -> DelayFact {
+) -> Result<DelayFact, WindowError> {
     let ambiguous = DelayFact::ambiguous(hint, block);
-    let (start, end) = body.blocks[block.0].range;
-    let _ = pos_of;
-    let debug_assert_pos = body.layout.get(pos) == Some(&hint);
-    debug_assert!(debug_assert_pos);
+    let (_, end) = body.blocks[block.0].range;
+    debug_assert_eq!(body.layout.get(pos), Some(&hint));
 
-    // Consumers first (forward): consumer0 is the next instruction, consumer1
-    // is skip_forward further. Either past the block end means a cross-block
-    // reach.
+    // Consumers (forward): consumer0 is the next layout instruction,
+    // consumer1 is skip_forward further. SKIP counts layout instructions, so
+    // the consumers are positional; a consumer past the block end means the
+    // skip counts across control flow, which the straight-line window model
+    // cannot preserve: reject like a clause window crossing a leader.
     let fwd = match skip_forward(raw.instskip) {
         Some(fwd) => fwd,
-        None => return ambiguous,
+        None => return Ok(ambiguous),
     };
-    if pos + 1 >= end {
-        return ambiguous;
+    if pos + 1 >= end || pos + 1 + fwd >= end {
+        return Err(WindowError::DelayCrossesLeader { index: pos });
     }
     let consumer0 = body.layout[pos + 1];
-    if pos + 1 + fwd >= end || start >= end {
-        return ambiguous;
-    }
     let consumer1 = body.layout[pos + 1 + fwd];
 
-    // Producers (backward): walk within the block only.
+    // Producers (backward): INSTID counts issued VALU on the executed path
+    // (branched-over instructions do not count; EXEC-skipped VALU do). Walk
+    // back along single-predecessor chains, which carry exactly one path; a
+    // join, a loop revisit, an invalid id, or an unmet need all yield
+    // Ambiguous, never a rejection: hints are performance-only and NO_DEP is
+    // always sound.
     let mut producers: [Option<InstId>; 2] = [None, None];
     for (slot, value) in [raw.instid0, raw.instid1].iter().enumerate() {
         match id_need(*value) {
             IdNeed::None => {}
-            IdNeed::Unknown => return ambiguous,
-            IdNeed::Salu => {
-                // Nearest previous SALU-form instruction (M1 approximation
-                // of the SALU cycle penalty).
-                let mut found = None;
-                let mut j = pos;
-                while j > start {
-                    j -= 1;
-                    let candidate = body.layout[j];
-                    if is_salu(&body.insts.get(candidate).expect("laid out")) {
-                        found = Some(candidate);
-                        break;
-                    }
-                }
-                // No SALU in-block before the hint: the penalty has no
-                // in-block producer; treat as no dependency rather than
-                // guessing across the edge.
-                producers[slot] = found;
-            }
-            IdNeed::Valu(need) => {
-                let mut seen = 0usize;
-                let mut found = None;
-                let mut j = pos;
-                while j > start {
-                    j -= 1;
-                    let candidate = body.layout[j];
-                    if is_valu(&body.insts.get(candidate).expect("laid out")) {
-                        seen += 1;
-                        if seen == need {
-                            found = Some(candidate);
-                            break;
-                        }
-                    }
-                }
-                match found {
-                    Some(inst) => producers[slot] = Some(inst),
-                    None => return ambiguous,
-                }
-            }
+            IdNeed::Unknown => return Ok(ambiguous),
+            IdNeed::Salu => match back_search(body, block, pos, false, 0) {
+                BackResult::Found(inst) => producers[slot] = Some(inst),
+                BackResult::Ambiguous => return Ok(ambiguous),
+            },
+            IdNeed::Valu(need) => match back_search(body, block, pos, true, need) {
+                BackResult::Found(inst) => producers[slot] = Some(inst),
+                BackResult::Ambiguous => return Ok(ambiguous),
+            },
         }
     }
-    DelayFact {
+    Ok(DelayFact {
         hint,
         block,
         status: DelayStatus::Resolved {
             producers,
             consumers: [Some(consumer0), Some(consumer1)],
         },
+    })
+}
+
+enum BackResult {
+    Found(InstId),
+    Ambiguous,
+}
+
+/// Backward search for a producer along the unique reaching path: within the
+/// block, then across single-predecessor edges (exact: one path reaches the
+/// hint through such an edge). `valu=true` counts the `need`-th previous
+/// VALU-issuing instruction; `valu=false` finds the nearest previous
+/// SALU-form instruction (M1 approximation of the SALU cycle penalty).
+/// Unmet needs and multi-predecessor joins yield Ambiguous.
+fn back_search(body: &Body, block: BlockId, pos: usize, valu: bool, need: usize) -> BackResult {
+    let mut seen = 0usize;
+    let mut cur = block;
+    let mut j = pos;
+    let mut visited = vec![block];
+    loop {
+        let (start, _) = body.blocks[cur.0].range;
+        while j > start {
+            j -= 1;
+            let candidate = body.layout[j];
+            let hit = if valu {
+                is_valu(&body.insts.get(candidate).expect("laid out"))
+            } else {
+                is_salu(&body.insts.get(candidate).expect("laid out"))
+            };
+            if hit && (!valu || {
+                seen += 1;
+                seen == need
+            }) {
+                return BackResult::Found(candidate);
+            }
+        }
+        let preds = &body.blocks[cur.0].preds;
+        if preds.len() != 1 || visited.contains(&preds[0]) {
+            return BackResult::Ambiguous;
+        }
+        cur = preds[0];
+        visited.push(cur);
+        j = body.blocks[cur.0].range.1;
     }
 }
 
@@ -405,17 +423,36 @@ mod tests {
     }
 
     #[test]
-    fn delay_past_either_block_edge_is_ambiguous() {
-        // Producer walk past block start: hint needs 2 VALU back, only 1 in block.
+    fn delay_past_block_start_without_unique_path_is_ambiguous() {
+        // Hint needs 2 VALU back, only 1 precedes it on the unique entry path.
         let mut body = body_of(vec![valu(), delay_hint(2, 0, 0), valu(), endpgm()]);
         build_blocks(&mut body).unwrap();
         let facts = check_windows(&body).unwrap();
         assert!(facts.delays[0].is_ambiguous());
         assert_eq!(facts.delays[0].producers(), None);
+    }
 
-        // Consumer past block end: a branch targets the instruction right
-        // after the hint, so the hint is alone in its block and its consumer
-        // lives in the next one.
+    #[test]
+    fn delay_producer_resolves_across_single_pred_edge() {
+        // The 2nd VALU back lives in the single-predecessor entry block: one
+        // reaching path, so the walk continues across the edge exactly.
+        // valu@0 jump@1(->@2) valu@2 hint@3(need 2) valu@4 endpgm@5.
+        let mut entry = mk("s_branch", Form::Sopp);
+        entry.effects.control = Control::Jump;
+        entry.operands.push(Operand::Imm(ImmField::Sopp(0)));
+        let mut body = body_of(vec![valu(), entry, valu(), delay_hint(2, 0, 0), valu(), endpgm()]);
+        build_blocks(&mut body).unwrap();
+        assert_eq!(body.blocks.len(), 2);
+        let facts = check_windows(&body).unwrap();
+        assert_eq!(facts.delays[0].producers(), Some([Some(body.layout[0]), None]));
+    }
+
+    #[test]
+    fn delay_consumer_past_block_end_rejects() {
+        // A branch targets the instruction right after the hint, so the hint
+        // is alone in its block and its consumer lives in the next one: the
+        // skip would count across control flow, which the window model
+        // cannot preserve.
         // Layout: hint@0 valu@1 valu@2 branch@3(taken valu@1, off -3) endpgm@4.
         let mut back = mk("s_branch", Form::Sopp);
         back.effects.control = Control::Jump;
@@ -423,8 +460,7 @@ mod tests {
         let mut body = body_of(vec![delay_hint(0, 0, 0), valu(), valu(), back, endpgm()]);
         build_blocks(&mut body).unwrap();
         assert_eq!(body.blocks[0].range, (0, 1));
-        let facts = check_windows(&body).unwrap();
-        assert!(facts.delays[0].is_ambiguous());
+        assert_eq!(check_windows(&body), Err(WindowError::DelayCrossesLeader { index: 0 }));
     }
     #[test]
     fn smem_clause_of_mixed_widths_validates() {

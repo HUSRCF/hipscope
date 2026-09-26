@@ -460,7 +460,7 @@ mod tests {
 
     #[test]
     fn def_reaches_use_across_diamond_join() {
-        // b0: def v5; cbr -> b1 | b2; b1/b2: plain; b3: use v5; endpgm.
+        // b0: def v5 + interior cbr; b1: plain (branch target); b2: use v5.
         let mut body = body_of(vec![
             vdef(5),
             branch(2),
@@ -471,47 +471,51 @@ mod tests {
             endpgm(),
         ]);
         build_blocks(&mut body).unwrap();
-        assert_eq!(body.blocks.len(), 4);
+        assert_eq!(body.blocks.len(), 3);
         let live = Liveness::analyze(&body);
-        // v5 is live-in at the join and at both middles (may-analysis).
-        assert!(live.live_in(BlockId(3)).contains(&Loc::V(5)));
-        assert!(live.live_in(BlockId(1)).contains(&Loc::V(5)));
+        // v5 is live-in at the join and along both paths (may-analysis).
         assert!(live.live_in(BlockId(2)).contains(&Loc::V(5)));
+        assert!(live.live_in(BlockId(1)).contains(&Loc::V(5)));
+        assert!(live.live_out(BlockId(0)).contains(&Loc::V(5)));
         assert!(!live.live_in(BlockId(0)).contains(&Loc::V(5)));
         // SCC is live-in at entry: the branch reads it.
         assert!(live.live_in(BlockId(0)).contains(&Loc::Scc));
         let cfg = Cfg::build(&body).unwrap();
-        assert!(cfg.dominates(BlockId(0), BlockId(3)));
+        assert!(cfg.dominates(BlockId(0), BlockId(2)));
     }
 
     #[test]
     fn v200_diamond_stays_live_on_uninitialised_path() {
-        // Spec §6.2 scenario at the liveness level: one predecessor defines
-        // v200, the other does not; the join's live-in still holds v200 (may),
-        // so a later definite-assignment check (C6) must refuse unguarded uses.
+        // Spec §6.2 scenario at the liveness level: one path defines v200,
+        // the other does not; the join's live-in still holds v200 (may), so a
+        // later definite-assignment check (C6) must refuse unguarded uses.
+        // b0 holds the interior branch, the def, and the final jump; b1 is
+        // the path that never defines v200; b2 is the join.
         let mut def = mk("v_mov_b32_e32", Form::Vop1);
         def.effects.defs.push(RegRef { kind: Kind::V, base: 200, len: 1 });
         let mut body = body_of(vec![
-            branch(2), // taken -> join@4... targets: fallthrough b1@1? layout below
-            def,       // b1 defines v200
-            jump(1),   // -> join
-            mk("v_mov_b32_e32", Form::Vop1), // b2: no def
-            vuse(200), // join uses v200
+            branch(2),
+            def,
+            jump(1),
+            mk("v_mov_b32_e32", Form::Vop1),
+            vuse(200),
             endpgm(),
         ]);
         build_blocks(&mut body).unwrap();
+        assert_eq!(body.blocks.len(), 3);
         let live = Liveness::analyze(&body);
-        assert!(live.live_in(BlockId(3)).contains(&Loc::V(200)));
+        assert!(live.live_in(BlockId(2)).contains(&Loc::V(200)));
         // May-merge: v200 is live-out of BOTH predecessors, including the one
         // that never defined it. Liveness cannot tell initialised from live,
         // which is exactly why C6 needs definite assignment on top.
+        assert!(live.live_out(BlockId(0)).contains(&Loc::V(200)));
         assert!(live.live_out(BlockId(1)).contains(&Loc::V(200)));
-        assert!(live.live_out(BlockId(2)).contains(&Loc::V(200)));
     }
 
     #[test]
     fn loop_carried_value_stays_live() {
-        // mov; jmp->H; H: use v5 (and def v6); cbr -> exit | body; body: jmp->H; exit: endpgm.
+        // b0: def; b1: use (no leader splits the fall-through); b2: interior
+        // cbr plus the back-edge jump. Leaders {0,2,3,6}.
         let mut use5 = mk("v_add_nc_u32_e32", Form::Vop2);
         use5.effects.uses.push(RegRef { kind: Kind::V, base: 5, len: 1 });
         use5.effects.defs.push(RegRef { kind: Kind::V, base: 6, len: 1 });
@@ -525,12 +529,15 @@ mod tests {
             endpgm(),
         ]);
         build_blocks(&mut body).unwrap();
+        assert_eq!(body.blocks.len(), 4);
         let live = Liveness::analyze(&body);
         assert!(live.live_in(BlockId(1)).contains(&Loc::V(5)));
         assert!(live.live_in(BlockId(2)).contains(&Loc::V(5)));
+        // The def's range spans the loop back to the back-edge jump.
         let ranges = live.ranges(&body);
         let r5 = ranges.iter().find(|r| r.reg == RegRef { kind: Kind::V, base: 5, len: 1 }).unwrap();
         assert_eq!(r5.from, body.layout[0]);
+        assert_eq!(r5.to, body.layout[5]);
     }
 
     #[test]
