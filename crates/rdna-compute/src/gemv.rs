@@ -14183,6 +14183,64 @@ impl Gpu {
             blob_builder,
         )
     }
+
+    /// [`Gpu::gemv_bf16_xf32`] for four `(weight, y, m)` BF16 matrices that
+    /// read the same `x` (width `k`), in one launch. Every output row is the
+    /// value the single-matrix launch computes.
+    pub fn gemv_bf16_xf32_x4(
+        &mut self,
+        parts: [(&GpuTensor, &GpuTensor, usize); 4],
+        x: &GpuTensor,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_bf16_xf32",
+            kernels::GEMV_BF16_XF32_SRC,
+            "gemv_bf16_xf32_x4",
+        )?;
+        let w = parts.map(|(w, _, _)| w.buf.as_ptr());
+        let y = parts.map(|(_, y, _)| y.buf.as_ptr());
+        let m = parts.map(|(_, _, m)| m as i32);
+        let x_ptr = x.buf.as_ptr();
+        let k_val = k as i32;
+        let rows: usize = parts.iter().map(|(_, _, m)| m).sum();
+        let mut params: Vec<*mut c_void> = Vec::with_capacity(13);
+        for p in &w {
+            params.push(p as *const _ as *mut c_void);
+        }
+        params.push(&x_ptr as *const _ as *mut c_void);
+        for p in &y {
+            params.push(p as *const _ as *mut c_void);
+        }
+        for v in &m {
+            params.push(v as *const _ as *mut c_void);
+        }
+        params.push(&k_val as *const _ as *mut c_void);
+        let blob_builder = || {
+            let mut b = hip_bridge::KernargBlob::new();
+            for p in w {
+                b.push_ptr(p);
+            }
+            b.push_ptr(x_ptr);
+            for p in y {
+                b.push_ptr(p);
+            }
+            for v in m {
+                b.push_i32(v);
+            }
+            b.push_i32(k_val);
+            b
+        };
+        self.launch_maybe_blob(
+            "gemv_bf16_xf32_x4",
+            [rows as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            blob_builder,
+        )
+    }
     pub fn deepseek4_gemv_mq2g256_lloyd_moe_down_residual_scaled_indexed(
         &mut self,
         expert_ptrs: &GpuTensor,

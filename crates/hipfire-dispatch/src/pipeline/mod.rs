@@ -2893,6 +2893,24 @@ fn decode_gate_side_stage(
                 shared_up_w.m,
                 p.router.k,
             ))?;
+        } else if route == Some(MoeRouteCapability::Qt44Qt53Grouped)
+            && [&p.router, shared_expert_gate, shared_gate_w, shared_up_w]
+                .iter()
+                .all(|w| w.dtype == DType::BF16 && w.awq_scale.is_none() && w.k == p.router.k)
+        {
+            // Router, selector and shared gate/up are BF16 projections of the
+            // same natural activation: one launch, each row computed as the
+            // single-matrix GEMV would.
+            hip!(gpu.gemv_bf16_xf32_x4(
+                [
+                    (p.router.buf, p.router_logits, p.router.m),
+                    (shared_expert_gate.buf, scalar_buf, shared_expert_gate.m),
+                    (shared_gate_w.buf, shared_gate, shared_gate_w.m),
+                    (shared_up_w.buf, shared_up, shared_up_w.m),
+                ],
+                p.x_norm,
+                p.router.k,
+            ))?;
         } else {
             static GEMV_GATE: OnceLock<GemvFamily> = OnceLock::new();
             let gemv = GEMV_GATE.get_or_init(GemvFamily::new);

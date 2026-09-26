@@ -27,18 +27,15 @@
 #define HF_BF16_LO(u) __uint_as_float((u) << 16)
 #define HF_BF16_HI(u) __uint_as_float((u) & 0xFFFF0000u)
 
-__launch_bounds__(32, 20)
-extern "C" __global__ void gemv_bf16_xf32(
-    const unsigned short* __restrict__ W,  // [M, K] bf16 (raw u16)
-    const float*          __restrict__ x,  // [K] F32
-    float*                __restrict__ y,  // [M] F32
-    int M, int K
+// One output row: y_row = dot(w_row, x). Every entry point below runs this
+// same body, so a row's value does not depend on which launch computed it.
+static __device__ __forceinline__ void gemv_bf16_xf32_row(
+    const unsigned short* __restrict__ w_row,
+    const float*          __restrict__ x,
+    float*                __restrict__ y_row,
+    int K
 ) {
-    const int row = blockIdx.x;
-    if (row >= M) return;
     const int tid = threadIdx.x;
-
-    const unsigned short* w_row = W + (size_t)row * K;
 
     float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
 
@@ -99,5 +96,49 @@ extern "C" __global__ void gemv_bf16_xf32(
     for (int offset = 16; offset > 0; offset >>= 1) {
         sum += __shfl_down(sum, offset);
     }
-    if (tid == 0) y[row] = sum;
+    if (tid == 0) *y_row = sum;
+}
+
+__launch_bounds__(32, 20)
+extern "C" __global__ void gemv_bf16_xf32(
+    const unsigned short* __restrict__ W,  // [M, K] bf16 (raw u16)
+    const float*          __restrict__ x,  // [K] F32
+    float*                __restrict__ y,  // [M] F32
+    int M, int K
+) {
+    const int row = blockIdx.x;
+    if (row >= M) return;
+    gemv_bf16_xf32_row(W + (size_t)row * K, x, y + row, K);
+}
+
+// Four BF16 matrices reading the same x (same K) in one launch: blocks
+// [0, M0) are rows of W0, the next M1 rows of W1, and so on. Each row is the
+// same computation gemv_bf16_xf32 does for it.
+__launch_bounds__(32, 20)
+extern "C" __global__ void gemv_bf16_xf32_x4(
+    const unsigned short* __restrict__ W0,
+    const unsigned short* __restrict__ W1,
+    const unsigned short* __restrict__ W2,
+    const unsigned short* __restrict__ W3,
+    const float*          __restrict__ x,
+    float* __restrict__ y0,
+    float* __restrict__ y1,
+    float* __restrict__ y2,
+    float* __restrict__ y3,
+    int M0, int M1, int M2, int M3, int K
+) {
+    int row = blockIdx.x;
+    const unsigned short* W = W0;
+    float* y = y0;
+    if (row >= M0) {
+        row -= M0; W = W1; y = y1;
+        if (row >= M1) {
+            row -= M1; W = W2; y = y2;
+            if (row >= M2) {
+                row -= M2; W = W3; y = y3;
+                if (row >= M3) return;
+            }
+        }
+    }
+    gemv_bf16_xf32_row(W + (size_t)row * K, x, y + row, K);
 }
