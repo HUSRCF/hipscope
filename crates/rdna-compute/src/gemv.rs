@@ -14286,6 +14286,47 @@ impl Gpu {
         )
     }
 
+    /// [`Gpu::gemv_bf16_xf32`] of `weight` and `x` folded into `residual` as
+    /// `bf16_scaled_add_f32` (with `scalar[0]`) does, one launch; bitwise the
+    /// two launches. The GEMV output is not stored.
+    pub fn gemv_bf16_xf32_bf16_scaled_add(
+        &mut self,
+        weight: &GpuTensor,
+        x: &GpuTensor,
+        residual: &GpuTensor,
+        scalar: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        const FUNC: &str = "gemv_bf16_xf32_bf16_scaled_add";
+        self.ensure_kernel("gemv_bf16_xf32", kernels::GEMV_BF16_XF32_SRC, FUNC)?;
+        let w_ptr = weight.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let r_ptr = residual.buf.as_ptr();
+        let s_ptr = scalar.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &w_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &r_ptr as *const _ as *mut c_void,
+            &s_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(FUNC, [m as u32, 1, 1], [32, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(w_ptr);
+            b.push_ptr(x_ptr);
+            b.push_ptr(r_ptr);
+            b.push_ptr(s_ptr);
+            b.push_i32(m_val);
+            b.push_i32(k_val);
+            b
+        })
+    }
+
     /// [`Gpu::gemv_bf16_xf32`] for four `(weight, y, m)` BF16 matrices that
     /// read the same `x` (width `k`), in one launch. Every output row is the
     /// value the single-matrix launch computes.

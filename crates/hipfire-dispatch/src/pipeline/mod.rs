@@ -3205,6 +3205,22 @@ fn decode_shared_down_stage(
             }
             static GEMV_QT44_QT53_SHARED_DOWN: LazyLock<GemvFamily> =
                 LazyLock::new(GemvFamily::new);
+            if p.recipe.bf16_round_trip()
+                && shared_down_w.dtype == DType::BF16
+                && shared_down_w.awq_scale.is_none()
+            {
+                // The BF16 shared down GEMV folds its rows into the residual
+                // with the source BF16 scaled add in its epilogue.
+                hip!(gpu.gemv_bf16_xf32_bf16_scaled_add(
+                    shared_down_w.buf,
+                    &shared_hid,
+                    out_target,
+                    scalar_buf,
+                    shared_down_w.m,
+                    shared_down_w.k,
+                ))?;
+                return Ok(());
+            }
             if shared_down_w.dtype == DType::MQ4G128V2 {
                 let shared_down_rot = slice_moe_f32_view(p.rot_batch, 0, shared_down_w.k);
                 hip!(gpu.rotate_x_mq_128_v2(&shared_hid, &shared_down_rot, shared_down_w.k, 1,))?;

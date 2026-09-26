@@ -150,6 +150,32 @@ extern "C" __global__ void gemv_bf16_xf32_k4(
     y[row] = value;
 }
 
+// gemv_bf16_xf32 followed by bf16_scaled_add_f32 on each output row: the
+// source BF16 shared-expert fold residual[row] = bf16(bf16(residual[row]) +
+// bf16(bf16(scalar[0]) * bf16(W[row] . x))), the same expression, so the
+// residual is bitwise the GEMV + scaled-add launches (the GEMV output itself
+// is not stored).
+__launch_bounds__(32, 20)
+extern "C" __global__ void gemv_bf16_xf32_bf16_scaled_add(
+    const unsigned short* __restrict__ W,  // [M, K] bf16 (raw u16)
+    const float*          __restrict__ x,  // [K] F32
+    float*                __restrict__ residual,  // [M] F32
+    const float*          __restrict__ scalar,  // [1]
+    int M, int K
+) {
+    const int row = blockIdx.x;
+    if (row >= M) return;
+    const float sum = gemv_bf16_xf32_row(W + (size_t)row * K, x, K, threadIdx.x);
+    if (threadIdx.x != 0) return;
+    const hip_bfloat16 lhs = static_cast<hip_bfloat16>(residual[row]);
+    const hip_bfloat16 rhs = static_cast<hip_bfloat16>(sum);
+    const hip_bfloat16 gate = static_cast<hip_bfloat16>(scalar[0]);
+    const hip_bfloat16 product = static_cast<hip_bfloat16>(
+        static_cast<float>(gate) * static_cast<float>(rhs));
+    residual[row] = static_cast<float>(static_cast<hip_bfloat16>(
+        static_cast<float>(lhs) + static_cast<float>(product)));
+}
+
 // Four BF16 matrices reading the same x (same K) in one launch: blocks
 // [0, M0) are rows of W0, the next M1 rows of W1, and so on. Each row is the
 // same computation gemv_bf16_xf32 does for it.
