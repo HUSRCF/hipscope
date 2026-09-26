@@ -2212,8 +2212,20 @@ impl Gpu {
 
     #[cfg(feature = "deltanet")]
     pub fn sigmoid_f32(&mut self, x: &GpuTensor) -> HipResult<()> {
+        self.sigmoid_launch("sigmoid_f32", x)
+    }
+
+    /// [`Gpu::sigmoid_f32`] of `x` round-tripped through BF16 first
+    /// ([`Gpu::bf16_round_trip_f32`]'s rounding): the pair in one pass.
+    #[cfg(feature = "deltanet")]
+    pub fn sigmoid_bf16_in_f32(&mut self, x: &GpuTensor) -> HipResult<()> {
+        self.sigmoid_launch("sigmoid_bf16_in_f32", x)
+    }
+
+    #[cfg(feature = "deltanet")]
+    fn sigmoid_launch(&mut self, kernel: &'static str, x: &GpuTensor) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel("sigmoid", kernels::SIGMOID_SRC, "sigmoid_f32")?;
+        self.ensure_kernel("sigmoid", kernels::SIGMOID_SRC, kernel)?;
         let xp = x.buf.as_ptr();
         let n = x.numel() as i32;
         let mut params: Vec<*mut c_void> = vec![
@@ -2223,9 +2235,9 @@ impl Gpu {
         let block = 256u32;
         let grid = ((n as u32) + block - 1) / block;
         let bytes = crate::profile::elementwise1_bytes(n as usize);
-        let timer = crate::profile::begin_timer(&self.hip, "elementwise", "sigmoid_f32", bytes);
+        let timer = crate::profile::begin_timer(&self.hip, "elementwise", kernel, bytes);
         let result = self.launch_maybe_blob(
-            "sigmoid_f32",
+            kernel,
             [grid, 1, 1],
             [block, 1, 1],
             0,

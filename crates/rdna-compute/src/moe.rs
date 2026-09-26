@@ -1784,7 +1784,8 @@ impl Gpu {
         )
     }
     /// Qwen4's fixed 512-way/top-10 GPU router.  The incumbent k=8 routers
-    /// remain separate symbols and launchers.
+    /// remain separate symbols and launchers.  `round_logits` reads the logits
+    /// through [`Gpu::bf16_round_trip_f32`]'s rounding (the buffer is unchanged).
     pub fn moe_router_softmax_top10_f32(
         &mut self,
         logits: &GpuTensor,
@@ -1792,6 +1793,7 @@ impl Gpu {
         topk_w: &GpuTensor,
         tokens: usize,
         normalize_topk_prob: bool,
+        round_logits: bool,
     ) -> HipResult<()> {
         self.bind_thread()?;
         const FUNC: &str = "moe_router_softmax_top10_f32";
@@ -1802,6 +1804,7 @@ impl Gpu {
         let ne = 512i32;
         let kt = 10i32;
         let norm = i32::from(normalize_topk_prob);
+        let round = i32::from(round_logits);
         let mut params = [
             &lp as *const _ as *mut c_void,
             &ip as *const _ as *mut c_void,
@@ -1809,6 +1812,7 @@ impl Gpu {
             &ne as *const _ as *mut c_void,
             &kt as *const _ as *mut c_void,
             &norm as *const _ as *mut c_void,
+            &round as *const _ as *mut c_void,
         ];
         let bytes = (tokens * 512 + tokens * 10 * 2) * 4;
         let timer = crate::profile::begin_timer(&self.hip, "elementwise", FUNC, bytes);
@@ -1826,6 +1830,7 @@ impl Gpu {
                 b.push_i32(ne);
                 b.push_i32(kt);
                 b.push_i32(norm);
+                b.push_i32(round);
                 b
             },
         );

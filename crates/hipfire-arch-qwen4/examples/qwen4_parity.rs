@@ -2790,7 +2790,7 @@ fn run_moe_operator(
     let weights_gpu = gpu
         .zeros(&[tokens * top_k], DType::F32)
         .map_err(|error| error.to_string())?;
-    gpu.moe_router_softmax_top10_f32(&logits_gpu, &selected_gpu, &weights_gpu, tokens, true)
+    gpu.moe_router_softmax_top10_f32(&logits_gpu, &selected_gpu, &weights_gpu, tokens, true, false)
         .map_err(|error| error.to_string())?;
     let selected_experts = download_i32(gpu, &selected_gpu, tokens * top_k)?;
     let routing_weights = gpu

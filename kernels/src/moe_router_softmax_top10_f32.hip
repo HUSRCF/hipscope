@@ -23,6 +23,15 @@ __device__ __forceinline__ bool router_better(
         (lhs_value == rhs_value && lhs_index < rhs_index);
 }
 
+// bf16_round_trip_f32's rounding (RNE; non-finite values unchanged).
+__device__ __forceinline__ float router_bf16_rt(float v) {
+    if (!isfinite(v)) return v;
+    const unsigned int u = __float_as_uint(v);
+    return __uint_as_float((u + 0x7FFFu + ((u >> 16) & 1u)) & 0xFFFF0000u);
+}
+
+// `round_logits != 0` reads every logit through that BF16 round trip, the
+// source storage boundary a separate bf16_round_trip_f32 launch would apply.
 __launch_bounds__(256, 1)
 extern "C" __global__ void moe_router_softmax_top10_f32(
     const float* __restrict__ logits, // [tokens, n_exp]
@@ -30,7 +39,8 @@ extern "C" __global__ void moe_router_softmax_top10_f32(
     float* __restrict__ topk_w,       // [tokens, 10]
     int n_exp,
     int top_k,
-    int normalize_topk_prob
+    int normalize_topk_prob,
+    int round_logits
 ) {
     __shared__ float wave_values[80];
     __shared__ int wave_indices[80];
@@ -46,8 +56,12 @@ extern "C" __global__ void moe_router_softmax_top10_f32(
     if (n_exp != 512 || top_k != 10) return;
 
     const size_t token_base = (size_t)token * 512;
-    const float first_logit = logits[token_base + thread];
-    const float second_logit = logits[token_base + thread + 256];
+    float first_logit = logits[token_base + thread];
+    float second_logit = logits[token_base + thread + 256];
+    if (round_logits != 0) {
+        first_logit = router_bf16_rt(first_logit);
+        second_logit = router_bf16_rt(second_logit);
+    }
     float first_value = first_logit;
     float second_value = second_logit;
     const int first_index = thread;

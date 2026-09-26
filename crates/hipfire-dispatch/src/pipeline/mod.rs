@@ -3010,8 +3010,11 @@ fn decode_gate_side_stage(
         }
     } // end `if !skip_routing` (gate-side GEMV)
       // BF16-source recipes round F32 projection scratch at their storage
-      // boundary before the router and shared nonlinearities consume it.
-    if p.recipe.bf16_round_trip() {
+      // boundary before the router and shared nonlinearities consume it. The
+      // grouped route's consumers round what they read themselves (the top-10
+      // router its logits, `sigmoid_bf16_in_f32` the selector,
+      // `silu_mul_bf16_rt_f32` the shared gate/up), so no pass is owed here.
+    if p.recipe.bf16_round_trip() && route != Some(MoeRouteCapability::Qt44Qt53Grouped) {
         // The decode step program is single-row (`build_moe_decode` binds
         // `batch_size: 1`), but every scratch buffer is sized for the prefill
         // chunk cap (512 rows). Rounding the whole buffer would carry 512x the
@@ -3020,12 +3023,8 @@ fn decode_gate_side_stage(
         // single scalar, and the already-live-sized shared gate/up slices.
         hip!(gpu.bf16_round_trip_f32(&slice_moe_f32_view(p.router_logits, 0, p.n_exp)))?;
         hip!(gpu.bf16_round_trip_f32(&slice_moe_f32_view(scalar_buf, 0, 1)))?;
-        // The grouped route's shared activation (`silu_mul_bf16_rt_f32`) rounds
-        // gate and up as it reads them; a round trip here would be repeated.
-        if route != Some(MoeRouteCapability::Qt44Qt53Grouped) || p.skip_shared {
-            hip!(gpu.bf16_round_trip_f32(shared_gate))?;
-            hip!(gpu.bf16_round_trip_f32(shared_up))?;
-        }
+        hip!(gpu.bf16_round_trip_f32(shared_gate))?;
+        hip!(gpu.bf16_round_trip_f32(shared_up))?;
     }
     Ok(())
 }
@@ -3081,6 +3080,7 @@ fn decode_route_gpu_stage(
                 p.topk_weights,
                 1,
                 p.norm_topk_prob,
+                p.recipe.bf16_round_trip(),
             ))?;
         } else if router_shared_fuse {
             let shared_x_rot = unsafe {
@@ -3129,7 +3129,11 @@ fn decode_route_gpu_stage(
                 p.norm_topk_prob
             ))?;
         }
-        if p.recipe.bf16_round_trip() {
+        // The grouped route's top-10 combine rounds each weight to BF16 as it
+        // reads it (a deferred combine may read them elsewhere).
+        let combine_rounds =
+            route == Some(MoeRouteCapability::Qt44Qt53Grouped) && !p.defer_routed_combine;
+        if p.recipe.bf16_round_trip() && !combine_rounds {
             // Only the selected slots are live; scratch may be prefill-sized.
             hip!(gpu.bf16_round_trip_f32(&slice_moe_f32_view(p.topk_weights, 0, p.k)))?;
         }
@@ -3165,15 +3169,16 @@ fn decode_shared_down_stage(
         #[cfg(feature = "deltanet")]
         {
             // Single-row decode consumes only selector scalar[0] for the
-            // shared add. The gate stage already rounded it (BF16 recipes),
-            // and `bf16_scaled_add` rounds the sigmoid it reads, so neither
-            // side of the sigmoid needs another round trip.
+            // shared add. BF16 recipes round it on the way into the sigmoid;
+            // `bf16_scaled_add` rounds the sigmoid it reads, so no round trip
+            // follows. The shared gate/up are rounded as silu_mul reads them.
             let scalar_live = slice_moe_f32_view(scalar_buf, 0, 1);
-            hip!(gpu.sigmoid_f32(&scalar_live))?;
             let shared_hid = slice_moe_f32_view(p.ffn_hidden, 0, smi);
             if p.recipe.bf16_round_trip() {
+                hip!(gpu.sigmoid_bf16_in_f32(&scalar_live))?;
                 hip!(gpu.silu_mul_bf16_rt_f32(shared_gate, shared_up, &shared_hid))?;
             } else {
+                hip!(gpu.sigmoid_f32(&scalar_live))?;
                 hip!(gpu.silu_mul_f32(shared_gate, shared_up, &shared_hid))?;
             }
             static GEMV_QT44_QT53_SHARED_DOWN: LazyLock<GemvFamily> =
@@ -3704,7 +3709,9 @@ fn decode_down_stage(
             1,
             p.n_exp,
         ))?;
-        if p.recipe.bf16_round_trip() {
+        // The top-10 combine rounds every expert output it reads to BF16; a
+        // deferred combine may read the buffer elsewhere, so it keeps the pass.
+        if p.recipe.bf16_round_trip() && p.defer_routed_combine {
             hip!(gpu.bf16_round_trip_f32(&down_expanded))?;
         }
         return Ok(());

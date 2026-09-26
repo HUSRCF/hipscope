@@ -2079,6 +2079,7 @@ pub(super) fn produce_prefill_route<'a>(
                     params.topk_weights,
                     params.batch_size,
                     normalize,
+                    false,
                 )
                 .map_err(|e| DispatchError::Hip(e.to_string()))?;
             } else {
