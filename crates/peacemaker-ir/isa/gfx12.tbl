@@ -1,5 +1,5 @@
 # gfx1201, RDNA4 XML SHA-256 f8a290c8471e26a1071b08b61a33e4d9efa46ec6cedcdb8e5ba57d7969b60692; AMD LLVM 23.0.0git.
-# Census: KT48 first-op spellings, builder GFX1201 goldens, every symbol in
+# Census: all six KT48 code-object kernels, builder GFX1201 goldens, every symbol in
 # gemm_mq4g256v2_wmma_fp8_gfx12_b1.hxaco and gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1.hxaco.
 # name	form	opcode(hex)	XML operand grammar	defs	uses	implicit	counter:weight	objdump/llvm-mc example	LE dwords(hex)	field rules
 buffer_load_b64	buffer	0x15	VDATA:64,VADDR:64,RSRC:128,SOFFSET:32	VDATA	VADDR,RSRC,SOFFSET	-	Load:1	buffer_load_b64 v[0:1], v2, s[4:7], s8 offen	C4054008 40800800 00000002	w0_extra:ignored:0x3803f00:0x0,w1_extra:ignored:0x100:0x0,vbuffer_format:honored:0x3f800000:0x800000,vbuffer_offen:honored:0x40000000:0x0/0x40000000,vbuffer_idxen:honored:0x80000000:0x0,vbuffer_tfe:honored:0x400000:0x0,vbuffer_scope:honored:0xc0000:0x0,vbuffer_th:honored:0x700000:0x0,vbuffer_nv:honored:0x80:0x0
@@ -192,3 +192,31 @@ v_ldexp_f32	vop3	0x31c	VDST:32,SRC0:32,SRC1:32	VDST	SRC0,SRC1	-	-	v_ldexp_f32 v1
 v_rndne_f32_e32	vop1	0x23	VDST:32,SRC0:32	VDST	SRC0	-	-	v_rndne_f32_e32 v129, v128	7F024780	w0_extra:ignored:0x10000:0x0
 v_s_rcp_f32	vop3	0x284	VDST:32,SRC0:32	VDST	SRC0	-	-	v_s_rcp_f32 s99, s99	D6840063 02010063	src1_unused:ignored:0x1ff:0x00/0x80/0x101,src2_unused:ignored:0x1ff:0x00/0x80/0x101
 v_xor_b32_e32	vop2	0x1d	VDST:32,SRC0:32,VSRC1:32	VDST	SRC0,VSRC1	-	-	v_xor_b32_e32 v3, v3, v1	3A060303	-
+ds_bpermute_b32	ds	0xb3	VDST:32,ADDR:32,DATA0:32	VDST	ADDR,DATA0	-	Ds:1	ds_bpermute_b32 v4, v158, v5	DACC0000 0400059E	w0_extra:ignored:0x30000:0x0
+global_load_d16_b16	global	0x20	VDST:32,VADDR:64,SADDR:64	VDST	VADDR,SADDR,VDST	-	Load:1	global_load_d16_b16 v3, v[5:6], off offset:1024	EE08007C 00000003 00040005	w0_extra:ignored:0xc03f00:0x0,w1_extra:ignored:0x8001ff00:0x0,vsrc_unused:ignored:0x7f800000:0x0,global_sve:honored:0x20000:0x0,global_scope:honored:0xc0000:0x0,global_th:honored:0x700000:0x0,global_nv:honored:0x80:0x0
+global_load_d16_hi_u8	global	0x21	VDST:32,VADDR:64,SADDR:64	VDST	VADDR,SADDR,VDST	-	Load:1	global_load_d16_hi_u8 v139, v[2:3], off offset:6192	EE08407C 0000008B 00183002	w0_extra:ignored:0xc03f00:0x0,w1_extra:ignored:0x8001ff00:0x0,vsrc_unused:ignored:0x7f800000:0x0,global_sve:honored:0x20000:0x0,global_scope:honored:0xc0000:0x0,global_th:honored:0x700000:0x0,global_nv:honored:0x80:0x0
+global_load_d16_u8	global	0x1e	VDST:32,VADDR:64,SADDR:64	VDST	VADDR,SADDR,VDST	-	Load:1	global_load_d16_u8 v5, v[2:3], off	EE07807C 00000005 00000002	w0_extra:ignored:0xc03f00:0x0,w1_extra:ignored:0x8001ff00:0x0,vsrc_unused:ignored:0x7f800000:0x0,global_sve:honored:0x20000:0x0,global_scope:honored:0xc0000:0x0,global_th:honored:0x700000:0x0,global_nv:honored:0x80:0x0
+global_load_u8	global	0x10	VDST:32,VADDR:64,SADDR:64	VDST	VADDR,SADDR	-	Load:1	global_load_u8 v0, v[2:3], off offset:1032	EE04007C 00000000 00040802	w0_extra:ignored:0xc03f00:0x0,w1_extra:ignored:0x8001ff00:0x0,vsrc_unused:ignored:0x7f800000:0x0,global_sve:honored:0x20000:0x0,global_scope:honored:0xc0000:0x0,global_th:honored:0x700000:0x0,global_nv:honored:0x80:0x0
+global_store_b32	global	0x1a	VADDR:64,VSRC:32,SADDR:64	-	VADDR,VSRC,SADDR	-	Store:1	global_store_b32 v[1:2], v0, off	EE06807C 00000000 00000001	w0_extra:ignored:0xc03f00:0x0,w1_extra:ignored:0x8001ff00:0x0,global_sve:honored:0x20000:0x0,global_scope:honored:0xc0000:0x0,global_th:honored:0x700000:0x0,global_nv:honored:0x80:0x0
+global_store_b64	global	0x1b	VADDR:64,VSRC:64,SADDR:64	-	VADDR,VSRC,SADDR	-	Store:1	global_store_b64 v[4:5], v[12:13], off	EE06C07C 06000000 00000004	w0_extra:ignored:0xc03f00:0x0,w1_extra:ignored:0x8001ff00:0x0,global_sve:honored:0x20000:0x0,global_scope:honored:0xc0000:0x0,global_th:honored:0x700000:0x0,global_nv:honored:0x80:0x0
+s_ashr_i32	sop2	0xc	SDST:32,SSRC0:32,SSRC1:32	SDST	SSRC0,SSRC1	scc:w	-	s_ashr_i32 s5, ttmp7, 31	86059F73	-
+s_bitset0_b32	sop1	0x10	SDST:32,SSRC0:32	SDST	SSRC0,SDST	-	-	s_bitset0_b32 s6, 31	BE86109F	-
+s_cbranch_scc0	sopp	0x21	SIMM16:16	-	SIMM16	scc:r	-	s_cbranch_scc0 64772	BFA1FD04	-
+s_cmp_ge_f32	sopc	0x46	SSRC0:32,SSRC1:32	-	SSRC0,SSRC1	scc:w	-	s_cmp_ge_f32 s6, s4	BF460406	-
+s_fmac_f32	sop2	0x47	SDST:32,SSRC0:32,SSRC1:32	SDST	SSRC0,SSRC1,SDST	-	-	s_fmac_f32 s6, s0, s4	A3860400	-
+s_load_b64	smem	0x1	SDATA:64,SBASE:64,SOFFSET:32	SDATA	SBASE,SOFFSET	-	Km:1	s_load_b64 s[0:1], s[0:1], 0x20	F4002000 F8000020	w0_extra:ignored:0x2080000:0x0,w1_extra:ignored:0x1000000:0x0
+s_lshl4_add_u32	sop2	0x11	SDST:32,SSRC0:32,SSRC1:32	SDST	SSRC0,SSRC1	scc:w	-	s_lshl4_add_u32 s0, s28, s26	88801A1C	-
+s_movk_i32	sopk	0x0	SDST:32,SIMM16:16	SDST	SIMM16	-	-	s_movk_i32 s0, 0xc000	B000C000	-
+s_trunc_f32	sop1	0x62	SDST:32,SSRC0:32	SDST	SSRC0	-	-	s_trunc_f32 s20, s20	BE946214	-
+v_cmp_le_i32_e64	vop3	0x43	VDST:64,SRC0:32,SRC1:32	VDST	SRC0,SRC1	-	-	v_cmp_le_i32_e64 s8, v2, v170	D4430008 02035502	src2_unused:ignored:0x1ff:0x00/0x80/0x101
+v_cmp_lt_f32_e64	vop3	0x11	VDST:64,SRC0:32,SRC1:32	VDST	SRC0,SRC1	-	-	v_cmp_lt_f32_e64 s0, 0, v11	D4110000 02021680	src2_unused:ignored:0x1ff:0x00/0x80/0x101
+v_cmp_lt_u32_e32	vopc	0x49	SRC0:32,VSRC1:32,literal@last	implicit	SRC0,VSRC1	vcc:w	-	v_cmp_lt_u32_e32 vcc_lo, 0xdf, v3	7C9206FF 000000DF	-
+v_cmp_neq_f32_e32	vopc	0x1d	SRC0:32,VSRC1:32,literal@last	implicit	SRC0,VSRC1	vcc:w	-	v_cmp_neq_f32_e32 vcc_lo, 0xff800000, v168	7C3B50FF FF800000	-
+v_cmpx_gt_i32_e64	vop3	0xc4	VDST:64,SRC0:32,SRC1:32	VDST	SRC0,SRC1	exec:w	-	v_cmpx_gt_i32_e64 s7, v4	D4C4007E 02020807	src2_unused:ignored:0x1ff:0x00/0x80/0x101
+v_cmpx_gt_u32_e32	vopc	0xcc	SRC0:32,VSRC1:32	-	SRC0,VSRC1	exec:w	-	v_cmpx_gt_u32_e32 8, v6	7D980C88	-
+v_cmpx_lt_f32_e32	vopc	0x91	SRC0:32,VSRC1:32	-	SRC0,VSRC1	exec:w	-	v_cmpx_lt_f32_e32 0, v143	7D231E80	-
+v_cvt_f16_f32_e32	vop1	0xa	VDST:16,SRC0:32	VDST	SRC0,VDST	-	-	v_cvt_f16_f32_e32 v0.l, v0	7E001500	w0_extra:ignored:0x10000:0x0
+v_cvt_f32_f16_e32	vop1	0xb	VDST:32,SRC0:16	VDST	SRC0	-	-	v_cvt_f32_f16_e32 v3, v2.l	7E061702	w0_extra:ignored:0x10000:0x0
+v_dual_max_num_f32	vopd	0xa	VDSTX:32,SRCX0:32,VSRCX1:32	VDSTX	SRCX0,VSRCX1	-	-	v_dual_max_num_f32 v2, v2, v2 :: v_dual_lshlrev_b32 v13, 2, v13	CAA20502 020C1A82	-
+v_max_num_f32_e64	vop3	0x116	VDST:32,SRC0:32,SRC1:32	VDST	SRC0,SRC1	-	-	v_max_num_f32_e64 v0, |v5|, |v5|	D5160300 02020B05	src2_unused:ignored:0x1ff:0x00/0x80/0x101,neg:honored:0x7,abs:honored:0x7,omod:ignored:0x3:0x0/0x1/0x2/0x3
+v_mov_b16_e32	vop1	0x1c	VDST:16,SRC0:16	VDST	SRC0,VDST	-	-	v_mov_b16_e32 v5.h, 0	7F0A3880	w0_extra:ignored:0x10000:0x0

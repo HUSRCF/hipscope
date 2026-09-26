@@ -32,6 +32,10 @@ impl Effects {
             .ok_or(ValidateError::UnknownOpcode { op, form })?;
         let mut out = Self::default();
         let mut field_names = row.grammar.split(',').map(|s| s.split(':').next().unwrap_or(""));
+        // CMPX encodes the fixed EXEC destination as VDST, but it is not an operand.
+        if form == Form::Vop3 && row.name.starts_with("v_cmpx_") {
+            field_names.next();
+        }
         // VOPC's explicit printed `vcc_lo` destination is fieldless in XML.
         let prefix = usize::from(form == Form::Vopc && row.name.starts_with("v_cmp_")
             && matches!(operands.first(), Some(Operand::Special(Special::Vcc | Special::VccLo))));
