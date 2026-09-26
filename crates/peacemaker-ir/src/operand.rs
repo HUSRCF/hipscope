@@ -1,4 +1,4 @@
-use std::fmt;
+use std::fmt::{self, Write as _};
 use crate::{cfg::BlockId, reg::RegRef, wait::WaitImm};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Half { Hi, Lo }
@@ -7,13 +7,19 @@ pub enum Special { Vcc, VccLo, VccHi, Exec, ExecLo, ExecHi, Scc, M0, Null, Ttmp(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InlineConst { Integer(i8), FloatBits(u32), InvTwoPi }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ImmField { Sopp(i16), Sopk(i16), DsOffset0(u8), DsOffset1(u8), VmemOffset(i32), SmemOffset(i32), Unsigned(u32) }
+pub enum ImmField { Sopp(i16), Sopk(i16), DsOffset(u16), DsOffset0(u8), DsOffset1(u8), VmemOffset(i32), SmemOffset(i32), Unsigned(u32) }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HwReg { pub id: u8, pub offset: u8, pub size: u8 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Msg { pub id: u8, pub op: u8 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Depctr { SaSdst(u8), VaSdst(u8) }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CacheScope { Cu, Se, Dev, Sys }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VmemToken { Off, Offen }
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum Operand { Reg(RegRef), Special(Special), Inline(InlineConst), Literal(u32), Imm(ImmField), Label(BlockId), Hwreg(HwReg), SendMsg(Msg), Half(RegRef, Half) }
+pub enum Operand { Reg(RegRef), Special(Special), Inline(InlineConst), Literal(u32), Imm(ImmField), Label(BlockId), Hwreg(HwReg), SendMsg(Msg), Half(RegRef, Half), Depctr(Depctr), Scope(CacheScope), Vmem(VmemToken) }
 impl Operand {
     pub fn validate(&self) -> Result<(), String> {
         match self { Self::Reg(r) | Self::Half(r, _) => r.validate(),
@@ -33,14 +39,22 @@ impl fmt::Display for Operand {
             Self::Inline(InlineConst::InvTwoPi) => f.write_str("0.15915494"),
             Self::Literal(n) => write!(f, "{n:#x}"),
             Self::Imm(ImmField::Sopp(n) | ImmField::Sopk(n)) => write!(f, "{n}"),
+            Self::Imm(ImmField::DsOffset(n)) => write!(f, "offset:{n}"),
             Self::Imm(ImmField::DsOffset0(n)) => write!(f, "offset0:{n}"),
             Self::Imm(ImmField::DsOffset1(n)) => write!(f, "offset1:{n}"),
-            Self::Imm(ImmField::VmemOffset(n) | ImmField::SmemOffset(n)) => write!(f, "{n}"),
+            Self::Imm(ImmField::VmemOffset(n)) => write!(f, "offset:{n}"),
+            Self::Imm(ImmField::SmemOffset(n)) => write!(f, "{n}"),
             Self::Imm(ImmField::Unsigned(n)) => write!(f, "{n:#x}"),
             Self::Label(id) => write!(f, ".LBB{}", id.0),
             Self::Hwreg(r) => write!(f, "hwreg({}, {}, {})", r.id, r.offset, r.size),
+            Self::SendMsg(Msg { id: 3, op: 0 }) => f.write_str("sendmsg(MSG_DEALLOC_VGPRS)"),
             Self::SendMsg(m) => write!(f, "sendmsg({}, {})", m.id, m.op),
             Self::Half(r, part) => write!(f, "{r}.{}", match part { Half::Hi => "h", Half::Lo => "l" }),
+            Self::Depctr(Depctr::SaSdst(n)) => write!(f, "depctr_sa_sdst({n})"),
+            Self::Depctr(Depctr::VaSdst(n)) => write!(f, "depctr_va_sdst({n})"),
+            Self::Scope(s) => f.write_str(match s { CacheScope::Cu => "scope:SCOPE_CU", CacheScope::Se => "scope:SCOPE_SE", CacheScope::Dev => "scope:SCOPE_DEV", CacheScope::Sys => "scope:SCOPE_SYS" }),
+            Self::Vmem(VmemToken::Off) => f.write_str("off"),
+            Self::Vmem(VmemToken::Offen) => f.write_str("offen"),
         }
     }
 }
@@ -64,13 +78,11 @@ pub struct Modifiers {
     pub ds: DsMods, pub wait: Option<WaitImm>, pub delay: Option<DelayAluHint>, pub clause: Option<u8>,
 }
 impl Modifiers {
-    pub fn text_suffix(&self) -> String {
-        let mut out = String::new();
-        if self.neg_lo != 0 { out.push_str(&format!(" neg_lo:[{},{},{}]", self.neg_lo & 1, (self.neg_lo >> 1) & 1, (self.neg_lo >> 2) & 1)); }
-        if self.neg_hi != 0 { out.push_str(&format!(" neg_hi:[{},{},{}]", self.neg_hi & 1, (self.neg_hi >> 1) & 1, (self.neg_hi >> 2) & 1)); }
-        if self.op_sel != 0 { out.push_str(&format!(" op_sel:[{},{},{}]", self.op_sel & 1, (self.op_sel >> 1) & 1, (self.op_sel >> 2) & 1)); }
-        if self.op_sel_hi != 0 { out.push_str(&format!(" op_sel_hi:[{},{},{}]", self.op_sel_hi & 1, (self.op_sel_hi >> 1) & 1, (self.op_sel_hi >> 2) & 1)); }
+    pub fn append_text_suffix(&self, out: &mut String) {
+        if self.neg_lo != 0 { write!(out, " neg_lo:[{},{},{}]", self.neg_lo & 1, (self.neg_lo >> 1) & 1, (self.neg_lo >> 2) & 1).expect("String write"); }
+        if self.neg_hi != 0 { write!(out, " neg_hi:[{},{},{}]", self.neg_hi & 1, (self.neg_hi >> 1) & 1, (self.neg_hi >> 2) & 1).expect("String write"); }
+        if self.op_sel != 0 { write!(out, " op_sel:[{},{},{}]", self.op_sel & 1, (self.op_sel >> 1) & 1, (self.op_sel >> 2) & 1).expect("String write"); }
+        if self.op_sel_hi != 0 { write!(out, " op_sel_hi:[{},{},{}]", self.op_sel_hi & 1, (self.op_sel_hi >> 1) & 1, (self.op_sel_hi >> 2) & 1).expect("String write"); }
         if self.clamp { out.push_str(" clamp"); }
-        out
     }
 }

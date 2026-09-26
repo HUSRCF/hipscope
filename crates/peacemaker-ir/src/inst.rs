@@ -1,7 +1,8 @@
+use std::fmt::Write as _;
 use smallvec::SmallVec;
 use thiserror::Error;
 
-use crate::{cfg::{Body, InstId, Terminator}, descriptor::KernelDescriptor, effects::Effects, metadata::HsaKernelMetadata, operand::{Modifiers, Operand}, provenance::Provenance};
+use crate::{cfg::{Body, Terminator}, descriptor::KernelDescriptor, effects::Effects, metadata::HsaKernelMetadata, operand::{Modifiers, Operand}, provenance::Provenance};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum Arch { Gfx1010, Gfx1030, Gfx1100, Gfx1151, Gfx1201 }
@@ -31,6 +32,9 @@ pub enum Form { Sop1, Sop2, Sopc, Sopk, Sopp, Smem, Vop1, Vop2, Vopc, Vop3, Vop3
 pub enum FormFields {
     #[default] None,
     Vop3b { src2_unused: u16 },
+    /// VOPD is one instruction with two independently typed opcode halves.
+    /// The flattened operand list contains X then Y operands.
+    Vopd { y_op: Opcode, x_operands: u8 },
     Bits { ignored: SmallVec<[NamedField; 4]>, honored: SmallVec<[NamedField; 4]> },
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -51,21 +55,60 @@ impl Inst {
         let row = crate::isa::lookup(arch, self.op, self.form)
             .ok_or(ValidateError::UnknownOpcode { op: self.op, form: self.form })?;
         let mut text = row.name.to_owned();
-        if !self.operands.is_empty() {
-            text.push(' ');
-            for (index, operand) in self.operands.iter().enumerate() {
-                if index != 0 { text.push_str(", "); }
-                text.push_str(&operand.to_string());
+        let mut previous_operand = false;
+        for (index, operand) in self.operands.iter().enumerate() {
+            if let FormFields::Vopd { y_op, x_operands } = self.fields {
+                if index == usize::from(x_operands) {
+                    let y_name = y_op.name(arch).ok_or(ValidateError::UnknownOpcode { op: y_op, form: Form::Vopd })?;
+                    text.push_str(" :: ");
+                    text.push_str(y_name);
+                    previous_operand = false;
+                }
             }
+            if previous_operand {
+                if matches!(operand, Operand::Imm(crate::operand::ImmField::DsOffset(_) | crate::operand::ImmField::DsOffset0(_) | crate::operand::ImmField::DsOffset1(_) | crate::operand::ImmField::VmemOffset(_)) | Operand::Vmem(crate::operand::VmemToken::Offen)) {
+                    text.push(' ');
+                } else { text.push_str(", "); }
+            } else { text.push(' '); }
+            write!(&mut text, "{operand}").expect("String write");
+            previous_operand = true;
         }
-        text.push_str(&self.mods.text_suffix());
+        self.mods.append_text_suffix(&mut text);
         Ok(text)
+    }
+    pub fn from_parts(
+        arch: Arch, op: Opcode, form: Form, fields: FormFields,
+        operands: SmallVec<[Operand; 6]>, mods: Modifiers, literal: Option<u32>,
+        prov: Provenance,
+    ) -> Result<Self, ValidateError> {
+        let effects = if let FormFields::Vopd { y_op, x_operands } = &fields {
+            let split = usize::from(*x_operands);
+            if split == 0 || split >= operands.len() {
+                return Err(ValidateError::Operand("VOPD operand split is outside the packet".into()));
+            }
+            let mut x = Effects::from_table(arch, op, form, &operands[..split])?;
+            let y = Effects::from_table(arch, *y_op, Form::Vopd, &operands[split..])?;
+            x.defs.extend(y.defs);
+            x.uses.extend(y.uses);
+            x.implicit.reads |= y.implicit.reads;
+            x.implicit.writes |= y.implicit.writes;
+            x
+        } else { Effects::from_table(arch, op, form, &operands)? };
+        let inst = Self { op, form, fields, operands, mods, literal, effects, prov };
+        inst.validate(arch)?;
+        Ok(inst)
     }
     pub fn validate(&self, arch: Arch) -> Result<(), ValidateError> {
         let row = crate::isa::lookup(arch, self.op, self.form)
             .ok_or(ValidateError::UnknownOpcode { op: self.op, form: self.form })?;
         for operand in &self.operands {
             operand.validate().map_err(|reason| ValidateError::Operand(reason))?;
+        }
+        if let FormFields::Vopd { y_op, x_operands } = self.fields {
+            if self.form != Form::Vopd || usize::from(x_operands) >= self.operands.len()
+                || crate::isa::lookup(arch, y_op, Form::Vopd).is_none() {
+                return Err(ValidateError::Operand("VOPD must have both typed opcode halves and operands".into()));
+            }
         }
         if let FormFields::Vop3b { src2_unused } = self.fields {
             if src2_unused > 0x1ff || src2_unused == 0xff {
@@ -76,6 +119,9 @@ impl Inst {
             }
         }
         for field in self.fields.ignored() {
+            if field.name == "src2_unused" && field.value == 0xff {
+                return Err(ValidateError::DangerousFill { field: "src2_unused", value: field.value });
+            }
             let rule = row.fields.iter().find(|rule| rule.name == field.name)
                 .ok_or(ValidateError::UnknownDontCare { field: field.name, value: field.value })?;
             if rule.class != crate::isa::FieldClass::Ignored || !rule.allowed.contains(&field.value) {
@@ -88,13 +134,15 @@ impl Inst {
             if rule.class != crate::isa::FieldClass::Honored || field.value & !rule.mask != 0 {
                 return Err(ValidateError::UnmodeledField { field: field.name });
             }
+            if !rule.allowed.is_empty() && !rule.allowed.contains(&field.value) {
+                return Err(ValidateError::UnsupportedFieldValue { field: field.name, value: field.value });
+            }
         }
         if matches!(self.form, Form::Smem) {
-            for operand in &self.operands {
-                if let Operand::Reg(reg) = operand {
-                    if reg.kind == crate::reg::Kind::S && reg.len > 1 && reg.base % u16::from(reg.len) != 0 {
-                        return Err(ValidateError::MisalignedSmemSdata { base: reg.base, len: reg.len });
-                    }
+            if let Some(Operand::Reg(reg)) = self.operands.first() {
+                if reg.kind == crate::reg::Kind::S && reg.len > 1
+                    && reg.base % u16::from(reg.len.next_power_of_two().min(4)) != 0 {
+                    return Err(ValidateError::MisalignedSmemSdata { base: reg.base, len: reg.len });
                 }
             }
         }
@@ -136,6 +184,8 @@ pub enum ValidateError {
     UnknownDontCare { field: &'static str, value: u32 },
     #[error("field {field} has no known encoding rule")]
     UnmodeledField { field: &'static str },
+    #[error("semantic field {field} value {value:#x} is outside the modeled form")]
+    UnsupportedFieldValue { field: &'static str, value: u32 },
     #[error("unused field {field} value {value:#x} is the literal selector or out of range")]
     DangerousFill { field: &'static str, value: u32 },
     #[error("SMEM SDATA s{base} length {len} must be aligned")]
@@ -147,9 +197,27 @@ pub enum ValidateError {
 }
 impl Program {
     pub fn validate(&self) -> Result<(), ValidateError> {
-        let mut regions = Vec::new();
-        for kernel in &self.kernels {
+        for (index, kernel) in self.kernels.iter().enumerate() {
+            if self.kernels[..index].iter().any(|previous| previous.symbol == kernel.symbol) {
+                return Err(ValidateError::Layout("two kernels share a symbol".into()));
+            }
+            match &kernel.abi {
+                Abi::Hsa { descriptor, metadata } => {
+                    if metadata.parsed.symbol != format!("{}.kd", kernel.symbol.0) {
+                        return Err(ValidateError::Layout("HSA metadata symbol does not match descriptor symbol".into()));
+                    }
+                    if descriptor.kernel_code_properties.wave32() != (kernel.wave == Wave::Wave32) {
+                        return Err(ValidateError::Layout("kernel wave disagrees with descriptor".into()));
+                    }
+                }
+                Abi::Raw { wave, .. } if *wave != kernel.wave =>
+                    return Err(ValidateError::Layout("raw ABI wave disagrees with kernel".into())),
+                Abi::Raw { .. } => {}
+            }
             let body = &kernel.body;
+            if body.layout.is_empty() || body.blocks.is_empty() {
+                return Err(ValidateError::Layout("kernel body must contain instructions and a CFG entry".into()));
+            }
             let mut seen = vec![false; body.insts.len()];
             for &id in &body.layout {
                 let Some(slot) = seen.get_mut(id.0) else { return Err(ValidateError::Layout("layout refers to missing slot".into())); };
@@ -170,18 +238,64 @@ impl Program {
                 for &succ in &block.succs {
                     if body.blocks.get(succ.0).is_none() { return Err(ValidateError::Layout("edge leaves CFG".into())); }
                 }
+                let last = body.insts.get(body.layout[block.range.1 - 1])
+                    .expect("layout instructions were checked above");
+                let name = last.op.name(self.target.arch)
+                    .ok_or(ValidateError::UnknownOpcode { op: last.op, form: last.form })?;
+                let matches_term = match &block.term {
+                    Terminator::EndPgm => name == "s_endpgm",
+                    Terminator::Jump(_) => name == "s_branch",
+                    Terminator::Branch { .. } => name.starts_with("s_cbranch_"),
+                    Terminator::FallThrough => name != "s_endpgm" && name != "s_branch" && !name.starts_with("s_cbranch_"),
+                    Terminator::Unreachable => true,
+                };
+                if !matches_term {
+                    return Err(ValidateError::Layout("block terminator disagrees with encoded last instruction".into()));
+                }
                 cursor = block.range.1;
             }
             if cursor != body.layout.len() { return Err(ValidateError::Layout("blocks do not cover layout".into())); }
-            if !body.blocks.is_empty() && !body.blocks.iter().any(|b| b.term == Terminator::EndPgm) {
-                return Err(ValidateError::Layout("missing s_endpgm terminator".into()));
+            if !body.blocks.is_empty() {
+                let mut reached = vec![false; body.blocks.len()];
+                let mut frontier = Vec::with_capacity(body.blocks.len());
+                frontier.push(crate::cfg::BlockId(0));
+                let mut has_exit = false;
+                while let Some(id) = frontier.pop() {
+                    if std::mem::replace(&mut reached[id.0], true) { continue; }
+                    let block = &body.blocks[id.0];
+                    let expected: SmallVec<[crate::cfg::BlockId; 2]> = match &block.term {
+                        Terminator::FallThrough if id.0 + 1 < body.blocks.len() =>
+                            smallvec::smallvec![crate::cfg::BlockId(id.0 + 1)],
+                        Terminator::FallThrough => SmallVec::new(),
+                        Terminator::Jump(to) => smallvec::smallvec![*to],
+                        Terminator::Branch { taken, fallthrough, .. } => smallvec::smallvec![*taken, *fallthrough],
+                        Terminator::EndPgm => { has_exit = true; SmallVec::new() },
+                        Terminator::Unreachable => return Err(ValidateError::Layout("reachable unreachable-block terminator".into())),
+                    };
+                    if block.succs.len() != expected.len() || expected.iter().any(|edge| !block.succs.contains(edge)) {
+                        return Err(ValidateError::Layout("terminator and successor edges disagree".into()));
+                    }
+                    if expected.is_empty() && block.term != Terminator::EndPgm {
+                        return Err(ValidateError::Layout("reachable path has no s_endpgm".into()));
+                    }
+                    for next in expected {
+                        if !body.blocks[next.0].preds.contains(&id) {
+                            return Err(ValidateError::Layout("predecessor and successor edges disagree".into()));
+                        }
+                        frontier.push(next);
+                    }
+                }
+                if !has_exit { return Err(ValidateError::Layout("no reachable s_endpgm".into())); }
             }
             if let KernelOrigin::Frontend { entry_va, size, .. } = &kernel.origin {
                 let end = entry_va.checked_add(*size).ok_or_else(|| ValidateError::KernelOverlap(kernel.symbol.0.clone()))?;
-                if regions.iter().any(|&(lo, hi)| *entry_va < hi && lo < end) {
+                if self.kernels[..index].iter().any(|previous| {
+                    if let KernelOrigin::Frontend { entry_va: lo, size: previous_size, .. } = &previous.origin {
+                        lo.checked_add(*previous_size).is_none_or(|hi| *entry_va < hi && *lo < end)
+                    } else { false }
+                }) {
                     return Err(ValidateError::KernelOverlap(kernel.symbol.0.clone()));
                 }
-                regions.push((*entry_va, end));
             }
         }
         Ok(())

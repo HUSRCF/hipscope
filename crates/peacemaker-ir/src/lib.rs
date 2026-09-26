@@ -22,6 +22,96 @@ pub use inst::{Arch, Form, FormFields, Inst, Kernel, Opcode, Program, Target};
 mod tests {
     use super::*;
     use std::{collections::{HashMap, HashSet}, process::Command};
+    #[test]
+    fn builder_gfx1201_golden_spellings_print_from_typed_operands() {
+        use operand::{CacheScope, Depctr, ImmField, InlineConst, Msg, Operand as O, VmemToken};
+        use reg::{Kind, RegRef};
+        fn v(base: u16, len: u8) -> O { O::Reg(RegRef { kind: Kind::V, base, len }) }
+        fn s(base: u16, len: u8) -> O { O::Reg(RegRef { kind: Kind::S, base, len }) }
+        fn u(value: u32) -> O { O::Imm(ImmField::Unsigned(value)) }
+        fn render(name: &str, operands: Vec<O>, mods: operand::Modifiers, fields: FormFields) -> String {
+            let row = isa::gfx12().iter().find(|r| r.name == name).unwrap();
+            Inst::from_parts(Arch::Gfx1201, row.op, row.form, fields,
+                operands.into_iter().collect(), mods, None, Default::default())
+                .unwrap().text(Arch::Gfx1201).unwrap()
+        }
+        let plain = operand::Modifiers::default();
+        let wmma = operand::Modifiers { neg_lo: 3, ..plain.clone() };
+        let mul = isa::gfx12().iter().find(|r| r.name == "v_dual_mul_f32").unwrap().op;
+        let fmac = isa::gfx12().iter().find(|r| r.name == "v_dual_fmac_f32").unwrap().op;
+        let expected = [
+            (render("s_wait_loadcnt", vec![u(3)], plain.clone(), FormFields::None), "s_wait_loadcnt 0x3"),
+            (render("s_wait_dscnt", vec![u(1)], plain.clone(), FormFields::None), "s_wait_dscnt 0x1"),
+            (render("s_wait_loadcnt_dscnt", vec![u(0x205)], plain.clone(), FormFields::None), "s_wait_loadcnt_dscnt 0x205"),
+            (render("s_wait_kmcnt", vec![u(0)], plain.clone(), FormFields::None), "s_wait_kmcnt 0x0"),
+            (render("s_wait_alu", vec![O::Depctr(Depctr::SaSdst(0))], plain.clone(), FormFields::None), "s_wait_alu depctr_sa_sdst(0)"),
+            (render("s_wait_alu", vec![O::Depctr(Depctr::VaSdst(0))], plain.clone(), FormFields::None), "s_wait_alu depctr_va_sdst(0)"),
+            (render("s_barrier_signal", vec![O::Imm(ImmField::Sopp(-1))], plain.clone(), FormFields::None), "s_barrier_signal -1"),
+            (render("s_barrier_wait", vec![u(0xffff)], plain.clone(), FormFields::None), "s_barrier_wait 0xffff"),
+            (render("global_inv", vec![O::Scope(CacheScope::Se)], plain.clone(), FormFields::None), "global_inv scope:SCOPE_SE"),
+            (render("v_wmma_i32_16x16x32_iu4", vec![v(57,8), v(71,2), v(1,2), O::Inline(InlineConst::Integer(0))], wmma, FormFields::None),
+                "v_wmma_i32_16x16x32_iu4 v[57:64], v[71:72], v[1:2], 0 neg_lo:[1,1,0]"),
+            (render("v_swmmac_i32_16x16x64_iu4", vec![v(0,8),v(8,2),v(10,4),v(14,1)], plain.clone(), FormFields::None),
+                "v_swmmac_i32_16x16x64_iu4 v[0:7], v[8:9], v[10:13], v14"),
+            (render("v_dual_mul_f32", vec![v(83,1),v(97,1),v(81,1),v(84,1),v(98,1),v(81,1)], plain.clone(), FormFields::Vopd { y_op: mul, x_operands: 3 }),
+                "v_dual_mul_f32 v83, v97, v81 :: v_dual_mul_f32 v84, v98, v81"),
+            (render("v_dual_fmac_f32", vec![v(163,1),v(83,1),v(57,1),v(166,1),v(84,1),v(58,1)], plain.clone(), FormFields::Vopd { y_op: fmac, x_operands: 3 }),
+                "v_dual_fmac_f32 v163, v83, v57 :: v_dual_fmac_f32 v166, v84, v58"),
+            (render("buffer_load_b64", vec![v(0,2),v(2,1),s(4,4),s(8,1),O::Vmem(VmemToken::Offen)], plain.clone(), FormFields::None),
+                "buffer_load_b64 v[0:1], v2, s[4:7], s8 offen"),
+            (render("ds_load_2addr_stride64_b64", vec![v(71,4),v(81,1),O::Imm(ImmField::DsOffset1(1))], plain.clone(), FormFields::None),
+                "ds_load_2addr_stride64_b64 v[71:74], v81 offset1:1"),
+            (render("s_clause", vec![u(1)], plain.clone(), FormFields::None), "s_clause 0x1"),
+            (render("v_cvt_f32_i32_e32", vec![v(57,1),v(57,1)], plain.clone(), FormFields::None), "v_cvt_f32_i32_e32 v57, v57"),
+            (render("s_sendmsg", vec![O::SendMsg(Msg{id:3,op:0})], plain.clone(), FormFields::None), "s_sendmsg sendmsg(MSG_DEALLOC_VGPRS)"),
+            (render("s_endpgm", vec![], plain, FormFields::None), "s_endpgm"),
+        ];
+        assert_eq!(expected.len(), 19);
+        for (actual, canonical) in expected { assert_eq!(actual, canonical); }
+    }
+
+    #[test]
+    fn program_rejects_reachable_path_without_endpgm_and_wave_mismatch() {
+        use cfg::{Block, BlockId, Terminator};
+        use inst::{Abi, Envelope, KernelOrigin, Setting, SymbolId, Wave};
+        let row = isa::gfx12().iter().find(|row| row.name == "s_endpgm").unwrap();
+        let end = Inst::from_parts(Arch::Gfx1201, row.op, row.form, FormFields::None,
+            Default::default(), Default::default(), None, Default::default()).unwrap();
+        let mut body = Body::default();
+        let id = body.insts.insert(end);
+        body.layout.push(id);
+        body.blocks.push(Block { id: BlockId(0), range: (0, 1), term: Terminator::EndPgm,
+            preds: Default::default(), succs: Default::default() });
+        let mut program = Program {
+            target: Target { arch: Arch::Gfx1201, xnack: Setting::Any, sramecc: Setting::Any, abi_version: 4 },
+            kernels: vec![Kernel { symbol: SymbolId("test".into()), wave: Wave::Wave32,
+                abi: Abi::Raw { user_sgprs: vec![], wave: Wave::Wave32, lds_bytes: 0, sidecar_sha256: [0; 32] },
+                body, origin: KernelOrigin::Authored { builder_crate: "test".into(), version: "1".into(), git: "0".into() } }],
+            envelope: Envelope::default(),
+        };
+        program.validate().unwrap();
+        program.kernels[0].body.blocks[0].term = Terminator::FallThrough;
+        assert!(matches!(&program.validate(), Err(inst::ValidateError::Layout(reason)) if reason.contains("terminator disagrees")));
+        program.kernels[0].body.blocks[0].term = Terminator::EndPgm;
+        program.kernels[0].wave = Wave::Wave64;
+        assert!(matches!(&program.validate(), Err(inst::ValidateError::Layout(reason)) if reason.contains("raw ABI wave")));
+    }
+
+    #[test]
+    fn vopd_packet_has_two_defs_and_fmac_reads_each_destination() {
+        use operand::Operand;
+        use reg::{Kind, RegRef};
+        fn v(n: u16) -> Operand { Operand::Reg(RegRef { kind: Kind::V, base: n, len: 1 }) }
+        let row = isa::gfx12().iter().find(|row| row.name == "v_dual_fmac_f32").unwrap();
+        let inst = Inst::from_parts(Arch::Gfx1201, row.op, row.form,
+            FormFields::Vopd { y_op: row.op, x_operands: 3 },
+            [v(163),v(83),v(57),v(166),v(84),v(58)].into_iter().collect(),
+            Default::default(), None, Default::default()).unwrap();
+        assert_eq!(inst.effects.defs.as_slice(), &[RegRef { kind: Kind::V, base: 163, len: 1 },
+            RegRef { kind: Kind::V, base: 166, len: 1 }]);
+        assert!(inst.effects.uses.contains(&RegRef { kind: Kind::V, base: 163, len: 1 }));
+        assert!(inst.effects.uses.contains(&RegRef { kind: Kind::V, base: 166, len: 1 }));
+    }
 
     #[test]
     fn opcode_examples_match_pinned_llvm_mc_for_every_declared_form() {
