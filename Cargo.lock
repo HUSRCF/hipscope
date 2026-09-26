@@ -2423,6 +2423,7 @@ dependencies = [
  "proptest",
  "rmpv",
  "sha2",
+ "smallvec",
  "thiserror 2.0.18",
 ]
 

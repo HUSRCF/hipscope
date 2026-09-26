@@ -40,6 +40,11 @@ pub(crate) mod support {
             }
             return Ok(Some(Toolchain { objdump, mc }));
         }
+        // Test hook: exercise the committed-fixture fallback on machines
+        // that do have a toolchain.
+        if std::env::var("PEACEMAKER_NO_ROCM").is_ok() {
+            return Ok(None);
+        }
         let root = PathBuf::from("/opt/rocm/core-10.0");
         let objdump = root.join(BIN).join("llvm-objdump");
         let mc = root.join(BIN).join("llvm-mc");
@@ -87,27 +92,38 @@ pub(crate) mod support {
                 continue;
             }
             let comment = body[mark + 2..].trim();
-            let mut parts = comment.split_whitespace();
-            let addr = parts.next().and_then(|a| {
-                u32::from_str_radix(a.trim_end_matches(':'), 16).ok()
-            });
-            let Some(addr) = addr else { continue };
             let mut words = Vec::new();
             let mut ann = String::new();
-            for tok in parts {
+            let mut seen_addr = false;
+            let mut addr = 0u32;
+            for tok in comment.split_whitespace() {
+                if !seen_addr {
+                    seen_addr = true;
+                    addr = match u32::from_str_radix(
+                        tok.trim_end_matches(':'),
+                        16,
+                    ) {
+                        Ok(a) => a,
+                        Err(_) => continue,
+                    };
+                    continue;
+                }
                 if let Some(a) = tok.strip_prefix('<') {
                     ann = format!("<{a}");
-                    for rest in parts {
-                        ann.push(' ');
-                        ann.push_str(rest);
-                    }
+                    // Remainder of the comment is the annotation tail.
+                    let tail_start = comment.find(tok).unwrap() + tok.len();
+                    ann.push_str(&comment[tail_start..].replace(' ', " "));
+                    ann = ann.split_whitespace().collect::<Vec<_>>().join(" ");
                     break;
                 }
-                if tok.len() == 8
-                    && let Ok(w) = u32::from_str_radix(tok, 16)
-                {
-                    words.push(w);
+                if tok.len() == 8 {
+                    if let Ok(w) = u32::from_str_radix(tok, 16) {
+                        words.push(w);
+                    }
                 }
+            }
+            if !seen_addr {
+                continue;
             }
             out.push(ObjdumpLine { addr, words, text, ann });
         }
@@ -178,5 +194,141 @@ pub(crate) mod support {
             ));
         }
         Ok(encodings)
+    }
+/// Bits the canonical syntax cannot spell: don't-care fields plus
+/// modifiers the printer omits (op_sel on rows without 16-bit
+/// operands). `llvm-mc` fills those with its defaults; anything else
+/// must round-trip exactly.
+use peacemaker_ir::{
+        codec::gfx12,
+        inst::{Arch, Form, FormFields, Inst},
+        isa,
+    };
+
+    /// Bits the canonical syntax cannot spell (moved here for T9/parser
+    /// sharing; see the printer docs for the rule derivations).
+    pub(crate) fn lossy_mask(inst: &Inst) -> [u32; 3] {
+    let mut mask = [0u32; 3];
+    match &inst.fields {
+        FormFields::Vop3b { .. } => mask[1] |= 0x1ff << 18,
+        FormFields::Bits { ignored, .. } => {
+            for field in ignored {
+                match field.name {
+                    "src2_unused" => mask[1] |= 0x1ff << 18,
+                    "src1_unused" => mask[1] |= 0x1ff << 9,
+                    "w0_extra" | "wait_unused" => {
+                        if let Some(rule) = isa::lookup(
+                            Arch::Gfx1201,
+                            inst.op,
+                            inst.form,
+                        )
+                        .and_then(|row| {
+                            row.fields
+                                .iter()
+                                .find(|r| r.name == field.name)
+                        }) {
+                            mask[0] |= rule.mask;
+                        }
+                    }
+                    "w1_extra" | "vsrc_unused" => {
+                        if let Some(rule) = isa::lookup(
+                            Arch::Gfx1201,
+                            inst.op,
+                            inst.form,
+                        )
+                        .and_then(|row| {
+                            row.fields
+                                .iter()
+                                .find(|r| r.name == field.name)
+                        }) {
+                            mask[1] |= rule.mask;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        FormFields::None | FormFields::Vopd { .. } => {}
+    }
+    // Omitted op_sel modifiers (no 16-bit operand rows print none).
+    let row =
+        isa::lookup(Arch::Gfx1201, inst.op, inst.form).unwrap();
+    let has16 = row
+        .grammar
+        .split(',')
+        .any(|part| part.ends_with(":16"));
+    if !has16
+        && (inst.mods.op_sel != 0 || inst.mods.op_sel_hi != 0)
+    {
+        match inst.form {
+            Form::Vop3 => mask[0] |= 0xf << 11,
+            Form::Vop3p => {
+                mask[0] |= 0x7 << 11;
+                mask[1] |= 0x3 << 27;
+                mask[0] |= 0x1 << 14;
+            }
+            _ => {}
+        }
+    }
+    mask
+}
+
+#[derive(Debug, PartialEq)]
+pub(crate) enum Parity {
+    Exact,
+    Reported,
+    Mismatch,
+}
+
+pub(crate) fn classify(
+    inst: &Inst,
+    mc_words: &[u32],
+) -> Result<Parity, String> {
+    let enc = gfx12::encode(inst)
+        .map_err(|e| format!("encode failed: {e}"))?;
+    if enc.as_slice() == mc_words {
+        return Ok(Parity::Exact);
+    }
+    let mask = lossy_mask(inst);
+    let masked_eq = enc.len() == mc_words.len()
+        && enc
+            .iter()
+            .zip(mc_words.iter())
+            .enumerate()
+            .all(|(i, (a, b))| {
+                let m = mask.get(i).copied().unwrap_or(0);
+                (a ^ b) & !m == 0 && (a ^ b) & m == (a ^ b)
+            });
+    if masked_eq && !mask.iter().all(|m| *m == 0) {
+        // Differs, but only inside unspellable bits: reported, and the
+        // semantics must still agree (re-decode check).
+        let (back, n) = gfx12::decode(mc_words)
+            .map_err(|e| format!("re-decode of mc bytes failed: {e}"))?;
+        if n != mc_words.len()
+            || back.op != inst.op
+            || back.form != inst.form
+            || back.operands != inst.operands
+            || back.mods != inst.mods
+            || back.literal != inst.literal
+        {
+            return Ok(Parity::Mismatch);
+        }
+        return Ok(Parity::Reported);
+    }
+    Ok(Parity::Mismatch)
+}
+
+
+    /// Modifiers with textually invisible bits cleared (mirrors the
+    /// printer omit rule), for semantic comparisons.
+    pub(crate) fn masked_mods(inst: &Inst) -> peacemaker_ir::operand::Modifiers {
+        let mut mods = inst.mods.clone();
+        let row = isa::lookup(Arch::Gfx1201, inst.op, inst.form).unwrap();
+        let has16 = row.grammar.split(',').any(|part| part.ends_with(":16"));
+        if !has16 {
+            mods.op_sel = 0;
+            mods.op_sel_hi = 0;
+        }
+        mods
     }
 }
