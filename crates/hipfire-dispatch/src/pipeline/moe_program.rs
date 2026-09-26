@@ -486,6 +486,7 @@ impl<'a> SealedMoeOp<'a> {
                 .then_some(params.x_rot_local),
             shared_gate,
             shared_up,
+            selection.route,
         )
     }
 
@@ -707,6 +708,7 @@ impl<'a> SealedMoeOp<'a> {
                     .then_some(params.x_rot_local),
                 shared_gate,
                 shared_up,
+                selection.route,
             );
         }
         let (params, selection) = self.state.prefill_parts()?;

@@ -2818,6 +2818,7 @@ fn decode_gate_side_stage(
     x_rot_local: Option<&GpuTensor>,
     shared_gate: &GpuTensor,
     shared_up: &GpuTensor,
+    route: Option<MoeRouteCapability>,
 ) -> Result<(), DispatchError> {
     let shared = p.shared.as_ref().ok_or_else(|| {
         DispatchError::Hip("shared gate-side stage requires shared weights".into())
@@ -3019,8 +3020,12 @@ fn decode_gate_side_stage(
         // single scalar, and the already-live-sized shared gate/up slices.
         hip!(gpu.bf16_round_trip_f32(&slice_moe_f32_view(p.router_logits, 0, p.n_exp)))?;
         hip!(gpu.bf16_round_trip_f32(&slice_moe_f32_view(scalar_buf, 0, 1)))?;
-        hip!(gpu.bf16_round_trip_f32(shared_gate))?;
-        hip!(gpu.bf16_round_trip_f32(shared_up))?;
+        // The grouped route's shared activation (`silu_mul_bf16_rt_f32`) rounds
+        // gate and up as it reads them; a round trip here would be repeated.
+        if route != Some(MoeRouteCapability::Qt44Qt53Grouped) || p.skip_shared {
+            hip!(gpu.bf16_round_trip_f32(shared_gate))?;
+            hip!(gpu.bf16_round_trip_f32(shared_up))?;
+        }
     }
     Ok(())
 }
@@ -3160,20 +3165,16 @@ fn decode_shared_down_stage(
         #[cfg(feature = "deltanet")]
         {
             // Single-row decode consumes only selector scalar[0] for the
-            // shared add, regardless of BF16 or F32 accumulation. Round
-            // that live element, not the prefill-sized scratch buffer.
+            // shared add. The gate stage already rounded it (BF16 recipes),
+            // and `bf16_scaled_add` rounds the sigmoid it reads, so neither
+            // side of the sigmoid needs another round trip.
             let scalar_live = slice_moe_f32_view(scalar_buf, 0, 1);
-            if p.recipe.bf16_round_trip() {
-                hip!(gpu.bf16_round_trip_f32(&scalar_live))?;
-            }
             hip!(gpu.sigmoid_f32(&scalar_live))?;
-            if p.recipe.bf16_round_trip() {
-                hip!(gpu.bf16_round_trip_f32(&scalar_live))?;
-            }
             let shared_hid = slice_moe_f32_view(p.ffn_hidden, 0, smi);
-            hip!(gpu.silu_mul_f32(shared_gate, shared_up, &shared_hid))?;
             if p.recipe.bf16_round_trip() {
-                hip!(gpu.bf16_round_trip_f32(&shared_hid))?;
+                hip!(gpu.silu_mul_bf16_rt_f32(shared_gate, shared_up, &shared_hid))?;
+            } else {
+                hip!(gpu.silu_mul_f32(shared_gate, shared_up, &shared_hid))?;
             }
             static GEMV_QT44_QT53_SHARED_DOWN: LazyLock<GemvFamily> =
                 LazyLock::new(GemvFamily::new);
@@ -3193,9 +3194,10 @@ fn decode_shared_down_stage(
                     .map_err(|e| DispatchError::Hip(e.to_string()))?;
             }
             // One live row of the shared-expert output (the buffer is the
-            // prefill chunk cap wide).
+            // prefill chunk cap wide). `bf16_scaled_add` rounds the residual,
+            // the value and the gate it reads and stores a BF16-exact sum, so
+            // no round trip brackets it.
             if p.recipe.bf16_round_trip() {
-                hip!(gpu.bf16_round_trip_f32(&slice_moe_f32_view(p.ffn_out, 0, p.hidden)))?;
                 hip!(bf16_scaled_add(
                     gpu,
                     &Bf16ScaledAdd {
@@ -3205,7 +3207,6 @@ fn decode_shared_down_stage(
                         elements: p.hidden,
                     },
                 ))?;
-                hip!(gpu.bf16_round_trip_f32(&slice_moe_f32_view(out_target, 0, p.hidden)))?;
             } else {
                 hip!(gpu.scaled_add_inplace_gpu_scalar_f32(out_target, p.ffn_out, scalar_buf))?;
             }
@@ -3395,10 +3396,8 @@ fn decode_gate_up_stage(
             p.hidden,
             1,
         ))?;
-        if p.recipe.bf16_round_trip() {
-            hip!(gpu.bf16_round_trip_f32(&gate_batch))?;
-            hip!(gpu.bf16_round_trip_f32(&up_batch))?;
-        }
+        // BF16 recipes round gate and up where the activation reads them
+        // (`silu_mul_bf16_rt_f32`), their only reader.
         return Ok(());
     }
     if ninepath_d3 {
@@ -3603,9 +3602,10 @@ fn decode_activation_stage(
         let gate_batch = slice_moe_f32_view(p.gate_batch, 0, routed_slots);
         let up_batch = slice_moe_f32_view(p.up_batch, 0, routed_slots);
         let rot_batch = slice_moe_f32_view(p.rot_batch, 0, routed_slots);
-        hip!(gpu.silu_mul_f32(&gate_batch, &up_batch, &rot_batch))?;
         if p.recipe.bf16_round_trip() {
-            hip!(gpu.bf16_round_trip_f32(&rot_batch))?;
+            hip!(gpu.silu_mul_bf16_rt_f32(&gate_batch, &up_batch, &rot_batch))?;
+        } else {
+            hip!(gpu.silu_mul_f32(&gate_batch, &up_batch, &rot_batch))?;
         }
         hip!(gpu.rotate_x_mq_128_v2(&rot_batch, &rot_batch, p.mi, p.k))?;
         return Ok(());
@@ -4226,7 +4226,14 @@ fn decode_combine_stage(
             1,
         ))?;
     }
-    if p.recipe.bf16_round_trip() {
+    // The grouped route's shared stage then adds into this same target with
+    // `bf16_scaled_add`, which rounds the residual it reads: the round trip is
+    // owed only when nothing follows (mirrors the grouped prefill combine).
+    let shared_add_follows = route == Some(MoeRouteCapability::Qt44Qt53Grouped)
+        && p.recipe.shared_after_combine()
+        && !p.skip_shared
+        && p.ep_mode == crate::families::moe::MoeEpMode::None;
+    if p.recipe.bf16_round_trip() && !shared_add_follows {
         // One live row: the target may be allocated to the prefill chunk cap.
         hip!(gpu.bf16_round_trip_f32(&slice_moe_f32_view(target, 0, p.hidden)))?;
     }
