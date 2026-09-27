@@ -12,8 +12,13 @@
 //! `INSTSKIP = SIMM16[6:4]` selects the instruction carrying the second
 //! dependency (`SAME` = same next instruction, `NEXT` = the one after,
 //! `SKIP_N` = N further), `INSTID1 = SIMM16[10:7]` names its hazard. Each
-//! INSTID counts backwards N previously issued VALU on the executed path
-//! (branched-over instructions do not count; EXEC-skipped VALU do). Values:
+//! INSTID counts backwards on the executed path (branched-over instructions do
+//! not count; EXEC-skipped VALU do): `VALU_DEP_n` counts non-TRANS VALUs,
+//! `TRANS32_DEP_n` TRANS ones (LLVM `AMDGPUInsertDelayAlu`), from the
+//! instruction it applies to: INSTID0 from the next instruction, INSTID1 from
+//! the one INSTSKIP selects, so VALUs between the two consumers count for
+//! INSTID1 (RDNA4 §16.5 p270 example: `SKIP_1` + `VALU_DEP_1` names the
+//! skipped `v_sub_f32 v11`, which `v_mul_f32 v10, v13, v11` reads). Values:
 //! 0 = NO_DEP, 1-4 = VALU_DEP_n, 5-7 = TRANS32_DEP_n, 8 = FMA_ACCUM_CYCLE_1
 //! (reserved), 9-11 = SALU_CYCLE_1..3, 12-15 invalid. This pass assumes C3
 //! stores those raw field values in `DelayAluHint { instid0, instskip,
@@ -123,8 +128,8 @@ pub enum WindowError {
     DelayCrossesLeader { index: usize },
 }
 
-/// VALU-issuing forms for INSTID lookback. Comparisons issue on the vector
-/// ALU; SALU/DS/VMEM/SMEM/export do not.
+/// VALU-issuing forms. Comparisons issue on the vector ALU; SALU/DS/VMEM/SMEM/export
+/// do not.
 fn is_valu(inst: &crate::inst::Inst) -> bool {
     matches!(
         inst.form,
@@ -132,17 +137,31 @@ fn is_valu(inst: &crate::inst::Inst) -> bool {
     )
 }
 
+/// Transcendental VALU ops (LLVM `TRANS = 1`: exp, log, rcp, rcp_iflag, rsq, sqrt, sin,
+/// cos in f16/f32/f64). `VALU_DEP_n` counts VALUs that are not TRANS and
+/// `TRANS32_DEP_n` counts TRANS only (LLVM `AMDGPUInsertDelayAlu`: `VALUNum` advances
+/// on VALU, `TRANSNum` on TRANS). KT48 pins it: `v_rcp_f32` sits between hipcc's
+/// `VALU_DEP_3` hints and the producers their consumers read.
+pub fn is_trans(inst: &crate::inst::Inst) -> bool {
+    const TRANS: [&str; 8] = ["v_exp_f", "v_log_f", "v_rcp_f", "v_rcp_iflag_f", "v_rsq_f", "v_sqrt_f", "v_sin_f", "v_cos_f"];
+    is_valu(inst) && inst.op.name(crate::inst::Arch::Gfx1201).is_some_and(|n| TRANS.iter().any(|t| n.starts_with(t)))
+}
+
+/// What `VALU_DEP_n` counts: issued VALUs other than TRANS.
+pub fn counts_for_valu_dep(inst: &crate::inst::Inst) -> bool { is_valu(inst) && !is_trans(inst) }
+
 fn is_salu(inst: &crate::inst::Inst) -> bool {
     matches!(inst.form, Form::Sop1 | Form::Sop2 | Form::Sopc | Form::Sopk | Form::Sopp)
 }
 
-/// Backward VALU distance named by an INSTID value: `None` = NO_DEP,
-/// `Some(0)` = nearest SALU (cycle penalty, no VALU reach), `Some(n)` = n-th
-/// previous VALU. Values 12-15 are invalid per the ISA and resolve to
-/// `Unknown` (ambiguous, never reject).
+/// What an INSTID value names: `None` = NO_DEP, the n-th previous non-TRANS VALU, the
+/// n-th previous TRANS, the nearest SALU (cycle penalty), or `Unknown` (values 12-15
+/// are invalid per the ISA: ambiguous, never reject).
+#[derive(Clone, Copy)]
 enum IdNeed {
     None,
     Valu(usize),
+    Trans(usize),
     Salu,
     Unknown,
 }
@@ -151,9 +170,7 @@ fn id_need(value: u8) -> IdNeed {
     match value {
         0 => IdNeed::None,
         1..=4 => IdNeed::Valu(usize::from(value)),
-        // TRANS32 issues on vector pipes; counting it as VALU lookback is
-        // the M1 approximation (documented: hardware counts TRANS only).
-        5..=7 => IdNeed::Valu(usize::from(value - 4)),
+        5..=7 => IdNeed::Trans(usize::from(value - 4)),
         // Reserved FMA accumulator penalty: treat as one VALU back.
         8 => IdNeed::Valu(1),
         9..=11 => IdNeed::Salu,
@@ -265,21 +282,18 @@ fn resolve_delay(
     let consumer1 = body.layout[pos + 1 + fwd];
 
     // Producers (backward): INSTID counts issued VALU on the executed path
-    // (branched-over instructions do not count; EXEC-skipped VALU do). Walk
-    // back along single-predecessor chains, which carry exactly one path; a
-    // join, a loop revisit, an invalid id, or an unmet need all yield
-    // Ambiguous, never a rejection: hints are performance-only and NO_DEP is
-    // always sound.
+    // (branched-over instructions do not count; EXEC-skipped VALU do), from
+    // its own consumer. Walk back along single-predecessor chains, which carry
+    // exactly one path; a join, a loop revisit, an invalid id, or an unmet
+    // need all yield Ambiguous, never a rejection: hints are performance-only
+    // and NO_DEP is always sound.
     let mut producers: [Option<InstId>; 2] = [None, None];
     for (slot, value) in [raw.instid0, raw.instid1].iter().enumerate() {
+        let from = if slot == 0 { pos + 1 } else { pos + 1 + fwd };
         match id_need(*value) {
             IdNeed::None => {}
             IdNeed::Unknown => return Ok(ambiguous),
-            IdNeed::Salu => match back_search(body, block, pos, false, 0) {
-                BackResult::Found(inst) => producers[slot] = Some(inst),
-                BackResult::Ambiguous => return Ok(ambiguous),
-            },
-            IdNeed::Valu(need) => match back_search(body, block, pos, true, need) {
+            need => match back_search(body, block, from, need) {
                 BackResult::Found(inst) => producers[slot] = Some(inst),
                 BackResult::Ambiguous => return Ok(ambiguous),
             },
@@ -300,13 +314,20 @@ enum BackResult {
     Ambiguous,
 }
 
-/// Backward search for a producer along the unique reaching path: within the
-/// block, then across single-predecessor edges (exact: one path reaches the
-/// hint through such an edge). `valu=true` counts the `need`-th previous
-/// VALU-issuing instruction; `valu=false` finds the nearest previous
-/// SALU-form instruction (M1 approximation of the SALU cycle penalty).
-/// Unmet needs and multi-predecessor joins yield Ambiguous.
-fn back_search(body: &Body, block: BlockId, pos: usize, valu: bool, need: usize) -> BackResult {
+/// Backward search for a producer along the unique reaching path, from layout
+/// position `pos` (exclusive): within the block, then across single-predecessor
+/// edges (exact: one path reaches the hint through such an edge). `Valu(n)` counts
+/// the n-th previous non-TRANS VALU, `Trans(n)` the n-th previous TRANS, `Salu` finds
+/// the nearest previous SALU-form instruction (M1 approximation of the SALU cycle
+/// penalty; `s_delay_alu` itself is not one). Unmet needs and multi-predecessor joins
+/// yield Ambiguous.
+fn back_search(body: &Body, block: BlockId, pos: usize, need: IdNeed) -> BackResult {
+    let (counts, need): (fn(&crate::inst::Inst) -> bool, usize) = match need {
+        IdNeed::Valu(n) => (counts_for_valu_dep, n),
+        IdNeed::Trans(n) => (is_trans, n),
+        IdNeed::Salu => (|i: &crate::inst::Inst| is_salu(i) && i.effects.control != Control::Delay, 1),
+        IdNeed::None | IdNeed::Unknown => return BackResult::Ambiguous,
+    };
     let mut seen = 0usize;
     let mut cur = block;
     let mut j = pos;
@@ -316,16 +337,9 @@ fn back_search(body: &Body, block: BlockId, pos: usize, valu: bool, need: usize)
         while j > start {
             j -= 1;
             let candidate = body.layout[j];
-            let hit = if valu {
-                is_valu(&body.insts.get(candidate).expect("laid out"))
-            } else {
-                is_salu(&body.insts.get(candidate).expect("laid out"))
-            };
-            if hit && (!valu || {
+            if counts(body.insts.get(candidate).expect("laid out")) {
                 seen += 1;
-                seen == need
-            }) {
-                return BackResult::Found(candidate);
+                if seen == need { return BackResult::Found(candidate); }
             }
         }
         let preds = &body.blocks[cur.0].preds;
@@ -604,5 +618,42 @@ mod tests {
         build_blocks(&mut body).unwrap();
         let facts = check_windows(&body).unwrap();
         assert_eq!(facts.delays[0].producers(), Some([None, None]));
+    }
+}
+
+#[cfg(test)]
+mod instid1_tests {
+    use super::*;
+    use crate::cfg::Arena;
+    use crate::inst::Inst;
+    use crate::operand::DelayAluHint;
+    use crate::passes::cfg::build_blocks;
+
+    fn decoded(words: &[u32]) -> Inst { crate::codec::gfx12::decode(words).unwrap().0 }
+
+    /// RDNA4 ISA §16.5 p270, `S_DELAY_ALU` example: INSTID1 counts back from the
+    /// instruction INSTSKIP selects, so the skipped VALU is `VALU_DEP_1` of the third.
+    /// Encodings from pinned `llvm-mc -mcpu=gfx1201` (the `_e32` spellings of the example).
+    #[test]
+    fn instid1_counts_back_from_its_own_consumer() {
+        let insts = vec![
+            decoded(&[0x7e06_0300]), // v_mov_b32_e32 v3, v0
+            decoded(&[0x303c_3e81]), // v_lshlrev_b32_e32 v30, 1, v31
+            decoded(&[0x3030_3281]), // v_lshlrev_b32_e32 v24, 1, v25
+            decoded(&[0xbf87_00a3]), // s_delay_alu instid0(VALU_DEP_3) | instskip(SKIP_1) | instid1(VALU_DEP_1)
+            decoded(&[0x0600_0701]), // v_add_f32_e32 v0, v1, v3
+            decoded(&[0x0816_1309]), // v_sub_f32_e32 v11, v9, v9
+            decoded(&[0x1014_170d]), // v_mul_f32_e32 v10, v13, v11
+            decoded(&[0xbfb0_0000]), // s_endpgm
+        ];
+        assert_eq!(insts[3].mods.delay, Some(DelayAluHint { instid0: 3, instskip: 2, instid1: 1 }));
+        let mut arena: Arena<Inst> = Arena::new();
+        let layout: Vec<_> = insts.into_iter().map(|i| arena.insert(i)).collect();
+        let mut body = Body { insts: arena, blocks: Vec::new(), layout };
+        build_blocks(&mut body).unwrap();
+        let facts = check_windows(&body).unwrap();
+        let l = &body.layout;
+        assert_eq!(facts.delays[0].consumers(), Some([Some(l[4]), Some(l[6])]));
+        assert_eq!(facts.delays[0].producers(), Some([Some(l[0]), Some(l[5])]), "v_mov v3 for v_add; v_sub v11 for v_mul");
     }
 }

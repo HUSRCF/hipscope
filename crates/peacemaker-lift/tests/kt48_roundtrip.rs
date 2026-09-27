@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use peacemaker_ir::cfg::{BlockId, Terminator};
 use peacemaker_ir::codec::gfx12;
-use peacemaker_ir::inst::{Abi, Arch, FormFields, Frontend, Inst, Kernel, KernelOrigin, Program, Wave};
+use peacemaker_ir::inst::{Abi, Arch, Form, FormFields, Frontend, Inst, Kernel, KernelOrigin, Program, Wave};
 use peacemaker_ir::operand::{Half, Operand};
 use peacemaker_ir::state::Lifted;
 use peacemaker_lift::{emit, lift_object, LiftError, Options, Rule};
@@ -220,6 +220,67 @@ fn cfg_matches_hipcc_labels() {
             assert_eq!(block_of(consumer), delay.block);
         }
     }
+}
+
+/// `s_delay_alu` reading (M1 C6 finding, resolved against RDNA4 §16.5 p270 and LLVM's
+/// `AMDGPUInsertDelayAlu`): each INSTID counts back from the instruction it applies to,
+/// so INSTID1 counts from the consumer INSTSKIP selects, and `VALU_DEP_n` counts
+/// non-TRANS VALUs (`TRANS32_DEP_n` TRANS ones). LLVM emits a hint only for a real
+/// dependency, so on all six KT48 kernels every resolved producer writes a register its
+/// consumer reads. Each rejected reading (INSTID1 counted from the hint; TRANS counted
+/// as VALU) names a non-producer for some of hipcc's hints. Two hints select a
+/// `ds_load_b128` as INSTID1's consumer: hipcc counted an empty inline-asm statement
+/// (`;;#ASMSTART`/`;;#ASMEND` in the `.s`, no bytes) into INSTSKIP, so in the machine
+/// code their second dependency lands on a non-ALU instruction (performance-only).
+#[test]
+fn delay_hints_name_the_producers_their_consumers_read() {
+    use peacemaker_ir::effects::ImplicitSet;
+    use peacemaker_ir::passes::windows::{counts_for_valu_dep, is_trans};
+    let lifted = lift(&kt48_co(), Frontend::Hipcc);
+    let reads = |consumer: &Inst, producer: &Inst| {
+        producer.effects.defs.iter().any(|d| consumer.effects.uses.iter().any(|u| u.overlaps(*d)))
+            || producer.effects.implicit.writes & consumer.effects.implicit.reads & ImplicitSet::VCC != 0
+    };
+    let (mut checked, mut instid1, mut from_hint_misses, mut trans_as_valu_misses) = (0, 0, 0, 0);
+    let mut non_alu_consumers = Vec::new();
+    for kernel in &lifted.program.kernels {
+        let body = &kernel.body;
+        let inst = |id| body.insts.get(id).expect("live");
+        let pos = |id| body.layout.iter().position(|x| *x == id).expect("laid out");
+        // The n-th instruction before layout position `at` that `counts` (straight line).
+        let nth_before = |at: usize, n: u8, counts: &dyn Fn(&Inst) -> bool| {
+            body.layout[..at].iter().rev().copied().filter(|&id| counts(inst(id))).nth(usize::from(n) - 1)
+        };
+        let windows = peacemaker_ir::passes::windows::check_windows(body).unwrap();
+        for fact in &windows.delays {
+            let (Some(producers), Some(consumers)) = (fact.producers(), fact.consumers()) else { continue };
+            let hint = inst(fact.hint).mods.delay.expect("hint");
+            for (slot, value) in [hint.instid0, hint.instid1].into_iter().enumerate() {
+                if !(1..=7).contains(&value) { continue; }
+                let (producer, consumer) = (producers[slot].expect("resolved"), consumers[slot].expect("resolved"));
+                if !matches!(inst(consumer).form, Form::Vop1 | Form::Vop2 | Form::Vop3 | Form::Vop3p | Form::Vopd | Form::Vopc | Form::Sop1 | Form::Sop2 | Form::Sopc) {
+                    non_alu_consumers.push((kernel.symbol.0.clone(), inst(fact.hint).prov.pc, slot, name(inst(consumer))));
+                    continue;
+                }
+                assert!(reads(inst(consumer), inst(producer)), "{}: hint {:?} slot {slot} value {value}: {} does not read {}",
+                    kernel.symbol.0, fact.hint, name(inst(consumer)), name(inst(producer)));
+                assert_eq!(is_trans(inst(producer)), value >= 5, "TRANS32_DEP names a TRANS, VALU_DEP a non-TRANS VALU");
+                checked += 1;
+                if value > 4 { continue; }
+                let miss = |p: Option<peacemaker_ir::cfg::InstId>| p.is_none_or(|p| !reads(inst(consumer), inst(p)));
+                let any_valu = |i: &Inst| counts_for_valu_dep(i) || is_trans(i);
+                if miss(nth_before(pos(consumer), value, &any_valu)) { trans_as_valu_misses += 1; }
+                if slot == 1 {
+                    instid1 += 1;
+                    if miss(nth_before(pos(fact.hint), value, &counts_for_valu_dep)) { from_hint_misses += 1; }
+                }
+            }
+        }
+    }
+    eprintln!("delay slots checked: {checked} ({instid1} INSTID1 VALU_DEP); misses: INSTID1 from the hint {from_hint_misses}, TRANS counted as VALU {trans_as_valu_misses}");
+    assert!(instid1 > 0 && from_hint_misses > 0 && trans_as_valu_misses > 0, "the corpus separates both rejected readings");
+    assert_eq!(non_alu_consumers, [(SELECTED.to_owned(), Some(0x95c8), 1, "ds_load_b128"), (SELECTED.to_owned(), Some(0x9604), 1, "ds_load_b128")],
+        "only the two inline-asm-miscounted INSTSKIPs");
 }
 
 /// T5: descriptor and metadata values of core.md §0 (errata: 25 args, 11 explicit + 14
@@ -574,6 +635,19 @@ fn codec_is_total_over_the_table() {
     assert!(combinations > peacemaker_ir::isa::gfx12().len(), "don't-care combinations were exercised");
 }
 
+/// A VMEM VADDR byte the instruction does not use (scratch with SVE clear,
+/// `global_*_addtid`) has no typed home, so only its zero encoding decodes.
+#[test]
+fn unused_vmem_vaddr_byte_rejects() {
+    for (canonical, extra) in [([0xED05_C07C, 0, 0x0001_1000], 0x01), ([0xEE0A_401C, 0x7790_0000, 0xFFFF_F800], 0x80)] {
+        let (inst, _) = gfx12::decode(&canonical).unwrap();
+        assert_eq!(gfx12::encode(&inst).unwrap().as_slice(), canonical.as_slice());
+        let mut dirty = canonical;
+        dirty[2] |= extra;
+        assert!(gfx12::decode(&dirty).is_err(), "{dirty:08x?} would re-encode without its VADDR byte");
+    }
+}
+
 proptest::proptest! {
     #![proptest_config(proptest::test_runner::Config::with_cases(1000))]
     /// T8, fuzz property (the `fuzz/decode` target's body, uninstrumented): arbitrary words
@@ -680,7 +754,7 @@ fn edit_inverse_restores_bytes() {
     let words: [&[u32]; 5] = [&[0xf400_4100, 0xf800_0148], &[0xf400_2200, 0xf800_0158], &[0xbfc7_0000], &[0xbe9c_0004], &[0xbe9d_0005]];
     let header: Vec<Inst> = words.iter().map(|w| gfx12::decode(w).unwrap().0).collect();
     let header_bytes: Vec<u8> = words.concat().iter().flat_map(|w| w.to_le_bytes()).collect();
-    let arg = |name: &str, offset| Kernarg { name: name.into(), size: 8, offset, value_kind: "by_value".into() };
+    let arg = |name: &str, offset| Kernarg { name: name.into(), size: 8, offset, value_kind: "by_value".into(), address_space: None };
     let args = vec![arg("pm_profile_records", 328), arg("pm_profile_stride", 336), arg("pm_profile_grid", 344)];
     let claims = vec![RegClaim { name: "pm_pointer".into(), reg: RegRef { kind: Kind::S, base: 28, len: 2 }, scope: Scope::Whole, owner: ClaimOwner::Builder }];
     let profiled = format!("{SELECTED}__pm_profile");

@@ -10,5 +10,7 @@ pub struct KernelMeta {
     pub uniform_work_group_size: bool, pub uses_dynamic_stack: bool,
     pub sgpr_spill_count: u32, pub vgpr_spill_count: u32,
 }
+/// One `.args[]` entry. `address_space` is the pointer's `.address_space` (`global`,
+/// `generic`, …) when the map carries one.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct Kernarg { pub name: String, pub size: u32, pub offset: u32, pub value_kind: String }
+pub struct Kernarg { pub name: String, pub size: u32, pub offset: u32, pub value_kind: String, pub address_space: Option<String> }

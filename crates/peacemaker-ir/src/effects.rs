@@ -1,5 +1,5 @@
 use smallvec::SmallVec;
-use crate::{cfg::{BarrierKind, Cond}, inst::{Arch, Form, Opcode, ValidateError}, lds::LdsAccess, operand::{Operand, Special}, reg::RegRef, wait::{Counter, CounterSet}};
+use crate::{cfg::{BarrierKind, Cond}, inst::{Arch, Form, Inst, Opcode, ValidateError}, lds::LdsAccess, operand::{Operand, Special}, reg::{Kind, RegRef}, wait::{Counter, CounterSet}};
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ImplicitSet { pub reads: u8, pub writes: u8 }
 impl ImplicitSet {
@@ -21,6 +21,29 @@ pub struct MemEffect { pub class: MemClass, pub counters: CounterSet, pub in_ord
 pub enum Control { #[default] None, Branch { cond: Cond }, Jump, EndPgm, Barrier(BarrierKind), Wait, Clause, Delay, Halt, Trap }
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Effects { pub defs: SmallVec<[RegRef; 2]>, pub uses: SmallVec<[RegRef; 4]>, pub implicit: ImplicitSet, pub mem: Option<MemEffect>, pub control: Control, pub lds: Option<LdsAccess> }
+/// The old VGPR value preserved by a lane/half write.  This is not a
+/// full-register definition: without lane-sensitive proof, an undefined old
+/// destination must remain an open obligation rather than a proved read.
+pub fn preserved_vgpr_destination(arch: Arch, inst: &Inst) -> Option<RegRef> {
+    let writelane = inst.op.name(arch) == Some("v_writelane_b32");
+    inst.operands.iter().enumerate().find_map(|(i, operand)| {
+        let reg = match operand {
+            Operand::Half(reg, _) => reg,
+            Operand::Reg(reg) if writelane && i == 0 => reg,
+            _ => return None,
+        };
+        if reg.kind != Kind::V || !inst.effects.defs.contains(reg) { return None; }
+        // An explicit source overlapping the old destination remains a real
+        // undefined read, not merely the value preserved by the partial write.
+        let overlap = inst.operands.iter().enumerate().any(|(j, src)| {
+            if j == i { return false; }
+            let other = match src { Operand::Reg(r) | Operand::Half(r, _) => r, _ => return false };
+            other.kind == reg.kind && other.base < reg.base + u16::from(reg.len) && reg.base < other.base + u16::from(other.len)
+        });
+        (!overlap).then_some(*reg)
+    })
+}
+
 
 impl Effects {
     /// Single table source for authoring and lifted instruction effects.
@@ -97,6 +120,8 @@ impl Effects {
             let mut counters = CounterSet::default();
             counters.insert(counter);
             let (class, order) = if name.starts_with("s_load") { (MemClass::SmemLoad, OrderType::Smem) }
+                // Returns its SGPRs through KMcnt, out of order like SMEM (RDNA4 §5.7.1).
+                else if name.starts_with("s_sendmsg_rtn") { (MemClass::SmemLoad, OrderType::Smem) }
                 else if name.starts_with("ds_load") { (MemClass::DsLoad, OrderType::Ds) }
                 else if name.starts_with("ds_store") { (MemClass::DsStore, OrderType::Ds) }
                 else if name.starts_with("ds_") { (MemClass::DsAtomic { returns: !out.defs.is_empty() }, OrderType::Ds) }
@@ -112,7 +137,6 @@ impl Effects {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::{codec::gfx12, reg::Kind};
 
     #[test]

@@ -232,7 +232,7 @@ pub fn build_blocks(body: &mut Body) -> Result<LayoutInfo, CfgError> {
     }
     let mut terms: Vec<Term> = vec![Term::FallThrough { next: None }; block_count];
     let mut succs: Vec<Vec<usize>> = vec![Vec::new(); block_count];
-    for (block_idx, &start) in leader_list.iter().enumerate() {
+    for block_idx in 0..block_count {
         let end = if block_idx + 1 < block_count { leader_list[block_idx + 1] } else { n };
         let next = if block_idx + 1 < block_count { Some(block_idx + 1) } else { None };
         match &ends[end - 1] {

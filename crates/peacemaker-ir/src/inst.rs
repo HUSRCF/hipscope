@@ -277,7 +277,7 @@ impl Program {
                 while let Some(id) = frontier.pop() {
                     if std::mem::replace(&mut reached[id.0], true) { continue; }
                     let block = &body.blocks[id.0];
-                    let expected: SmallVec<[crate::cfg::BlockId; 2]> = match &block.term {
+                    let mut expected: SmallVec<[crate::cfg::BlockId; 2]> = match &block.term {
                         Terminator::FallThrough if id.0 + 1 < body.blocks.len() =>
                             smallvec::smallvec![crate::cfg::BlockId(id.0 + 1)],
                         Terminator::FallThrough => SmallVec::new(),
@@ -286,7 +286,13 @@ impl Program {
                         Terminator::EndPgm => { has_exit = true; SmallVec::new() },
                         Terminator::Unreachable => return Err(ValidateError::Layout("reachable unreachable-block terminator".into())),
                     };
-                    if block.succs.len() != expected.len() || expected.iter().any(|edge| !block.succs.contains(edge)) {
+                    // A neutral conditional branch (taken == fall-through) has one successor edge.
+                    expected.sort_unstable_by_key(|b| b.0);
+                    expected.dedup();
+                    let mut actual = block.succs.clone();
+                    actual.sort_unstable_by_key(|b| b.0);
+                    actual.dedup();
+                    if actual != expected {
                         return Err(ValidateError::Layout("terminator and successor edges disagree".into()));
                     }
                     if expected.is_empty() && block.term != Terminator::EndPgm {

@@ -364,7 +364,12 @@ v_sub_co_u32	vop3	0x301	VDST:32,SDST:64,SRC0:32,SRC1:32	VDST,SDST	SRC0,SRC1	-	-	
 v_subrev_co_ci_u32_e64	vop3	0x122	VDST:32,SDST:64,SRC0:32,SRC1:32,SRC2:64	VDST,SDST	SRC0,SRC1,SRC2	-	-	v_subrev_co_ci_u32_e64 v6, null, s9, v6, vcc_lo	D5227C06 01AA0C09	-
 v_trunc_f32_e32	vop1	0x21	VDST:32,SRC0:32	VDST	SRC0	-	-	v_trunc_f32_e32 v1, v22	7E024316	w0_extra:ignored:0x10000:0x0
 v_wmma_f32_16x16x16_f16	vop3p	0x40	VDST:256,SRC0:128,SRC1:128,SRC2:256	VDST	SRC0,SRC1,SRC2	-	-	v_wmma_f32_16x16x16_f16 v[0:7], v[37:40], v[21:24], v[0:7]	CC404000 1C022B25	w0_extra:ignored:0x800000:0x0
-v_writelane_b32	vop3	0x361	VDST:32,SRC0:32,SRC1:32	VDST	SRC0,SRC1,VDST	-	-	v_writelane_b32 v97, s0, 0	D7610061 02010000	src2_unused:ignored:0x1ff:0x00/0x80/0x101,neg:honored:0x7,abs:honored:0x7,omod:ignored:0x3:0x0/0x1/0x2/0x3
+v_writelane_b32	vop3	0x361	VDST:32,SRC0:32,SRC1:32,literal@last	VDST	SRC0,SRC1,VDST	-	-	v_writelane_b32 v239, 0x504d5046, 0	D76100EF 020100FF 504D5046	src2_unused:ignored:0x1ff:0x00/0x80/0x101,neg:honored:0x7,abs:honored:0x7,omod:ignored:0x3:0x0/0x1/0x2/0x3
 v_xor3_b32	vop3	0x240	VDST:32,SRC0:32,SRC1:32,SRC2:32	VDST	SRC0,SRC1,SRC2	-	-	v_xor3_b32 v1, v16, v18, v1	D6400001 04062510	neg:honored:0x7,abs:honored:0x7,omod:ignored:0x3:0x0/0x1/0x2/0x3
 v_add_f32_dpp	vop2_dpp	0x3	VDST:32,SRC0:32,VSRC1:32	VDST	SRC0,VSRC1	-	-	v_add_f32_dpp v18, v18, v18 row_shl:8 row_mask:0xf bank_mask:0xf bound_ctrl:1	062424FA FF090812	dpp_fi:honored:0x40000
 v_mov_b32_dpp	vop1_dpp	0x1	VDST:32,SRC0:32	VDST	SRC0	-	-	v_mov_b32_dpp v2, v1 row_shl:1 row_mask:0xf bank_mask:0xf bound_ctrl:1	7E0402FA FF090101	dpp_fi:honored:0x40000
+# M3 profiler/attn-sync encodings (pinned llvm-mc gfx1201).
+s_getreg_b32	sopk	0x11	SDST:32,SIMM16:16	SDST	SIMM16	-	-	s_getreg_b32 s30, hwreg(HW_REG_SHADER_CYCLES_LO)	B89EF81D	-
+s_sendmsg_rtn_b64	sop1	0x4d	SDST:64,SSRC0:32	SDST	-	-	Km:1	s_sendmsg_rtn_b64 s[12:13], sendmsg(MSG_RTN_GET_REALTIME)	BE8C4D83	-
+s_setprio	sopp	0x35	SIMM16:16	-	SIMM16	-	-	s_setprio 3	BFB50003	-
+global_store_addtid_b32	global	0x29	VSRC:32,SADDR:64	-	VSRC,SADDR	-	Store:1	global_store_addtid_b32 v239, s[28:29] offset:-8 th:TH_STORE_NT	EE0A401C 77900000 FFFFF800	w0_extra:ignored:0xc03f00:0x0,w1_extra:ignored:0x8001ff00:0x0,global_sve:honored:0x20000:0x0,global_scope:honored:0xc0000:0x0,global_th:honored:0x700000:0x0/0x100000,global_nv:honored:0x80:0x0

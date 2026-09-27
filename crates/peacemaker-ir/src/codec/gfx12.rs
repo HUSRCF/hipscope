@@ -70,14 +70,21 @@ fn operand(name: &str, bits: u16, code: u32, literal: Option<u32>, row: &OpRow, 
         if row.name == "s_sendmsg" && code == 3 { return Ok(Operand::SendMsg(Msg { id: 3, op: 0 })); }
         return Ok(Operand::Imm(if form == Form::Sopk { ImmField::Sopk(code as i16) } else { ImmField::Sopp(code as i16) }));
     }
+    // `s_sendmsg_rtn_*` carries its message id in the SSRC0 field (not a source selector).
+    if name == "SSRC0" && row.name.starts_with("s_sendmsg_rtn") { return Ok(Operand::SendMsg(Msg { id: code as u8, op: 0 })); }
     if name == "SOFFSET" && form == Form::Smem && code == 124 {
         return Ok(Operand::Imm(ImmField::SmemOffset(field_value("IOFFSET", row, words) as i32)));
     }
     if name == "SBASE" { return Ok(reg(Kind::S, code * 2, bits)); }
     if name == "RSRC" { return Ok(reg(Kind::S, code, bits)); }
     if name == "SADDR" && code == 124 { return Ok(Operand::Vmem(VmemToken::Off)); }
+    // With SVE clear the VADDR byte is unused; only its canonical zero
+    // round-trips through `off`, so any other value is refused.
     if name == "VADDR" && form == Form::Vmem(crate::inst::VmemForm::Scratch)
-        && field_value("SVE",row,words)==0 { return Ok(Operand::Vmem(VmemToken::Off)); }
+        && field_value("SVE",row,words)==0 {
+        if code != 0 { return Err(reject("scratch VADDR must be zero when SVE is clear")); }
+        return Ok(Operand::Vmem(VmemToken::Off));
+    }
     if name=="SRC0" && matches!(form,Form::Vop1Dpp|Form::Vop2Dpp) {
         return Ok(reg(Kind::V,code,bits));
     }
@@ -118,6 +125,7 @@ fn operand(name: &str, bits: u16, code: u32, literal: Option<u32>, row: &OpRow, 
 fn encoded_operand(name: &str, bits: u16, op: &Operand, form: Form) -> Result<u32, DecodeError> {
     match (name, op) {
         ("SIMM16", Operand::SendMsg(Msg { id:3,op:0 })) => Ok(3),
+        ("SSRC0", Operand::SendMsg(Msg { id, op: 0 })) if form == Form::Sop1 => Ok(u32::from(*id)),
         ("SIMM16", Operand::Imm(ImmField::Sopp(n) | ImmField::Sopk(n))) => Ok((*n as u16).into()),
         ("SOFFSET", Operand::Imm(ImmField::SmemOffset(_))) if form == Form::Smem => Ok(124),
         ("SBASE", Operand::Reg(r)) if r.kind == Kind::S && r.base % 2 == 0 => Ok(u32::from(r.base / 2)),
@@ -340,7 +348,9 @@ pub fn decode(words: &[u32]) -> Result<(Inst, usize), DecodeError> {
         } else if row.name=="global_inv" && field_value("SCOPE",row,words)==1 {
             operands.push(Operand::Scope(CacheScope::Se));
         }
-        consumed[2] = u32::MAX;
+        // Word 2 is VADDR (consumed above only when the row has one) and
+        // IOFFSET; an unused VADDR byte must be zero to round-trip.
+        consumed[2] |= forms::field(row.form,"IOFFSET").expect("VMEM IOFFSET").mask();
     }
     if row.form == Form::Vopd {
         let y_id = ((words[0] >> 17) & 31) as u16;
@@ -395,7 +405,7 @@ pub fn decode(words: &[u32]) -> Result<(Inst, usize), DecodeError> {
         consumed[0] |= forms::field(row.form,"SADDR").expect("global SADDR").mask();
     }
     let fields=fields_from(row,words,&mut consumed)?;
-    for i in 0..n { if Some(i) == literal.map(|_|n-1) || matches!(row.form,Form::Vmem(_)) && i==2 { continue; }
+    for i in 0..n { if Some(i) == literal.map(|_|n-1) { continue; }
         let unknown=words[i] & !consumed[i]; if unknown!=0 { return Err(reject(format!("unknown bits in word {i}: {unknown:#010x}"))); }
     }
     let inst=Inst::from_parts(Arch::Gfx1201,row.op,row.form,fields,operands,mods,literal,Provenance::default()).map_err(|e| reject(e.to_string()))?;

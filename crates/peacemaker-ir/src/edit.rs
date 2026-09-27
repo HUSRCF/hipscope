@@ -34,7 +34,7 @@ use smallvec::SmallVec;
 use thiserror::Error;
 
 use crate::cfg::{Arena, Block, BlockId, Body, InstId, Terminator};
-use crate::effects::{Control, Effects, ImplicitSet};
+use crate::effects::{preserved_vgpr_destination, Control, Effects, ImplicitSet};
 use crate::inst::{Abi, Arch, Form, FormFields, Inst, Kernel, Program, SymbolId, UserSgprRole, ValidateError, Wave};
 use crate::lds::AddrFact;
 use crate::metadata::Kernarg;
@@ -290,10 +290,21 @@ fn analyze_at(program: Program, kernel: &SymbolId, revision: u32) -> Result<Anal
     let flow = Flow::new(body, arch, kern.wave)?;
     let (def_in, _) = flow.defined(entry_seed(kern, arch)?);
     for p in 0..flow.n {
+        let id = flow.ids[p];
+        let inst = body.insts.get(id).ok_or(EditError::UnknownInst(id))?;
         let missing = flow.acc[p].reads.minus(&def_in[p]);
+        let partial = partial_undefined(arch, inst, &missing);
+        if !partial.is_empty() {
+            obligations.push(Obligation {
+                kind: ObligationKind::Definedness, insts: vec![id], rule_id: "definedness-partial-write".into(),
+                text: format!("{} preserves {} without a definition on every path; lane coverage remains unproved",
+                    inst.op.name(arch).unwrap_or("unknown opcode"), bits_names(&partial)),
+            });
+        }
+        let missing = missing.minus(&partial);
         if !missing.is_empty() {
             obligations.push(Obligation {
-                kind: ObligationKind::Definedness, insts: vec![flow.ids[p]], rule_id: "definedness-entry".into(),
+                kind: ObligationKind::Definedness, insts: vec![id], rule_id: "definedness-entry".into(),
                 text: format!("reads {} without a definition on every path from the kernel entry (ABI entry table)", bits_names(&missing)),
             });
         }
@@ -622,10 +633,6 @@ fn is_vector_form(form: Form) -> bool {
     matches!(form, Form::Vop1 | Form::Vop2 | Form::Vop3 | Form::Vop3p | Form::Vopc | Form::Vopd | Form::Vinterp | Form::Ds | Form::Vmem(_) | Form::Export)
 }
 
-fn is_valu(inst: &Inst) -> bool {
-    matches!(inst.form, Form::Vop1 | Form::Vop2 | Form::Vop3 | Form::Vop3p | Form::Vopd | Form::Vopc | Form::Vinterp)
-}
-
 fn access(arch: Arch, wave: Wave, inst: &Inst) -> Result<Access, EditError> {
     let roles = operand_roles(arch, inst)?;
     let mut acc = Access::default();
@@ -644,7 +651,9 @@ fn access(arch: Arch, wave: Wave, inst: &Inst) -> Result<Access, EditError> {
                 if used {
                     acc.uses.dword(d);
                     // A half destination listed as a use is the preserved
-                    // other half, not a value this instruction consumes.
+                    // other half, not a value this instruction consumes: the
+                    // half-granular state keeps that half's own definedness,
+                    // so any later reader of it is checked where it reads.
                     if !def { acc.reads.half(d, hi); }
                 }
             }
@@ -671,6 +680,18 @@ fn access(arch: Arch, wave: Wave, inst: &Inst) -> Result<Access, EditError> {
     for d in implicit_dwords(writes, wave) { acc.writes.dword(d); }
     Ok(acc)
 }
+/// Only the old value preserved by a lane write may remain open: the
+/// dword-granular state marks the whole VGPR defined after `v_writelane`,
+/// so its undefined preserved lanes are recorded at the write. A half write
+/// contributes nothing: `access` does not read the preserved half, whose own
+/// definedness is checked at its readers. Explicit
+/// undefined sources, even when they overlap the destination, still fail
+/// the checked edit.
+fn partial_undefined(arch: Arch, inst: &Inst, missing: &Bits) -> Bits {
+    let Some(reg) = preserved_vgpr_destination(arch, inst) else { return Bits::default(); };
+    missing.inter(&Bits::of_reg(reg))
+}
+
 
 /// gfx12 ABI entry table (core.md §6.2): the only locations defined at entry.
 fn entry_seed(kern: &Kernel, arch: Arch) -> Result<Bits, EditError> {
@@ -1046,7 +1067,7 @@ fn revive(arena: &mut Arena<Inst>, items: &[(InstId, Inst)]) -> Result<(), EditE
 
 struct HintSlot { hint: InstId, slot: u8, n: u8, producers: BTreeSet<Option<InstId>> }
 
-/// Producers `n` VALUs back from `consumer` on every path (`None` = a path
+/// Producers `n` non-TRANS VALUs back (`VALU_DEP_n`) from `consumer` on every path (`None` = a path
 /// reaches the entry first).
 fn producers(flow: &Flow, body: &Body, consumer: usize, n: u8) -> BTreeSet<Option<InstId>> {
     let mut out = BTreeSet::new();
@@ -1055,7 +1076,7 @@ fn producers(flow: &Flow, body: &Body, consumer: usize, n: u8) -> BTreeSet<Optio
     if work.is_empty() { out.insert(None); }
     while let Some((p, count)) = work.pop() {
         if !seen.insert((p, count)) { continue; }
-        let valu = body.insts.get(flow.ids[p]).is_some_and(is_valu);
+        let valu = body.insts.get(flow.ids[p]).is_some_and(passes::windows::counts_for_valu_dep);
         let count = count + u8::from(valu);
         if valu && count == n { out.insert(Some(flow.ids[p])); continue; }
         if flow.pred[p].is_empty() { out.insert(None); }
@@ -1236,7 +1257,10 @@ impl Tx {
         let (def_in, _) = flow.defined(entry_seed(self.kernel(), self.arch)?);
         for id in ids {
             let p = flow.pos[id];
+            let inst = self.body().insts.get(*id).ok_or(EditError::UnknownInst(*id))?;
             let missing = flow.acc[p].reads.minus(&def_in[p]);
+            let partial = partial_undefined(self.arch, inst, &missing);
+            let missing = missing.minus(&partial);
             if !missing.is_empty() { return Err(EditError::Undefined { inst: *id, regs: bits_names(&missing) }); }
         }
         Ok(())
@@ -1338,18 +1362,17 @@ impl Tx {
         Ok(())
     }
 
-    /// Only a conditional branch whose taken and fall-through targets are the
-    /// same next block may be inserted (semantically neutral); `Retarget`
-    /// then gives it meaning.
+    /// Only a branch or jump to the same next block it would fall through to
+    /// may be inserted (semantically neutral); `Retarget` then gives it meaning.
     fn check_inserted_control(&self, insts: &[Inst], gap: Gap) -> Result<(), EditError> {
         for (index, inst) in insts.iter().enumerate() {
             let bad = |reason: &str| EditError::ControlInsert { index, reason: reason.into() };
             match inst.effects.control {
-                Control::Jump | Control::EndPgm | Control::Halt | Control::Trap =>
-                    return Err(bad("jumps and terminators are never inserted")),
-                Control::Branch { .. } => {
+                Control::EndPgm | Control::Halt | Control::Trap =>
+                    return Err(bad("terminators are never inserted")),
+                Control::Branch { .. } | Control::Jump => {
                     let neutral = index + 1 == insts.len() && gap.at_end && label_of(inst) == Some(BlockId(gap.block + 1));
-                    if !neutral { return Err(bad("a branch may only be inserted last, at a block end, targeting its own fall-through (then Retarget)")); }
+                    if !neutral { return Err(bad("a branch or jump may only be inserted last, at a block end, targeting its own fall-through (then Retarget)")); }
                 }
                 Control::Clause | Control::Delay => {
                     let reach = if inst.effects.control == Control::Clause {
@@ -1415,8 +1438,8 @@ impl Tx {
             let id = flow.ids[p];
             let inst = body.insts.get(id).ok_or(EditError::UnknownInst(id))?;
             match inst.effects.control {
-                Control::EndPgm | Control::Halt | Control::Trap | Control::Jump => return Err(EditError::ControlRemove { inst: id }),
-                Control::Branch { .. } => {
+                Control::EndPgm | Control::Halt | Control::Trap => return Err(EditError::ControlRemove { inst: id }),
+                Control::Branch { .. } | Control::Jump => {
                     let neutral = is_edit_inserted(inst) && p + 1 == body.blocks[flow.block_of[p]].range.1
                         && label_of(inst) == Some(BlockId(flow.block_of[p] + 1));
                     if !neutral { return Err(EditError::ControlRemove { inst: id }); }
@@ -1749,6 +1772,13 @@ impl Tx {
         Ok(Edit::SplitBlock { at: Cursor::before(BlockId(b - 1), leader) })
     }
 
+    /// An inserted branch or jump may target (a) its own fall-through
+    /// (neutral), (b) a block it alone reaches (dedicated code), or (c) a later
+    /// block when every instruction it skips — the layout blocks between its
+    /// own and the target — is edit-inserted, so the original instruction
+    /// sequence of every path is unchanged and only inserted code is chosen.
+    /// New paths are re-checked for barrier pairing and for the definedness
+    /// of every inserted read.
     fn retarget(&mut self, branch: InstId, to: BlockId, checked: bool) -> Result<Edit, EditError> {
         let body = self.body();
         let p = body.layout.iter().position(|x| *x == branch).ok_or(EditError::UnknownInst(branch))?;
@@ -1757,7 +1787,10 @@ impl Tx {
         if to.0 >= body.blocks.len() { return Err(EditError::UnknownBlock(to)); }
         let old = label_of(inst).ok_or_else(|| EditError::Retarget(format!("{branch:?} has no label")))?;
         let from_block = body.blocks.iter().position(|b| b.range.0 <= p && p < b.range.1).expect("laid out");
-        let neutralising = matches!(inst.effects.control, Control::Branch { .. }) && to.0 == from_block + 1;
+        let neutralising = to.0 == from_block + 1;
+        let skips_inserted_only = to.0 > from_block + 1
+            && body.layout[body.blocks[from_block + 1].range.0..body.blocks[to.0].range.0].iter()
+                .all(|id| body.insts.get(*id).is_some_and(is_edit_inserted));
         if checked && !is_edit_inserted(inst) { return Err(EditError::RetargetOriginal(branch)); }
         let base_barriers = if checked { Some(self.barrier_findings()?) } else { None };
         let inst = self.body_mut().insts.get_mut(branch).expect("live");
@@ -1767,10 +1800,14 @@ impl Tx {
         if checked {
             let preds = &self.body().blocks[to.0].preds;
             // The entry block always has the kernel entry as an extra predecessor.
-            if !neutralising && (to.0 == 0 || preds.len() != 1 || preds[0].0 != from_block) {
-                return Err(EditError::Retarget(format!("{to:?} must have the inserted branch's block as its only predecessor")));
+            let dedicated = to.0 != 0 && preds.len() == 1 && preds[0].0 == from_block;
+            if !neutralising && !dedicated && !skips_inserted_only {
+                return Err(EditError::Retarget(format!("{to:?} must be reached only by the inserted branch, or lie after it past inserted code only")));
             }
             if let Some(base) = base_barriers { self.check_barriers_not_worse(&base)?; }
+            let inserted: Vec<InstId> = self.body().layout.iter().copied()
+                .filter(|id| self.body().insts.get(*id).is_some_and(is_edit_inserted)).collect();
+            self.check_defined(&inserted)?;
         }
         Ok(Edit::Retarget { branch, to: old })
     }
@@ -1851,6 +1888,9 @@ impl Tx {
             };
             let mut new = hint;
             if slot.slot == 0 { new.instid0 = target.unwrap_or(0); } else { new.instid1 = target.unwrap_or(0); }
+            // Without a second dependency INSTSKIP names nothing; the assembler's
+            // spelling (`s_delay_alu instid0(..)` / `s_delay_alu 0`) encodes it as 0.
+            if new.instid1 == 0 { new.instskip = 0; }
             if !originals.iter().any(|(id, _)| *id == slot.hint) { originals.push((slot.hint, hint)); }
             set_delay(self.body_mut().insts.get_mut(slot.hint).expect("live"), new);
         }
@@ -2259,11 +2299,15 @@ mod tests {
         // s_sendmsg's table row reads M0, which the ABI never initialises and
         // KT48 never writes; the VGPR findings are loads skipped on an
         // s_cbranch_execz path (lanes are not modelled) and true16 halves
-        // written on one path only.
+        // written on one path only. The true16 pairs `v_mov_b16_e64 v198.l`
+        // then `.h` (and v199) preserve a half the next instruction
+        // overwrites; the preserved half is not read, so they add no
+        // `definedness-partial-write` obligation (that class is for lane
+        // writes, which the dword-granular state cannot follow).
         assert_eq!(undefined.len(), 27);
         let dealloc = undefined.iter().filter(|o| o.text.starts_with("reads m0 ")).count();
         assert_eq!(dealloc, 1);
-        assert!(undefined.iter().all(|o| o.text.contains("reads m0 ") || o.text.contains("reads v")));
+        assert!(undefined.iter().all(|o| o.rule_id == "definedness-entry" && (o.text.contains("reads m0 ") || o.text.contains("reads v"))));
         assert_eq!(a.obligations.iter().filter(|o| o.kind == ObligationKind::SrcReadTiming(MemClass::DsStore)).count(), 124);
         assert!(!a.obligations.iter().any(|o| o.kind == ObligationKind::Unknown), "descriptor/metadata agree with the code");
     }
@@ -2316,7 +2360,7 @@ mod tests {
         let base = analyze(kt48_program(), &kernel).unwrap();
         let base_stream = stream(&base.program);
         let profiled = format!("{KT48}__pm_profile");
-        let arg = |name: &str, offset: u32, size: u32, kind: &str| Kernarg { name: name.into(), size, offset, value_kind: kind.into() };
+        let arg = |name: &str, offset: u32, size: u32, kind: &str| Kernarg { name: name.into(), size, offset, value_kind: kind.into(), address_space: None };
         let args = vec![arg("pm_profile_records", 328, 8, "global_buffer"), arg("pm_slot_bytes", 336, 4, "by_value"),
             arg("pm_waves_per_wg", 340, 4, "by_value"), arg("pm_grid_x", 344, 4, "by_value"), arg("pm_grid_y", 348, 4, "by_value")];
         let claims = vec![claim("pm_pointer", sreg(28, 2), Scope::Whole), claim("pm_exec_save", sreg(31, 1), Scope::Whole),
@@ -2491,14 +2535,20 @@ mod tests {
         let l = ids(&a);
         let control = |e: Result<(Analyzed<Program>, EditDelta), EditError>| matches!(e.unwrap_err(), EditError::ControlInsert { .. });
         assert!(control(edit(&a, insert(at(2, l[3]), vec![endpgm()]))), "terminators are never inserted");
-        assert!(control(edit(&a, insert(Cursor::end(BlockId(1)), vec![mk("s_branch", vec![Operand::Label(BlockId(2))])]))), "nor jumps");
+        assert!(control(edit(&a, insert(Cursor::end(BlockId(1)), vec![mk("s_branch", vec![Operand::Label(BlockId(0))])]))), "nor non-neutral jumps");
         let branch_to = |b| mk("s_cbranch_scc1", vec![Operand::Label(BlockId(b))]);
         assert!(control(edit(&a, insert(at(1, l[2]), vec![branch_to(2)]))), "mid-block");
         assert!(control(edit(&a, insert(Cursor::end(BlockId(1)), vec![branch_to(0)]))), "not its fall-through");
         assert!(control(edit(&a, insert(Cursor::end(BlockId(1)), vec![branch_to(2), nop()]))), "not last");
-        // The accepted neutral form is exercised with its Retarget in
-        // `inserted_branch_retargets_to_a_block_it_alone_reaches`.
         assert_eq!(edit(&a, insert(Cursor::end(BlockId(0)), vec![nop()])).unwrap_err(), EditError::CursorAfterTerminator(BlockId(0)));
+        // M1 C6 finding: a neutral branch (taken == fall-through) inserted as its own
+        // edit is a valid program with one successor edge; so is a neutral jump. Both
+        // revert through their inverse.
+        for neutral in [branch_to(2), mk("s_branch", vec![Operand::Label(BlockId(2))])] {
+            let (b, _) = round_trip(&a, insert(Cursor::end(BlockId(1)), vec![neutral]));
+            b.program.validate().unwrap();
+            assert_eq!(b.program.kernels[0].body.blocks[1].succs.as_slice(), &[BlockId(2)]);
+        }
     }
 
     #[test]
@@ -2722,6 +2772,41 @@ mod tests {
         assert!(matches!(err, EditError::BarrierPairing(_)), "the new edge skips the s_barrier_wait: {err:?}");
     }
 
+    /// Inserted control may choose among inserted code: a forward Retarget is
+    /// admitted when every instruction it skips is edit-inserted (prio-entry's
+    /// priority switch, attn-sync's guarded signal), and refused when it would
+    /// skip an original instruction.
+    #[test]
+    fn inserted_branch_may_skip_inserted_code_only() {
+        let a = analyzed(vec![I(vmov(3, int(1))), I(vmov(4, int(2))), I(vmov(5, int(3))), I(endpgm())]);
+        let l = ids(&a);
+        let next = a.program.kernels[0].body.insts.len();
+        let (cmp, alt, branch, jump) = (InstId(next), InstId(next + 1), InstId(next + 2), InstId(next + 3));
+        // [v3, s_cmp, cbr->B1] [s_nop 0 ; s_branch->B2] [v4, v5, s_endpgm]
+        let script = Edit::Batch(vec![
+            insert(at(0, l[1]), vec![mk("s_cmp_eq_u32", vec![s(0), int(0)]), nop()]),
+            Edit::SplitBlock { at: at(0, alt) },
+            Edit::SplitBlock { at: at(1, l[1]) },
+            insert(Cursor::end(BlockId(0)), vec![mk("s_cbranch_scc1", vec![Operand::Label(BlockId(1))])]),
+            insert(Cursor::end(BlockId(1)), vec![mk("s_branch", vec![Operand::Label(BlockId(2))])]),
+            Edit::Retarget { branch, to: BlockId(2) },
+        ]);
+        let (b, _) = round_trip(&a, script);
+        let body = &b.program.kernels[0].body;
+        assert_eq!(body.layout, vec![l[0], cmp, branch, alt, jump, l[1], l[2], l[3]]);
+        assert!(matches!(body.blocks[0].term, Terminator::Branch { taken: BlockId(2), fallthrough: BlockId(1), .. }));
+        assert_eq!(body.blocks[2].preds.as_slice(), &[BlockId(0), BlockId(1)], "a join after inserted code");
+        // Skipping the original v_mov v4 is refused.
+        let skip_original = Edit::Batch(vec![
+            insert(at(0, l[1]), vec![mk("s_cmp_eq_u32", vec![s(0), int(0)])]),
+            Edit::SplitBlock { at: at(0, l[1]) },
+            Edit::SplitBlock { at: at(1, l[2]) },
+            insert(Cursor::end(BlockId(0)), vec![mk("s_cbranch_scc1", vec![Operand::Label(BlockId(1))])]),
+            Edit::Retarget { branch: InstId(next + 1), to: BlockId(2) },
+        ]);
+        assert!(matches!(edit(&a, skip_original).unwrap_err(), EditError::Retarget(_)));
+    }
+
     // ---- SetWait / SetDelayHint ----
 
     #[test]
@@ -2770,7 +2855,7 @@ mod tests {
         assert_eq!(descriptor.compute_pgm_rsrc1.vgpr_granules(), 12);
         round_trip(&a, desc(DescriptorChange::KernargSize(96)));
         round_trip(&a, desc(DescriptorChange::GroupSegmentFixedSize(4096)));
-        let arg = |name: &str, offset, size| Kernarg { name: name.into(), size, offset, value_kind: "by_value".into() };
+        let arg = |name: &str, offset, size| Kernarg { name: name.into(), size, offset, value_kind: "by_value".into(), address_space: None };
         assert!(bad_meta(meta(MetaChange::AppendArgs(vec![arg("a", 64, 8), arg("b", 68, 4)]))), "overlap");
         assert!(bad_meta(meta(MetaChange::AppendArgs(vec![arg("a", 66, 4)]))), "misaligned");
         assert!(bad_meta(meta(MetaChange::SetVgprCount(64))));
