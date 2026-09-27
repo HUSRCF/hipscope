@@ -652,6 +652,21 @@ impl Qwen4Bundle {
             .map_err(|error| BundleError::Forward(error.to_string()))
     }
 
+    pub(crate) fn mtp_truncate_retain(
+        &mut self,
+        snapshot: MtpGpuStateSnapshot,
+        keep: usize,
+    ) -> Result<(), BundleError> {
+        let compress = self.config.indexer_compress_ratio;
+        self.mtp
+            .as_mut()
+            .ok_or_else(|| {
+                BundleError::Forward("Qwen4 MTP resources are not attached".to_string())
+            })?
+            .truncate_retain(snapshot, keep, compress)
+            .map_err(|error| BundleError::Forward(error.to_string()))
+    }
+
     pub(crate) fn mtp_validate_commit(
         &self,
         snapshot: MtpGpuStateSnapshot,

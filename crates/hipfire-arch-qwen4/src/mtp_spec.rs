@@ -994,7 +994,7 @@ impl MtpDrafter for Qwen4MtpDrafter {
                     .rollback_verify_rows_retain(gpu, target_snapshot, target_accept_len + 1, &block)
                     .map_err(|error| error.to_string())?;
             }
-            timers.mark(gpu, "mtp_replay");
+            timers.mark(gpu, "mtp_commit");
             let mtp_ticket = snapshot
                 .as_ref()
                 .copied()
@@ -1008,6 +1008,12 @@ impl MtpDrafter for Qwen4MtpDrafter {
                     .ok_or_else(|| "Qwen4 MTP step position overflow".to_string())?;
                 picks
                     .mtp_advance_token(gpu, last_draft, None, last_position, false)
+                    .map_err(|error| error.to_string())?;
+            } else if target_accept_len < drafts.len() {
+                // The draft steps already consumed the kept prefix with the
+                // replay's exact inputs: keep them, drop the rejected tail.
+                picks
+                    .mtp_truncate_retain(mtp_ticket, target_accept_len + 1)
                     .map_err(|error| error.to_string())?;
             } else {
                 picks

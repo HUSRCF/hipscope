@@ -954,6 +954,34 @@ impl MtpGpuState {
         self.restore_impl(gpu, snapshot, false)
     }
 
+    /// Keep the first `keep` tokens consumed since the ticket's mark,
+    /// retaining the ticket. The K/V, raw and pooled key arenas are append
+    /// storage (later rows are invisible until overwritten; a step re-pools
+    /// every complete block), and the selection and own hidden are rebuilt by
+    /// the next window's first step, so only the marks move.
+    pub(crate) fn truncate_retain(
+        &mut self,
+        snapshot: MtpGpuStateSnapshot,
+        keep: usize,
+        compress: usize,
+    ) -> Result<(), MtpGpuError> {
+        self.snapshot_arena.validate_ticket(self, &snapshot)?;
+        let mark = self.snapshot_arena.mark;
+        let position = mark.position + keep;
+        if position > self.position {
+            return Err(invalid(format!(
+                "MTP truncate to {position} is past the consumed end {}",
+                self.position
+            )));
+        }
+        self.position = position;
+        self.full_len = position;
+        self.raw_len = position;
+        self.pooled_len = position / compress;
+        self.step_index = mark.step_index.wrapping_add(keep);
+        Ok(())
+    }
+
     pub(crate) fn validate_commit(&self, snapshot: MtpGpuStateSnapshot) -> Result<(), MtpGpuError> {
         self.snapshot_arena.validate_ticket(self, &snapshot)
     }
@@ -1134,6 +1162,15 @@ impl Qwen4MtpGpu {
         snapshot: MtpGpuStateSnapshot,
     ) -> Result<(), MtpGpuError> {
         self.state.restore_retain(gpu, snapshot)
+    }
+
+    pub(crate) fn truncate_retain(
+        &mut self,
+        snapshot: MtpGpuStateSnapshot,
+        keep: usize,
+        compress: usize,
+    ) -> Result<(), MtpGpuError> {
+        self.state.truncate_retain(snapshot, keep, compress)
     }
 
     pub(crate) fn validate_commit(&self, snapshot: MtpGpuStateSnapshot) -> Result<(), MtpGpuError> {
