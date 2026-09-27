@@ -95,6 +95,8 @@ impl Effects {
             let mut counters = CounterSet::default();
             counters.insert(counter);
             let (class, order) = if name.starts_with("s_load") { (MemClass::SmemLoad, OrderType::Smem) }
+                // Returns its SGPRs through KMcnt, out of order like SMEM (RDNA4 §5.7.1).
+                else if name.starts_with("s_sendmsg_rtn") { (MemClass::SmemLoad, OrderType::Smem) }
                 else if name.starts_with("ds_load") { (MemClass::DsLoad, OrderType::Ds) }
                 else if name.starts_with("ds_store") { (MemClass::DsStore, OrderType::Ds) }
                 else if name.starts_with("ds_") { (MemClass::DsAtomic { returns: !out.defs.is_empty() }, OrderType::Ds) }

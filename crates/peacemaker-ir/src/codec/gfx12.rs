@@ -70,6 +70,8 @@ fn operand(name: &str, bits: u16, code: u32, literal: Option<u32>, row: &OpRow, 
         if row.name == "s_sendmsg" && code == 3 { return Ok(Operand::SendMsg(Msg { id: 3, op: 0 })); }
         return Ok(Operand::Imm(if form == Form::Sopk { ImmField::Sopk(code as i16) } else { ImmField::Sopp(code as i16) }));
     }
+    // `s_sendmsg_rtn_*` carries its message id in the SSRC0 field (not a source selector).
+    if name == "SSRC0" && row.name.starts_with("s_sendmsg_rtn") { return Ok(Operand::SendMsg(Msg { id: code as u8, op: 0 })); }
     if name == "SOFFSET" && form == Form::Smem && code == 124 {
         return Ok(Operand::Imm(ImmField::SmemOffset(field_value("IOFFSET", row, words) as i32)));
     }
@@ -110,6 +112,7 @@ fn operand(name: &str, bits: u16, code: u32, literal: Option<u32>, row: &OpRow, 
 fn encoded_operand(name: &str, bits: u16, op: &Operand, form: Form) -> Result<u32, DecodeError> {
     match (name, op) {
         ("SIMM16", Operand::SendMsg(Msg { id:3,op:0 })) => Ok(3),
+        ("SSRC0", Operand::SendMsg(Msg { id, op: 0 })) if form == Form::Sop1 => Ok(u32::from(*id)),
         ("SIMM16", Operand::Imm(ImmField::Sopp(n) | ImmField::Sopk(n))) => Ok((*n as u16).into()),
         ("SOFFSET", Operand::Imm(ImmField::SmemOffset(_))) if form == Form::Smem => Ok(124),
         ("SBASE", Operand::Reg(r)) if r.kind == Kind::S && r.base % 2 == 0 => Ok(u32::from(r.base / 2)),

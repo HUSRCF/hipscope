@@ -220,3 +220,9 @@ v_cvt_f32_f16_e32	vop1	0xb	VDST:32,SRC0:16	VDST	SRC0	-	-	v_cvt_f32_f16_e32 v3, v
 v_dual_max_num_f32	vopd	0xa	VDSTX:32,SRCX0:32,VSRCX1:32	VDSTX	SRCX0,VSRCX1	-	-	v_dual_max_num_f32 v2, v2, v2 :: v_dual_lshlrev_b32 v13, 2, v13	CAA20502 020C1A82	-
 v_max_num_f32_e64	vop3	0x116	VDST:32,SRC0:32,SRC1:32	VDST	SRC0,SRC1	-	-	v_max_num_f32_e64 v0, |v5|, |v5|	D5160300 02020B05	src2_unused:ignored:0x1ff:0x00/0x80/0x101,neg:honored:0x7,abs:honored:0x7,omod:ignored:0x3:0x0/0x1/0x2/0x3
 v_mov_b16_e32	vop1	0x1c	VDST:16,SRC0:16	VDST	SRC0,VDST	-	-	v_mov_b16_e32 v5.h, 0	7F0A3880	w0_extra:ignored:0x10000:0x0
+# M3: the instructions the profiler and attn-sync edits insert (pinned llvm-mc -mcpu=gfx1201 encodings).
+s_getreg_b32	sopk	0x11	SDST:32,SIMM16:16	SDST	SIMM16	-	-	s_getreg_b32 s30, hwreg(HW_REG_SHADER_CYCLES_LO)	B89EF81D	-
+s_sendmsg_rtn_b64	sop1	0x4d	SDST:64,SSRC0:32	SDST	-	-	Km:1	s_sendmsg_rtn_b64 s[12:13], sendmsg(MSG_RTN_GET_REALTIME)	BE8C4D83	-
+s_setprio	sopp	0x35	SIMM16:16	-	SIMM16	-	-	s_setprio 3	BFB50003	-
+v_writelane_b32	vop3	0x361	VDST:32,SRC0:32,SRC1:32,literal@last	VDST	SRC0,SRC1	-	-	v_writelane_b32 v239, 0x504d5046, 0	D76100EF 020100FF 504D5046	src2_unused:ignored:0x1ff:0x00/0x80/0x101
+global_store_addtid_b32	global	0x29	VSRC:32,SADDR:64	-	VSRC,SADDR	-	Store:1	global_store_addtid_b32 v239, s[28:29] offset:-8 th:TH_STORE_NT	EE0A401C 77900000 FFFFF800	w0_extra:ignored:0xc03f00:0x0,w1_extra:ignored:0x8001ff00:0x0,global_sve:honored:0x20000:0x0,global_scope:honored:0xc0000:0x0,global_th:honored:0x700000:0x0/0x100000,global_nv:honored:0x80:0x0
