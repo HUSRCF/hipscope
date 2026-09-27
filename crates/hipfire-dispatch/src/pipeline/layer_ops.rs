@@ -192,6 +192,36 @@ pub fn project_weights(
     }
     // Quantized weights of one FWHT basis and K read the same rotated input:
     // rotate it once for the whole group instead of once per weight.
+    // Few rows (speculative verify) on gfx11+: BF16 weights of one K share
+    // multi-row launches, four matrices at a time, each weight read once.
+    if (2..=8).contains(&rows) && gpu.arch_caps.has_gfx11_plus_simt() {
+        for i in 0..projections.len() {
+            let (weight, _) = projections[i];
+            if done[i] || weight.dtype != DType::BF16 {
+                continue;
+            }
+            let group: SmallVec<[usize; 4]> = (i..projections.len())
+                .filter(|&j| {
+                    !done[j] && projections[j].0.dtype == DType::BF16 && projections[j].0.k == weight.k
+                })
+                .collect();
+            for chunk in group.chunks(4) {
+                let part = |n: usize| {
+                    let (w, y) = projections[chunk[n.min(chunk.len() - 1)]];
+                    (w.buf, y, if n < chunk.len() { w.m } else { 0 })
+                };
+                hip(gpu.gemv_bf16_xf32_x4_rows(
+                    [part(0), part(1), part(2), part(3)],
+                    input,
+                    weight.k,
+                    rows,
+                ))?;
+                for &j in chunk {
+                    done[j] = true;
+                }
+            }
+        }
+    }
     for i in 0..projections.len() {
         if done[i] {
             continue;
@@ -306,6 +336,11 @@ fn project_rotated(
 ) -> Result<(), DispatchError> {
     if weight.dtype == DType::MQ6G256V2 && (2..=8).contains(&rows) {
         return hip(gpu.gemm_mq6g256v2_f32_rows(weight.buf, x, output, weight.m, weight.k, rows));
+    }
+    if weight.dtype == DType::BF16 && (2..=8).contains(&rows) && gpu.arch_caps.has_gfx11_plus_simt() {
+        let part = (weight.buf, output, weight.m);
+        let none = (weight.buf, output, 0);
+        return hip(gpu.gemv_bf16_xf32_x4_rows([part, none, none, none], x, weight.k, rows));
     }
     let result = match (weight.dtype, rows > 1) {
         (DType::BF16, false) => gpu.gemv_bf16_xf32(weight.buf, x, output, weight.m, weight.k),

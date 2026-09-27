@@ -14975,6 +14975,66 @@ impl Gpu {
             blob_builder,
         )
     }
+    /// [`Gpu::gemv_bf16_xf32_x4`] over `rows` (2..=8) activation rows: x is
+    /// `[rows, k]`, each output `[rows, m]`; every weight row is read once
+    /// and each output element is bitwise the one-row kernel's.
+    pub fn gemv_bf16_xf32_x4_rows(
+        &mut self,
+        parts: [(&GpuTensor, &GpuTensor, usize); 4],
+        x: &GpuTensor,
+        k: usize,
+        rows: usize,
+    ) -> HipResult<()> {
+        const FUNCS: [&str; 7] = [
+            "gemv_bf16_xf32_x4_rows_r2",
+            "gemv_bf16_xf32_x4_rows_r3",
+            "gemv_bf16_xf32_x4_rows_r4",
+            "gemv_bf16_xf32_x4_rows_r5",
+            "gemv_bf16_xf32_x4_rows_r6",
+            "gemv_bf16_xf32_x4_rows_r7",
+            "gemv_bf16_xf32_x4_rows_r8",
+        ];
+        if !(2..=8).contains(&rows) {
+            return Err(hip_bridge::HipError::new(1, "gemv_bf16_xf32_x4_rows needs 2..=8 rows"));
+        }
+        let func = FUNCS[rows - 2];
+        self.bind_thread()?;
+        self.ensure_kernel("gemv_bf16_xf32", kernels::GEMV_BF16_XF32_SRC, func)?;
+        let w = parts.map(|(w, _, _)| w.buf.as_ptr());
+        let y = parts.map(|(_, y, _)| y.buf.as_ptr());
+        let m = parts.map(|(_, _, m)| m as i32);
+        let x_ptr = x.buf.as_ptr();
+        let k_val = k as i32;
+        let blocks: usize = parts.iter().map(|(_, _, m)| m).sum();
+        let mut params: Vec<*mut c_void> = Vec::with_capacity(13);
+        for p in &w {
+            params.push(p as *const _ as *mut c_void);
+        }
+        params.push(&x_ptr as *const _ as *mut c_void);
+        for p in &y {
+            params.push(p as *const _ as *mut c_void);
+        }
+        for v in &m {
+            params.push(v as *const _ as *mut c_void);
+        }
+        params.push(&k_val as *const _ as *mut c_void);
+        self.launch_maybe_blob(func, [blocks as u32, 1, 1], [32, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            for p in w {
+                b.push_ptr(p);
+            }
+            b.push_ptr(x_ptr);
+            for p in y {
+                b.push_ptr(p);
+            }
+            for v in m {
+                b.push_i32(v);
+            }
+            b.push_i32(k_val);
+            b
+        })
+    }
+
     pub fn deepseek4_gemv_mq2g256_lloyd_moe_down_residual_scaled_indexed(
         &mut self,
         expert_ptrs: &GpuTensor,
