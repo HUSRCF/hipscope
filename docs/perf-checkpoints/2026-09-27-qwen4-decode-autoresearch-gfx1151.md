@@ -45,7 +45,8 @@ update.
 - Serve route: `scripts/serve_harness.py --mode battery --sampling greedy
   --thinking high --max-think-tokens 512 --max-tokens 700 --mtp off
   --speculation off --max-seq 2048` against the run-247 daemon (md5
-  `33edbdb4b107f593cb0913a68816e6f3`): 5/5 turns `finish=stop`, no
+  `33edbdb4b107f593cb0913a68816e6f3`) and the run-270 daemon (md5
+  `90667a61b6edef0344c75c64af49ac88`): 5/5 turns `finish=stop` each, no
   runaway/empty/attractor, answers read and correct.
 
 ## Result
