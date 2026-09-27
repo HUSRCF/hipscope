@@ -16,19 +16,19 @@
 use crate::families::gemv::WeightRef;
 use crate::types::DispatchError;
 use rdna_compute::tensor_ops::{
-    argmax_f32, bf16_roundtrip_f32, gated_delta_chunk_route, gated_delta_conv_params,
-    gated_delta_conv_batched, gated_delta_gate_batched,
-    gated_delta_params_batched, gated_delta_step_batched, gated_delta_step_gated,
-    gated_delta_step_gate_wmma, hc_activation_fused_f32, hc_state_bf16_add_f32,
-    hc_state_bf16_to_f32, hyper_norm, hyper_norm_f16, hyper_norm_gate, hyper_read_projected,
-    hyper_read_up_fused, hyper_read_up_wmma, hyper_write, hyper_write_norm, HyperNextGates, indexed_attention_attention_batch,
+    argmax_f32, bf16_roundtrip_f32, gated_delta_chunk_route, gated_delta_conv_batched,
+    gated_delta_conv_params, gated_delta_gate_batched, gated_delta_params_batched,
+    gated_delta_step_batched, gated_delta_step_gate_wmma, gated_delta_step_gated,
+    hc_activation_fused_f32, hc_state_bf16_add_f32, hc_state_bf16_to_f32, hyper_norm,
+    hyper_norm_f16, hyper_norm_gate, hyper_read_projected, hyper_read_up_fused, hyper_read_up_wmma,
+    hyper_write, hyper_write_norm, indexed_attention_attention_batch,
     indexed_attention_cache_append_batch, indexed_attention_decode_prologue,
-    indexed_attention_norm_rope_batch,
-    indexed_attention_pool_rope, indexed_attention_select_batch, scale_f32, ArgmaxF32,
-    Bf16Roundtrip, GatedDeltaConv, GatedDeltaConvBatched, GatedDeltaGate, GatedDeltaGateBatched,
-    GatedDeltaParams, GatedDeltaParamsBatched, GatedDeltaStep, GatedDeltaStepBatched,
-    HcActivationFused, HyperNorm, HyperNormGate, HyperReadProjected, HyperReadUpFused, HyperWrite,
-    IndexedAttentionAttentionBatch, IndexedAttentionCacheAppendBatch, IndexedAttentionDecodePrologue,
+    indexed_attention_norm_rope_batch, indexed_attention_pool_rope, indexed_attention_select_batch,
+    scale_f32, ArgmaxF32, Bf16Roundtrip, GatedDeltaConv, GatedDeltaConvBatched, GatedDeltaGate,
+    GatedDeltaGateBatched, GatedDeltaParams, GatedDeltaParamsBatched, GatedDeltaStep,
+    GatedDeltaStepBatched, HcActivationFused, HyperNextGates, HyperNorm, HyperNormGate,
+    HyperReadProjected, HyperReadUpFused, HyperWrite, IndexedAttentionAttentionBatch,
+    IndexedAttentionCacheAppendBatch, IndexedAttentionDecodePrologue,
     IndexedAttentionNormRopeBatch, IndexedAttentionPoolRope, IndexedAttentionSelectBatch, ScaleF32,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};

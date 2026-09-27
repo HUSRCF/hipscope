@@ -147,13 +147,15 @@ pub fn gated_delta_step_gated(
     }
     validate_gated_delta_gate(g)?;
     let width = g.output.numel();
-    let rotate_into = rotate_into.filter(|r| {
-        p.value_heads % 2 == 0 && r.dtype == DType::F32 && r.numel() >= width
-    });
+    let rotate_into = rotate_into
+        .filter(|r| p.value_heads % 2 == 0 && r.dtype == DType::F32 && r.numel() >= width);
     gated_delta_step_launch(gpu, p, Some(g), rotate_into)?;
     if let Some(rotated) = rotate_into {
-        gpu.scratch.prerotated =
-            Some((g.output.buf.as_ptr() as usize, rotated.buf.as_ptr() as usize, width));
+        gpu.scratch.prerotated = Some((
+            g.output.buf.as_ptr() as usize,
+            rotated.buf.as_ptr() as usize,
+            width,
+        ));
     }
     Ok(rotate_into.is_some())
 }
@@ -1781,7 +1783,9 @@ pub fn indexed_attention_decode_prologue(
     }
     let kv_width = checked_product(p.kv_heads, p.head_dim, "QSA prologue KV width")?;
     let end = checked_add(p.position, 1, "QSA prologue position")?;
-    let bad = [p.index_q_norm, p.q_norm, p.k_norm].iter().any(|n| n.dtype != DType::BF16)
+    let bad = [p.index_q_norm, p.q_norm, p.k_norm]
+        .iter()
+        .any(|n| n.dtype != DType::BF16)
         || p.index_heads == 0
         || p.heads == 0
         || p.kv_heads == 0
@@ -3074,7 +3078,12 @@ pub fn argmax_f32_host(gpu: &mut Gpu, logits: &GpuTensor) -> HipResult<u32> {
     indices.shape = vec![4];
     argmax_f32(
         gpu,
-        &ArgmaxF32 { logits, indices: &indices, rows: 1, vocab: logits.numel() },
+        &ArgmaxF32 {
+            logits,
+            indices: &indices,
+            rows: 1,
+            vocab: logits.numel(),
+        },
     )?;
     Ok(gpu.download_f32(&result)?[0].to_bits())
 }
@@ -4003,7 +4012,10 @@ mod tests {
             // Ties resolve to the first index.
             (vec![1.0, 5.0, 3.0, 5.0], 1),
             // Non-finite values never win.
-            (vec![f32::NAN, f32::INFINITY, 2.0, f32::NEG_INFINITY, 2.0], 2),
+            (
+                vec![f32::NAN, f32::INFINITY, 2.0, f32::NEG_INFINITY, 2.0],
+                2,
+            ),
             // No finite value: index 0.
             (vec![f32::NAN, f32::INFINITY, f32::NEG_INFINITY], 0),
             (long, 5),

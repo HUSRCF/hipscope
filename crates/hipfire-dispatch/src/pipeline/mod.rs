@@ -3645,8 +3645,7 @@ fn qt44_shared_activation_in_routed(
         && p.recipe.bf16_round_trip()
         && !p.skip_shared
         && p.ep_mode == crate::families::moe::MoeEpMode::None
-        && p
-            .shared
+        && p.shared
             .as_ref()
             .is_some_and(|shared| shared.intermediate <= p.mi.div_ceil(128) * 128)
 }
@@ -3668,7 +3667,11 @@ fn decode_activation_stage(
         if p.recipe.bf16_round_trip() {
             // Activation and the down projection's 128-wide rotation, one pass
             // (with the shared expert's activation when it rides along).
-            let shared = match (qt44_shared_activation_in_routed(p, route), shared_views, &p.shared) {
+            let shared = match (
+                qt44_shared_activation_in_routed(p, route),
+                shared_views,
+                &p.shared,
+            ) {
                 (true, Some((gate, up)), Some(shared)) => Some((
                     gate,
                     up,

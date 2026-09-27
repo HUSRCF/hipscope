@@ -740,13 +740,15 @@ pub fn execute_validated_steps<'a>(
             if let (Step::HyperWrite(write), Some(Step::HyperRead(read))) =
                 (&steps[i], steps.get(i + 1))
             {
-                use crate::pipeline::layer_ops::{execute_hyper_write_then_read, hyper_gate_quarters};
+                use crate::pipeline::layer_ops::{
+                    execute_hyper_write_then_read, hyper_gate_quarters,
+                };
                 let quarters_in = gates_ready
                     .filter(|(at, _)| *at == i)
                     .and_then(|(_, slot)| hyper_gate_quarters(write, slot));
                 let slot = gates_ready.map_or(0, |(_, slot)| slot ^ 1);
-                let next = next_fused_hyper_write(steps, i + 2, read)
-                    .and_then(|j| match &steps[j] {
+                let next =
+                    next_fused_hyper_write(steps, i + 2, read).and_then(|j| match &steps[j] {
                         Step::HyperWrite(next) => {
                             hyper_gate_quarters(next, slot).map(|q| (j, next, q))
                         }

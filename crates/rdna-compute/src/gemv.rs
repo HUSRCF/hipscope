@@ -3426,7 +3426,10 @@ impl Gpu {
             || mixed.numel() < hidden
             || rotated.numel() < hidden
         {
-            return Err(hip_bridge::HipError::new(1, "hyper_read_projected_rotate shape"));
+            return Err(hip_bridge::HipError::new(
+                1,
+                "hyper_read_projected_rotate shape",
+            ));
         }
         self.bind_thread()?;
         const FUNC: &str = "hyper_read_projected_rotate_f32";
@@ -3448,17 +3451,24 @@ impl Gpu {
             &s2 as *const _ as *mut c_void,
             &h_val as *const _ as *mut c_void,
         ];
-        self.launch_maybe_blob(FUNC, [(hidden / 256) as u32, 1, 1], [256, 1, 1], 0, &mut params, || {
-            let mut b = hip_bridge::KernargBlob::new();
-            b.push_ptr(n_ptr);
-            b.push_ptr(u_ptr);
-            b.push_ptr(m_ptr);
-            b.push_ptr(r_ptr);
-            b.push_ptr(s1);
-            b.push_ptr(s2);
-            b.push_i32(h_val);
-            b
-        })?;
+        self.launch_maybe_blob(
+            FUNC,
+            [(hidden / 256) as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(n_ptr);
+                b.push_ptr(u_ptr);
+                b.push_ptr(m_ptr);
+                b.push_ptr(r_ptr);
+                b.push_ptr(s1);
+                b.push_ptr(s2);
+                b.push_i32(h_val);
+                b
+            },
+        )?;
         self.scratch.prerotated = Some((m_ptr as usize, r_ptr as usize, hidden));
         Ok(())
     }
@@ -3726,7 +3736,10 @@ impl Gpu {
     ) -> HipResult<()> {
         let shared_n = shared.map_or(0, |(_, _, out, _)| out.numel());
         if shared_n > k.div_ceil(128) * 128 {
-            return Err(hip_bridge::HipError::new(1, "shared activation wider than the routed grid"));
+            return Err(hip_bridge::HipError::new(
+                1,
+                "shared activation wider than the routed grid",
+            ));
         }
         self.bind_thread()?;
         const FUNC: &str = "mq_rotate_x_128_v2_silu_bf16";
