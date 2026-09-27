@@ -735,6 +735,10 @@ name = "test_mrope_rope_parity"
 required-features = ["lab"]
 
 [[example]]
+name = "test_kv_slot_desc_ports"
+required-features = ["lab"]
+
+[[example]]
 name = "test_multislot_ops"
 required-features = ["lab"]
 

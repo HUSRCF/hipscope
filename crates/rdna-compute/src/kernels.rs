@@ -4329,7 +4329,6 @@ pub const MQ4V2_FP8_FRAGMENT_REPACK_GFX1201: &[u8] =
 pub const GEMM_MQ4G256V2_RESIDUAL_IU4_PM_V2B_GFX1151: &[u8] =
     include_bytes!("../../../kernels/gemm_mq4g256v2_residual_iu4_pm_v2b_gfx1151.hxaco");
 
-
 /// gfx1201 A8 MQ4v2: standalone K128 int8 quantizer and all three GEMM entries.
 pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_I8_GFX12_SRC: &str = concat!(
     include_str!("../../../kernels/src/block_i8_128_quant.hip"),
@@ -4742,12 +4741,18 @@ macro_rules! fp8_v2_symfold_source {
 
 fp8_v2_symfold_source!(
     GEMM_GATE_UP_MQ4G256V2_WMMA_FP8_GFX12_V2_SYMFOLD_SRC,
-    256, 64, 8, "",
+    256,
+    64,
+    8,
+    "",
     "gemm_gate_up_mq4g256v2_wmma_fp8_v2_gfx1201_symfold"
 );
 fp8_v2_symfold_source!(
     GEMM_GATE_UP_MQ4G256V2_WMMA_FP8_GFX12_V2_B128X128_SYMFOLD_SRC,
-    128, 128, 8, "",
+    128,
+    128,
+    8,
+    "",
     "gemm_gate_up_mq4g256v2_wmma_fp8_v2_b128x128_gfx1201_symfold"
 );
 /// Paired-row gate/up computes h in the gate output, preserving the two-plane
@@ -4765,72 +4770,114 @@ pub const GEMM_GATE_UP_MQ4G256V2_WMMA_FP8_GFX12_V2_B128X128_SILU_H_BF16_SRC: &st
 
 fp8_v2_symfold_source!(
     GEMM_GATE_UP_MQ4G256V2_WMMA_FP8_GFX12_V2_B64X256_SYMFOLD_SRC,
-    64, 256, 8, "",
+    64,
+    256,
+    8,
+    "",
     "gemm_gate_up_mq4g256v2_wmma_fp8_v2_b64x256_gfx1201_symfold"
 );
 fp8_v2_symfold_source!(
     GEMM_GATE_UP_MQ4G256V2_WMMA_FP8_GFX12_V2_B128X64W4_SYMFOLD_SRC,
-    128, 64, 4, "",
+    128,
+    64,
+    4,
+    "",
     "gemm_gate_up_mq4g256v2_wmma_fp8_v2_b128x64w4_gfx1201_symfold"
 );
 fp8_v2_symfold_source!(
     GEMM_MQ4G256V2_RESIDUAL_WMMA_FP8_GFX12_V2_SYMFOLD_SRC,
-    256, 64, 8, "#define HIPFIRE_FP8_RESIDUAL 1\n",
+    256,
+    64,
+    8,
+    "#define HIPFIRE_FP8_RESIDUAL 1\n",
     "gemm_mq4g256v2_residual_wmma_fp8_v2_gfx1201_symfold"
 );
 fp8_v2_symfold_source!(
     GEMM_MQ4G256V2_RESIDUAL_WMMA_FP8_GFX12_V2_B128X128_SYMFOLD_SRC,
-    128, 128, 8, "#define HIPFIRE_FP8_RESIDUAL 1\n",
+    128,
+    128,
+    8,
+    "#define HIPFIRE_FP8_RESIDUAL 1\n",
     "gemm_mq4g256v2_residual_wmma_fp8_v2_b128x128_gfx1201_symfold"
 );
 fp8_v2_symfold_source!(
     GEMM_MQ4G256V2_RESIDUAL_WMMA_FP8_GFX12_V2_B64X256_SYMFOLD_SRC,
-    64, 256, 8, "#define HIPFIRE_FP8_RESIDUAL 1\n",
+    64,
+    256,
+    8,
+    "#define HIPFIRE_FP8_RESIDUAL 1\n",
     "gemm_mq4g256v2_residual_wmma_fp8_v2_b64x256_gfx1201_symfold"
 );
 fp8_v2_symfold_source!(
     GEMM_MQ4G256V2_RESIDUAL_WMMA_FP8_GFX12_V2_B128X64W4_SYMFOLD_SRC,
-    128, 64, 4, "#define HIPFIRE_FP8_RESIDUAL 1\n",
+    128,
+    64,
+    4,
+    "#define HIPFIRE_FP8_RESIDUAL 1\n",
     "gemm_mq4g256v2_residual_wmma_fp8_v2_b128x64w4_gfx1201_symfold"
 );
 fp8_v2_symfold_source!(
     GEMM_QKVZA_MQ4G256V2_WMMA_FP8_GFX12_V2_SYMFOLD_SRC,
-    256, 64, 8, "#define HIPFIRE_FP8_QKVZA 1\n",
+    256,
+    64,
+    8,
+    "#define HIPFIRE_FP8_QKVZA 1\n",
     "gemm_qkvza_mq4g256v2_wmma_fp8_v2_gfx1201_symfold"
 );
 fp8_v2_symfold_source!(
     GEMM_QKVZA_MQ4G256V2_WMMA_FP8_GFX12_V2_B128X128_SYMFOLD_SRC,
-    128, 128, 8, "#define HIPFIRE_FP8_QKVZA 1\n",
+    128,
+    128,
+    8,
+    "#define HIPFIRE_FP8_QKVZA 1\n",
     "gemm_qkvza_mq4g256v2_wmma_fp8_v2_b128x128_gfx1201_symfold"
 );
 fp8_v2_symfold_source!(
     GEMM_QKVZA_MQ4G256V2_WMMA_FP8_GFX12_V2_B64X256_SYMFOLD_SRC,
-    64, 256, 8, "#define HIPFIRE_FP8_QKVZA 1\n",
+    64,
+    256,
+    8,
+    "#define HIPFIRE_FP8_QKVZA 1\n",
     "gemm_qkvza_mq4g256v2_wmma_fp8_v2_b64x256_gfx1201_symfold"
 );
 fp8_v2_symfold_source!(
     GEMM_QKVZA_MQ4G256V2_WMMA_FP8_GFX12_V2_B128X64W4_SYMFOLD_SRC,
-    128, 64, 4, "#define HIPFIRE_FP8_QKVZA 1\n",
+    128,
+    64,
+    4,
+    "#define HIPFIRE_FP8_QKVZA 1\n",
     "gemm_qkvza_mq4g256v2_wmma_fp8_v2_b128x64w4_gfx1201_symfold"
 );
 fp8_v2_symfold_source!(
     GEMM_QKV_MQ4G256V2_WMMA_FP8_GFX12_V2_SYMFOLD_SRC,
-    256, 64, 8, "#define HIPFIRE_FP8_QKV 1\n",
+    256,
+    64,
+    8,
+    "#define HIPFIRE_FP8_QKV 1\n",
     "gemm_qkv_mq4g256v2_wmma_fp8_v2_gfx1201_symfold"
 );
 fp8_v2_symfold_source!(
     GEMM_QKV_MQ4G256V2_WMMA_FP8_GFX12_V2_B128X128_SYMFOLD_SRC,
-    128, 128, 8, "#define HIPFIRE_FP8_QKV 1\n",
+    128,
+    128,
+    8,
+    "#define HIPFIRE_FP8_QKV 1\n",
     "gemm_qkv_mq4g256v2_wmma_fp8_v2_b128x128_gfx1201_symfold"
 );
 fp8_v2_symfold_source!(
     GEMM_QKV_MQ4G256V2_WMMA_FP8_GFX12_V2_B64X256_SYMFOLD_SRC,
-    64, 256, 8, "#define HIPFIRE_FP8_QKV 1\n",
+    64,
+    256,
+    8,
+    "#define HIPFIRE_FP8_QKV 1\n",
     "gemm_qkv_mq4g256v2_wmma_fp8_v2_b64x256_gfx1201_symfold"
 );
 fp8_v2_symfold_source!(
     GEMM_QKV_MQ4G256V2_WMMA_FP8_GFX12_V2_B128X64W4_SYMFOLD_SRC,
-    128, 64, 4, "#define HIPFIRE_FP8_QKV 1\n",
+    128,
+    64,
+    4,
+    "#define HIPFIRE_FP8_QKV 1\n",
     "gemm_qkv_mq4g256v2_wmma_fp8_v2_b128x64w4_gfx1201_symfold"
 );
 pub const GEMM_GATE_UP_MQ5G256V2_WMMA_GFX12_BT_SRC: &str =
@@ -6970,7 +7017,6 @@ pub const ATTENTION_FP8_E4M3_FA2_GQA_QRESIDENT_V2_Q8_A4EPI_GFX1201_SRC: &str = c
     include_str!("../../../kernels/src/attention_q8_0_fa2_gqa.gfx1201.hip")
 );
 
-
 /// gfx11 (RDNA3) sister of [`ATTENTION_Q8_0_FA2_GQA_GFX1201_SRC`]
 /// (research opt-in). One workgroup per KV head x 8 positions; K/V
 /// dequantized once per KT32 tile into two swizzled f16 LDS planes
@@ -7825,7 +7871,6 @@ pub const GATED_DELTA_NET_Q8_COMPACT2_DPP_GFX1151_SRC: &str = concat!(
     "#define HIPFIRE_GDN_QK_HEAD_DIV 2\n#define HIPFIRE_GDN_MIN_BLOCKS 2\n#define HIPFIRE_GDN_DPP_REDUCE 1\n#define HIPFIRE_GDN_KERNEL gated_delta_net_q8_compact2_dpp_gfx1151\n",
     include_str!("../../../kernels/src/gated_delta_net_q8_fast.hip")
 );
-
 
 /// Tree-aware variant of gated_delta_net_q8. Per-token S-tile persist-write
 /// to a caller-owned tape buffer, so sibling tokens read the parent's
@@ -9157,6 +9202,87 @@ pub const GEMM_F16_X_F16_WMMA_LDS256_SRC: &str =
 /// sufficient: every produced coordinate and block scale must have identical
 /// bits to the generic implementation.
 #[cfg(test)]
+mod moe_topk_renorm_barriers {
+    use super::MOE_TOPK_RENORM_K8_SRC;
+
+    /// Strip `//` and `/* */` comments and macro line-continuations, then
+    /// collapse whitespace, so the structural check below is not defeated by
+    /// reformatting or by a comment that happens to contain the tokens.
+    fn normalize(src: &str) -> String {
+        let mut out = String::with_capacity(src.len());
+        let b = src.as_bytes();
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] == b'/' && i + 1 < b.len() && b[i + 1] == b'/' {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            } else if b[i] == b'/' && i + 1 < b.len() && b[i + 1] == b'*' {
+                i += 2;
+                while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(b.len());
+            } else if b[i] == b'\\' {
+                i += 1; // macro line-continuation
+            } else {
+                out.push(b[i] as char);
+                i += 1;
+            }
+        }
+        out.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// Every winner-invalidation must be followed by a barrier BEFORE the next
+    /// round restages `warp_v[warp_id]` / `warp_i[warp_id]`.
+    ///
+    /// The hazard this pins: `warp_i[0]` is dual-purpose in this kernel — it is
+    /// both warp 0's per-warp staging slot AND the slot through which a round's
+    /// winner is published to every thread. Without a barrier after the winner
+    /// is consumed, warp 0 races into the next round and overwrites `warp_i[0]`
+    /// while a slower warp is still reading it as the winner. That warp then
+    /// fails to invalidate the expert just picked, so the SAME expert is
+    /// selected again — the top-8 comes back with a duplicate and a distinct
+    /// expert missing.
+    ///
+    /// Not hypothetical: measured at ~1 occurrence per 46k router calls on Maple
+    /// (arch 15) from bit-identical input logits. It is a silent quality fault —
+    /// the duplicated expert is double-weighted and a legitimately selected one
+    /// never runs. The sibling kernels (`moe_softmax_topk_k8`, both `_batched`
+    /// variants) are immune because they mask through a separate
+    /// `smem_v`/`picked_idx` instead of aliasing the staging array.
+    #[test]
+    fn invalidation_is_closed_by_a_barrier_before_the_next_restage() {
+        let norm = normalize(MOE_TOPK_RENORM_K8_SRC);
+        let sites: Vec<usize> = norm.match_indices("cur_i = -1;").map(|(i, _)| i).collect();
+        assert_eq!(
+            sites.len(),
+            2,
+            "expected exactly two winner-invalidation sites (the exact-256 fast \
+             path and the n_exp<=BLOCK_SIZE path); found {}. If the kernel was \
+             restructured, re-derive this invariant rather than deleting it.",
+            sites.len()
+        );
+        for site in sites {
+            let rest = &norm[site..];
+            let barrier = rest
+                .find("__syncthreads();")
+                .expect("no barrier at all follows a winner-invalidation");
+            if let Some(restage) = rest.find("warp_v[warp_id] =") {
+                assert!(
+                    barrier < restage,
+                    "winner-invalidation is not barrier-closed: the next \
+                     `warp_v[warp_id] =` restage is reachable before any \
+                     `__syncthreads()`. warp 0 can clobber `warp_i[0]` while \
+                     another warp still reads it as this round's winner, which \
+                     yields a DUPLICATED expert in the top-8."
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod gfx1201_e8_decode_identity {
     fn generic_cvt_e4m3(b: u8) -> f32 {
         let exp = ((b >> 3) & 0xF) as i32;
@@ -9318,15 +9444,13 @@ mod dispatch_tests {
         ));
         assert!(GATED_NORM_MQ_ROTATE_AWQ_GFX1100_SRC
             .contains("#define HIPFIRE_GATED_NORM_MQ_ROTATE_AWQ 1"));
-        assert!(GATED_NORM_MQ_ROTATE_AWQ_GFX1151_SRC.starts_with(
-            "#define HIPFIRE_GATED_NORM_MQ_ROTATE_AWQ 1"
-        ));
+        assert!(GATED_NORM_MQ_ROTATE_AWQ_GFX1151_SRC
+            .starts_with("#define HIPFIRE_GATED_NORM_MQ_ROTATE_AWQ 1"));
         assert!(GATED_NORM_MQ_ROTATE_AWQ_GFX1151_SRC.contains(
             "#define HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL gated_norm_mq_rotate_awq_gfx1151"
         ));
-        assert!(GATED_NORM_MQ_ROTATE_AWQ_GFX1201_SRC.starts_with(
-            "#define HIPFIRE_GATED_NORM_MQ_ROTATE_AWQ 1"
-        ));
+        assert!(GATED_NORM_MQ_ROTATE_AWQ_GFX1201_SRC
+            .starts_with("#define HIPFIRE_GATED_NORM_MQ_ROTATE_AWQ 1"));
         assert!(GATED_NORM_MQ_ROTATE_AWQ_GFX1201_SRC.contains(
             "#define HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL gated_norm_mq_rotate_awq_gfx1201"
         ));
@@ -9342,15 +9466,13 @@ mod dispatch_tests {
         ));
         assert!(ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_AWQ_GFX1100_SRC
             .contains("#define HIPFIRE_ATTENTION_REDUCE_GATED_MQ_AWQ 1"));
-        assert!(ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_AWQ_GFX1151_SRC.starts_with(
-            "#define HIPFIRE_ATTENTION_REDUCE_GATED_MQ_AWQ 1"
-        ));
+        assert!(ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_AWQ_GFX1151_SRC
+            .starts_with("#define HIPFIRE_ATTENTION_REDUCE_GATED_MQ_AWQ 1"));
         assert!(ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_AWQ_GFX1151_SRC.contains(
             "#define HIPFIRE_ATTENTION_REDUCE_GATED_MQ_KERNEL attention_flash_q8_0_reduce_gated_mq_rotate_awq_gfx1151"
         ));
-        assert!(ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_AWQ_GFX1201_SRC.starts_with(
-            "#define HIPFIRE_ATTENTION_REDUCE_GATED_MQ_AWQ 1"
-        ));
+        assert!(ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_AWQ_GFX1201_SRC
+            .starts_with("#define HIPFIRE_ATTENTION_REDUCE_GATED_MQ_AWQ 1"));
         assert!(ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_AWQ_GFX1201_SRC.contains(
             "#define HIPFIRE_ATTENTION_REDUCE_GATED_MQ_KERNEL attention_flash_q8_0_reduce_gated_mq_rotate_awq_gfx1201"
         ));
@@ -9385,8 +9507,7 @@ mod dispatch_tests {
         assert!(!MQ_ROTATE_X_I4_SRC.contains("#define HIPFIRE_ROTATE_AWQ 1"));
         assert!(MQ_ROTATE_X_AWQ_I4_SRC.contains("#define HIPFIRE_ROTATE_AWQ 1\n"));
         assert!(MQ_ROTATE_X_I4_SRC.contains("#define HIPFIRE_ROTATE_KERNEL mq_rotate_x_i4"));
-        assert!(MQ_ROTATE_X_AWQ_I4_SRC
-            .contains("#define HIPFIRE_ROTATE_KERNEL rotate_x_mq_awq_i4"));
+        assert!(MQ_ROTATE_X_AWQ_I4_SRC.contains("#define HIPFIRE_ROTATE_KERNEL rotate_x_mq_awq_i4"));
         // Shared recipe (struct + emit helper) must precede the kernel body,
         // and the standalone symbol must stay out of the concat.
         for src in [MQ_ROTATE_X_I4_SRC, MQ_ROTATE_X_AWQ_I4_SRC] {
@@ -9398,7 +9519,6 @@ mod dispatch_tests {
             assert!(recipe < kernel);
         }
     }
-
 
     #[test]
     fn qwen2_bias_symbols_are_isolated_from_existing_qkv_modules() {

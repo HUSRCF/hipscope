@@ -100,18 +100,19 @@ use rdna_compute::slot_pool::SlotPool;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 /// Pack a `KvSlotDesc` table byte-identically to `kernels/src/kv_slot_desc.h`
-/// (`k_base: u64, v_base: u64, seq_len: i32, cap: i32`, 24 bytes, no padding
+/// (`block_table: u64, legacy_k_base: u64, legacy_v_base: u64, seq_len: i32, page_tokens: i32`, 32 bytes, no padding
 /// between fields on this target). Mirrors the packer SP1's Task 7 harness
 /// uses (`rdna-compute/examples/test_batched_attn_slots.rs::pack_descs`) —
 /// duplicated rather than shared because that packer lives in `examples/`
 /// (test-only) and this is production `src/`.
 fn pack_descs(descs: &[KvSlotDesc]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(descs.len() * 24);
+    let mut out = Vec::with_capacity(descs.len() * 32);
     for d in descs {
-        out.extend_from_slice(&d.k_base.to_ne_bytes());
-        out.extend_from_slice(&d.v_base.to_ne_bytes());
+        out.extend_from_slice(&d.block_table.to_ne_bytes());
+        out.extend_from_slice(&d.legacy_k_base.to_ne_bytes());
+        out.extend_from_slice(&d.legacy_v_base.to_ne_bytes());
         out.extend_from_slice(&d.seq_len.to_ne_bytes());
-        out.extend_from_slice(&d.cap.to_ne_bytes());
+        out.extend_from_slice(&d.page_tokens.to_ne_bytes());
     }
     out
 }
@@ -1434,8 +1435,9 @@ fn q8_flash_prefill_wmma_eligible(gpu: &Gpu, head_dim: usize, batch_size: usize)
 /// `single_slot`, when `Some((k_base, slab_bytes))`, means exactly one slot
 /// is active in this step (true for every `n_slots == 1` call, and for a
 /// larger pool whenever only one slot has live rows this step). `k_base` is
-/// that slot's byte offset into the shared arena (`SlotPool` guarantees
-/// `v_base == k_base`); slot 0 of a fresh pool always has `k_base == 0`, so
+/// that slot's byte offset into the shared arena. On Q8_0 the K and V
+/// per-position strides are equal, so `legacy_v_base == legacy_k_base`;
+/// slot 0 of a fresh pool always has `k_base == 0`, so
 /// this reduces byte-for-byte to the reference's own `k_cache`/`v_cache`
 /// addressing when `n_slots == 1`. This path is kept (rather than folded into
 /// the general multi-slot path below) because it is strictly cheaper: no
@@ -1763,8 +1765,9 @@ fn run_fullattn_layer_slots(
     )?;
 
     // 6. Batched KV write — slot-aware, one launch each for K and V across
-    // every slot. Both arenas resolve through `k_base`/`v_base`; correct
-    // under the Q8_0 ABI (`SlotPool` enforces `v_base == k_base`). asym3
+    // every slot. Both arenas resolve through the descriptor's
+    // `legacy_k_base`/`legacy_v_base`; equal under the Q8_0 ABI (the K and V
+    // per-position strides match). asym3
     // cannot use this path — its K/V strides differ — and this file never
     // routes asym3 through it (Q8_0-only scope).
     gpu.kv_cache_write_q8_0_batched_slots(
@@ -1776,6 +1779,7 @@ fn run_fullattn_layer_slots(
         n,
         Some(&desc_staging.descs_dev),
         Some(&desc_staging.row_slot_dev),
+        false,
     )?;
     gpu.kv_cache_write_q8_0_batched_slots(
         v_cache,
@@ -1786,6 +1790,7 @@ fn run_fullattn_layer_slots(
         n,
         Some(&desc_staging.descs_dev),
         Some(&desc_staging.row_slot_dev),
+        false,
     )?;
 
     // 7. Batched attend — slot-aware, one launch across every slot.
@@ -2063,6 +2068,7 @@ fn run_fullattn_moe_layer_slots(
         n,
         Some(&desc_staging.descs_dev),
         Some(&desc_staging.row_slot_dev),
+        false,
     )?;
     gpu.kv_cache_write_q8_0_batched_slots(
         v_cache,
@@ -2073,6 +2079,7 @@ fn run_fullattn_moe_layer_slots(
         n,
         Some(&desc_staging.descs_dev),
         Some(&desc_staging.row_slot_dev),
+        false,
     )?;
 
     // 7. Batched attend — slot-aware, one launch across every slot.
@@ -2530,7 +2537,7 @@ pub fn forward_batch_slots_graphed(
         );
     }
 
-    let physical_cap = pool.descriptors()[0].cap as usize;
+    let physical_cap = pool.cap_tokens();
     let true_ctx = (batch.positions.iter().copied().max().unwrap_or(0) as usize + 1)
         .min(physical_cap)
         .max(1);
@@ -2863,7 +2870,7 @@ pub fn forward_batch_slots_opts(
         }
     }
 
-    let physical_cap = pool.descriptors()[0].cap as usize;
+    let physical_cap = pool.cap_tokens();
     let max_ctx_len = opts.ctx_override.unwrap_or(
         (batch.positions.iter().copied().max().unwrap_or(0) as usize + 1)
             .min(physical_cap)
@@ -2884,7 +2891,7 @@ pub fn forward_batch_slots_opts(
             .iter()
             .position(|&m| m > 0)
             .expect("active_slots == 1 implies exactly one m_per_slot entry > 0");
-        let k_base = pool.descriptors()[slot_idx].k_base;
+        let k_base = pool.descriptors()[slot_idx].legacy_k_base;
         let slab_bytes = pool.arena_bytes() / n_slots;
         Some((k_base, slab_bytes))
     } else {

@@ -224,6 +224,7 @@ impl Gpu {
         )
     }
 
+
     /// Batched F16 embedding lookup. Copies N rows of an F16 table into
     /// `output[n × dim]` (F32), reading token ids from a device buffer so the
     /// caller's chain stays GPU-resident. The F16→F32 widening is exact, so the
