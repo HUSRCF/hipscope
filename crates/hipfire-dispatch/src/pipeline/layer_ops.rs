@@ -23,15 +23,15 @@ use rdna_compute::tensor_ops::{
     hyper_norm_f16, hyper_norm_gate, hyper_read_projected, hyper_read_up_fused, hyper_read_up_wmma,
     hyper_write, hyper_write_norm, indexed_attention_attention_batch,
     indexed_attention_cache_append_batch, indexed_attention_decode_prologue,
-    indexed_attention_norm_rope_batch, indexed_attention_pool_rope, indexed_attention_pool_rope_incremental,
-    indexed_attention_select_batch,
-    indexed_attention_select_batch_mirrored,
-    scale_f32, ArgmaxF32, Bf16Roundtrip, GatedDeltaConv, GatedDeltaConvBatched, GatedDeltaGate,
-    GatedDeltaGateBatched, GatedDeltaParams, GatedDeltaParamsBatched, GatedDeltaStep,
-    GatedDeltaStepBatched, HcActivationFused, HyperNextGates, HyperNorm, HyperNormGate,
-    HyperReadProjected, HyperReadUpFused, HyperWrite, IndexedAttentionAttentionBatch,
-    IndexedAttentionCacheAppendBatch, IndexedAttentionDecodePrologue,
-    IndexedAttentionNormRopeBatch, IndexedAttentionPoolRope, IndexedAttentionSelectBatch, ScaleF32,
+    indexed_attention_norm_rope_batch, indexed_attention_pool_rope,
+    indexed_attention_pool_rope_incremental, indexed_attention_select_batch,
+    indexed_attention_select_batch_mirrored, scale_f32, ArgmaxF32, Bf16Roundtrip, GatedDeltaConv,
+    GatedDeltaConvBatched, GatedDeltaGate, GatedDeltaGateBatched, GatedDeltaParams,
+    GatedDeltaParamsBatched, GatedDeltaStep, GatedDeltaStepBatched, HcActivationFused,
+    HyperNextGates, HyperNorm, HyperNormGate, HyperReadProjected, HyperReadUpFused, HyperWrite,
+    IndexedAttentionAttentionBatch, IndexedAttentionCacheAppendBatch,
+    IndexedAttentionDecodePrologue, IndexedAttentionNormRopeBatch, IndexedAttentionPoolRope,
+    IndexedAttentionSelectBatch, ScaleF32,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 use smallvec::SmallVec;
@@ -434,7 +434,7 @@ impl HyperReadOp<'_> {
 }
 
 pub fn execute_hyper_read(gpu: &mut Gpu, op: &HyperReadOp<'_>) -> Result<(), DispatchError> {
-    execute_hyper_read_inner(gpu, op, false, false)
+    execute_hyper_read_inner(gpu, op, false, None)
 }
 
 /// `normalized_ready`: a preceding fused launch already wrote this read's
@@ -443,7 +443,7 @@ fn execute_hyper_read_inner(
     gpu: &mut Gpu,
     op: &HyperReadOp<'_>,
     normalized_ready: bool,
-    rotate_mixed: bool,
+    rotate_into: Option<&GpuTensor>,
 ) -> Result<(), DispatchError> {
     let wide = checked_mul(op.branches, op.hidden, "hyper read wide")?;
     let input = view(op.input, 0, op.rows * wide);
@@ -611,14 +611,16 @@ fn execute_hyper_read_inner(
         return hip(hyper_read_up_fused(gpu, &read));
     }
     project_weight(gpu, &op.input_mix_up, &low, &up, op.rows, Some(op.rotation))?;
-    if rotate_mixed && op.rows == 1 && op.branches == 4 && op.hidden % 256 == 0 {
-        // The next step rotates `mixed` into this same scratch first: write
-        // that rotation here too (the step's rotate_x_mq then skips).
+    if let Some(rotated) = rotate_into.filter(|r| {
+        op.rows == 1 && op.branches == 4 && op.hidden % 256 == 0 && r.numel() >= op.hidden
+    }) {
+        // The next step rotates `mixed` into `rotated` first: write that
+        // rotation here too (the step's rotate_x_mq then skips).
         return hip(gpu.hyper_read_projected_rotate(
             &normalized,
             &up,
             &mixed,
-            &view(op.rotation, 0, op.hidden),
+            &view(rotated, 0, op.hidden),
             op.hidden,
         ));
     }
@@ -742,8 +744,8 @@ pub fn hyper_gate_quarters(op: &HyperWriteOp<'_>, slot: usize) -> Option<GpuTens
 /// and gate GEMV already ran); with `next` it also produces the quarters for
 /// `next`, the following hyper write of these streams, into `next`'s slot,
 /// and zero-fills `clear`'s prefix (the caller skips that step). With
-/// `rotate_mixed` the read also leaves `mq_rotate_x(mixed)` in its rotation
-/// scratch for the step that follows.
+/// `rotate_into` the read also leaves `mq_rotate_x(mixed)` there for the step
+/// that follows.
 /// Returns `None`, having launched nothing, when the pair does not have that
 /// shape, else whether `next`'s quarters were produced.
 pub fn execute_hyper_write_then_read(
@@ -753,7 +755,7 @@ pub fn execute_hyper_write_then_read(
     quarters_in: Option<&GpuTensor>,
     next: Option<(&HyperWriteOp<'_>, &GpuTensor)>,
     clear: Option<&ClearOp<'_>>,
-    rotate_mixed: bool,
+    rotate_into: Option<&GpuTensor>,
 ) -> Result<Option<bool>, DispatchError> {
     let fusable = write.rows == 1
         && read.rows == 1
@@ -814,7 +816,7 @@ pub fn execute_hyper_write_then_read(
         next_gates.as_ref(),
         clear.as_ref(),
     ))?;
-    execute_hyper_read_inner(gpu, read, true, rotate_mixed)?;
+    execute_hyper_read_inner(gpu, read, true, rotate_into)?;
     Ok(Some(next_gates.is_some()))
 }
 

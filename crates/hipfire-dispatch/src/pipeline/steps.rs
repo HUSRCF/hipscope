@@ -763,15 +763,18 @@ pub fn execute_validated_steps<'a>(
                 // the read writes that rotation too (consumed by the mixer's
                 // first rotate, cleared after that step).
                 let mixed = read.mixed.buf.as_ptr();
-                let rotation = read.rotation.buf.as_ptr();
-                let rotate_mixed = match steps.get(i + 2) {
-                    Some(Step::GatedDeltaNet(op)) => {
-                        op.input.buf.as_ptr() == mixed && op.rotation.buf.as_ptr() == rotation
+                let rotate_into = match steps.get(i + if clear.is_some() { 3 } else { 2 }) {
+                    Some(Step::GatedDeltaNet(op)) if op.input.buf.as_ptr() == mixed => {
+                        Some(op.rotation)
                     }
-                    Some(Step::IndexedAttention(op)) => {
-                        op.input.buf.as_ptr() == mixed && op.rotation.buf.as_ptr() == rotation
+                    Some(Step::IndexedAttention(op)) if op.input.buf.as_ptr() == mixed => {
+                        Some(op.rotation)
                     }
-                    _ => false,
+                    Some(Step::Moe(call)) => call
+                        .decode_params()
+                        .filter(|p| p.x_norm.buf.as_ptr() == mixed && !p.x_rot_prerotated)
+                        .map(|p| p.x_rot_local),
+                    _ => None,
                 };
                 if let Some(produced) = execute_hyper_write_then_read(
                     gpu,
@@ -780,7 +783,7 @@ pub fn execute_validated_steps<'a>(
                     quarters_in.as_ref(),
                     next.as_ref().map(|(_, op, q)| (*op, q)),
                     clear,
-                    rotate_mixed,
+                    rotate_into,
                 )? {
                     gates_ready = next.filter(|_| produced).map(|(j, _, _)| (j, slot));
                     i += if clear.is_some() { 3 } else { 2 };
@@ -788,7 +791,11 @@ pub fn execute_validated_steps<'a>(
                 }
             }
             launch_op(gpu, ctx, &steps[i])?;
-            gpu.scratch.prerotated = None;
+            // A pending prerotated input lives until its consumer step ran;
+            // a sealed MoE consumes it in one of its granular stages.
+            if !matches!(steps[i], Step::Moe(_) | Step::MoeStage(..)) {
+                gpu.scratch.prerotated = None;
+            }
             i += 1;
         }
     }

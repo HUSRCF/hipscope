@@ -2467,7 +2467,10 @@ fn indexed_attention_pool_rope_impl(
     incremental: bool,
 ) -> HipResult<()> {
     if incremental && p.position.is_none() {
-        return Err(HipError::new(0, "incremental QSA pooling needs a declared position"));
+        return Err(HipError::new(
+            0,
+            "incremental QSA pooling needs a declared position",
+        ));
     }
     for tensor in [p.raw_keys, p.pooled] {
         ensure_f32(tensor)?;
