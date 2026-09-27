@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Qwen4 decode on gfx1151: 19.2 → 29.7 tok/s (1131-token prompt, greedy,
+- Qwen4 decode on gfx1151: 19.2 → 29.8 tok/s (1131-token prompt, greedy,
   `qwen3.8-flash-next.mq6q8-pleq8`). Per-token dispatches drop by fusing the
   small kernels between the streaming GEMVs (HC write + next HC read norm and
   the next write's gate, QSA decode prologue, GDN step + gated norm + output

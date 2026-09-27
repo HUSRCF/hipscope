@@ -4,7 +4,7 @@
 
 **Disposition:** measured local deltas on `gfx1151`, landed on branch
 `autoresearch/improve-autoregressive-decode-performance-for-qw-20260926`
-(`922308c38` → `47420b9ea`). Not a G5 admission, not a retained-replay
+(`922308c38` → `8a9b5961f`). Not a G5 admission, not a retained-replay
 certification, not a cross-architecture result, and not a product speed-floor
 update.
 
@@ -51,11 +51,11 @@ update.
 
 ## Result
 
-| | start (run 181, `922308c38`) | end (run 270, `47420b9ea`) |
+| | start (run 181, `922308c38`) | end (run 273, `8a9b5961f`) |
 |---|---:|---:|
-| decode tok/s | 19.20 | **29.73** (+54.8%) |
+| decode tok/s | 19.20 | **29.82** (+55.3%) |
 | 8-chunk decode KLD | 0.072049 | 0.069977 |
-| prefill tok/s | 1238.2 | 1262.0 |
+| prefill tok/s | 1238.2 | 1258.8 |
 
 Per-token profile from mid-campaign (run 200 state, 25.7 tok/s) to run 247:
 1685 → 1039 dispatches, span 40.4 → 35.5 ms (profiler-inflated), idle gaps
@@ -130,6 +130,10 @@ use. `hyper_norm` (`879ad6c4f`, `247ea5d8a`), MoE down GEMV (`0957e4fa1`,
   loop — the row loop's 1-byte quant loads and broadcast scale loads were the
   limit (`47420b9ea`, 226 → 241 GB/s, ~0.2 ms/token). The same staging for the
   MQ6 and MoE-down GEMVs did not help.
+- MoE top-10 combine in 64-thread blocks (40 instead of 10 workgroups for
+  one decode row; `8a9b5961f`). The opposite — the HC read mix+rotate as one
+  wave per 256 columns with every load up front — was 3.7% slower: these
+  small kernels want many threads in flight, not deep per-lane batches.
 - GDN q/k norm: BF16 squares computed in parallel, thread 0 only sums them in
   order (`bbcdce045`); MoE combine and the GDN K=4 conv load every operand up
   front (`6d09e50bb`).
