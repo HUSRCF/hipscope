@@ -2220,7 +2220,8 @@ extern "C" __global__ void indexed_attention_attention_f32_batched_serial(
 // row's weight is the same expf, and every channel sums its weights and
 // products in selected-row order.  Weights are exponentiated once per row
 // (not per channel), and the value loads of UNROLL rows are issued before
-// their in-order accumulation.  Invalid rows keep weight 0 and select value
+// their in-order accumulation (rows are kept as cache offsets, token *
+// kv_stride).  Invalid rows keep weight 0 and select value
 // 0, adding +0.0 to sums that are never -0.0.
 extern "C" __global__ __launch_bounds__(256) void indexed_attention_attention_f32_batched(
     const float* q_with_gate,
@@ -2258,7 +2259,7 @@ extern "C" __global__ __launch_bounds__(256) void indexed_attention_attention_f3
     for (int selected_row = tid; selected_row < selected_len; selected_row += (int)blockDim.x) {
         int token = row_selected[selected_row];
         bool ok = token >= 0 && token < full_capacity && token < visible;
-        row_tokens[selected_row] = ok ? token : -1;
+        row_tokens[selected_row] = ok ? token * kv_stride : -1;
         float score = 0.0f;
         if (ok) {
             const float* key = keys + token * kv_stride;
@@ -2314,14 +2315,25 @@ extern "C" __global__ __launch_bounds__(256) void indexed_attention_attention_f3
     const float* values = full_values + kv_head * head_dim + channel;
     float denominator = 0.0f;
     float numerator = 0.0f;
-    constexpr int UNROLL = 32;
+    // Value loads run one batch ahead of the in-order accumulation.
+    constexpr int UNROLL = 24;
     int i = 0;
-    for (; i + UNROLL <= selected_len; i += UNROLL) {
-        float value[UNROLL];
+    float value[UNROLL];
+    if (selected_len >= UNROLL) {
 #pragma unroll
         for (int u = 0; u < UNROLL; ++u) {
-            const int token = row_tokens[i + u];
-            value[u] = values[(token < 0 ? 0 : token) * kv_stride];
+            const int offset = row_tokens[u];
+            value[u] = values[(unsigned)(offset < 0 ? 0 : offset)];
+        }
+    }
+    for (; i + UNROLL <= selected_len; i += UNROLL) {
+        float next[UNROLL];
+        if (i + 2 * UNROLL <= selected_len) {
+#pragma unroll
+            for (int u = 0; u < UNROLL; ++u) {
+                const int offset = row_tokens[i + UNROLL + u];
+                next[u] = values[(unsigned)(offset < 0 ? 0 : offset)];
+            }
         }
 #pragma unroll
         for (int u = 0; u < UNROLL; ++u) {
@@ -2329,11 +2341,13 @@ extern "C" __global__ __launch_bounds__(256) void indexed_attention_attention_f3
             denominator += weight;
             numerator += weight * (row_tokens[i + u] < 0 ? 0.0f : value[u]);
         }
+#pragma unroll
+        for (int u = 0; u < UNROLL; ++u) value[u] = next[u];
     }
     for (; i < selected_len; ++i) {
         const int token = row_tokens[i];
         const float weight = row_scores[i];
-        const float value = token < 0 ? 0.0f : values[token * kv_stride];
+        const float value = token < 0 ? 0.0f : values[(unsigned)token];
         denominator += weight;
         numerator += weight * value;
     }
