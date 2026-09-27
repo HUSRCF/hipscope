@@ -4,7 +4,7 @@
 
 **Disposition:** measured local deltas on `gfx1151`, landed on branch
 `autoresearch/improve-autoregressive-decode-performance-for-qw-20260926`
-(`922308c38` → `f4dc7f9b2`). Not a G5 admission, not a retained-replay
+(`922308c38` → `939cadb71`). Not a G5 admission, not a retained-replay
 certification, not a cross-architecture result, and not a product speed-floor
 update.
 
@@ -50,11 +50,11 @@ update.
 
 ## Result
 
-| | start (run 181, `922308c38`) | end (run 254, `f4dc7f9b2`) |
+| | start (run 181, `922308c38`) | end (run 269, `939cadb71`) |
 |---|---:|---:|
-| decode tok/s | 19.20 | **29.41** (+53.2%) |
+| decode tok/s | 19.20 | **29.63** (+54.3%) |
 | 8-chunk decode KLD | 0.072049 | 0.069977 |
-| prefill tok/s | 1238.2 | 1266.7 |
+| prefill tok/s | 1238.2 | 1264.8 |
 
 Per-token profile from mid-campaign (run 200 state, 25.7 tok/s) to run 247:
 1685 → 1039 dispatches, span 40.4 → 35.5 ms (profiler-inflated), idle gaps
@@ -62,7 +62,8 @@ between dispatches 4.8 → 3.0 ms; runs 250-254 removed about 60 more. The large
 (`gemv_mq6g256v2_x4`, the MoE gate/up and down GEMVs, the BF16 HC GEMVs, the
 Q8 LM head) run at 190-230 GB/s, close to what this box streams; what remains
 above them is per-dispatch overhead (~2.7 us gap plus ~1.5 us minimum kernel)
-and a few latency-bound kernels (QSA attention ~79 us/layer, GDN step ~35
+and a few latency-bound kernels (QSA attention ~79 us/layer, ~60 after
+`78aa7664a`; GDN step ~35
 us/layer, the fused HC write kernel ~7 us/sublayer).
 
 ## What worked — reusable levers
@@ -116,6 +117,13 @@ use. `hyper_norm` (`879ad6c4f`, `247ea5d8a`), MoE down GEMV (`0957e4fa1`,
   (`baee3fc4a`).
 - QSA select rank loop: float4 LDS reads (`3e57d0777`, `68d406672`): 29 → 13
   us/layer.
+- QSA attention PV: the selected rows are kept as cache offsets (32-bit
+  scalar-base loads instead of 64-bit per-lane address math) and each value
+  batch loads one batch ahead of the in-order accumulation (`78aa7664a`):
+  72 → 47 us warm in isolation.
+- MoE gate/up (K = 2560): eight rows per 256-thread block read one LDS copy of
+  x; the per-wave x re-reads (8× the 4-bit weight bytes) were L2-bound
+  (`939cadb71`, 89 → 85 us in isolation).
 - GDN q/k norm: BF16 squares computed in parallel, thread 0 only sums them in
   order (`bbcdce045`); MoE combine and the GDN K=4 conv load every operand up
   front (`6d09e50bb`).
@@ -141,6 +149,21 @@ use. `hyper_norm` (`879ad6c4f`, `247ea5d8a`), MoE down GEMV (`0957e4fa1`,
   tail, wider MoE down loads, PV unroll 64, float4 router denominator reads,
   32-deep GDN state load batches: no change or slower.
 - Non-bit-exact MoE down with 8 lanes per row: +2% but KLD 0.071630 > gate.
+- Router top-10 in the last-arriving wave of the gate-side x4 GEMV, the shared
+  expert's BF16 down rows as an 11th rank of the routed down launch (with the
+  scaled add in the combine), and a 1024-thread QSA select with split rank
+  counts: all bitwise, none faster (the work moves into a serialized tail).
+- Pipelined QSA key loads: -6 us warm, +13 us with a cold cache; decode is
+  the cold case.
+- Deferring decode PLE staging past layers 0-1 and stream-ordered H2D copies:
+  no change — the host prefix is ~0.1 ms/token (step build 87 us), enqueue
+  1.8 ms/token, far below the 34 ms of GPU work.
+- Prefetching the next dense GEMV's weights into the 32 MiB MALL (warm reads
+  ~850 GB/s vs ~220 cold): a second stream paced by HIP events costs ~4 us
+  per event; extra prefetch workgroups inside QSA attention made the GEMV 3×
+  faster but slowed attention by the same time. Latency-bound kernels are not
+  idle DRAM windows.
+- LDS-shared x for the dense MQ6 and BF16 GEMVs and the MoE down: no gain.
 - Retained PM4 replay (measured with a local ROCm root that finds ROCr): same
   decode rate as ordinary HIP — the inter-dispatch gap is GPU-side.
   `HIP_FORCE_DEV_KERNARG=1`, `ROC_ACTIVE_WAIT_TIMEOUT=0`: no change.
