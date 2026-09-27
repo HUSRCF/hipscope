@@ -61,6 +61,39 @@
 // qt44 through the V1 batched sister) silently mis-decodes scale/zero and
 // produces fluent corruption. Dispatch must select by exact wire identity.
 
+// Qwen4 K = 2560 (ten groups): every header and payload load issues up
+// front instead of one quad (then the tail) per memory round trip. Group g
+// accumulates into acc[g & 3] in the loop's order; returns this lane's
+// (acc0 + acc1) + (acc2 + acc3).
+static __device__ __forceinline__ float mq4v2_gate_up_row10(
+    const char* __restrict__ row_ptr, const float* x_row, int tid
+) {
+    const int boff = tid * 4;
+    const int hoff = (tid < 16) ? 0 : 4;
+    unsigned int h[10], pk[10];
+#pragma unroll
+    for (int g = 0; g < 10; ++g) {
+        h[g] = *(const unsigned int*)(row_ptr + g * 136 + hoff);
+        pk[g] = *(const unsigned int*)(row_ptr + g * 136 + 8 + boff);
+    }
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+    for (int g = 0; g < 10; ++g) {
+        const float sc = __half2float(__ushort_as_half((unsigned short)(h[g] & 0xFFFFu)));
+        const float zp = __half2float(__ushort_as_half((unsigned short)(h[g] >> 16)));
+        const int b = g * 256 + tid * 8;
+        acc[g & 3] += (sc * (float)(pk[g] & 0xFu)        + zp) * x_row[b]
+                    + (sc * (float)((pk[g] >> 4) & 0xFu)  + zp) * x_row[b + 1]
+                    + (sc * (float)((pk[g] >> 8) & 0xFu)  + zp) * x_row[b + 2]
+                    + (sc * (float)((pk[g] >> 12) & 0xFu) + zp) * x_row[b + 3]
+                    + (sc * (float)((pk[g] >> 16) & 0xFu) + zp) * x_row[b + 4]
+                    + (sc * (float)((pk[g] >> 20) & 0xFu) + zp) * x_row[b + 5]
+                    + (sc * (float)((pk[g] >> 24) & 0xFu) + zp) * x_row[b + 6]
+                    + (sc * (float)((pk[g] >> 28) & 0xFu) + zp) * x_row[b + 7];
+    }
+    return (acc[0] + acc[1]) + (acc[2] + acc[3]);
+}
+
 __launch_bounds__(32, 16)
 extern "C" __global__ void gemv_mq4g256v2_moe_gate_up_k8_indexed_batched(
     const unsigned long long* __restrict__ expert_ptrs, // [n_exp]
@@ -92,35 +125,9 @@ extern "C" __global__ void gemv_mq4g256v2_moe_gate_up_k8_indexed_batched(
     const int quads = groups_per_row >> 2;
     const int tail = groups_per_row & 3;
 
-    // Qwen4 K = 2560 (ten groups): every header and payload load issues up
-    // front instead of one quad (then the tail) per memory round trip.
-    // Group g accumulates into acc[g & 3] in the loop's order.
+    // Qwen4 K = 2560: acc0 carries the folded lane sum.
     if (groups_per_row == 10) {
-        unsigned int h[10], pk[10];
-#pragma unroll
-        for (int g = 0; g < 10; ++g) {
-            h[g] = *(const unsigned int*)(row_ptr + g * 136 + hoff);
-            pk[g] = *(const unsigned int*)(row_ptr + g * 136 + 8 + boff);
-        }
-        float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-#pragma unroll
-        for (int g = 0; g < 10; ++g) {
-            const float sc = __half2float(__ushort_as_half((unsigned short)(h[g] & 0xFFFFu)));
-            const float zp = __half2float(__ushort_as_half((unsigned short)(h[g] >> 16)));
-            const int b = g * 256 + tid * 8;
-            acc[g & 3] += (sc * (float)(pk[g] & 0xFu)        + zp) * x_row[b]
-                        + (sc * (float)((pk[g] >> 4) & 0xFu)  + zp) * x_row[b + 1]
-                        + (sc * (float)((pk[g] >> 8) & 0xFu)  + zp) * x_row[b + 2]
-                        + (sc * (float)((pk[g] >> 12) & 0xFu) + zp) * x_row[b + 3]
-                        + (sc * (float)((pk[g] >> 16) & 0xFu) + zp) * x_row[b + 4]
-                        + (sc * (float)((pk[g] >> 20) & 0xFu) + zp) * x_row[b + 5]
-                        + (sc * (float)((pk[g] >> 24) & 0xFu) + zp) * x_row[b + 6]
-                        + (sc * (float)((pk[g] >> 28) & 0xFu) + zp) * x_row[b + 7];
-        }
-        acc0 = acc[0];
-        acc1 = acc[1];
-        acc2 = acc[2];
-        acc3 = acc[3];
+        acc0 = mq4v2_gate_up_row10(row_ptr, x_row, tid);
     } else for (int q = 0; q < quads; q++) {
         const int g = q << 2;
         const char* gp0 = row_ptr + g * 136;
@@ -207,10 +214,49 @@ extern "C" __global__ void gemv_mq4g256v2_moe_gate_up_k8_indexed_batched(
     }
     #undef TAIL_DOG
 
-    float acc = (acc0 + acc1) + (acc2 + acc3);
+    float acc = groups_per_row == 10 ? acc0 : (acc0 + acc1) + (acc2 + acc3);
     for (int offset = 16; offset > 0; offset >>= 1)
         acc += __shfl_down(acc, offset);
 
+    if (tid == 0) {
+        const int mi = M >> 1;
+        const long long base_out = (long long)bid * K_TOP * mi + (long long)krank * mi;
+        if (row < mi) {
+            y_gate[base_out + row] = acc;
+        } else {
+            y_up[base_out + (row - mi)] = acc;
+        }
+    }
+}
+
+// K = 2560 rows, eight per 256-thread block (grid (M / 8, K_TOP, N)): the
+// block's waves read one LDS copy of the token's x instead of each streaming
+// it from L2, which the per-wave x re-reads otherwise saturate. Each wave's
+// row is the kernel above's value, bit for bit.
+__launch_bounds__(256)
+extern "C" __global__ void gemv_mq4g256v2_moe_gate_up_k2560_rows8_indexed_batched(
+    const unsigned long long* __restrict__ expert_ptrs, // [n_exp]
+    const int* __restrict__ topk_indices,                // [N × K_TOP]
+    const float* __restrict__ x,                         // [N × 2560]
+    float* __restrict__ y_gate,                          // [N × K_TOP × MI]
+    float* __restrict__ y_up,                            // [N × K_TOP × MI]
+    int M, int K_TOP
+) {
+    __shared__ __align__(16) float xs[2560];
+    const int krank = blockIdx.y;
+    const int bid = blockIdx.z;
+    const float4* x4 = reinterpret_cast<const float4*>(x + (long long)bid * 2560);
+    for (int i = threadIdx.x; i < 640; i += 256) reinterpret_cast<float4*>(xs)[i] = x4[i];
+    __syncthreads();
+    const int row = blockIdx.x * 8 + (threadIdx.x >> 5);
+    if (row >= M) return;
+    const int tid = threadIdx.x & 31;
+    const int expert_id = topk_indices[bid * K_TOP + krank];
+    const char* __restrict__ row_ptr =
+        reinterpret_cast<const char*>(expert_ptrs[expert_id]) + (long long)row * 10 * 136;
+    float acc = mq4v2_gate_up_row10(row_ptr, xs, tid);
+    for (int offset = 16; offset > 0; offset >>= 1)
+        acc += __shfl_down(acc, offset);
     if (tid == 0) {
         const int mi = M >> 1;
         const long long base_out = (long long)bid * K_TOP * mi + (long long)krank * mi;

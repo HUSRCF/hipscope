@@ -12351,6 +12351,46 @@ impl Gpu {
         ];
         let bytes = batch_size * 10 * (crate::profile::gemv_hfq4g256_bytes(m, k) + m * 4);
         let timer = crate::profile::begin_timer(&self.hip, "gemv", FUNC, bytes);
+        if k == 2560 && m % 8 == 0 {
+            // Eight rows per block share an LDS copy of x (same row values).
+            const ROWS8: &str = "gemv_mq4g256v2_moe_gate_up_k2560_rows8_indexed_batched";
+            self.ensure_kernel(
+                FUNC,
+                kernels::GEMV_MQ4G256V2_MOE_GATE_UP_TOP10_INDEXED_BATCHED_SRC,
+                ROWS8,
+            )?;
+            let mut params: Vec<*mut c_void> = vec![
+                &pp as *const _ as *mut c_void,
+                &ip as *const _ as *mut c_void,
+                &xp as *const _ as *mut c_void,
+                &ygp as *const _ as *mut c_void,
+                &yup as *const _ as *mut c_void,
+                &m_val as *const _ as *mut c_void,
+                &kt_val as *const _ as *mut c_void,
+            ];
+            let result = self.launch_maybe_blob(
+                ROWS8,
+                [m as u32 / 8, 10, batch_size as u32],
+                [256, 1, 1],
+                0,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(pp);
+                    b.push_ptr(ip);
+                    b.push_ptr(xp);
+                    b.push_ptr(ygp);
+                    b.push_ptr(yup);
+                    b.push_i32(m_val);
+                    b.push_i32(kt_val);
+                    b
+                },
+            );
+            if let Some(t) = timer {
+                t.finish(&self.hip);
+            }
+            return result;
+        }
         let result = self.launch_maybe_blob(
             FUNC,
             [m as u32, 10, batch_size as u32],
