@@ -1136,7 +1136,17 @@ static __device__ __forceinline__ void gated_delta_conv_channel(
     float value = bf16_to_f32(kernel[channel * kernel_size + history_rows]) * current;
     // causal_conv1d uses the raw HF weight order: oldest history first,
     // newest history last, and the current token at the final tap.
-    for (int tap = 0; tap < history_rows; ++tap) {
+    if (history_rows == 3) {
+        // K = 4 (Qwen4): the three taps' loads issue together.
+        float w[3], h[3];
+#pragma unroll
+        for (int tap = 0; tap < 3; ++tap) {
+            w[tap] = bf16_to_f32(kernel[channel * kernel_size + tap]);
+            h[tap] = history[((cursor + tap) % 3) * channels + channel];
+        }
+#pragma unroll
+        for (int tap = 0; tap < 3; ++tap) value += w[tap] * bf16_to_f32(bf16_round(h[tap]));
+    } else for (int tap = 0; tap < history_rows; ++tap) {
         int row = (cursor + tap) % history_rows;
         value += bf16_to_f32(kernel[channel * kernel_size + tap])
             * bf16_to_f32(bf16_round(history[row * channels + channel]));

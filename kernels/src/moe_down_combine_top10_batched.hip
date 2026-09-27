@@ -31,26 +31,36 @@ extern "C" __global__ void moe_down_combine_top10_batched(
     const int token = blockIdx.y;
     if (column >= hidden || token >= tokens) return;
     const size_t token_slot = (size_t)token * 10;
+    // Every operand loads up front (one memory round trip); the ascending-
+    // expert order is then chosen in registers, accumulating as before.
+    int experts[10];
+    float weights[10], outputs[10];
+#pragma unroll
+    for (int rank = 0; rank < 10; ++rank) {
+        experts[rank] = topk_indices[token_slot + rank];
+        weights[rank] = topk_weights[token_slot + rank];
+        outputs[rank] = expert_outputs[(token_slot + rank) * hidden + column];
+    }
     __hip_bfloat16 accumulated = moe_top10_bf16_round(
         residual[(size_t)token * hidden + column]);
     int used_ranks = 0;
     for (int count = 0; count < 10; ++count) {
         int selected_rank = -1;
         int selected_expert = 0x7fffffff;
+        float selected_weight = 0.0f, selected_output = 0.0f;
+#pragma unroll
         for (int rank = 0; rank < 10; ++rank) {
-            if ((used_ranks & (1 << rank)) != 0) continue;
-            const int expert = topk_indices[token_slot + rank];
-            if (expert < selected_expert) {
-                selected_expert = expert;
+            if ((used_ranks & (1 << rank)) == 0 && experts[rank] < selected_expert) {
+                selected_expert = experts[rank];
                 selected_rank = rank;
+                selected_weight = weights[rank];
+                selected_output = outputs[rank];
             }
         }
         if (selected_rank < 0) break;
         used_ranks |= 1 << selected_rank;
-        const __hip_bfloat16 weight =
-            moe_top10_bf16_round(topk_weights[token_slot + selected_rank]);
-        const __hip_bfloat16 output = moe_top10_bf16_round(
-            expert_outputs[(token_slot + selected_rank) * hidden + column]);
+        const __hip_bfloat16 weight = moe_top10_bf16_round(selected_weight);
+        const __hip_bfloat16 output = moe_top10_bf16_round(selected_output);
         const __hip_bfloat16 weighted = moe_top10_bf16_round(
             moe_top10_bf16_to_f32(output) * moe_top10_bf16_to_f32(weight));
         accumulated = moe_top10_bf16_round(
