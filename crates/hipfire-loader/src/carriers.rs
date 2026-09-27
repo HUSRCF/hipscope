@@ -43,6 +43,16 @@ struct SourceMeta {
     arch_id: u32,
 }
 
+/// Discover a `.vl` sidecar file for the given trunk model path.
+///
+/// Same resolution the daemon uses (they are one implementation now, in
+/// [`hipfire_runtime::sidecar`]): `HIPFIRE_VL_FILE` env, then the
+/// `<stem>.vl` sibling candidates (`<stem>` also strips `.hfq` and a quant
+/// suffix, so `model.mq4v2.hfq` finds `model.vl`).
+fn discover_vl_path(model_path: &str) -> Option<std::path::PathBuf> {
+    hipfire_runtime::sidecar::resolve_vl_sidecar(model_path)
+}
+
 fn resolve_source_meta(src: &ModelSource, path: &str) -> Result<SourceMeta, String> {
     match src {
         ModelSource::Hfq(hfq) => Ok(SourceMeta {
@@ -219,18 +229,27 @@ fn resolve_qwen_kv_pair(
     use hipfire_runtime::kv_mode::{self, KvPair};
     let mode_raw = kv_mode_from_ctx(ctx);
     let pair = kv_mode::resolve_kv_pair(
-        &mode_raw, ctx.kv_k_override, ctx.kv_v_override, policy,
-        ctx.gpu.arch.as_str(), ctx.qwen_default_q8,
-    ).map_err(|e| e.to_string())?;
+        &mode_raw,
+        ctx.kv_k_override,
+        ctx.kv_v_override,
+        policy,
+        ctx.gpu.arch.as_str(),
+        ctx.qwen_default_q8,
+    )
+    .map_err(|e| e.to_string())?;
     match pair {
         KvPair::Native(k) => eprintln!(
             "  KV cache: requested mode={mode_raw}, effective KV={} (site {})",
-            kv_mode::qwen_k_display_name(k), policy.site
+            kv_mode::qwen_k_display_name(k),
+            policy.site
         ),
         KvPair::Split(k, v) => {
             let k_name = kv_mode::qwen_k_display_name(k);
             let v_name = kv_mode::qwen_v_display_name(v);
-            eprintln!("  KV cache: requested mode={mode_raw}, effective K={k_name} V={v_name} (site {})", policy.site);
+            eprintln!(
+                "  KV cache: requested mode={mode_raw}, effective K={k_name} V={v_name} (site {})",
+                policy.site
+            );
             eprintln!("  K={k_name} V={v_name}");
         }
     }
@@ -307,7 +326,10 @@ fn load_qwen35_pp(
         .collect();
     let pair = resolve_qwen_kv_pair(ctx, &hipfire_runtime::kv_mode::QWEN35_PP_POLICY)?;
     let mode = pair.k();
-    if pair.v().is_some_and(|v| v != hipfire_runtime::llama::VMode::Q8) {
+    if pair
+        .v()
+        .is_some_and(|v| v != hipfire_runtime::llama::VMode::Q8)
+    {
         return Err(format!(
             "qwen35: V={} requires pp=1 (site {}); multi-GPU has no lloyd-V constructor",
             hipfire_runtime::kv_mode::qwen_v_display_name(pair.v().expect("PP split pair")),
@@ -565,10 +587,87 @@ impl Carrier for Qwen35Carrier {
                 let (vision_config, vision_weights) = {
                     use hipfire_arch_qwen35_vl::Qwen35Vl;
                     use hipfire_runtime::arch::Architecture;
-                    let has_vision = hfq_file
+
+                    // Vision tower sidecar resolution: an explicit
+                    // `--vision-path` (or HIPFIRE_VL_FILE) must never be
+                    // shadowed by a co-located `<stem>.vl` sibling — the
+                    // operator's tower wins, and sibling discovery is only
+                    // the fallback.
+                    let vl_path = ctx
+                        .vision_path
+                        .as_ref()
+                        .map(std::path::PathBuf::from)
+                        // `vision_mode=off` suppresses sibling discovery too —
+                        // a co-located `<stem>.vl` must not load the tower
+                        // under the documented text-only default (the daemon
+                        // gates the explicit sidecar; this gates the probe).
+                        .or_else(|| {
+                            if ctx.vision_mode == "off" {
+                                None
+                            } else {
+                                discover_vl_path(ctx.path)
+                            }
+                        });
+                    let has_inline_vision = hfq_file
                         .tensor_data("model.visual.patch_embed.proj.weight")
                         .is_some();
-                    if has_vision {
+
+                    if let Some(vl) = &vl_path {
+                        eprintln!(
+                            "  loading vision weights from .vl sidecar: {}",
+                            vl.display()
+                        );
+                        let mut vl_hfq = hipfire_runtime::hfq::HfqFile::open(vl)
+                            .map_err(|e| format!("open .vl file {}: {e}", vl.display()))?;
+                        let vc = Qwen35Vl::config_from_hfq(&vl_hfq)
+                            .map_err(|e| format!(".vl vision_config: {e}"))?;
+                        // Identity: the tower's projector writes the trunk's
+                        // text hidden width. A sidecar paired with a different
+                        // trunk (a sibling `foo.vl` next to `bar.mq4`) would
+                        // load "successfully" and then misalign every image
+                        // embedding — refuse the mismatch at load time.
+                        // Probe the trunk's final norm under its real HFQ
+                        // names (`output_norm.weight` is GGUF-only and never
+                        // resolves here, which would skip the check entirely).
+                        let trunk_dim = [
+                            "model.language_model.norm.weight",
+                            "model.norm.weight",
+                            "norm.weight",
+                        ]
+                        .iter()
+                        .find_map(|n| hfq_file.find_tensor_info(n))
+                        .and_then(|t| t.shape.first().copied())
+                        .map(|d| d as usize);
+                        if let Some(trunk_dim) = trunk_dim {
+                            if vc.out_hidden_size != trunk_dim {
+                                return Err(format!(
+                                    "vision sidecar {} does not match trunk {}: projector \
+                                     output {} != trunk hidden {}",
+                                    vl.display(),
+                                    ctx.path,
+                                    vc.out_hidden_size,
+                                    trunk_dim
+                                ));
+                            }
+                        }
+
+                        // Fail the load, loudly: swallowing the error here
+                        // used to yield (Some(config), None) — a model whose
+                        // daemon-side image gate stays open (has_vision keys
+                        // off the config) but whose vision weights are gone.
+                        // The sequential path then panics on the unwrap and
+                        // the slots path rejects image requests with a
+                        // misleading "no vision encoder" message. A corrupt
+                        // or truncated .vl must be a load-time error the
+                        // operator can see.
+                        let vw = Qwen35Vl::load_weights(&mut vl_hfq, &vc, ctx.gpu)
+                            .map_err(|e| format!("VL weight load from .vl: {e:?}"))?;
+                        eprintln!(
+                            "  VL model: vision encoder (hidden={}, layers={})",
+                            vc.hidden_size, vc.num_layers
+                        );
+                        (Some(vc), Some(vw))
+                    } else if has_inline_vision {
                         let vc = Qwen35Vl::config_from_hfq(&hfq_file).ok();
                         match vc {
                             Some(vc) => {
@@ -679,8 +778,13 @@ impl Carrier for Qwen35Carrier {
                     .map(|t| *t == hipfire_arch_qwen35::qwen35::LayerType::FullAttention)
                     .collect();
                 let native_eligible = hipfire_runtime::kv_mode::qwen35_native_eligible(
-                    ctx.gpu.arch.as_str(), config.n_heads, config.n_kv_heads, config.head_dim,
-                    ctx.pp, false, ctx.cask.sidecar.is_some(),
+                    ctx.gpu.arch.as_str(),
+                    config.n_heads,
+                    config.n_kv_heads,
+                    config.head_dim,
+                    ctx.pp,
+                    false,
+                    ctx.cask.sidecar.is_some(),
                 );
                 let policy = hipfire_runtime::kv_mode::qwen35_policy_for_native(
                     &hipfire_runtime::kv_mode::QWEN35_PARO_POLICY,
@@ -1357,7 +1461,10 @@ impl Carrier for Deepseek4Carrier {
             hipfire_config::Deepseek4ComputePlacement::Single
         ) {
             if ctx.kv_backend != KvBackend::Legacy {
-                return Err("deepseek4 heterogeneous compressor owner requires admitted legacy backend".into());
+                return Err(
+                    "deepseek4 heterogeneous compressor owner requires admitted legacy backend"
+                        .into(),
+                );
             }
             let model = hipfire_arch_deepseek4::load_deepseek4_heterogeneous_model(
                 &src,
@@ -1453,7 +1560,11 @@ impl Carrier for Deepseek4Carrier {
         let advertised_context = config.max_position_embeddings;
         eprintln!(
             "  deepseek4 KV cache: {} growth to advertised context {advertised_context}",
-            if ctx.kv_backend == KvBackend::Vmm { "VMM" } else { "legacy" }
+            if ctx.kv_backend == KvBackend::Vmm {
+                "VMM"
+            } else {
+                "legacy"
+            }
         );
         Ok(LoadedModel {
             state: Some(Box::new(deepseek4::Deepseek4Bundle {

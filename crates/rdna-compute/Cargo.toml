@@ -735,10 +735,6 @@ name = "test_mrope_rope_parity"
 required-features = ["lab"]
 
 [[example]]
-name = "test_kv_slot_desc_ports"
-required-features = ["lab"]
-
-[[example]]
 name = "test_multislot_ops"
 required-features = ["lab"]
 
@@ -812,4 +808,16 @@ required-features = ["lab"]
 
 [[example]]
 name = "tmp_scratch_leak_probe"
+required-features = ["lab"]
+
+[[example]]
+name = "test_kv_slot_desc_ports"
+required-features = ["lab"]
+
+[[example]]
+name = "vit_qtiled_parity_probe"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_vit_attention_shapes"
 required-features = ["lab"]

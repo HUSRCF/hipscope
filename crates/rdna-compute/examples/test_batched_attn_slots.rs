@@ -80,10 +80,11 @@ fn pack_descs(descs: &[KvSlotDesc]) -> Vec<u8> {
 }
 
 /// build_arena is called once for K and once for V (different strides);
-/// each call independently numbers its own base offsets starting from 0
-/// (since build_arena sets `k_base == v_base == base` within one call).
-/// Merge the two so the final descriptor's k_base points into the K arena
-/// and v_base into the V arena.
+/// each call independently numbers its own base offsets starting from 0.
+/// Merge the two so the final descriptor's legacy_k_base points into the K
+/// arena and legacy_v_base into the V arena — for asym3 the K and V
+/// per-position strides differ, so the slab offsets genuinely differ and
+/// MUST NOT be collapsed into one field.
 fn merge_descs(k_descs: &[KvSlotDesc], v_descs: &[KvSlotDesc]) -> Vec<KvSlotDesc> {
     k_descs
         .iter()
@@ -718,7 +719,7 @@ fn run_general_reference(
             continue;
         }
         let desc = batch.descs[s];
-        let cap = rdna_compute::kv_slots::legacy_cap(desc.seq_len.max(0) as usize);
+        let cap = rdna_compute::kv_slots::legacy_cap(desc.seq_len as usize);
         let sl = shape.seq_lens[s];
         let k_view = batch
             .k_arena
@@ -1107,7 +1108,7 @@ fn run_lds_reference(gpu: &mut Gpu, shape: &Shape, batch: &LdsBatch) -> Vec<f32>
             continue;
         }
         let desc = batch.descs[s];
-        let cap = rdna_compute::kv_slots::legacy_cap(desc.seq_len.max(0) as usize);
+        let cap = rdna_compute::kv_slots::legacy_cap(desc.seq_len as usize);
         let sl = shape.seq_lens[s];
         let k_view = batch
             .k_arena
@@ -1354,7 +1355,7 @@ fn run_prefill_reference(
             continue;
         }
         let desc = batch.descs[s];
-        let cap = rdna_compute::kv_slots::legacy_cap(desc.seq_len.max(0) as usize);
+        let cap = rdna_compute::kv_slots::legacy_cap(desc.seq_len as usize);
         let k_view = batch
             .k_arena
             .sub_offset(desc.legacy_k_base as usize, cap * per_pos);
