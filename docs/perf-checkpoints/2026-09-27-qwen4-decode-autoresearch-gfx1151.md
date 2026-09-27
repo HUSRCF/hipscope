@@ -4,7 +4,7 @@
 
 **Disposition:** measured local deltas on `gfx1151`, landed on branch
 `autoresearch/improve-autoregressive-decode-performance-for-qw-20260926`
-(`922308c38` → `aab5f9cf9`). Not a G5 admission, not a retained-replay
+(`922308c38` → `f4dc7f9b2`). Not a G5 admission, not a retained-replay
 certification, not a cross-architecture result, and not a product speed-floor
 update.
 
@@ -17,8 +17,7 @@ update.
   (the Flash-Next pin in `AGENTS.md`).
 - Prompt `benchmarks/prompts/glimmer_prefill_1024.txt`, md5
   `0ee8f86ada3683eda452bc294ec824a9`, 1131 prompt tokens, 128 decoded tokens.
-- Harness `autoresearch.sh` on the campaign branch. Final daemon (`aab5f9cf9`)
-  md5 `33edbdb4b107f593cb0913a68816e6f3`.
+- Harness `autoresearch.sh` on the campaign branch.
 
 ## Method
 
@@ -45,20 +44,21 @@ update.
 - The GPU was shared with external `llama-server` processes.
 - Serve route: `scripts/serve_harness.py --mode battery --sampling greedy
   --thinking high --max-think-tokens 512 --max-tokens 700 --mtp off
-  --speculation off --max-seq 2048` against the final daemon: 5/5 turns
-  `finish=stop`, no runaway/empty/attractor, answers read and correct.
+  --speculation off --max-seq 2048` against the run-247 daemon (md5
+  `33edbdb4b107f593cb0913a68816e6f3`): 5/5 turns `finish=stop`, no
+  runaway/empty/attractor, answers read and correct.
 
 ## Result
 
-| | start (run 181, `922308c38`) | end (run 247, `c2e6c3570`) |
+| | start (run 181, `922308c38`) | end (run 254, `f4dc7f9b2`) |
 |---|---:|---:|
-| decode tok/s | 19.20 | **28.97** (+50.9%) |
+| decode tok/s | 19.20 | **29.41** (+53.2%) |
 | 8-chunk decode KLD | 0.072049 | 0.069977 |
-| prefill tok/s | 1238.2 | 1262.7 |
+| prefill tok/s | 1238.2 | 1266.7 |
 
-Per-token profile from mid-campaign (run 200 state, 25.7 tok/s) to the end:
+Per-token profile from mid-campaign (run 200 state, 25.7 tok/s) to run 247:
 1685 → 1039 dispatches, span 40.4 → 35.5 ms (profiler-inflated), idle gaps
-between dispatches 4.8 → 3.0 ms. The large projections
+between dispatches 4.8 → 3.0 ms; runs 250-254 removed about 60 more. The large projections
 (`gemv_mq6g256v2_x4`, the MoE gate/up and down GEMVs, the BF16 HC GEMVs, the
 Q8 LM head) run at 190-230 GB/s, close to what this box streams; what remains
 above them is per-dispatch overhead (~2.7 us gap plus ~1.5 us minimum kernel)
@@ -86,10 +86,15 @@ use. `hyper_norm` (`879ad6c4f`, `247ea5d8a`), MoE down GEMV (`0957e4fa1`,
   into the fused HC kernel (`920cbe9f6`).
 - Compute a consumer's input where its producer already holds the data: the
   HC read writes `mq_rotate_x(mixed)` for the GDN/QSA projection
-  (`f2dd9fd20`), the GDN step writes the out-projection's rotation (head pairs,
-  arrival counter; `c2e6c3570`). A one-shot `ScratchState::prerotated` memo
-  lets the consumer's `rotate_x_mq` skip; the step executor clears it after
-  every step.
+  (`f2dd9fd20`) and for the sealed MoE (`f4dc7f9b2`), the GDN step writes the
+  out-projection's rotation (head pairs, arrival counter; `c2e6c3570`). A
+  one-shot `ScratchState::prerotated` memo lets the consumer's `rotate_x_mq`
+  skip; the step executor clears it after every step except the MoE's
+  granular stages.
+- The decode QSA select writes the persistent selected indices itself
+  (`bbcdce045`), and decode pools only the QSA block its row completes
+  (`4b9faa30b`; earlier blocks hold the same kernel's output for unchanged raw
+  keys).
 - Identical inputs, different weights: the HC write's norm uses the same
   streams (same RMS) as the preceding HC read, so the fused write+read kernel
   also produces the next write's normalized row and its four k4 gate quarter
@@ -111,6 +116,9 @@ use. `hyper_norm` (`879ad6c4f`, `247ea5d8a`), MoE down GEMV (`0957e4fa1`,
   (`baee3fc4a`).
 - QSA select rank loop: float4 LDS reads (`3e57d0777`, `68d406672`): 29 → 13
   us/layer.
+- GDN q/k norm: BF16 squares computed in parallel, thread 0 only sums them in
+  order (`bbcdce045`); MoE combine and the GDN K=4 conv load every operand up
+  front (`6d09e50bb`).
 
 ### 4. Host
 
@@ -130,7 +138,8 @@ use. `hyper_norm` (`879ad6c4f`, `247ea5d8a`), MoE down GEMV (`0957e4fa1`,
   512/1024 threads, a wide split QSA score kernel (uncoalesced 1 KB key rows
   thrash L2 at higher concurrency), LDS-staged coalesced key chunks.
 - DPP instead of `ds_bpermute` in the BF16 GEMV reduction, `hyper_norm` shuffle
-  tail, wider MoE down loads, PV unroll 64: no change.
+  tail, wider MoE down loads, PV unroll 64, float4 router denominator reads,
+  32-deep GDN state load batches: no change or slower.
 - Non-bit-exact MoE down with 8 lanes per row: +2% but KLD 0.071630 > gate.
 - Retained PM4 replay (measured with a local ROCm root that finds ROCr): same
   decode rate as ordinary HIP — the inter-dispatch gap is GPU-side.
