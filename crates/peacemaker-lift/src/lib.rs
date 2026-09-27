@@ -14,6 +14,7 @@ pub mod elf;
 pub mod kd;
 pub mod layout;
 pub mod metadata;
+pub mod rewrite;
 pub mod text;
 
 use peacemaker_ir::cfg::{BlockId, Body};
@@ -360,9 +361,10 @@ pub mod emit {
     use peacemaker_ir::codec::gfx12;
     use peacemaker_ir::edit::{lower_labels, EditError};
     use peacemaker_ir::inst::{Abi, Arch, Inst, Kernel, Program};
+    use peacemaker_ir::state::Lifted;
 
     use crate::bundle::{SourceCodec, SourceError};
-    use crate::elf::KernelParts;
+    use crate::elf::{EnvelopeCodec, KernelParts};
     use crate::text::{kernel_lines, PrintError};
 
     #[derive(Debug, thiserror::Error)]
@@ -379,6 +381,10 @@ pub mod emit {
         Source(#[from] SourceError),
         #[error(transparent)]
         Print(#[from] PrintError),
+        #[error("the emitted module does not lift back: {0}")]
+        Relift(String),
+        #[error("the emitted module lifts back to a different {what} for kernel {kernel}")]
+        Mismatch { kernel: String, what: String },
     }
 
     /// The kernel's instructions in layout order with every `Label` lowered to its SOPP
@@ -409,15 +415,45 @@ pub mod emit {
         Ok(kernel_lines(&insts(kernel)?, arch)?)
     }
 
+    fn parts<'a>(program: &'a Program, codes: &'a [Vec<u8>]) -> Result<Vec<KernelParts<'a>>, EmitError> {
+        program.kernels.iter().zip(codes).map(|(kernel, code)| match &kernel.abi {
+            Abi::Hsa { descriptor, metadata } => Ok(KernelParts { code, descriptor, metadata }),
+            Abi::Raw { .. } => Err(EmitError::RawAbi(kernel.symbol.0.clone())),
+        }).collect()
+    }
+
     /// The module: the retained envelope with every kernel's re-encoded stream and
-    /// re-serialised descriptor and metadata spliced into its slot.
+    /// re-serialised descriptor and metadata spliced into its slot (re-laid out when the
+    /// code, the metadata note or a kernel name no longer fits, `crate::layout`).
     pub fn module(program: &Program) -> Result<Vec<u8>, EmitError> {
         let source = program.source.as_ref().ok_or(EmitError::NoEnvelope)?;
         let codes = program.kernels.iter().map(bytes).collect::<Result<Vec<_>, _>>()?;
-        let parts = program.kernels.iter().zip(&codes).map(|(kernel, code)| match &kernel.abi {
-            Abi::Hsa { descriptor, metadata } => Ok(KernelParts { code, descriptor, metadata }),
-            Abi::Raw { .. } => Err(EmitError::RawAbi(kernel.symbol.0.clone())),
-        }).collect::<Result<Vec<_>, _>>()?;
-        Ok(source.write(&parts)?)
+        Ok(source.write(&parts(program, &codes)?)?)
+    }
+
+    /// [`module`], then re-read: the bytes must lift (`lift_object`) to the same kernels
+    /// in the same order — symbol, instruction stream, metadata, and the descriptor the
+    /// layout derived (entry offset and `INST_PREF_SIZE` follow the new layout).
+    pub fn checked(program: &Program, options: crate::Options) -> Result<(Vec<u8>, Lifted<Program>), EmitError> {
+        let source = program.source.as_ref().ok_or(EmitError::NoEnvelope)?;
+        let codes = program.kernels.iter().map(bytes).collect::<Result<Vec<_>, _>>()?;
+        let parts = parts(program, &codes)?;
+        let layout = source.elf.layout(&parts).map_err(SourceError::from)?;
+        let out = source.write(&parts)?;
+        let lifted = crate::lift_object(&out, options).map_err(|e| EmitError::Relift(e.to_string()))?;
+        if lifted.program.kernels.len() != program.kernels.len() {
+            return Err(EmitError::Mismatch { kernel: "module".into(), what: "kernel count".into() });
+        }
+        for ((kernel, back), descriptor) in program.kernels.iter().zip(&lifted.program.kernels).zip(&layout.descriptors) {
+            let differ = |what: &str| EmitError::Mismatch { kernel: kernel.symbol.0.clone(), what: what.into() };
+            if kernel.symbol != back.symbol { return Err(differ("symbol")); }
+            if words(kernel)? != words(back)? { return Err(differ("instruction stream")); }
+            let (Abi::Hsa { metadata, .. }, Abi::Hsa { descriptor: read, metadata: read_meta }) = (&kernel.abi, &back.abi) else {
+                return Err(differ("ABI"));
+            };
+            if metadata.parsed != read_meta.parsed { return Err(differ("metadata")); }
+            if read != descriptor { return Err(differ("descriptor")); }
+        }
+        Ok((out, lifted))
     }
 }
