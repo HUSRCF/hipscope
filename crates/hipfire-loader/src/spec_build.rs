@@ -173,7 +173,11 @@ pub fn build_speculator(
     spec: hipfire_runtime::loader_api::SpecLoadCfg,
 ) -> Option<Box<dyn Speculator>> {
     if let Some(df) = dflash {
-        return Some(build_dflash_speculator(df, eviction_is_none));
+        return Some(build_dflash_speculator(
+            df,
+            eviction_is_none,
+            spec.dflash_adaptive_b.unwrap_or(true),
+        ));
     }
     // qwen35 MTP head (arch 5/6). MTP wins over n-gram when present; the load
     // site is authoritative for whether a head was loaded (no `&mut Gpu` here

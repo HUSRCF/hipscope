@@ -141,6 +141,9 @@ pub struct LoadCtx<'a> {
 /// yields the chosen mechanism without the loader needing a selector of its own.
 #[derive(Clone, Copy, Default)]
 pub struct SpecLoadCfg {
+    /// Adapt the DFlash chain block size from recent acceptance. `None` keeps
+    /// the loader/runtime default.
+    pub dflash_adaptive_b: Option<bool>,
     /// Enable the model-free n-gram drafter for this load. `None` = unspecified.
     pub ngram_draft: Option<bool>,
     /// n-gram draft window K (`HIPFIRE_NGRAM_DRAFT_K`). `None` = loader default.

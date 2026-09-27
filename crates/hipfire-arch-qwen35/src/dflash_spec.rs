@@ -28,7 +28,7 @@ use hipfire_runtime::spec::{
     SpecRequestConfig, SpecStep, SpecTarget, Speculator,
 };
 use rdna_compute::{Gpu, GpuTensor};
-use std::path::Path;
+use std::{collections::VecDeque, path::Path};
 
 /// Extract layers the retained B=16 DFlash2 verify route admits.
 const DFLASH_VERIFY_PM4_EXTRACT_LAYERS: [usize; 5] = [5, 19, 33, 47, 61];
@@ -553,6 +553,10 @@ pub struct DflashSpeculator {
     ck_interval: usize,
     ck_cap: usize,
     last_window: Option<DflashWindowMark>,
+    adaptive_b: bool,
+    adaptive_b_current: usize,
+    adaptive_b_cooldown: usize,
+    adaptive_accepts: VecDeque<usize>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -566,7 +570,14 @@ impl DflashSpeculator {
     /// `resume_enabled`/`ck_interval`/`ck_cap` mirror the daemon's
     /// `ckpt_resume_enabled()`/`ckpt_interval()`/`ckpt_max()` — passed in by
     /// `build_dflash_speculator` so `new` itself is env-free (and unit-testable).
-    pub fn new(df: DflashState, resume_enabled: bool, ck_interval: usize, ck_cap: usize) -> Self {
+    pub fn new(
+        df: DflashState,
+        resume_enabled: bool,
+        ck_interval: usize,
+        ck_cap: usize,
+        adaptive_b: bool,
+    ) -> Self {
+        let adaptive_b_current = df.block_size.max(2);
         Self {
             df,
             // Same fixed seed the daemon's DFlash loop used. `set_sampling`
@@ -585,6 +596,60 @@ impl DflashSpeculator {
             ck_interval,
             ck_cap,
             last_window: None,
+            adaptive_b,
+            adaptive_b_current,
+            adaptive_b_cooldown: 0,
+            adaptive_accepts: VecDeque::with_capacity(4),
+        }
+    }
+
+    fn reset_adaptive_b(&mut self) {
+        self.adaptive_b_current = self.df.block_size.max(2);
+        self.adaptive_b_cooldown = 0;
+        self.adaptive_accepts.clear();
+    }
+
+    fn note_acceptance(&mut self, accepted: usize) {
+        // DDTree has its own structural budget; adaptive chain-B must not
+        // alter tree verification geometry.
+        if !self.adaptive_b || self.df.ddtree.is_some() || self.df.block_size <= 8 {
+            return;
+        }
+        const WINDOW: usize = 4;
+        const COOLDOWN: usize = 4;
+        const STEP: usize = 2;
+        const MIN_B: usize = 8;
+        const UP: f64 = 0.45;
+        const DOWN: f64 = 0.25;
+
+        if self.adaptive_accepts.len() == WINDOW {
+            self.adaptive_accepts.pop_front();
+        }
+        self.adaptive_accepts.push_back(accepted);
+        if self.adaptive_accepts.len() < WINDOW {
+            self.adaptive_b_cooldown = self.adaptive_b_cooldown.saturating_add(1);
+            return;
+        }
+        if self.adaptive_b_cooldown < COOLDOWN {
+            self.adaptive_b_cooldown += 1;
+            return;
+        }
+
+        let mean = self.adaptive_accepts.iter().sum::<usize>() as f64 / WINDOW as f64;
+        let util = mean / self.adaptive_b_current.saturating_sub(1).max(1) as f64;
+        let old = self.adaptive_b_current;
+        if util > UP && self.adaptive_b_current + STEP <= self.df.block_size {
+            self.adaptive_b_current += STEP;
+            self.adaptive_b_cooldown = 0;
+        } else if util < DOWN && self.adaptive_b_current >= MIN_B + STEP {
+            self.adaptive_b_current -= STEP;
+            self.adaptive_b_cooldown = 0;
+        }
+        if old != self.adaptive_b_current {
+            eprintln!(
+                "  DFlash adaptive-B: {} -> {} (mean_accept={:.2}, util={:.3})",
+                old, self.adaptive_b_current, mean, util
+            );
         }
     }
 
@@ -615,6 +680,7 @@ impl Speculator for DflashSpeculator {
         resume_from: Option<usize>,
         abort: &dyn Fn() -> bool,
     ) -> Result<PrefillOutcome, String> {
+        self.reset_adaptive_b();
         self.last_window = None;
         let slot = target
             .as_any_mut()
@@ -859,7 +925,11 @@ impl Speculator for DflashSpeculator {
         // (uniform for max_emit >= 1); max_accept clamps accept before commit
         // so max_emit == 1 is a true one-token path (accept 0 + bonus).
         let block_override = {
-            let cfg_b = self.df.block_size.max(2);
+            let cfg_b = if self.adaptive_b {
+                self.adaptive_b_current.max(2)
+            } else {
+                self.df.block_size.max(2)
+            };
             let want = max_emit.max(2);
             let b = cfg_b.min(want);
             if b < cfg_b || b != self.df.draft_config.block_size {
@@ -961,7 +1031,10 @@ impl Speculator for DflashSpeculator {
         };
 
         let lowered = result
-            .map(lower_qwen35)
+            .map(|s| {
+                self.note_acceptance(s.accepted);
+                lower_qwen35(s)
+            })
             // Defense only — accept stage already committed ≤ max_emit.
             .map(|s| s.cap_emit(max_emit))
             .map_err(|e| e.to_string());
@@ -992,6 +1065,7 @@ impl Speculator for DflashSpeculator {
         // daemon's job — it owns the bundle).
         self.df.draft_scratch.reset_upload_tracking();
         self.last_window = None;
+        self.reset_adaptive_b();
         for (_, snap) in self.checkpoints.drain(..) {
             snap.free_gpu(gpu);
         }
@@ -1162,7 +1236,11 @@ impl Speculator for DflashSpeculator {
 /// resume (`HIPFIRE_DFLASH_CKPT_RESUME` + no-eviction) and interval/cap
 /// (`HIPFIRE_CACHE_CKPT_INTERVAL`/`_MAX`, matching the daemon's
 /// `ckpt_interval()`/`ckpt_max()` defaults). Called once at load.
-pub fn build_dflash_speculator(df: DflashState, eviction_is_none: bool) -> Box<dyn Speculator> {
+pub fn build_dflash_speculator(
+    df: DflashState,
+    eviction_is_none: bool,
+    adaptive_b: bool,
+) -> Box<dyn Speculator> {
     let resume_enabled = hipfire_config::developer_var("HIPFIRE_DFLASH_CKPT_RESUME")
         .ok()
         .as_deref()
@@ -1183,6 +1261,7 @@ pub fn build_dflash_speculator(df: DflashState, eviction_is_none: bool) -> Box<d
         resume_enabled,
         ck_interval,
         ck_cap,
+        adaptive_b,
     ))
 }
 
