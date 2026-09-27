@@ -1870,7 +1870,8 @@ impl Gpu {
             &hv as *const _ as *mut c_void,
             &tv as *const _ as *mut c_void,
         ];
-        let block = 256u32;
+        // 64 threads: a decode row spreads over 40 CUs instead of 10.
+        let block = 64u32;
         let grid_x = (hidden as u32).div_ceil(block);
         let bytes = (tokens * 10 * hidden + 2 * tokens * 10 + 2 * tokens * hidden) * 4;
         let timer = crate::profile::begin_timer(&self.hip, "elementwise", FUNC, bytes);
