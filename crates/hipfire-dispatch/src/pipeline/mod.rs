@@ -31,7 +31,7 @@ pub(crate) mod steps;
 pub use layer_ops::{
     execute_argmax, execute_clear, execute_final_hyper, execute_gated_delta_net,
     execute_grouped_depthwise, execute_hyper_read, execute_hyper_write, execute_indexed_attention,
-    execute_lm_head, project_weight, validate_lm_head, ClearOp, GatedDeltaNetOp,
+    execute_lm_head, project_weight, validate_lm_head, ClearOp, GatedDeltaNetOp, GdnRowCapture,
     GroupedDepthwiseOp, HyperReadOp, HyperWriteOp, IndexedAttentionOp, IndexedAttentionState,
 };
 pub use steps::{

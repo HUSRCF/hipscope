@@ -267,6 +267,7 @@ extern "C" __global__ void gated_delta_step_halves_state128_persistent256_f32(
     const float* beta,
     float* state,
     float* output,
+    float* row_states,
     int rows,
     int qkv_width,
     int key_heads,
@@ -452,6 +453,16 @@ extern "C" __global__ void gated_delta_step_halves_state128_persistent256_f32(
                     out += state_half[kd] * qv;
                 }
                 output[row * value_width + value_head * 128 + value_index] = out;
+            }
+            // Speculative verify: the state after every row but the last
+            // (which lands in `state`), so a rejected suffix rolls back
+            // without re-running the accepted rows.
+            if (row_states != nullptr && row + 1 < rows) {
+                float* slot = row_states + (size_t)row * value_heads * 128 * 128;
+                #pragma unroll
+                for (int kd = 0; kd < 64; ++kd) {
+                    slot[state_base + (kd_base + kd) * 128 + value_index] = state_half[kd];
+                }
             }
         }
     }

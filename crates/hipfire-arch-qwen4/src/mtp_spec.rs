@@ -399,9 +399,13 @@ impl SpecTarget for Qwen4Bundle {
             .downcast_mut::<Qwen4SpecScratch>()
             .ok_or("Qwen4 verify_block: scratch is not Qwen4SpecScratch")?
             .target_snapshot = Some(snapshot);
+        // The verify leaves per-row rollback points, so a rejected suffix
+        // is dropped without re-running the accepted rows.
+        self.state.row_capture_armed = true;
         let result = self
             .spec_forward_rows(gpu, block, true)
             .map_err(|error| error.to_string());
+        self.state.row_capture_armed = false;
         if let Err(error) = &result {
             let snapshot = scratch
                 .as_any_mut()
@@ -503,8 +507,11 @@ enum DraftPairing {
     AlignedTarget,
 }
 
-/// Per-draft agreement at or above which the batched verify is used.
-const MTP_BATCHED_AGREEMENT: f32 = 0.8;
+/// Per-draft agreement at or above which the batched verify is used: a
+/// K=3 window (4-row verify, three draft steps, rollback) costs about 2.5
+/// interleaved rows on gfx1151, which 1 + a + a^2 + a^3 tokens repay from
+/// a ~= 0.69.
+const MTP_BATCHED_AGREEMENT: f32 = 0.7;
 /// Per-window decay of the agreement counts.
 const MTP_AGREEMENT_DECAY: f32 = 0.875;
 /// Agreement counts a request starts from: optimistic, so the first windows
@@ -567,6 +574,11 @@ impl Qwen4MtpDrafter {
         };
         let prefill_rows = {
             let bundle = Self::bundle(target)?;
+            let conv_history = bundle.config.linear_conv_kernel_dim - 1;
+            bundle
+                .state
+                .ensure_row_capture(gpu, self.max_k + 1, conv_history)
+                .map_err(|error| error.to_string())?;
             bundle.spec_chunk_rows().unwrap_or(1).max(1)
         };
         if self.scratch.is_none() {
@@ -873,7 +885,7 @@ impl MtpDrafter for Qwen4MtpDrafter {
         }
         self.ensure_resources(gpu, target)?;
         let trace = std::env::var("HIPFIRE_MTP_TRACE").is_ok_and(|value| value == "1");
-        // Route: a (k+1)-row batched verify costs about two single-row
+        // Route: a (k+1)-row batched verify costs about 2.5 single-row
         // forwards, so it pays only while drafts keep being accepted; the
         // interleaved verify costs one forward per emitted token and wastes no
         // draft. `HIPFIRE_MTP_INCREMENTAL=0|1` forces a route.
@@ -977,13 +989,9 @@ impl MtpDrafter for Qwen4MtpDrafter {
             // copy succeeds. A retained restore lets the outer rollback repair
             // both owners if either side's GPU work fails.
             if !full_accept {
-                timers.mark(gpu, "target_replay");
+                timers.mark(gpu, "target_rollback");
                 picks
-                    .restore_retain(gpu, target_snapshot)
-                    .map_err(|error| error.to_string())?;
-                picks
-                    .spec_forward_rows(gpu, &block[..target_accept_len + 1], true)
-                    .map(|_| ())
+                    .rollback_verify_rows_retain(gpu, target_snapshot, target_accept_len + 1, &block)
                     .map_err(|error| error.to_string())?;
             }
             timers.mark(gpu, "mtp_replay");

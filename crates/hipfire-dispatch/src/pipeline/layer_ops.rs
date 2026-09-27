@@ -953,6 +953,20 @@ pub struct GatedDeltaNetOp<'a> {
     /// FWHT basis scratch for quantized payloads (`rows * k` elements); the
     /// BF16 path never reads it.
     pub rotation: &'a GpuTensor,
+    /// Few-row speculative verify: per-row rollback points (see
+    /// [`GdnRowCapture`]); ignored by the one-row and chunked routes.
+    pub row_capture: Option<GdnRowCapture<'a>>,
+}
+
+/// Where a few-row GDN forward leaves what a later rollback to any accepted
+/// row prefix needs: the recurrent state after each row but the last
+/// (`[rows - 1, value_heads * value_dim * key_dim]` F32) and the convolution
+/// input rows (`[rows, qkv]` F32; every reader of the convolution history
+/// rounds it to BF16).
+#[derive(Clone, Copy)]
+pub struct GdnRowCapture<'a> {
+    pub states: &'a GpuTensor,
+    pub inputs: &'a GpuTensor,
 }
 
 impl GatedDeltaNetOp<'_> {
@@ -1096,12 +1110,14 @@ pub fn execute_gated_delta_net(
         && op.value_dim == 128
         && op.conv_kernel == 4;
     let recurrent_output = view(op.recurrent_output, 0, op.rows * value);
+    let capture = op.row_capture.filter(|_| persistent_batch);
     let dims = GatedDeltaStepBatched {
         projection: &projection2,
         gate: &gate,
         beta: &beta,
         state: op.recurrent,
         output: &recurrent_output,
+        row_states: capture.map(|c| c.states),
         rows: op.rows,
         qkv_width: qkv,
         key_heads: op.key_heads,
@@ -1110,6 +1126,11 @@ pub fn execute_gated_delta_net(
         value_dim: op.value_dim,
     };
     let chunked = persistent_batch && gated_delta_chunk_route(gpu, &dims);
+    if chunked && capture.is_some() {
+        return Err(DispatchError::Hip(
+            "GDN row capture is a few-row verify contract, not the chunked prefill route".into(),
+        ));
+    }
     // On the chunked route the qkv projection is read (by the convolution)
     // only through its BF16 rounding, so the MQ6 GEMM stores it as BF16 bits.
     let bf16_store = |w: &WeightRef<'_>, gpu: &Gpu| {
@@ -1130,6 +1151,9 @@ pub fn execute_gated_delta_net(
             (&op.z, &z),
         ],
     )?;
+    if let Some(capture) = capture {
+        hip(gpu.copy_f32_buffer(capture.inputs, &projection, op.rows * qkv))?;
+    }
     let mut gdn_output = view(op.output_scratch, 0, op.rows * value);
     if persistent_batch {
         let start_cursor = op.start_position % history_rows;
@@ -2263,6 +2287,7 @@ mod tests {
                 value_dim: 2,
                 conv_kernel: 2,
                 input_width: 2,
+                row_capture: None,
             }
         }
     }

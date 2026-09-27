@@ -488,6 +488,40 @@ impl Qwen4Bundle {
             .map_err(BundleError::Hip)
     }
 
+    /// Keep the first `keep` rows of the armed `tokens.len()`-row verify the
+    /// active snapshot ticket brackets, without re-running them; the ticket
+    /// stays active for the caller's commit or restore.
+    pub(crate) fn rollback_verify_rows_retain(
+        &mut self,
+        gpu: &mut Gpu,
+        snapshot: Qwen4StateSnapshot,
+        keep: usize,
+        tokens: &[u32],
+    ) -> Result<(), BundleError> {
+        let ple_normed = &self
+            .execution
+            .as_ref()
+            .ok_or_else(|| {
+                BundleError::Forward("Qwen4 forward resources are not attached".to_string())
+            })?
+            .scratch
+            .ple_normed;
+        self.state
+            .rollback_rows_retain(
+                gpu,
+                snapshot,
+                keep,
+                tokens.len(),
+                tokens,
+                ple_normed,
+                self.config.ple_conv_history_rows(),
+                self.config.linear_conv_kernel_dim - 1,
+                self.config.indexer_compress_ratio,
+                self.config.indexer_budget,
+            )
+            .map_err(BundleError::State)
+    }
+
     pub(crate) fn spec_capture_token(
         &mut self,
         gpu: &mut Gpu,

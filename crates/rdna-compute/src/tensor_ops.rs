@@ -272,6 +272,9 @@ pub struct GatedDeltaStepBatched<'a> {
     pub beta: &'a GpuTensor,
     pub state: &'a GpuTensor,
     pub output: &'a GpuTensor,
+    /// Optional `[rows - 1, state]` F32: the recurrent state after each row
+    /// but the last (speculative-verify rollback points).
+    pub row_states: Option<&'a GpuTensor>,
     pub rows: usize,
     pub qkv_width: usize,
     pub key_heads: usize,
@@ -310,6 +313,9 @@ pub fn gated_delta_step_batched(gpu: &mut Gpu, p: &GatedDeltaStepBatched<'_>) ->
         || p.beta.numel() != rows_heads
         || p.state.numel() != state_elements
         || p.output.numel() != rows_value
+        || p.row_states.is_some_and(|states| {
+            states.dtype != DType::F32 || states.numel() < (p.rows - 1) * state_elements
+        })
     {
         return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
     }
@@ -326,6 +332,10 @@ pub fn gated_delta_step_batched(gpu: &mut Gpu, p: &GatedDeltaStepBatched<'_>) ->
     for tensor in [p.projection, p.gate, p.beta, p.state, p.output] {
         args.push_ptr(tensor.buf.as_ptr());
     }
+    args.push_ptr(
+        p.row_states
+            .map_or(std::ptr::null(), |states| states.buf.as_ptr() as *const _),
+    );
     args.push_i32(rows);
     args.push_i32(qkv_width);
     args.push_i32(key_heads);
@@ -3791,6 +3801,7 @@ mod tests {
                 beta: &beta_gpu,
                 state: &batched_state,
                 output: &batched_out,
+                row_states: None,
                 rows,
                 qkv_width: qkv,
                 key_heads,
@@ -3927,6 +3938,7 @@ mod tests {
                 beta: &beta_gpu,
                 state: &state,
                 output: &recurrent,
+                row_states: None,
                 rows,
                 qkv_width: qkv,
                 key_heads,
