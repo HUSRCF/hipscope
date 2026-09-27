@@ -59,30 +59,10 @@ extern "C" __global__ void gemv_q8_0(
     if (threadIdx.x == 0) y[row] = sum;
 }
 
-// One K = 2560 row (2720 bytes, 4-byte aligned): the wave first copies it into
-// `staged_row` (LDS) with dword loads, every load before the first store (32 x
-// 4 B per load instead of the row loop's 32 x 1 B quant loads and broadcast
-// scale loads), then runs gemv_q8_0_row on the copy.
-static __device__ __forceinline__ float gemv_q8_0_row_2560_staged(
-    const unsigned char* __restrict__ row_data,
-    unsigned int* staged_row,
-    const float* __restrict__ x,
-    int tid
-) {
-    const unsigned int* src = reinterpret_cast<const unsigned int*>(row_data);
-    unsigned int v[22];
-#pragma unroll
-    for (int u = 0; u < 21; ++u) v[u] = src[tid + u * 32];
-    v[21] = tid < 8 ? src[tid + 672] : 0u;
-#pragma unroll
-    for (int u = 0; u < 21; ++u) staged_row[tid + u * 32] = v[u];
-    if (tid < 8) staged_row[tid + 672] = v[21];
-    // One wave: its LDS accesses complete in order, so no workgroup fence.
-    __builtin_amdgcn_fence(__ATOMIC_ACQ_REL, "wavefront");
-    return gemv_q8_0_row(reinterpret_cast<const unsigned char*>(staged_row), x, 2560, tid);
-}
-
-// gemv_q8_0 for K = 2560 (2720-byte rows), staged through LDS.
+// gemv_q8_0 for K = 2560 (2720-byte rows): the wave first copies its row into
+// LDS with dword loads, every load before the first store (32 x 4 B per load
+// instead of the row loop's 32 x 1 B quant loads and broadcast scale loads),
+// then runs the same row loop on the copy.
 __launch_bounds__(32, 20)
 extern "C" __global__ void gemv_q8_0_k2560_staged(
     const unsigned char* __restrict__ A_q8,
@@ -94,17 +74,55 @@ extern "C" __global__ void gemv_q8_0_k2560_staged(
     const int row = blockIdx.x;
     if (row >= M) return;
     const int tid = threadIdx.x;
-    const float sum = gemv_q8_0_row_2560_staged(A_q8 + (size_t)row * 2720, staged_row, x, tid);
+    const unsigned int* src = reinterpret_cast<const unsigned int*>(A_q8 + (size_t)row * 2720);
+    unsigned int v[22];
+#pragma unroll
+    for (int u = 0; u < 21; ++u) v[u] = src[tid + u * 32];
+    v[21] = tid < 8 ? src[tid + 672] : 0u;
+#pragma unroll
+    for (int u = 0; u < 21; ++u) staged_row[tid + u * 32] = v[u];
+    if (tid < 8) staged_row[tid + 672] = v[21];
+    // One wave: its LDS accesses complete in order, so no workgroup fence.
+    __builtin_amdgcn_fence(__ATOMIC_ACQ_REL, "wavefront");
+    const float sum = gemv_q8_0_row(
+        reinterpret_cast<const unsigned char*>(staged_row), x, 2560, tid);
     if (tid == 0) y[row] = sum;
 }
 
-// Long-K rows (Qwen4 decode HC read down, K = 4 * 2560), as gemv_bf16_xf32_k4:
-// four waves take a quarter of each row (staged like gemv_q8_0_k2560_staged
-// when a quarter is 2560), quarter sums fold (q0 + q1) + (q2 + q3), and
-// `hc_act` applies the HC activation (BF16 round trip, `scale`, round trip,
-// SiLU, round trip). Grid [M], block 128, K % 128 == 0.
-__launch_bounds__(128)
-extern "C" __global__ void gemv_q8_0_k4(
+// gemv_q8_0 for K = 320 (340-byte rows, Qwen4 decode HC read up), staged like
+// gemv_q8_0_k2560_staged; two rows (waves) per block. 132 -> 218 GB/s on
+// gfx1151 against gemv_q8_0_wide.
+__launch_bounds__(64)
+extern "C" __global__ void gemv_q8_0_k320_staged(
+    const unsigned char* __restrict__ A_q8,
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    int M
+) {
+    __shared__ __align__(16) unsigned int staged[2][85];
+    const int wave = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int row = blockIdx.x * 2 + wave;
+    if (row >= M) return;
+    const unsigned int* src = reinterpret_cast<const unsigned int*>(A_q8 + (size_t)row * 340);
+    const unsigned int v0 = src[lane];
+    const unsigned int v1 = src[lane + 32];
+    const unsigned int v2 = lane < 21 ? src[lane + 64] : 0u;
+    staged[wave][lane] = v0;
+    staged[wave][lane + 32] = v1;
+    if (lane < 21) staged[wave][lane + 64] = v2;
+    __builtin_amdgcn_fence(__ATOMIC_ACQ_REL, "wavefront");
+    const float sum = gemv_q8_0_row(reinterpret_cast<const unsigned char*>(staged[wave]), x, 320, lane);
+    if (lane == 0) y[row] = sum;
+}
+
+// Long-K rows (Qwen4 decode HC read down, K = 4 * 2560): eight waves take an
+// eighth of each row each, the partial sums fold ((p0 + p1) + (p2 + p3)) +
+// ((p4 + p5) + (p6 + p7)), and `hc_act` applies the HC activation (BF16 round
+// trip, `scale`, round trip, SiLU, round trip) as gemv_bf16_xf32_k4 does.
+// Grid [M], block 256, K % 256 == 0.
+__launch_bounds__(256)
+extern "C" __global__ void gemv_q8_0_k8(
     const unsigned char* __restrict__ A_q8,
     const float* __restrict__ x,
     float* __restrict__ y,
@@ -112,21 +130,18 @@ extern "C" __global__ void gemv_q8_0_k4(
     float scale,
     int hc_act
 ) {
-    __shared__ __align__(16) unsigned int staged[4][680];
-    __shared__ float quarter[4];
+    __shared__ float part[8];
     const int row = blockIdx.x;
     if (row >= M) return;
     const int wave = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
-    const int part = K / 4;
-    const unsigned char* src = A_q8 + ((size_t)row * 4 + wave) * (part / 32) * 34;
-    const float s = part == 2560
-        ? gemv_q8_0_row_2560_staged(src, staged[wave], x + wave * part, lane)
-        : gemv_q8_0_row(src, x + wave * part, part, lane);
-    if (lane == 0) quarter[wave] = s;
+    const int pk = K / 8;
+    const float s = gemv_q8_0_row(
+        A_q8 + ((size_t)row * 8 + wave) * (pk / 32) * 34, x + wave * pk, pk, lane);
+    if (lane == 0) part[wave] = s;
     __syncthreads();
     if (threadIdx.x != 0) return;
-    float value = (quarter[0] + quarter[1]) + (quarter[2] + quarter[3]);
+    float value = ((part[0] + part[1]) + (part[2] + part[3])) + ((part[4] + part[5]) + (part[6] + part[7]));
     if (hc_act) {
         value = static_cast<float>(static_cast<hip_bfloat16>(value));
         value *= scale;

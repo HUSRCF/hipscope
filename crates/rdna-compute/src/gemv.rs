@@ -14011,6 +14011,33 @@ impl Gpu {
             b
         };
 
+        // gfx1151, K = 320 (Qwen4 decode HC read up): rows staged through LDS,
+        // two per block (132 -> 218 GB/s against gemv_q8_0_wide).
+        if self.arch_caps.is_gfx1151() && k == 320 {
+            const FUNC: &str = "gemv_q8_0_k320_staged";
+            self.ensure_kernel("gemv_q8_0", kernels::GEMV_Q8_0_SRC, FUNC)?;
+            let mut params = [
+                &a_ptr as *const _ as *mut c_void,
+                &x_ptr as *const _ as *mut c_void,
+                &y_ptr as *const _ as *mut c_void,
+                &m_val as *const _ as *mut c_void,
+            ];
+            return self.launch_maybe_blob(
+                FUNC,
+                [m.div_ceil(2) as u32, 1, 1],
+                [64, 1, 1],
+                0,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(a_ptr);
+                    b.push_ptr(x_ptr);
+                    b.push_ptr(y_ptr);
+                    b.push_i32(m_val);
+                    b
+                },
+            );
+        }
         // Adaptive dispatch: wide kernel for small K (more threads per row),
         // narrow kernel for large K (more blocks, better occupancy).
         if k <= 1536 {
@@ -14426,12 +14453,12 @@ impl Gpu {
         }
         self.bind_thread()?;
         self.ensure_kernel("gemv_bf16_xf32", kernels::GEMV_BF16_XF32_SRC, "gemv_bf16_xf32_k4")?;
-        self.launch_gemv_k4("gemv_bf16_xf32_k4", weight, x, y, m, k, hc_act_scale)
+        self.launch_gemv_split("gemv_bf16_xf32_k4", 128, weight, x, y, m, k, hc_act_scale)
     }
 
-    /// [`Gpu::gemv_bf16_xf32_k4`] over a Q8_0 weight (same split, fold and
-    /// epilogue). Requires `k % 128 == 0` (whole Q8_0 blocks per quarter).
-    pub fn gemv_q8_0_k4(
+    /// [`Gpu::gemv_bf16_xf32_k4`] over a Q8_0 weight with each row split
+    /// across eight waves (same epilogue). Requires `k % 256 == 0`.
+    pub fn gemv_q8_0_k8(
         &mut self,
         weight: &GpuTensor,
         x: &GpuTensor,
@@ -14440,15 +14467,15 @@ impl Gpu {
         k: usize,
         hc_act_scale: Option<f32>,
     ) -> HipResult<()> {
-        if k % 128 != 0 {
+        if k % 256 != 0 {
             return Err(hip_bridge::HipError::new(
                 1,
-                "gemv_q8_0_k4 needs K % 128 == 0",
+                "gemv_q8_0_k8 needs K % 256 == 0",
             ));
         }
         self.bind_thread()?;
-        self.ensure_kernel("gemv_q8_0", kernels::GEMV_Q8_0_SRC, "gemv_q8_0_k4")?;
-        self.launch_gemv_k4("gemv_q8_0_k4", weight, x, y, m, k, hc_act_scale)
+        self.ensure_kernel("gemv_q8_0", kernels::GEMV_Q8_0_SRC, "gemv_q8_0_k8")?;
+        self.launch_gemv_split("gemv_q8_0_k8", 256, weight, x, y, m, k, hc_act_scale)
     }
 
     /// Requantize a row-major BF16 `[m, k]` weight to a new Q8_0 tensor
@@ -14500,9 +14527,10 @@ impl Gpu {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn launch_gemv_k4(
+    fn launch_gemv_split(
         &mut self,
         func: &str,
+        block: u32,
         weight: &GpuTensor,
         x: &GpuTensor,
         y: &GpuTensor,
@@ -14526,17 +14554,24 @@ impl Gpu {
             &scale as *const _ as *mut c_void,
             &hc_act as *const _ as *mut c_void,
         ];
-        self.launch_maybe_blob(func, [m as u32, 1, 1], [128, 1, 1], 0, &mut params, || {
-            let mut b = hip_bridge::KernargBlob::new();
-            b.push_ptr(w_ptr);
-            b.push_ptr(x_ptr);
-            b.push_ptr(y_ptr);
-            b.push_i32(m_val);
-            b.push_i32(k_val);
-            b.push_f32(scale);
-            b.push_i32(hc_act);
-            b
-        })
+        self.launch_maybe_blob(
+            func,
+            [m as u32, 1, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(w_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_f32(scale);
+                b.push_i32(hc_act);
+                b
+            },
+        )
     }
 
     /// [`Gpu::gemv_bf16_xf32`] of `weight` and `x` folded into `residual` as
