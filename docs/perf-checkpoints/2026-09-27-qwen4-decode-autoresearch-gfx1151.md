@@ -4,7 +4,7 @@
 
 **Disposition:** measured local deltas on `gfx1151`, landed on branch
 `autoresearch/improve-autoregressive-decode-performance-for-qw-20260926`
-(`922308c38` → `939cadb71`). Not a G5 admission, not a retained-replay
+(`922308c38` → `47420b9ea`). Not a G5 admission, not a retained-replay
 certification, not a cross-architecture result, and not a product speed-floor
 update.
 
@@ -50,11 +50,11 @@ update.
 
 ## Result
 
-| | start (run 181, `922308c38`) | end (run 269, `939cadb71`) |
+| | start (run 181, `922308c38`) | end (run 270, `47420b9ea`) |
 |---|---:|---:|
-| decode tok/s | 19.20 | **29.63** (+54.3%) |
+| decode tok/s | 19.20 | **29.73** (+54.8%) |
 | 8-chunk decode KLD | 0.072049 | 0.069977 |
-| prefill tok/s | 1238.2 | 1264.8 |
+| prefill tok/s | 1238.2 | 1262.0 |
 
 Per-token profile from mid-campaign (run 200 state, 25.7 tok/s) to run 247:
 1685 → 1039 dispatches, span 40.4 → 35.5 ms (profiler-inflated), idle gaps
@@ -124,6 +124,11 @@ use. `hyper_norm` (`879ad6c4f`, `247ea5d8a`), MoE down GEMV (`0957e4fa1`,
 - MoE gate/up (K = 2560): eight rows per 256-thread block read one LDS copy of
   x; the per-wave x re-reads (8× the 4-bit weight bytes) were L2-bound
   (`939cadb71`, 89 → 85 us in isolation).
+- Q8 LM head (K = 2560, gfx1151): each wave copies its 2720-byte row into LDS
+  with dword loads, all issued before the first store, then runs the same row
+  loop — the row loop's 1-byte quant loads and broadcast scale loads were the
+  limit (`47420b9ea`, 226 → 241 GB/s, ~0.2 ms/token). The same staging for the
+  MQ6 and MoE-down GEMVs did not help.
 - GDN q/k norm: BF16 squares computed in parallel, thread 0 only sums them in
   order (`bbcdce045`); MoE combine and the GDN K=4 conv load every operand up
   front (`6d09e50bb`).
