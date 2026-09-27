@@ -807,20 +807,35 @@ pub fn hyper_write(gpu: &mut Gpu, p: &HyperWrite<'_>) -> HipResult<()> {
     )
 }
 
-/// [`hyper_write`] of one F32 decode row (`hidden == 2560`) followed by
-/// [`hyper_norm`] of the written streams with `norm_weight` into
-/// `normalized`, one launch; bitwise the two launches.
+/// The next hyper write's gate inputs: its norm weight and BF16 `[4, 4 *
+/// hidden]` inject projection, and the 16-float quarter-dot output.
+pub struct HyperNextGates<'a> {
+    pub norm_weight: &'a GpuTensor,
+    pub inject: &'a GpuTensor,
+    pub quarters: &'a GpuTensor,
+}
+
+/// [`hyper_write`] of one F32 decode row (`hidden == 2560`, four branches)
+/// followed by [`hyper_norm`] of the written streams with `norm_weight` into
+/// `normalized`, one launch; bitwise the two launches. `quarters_in` (from a
+/// previous call's `next`) replaces `p.gates` as the gate source; `next`
+/// also computes the next hyper write's gate quarters (its norm and k4 gate
+/// GEMV of these streams, bitwise).
 pub fn hyper_write_norm(
     gpu: &mut Gpu,
     p: &HyperWrite<'_>,
     norm_weight: &GpuTensor,
     normalized: &GpuTensor,
+    quarters_in: Option<&GpuTensor>,
+    next: Option<&HyperNextGates<'_>>,
 ) -> HipResult<()> {
     for tensor in [p.input, p.mixed, p.gates, p.output, normalized] {
         ensure_f32(tensor)?;
     }
     let wide = checked_product(p.branches, p.hidden, "HC write width")?;
+    let quarters_ok = |q: &GpuTensor| q.dtype == DType::F32 && q.numel() == 16;
     if p.state_bf16
+        || p.branches != 4
         || p.hidden != 2560
         || norm_weight.dtype != DType::BF16
         || p.input.numel() != wide
@@ -829,20 +844,44 @@ pub fn hyper_write_norm(
         || norm_weight.numel() != wide
         || p.mixed.numel() != p.hidden
         || p.gates.numel() != p.branches
+        || quarters_in.is_some_and(|q| !quarters_ok(q))
+        || next.is_some_and(|n| {
+            !quarters_ok(n.quarters)
+                || n.norm_weight.dtype != DType::BF16
+                || n.norm_weight.numel() != wide
+                || n.inject.dtype != DType::BF16
+                || n.inject.numel() != 4 * wide
+        })
     {
         return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
     }
-    gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, "hyper_write_norm_f32")?;
+    gpu.ensure_kernel(
+        "gemv_bf16_xf32",
+        crate::kernels::GEMV_BF16_XF32_SRC,
+        "hyper_write_norm_f32",
+    )?;
+    let null = std::ptr::null_mut();
     let mut args = KernargBlob::new();
-    for tensor in [p.input, p.mixed, p.gates, p.output, norm_weight, normalized] {
-        args.push_ptr(tensor.buf.as_ptr());
+    for ptr in [
+        p.input.buf.as_ptr(),
+        p.mixed.buf.as_ptr(),
+        p.gates.buf.as_ptr(),
+        quarters_in.map_or(null, |q| q.buf.as_ptr()),
+        p.output.buf.as_ptr(),
+        norm_weight.buf.as_ptr(),
+        normalized.buf.as_ptr(),
+        next.map_or(null, |n| n.norm_weight.buf.as_ptr()),
+        next.map_or(null, |n| n.inject.buf.as_ptr()),
+        next.map_or(null, |n| n.quarters.buf.as_ptr()),
+    ] {
+        args.push_ptr(ptr);
     }
-    args.push_i32(checked_i32(p.branches, "HC write branch count")?);
-    args.push_i32(checked_i32(p.hidden, "HC write hidden width")?);
+    args.push_i32(4);
+    args.push_i32(2560);
     args.pad_to(16);
     gpu.launch_blob_recorded(
         "hyper_write_norm_f32",
-        [checked_u32(p.branches, "HC write branch grid")?, 1, 1],
+        [4, 1, 1],
         [256, 1, 1],
         0,
         args.as_mut_slice(),

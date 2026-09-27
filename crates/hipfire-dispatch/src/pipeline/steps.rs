@@ -716,6 +716,9 @@ pub fn execute_validated_steps<'a>(
     steps: &[Step<'a>],
 ) -> Result<(), DispatchError> {
     let mut i = 0;
+    // A fused hyper write that produced the gate quarters of the hyper write
+    // at this index, and the quarter slot it used.
+    let mut gates_ready: Option<(usize, usize)> = None;
     while i < steps.len() {
         if let Some((key, len)) = match_prefix(FUSED_TABLE, &steps[i..], ctx) {
             // ── QKV bias fold (HIPFIRE_FUSE_QKV_BIAS) ────────────────────────
@@ -737,7 +740,26 @@ pub fn execute_validated_steps<'a>(
             if let (Step::HyperWrite(write), Some(Step::HyperRead(read))) =
                 (&steps[i], steps.get(i + 1))
             {
-                if crate::pipeline::layer_ops::execute_hyper_write_then_read(gpu, write, read)? {
+                use crate::pipeline::layer_ops::{execute_hyper_write_then_read, hyper_gate_quarters};
+                let quarters_in = gates_ready
+                    .filter(|(at, _)| *at == i)
+                    .and_then(|(_, slot)| hyper_gate_quarters(write, slot));
+                let slot = gates_ready.map_or(0, |(_, slot)| slot ^ 1);
+                let next = next_fused_hyper_write(steps, i + 2, read)
+                    .and_then(|j| match &steps[j] {
+                        Step::HyperWrite(next) => {
+                            hyper_gate_quarters(next, slot).map(|q| (j, next, q))
+                        }
+                        _ => None,
+                    });
+                if let Some(produced) = execute_hyper_write_then_read(
+                    gpu,
+                    write,
+                    read,
+                    quarters_in.as_ref(),
+                    next.as_ref().map(|(_, op, q)| (*op, q)),
+                )? {
+                    gates_ready = next.filter(|_| produced).map(|(j, _, _)| (j, slot));
                     i += 2;
                     continue;
                 }
@@ -747,6 +769,33 @@ pub fn execute_validated_steps<'a>(
         }
     }
     Ok(())
+}
+
+/// The index of the next hyper write of `read`'s streams when it is itself
+/// followed by a hyper read of them and only stream-neutral mixer steps
+/// separate it from `read` (so the streams it normalizes are the ones `read`
+/// normalized). Its gates can then come from the fused write before `read`.
+fn next_fused_hyper_write(
+    steps: &[Step<'_>],
+    from: usize,
+    read: &crate::pipeline::layer_ops::HyperReadOp<'_>,
+) -> Option<usize> {
+    let streams = read.input.buf.as_ptr();
+    for (j, step) in steps.iter().enumerate().skip(from) {
+        match step {
+            Step::GatedDeltaNet(_) | Step::IndexedAttention(_) | Step::Clear(_) | Step::Moe(_) => {}
+            Step::HyperWrite(write)
+                if write.input.buf.as_ptr() == streams
+                    && write.output.buf.as_ptr() == streams
+                    && matches!(steps.get(j + 1),
+                        Some(Step::HyperRead(next)) if next.input.buf.as_ptr() == streams) =>
+            {
+                return Some(j);
+            }
+            _ => return None,
+        }
+    }
+    None
 }
 
 /// Keys whose 3-way QKV **decode** dispatch arm folds the optional Q/K/V bias

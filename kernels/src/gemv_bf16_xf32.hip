@@ -150,6 +150,89 @@ extern "C" __global__ void gemv_bf16_xf32_k4(
     y[row] = value;
 }
 
+// Decode HC write + next HC read norm (tensor_ops.hip's hyper_write_f32 and
+// hyper_norm_f32 on one F32 row, bitwise): one block per branch; each thread
+// writes its ten columns of the new streams, keeps them, and normalizes them
+// with hyper_norm_rows' partials, 256-wide LDS tree and expression.
+//
+// `quarters_in` (optional) replaces `gates`: gate[b] is the k4 fold
+// (q[b][0] + q[b][1]) + (q[b][2] + q[b][3]) of four quarter dots.
+// `quarters_out` (optional) produces those quarters for the NEXT hyper write
+// of these same streams: its norm (`next_norm`) has hyper_norm's `inv` (same
+// rows), so block b normalizes its branch into LDS and waves 0..3 run
+// gemv_bf16_xf32_k4's quarter b of gate rows 0..3 (gemv_bf16_xf32_row over
+// that branch) — the next write then needs neither its norm nor its gate
+// GEMV. Grid [branches = 4], block 256, hidden == 2560.
+static __device__ __forceinline__ float hf_bf16(float v) {
+    return static_cast<float>(static_cast<hip_bfloat16>(v));
+}
+
+__launch_bounds__(256)
+extern "C" __global__ void hyper_write_norm_f32(
+    const float* __restrict__ input,
+    const float* __restrict__ mixed,
+    const float* __restrict__ gates,
+    const float* __restrict__ quarters_in,
+    float* output,
+    const unsigned short* __restrict__ norm_weight,
+    float* __restrict__ normalized,
+    const unsigned short* __restrict__ next_norm,
+    const unsigned short* __restrict__ next_inject,
+    float* __restrict__ quarters_out,
+    int branches,
+    int hidden
+) {
+    const int branch = (int)blockIdx.x;
+    const int tid = (int)threadIdx.x;
+    const int offset = branch * hidden;
+    __shared__ float rms_sum[256];
+    __shared__ float xn[2560];
+    float raw[10], mix[10], weight[10];
+#pragma unroll
+    for (int u = 0; u < 10; ++u) {
+        raw[u] = input[offset + tid + u * 256];
+        mix[u] = mixed[tid + u * 256];
+        weight[u] = HF_BF16_LO((unsigned int)norm_weight[offset + tid + u * 256]);
+    }
+    const float* q = quarters_in + branch * 4;
+    const float gate_logit = hf_bf16(
+        quarters_in ? (q[0] + q[1]) + (q[2] + q[3]) : gates[branch]);
+    const float gate_scaled = hf_bf16(gate_logit / (float)branches);
+    const float gate = hf_bf16(2.0f * hf_bf16(1.0f / (1.0f + expf(-gate_scaled))));
+    float partial = 0.0f;
+#pragma unroll
+    for (int u = 0; u < 10; ++u) {
+        const float injection = hf_bf16(gate * hf_bf16(mix[u]));
+        raw[u] = hf_bf16(hf_bf16(raw[u]) + injection);
+        output[offset + tid + u * 256] = raw[u];
+        const float normed_in = hf_bf16(raw[u]);
+        partial += normed_in * normed_in;
+    }
+    rms_sum[tid] = partial;
+    __syncthreads();
+    for (int stride = 128; stride > 0; stride >>= 1) {
+        if (tid < stride) rms_sum[tid] += rms_sum[tid + stride];
+        __syncthreads();
+    }
+    const float inv = rsqrtf(rms_sum[0] / (float)hidden + 1.0e-6f);
+#pragma unroll
+    for (int u = 0; u < 10; ++u) {
+        normalized[offset + tid + u * 256] = hf_bf16(hf_bf16(raw[u]) * inv * (1.0f + weight[u]));
+    }
+    if (!quarters_out) return;
+#pragma unroll
+    for (int u = 0; u < 10; ++u) {
+        const float w = HF_BF16_LO((unsigned int)next_norm[offset + tid + u * 256]);
+        xn[tid + u * 256] = hf_bf16(hf_bf16(raw[u]) * inv * (1.0f + w));
+    }
+    __syncthreads();
+    const int wave = tid >> 5;
+    if (wave >= 4) return;
+    const float s = gemv_bf16_xf32_row(
+        next_inject + (size_t)wave * 4 * hidden + offset, xn, hidden, tid & 31);
+    if ((tid & 31) == 0) quarters_out[wave * 4 + branch] = s;
+}
+
 // gemv_bf16_xf32 followed by bf16_scaled_add_f32 on each output row: the
 // source BF16 shared-expert fold residual[row] = bf16(bf16(residual[row]) +
 // bf16(bf16(scalar[0]) * bf16(W[row] . x))), the same expression, so the

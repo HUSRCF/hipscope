@@ -860,65 +860,6 @@ extern "C" __global__ void hyper_norm_f32(
         hyper_norm_rows((const float*)input, norm_weight, normalized, branches, hidden, rows,
                         normalized16);
 }
-// hyper_write_f32 of one F32 decode row followed by hyper_norm_f32 of the
-// written streams (the next hyper read's norm), one block per branch: each
-// thread writes its ten columns (hyper_write_f32's expression), keeps them,
-// and normalizes them with hyper_norm_rows' partials, tree and expression,
-// so `output` and `normalized` are bitwise the two launches. Grid
-// [branches], block 256, hidden == 2560.
-extern "C" __global__ __launch_bounds__(256) void hyper_write_norm_f32(
-    const float* input,
-    const float* mixed,
-    const float* gates,
-    float* output,
-    const __hip_bfloat16* norm_weight,
-    float* normalized,
-    int branches,
-    int hidden) {
-    const int branch = (int)blockIdx.x;
-    const int tid = (int)threadIdx.x;
-    const int offset = branch * hidden;
-    __shared__ float rms_sum[256];
-    float raw[10], mix[10], weight[10];
-#pragma unroll
-    for (int u = 0; u < 10; ++u) {
-        raw[u] = input[offset + tid + u * 256];
-        mix[u] = mixed[tid + u * 256];
-        weight[u] = bf16_to_f32(norm_weight[offset + tid + u * 256]);
-    }
-    const float gate_logit = bf16_to_f32(bf16_round(gates[branch]));
-    const float gate_scaled = bf16_to_f32(
-        bf16_round(gate_logit / (float)branches));
-    const float gate = bf16_to_f32(bf16_round(
-        2.0f * bf16_to_f32(bf16_round(
-            1.0f / (1.0f + expf(-gate_scaled))))));
-    float partial = 0.0f;
-#pragma unroll
-    for (int u = 0; u < 10; ++u) {
-        const float injection = bf16_to_f32(bf16_round(
-            gate * bf16_to_f32(bf16_round(mix[u]))));
-        const float value = bf16_to_f32(bf16_round(raw[u])) + injection;
-        raw[u] = bf16_to_f32(bf16_round(value));
-        output[offset + tid + u * 256] = raw[u];
-        const float normed_in = bf16_to_f32(bf16_round(raw[u]));
-        partial += normed_in * normed_in;
-    }
-    rms_sum[tid] = partial;
-    __syncthreads();
-    for (int stride = 128; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            rms_sum[tid] += rms_sum[tid + stride];
-        }
-        __syncthreads();
-    }
-    const float inv = rsqrtf(rms_sum[0] / (float)hidden + 1.0e-6f);
-#pragma unroll
-    for (int u = 0; u < 10; ++u) {
-        normalized[offset + tid + u * 256] = bf16_to_f32(bf16_round(
-            bf16_to_f32(bf16_round(raw[u])) * inv * (1.0f + weight[u])));
-    }
-}
-
 // Lane 0 of `v += __shfl_down(v, off, 32)` for off = 16..1, with the
 // partners moved by permlanex16 / row DPP on gfx11/gfx12 (same additions and
 // order as gemm_bf16_xf32_multirow's reduction).
