@@ -14037,6 +14037,33 @@ impl Gpu {
             return result;
         }
 
+        // gfx1151, K = 2560: rows staged through LDS with dword loads (same
+        // values; 226 -> 241 GB/s on the Qwen4 LM head).
+        if self.arch_caps.is_gfx1151() && k == 2560 {
+            const FUNC: &str = "gemv_q8_0_k2560_staged";
+            self.ensure_kernel("gemv_q8_0", kernels::GEMV_Q8_0_SRC, FUNC)?;
+            let mut params = [
+                &a_ptr as *const _ as *mut c_void,
+                &x_ptr as *const _ as *mut c_void,
+                &y_ptr as *const _ as *mut c_void,
+                &m_val as *const _ as *mut c_void,
+            ];
+            return self.launch_maybe_blob(
+                FUNC,
+                [m as u32, 1, 1],
+                [32, 1, 1],
+                0,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(a_ptr);
+                    b.push_ptr(x_ptr);
+                    b.push_ptr(y_ptr);
+                    b.push_i32(m_val);
+                    b
+                },
+            );
+        }
         self.ensure_kernel("gemv_q8_0", kernels::GEMV_Q8_0_SRC, "gemv_q8_0")?;
         let block_size = 32u32;
         let bytes = m * (k / 32) * 34 + k * 4 + m * 4;
