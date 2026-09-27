@@ -478,6 +478,16 @@ pub(crate) fn activation(
     hip(gpu.rotate_x_mq_128_v2(p.rot_batch, p.rot_batch, p.mi, total_slots))
 }
 
+/// A few-row forward (speculative verify) on grouped path 2 without the WMMA
+/// down: the route slots are nearly all distinct experts, so the grouped down
+/// tile (16 slot rows per expert) runs almost empty; the decode kernel's
+/// per-slot down over the unscattered, rotated rows streams the experts
+/// faster.  Its per-slot dot is the grouped kernel's (bitwise), combined in
+/// slot order.
+fn indexed_down(gpu: &Gpu, p: &MoePrefillParams<'_>, use_path2: bool) -> bool {
+    use_path2 && p.batch_size <= 8 && !down_wmma(gpu, p)
+}
+
 pub(crate) fn down(
     gpu: &mut Gpu,
     p: &MoePrefillParams<'_>,
@@ -486,6 +496,9 @@ pub(crate) fn down(
 ) -> Result<(), DispatchError> {
     require_geometry(p)?;
     let total_slots = p.batch_size * p.k_top;
+    if indexed_down(gpu, p, use_path2) {
+        return down(gpu, p, false, grouped_rows);
+    }
     if use_path2 && down_wmma(gpu, p) {
         // Rotation and GEMM in one stage: the rotated F16 rows live in the
         // shared FP16 scratch, which another stage's GEMM would overwrite.
@@ -557,6 +570,9 @@ pub(crate) fn combine(
 ) -> Result<(), DispatchError> {
     require_geometry(p)?;
     let target = p.routed_out.unwrap_or(p.x_batch);
+    if indexed_down(gpu, p, use_path2) {
+        return combine(gpu, p, false, grouped_rows);
+    }
     if use_path2 && down_wmma(gpu, p) {
         // The rank order goes to `down_expanded`: unused on this route until
         // the shared down, which runs after the combine.
