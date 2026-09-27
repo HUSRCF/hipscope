@@ -186,6 +186,7 @@ fn kernel_meta(value: &Value) -> Result<KernelMeta, MetadataError> {
                 size: req_u32(arg, ".size", &key(".size"))?,
                 offset: req_u32(arg, ".offset", &key(".offset"))?,
                 value_kind: req_str(arg, ".value_kind", &key(".value_kind"))?,
+                address_space: opt_str(arg, ".address_space", &key(".address_space"))?,
             })
         }).collect::<Result<_, MetadataError>>()?,
         Some(_) => return Err(MetadataError::WrongType { key: ".args".into(), expected: "array" }),
@@ -257,6 +258,10 @@ fn apply(value: &mut Value, meta: &KernelMeta) -> Result<(), MetadataError> {
         }
         let Value::Map(fields) = &mut items[i] else { return Err(MetadataError::NotMap { what: format!(".args[{i}]") }) };
         let named = !arg.name.is_empty();
+        match &arg.address_space {
+            Some(space) => put(fields, ".address_space", Value::from(space.as_str()), true),
+            None => fields.retain(|(k, _)| k.as_str() != Some(".address_space")),
+        }
         put(fields, ".name", Value::from(arg.name.as_str()), named);
         put(fields, ".offset", Value::from(arg.offset), true);
         put(fields, ".size", Value::from(arg.size), true);
@@ -450,7 +455,7 @@ mod tests {
         meta.parsed.vgpr_count = 256;
         meta.parsed.kernarg_segment_size = 336;
         meta.parsed.uses_dynamic_stack = true;
-        meta.parsed.args.push(Kernarg { name: "pm_profile".into(), size: 8, offset: 328, value_kind: "global_buffer".into() });
+        meta.parsed.args.push(Kernarg { name: "pm_profile".into(), size: 8, offset: 328, value_kind: "global_buffer".into(), address_space: Some("global".into()) });
         let bytes = serialize_kernel(&meta).unwrap();
         let again = parse_kernel(&bytes).unwrap();
         assert_eq!(again.parsed, meta.parsed);
@@ -464,7 +469,7 @@ mod tests {
         assert_eq!(get(first, ".address_space").and_then(Value::as_str), Some("global"));
         let Value::Map(added) = args.last().unwrap() else { panic!("added arg") };
         let keys: Vec<_> = added.iter().map(|(k, _)| k.as_str().unwrap()).collect();
-        assert_eq!(keys, [".name", ".offset", ".size", ".value_kind"]);
+        assert_eq!(keys, [".address_space", ".name", ".offset", ".size", ".value_kind"], "keys in LLVM's sorted order");
     }
 
     #[test]

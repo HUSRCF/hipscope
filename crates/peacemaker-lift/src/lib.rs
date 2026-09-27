@@ -12,6 +12,7 @@
 pub mod bundle;
 pub mod elf;
 pub mod kd;
+pub mod layout;
 pub mod metadata;
 pub mod text;
 

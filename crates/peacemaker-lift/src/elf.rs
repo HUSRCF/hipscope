@@ -28,6 +28,7 @@ use peacemaker_ir::envelope::{
 use peacemaker_ir::metadata::HsaKernelMetadata;
 
 use crate::kd::{DescriptorCodec, KD_SIZE};
+use crate::layout::{self, Layout};
 use crate::metadata::{MetadataDocCodec, MetadataError};
 
 /// `NT_AMDGPU_METADATA`: the code object V3+ msgpack metadata note.
@@ -56,8 +57,8 @@ pub enum ElfError {
     Descriptor { kernel: String, #[source] error: DescriptorError },
     #[error("write needs one KernelParts per kernel slot: {expected} slots, {got} parts")]
     PartCount { expected: usize, got: usize },
-    #[error("{what} changed size ({original} -> {new} bytes); the envelope writer keeps the original layout")]
-    SizeChanged { what: String, original: u64, new: u64 },
+    #[error("re-layout: {0}")]
+    Layout(String),
 }
 
 fn has_file_bytes(h: &SectionHeader) -> bool { h.sh_type != E::SHT_NOBITS && h.sh_size != 0 }
@@ -98,8 +99,13 @@ pub trait EnvelopeCodec: Sized {
     /// Parses a code object into its envelope and kernel images.
     fn read(bytes: &[u8]) -> Result<(Self, Vec<KernelImage>), ElfError>;
     /// Emits the module: the envelope with each kernel slot filled from `parts` (same order
-    /// as `kernels`): code spliced, descriptor and metadata map re-serialised.
+    /// as `kernels`): code spliced, descriptor and metadata map re-serialised. Parts that
+    /// no longer fit the input layout (code or metadata note size, kernel renames) are
+    /// written through [`EnvelopeCodec::layout`].
     fn write(&self, parts: &[KernelParts<'_>]) -> Result<Vec<u8>, ElfError>;
+    /// The layout `write` emits `parts` into: the envelope itself when they fit, else the
+    /// ld.lld re-layout (`crate::layout`) with each kernel's layout-derived descriptor.
+    fn layout(&self, parts: &[KernelParts<'_>]) -> Result<Layout, ElfError>;
     /// Section name from the section header string table.
     fn section_name(&self, index: usize) -> Option<&str>;
     /// Symbol name from the string table linked by symbol table section `table`.
@@ -252,99 +258,22 @@ impl EnvelopeCodec for Envelope {
     }
 
     fn write(&self, parts: &[KernelParts<'_>]) -> Result<Vec<u8>, ElfError> {
-        if parts.len() != self.kernels.len() {
-            return Err(ElfError::PartCount { expected: self.kernels.len(), got: parts.len() });
+        let metadata = check_parts(self, parts)?;
+        if layout::fits(self, parts, &metadata)? {
+            return write_fixed(self, parts, &metadata);
         }
-        let mut metadata: Vec<Option<&HsaKernelMetadata>> = vec![None; self.kernels.len()];
-        for (slot, part) in self.kernels.iter().zip(parts) {
-            let kernel_error = |reason: String| ElfError::Kernel { kernel: slot.name.clone(), reason };
-            if part.code.len() as u64 != slot.size {
-                return Err(ElfError::SizeChanged { what: format!("code of kernel {}", slot.name), original: slot.size, new: part.code.len() as u64 });
-            }
-            if part.metadata.parsed.symbol != format!("{}.kd", slot.name) {
-                return Err(kernel_error(format!("metadata .symbol {} does not name this kernel's descriptor", part.metadata.parsed.symbol)));
-            }
-            if slot.kd_va.checked_add_signed(part.descriptor.kernel_code_entry_byte_offset) != Some(slot.entry_va) {
-                return Err(kernel_error("descriptor entry offset does not reach the kernel entry".into()));
-            }
-            *metadata.get_mut(slot.metadata_index).ok_or_else(|| kernel_error("metadata index out of range".into()))? = Some(part.metadata);
-        }
-        let metadata = metadata.into_iter().collect::<Option<Vec<_>>>()
-            .ok_or_else(|| ElfError::Format("kernel slots do not cover the metadata array".into()))?;
+        let laid = layout::relayout(self, parts, &metadata)?;
+        let parts: Vec<KernelParts<'_>> = parts.iter().zip(&laid.descriptors)
+            .map(|(part, descriptor)| KernelParts { descriptor, ..*part }).collect();
+        write_fixed(&laid.envelope, &parts, &metadata)
+    }
 
-        let mut chunks = vec![Chunk::bytes("ELF header", 0, header_bytes(self)?)];
-        if !self.segments.is_empty() {
-            let mut table = Vec::with_capacity(self.segments.len() * PHDR_SIZE as usize);
-            for p in &self.segments {
-                table.extend_from_slice(pod::bytes_of(&ProgramHeader64::<LE> {
-                    p_type: U32::new(LE, p.p_type),
-                    p_flags: U32::new(LE, p.p_flags),
-                    p_offset: U64::new(LE, p.p_offset),
-                    p_vaddr: U64::new(LE, p.p_vaddr),
-                    p_paddr: U64::new(LE, p.p_paddr),
-                    p_filesz: U64::new(LE, p.p_filesz),
-                    p_memsz: U64::new(LE, p.p_memsz),
-                    p_align: U64::new(LE, p.p_align),
-                }));
-            }
-            chunks.push(Chunk::bytes("program headers", self.header.e_phoff, table));
+    fn layout(&self, parts: &[KernelParts<'_>]) -> Result<Layout, ElfError> {
+        let metadata = check_parts(self, parts)?;
+        if layout::fits(self, parts, &metadata)? {
+            return Ok(Layout { envelope: self.clone(), descriptors: parts.iter().map(|p| p.descriptor.clone()).collect() });
         }
-        if !self.sections.is_empty() {
-            let mut table = Vec::with_capacity(self.sections.len() * SHDR_SIZE as usize);
-            for s in &self.sections {
-                let h = &s.header;
-                table.extend_from_slice(pod::bytes_of(&SectionHeader64::<LE> {
-                    sh_name: U32::new(LE, h.sh_name),
-                    sh_type: U32::new(LE, h.sh_type),
-                    sh_flags: U64::new(LE, h.sh_flags),
-                    sh_addr: U64::new(LE, h.sh_addr),
-                    sh_offset: U64::new(LE, h.sh_offset),
-                    sh_size: U64::new(LE, h.sh_size),
-                    sh_link: U32::new(LE, h.sh_link),
-                    sh_info: U32::new(LE, h.sh_info),
-                    sh_addralign: U64::new(LE, h.sh_addralign),
-                    sh_entsize: U64::new(LE, h.sh_entsize),
-                }));
-            }
-            chunks.push(Chunk::bytes("section headers", self.header.e_shoff, table));
-        }
-        for (index, section) in self.sections.iter().enumerate() {
-            let h = &section.header;
-            let data: Cow<'_, [u8]> = match &section.data {
-                SectionData::NoBits => continue,
-                SectionData::Bytes(b) => Cow::Borrowed(b),
-                SectionData::Symbols(syms) => Cow::Owned(syms.iter().flat_map(|s| pod::bytes_of(&Sym64::<LE> {
-                    st_name: U32::new(LE, s.st_name),
-                    st_info: s.st_info,
-                    st_other: s.st_other,
-                    st_shndx: U16::new(LE, s.st_shndx),
-                    st_value: U64::new(LE, s.st_value),
-                    st_size: U64::new(LE, s.st_size),
-                }).to_vec()).collect()),
-                SectionData::Dynamic(dyns) => Cow::Owned(dyns.iter().flat_map(|d| pod::bytes_of(&Dyn64::<LE> {
-                    d_tag: U64::new(LE, d.d_tag),
-                    d_val: U64::new(LE, d.d_val),
-                }).to_vec()).collect()),
-                SectionData::Notes(notes) => Cow::Owned(write_notes(notes, h.sh_addralign, &metadata)?),
-            };
-            if data.len() as u64 != h.sh_size {
-                let what = format!("section {index} ({})", self.section_name(index).unwrap_or("?"));
-                return Err(ElfError::SizeChanged { what, original: h.sh_size, new: data.len() as u64 });
-            }
-            if !data.is_empty() {
-                chunks.push(Chunk { what: format!("section {index}"), offset: h.sh_offset, body: Body::Bytes(data) });
-            }
-        }
-        chunks.extend(self.gaps.iter().map(Chunk::gap));
-        let mut out = assemble(chunks).map_err(ElfError::from)?;
-        for (slot, part) in self.kernels.iter().zip(parts) {
-            let hole = |what: &str| ElfError::Kernel { kernel: slot.name.clone(), reason: format!("{what} hole no longer maps to an allocated section") };
-            let code_at = self.file_offset(slot.entry_va, slot.size).ok_or_else(|| hole("code"))?;
-            out[code_at..code_at + part.code.len()].copy_from_slice(part.code);
-            let kd_at = self.file_offset(slot.kd_va, KD_SIZE as u64).ok_or_else(|| hole("descriptor"))?;
-            out[kd_at..kd_at + KD_SIZE].copy_from_slice(&part.descriptor.to_bytes());
-        }
-        Ok(out)
+        layout::relayout(self, parts, &metadata)
     }
 
     fn section_name(&self, index: usize) -> Option<&str> {
@@ -366,6 +295,112 @@ impl EnvelopeCodec for Envelope {
         })
     }
 
+}
+
+/// Checks `parts` against the slots (count, `.symbol`, descriptor entry offset under the
+/// current layout) and returns the metadata maps in note order.
+fn check_parts<'a>(env: &Envelope, parts: &[KernelParts<'a>]) -> Result<Vec<&'a HsaKernelMetadata>, ElfError> {
+    if parts.len() != env.kernels.len() {
+        return Err(ElfError::PartCount { expected: env.kernels.len(), got: parts.len() });
+    }
+    let mut metadata: Vec<Option<&HsaKernelMetadata>> = vec![None; env.kernels.len()];
+    for (slot, part) in env.kernels.iter().zip(parts) {
+        let kernel_error = |reason: String| ElfError::Kernel { kernel: slot.name.clone(), reason };
+        if part.metadata.parsed.symbol != format!("{}.kd", slot.name) {
+            return Err(kernel_error(format!("metadata .symbol {} does not name this kernel's descriptor", part.metadata.parsed.symbol)));
+        }
+        if slot.kd_va.checked_add_signed(part.descriptor.kernel_code_entry_byte_offset) != Some(slot.entry_va) {
+            return Err(kernel_error("descriptor entry offset does not reach the kernel entry".into()));
+        }
+        *metadata.get_mut(slot.metadata_index).ok_or_else(|| kernel_error("metadata index out of range".into()))? = Some(part.metadata);
+    }
+    metadata.into_iter().collect::<Option<Vec<_>>>()
+        .ok_or_else(|| ElfError::Format("kernel slots do not cover the metadata array".into()))
+}
+
+/// Writes `parts` into `env`'s own layout; every part must fit its slot exactly.
+fn write_fixed(env: &Envelope, parts: &[KernelParts<'_>], metadata: &[&HsaKernelMetadata]) -> Result<Vec<u8>, ElfError> {
+    for (slot, part) in env.kernels.iter().zip(parts) {
+        if part.code.len() as u64 != slot.size {
+            return Err(ElfError::Layout(format!("code of kernel {} is {} bytes, its slot {}", slot.name, part.code.len(), slot.size)));
+        }
+        if slot.kd_va.checked_add_signed(part.descriptor.kernel_code_entry_byte_offset) != Some(slot.entry_va) {
+            return Err(ElfError::Kernel { kernel: slot.name.clone(), reason: "descriptor entry offset does not reach the kernel entry".into() });
+        }
+    }
+    let mut chunks = vec![Chunk::bytes("ELF header", 0, header_bytes(env)?)];
+    if !env.segments.is_empty() {
+        let mut table = Vec::with_capacity(env.segments.len() * PHDR_SIZE as usize);
+        for p in &env.segments {
+            table.extend_from_slice(pod::bytes_of(&ProgramHeader64::<LE> {
+                p_type: U32::new(LE, p.p_type),
+                p_flags: U32::new(LE, p.p_flags),
+                p_offset: U64::new(LE, p.p_offset),
+                p_vaddr: U64::new(LE, p.p_vaddr),
+                p_paddr: U64::new(LE, p.p_paddr),
+                p_filesz: U64::new(LE, p.p_filesz),
+                p_memsz: U64::new(LE, p.p_memsz),
+                p_align: U64::new(LE, p.p_align),
+            }));
+        }
+        chunks.push(Chunk::bytes("program headers", env.header.e_phoff, table));
+    }
+    if !env.sections.is_empty() {
+        let mut table = Vec::with_capacity(env.sections.len() * SHDR_SIZE as usize);
+        for s in &env.sections {
+            let h = &s.header;
+            table.extend_from_slice(pod::bytes_of(&SectionHeader64::<LE> {
+                sh_name: U32::new(LE, h.sh_name),
+                sh_type: U32::new(LE, h.sh_type),
+                sh_flags: U64::new(LE, h.sh_flags),
+                sh_addr: U64::new(LE, h.sh_addr),
+                sh_offset: U64::new(LE, h.sh_offset),
+                sh_size: U64::new(LE, h.sh_size),
+                sh_link: U32::new(LE, h.sh_link),
+                sh_info: U32::new(LE, h.sh_info),
+                sh_addralign: U64::new(LE, h.sh_addralign),
+                sh_entsize: U64::new(LE, h.sh_entsize),
+            }));
+        }
+        chunks.push(Chunk::bytes("section headers", env.header.e_shoff, table));
+    }
+    for (index, section) in env.sections.iter().enumerate() {
+        let h = &section.header;
+        let data: Cow<'_, [u8]> = match &section.data {
+            SectionData::NoBits => continue,
+            SectionData::Bytes(b) => Cow::Borrowed(b),
+            SectionData::Symbols(syms) => Cow::Owned(syms.iter().flat_map(|s| pod::bytes_of(&Sym64::<LE> {
+                st_name: U32::new(LE, s.st_name),
+                st_info: s.st_info,
+                st_other: s.st_other,
+                st_shndx: U16::new(LE, s.st_shndx),
+                st_value: U64::new(LE, s.st_value),
+                st_size: U64::new(LE, s.st_size),
+            }).to_vec()).collect()),
+            SectionData::Dynamic(dyns) => Cow::Owned(dyns.iter().flat_map(|d| pod::bytes_of(&Dyn64::<LE> {
+                d_tag: U64::new(LE, d.d_tag),
+                d_val: U64::new(LE, d.d_val),
+            }).to_vec()).collect()),
+            SectionData::Notes(notes) => Cow::Owned(write_notes(notes, h.sh_addralign, metadata)?),
+        };
+        if data.len() as u64 != h.sh_size {
+            let name = env.section_name(index).unwrap_or("?");
+            return Err(ElfError::Layout(format!("section {index} ({name}) holds {} bytes, its header {}", data.len(), h.sh_size)));
+        }
+        if !data.is_empty() {
+            chunks.push(Chunk { what: format!("section {index}"), offset: h.sh_offset, body: Body::Bytes(data) });
+        }
+    }
+    chunks.extend(env.gaps.iter().map(Chunk::gap));
+    let mut out = assemble(chunks).map_err(ElfError::from)?;
+    for (slot, part) in env.kernels.iter().zip(parts) {
+        let hole = |what: &str| ElfError::Kernel { kernel: slot.name.clone(), reason: format!("{what} hole no longer maps to an allocated section") };
+        let code_at = env.file_offset(slot.entry_va, slot.size).ok_or_else(|| hole("code"))?;
+        out[code_at..code_at + part.code.len()].copy_from_slice(part.code);
+        let kd_at = env.file_offset(slot.kd_va, KD_SIZE as u64).ok_or_else(|| hole("descriptor"))?;
+        out[kd_at..kd_at + KD_SIZE].copy_from_slice(&part.descriptor.to_bytes());
+    }
+    Ok(out)
 }
 
 fn section_at(env: &Envelope, va: u64, len: u64) -> Option<usize> {
@@ -498,7 +533,7 @@ fn bytes_mut(env: &mut Envelope, section: usize, va: u64, len: u64) -> Option<&m
     data.get_mut(start..start + len as usize)
 }
 
-fn write_notes(notes: &[Note], align: u64, metadata: &[&HsaKernelMetadata]) -> Result<Vec<u8>, ElfError> {
+pub(crate) fn write_notes(notes: &[Note], align: u64, metadata: &[&HsaKernelMetadata]) -> Result<Vec<u8>, ElfError> {
     let align = if align <= 4 { 4 } else { align as usize };
     let pad = |out: &mut Vec<u8>| out.resize(out.len().next_multiple_of(align), 0);
     let mut out = Vec::new();
@@ -521,7 +556,7 @@ fn write_notes(notes: &[Note], align: u64, metadata: &[&HsaKernelMetadata]) -> R
     Ok(out)
 }
 
-fn cstr(table: &[u8], offset: u32) -> Option<&str> {
+pub(crate) fn cstr(table: &[u8], offset: u32) -> Option<&str> {
     let tail = table.get(offset as usize..)?;
     std::str::from_utf8(&tail[..tail.iter().position(|&b| b == 0)?]).ok()
 }
@@ -714,24 +749,76 @@ mod tests {
     }
 
     #[test]
-    fn write_rejects_parts_that_do_not_fit_the_slots() {
+    fn write_rejects_parts_it_cannot_place() {
         let (envelope, images) = Envelope::read(&kt48_co()).unwrap();
         let parts: Vec<_> = images.iter().map(KernelImage::parts).collect();
         assert!(matches!(envelope.write(&parts[1..]), Err(ElfError::PartCount { expected: 6, got: 5 })));
 
         let mut short = parts.clone();
         short[0].code = &images[0].code[1..];
-        assert!(matches!(envelope.write(&short), Err(ElfError::SizeChanged { .. })));
-
-        let mut grown = images[0].metadata.clone();
-        grown.parsed.args.push(peacemaker_ir::metadata::Kernarg { name: String::new(), size: 8, offset: 328, value_kind: "by_value".into() });
-        let mut longer = parts.clone();
-        longer[0].metadata = &grown;
-        assert!(matches!(envelope.write(&longer), Err(ElfError::SizeChanged { what, .. }) if what.contains(".note")));
+        assert!(matches!(envelope.write(&short), Err(ElfError::Layout(reason)) if reason.contains("dword")));
 
         let mut swapped = parts.clone();
         swapped.swap(0, 1);
-        assert!(matches!(envelope.write(&swapped), Err(ElfError::SizeChanged { .. } | ElfError::Kernel { .. })));
+        assert!(matches!(envelope.write(&swapped), Err(ElfError::Kernel { .. })));
+    }
+
+    /// The ld.lld rules applied to an unedited module's own sizes re-derive every layout
+    /// byte of it: KT48 (hipcc: `.eh_frame`, `.bss`, `s_code_end` tail) and the F2 builder
+    /// bundle (no `.eh_frame`, no tail).
+    #[test]
+    fn relayout_of_an_unedited_module_reproduces_it() {
+        for (input, bundled) in [(kt48_co(), false), (f2_hxaco(), true)] {
+            let (source, images) = Source::read(&input, Arch::Gfx1201).unwrap();
+            let env = &source.elf;
+            let parts = parts(&images);
+            let metadata = check_parts(env, &parts).unwrap();
+            let laid = layout::relayout(env, &parts, &metadata).unwrap_or_else(|e| panic!("bundled={bundled}: {e}"));
+            assert_eq!(laid.envelope.header, env.header, "bundled={bundled}");
+            assert_eq!(laid.envelope.segments, env.segments, "bundled={bundled}");
+            for (i, (a, b)) in laid.envelope.sections.iter().zip(&env.sections).enumerate() {
+                assert_eq!(a.header, b.header, "bundled={bundled} section {i} header");
+                assert!(a.data == b.data, "bundled={bundled} section {i} data");
+            }
+            assert_eq!(laid.envelope.kernels, env.kernels, "bundled={bundled}");
+            let descriptors: Vec<_> = images.iter().map(|k| k.descriptor.clone()).collect();
+            assert_eq!(laid.descriptors, descriptors);
+            let laid_parts: Vec<_> = parts.iter().zip(&laid.descriptors).map(|(p, d)| KernelParts { descriptor: d, ..*p }).collect();
+            let elf = write_fixed(&laid.envelope, &laid_parts, &metadata).unwrap();
+            let device: Vec<u8> = if bundled {
+                let (_, payloads) = <peacemaker_ir::envelope::Bundle as crate::bundle::BundleCodec>::read(&input).unwrap();
+                payloads.into_iter().find(|p| !p.is_empty()).unwrap().to_vec()
+            } else { input.clone() };
+            assert_eq!(elf, device, "bundled={bundled}");
+        }
+    }
+
+    /// A grown metadata note moves every later allocated section: the module is re-laid
+    /// out, re-reads, and carries the same kernels with the grown map.
+    #[test]
+    fn grown_metadata_note_relays_the_module() {
+        let co = kt48_co();
+        let (envelope, images) = Envelope::read(&co).unwrap();
+        let mut grown = images[0].metadata.clone();
+        grown.parsed.args.push(peacemaker_ir::metadata::Kernarg { name: "extra".into(), size: 8, offset: 328, value_kind: "by_value".into(), address_space: None });
+        let mut parts = parts(&images);
+        parts[0].metadata = &grown;
+        let out = envelope.write(&parts).unwrap();
+        let (again, relifted) = Envelope::read(&out).unwrap();
+        assert_eq!(relifted.len(), images.len());
+        for (a, b) in relifted.iter().zip(&images) {
+            assert_eq!((&a.name, &a.code), (&b.name, &b.code));
+            assert_eq!(a.metadata.parsed, if a.name == images[0].name { grown.parsed.clone() } else { b.metadata.parsed.clone() });
+            let mut expected = b.descriptor.clone();
+            expected.kernel_code_entry_byte_offset = a.descriptor.kernel_code_entry_byte_offset;
+            assert_eq!(a.descriptor, expected, "only the entry offset is layout-derived here");
+        }
+        let note = |env: &Envelope| env.sections[section(env, ".note")].header.sh_size;
+        assert!(note(&again) > note(&envelope));
+        let header = |env: &Envelope, name: &str| env.sections[section(env, name)].header;
+        assert!(header(&again, ".dynsym").sh_addr > header(&envelope, ".dynsym").sh_addr, "sections after the note move");
+        assert_eq!(header(&again, ".text").sh_size, header(&envelope, ".text").sh_size);
+        assert_eq!(header(&again, ".text").sh_addr % 256, 0);
     }
 
     #[test]

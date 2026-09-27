@@ -1040,7 +1040,7 @@ fn revive(arena: &mut Arena<Inst>, items: &[(InstId, Inst)]) -> Result<(), EditE
 
 struct HintSlot { hint: InstId, slot: u8, n: u8, producers: BTreeSet<Option<InstId>> }
 
-/// Producers `n` VALUs back from `consumer` on every path (`None` = a path
+/// Producers `n` non-TRANS VALUs back (`VALU_DEP_n`) from `consumer` on every path (`None` = a path
 /// reaches the entry first).
 fn producers(flow: &Flow, body: &Body, consumer: usize, n: u8) -> BTreeSet<Option<InstId>> {
     let mut out = BTreeSet::new();
@@ -1049,7 +1049,7 @@ fn producers(flow: &Flow, body: &Body, consumer: usize, n: u8) -> BTreeSet<Optio
     if work.is_empty() { out.insert(None); }
     while let Some((p, count)) = work.pop() {
         if !seen.insert((p, count)) { continue; }
-        let valu = body.insts.get(flow.ids[p]).is_some_and(is_valu);
+        let valu = body.insts.get(flow.ids[p]).is_some_and(passes::windows::counts_for_valu_dep);
         let count = count + u8::from(valu);
         if valu && count == n { out.insert(Some(flow.ids[p])); continue; }
         if flow.pred[p].is_empty() { out.insert(None); }
@@ -2310,7 +2310,7 @@ mod tests {
         let base = analyze(kt48_program(), &kernel).unwrap();
         let base_stream = stream(&base.program);
         let profiled = format!("{KT48}__pm_profile");
-        let arg = |name: &str, offset: u32, size: u32, kind: &str| Kernarg { name: name.into(), size, offset, value_kind: kind.into() };
+        let arg = |name: &str, offset: u32, size: u32, kind: &str| Kernarg { name: name.into(), size, offset, value_kind: kind.into(), address_space: None };
         let args = vec![arg("pm_profile_records", 328, 8, "global_buffer"), arg("pm_slot_bytes", 336, 4, "by_value"),
             arg("pm_waves_per_wg", 340, 4, "by_value"), arg("pm_grid_x", 344, 4, "by_value"), arg("pm_grid_y", 348, 4, "by_value")];
         let claims = vec![claim("pm_pointer", sreg(28, 2), Scope::Whole), claim("pm_exec_save", sreg(31, 1), Scope::Whole),
@@ -2764,7 +2764,7 @@ mod tests {
         assert_eq!(descriptor.compute_pgm_rsrc1.vgpr_granules(), 12);
         round_trip(&a, desc(DescriptorChange::KernargSize(96)));
         round_trip(&a, desc(DescriptorChange::GroupSegmentFixedSize(4096)));
-        let arg = |name: &str, offset, size| Kernarg { name: name.into(), size, offset, value_kind: "by_value".into() };
+        let arg = |name: &str, offset, size| Kernarg { name: name.into(), size, offset, value_kind: "by_value".into(), address_space: None };
         assert!(bad_meta(meta(MetaChange::AppendArgs(vec![arg("a", 64, 8), arg("b", 68, 4)]))), "overlap");
         assert!(bad_meta(meta(MetaChange::AppendArgs(vec![arg("a", 66, 4)]))), "misaligned");
         assert!(bad_meta(meta(MetaChange::SetVgprCount(64))));
