@@ -26,11 +26,13 @@ import hashlib, json, os, re, select, statistics, subprocess, sys, time
 
 MODEL = os.path.expanduser("~/.hipfire/models/qwen3.8-flash-next.mq6q8-pleq8.hfq")
 KLD_REF = "/home/bjoern/hipfire-qwen4-kld/.codeinsight+research/qwen4-kld/source-teacher/bf16src-wt2-c512x32.kldref"
-KLD_CHUNKS = 8
-# Decode-route KLD ceiling = the noise band of reduction-order-only changes: the
-# bit-exact baseline measured 0.072049, the K-split HC GEMV (run 200) 0.069977 on
-# the same weights. Numerics changes are accepted up to the top of that band.
-KLD_MAX = 0.072049
+KLD_CHUNKS = 32
+# Decode-route KLD ceiling = baseline + noise band. Weight perturbations of
+# equal expected quality (fake int8 of the HC projections, g16 vs g32) moved
+# the 32-chunk KLD by -1.8%..+1.4% around the HEAD value 0.074299 (single
+# chunks swing +-0.03), so the band is +2%. Fixed to the segment baseline, not
+# the moving best, so within-noise keeps cannot creep.
+KLD_MAX = 0.074299 * 1.02
 PROMPT_PATH = "benchmarks/prompts/glimmer_prefill_1024.txt"
 PROMPT_MD5 = "0ee8f86ada3683eda452bc294ec824a9"
 RUNS = int(os.environ.get("AR_RUNS", "3"))
