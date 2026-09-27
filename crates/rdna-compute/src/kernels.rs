@@ -1211,13 +1211,38 @@ pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_FP8_INREG_GFX12_SRC: &str = concat!(
 );
 /// At K <= 6144, three groups per wave suffice; this shorter object avoids
 /// inflating the RMSNorm instruction footprint for the model's K=5120 rows.
+/// Phase-1a keeps up to 8 row loads in flight per wave instead of one
+/// (`HIPFIRE_RMSNORM_P1A_BATCHED` + `HIPFIRE_RMSNORM_P1A_DRAIN` +
+/// `HIPFIRE_RMSNORM_P1A_MAX8`): same elements, same strictly sequential
+/// `fma(v, v, acc)` chain from +0 as the incumbent loop's contraction, same
+/// reduction tree — bit-identical rms. `HIPFIRE_RMSNORM_P1A_BATCHED=0` selects
+/// the `_SEQ` single-outstanding twin below.
 pub const FUSED_RMSNORM_MQ_ROTATE_FP8_INREG_SHORT_GFX12_SRC: &str = concat!(
+    include_str!("../../../kernels/src/mq4v2_fp8_producer_pack.hip"),
+    "#define HIPFIRE_FP8_STREAM 1\n#define HIPFIRE_FP8_PROD_INREG 1\n#define HIPFIRE_FP8_PROD_SHORT 1\n",
+    "#define HIPFIRE_RMSNORM_P1A_BATCHED 1\n#define HIPFIRE_RMSNORM_P1A_DRAIN 1\n#define HIPFIRE_RMSNORM_P1A_MAX8 1\n",
+    "#define HIPFIRE_RMSNORM_KERNEL fused_rmsnorm_mq_rotate_mq4v2_fp8_inreg_short_gfx12\n",
+    include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate.hip")
+);
+pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_FP8_INREG_SHORT_GFX12_SRC: &str = concat!(
+    include_str!("../../../kernels/src/mq4v2_fp8_producer_pack.hip"),
+    "#define HIPFIRE_FP8_STREAM 1\n#define HIPFIRE_FP8_PROD_INREG 1\n#define HIPFIRE_FP8_PROD_SHORT 1\n#define HIPFIRE_RMSNORM_AWQ 1\n#define HIPFIRE_RMSNORM_FP8_STRIDED 1\n",
+    "#define HIPFIRE_RMSNORM_P1A_BATCHED 1\n#define HIPFIRE_RMSNORM_P1A_DRAIN 1\n#define HIPFIRE_RMSNORM_P1A_MAX8 1\n",
+    "#define HIPFIRE_RMSNORM_KERNEL fused_rmsnorm_mq_rotate_awq_mq4v2_fp8_inreg_short_gfx12\n",
+    include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate.hip")
+);
+/// Single-outstanding phase-1a twins of the SHORT fp8 producers above:
+/// byte-identical source to beta (no `HIPFIRE_RMSNORM_P1A_BATCHED`), kept for
+/// the `HIPFIRE_RMSNORM_P1A_BATCHED=0` opt-out arm. Same entry symbols, so the
+/// same binary runs both arms in separate processes; module names differ so
+/// JIT logs and cache entries stay distinguishable.
+pub const FUSED_RMSNORM_MQ_ROTATE_FP8_INREG_SHORT_SEQ_GFX12_SRC: &str = concat!(
     include_str!("../../../kernels/src/mq4v2_fp8_producer_pack.hip"),
     "#define HIPFIRE_FP8_STREAM 1\n#define HIPFIRE_FP8_PROD_INREG 1\n#define HIPFIRE_FP8_PROD_SHORT 1\n",
     "#define HIPFIRE_RMSNORM_KERNEL fused_rmsnorm_mq_rotate_mq4v2_fp8_inreg_short_gfx12\n",
     include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate.hip")
 );
-pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_FP8_INREG_SHORT_GFX12_SRC: &str = concat!(
+pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_FP8_INREG_SHORT_SEQ_GFX12_SRC: &str = concat!(
     include_str!("../../../kernels/src/mq4v2_fp8_producer_pack.hip"),
     "#define HIPFIRE_FP8_STREAM 1\n#define HIPFIRE_FP8_PROD_INREG 1\n#define HIPFIRE_FP8_PROD_SHORT 1\n#define HIPFIRE_RMSNORM_AWQ 1\n#define HIPFIRE_RMSNORM_FP8_STRIDED 1\n",
     "#define HIPFIRE_RMSNORM_KERNEL fused_rmsnorm_mq_rotate_awq_mq4v2_fp8_inreg_short_gfx12\n",

@@ -20,6 +20,12 @@ fn gfx942_rotate_live_validation_enabled() -> bool {
 fn fp8_prod_inreg(k: usize) -> bool {
     k <= 17408 && hipfire_config::developer_bool("HIPFIRE_FP8_PROD_INREG", true)
 }
+/// Phase-1a-batched fp8 SHORT RMSNorm: up to 8 row loads in flight per wave
+/// instead of one, same arithmetic order (bit-identical rms). Default on;
+/// `HIPFIRE_RMSNORM_P1A_BATCHED=0` selects the single-outstanding `_SEQ` twin.
+fn rmsnorm_p1a_batched() -> bool {
+    hipfire_config::developer_bool("HIPFIRE_RMSNORM_P1A_BATCHED", true)
+}
 /// Process-frozen G3 row-scale perturbation, shared by fused and standalone
 /// fp8 producers. Reject unsupported shifts before any producer launch.
 pub(crate) fn fp8_row_scale_shift() -> HipResult<i32> {
@@ -3659,15 +3665,26 @@ impl Gpu {
         }
         let mut row_scale_shift = fp8_row_scale_shift()?;
         self.ensure_mq_signs()?;
+        let p1a = rmsnorm_p1a_batched();
         let (module, source, kernel) = match (awq, fp8_prod_inreg(k), k <= 6144) {
-            (Some(_), true, true) => (
+            (Some(_), true, true) if p1a => (
                 "fused_rmsnorm_mq_rotate_awq_mq4v2_fp8_inreg_short_gfx12",
                 kernels::FUSED_RMSNORM_MQ_ROTATE_AWQ_FP8_INREG_SHORT_GFX12_SRC,
                 "fused_rmsnorm_mq_rotate_awq_mq4v2_fp8_inreg_short_gfx12",
             ),
-            (None, true, true) => (
+            (Some(_), true, true) => (
+                "fused_rmsnorm_mq_rotate_awq_mq4v2_fp8_inreg_short_gfx12_seq",
+                kernels::FUSED_RMSNORM_MQ_ROTATE_AWQ_FP8_INREG_SHORT_SEQ_GFX12_SRC,
+                "fused_rmsnorm_mq_rotate_awq_mq4v2_fp8_inreg_short_gfx12",
+            ),
+            (None, true, true) if p1a => (
                 "fused_rmsnorm_mq_rotate_mq4v2_fp8_inreg_short_gfx12",
                 kernels::FUSED_RMSNORM_MQ_ROTATE_FP8_INREG_SHORT_GFX12_SRC,
+                "fused_rmsnorm_mq_rotate_mq4v2_fp8_inreg_short_gfx12",
+            ),
+            (None, true, true) => (
+                "fused_rmsnorm_mq_rotate_mq4v2_fp8_inreg_short_gfx12_seq",
+                kernels::FUSED_RMSNORM_MQ_ROTATE_FP8_INREG_SHORT_SEQ_GFX12_SRC,
                 "fused_rmsnorm_mq_rotate_mq4v2_fp8_inreg_short_gfx12",
             ),
             (Some(_), true, false) => (
