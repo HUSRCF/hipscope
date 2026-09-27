@@ -44,7 +44,7 @@ use hipfire_dispatch::pipeline::{
 use hipfire_dispatch::types::dtype_rotation_plan;
 use hipfire_runtime::external_rows::RowFetch;
 use hipfire_runtime::weight_manifest::ExpertSourceLayout;
-use rdna_compute::replay::ShadowBodyRoute;
+use rdna_compute::replay::{ReplayState, ShadowBodyRoute};
 use rdna_compute::tensor_ops::{argmax_f32, ArgmaxF32};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use smallvec::SmallVec;
@@ -1699,6 +1699,12 @@ impl Qwen4GpuForward {
             )?;
         }
 
+        // The PLE row fetch runs on the row store's worker while the step
+        // program is built below.
+        let mut ple = RowFetch::begin(&bundle.ple_rows)
+            .map_err(|error| Qwen4GpuForwardError::Ple(error.to_string()))?;
+        ple.prefetch(bundle.state.ple_history.row_ids(&bundle.ple_metadata, tokens))
+            .map_err(|error| Qwen4GpuForwardError::Ple(error.to_string()))?;
         let router_logits = matrix_view(&self.scratch.router_logits, n, dims.num_experts)?;
         let scratch_desc = layer_scratch(&self.scratch, &router_logits);
         // Decided once: every op touching the HC streams in this forward agrees.
@@ -1980,10 +1986,17 @@ impl Qwen4GpuForward {
             let bytes = &mut self.host_token_bytes[index * 4..index * 4 + 4];
             bytes.copy_from_slice(&(token as i32).to_ne_bytes());
         }
-        gpu.memcpy_htod_auto(
-            &self.scratch.token_ids.buf,
-            &self.host_token_bytes[..n * std::mem::size_of::<i32>()],
-        )?;
+        if n == 1 && matches!(gpu.replay.state(), ReplayState::Hip | ReplayState::Fallback) {
+            // A HIP body (no retained tape records or routes this forward):
+            // the one id is a stream-ordered fill, not a synchronous copy.
+            let active = gpu.active_stream.as_ref();
+            gpu.hip.memset_d32_async(&self.scratch.token_ids.buf, tokens[0] as i32, 1, active)?;
+        } else {
+            gpu.memcpy_htod_auto(
+                &self.scratch.token_ids.buf,
+                &self.host_token_bytes[..n * std::mem::size_of::<i32>()],
+            )?;
+        }
         let embedding = bundle.weights.resident(&bundle.weights.root.embedding)?;
         let embedding_rot = view(&self.scratch.embedding_rot, 0, n * config.hidden_size);
         let embeddings = view(&self.scratch.embeddings, 0, n * config.hidden_size);
@@ -1998,8 +2011,6 @@ impl Qwen4GpuForward {
             config.hidden_size,
         )?;
 
-        let mut ple = RowFetch::begin(&bundle.ple_rows)
-            .map_err(|error| Qwen4GpuForwardError::Ple(error.to_string()))?;
         let next_history = bundle.state.ple_history;
         let next_position = bundle.state.position;
         // Boundary samples, hoisted so the post-body finalize outside this closure
@@ -2012,8 +2023,6 @@ impl Qwen4GpuForward {
             SmallVec<[(usize, usize, usize, usize, usize, usize); QWEN4_QSA_INLINE_CAPACITY]>,
             Qwen4GpuForwardError,
         > {
-            ple.prefetch(next_history.row_ids(&bundle.ple_metadata, tokens))
-                .map_err(|error| Qwen4GpuForwardError::Ple(error.to_string()))?;
             let ple_rows = view(&self.scratch.ple_rows, 0, n * config.hidden_size);
             let staged = view(
                 &self.scratch.ple_staged,

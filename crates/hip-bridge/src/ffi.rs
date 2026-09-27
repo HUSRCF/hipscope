@@ -254,6 +254,7 @@ pub struct HipRuntime {
         unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_uint, HipStream) -> u32,
     fn_memset: unsafe extern "C" fn(*mut c_void, c_int, usize) -> u32,
     fn_memset_async: unsafe extern "C" fn(*mut c_void, c_int, usize, HipStream) -> u32,
+    fn_memset_d32_async: unsafe extern "C" fn(*mut c_void, c_int, usize, HipStream) -> u32,
     fn_mem_address_reserve:
         Option<unsafe extern "C" fn(*mut *mut c_void, usize, usize, *mut c_void, u64) -> u32>,
     fn_mem_address_free: Option<unsafe extern "C" fn(*mut c_void, usize) -> u32>,
@@ -497,6 +498,11 @@ impl HipRuntime {
                 fn_memset_async: load_fn!(
                     lib,
                     "hipMemsetAsync",
+                    unsafe extern "C" fn(*mut c_void, c_int, usize, HipStream) -> u32
+                ),
+                fn_memset_d32_async: load_fn!(
+                    lib,
+                    "hipMemsetD32Async",
                     unsafe extern "C" fn(*mut c_void, c_int, usize, HipStream) -> u32
                 ),
                 fn_mem_address_reserve: load_optional_fn!(
@@ -1266,6 +1272,21 @@ impl HipRuntime {
             );
         }
         self.check(code, "hipMemset")
+    }
+
+    /// Fill `count` 32-bit words of `buf` with `value`, ordered on `stream`
+    /// (the null stream when `None`) without blocking the host.
+    pub fn memset_d32_async(
+        &self,
+        buf: &DeviceBuffer,
+        value: i32,
+        count: usize,
+        stream: Option<&Stream>,
+    ) -> HipResult<()> {
+        assert!(count * 4 <= buf.size);
+        let stream_raw = stream.map_or(ptr::null_mut(), |s| s.0);
+        let code = unsafe { (self.fn_memset_d32_async)(buf.ptr, value, count, stream_raw) };
+        self.check(code, "hipMemsetD32Async")
     }
 
     /// Async memset on a specific stream — does NOT block the host.
