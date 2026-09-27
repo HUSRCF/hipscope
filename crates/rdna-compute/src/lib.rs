@@ -40,6 +40,7 @@ pub mod replay;
 pub mod sampling;
 pub mod scratch;
 pub use scratch::{Int4MmqPrepared, Int4MmqReservation, Int8MmqPrepared, Int8MmqReservation, Mq4v2Fp8Prepared};
+pub use gemm::F2GdnTargets;
 pub mod slot_pool;
 pub mod text_encoder;
 pub mod vae;

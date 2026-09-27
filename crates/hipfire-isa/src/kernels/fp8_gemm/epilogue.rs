@@ -1,4 +1,4 @@
-use super::{ActScale, Builder, EPILOGUE, Epi, Spec, mem, op, s, so, sr, v, vo, vr, vload};
+use super::{ActScale, Builder, END, EPILOGUE, Epi, Spec, gdn_epilogue, mem, op, s, so, sr, v, vo, vr, vload};
 use crate::{insn::MemoryClass, kernels::iu4_gemm::region::{self, Binding, Region}};
 
 /// Match hip_bfloat16::round_to_bfloat16 bit for bit, including infinities
@@ -113,6 +113,14 @@ pub(super) fn emit(b:&mut Builder,spec:Spec)->Result<(),String>{
         vo(b,format!("v_mul_f32_e32 v{acc}, v{acc}, v{ew}"),&[acc],&[acc,ew],&[])?;
         vo(b,format!("v_mul_f32_e32 v{acc}, v{acc}, v{}",160+tt),&[acc],&[acc,160+tt as u8],&[])?;
     }}}
+    if spec.epi==Epi::QkvzaGdn {
+        // Row tiles below M0/256 hold only q/k/v rows (the host admits
+        // M0 % 256 == 0): they take the fused GDN preparation instead of
+        // the f32 store. z/beta/alpha tiles keep the QKVZA stores below.
+        so(b,"s_lshr_b32 s97, s26, 8",&[97],&[26])?;
+        so(b,"s_cmp_lt_u32 s83, s97",&[],&[83,97])?;
+        op(b,format!("s_cbranch_scc1 {}",gdn_epilogue::ENTRY),&[],&[])?;
+    }
     // Absolute virtual row and token coordinates of the native WMMA output.
     // The lane's low four bits are token columns; high bit owns 8 row values.
     so(b,"s_lshl_b32 s72, s83, 8",&[72],&[83])?;
@@ -165,7 +173,7 @@ pub(super) fn emit(b:&mut Builder,spec:Spec)->Result<(),String>{
                 store_quad(b,0,188,189,g,bf16)?;
             }
         }}
-    } else if matches!(spec.epi,Epi::Qkv|Epi::Qkvza) {
+    } else if matches!(spec.epi,Epi::Qkv|Epi::Qkvza|Epi::QkvzaGdn) {
         // s72 is the first row of the 64-row wave. Interior waves need
         // only one segment decision; short/empty segments and padded waves
         // retain the exact per-quad selector below.
@@ -224,5 +232,9 @@ pub(super) fn emit(b:&mut Builder,spec:Spec)->Result<(),String>{
     }
     op(b,"s_mov_b32 exec_lo, -1",&[],&[])?;
     b.wait_all()?;
+    if spec.epi==Epi::QkvzaGdn {
+        op(b,format!("s_branch {END}"),&[],&[])?;
+        gdn_epilogue::emit(b)?;
+    }
     Ok(())
 }

@@ -7362,6 +7362,13 @@ pub const GATED_DELTA_NET_Q8_FAST_SRC: &str = concat!(
 pub const GDN_CHUNK_PREP_SRC: &str =
     include_str!("../../../kernels/src/gdn_chunk_scan_prep.gfx1201.hip");
 
+/// gfx1201 completion pass of the F2 QKVZA+GDN epilogue: the C64 gates, the
+/// three tile-head tokens of every 128-token tile after the first and the
+/// persistent conv ring, with `gdn_chunk_prep`'s expressions.
+#[cfg(feature = "deltanet")]
+pub const GDN_CHUNK_PREP_FIXUP_SRC: &str =
+    include_str!("../../../kernels/src/gdn_chunk_prep_fixup.gfx1201.hip");
+
 /// gfx1100/gfx1151 GDN chunk-scan preparation: `gdn_chunk_prep` arithmetic on a
 /// row-major (channel group, C64 row chunk) grid with 16-byte x loads.
 #[cfg(feature = "deltanet")]

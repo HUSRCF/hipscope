@@ -3,26 +3,32 @@ use crate::{Arch, KernargLayout};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ActScale { Row, K128 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Epi { Set, Add, GateUpSilu, GateUpSiluBf16, Qkv, Qkvza }
+pub enum Epi { Set, Add, GateUpSilu, GateUpSiluBf16, Qkv, Qkvza,
+    /// QKVZA with the GDN preparation fused into the q/k/v rows (see `gdn_epilogue`).
+    QkvzaGdn }
 #[derive(Clone, Copy, Debug)]
 pub struct Spec { pub arch: Arch, pub act_scale: ActScale, pub epi: Epi }
 
 pub const VGPR_CEILING: u16 = 192;
 pub const LDS_BYTES: u32 = 19_456;
 pub const SRD_WORD3: u32 = 0x3100_4000;
+pub const GDN_KERNARG_BYTES: u32 = 144;
 
 impl ActScale {
     pub fn name(self) -> &'static str { match self { Self::Row => "row", Self::K128 => "k128" } }
 }
 impl Epi {
-    pub fn name(self) -> &'static str { match self { Self::Set => "set", Self::Add => "add", Self::GateUpSilu | Self::GateUpSiluBf16 => "silu", Self::Qkv => "qkv", Self::Qkvza => "qkvza" } }
-    pub fn count(self) -> usize { match self { Self::Set | Self::Add => 1, Self::GateUpSilu | Self::GateUpSiluBf16 => 2, Self::Qkv => 3, Self::Qkvza => 4 } }
+    pub fn name(self) -> &'static str { match self { Self::Set => "set", Self::Add => "add", Self::GateUpSilu | Self::GateUpSiluBf16 => "silu", Self::Qkv => "qkv", Self::Qkvza => "qkvza", Self::QkvzaGdn => "qkvzagdn" } }
+    pub fn count(self) -> usize { match self { Self::Set | Self::Add => 1, Self::GateUpSilu | Self::GateUpSiluBf16 => 2, Self::Qkv => 3, Self::Qkvza | Self::QkvzaGdn => 4 } }
 }
 impl Spec {
     pub fn validate(self) -> Result<(), String> {
         if self.arch != Arch::Gfx1201 { return Err("fp8 GEMM requires gfx1201 wave32".into()) }
         if self.epi==Epi::GateUpSiluBf16 && self.act_scale!=ActScale::Row {
             return Err("bf16 h is only supported for row-scaled SiLU".into());
+        }
+        if self.epi==Epi::QkvzaGdn && self.act_scale!=ActScale::Row {
+            return Err("the GDN-fused QKVZA epilogue is only emitted for Row scaling".into());
         }
         Ok(())
     }
@@ -35,13 +41,23 @@ impl Spec {
         let base=format!("ratio-256x128x8-{}.{}", self.act_scale.name(), self.epi.name());
         if self.epi==Epi::GateUpSiluBf16 {format!("{base}-bf16")} else {base}
     }
-    pub fn kernargs() -> KernargLayout {
-        let mut layout=KernargLayout::new(96);
+    /// The frozen 96-byte ABI. The GDN-fused QKVZA appends the conv weights,
+    /// the persistent conv ring, the FP16 q/k/v bases and q_scale/eps (144 bytes);
+    /// its Y0 receives only the raw rows the completion pass reads.
+    pub fn kernargs(self) -> KernargLayout {
+        let gdn=self.epi==Epi::QkvzaGdn;
+        let mut layout=KernargLayout::new(if gdn {GDN_KERNARG_BYTES} else {96});
         for (name,offset) in ["Wf","Rw","Ew","X8","D","Y0","Y1","Y2","Y3"].into_iter().zip((0..9).map(|i|i*8)) {
             layout=layout.pointer(name,offset);
         }
         for (name,offset) in ["M0","M1","M2","M3","K","N"].into_iter().zip((0..6).map(|i|72+i*4)) {
             layout=layout.hidden(name,offset,4,"by_value");
+        }
+        if gdn {
+            for (name,offset) in ["ConvW","ConvState","Q","K16","V"].into_iter().zip((0..5).map(|i|96+i*8)) {
+                layout=layout.pointer(name,offset);
+            }
+            layout=layout.hidden("QScale",136,4,"by_value").hidden("Eps",140,4,"by_value");
         }
         layout
     }
@@ -55,8 +71,22 @@ pub fn check_lds_access(source:&str,symbol:&str,launch_dynamic:u32)->Result<u32,
     if launch_dynamic!=LDS_BYTES {return Err(format!("{symbol}: expected {LDS_BYTES} launch LDS bytes, got {launch_dynamic}"))}
     let marker=format!("\n{symbol}:\n");
     let (_,rest)=source.split_once(&marker).ok_or("F2 LDS certificate missing symbol")?;
-    let (body,_)=rest.split_once("\ts_endpgm").ok_or("F2 LDS certificate missing kernel end")?;
-    let (body,_)=body.split_once("_epilogue:\n").ok_or("F2 LDS certificate missing epilogue")?;
+    let (kernel,_)=rest.split_once("\ts_endpgm").ok_or("F2 LDS certificate missing kernel end")?;
+    let (body,epilogue)=kernel.split_once("_epilogue:\n").ok_or("F2 LDS certificate missing epilogue")?;
+    // Only the GDN-fused QKVZA epilogue touches LDS; it is certified separately.
+    let gdn_end=match epilogue.split_once("_gdn:\n") {
+        Some((plain,gdn)) if symbol.contains("_qkvzagdn_") => {
+            if plain.lines().any(|l|l.trim().starts_with("ds_")) {return Err(format!("{symbol}: LDS access in the plain epilogue"))}
+            if kernel.lines().map(str::trim).filter(|l|l.split_whitespace().nth(1)==Some("v187,")).collect::<Vec<_>>()!=["v_mov_b32_e32 v187, v0"] {
+                return Err(format!("{symbol}: thread-id register v187 is redefined"))
+            }
+            Some(check_gdn_lds(symbol,gdn)?)
+        }
+        _ => {
+            if epilogue.lines().any(|l|l.trim().starts_with("ds_")) {return Err(format!("{symbol}: unproven LDS access in the epilogue"))}
+            None
+        }
+    };
     for (reg,expected) in [
         (178,&["v_lshrrev_b32_e32 v178, 4, v188","v_lshlrev_b32_e32 v178, 8, v178","v_add_nc_u32_e32 v178, v178, v171","v_add_nc_u32_e32 v178, v178, v171"][..]),
         (179,&["v_and_b32_e32 v179, 31, v0","v_lshlrev_b32_e32 v179, 3, v179","v_add_nc_u32_e32 v179, s72, v179"][..]),
@@ -118,10 +148,91 @@ pub fn check_lds_access(source:&str,symbol:&str,launch_dynamic:u32)->Result<u32,
         max_end=max_end.max(end);accesses+=1;
     }
     if accesses==0 {return Err(format!("{symbol}: no LDS accesses certified"))}
+    Ok(max_end.max(gdn_end.unwrap_or(0)))
+}
+
+/// Certify the GDN epilogue's ring accesses (`gdn_epilogue`): every LDS
+/// address is one of three registers whose derivations are matched exactly,
+/// and the ring-row SGPRs only change through `mod 19` idioms that keep them
+/// in [0, 19). Lines exclude labels, waits and issue hints; adjacency below
+/// is over the remaining instructions.
+fn check_gdn_lds(symbol:&str,text:&str)->Result<u32,String>{
+    const RING:u32=19;
+    let lines:Vec<&str>=text.lines().map(str::trim).filter(|l|!l.is_empty()&&!l.ends_with(':')&&!l.starts_with("s_delay_alu")&&!l.starts_with("s_wait")).collect();
+    let fail=|what:String|Err(format!("{symbol}: GDN LDS certificate: {what}"));
+    fn dst(l:&str)->&str{l.split_whitespace().nth(1).map(|t|t.trim_end_matches(',')).unwrap_or("")}
+    let writes=|l:&str|!["ds_","buffer_store","s_cmp","s_bitcmp","s_cbranch","s_branch"].iter().any(|p|l.starts_with(p));
+    let defs=|reg:&str|->Vec<usize>{lines.iter().enumerate().filter(|(_,l)|writes(l)&&dst(l)==reg).map(|(i,_)|i).collect()};
+    let at=|i:usize|lines.get(i).copied().unwrap_or("");
+    // Lane and wave terms: lane15 <= 15; hi*32 + rg*256 <= 800; lane*16 + hd*512 <= 1008.
+    for (reg,expected) in [
+        ("v184",&["v_and_b32_e32 v184, 15, v187"][..]),
+        ("v183",&["v_lshrrev_b32_e32 v183, 4, v187","v_and_b32_e32 v183, 1, v183","v_lshlrev_b32_e32 v183, 5, v183","v_add_nc_u32_e32 v183, s97, v183"][..]),
+        ("v185",&["v_and_b32_e32 v185, 31, v187","v_lshlrev_b32_e32 v185, 4, v185","v_add_nc_u32_e32 v185, s97, v185"][..]),
+        ("s72",&["s_lshr_b32 s72, s88, 1"][..]),
+        ("s73",&["s_and_b32 s73, s88, 1"][..]),
+    ] {
+        if defs(reg).iter().map(|&i|at(i)).collect::<Vec<_>>()!=expected {return fail(format!("{reg} derivation changed"))}
+    }
+    let before=|reg:&str,i:usize|(0..i).rev().find(|&j|writes(at(j))&&dst(at(j))==reg).map(at);
+    for (add,shift) in [("v_add_nc_u32_e32 v183, s97, v183","s_lshl_b32 s97, s88, 8"),("v_add_nc_u32_e32 v185, s97, v185","s_lshl_b32 s97, s72, 9")] {
+        let i=lines.iter().position(|l|*l==add).ok_or("missing lane term")?;
+        if before("s97",i)!=Some(shift) {return fail(format!("{add} is not preceded by {shift}"))}
+    }
+    // `x = (x + k) mod 19`: the add, then subtract-and-select once (valid for x + k < 38).
+    let mod19=|i:usize,reg:&str|at(i+1)==format!("s_sub_co_i32 s99, {reg}, {RING}")&&at(i+2)==format!("s_cmp_ge_u32 {reg}, {RING}")&&at(i+3)==format!("s_cselect_b32 {reg}, s99, {reg}");
+    let in_idiom=|i:usize,reg:&str|at(i)==format!("s_cselect_b32 {reg}, s99, {reg}")&&i>=3&&mod19(i-3,reg);
+    for i in defs("s93") {
+        let l=at(i);
+        if l=="s_mov_b32 s93, 3"||in_idiom(i,"s93")||(l=="s_add_co_i32 s93, s93, 16"&&mod19(i,"s93")) {continue}
+        return fail(format!("unproven ring row update `{l}`"))
+    }
+    for i in defs("s94") {
+        let l=at(i);
+        let ok=in_idiom(i,"s94")
+            ||(l=="s_add_co_i32 s94, s93, 16"&&mod19(i,"s94"))
+            ||(l=="s_add_co_i32 s94, s94, 1"&&mod19(i,"s94"))
+            ||(l=="s_mov_b32 s94, s94"&&mod19(i,"s94"))
+            // + 8*(rg & 1) <= 8, reduced by the idiom that follows.
+            ||(l=="s_add_co_i32 s94, s94, s97"&&before("s97",i)==Some("s_lshl_b32 s97, s73, 3")&&at(i+1)=="s_mov_b32 s94, s94"&&mod19(i+1,"s94"));
+        if !ok {return fail(format!("unproven ring row update `{l}`"))}
+    }
+    let (mut max_end,mut accesses)=(0u32,0usize);
+    for (i,l) in lines.iter().enumerate() {
+        let Some((opcode,operands))=l.split_once(' ') else {continue};
+        if !opcode.starts_with("ds_") {continue}
+        let (args,offset)=match operands.split_once(" offset:") {Some((a,o))=>(a,o.parse::<u32>().map_err(|_|"invalid GDN LDS offset")?),None=>(operands,0)};
+        let addr=if opcode=="ds_store_b128" {args.split(',').next()} else if opcode=="ds_load_b128" {args.split(',').nth(1)} else {return fail(format!("unexpected {opcode}"))}.unwrap_or("").trim();
+        let base_max=match (opcode,addr) {
+            // Ring row min(r, r - 19) of r = s93 + lane15 <= 33, times 1024, plus the channel term.
+            ("ds_store_b128","v182")=>{
+                let d=defs("v182");
+                let j=(0..i).rev().find(|j|d.contains(j)).ok_or("W address undefined")?;
+                if !(at(j)=="v_lshl_add_u32 v182, v182, 10, v183"&&at(j-1)=="v_min_u32_e32 v182, v182, v186"&&at(j-2)==format!("v_subrev_nc_u32_e32 v186, {RING}, v182")&&at(j-3)=="v_add_nc_u32_e32 v182, s93, v184") {
+                    return fail("W ring address derivation changed".into())
+                }
+                (RING-1)*1024+800
+            }
+            // Halo rows 0..2 through the per-lane head base.
+            ("ds_store_b128","v185") if offset<=2048 => 1008,
+            // P rows: ((s94 + k) mod 19) << 10 over the head base.
+            ("ds_load_b128","v186")=>{
+                let row_ok=i>=7&&at(i-1)=="v_add_nc_u32_e32 v186, s97, v185"&&at(i-2)=="s_lshl_b32 s97, s97, 10"&&mod19(i-6,"s97")
+                    &&(at(i-6)=="s_mov_b32 s97, s94"||(1..=3).any(|k|at(i-6)==format!("s_add_co_i32 s97, s94, {k}")));
+                if !row_ok {return fail(format!("P row address before line `{l}` changed"))}
+                (RING-1)*1024+1008
+            }
+            _=>return fail(format!("unproven LDS base {addr} in `{l}`")),
+        };
+        let end=offset+base_max+16;
+        if end>LDS_BYTES {return fail(format!("`{l}` reaches LDS byte {end}"))}
+        max_end=max_end.max(end);accesses+=1;
+    }
+    if accesses==0 {return fail("no accesses".into())}
     Ok(max_end)
 }
 impl std::str::FromStr for ActScale { type Err=String; fn from_str(s:&str)->Result<Self,String> { match s {"row"=>Ok(Self::Row),"k128"=>Ok(Self::K128),_=>Err(format!("unknown scale layout {s}"))} } }
-impl std::str::FromStr for Epi { type Err=String; fn from_str(s:&str)->Result<Self,String> { match s {"set"=>Ok(Self::Set),"add"=>Ok(Self::Add),"silu"=>Ok(Self::GateUpSilu),"silu-bf16"=>Ok(Self::GateUpSiluBf16),"qkv"=>Ok(Self::Qkv),"qkvza"=>Ok(Self::Qkvza),_=>Err(format!("unknown fp8 epilogue {s}"))} } }
+impl std::str::FromStr for Epi { type Err=String; fn from_str(s:&str)->Result<Self,String> { match s {"set"=>Ok(Self::Set),"add"=>Ok(Self::Add),"silu"=>Ok(Self::GateUpSilu),"silu-bf16"=>Ok(Self::GateUpSiluBf16),"qkv"=>Ok(Self::Qkv),"qkvza"=>Ok(Self::Qkvza),"qkvzagdn"=>Ok(Self::QkvzaGdn),_=>Err(format!("unknown fp8 epilogue {s}"))} } }
 
 #[cfg(test)]
 mod tests {

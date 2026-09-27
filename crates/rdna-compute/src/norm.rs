@@ -4923,6 +4923,62 @@ impl Gpu {
         )
     }
 
+    /// The fused F2 QKVZA+GDN route (gfx1201, default on; `HIPFIRE_GDN_PREP_FUSED=0`
+    /// keeps the f32 projection + `gdn_chunk_prep`). The GEMM itself is admitted
+    /// separately by [`Self::gemm_qkvza_mq4g256v2_fp8_gdn_prepared`].
+    #[cfg(feature = "deltanet")]
+    pub fn gdn_prep_fused_enabled(&self) -> bool {
+        self.arch == "gfx1201"
+            && hipfire_config::developer_var("HIPFIRE_GDN_PREP_FUSED").as_deref() != Ok("0")
+    }
+
+    /// JIT the completion pass before the projection mutates anything.
+    #[cfg(feature = "deltanet")]
+    pub fn gdn_chunk_prep_fixup_prepare(&mut self) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("gdn_chunk_prep_fixup", kernels::GDN_CHUNK_PREP_FIXUP_SRC, "gdn_chunk_prep_fixup")
+    }
+
+    /// Completion pass after the F2 QKVZA+GDN GEMM (`gemm_mq4g256v2_fp8_qkvzagdn_row_b1`):
+    /// same ABI as [`Self::gdn_chunk_prep`], where `input` holds only the raw rows
+    /// that GEMM left (tile positions 0..2 / 125..127 and the last three tokens).
+    /// Grid `(max(ceil(T/64), ceil(T/128)), 11)`: row 0 owns the C64 gates, rows
+    /// 1..10 the 80 q/k/v units of every tile head and the persistent conv ring.
+    #[cfg(feature = "deltanet")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_chunk_prep_fixup(
+        &mut self,
+        input: &GpuTensor,
+        conv_weight: &GpuTensor,
+        conv_state: &GpuTensor,
+        g: &GpuTensor,
+        beta: &GpuTensor,
+        dt_bias: &GpuTensor,
+        a_log: &GpuTensor,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        v: &GpuTensor,
+        n_tokens: usize,
+        q_scale: f32,
+        eps: f32,
+    ) -> HipResult<()> {
+        const MODULE: &str = "gdn_chunk_prep_fixup";
+        self.gdn_chunk_prep_fixup_prepare()?;
+        let grid_x = n_tokens.div_ceil(64).max(n_tokens.div_ceil(128)) as u32;
+        let ptrs = [input, conv_weight, conv_state, g, beta, dt_bias, a_log, q, k, v].map(|t| t.buf.as_ptr());
+        let nt = n_tokens as i32;
+        let mut params: Vec<*mut c_void> = ptrs.iter().map(|p| p as *const _ as *mut c_void).collect();
+        params.extend([&nt as *const _ as *mut c_void, &q_scale as *const _ as *mut c_void, &eps as *const _ as *mut c_void]);
+        self.launch_maybe_blob(MODULE, [grid_x, 11, 1], [256, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            for p in ptrs { b.push_ptr(p); }
+            b.push_i32(nt);
+            b.push_f32(q_scale);
+            b.push_f32(eps);
+            b
+        })
+    }
+
     /// GDN KKT solve and fused scan for one legacy segment.
     /// All parent arrays remain unsliced; `row0` selects the segment and state
     /// stays the single unsliced persistent owner.

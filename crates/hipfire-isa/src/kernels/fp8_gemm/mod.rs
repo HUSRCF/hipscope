@@ -6,6 +6,8 @@ mod publish;
 mod fold;
 mod kloop;
 mod epilogue;
+mod gdn_epilogue;
+pub mod gdn_region;
 
 pub use spec::{ActScale, Epi, Spec};
 use crate::{Arch, Builder, BuilderProof, Emitted, KernelSpec, RegPlan,
@@ -88,7 +90,7 @@ fn declare_lds(b:&mut Builder)->Result<(),String>{
 pub fn emit(spec:Spec)->Result<Emitted,String>{
     spec.validate()?;
     let kernel=KernelSpec{kernel_id:"fp8_gemm".into(),variant:spec.variant(),arch:spec.arch,symbol:spec.symbol(),
-        kernargs:Spec::kernargs(),user_sgpr_count:2,system_sgpr_workgroup_id_y:true,
+        kernargs:spec.kernargs(),user_sgpr_count:2,system_sgpr_workgroup_id_y:true,
         workgroup_size:256,group_segment_fixed_size:0,wave32:true,cu_mode:false};
     let mut b=Builder::new(kernel,plan()?);
     b.enable_delay_alu();
@@ -111,7 +113,11 @@ pub fn module(emitted:&[Emitted])->Result<(String,ModuleProof),String>{
     let bf16=if emitted.iter().any(|e| e.proof.variant=="ratio-256x128x8-row.silu") {
         Some(emit(Spec{arch:first.proof.arch,act_scale:ActScale::Row,epi:Epi::GateUpSiluBf16})?)
     } else {None};
-    let all:Vec<_>=emitted.iter().chain(bf16.iter()).collect();
+    // Likewise the GDN-fused QKVZA sibling rides with the row QKVZA symbol.
+    let gdn=if emitted.iter().any(|e| e.proof.variant=="ratio-256x128x8-row.qkvza") {
+        Some(emit(Spec{arch:first.proof.arch,act_scale:ActScale::Row,epi:Epi::QkvzaGdn})?)
+    } else {None};
+    let all:Vec<_>=emitted.iter().chain(bf16.iter()).chain(gdn.iter()).collect();
     let mut header=String::new();let mut bodies=String::new();let mut kernels=String::new();let mut tail=String::new();
     for (i,e) in all.iter().enumerate(){
         let (code,meta)=e.s_text.split_once(".amdgpu_metadata\n").ok_or("missing metadata")?;

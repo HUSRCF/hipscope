@@ -582,6 +582,7 @@ impl KernelCompiler {
             && matches!(
                 name,
                 "gdn_chunk_prep"
+                    | "gdn_chunk_prep_fixup"
                     | "gdn_chunk_kkt_solve"
                     | "gdn_chunk_scan"
                     | "gdn_chunk_prep_gfx11"

@@ -5960,6 +5960,10 @@ fn mq_f16_projection_fast_route(gpu: &Gpu, fusion: DflashFusionCtx, n: usize, di
 /// Same statements, same order, same launches as the inlined block.
 /// S9-mq4v2-persistent-prologues will issue `try_mq4v2_persistent_prologue`
 /// from inside this hook after S3/S4 land.
+/// With `gdn` (the admitted chunk-scan route), the gfx1201 FP8 F2 QKVZA may
+/// also run `gdn_chunk_prep` in its epilogue; the return value says whether it
+/// did, in which case the caller runs `gdn_chunk_prep_fixup` instead of the prep.
+#[allow(clippy::too_many_arguments)]
 fn batch_chunk_delta_net_input_projection(
     gpu: &mut Gpu,
     layer: &DeltaNetLayerWeights,
@@ -5969,7 +5973,8 @@ fn batch_chunk_delta_net_input_projection(
     dim: usize,
     q8_wmma_arch: bool,
     fusion: DflashFusionCtx,
-) -> HipResult<()> {
+    gdn: Option<&rdna_compute::F2GdnTargets<'_>>,
+) -> HipResult<bool> {
     let _ = fusion;
     // S3-f16-projection-inputs fast path: emit exact FP16 directly from the
     // RMSNorm+FWHT producer into `x_rot_f16_batch` and consume it with the
@@ -5993,7 +5998,7 @@ fn batch_chunk_delta_net_input_projection(
             config.norm_eps,
             n,
         )?;
-        return gpu.gemm_qkvza_mq4g256v2_wmma_f16(
+        gpu.gemm_qkvza_mq4g256v2_wmma_f16(
             &layer.wqkv.buf,
             &layer.wz.buf,
             &layer.w_beta.buf,
@@ -6009,7 +6014,8 @@ fn batch_chunk_delta_net_input_projection(
             layer.w_alpha.m,
             layer.wqkv.k,
             n,
-        );
+        )?;
+        return Ok(false);
     }
     let is_mq = matches!(
         layer.wqkv.gpu_dtype,
@@ -6438,6 +6444,25 @@ fn batch_chunk_delta_net_input_projection(
             // of the family's fp8 route — no pack launch. Same fp8 intercept
             // conditions as the uniform router (iu4 divergence excluded by
             // producer-side ordering: fp8_prep implies iu4_prep is None).
+            if let Some(targets) = gdn {
+                if gpu.gemm_qkvza_mq4g256v2_fp8_gdn_prepared(
+                    &layer.wqkv.buf,
+                    &layer.wz.buf,
+                    &layer.w_beta.buf,
+                    &layer.w_alpha.buf,
+                    fp8_prep.as_ref().unwrap(),
+                    &pbs.dn_qkv_batch,
+                    &pbs.dn_z_batch,
+                    &pbs.dn_beta_batch,
+                    &pbs.dn_alpha_batch,
+                    [layer.wqkv.m, layer.wz.m, layer.w_beta.m, layer.w_alpha.m],
+                    layer.wqkv.k,
+                    n,
+                    targets,
+                )? {
+                    return Ok(true);
+                }
+            }
             gpu.gemm_qkvza_hfq4g256_wmma_gfx12_mq4v2_fp8_prepared(
                 &layer.wqkv.buf,
                 &layer.wz.buf,
@@ -6476,7 +6501,7 @@ fn batch_chunk_delta_net_input_projection(
             n,
         )?;
     }
-    Ok(())
+    Ok(false)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7132,15 +7157,37 @@ pub(crate) fn batch_chunk_delta_net_attn(
         // JIT/load failure must occur before input projection or persistent
         // preamble mutation; no legacy retry is valid after this point.
         gpu.gdn_chunk_prepare()?;
+        if gpu.gdn_prep_fused_enabled() {
+            gpu.gdn_chunk_prep_fixup_prepare()?;
+        }
         Some((q, k, v, a, segment_rows))
     } else {
         None
     };
 
-    batch_chunk_delta_net_input_projection(gpu, layer, config, pbs, n, dim, q8_wmma_arch, fusion)?;
+    let q_scale = 1.0 / (hd as f32).sqrt();
+    let gdn_targets = match &gdn_chunk_scan_views {
+        Some((q, k, v, _, _)) if gpu.gdn_prep_fused_enabled() => Some(rdna_compute::F2GdnTargets {
+            conv_weight: &layer.conv_weight,
+            conv_state: &dn_state.conv_states[delta_layer_idx],
+            q,
+            k,
+            v,
+            q_scale,
+            eps: config.norm_eps,
+        }),
+        _ => None,
+    };
+    let prep_fused = batch_chunk_delta_net_input_projection(
+        gpu, layer, config, pbs, n, dim, q8_wmma_arch, fusion, gdn_targets.as_ref(),
+    )?;
 
     if let Some((q, k, v, a, segment_rows)) = gdn_chunk_scan_views {
-        gpu.gdn_chunk_prep(
+        // The fused QKVZA already wrote q/k/v except the tile heads; the
+        // completion pass finishes them, the gates and the conv ring.
+        let prep = if prep_fused { Gpu::gdn_chunk_prep_fixup } else { Gpu::gdn_chunk_prep };
+        prep(
+            gpu,
             &pbs.dn_qkv_batch,
             &layer.conv_weight,
             &dn_state.conv_states[delta_layer_idx],
@@ -7152,7 +7199,7 @@ pub(crate) fn batch_chunk_delta_net_attn(
             &k,
             &v,
             n,
-            1.0 / (hd as f32).sqrt(),
+            q_scale,
             config.norm_eps,
         )?;
         let ef = dn_state

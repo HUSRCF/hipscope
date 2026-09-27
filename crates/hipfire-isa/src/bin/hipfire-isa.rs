@@ -54,8 +54,9 @@ fn fp8_gemm(scale:&str,epi:&str,arch:Arch)->Result<(String,Vec<u8>),String>{
 /// the committed golden the gate/up epilogue instantiates.
 fn region_import(mut args:impl Iterator<Item=String>)->Result<(),String>{
  use hipfire_isa::kernels::iu4_gemm::region;
- let mut dis=None;let mut symbol="gemm_mq4g256v2_gate_up_silu_mmq_iu4_v3".to_string();
- while let Some(flag)=args.next(){let value=args.next().ok_or_else(||format!("missing value after {flag}"))?;match flag.as_str(){"--disassembly"=>dis=Some(value),"--symbol"=>symbol=value,_=>return Err(format!("unknown flag {flag}\n{USAGE}"))}}
+ let mut dis=None;let mut symbol="gemm_mq4g256v2_gate_up_silu_mmq_iu4_v3".to_string();let mut gdn=None;let mut write=false;let mut provenance=String::new();
+ while let Some(flag)=args.next(){if flag=="--write"{write=true;continue}let value=args.next().ok_or_else(||format!("missing value after {flag}"))?;match flag.as_str(){"--disassembly"=>dis=Some(value),"--symbol"=>symbol=value,"--gdn-object"=>gdn=Some(value),"--provenance"=>provenance=value,_=>return Err(format!("unknown flag {flag}\n{USAGE}"))}}
+ if let Some(object)=gdn {return gdn_region_import(&object,write,&provenance)}
  let text=fs::read_to_string(dis.ok_or("missing --disassembly")?).map_err(|e|e.to_string())?;
  let slice=region::slice_silu(&text,&symbol)?;
  print!("{slice}");
@@ -64,6 +65,32 @@ fn region_import(mut args:impl Iterator<Item=String>)->Result<(),String>{
  eprintln!("region-import: {symbol} SiLU slice matches the committed golden");
  Ok(())
 }
+/// Lift `gdn_chunk_prep`'s hipcc code object with peacemaker (byte-exact
+/// round trip), slice its per-token regions and require them to equal the
+/// committed goldens (`--write` regenerates them, prefixing `--provenance`).
+#[cfg(feature="lift")]
+fn gdn_region_import(object:&str,write:bool,provenance:&str)->Result<(),String>{
+ use hipfire_isa::kernels::fp8_gemm::gdn_region::{self,golden_body};
+ use sha2::{Digest,Sha256};
+ let bytes=fs::read(object).map_err(|e|format!("{object}: {e}"))?;
+ let lifted=peacemaker_lift::lift_object(&bytes,peacemaker_lift::Options{frontend:peacemaker_ir::inst::Frontend::Hipcc}).map_err(|e|e.to_string())?;
+ let kernel=lifted.program.kernels.iter().find(|k|k.symbol.0=="gdn_chunk_prep").ok_or("object has no gdn_chunk_prep kernel")?;
+ let lines=peacemaker_lift::emit::text(kernel,peacemaker_ir::inst::Arch::Gfx1201).map_err(|e|e.to_string())?;
+ let g=gdn_region::slice_gdn(&lines)?;
+ let sha=format!("{:x}",Sha256::digest(&bytes));
+ for (name,text,golden) in [("conv_silu",&g.conv_silu,gdn_region::CONV_SILU_GOLDEN),("norm_q",&g.norm_q,gdn_region::NORM_Q_GOLDEN),("norm_k",&g.norm_k,gdn_region::NORM_K_GOLDEN),("cvt_v",&g.cvt_v,gdn_region::CVT_V_GOLDEN)] {
+  let path=format!("{}/kernels/fp8_gemm.gdn.{name}.region.s",env!("CARGO_MANIFEST_DIR"));
+  if write {
+   let head:String=provenance.split("\\n").map(|l|format!("; {l}\n")).collect();
+   fs::write(&path,format!("{head}; Lifted with peacemaker-lift from {object} (sha256 {sha}); region `{name}`.\n; Regenerate/compare: `hipfire-isa region-import --gdn-object <object>` (feature `lift`).\n{text}")).map_err(|e|e.to_string())?;
+   eprintln!("region-import: wrote {path}");
+  } else if text!=&golden_body(golden) {return Err(format!("sliced {name} differs from {path}"))}
+ }
+ if !write {eprintln!("region-import: gdn_chunk_prep ({sha}) regions match the committed goldens")}
+ Ok(())
+}
+#[cfg(not(feature="lift"))]
+fn gdn_region_import(_:&str,_:bool,_:&str)->Result<(),String>{Err("rebuild hipfire-isa with --features lift for --gdn-object".into())}
 fn run()->Result<(),String>{let mut args=env::args().skip(1);let command=args.next();if command.as_deref()==Some("region-import"){return region_import(args)}if command.as_deref()!=Some("emit"){return Err(USAGE.into())}let mut kernel=None;let mut arch=None;let mut out=None;let mut proof=None;let mut variant=None;let (mut fold,mut tile,mut cacc,mut epi,mut scale)=(None,None,None,None,None);while let Some(flag)=args.next(){let value=args.next().ok_or_else(||format!("missing value after {flag}"))?;match flag.as_str(){"--kernel"=>kernel=Some(value),"--arch"=>arch=Some(value.parse::<Arch>()?),"--out"=>out=Some(value),"--proof"=>proof=Some(value),"--variant"=>variant=Some(value),"--fold"=>fold=Some(value),"--tile"=>tile=Some(value),"--cacc"=>cacc=Some(value),"--epi"=>epi=Some(value),"--scale"=>scale=Some(value),_=>return Err(format!("unknown flag {flag}"))}}
  let kernel=kernel.ok_or("missing --kernel")?;let arch=arch.ok_or("missing --arch")?;
  let (text,proof_json)=match kernel.as_str(){

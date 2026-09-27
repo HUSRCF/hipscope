@@ -12,6 +12,18 @@ use hip_bridge::{DeviceBuffer, HipResult};
 use std::ffi::c_void;
 use std::sync::{LazyLock, OnceLock};
 
+/// `gdn_chunk_prep` targets of the fused F2 QKVZA epilogue
+/// ([`Gpu::gemm_qkvza_mq4g256v2_fp8_gdn_prepared`]).
+pub struct F2GdnTargets<'a> {
+    pub conv_weight: &'a GpuTensor,
+    pub conv_state: &'a GpuTensor,
+    pub q: &'a GpuTensor,
+    pub k: &'a GpuTensor,
+    pub v: &'a GpuTensor,
+    pub q_scale: f32,
+    pub eps: f32,
+}
+
 /// One instantiation of the parameterised LDS-staged WMMA GEMM
 /// (`kernels/src/gemm_f16_x_f16_wmma_lds256.hip`).
 ///
@@ -9493,6 +9505,53 @@ impl Gpu {
             && (!silu || (dims.len() == 2 && dims[0] == dims[1]))
     }
 
+    /// F2 QKVZA whose q/k/v row tiles also run `gdn_chunk_prep` (conv1d,
+    /// SiLU, q/k head norm, q scale, FP16 q/k/v) in the epilogue. Admitted
+    /// only where the incumbent F2 QKVZA runs, with the Qwen3.5 GDN geometry
+    /// the epilogue hard-codes (q/k/v = 16 + 16 + 48 heads of 128). Returns
+    /// `Ok(false)` without launching anything when not admitted; after
+    /// `Ok(true)` the caller must run [`Self::gdn_chunk_prep_fixup`], and
+    /// `y_qkv` holds only the raw rows that pass reads.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_qkvza_mq4g256v2_fp8_gdn_prepared(
+        &mut self,
+        a_qkv: &GpuTensor,
+        a_z: &GpuTensor,
+        a_beta: &GpuTensor,
+        a_alpha: &GpuTensor,
+        prepared: &crate::scratch::Mq4v2Fp8Prepared,
+        y_qkv: &GpuTensor,
+        y_z: &GpuTensor,
+        y_beta: &GpuTensor,
+        y_alpha: &GpuTensor,
+        dims: [usize; 4],
+        k: usize,
+        batch_size: usize,
+        gdn: &F2GdnTargets<'_>,
+    ) -> HipResult<bool> {
+        self.bind_thread()?;
+        if !(self.flags.gfx12_mq4v2_fp8_qkvza
+            && self.fp8_f2_row_active(batch_size, k, &dims, false)
+            && prepared.scale_mode == 1
+            && prepared.n == batch_size
+            && prepared.k == k
+            && dims == [10240, dims[1], 48, 48]
+            && [gdn.q, gdn.k].iter().all(|t| t.buf.size() >= batch_size * 16 * 128 * 2)
+            && gdn.v.buf.size() >= batch_size * 48 * 128 * 2
+            && gdn.conv_weight.buf.size() >= 10240 * 4 * 4
+            && gdn.conv_state.buf.size() >= 10240 * 3 * 4
+            && y_qkv.buf.size() >= batch_size * 10240 * 4)
+        {
+            return Ok(false);
+        }
+        self.fp8_f2_row_launch(
+            &[a_qkv, a_z, a_beta, a_alpha],
+            &[y_qkv, y_z, y_beta, y_alpha],
+            prepared, &dims, k, batch_size, "qkvzagdn", Some(gdn),
+        )?;
+        Ok(true)
+    }
+
     /// One transaction on the active stream: completely repack the selected
     /// weights into the grow-only workspace, then consume them with F2 Row.
     /// Never retry the incumbent after either launch has begun.
@@ -9507,8 +9566,28 @@ impl Gpu {
         n: usize,
         epi: &str,
     ) -> HipResult<()> {
+        self.fp8_f2_row_launch(weights, outputs, prepared, dims, k, n, epi, None)
+    }
+
+    /// [`Self::fp8_f2_row_prepared`]; `gdn` selects the QKVZA symbol whose
+    /// q/k/v row tiles emit `gdn_chunk_prep`'s FP16 q/k/v (144-byte ABI).
+    #[allow(clippy::too_many_arguments)]
+    fn fp8_f2_row_launch(
+        &mut self,
+        weights: &[&GpuTensor],
+        outputs: &[&GpuTensor],
+        prepared: &crate::scratch::Mq4v2Fp8Prepared,
+        dims: &[usize],
+        k: usize,
+        n: usize,
+        epi: &str,
+        gdn: Option<&F2GdnTargets<'_>>,
+    ) -> HipResult<()> {
         self.bind_thread()?;
         let silu = epi == "silu";
+        if gdn.is_some() != (epi == "qkvzagdn") {
+            return Err(hip_bridge::HipError::new(0, "F2: GDN targets require the qkvzagdn epilogue"));
+        }
         if !self.fp8_f2_row_active(n, k, dims, silu)
             || prepared.n != n || prepared.k != k || prepared.scale_mode != 1
             || weights.len() != dims.len()
@@ -9544,6 +9623,7 @@ impl Gpu {
             "silu" => "gemm_mq4g256v2_fp8_silu_row_b1",
             "qkv" => "gemm_mq4g256v2_fp8_qkv_row_b1",
             "qkvza" => "gemm_mq4g256v2_fp8_qkvza_row_b1",
+            "qkvzagdn" => "gemm_mq4g256v2_fp8_qkvzagdn_row_b1",
             _ => return Err(hip_bridge::HipError::new(0, "F2: unknown epilogue")),
         };
         self.ensure_embedded_kernel(REPACK_MODULE, kernels::MQ4V2_FP8_FRAGMENT_REPACK_GFX1201, REPACK)?;
@@ -9603,6 +9683,14 @@ impl Gpu {
         gemm_params.extend(ys.iter_mut().map(|p| p as *mut _ as *mut c_void));
         gemm_params.extend(ms.iter_mut().map(|m| m as *mut _ as *mut c_void));
         gemm_params.extend([&mut kv as *mut _ as *mut c_void, &mut nv as *mut _ as *mut c_void]);
+        let mut gdn_ptrs = [std::ptr::null_mut(); 5];
+        let (mut q_scale, mut eps) = (0f32, 0f32);
+        if let Some(t) = gdn {
+            gdn_ptrs = [t.conv_weight, t.conv_state, t.q, t.k, t.v].map(|x| x.buf.as_ptr());
+            (q_scale, eps) = (t.q_scale, t.eps);
+            gemm_params.extend(gdn_ptrs.iter_mut().map(|p| p as *mut _ as *mut c_void));
+            gemm_params.extend([&mut q_scale as *mut _ as *mut c_void, &mut eps as *mut _ as *mut c_void]);
+        }
         let output_bytes = if silu && bf16_h_fp8_enabled() { 2 } else { 4 };
         let timer = crate::profile::begin_timer(&self.hip, "gemm", symbol, needed + n * mt * output_bytes);
         let result = self.launch_maybe_blob(
@@ -9614,7 +9702,12 @@ impl Gpu {
                 b.push_ptr(x8); b.push_ptr(d);
                 for p in ys { b.push_ptr(p); }
                 for m in ms { b.push_i32(m); }
-                b.push_i32(kv); b.push_i32(nv); b
+                b.push_i32(kv); b.push_i32(nv);
+                if gdn.is_some() {
+                    for p in gdn_ptrs { b.push_ptr(p); }
+                    b.push_f32(q_scale); b.push_f32(eps);
+                }
+                b
             },
         );
         if let Some(t) = timer { t.finish(&self.hip); }

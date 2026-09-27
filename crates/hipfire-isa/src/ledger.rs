@@ -109,6 +109,13 @@ impl Ledger {
         waits
     }
 
+    /// After `s_wait_alu depctr_vm_vsrc(0)` every issued VMEM store has read
+    /// its source registers: pending stores lock nothing and define nothing,
+    /// so they leave the ledger (completion order is never inferred for them).
+    pub fn release_store_sources(&mut self) {
+        self.pending.retain(|p| !matches!(p.counter, Counter::Store | Counter::Vs));
+    }
+
     pub fn pending_stores(&self) -> bool {
         self.pending.iter().any(|p| p.counter == Counter::Ds && !p.src_locks.is_empty())
     }
