@@ -323,8 +323,9 @@ fn program_dims(config: &Qwen4Config) -> Qwen4ProgramDims {
     }
 }
 
-/// A single-token forward's HC read projection: its Q8_0 decode copy
-/// (`Qwen4GpuForward::hc_q8`) when one exists.
+/// A decode-shaped forward's HC read projection (one token, or the few rows
+/// of a speculative verify): its Q8_0 decode copy (`Qwen4GpuForward::hc_q8`)
+/// when one exists.
 fn hc_mix<'a>(
     copies: &'a [GpuTensor],
     index: usize,
@@ -332,7 +333,7 @@ fn hc_mix<'a>(
     source: WeightRef<'a>,
 ) -> WeightRef<'a> {
     match copies.get(index) {
-        Some(buf) if rows == 1 => WeightRef {
+        Some(buf) if rows <= 8 => WeightRef {
             buf,
             dtype: DType::Q8_0,
             row_stride: row_stride(DType::Q8_0, source.k),

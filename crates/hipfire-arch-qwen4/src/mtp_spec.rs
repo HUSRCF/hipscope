@@ -503,6 +503,14 @@ enum DraftPairing {
     AlignedTarget,
 }
 
+/// Per-draft agreement at or above which the batched verify is used.
+const MTP_BATCHED_AGREEMENT: f32 = 0.8;
+/// Per-window decay of the agreement counts.
+const MTP_AGREEMENT_DECAY: f32 = 0.875;
+/// Agreement counts a request starts from: optimistic, so the first windows
+/// are batched and measure the real rate.
+const MTP_AGREEMENT_PRIOR: (f32, f32) = (4.0, 4.0);
+
 /// Native GPU MTP drafter.  The MTP operator/state stay model-owned by the
 /// target bundle; this adapter owns only the reusable verifier scratch and one
 /// pending target-hidden row needed to seed each MTP window.
@@ -516,6 +524,10 @@ pub struct Qwen4MtpDrafter {
     /// Prompt rows one chunked prefill call may capture; mirrors the attached
     /// forward's chunk capacity and sizes the spec hidden capture buffer.
     prefill_rows: usize,
+    /// Recent per-draft agreement as decayed (accepted, compared) draft
+    /// counts (see `observe_agreement`); picks the verify route when
+    /// `HIPFIRE_MTP_INCREMENTAL` is unset.
+    agreement: (f32, f32),
 }
 
 impl Qwen4MtpDrafter {
@@ -528,6 +540,7 @@ impl Qwen4MtpDrafter {
             pending_hidden: None,
             row_hidden: None,
             prefill_rows: 0,
+            agreement: MTP_AGREEMENT_PRIOR,
         }
     }
 
@@ -751,6 +764,17 @@ impl Qwen4MtpDrafter {
         })
     }
 
+    /// Per-draft agreement counts only the drafts compared before the first
+    /// rejection, so both routes measure the same conditional rate.
+    fn observe_agreement(&mut self, window: &MtpWindow) {
+        let compared = (window.accepted + 1).min(window.drafts_generated);
+        let (accepted, total) = self.agreement;
+        self.agreement = (
+            accepted * MTP_AGREEMENT_DECAY + window.accepted as f32,
+            total * MTP_AGREEMENT_DECAY + compared as f32,
+        );
+    }
+
     fn pending_hidden(&self) -> Result<&GpuTensor, String> {
         self.pending_hidden
             .as_ref()
@@ -771,6 +795,7 @@ impl MtpDrafter for Qwen4MtpDrafter {
     ) -> Result<u32, String> {
         require_native_greedy(self.request.temp)?;
         validate_native_mtp_prefill_request(prompt_tokens, fill_tokens, start_pos, cache_hit)?;
+        self.agreement = MTP_AGREEMENT_PRIOR;
         // Native Qwen4 MTP has no exact target+MTP suffix rehydration yet.
         // Always discard any AR or stale MTP prefix and rebuild the complete
         // rendered prompt from position zero.
@@ -848,10 +873,19 @@ impl MtpDrafter for Qwen4MtpDrafter {
         }
         self.ensure_resources(gpu, target)?;
         let trace = std::env::var("HIPFIRE_MTP_TRACE").is_ok_and(|value| value == "1");
-        // Incremental verification is the default on every GPU; batching is opt-in.
-        let incremental = !matches!(std::env::var("HIPFIRE_MTP_INCREMENTAL").as_deref(), Ok("0"));
+        // Route: a (k+1)-row batched verify costs about two single-row
+        // forwards, so it pays only while drafts keep being accepted; the
+        // interleaved verify costs one forward per emitted token and wastes no
+        // draft. `HIPFIRE_MTP_INCREMENTAL=0|1` forces a route.
+        let incremental = match std::env::var("HIPFIRE_MTP_INCREMENTAL").as_deref() {
+            Ok("0") => false,
+            Ok("1") => true,
+            _ => self.agreement.0 < MTP_BATCHED_AGREEMENT * self.agreement.1,
+        };
         if incremental {
-            return self.mtp_step_incremental(gpu, target, position, seed, k, eos, trace);
+            let window = self.mtp_step_incremental(gpu, target, position, seed, k, eos, trace)?;
+            self.observe_agreement(&window);
+            return Ok(window);
         }
         {
             let bundle = Self::bundle(target)?;
@@ -1024,6 +1058,9 @@ impl MtpDrafter for Qwen4MtpDrafter {
             snapshot = None;
             Ok(window)
         })();
+        if let Ok(window) = &result {
+            self.observe_agreement(window);
+        }
         if timers.enabled() {
             let fields = format!(
                 "\"position\":{position},\"k\":{k},\"accepted\":{accepted_drafts},\"window_us\":{:.1},\"t_end\":{}",

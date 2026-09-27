@@ -22997,6 +22997,11 @@ impl Gpu {
         k: usize,
         n: usize,
     ) -> HipResult<()> {
+        // Few rows (speculative verify) on gfx1151: the decode kernels over
+        // every row, weights read once.
+        if self.gemv_q8_0_staged_rows_supported(k, n) {
+            return self.gemv_q8_0_staged_rows(a_raw, x, y, m, k, n);
+        }
         self.bind_thread()?;
         const MAX_BATCH: usize = 64;
         let mut off = 0;

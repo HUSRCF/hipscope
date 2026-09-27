@@ -152,6 +152,146 @@ extern "C" __global__ void gemv_q8_0_k8(
     y[row] = value;
 }
 
+// Multi-row variants of the staged / split decode kernels above: each weight
+// row is loaded once and dotted with `rows` activation rows (x row stride K,
+// y row stride M). Every row's value is bitwise the single-row kernel's.
+__launch_bounds__(32, 20)
+extern "C" __global__ void gemv_q8_0_k2560_staged_rows(
+    const unsigned char* __restrict__ A_q8,
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    int M,
+    int rows
+) {
+    __shared__ __align__(16) unsigned int staged_row[680];
+    const int row = blockIdx.x;
+    if (row >= M) return;
+    const int tid = threadIdx.x;
+    const unsigned int* src = reinterpret_cast<const unsigned int*>(A_q8 + (size_t)row * 2720);
+    unsigned int v[22];
+#pragma unroll
+    for (int u = 0; u < 21; ++u) v[u] = src[tid + u * 32];
+    v[21] = tid < 8 ? src[tid + 672] : 0u;
+#pragma unroll
+    for (int u = 0; u < 21; ++u) staged_row[tid + u * 32] = v[u];
+    if (tid < 8) staged_row[tid + 672] = v[21];
+    __builtin_amdgcn_fence(__ATOMIC_ACQ_REL, "wavefront");
+    for (int r = 0; r < rows; ++r) {
+        const float sum = gemv_q8_0_row(
+            reinterpret_cast<const unsigned char*>(staged_row), x + (size_t)r * 2560, 2560, tid);
+        if (tid == 0) y[(size_t)r * M + row] = sum;
+    }
+}
+
+__launch_bounds__(64)
+extern "C" __global__ void gemv_q8_0_k320_staged_rows(
+    const unsigned char* __restrict__ A_q8,
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    int M,
+    int rows
+) {
+    __shared__ __align__(16) unsigned int staged[2][85];
+    const int wave = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int row = blockIdx.x * 2 + wave;
+    if (row >= M) return;
+    const unsigned int* src = reinterpret_cast<const unsigned int*>(A_q8 + (size_t)row * 340);
+    const unsigned int v0 = src[lane];
+    const unsigned int v1 = src[lane + 32];
+    const unsigned int v2 = lane < 21 ? src[lane + 64] : 0u;
+    staged[wave][lane] = v0;
+    staged[wave][lane + 32] = v1;
+    if (lane < 21) staged[wave][lane + 64] = v2;
+    __builtin_amdgcn_fence(__ATOMIC_ACQ_REL, "wavefront");
+    for (int r = 0; r < rows; ++r) {
+        const float sum = gemv_q8_0_row(
+            reinterpret_cast<const unsigned char*>(staged[wave]), x + (size_t)r * 320, 320, lane);
+        if (lane == 0) y[(size_t)r * M + row] = sum;
+    }
+}
+
+// gemv_q8_0_row over up to 8 activation rows: each (scale, quant) pair is
+// loaded once and folded into every row's sum in the single-row order.
+static __device__ __forceinline__ void gemv_q8_0_row_multi(
+    const unsigned char* row_data,
+    const float* __restrict__ x,
+    size_t x_stride,
+    int K,
+    int tid,
+    int rows,
+    float* sum
+) {
+    const int blocks_per_row = K / 32;
+#pragma unroll
+    for (int r = 0; r < 8; ++r) sum[r] = 0.0f;
+    const int outer_iters = blocks_per_row / 8;
+    for (int oi = 0; oi < outer_iters; oi++) {
+        const unsigned char* base = row_data + oi * 8 * 34;
+        #pragma unroll
+        for (int sub = 0; sub < 8; sub++) {
+            const unsigned char* block = base + sub * 34;
+            float d = (float)*((const _Float16*)block);
+            signed char qval = (signed char)block[2 + tid];
+            const float w = d * (float)qval;
+            const int col = oi * 256 + sub * 32 + tid;
+#pragma unroll
+            for (int r = 0; r < 8; ++r)
+                if (r < rows) sum[r] += w * x[r * x_stride + col];
+        }
+    }
+    for (int bi = outer_iters * 8; bi < blocks_per_row; bi++) {
+        const unsigned char* block = row_data + bi * 34;
+        float d = (float)*((const _Float16*)block);
+        signed char qval = (signed char)block[2 + tid];
+        const float w = d * (float)qval;
+#pragma unroll
+        for (int r = 0; r < 8; ++r)
+            if (r < rows) sum[r] += w * x[r * x_stride + bi * 32 + tid];
+    }
+#pragma unroll
+    for (int r = 0; r < 8; ++r)
+        for (int offset = 16; offset > 0; offset >>= 1)
+            sum[r] += __shfl_down(sum[r], offset);
+}
+
+__launch_bounds__(256)
+extern "C" __global__ void gemv_q8_0_k8_rows(
+    const unsigned char* __restrict__ A_q8,
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    int M, int K,
+    float scale,
+    int hc_act,
+    int rows
+) {
+    __shared__ float part[8][8];
+    const int row = blockIdx.x;
+    if (row >= M) return;
+    const int wave = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int pk = K / 8;
+    float s[8];
+    gemv_q8_0_row_multi(A_q8 + ((size_t)row * 8 + wave) * (pk / 32) * 34, x + wave * pk,
+                        (size_t)K, pk, lane, rows, s);
+    if (lane == 0) {
+#pragma unroll
+        for (int r = 0; r < 8; ++r) part[r][wave] = s[r];
+    }
+    __syncthreads();
+    const int r = threadIdx.x;
+    if (r >= rows) return;
+    float value = ((part[r][0] + part[r][1]) + (part[r][2] + part[r][3])) + ((part[r][4] + part[r][5]) + (part[r][6] + part[r][7]));
+    if (hc_act) {
+        value = static_cast<float>(static_cast<hip_bfloat16>(value));
+        value *= scale;
+        value = static_cast<float>(static_cast<hip_bfloat16>(value));
+        value = value / (1.0f + expf(-value));
+        value = static_cast<float>(static_cast<hip_bfloat16>(value));
+    }
+    y[(size_t)r * M + row] = value;
+}
+
 // Requantize BF16 to Q8_0, one thread per 32-block: scale = f16(amax / 127),
 // q = round(w / scale) with the stored (f16) scale.
 extern "C" __global__ void quantize_bf16_q8_0(

@@ -14481,6 +14481,111 @@ impl Gpu {
         self.launch_gemv_split("gemv_q8_0_k8", 256, weight, x, y, m, k, hc_act_scale)
     }
 
+    /// [`Gpu::gemv_q8_0_k8`] of `rows` activation rows (x row stride K, y row
+    /// stride M) in one launch; each row bitwise the single-row kernel's.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_q8_0_k8_rows(
+        &mut self,
+        weight: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        hc_act_scale: Option<f32>,
+        rows: usize,
+    ) -> HipResult<()> {
+        if !k.is_multiple_of(256) || !(1..=8).contains(&rows) {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "gemv_q8_0_k8_rows needs K % 256 == 0 and 1..=8 rows",
+            ));
+        }
+        self.bind_thread()?;
+        const FUNC: &str = "gemv_q8_0_k8_rows";
+        self.ensure_kernel("gemv_q8_0", kernels::GEMV_Q8_0_SRC, FUNC)?;
+        let w_ptr = weight.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let scale = hc_act_scale.unwrap_or(1.0);
+        let hc_act = i32::from(hc_act_scale.is_some());
+        let rows_val = rows as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &w_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &scale as *const _ as *mut c_void,
+            &hc_act as *const _ as *mut c_void,
+            &rows_val as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(FUNC, [m as u32, 1, 1], [256, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(w_ptr);
+            b.push_ptr(x_ptr);
+            b.push_ptr(y_ptr);
+            b.push_i32(m_val);
+            b.push_i32(k_val);
+            b.push_f32(scale);
+            b.push_i32(hc_act);
+            b.push_i32(rows_val);
+            b
+        })
+    }
+
+    /// Whether [`Gpu::gemv_q8_0_staged_rows`] covers this shape.
+    pub fn gemv_q8_0_staged_rows_supported(&self, k: usize, rows: usize) -> bool {
+        self.arch_caps.is_gfx1151() && (k == 2560 || k == 320) && (1..=8).contains(&rows)
+    }
+
+    /// [`Gpu::gemv_q8_0`]'s gfx1151 staged kernels (K = 2560 / 320) over
+    /// `rows` activation rows in one launch: each weight row is loaded once;
+    /// each output row is bitwise the single-row kernel's.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_q8_0_staged_rows(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        rows: usize,
+    ) -> HipResult<()> {
+        if !self.gemv_q8_0_staged_rows_supported(k, rows) {
+            return Err(hip_bridge::HipError::new(1, "gemv_q8_0_staged_rows shape"));
+        }
+        self.bind_thread()?;
+        let (func, grid, block) = if k == 2560 {
+            ("gemv_q8_0_k2560_staged_rows", m as u32, 32u32)
+        } else {
+            ("gemv_q8_0_k320_staged_rows", m.div_ceil(2) as u32, 64u32)
+        };
+        self.ensure_kernel("gemv_q8_0", kernels::GEMV_Q8_0_SRC, func)?;
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let rows_val = rows as i32;
+        let mut params = [
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &rows_val as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(func, [grid, 1, 1], [block, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(a_ptr);
+            b.push_ptr(x_ptr);
+            b.push_ptr(y_ptr);
+            b.push_i32(m_val);
+            b.push_i32(rows_val);
+            b
+        })
+    }
+
     /// Requantize a row-major BF16 `[m, k]` weight to a new Q8_0 tensor
     /// (per 32: f16 scale amax/127, int8 round-to-nearest). `k % 32 == 0`.
     pub fn quantize_bf16_q8_0(
