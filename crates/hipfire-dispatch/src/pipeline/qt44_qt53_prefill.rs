@@ -196,9 +196,14 @@ pub(crate) fn shared_gate_up(gpu: &mut Gpu, p: &MoePrefillParams<'_>) -> Result<
     }
     if p.recipe.bf16_round_trip() {
         // gate/up are round-tripped where the activation reads them (their
-        // only reader), in the same pass.
-        hip(gpu.bf16_round_trip_f32(p.prelude.router_logits))?;
-        hip(gpu.bf16_round_trip_f32(shared.scalar))?;
+        // only reader), in the same pass. The live rows only: both buffers
+        // are sized for the chunk cap.
+        hip(gpu.bf16_round_trip_f32(&f32_view(
+            p.prelude.router_logits,
+            0,
+            p.batch_size * p.n_exp,
+        )))?;
+        hip(gpu.bf16_round_trip_f32(&f32_view(shared.scalar, 0, p.batch_size)))?;
     }
     Ok(())
 }
