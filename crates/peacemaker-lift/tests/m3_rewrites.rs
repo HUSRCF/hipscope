@@ -227,8 +227,8 @@ fn kt48_profile_reproduces_kt48_pmprofile() {
     let out = run(&co, HIPCC, KT48, plan.script, EquivalenceKind::ProvedCommutation);
     assert_reproduces(&out.bytes, "9761e1e64f9d190dd8879905b570a5e5263628de1fb613e3e92998fa43c91036", 44_280, "peacemaker/profile/attn/kt48_pmprofile.co");
     assert_eq!(out.receipt.definedness, Ok(()), "check 11: the straight-line profiler insertion passes");
-    assert!(out.receipt.new_obligations.iter().any(|o| o.rule_id == "definedness-partial-write" && o.text.contains("v239")),
-        "the preserved lanes of v239 need a separate lane-aware proof");
+    assert!(!out.receipt.new_obligations.iter().any(|o| o.rule_id == "definedness-partial-write"),
+        "v239 lanes 0..7 are written before the header store under EXEC=0xff; later records rewrite lanes 0..1/3 under equally narrow masks");
     assert_eq!(out.receipt.delay_rewrites.len(), 2);
 }
 
@@ -253,6 +253,6 @@ fn silu_profile_reproduces_silu_pmprofile() {
     let out = run(&co, BUILDER, SILU, plan.script, EquivalenceKind::ProvedCommutation);
     assert_reproduces(&out.bytes, "b677527e75cd2efe2df769b70a6c3808c7304a17177e4f661830fa14af65c041", 284_696, "peacemaker/profile/f2/silu_pmprofile.co");
     assert_eq!(out.receipt.definedness, Ok(()));
-    assert!(out.receipt.new_obligations.iter().any(|o| o.rule_id == "definedness-partial-write" && o.text.contains("v191")),
-        "the preserved lanes of v191 need a separate lane-aware proof");
+    assert!(!out.receipt.new_obligations.iter().any(|o| o.rule_id == "definedness-partial-write"),
+        "v191 lanes 0..7 are written before the header store under EXEC=0xff; later records rewrite lanes 0..1/3 under equally narrow masks");
 }

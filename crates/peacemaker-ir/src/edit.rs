@@ -45,6 +45,9 @@ use crate::reg::{Kind, RegClaim, RegRef, RegSet, Scope};
 use crate::state::{Analyzed, Facts, Obligation, ObligationKind};
 use crate::wait::{Counter, WaitImm, N};
 
+#[path = "edit/lane_definedness.rs"]
+mod lane_definedness;
+
 // ---------------------------------------------------------------------------
 // Public edit vocabulary
 // ---------------------------------------------------------------------------
@@ -289,12 +292,19 @@ fn analyze_at(program: Program, kernel: &SymbolId, revision: u32) -> Result<Anal
     obligations.extend(barriers.obligations);
     let flow = Flow::new(body, arch, kern.wave)?;
     let (def_in, _) = flow.defined(entry_seed(kern, arch)?);
+    let partial_sites: Vec<_> = (0..flow.n).filter(|&p| {
+        let inst = body.insts.get(flow.ids[p]).expect("laid out");
+        !partial_undefined(arch, inst, &flow.acc[p].reads.minus(&def_in[p])).is_empty()
+    }).collect();
+    let lane_proofs = if partial_sites.is_empty() { Vec::new() } else {
+        lane_definedness::prove(body, &flow, arch, kern.wave, &partial_sites)
+    };
     for p in 0..flow.n {
         let id = flow.ids[p];
         let inst = body.insts.get(id).ok_or(EditError::UnknownInst(id))?;
         let missing = flow.acc[p].reads.minus(&def_in[p]);
         let partial = partial_undefined(arch, inst, &missing);
-        if !partial.is_empty() {
+        if !partial.is_empty() && !lane_proofs.contains(&p) {
             obligations.push(Obligation {
                 kind: ObligationKind::Definedness, insts: vec![id], rule_id: "definedness-partial-write".into(),
                 text: format!("{} preserves {} without a definition on every path; lane coverage remains unproved",
@@ -2310,6 +2320,55 @@ mod tests {
         assert!(undefined.iter().all(|o| o.rule_id == "definedness-entry" && (o.text.contains("reads m0 ") || o.text.contains("reads v"))));
         assert_eq!(a.obligations.iter().filter(|o| o.kind == ObligationKind::SrcReadTiming(MemClass::DsStore)).count(), 124);
         assert!(!a.obligations.iter().any(|o| o.kind == ObligationKind::Unknown), "descriptor/metadata agree with the code");
+    }
+
+    #[test]
+    fn lane_definedness_proves_only_the_lanes_observed_on_every_path() {
+        let write = |lane| I(mk("v_writelane_b32", vec![v(200), int(7), int(lane)]));
+        let exec = || Operand::Special(Special::ExecLo);
+        let store = || I(ds_store(0, 200));
+        let findings = |items| {
+            let analyzed = analyzed(items);
+            analyzed.obligations.iter().filter(|o| o.rule_id == "definedness-partial-write").count()
+        };
+        let narrow = vec![write(0), write(1), I(smov(s(20), exec())),
+            I(smov(exec(), int(3))), store(), I(smov(exec(), s(20))), I(endpgm())];
+        assert_eq!(findings(narrow), 0, "the two written lanes cover EXEC=0b11");
+        assert_eq!(findings(vec![write(0), write(1), I(smov(exec(), int(7))), store(), I(endpgm())]), 1,
+            "a store of lane 2 cannot read an unwritten lane");
+        assert_eq!(findings(vec![write(0), write(1), store(), I(endpgm())]), 1,
+            "the ABI's unknown initial EXEC may include unwritten lanes");
+        assert_eq!(findings(vec![write(0), write(1),
+            I(mk("s_and_b32", vec![exec(), exec(), int(3)])), store(), I(endpgm())]), 0,
+            "AND with a constant bounds the active lanes even when initial EXEC is unknown");
+        assert_eq!(findings(vec![write(0), I(mk("s_cmp_eq_u32", vec![s(0), int(0)])),
+            B("s_cbranch_scc1", "skip"), write(1), B("s_branch", "join"),
+            L("skip"), I(nop()), L("join"), I(smov(exec(), int(3))), store(), I(endpgm())]), 1,
+            "a lane written on just one branch cannot cover the join");
+        assert_eq!(findings(vec![write(0), I(mk("v_readlane_b32", vec![s(22), v(200), int(0)])), I(endpgm())]), 0,
+            "a lane read observes its selected lane, not the current unknown EXEC");
+        assert_eq!(findings(vec![write(0), I(mk("v_readlane_b32", vec![s(22), v(200), int(1)])), I(endpgm())]), 1,
+            "a lane read of another lane is unsafe even if EXEC has no known mask");
+        assert_eq!(findings(vec![I(smov(s(21), int(1))),
+            I(mk("v_writelane_b32", vec![v(200), int(7), s(21)])), write(0),
+            I(smov(exec(), int(3))), store(), I(endpgm())]), 0,
+            "a lane index copied through an SGPR defines that specific lane");
+        assert_eq!(findings(vec![
+            I(mk("v_writelane_b32", vec![v(200), int(7), s(21)])),
+            I(smov(exec(), int(1))), store(), I(endpgm())]), 1,
+            "an unknown scalar lane index cannot establish coverage of lane 0");
+        assert_eq!(findings(vec![write(0), I(smov(exec(), int(2))),
+            I(vmov(200, int(9))), I(smov(exec(), int(3))), store(), I(endpgm())]), 0,
+            "an EXEC-masked full VGPR write defines its definitely active lanes");
+        assert_eq!(findings(vec![write(0), I(vmov(200, int(9))),
+            I(smov(exec(), int(3))), store(), I(endpgm())]), 1,
+            "a full VGPR write under unknown EXEC cannot prove lane 1");
+        assert_eq!(findings(vec![write(0), I(smov(s(20), int(1))),
+            I(mk("s_and_saveexec_b32", vec![s(21), s(20)])), store(), I(endpgm())]), 0,
+            "saveexec AND bounds the lanes even when it saves an unknown old EXEC");
+        assert_eq!(findings(vec![write(0), I(smov(s(20), int(1))),
+            I(mk("s_or_saveexec_b32", vec![s(21), s(20)])), store(), I(endpgm())]), 1,
+            "saveexec OR cannot bound an unknown old EXEC");
     }
 
     // ---- T10: the profiler entry script and its inverse on KT48 ----
