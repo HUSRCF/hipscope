@@ -103,3 +103,23 @@ __launch_bounds__(32, 8)
 extern "C" __global__ void gemm_mq6g256v2_f32_rows_r4(
     const char* A, const float* x, float* y, int M, int K
 ) { mq6g256v2_f32_rows_body<4>(A, x, y, M, K); }
+
+__launch_bounds__(32, 6)
+extern "C" __global__ void gemm_mq6g256v2_f32_rows_r5(
+    const char* A, const float* x, float* y, int M, int K
+) { mq6g256v2_f32_rows_body<5>(A, x, y, M, K); }
+
+__launch_bounds__(32, 6)
+extern "C" __global__ void gemm_mq6g256v2_f32_rows_r6(
+    const char* A, const float* x, float* y, int M, int K
+) { mq6g256v2_f32_rows_body<6>(A, x, y, M, K); }
+
+__launch_bounds__(32, 4)
+extern "C" __global__ void gemm_mq6g256v2_f32_rows_r7(
+    const char* A, const float* x, float* y, int M, int K
+) { mq6g256v2_f32_rows_body<7>(A, x, y, M, K); }
+
+__launch_bounds__(32, 4)
+extern "C" __global__ void gemm_mq6g256v2_f32_rows_r8(
+    const char* A, const float* x, float* y, int M, int K
+) { mq6g256v2_f32_rows_body<8>(A, x, y, M, K); }

@@ -306,7 +306,7 @@ fn project_rotated(
     output: &GpuTensor,
     rows: usize,
 ) -> Result<(), DispatchError> {
-    if weight.dtype == DType::MQ6G256V2 && (2..=4).contains(&rows) {
+    if weight.dtype == DType::MQ6G256V2 && (2..=8).contains(&rows) {
         return hip(gpu.gemm_mq6g256v2_f32_rows(weight.buf, x, output, weight.m, weight.k, rows));
     }
     let result = match (weight.dtype, rows > 1) {

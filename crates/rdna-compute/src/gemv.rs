@@ -16642,7 +16642,11 @@ impl Gpu {
             2 => "gemm_mq6g256v2_f32_rows_r2",
             3 => "gemm_mq6g256v2_f32_rows_r3",
             4 => "gemm_mq6g256v2_f32_rows_r4",
-            _ => return Err(hip_bridge::HipError::new(1, "MQ6 F32 rows must be 2..=4")),
+            5 => "gemm_mq6g256v2_f32_rows_r5",
+            6 => "gemm_mq6g256v2_f32_rows_r6",
+            7 => "gemm_mq6g256v2_f32_rows_r7",
+            8 => "gemm_mq6g256v2_f32_rows_r8",
+            _ => return Err(hip_bridge::HipError::new(1, "MQ6 F32 rows must be 2..=8")),
         };
         if m == 0 || k == 0 || k % 256 != 0 || m > i32::MAX as usize || k > i32::MAX as usize {
             return Err(hip_bridge::HipError::new(

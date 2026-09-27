@@ -507,16 +507,18 @@ enum DraftPairing {
     AlignedTarget,
 }
 
-/// Per-draft agreement at or above which the batched verify is used: a
-/// K=3 window (4-row verify, three draft steps, rollback) costs about 2.5
-/// interleaved rows on gfx1151, which 1 + a + a^2 + a^3 tokens repay from
-/// a ~= 0.69.
-const MTP_BATCHED_AGREEMENT: f32 = 0.7;
-/// Per-window decay of the agreement counts.
+/// Cost of a batched window that drafts K tokens (index K: K draft steps,
+/// a (K+1)-row verify, rollback), in interleaved-route emitted tokens (one
+/// single-row forward plus one draft step). gfx1151, Qwen3.8-Flash-Next,
+/// measured: interleaved ~33.5 ms/token, K=2 window ~69 ms, K=3 ~79 ms;
+/// deeper windows from the few-row forward's growth (5 rows ~69 ms, 8 ~98).
+const MTP_WINDOW_COST: [f32; 8] = [1.0, 1.8, 2.07, 2.37, 2.7, 2.9, 3.3, 3.8];
+/// Per-window decay of the per-depth agreement counts.
 const MTP_AGREEMENT_DECAY: f32 = 0.875;
-/// Agreement counts a request starts from: optimistic, so the first windows
-/// are batched and measure the real rate.
-const MTP_AGREEMENT_PRIOR: (f32, f32) = (4.0, 4.0);
+/// Per-depth (accepted, compared) counts a request starts from (0.8).
+const MTP_AGREEMENT_PRIOR: (f32, f32) = (1.6, 2.0);
+/// Draft depths tracked (the drafter's K is clamped to this).
+const MTP_MAX_DEPTH: usize = 10;
 
 /// Native GPU MTP drafter.  The MTP operator/state stay model-owned by the
 /// target bundle; this adapter owns only the reusable verifier scratch and one
@@ -531,10 +533,10 @@ pub struct Qwen4MtpDrafter {
     /// Prompt rows one chunked prefill call may capture; mirrors the attached
     /// forward's chunk capacity and sizes the spec hidden capture buffer.
     prefill_rows: usize,
-    /// Recent per-draft agreement as decayed (accepted, compared) draft
-    /// counts (see `observe_agreement`); picks the verify route when
-    /// `HIPFIRE_MTP_INCREMENTAL` is unset.
-    agreement: (f32, f32),
+    /// Recent agreement per draft depth as decayed (accepted, compared)
+    /// counts (see `observe_agreement`); picks the verify route and draft
+    /// depth when `HIPFIRE_MTP_INCREMENTAL` is unset.
+    agreement: [(f32, f32); MTP_MAX_DEPTH],
 }
 
 impl Qwen4MtpDrafter {
@@ -547,7 +549,7 @@ impl Qwen4MtpDrafter {
             pending_hidden: None,
             row_hidden: None,
             prefill_rows: 0,
-            agreement: MTP_AGREEMENT_PRIOR,
+            agreement: [MTP_AGREEMENT_PRIOR; MTP_MAX_DEPTH],
         }
     }
 
@@ -776,15 +778,39 @@ impl Qwen4MtpDrafter {
         })
     }
 
-    /// Per-draft agreement counts only the drafts compared before the first
-    /// rejection, so both routes measure the same conditional rate.
+    /// Only the drafts compared before the first rejection count, so each
+    /// depth measures the agreement conditional on its prefix being accepted
+    /// (the same quantity on both routes).
     fn observe_agreement(&mut self, window: &MtpWindow) {
         let compared = (window.accepted + 1).min(window.drafts_generated);
-        let (accepted, total) = self.agreement;
-        self.agreement = (
-            accepted * MTP_AGREEMENT_DECAY + window.accepted as f32,
-            total * MTP_AGREEMENT_DECAY + compared as f32,
-        );
+        for (depth, (accepted, total)) in self.agreement.iter_mut().enumerate() {
+            *accepted *= MTP_AGREEMENT_DECAY;
+            *total *= MTP_AGREEMENT_DECAY;
+            if depth < compared {
+                *total += 1.0;
+                *accepted += f32::from(u8::from(depth < window.accepted));
+            }
+        }
+    }
+
+    /// Draft depth for the next window: the K maximizing expected emitted
+    /// tokens (1 + sum over depths of the accepted-prefix probability) per
+    /// window cost, or 0 (interleaved) when no batched window beats one
+    /// token per interleaved step.
+    fn batched_depth(&self, k: usize) -> usize {
+        let mut best = (0, 1.0f32);
+        let mut prefix = 1.0f32;
+        let mut expected = 1.0f32;
+        for depth in 1..=k.min(MTP_WINDOW_COST.len() - 1) {
+            let (accepted, total) = self.agreement[depth - 1];
+            prefix *= accepted / total.max(f32::MIN_POSITIVE);
+            expected += prefix;
+            let rate = expected / MTP_WINDOW_COST[depth];
+            if rate > best.1 {
+                best = (depth, rate);
+            }
+        }
+        best.0
     }
 
     fn pending_hidden(&self) -> Result<&GpuTensor, String> {
@@ -807,7 +833,7 @@ impl MtpDrafter for Qwen4MtpDrafter {
     ) -> Result<u32, String> {
         require_native_greedy(self.request.temp)?;
         validate_native_mtp_prefill_request(prompt_tokens, fill_tokens, start_pos, cache_hit)?;
-        self.agreement = MTP_AGREEMENT_PRIOR;
+        self.agreement = [MTP_AGREEMENT_PRIOR; MTP_MAX_DEPTH];
         // Native Qwen4 MTP has no exact target+MTP suffix rehydration yet.
         // Always discard any AR or stale MTP prefix and rebuild the complete
         // rendered prompt from position zero.
@@ -889,16 +915,17 @@ impl MtpDrafter for Qwen4MtpDrafter {
         // forwards, so it pays only while drafts keep being accepted; the
         // interleaved verify costs one forward per emitted token and wastes no
         // draft. `HIPFIRE_MTP_INCREMENTAL=0|1` forces a route.
-        let incremental = match std::env::var("HIPFIRE_MTP_INCREMENTAL").as_deref() {
-            Ok("0") => false,
-            Ok("1") => true,
-            _ => self.agreement.0 < MTP_BATCHED_AGREEMENT * self.agreement.1,
+        let depth = match std::env::var("HIPFIRE_MTP_INCREMENTAL").as_deref() {
+            Ok("0") => k,
+            Ok("1") => 0,
+            _ => self.batched_depth(k),
         };
-        if incremental {
+        if depth == 0 {
             let window = self.mtp_step_incremental(gpu, target, position, seed, k, eos, trace)?;
             self.observe_agreement(&window);
             return Ok(window);
         }
+        let k = depth;
         {
             let bundle = Self::bundle(target)?;
             let target_position = bundle.state.position;
@@ -922,6 +949,7 @@ impl MtpDrafter for Qwen4MtpDrafter {
         let mut accepted_drafts = 0usize;
         let window_start = Instant::now();
         let result = (|| -> Result<MtpWindow, String> {
+            timers.mark(gpu, "draft");
             let mut drafts = Vec::with_capacity(k);
             let mut input = seed;
             // Every proposal starts with a fresh QSA selection; only later
