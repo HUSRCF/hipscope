@@ -753,12 +753,13 @@ pub fn execute_hyper_write(gpu: &mut Gpu, op: &HyperWriteOp<'_>) -> Result<(), D
 }
 
 /// Gate quarters a fused hyper write hands to the next hyper write of the same
-/// streams (see [`execute_hyper_write_then_read`]): 16 floats past the live
-/// gates in `gates`' capacity, two alternating slots.
+/// streams (see [`execute_hyper_write_then_read`]): 16 floats per row past
+/// the live gates in `gates`' capacity, two alternating slots.
 pub fn hyper_gate_quarters(op: &HyperWriteOp<'_>, slot: usize) -> Option<GpuTensor> {
-    let start = op.rows.checked_mul(op.branches)?.checked_add(16 * slot)?;
-    (op.gates.dtype == DType::F32 && op.gates.numel() >= start + 16)
-        .then(|| view(op.gates, start, 16))
+    let len = op.rows.checked_mul(16)?;
+    let start = op.rows.checked_mul(op.branches)?.checked_add(len.checked_mul(slot)?)?;
+    (op.gates.dtype == DType::F32 && op.gates.numel() >= start + len)
+        .then(|| view(op.gates, start, len))
 }
 
 /// A single-row F32 hyper write immediately followed by the hyper read of the
@@ -781,8 +782,8 @@ pub fn execute_hyper_write_then_read(
     clear: Option<&ClearOp<'_>>,
     rotate_into: Option<&GpuTensor>,
 ) -> Result<Option<bool>, DispatchError> {
-    let fusable = write.rows == 1
-        && read.rows == 1
+    let fusable = (1..=8).contains(&write.rows)
+        && read.rows == write.rows
         && !write.state_bf16
         && !read.state_bf16
         && write.branches == 4
@@ -794,6 +795,7 @@ pub fn execute_hyper_write_then_read(
         return Ok(None);
     }
     let wide = checked_mul(read.branches, read.hidden, "hyper read wide")?;
+    let rows = write.rows;
     let next_gates = next
         .filter(|(op, _)| {
             op.block_inject.dtype == DType::BF16
@@ -806,12 +808,12 @@ pub fn execute_hyper_write_then_read(
             inject: op.block_inject.buf,
             quarters,
         });
-    let input = view(write.input, 0, wide);
-    let mixed = view(write.mixed, 0, write.hidden);
-    let gates = view(write.gates, 0, write.branches);
-    let output = view(write.output, 0, wide);
-    let write_normalized = view(write.normalized, 0, wide);
-    let normalized = view(read.normalized, 0, wide);
+    let input = view(write.input, 0, rows * wide);
+    let mixed = view(write.mixed, 0, rows * write.hidden);
+    let gates = view(write.gates, 0, rows * write.branches);
+    let output = view(write.output, 0, rows * wide);
+    let write_normalized = view(write.normalized, 0, rows * wide);
+    let normalized = view(read.normalized, 0, rows * wide);
     let clear = match clear {
         Some(op) => {
             op.validate_for_gpu(gpu)?;

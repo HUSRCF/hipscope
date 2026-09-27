@@ -186,12 +186,22 @@ extern "C" __global__ void hyper_write_norm_f32(
     int branches,
     int hidden
 ) {
+    // Grid [branches, rows]: block (branch, row) owns one branch of one token
+    // row; the weights are per branch.
     const int branch = (int)blockIdx.x;
+    const int row = (int)blockIdx.y;
     const int tid = (int)threadIdx.x;
-    const int offset = branch * hidden;
+    const int woff = branch * hidden;
+    const int offset = row * branches * hidden + woff;
+    mixed += (size_t)row * hidden;
+    gates += (size_t)row * branches;
+    if (quarters_in) quarters_in += (size_t)row * 16;
+    if (quarters_out) quarters_out += (size_t)row * 16;
     // Optional: a scratch prefix the following steps expect zeroed.
     if (clear) {
-        for (int i = branch * 256 + tid; i < clear_elements; i += branches * 256) clear[i] = 0.0f;
+        const int blocks = (int)gridDim.y * branches;
+        for (int i = (row * branches + branch) * 256 + tid; i < clear_elements; i += blocks * 256)
+            clear[i] = 0.0f;
     }
     __shared__ float rms_sum[256];
     __shared__ __align__(16) float xn[2560];
@@ -206,14 +216,14 @@ extern "C" __global__ void hyper_write_norm_f32(
     for (int u = 0; u < 10; ++u) {
         raw[u] = input[offset + tid + u * 256];
         mix[u] = mixed[tid + u * 256];
-        weight[u] = HF_BF16_LO((unsigned int)norm_weight[offset + tid + u * 256]);
+        weight[u] = HF_BF16_LO((unsigned int)norm_weight[woff + tid + u * 256]);
     }
     if (quarters_out) {
 #pragma unroll
         for (int u = 0; u < 10; ++u)
-            next_weight[u] = HF_BF16_LO((unsigned int)next_norm[offset + tid + u * 256]);
+            next_weight[u] = HF_BF16_LO((unsigned int)next_norm[woff + tid + u * 256]);
         if (wave < 4) {
-            const unsigned short* w_row = next_inject + (size_t)wave * 4 * hidden + offset;
+            const unsigned short* w_row = next_inject + (size_t)wave * 4 * hidden + woff;
 #pragma unroll
             for (int s = 0; s < 10; ++s) wv[s] = *(const uint4*)(w_row + lane * 8 + s * 256);
         }

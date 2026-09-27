@@ -879,12 +879,13 @@ pub struct HyperNextGates<'a> {
     pub quarters: &'a GpuTensor,
 }
 
-/// [`hyper_write`] of one F32 decode row (`hidden == 2560`, four branches)
-/// followed by [`hyper_norm`] of the written streams with `norm_weight` into
-/// `normalized`, one launch; bitwise the two launches. `quarters_in` (from a
-/// previous call's `next`) replaces `p.gates` as the gate source; `next`
-/// also computes the next hyper write's gate quarters (its norm and k4 gate
-/// GEMV of these streams, bitwise); `clear` is zero-filled (a `zero_f32`).
+/// [`hyper_write`] of up to eight F32 token rows (`hidden == 2560`, four
+/// branches; rows = `input` elements / width) followed by [`hyper_norm`] of
+/// the written streams with `norm_weight` into `normalized`, one launch;
+/// bitwise the two launches. `quarters_in` (16 per row, from a previous
+/// call's `next`) replaces `p.gates` as the gate source; `next` also computes
+/// the next hyper write's gate quarters (its norm and k4 gate GEMV of these
+/// streams, bitwise); `clear` is zero-filled (a `zero_f32`).
 pub fn hyper_write_norm(
     gpu: &mut Gpu,
     p: &HyperWrite<'_>,
@@ -898,17 +899,21 @@ pub fn hyper_write_norm(
         ensure_f32(tensor)?;
     }
     let wide = checked_product(p.branches, p.hidden, "HC write width")?;
-    let quarters_ok = |q: &GpuTensor| q.dtype == DType::F32 && q.numel() == 16;
+    // Token rows: one block per (branch, row).
+    let rows = p.input.numel() / wide.max(1);
+    let quarters_ok = |q: &GpuTensor| q.dtype == DType::F32 && q.numel() == 16 * rows;
     if p.state_bf16
         || p.branches != 4
         || p.hidden != 2560
+        || rows == 0
+        || rows > 8
         || norm_weight.dtype != DType::BF16
-        || p.input.numel() != wide
-        || p.output.numel() != wide
-        || normalized.numel() != wide
+        || p.input.numel() != rows * wide
+        || p.output.numel() != rows * wide
+        || normalized.numel() != rows * wide
         || norm_weight.numel() != wide
-        || p.mixed.numel() != p.hidden
-        || p.gates.numel() != p.branches
+        || p.mixed.numel() != rows * p.hidden
+        || p.gates.numel() != rows * p.branches
         || quarters_in.is_some_and(|q| !quarters_ok(q))
         || clear.is_some_and(|c| c.dtype != DType::F32 || c.numel() > i32::MAX as usize)
         || next.is_some_and(|n| {
@@ -949,7 +954,7 @@ pub fn hyper_write_norm(
     args.pad_to(16);
     gpu.launch_blob_recorded(
         "hyper_write_norm_f32",
-        [4, 1, 1],
+        [4, rows as u32, 1],
         [256, 1, 1],
         0,
         args.as_mut_slice(),
