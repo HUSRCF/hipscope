@@ -7810,13 +7810,13 @@ pub fn generate_qwen4_ar(
                         .map_err(|error| error.to_string())
                 })
         },
-        |model, device, token, logits| {
+        |model, device, resolve, logits| {
             model
                 .qwen4_mut()
                 .ok_or_else(|| "qwen4 AR bundle disappeared during decode".to_string())
                 .and_then(|bundle| {
                     bundle
-                        .forward_token(device, token, logits, None)
+                        .forward_token_resolved(device, resolve, logits)
                         .map_err(|error| error.to_string())
                 })
         },

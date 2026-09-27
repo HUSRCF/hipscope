@@ -660,6 +660,24 @@ impl Qwen4Bundle {
         result
     }
 
+    /// [`Self::forward_token`] of the token `resolve` returns once the step
+    /// program is built (see `Qwen4GpuForward::forward_token_resolved`).
+    pub fn forward_token_resolved(
+        &mut self,
+        gpu: &mut Gpu,
+        resolve: &mut dyn FnMut(&mut Gpu) -> Result<u32, String>,
+        logits: &GpuTensor,
+    ) -> Result<u32, BundleError> {
+        let mut forward = self.execution.take().ok_or_else(|| {
+            BundleError::Forward("Qwen4 forward resources are not attached".to_string())
+        })?;
+        let result = forward
+            .forward_token_resolved(self, gpu, resolve, logits)
+            .map_err(|error| BundleError::Forward(error.to_string()));
+        self.execution = Some(forward);
+        result
+    }
+
     /// Run a token sequence through the shared execution owner.  The forward
     /// owner tiles requests longer than its bounded scratch capacity while
     /// preserving the public all-row logits contract.

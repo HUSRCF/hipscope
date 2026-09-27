@@ -1473,11 +1473,42 @@ impl Qwen4GpuForward {
             bundle,
             gpu,
             std::slice::from_ref(&token),
+            None,
             logits,
             top1,
             None,
             Qwen4OutputPolicy::Rows(Qwen4OutputRows::Final),
         )
+    }
+
+    /// [`Self::forward_token`] of the token `resolve` returns. It is called
+    /// once the step program is built, before any forward-side effect, so the
+    /// host builds while the GPU still runs the previous token. Returns the
+    /// token.
+    pub fn forward_token_resolved(
+        &mut self,
+        bundle: &mut Qwen4Bundle,
+        gpu: &mut Gpu,
+        resolve: &mut dyn FnMut(&mut Gpu) -> Result<u32, String>,
+        logits: &GpuTensor,
+    ) -> Result<u32, Qwen4GpuForwardError> {
+        let mut token = None;
+        let mut record = |gpu: &mut Gpu| {
+            let resolved = resolve(gpu)?;
+            token = Some(resolved);
+            Ok(resolved)
+        };
+        self.forward_chunk_inner(
+            bundle,
+            gpu,
+            &[0],
+            Some(&mut record),
+            logits,
+            None,
+            None,
+            Qwen4OutputPolicy::Rows(Qwen4OutputRows::Final),
+        )?;
+        token.ok_or_else(|| invalid("Qwen4 forward did not resolve its token"))
     }
 
     /// Run bounded forward tiles, writing all logits rows or only the last.
@@ -1565,6 +1596,7 @@ impl Qwen4GpuForward {
                 bundle,
                 gpu,
                 &tokens[offset..offset + rows],
+                None,
                 &logits_chunk,
                 top1_chunk.as_ref(),
                 capture_chunk.as_ref(),
@@ -1577,16 +1609,21 @@ impl Qwen4GpuForward {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn forward_chunk_inner(
         &mut self,
         bundle: &mut Qwen4Bundle,
         gpu: &mut Gpu,
         tokens: &[u32],
+        mut resolve: Option<&mut dyn FnMut(&mut Gpu) -> Result<u32, String>>,
         logits: &GpuTensor,
         top1: Option<&GpuTensor>,
         wide_hidden_capture: Option<&GpuTensor>,
         output_policy: Qwen4OutputPolicy,
     ) -> Result<(), Qwen4GpuForwardError> {
+        if resolve.is_some() && tokens.len() != 1 {
+            return Err(invalid("a resolved Qwen4 forward carries one token"));
+        }
         let n = tokens.len();
         if n == 0 || n > self.scratch.max_chunk {
             return Err(invalid(format!(
@@ -1606,10 +1643,11 @@ impl Qwen4GpuForward {
                 bundle.state.max_seq_len
             )));
         }
-        if tokens
-            .iter()
-            .copied()
-            .any(|token| (token as usize) >= config.vocab_size)
+        if resolve.is_none()
+            && tokens
+                .iter()
+                .copied()
+                .any(|token| (token as usize) >= config.vocab_size)
         {
             return Err(invalid(
                 "Qwen4 token id is outside the embedding vocabulary",
@@ -1703,8 +1741,15 @@ impl Qwen4GpuForward {
         // program is built below.
         let mut ple = RowFetch::begin(&bundle.ple_rows)
             .map_err(|error| Qwen4GpuForwardError::Ple(error.to_string()))?;
-        ple.prefetch(bundle.state.ple_history.row_ids(&bundle.ple_metadata, tokens))
+        if resolve.is_none() {
+            ple.prefetch(
+                bundle
+                    .state
+                    .ple_history
+                    .row_ids(&bundle.ple_metadata, tokens),
+            )
             .map_err(|error| Qwen4GpuForwardError::Ple(error.to_string()))?;
+        }
         let router_logits = matrix_view(&self.scratch.router_logits, n, dims.num_experts)?;
         let scratch_desc = layer_scratch(&self.scratch, &router_logits);
         // Decided once: every op touching the HC streams in this forward agrees.
@@ -1982,6 +2027,29 @@ impl Qwen4GpuForward {
                 ));
             }
         }
+        // A resolved forward takes its token now: the program above is built,
+        // and nothing has touched the device or the state yet.
+        let resolved: [u32; 1];
+        let tokens = match resolve.as_mut() {
+            Some(resolve) => {
+                let token = resolve(gpu).map_err(Qwen4GpuForwardError::Dispatch)?;
+                if token as usize >= config.vocab_size {
+                    return Err(invalid(
+                        "Qwen4 token id is outside the embedding vocabulary",
+                    ));
+                }
+                resolved = [token];
+                ple.prefetch(
+                    bundle
+                        .state
+                        .ple_history
+                        .row_ids(&bundle.ple_metadata, &resolved),
+                )
+                .map_err(|error| Qwen4GpuForwardError::Ple(error.to_string()))?;
+                &resolved[..]
+            }
+            None => tokens,
+        };
         for (index, token) in tokens.iter().copied().enumerate() {
             let bytes = &mut self.host_token_bytes[index * 4..index * 4 + 4];
             bytes.copy_from_slice(&(token as i32).to_ne_bytes());
@@ -1990,7 +2058,8 @@ impl Qwen4GpuForward {
             // A HIP body (no retained tape records or routes this forward):
             // the one id is a stream-ordered fill, not a synchronous copy.
             let active = gpu.active_stream.as_ref();
-            gpu.hip.memset_d32_async(&self.scratch.token_ids.buf, tokens[0] as i32, 1, active)?;
+            gpu.hip
+                .memset_d32_async(&self.scratch.token_ids.buf, tokens[0] as i32, 1, active)?;
         } else {
             gpu.memcpy_htod_auto(
                 &self.scratch.token_ids.buf,

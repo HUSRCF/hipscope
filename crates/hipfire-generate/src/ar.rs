@@ -1739,12 +1739,14 @@ pub fn generate_ar_with_forward<Prefill, Decode>(
         &[u32],
         &rdna_compute::GpuTensor,
     ) -> Result<(), String>,
+    // Runs the token `resolve` returns (called once the forward has done its
+    // token-independent host work) and returns it.
     Decode: FnMut(
         &mut LoadedModel,
         &mut rdna_compute::Gpu,
-        u32,
+        &mut dyn FnMut(&mut rdna_compute::Gpu) -> Result<u32, String>,
         &rdna_compute::GpuTensor,
-    ) -> Result<(), String>,
+    ) -> Result<u32, String>,
 {
     if vocab_size == 0 {
         emit_active_attempt_error(
@@ -1836,7 +1838,13 @@ pub fn generate_ar_with_forward<Prefill, Decode>(
         top_k,
         min_p,
     };
-    let mut next_token = sampler::sample_cpu(&mut logits, &m.conversation_tokens, &sampler_config);
+    // The next token when the host already has it; otherwise the decode
+    // forward takes it from the GPU argmax of `decode_logits`.
+    let mut pending = Some(sampler::sample_cpu(
+        &mut logits,
+        &m.conversation_tokens,
+        &sampler_config,
+    ));
     // `sample_cpu` reduces to `llama::argmax` here: take it on the GPU and
     // read back one index instead of the logits row.
     let greedy_on_gpu = sampler_config.temperature <= 0.0
@@ -1859,19 +1867,30 @@ pub fn generate_ar_with_forward<Prefill, Decode>(
             emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
             return;
         }
-        if let Err(error) = forward_token(m, gpu, next_token, &decode_logits) {
-            let _ = gpu.free_tensor(decode_logits);
-            let ep = production_fail_closed_rollback(m, gpu, None, None);
-            emit_fail_closed_error(
-                stdout,
-                Some(id),
-                &format!("{} forward_token decode failed: {error}", route.name()),
-                "gpu",
-                false,
-                &ep,
-            );
-            return;
-        }
+        let forwarded = {
+            let mut resolve = |gpu: &mut rdna_compute::Gpu| match pending.take() {
+                Some(token) => Ok(token),
+                None => rdna_compute::tensor_ops::argmax_f32_host(gpu, &decode_logits)
+                    .map_err(|error| format!("decode argmax failed: {error}")),
+            };
+            forward_token(m, gpu, &mut resolve, &decode_logits)
+        };
+        let next_token = match forwarded {
+            Ok(token) => token,
+            Err(error) => {
+                let _ = gpu.free_tensor(decode_logits);
+                let ep = production_fail_closed_rollback(m, gpu, None, None);
+                emit_fail_closed_error(
+                    stdout,
+                    Some(id),
+                    &format!("{} forward_token decode failed: {error}", route.name()),
+                    "gpu",
+                    false,
+                    &ep,
+                );
+                return;
+            }
+        };
 
         let previous_bytes = bytes_fed_to_filter;
         let elapsed_ms = t0.elapsed().as_millis() as u64;
@@ -1947,25 +1966,8 @@ pub fn generate_ar_with_forward<Prefill, Decode>(
         }
 
         if greedy_on_gpu {
-            match rdna_compute::tensor_ops::argmax_f32_host(gpu, &decode_logits) {
-                Ok(token) => {
-                    next_token = token;
-                    continue;
-                }
-                Err(error) => {
-                    let _ = gpu.free_tensor(decode_logits);
-                    let ep = production_fail_closed_rollback(m, gpu, None, None);
-                    emit_fail_closed_error(
-                        stdout,
-                        Some(id),
-                        &format!("{} decode argmax failed: {error}", route.name()),
-                        "gpu",
-                        false,
-                        &ep,
-                    );
-                    return;
-                }
-            }
+            // The next forward reads the argmax once its program is built.
+            continue;
         }
         let next_logits = match gpu.download_f32(&decode_logits) {
             Ok(logits) => logits,
@@ -1984,7 +1986,11 @@ pub fn generate_ar_with_forward<Prefill, Decode>(
             }
         };
         logits = next_logits;
-        next_token = sampler::sample_cpu(&mut logits, &m.conversation_tokens, &sampler_config);
+        pending = Some(sampler::sample_cpu(
+            &mut logits,
+            &m.conversation_tokens,
+            &sampler_config,
+        ));
     }
 
     let hit_length_cap = generated >= max_tokens && !natural_stop;
