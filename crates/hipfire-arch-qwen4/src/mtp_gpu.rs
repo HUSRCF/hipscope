@@ -1119,8 +1119,10 @@ impl Qwen4MtpGpu {
         let lm_head = weights.resident(&weights.root.lm_head)?;
         // Only a bigger head is worth a smaller copy.
         let draft_format = draft_format.filter(|&format| {
-            matches!(lm_head.dtype, DType::Q8_0 | DType::BF16 | DType::MQ6G256V2 | DType::MQ5G256V2)
-                && format != lm_head.dtype
+            matches!(
+                lm_head.dtype,
+                DType::Q8_0 | DType::BF16 | DType::MQ6G256V2 | DType::MQ5G256V2
+            ) && format != lm_head.dtype
         });
         let draft_head = match draft_format {
             Some(format) => {

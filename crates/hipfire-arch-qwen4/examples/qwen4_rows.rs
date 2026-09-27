@@ -61,8 +61,12 @@ fn main() -> Result<(), String> {
         receipt.ple,
     )
     .map_err(|e| e.to_string())?;
-    bundle.attach_forward(&mut gpu, n_ctx).map_err(|e| e.to_string())?;
-    let logits = gpu.zeros(&[8 * vocab], DType::F32).map_err(|e| e.to_string())?;
+    bundle
+        .attach_forward(&mut gpu, n_ctx)
+        .map_err(|e| e.to_string())?;
+    let logits = gpu
+        .zeros(&[8 * vocab], DType::F32)
+        .map_err(|e| e.to_string())?;
     let row = logits.sub_offset(0, vocab);
     let tokens = tokenizer.encode(&prompt);
     let filler: Vec<u32> = tokens.iter().copied().cycle().skip(7).take(64).collect();
@@ -78,7 +82,9 @@ fn main() -> Result<(), String> {
         let mut single_ms = Vec::new();
         for it in 0..iters {
             bundle.reset(&mut gpu).map_err(|e| e.to_string())?;
-            bundle.forward_chunk_final(&mut gpu, &tokens, &row, None).map_err(|e| e.to_string())?;
+            bundle
+                .forward_chunk_final(&mut gpu, &tokens, &row, None)
+                .map_err(|e| e.to_string())?;
             gpu.hip.device_synchronize().map_err(|e| e.to_string())?;
             let block = &filler[it..it + rows];
             let t = Instant::now();
@@ -92,12 +98,16 @@ fn main() -> Result<(), String> {
                 .map_err(|e| e.to_string())?;
 
             bundle.reset(&mut gpu).map_err(|e| e.to_string())?;
-            bundle.forward_chunk_final(&mut gpu, &tokens, &row, None).map_err(|e| e.to_string())?;
+            bundle
+                .forward_chunk_final(&mut gpu, &tokens, &row, None)
+                .map_err(|e| e.to_string())?;
             gpu.hip.device_synchronize().map_err(|e| e.to_string())?;
             let t = Instant::now();
             let mut single_logits = Vec::with_capacity(rows * vocab);
             for &token in block {
-                bundle.forward_token(&mut gpu, token, &row, None).map_err(|e| e.to_string())?;
+                bundle
+                    .forward_token(&mut gpu, token, &row, None)
+                    .map_err(|e| e.to_string())?;
                 if it == 0 {
                     single_logits.extend(gpu.download_f32(&row).map_err(|e| e.to_string())?);
                 }

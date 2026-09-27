@@ -829,8 +829,8 @@ impl Qwen4State {
         let generation = self.snapshot_arena.generation;
         let result = (|| -> Result<(), StateError> {
             let arena = &mut self.snapshot_arena;
-            arena.gdn_live = (self.row_capture_armed && !self.row_capture.is_empty())
-                .then_some(self.gdn_live);
+            arena.gdn_live =
+                (self.row_capture_armed && !self.row_capture.is_empty()).then_some(self.gdn_live);
             if arena.gdn_live.is_none() {
                 for (layer, destination) in self.gdn.iter().zip(&arena.recurrent) {
                     gpu.copy_d2d(&layer.recurrent, destination, layer.recurrent.byte_size())
@@ -1106,8 +1106,12 @@ impl Qwen4State {
             let ring = gpu
                 .zeros(&[2 * rows * state], DType::F32)
                 .map_err(StateError::Hip)?;
-            gpu.copy_d2d(&layer.recurrent, &ring.sub_offset(0, state), layer.recurrent.byte_size())
-                .map_err(StateError::Hip)?;
+            gpu.copy_d2d(
+                &layer.recurrent,
+                &ring.sub_offset(0, state),
+                layer.recurrent.byte_size(),
+            )
+            .map_err(StateError::Hip)?;
             let inputs = gpu
                 .zeros(&[rows * (layer.conv.numel() / conv_history)], DType::F32)
                 .map_err(StateError::Hip)?;
@@ -1165,10 +1169,12 @@ impl Qwen4State {
         }
         let state = self.gdn.get(slot)?.recurrent.numel();
         let base = self.capture_base(self.gdn_live);
-        self.row_capture.get(slot).map(|(ring, inputs)| GdnRowCapture {
-            states: ring.sub_offset(base * state, rows * state),
-            inputs,
-        })
+        self.row_capture
+            .get(slot)
+            .map(|(ring, inputs)| GdnRowCapture {
+                states: ring.sub_offset(base * state, rows * state),
+                inputs,
+            })
     }
 
     /// An armed `rows`-row verify forward succeeded: its last row's state is
@@ -1212,7 +1218,10 @@ impl Qwen4State {
             });
         }
         let start = self.snapshot_arena.position;
-        let before = self.snapshot_arena.gdn_live.ok_or(StateError::SnapshotTicket)?;
+        let before = self
+            .snapshot_arena
+            .gdn_live
+            .ok_or(StateError::SnapshotTicket)?;
         self.set_gdn_live(self.capture_base(before) + keep - 1);
         let arena = &self.snapshot_arena;
         for (index, layer) in self.gdn.iter().enumerate() {

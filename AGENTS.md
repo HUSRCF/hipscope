@@ -624,11 +624,19 @@ Caveats that are part of the fixture, not trivia:
 - Loading it needs a build whose qwen4 trunk source contract admits **both**
   packed trunk tiers and whose external-PLE admission accepts both PLE tiers.
   Older builds refuse at load; that refusal is correct, not a corrupt file.
-- **MTP is enabled by default on this recipe as of `6b9db7774`.** Verification
-  defaults to incremental on every GPU. `HIPFIRE_MTP_INCREMENTAL=0` opts into
-  batched verification; `1` explicitly selects incremental verification.
-  The batched MQ6 trunk uses shared-weight F32 GEMV:
-  the prior F16 WMMA route changed target logits and recurrent state.
+- **MTP is enabled by default on this recipe as of `6b9db7774`.** Each MTP
+  window picks its verification route: a batched `(K+1)`-row verify at the
+  draft depth `K` that maximizes expected emitted tokens per window cost
+  (per-depth draft agreement, decayed), or the interleaved route (one target
+  row per draft, stop at the first rejection) when no depth pays.
+  `HIPFIRE_MTP_INCREMENTAL=0` forces batched at the full `mtp_k`; `1` forces
+  interleaved. The few-row (2..8) verify forward is bitwise the single-row
+  decode route, so greedy MTP emits AR's exact tokens on either route. On GPUs
+  whose GDN route captures per-row states (gfx11+ SIMT) a rejected suffix
+  rolls back without re-running the accepted rows; elsewhere the batched
+  route restores and replays. Drafts rank the vocabulary with an MQ2 copy of
+  the LM head and re-score its top 8 exactly against the Q8_0 rows
+  (`HIPFIRE_MTP_DRAFT_HEAD`, default `mq2r`).
   Teacher-forced prompt and replay steps advance MTP state without computing
   an unused language-head prediction; prompt target chunks emit only their
   final logit row while retaining every wide hidden row.
@@ -649,6 +657,12 @@ Caveats that are part of the fixture, not trivia:
   to a claimed 80% gain is verifier/replay cost, not evidence that the
   trained drafter is defective. Do not extrapolate these fixture-bound
   measurements to other architectures or prompts.
+- **Later measurement (2026-09-28, same prompts, fixture-bound):** after the
+  few-row verify, rollback and draft-head work in
+  [`docs/perf-checkpoints/2026-09-28-qwen4-mtp-decode-autoresearch-gfx1151.md`](docs/perf-checkpoints/2026-09-28-qwen4-mtp-decode-autoresearch-gfx1151.md),
+  MTP decode was code ~55 and prose ~37 tok/s against AR ~33 on the same
+  build, with greedy MTP ids equal to AR's. The GPU was shared with external
+  processes; read the checkpoint's method before citing a number.
 - `hipfire bench` cannot measure this model at all: the qwen4 contract pins
   `max_seq` to 2048 while bench asks for the configured 32768 (still 5120 with
   `memory.max_seq` forced to 2048), so it fails closed at load and never

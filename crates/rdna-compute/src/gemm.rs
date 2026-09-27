@@ -25547,7 +25547,10 @@ impl Gpu {
                 [batch_size.div_ceil(2) as u32, m.div_ceil(16) as u32, 1],
                 32,
             )
-        } else if self.arch_caps.has_gfx11_plus_simt() && k.is_multiple_of(8) && (257..=512).contains(&k) {
+        } else if self.arch_caps.has_gfx11_plus_simt()
+            && k.is_multiple_of(8)
+            && (257..=512).contains(&k)
+        {
             // One thread per output row, weights in LDS, 64 tokens per
             // block; bitwise identical to the four-row kernel.
             (
@@ -25556,7 +25559,10 @@ impl Gpu {
                 [m.div_ceil(32) as u32, batch_size.div_ceil(64) as u32, 1],
                 256,
             )
-        } else if self.arch_caps.has_gfx11_plus_simt() && k.is_multiple_of(8) && (513..=768).contains(&k) {
+        } else if self.arch_caps.has_gfx11_plus_simt()
+            && k.is_multiple_of(8)
+            && (513..=768).contains(&k)
+        {
             // Small K: one wave keeps its four tokens' X in registers and
             // walks sixteen rows; bitwise identical to the four-row kernel.
             (

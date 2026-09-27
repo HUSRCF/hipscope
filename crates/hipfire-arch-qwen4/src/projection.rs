@@ -175,9 +175,7 @@ pub(crate) fn dispatch_embedding(
         EmbeddingPath::Bf16 => {
             gpu.embedding_lookup_bf16_batched(embedding, output, token_ids, n, dim)
         }
-        EmbeddingPath::Q8 => {
-            gpu.embedding_lookup_q8_batched(embedding, output, token_ids, n, dim)
-        }
+        EmbeddingPath::Q8 => gpu.embedding_lookup_q8_batched(embedding, output, token_ids, n, dim),
     }
 }
 

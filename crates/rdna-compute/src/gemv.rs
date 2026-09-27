@@ -14455,7 +14455,11 @@ impl Gpu {
             ));
         }
         self.bind_thread()?;
-        self.ensure_kernel("gemv_bf16_xf32", kernels::GEMV_BF16_XF32_SRC, "gemv_bf16_xf32_k4")?;
+        self.ensure_kernel(
+            "gemv_bf16_xf32",
+            kernels::GEMV_BF16_XF32_SRC,
+            "gemv_bf16_xf32_k4",
+        )?;
         self.launch_gemv_split("gemv_bf16_xf32_k4", 128, weight, x, y, m, k, hc_act_scale)
     }
 
@@ -14560,14 +14564,22 @@ impl Gpu {
         const GROUPS: usize = 128;
         let chunk = n.div_ceil(GROUPS);
         if chunk > 2048 || partial.buf.size() < Self::TOPK8_PARTIAL_BYTES || x.numel() < 2560 {
-            return Err(hip_bridge::HipError::new(1, "q8_0_topk8_rescore_k2560 shape"));
+            return Err(hip_bridge::HipError::new(
+                1,
+                "q8_0_topk8_rescore_k2560 shape",
+            ));
         }
         self.bind_thread()?;
         self.ensure_kernel("gemv_q8_0", kernels::GEMV_Q8_0_SRC, "topk8_partial_f32")?;
-        self.ensure_kernel("gemv_q8_0", kernels::GEMV_Q8_0_SRC, "topk8_rescore_q8_0_k2560")?;
+        self.ensure_kernel(
+            "gemv_q8_0",
+            kernels::GEMV_Q8_0_SRC,
+            "topk8_rescore_q8_0_k2560",
+        )?;
         let v_ptr = logits.buf.as_ptr();
         let pv_ptr = partial.buf.as_ptr();
-        let pi_ptr = unsafe { (partial.buf.as_ptr() as *mut u8).add(GROUPS * 8 * 4) as *mut c_void };
+        let pi_ptr =
+            unsafe { (partial.buf.as_ptr() as *mut u8).add(GROUPS * 8 * 4) as *mut c_void };
         let n_val = n as i32;
         let chunk_val = chunk as i32;
         let mut params = [
@@ -14737,7 +14749,12 @@ impl Gpu {
         k: usize,
         target: DType,
     ) -> HipResult<GpuTensor> {
-        let bad = |what: &str| Err(hip_bridge::HipError::new(1, &format!("requant_g256: {what}")));
+        let bad = |what: &str| {
+            Err(hip_bridge::HipError::new(
+                1,
+                &format!("requant_g256: {what}"),
+            ))
+        };
         let mq_bits = |dtype: DType| match dtype {
             DType::MQ2G256V2 => Some(2),
             DType::MQ3G256V2 => Some(3),
@@ -14764,7 +14781,12 @@ impl Gpu {
         let n = m * k;
         let values = self.alloc_tensor(&[n], DType::F32)?;
         let out = self.alloc_tensor(&[n / 256 * (8 + 32 * bits as usize)], target)?;
-        let run = |gpu: &mut Self, func: &str, src: &GpuTensor, dst: &GpuTensor, count: usize, bits: i32| {
+        let run = |gpu: &mut Self,
+                   func: &str,
+                   src: &GpuTensor,
+                   dst: &GpuTensor,
+                   count: usize,
+                   bits: i32| {
             gpu.ensure_kernel("requant_g256", kernels::REQUANT_G256_SRC, func)?;
             let (s, d, c) = (src.buf.as_ptr(), dst.buf.as_ptr(), count as i64);
             let mut params: Vec<*mut c_void> = vec![
@@ -14773,14 +14795,21 @@ impl Gpu {
                 &c as *const _ as *mut c_void,
                 &bits as *const _ as *mut c_void,
             ];
-            gpu.launch_maybe_blob(func, [count.div_ceil(64) as u32, 1, 1], [64, 1, 1], 0, &mut params, || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(s);
-                b.push_ptr(d);
-                b.push_u64(c as u64);
-                b.push_i32(bits);
-                b
-            })
+            gpu.launch_maybe_blob(
+                func,
+                [count.div_ceil(64) as u32, 1, 1],
+                [64, 1, 1],
+                0,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(s);
+                    b.push_ptr(d);
+                    b.push_u64(c as u64);
+                    b.push_i32(bits);
+                    b
+                },
+            )
         };
         let result = (|| {
             run(self, unpack, weight, &values, n, source_bits)?;

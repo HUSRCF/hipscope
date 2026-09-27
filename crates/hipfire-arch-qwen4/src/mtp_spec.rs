@@ -1044,7 +1044,12 @@ impl MtpDrafter for Qwen4MtpDrafter {
             if !full_accept && picks.state.row_capture_rows() >= block.len() {
                 timers.mark(gpu, "target_rollback");
                 picks
-                    .rollback_verify_rows_retain(gpu, target_snapshot, target_accept_len + 1, &block)
+                    .rollback_verify_rows_retain(
+                        gpu,
+                        target_snapshot,
+                        target_accept_len + 1,
+                        &block,
+                    )
                     .map_err(|error| error.to_string())?;
             } else if !full_accept {
                 timers.mark(gpu, "target_replay");

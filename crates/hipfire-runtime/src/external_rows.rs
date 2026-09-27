@@ -1581,7 +1581,11 @@ impl RowStoreInner {
     }
 
     /// Read one coalesced page group's bytes into `bytes`.
-    fn read_group_bytes(&self, group: &[PageKey], bytes: &mut Vec<u8>) -> Result<(), RowStoreError> {
+    fn read_group_bytes(
+        &self,
+        group: &[PageKey],
+        bytes: &mut Vec<u8>,
+    ) -> Result<(), RowStoreError> {
         let first = *group.first().ok_or_else(|| RowStoreError::InvalidLease {
             reason: "empty coalesced page group".to_string(),
         })?;
@@ -1594,11 +1598,11 @@ impl RowStoreInner {
             })? as u64;
         let mut total = 0usize;
         for &page in group {
-            total = total
-                .checked_add(self.page_len(page)?)
-                .ok_or_else(|| RowStoreError::InvalidLease {
+            total = total.checked_add(self.page_len(page)?).ok_or_else(|| {
+                RowStoreError::InvalidLease {
                     reason: "coalesced length overflow".to_string(),
-                })?;
+                }
+            })?;
         }
         if total > self.staging_bytes {
             return Err(RowStoreError::InvalidLease {

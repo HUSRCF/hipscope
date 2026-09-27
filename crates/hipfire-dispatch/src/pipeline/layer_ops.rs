@@ -291,9 +291,7 @@ fn rotate_input(
             hip(gpu.rotate_x_mq_batched(input, &scratch, weight.k, rows))?
         }
         RotationBasis::Aligned256 => hip(gpu.rotate_x_mq(input, &scratch, weight.k))?,
-        RotationBasis::RowLocal128 => {
-            hip(gpu.rotate_x_mq_128_v2(input, &scratch, weight.k, rows))?
-        }
+        RotationBasis::RowLocal128 => hip(gpu.rotate_x_mq_128_v2(input, &scratch, weight.k, rows))?,
     }
     Ok(Some(scratch))
 }
@@ -757,7 +755,10 @@ pub fn execute_hyper_write(gpu: &mut Gpu, op: &HyperWriteOp<'_>) -> Result<(), D
 /// the live gates in `gates`' capacity, two alternating slots.
 pub fn hyper_gate_quarters(op: &HyperWriteOp<'_>, slot: usize) -> Option<GpuTensor> {
     let len = op.rows.checked_mul(16)?;
-    let start = op.rows.checked_mul(op.branches)?.checked_add(len.checked_mul(slot)?)?;
+    let start = op
+        .rows
+        .checked_mul(op.branches)?
+        .checked_add(len.checked_mul(slot)?)?;
     (op.gates.dtype == DType::F32 && op.gates.numel() >= start + len)
         .then(|| view(op.gates, start, len))
 }

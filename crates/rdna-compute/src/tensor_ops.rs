@@ -1303,7 +1303,14 @@ fn gated_delta_conv_launch(
         if heads > 256 {
             return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
         }
-        for tensor in [params.a, params.b, params.a_log, params.dt_bias, params.gate, params.beta] {
+        for tensor in [
+            params.a,
+            params.b,
+            params.a_log,
+            params.dt_bias,
+            params.gate,
+            params.beta,
+        ] {
             args.push_ptr(tensor.buf.as_ptr());
         }
         args.push_i32(heads_i);
