@@ -3708,6 +3708,26 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.silu_mul_bf16_rt_rotate_x_mq_128_v2_shared(gate, up, x_rot, k, batch_size, None)
+    }
+
+    /// [`Self::silu_mul_bf16_rt_rotate_x_mq_128_v2`] plus, when `shared` is
+    /// `(gate, up, out, selector)`, [`Self::shared_expert_activation_bf16_f32`]
+    /// of those in the same launch (bitwise both). The shared width must fit
+    /// `k` rounded up to 128.
+    pub fn silu_mul_bf16_rt_rotate_x_mq_128_v2_shared(
+        &mut self,
+        gate: &GpuTensor,
+        up: &GpuTensor,
+        x_rot: &GpuTensor,
+        k: usize,
+        batch_size: usize,
+        shared: Option<(&GpuTensor, &GpuTensor, &GpuTensor, &GpuTensor)>,
+    ) -> HipResult<()> {
+        let shared_n = shared.map_or(0, |(_, _, out, _)| out.numel());
+        if shared_n > k.div_ceil(128) * 128 {
+            return Err(hip_bridge::HipError::new(1, "shared activation wider than the routed grid"));
+        }
         self.bind_thread()?;
         const FUNC: &str = "mq_rotate_x_128_v2_silu_bf16";
         self.ensure_kernel("mq_rotate_x_128_v2", kernels::MQ_ROTATE_X_128_V2_SRC, FUNC)?;
@@ -3718,6 +3738,12 @@ impl Gpu {
         let s1 = self.scratch.mq_signs1_128.as_ref().unwrap().buf.as_ptr();
         let s2 = self.scratch.mq_signs2_128.as_ref().unwrap().buf.as_ptr();
         let kv = k as i32;
+        let null = std::ptr::null_mut();
+        let sg = shared.map_or(null, |(g, _, _, _)| g.buf.as_ptr());
+        let su = shared.map_or(null, |(_, u, _, _)| u.buf.as_ptr());
+        let so = shared.map_or(null, |(_, _, o, _)| o.buf.as_ptr());
+        let sel = shared.map_or(null, |(_, _, _, s)| s.buf.as_ptr());
+        let sn = shared_n as i32;
         let mut params: Vec<*mut c_void> = vec![
             &gp as *const _ as *mut c_void,
             &up_ptr as *const _ as *mut c_void,
@@ -3725,10 +3751,16 @@ impl Gpu {
             &s1 as *const _ as *mut c_void,
             &s2 as *const _ as *mut c_void,
             &kv as *const _ as *mut c_void,
+            &sg as *const _ as *mut c_void,
+            &su as *const _ as *mut c_void,
+            &so as *const _ as *mut c_void,
+            &sel as *const _ as *mut c_void,
+            &sn as *const _ as *mut c_void,
         ];
+        let rows = batch_size + usize::from(shared.is_some());
         self.launch_maybe_blob(
             FUNC,
-            [k.div_ceil(128) as u32, batch_size as u32, 1],
+            [k.div_ceil(128) as u32, rows as u32, 1],
             [32, 1, 1],
             0,
             &mut params,
@@ -3740,6 +3772,11 @@ impl Gpu {
                 b.push_ptr(s1);
                 b.push_ptr(s2);
                 b.push_i32(kv);
+                b.push_ptr(sg);
+                b.push_ptr(su);
+                b.push_ptr(so);
+                b.push_ptr(sel);
+                b.push_i32(sn);
                 b
             },
         )

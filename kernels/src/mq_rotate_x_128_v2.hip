@@ -82,16 +82,37 @@ static __device__ __forceinline__ float rot128_silu_mul(float g, float u) {
     return rot128_bf16_rt((v / (1.0f + expf(-v))) * rot128_bf16_rt(u));
 }
 
+//
+// Optional shared expert (`shared_out` non-null): the grid's extra last
+// y-row applies silu_mul.hip's shared_expert_activation_bf16_f32 to
+// `shared_n` elements (four per lane at the same group * 128 + lane * 4
+// positions) and replaces `selector[0]` with sigmoid(its BF16 round trip),
+// the same expressions, so it is bitwise that launch as well.
 extern "C" __global__ void mq_rotate_x_128_v2_silu_bf16(
     const float* __restrict__ gate,
     const float* __restrict__ up,
     float* __restrict__ x_out,
     const float* __restrict__ signs1,
     const float* __restrict__ signs2,
-    int K
+    int K,
+    const float* __restrict__ shared_gate,
+    const float* __restrict__ shared_up,
+    float* __restrict__ shared_out,
+    float* __restrict__ selector,
+    int shared_n
 ) {
     const int group = blockIdx.x;
     const int tid = threadIdx.x;
+    if (shared_out && blockIdx.y == gridDim.y - 1) {
+        if (group == 0 && tid == 0)
+            selector[0] = 1.0f / (1.0f + expf(-rot128_bf16_rt(selector[0])));
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            const int i = group * 128 + tid * 4 + e;
+            if (i < shared_n) shared_out[i] = rot128_silu_mul(shared_gate[i], shared_up[i]);
+        }
+        return;
+    }
     const int groups_total = (K + 127) / 128;
     if (group >= groups_total || K <= 0) return;
 

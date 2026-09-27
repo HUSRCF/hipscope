@@ -3192,7 +3192,9 @@ fn decode_shared_down_stage(
             // follows. The shared gate/up are rounded as silu_mul reads them.
             let scalar_live = slice_moe_f32_view(scalar_buf, 0, 1);
             let shared_hid = slice_moe_f32_view(p.ffn_hidden, 0, smi);
-            if p.recipe.bf16_round_trip() {
+            if qt44_shared_activation_in_routed(p, route) {
+                // The routed activation launch already ran it.
+            } else if p.recipe.bf16_round_trip() {
                 hip!(gpu.shared_expert_activation_bf16_f32(
                     shared_gate,
                     shared_up,
@@ -3632,11 +3634,29 @@ fn decode_gate_up_stage(
     Ok(())
 }
 
+/// Whether the grouped BF16 decode runs the shared expert's activation (and
+/// selector sigmoid) inside the routed activation launch; its inputs are the
+/// router GEMV's shared gate/up, so it need not wait for the shared stage.
+fn qt44_shared_activation_in_routed(
+    p: &crate::families::moe::MoeParams<'_>,
+    route: Option<MoeRouteCapability>,
+) -> bool {
+    route == Some(MoeRouteCapability::Qt44Qt53Grouped)
+        && p.recipe.bf16_round_trip()
+        && !p.skip_shared
+        && p.ep_mode == crate::families::moe::MoeEpMode::None
+        && p
+            .shared
+            .as_ref()
+            .is_some_and(|shared| shared.intermediate <= p.mi.div_ceil(128) * 128)
+}
+
 fn decode_activation_stage(
     gpu: &mut Gpu,
     p: &crate::families::moe::MoeParams<'_>,
     res: crate::families::moe::MoeResolution,
     route: Option<MoeRouteCapability>,
+    shared_views: Option<(&GpuTensor, &GpuTensor)>,
 ) -> Result<(), DispatchError> {
     if route == Some(MoeRouteCapability::Qt44Qt53Grouped) {
         let routed_slots =
@@ -3646,13 +3666,29 @@ fn decode_activation_stage(
         let up_batch = slice_moe_f32_view(p.up_batch, 0, routed_slots);
         let rot_batch = slice_moe_f32_view(p.rot_batch, 0, routed_slots);
         if p.recipe.bf16_round_trip() {
-            // Activation and the down projection's 128-wide rotation, one pass.
-            hip!(gpu.silu_mul_bf16_rt_rotate_x_mq_128_v2(
+            // Activation and the down projection's 128-wide rotation, one pass
+            // (with the shared expert's activation when it rides along).
+            let shared = match (qt44_shared_activation_in_routed(p, route), shared_views, &p.shared) {
+                (true, Some((gate, up)), Some(shared)) => Some((
+                    gate,
+                    up,
+                    slice_moe_f32_view(p.ffn_hidden, 0, shared.intermediate),
+                    slice_moe_f32_view(shared.scalar, 0, 1),
+                )),
+                (true, ..) => {
+                    return Err(DispatchError::Hip(
+                        "sealed moe: fused shared activation has no shared views".into(),
+                    ))
+                }
+                _ => None,
+            };
+            hip!(gpu.silu_mul_bf16_rt_rotate_x_mq_128_v2_shared(
                 &gate_batch,
                 &up_batch,
                 &rot_batch,
                 p.mi,
-                p.k
+                p.k,
+                shared.as_ref().map(|(g, u, out, sel)| (*g, *u, out, sel)),
             ))?;
         } else {
             hip!(gpu.silu_mul_f32(&gate_batch, &up_batch, &rot_batch))?;

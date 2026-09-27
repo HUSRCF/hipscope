@@ -846,6 +846,7 @@ impl<'a> SealedMoeOp<'a> {
                 params,
                 selection.resolution,
                 selection.route,
+                self.state.shared_views().ok(),
             );
         }
         let (params, selection) = self.state.prefill_parts()?;
