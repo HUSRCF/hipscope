@@ -74,6 +74,9 @@ fn projection_weight_dtype(dtype: DType) -> bool {
             | DType::MQ4G256V2
             | DType::MQ4G128V2
             | DType::MQ6G256V2
+            | DType::MQ5G256V2
+            | DType::MQ3G256V2
+            | DType::MQ2G256V2
             | DType::MFP4G32E8SOA
     )
 }
@@ -244,7 +247,12 @@ enum RotationBasis {
 
 fn rotation_basis(dtype: DType) -> Option<RotationBasis> {
     match dtype {
-        DType::MQ4G256V2 | DType::MQ6G256V2 | DType::MFP4G32E8SOA => Some(RotationBasis::Aligned256),
+        DType::MQ4G256V2
+        | DType::MQ6G256V2
+        | DType::MQ5G256V2
+        | DType::MQ3G256V2
+        | DType::MQ2G256V2
+        | DType::MFP4G32E8SOA => Some(RotationBasis::Aligned256),
         DType::MQ4G128V2 => Some(RotationBasis::RowLocal128),
         _ => None,
     }
@@ -325,6 +333,18 @@ fn project_rotated(
         (DType::MQ6G256V2, false) => gpu.gemv_mq6g256v2(weight.buf, x, output, weight.m, weight.k),
         (DType::MQ6G256V2, true) => {
             gpu.gemm_mq6g256v2(weight.buf, x, output, weight.m, weight.k, rows)
+        }
+        (DType::MQ5G256V2, false) => gpu.gemv_mq5g256v2(weight.buf, x, output, weight.m, weight.k),
+        (DType::MQ5G256V2, true) => {
+            gpu.gemm_mq5g256v2(weight.buf, x, output, weight.m, weight.k, rows)
+        }
+        (DType::MQ3G256V2, false) => gpu.gemv_mq3g256v2(weight.buf, x, output, weight.m, weight.k),
+        (DType::MQ3G256V2, true) => {
+            gpu.gemm_mq3g256v2(weight.buf, x, output, weight.m, weight.k, rows)
+        }
+        (DType::MQ2G256V2, false) => gpu.gemv_mq2g256v2(weight.buf, x, output, weight.m, weight.k),
+        (DType::MQ2G256V2, true) => {
+            gpu.gemm_mq2g256v2(weight.buf, x, output, weight.m, weight.k, rows)
         }
         (DType::Q8_0, false) => gpu.gemv_q8_0(weight.buf, x, output, weight.m, weight.k),
         // `gemm_q8_0_batched` is capped at MAX_BATCH=64 (it asserts), so a

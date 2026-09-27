@@ -5137,6 +5137,7 @@ pub const GEMM_Q8_0_BATCHED_WIDE_EXACT_SRC: &str =
     include_str!("../../../kernels/src/gemm_q8_0_batched_wide_exact.hip");
 
 pub const GEMV_Q8_0_SRC: &str = include_str!("../../../kernels/src/gemv_q8_0.hip");
+pub const REQUANT_G256_SRC: &str = include_str!("../../../kernels/src/requant_g256.hip");
 
 /// Batched Q8_0 GEMM. Same per-row math as gemv_q8_0 but holds MAX_BATCH
 /// per-row accumulators in registers, broadcasting each weight load across

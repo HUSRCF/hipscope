@@ -242,6 +242,9 @@ impl Qwen4Bundle {
             ));
         }
         let max_chunk = max_chunk.min(QWEN4_PREFILL_CHUNK_CAP);
+        self.weights
+            .requant_from_env(gpu)
+            .map_err(BundleError::Forward)?;
         let forward = Qwen4GpuForward::new(gpu, self, max_chunk)
             .map_err(|error| BundleError::Forward(error.to_string()))?;
         let logits_len = max_chunk

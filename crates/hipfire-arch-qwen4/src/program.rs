@@ -398,6 +398,9 @@ pub fn validate_lm_head(
         | DType::MQ4G256V2
         | DType::MQ4G128V2
         | DType::MQ6G256V2
+        | DType::MQ5G256V2
+        | DType::MQ3G256V2
+        | DType::MQ2G256V2
         | DType::MFP4G32E8SOA => require_weight(weight, weight.m, weight.k, "LM-head weight")?,
         DType::F32 => {
             require_dense_weight(weight, weight.m, weight.k, DType::F32, "LM-head weight")?
@@ -564,6 +567,9 @@ fn require_projection_weight(
         DType::MQ4G256V2
         | DType::MQ4G128V2
         | DType::MQ6G256V2
+        | DType::MQ5G256V2
+        | DType::MQ3G256V2
+        | DType::MQ2G256V2
         | DType::MFP4G32E8SOA
         | DType::Q8_0 => Ok(()),
         dtype => Err(DispatchError::Hip(format!(

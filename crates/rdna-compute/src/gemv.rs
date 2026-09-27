@@ -14529,6 +14529,80 @@ impl Gpu {
         }
     }
 
+    /// Requantize a row-major `[m, k]` weight into an MQ{2,3,4,5,6}G256V2
+    /// tensor (load-time precision experiments). BF16 / Q8_0 sources are
+    /// rotated into the MQ G256 basis; MQ G256 V2 sources already live in it
+    /// and are repacked from their dequantized values. `k % 256 == 0`.
+    pub fn requant_g256(
+        &mut self,
+        weight: &GpuTensor,
+        m: usize,
+        k: usize,
+        target: DType,
+    ) -> HipResult<GpuTensor> {
+        let bad = |what: &str| Err(hip_bridge::HipError::new(1, &format!("requant_g256: {what}")));
+        let mq_bits = |dtype: DType| match dtype {
+            DType::MQ2G256V2 => Some(2),
+            DType::MQ3G256V2 => Some(3),
+            DType::MQ4G256V2 => Some(4),
+            DType::MQ5G256V2 => Some(5),
+            DType::MQ6G256V2 => Some(6),
+            _ => None,
+        };
+        let Some(bits) = mq_bits(target) else {
+            return bad("target must be an MQ G256 V2 format");
+        };
+        let (unpack, source_bits, rotate) = match weight.dtype {
+            DType::BF16 => ("requant_bf16_to_f32", 0, true),
+            DType::Q8_0 => ("requant_q8_0_to_f32", 0, true),
+            dtype => match mq_bits(dtype) {
+                Some(source_bits) => ("requant_mqg256v2_to_f32", source_bits, false),
+                None => return bad("source must be BF16, Q8_0 or an MQ G256 V2 format"),
+            },
+        };
+        if m == 0 || !k.is_multiple_of(256) {
+            return bad("needs m > 0 and K % 256 == 0");
+        }
+        self.bind_thread()?;
+        let n = m * k;
+        let values = self.alloc_tensor(&[n], DType::F32)?;
+        let out = self.alloc_tensor(&[n / 256 * (8 + 32 * bits as usize)], target)?;
+        let run = |gpu: &mut Self, func: &str, src: &GpuTensor, dst: &GpuTensor, count: usize, bits: i32| {
+            gpu.ensure_kernel("requant_g256", kernels::REQUANT_G256_SRC, func)?;
+            let (s, d, c) = (src.buf.as_ptr(), dst.buf.as_ptr(), count as i64);
+            let mut params: Vec<*mut c_void> = vec![
+                &s as *const _ as *mut c_void,
+                &d as *const _ as *mut c_void,
+                &c as *const _ as *mut c_void,
+                &bits as *const _ as *mut c_void,
+            ];
+            gpu.launch_maybe_blob(func, [count.div_ceil(64) as u32, 1, 1], [64, 1, 1], 0, &mut params, || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(s);
+                b.push_ptr(d);
+                b.push_u64(c as u64);
+                b.push_i32(bits);
+                b
+            })
+        };
+        let result = (|| {
+            run(self, unpack, weight, &values, n, source_bits)?;
+            if rotate {
+                self.rotate_x_mq_batched(&values, &values, k, m)?;
+            }
+            run(self, "requant_pack_mqg256v2", &values, &out, n / 128, bits)?;
+            self.hip.device_synchronize()
+        })();
+        let freed = self.free_tensor(values);
+        match result.and(freed) {
+            Ok(()) => Ok(out),
+            Err(error) => {
+                let _ = self.free_tensor(out);
+                Err(error)
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn launch_gemv_split(
         &mut self,
