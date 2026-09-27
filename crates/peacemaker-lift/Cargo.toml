@@ -11,6 +11,7 @@ smallvec = "1"
 rmpv = "1"
 thiserror.workspace = true
 sha2 = "0.10"
+serde_json.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

@@ -2422,6 +2422,7 @@ dependencies = [
  "peacemaker-ir",
  "proptest",
  "rmpv",
+ "serde_json",
  "sha2",
  "smallvec",
  "thiserror 2.0.18",
