@@ -6877,9 +6877,10 @@ fn gdn_out_reader(
     }
 }
 
-/// Storage of the gfx1201 GDN chunk-scan `out` plane for this LA layer: the
-/// route default of its producer (FP8-stream and A4 IU4: bf16), overridable
-/// by `HIPFIRE_GDN_SCAN_OUT`; f32 for every producer without an `_xbf16` twin.
+/// Storage of the gfx1201 GDN chunk-scan `out` plane for this LA layer, by the
+/// producer that reads it (overridable by `HIPFIRE_GDN_SCAN_OUT`): A4 IU4
+/// default bf16 (pp8192 faster in both orders); FP8-stream default f32 (its
+/// bf16 twin measured slower end to end); f32 for producers without a twin.
 fn gdn_scan_out_fmt(
     gpu: &Gpu,
     layer: &DeltaNetLayerWeights,
@@ -6890,7 +6891,7 @@ fn gdn_scan_out_fmt(
     fusion: DflashFusionCtx,
 ) -> HipResult<GdnScanOut> {
     match gdn_out_reader(gpu, layer, config, n, n_v_heads, epilogue, fusion) {
-        GdnOutReader::Fp8Stream => gpu.gdn_scan_out(GdnScanOut::Bf16),
+        GdnOutReader::Fp8Stream => gpu.gdn_scan_out(GdnScanOut::F32),
         GdnOutReader::Gfx12Iu4 => gpu.gdn_scan_out(GdnScanOut::Bf16),
         GdnOutReader::F32Only => Ok(GdnScanOut::F32),
     }
