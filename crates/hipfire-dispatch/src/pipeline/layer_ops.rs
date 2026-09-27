@@ -22,12 +22,13 @@ use rdna_compute::tensor_ops::{
     gated_delta_step_gate_wmma, hc_activation_fused_f32, hc_state_bf16_add_f32,
     hc_state_bf16_to_f32, hyper_norm, hyper_norm_f16, hyper_norm_gate, hyper_read_projected,
     hyper_read_up_fused, hyper_read_up_wmma, hyper_write, hyper_write_norm, HyperNextGates, indexed_attention_attention_batch,
-    indexed_attention_cache_append_batch, indexed_attention_norm_rope_batch,
+    indexed_attention_cache_append_batch, indexed_attention_decode_prologue,
+    indexed_attention_norm_rope_batch,
     indexed_attention_pool_rope, indexed_attention_select_batch, scale_f32, ArgmaxF32,
     Bf16Roundtrip, GatedDeltaConv, GatedDeltaConvBatched, GatedDeltaGate, GatedDeltaGateBatched,
     GatedDeltaParams, GatedDeltaParamsBatched, GatedDeltaStep, GatedDeltaStepBatched,
     HcActivationFused, HyperNorm, HyperNormGate, HyperReadProjected, HyperReadUpFused, HyperWrite,
-    IndexedAttentionAttentionBatch, IndexedAttentionCacheAppendBatch,
+    IndexedAttentionAttentionBatch, IndexedAttentionCacheAppendBatch, IndexedAttentionDecodePrologue,
     IndexedAttentionNormRopeBatch, IndexedAttentionPoolRope, IndexedAttentionSelectBatch, ScaleF32,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -1590,86 +1591,113 @@ pub fn execute_indexed_attention(
         ],
     )?;
 
-    hip(indexed_attention_norm_rope_batch(
-        gpu,
-        &IndexedAttentionNormRopeBatch {
-            values: &index_batch,
-            norm: op.indexer_q_norm,
-            rows: op.rows,
-            row_stride: index_width,
-            heads: op.index_heads,
-            head_dim: op.index_dim,
-            head_stride: op.index_dim,
-            position_start: initial_position,
-            rotary_dim: op.index_dim.min(64),
-        },
-    ))?;
-    hip(gpu.bf16_round_trip_f32_strided(
-        &index_batch,
-        op.rows,
-        index_q_width,
-        index_width,
-        index_kv_width,
-    ))?;
-    let index_k_batch = view(
-        &index_batch,
-        index_q_width,
-        op.rows * index_width - index_q_width,
-    );
-    // The destination row offset travels as a scalar (`= position *
-    // index_kv_width`) against the base tensor, and the recorder declares it, so
-    // the tape keeps a position-independent pointer and replay re-derives the
-    // offset for its own position instead of replaying the capture-position row.
-    hip(gpu.copy_rows_strided_f32(
-        &index_k_batch,
-        op.state.raw_index_keys,
-        op.rows,
-        index_kv_width,
-        index_width,
-        index_kv_width,
-        initial_position * index_kv_width,
-        Some(index_kv_width),
-    ))?;
-    hip(indexed_attention_norm_rope_batch(
-        gpu,
-        &IndexedAttentionNormRopeBatch {
-            values: &qgate_batch,
-            norm: op.q_norm,
-            rows: op.rows,
-            row_stride: 2 * q_width,
-            heads: op.heads,
-            head_dim: op.head_dim,
-            head_stride: 2 * op.head_dim,
-            position_start: initial_position,
-            rotary_dim: op.head_dim.min(64),
-        },
-    ))?;
-    hip(indexed_attention_norm_rope_batch(
-        gpu,
-        &IndexedAttentionNormRopeBatch {
-            values: &k_batch,
-            norm: op.k_norm,
-            rows: op.rows,
-            row_stride: kv_width,
-            heads: op.kv_heads,
-            head_dim: op.head_dim,
-            head_stride: op.head_dim,
-            position_start: initial_position,
-            rotary_dim: op.head_dim.min(64),
-        },
-    ))?;
-    hip(indexed_attention_cache_append_batch(
-        gpu,
-        &IndexedAttentionCacheAppendBatch {
-            key: &k_batch,
-            value: &v_batch,
-            full_keys: op.state.full_keys,
-            full_values: op.state.full_values,
-            rows: op.rows,
-            position_start: initial_position,
-            kv_width,
-        },
-    ))?;
+    if op.rows == 1 && op.index_dim <= 256 && op.head_dim <= 256 {
+        // Decode: the norms, RoPE, cache append and index-key round trip and
+        // copy below, in one launch.
+        hip(indexed_attention_decode_prologue(
+            gpu,
+            &IndexedAttentionDecodePrologue {
+                index_row: &index_batch,
+                qgate: &qgate_batch,
+                keys: &k_batch,
+                values: &v_batch,
+                full_keys: op.state.full_keys,
+                full_values: op.state.full_values,
+                raw_index_keys: op.state.raw_index_keys,
+                index_q_norm: op.indexer_q_norm,
+                q_norm: op.q_norm,
+                k_norm: op.k_norm,
+                index_heads: op.index_heads,
+                index_dim: op.index_dim,
+                index_kv_width,
+                heads: op.heads,
+                kv_heads: op.kv_heads,
+                head_dim: op.head_dim,
+                position: initial_position,
+            },
+        ))?;
+    } else {
+        hip(indexed_attention_norm_rope_batch(
+            gpu,
+            &IndexedAttentionNormRopeBatch {
+                values: &index_batch,
+                norm: op.indexer_q_norm,
+                rows: op.rows,
+                row_stride: index_width,
+                heads: op.index_heads,
+                head_dim: op.index_dim,
+                head_stride: op.index_dim,
+                position_start: initial_position,
+                rotary_dim: op.index_dim.min(64),
+            },
+        ))?;
+        hip(gpu.bf16_round_trip_f32_strided(
+            &index_batch,
+            op.rows,
+            index_q_width,
+            index_width,
+            index_kv_width,
+        ))?;
+        let index_k_batch = view(
+            &index_batch,
+            index_q_width,
+            op.rows * index_width - index_q_width,
+        );
+        // The destination row offset travels as a scalar (`= position *
+        // index_kv_width`) against the base tensor, and the recorder declares it, so
+        // the tape keeps a position-independent pointer and replay re-derives the
+        // offset for its own position instead of replaying the capture-position row.
+        hip(gpu.copy_rows_strided_f32(
+            &index_k_batch,
+            op.state.raw_index_keys,
+            op.rows,
+            index_kv_width,
+            index_width,
+            index_kv_width,
+            initial_position * index_kv_width,
+            Some(index_kv_width),
+        ))?;
+        hip(indexed_attention_norm_rope_batch(
+            gpu,
+            &IndexedAttentionNormRopeBatch {
+                values: &qgate_batch,
+                norm: op.q_norm,
+                rows: op.rows,
+                row_stride: 2 * q_width,
+                heads: op.heads,
+                head_dim: op.head_dim,
+                head_stride: 2 * op.head_dim,
+                position_start: initial_position,
+                rotary_dim: op.head_dim.min(64),
+            },
+        ))?;
+        hip(indexed_attention_norm_rope_batch(
+            gpu,
+            &IndexedAttentionNormRopeBatch {
+                values: &k_batch,
+                norm: op.k_norm,
+                rows: op.rows,
+                row_stride: kv_width,
+                heads: op.kv_heads,
+                head_dim: op.head_dim,
+                head_stride: op.head_dim,
+                position_start: initial_position,
+                rotary_dim: op.head_dim.min(64),
+            },
+        ))?;
+        hip(indexed_attention_cache_append_batch(
+            gpu,
+            &IndexedAttentionCacheAppendBatch {
+                key: &k_batch,
+                value: &v_batch,
+                full_keys: op.state.full_keys,
+                full_values: op.state.full_values,
+                rows: op.rows,
+                position_start: initial_position,
+                kv_width,
+            },
+        ))?;
+    }
 
     // Every QSA launch declares a position-independent shape: the pool grid and
     // both dynamic-LDS reservations come from the declared capacities while the

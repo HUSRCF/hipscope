@@ -1514,6 +1514,53 @@ extern "C" __global__ void indexed_attention_norm_rope_f32(
     values[start + channel] = value;
 }
  
+// One head's RMSNorm + HalfSplit RoPE at `position` (block 256, one channel
+// per thread; returns the channel's value, `head_dim` <= 256). Every block
+// thread must call it (it synchronizes).
+static __device__ __forceinline__ float qsa_norm_rope_head(
+    const float* head_values,
+    const __hip_bfloat16* norm,
+    int head_dim,
+    int position,
+    int rotary_dim,
+    float* input_row,
+    float* row_sum) {
+    const int channel = (int)threadIdx.x;
+    if (channel < head_dim) {
+        input_row[channel] = head_values[channel];
+    }
+    __syncthreads();
+    // One wave runs the serial i-order sum (identical in every lane) instead
+    // of every wave repeating it.
+    if (threadIdx.x < 32) {
+        float sum = 0.0f;
+        for (int i = 0; i < head_dim; ++i) {
+            float row_value = input_row[i];
+            sum += row_value * row_value;
+        }
+        if (threadIdx.x == 0) *row_sum = sum;
+    }
+    __syncthreads();
+    if (channel >= head_dim) return 0.0f;
+    float inv = rsqrtf(*row_sum / (float)head_dim + 1.0e-6f);
+    float value = input_row[channel] * inv
+        * (1.0f + bf16_to_f32(norm[channel]));
+    if (channel < rotary_dim) {
+        int half = rotary_dim / 2;
+        int partner = channel < half ? channel + half : channel - half;
+        float other = input_row[partner] * inv
+            * (1.0f + bf16_to_f32(norm[partner]));
+        int base = channel < half ? channel : partner;
+        float angle = (float)position
+            * powf(10000000.0f, -((float)(2 * base)) / (float)rotary_dim);
+        float sine = sinf(angle);
+        float cosine = cosf(angle);
+        value = channel < half ? value * cosine - other * sine
+            : other * sine + value * cosine;
+    }
+    return value;
+}
+
 extern "C" __global__ void indexed_attention_norm_rope_f32_batched(
     float* values,
     const __hip_bfloat16* norm,
@@ -1526,44 +1573,82 @@ extern "C" __global__ void indexed_attention_norm_rope_f32_batched(
     int rotary_dim) {
     int row = (int)blockIdx.z;
     int head = (int)blockIdx.x;
-    int channel = (int)(blockIdx.y * blockDim.x + threadIdx.x);
-    if (row >= rows || head >= heads) return;
+    if (row >= rows || head >= heads || blockIdx.y != 0) return;
     int start = row * row_stride + head * head_stride;
     __shared__ float input_row[256];
     __shared__ float row_sum;
-    if (channel < head_dim) {
-        input_row[channel] = values[start + channel];
+    const float value = qsa_norm_rope_head(values + start, norm, head_dim, position_start + row,
+                                           rotary_dim, input_row, &row_sum);
+    if ((int)threadIdx.x < head_dim) values[start + threadIdx.x] = value;
+}
+
+// Single-row decode QSA prologue in one launch (block 256, one block per
+// head): the index-query, query and key RMSNorm + RoPE (the three
+// indexed_attention_norm_rope_f32_batched launches), the key/value cache
+// append at `position`, and the index key's BF16 round trip and raw-key copy
+// (bf16_round_trip_f32_strided + copy_rows_strided_f32). Same per-element
+// operations. Grid [index_heads + heads + kv_heads + 1].
+extern "C" __global__ __launch_bounds__(256) void indexed_attention_decode_prologue_f32(
+    float* index_row,
+    float* qgate,
+    float* keys,
+    const float* values,
+    float* full_keys,
+    float* full_values,
+    float* raw_index_keys,
+    const __hip_bfloat16* index_q_norm,
+    const __hip_bfloat16* q_norm,
+    const __hip_bfloat16* k_norm,
+    int index_heads,
+    int index_dim,
+    int index_kv_width,
+    int heads,
+    int kv_heads,
+    int head_dim,
+    int position) {
+    __shared__ float input_row[256];
+    __shared__ float row_sum;
+    const int c = (int)threadIdx.x;
+    int block = (int)blockIdx.x;
+    if (block < index_heads) {
+        float* row = index_row + block * index_dim;
+        const float value = qsa_norm_rope_head(row, index_q_norm, index_dim, position,
+                                               min(index_dim, 64), input_row, &row_sum);
+        if (c < index_dim) row[c] = value;
+        return;
     }
-    __syncthreads();
-    // One wave runs the serial i-order sum (identical in every lane) instead
-    // of every wave repeating it.
-    if (threadIdx.x < 32) {
-        float sum = 0.0f;
-        for (int i = 0; i < head_dim; ++i) {
-            float row_value = input_row[i];
-            sum += row_value * row_value;
+    block -= index_heads;
+    if (block < heads) {
+        float* row = qgate + block * 2 * head_dim;
+        const float value = qsa_norm_rope_head(row, q_norm, head_dim, position,
+                                               min(head_dim, 64), input_row, &row_sum);
+        if (c < head_dim) row[c] = value;
+        return;
+    }
+    block -= heads;
+    const int kv_width = kv_heads * head_dim;
+    if (block < kv_heads) {
+        float* row = keys + block * head_dim;
+        const float value = qsa_norm_rope_head(row, k_norm, head_dim, position,
+                                               min(head_dim, 64), input_row, &row_sum);
+        if (c < head_dim) {
+            const int channel = block * head_dim + c;
+            row[c] = value;
+            full_keys[position * kv_width + channel] = value;
+            full_values[position * kv_width + channel] = values[channel];
         }
-        if (threadIdx.x == 0) row_sum = sum;
+        return;
     }
-    __syncthreads();
-    if (channel >= head_dim) return;
-    float inv = rsqrtf(row_sum / (float)head_dim + 1.0e-6f);
-    float value = input_row[channel] * inv
-        * (1.0f + bf16_to_f32(norm[channel]));
-    if (channel < rotary_dim) {
-        int half = rotary_dim / 2;
-        int partner = channel < half ? channel + half : channel - half;
-        float other = input_row[partner] * inv
-            * (1.0f + bf16_to_f32(norm[partner]));
-        int base = channel < half ? channel : partner;
-        float angle = (float)(position_start + row)
-            * powf(10000000.0f, -((float)(2 * base)) / (float)rotary_dim);
-        float sine = sinf(angle);
-        float cosine = cosf(angle);
-        value = channel < half ? value * cosine - other * sine
-            : other * sine + value * cosine;
+    const int index_q_width = index_heads * index_dim;
+    for (int i = c; i < index_kv_width; i += 256) {
+        float v = index_row[index_q_width + i];
+        if (isfinite(v)) {
+            v = __uint_as_float((__float_as_uint(v) + 0x7FFFu + ((__float_as_uint(v) >> 16) & 1u))
+                                & 0xFFFF0000u);
+            index_row[index_q_width + i] = v;
+        }
+        raw_index_keys[position * index_kv_width + i] = v;
     }
-    values[start + channel] = value;
 }
  
 

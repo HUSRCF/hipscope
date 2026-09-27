@@ -1691,6 +1691,127 @@ pub struct IndexedAttentionNormRopeBatch<'a> {
     pub rotary_dim: usize,
 }
 
+/// Single-row decode QSA prologue: the index-query, query and key norm+RoPE,
+/// the key/value cache append and the index key's BF16 round trip + raw-key
+/// copy, in one launch (bitwise the six launches it replaces).
+pub struct IndexedAttentionDecodePrologue<'a> {
+    /// `[index q (index_heads * index_dim) | index k (index_kv_width)]`.
+    pub index_row: &'a GpuTensor,
+    /// `[heads, 2 * head_dim]` query + gate.
+    pub qgate: &'a GpuTensor,
+    pub keys: &'a GpuTensor,
+    pub values: &'a GpuTensor,
+    pub full_keys: &'a GpuTensor,
+    pub full_values: &'a GpuTensor,
+    pub raw_index_keys: &'a GpuTensor,
+    pub index_q_norm: &'a GpuTensor,
+    pub q_norm: &'a GpuTensor,
+    pub k_norm: &'a GpuTensor,
+    pub index_heads: usize,
+    pub index_dim: usize,
+    pub index_kv_width: usize,
+    pub heads: usize,
+    pub kv_heads: usize,
+    pub head_dim: usize,
+    pub position: usize,
+}
+
+pub fn indexed_attention_decode_prologue(
+    gpu: &mut Gpu,
+    p: &IndexedAttentionDecodePrologue<'_>,
+) -> HipResult<()> {
+    for tensor in [
+        p.index_row,
+        p.qgate,
+        p.keys,
+        p.values,
+        p.full_keys,
+        p.full_values,
+        p.raw_index_keys,
+    ] {
+        ensure_f32(tensor)?;
+    }
+    let kv_width = checked_product(p.kv_heads, p.head_dim, "QSA prologue KV width")?;
+    let end = checked_add(p.position, 1, "QSA prologue position")?;
+    let bad = [p.index_q_norm, p.q_norm, p.k_norm].iter().any(|n| n.dtype != DType::BF16)
+        || p.index_heads == 0
+        || p.heads == 0
+        || p.kv_heads == 0
+        || p.index_dim == 0
+        || p.index_dim > 256
+        || p.head_dim == 0
+        || p.head_dim > 256
+        || p.index_q_norm.numel() != p.index_dim
+        || p.q_norm.numel() != p.head_dim
+        || p.k_norm.numel() != p.head_dim
+        || p.index_row.numel()
+            < checked_product(p.index_heads, p.index_dim, "QSA prologue index")? + p.index_kv_width
+        || p.qgate.numel() < checked_product(2 * p.heads, p.head_dim, "QSA prologue query")?
+        || p.keys.numel() < kv_width
+        || p.values.numel() < kv_width
+        || p.full_keys.numel() < checked_product(end, kv_width, "QSA prologue cache")?
+        || p.full_values.numel() < checked_product(end, kv_width, "QSA prologue cache")?
+        || p.raw_index_keys.numel()
+            < checked_product(end, p.index_kv_width, "QSA prologue raw keys")?;
+    if bad {
+        return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
+    }
+    let blocks_x = checked_u32(
+        p.index_heads + p.heads + p.kv_heads + 1,
+        "QSA prologue block count",
+    )?;
+    gpu.ensure_kernel_public(
+        "tensor_ops",
+        TENSOR_OPS_SRC,
+        "indexed_attention_decode_prologue_f32",
+    )?;
+    let mut args = KernargBlob::new();
+    for tensor in [
+        p.index_row,
+        p.qgate,
+        p.keys,
+        p.values,
+        p.full_keys,
+        p.full_values,
+        p.raw_index_keys,
+        p.index_q_norm,
+        p.q_norm,
+        p.k_norm,
+    ] {
+        args.push_ptr(tensor.buf.as_ptr());
+    }
+    for (value, label) in [
+        (p.index_heads, "QSA prologue index heads"),
+        (p.index_dim, "QSA prologue index width"),
+        (p.index_kv_width, "QSA prologue index KV width"),
+        (p.heads, "QSA prologue heads"),
+        (p.kv_heads, "QSA prologue KV heads"),
+        (p.head_dim, "QSA prologue head width"),
+    ] {
+        args.push_i32(checked_i32(value, label)?);
+    }
+    args.push_i32(checked_i32(p.position, "QSA prologue position")?);
+    // Declared dynamic field: replay re-derives the position (angles and
+    // both cache rows follow it).
+    let position_offset = args.len() - 4;
+    args.pad_to(16);
+    let position_binding = [crate::replay::ReplayKernargBinding::PositionPlusU32 {
+        offset: position_offset,
+        addend: 0,
+    }];
+    gpu.launch_blob_recorded(
+        "indexed_attention_decode_prologue_f32",
+        [blocks_x, 1, 1],
+        [256, 1, 1],
+        0,
+        args.as_mut_slice(),
+        crate::dispatch::ReplayLaunchBindings {
+            grid: None,
+            kernargs: &position_binding,
+        },
+    )
+}
+
 pub fn indexed_attention_norm_rope_batch(
     gpu: &mut Gpu,
     p: &IndexedAttentionNormRopeBatch<'_>,
