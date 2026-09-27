@@ -47,6 +47,8 @@ pub enum WaitError {
     UnsupportedArch(Arch),
     #[error("layout refers to a tombstoned or missing instruction")]
     DanglingInst { id: InstId },
+    #[error("wait replay did not reach a fixpoint within {walks} block walks")]
+    NoFixpoint { walks: usize },
 }
 
 /// Census of wait instructions by opcode, for T6.
@@ -577,71 +579,7 @@ pub fn replay(body: &Body, arch: Arch) -> Result<WaitReplay, WaitError> {
         }
     }
     let ranges = ranges_of(body);
-    // Fixpoint over entry states (dry runs, no recording).
-    let mut entries: HashMap<BlockId, WaitState> = HashMap::new();
-    for (id, _, _) in &ranges {
-        entries.insert(*id, WaitState::default());
-    }
-    let mut scratch_events = EventTable { ids: HashMap::new(), events: Vec::new(), next: 0 };
-    // True fall-through edges: p -> b iff p ends where b begins and p's
-    // last instruction can fall through. C4 `preds` conflate these with
-    // mid-block conditional-branch targets, which the walk reports as
-    // branch exits instead.
-    let mut fall_in: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
-    for (id, range, _) in &ranges {
-        let Some((next, _, _)) = ranges.iter().find(|(_, other, _)| other.0 == range.1) else {
-            continue;
-        };
-        let falls = match range.0 == range.1 {
-            true => false,
-            false => match body.insts.get(body.layout[range.1 - 1]) {
-                Some(last) => !matches!(
-                    last.effects.control,
-                    Control::Jump | Control::EndPgm
-                ),
-                None => false,
-            },
-        };
-        if falls {
-            fall_in.entry(*next).or_default().push(*id);
-        }
-    }
-    for _ in 0..1000 {
-        // Fresh exits from the current entries.
-        let mut exits: HashMap<BlockId, BlockExits> = HashMap::new();
-        for (id, range, _) in &ranges {
-            let entry = entries.get(id).cloned().unwrap_or_default();
-            exits.insert(*id, walk_block(body, arch, *range, &entry, &mut scratch_events, None)?);
-        }
-        let mut changed = false;
-        for (id, _, _) in &ranges {
-            let mut joined: Option<WaitState> = None;
-            let mut merge = |state: &WaitState| {
-                joined = Some(match joined.take() {
-                    None => state.clone(),
-                    Some(prior) => join_states(&prior, state),
-                });
-            };
-            for pred in fall_in.get(id).cloned().unwrap_or_default() {
-                merge(&exits[&pred].fall);
-            }
-            for exit in exits.values() {
-                for (target, state) in &exit.branches {
-                    if target == id {
-                        merge(state);
-                    }
-                }
-            }
-            let joined = joined.unwrap_or_default();
-            if entries.get(id) != Some(&joined) {
-                entries.insert(*id, joined);
-                changed = true;
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
+    let entries = fixpoint(body, arch, &ranges)?;
     // Final recording pass in layout order.
     let mut events = EventTable { ids: HashMap::new(), events: Vec::new(), next: 0 };
     let mut recorder = Recorder {
@@ -649,9 +587,8 @@ pub fn replay(body: &Body, arch: Arch) -> Result<WaitReplay, WaitError> {
         obligations: Vec::new(),
         before: HashMap::new(),
     };
-    for (id, range, _) in &ranges {
-        let entry = entries.get(id).cloned().unwrap_or_default();
-        walk_block(body, arch, *range, &entry, &mut events, Some(&mut recorder))?;
+    for ((_, range, _), entry) in ranges.iter().zip(&entries) {
+        walk_block(body, arch, *range, entry, &mut events, Some(&mut recorder))?;
     }
     Ok(WaitReplay {
         events: events.events,
@@ -659,6 +596,67 @@ pub fn replay(body: &Body, arch: Arch) -> Result<WaitReplay, WaitError> {
         obligations: recorder.obligations,
         before: recorder.before,
     })
+}
+
+/// Block entry states: the least fixpoint of "entry = join of the incoming
+/// exits" from empty states, solved with a worklist so a block is re-walked
+/// only when its entry changes and a changed exit only revisits its own
+/// successors. Each block's exit edges (fall-through, and every mid-block
+/// branch the walk reaches) do not depend on the entry state, so the edge
+/// lists come from the first walk.
+fn fixpoint(body: &Body, arch: Arch, ranges: &[(BlockId, (usize, usize), Vec<BlockId>)]) -> Result<Vec<WaitState>, WaitError> {
+    let count = ranges.len();
+    let index: HashMap<BlockId, usize> = ranges.iter().enumerate().map(|(i, (id, _, _))| (*id, i)).collect();
+    let mut first_at: HashMap<usize, usize> = HashMap::new();
+    for (i, (_, range, _)) in ranges.iter().enumerate() {
+        first_at.entry(range.0).or_insert(i);
+    }
+    let mut scratch_events = EventTable { ids: HashMap::new(), events: Vec::new(), next: 0 };
+    let mut entries = vec![WaitState::default(); count];
+    let mut exits = Vec::with_capacity(count);
+    for (_, range, _) in ranges {
+        exits.push(walk_block(body, arch, *range, &WaitState::default(), &mut scratch_events, None)?);
+    }
+    // Incoming edges per block: true fall-through first (p ends where b
+    // begins and p's last instruction can fall through; C4 `preds`
+    // conflate these with mid-block conditional-branch targets, which the
+    // walk reports as branch exits instead), then branch exits.
+    let mut incoming: Vec<Vec<(usize, Option<usize>)>> = vec![Vec::new(); count];
+    let mut succs: Vec<Vec<usize>> = vec![Vec::new(); count];
+    for (p, (_, range, _)) in ranges.iter().enumerate() {
+        let falls = range.0 != range.1 && body.insts.get(body.layout[range.1 - 1])
+            .is_some_and(|last| !matches!(last.effects.control, Control::Jump | Control::EndPgm));
+        if let (true, Some(&b)) = (falls, first_at.get(&range.1)) {
+            incoming[b].push((p, None));
+            succs[p].push(b);
+        }
+    }
+    for (p, exit) in exits.iter().enumerate() {
+        for (k, (target, _)) in exit.branches.iter().enumerate() {
+            if let Some(&b) = index.get(target) {
+                incoming[b].push((p, Some(k)));
+                if !succs[p].contains(&b) { succs[p].push(b); }
+            }
+        }
+    }
+    let mut work: std::collections::BTreeSet<usize> = (0..count).collect();
+    let budget = count.saturating_mul(1000).max(1000);
+    let mut walks = 0usize;
+    while let Some(b) = work.pop_first() {
+        let mut joined: Option<WaitState> = None;
+        for &(p, edge) in &incoming[b] {
+            let state = match edge { None => &exits[p].fall, Some(k) => &exits[p].branches[k].1 };
+            joined = Some(match joined { None => state.clone(), Some(prior) => join_states(&prior, state) });
+        }
+        let joined = joined.unwrap_or_default();
+        if joined == entries[b] { continue; }
+        walks += 1;
+        if walks > budget { return Err(WaitError::NoFixpoint { walks }); }
+        exits[b] = walk_block(body, arch, ranges[b].1, &joined, &mut scratch_events, None)?;
+        entries[b] = joined;
+        work.extend(succs[b].iter().copied());
+    }
+    Ok(entries)
 }
 
 /// Count wait instructions by opcode for T6.
@@ -1131,5 +1129,24 @@ mod c5_tests {
             }
         }
         assert!(produced, "kmcnt 0x0 -> 0x1 must strand an s_load destination");
+    }
+
+    /// A pending load reaches its consumer across any number of blocks. The
+    /// entry fixpoint used to re-walk every block per round with a
+    /// 1000-round cap, so state advanced one block per round: this chain
+    /// was never reached (and a 4485-block kernel took hours).
+    #[test]
+    fn pending_load_crosses_a_long_block_chain() {
+        let mut insts = vec![buffer_load(0, 8)];
+        insts.extend((0..1500).map(|_| mi("s_cbranch_scc0", vec![sopp(0)])));
+        insts.push(vadd(2, 0, 3));
+        insts.push(mi("s_endpgm", vec![]));
+        let mut body = body_of(insts);
+        build_blocks(&mut body).unwrap();
+        assert!(body.blocks.len() > 1500);
+        let consumer = body.layout[body.layout.len() - 2];
+        let replay = replay(&body, Arch::Gfx1201).unwrap();
+        assert!(replay.obligations.iter().any(|o| o.rule_id == "wait-raw-vmem-load" && o.insts == [consumer]),
+            "{:?}", replay.obligations);
     }
 }
