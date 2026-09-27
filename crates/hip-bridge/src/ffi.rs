@@ -278,6 +278,7 @@ pub struct HipRuntime {
 
     // Streams
     fn_stream_create: unsafe extern "C" fn(*mut HipStream) -> u32,
+    fn_stream_create_with_flags: unsafe extern "C" fn(*mut HipStream, c_uint) -> u32,
     fn_stream_synchronize: unsafe extern "C" fn(HipStream) -> u32,
     fn_stream_destroy: unsafe extern "C" fn(HipStream) -> u32,
 
@@ -560,6 +561,11 @@ impl HipRuntime {
                     lib,
                     "hipStreamCreate",
                     unsafe extern "C" fn(*mut HipStream) -> u32
+                ),
+                fn_stream_create_with_flags: load_fn!(
+                    lib,
+                    "hipStreamCreateWithFlags",
+                    unsafe extern "C" fn(*mut HipStream, c_uint) -> u32
                 ),
                 fn_stream_synchronize: load_fn!(
                     lib,
@@ -1333,6 +1339,15 @@ impl HipRuntime {
         Ok(Stream(stream))
     }
 
+    /// A stream that does not synchronize with the legacy null stream
+    /// (`hipStreamNonBlocking`).
+    pub fn stream_create_non_blocking(&self) -> HipResult<Stream> {
+        let mut stream: HipStream = ptr::null_mut();
+        let code = unsafe { (self.fn_stream_create_with_flags)(&mut stream, 0x1) };
+        self.check(code, "hipStreamCreateWithFlags")?;
+        Ok(Stream(stream))
+    }
+
     pub fn stream_synchronize(&self, stream: &Stream) -> HipResult<()> {
         let t = std::time::Instant::now();
         let code = unsafe { (self.fn_stream_synchronize)(stream.0) };
@@ -1565,6 +1580,22 @@ impl HipRuntime {
             )
         };
         self.check(code, "hipMemcpyAsync H2D")
+    }
+
+    /// Host-asynchronous H→D copy on the legacy/default stream: `src` must
+    /// stay unchanged until the stream reaches the copy.
+    pub fn memcpy_htod_async_default(&self, dst: &DeviceBuffer, src: &[u8]) -> HipResult<()> {
+        assert!(src.len() <= dst.size);
+        let code = unsafe {
+            (self.fn_memcpy_async)(
+                dst.ptr,
+                src.as_ptr() as *const c_void,
+                src.len(),
+                MemcpyKind::HostToDevice as c_uint,
+                ptr::null_mut(),
+            )
+        };
+        self.check(code, "hipMemcpyAsync H2D default stream")
     }
 
     pub fn memcpy_dtoh_async(

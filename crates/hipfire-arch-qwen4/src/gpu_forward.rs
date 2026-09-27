@@ -1312,7 +1312,16 @@ pub struct Qwen4GpuForward {
     pub scratch: Qwen4GpuForwardScratch,
     host_token_bytes: Vec<u8>,
     host_ple_bytes: Vec<u8>,
+    /// Device-argmax token readback (`forward_token_or_argmax`), once used.
+    token_readback: Option<TokenReadback>,
     moe: Vec<Qwen4MoeLayerRuntime>,
+}
+
+/// An event after a forward's device argmax and a stream independent of the
+/// legacy null stream to read the token id on.
+struct TokenReadback {
+    stream: hip_bridge::Stream,
+    event: hip_bridge::Event,
 }
 
 impl Qwen4GpuForward {
@@ -1346,13 +1355,30 @@ impl Qwen4GpuForward {
             scratch,
             host_token_bytes,
             host_ple_bytes,
+            token_readback: None,
             moe,
         })
     }
 
     pub fn free_gpu(self, gpu: &mut Gpu) -> Result<(), hip_bridge::HipError> {
-        let Qwen4GpuForward { scratch, moe, .. } = self;
+        let Qwen4GpuForward {
+            scratch,
+            moe,
+            token_readback,
+            ..
+        } = self;
         let mut first = scratch.free_gpu(gpu);
+        if let Some(readback) = token_readback {
+            for result in [
+                gpu.hip.stream_synchronize(&readback.stream),
+                gpu.hip.stream_destroy(readback.stream),
+                gpu.hip.event_destroy(readback.event),
+            ] {
+                if let Err(error) = result {
+                    first.get_or_insert(error);
+                }
+            }
+        }
         for layer in moe {
             if let Some(error) = layer.free_gpu(gpu) {
                 if first.is_none() {
@@ -1481,34 +1507,31 @@ impl Qwen4GpuForward {
         )
     }
 
-    /// [`Self::forward_token`] of the token `resolve` returns. It is called
-    /// once the step program is built, before any forward-side effect, so the
-    /// host builds while the GPU still runs the previous token. Returns the
-    /// token.
-    pub fn forward_token_resolved(
+    /// [`Self::forward_token`] of `token`, or (`None`) of the GPU argmax of
+    /// `logits` as the previous forward left them; returns the token. The
+    /// argmax is taken only after this forward's step program is built, and
+    /// on the HIP body it stays on the device until the PLE layer, so neither
+    /// the host build nor the readback leaves the GPU idle.
+    pub fn forward_token_or_argmax(
         &mut self,
         bundle: &mut Qwen4Bundle,
         gpu: &mut Gpu,
-        resolve: &mut dyn FnMut(&mut Gpu) -> Result<u32, String>,
+        token: Option<u32>,
         logits: &GpuTensor,
     ) -> Result<u32, Qwen4GpuForwardError> {
-        let mut token = None;
-        let mut record = |gpu: &mut Gpu| {
-            let resolved = resolve(gpu)?;
-            token = Some(resolved);
-            Ok(resolved)
-        };
+        let placeholder = token.unwrap_or(0);
         self.forward_chunk_inner(
             bundle,
             gpu,
-            &[0],
-            Some(&mut record),
+            std::slice::from_ref(&placeholder),
+            token.is_none().then_some(logits),
             logits,
             None,
             None,
             Qwen4OutputPolicy::Rows(Qwen4OutputRows::Final),
         )?;
-        token.ok_or_else(|| invalid("Qwen4 forward did not resolve its token"))
+        // The forward committed its token as the newest PLE history slot.
+        Ok(bundle.state.ple_history.previous()[1])
     }
 
     /// Run bounded forward tiles, writing all logits rows or only the last.
@@ -1615,14 +1638,14 @@ impl Qwen4GpuForward {
         bundle: &mut Qwen4Bundle,
         gpu: &mut Gpu,
         tokens: &[u32],
-        mut resolve: Option<&mut dyn FnMut(&mut Gpu) -> Result<u32, String>>,
+        argmax_of: Option<&GpuTensor>,
         logits: &GpuTensor,
         top1: Option<&GpuTensor>,
         wide_hidden_capture: Option<&GpuTensor>,
         output_policy: Qwen4OutputPolicy,
     ) -> Result<(), Qwen4GpuForwardError> {
-        if resolve.is_some() && tokens.len() != 1 {
-            return Err(invalid("a resolved Qwen4 forward carries one token"));
+        if argmax_of.is_some() && tokens.len() != 1 {
+            return Err(invalid("an argmax-token Qwen4 forward carries one token"));
         }
         let n = tokens.len();
         if n == 0 || n > self.scratch.max_chunk {
@@ -1643,7 +1666,7 @@ impl Qwen4GpuForward {
                 bundle.state.max_seq_len
             )));
         }
-        if resolve.is_none()
+        if argmax_of.is_none()
             && tokens
                 .iter()
                 .copied()
@@ -1741,7 +1764,7 @@ impl Qwen4GpuForward {
         // program is built below.
         let mut ple = RowFetch::begin(&bundle.ple_rows)
             .map_err(|error| Qwen4GpuForwardError::Ple(error.to_string()))?;
-        if resolve.is_none() {
+        if argmax_of.is_none() {
             ple.prefetch(
                 bundle
                     .state
@@ -2027,49 +2050,83 @@ impl Qwen4GpuForward {
                 ));
             }
         }
-        // A resolved forward takes its token now: the program above is built,
-        // and nothing has touched the device or the state yet.
-        let resolved: [u32; 1];
-        let tokens = match resolve.as_mut() {
-            Some(resolve) => {
-                let token = resolve(gpu).map_err(Qwen4GpuForwardError::Dispatch)?;
+        // A HIP body: no retained tape records or routes this forward.
+        let hip_body =
+            n == 1 && matches!(gpu.replay.state(), ReplayState::Hip | ReplayState::Fallback);
+        // `argmax_of` on a HIP body: the GPU argmax writes the token id and the
+        // host reads it back only at the PLE layer, so the GPU runs this
+        // forward's first layers while the host waits. Otherwise the host
+        // takes the argmax now (the program above is built and nothing has
+        // touched the device or the state yet).
+        let device_token = argmax_of.filter(|_| hip_body);
+        let host_argmax: [u32; 1];
+        let tokens = match argmax_of {
+            Some(previous) if !hip_body => {
+                let token = rdna_compute::tensor_ops::argmax_f32_host(gpu, previous)?;
                 if token as usize >= config.vocab_size {
                     return Err(invalid(
                         "Qwen4 token id is outside the embedding vocabulary",
                     ));
                 }
-                resolved = [token];
+                host_argmax = [token];
                 ple.prefetch(
                     bundle
                         .state
                         .ple_history
-                        .row_ids(&bundle.ple_metadata, &resolved),
+                        .row_ids(&bundle.ple_metadata, &host_argmax),
                 )
                 .map_err(|error| Qwen4GpuForwardError::Ple(error.to_string()))?;
-                &resolved[..]
+                &host_argmax[..]
             }
-            None => tokens,
+            _ => tokens,
         };
-        for (index, token) in tokens.iter().copied().enumerate() {
-            let bytes = &mut self.host_token_bytes[index * 4..index * 4 + 4];
-            bytes.copy_from_slice(&(token as i32).to_ne_bytes());
-        }
-        if n == 1 && matches!(gpu.replay.state(), ReplayState::Hip | ReplayState::Fallback) {
-            // A HIP body (no retained tape records or routes this forward):
-            // the one id is a stream-ordered fill, not a synchronous copy.
-            let active = gpu.active_stream.as_ref();
-            gpu.hip
-                .memset_d32_async(&self.scratch.token_ids.buf, tokens[0] as i32, 1, active)?;
-        } else {
-            gpu.memcpy_htod_auto(
-                &self.scratch.token_ids.buf,
-                &self.host_token_bytes[..n * std::mem::size_of::<i32>()],
+        let ids = view(&self.scratch.token_ids, 0, n * std::mem::size_of::<i32>());
+        if let Some(previous) = device_token {
+            argmax_f32(
+                gpu,
+                &ArgmaxF32 {
+                    logits: previous,
+                    indices: &ids,
+                    rows: 1,
+                    vocab: config.vocab_size,
+                },
             )?;
+            if self.token_readback.is_none() {
+                self.token_readback = Some(TokenReadback {
+                    stream: gpu.hip.stream_create_non_blocking()?,
+                    event: gpu
+                        .hip
+                        .event_create_with_flags(hip_bridge::HIP_EVENT_DISABLE_TIMING)?,
+                });
+            }
+            if let Some(readback) = self.token_readback.as_ref() {
+                gpu.hip
+                    .event_record(&readback.event, gpu.active_stream.as_ref())?;
+            }
+        } else {
+            for (index, token) in tokens.iter().copied().enumerate() {
+                let bytes = &mut self.host_token_bytes[index * 4..index * 4 + 4];
+                bytes.copy_from_slice(&(token as i32).to_ne_bytes());
+            }
+            if hip_body {
+                // The one id is a stream-ordered fill, not a synchronous copy.
+                let active = gpu.active_stream.as_ref();
+                gpu.hip.memset_d32_async(
+                    &self.scratch.token_ids.buf,
+                    tokens[0] as i32,
+                    1,
+                    active,
+                )?;
+            } else {
+                gpu.memcpy_htod_auto(
+                    &self.scratch.token_ids.buf,
+                    &self.host_token_bytes[..n * std::mem::size_of::<i32>()],
+                )?;
+            }
         }
         let embedding = bundle.weights.resident(&bundle.weights.root.embedding)?;
         let embedding_rot = view(&self.scratch.embedding_rot, 0, n * config.hidden_size);
         let embeddings = view(&self.scratch.embeddings, 0, n * config.hidden_size);
-        let ids = view(&self.scratch.token_ids, 0, n * std::mem::size_of::<i32>());
         dispatch_embedding(
             gpu,
             embedding,
@@ -2085,6 +2142,7 @@ impl Qwen4GpuForward {
         // Boundary samples, hoisted so the post-body finalize outside this closure
         // can report them: they are taken where the window opens, which is what
         // makes the census an exact bracket of one recorded body.
+        let mut device_read: Option<u32> = None;
         let mut diagnostic_capture = false;
         let mut launched_before = 0u64;
         let mut effects_before = (0u64, 0u64, 0u64, 0u64);
@@ -2127,10 +2185,38 @@ impl Qwen4GpuForward {
             // read at the PLE layer), so the host fetch overlaps GPU work; a
             // single-token forward keeps it ahead of the retained-body boundary.
             let host_ple_bytes = &mut self.host_ple_bytes;
+            let readback = self.token_readback.as_ref();
+            let token_ids = &self.scratch.token_ids;
+            let history = &bundle.state.ple_history;
+            let ple_metadata = &bundle.ple_metadata;
+            let vocab = config.vocab_size;
+            let read_token = &mut device_read;
             let mut stage_ple = |gpu: &mut Gpu| -> Result<(), Qwen4GpuForwardError> {
                 if ple.lease().is_some() {
                     return Ok(());
                 }
+                if device_token.is_some() {
+                    // The argmax this forward enqueued first: wait for it alone
+                    // and read its id on a stream independent of the layers
+                    // enqueued since.
+                    let readback =
+                        readback.ok_or_else(|| invalid("Qwen4 token readback missing"))?;
+                    gpu.hip.event_synchronize(&readback.event)?;
+                    let mut bytes = [0u8; 4];
+                    gpu.hip
+                        .memcpy_dtoh_async(&mut bytes, &token_ids.buf, &readback.stream)?;
+                    gpu.hip.stream_synchronize(&readback.stream)?;
+                    let token = i32::from_ne_bytes(bytes) as u32;
+                    if token as usize >= vocab {
+                        return Err(invalid(
+                            "Qwen4 token id is outside the embedding vocabulary",
+                        ));
+                    }
+                    *read_token = Some(token);
+                    ple.prefetch(history.row_ids(ple_metadata, &[token]))
+                        .map_err(|error| Qwen4GpuForwardError::Ple(error.to_string()))?;
+                }
+
                 let wait_started = qwen4_profile_start();
                 let lease_result = ple.wait();
                 qwen4_profile_record(Qwen4ProfilePhase::PleWait, wait_started);
@@ -2145,7 +2231,14 @@ impl Qwen4GpuForward {
                 qwen4_profile_record(Qwen4ProfilePhase::PleStage, stage_started);
                 stage_result.map_err(|error| Qwen4GpuForwardError::Ple(error.to_string()))?;
                 let upload_started = qwen4_profile_start();
-                let upload_result = gpu.memcpy_htod_auto(&staged.buf, &host_ple_bytes[..upload_len]);
+                // After a device-token readback the host has synchronized past
+                // the previous forward's upload, so the staging buffer is free.
+                let upload_result = if device_token.is_some() {
+                    gpu.hip
+                        .memcpy_htod_async_default(&staged.buf, &host_ple_bytes[..upload_len])
+                } else {
+                    gpu.memcpy_htod_auto(&staged.buf, &host_ple_bytes[..upload_len])
+                };
                 qwen4_profile_record(Qwen4ProfilePhase::PleUpload, upload_started);
                 upload_result?;
                 lease
@@ -2165,7 +2258,7 @@ impl Qwen4GpuForward {
             let ple_split = steps
                 .iter()
                 .position(|step| matches!(step, Step::GroupedDepthwise(_)))
-                .filter(|_| n > 1);
+                .filter(|_| n > 1 || device_token.is_some());
             if ple_split.is_none() {
                 stage_ple(gpu)?;
             }
@@ -2358,6 +2451,14 @@ impl Qwen4GpuForward {
             drop(steps);
             Ok(qsa_commits)
         })();
+        let read_tokens: [u32; 1];
+        let tokens = match device_read {
+            Some(token) => {
+                read_tokens = [token];
+                &read_tokens[..]
+            }
+            None => tokens,
+        };
         match attempt {
             Ok(qsa_commits) => {
                 ple.complete();

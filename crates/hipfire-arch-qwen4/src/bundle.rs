@@ -660,19 +660,20 @@ impl Qwen4Bundle {
         result
     }
 
-    /// [`Self::forward_token`] of the token `resolve` returns once the step
-    /// program is built (see `Qwen4GpuForward::forward_token_resolved`).
-    pub fn forward_token_resolved(
+    /// [`Self::forward_token`] of `token`, or (`None`) of the GPU argmax of
+    /// `logits` as the previous forward left them; returns the token (see
+    /// `Qwen4GpuForward::forward_token_or_argmax`).
+    pub fn forward_token_or_argmax(
         &mut self,
         gpu: &mut Gpu,
-        resolve: &mut dyn FnMut(&mut Gpu) -> Result<u32, String>,
+        token: Option<u32>,
         logits: &GpuTensor,
     ) -> Result<u32, BundleError> {
         let mut forward = self.execution.take().ok_or_else(|| {
             BundleError::Forward("Qwen4 forward resources are not attached".to_string())
         })?;
         let result = forward
-            .forward_token_resolved(self, gpu, resolve, logits)
+            .forward_token_or_argmax(self, gpu, token, logits)
             .map_err(|error| BundleError::Forward(error.to_string()));
         self.execution = Some(forward);
         result

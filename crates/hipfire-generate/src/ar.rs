@@ -1739,12 +1739,12 @@ pub fn generate_ar_with_forward<Prefill, Decode>(
         &[u32],
         &rdna_compute::GpuTensor,
     ) -> Result<(), String>,
-    // Runs the token `resolve` returns (called once the forward has done its
-    // token-independent host work) and returns it.
+    // Runs the token (`None`: the GPU argmax of the logits tensor, as the
+    // previous decode left it) and returns it.
     Decode: FnMut(
         &mut LoadedModel,
         &mut rdna_compute::Gpu,
-        &mut dyn FnMut(&mut rdna_compute::Gpu) -> Result<u32, String>,
+        Option<u32>,
         &rdna_compute::GpuTensor,
     ) -> Result<u32, String>,
 {
@@ -1867,15 +1867,7 @@ pub fn generate_ar_with_forward<Prefill, Decode>(
             emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
             return;
         }
-        let forwarded = {
-            let mut resolve = |gpu: &mut rdna_compute::Gpu| match pending.take() {
-                Some(token) => Ok(token),
-                None => rdna_compute::tensor_ops::argmax_f32_host(gpu, &decode_logits)
-                    .map_err(|error| format!("decode argmax failed: {error}")),
-            };
-            forward_token(m, gpu, &mut resolve, &decode_logits)
-        };
-        let next_token = match forwarded {
+        let next_token = match forward_token(m, gpu, pending.take(), &decode_logits) {
             Ok(token) => token,
             Err(error) => {
                 let _ = gpu.free_tensor(decode_logits);
@@ -1966,7 +1958,7 @@ pub fn generate_ar_with_forward<Prefill, Decode>(
         }
 
         if greedy_on_gpu {
-            // The next forward reads the argmax once its program is built.
+            // The next forward takes the argmax of `decode_logits` itself.
             continue;
         }
         let next_logits = match gpu.download_f32(&decode_logits) {
