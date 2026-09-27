@@ -148,7 +148,7 @@ pub fn gated_delta_step_gated(
     validate_gated_delta_gate(g)?;
     let width = g.output.numel();
     let rotate_into = rotate_into
-        .filter(|r| p.value_heads % 2 == 0 && r.dtype == DType::F32 && r.numel() >= width);
+        .filter(|r| p.value_heads.is_multiple_of(2) && r.dtype == DType::F32 && r.numel() >= width);
     gated_delta_step_launch(gpu, p, Some(g), rotate_into)?;
     if let Some(rotated) = rotate_into {
         gpu.scratch.prerotated = Some((

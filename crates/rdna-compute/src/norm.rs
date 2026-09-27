@@ -666,7 +666,7 @@ impl Gpu {
             &n as *const _ as *mut c_void,
         ];
         let block = 256u32;
-        let grid = ((n as u32).max(1) + block - 1) / block;
+        let grid = (n as u32).max(1).div_ceil(block);
         self.launch_maybe_blob(KERNEL, [grid, 1, 1], [block, 1, 1], 0, &mut params, || {
             let mut b = hip_bridge::KernargBlob::new();
             b.push_ptr(gate_ptr);

@@ -493,8 +493,8 @@ fn execute_hyper_read_inner(
         normalized_f16 = Some(x16);
     } else if op.rows == 1
         && gpu.arch_caps.has_gfx11_plus_simt()
-        && ((op.input_mix_down.dtype == DType::BF16 && op.input_mix_down.k % 32 == 0)
-            || (op.input_mix_down.dtype == DType::Q8_0 && op.input_mix_down.k % 256 == 0))
+        && ((op.input_mix_down.dtype == DType::BF16 && op.input_mix_down.k.is_multiple_of(32))
+            || (op.input_mix_down.dtype == DType::Q8_0 && op.input_mix_down.k.is_multiple_of(256)))
     {
         // Decode: the long-K down GEMV splits each row across four waves and
         // applies the activation below in its epilogue.
@@ -611,7 +611,7 @@ fn execute_hyper_read_inner(
     }
     project_weight(gpu, &op.input_mix_up, &low, &up, op.rows, Some(op.rotation))?;
     if let Some(rotated) = rotate_into.filter(|r| {
-        op.rows == 1 && op.branches == 4 && op.hidden % 256 == 0 && r.numel() >= op.hidden
+        op.rows == 1 && op.branches == 4 && op.hidden.is_multiple_of(256) && r.numel() >= op.hidden
     }) {
         // The next step rotates `mixed` into `rotated` first: write that
         // rotation here too (the step's rotate_x_mq then skips).
@@ -866,7 +866,7 @@ fn hyper_write_gates(
         if op.rows == 1
             && gpu.arch_caps.has_gfx11_plus_simt()
             && op.block_inject.dtype == DType::BF16
-            && op.block_inject.k % 32 == 0
+            && op.block_inject.k.is_multiple_of(32)
         {
             // Decode: four gate rows of K = branches * hidden; four waves per
             // row instead of one.

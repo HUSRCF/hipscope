@@ -3420,7 +3420,7 @@ impl Gpu {
         rotated: &GpuTensor,
         hidden: usize,
     ) -> HipResult<()> {
-        if hidden % 256 != 0
+        if !hidden.is_multiple_of(256)
             || normalized.numel() < 4 * hidden
             || up.numel() < 4 * hidden
             || mixed.numel() < hidden
@@ -12351,7 +12351,7 @@ impl Gpu {
         ];
         let bytes = batch_size * 10 * (crate::profile::gemv_hfq4g256_bytes(m, k) + m * 4);
         let timer = crate::profile::begin_timer(&self.hip, "gemv", FUNC, bytes);
-        if k == 2560 && m % 8 == 0 {
+        if k == 2560 && m.is_multiple_of(8) {
             // Eight rows per block share an LDS copy of x (same row values).
             const ROWS8: &str = "gemv_mq4g256v2_moe_gate_up_k2560_rows8_indexed_batched";
             self.ensure_kernel(
@@ -14448,8 +14448,11 @@ impl Gpu {
         k: usize,
         hc_act_scale: Option<f32>,
     ) -> HipResult<()> {
-        if k % 32 != 0 {
-            return Err(hip_bridge::HipError::new(1, "gemv_bf16_xf32_k4 needs K % 32 == 0"));
+        if !k.is_multiple_of(32) {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "gemv_bf16_xf32_k4 needs K % 32 == 0",
+            ));
         }
         self.bind_thread()?;
         self.ensure_kernel("gemv_bf16_xf32", kernels::GEMV_BF16_XF32_SRC, "gemv_bf16_xf32_k4")?;
@@ -14467,7 +14470,7 @@ impl Gpu {
         k: usize,
         hc_act_scale: Option<f32>,
     ) -> HipResult<()> {
-        if k % 256 != 0 {
+        if !k.is_multiple_of(256) {
             return Err(hip_bridge::HipError::new(
                 1,
                 "gemv_q8_0_k8 needs K % 256 == 0",
@@ -14486,7 +14489,7 @@ impl Gpu {
         m: usize,
         k: usize,
     ) -> HipResult<GpuTensor> {
-        if k % 32 != 0 || weight.dtype != DType::BF16 || weight.numel() < m * k {
+        if !k.is_multiple_of(32) || weight.dtype != DType::BF16 || weight.numel() < m * k {
             return Err(hip_bridge::HipError::new(
                 1,
                 "quantize_bf16_q8_0 needs a BF16 [m, k], K % 32 == 0",

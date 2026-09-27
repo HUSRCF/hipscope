@@ -1899,12 +1899,7 @@ impl Qwen4GpuForward {
                 state_bf16: bf16_state,
                 input: &self.scratch.streams,
                 norm_weight: attn_read.norm,
-                input_mix_down: hc_mix(
-                    &self.hc_q8,
-                    layer_index * 4 + 0,
-                    n,
-                    attn_read.input_mix_down,
-                ),
+                input_mix_down: hc_mix(&self.hc_q8, layer_index * 4, n, attn_read.input_mix_down),
                 input_mix_up: hc_mix(&self.hc_q8, layer_index * 4 + 1, n, attn_read.input_mix_up),
                 normalized: &self.scratch.hc_normalized,
                 low: &self.scratch.hc_low,
