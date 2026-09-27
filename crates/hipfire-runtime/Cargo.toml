@@ -568,6 +568,10 @@ name = "test_serve_tool_reentry"
 required-features = ["lab"]
 
 [[example]]
+name = "test_serve_prefix_cache"
+required-features = ["lab"]
+
+[[example]]
 name = "test_swap_equivalence"
 required-features = ["lab"]
 
@@ -687,4 +691,12 @@ required-features = ["lab"]
 
 [[example]]
 name = "fp8stream_producer_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "test_e4_engine_repro"
+required-features = ["lab"]
+
+[[example]]
+name = "a13_repro"
 required-features = ["lab"]
