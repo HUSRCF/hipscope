@@ -272,8 +272,9 @@ pub struct GatedDeltaStepBatched<'a> {
     pub beta: &'a GpuTensor,
     pub state: &'a GpuTensor,
     pub output: &'a GpuTensor,
-    /// Optional `[rows - 1, state]` F32: the recurrent state after each row
-    /// but the last (speculative-verify rollback points).
+    /// Optional `[rows, state]` F32: the recurrent state after every row,
+    /// written instead of updating `state` (speculative-verify rollback
+    /// points; `state` keeps the pre-call value).
     pub row_states: Option<&'a GpuTensor>,
     pub rows: usize,
     pub qkv_width: usize,
@@ -314,7 +315,7 @@ pub fn gated_delta_step_batched(gpu: &mut Gpu, p: &GatedDeltaStepBatched<'_>) ->
         || p.state.numel() != state_elements
         || p.output.numel() != rows_value
         || p.row_states.is_some_and(|states| {
-            states.dtype != DType::F32 || states.numel() < (p.rows - 1) * state_elements
+            states.dtype != DType::F32 || states.numel() < p.rows * state_elements
         })
     {
         return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));

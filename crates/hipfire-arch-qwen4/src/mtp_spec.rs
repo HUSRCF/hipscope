@@ -393,15 +393,23 @@ impl SpecTarget for Qwen4Bundle {
                 self.state.max_seq_len
             ));
         }
-        let snapshot = self.snapshot(gpu).map_err(|error| error.to_string())?;
+        // The verify leaves per-row rollback points, so a rejected suffix is
+        // dropped without re-running the accepted rows (armed before the
+        // snapshot: the GDN states then need no copy).
+        self.state.row_capture_armed =
+            block.len() >= 2 && self.state.row_capture_rows() >= block.len();
+        let snapshot = match self.snapshot(gpu) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.state.row_capture_armed = false;
+                return Err(error.to_string());
+            }
+        };
         scratch
             .as_any_mut()
             .downcast_mut::<Qwen4SpecScratch>()
             .ok_or("Qwen4 verify_block: scratch is not Qwen4SpecScratch")?
             .target_snapshot = Some(snapshot);
-        // The verify leaves per-row rollback points, so a rejected suffix
-        // is dropped without re-running the accepted rows.
-        self.state.row_capture_armed = true;
         let result = self
             .spec_forward_rows(gpu, block, true)
             .map_err(|error| error.to_string());
@@ -576,11 +584,18 @@ impl Qwen4MtpDrafter {
         };
         let prefill_rows = {
             let bundle = Self::bundle(target)?;
-            let conv_history = bundle.config.linear_conv_kernel_dim - 1;
-            bundle
-                .state
-                .ensure_row_capture(gpu, self.max_k + 1, conv_history)
-                .map_err(|error| error.to_string())?;
+            // Row capture rides the few-row persistent GDN recurrence.
+            let config = &bundle.config;
+            if gpu.arch_caps.has_gfx11_plus_simt()
+                && config.linear_key_head_dim == 128
+                && config.linear_value_head_dim == 128
+                && config.linear_conv_kernel_dim == 4
+            {
+                bundle
+                    .state
+                    .ensure_row_capture(gpu, self.max_k + 1, config.linear_conv_kernel_dim - 1)
+                    .map_err(|error| error.to_string())?;
+            }
             bundle.spec_chunk_rows().unwrap_or(1).max(1)
         };
         if self.scratch.is_none() {
@@ -1016,10 +1031,19 @@ impl MtpDrafter for Qwen4MtpDrafter {
             // Keep both pre-window tickets active until every replay and hidden
             // copy succeeds. A retained restore lets the outer rollback repair
             // both owners if either side's GPU work fails.
-            if !full_accept {
+            if !full_accept && picks.state.row_capture_rows() >= block.len() {
                 timers.mark(gpu, "target_rollback");
                 picks
                     .rollback_verify_rows_retain(gpu, target_snapshot, target_accept_len + 1, &block)
+                    .map_err(|error| error.to_string())?;
+            } else if !full_accept {
+                timers.mark(gpu, "target_replay");
+                picks
+                    .restore_retain(gpu, target_snapshot)
+                    .map_err(|error| error.to_string())?;
+                picks
+                    .spec_forward_rows(gpu, &block[..target_accept_len + 1], true)
+                    .map(|_| ())
                     .map_err(|error| error.to_string())?;
             }
             timers.mark(gpu, "mtp_commit");

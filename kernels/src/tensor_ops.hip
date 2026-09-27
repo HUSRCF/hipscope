@@ -260,9 +260,10 @@ extern "C" __global__ void gated_delta_step_shared_norm128_gfx1151(
 // normalized q/k vectors are double-buffered so a row needs no trailing
 // barrier.  Every value is produced by the same expression sequence as
 // gated_delta_step_f32, so the result is bitwise unchanged.
-// `kCapture`: also leave the state after every row but the last in
-// `row_states` (speculative-verify rollback points); a separate
-// instantiation so the plain route's register allocation is unchanged.
+// `kCapture`: leave the state after every row in `row_states` instead of
+// updating `state` (speculative verify: the pre-verify state stays intact
+// and every row is a rollback point); a separate instantiation so the plain
+// route's register allocation is unchanged.
 template <bool kCapture>
 __device__ __forceinline__ void gated_delta_step_persistent256_body(
     const float* projection,
@@ -457,10 +458,7 @@ __device__ __forceinline__ void gated_delta_step_persistent256_body(
                 }
                 output[row * value_width + value_head * 128 + value_index] = out;
             }
-            // Speculative verify: the state after every row but the last
-            // (which lands in `state`), so a rejected suffix rolls back
-            // without re-running the accepted rows.
-            if (kCapture && row + 1 < rows) {
+            if (kCapture) {
                 float* slot = row_states + (size_t)row * value_heads * 128 * 128;
                 #pragma unroll
                 for (int kd = 0; kd < 64; ++kd) {
@@ -470,6 +468,7 @@ __device__ __forceinline__ void gated_delta_step_persistent256_body(
         }
     }
 
+    if (kCapture) return;
     #pragma unroll
     for (int kd = 0; kd < 64; ++kd) {
         state[state_base + (kd_base + kd) * 128 + value_index] =

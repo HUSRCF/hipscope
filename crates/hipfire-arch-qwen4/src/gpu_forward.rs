@@ -2545,6 +2545,7 @@ impl Qwen4GpuForward {
                     next_history.push(token);
                 }
                 bundle.state.ple_history = next_history;
+                bundle.state.commit_row_capture(n);
                 bundle.state.position = next_position
                     .checked_add(n)
                     .ok_or_else(|| invalid("Qwen4 forward position overflows at commit"))?;

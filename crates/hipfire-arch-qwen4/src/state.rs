@@ -222,6 +222,9 @@ pub(crate) struct Qwen4StateSnapshotArena {
     qsa_marks: Vec<QsaMark>,
     ple_history: PleHistory,
     position: usize,
+    /// Live GDN ring slot when the snapshot brackets an armed verify: the
+    /// recurrent state was not copied (the verify leaves that slot intact).
+    gdn_live: Option<usize>,
     model_id: u64,
     active: bool,
     generation: u64,
@@ -330,6 +333,7 @@ impl Qwen4StateSnapshotArena {
             qsa_marks: qsa.iter().map(QsaGpuState::mark).collect(),
             ple_history,
             position,
+            gdn_live: None,
             model_id,
             active: false,
             generation: 0,
@@ -493,11 +497,18 @@ pub struct Qwen4State {
     pub max_seq_len: usize,
     pub qsa_selected_capacity: usize,
     snapshot_arena: Qwen4StateSnapshotArena,
-    /// Few-row verify rollback points per GDN layer: (states after each row
-    /// but the last, convolution input rows); see `GdnRowCapture`.
+    /// Few-row verify rollback points per GDN layer: (recurrent-state ring,
+    /// convolution input rows); see `GdnRowCapture`. With a ring, each GDN
+    /// layer's `recurrent` is a view of its live slot: a verify writes every
+    /// row's state into the half of the ring the live slot is not in, so the
+    /// pre-verify state is never overwritten and committing or rolling back
+    /// to any row only moves the live slot.
     row_capture: Vec<(GpuTensor, GpuTensor)>,
-    /// Rows a verify may capture (0 = none allocated).
+    /// Rows a verify may capture (0 = none allocated); the ring holds twice
+    /// as many slots.
     row_capture_rows: usize,
+    /// Live ring slot of every GDN layer's recurrent state.
+    gdn_live: usize,
     /// Set only around a speculative verify forward.
     pub(crate) row_capture_armed: bool,
     model_id: u64,
@@ -742,6 +753,7 @@ impl Qwen4State {
             snapshot_arena,
             row_capture: Vec::new(),
             row_capture_rows: 0,
+            gdn_live: 0,
             row_capture_armed: false,
             model_id,
             reset_epoch: 0,
@@ -817,9 +829,13 @@ impl Qwen4State {
         let generation = self.snapshot_arena.generation;
         let result = (|| -> Result<(), StateError> {
             let arena = &mut self.snapshot_arena;
-            for (layer, destination) in self.gdn.iter().zip(&arena.recurrent) {
-                gpu.copy_d2d(&layer.recurrent, destination, layer.recurrent.byte_size())
-                    .map_err(StateError::Hip)?;
+            arena.gdn_live = (self.row_capture_armed && !self.row_capture.is_empty())
+                .then_some(self.gdn_live);
+            if arena.gdn_live.is_none() {
+                for (layer, destination) in self.gdn.iter().zip(&arena.recurrent) {
+                    gpu.copy_d2d(&layer.recurrent, destination, layer.recurrent.byte_size())
+                        .map_err(StateError::Hip)?;
+                }
             }
             for (layer, destination) in self.gdn.iter().zip(&arena.conv) {
                 gpu.copy_d2d(&layer.conv, destination, layer.conv.byte_size())
@@ -907,10 +923,15 @@ impl Qwen4State {
             arena.validate_ticket(self, &snapshot)?;
         }
         let result = (|| -> Result<(), StateError> {
+            if let Some(live) = self.snapshot_arena.gdn_live {
+                self.set_gdn_live(live);
+            }
             let arena = &mut self.snapshot_arena;
-            for (layer, source) in self.gdn.iter_mut().zip(&arena.recurrent) {
-                gpu.copy_d2d(source, &layer.recurrent, layer.recurrent.byte_size())
-                    .map_err(StateError::Hip)?;
+            if arena.gdn_live.is_none() {
+                for (layer, source) in self.gdn.iter_mut().zip(&arena.recurrent) {
+                    gpu.copy_d2d(source, &layer.recurrent, layer.recurrent.byte_size())
+                        .map_err(StateError::Hip)?;
+                }
             }
             for (layer, source) in self.gdn.iter_mut().zip(&arena.conv) {
                 gpu.copy_d2d(source, &layer.conv, layer.conv.byte_size())
@@ -1041,8 +1062,12 @@ impl Qwen4State {
                 }
             }
         };
+        let ringed = !self.row_capture.is_empty();
         for layer in self.gdn {
-            free(layer.recurrent);
+            // With a ring, `recurrent` is a view of it (freed below).
+            if !ringed {
+                free(layer.recurrent);
+            }
             free(layer.conv);
         }
         for layer in self.qsa {
@@ -1056,15 +1081,16 @@ impl Qwen4State {
         }
         free(self.ple_conv);
         free(self.hyper_feedback);
-        for (states, inputs) in self.row_capture {
-            free(states);
+        for (ring, inputs) in self.row_capture {
+            free(ring);
             free(inputs);
         }
         first.map_or(Ok(()), |error| Err(StateError::Hip(error)))
     }
 
-    /// Allocate the few-row verify rollback points for blocks of `rows`
-    /// (`conv_history` = convolution kernel - 1).
+    /// Allocate the few-row verify rollback points for blocks of up to
+    /// `rows` rows (`conv_history` = convolution kernel - 1). Only called
+    /// where the GDN route captures rows (see `GatedDeltaNetOp::row_capture`).
     pub(crate) fn ensure_row_capture(
         &mut self,
         gpu: &mut Gpu,
@@ -1074,33 +1100,84 @@ impl Qwen4State {
         if rows <= self.row_capture_rows || rows < 2 {
             return Ok(());
         }
-        for (states, inputs) in self.row_capture.drain(..) {
-            gpu.free_tensor(states).map_err(StateError::Hip)?;
-            gpu.free_tensor(inputs).map_err(StateError::Hip)?;
-        }
-        self.row_capture_rows = 0;
+        let mut next = Vec::with_capacity(self.gdn.len());
         for layer in &self.gdn {
-            let states = gpu
-                .zeros(&[(rows - 1) * layer.recurrent.numel()], DType::F32)
+            let state = layer.recurrent.numel();
+            let ring = gpu
+                .zeros(&[2 * rows * state], DType::F32)
+                .map_err(StateError::Hip)?;
+            gpu.copy_d2d(&layer.recurrent, &ring.sub_offset(0, state), layer.recurrent.byte_size())
                 .map_err(StateError::Hip)?;
             let inputs = gpu
                 .zeros(&[rows * (layer.conv.numel() / conv_history)], DType::F32)
                 .map_err(StateError::Hip)?;
-            self.row_capture.push((states, inputs));
+            next.push((ring, inputs));
+        }
+        let previous = std::mem::replace(&mut self.row_capture, next);
+        let ringed = !previous.is_empty();
+        for (index, layer) in self.gdn.iter_mut().enumerate() {
+            let state = layer.recurrent.numel();
+            let old = std::mem::replace(
+                &mut layer.recurrent,
+                self.row_capture[index].0.sub_offset(0, state),
+            );
+            if !ringed {
+                gpu.free_tensor(old).map_err(StateError::Hip)?;
+            }
+        }
+        for (ring, inputs) in previous {
+            gpu.free_tensor(ring).map_err(StateError::Hip)?;
+            gpu.free_tensor(inputs).map_err(StateError::Hip)?;
         }
         self.row_capture_rows = rows;
+        self.gdn_live = 0;
         Ok(())
     }
 
+    /// Rows an armed verify captures (0 = this GPU's GDN route cannot).
+    pub(crate) fn row_capture_rows(&self) -> usize {
+        self.row_capture_rows
+    }
+
+    /// First ring slot an armed verify writes: the half without the live slot.
+    fn capture_base(&self, live: usize) -> usize {
+        if live < self.row_capture_rows {
+            self.row_capture_rows
+        } else {
+            0
+        }
+    }
+
+    /// Point every GDN layer's `recurrent` at ring slot `slot`.
+    fn set_gdn_live(&mut self, slot: usize) {
+        self.gdn_live = slot;
+        for (layer, (ring, _)) in self.gdn.iter_mut().zip(&self.row_capture) {
+            let state = layer.recurrent.numel();
+            layer.recurrent = ring.sub_offset(slot * state, state);
+        }
+    }
+
     /// The rollback points GDN layer `slot` writes in an armed `rows`-row
-    /// verify forward.
+    /// verify forward: every row's state into the free half of the ring.
     pub(crate) fn gdn_row_capture(&self, slot: usize, rows: usize) -> Option<GdnRowCapture<'_>> {
         if !self.row_capture_armed || rows < 2 || rows > self.row_capture_rows {
             return None;
         }
-        self.row_capture
-            .get(slot)
-            .map(|(states, inputs)| GdnRowCapture { states, inputs })
+        let state = self.gdn.get(slot)?.recurrent.numel();
+        let base = self.capture_base(self.gdn_live);
+        self.row_capture.get(slot).map(|(ring, inputs)| GdnRowCapture {
+            states: ring.sub_offset(base * state, rows * state),
+            inputs,
+        })
+    }
+
+    /// An armed `rows`-row verify forward succeeded: its last row's state is
+    /// live.
+    pub(crate) fn commit_row_capture(&mut self, rows: usize) {
+        if self.row_capture_armed && rows >= 2 && rows <= self.row_capture_rows {
+            let base = self.capture_base(self.gdn_live);
+            self.set_gdn_live(base + rows - 1);
+        }
     }
 
     /// Roll an armed `rows`-row verify forward back to its first `keep` rows
@@ -1135,18 +1212,11 @@ impl Qwen4State {
             });
         }
         let start = self.snapshot_arena.position;
+        let before = self.snapshot_arena.gdn_live.ok_or(StateError::SnapshotTicket)?;
+        self.set_gdn_live(self.capture_base(before) + keep - 1);
         let arena = &self.snapshot_arena;
         for (index, layer) in self.gdn.iter().enumerate() {
-            let (states, inputs) = &self.row_capture[index];
-            let state_bytes = layer.recurrent.byte_size();
-            gpu.memcpy_dtod_at_auto(
-                &layer.recurrent.buf,
-                0,
-                &states.buf,
-                (keep - 1) * state_bytes,
-                state_bytes,
-            )
-            .map_err(StateError::Hip)?;
+            let (_, inputs) = &self.row_capture[index];
             gpu.copy_d2d(&arena.conv[index], &layer.conv, layer.conv.byte_size())
                 .map_err(StateError::Hip)?;
             let channel_bytes = layer.conv.byte_size() / conv_history;

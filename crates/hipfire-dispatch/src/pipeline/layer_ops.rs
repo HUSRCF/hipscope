@@ -959,13 +959,13 @@ pub struct GatedDeltaNetOp<'a> {
 }
 
 /// Where a few-row GDN forward leaves what a later rollback to any accepted
-/// row prefix needs: the recurrent state after each row but the last
-/// (`[rows - 1, value_heads * value_dim * key_dim]` F32) and the convolution
-/// input rows (`[rows, qkv]` F32; every reader of the convolution history
-/// rounds it to BF16).
-#[derive(Clone, Copy)]
+/// row prefix needs: the recurrent state after every row
+/// (`[rows, value_heads * value_dim * key_dim]` F32, written instead of
+/// updating `recurrent` in place, which stays the pre-forward state) and the
+/// convolution input rows (`[rows, qkv]` F32; every reader of the
+/// convolution history rounds it to BF16).
 pub struct GdnRowCapture<'a> {
-    pub states: &'a GpuTensor,
+    pub states: GpuTensor,
     pub inputs: &'a GpuTensor,
 }
 
@@ -1110,14 +1110,19 @@ pub fn execute_gated_delta_net(
         && op.value_dim == 128
         && op.conv_kernel == 4;
     let recurrent_output = view(op.recurrent_output, 0, op.rows * value);
-    let capture = op.row_capture.filter(|_| persistent_batch);
+    if op.row_capture.is_some() && !persistent_batch {
+        return Err(DispatchError::Hip(
+            "GDN row capture needs the few-row persistent recurrence route".into(),
+        ));
+    }
+    let capture = op.row_capture.as_ref();
     let dims = GatedDeltaStepBatched {
         projection: &projection2,
         gate: &gate,
         beta: &beta,
         state: op.recurrent,
         output: &recurrent_output,
-        row_states: capture.map(|c| c.states),
+        row_states: capture.map(|c| &c.states),
         rows: op.rows,
         qkv_width: qkv,
         key_heads: op.key_heads,
