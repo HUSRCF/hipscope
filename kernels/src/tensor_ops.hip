@@ -1406,8 +1406,13 @@ extern "C" __global__ void gated_delta_step_gate_norm128_gfx1151(
     int value_heads,
     int key_dim,
     int value_dim,
-    float query_scale) {
+    float query_scale,
+    float* rotated,
+    const float* signs1,
+    const float* signs2,
+    unsigned int* pair_counters) {
     __shared__ float head_values[128];
+    __shared__ int rotate_pair;
     float out;
     if (!gated_delta_step_norm128_body(q, k, v, gate, beta, state, key_heads, value_heads,
                                        key_dim, value_dim, query_scale, &out))
@@ -1417,6 +1422,29 @@ extern "C" __global__ void gated_delta_step_gate_norm128_gfx1151(
     __syncthreads();
     const int start = (int)blockIdx.x * 128;
     gated_delta_gate_channel(head_values, z + start, norm, output + start, channel, 128);
+    if (!rotated) return;
+    // Optional: `rotated` receives mq_rotate_x(output) (256-wide groups = head
+    // pairs). The second head of a pair to finish rotates the pair's group
+    // (a zeroed arrival counter per pair, reset by that block).
+    __threadfence();
+    __syncthreads();
+    const int pair = (int)blockIdx.x >> 1;
+    if (threadIdx.x == 0) rotate_pair = atomicAdd(&pair_counters[pair], 1u) == 1u;
+    __syncthreads();
+    if (!rotate_pair || threadIdx.x >= 32) return;
+    __threadfence();
+    const int d0 = (int)threadIdx.x * 8;
+    const int base = pair * 256;
+    float values[8];
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+        values[e] = __hip_atomic_load(&output[base + d0 + e], __ATOMIC_RELAXED,
+                                      __HIP_MEMORY_SCOPE_AGENT) * signs1[d0 + e];
+    }
+    mq_fwht256_lane(values, (int)threadIdx.x);
+#pragma unroll
+    for (int e = 0; e < 8; ++e) rotated[base + d0 + e] = values[e] * 0.0625f * signs2[d0 + e];
+    if (threadIdx.x == 0) pair_counters[pair] = 0u;
 }
 // Row-batched gated RMSNorm. The recurrent output is rounded in place before
 // the norm reduction, matching the scalar BF16 boundary.  One wave owns one

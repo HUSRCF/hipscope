@@ -1212,6 +1212,12 @@ pub fn execute_gated_delta_net(
             // boundary itself; no round-trip pass precedes it.
             let z_row = view(&z, row * value, value);
             let gdn_output = view(op.output_scratch, row * value, value);
+            // Decode: the step also writes the output projection's
+            // 256-wide rotation of this row (its rotate then skips).
+            let rotate_into = (op.rows == 1
+                && rotation_basis(op.output.dtype) == Some(RotationBasis::Aligned256)
+                && op.output.k == value)
+                .then(|| view(op.rotation, 0, value));
             hip(gated_delta_step_gated(
                 gpu,
                 &GatedDeltaStep {
@@ -1235,6 +1241,7 @@ pub fn execute_gated_delta_net(
                     value_heads: op.value_heads,
                     value_dim: op.value_dim,
                 },
+                rotate_into.as_ref(),
             ))?;
         }
     }

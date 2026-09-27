@@ -1046,7 +1046,10 @@ pub const GEMV_HFQ3G256_RESIDUAL_SRC: &str =
 pub const GEMV_HFQ3G256_RESIDUAL_GFX1100_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq3g256_residual.gfx1100.hip");
 pub const GEMV_HFQ3G128_SRC: &str = include_str!("../../../kernels/src/gemv_hfq3g128.hip");
-pub const GEMV_MQ4G256_SRC: &str = include_str!("../../../kernels/src/gemv_mq4g256.hip");
+pub const GEMV_MQ4G256_SRC: &str = concat!(
+    include_str!("../../../kernels/src/mq_fwht256.h"),
+    include_str!("../../../kernels/src/gemv_mq4g256.hip")
+);
 pub const MQ_ROTATE_X_GFX942_SRC: &str =
     include_str!("../../../kernels/src/mq_rotate_x.gfx942.hip");
 pub const GEMV_MQ4G128_SRC: &str = include_str!("../../../kernels/src/gemv_mq4g128.hip");

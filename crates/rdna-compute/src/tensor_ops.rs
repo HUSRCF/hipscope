@@ -12,7 +12,10 @@ use hip_bridge::{HipError, HipResult, KernargBlob};
 
 use crate::{DType, Gpu, GpuTensor};
 
-pub(crate) const TENSOR_OPS_SRC: &str = include_str!("../../../kernels/src/tensor_ops.hip");
+pub(crate) const TENSOR_OPS_SRC: &str = concat!(
+    include_str!("../../../kernels/src/mq_fwht256.h"),
+    include_str!("../../../kernels/src/tensor_ops.hip")
+);
 const HYPER_READ_UP_WMMA_SRC: &str =
     include_str!("../../../kernels/src/hyper_read_up_wmma.gfx1151.hip");
 const GATED_DELTA_CHUNK_WMMA_SRC: &str =
@@ -115,32 +118,51 @@ pub struct GatedDeltaStep<'a> {
     pub value_dim: usize,
 }
 
+/// Head-pair arrival counters of the fused GDN step's optional rotation.
+const GDN_PAIR_COUNTERS: usize = 256;
+
 pub fn gated_delta_step(gpu: &mut Gpu, p: &GatedDeltaStep<'_>) -> HipResult<()> {
-    gated_delta_step_launch(gpu, p, None)
+    gated_delta_step_launch(gpu, p, None, None)
 }
 
 /// [`gated_delta_step`] followed by [`gated_delta_gate`] of its output
 /// (`g.recurrent_output` must be `p.output`). On the gfx11+ 128x128 route one
 /// launch keeps the recurrent output in LDS (bitwise the two launches; the
 /// recurrent output is then not stored); elsewhere the two launches run.
+/// With `rotate_into`, that launch also writes `mq_rotate_x(g.output)` there
+/// (head pairs form the 256-wide groups) and the next matching
+/// `Gpu::rotate_x_mq` skips (`ScratchState::prerotated`); returns whether it
+/// did.
 pub fn gated_delta_step_gated(
     gpu: &mut Gpu,
     p: &GatedDeltaStep<'_>,
     g: &GatedDeltaGate<'_>,
-) -> HipResult<()> {
+    rotate_into: Option<&GpuTensor>,
+) -> HipResult<bool> {
     let fused = gpu.arch_caps.has_gfx11_plus_simt() && p.key_dim == 128 && p.value_dim == 128;
     if !fused || g.recurrent_output.buf.as_ptr() != p.output.buf.as_ptr() {
         gated_delta_step(gpu, p)?;
-        return gated_delta_gate(gpu, g);
+        gated_delta_gate(gpu, g)?;
+        return Ok(false);
     }
     validate_gated_delta_gate(g)?;
-    gated_delta_step_launch(gpu, p, Some(g))
+    let width = g.output.numel();
+    let rotate_into = rotate_into.filter(|r| {
+        p.value_heads % 2 == 0 && r.dtype == DType::F32 && r.numel() >= width
+    });
+    gated_delta_step_launch(gpu, p, Some(g), rotate_into)?;
+    if let Some(rotated) = rotate_into {
+        gpu.scratch.prerotated =
+            Some((g.output.buf.as_ptr() as usize, rotated.buf.as_ptr() as usize, width));
+    }
+    Ok(rotate_into.is_some())
 }
 
 fn gated_delta_step_launch(
     gpu: &mut Gpu,
     p: &GatedDeltaStep<'_>,
     gated: Option<&GatedDeltaGate<'_>>,
+    rotate_into: Option<&GpuTensor>,
 ) -> HipResult<()> {
     for tensor in [p.q, p.k, p.v, p.gate, p.beta, p.state, p.output] {
         ensure_f32(tensor)?;
@@ -201,6 +223,32 @@ fn gated_delta_step_launch(
     args.push_i32(key_dim);
     args.push_i32(value_dim);
     args.push_f32((p.key_dim as f32).sqrt().recip());
+    if gated.is_some() && shared_norm128 {
+        let null = std::ptr::null_mut();
+        let (rotated, signs1, signs2, counters) = match rotate_into {
+            Some(rotated) => {
+                gpu.ensure_mq_signs()?;
+                if gpu.scratch.gdn_pair_counters.is_none() {
+                    let counters = gpu.hip.malloc(GDN_PAIR_COUNTERS * 4)?;
+                    gpu.hip.memset(&counters, 0, GDN_PAIR_COUNTERS * 4)?;
+                    gpu.scratch.gdn_pair_counters = Some(counters);
+                }
+                if p.value_heads / 2 > GDN_PAIR_COUNTERS {
+                    return Err(HipError::new(0, "GDN rotate: too many head pairs"));
+                }
+                (
+                    rotated.buf.as_ptr(),
+                    gpu.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr(),
+                    gpu.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr(),
+                    gpu.scratch.gdn_pair_counters.as_ref().unwrap().as_ptr(),
+                )
+            }
+            None => (null, null, null, null),
+        };
+        for ptr in [rotated, signs1, signs2, counters] {
+            args.push_ptr(ptr);
+        }
+    }
     args.pad_to(16);
     gpu.launch_blob_recorded(
         kernel,

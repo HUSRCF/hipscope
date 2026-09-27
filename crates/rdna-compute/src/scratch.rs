@@ -55,6 +55,9 @@ pub struct ScratchState {
     /// `Gpu::rotate_x_mq` consumes it instead of launching. The step executor
     /// clears it after the consuming step.
     pub prerotated: Option<(usize, usize, usize)>,
+    /// Zeroed head-pair arrival counters of the fused GDN step's rotation
+    /// epilogue (each launch leaves them zero).
+    pub gdn_pair_counters: Option<DeviceBuffer>,
     /// Dedicated F32 temporary for the unfused GEMV-residual alias fallback.
     /// Lazily allocated and grown on demand; no other scratch path uses it.
     pub gemv_residual_tmp: Option<GpuTensor>,
