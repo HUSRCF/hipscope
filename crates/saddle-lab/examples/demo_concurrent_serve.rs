@@ -293,6 +293,9 @@ fn main() {
                 e = AdmitError::WouldExceedBudget { need, available },
             );
         }
+        Err(e @ AdmitError::UnknownSession(_)) => {
+            panic!("open() reported {e}; only resize() can name an unknown session");
+        }
         Err(e @ AdmitError::PoolFull) => {
             panic!(
                 "session rejected as PoolFull ({e}), not WouldExceedBudget — the spare pool \

@@ -5,7 +5,7 @@
 //! Qwen-family sites use [`parse_qwen_k_name`] / [`resolve_kv_pair`] (shared
 //! name table, hard errors, arch-aware `auto`). Non-Qwen sites keep [`resolve`].
 
-pub use saddle_core::kv::{KvMode, VMode};
+pub use saddle_core::kv::{KvMode, SlotKvTierPlan, VMode};
 
 /// Per-site alias table + accepted set + default. One const per load site.
 #[derive(Clone, Copy)]
@@ -118,7 +118,6 @@ impl KvPair {
     }
 }
 
-
 /// Shared Qwen K-name table (site-independent). Explicit K / `--kv-mode` preset
 /// K only — `auto` / `""` are **not** K formats (see [`resolve_kv_pair`]).
 /// Native fp8/bf16 are indivisible whole-cache presets, never K overrides.
@@ -180,7 +179,6 @@ pub fn qwen_v_display_name(v: VMode) -> &'static str {
     }
 }
 
-
 /// Non-empty authored override axis (`None` / `Some("")` / whitespace = absent).
 fn authored_axis(raw: Option<&str>) -> Option<&str> {
     raw.map(str::trim).filter(|s| !s.is_empty())
@@ -189,7 +187,6 @@ fn authored_axis(raw: Option<&str>) -> Option<&str> {
 fn is_fwht_k(k: KvMode) -> bool {
     matches!(k, Fwht2 | Fwht3 | Fwht4)
 }
-
 
 /// Qwen `""`|`auto` pair before axis overrides.
 ///
@@ -293,7 +290,6 @@ pub fn resolve_kv_pair(
     Ok(pair)
 }
 
-
 const FULL_LADDER: &[KvMode] = &[Q8, Asym2, Asym3, Asym4, Fwht2, Fwht3, Fwht4, Fp8, Bf16];
 
 /// Qwen shared alias surface for the legacy single-string [`resolve`] path.
@@ -387,7 +383,6 @@ pub const QWEN35_TP_POLICY: KvModePolicy = KvModePolicy {
     default: Q8,
 };
 
-
 /// Site 7 — maple (arch 15). Unchanged: accept {Q8, Bf16}, default bf16.
 fn normalize_maple(raw: &str) -> Option<KvMode> {
     match raw {
@@ -403,6 +398,25 @@ pub const MAPLE_POLICY: KvModePolicy = KvModePolicy {
     default: Bf16,
 };
 
+/// Site 8 — the multi-slot serve engine (qwen35). The slots engine ran
+/// Q8_0-only for its whole life; the full static ladder is now wired
+/// end-to-end (descriptor-aware K writers + flash tile kernels, legacy and
+/// paged pools), so every rotated tier the sequential path accepts is
+/// accepted here too — EXCEPT the native fp8/bf16 tiers, which have no
+/// slot-reader support and must stay refused (fail closed) on this site.
+/// The DEFAULT stays q8 — deliberately NOT the sequential site's fwht3:
+/// the slots q8 path has production mileage on every fixture, and an
+/// operator who wants a rotated tier on the slots engine says so
+/// explicitly (`HIPFIRE_KV_MODE=fwht3` / config). "auto" therefore means
+/// q8 HERE (mirroring the qwen35-pp site's convention, not the hfq site's).
+/// Names come from the shared Qwen table: `asymN`/`turboN` → FwhtN,
+/// `legacy-asymN` → AsymN.
+pub const QWEN35_SLOTS_POLICY: KvModePolicy = KvModePolicy {
+    site: "qwen35-slots",
+    normalize_alias: normalize_qwen,
+    accepted: &[Q8, Asym2, Asym3, Asym4, Fwht2, Fwht3, Fwht4],
+    default: Q8,
+};
 /// Pure: `&str + &'static policy → ResolveResult`. No GPU, no env read.
 /// Non-Qwen / Maple / legacy single-string path. Qwen pair sites prefer
 /// [`resolve_kv_pair`].
@@ -429,7 +443,17 @@ pub fn resolve(raw: &str, policy: &KvModePolicy) -> ResolveResult {
             let warning = if raw.is_empty() {
                 None
             } else {
-                Some("unrecognized or unsupported HIPFIRE_KV_MODE; using site default")
+                // Once-per-load diagnostic: leak the formatted string to
+                // satisfy the `&'static str` warning type.
+                let leaked: &'static str = Box::leak(
+                    format!(
+                        "unrecognized or unsupported kv mode {raw:?} for site {}; \
+                         using site default {:?}",
+                        policy.site, policy.default
+                    )
+                    .into_boxed_str(),
+                );
+                Some(leaked)
             };
             (policy.default, warning)
         }
@@ -500,7 +524,13 @@ mod tests {
                 // shipped default: Q8 everywhere without native FP8 admit
                 for arch in ["gfx1100", "gfx1200", "gfx942", "gfx1151"] {
                     let (k, v) = pair(raw, None, None, p, arch, true).unwrap();
-                    assert_eq!((k, v), (Q8, Some(VMode::Q8)), "site={} arch={} raw={raw}", p.site, arch);
+                    assert_eq!(
+                        (k, v),
+                        (Q8, Some(VMode::Q8)),
+                        "site={} arch={} raw={raw}",
+                        p.site,
+                        arch
+                    );
                 }
             }
         }
@@ -529,14 +559,36 @@ mod tests {
             let small = qwen35_native_eligible("gfx1201", 8, 2, 256, 1, false, false);
             assert!(eligible);
             assert!(!small);
-            assert!(!qwen35_native_eligible("gfx1201", 24, 4, 256, 1, false, true));
+            assert!(!qwen35_native_eligible(
+                "gfx1201", 24, 4, 256, 1, false, true
+            ));
             let native = qwen35_policy_for_native(base, "auto", eligible);
             let portable = qwen35_policy_for_native(base, "auto", small);
-            assert_eq!(pair("auto", None, None, &native, "gfx1201", true).unwrap().0, Fp8);
-            assert_eq!(pair("auto", None, None, &portable, "gfx1201", true).unwrap().0, Q8);
-            assert_eq!(pair("auto", Some("q8"), None, &portable, "gfx1201", true).unwrap().0, Q8);
+            assert_eq!(
+                pair("auto", None, None, &native, "gfx1201", true)
+                    .unwrap()
+                    .0,
+                Fp8
+            );
+            assert_eq!(
+                pair("auto", None, None, &portable, "gfx1201", true)
+                    .unwrap()
+                    .0,
+                Q8
+            );
+            assert_eq!(
+                pair("auto", Some("q8"), None, &portable, "gfx1201", true)
+                    .unwrap()
+                    .0,
+                Q8
+            );
             let explicit = qwen35_policy_for_native(base, "fp8", small);
-            assert_eq!(pair("fp8", None, None, &explicit, "gfx1201", true).unwrap().0, Fp8);
+            assert_eq!(
+                pair("fp8", None, None, &explicit, "gfx1201", true)
+                    .unwrap()
+                    .0,
+                Fp8
+            );
         }
     }
 
@@ -601,8 +653,24 @@ mod tests {
 
     #[test]
     fn paro_rejects_legacy_asym3_hfq_accepts() {
-        assert!(pair("legacy-asym3", None, None, &QWEN35_PARO_POLICY, "gfx1100", true).is_err());
-        let (k, _) = pair("legacy-asym3", None, None, &QWEN35_HFQ_POLICY, "gfx1100", true).unwrap();
+        assert!(pair(
+            "legacy-asym3",
+            None,
+            None,
+            &QWEN35_PARO_POLICY,
+            "gfx1100",
+            true
+        )
+        .is_err());
+        let (k, _) = pair(
+            "legacy-asym3",
+            None,
+            None,
+            &QWEN35_HFQ_POLICY,
+            "gfx1100",
+            true,
+        )
+        .unwrap();
         assert_eq!(k, Asym3);
         // bare asym3 is Fwht3 — accepted on PaRo
         let (k, _) = pair("asym3", None, None, &QWEN35_PARO_POLICY, "gfx1100", true).unwrap();
@@ -611,12 +679,52 @@ mod tests {
 
     #[test]
     fn dir_rejects_fwht_accepts_legacy_asym() {
-        assert!(pair("fwht3", None, None, &DIR_SAFETENSORS_POLICY, "gfx1100", true).is_err());
-        assert!(pair("turbo3", None, None, &DIR_SAFETENSORS_POLICY, "gfx1100", true).is_err());
-        assert!(pair("asym3", None, None, &DIR_SAFETENSORS_POLICY, "gfx1100", true).is_err());
-        let (k, _) = pair("legacy-asym3", None, None, &DIR_SAFETENSORS_POLICY, "gfx1100", true).unwrap();
+        assert!(pair(
+            "fwht3",
+            None,
+            None,
+            &DIR_SAFETENSORS_POLICY,
+            "gfx1100",
+            true
+        )
+        .is_err());
+        assert!(pair(
+            "turbo3",
+            None,
+            None,
+            &DIR_SAFETENSORS_POLICY,
+            "gfx1100",
+            true
+        )
+        .is_err());
+        assert!(pair(
+            "asym3",
+            None,
+            None,
+            &DIR_SAFETENSORS_POLICY,
+            "gfx1100",
+            true
+        )
+        .is_err());
+        let (k, _) = pair(
+            "legacy-asym3",
+            None,
+            None,
+            &DIR_SAFETENSORS_POLICY,
+            "gfx1100",
+            true,
+        )
+        .unwrap();
         assert_eq!(k, Asym3);
-        let (k, _) = pair("legacy-asym4", None, None, &DIR_SAFETENSORS_POLICY, "gfx1100", true).unwrap();
+        let (k, _) = pair(
+            "legacy-asym4",
+            None,
+            None,
+            &DIR_SAFETENSORS_POLICY,
+            "gfx1100",
+            true,
+        )
+        .unwrap();
         assert_eq!(k, Asym4);
     }
 
@@ -626,7 +734,15 @@ mod tests {
         assert_eq!(k, Fwht3);
         let (k, _) = pair("asym3", None, None, &QWEN35_PP_POLICY, "gfx1100", true).unwrap();
         assert_eq!(k, Fwht3);
-        let (k, _) = pair("legacy-asym3", None, None, &QWEN35_PP_POLICY, "gfx1100", true).unwrap();
+        let (k, _) = pair(
+            "legacy-asym3",
+            None,
+            None,
+            &QWEN35_PP_POLICY,
+            "gfx1100",
+            true,
+        )
+        .unwrap();
         assert_eq!(k, Asym3);
         assert!(pair("fwht4", None, None, &QWEN35_PP_POLICY, "gfx1100", true).is_err());
         let (k, _) = pair("fwht2", None, None, &QWEN35_PP_POLICY, "gfx1100", true).unwrap();
@@ -638,12 +754,36 @@ mod tests {
 
     #[test]
     fn lloyd_v_requires_fwht_k() {
-        let (k, v) = pair("fwht3", None, Some("lloyd3"), &QWEN35_HFQ_POLICY, "gfx1100", true).unwrap();
+        let (k, v) = pair(
+            "fwht3",
+            None,
+            Some("lloyd3"),
+            &QWEN35_HFQ_POLICY,
+            "gfx1100",
+            true,
+        )
+        .unwrap();
         assert_eq!((k, v), (Fwht3, Some(VMode::Lloyd3)));
-        let (k, v) = pair("asym3", None, Some("lloyd3"), &QWEN35_HFQ_POLICY, "gfx1100", true).unwrap();
+        let (k, v) = pair(
+            "asym3",
+            None,
+            Some("lloyd3"),
+            &QWEN35_HFQ_POLICY,
+            "gfx1100",
+            true,
+        )
+        .unwrap();
         assert_eq!((k, v), (Fwht3, Some(VMode::Lloyd3)));
         // q8 + lloyd fails
-        assert!(pair("q8", None, Some("lloyd3"), &QWEN35_HFQ_POLICY, "gfx1100", true).is_err());
+        assert!(pair(
+            "q8",
+            None,
+            Some("lloyd3"),
+            &QWEN35_HFQ_POLICY,
+            "gfx1100",
+            true
+        )
+        .is_err());
         // legacy-asym + lloyd fails
         assert!(pair(
             "legacy-asym3",
@@ -672,11 +812,31 @@ mod tests {
         // authored native + any axis → error
         assert!(pair("fp8", Some("q8"), None, &QWEN35_HFQ_POLICY, "gfx1201", true).is_err());
         assert!(pair("fp8", None, Some("q8"), &QWEN35_HFQ_POLICY, "gfx1201", true).is_err());
-        assert!(resolve_kv_pair("fp8", None, Some("q8"), &QWEN35_HFQ_POLICY, "gfx1201", true)
-            .unwrap_err().to_string().contains("indivisible"));
-        assert!(pair("bf16", Some("fwht3"), Some("q8"), &QWEN35_HFQ_POLICY, "gfx1100", true).is_err());
+        assert!(
+            resolve_kv_pair("fp8", None, Some("q8"), &QWEN35_HFQ_POLICY, "gfx1201", true)
+                .unwrap_err()
+                .to_string()
+                .contains("indivisible")
+        );
+        assert!(pair(
+            "bf16",
+            Some("fwht3"),
+            Some("q8"),
+            &QWEN35_HFQ_POLICY,
+            "gfx1100",
+            true
+        )
+        .is_err());
         // An FP8 K axis with a Q8 V axis is not a supported native preset.
-        assert!(pair("auto", Some("fp8"), Some("q8"), &QWEN35_HFQ_POLICY, "gfx1201", true).is_err());
+        assert!(pair(
+            "auto",
+            Some("fp8"),
+            Some("q8"),
+            &QWEN35_HFQ_POLICY,
+            "gfx1201",
+            true
+        )
+        .is_err());
         // explicit native alone ok when accepted
         let (k, v) = pair("fp8", None, None, &QWEN35_HFQ_POLICY, "gfx1100", true).unwrap();
         assert_eq!((k, v), (Fp8, None));
@@ -693,8 +853,24 @@ mod tests {
         let (k, v) = pair("auto", None, None, &QWEN35_HFQ_POLICY, "gfx1201", true).unwrap();
         assert_eq!((k, v), (Fp8, None));
         // single axis refuses
-        assert!(pair("auto", Some("q8"), None, &QWEN35_HFQ_POLICY, "gfx1201", true).is_err());
-        assert!(pair("auto", None, Some("q8"), &QWEN35_HFQ_POLICY, "gfx1201", true).is_err());
+        assert!(pair(
+            "auto",
+            Some("q8"),
+            None,
+            &QWEN35_HFQ_POLICY,
+            "gfx1201",
+            true
+        )
+        .is_err());
+        assert!(pair(
+            "auto",
+            None,
+            Some("q8"),
+            &QWEN35_HFQ_POLICY,
+            "gfx1201",
+            true
+        )
+        .is_err());
         // both axes replace
         let (k, v) = pair(
             "auto",
@@ -732,7 +908,15 @@ mod tests {
         .unwrap();
         assert_eq!((k, v), (Fwht3, Some(VMode::Lloyd2)));
         // explicit kv-k q8 against non-native mode → Q8/Q8
-        let (k, v) = pair("fwht3", Some("q8"), None, &QWEN35_HFQ_POLICY, "gfx1100", true).unwrap();
+        let (k, v) = pair(
+            "fwht3",
+            Some("q8"),
+            None,
+            &QWEN35_HFQ_POLICY,
+            "gfx1100",
+            true,
+        )
+        .unwrap();
         assert_eq!((k, v), (Q8, Some(VMode::Q8)));
     }
 
@@ -755,6 +939,62 @@ mod tests {
         }
         let garbage = resolve("garbage", p);
         assert_eq!(garbage.mode, KvMode::Bf16);
+        assert!(garbage.warning.is_some());
+    }
+
+    #[test]
+    fn truth_table_qwen35_slots_default_is_q8() {
+        let p = &QWEN35_SLOTS_POLICY;
+        // Unset and "auto" both mean q8, SILENTLY — q8 is the slots
+        // engine's shipped default and its longest-validated path.
+        assert_eq!(resolve("", p).mode, KvMode::Q8);
+        assert!(resolve("", p).warning.is_none());
+        assert_eq!(resolve("auto", p).mode, KvMode::Q8);
+        assert!(resolve("auto", p).warning.is_none());
+        assert_eq!(resolve("q8", p).mode, KvMode::Q8);
+        assert!(resolve("q8", p).warning.is_none());
+        // Every rotated tier is HONORED (the ladder is fully wired) and
+        // must not warn — an explicit tier is an intentional choice.
+        // Names use the shared Qwen table: asymN/turboN → FwhtN,
+        // legacy-asymN → AsymN.
+        for (raw, mode) in [
+            ("asym2", KvMode::Fwht2),
+            ("asym3", KvMode::Fwht3),
+            ("turbo", KvMode::Fwht3),
+            ("asym4", KvMode::Fwht4),
+            ("fwht2", KvMode::Fwht2),
+            ("fwht3", KvMode::Fwht3),
+            ("fwht4", KvMode::Fwht4),
+            ("legacy-asym2", KvMode::Asym2),
+            ("legacy-asym3", KvMode::Asym3),
+            ("legacy-asym4", KvMode::Asym4),
+        ] {
+            let r = resolve(raw, p);
+            assert_eq!(r.mode, mode, "{raw} must be honored on the slots site");
+            assert!(r.warning.is_none(), "{raw} must not warn");
+        }
+        // fp8/bf16 are not allocatable on the slots site (no slot readers):
+        // the single-string path refuses to the default WITH a warning
+        // (never a silent downgrade), and the pair path hard-errors instead
+        // of selecting an indivisible native tier.
+        for raw in ["fp8", "bf16"] {
+            let r = resolve(raw, p);
+            assert_eq!(
+                r.mode,
+                KvMode::Q8,
+                "{raw} must not resolve to a native tier"
+            );
+            assert!(
+                r.warning.is_some(),
+                "{raw} must warn, not silently downgrade"
+            );
+            assert!(
+                resolve_kv_pair(raw, None, None, p, "gfx1201", true).is_err(),
+                "{raw} must error on the slots pair path"
+            );
+        }
+        let garbage = resolve("garbage", p);
+        assert_eq!(garbage.mode, KvMode::Q8);
         assert!(garbage.warning.is_some());
     }
 
@@ -795,7 +1035,6 @@ mod tests {
         assert_eq!(resolve("fwht4", p).mode, KvMode::Q8);
         assert_eq!(resolve("garbage", p).mode, KvMode::Q8);
     }
-
 
     #[test]
     fn resolve_qwen_legacy_path_uses_shared_names() {

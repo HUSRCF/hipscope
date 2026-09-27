@@ -352,7 +352,6 @@ impl HfqFile {
         self.mq4v2_symmetric
     }
 
-
     /// `open` with the REAP plan injected instead of taken from process config.
     ///
     /// Public because the process config is a START-TIME SNAPSHOT
@@ -643,7 +642,9 @@ impl HfqFile {
         let mq4v2_symmetric = serde_json::from_str::<serde_json::Value>(&metadata_json)
             .ok()
             .and_then(|metadata| metadata.get("mq4v2.symmetric").cloned())
-            .is_some_and(|marker| marker == serde_json::json!(1) || marker == serde_json::json!(true));
+            .is_some_and(|marker| {
+                marker == serde_json::json!(1) || marker == serde_json::json!(true)
+            });
 
         // Parse tensor index (follows metadata JSON)
         let mut pos = metadata_offset + json_end;
@@ -720,7 +721,11 @@ impl HfqFile {
         }
         if mq4v2_symmetric {
             let mut sampled_groups = 0usize;
-            for tensor in tensors.iter().filter(|tensor| tensor.quant_type == 44).take(4) {
+            for tensor in tensors
+                .iter()
+                .filter(|tensor| tensor.quant_type == 44)
+                .take(4)
+            {
                 let groups = tensor.data_size / 136;
                 if groups == 0 {
                     continue;
@@ -729,7 +734,8 @@ impl HfqFile {
                     let header = tensor.data_offset + group * 136;
                     for half_idx in 0..2 {
                         let offset = header + half_idx * 4;
-                        let d_bits = u16::from_le_bytes(mmap[offset..offset + 2].try_into().unwrap());
+                        let d_bits =
+                            u16::from_le_bytes(mmap[offset..offset + 2].try_into().unwrap());
                         let z_bits =
                             u16::from_le_bytes(mmap[offset + 2..offset + 4].try_into().unwrap());
                         let d = half::f16::from_bits(d_bits).to_f32();
@@ -1052,10 +1058,23 @@ impl HfqFile {
         // back to tensor_data_vec()/tensor_data_pread() on None. Do NOT
         // assert-fail debug builds on that expected path.
         let mmap = self.mmap.as_ref()?;
-        Some((
-            info,
-            &mmap[info.data_offset..info.data_offset + info.data_size],
-        ))
+        // A file truncated in its data region (intact header+index — exactly
+        // what a partial copy leaves) must not panic on the slice below.
+        // The index loop validated every header field, but the data region's
+        // END is only known here. Surface it as None so callers treat the
+        // tensor as missing instead of crashing the loader.
+        let end = info.data_offset.checked_add(info.data_size)?;
+        if end > mmap.len() {
+            eprintln!(
+                "HfqFile: tensor {name:?} data region [{}, {}) overruns the \
+                 {}-byte file — truncated or corrupt HFQ container",
+                info.data_offset,
+                info.data_offset + info.data_size,
+                mmap.len()
+            );
+            return None;
+        }
+        Some((info, &mmap[info.data_offset..end]))
     }
 
     /// Read tensor data via pread into a reusable buffer, then FADV_DONTNEED
@@ -1087,6 +1106,7 @@ impl HfqFile {
             let mut buf = self.pread_buf.borrow_mut();
             buf.resize(info.data_size, 0);
             let mut total_read = 0usize;
+            let mut read_err: Option<std::io::Error> = None;
             while total_read < info.data_size {
                 let n = unsafe {
                     libc::pread(
@@ -1096,7 +1116,16 @@ impl HfqFile {
                         (info.data_offset + total_read) as libc::off_t,
                     )
                 };
-                if n <= 0 {
+                if n == 0 {
+                    // EOF: the file is shorter than the index claims. Without
+                    // this check the tail of the zero-initialized buffer would
+                    // be served as tensor data — silent weight corruption for
+                    // a truncated copy. Drop the partial buffer and report
+                    // the tensor as missing.
+                    break;
+                }
+                if n < 0 {
+                    read_err = Some(std::io::Error::last_os_error());
                     break;
                 }
                 total_read += n as usize;
@@ -1106,6 +1135,17 @@ impl HfqFile {
             // the caller refuses — never hand back a zero-filled tail as if
             // it were weights.
             if total_read < info.data_size {
+                eprintln!(
+                    "HfqFile: tensor {name:?} short read ({total_read} of {} \
+                     bytes at offset {}) — truncated or corrupt HFQ container{}",
+                    info.data_size,
+                    info.data_offset,
+                    read_err
+                        .as_ref()
+                        .map(|e| format!(": {e}"))
+                        .unwrap_or_default()
+                );
+                buf.clear();
                 return None;
             }
             // Evict these pages from cache — works because pread doesn't hold a
@@ -1271,6 +1311,34 @@ impl HfqFile {
     /// `tensor_data_vec`.
     pub fn tensors(&self) -> &[HfqTensorInfo] {
         &self.tensors
+    }
+
+    /// SHA-256 of architecture, metadata JSON, ordered tensor manifest, and
+    /// file length (spec §4.1 C1). Path, inode and mtime are excluded so a
+    /// byte-identical copy at another path is the same content. Computed
+    /// once at load for cache-domain identity.
+    pub fn content_digest(&self) -> Vec<u8> {
+        use sha2::{Digest as Sha256Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(self.arch_id.to_le_bytes());
+        h.update((self.metadata_json.len() as u64).to_le_bytes());
+        h.update(self.metadata_json.as_bytes());
+        h.update((self.tensors.len() as u64).to_le_bytes());
+        for t in &self.tensors {
+            h.update((t.name.len() as u64).to_le_bytes());
+            h.update(t.name.as_bytes());
+            h.update([t.quant_type]);
+            h.update((t.shape.len() as u64).to_le_bytes());
+            for d in &t.shape {
+                h.update(d.to_le_bytes());
+            }
+            h.update(t.group_size.to_le_bytes());
+            h.update((t.data_offset as u64).to_le_bytes());
+            h.update((t.data_size as u64).to_le_bytes());
+        }
+        let len = std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
+        h.update(len.to_le_bytes());
+        h.finalize().to_vec()
     }
 
     /// Compute the exact immutable source identity for this opened HFQ file.

@@ -55,6 +55,7 @@ fn main() {
         gemma4_drafter_path: None,
         gemma4_draft_len: 3,
         vision_path: None,
+        vision_mode: "auto".to_string(),
         xdna: None,
     };
 

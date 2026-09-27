@@ -21,7 +21,7 @@ use std::thread::JoinHandle;
 
 use hipfire_runtime::admission::{AdmissionController, ModelFootprint};
 use hipfire_runtime::serve::{
-    send_event, Continuation, DoneReason, EngineStats, Event, SubmitRequest,
+    send_event, Continuation, DoneReason, EngineStats, Event, RejectClass, SubmitRequest,
 };
 use hipfire_runtime::session_table::{SessionId, SessionTable};
 use hipfire_runtime::swap::snapshot::{capture_slot, restore_slot, SnapshotStamp};
@@ -446,6 +446,7 @@ impl Rig {
             model_hash: weight_bytes,
             kv_dtype_tag: 1,
             per_pos_bytes: per_pos_bytes as u32,
+            per_pos_v_bytes: per_pos_bytes as u32,
             n_fa_layers: n_fa_layers as u32,
             dn_layout_version: 1,
             cap: pool.cap_tokens() as u32,
@@ -605,6 +606,7 @@ fn run_loop(
                 let _ = send_event(
                     &f.reply,
                     Event::Rejected {
+                        class: RejectClass::Internal,
                         reason: reason.clone(),
                     },
                 );
@@ -677,6 +679,7 @@ fn run_loop(
                     let _ = send_event(
                         &f.reply,
                         Event::Rejected {
+                            class: RejectClass::Internal,
                             reason: reason.clone(),
                         },
                     );
@@ -1064,6 +1067,7 @@ fn admit(
                         let _ = send_event(
                             &req.reply,
                             Event::Rejected {
+                                class: RejectClass::Internal,
                                 reason: "eviction failed".to_string(),
                             },
                         );
@@ -1080,6 +1084,7 @@ fn admit(
                             let _ = send_event(
                                 &req.reply,
                                 Event::Rejected {
+                                    class: RejectClass::Internal,
                                     reason: format!("{e:?}"),
                                 },
                             );
@@ -1094,6 +1099,7 @@ fn admit(
                     let _ = send_event(
                         &req.reply,
                         Event::Rejected {
+                            class: RejectClass::Internal,
                             reason: "all slots busy".to_string(),
                         },
                     );
@@ -1110,6 +1116,7 @@ fn admit(
             let _ = send_event(
                 &req.reply,
                 Event::Rejected {
+                    class: RejectClass::Internal,
                     reason: "admitted session holds no slot".to_string(),
                 },
             );
@@ -1127,6 +1134,7 @@ fn admit(
         let _ = send_event(
             &req.reply,
             Event::Rejected {
+                class: RejectClass::Internal,
                 reason: format!("state reset failed: {e}"),
             },
         );
@@ -1143,7 +1151,13 @@ fn admit(
     {
         Ok(p) => p,
         Err(e) => {
-            let _ = send_event(&req.reply, Event::Rejected { reason: e });
+            let _ = send_event(
+                &req.reply,
+                Event::Rejected {
+                    class: RejectClass::Validation,
+                    reason: e,
+                },
+            );
             rig.sessions.close(&mut rig.pool, &mut rig.adm, id);
             stats.lock().expect("stats").note_rejected();
             return;

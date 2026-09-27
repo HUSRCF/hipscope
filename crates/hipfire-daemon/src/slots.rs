@@ -822,6 +822,17 @@ impl SlotBackend {
             top_p,
             top_k: top_k as i32,
             seed,
+            repeat_window: 0,
+            repeat_penalty: 1.0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            min_p: 0.0,
+            visual_data: None,
+            json_schema: None,
+            started_in_think,
+            think_budget: usize::MAX,
+            queue_bytes: 0,
+            request_tag: 0,
             reply: tx,
         };
         if let Err(e) = self.engine.submit(req) {
@@ -959,7 +970,7 @@ impl SlotBackend {
                         done_reason = Some((reason, generated));
                         break;
                     }
-                    Event::Rejected { reason } => {
+                    Event::Rejected { reason, .. } => {
                         rejected = Some(reason);
                         break;
                     }
