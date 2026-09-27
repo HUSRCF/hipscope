@@ -48,6 +48,8 @@ pub struct ScratchState {
     /// f32 RMS value, and three u32 epoch counters, padded to 64 bytes; the
     /// split path uses its first f32 as the RMS handoff.
     pub mq_rmsnorm_wavegrid_scratch: Option<DeviceBuffer>,
+    /// Four-byte result of `tensor_ops::argmax_f32_host`.
+    pub argmax_host: Option<GpuTensor>,
     /// Dedicated F32 temporary for the unfused GEMV-residual alias fallback.
     /// Lazily allocated and grown on demand; no other scratch path uses it.
     pub gemv_residual_tmp: Option<GpuTensor>,

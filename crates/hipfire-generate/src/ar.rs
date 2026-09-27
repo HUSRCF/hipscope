@@ -1837,6 +1837,13 @@ pub fn generate_ar_with_forward<Prefill, Decode>(
         min_p,
     };
     let mut next_token = sampler::sample_cpu(&mut logits, &m.conversation_tokens, &sampler_config);
+    // `sample_cpu` reduces to `llama::argmax` here: take it on the GPU and
+    // read back one index instead of the logits row.
+    let greedy_on_gpu = sampler_config.temperature <= 0.0
+        && !(sampler_config.repeat_penalty != 1.0 && sampler_config.repeat_window > 0)
+        && !((sampler_config.presence_penalty > 0.0 || sampler_config.frequency_penalty > 0.0)
+            && sampler_config.repeat_window > 0)
+        && sampler_config.blocked_tokens.is_empty();
     let mut semantic =
         QwenArSemanticProducer::new_with_tool_protocol(id, started_in_think, tool_protocol_enabled);
     let mut streamed_tokens = Vec::new();
@@ -1939,6 +1946,27 @@ pub fn generate_ar_with_forward<Prefill, Decode>(
             break;
         }
 
+        if greedy_on_gpu {
+            match rdna_compute::tensor_ops::argmax_f32_host(gpu, &decode_logits) {
+                Ok(token) => {
+                    next_token = token;
+                    continue;
+                }
+                Err(error) => {
+                    let _ = gpu.free_tensor(decode_logits);
+                    let ep = production_fail_closed_rollback(m, gpu, None, None);
+                    emit_fail_closed_error(
+                        stdout,
+                        Some(id),
+                        &format!("{} decode argmax failed: {error}", route.name()),
+                        "gpu",
+                        false,
+                        &ep,
+                    );
+                    return;
+                }
+            }
+        }
         let next_logits = match gpu.download_f32(&decode_logits) {
             Ok(logits) => logits,
             Err(error) => {

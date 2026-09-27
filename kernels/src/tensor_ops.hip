@@ -2500,6 +2500,10 @@ extern "C" __global__ void hc_activation_fused_f32(
 
 // Deterministic device-side greedy top-1 over one or more contiguous logits
 // rows.  Ties retain the lowest vocabulary id, matching the reference route.
+// Row argmax with the host sampler's semantics (llama::argmax): the first
+// index of the largest finite value; non-finite values never win, and a row
+// with no finite value yields 0. Ties resolve to the lowest index, so the
+// reduction shape does not matter. Block <= 1024 threads.
 extern "C" __global__ void argmax_f32(
     const float* logits,
     int* indices,
@@ -2507,14 +2511,15 @@ extern "C" __global__ void argmax_f32(
     int vocab) {
     int row = (int)blockIdx.x;
     if (row >= rows) return;
-    __shared__ float values[256];
-    __shared__ int ids[256];
-    float best = -3.402823466e+38f;
-    int best_id = 0x7fffffff;
+    __shared__ float values[1024];
+    __shared__ int ids[1024];
+    float best = -INFINITY;
+    int best_id = 0;
     int base = row * vocab;
+#pragma unroll 8
     for (int id = (int)threadIdx.x; id < vocab; id += (int)blockDim.x) {
         float value = logits[base + id];
-        if (value > best || (value == best && id < best_id)) {
+        if (isfinite(value) && value > best) {
             best = value;
             best_id = id;
         }
@@ -2522,8 +2527,8 @@ extern "C" __global__ void argmax_f32(
     values[threadIdx.x] = best;
     ids[threadIdx.x] = best_id;
     __syncthreads();
-    for (int stride = 128; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) {
+    for (int stride = (int)blockDim.x / 2; stride > 0; stride >>= 1) {
+        if ((int)threadIdx.x < stride) {
             float other = values[threadIdx.x + stride];
             int other_id = ids[threadIdx.x + stride];
             if (other > values[threadIdx.x]

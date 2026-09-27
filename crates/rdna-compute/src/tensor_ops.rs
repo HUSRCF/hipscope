@@ -2886,11 +2886,28 @@ pub fn argmax_f32(gpu: &mut Gpu, p: &ArgmaxF32<'_>) -> HipResult<()> {
     gpu.launch_blob_recorded(
         "argmax_f32",
         [row_grid, 1, 1],
-        [256, 1, 1],
+        [1024, 1, 1],
         0,
         args.as_mut_slice(),
         crate::dispatch::ReplayLaunchBindings::NONE,
     )
+}
+
+/// [`argmax_f32`] of one logits row, read back: `llama::argmax(logits)`
+/// without downloading the row. Uses a lazily allocated 4-byte scratch.
+pub fn argmax_f32_host(gpu: &mut Gpu, logits: &GpuTensor) -> HipResult<u32> {
+    if gpu.scratch.argmax_host.is_none() {
+        gpu.scratch.argmax_host = Some(gpu.alloc_tensor(&[1], DType::F32)?);
+    }
+    let result = gpu.scratch.argmax_host.as_ref().unwrap().sub_offset(0, 1);
+    let mut indices = result.sub_offset(0, 1);
+    indices.dtype = DType::Raw;
+    indices.shape = vec![4];
+    argmax_f32(
+        gpu,
+        &ArgmaxF32 { logits, indices: &indices, rows: 1, vocab: logits.numel() },
+    )?;
+    Ok(gpu.download_f32(&result)?[0].to_bits())
 }
 
 #[cfg(test)]
@@ -3801,6 +3818,32 @@ mod tests {
         assert!(checked_add(max, 1, "boundary").is_err());
         assert!(blocks(max).is_ok());
         assert!(blocks(max + 1).is_err());
+    }
+
+    #[test]
+    fn host_argmax_matches_sampler_semantics() {
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        let mut long = vec![0.25f32; 248_320];
+        long[200_001] = 7.0;
+        long[5] = 7.0;
+        long[9] = f32::INFINITY;
+        let cases: [(Vec<f32>, u32); 4] = [
+            // Ties resolve to the first index.
+            (vec![1.0, 5.0, 3.0, 5.0], 1),
+            // Non-finite values never win.
+            (vec![f32::NAN, f32::INFINITY, 2.0, f32::NEG_INFINITY, 2.0], 2),
+            // No finite value: index 0.
+            (vec![f32::NAN, f32::INFINITY, f32::NEG_INFINITY], 0),
+            (long, 5),
+        ];
+        for (values, expected) in cases {
+            let logits = gpu.upload_f32(&values, &[values.len()]).unwrap();
+            assert_eq!(argmax_f32_host(&mut gpu, &logits).unwrap(), expected);
+            gpu.free_tensor(logits).unwrap();
+        }
     }
 
     #[test]
