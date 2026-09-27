@@ -1747,10 +1747,13 @@ extern "C" __global__ void indexed_attention_pool_rope_f32(
     const __hip_bfloat16* norm,
     int block_count,
     int compress,
-    int index_dim) {
+    int index_dim,
+    int first_block) {
     int block = (int)blockIdx.x;
     int channel = (int)(blockIdx.y * blockDim.x + threadIdx.x);
-    if (block >= block_count || compress <= 0) return;
+    // Blocks below `first_block` already hold this kernel's output for their
+    // unchanged raw keys (the incremental decode caller).
+    if (block < first_block || block >= block_count || compress <= 0) return;
     bool active = channel < index_dim;
     int base = block * compress * index_dim;
     float mean = 0.0f;

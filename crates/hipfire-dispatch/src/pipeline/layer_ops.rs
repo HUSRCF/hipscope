@@ -23,7 +23,8 @@ use rdna_compute::tensor_ops::{
     hyper_norm_f16, hyper_norm_gate, hyper_read_projected, hyper_read_up_fused, hyper_read_up_wmma,
     hyper_write, hyper_write_norm, indexed_attention_attention_batch,
     indexed_attention_cache_append_batch, indexed_attention_decode_prologue,
-    indexed_attention_norm_rope_batch, indexed_attention_pool_rope, indexed_attention_select_batch,
+    indexed_attention_norm_rope_batch, indexed_attention_pool_rope, indexed_attention_pool_rope_incremental,
+    indexed_attention_select_batch,
     indexed_attention_select_batch_mirrored,
     scale_f32, ArgmaxF32, Bf16Roundtrip, GatedDeltaConv, GatedDeltaConvBatched, GatedDeltaGate,
     GatedDeltaGateBatched, GatedDeltaParams, GatedDeltaParamsBatched, GatedDeltaStep,
@@ -1727,7 +1728,14 @@ pub fn execute_indexed_attention(
     // active lengths stay scalars. Measured bit-identical to the position-derived
     // shapes with no throughput delta (docs/design/qwen4-program-retained-pm4.md).
     if complete > 0 {
-        hip(indexed_attention_pool_rope(
+        // Decode pools only the block its row completes (earlier blocks hold
+        // the same kernel's output for unchanged raw keys).
+        let pool = if op.rows == 1 {
+            indexed_attention_pool_rope_incremental
+        } else {
+            indexed_attention_pool_rope
+        };
+        hip(pool(
             gpu,
             &IndexedAttentionPoolRope {
                 raw_keys: op.state.raw_index_keys,

@@ -2447,6 +2447,28 @@ pub fn indexed_attention_pool_rope(
     gpu: &mut Gpu,
     p: &IndexedAttentionPoolRope<'_>,
 ) -> HipResult<()> {
+    indexed_attention_pool_rope_impl(gpu, p, false)
+}
+
+/// [`indexed_attention_pool_rope`] that pools only the blocks the launch's
+/// rows complete: those below `position_start / compress` were pooled by an
+/// earlier launch from the same raw keys and are left as they are (a declared
+/// position is required).
+pub fn indexed_attention_pool_rope_incremental(
+    gpu: &mut Gpu,
+    p: &IndexedAttentionPoolRope<'_>,
+) -> HipResult<()> {
+    indexed_attention_pool_rope_impl(gpu, p, true)
+}
+
+fn indexed_attention_pool_rope_impl(
+    gpu: &mut Gpu,
+    p: &IndexedAttentionPoolRope<'_>,
+    incremental: bool,
+) -> HipResult<()> {
+    if incremental && p.position.is_none() {
+        return Err(HipError::new(0, "incremental QSA pooling needs a declared position"));
+    }
     for tensor in [p.raw_keys, p.pooled] {
         ensure_f32(tensor)?;
     }
@@ -2523,24 +2545,34 @@ pub fn indexed_attention_pool_rope(
     let block_count_offset = args.len() - 4;
     args.push_i32(compress);
     args.push_i32(index_dim);
-    args.pad_to(16);
-    let block_count_binding = match p.position {
-        None => None,
-        Some(position) => {
-            let addend = u32::try_from(position.rows)
-                .map_err(|_| HipError::new(0, "QSA pool/RoPE rows exceed u32"))?;
-            let divisor = u32::try_from(p.compress)
-                .map_err(|_| HipError::new(0, "QSA pool/RoPE compression exceeds u32"))?;
-            Some([crate::replay::ReplayKernargBinding::PositionDivU32 {
-                offset: block_count_offset,
-                addend,
-                divisor,
-            }])
-        }
+    let first_block = match (incremental, p.position) {
+        (true, Some(position)) => position.position_start / p.compress,
+        _ => 0,
     };
-    let kernargs: &[crate::replay::ReplayKernargBinding] = match block_count_binding.as_ref() {
-        None => &[],
-        Some(bindings) => &bindings[..],
+    args.push_i32(checked_i32(first_block, "QSA pool/RoPE first block")?);
+    // Declared dynamic too when incremental: `position_start / compress`.
+    let first_block_offset = args.len() - 4;
+    args.pad_to(16);
+    let addend = u32::try_from(p.position.map_or(0, |position| position.rows))
+        .map_err(|_| HipError::new(0, "QSA pool/RoPE rows exceed u32"))?;
+    let divisor = u32::try_from(p.compress)
+        .map_err(|_| HipError::new(0, "QSA pool/RoPE compression exceeds u32"))?;
+    let bindings = [
+        crate::replay::ReplayKernargBinding::PositionDivU32 {
+            offset: block_count_offset,
+            addend,
+            divisor,
+        },
+        crate::replay::ReplayKernargBinding::PositionDivU32 {
+            offset: first_block_offset,
+            addend: 0,
+            divisor,
+        },
+    ];
+    let kernargs: &[crate::replay::ReplayKernargBinding] = match (p.position, incremental) {
+        (None, _) => &[],
+        (Some(_), false) => &bindings[..1],
+        (Some(_), true) => &bindings[..],
     };
     gpu.launch_blob_recorded(
         "indexed_attention_pool_rope_f32",
