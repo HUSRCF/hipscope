@@ -194,13 +194,29 @@ extern "C" __global__ void hyper_write_norm_f32(
         for (int i = branch * 256 + tid; i < clear_elements; i += branches * 256) clear[i] = 0.0f;
     }
     __shared__ float rms_sum[256];
-    __shared__ float xn[2560];
-    float raw[10], mix[10], weight[10];
+    __shared__ __align__(16) float xn[2560];
+    const int wave = tid >> 5;
+    const int lane = tid & 31;
+    // Every load issues up front, including the next write's norm weights and
+    // (waves 0..3) its gate row quarter: gemv_bf16_xf32_row's eight bf16 per
+    // lane at lane * 8 + s * 256, s = 0..9 for K = 2560.
+    float raw[10], mix[10], weight[10], next_weight[10];
+    uint4 wv[10];
 #pragma unroll
     for (int u = 0; u < 10; ++u) {
         raw[u] = input[offset + tid + u * 256];
         mix[u] = mixed[tid + u * 256];
         weight[u] = HF_BF16_LO((unsigned int)norm_weight[offset + tid + u * 256]);
+    }
+    if (quarters_out) {
+#pragma unroll
+        for (int u = 0; u < 10; ++u)
+            next_weight[u] = HF_BF16_LO((unsigned int)next_norm[offset + tid + u * 256]);
+        if (wave < 4) {
+            const unsigned short* w_row = next_inject + (size_t)wave * 4 * hidden + offset;
+#pragma unroll
+            for (int s = 0; s < 10; ++s) wv[s] = *(const uint4*)(w_row + lane * 8 + s * 256);
+        }
     }
     const float* q = quarters_in + branch * 4;
     const float gate_logit = hf_bf16(
@@ -230,15 +246,28 @@ extern "C" __global__ void hyper_write_norm_f32(
     if (!quarters_out) return;
 #pragma unroll
     for (int u = 0; u < 10; ++u) {
-        const float w = HF_BF16_LO((unsigned int)next_norm[offset + tid + u * 256]);
-        xn[tid + u * 256] = hf_bf16(hf_bf16(raw[u]) * inv * (1.0f + w));
+        xn[tid + u * 256] = hf_bf16(hf_bf16(raw[u]) * inv * (1.0f + next_weight[u]));
     }
     __syncthreads();
-    const int wave = tid >> 5;
     if (wave >= 4) return;
-    const float s = gemv_bf16_xf32_row(
-        next_inject + (size_t)wave * 4 * hidden + offset, xn, hidden, tid & 31);
-    if ((tid & 31) == 0) quarters_out[wave * 4 + branch] = s;
+    // gemv_bf16_xf32_row's accumulation for K = 2560, on the preloaded row.
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+#pragma unroll
+    for (int s = 0; s < 10; ++s) {
+        const float4 xa = *(const float4*)(xn + lane * 8 + s * 256);
+        const float4 xb = *(const float4*)(xn + lane * 8 + s * 256 + 4);
+        a0 += HF_BF16_LO(wv[s].x) * xa.x;
+        a1 += HF_BF16_HI(wv[s].x) * xa.y;
+        a2 += HF_BF16_LO(wv[s].y) * xa.z;
+        a3 += HF_BF16_HI(wv[s].y) * xa.w;
+        a0 += HF_BF16_LO(wv[s].z) * xb.x;
+        a1 += HF_BF16_HI(wv[s].z) * xb.y;
+        a2 += HF_BF16_LO(wv[s].w) * xb.z;
+        a3 += HF_BF16_HI(wv[s].w) * xb.w;
+    }
+    float sum = (a0 + a1) + (a2 + a3);
+    for (int off = 16; off > 0; off >>= 1) sum += __shfl_down(sum, off);
+    if (lane == 0) quarters_out[wave * 4 + branch] = sum;
 }
 
 // gemv_bf16_xf32 followed by bf16_scaled_add_f32 on each output row: the
