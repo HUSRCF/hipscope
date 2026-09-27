@@ -4726,11 +4726,13 @@ impl Gpu {
     /// a prepared handle — never calls `ensure_int4_mmq_x`. Gated by
     /// `HIPFIRE_GFX12_PRODUCER_QUANT_FUSED`; `HIPFIRE_G12_NORM` (default on)
     /// selects the bit-identical `_v2` twins (one wave per 256-group, two
-    /// groups per 64-thread workgroup).
+    /// groups per 64-thread workgroup). `x_fmt` is the storage of `x`, the
+    /// GDN chunk-scan plane (`Bf16` selects the exactly-widening `_xbf16` twins).
     #[allow(clippy::too_many_arguments)]
     pub fn gated_norm_rotate_mq_i4_gfx12_batched(
         &mut self,
         x: &GpuTensor,
+        x_fmt: crate::norm::GdnScanOut,
         z: &GpuTensor,
         weight: &GpuTensor,
         awq: Option<&GpuTensor>,
@@ -4771,28 +4773,27 @@ impl Gpu {
         }
         self.ensure_mq_signs()?;
         let v2 = self.flags.g12_norm_enabled();
-        let (module, source, kernel) = match (awq.is_some(), v2) {
-            (true, false) => (
-                "gated_norm_mq_rotate_awq_i4_gfx12",
-                kernels::GATED_NORM_MQ_ROTATE_AWQ_I4_GFX12_SRC,
-                "gated_norm_mq_rotate_awq_i4_gfx12",
+        let bf16 = x_fmt == crate::norm::GdnScanOut::Bf16;
+        let (module, source) = match (awq.is_some(), v2, bf16) {
+            (true, false, false) => ("gated_norm_mq_rotate_awq_i4_gfx12", kernels::GATED_NORM_MQ_ROTATE_AWQ_I4_GFX12_SRC),
+            (false, false, false) => ("gated_norm_mq_rotate_i4_gfx12", kernels::GATED_NORM_MQ_ROTATE_I4_GFX12_SRC),
+            (true, true, false) => ("gated_norm_mq_rotate_awq_i4_gfx12_v2", kernels::GATED_NORM_MQ_ROTATE_AWQ_I4_GFX12_V2_SRC),
+            (false, true, false) => ("gated_norm_mq_rotate_i4_gfx12_v2", kernels::GATED_NORM_MQ_ROTATE_I4_GFX12_V2_SRC),
+            (true, false, true) => (
+                "gated_norm_mq_rotate_awq_i4_gfx12_xbf16",
+                kernels::GATED_NORM_MQ_ROTATE_AWQ_I4_GFX12_XBF16_SRC,
             ),
-            (false, false) => (
-                "gated_norm_mq_rotate_i4_gfx12",
-                kernels::GATED_NORM_MQ_ROTATE_I4_GFX12_SRC,
-                "gated_norm_mq_rotate_i4_gfx12",
+            (false, false, true) => ("gated_norm_mq_rotate_i4_gfx12_xbf16", kernels::GATED_NORM_MQ_ROTATE_I4_GFX12_XBF16_SRC),
+            (true, true, true) => (
+                "gated_norm_mq_rotate_awq_i4_gfx12_v2_xbf16",
+                kernels::GATED_NORM_MQ_ROTATE_AWQ_I4_GFX12_V2_XBF16_SRC,
             ),
-            (true, true) => (
-                "gated_norm_mq_rotate_awq_i4_gfx12_v2",
-                kernels::GATED_NORM_MQ_ROTATE_AWQ_I4_GFX12_V2_SRC,
-                "gated_norm_mq_rotate_awq_i4_gfx12_v2",
-            ),
-            (false, true) => (
-                "gated_norm_mq_rotate_i4_gfx12_v2",
-                kernels::GATED_NORM_MQ_ROTATE_I4_GFX12_V2_SRC,
-                "gated_norm_mq_rotate_i4_gfx12_v2",
+            (false, true, true) => (
+                "gated_norm_mq_rotate_i4_gfx12_v2_xbf16",
+                kernels::GATED_NORM_MQ_ROTATE_I4_GFX12_V2_XBF16_SRC,
             ),
         };
+        let kernel = module;
         // v2: two 256-groups (one per wave) per 64-thread workgroup.
         let grid_x = if v2 { (k / 256).div_ceil(2) } else { k / 256 };
         self.ensure_kernel(module, source, kernel)?;
@@ -4835,7 +4836,8 @@ impl Gpu {
         );
         let blocks_k = k / 128;
         let bytes = (crate::profile::gated_norm_bytes(k) + crate::profile::mq_rotate_bytes(k)
-            + blocks_k * 72)
+            + blocks_k * 72
+            - if bf16 { k * 2 } else { 0 })
             * batch_size;
         let timer = crate::profile::begin_timer(
             &self.hip,
@@ -4883,11 +4885,15 @@ impl Gpu {
         Ok(crate::scratch::Int4MmqPrepared::from_reservation(reservation))
     }
     /// gfx1201 FP8-stream LA output producer: gated RMSNorm + AWQ/FWHT +
-    /// scale_mode=1 E4M3 preparation in one row workgroup.
+    /// scale_mode=1 E4M3 preparation in one row workgroup. `x_fmt` is the
+    /// storage of `x`, the GDN chunk-scan plane (`Bf16` selects the `_xbf16`
+    /// twin, whose exact widening makes every output byte equal to the f32
+    /// producer on the same values).
     #[allow(clippy::too_many_arguments)]
     pub fn gated_norm_rotate_mq_fp8_gfx12_batched(
         &mut self,
         x: &GpuTensor,
+        x_fmt: crate::norm::GdnScanOut,
         z: &GpuTensor,
         weight: &GpuTensor,
         awq: Option<&GpuTensor>,
@@ -4898,6 +4904,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<crate::scratch::Mq4v2Fp8Prepared> {
+        use crate::norm::GdnScanOut;
         self.bind_thread()?;
         if self.replay.is_recording() || self.graphs.capture_mode {
             return Err(hip_bridge::HipError::new(
@@ -4917,7 +4924,11 @@ impl Gpu {
                 "gated_norm_rotate_mq_fp8_gfx12_batched: invalid gfx1201 shape",
             ));
         }
-        if x.numel() < batch_size * k
+        let x_short = match x_fmt {
+            GdnScanOut::F32 => x.numel() < batch_size * k,
+            GdnScanOut::Bf16 => x.buf.size() < batch_size * k * 2,
+        };
+        if x_short
             || z.numel() < batch_size * k
             || weight.numel() < head_dim
             || x_rot.numel() < batch_size * k
@@ -4931,28 +4942,41 @@ impl Gpu {
         let mut row_scale_shift = fp8_row_scale_shift()?;
         self.ensure_mq_signs()?;
         let inreg = fp8_prod_inreg(k) && (k + 8) * 4 <= 65_536;
-        let (module, source, kernel) = match (awq, inreg) {
-            (Some(_), true) => (
+        let (module, source) = match (awq.is_some(), inreg, x_fmt) {
+            (true, true, GdnScanOut::F32) => (
                 "gated_norm_mq_rotate_awq_mq4v2_fp8_inreg_gfx12",
                 kernels::GATED_NORM_MQ_ROTATE_AWQ_FP8_INREG_GFX12_SRC,
-                "gated_norm_mq_rotate_awq_mq4v2_fp8_inreg_gfx12",
             ),
-            (None, true) => (
+            (false, true, GdnScanOut::F32) => (
                 "gated_norm_mq_rotate_mq4v2_fp8_inreg_gfx12",
                 kernels::GATED_NORM_MQ_ROTATE_FP8_INREG_GFX12_SRC,
-                "gated_norm_mq_rotate_mq4v2_fp8_inreg_gfx12",
             ),
-            (Some(_), false) => (
+            (true, false, GdnScanOut::F32) => (
                 "gated_norm_mq_rotate_awq_mq4v2_fp8_gfx12",
                 kernels::GATED_NORM_MQ_ROTATE_AWQ_FP8_GFX12_SRC,
-                "gated_norm_mq_rotate_awq_mq4v2_fp8_gfx12",
             ),
-            (None, false) => (
+            (false, false, GdnScanOut::F32) => (
                 "gated_norm_mq_rotate_mq4v2_fp8_gfx12",
                 kernels::GATED_NORM_MQ_ROTATE_FP8_GFX12_SRC,
-                "gated_norm_mq_rotate_mq4v2_fp8_gfx12",
+            ),
+            (true, true, GdnScanOut::Bf16) => (
+                "gated_norm_mq_rotate_awq_mq4v2_fp8_inreg_gfx12_xbf16",
+                kernels::GATED_NORM_MQ_ROTATE_AWQ_FP8_INREG_GFX12_XBF16_SRC,
+            ),
+            (false, true, GdnScanOut::Bf16) => (
+                "gated_norm_mq_rotate_mq4v2_fp8_inreg_gfx12_xbf16",
+                kernels::GATED_NORM_MQ_ROTATE_FP8_INREG_GFX12_XBF16_SRC,
+            ),
+            (true, false, GdnScanOut::Bf16) => (
+                "gated_norm_mq_rotate_awq_mq4v2_fp8_gfx12_xbf16",
+                kernels::GATED_NORM_MQ_ROTATE_AWQ_FP8_GFX12_XBF16_SRC,
+            ),
+            (false, false, GdnScanOut::Bf16) => (
+                "gated_norm_mq_rotate_mq4v2_fp8_gfx12_xbf16",
+                kernels::GATED_NORM_MQ_ROTATE_FP8_GFX12_XBF16_SRC,
             ),
         };
+        let kernel = module;
         self.ensure_kernel(module, source, kernel)?;
         let (x_fp8_bytes, half_sums_bytes, row_scales_bytes) =
             crate::scratch::mq4v2_fp8_needed(batch_size, k);
@@ -5017,7 +5041,8 @@ impl Gpu {
             ]
             .into_iter(),
         );
-        let bytes = (k * 4 * 4 + k + (k / 256) * 2 * 4 + 4) * batch_size;
+        let x_bytes = if x_fmt == GdnScanOut::Bf16 { 2 } else { 4 };
+        let bytes = (k * (3 * 4 + x_bytes) + k + (k / 256) * 2 * 4 + 4) * batch_size;
         let timer = crate::profile::begin_timer(
             &self.hip,
             "fused",

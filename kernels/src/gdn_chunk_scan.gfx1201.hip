@@ -22,6 +22,37 @@ typedef float gs_f8 __attribute__((ext_vector_type(8)));
 
 __device__ __forceinline__ float gs_bf(unsigned short x){return __half2float(__ushort_as_half(x));}
 __device__ __forceinline__ unsigned short gs_b16(float x){return __half_as_ushort(__float2half_rn(x));}
+// Scan output format (host-selected module variants; the default build is
+// unchanged). GDN_SCAN_OUT_EMU=1/2 is the diagnostic emulation: every `out`
+// value is rounded to bf16/f16 RNE and still stored as f32.
+// GDN_SCAN_OUT_BF16 stores the EMU=1 values' bf16 bits as a 16-bit plane
+// (same [T][48][128] element layout, half the bytes).
+#ifndef GDN_SCAN_OUT_EMU
+#define GDN_SCAN_OUT_EMU 0
+#endif
+#if GDN_SCAN_OUT_EMU && defined(GDN_SCAN_OUT_BF16)
+#error "GDN_SCAN_OUT_EMU and GDN_SCAN_OUT_BF16 are exclusive"
+#endif
+#ifndef GDN_CHUNK_SCAN_KERNEL
+#define GDN_CHUNK_SCAN_KERNEL gdn_chunk_scan
+#endif
+__device__ __forceinline__ unsigned short gs_bf16_rne(float x){unsigned u=__float_as_uint(x);
+ if((u&0x7fffffffu)>0x7f800000u)return (unsigned short)((u>>16)|0x40u);
+ return (unsigned short)((u+0x7fffu+((u>>16)&1u))>>16);}
+__device__ __forceinline__ float gs_out_emu(float x){
+#if GDN_SCAN_OUT_EMU==1
+ return __uint_as_float((unsigned)gs_bf16_rne(x)<<16);
+#elif GDN_SCAN_OUT_EMU==2
+ return __half2float(__float2half_rn(x));
+#else
+ return x;
+#endif
+}
+#ifdef GDN_SCAN_OUT_BF16
+typedef unsigned short gs_out_t;
+#else
+typedef float gs_out_t;
+#endif
 __device__ __forceinline__ gs_f8 gs_z8(){return (gs_f8){0,0,0,0,0,0,0,0};}
 __device__ __forceinline__ gs_f8 gs_mma(gs_bfrag a,gs_bfrag b,gs_f8 c){
 #if GDN_CHUNK_GFX12
@@ -92,10 +123,10 @@ __global__ void gdn_chunk_scan_f32_edge(
  const float* __restrict__ h0,float* __restrict__ ht,float* __restrict__ out,int row0,int T){
 #else
 extern "C" __launch_bounds__(512,1)
-__global__ void gdn_chunk_scan(
+__global__ void GDN_CHUNK_SCAN_KERNEL(
  const unsigned short* __restrict__ q,const unsigned short* __restrict__ k,const unsigned short* __restrict__ v,
  const unsigned short* __restrict__ A,const float* __restrict__ G,const float* __restrict__ beta,
- signed char* __restrict__ sq,float* __restrict__ sc,_Float16* __restrict__ ef,float* __restrict__ out,int row0,int T){
+ signed char* __restrict__ sq,float* __restrict__ sc,_Float16* __restrict__ ef,gs_out_t* __restrict__ out,int row0,int T){
 #endif
  if(T<=0||T>512)return;
  const int head=(int)blockIdx.y;
@@ -212,9 +243,17 @@ __global__ void gdn_chunk_scan(
   const int tok=mt*16+lo;
   if(tok<rows){unsigned char*ob=reinterpret_cast<unsigned char*>(out+((unsigned long long)parent0*48+head)*GS_D+vbase);
 #pragma unroll
-   for(int j=0;j<2;++j){const unsigned off=(unsigned)tok*(48u*GS_D*4u)+(unsigned)((ntb+j)*16+8*hi)*4u;
-    *reinterpret_cast<float4*>(ob+off)=make_float4(O[j][0],O[j][1],O[j][2],O[j][3]);
-    *reinterpret_cast<float4*>(ob+off+16u)=make_float4(O[j][4],O[j][5],O[j][6],O[j][7]);}}
+   for(int j=0;j<2;++j){
+#ifdef GDN_SCAN_OUT_BF16
+    const unsigned off=(unsigned)tok*(48u*GS_D*2u)+(unsigned)((ntb+j)*16+8*hi)*2u;unsigned w[4];
+#pragma unroll
+    for(int e=0;e<4;++e)w[e]=(unsigned)gs_bf16_rne(O[j][2*e])|((unsigned)gs_bf16_rne(O[j][2*e+1])<<16);
+    *reinterpret_cast<uint4*>(ob+off)=make_uint4(w[0],w[1],w[2],w[3]);}}
+#else
+    const unsigned off=(unsigned)tok*(48u*GS_D*4u)+(unsigned)((ntb+j)*16+8*hi)*4u;
+    *reinterpret_cast<float4*>(ob+off)=make_float4(gs_out_emu(O[j][0]),gs_out_emu(O[j][1]),gs_out_emu(O[j][2]),gs_out_emu(O[j][3]));
+    *reinterpret_cast<float4*>(ob+off+16u)=make_float4(gs_out_emu(O[j][4]),gs_out_emu(O[j][5]),gs_out_emu(O[j][6]),gs_out_emu(O[j][7]));}}
+#endif
   // The z tile in state[] has been dead since the previous barrier.
 #pragma unroll
   for(int it=0;it<2;++it){const int idx=tid+it*512,r=idx>>4,c=(idx&15)*8;uint2*dst=reinterpret_cast<uint2*>(&sm.state[0][r][c]);dst[0]=make_uint2(kw[it].x,kw[it].y);dst[1]=make_uint2(kw[it].z,kw[it].w);}
@@ -283,7 +322,11 @@ __global__ void gdn_chunk_scan(
   const int tok=mt*16+lo;
   if(tok<rows){
 #pragma unroll
-   for(int j=0;j<2;++j)for(int e=0;e<8;++e){int vv=vbase+(ntb+j)*16+gs_acc_row(lane,e);out[((unsigned long long)(parent0+tok)*48+head)*GS_D+vv]=O[j][e];}}
+#ifdef GDN_SCAN_OUT_BF16
+   for(int j=0;j<2;++j)for(int e=0;e<8;++e){int vv=vbase+(ntb+j)*16+gs_acc_row(lane,e);out[((unsigned long long)(parent0+tok)*48+head)*GS_D+vv]=gs_bf16_rne(O[j][e]);}}
+#else
+   for(int j=0;j<2;++j)for(int e=0;e<8;++e){int vv=vbase+(ntb+j)*16+gs_acc_row(lane,e);out[((unsigned long long)(parent0+tok)*48+head)*GS_D+vv]=gs_out_emu(O[j][e]);}}
+#endif
   GS_BAR();
 #pragma unroll
   for(int j=0;j<2;++j)for(int e=0;e<8;++e){int t=mt*16+gs_acc_row(lane,e),vv=(ntb+j)*16+lo;sm.d[half][vv][t]=gs_b16(sm.ctrl[1][t]*gs_bf(sm.d[half][vv][t]));}

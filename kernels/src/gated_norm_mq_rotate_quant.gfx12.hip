@@ -54,13 +54,24 @@
 #define HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL gated_norm_mq_rotate_i4_gfx12
 #endif
 
+// HIPFIRE_GATED_NORM_X_BF16 (gfx1201 `_xbf16` symbols): `x` (the GDN
+// chunk-scan output) is a bf16 plane; every element widens exactly to the
+// f32 the incumbent loaded.
+#ifdef HIPFIRE_GATED_NORM_X_BF16
+typedef unsigned short gnq_x_t;
+__device__ __forceinline__ float gnq_x(gnq_x_t v) { return __uint_as_float((unsigned)v << 16); }
+#else
+typedef float gnq_x_t;
+__device__ __forceinline__ float gnq_x(gnq_x_t v) { return v; }
+#endif
+
 #ifdef HIPFIRE_GATED_NORM_WAVE_GROUP
 #ifndef HIPFIRE_GATED_NORM_WAVES
 #define HIPFIRE_GATED_NORM_WAVES 2
 #endif
 extern "C" __launch_bounds__(32 * HIPFIRE_GATED_NORM_WAVES)
 __global__ void HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL(
-    const float* __restrict__ x,
+    const gnq_x_t* __restrict__ x,
     const float* __restrict__ z,
     const float* __restrict__ weight,
 #ifdef HIPFIRE_GATED_NORM_MQ_ROTATE_AWQ
@@ -88,7 +99,7 @@ __global__ void HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL(
     if (group * 2 + 1 >= n_heads) return;
 
     const long long batch_off = (long long)batch * K;
-    const float* xg = x + batch_off + (long long)group * 256;
+    const gnq_x_t* xg = x + batch_off + (long long)group * 256;
     const float* zg = z + batch_off + (long long)group * 256;
 
     __shared__ float normalized_waves[HIPFIRE_GATED_NORM_WAVES * 256];
@@ -104,7 +115,7 @@ __global__ void HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL(
     for (int h = 0; h < 2; ++h) {
         #pragma unroll
         for (int k = 0; k < 4; ++k) {
-            xv[h][k] = xg[h * 128 + lane + 32 * k];
+            xv[h][k] = gnq_x(xg[h * 128 + lane + 32 * k]);
             zv[h][k] = zg[h * 128 + lane + 32 * k];
 #ifdef HIPFIRE_GATED_NORM_MQ_ROTATE_AWQ
             av[h][k] = awq_scale[(long long)group * 256 + h * 128 + lane + 32 * k];
@@ -143,7 +154,7 @@ __global__ void HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL(
 #else
 extern "C" __launch_bounds__(64, 8)
 __global__ void HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL(
-    const float* __restrict__ x,
+    const gnq_x_t* __restrict__ x,
     const float* __restrict__ z,
     const float* __restrict__ weight,
 #ifdef HIPFIRE_GATED_NORM_MQ_ROTATE_AWQ
@@ -174,7 +185,7 @@ __global__ void HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL(
     if (head >= n_heads) return;
 
     const long long batch_off = (long long)batch * K;
-    const float* xh = x + batch_off + (long long)head * head_dim;
+    const gnq_x_t* xh = x + batch_off + (long long)head * head_dim;
     const float* zh = z + batch_off + (long long)head * head_dim;
 #ifdef HIPFIRE_GATED_NORM_MQ_ROTATE_AWQ
     const long long head_off = (long long)head * head_dim;
@@ -187,13 +198,13 @@ __global__ void HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL(
     // reduction exactly.
     float sq_sum = 0.0f;
     for (int i = lane; i < head_dim; i += 32)
-        sq_sum += xh[i] * xh[i];
+        sq_sum += gnq_x(xh[i]) * gnq_x(xh[i]);
     for (int o = 16; o > 0; o >>= 1)
         sq_sum += __shfl_xor(sq_sum, o);
     const float inv_rms = rsqrtf(sq_sum / (float)head_dim + eps);
 
     for (int i = lane; i < head_dim; i += 32) {
-        const float normed = xh[i] * inv_rms * weight[i];
+        const float normed = gnq_x(xh[i]) * inv_rms * weight[i];
         const float z_val = zh[i];
         const float silu_z = z_val / (1.0f + expf(-z_val));
 #ifdef HIPFIRE_GATED_NORM_MQ_ROTATE_AWQ

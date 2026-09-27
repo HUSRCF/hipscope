@@ -585,12 +585,15 @@ impl KernelCompiler {
                     | "gdn_chunk_prep_fixup"
                     | "gdn_chunk_kkt_solve"
                     | "gdn_chunk_scan"
+                    | "gdn_chunk_scan_emu_bf16"
+                    | "gdn_chunk_scan_emu_f16"
+                    | "gdn_chunk_scan_bf16"
                     | "gdn_chunk_prep_gfx11"
                     | "gdn_chunk_kkt_solve_gfx1100"
             )
         {
             let mut flags = vec!["-ffp-contract=off".to_owned()];
-            if arch == "gfx1201" && name == "gdn_chunk_scan" {
+            if arch == "gfx1201" && name.starts_with("gdn_chunk_scan") {
                 flags.push("-mcumode".to_owned());
             }
             flags

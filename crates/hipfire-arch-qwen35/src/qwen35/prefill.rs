@@ -47,6 +47,7 @@ use hipfire_runtime::llama::fused_rmsnorm_rotate_for_mq;
 use hipfire_runtime::llama::fused_rmsnorm_rotate_mq_batched_for;
 use hipfire_runtime::llama::fused_rmsnorm_rotate_mq_f16_batched_for;
 use hipfire_runtime::llama::fused_silu_mul_rotate_mq_batched_for;
+use rdna_compute::norm::GdnScanOut;
 
 /// Producer-emitted A8 RMSNorm/FWHT, selected only for uniform MQ4v2 weights.
 #[allow(clippy::too_many_arguments)]
@@ -78,6 +79,16 @@ fn try_a8_hin_prepared(
     gpu.fused_silu_hin_rotate_mq_i8_gfx12_batched(h, awq, reservation, k, n).map(Some)
 }
 
+fn a8_gdn_admitted(
+    gpu: &Gpu, wo: &hipfire_runtime::llama::WeightTensor,
+    n_heads: usize, head_dim: usize, k: usize, n: usize, epilogue: &BatchEpilogue<'_>,
+) -> bool {
+    gpu.flags.a8_fused_prod && gpu.a8_prefill_active(n, k)
+        && wo.gpu_dtype == DType::MQ4G256V2
+        && matches!(epilogue, BatchEpilogue::Residual)
+        && head_dim == 128 && n_heads * head_dim == k
+}
+
 #[allow(clippy::too_many_arguments)]
 fn try_a8_gdn_prepared(
     gpu: &mut Gpu, wo: &hipfire_runtime::llama::WeightTensor,
@@ -85,10 +96,7 @@ fn try_a8_gdn_prepared(
     n_heads: usize, head_dim: usize, eps: f32, k: usize, n: usize,
     epilogue: &BatchEpilogue<'_>,
 ) -> HipResult<Option<rdna_compute::Int8MmqPrepared>> {
-    if !gpu.flags.a8_fused_prod || !gpu.a8_prefill_active(n, k)
-        || wo.gpu_dtype != DType::MQ4G256V2
-        || !matches!(epilogue, BatchEpilogue::Residual)
-        || head_dim != 128 || n_heads * head_dim != k {
+    if !a8_gdn_admitted(gpu, wo, n_heads, head_dim, k, n, epilogue) {
         return Ok(None);
     }
     let reservation = gpu.reserve_int8_mmq(k, n)?;
@@ -580,6 +588,22 @@ fn try_gfx11_sigmoid_rotate_quant_fused_prepared(
 }
 
 
+fn gfx12_gdn_quant_fused_admitted(
+    gpu: &Gpu,
+    wo: &hipfire_runtime::llama::WeightTensor,
+    n_heads: usize,
+    head_dim: usize,
+    k: usize,
+    n: usize,
+    epilogue: &BatchEpilogue<'_>,
+) -> bool {
+    wo.gpu_dtype == DType::MQ4G256V2
+        && matches!(epilogue, BatchEpilogue::Residual)
+        && head_dim == 128
+        && n_heads * head_dim == k
+        && gpu.iu4_producer_quant_fused_active(n, k)
+}
+
 /// gfx1201 slices-4: gated RMSNorm + FWHT + `block_i4_128` IU4 producer for
 /// the LA post-GDN `wo` input. `None` → caller keeps the incumbent
 /// gated_norm_f32 + rotate + standalone-quantizer path. Admission is
@@ -589,12 +613,13 @@ fn try_gfx11_sigmoid_rotate_quant_fused_prepared(
 /// the caller must skip the standalone `gated_norm_f32_batched` store
 /// (`dn_normed_batch` has no other reader on the admitted path); the f32
 /// `x_rot` store is always written, so every downstream reader is preserved
-/// byte-for-byte.
+/// byte-for-byte. `x_fmt` is the storage of `x` (the GDN chunk-scan plane).
 #[allow(clippy::too_many_arguments)]
 fn try_gfx12_gdn_quant_fused_prepared(
     gpu: &mut Gpu,
     wo: &hipfire_runtime::llama::WeightTensor,
     x: &GpuTensor,
+    x_fmt: GdnScanOut,
     z: &GpuTensor,
     norm_weight: &GpuTensor,
     x_rot: &GpuTensor,
@@ -605,17 +630,13 @@ fn try_gfx12_gdn_quant_fused_prepared(
     n: usize,
     epilogue: &BatchEpilogue<'_>,
 ) -> HipResult<Option<rdna_compute::Int4MmqPrepared>> {
-    if wo.gpu_dtype != DType::MQ4G256V2
-        || !matches!(epilogue, BatchEpilogue::Residual)
-        || head_dim != 128
-        || n_heads * head_dim != k
-        || !gpu.iu4_producer_quant_fused_active(n, k)
-    {
+    if !gfx12_gdn_quant_fused_admitted(gpu, wo, n_heads, head_dim, k, n, epilogue) {
         return Ok(None);
     }
     let res = gpu.reserve_int4_mmq(k, n)?;
     let prep = gpu.gated_norm_rotate_mq_i4_gfx12_batched(
         x,
+        x_fmt,
         z,
         norm_weight,
         wo.awq_scale.as_ref(),
@@ -629,14 +650,31 @@ fn try_gfx12_gdn_quant_fused_prepared(
     )?;
     Ok(Some(prep))
 }
+
+fn gfx12_fp8_stream_gdn_admitted(
+    gpu: &Gpu,
+    wo: &hipfire_runtime::llama::WeightTensor,
+    n_heads: usize,
+    head_dim: usize,
+    k: usize,
+    n: usize,
+) -> bool {
+    matches!(wo.gpu_dtype, DType::MQ4G256V2 | DType::MQ4G256V2Lloyd)
+        && head_dim == 128
+        && n_heads * head_dim == k
+        && gpu.fp8_stream_active(n, k)
+}
+
 /// gfx1201 FP8-stream LA output producer.  Replaces gated_norm + AWQ/FWHT
 /// rotate + standalone pack for Lloyd residual consumers. With
 /// `HIPFIRE_FP8_PROD_INREG=1`, the FP8 prepared consumer does not read `x_rot`.
+/// `x_fmt` is the storage of `x` (the GDN chunk-scan plane).
 #[allow(clippy::too_many_arguments)]
 fn try_gfx12_fp8_stream_gdn_prepared(
     gpu: &mut Gpu,
     wo: &hipfire_runtime::llama::WeightTensor,
     x: &GpuTensor,
+    x_fmt: GdnScanOut,
     z: &GpuTensor,
     norm_weight: &GpuTensor,
     x_rot: &GpuTensor,
@@ -646,15 +684,12 @@ fn try_gfx12_fp8_stream_gdn_prepared(
     k: usize,
     n: usize,
 ) -> HipResult<Option<rdna_compute::Mq4v2Fp8Prepared>> {
-    if !matches!(wo.gpu_dtype, DType::MQ4G256V2 | DType::MQ4G256V2Lloyd)
-        || head_dim != 128
-        || n_heads * head_dim != k
-        || !gpu.fp8_stream_active(n, k)
-    {
+    if !gfx12_fp8_stream_gdn_admitted(gpu, wo, n_heads, head_dim, k, n) {
         return Ok(None);
     }
     let prep = gpu.gated_norm_rotate_mq_fp8_gfx12_batched(
         x,
+        x_fmt,
         z,
         norm_weight,
         wo.awq_scale.as_ref(),
@@ -666,6 +701,22 @@ fn try_gfx12_fp8_stream_gdn_prepared(
         n,
     )?;
     Ok(Some(prep))
+}
+
+fn gfx11_gdn_quant_fused_admitted(
+    gpu: &Gpu,
+    wo: &hipfire_runtime::llama::WeightTensor,
+    n_heads: usize,
+    head_dim: usize,
+    k: usize,
+    n: usize,
+    epilogue: &BatchEpilogue<'_>,
+) -> bool {
+    wo.gpu_dtype == DType::MQ4G256V2
+        && matches!(epilogue, BatchEpilogue::Residual)
+        && head_dim == 128
+        && n_heads * head_dim == k
+        && gpu.iu4_gfx11_producer_quant_fused_active(n, k)
 }
 
 /// gfx11 slices-4: gated RMSNorm + FWHT + `block_i4_128` IU4 producer for
@@ -693,12 +744,7 @@ fn try_gfx11_gdn_quant_fused_prepared(
     n: usize,
     epilogue: &BatchEpilogue<'_>,
 ) -> HipResult<Option<rdna_compute::Int4MmqPrepared>> {
-    if wo.gpu_dtype != DType::MQ4G256V2
-        || !matches!(epilogue, BatchEpilogue::Residual)
-        || head_dim != 128
-        || n_heads * head_dim != k
-        || !gpu.iu4_gfx11_producer_quant_fused_active(n, k)
-    {
+    if !gfx11_gdn_quant_fused_admitted(gpu, wo, n_heads, head_dim, k, n, epilogue) {
         return Ok(None);
     }
     let res = gpu.reserve_int4_mmq(k, n)?;
@@ -6796,11 +6842,66 @@ fn s4_residual_fast(
         && (1..=16).contains(&n)
 }
 
+/// Producer that [`batch_chunk_delta_net_output_projection`] selects for the
+/// LA `out` plane (same selection order). Only the gfx1201 FP8-stream and A4
+/// IU4 producers have `_xbf16` twins.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GdnOutReader {
+    Fp8Stream,
+    Gfx12Iu4,
+    F32Only,
+}
+
+fn gdn_out_reader(
+    gpu: &Gpu,
+    layer: &DeltaNetLayerWeights,
+    config: &Qwen35Config,
+    n: usize,
+    n_v_heads: usize,
+    epilogue: &BatchEpilogue<'_>,
+    fusion: DflashFusionCtx,
+) -> GdnOutReader {
+    let (wo, hd, k) = (&layer.wo, config.linear_value_head_dim, layer.wo.k);
+    if s4_residual_fast(gpu, fusion, wo.gpu_dtype, epilogue, n)
+        || a8_gdn_admitted(gpu, wo, n_v_heads, hd, k, n, epilogue)
+    {
+        GdnOutReader::F32Only
+    } else if gfx12_gdn_quant_fused_admitted(gpu, wo, n_v_heads, hd, k, n, epilogue) {
+        GdnOutReader::Gfx12Iu4
+    } else if gfx11_gdn_quant_fused_admitted(gpu, wo, n_v_heads, hd, k, n, epilogue) {
+        GdnOutReader::F32Only
+    } else if gfx12_fp8_stream_gdn_admitted(gpu, wo, n_v_heads, hd, k, n) {
+        GdnOutReader::Fp8Stream
+    } else {
+        GdnOutReader::F32Only
+    }
+}
+
+/// Storage of the gfx1201 GDN chunk-scan `out` plane for this LA layer: the
+/// route default of its producer (FP8-stream and A4 IU4: bf16), overridable
+/// by `HIPFIRE_GDN_SCAN_OUT`; f32 for every producer without an `_xbf16` twin.
+fn gdn_scan_out_fmt(
+    gpu: &Gpu,
+    layer: &DeltaNetLayerWeights,
+    config: &Qwen35Config,
+    n: usize,
+    n_v_heads: usize,
+    epilogue: &BatchEpilogue<'_>,
+    fusion: DflashFusionCtx,
+) -> HipResult<GdnScanOut> {
+    match gdn_out_reader(gpu, layer, config, n, n_v_heads, epilogue, fusion) {
+        GdnOutReader::Fp8Stream => gpu.gdn_scan_out(GdnScanOut::Bf16),
+        GdnOutReader::Gfx12Iu4 => gpu.gdn_scan_out(GdnScanOut::Bf16),
+        GdnOutReader::F32Only => Ok(GdnScanOut::F32),
+    }
+}
+
 /// Prescaffold (behavior-only) extraction for S4-f16-residual-inputs.
 ///
 /// Same statements, same order, same launches as the inlined block.
 /// S9-mq4v2-persistent-prologues will issue `try_mq4v2_persistent_prologue`
 /// from inside this hook after S3/S4 land.
+/// `x_fmt` is the storage of `dn_attn_out_batch` ([`gdn_scan_out_fmt`]).
 fn batch_chunk_delta_net_output_projection(
     gpu: &mut Gpu,
     layer: &DeltaNetLayerWeights,
@@ -6812,7 +6913,13 @@ fn batch_chunk_delta_net_output_projection(
     arch_has_wmma: bool,
     epilogue: BatchEpilogue<'_>,
     fusion: DflashFusionCtx,
+    x_fmt: GdnScanOut,
 ) -> HipResult<()> {
+    if x_fmt != GdnScanOut::F32
+        && gdn_out_reader(gpu, layer, config, n, n_v_heads, &epilogue, fusion) == GdnOutReader::F32Only
+    {
+        return Err(HipError::new(0, "bf16 GDN scan plane without an _xbf16 producer"));
+    }
     // S4: one gated_norm+FWHT+F16 producer + direct-F16 residual GEMM
     // instead of gated_norm_f32 + mq_rotate_x + convert.
     if s4_residual_fast(gpu, fusion, layer.wo.gpu_dtype, &epilogue, n)
@@ -6876,7 +6983,7 @@ fn batch_chunk_delta_net_output_projection(
     )?;
     let mut gdn_fused_prep = if a8_gdn_prep.is_none() {
         try_gfx12_gdn_quant_fused_prepared(
-            gpu, &layer.wo, &pbs.dn_attn_out_batch, &pbs.dn_z_batch,
+            gpu, &layer.wo, &pbs.dn_attn_out_batch, x_fmt, &pbs.dn_z_batch,
             &layer.norm_weight, &pbs.dn_normed_rot_batch, n_v_heads,
             config.linear_value_head_dim, config.norm_eps, layer.wo.k, n, &epilogue,
         )?
@@ -6902,6 +7009,7 @@ fn batch_chunk_delta_net_output_projection(
             gpu,
             &layer.wo,
             &pbs.dn_attn_out_batch,
+            x_fmt,
             &pbs.dn_z_batch,
             &layer.norm_weight,
             &pbs.dn_normed_rot_batch,
@@ -7156,18 +7264,19 @@ pub(crate) fn batch_chunk_delta_net_attn(
 
         // JIT/load failure must occur before input projection or persistent
         // preamble mutation; no legacy retry is valid after this point.
-        gpu.gdn_chunk_prepare()?;
+        let scan_out = gdn_scan_out_fmt(gpu, layer, config, n, n_v_heads, &epilogue, fusion)?;
+        gpu.gdn_chunk_prepare(scan_out)?;
         if gpu.gdn_prep_fused_enabled() {
             gpu.gdn_chunk_prep_fixup_prepare()?;
         }
-        Some((q, k, v, a, segment_rows))
+        Some((q, k, v, a, segment_rows, scan_out))
     } else {
         None
     };
 
     let q_scale = 1.0 / (hd as f32).sqrt();
     let gdn_targets = match &gdn_chunk_scan_views {
-        Some((q, k, v, _, _)) if gpu.gdn_prep_fused_enabled() => Some(rdna_compute::F2GdnTargets {
+        Some((q, k, v, _, _, _)) if gpu.gdn_prep_fused_enabled() => Some(rdna_compute::F2GdnTargets {
             conv_weight: &layer.conv_weight,
             conv_state: &dn_state.conv_states[delta_layer_idx],
             q,
@@ -7182,7 +7291,7 @@ pub(crate) fn batch_chunk_delta_net_attn(
         gpu, layer, config, pbs, n, dim, q8_wmma_arch, fusion, gdn_targets.as_ref(),
     )?;
 
-    if let Some((q, k, v, a, segment_rows)) = gdn_chunk_scan_views {
+    if let Some((q, k, v, a, segment_rows, scan_out)) = gdn_chunk_scan_views {
         // The fused QKVZA already wrote q/k/v except the tile heads; the
         // completion pass finishes them, the gates and the conv ring.
         let prep = if prep_fused { Gpu::gdn_chunk_prep_fixup } else { Gpu::gdn_chunk_prep };
@@ -7218,6 +7327,7 @@ pub(crate) fn batch_chunk_delta_net_attn(
                 &dn_state.s_scales[delta_layer_idx],
                 ef,
                 &pbs.dn_attn_out_batch,
+                scan_out,
                 row0,
                 rows,
             )?;
@@ -7233,6 +7343,7 @@ pub(crate) fn batch_chunk_delta_net_attn(
             arch_has_wmma,
             epilogue,
             fusion,
+            scan_out,
         )?;
         return Ok(());
     }
@@ -7465,6 +7576,7 @@ pub(crate) fn batch_chunk_delta_net_attn(
         arch_has_wmma,
         epilogue,
         fusion,
+        GdnScanOut::F32,
     )?;
 
     Ok(())
@@ -10763,6 +10875,7 @@ fn batch_chunk_delta_net_moe(
         gpu,
         &layer.wo,
         &pbs.dn_attn_out_batch,
+        GdnScanOut::F32,
         &pbs.dn_z_batch,
         &layer.norm_weight,
         &pbs.dn_normed_rot_batch,
@@ -16162,6 +16275,7 @@ mod tests {
         let prep = gpu
             .gated_norm_rotate_mq_i4_gfx12_batched(
                 &x_t,
+                GdnScanOut::F32,
                 &z_t,
                 norm_weight,
                 wo.awq_scale.as_ref(),

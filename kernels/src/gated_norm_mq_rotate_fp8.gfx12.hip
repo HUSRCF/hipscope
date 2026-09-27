@@ -13,9 +13,19 @@
 #define HIPFIRE_GATED_NORM_FP8_KERNEL gated_norm_mq_rotate_mq4v2_fp8_gfx12
 #endif
 
+// HIPFIRE_GATED_NORM_X_BF16: `x` (the GDN chunk-scan output) is a bf16 plane;
+// every element widens exactly to the f32 the incumbent loaded.
+#ifdef HIPFIRE_GATED_NORM_X_BF16
+typedef unsigned short gnf_x_t;
+__device__ __forceinline__ float gnf_x(gnf_x_t v) { return __uint_as_float((unsigned)v << 16); }
+#else
+typedef float gnf_x_t;
+__device__ __forceinline__ float gnf_x(gnf_x_t v) { return v; }
+#endif
+
 extern "C" __launch_bounds__(256, 1) __global__
 void HIPFIRE_GATED_NORM_FP8_KERNEL(
-    const float* __restrict__ x,
+    const gnf_x_t* __restrict__ x,
     const float* __restrict__ z,
     const float* __restrict__ weight,
 #ifdef HIPFIRE_GATED_NORM_FP8_AWQ
@@ -41,7 +51,7 @@ void HIPFIRE_GATED_NORM_FP8_KERNEL(
     const int lane = tid & 31;
     const int wave = tid >> 5;
     const long long row_off = (long long)token * K;
-    const float* x_b = x + row_off;
+    const gnf_x_t* x_b = x + row_off;
     const float* z_b = z + row_off;
 #ifndef HIPFIRE_FP8_PROD_INREG
     float* x_rot_b = x_rot + row_off;
@@ -57,17 +67,17 @@ void HIPFIRE_GATED_NORM_FP8_KERNEL(
     // expression order.  Eight waves cover the row's heads in strides of 8.
     for (int head = wave; head < n_heads; head += 8) {
         const long long head_off = (long long)head * head_dim;
-        const float* xh = x_b + head_off;
+        const gnf_x_t* xh = x_b + head_off;
         const float* zh = z_b + head_off;
         float* oh = normalized + head_off;
         float sq_sum = 0.0f;
         for (int i = lane; i < head_dim; i += 32)
-            sq_sum += xh[i] * xh[i];
+            sq_sum += gnf_x(xh[i]) * gnf_x(xh[i]);
         for (int o = 16; o > 0; o >>= 1)
             sq_sum += __shfl_xor(sq_sum, o);
         const float inv_rms = rsqrtf(sq_sum / (float)head_dim + eps);
         for (int i = lane; i < head_dim; i += 32) {
-            const float normed = xh[i] * inv_rms * weight[i];
+            const float normed = gnf_x(xh[i]) * inv_rms * weight[i];
             const float z_val = zh[i];
             const float silu_z = z_val / (1.0f + expf(-z_val));
 #ifdef HIPFIRE_GATED_NORM_FP8_AWQ

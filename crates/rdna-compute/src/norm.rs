@@ -83,6 +83,17 @@ pub fn gdn_chunk_size() -> usize {
     cs.clamp(1, 32)
 }
 
+/// Storage of the GDN chunk-scan `out` plane (`[T][48][128]` elements, see
+/// [`Gpu::gdn_chunk_scan_segment`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GdnScanOut {
+    /// The shipped f32 plane.
+    F32,
+    /// gfx1201 only: the same values rounded to bf16 RNE, half the bytes. Read
+    /// only by the LA output producers' `_xbf16` twins.
+    Bf16,
+}
+
 impl Gpu {
     /// out = rmsnorm(x, weight, eps)
     pub fn rmsnorm_f32(
@@ -4812,18 +4823,10 @@ impl Gpu {
 
     /// Resolve the gfx1100/gfx1151/gfx1201 chunk scan modules before any
     /// admitted route mutates its input scratch or persistent convolution state.
+    /// `out` selects the scan variant [`Self::gdn_chunk_scan_segment`] will run.
     #[cfg(feature = "deltanet")]
-    pub fn gdn_chunk_prepare(&mut self) -> HipResult<()> {
-        self.bind_thread()?;
-        if self.gdn_chunk_prep_gfx11() {
-            self.ensure_kernel(
-                "gdn_chunk_prep_gfx11",
-                kernels::GDN_CHUNK_PREP_GFX11_SRC,
-                "gdn_chunk_prep_gfx11",
-            )?;
-        } else {
-            self.ensure_kernel("gdn_chunk_prep", kernels::GDN_CHUNK_PREP_SRC, "gdn_chunk_prep")?;
-        }
+    pub fn gdn_chunk_prepare(&mut self, out: GdnScanOut) -> HipResult<()> {
+        self.gdn_chunk_prep_module()?;
         if self.gdn_chunk_kkt_gfx1100() {
             self.ensure_kernel(
                 "gdn_chunk_kkt_solve_gfx1100",
@@ -4837,7 +4840,71 @@ impl Gpu {
                 "gdn_chunk_kkt_solve",
             )?;
         }
-        self.ensure_kernel("gdn_chunk_scan", kernels::GDN_CHUNK_SCAN_SRC, "gdn_chunk_scan")
+        let (scan_module, scan_source) = self.gdn_chunk_scan_module(out)?;
+        self.ensure_kernel(scan_module, scan_source, scan_module)
+    }
+
+    /// Chunk-scan `out` format for a gfx1201 LA layer whose output producer has
+    /// an `_xbf16` twin; `route_default` is that route's shipped format.
+    /// `HIPFIRE_GDN_SCAN_OUT=f32|bf16` overrides it; the
+    /// `HIPFIRE_GDN_SCAN_OUT_EMU` diagnostic implies the f32 plane. Always f32
+    /// off gfx1201.
+    #[cfg(feature = "deltanet")]
+    pub fn gdn_scan_out(&self, route_default: GdnScanOut) -> HipResult<GdnScanOut> {
+        if self.arch != "gfx1201" {
+            return Ok(GdnScanOut::F32);
+        }
+        let emu = hipfire_config::developer_var("HIPFIRE_GDN_SCAN_OUT_EMU").is_ok();
+        match hipfire_config::developer_var("HIPFIRE_GDN_SCAN_OUT").ok().as_deref() {
+            None if emu => Ok(GdnScanOut::F32),
+            None => Ok(route_default),
+            Some("f32") => Ok(GdnScanOut::F32),
+            Some("bf16") if !emu => Ok(GdnScanOut::Bf16),
+            Some(v) => Err(hip_bridge::HipError::new(
+                0,
+                &format!("HIPFIRE_GDN_SCAN_OUT={v}: expected f32|bf16 (bf16 excludes HIPFIRE_GDN_SCAN_OUT_EMU)"),
+            )),
+        }
+    }
+
+    #[cfg(feature = "deltanet")]
+    fn gdn_chunk_prep_module(&mut self) -> HipResult<()> {
+        self.bind_thread()?;
+        if self.gdn_chunk_prep_gfx11() {
+            self.ensure_kernel(
+                "gdn_chunk_prep_gfx11",
+                kernels::GDN_CHUNK_PREP_GFX11_SRC,
+                "gdn_chunk_prep_gfx11",
+            )
+        } else {
+            self.ensure_kernel("gdn_chunk_prep", kernels::GDN_CHUNK_PREP_SRC, "gdn_chunk_prep")
+        }
+    }
+
+    /// Chunk-scan module (= symbol) writing `out` in the given format.
+    /// `HIPFIRE_GDN_SCAN_OUT_EMU=bf16|f16` (gfx1201, f32 `out` only) is a
+    /// quality diagnostic that rounds every `out` value to bf16/f16 RNE while
+    /// keeping the f32 store; `emu_bf16` is the byte oracle of the bf16 plane.
+    #[cfg(feature = "deltanet")]
+    fn gdn_chunk_scan_module(&self, out: GdnScanOut) -> HipResult<(&'static str, &'static str)> {
+        let emu = hipfire_config::developer_var("HIPFIRE_GDN_SCAN_OUT_EMU").ok();
+        match (self.arch.as_str(), out, emu.as_deref()) {
+            ("gfx1201", GdnScanOut::Bf16, None) => Ok(("gdn_chunk_scan_bf16", kernels::GDN_CHUNK_SCAN_BF16_SRC)),
+            (_, GdnScanOut::F32, None) => Ok(("gdn_chunk_scan", kernels::GDN_CHUNK_SCAN_SRC)),
+            ("gfx1201", GdnScanOut::F32, Some("bf16")) => {
+                Ok(("gdn_chunk_scan_emu_bf16", kernels::GDN_CHUNK_SCAN_EMU_BF16_SRC))
+            }
+            ("gfx1201", GdnScanOut::F32, Some("f16")) => {
+                Ok(("gdn_chunk_scan_emu_f16", kernels::GDN_CHUNK_SCAN_EMU_F16_SRC))
+            }
+            (arch, out, emu) => Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "GDN chunk scan: out {out:?} with HIPFIRE_GDN_SCAN_OUT_EMU={emu:?} is unsupported on {arch} \
+                     (emulation needs gfx1201, an f32 plane and bf16|f16)"
+                ),
+            )),
+        }
     }
     /// GDN chunk scan preamble for gfx1100/gfx1151/gfx1201. The compact Q/K/V
     /// buffers are BF16 byte views borrowed from the ordinary prefill scratch.
@@ -4859,7 +4926,7 @@ impl Gpu {
         q_scale: f32,
         eps: f32,
     ) -> HipResult<()> {
-        self.gdn_chunk_prepare()?;
+        self.gdn_chunk_prep_module()?;
         let gfx11 = self.gdn_chunk_prep_gfx11();
         let prep_module = if gfx11 {
             "gdn_chunk_prep_gfx11"
@@ -4981,7 +5048,8 @@ impl Gpu {
 
     /// GDN KKT solve and fused scan for one legacy segment.
     /// All parent arrays remain unsliced; `row0` selects the segment and state
-    /// stays the single unsliced persistent owner.
+    /// stays the single unsliced persistent owner. `out` is `[T][48][128]` in
+    /// `out_fmt` elements (4 or 2 bytes).
     #[cfg(feature = "deltanet")]
     #[allow(clippy::too_many_arguments)]
     pub fn gdn_chunk_scan_segment(
@@ -4996,6 +5064,7 @@ impl Gpu {
         state_scales: &GpuTensor,
         ef_residual: &GpuTensor,
         out: &GpuTensor,
+        out_fmt: GdnScanOut,
         row0: usize,
         n_tokens: usize,
     ) -> HipResult<()> {
@@ -5021,7 +5090,8 @@ impl Gpu {
                 )
             };
         self.ensure_kernel(kkt_module, kkt_source, kkt_symbol)?;
-        self.ensure_kernel("gdn_chunk_scan", kernels::GDN_CHUNK_SCAN_SRC, "gdn_chunk_scan")?;
+        let (scan_module, scan_source) = self.gdn_chunk_scan_module(out_fmt)?;
+        self.ensure_kernel(scan_module, scan_source, scan_module)?;
 
         let kp = k.buf.as_ptr();
         let gp = g.buf.as_ptr();
@@ -5079,7 +5149,7 @@ impl Gpu {
             &nt as *const _ as *mut c_void,
         ];
         self.launch_maybe_blob(
-            "gdn_chunk_scan",
+            scan_module,
             [1, 48, 1],
             [512, 1, 1],
             0,

@@ -1564,6 +1564,38 @@ pub const GATED_NORM_MQ_ROTATE_AWQ_I4_GFX12_V2_SRC: &str = concat!(
     "#define HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL gated_norm_mq_rotate_awq_i4_gfx12_v2\n",
     include_str!("../../../kernels/src/gated_norm_mq_rotate_quant.gfx12.hip")
 );
+/// `_xbf16` twins of the four gfx1201 gated-norm IU4 producers: `x` is the
+/// bf16 GDN chunk-scan plane (`GDN_CHUNK_SCAN_BF16_SRC`), widened exactly to
+/// f32 at load; everything else is the f32 producer.
+pub const GATED_NORM_MQ_ROTATE_I4_GFX12_XBF16_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    "#define HIPFIRE_GATED_NORM_X_BF16 1\n",
+    "#define HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL gated_norm_mq_rotate_i4_gfx12_xbf16\n",
+    include_str!("../../../kernels/src/gated_norm_mq_rotate_quant.gfx12.hip")
+);
+pub const GATED_NORM_MQ_ROTATE_AWQ_I4_GFX12_XBF16_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    "#define HIPFIRE_GATED_NORM_X_BF16 1\n#define HIPFIRE_GATED_NORM_MQ_ROTATE_AWQ 1\n",
+    "#define HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL gated_norm_mq_rotate_awq_i4_gfx12_xbf16\n",
+    include_str!("../../../kernels/src/gated_norm_mq_rotate_quant.gfx12.hip")
+);
+pub const GATED_NORM_MQ_ROTATE_I4_GFX12_V2_XBF16_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    "#define HIPFIRE_GATED_NORM_X_BF16 1\n#define HIPFIRE_GATED_NORM_WAVE_GROUP 1\n",
+    "#define HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL gated_norm_mq_rotate_i4_gfx12_v2_xbf16\n",
+    include_str!("../../../kernels/src/gated_norm_mq_rotate_quant.gfx12.hip")
+);
+pub const GATED_NORM_MQ_ROTATE_AWQ_I4_GFX12_V2_XBF16_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    "#define HIPFIRE_GATED_NORM_X_BF16 1\n#define HIPFIRE_GATED_NORM_MQ_ROTATE_AWQ 1\n",
+    "#define HIPFIRE_GATED_NORM_WAVE_GROUP 1\n",
+    "#define HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL gated_norm_mq_rotate_awq_i4_gfx12_v2_xbf16\n",
+    include_str!("../../../kernels/src/gated_norm_mq_rotate_quant.gfx12.hip")
+);
 /// gfx1201 FP8-stream gated-norm producer for the LA output projection.
 /// Emits the exact gated-norm/AWQ/FWHT F32 row and the standalone packer's
 /// three planes in one row-wide workgroup.
@@ -1587,6 +1619,33 @@ pub const GATED_NORM_MQ_ROTATE_AWQ_FP8_INREG_GFX12_SRC: &str = concat!(
     include_str!("../../../kernels/src/mq4v2_fp8_producer_pack.hip"),
     "#define HIPFIRE_FP8_PROD_INREG 1\n#define HIPFIRE_GATED_NORM_FP8_AWQ 1\n",
     "#define HIPFIRE_GATED_NORM_FP8_KERNEL gated_norm_mq_rotate_awq_mq4v2_fp8_inreg_gfx12\n",
+    include_str!("../../../kernels/src/gated_norm_mq_rotate_fp8.gfx12.hip")
+);
+/// `_xbf16` twins of the four FP8-stream gated-norm producers: `x` is the
+/// bf16 GDN chunk-scan plane (`GDN_CHUNK_SCAN_BF16_SRC`), widened exactly to
+/// f32 at load; everything else is the f32 producer.
+pub const GATED_NORM_MQ_ROTATE_FP8_GFX12_XBF16_SRC: &str = concat!(
+    include_str!("../../../kernels/src/mq4v2_fp8_producer_pack.hip"),
+    "#define HIPFIRE_GATED_NORM_X_BF16 1\n",
+    "#define HIPFIRE_GATED_NORM_FP8_KERNEL gated_norm_mq_rotate_mq4v2_fp8_gfx12_xbf16\n",
+    include_str!("../../../kernels/src/gated_norm_mq_rotate_fp8.gfx12.hip")
+);
+pub const GATED_NORM_MQ_ROTATE_AWQ_FP8_GFX12_XBF16_SRC: &str = concat!(
+    include_str!("../../../kernels/src/mq4v2_fp8_producer_pack.hip"),
+    "#define HIPFIRE_GATED_NORM_X_BF16 1\n#define HIPFIRE_GATED_NORM_FP8_AWQ 1\n",
+    "#define HIPFIRE_GATED_NORM_FP8_KERNEL gated_norm_mq_rotate_awq_mq4v2_fp8_gfx12_xbf16\n",
+    include_str!("../../../kernels/src/gated_norm_mq_rotate_fp8.gfx12.hip")
+);
+pub const GATED_NORM_MQ_ROTATE_FP8_INREG_GFX12_XBF16_SRC: &str = concat!(
+    include_str!("../../../kernels/src/mq4v2_fp8_producer_pack.hip"),
+    "#define HIPFIRE_GATED_NORM_X_BF16 1\n#define HIPFIRE_FP8_PROD_INREG 1\n",
+    "#define HIPFIRE_GATED_NORM_FP8_KERNEL gated_norm_mq_rotate_mq4v2_fp8_inreg_gfx12_xbf16\n",
+    include_str!("../../../kernels/src/gated_norm_mq_rotate_fp8.gfx12.hip")
+);
+pub const GATED_NORM_MQ_ROTATE_AWQ_FP8_INREG_GFX12_XBF16_SRC: &str = concat!(
+    include_str!("../../../kernels/src/mq4v2_fp8_producer_pack.hip"),
+    "#define HIPFIRE_GATED_NORM_X_BF16 1\n#define HIPFIRE_FP8_PROD_INREG 1\n#define HIPFIRE_GATED_NORM_FP8_AWQ 1\n",
+    "#define HIPFIRE_GATED_NORM_FP8_KERNEL gated_norm_mq_rotate_awq_mq4v2_fp8_inreg_gfx12_xbf16\n",
     include_str!("../../../kernels/src/gated_norm_mq_rotate_fp8.gfx12.hip")
 );
 /// gfx11 slices-4 IU4 producer: batched gated RMSNorm + FWHT + in-register
@@ -7416,6 +7475,27 @@ pub const GDN_CHUNK_KKT_SOLVE_GFX1100_SRC: &str =
 #[cfg(feature = "deltanet")]
 pub const GDN_CHUNK_SCAN_SRC: &str =
     include_str!("../../../kernels/src/gdn_chunk_scan.gfx1201.hip");
+
+/// Quality diagnostic twins of [`GDN_CHUNK_SCAN_SRC`] (`HIPFIRE_GDN_SCAN_OUT_EMU`):
+/// every `out` value rounded to bf16 / f16 RNE, still stored as f32.
+#[cfg(feature = "deltanet")]
+pub const GDN_CHUNK_SCAN_EMU_BF16_SRC: &str = concat!(
+    "#define GDN_SCAN_OUT_EMU 1\n#define GDN_CHUNK_SCAN_KERNEL gdn_chunk_scan_emu_bf16\n",
+    include_str!("../../../kernels/src/gdn_chunk_scan.gfx1201.hip")
+);
+#[cfg(feature = "deltanet")]
+pub const GDN_CHUNK_SCAN_EMU_F16_SRC: &str = concat!(
+    "#define GDN_SCAN_OUT_EMU 2\n#define GDN_CHUNK_SCAN_KERNEL gdn_chunk_scan_emu_f16\n",
+    include_str!("../../../kernels/src/gdn_chunk_scan.gfx1201.hip")
+);
+/// gfx1201 chunk scan with a bf16 `out` plane (RNE, the same values as the
+/// `_emu_bf16` diagnostic): half the store bytes. Read only by the LA output
+/// producers' `_xbf16` twins.
+#[cfg(feature = "deltanet")]
+pub const GDN_CHUNK_SCAN_BF16_SRC: &str = concat!(
+    "#define GDN_SCAN_OUT_BF16 1\n#define GDN_CHUNK_SCAN_KERNEL gdn_chunk_scan_bf16\n",
+    include_str!("../../../kernels/src/gdn_chunk_scan.gfx1201.hip")
+);
 
 /// Decode-only compact-QK variants for Qwen3.5 DeltaNet GQA (16 Q/K heads,
 /// 32 value/state heads). Each pair of state heads reads one normalized Q/K
