@@ -48,6 +48,8 @@ pub const PAGE_CACHE_BYTES: usize = 256 * 1024 * 1024;
 /// overhead outside the byte budget. Four rows keeps the page inside a fifth of
 /// an OS page and the index overhead near a quarter of the payload.
 const ROWS_PER_PAGE: usize = 4;
+/// Concurrent source reads of one request's scattered page groups.
+const PARALLEL_READERS: usize = 16;
 /// Byte budget of one coalesced read or one staging buffer.  The effective
 /// size is rounded down to a whole number of decoded rows.
 const STAGING_BUDGET_BYTES: usize = 8 * 1024 * 1024;
@@ -708,6 +710,26 @@ impl RowStore {
     /// publish them.  Every id is checked against the valid rows before the
     /// ticket exists.
     pub fn prefetch(&self, epoch: u64, row_ids: Vec<u64>) -> Result<RowTicket, RowStoreError> {
+        self.enqueue(epoch, row_ids, false)
+    }
+
+    /// Best-effort: read `row_ids`' pages into the cache ahead of a request
+    /// that will need them (e.g. speculative tokens known before their
+    /// forward starts). There is no lease; a later epoch drops it if it has
+    /// not started.
+    pub fn warm(&self, row_ids: Vec<u64>) -> Result<(), RowStoreError> {
+        let ticket = self.enqueue(self.current_epoch(), row_ids, true)?;
+        // The reader owns a warm ticket's lifetime.
+        ticket.consumed.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    fn enqueue(
+        &self,
+        epoch: u64,
+        row_ids: Vec<u64>,
+        warm: bool,
+    ) -> Result<RowTicket, RowStoreError> {
         let max_rows = self.max_rows_per_prefetch();
         if row_ids.len() > max_rows {
             return Err(RowStoreError::RequestTooLarge {
@@ -758,6 +780,7 @@ impl RowStore {
                 required_bytes,
                 output: None,
                 status: TicketStatus::Pending,
+                warm,
             },
         );
         state.queue.push_back(id);
@@ -1418,6 +1441,41 @@ impl RowStoreInner {
         }
 
         let groups = self.coalesce_pages(&missing)?;
+        if groups.len() > 1 {
+            // Rows are drawn at random over the table, so the groups are
+            // scattered single-page reads: issued serially each one waits a
+            // full device round trip (~64 reads = 10-15 ms per few-token
+            // request on NVMe), issued together the device overlaps them.
+            let mut buffers: Vec<Vec<u8>> = vec![Vec::new(); groups.len()];
+            let per_thread = groups.len().div_ceil(PARALLEL_READERS);
+            std::thread::scope(|scope| -> Result<(), RowStoreError> {
+                let handles: Vec<_> = groups
+                    .chunks(per_thread)
+                    .zip(buffers.chunks_mut(per_thread))
+                    .map(|(chunk, staging)| {
+                        scope.spawn(move || -> Result<(), RowStoreError> {
+                            for (group, bytes) in chunk.iter().zip(staging) {
+                                self.read_group_bytes(group, bytes)?;
+                            }
+                            Ok(())
+                        })
+                    })
+                    .collect();
+                for handle in handles {
+                    handle.join().expect("row reader thread panicked")?;
+                }
+                Ok(())
+            })?;
+            // Pages are published even under cancellation: the reads are done
+            // and a later request (or the warm-up's owner) wants them cached.
+            for (group, bytes) in groups.iter().zip(&buffers) {
+                self.publish_group(group, bytes, &requested, output)?;
+            }
+            if canceled.load(Ordering::Acquire) {
+                return Err(RowStoreError::Canceled);
+            }
+            return Ok(());
+        }
         for group in groups {
             if canceled.load(Ordering::Acquire) {
                 return Err(RowStoreError::Canceled);
@@ -1519,7 +1577,53 @@ impl RowStoreInner {
         if canceled.load(Ordering::Acquire) {
             return Err(RowStoreError::Canceled);
         }
+        self.publish_group(group, read_staging, requested, output)
+    }
 
+    /// Read one coalesced page group's bytes into `bytes`.
+    fn read_group_bytes(&self, group: &[PageKey], bytes: &mut Vec<u8>) -> Result<(), RowStoreError> {
+        let first = *group.first().ok_or_else(|| RowStoreError::InvalidLease {
+            reason: "empty coalesced page group".to_string(),
+        })?;
+        let first_offset = first
+            .page
+            .checked_mul(self.rows_per_page)
+            .and_then(|row| row.checked_mul(self.encoded_row_bytes))
+            .ok_or_else(|| RowStoreError::InvalidLease {
+                reason: "coalesced offset overflow".to_string(),
+            })? as u64;
+        let mut total = 0usize;
+        for &page in group {
+            total = total
+                .checked_add(self.page_len(page)?)
+                .ok_or_else(|| RowStoreError::InvalidLease {
+                    reason: "coalesced length overflow".to_string(),
+                })?;
+        }
+        if total > self.staging_bytes {
+            return Err(RowStoreError::InvalidLease {
+                reason: "coalesced read exceeds staging budget".to_string(),
+            });
+        }
+        bytes.resize(total, 0);
+        self.source
+            .read_at(first.shard, first_offset, bytes)
+            .map_err(RowStoreError::Source)
+    }
+
+    /// Copy a read group's requested rows into `output` and cache its pages.
+    fn publish_group(
+        &self,
+        group: &[PageKey],
+        read_staging: &[u8],
+        requested: &HashMap<PageKey, Vec<RowCopy>>,
+        output: &mut [u8],
+    ) -> Result<(), RowStoreError> {
+        let lengths: Vec<usize> = group
+            .iter()
+            .map(|&page| self.page_len(page))
+            .collect::<Result<_, _>>()?;
+        let total: usize = lengths.iter().sum();
         let mut state = self.state.lock().expect("row store state mutex poisoned");
         let mut cursor = 0usize;
         for (&page, &length) in group.iter().zip(&lengths) {
@@ -1609,6 +1713,9 @@ struct TicketState {
     required_bytes: usize,
     output: Option<Vec<u8>>,
     status: TicketStatus,
+    /// Cache warm-up only ([`RowStore::warm`]): no lease; the reader drops
+    /// the ticket once its pages are cached.
+    warm: bool,
 }
 
 enum TicketStatus {
@@ -1746,6 +1853,18 @@ fn worker_loop(weak: Weak<RowStoreInner>) {
         let mut state = inner.state.lock().expect("row store state mutex poisoned");
         state.active_readers = state.active_readers.saturating_sub(1);
         inner.return_staging_locked(&mut state, read_buffer);
+        if state.tickets.get(&id).is_some_and(|ticket| ticket.warm) {
+            if let Some(ticket) = state.tickets.remove(&id) {
+                if let Some(buffer) = ticket.output {
+                    inner.return_staging_locked(&mut state, buffer);
+                }
+            }
+            if let Some(buffer) = output.take() {
+                inner.return_staging_locked(&mut state, buffer);
+            }
+            inner.cv.notify_all();
+            continue;
+        }
         let Some((ticket_canceled, ticket_epoch)) = state
             .tickets
             .get(&id)

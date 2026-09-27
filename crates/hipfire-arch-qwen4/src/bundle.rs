@@ -522,6 +522,14 @@ impl Qwen4Bundle {
             .map_err(BundleError::State)
     }
 
+    /// Start reading the PLE rows `tokens` (the next tokens after the
+    /// committed history, in order) will need, so a forward over them later
+    /// finds them cached. Best effort: a failure only loses the head start.
+    pub(crate) fn warm_ple_rows(&self, tokens: &[u32]) {
+        let ids = self.state.ple_history.row_ids(&self.ple_metadata, tokens);
+        let _ = self.ple_rows.warm(ids);
+    }
+
     pub(crate) fn spec_capture_token(
         &mut self,
         gpu: &mut Gpu,

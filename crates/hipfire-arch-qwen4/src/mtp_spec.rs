@@ -968,6 +968,11 @@ impl MtpDrafter for Qwen4MtpDrafter {
             timers.mark(gpu, "draft");
             let mut drafts = Vec::with_capacity(k);
             let mut input = seed;
+            // The verify's PLE rows are SSD-resident: start reading each
+            // token's rows as soon as it is known, while the drafts run.
+            let mut known = Vec::with_capacity(k + 1);
+            known.push(seed);
+            Self::bundle(target)?.warm_ple_rows(&known);
             // Every proposal starts with a fresh QSA selection; only later
             // draft rows within this window reuse it.
             for index in 0..k {
@@ -983,6 +988,10 @@ impl MtpDrafter for Qwen4MtpDrafter {
                     .mtp_forward_token(gpu, input, hidden, token_position, index == 0)
                     .map_err(|error| error.to_string())?;
                 drafts.push(input);
+                if index + 1 < k {
+                    known.push(input);
+                    Self::bundle(target)?.warm_ple_rows(&known);
+                }
             }
             let mut block = Vec::with_capacity(k + 1);
             block.push(seed);
