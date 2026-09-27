@@ -103,7 +103,7 @@ pub fn canonical(inst: &Inst, arch: Arch) -> Result<String, PrintError> {
             ))
         })?;
         let mut text = operand_text(operand, Some(slot_name), row, inst)?;
-        if inst.form == Form::Vop3 {
+        if matches!(inst.form, Form::Vop3 | Form::Vop1Dpp | Form::Vop2Dpp) {
             text = apply_vop3_src_mods(&text, operand, slot_name, &inst.mods)?;
         }
         parts.push(text);
@@ -128,6 +128,7 @@ pub fn canonical(inst: &Inst, arch: Arch) -> Result<String, PrintError> {
         } else if part.starts_with("offset")
             || *part == "offen"
             || part.starts_with("scope:")
+            || part.starts_with("th:")
         {
             text.push(' ');
         } else {
@@ -165,7 +166,7 @@ fn grammar_slots(row: &OpRow) -> Vec<(&str, u16)> {
 
 fn operand_text(
     operand: &Operand,
-    slot: Option<&str>,
+    _slot: Option<&str>,
     row: &OpRow,
     inst: &Inst,
 ) -> Result<String, PrintError> {
@@ -208,13 +209,23 @@ fn operand_text(
         } else {
             format!("-0x{:x}", n.unsigned_abs())
         }),
-        Operand::Imm(ImmField::VmemOffset(_))
+        Operand::Imm(ImmField::SmemDisplacement(_))
+        | Operand::Imm(ImmField::VmemOffset(_))
         | Operand::Imm(ImmField::DsOffset(_))
         | Operand::Imm(ImmField::DsOffset0(_))
         | Operand::Imm(ImmField::DsOffset1(_)) => Ok(format!("{operand}")),
         Operand::Imm(ImmField::Unsigned(n)) => Ok(format!("{n:#x}")),
         Operand::Label(id) => Ok(format!(".LBB{}", id.0)),
-        Operand::Scope(_) | Operand::Vmem(_) => Ok(format!("{operand}")),
+        Operand::CacheTh(th) if row.name.starts_with("buffer_") => {
+            let hints = if row.name.contains("_load") {
+                ["RT", "NT", "HT", "LU", "NT_RT", "RT_NT", "NT_HT", "BYPASS"]
+            } else {
+                ["RT", "NT", "HT", "BYPASS", "NT_RT", "RT_NT", "NT_HT", "NT_WB"]
+            };
+            Ok(format!("th:TH_{}_{}", if row.name.contains("_load") { "LOAD" } else { "STORE" },
+                hints[usize::from(*th)]))
+        }
+        Operand::Scope(_) | Operand::CacheTh(_) | Operand::Vmem(_) => Ok(format!("{operand}")),
         Operand::Depctr(_) => Err(PrintError::Unspellable(
             "depctr operand (encode via s_wait_alu immediate)".into(),
         )),
@@ -385,6 +396,13 @@ fn modifier_suffix(inst: &Inst, row: &OpRow) -> Result<String, PrintError> {
     let mods = &inst.mods;
     let mut out = String::new();
     match inst.form {
+        Form::Vop1Dpp | Form::Vop2Dpp => {
+            let dpp = mods.dpp.ok_or_else(|| PrintError::Unspellable("DPP modifiers missing".into()))?;
+            let shift = dpp.ctrl.checked_sub(0x100).filter(|v| (1..=15).contains(v))
+                .ok_or_else(|| PrintError::Unspellable(format!("DPP control {:#x}", dpp.ctrl)))?;
+            out.push_str(&format!(" row_shl:{shift} row_mask:{:#x} bank_mask:{:#x} bound_ctrl:{}",
+                dpp.row_mask, dpp.bank_mask, u8::from(dpp.bound_ctrl)));
+        }
         Form::Vop3 => {
             if mods.omod != Omod::None {
                 out.push_str(match mods.omod {

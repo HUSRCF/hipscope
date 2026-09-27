@@ -149,12 +149,16 @@ fn is_suffix_token(token: &str) -> bool {
         || token == "mul:2"
         || token == "mul:4"
         || token == "div:2"
+        || token.starts_with("row_shl:")
+        || token.starts_with("row_mask:")
+        || token.starts_with("bank_mask:")
+        || token.starts_with("bound_ctrl:")
 }
 
 fn is_extra_token(token: &str) -> bool {
     token.starts_with("offset")
         || token == "offen"
-        || token.starts_with("scope:")
+        || token.starts_with("scope:") || token.starts_with("th:")
 }
 
 /// The last comma segment may carry space-separated suffix modifiers (VOP3)
@@ -259,7 +263,7 @@ fn parse_single(row: &'static OpRow, rest: &str) -> Result<Inst, ParseError> {
         });
     }
     if !extras.is_empty()
-        && !(row.form == Form::Ds || matches!(row.form, Form::Vmem(_)))
+        && !(row.form == Form::Ds || row.form == Form::Smem || matches!(row.form, Form::Vmem(_)))
     {
         return Err(bad_operand(
             row.name,
@@ -274,7 +278,7 @@ fn parse_single(row: &'static OpRow, rest: &str) -> Result<Inst, ParseError> {
         }
         let slot_index = i + slot_offset - text_offset;
         let (slot, bits) = slots[slot_index];
-        let operand = if row.form == Form::Vop3 {
+        let operand = if matches!(row.form, Form::Vop3 | Form::Vop1Dpp | Form::Vop2Dpp) {
             parse_vop3_operand(row, slot, bits, text, &mut parsed.mods)?
         } else {
             parse_operand(row, slot, bits, text)?
@@ -283,6 +287,13 @@ fn parse_single(row: &'static OpRow, rest: &str) -> Result<Inst, ParseError> {
     }
     for text in &extras {
         parsed.operands.push(parse_extra(row, text)?);
+    }
+    if row.form == Form::Vmem(peacemaker_ir::inst::VmemForm::Buffer)
+        && parsed.operands.iter().any(|op| matches!(op, Operand::Vmem(VmemToken::Offen)))
+    {
+        if let Some((index, _)) = slots.iter().enumerate().find(|(_, (name, _))| *name == "VADDR") {
+            if let Some(Operand::Reg(addr)) = parsed.operands.get_mut(index) { addr.len = 1; }
+        }
     }
     parse_suffixes(row, &suffixes, &mut parsed.mods)?;
     imply_op_sel(row, &suffixes, &mut parsed.mods, &parsed.operands)?;
@@ -925,6 +936,19 @@ fn parse_extra(row: &OpRow, text: &str) -> Result<Operand, ParseError> {
     if let Some(scope) = parse_scope(text) {
         return Ok(Operand::Scope(scope));
     }
+    if let Some(th) = text.strip_prefix("th:") {
+        let names = if row.name.starts_with("buffer_load") {
+            ["RT", "NT", "HT", "LU", "NT_RT", "RT_NT", "NT_HT", "BYPASS"]
+        } else if row.name.starts_with("buffer_store") {
+            ["RT", "NT", "HT", "BYPASS", "NT_RT", "RT_NT", "NT_HT", "NT_WB"]
+        } else {
+            return Err(bad_operand(row.name, text, "cache TH only modeled for VBUFFER"));
+        };
+        let prefix = if row.name.starts_with("buffer_load") { "TH_LOAD_" } else { "TH_STORE_" };
+        let value = th.strip_prefix(prefix).and_then(|word| names.iter().position(|name| *name == word))
+            .ok_or_else(|| bad_operand(row.name, text, "bad cache TH"))?;
+        return Ok(Operand::CacheTh(value as u8));
+    }
     if let Some((kind, value)) = text.split_once(':') {
         // VMEM offsets are signed 24-bit (`offset:-48` occurs in hipcc's
         // own `.s`); DS offsets are unsigned.
@@ -950,9 +974,12 @@ fn parse_extra(row: &OpRow, text: &str) -> Result<Operand, ParseError> {
                 )));
             }
             "offset" => {
+                if row.form == Form::Smem {
+                    return Ok(Operand::Imm(ImmField::SmemDisplacement(
+                        signed.ok_or_else(bad)?,
+                    )));
+                }
                 if matches!(row.form, Form::Vmem(_)) {
-                    // Signed 24-bit, as the codec decodes it; the
-                    // encoder masks to the field.
                     return Ok(Operand::Imm(ImmField::VmemOffset(
                         signed.ok_or_else(bad)?,
                     )));
@@ -972,6 +999,9 @@ fn parse_suffixes(
     suffixes: &[String],
     mods: &mut Modifiers,
 ) -> Result<(), ParseError> {
+    if matches!(row.form, Form::Vop1Dpp | Form::Vop2Dpp) {
+        mods.dpp = Some(peacemaker_ir::operand::Dpp { ctrl: 0x100, row_mask: 15, bank_mask: 15, bound_ctrl: false });
+    }
     for suffix in suffixes {
         if suffix == "clamp" {
             mods.clamp = true;
@@ -989,6 +1019,24 @@ fn parse_suffixes(
             mods.neg_lo = parse_trits(row, suffix, list)?;
         } else if let Some(list) = suffix.strip_prefix("neg_hi:[") {
             mods.neg_hi = parse_trits(row, suffix, list)?;
+        } else if let Some(value) = suffix.strip_prefix("row_shl:") {
+            let shift: u16 = value.parse().map_err(|_| bad_operand(row.name, suffix, "invalid DPP row shift"))?;
+            if !(1..=15).contains(&shift) { return Err(bad_operand(row.name, suffix, "DPP shift outside 1..=15")); }
+            mods.dpp.as_mut().ok_or_else(|| bad_operand(row.name, suffix, "DPP control on non-DPP row"))?.ctrl = 0x100 + shift;
+        } else if let Some(value) = suffix.strip_prefix("row_mask:") {
+            let mask = parse_number(value, row.name, suffix)?;
+            if mask > 15 { return Err(bad_operand(row.name, suffix, "DPP row mask exceeds four bits")); }
+            mods.dpp.as_mut().ok_or_else(|| bad_operand(row.name, suffix, "DPP mask on non-DPP row"))?.row_mask = mask as u8;
+        } else if let Some(value) = suffix.strip_prefix("bank_mask:") {
+            let mask = parse_number(value, row.name, suffix)?;
+            if mask > 15 { return Err(bad_operand(row.name, suffix, "DPP bank mask exceeds four bits")); }
+            mods.dpp.as_mut().ok_or_else(|| bad_operand(row.name, suffix, "DPP mask on non-DPP row"))?.bank_mask = mask as u8;
+        } else if let Some(value) = suffix.strip_prefix("bound_ctrl:") {
+            mods.dpp.as_mut().ok_or_else(|| bad_operand(row.name, suffix, "DPP bound control on non-DPP row"))?.bound_ctrl = match value {
+                "0" => false,
+                "1" => true,
+                _ => return Err(bad_operand(row.name, suffix, "DPP bound control must be 0 or 1")),
+            };
         } else {
             return Err(ParseError::BadModifier {
                 name: row.name.into(),
@@ -1215,6 +1263,7 @@ fn push_rule(
         "op_sel" => u32::from(parsed.mods.op_sel),
         "op_sel_hi" => u32::from(parsed.mods.op_sel_hi),
         "global_scope" => u32::from(parsed.mods.cpol.scope) << 18,
+        "dpp_fi" => 0,
         "global_nv" | "global_sve" | "global_th" => 0,
         "vbuffer_format" => 0x800000,
         "vbuffer_offen" => {
@@ -1226,8 +1275,9 @@ fn push_rule(
                 0
             }
         }
-        "vbuffer_idxen" | "vbuffer_nv" | "vbuffer_scope" | "vbuffer_tfe"
-        | "vbuffer_th" => 0,
+        "vbuffer_scope" => u32::from(parsed.mods.cpol.scope) << 18,
+        "vbuffer_th" => u32::from(parsed.mods.cpol.th) << 20,
+        "vbuffer_idxen" | "vbuffer_nv" | "vbuffer_tfe" => 0,
         _ => {
             return Err(bad_operand(
                 row.name,
@@ -1272,6 +1322,7 @@ fn finish(
                 CacheScope::Sys => 3,
             };
         }
+        if let Operand::CacheTh(th) = operand { parsed.mods.cpol.th = *th; }
     }
     let fields = derive_fields(row, &parsed)?;
     Inst::from_parts(

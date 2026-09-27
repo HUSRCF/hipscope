@@ -38,7 +38,7 @@ pub fn base_dwords(form: Form) -> usize {
         Form::Sop1 | Form::Sop2 | Form::Sopc | Form::Sopk | Form::Sopp => 1,
         Form::Vop1 | Form::Vop2 | Form::Vopc => 1,
         Form::Smem => 2,
-        Form::Vop3 | Form::Vop3p | Form::Vopd | Form::Vinterp => 2,
+        Form::Vop1Dpp | Form::Vop2Dpp | Form::Vop3 | Form::Vop3p | Form::Vopd | Form::Vinterp => 2,
         Form::Ds => 2,
         Form::Vmem(_) => 3,
         // No M1 table rows yet; provisional until the forms are tabled.

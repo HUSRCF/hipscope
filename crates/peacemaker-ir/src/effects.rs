@@ -42,7 +42,9 @@ impl Effects {
         for operand in operands.iter().skip(prefix) {
             let name = field_names.next().unwrap_or("");
             let def = row.defs.split(',').any(|s| s == name);
-            let used = row.uses.split(',').any(|s| s == name);
+            // A half-register destination leaves the other half intact.
+            let used = row.uses.split(',').any(|s| s == name)
+                || def && matches!(operand, Operand::Half(..));
             match operand {
                 Operand::Reg(reg) | Operand::Half(reg, _) => {
                     if def { out.defs.push(*reg); }
@@ -98,12 +100,32 @@ impl Effects {
                 else if name.starts_with("ds_load") { (MemClass::DsLoad, OrderType::Ds) }
                 else if name.starts_with("ds_store") { (MemClass::DsStore, OrderType::Ds) }
                 else if name.starts_with("ds_") { (MemClass::DsAtomic { returns: !out.defs.is_empty() }, OrderType::Ds) }
-                else if name.starts_with("global_load") || name.starts_with("buffer_load") { (MemClass::VmemLoad, OrderType::Load) }
-                else if name.starts_with("global_store") || name.starts_with("buffer_store") { (MemClass::VmemStore, OrderType::Store) }
+                else if name.starts_with("global_load") || name.starts_with("buffer_load") || name.starts_with("scratch_load") { (MemClass::VmemLoad, OrderType::Load) }
+                else if name.starts_with("global_store") || name.starts_with("buffer_store") || name.starts_with("scratch_store") { (MemClass::VmemStore, OrderType::Store) }
                 else { return Err(ValidateError::Operand(format!("unclassified memory rule for {name}"))); };
             out.mem = Some(MemEffect { class, counters, in_order_type: order,
                 src_read: if matches!(class, MemClass::DsStore) { SrcRead::Deferred } else { SrcRead::AtIssue } });
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{codec::gfx12, reg::Kind};
+
+    #[test]
+    fn partial_writes_depend_on_the_previous_destination() {
+        for words in [
+            &[0x7e00_1500][..],                 // v_cvt_f16_f32_e32 v0.l, v0
+            &[0xda98_08c0, 0x3e00_0032][..],  // ds_load_u16_d16 v62, v50
+            &[0xcc22_0011, 0x244e_2f1a][..],  // v_fma_mixhi_f16 v17, ...
+            &[0xd761_0061, 0x0201_0000][..],  // v_writelane_b32 v97, ...
+        ] {
+            let (inst, _) = gfx12::decode(words).unwrap();
+            let dest = inst.effects.defs.iter().find(|r| r.kind == Kind::V).unwrap();
+            assert!(inst.effects.uses.contains(dest), "{:?} fails to read its preserved destination", inst.op);
+        }
     }
 }

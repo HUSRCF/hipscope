@@ -24,7 +24,7 @@ impl Opcode {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum VmemForm { Global, Scratch, Flat, Buffer, Image }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub enum Form { Sop1, Sop2, Sopc, Sopk, Sopp, Smem, Vop1, Vop2, Vopc, Vop3, Vop3p, Vopd, Vinterp, Ds, Vmem(VmemForm), Export }
+pub enum Form { Sop1, Sop2, Sopc, Sopk, Sopp, Smem, Vop1, Vop1Dpp, Vop2, Vop2Dpp, Vopc, Vop3, Vop3p, Vopd, Vinterp, Ds, Vmem(VmemForm), Export }
 
 /// Values not represented by semantic operands/modifiers. An honored field is never
 /// canonicalized; an ignored field is validated against the table's benign set.
@@ -66,7 +66,7 @@ impl Inst {
                 }
             }
             if previous_operand {
-                if matches!(operand, Operand::Imm(crate::operand::ImmField::DsOffset(_) | crate::operand::ImmField::DsOffset0(_) | crate::operand::ImmField::DsOffset1(_) | crate::operand::ImmField::VmemOffset(_)) | Operand::Vmem(crate::operand::VmemToken::Offen)) {
+                if matches!(operand, Operand::Imm(crate::operand::ImmField::DsOffset(_) | crate::operand::ImmField::DsOffset0(_) | crate::operand::ImmField::DsOffset1(_) | crate::operand::ImmField::VmemOffset(_) | crate::operand::ImmField::SmemDisplacement(_)) | Operand::Vmem(crate::operand::VmemToken::Offen)) {
                     text.push(' ');
                 } else { text.push_str(", "); }
             } else { text.push(' '); }

@@ -7,7 +7,7 @@ pub enum Special { Vcc, VccLo, VccHi, Exec, ExecLo, ExecHi, Scc, M0, Null, Ttmp(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InlineConst { Integer(i8), FloatBits(u32), InvTwoPi }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ImmField { Sopp(i16), Sopk(i16), DsOffset(u16), DsOffset0(u8), DsOffset1(u8), VmemOffset(i32), SmemOffset(i32), Unsigned(u32) }
+pub enum ImmField { Sopp(i16), Sopk(i16), DsOffset(u16), DsOffset0(u8), DsOffset1(u8), VmemOffset(i32), SmemOffset(i32), SmemDisplacement(i32), Unsigned(u32) }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HwReg { pub id: u8, pub offset: u8, pub size: u8 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -19,12 +19,13 @@ pub enum CacheScope { Cu, Se, Dev, Sys }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VmemToken { Off, Offen }
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum Operand { Reg(RegRef), Special(Special), Inline(InlineConst), Literal(u32), Imm(ImmField), Label(BlockId), Hwreg(HwReg), SendMsg(Msg), Half(RegRef, Half), Depctr(Depctr), Scope(CacheScope), Vmem(VmemToken) }
+pub enum Operand { Reg(RegRef), Special(Special), Inline(InlineConst), Literal(u32), Imm(ImmField), Label(BlockId), Hwreg(HwReg), SendMsg(Msg), Half(RegRef, Half), Depctr(Depctr), Scope(CacheScope), CacheTh(u8), Vmem(VmemToken) }
 impl Operand {
     pub fn validate(&self) -> Result<(), String> {
         match self { Self::Reg(r) | Self::Half(r, _) => r.validate(),
             Self::Imm(ImmField::VmemOffset(n)) if !(-8_388_608..=8_388_607).contains(n) => Err("VMEM offset exceeds signed 24-bit field".into()),
-            Self::Imm(ImmField::SmemOffset(n)) if !(-1_048_576..=1_048_575).contains(n) => Err("SMEM offset exceeds signed 21-bit field".into()),
+            Self::Imm(ImmField::SmemOffset(n) | ImmField::SmemDisplacement(n)) if !(-1_048_576..=1_048_575).contains(n) => Err("SMEM offset exceeds signed 21-bit field".into()),
+            Self::CacheTh(th) if *th > 7 => Err("cache TH exceeds 3-bit field".into()),
             Self::Inline(InlineConst::Integer(n)) if !(-16..=64).contains(n) => Err("inline integer outside ISA range".into()),
             _ => Ok(()) }
     }
@@ -44,6 +45,7 @@ impl fmt::Display for Operand {
             Self::Imm(ImmField::DsOffset1(n)) => write!(f, "offset1:{n}"),
             Self::Imm(ImmField::VmemOffset(n)) => write!(f, "offset:{n}"),
             Self::Imm(ImmField::SmemOffset(n)) => write!(f, "{n}"),
+            Self::Imm(ImmField::SmemDisplacement(n)) => write!(f, "offset:{n:#x}"),
             Self::Imm(ImmField::Unsigned(n)) => write!(f, "{n:#x}"),
             Self::Label(id) => write!(f, ".LBB{}", id.0),
             Self::Hwreg(r) => write!(f, "hwreg({}, {}, {})", r.id, r.offset, r.size),
@@ -53,6 +55,7 @@ impl fmt::Display for Operand {
             Self::Depctr(Depctr::SaSdst(n)) => write!(f, "depctr_sa_sdst({n})"),
             Self::Depctr(Depctr::VaSdst(n)) => write!(f, "depctr_va_sdst({n})"),
             Self::Scope(s) => f.write_str(match s { CacheScope::Cu => "scope:SCOPE_CU", CacheScope::Se => "scope:SCOPE_SE", CacheScope::Dev => "scope:SCOPE_DEV", CacheScope::Sys => "scope:SCOPE_SYS" }),
+            Self::CacheTh(th) => write!(f, "th:{th}"),
             Self::Vmem(VmemToken::Off) => f.write_str("off"),
             Self::Vmem(VmemToken::Offen) => f.write_str("offen"),
         }

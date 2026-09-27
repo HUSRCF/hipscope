@@ -101,8 +101,6 @@ pub enum DescriptorReject {
     Descriptor(#[from] DescriptorError),
     #[error("{field} bits {bits:#x} must be 0 on {arch:?}")]
     ReservedBits { field: &'static str, bits: u32, arch: Arch },
-    #[error("private_segment_fixed_size is {0}; scratch-using kernels are not lifted")]
-    PrivateSegment(u32),
     #[error("USES_DYNAMIC_STACK is set")]
     DynamicStack,
     #[error("{0} is unsupported with architected flat scratch")]
@@ -126,9 +124,6 @@ pub fn validate(kd: &KernelDescriptor, arch: Arch) -> Result<(), DescriptorRejec
     let reserved = |field, bits: u32| if bits == 0 { Ok(()) } else { Err(DescriptorReject::ReservedBits { field, bits, arch }) };
     let properties = kd.kernel_code_properties.0;
     reserved("kernel_code_properties", u32::from(properties & KCP_RESERVED))?;
-    if kd.private_segment_fixed_size != 0 {
-        return Err(DescriptorReject::PrivateSegment(kd.private_segment_fixed_size));
-    }
     if properties & KCP_USES_DYNAMIC_STACK != 0 {
         return Err(DescriptorReject::DynamicStack);
     }
@@ -212,7 +207,7 @@ mod tests {
             Err(DescriptorReject::ReservedBits { field: "compute_pgm_rsrc3", bits: 1 << 17, arch: Arch::Gfx1201 }));
         assert_eq!(with(|kd| kd.compute_pgm_rsrc1.0 |= 1 << 6),
             Err(DescriptorReject::ReservedBits { field: "compute_pgm_rsrc1", bits: 1 << 6, arch: Arch::Gfx1201 }));
-        assert_eq!(with(|kd| kd.private_segment_fixed_size = 16), Err(DescriptorReject::PrivateSegment(16)));
+        assert_eq!(with(|kd| kd.private_segment_fixed_size = 16), Ok(()));
         assert_eq!(with(|kd| kd.kernel_code_properties.0 |= 1 << 11), Err(DescriptorReject::DynamicStack));
         assert!(matches!(with(|kd| kd.kernel_code_properties.0 |= 1 << 5), Err(DescriptorReject::ArchitectedFlatScratch(_))));
         assert!(matches!(with(|kd| kd.kernarg_preload.0 = 1), Err(DescriptorReject::ReservedBits { field: "kernarg_preload", .. })));

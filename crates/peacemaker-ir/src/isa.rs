@@ -24,7 +24,7 @@ fn form(value: &str) -> Option<Form> {
     Some(match value {
         "sop1" => Form::Sop1, "sop2" => Form::Sop2, "sopc" => Form::Sopc, "sopk" => Form::Sopk,
         "sopp" => Form::Sopp, "smem" => Form::Smem, "vop1" => Form::Vop1,
-        "vop2" => Form::Vop2, "vopc" => Form::Vopc, "vop3" => Form::Vop3,
+        "vop1_dpp" => Form::Vop1Dpp, "vop2" => Form::Vop2, "vop2_dpp" => Form::Vop2Dpp, "vopc" => Form::Vopc, "vop3" => Form::Vop3,
         "vop3p" => Form::Vop3p, "vopd" => Form::Vopd, "vinterp" => Form::Vinterp,
         "ds" => Form::Ds, "global" => Form::Vmem(VmemForm::Global),
         "scratch" => Form::Vmem(VmemForm::Scratch), "flat" => Form::Vmem(VmemForm::Flat),
@@ -36,7 +36,7 @@ fn family(form: Form) -> Family {
     match form {
         Form::Sop1 => Family::Sop1, Form::Sop2 => Family::Sop2, Form::Sopc => Family::Sopc,
         Form::Sopk => Family::Sopk, Form::Sopp => Family::Sopp, Form::Smem => Family::Smem,
-        Form::Vop1 => Family::Vop1, Form::Vop2 => Family::Vop2, Form::Vopc => Family::Vopc,
+        Form::Vop1 | Form::Vop1Dpp => Family::Vop1, Form::Vop2 | Form::Vop2Dpp => Family::Vop2, Form::Vopc => Family::Vopc,
         Form::Vop3 => Family::Vop3, Form::Vop3p => Family::Vop3p,
         Form::Vopd => Family::Vopd, Form::Vinterp => Family::Vinterp, Form::Ds => Family::Ds,
         Form::Vmem(_) => Family::Vmem, Form::Export => Family::Export,

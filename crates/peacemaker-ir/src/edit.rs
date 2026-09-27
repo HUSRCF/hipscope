@@ -306,15 +306,17 @@ fn abi_obligations(kern: &Kernel, summary: &crate::state::ResourceSummary) -> Ve
     let Abi::Hsa { descriptor, metadata } = &kern.abi else { return Vec::new() };
     let meta = &metadata.parsed;
     let wave32 = descriptor.kernel_code_properties.wave32();
-    let granule = if wave32 { 8 } else { 4 };
     let mut out = Vec::new();
     let mut push = |rule: &str, text: String| out.push(Obligation { kind: ObligationKind::Unknown, insts: Vec::new(), rule_id: rule.into(), text });
     let max_vgpr = u32::from(summary.max_vgpr);
     let next_free = descriptor.compute_pgm_rsrc1.next_free_vgpr(wave32);
     if max_vgpr > next_free { push("resource-vgpr-descriptor", format!("code uses {max_vgpr} VGPRs, descriptor allocates {next_free}")); }
     if max_vgpr > meta.vgpr_count { push("resource-vgpr-metadata", format!("code uses {max_vgpr} VGPRs, .vgpr_count is {}", meta.vgpr_count)); }
-    if meta.vgpr_count.div_ceil(granule).saturating_sub(1) != descriptor.compute_pgm_rsrc1.vgpr_granules() {
-        push("abi-vgpr-granule", format!(".vgpr_count {} disagrees with the rsrc1 VGPR granule", meta.vgpr_count));
+    if meta.vgpr_count > next_free {
+        push("abi-vgpr-allocation", format!(".vgpr_count {} exceeds the descriptor allocation {next_free}", meta.vgpr_count));
+    }
+    if descriptor.private_segment_fixed_size != 0 {
+        push("scratch-in-use", format!("kernel allocates {} bytes of architected flat scratch per work-item; scratch address bounds are not certified", descriptor.private_segment_fixed_size));
     }
     let sgprs = u32::from(summary.max_sgpr) + if summary.uses_vcc { 2 } else { 0 };
     if sgprs > meta.sgpr_count { push("resource-sgpr-metadata", format!("code needs {sgprs} SGPRs (VCC included), .sgpr_count is {}", meta.sgpr_count)); }
@@ -326,6 +328,9 @@ fn abi_obligations(kern: &Kernel, summary: &crate::state::ResourceSummary) -> Ve
     }
     if meta.group_segment_fixed_size != descriptor.group_segment_fixed_size {
         push("abi-group-segment", format!(".group_segment_fixed_size {} but descriptor {}", meta.group_segment_fixed_size, descriptor.group_segment_fixed_size));
+    }
+    if meta.private_segment_fixed_size != descriptor.private_segment_fixed_size {
+        push("abi-private-segment", format!(".private_segment_fixed_size {} but descriptor {}", meta.private_segment_fixed_size, descriptor.private_segment_fixed_size));
     }
     out
 }
@@ -591,7 +596,8 @@ fn operand_roles(arch: Arch, inst: &Inst) -> Result<Vec<(bool, bool)>, EditError
         && matches!(inst.operands.first(), Some(Operand::Special(Special::Vcc | Special::VccLo)));
     let probe: SmallVec<[Operand; 6]> = inst.operands.iter().enumerate().map(|(k, op)| match op {
         Operand::Special(_) if k == 0 && vopc_prefix => op.clone(),
-        Operand::Reg(_) | Operand::Half(..) | Operand::Special(_) => Operand::Reg(marker(k)),
+        Operand::Reg(_) | Operand::Special(_) => Operand::Reg(marker(k)),
+        Operand::Half(_, half) => Operand::Half(marker(k), *half),
         _ => op.clone(),
     }).collect();
     let table = |e: ValidateError| EditError::Unsupported(e.to_string());

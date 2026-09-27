@@ -151,10 +151,9 @@ pub fn serialize_kernel(meta: &HsaKernelMetadata) -> Result<Vec<u8>, MetadataErr
     Ok(out)
 }
 
-/// Cross-checks a kernel's metadata against its descriptor (lifter reject rules, core.md §5.2):
-/// `.symbol` must be `<kernel>.kd`, `.wavefront_size` must match KD `ENABLE_WAVEFRONT_SIZE32`,
-/// and `.vgpr_count` must round to the descriptor's VGPR granule (GFX10–12: 8 per granule in
-/// wave32, 4 in wave64).
+/// Cross-checks the HSA symbol, wave, private-segment size, and VGPR allocation.
+/// On gfx1201 the descriptor may reserve more VGPRs than `.vgpr_count`
+/// (AMDGPUUsage only defines the latter as an exact register count through GFX9).
 pub fn check(meta: &KernelMeta, kernel: &str, kd: &KernelDescriptor) -> Result<(), MetadataError> {
     let fail = |reason: String| Err(MetadataError::Inconsistent { kernel: kernel.into(), reason });
     if meta.symbol != format!("{kernel}.kd") {
@@ -165,11 +164,12 @@ pub fn check(meta: &KernelMeta, kernel: &str, kd: &KernelDescriptor) -> Result<(
     if meta.wavefront_size != wave {
         return fail(format!(".wavefront_size {} but the descriptor selects wave{wave}", meta.wavefront_size));
     }
-    let granule = if wave32 { 8 } else { 4 };
-    let expected = meta.vgpr_count.div_ceil(granule).saturating_sub(1);
-    let encoded = kd.compute_pgm_rsrc1.vgpr_granules();
-    if expected != encoded {
-        return fail(format!(".vgpr_count {} needs VGPR granule {expected}, rsrc1 encodes {encoded}", meta.vgpr_count));
+    if meta.private_segment_fixed_size != kd.private_segment_fixed_size {
+        return fail(format!(".private_segment_fixed_size {} but the descriptor allocates {}", meta.private_segment_fixed_size, kd.private_segment_fixed_size));
+    }
+    let allocated = kd.compute_pgm_rsrc1.next_free_vgpr(wave32);
+    if meta.vgpr_count > allocated {
+        return fail(format!(".vgpr_count {} exceeds the descriptor allocation {allocated}", meta.vgpr_count));
     }
     Ok(())
 }
@@ -504,11 +504,11 @@ mod tests {
             edit(&mut meta);
             check(&meta, &image.name, &image.descriptor)
         };
-        // rsrc1 granule 29 covers 233..=240 VGPRs in wave32.
-        assert_eq!(with(|m| m.vgpr_count = 233), Ok(()));
+        // The descriptor reserves 240 VGPRs, though smaller kernels are legal.
+        assert_eq!(with(|m| m.vgpr_count = 27), Ok(()));
         assert_eq!(with(|m| m.vgpr_count = 240), Ok(()));
-        assert!(matches!(with(|m| m.vgpr_count = 232), Err(MetadataError::Inconsistent { .. })));
         assert!(matches!(with(|m| m.vgpr_count = 241), Err(MetadataError::Inconsistent { .. })));
+        assert!(matches!(with(|m| m.private_segment_fixed_size = 16), Err(MetadataError::Inconsistent { .. })));
         assert!(matches!(with(|m| m.wavefront_size = 64), Err(MetadataError::Inconsistent { .. })));
         assert!(matches!(with(|m| m.symbol = "other.kd".into()), Err(MetadataError::Inconsistent { .. })));
     }

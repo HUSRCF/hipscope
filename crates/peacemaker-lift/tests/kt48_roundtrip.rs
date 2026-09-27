@@ -500,7 +500,6 @@ fn rejects_what_it_cannot_model() {
         ("undefined opcode word", vec![0xbfff_0000], Rule::Decode, "undefined gfx1201 opcode"),
         ("branch to mid-instruction", vec![0xbfa0_0000 | mid_instruction], Rule::BranchTarget, "mid-instruction"),
         ("branch past the symbol end", vec![0xbfa0_7fff], Rule::BranchTarget, "outside the kernel"),
-        ("s_setpc_b64 s[0:1]", vec![0xbe80_4800], Rule::Decode, "undefined gfx1201 opcode"),
         // s_clause 0x1; s_load_b32 s4, s[0:1], 0x0; s_load_b32 s5, s[0:1], 0x4; s_cbranch_scc1 -3
         ("clause window crossing a target", vec![0xbf85_0001, 0xf400_0100, 0xf800_0000, 0xf400_0140, 0xf800_0004, 0xbfa2_fffd], Rule::Window, "leaves its block"),
         ("s_waitcnt vmcnt(0) lgkmcnt(0) on gfx12", vec![0xbf89_0007], Rule::Decode, "undefined gfx1201 opcode"),

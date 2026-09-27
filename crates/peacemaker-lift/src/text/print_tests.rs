@@ -18,6 +18,65 @@ use peacemaker_ir::{
 use smallvec::SmallVec;
 
 const KT48_VA: u32 = 0x7f00;
+#[test]
+fn dpp_text_roundtrips_and_assembles_to_the_shipped_words() {
+    for (words, expected) in [
+        ([0x0624_24fa, 0xff09_0812], "v_add_f32_dpp v18, v18, v18 row_shl:8 row_mask:0xf bank_mask:0xf bound_ctrl:1"),
+        ([0x7e04_02fa, 0xff09_0101], "v_mov_b32_dpp v2, v1 row_shl:1 row_mask:0xf bank_mask:0xf bound_ctrl:1"),
+    ] {
+        let (inst, used) = gfx12::decode(&words).expect("shipped DPP encoding");
+        assert_eq!(used, 2);
+        assert_eq!(canonical(&inst, Arch::Gfx1201).unwrap(), expected);
+        let parsed = crate::text::parse_line(expected, Arch::Gfx1201).unwrap();
+        assert_eq!(gfx12::encode(&parsed).unwrap().as_slice(), &words);
+        if let Some(tc) = support::toolchain().expect("toolchain discovery") {
+            assert_eq!(support::mc_batch(&tc.mc, &[expected.into()]).unwrap()[0], words);
+        }
+    }
+}
+
+#[test]
+fn every_table_example_matches_pinned_llvm_mc_except_declared_dont_cares() {
+    let Some(tc) = support::toolchain().expect("toolchain discovery") else { return };
+    let rows = isa::gfx12();
+    let lines: Vec<String> = rows.iter().map(|row| row.sample.into()).collect();
+    let assembled = support::mc_batch(&tc.mc, &lines).expect("assemble every table example");
+    let mut reported = Vec::new();
+    for (row, words) in rows.iter().zip(&assembled) {
+        let original: Vec<u32> = row.encoding.split_whitespace()
+            .map(|w| u32::from_str_radix(w, 16).unwrap()).collect();
+        let (inst, consumed) = gfx12::decode(&original).unwrap();
+        assert_eq!(consumed, original.len(), "{}", row.name);
+        assert_eq!(gfx12::encode(&inst).unwrap().as_slice(), original, "{}", row.name);
+        match classify(&inst, words).unwrap_or(Parity::Mismatch) {
+            Parity::Exact => {}
+            Parity::Reported => reported.push(row.name),
+            Parity::Mismatch => panic!("{}: llvm-mc={words:08x?}, encoded={original:08x?}", row.name),
+        }
+    }
+    eprintln!("{} table rows, {} syntax-lossy samples", rows.len(), reported.len());
+}
+
+#[test]
+fn buffer_cache_hints_roundtrip_through_objdump_and_llvm_mc_syntax() {
+    for (words, line) in [
+        ([0xc405_005c, 0x409c_50b8, 0x0000_00b6],
+            "buffer_load_b32 v184, v182, s[40:43], s92 offen th:TH_LOAD_NT scope:SCOPE_SYS"),
+        ([0xc406_8051, 0x40fc_5020, 0x0000_008a],
+            "buffer_store_b32 v32, v138, s[40:43], s81 offen th:TH_STORE_NT_WB scope:SCOPE_SYS"),
+    ] {
+        let (inst, used) = gfx12::decode(&words).unwrap();
+        assert_eq!(used, 3);
+        assert_eq!(canonical(&inst, Arch::Gfx1201).unwrap(), line);
+        let parsed = crate::text::parse_line(line, Arch::Gfx1201).unwrap();
+        assert_eq!((&parsed.operands, &parsed.fields, &parsed.mods), (&inst.operands, &inst.fields, &inst.mods), "{line}");
+        assert_eq!(gfx12::encode(&parsed).unwrap().as_slice(), &words);
+        if let Some(tc) = support::toolchain().expect("toolchain discovery") {
+            assert_eq!(support::mc_batch(&tc.mc, &[line.into()]).unwrap()[0], words);
+        }
+    }
+}
+
 const KT48_SIZE: usize = 10_604;
 
 /// Per-kernel census pins `(symbol, instructions, branches, distinct branch

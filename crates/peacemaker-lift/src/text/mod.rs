@@ -186,8 +186,9 @@ pub(crate) mod support {
         mc: &std::path::Path,
         lines: &[String],
     ) -> Result<Vec<Vec<u32>>, String> {
-        let path =
-            std::env::temp_dir().join(format!("pm-c3b-mc-{}.s", std::process::id()));
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("pm-c3b-mc-{}-{id}.s", std::process::id()));
         std::fs::write(&path, lines.join("\n") + "\n")
             .map_err(|e| format!("mc input write: {e}"))?;
         let output = std::process::Command::new(mc)
