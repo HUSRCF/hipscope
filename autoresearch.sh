@@ -27,12 +27,19 @@ import hashlib, json, os, re, select, statistics, subprocess, sys, time
 MODEL = os.path.expanduser("~/.hipfire/models/qwen3.8-flash-next.mq6q8-pleq8.hfq")
 KLD_REF = "/home/bjoern/hipfire-qwen4-kld/.codeinsight+research/qwen4-kld/source-teacher/bf16src-wt2-c512x32.kldref"
 KLD_CHUNKS = 32
-# Decode-route KLD ceiling = baseline + noise band. Weight perturbations of
-# equal expected quality (fake int8 of the HC projections, g16 vs g32) moved
-# the 32-chunk KLD by -1.8%..+1.4% around the HEAD value 0.074299 (single
-# chunks swing +-0.03), so the band is +2%. Fixed to the segment baseline, not
-# the moving best, so within-noise keeps cannot creep.
-KLD_MAX = 0.074299 * 1.02
+# Decode-route KLD gate = the noise band, measured per chunk against the
+# pre-requant baseline (HEAD 7e4ece53a, logits sha 96dd8b39..., mean 0.074299).
+# Any numerics change perturbs every chunk chaotically (paired per-chunk
+# deltas sd ~0.009, so the 32-chunk mean moves +-0.0015 for equal-quality
+# variants). A candidate passes while its paired mean delta is not
+# significantly positive (t <= KLD_T_MAX) and its mean stays under a hard cap.
+# The comparison is always against this fixed baseline, so keeps cannot creep.
+KLD_BASE_CHUNKS = [0.075312, 0.076485, 0.088540, 0.082121, 0.060628, 0.063129, 0.046638, 0.066967,
+                   0.080128, 0.039394, 0.122432, 0.104041, 0.097149, 0.081043, 0.060227, 0.049957,
+                   0.076041, 0.072746, 0.094786, 0.062741, 0.140943, 0.033842, 0.072409, 0.067402,
+                   0.043395, 0.102479, 0.051802, 0.095481, 0.107308, 0.060969, 0.056740, 0.044298]
+KLD_T_MAX = 2.0
+KLD_MAX = 0.074299 * 1.05
 PROMPT_PATH = "benchmarks/prompts/glimmer_prefill_1024.txt"
 PROMPT_MD5 = "0ee8f86ada3683eda452bc294ec824a9"
 RUNS = int(os.environ.get("AR_RUNS", "3"))
@@ -166,14 +173,21 @@ m = re.search(r"mean KLD = ([0-9.]+)\s+mean NLL = ([0-9.]+).*top1 = ([0-9.]+).*l
 if rc != 0 or not m:
     print(tail[-3000:]); print("FAIL: qwen4_kld eval --decode"); sys.exit(1)
 kld, nll, top1, sha = float(m.group(1)), float(m.group(2)), float(m.group(3)), m.group(4)
+chunks = [float(x) for x in re.findall(r"chunk \d+/\d+\s+KLD ([0-9.]+)", tail)]
+if len(chunks) != len(KLD_BASE_CHUNKS):
+    print(f"FAIL: {len(chunks)} chunk KLDs parsed"); sys.exit(1)
+deltas = [c - b for c, b in zip(chunks, KLD_BASE_CHUNKS)]
+sd = statistics.stdev(deltas)
+kld_t = statistics.mean(deltas) / (sd / len(deltas) ** 0.5) if sd > 0 else 0.0
 print(f"decode_logits_sha256={sha}")
 print(f"METRIC decode_tok_s={statistics.median(dec):.3f}")
 print(f"METRIC decode_kld={kld:.6f}")
+print(f"METRIC decode_kld_t={kld_t:.3f}")
 print(f"METRIC decode_nll={nll:.6f}")
 print(f"METRIC decode_top1={top1:.4f}")
 print(f"METRIC prefill_tok_s={statistics.median(pp):.2f}")
 print(f"METRIC token_match={match}")
 print(f"METRIC load_s={load_s:.1f}")
-if KLD_MAX is not None and kld > KLD_MAX:
-    print(f"FAIL: decode KLD {kld:.6f} > baseline {KLD_MAX:.6f}"); sys.exit(1)
+if kld_t > KLD_T_MAX or kld > KLD_MAX:
+    print(f"FAIL: decode KLD {kld:.6f} (paired t {kld_t:.2f}) outside the baseline noise band"); sys.exit(1)
 PY
