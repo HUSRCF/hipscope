@@ -2182,6 +2182,25 @@ pub fn indexed_attention_select_batch(
     gpu: &mut Gpu,
     p: &IndexedAttentionSelectBatch<'_>,
 ) -> HipResult<()> {
+    indexed_attention_select_batch_impl(gpu, p, None).map(|_| ())
+}
+
+/// [`indexed_attention_select_batch`] of a single row that also writes the
+/// selection into `mirror` (`capacity` i32) on the parallel route; returns
+/// whether it did (the caller copies otherwise).
+pub fn indexed_attention_select_batch_mirrored(
+    gpu: &mut Gpu,
+    p: &IndexedAttentionSelectBatch<'_>,
+    mirror: &GpuTensor,
+) -> HipResult<bool> {
+    indexed_attention_select_batch_impl(gpu, p, Some(mirror))
+}
+
+fn indexed_attention_select_batch_impl(
+    gpu: &mut Gpu,
+    p: &IndexedAttentionSelectBatch<'_>,
+    mirror: Option<&GpuTensor>,
+) -> HipResult<bool> {
     for tensor in [p.query, p.pooled] {
         ensure_f32(tensor)?;
     }
@@ -2297,6 +2316,14 @@ pub fn indexed_attention_select_batch(
     args.push_i32(position_start);
     let position_offset = args.len() - 4;
     args.push_i32(capacity);
+    let mirror = mirror.filter(|m| {
+        kernel_name == "indexed_attention_select_f32_batched"
+            && p.rows == 1
+            && m.numel() * m.dtype.size() >= p.capacity * std::mem::size_of::<i32>()
+    });
+    if kernel_name == "indexed_attention_select_f32_batched" {
+        args.push_ptr(mirror.map_or(std::ptr::null_mut(), |m| m.buf.as_ptr()));
+    }
     args.pad_to(16);
     // Both declared fields make the selection follow the replay position instead
     // of the capture position.
@@ -2325,7 +2352,8 @@ pub fn indexed_attention_select_batch(
             grid: None,
             kernargs: &bindings,
         },
-    )
+    )?;
+    Ok(mirror.is_some())
 }
 /// Device-side stable reuse of a prior MTP QSA selection row.
 ///

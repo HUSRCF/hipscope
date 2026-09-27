@@ -24,6 +24,7 @@ use rdna_compute::tensor_ops::{
     hyper_write, hyper_write_norm, indexed_attention_attention_batch,
     indexed_attention_cache_append_batch, indexed_attention_decode_prologue,
     indexed_attention_norm_rope_batch, indexed_attention_pool_rope, indexed_attention_select_batch,
+    indexed_attention_select_batch_mirrored,
     scale_f32, ArgmaxF32, Bf16Roundtrip, GatedDeltaConv, GatedDeltaConvBatched, GatedDeltaGate,
     GatedDeltaGateBatched, GatedDeltaParams, GatedDeltaParamsBatched, GatedDeltaStep,
     GatedDeltaStepBatched, HcActivationFused, HyperNextGates, HyperNorm, HyperNormGate,
@@ -1744,24 +1745,33 @@ pub fn execute_indexed_attention(
         ))?;
     }
     let budget_blocks = op.budget / op.compress;
-    hip(indexed_attention_select_batch(
-        gpu,
-        &IndexedAttentionSelectBatch {
-            query: &index_batch,
-            pooled: op.state.pooled_keys,
-            selected: &selected_batch,
-            rows: op.rows,
-            query_row_stride: index_width,
-            block_count: complete,
-            index_heads: op.index_heads,
-            index_dim: op.index_dim,
-            budget_blocks,
-            compress: op.compress,
-            position_start: initial_position,
-            capacity: op.state.selected_capacity,
-            shape_blocks: op.state.pooled_capacity,
-        },
-    ))?;
+    let select = IndexedAttentionSelectBatch {
+        query: &index_batch,
+        pooled: op.state.pooled_keys,
+        selected: &selected_batch,
+        rows: op.rows,
+        query_row_stride: index_width,
+        block_count: complete,
+        index_heads: op.index_heads,
+        index_dim: op.index_dim,
+        budget_blocks,
+        compress: op.compress,
+        position_start: initial_position,
+        capacity: op.state.selected_capacity,
+        shape_blocks: op.state.pooled_capacity,
+    };
+    // Decode: the selection also lands in the persistent selected indices
+    // (the copy at the end is then skipped).
+    let selection_persisted = if op.rows == 1 {
+        hip(indexed_attention_select_batch_mirrored(
+            gpu,
+            &select,
+            op.state.selected_indices,
+        ))?
+    } else {
+        hip(indexed_attention_select_batch(gpu, &select))?;
+        false
+    };
     hip(indexed_attention_attention_batch(
         gpu,
         &IndexedAttentionAttentionBatch {
@@ -1798,11 +1808,13 @@ pub fn execute_indexed_attention(
     // A recorded launch, not a `copy_d2d`: the retained tape replays dispatches,
     // so a device copy inside the body would be state the replay cannot
     // reproduce. `copy_f32_buffer` moves the same bytes with an explicit ABI.
-    hip(gpu.copy_f32_buffer(
-        op.state.selected_indices,
-        &final_selected,
-        op.state.selected_capacity,
-    ))?;
+    if !selection_persisted {
+        hip(gpu.copy_f32_buffer(
+            op.state.selected_indices,
+            &final_selected,
+            op.state.selected_capacity,
+        ))?;
+    }
     Ok(())
 }
 

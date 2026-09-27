@@ -136,16 +136,25 @@ static __device__ __forceinline__ bool gated_delta_step_norm128_body(
     __shared__ __hip_bfloat16 k_norm[128];
     __shared__ __hip_bfloat16 q_inv_shared;
     __shared__ __hip_bfloat16 k_inv_shared;
+    __shared__ __align__(16) float q_square[128];
+    __shared__ __align__(16) float k_square[128];
 
-    // Load the BF16-rounded q/k vectors cooperatively.  Threads beyond the
+    // Load the BF16-rounded q/k vectors cooperatively, with each element's
+    // BF16-rounded square for the serial sums below.  Threads beyond the
     // exact 128-wide vector remain barrier participants so the old 256-wide
     // launch remains safe for direct callers.
     if (exact_shape && value_head < value_heads && threadIdx.x < 128) {
         const int repeat = value_heads / key_heads;
         const int key_head = value_head / repeat;
         const int key_base = key_head * 128;
-        q_norm[threadIdx.x] = bf16_round(q[key_base + threadIdx.x]);
-        k_norm[threadIdx.x] = bf16_round(k[key_base + threadIdx.x]);
+        const __hip_bfloat16 q_value = bf16_round(q[key_base + threadIdx.x]);
+        const __hip_bfloat16 k_value = bf16_round(k[key_base + threadIdx.x]);
+        q_norm[threadIdx.x] = q_value;
+        k_norm[threadIdx.x] = k_value;
+        const float q_float = bf16_to_f32(q_value);
+        const float k_float = bf16_to_f32(k_value);
+        q_square[threadIdx.x] = bf16_to_f32(bf16_round(q_float * q_float));
+        k_square[threadIdx.x] = bf16_to_f32(bf16_round(k_float * k_float));
     }
     __syncthreads();
 
@@ -153,13 +162,19 @@ static __device__ __forceinline__ bool gated_delta_step_norm128_body(
         float q_sum_f32 = 0.0f;
         float k_sum_f32 = 0.0f;
         const __hip_bfloat16 eps = bf16_round(1.0e-6f);
-        for (int kd = 0; kd < 128; ++kd) {
-            const __hip_bfloat16 q_value = q_norm[kd];
-            const __hip_bfloat16 k_value = k_norm[kd];
-            const float q_float = bf16_to_f32(q_value);
-            const float k_float = bf16_to_f32(k_value);
-            q_sum_f32 += bf16_to_f32(bf16_round(q_float * q_float));
-            k_sum_f32 += bf16_to_f32(bf16_round(k_float * k_float));
+        // The serial kd-order sums, four LDS squares per read.
+#pragma unroll 4
+        for (int kd = 0; kd < 128; kd += 4) {
+            const float4 qs = *reinterpret_cast<const float4*>(q_square + kd);
+            const float4 ks = *reinterpret_cast<const float4*>(k_square + kd);
+            q_sum_f32 += qs.x;
+            k_sum_f32 += ks.x;
+            q_sum_f32 += qs.y;
+            k_sum_f32 += ks.y;
+            q_sum_f32 += qs.z;
+            k_sum_f32 += ks.z;
+            q_sum_f32 += qs.w;
+            k_sum_f32 += ks.w;
         }
         const __hip_bfloat16 q_sum = bf16_round(q_sum_f32);
         const __hip_bfloat16 k_sum = bf16_round(k_sum_f32);
@@ -1933,7 +1948,8 @@ extern "C" __global__ void indexed_attention_select_f32_batched(
     int budget_blocks,
     int compress,
     int position_start,
-    int capacity) {
+    int capacity,
+    int* mirror) {
     int row = (int)blockIdx.x;
     if (row >= rows) return;
     extern __shared__ __align__(16) float scores[];
@@ -1947,6 +1963,7 @@ extern "C" __global__ void indexed_attention_select_f32_batched(
     // complete block. This is the fill the old single-threaded path did.
     for (int i = (int)threadIdx.x; i < capacity; i += (int)blockDim.x) {
         row_selected[i] = -1;
+        if (mirror) mirror[i] = -1;
     }
     if (row_block_count > 0) {
         for (int block = (int)threadIdx.x;
@@ -1987,7 +2004,10 @@ extern "C" __global__ void indexed_attention_select_f32_batched(
             for (int slot = 0; slot < compress; ++slot) {
                 int index = rank * compress + slot;
                 int token = block * compress + slot;
-                if (index < capacity && token < visible) row_selected[index] = token;
+                if (index < capacity && token < visible) {
+                    row_selected[index] = token;
+                    if (mirror) mirror[index] = token;
+                }
             }
         }
     }
@@ -1997,6 +2017,7 @@ extern "C" __global__ void indexed_attention_select_f32_batched(
          token < visible && offset + (token - tail_start) < capacity;
          token += (int)blockDim.x) {
         row_selected[offset + (token - tail_start)] = token;
+        if (mirror) mirror[offset + (token - tail_start)] = token;
     }
 }
 
