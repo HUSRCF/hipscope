@@ -50,8 +50,8 @@ pub struct PrefillBatchScratch {
     pub x_norm_batch: GpuTensor,
 
     // LA-layer projection outputs
-    pub dn_qkv_batch: GpuTensor,      // [N × qkv_dim]
-    pub dn_z_batch: GpuTensor,        // [N × v_dim]
+    pub dn_qkv_batch: GpuTensor, // [N × qkv_dim]
+    pub dn_z_batch: GpuTensor,   // [N × v_dim]
     /// Z plus up to 256 appended beta/alpha/padding rows, used only by the
     /// symmetric IU4 fold; output is deinterleaved before GDN consumes it.
     pub dn_z_fold_batch: GpuTensor,
@@ -85,6 +85,13 @@ pub struct PrefillBatchScratch {
     // tree-verify mode; FA RoPE reads it instead of `positions` while KV
     // writes and attention seq_len keep the flat physical slots.
     pub rope_positions: GpuTensor,
+    // VL M-RoPE phases: [max_batch × 3] i32-in-F32 per-row absolute (t,h,w).
+    // Read by the FA RoPE branch only on steps whose SlotBatch carries pos3.
+    pub pos3: GpuTensor,
+    // VL external-embedding scatter inputs (i32-in-F32 index, and per-row
+    // matrix pointer as 64-bit payload). See the alloc-site comment.
+    pub ext_emb_index: GpuTensor,
+    pub ext_emb_row_ptr: GpuTensor,
     // Token-ids buffer feeding the batched embedding kernel. [max_batch] i32
     // stored as F32 (same dtype-cosmetic pattern as `positions`). Uploaded
     // once per batched forward and read by `embedding_lookup_hfq4g256_batched`.
@@ -202,7 +209,14 @@ impl PrefillBatchScratch {
         max_batch: usize,
         cap_gdn_tape: bool,
     ) -> HipResult<Self> {
-        Self::new_opt_with_alloc(gpu, config, max_batch, cap_gdn_tape, false, Gpu::alloc_tensor)
+        Self::new_opt_with_alloc(
+            gpu,
+            config,
+            max_batch,
+            cap_gdn_tape,
+            false,
+            Gpu::alloc_tensor,
+        )
     }
 
     /// Only for the model-wide admitted ordinary gfx11 route; callers must
@@ -308,7 +322,25 @@ impl PrefillBatchScratch {
         // from `TreeVerifyCtx.positions`; FA RoPE kernels read it ONLY
         // when `tree_verify.is_some()`. Same i32-in-F32 cosmetic dtype
         // pattern as `positions`.
-        let i_rope_positions = if lean { None } else { Some(alloc!(&[max_batch], DType::F32)) };
+        let i_rope_positions = if lean {
+            None
+        } else {
+            Some(alloc!(&[max_batch], DType::F32))
+        };
+        // VL M-RoPE phases: [max_batch × 3] i32-in-F32, per-row absolute
+        // (t, h, w). Uploaded only on steps whose SlotBatch carries
+        // `pos3`; the FA RoPE branch dispatches the batched M-RoPE
+        // kernel instead of the 1D one. Same cosmetic-dtype pattern as
+        // `positions`.
+        let i_pos3 = alloc!(&[max_batch * 3], DType::F32);
+        // VL external-embedding scatter inputs: per-row index into that
+        // row's slot's vision-embedding matrix (-1 = token table), and
+        // per-row device pointer to that matrix (null when the slot has
+        // none). Uploaded on VL steps; the scatter kernel runs right
+        // after the token-embedding lookup and overwrites image-pad rows.
+        let i_ext_emb_index = alloc!(&[max_batch], DType::F32);
+        // u64 device pointers — 8 B/row, Raw dtype counts bytes.
+        let i_ext_emb_row_ptr = alloc!(&[max_batch * 8], DType::Raw);
         let i_tokens = alloc!(&[max_batch], DType::F32);
         let i_fa_q_full_batch = alloc!(&[max_batch * q_dim * 2], DType::F32);
         let i_fa_q_batch = alloc!(&[max_batch * q_dim], DType::F32);
@@ -317,10 +349,26 @@ impl PrefillBatchScratch {
         let i_fa_v_batch = alloc!(&[max_batch * kv_dim], DType::F32);
         let i_fa_attn_out_batch = alloc!(&[max_batch * q_dim], DType::F32);
         let i_fa_attn_out_rot_batch = alloc!(&[fallback_rows * q_dim], DType::F32);
-        let i_x_rot_f16_batch = if lean { None } else { Some(alloc!(&[max_batch * dim], DType::F16)) };
-        let i_dn_normed_rot_f16_batch = if lean { None } else { Some(alloc!(&[max_batch * v_dim], DType::F16)) };
-        let i_ffn_hidden_f16_batch = if lean { None } else { Some(alloc!(&[max_batch * hidden_dim], DType::F16)) };
-        let i_fa_attn_out_rot_f16_batch = if lean { None } else { Some(alloc!(&[max_batch * q_dim], DType::F16)) };
+        let i_x_rot_f16_batch = if lean {
+            None
+        } else {
+            Some(alloc!(&[max_batch * dim], DType::F16))
+        };
+        let i_dn_normed_rot_f16_batch = if lean {
+            None
+        } else {
+            Some(alloc!(&[max_batch * v_dim], DType::F16))
+        };
+        let i_ffn_hidden_f16_batch = if lean {
+            None
+        } else {
+            Some(alloc!(&[max_batch * hidden_dim], DType::F16))
+        };
+        let i_fa_attn_out_rot_f16_batch = if lean {
+            None
+        } else {
+            Some(alloc!(&[max_batch * q_dim], DType::F16))
+        };
         let i_mq_prologue_ctrl = alloc!(&[256], DType::Raw);
         let i_moe_router_logits_batch = alloc_opt!(
             config.num_experts > 0,
@@ -442,13 +490,15 @@ impl PrefillBatchScratch {
             shape: vec![0],
             dtype,
         };
-        let sentinels = lean.then(|| (
-            borrowed_sentinel(DType::F32),
-            borrowed_sentinel(DType::F16),
-            borrowed_sentinel(DType::F16),
-            borrowed_sentinel(DType::F16),
-            borrowed_sentinel(DType::F16),
-        ));
+        let sentinels = lean.then(|| {
+            (
+                borrowed_sentinel(DType::F32),
+                borrowed_sentinel(DType::F16),
+                borrowed_sentinel(DType::F16),
+                borrowed_sentinel(DType::F16),
+                borrowed_sentinel(DType::F16),
+            )
+        });
         let (
             rope_positions,
             x_rot_f16_batch,
@@ -501,6 +551,9 @@ impl PrefillBatchScratch {
             dn_normed_rot_batch: take!(i_dn_normed_rot_batch),
             positions: take!(i_positions),
             rope_positions,
+            pos3: take!(i_pos3),
+            ext_emb_index: take!(i_ext_emb_index),
+            ext_emb_row_ptr: take!(i_ext_emb_row_ptr),
             tokens: take!(i_tokens),
             fa_q_full_batch: take!(i_fa_q_full_batch),
             fa_q_batch: take!(i_fa_q_batch),
@@ -569,6 +622,9 @@ impl PrefillBatchScratch {
             self.ffn_hidden_batch,
             self.dn_normed_rot_batch,
             self.positions,
+            self.pos3,
+            self.ext_emb_index,
+            self.ext_emb_row_ptr,
             self.tokens,
             self.fa_q_full_batch,
             self.fa_q_batch,
@@ -1349,6 +1405,12 @@ impl PrefillBatchScratch {
         add(n, 4)?;
         add(n, 4)?;
         add(n, 4)?;
+        // VL side arrays: pos3 [n×3] and ext_emb_index [n] (i32-in-F32, 4
+        // B/row each) plus ext_emb_row_ptr [n] raw u64 pointers (8 B/row) —
+        // must mirror the alloc!s in new_opt exactly.
+        add(cm(n, 3)?, 4)?;
+        add(n, 4)?;
+        add(n, 8)?;
         add(
             cm(n, q_dim)?
                 .checked_mul(2)

@@ -34,6 +34,18 @@ pub mod arch;
 pub mod arch_model;
 #[cfg(feature = "deltanet")]
 pub mod carrier;
+/// Qwen3.5 hybrid-state checkpoint pool for serving prefix-cache resume
+/// (spec §4.5 C5). Byte-bounded LRU of immutable `DeltaNetSnapshot`
+/// bundles keyed by `(CacheDomain, boundary_p)`, with `plan_resume`
+/// last-token semantics and GPU-backed capture/restore paths.
+#[cfg(feature = "deltanet")]
+pub mod checkpoint;
+/// DFlash2 speculative decode for the multi-slot serve engine: shared draft
+/// state, per-slot draft context, and the draft/verify-accept steps that
+/// plug into `serve_engine`'s batched forward. Deltanet-gated like
+/// `dflash_spec` (the draft forward consumes `ModelSlot`-family types).
+#[cfg(feature = "deltanet")]
+pub mod dflash_slot;
 /// Qwen3.5 DFlash / DDTree speculative-decode state (`DflashState`,
 /// `load_dflash_state`) and the `DflashSpeculator` impl of the arch-generic
 /// `hipfire_runtime::spec::Speculator`. Deltanet-gated — it owns `ModelSlot`-

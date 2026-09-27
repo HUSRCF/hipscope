@@ -13414,6 +13414,138 @@ impl Gpu {
         }
     }
 
+    /// Q-tiled flash-style ViT self-attention: same packed-QKV contract as
+    /// [`Gpu::vit_attention_f32`], but QB=16 queries per block share each
+    /// K/V tile pulled through LDS (online softmax, no full-row score
+    /// buffer), cutting the DRAM re-read traffic by ~16×. This is the
+    /// production path for the vision tower — the naive kernel measured
+    /// 1.02 s/layer at N=4624 on gfx1101 (25.5 s per 68x68-grid image);
+    /// this variant should land two orders under it. Requires
+    /// head_dim % 16 == 0 and head_dim <= 128.
+    pub fn vit_attention_qtiled_f32(
+        &mut self,
+        qkv: &GpuTensor,
+        out: &GpuTensor,
+        n: usize,
+        hidden: usize,
+        num_heads: usize,
+        head_dim: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        // Shapes outside the Q-tiled contract (per-lane accumulators are
+        // sized for head_dim <= 128 in 16-lane multiples of 16) fall back
+        // to the naive kernel instead of asserting: an assert here runs on
+        // the engine-owning thread, where a panic is a serve hang. The
+        // naive kernel is slower but correct for any tower shape.
+        if head_dim % 16 != 0 || head_dim > 128 {
+            eprintln!(
+                "vit_attention_qtiled_f32: head_dim={head_dim} is outside the \
+                 Q-tiled contract (multiple of 16, <= 128); falling back to \
+                 vit_attention_f32"
+            );
+            return self.vit_attention_f32(qkv, out, n, hidden, num_heads, head_dim);
+        }
+        self.ensure_kernel(
+            "vit_attention_qtiled_f32",
+            kernels::VIT_ATTENTION_QTILED_SRC,
+            "vit_attention_qtiled_f32",
+        )?;
+        let func = &self.functions["vit_attention_qtiled_f32"];
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let mut qp = qkv.buf.as_ptr();
+        let mut op = out.buf.as_ptr();
+        let mut ni = n as i32;
+        let mut hi = hidden as i32;
+        let mut nh = num_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut sc = scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut qp as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+            &mut hi as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+        ];
+        // Layout must mirror the kernel's smem carve-up (QB=16, K_TILE=64):
+        // k_tile + q_tile + s_tile + ws_max + ws_sum + m_l + out_run. (V is
+        // deliberately NOT staged in LDS — each (j, d) element is read by
+        // exactly one lane, so there is no intra-block reuse to pay for.)
+        const QB: usize = 16;
+        const K_TILE: usize = 64;
+        let shared_mem =
+            ((K_TILE * head_dim + 2 * QB * head_dim + QB * K_TILE + 2 * QB * 16 + QB * 2) * 4)
+                as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [num_heads as u32, (n as u32).div_ceil(QB as u32), 1],
+                [256, 1, 1],
+                shared_mem,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// Multi-slot variant of
+    /// [`Self::attention_flash_bf16_batched_masked_windowed`] — the bf16
+    /// tile kernel is descriptor-aware (it is one of the two kernels the
+    /// original SP1 descriptor port landed on), so this only threads the
+    /// arguments through the shared launcher.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_flash_bf16_batched_masked_windowed_slots(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+        partials: &GpuTensor,
+        tree_bias: Option<&GpuTensor>,
+        block_start: usize,
+        block_cols: usize,
+        window: i32,
+        slot_descs: Option<&GpuTensor>,
+        row_slot: Option<&GpuTensor>,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.launch_asym_flash_batched(
+            "attention_flash_bf16_tile_batched",
+            kernels::ATTENTION_FLASH_BF16_TILE_BATCHED_SRC,
+            "attention_flash_bf16_tile_batched",
+            q,
+            k_cache,
+            v_cache,
+            out,
+            positions,
+            q, // cos_theta dummy — kernel ignores
+            q, // sin_theta dummy — kernel ignores
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_seq,
+            max_ctx_len,
+            batch_size,
+            partials,
+            tree_bias,
+            block_start,
+            block_cols,
+            V_MODE_Q8,
+            window,
+            /*force_wmma_grid=*/ false,
+            slot_descs,
+            row_slot,
+        )
+    }
+
 
     /// DFlash draft cross-attention: `B` queries attend to `L` keys/values
     /// with NO causal mask (bidirectional). Supports GQA; `n_heads` must be

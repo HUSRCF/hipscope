@@ -8078,6 +8078,11 @@ pub const EMBEDDING_HFQ4G256_BATCHED_SRC: &str =
 /// verify hot path needs this variant to enable graph capture on that model.
 pub const EMBEDDING_Q8_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/embedding_q8_batched.hip");
+/// VL batched prefill: overwrite image-pad rows of the token-embedding batch
+/// with per-row vision-embedding matrix rows. Consumed by
+/// `Gpu::embedding_scatter_ext_batched` on the multi-slot VL path.
+pub const EMBEDDING_SCATTER_EXT_SRC: &str =
+    include_str!("../../../kernels/src/embedding_scatter_ext.hip");
 
 /// Batched F16 embedding: copies N rows of an F16 table into `[N × dim]` F32,
 /// reading token ids from a device buffer. Keeps the DSpark markov head chain
@@ -8250,6 +8255,13 @@ pub const TRANSPOSE_SRC: &str = include_str!("../../../kernels/src/transpose.hip
 /// Fused ViT self-attention: Q@K^T → softmax → @V, reading QKV from [N, 3*hidden].
 /// Grid=[n_heads, N]. Each block computes one (head, query_pos) output row.
 pub const VIT_ATTENTION_SRC: &str = include_str!("../../../kernels/src/vit_attention.hip");
+/// Q-tiled flash-style ViT attention (`Gpu::vit_attention_qtiled_f32`):
+/// QB queries per block share K/V tiles in LDS - ~QB× less DRAM traffic
+/// than the per-(head, query) `vit_attention_f32`, which was the whole
+/// 25 s @ 68x68-grid vision-forward hot spot (1.02 s/layer measured on
+/// gfx1101 at N=4624). See kernels/src/vit_attention_qtiled.hip.
+pub const VIT_ATTENTION_QTILED_SRC: &str =
+    include_str!("../../../kernels/src/vit_attention_qtiled.hip");
 
 /// 2D rotary positional embedding for the Qwen3.5-VL vision tower. Rotates Q
 /// and K halves of the packed QKV buffer in-place using per-token cos/sin of

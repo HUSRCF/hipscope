@@ -60,6 +60,7 @@ pub mod safetensors_source;
 pub mod sampler;
 pub mod sealed_moe;
 pub mod serve;
+pub mod checkpoint_pool;
 pub mod serve_contract;
 pub mod serve_fairness;
 pub mod serve_wait;
