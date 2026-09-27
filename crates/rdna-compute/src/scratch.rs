@@ -50,6 +50,11 @@ pub struct ScratchState {
     pub mq_rmsnorm_wavegrid_scratch: Option<DeviceBuffer>,
     /// Four-byte result of `tensor_ops::argmax_f32_host`.
     pub argmax_host: Option<GpuTensor>,
+    /// `(x, x_rot, k)` pointers of an `mq_rotate_x` output a fused kernel
+    /// already wrote (`Gpu::hyper_read_projected_rotate`); the next matching
+    /// `Gpu::rotate_x_mq` consumes it instead of launching. The step executor
+    /// clears it after the consuming step.
+    pub prerotated: Option<(usize, usize, usize)>,
     /// Dedicated F32 temporary for the unfused GEMV-residual alias fallback.
     /// Lazily allocated and grown on demand; no other scratch path uses it.
     pub gemv_residual_tmp: Option<GpuTensor>,

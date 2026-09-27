@@ -757,6 +757,20 @@ pub fn execute_validated_steps<'a>(
                     Some(Step::Clear(op)) => Some(op),
                     _ => None,
                 };
+                // A mixer reading `mixed` through the read's rotation scratch:
+                // the read writes that rotation too (consumed by the mixer's
+                // first rotate, cleared after that step).
+                let mixed = read.mixed.buf.as_ptr();
+                let rotation = read.rotation.buf.as_ptr();
+                let rotate_mixed = match steps.get(i + 2) {
+                    Some(Step::GatedDeltaNet(op)) => {
+                        op.input.buf.as_ptr() == mixed && op.rotation.buf.as_ptr() == rotation
+                    }
+                    Some(Step::IndexedAttention(op)) => {
+                        op.input.buf.as_ptr() == mixed && op.rotation.buf.as_ptr() == rotation
+                    }
+                    _ => false,
+                };
                 if let Some(produced) = execute_hyper_write_then_read(
                     gpu,
                     write,
@@ -764,6 +778,7 @@ pub fn execute_validated_steps<'a>(
                     quarters_in.as_ref(),
                     next.as_ref().map(|(_, op, q)| (*op, q)),
                     clear,
+                    rotate_mixed,
                 )? {
                     gates_ready = next.filter(|_| produced).map(|(j, _, _)| (j, slot));
                     i += if clear.is_some() { 3 } else { 2 };
@@ -771,6 +786,7 @@ pub fn execute_validated_steps<'a>(
                 }
             }
             launch_op(gpu, ctx, &steps[i])?;
+            gpu.scratch.prerotated = None;
             i += 1;
         }
     }

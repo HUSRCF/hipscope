@@ -3408,8 +3408,67 @@ impl Gpu {
         result
     }
 
+    /// The decode HC read's four-branch mix (`hyper_read_projected`) of `up`
+    /// and `normalized` into `mixed`, plus `mq_rotate_x(mixed)` into
+    /// `rotated`, one launch; bitwise both. The next `rotate_x_mq(mixed,
+    /// rotated, hidden)` is then a no-op (see `ScratchState::prerotated`).
+    pub fn hyper_read_projected_rotate(
+        &mut self,
+        normalized: &GpuTensor,
+        up: &GpuTensor,
+        mixed: &GpuTensor,
+        rotated: &GpuTensor,
+        hidden: usize,
+    ) -> HipResult<()> {
+        if hidden % 256 != 0
+            || normalized.numel() < 4 * hidden
+            || up.numel() < 4 * hidden
+            || mixed.numel() < hidden
+            || rotated.numel() < hidden
+        {
+            return Err(hip_bridge::HipError::new(1, "hyper_read_projected_rotate shape"));
+        }
+        self.bind_thread()?;
+        const FUNC: &str = "hyper_read_projected_rotate_f32";
+        self.ensure_kernel("mq_rotate_x", kernels::GEMV_MQ4G256_SRC, FUNC)?;
+        self.ensure_mq_signs()?;
+        let s1 = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2 = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let n_ptr = normalized.buf.as_ptr();
+        let u_ptr = up.buf.as_ptr();
+        let m_ptr = mixed.buf.as_ptr();
+        let r_ptr = rotated.buf.as_ptr();
+        let h_val = hidden as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &n_ptr as *const _ as *mut c_void,
+            &u_ptr as *const _ as *mut c_void,
+            &m_ptr as *const _ as *mut c_void,
+            &r_ptr as *const _ as *mut c_void,
+            &s1 as *const _ as *mut c_void,
+            &s2 as *const _ as *mut c_void,
+            &h_val as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(FUNC, [(hidden / 256) as u32, 1, 1], [256, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(n_ptr);
+            b.push_ptr(u_ptr);
+            b.push_ptr(m_ptr);
+            b.push_ptr(r_ptr);
+            b.push_ptr(s1);
+            b.push_ptr(s2);
+            b.push_i32(h_val);
+            b
+        })?;
+        self.scratch.prerotated = Some((m_ptr as usize, r_ptr as usize, hidden));
+        Ok(())
+    }
+
     /// Standalone FWHT rotation for MagnumQuant (MQ4). Writes K floats into x_rot.
     pub fn rotate_x_mq(&mut self, x: &GpuTensor, x_rot: &GpuTensor, k: usize) -> HipResult<()> {
+        let key = (x.buf.as_ptr() as usize, x_rot.buf.as_ptr() as usize, k);
+        if self.scratch.prerotated.take() == Some(key) {
+            return Ok(());
+        }
         self.bind_thread()?;
         let validate_live = self.arch == "gfx942"
             && gfx942_rotate_live_validation_enabled()

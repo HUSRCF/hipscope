@@ -3,6 +3,7 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 #include <hip/hip_runtime.h>
+#include <hip/hip_bfloat16.h>
 
 // MagnumQuant GEMV: FWHT-rotated HFQ4-G256.
 // x_rot is PRE-ROTATED by the caller (one FWHT pass on x, not per-row).
@@ -64,6 +65,46 @@ extern "C" __global__ void gemv_mq4g256(
 // launch, public-HSA AQL, and retained PM4 all derive batch/group from the same
 // hardware blockIdx.x value.
 // x_in / x_out are laid out as [batch × K] row-major.
+// The 256-point signed FWHT of one group held as eight values per lane of a
+// wave (lane `tid` owns elements tid*8 .. tid*8+7, `signs1` already
+// applied): local butterflies at strides 1, 2, 4, then strides 8..128 across
+// lanes via ds_swizzle. The caller applies 0.0625 * signs2.
+static __device__ __forceinline__ void mq_fwht256_lane(float (&v)[8], int tid) {
+    float t;
+    t = v[0]; v[0] = v[0] + v[1]; v[1] = t - v[1];
+    t = v[2]; v[2] = v[2] + v[3]; v[3] = t - v[3];
+    t = v[4]; v[4] = v[4] + v[5]; v[5] = t - v[5];
+    t = v[6]; v[6] = v[6] + v[7]; v[7] = t - v[7];
+
+    t = v[0]; v[0] = v[0] + v[2]; v[2] = t - v[2];
+    t = v[1]; v[1] = v[1] + v[3]; v[3] = t - v[3];
+    t = v[4]; v[4] = v[4] + v[6]; v[6] = t - v[6];
+    t = v[5]; v[5] = v[5] + v[7]; v[7] = t - v[7];
+
+    t = v[0]; v[0] = v[0] + v[4]; v[4] = t - v[4];
+    t = v[1]; v[1] = v[1] + v[5]; v[5] = t - v[5];
+    t = v[2]; v[2] = v[2] + v[6]; v[6] = t - v[6];
+    t = v[3]; v[3] = v[3] + v[7]; v[7] = t - v[7];
+
+    // Wave butterfly: strides 1-16 in thread space via ds_swizzle
+    #define HBFLY(x, pat, str) do { \
+        float _p = __int_as_float(__builtin_amdgcn_ds_swizzle(__float_as_int(x), (pat))); \
+        if (tid & (str)) { (x) = _p - (x); } else { (x) = (x) + _p; } \
+    } while(0)
+
+    #define HBFLY8(pat, str) \
+        HBFLY(v[0],pat,str); HBFLY(v[1],pat,str); HBFLY(v[2],pat,str); HBFLY(v[3],pat,str); \
+        HBFLY(v[4],pat,str); HBFLY(v[5],pat,str); HBFLY(v[6],pat,str); HBFLY(v[7],pat,str)
+
+    HBFLY8(0x041F, 1);
+    HBFLY8(0x081F, 2);
+    HBFLY8(0x101F, 4);
+    HBFLY8(0x201F, 8);
+    HBFLY8(0x401F, 16);
+    #undef HBFLY8
+    #undef HBFLY
+}
+
 extern "C" __launch_bounds__(32, 16)
 __global__ void mq_rotate_x(
     const float* __restrict__ x_in,
@@ -85,59 +126,57 @@ __global__ void mq_rotate_x(
     int d0 = tid * 8;
     int base = group * 256 + d0;
 
-    float v0 = x_in_b[base]     * signs1[d0];
-    float v1 = x_in_b[base + 1] * signs1[d0 + 1];
-    float v2 = x_in_b[base + 2] * signs1[d0 + 2];
-    float v3 = x_in_b[base + 3] * signs1[d0 + 3];
-    float v4 = x_in_b[base + 4] * signs1[d0 + 4];
-    float v5 = x_in_b[base + 5] * signs1[d0 + 5];
-    float v6 = x_in_b[base + 6] * signs1[d0 + 6];
-    float v7 = x_in_b[base + 7] * signs1[d0 + 7];
-
-    // Local butterfly: strides 1, 2, 4
-    float t;
-    t = v0; v0 = v0 + v1; v1 = t - v1;
-    t = v2; v2 = v2 + v3; v3 = t - v3;
-    t = v4; v4 = v4 + v5; v5 = t - v5;
-    t = v6; v6 = v6 + v7; v7 = t - v7;
-
-    t = v0; v0 = v0 + v2; v2 = t - v2;
-    t = v1; v1 = v1 + v3; v3 = t - v3;
-    t = v4; v4 = v4 + v6; v6 = t - v6;
-    t = v5; v5 = v5 + v7; v7 = t - v7;
-
-    t = v0; v0 = v0 + v4; v4 = t - v4;
-    t = v1; v1 = v1 + v5; v5 = t - v5;
-    t = v2; v2 = v2 + v6; v6 = t - v6;
-    t = v3; v3 = v3 + v7; v7 = t - v7;
-
-    // Wave butterfly: strides 1-16 in thread space via ds_swizzle
-    #define HBFLY(v, pat, str) do { \
-        float _p = __int_as_float(__builtin_amdgcn_ds_swizzle(__float_as_int(v), (pat))); \
-        if (tid & (str)) { (v) = _p - (v); } else { (v) = (v) + _p; } \
-    } while(0)
-
-    #define HBFLY8(pat, str) \
-        HBFLY(v0,pat,str); HBFLY(v1,pat,str); HBFLY(v2,pat,str); HBFLY(v3,pat,str); \
-        HBFLY(v4,pat,str); HBFLY(v5,pat,str); HBFLY(v6,pat,str); HBFLY(v7,pat,str)
-
-    HBFLY8(0x041F, 1);
-    HBFLY8(0x081F, 2);
-    HBFLY8(0x101F, 4);
-    HBFLY8(0x201F, 8);
-    HBFLY8(0x401F, 16);
-    #undef HBFLY8
-    #undef HBFLY
+    float v[8];
+#pragma unroll
+    for (int e = 0; e < 8; ++e) v[e] = x_in_b[base + e] * signs1[d0 + e];
+    mq_fwht256_lane(v, tid);
 
     const float s = 0.0625f;
-    x_out_b[base]     = v0 * s * signs2[d0];
-    x_out_b[base + 1] = v1 * s * signs2[d0 + 1];
-    x_out_b[base + 2] = v2 * s * signs2[d0 + 2];
-    x_out_b[base + 3] = v3 * s * signs2[d0 + 3];
-    x_out_b[base + 4] = v4 * s * signs2[d0 + 4];
-    x_out_b[base + 5] = v5 * s * signs2[d0 + 5];
-    x_out_b[base + 6] = v6 * s * signs2[d0 + 6];
-    x_out_b[base + 7] = v7 * s * signs2[d0 + 7];
+#pragma unroll
+    for (int e = 0; e < 8; ++e) x_out_b[base + e] = v[e] * s * signs2[d0 + e];
+}
+
+// Decode HC read branch mix (tensor_ops.hip's hyper_read_projected_f32 for
+// four branches, same expression) that also writes the mixed row's
+// mq_rotate_x rotation: a block per 256-column group, wave 0 rotates the
+// group from LDS. Grid [hidden / 256], block 256.
+static __device__ __forceinline__ float mq_bf16(float v) {
+    return static_cast<float>(static_cast<hip_bfloat16>(v));
+}
+
+extern "C" __launch_bounds__(256)
+__global__ void hyper_read_projected_rotate_f32(
+    const float* __restrict__ normalized,
+    const float* __restrict__ projected_up,
+    float* __restrict__ mixed,
+    float* __restrict__ rotated,
+    const float* __restrict__ signs1,
+    const float* __restrict__ signs2,
+    int hidden
+) {
+    __shared__ float group_values[256];
+    const int tid = threadIdx.x;
+    const int column = blockIdx.x * 256 + tid;
+    float value = 0.0f;
+#pragma unroll
+    for (int branch = 0; branch < 4; ++branch) {
+        const int offset = branch * hidden + column;
+        const float gate = mq_bf16(1.0f / (1.0f + expf(-mq_bf16(projected_up[offset]))));
+        value += mq_bf16(gate * mq_bf16(normalized[offset]));
+    }
+    value = mq_bf16(value / 4.0f);
+    mixed[column] = value;
+    group_values[tid] = value;
+    __syncthreads();
+    if (tid >= 32) return;
+    const int d0 = tid * 8;
+    float v[8];
+#pragma unroll
+    for (int e = 0; e < 8; ++e) v[e] = group_values[d0 + e] * signs1[d0 + e];
+    mq_fwht256_lane(v, tid);
+    const float s = 0.0625f;
+#pragma unroll
+    for (int e = 0; e < 8; ++e) rotated[blockIdx.x * 256 + d0 + e] = v[e] * s * signs2[d0 + e];
 }
 
 // mq_rotate_x writing F16 (the same float value, rounded as
