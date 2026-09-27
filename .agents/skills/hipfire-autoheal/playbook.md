@@ -44,6 +44,7 @@ top-down unless evidence uniquely matches a later row.
 | Multi-turn name/recall wrong on old installs | log / version; see **historical** known-issues | 5 (legacy only) |
 | Mid-gen `HipError` 700 illegal memory access | Confirm whether path is legacy/direct without auto-bump; else kernel/KV bisection — **not** automatic `max_seq` repair | 6 (legacy only) or bisection C |
 | `HipError` 2 OOM on load | `rocm-smi` VRAM; model size; idle other GPU holders | 8, 10 |
+| Load never finishes; every restart re-wedges, `serve.log` frozen mid-layer | daemon spinning in `R`, VRAM held, threads in `kfd_wait_on_events` | 11 |
 | Prefill ~1 tok/s on non-Qwen-3.5 with asym KV | model family + `kv_cache` | 9 |
 | `HipError` 101 invalid device / 201 invalid context | Map code correctly; require independent process/VRAM/port evidence before foreign-holder path | 10 |
 | Bench OK, HTTP/serve broken | bisection A/G | bisection.md |
@@ -347,6 +348,55 @@ sudo fuser -v /dev/kfd /dev/dri/renderD128
 Do not kill unknown PIDs without user confirmation of what they are.
 
 **Verify:** device opens; daemon starts; VRAM coherent with `rocm-smi`.
+
+---
+
+### 11. Loader wedge → degraded GPU/driver state (needs a GPU reset)
+
+**Symptom:** Loads never finish, and every restart reproduces it. The daemon
+main thread spins in `R` state, `~/.hipfire/serve.log` freezes mid-layer (seen
+at 62/64, 54, 49, 41, 33, 10 …), the model reports `null`, VRAM stays held
+(11–15 GB), and `/health` may still answer. Thread wait channels show the main
+thread spinning in userspace (`wchan 0`) with two threads parked in
+`kfd_wait_on_events` — a GPU completion that never arrives.
+
+**Diagnosis:** This is **not** a stale pidfile (catalog 1) or cold JIT
+(catalog 7). Confirm first: the log freezes while the daemon spins, the same
+mid-layer position recurs across attempts, and VRAM is held. When restarts
+stop helping and wedges repeat, the GPU/driver state itself is degraded —
+another serve restart cannot clear it, a reset can.
+
+**Minimal repair (privileged — approval + owner inspection first):**
+
+```bash
+# 1) Stop the service so nothing holds VRAM across the reset
+systemctl --user stop hipfire
+
+# 2) Reset the GPU
+echo 1 | sudo tee /sys/class/drm/card2/device/reset   # card2 = AMD Navi31
+
+# 3) Bring the service and its watchdog back
+systemctl --user start hipfire.service
+systemctl --user start hipfire-watchdog.timer
+```
+
+Pick the DRM node that is actually the AMD GPU — verify the vendor, do **not**
+assume `card2`:
+
+```bash
+for c in /sys/class/drm/card*/device; do
+  echo "$(basename "$(dirname "$c")"): vendor=$(cat "$c/vendor")"
+done   # AMD = 0x1002
+```
+
+A reboot also clears the state. Do **not** loop restarts: `hipfire-watchdog.sh`
+counts consecutive wedges (`MAX_WEDGES_IN_A_ROW`) and, once exceeded,
+desktop-notifies this exact reset sequence instead of restarting forever.
+
+**Verify:** the model loads past the previously frozen layer and
+`rocm-smi --showmeminfo vram` reflects a resident model; a later cold start
+succeeds without re-wedging. For generation/state-lifecycle claims, route
+through `scripts/serve_harness.py` ([`docs/VALIDATION.md`](../../../docs/VALIDATION.md)).
 
 ---
 

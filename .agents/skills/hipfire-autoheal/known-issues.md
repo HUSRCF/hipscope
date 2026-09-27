@@ -53,6 +53,35 @@ Playbook fix 9.
 
 ---
 
+### Loader wedge → degraded GPU/driver state (AMD RDNA)
+
+| Field | Value |
+|---|---|
+| **Status** | Current — driver-level; observed 2026-09-27 on gfx1100 (Navi31 / RX 7900 XTX) |
+| **Scope** | AMD RDNA serve loads (seen loading `qwen3.8:27b-mq4-xt`, mq4 weights + q8 KV) |
+
+**Symptom:** Loads never complete and every restart reproduces it. The daemon
+spins in `R` state while `serve.log` freezes mid-layer; two threads park in
+`kfd_wait_on_events` (a GPU completion that never arrives); VRAM stays held
+(11–15 GB) and `/health` may still answer. Observed freeze positions varied
+(62/64, 54, 49, 41, 33, 10 …).
+
+**Workaround (privileged — approval + owner inspection; playbook fix 11):**
+
+```bash
+systemctl --user stop hipfire
+echo 1 | sudo tee /sys/class/drm/card2/device/reset   # card2 = AMD Navi31
+systemctl --user start hipfire.service
+systemctl --user start hipfire-watchdog.timer
+```
+
+Restarting serve does **not** clear this. `~/.hipfire/bin/hipfire-watchdog.sh`
+detects the repeating pattern (`MAX_WEDGES_IN_A_ROW`) and notifies the same
+sequence; a reboot also clears it. Verify the DRM node vendor is `0x1002`
+before resetting — do **not** assume `card2`.
+
+---
+
 ## Unknown / needs ref-pinned verification
 
 ### Qwen 3.5 0.8B + hipGraph capture panic
