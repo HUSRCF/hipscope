@@ -15,6 +15,13 @@
 //! idiom (`lane ^ d`, its always-true `< 32` guard, `<< 2`, `ds_bpermute_b32`)
 //! becomes a register exchange (`v_mov_b32_dpp row_xmask:d`, or
 //! `v_permlanex16_b32` for d = 16). Both move identical bits.
+//!
+//! The epilogue instantiates one region that is not a slice:
+//! `fp8_gemm.gdn.conv_silu_lean.region.s` keeps the golden's four conv MACs
+//! verbatim and replaces its SiLU with a shorter sequence (clamped exp range
+//! reduction, one-correction division ending in `v_div_fixup_f32`) that
+//! returns the golden's bits for all 2^32 f32 conv results
+//! (`tools/gdn/silu_exhaust.py` runs both regions exhaustively on gfx1201).
 use crate::{Builder, reg::{Kind, RegRef}, vopd::{self, VopdF32, VopdOp}};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -22,6 +29,7 @@ pub const CONV_SILU_GOLDEN: &str = include_str!("../../../kernels/fp8_gemm.gdn.c
 pub const NORM_Q_GOLDEN: &str = include_str!("../../../kernels/fp8_gemm.gdn.norm_q.region.s");
 pub const NORM_K_GOLDEN: &str = include_str!("../../../kernels/fp8_gemm.gdn.norm_k.region.s");
 pub const CVT_V_GOLDEN: &str = include_str!("../../../kernels/fp8_gemm.gdn.cvt_v.region.s");
+pub const CONV_SILU_LEAN: &str = include_str!("../../../kernels/fp8_gemm.gdn.conv_silu_lean.region.s");
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Half { Full, Lo, Hi }
@@ -241,6 +249,8 @@ impl Region {
             outputs: outputs.iter().map(|(n, _)| (*n).into()).collect(), temps: vmap.len(), masks })
     }
     pub fn conv_silu() -> Result<Self, String> { Self::parse(CONV_SILU_GOLDEN) }
+    /// The exhaustively proven lean conv+SiLU (SGPR input `clamp` = 128.0).
+    pub fn conv_silu_lean() -> Result<Self, String> { Self::parse(CONV_SILU_LEAN) }
     pub fn norm_q() -> Result<Self, String> { Self::parse(NORM_Q_GOLDEN) }
     pub fn norm_k() -> Result<Self, String> { Self::parse(NORM_K_GOLDEN) }
     pub fn cvt_v() -> Result<Self, String> { Self::parse(CVT_V_GOLDEN) }
@@ -695,5 +705,16 @@ mod tests {
         }
         let v = Region::cvt_v().unwrap();
         assert_eq!(v.mnemonics(), ["v_cvt_f16_f32_e32"; 4]);
+    }
+
+    /// The lean region keeps the imported conv MACs and interface; only the
+    /// SiLU after them is replaced (its equivalence is the exhaustive run).
+    #[test]
+    fn lean_conv_silu_keeps_the_golden_conv_and_interface() {
+        let body = |g: &str| golden_body(g).lines().filter(|l| !l.starts_with(';')).map(str::to_owned).collect::<Vec<_>>();
+        let (gold, lean) = (body(CONV_SILU_GOLDEN), body(CONV_SILU_LEAN));
+        assert_eq!(gold[..4], lean[..4]);
+        let (g, l) = (Region::conv_silu().unwrap(), Region::conv_silu_lean().unwrap());
+        assert_eq!((l.inputs, l.outputs, l.sinputs), (g.inputs, g.outputs, vec!["clamp".to_owned()]));
     }
 }

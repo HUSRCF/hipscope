@@ -4029,10 +4029,12 @@ pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1: &[u8] =
 pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1_CONTROL: &[u8] =
     include_bytes!("../../../kernels/gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1_control.hxaco");
 /// Certified gfx1201 F2 Row/K128 bundle; production selects Row only.
-/// SHA-256 962fe61d136b8bf12fd4d4b914d25c35851ad4c513b4a6599e3f3e5e5168d4a0:
-/// prefetch the next K128's W in retired ring units, and its Rw row ratio
-/// before slab 0; outputs byte-identical to the former 1b25e3aa bundle.
-/// Release qualification: 200 poisoned whole-buffer byte/guard comparisons
+/// SHA-256 1b26cd3a0bbddfafd8cf93250283aacee16bd37a4886233461fe0e175133f373:
+/// the prefetch F2 symbols (code unchanged since 962fe61d: next K128's W in
+/// retired ring units, Rw row ratio before slab 0) plus the QKVZA+GDN symbol
+/// with the lean conv+SiLU and one ring row per token (outputs byte-identical
+/// to the 7fd9f338 bundle; /home/kaden/qcal/perf/fp8-4k5/qkvza-epi/report.md).
+/// Prefetch release qualification: 200 poisoned whole-buffer byte/guard comparisons
 /// per family at N=8192/1024/1023/513/512, full H2 and single-CU four-row.
 /// Reproduction: /home/kaden/qcal/perf/fp8-4k5/f2/prefetch/report.md.
 /// Regenerate with `hipfire-isa emit --kernel fp8_gemm --scale both --epi all`

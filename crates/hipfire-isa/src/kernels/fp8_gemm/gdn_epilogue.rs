@@ -14,8 +14,10 @@
 //! tokens of block b and the 3 previous ones are always resident. Block b
 //! (tokens 16b..16b+15) is drained from the accumulators of token half
 //! b / 4, column block b % 4, by that half's four waves, which then run the
-//! imported per-token regions in `gdn_chunk_prep`'s lane layout: a wave owns
-//! one head (lane = 4 channels) and 8 consecutive tokens.
+//! per-token regions in `gdn_chunk_prep`'s lane layout: a wave owns
+//! one head (lane = 4 channels) and 8 consecutive tokens. The conv+SiLU is
+//! the exhaustively proven lean region (`Region::conv_silu_lean`); the norms
+//! are the imported goldens.
 use super::{Builder, mem, op, s, so, sr, v, vo, vr, vload};
 use super::gdn_region::{self, Binding, Half, Region};
 use crate::{insn::{Instruction, MemoryClass}, lds::Transition, ledger::Counter};
@@ -26,7 +28,10 @@ const RING_BYTES: u32 = RING_ROWS * 1024;
 
 // VGPRs of the GDN path (the accumulators v0..v127 drain block by block).
 const W: u8 = 128; // conv taps: w[tap][c] at W + 4*tap + c
-const ROWS: u8 = 144; // window: row r (token t-3+r) channel c at ROWS + 4*r + c; row 3 is the current token
+// window: four slots of four channels at ROWS + 4*slot + c. The n-th token of
+// a P run (j = n mod 4) reads rows t-3..t from slots j, j+1, j+2, j+3 (mod 4)
+// and loads only row t, into slot (j + 3) % 4, over the slot of row t-4.
+const ROWS: u8 = 144;
 const CONV: u8 = 160; // two conv+SiLU instances x 8 temps; the norm reuses CONV..CONV+7
 const OUT: u8 = 176; // o0..o3 (SiLU outputs of channels 0..3)
 // FP16 halves h0..h3 in v0.l v0.h v1.l v1.h. A true16 VOP1 destination must
@@ -47,9 +52,9 @@ const VRAWA: u8 = 191; // raw store address
 
 // SGPRs (K-loop descriptors and the Ew/D descriptors are dead here).
 const KA: u8 = 32; // s[32:39] = ConvW ConvState Q K ; s[40:43] = V QScale Eps
+const CLAMP: u8 = 36; // 128.0, the lean SiLU's exp clamp (Q's pointer is dead once OUTD is built)
 const QSCALE: u8 = 42;
 const EPS: u8 = 43;
-const MASKS: u8 = 44; // conv+SiLU masks s44..s47, norm mask s48
 const NORM_MASK: u8 = 48;
 const RAWD: u8 = 52; // Y0 rebuilt with num_records = N * 10240 * 4
 const OUTD: u8 = 56; // selected q/k/v, num_records = N * heads * 256
@@ -101,17 +106,21 @@ fn ds_load_b128(b: &mut Builder, slot: usize, data: u8, addr: u8) -> Result<(), 
 
 struct Regions { conv: Region, norm_q: Region, norm_k: Region, cvt_v: Region }
 
-/// Instance `k` (0/1) of a conv+SiLU pair for channel `c`: temps rotated by
-/// `k` so VOPD partners differ in bank and destination parity.
-fn conv_bind(r: &Region, c: u8, k: u8) -> Result<Binding, String> {
+/// Instance `k` (0/1) of a conv+SiLU pair for channel `c` of token `j`
+/// (window rotation): temps rotated by `k` so VOPD partners differ in bank
+/// and destination parity.
+fn conv_bind(r: &Region, c: u8, k: u8, j: u8) -> Result<Binding, String> {
     let mut inputs = vec![0u8; r.inputs.len()];
+    let slot = |d: u8| ROWS + 4 * ((j + d) % 4) + c;
     for (name, reg) in [("w0", W + c), ("w1", W + 4 + c), ("w2", W + 8 + c), ("w3", W + 12 + c),
-        ("win0", ROWS + c), ("win1", ROWS + 4 + c), ("win2", ROWS + 8 + c), ("cur", ROWS + 12 + c)] {
+        ("win0", slot(0)), ("win1", slot(1)), ("win2", slot(2)), ("cur", slot(3))] {
         inputs[r.input(name)?] = reg;
     }
-    if r.temps > 8 || r.masks > 2 { return Err("conv+SiLU region exceeds its GDN registers".into()) }
+    if r.temps > 8 || r.masks > 0 { return Err("conv+SiLU region exceeds its GDN registers".into()) }
     let temps = (0..r.temps as u8).map(|t| CONV + 8 * k + (t + k) % 8).collect();
-    Ok(Binding { inputs, sinputs: vec![], temps, masks: vec![MASKS + 2 * k, MASKS + 2 * k + 1], outputs: vec![(OUT + c, Half::Full)], lane_select: None })
+    let mut sinputs = vec![0u8; r.sinputs.len()];
+    sinputs[r.sinput("clamp")?] = CLAMP;
+    Ok(Binding { inputs, sinputs, temps, masks: vec![], outputs: vec![(OUT + c, Half::Full)], lane_select: None })
 }
 fn norm_bind(r: &Region) -> Result<Binding, String> {
     let mut inputs = vec![0u8; r.inputs.len()];
@@ -127,18 +136,23 @@ fn norm_bind(r: &Region) -> Result<Binding, String> {
     Ok(Binding { inputs, sinputs, temps: (0..r.temps as u8).map(|t| CONV + t).collect(), masks: vec![NORM_MASK], outputs, lane_select: Some(LANESEL) })
 }
 
-/// One token of a P wave: tile-local token `T`, global `TG`, window rows
-/// starting at ring row `R`. `tag` keeps labels unique per emission site.
-fn token(b: &mut Builder, g: usize, re: &Regions, tag: &str) -> Result<(), String> {
+/// Load ring row `(R + k) mod 19` of this head into window slot `slot`.
+fn load_row(b: &mut Builder, g: usize, k: u8, slot: u8) -> Result<(), String> {
+    mod19(b, S0, R, u32::from(k))?;
+    so(b, format!("s_lshl_b32 s{S0}, s{S0}, 10"), &[S0], &[S0])?;
+    vo(b, format!("v_add_nc_u32_e32 v{VPA}, s{S0}, v{VP}"), &[VPA], &[VP], &[S0])?;
+    ds_load_b128(b, g, ROWS + 4 * slot, VPA)
+}
+
+/// Token `j` (window rotation, 0..3) of a P wave: tile-local token `T`,
+/// global `TG`, window rows starting at ring row `R`; rows t-3..t-1 are
+/// already in the window. `tag` keeps labels unique per emission site.
+fn token(b: &mut Builder, g: usize, re: &Regions, tag: &str, j: u8) -> Result<(), String> {
     // The previous token's stores have read their sources (rows, halves, addresses).
     b.release_store_sources()?;
-    // Rows t-3..t of this head from the ring.
-    for k in 0..4u8 {
-        mod19(b, S0, R, u32::from(k))?;
-        so(b, format!("s_lshl_b32 s{S0}, s{S0}, 10"), &[S0], &[S0])?;
-        vo(b, format!("v_add_nc_u32_e32 v{VPA}, s{S0}, v{VP}"), &[VPA], &[VP], &[S0])?;
-        ds_load_b128(b, g, ROWS + 4 * k, VPA)?;
-    }
+    // Row t of this head from the ring, over row t-4.
+    let cur = ROWS + 4 * ((j + 3) % 4);
+    load_row(b, g, 3, (j + 3) % 4)?;
     // Raw row for the completion pass: tile positions 0..2 / 125..127 and the
     // last three tokens. Others (and tokens >= N) go past num_records.
     so(b, format!("s_cmp_lt_u32 s{T}, 3"), &[], &[T])?;
@@ -155,11 +169,11 @@ fn token(b: &mut Builder, g: usize, re: &Regions, tag: &str) -> Result<(), Strin
     so(b, format!("s_cselect_b32 s{RAWOFF}, s{}, s{RAWOFF}", RAWD + 2), &[RAWOFF], &[RAWD + 2, RAWOFF])?;
     // The token offset rides in VOFFSET: raw-buffer range checks cover it.
     vo(b, format!("v_add_nc_u32_e32 v{VRAWA}, s{RAWOFF}, v{VRAW}"), &[VRAWA], &[VRAW], &[RAWOFF])?;
-    mem(b, format!("buffer_store_b128 {}, v{VRAWA}, s[{RAWD}:{}], null offen", vr(ROWS + 12, 4), RAWD + 3),
-        &[], &[vr(ROWS + 12, 4), v(VRAWA), sr(RAWD, 4)], MemoryClass::VmemStore)?;
+    mem(b, format!("buffer_store_b128 {}, v{VRAWA}, s[{RAWD}:{}], null offen", vr(cur, 4), RAWD + 3),
+        &[], &[vr(cur, 4), v(VRAWA), sr(RAWD, 4)], MemoryClass::VmemStore)?;
     // conv1d + SiLU of the four channels, two interleaved instances at a time.
     for pair in [0u8, 2] {
-        let binds = vec![conv_bind(&re.conv, pair, 0)?, conv_bind(&re.conv, pair + 1, 1)?];
+        let binds = vec![conv_bind(&re.conv, pair, 0, j)?, conv_bind(&re.conv, pair + 1, 1, j)?];
         gdn_region::emit_interleaved(b, &re.conv, &binds)?;
     }
     // Head norm (q, k) or plain conversion (v), selected by the tile's class.
@@ -195,7 +209,7 @@ fn token(b: &mut Builder, g: usize, re: &Regions, tag: &str) -> Result<(), Strin
 }
 
 pub(super) fn emit(b: &mut Builder) -> Result<(), String> {
-    let re = Regions { conv: Region::conv_silu()?, norm_q: Region::norm_q()?, norm_k: Region::norm_k()?, cvt_v: Region::cvt_v()? };
+    let re = Regions { conv: Region::conv_silu_lean()?, norm_q: Region::norm_q()?, norm_k: Region::norm_k()?, cvt_v: Region::cvt_v()? };
     b.label(ENTRY)?;
     mem(b, "s_load_b256 s[32:39], s[0:1], 0x60", &[sr(KA, 4), sr(KA + 4, 4)], &[sr(0, 2)], MemoryClass::SmemLoad)?;
     mem(b, "s_load_b128 s[40:43], s[0:1], 0x80", &[sr(KA + 8, 4)], &[sr(0, 2)], MemoryClass::SmemLoad)?;
@@ -219,6 +233,7 @@ pub(super) fn emit(b: &mut Builder) -> Result<(), String> {
     so(b, format!("s_cmp_eq_u32 s{CLASS}, 2"), &[], &[CLASS])?;
     op(b, format!("s_cselect_b64 s[{S1}:{S2}], s[{}:{}], s[{S1}:{S2}]", KA + 8, KA + 9), &[s(S1), s(S2)], &[sr(KA + 8, 2), s(S1), s(S2)])?;
     descriptor(b, OUTD, S1, None)?;
+    so(b, format!("s_mov_b32 s{CLAMP}, 0x43000000"), &[CLAMP], &[])?;
     so(b, format!("s_mul_i32 s{}, s31, s{TOKSTRIDE}", OUTD + 2), &[OUTD + 2], &[31, TOKSTRIDE])?;
     descriptor(b, CWD, KA, None)?;
     descriptor(b, CSD, KA + 2, None)?;
@@ -308,10 +323,13 @@ pub(super) fn emit(b: &mut Builder) -> Result<(), String> {
         mod19(b, R, RB, 16)?;
         so(b, format!("s_add_co_i32 s{R}, s{R}, s{S0}"), &[R], &[R, S0])?;
         mod19(b, R, R, 0)?;
-        token(b, g, &re, "p")?;
-        so(b, format!("s_mov_b32 s{J}, 7"), &[J], &[])?;
+        // Window rows t0-3..t0-1 into slots 0..2; the loop body starts empty.
+        for k in 0..3u8 { load_row(b, g, k, k)?; }
+        b.wait(Counter::Ds, 0)?;
+        so(b, format!("s_mov_b32 s{J}, 2"), &[J], &[])?;
         b.loop_(&format!("{ENTRY}_token"), |b| {
-            token(b, g, &re, "l")?;
+            for j in 0..4u8 { token(b, g, &re, &format!("l{j}"), j)?; }
+            b.release_store_sources()?;
             so(b, format!("s_add_co_i32 s{J}, s{J}, -1"), &[J], &[J])?;
             so(b, format!("s_cmp_lg_u32 s{J}, 0"), &[], &[J])?;
             op(b, format!("s_cbranch_scc1 {ENTRY}_token"), &[], &[])

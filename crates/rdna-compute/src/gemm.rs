@@ -9627,7 +9627,19 @@ impl Gpu {
             _ => return Err(hip_bridge::HipError::new(0, "F2: unknown epilogue")),
         };
         self.ensure_embedded_kernel(REPACK_MODULE, kernels::MQ4V2_FP8_FRAGMENT_REPACK_GFX1201, REPACK)?;
-        self.ensure_embedded_kernel(GEMM_MODULE, kernels::GEMM_MQ4G256V2_WMMA_FP8_GFX12_B1, symbol)?;
+        // `HIPFIRE_G12_FP8_F2_BUNDLE=<path>` (developer A/B of builder bundles
+        // with one binary) loads the F2 bundle from a file instead of the
+        // embedded image; the first F2 launch of the process fixes the module.
+        if !self.functions.contains_key(symbol) {
+            match hipfire_config::developer_var("HIPFIRE_G12_FP8_F2_BUNDLE") {
+                Ok(path) => {
+                    let image = std::fs::read(&path)
+                        .map_err(|e| hip_bridge::HipError::new(0, &format!("F2: bundle {path}: {e}")))?;
+                    self.ensure_embedded_kernel(GEMM_MODULE, &image, symbol)?;
+                }
+                Err(_) => self.ensure_embedded_kernel(GEMM_MODULE, kernels::GEMM_MQ4G256V2_WMMA_FP8_GFX12_B1, symbol)?,
+            }
+        }
         if crate::scratch::scratch_will_grow(
             self.scratch.fp8_f2_weights_bytes, self.scratch.fp8_f2_weights.is_some(), needed
         ) {
