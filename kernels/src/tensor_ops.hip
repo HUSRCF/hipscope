@@ -260,8 +260,11 @@ extern "C" __global__ void gated_delta_step_shared_norm128_gfx1151(
 // normalized q/k vectors are double-buffered so a row needs no trailing
 // barrier.  Every value is produced by the same expression sequence as
 // gated_delta_step_f32, so the result is bitwise unchanged.
-__launch_bounds__(256)
-extern "C" __global__ void gated_delta_step_halves_state128_persistent256_f32(
+// `kCapture`: also leave the state after every row but the last in
+// `row_states` (speculative-verify rollback points); a separate
+// instantiation so the plain route's register allocation is unchanged.
+template <bool kCapture>
+__device__ __forceinline__ void gated_delta_step_persistent256_body(
     const float* projection,
     const float* gate,
     const float* beta,
@@ -457,7 +460,7 @@ extern "C" __global__ void gated_delta_step_halves_state128_persistent256_f32(
             // Speculative verify: the state after every row but the last
             // (which lands in `state`), so a rejected suffix rolls back
             // without re-running the accepted rows.
-            if (row_states != nullptr && row + 1 < rows) {
+            if (kCapture && row + 1 < rows) {
                 float* slot = row_states + (size_t)row * value_heads * 128 * 128;
                 #pragma unroll
                 for (int kd = 0; kd < 64; ++kd) {
@@ -472,6 +475,24 @@ extern "C" __global__ void gated_delta_step_halves_state128_persistent256_f32(
         state[state_base + (kd_base + kd) * 128 + value_index] =
             state_half[kd];
     }
+}
+
+__launch_bounds__(256)
+extern "C" __global__ void gated_delta_step_halves_state128_persistent256_f32(
+    const float* projection, const float* gate, const float* beta, float* state,
+    float* output, int rows, int qkv_width, int key_heads, int value_heads,
+    int key_dim, int value_dim, float query_scale) {
+    gated_delta_step_persistent256_body<false>(projection, gate, beta, state, output, nullptr,
+        rows, qkv_width, key_heads, value_heads, key_dim, value_dim, query_scale);
+}
+
+__launch_bounds__(256)
+extern "C" __global__ void gated_delta_step_halves_state128_persistent256_capture_f32(
+    const float* projection, const float* gate, const float* beta, float* state,
+    float* output, float* row_states, int rows, int qkv_width, int key_heads,
+    int value_heads, int key_dim, int value_dim, float query_scale) {
+    gated_delta_step_persistent256_body<true>(projection, gate, beta, state, output, row_states,
+        rows, qkv_width, key_heads, value_heads, key_dim, value_dim, query_scale);
 }
 
 

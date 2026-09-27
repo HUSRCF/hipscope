@@ -326,16 +326,19 @@ pub fn gated_delta_step_batched(gpu: &mut Gpu, p: &GatedDeltaStepBatched<'_>) ->
     let key_dim = checked_i32(p.key_dim, "GDN batched key width")?;
     let value_dim = checked_i32(p.value_dim, "GDN batched value width")?;
     let value_heads_grid = checked_u32(p.value_heads, "GDN batched value-head grid")?;
-    let kernel = "gated_delta_step_halves_state128_persistent256_f32";
+    let kernel = if p.row_states.is_some() {
+        "gated_delta_step_halves_state128_persistent256_capture_f32"
+    } else {
+        "gated_delta_step_halves_state128_persistent256_f32"
+    };
     gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel)?;
     let mut args = KernargBlob::new();
     for tensor in [p.projection, p.gate, p.beta, p.state, p.output] {
         args.push_ptr(tensor.buf.as_ptr());
     }
-    args.push_ptr(
-        p.row_states
-            .map_or(std::ptr::null(), |states| states.buf.as_ptr() as *const _),
-    );
+    if let Some(states) = p.row_states {
+        args.push_ptr(states.buf.as_ptr() as *const _);
+    }
     args.push_i32(rows);
     args.push_i32(qkv_width);
     args.push_i32(key_heads);

@@ -211,20 +211,20 @@ extern "C" __global__ void gemv_q8_0_k320_staged_rows(
     }
 }
 
-// gemv_q8_0_row over up to 8 activation rows: each (scale, quant) pair is
-// loaded once and folded into every row's sum in the single-row order.
+// gemv_q8_0_row over R activation rows: each (scale, quant) pair is loaded
+// once and folded into every row's sum in the single-row order.
+template <int R>
 static __device__ __forceinline__ void gemv_q8_0_row_multi(
     const unsigned char* row_data,
     const float* __restrict__ x,
-    size_t x_stride,
+    int x_stride,
     int K,
     int tid,
-    int rows,
-    float* sum
+    float (&sum)[R]
 ) {
     const int blocks_per_row = K / 32;
 #pragma unroll
-    for (int r = 0; r < 8; ++r) sum[r] = 0.0f;
+    for (int r = 0; r < R; ++r) sum[r] = 0.0f;
     const int outer_iters = blocks_per_row / 8;
     for (int oi = 0; oi < outer_iters; oi++) {
         const unsigned char* base = row_data + oi * 8 * 34;
@@ -233,54 +233,51 @@ static __device__ __forceinline__ void gemv_q8_0_row_multi(
             const unsigned char* block = base + sub * 34;
             float d = (float)*((const _Float16*)block);
             signed char qval = (signed char)block[2 + tid];
-            const float w = d * (float)qval;
-            const int col = oi * 256 + sub * 32 + tid;
+            const float* xb = x + oi * 256 + sub * 32 + tid;
 #pragma unroll
-            for (int r = 0; r < 8; ++r)
-                if (r < rows) sum[r] += w * x[r * x_stride + col];
+            for (int r = 0; r < R; ++r)
+                sum[r] += d * (float)qval * xb[r * x_stride];
         }
     }
     for (int bi = outer_iters * 8; bi < blocks_per_row; bi++) {
         const unsigned char* block = row_data + bi * 34;
         float d = (float)*((const _Float16*)block);
         signed char qval = (signed char)block[2 + tid];
-        const float w = d * (float)qval;
 #pragma unroll
-        for (int r = 0; r < 8; ++r)
-            if (r < rows) sum[r] += w * x[r * x_stride + bi * 32 + tid];
+        for (int r = 0; r < R; ++r)
+            sum[r] += d * (float)qval * x[r * x_stride + bi * 32 + tid];
     }
 #pragma unroll
-    for (int r = 0; r < 8; ++r)
+    for (int r = 0; r < R; ++r)
         for (int offset = 16; offset > 0; offset >>= 1)
             sum[r] += __shfl_down(sum[r], offset);
 }
 
-__launch_bounds__(256)
-extern "C" __global__ void gemv_q8_0_k8_rows(
+template <int R>
+static __device__ __forceinline__ void gemv_q8_0_k8_rows_body(
     const unsigned char* __restrict__ A_q8,
     const float* __restrict__ x,
     float* __restrict__ y,
     int M, int K,
     float scale,
-    int hc_act,
-    int rows
+    int hc_act
 ) {
-    __shared__ float part[8][8];
+    __shared__ float part[R][8];
     const int row = blockIdx.x;
     if (row >= M) return;
     const int wave = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
     const int pk = K / 8;
-    float s[8];
-    gemv_q8_0_row_multi(A_q8 + ((size_t)row * 8 + wave) * (pk / 32) * 34, x + wave * pk,
-                        (size_t)K, pk, lane, rows, s);
+    float s[R];
+    gemv_q8_0_row_multi<R>(A_q8 + ((size_t)row * 8 + wave) * (pk / 32) * 34, x + wave * pk,
+                           K, pk, lane, s);
     if (lane == 0) {
 #pragma unroll
-        for (int r = 0; r < 8; ++r) part[r][wave] = s[r];
+        for (int r = 0; r < R; ++r) part[r][wave] = s[r];
     }
     __syncthreads();
     const int r = threadIdx.x;
-    if (r >= rows) return;
+    if (r >= R) return;
     float value = ((part[r][0] + part[r][1]) + (part[r][2] + part[r][3])) + ((part[r][4] + part[r][5]) + (part[r][6] + part[r][7]));
     if (hc_act) {
         value = static_cast<float>(static_cast<hip_bfloat16>(value));
@@ -291,6 +288,21 @@ extern "C" __global__ void gemv_q8_0_k8_rows(
     }
     y[(size_t)r * M + row] = value;
 }
+
+#define GEMV_Q8_0_K8_ROWS(R)                                                        \
+    __launch_bounds__(256) extern "C" __global__ void gemv_q8_0_k8_rows_r##R(        \
+        const unsigned char* __restrict__ A_q8, const float* __restrict__ x,        \
+        float* __restrict__ y, int M, int K, float scale, int hc_act) {             \
+        gemv_q8_0_k8_rows_body<R>(A_q8, x, y, M, K, scale, hc_act);                 \
+    }
+GEMV_Q8_0_K8_ROWS(2)
+GEMV_Q8_0_K8_ROWS(3)
+GEMV_Q8_0_K8_ROWS(4)
+GEMV_Q8_0_K8_ROWS(5)
+GEMV_Q8_0_K8_ROWS(6)
+GEMV_Q8_0_K8_ROWS(7)
+GEMV_Q8_0_K8_ROWS(8)
+#undef GEMV_Q8_0_K8_ROWS
 
 // Requantize BF16 to Q8_0, one thread per 32-block: scale = f16(amax / 127),
 // q = round(w / scale) with the stored (f16) scale.

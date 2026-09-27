@@ -14494,15 +14494,27 @@ impl Gpu {
         hc_act_scale: Option<f32>,
         rows: usize,
     ) -> HipResult<()> {
-        if !k.is_multiple_of(256) || !(1..=8).contains(&rows) {
+        const FUNCS: [&str; 7] = [
+            "gemv_q8_0_k8_rows_r2",
+            "gemv_q8_0_k8_rows_r3",
+            "gemv_q8_0_k8_rows_r4",
+            "gemv_q8_0_k8_rows_r5",
+            "gemv_q8_0_k8_rows_r6",
+            "gemv_q8_0_k8_rows_r7",
+            "gemv_q8_0_k8_rows_r8",
+        ];
+        if rows == 1 {
+            return self.gemv_q8_0_k8(weight, x, y, m, k, hc_act_scale);
+        }
+        if !k.is_multiple_of(256) || !(2..=8).contains(&rows) {
             return Err(hip_bridge::HipError::new(
                 1,
                 "gemv_q8_0_k8_rows needs K % 256 == 0 and 1..=8 rows",
             ));
         }
         self.bind_thread()?;
-        const FUNC: &str = "gemv_q8_0_k8_rows";
-        self.ensure_kernel("gemv_q8_0", kernels::GEMV_Q8_0_SRC, FUNC)?;
+        let func = FUNCS[rows - 2];
+        self.ensure_kernel("gemv_q8_0", kernels::GEMV_Q8_0_SRC, func)?;
         let w_ptr = weight.buf.as_ptr();
         let x_ptr = x.buf.as_ptr();
         let y_ptr = y.buf.as_ptr();
@@ -14510,7 +14522,6 @@ impl Gpu {
         let k_val = k as i32;
         let scale = hc_act_scale.unwrap_or(1.0);
         let hc_act = i32::from(hc_act_scale.is_some());
-        let rows_val = rows as i32;
         let mut params: Vec<*mut c_void> = vec![
             &w_ptr as *const _ as *mut c_void,
             &x_ptr as *const _ as *mut c_void,
@@ -14519,9 +14530,8 @@ impl Gpu {
             &k_val as *const _ as *mut c_void,
             &scale as *const _ as *mut c_void,
             &hc_act as *const _ as *mut c_void,
-            &rows_val as *const _ as *mut c_void,
         ];
-        self.launch_maybe_blob(FUNC, [m as u32, 1, 1], [256, 1, 1], 0, &mut params, || {
+        self.launch_maybe_blob(func, [m as u32, 1, 1], [256, 1, 1], 0, &mut params, || {
             let mut b = hip_bridge::KernargBlob::new();
             b.push_ptr(w_ptr);
             b.push_ptr(x_ptr);
@@ -14530,7 +14540,6 @@ impl Gpu {
             b.push_i32(k_val);
             b.push_f32(scale);
             b.push_i32(hc_act);
-            b.push_i32(rows_val);
             b
         })
     }
