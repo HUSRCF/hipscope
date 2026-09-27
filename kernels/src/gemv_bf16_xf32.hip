@@ -162,7 +162,9 @@ extern "C" __global__ void gemv_bf16_xf32_k4(
 // rows), so block b normalizes its branch into LDS and waves 0..3 run
 // gemv_bf16_xf32_k4's quarter b of gate rows 0..3 (gemv_bf16_xf32_row over
 // that branch) — the next write then needs neither its norm nor its gate
-// GEMV. Grid [branches = 4], block 256, hidden == 2560.
+// GEMV. `clear` (optional) zeroes `clear_elements` floats, the
+// zero_f32 of a Clear step this launch absorbs. Grid [branches = 4],
+// block 256, hidden == 2560.
 static __device__ __forceinline__ float hf_bf16(float v) {
     return static_cast<float>(static_cast<hip_bfloat16>(v));
 }
@@ -179,12 +181,18 @@ extern "C" __global__ void hyper_write_norm_f32(
     const unsigned short* __restrict__ next_norm,
     const unsigned short* __restrict__ next_inject,
     float* __restrict__ quarters_out,
+    float* __restrict__ clear,
+    int clear_elements,
     int branches,
     int hidden
 ) {
     const int branch = (int)blockIdx.x;
     const int tid = (int)threadIdx.x;
     const int offset = branch * hidden;
+    // Optional: a scratch prefix the following steps expect zeroed.
+    if (clear) {
+        for (int i = branch * 256 + tid; i < clear_elements; i += branches * 256) clear[i] = 0.0f;
+    }
     __shared__ float rms_sum[256];
     __shared__ float xn[2560];
     float raw[10], mix[10], weight[10];

@@ -752,15 +752,21 @@ pub fn execute_validated_steps<'a>(
                         }
                         _ => None,
                     });
+                // A Clear right after the read is folded into the same launch.
+                let clear = match steps.get(i + 2) {
+                    Some(Step::Clear(op)) => Some(op),
+                    _ => None,
+                };
                 if let Some(produced) = execute_hyper_write_then_read(
                     gpu,
                     write,
                     read,
                     quarters_in.as_ref(),
                     next.as_ref().map(|(_, op, q)| (*op, q)),
+                    clear,
                 )? {
                     gates_ready = next.filter(|_| produced).map(|(j, _, _)| (j, slot));
-                    i += 2;
+                    i += if clear.is_some() { 3 } else { 2 };
                     continue;
                 }
             }

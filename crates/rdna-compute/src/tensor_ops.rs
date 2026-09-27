@@ -820,7 +820,7 @@ pub struct HyperNextGates<'a> {
 /// `normalized`, one launch; bitwise the two launches. `quarters_in` (from a
 /// previous call's `next`) replaces `p.gates` as the gate source; `next`
 /// also computes the next hyper write's gate quarters (its norm and k4 gate
-/// GEMV of these streams, bitwise).
+/// GEMV of these streams, bitwise); `clear` is zero-filled (a `zero_f32`).
 pub fn hyper_write_norm(
     gpu: &mut Gpu,
     p: &HyperWrite<'_>,
@@ -828,6 +828,7 @@ pub fn hyper_write_norm(
     normalized: &GpuTensor,
     quarters_in: Option<&GpuTensor>,
     next: Option<&HyperNextGates<'_>>,
+    clear: Option<&GpuTensor>,
 ) -> HipResult<()> {
     for tensor in [p.input, p.mixed, p.gates, p.output, normalized] {
         ensure_f32(tensor)?;
@@ -845,6 +846,7 @@ pub fn hyper_write_norm(
         || p.mixed.numel() != p.hidden
         || p.gates.numel() != p.branches
         || quarters_in.is_some_and(|q| !quarters_ok(q))
+        || clear.is_some_and(|c| c.dtype != DType::F32 || c.numel() > i32::MAX as usize)
         || next.is_some_and(|n| {
             !quarters_ok(n.quarters)
                 || n.norm_weight.dtype != DType::BF16
@@ -873,9 +875,11 @@ pub fn hyper_write_norm(
         next.map_or(null, |n| n.norm_weight.buf.as_ptr()),
         next.map_or(null, |n| n.inject.buf.as_ptr()),
         next.map_or(null, |n| n.quarters.buf.as_ptr()),
+        clear.map_or(null, |c| c.buf.as_ptr()),
     ] {
         args.push_ptr(ptr);
     }
+    args.push_i32(clear.map_or(0, |c| c.numel() as i32));
     args.push_i32(4);
     args.push_i32(2560);
     args.pad_to(16);

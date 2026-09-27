@@ -725,7 +725,8 @@ pub fn hyper_gate_quarters(op: &HyperWriteOp<'_>, slot: usize) -> Option<GpuTens
 /// read's norm (bitwise the separate launches). With `quarters_in` the write
 /// takes its gates from quarters an earlier fused write produced (its norm
 /// and gate GEMV already ran); with `next` it also produces the quarters for
-/// `next`, the following hyper write of these streams, into `next`'s slot.
+/// `next`, the following hyper write of these streams, into `next`'s slot,
+/// and zero-fills `clear`'s prefix (the caller skips that step).
 /// Returns `None`, having launched nothing, when the pair does not have that
 /// shape, else whether `next`'s quarters were produced.
 pub fn execute_hyper_write_then_read(
@@ -734,6 +735,7 @@ pub fn execute_hyper_write_then_read(
     read: &HyperReadOp<'_>,
     quarters_in: Option<&GpuTensor>,
     next: Option<(&HyperWriteOp<'_>, &GpuTensor)>,
+    clear: Option<&ClearOp<'_>>,
 ) -> Result<Option<bool>, DispatchError> {
     let fusable = write.rows == 1
         && read.rows == 1
@@ -766,6 +768,13 @@ pub fn execute_hyper_write_then_read(
     let output = view(write.output, 0, wide);
     let write_normalized = view(write.normalized, 0, wide);
     let normalized = view(read.normalized, 0, wide);
+    let clear = match clear {
+        Some(op) => {
+            op.validate_for_gpu(gpu)?;
+            Some(view(op.tensor, 0, op.elements))
+        }
+        None => None,
+    };
     if quarters_in.is_none() {
         hyper_write_gates(gpu, write, &input, &write_normalized, &gates)?;
     }
@@ -785,6 +794,7 @@ pub fn execute_hyper_write_then_read(
         &normalized,
         quarters_in,
         next_gates.as_ref(),
+        clear.as_ref(),
     ))?;
     execute_hyper_read_inner(gpu, read, true)?;
     Ok(Some(next_gates.is_some()))
