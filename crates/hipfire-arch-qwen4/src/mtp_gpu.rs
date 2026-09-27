@@ -1065,12 +1065,17 @@ pub struct Qwen4MtpGpu {
     pub(crate) state: MtpGpuState,
     pub(crate) moe: Qwen4MoeLayerRuntime,
     pub(crate) max_seq: usize,
-    /// Lower-precision copy of the LM head the draft steps take their argmax
-    /// from (`HIPFIRE_MTP_DRAFT_HEAD`, default MQ4G256V2; `lm` = the model's
-    /// own head). Drafts only steer acceptance: the target verifies every
-    /// emitted token. On the shipped Q8 head, MQ4 halves the draft step's
-    /// dominant read with no measured acceptance loss on code (MQ3 loses).
+    /// Lower-precision copy of the LM head the draft steps rank the
+    /// vocabulary with (`HIPFIRE_MTP_DRAFT_HEAD=mq2..mq6[r]`, default `mq2r`;
+    /// anything else = the model's own head). Drafts only steer acceptance:
+    /// the target verifies every emitted token. On the shipped Q8_0 head an
+    /// MQ2 copy with exact re-scoring of its top 8 (`r`) drafts the Q8_0
+    /// head's own argmax at a quarter of its read; plain MQ3 loses acceptance.
     draft_head: Option<GpuTensor>,
+    /// With a draft head over a Q8_0 LM head (`HIPFIRE_MTP_DRAFT_HEAD=mqNr`):
+    /// top-8 scratch for re-scoring the draft head's best 8 exactly, so the
+    /// draft is the Q8_0 head's argmax whenever it ranks there.
+    draft_rescore: Option<GpuTensor>,
 }
 
 impl Qwen4MtpGpu {
@@ -1100,13 +1105,16 @@ impl Qwen4MtpGpu {
                 return Err(error.into());
             }
         };
-        let draft_format = match std::env::var("HIPFIRE_MTP_DRAFT_HEAD").as_deref() {
-            Ok("mq6") => Some(DType::MQ6G256V2),
-            Ok("mq5") => Some(DType::MQ5G256V2),
-            Ok("mq4") => Some(DType::MQ4G256V2),
-            Ok("mq3") => Some(DType::MQ3G256V2),
-            Ok("lm") => None,
-            _ => Some(DType::MQ4G256V2),
+        let draft_choice =
+            std::env::var("HIPFIRE_MTP_DRAFT_HEAD").unwrap_or_else(|_| "mq2r".to_string());
+        let rescore = draft_choice.ends_with('r');
+        let draft_format = match draft_choice.trim_end_matches('r') {
+            "mq6" => Some(DType::MQ6G256V2),
+            "mq5" => Some(DType::MQ5G256V2),
+            "mq4" => Some(DType::MQ4G256V2),
+            "mq3" => Some(DType::MQ3G256V2),
+            "mq2" => Some(DType::MQ2G256V2),
+            _ => None,
         };
         let lm_head = weights.resident(&weights.root.lm_head)?;
         // Only a bigger head is worth a smaller copy.
@@ -1128,12 +1136,22 @@ impl Qwen4MtpGpu {
             }
             None => None,
         };
+        let draft_rescore = if rescore
+            && draft_head.is_some()
+            && lm_head.dtype == DType::Q8_0
+            && config.hidden_size == 2560
+        {
+            Some(gpu.zeros(&[Gpu::TOPK8_PARTIAL_BYTES], DType::Raw)?)
+        } else {
+            None
+        };
         Ok(Self {
             scratch,
             state,
             moe,
             max_seq,
             draft_head,
+            draft_rescore,
         })
     }
 
@@ -1143,10 +1161,11 @@ impl Qwen4MtpGpu {
             state,
             moe,
             draft_head,
+            draft_rescore,
             ..
         } = self;
-        if let Some(head) = draft_head {
-            let _ = gpu.free_tensor(head);
+        for tensor in [draft_head, draft_rescore].into_iter().flatten() {
+            let _ = gpu.free_tensor(tensor);
         }
         let scratch_error = scratch.free_gpu(gpu);
         let state_error = state.free_gpu(gpu);
@@ -1702,15 +1721,26 @@ impl Qwen4MtpGpu {
                 config.vocab_size,
                 config.hidden_size,
             )?;
-            argmax_f32(
-                gpu,
-                &ArgmaxF32 {
-                    logits: &scratch.logits,
-                    indices: &scratch.top1,
-                    rows: 1,
-                    vocab: config.vocab_size,
-                },
-            )?;
+            if let Some(partial) = self.draft_rescore.as_ref() {
+                gpu.q8_0_topk8_rescore_k2560(
+                    &scratch.logits,
+                    config.vocab_size,
+                    weights.resident(&weights.root.lm_head)?,
+                    &scratch.hc_mixed,
+                    partial,
+                    &scratch.top1,
+                )?;
+            } else {
+                argmax_f32(
+                    gpu,
+                    &ArgmaxF32 {
+                        logits: &scratch.logits,
+                        indices: &scratch.top1,
+                        rows: 1,
+                        vocab: config.vocab_size,
+                    },
+                )?;
+            }
             let mut token_bytes = [0u8; 4];
             gpu.hip.memcpy_dtoh(&mut token_bytes, &scratch.top1.buf)?;
             let next_token = u32::from_ne_bytes(token_bytes);

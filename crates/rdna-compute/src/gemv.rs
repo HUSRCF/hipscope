@@ -14544,6 +14544,89 @@ impl Gpu {
         })
     }
 
+    /// Argmax of `head_q8 · x` (Q8_0, K = 2560) restricted to the top 8
+    /// entries of the approximate `logits` (`n` = vocabulary), each scored
+    /// with the decode kernel's exact dot; the token id lands in `out[0]`.
+    /// `partial` is scratch of at least [`Gpu::TOPK8_PARTIAL_BYTES`].
+    pub fn q8_0_topk8_rescore_k2560(
+        &mut self,
+        logits: &GpuTensor,
+        n: usize,
+        head_q8: &GpuTensor,
+        x: &GpuTensor,
+        partial: &GpuTensor,
+        out: &GpuTensor,
+    ) -> HipResult<()> {
+        const GROUPS: usize = 128;
+        let chunk = n.div_ceil(GROUPS);
+        if chunk > 2048 || partial.buf.size() < Self::TOPK8_PARTIAL_BYTES || x.numel() < 2560 {
+            return Err(hip_bridge::HipError::new(1, "q8_0_topk8_rescore_k2560 shape"));
+        }
+        self.bind_thread()?;
+        self.ensure_kernel("gemv_q8_0", kernels::GEMV_Q8_0_SRC, "topk8_partial_f32")?;
+        self.ensure_kernel("gemv_q8_0", kernels::GEMV_Q8_0_SRC, "topk8_rescore_q8_0_k2560")?;
+        let v_ptr = logits.buf.as_ptr();
+        let pv_ptr = partial.buf.as_ptr();
+        let pi_ptr = unsafe { (partial.buf.as_ptr() as *mut u8).add(GROUPS * 8 * 4) as *mut c_void };
+        let n_val = n as i32;
+        let chunk_val = chunk as i32;
+        let mut params = [
+            &v_ptr as *const _ as *mut c_void,
+            &n_val as *const _ as *mut c_void,
+            &chunk_val as *const _ as *mut c_void,
+            &pv_ptr as *const _ as *mut c_void,
+            &pi_ptr as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "topk8_partial_f32",
+            [GROUPS as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(v_ptr);
+                b.push_i32(n_val);
+                b.push_i32(chunk_val);
+                b.push_ptr(pv_ptr);
+                b.push_ptr(pi_ptr);
+                b
+            },
+        )?;
+        let m_val = (GROUPS * 8) as i32;
+        let a_ptr = head_q8.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let o_ptr = out.buf.as_ptr();
+        let mut params = [
+            &pv_ptr as *const _ as *mut c_void,
+            &pi_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &o_ptr as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "topk8_rescore_q8_0_k2560",
+            [1, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pv_ptr);
+                b.push_ptr(pi_ptr);
+                b.push_i32(m_val);
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(o_ptr);
+                b
+            },
+        )
+    }
+
+    /// Scratch bytes [`Gpu::q8_0_topk8_rescore_k2560`] needs.
+    pub const TOPK8_PARTIAL_BYTES: usize = 128 * 8 * 8;
+
     /// Whether [`Gpu::gemv_q8_0_staged_rows`] covers this shape.
     pub fn gemv_q8_0_staged_rows_supported(&self, k: usize, rows: usize) -> bool {
         self.arch_caps.is_gfx1151() && (k == 2560 || k == 320) && (1..=8).contains(&rows)
