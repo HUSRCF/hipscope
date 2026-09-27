@@ -4,7 +4,7 @@
 
 **Disposition:** measured local deltas on `gfx1151`, landed on branch
 `autoresearch/improve-autoregressive-decode-performance-for-qw-20260926`
-(`922308c38` → `8a9b5961f`). Not a G5 admission, not a retained-replay
+(`922308c38` → `3159327df`). Not a G5 admission, not a retained-replay
 certification, not a cross-architecture result, and not a product speed-floor
 update.
 
@@ -46,16 +46,17 @@ update.
   --thinking high --max-think-tokens 512 --max-tokens 700 --mtp off
   --speculation off --max-seq 2048` against the run-247 daemon (md5
   `33edbdb4b107f593cb0913a68816e6f3`) and the run-270 daemon (md5
-  `90667a61b6edef0344c75c64af49ac88`): 5/5 turns `finish=stop` each, no
-  runaway/empty/attractor, answers read and correct.
+  `90667a61b6edef0344c75c64af49ac88`) and the run-288 daemon (md5
+  `5e2999e0024250a22ef7f895c523825d`, identical outputs): 5/5 turns
+  `finish=stop` each, no runaway/empty/attractor, answers read and correct.
 
 ## Result
 
-| | start (run 181, `922308c38`) | end (run 273, `8a9b5961f`) |
+| | start (run 181, `922308c38`) | end (run 288, `3159327df`) |
 |---|---:|---:|
-| decode tok/s | 19.20 | **29.82** (+55.3%) |
+| decode tok/s | 19.20 | **30.04** (+56.5%) |
 | 8-chunk decode KLD | 0.072049 | 0.069977 |
-| prefill tok/s | 1238.2 | 1258.8 |
+| prefill tok/s | 1238.2 | 1273.2 |
 
 Per-token profile from mid-campaign (run 200 state, 25.7 tok/s) to run 247:
 1685 → 1039 dispatches, span 40.4 → 35.5 ms (profiler-inflated), idle gaps
@@ -145,6 +146,17 @@ use. `hyper_norm` (`879ad6c4f`, `247ea5d8a`), MoE down GEMV (`0957e4fa1`,
 - Pure-greedy sampling takes the argmax on the GPU and reads back 4 bytes
   (`2dfa3c920`); `tensor_ops::argmax_f32` now has `llama::argmax` semantics
   (first finite maximum, 0 when nothing is finite), covered by a parity test.
+- The token boundary was host-bound: ~300 us per token between the argmax
+  readback and the first kernel of the next forward (a 300 us host spin there
+  cost 0.7%). The PLE row fetch starts before the step program is built and
+  the token id is a `hipMemsetD32Async` fill instead of a synchronous copy
+  (`a56e69ee8`); the forward builds its program before it takes the token
+  (`0f2793696`); and a greedy token now stays on the GPU — the forward
+  enqueues `argmax(previous logits) → token_ids`, the embedding and the layers
+  before the PLE layer, then reads the id back on a non-blocking stream for
+  the PLE fetch (`3159327df`). 29.73 → 30.04 tok/s, same token ids.
+  `generate_ar_with_forward`'s decode callback takes `Option<u32>` (`None`:
+  the argmax of the logits).
 
 ## What did not work
 
@@ -174,6 +186,9 @@ use. `hyper_norm` (`879ad6c4f`, `247ea5d8a`), MoE down GEMV (`0957e4fa1`,
   faster but slowed attention by the same time. Latency-bound kernels are not
   idle DRAM windows.
 - LDS-shared x for the dense MQ6 and BF16 GEMVs and the MoE down: no gain.
+- The MoE combine and shared add folded into the next HC write kernel
+  (bitwise): 7% slower — its four workgroups cannot hide 100 routed loads per
+  thread.
 - Retained PM4 replay (measured with a local ROCm root that finds ROCr): same
   decode rate as ordinary HIP — the inter-dispatch gap is GPU-side.
   `HIP_FORCE_DEV_KERNARG=1`, `ROC_ACTIVE_WAIT_TIMEOUT=0`: no change.

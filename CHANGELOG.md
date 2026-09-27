@@ -2,13 +2,15 @@
 
 ## Unreleased
 
-- Qwen4 decode on gfx1151: 19.2 → 29.8 tok/s (1131-token prompt, greedy,
+- Qwen4 decode on gfx1151: 19.2 → 30.0 tok/s (1131-token prompt, greedy,
   `qwen3.8-flash-next.mq6q8-pleq8`). Per-token dispatches drop by fusing the
   small kernels between the streaming GEMVs (HC write + next HC read norm and
   the next write's gate, QSA decode prologue, GDN step + gated norm + output
   rotation, rotations written by their producers) and latency-bound kernels
   issue their loads up front. Pure-greedy sampling takes the argmax on the GPU
-  (`argmax_f32` now matches `llama::argmax`: first finite maximum). One change
+  (`argmax_f32` now matches `llama::argmax`: first finite maximum), and the
+  greedy token feeds the next forward on the device, read back only at the
+  PLE layer, so the token boundary no longer idles the GPU. One change
   (four-wave K split of the decode HC GEMVs) moves numerics and lowers decode
   KLD (32 chunks 0.075160 → 0.074299); every other change is bit-exact.
   [The checkpoint](docs/perf-checkpoints/2026-09-27-qwen4-decode-autoresearch-gfx1151.md).
