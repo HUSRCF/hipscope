@@ -1065,6 +1065,12 @@ pub struct Qwen4MtpGpu {
     pub(crate) state: MtpGpuState,
     pub(crate) moe: Qwen4MoeLayerRuntime,
     pub(crate) max_seq: usize,
+    /// Lower-precision copy of the LM head the draft steps take their argmax
+    /// from (`HIPFIRE_MTP_DRAFT_HEAD`, default MQ4G256V2; `lm` = the model's
+    /// own head). Drafts only steer acceptance: the target verifies every
+    /// emitted token. On the shipped Q8 head, MQ4 halves the draft step's
+    /// dominant read with no measured acceptance loss on code (MQ3 loses).
+    draft_head: Option<GpuTensor>,
 }
 
 impl Qwen4MtpGpu {
@@ -1094,11 +1100,40 @@ impl Qwen4MtpGpu {
                 return Err(error.into());
             }
         };
+        let draft_format = match std::env::var("HIPFIRE_MTP_DRAFT_HEAD").as_deref() {
+            Ok("mq6") => Some(DType::MQ6G256V2),
+            Ok("mq5") => Some(DType::MQ5G256V2),
+            Ok("mq4") => Some(DType::MQ4G256V2),
+            Ok("mq3") => Some(DType::MQ3G256V2),
+            Ok("lm") => None,
+            _ => Some(DType::MQ4G256V2),
+        };
+        let lm_head = weights.resident(&weights.root.lm_head)?;
+        // Only a bigger head is worth a smaller copy.
+        let draft_format = draft_format.filter(|&format| {
+            matches!(lm_head.dtype, DType::Q8_0 | DType::BF16 | DType::MQ6G256V2 | DType::MQ5G256V2)
+                && format != lm_head.dtype
+        });
+        let draft_head = match draft_format {
+            Some(format) => {
+                match gpu.requant_g256(lm_head, config.vocab_size, config.hidden_size, format) {
+                    Ok(copy) => Some(copy),
+                    Err(error) => {
+                        let _ = moe.free_gpu(gpu);
+                        let _ = state.free_gpu(gpu);
+                        let _ = scratch.free_gpu(gpu);
+                        return Err(error.into());
+                    }
+                }
+            }
+            None => None,
+        };
         Ok(Self {
             scratch,
             state,
             moe,
             max_seq,
+            draft_head,
         })
     }
 
@@ -1107,8 +1142,12 @@ impl Qwen4MtpGpu {
             scratch,
             state,
             moe,
+            draft_head,
             ..
         } = self;
+        if let Some(head) = draft_head {
+            let _ = gpu.free_tensor(head);
+        }
         let scratch_error = scratch.free_gpu(gpu);
         let state_error = state.free_gpu(gpu);
         let moe_error = moe.free_gpu(gpu);
@@ -1650,7 +1689,10 @@ impl Qwen4MtpGpu {
                 &scratch.hc_mixed,
                 &scratch.rotation,
             )?;
-            let lm_head = weights.resident(&weights.root.lm_head)?;
+            let lm_head = match self.draft_head.as_ref() {
+                Some(head) => head,
+                None => weights.resident(&weights.root.lm_head)?,
+            };
             dispatch_gemv(
                 gpu,
                 lm_head,

@@ -38,8 +38,8 @@ use hipfire_dispatch::pipeline::sealed_moe::{
 use hipfire_dispatch::pipeline::{
     execute_steps, execute_validated_steps, seal_decode, validate_steps, BoundMoeExperts, ClearOp,
     ExpertBindingCache, ExpertMetadata, ExpertResource, ExpertResources, ExpertTable,
-    GatedDeltaNetOp, GdnRowCapture, GroupedDepthwiseOp, HyperReadOp, HyperWriteOp,
-    IndexedAttentionOp, IndexedAttentionState, Step,
+    GatedDeltaNetOp, GroupedDepthwiseOp, HyperReadOp, HyperWriteOp, IndexedAttentionOp,
+    IndexedAttentionState, Step,
 };
 use hipfire_dispatch::types::dtype_rotation_plan;
 use hipfire_runtime::external_rows::RowFetch;

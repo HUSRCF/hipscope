@@ -102,6 +102,8 @@ pub(crate) fn dispatch_gemv(
     match weight.dtype {
         DType::MQ4G256V2
         | DType::MQ4G128V2
+        | DType::MQ3G256V2
+        | DType::MQ5G256V2
         | DType::MQ6G256V2
         | DType::MFP4G32E8SOA
         | DType::Q8_0
