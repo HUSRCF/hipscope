@@ -323,6 +323,25 @@ fn program_dims(config: &Qwen4Config) -> Qwen4ProgramDims {
     }
 }
 
+/// A single-token forward's HC read projection: its Q8_0 decode copy
+/// (`Qwen4GpuForward::hc_q8`) when one exists.
+fn hc_mix<'a>(
+    copies: &'a [GpuTensor],
+    index: usize,
+    rows: usize,
+    source: WeightRef<'a>,
+) -> WeightRef<'a> {
+    match copies.get(index) {
+        Some(buf) if rows == 1 => WeightRef {
+            buf,
+            dtype: DType::Q8_0,
+            row_stride: row_stride(DType::Q8_0, source.k),
+            ..source
+        },
+        _ => source,
+    }
+}
+
 fn hyper_read_desc<'a>(
     weights: &'a Qwen4Weights,
     hyper: &HyperConnectionReadWeights,
@@ -1315,6 +1334,13 @@ pub struct Qwen4GpuForward {
     /// Device-argmax token readback (`forward_token_or_argmax`), once used.
     token_readback: Option<TokenReadback>,
     moe: Vec<Qwen4MoeLayerRuntime>,
+    /// Four per layer [attn down, attn up, mlp down, mlp up]: the HC read
+    /// projections requantized BF16 -> Q8_0 for single-token forwards (gfx1151).
+    /// Batch-1 decode streams every weight once per token, and these BF16
+    /// matrices are ~1.3 GB of it; Q8_0 halves that at a decode KLD inside the
+    /// noise band (0.0743 -> 0.0754 / 0.0730 over 32 chunks for fake-quant
+    /// variants). Prefill keeps the BF16 source for its WMMA routes.
+    hc_q8: Vec<GpuTensor>,
 }
 
 /// An event after a forward's device argmax and a stream independent of the
@@ -1333,6 +1359,7 @@ impl Qwen4GpuForward {
         let (scratch, host_token_bytes, host_ple_bytes) =
             Qwen4GpuForwardScratch::new(gpu, &bundle.config, max_chunk)?;
         let mut moe = Vec::with_capacity(bundle.config.num_hidden_layers);
+        let mut hc_q8 = Vec::new();
         let result = (|| {
             for layer in &bundle.weights.layer_refs {
                 moe.push(Qwen4MoeLayerRuntime::new(
@@ -1342,11 +1369,37 @@ impl Qwen4GpuForward {
                     &bundle.config,
                 )?);
             }
+            let sources = bundle
+                .weights
+                .layer_refs
+                .iter()
+                .flat_map(|layer| {
+                    [
+                        &layer.attn_hyper.input_mix_down,
+                        &layer.attn_hyper.input_mix_up,
+                        &layer.mlp_hyper.input_mix_down,
+                        &layer.mlp_hyper.input_mix_up,
+                    ]
+                })
+                .map(|reference| dense_ref(&bundle.weights, reference))
+                .collect::<Result<Vec<_>, _>>()?;
+            if gpu.arch_caps.is_gfx1151()
+                && sources
+                    .iter()
+                    .all(|weight| weight.dtype == DType::BF16 && weight.k % 32 == 0)
+            {
+                for weight in sources {
+                    hc_q8.push(gpu.quantize_bf16_q8_0(weight.buf, weight.m, weight.k)?);
+                }
+            }
             Ok::<(), Qwen4GpuForwardError>(())
         })();
         if let Err(error) = result {
             for layer in moe {
                 let _ = layer.free_gpu(gpu);
+            }
+            for tensor in hc_q8 {
+                let _ = gpu.free_tensor(tensor);
             }
             let _ = scratch.free_gpu(gpu);
             return Err(error);
@@ -1357,6 +1410,7 @@ impl Qwen4GpuForward {
             host_ple_bytes,
             token_readback: None,
             moe,
+            hc_q8,
         })
     }
 
@@ -1365,9 +1419,15 @@ impl Qwen4GpuForward {
             scratch,
             moe,
             token_readback,
+            hc_q8,
             ..
         } = self;
         let mut first = scratch.free_gpu(gpu);
+        for tensor in hc_q8 {
+            if let Err(error) = gpu.free_tensor(tensor) {
+                first.get_or_insert(error);
+            }
+        }
         if let Some(readback) = token_readback {
             for result in [
                 gpu.hip.stream_synchronize(&readback.stream),
@@ -1839,8 +1899,13 @@ impl Qwen4GpuForward {
                 state_bf16: bf16_state,
                 input: &self.scratch.streams,
                 norm_weight: attn_read.norm,
-                input_mix_down: attn_read.input_mix_down,
-                input_mix_up: attn_read.input_mix_up,
+                input_mix_down: hc_mix(
+                    &self.hc_q8,
+                    layer_index * 4 + 0,
+                    n,
+                    attn_read.input_mix_down,
+                ),
+                input_mix_up: hc_mix(&self.hc_q8, layer_index * 4 + 1, n, attn_read.input_mix_up),
                 normalized: &self.scratch.hc_normalized,
                 low: &self.scratch.hc_low,
                 up: &self.scratch.hc_up,
@@ -1983,8 +2048,13 @@ impl Qwen4GpuForward {
                 state_bf16: bf16_state,
                 input: &self.scratch.streams,
                 norm_weight: mlp_read.norm,
-                input_mix_down: mlp_read.input_mix_down,
-                input_mix_up: mlp_read.input_mix_up,
+                input_mix_down: hc_mix(
+                    &self.hc_q8,
+                    layer_index * 4 + 2,
+                    n,
+                    mlp_read.input_mix_down,
+                ),
+                input_mix_up: hc_mix(&self.hc_q8, layer_index * 4 + 3, n, mlp_read.input_mix_up),
                 normalized: &self.scratch.hc_normalized,
                 low: &self.scratch.hc_low,
                 up: &self.scratch.hc_up,

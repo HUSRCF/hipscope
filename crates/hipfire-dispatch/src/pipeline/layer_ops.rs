@@ -493,22 +493,21 @@ fn execute_hyper_read_inner(
         normalized_f16 = Some(x16);
     } else if op.rows == 1
         && gpu.arch_caps.has_gfx11_plus_simt()
-        && op.input_mix_down.dtype == DType::BF16
-        && op.input_mix_down.k % 32 == 0
+        && ((op.input_mix_down.dtype == DType::BF16 && op.input_mix_down.k % 32 == 0)
+            || (op.input_mix_down.dtype == DType::Q8_0 && op.input_mix_down.k % 128 == 0))
     {
         // Decode: the long-K down GEMV splits each row across four waves and
         // applies the activation below in its epilogue.
         if !normalized_ready {
             hip(hyper_norm(gpu, &norm))?;
         }
-        hip(gpu.gemv_bf16_xf32_k4(
-            op.input_mix_down.buf,
-            &normalized,
-            &low,
-            op.input_mix_down.m,
-            op.input_mix_down.k,
-            Some(1.0 / op.branches as f32),
-        ))?;
+        let down = &op.input_mix_down;
+        let act = Some(1.0 / op.branches as f32);
+        hip(if down.dtype == DType::Q8_0 {
+            gpu.gemv_q8_0_k4(down.buf, &normalized, &low, down.m, down.k, act)
+        } else {
+            gpu.gemv_bf16_xf32_k4(down.buf, &normalized, &low, down.m, down.k, act)
+        })?;
         activated = true;
     } else {
         if !normalized_ready {
