@@ -4,7 +4,7 @@
 
 **Disposition:** measured local deltas on `gfx1151`, landed on branch
 `autoresearch/improve-autoregressive-decode-performance-for-qw-20260926`
-(`922308c38` → `3159327df`). Not a G5 admission, not a retained-replay
+(`922308c38` → `30d17ce50`). Not a G5 admission, not a retained-replay
 certification, not a cross-architecture result, and not a product speed-floor
 update.
 
@@ -67,6 +67,39 @@ above them is per-dispatch overhead (~2.7 us gap plus ~1.5 us minimum kernel)
 and a few latency-bound kernels (QSA attention ~79 us/layer, ~60 after
 `78aa7664a`; GDN step ~35
 us/layer, the fused HC write kernel ~7 us/sublayer).
+
+## Numerics-relaxed phase (runs 290-298)
+
+Bit-exactness was dropped as a requirement; the gate became decode KLD within
+the noise band. Every numerics change perturbs every chunk chaotically: the
+paired per-chunk KLD deltas of equal-quality variants have sd ~0.009, so the
+32-chunk mean moves ±0.0015 (one standard error). The harness therefore scores
+all 32 chunks and requires the paired t of (candidate − pre-requant baseline
+chunks, mean 0.074299) to stay ≤ 2, always against that fixed baseline.
+
+| | run 292 (`7e4ece53a`) | run 295 (`30d17ce50`) |
+|---|---:|---:|
+| decode tok/s | 30.04 | **32.34** (+7.6%) |
+| 32-chunk decode KLD | 0.074299 | 0.075390 (paired t 1.59) |
+| top-1 | 0.8923 | 0.8895 |
+| prefill tok/s | 1263.8 | 1271.4 |
+
+- Batch-1 decode streams every weight once per token; the BF16 HC read
+  projections (`input_mix_down` 320×10240, `input_mix_up` 10240×320, two per
+  layer) were ~1.3 GB of it. At load, gfx1151 requantizes them to Q8_0
+  (`Gpu::quantize_bf16_q8_0`, f16 scale per 32) for single-token forwards
+  (`Qwen4GpuForward::hc_q8`, +0.67 GB); prefill keeps BF16 for its WMMA routes
+  (`598041b23`, 31.51). New kernels: `gemv_q8_0_k8` (eight waves per down row,
+  HC activation epilogue) and `gemv_q8_0_k320_staged` (up rows staged through
+  LDS, 132 → 218 GB/s against `gemv_q8_0_wide`; `30d17ce50`, 32.34).
+- Rejected by the gate: shared-expert gate/up/down as Q8_0 decode shadows
+  (32.88, t 2.19) and a split QSA decode attention (heads × 4 workgroups,
+  wave-cooperative scores, per-split softmax partials folded by the last
+  arriver; 32.61, t 2.12 — a pure fp32 reorder, i.e. noise on top of the HC
+  requantization's t 1.59). Fake-quant probes: router Q8 +0.0025 (8 chunks).
+- Serve battery (same flags as above) against daemon md5
+  `83c2a9625d38fc83565e9d91dc9ee480`: 5/5 `finish=stop`, no
+  runaway/empty/attractor, answers read and correct.
 
 ## What worked — reusable levers
 

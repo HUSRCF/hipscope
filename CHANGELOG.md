@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Qwen4 decode on gfx1151: 19.2 → 30.0 tok/s (1131-token prompt, greedy,
+- Qwen4 decode on gfx1151: 19.2 → 32.3 tok/s (1131-token prompt, greedy,
   `qwen3.8-flash-next.mq6q8-pleq8`). Per-token dispatches drop by fusing the
   small kernels between the streaming GEMVs (HC write + next HC read norm and
   the next write's gate, QSA decode prologue, GDN step + gated norm + output
@@ -13,6 +13,10 @@
   PLE layer, so the token boundary no longer idles the GPU. One change
   (four-wave K split of the decode HC GEMVs) moves numerics and lowers decode
   KLD (32 chunks 0.075160 → 0.074299); every other change is bit-exact.
+  Then 30.0 → 32.3 tok/s: single-token forwards on gfx1151 read the HC read
+  projections as Q8_0 requantized from BF16 at load (+0.67 GB; prefill keeps
+  BF16), decode KLD 0.074299 → 0.075390 over 32 chunks (paired t 1.59, inside
+  the noise band).
   [The checkpoint](docs/perf-checkpoints/2026-09-27-qwen4-decode-autoresearch-gfx1151.md).
 
 - Qwen4 prefill on gfx1151: 185 → 1301 tok/s on a 1131-token prompt
