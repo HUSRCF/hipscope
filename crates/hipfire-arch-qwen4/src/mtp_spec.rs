@@ -518,9 +518,10 @@ enum DraftPairing {
 /// Cost of a batched window that drafts K tokens (index K: K draft steps,
 /// a (K+1)-row verify, rollback), in interleaved-route emitted tokens (one
 /// single-row forward plus one draft step). gfx1151, Qwen3.8-Flash-Next,
-/// measured: interleaved ~33.5 ms/token, K=2 window ~69 ms, K=3 ~79 ms;
-/// deeper windows from the few-row forward's growth (5 rows ~69 ms, 8 ~98).
-const MTP_WINDOW_COST: [f32; 8] = [1.0, 1.8, 2.07, 2.37, 2.7, 2.9, 3.3, 3.8];
+/// measured: interleaved ~33.5 ms/token, K=2 window ~62.5 ms, K=3 ~75.4 ms;
+/// the others from the few-row forward's growth (2 rows ~50 ms, 5 ~69,
+/// 8 ~98) plus ~2.7 ms per draft step.
+const MTP_WINDOW_COST: [f32; 8] = [1.0, 1.7, 1.87, 2.25, 2.55, 2.75, 3.0, 3.6];
 /// Per-window decay of the per-depth agreement counts.
 const MTP_AGREEMENT_DECAY: f32 = 0.875;
 /// Per-depth (accepted, compared) counts a request starts from (0.8).
