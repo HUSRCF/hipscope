@@ -20,7 +20,7 @@ use crate::program::{
     Qwen4LayerDescription, Qwen4LayerScratch, Qwen4MoeBinding, Qwen4PleWeights, Qwen4ProgramDims,
     Qwen4QsaWeights, Qwen4ScratchLayout,
 };
-use crate::projection::{dispatch_embedding, row_stride, ProjectionView};
+use crate::projection::{row_stride, ProjectionView};
 use crate::weights::{
     HyperConnectionReadWeights, HyperConnectionWeights, MoeWeights, Qwen4LayerWeights,
     Qwen4Weights, TensorRef, WeightError,
@@ -36,10 +36,10 @@ use hipfire_dispatch::pipeline::sealed_moe::{
     retained_body_action, specialized_sealed_moe_retained_admission, RetainedBodyAction,
 };
 use hipfire_dispatch::pipeline::{
-    execute_steps, execute_validated_steps, seal_decode, validate_steps, BoundMoeExperts, ClearOp,
-    ExpertBindingCache, ExpertMetadata, ExpertResource, ExpertResources, ExpertTable,
-    GatedDeltaNetOp, GroupedDepthwiseOp, HyperReadOp, HyperWriteOp, IndexedAttentionMode,
-    IndexedAttentionOp, IndexedAttentionState, Step,
+    execute_embedding, execute_steps, execute_validated_steps, seal_decode, validate_steps,
+    BoundMoeExperts, ClearOp, EmbeddingOp, ExpertBindingCache, ExpertMetadata, ExpertResource,
+    ExpertResources, ExpertTable, GatedDeltaNetOp, GroupedDepthwiseOp, HyperReadOp, HyperWriteOp,
+    IndexedAttentionMode, IndexedAttentionOp, IndexedAttentionState, Step,
 };
 use hipfire_dispatch::types::dtype_rotation_plan;
 use hipfire_runtime::external_rows::RowFetch;
@@ -2243,15 +2243,18 @@ impl Qwen4GpuForward {
         let embedding = bundle.weights.resident(&bundle.weights.root.embedding)?;
         let embedding_rot = view(&self.scratch.embedding_rot, 0, n * config.hidden_size);
         let embeddings = view(&self.scratch.embeddings, 0, n * config.hidden_size);
-        dispatch_embedding(
+        execute_embedding(
             gpu,
-            embedding,
-            &embedding_rot,
-            &embeddings,
-            &ids,
-            n,
-            config.hidden_size,
-        )?;
+            &EmbeddingOp {
+                table: embedding,
+                rotated: &embedding_rot,
+                token_ids: &ids,
+                output: &embeddings,
+                rows: n,
+                dim: config.hidden_size,
+            },
+        )
+        .map_err(|e| Qwen4GpuForwardError::Dispatch(format!("Qwen4 embedding: {e:?}")))?;
 
         let next_history = bundle.state.ple_history;
         let next_position = bundle.state.position;

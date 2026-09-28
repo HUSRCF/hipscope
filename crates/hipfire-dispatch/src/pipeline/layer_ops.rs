@@ -2237,6 +2237,77 @@ pub fn execute_clear(gpu: &mut Gpu, op: &ClearOp<'_>) -> Result<(), DispatchErro
     hip(gpu.zero_f32(&span))
 }
 
+/// Embedding-table lookup for `rows` token ids (`token_ids`: `rows` i32 bytes).
+/// MQ4 v2 tables stage rows in `rotated` (`rows * dim` F32) before FWHT decode.
+pub struct EmbeddingOp<'a> {
+    pub table: &'a GpuTensor,
+    pub rotated: &'a GpuTensor,
+    pub token_ids: &'a GpuTensor,
+    pub output: &'a GpuTensor,
+    pub rows: usize,
+    pub dim: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EmbeddingPath {
+    Mq4V2,
+    Bf16,
+    Q8,
+}
+
+fn embedding_path(dtype: DType) -> Option<EmbeddingPath> {
+    match dtype {
+        DType::MQ4G256V2 | DType::MQ4G128V2 => Some(EmbeddingPath::Mq4V2),
+        DType::BF16 => Some(EmbeddingPath::Bf16),
+        DType::Q8_0 => Some(EmbeddingPath::Q8),
+        _ => None,
+    }
+}
+
+fn unsupported_embedding(dtype: DType) -> DispatchError {
+    DispatchError::Hip(format!(
+        "embedding table has unsupported resident dtype {dtype:?}"
+    ))
+}
+
+impl EmbeddingOp<'_> {
+    pub fn validate_for_gpu(&self, _gpu: &Gpu) -> Result<(), DispatchError> {
+        if self.rows == 0 || self.dim == 0 {
+            return Err(DispatchError::Hip("embedding has empty geometry".into()));
+        }
+        let path = embedding_path(self.table.dtype)
+            .ok_or_else(|| unsupported_embedding(self.table.dtype))?;
+        let elements = checked_mul(self.rows, self.dim, "embedding rows")?;
+        require_tensor(self.output, elements, DType::F32, "embedding output")?;
+        if path == EmbeddingPath::Mq4V2 {
+            require_tensor(self.rotated, elements, DType::F32, "embedding rotation")?;
+        }
+        if self.token_ids.buf.size() < checked_mul(self.rows, 4, "embedding token ids")? {
+            return Err(DispatchError::Hip(
+                "embedding token ids hold fewer than rows i32 values".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// BF16 rows are widened directly; packed MQv2 rows use the rotated staging
+/// buffer and FWHT decode; Q8 rows are block-decoded in place.
+pub fn execute_embedding(gpu: &mut Gpu, op: &EmbeddingOp<'_>) -> Result<(), DispatchError> {
+    let path =
+        embedding_path(op.table.dtype).ok_or_else(|| unsupported_embedding(op.table.dtype))?;
+    let (table, output, ids) = (op.table, op.output, op.token_ids);
+    hip(match path {
+        EmbeddingPath::Mq4V2 => {
+            gpu.embedding_lookup_mq4v2_batched(table, op.rotated, output, ids, op.rows, op.dim)
+        }
+        EmbeddingPath::Bf16 => {
+            gpu.embedding_lookup_bf16_batched(table, output, ids, op.rows, op.dim)
+        }
+        EmbeddingPath::Q8 => gpu.embedding_lookup_q8_batched(table, output, ids, op.rows, op.dim),
+    })
+}
+
 /// Final hyper read uses the same operation contract as a regular read; this
 /// helper only supplies the projection-free final output shape.
 pub fn execute_final_hyper(gpu: &mut Gpu, op: &HyperReadOp<'_>) -> Result<(), DispatchError> {
@@ -2444,6 +2515,19 @@ mod tests {
                 row_capture: None,
             }
         }
+    }
+
+    #[test]
+    fn embedding_dispatch_preserves_bf16_and_routed_mqv2_contracts() {
+        assert_eq!(embedding_path(DType::BF16), Some(EmbeddingPath::Bf16));
+        assert_eq!(embedding_path(DType::MQ4G256V2), Some(EmbeddingPath::Mq4V2));
+        assert_eq!(embedding_path(DType::MQ4G128V2), Some(EmbeddingPath::Mq4V2));
+        assert_eq!(embedding_path(DType::Q8_0), Some(EmbeddingPath::Q8));
+    }
+
+    #[test]
+    fn embedding_dispatch_rejects_unadmitted_dtype() {
+        assert!(embedding_path(DType::F32).is_none());
     }
 
     #[test]

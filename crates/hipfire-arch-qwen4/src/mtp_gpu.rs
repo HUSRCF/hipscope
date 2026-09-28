@@ -13,9 +13,9 @@ use crate::config::Qwen4Config;
 use crate::gpu_forward::{
     dense_ref, execute_moe, Qwen4GpuForwardError, Qwen4MoeLayerRuntime, Qwen4MoeScratch,
 };
-use crate::projection::{dispatch_embedding, dispatch_gemv, dispatch_gemv_rows};
+use crate::projection::{dispatch_gemv, dispatch_gemv_rows};
 use crate::weights::{HyperConnectionWeights, Qwen4Weights, TensorRef, WeightError};
-use hipfire_dispatch::pipeline::{execute_hyper_read, HyperReadOp};
+use hipfire_dispatch::pipeline::{execute_embedding, execute_hyper_read, EmbeddingOp, HyperReadOp};
 use hipfire_runtime::spec::SpecGrammar;
 use rdna_compute::tensor_ops::{
     argmax_f32, hyper_norm, hyper_write, indexed_attention_attention,
@@ -134,30 +134,27 @@ fn hc_write(
     Ok(())
 }
 
-/// Embed the pending MTP token from the trunk-owned tied table.
-///
-/// The resident-dtype→lookup decision belongs to
-/// [`crate::projection::dispatch_embedding`] alone.  This module used to carry
-/// its own dtype table, which silently admitted fewer tiers than the trunk did;
-/// sharing one dispatch is what keeps the draft head and the target from
-/// disagreeing about the embedding tier an artifact may use.
+/// Embed the pending MTP token from the trunk-owned tied table through the
+/// trunk's own lookup, so the draft head and the target cannot disagree about
+/// the embedding tier an artifact may use.
 fn embed_token(
     gpu: &mut Gpu,
     weights: &Qwen4Weights,
     config: &Qwen4Config,
     scratch: &MtpGpuScratch,
 ) -> Result<(), MtpGpuError> {
-    let embedding = weights.resident(&weights.root.embedding)?;
-    dispatch_embedding(
+    execute_embedding(
         gpu,
-        embedding,
-        &scratch.embedding_rot,
-        &scratch.token_embedding,
-        &scratch.token_ids,
-        1,
-        config.hidden_size,
+        &EmbeddingOp {
+            table: weights.resident(&weights.root.embedding)?,
+            rotated: &scratch.embedding_rot,
+            token_ids: &scratch.token_ids,
+            output: &scratch.token_embedding,
+            rows: 1,
+            dim: config.hidden_size,
+        },
     )
-    .map_err(MtpGpuError::Hip)
+    .map_err(|error| Qwen4GpuForwardError::Dispatch(error.to_string()).into())
 }
 
 /// Errors from native GPU MTP execution and resource management.

@@ -147,53 +147,6 @@ pub(crate) fn dispatch_gemv_rows(
     hipfire_dispatch::pipeline::project_weight(gpu, &reference, input, output, rows, Some(rotation))
         .map_err(|error| hip_bridge::HipError::new(0, &error.to_string()))
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum EmbeddingPath {
-    Mq4V2,
-    Bf16,
-    Q8,
-}
-
-fn embedding_path(dtype: DType) -> Option<EmbeddingPath> {
-    match dtype {
-        DType::MQ4G256V2 | DType::MQ4G128V2 => Some(EmbeddingPath::Mq4V2),
-        DType::BF16 => Some(EmbeddingPath::Bf16),
-        DType::Q8_0 => Some(EmbeddingPath::Q8),
-        _ => None,
-    }
-}
-
-/// Dispatch one embedding lookup according to the resident table's exact
-/// contract.  BF16 rows are widened directly; packed MQv2 rows use the rotated
-/// staging buffer and FWHT decode; Q8 rows are block-decoded in place.
-pub(crate) fn dispatch_embedding(
-    gpu: &mut Gpu,
-    embedding: &GpuTensor,
-    rotated: &GpuTensor,
-    output: &GpuTensor,
-    token_ids: &GpuTensor,
-    n: usize,
-    dim: usize,
-) -> hip_bridge::HipResult<()> {
-    let path = embedding_path(embedding.dtype).ok_or_else(|| {
-        hip_bridge::HipError::new(
-            0,
-            &format!(
-                "Qwen4 embedding has unsupported resident dtype {:?}",
-                embedding.dtype
-            ),
-        )
-    })?;
-    match path {
-        EmbeddingPath::Mq4V2 => {
-            gpu.embedding_lookup_mq4v2_batched(embedding, rotated, output, token_ids, n, dim)
-        }
-        EmbeddingPath::Bf16 => {
-            gpu.embedding_lookup_bf16_batched(embedding, output, token_ids, n, dim)
-        }
-        EmbeddingPath::Q8 => gpu.embedding_lookup_q8_batched(embedding, output, token_ids, n, dim),
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -214,18 +167,5 @@ mod tests {
         // Q8F16: 34-byte blocks of 32 weights.
         assert_eq!(row_stride(DType::Q8_0, 2560), 80 * 34);
         assert_eq!(row_stride(DType::Q8_0, 6144), 192 * 34);
-    }
-
-    #[test]
-    fn embedding_dispatch_preserves_bf16_and_routed_mqv2_contracts() {
-        assert_eq!(embedding_path(DType::BF16), Some(EmbeddingPath::Bf16));
-        assert_eq!(embedding_path(DType::MQ4G256V2), Some(EmbeddingPath::Mq4V2));
-        assert_eq!(embedding_path(DType::MQ4G128V2), Some(EmbeddingPath::Mq4V2));
-        assert_eq!(embedding_path(DType::Q8_0), Some(EmbeddingPath::Q8));
-    }
-
-    #[test]
-    fn embedding_dispatch_rejects_unadmitted_dtype() {
-        assert!(embedding_path(DType::F32).is_none());
     }
 }
