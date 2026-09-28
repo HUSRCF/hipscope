@@ -456,8 +456,14 @@ extern "C" __global__ void topk8_rescore_q8_0_k2560(
     if (threadIdx.x == 0) {
         float bv = exact[0];
         int bi = cand[0];
+        int bw = 0;
         for (int w = 1; w < 8; ++w)
-            if (q8_topk_better(exact[w], cand[w], bv, bi)) { bv = exact[w]; bi = cand[w]; }
+            if (q8_topk_better(exact[w], cand[w], bv, bi)) { bv = exact[w]; bi = cand[w]; bw = w; }
+        // out[1]: the winner's exact margin over the best other candidate.
+        float second = -INFINITY;
+        for (int w = 0; w < 8; ++w)
+            if (w != bw) second = fmaxf(second, exact[w]);
         out[0] = bi;
+        out[1] = __float_as_int(bv - second);
     }
 }

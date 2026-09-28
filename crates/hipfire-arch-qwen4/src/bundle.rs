@@ -570,6 +570,11 @@ impl Qwen4Bundle {
         })
     }
 
+    /// Exact logit margin of the last MTP draft over its runner-up.
+    pub(crate) fn mtp_draft_margin(&self) -> f32 {
+        self.mtp.as_ref().map_or(f32::INFINITY, |mtp| mtp.draft_margin)
+    }
+
     pub(crate) fn mtp_advance_token(
         &mut self,
         gpu: &mut Gpu,

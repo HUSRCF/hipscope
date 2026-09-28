@@ -528,6 +528,25 @@ const MTP_AGREEMENT_DECAY: f32 = 0.875;
 const MTP_AGREEMENT_PRIOR: (f32, f32) = (1.6, 2.0);
 /// Draft depths tracked (the drafter's K is clamped to this).
 const MTP_MAX_DEPTH: usize = 10;
+/// Smallest probability that a verify row's whole draft prefix is accepted
+/// for the row (plus its draft step) to pay: ~6 ms of a ~47 ms window
+/// emitting ~2-3.5 tokens.
+const MTP_ROW_WORTH: f32 = 0.2;
+/// Best per-draft acceptance [`draft_accept_estimate`] gives.
+const DRAFT_ACCEPT_MAX: f32 = 0.98;
+
+/// Acceptance of a draft whose exact logit leads its runner-up (among the
+/// re-scored candidates) by `margin`; measured on the committed sweep prompts
+/// (gfx1151, Qwen3.8-Flash-Next, all depths pooled).
+fn draft_accept_estimate(margin: f32) -> f32 {
+    match margin {
+        m if m < 0.25 => 0.3,
+        m if m < 1.5 => 0.5,
+        m if m < 3.0 => 0.7,
+        m if m < 6.0 => 0.82,
+        _ => DRAFT_ACCEPT_MAX,
+    }
+}
 
 /// Native GPU MTP drafter.  The MTP operator/state stay model-owned by the
 /// target bundle; this adapter owns only the reusable verifier scratch and one
@@ -941,7 +960,9 @@ impl MtpDrafter for Qwen4MtpDrafter {
             self.observe_agreement(&window);
             return Ok(window);
         }
-        let k = depth;
+        // History picks the route and the most drafts; the drafts' own
+        // margins stop early.
+        let k_max = depth;
         {
             let bundle = Self::bundle(target)?;
             let target_position = bundle.state.position;
@@ -966,16 +987,21 @@ impl MtpDrafter for Qwen4MtpDrafter {
         let window_start = Instant::now();
         let result = (|| -> Result<MtpWindow, String> {
             timers.mark(gpu, "draft");
-            let mut drafts = Vec::with_capacity(k);
+            let mut drafts = Vec::with_capacity(k_max);
+            let mut margins: Vec<f32> = Vec::with_capacity(k_max);
             let mut input = seed;
             // The verify's PLE rows are SSD-resident: start reading each
             // token's rows as soon as it is known, while the drafts run.
-            let mut known = Vec::with_capacity(k + 1);
+            let mut known = Vec::with_capacity(k_max + 1);
             known.push(seed);
             Self::bundle(target)?.warm_ple_rows(&known);
+            // Probability the whole draft prefix is accepted, from each
+            // draft's exact logit margin over its runner-up.
+            let mut prefix = 1.0f32;
+            let mut steps = 0usize;
             // Every proposal starts with a fresh QSA selection; only later
             // draft rows within this window reuse it.
-            for index in 0..k {
+            for index in 0..k_max {
                 let hidden = if index == 0 {
                     Some(self.pending_hidden()?)
                 } else {
@@ -987,12 +1013,25 @@ impl MtpDrafter for Qwen4MtpDrafter {
                 input = Self::bundle(target)?
                     .mtp_forward_token(gpu, input, hidden, token_position, index == 0)
                     .map_err(|error| error.to_string())?;
+                steps += 1;
+                let margin = Self::bundle(target)?.mtp_draft_margin();
+                prefix *= draft_accept_estimate(margin);
+                // A verify row pays only while its whole prefix is likely
+                // accepted; the first draft always rides.
+                if index > 0 && prefix < MTP_ROW_WORTH {
+                    break;
+                }
+                margins.push(margin);
                 drafts.push(input);
-                if index + 1 < k {
+                if prefix * DRAFT_ACCEPT_MAX < MTP_ROW_WORTH {
+                    break;
+                }
+                if index + 1 < k_max {
                     known.push(input);
                     Self::bundle(target)?.warm_ple_rows(&known);
                 }
             }
+            let k = drafts.len();
             let mut block = Vec::with_capacity(k + 1);
             block.push(seed);
             block.extend_from_slice(&drafts);
@@ -1015,9 +1054,10 @@ impl MtpDrafter for Qwen4MtpDrafter {
                 let rows = drafts
                     .iter()
                     .zip(target_picks.iter())
-                    .map(|(draft, pick)| {
+                    .zip(margins.iter())
+                    .map(|((draft, pick), margin)| {
                         format!(
-                            "{{\"draft\":{draft},\"pick\":{pick},\"match\":{}}}",
+                            "{{\"draft\":{draft},\"pick\":{pick},\"match\":{},\"margin\":{margin:.4}}}",
                             draft == pick
                         )
                     })
@@ -1066,7 +1106,10 @@ impl MtpDrafter for Qwen4MtpDrafter {
                 .as_ref()
                 .copied()
                 .expect("MTP snapshot remains active until transaction commit");
-            if full_accept && k > 0 {
+            if full_accept && steps > k {
+                // The step that drafted the dropped token already consumed
+                // the last kept draft at its position.
+            } else if full_accept && k > 0 {
                 let last_draft = *drafts
                     .last()
                     .ok_or_else(|| "Qwen4 native MTP full accept has no final draft".to_string())?;
