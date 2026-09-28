@@ -7253,7 +7253,11 @@ pub(crate) fn batch_chunk_delta_net_attn(
 
         let q_bytes = checked_bytes(n, 16 * 128, 2)?;
         let v_bytes = checked_bytes(n, 48 * 128, 2)?;
-        let a_rows = (segment_rows + 63) / 64 * 64;
+        // Batched KKT: one solve per layer writes every segment's A blocks at
+        // their layer row, so A spans all rows; segments must sit on C64 chunks.
+        let kkt_batched =
+            gpu.gdn_kkt_batched_enabled() && segment_rows % 64 == 0 && n > segment_rows;
+        let a_rows = (if kkt_batched { n } else { segment_rows } + 63) / 64 * 64;
         let a_bytes = checked_bytes(a_rows, 48 * 64, 2)?;
         let q = raw_view(&pbs.dn_q_batch, q_bytes, "q")?;
         let k = raw_view(&pbs.dn_k_batch, q_bytes, "k")?;
@@ -7307,14 +7311,14 @@ pub(crate) fn batch_chunk_delta_net_attn(
         if gpu.gdn_prep_fused_enabled() {
             gpu.gdn_chunk_prep_fixup_prepare()?;
         }
-        Some((q, k, v, a, segment_rows, scan_out))
+        Some((q, k, v, a, segment_rows, scan_out, kkt_batched))
     } else {
         None
     };
 
     let q_scale = 1.0 / (hd as f32).sqrt();
     let gdn_targets = match &gdn_chunk_scan_views {
-        Some((q, k, v, _, _, _)) if gpu.gdn_prep_fused_enabled() => Some(rdna_compute::F2GdnTargets {
+        Some((q, k, v, _, _, _, _)) if gpu.gdn_prep_fused_enabled() => Some(rdna_compute::F2GdnTargets {
             conv_weight: &layer.conv_weight,
             conv_state: &dn_state.conv_states[delta_layer_idx],
             q,
@@ -7329,7 +7333,7 @@ pub(crate) fn batch_chunk_delta_net_attn(
         gpu, layer, config, pbs, n, dim, q8_wmma_arch, fusion, gdn_targets.as_ref(),
     )?;
 
-    if let Some((q, k, v, a, segment_rows, scan_out)) = gdn_chunk_scan_views {
+    if let Some((q, k, v, a, segment_rows, scan_out, kkt_batched)) = gdn_chunk_scan_views {
         // The fused QKVZA already wrote q/k/v except the tile heads; the
         // completion pass finishes them, the gates and the conv ring.
         let prep = if prep_fused { Gpu::gdn_chunk_prep_fixup } else { Gpu::gdn_chunk_prep };
@@ -7352,13 +7356,22 @@ pub(crate) fn batch_chunk_delta_net_attn(
         let ef = dn_state
             .ef_residual(delta_layer_idx)
             .expect("GDN chunk scan admission prevalidated EF state");
+        if kkt_batched {
+            gpu.gdn_chunk_kkt_solve_batched(&k, &pbs.dn_alpha_batch, &pbs.dn_beta_batch, &a, n)?;
+        }
         for row0 in (0..n).step_by(segment_rows) {
             let rows = (n - row0).min(segment_rows);
+            // Batched: this segment's A blocks start at its layer row.
+            let a_seg = if kkt_batched {
+                a.sub_offset(row0 * 48 * 64 * 2, rows.div_ceil(64) * 64 * 48 * 64 * 2)
+            } else {
+                a.shallow_clone()
+            };
             gpu.gdn_chunk_scan_segment(
                 &q,
                 &k,
                 &v,
-                &a,
+                &a_seg,
                 &pbs.dn_alpha_batch,
                 &pbs.dn_beta_batch,
                 &dn_state.s_matrices[delta_layer_idx],
@@ -7368,6 +7381,7 @@ pub(crate) fn batch_chunk_delta_net_attn(
                 scan_out,
                 row0,
                 rows,
+                !kkt_batched,
             )?;
         }
         batch_chunk_delta_net_output_projection(

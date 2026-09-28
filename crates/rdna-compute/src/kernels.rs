@@ -7561,6 +7561,16 @@ pub const GDN_CHUNK_PREP_GFX11_SRC: &str =
 #[cfg(feature = "deltanet")]
 pub const GDN_CHUNK_KKT_SOLVE_SRC: &str =
     include_str!("../../../kernels/src/gdn_chunk_scan_kkt_solve.gfx1201.hip");
+/// One-launch-per-layer twin of [`GDN_CHUNK_KKT_SOLVE_SRC`]
+/// (`gdn_chunk_kkt_solve_batched`, gfx1201): row0 = 0 and T = every row of the
+/// chunk, so all commit segments' A blocks are solved before the first scan.
+/// Same chunks and arithmetic; the 512-row segment cap is lifted and the grid
+/// is [16 key heads, chunks] (head fastest).
+#[cfg(feature = "deltanet")]
+pub const GDN_CHUNK_KKT_SOLVE_BATCHED_SRC: &str = concat!(
+    "#define GDN_KKT_BATCHED 1\n",
+    include_str!("../../../kernels/src/gdn_chunk_scan_kkt_solve.gfx1201.hip")
+);
 
 /// gfx1100 KKT solve: one value head per workgroup, 48-way parallel.
 #[cfg(feature = "deltanet")]

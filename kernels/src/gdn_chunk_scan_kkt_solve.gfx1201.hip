@@ -124,17 +124,36 @@ struct __attribute__((aligned(16))) GkLds {
 #endif
 };
 
+// GDN_KKT_BATCHED (`gdn_chunk_kkt_solve_batched`): one launch per layer for
+// every commit segment (row0 = 0, T = all rows) instead of one per <= 512-row
+// segment.  The segment cap is lifted and the grid is [16, ceil(T/64)] (key
+// head fastest): the 16 head workgroups of a chunk share its k/G/beta rows and
+// A rows, as in the per-segment launches; chunk-fastest over a whole layer was
+// 46% slower.  With segments on 64-row boundaries the C64 chunks, their reads
+// and every A value are the per-segment launches'; chunk c's A lands at row
+// 64c of the layer workspace.
+#ifdef GDN_KKT_BATCHED
+#define GDN_KKT_SOLVE_KERNEL gdn_chunk_kkt_solve_batched
+#else
+#define GDN_KKT_SOLVE_KERNEL gdn_chunk_kkt_solve
+#endif
 extern "C" __launch_bounds__(128)
-__global__ void gdn_chunk_kkt_solve(
+__global__ void GDN_KKT_SOLVE_KERNEL(
     const unsigned short* __restrict__ k,
     const float* __restrict__ G,
     const float* __restrict__ beta,
     unsigned short* __restrict__ A,
     int row0,
     int T) {
+#ifdef GDN_KKT_BATCHED
+    if (T <= 0) return;
+    const int chunk = (int)blockIdx.y;
+    const int kh = (int)blockIdx.x;
+#else
     if (T <= 0 || T > 512) return;
     const int chunk = (int)blockIdx.x;
     const int kh = (int)blockIdx.y;
+#endif
     if (kh >= 16 || chunk*GK_C >= T) return;
     const int tid=(int)threadIdx.x, wave=tid>>5, lane=tid&31;
     const int local0=chunk*GK_C;

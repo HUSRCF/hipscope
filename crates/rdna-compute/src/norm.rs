@@ -4821,6 +4821,15 @@ impl Gpu {
             && hipfire_config::developer_var("HIPFIRE_GDN_KKT_GFX1100").as_deref() != Ok("0")
     }
 
+    /// One KKT launch per layer ([`Self::gdn_chunk_kkt_solve_batched`]) instead
+    /// of one per commit segment (gfx1201, default on;
+    /// `HIPFIRE_GDN_KKT_BATCHED=0` keeps the per-segment launches). The caller
+    /// also requires 64-row-aligned segments and more than one of them.
+    #[cfg(feature = "deltanet")]
+    pub fn gdn_kkt_batched_enabled(&self) -> bool {
+        self.arch == "gfx1201" && hipfire_config::developer_bool("HIPFIRE_GDN_KKT_BATCHED", true)
+    }
+
     /// Resolve the gfx1100/gfx1151/gfx1201 chunk scan modules before any
     /// admitted route mutates its input scratch or persistent convolution state.
     /// `out` selects the scan variant [`Self::gdn_chunk_scan_segment`] will run.
@@ -4839,6 +4848,13 @@ impl Gpu {
                 kernels::GDN_CHUNK_KKT_SOLVE_SRC,
                 "gdn_chunk_kkt_solve",
             )?;
+            if self.gdn_kkt_batched_enabled() {
+                self.ensure_kernel(
+                    "gdn_chunk_kkt_solve_batched",
+                    kernels::GDN_CHUNK_KKT_SOLVE_BATCHED_SRC,
+                    "gdn_chunk_kkt_solve_batched",
+                )?;
+            }
         }
         let (scan_module, scan_source) = self.gdn_chunk_scan_module(out)?;
         self.ensure_kernel(scan_module, scan_source, scan_module)
@@ -5046,10 +5062,56 @@ impl Gpu {
         })
     }
 
+    /// [`Self::gdn_chunk_scan_segment`]'s KKT solve for every row of the layer
+    /// chunk in one launch (`gdn_chunk_kkt_solve_batched`, row0 = 0, T =
+    /// `n_tokens`, grid [16 key heads, chunks]): chunk c's A block lands at
+    /// row 64c of `a`, so the segment at `row0` (a multiple of 64) reads it
+    /// from `a` offset by `row0` rows. Gated by
+    /// [`Self::gdn_kkt_batched_enabled`]; each segment then runs with `kkt = false`.
+    #[cfg(feature = "deltanet")]
+    pub fn gdn_chunk_kkt_solve_batched(
+        &mut self,
+        k: &GpuTensor,
+        g: &GpuTensor,
+        beta: &GpuTensor,
+        a: &GpuTensor,
+        n_tokens: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        const SYMBOL: &str = "gdn_chunk_kkt_solve_batched";
+        self.ensure_kernel(SYMBOL, kernels::GDN_CHUNK_KKT_SOLVE_BATCHED_SRC, SYMBOL)?;
+        let kp = k.buf.as_ptr();
+        let gp = g.buf.as_ptr();
+        let bp = beta.buf.as_ptr();
+        let ap = a.buf.as_ptr();
+        let r0 = 0i32;
+        let nt = n_tokens as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &kp as *const _ as *mut c_void,
+            &gp as *const _ as *mut c_void,
+            &bp as *const _ as *mut c_void,
+            &ap as *const _ as *mut c_void,
+            &r0 as *const _ as *mut c_void,
+            &nt as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(SYMBOL, [16, n_tokens.div_ceil(64) as u32, 1], [128, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(kp);
+            b.push_ptr(gp);
+            b.push_ptr(bp);
+            b.push_ptr(ap);
+            b.push_i32(r0);
+            b.push_i32(nt);
+            b
+        })
+    }
+
     /// GDN KKT solve and fused scan for one legacy segment.
     /// All parent arrays remain unsliced; `row0` selects the segment and state
     /// stays the single unsliced persistent owner. `out` is `[T][48][128]` in
-    /// `out_fmt` elements (4 or 2 bytes).
+    /// `out_fmt` elements (4 or 2 bytes). `kkt = false` skips the KKT launch
+    /// when [`Self::gdn_chunk_kkt_solve_batched`] already wrote this segment's
+    /// A blocks and `a` points at the segment's first row.
     #[cfg(feature = "deltanet")]
     #[allow(clippy::too_many_arguments)]
     pub fn gdn_chunk_scan_segment(
@@ -5067,6 +5129,7 @@ impl Gpu {
         out_fmt: GdnScanOut,
         row0: usize,
         n_tokens: usize,
+        kkt: bool,
     ) -> HipResult<()> {
         self.bind_thread()?;
         let (kkt_module, kkt_source, kkt_symbol, kkt_rows, kkt_heads, kkt_block) =
@@ -5089,7 +5152,9 @@ impl Gpu {
                     128,
                 )
             };
-        self.ensure_kernel(kkt_module, kkt_source, kkt_symbol)?;
+        if kkt {
+            self.ensure_kernel(kkt_module, kkt_source, kkt_symbol)?;
+        }
         let (scan_module, scan_source) = self.gdn_chunk_scan_module(out_fmt)?;
         self.ensure_kernel(scan_module, scan_source, scan_module)?;
 
@@ -5099,31 +5164,33 @@ impl Gpu {
         let ap = a.buf.as_ptr();
         let r0 = row0 as i32;
         let nt = n_tokens as i32;
-        let mut kkt_params: Vec<*mut c_void> = vec![
-            &kp as *const _ as *mut c_void,
-            &gp as *const _ as *mut c_void,
-            &bp as *const _ as *mut c_void,
-            &ap as *const _ as *mut c_void,
-            &r0 as *const _ as *mut c_void,
-            &nt as *const _ as *mut c_void,
-        ];
-        self.launch_maybe_blob(
-            kkt_symbol,
-            [((n_tokens + kkt_rows - 1) / kkt_rows) as u32, kkt_heads, 1],
-            [kkt_block, 1, 1],
-            0,
-            &mut kkt_params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(kp);
-                b.push_ptr(gp);
-                b.push_ptr(bp);
-                b.push_ptr(ap);
-                b.push_i32(r0);
-                b.push_i32(nt);
-                b
-            },
-        )?;
+        if kkt {
+            let mut kkt_params: Vec<*mut c_void> = vec![
+                &kp as *const _ as *mut c_void,
+                &gp as *const _ as *mut c_void,
+                &bp as *const _ as *mut c_void,
+                &ap as *const _ as *mut c_void,
+                &r0 as *const _ as *mut c_void,
+                &nt as *const _ as *mut c_void,
+            ];
+            self.launch_maybe_blob(
+                kkt_symbol,
+                [((n_tokens + kkt_rows - 1) / kkt_rows) as u32, kkt_heads, 1],
+                [kkt_block, 1, 1],
+                0,
+                &mut kkt_params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(kp);
+                    b.push_ptr(gp);
+                    b.push_ptr(bp);
+                    b.push_ptr(ap);
+                    b.push_i32(r0);
+                    b.push_i32(nt);
+                    b
+                },
+            )?;
+        }
 
         // Preserve the incumbent deterministic frame cadence even though the
         // required EF path does not consume the stochastic seed.

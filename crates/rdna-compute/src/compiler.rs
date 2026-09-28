@@ -584,6 +584,7 @@ impl KernelCompiler {
                 "gdn_chunk_prep"
                     | "gdn_chunk_prep_fixup"
                     | "gdn_chunk_kkt_solve"
+                    | "gdn_chunk_kkt_solve_batched"
                     | "gdn_chunk_scan"
                     | "gdn_chunk_scan_emu_bf16"
                     | "gdn_chunk_scan_emu_f16"
