@@ -44,7 +44,7 @@
   interleaved).
   The exact top-8 re-score needs a Q8_0 head: on `qwen3.8-flash-next.mq4`
   (MQ6G256V2 head) drafts come from the plain MQ2 copy, and greedy MTP is
-  0.97-1.9x AR over the committed sweep prompts versus 1.5-2.2x on the
+  1.1-2.1x AR over the committed sweep prompts versus 1.5-2.2x on the
   Q8-head fixture (tokens still equal to AR's).
   [The checkpoint](docs/perf-checkpoints/2026-09-28-qwen4-mtp-decode-autoresearch-gfx1151.md)
   and amendments [1](docs/perf-checkpoints/2026-09-28-qwen4-mtp-decode-autoresearch-gfx1151-amendment-1.md),
