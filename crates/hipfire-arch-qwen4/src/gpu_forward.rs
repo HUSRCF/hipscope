@@ -256,7 +256,7 @@ fn weight_dims(reference: &TensorRef) -> Result<(usize, usize), Qwen4GpuForwardE
     }
     Ok((reference.shape[0], reference.shape[1]))
 }
-fn dense_ref<'a>(
+pub(crate) fn dense_ref<'a>(
     weights: &'a Qwen4Weights,
     reference: &TensorRef,
 ) -> Result<WeightRef<'a>, Qwen4GpuForwardError> {

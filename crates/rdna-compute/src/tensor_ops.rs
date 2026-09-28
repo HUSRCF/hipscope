@@ -384,7 +384,7 @@ pub fn gated_delta_rollback_layers(
     if p.keep == 0
         || p.keep > p.rows
         || p.key_heads == 0
-        || p.value_heads % p.key_heads != 0
+        || !p.value_heads.is_multiple_of(p.key_heads)
         || p.qkv_width != 2 * 128 * p.key_heads + value
         || p.table.buf.size() < 16 * p.layers
         || p.discard.numel() < checked_product(p.keep, value, "GDN rollback output")?
@@ -2848,7 +2848,7 @@ pub fn copy_regions(gpu: &mut Gpu, regions: &[CopyRegion<'_>]) -> HipResult<()> 
         let dst = region.dst.as_ptr() as u64 + region.dst_offset as u64;
         let src = region.src.as_ptr() as u64 + region.src_offset as u64;
         let words = region.bytes / 4;
-        if (dst | src | region.bytes as u64) % 4 != 0 || words > u32::MAX as usize {
+        if !(dst | src | region.bytes as u64).is_multiple_of(4) || words > u32::MAX as usize {
             gpu.memcpy_dtod_at_auto(
                 region.dst,
                 region.dst_offset,

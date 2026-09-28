@@ -530,7 +530,7 @@ pub(crate) fn unscatter(
 /// Whether path 2's F32 unscatter also applies the down's 128-wide rotation
 /// (in the same launch), leaving [`activation`] nothing to do.
 fn unscatter_rotates(gpu: &Gpu, p: &MoePrefillParams<'_>) -> bool {
-    !gateup_bf16(gpu, p) && !down_wmma(gpu, p) && p.mi % 128 == 0
+    !gateup_bf16(gpu, p) && !down_wmma(gpu, p) && p.mi.is_multiple_of(128)
 }
 
 /// Whether path 2's fused unscatter launch also runs the BF16 shared expert

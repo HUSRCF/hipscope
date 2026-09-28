@@ -11,18 +11,18 @@
 
 use crate::config::Qwen4Config;
 use crate::gpu_forward::{
-    execute_moe, Qwen4GpuForwardError, Qwen4MoeLayerRuntime, Qwen4MoeScratch,
+    dense_ref, execute_moe, Qwen4GpuForwardError, Qwen4MoeLayerRuntime, Qwen4MoeScratch,
 };
 use crate::projection::{dispatch_embedding, dispatch_gemv, dispatch_gemv_rows};
 use crate::weights::{HyperConnectionWeights, Qwen4Weights, TensorRef, WeightError};
+use hipfire_dispatch::pipeline::{execute_hyper_read, HyperReadOp};
 use hipfire_runtime::spec::SpecGrammar;
 use rdna_compute::tensor_ops::{
-    argmax_f32, hc_activation_fused_f32, hyper_norm, hyper_read_projected, hyper_write,
-    indexed_attention_attention, indexed_attention_decode_prologue, indexed_attention_pool_rope,
-    indexed_attention_reuse_selection, indexed_attention_select, ArgmaxF32, HcActivationFused,
-    HyperNorm, HyperReadProjected, HyperWrite, IndexedAttentionAttention,
-    IndexedAttentionDecodePrologue, IndexedAttentionPoolRope, IndexedAttentionReuseSelection,
-    IndexedAttentionSelect,
+    argmax_f32, hyper_norm, hyper_write, indexed_attention_attention,
+    indexed_attention_decode_prologue, indexed_attention_pool_rope,
+    indexed_attention_reuse_selection, indexed_attention_select, ArgmaxF32, HyperNorm, HyperWrite,
+    IndexedAttentionAttention, IndexedAttentionDecodePrologue, IndexedAttentionPoolRope,
+    IndexedAttentionReuseSelection, IndexedAttentionSelect,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::fmt;
@@ -49,6 +49,8 @@ fn f32_view(tensor: &GpuTensor, offset: usize, len: usize) -> GpuTensor {
     view(tensor, offset, len)
 }
 
+/// The MTP head's HC read: the trunk's shared hyper-read op on one row.
+#[allow(clippy::too_many_arguments)]
 fn hc_read(
     gpu: &mut Gpu,
     config: &Qwen4Config,
@@ -57,58 +59,29 @@ fn hc_read(
     down_ref: &TensorRef,
     up_ref: &TensorRef,
     input: &GpuTensor,
-    normalized: &GpuTensor,
-    low: &GpuTensor,
-    up: &GpuTensor,
-    mixed: &GpuTensor,
-    rotation: &GpuTensor,
+    scratch: &MtpGpuScratch,
 ) -> Result<(), MtpGpuError> {
-    let norm = weights.resident(norm_ref)?;
-    let down = weights.resident(down_ref)?;
-    let up_weight = weights.resident(up_ref)?;
-    hyper_norm(
+    execute_hyper_read(
         gpu,
-        &HyperNorm {
-            input,
-            norm_weight: norm,
-            normalized,
-            branches: config.hc_count,
-            hidden: config.hidden_size,
+        &HyperReadOp {
             state_bf16: false,
-        },
-    )?;
-    let (low_rank, wide) = (config.hc_lowrank, config.hc_count * config.hidden_size);
-    let scale = 1.0 / config.hc_count as f32;
-    if down.dtype == DType::BF16 {
-        // Four waves per row (320 one-wave rows starve the GPU) with the
-        // activation in the epilogue. Drafts only: not bitwise the one-wave sum.
-        gpu.gemv_bf16_xf32_k4(down, normalized, low, low_rank, wide, Some(scale))?;
-    } else {
-        dispatch_gemv(gpu, down, normalized, rotation, low, low_rank, wide)?;
-        hc_activation_fused_f32(
-            gpu,
-            &HcActivationFused {
-                values: low,
-                scale,
-                bf16_out: None,
-            },
-        )?;
-    }
-    dispatch_gemv(gpu, up_weight, low, rotation, up, wide, low_rank)?;
-    let projected_up = f32_view(up, 0, wide);
-    hyper_read_projected(
-        gpu,
-        &HyperReadProjected {
             input,
-            norm_weight: norm,
-            up: &projected_up,
-            normalized,
-            mixed,
+            norm_weight: weights.resident(norm_ref)?,
+            input_mix_down: dense_ref(weights, down_ref)?,
+            input_mix_up: dense_ref(weights, up_ref)?,
+            normalized: &scratch.hc_normalized,
+            low: &scratch.hc_low,
+            up: &scratch.hc_up,
+            mixed: &scratch.hc_mixed,
+            bf16_scratch: &scratch.hc_bf16,
+            rows: 1,
             branches: config.hc_count,
             hidden: config.hidden_size,
+            low_rank: config.hc_lowrank,
+            rotation: &scratch.rotation,
         },
-    )?;
-    Ok(())
+    )
+    .map_err(|error| Qwen4GpuForwardError::Dispatch(error.to_string()).into())
 }
 
 fn hc_write(
@@ -246,6 +219,8 @@ pub struct MtpGpuScratch {
     hc_up: GpuTensor,
     hc_mixed: GpuTensor,
     hc_gates: GpuTensor,
+    /// BF16 round-trip scratch of the shared HC read (non-gfx11 route).
+    hc_bf16: GpuTensor,
     rotation: GpuTensor,
     index: GpuTensor,
     q_and_gate: GpuTensor,
@@ -312,6 +287,7 @@ impl MtpGpuScratch {
             alloc(&[hc_up], DType::F32)?;
             alloc(&[hidden], DType::F32)?;
             alloc(&[config.hc_count], DType::F32)?;
+            alloc(&[hidden.max(config.hc_lowrank)], DType::BF16)?;
             alloc(&[max_rotation], DType::F32)?;
             alloc(&[index_width], DType::F32)?;
             alloc(&[2 * q_width], DType::F32)?;
@@ -370,6 +346,7 @@ impl MtpGpuScratch {
             hc_up: next(),
             hc_mixed: next(),
             hc_gates: next(),
+            hc_bf16: next(),
             rotation: next(),
             index: next(),
             q_and_gate: next(),
@@ -412,6 +389,7 @@ impl MtpGpuScratch {
             self.hc_up,
             self.hc_mixed,
             self.hc_gates,
+            self.hc_bf16,
             self.rotation,
             self.index,
             self.q_and_gate,
@@ -1456,11 +1434,7 @@ impl Qwen4MtpGpu {
             &weights.mtp.attn_hyper.input_mix_down,
             &weights.mtp.attn_hyper.input_mix_up,
             &scratch.wide,
-            &scratch.hc_normalized,
-            &scratch.hc_low,
-            &scratch.hc_up,
-            &scratch.hc_mixed,
-            &scratch.rotation,
+            scratch,
         )?;
         let qsa = &weights.mtp.attention;
         let index_dim = config.indexer_head_dim;
@@ -1663,11 +1637,7 @@ impl Qwen4MtpGpu {
             &weights.mtp.mlp_hyper.input_mix_down,
             &weights.mtp.mlp_hyper.input_mix_up,
             &scratch.wide,
-            &scratch.hc_normalized,
-            &scratch.hc_low,
-            &scratch.hc_up,
-            &scratch.hc_mixed,
-            &scratch.rotation,
+            scratch,
         )?;
         execute_moe(
             gpu,
@@ -1715,11 +1685,7 @@ impl Qwen4MtpGpu {
                 &weights.mtp.final_hyper.input_mix_down,
                 &weights.mtp.final_hyper.input_mix_up,
                 &scratch.wide,
-                &scratch.hc_normalized,
-                &scratch.hc_low,
-                &scratch.hc_up,
-                &scratch.hc_mixed,
-                &scratch.rotation,
+                scratch,
             )?;
             let lm_head = match self.draft_head.as_ref() {
                 Some(head) => head,

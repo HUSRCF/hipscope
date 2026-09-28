@@ -836,11 +836,12 @@ impl Qwen4MtpDrafter {
         let mut best = (0, 1.0f32);
         let mut prefix = 1.0f32;
         let mut expected = 1.0f32;
-        for depth in 1..=k.min(MTP_WINDOW_COST.len() - 1) {
-            let (accepted, total) = self.agreement[depth - 1];
+        let depths = self.agreement.iter().zip(&MTP_WINDOW_COST[1..]).take(k);
+        for (i, (&(accepted, total), &cost)) in depths.enumerate() {
+            let depth = i + 1;
             prefix *= accepted / total.max(f32::MIN_POSITIVE);
             expected += prefix;
-            let rate = expected / MTP_WINDOW_COST[depth];
+            let rate = expected / cost;
             if rate > best.1 {
                 best = (depth, rate);
             }

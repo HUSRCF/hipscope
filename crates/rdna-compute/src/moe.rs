@@ -2319,7 +2319,7 @@ impl Gpu {
         bf16_round_trip: bool,
         shared: Option<&SharedExpertActivation<'_>>,
     ) -> HipResult<()> {
-        if mi % 128 != 0 {
+        if !mi.is_multiple_of(128) {
             return Err(hip_bridge::HipError::new(
                 0,
                 "fused unscatter/rotate needs mi % 128 == 0",
