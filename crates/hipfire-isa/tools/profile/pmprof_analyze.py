@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """DIAGNOSTIC: turn `peacemaker profile` records into phase statistics.
 
-    pmprof_analyze.py <profiled.map.json> <run_dir> <f2|attn|iu4|v2c|v2cx> [out_dir]
+    pmprof_analyze.py <profiled.map.json> <run_dir> <f2|attn|iu4|v2c|v2cx|v2b> [out_dir]
 
 Reads run_dir/{trace.bin (or trace.bin.zst),meta.json} written by pmprof. Writes out_dir
 (default run_dir) summary.json, summary.md, waves.csv (one row per wave:
@@ -102,17 +102,43 @@ PHASES["v2cx"] = {
     ("fold#2", "epilogue"): "last epoch: fold pass 1",
     ("epilogue", "exit"): "epilogue",
 }
-PERIOD = {"f2": "kblock", "attn": "tile", "iu4": "slab", "v2c": "epoch", "v2cx": "epoch"}
+# gfx1151 builder V2B (points `v2b_*.points.json`): "epoch" is pass 0's first
+# fragment load; SET/SiLU issue the next epoch's head after the barrier, the
+# ADD at its own epoch start.
+PHASES["v2b"] = {
+    ("epoch", "fold#1"): "pass 0: 32 WMMA + fragment LDS loads",
+    ("fold#1", "pass#1"): "fold 0 (VMEM wait, cvt, 8 DPP, 48 VOPD)",
+    ("pass#1", "fold#2"): "pass 1: 32 WMMA + fragment LDS loads",
+    ("fold#2", "pass#2"): "fold 1 (cvt, 8 DPP, 48 VOPD)",
+    ("pass#2", "fold#3"): "pass 2: 32 WMMA + fragment LDS loads",
+    ("fold#3", "stage"): "fold 2 (8 DPP, 48 VOPD)",
+    ("stage", "stage.done"): "stage: VMEM waits, 8 xor, 8 DS stores",
+    ("stage.done", "pass#3"): "stage to pass 3",
+    ("fold#3", "pass#3"): "fold 2 (8 DPP, 48 VOPD), no staging",
+    ("pass#3", "bar.pre_signal"): "pass 3: 32 WMMA + fragment LDS loads",
+    ("pass#3", "fold#4"): "last pass 3: 32 WMMA",
+    ("bar.pre_signal", "bar.post_wait"): "s_barrier wait",
+    ("bar.post_wait", "head"): "next-slot step-0 LDS issue",
+    ("head", "fold#4"): "head: metadata + staging VMEM issue, SALU addressing",
+    ("bar.post_wait", "fold#4"): "next-slot step-0 LDS issue",
+    ("fold#4", "epoch"): "fold 3 (8 DPP, 48 VOPD)",
+    ("fold#4", "head"): "fold 3 (8 DPP, 48 VOPD)",
+    ("head", "epoch"): "head: metadata + staging (+ touch) VMEM issue, SALU addressing",
+    ("fold#4", "epilogue"): "last fold 3",
+    ("epilogue", "exit"): "epilogue: stores (ADD: residual loads + adds; SiLU: SiLU math)",
+}
+PERIOD = {"f2": "kblock", "attn": "tile", "iu4": "slab", "v2c": "epoch", "v2cx": "epoch", "v2b": "epoch"}
 # Load issue -> first use: F2 weights/fragments are issued after block start;
 # iu4 VMEM is issued at slab start and its first drain follows 16 WMMAs.
 ISSUE_USE = {"f2": ("kblock", "w0.post"), "attn": ("fill.done", "bar.pre_signal"),
-             "iu4": ("slab", "vmem.post"), "v2c": ("epoch", "stage"), "v2cx": ("epoch", "stage")}
+             "iu4": ("slab", "vmem.post"), "v2c": ("epoch", "stage"), "v2cx": ("epoch", "stage"),
+             "v2b": ("head", "stage")}
 EXPOSED = {"f2": ("w0.pre", "w0.post"), "attn": ("bar.pre_drain", "bar.pre_signal"),
            "iu4": ("vmem.pre", "vmem.post"), "v2c": ("bar.pre_signal", "bar.post_wait"),
-           "v2cx": ("bar.pre_signal", "bar.post_wait")}
+           "v2cx": ("bar.pre_signal", "bar.post_wait"), "v2b": ("bar.pre_signal", "bar.post_wait")}
 QUALIFY = {"f2": {"bar.pre_signal", "bar.post_signal", "bar.post_wait"}, "attn": set(),
            "iu4": {"bar.pre_signal", "bar.post_signal", "bar.pre_wait", "bar.post_wait"},
-           "v2c": {"pass", "fold"}, "v2cx": {"pass", "fold"}}
+           "v2c": {"pass", "fold"}, "v2cx": {"pass", "fold"}, "v2b": {"pass", "fold"}}
 
 
 def parse(map_path, run_dir):

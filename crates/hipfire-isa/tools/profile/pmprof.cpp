@@ -9,6 +9,7 @@
 //               (gfx1100 builder SET / ADD / gate-up SiLU on a dumped real site: <site_dir>/
 //               {A.bin|G.bin,U.bin},Xq.bin[,Y.bin],meta.txt; symbol PM_V2C_SYM or the product
 //               symbol of the kind; MROWS=<rows> uses the first rows of the dumped weight)
+//   pmprof v2b  <base.co> <profiled.co> <set|add|silu> <outdir> [rounds]   (gfx1151; PM_V2B_DUMP)
 //
 // For one real H2 shape it runs the uninstrumented and the profiled kernel on
 // identical inputs, compares every output byte (outputs are poisoned before
@@ -268,6 +269,44 @@ int main(int argc, char** argv) {
         if (add) { auto y = slurp(dir + "/Y.bin"); y.resize((size_t)M * N * 4); v2cx_residual = upload(y.data(), y.size()); }
         L.grid[0] = N / 128; L.grid[1] = (silu ? 2 * M : M) / 128; L.grid[2] = 1;
         L.block = 256; L.lds = 32768; waves_per_wg = 8; periods = K / 128;
+    } else if (mode == "v2b") {
+        // gfx1151 builder V2B entries on the real H2 dumps in PM_V2B_DUMP
+        // ({set,add,silu}/meta.txt + A|G,U / Xq / Y .bin): SET, FFN-down ADD at
+        // GSHIFT 2 (grouped raster; Y poisoned, so identity still holds), or
+        // gate/up SiLU. Block 512 (16 waves), dynamic LDS 65536.
+        const std::string epi = argv[4];
+        outdir = argv[5]; rounds = argc > 6 ? atoi(argv[6]) : 8;
+        const char* dp = getenv("PM_V2B_DUMP");
+        if (!dp || (epi != "set" && epi != "add" && epi != "silu")) { fprintf(stderr, "v2b mode needs PM_V2B_DUMP and set|add|silu\n"); return 2; }
+        auto slurp = [](const std::string& path) {
+            FILE* f = fopen(path.c_str(), "rb"); if (!f) { fprintf(stderr, "open %s\n", path.c_str()); exit(1); }
+            fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+            std::vector<unsigned char> v(n); if (fread(v.data(), 1, n, f) != (size_t)n) exit(1); fclose(f); return v; };
+        const std::string dir = std::string(dp) + "/" + epi + "/";
+        auto mt = slurp(dir + "meta.txt"); std::string meta_s(mt.begin(), mt.end());
+        auto meta_int = [&](const char* k) { size_t i = meta_s.find(std::string(k) + "="); if (i == std::string::npos) exit(2); return atoi(meta_s.c_str() + i + strlen(k) + 1); };
+        const int M = meta_int("m"), K = meta_int("k"), N = meta_int("n");
+        auto w = slurp(dir + (epi == "silu" ? "G.bin" : "A.bin")), x = slurp(dir + "Xq.bin");
+        if (w.size() != (size_t)M * (K / 256) * 136 || x.size() != (size_t)(K / 128) * N * 72) { fprintf(stderr, "v2b input sizes\n"); return 2; }
+        Buf W = upload(w.data(), w.size()), X = upload(x.data(), x.size());
+        Buf Y = alloc(((size_t)M * N + 64) * sizeof(float));
+        outputs = {Y};
+        shape = "v2b " + epi + " M=" + std::to_string(M) + " K=" + std::to_string(K) + " N=" + std::to_string(N);
+        L.grid[0] = N / 256; L.grid[1] = (epi == "silu" ? 2 * M : M) / 256; L.grid[2] = 1;
+        if (epi == "set") {
+            sym = "gemm_mq4g256v2_residual_iu4_pm_v2b_set_gfx1151";
+            L.args = {arg(W.p), arg(X.p), arg(Y.p), arg(M), arg(K), arg(N)};
+        } else if (epi == "add") {
+            sym = "gemm_mq4g256v2_residual_iu4_pm_v2b_add_gfx1151";
+            L.args = {arg(W.p), arg(X.p), arg(Y.p), arg(M), arg(K), arg(N), arg(2)};
+            L.grid[0] = (N / 256) << 2; L.grid[1] = (M / 256) >> 2;
+        } else {
+            sym = "gemm_mq4g256v2_gate_up_silu_iu4_pm_v2b_gfx1151";
+            auto u = slurp(dir + "U.bin");
+            Buf U = upload(u.data(), u.size());
+            L.args = {arg(W.p), arg(U.p), arg(X.p), arg(Y.p), arg(M), arg(K), arg(N)};
+        }
+        L.block = 512; L.lds = 65536; waves_per_wg = 16; periods = K / 128;
     } else if (mode == "attn") {
         const int batch = atoi(argv[4]), start = atoi(argv[5]);
         outdir = argv[6]; rounds = argc > 7 ? atoi(argv[7]) : 8;
