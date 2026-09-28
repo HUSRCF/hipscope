@@ -10,19 +10,29 @@
 //! 128j..128j+2 (j >= 1) are left to that pass; the first token tile reads
 //! the persistent conv ring as its halo.
 //!
-//! LDS is one 19-row ring of 128 f32 channels (9,728 bytes of the 20,480-byte
-//! `_b1` allocation): token t of the tile lives in row (t + 3) mod 19. Block b
-//! (tokens 16b..16b+15) is drained from column block b % 4 of token half
-//! b / 4 by that half's four waves (lane (m, k) of wave pair p stores rows
-//! 32p + 16rg + 8k + 0..7 of token m); then each of those waves runs four
-//! consecutive tokens 16b + 4p .. +3 in `gdn_chunk_prep`'s lane layout (lane =
-//! 4 channels). Region instances (lean conv+SiLU, the imported norm goldens)
-//! use F2's register numbers, so their VOPD packing is F2's.
+//! LDS is one 19-row ring of 128 f32 channels (rows 528 bytes apart, 10,032
+//! bytes of the 20,480-byte `_b1` allocation): token t of the tile lives in
+//! row (t + 3) mod 19. Block b (tokens 16b..16b+15) is drained from column
+//! block b % 4 of token half b / 4 by that half's four waves (lane (m, k) of
+//! wave pair p stores rows 32p + 16rg + 8k + 0..7 of token m); then each of
+//! those waves runs four consecutive tokens 16b + 4p .. +3 in
+//! `gdn_chunk_prep`'s lane layout (lane = 4 channels). Region instances (lean
+//! conv+SiLU, the imported norm goldens) use F2's register numbers, so their
+//! VOPD packing is F2's.
+//!
+//! Two choices only schedule the same instructions:
+//! - The 16 bytes of row padding put the 16 token rows of a W store four
+//!   dword banks apart. With 512-byte rows every lane of a store hit the same
+//!   four banks (16-way conflicts on the LDS the co-resident K-loops need).
+//! - The GDN path runs at wave priority 0 under the kernel's priority 1
+//!   (`mod.rs`), so co-resident K-loop waves win instruction arbitration and
+//!   the epilogue's VALU work fills their stall cycles.
 use super::{GDN, Gen, mem, op, publish::vload, s, sr, v, vr};
 use crate::{RegPlan, insn::{Instruction, MemoryClass}, kernels::fp8_gemm::gdn_region::{self, Binding, Half, Region}, lds::{SlotState, Transition}, ledger::Counter, reg::Live};
 
 const RING_ROWS: u32 = 19;
-const ROW_BYTES: u32 = 512;
+/// Ring row pitch: 512 bytes of data plus 16 (bank skew; keeps b128 alignment).
+const ROW_BYTES: u32 = 528;
 pub const RING_BYTES: u32 = RING_ROWS * ROW_BYTES;
 
 // VGPRs (accumulators v64..v127 drain block by block; v185 = sc_addr is the
@@ -160,7 +170,7 @@ fn norm_bind(r: &Region) -> Result<Binding, String> {
 /// Load ring row `(R + k) mod 19` into window slot `slot`.
 fn load_row(b: &mut crate::Builder, ring: usize, k: u8, slot: u8) -> Result<(), String> {
     mod19(b, S0, R, u32::from(k))?;
-    so(b, format!("s_lshl_b32 s{S0}, s{S0}, 9"), &[S0], &[S0])?;
+    so(b, format!("s_mul_i32 s{S0}, s{S0}, {ROW_BYTES:#x}"), &[S0], &[S0])?;
     vo(b, format!("v_add_nc_u32_e32 v{VPA}, s{S0}, v{VP}"), &[VPA], &[VP], &[S0])?;
     ds_load_b128(b, ring, ROWS + 4 * slot, VPA)
 }
@@ -232,6 +242,8 @@ fn token(b: &mut crate::Builder, ring: usize, re: &Regions, tag: &str, j: u8) ->
 pub(crate) fn emit(b: &mut crate::Builder, g: &Gen) -> Result<(), String> {
     let re = Regions { conv: Region::conv_silu_lean()?, norm_q: Region::norm_q()?, norm_k: Region::norm_k()?, cvt_v: Region::cvt_v()? };
     b.label(GDN)?;
+    // Below the K-loop's priority 1: co-resident K-loops issue first.
+    op(b, "s_setprio 0", &[], &[])?;
     // The GDN arithmetic is VALU-issue bound: give it F2's issue hints.
     b.enable_delay_alu();
     mem(b, format!("s_load_b256 s[{KA}:{}], s[0:1], 0x40", KA + 7), &[sr(KA, 8)], &[sr(0, 2)], MemoryClass::SmemLoad)?;
@@ -294,7 +306,7 @@ pub(crate) fn emit(b: &mut crate::Builder, g: &Gen) -> Result<(), String> {
         vo(b, format!("v_add_nc_u32_e32 v{VA}, s{RB}, v{VL}"), &[VA], &[VL], &[RB])?;
         vo(b, format!("v_subrev_nc_u32_e32 v{VPA}, {RING_ROWS}, v{VA}"), &[VPA], &[VA], &[])?;
         vo(b, format!("v_min_u32_e32 v{VA}, v{VA}, v{VPA}"), &[VA], &[VA, VPA], &[])?;
-        vo(b, format!("v_lshl_add_u32 v{VA}, v{VA}, 9, v{VC}"), &[VA], &[VA, VC], &[])?;
+        vo(b, format!("v_mad_u32_u24 v{VA}, v{VA}, {ROW_BYTES:#x}, v{VC}"), &[VA], &[VA, VC], &[])?;
         for tt in 0..4u8 {
             so(b, format!("s_cmp_eq_u32 s{TT}, {tt}"), &[], &[TT])?;
             op(b, format!("s_cbranch_scc1 {GDN}_w{tt}"), &[], &[])?;
@@ -433,11 +445,11 @@ pub fn check_lds_access(source: &str, symbol: &str, launch_dynamic: u32) -> Resu
         let (args, offset) = match operands.split_once(" offset:") { Some((a, o)) => (a, o.parse::<u32>().map_err(|_| "invalid GDN LDS offset")?), None => (operands, 0) };
         let addr = if opcode == "ds_store_b128" { args.split(',').next() } else if opcode == "ds_load_b128" { args.split(',').nth(1) } else { return fail(format!("unexpected {opcode}")) }.unwrap_or("").trim();
         let base_max = match (opcode, addr) {
-            // Ring row min(r, r - 19) of r = s93 + lane15 <= 33, times 512, plus sc_addr <= 416.
+            // Ring row min(r, r - 19) of r = s93 + lane15 <= 33, times ROW_BYTES, plus sc_addr <= 416.
             ("ds_store_b128", "v180") => {
                 let d = defs("v180");
                 let j = (0..i).rev().find(|j| d.contains(j)).ok_or("W address undefined")?;
-                if !(j >= 3 && at(j) == "v_lshl_add_u32 v180, v180, 9, v185" && at(j - 1) == "v_min_u32_e32 v180, v180, v184"
+                if !(j >= 3 && at(j) == format!("v_mad_u32_u24 v180, v180, {ROW_BYTES:#x}, v185") && at(j - 1) == "v_min_u32_e32 v180, v180, v184"
                     && at(j - 2) == format!("v_subrev_nc_u32_e32 v184, {RING_ROWS}, v180") && at(j - 3) == "v_add_nc_u32_e32 v180, s93, v182") {
                     return fail("W ring address derivation changed".into())
                 }
@@ -445,9 +457,9 @@ pub fn check_lds_access(source: &str, symbol: &str, launch_dynamic: u32) -> Resu
             }
             // Halo rows 0..2 through the lane's channel base.
             ("ds_store_b128", "v183") if offset <= 2 * ROW_BYTES => 496,
-            // P rows: ((s94 + k) mod 19) << 9 over the lane's channel base.
+            // P rows: ((s94 + k) mod 19) * ROW_BYTES over the lane's channel base.
             ("ds_load_b128", "v184") => {
-                let row_ok = i >= 6 && at(i - 1) == "v_add_nc_u32_e32 v184, s97, v183" && at(i - 2) == "s_lshl_b32 s97, s97, 9" && mod19(i - 6, "s97")
+                let row_ok = i >= 6 && at(i - 1) == "v_add_nc_u32_e32 v184, s97, v183" && at(i - 2) == format!("s_mul_i32 s97, s97, {ROW_BYTES:#x}") && mod19(i - 6, "s97")
                     && (at(i - 6) == "s_mov_b32 s97, s94" || (1..=3).any(|k| at(i - 6) == format!("s_add_co_i32 s97, s94, {k}")));
                 if !row_ok { return fail(format!("P row address before line `{l}` changed")) }
                 (RING_ROWS - 1) * ROW_BYTES + 496
@@ -464,18 +476,20 @@ pub fn check_lds_access(source: &str, symbol: &str, launch_dynamic: u32) -> Resu
 
 #[cfg(test)]
 mod tests {
-    use super::{RING_BYTES, check_lds_access};
+    use super::{RING_ROWS, ROW_BYTES, check_lds_access};
     use crate::kernels::iu4_gemm::{Epi, Spec, emit};
 
     #[test]
     fn gdn_lds_certificate_bounds_the_ring_and_rejects_changes() {
         let spec = Spec::control(Epi::QkvzaGdn);
         let source = emit(spec).unwrap().s_text;
-        assert_eq!(check_lds_access(&source, &spec.symbol(), 20480).unwrap(), RING_BYTES);
+        // The last ring row's 512 data bytes end the GDN accesses (its padding is never touched).
+        assert_eq!(check_lds_access(&source, &spec.symbol(), 20480).unwrap(), (RING_ROWS - 1) * ROW_BYTES + 512);
         assert!(check_lds_access(&source, &spec.symbol(), 20479).is_err());
         for (from, to) in [
-            ("v_lshl_add_u32 v180, v180, 9, v185", "v_lshl_add_u32 v180, v180, 10, v185"),
-            ("ds_store_b128 v183, v[152:155] offset:1024", "ds_store_b128 v183, v[152:155] offset:9728"),
+            ("v_mad_u32_u24 v180, v180, 0x210, v185", "v_mad_u32_u24 v180, v180, 0x220, v185"),
+            ("s_mul_i32 s97, s97, 0x210", "s_mul_i32 s97, s97, 0x200"),
+            ("ds_store_b128 v183, v[152:155] offset:1056", "ds_store_b128 v183, v[152:155] offset:10032"),
             ("s_lshl_b32 s97, s73, 2", "s_lshl_b32 s97, s73, 3"),
             ("s_add_co_i32 s93, s93, 16", "s_add_co_i32 s93, s93, 17"),
         ] {

@@ -318,13 +318,41 @@ fn g12_iu4_v3_enabled() -> bool {
 static G12_IU4_B1_CONTROL: LazyLock<bool> =
     LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_G12_IU4_B1_CONTROL", false));
 
-#[inline]
-fn g12_iu4_b1_image() -> &'static [u8] {
-    if *G12_IU4_B1_CONTROL {
-        kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1_CONTROL
-    } else {
-        kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1
+/// Developer A/B of iu4 builder bundles with one binary (for example the
+/// previous certified bundle as a same-binary opt-out):
+/// `HIPFIRE_G12_IU4_B1_BUNDLE=<path>` / `HIPFIRE_G12_IU4_B1S_BUNDLE=<path>`
+/// load the token / slab bundle from a file instead of the embedded image.
+/// Read once; an unreadable file fails every launch that needs the bundle.
+type BundleOverride = Option<Result<Vec<u8>, String>>;
+fn g12_iu4_bundle_override(var: &str) -> BundleOverride {
+    let path = hipfire_config::developer_var(var).ok()?;
+    Some(std::fs::read(&path).map_err(|e| format!("{var}: bundle {path}: {e}")))
+}
+static G12_IU4_B1_BUNDLE: LazyLock<BundleOverride> =
+    LazyLock::new(|| g12_iu4_bundle_override("HIPFIRE_G12_IU4_B1_BUNDLE"));
+static G12_IU4_B1S_BUNDLE: LazyLock<BundleOverride> =
+    LazyLock::new(|| g12_iu4_bundle_override("HIPFIRE_G12_IU4_B1S_BUNDLE"));
+
+fn g12_iu4_bundle(file: &'static BundleOverride, embedded: &'static [u8]) -> HipResult<&'static [u8]> {
+    match file {
+        Some(Ok(image)) => Ok(image),
+        Some(Err(e)) => Err(hip_bridge::HipError::new(0, e)),
+        None => Ok(embedded),
     }
+}
+
+#[inline]
+fn g12_iu4_b1_image() -> HipResult<&'static [u8]> {
+    if *G12_IU4_B1_CONTROL {
+        Ok(kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1_CONTROL)
+    } else {
+        g12_iu4_bundle(&G12_IU4_B1_BUNDLE, kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1)
+    }
+}
+
+#[inline]
+fn g12_iu4_b1s_image() -> HipResult<&'static [u8]> {
+    g12_iu4_bundle(&G12_IU4_B1S_BUNDLE, kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1S)
 }
 /// B-1 slab activation layout (`HIPFIRE_A4_SLAB`, default on; `=0` opts
 /// out): the default gfx1201 A4 producers store each K128 block's
@@ -20310,7 +20338,7 @@ impl Gpu {
             if isa {
                 self.ensure_embedded_kernel(
                     module,
-                    if slab { kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1S } else { g12_iu4_b1_image() },
+                    if slab { g12_iu4_b1s_image()? } else { g12_iu4_b1_image()? },
                     kernel_name,
                 )?;
             } else {
@@ -30598,13 +30626,13 @@ impl Gpu {
         let (module, image, symbol) = if self.scratch.int4_mmq_slab_at(xq) {
             (
                 "gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s",
-                kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1S,
+                g12_iu4_b1s_image()?,
                 "gemm_mq4g256v2_residual_mmq_iu4_qkvzagdn_b1s",
             )
         } else {
             (
                 "gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1",
-                g12_iu4_b1_image(),
+                g12_iu4_b1_image()?,
                 "gemm_mq4g256v2_residual_mmq_iu4_qkvzagdn_b1",
             )
         };
@@ -32728,7 +32756,7 @@ impl Gpu {
         if isa {
             self.ensure_embedded_kernel(
                 module,
-                if slab { kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1S } else { g12_iu4_b1_image() },
+                if slab { g12_iu4_b1s_image()? } else { g12_iu4_b1_image()? },
                 kernel,
             )?;
         } else {

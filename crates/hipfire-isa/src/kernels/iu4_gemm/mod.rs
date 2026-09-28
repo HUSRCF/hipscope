@@ -209,6 +209,10 @@ pub fn emit(spec: Spec) -> Result<Emitted, String> {
     };
     let mut b = Builder::new(kspec, g.plan()?);
     g.declare_lds(&mut b)?;
+    // Fused projection: K-loop waves run at priority 1 and the QKV tiles'
+    // GDN epilogue drops to 0 (`gdn_epilogue`), so co-resident K-loops win
+    // issue arbitration. Scheduling only; every result bit is unchanged.
+    if spec.epi == Epi::QkvzaGdn { op(&mut b, "s_setprio 1", &[], &[])?; }
     prologue::emit(&mut b, &g)?;
     kloop::emit(&mut b, &g)?;
     epilogue::emit(&mut b, &g)?;
