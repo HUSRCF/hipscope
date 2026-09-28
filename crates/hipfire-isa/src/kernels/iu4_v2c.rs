@@ -168,13 +168,13 @@ fn stage_base(epi: Epi) -> u8 { if epi.silu() { Regs::SS } else { Regs::SA } }
 const SLOT_A: [usize; 2] = [0, 2];
 const SLOT_X: [usize; 2] = [1, 3];
 
-fn op(b: &mut Builder, text: impl Into<String>, defs: &[RegRef], uses: &[RegRef]) -> Result<(), String> {
+pub(super) fn op(b: &mut Builder, text: impl Into<String>, defs: &[RegRef], uses: &[RegRef]) -> Result<(), String> {
     b.push(Instruction::new(text, defs.to_vec(), uses.to_vec()))
 }
-fn mem(b: &mut Builder, text: impl Into<String>, defs: &[RegRef], uses: &[RegRef], class: MemoryClass) -> Result<(), String> {
+pub(super) fn mem(b: &mut Builder, text: impl Into<String>, defs: &[RegRef], uses: &[RegRef], class: MemoryClass) -> Result<(), String> {
     b.push(Instruction::new(text, defs.to_vec(), uses.to_vec()).memory(class))
 }
-fn off(o: u32) -> Result<String, String> {
+pub(super) fn off(o: u32) -> Result<String, String> {
     if o > 4095 { return Err(format!("global offset {o} exceeds the gfx11 13-bit signed field")) }
     Ok(if o == 0 { String::new() } else { format!(" offset:{o}") })
 }

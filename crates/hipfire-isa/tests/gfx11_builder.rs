@@ -1,9 +1,9 @@
 //! gfx11 builder target: counter waits, LDS barrier drain, VOPD pairing, the
-//! V2C-equivalent SET/ADD/gate-up kernels, and byte identity of the gfx1201
-//! products.
+//! V2C-equivalent SET/ADD/gate-up kernels (gfx1100), the V2B module
+//! (gfx1151), and byte identity of the committed builder products.
 use hipfire_isa::{Arch, Builder, KernelSpec, KernargLayout, RegPlan};
 use hipfire_isa::insn::{Instruction, MemoryClass};
-use hipfire_isa::kernels::{iu4_gemm, iu4_v2c, fp8_gemm};
+use hipfire_isa::kernels::{iu4_gemm, iu4_v2b, iu4_v2c, fp8_gemm};
 use hipfire_isa::lds::Transition;
 use hipfire_isa::reg::Live;
 use hipfire_isa::vopd::{Operand, VopdF32, VopdOp};
@@ -220,6 +220,50 @@ fn committed_gfx1201_bundles_equal_fresh_emission() {
     }
 }
 
+fn v2b(epi: iu4_v2b::Epi) -> hipfire_isa::Emitted { iu4_v2b::emit(iu4_v2b::Spec { arch: Arch::Gfx1151, epi }).unwrap() }
+
+#[test]
+fn v2b_entries_are_deterministic_and_gfx1151_only() {
+    for epi in iu4_v2b::Epi::ALL {
+        let (a, b) = (v2b(epi), v2b(epi));
+        assert_eq!(a.proof.s_text_sha256, b.proof.s_text_sha256);
+        assert!(a.shape.next_free_vgpr <= iu4_v2b::VGPR_CEILING);
+        for arch in [Arch::Gfx1100, Arch::Gfx1201] { assert!(iu4_v2b::emit(iu4_v2b::Spec { arch, epi }).is_err()); }
+    }
+}
+
+#[test]
+fn v2b_fold_is_fully_vopd_paired_in_every_entry() {
+    // One trip = two K128 epochs; per epoch and wave 128 K16 WMMAs, the 384
+    // fold ops as 192 packets (128 mul/add, 64 fmac/fmac), 32 DPP scale
+    // shares, 2 converts and 8 A rebias XORs: 234 VALU slots, none of them
+    // an unpaired fold op.
+    for epi in iu4_v2b::Epi::ALL {
+        let census = iu4_v2b::hot_loop_census(&v2b(epi).s_text, epi);
+        for (name, n) in [("v_wmma_i32_16x16x16_iu4", 256), ("vopd_packets", 384), ("v_dual_mul_f32", 256), ("v_dual_fmac_f32", 128),
+            ("v_mov_b32_dpp", 64), ("v_cvt_f32_f16_e64", 4), ("v_xor_b32_e32", 16), ("valu_slots", 468), ("s_barrier", 2),
+            ("ds_load_2addr_b64", 160), ("ds_store_b64", 16), ("global_load_b64", 16), ("global_load_b32", 8), ("global_load_u16", 4)] {
+            assert_eq!(census.get(name).copied().unwrap_or(0), n, "{epi:?} {name}");
+        }
+        for unpaired in ["v_mul_f32_e32", "v_add_f32_e32", "v_fmac_f32_e32", "v_fma_f32", "buffer_gl0_inv", "s_nop", "v_nop"] {
+            assert!(!census.contains_key(unpaired), "{epi:?} {unpaired}");
+        }
+    }
+}
+
+#[test]
+fn v2b_module_assembles_for_gfx1151_with_zero_diagnostics() { assemble(&iu4_v2b::emit_module(Arch::Gfx1151).unwrap().1, "gfx1151") }
+
+/// The runtime embeds the certified gfx1151 bundle: it must be exactly what
+/// the builder emits today.
+#[test]
+fn committed_gfx1151_v2b_bundle_equals_fresh_emission() {
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../kernels");
+    let committed = std::fs::read(format!("{root}/{}.hxaco", iu4_v2b::MODULE)).unwrap();
+    let text = iu4_v2b::emit_module(Arch::Gfx1151).unwrap().1;
+    assert!(text_section(&link(&text, "gfx1151", iu4_v2b::MODULE)) == text_section(&committed), "fresh gfx1151 V2B emission differs from the committed bundle");
+}
+
 #[cfg(feature = "toolchain")]
 mod toolchain {
     use super::*;
@@ -250,6 +294,25 @@ mod toolchain {
             let contract = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
             hipfire_isa::toolchain::certify(&toolchain, &build, &s, "gfx1100", &dir.join(format!("{}.manifest.json", epi.name())),
                 Some(&contract), "test", "test").unwrap_or_else(|e| panic!("{epi:?}: {e}"));
+        }
+    }
+
+    #[test]
+    fn v2b_entries_pass_gfx1151_certification_checks() {
+        let (_, text, _) = iu4_v2b::emit_module(Arch::Gfx1151).unwrap();
+        ledger_replay::replay_waits(&text, Arch::Gfx1151).unwrap();
+        let dir = std::env::temp_dir().join(format!("hipfire-isa-v2b-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let s = dir.join("v2b.s");
+        std::fs::write(&s, &text).unwrap();
+        let build = assemble_link_bundle(&Toolchain::default(), &s, &dir.join("v2b.hsaco"), "gfx1151").unwrap();
+        for epi in iu4_v2b::Epi::ALL {
+            let symbol = iu4_v2b::Spec { arch: Arch::Gfx1151, epi }.symbol();
+            assert_eq!(pm_check::lds_bounds(&text, &symbol, iu4_v2b::WAVES, iu4_v2b::LDS_BYTES).unwrap(), iu4_v2b::LDS_BYTES);
+            assert!(pm_check::lds_bounds(&text, &symbol, iu4_v2b::WAVES, iu4_v2b::LDS_BYTES - 8).is_err());
+            let m7 = pm_check::m7(&build.elf, "gfx1151", &symbol).unwrap();
+            assert_eq!(m7["lift"], "byte-exact", "{symbol}");
+            assert_eq!(m7["obligations"], serde_json::json!({}), "{symbol}");
         }
     }
 
