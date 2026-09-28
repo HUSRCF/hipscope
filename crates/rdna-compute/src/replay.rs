@@ -1315,8 +1315,14 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             read(40),
             read(48),
         ]),
-        "attention_flash_q8_0_tile" => Some(vec![read(0), read(8), read(16), write(24), read(32)]),
-        "attention_flash_q8_0_reduce" => Some(vec![read(0), write(8), read(24)]),
+        // The gfx1201 GQA fp8 decode tile and head-dim-split reduce keep their
+        // reference twins' 13/7-argument ABIs and pointer effects.
+        "attention_flash_q8_0_tile" | "attention_flash_fp8_e4m3_tile_gqa_gfx1201" => {
+            Some(vec![read(0), read(8), read(16), write(24), read(32)])
+        }
+        "attention_flash_q8_0_reduce" | "attention_flash_reduce_dsplit_gfx1201" => {
+            Some(vec![read(0), write(8), read(24)])
+        }
         "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1100"
         | "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1151"
         | "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1201" => Some(vec![
@@ -1680,6 +1686,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "sigmoid_mul_f32" => Some(32),
         "gemma4_ple_gelu_mul_strided_f32" => Some(48),
         "attention_flash_q8_0_reduce"
+        | "attention_flash_reduce_dsplit_gfx1201"
         | "fused_rmsnorm_mq_rotate"
         | "fused_rmsnorm_mq_rotate_vecsum"
         | "fused_rmsnorm_mq_rotate_vecsum_sign_const"
@@ -1732,6 +1739,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "moe_down_combine_rmsnorm_mq_rotate_vecsum_gfx1151" => Some(72),
         "gemv_hfq4g256_moe_down_k8_indexed_last_combine" => Some(64),
         "attention_flash_q8_0_tile"
+        | "attention_flash_fp8_e4m3_tile_gqa_gfx1201"
         | "fused_qkv_hfq4g256"
         | "fused_qkv_mq4g256v2"
         | "fused_qkv_mq4g256v2_k2048_x_buffer_gfx1100"
@@ -4368,7 +4376,8 @@ impl ReplayController {
     /// model load resets the process-local controller so prepared queues,
     /// command buffers, and fallback state cannot bleed across model swaps.
     /// Eligible single-GPU MQ4R models may default to retained PM4 on
-    /// gfx1100, gfx1151, and gfx1201; this is runtime policy, not certification.
+    /// gfx1100, gfx1151, and gfx1201, as may Qwen3.5 dense plain-AR decode on
+    /// gfx1201; this is runtime policy, not certification.
     /// All other models return to ordinary HIP. An explicit transport still
     /// overrides the PM4 transport choice for diagnostics.
     pub fn configure_model_default(&mut self, enable_mq4r: bool) -> bool {
@@ -7474,6 +7483,60 @@ mod tests {
         blob.pad_to(16);
         assert_eq!(blob.len(), 48, "recorded launches are padded to 16 bytes");
         assert_eq!(expected_kernarg_bytes(kernel), Some(blob.len()));
+    }
+
+    #[test]
+    fn gfx1201_fp8_decode_attention_pair_keeps_padded_replay_contract() {
+        // Launcher order: q, k, v, partials, pos, then 8 scalars.
+        let tile = "attention_flash_fp8_e4m3_tile_gqa_gfx1201";
+        let mut blob = hip_bridge::KernargBlob::new();
+        for _ in 0..5 {
+            blob.push_ptr(std::ptr::null());
+        }
+        for _ in 0..4 {
+            blob.push_i32(0);
+        }
+        blob.push_f32(0.0);
+        for _ in 0..3 {
+            blob.push_i32(0);
+        }
+        blob.pad_to(16);
+        assert_eq!(expected_kernarg_bytes(tile), Some(blob.len()));
+        let effects = pointer_effects(tile).expect("GQA tile contract");
+        let modes: Vec<_> = effects.iter().map(|e| (e.offset, e.mode)).collect();
+        assert_eq!(
+            modes,
+            vec![
+                (0, RecordedAccessMode::Read),
+                (8, RecordedAccessMode::Read),
+                (16, RecordedAccessMode::Read),
+                (24, RecordedAccessMode::Write),
+                (32, RecordedAccessMode::Read),
+            ]
+        );
+
+        // Launcher order: partials, out, n_heads, head_dim, pos, tile, max_tiles.
+        let reduce = "attention_flash_reduce_dsplit_gfx1201";
+        let mut blob = hip_bridge::KernargBlob::new();
+        blob.push_ptr(std::ptr::null());
+        blob.push_ptr(std::ptr::null());
+        blob.push_i32(0);
+        blob.push_i32(0);
+        blob.push_ptr(std::ptr::null());
+        blob.push_i32(0);
+        blob.push_i32(0);
+        blob.pad_to(16);
+        assert_eq!(expected_kernarg_bytes(reduce), Some(blob.len()));
+        let effects = pointer_effects(reduce).expect("dsplit reduce contract");
+        let modes: Vec<_> = effects.iter().map(|e| (e.offset, e.mode)).collect();
+        assert_eq!(
+            modes,
+            vec![
+                (0, RecordedAccessMode::Read),
+                (8, RecordedAccessMode::Write),
+                (24, RecordedAccessMode::Read),
+            ]
+        );
     }
 
     #[test]

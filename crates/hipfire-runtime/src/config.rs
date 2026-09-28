@@ -30,7 +30,10 @@ pub fn mq4r_redline_default(gpu_arch: &str, model_path: &str, pp: usize, tp: usi
 /// dispatch path that cannot yet execute it. Delete this carve-out together
 /// with the lowering. DeepSeek4 MQ2R is narrower still: only the certified
 /// gfx1151 single-GPU AR route is admitted, and an installed drafter keeps the
-/// model on its speculative execution path.
+/// model on its speculative execution path. Qwen3.5 dense (arch 5) on exact
+/// gfx1201 is admitted for any weight format on the single-GPU plain-AR route
+/// (no drafter): its retained PM4 decode tape is byte-identical to the HIP
+/// AR graph. `replay.backend = "hip"` opts out.
 pub fn retained_redline_default(
     gpu_arch: &str,
     model_arch: &str,
@@ -43,6 +46,14 @@ pub fn retained_redline_default(
         return false;
     }
     if mq4r_redline_default(gpu_arch, model_path, pp, tp) {
+        return true;
+    }
+    if gpu_arch.eq_ignore_ascii_case("gfx1201")
+        && model_arch.eq_ignore_ascii_case("qwen3_5")
+        && pp == 1
+        && tp == 1
+        && !has_drafter
+    {
         return true;
     }
     gpu_arch.eq_ignore_ascii_case("gfx1151")
@@ -424,5 +435,23 @@ mod tests {
             1,
             false,
         ));
+    }
+
+    #[test]
+    fn qwen35_dense_redline_default_requires_gfx1201_single_gpu_ar() {
+        let h2 = "/models/h2.group-alpha-refit.hfq";
+        assert!(retained_redline_default("gfx1201", "qwen3_5", h2, 1, 1, false));
+        // A drafter keeps the model on its speculative path.
+        assert!(!retained_redline_default("gfx1201", "qwen3_5", h2, 1, 1, true));
+        // Pipeline / tensor parallel stay on HIP.
+        assert!(!retained_redline_default("gfx1201", "qwen3_5", h2, 2, 1, false));
+        assert!(!retained_redline_default("gfx1201", "qwen3_5", h2, 1, 2, false));
+        // Exact gfx1201 only; other dense archs and the MoE sibling stay on HIP.
+        for gpu_arch in ["gfx1100", "gfx1151", "gfx1200"] {
+            assert!(!retained_redline_default(gpu_arch, "qwen3_5", h2, 1, 1, false));
+        }
+        for model_arch in ["qwen3_5_moe", "qwen3", "qwen2", "gemma4"] {
+            assert!(!retained_redline_default("gfx1201", model_arch, h2, 1, 1, false));
+        }
     }
 }

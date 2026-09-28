@@ -13144,7 +13144,10 @@ pub(crate) fn forward_batch_chunk_impl(
         && gdn_tape.is_none()
         && fusion == DflashFusionCtx::Off
         && !gpu.graphs.capture_mode
-        && !gpu.replay.is_enabled()
+        // Only a forward being recorded into a Redline tape must stay off the
+        // chunk scan; prefill never records, so a Redline-enabled process
+        // prefills exactly like the HIP-graph default.
+        && !gpu.replay.is_recording()
         && hidden_rb.is_none()
         && per_token_hidden_out.is_none()
         && band.is_none()
