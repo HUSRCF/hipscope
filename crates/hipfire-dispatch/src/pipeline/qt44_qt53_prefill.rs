@@ -116,6 +116,10 @@ pub(crate) fn router_projection(
     p: &MoePrefillParams<'_>,
 ) -> Result<(), DispatchError> {
     require_geometry(p)?;
+    // Projected by the shared gate/up stage's launch instead.
+    if router_with_shared(p) {
+        return Ok(());
+    }
     batch_projection(
         gpu,
         &p.prelude.router,
@@ -123,6 +127,20 @@ pub(crate) fn router_projection(
         p.prelude.router_logits,
         p.batch_size,
     )
+}
+
+/// Whether a few-row forward (<= 8 rows, where the grouped BF16 row kernel is
+/// bitwise each projection's own) projects the router together with the
+/// all-BF16 shared selector/gate/up in one launch (the shared gate/up stage,
+/// which the route always runs right after the router stage).
+fn router_with_shared(p: &MoePrefillParams<'_>) -> bool {
+    p.batch_size <= 8
+        && p.prelude.router.dtype == DType::BF16
+        && p.prelude.shared.as_ref().is_some_and(|shared| {
+            [&shared.weights.selector, &shared.weights.gate, &shared.weights.up]
+                .iter()
+                .all(|w| w.dtype == DType::BF16)
+        })
 }
 
 /// Shared selector and gate/up are ordinary batched projections.  This is the
@@ -137,7 +155,21 @@ pub(crate) fn shared_gate_up(gpu: &mut Gpu, p: &MoePrefillParams<'_>) -> Result<
         .as_ref()
         .ok_or_else(|| DispatchError::Hip("grouped prefill shared weights missing".into()))?;
     let weights = &shared.weights;
-    if [&weights.selector, &weights.gate, &weights.up]
+    if router_with_shared(p) {
+        // All read the natural activation: one launch (one F16 conversion).
+        super::layer_ops::project_weights(
+            gpu,
+            p.x_norm_batch,
+            p.batch_size,
+            None,
+            &[
+                (&p.prelude.router, p.prelude.router_logits),
+                (&weights.selector, shared.scalar),
+                (&weights.gate, shared.gate_out),
+                (&weights.up, shared.up_out),
+            ],
+        )?;
+    } else if [&weights.selector, &weights.gate, &weights.up]
         .iter()
         .all(|w| w.dtype == DType::BF16)
     {
