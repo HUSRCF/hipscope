@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- Qwen4 decode 32.4 → 33.4 tok/s on gfx1151 (1131-token prompt, 5 runs,
+  same binary), prefill unchanged at ~1255 tok/s:
+  - Single-token forwards also read the shared expert as load-time Q8_0
+    copies (+0.25 GB, like the HC read projections); 32.4 → 32.8 tok/s on
+    the published `qwen3.8-flash-next.mq6q8-pleq8`.
+  - Recipe r2, `qwen3.8-flash-next.mq4` (125288540696 B,
+    quantized from the BF16 checkpoint): the language head ships MQ6G256V2
+    instead of Q8F16 (−0.18 GB read per token); every other tensor is
+    unchanged. 32.8 → 33.4 tok/s. KLD against the BF16 source, 32 chunks:
+    decode route 0.07539 → 0.07602, prefill route 0.07347 → 0.07432.
+  - Measured and not taken: Q8 in the file for the shared expert, the PLE
+    key/value and the HC read projections. Decode already reads Q8 copies
+    of the matrices it streams, while prefill then lost its BF16 source
+    (prefill-route KLD +0.0035) and short prompts had no fast exact Q8
+    multi-row GEMM (+46% prefill time at ~100 tokens).
+
 - Qwen4 decode on gfx1151: 19.2 → 32.3 tok/s (1131-token prompt, greedy,
   `qwen3.8-flash-next.mq6q8-pleq8`). Per-token dispatches drop by fusing the
   small kernels between the streaming GEMVs (HC write + next HC read norm and

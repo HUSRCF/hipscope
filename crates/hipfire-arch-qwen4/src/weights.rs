@@ -73,17 +73,26 @@ const QWEN4_SOURCE_EXACT_SUFFIXES: &[&str] = &["mtp.fc_embedding.weight", "mtp.f
 /// worth of traffic.
 const QWEN4_SOURCE_EXACT_MARKERS: &[&str] = &["hyper_connection"];
 
-/// The two classes the repo's MoE recipes hold at eight bits rather than four.
+/// The classes the repo's MoE recipes hold at eight bits rather than four.
 ///
 /// Every family's embedding arm ships Q8 (never MQ4), and the quantizer's MoE
 /// default promotes the whole fixed tier — attention, lm_head, embed, router —
 /// to Q8F16 (qt=3, 34 bytes per 32 weights) because it is quality-critical and
 /// small relative to the routed experts.  `qwen3.6-35b-a3b.mq6` ships its
-/// lm_head, embed and router at qt=3 while its experts carry the six-bit tier;
-/// muse_glimmer's untied 202k-vocab head was forced to Q8 after an MQ4 build
-/// shipped.  For Qwen4's untied 248k-vocab head that is 0.68 GB per token
-/// instead of 1.27, at a tier the repo already trusts for this exact shape.
-const QWEN4_Q8_MARKERS: &[&str] = &["lm_head.weight", "embed_tokens.weight"];
+/// lm_head, embed and router at qt=3 while its experts carry the six-bit tier.
+const QWEN4_Q8_MARKERS: &[&str] = &["embed_tokens.weight"];
+
+/// The untied 248k-vocab head ships at the trunk's six-bit tier (MQ6G256V2):
+/// 0.50 GB read per token instead of Q8F16's 0.68, measured on the decode
+/// route at +0.0005 KLD against the Q8F16 head (2026-09-28).  Four bits cost
+/// +0.014 KLD there, so six is the floor.
+///
+/// The other matrices decode streams at BF16 (HC read, shared expert) stay
+/// BF16 here: decode reads load-time Q8_0 copies of them
+/// (`Qwen4GpuForward::decode_q8`) while prefill keeps the BF16 source — Q8 in
+/// the file cost the prefill route +0.0021 KLD (HC) and short-prompt prefill
+/// 46% (shared expert, no fast exact multi-row Q8 GEMM) for no decode speed.
+const QWEN4_LM_HEAD: &str = "lm_head.weight";
 
 fn qwen4_q8_dtype(name: &str) -> bool {
     QWEN4_Q8_MARKERS.iter().any(|marker| name.ends_with(marker))
@@ -145,8 +154,13 @@ fn qwen4_matrix_dtype(shape: &[usize]) -> DType {
 }
 
 fn qwen4_target_dtype(name: &str, shape: &[usize], requested: DType) -> DType {
-    if qwen4_q8_dtype(name) && matches!(requested, DType::BF16 | DType::Q8_0) {
-        return DType::Q8_0;
+    if matches!(requested, DType::BF16 | DType::Q8_0) {
+        if name == QWEN4_LM_HEAD {
+            return DType::MQ6G256V2;
+        }
+        if qwen4_q8_dtype(name) {
+            return DType::Q8_0;
+        }
     }
     if qwen4_quantizable_matrix(name, shape)
         && (requested == DType::BF16 || qwen4_quantized_dtype(requested))
@@ -394,7 +408,9 @@ impl Qwen4Manifest {
                      policy: ShardPolicy,
                      source: &DTypeConstraint| {
             let dtype = qwen4_trunk_target(name, &shape, requested_dtype, trunk_tier);
-            let source = if qwen4_trunk_matrix(name, &shape) {
+            // The head shares the trunk's source set, so artifacts written
+            // with its earlier Q8F16 tier keep loading.
+            let source = if qwen4_trunk_matrix(name, &shape) || name == QWEN4_LM_HEAD {
                 &quant_trunk
             } else if dtype == DType::Q8_0 {
                 &quant_q8
@@ -2212,15 +2228,12 @@ mod tests {
             }
         }
 
-        // The token embedding and the language head take the same eight-bit
-        // class tier, which every MoE recipe in this tree uses for them.
-        for name in ["model.language_model.embed_tokens.weight", "lm_head.weight"] {
-            assert_eq!(
-                tensor(name, &[2, 256]).dtype,
-                DType::Q8_0,
-                "{name} is an eight-bit class"
-            );
-        }
+        // The token embedding is eight-bit; the language head is six-bit.
+        assert_eq!(
+            tensor("model.language_model.embed_tokens.weight", &[2, 256]).dtype,
+            DType::Q8_0
+        );
+        assert_eq!(tensor("lm_head.weight", &[2, 256]).dtype, DType::MQ6G256V2);
 
         // The thinnest-over-widest reduction keeps source bytes whatever its K:
         // the hyper-connection mixer is four rows over a
@@ -2537,17 +2550,24 @@ mod tests {
         for name in ["mtp.fc_embedding.weight", "mtp.fc_hidden.weight"] {
             assert_bf16(name, None);
         }
-        // The eight-bit classes: BF16 in the checkpoint, Q8 in the artifact.
-        for name in ["model.language_model.embed_tokens.weight", "lm_head.weight"] {
-            let entry = manifest.entry(name, None).expect("eight-bit class entry");
-            assert_eq!(entry.dtype, DType::Q8_0, "{name} target dtype");
-            assert!(entry.dtype_constraint.accepts(DType::BF16));
-            assert!(entry.dtype_constraint.accepts(DType::Q8_0));
-            assert!(!entry.dtype_constraint.accepts(DType::MQ4G256V2));
-            // The head and the embedding are eight-bit by recipe; a six-bit
-            // payload there is the same class of mistake as four bits.
-            assert!(!entry.dtype_constraint.accepts(DType::MQ6G256V2));
+        // The embedding: BF16 in the checkpoint, Q8 in the artifact.
+        let entry = manifest
+            .entry("model.language_model.embed_tokens.weight", None)
+            .expect("embedding entry");
+        assert_eq!(entry.dtype, DType::Q8_0);
+        assert!(entry.dtype_constraint.accepts(DType::BF16));
+        assert!(entry.dtype_constraint.accepts(DType::Q8_0));
+        assert!(!entry.dtype_constraint.accepts(DType::MQ6G256V2));
+        // The head ships six-bit and still admits the earlier Q8F16 tier.
+        let entry = manifest.entry("lm_head.weight", None).expect("head entry");
+        assert_eq!(entry.dtype, DType::MQ6G256V2);
+        for dtype in [DType::BF16, DType::Q8_0, DType::MQ6G256V2] {
+            assert!(
+                entry.dtype_constraint.accepts(dtype),
+                "head admits {dtype:?}"
+            );
         }
+        assert!(!entry.dtype_constraint.accepts(DType::MQ4G256V2));
         // The shared expert, the router, and the PLE projections stay
         // source-exact: they ride the sealed-MoE route or select among 512
         // experts, and neither is a wide attention projection.
