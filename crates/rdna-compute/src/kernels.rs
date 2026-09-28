@@ -4106,7 +4106,9 @@ pub const SPLIT_MQ4V2_Z_BETAALPHA_SRC: &str =
 /// h = silu(gate)*up.
 pub const GEMM_MQ4G256V2_RESIDUAL_IU4_V2C_GFX11_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq4g256v2_residual_iu4_v2c.gfx11.hip");
-/// Certified gfx1100 builder code object (`hipfire-isa emit --kernel iu4_v2c
+/// Certified gfx1100 builder code object, SHA-256
+/// 00c4747c76b4de3f8c7b430f1cc557b814e52eed1b7363e4bd5c7697db62494b
+/// (builder ae0cf8241; `hipfire-isa emit --kernel iu4_v2c
 /// --epi all`, one contract-checked `peacemaker custom build --arch gfx1100`
 /// per symbol): the V2C algorithm's SET, ADD and F1-lite gate/up SiLU
 /// entries with every fold op VOPD-paired, 256-thread blocks, the V2C grid
