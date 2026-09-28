@@ -513,6 +513,13 @@ fn gfx12_sigmoid_rotate_quant_admitted(
 fn a4_fa_gate_in_place_enabled() -> bool {
     hipfire_config::developer_bool("HIPFIRE_A4_FA_GATE_IL", true)
 }
+/// A4 (IU4) attention epilogue: `HIPFIRE_A4_ATTN_EPI=0` keeps the fp8q
+/// Q-resident attention's f32 output and the separate `_gil_` slab sigmoid
+/// producer instead of the attention writing that producer's slab (default
+/// on).
+fn a4_attn_epilogue_enabled() -> bool {
+    hipfire_config::developer_bool("HIPFIRE_A4_ATTN_EPI", true)
+}
 /// gfx1201 FA out-proj producer: fuse the still-standalone
 /// `sigmoid_mul_f32` into the AWQ rotate+IU4 sidecar. This is deliberately
 /// AWQ-only: the arm of record has AWQ sidecars, while every failed predicate
@@ -8943,7 +8950,13 @@ fn batch_chunk_full_attn_output_projection(
     // was left in `fa_q_full_batch` and only the gfx1201 IU4 or FP8-stream
     // sigmoid producer reads it.
     fa_gate_in_place: bool,
+    // The out-projection's A4 slab, already written by the A4 attention
+    // epilogue ([`batch_chunk_fa_attend_a4`]); `fa_attn_out_batch` was not.
+    a4_epi: Option<rdna_compute::Int4MmqPrepared>,
 ) -> HipResult<()> {
+    if let Some(prep) = &a4_epi {
+        return out_proj_residual_iu4_prepared(gpu, pbs, &layer.wo, &layer.w_gate, prep, fusion, n);
+    }
     // S4: one sigmoid*attn+FWHT+F16 producer + direct-F16 residual GEMM
     // instead of sigmoid_mul_f32 + mq_rotate_x + convert. The F32 attn
     // input is left unmutated (the old in-place sigmoid write is skipped).
@@ -9250,6 +9263,7 @@ fn batch_chunk_fa_attend(
                 ctx,
                 None,
                 layer_idx,
+                None,
             )?;
             return Ok(());
         }
@@ -9300,6 +9314,7 @@ fn batch_chunk_fa_attend(
                 ctx,
                 None,
                 layer_idx,
+                None,
             )?;
             return Ok(());
         }
@@ -9334,6 +9349,7 @@ fn batch_chunk_fa_attend(
                 ctx,
                 tree_verify,
                 layer_idx,
+                None,
             )?;
         }
         return Ok(());
@@ -9348,7 +9364,7 @@ fn batch_chunk_fa_attend(
         return execute_fa_attend_step(
             gpu, config, &q_codes, &pbs.fa_k_batch, &pbs.fa_v_batch, &pbs.positions,
             &pbs.fa_attn_out_batch, s, kv_cache, n, start_pos, max_ctx_len,
-            ctx, tree_verify, layer_idx,
+            ctx, tree_verify, layer_idx, None,
         );
     }
     if multirow {
@@ -9409,6 +9425,7 @@ fn batch_chunk_fa_attend(
         ctx,
         tree_verify,
         layer_idx,
+        None,
     )
 
 }
@@ -9420,7 +9437,9 @@ fn batch_chunk_fa_attend(
 /// halves. Same plan derivation, same single `Step::Attend` (the family
 /// writes the KV rows from `k`/`v` at `positions` before attending, so both
 /// halves' KV are fully written before the merged FA2 reads them), same
-/// stream ordering.
+/// stream ordering. `a4_epilogue` = (Q/gate projection rows, wo AWQ scales)
+/// selects the A4 epilogue attention on the fp8q route; `output` is then the
+/// out-projection's A4 slab ([`batch_chunk_fa_attend_a4`]).
 #[allow(clippy::too_many_arguments)]
 fn execute_fa_attend_step(
     gpu: &mut Gpu,
@@ -9438,6 +9457,7 @@ fn execute_fa_attend_step(
     ctx: &DispatchCtx,
     tree_verify: Option<TreeVerifyCtx<'_>>,
     layer_idx: usize,
+    a4_epilogue: Option<(&GpuTensor, &GpuTensor)>,
 ) -> HipResult<()> {
     let is_tree = tree_verify.is_some();
     let (block_start, block_cols) = match tree_verify.as_ref() {
@@ -9477,12 +9497,55 @@ fn execute_fa_attend_step(
         tree_bias,
         block_start,
         block_cols,
-        output_gate: None,
-        output_awq_scale: None,
+        output_gate: a4_epilogue.map(|(gate, _)| gate),
+        output_awq_scale: a4_epilogue.map(|(_, awq)| awq),
         output,
     };
     execute_steps(gpu, ctx, &[Step::Attend { plan, io }])
         .map_err(|e| HipError::new(0, &e.to_string()))
+}
+
+/// The fp8q route's single write-then-attend step (what `batch_chunk_fa_attend`
+/// reduces to with `gfx12_fa_prep_fp8q`) with the A4 attention epilogue: the
+/// attention writes the out-projection's A4 slab into a fresh IU4
+/// reservation of `(k, n)` instead of `fa_attn_out_batch`; the gate is read
+/// in place from `fa_q_full_batch`.
+#[allow(clippy::too_many_arguments)]
+fn batch_chunk_fa_attend_a4(
+    gpu: &mut Gpu,
+    config: &Qwen35Config,
+    pbs: &PrefillBatchScratch,
+    s: &Qwen35Scratch,
+    kv_cache: &llama::KvCache,
+    n: usize,
+    start_pos: usize,
+    max_ctx_len: usize,
+    ctx: &DispatchCtx,
+    layer_idx: usize,
+    k: usize,
+    awq: &GpuTensor,
+) -> HipResult<rdna_compute::Int4MmqPrepared> {
+    let res = gpu.reserve_int4_mmq(k, n)?;
+    let slab_bytes = (k / 128) * n * 72;
+    let slab = GpuTensor {
+        buf: unsafe { hip_bridge::DeviceBuffer::from_raw(res.ptr(), slab_bytes) },
+        shape: vec![slab_bytes],
+        dtype: DType::Raw,
+    };
+    let q_bytes = n * config.n_heads * (config.head_dim + 4);
+    let q_codes = GpuTensor {
+        buf: unsafe { hip_bridge::DeviceBuffer::from_raw(pbs.fa_q_batch.buf.as_ptr(), q_bytes) },
+        shape: vec![q_bytes],
+        dtype: DType::Raw,
+    };
+    execute_fa_attend_step(
+        gpu, config, &q_codes, &pbs.fa_k_batch, &pbs.fa_v_batch, &pbs.positions, &slab, s,
+        kv_cache, n, start_pos, max_ctx_len, ctx, None, layer_idx,
+        Some((&pbs.fa_q_full_batch, awq)),
+    )?;
+    let prep = rdna_compute::Int4MmqPrepared::from_reservation(res);
+    gpu.scratch.mark_int4_mmq_slab(&prep)?;
+    Ok(prep)
 }
 
 pub(crate) fn batch_chunk_full_attn_attn(
@@ -9555,6 +9618,19 @@ pub(crate) fn batch_chunk_full_attn_attn(
                 && gpu.fp8_stream_active(n, layer.wo.k)
                 && !gpu.iu4_producer_quant_fused_active(n, layer.wo.k)
         };
+    // A4 attention epilogue: when the gate stays in place for the gfx1201 IU4
+    // AWQ sigmoid producer on the slab route, the fp8q attention itself
+    // writes that producer's A4 slab (`HIPFIRE_A4_ATTN_EPI=0` keeps the
+    // attention + producer pair). Implies the fp8q single-step attend.
+    let a4_epi_awq = if fa_gate_in_place
+        && gpu.a4_slab_active()
+        && gfx12_sigmoid_rotate_quant_admitted(gpu, &layer.wo, layer.wo.k, n, &epilogue)
+        && a4_attn_epilogue_enabled()
+    {
+        layer.wo.awq_scale.as_ref()
+    } else {
+        None
+    };
     batch_chunk_full_attn_input_projection(gpu, layer, config, pbs, n, dim, q8_wmma_arch, fusion)?;
 
     batch_chunk_full_attn_prepare(
@@ -9583,23 +9659,32 @@ pub(crate) fn batch_chunk_full_attn_attn(
     // `batch_chunk_full_attn_prepare` (F2) so a chunk pair can run both
     // halves' prep first and share one merged attend step; called here for
     // the single-chunk path in the original position.
-    batch_chunk_fa_attend(
-        gpu,
-        config,
-        pbs,
-        s,
-        kv_cache,
-        n,
-        start_pos,
-        max_ctx_len,
-        ctx,
-        batch_semantics,
-        tree_verify,
-        layer_idx,
-        fa_attn_multirow,
-        commit_stride,
-        gfx12_fa_prep_fp8q,
-    )?;
+    let a4_epi = match a4_epi_awq {
+        Some(awq) => Some(batch_chunk_fa_attend_a4(
+            gpu, config, pbs, s, kv_cache, n, start_pos, max_ctx_len, ctx, layer_idx,
+            layer.wo.k, awq,
+        )?),
+        None => {
+            batch_chunk_fa_attend(
+                gpu,
+                config,
+                pbs,
+                s,
+                kv_cache,
+                n,
+                start_pos,
+                max_ctx_len,
+                ctx,
+                batch_semantics,
+                tree_verify,
+                layer_idx,
+                fa_attn_multirow,
+                commit_stride,
+                gfx12_fa_prep_fp8q,
+            )?;
+            None
+        }
+    };
     batch_chunk_full_attn_output_projection(
         gpu,
         layer,
@@ -9610,6 +9695,7 @@ pub(crate) fn batch_chunk_full_attn_attn(
         epilogue,
         fusion,
         fa_gate_in_place,
+        a4_epi,
     )?;
 
     Ok(())
@@ -12130,6 +12216,7 @@ fn batch_chunk_fa_attend_merged(
         ctx,
         None,
         layer_idx,
+        None,
     )?;
     gpu.hip.memcpy_dtod_at(
         &pbs_c.fa_attn_out_batch.buf,
@@ -12453,6 +12540,7 @@ fn forward_prefill_chunk_pair(
                         BatchEpilogue::Residual,
                         fusion,
                         false,
+                        None,
                     )?;
                     batch_chunk_full_attn_ffn(
                         gpu,
@@ -12477,6 +12565,7 @@ fn forward_prefill_chunk_pair(
                         BatchEpilogue::Residual,
                         fusion,
                         false,
+                        None,
                     )?;
                     batch_chunk_full_attn_ffn(
                         gpu,

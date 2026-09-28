@@ -129,6 +129,14 @@ pub fn q8_flash_tile_size(
 const QRESIDENT_V2_LDS_BYTES: u32 = 2 * (2 * 12288 + 2 * 192) + 16;
 const _: () = assert!(QRESIDENT_V2_LDS_BYTES == 49936);
 
+/// Output of a Q-resident attention launch: the f32 rows, or (A4 epilogue
+/// twin) the Q/gate rows, output-projection AWQ scales and A4 slab.
+#[derive(Clone, Copy)]
+enum QresidentOut<'a> {
+    F32(&'a GpuTensor),
+    A4Slab { qgate: &'a GpuTensor, awq: &'a GpuTensor, x_i4: &'a GpuTensor },
+}
+
 const V_MODE_Q8: i32 = 8;
 /// Token-local row bytes for the native fp8-E4M3 KV format (§2.1): Hkv*D
 /// codes followed by Hkv little-endian f16 scales. 1032 B/side at Hkv=4,D=256.
@@ -4862,7 +4870,7 @@ impl Gpu {
             q,
             k_cache,
             v_cache,
-            out,
+            QresidentOut::F32(out),
             positions,
             n_heads,
             n_kv_heads,
@@ -4898,7 +4906,7 @@ impl Gpu {
             q,
             k_cache,
             v_cache,
-            out,
+            QresidentOut::F32(out),
             positions,
             n_heads,
             n_kv_heads,
@@ -4931,7 +4939,47 @@ impl Gpu {
         self.qresident_launch(
             "attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_gfx1201",
             kernels::ATTENTION_FP8_E4M3_FA2_GQA_QRESIDENT_V2_Q8_GFX1201_SRC,
-            QRESIDENT_V2_LDS_BYTES, true, q, k_cache, v_cache, out, positions,
+            QRESIDENT_V2_LDS_BYTES, true, q, k_cache, v_cache, QresidentOut::F32(out), positions,
+            n_heads, n_kv_heads, head_dim, max_ctx_len, batch_size,
+        )
+    }
+
+    /// A4 epilogue twin of [`Self::attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_gfx1201`]
+    /// (`attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_a4epi_gfx1201`): the same
+    /// body, but its epilogue writes the FA out-projection's A4 slab to `x_i4`
+    /// instead of the f32 output. The bytes are those
+    /// `sigmoid_mul_rotate_x_mq_awq_i4_gil_gfx12_slab` forms from that output:
+    /// sigmoid gate read in place from the Q/gate projection rows `qgate`
+    /// (`[batch, n_heads x (head_dim q, head_dim gate)]` f32), the output
+    /// projection's `awq` scales and the model FWHT signs. `x_i4` holds the
+    /// slab, `(n_heads * head_dim / 128) * batch * 72` bytes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_a4epi_gfx1201(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        qgate: &GpuTensor,
+        awq: &GpuTensor,
+        x_i4: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        if q.dtype != crate::DType::Raw
+            || q.buf.size() < batch_size * n_heads * (head_dim + 4)
+        {
+            return Err(hip_bridge::HipError::new(0, "Q8 resident attention requires Raw codes and scales"));
+        }
+        self.ensure_mq_signs()?;
+        self.qresident_launch(
+            "attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_a4epi_gfx1201",
+            kernels::ATTENTION_FP8_E4M3_FA2_GQA_QRESIDENT_V2_Q8_A4EPI_GFX1201_SRC,
+            QRESIDENT_V2_LDS_BYTES, true, q, k_cache, v_cache,
+            QresidentOut::A4Slab { qgate, awq, x_i4 }, positions,
             n_heads, n_kv_heads, head_dim, max_ctx_len, batch_size,
         )
     }
@@ -4948,7 +4996,7 @@ impl Gpu {
         q: &GpuTensor,
         k_cache: &GpuTensor,
         v_cache: &GpuTensor,
-        out: &GpuTensor,
+        out: QresidentOut<'_>,
         positions: &GpuTensor,
         n_heads: usize,
         n_kv_heads: usize,
@@ -4987,14 +5035,21 @@ impl Gpu {
             ));
         }
         let need_qo = batch_size * n_heads * head_dim;
-        if q.numel() < need_qo || out.numel() < need_qo || positions.numel() < batch_size {
+        let out_ok = match out {
+            QresidentOut::F32(o) => o.numel() >= need_qo,
+            QresidentOut::A4Slab { qgate, awq, x_i4 } => {
+                qgate.numel() >= 2 * need_qo
+                    && awq.numel() >= n_heads * head_dim
+                    && x_i4.buf.size() >= (n_heads * head_dim / 128) * batch_size * 72
+            }
+        };
+        if q.numel() < need_qo || !out_ok || positions.numel() < batch_size {
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
                     "{symbol} capacity mismatch: \
-                     q={} out={} positions={} (need qo>={need_qo}, pos>={batch_size})",
+                     q={} positions={} (need qo>={need_qo}, pos>={batch_size}; output ok={out_ok})",
                     q.numel(),
-                    out.numel(),
                     positions.numel()
                 ),
             ));
@@ -5014,7 +5069,21 @@ impl Gpu {
         };
         let mut k_ptr = k_cache.buf.as_ptr();
         let mut v_ptr = v_cache.buf.as_ptr();
-        let mut out_ptr = out.buf.as_ptr();
+        // F32: the output rows. A4Slab: gate rows, awq, signs1, signs2, slab.
+        let null = std::ptr::null_mut();
+        let (mut out_ptrs, n_out): ([*mut c_void; 5], usize) = match out {
+            QresidentOut::F32(o) => ([o.buf.as_ptr(), null, null, null, null], 1),
+            QresidentOut::A4Slab { qgate, awq, x_i4 } => (
+                [
+                    qgate.buf.as_ptr(),
+                    awq.buf.as_ptr(),
+                    self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr(),
+                    self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr(),
+                    x_i4.buf.as_ptr(),
+                ],
+                5,
+            ),
+        };
         let mut pos_ptr = positions.buf.as_ptr();
         let mut nh = n_heads as i32;
         let mut nkv = n_kv_heads as i32;
@@ -5025,14 +5094,18 @@ impl Gpu {
             &mut q_arg as *mut _ as *mut c_void,
             &mut k_ptr as *mut _ as *mut c_void,
             &mut v_ptr as *mut _ as *mut c_void,
-            &mut out_ptr as *mut _ as *mut c_void,
+        ];
+        for p in out_ptrs[..n_out].iter_mut() {
+            params.push(p as *mut _ as *mut c_void);
+        }
+        params.extend([
             &mut pos_ptr as *mut _ as *mut c_void,
             &mut nh as *mut _ as *mut c_void,
             &mut nkv as *mut _ as *mut c_void,
             &mut hd as *mut _ as *mut c_void,
             &mut bs as *mut _ as *mut c_void,
             &mut sc as *mut _ as *mut c_void,
-        ];
+        ]);
         if q8_input {
             params.insert(1, &mut q_scales as *mut _ as *mut c_void);
         }
@@ -5054,7 +5127,9 @@ impl Gpu {
                 }
                 b.push_ptr(k_ptr);
                 b.push_ptr(v_ptr);
-                b.push_ptr(out_ptr);
+                for &p in &out_ptrs[..n_out] {
+                    b.push_ptr(p);
+                }
                 b.push_ptr(pos_ptr);
                 b.push_i32(nh);
                 b.push_i32(nkv);

@@ -2709,9 +2709,360 @@ static __device__ __forceinline__ float fa2_qr2_div448(float x)
 #define FA2_QR2_YLO(y) ((y) * 0x1.fffffp-1f)
 #define FA2_QR2_YHI(y) ((y) * 0x1.000008p+0f)
 
+#if defined(HIPFIRE_FA2_A4_EPILOGUE)
+// ---- A4 attention-output epilogue (HIPFIRE_FA2_A4_EPILOGUE) ----
+// attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_a4epi_gfx1201 runs the Q8 body
+// unchanged and, instead of storing the f32 output O = Ofr * inv, forms the
+// out-projection's A4 slab in the epilogue: exactly what
+// sigmoid_mul_rotate_x_mq_awq_i4_gil_gfx12_slab (mq_rotate_x_i4.hip +
+// block_i4_128_quant.hip, IU4_A4_CANDIDATES=2, HIPFIRE_IU4_SLAB) computes
+// from that O. Head dim 256 is one FWHT-256 group and two K128 blocks, so a
+// row's lane pair (ml, ml + 16) holds a whole group: dim d = 16 dc + 8 kg + j
+// sits in Ofr[dc][j] of lane 16 kg + ml.
+// Arithmetic, element by element, as the producer:
+//  * x = O * sigmoid(gate), gate read in place from the Q/gate rows (float
+//    512 h + 256 + d); sigmoid is fa2_a4_sigmoid below, bit-identical to the
+//    producer's `1.0f / (1.0f + expf(-g))` for all 2^32 g;
+//  * v = (x / awq[256 h + d]) * signs1[d];
+//  * FWHT-256 stages in the producer's order, dim bits 0..7, each butterfly
+//    (lo, hi) -> (lo + hi, lo - hi): bits 0-2 are j (in register), bit 3 is
+//    kg (lane ^ 16: fma(+-1, v, partner) is exactly v + p / p - v), bits
+//    4-7 are dc (in register);
+//  * f = (v * 0.0625f) * signs2[d].
+// Quant of each K128 block, as emit_iu4_sidecar_c2_gfx12: amax (max is
+// order-free), the same d0/d1 and refined reciprocals, codes, frac test,
+// and the reference divides when any lane of the wave fails it (both
+// branches give the reference codes, so the wave granularity is free). The
+// block mse is the reference tree: per group of 4 elements (g = e >> 2) an
+// fma chain in element order, then pairs of g differing in bit 4, 3, 2, 1,
+// 0. Here g bits 2-4 are dc bits 0-2 (in register), bit 1 is kg (lane ^ 16)
+// and bit 0 is j bit 2. Code sum is exact integer arithmetic; qs word w =
+// 2 (dc & 7) + kg holds the lane's eight codes of that dc. Slab store: per
+// block (2 h + blk) planes [d 4N][s 4N][qs 0..31: 32N][qs 32..63: 32N].
+#define FA2_A4_AWQ_STRIDE 268  // 268 / 4 = 67 = 3 (mod 16): the 12 (head, kg) b128 reads of one load hit distinct bank quads
+#define FA2_A4_GATE_AHEAD 3    // gate loads in flight ahead of the dc being computed
+// Scheduling fence: keeps the 128-value working set from being interleaved
+// across phases (which spills); six resident waves per SIMD supply the ILP.
+#define FA2_A4_FENCE() __builtin_amdgcn_sched_barrier(0)
+
+static __device__ __forceinline__ int fa2_a4_xor16i(int v)
+{
+    return __builtin_amdgcn_permlanex16(v, v, 0x76543210, 0xfedcba98, false, false);
+}
+
+// sigmoid(g) with the bits of the producer's `1.0f / (1.0f + expf(-g))` for
+// every one of the 2^32 f32 g (NaN payloads, signed zeros, denormals and
+// infinities included; exhaustive check on gfx1201: fa2_a4_sigmoid_exhaust in
+// the attn-epi harness). Contraction off: the sequence is the ocml expf
+// expansion hipcc emits for the producer (hi/lo split of -g log2 e, rint,
+// exp2, ldexp), except
+//  * one NaN-propagating clamp of g to [-128, 128] (v_maximumminimum_f32)
+//    replaces its two compare+select range fixups: g > 103.28 gives e = 0,
+//    g < -88.72 gives e = inf, and both saturate 1 + e to the same value;
+//  * the IEEE 1 / d (d = 1 + e >= 1, VCC-bound div_scale/div_fmas) becomes
+//    rcp(d 2^-32) 2^-32 (rcp would flush for d >= 2^126), one residual
+//    correction and the same v_div_fixup_f32 for the special operands.
+static __device__ __forceinline__ float fa2_a4_sigmoid(float g)
+{
+#pragma clang fp contract(off)
+    const float x = __builtin_elementwise_minimum(
+        __builtin_elementwise_maximum(g, -128.0f), 128.0f);
+    const float hi = __uint_as_float(0xbfb8aa3bu);  // -log2(e), high part
+    const float lo = __uint_as_float(0xb2a5705fu);  // low part
+    const float ph = x * hi;
+    float pl = __builtin_fmaf(x, hi, -ph);
+    const float rn = __builtin_rintf(ph);
+    pl = __builtin_fmaf(x, lo, pl);
+    const float t = (ph - rn) + pl;
+    const float e = __builtin_amdgcn_ldexpf(__builtin_amdgcn_exp2f(t), (int)rn);
+    const float d = 1.0f + e;
+    const float r = __builtin_amdgcn_rcpf(d * 0x1p-32f) * 0x1p-32f;
+    const float q = __builtin_fmaf(__builtin_fmaf(-d, r, 1.0f), r, r);
+    return __builtin_amdgcn_div_fixupf(q, d, 1.0f);
+}
+
+// Producer-order FWHT stages on dim bits 0-2 (the eight j of one dc).
+static __device__ __forceinline__ void fa2_a4_fwht8(float (&o)[8])
+{
+    float v0 = o[0], v1 = o[1], v2 = o[2], v3 = o[3];
+    float v4 = o[4], v5 = o[5], v6 = o[6], v7 = o[7];
+    float t;
+    t = v0; v0 = v0 + v1; v1 = t - v1;
+    t = v2; v2 = v2 + v3; v3 = t - v3;
+    t = v4; v4 = v4 + v5; v5 = t - v5;
+    t = v6; v6 = v6 + v7; v7 = t - v7;
+
+    t = v0; v0 = v0 + v2; v2 = t - v2;
+    t = v1; v1 = v1 + v3; v3 = t - v3;
+    t = v4; v4 = v4 + v6; v6 = t - v6;
+    t = v5; v5 = v5 + v7; v7 = t - v7;
+
+    t = v0; v0 = v0 + v4; v4 = t - v4;
+    t = v1; v1 = v1 + v5; v5 = t - v5;
+    t = v2; v2 = v2 + v6; v6 = t - v6;
+    t = v3; v3 = v3 + v7; v7 = t - v7;
+    o[0] = v0; o[1] = v1; o[2] = v2; o[3] = v3;
+    o[4] = v4; o[5] = v5; o[6] = v6; o[7] = v7;
+}
+
+// Reference mse tree of one candidate from the per-(dc & 7, j >> 2) chains.
+static __device__ __forceinline__ float fa2_a4_mse(const float c[8][2])
+{
+    float w[2];
+#pragma unroll
+    for (int jb = 0; jb < 2; ++jb) {
+        w[jb] = ((c[0][jb] + c[4][jb]) + (c[2][jb] + c[6][jb]))
+              + ((c[1][jb] + c[5][jb]) + (c[3][jb] + c[7][jb]));
+        w[jb] += fa2_qr2_xor16(w[jb]);
+    }
+    return w[0] + w[1];
+}
+
+// Both candidates' block mse over o[0..7] (one K128 block of this lane) as
+// iu4_c2_mse: q0 clamped, q1 as given (already clamped by the caller on the
+// divide path, in range on the fast path).
+template <bool Divide>
+static __device__ __forceinline__ void fa2_a4_block_mse(
+    const float (*o)[8], float d0, float d1, float r0, float r1,
+    float& mse0, float& mse1, float& frac)
+{
+    float c0[8][2], c1[8][2];
+#pragma unroll
+    for (int dcl = 0; dcl < 8; ++dcl) {
+#pragma unroll
+        for (int jb = 0; jb < 2; ++jb) {
+            float a0 = 0.0f, a1 = 0.0f;
+#pragma unroll
+            for (int jj = 0; jj < 4; ++jj) {
+                const float x = o[dcl][4 * jb + jj];
+                float q0, q1;
+                if (Divide) {
+                    q0 = rintf(x / d0);
+                    q1 = fminf(fmaxf(rintf(x / d1), -8.0f), 7.0f);
+                } else {
+                    const float y0 = x * r0;
+                    const float y1 = x * r1;
+                    q0 = rintf(y0);
+                    q1 = rintf(y1);
+                    frac = fmaxf(frac, fmaxf(fabsf(y0 - q0), fabsf(y1 - q1)));
+                }
+                q0 = fminf(fmaxf(q0, -8.0f), 7.0f);
+                const float e0 = __fmaf_rn(-q0, d0, x);
+                const float e1 = __fmaf_rn(-q1, d1, x);
+                a0 = __fmaf_rn(e0, e0, a0);
+                a1 = __fmaf_rn(e1, e1, a1);
+            }
+            c0[dcl][jb] = a0;
+            c1[dcl][jb] = a1;
+        }
+        FA2_A4_FENCE();
+    }
+    mse0 = fa2_a4_mse(c0);
+    mse1 = fa2_a4_mse(c1);
+}
+
+// Final codes of one K128 block: the chosen candidate (the reference's q0 is
+// clamped, its fast-path q1 is in range, so both clamp), or on unit lanes
+// the reference's unit/zero fallback (Unit: some lane of the wave has one);
+// the lane's code sum and one qs word per dcl.
+template <bool Divide, bool Unit>
+static __device__ __forceinline__ void fa2_a4_codes(
+    const float (*o)[8], float dsel, float rsel, bool unit, bool zero, int& s,
+    unsigned int w[8])
+{
+#pragma unroll
+    for (int dcl = 0; dcl < 8; ++dcl) {
+        unsigned int word = 0u;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const float x = o[dcl][j];
+            float q = Divide ? rintf(x / dsel) : rintf(x * rsel);
+            q = fminf(fmaxf(q, -8.0f), 7.0f);
+            if (Unit && unit)
+                q = zero ? 0.0f : fminf(fmaxf(rintf(x / 1.0f), -8.0f), 7.0f);
+            const int qi = (int)q;
+            s += qi;
+            word |= (unsigned int)(qi & 15) << (4 * j);
+        }
+        w[dcl] = word;
+        FA2_A4_FENCE();
+    }
+}
+
+// Scale (the producer's `v * s * signs2[d]`), quantize and store one K128
+// block (o[0..7] = dc 8 blk .. 8 blk + 7, s2 = signs2 + 128 blk + 8 kg).
+// The scale runs here so each block's multiplies stay next to its uses.
+static __device__ __forceinline__ void fa2_a4_block(
+    float (*o)[8], const float* s2, int kg, bool qok, unsigned tok, int head,
+    int blk, unsigned char* __restrict__ x_i4, int N)
+{
+    float amax = 0.0f;
+#pragma unroll
+    for (int dcl = 0; dcl < 8; ++dcl) {
+        const float4 t0 = *(const float4*)(s2 + dcl * 16);
+        const float4 t1 = *(const float4*)(s2 + dcl * 16 + 4);
+        const float sv[8] = {t0.x, t0.y, t0.z, t0.w, t1.x, t1.y, t1.z, t1.w};
+        const float s = 0.0625f;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            o[dcl][j] = o[dcl][j] * s * sv[j];
+            // max_num is order-free; seeded with the first element so an
+            // all-NaN block keeps amax = NaN as in the reference.
+            amax = (dcl | j) ? fmaxf(amax, fabsf(o[dcl][j])) : fabsf(o[dcl][j]);
+        }
+        FA2_A4_FENCE();
+    }
+    amax = fmaxf(amax, fa2_qr2_xor16(amax));
+    const bool zero = amax == 0.0f;
+
+    const float candidate_base = (amax / 7.0f) * 0.5f;
+    const float d0 = candidate_base * 0x1.b6db6ep+0f;
+    const float d1 = candidate_base * 2.0f;
+    float r0 = __builtin_amdgcn_rcpf(d0);
+    float r1 = __builtin_amdgcn_rcpf(d1);
+    r0 = __fmaf_rn(r0, __fmaf_rn(-d0, r0, 1.0f), r0);
+    r1 = __fmaf_rn(r1, __fmaf_rn(-d1, r1, 1.0f), r1);
+
+    float mse0, mse1, frac = 0.0f;
+    fa2_a4_block_mse<false>(o, d0, d1, r0, r1, mse0, mse1, frac);
+    const bool exact = zero
+        || (amax >= 0x1p-100f && amax <= 0x1.fffffep+127f && frac <= 0.5f - 0x1p-18f);
+    const bool divide = __builtin_amdgcn_ballot_w32(!exact) != 0u;
+    if (divide)
+        fa2_a4_block_mse<true>(o, d0, d1, r0, r1, mse0, mse1, frac);
+    const bool take0 = mse0 < 1.0e30f;
+    const bool use1 = mse1 < (take0 ? mse0 : 1.0e30f);
+    const bool unit = zero || !(take0 || use1);
+    const float dsel = use1 ? d1 : d0;
+    const float rsel = use1 ? r1 : r0;
+
+    // The divide codes are the reference codes whatever the frac test said,
+    // so a wave with a unit lane takes them too; the common wave runs the
+    // fast codes without the per-element unit select.
+    int s = 0;
+    unsigned int w[8];
+    if (divide || __builtin_amdgcn_ballot_w32(unit) != 0u)
+        fa2_a4_codes<true, true>(o, dsel, rsel, unit, zero, s, w);
+    else
+        fa2_a4_codes<false, false>(o, dsel, rsel, unit, zero, s, w);
+    s += fa2_a4_xor16i(s);
+
+    // Word 2 dcl + kg; the lane pair trades words so each lane stores 16
+    // contiguous bytes per qs plane (kg 0: words 0-3 / 8-11, kg 1: 4-7 /
+    // 12-15): kg 1 sends its dcl 0,1 / 4,5 words, kg 0 its dcl 2,3 / 6,7.
+    unsigned int e[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int lo = (i & 1) + 4 * (i >> 1);
+        e[i] = (unsigned int)fa2_a4_xor16i((int)(kg ? w[lo] : w[lo + 2]));
+    }
+    if (qok) {
+        unsigned char* b = x_i4 + (unsigned long long)(2 * head + blk)
+            * (unsigned long long)N * 72ULL;
+        const unsigned long long n = (unsigned long long)N;
+        if (kg == 0) {
+            *(float*)(b + tok * 4ULL) = unit ? 1.0f : dsel;
+            *(int*)(b + 4ULL * n + tok * 4ULL) = s;
+        }
+#pragma unroll
+        for (int plane = 0; plane < 2; ++plane) {
+            const int d = 4 * plane;
+            unsigned char* p = b + (plane ? 40ULL : 8ULL) * n + tok * 32ULL
+                + (unsigned)(kg * 16);
+            const uint2 lo = kg ? make_uint2(e[2 * plane], w[d + 2])
+                                : make_uint2(w[d], e[2 * plane]);
+            const uint2 hi = kg ? make_uint2(e[2 * plane + 1], w[d + 3])
+                                : make_uint2(w[d + 1], e[2 * plane + 1]);
+            *(uint2*)p = lo;
+            *(uint2*)(p + 8) = hi;
+        }
+    }
+}
+
+static __device__ __forceinline__ void fa2_a4_epilogue(
+    const float8_t (&O)[16], float inv, bool qok, int query, int head, int hl,
+    int kg, const float* __restrict__ qgate, const float* awq_l,
+    const float* s1_l, const float* s2_l, unsigned char* __restrict__ x_i4,
+    int N)
+{
+    const unsigned tok = qok ? (unsigned)query : 0u;
+    const float* gp = qgate + (unsigned long long)tok * 12288ULL
+        + (unsigned)(head * 512 + 256 + kg * 8);
+    const float* ap = awq_l + hl * FA2_A4_AWQ_STRIDE + kg * 8;
+    const float* s1 = s1_l + kg * 8;
+    // Scalar working set: element-wise updates of the float8_t accumulator
+    // tuples would keep whole 8-register tuples live.
+    float o[16][8];
+    // Gate ring: the loads for dc + FA2_A4_GATE_AHEAD issue while dc computes.
+    float4 gr[FA2_A4_GATE_AHEAD][2];
+#pragma unroll
+    for (int i = 0; i < FA2_A4_GATE_AHEAD; ++i) {
+        gr[i][0] = *(const float4*)(gp + i * 16);
+        gr[i][1] = *(const float4*)(gp + i * 16 + 4);
+    }
+    // v = (O * sigmoid(gate) / awq) * signs1, FWHT dim bits 0-2.
+#pragma unroll
+    for (int dc = 0; dc < 16; ++dc) {
+        const float4 g0 = gr[dc % FA2_A4_GATE_AHEAD][0];
+        const float4 g1 = gr[dc % FA2_A4_GATE_AHEAD][1];
+        if (dc + FA2_A4_GATE_AHEAD < 16) {
+            gr[dc % FA2_A4_GATE_AHEAD][0] =
+                *(const float4*)(gp + (dc + FA2_A4_GATE_AHEAD) * 16);
+            gr[dc % FA2_A4_GATE_AHEAD][1] =
+                *(const float4*)(gp + (dc + FA2_A4_GATE_AHEAD) * 16 + 4);
+        }
+        const float4 a0 = *(const float4*)(ap + dc * 16);
+        const float4 a1 = *(const float4*)(ap + dc * 16 + 4);
+        const float4 t0 = *(const float4*)(s1 + dc * 16);
+        const float4 t1 = *(const float4*)(s1 + dc * 16 + 4);
+        const float gv[8] = {g0.x, g0.y, g0.z, g0.w, g1.x, g1.y, g1.z, g1.w};
+        const float av[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
+        const float sv[8] = {t0.x, t0.y, t0.z, t0.w, t1.x, t1.y, t1.z, t1.w};
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            float x = O[dc][j] * inv;
+            x = x * fa2_a4_sigmoid(gv[j]);
+            o[dc][j] = (x / av[j]) * sv[j];
+        }
+        fa2_a4_fwht8(o[dc]);
+        FA2_A4_FENCE();
+    }
+    // FWHT dim bit 3 (lane ^ 16), then bits 4-7 one j at a time.
+    const float sg = kg ? -1.0f : 1.0f;
+#pragma unroll
+    for (int dc = 0; dc < 16; ++dc) {
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+            o[dc][j] = __builtin_fmaf(sg, o[dc][j], fa2_qr2_xor16(o[dc][j]));
+        FA2_A4_FENCE();
+    }
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+#pragma unroll
+        for (int b = 1; b < 16; b <<= 1)
+#pragma unroll
+            for (int dc = 0; dc < 16; ++dc)
+                if (!(dc & b)) {
+                    const float lo = o[dc][j];
+                    const float hi = o[dc + b][j];
+                    o[dc][j] = lo + hi;
+                    o[dc + b][j] = lo - hi;
+                }
+        FA2_A4_FENCE();
+    }
+    fa2_a4_block(&o[0], s2_l + kg * 8, kg, qok, tok, head, 0, x_i4, N);
+    FA2_A4_FENCE();
+    fa2_a4_block(&o[8], s2_l + 128 + kg * 8, kg, qok, tok, head, 1, x_i4, N);
+}
+#endif
+
 extern "C" __global__ __launch_bounds__(768, 1)
 __attribute__((amdgpu_waves_per_eu(6), amdgpu_num_vgpr(240)))
-#if defined(HIPFIRE_FA2_QRESIDENT_V2_Q8)
+#if defined(HIPFIRE_FA2_A4_EPILOGUE)
+void attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_a4epi_gfx1201(
+    const unsigned char* __restrict__ q_codes,
+    const float* __restrict__ q_scales,
+#elif defined(HIPFIRE_FA2_QRESIDENT_V2_Q8)
 void attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_gfx1201(
     const unsigned char* __restrict__ q_codes,
     const float* __restrict__ q_scales,
@@ -2721,7 +3072,15 @@ void attention_fp8_e4m3_fa2_gqa_qresident_v2_gfx1201(
 #endif
     const unsigned char* __restrict__ k_cache,
     const unsigned char* __restrict__ v_cache,
+#if defined(HIPFIRE_FA2_A4_EPILOGUE)
+    const float* __restrict__ qgate,      // [N, 24 x (256 q, 256 gate)] f32
+    const float* __restrict__ awq_scale,  // [6144] f32
+    const float* __restrict__ signs1,     // [256] FWHT signs
+    const float* __restrict__ signs2,     // [256]
+    unsigned char* __restrict__ x_i4,     // A4 slab, 48 blocks x 72 N bytes
+#else
     float* __restrict__ out,
+#endif
     const int* __restrict__ positions,
     int n_heads,
     int n_kv_heads,
@@ -3150,6 +3509,27 @@ void attention_fp8_e4m3_fa2_gqa_qresident_v2_gfx1201(
         buf ^= 1u;
     }
 
+#if defined(HIPFIRE_FA2_A4_EPILOGUE)
+    // The last tile's barrier retired every K/V read: reuse the LDS for this
+    // workgroup's six AWQ rows and the two sign vectors.
+    {
+        // [awq rows 6 x FA2_A4_AWQ_STRIDE][signs1 256][signs2 256]
+        float* awq_l = (float*)LDS;
+        float* s1_l = awq_l + 6 * FA2_A4_AWQ_STRIDE;
+        float* s2_l = s1_l + 256;
+        const float* awq_h = awq_scale + kv_h * 1536;
+        awq_l[(tid >> 8) * FA2_A4_AWQ_STRIDE + (tid & 255)] = awq_h[tid];
+        awq_l[((tid >> 8) + 3) * FA2_A4_AWQ_STRIDE + (tid & 255)] = awq_h[tid + 768];
+        if (tid < 256)
+            s1_l[tid] = signs1[tid];
+        else if (tid < 512)
+            s2_l[tid - 256] = signs2[tid - 256];
+        __syncthreads();
+        const float inv = l_val > 0.0f ? b_ref / l_val : 0.0f;
+        fa2_a4_epilogue(Ofr, inv, qok, query, head, row % 6, kg, qgate,
+                        awq_l, s1_l, s2_l, x_i4, batch_size);
+    }
+#else
     if (qok) {
         const float inv = l_val > 0.0f ? b_ref / l_val : 0.0f;
         const unsigned bo =
@@ -3163,6 +3543,7 @@ void attention_fp8_e4m3_fa2_gqa_qresident_v2_gfx1201(
                 out[bd + (unsigned)j] = Ofr[dc][j] * inv;
         }
     }
+#endif
 }
 #undef FA2_QR2_YLO
 #undef FA2_QR2_YHI

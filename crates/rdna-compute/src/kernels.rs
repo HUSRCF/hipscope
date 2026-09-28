@@ -6848,6 +6848,19 @@ pub const ATTENTION_FP8_E4M3_FA2_GQA_QRESIDENT_V2_Q8_GFX1201_SRC: &str = concat!
     "#define HIPFIRE_FA2_KMODE 8\n",
     include_str!("../../../kernels/src/attention_q8_0_fa2_gqa.gfx1201.hip")
 );
+/// A4 epilogue twin of [`ATTENTION_FP8_E4M3_FA2_GQA_QRESIDENT_V2_Q8_GFX1201_SRC`]
+/// (`attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_a4epi_gfx1201`): the same
+/// body; its epilogue emits the FA out-projection's A4 slab (the bytes
+/// `sigmoid_mul_rotate_x_mq_awq_i4_gil_gfx12_slab` forms from the f32 output)
+/// instead of the f32 output. Default on the exact gfx1201 A4 slab route;
+/// `HIPFIRE_A4_ATTN_EPI=0` restores the q8 body + producer pair.
+pub const ATTENTION_FP8_E4M3_FA2_GQA_QRESIDENT_V2_Q8_A4EPI_GFX1201_SRC: &str = concat!(
+    "#define HIPFIRE_FA2_QRESIDENT_V2_Q8 1\n",
+    "#define HIPFIRE_FA2_A4_EPILOGUE 1\n",
+    "#define HIPFIRE_FA2_FP8 1\n",
+    "#define HIPFIRE_FA2_KMODE 8\n",
+    include_str!("../../../kernels/src/attention_q8_0_fa2_gqa.gfx1201.hip")
+);
 
 
 /// gfx11 (RDNA3) sister of [`ATTENTION_Q8_0_FA2_GQA_GFX1201_SRC`]

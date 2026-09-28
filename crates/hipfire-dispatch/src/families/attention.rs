@@ -57,10 +57,13 @@ pub struct AttnParams<'a> {
     pub block_start: usize,
     /// Tree window cols (0 for plain causal).
     pub block_cols: usize,
-    /// Optional Qwen decode gate. When present on the narrow Q8 single-token
+    /// Optional Qwen output gate. When present on the narrow Q8 single-token
     /// path, the family pairs the K/V writes and applies the gate plus MQ
-    /// rotation in the flash-reduce epilogue; all other callers leave this
-    /// `None`.
+    /// rotation in the flash-reduce epilogue. On the batched gfx1201
+    /// native-fp8 Raw-Q (Q-resident v2 q8) path it is the Q/gate projection
+    /// rows, and with `output_awq_scale` it selects the A4 epilogue twin,
+    /// which writes the out-projection's A4 slab to a Raw `output`. All
+    /// other callers leave this `None`.
     pub output_gate: Option<&'a GpuTensor>,
     /// AWQ scale for the WO projection following this attention output. Some
     /// with output_gate None is a dispatch error; (Some gate, Some scale)
@@ -2384,10 +2387,26 @@ fn dispatch_attend(
                     && io.tree_bias.is_none()
                 {
                     if io.q.dtype == DType::Raw {
-                        hip!(gpu.attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_gfx1201(
-                            io.q, io.k_cache, io.v_cache, io.output, io.positions(),
-                            io.n_heads, io.n_kv_heads, io.head_dim, io.max_ctx_len, io.batch_size,
-                        ))?;
+                        // With the Qwen output gate and AWQ scale, the A4
+                        // epilogue twin writes the out-projection's A4 slab
+                        // (Raw `output`) instead of the f32 output.
+                        match (io.output_gate, io.output_awq_scale) {
+                            (Some(gate), Some(awq)) => hip!(gpu
+                                .attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_a4epi_gfx1201(
+                                    io.q, io.k_cache, io.v_cache, gate, awq, io.output,
+                                    io.positions(), io.n_heads, io.n_kv_heads, io.head_dim,
+                                    io.max_ctx_len, io.batch_size,
+                                ))?,
+                            (None, None) => hip!(gpu.attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_gfx1201(
+                                io.q, io.k_cache, io.v_cache, io.output, io.positions(),
+                                io.n_heads, io.n_kv_heads, io.head_dim, io.max_ctx_len, io.batch_size,
+                            ))?,
+                            _ => {
+                                return Err(DispatchError::Hip(
+                                    "batched Raw-Q attention: output gate and AWQ scale must be set together".into(),
+                                ))
+                            }
+                        }
                         return Ok(());
                     }
                     // v2 is the bit-exact reschedule of the same body;
