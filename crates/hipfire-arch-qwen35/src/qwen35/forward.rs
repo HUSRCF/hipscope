@@ -1118,6 +1118,41 @@ fn qwen35_x_rot_len(dim: usize, hidden_dim: usize, v_dim: usize) -> usize {
     dim.max(hidden_dim).max(v_dim)
 }
 
+/// Number of F32 elements in the shared flash-attention partials buffer.
+///
+/// Legacy sizing (every arch except the measured gfx1100 split below):
+/// `batch_mult` query rows at the smallest of the Q8 decode tile, 128 and the
+/// batched-attention tile.
+///
+/// Exact gfx1100 whose Q8 decode tile is finer than the batched tile (tile32
+/// vs tile128 through 8K): single-token decode and batched attention never
+/// use the buffer at the same time, so it holds the larger of one decode row
+/// at the decode tile and `batch_mult` rows (default 32) at the batched tile.
+/// Batched launchers sub-batch by the buffer's capacity, so the smaller
+/// buffer only costs extra launches past 32 rows.
+fn qwen35_flash_partials_len(
+    arch: &str,
+    n_heads: usize,
+    head_dim: usize,
+    kv_max_seq: usize,
+    q8_decode_tile: usize,
+    batched_tile: usize,
+    configured_batch: Option<usize>,
+) -> usize {
+    let stride = 2 + head_dim;
+    if arch == "gfx1100" && q8_decode_tile < batched_tile {
+        let decode_elems = n_heads * kv_max_seq.div_ceil(q8_decode_tile) * stride;
+        let batched_elems =
+            configured_batch.unwrap_or(32) * n_heads * kv_max_seq.div_ceil(batched_tile) * stride;
+        return decode_elems.max(batched_elems);
+    }
+    // See llama.rs: also floor against the batched-attention tile, since a
+    // smaller HIPFIRE_ATTN_TILE_SIZE raises max_tiles and would undersize
+    // this same buffer.
+    let tile_size = q8_decode_tile.min(128).min(batched_tile);
+    configured_batch.unwrap_or(16) * n_heads * kv_max_seq.div_ceil(tile_size) * stride
+}
+
 impl Qwen35Scratch {
     pub fn new(gpu: &mut Gpu, config: &Qwen35Config, repeat_window: usize) -> HipResult<Self> {
         // Flash partials are sized for up to 8192 ctx. Override via new_with_kv_max.
@@ -1245,6 +1280,8 @@ impl Qwen35Scratch {
             // Q8 decode experiments and the fixed tile_size=128 paths.
             // n_heads * max_tiles * (2 + head_dim) floats per batched query
             // position; total buffer = batch_mult × per-position-bytes.
+            // Exact gfx1100 through 8K sizes decode and batched rows
+            // separately; see `qwen35_flash_partials_len`.
             //
             // batch_mult is the maximum query positions a single FA dispatch
             // can fit; the dispatcher (`launch_asym_flash_batched`) reads the
@@ -1263,30 +1300,33 @@ impl Qwen35Scratch {
             // worst-case shape; CASK-on workloads (small physical_cap) are
             // unaffected because the buffer is already tiny there.
             //
+            // On the gfx1100 tile32/tile128 split the legacy formula
+            // incidentally gave 64 batched rows; 16 regressed prefill, 32
+            // keeps it and halves the buffer.
+            //
             // Override with HIPFIRE_FLASH_PARTIALS_BATCH for tuning. Power of
             // two preferred (matches FA dispatcher chunking).
             flash_partials: {
-                let tile_size = rdna_compute::attention::q8_flash_tile_size(
+                let q8_decode_tile = rdna_compute::attention::q8_flash_tile_size(
                     &gpu.arch,
                     config.n_heads,
                     config.n_kv_heads,
                     config.head_dim,
                     kv_max_seq,
-                )
-                .min(128)
-                // See llama.rs: also floor against the batched-attention tile,
-                // since a smaller HIPFIRE_ATTN_TILE_SIZE raises max_tiles and
-                // would undersize this same buffer.
-                .min(gpu.attn_tile_size());
-                let max_tiles = (kv_max_seq + tile_size - 1) / tile_size;
-                let batch_mult = hipfire_runtime::config::get()
+                );
+                let configured_batch = hipfire_runtime::config::get()
                     .flash_partials_batch
-                    .filter(|&n| n >= 1 && n <= PREFILL_MAX_BATCH)
-                    .unwrap_or(16);
-                tracked_tensor!(gpu.alloc_tensor(
-                    &[batch_mult * config.n_heads * max_tiles * (2 + config.head_dim)],
-                    DType::F32,
-                ))
+                    .filter(|&n| n >= 1 && n <= PREFILL_MAX_BATCH);
+                let n = qwen35_flash_partials_len(
+                    &gpu.arch,
+                    config.n_heads,
+                    config.head_dim,
+                    kv_max_seq,
+                    q8_decode_tile,
+                    gpu.attn_tile_size(),
+                    configured_batch,
+                );
+                tracked_tensor!(gpu.alloc_tensor(&[n], DType::F32))
             },
             // Flash attention tri-state for the Q8 path. Asym modes always
             // flash regardless.
@@ -7514,6 +7554,35 @@ mod tests {
     fn x_rot_covers_deltanet_value_width_for_moe_configs() {
         assert_eq!(qwen35_x_rot_len(2048, 0, 4096), 4096);
         assert_eq!(qwen35_x_rot_len(2048, 8192, 4096), 8192);
+    }
+
+    #[test]
+    fn flash_partials_split_sizing_is_exact_gfx1100_only() {
+        // Legacy: batch rows at min(q8 tile, 128, batched tile).
+        let legacy = |heads: usize, kv: usize, tile: usize| 16 * heads * kv.div_ceil(tile) * 258 * 4;
+
+        // gfx1100 Qwen3.8-27B at 8K (Q8 decode tile32, batched tile128): 32
+        // batched rows at tile128 dominate one tile32 decode row, half the
+        // legacy 16 x tile32 buffer (101,449,728 B).
+        let len = |arch, heads, kv, q8, batched, cfg| {
+            4 * qwen35_flash_partials_len(arch, heads, 256, kv, q8, batched, cfg)
+        };
+        assert_eq!(legacy(24, 8_192, 32), 101_449_728);
+        assert_eq!(len("gfx1100", 24, 8_192, 32, 128, None), 50_724_864);
+        // An explicit HIPFIRE_FLASH_PARTIALS_BATCH is the batched row count;
+        // one decode row at tile32 still bounds it from below.
+        assert_eq!(len("gfx1100", 24, 8_192, 32, 128, Some(1)), 6_340_608);
+        assert_eq!(len("gfx1100", 24, 8_192, 32, 128, Some(64)), 101_449_728);
+        // Past 8K gfx1100 decodes at tile128 too: legacy sizing.
+        assert_eq!(len("gfx1100", 24, 65_536, 128, 128, None), legacy(24, 65_536, 128));
+
+        // Every other arch keeps the legacy buffer, including the shapes whose
+        // decode tile is finer than the batched tile.
+        assert_eq!(len("gfx1201", 24, 8_192, 128, 128, None), legacy(24, 8_192, 128));
+        assert_eq!(len("gfx1151", 24, 8_192, 128, 128, None), legacy(24, 8_192, 128));
+        assert_eq!(len("gfx1201", 8, 8_192, 16, 128, None), legacy(8, 8_192, 16));
+        assert_eq!(len("gfx1151", 16, 2_048, 32, 128, None), legacy(16, 2_048, 32));
+        assert_eq!(len("gfx1101", 24, 8_192, 32, 128, None), legacy(24, 8_192, 32));
     }
     #[test]
     fn gfx1201_fa_epilogue_admits_q8_and_fp8_tile() {
