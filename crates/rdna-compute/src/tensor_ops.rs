@@ -272,9 +272,9 @@ pub struct GatedDeltaStepBatched<'a> {
     pub beta: &'a GpuTensor,
     pub state: &'a GpuTensor,
     pub output: &'a GpuTensor,
-    /// Optional `[rows, state]` F32: the recurrent state after every row,
-    /// written instead of updating `state` (speculative-verify rollback
-    /// points; `state` keeps the pre-call value).
+    /// Optional `[rows, state]` F32: the recurrent state after the last row
+    /// lands in slot `rows - 1` instead of updating `state` (speculative
+    /// verify; `state` keeps the pre-call value).
     pub row_states: Option<&'a GpuTensor>,
     pub rows: usize,
     pub qkv_width: usize,
@@ -351,6 +351,71 @@ pub fn gated_delta_step_batched(gpu: &mut Gpu, p: &GatedDeltaStepBatched<'_>) ->
     gpu.launch_blob_recorded(
         kernel,
         [value_heads_grid, 1, 1],
+        [256, 1, 1],
+        0,
+        args.as_mut_slice(),
+        crate::dispatch::ReplayLaunchBindings::NONE,
+    )
+}
+
+/// Few-row verify rollback of every GDN layer in one launch (kernel
+/// `gated_delta_rollback_layers_f32`): `table` is `layers` pairs of device
+/// pointers (captured recurrence input, state ring); each layer re-runs its
+/// first `keep` of `rows` captured rows from ring slot `from` and leaves the
+/// last kept row's state in slot `to + keep - 1`. 128-wide heads.
+pub struct GatedDeltaRollbackLayers<'a> {
+    pub table: &'a GpuTensor,
+    pub discard: &'a GpuTensor,
+    pub layers: usize,
+    pub rows: usize,
+    pub keep: usize,
+    pub from: usize,
+    pub to: usize,
+    pub qkv_width: usize,
+    pub key_heads: usize,
+    pub value_heads: usize,
+}
+
+pub fn gated_delta_rollback_layers(
+    gpu: &mut Gpu,
+    p: &GatedDeltaRollbackLayers<'_>,
+) -> HipResult<()> {
+    let value = checked_product(p.value_heads, 128, "GDN rollback value width")?;
+    if p.keep == 0
+        || p.keep > p.rows
+        || p.key_heads == 0
+        || p.value_heads % p.key_heads != 0
+        || p.qkv_width != 2 * 128 * p.key_heads + value
+        || p.table.buf.size() < 16 * p.layers
+        || p.discard.numel() < checked_product(p.keep, value, "GDN rollback output")?
+    {
+        return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
+    }
+    let kernel = "gated_delta_rollback_layers_f32";
+    gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel)?;
+    let mut args = KernargBlob::new();
+    args.push_ptr(p.table.buf.as_ptr());
+    args.push_ptr(p.discard.buf.as_ptr());
+    for (value, label) in [
+        (p.rows, "GDN rollback rows"),
+        (p.keep, "GDN rollback kept rows"),
+        (p.from, "GDN rollback source slot"),
+        (p.to, "GDN rollback target slot"),
+        (p.qkv_width, "GDN rollback qkv width"),
+        (p.key_heads, "GDN rollback key heads"),
+        (p.value_heads, "GDN rollback value heads"),
+    ] {
+        args.push_i32(checked_i32(value, label)?);
+    }
+    args.push_f32(128f32.sqrt().recip());
+    args.pad_to(16);
+    gpu.launch_blob_recorded(
+        kernel,
+        [
+            checked_u32(p.value_heads, "GDN rollback value-head grid")?,
+            checked_u32(p.layers, "GDN rollback layer grid")?,
+            1,
+        ],
         [256, 1, 1],
         0,
         args.as_mut_slice(),

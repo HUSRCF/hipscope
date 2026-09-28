@@ -1006,14 +1006,17 @@ pub struct GatedDeltaNetOp<'a> {
 }
 
 /// Where a few-row GDN forward leaves what a later rollback to any accepted
-/// row prefix needs: the recurrent state after every row
-/// (`[rows, value_heads * value_dim * key_dim]` F32, written instead of
-/// updating `recurrent` in place, which stays the pre-forward state) and the
-/// convolution input rows (`[rows, qkv]` F32; every reader of the
-/// convolution history rounds it to BF16).
+/// row prefix needs: the recurrent state after the last row (slot `rows - 1`
+/// of `states`, `[rows, value_heads * value_dim * key_dim]` F32, written
+/// instead of updating `recurrent`, which stays the pre-forward state), the
+/// convolution input rows (`inputs`, `[rows, qkv]` F32; every reader of the
+/// convolution history rounds it to BF16), and the recurrence inputs a
+/// rollback re-runs the kept rows from (`recurrence`: the convolution output
+/// `[rows, qkv]`, then gate and beta `[rows, value_heads]` each).
 pub struct GdnRowCapture<'a> {
     pub states: GpuTensor,
     pub inputs: &'a GpuTensor,
+    pub recurrence: &'a GpuTensor,
 }
 
 impl GatedDeltaNetOp<'_> {
@@ -1147,8 +1150,8 @@ pub fn execute_gated_delta_net(
     let projection2 = view(op.projection2, 0, op.rows * qkv);
     let a = view(op.a, 0, op.rows * op.value_heads);
     let b = view(op.b, 0, op.rows * op.value_heads);
-    let gate = view(op.gate, 0, op.rows * op.value_heads);
-    let beta = view(op.beta, 0, op.rows * op.value_heads);
+    let mut gate = view(op.gate, 0, op.rows * op.value_heads);
+    let mut beta = view(op.beta, 0, op.rows * op.value_heads);
     let z = view(op.z_output, 0, op.rows * value);
     let history_rows = op.conv_kernel.saturating_sub(1);
     let persistent_batch = gpu.arch_caps.has_gfx11_plus_simt()
@@ -1163,9 +1166,15 @@ pub fn execute_gated_delta_net(
         ));
     }
     let capture = op.row_capture.as_ref();
-    // A row capture keeps the qkv projection: project straight into it.
+    // A row capture keeps the qkv projection and the recurrence inputs:
+    // write them straight into it.
+    let mut conv_output = view(op.projection2, 0, op.rows * qkv);
     if let Some(capture) = capture {
         projection = view(capture.inputs, 0, op.rows * qkv);
+        let heads = op.rows * op.value_heads;
+        conv_output = view(capture.recurrence, 0, op.rows * qkv);
+        gate = view(capture.recurrence, op.rows * qkv, heads);
+        beta = view(capture.recurrence, op.rows * qkv + heads, heads);
     }
     let dims = GatedDeltaStepBatched {
         projection: &projection2,
@@ -1212,7 +1221,6 @@ pub fn execute_gated_delta_net(
         let start_cursor = op.start_position % history_rows;
         // The F16 prefill route's chunked recurrence reads the convolution
         // output as packed BF16 (every value is BF16-rounded already).
-        let mut conv_output = view(op.projection2, 0, op.rows * qkv);
         if chunked {
             conv_output.dtype = DType::BF16;
         }

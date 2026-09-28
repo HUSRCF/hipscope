@@ -269,10 +269,11 @@ __device__ __forceinline__ void gdn_lds_barrier() {
 // normalized q/k vectors are double-buffered so a row needs no trailing
 // barrier.  Every value is produced by the same expression sequence as
 // gated_delta_step_f32, so the result is bitwise unchanged.
-// `kCapture`: leave the state after every row in `row_states` instead of
-// updating `state` (speculative verify: the pre-verify state stays intact
-// and every row is a rollback point); a separate instantiation so the plain
-// route's register allocation is unchanged.
+// `kCapture`: leave the state after the last row in `row_states` slot
+// `rows - 1` instead of updating `state` (speculative verify: the
+// pre-verify state stays intact, and a rollback re-runs the kept rows from
+// it); a separate instantiation so the plain route's register allocation is
+// unchanged.
 template <bool kCapture>
 __device__ __forceinline__ void gated_delta_step_persistent256_body(
     const float* projection,
@@ -467,24 +468,14 @@ __device__ __forceinline__ void gated_delta_step_persistent256_body(
                 }
                 output[row * value_width + value_head * 128 + value_index] = out;
             }
-            if (kCapture) {
-                // Streamed out now, while this latency-bound kernel leaves
-                // DRAM idle: a write-back copy would sit dirty in the MALL
-                // and be evicted by the bandwidth-bound GEMVs a few kernels on.
-                float* slot = row_states + (size_t)row * value_heads * 128 * 128;
-                #pragma unroll
-                for (int kd = 0; kd < 64; ++kd) {
-                    __builtin_nontemporal_store(
-                        state_half[kd], &slot[state_base + (kd_base + kd) * 128 + value_index]);
-                }
-            }
         }
     }
 
-    if (kCapture) return;
+    float* const final_state =
+        kCapture ? row_states + (size_t)(rows - 1) * value_heads * 128 * 128 : state;
     #pragma unroll
     for (int kd = 0; kd < 64; ++kd) {
-        state[state_base + (kd_base + kd) * 128 + value_index] =
+        final_state[state_base + (kd_base + kd) * 128 + value_index] =
             state_half[kd];
     }
 }
@@ -505,6 +496,27 @@ extern "C" __global__ void gated_delta_step_halves_state128_persistent256_captur
     int value_heads, int key_dim, int value_dim, float query_scale) {
     gated_delta_step_persistent256_body<true>(projection, gate, beta, state, output, row_states,
         rows, qkv_width, key_heads, value_heads, key_dim, value_dim, query_scale);
+}
+
+// Few-row verify rollback: re-run the `keep` kept rows of every GDN layer in
+// one launch (blockIdx.y = layer; the layers' recurrences are independent).
+// `table[2 * layer]` is the layer's captured recurrence input (the verify's
+// `rows`-row convolution output [rows, qkv], then gate and beta
+// [rows, value_heads] each), `table[2 * layer + 1]` its state ring: the rows
+// re-run from ring slot `from` and the last kept row's state lands in slot
+// `to + keep - 1`, bitwise the verify's own prefix. `discard` takes the
+// recurrence output ([keep, value_heads * 128], shared by all layers).
+__launch_bounds__(256)
+extern "C" __global__ void gated_delta_rollback_layers_f32(
+    const unsigned long long* table, float* discard, int rows, int keep, int from, int to,
+    int qkv_width, int key_heads, int value_heads, float query_scale) {
+    const float* recurrence = reinterpret_cast<const float*>(table[2 * blockIdx.y]);
+    float* ring = reinterpret_cast<float*>(table[2 * blockIdx.y + 1]);
+    const size_t state = (size_t)value_heads * 128 * 128;
+    const size_t gate = (size_t)rows * qkv_width;
+    gated_delta_step_persistent256_body<true>(recurrence, recurrence + gate,
+        recurrence + gate + (size_t)rows * value_heads, ring + from * state, discard,
+        ring + to * state, keep, qkv_width, key_heads, value_heads, 128, 128, query_scale);
 }
 
 

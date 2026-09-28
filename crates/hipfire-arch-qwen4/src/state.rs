@@ -10,10 +10,15 @@
 use crate::config::{LayerType, Qwen4Config};
 use crate::ple::PleHistory;
 use hipfire_dispatch::pipeline::GdnRowCapture;
-use rdna_compute::tensor_ops::{copy_regions, CopyRegion};
+use rdna_compute::tensor_ops::{
+    copy_regions, gated_delta_rollback_layers, CopyRegion, GatedDeltaRollbackLayers,
+};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+/// GDN key and value head width of the few-row capture route.
+const GDN_HEAD_DIM: usize = 128;
 
 static NEXT_QWEN4_MODEL_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -510,12 +515,17 @@ pub struct Qwen4State {
     pub qsa_selected_capacity: usize,
     snapshot_arena: Qwen4StateSnapshotArena,
     /// Few-row verify rollback points per GDN layer: (recurrent-state ring,
-    /// convolution input rows); see `GdnRowCapture`. With a ring, each GDN
-    /// layer's `recurrent` is a view of its live slot: a verify writes every
-    /// row's state into the half of the ring the live slot is not in, so the
-    /// pre-verify state is never overwritten and committing or rolling back
-    /// to any row only moves the live slot.
-    row_capture: Vec<(GpuTensor, GpuTensor)>,
+    /// convolution input rows, recurrence inputs); see `GdnRowCapture`. With
+    /// a ring, each GDN layer's `recurrent` is a view of its live slot: a
+    /// verify writes its last row's state into the half of the ring the live
+    /// slot is not in, so the pre-verify state is never overwritten;
+    /// committing only moves the live slot, and rolling back re-runs the kept
+    /// rows' recurrence from the pre-verify state into that half.
+    row_capture: Vec<(GpuTensor, GpuTensor, GpuTensor)>,
+    /// Discarded recurrence output of a rollback re-run (`rows` x the widest
+    /// GDN value width) and the per-layer (recurrence, ring) device pointer
+    /// table the one-launch re-run reads.
+    row_capture_output: Option<(GpuTensor, GpuTensor)>,
     /// Rows a verify may capture (0 = none allocated); the ring holds twice
     /// as many slots.
     row_capture_rows: usize,
@@ -764,6 +774,7 @@ impl Qwen4State {
             qsa_selected_capacity: selected_capacity,
             snapshot_arena,
             row_capture: Vec::new(),
+            row_capture_output: None,
             row_capture_rows: 0,
             gdn_live: 0,
             row_capture_armed: false,
@@ -1100,9 +1111,14 @@ impl Qwen4State {
         }
         free(self.ple_conv);
         free(self.hyper_feedback);
-        for (ring, inputs) in self.row_capture {
+        for (ring, inputs, recurrence) in self.row_capture {
             free(ring);
             free(inputs);
+            free(recurrence);
+        }
+        if let Some((output, table)) = self.row_capture_output {
+            free(output);
+            free(table);
         }
         first.map_or(Ok(()), |error| Err(StateError::Hip(error)))
     }
@@ -1120,6 +1136,7 @@ impl Qwen4State {
             return Ok(());
         }
         let mut next = Vec::with_capacity(self.gdn.len());
+        let mut widest_value = 0;
         for layer in &self.gdn {
             let state = layer.recurrent.numel();
             let ring = gpu
@@ -1131,10 +1148,33 @@ impl Qwen4State {
                 layer.recurrent.byte_size(),
             )
             .map_err(StateError::Hip)?;
+            let qkv = layer.conv.numel() / conv_history;
             let inputs = gpu
-                .zeros(&[rows * (layer.conv.numel() / conv_history)], DType::F32)
+                .zeros(&[rows * qkv], DType::F32)
                 .map_err(StateError::Hip)?;
-            next.push((ring, inputs));
+            let value_heads = state / (GDN_HEAD_DIM * GDN_HEAD_DIM);
+            let recurrence = gpu
+                .zeros(&[rows * (qkv + 2 * value_heads)], DType::F32)
+                .map_err(StateError::Hip)?;
+            widest_value = widest_value.max(value_heads * GDN_HEAD_DIM);
+            next.push((ring, inputs, recurrence));
+        }
+        let output = gpu
+            .zeros(&[rows * widest_value], DType::F32)
+            .map_err(StateError::Hip)?;
+        let pointers: Vec<u8> = next
+            .iter()
+            .flat_map(|(ring, _, recurrence)| [recurrence.buf.as_ptr(), ring.buf.as_ptr()])
+            .flat_map(|pointer| (pointer as u64).to_ne_bytes())
+            .collect();
+        let table = gpu
+            .zeros(&[pointers.len().max(1)], DType::Raw)
+            .map_err(StateError::Hip)?;
+        gpu.memcpy_htod_auto(&table.buf, &pointers)
+            .map_err(StateError::Hip)?;
+        if let Some((output, table)) = self.row_capture_output.replace((output, table)) {
+            gpu.free_tensor(output).map_err(StateError::Hip)?;
+            gpu.free_tensor(table).map_err(StateError::Hip)?;
         }
         let previous = std::mem::replace(&mut self.row_capture, next);
         let ringed = !previous.is_empty();
@@ -1148,9 +1188,10 @@ impl Qwen4State {
                 gpu.free_tensor(old).map_err(StateError::Hip)?;
             }
         }
-        for (ring, inputs) in previous {
+        for (ring, inputs, recurrence) in previous {
             gpu.free_tensor(ring).map_err(StateError::Hip)?;
             gpu.free_tensor(inputs).map_err(StateError::Hip)?;
+            gpu.free_tensor(recurrence).map_err(StateError::Hip)?;
         }
         self.row_capture_rows = rows;
         self.gdn_live = 0;
@@ -1174,14 +1215,15 @@ impl Qwen4State {
     /// Point every GDN layer's `recurrent` at ring slot `slot`.
     fn set_gdn_live(&mut self, slot: usize) {
         self.gdn_live = slot;
-        for (layer, (ring, _)) in self.gdn.iter_mut().zip(&self.row_capture) {
+        for (layer, (ring, _, _)) in self.gdn.iter_mut().zip(&self.row_capture) {
             let state = layer.recurrent.numel();
             layer.recurrent = ring.sub_offset(slot * state, state);
         }
     }
 
     /// The rollback points GDN layer `slot` writes in an armed `rows`-row
-    /// verify forward: every row's state into the free half of the ring.
+    /// verify forward: its last row's state into the free half of the ring,
+    /// plus the convolution and recurrence inputs.
     pub(crate) fn gdn_row_capture(&self, slot: usize, rows: usize) -> Option<GdnRowCapture<'_>> {
         if !self.row_capture_armed || rows < 2 || rows > self.row_capture_rows {
             return None;
@@ -1190,9 +1232,10 @@ impl Qwen4State {
         let base = self.capture_base(self.gdn_live);
         self.row_capture
             .get(slot)
-            .map(|(ring, inputs)| GdnRowCapture {
+            .map(|(ring, inputs, recurrence)| GdnRowCapture {
                 states: ring.sub_offset(base * state, rows * state),
                 inputs,
+                recurrence,
             })
     }
 
@@ -1205,15 +1248,17 @@ impl Qwen4State {
         }
     }
 
-    /// Roll an armed `rows`-row verify forward back to its first `keep` rows
-    /// without re-running them, keeping the snapshot ticket active (the
-    /// caller commits or restores it). GDN recurrent state and convolution
-    /// history come from the verify's rollback points, the PLE convolution
-    /// history from `ple_normed` (the verify's PLE convolution input rows),
-    /// QSA marks and PLE token history from the ticket plus `keep`.  Append
-    /// arenas (QSA K/V, raw and pooled index keys) need no rollback: rows past
-    /// the kept end are invisible until overwritten, and a pooled block is
-    /// re-pooled by the row that completes it.
+    /// Roll an armed `rows`-row verify forward back to its first `keep` rows,
+    /// keeping the snapshot ticket active (the caller commits or restores
+    /// it). The GDN recurrent state re-runs the kept rows' recurrence from
+    /// the pre-verify state (bitwise the verify's own prefix) into the free
+    /// half of the ring; convolution history comes from the verify's input
+    /// rows, the PLE convolution history from `ple_normed` (the verify's PLE
+    /// convolution input rows), QSA marks and PLE token history from the
+    /// ticket plus `keep`.  Append arenas (QSA K/V, raw and pooled index keys)
+    /// need no rollback: rows past the kept end are invisible until
+    /// overwritten, and a pooled block is re-pooled by the row that completes
+    /// it.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn rollback_rows_retain(
         &mut self,
@@ -1241,7 +1286,45 @@ impl Qwen4State {
             .snapshot_arena
             .gdn_live
             .ok_or(StateError::SnapshotTicket)?;
-        self.set_gdn_live(self.capture_base(before) + keep - 1);
+        let base = self.capture_base(before);
+        let (output, table) = self
+            .row_capture_output
+            .as_ref()
+            .ok_or(StateError::SnapshotTicket)?;
+        if let Some(first) = self.gdn.first() {
+            // One launch re-runs every layer: they share one geometry.
+            let (state, conv) = (first.recurrent.numel(), first.conv.numel());
+            if self
+                .gdn
+                .iter()
+                .any(|layer| layer.recurrent.numel() != state || layer.conv.numel() != conv)
+            {
+                return Err(StateError::Length {
+                    what: "uniform GDN rollback geometry",
+                    expected: state,
+                    actual: 0,
+                });
+            }
+            let qkv = conv / conv_history;
+            let value_heads = state / (GDN_HEAD_DIM * GDN_HEAD_DIM);
+            gated_delta_rollback_layers(
+                gpu,
+                &GatedDeltaRollbackLayers {
+                    table,
+                    discard: output,
+                    layers: self.gdn.len(),
+                    rows,
+                    keep,
+                    from: before,
+                    to: base,
+                    qkv_width: qkv,
+                    key_heads: (qkv - value_heads * GDN_HEAD_DIM) / (2 * GDN_HEAD_DIM),
+                    value_heads,
+                },
+            )
+            .map_err(StateError::Hip)?;
+        }
+        self.set_gdn_live(base + keep - 1);
         let arena = &self.snapshot_arena;
         let row_bytes = self.ple_conv.byte_size() / ple_history_rows;
         let mut copies =
@@ -1250,7 +1333,7 @@ impl Qwen4State {
         // rows' inputs where they reach, the snapshot's history elsewhere.
         let rows_from = (start + keep).saturating_sub(conv_history).max(start);
         for (index, layer) in self.gdn.iter().enumerate() {
-            let (_, inputs) = &self.row_capture[index];
+            let (_, inputs, _) = &self.row_capture[index];
             let channel_bytes = layer.conv.byte_size() / conv_history;
             for slot in 0..conv_history {
                 let kept =
