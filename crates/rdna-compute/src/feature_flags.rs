@@ -318,11 +318,12 @@ pub struct FeatureFlags {
     /// Emit preconverted fp8 Q for the v2 Q-resident attention twin.
     /// `HIPFIRE_GFX12_FA_PREP_FP8Q=0` retains F32 Q.
     pub gfx12_fa_prep_fp8q: bool,
-    /// Experimental whole-chunk Q8/Q8 FA2 on exact gfx1100/gfx1151
+    /// Whole-chunk Q8/Q8 FA2 on exact gfx1100/gfx1151
     /// (`HIPFIRE_GFX11_Q8_FA2_WIDE`, `kernel.gfx11_q8_fa2_wide`).
-    /// Default ON only on exact gfx1100; gfx1151 defaults OFF but an
-    /// explicit true still opts it in. Requires the master gfx11 FA2 flag.
-    /// B64..8192, above-512 batches aligned to 512, ctx64..32768.
+    /// Default ON on exact gfx1100 and gfx1151 (whose FA2 twin dispatches
+    /// the heaviest q-tiles first); explicit false opts out. Requires the
+    /// master gfx11 FA2 flag. B64..8192, above-512 batches aligned to 512,
+    /// ctx64..32768.
     pub gfx11_q8_fa2_wide: bool,
     /// `HIPFIRE_GFX11_FA2_PREFILL=0` opts out of the gfx11 GQA-fused FA2
     /// prefill attention candidate (Qwen NH24/NKV4/HD256, eager HIP only).
@@ -747,7 +748,7 @@ impl FeatureFlags {
             gfx12_fa_prep_fp8q: parse_bool("HIPFIRE_GFX12_FA_PREP_FP8Q")
                 .unwrap_or(arch == "gfx1201"),
             gfx11_q8_fa2_wide: parse_bool("HIPFIRE_GFX11_Q8_FA2_WIDE")
-                .unwrap_or(arch == "gfx1100"),
+                .unwrap_or(matches!(arch, "gfx1100" | "gfx1151")),
             gfx11_fa2_prefill: parse_bool("HIPFIRE_GFX11_FA2_PREFILL")
                 .unwrap_or(matches!(arch, "gfx1100" | "gfx1151")),
             gemm_dump: value("HIPFIRE_GEMM_DUMP").ok().as_deref() == Some("1"),
@@ -1598,13 +1599,13 @@ mod tests {
     }
 
     #[test]
-    fn gfx11_q8_fa2_wide_auto_is_exact_gfx1100_with_explicit_overrides() {
+    fn gfx11_q8_fa2_wide_auto_is_exact_gfx1100_and_gfx1151_with_explicit_overrides() {
         let process = ProcessConfig::from_resolved(&resolve([]).unwrap()).unwrap();
         assert!(process.legacy_value("HIPFIRE_GFX11_Q8_FA2_WIDE").is_none());
         for (arch, expected) in [
             ("gfx1100", true),
             ("gfx1101", false),
-            ("gfx1151", false),
+            ("gfx1151", true),
             ("gfx1201", false),
         ] {
             assert_eq!(FeatureFlags::from_process_config(arch, &process).gfx11_q8_fa2_wide, expected, "arch={arch}");

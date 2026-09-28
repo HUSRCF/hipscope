@@ -5824,8 +5824,17 @@ impl Gpu {
         let r3 = fill
             && self.arch == "gfx1100"
             && hipfire_config::developer_bool("HIPFIRE_GFX1100_FA2_R3", true);
+        // Exact gfx1151 runs its own twin of the fill build (CU mode,
+        // heaviest q-tile first, conflict-free helper V stores; the same
+        // arithmetic, bit-identical). `HIPFIRE_GFX1151_FA2_TWIN=0` restores
+        // the gfx11 module.
+        let twin = fill
+            && self.arch == "gfx1151"
+            && hipfire_config::developer_bool("HIPFIRE_GFX1151_FA2_TWIN", true);
         let (module, preconvert) = if r3 {
             ("attention_q8_0_fa2_gqa_gfx1100", "attention_fa2_q_preconvert_gfx1100")
+        } else if twin {
+            ("attention_q8_0_fa2_gqa_gfx1151", "attention_fa2_q_preconvert_gfx1151")
         } else {
             ("attention_q8_0_fa2_gqa_gfx11", "attention_fa2_q_preconvert_gfx11")
         };
@@ -5834,18 +5843,24 @@ impl Gpu {
         // archs for both K modes; the KT64 path was removed.
         // F4b: the body reads f16 Q from Gpu-owned scratch (pre-converted on
         // the same stream just below); the entry symbol and the pre-convert
-        // symbol both resolve out of this module's source.
+        // symbol both resolve out of the module's source.
         if !self.functions.contains_key(module) || !self.functions.contains_key(preconvert) {
-            let src = format!(
-                "{}#define HIPFIRE_FA2_KT 32\n#define HIPFIRE_FA2_Q16 {}\n#define HIPFIRE_FA2_FILL {}\n{}{}",
-                if r3 { "// HIPFIRE_COMPILER_FLAGS: -mcumode\n" } else { "" },
-                u8::from(q16_tile),
-                u8::from(fill),
-                if r3 { "#define HIPFIRE_FA2_GFX1100 1\n" } else { "" },
-                kernels::ATTENTION_Q8_0_FA2_GQA_GFX11_SRC
-            );
-            self.ensure_kernel(module, &src, module)?;
-            self.ensure_kernel(module, &src, preconvert)?;
+            if twin {
+                let src = kernels::ATTENTION_Q8_0_FA2_GQA_GFX1151_SRC;
+                self.ensure_kernel(module, src, module)?;
+                self.ensure_kernel(module, src, preconvert)?;
+            } else {
+                let src = format!(
+                    "{}#define HIPFIRE_FA2_KT 32\n#define HIPFIRE_FA2_Q16 {}\n#define HIPFIRE_FA2_FILL {}\n{}{}",
+                    if r3 { "// HIPFIRE_COMPILER_FLAGS: -mcumode\n" } else { "" },
+                    u8::from(q16_tile),
+                    u8::from(fill),
+                    if r3 { "#define HIPFIRE_FA2_GFX1100 1\n" } else { "" },
+                    kernels::ATTENTION_Q8_0_FA2_GQA_GFX11_SRC
+                );
+                self.ensure_kernel(module, &src, module)?;
+                self.ensure_kernel(module, &src, preconvert)?;
+            }
         }
         // F4b scratch: [batch, 24, 256] f16 (n_heads/head_dim validated
         // H24/D256 above), Gpu-owned, grows-never-shrinks.

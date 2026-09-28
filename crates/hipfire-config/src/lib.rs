@@ -2350,7 +2350,7 @@ pub static FIELDS: &[ConfigField] = &[
         Kernel,
         true,
         "HIPFIRE_GFX11_Q8_FA2_WIDE",
-        "Whole-chunk Q8/Q8 FA2 prefill: auto enables on exact gfx1100 only; gfx1151 and other arches default off. Explicit false opts out; explicit true can opt gfx1151 in. Requires kernel.gfx11_fa2_prefill, H24/KV4/D256, 64..8192 rows (above 512 aligned to 512), context 64..32768; explicit flash-off, CK and alternate variants retain precedence."
+        "Whole-chunk Q8/Q8 FA2 prefill: auto enables on exact gfx1100 and gfx1151; other arches default off. Explicit false opts out. Requires kernel.gfx11_fa2_prefill, H24/KV4/D256, 64..8192 rows (above 512 aligned to 512), context 64..32768; explicit flash-off, CK and alternate variants retain precedence."
     ),
     process_bool_field!(
         "kernel.gfx11_fa2_prefill",

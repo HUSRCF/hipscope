@@ -6970,6 +6970,16 @@ pub const ATTENTION_FP8_E4M3_FA2_GQA_QRESIDENT_V2_Q8_A4EPI_GFX1201_SRC: &str = c
 pub const ATTENTION_Q8_0_FA2_GQA_GFX11_SRC: &str =
     include_str!("../../../kernels/src/attention_q8_0_fa2_gqa.gfx11.hip");
 
+/// Exact-gfx1151 twin of the [`ATTENTION_Q8_0_FA2_GQA_GFX11_SRC`] fill build
+/// (Q16, KT32, warp-specialized fill): `attention_q8_0_fa2_gqa_gfx1151` and
+/// `attention_fa2_q_preconvert_gfx1151`, same kernargs and launch geometry,
+/// bit-identical outputs. Compiled `-mcumode` (in-source flag); heaviest
+/// q-tile first; conflict-free helper V stores; wave-uniform O-rescale skip.
+/// Selected by the gfx11 FA2 launcher on gfx1151 unless
+/// `HIPFIRE_GFX1151_FA2_TWIN=0`.
+pub const ATTENTION_Q8_0_FA2_GQA_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/attention_q8_0_fa2_gqa.gfx1151.hip");
+
 /// fwht3-K variant of [`ATTENTION_Q8_0_FA2_GQA_GFX11_SRC`] (`HIPFIRE_FA2_KMODE=3`):
 /// K dequantizes fwht3 records (f32 cnorm + 96 B of 3-bit codes, K stored
 /// FWHT-rotated) into the unchanged K plane. F4b: the Q-side signed-FWHT-256
