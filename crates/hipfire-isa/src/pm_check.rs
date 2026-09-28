@@ -105,9 +105,24 @@ fn dst(first: &str) -> Option<(char, u16)> {
     t[1..].parse().ok().map(|n| (class, n))
 }
 
+/// `v[lo:hi]` / `s[lo:hi]`.
+fn range_dst(first: &str) -> Option<(char, u16, u16)> {
+    let t = first.trim();
+    let class = t.chars().next()?;
+    if !matches!(class, 'v' | 's') { return None }
+    let (lo, hi) = t[1..].strip_prefix('[')?.strip_suffix(']')?.split_once(':')?;
+    Some((class, lo.parse().ok()?, hi.parse().ok()?))
+}
+
 /// Execute one straight-line instruction for all lanes. Unknown operations
-/// make their destination unknown.
+/// make their destination unknown; scalar compares write only SCC, and a
+/// register-range destination makes every register of the range unknown.
 fn step(w: &mut Wave, name: &str, ops: &[&str]) {
+    if name.starts_with("s_cmp") || name.starts_with("s_bitcmp") { return }
+    if let Some((class, lo, hi)) = ops.first().and_then(|o| range_dst(o)) {
+        for n in lo..=hi { if class == 'v' { w.v.insert(n, [None; 32]); } else { w.s.insert(n, None); } }
+        return;
+    }
     let Some((class, n)) = ops.first().and_then(|o| dst(o)) else { return };
     let lanes = |f: &dyn Fn(usize) -> Option<u32>| -> Lanes { std::array::from_fn(f) };
     let a = |i: usize| ops.get(i).map(|o| w.operand(o)).unwrap_or([None; 32]);
@@ -223,5 +238,17 @@ mod tests {
         assert!(lds_bounds(&unknown, "k", 1, 1 << 20).is_err());
         let redefined = K.replace(".Lk_end:", "\tv_add_nc_u32_e32 v2, 8, v2\n.Lk_end:");
         assert!(lds_bounds(&redefined, "k", 1, 1 << 20).is_err());
+    }
+    /// A scalar compare writes only SCC: the SGPR it reads stays known. A
+    /// register-range write (an SMEM load, a 64-bit select) makes every
+    /// register of the range unknown, so an address derived from it fails.
+    #[test]
+    fn compares_keep_their_operands_and_range_writes_clobber() {
+        let compare = K.replace("\tv_lshl_add_u32 v2", "\ts_bitcmp1_b32 s4, 0\n\ts_cmp_eq_u32 s4, 0\n\tv_lshl_add_u32 v2");
+        assert_eq!(lds_bounds(&compare, "k", 2, 1024).unwrap(), 256 + 248 + 256 + 8);
+        for clobber in ["s_load_b64 s[4:5], s[0:1], 0x0", "s_cselect_b64 s[4:5], s[6:7], s[8:9]"] {
+            let text = K.replace("\tv_lshl_add_u32 v2", &format!("\t{clobber}\n\tv_lshl_add_u32 v2"));
+            assert!(lds_bounds(&text, "k", 1, 1 << 20).is_err(), "{clobber}");
+        }
     }
 }

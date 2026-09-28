@@ -14,6 +14,9 @@ use crate::{Builder, reg::{Kind, RegRef}, vopd::{self, VopdF32, VopdOp}};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const SILU_GOLDEN: &str = include_str!("../../../kernels/iu4_gemm.silu.region.s");
+/// The same SiLU DAG sliced from hipcc's gfx1100 V2C gate/up object
+/// (`slice_silu_gfx11`); gfx11 needs no ALU dependency waits inside it.
+pub const SILU_GOLDEN_GFX1100: &str = include_str!("../../../kernels/iu4_v2c.gfx1100.silu.region.s");
 /// Temporaries and lane-mask SGPRs one element needs.
 pub const SILU_TEMPS: usize = 7;
 pub const SILU_MASKS: usize = 2;
@@ -113,6 +116,8 @@ impl Region {
     }
 
     pub fn silu() -> Result<Self, String> { Self::parse(SILU_GOLDEN) }
+    /// The gfx1100 golden (hipcc's gfx1100 lowering of the same source).
+    pub fn silu_gfx1100() -> Result<Self, String> { Self::parse(SILU_GOLDEN_GFX1100) }
     pub fn len(&self) -> usize { self.ops.len() }
     pub fn is_empty(&self) -> bool { self.ops.is_empty() }
     /// Mnemonic sequence (for census and tests).
@@ -261,7 +266,7 @@ pub fn emit_interleaved(b: &mut Builder, region: &Region, binds: &[Binding]) -> 
             [a] => (a.text.clone(), a.defs.clone(), a.uses.clone()),
             _ => unreachable!("groups hold one op or one packet"),
         };
-        if uses.iter().any(|r| r.kind == Kind::S && unfenced.contains(&r.base)) {
+        if b.spec.arch.gfx12() && uses.iter().any(|r| r.kind == Kind::S && unfenced.contains(&r.base)) {
             op_fence(b)?;
             unfenced.clear();
         }
@@ -349,9 +354,116 @@ pub fn slice_silu(disassembly: &str, symbol: &str) -> Result<String, String> {
     Ok(out)
 }
 
+/// Slice the SiLU region out of an llvm-objdump listing of hipcc's gfx11
+/// V2C gate/up symbol, as `slice_silu` does on gfx12: the backward dataflow
+/// slice of the first value stored after the first `v_div_fixup_f32`,
+/// stopping at the two accumulator live-ins.
+///
+/// gfx11 hipcc keeps some lane masks in VCC: VOPC compares, VOP2 and VOPD
+/// `cndmask` selects, and a `s_mov_b32 vcc_lo, sN` copy of a `v_div_scale`
+/// carry written to an SGPR. The region instead names every select mask
+/// its own SGPR, spelling the same compare and select opcodes in their VOP3
+/// form, and writes the division carry straight into VCC, where
+/// `v_div_fmas_f32` reads it: the operations, operands, constants and their
+/// order are hipcc's, only mask registers are renamed. gfx11 hazard and
+/// issue waits (`s_waitcnt_depctr`, `s_delay_alu`) are the builder's to
+/// place (NoDataDepHazard: no VCC/SGPR wait is architectural here).
+pub fn slice_silu_gfx11(disassembly: &str, symbol: &str) -> Result<String, String> {
+    let mut stream: Vec<(String, String)> = Vec::new();
+    let mut inside = false;
+    for line in disassembly.lines() {
+        let t = line.trim();
+        if t.ends_with(">:") && t.contains(" <") {
+            if inside { break }
+            inside = t.ends_with(&format!("<{symbol}>:"));
+            continue;
+        }
+        if !inside { continue }
+        let Some((code, _)) = line.split_once("//") else { continue };
+        for part in code.trim().split(" :: ") {
+            let (m, a) = part.trim().split_once(' ').unwrap_or((part.trim(), ""));
+            if !m.is_empty() { stream.push((m.into(), a.trim().into())) }
+        }
+    }
+    let regs = |s: &[&str]| -> Vec<String> {
+        s.iter().filter_map(|t| register(t).map(|(_, k, n)| format!("{k}{n}"))).collect()
+    };
+    let du = |m: &str, a: &str| -> (Vec<String>, Vec<String>) {
+        if m.starts_with("s_wait") || m.starts_with("s_delay") || m.starts_with("s_cbranch") || m.starts_with("s_branch") || a.is_empty() { return (vec![], vec![]) }
+        let tokens: Vec<&str> = a.split(',').map(str::trim).collect();
+        let mut d = if tokens[0] == "vcc_lo" { vec!["vcc".to_owned()] } else { regs(&tokens[..1]) };
+        let rest = if m == "v_div_scale_f32" {
+            match tokens.get(1).copied() { Some("vcc_lo") => d.push("vcc".into()), Some(t) => d.extend(regs(&[t])), None => {} }
+            &tokens[2.min(tokens.len())..]
+        } else { &tokens[1..] };
+        let mut u = regs(rest);
+        if rest.contains(&"vcc_lo") || m == "v_dual_cndmask_b32" || m == "v_div_fmas_f32" { u.push("vcc".into()) }
+        if m.contains("fmac") { u.extend(d.iter().filter(|r| r.starts_with('v')).cloned()) }
+        (d, u)
+    };
+    let fixup = stream.iter().position(|(m, _)| m == "v_div_fixup_f32").ok_or("no v_div_fixup_f32 in symbol")?;
+    let q = du(&stream[fixup].0, &stream[fixup].1).0[0].clone();
+    let g = du(&stream[fixup].0, &stream[fixup].1).1.last().cloned().ok_or("fixup operands")?;
+    let consumer = (fixup + 1..stream.len()).find(|&i| du(&stream[i].0, &stream[i].1).1.contains(&q)).ok_or("no consumer of the quotient")?;
+    let u = du(&stream[consumer].0, &stream[consumer].1).1.into_iter().find(|r| *r != q).ok_or("no u operand")?;
+    let inputs = [g, u];
+    let mut need: BTreeSet<String> = du(&stream[consumer].0, &stream[consumer].1).1.into_iter().filter(|r| !inputs.contains(r)).collect();
+    let mut slice = vec![consumer];
+    let mut i = consumer;
+    while !need.is_empty() {
+        if i == 0 { return Err(format!("unresolved region live-ins {need:?}")) }
+        i -= 1;
+        let (d, u) = du(&stream[i].0, &stream[i].1);
+        if d.iter().any(|r| need.contains(r)) {
+            for r in &d { need.remove(r); }
+            need.extend(u.into_iter().filter(|r| !inputs.contains(r)));
+            slice.push(i);
+        }
+    }
+    slice.sort_unstable();
+    // Mask renaming: `held` maps the register currently holding a select
+    // mask (vcc or an SGPR) to its region SGPR; `carry` holds the SGPR a
+    // `v_div_scale` wrote its carry to, until the VCC copy consumes it.
+    let mut held: BTreeMap<String, String> = BTreeMap::new();
+    let mut carry: Option<String> = None;
+    let mut masks = 0usize;
+    let mut out = String::new();
+    for &j in &slice {
+        let (m, a) = (&stream[j].0, &stream[j].1);
+        let tokens: Vec<&str> = a.split(',').map(str::trim).collect();
+        let mask = |held: &BTreeMap<String, String>, holder: &str| held.get(holder).cloned().ok_or_else(|| format!("select mask {holder} has no region compare"));
+        let line = if m.starts_with("v_cmp_") {
+            let name = format!("s{masks}");
+            masks += 1;
+            held.insert(if tokens[0] == "vcc_lo" { "vcc".into() } else { tokens[0].into() }, name.clone());
+            let base = m.strip_suffix("_e32").or_else(|| m.strip_suffix("_e64")).ok_or_else(|| format!("compare form {m}"))?;
+            format!("{base}_e64 {name}, {}", tokens[1..].join(", "))
+        } else if m == "v_cndmask_b32_e32" || m == "v_dual_cndmask_b32" {
+            format!("v_cndmask_b32_e64 {}, {}, {}, {}", tokens[0], tokens[1], tokens[2], mask(&held, "vcc")?)
+        } else if m == "v_cndmask_b32_e64" {
+            format!("v_cndmask_b32_e64 {}, {}, {}, {}", tokens[0], tokens[1], tokens[2], mask(&held, tokens[3])?)
+        } else if m == "v_div_scale_f32" && tokens.get(1).is_some_and(|t| t.starts_with('s')) {
+            carry = Some(tokens[1].into());
+            format!("v_div_scale_f32 {}, vcc_lo, {}", tokens[0], tokens[2..].join(", "))
+        } else if m == "s_mov_b32" && tokens[0] == "vcc_lo" {
+            if carry.take().as_deref() != Some(tokens[1]) { return Err(format!("VCC copy of {} is not a division carry", tokens[1])) }
+            continue;
+        } else if m.starts_with("s_") {
+            return Err(format!("unexpected scalar instruction in the SiLU slice: {m} {a}"));
+        } else {
+            format!("{m} {a}")
+        };
+        out.push_str(&line);
+        out.push('\n');
+    }
+    Ok(out)
+}
+
 /// The committed golden without its provenance comments.
-pub fn golden_body() -> String {
-    SILU_GOLDEN.lines().filter(|l| !l.trim_start().starts_with(';') && !l.trim().is_empty()).map(|l| format!("{l}\n")).collect()
+pub fn golden_body() -> String { body_of(SILU_GOLDEN) }
+/// A committed golden without its provenance comments.
+pub fn body_of(golden: &str) -> String {
+    golden.lines().filter(|l| !l.trim_start().starts_with(';') && !l.trim().is_empty()).map(|l| format!("{l}\n")).collect()
 }
 
 #[cfg(test)]

@@ -19,7 +19,7 @@ fn probe(arch:Arch)->Result<Emitted,String>{
  b.push(Instruction::new("s_endpgm",vec![],vec![]))?;
  b.finish()
 }
-const USAGE:&str="usage: hipfire-isa emit --kernel fold_magic --arch gfx1201 --out FILE --proof FILE\n       hipfire-isa emit --kernel iu4_v2c [--epi set] --arch gfx1100 --out FILE --proof FILE\n       hipfire-isa emit --kernel iu4_gemm --fold k128 --tile 128x128x8|256x128x16 --cacc 1 --epi set|add|silu|silu-bf16|qkvzagdn|all [--alayout token|slab] --arch gfx1201 --out FILE --proof FILE\n       hipfire-isa emit --kernel fp8_gemm --scale row|k128|both --epi set|add|silu|qkv|qkvza|all --arch gfx1201 --out FILE --proof FILE\n       hipfire-isa emit --kernel gdn_scan --arch gfx1201 --out FILE --proof FILE\n       hipfire-isa region-import --disassembly OBJDUMP.txt [--symbol gemm_mq4g256v2_gate_up_silu_mmq_iu4_v3]";
+const USAGE:&str="usage: hipfire-isa emit --kernel fold_magic --arch gfx1201 --out FILE --proof FILE\n       hipfire-isa emit --kernel iu4_v2c [--epi set|add|add_touch|silu|all] --arch gfx1100 --out FILE --proof FILE\n       hipfire-isa emit --kernel iu4_gemm --fold k128 --tile 128x128x8|256x128x16 --cacc 1 --epi set|add|silu|silu-bf16|qkvzagdn|all [--alayout token|slab] --arch gfx1201 --out FILE --proof FILE\n       hipfire-isa emit --kernel fp8_gemm --scale row|k128|both --epi set|add|silu|qkv|qkvza|all --arch gfx1201 --out FILE --proof FILE\n       hipfire-isa emit --kernel gdn_scan --arch gfx1201 --out FILE --proof FILE\n       hipfire-isa region-import --disassembly OBJDUMP.txt [--symbol gemm_mq4g256v2_gate_up_silu_mmq_iu4_v3]";
 /// `--epi all` emits the three epilogue symbols as one module (the product
 /// code object the oracle loads); a single epilogue emits one symbol.
 fn iu4_gemm(fold:&str,tile:&str,cacc:&str,epi:&str,act:&str,arch:Arch)->Result<(String,Vec<u8>),String>{
@@ -28,6 +28,14 @@ fn iu4_gemm(fold:&str,tile:&str,cacc:&str,epi:&str,act:&str,arch:Arch)->Result<(
  if epi=="all"{let (_,text,proof)=iu4_gemm::emit_module(fold,tile,cacc,act,arch)?;return Ok((text,serde_json::to_vec_pretty(&proof).map_err(|e|e.to_string())?))}
  let emitted=iu4_gemm::emit(Spec{fold,tile,cacc,epi:epi.parse()?,act,arch})?;
  Ok((emitted.s_text,serde_json::to_vec_pretty(&emitted.proof).map_err(|e|e.to_string())?))
+}
+/// gfx1100 V2C-equivalent GEMM: one epilogue symbol, or `--epi all` for the
+/// product module (every epilogue symbol in one code object).
+fn iu4_v2c(epi:&str,arch:Arch)->Result<(String,Vec<u8>),String>{
+ use hipfire_isa::kernels::iu4_v2c::{self,Epi,Spec};
+ if epi=="all"{let (_,text,proof)=iu4_v2c::module(arch,&Epi::ALL)?;return Ok((text,serde_json::to_vec_pretty(&proof).map_err(|e|e.to_string())?))}
+ let e=iu4_v2c::emit(Spec{arch,epi:epi.parse()?})?;
+ Ok((e.s_text,serde_json::to_vec_pretty(&e.proof).map_err(|e|e.to_string())?))
 }
 fn fp8_gemm(scale:&str,epi:&str,arch:Arch)->Result<(String,Vec<u8>),String>{
  use hipfire_isa::kernels::fp8_gemm::{self,Spec,ActScale,Epi};
@@ -54,10 +62,28 @@ fn fp8_gemm(scale:&str,epi:&str,arch:Arch)->Result<(String,Vec<u8>),String>{
 /// the committed golden the gate/up epilogue instantiates.
 fn region_import(mut args:impl Iterator<Item=String>)->Result<(),String>{
  use hipfire_isa::kernels::iu4_gemm::region;
- let mut dis=None;let mut symbol="gemm_mq4g256v2_gate_up_silu_mmq_iu4_v3".to_string();let mut gdn=None;let mut write=false;let mut provenance=String::new();
- while let Some(flag)=args.next(){if flag=="--write"{write=true;continue}let value=args.next().ok_or_else(||format!("missing value after {flag}"))?;match flag.as_str(){"--disassembly"=>dis=Some(value),"--symbol"=>symbol=value,"--gdn-object"=>gdn=Some(value),"--provenance"=>provenance=value,_=>return Err(format!("unknown flag {flag}\n{USAGE}"))}}
+ let mut dis=None;let mut symbol=None;let mut gdn=None;let mut write=false;let mut provenance=String::new();let mut arch=Arch::Gfx1201;
+ while let Some(flag)=args.next(){if flag=="--write"{write=true;continue}let value=args.next().ok_or_else(||format!("missing value after {flag}"))?;match flag.as_str(){"--disassembly"=>dis=Some(value),"--symbol"=>symbol=Some(value),"--gdn-object"=>gdn=Some(value),"--provenance"=>provenance=value,"--arch"=>arch=value.parse()?,_=>return Err(format!("unknown flag {flag}\n{USAGE}"))}}
  if let Some(object)=gdn {return gdn_region_import(&object,write,&provenance)}
  let text=fs::read_to_string(dis.ok_or("missing --disassembly")?).map_err(|e|e.to_string())?;
+ if !arch.gfx12(){
+  // gfx1100: hipcc's V2C gate/up object (`--write` regenerates the golden, prefixing `--provenance`).
+  let symbol=symbol.unwrap_or_else(||"gemm_mq4g256v2_gate_up_silu_iu4_v2c_gfx11".into());
+  let slice=region::slice_silu_gfx11(&text,&symbol)?;
+  region::Region::parse(&slice)?;
+  let path=format!("{}/kernels/iu4_v2c.gfx1100.silu.region.s",env!("CARGO_MANIFEST_DIR"));
+  if write {
+   let head:String=provenance.split("\\n").map(|l|format!("; {l}\n")).collect();
+   fs::write(&path,format!("{head}{slice}")).map_err(|e|e.to_string())?;
+   eprintln!("region-import: wrote {path}");
+   return Ok(())
+  }
+  print!("{slice}");
+  if slice!=region::body_of(region::SILU_GOLDEN_GFX1100){return Err(format!("sliced region differs from {path}"))}
+  eprintln!("region-import: {symbol} gfx1100 SiLU slice matches the committed golden");
+  return Ok(())
+ }
+ let symbol=symbol.unwrap_or_else(||"gemm_mq4g256v2_gate_up_silu_mmq_iu4_v3".into());
  let slice=region::slice_silu(&text,&symbol)?;
  print!("{slice}");
  if slice!=region::golden_body(){return Err("sliced region differs from kernels/iu4_gemm.silu.region.s".into())}
@@ -97,7 +123,7 @@ fn run()->Result<(),String>{let mut args=env::args().skip(1);let command=args.ne
   "fold_magic"=>{if let Some(var)=variant {if var!="probe" {return Err("fold_magic supports only variant probe".into())}}let emitted=probe(arch)?;(emitted.s_text,serde_json::to_vec_pretty(&emitted.proof).map_err(|e|e.to_string())?)}
   "iu4_gemm"=>iu4_gemm(fold.as_deref().unwrap_or("k128"),tile.as_deref().ok_or("missing --tile")?,cacc.as_deref().unwrap_or("1"),epi.as_deref().ok_or("missing --epi")?,alayout.as_deref().unwrap_or("token"),arch)?,
   "gdn_scan"=>{let e=hipfire_isa::kernels::gdn_scan::emit(arch)?;(e.s_text,serde_json::to_vec_pretty(&e.proof).map_err(|e|e.to_string())?)}
-  "iu4_v2c"=>{if epi.as_deref().is_some_and(|e|e!="set"){return Err("iu4_v2c emits only --epi set".into())}let e=hipfire_isa::kernels::iu4_v2c::emit(hipfire_isa::kernels::iu4_v2c::Spec{arch})?;(e.s_text,serde_json::to_vec_pretty(&e.proof).map_err(|e|e.to_string())?)}
+  "iu4_v2c"=>iu4_v2c(epi.as_deref().unwrap_or("set"),arch)?,
   "fp8_gemm"=>fp8_gemm(scale.as_deref().ok_or("missing --scale")?,epi.as_deref().ok_or("missing --epi")?,arch)?,
   _=>return Err(format!("kernel {kernel} is not authored\n{USAGE}"))};
  fs::write(out.ok_or("missing --out")?,text).map_err(|e|e.to_string())?;fs::write(proof.ok_or("missing --proof")?,proof_json).map_err(|e|e.to_string())?;Ok(())}

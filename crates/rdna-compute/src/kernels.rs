@@ -4106,6 +4106,14 @@ pub const SPLIT_MQ4V2_Z_BETAALPHA_SRC: &str =
 /// h = silu(gate)*up.
 pub const GEMM_MQ4G256V2_RESIDUAL_IU4_V2C_GFX11_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq4g256v2_residual_iu4_v2c.gfx11.hip");
+/// Certified gfx1100 builder code object (`hipfire-isa emit --kernel iu4_v2c
+/// --epi all`, one contract-checked `peacemaker custom build --arch gfx1100`
+/// per symbol): the V2C algorithm's SET, ADD and F1-lite gate/up SiLU
+/// entries with every fold op VOPD-paired, 256-thread blocks, the V2C grid
+/// and ABI, byte-identical outputs. Selected by `gfx1100_pm_gemm`
+/// (`HIPFIRE_GFX1100_PM_GEMM=0` restores the hipcc entries above).
+pub const GEMM_MQ4G256V2_RESIDUAL_IU4_PM_GFX1100: &[u8] =
+    include_bytes!("../../../kernels/gemm_mq4g256v2_residual_iu4_pm_gfx1100.hxaco");
 /// gfx11 GEMM v2 "V2B" symmetric IU4 prefill tile (M256xN256, 16 waves, two
 /// 32 KiB K128 LDS slots, 1 CTA/WGP), dispatched on gfx1151. Same production
 /// operand layouts, staging permutation, fold numerics and 6-argument

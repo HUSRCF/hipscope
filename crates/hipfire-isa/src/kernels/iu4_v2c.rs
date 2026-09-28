@@ -1,6 +1,9 @@
-//! Builder-emitted gfx11 (RDNA3, wave32) MQ4V2 x block_i4_128 SET GEMM with
-//! the hipcc V2C algorithm (`kernels/src/gemm_mq4g256v2_residual_iu4_v2c.gfx11.hip`,
-//! symbol `gemm_mq4g256v2_residual_iu4_v2c_set_gfx11`), bit for bit.
+//! Builder-emitted gfx11 (RDNA3, wave32) MQ4V2 x block_i4_128 GEMM with the
+//! hipcc V2C algorithm (`kernels/src/gemm_mq4g256v2_residual_iu4_v2c.gfx11.hip`),
+//! bit for bit, for its three epilogue families:
+//! SET (`gemm_mq4g256v2_residual_iu4_v2c_set_gfx11`), ADD (`_add` /
+//! `_add_touch`) and the F1-lite gate/up SiLU entry
+//! (`gemm_mq4g256v2_gate_up_silu_iu4_v2c_gfx11`).
 //!
 //! Tile M128 x N128, 8 waves; wave `w` owns rows `32*(w/2)..+32` (two 16-row
 //! fragments `a`) and tokens `64*(w%2)..+64` (four 16-token fragments `c`).
@@ -15,11 +18,23 @@
 //! from `sum = +0`, as hipcc compiles V2C (`v_mul_f32`, `v_add_f32`
 //! literal, `v_fmac_f32`). A is rebiased once at staging (XOR 0x88888888,
 //! the symmetric `zp == -8*sc` contract); both operands are signed nibbles.
+//! SET stores `sum`, ADD stores `RN(Y + sum)`, and gate/up stores
+//! `h = SILU_MUL(g, u)` through the imported hipcc region
+//! (`kernels/iu4_v2c.gfx1100.silu.region.s`).
 //!
-//! Launch contract (as V2C SET): grid `[N/128, M/128]`, block `[256,1,1]`,
-//! dynamic LDS 32768 bytes; `M % 128 == N % 128 == 0`, `K % 256 == 0`,
-//! kernargs `A, Xq, Y, M, K, N` (Y token-major `[N][M]` f32).
-use super::iu4_gemm::{ds_offsets, lit, s, sr, v, vr};
+//! Gate/up (F1-lite): the CTA covers 128 virtual rows = 64 h rows; tile
+//! fragment `2p` is gate rows and `2p+1` the same up rows (staging wave `w`
+//! loads gate (`w` even) or up (`w` odd) rows `64*wgy + 16*(w/2) + 0..15`).
+//! Each lane loads both the gate and the up FP16 scale of its row; fold
+//! pass 0 shares gate scales and pass 1 up scales, so the fold (and its
+//! full VOPD pairing) is SET's plus one conversion.
+//!
+//! Launch contract (as V2C): grid `[N/128, M/128]` (gate/up: `[N/128,
+//! 2M/128]`), block `[256,1,1]`, dynamic LDS 32768 bytes; `M % 128 == N % 128
+//! == 0`, `K % 256 == 0`, `M * 4 < 2^24`; kernargs `A, Xq, Y, M, K, N`
+//! (gate/up: `G, U, Xq, H, M, K, N` with `M` the gate row count), Y/H
+//! token-major `[N][M]` f32.
+use super::iu4_gemm::{ds_offsets, lit, region::{self, Binding, Region}, s, sr, v, vr};
 use crate::{Arch, Builder, Emitted, KernargLayout, KernelSpec, RegPlan, V,
     insn::{Instruction, MemoryClass, Sop, Wmma}, lds::Transition,
     reg::{Live, RegRef}, vopd::{Operand, VopdF32, VopdOp}};
@@ -43,20 +58,55 @@ pub const TAIL: &str = ".Lv2c_tail";
 pub const EPI: &str = ".Lv2c_epilogue";
 pub const END: &str = ".Lv2c_end";
 
-/// Variant axes of this first gfx11 slice: the SET epilogue on gfx1100.
+/// Epilogue family. `AddTouch` is ADD with the residual tile touched during
+/// the last two epochs so the epilogue's loads hit cache (outputs identical).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Spec { pub arch: Arch }
+pub enum Epi { Set, Add, AddTouch, Silu }
+impl Epi {
+    pub const ALL: [Epi; 4] = [Epi::Set, Epi::Add, Epi::AddTouch, Epi::Silu];
+    pub fn name(self) -> &'static str { match self { Self::Set => "set", Self::Add => "add", Self::AddTouch => "add_touch", Self::Silu => "silu" } }
+    fn silu(self) -> bool { self == Self::Silu }
+}
+impl std::str::FromStr for Epi {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        Self::ALL.into_iter().find(|e| e.name() == s).ok_or_else(|| format!("iu4_v2c epilogue {s}: expected set|add|add_touch|silu"))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Spec { pub arch: Arch, pub epi: Epi }
 
 impl Spec {
-    pub fn symbol(self) -> String { format!("gemm_mq4g256v2_residual_iu4_pm_set_{}", self.arch.name()) }
+    pub fn symbol(self) -> String {
+        let arch = self.arch.name();
+        match self.epi {
+            Epi::Silu => format!("gemm_mq4g256v2_gate_up_silu_iu4_pm_{arch}"),
+            e => format!("gemm_mq4g256v2_residual_iu4_pm_{}_{arch}", e.name()),
+        }
+    }
     pub fn validate(self) -> Result<(), String> {
         if self.arch != Arch::Gfx1100 { return Err("iu4_v2c: the V2C tile is proven on gfx1100 only (gfx1151 ships V2B)".into()) }
         Ok(())
     }
     pub fn kernargs(self) -> KernargLayout {
+        if self.epi.silu() {
+            return KernargLayout::new(44).pointer("G", 0).pointer("U", 8).pointer("Xq", 16).pointer("Y", 24)
+                .hidden("M", 32, 4, "by_value").hidden("K", 36, 4, "by_value").hidden("N", 40, 4, "by_value");
+        }
         KernargLayout::new(36).pointer("A", 0).pointer("Xq", 8).pointer("Y", 16)
             .hidden("M", 24, 4, "by_value").hidden("K", 28, 4, "by_value").hidden("N", 32, 4, "by_value")
     }
+}
+
+/// Kernel-argument SGPRs: SET/ADD `s_load_b256 s[8:15]` (A, Xq, Y, M, K) +
+/// `s_load_b32 s16` (N); gate/up `s_load_b256 s[8:15]` (G, U, Xq, Y) +
+/// `s_load_b64 s[30:31]` (M, K) + `s_load_b32 s16` (N).
+#[derive(Clone, Copy)]
+struct Args { a: u8, xq: u8, y: u8, m: u8, k: u8, n: u8 }
+fn args(epi: Epi) -> Args {
+    if epi.silu() { Args { a: 8, xq: 12, y: 14, m: 30, k: 31, n: 16 } }
+    else { Args { a: Regs::A, xq: Regs::XQ, y: Regs::Y, m: Regs::M, k: Regs::K, n: Regs::N } }
 }
 
 /// Physical registers (see `plan`).
@@ -80,6 +130,16 @@ impl Regs {
     const AB: [u8; 2] = [174, 175];
     const XB: [[u8; 2]; 2] = [[176, 177], [178, 179]];
     const YOFF: u8 = 180;
+    // Gate/up: this lane's raw / f32 up-row scale.
+    const WSU: u8 = 181; const WSFU: u8 = 182;
+    // ADD touch: this thread's residual line offset, then two touch sinks.
+    const TOFF: u8 = 181; const TDST: [u8; 2] = [182, 183];
+    // Epilogue (every K-loop register is dead): ADD residual quads
+    // v104..v167; gate/up h octets v104..v135 and four slots of nine SiLU
+    // temporaries, v136.. and v145.. (VOPD partner slots 0/1) and v4.. and
+    // v13.. (slots 2/3), clear of every LDS address register (v170..v179,
+    // which the all-lane LDS bound requires unchanged after the prologue).
+    const RESID: u8 = 104; const H: u8 = 104; const SILU_T: [u8; 4] = [136, 145, 4, 13];
     // SGPRs
     const KARG: u8 = 0; const WGX: u8 = 2; const WGY: u8 = 3;
     const T0: u8 = 4; const T1: u8 = 5; const T64: u8 = 6;
@@ -88,7 +148,18 @@ impl Regs {
     const SA: u8 = 20; const SX: u8 = 22; const SY: u8 = 24;
     const N72: u8 = 26; const M64: u8 = 27; const WR: u8 = 28; const WC: u8 = 29;
     const A: u8 = 8; const XQ: u8 = 10; const Y: u8 = 12; const M: u8 = 14; const K: u8 = 15;
+    // Gate/up: M, K s[30:31]; staging base (gate or up rows of this wave)
+    // s[32:33]; the up-row scale base s[34:35] (SA holds the gate-row one);
+    // SiLU lane masks s36, s38, .., s50 (one aligned pair each).
+    const MK: u8 = 30; const SS: u8 = 32; const SU: u8 = 34; const MASKS: u8 = 36;
 }
+
+/// SiLU region slots (instances live at once) and their temporaries.
+const SILU_SLOTS: u8 = 4;
+const SILU_TEMPS: u8 = 9;
+
+/// Staging A base: the tile's rows (SET/ADD) or this wave's gate/up rows.
+fn stage_base(epi: Epi) -> u8 { if epi.silu() { Regs::SS } else { Regs::SA } }
 
 const SLOT_A: [usize; 2] = [0, 2];
 const SLOT_X: [usize; 2] = [1, 3];
@@ -108,15 +179,15 @@ fn global_load(b: &mut Builder, width: u8, dst: u8, voff: u8, base: u8, offset: 
     mem(b, format!("{name} {reg}, v{voff}, s[{base}:{}]{}", base + 1, off(offset)?), &[reg], &[v(voff), sr(base, 2)], MemoryClass::VmemLoad)
 }
 
-fn plan() -> Result<RegPlan, String> {
+fn plan(epi: Epi) -> Result<RegPlan, String> {
     let mut p = RegPlan::new(VGPR_CEILING, 104)?;
     let kl = || Live::Between(K_BEGIN.into(), EPI.into());
     let kernel = || Live::Between("entry".into(), EPI.into());
     let pro = || Live::Between("entry".into(), K_BEGIN.into());
-    let epi = || Live::Between(EPI.into(), END.into());
+    let epl = || Live::Between(EPI.into(), END.into());
     for c in 0..4u8 { p.v::<8>("C", Regs::C + 8 * c, kl())?; }
     for i in 0..32u8 { p.v::<1>(if i == 0 { "tid" } else { "prologue_tmp" }, Regs::C + i, pro())?; }
-    for i in 0..4u8 { p.v::<1>("y_off_c", Regs::C + i, epi())?; }
+    for i in 0..4u8 { p.v::<1>("y_off_c", Regs::C + i, epl())?; }
     for k in 0..8u8 { p.v::<8>("acc", Regs::ACC + 8 * k, Live::Whole)?; }
     p.v::<8>("magic8", Regs::MAGIC, kernel())?;
     for r in Regs::AV { p.v::<4>("a_frag_pair", r, kl())?; }
@@ -148,6 +219,28 @@ fn plan() -> Result<RegPlan, String> {
     p.s::<2>("a_base", Regs::SA, Live::Whole)?;
     p.s::<2>("x_base", Regs::SX, Live::Whole)?;
     p.s::<2>("y_base", Regs::SY, Live::Whole)?;
+    match epi {
+        Epi::Set => {}
+        Epi::Add | Epi::AddTouch => {
+            for q in 0..16u8 { p.v::<4>("residual", Regs::RESID + 4 * q, epl())?; }
+            if epi == Epi::AddTouch {
+                p.v::<1>("touch_off", Regs::TOFF, Live::Whole)?;
+                for r in Regs::TDST { p.v::<1>("touch_sink", r, Live::Whole)?; }
+            }
+        }
+        Epi::Silu => {
+            p.v::<1>("scale_f16_up", Regs::WSU, kl())?;
+            p.v::<1>("scale_f32_up", Regs::WSFU, kl())?;
+            for c in 0..4u8 { p.v::<8>("h", Regs::H + 8 * c, epl())?; }
+            for base in Regs::SILU_T { for t in 0..SILU_TEMPS { p.v::<1>("silu_tmp", base + t, epl())?; } }
+            p.s::<2>("m_k", Regs::MK, Live::Whole)?;
+            p.s::<2>("stage_base", Regs::SS, Live::Whole)?;
+            p.s::<2>("up_scale_base", Regs::SU, Live::Whole)?;
+            // Each wave32 lane mask owns an aligned SGPR pair: M7's gfx1100
+            // table models VOP3 mask operands with their wave64 width.
+            for m in 0..2 * SILU_SLOTS { p.s::<2>("silu_mask", Regs::MASKS + 2 * m, epl())?; }
+        }
+    }
     Ok(p)
 }
 
@@ -159,11 +252,17 @@ fn declare_lds(b: &mut Builder) -> Result<(), String> {
 }
 
 /// Kernel arguments, workgroup bases and every lane-invariant offset.
-fn prologue(b: &mut Builder) -> Result<(), String> {
+fn prologue(b: &mut Builder, epi: Epi) -> Result<(), String> {
     let (t0, t1, t64) = (Regs::T0, Regs::T1, Regs::T64);
+    let ar = args(epi);
     // gfx11 llvm-objdump spells a zero SMEM offset `null`; parse-back compares canonical text.
     mem(b, format!("s_load_b256 s[{}:{}], s[0:1], null", Regs::ARGS, Regs::ARGS + 7), &[sr(Regs::ARGS, 8)], &[sr(Regs::KARG, 2)], MemoryClass::SmemLoad)?;
-    mem(b, format!("s_load_b32 s{}, s[0:1], 0x20", Regs::N), &[s(Regs::N)], &[sr(Regs::KARG, 2)], MemoryClass::SmemLoad)?;
+    if epi.silu() {
+        mem(b, format!("s_load_b64 s[{}:{}], s[0:1], 0x20", Regs::MK, Regs::MK + 1), &[sr(Regs::MK, 2)], &[sr(Regs::KARG, 2)], MemoryClass::SmemLoad)?;
+        mem(b, format!("s_load_b32 s{}, s[0:1], 0x28", ar.n), &[s(ar.n)], &[sr(Regs::KARG, 2)], MemoryClass::SmemLoad)?;
+    } else {
+        mem(b, format!("s_load_b32 s{}, s[0:1], 0x20", ar.n), &[s(ar.n)], &[sr(Regs::KARG, 2)], MemoryClass::SmemLoad)?;
+    }
     // v0 = tid; v1 = wave; v2 = lane; v3 = lr; v4 = hi.
     op(b, "v_lshrrev_b32_e32 v1, 5, v0", &[v(1)], &[v(0)])?;
     op(b, "v_and_b32_e32 v2, 31, v0", &[v(2)], &[v(0)])?;
@@ -173,36 +272,59 @@ fn prologue(b: &mut Builder) -> Result<(), String> {
     op(b, format!("s_lshr_b32 s{}, s{}, 1", Regs::WR, Regs::WAVE), &[s(Regs::WR)], &[s(Regs::WAVE)])?;
     op(b, format!("s_and_b32 s{}, s{}, 1", Regs::WC, Regs::WAVE), &[s(Regs::WC)], &[s(Regs::WAVE)])?;
     // row_bytes = (K/256)*136; trips = K/256 - 1 (whole two-epoch trips before the tail pair).
-    op(b, format!("s_lshr_b32 s{}, s{}, 8", Regs::ROWB, Regs::K), &[s(Regs::ROWB)], &[s(Regs::K)])?;
+    op(b, format!("s_lshr_b32 s{}, s{}, 8", Regs::ROWB, ar.k), &[s(Regs::ROWB)], &[s(ar.k)])?;
     op(b, format!("s_add_i32 s{}, s{}, -1", Regs::TRIPS, Regs::ROWB), &[s(Regs::TRIPS)], &[s(Regs::ROWB)])?;
     op(b, format!("s_mulk_i32 s{}, {}", Regs::ROWB, lit(GROUP_BYTES)), &[s(Regs::ROWB)], &[s(Regs::ROWB)])?;
-    // A base: A + (128*wgy)*row_bytes.
-    op(b, format!("s_lshl_b32 s{t0}, s{}, 7", Regs::WGY), &[s(t0)], &[s(Regs::WGY)])?;
-    op(b, format!("s_mul_i32 s{t1}, s{t0}, s{}", Regs::ROWB), &[s(t1)], &[s(t0), s(Regs::ROWB)])?;
-    op(b, format!("s_mul_hi_u32 s{t64}, s{t0}, s{}", Regs::ROWB), &[s(t64)], &[s(t0), s(Regs::ROWB)])?;
-    op(b, format!("s_add_u32 s{}, s{}, s{t1}", Regs::SA, Regs::A), &[s(Regs::SA)], &[s(Regs::A), s(t1)])?;
-    op(b, format!("s_addc_u32 s{}, s{}, s{t64}", Regs::SA + 1, Regs::A + 1), &[s(Regs::SA + 1)], &[s(Regs::A + 1), s(t64)])?;
+    if epi.silu() {
+        // h rows 64*wgy..+63: gate/up scale bases G, U + (64*wgy)*row_bytes;
+        // staging base (wave odd ? U : G) + (64*wgy + 16*(wave/2))*row_bytes.
+        let u = ar.a + 2;
+        op(b, format!("s_lshl_b32 s{t0}, s{}, 6", Regs::WGY), &[s(t0)], &[s(Regs::WGY)])?;
+        op(b, format!("s_mul_i32 s{t1}, s{t0}, s{}", Regs::ROWB), &[s(t1)], &[s(t0), s(Regs::ROWB)])?;
+        op(b, format!("s_mul_hi_u32 s{t64}, s{t0}, s{}", Regs::ROWB), &[s(t64)], &[s(t0), s(Regs::ROWB)])?;
+        op(b, format!("s_add_u32 s{}, s{}, s{t1}", Regs::SA, ar.a), &[s(Regs::SA)], &[s(ar.a), s(t1)])?;
+        op(b, format!("s_addc_u32 s{}, s{}, s{t64}", Regs::SA + 1, ar.a + 1), &[s(Regs::SA + 1)], &[s(ar.a + 1), s(t64)])?;
+        op(b, format!("s_add_u32 s{}, s{u}, s{t1}", Regs::SU), &[s(Regs::SU)], &[s(u), s(t1)])?;
+        op(b, format!("s_addc_u32 s{}, s{}, s{t64}", Regs::SU + 1, u + 1), &[s(Regs::SU + 1)], &[s(u + 1), s(t64)])?;
+        op(b, format!("s_bitcmp1_b32 s{}, 0", Regs::WAVE), &[], &[s(Regs::WAVE)])?;
+        op(b, format!("s_cselect_b64 s[{}:{}], s[{}:{}], s[{}:{}]", Regs::SS, Regs::SS + 1, Regs::SU, Regs::SU + 1, Regs::SA, Regs::SA + 1),
+            &[sr(Regs::SS, 2)], &[sr(Regs::SU, 2), sr(Regs::SA, 2)])?;
+        op(b, format!("s_lshl_b32 s{t1}, s{}, 4", Regs::WR), &[s(t1)], &[s(Regs::WR)])?;
+        op(b, format!("s_mul_i32 s{t1}, s{t1}, s{}", Regs::ROWB), &[s(t1)], &[s(t1), s(Regs::ROWB)])?;
+        op(b, format!("s_add_u32 s{}, s{}, s{t1}", Regs::SS, Regs::SS), &[s(Regs::SS)], &[s(Regs::SS), s(t1)])?;
+        op(b, format!("s_addc_u32 s{}, s{}, 0", Regs::SS + 1, Regs::SS + 1), &[s(Regs::SS + 1)], &[s(Regs::SS + 1)])?;
+    } else {
+        // A base: A + (128*wgy)*row_bytes.
+        op(b, format!("s_lshl_b32 s{t0}, s{}, 7", Regs::WGY), &[s(t0)], &[s(Regs::WGY)])?;
+        op(b, format!("s_mul_i32 s{t1}, s{t0}, s{}", Regs::ROWB), &[s(t1)], &[s(t0), s(Regs::ROWB)])?;
+        op(b, format!("s_mul_hi_u32 s{t64}, s{t0}, s{}", Regs::ROWB), &[s(t64)], &[s(t0), s(Regs::ROWB)])?;
+        op(b, format!("s_add_u32 s{}, s{}, s{t1}", Regs::SA, ar.a), &[s(Regs::SA)], &[s(ar.a), s(t1)])?;
+        op(b, format!("s_addc_u32 s{}, s{}, s{t64}", Regs::SA + 1, ar.a + 1), &[s(Regs::SA + 1)], &[s(ar.a + 1), s(t64)])?;
+    }
     // X base: Xq + (128*wgx)*72.
     op(b, format!("s_mul_i32 s{t1}, s{}, {}", Regs::WGX, lit(128 * XBLK_BYTES)), &[s(t1)], &[s(Regs::WGX)])?;
-    op(b, format!("s_add_u32 s{}, s{}, s{t1}", Regs::SX, Regs::XQ), &[s(Regs::SX)], &[s(Regs::XQ), s(t1)])?;
-    op(b, format!("s_addc_u32 s{}, s{}, 0", Regs::SX + 1, Regs::XQ + 1), &[s(Regs::SX + 1)], &[s(Regs::XQ + 1)])?;
-    op(b, format!("s_mul_i32 s{}, s{}, {}", Regs::N72, Regs::N, lit(XBLK_BYTES)), &[s(Regs::N72)], &[s(Regs::N)])?;
-    op(b, format!("s_lshl_b32 s{}, s{}, 6", Regs::M64, Regs::M), &[s(Regs::M64)], &[s(Regs::M)])?;
-    // Y base: Y + 4*(128*wgx*M + 128*wgy), 64-bit.
+    op(b, format!("s_add_u32 s{}, s{}, s{t1}", Regs::SX, ar.xq), &[s(Regs::SX)], &[s(ar.xq), s(t1)])?;
+    op(b, format!("s_addc_u32 s{}, s{}, 0", Regs::SX + 1, ar.xq + 1), &[s(Regs::SX + 1)], &[s(ar.xq + 1)])?;
+    op(b, format!("s_mul_i32 s{}, s{}, {}", Regs::N72, ar.n, lit(XBLK_BYTES)), &[s(Regs::N72)], &[s(ar.n)])?;
+    op(b, format!("s_lshl_b32 s{}, s{}, 6", Regs::M64, ar.m), &[s(Regs::M64)], &[s(ar.m)])?;
+    // Y base: Y + 4*(128*wgx*M + first row), 64-bit; the first row
+    // (128*wgy, gate/up 64*wgy) is still in t0.
     op(b, format!("s_lshl_b32 s{t1}, s{}, 7", Regs::WGX), &[s(t1)], &[s(Regs::WGX)])?;
-    op(b, format!("s_mul_hi_u32 s{}, s{t1}, s{}", t64 + 1, Regs::M), &[s(t64 + 1)], &[s(t1), s(Regs::M)])?;
-    op(b, format!("s_mul_i32 s{t64}, s{t1}, s{}", Regs::M), &[s(t64)], &[s(t1), s(Regs::M)])?;
+    op(b, format!("s_mul_hi_u32 s{}, s{t1}, s{}", t64 + 1, ar.m), &[s(t64 + 1)], &[s(t1), s(ar.m)])?;
+    op(b, format!("s_mul_i32 s{t64}, s{t1}, s{}", ar.m), &[s(t64)], &[s(t1), s(ar.m)])?;
     op(b, format!("s_add_u32 s{t64}, s{t64}, s{t0}"), &[s(t64)], &[s(t64), s(t0)])?;
     op(b, format!("s_addc_u32 s{}, s{}, 0", t64 + 1, t64 + 1), &[s(t64 + 1)], &[s(t64 + 1)])?;
     op(b, format!("s_lshl_b64 s[{t64}:{}], s[{t64}:{}], 2", t64 + 1, t64 + 1), &[sr(t64, 2)], &[sr(t64, 2)])?;
-    op(b, format!("s_add_u32 s{}, s{}, s{t64}", Regs::SY, Regs::Y), &[s(Regs::SY)], &[s(Regs::Y), s(t64)])?;
-    op(b, format!("s_addc_u32 s{}, s{}, s{}", Regs::SY + 1, Regs::Y + 1, t64 + 1), &[s(Regs::SY + 1)], &[s(Regs::Y + 1), s(t64 + 1)])?;
+    op(b, format!("s_add_u32 s{}, s{}, s{t64}", Regs::SY, ar.y), &[s(Regs::SY)], &[s(ar.y), s(t64)])?;
+    op(b, format!("s_addc_u32 s{}, s{}, s{}", Regs::SY + 1, ar.y + 1, t64 + 1), &[s(Regs::SY + 1)], &[s(ar.y + 1), s(t64 + 1)])?;
 
     // Staging offsets. sr = 16*wave + lr; the row/token's K16 slice pair i
     // is at +8 (header / d,s skip) + 8*hi + 16*i.
     op(b, format!("v_lshl_add_u32 v5, s{}, 4, v3", Regs::WAVE), &[v(5)], &[s(Regs::WAVE), v(3)])?;
     op(b, "v_lshl_add_u32 v6, v4, 3, 8", &[v(6)], &[v(4)])?;
-    op(b, format!("v_mad_u32_u24 v{}, v5, s{}, v6", Regs::A_OFF, Regs::ROWB), &[v(Regs::A_OFF)], &[v(5), s(Regs::ROWB), v(6)])?;
+    // Gate/up stages row lr of its wave's base (the wave's 16 rows are in SS).
+    let a_row = if epi.silu() { 3 } else { 5 };
+    op(b, format!("v_mad_u32_u24 v{}, v{a_row}, s{}, v6", Regs::A_OFF, Regs::ROWB), &[v(Regs::A_OFF)], &[v(a_row), s(Regs::ROWB), v(6)])?;
     op(b, format!("v_mad_u32_u24 v{}, v5, {}, v6", Regs::X_OFF, lit(XBLK_BYTES)), &[v(Regs::X_OFF)], &[v(5), v(6)])?;
     // LDS store address: wave*1024 + hi*128 + lr*8 (fragment block w, slice 2i+hi).
     op(b, "v_lshlrev_b32_e32 v7, 3, v3", &[v(7)], &[v(3)])?;
@@ -225,26 +347,46 @@ fn prologue(b: &mut Builder) -> Result<(), String> {
     for (dst, add) in [(Regs::XB[0][0], A_BYTES), (Regs::XB[0][1], A_BYTES + 2048), (Regs::XB[1][0], SLOT_BYTES + A_BYTES), (Regs::XB[1][1], SLOT_BYTES + A_BYTES + 2048)] {
         op(b, format!("v_add_nc_u32_e32 v{dst}, {}, v10", lit(add)), &[v(dst)], &[v(10)])?;
     }
-    // Scale row of lane (hi, lr): wr*32 + 16*(lr>>3) + 8*hi + (lr&7).
-    op(b, "v_lshrrev_b32_e32 v12, 3, v3", &[v(12)], &[v(3)])?;
-    op(b, "v_lshlrev_b32_e32 v12, 4, v12", &[v(12)], &[v(12)])?;
-    op(b, "v_lshl_add_u32 v12, v4, 3, v12", &[v(12)], &[v(4), v(12)])?;
+    // Scale row of lane (hi, lr): wr*32 + 16*(lr>>3) + 8*hi + (lr&7);
+    // gate/up: h row wr*16 + 8*hi + (lr&7) of both the G and U bases.
+    if !epi.silu() {
+        op(b, "v_lshrrev_b32_e32 v12, 3, v3", &[v(12)], &[v(3)])?;
+        op(b, "v_lshlrev_b32_e32 v12, 4, v12", &[v(12)], &[v(12)])?;
+        op(b, "v_lshl_add_u32 v12, v4, 3, v12", &[v(12)], &[v(4), v(12)])?;
+    } else {
+        op(b, "v_lshlrev_b32_e32 v12, 3, v4", &[v(12)], &[v(4)])?;
+    }
     op(b, "v_and_b32_e32 v13, 7, v3", &[v(13)], &[v(3)])?;
     op(b, "v_add_nc_u32_e32 v12, v12, v13", &[v(12)], &[v(12), v(13)])?;
-    op(b, format!("v_lshl_add_u32 v12, s{}, 5, v12", Regs::WR), &[v(12)], &[s(Regs::WR), v(12)])?;
+    let wave_rows_log2 = if epi.silu() { 4 } else { 5 };
+    op(b, format!("v_lshl_add_u32 v12, s{}, {wave_rows_log2}, v12", Regs::WR), &[v(12)], &[s(Regs::WR), v(12)])?;
     op(b, format!("v_mul_u32_u24_e32 v{}, s{}, v12", Regs::LWS, Regs::ROWB), &[v(Regs::LWS)], &[s(Regs::ROWB), v(12)])?;
     // d of token wc*64 + lr (+16c): (wc*64 + lr)*72.
     op(b, format!("v_lshl_add_u32 v14, s{}, 6, v3", Regs::WC), &[v(14)], &[s(Regs::WC), v(3)])?;
     op(b, format!("v_mul_u32_u24_e32 v{}, {}, v14", Regs::LXS, lit(XBLK_BYTES)), &[v(Regs::LXS)], &[v(14)])?;
-    // Y offset of (token wc*64 + lr, row wr*32 + 8*hi), bytes.
+    // Y offset of (token wc*64 + lr, row wr*32 + 8*hi; gate/up h row
+    // wr*16 + 8*hi), bytes.
     op(b, "v_lshlrev_b32_e32 v15, 3, v4", &[v(15)], &[v(4)])?;
-    op(b, format!("v_lshl_add_u32 v15, s{}, 5, v15", Regs::WR), &[v(15)], &[s(Regs::WR), v(15)])?;
-    op(b, format!("v_mad_u32_u24 v15, v14, s{}, v15", Regs::M), &[v(15)], &[v(14), s(Regs::M), v(15)])?;
+    op(b, format!("v_lshl_add_u32 v15, s{}, {wave_rows_log2}, v15", Regs::WR), &[v(15)], &[s(Regs::WR), v(15)])?;
+    op(b, format!("v_mad_u32_u24 v15, v14, s{}, v15", ar.m), &[v(15)], &[v(14), s(ar.m), v(15)])?;
     op(b, format!("v_lshlrev_b32_e32 v{}, 2, v15", Regs::YOFF), &[v(Regs::YOFF)], &[v(15)])?;
+    if epi == Epi::AddTouch {
+        // Residual line l = tid + 256*i of the tile (8 64-byte lines per
+        // token): token tid/8 + 32*i, byte (tid%8)*64; i*32 tokens are
+        // added in the tail.
+        op(b, format!("s_lshl_b32 s{t1}, s{}, 2", ar.m), &[s(t1)], &[s(ar.m)])?;
+        op(b, "v_lshrrev_b32_e32 v17, 3, v0", &[v(17)], &[v(0)])?;
+        op(b, "v_and_b32_e32 v18, 7, v0", &[v(18)], &[v(0)])?;
+        op(b, "v_lshlrev_b32_e32 v18, 6, v18", &[v(18)], &[v(18)])?;
+        op(b, format!("v_mad_u32_u24 v{}, v17, s{t1}, v18", Regs::TOFF), &[v(Regs::TOFF)], &[v(17), s(t1), v(18)])?;
+        // M7's gfx1100 table reads a `saddr` global offset as a VGPR pair:
+        // the first touch reads sink v183 as the pair's high half.
+        op(b, format!("v_mov_b32_e32 v{}, 0", Regs::TDST[1]), &[v(Regs::TDST[1])], &[])?;
+    }
 
     // Stage epoch 0 into slot 0, and seed the chain constant and the sums
     // while the loads are in flight.
-    stage_loads(b, 0)?;
+    stage_loads(b, epi, 0)?;
     for j in 0..8u8 { op(b, format!("v_mov_b32_e32 v{}, {}", Regs::MAGIC + j, lit(MAGIC)), &[v(Regs::MAGIC + j)], &[])?; }
     for r in 0..64u8 { op(b, format!("v_mov_b32_e32 v{}, 0", Regs::ACC + r), &[v(Regs::ACC + r)], &[])?; }
     stage_store(b, 0)?;
@@ -253,8 +395,9 @@ fn prologue(b: &mut Builder) -> Result<(), String> {
 
 /// Global loads of the next epoch's staging packet. `a_imm` selects the K
 /// half inside the current A group (64 for an odd epoch).
-fn stage_loads(b: &mut Builder, a_imm: u32) -> Result<(), String> {
-    b.clause(|b| { for i in 0..4u8 { global_load(b, 2, Regs::STA + 2 * i, Regs::A_OFF, Regs::SA, a_imm + 16 * u32::from(i))?; } Ok(()) })?;
+fn stage_loads(b: &mut Builder, epi: Epi, a_imm: u32) -> Result<(), String> {
+    let base = stage_base(epi);
+    b.clause(|b| { for i in 0..4u8 { global_load(b, 2, Regs::STA + 2 * i, Regs::A_OFF, base, a_imm + 16 * u32::from(i))?; } Ok(()) })?;
     b.clause(|b| { for i in 0..4u8 { global_load(b, 2, Regs::STX + 2 * i, Regs::X_OFF, Regs::SX, 16 * u32::from(i))?; } Ok(()) })
 }
 
@@ -304,15 +447,18 @@ fn step_wmma(b: &mut Builder, i: usize) -> Result<(), String> {
 }
 
 /// Fold pass `a`: sum[a][c][j] = fma(d_c * sc_j, C[c][j] - 1.5*2^23, sum).
-/// Row 16a + 8hi + j's scale comes from lane 8a + j of this lane's row of 16.
-fn fold(b: &mut Builder, a: u8) -> Result<(), String> {
-    if a == 0 {
-        // True16 VOP1 reaches only v0-v127 halves; v149 needs the VOP3 form.
-        op(b, format!("v_cvt_f32_f16_e64 v{}, v{}.l", Regs::WSF, Regs::WS), &[v(Regs::WSF)], &[v(Regs::WS)])?;
+/// Row 16a + 8hi + j's scale comes from lane 8a + j of this lane's row of 16
+/// (gate/up: pass 0 from the gate scales, pass 1 from the up scales).
+fn fold(b: &mut Builder, epi: Epi, a: u8) -> Result<(), String> {
+    let scale = if epi.silu() && a == 1 { Regs::WSFU } else { Regs::WSF };
+    if a == 0 || epi.silu() {
+        // True16 VOP1 reaches only v0-v127 halves; v149/v181 need the VOP3 form.
+        let raw = if a == 0 { Regs::WS } else { Regs::WSU };
+        op(b, format!("v_cvt_f32_f16_e64 v{scale}, v{raw}.l"), &[v(scale)], &[v(raw)])?;
     }
     for j in 0..8u8 {
-        op(b, format!("v_mov_b32_dpp v{}, v{} row_share:{} row_mask:0xf bank_mask:0xf", Regs::SCF + j, Regs::WSF, 8 * a + j),
-            &[v(Regs::SCF + j)], &[v(Regs::WSF)])?;
+        op(b, format!("v_mov_b32_dpp v{}, v{scale} row_share:{} row_mask:0xf bank_mask:0xf", Regs::SCF + j, 8 * a + j),
+            &[v(Regs::SCF + j)], &[v(scale)])?;
     }
     for cp in [0u8, 2] {
         // t_j = d_c * sc_j paired with C[c][j^1] += -1.5*2^23 (opposite
@@ -341,29 +487,37 @@ fn fold(b: &mut Builder, a: u8) -> Result<(), String> {
 
 /// One K128 epoch reading slot `p` (epoch parity p). With `next`, the
 /// staging packet of epoch e+1 is loaded, published into slot 1-p and the
-/// barrier hands the slots over; the last epoch has neither.
-fn epoch(b: &mut Builder, p: usize, next: bool) -> Result<(), String> {
+/// barrier hands the slots over; the last epoch has neither. `touch` (ADD
+/// touch, last two epochs) loads residual lines `touch` and `touch + 1`.
+fn epoch(b: &mut Builder, epi: Epi, p: usize, next: bool, touch: Option<u8>) -> Result<(), String> {
     // Current-epoch metadata first: in-order VMcnt returns it before the packet.
-    mem(b, format!("global_load_u16 v{}, v{}, s[{}:{}]{}", Regs::WS, Regs::LWS, Regs::SA, Regs::SA + 1, off(4 * p as u32)?),
-        &[v(Regs::WS)], &[v(Regs::LWS), sr(Regs::SA, 2)], MemoryClass::VmemLoad)?;
+    let scales: &[(u8, u8)] = if epi.silu() { &[(Regs::WS, Regs::SA), (Regs::WSU, Regs::SU)] } else { &[(Regs::WS, Regs::SA)] };
+    for &(dst, base) in scales {
+        mem(b, format!("global_load_u16 v{dst}, v{}, s[{base}:{}]{}", Regs::LWS, base + 1, off(4 * p as u32)?),
+            &[v(dst)], &[v(Regs::LWS), sr(base, 2)], MemoryClass::VmemLoad)?;
+    }
     for c in 0..4u8 { global_load(b, 1, Regs::DC + c, Regs::LXS, Regs::SX, 16 * XBLK_BYTES * u32::from(c))?; }
+    if let Some(line) = touch { touch_loads(b, epi, line)?; }
     if next {
         if p == 1 {
             // Epoch e+1 starts the next 136-byte A group.
-            op(b, format!("s_add_u32 s{0}, s{0}, {1}", Regs::SA, lit(GROUP_BYTES)), &[s(Regs::SA)], &[s(Regs::SA)])?;
-            op(b, format!("s_addc_u32 s{0}, s{0}, 0", Regs::SA + 1), &[s(Regs::SA + 1)], &[s(Regs::SA + 1)])?;
+            let bases: &[u8] = if epi.silu() { &[Regs::SA, Regs::SU, Regs::SS] } else { &[Regs::SA] };
+            for &base in bases {
+                op(b, format!("s_add_u32 s{0}, s{0}, {1}", base, lit(GROUP_BYTES)), &[s(base)], &[s(base)])?;
+                op(b, format!("s_addc_u32 s{0}, s{0}, 0", base + 1), &[s(base + 1)], &[s(base + 1)])?;
+            }
         }
         op(b, format!("s_add_u32 s{0}, s{0}, s{1}", Regs::SX, Regs::N72), &[s(Regs::SX)], &[s(Regs::SX), s(Regs::N72)])?;
         op(b, format!("s_addc_u32 s{0}, s{0}, 0", Regs::SX + 1), &[s(Regs::SX + 1)], &[s(Regs::SX + 1)])?;
-        stage_loads(b, if p == 0 { 64 } else { 0 })?;
+        stage_loads(b, epi, if p == 0 { 64 } else { 0 })?;
     }
     step_loads(b, p, 0)?;
     for i in 0..16 {
         if i + 1 < 16 { step_loads(b, p, i + 1)?; }
         step_wmma(b, i)?;
-        if i == 7 { fold(b, 0)?; }
+        if i == 7 { fold(b, epi, 0)?; }
     }
-    fold(b, 1)?;
+    fold(b, epi, 1)?;
     if next {
         stage_store(b, 1 - p)?;
         b.barrier(&[Transition::Retire(SLOT_A[p]), Transition::Retire(SLOT_X[p]), Transition::Ready(SLOT_A[1 - p]), Transition::Ready(SLOT_X[1 - p])])?;
@@ -371,14 +525,45 @@ fn epoch(b: &mut Builder, p: usize, next: bool) -> Result<(), String> {
     Ok(())
 }
 
-fn kloop(b: &mut Builder) -> Result<(), String> {
+/// ADD touch: one dword of residual lines `first` and `first + 1` of this
+/// thread (line i is 32*i tokens past `TOFF`) into the two sinks. The loads
+/// ride ahead of the staging packet, whose wait retires them; the values
+/// are never read.
+fn touch_loads(b: &mut Builder, epi: Epi, first: u8) -> Result<(), String> {
+    let m = args(epi).m;
+    let (t0, t1) = (Regs::T0, Regs::T1);
+    let [d0, d1] = Regs::TDST;
+    let load = |b: &mut Builder, dst: u8, voff: u8| mem(b, format!("global_load_b32 v{dst}, v{voff}, s[{}:{}]", Regs::SY, Regs::SY + 1),
+        &[v(dst)], &[v(voff), sr(Regs::SY, 2)], MemoryClass::VmemLoad);
+    match first {
+        // Issue order keeps every VGPR offset's successor free of a pending
+        // load: M7's gfx1100 table models a `saddr` global's offset as a
+        // 64-bit pair, which is conservative but must stay obligation-free.
+        0 => {
+            op(b, format!("s_lshl_b32 s{t1}, s{m}, 7"), &[s(t1)], &[s(m)])?;
+            op(b, format!("v_add_nc_u32_e32 v{d0}, s{t1}, v{}", Regs::TOFF), &[v(d0)], &[s(t1), v(Regs::TOFF)])?;
+            load(b, d1, d0)?;
+            load(b, d0, Regs::TOFF)
+        }
+        2 => {
+            op(b, format!("s_lshl_b32 s{t0}, s{m}, 8"), &[s(t0)], &[s(m)])?;
+            op(b, format!("v_add_nc_u32_e32 v{d0}, s{t0}, v{}", Regs::TOFF), &[v(d0)], &[s(t0), v(Regs::TOFF)])?;
+            op(b, format!("v_add_nc_u32_e32 v{d1}, s{t1}, v{d0}"), &[v(d1)], &[s(t1), v(d0)])?;
+            load(b, d0, d0)?;
+            load(b, d1, d1)
+        }
+        _ => Err("touch lines come in pairs 0,1 and 2,3".into()),
+    }
+}
+
+fn kloop(b: &mut Builder, epi: Epi) -> Result<(), String> {
     b.label(K_BEGIN)?;
     if !b.ledger.is_empty() { return Err(format!("prologue left memory operations pending at the K loop: {:?}", b.ledger.shape())) }
     op(b, format!("s_cmp_eq_u32 s{}, 0", Regs::TRIPS), &[], &[s(Regs::TRIPS)])?;
     op(b, format!("s_cbranch_scc1 {TAIL}"), &[], &[])?;
     b.loop_(K_LOOP, |b| {
-        epoch(b, 0, true)?;
-        epoch(b, 1, true)?;
+        epoch(b, epi, 0, true, None)?;
+        epoch(b, epi, 1, true, None)?;
         op(b, format!("s_add_i32 s{0}, s{0}, -1", Regs::TRIPS), &[s(Regs::TRIPS)], &[s(Regs::TRIPS)])?;
         op(b, format!("s_cmp_lg_u32 s{}, 0", Regs::TRIPS), &[], &[s(Regs::TRIPS)])?;
         op(b, format!("s_cbranch_scc1 {K_LOOP}"), &[], &[])
@@ -388,24 +573,69 @@ fn kloop(b: &mut Builder) -> Result<(), String> {
     // empty ledger, so its waits hold on either.
     if !b.ledger.is_empty() { return Err("K loop exit leaves memory operations pending".into()) }
     b.label(TAIL)?;
-    epoch(b, 0, true)?;
-    epoch(b, 1, false)
+    let touch = epi == Epi::AddTouch;
+    epoch(b, epi, 0, true, touch.then_some(0))?;
+    epoch(b, epi, 1, false, touch.then_some(2))
 }
 
-/// SET: lane (hi, lr) owns rows 8hi..8hi+7 of each fragment for one token;
-/// two b128 stores per (a, c). Token fragment c is 16*M*4 bytes further.
-fn epilogue(b: &mut Builder) -> Result<(), String> {
+/// Lane (hi, lr) owns rows 8hi..8hi+7 of each fragment for one token; two
+/// b128 accesses per (a, c), token fragment c 16*M*4 bytes further.
+/// SET stores the sums; ADD first loads every residual quad, then stores
+/// RN(old + sum) per quad; gate/up stores h = SILU_MUL(g, u) of fragment
+/// pair (0, 1), one h octet per token fragment.
+fn epilogue(b: &mut Builder, epi: Epi) -> Result<(), String> {
     b.label(EPI)?;
     op(b, format!("v_mov_b32_e32 v0, v{}", Regs::YOFF), &[v(0)], &[v(Regs::YOFF)])?;
     for c in 1..4u8 {
         op(b, format!("v_add_nc_u32_e32 v{c}, s{}, v{}", Regs::M64, c - 1), &[v(c)], &[s(Regs::M64), v(c - 1)])?;
     }
-    for c in 0..4u8 {
-        for a in 0..2u8 {
-            for q in 0..2u8 {
-                let data = vr(Regs::ACC + 8 * (4 * a + c) + 4 * q, 4);
-                mem(b, format!("global_store_b128 v{c}, {data}, s[{}:{}]{}", Regs::SY, Regs::SY + 1, off(4 * (16 * u32::from(a) + 4 * u32::from(q)))?),
-                    &[], &[v(c), data, sr(Regs::SY, 2)], MemoryClass::VmemStore)?;
+    let store = |b: &mut Builder, c: u8, data: u8, offset: u32| {
+        let data = vr(data, 4);
+        mem(b, format!("global_store_b128 v{c}, {data}, s[{}:{}]{}", Regs::SY, Regs::SY + 1, off(offset)?),
+            &[], &[v(c), data, sr(Regs::SY, 2)], MemoryClass::VmemStore)
+    };
+    let quads = || (0..4u8).flat_map(|c| (0..2u8).flat_map(move |a| (0..2u8).map(move |q| (c, a, q))));
+    let offset = |a: u8, q: u8| 4 * (16 * u32::from(a) + 4 * u32::from(q));
+    let acc = |c: u8, a: u8, q: u8| Regs::ACC + 8 * (4 * a + c) + 4 * q;
+    match epi {
+        Epi::Set => {
+            for (c, a, q) in quads() { store(b, c, acc(c, a, q), offset(a, q))?; }
+        }
+        Epi::Add | Epi::AddTouch => {
+            for (i, (c, a, q)) in quads().enumerate() {
+                let r = Regs::RESID + 4 * i as u8;
+                mem(b, format!("global_load_b128 {}, v{c}, s[{}:{}]{}", vr(r, 4), Regs::SY, Regs::SY + 1, off(offset(a, q))?),
+                    &[vr(r, 4)], &[v(c), sr(Regs::SY, 2)], MemoryClass::VmemLoad)?;
+            }
+            for (i, (c, a, q)) in quads().enumerate() {
+                let (r, x) = (Regs::RESID + 4 * i as u8, acc(c, a, q));
+                for k in [0u8, 2] {
+                    let lo = VopdOp { op: VopdF32::Add, dst: r + k, src0: Operand::V(r + k), src1: x + k };
+                    let hi = VopdOp { op: VopdF32::Add, dst: r + k + 1, src0: Operand::V(r + k + 1), src1: x + k + 1 };
+                    b.vopd(lo, hi)?;
+                }
+                store(b, c, r, offset(a, q))?;
+            }
+        }
+        Epi::Silu => {
+            let region = Region::silu_gfx1100()?;
+            if region.temps > usize::from(SILU_TEMPS) || region.masks > 2 { return Err("gfx1100 SiLU region needs more temporaries than planned".into()) }
+            // Element k of token fragment c uses slot k % 4 (temporaries
+            // SILU_T[q] + 0..8, masks s[36 + 4q], s[38 + 4q]), so k + 4 starts once k
+            // has issued its last op; VOPD partners (2i, 2i + 1) sit an odd
+            // distance apart in every operand (g, u, h: 1; temporaries: 9),
+            // which keeps each same-op packet parity- and bank-legal.
+            for c in 0..4u8 {
+                let binds: Vec<Binding> = (0..8u8).map(|k| {
+                    let q = k % SILU_SLOTS;
+                    Binding {
+                        g: acc(c, 0, 0) + k, u: acc(c, 1, 0) + k, out: Regs::H + 8 * c + k,
+                        temps: (0..SILU_TEMPS).map(|t| Regs::SILU_T[usize::from(q)] + t).collect(),
+                        masks: vec![Regs::MASKS + 4 * q, Regs::MASKS + 4 * q + 2],
+                    }
+                }).collect();
+                region::emit_interleaved(b, &region, &binds)?;
+                for q in 0..2u8 { store(b, c, Regs::H + 8 * c + 4 * q, 16 * u32::from(q))?; }
             }
         }
     }
@@ -415,19 +645,36 @@ fn epilogue(b: &mut Builder) -> Result<(), String> {
 pub fn emit(spec: Spec) -> Result<Emitted, String> {
     spec.validate()?;
     let kspec = KernelSpec {
-        kernel_id: "iu4_v2c".into(), variant: "set".into(), arch: spec.arch, symbol: spec.symbol(),
+        kernel_id: "iu4_v2c".into(), variant: spec.epi.name().into(), arch: spec.arch, symbol: spec.symbol(),
         kernargs: spec.kernargs(), user_sgpr_count: 2, system_sgpr_workgroup_id_y: true,
         workgroup_size: THREADS, group_segment_fixed_size: 0, wave32: true, cu_mode: false,
     };
-    let mut b = Builder::new(kspec, plan()?);
+    let mut b = Builder::new(kspec, plan(spec.epi)?);
     b.enable_delay_alu();
     declare_lds(&mut b)?;
-    prologue(&mut b)?;
-    kloop(&mut b)?;
-    epilogue(&mut b)?;
+    prologue(&mut b, spec.epi)?;
+    kloop(&mut b, spec.epi)?;
+    epilogue(&mut b, spec.epi)?;
     b.label(END)?;
     b.push(Sop::End.encode(spec.arch)?)?;
     b.finish()
+}
+
+/// Name of the gfx1100 product code object.
+pub const MODULE: &str = "gemm_mq4g256v2_residual_iu4_pm_gfx1100";
+
+/// One code object with the given epilogue symbols: each kernel's local
+/// `.Lv2c_` labels are qualified by its epilogue so they share one
+/// assembler unit (the machine code of every symbol is unchanged).
+pub fn module(arch: Arch, epis: &[Epi]) -> Result<(Vec<Emitted>, String, super::iu4_gemm::ModuleProof), String> {
+    let emitted = epis.iter().map(|&epi| emit(Spec { arch, epi })).collect::<Result<Vec<_>, _>>()?;
+    let renamed: Vec<Emitted> = emitted.iter().map(|e| {
+        let mut e = e.clone();
+        e.s_text = e.s_text.replace(".Lv2c_", &format!(".Lv2c_{}_", e.proof.variant));
+        e
+    }).collect();
+    let (text, proof) = super::iu4_gemm::module(&renamed, MODULE)?;
+    Ok((emitted, text, proof))
 }
 
 /// Instruction census of one steady-state K-loop trip (two epochs).

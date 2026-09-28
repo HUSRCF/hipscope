@@ -207,6 +207,22 @@ pub fn check_shape(disassembly: &str, report: &radiowave::KernelReport,
         vgpr_spill_count: report.vgpr_spill_count,
         sgpr_spill_count: report.sgpr_spill_count, ..Default::default()
     };
+    // Alignment padding the linker places between the kernels of a module
+    // (`s_nop 0` / `s_code_end` after a symbol's last `s_endpgm`) belongs to
+    // no symbol: a trailing run of it is dropped at the next symbol, while
+    // any later instruction proves it was code and replays it.
+    let mut padding: Vec<String> = Vec::new();
+    let mut after_end = false;
+    let accept = |insn: &str, in_region: bool, result: &mut IsaShapeResult| -> Result<()> {
+        let mnemonic = insn.split_whitespace().next().unwrap_or("");
+        for forbidden in &contract.forbidden {
+            if mnemonic == forbidden || (forbidden.ends_with('*') && mnemonic.starts_with(forbidden.trim_end_matches('*'))) {
+                return Err(format!("forbidden instruction {mnemonic}"));
+            }
+        }
+        if in_region { count(insn, &mut result.counts); }
+        Ok(())
+    };
     for line in disassembly.lines() {
         let trimmed = line.trim();
         if let Some((_, name)) = trimmed.split_once('<') {
@@ -225,12 +241,10 @@ pub fn check_shape(disassembly: &str, report: &radiowave::KernelReport,
         if !in_symbol { continue; }
         if let Some(insn) = instruction(trimmed) {
             let mnemonic = insn.split_whitespace().next().unwrap_or("");
-            for forbidden in &contract.forbidden {
-                if mnemonic == forbidden || (forbidden.ends_with('*') && mnemonic.starts_with(forbidden.trim_end_matches('*'))) {
-                    return Err(format!("forbidden instruction {mnemonic}"));
-                }
-            }
-            if in_region { count(insn, &mut result.counts); }
+            if after_end && (insn.trim() == "s_nop 0" || mnemonic == "s_code_end") { padding.push(insn.to_owned()); continue; }
+            for held in padding.drain(..) { accept(&held, in_region, &mut result)?; }
+            after_end = mnemonic == "s_endpgm";
+            accept(insn, in_region, &mut result)?;
         }
     }
     if !saw_symbol || !saw_start || !saw_end { return Err("missing symbol or region boundary".into()); }
@@ -544,6 +558,18 @@ mod tests {
         };
         let disasm = "000000 <k>:\n v_dual_mul_f32 v0, v1, v2 :: v_dual_mul_f32 v3, v4, v5 // 0000\n s_waitcnt vmcnt(0) // 0008\n";
         assert!(check_shape(disasm, &radiowave::KernelReport::default(), &contract).is_err());
+    }
+    /// Alignment padding after a module kernel's final `s_endpgm` is no
+    /// instruction of that kernel; an `s_nop` that code follows is.
+    #[test]
+    fn shape_skips_inter_kernel_padding_only() {
+        let contract = IsaShapeContract { symbol: "k".into(), forbidden: vec!["s_nop".into()], counts: [("s_endpgm".into(), CountBound::Exact(1))].into(), ..Default::default() };
+        let padded = "000000 <k>:\n s_endpgm // 0\n s_nop 0 // 4\n s_nop 0 // 8\n000100 <j>:\n s_nop 0 // 100\n s_endpgm // 104\n";
+        assert!(check_shape(padded, &radiowave::KernelReport::default(), &contract).is_ok());
+        let inside = "000000 <k>:\n s_nop 0 // 0\n s_endpgm // 4\n";
+        assert!(check_shape(inside, &radiowave::KernelReport::default(), &contract).is_err());
+        let code_after = "000000 <k>:\n s_endpgm // 0\n s_nop 0 // 4\n s_endpgm // 8\n";
+        assert!(check_shape(code_after, &radiowave::KernelReport::default(), &contract).is_err());
     }
     #[test]
     fn parse_back_rejects_silently_wrapped_immediate() {

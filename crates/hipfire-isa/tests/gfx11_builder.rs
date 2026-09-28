@@ -1,5 +1,6 @@
 //! gfx11 builder target: counter waits, LDS barrier drain, VOPD pairing, the
-//! V2C-equivalent SET kernel, and byte identity of the gfx1201 products.
+//! V2C-equivalent SET/ADD/gate-up kernels, and byte identity of the gfx1201
+//! products.
 use hipfire_isa::{Arch, Builder, KernelSpec, KernargLayout, RegPlan};
 use hipfire_isa::insn::{Instruction, MemoryClass};
 use hipfire_isa::kernels::{iu4_gemm, iu4_v2c, fp8_gemm};
@@ -62,15 +63,18 @@ fn gfx11_vopd_halves_may_not_read_each_others_destination() {
     assert!(hipfire_isa::vopd::validate_pair(Arch::Gfx1100, x, independent).is_ok());
 }
 
-fn v2c() -> hipfire_isa::Emitted { iu4_v2c::emit(iu4_v2c::Spec { arch: Arch::Gfx1100 }).unwrap() }
+fn v2c_epi(epi: iu4_v2c::Epi) -> hipfire_isa::Emitted { iu4_v2c::emit(iu4_v2c::Spec { arch: Arch::Gfx1100, epi }).unwrap() }
+fn v2c() -> hipfire_isa::Emitted { v2c_epi(iu4_v2c::Epi::Set) }
 
 #[test]
-fn v2c_set_is_deterministic_within_the_occupancy_ceiling() {
-    let (a, b) = (v2c(), v2c());
-    assert_eq!(a.proof.s_text_sha256, b.proof.s_text_sha256);
-    assert!(a.shape.next_free_vgpr <= iu4_v2c::VGPR_CEILING);
-    assert_eq!(a.proof.loop_fixpoints.len(), 1);
-    assert!(iu4_v2c::emit(iu4_v2c::Spec { arch: Arch::Gfx1201 }).is_err());
+fn v2c_is_deterministic_within_the_occupancy_ceiling() {
+    for epi in iu4_v2c::Epi::ALL {
+        let (a, b) = (v2c_epi(epi), v2c_epi(epi));
+        assert_eq!(a.proof.s_text_sha256, b.proof.s_text_sha256, "{epi:?}");
+        assert!(a.shape.next_free_vgpr <= iu4_v2c::VGPR_CEILING, "{epi:?}");
+        assert_eq!(a.proof.loop_fixpoints.len(), 1, "{epi:?}");
+        assert!(iu4_v2c::emit(iu4_v2c::Spec { arch: Arch::Gfx1201, epi }).is_err());
+    }
 }
 
 #[test]
@@ -87,6 +91,34 @@ fn v2c_steady_state_trip_matches_the_v2c_algorithm() {
     for forbidden in ["buffer_gl0_inv", "s_nop", "v_nop", "scratch_load_b32"] { assert!(!census.contains_key(forbidden), "{forbidden}"); }
 }
 
+/// The K-loop trip between the loop head and its end label.
+fn hot_loop(text: &str) -> String {
+    let start = text.find(&format!("{}:", iu4_v2c::K_LOOP)).unwrap();
+    let end = text.find(&format!("{}:", iu4_v2c::K_LOOP_END)).unwrap();
+    text[start..end].to_owned()
+}
+
+/// ADD (with or without the residual touch) differs from SET only in its
+/// epilogue: the steady-state K loop is SET's, instruction for instruction.
+#[test]
+fn v2c_add_runs_the_set_k_loop() {
+    let set = hot_loop(&v2c().s_text);
+    for epi in [iu4_v2c::Epi::Add, iu4_v2c::Epi::AddTouch] { assert!(hot_loop(&v2c_epi(epi).s_text) == set, "{epi:?}"); }
+}
+
+/// Gate/up keeps SET's fully paired fold: per epoch one extra f16 up-scale
+/// load and conversion (the pass-1 scales), nothing else.
+#[test]
+fn v2c_gate_up_trip_is_the_paired_set_fold_plus_up_scales() {
+    let set = iu4_v2c::hot_loop_census(&v2c().s_text);
+    let silu = iu4_v2c::hot_loop_census(&v2c_epi(iu4_v2c::Epi::Silu).s_text);
+    for (name, extra) in [("v_wmma_i32_16x16x16_iu4", 0), ("vopd_packets", 0), ("v_dual_mul_f32", 0), ("v_dual_fmac_f32", 0), ("v_mov_b32_dpp", 0),
+        ("v_cvt_f32_f16_e64", 2), ("global_load_u16", 2), ("global_load_b64", 0), ("global_load_b32", 0), ("ds_load_2addr_b64", 0),
+        ("ds_store_2addr_b64", 0), ("s_barrier", 0), ("valu_slots", 2)] {
+        assert_eq!(silu.get(name).copied().unwrap_or(0), set.get(name).copied().unwrap_or(0) + extra, "{name}");
+    }
+}
+
 fn assemble(text: &str, arch: &str) {
     let mut child = Command::new(format!("{LLVM}/llvm-mc")).args(["-triple=amdgcn-amd-amdhsa", &format!("-mcpu={arch}"), "-filetype=obj", "-o", "/dev/null"])
         .stdin(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
@@ -96,7 +128,42 @@ fn assemble(text: &str, arch: &str) {
 }
 
 #[test]
-fn v2c_set_assembles_for_gfx1100_with_zero_diagnostics() { assemble(&v2c().s_text, "gfx1100") }
+fn v2c_module_assembles_for_gfx1100_with_zero_diagnostics() {
+    assemble(&iu4_v2c::module(Arch::Gfx1100, &iu4_v2c::Epi::ALL).unwrap().1, "gfx1100")
+}
+
+/// The gfx1100 SiLU golden equals a fresh slice of hipcc's own V2C gate/up
+/// object (when hipcc is installed): the region's parse-back from foreign
+/// bytes, as for the gfx1201 golden.
+#[test]
+fn gfx1100_silu_region_matches_fresh_hipcc_object() {
+    use hipfire_isa::kernels::iu4_gemm::region;
+    let hipcc = "/opt/rocm/core-10.0/bin/hipcc";
+    if !std::path::Path::new(hipcc).exists() { eprintln!("skip: no {hipcc}"); return }
+    let root = format!("{}/../..", env!("CARGO_MANIFEST_DIR"));
+    let dir = std::env::temp_dir().join(format!("v2c-silu-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (bundle, co) = (dir.join("v2c.hsaco"), dir.join("v2c.co"));
+    let status = Command::new(hipcc).args(["--genco", "--offload-arch=gfx1100", "-O3", "--no-offload-compress", "-o"])
+        .arg(&bundle).arg(format!("{root}/kernels/src/gemm_mq4g256v2_residual_iu4_v2c.gfx11.hip")).status().unwrap();
+    assert!(status.success());
+    let status = Command::new(format!("{LLVM}/clang-offload-bundler")).args(["--type=o", "--unbundle", "--targets=hipv4-amdgcn-amd-amdhsa--gfx1100"])
+        .arg(format!("--input={}", bundle.display())).arg(format!("--output={}", co.display())).status().unwrap();
+    assert!(status.success());
+    let dis = Command::new(format!("{LLVM}/llvm-objdump")).args(["-d", "--mcpu=gfx1100"]).arg(&co).output().unwrap();
+    let listing = String::from_utf8(dis.stdout).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    let slice = region::slice_silu_gfx11(&listing, "gemm_mq4g256v2_gate_up_silu_iu4_v2c_gfx11").unwrap();
+    assert_eq!(slice, region::body_of(region::SILU_GOLDEN_GFX1100));
+    // expf range reduction and the IEEE division, every select mask an SGPR.
+    let r = region::Region::silu_gfx1100().unwrap();
+    let m = r.mnemonics();
+    for (op, n) in [("v_exp_f32_e32", 1), ("v_ldexp_f32", 1), ("v_cndmask_b32_e64", 2), ("v_cmp_nlt_f32_e64", 1), ("v_cmp_ngt_f32_e64", 1),
+        ("v_div_scale_f32", 2), ("v_div_fmas_f32", 1), ("v_div_fixup_f32", 1), ("v_rcp_f32_e32", 1), ("s_mov_b32", 0), ("s_wait_alu", 0)] {
+        assert_eq!(m.iter().filter(|x| **x == op).count(), n, "{op}");
+    }
+    assert_eq!((r.masks, m.last().copied()), (2, Some("v_mul_f32_e32")));
+}
 
 /// `.text` of the device ELF inside a clang offload bundle (or a bare ELF).
 fn text_section(bytes: &[u8]) -> Vec<u8> {
@@ -150,22 +217,32 @@ mod toolchain {
     use super::*;
     use hipfire_isa::{ledger_replay, pm_check, profile, toolchain::{assemble_link_bundle, Toolchain}};
 
+    /// Every symbol of the product module certifies against its committed
+    /// contract: parse-back, exact counts (the linker's inter-kernel
+    /// padding is no symbol's `s_nop`), resources, the all-lane LDS bound
+    /// and M7's analyses of the linked ELF with no obligation.
     #[test]
-    fn v2c_set_passes_gfx11_certification_checks() {
-        let e = v2c();
-        ledger_replay::replay_waits(&e.s_text, Arch::Gfx1100).unwrap();
+    fn v2c_module_passes_gfx11_certification_for_every_symbol() {
+        let (emitted, text, _) = iu4_v2c::module(Arch::Gfx1100, &iu4_v2c::Epi::ALL).unwrap();
+        for e in &emitted { ledger_replay::replay_waits(&e.s_text, Arch::Gfx1100).unwrap(); }
         let dir = std::env::temp_dir().join(format!("hipfire-isa-v2c-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let s = dir.join("v2c.s");
-        std::fs::write(&s, &e.s_text).unwrap();
-        let build = assemble_link_bundle(&Toolchain::default(), &s, &dir.join("v2c.hsaco"), "gfx1100").unwrap();
-        let symbol = iu4_v2c::Spec { arch: Arch::Gfx1100 }.symbol();
-        assert_eq!(pm_check::lds_bounds(&e.s_text, &symbol, 8, iu4_v2c::LDS_BYTES).unwrap(), iu4_v2c::LDS_BYTES);
-        // A launch allocation smaller than the highest access is rejected.
-        assert!(pm_check::lds_bounds(&e.s_text, &symbol, 8, iu4_v2c::LDS_BYTES - 8).is_err());
-        let m7 = pm_check::m7(&build.elf, "gfx1100", &symbol).unwrap();
-        assert_eq!(m7["lift"], "byte-exact");
-        assert_eq!(m7["obligations"], serde_json::json!({}));
+        std::fs::write(&s, &text).unwrap();
+        let toolchain = Toolchain::default();
+        let build = assemble_link_bundle(&toolchain, &s, &dir.join("v2c.hsaco"), "gfx1100").unwrap();
+        for epi in iu4_v2c::Epi::ALL {
+            let symbol = iu4_v2c::Spec { arch: Arch::Gfx1100, epi }.symbol();
+            assert_eq!(pm_check::lds_bounds(&text, &symbol, 8, iu4_v2c::LDS_BYTES).unwrap(), iu4_v2c::LDS_BYTES, "{epi:?}");
+            // A launch allocation smaller than the highest access is rejected.
+            assert!(pm_check::lds_bounds(&text, &symbol, 8, iu4_v2c::LDS_BYTES - 8).is_err());
+            let m7 = pm_check::m7(&build.elf, "gfx1100", &symbol).unwrap();
+            assert_eq!((m7["lift"].as_str(), &m7["obligations"]), (Some("byte-exact"), &serde_json::json!({})), "{epi:?}");
+            let path = format!("{}/kernels/iu4_v2c.gfx1100.{}.contract.json", env!("CARGO_MANIFEST_DIR"), epi.name());
+            let contract = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            hipfire_isa::toolchain::certify(&toolchain, &build, &s, "gfx1100", &dir.join(format!("{}.manifest.json", epi.name())),
+                Some(&contract), "test", "test").unwrap_or_else(|e| panic!("{epi:?}: {e}"));
+        }
     }
 
     #[test]

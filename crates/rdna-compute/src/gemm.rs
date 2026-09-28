@@ -420,6 +420,20 @@ fn g12_iu4_b1_eligible(m: usize, k: usize, output: *mut c_void) -> bool {
     k % 256 == 0 && m % 4 == 0 && (output as usize) % 16 == 0
 }
 
+/// Certified builder V2C tile on exact gfx1100 (`HIPFIRE_GFX1100_PM_GEMM`,
+/// default on; `=0` restores the hipcc V2C JIT entries). Same algorithm,
+/// launch grid and bytes as V2C SET / ADD / F1-lite gate-up, with every fold
+/// op VOPD-paired. Parsed once so every launch of a process agrees.
+static GFX1100_PM_GEMM: LazyLock<bool> =
+    LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_GFX1100_PM_GEMM", true));
+
+/// The builder V2C admits every V2C shape whose 32-bit lane offsets fit its
+/// 24-bit multiplies (`(token)*M` with M < 2^22; H2's largest M is 17,408).
+#[inline]
+fn gfx1100_pm_gemm(m: usize) -> bool {
+    *GFX1100_PM_GEMM && m < (1 << 22)
+}
+
 impl Gpu {
     /// Every condition of the gfx1201 builder `_b1` selection except the
     /// per-launch shape/pointer check ([`g12_iu4_b1_eligible`]).
@@ -20438,20 +20452,32 @@ impl Gpu {
         if v2_tile == Some(Iu4V2Tile::V2c) {
             // ADD epilogue (`HIPFIRE_V2C_ADDEPI=0` restores the plain ADD):
             // `_add_touch` touches the residual tile ahead of the epilogue,
-            // byte-identical to `_add`.
-            let kernel_name = match (
-                add,
-                hipfire_config::developer_var("HIPFIRE_V2C_ADDEPI").as_deref() != Ok("0"),
-            ) {
-                (false, _) => "gemm_mq4g256v2_residual_iu4_v2c_set_gfx11",
-                (true, true) => "gemm_mq4g256v2_residual_iu4_v2c_add_touch_gfx11",
-                (true, false) => "gemm_mq4g256v2_residual_iu4_v2c_add_gfx11",
+            // byte-identical to `_add`. The builder tile
+            // (`gfx1100_pm_gemm`) runs the same algorithm from the embedded
+            // certified bundle as one 256-thread block.
+            let touch = hipfire_config::developer_var("HIPFIRE_V2C_ADDEPI").as_deref() != Ok("0");
+            let pm = gfx1100_pm_gemm(m);
+            let kernel_name = match (pm, add, touch) {
+                (false, false, _) => "gemm_mq4g256v2_residual_iu4_v2c_set_gfx11",
+                (false, true, true) => "gemm_mq4g256v2_residual_iu4_v2c_add_touch_gfx11",
+                (false, true, false) => "gemm_mq4g256v2_residual_iu4_v2c_add_gfx11",
+                (true, false, _) => "gemm_mq4g256v2_residual_iu4_pm_set_gfx1100",
+                (true, true, true) => "gemm_mq4g256v2_residual_iu4_pm_add_touch_gfx1100",
+                (true, true, false) => "gemm_mq4g256v2_residual_iu4_pm_add_gfx1100",
             };
-            self.ensure_kernel(
-                "gemm_mq4g256v2_residual_iu4_v2c_gfx11",
-                kernels::GEMM_MQ4G256V2_RESIDUAL_IU4_V2C_GFX11_SRC,
-                kernel_name,
-            )?;
+            if pm {
+                self.ensure_embedded_kernel(
+                    "gemm_mq4g256v2_residual_iu4_pm_gfx1100",
+                    kernels::GEMM_MQ4G256V2_RESIDUAL_IU4_PM_GFX1100,
+                    kernel_name,
+                )?;
+            } else {
+                self.ensure_kernel(
+                    "gemm_mq4g256v2_residual_iu4_v2c_gfx11",
+                    kernels::GEMM_MQ4G256V2_RESIDUAL_IU4_V2C_GFX11_SRC,
+                    kernel_name,
+                )?;
+            }
             let mut a_ptr = a_raw.buf.as_ptr();
             let mut xq_ptr = x_i4_ptr;
             let mut y_ptr = y.buf.as_ptr();
@@ -20473,7 +20499,7 @@ impl Gpu {
             let result = self.launch_maybe_blob(
                 kernel_name,
                 [(batch_size / 128) as u32, (m / 128) as u32, 1],
-                [32, 8, 1],
+                if pm { [256, 1, 1] } else { [32, 8, 1] },
                 V2C_LDS_BYTES,
                 &mut params,
                 || {
@@ -32609,7 +32635,13 @@ impl Gpu {
         // residual add before overwriting it (see `arm_residual_fold`).
         self.flush_residual_fold()?;
         let xq = self.int4_mmq_prepared_ptr(prepared, k, batch_size)?;
+        let pm = tile == Iu4V2Tile::V2c && gfx1100_pm_gemm(gate_m);
         let (module, source, kernel_name) = match tile {
+            Iu4V2Tile::V2c if pm => (
+                "gemm_mq4g256v2_residual_iu4_pm_gfx1100",
+                "",
+                "gemm_mq4g256v2_gate_up_silu_iu4_pm_gfx1100",
+            ),
             Iu4V2Tile::V2c => (
                 "gemm_mq4g256v2_residual_iu4_v2c_gfx11",
                 kernels::GEMM_MQ4G256V2_RESIDUAL_IU4_V2C_GFX11_SRC,
@@ -32621,7 +32653,11 @@ impl Gpu {
                 "gemm_mq4g256v2_gate_up_silu_iu4_v2b_gfx11",
             ),
         };
-        self.ensure_kernel(module, source, kernel_name)?;
+        if pm {
+            self.ensure_embedded_kernel(module, kernels::GEMM_MQ4G256V2_RESIDUAL_IU4_PM_GFX1100, kernel_name)?;
+        } else {
+            self.ensure_kernel(module, source, kernel_name)?;
+        }
         let mut g_ptr = a_gate.buf.as_ptr();
         let mut u_ptr = a_up.buf.as_ptr();
         let mut xq_ptr = xq;
@@ -32646,7 +32682,7 @@ impl Gpu {
         let result = self.launch_maybe_blob(
             kernel_name,
             [(batch_size / t) as u32, (2 * gate_m / t) as u32, 1],
-            [32, tile.waves(), 1],
+            if pm { [256, 1, 1] } else { [32, tile.waves(), 1] },
             tile.lds_bytes(),
             &mut params,
             || {
