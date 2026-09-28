@@ -77,33 +77,25 @@ fn hc_read(
             state_bf16: false,
         },
     )?;
-    dispatch_gemv(
-        gpu,
-        down,
-        normalized,
-        rotation,
-        low,
-        config.hc_lowrank,
-        config.hc_count * config.hidden_size,
-    )?;
-    hc_activation_fused_f32(
-        gpu,
-        &HcActivationFused {
-            values: low,
-            scale: 1.0 / config.hc_count as f32,
-            bf16_out: None,
-        },
-    )?;
-    dispatch_gemv(
-        gpu,
-        up_weight,
-        low,
-        rotation,
-        up,
-        config.hc_count * config.hidden_size,
-        config.hc_lowrank,
-    )?;
-    let projected_up = f32_view(up, 0, config.hc_count * config.hidden_size);
+    let (low_rank, wide) = (config.hc_lowrank, config.hc_count * config.hidden_size);
+    let scale = 1.0 / config.hc_count as f32;
+    if down.dtype == DType::BF16 {
+        // Four waves per row (320 one-wave rows starve the GPU) with the
+        // activation in the epilogue. Drafts only: not bitwise the one-wave sum.
+        gpu.gemv_bf16_xf32_k4(down, normalized, low, low_rank, wide, Some(scale))?;
+    } else {
+        dispatch_gemv(gpu, down, normalized, rotation, low, low_rank, wide)?;
+        hc_activation_fused_f32(
+            gpu,
+            &HcActivationFused {
+                values: low,
+                scale,
+                bf16_out: None,
+            },
+        )?;
+    }
+    dispatch_gemv(gpu, up_weight, low, rotation, up, wide, low_rank)?;
+    let projected_up = f32_view(up, 0, wide);
     hyper_read_projected(
         gpu,
         &HyperReadProjected {
