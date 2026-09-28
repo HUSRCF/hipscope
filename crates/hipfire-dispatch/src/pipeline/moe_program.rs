@@ -346,16 +346,6 @@ impl<'a> SealedMoeOp<'a> {
         Self { state }
     }
 
-    /// Where this grouped-prefill MoE's first rotation writes `x`'s FWHT basis
-    /// when `x` is its (provided, unnormalized) input: a preceding HC read
-    /// can pre-rotate into it (see `ScratchState::prerotated`).
-    pub(super) fn prefill_rotation_of(&self, x: *const std::ffi::c_void) -> Option<&'a GpuTensor> {
-        let (params, _) = self.state.prefill_parts().ok()?;
-        (matches!(params.prelude.normalization, MoeNormalization::Provided)
-            && params.x_norm_batch.buf.as_ptr() as *const _ == x)
-            .then_some(params.x_rot_batch)
-    }
-
     pub(super) fn execute_stage(
         &self,
         gpu: &mut Gpu,
