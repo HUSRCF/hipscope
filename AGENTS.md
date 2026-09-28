@@ -604,20 +604,27 @@ against the A3B MoE DFlash perfmaxx line.
 ### Pinned Flash-Next bench fixture
 
 The canonical Flash-Next trunk is whichever local artifact byte-matches
-`qwen3.8-flash-next.mq6q8-pleq8` from HF repo `hipfire-models/qwen3.8-flash-next`
-(registry tag `qwen3.8:flash-next`):
+`qwen3.8-flash-next.mq4` from HF repo `hipfire-models/qwen3.8-flash-next`
+(registry tag `qwen3.8:flash-next`, since 2026-09-28):
 
 - HF repo: `hipfire-models/qwen3.8-flash-next`
-- HF / local file: `qwen3.8-flash-next.mq6q8-pleq8`
-- File size: `125467331096`
-- SHA-256: `58fb4f586403000b3394413c38f58b0ec0d8845675f81c3d3c0b5de2cdaa4aed`
-- MD5: `d6173f38055aefa7b0065b2a44ee9cda`
-- Recipe: MQ6G256V2 trunk (240 tensors), MQ4G256V2/MQ4G128V2 experts,
-  Q8F16 head/embed/MTP-attention and PLE n-gram rows (128 shards,
-  external-resident, 54,400,261,120 B).
+- HF / local file: `qwen3.8-flash-next.mq4`
+- File size: `125288540696`
+- SHA-256: `cd7cbb911d3d016e034b1d22be1be37b42873a21699c94f09337528f1eee9db6`
+- MD5: `b91c31fb43847e9fda814e10d955e08c`
+- Recipe (r2): MQ6G256V2 trunk (240 tensors) and language head,
+  MQ4G256V2/MQ4G128V2 experts, Q8F16 embed/MTP-attention and PLE n-gram rows
+  (128 shards, external-resident, 54,400,261,120 B). Needs a build at or
+  after `c7c8c52f1` (MQ6G256V2 head admission).
 
 Before reporting Flash-Next results, verify the candidate trunk with
 `sha256sum` and require the digest above.
+
+Historical: the prior pin was `qwen3.8-flash-next.mq6q8-pleq8` (still on HF,
+tag `qwen3.8:flash-next-mq6q8-pleq8`; size `125467331096`, sha256
+`58fb4f586403000b3394413c38f58b0ec0d8845675f81c3d3c0b5de2cdaa4aed`); it differs
+only in its Q8F16 head. The caveats and measurements below were taken on that
+prior pin unless they say otherwise.
 
 Caveats that are part of the fixture, not trivia:
 

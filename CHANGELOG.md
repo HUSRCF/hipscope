@@ -12,6 +12,9 @@
     instead of Q8F16 (−0.18 GB read per token); every other tensor is
     unchanged. 32.8 → 33.4 tok/s. KLD against the BF16 source, 32 chunks:
     decode route 0.07539 → 0.07602, prefill route 0.07347 → 0.07432.
+    Published on HF `hipfire-models/qwen3.8-flash-next`; `qwen3.8:flash-next`
+    now pulls it (tier tag `qwen3.8:flash-next-mq4`), and the previous file
+    stays available as `qwen3.8:flash-next-mq6q8-pleq8`.
   - Measured and not taken: Q8 in the file for the shared expert, the PLE
     key/value and the HC read projections. Decode already reads Q8 copies
     of the matrices it streams, while prefill then lost its BF16 source
