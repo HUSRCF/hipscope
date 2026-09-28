@@ -1585,25 +1585,13 @@ impl Qwen4MtpGpu {
                     selected_len_out: &state.selected_len_out,
                 },
             )?;
-            let mut selected_len_bytes = [0u8; std::mem::size_of::<i32>()];
-            gpu.hip
-                .memcpy_dtoh(&mut selected_len_bytes, &state.selected_len_out.buf)?;
-            let selected_len = i32::from_ne_bytes(selected_len_bytes);
-            if selected_len < 0 {
-                return Err(invalid(
-                    "Qwen4 QSA reuse returned a negative selection length",
-                ));
-            }
-            let selected_len = selected_len as usize;
-            if selected_len == 0 || selected_len > state.selected_capacity || selected_len > visible
-            {
-                return Err(invalid(format!(
-                    "Qwen4 QSA reuse returned invalid selection length {selected_len} \
-                     (capacity {}, visible {visible})",
-                    state.selected_capacity
-                )));
-            }
-            state.selected_len = selected_len;
+            // No readback: the kernel keeps the prior rows (all before
+            // `position`) and appends `position`, so the length is prev + 1
+            // (capacity-bounded). Were a row dropped instead, the kernel pads
+            // the tail with -1, which the attention skips exactly.
+            state.selected_len = (state.selected_len + 1)
+                .min(state.selected_capacity)
+                .min(visible);
         }
         let selected = state.selected_len;
         indexed_attention_attention(

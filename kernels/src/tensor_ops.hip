@@ -2246,46 +2246,28 @@ extern "C" __global__ void indexed_attention_attention_f32_batched_serial(
         denominator > 0.0f ? numerator / denominator / (1.0f + expf(-gate)) : 0.0f;
 }
 
-// Bitwise-equal to indexed_attention_attention_f32_batched_serial: every score
-// is the same serial d-order dot, fmaxf is exact and order-independent, each
-// row's weight is the same expf, and every channel sums its weights and
-// products in selected-row order.  Weights are exponentiated once per row
-// (not per channel), and the value loads of UNROLL rows are issued before
-// their in-order accumulation (rows are kept as cache offsets, token *
-// kv_stride).  Invalid rows keep weight 0 and select value
-// 0, adding +0.0 to sums that are never -0.0.
-extern "C" __global__ __launch_bounds__(256) void indexed_attention_attention_f32_batched(
-    const float* q_with_gate,
+// One query row of the parallel attention below against `selected_len`
+// entries of `row_selected`; rows at or past `visible` count as invalid.
+static __device__ __forceinline__ void qsa_attention_row_parallel(
+    const float* __restrict__ q,
     const float* full_keys,
     const float* full_values,
-    const int* selected_indices,
-    float* output,
-    int rows,
-    int position_start,
+    const int* row_selected,
+    float* output_row,
+    int selected_len,
+    int visible,
     int n_heads,
     int n_kv_heads,
     int head_dim,
-    int budget_blocks,
-    int compress,
-    int capacity,
     int full_capacity) {
-    int row = (int)blockIdx.z;
-    if (row >= rows) return;
-    int visible = position_start + row + 1;
-    int block_count = visible / compress;
-    int chosen = budget_blocks < block_count ? budget_blocks : block_count;
-    int selected_len = chosen * compress + visible - block_count * compress;
-    if (selected_len > capacity) selected_len = capacity;
     extern __shared__ float row_scores[];
     int* row_tokens = reinterpret_cast<int*>(row_scores + selected_len);
     __shared__ float wave_max[8];
     const int tid = (int)threadIdx.x;
-    const int* row_selected = selected_indices + row * capacity;
     const int head = (int)blockIdx.x;
     const int kv_head = head / (n_heads / n_kv_heads);
     const int kv_stride = n_kv_heads * head_dim;
     const float* keys = full_keys + kv_head * head_dim;
-    const float* __restrict__ q = q_with_gate + row * 2 * n_heads * head_dim + head * head_dim * 2;
     float partial_max = -3.402823466e+38f;
     for (int selected_row = tid; selected_row < selected_len; selected_row += (int)blockDim.x) {
         int token = row_selected[selected_row];
@@ -2382,10 +2364,46 @@ extern "C" __global__ __launch_bounds__(256) void indexed_attention_attention_f3
         denominator += weight;
         numerator += weight * value;
     }
-    int output_offset = row * n_heads * head_dim + head * head_dim + channel;
     float gate = q[head_dim + channel];
-    output[output_offset] =
+    output_row[head * head_dim + channel] =
         denominator > 0.0f ? numerator / denominator / (1.0f + expf(-gate)) : 0.0f;
+}
+
+// Bitwise-equal to indexed_attention_attention_f32_batched_serial: every score
+// is the same serial d-order dot, fmaxf is exact and order-independent, each
+// row's weight is the same expf, and every channel sums its weights and
+// products in selected-row order.  Weights are exponentiated once per row
+// (not per channel), and the value loads of UNROLL rows are issued before
+// their in-order accumulation (rows are kept as cache offsets, token *
+// kv_stride).  Invalid rows keep weight 0 and select value
+// 0, adding +0.0 to sums that are never -0.0.
+extern "C" __global__ __launch_bounds__(256) void indexed_attention_attention_f32_batched(
+    const float* q_with_gate,
+    const float* full_keys,
+    const float* full_values,
+    const int* selected_indices,
+    float* output,
+    int rows,
+    int position_start,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int budget_blocks,
+    int compress,
+    int capacity,
+    int full_capacity) {
+    int row = (int)blockIdx.z;
+    if (row >= rows) return;
+    int visible = position_start + row + 1;
+    int block_count = visible / compress;
+    int chosen = budget_blocks < block_count ? budget_blocks : block_count;
+    int selected_len = chosen * compress + visible - block_count * compress;
+    if (selected_len > capacity) selected_len = capacity;
+    qsa_attention_row_parallel(
+        q_with_gate + row * 2 * n_heads * head_dim + (int)blockIdx.x * head_dim * 2,
+        full_keys, full_values, selected_indices + row * capacity,
+        output + row * n_heads * head_dim, selected_len, visible,
+        n_heads, n_kv_heads, head_dim, full_capacity);
 }
 
 // Bitwise-equal to indexed_attention_attention_f32_batched_serial for
@@ -2604,10 +2622,10 @@ extern "C" __global__ void indexed_attention_attention_f32_serial(
         denominator > 0.0f ? numerator / denominator / (1.0f + expf(-gate)) : 0.0f;
 }
 
-// Compute each selected row's token and normalized Q/K score once per
-// channel tile, then keep the max/weight/numerator scans serial per output
-// channel in the original selected-row order.
-extern "C" __global__ void indexed_attention_attention_f32(
+// Single query row with an explicit selection length (the MTP head's reused
+// selections do not follow the batched length formula); same arithmetic as
+// the batched kernel.
+extern "C" __global__ __launch_bounds__(256) void indexed_attention_attention_f32(
     const float* q_with_gate,
     const float* full_keys,
     const float* full_values,
@@ -2618,47 +2636,10 @@ extern "C" __global__ void indexed_attention_attention_f32(
     int head_dim,
     int selected_len,
     int full_capacity) {
-    extern __shared__ float row_scores[];
-    int* row_tokens = reinterpret_cast<int*>(row_scores + selected_len);
-    for (int row = (int)threadIdx.x;
-         row < selected_len;
-         row += (int)blockDim.x) {
-        int token = selected_indices[row];
-        row_tokens[row] = token;
-        float score = 0.0f;
-        if (token >= 0 && token < full_capacity) {
-            for (int d = 0; d < head_dim; ++d) {
-                score += q_with_gate[(int)blockIdx.x * head_dim * 2 + d]
-                    * full_keys[token * n_kv_heads * head_dim
-                        + ((int)blockIdx.x / (n_heads / n_kv_heads)) * head_dim + d];
-            }
-            score /= sqrtf((float)head_dim);
-        }
-        row_scores[row] = score;
-    }
-    __syncthreads();
-    int head = (int)blockIdx.x;
-    int channel = (int)(blockIdx.y * blockDim.x + threadIdx.x);
-    if (head >= n_heads || channel >= head_dim) return;
-    int kv_head = head / (n_heads / n_kv_heads);
-    float max_score = -3.402823466e+38f;
-    for (int row = 0; row < selected_len; ++row) {
-        int token = row_tokens[row];
-        if (token < 0 || token >= full_capacity) continue;
-        max_score = fmaxf(max_score, row_scores[row]);
-    }
-    float denominator = 0.0f;
-    float numerator = 0.0f;
-    for (int row = 0; row < selected_len; ++row) {
-        int token = row_tokens[row];
-        if (token < 0 || token >= full_capacity) continue;
-        float weight = expf(row_scores[row] - max_score);
-        denominator += weight;
-        numerator += weight * full_values[token * n_kv_heads * head_dim + kv_head * head_dim + channel];
-    }
-    float gate = q_with_gate[head * head_dim * 2 + head_dim + channel];
-    output[head * head_dim + channel] =
-        denominator > 0.0f ? numerator / denominator / (1.0f + expf(-gate)) : 0.0f;
+    qsa_attention_row_parallel(
+        q_with_gate + (int)blockIdx.x * head_dim * 2, full_keys, full_values,
+        selected_indices, output, selected_len, full_capacity,
+        n_heads, n_kv_heads, head_dim, full_capacity);
 }
 extern "C" __global__ void scale_f32(
     float* values,
