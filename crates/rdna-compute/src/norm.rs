@@ -5018,11 +5018,16 @@ impl Gpu {
     /// `HIPFIRE_GDN_SCAN_OUT_EMU=bf16|f16` (gfx1201, f32 `out` only) is a
     /// quality diagnostic that rounds every `out` value to bf16/f16 RNE while
     /// keeping the f32 store; `emu_bf16` is the byte oracle of the bf16 plane.
+    /// Exact gfx1151 runs its pipelined twin (`gdn_chunk_scan_gfx1151`,
+    /// byte-identical); `HIPFIRE_GFX1151_GDN_SCAN=0` restores `gdn_chunk_scan`.
     #[cfg(feature = "deltanet")]
     fn gdn_chunk_scan_module(&self, out: GdnScanOut) -> HipResult<(&'static str, &'static str)> {
         let emu = hipfire_config::developer_var("HIPFIRE_GDN_SCAN_OUT_EMU").ok();
         match (self.arch.as_str(), out, emu.as_deref()) {
             ("gfx1201", GdnScanOut::Bf16, None) => Ok(("gdn_chunk_scan_bf16", kernels::GDN_CHUNK_SCAN_BF16_SRC)),
+            ("gfx1151", GdnScanOut::F32, None) if hipfire_config::developer_bool("HIPFIRE_GFX1151_GDN_SCAN", true) => {
+                Ok(("gdn_chunk_scan_gfx1151", kernels::GDN_CHUNK_SCAN_GFX1151_SRC))
+            }
             (_, GdnScanOut::F32, None) => Ok(("gdn_chunk_scan", kernels::GDN_CHUNK_SCAN_SRC)),
             ("gfx1201", GdnScanOut::F32, Some("bf16")) => {
                 Ok(("gdn_chunk_scan_emu_bf16", kernels::GDN_CHUNK_SCAN_EMU_BF16_SRC))
@@ -5274,6 +5279,13 @@ impl Gpu {
         }
         let (scan_module, scan_source) = self.gdn_chunk_scan_module(out_fmt)?;
         self.ensure_kernel(scan_module, scan_source, scan_module)?;
+        // The gfx1151 twin runs one BV=64 value half of a head per 256-thread
+        // workgroup; every other scan module runs both halves in 512 threads.
+        let (scan_grid, scan_block) = if scan_module == "gdn_chunk_scan_gfx1151" {
+            ([2, 48, 1], [256, 1, 1])
+        } else {
+            ([1, 48, 1], [512, 1, 1])
+        };
 
         let kp = k.buf.as_ptr();
         let gp = g.buf.as_ptr();
@@ -5334,8 +5346,8 @@ impl Gpu {
         ];
         self.launch_maybe_blob(
             scan_module,
-            [1, 48, 1],
-            [512, 1, 1],
+            scan_grid,
+            scan_block,
             0,
             &mut scan_params,
             || {

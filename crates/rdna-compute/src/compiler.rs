@@ -590,6 +590,7 @@ impl KernelCompiler {
                     | "gdn_chunk_scan_emu_f16"
                     | "gdn_chunk_scan_bf16"
                     | "gdn_chunk_scan_bf16_mseg"
+                    | "gdn_chunk_scan_gfx1151"
                     | "gdn_chunk_prep_gfx11"
                     | "gdn_chunk_kkt_solve_gfx1100"
             )

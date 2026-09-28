@@ -170,6 +170,7 @@ Values and defaults below match `hipfire-config`, the native CLI, and/or `Runtim
 | `HIPFIRE_FP8_SYMFOLD` | Developer opt-out for centered FP8-v2 GEMM twins on exact gfx1201 symmetric MQ4V2 artifacts (`mq4v2.symmetric`): default enabled when the artifact marker and v2 route are both active; `=0` restores the asymmetric v2 entries. Non-symmetric artifacts are unchanged |
 | `HIPFIRE_GFX12_MQ4V2_FP8_V2_GEOM` | v2 tile geometry: `128x128` (default on exact gfx1201, the measured pin), `64x256`, `128x64`, `256x64` (prior default, still selectable) |
 | `HIPFIRE_GFX12_GDN_PRE_FUSED` | gfx1201 batched-prefill GDN preamble fusion (sigmoid+conv+qknorm 3→1, byte-exact) — default ON on exact gfx1201 (`kernel.gfx12_gdn_pre_fused`); `=0` restores the 3-launch sequence |
+| `HIPFIRE_GFX1151_GDN_SCAN` | Exact-gfx1151 twin of the GDN chunk scan (`gdn_chunk_scan_gfx1151`: pipelined chunk loop, K staged transposed, one value half per 256-thread workgroup; byte-identical `out` and state) — default ON; `=0` restores `gdn_chunk_scan` |
 | `HIPFIRE_GFX12_FP8_STREAM` | gfx1201 RMSNorm+rotate producer → MQ4v2 FP8 pre-pass fusion (byte-identical `prepare_mq4v2_fp8_x_f32` outputs for the qkvza/gate_up/qkv inputs; standalone pack launch disappears) — default ON on exact gfx1201 (`kernel.gfx12_fp8_stream`); `=0` opts out; other arches off |
 | `HIPFIRE_G12_NORM` | gfx1201 `_v2` RMSNorm and gated-norm int4 producers (batched sum-of-squares loads + one-reciprocal RTN codes; one wave per gated-norm group; bit-identical) — default ON on exact gfx1201 (`kernel.g12_norm`); `=0` restores the incumbent `_gfx12` symbols |
 | `HIPFIRE_G12_DEC_NORM` | gfx1201 decode norms as multi-workgroup grids (f32 AWQ RMSNorm+FWHT: K/256 workgroups, each redoing the row's reduction and rotating one group; out-of-place single-row `rmsnorm_f32`: n/256 workgroups; half-split partial RoPE: one workgroup per head; bit-identical) — default ON on exact gfx1201 (`kernel.g12_dec_norm`); `=0` restores the single-workgroup launches |
@@ -674,6 +675,7 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_GFX1151_GATE_UP_WAVE64` | crates/rdna-compute/src/gemv.rs |
 | `HIPFIRE_GFX1151_GDN_DPP` | crates/rdna-compute/src/norm.rs |
 | `HIPFIRE_GFX1151_GDN_DPP_REDUCE` | crates/rdna-compute/src/kernels.rs |
+| `HIPFIRE_GFX1151_GDN_SCAN` | crates/rdna-compute/src/norm.rs |
 | `HIPFIRE_GFX1151_GDN_R4X2` | crates/rdna-compute/src/norm.rs |
 | `HIPFIRE_GFX1151_GDN_R8` | crates/rdna-compute/src/norm.rs |
 | `HIPFIRE_GFX1151_LM_HEAD_ALL_BUFFER` | crates/rdna-compute/src/gemv.rs |

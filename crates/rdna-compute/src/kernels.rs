@@ -4319,11 +4319,13 @@ pub const MQ4V2_FP8_FRAGMENT_REPACK_GFX1201: &[u8] =
 /// per entry): SET, ADD (residual touch + grouped raster, `GSHIFT`) and the
 /// gate/up SiLU, byte-identical to the hipcc V2B `_set`, `_add_touch(_swz)`
 /// and `gate_up_silu` entries, with every fold op VOPD-paired, fold products
-/// bank-placed (`t + (j^2)`) and the SET's stores issued during its last
-/// epoch. Dispatched by `v2b_pm_entry` (gemm.rs) on gfx1151 only;
-/// `HIPFIRE_V2B_PM=0` opts out to hipcc, `HIPFIRE_V2B_PM_BUNDLE=<path>`
-/// loads another builder bundle (e.g. the previous one) instead.
-/// SHA-256 24a8d9eb55fc367c8bee744eb10344b0be0b51c65a8272f9b4105dd0f175d314.
+/// bank-placed (`t + (j^2)`), the per-epoch scale shares broadcast by
+/// `ds_swizzle_b32` instead of DPP `row_share` moves, and the SET's stores
+/// issued during its last epoch. Dispatched by `v2b_pm_entry` (gemm.rs) on
+/// gfx1151 only; `HIPFIRE_V2B_PM=0` opts out to hipcc,
+/// `HIPFIRE_V2B_PM_BUNDLE=<path>` loads another builder bundle (e.g. the
+/// previous one) instead.
+/// SHA-256 485d21ba678eb3b5aca8b662c08031d227c8a09ef120e364f04f0977f18d5642.
 pub const GEMM_MQ4G256V2_RESIDUAL_IU4_PM_V2B_GFX1151: &[u8] =
     include_bytes!("../../../kernels/gemm_mq4g256v2_residual_iu4_pm_v2b_gfx1151.hxaco");
 
@@ -7731,6 +7733,15 @@ pub const GDN_CHUNK_KKT_SOLVE_GFX1100_SRC: &str =
 #[cfg(feature = "deltanet")]
 pub const GDN_CHUNK_SCAN_SRC: &str =
     include_str!("../../../kernels/src/gdn_chunk_scan.gfx1201.hip");
+
+/// Exact-gfx1151 twin of [`GDN_CHUNK_SCAN_SRC`] (`gdn_chunk_scan_gfx1151`,
+/// `HIPFIRE_GFX1151_GDN_SCAN=0` opts out): the gfx1201 pipelined chunk loop
+/// with the gfx11 layouts, K staged transposed, one BV=64 value half per
+/// 256-thread workgroup (grid [2, 48]). Same LDS values, WMMA operands, order
+/// and roundings: byte-identical `out` and state.
+#[cfg(feature = "deltanet")]
+pub const GDN_CHUNK_SCAN_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gdn_chunk_scan.gfx1151.hip");
 
 /// Quality diagnostic twins of [`GDN_CHUNK_SCAN_SRC`] (`HIPFIRE_GDN_SCAN_OUT_EMU`):
 /// every `out` value rounded to bf16 / f16 RNE, still stored as f32.

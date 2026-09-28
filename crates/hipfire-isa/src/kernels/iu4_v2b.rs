@@ -21,7 +21,8 @@
 //! pairs 342 in SET and 260 in gate/up). Scale words are laid out so each
 //! word's rows come from one weight tensor: word `w` of lane `(hi, lr)` holds
 //! the row of wave fragment `w + 2*(lr>>3)`, so pass `a` shares word `a&1`
-//! from lane `8*(a>>1) + j` (gate rows and up rows never share a word).
+//! from lane `8*(a>>1) + j` (gate rows and up rows never share a word), as a
+//! `ds_swizzle_b32` broadcast on the LDS crossbar issued ahead of the fold.
 //! Fold products sit at `t + (j^2)` so no fmac half reads one VGPR bank
 //! three times. The SET stores each pass's final sums one b128 per WMMA step
 //! during the last epoch; ADD and SiLU store after the K loop.
@@ -111,7 +112,7 @@ impl Regs {
     const MAGIC: u8 = 160;    // 8 x 0x4b400000, the chain seed
     const AV: [u8; 2] = [168, 172];  // A fragment pairs (slice s, s+1)
     const XV: [u8; 2] = [176, 184];  // X fragments c=0..3 of one slice
-    const SCF: u8 = 192;      // row scales of the fold pass (DPP row_share)
+    const SCF: u8 = 192;      // row scales of the fold pass (ds_swizzle broadcast)
     const T: u8 = 200;        // fold products t = d*sc
     const DC: [u8; 2] = [208, 212];  // d of the four token fragments, by epoch parity
     const WSF: [u8; 2] = [220, 255]; // f32 scale words (v255 keeps the reservation a whole granule)
@@ -181,6 +182,14 @@ impl Gen {
         // temporaries need VGPRs the K loop still holds, so they store after it.
         let early = spec.epi == Epi::Set;
         Self { spec, args, sched, early }
+    }
+    /// WMMA step after which pass 0's scale broadcast issues: its f16 scale
+    /// word must have landed. `Early` loaded it before the previous epoch's
+    /// last fold; `Defer` loads it at the epoch start, so the ADD waits for
+    /// step 6 (HR4 screen, real H2 sites: SET/SiLU equal at steps 1-6, ADD
+    /// +1.9% cycles at step 1, -0.7% at step 6).
+    fn scales0_step(&self) -> usize {
+        match self.sched { Sched::Early => 2, Sched::Defer => 6 }
     }
     fn label(&self, name: &str) -> String { format!(".Lv2b_{}_{name}", self.spec.epi.tag()) }
     fn silu(&self) -> bool { self.spec.epi == Epi::GateUpSilu }
@@ -496,19 +505,27 @@ fn step_wmma(b: &mut Builder, i: usize) -> Result<(), String> {
     Ok(())
 }
 
-/// Fold pass `a`: sum[a][c][j] = fma(d_c * sc_j, C[c][j] - 1.5*2^23, sum).
-/// Row 16a + 8hi + j's scale is word `a&1` of lane 8*(a>>1) + j of this
-/// lane's row of 16.
-fn fold(b: &mut Builder, a: u8, dc: u8) -> Result<(), String> {
+/// Scale broadcast of fold pass `a` on the LDS crossbar, off the VALU port:
+/// row 16a + 8hi + j's scale is word `a&1` of lane 8*(a>>1) + j of this
+/// lane's row of 16, the lane `ds_swizzle_b32 swizzle(BROADCAST,16,k)` reads
+/// (DPP `row_share:k`). Issued ahead of the fold so the swizzles retire
+/// under WMMA issue (see `epoch`).
+fn scales(b: &mut Builder, a: u8) -> Result<(), String> {
     let w = usize::from(a & 1);
     if a < 2 {
         // True16 VOP1 reaches only v0-v127 halves; v221/v222 need the VOP3 form.
         op(b, format!("v_cvt_f32_f16_e64 v{}, v{}.l", Regs::WSF[w], Regs::WS[w]), &[v(Regs::WSF[w])], &[v(Regs::WS[w])])?;
     }
     for j in 0..8u8 {
-        op(b, format!("v_mov_b32_dpp v{}, v{} row_share:{} row_mask:0xf bank_mask:0xf", Regs::SCF + j, Regs::WSF[w], 8 * (a >> 1) + j),
-            &[v(Regs::SCF + j)], &[v(Regs::WSF[w])])?;
+        let text = format!("ds_swizzle_b32 v{}, v{} offset:swizzle(BROADCAST,16,{})", Regs::SCF + j, Regs::WSF[w], 8 * (a >> 1) + j);
+        b.ds_crosslane(Instruction::new(text, vec![v(Regs::SCF + j)], vec![v(Regs::WSF[w])]).memory(MemoryClass::DsLoad))?;
     }
+    Ok(())
+}
+
+/// Fold pass `a`: sum[a][c][j] = fma(d_c * sc_j, C[c][j] - 1.5*2^23, sum),
+/// with the pass's row scales already broadcast into SCF by `scales(a)`.
+fn fold(b: &mut Builder, a: u8, dc: u8) -> Result<(), String> {
     for c in 0..4u8 {
         // t_j = d_c * sc_j paired with C[c][j^1] += -1.5*2^23 (opposite
         // destination parity, distinct src1 banks); then the fmac pairs,
@@ -570,7 +587,9 @@ fn head(b: &mut Builder, p: usize, stage: bool, touch: bool) -> Result<(), Strin
 /// staged packet is published into slot 1-p after pass 2 (its LDS stores
 /// drain under pass 3's WMMAs) and the barrier hands the slots over; the
 /// last epoch has neither. `succ_stages`: epoch e+1 has a successor too
-/// (the early schedule issues e+1's head here).
+/// (the early schedule issues e+1's head here). Pass 0's scale broadcast
+/// issues after WMMA step `scales0_step`, pass a+1's right after fold pass
+/// a released the broadcast registers.
 fn epoch(b: &mut Builder, g: &Gen, p: usize, next: bool, succ_stages: bool, touch: bool) -> Result<(), String> {
     let sched = g.sched;
     if sched != Sched::Early { head(b, p, next, touch)?; }
@@ -582,8 +601,10 @@ fn epoch(b: &mut Builder, g: &Gen, p: usize, next: bool, succ_stages: bool, touc
         if i + 1 < 32 { step_loads(b, p, i + 1)?; }
         step_wmma(b, i)?;
         if let Some((a, c, q)) = pending.pop() { early_store(b, a, c, q)?; }
+        if i == g.scales0_step() { scales(b, 0)?; }
         if i % 8 == 7 && i < 31 {
             fold(b, (i / 8) as u8, Regs::DC[p])?;
+            scales(b, (i / 8) as u8 + 1)?;
             if next && i / 8 == PUBLISH_AFTER_PASS { stage_store(b, 1 - p)?; }
             if g.early && !next {
                 let a = (i / 8) as u8;

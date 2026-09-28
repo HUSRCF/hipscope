@@ -238,13 +238,13 @@ fn v2b_entries_are_deterministic_and_gfx1151_only() {
 #[test]
 fn v2b_fold_is_fully_vopd_paired_in_every_entry() {
     // One trip = two K128 epochs; per epoch and wave 128 K16 WMMAs, the 384
-    // fold ops as 192 packets (128 mul/add, 64 fmac/fmac), 32 DPP scale
-    // shares, 2 converts and 8 A rebias XORs: 234 VALU slots, none of them
-    // an unpaired fold op.
+    // fold ops as 192 packets (128 mul/add, 64 fmac/fmac), 2 converts and 8 A
+    // rebias XORs: 202 VALU slots, none of them an unpaired fold op. The 32
+    // scale shares are `ds_swizzle_b32` broadcasts, off the VALU port.
     for epi in iu4_v2b::Epi::ALL {
         let census = iu4_v2b::hot_loop_census(&v2b(epi).s_text, epi);
         for (name, n) in [("v_wmma_i32_16x16x16_iu4", 256), ("vopd_packets", 384), ("v_dual_mul_f32", 256), ("v_dual_fmac_f32", 128),
-            ("v_mov_b32_dpp", 64), ("v_cvt_f32_f16_e64", 4), ("v_xor_b32_e32", 16), ("valu_slots", 468), ("s_barrier", 2),
+            ("v_mov_b32_dpp", 0), ("ds_swizzle_b32", 64), ("v_cvt_f32_f16_e64", 4), ("v_xor_b32_e32", 16), ("valu_slots", 404), ("s_barrier", 2),
             ("ds_load_2addr_b64", 160), ("ds_store_b64", 16), ("global_load_b64", 16), ("global_load_b32", 8), ("global_load_u16", 4)] {
             assert_eq!(census.get(name).copied().unwrap_or(0), n, "{epi:?} {name}");
         }
