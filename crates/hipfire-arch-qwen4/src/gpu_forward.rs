@@ -34,11 +34,12 @@ use hipfire_dispatch::families::moe::{
 };
 use hipfire_dispatch::pipeline::sealed_moe::{
     retained_body_action, specialized_sealed_moe_retained_admission, RetainedBodyAction,
+    SealedMoeCall,
 };
 use hipfire_dispatch::pipeline::{
-    execute_embedding, execute_steps, execute_validated_steps, seal_decode, validate_steps,
-    BoundMoeExperts, ClearOp, EmbeddingOp, ExpertBindingCache, ExpertMetadata, ExpertResource,
-    ExpertResources, ExpertTable, GatedDeltaNetOp, GroupedDepthwiseOp, HyperReadOp, HyperWriteOp,
+    execute_embedding, execute_validated_steps, seal_decode, validate_steps, BoundMoeExperts,
+    ClearOp, EmbeddingOp, ExpertBindingCache, ExpertMetadata, ExpertResource, ExpertResources,
+    ExpertTable, GatedDeltaNetOp, GroupedDepthwiseOp, HyperReadOp, HyperWriteOp,
     IndexedAttentionMode, IndexedAttentionOp, IndexedAttentionState, Step,
 };
 use hipfire_dispatch::types::dtype_rotation_plan;
@@ -348,7 +349,7 @@ fn decode_copy<'a>(
     }
 }
 
-fn hyper_read_desc<'a>(
+pub(crate) fn hyper_read_desc<'a>(
     weights: &'a Qwen4Weights,
     hyper: &HyperConnectionReadWeights,
 ) -> Result<Qwen4HyperReadWeights<'a>, Qwen4GpuForwardError> {
@@ -359,7 +360,7 @@ fn hyper_read_desc<'a>(
     })
 }
 
-fn hyper_desc<'a>(
+pub(crate) fn hyper_desc<'a>(
     weights: &'a Qwen4Weights,
     hyper: &HyperConnectionWeights,
 ) -> Result<Qwen4HyperWeights<'a>, Qwen4GpuForwardError> {
@@ -394,7 +395,7 @@ fn gdn_desc<'a>(
     })
 }
 
-fn qsa_desc<'a>(
+pub(crate) fn qsa_desc<'a>(
     weights: &'a Qwen4Weights,
     qsa: &crate::weights::QsaWeights,
 ) -> Result<Qwen4QsaWeights<'a>, Qwen4GpuForwardError> {
@@ -815,19 +816,17 @@ pub(crate) struct Qwen4MoeScratch<'a> {
     pub(crate) down_expanded: &'a GpuTensor,
 }
 
-pub(crate) fn execute_moe(
-    gpu: &mut Gpu,
+/// Seal the one-row decode MoE of `runtime` for a caller's step list; the
+/// caller clears `output` with a preceding `Step::Clear`.
+pub(crate) fn seal_moe_decode<'a>(
+    ctx: &'a DispatchCtx,
     config: &Qwen4Config,
     layer_index: usize,
-    runtime: &Qwen4MoeLayerRuntime,
-    input: &GpuTensor,
-    output: &GpuTensor,
-    scratch: Qwen4MoeScratch<'_>,
-) -> Result<(), Qwen4GpuForwardError> {
-    let ctx = DispatchCtx::new(gpu);
-    // A stream-ordered kernel, not a blocking default-stream hipMemset that
-    // drains the queue every MTP draft step; both write exact +0.0.
-    gpu.zero_f32(output)?;
+    runtime: &'a Qwen4MoeLayerRuntime,
+    input: &'a GpuTensor,
+    output: &'a GpuTensor,
+    scratch: Qwen4MoeScratch<'a>,
+) -> Result<SealedMoeCall<'a>, Qwen4GpuForwardError> {
     let dtypes = MoeDtypes {
         router: runtime.router.dtype,
         shared: Some(MoeSharedDtypes {
@@ -917,13 +916,10 @@ pub(crate) fn execute_moe(
     let bound = BoundMoeExperts::from_cache(&runtime.table, &runtime.cache)
         .map_err(|error| Qwen4GpuForwardError::Dispatch(format!("bound MoE experts: {error:?}")))?;
     let seal_started = qwen4_profile_start();
-    let sealed_result = seal_decode(bound, &ctx, params);
+    let sealed_result = seal_decode(bound, ctx, params);
     qwen4_profile_record(Qwen4ProfilePhase::MoeSeal, seal_started);
-    let sealed = sealed_result
-        .map_err(|error| Qwen4GpuForwardError::Dispatch(format!("seal Qwen4 MoE: {error:?}")))?;
-    execute_steps(gpu, &ctx, &[Step::Moe(sealed)])
-        .map_err(|error| Qwen4GpuForwardError::Dispatch(format!("execute Qwen4 MoE: {error:?}")))?;
-    Ok(())
+    sealed_result
+        .map_err(|error| Qwen4GpuForwardError::Dispatch(format!("seal Qwen4 MoE: {error:?}")))
 }
 
 /// Device buffers shared by one forward object.  All allocations happen in

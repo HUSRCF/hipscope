@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Qwen4 MTP draft head runs as one engine `Step` list: the prologue
+  (`Embed`, `HyperNorm`, `Project`, `BroadcastAdd`), HC read/write, indexed
+  attention (new `IndexedAttentionMode` append-only and selection-reuse
+  modes), MoE and final HC read execute through `hipfire_dispatch`, and the
+  draft ranking moved to the shared `DraftHead`. Greedy MTP tokens still
+  equal AR's; 9-prompt MTP geomean 59.37 → 59.04 tok/s (best of 3, within
+  noise), mean tau unchanged at 2.10.
+
 - Qwen4 decode 32.4 → 33.4 tok/s on gfx1151 (1131-token prompt, 5 runs,
   same binary), prefill unchanged at ~1255 tok/s:
   - Single-token forwards also read the shared expert as load-time Q8_0

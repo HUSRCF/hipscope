@@ -9,7 +9,7 @@
 //! encoded byte capacity for sealed expert-resource validation.
 
 use hipfire_dispatch::families::gemv::WeightRef;
-use rdna_compute::{DType, Gpu, GpuTensor};
+use rdna_compute::{DType, GpuTensor};
 
 pub(crate) fn row_stride(dtype: DType, k: usize) -> usize {
     dtype.row_bytes(k).unwrap_or(k * dtype.size())
@@ -86,66 +86,6 @@ impl ProjectionView {
             awq_scale: None,
         }
     }
-}
-
-/// Dispatch one logical projection with the same MQv2 basis convention as the
-/// ordinary Qwen4 trunk.  Inputs/outputs are F32; BF16 remains unrotated.
-pub(crate) fn dispatch_gemv(
-    gpu: &mut Gpu,
-    weight: &GpuTensor,
-    input: &GpuTensor,
-    rotation: &GpuTensor,
-    output: &GpuTensor,
-    m: usize,
-    k: usize,
-) -> hip_bridge::HipResult<()> {
-    dispatch_gemv_rows(gpu, weight, input, rotation, output, m, k, 1)
-}
-
-/// [`dispatch_gemv`] over `rows` row-major input rows (`[rows, k]` in,
-/// `[rows, m]` out); each row is bitwise its single-row projection.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn dispatch_gemv_rows(
-    gpu: &mut Gpu,
-    weight: &GpuTensor,
-    input: &GpuTensor,
-    rotation: &GpuTensor,
-    output: &GpuTensor,
-    m: usize,
-    k: usize,
-    rows: usize,
-) -> hip_bridge::HipResult<()> {
-    match weight.dtype {
-        DType::MQ4G256V2
-        | DType::MQ4G128V2
-        | DType::MQ2G256V2
-        | DType::MQ3G256V2
-        | DType::MQ5G256V2
-        | DType::MQ6G256V2
-        | DType::MFP4G32E8SOA
-        | DType::Q8_0
-        | DType::BF16 => {}
-        dtype => {
-            return Err(hip_bridge::HipError::new(
-                0,
-                &format!("Qwen4 projection has unsupported resident dtype {dtype:?}"),
-            ));
-        }
-    }
-    // One projection contract: the shared lowering owns the FWHT basis
-    // convention, so a packed payload is rotated and decoded exactly as the
-    // trunk's own ops decode it.
-    let reference = WeightRef {
-        buf: weight,
-        dtype: weight.dtype,
-        m,
-        k,
-        row_stride: row_stride(weight.dtype, k),
-        rotation: None,
-        awq_scale: None,
-    };
-    hipfire_dispatch::pipeline::project_weight(gpu, &reference, input, output, rows, Some(rotation))
-        .map_err(|error| hip_bridge::HipError::new(0, &error.to_string()))
 }
 
 #[cfg(test)]
