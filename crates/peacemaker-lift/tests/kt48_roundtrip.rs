@@ -162,8 +162,8 @@ fn selected_kernel_stream_is_reencoded_not_copied() {
 fn builder_bundles_round_trip() {
     for (relative, sha, kernels, bytes) in [
         ("../../kernels/gemm_mq4g256v2_wmma_fp8_gfx12_b1.hxaco", "1b26cd3a0bbddfafd8cf93250283aacee16bd37a4886233461fe0e175133f373", 12, 367_072),
-        ("../../kernels/gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1.hxaco", "b884f5f79c76efe358434221bc5f1b3191ab8f334aeb5d28d641d0976b557ed4", 5, 79_384),
-        ("../../kernels/gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s.hxaco", "3afa298ef8f783f0f9a4c4d10c67af88dbba908541ed243f194649dfdf997796", 5, 79_408),
+        ("../../kernels/gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1.hxaco", "c6e714e7d189e26bea6c4d7ee178e6a1834a77dec19b3354f172ba38373769f8", 5, 83_224),
+        ("../../kernels/gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s.hxaco", "d5190d97df5e15fbf53aef47593d5fff49dd0732ef4fc13ed641d63c03015d63", 5, 83_504),
     ] {
         let input = load(relative, sha);
         assert_eq!(input.len(), bytes);

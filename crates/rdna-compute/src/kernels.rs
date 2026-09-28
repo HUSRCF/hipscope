@@ -4250,10 +4250,13 @@ pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_V3_SRC: &str = concat!(
     include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_iu4_v3.gfx12.hip")
 );
 /// Certified gfx1201 K128/T128 builder code object, all three epilogues.
-/// SHA-256 b884f5f79c76efe358434221bc5f1b3191ab8f334aeb5d28d641d0976b557ed4:
+/// SHA-256 c6e714e7d189e26bea6c4d7ee178e6a1834a77dec19b3354f172ba38373769f8:
 /// prefetch the next K128's slab-1 A/W after B2 and scale/weight metadata before B1;
-/// the fused GDN projection pads its LDS ring rows to 528 bytes and runs its
-/// GDN epilogue below the K-loop's wave priority.
+/// the fused GDN projection pads its LDS ring rows to 528 bytes; every symbol
+/// runs its K-loop at wave priority 1 and its epilogue (the fused projection:
+/// its GDN epilogue) at 0; the fold subtracts the magic as a VOPD literal,
+/// keeps each fmac's product in another VGPR bank than its C/acc, and pairs
+/// row group 1's subrev with row group 0's fmac in one packet.
 pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1: &[u8] =
     include_bytes!("../../../kernels/gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1.hxaco");
 /// Original certified `_b1` bundle for same-binary model/performance controls.
@@ -4264,7 +4267,7 @@ pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1_CONTROL: &[u8] =
 /// the slab activation layout (`hipfire-isa emit --alayout slab`), fed only
 /// by the slab producer twins (`Gpu::a4_slab_active`), including the fused
 /// GDN input projection `gemm_mq4g256v2_residual_mmq_iu4_qkvzagdn_b1s`.
-/// SHA-256 3afa298ef8f783f0f9a4c4d10c67af88dbba908541ed243f194649dfdf997796.
+/// SHA-256 d5190d97df5e15fbf53aef47593d5fff49dd0732ef4fc13ed641d63c03015d63.
 pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1S: &[u8] =
     include_bytes!("../../../kernels/gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s.hxaco");
 /// Certified gfx1201 F2 Row/K128 bundle; production selects Row only.

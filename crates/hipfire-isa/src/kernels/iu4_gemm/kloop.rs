@@ -8,9 +8,10 @@
 //!   fragment loads from slot 0; slab-0 WMMAs; publish slab 1 into slot 1;
 //!   B1 retires slot 0 and publishes slot 1.
 //! - Phase B: next-block slab-0 fetch and metadata; fragment loads from slot 1;
-//!   slab-1 WMMAs and the fold's `subrev` stage; publish the next block into
-//!   slot 0; B2 signal retires its payload; fetch next block's slab 1 during
-//!   the fold's `mul`/`fmac` stage; B2 wait.
+//!   slab-1 WMMAs and the fold's `subrev` stage of row group 0; publish the
+//!   next block into slot 0; B2 signal retires its payload; fetch next block's
+//!   slab 1 during the fold's `mul`/`fmac` stage (row group 1's `subrev`
+//!   rides in row group 0's `fmac` packets); B2 wait.
 use super::{Gen, K_LOOP, K_LOOP_END, EPI, fold, op, publish::{self, ds_load}, s, sr};
 use crate::{Builder, V, insn::Wmma, lds::Transition, reg::Live};
 
@@ -90,7 +91,6 @@ fn block_with(b: &mut Builder, g: &Gen, tag: &str, h: usize, fetch_next: bool, e
     bundle(b, g, 1, false, |b, i| fold::unbias_after_wmma(b, g, i))?;
     b.label(&x1)?;
     ds_load(b, g.slot_sz[h], format!("ds_load_b128 v[{}:{}], v{}{}", f1, f1 + 3, g.sc_addr, super::ds_offset(sz + 80)), super::vr(f1, 4), g.sc_addr)?;
-    fold::unbias_tail(b, g)?;
     if fetch_next {
         publish::publish_slab(b, g, 0)?;
         publish::publish_meta(b, g, h ^ 1)?;

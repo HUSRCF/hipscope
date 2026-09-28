@@ -44,6 +44,8 @@ fn round_bf16(b: &mut Builder, src: u8, dst: u8) -> Result<(), String> {
 pub(crate) fn emit(b: &mut Builder, g: &Gen) -> Result<(), String> {
     b.label(EPI)?;
     if g.spec.epi == Epi::QkvzaGdn { return fused_stores(b, g) }
+    // Below the K-loop's priority 1: co-resident K-loops issue first.
+    op(b, "s_setprio 0", &[], &[])?;
     let a = g.args;
     let rbase = if g.spec.epi.is_silu() { g.hs } else { g.rs };
     store(b, g, g.spec.epi, a.y, a.m, rbase, None)

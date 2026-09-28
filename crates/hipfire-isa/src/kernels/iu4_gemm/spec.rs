@@ -31,7 +31,8 @@ pub struct Spec { pub fold: Fold, pub tile: Tile, pub cacc: Cacc, pub epi: Epi, 
 /// Every variant keeps occupancy only at or below this many VGPRs (G0g:
 /// 4 WG/WGP for 8-wave and 2 WG/WGP for 16-wave workgroups).
 pub const VGPR_CEILING: u16 = 192;
-/// Fold magic: the int32 bit pattern of 12582912.0f seeded as WMMA C.
+/// Fold magic: the int32 bit pattern of 12582912.0f, seeded as WMMA C and
+/// subtracted by the fold's stage 1 as a VOPD literal.
 pub const MAGIC: u32 = 0x4b40_0000;
 /// Buffer resource word 3 (raw, 32-bit untyped, OOB_SELECT raw), GPU-proven by K1.
 pub const SRD_WORD3: u32 = 0x3100_4000;

@@ -5,9 +5,9 @@
     "vopd_packets": {
       "min": 384
     },
-    "v_dual_subrev_f32": 128,
+    "v_dual_subrev_f32": 64,
     "v_dual_mul_f32": 128,
-    "v_dual_fmac_f32": 128
+    "v_dual_fmac_f32": 192
   },
   "forbidden": [
     "s_waitcnt",

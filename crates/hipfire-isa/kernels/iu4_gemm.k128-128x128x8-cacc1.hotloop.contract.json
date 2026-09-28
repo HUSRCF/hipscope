@@ -8,9 +8,9 @@
       "max": 220
     },
     "vopd_packets": 192,
-    "v_dual_subrev_f32": 64,
+    "v_dual_subrev_f32": 32,
     "v_dual_mul_f32": 64,
-    "v_dual_fmac_f32": 64,
+    "v_dual_fmac_f32": 96,
     "v_xor_b32_e32": 16,
     "v_cvt_f32_i32*": 0,
     "v_add_co*": 0,
