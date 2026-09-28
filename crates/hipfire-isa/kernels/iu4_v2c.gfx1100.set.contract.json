@@ -5,7 +5,8 @@
     "vopd_packets": 384,
     "v_dual_mul_f32": 256,
     "v_dual_fmac_f32": 128,
-    "v_mov_b32_dpp": 64,
+    "v_mov_b32_dpp": 0,
+    "ds_swizzle_b32": 64,
     "v_cvt_f32_f16_e64": 4,
     "v_xor_b32_e32": 32,
     "ds_load_2addr_b64": 160,
@@ -15,7 +16,8 @@
     "global_load_u16": 4,
     "global_store_b128": 16,
     "s_barrier": 4,
-    "buffer_gl0_inv": 0
+    "buffer_gl0_inv": 0,
+    "s_setprio": 0
   },
   "forbidden": [
     "s_wait_loadcnt*",

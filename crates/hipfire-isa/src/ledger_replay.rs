@@ -176,7 +176,8 @@ fn replay(assembly: &str, arch: Arch, all: bool) -> Result<Vec<String>, String> 
             Some((Kind::Vmem, true))
         } else if name.starts_with("buffer_store") || name.starts_with("global_store") {
             Some((Kind::Store, false))
-        } else if name.starts_with("ds_load") {
+        } else if name.starts_with("ds_load") || name == "ds_swizzle_b32" {
+            // ds_swizzle_b32 returns its lane exchange through the DS queue like a load.
             Some((Kind::Ds, true))
         } else if name.starts_with("ds_store") {
             Some((Kind::Ds, false))
@@ -311,5 +312,18 @@ mod tests {
         // Architecture-foreign spellings are rejected, not ignored.
         assert!(gfx11(&format!("{loads}s_wait_loadcnt 0x0\nv_add_f32 v4, v1, v1\n")).is_err());
         assert!(super::replay_waits("s_waitcnt vmcnt(0)\n", crate::Arch::Gfx1201).is_err());
+    }
+    /// A ds_swizzle_b32 lane exchange returns through the DS queue: its
+    /// destination is unfinished until an lgkmcnt wait retires it, in order
+    /// with the DS loads around it.
+    #[test]
+    fn gfx11_swizzle_results_wait_like_ds_loads() {
+        let gfx11 = |text: &str| super::replay_waits(text, crate::Arch::Gfx1100);
+        let stream = "ds_load_b32 v2, v9\nds_swizzle_b32 v3, v4 offset:swizzle(BROADCAST,16,0)\nds_load_b32 v5, v9 offset:4\n";
+        assert!(gfx11(&format!("{stream}v_add_f32 v6, v3, v3\n")).is_err());
+        assert!(gfx11(&format!("{stream}s_waitcnt lgkmcnt(2)\nv_add_f32 v6, v3, v3\n")).is_err());
+        assert!(gfx11(&format!("{stream}s_waitcnt lgkmcnt(1)\nv_add_f32 v6, v3, v3\n")).is_ok());
+        // lgkmcnt(1) leaves the youngest load, behind the swizzle, pending.
+        assert!(gfx11(&format!("{stream}s_waitcnt lgkmcnt(1)\nv_add_f32 v6, v5, v5\n")).is_err());
     }
 }

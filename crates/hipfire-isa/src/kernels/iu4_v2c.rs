@@ -450,10 +450,13 @@ fn step_wmma(b: &mut Builder, i: usize) -> Result<(), String> {
     Ok(())
 }
 
-/// Fold pass `a`: sum[a][c][j] = fma(d_c * sc_j, C[c][j] - 1.5*2^23, sum).
-/// Row 16a + 8hi + j's scale comes from lane 8a + j of this lane's row of 16
-/// (gate/up: pass 0 from the gate scales, pass 1 from the up scales).
-fn fold(b: &mut Builder, epi: Epi, a: u8) -> Result<(), String> {
+/// Scale broadcast of fold pass `a`: row 16a + 8hi + j's scale comes from
+/// lane 8a + j of this lane's row of 16 (gate/up: pass 0 from the gate
+/// scales, pass 1 from the up scales). The broadcast runs on the LDS
+/// crossbar (`ds_swizzle_b32 swizzle(BROADCAST,16,k)`: lane `(lane & 16) | k`,
+/// the bits of DPP `row_share:k`), off the VALU port, and is issued ahead of
+/// its fold so the swizzles retire under WMMA issue.
+fn scales(b: &mut Builder, epi: Epi, a: u8) -> Result<(), String> {
     let scale = if epi.silu() && a == 1 { Regs::WSFU } else { Regs::WSF };
     if a == 0 || epi.silu() {
         // True16 VOP1 reaches only v0-v127 halves; v149/v181 need the VOP3 form.
@@ -461,31 +464,58 @@ fn fold(b: &mut Builder, epi: Epi, a: u8) -> Result<(), String> {
         op(b, format!("v_cvt_f32_f16_e64 v{scale}, v{raw}.l"), &[v(scale)], &[v(raw)])?;
     }
     for j in 0..8u8 {
-        op(b, format!("v_mov_b32_dpp v{}, v{scale} row_share:{} row_mask:0xf bank_mask:0xf", Regs::SCF + j, 8 * a + j),
-            &[v(Regs::SCF + j)], &[v(scale)])?;
+        let text = format!("ds_swizzle_b32 v{}, v{scale} offset:swizzle(BROADCAST,16,{})", Regs::SCF + j, 8 * a + j);
+        b.ds_crosslane(Instruction::new(text, vec![v(Regs::SCF + j)], vec![v(scale)]).memory(MemoryClass::DsLoad))?;
     }
-    for cp in [0u8, 2] {
-        // t_j = d_c * sc_j paired with C[c][j^1] += -1.5*2^23 (opposite
-        // destination parity, distinct src1 banks); then the fmac pairs.
-        for c in [cp, cp + 1] {
-            let t = Regs::T[usize::from(c % 2)];
-            for j in 0..8u8 {
-                let mul = VopdOp { op: VopdF32::Mul, dst: t + j, src0: Operand::V(Regs::DC + c), src1: Regs::SCF + j };
-                let cf = Regs::C + 8 * c + (j ^ 1);
-                let add = VopdOp { op: VopdF32::Add, dst: cf, src0: Operand::Lit(MAGIC_NEG), src1: cf };
-                b.vopd(mul, add)?;
+    Ok(())
+}
+
+/// Register offset of element j inside a sum octet. The mixed pairing keeps
+/// sums at acc + (j ^ 2); SET keeps them in order so its epilogue stays one
+/// b128 store per quad (the swapped halves cost two b64 stores: +1.9% on
+/// the QKV SET, where the pairing saves less than that).
+fn acc_slot(epi: Epi, j: u8) -> u8 { if epi == Epi::Set { j } else { j ^ 2 } }
+
+/// Fold pass `a`: sum[a][c][j] = fma(d_c * sc_j, C[c][j] - 1.5*2^23, sum),
+/// same ops and per-element order as V2C.
+/// - ADD / gate-up (mixed pairing): sums at acc + (j ^ 2), products at
+///   t + (j ^ 1), so an fmac of element j reads banks j^2, j^1, j and rides
+///   with the magic add of element j^3 of a later token fragment (four
+///   distinct banks); fragments 2/3 products pair mul::mul and their fmacs
+///   pair with each other.
+/// - SET: products at t + (j ^ 2) paired with the magic adds, then fmac
+///   pairs whose halves read banks j, j^2, j (not j three times).
+fn fold(b: &mut Builder, epi: Epi, a: u8) -> Result<(), String> {
+    let cr = |c: u8, j: u8| Regs::C + 8 * c + j;
+    let add = |c: u8, j: u8| VopdOp { op: VopdF32::Add, dst: cr(c, j), src0: Operand::Lit(MAGIC_NEG), src1: cr(c, j) };
+    let acc = |c: u8, j: u8| Regs::ACC + 8 * (4 * a + c) + acc_slot(epi, j);
+    if epi == Epi::Set {
+        let t = |c: u8, j: u8| Regs::T[usize::from(c % 2)] + (j ^ 2);
+        for cp in [0u8, 2] {
+            // t_j paired with C[c][j^1] += -1.5*2^23 (opposite destination
+            // parity, distinct src1 banks); then the fmac pairs.
+            for c in [cp, cp + 1] {
+                for j in 0..8u8 {
+                    b.vopd(VopdOp { op: VopdF32::Mul, dst: t(c, j), src0: Operand::V(Regs::DC + c), src1: Regs::SCF + j }, add(c, j ^ 1))?;
+                }
+            }
+            for c in [cp, cp + 1] {
+                for j in (0..8u8).step_by(2) {
+                    let x = VopdOp { op: VopdF32::Fmac, dst: acc(c, j), src0: Operand::V(t(c, j)), src1: cr(c, j) };
+                    let y = VopdOp { op: VopdF32::Fmac, dst: acc(c, j + 1), src0: Operand::V(t(c, j + 1)), src1: cr(c, j + 1) };
+                    b.vopd(x, y)?;
+                }
             }
         }
-        for c in [cp, cp + 1] {
-            let t = Regs::T[usize::from(c % 2)];
-            let acc = Regs::ACC + 8 * (4 * a + c);
-            for j in (0..8u8).step_by(2) {
-                let x = VopdOp { op: VopdF32::Fmac, dst: acc + j, src0: Operand::V(t + j), src1: Regs::C + 8 * c + j };
-                let y = VopdOp { op: VopdF32::Fmac, dst: acc + j + 1, src0: Operand::V(t + j + 1), src1: Regs::C + 8 * c + j + 1 };
-                b.vopd(x, y)?;
-            }
-        }
+        return Ok(())
     }
+    let t = |c: u8, j: u8| Regs::T[usize::from(c % 2)] + (j ^ 1);
+    let mul = |c: u8, j: u8| VopdOp { op: VopdF32::Mul, dst: t(c, j), src0: Operand::V(Regs::DC + c), src1: Regs::SCF + j };
+    let fmac = |c: u8, j: u8| VopdOp { op: VopdF32::Fmac, dst: acc(c, j), src0: Operand::V(t(c, j)), src1: cr(c, j) };
+    for c in [0u8, 1] { for j in 0..8u8 { b.vopd(mul(c, j), add(c, j ^ 2))?; } }
+    for (c, c2) in [(0u8, 2u8), (1, 3)] { for j in 0..8u8 { b.vopd(fmac(c, j), add(c2, j ^ 3))?; } }
+    for j in 0..8u8 { b.vopd(mul(2, j), mul(3, j ^ 1))?; }
+    for c in [2u8, 3] { for j in (0..8u8).step_by(2) { b.vopd(fmac(c, j), fmac(c, j + 1))?; } }
     Ok(())
 }
 
@@ -495,8 +525,8 @@ fn fold(b: &mut Builder, epi: Epi, a: u8) -> Result<(), String> {
 /// touch, last two epochs) loads residual lines `touch` and `touch + 1`.
 fn epoch(b: &mut Builder, epi: Epi, p: usize, next: bool, touch: bool) -> Result<(), String> {
     // Current-epoch metadata first: in-order VMcnt returns it before the packet.
-    let scales: &[(u8, u8)] = if epi.silu() { &[(Regs::WS, Regs::SA), (Regs::WSU, Regs::SU)] } else { &[(Regs::WS, Regs::SA)] };
-    for &(dst, base) in scales {
+    let scale_loads: &[(u8, u8)] = if epi.silu() { &[(Regs::WS, Regs::SA), (Regs::WSU, Regs::SU)] } else { &[(Regs::WS, Regs::SA)] };
+    for &(dst, base) in scale_loads {
         mem(b, format!("global_load_u16 v{dst}, v{}, s[{base}:{}]{}", Regs::LWS, base + 1, off(4 * p as u32)?),
             &[v(dst)], &[v(Regs::LWS), sr(base, 2)], MemoryClass::VmemLoad)?;
     }
@@ -515,11 +545,18 @@ fn epoch(b: &mut Builder, epi: Epi, p: usize, next: bool, touch: bool) -> Result
         op(b, format!("s_addc_u32 s{0}, s{0}, 0", Regs::SX + 1), &[s(Regs::SX + 1)], &[s(Regs::SX + 1)])?;
         stage_loads(b, epi, if p == 0 { 64 } else { 0 })?;
     }
+    // Pass 0's scale broadcast issues after step 3 (its f16 scale load has
+    // had 16 WMMA issue slots), pass 1's right after fold pass 0 released
+    // the broadcast registers; both retire under the following WMMA steps.
     step_loads(b, p, 0)?;
     for i in 0..16 {
         if i + 1 < 16 { step_loads(b, p, i + 1)?; }
         step_wmma(b, i)?;
-        if i == 7 { fold(b, epi, 0)?; }
+        if i == 3 { scales(b, epi, 0)?; }
+        if i == 7 {
+            fold(b, epi, 0)?;
+            scales(b, epi, 1)?;
+        }
     }
     // Publish the staged packet before fold pass 1 (slot 1-p was retired by
     // the previous barrier), so its LGKM drain hides under the fold: this
@@ -583,6 +620,11 @@ fn kloop(b: &mut Builder, epi: Epi) -> Result<(), String> {
 /// pair (0, 1), one h octet per token fragment.
 fn epilogue(b: &mut Builder, epi: Epi) -> Result<(), String> {
     b.label(EPI)?;
+    if epi.silu() {
+        // PRIO: the K loop ran at wave priority 1 (set at entry); the SiLU
+        // epilogue yields issue to resident waves still in their K loop.
+        op(b, "s_setprio 0", &[], &[])?;
+    }
     op(b, format!("v_mov_b32_e32 v0, v{}", Regs::YOFF), &[v(0)], &[v(Regs::YOFF)])?;
     for c in 1..4u8 {
         op(b, format!("v_add_nc_u32_e32 v{c}, s{}, v{}", Regs::M64, c - 1), &[v(c)], &[s(Regs::M64), v(c - 1)])?;
@@ -608,8 +650,8 @@ fn epilogue(b: &mut Builder, epi: Epi) -> Result<(), String> {
             for (i, (c, a, q)) in quads().enumerate() {
                 let (r, x) = (Regs::RESID + 4 * i as u8, acc(c, a, q));
                 for k in [0u8, 2] {
-                    let lo = VopdOp { op: VopdF32::Add, dst: r + k, src0: Operand::V(r + k), src1: x + k };
-                    let hi = VopdOp { op: VopdF32::Add, dst: r + k + 1, src0: Operand::V(r + k + 1), src1: x + k + 1 };
+                    let lo = VopdOp { op: VopdF32::Add, dst: r + k, src0: Operand::V(r + k), src1: x + acc_slot(epi, k) };
+                    let hi = VopdOp { op: VopdF32::Add, dst: r + k + 1, src0: Operand::V(r + k + 1), src1: x + acc_slot(epi, k + 1) };
                     b.vopd(lo, hi)?;
                 }
                 store(b, c, r, offset(a, q))?;
@@ -627,7 +669,7 @@ fn epilogue(b: &mut Builder, epi: Epi) -> Result<(), String> {
                 let binds: Vec<Binding> = (0..8u8).map(|k| {
                     let q = k % SILU_SLOTS;
                     Binding {
-                        g: acc(c, 0, 0) + k, u: acc(c, 1, 0) + k, out: Regs::H + 8 * c + k,
+                        g: acc(c, 0, 0) + acc_slot(epi, k), u: acc(c, 1, 0) + acc_slot(epi, k), out: Regs::H + 8 * c + k,
                         temps: (0..SILU_TEMPS).map(|t| Regs::SILU_T[usize::from(q)] + t).collect(),
                         masks: vec![Regs::MASKS + 4 * q, Regs::MASKS + 4 * q + 2],
                     }
@@ -650,6 +692,10 @@ pub fn emit(spec: Spec) -> Result<Emitted, String> {
     let mut b = Builder::new(kspec, plan(spec.epi)?);
     b.enable_delay_alu();
     declare_lds(&mut b)?;
+    // PRIO (gate/up only): prologue and K loop at wave priority 1, the SiLU
+    // epilogue at 0. On the ADD entry the same split starves the epilogue
+    // (K6144 +1.8%), and SET is neutral.
+    if spec.epi.silu() { op(&mut b, "s_setprio 1", &[], &[])?; }
     prologue(&mut b, spec.epi)?;
     kloop(&mut b, spec.epi)?;
     epilogue(&mut b, spec.epi)?;

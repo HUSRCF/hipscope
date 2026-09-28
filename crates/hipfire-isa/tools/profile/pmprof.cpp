@@ -5,6 +5,10 @@
 //   pmprof iu4  <base.hxaco> <profiled.co> <gate|down> <N> <outdir> [rounds]
 //   pmprof attn <base.hsaco> <profiled.co> <batch> <start> <outdir> [rounds]
 //   pmprof v2c  <base.hsaco> <profiled.co> <N> <outdir> [rounds]   (gfx1100; PM_V2C_W, PM_V2C_XQ)
+//   pmprof v2cx <base.co> <profiled.co> <set|add|silu> <site_dir> <N> <outdir> [rounds]
+//               (gfx1100 builder SET / ADD / gate-up SiLU on a dumped real site: <site_dir>/
+//               {A.bin|G.bin,U.bin},Xq.bin[,Y.bin],meta.txt; symbol PM_V2C_SYM or the product
+//               symbol of the kind; MROWS=<rows> uses the first rows of the dumped weight)
 //
 // For one real H2 shape it runs the uninstrumented and the profiled kernel on
 // identical inputs, compares every output byte (outputs are poisoned before
@@ -137,6 +141,7 @@ int main(int argc, char** argv) {
     Launch L{};
     std::string sym, outdir, shape;
     std::vector<Buf> outputs;       // compared byte-for-byte
+    Buf v2cx_residual{nullptr, 0};  // v2cx ADD: the dumped residual, restored into Y before timing
     unsigned waves_per_wg = 0;
     size_t slot_bytes = 0;
     int rounds = 0;
@@ -226,6 +231,43 @@ int main(int argc, char** argv) {
         L.args = {arg(W.p), arg(X.p), arg(Y.p), arg(M), arg(K), arg(N)};
         L.grid[0] = N / 128; L.grid[1] = M / 128; L.grid[2] = 1;
         L.block = 256; L.lds = 32768; waves_per_wg = 8; periods = K / 128;
+    } else if (mode == "v2cx") {
+        const std::string kind = argv[4], dir = argv[5];
+        const int N = atoi(argv[6]); outdir = argv[7]; rounds = argc > 8 ? atoi(argv[8]) : 8;
+        auto slurp = [](const std::string& path) {
+            FILE* f = fopen(path.c_str(), "rb"); if (!f) { fprintf(stderr, "open %s\n", path.c_str()); exit(1); }
+            fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+            std::vector<unsigned char> v(n); if (fread(v.data(), 1, n, f) != (size_t)n) exit(1); fclose(f); return v; };
+        auto mt = slurp(dir + "/meta.txt"); std::string meta_s(mt.begin(), mt.end());
+        auto field = [&](const std::string& k) {  // meta: "kind=set m=10240 k=5120 n=8192 call=2"
+            size_t i = meta_s.find(" " + k + "=");
+            if (i == std::string::npos) { fprintf(stderr, "meta lacks %s\n", k.c_str()); exit(2); }
+            return atoi(meta_s.c_str() + i + k.size() + 2); };
+        const char* rows = getenv("MROWS");
+        const int M = rows ? atoi(rows) : field("m"), K = field("k"), N0 = field("n");
+        const bool silu = kind == "silu", add = kind == "add";
+        if (!silu && !add && kind != "set") { fprintf(stderr, "v2cx kind must be set, add or silu\n"); return 2; }
+        if (N % 128 || N > N0 || M % 128 || K % 256) { fprintf(stderr, "v2cx shape\n"); return 2; }
+        const char* s_env = getenv("PM_V2C_SYM");
+        sym = s_env ? s_env : silu ? "gemm_mq4g256v2_gate_up_silu_iu4_pm_gfx1100"
+                    : add ? "gemm_mq4g256v2_residual_iu4_pm_add_gfx1100" : "gemm_mq4g256v2_residual_iu4_pm_set_gfx1100";
+        shape = "v2cx " + kind + " M=" + std::to_string(M) + " K=" + std::to_string(K) + " N=" + std::to_string(N) + " site=" + dir;
+        const size_t row_bytes = (size_t)(K / 256) * 136;
+        auto a = slurp(dir + (silu ? "/G.bin" : "/A.bin")); a.resize((size_t)M * row_bytes);
+        std::vector<unsigned char> x((size_t)(K / 128) * N * 72);
+        { auto x0 = slurp(dir + "/Xq.bin");
+          for (int h = 0; h < K / 128; ++h) memcpy(&x[(size_t)h * N * 72], &x0[(size_t)h * N0 * 72], (size_t)N * 72); }
+        Buf A = upload(a.data(), a.size()), X = upload(x.data(), x.size());
+        Buf Y = alloc(((size_t)M * N + 64) * sizeof(float));
+        outputs = {Y};
+        L.args = {arg(A.p)};
+        if (silu) { auto u = slurp(dir + "/U.bin"); u.resize((size_t)M * row_bytes); Buf U = upload(u.data(), u.size()); L.args.push_back(arg(U.p)); }
+        L.args.push_back(arg(X.p)); L.args.push_back(arg(Y.p));
+        L.args.push_back(arg(M)); L.args.push_back(arg(K)); L.args.push_back(arg(N));
+        // ADD reads its residual from Y: identity runs on the poison, timing on the dumped residual.
+        if (add) { auto y = slurp(dir + "/Y.bin"); y.resize((size_t)M * N * 4); v2cx_residual = upload(y.data(), y.size()); }
+        L.grid[0] = N / 128; L.grid[1] = (silu ? 2 * M : M) / 128; L.grid[2] = 1;
+        L.block = 256; L.lds = 32768; waves_per_wg = 8; periods = K / 128;
     } else if (mode == "attn") {
         const int batch = atoi(argv[4]), start = atoi(argv[5]);
         outdir = argv[6]; rounds = argc > 7 ? atoi(argv[7]) : 8;
@@ -293,6 +335,7 @@ int main(int argc, char** argv) {
     }
     size_t finite = 0, nonzero = 0, n0 = ref[0].size() / 4;
     for (size_t i = 0; i < n0; ++i) { float v; memcpy(&v, &ref[0][i * 4], 4); finite += std::isfinite(v); nonzero += v != 0.0f; }
+    if (v2cx_residual.p) CK(hipMemcpy(outputs[0].p, v2cx_residual.p, v2cx_residual.n, hipMemcpyDeviceToDevice));
 
     // Interleaved timing after a 3 s preheat of the baseline.
     hipEvent_t e0, e1; CK(hipEventCreate(&e0)); CK(hipEventCreate(&e1));

@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """DIAGNOSTIC: turn `peacemaker profile` records into phase statistics.
 
-    pmprof_analyze.py <profiled.map.json> <run_dir> <f2|attn|iu4|v2c> [out_dir]
+    pmprof_analyze.py <profiled.map.json> <run_dir> <f2|attn|iu4|v2c|v2cx> [out_dir]
 
 Reads run_dir/{trace.bin (or trace.bin.zst),meta.json} written by pmprof. Writes out_dir
 (default run_dir) summary.json, summary.md, waves.csv (one row per wave:
@@ -87,16 +87,32 @@ PHASES["v2c"] = {
     ("stage", "epilogue"): "last epoch (no staging) to epilogue",
     ("epilogue", "exit"): "epilogue: 16 b128 Y stores",
 }
-PERIOD = {"f2": "kblock", "attn": "tile", "iu4": "slab", "v2c": "epoch"}
+# gfx1100 builder SET / ADD / gate-up with the publish before fold pass 1
+# (points: epoch, pass, fold, stage = first rebias xor, s_barrier pre/post).
+PHASES["v2cx"] = {
+    ("epoch", "pass#1"): "metadata + staging VMEM issue, first fragment LDS wait",
+    ("pass#1", "fold#1"): "pass 0: 32 WMMA + fragment LDS loads",
+    ("fold#1", "pass#2"): "fold pass 0 (cvt, 8 DPP, 48 VOPD)",
+    ("pass#2", "stage"): "pass 1: 32 WMMA + fragment LDS loads",
+    ("stage", "fold#2"): "stage: VMEM wait, rebias, 4 DS stores (publish)",
+    ("fold#2", "bar.pre_signal"): "fold pass 1 (8 DPP, 48 VOPD) + LGKM drain",
+    ("bar.pre_signal", "bar.post_wait"): "s_barrier wait",
+    ("bar.post_wait", "epoch"): "epoch latch",
+    ("pass#2", "fold#2"): "last epoch: pass 1 WMMA (no staging)",
+    ("fold#2", "epilogue"): "last epoch: fold pass 1",
+    ("epilogue", "exit"): "epilogue",
+}
+PERIOD = {"f2": "kblock", "attn": "tile", "iu4": "slab", "v2c": "epoch", "v2cx": "epoch"}
 # Load issue -> first use: F2 weights/fragments are issued after block start;
 # iu4 VMEM is issued at slab start and its first drain follows 16 WMMAs.
 ISSUE_USE = {"f2": ("kblock", "w0.post"), "attn": ("fill.done", "bar.pre_signal"),
-             "iu4": ("slab", "vmem.post"), "v2c": ("epoch", "stage")}
+             "iu4": ("slab", "vmem.post"), "v2c": ("epoch", "stage"), "v2cx": ("epoch", "stage")}
 EXPOSED = {"f2": ("w0.pre", "w0.post"), "attn": ("bar.pre_drain", "bar.pre_signal"),
-           "iu4": ("vmem.pre", "vmem.post"), "v2c": ("bar.pre_signal", "bar.post_wait")}
+           "iu4": ("vmem.pre", "vmem.post"), "v2c": ("bar.pre_signal", "bar.post_wait"),
+           "v2cx": ("bar.pre_signal", "bar.post_wait")}
 QUALIFY = {"f2": {"bar.pre_signal", "bar.post_signal", "bar.post_wait"}, "attn": set(),
            "iu4": {"bar.pre_signal", "bar.post_signal", "bar.pre_wait", "bar.post_wait"},
-           "v2c": {"pass", "fold"}}
+           "v2c": {"pass", "fold"}, "v2cx": {"pass", "fold"}}
 
 
 def parse(map_path, run_dir):

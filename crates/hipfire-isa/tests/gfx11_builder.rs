@@ -79,13 +79,13 @@ fn v2c_is_deterministic_within_the_occupancy_ceiling() {
 
 #[test]
 fn v2c_steady_state_trip_matches_the_v2c_algorithm() {
-    // One trip = two K128 epochs; per epoch 64 K16 WMMAs, 2 x (8 DPP + 32
-    // mul/add + 16 fmac packets), 8 A rebias XORs, 4 + 4 staging loads,
-    // 40 fragment loads, 4 LDS stores and one barrier.
+    // One trip = two K128 epochs; per epoch 64 K16 WMMAs, 2 x (8 ds_swizzle
+    // scale broadcasts + 32 mul/add + 16 fmac packets), 8 A rebias XORs,
+    // 4 + 4 staging loads, 40 fragment loads, 4 LDS stores and one barrier.
     let census = iu4_v2c::hot_loop_census(&v2c().s_text);
     for (name, n) in [("v_wmma_i32_16x16x16_iu4", 128), ("vopd_packets", 192), ("v_dual_mul_f32", 128), ("v_dual_fmac_f32", 64),
-        ("v_mov_b32_dpp", 32), ("v_cvt_f32_f16_e64", 2), ("v_xor_b32_e32", 16), ("global_load_b64", 16), ("global_load_b32", 8),
-        ("global_load_u16", 2), ("ds_load_2addr_b64", 80), ("ds_store_2addr_b64", 8), ("s_barrier", 2), ("valu_slots", 242)] {
+        ("ds_swizzle_b32", 32), ("v_mov_b32_dpp", 0), ("v_cvt_f32_f16_e64", 2), ("v_xor_b32_e32", 16), ("global_load_b64", 16), ("global_load_b32", 8),
+        ("global_load_u16", 2), ("ds_load_2addr_b64", 80), ("ds_store_2addr_b64", 8), ("s_barrier", 2), ("valu_slots", 210)] {
         assert_eq!(census.get(name).copied().unwrap_or(0), n, "{name}");
     }
     for forbidden in ["buffer_gl0_inv", "s_nop", "v_nop", "scratch_load_b32"] { assert!(!census.contains_key(forbidden), "{forbidden}"); }
@@ -120,11 +120,14 @@ fn v2c_add_runs_the_set_k_loop_plus_a_gated_touch() {
 fn v2c_gate_up_trip_is_the_paired_set_fold_plus_up_scales() {
     let set = iu4_v2c::hot_loop_census(&v2c().s_text);
     let silu = iu4_v2c::hot_loop_census(&v2c_epi(iu4_v2c::Epi::Silu).s_text);
-    for (name, extra) in [("v_wmma_i32_16x16x16_iu4", 0), ("vopd_packets", 0), ("v_dual_mul_f32", 0), ("v_dual_fmac_f32", 0), ("v_mov_b32_dpp", 0),
+    for (name, extra) in [("v_wmma_i32_16x16x16_iu4", 0), ("vopd_packets", 0), ("ds_swizzle_b32", 0),
         ("v_cvt_f32_f16_e64", 2), ("global_load_u16", 2), ("global_load_b64", 0), ("global_load_b32", 0), ("ds_load_2addr_b64", 0),
         ("ds_store_2addr_b64", 0), ("s_barrier", 0), ("valu_slots", 2)] {
         assert_eq!(silu.get(name).copied().unwrap_or(0), set.get(name).copied().unwrap_or(0) + extra, "{name}");
     }
+    // The same 192 fold ops per pass pair mixed on gate/up: per pass 16
+    // mul::add + 8 mul::mul (X = mul) and 16 fmac::add + 8 fmac::fmac.
+    assert_eq!((silu["v_dual_mul_f32"], silu["v_dual_fmac_f32"]), (96, 96));
 }
 
 fn assemble(text: &str, arch: &str) {
@@ -262,6 +265,16 @@ fn committed_gfx1151_v2b_bundle_equals_fresh_emission() {
     let committed = std::fs::read(format!("{root}/{}.hxaco", iu4_v2b::MODULE)).unwrap();
     let text = iu4_v2b::emit_module(Arch::Gfx1151).unwrap().1;
     assert!(text_section(&link(&text, "gfx1151", iu4_v2b::MODULE)) == text_section(&committed), "fresh gfx1151 V2B emission differs from the committed bundle");
+}
+
+/// The runtime embeds the certified gfx1100 bundle: it must be exactly what
+/// the builder emits today.
+#[test]
+fn committed_gfx1100_v2c_bundle_equals_fresh_emission() {
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../kernels");
+    let committed = std::fs::read(format!("{root}/{}.hxaco", iu4_v2c::MODULE)).unwrap();
+    let text = iu4_v2c::module(Arch::Gfx1100, &iu4_v2c::Epi::ALL).unwrap().1;
+    assert!(text_section(&link(&text, "gfx1100", iu4_v2c::MODULE)) == text_section(&committed), "fresh gfx1100 V2C emission differs from the committed bundle");
 }
 
 #[cfg(feature = "toolchain")]

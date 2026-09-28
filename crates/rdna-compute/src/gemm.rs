@@ -447,6 +447,19 @@ fn gfx1100_pm_gemm(m: usize) -> bool {
     *GFX1100_PM_GEMM && m < (1 << 22)
 }
 
+/// Developer A/B of the gfx1100 builder bundle with one binary (for example
+/// the previous certified bundle as a same-binary opt-out):
+/// `HIPFIRE_GFX1100_PM_BUNDLE=<path>` loads it from a file instead of the
+/// embedded image. Read once; an unreadable file fails every launch that
+/// needs the bundle.
+static GFX1100_PM_BUNDLE: LazyLock<BundleOverride> =
+    LazyLock::new(|| g12_iu4_bundle_override("HIPFIRE_GFX1100_PM_BUNDLE"));
+
+#[inline]
+fn gfx1100_pm_image() -> HipResult<&'static [u8]> {
+    g12_iu4_bundle(&GFX1100_PM_BUNDLE, kernels::GEMM_MQ4G256V2_RESIDUAL_IU4_PM_GFX1100)
+}
+
 impl Gpu {
     /// Every condition of the gfx1201 builder `_b1` selection except the
     /// per-launch shape/pointer check ([`g12_iu4_b1_eligible`]).
@@ -20526,7 +20539,7 @@ impl Gpu {
             if pm {
                 self.ensure_embedded_kernel(
                     "gemm_mq4g256v2_residual_iu4_pm_gfx1100",
-                    kernels::GEMM_MQ4G256V2_RESIDUAL_IU4_PM_GFX1100,
+                    gfx1100_pm_image()?,
                     kernel_name,
                 )?;
             } else {
@@ -32857,7 +32870,7 @@ impl Gpu {
                 name
             }
             None if pm => {
-                self.ensure_embedded_kernel(module, kernels::GEMM_MQ4G256V2_RESIDUAL_IU4_PM_GFX1100, kernel_name)?;
+                self.ensure_embedded_kernel(module, gfx1100_pm_image()?, kernel_name)?;
                 kernel_name
             }
             None => {

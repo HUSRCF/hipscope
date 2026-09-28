@@ -198,7 +198,8 @@ pub fn lds_bounds(source: &str, symbol: &str, waves: u32, limit: u32) -> Result<
         let mut w = Wave { v: BTreeMap::new(), s: BTreeMap::new() };
         w.v.insert(0, std::array::from_fn(|l| Some(wave * 32 + l as u32)));
         for (i, (name, ops, rest)) in lines.iter().enumerate() {
-            if name.starts_with("ds_") {
+            // ds_swizzle_b32 exchanges lanes on the LDS crossbar and touches no LDS memory.
+            if name.starts_with("ds_") && *name != "ds_swizzle_b32" {
                 let addr_op = if name.starts_with("ds_store") { ops.first() } else { ops.get(1) };
                 let reg = addr_op.map(|o| o.split_whitespace().next().unwrap_or("")).and_then(|o| o.strip_prefix('v')).and_then(|n| n.parse::<u16>().ok())
                     .ok_or_else(|| format!("{name}: unparsed LDS address in `{rest}`"))?;
@@ -238,6 +239,13 @@ mod tests {
         assert!(lds_bounds(&unknown, "k", 1, 1 << 20).is_err());
         let redefined = K.replace(".Lk_end:", "\tv_add_nc_u32_e32 v2, 8, v2\n.Lk_end:");
         assert!(lds_bounds(&redefined, "k", 1, 1 << 20).is_err());
+    }
+    /// ds_swizzle_b32 touches no LDS memory: its operand is lane data that
+    /// the loop may redefine, and it adds nothing to the access bound.
+    #[test]
+    fn swizzle_is_not_an_lds_access() {
+        let swizzle = K.replace(".Lk_end:", "\tv_cvt_f32_f16_e64 v9, v8.l\n\tds_swizzle_b32 v10, v9 offset:swizzle(BROADCAST,16,3)\n.Lk_end:");
+        assert_eq!(lds_bounds(&swizzle, "k", 2, 1024).unwrap(), 256 + 248 + 256 + 8);
     }
     /// A scalar compare writes only SCC: the SGPR it reads stays known. A
     /// register-range write (an SMEM load, a 64-bit select) makes every
