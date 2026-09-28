@@ -13,6 +13,12 @@ pub fn validate_pair(arch:Arch,x:VopdOp,y:VopdOp)->Result<(),String> {
     if x.src1%4==y.src1%4 && !(arch.gfx12()&&x.src1==y.src1) {return Err("VOPD src1 bank collision".into())}
     let literals=[x.src0,y.src0].iter().filter_map(|s|if let Operand::Lit(n)=s {Some(*n)}else{None}).collect::<Vec<_>>();
     if literals.len()>1 && literals[0]!=literals[1] {return Err("VOPD supports only one shared literal".into())}
+    // gfx11 (LLVM `checkVOPDRegConstraints` pairing): neither half may read
+    // the other half's destination.
+    if !arch.gfx12() {
+        let reads=|op:VopdOp,reg:u8| op.src0==Operand::V(reg)||op.src1==reg;
+        if reads(y,x.dst)||reads(x,y.dst) {return Err("gfx11 VOPD half reads the other half's destination".into())}
+    }
     Ok(())
 }
 pub fn packet(arch:Arch,x:VopdOp,y:VopdOp)->Result<Instruction,String> {validate_pair(arch,x,y)?;let mut uses=vec![V::<1>(x.src1).reg(),V::<1>(y.src1).reg()];for op in [x.src0,y.src0] {if let Some(r)=op.reg(){uses.push(r)}}; if x.op==VopdF32::Fmac {uses.push(V::<1>(x.dst).reg())} if y.op==VopdF32::Fmac {uses.push(V::<1>(y.dst).reg())} Ok(Instruction::new(format!("{} :: {}",x.text(),y.text()),vec![V::<1>(x.dst).reg(),V::<1>(y.dst).reg()],uses)) }

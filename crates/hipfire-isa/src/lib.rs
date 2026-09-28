@@ -5,10 +5,11 @@
 //! and slot states before returning ownership. Foreign bytes become a region
 //! only after disassembly parse-back and independent wait-ledger replay.
 pub mod arch; pub mod reg; pub mod plan; pub mod ledger; pub mod hazard; pub mod vopd; pub mod lds; pub mod insn; pub mod emit; pub mod aco; pub mod profile;
-pub mod kernels { pub mod iu4_k1; pub mod iu4_gemm; pub mod fp8_gemm; pub mod gdn_scan; }
+pub mod kernels { pub mod iu4_k1; pub mod iu4_gemm; pub mod iu4_v2c; pub mod fp8_gemm; pub mod gdn_scan; }
 #[cfg(feature="toolchain")] pub mod toolchain;
 #[cfg(feature="toolchain")] pub mod ledger_replay;
 #[cfg(feature="toolchain")] pub mod audit;
+#[cfg(feature="toolchain")] pub mod pm_check;
 pub use arch::Arch;
 pub use reg::{RegPlan,V,S};
 pub use plan::{KernelSpec,KernargLayout,Emitted,BuilderProof,IsaShape,MemoryScope};
@@ -25,8 +26,15 @@ use sha2::{Sha256,Digest};
 fn load_ds_wait_imm(load_count:u8,ds_count:u8)->u16 {
  (u16::from(load_count)<<8)|u16::from(ds_count)
 }
+/// The two counters one combined wait retires: gfx12 `s_wait_loadcnt_dscnt`
+/// (LOADcnt, DScnt) or the gfx11 `s_waitcnt` fields (VMcnt, LGKMcnt; RDNA3
+/// ISA §16.5: VM[15:10], LGKM[9:4], EXP[2:0]).
+fn combined_wait(arch:Arch,first:u8,second:u8)->(Counter,Counter,String) {
+ if arch.gfx12(){(Counter::Load,Counter::Ds,format!("s_wait_loadcnt_dscnt {:#x}",load_ds_wait_imm(first,second)))}
+ else{(Counter::Vm,Counter::Lgkm,format!("s_waitcnt vmcnt({first}) lgkmcnt({second})"))}
+}
 impl Builder {
- pub fn new(spec:KernelSpec,regs:RegPlan)->Self {let arch=spec.arch;Self{spec,regs,program:Program{arch,instructions:vec![]},ledger:Ledger::default(),lds:Lds::default(),waits:vec![],hazards:vec![],clauses:vec![],barriers:vec![],loop_fixpoints:vec![],hazard:Gfx12Sgpr::default(),gfx11_hazard:Gfx11Hazards::default(),delay_alu:None,labels:vec!["entry".into()],current_label:"entry".into(),lds_access_allowed:false,previous_wmma_dst:None,pending_barrier:None}}
+ pub fn new(spec:KernelSpec,regs:RegPlan)->Self {let arch=spec.arch;Self{spec,regs,program:Program{arch,instructions:vec![]},ledger:Ledger::default(),lds:Lds::default(),waits:vec![],hazards:vec![],clauses:vec![],barriers:vec![],loop_fixpoints:vec![],hazard:Gfx12Sgpr::default(),gfx11_hazard:Gfx11Hazards::for_arch(arch),delay_alu:None,labels:vec!["entry".into()],current_label:"entry".into(),lds_access_allowed:false,previous_wmma_dst:None,pending_barrier:None}}
  /// Emit `s_delay_alu` issue hints before dependent VALU instructions (see
  /// `hazard::DelayAlu`). Opt-in, so existing kernels keep their bytes.
  pub fn enable_delay_alu(&mut self){self.delay_alu=Some(DelayAlu::default())}
@@ -34,21 +42,20 @@ impl Builder {
  fn emit_wait(&mut self,c:Counter,n:u8,reason:Reason)->Result<(),String> {let entries=Ledger::wait_instruction(self.spec.arch,&[(c,n,reason.clone())])?;for (_,_,text,_) in entries {let pc_index=self.program.instructions.len();self.program.instructions.push(Instruction::new(text.clone(),vec![],vec![]));self.waits.push(WaitProof{pc_index,insn:text,counter:c,count:n,reason:reason.clone()})}self.ledger.wait(c,n);Ok(())}
  pub fn wait(&mut self,c:Counter,n:u8)->Result<(),String>{self.emit_wait(c,n,Reason::Barrier)}
  fn emit_required(&mut self,mut required:Vec<(Counter,u8,Reason)>)->Result<(),String>{
-  if self.spec.arch.gfx12(){
-   let load=required.iter().position(|(counter,_,_)|*counter==Counter::Load);
-   let ds=required.iter().position(|(counter,_,_)|*counter==Counter::Ds);
-   if let (Some(load),Some(ds))=(load,ds){
-    let (load_count,load_reason)=(required[load].1,required[load].2.clone());
-    let (ds_count,ds_reason)=(required[ds].1,required[ds].2.clone());
-    let text=format!("s_wait_loadcnt_dscnt {:#x}",load_ds_wait_imm(load_count,ds_count));
-    let pc_index=self.program.instructions.len();
-    self.program.instructions.push(Instruction::new(text.clone(),vec![],vec![]));
-    self.waits.push(WaitProof{pc_index,insn:text.clone(),counter:Counter::Load,count:load_count,reason:load_reason});
-    self.waits.push(WaitProof{pc_index,insn:text,counter:Counter::Ds,count:ds_count,reason:ds_reason});
-    self.ledger.wait(Counter::Load,load_count);
-    self.ledger.wait(Counter::Ds,ds_count);
-    required.retain(|(counter,_,_)|!matches!(counter,Counter::Load|Counter::Ds));
-   }
+  let (first_counter,second_counter,_)=combined_wait(self.spec.arch,0,0);
+  let first=required.iter().position(|(counter,_,_)|*counter==first_counter);
+  let second=required.iter().position(|(counter,_,_)|*counter==second_counter);
+  if let (Some(first),Some(second))=(first,second){
+   let (first_count,first_reason)=(required[first].1,required[first].2.clone());
+   let (second_count,second_reason)=(required[second].1,required[second].2.clone());
+   let (_,_,text)=combined_wait(self.spec.arch,first_count,second_count);
+   let pc_index=self.program.instructions.len();
+   self.program.instructions.push(Instruction::new(text.clone(),vec![],vec![]));
+   self.waits.push(WaitProof{pc_index,insn:text.clone(),counter:first_counter,count:first_count,reason:first_reason});
+   self.waits.push(WaitProof{pc_index,insn:text,counter:second_counter,count:second_count,reason:second_reason});
+   self.ledger.wait(first_counter,first_count);
+   self.ledger.wait(second_counter,second_count);
+   required.retain(|(counter,_,_)|*counter!=first_counter&&*counter!=second_counter);
   }
   for (counter,count,reason) in required {self.emit_wait(counter,count,reason)?}
   Ok(())
@@ -67,7 +74,7 @@ impl Builder {
   if !self.spec.arch.gfx12(){for text in self.gfx11_hazard.step(pipe,mnemonic,&insn.uses,&insn.defs){
    let pc_index=self.program.instructions.len();
    self.program.instructions.push(Instruction::new(text.clone(),vec![],vec![]));
-   self.hazards.push(HazardProof{pc_index,insn:text,rule:"gfx11 wave32 trans-use / VMEM SGPR dependence".into()});
+   self.hazards.push(HazardProof{pc_index,insn:text,rule:"gfx1100 wave32 TRANS-use (VALUTransUseHazard)".into()});
   }}
   if mnemonic.starts_with("v_wmma_")||mnemonic.starts_with("v_swmmac_"){
    let dst=*insn.defs.first().ok_or("WMMA destination is missing from instruction defs")?;
@@ -81,7 +88,12 @@ impl Builder {
    }
    self.previous_wmma_dst=Some(dst);
   }else if pipe==Pipeline::Valu{self.previous_wmma_dst=None}
-  if pipe==Pipeline::Valu{if let Some(text)=self.delay_alu.as_mut().and_then(|d|d.step(mnemonic,&insn.uses,&insn.defs)){
+  // gfx11 WMMA chains accumulate in the matrix core, where LLVM emits no
+  // `s_delay_alu`: a WMMA counts as an issued VALU but neither takes a hint
+  // nor becomes a hint producer.
+  let matrix=mnemonic.starts_with("v_wmma_")||mnemonic.starts_with("v_swmmac_");
+  if pipe==Pipeline::Valu&&matrix&&!self.spec.arch.gfx12(){if let Some(d)=&mut self.delay_alu{d.step(mnemonic,&[],&[]);}}
+  else if pipe==Pipeline::Valu{if let Some(text)=self.delay_alu.as_mut().and_then(|d|d.step(mnemonic,&insn.uses,&insn.defs)){
    let pc_index=self.program.instructions.len();
    self.program.instructions.push(Instruction::new(text.clone(),vec![],vec![]));
    self.hazards.push(HazardProof{pc_index,insn:text,rule:"VALU dependency issue hint".into()});

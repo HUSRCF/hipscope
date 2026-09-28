@@ -4,6 +4,7 @@
 //   pmprof f2   <base.hsaco> <profiled.co> <N> <outdir> [rounds]
 //   pmprof iu4  <base.hxaco> <profiled.co> <gate|down> <N> <outdir> [rounds]
 //   pmprof attn <base.hsaco> <profiled.co> <batch> <start> <outdir> [rounds]
+//   pmprof v2c  <base.hsaco> <profiled.co> <N> <outdir> [rounds]   (gfx1100; PM_V2C_W, PM_V2C_XQ)
 //
 // For one real H2 shape it runs the uninstrumented and the profiled kernel on
 // identical inputs, compares every output byte (outputs are poisoned before
@@ -204,6 +205,27 @@ int main(int argc, char** argv) {
         L.grid[0] = (gate ? 2 * M : M) / 128;
         L.grid[1] = (N + 127) / 128; L.grid[2] = 1;
         L.block = 256; L.lds = 20480; waves_per_wg = 8; periods = xblocks;
+    } else if (mode == "v2c") {
+        // gfx1100 builder V2C-equivalent SET: real inputs from PM_V2C_W /
+        // PM_V2C_XQ (MQ4G256V2 rows, block_i4_128[h*N + t]), M17408 K5120.
+        const int N = atoi(argv[4]); outdir = argv[5]; rounds = argc > 6 ? atoi(argv[6]) : 8;
+        const int M = 17408, K = 5120;
+        sym = "gemm_mq4g256v2_residual_iu4_pm_set_gfx1100";
+        shape = "v2c SET M=17408 K=5120 N=" + std::to_string(N);
+        const char* wp = getenv("PM_V2C_W"); const char* xp = getenv("PM_V2C_XQ");
+        if (!wp || !xp) { fprintf(stderr, "v2c mode needs PM_V2C_W and PM_V2C_XQ\n"); return 2; }
+        auto slurp = [](const char* path) {
+            FILE* f = fopen(path, "rb"); if (!f) { fprintf(stderr, "open %s\n", path); exit(1); }
+            fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+            std::vector<unsigned char> v(n); if (fread(v.data(), 1, n, f) != (size_t)n) exit(1); fclose(f); return v; };
+        auto w = slurp(wp), x = slurp(xp);
+        if (w.size() != (size_t)M * (K / 256) * 136 || x.size() != (size_t)(K / 128) * N * 72) { fprintf(stderr, "v2c input sizes\n"); return 2; }
+        Buf W = upload(w.data(), w.size()), X = upload(x.data(), x.size());
+        Buf Y = alloc(((size_t)M * N + 64) * sizeof(float));
+        outputs = {Y};
+        L.args = {arg(W.p), arg(X.p), arg(Y.p), arg(M), arg(K), arg(N)};
+        L.grid[0] = N / 128; L.grid[1] = M / 128; L.grid[2] = 1;
+        L.block = 256; L.lds = 32768; waves_per_wg = 8; periods = K / 128;
     } else if (mode == "attn") {
         const int batch = atoi(argv[4]), start = atoi(argv[5]);
         outdir = argv[6]; rounds = argc > 7 ? atoi(argv[7]) : 8;

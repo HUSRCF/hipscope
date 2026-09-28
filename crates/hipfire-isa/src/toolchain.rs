@@ -108,6 +108,9 @@ pub struct IsaShapeResult {
     pub max_used_sgpr: Option<u32>,
     #[serde(skip_serializing_if="Option::is_none")]
     pub descriptor_vgpr_reservation: Option<u32>,
+    /// gfx11: M7 lift/emit identity and whole-program analysis summary.
+    #[serde(skip_serializing_if="Option::is_none")]
+    pub m7_analysis: Option<serde_json::Value>,
 }
 
 fn instruction(line: &str) -> Option<&str> {
@@ -365,6 +368,18 @@ pub fn disassemble_code_object(toolchain: &Toolchain, input: &Path, arch: &str) 
     let _ = fs::remove_file(temporary);
     result
 }
+/// `.max_flat_workgroup_size` of `symbol` in the source's code-object metadata.
+fn workgroup_size(source: &str, symbol: &str) -> Result<u32> {
+    let lines: Vec<&str> = source.lines().map(str::trim).collect();
+    let name = lines.iter().position(|l| l.strip_prefix(".name:").is_some_and(|n| n.trim() == symbol))
+        .ok_or_else(|| format!("{symbol}: no metadata entry"))?;
+    lines[..name].iter().rev().take_while(|l| !l.starts_with("- ")).find_map(|l| l.strip_prefix(".max_flat_workgroup_size:"))
+        .and_then(|n| n.trim().parse().ok()).ok_or_else(|| format!("{symbol}: no .max_flat_workgroup_size"))
+}
+/// Wait-counter model of a certification target: gfx1200 shares gfx1201's.
+fn wait_arch(arch: &str) -> Result<crate::Arch> {
+    if arch == "gfx1200" { Ok(crate::Arch::Gfx1201) } else { arch.parse() }
+}
 /// The external commands are deliberately fixed: no HIP compilation or compression.
 pub fn assemble_link_bundle(toolchain: &Toolchain, source: &Path, output: &Path,
     arch: &str) -> Result<BuildOutput> {
@@ -415,7 +430,8 @@ pub fn certify(toolchain: &Toolchain, build: &BuildOutput, source: &Path, arch: 
         // The register-use audit covers every builder symbol that reuses
         // registers across phases: F2 and the fused A4 GDN projection.
         let gdn_iu4=contract.symbol.contains("_iu4_qkvzagdn_");
-        if contract.symbol.starts_with("gemm_mq4g256v2_fp8_") || gdn_iu4 {
+        let gfx11=matches!(arch,"gfx1100"|"gfx1151");
+        if contract.symbol.starts_with("gemm_mq4g256v2_fp8_") || gdn_iu4 || gfx11 {
             let mut highest_v=0u32;
             let mut highest_s=0u32;
             let mut in_symbol=false;
@@ -464,8 +480,19 @@ pub fn certify(toolchain: &Toolchain, build: &BuildOutput, source: &Path, arch: 
             shape.launch_dynamic_lds_bytes=Some(dynamic);
             shape.max_lds_access_end=Some(max_end);
         }
+        if gfx11 {
+            // Every gfx11 builder kernel: an all-lane LDS bound over the launch
+            // allocation, then M7's lift/emit identity and analyses.
+            let dynamic=contract.launch_dynamic_lds_bytes.ok_or("gfx11 contract missing launch dynamic LDS bytes")?;
+            let source_text=fs::read_to_string(source).map_err(|e|e.to_string())?;
+            let waves=workgroup_size(&source_text,&contract.symbol)?.div_ceil(32);
+            let max_end=crate::pm_check::lds_bounds(&source_text,&contract.symbol,waves,kd.group_segment_size+dynamic)?;
+            shape.launch_dynamic_lds_bytes=Some(dynamic);
+            shape.max_lds_access_end=Some(max_end);
+            shape.m7_analysis=Some(crate::pm_check::m7(&build.elf,arch,&contract.symbol)?);
+        }
         crate::ledger_replay::replay_waits(
-            &fs::read_to_string(source).map_err(|e| e.to_string())?
+            &fs::read_to_string(source).map_err(|e| e.to_string())?, wait_arch(arch)?
         )?;
         invoke(&toolchain.readobj,
             &["--sections".into(), build.elf.display().to_string()])?;

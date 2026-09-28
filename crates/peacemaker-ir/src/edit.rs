@@ -708,6 +708,17 @@ fn entry_seed(kern: &Kernel, arch: Arch) -> Result<Bits, EditError> {
     if !matches!(arch, Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1201) { return Err(EditError::Unsupported(format!("no ABI entry table for {arch:?}"))); }
     let mut seed = Bits::default();
     let (user, wg_x, wg_yz) = match &kern.abi {
+        // gfx11 (RDNA3 ISA §3.3 / LLVM AMDHSA): the system SGPRs follow the
+        // COMPUTE_PGM_RSRC2.USER_SGPR_COUNT user SGPRs in order TGID_X
+        // (bit 7), TGID_Y (bit 8), TGID_Z (bit 9), TG_SIZE (bit 10); there
+        // are no workgroup-id TTMPs.
+        Abi::Hsa { descriptor, .. } if arch != Arch::Gfx1201 => {
+            let rsrc2 = descriptor.compute_pgm_rsrc2.0;
+            let user = (rsrc2 >> 1 & 0x1f) as usize;
+            let system = (7..=10).filter(|bit| rsrc2 >> bit & 1 != 0).count();
+            for s in 0..(user + system).min(106) { seed.dword(S0 + s); }
+            (0, false, false)
+        }
         Abi::Hsa { descriptor, .. } => {
             let props = descriptor.kernel_code_properties.0;
             let sizes = [4usize, 2, 2, 2, 2, 2, 1];

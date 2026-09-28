@@ -69,7 +69,7 @@ fn run() -> Result<(), String> {
 fn usage() -> &'static str {
     "usage: peacemaker custom build --arch gfx1201 --s file.s --out file.hsaco --manifest file.json [--contract shape.json --proof proof.json] [--host-target triple]\n\
      peacemaker audit --arch gfx1201 (--source file.hip | --hsaco file.hsaco) [--prepend header.hip] [--define NAME=VALUE] [--flag FLAG] [--intent intent.json] [--json report.json] [--markdown report.md] [--sweep-profiles]\n\
-     peacemaker profile --arch gfx1201 --s module.s --points points.json --out diag.hsaco   (DIAGNOSTIC build: writes diag.s, diag.map.json, diag.co)"
+     peacemaker profile --arch gfx1201|gfx1100|gfx1151 --s module.s --points points.json --out diag.hsaco   (DIAGNOSTIC build: writes diag.s, diag.map.json, diag.co)"
 }
 
 /// DIAGNOSTIC: instrument one kernel with timestamp records, verify the
@@ -89,19 +89,19 @@ fn run_profile(mut args: impl Iterator<Item=String>) -> Result<(), String> {
         }
     }
     let arch = arch.ok_or("missing --arch")?;
-    if !arch.starts_with("gfx12") { return Err("profile targets gfx12 wave32 kernels".into()) }
+    let target: hipfire_isa::Arch = arch.parse()?;
     let source_path = source.ok_or("missing --s")?;
     let output = output.ok_or("missing --out")?;
     let read = |p: &PathBuf| fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()));
     let source = read(&source_path)?;
     let config: profile::Config = serde_json::from_str(&read(&points.ok_or("missing --points")?)?)
         .map_err(|e| format!("points: {e}"))?;
-    let (text, map) = profile::instrument(&source, &config)?;
+    let (text, map) = profile::instrument(&source, &config, target)?;
     profile::verify(&source, &text, &map)?;
     // The independent wait replay must find exactly the original's hazards
     // (none for builder kernels; hipcc's interlocked DS-source reuse otherwise).
-    let original_replay = replay_hazards(&profile::kernel_body(&source, &map.symbol)?)?;
-    let profiled_replay = replay_hazards(&profile::kernel_body(&text, &map.profiled_symbol)?)?;
+    let original_replay = replay_hazards(&profile::kernel_body(&source, &map.symbol)?, target)?;
+    let profiled_replay = replay_hazards(&profile::kernel_body(&text, &map.profiled_symbol)?, target)?;
     if original_replay != profiled_replay {
         return Err(format!("wait replay: profiled kernel has {} hazards, original {}", profiled_replay.len(), original_replay.len()));
     }

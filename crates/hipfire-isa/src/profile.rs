@@ -1,6 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 //! DIAGNOSTIC ONLY: `peacemaker profile` in-kernel timestamp instrumentation.
 //!
+//! gfx11 (gfx1100/gfx1151) differs from the gfx12 description below only in
+//! its instructions (`/home/kaden/qcal/peacemaker/probes/timers.md`): points
+//! read the 20-bit `HW_REG_SHADER_CYCLES` (same-wave deltas, wrap handled by
+//! the analyzer); entry/exit read the 64-bit 100 MHz clock with
+//! `s_sendmsg_rtn_b64 MSG_RTN_GET_REALTIME` + `s_waitcnt lgkmcnt(0)`;
+//! workgroup ids are the system SGPRs after the user SGPRs; records go out
+//! through `global_store_b32 vO, vD, s[p:p+1] offset:-bytes` whose per-lane
+//! offset VGPR `vO` is advanced first (VALU, no SCC) under EXEC 0xff, and
+//! `s_waitcnt_depctr depctr_vm_vsrc(0)` precedes each rewrite of vD/vO.
+//! Records count in VScnt, so every original `s_waitcnt_vscnt` must be 0.
+//! Each gfx11 point adds three VALU instructions (hint fix-ups use 3).
+//!
 //! The pass rewrites one wave32 gfx12 kernel in an assembly module (builder
 //! output or a hipcc `-save-temps` `.s`) into `<symbol>__pm_profile`, which
 //! stores a per-wave record at every named point. The profiled symbol is a
@@ -45,6 +57,7 @@
 //! point adds two VALU instructions, so an original `VALU_DEP_n` hint whose
 //! producer precedes a point is rewritten to `VALU_DEP_{n+2k}` (or `NO_DEP`
 //! beyond 4). Hints never change results; they are kept exact.
+use crate::Arch;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
@@ -59,7 +72,7 @@ pub const BEGIN: &str = "; @pm-profile begin";
 pub const END: &str = "; @pm-profile end";
 const SGPR_LIMIT: u16 = 106;
 const VGPR_GRANULE: u16 = 24;
-const POINT_VALU: usize = 2;
+fn point_valu(arch: Arch) -> usize { if arch.gfx12() { 2 } else { 3 } }
 
 /// One named point family. Exactly one of `label`, `before`, `after`.
 /// `before`/`after` match instructions whose text starts with the prefix;
@@ -90,13 +103,21 @@ pub struct DelayFixup { pub line: usize, pub before: String, pub after: String }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Registers {
-    pub scratch_vgpr: u16, pub pointer: u16, pub timestamp: u16, pub exec_save: u16,
+    pub scratch_vgpr: u16,
+    /// gfx11 only: the per-lane record offset VGPR.
+    #[serde(default)] pub offset_vgpr: Option<u16>,
+    pub pointer: u16, pub timestamp: u16, pub exec_save: u16,
     pub entry_quad: u16, pub entry_pair: u16, pub realtime_pair: u16, pub entry_singles: Vec<u16>,
+    /// gfx11 only: workgroup-id system SGPRs the entry header reads.
+    #[serde(default)] pub workgroup_ids: Vec<u16>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Map {
     pub diagnostic: String,
+    #[serde(default = "default_arch")] pub arch: Arch,
+    /// Width of the point cycle counter (gfx12 SHADER_CYCLES_LO 32, gfx11 20).
+    #[serde(default = "default_cycle_bits")] pub cycle_bits: u32,
     pub symbol: String,
     pub profiled_symbol: String,
     pub kernarg_size: u32,
@@ -114,6 +135,9 @@ pub struct Map {
     pub sites: Vec<Site>,
     pub delay_fixups: Vec<DelayFixup>,
 }
+
+fn default_arch() -> Arch { Arch::Gfx1201 }
+fn default_cycle_bits() -> u32 { 32 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Kind { Insn, Label, Other }
@@ -152,7 +176,7 @@ pub fn registers(text: &str, class: u8) -> BTreeSet<u16> {
     out
 }
 
-struct Descriptor { kernarg: u32, vgpr: u16, sgpr: u16, inputs: u16 }
+struct Descriptor { kernarg: u32, vgpr: u16, sgpr: u16, inputs: u16, user: u16, wg_y: bool, wg_z: bool }
 
 fn descriptor(lines: &[&str], symbol: &str) -> Result<(usize, usize, Descriptor), String> {
     let start = lines.iter().position(|l| code(l) == format!(".amdhsa_kernel {symbol}"))
@@ -174,6 +198,9 @@ fn descriptor(lines: &[&str], symbol: &str) -> Result<(usize, usize, Descriptor)
         vgpr: get(".amdhsa_next_free_vgpr").ok_or("missing literal .amdhsa_next_free_vgpr")? as u16,
         sgpr: get(".amdhsa_next_free_sgpr").ok_or("missing literal .amdhsa_next_free_sgpr")? as u16,
         inputs: (get(".amdhsa_user_sgpr_count").ok_or("missing .amdhsa_user_sgpr_count")? + sys) as u16,
+        user: get(".amdhsa_user_sgpr_count").unwrap_or(0) as u16,
+        wg_y: get(".amdhsa_system_sgpr_workgroup_id_y") == Some(1),
+        wg_z: get(".amdhsa_system_sgpr_workgroup_id_z") == Some(1),
     };
     Ok((start, end, d))
 }
@@ -289,11 +316,15 @@ fn settle(mut at: usize, down: bool, rule: &Rule, win: &[(usize, usize)], anchor
     Gap { at, rule: rule.name.clone(), anchor: anchor.to_string(), moved }
 }
 
-struct Regs { v: u16, p: u16, t: u16, e: u16, q: u16, r: u16, rt: u16, singles: Vec<u16> }
+struct Regs { v: u16, o: Option<u16>, p: u16, t: u16, e: u16, q: u16, r: u16, rt: u16, singles: Vec<u16> }
 
-fn pick(dsc: &Descriptor, vgpr_limit: u16, used_v: &BTreeSet<u16>, used_s: &BTreeSet<u16>) -> Result<Regs, String> {
-    let v = (0..vgpr_limit).rev().find(|n| !used_v.contains(n))
+fn pick(arch: Arch, dsc: &Descriptor, vgpr_limit: u16, used_v: &BTreeSet<u16>, used_s: &BTreeSet<u16>) -> Result<Regs, String> {
+    let mut free_v = (0..vgpr_limit).rev().filter(|n| !used_v.contains(n));
+    let v = free_v.next()
         .ok_or_else(|| format!("no unreferenced VGPR below the occupancy ceiling v{vgpr_limit}"))?;
+    let o = if arch.gfx12() { None } else {
+        Some(free_v.next().ok_or_else(|| format!("gfx11 profile needs two unreferenced VGPRs below v{vgpr_limit}"))?)
+    };
     let mut taken: BTreeSet<u16> = (0..dsc.inputs).collect();
     let free = |taken: &BTreeSet<u16>, n: u16, align: u16, unused_only: bool| (0..SGPR_LIMIT).step_by(align as usize)
         .find(|&b| b + n <= SGPR_LIMIT && (b..b + n).all(|r| !taken.contains(&r) && (!unused_only || !used_s.contains(&r))));
@@ -311,7 +342,7 @@ fn pick(dsc: &Descriptor, vgpr_limit: u16, used_v: &BTreeSet<u16>, used_s: &BTre
     let r = take(&mut taken, 2, 2, false)?;
     let rt = take(&mut taken, 2, 2, false)?;
     let singles = (0..6).map(|_| take(&mut taken, 1, 1, false)).collect::<Result<Vec<_>, _>>()?;
-    Ok(Regs { v, p, t, e, q, r, rt, singles })
+    Ok(Regs { v, o, p, t, e, q, r, rt, singles })
 }
 
 /// Immediates as the disassembler prints them: inline constants in decimal,
@@ -394,6 +425,81 @@ fn exit(r: &Regs, id: u32, va_sdst: bool) -> Vec<String> {
     s
 }
 
+/// gfx11 record store: advance the lanes' offsets first (VALU under EXEC
+/// 0xff: no SCC), then store `lanes` dwords at `offset:-bytes`.
+fn store11(r: &Regs, lanes: u32, bytes: u32) -> Vec<String> {
+    let (p, p1, o) = (r.p, r.p + 1, r.o.expect("gfx11 offset VGPR"));
+    vec![format!("s_mov_b32 s{}, exec_lo", r.e),
+        "s_mov_b32 exec_lo, 0xff".into(),
+        format!("v_add_nc_u32_e32 v{o}, {}, v{o}", imm(bytes)),
+        format!("s_mov_b32 exec_lo, {}", imm((1u32 << lanes) - 1)),
+        format!("global_store_b32 v{o}, v{}, s[{p}:{p1}] offset:-{bytes}", r.v),
+        format!("s_mov_b32 exec_lo, s{}", r.e)]
+}
+
+fn point11(r: &Regs, id: u32, name: &str) -> Vec<String> {
+    let mut s = vec![format!("{BEGIN} site {id} {name}"),
+        format!("s_getreg_b32 s{}, hwreg(HW_REG_SHADER_CYCLES, 0, 20)", r.t),
+        "s_waitcnt_depctr depctr_vm_vsrc(0)".into(),
+        format!("v_writelane_b32 v{}, s{}, 0", r.v, r.t),
+        format!("v_writelane_b32 v{}, {}, 1", r.v, imm(id))];
+    s.extend(store11(r, 2, RECORD_BYTES));
+    s.push(END.into());
+    s
+}
+
+fn entry11(r: &Regs, dsc: &Descriptor, ext: u32) -> Result<Vec<String>, String> {
+    if dsc.wg_z { return Err("gfx11 profile supports x/y workgroup grids".into()) }
+    let [w, h1, h2, ch, z, l] = [r.singles[0], r.singles[1], r.singles[2], r.singles[3], r.singles[4], r.singles[5]];
+    let (q, rr, rt, p, o) = (r.q, r.r, r.rt, r.p, r.o.expect("gfx11 offset VGPR"));
+    let wgx = dsc.user;
+    let mut s = vec![format!("{BEGIN} entry header (DIAGNOSTIC: never embed)"),
+        format!("s_load_b128 s[{q}:{}], s[0:1], {ext:#x}", q + 3),
+        format!("s_load_b64 s[{rr}:{}], s[0:1], {:#x}", rr + 1, ext + 16),
+        format!("s_getreg_b32 s{h1}, hwreg(HW_REG_HW_ID1)"),
+        format!("s_getreg_b32 s{h2}, hwreg(HW_REG_HW_ID2)"),
+        format!("s_getreg_b32 s{ch}, hwreg(HW_REG_SHADER_CYCLES, 0, 20)"),
+        format!("v_readfirstlane_b32 s{w}, v0"),
+        format!("s_sendmsg_rtn_b64 s[{rt}:{}], sendmsg(MSG_RTN_GET_REALTIME)", rt + 1),
+        "s_waitcnt lgkmcnt(0)".into(),
+        format!("s_and_b32 s{w}, s{w}, 0x3ff"),
+        format!("s_lshr_b32 s{w}, s{w}, 5")];
+    // Linear workgroup (x + grid_x*y) and wave w = wg*waves_per_wg + wave_in_wg.
+    if dsc.wg_y { s.push(format!("s_mul_i32 s{z}, s{}, s{rr}", wgx + 1)); } else { s.push(format!("s_mov_b32 s{z}, 0")); }
+    s.extend([format!("s_add_i32 s{z}, s{z}, s{wgx}"),
+        format!("s_mul_i32 s{l}, s{z}, s{}", q + 3),
+        format!("s_add_i32 s{l}, s{l}, s{w}"),
+        format!("s_mul_i32 s{p}, s{l}, s{}", q + 2),
+        format!("s_mul_hi_u32 s{}, s{l}, s{}", p + 1, q + 2),
+        format!("s_add_u32 s{p}, s{p}, s{q}"),
+        format!("s_addc_u32 s{}, s{}, s{}", p + 1, p + 1, q + 1),
+        format!("v_and_b32_e32 v{o}, 31, v0"),
+        format!("v_lshlrev_b32_e32 v{o}, 2, v{o}"),
+        format!("v_writelane_b32 v{}, {MAGIC:#x}, 0", r.v)]);
+    for (lane, src) in [h1, h2, z, w, rt, rt + 1, ch].into_iter().enumerate() {
+        s.push(format!("v_writelane_b32 v{}, s{src}, {}", r.v, lane + 1));
+    }
+    s.extend(store11(r, 8, HEADER_BYTES));
+    s.push(END.into());
+    s.extend(point11(r, 0, "entry"));
+    Ok(s)
+}
+
+fn exit11(r: &Regs, id: u32) -> Vec<String> {
+    let mut s = vec![format!("{BEGIN} site {id} exit"),
+        format!("s_getreg_b32 s{}, hwreg(HW_REG_SHADER_CYCLES, 0, 20)", r.t),
+        format!("s_sendmsg_rtn_b64 s[{}:{}], sendmsg(MSG_RTN_GET_REALTIME)", r.rt, r.rt + 1),
+        "s_waitcnt lgkmcnt(0)".into(),
+        "s_waitcnt_depctr depctr_vm_vsrc(0)".into(),
+        format!("v_writelane_b32 v{}, s{}, 0", r.v, r.t),
+        format!("v_writelane_b32 v{}, {:#x}, 1", r.v, id | EXIT_FLAG),
+        format!("v_writelane_b32 v{}, s{}, 2", r.v, r.rt),
+        format!("v_writelane_b32 v{}, s{}, 3", r.v, r.rt + 1)];
+    s.extend(store11(r, 4, EXIT_RECORD_BYTES));
+    s.push(END.into());
+    s
+}
+
 fn rename(text: &str, from: &str, to: &str) -> String {
     let mut out = String::with_capacity(text.len() + 256);
     let mut rest = text;
@@ -418,7 +524,7 @@ fn set_value(line: &str, value: impl std::fmt::Display) -> String {
 }
 
 /// Instrument `symbol` in `source`. Returns the rewritten module and the map.
-pub fn instrument(source: &str, cfg: &Config) -> Result<(String, Map), String> {
+pub fn instrument(source: &str, cfg: &Config, arch: Arch) -> Result<(String, Map), String> {
     let sym = cfg.symbol.as_str();
     let lines: Vec<&str> = source.lines().collect();
     let start = lines.iter().position(|l| code(l) == format!("{sym}:")).ok_or_else(|| format!("kernel label {sym}: not found"))?;
@@ -435,14 +541,20 @@ pub fn instrument(source: &str, cfg: &Config) -> Result<(String, Map), String> {
         used_v.extend(registers(c, b'v'));
         used_s.extend(registers(c, b's'));
         valu_exec_writer |= mnemonic(c).starts_with("v_cmpx");
-        if let Some(rest) = c.strip_prefix("s_wait_storecnt_dscnt ") {
+        if !arch.gfx12() {
+            if let Some(rest) = c.strip_prefix("s_waitcnt_vscnt ") {
+                let n = rest.rsplit(',').next().unwrap_or("").trim();
+                if parse_imm(n)? != 0 { return Err(format!("line {}: nonzero vscnt wait would count profile stores", i + 1)) }
+            }
+            if c.starts_with("s_wait_") { return Err(format!("line {}: gfx12 wait in a gfx11 profile", i + 1)) }
+        } else if let Some(rest) = c.strip_prefix("s_wait_storecnt_dscnt ") {
             if parse_imm(rest)? >> 8 != 0 { return Err(format!("line {}: nonzero store wait would count profile stores", i + 1)) }
         } else if let Some(rest) = c.strip_prefix("s_wait_storecnt ") {
             if parse_imm(rest)? != 0 { return Err(format!("line {}: nonzero store wait would count profile stores", i + 1)) }
         }
     }
     let vgpr_limit = cfg.vgpr_limit.unwrap_or(dsc.vgpr.div_ceil(VGPR_GRANULE) * VGPR_GRANULE).min(256);
-    let regs = pick(&dsc, vgpr_limit, &used_v, &used_s)?;
+    let regs = pick(arch, &dsc, vgpr_limit, &used_v, &used_s)?;
     let win = windows(&lines, body.clone())?;
 
     // Gaps: entry before the first instruction, exits at each s_endpgm, rules.
@@ -470,7 +582,7 @@ pub fn instrument(source: &str, cfg: &Config) -> Result<(String, Map), String> {
 
     // s_delay_alu fix-ups for VALU_DEP hints that reach back across a point.
     let valu = |i: usize| kind(lines[i]) == Kind::Insn && mnemonic(lines[i]).starts_with("v_");
-    let inserted = |lo: usize, hi: usize| gaps.iter().filter(|g| g.at > lo && g.at <= hi && g.rule != "exit").count() * POINT_VALU;
+    let inserted = |lo: usize, hi: usize| gaps.iter().filter(|g| g.at > lo && g.at <= hi && g.rule != "exit").count() * point_valu(arch);
     let mut fixups = Vec::new();
     let mut replaced: Vec<Option<String>> = vec![None; lines.len()];
     for i in body.clone() {
@@ -500,10 +612,11 @@ pub fn instrument(source: &str, cfg: &Config) -> Result<(String, Map), String> {
 
     let (dstart, dend, _) = descriptor(&lines, sym)?;
     let ext = dsc.kernarg.div_ceil(8) * 8;
-    let new_vgpr = dsc.vgpr.max(regs.v + 1);
+    let new_vgpr = dsc.vgpr.max(regs.v + 1).max(regs.o.map_or(0, |o| o + 1));
     let ours = [regs.p + 1, regs.t, regs.e, regs.q + 3, regs.r + 1, regs.rt + 1].into_iter().chain(regs.singles.iter().copied()).max().unwrap_or(0);
     let new_sgpr = dsc.sgpr.max(ours + 1);
-    if new_sgpr > SGPR_LIMIT { return Err("profile SGPRs exceed the gfx12 limit".into()) }
+    if new_sgpr > SGPR_LIMIT { return Err("profile SGPRs exceed the architectural limit".into()) }
+    let entry_seq = if arch.gfx12() { entry(&regs, ext, valu_exec_writer) } else { entry11(&regs, &dsc, ext)? };
 
     let mut out: Vec<String> = Vec::with_capacity(lines.len() + gaps.len() * 12 + 64);
     let mut gi = 0;
@@ -512,9 +625,14 @@ pub fn instrument(source: &str, cfg: &Config) -> Result<(String, Map), String> {
         if i == start {
             out.push(format!("; DIAGNOSTIC: {sym}{PROFILED_SUFFIX} is a peacemaker profile build; never embed."));
         }
-        if i == first { out.extend(entry(&regs, ext, valu_exec_writer).into_iter().map(|l| format!("\t{l}"))); }
+        if i == first { out.extend(entry_seq.iter().map(|l| format!("\t{l}"))); }
         while gi < gaps.len() && gaps[gi].at == i {
-            let seq = if gaps[gi].rule == "exit" { exit(&regs, site, valu_exec_writer) } else { point(&regs, site, &gaps[gi].rule, valu_exec_writer) };
+            let seq = match (arch.gfx12(), gaps[gi].rule == "exit") {
+                (true, true) => exit(&regs, site, valu_exec_writer),
+                (true, false) => point(&regs, site, &gaps[gi].rule, valu_exec_writer),
+                (false, true) => exit11(&regs, site),
+                (false, false) => point11(&regs, site, &gaps[gi].rule),
+            };
             out.extend(seq.into_iter().map(|l| format!("\t{l}")));
             gi += 1; site += 1;
         }
@@ -534,13 +652,15 @@ pub fn instrument(source: &str, cfg: &Config) -> Result<(String, Map), String> {
     let text = rename(&text, sym, &format!("{sym}{PROFILED_SUFFIX}"));
     let map = Map {
         diagnostic: "peacemaker profile build: timing records only, never embed".into(),
+        arch, cycle_bits: if arch.gfx12() { 32 } else { 20 },
         symbol: sym.into(), profiled_symbol: format!("{sym}{PROFILED_SUFFIX}"),
         kernarg_size: ext + KERNARG_EXT_BYTES, kernarg_ext_offset: ext, kernarg_ext_bytes: KERNARG_EXT_BYTES,
         header_bytes: HEADER_BYTES, record_bytes: RECORD_BYTES, exit_record_bytes: EXIT_RECORD_BYTES,
         exit_flag: EXIT_FLAG, magic: MAGIC,
         vgpr_before: dsc.vgpr, vgpr_after: new_vgpr, vgpr_limit, sgpr_before: dsc.sgpr, sgpr_after: new_sgpr,
-        registers: Registers { scratch_vgpr: regs.v, pointer: regs.p, timestamp: regs.t, exec_save: regs.e,
-            entry_quad: regs.q, entry_pair: regs.r, realtime_pair: regs.rt, entry_singles: regs.singles.clone() },
+        registers: Registers { scratch_vgpr: regs.v, offset_vgpr: regs.o, pointer: regs.p, timestamp: regs.t, exec_save: regs.e,
+            entry_quad: regs.q, entry_pair: regs.r, realtime_pair: regs.rt, entry_singles: regs.singles.clone(),
+            workgroup_ids: if arch.gfx12() { vec![] } else { (dsc.user..dsc.user + 1 + u16::from(dsc.wg_y)).collect() } },
         valu_exec_writer, sites, delay_fixups: fixups,
     };
     Ok((text, map))
@@ -611,6 +731,7 @@ pub fn verify(source: &str, instrumented: &str, map: &Map) -> Result<(), String>
     entry_s.extend(r.entry_quad..r.entry_quad + 4);
     entry_s.extend([r.entry_pair, r.entry_pair + 1, r.realtime_pair, r.realtime_pair + 1, 0, 1]);
     entry_s.extend(r.entry_singles.iter().copied());
+    entry_s.extend(r.workgroup_ids.iter().copied());
     let mut stripped = Vec::new();
     let mut block: Option<String> = None;
     let mut blocks = 0;
@@ -623,7 +744,7 @@ pub fn verify(source: &str, instrumented: &str, map: &Map) -> Result<(), String>
             let v = registers(c, b'v');
             let s = registers(c, b's');
             let entry_block = b.contains("entry header");
-            let allowed_v = |n: &u16| *n == r.scratch_vgpr || (entry_block && *n == 0);
+            let allowed_v = |n: &u16| *n == r.scratch_vgpr || Some(*n) == r.offset_vgpr || (entry_block && *n == 0);
             if !v.iter().all(allowed_v) { return Err(format!("profile block touches VGPRs {v:?}: {c}")) }
             let allowed_s = if entry_block { &entry_s } else { &persistent_s };
             let exit_block = b.ends_with(" exit");
@@ -633,8 +754,13 @@ pub fn verify(source: &str, instrumented: &str, map: &Map) -> Result<(), String>
             // Points run inside live code: only SCC/VCC/M0-neutral opcodes.
             // Entry code runs before the kernel and may use SALU arithmetic.
             let m = mnemonic(c);
-            let point_ok = matches!(m, "s_getreg_b32" | "s_wait_alu" | "v_writelane_b32" | "s_mov_b32"
-                | "s_add_nc_u64" | "global_store_addtid_b32" | "s_sendmsg_rtn_b64" | "s_wait_kmcnt");
+            let point_ok = if map.arch.gfx12() {
+                matches!(m, "s_getreg_b32" | "s_wait_alu" | "v_writelane_b32" | "s_mov_b32"
+                    | "s_add_nc_u64" | "global_store_addtid_b32" | "s_sendmsg_rtn_b64" | "s_wait_kmcnt")
+            } else {
+                matches!(m, "s_getreg_b32" | "s_waitcnt_depctr" | "v_writelane_b32" | "s_mov_b32"
+                    | "v_add_nc_u32_e32" | "global_store_b32" | "s_sendmsg_rtn_b64" | "s_waitcnt")
+            };
             if m.contains("branch") || c.contains("vcc") || c.contains("m0") || (!entry_block && !point_ok) {
                 return Err(format!("profile block touches control state: {c}"))
             }
@@ -658,7 +784,8 @@ pub fn verify(source: &str, instrumented: &str, map: &Map) -> Result<(), String>
     for line in &original {
         if kind(line) != Kind::Insn { continue }
         let c = code(line);
-        if registers(c, b'v').contains(&r.scratch_vgpr) || !registers(c, b's').is_disjoint(&persistent_s) {
+        let v = registers(c, b'v');
+        if v.contains(&r.scratch_vgpr) || r.offset_vgpr.is_some_and(|o| v.contains(&o)) || !registers(c, b's').is_disjoint(&persistent_s) {
             return Err(format!("original kernel uses a profile register: {c}"))
         }
     }
@@ -688,7 +815,7 @@ mod tests {
     #[test]
     fn points_keep_windows_and_retarget_valu_hints() {
         let c = cfg(r#"[{"name":"bar","after":"s_barrier_wait"},{"name":"ld","after":"s_clause"}]"#);
-        let (text, map) = instrument(KERNEL, &c).unwrap();
+        let (text, map) = instrument(KERNEL, &c, Arch::Gfx1201).unwrap();
         // The barrier point sits between both producers and their consumers:
         // two inserted VALUs push VALU_DEP_2 to VALU_DEP_4.
         assert_eq!(map.delay_fixups.len(), 1);
@@ -707,12 +834,12 @@ mod tests {
     #[test]
     fn nonzero_store_wait_is_rejected() {
         let src = KERNEL.replace("\ts_endpgm", "\ts_wait_storecnt 0x1\n\ts_endpgm");
-        assert!(instrument(&src, &cfg("[]")).is_err());
+        assert!(instrument(&src, &cfg("[]"), Arch::Gfx1201).is_err());
     }
 
     #[test]
     fn verify_rejects_a_block_that_clobbers_kernel_state() {
-        let (text, map) = instrument(KERNEL, &cfg(r#"[{"name":"bar","before":"s_barrier_signal"}]"#)).unwrap();
+        let (text, map) = instrument(KERNEL, &cfg(r#"[{"name":"bar","before":"s_barrier_signal"}]"#), Arch::Gfx1201).unwrap();
         let bad = text.replacen("s_mov_b32 exec_lo, 3", "s_mov_b32 exec_lo, 3\n\tv_mov_b32 v1, 0", 1);
         assert_ne!(bad, text);
         assert!(verify(KERNEL, &bad, &map).is_err());

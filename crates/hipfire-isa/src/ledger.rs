@@ -116,8 +116,11 @@ impl Ledger {
         self.pending.retain(|p| !matches!(p.counter, Counter::Store | Counter::Vs));
     }
 
+    /// An LDS store not yet retired (DScnt on gfx12, LGKMcnt on gfx11): a
+    /// barrier that publishes LDS must drain it first.
     pub fn pending_stores(&self) -> bool {
-        self.pending.iter().any(|p| p.counter == Counter::Ds && !p.src_locks.is_empty())
+        self.pending.iter().any(|p| matches!(p.counter, Counter::Ds | Counter::Lgkm)
+            && p.family == MemoryFamily::Ds && !p.src_locks.is_empty())
     }
     pub fn is_empty(&self) -> bool { self.pending.is_empty() }
     /// Pending operations without their ids: two ledgers with equal shapes

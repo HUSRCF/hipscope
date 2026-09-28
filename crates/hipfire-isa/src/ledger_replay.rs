@@ -1,6 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Independent, source-text replay of async memory waits and register locks.
 //! Consumes assembly text, not the builder's pending-event ledger.
+//!
+//! gfx12 counters are LOADcnt, STOREcnt, DScnt and KMcnt. On gfx11 (RDNA3 ISA
+//! §16.5) `s_waitcnt` carries VMcnt (loads), LGKMcnt (DS *and* SMEM/message
+//! returns, one counter) and EXPcnt; `s_waitcnt_vscnt` waits on stores. A
+//! nonzero LGKMcnt retires only the oldest DS operations when no SMEM shares
+//! the counter (SMEM returns out of order), as in ROCm LLVM `SIInsertWaitcnts`.
+use crate::Arch;
 use std::collections::BTreeSet;
 
 #[derive(Clone, Debug)]
@@ -62,18 +69,47 @@ fn retire(pending: &mut Vec<Pending<'_>>, kind: Kind, count: usize) {
 
 /// Reject RAW, WAW and store-source WAR hazards from machine-readable text.
 /// Combined waits decode both counters independently.
-pub fn replay_waits(assembly: &str) -> Result<(), String> {
-    replay(assembly, false).map(|_| ())
+pub fn replay_waits(assembly: &str, arch: Arch) -> Result<(), String> {
+    replay(assembly, arch, false).map(|_| ())
 }
 
 /// Every hazard the replay finds, as the offending instruction text, in
 /// order. Used to show a rewrite adds no hazard to foreign (hipcc) code whose
 /// hardware-interlocked DS-source reuse the strict replay already flags.
-pub fn replay_hazards(assembly: &str) -> Result<Vec<String>, String> {
-    replay(assembly, true)
+pub fn replay_hazards(assembly: &str, arch: Arch) -> Result<Vec<String>, String> {
+    replay(assembly, arch, true)
 }
 
-fn replay(assembly: &str, all: bool) -> Result<Vec<String>, String> {
+/// gfx11 LGKMcnt: DS and SMEM share one counter. With any SMEM pending only
+/// a full drain retires anything; otherwise the oldest DS operations retire.
+fn retire_lgkm(pending: &mut Vec<Pending<'_>>, count: usize) {
+    if count == 0 {
+        pending.retain(|item| !matches!(item.kind, Kind::Ds | Kind::Km));
+    } else if !pending.iter().any(|item| item.kind == Kind::Km) {
+        retire(pending, Kind::Ds, count);
+    }
+}
+
+/// Fields of a gfx11 `s_waitcnt`: `vmcnt(n) expcnt(n) lgkmcnt(n)` in any
+/// order (absent = no wait), or a raw immediate VM[15:10] LGKM[9:4] EXP[2:0].
+fn gfx11_waitcnt(operands: &str) -> Option<(Option<usize>, Option<usize>)> {
+    let operands = operands.trim();
+    if operands.starts_with("0x") || operands.bytes().next().is_some_and(|b| b.is_ascii_digit()) {
+        let imm = wait_count(operands)?;
+        let (vm, lgkm) = ((imm >> 10) & 0x3f, (imm >> 4) & 0x3f);
+        return Some(((vm != 0x3f).then_some(vm), (lgkm != 0x3f).then_some(lgkm)));
+    }
+    let (mut vm, mut lgkm) = (None, None);
+    for field in operands.split(|c: char| c.is_whitespace() || c == '&' || c == ',').filter(|f| !f.is_empty()) {
+        let (name, value) = field.split_once('(')?;
+        let value: usize = value.strip_suffix(')')?.parse().ok()?;
+        match name { "vmcnt" => vm = Some(value), "lgkmcnt" => lgkm = Some(value), "expcnt" => {}, _ => return None }
+    }
+    Some((vm, lgkm))
+}
+
+fn replay(assembly: &str, arch: Arch, all: bool) -> Result<Vec<String>, String> {
+    let gfx11 = !arch.gfx12();
     let mut hazards = Vec::new();
     let mut pending = Vec::<Pending>::new();
     for (line_no, source) in assembly.lines().enumerate() {
@@ -84,6 +120,30 @@ fn replay(assembly: &str, all: bool) -> Result<Vec<String>, String> {
         }
         let Some((name, operands)) = line.split_once(char::is_whitespace) else { continue };
         if name.starts_with('.') || name.ends_with(':') { continue; }
+        if gfx11 {
+            let count = || operands.rsplit(',').next().and_then(wait_count)
+                .ok_or_else(|| format!("line {}: invalid wait", line_no+1));
+            match name {
+                "s_waitcnt" => {
+                    let (vm, lgkm) = gfx11_waitcnt(operands)
+                        .ok_or_else(|| format!("line {}: invalid s_waitcnt", line_no+1))?;
+                    if let Some(n) = vm { retire(&mut pending, Kind::Vmem, n); }
+                    if let Some(n) = lgkm { retire_lgkm(&mut pending, n); }
+                    continue;
+                }
+                "s_waitcnt_vmcnt" => { retire(&mut pending, Kind::Vmem, count()?); continue; }
+                "s_waitcnt_vscnt" => { retire(&mut pending, Kind::Store, count()?); continue; }
+                "s_waitcnt_lgkmcnt" => { retire_lgkm(&mut pending, count()?); continue; }
+                "s_waitcnt_depctr" if operands.contains("depctr_vm_vsrc(0)") => {
+                    for item in pending.iter_mut().filter(|item| item.kind == Kind::Store) { item.locks.clear(); }
+                    continue;
+                }
+                _ if name.starts_with("s_wait_") => return Err(format!("line {}: {name} is not a gfx11 wait", line_no+1)),
+                _ => {}
+            }
+        } else if name == "s_waitcnt" || name.starts_with("s_waitcnt_") {
+            return Err(format!("line {}: {name} is not a gfx12 wait", line_no+1));
+        }
         let wait_kind = match name {
             "s_wait_loadcnt" => Some(Kind::Vmem),
             "s_wait_storecnt" => Some(Kind::Store),
@@ -160,7 +220,8 @@ fn replay(assembly: &str, all: bool) -> Result<Vec<String>, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::replay_waits;
+    use super::replay_waits as gfx12_replay;
+    fn replay_waits(text: &str) -> Result<(), String> { gfx12_replay(text, crate::Arch::Gfx1201) }
     #[test]
     fn load_wait_uses_only_retired_destinations() {
         let legal = "buffer_load_b32 v0, v8, s[4:7], s9 offen\n\
@@ -226,5 +287,29 @@ mod tests {
         assert!(replay_waits("global_load_b32 v0, v8, s[4:5]\n\
             global_load_b64 v[1:2], v9, s[4:5]\n\
             s_wait_loadcnt 1\nv_add_f32 v3, v0, v4\n").is_ok());
+    }
+    #[test]
+    fn gfx11_waitcnt_fields_and_shared_lgkm() {
+        let gfx11 = |text: &str| super::replay_waits(text, crate::Arch::Gfx1100);
+        let loads = "global_load_b32 v0, v8, s[4:5]\nglobal_load_b32 v1, v8, s[4:5] offset:4\n\
+            ds_load_b32 v2, v9\nds_load_b32 v3, v9 offset:4\n";
+        assert!(gfx11(&format!("{loads}s_waitcnt vmcnt(1) lgkmcnt(1)\nv_add_f32 v4, v0, v2\n")).is_ok());
+        assert!(gfx11(&format!("{loads}s_waitcnt vmcnt(1) lgkmcnt(1)\nv_add_f32 v4, v1, v2\n")).is_err());
+        assert!(gfx11(&format!("{loads}s_waitcnt vmcnt(1)\nv_add_f32 v4, v0, v2\n")).is_err());
+        // SMEM shares LGKMcnt and returns out of order: only lgkmcnt(0) retires.
+        let mixed = "s_load_b32 s6, s[0:1], 0x0\nds_load_b32 v2, v9\nds_load_b32 v3, v9 offset:4\n";
+        assert!(gfx11(&format!("{mixed}s_waitcnt lgkmcnt(1)\nv_add_f32 v4, v2, v2\n")).is_err());
+        assert!(gfx11(&format!("{mixed}s_waitcnt lgkmcnt(0)\nv_add_f32 v4, v2, v2\n")).is_ok());
+        // Raw immediate: VM[15:10] = 0, LGKM[9:4] = 63 (no wait), EXP[2:0] = 7.
+        assert!(gfx11(&format!("{loads}s_waitcnt 0x3f7\nv_add_f32 v4, v1, v1\n")).is_ok());
+        assert!(gfx11(&format!("{loads}s_waitcnt 0x3f7\nv_add_f32 v4, v2, v2\n")).is_err());
+        // Stores: only vscnt(0) or vm_vsrc(0) releases their sources.
+        let store = "global_store_b32 v1, v0, s[4:5]\nv_mov_b32_e32 v0, 0\n";
+        assert!(gfx11(store).is_err());
+        assert!(gfx11(&store.replace("v_mov", "s_waitcnt_vscnt null, 0x0\nv_mov")).is_ok());
+        assert!(gfx11(&store.replace("v_mov", "s_waitcnt_depctr depctr_vm_vsrc(0)\nv_mov")).is_ok());
+        // Architecture-foreign spellings are rejected, not ignored.
+        assert!(gfx11(&format!("{loads}s_wait_loadcnt 0x0\nv_add_f32 v4, v1, v1\n")).is_err());
+        assert!(super::replay_waits("s_waitcnt vmcnt(0)\n", crate::Arch::Gfx1201).is_err());
     }
 }

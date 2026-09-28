@@ -10,7 +10,8 @@ path = "src/bin/peacemaker.rs"
 required-features = ["toolchain"]
 
 [features]
-toolchain = ["dep:radiowave"]
+# gfx11 certification lifts the linked object with M7 (`pm_check`).
+toolchain = ["dep:radiowave", "lift"]
 # `region-import --gdn-object`: lift the hipcc code object with peacemaker.
 lift = ["dep:peacemaker-lift", "dep:peacemaker-ir"]
 

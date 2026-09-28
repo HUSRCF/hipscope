@@ -102,7 +102,7 @@ fn every_module_assembles_with_zero_diagnostics() {
 fn module_waits_pass_independent_replay() {
     for (tile, act, _) in POINTS {
         let (_, text, _) = iu4_gemm::emit_module(Fold::K128, tile, Cacc::One, act, Arch::Gfx1201).unwrap();
-        hipfire_isa::ledger_replay::replay_waits(&text).unwrap_or_else(|e| panic!("{tile:?} {act:?}: {e}"));
+        hipfire_isa::ledger_replay::replay_waits(&text, Arch::Gfx1201).unwrap_or_else(|e| panic!("{tile:?} {act:?}: {e}"));
     }
 }
 

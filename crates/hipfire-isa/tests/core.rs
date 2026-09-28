@@ -149,16 +149,19 @@ fn global_visibility_is_explicit_not_implied_by_lds_barrier() {
 }
 
 #[test]
-fn gfx11_wave32_trans_and_sgpr_vmem_hazards() {
+fn gfx11_trans_use_is_gfx1100_only_and_vmem_sgpr_needs_no_nop() {
     use hipfire_isa::hazard::{Gfx11Hazards, Pipeline};
-    let mut hazard = Gfx11Hazards::default();
     let v = |base| RegRef { kind: Kind::V, base, len: 1 };
     let s = |base| RegRef { kind: Kind::S, base, len: 1 };
-    assert!(hazard.step(Pipeline::Valu, "v_rcp_f32", &[v(0)], &[v(1)]).is_empty());
-    assert_eq!(hazard.step(Pipeline::Valu, "v_mul_f32", &[v(1), v(2)], &[v(3)]), ["s_waitcnt_depctr depctr_va_vdst(0)"]);
-    assert!(hazard.step(Pipeline::Valu, "v_add_co_u32", &[v(0)], &[s(4)]).is_empty());
-    assert_eq!(hazard.step(Pipeline::Vmem, "buffer_load_b32", &[s(4)], &[v(5)]), ["s_nop 4"]);
-    assert!(hazard.step(Pipeline::Vmem, "buffer_load_b32", &[s(4)], &[v(6)]).is_empty());
+    let mut gfx1100 = Gfx11Hazards::for_arch(Arch::Gfx1100);
+    assert!(gfx1100.step(Pipeline::Valu, "v_rcp_f32", &[v(0)], &[v(1)]).is_empty());
+    assert_eq!(gfx1100.step(Pipeline::Valu, "v_mul_f32", &[v(1), v(2)], &[v(3)]), ["s_waitcnt_depctr depctr_va_vdst(0)"]);
+    // NoDataDepHazard (both gfx11 targets): a VALU-written SGPR feeds VMEM directly.
+    assert!(gfx1100.step(Pipeline::Valu, "v_add_co_u32", &[v(0)], &[s(4)]).is_empty());
+    assert!(gfx1100.step(Pipeline::Vmem, "buffer_load_b32", &[s(4)], &[v(5)]).is_empty());
+    let mut gfx1151 = Gfx11Hazards::for_arch(Arch::Gfx1151);
+    assert!(gfx1151.step(Pipeline::Valu, "v_rcp_f32", &[v(0)], &[v(1)]).is_empty());
+    assert!(gfx1151.step(Pipeline::Valu, "v_mul_f32", &[v(1), v(2)], &[v(3)]).is_empty());
 }
 
 #[test]

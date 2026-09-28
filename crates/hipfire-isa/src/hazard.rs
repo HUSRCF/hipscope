@@ -1,4 +1,4 @@
-use crate::reg::{Kind,RegRef};
+use crate::{arch::Arch,reg::{Kind,RegRef}};
 use serde::Serialize;
 #[derive(Clone,Copy,Debug,PartialEq,Eq)] pub enum Pipeline { Salu,Valu,Vmem,Smem,Ds }
 #[derive(Clone,Debug,Serialize)] pub struct HazardProof { pub pc_index:usize,pub insn:String,pub rule:String }
@@ -19,42 +19,38 @@ impl Gfx12Sgpr {
         if vcc_def {self.vcc_salu=pipe==Pipeline::Salu;self.vcc_valu=pipe==Pipeline::Valu} waits
     }
 }
-/// gfx11 wave32 hazards. The mask-write and partial-forwarding hazards in LLVM
-/// apply only to wave64, which this builder does not emit.
+/// gfx11 wave32 hazards, as M7's `peacemaker-ir` replay models them (ROCm
+/// LLVM `GCNHazardRecognizer.cpp` / `AMDGPU.td` at `8f497e09`):
+/// `VALUTransUseHazard` is a gfx1100 (FeatureISAVersion11_0_Common) feature,
+/// absent on gfx1151; both gfx11 targets have `NoDataDepHazard`, so the older
+/// VALU-SGPR -> VMEM NOP rule does not apply. The mask-write and
+/// partial-forwarding hazards apply only to wave64, which this builder does
+/// not emit; WMMA chaining is handled by the builder itself.
 #[derive(Clone,Debug,Default)]
 pub struct Gfx11Hazards {
+    trans_use: bool,
     trans_defs: Vec<(RegRef,u8,u8)>,
-    valu_sgpr_defs: Vec<(RegRef,u8)>,
 }
 impl Gfx11Hazards {
+    pub fn for_arch(arch:Arch)->Self { Self { trans_use: arch==Arch::Gfx1100, trans_defs: Vec::new() } }
     pub fn step(&mut self,pipe:Pipeline,mnemonic:&str,uses:&[RegRef],defs:&[RegRef])->Vec<String>{
         let mut waits=Vec::new();
+        if !self.trans_use {return waits}
         let trans=pipe==Pipeline::Valu && ["v_rcp_","v_sqrt_","v_rsq_","v_sin_","v_cos_","v_exp_","v_log_"].iter().any(|prefix|mnemonic.starts_with(prefix));
         if matches!(pipe,Pipeline::Vmem|Pipeline::Ds) {
             self.trans_defs.clear();
-        }
-        if pipe==Pipeline::Vmem {
-            let needed=self.valu_sgpr_defs.iter().filter(|(def,_)|uses.iter().any(|r|r.overlaps(*def)))
-                .map(|(_,age)|5u8.saturating_sub(*age)).max().unwrap_or(0);
-            if needed>0 {
-                waits.push(format!("s_nop {}",needed-1));
-                self.valu_sgpr_defs.clear();
-            }
         }
         if pipe==Pipeline::Valu && self.trans_defs.iter().any(|(def,valu_age,trans_age)|
             *valu_age<=5 && *trans_age<=1 && uses.iter().any(|r|r.overlaps(*def))) {
             waits.push("s_waitcnt_depctr depctr_va_vdst(0)".into());
             self.trans_defs.clear();
         }
-        for (_,age) in &mut self.valu_sgpr_defs { *age=age.saturating_add(1) }
-        self.valu_sgpr_defs.retain(|(_,age)|*age<5);
         if pipe==Pipeline::Valu {
             for (_,valu_age,trans_age) in &mut self.trans_defs {
                 *valu_age=valu_age.saturating_add(1);
                 if trans {*trans_age=trans_age.saturating_add(1)}
             }
             self.trans_defs.retain(|(_,valu_age,trans_age)|*valu_age<=5&&*trans_age<=1);
-            self.valu_sgpr_defs.extend(defs.iter().filter(|r|r.kind==Kind::S).map(|r|(*r,0)));
             if trans {self.trans_defs.extend(defs.iter().filter(|r|r.kind==Kind::V).map(|r|(*r,0,0)))}
         }
         waits

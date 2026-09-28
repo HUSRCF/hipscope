@@ -2,15 +2,17 @@
 # SPDX-License-Identifier: Apache-2.0
 """DIAGNOSTIC: turn `peacemaker profile` records into phase statistics.
 
-    pmprof_analyze.py <profiled.map.json> <run_dir> <f2|attn|iu4> [out_dir]
+    pmprof_analyze.py <profiled.map.json> <run_dir> <f2|attn|iu4|v2c> [out_dir]
 
 Reads run_dir/{trace.bin (or trace.bin.zst),meta.json} written by pmprof. Writes out_dir
 (default run_dir) summary.json, summary.md, waves.csv (one row per wave:
 placement, realtime span, cycles per phase) and timeline_wg<N>.csv (every
 record of every wave of three workgroups, on the WGP's shared cycle clock).
 
-Cycle values are SHADER_CYCLES_LO deltas within one wave (32-bit wrap
-handled); realtime is the 100 MHz constant clock from entry/exit records.
+Cycle values are shader-cycle deltas within one wave: gfx12 SHADER_CYCLES_LO
+(32-bit) or gfx11 SHADER_CYCLES (20-bit, map "cycle_bits"); consecutive
+records are unwrapped modulo the counter width. Realtime is the 100 MHz
+constant clock from entry/exit records.
 """
 import collections, csv, json, os, subprocess, sys
 import numpy as np
@@ -73,15 +75,28 @@ PHASES = {
         ("epilogue", "exit"): "epilogue: O normalize + stores",
     },
 }
-PERIOD = {"f2": "kblock", "attn": "tile", "iu4": "slab"}
+PHASES["v2c"] = {
+    ("epoch", "pass#1"): "metadata + staging VMEM issue, first fragment LDS wait",
+    ("pass#1", "fold#1"): "pass 0: 32 WMMA + fragment LDS loads",
+    ("fold#1", "pass#2"): "fold pass 0 (cvt, 8 DPP, 48 VOPD)",
+    ("pass#2", "fold#2"): "pass 1: 32 WMMA + fragment LDS loads",
+    ("fold#2", "stage"): "fold pass 1 (8 DPP, 48 VOPD)",
+    ("stage", "bar.pre_signal"): "stage: VMEM wait, rebias, 4 DS stores, LGKM drain",
+    ("bar.pre_signal", "bar.post_wait"): "s_barrier wait",
+    ("bar.post_wait", "epoch"): "epoch latch",
+    ("stage", "epilogue"): "last epoch (no staging) to epilogue",
+    ("epilogue", "exit"): "epilogue: 16 b128 Y stores",
+}
+PERIOD = {"f2": "kblock", "attn": "tile", "iu4": "slab", "v2c": "epoch"}
 # Load issue -> first use: F2 weights/fragments are issued after block start;
 # iu4 VMEM is issued at slab start and its first drain follows 16 WMMAs.
 ISSUE_USE = {"f2": ("kblock", "w0.post"), "attn": ("fill.done", "bar.pre_signal"),
-             "iu4": ("slab", "vmem.post")}
+             "iu4": ("slab", "vmem.post"), "v2c": ("epoch", "stage")}
 EXPOSED = {"f2": ("w0.pre", "w0.post"), "attn": ("bar.pre_drain", "bar.pre_signal"),
-           "iu4": ("vmem.pre", "vmem.post")}
+           "iu4": ("vmem.pre", "vmem.post"), "v2c": ("bar.pre_signal", "bar.post_wait")}
 QUALIFY = {"f2": {"bar.pre_signal", "bar.post_signal", "bar.post_wait"}, "attn": set(),
-           "iu4": {"bar.pre_signal", "bar.post_signal", "bar.pre_wait", "bar.post_wait"}}
+           "iu4": {"bar.pre_signal", "bar.post_signal", "bar.pre_wait", "bar.post_wait"},
+           "v2c": {"pass", "fold"}}
 
 
 def parse(map_path, run_dir):
@@ -111,7 +126,8 @@ def parse(map_path, run_dir):
             raise SystemExit(f"wave {w}: records after exit")
         site = (ids[: e + 1] & ~np.uint32(flag)).astype(np.int64)
         cyc = recs[: e + 1, 0].astype(np.int64)
-        rel = (cyc - cyc[0]) & 0xFFFFFFFF
+        mask = (1 << m.get("cycle_bits", 32)) - 1
+        rel = np.concatenate([[0], np.cumsum(np.diff(cyc) & mask)])
         out.append(dict(wave=w, wg=int(h[3]), wiw=int(h[4]), hw=HW(int(h[1])), hw2=int(h[2]),
                         rt0=int(h[6]) << 32 | int(h[5]), rt1=rt_exit, cyc0=int(cyc[0]), cyc_hi=int(h[7]),
                         rules=[names[int(s)] for s in site], rel=rel))
@@ -183,7 +199,8 @@ def analyze(kernel, m, meta, waves, out_dir):
     by_wg = collections.defaultdict(list)
     for wv in waves:
         by_wg[wv["wg"]].append(wv)
-    wrap = lambda a: (a + 2**31) % 2**32 - 2**31
+    bits = m.get("cycle_bits", 32)
+    wrap = lambda a: (a + 2**(bits - 1)) % 2**bits - 2**(bits - 1)
     skews, raw_skews, arrive, offsets_seen = [], [], [], []
     lag_by_rank = collections.defaultdict(list)
     for wg, ws in by_wg.items():
@@ -270,7 +287,7 @@ def analyze(kernel, m, meta, waves, out_dir):
             wr.writerow(["wave_in_wg", "simd", "slot", "record", "rule", "cycles_on_wgp_clock (SIMD offsets removed)"])
             for wv in ws:
                 for i, (r, t) in enumerate(zip(qualify(kernel, wv["rules"]), wv["rel"])):
-                    wr.writerow([wv["wiw"], wv["hw"]["simd"], wv["hw"]["wave"], i, r, ((wv["cyc0"] - wv.get("offset", 0) + int(t)) - base) & 0xFFFFFFFF])
+                    wr.writerow([wv["wiw"], wv["hw"]["simd"], wv["hw"]["wave"], i, r, ((wv["cyc0"] - wv.get("offset", 0) + int(t)) - base) & ((1 << bits) - 1)])
     with open(os.path.join(out_dir, "summary.md"), "w") as f:
         f.write(f"# {kernel} {meta['shape']} (DIAGNOSTIC profile)\n\n")
         f.write(f"outputs identical: {meta['outputs_identical']}; base {meta['base_ms_median']*1e3:.1f} us, profiled {meta['profiled_ms_median']*1e3:.1f} us, overhead {meta['overhead']*100:+.2f}%\n\n")
