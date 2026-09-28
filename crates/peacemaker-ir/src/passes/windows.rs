@@ -440,7 +440,7 @@ mod tests {
     fn delay_past_block_start_without_unique_path_is_ambiguous() {
         // Hint needs 2 VALU back, only 1 precedes it on the unique entry path.
         let mut body = body_of(vec![valu(), delay_hint(2, 0, 0), valu(), endpgm()]);
-        build_blocks(&mut body).unwrap();
+        build_blocks(&mut body, crate::inst::Arch::Gfx1201).unwrap();
         let facts = check_windows(&body).unwrap();
         assert!(facts.delays[0].is_ambiguous());
         assert_eq!(facts.delays[0].producers(), None);
@@ -455,7 +455,7 @@ mod tests {
         entry.effects.control = Control::Jump;
         entry.operands.push(Operand::Imm(ImmField::Sopp(0)));
         let mut body = body_of(vec![valu(), entry, valu(), delay_hint(2, 0, 0), valu(), endpgm()]);
-        build_blocks(&mut body).unwrap();
+        build_blocks(&mut body, crate::inst::Arch::Gfx1201).unwrap();
         assert_eq!(body.blocks.len(), 2);
         let facts = check_windows(&body).unwrap();
         assert_eq!(facts.delays[0].producers(), Some([Some(body.layout[0]), None]));
@@ -472,7 +472,7 @@ mod tests {
         back.effects.control = Control::Jump;
         back.operands.push(Operand::Imm(ImmField::Sopp(-3)));
         let mut body = body_of(vec![delay_hint(0, 0, 0), valu(), valu(), back, endpgm()]);
-        build_blocks(&mut body).unwrap();
+        build_blocks(&mut body, crate::inst::Arch::Gfx1201).unwrap();
         assert_eq!(body.blocks[0].range, (0, 1));
         assert_eq!(check_windows(&body), Err(WindowError::DelayCrossesLeader { index: 0 }));
     }
@@ -485,7 +485,7 @@ mod tests {
             mem("s_load_b128", Form::Smem, MemClass::SmemLoad),
             endpgm(),
         ]);
-        build_blocks(&mut body).unwrap();
+        build_blocks(&mut body, crate::inst::Arch::Gfx1201).unwrap();
         let facts = check_windows(&body).unwrap();
         assert_eq!(facts.clauses.len(), 1);
         assert_eq!(facts.clauses[0].class, MemClass::SmemLoad);
@@ -512,7 +512,7 @@ mod tests {
             branch_to(-3),
             endpgm(),
         ]);
-        build_blocks(&mut body).unwrap();
+        build_blocks(&mut body, crate::inst::Arch::Gfx1201).unwrap();
         assert_eq!(
             check_windows(&body),
             Err(WindowError::CrossesLeader { index: 0, len: 2 })
@@ -530,14 +530,14 @@ mod tests {
             wait,
             endpgm(),
         ]);
-        build_blocks(&mut body).unwrap();
+        build_blocks(&mut body, crate::inst::Arch::Gfx1201).unwrap();
         assert_eq!(
             check_windows(&body),
             Err(WindowError::WaitInsideClause { index: 0, member: 2 })
         );
         // Non-memory member.
         let mut body = body_of(vec![clause_opener(0), valu(), endpgm()]);
-        build_blocks(&mut body).unwrap();
+        build_blocks(&mut body, crate::inst::Arch::Gfx1201).unwrap();
         assert_eq!(
             check_windows(&body),
             Err(WindowError::NonMemoryMember { index: 0, member: 1 })
@@ -549,7 +549,7 @@ mod tests {
             mem("global_load_b32", Form::Vmem(crate::inst::VmemForm::Global), MemClass::VmemLoad),
             endpgm(),
         ]);
-        build_blocks(&mut body).unwrap();
+        build_blocks(&mut body, crate::inst::Arch::Gfx1201).unwrap();
         assert_eq!(
             check_windows(&body),
             Err(WindowError::MixedClass { index: 0, member: 2 })
@@ -560,7 +560,7 @@ mod tests {
             mem("s_load_b32", Form::Smem, MemClass::SmemLoad),
             endpgm(),
         ]);
-        build_blocks(&mut body).unwrap();
+        build_blocks(&mut body, crate::inst::Arch::Gfx1201).unwrap();
         assert_eq!(
             check_windows(&body),
             Err(WindowError::EndPgmInsideClause { index: 0 })
@@ -577,7 +577,7 @@ mod tests {
             valu(),
             endpgm(),
         ]);
-        build_blocks(&mut body).unwrap();
+        build_blocks(&mut body, crate::inst::Arch::Gfx1201).unwrap();
         let facts = check_windows(&body).unwrap();
         assert_eq!(facts.delays.len(), 1);
         let delay = &facts.delays[0];
@@ -602,7 +602,7 @@ mod tests {
             valu(),
             endpgm(),
         ]);
-        build_blocks(&mut body).unwrap();
+        build_blocks(&mut body, crate::inst::Arch::Gfx1201).unwrap();
         let facts = check_windows(&body).unwrap();
         let delay = &facts.delays[0];
         assert_eq!(
@@ -615,7 +615,7 @@ mod tests {
     #[test]
     fn no_dep_hint_resolves_empty() {
         let mut body = body_of(vec![valu(), delay_hint(0, 0, 0), valu(), endpgm()]);
-        build_blocks(&mut body).unwrap();
+        build_blocks(&mut body, crate::inst::Arch::Gfx1201).unwrap();
         let facts = check_windows(&body).unwrap();
         assert_eq!(facts.delays[0].producers(), Some([None, None]));
     }
@@ -650,7 +650,7 @@ mod instid1_tests {
         let mut arena: Arena<Inst> = Arena::new();
         let layout: Vec<_> = insts.into_iter().map(|i| arena.insert(i)).collect();
         let mut body = Body { insts: arena, blocks: Vec::new(), layout };
-        build_blocks(&mut body).unwrap();
+        build_blocks(&mut body, crate::inst::Arch::Gfx1201).unwrap();
         let facts = check_windows(&body).unwrap();
         let l = &body.layout;
         assert_eq!(facts.delays[0].consumers(), Some([Some(l[4]), Some(l[6])]));

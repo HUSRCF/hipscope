@@ -374,13 +374,13 @@ impl Analyzed<Program> {
         };
         let symbol = program.kernels[k].symbol.clone();
         let body = &program.kernels[k].body;
-        let lowered = lower_labels(body)?;
+        let lowered = lower_labels(body, program.target.arch)?;
         let mut inst_map = Vec::with_capacity(body.layout.len() + removed.len());
         let mut offset = 0u32;
         let mut reencoded_branches = Vec::new();
         for (&id, low) in body.layout.iter().zip(&lowered) {
             inst_map.push((id, Some(offset)));
-            offset += 4 * passes::cfg::dwords_of(low) as u32;
+            offset += 4 * passes::cfg::dwords_of(low, program.target.arch) as u32;
             let inst = body.insts.get(id).expect("laid out");
             if matches!(inst.effects.control, Control::Branch { .. } | Control::Jump) {
                 if let (Some(bytes), Ok(words)) = (inst.prov.bytes, crate::codec::gfx12::encode_for(program.target.arch, low)) {
@@ -432,17 +432,17 @@ pub fn digest(program: &Program, k: usize) -> StateDigest {
 
 /// Layout-ordered instructions with every `Operand::Label(b)` lowered to the
 /// SOPP simm16 dword offset from the next PC, computed from the current layout.
-pub fn lower_labels(body: &Body) -> Result<Vec<Inst>, EditError> {
+pub fn lower_labels(body: &Body, arch: Arch) -> Result<Vec<Inst>, EditError> {
     let mut pcs = Vec::with_capacity(body.layout.len() + 1);
     let mut pc = 0usize;
     for &id in &body.layout {
         pcs.push(pc);
-        pc += passes::cfg::dwords_of(body.insts.get(id).ok_or(EditError::UnknownInst(id))?);
+        pc += passes::cfg::dwords_of(body.insts.get(id).ok_or(EditError::UnknownInst(id))?, arch);
     }
     let mut out = Vec::with_capacity(body.layout.len());
     for (index, &id) in body.layout.iter().enumerate() {
         let mut inst = body.insts.get(id).ok_or(EditError::UnknownInst(id))?.clone();
-        let next = pcs[index] + passes::cfg::dwords_of(&inst);
+        let next = pcs[index] + passes::cfg::dwords_of(&inst, arch);
         for operand in inst.operands.iter_mut() {
             if let Operand::Label(target) = operand {
                 let block = body.blocks.get(target.0).ok_or_else(|| EditError::Label(format!("{id:?} targets missing block {target:?}")))?;
@@ -462,7 +462,7 @@ pub fn lower_labels(body: &Body) -> Result<Vec<Inst>, EditError> {
 pub fn encode_stream(body: &Body, arch: Arch) -> Result<Vec<u32>, EditError> {
     if !matches!(arch, Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1201) { return Err(EditError::Unsupported(format!("no codec for {arch:?}"))); }
     let mut words = Vec::new();
-    for (inst, &id) in lower_labels(body)?.iter().zip(&body.layout) {
+    for (inst, &id) in lower_labels(body, arch)?.iter().zip(&body.layout) {
         words.extend(crate::codec::gfx12::encode_for(arch, inst).map_err(|e| EditError::Encode { inst: id, reason: e.to_string() })?);
     }
     Ok(words)
@@ -2178,14 +2178,14 @@ mod tests {
             }
         }
         let mut pcs = vec![0usize];
-        for inst in &insts { pcs.push(pcs.last().unwrap() + passes::cfg::dwords_of(inst)); }
+        for inst in &insts { pcs.push(pcs.last().unwrap() + passes::cfg::dwords_of(inst, crate::inst::Arch::Gfx1201)); }
         for (at, target) in fixups {
             let off = pcs[labels[target]] as i64 - pcs[at + 1] as i64;
             insts[at].operands[0] = Operand::Imm(ImmField::Sopp(off as i16));
         }
         let mut body = Body::default();
         for inst in insts { let id = body.insts.insert(inst); body.layout.push(id); }
-        build_blocks(&mut body).unwrap();
+        build_blocks(&mut body, crate::inst::Arch::Gfx1201).unwrap();
         body
     }
 
@@ -2221,7 +2221,7 @@ mod tests {
             body.layout.push(id);
             index += count;
         }
-        build_blocks(&mut body).unwrap();
+        build_blocks(&mut body, crate::inst::Arch::Gfx1201).unwrap();
         let descriptor = KernelDescriptor { group_segment_fixed_size: 0, private_segment_fixed_size: 0, kernarg_size: 328,
             kernel_code_entry_byte_offset: 23_744, compute_pgm_rsrc3: Rsrc3(0x530), compute_pgm_rsrc1: Rsrc1(0xe00f_001d),
             compute_pgm_rsrc2: Rsrc2(0x384), kernel_code_properties: KernelCodeProperties(0x408), kernarg_preload: KernargPreload(0), reserved: [0; 28] };
@@ -2425,7 +2425,7 @@ mod tests {
         let claims = vec![claim("pm_pointer", sreg(28, 2), Scope::Whole), claim("pm_exec_save", sreg(31, 1), Scope::Whole),
             claim("pm_record", vreg(240, 8), Scope::Whole)];
         let record = profiler_entry();
-        let record_dwords: usize = record.iter().map(passes::cfg::dwords_of).sum();
+        let record_dwords: usize = record.iter().map(|inst| passes::cfg::dwords_of(inst, Arch::Gfx1201)).sum();
         let script = Edit::Batch(vec![
             Edit::Descriptor { kernel: kernel.clone(), change: DescriptorChange::KernargSize(352) },
             Edit::Metadata { kernel: kernel.clone(), change: MetaChange::AppendArgs(args.clone()) },

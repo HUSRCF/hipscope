@@ -9,11 +9,10 @@
 //! `Operand::Label(BlockId)`. Which instructions branch is read from
 //! `Effects.control` (`Branch`/`Jump`/`EndPgm`); this pass knows no opcode ids.
 //!
-//! PC model: dword offsets from the start of `layout`, where each
-//! instruction's width comes from [`dwords_of`] (form base width plus one when
-//! `literal` is present). The base widths are cross-checked against the pinned
-//! `isa::gfx12()` table by `table_widths_match_form_bases` (every sample row
-//! is either the base width or base+1 with `literal@last` in its grammar).
+//! PC model: dword offsets from the start of `layout`, using per-target form
+//! widths and one more dword when a literal follows. The pinned ISA tables
+//! carry sample words for both gfx11 and gfx12 (e.g. gfx1100
+//! `buffer_load_b64` is two dwords; gfx1201 VMEM is three).
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 
@@ -30,25 +29,23 @@ use crate::operand::{ImmField, Operand};
 
 /// Base dword width of one instruction word stream without a literal dword.
 ///
-/// Grounded in `isa/gfx12.tbl`: every sample encoding in the table has either
-/// this width or this width + 1 (the +1 rows all carry `literal@last` in their
-/// grammar); enforced by `table_widths_match_form_bases`.
-pub fn base_dwords(form: Form) -> usize {
+/// Grounded in the per-architecture ISA tables' encoding samples.
+pub fn base_dwords(form: Form, arch: crate::inst::Arch) -> usize {
     match form {
         Form::Sop1 | Form::Sop2 | Form::Sopc | Form::Sopk | Form::Sopp => 1,
         Form::Vop1 | Form::Vop2 | Form::Vopc => 1,
         Form::Smem => 2,
         Form::Vop1Dpp | Form::Vop2Dpp | Form::Vop3 | Form::Vop3p | Form::Vopd | Form::Vinterp => 2,
         Form::Ds => 2,
-        Form::Vmem(_) => 3,
+        Form::Vmem(_) => if arch == crate::inst::Arch::Gfx1201 { 3 } else { 2 },
         // No M1 table rows yet; provisional until the forms are tabled.
         Form::Export => 2,
     }
 }
 
-/// Dword width of a decoded instruction: base width plus one literal dword.
-pub fn dwords_of(inst: &Inst) -> usize {
-    base_dwords(inst.form) + usize::from(inst.literal.is_some())
+/// Dword width of a decoded instruction, including any literal.
+pub fn dwords_of(inst: &Inst, arch: crate::inst::Arch) -> usize {
+    base_dwords(inst.form, arch) + usize::from(inst.literal.is_some())
 }
 
 /// Dword PCs per layout position plus per-instruction widths, as computed by
@@ -115,7 +112,7 @@ pub fn containing_block(body: &Body, id: InstId) -> Option<BlockId> {
 
 /// Build `body.blocks` (plus preds/succs/terminators) from typed branch
 /// targets and rewrite branch offsets to `Operand::Label`.
-pub fn build_blocks(body: &mut Body) -> Result<LayoutInfo, CfgError> {
+pub fn build_blocks(body: &mut Body, arch: crate::inst::Arch) -> Result<LayoutInfo, CfgError> {
     if !body.blocks.is_empty() {
         return Err(CfgError::AlreadyBuilt);
     }
@@ -126,7 +123,7 @@ pub fn build_blocks(body: &mut Body) -> Result<LayoutInfo, CfgError> {
     let mut dwords = Vec::with_capacity(n);
     for id in &body.layout {
         let inst = body.insts.get(*id).ok_or(CfgError::DanglingInst { id: *id })?;
-        dwords.push(dwords_of(inst));
+        dwords.push(dwords_of(inst, arch));
     }
     let mut pcs = vec![0u32; n];
     let mut pc = 0u32;
@@ -628,24 +625,27 @@ mod tests {
 
     #[test]
     fn table_widths_match_form_bases() {
-        // Every pinned sample encoding is either the form base width (no
-        // literal) or base + 1 with `literal@last` in its grammar.
-        for row in isa::gfx12() {
-            let words = row.encoding.split_whitespace().count();
-            let base = base_dwords(row.form);
-            assert!(
-                words == base || words == base + 1,
-                "{} {:?}: {words} words vs base {base}",
-                row.name,
-                row.form
-            );
-            if words == base + 1 {
+        // AMD MR-ISA sample dwords (gfx1100/gfx1151) and pinned llvm-mc
+        // samples (gfx1201): base words, or base+1 with a literal. No gfx11
+        // MIMG NSA row is tabled; an unseen variable-length MIMG fails decode.
+        for arch in [crate::inst::Arch::Gfx1100, crate::inst::Arch::Gfx1151, crate::inst::Arch::Gfx1201] {
+            for row in isa::table(arch) {
+                let words = row.encoding.split_whitespace().count();
+                let base = base_dwords(row.form, arch);
                 assert!(
-                    row.grammar.contains("literal@last"),
-                    "{} {:?}: {words} words without a literal marker",
+                    words == base || words == base + 1,
+                    "{} {:?} {arch:?}: {words} words vs base {base}",
                     row.name,
                     row.form
                 );
+                if words == base + 1 {
+                    assert!(
+                        row.grammar.contains("literal@last"),
+                        "{} {:?} {arch:?}: {words} words without a literal marker",
+                        row.name,
+                        row.form
+                    );
+                }
             }
         }
     }
@@ -657,7 +657,7 @@ mod tests {
             plain("s_wait_dscnt", Form::Sopp),
             inst("s_endpgm", Form::Sopp, Control::EndPgm, Vec::new()),
         ]);
-        let info = build_blocks(&mut body).unwrap();
+        let info = build_blocks(&mut body, crate::inst::Arch::Gfx1201).unwrap();
         assert_eq!(info.pcs, vec![0, 1, 2]);
         assert_eq!(body.blocks.len(), 1);
         assert_eq!(body.blocks[0].term, Terminator::EndPgm);
@@ -682,7 +682,7 @@ mod tests {
             plain("v_sub_nc_u32_e32", Form::Vop2),
             inst("s_endpgm", Form::Sopp, Control::EndPgm, Vec::new()),
         ]);
-        let info = build_blocks(&mut body).unwrap();
+        let info = build_blocks(&mut body, crate::inst::Arch::Gfx1201).unwrap();
         // Entry-plus-target leaders exclude the fall-through-only leader @2.
         assert_eq!(info.entry_target_leaders, vec![0, 4, 5]);
         assert_eq!(body.blocks.len(), 4);
@@ -726,7 +726,7 @@ mod tests {
             sopp_branch("s_branch", None, -4),
             inst("s_endpgm", Form::Sopp, Control::EndPgm, Vec::new()),
         ]);
-        build_blocks(&mut body).unwrap();
+        build_blocks(&mut body, crate::inst::Arch::Gfx1201).unwrap();
         assert_eq!(body.blocks.len(), 4);
         assert!(matches!(body.blocks[2].term, Terminator::Jump(t) if t == BlockId(1)));
         let cfg = Cfg::build(&body).unwrap();
@@ -751,7 +751,7 @@ mod tests {
             sopp_branch("s_branch", None, -4),
             inst("s_endpgm", Form::Sopp, Control::EndPgm, Vec::new()),
         ]);
-        build_blocks(&mut body).unwrap();
+        build_blocks(&mut body, crate::inst::Arch::Gfx1201).unwrap();
         assert_eq!(body.blocks.len(), 5);
         let cfg = Cfg::build(&body).unwrap();
         assert_eq!(cfg.loops().len(), 1);
@@ -779,7 +779,7 @@ mod tests {
             inst("s_endpgm", Form::Sopp, Control::EndPgm, Vec::new()),
         ]);
         assert_eq!(
-            build_blocks(&mut body),
+            build_blocks(&mut body, crate::inst::Arch::Gfx1201),
             Err(CfgError::TargetMidInstruction { index: 0, target: 2 })
         );
 
@@ -788,7 +788,7 @@ mod tests {
             inst("s_endpgm", Form::Sopp, Control::EndPgm, Vec::new()),
         ]);
         assert_eq!(
-            build_blocks(&mut body),
+            build_blocks(&mut body, crate::inst::Arch::Gfx1201),
             Err(CfgError::TargetOutsideKernel { index: 0, target: 91 })
         );
     }
@@ -799,7 +799,7 @@ mod tests {
             plain("v_mov_b32_e32", Form::Vop1),
             plain("v_add_nc_u32_e32", Form::Vop2),
         ]);
-        assert_eq!(build_blocks(&mut body), Err(CfgError::MissingEndPgm));
+        assert_eq!(build_blocks(&mut body, crate::inst::Arch::Gfx1201), Err(CfgError::MissingEndPgm));
 
         // Padding after s_endpgm becomes Unreachable with no successors.
         let mut body = body_of(vec![
@@ -807,7 +807,7 @@ mod tests {
             plain("v_mov_b32_e32", Form::Vop1),
             plain("v_add_nc_u32_e32", Form::Vop2),
         ]);
-        build_blocks(&mut body).unwrap();
+        build_blocks(&mut body, crate::inst::Arch::Gfx1201).unwrap();
         assert_eq!(body.blocks.len(), 2);
         assert_eq!(body.blocks[0].term, Terminator::EndPgm);
         assert_eq!(body.blocks[1].term, Terminator::Unreachable);

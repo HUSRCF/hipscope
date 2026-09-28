@@ -128,7 +128,7 @@ mod kt48_tests {
             body.layout.push(id);
             index += count;
         }
-        build_blocks(&mut body).expect("CFG");
+        build_blocks(&mut body, crate::inst::Arch::Gfx1201).expect("CFG");
         body
     }
 

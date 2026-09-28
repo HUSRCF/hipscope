@@ -60,7 +60,7 @@ fn layout(kernel: &Kernel) -> Vec<&Inst> {
 }
 
 fn width(inst: &Inst) -> usize {
-    peacemaker_ir::passes::cfg::dwords_of(inst)
+    peacemaker_ir::passes::cfg::dwords_of(inst, peacemaker_ir::inst::Arch::Gfx1201)
 }
 
 /// File range of the selected kernel's code, from the lifted envelope.
@@ -416,7 +416,7 @@ fn decoder_agrees_with_pinned_objdump() {
     let body = &kernel.body;
     let lines = objdump_selected();
     assert_eq!(lines.len(), 1696);
-    let insts = emit::insts(kernel).unwrap();
+    let insts = emit::insts(kernel, ARCH).unwrap();
     let texts = emit::text(kernel, ARCH).unwrap();
     let pc = |index: usize| u64::from(body.insts.get(body.layout[index]).unwrap().prov.pc.expect("lifted pc"));
     let mut mismatches = Vec::new();
@@ -705,7 +705,7 @@ fn assembler_parity_where_syntax_is_lossless() {
     let lifted = lift(&kt48_co(), Frontend::Hipcc);
     let kernel = selected(&lifted.program);
     let lines = emit::text(kernel, ARCH).unwrap();
-    let insts = emit::insts(kernel).unwrap();
+    let insts = emit::insts(kernel, ARCH).unwrap();
     let index = insts.iter().position(|i| matches!(i.fields, FormFields::Vop3b { .. })).expect("KT48 has VOP3b");
     let FormFields::Vop3b { src2_unused } = insts[index].fields else { unreachable!() };
     let synth = Inst { fields: FormFields::Vop3b { src2_unused: if src2_unused == 0x80 { 0x00 } else { 0x80 } }, ..insts[index].clone() };

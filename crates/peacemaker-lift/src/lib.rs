@@ -243,7 +243,7 @@ fn lift_kernel(image: &KernelImage, slot: &KernelSlot, arch: Arch, frontend: Fro
         at += n;
     }
     let va_at = |index: usize| vas.get(index).copied().unwrap_or(image.entry_va);
-    build_blocks(&mut body).map_err(|e| {
+    build_blocks(&mut body, arch).map_err(|e| {
         let (index, rule) = match e {
             CfgError::TargetOutsideKernel { index, .. } | CfgError::TargetMidInstruction { index, .. } => (index, Rule::BranchTarget),
             CfgError::MissingOffset { index } | CfgError::UnexpectedLabel { index } => (index, Rule::ControlFlow),
@@ -389,14 +389,14 @@ pub mod emit {
 
     /// The kernel's instructions in layout order with every `Label` lowered to its SOPP
     /// offset (signed dwords from the next PC) under the current layout.
-    pub fn insts(kernel: &Kernel) -> Result<Vec<Inst>, EmitError> {
-        lower_labels(&kernel.body).map_err(|error| EmitError::Lower { kernel: kernel.symbol.0.clone(), error })
+    pub fn insts(kernel: &Kernel, arch: Arch) -> Result<Vec<Inst>, EmitError> {
+        lower_labels(&kernel.body, arch).map_err(|error| EmitError::Lower { kernel: kernel.symbol.0.clone(), error })
     }
 
     /// Encoded words of the kernel stream.
     pub fn words(kernel: &Kernel, arch: Arch) -> Result<Vec<u32>, EmitError> {
         let mut out = Vec::with_capacity(kernel.body.layout.len() * 2);
-        for (index, inst) in insts(kernel)?.iter().enumerate() {
+        for (index, inst) in insts(kernel, arch)?.iter().enumerate() {
             let encoded = gfx12::encode_for(arch, inst)
                 .map_err(|e| EmitError::Encode { kernel: kernel.symbol.0.clone(), index, reason: e.to_string() })?;
             out.extend_from_slice(&encoded);
@@ -412,7 +412,7 @@ pub mod emit {
     /// Canonical (pinned `llvm-objdump`) text, one line per instruction; the input of
     /// assembler parity (`mc(text(k)) == bytes(k)` where the syntax is lossless).
     pub fn text(kernel: &Kernel, arch: Arch) -> Result<Vec<String>, EmitError> {
-        Ok(kernel_lines(&insts(kernel)?, arch)?)
+        Ok(kernel_lines(&insts(kernel, arch)?, arch)?)
     }
 
     fn parts<'a>(program: &'a Program, codes: &'a [Vec<u8>]) -> Result<Vec<KernelParts<'a>>, EmitError> {

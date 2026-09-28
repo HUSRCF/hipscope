@@ -22,7 +22,7 @@ use crate::reg::Kind;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum LdsError {
-    #[error("LDS facts need the gfx1201 table (got {0:?})")]
+    #[error("LDS facts need a gfx11 or gfx12 opcode table (got {0:?})")]
     UnsupportedArch(Arch),
     #[error("layout refers to a tombstoned or missing instruction")]
     DanglingInst { id: InstId },
@@ -151,7 +151,7 @@ fn range_of(body: &Body, pos: usize) -> (usize, usize) {
 
 /// LDS facts for one kernel body.
 pub fn analyze(body: &Body, arch: Arch) -> Result<LdsAnalysis, LdsError> {
-    if arch != Arch::Gfx1201 {
+    if !matches!(arch, Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1201) {
         return Err(LdsError::UnsupportedArch(arch));
     }
     let whole = SegId(0);
@@ -313,7 +313,7 @@ mod kt48_tests {
             body.layout.push(id);
             index += count;
         }
-        build_blocks(&mut body).expect("CFG");
+        build_blocks(&mut body, crate::inst::Arch::Gfx1201).expect("CFG");
         body
     }
 

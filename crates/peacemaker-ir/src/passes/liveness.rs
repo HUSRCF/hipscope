@@ -470,7 +470,7 @@ mod tests {
             vuse(5),
             endpgm(),
         ]);
-        build_blocks(&mut body).unwrap();
+        build_blocks(&mut body, crate::inst::Arch::Gfx1201).unwrap();
         assert_eq!(body.blocks.len(), 4);
         let live = Liveness::analyze(&body);
         // v5 is live-in at the join and along both paths (may-analysis).
@@ -501,7 +501,7 @@ mod tests {
             vuse(200),
             endpgm(),
         ]);
-        build_blocks(&mut body).unwrap();
+        build_blocks(&mut body, crate::inst::Arch::Gfx1201).unwrap();
         assert_eq!(body.blocks.len(), 4);
         let live = Liveness::analyze(&body);
         assert!(live.live_in(BlockId(3)).contains(&Loc::V(200)));
@@ -528,7 +528,7 @@ mod tests {
             jump(-4),
             endpgm(),
         ]);
-        build_blocks(&mut body).unwrap();
+        build_blocks(&mut body, crate::inst::Arch::Gfx1201).unwrap();
         assert_eq!(body.blocks.len(), 5);
         let live = Liveness::analyze(&body);
         assert!(live.live_in(BlockId(1)).contains(&Loc::V(5)));
@@ -550,7 +550,7 @@ mod tests {
         predicated.effects.implicit.reads |= ImplicitSet::EXEC;
         predicated.effects.defs.push(RegRef { kind: Kind::V, base: 7, len: 1 });
         let mut body = body_of(vec![cmpx, predicated, endpgm()]);
-        build_blocks(&mut body).unwrap();
+        build_blocks(&mut body, crate::inst::Arch::Gfx1201).unwrap();
         let live = Liveness::analyze(&body);
         assert!(!live.live_in(BlockId(0)).contains(&Loc::ExecLo));
         let after_cmpx = live.live_after(body.layout[0]).unwrap();
@@ -561,7 +561,7 @@ mod tests {
     fn free_at_reports_coalesced_dead_ranges() {
         // v0 live across the cursor, everything else free.
         let mut body = body_of(vec![vdef(0), mk("v_mov_b32_e32", Form::Vop1), vuse(0), endpgm()]);
-        build_blocks(&mut body).unwrap();
+        build_blocks(&mut body, crate::inst::Arch::Gfx1201).unwrap();
         let live = Liveness::analyze(&body);
         let at = LivePoint { block: BlockId(0), before: Some(body.layout[1]) };
         let free = live.free_at(&body, at);
@@ -579,7 +579,7 @@ mod tests {
         // def v1; use v1 (kills the first def's range); def v1 again; endpgm.
         // v1 must not be live-in at entry.
         let mut body = body_of(vec![vdef(1), vuse(1), vdef(1), endpgm()]);
-        build_blocks(&mut body).unwrap();
+        build_blocks(&mut body, crate::inst::Arch::Gfx1201).unwrap();
         let live = Liveness::analyze(&body);
         assert!(!live.live_in(BlockId(0)).contains(&Loc::V(1)));
         // The first def's range ends at the use; the last def is dead.

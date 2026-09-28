@@ -7,10 +7,11 @@
 //!   comes from `Effects.mem.counters` (the C1 table column); the per-counter
 //!   unit weight comes from the same `isa/gfx12.tbl` row (`Km:1` vs `Km:2`).
 //! * Wait `s_wait_X n`: retire the oldest events of counter X until at most
-//!   `n` units remain, except `Km` and `Store` retire only at `n = 0`
-//!   (SMEM/stores are out of order) and `Load` retires partially only when
-//!   every pending `Load` event is one family (buffer vs global, the
-//!   `ledger.rs` family rule kept from `ledger_replay.rs:45-61`).
+//!   `n` units remain. `Km` and `Store` are out of order and retire only at
+//!   `n = 0`; gfx11 `Lgkm` retires partially when all outstanding events
+//!   belong to the in-order LDS family, but not when SMEM shares the counter.
+//!   `Load` retires partially only within one family (buffer vs global, the
+//!   `ledger.rs` rule kept from `ledger_replay.rs:45-61`).
 //! * Hazard: touching `defs` of a pending load (RAW/WAW), or redefining
 //!   `src_locks` of a pending store (WAR), before retirement is a finding.
 //!   Store locks are `Effects.uses` (the `ledger.rs` rule); the WAR def set
@@ -308,7 +309,18 @@ fn retire(
     count: u8,
 ) -> Vec<EventId> {
     if count != 0 {
-        if matches!(counter, Counter::Km | Counter::Store | Counter::Vs | Counter::Lgkm) {
+        if matches!(counter, Counter::Km | Counter::Store | Counter::Vs) {
+            return Vec::new();
+        }
+        // LLVM SIInsertWaitcnts.cpp::counterOutOfOrder: pre-gfx12 LGKM
+        // includes LDS and SMEM. SMEM reads can retire out of order; LDS
+        // accesses alone complete in issue order. A positive lgkmcnt can
+        // therefore retire the oldest LDS only if no SMEM/GDS/message event
+        // remains on any reaching path (the joined pending set is maximal).
+        if counter == Counter::Lgkm && state.pending.iter().any(|event| {
+            event.counters.contains(counter) && !event.satisfied.contains(counter)
+                && !matches!(event.class, MemClass::DsLoad | MemClass::DsStore)
+        }) {
             return Vec::new();
         }
         if counter == Counter::Load {
@@ -781,6 +793,42 @@ mod c5_tests {
         replay(body, Arch::Gfx1201).unwrap().obligations.is_empty()
     }
 
+    /// On gfx11 a positive lgkmcnt retires the oldest LDS access when no
+    /// SMEM shares LGKM. With mixed outstanding SMEM the same wait cannot
+    /// establish which earlier DS load has completed.
+    #[test]
+    fn gfx11_lgkm_partial_wait_respects_lds_order_and_smem_mixing() {
+        for arch in [Arch::Gfx1100, Arch::Gfx1151] {
+            let inst = |name: &str, operands: Vec<Operand>| {
+                let row = crate::isa::table(arch).iter().find(|row| row.name == name).expect(name);
+                Inst::from_parts(
+                    arch, row.op, row.form, FormFields::None,
+                    SmallVec::from_vec(operands), Modifiers::default(),
+                    None, Provenance::default(),
+                ).unwrap_or_else(|error| panic!("{arch:?} {name}: {error:?}"))
+            };
+            let ds = |dst| inst("ds_load_b32", vec![
+                v(dst, 1), v(9, 1), Operand::Imm(ImmField::DsOffset(0)),
+            ]);
+            let wait = crate::codec::gfx11::decode(arch, &[0xbf89_0432]).unwrap().0;
+            assert_eq!(wait.mods.wait.as_ref().unwrap().per_counter[Counter::Lgkm as usize], Some(3));
+            let consumer = || inst("v_add_f32_e32", vec![v(20, 1), v(1, 1), v(21, 1)]);
+            let ds_only = body_of(vec![ds(1), ds(2), ds(3), ds(4), wait.clone(), consumer()]);
+            assert!(replay(&ds_only, arch).unwrap().obligations.is_empty(), "{arch:?}: oldest LDS must retire");
+            let ds_later = body_of(vec![ds(1), ds(2), ds(3), ds(4), wait.clone(),
+                inst("v_add_f32_e32", vec![v(20, 1), v(2, 1), v(21, 1)])]);
+            assert!(replay(&ds_later, arch).unwrap().obligations.iter()
+                .any(|obligation| obligation.rule_id == "wait-raw-ds-load"));
+            let smem = inst("s_load_b32", vec![
+                s(20, 1), s(0, 2), Operand::Imm(ImmField::SmemOffset(0)),
+            ]);
+            let mixed = body_of(vec![ds(1), smem, ds(2), ds(3), ds(4), wait, consumer()]);
+            assert!(replay(&mixed, arch).unwrap().obligations.iter()
+                .any(|obligation| obligation.rule_id == "wait-raw-ds-load"),
+                "{arch:?}: SMEM makes partial lgkmcnt unable to prove LDS retirement");
+        }
+    }
+
     /// Linear `load_wait_uses_only_retired_destinations`, typed.
     #[test]
     fn load_wait_retires_oldest_first() {
@@ -985,7 +1033,7 @@ mod c5_tests {
             index += count;
         }
         assert_eq!(body.layout.len(), 1696);
-        build_blocks(&mut body).expect("KT48 CFG builds");
+        build_blocks(&mut body, crate::inst::Arch::Gfx1201).expect("KT48 CFG builds");
         body
     }
 
@@ -1149,7 +1197,7 @@ mod c5_tests {
         insts.push(vadd(2, 0, 3));
         insts.push(mi("s_endpgm", vec![]));
         let mut body = body_of(insts);
-        build_blocks(&mut body).unwrap();
+        build_blocks(&mut body, crate::inst::Arch::Gfx1201).unwrap();
         assert!(body.blocks.len() > 1500);
         let consumer = body.layout[body.layout.len() - 2];
         let replay = replay(&body, Arch::Gfx1201).unwrap();

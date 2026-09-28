@@ -253,7 +253,7 @@ fn scan_module(name: &str, path: &Path, indexed: bool, objdump: &Path, scratch: 
             if !roundtrip { return Err(format!("{name}: emit::module differs after successful lift").into()); }
             for kernel in &lifted.program.kernels {
                 let these = &kernel_lines[&kernel.symbol.0];
-                let emitted = emit::insts(kernel)?;
+                let emitted = emit::insts(kernel, arch)?;
                 let texts = emit::text(kernel, arch)?;
                 if these.len() != emitted.len() {
                     word_boundary_mismatches.push(format!("{}: {} objdump vs {} codec instructions", kernel.symbol.0, these.len(), emitted.len()));

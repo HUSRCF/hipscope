@@ -23,7 +23,7 @@ use crate::wait::Counter;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum BarrierError {
-    #[error("barrier analysis needs the gfx1201 table (got {0:?})")]
+    #[error("barrier analysis needs a gfx11 or gfx12 opcode table (got {0:?})")]
     UnsupportedArch(Arch),
     #[error(transparent)]
     Waits(#[from] waits::WaitError),
@@ -230,7 +230,7 @@ fn drain_obligation(id: InstId, what: &str) -> Obligation {
 
 /// Barrier pairing plus DS-drain checks for one kernel body.
 pub fn analyze(body: &Body, arch: Arch) -> Result<BarrierAnalysis, BarrierError> {
-    if arch != Arch::Gfx1201 {
+    if !matches!(arch, Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1201) {
         return Err(BarrierError::UnsupportedArch(arch));
     }
     for id in &body.layout {
@@ -326,7 +326,7 @@ mod kt48_tests {
             body.layout.push(id);
             index += count;
         }
-        build_blocks(&mut body).expect("CFG");
+        build_blocks(&mut body, crate::inst::Arch::Gfx1201).expect("CFG");
         body
     }
 

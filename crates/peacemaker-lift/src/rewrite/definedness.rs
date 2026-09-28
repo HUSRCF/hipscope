@@ -191,7 +191,7 @@ mod tests {
             layout.push(insts.insert(inst));
         }
         let mut body = Body { insts, blocks: Vec::new(), layout };
-        build_blocks(&mut body).unwrap();
+        build_blocks(&mut body, peacemaker_ir::inst::Arch::Gfx1201).unwrap();
         let descriptor = KernelDescriptor {
             group_segment_fixed_size: 0, private_segment_fixed_size: 0, kernarg_size: 0, kernel_code_entry_byte_offset: 0,
             compute_pgm_rsrc3: Rsrc3(0), compute_pgm_rsrc1: Rsrc1(0), compute_pgm_rsrc2: Rsrc2(2 << 1),
