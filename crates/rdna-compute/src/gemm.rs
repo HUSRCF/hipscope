@@ -334,6 +334,18 @@ fn g12_iu4_b1_image() -> &'static [u8] {
 /// under the 300 W cap. Parsed once so a producer and its consumers agree.
 static A4_SLAB: LazyLock<bool> =
     LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_A4_SLAB", true));
+/// Token-fastest grid for the slab HIN producer (`HIPFIRE_A4_HIN_TOKFAST`,
+/// default on; `=0` opts out): `fused_silu_mul_mq_rotate_awq_i4_hin_gfx12_slab_tokfast`
+/// on grid [N, K/256] instead of the group-fastest `_slab` twin on [K/256, N].
+/// The group-fastest order fills each 128-B slab-plane line from tokens 68
+/// workgroups apart; token-fastest fills it from neighbouring workgroups.
+/// Same per-workgroup math and stores, so byte-identical output.
+static A4_HIN_TOKFAST: LazyLock<bool> =
+    LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_A4_HIN_TOKFAST", true));
+#[inline]
+pub(crate) fn a4_hin_tokfast_enabled() -> bool {
+    *A4_HIN_TOKFAST
+}
 /// Quality receipts count the fused A4 GDN projection launches (print-only,
 /// one stderr line per launch). Kept off in production and all timing runs.
 static G12_IU4_GDN_COVERAGE: LazyLock<bool> =

@@ -4269,10 +4269,16 @@ impl Gpu {
         }
         self.ensure_mq_signs()?;
         let slab = !bf16_h && self.arch == "gfx1201" && self.a4_slab_active();
+        let tokfast = slab && crate::gemm::a4_hin_tokfast_enabled();
         let (source, kernel) = if bf16_h {
             (
                 kernels::FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_HIN_BF16_GFX12_SRC,
                 "fused_silu_mul_mq_rotate_awq_i4_hin_bf16_gfx12",
+            )
+        } else if tokfast {
+            (
+                kernels::FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_HIN_GFX12_SLAB_TOKFAST_SRC,
+                "fused_silu_mul_mq_rotate_awq_i4_hin_gfx12_slab_tokfast",
             )
         } else if slab {
             (
@@ -4316,7 +4322,7 @@ impl Gpu {
         let timer = crate::profile::begin_timer(&self.hip, "fused", kernel, bytes);
         let result = self.launch_maybe_blob(
             kernel,
-            [n_groups, batch_size as u32, 1],
+            if tokfast { [batch_size as u32, n_groups, 1] } else { [n_groups, batch_size as u32, 1] },
             [32, 1, 1],
             0,
             &mut params,

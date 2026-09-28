@@ -1792,6 +1792,19 @@ pub const FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_HIN_GFX12_SLAB_SRC: &str = concat!(
     "#define HIPFIRE_SILU_MQ_ROTATE_KERNEL fused_silu_mul_mq_rotate_awq_i4_hin_gfx12_slab\n",
     include_str!("../../../kernels/src/fused_silu_mul_mq_rotate_awq.hip")
 );
+/// Token-fastest-grid twin of the slab HIN (`HIPFIRE_GRID_TOKFAST`, grid
+/// [N, K/256]; selected unless `HIPFIRE_A4_HIN_TOKFAST=0`). The group-fastest
+/// slab grid fills each 128-B line of the `d`/`s`/`qs` planes from 32 or 4
+/// tokens dispatched K/256 workgroups apart; token-fastest fills it from
+/// consecutive workgroups. Same per-workgroup math and stores.
+pub const FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_HIN_GFX12_SLAB_TOKFAST_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n#define HIPFIRE_IU4_SLAB 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    "#define HIPFIRE_IU4_SIDECAR 1\n",
+    "#define HIPFIRE_SILU_HIN 1\n#define HIPFIRE_GRID_TOKFAST 1\n",
+    "#define HIPFIRE_SILU_MQ_ROTATE_KERNEL fused_silu_mul_mq_rotate_awq_i4_hin_gfx12_slab_tokfast\n",
+    include_str!("../../../kernels/src/fused_silu_mul_mq_rotate_awq.hip")
+);
 pub const FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_HIN_BF16_GFX12_SRC: &str = concat!(
     "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
     include_str!("../../../kernels/src/block_i4_128_quant.hip"),
