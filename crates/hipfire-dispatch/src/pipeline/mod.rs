@@ -31,11 +31,12 @@ pub use draft_head::{DraftHead, DraftHeadLayout, DraftHeadPolicy};
 pub(crate) mod layer_ops;
 pub(crate) mod steps;
 pub use layer_ops::{
-    execute_argmax, execute_clear, execute_embedding, execute_final_hyper, execute_gated_delta_net,
-    execute_grouped_depthwise, execute_hyper_read, execute_hyper_write, execute_indexed_attention,
-    execute_lm_head, project_weight, validate_lm_head, ClearOp, EmbeddingOp, GatedDeltaNetOp,
-    GdnRowCapture, GroupedDepthwiseOp, HyperReadOp, HyperWriteOp, IndexedAttentionMode,
-    IndexedAttentionOp, IndexedAttentionState,
+    execute_argmax, execute_broadcast_add, execute_clear, execute_embedding, execute_final_hyper,
+    execute_gated_delta_net, execute_grouped_depthwise, execute_hyper_norm, execute_hyper_read,
+    execute_hyper_write, execute_indexed_attention, execute_lm_head, execute_project,
+    project_weight, validate_lm_head, BroadcastAddOp, ClearOp, EmbeddingOp, GatedDeltaNetOp,
+    GdnRowCapture, GroupedDepthwiseOp, HyperNormOp, HyperReadOp, HyperWriteOp,
+    IndexedAttentionMode, IndexedAttentionOp, IndexedAttentionState, ProjectOp,
 };
 pub use steps::{
     execute_steps, execute_validated_steps, validate_steps, FusedPattern, GemvInput, Step,

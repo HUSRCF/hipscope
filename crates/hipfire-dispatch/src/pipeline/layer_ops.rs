@@ -2308,6 +2308,123 @@ pub fn execute_embedding(gpu: &mut Gpu, op: &EmbeddingOp<'_>) -> Result<(), Disp
     })
 }
 
+/// Grouped hyper-connection RMS norm: every row of `input` holds `branches`
+/// streams of `hidden`, normalized against one `branches * hidden` weight.
+pub struct HyperNormOp<'a> {
+    pub input: &'a GpuTensor,
+    pub norm_weight: &'a GpuTensor,
+    pub normalized: &'a GpuTensor,
+    pub branches: usize,
+    pub hidden: usize,
+    pub state_bf16: bool,
+}
+
+impl HyperNormOp<'_> {
+    pub fn validate_for_gpu(&self, _gpu: &Gpu) -> Result<(), DispatchError> {
+        let wide = checked_mul(self.branches, self.hidden, "hyper norm width")?;
+        let elements = self.input.numel();
+        if wide == 0
+            || self.input.dtype != DType::F32
+            || self.normalized.dtype != DType::F32
+            || elements == 0
+            || !elements.is_multiple_of(wide)
+            || self.normalized.numel() != elements
+            || self.norm_weight.dtype != DType::BF16
+            || self.norm_weight.numel() != wide
+        {
+            return Err(DispatchError::Hip(
+                "hyper norm has incompatible shape or dtype".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+pub fn execute_hyper_norm(gpu: &mut Gpu, op: &HyperNormOp<'_>) -> Result<(), DispatchError> {
+    hip(hyper_norm(
+        gpu,
+        &HyperNorm {
+            input: op.input,
+            norm_weight: op.norm_weight,
+            normalized: op.normalized,
+            branches: op.branches,
+            hidden: op.hidden,
+            state_bf16: op.state_bf16,
+        },
+    ))
+}
+
+/// One [`project_weight`] over `rows` row-major input rows.
+pub struct ProjectOp<'a> {
+    pub weight: WeightRef<'a>,
+    pub input: &'a GpuTensor,
+    pub output: &'a GpuTensor,
+    pub rows: usize,
+    /// FWHT basis scratch (`rows * k`), required by the rotated payloads.
+    pub rotation: Option<&'a GpuTensor>,
+}
+
+impl ProjectOp<'_> {
+    pub fn validate_for_gpu(&self, _gpu: &Gpu) -> Result<(), DispatchError> {
+        let (m, k) = (self.weight.m, self.weight.k);
+        if self.rows == 0 {
+            return Err(DispatchError::Hip("projection has no rows".into()));
+        }
+        require_weight(&self.weight, m, k, "projection")?;
+        let input = checked_mul(self.rows, k, "projection input")?;
+        require_tensor(self.input, input, DType::F32, "projection input")?;
+        let output = checked_mul(self.rows, m, "projection output")?;
+        require_tensor(self.output, output, DType::F32, "projection output")?;
+        if !matches!(self.weight.dtype, DType::BF16 | DType::Q8_0) {
+            let rotation = self.rotation.ok_or_else(|| {
+                DispatchError::Hip("rotated projection payload needs rotation scratch".into())
+            })?;
+            require_tensor(rotation, input, DType::F32, "projection rotation")?;
+        }
+        Ok(())
+    }
+}
+
+pub fn execute_project(gpu: &mut Gpu, op: &ProjectOp<'_>) -> Result<(), DispatchError> {
+    project_weight(gpu, &op.weight, op.input, op.output, op.rows, op.rotation)
+}
+
+/// `output[r] = rows_input[r] + row` for every one of `rows` rows of `width`.
+pub struct BroadcastAddOp<'a> {
+    pub rows_input: &'a GpuTensor,
+    pub row: &'a GpuTensor,
+    pub output: &'a GpuTensor,
+    pub rows: usize,
+    pub width: usize,
+}
+
+impl BroadcastAddOp<'_> {
+    pub fn validate_for_gpu(&self, _gpu: &Gpu) -> Result<(), DispatchError> {
+        if self.rows == 0 || self.width == 0 {
+            return Err(DispatchError::Hip(
+                "broadcast add has empty geometry".into(),
+            ));
+        }
+        let elements = checked_mul(self.rows, self.width, "broadcast add rows")?;
+        require_tensor(self.rows_input, elements, DType::F32, "broadcast add input")?;
+        require_tensor(self.output, elements, DType::F32, "broadcast add output")?;
+        require_tensor(self.row, self.width, DType::F32, "broadcast add row")
+    }
+}
+
+pub fn execute_broadcast_add(gpu: &mut Gpu, op: &BroadcastAddOp<'_>) -> Result<(), DispatchError> {
+    let row = view(op.row, 0, op.width);
+    for r in 0..op.rows {
+        let offset = r * op.width;
+        hip(gpu.add_f32(
+            &view(op.rows_input, offset, op.width),
+            &row,
+            &view(op.output, offset, op.width),
+        ))?;
+    }
+    Ok(())
+}
+
 /// Final hyper read uses the same operation contract as a regular read; this
 /// helper only supplies the projection-free final output shape.
 pub fn execute_final_hyper(gpu: &mut Gpu, op: &HyperReadOp<'_>) -> Result<(), DispatchError> {

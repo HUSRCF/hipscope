@@ -95,6 +95,14 @@ pub enum Step<'a> {
     GroupedDepthwise(crate::pipeline::layer_ops::GroupedDepthwiseOp<'a>),
     /// Launch-free clear of a preallocated scratch prefix.
     Clear(crate::pipeline::layer_ops::ClearOp<'a>),
+    /// Embedding-table lookup of device-resident token ids.
+    Embed(crate::pipeline::layer_ops::EmbeddingOp<'a>),
+    /// Grouped hyper-connection RMS norm.
+    HyperNorm(crate::pipeline::layer_ops::HyperNormOp<'a>),
+    /// One weight projection through the shared stateful-op contract.
+    Project(crate::pipeline::layer_ops::ProjectOp<'a>),
+    /// Per-row broadcast add of one activation row.
+    BroadcastAdd(crate::pipeline::layer_ops::BroadcastAddOp<'a>),
     /// Complete validated MoE program; granular operands come from its shared lowerer.
     Moe(sealed_moe::SealedMoeCall<'a>),
     /// Validated granular MoE stage; the sealed call is still the public authority.
@@ -121,6 +129,10 @@ fn op_kind(step: &Step) -> Option<PipelineOp> {
         | Step::HyperWrite(_)
         | Step::GroupedDepthwise(_)
         | Step::Clear(_)
+        | Step::Embed(_)
+        | Step::HyperNorm(_)
+        | Step::Project(_)
+        | Step::BroadcastAdd(_)
         | Step::Moe(_)
         | Step::MoeStage(..) => None,
     }
@@ -692,6 +704,10 @@ pub fn validate_steps<'a>(gpu: &Gpu, steps: &[Step<'a>]) -> Result<(), DispatchE
             Step::HyperWrite(op) => op.validate_for_gpu(gpu)?,
             Step::GroupedDepthwise(op) => op.validate_for_gpu(gpu)?,
             Step::Clear(op) => op.validate_for_gpu(gpu)?,
+            Step::Embed(op) => op.validate_for_gpu(gpu)?,
+            Step::HyperNorm(op) => op.validate_for_gpu(gpu)?,
+            Step::Project(op) => op.validate_for_gpu(gpu)?,
+            Step::BroadcastAdd(op) => op.validate_for_gpu(gpu)?,
             _ => {}
         }
     }
@@ -1178,6 +1194,10 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
             crate::pipeline::layer_ops::execute_grouped_depthwise(gpu, op)
         }
         Step::Clear(op) => crate::pipeline::layer_ops::execute_clear(gpu, op),
+        Step::Embed(op) => crate::pipeline::layer_ops::execute_embedding(gpu, op),
+        Step::HyperNorm(op) => crate::pipeline::layer_ops::execute_hyper_norm(gpu, op),
+        Step::Project(op) => crate::pipeline::layer_ops::execute_project(gpu, op),
+        Step::BroadcastAdd(op) => crate::pipeline::layer_ops::execute_broadcast_add(gpu, op),
         Step::Moe(call) => sealed_moe::execute_sealed(gpu, call),
         Step::MoeStage(op, stage) => op.execute_stage(gpu, *stage),
     }
