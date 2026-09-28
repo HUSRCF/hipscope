@@ -55,6 +55,17 @@
 // xor-consumed, so the epilogue reads the residual from the memory-side
 // cache instead of DRAM. Screened on Halo: touching over the last 8 epochs
 // or at kernel start is slower. Output bytes are identical to `_add`.
+//
+// ADD_TOUCH_SWZ (`_add_touch_swz`, FFN down): `_add_touch` with a grouped
+// CTA raster (GRP row tiles fastest in dispatch order), so a dispatch round
+// shares its token tiles' A4 activation (80 MB at N8192, above the 32 MiB
+// MALL) across GRP row tiles. Same tiles, same per-tile arithmetic: output
+// bytes identical to `_add_touch`.
+//
+// SET_ZBA (`_set_zba`, GDN Z|beta|alpha): SET over the folded Z rows
+// (M = ZM + 256) whose epilogue writes Z [N][ZM] and the last tile's rows
+// 0..47 / 48..95 to beta / alpha [N][48], dropping the padding rows; the
+// bytes of `_set` followed by split_mq4v2_z_betaalpha.
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
@@ -145,7 +156,7 @@ static __device__ __forceinline__ void stage_store(const Stage& st, char* slot,
 
 #define IU4_V2B_SILU_MUL(g, u) ((g) / (1.0f + expf(-(g))) * (u))
 
-enum { EPI_SET = 0, EPI_ADD = 1, EPI_SILU = 2 };
+enum { EPI_SET = 0, EPI_ADD = 1, EPI_SILU = 2, EPI_ZBA = 3 };
 
 // Residual touch: one dword per TOUCH_LINE bytes, one line per thread per
 // epoch, starting TOUCH_LEAD epochs before the end of the K loop.
@@ -154,10 +165,11 @@ constexpr int TOUCH_LINE = 64;
 constexpr int TOUCH_LINES = TN * TM * 4 / TOUCH_LINE / NT;  // per thread
 static_assert(TOUCH_LINES == 8 && TOUCH_LINES <= TOUCH_LEAD, "touch schedule");
 
-template <int EPI, bool TOUCH = false>
+template <int EPI, bool TOUCH = false, bool SWZ = false>
 static __device__ __forceinline__ void body(
     const char* __restrict__ A, const char* __restrict__ U, const char* __restrict__ Xq,
-    float* __restrict__ Y, int M, int K, int N) {
+    float* __restrict__ Y, int M, int K, int N, int grp = 0,
+    float* __restrict__ Beta = nullptr, float* __restrict__ Alpha = nullptr, int ZM = 0) {
     constexpr bool IS_ADD = EPI == EPI_ADD;
     constexpr bool SILU = EPI == EPI_SILU;
     static_assert(IS_ADD || !TOUCH, "touch is an ADD epilogue lever");
@@ -169,8 +181,27 @@ static __device__ __forceinline__ void body(
     const int lr = lane & 15;
     const int hi = lane >> 4;
     const int prow = 8 * (lr & 1) + (lr >> 1);
-    const int row0 = blockIdx.y * TM;
-    const int col0 = blockIdx.x * TN;
+    // Unsigned like blockIdx, so the unswizzled entries keep their codegen.
+    unsigned by = blockIdx.y;
+    unsigned bx = blockIdx.x;
+    if constexpr (SWZ) {
+        // Grouped raster: the dispatch-order linear id walks `grp` row tiles
+        // fastest, then token tiles, so each dispatch round covers a
+        // grp x (round/grp) block and re-reads X tiles from the memory-side
+        // cache instead of DRAM. Bijective; the last group may be short.
+        const int nx = gridDim.x;
+        const int ny = gridDim.y;
+        const int lin = blockIdx.y * nx + blockIdx.x;
+        const int span = grp * nx;
+        const int g = lin / span;
+        const int first = g * grp;
+        const int gsz = min(grp, ny - first);
+        const int rem = lin - g * span;
+        by = first + rem % gsz;
+        bx = rem / gsz;
+    }
+    const int row0 = by * TM;
+    const int col0 = bx * TN;
     const int E = K >> 7;
     const uint32_t row_bytes = (uint32_t)(K >> 8) * GROUP_BYTES;
     const size_t x_epoch = (size_t)N * XBLK_BYTES;
@@ -370,6 +401,45 @@ static __device__ __forceinline__ void body(
         }
         return;
     }
+    if constexpr (EPI == EPI_ZBA) {
+        // Z|beta|alpha scatter (replaces split_mq4v2_z_betaalpha): M is the
+        // folded row count ZM + 256. Row tiles below ZM store SET to Z
+        // [N][ZM]; the last tile stores its rows 0..47 to Beta [N][48] and
+        // 48..95 to Alpha [N][48] and drops the padding rows.
+        if (row0 < ZM) {
+            float* ztile = Y + (size_t)col0 * ZM + row0;
+#pragma unroll
+            for (int c = 0; c < NC; ++c) {
+                const uint32_t zoff = ((uint32_t)(wc * 64 + 16 * c + lr) * (uint32_t)ZM +
+                                       (uint32_t)(wr * WAVE_ROWS + 8 * hi)) * 4u;
+#pragma unroll
+                for (int a = 0; a < NA; ++a)
+#pragma unroll
+                    for (int q = 0; q < 2; ++q)
+                        *(v4f*)((char*)ztile + zoff + (uint32_t)(16 * a + 4 * q) * 4u) =
+                            (v4f){sum[a][c][4 * q + 0], sum[a][c][4 * q + 1],
+                                  sum[a][c][4 * q + 2], sum[a][c][4 * q + 3]};
+            }
+        } else {
+#pragma unroll
+            for (int c = 0; c < NC; ++c) {
+                const size_t tok = (size_t)(col0 + wc * 64 + 16 * c + lr);
+#pragma unroll
+                for (int a = 0; a < NA; ++a)
+#pragma unroll
+                    for (int q = 0; q < 2; ++q) {
+                        const int r = wr * WAVE_ROWS + 16 * a + 8 * hi + 4 * q;
+                        const v4f v = (v4f){sum[a][c][4 * q + 0], sum[a][c][4 * q + 1],
+                                            sum[a][c][4 * q + 2], sum[a][c][4 * q + 3]};
+                        if (r < 48)
+                            *(v4f*)(Beta + tok * 48 + r) = v;
+                        else if (r < 96)
+                            *(v4f*)(Alpha + tok * 48 + (r - 48)) = v;
+                    }
+            }
+        }
+        return;
+    }
     // Epilogue: lane owns rows 8*hi..8*hi+7 of each fragment for one token.
     float* ytile = Y + (size_t)col0 * M + row0;
     uint32_t yoff[NC];
@@ -433,6 +503,25 @@ gemm_mq4g256v2_gate_up_silu_iu4_v2b_gfx11(
     float* __restrict__ Y, int M, int K, int N) {
     iu4_v2b::body<iu4_v2b::EPI_SILU>(G, U, Xq, Y, M, K, N);
 }
+#if defined(__gfx1151__)
+// gfx1151-only twins (32 MiB MALL; the gfx1100 object stays code-identical).
+// FFN down with a grouped raster (see body<SWZ>): same grid (N/256, M/256)
+// and output bytes as `_add_touch`; GRP row tiles per raster group.
+extern "C" __global__ __launch_bounds__(iu4_v2b::NT, 1) void
+gemm_mq4g256v2_residual_iu4_v2b_add_touch_swz_gfx11(
+    const char* __restrict__ A, const char* __restrict__ Xq,
+    float* __restrict__ Y, int M, int K, int N, int GRP) {
+    iu4_v2b::body<iu4_v2b::EPI_ADD, true, true>(A, nullptr, Xq, Y, M, K, N, GRP);
+}
+// Z|beta|alpha SET with the split fused into the epilogue: A = the folded
+// Z rows (M = ZM + 256, ZM % 256 == 0), Z [N][ZM], Beta/Alpha [N][48].
+extern "C" __global__ __launch_bounds__(iu4_v2b::NT, 1) void
+gemm_mq4g256v2_residual_iu4_v2b_set_zba_gfx11(
+    const char* __restrict__ A, const char* __restrict__ Xq, float* __restrict__ Z,
+    float* __restrict__ Beta, float* __restrict__ Alpha, int M, int K, int N, int ZM) {
+    iu4_v2b::body<iu4_v2b::EPI_ZBA>(A, nullptr, Xq, Z, M, K, N, 0, Beta, Alpha, ZM);
+}
+#endif  // __gfx1151__
 #undef IU4_V2B_SILU_MUL
 #undef IU4_V2B_FENCE
 

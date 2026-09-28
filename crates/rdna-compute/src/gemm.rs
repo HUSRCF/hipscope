@@ -487,6 +487,11 @@ enum Mq4v2QkvVariant {
     K2048XBufferGfx1100,
 }
 
+/// V2B FFN-down raster group (row tiles per group) when
+/// `HIPFIRE_V2B_DOWN_SWZ` is unset (the V2B branch of
+/// `gemm_mq4g256v2_mmq_prequant_iu4`).
+const V2B_DOWN_SWZ_GRP: i32 = 4;
+
 /// GEMM v2 tile of an exact-gfx11 symmetric IU4 full-tile prefill GEMM
 /// (`Gpu::iu4_v2_tile`). Both read the unchanged MQ4V2 / `block_i4_128`
 /// layouts and are bit-identical to X5.
@@ -20539,6 +20544,25 @@ impl Gpu {
                 (true, true, false) => "gemm_mq4g256v2_residual_iu4_v2b_add_touch_gfx11",
                 (true, false, _) => "gemm_mq4g256v2_residual_iu4_v2b_add_gfx11",
             };
+            // FFN down raster (`HIPFIRE_V2B_DOWN_SWZ`, row tiles per group;
+            // `0` restores the token-fastest `_add_touch` order): the only
+            // `_add_touch` site is FFN down, whose A4 activation exceeds the
+            // 32 MiB MALL; grouping row tiles lets each dispatch round re-read
+            // its X tiles from the MALL. Byte-identical to `_add_touch`.
+            let swz_grp = if kernel_name == "gemm_mq4g256v2_residual_iu4_v2b_add_touch_gfx11" {
+                hipfire_config::developer_var("HIPFIRE_V2B_DOWN_SWZ")
+                    .ok()
+                    .and_then(|v| v.parse::<i32>().ok())
+                    .unwrap_or(V2B_DOWN_SWZ_GRP)
+                    .clamp(0, (m / 256) as i32)
+            } else {
+                0
+            };
+            let kernel_name = if swz_grp > 0 {
+                "gemm_mq4g256v2_residual_iu4_v2b_add_touch_swz_gfx11"
+            } else {
+                kernel_name
+            };
             self.ensure_kernel(
                 "gemm_mq4g256v2_residual_iu4_v2b_gfx11",
                 kernels::GEMM_MQ4G256V2_RESIDUAL_IU4_V2B_GFX11_SRC,
@@ -20550,6 +20574,7 @@ impl Gpu {
             let mut m_val = m as i32;
             let mut k_val = k as i32;
             let mut n_val = batch_size as i32;
+            let mut grp_val = swz_grp;
             let mut params: Vec<*mut c_void> = vec![
                 &mut a_ptr as *mut _ as *mut c_void,
                 &mut xq_ptr as *mut _ as *mut c_void,
@@ -20558,6 +20583,9 @@ impl Gpu {
                 &mut k_val as *mut _ as *mut c_void,
                 &mut n_val as *mut _ as *mut c_void,
             ];
+            if swz_grp > 0 {
+                params.push(&mut grp_val as *mut _ as *mut c_void);
+            }
             const V2B_LDS_BYTES: u32 = Iu4V2Tile::V2b.lds_bytes();
             let bytes = m * (k / 256) * crate::dispatch::MQ4V2_GROUP_BYTES + batch_size * m * 4;
             let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
@@ -20576,6 +20604,9 @@ impl Gpu {
                     b.push_i32(m_val);
                     b.push_i32(k_val);
                     b.push_i32(n_val);
+                    if swz_grp > 0 {
+                        b.push_i32(swz_grp);
+                    }
                     b
                 },
             );
@@ -30746,6 +30777,19 @@ impl Gpu {
         }
         let xq = self.int4_mmq_prepared_ptr(prepared, k, n)?;
         self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_qkv, xq, y_qkv, qkv_m, k, n)?;
+        // Halo V2B: scatter Z|beta|alpha straight from the SET epilogue
+        // (`HIPFIRE_V2B_ZBA_SCATTER=0` restores SET + split). Byte-identical
+        // outputs; deletes the split's folded read and Z/beta/alpha rewrite.
+        if folded_m == z_m + 256
+            && z_m % 256 == 0
+            && self.iu4_v2_tile(folded_m, k, n) == Some(Iu4V2Tile::V2b)
+            && y_z.byte_size() >= n * z_m * 4
+            && y_beta.byte_size() >= n * 48 * 4
+            && y_alpha.byte_size() >= n * 48 * 4
+            && hipfire_config::developer_var("HIPFIRE_V2B_ZBA_SCATTER").as_deref() != Ok("0")
+        {
+            return self.gemm_zba_v2b_scatter(a_z_fold, xq, y_z, y_beta, y_alpha, z_m, k, n);
+        }
         self.gemm_mq4g256v2_mmq_set_prequant_iu4(
             a_z_fold, xq, y_z_fold, folded_m, k, n,
         )?;
@@ -30784,6 +30828,72 @@ impl Gpu {
                 b.push_i32(zm);
                 b.push_i32(fm);
                 b.push_i32(nv);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// V2B Z|beta|alpha SET with the split in its epilogue
+    /// (`gemm_mq4g256v2_residual_iu4_v2b_set_zba_gfx11`): the folded Z rows
+    /// (M = z_m + 256) write Z [N][z_m], beta and alpha [N][48] directly.
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_zba_v2b_scatter(
+        &mut self,
+        a_z_fold: &GpuTensor,
+        xq: *mut c_void,
+        y_z: &GpuTensor,
+        y_beta: &GpuTensor,
+        y_alpha: &GpuTensor,
+        z_m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        const NAME: &str = "gemm_mq4g256v2_residual_iu4_v2b_set_zba_gfx11";
+        let folded_m = z_m + 256;
+        self.bind_thread()?;
+        self.flush_residual_fold()?;
+        self.ensure_kernel(
+            "gemm_mq4g256v2_residual_iu4_v2b_gfx11",
+            kernels::GEMM_MQ4G256V2_RESIDUAL_IU4_V2B_GFX11_SRC,
+            NAME,
+        )?;
+        let mut a_ptr = a_z_fold.buf.as_ptr();
+        let mut xq_ptr = xq;
+        let mut outs = [y_z, y_beta, y_alpha].map(|t| t.buf.as_ptr());
+        let mut ints = [folded_m as i32, k as i32, n as i32, z_m as i32];
+        let [o0, o1, o2] = &mut outs;
+        let [i0, i1, i2, i3] = &mut ints;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut xq_ptr as *mut _ as *mut c_void,
+            o0 as *mut _ as *mut c_void,
+            o1 as *mut _ as *mut c_void,
+            o2 as *mut _ as *mut c_void,
+            i0 as *mut _ as *mut c_void,
+            i1 as *mut _ as *mut c_void,
+            i2 as *mut _ as *mut c_void,
+            i3 as *mut _ as *mut c_void,
+        ];
+        let bytes = folded_m * (k / 256) * crate::dispatch::MQ4V2_GROUP_BYTES + n * (z_m + 96) * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", NAME, bytes);
+        let blob = (a_ptr, xq_ptr, outs, ints);
+        let result = self.launch_maybe_blob(
+            NAME,
+            [(n / 256) as u32, (folded_m / 256) as u32, 1],
+            [32, 16, 1],
+            Iu4V2Tile::V2b.lds_bytes(),
+            &mut params,
+            || {
+                let (a, x, outs, ints) = blob;
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a);
+                b.push_ptr(x);
+                for p in outs { b.push_ptr(p); }
+                for i in ints { b.push_i32(i); }
                 b
             },
         );
