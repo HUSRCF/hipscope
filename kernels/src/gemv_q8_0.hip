@@ -358,10 +358,12 @@ static __device__ __forceinline__ void q8_topk_block_best(float& v, int& i, floa
 }
 
 // Grid G, block 256: block b's top 8 of v[b*chunk, (b+1)*chunk) -> pv/pi[b*8 + j].
-// chunk <= 256 * 8.
+// chunk <= 256 * 8. Row j of v is token j, except for a head reordered as
+// [0, front) ++ [special, special + tail) ++ [front, special): pi gets token ids.
 __launch_bounds__(256)
 extern "C" __global__ void topk8_partial_f32(
-    const float* __restrict__ v, int n, int chunk, float* __restrict__ pv, int* __restrict__ pi
+    const float* __restrict__ v, int n, int chunk, float* __restrict__ pv, int* __restrict__ pi,
+    int front, int special, int tail
 ) {
     __shared__ float sv[8];
     __shared__ int si[8];
@@ -386,7 +388,11 @@ extern "C" __global__ void topk8_partial_f32(
 #pragma unroll
         for (int u = 0; u < 8; ++u)
             if (idx[u] == bi) { val[u] = -INFINITY; idx[u] = 0x7fffffff; }
-        if (threadIdx.x == 0) { pv[blockIdx.x * 8 + round] = bv; pi[blockIdx.x * 8 + round] = bi; }
+        if (threadIdx.x == 0) {
+            const int token = bi < front ? bi : (bi < front + tail ? bi - front + special : bi - tail);
+            pv[blockIdx.x * 8 + round] = bv;
+            pi[blockIdx.x * 8 + round] = token;
+        }
     }
 }
 

@@ -1076,6 +1076,59 @@ pub struct Qwen4MtpGpu {
     /// top-8 scratch for re-scoring the draft head's best 8 exactly, so the
     /// draft is the Q8_0 head's argmax whenever it ranks there.
     draft_rescore: Option<GpuTensor>,
+    /// With re-scoring: the draft head's rows are laid out token ids
+    /// `[0, draft_front)` (BPE merge order puts the frequent tokens first),
+    /// then EOS and the control tokens after it, then the rest, and a draft
+    /// step ranks only the first two ranges while no recent input token was
+    /// outside them (0 = whole vocabulary always).
+    draft_front: usize,
+    /// Draft steps still ranking the whole vocabulary after such a token.
+    draft_full_steps: u32,
+}
+
+/// Draft-head front: tokens below this id, plus EOS and the control ids
+/// after it, covered every non-control token of the committed English/code
+/// prompt set except rare multilingual ones and cut the draft head read 60%.
+const DRAFT_FRONT: usize = 100_000;
+/// Draft steps that rank the whole vocabulary after an input token outside
+/// the front (non-English text keeps the full head).
+const DRAFT_FULL_HOLD: u32 = 64;
+
+/// `head` (`vocab` equal rows) reordered `[0, front) ++ [special, vocab)
+/// ++ [front, special)`; `front == 0` keeps it.
+fn front_first(
+    gpu: &mut Gpu,
+    head: GpuTensor,
+    front: usize,
+    special: usize,
+    vocab: usize,
+) -> hip_bridge::HipResult<GpuTensor> {
+    if front == 0 {
+        return Ok(head);
+    }
+    let stride = head.buf.size() / vocab;
+    let out = match gpu.alloc_tensor(&head.shape, head.dtype) {
+        Ok(out) => out,
+        Err(error) => {
+            let _ = gpu.free_tensor(head);
+            return Err(error);
+        }
+    };
+    let mut dst = 0;
+    let mut copied = Ok(());
+    for (start, end) in [(0, front), (special, vocab), (front, special)] {
+        let bytes = (end - start) * stride;
+        copied = copied
+            .and_then(|_| gpu.memcpy_dtod_at_auto(&out.buf, dst, &head.buf, start * stride, bytes));
+        dst += bytes;
+    }
+    let copied = copied.and_then(|_| gpu.hip.device_synchronize());
+    let freed = gpu.free_tensor(head);
+    if let Err(error) = copied.and(freed) {
+        let _ = gpu.free_tensor(out);
+        return Err(error);
+    }
+    Ok(out)
 }
 
 /// What one MTP head step must produce.
@@ -1137,9 +1190,29 @@ impl Qwen4MtpGpu {
                 DType::Q8_0 | DType::BF16 | DType::MQ6G256V2 | DType::MQ5G256V2
             ) && format != lm_head.dtype
         });
+        let rescore = rescore
+            && draft_format.is_some()
+            && lm_head.dtype == DType::Q8_0
+            && config.hidden_size == 2560;
+        let eos = config.eos_token_id as usize;
+        let draft_front = if rescore && DRAFT_FRONT < eos {
+            DRAFT_FRONT
+        } else {
+            0
+        };
         let draft_head = match draft_format {
             Some(format) => {
-                match gpu.requant_g256(lm_head, config.vocab_size, config.hidden_size, format) {
+                match gpu
+                    .requant_g256(lm_head, config.vocab_size, config.hidden_size, format)
+                    .and_then(|copy| {
+                        front_first(
+                            gpu,
+                            copy,
+                            draft_front,
+                            eos,
+                            config.vocab_size,
+                        )
+                    }) {
                     Ok(copy) => Some(copy),
                     Err(error) => {
                         let _ = moe.free_gpu(gpu);
@@ -1151,11 +1224,7 @@ impl Qwen4MtpGpu {
             }
             None => None,
         };
-        let draft_rescore = if rescore
-            && draft_head.is_some()
-            && lm_head.dtype == DType::Q8_0
-            && config.hidden_size == 2560
-        {
+        let draft_rescore = if rescore {
             Some(gpu.zeros(&[Gpu::TOPK8_PARTIAL_BYTES], DType::Raw)?)
         } else {
             None
@@ -1167,6 +1236,8 @@ impl Qwen4MtpGpu {
             max_seq,
             draft_head,
             draft_rescore,
+            draft_front,
+            draft_full_steps: 0,
         })
     }
 
@@ -1330,6 +1401,10 @@ impl Qwen4MtpGpu {
         let next_position = position
             .checked_add(1)
             .ok_or_else(|| invalid("MTP position overflow"))?;
+        let eos = config.eos_token_id as usize;
+        if (self.draft_front..eos).contains(&(token as usize)) {
+            self.draft_full_steps = DRAFT_FULL_HOLD;
+        }
         let scratch = &mut self.scratch;
         let state = &mut self.state;
         let backbone_hidden = backbone_hidden.unwrap_or(&scratch.backbone_hidden);
@@ -1732,19 +1807,27 @@ impl Qwen4MtpGpu {
                 Some(head) => head,
                 None => weights.resident(&weights.root.lm_head)?,
             };
+            let vocab = config.vocab_size;
+            let (ranked, order) = match (self.draft_front, self.draft_full_steps) {
+                (0, _) => (vocab, (vocab, vocab, 0)),
+                (front, 0) => (front + vocab - eos, (front, eos, vocab - eos)),
+                (front, _) => (vocab, (front, eos, vocab - eos)),
+            };
+            self.draft_full_steps = self.draft_full_steps.saturating_sub(1);
             dispatch_gemv(
                 gpu,
                 lm_head,
                 &scratch.hc_mixed,
                 &scratch.rotation,
                 &scratch.logits,
-                config.vocab_size,
+                ranked,
                 config.hidden_size,
             )?;
             if let Some(partial) = self.draft_rescore.as_ref() {
                 gpu.q8_0_topk8_rescore_k2560(
                     &scratch.logits,
-                    config.vocab_size,
+                    ranked,
+                    order,
                     weights.resident(&weights.root.lm_head)?,
                     &scratch.hc_mixed,
                     partial,

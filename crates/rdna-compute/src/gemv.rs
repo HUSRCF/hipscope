@@ -14560,13 +14560,18 @@ impl Gpu {
     }
 
     /// Argmax of `head_q8 · x` (Q8_0, K = 2560) restricted to the top 8
-    /// entries of the approximate `logits` (`n` = vocabulary), each scored
-    /// with the decode kernel's exact dot; the token id lands in `out[0]`.
-    /// `partial` is scratch of at least [`Gpu::TOPK8_PARTIAL_BYTES`].
+    /// entries of the approximate `logits` (`n` rows), each scored with the
+    /// decode kernel's exact dot; the token id lands in `out[0]`. Logit row j
+    /// is token j unless `order = (front, special, tail)` says the ranking head
+    /// was laid out `[0, front) ++ [special, special + tail) ++ [front, special)`
+    /// (identity: `front >= n`). `partial` is scratch of at least
+    /// [`Gpu::TOPK8_PARTIAL_BYTES`].
+    #[allow(clippy::too_many_arguments)]
     pub fn q8_0_topk8_rescore_k2560(
         &mut self,
         logits: &GpuTensor,
         n: usize,
+        order: (usize, usize, usize),
         head_q8: &GpuTensor,
         x: &GpuTensor,
         partial: &GpuTensor,
@@ -14593,12 +14598,16 @@ impl Gpu {
             unsafe { (partial.buf.as_ptr() as *mut u8).add(GROUPS * 8 * 4) as *mut c_void };
         let n_val = n as i32;
         let chunk_val = chunk as i32;
+        let (front, special, tail) = (order.0 as i32, order.1 as i32, order.2 as i32);
         let mut params = [
             &v_ptr as *const _ as *mut c_void,
             &n_val as *const _ as *mut c_void,
             &chunk_val as *const _ as *mut c_void,
             &pv_ptr as *const _ as *mut c_void,
             &pi_ptr as *const _ as *mut c_void,
+            &front as *const _ as *mut c_void,
+            &special as *const _ as *mut c_void,
+            &tail as *const _ as *mut c_void,
         ];
         self.launch_maybe_blob(
             "topk8_partial_f32",
@@ -14613,6 +14622,9 @@ impl Gpu {
                 b.push_i32(chunk_val);
                 b.push_ptr(pv_ptr);
                 b.push_ptr(pi_ptr);
+                b.push_i32(front);
+                b.push_i32(special);
+                b.push_i32(tail);
                 b
             },
         )?;
