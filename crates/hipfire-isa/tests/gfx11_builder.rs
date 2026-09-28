@@ -98,12 +98,20 @@ fn hot_loop(text: &str) -> String {
     text[start..end].to_owned()
 }
 
-/// ADD (with or without the residual touch) differs from SET only in its
-/// epilogue: the steady-state K loop is SET's, instruction for instruction.
+/// ADD's steady-state K loop is SET's plus, per epoch, one EXEC-gated
+/// residual touch (scalar window test and address, one dword load) and
+/// nothing else: the fold, staging and fragment streams are unchanged.
 #[test]
-fn v2c_add_runs_the_set_k_loop() {
-    let set = hot_loop(&v2c().s_text);
-    for epi in [iu4_v2c::Epi::Add, iu4_v2c::Epi::AddTouch] { assert!(hot_loop(&v2c_epi(epi).s_text) == set, "{epi:?}"); }
+fn v2c_add_runs_the_set_k_loop_plus_a_gated_touch() {
+    let set = iu4_v2c::hot_loop_census(&v2c().s_text);
+    let add = iu4_v2c::hot_loop_census(&v2c_epi(iu4_v2c::Epi::Add).s_text);
+    for (name, extra) in [("v_wmma_i32_16x16x16_iu4", 0), ("vopd_packets", 0), ("valu_slots", 0), ("ds_load_2addr_b64", 0), ("ds_store_2addr_b64", 0),
+        ("global_load_b64", 0), ("global_load_u16", 0), ("global_load_b32", 2), ("s_cselect_b32", 2), ("s_mov_b32", 2), ("s_barrier", 0)] {
+        assert_eq!(add.get(name).copied().unwrap_or(0), set.get(name).copied().unwrap_or(0) + extra, "{name}");
+    }
+    let text = hot_loop(&v2c_epi(iu4_v2c::Epi::Add).s_text);
+    assert_eq!(text.matches("s_cselect_b32 exec_lo, -1, 0").count(), 2);
+    assert_eq!(text.matches("s_mov_b32 exec_lo, -1").count(), 2);
 }
 
 /// Gate/up keeps SET's fully paired fold: per epoch one extra f16 up-scale

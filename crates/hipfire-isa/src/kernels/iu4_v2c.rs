@@ -1,8 +1,8 @@
 //! Builder-emitted gfx11 (RDNA3, wave32) MQ4V2 x block_i4_128 GEMM with the
 //! hipcc V2C algorithm (`kernels/src/gemm_mq4g256v2_residual_iu4_v2c.gfx11.hip`),
 //! bit for bit, for its three epilogue families:
-//! SET (`gemm_mq4g256v2_residual_iu4_v2c_set_gfx11`), ADD (`_add` /
-//! `_add_touch`) and the F1-lite gate/up SiLU entry
+//! SET (`gemm_mq4g256v2_residual_iu4_v2c_set_gfx11`), ADD (`_add_touch`) and
+//! the F1-lite gate/up SiLU entry
 //! (`gemm_mq4g256v2_gate_up_silu_iu4_v2c_gfx11`).
 //!
 //! Tile M128 x N128, 8 waves; wave `w` owns rows `32*(w/2)..+32` (two 16-row
@@ -58,19 +58,20 @@ pub const TAIL: &str = ".Lv2c_tail";
 pub const EPI: &str = ".Lv2c_epilogue";
 pub const END: &str = ".Lv2c_end";
 
-/// Epilogue family. `AddTouch` is ADD with the residual tile touched during
-/// the last two epochs so the epilogue's loads hit cache (outputs identical).
+/// Epilogue family. ADD touches the tile's residual over epochs E-16..E-13
+/// (hipcc `_add_touch`'s window) so its epilogue loads hit cache; the
+/// output is RN(Y + sum) either way.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Epi { Set, Add, AddTouch, Silu }
+pub enum Epi { Set, Add, Silu }
 impl Epi {
-    pub const ALL: [Epi; 4] = [Epi::Set, Epi::Add, Epi::AddTouch, Epi::Silu];
-    pub fn name(self) -> &'static str { match self { Self::Set => "set", Self::Add => "add", Self::AddTouch => "add_touch", Self::Silu => "silu" } }
+    pub const ALL: [Epi; 3] = [Epi::Set, Epi::Add, Epi::Silu];
+    pub fn name(self) -> &'static str { match self { Self::Set => "set", Self::Add => "add", Self::Silu => "silu" } }
     fn silu(self) -> bool { self == Self::Silu }
 }
 impl std::str::FromStr for Epi {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, String> {
-        Self::ALL.into_iter().find(|e| e.name() == s).ok_or_else(|| format!("iu4_v2c epilogue {s}: expected set|add|add_touch|silu"))
+        Self::ALL.into_iter().find(|e| e.name() == s).ok_or_else(|| format!("iu4_v2c epilogue {s}: expected set|add|silu"))
     }
 }
 
@@ -132,8 +133,9 @@ impl Regs {
     const YOFF: u8 = 180;
     // Gate/up: this lane's raw / f32 up-row scale.
     const WSU: u8 = 181; const WSFU: u8 = 182;
-    // ADD touch: this thread's residual line offset, then two touch sinks.
-    const TOFF: u8 = 181; const TDST: [u8; 2] = [182, 183];
+    // ADD touch: this thread's residual line offset and the touch sink
+    // (v182 stays defined: M7 reads a `saddr` offset as a VGPR pair).
+    const TOFF: u8 = 181; const TPAIR: u8 = 182; const TSINK: u8 = 183;
     // Epilogue (every K-loop register is dead): ADD residual quads
     // v104..v167; gate/up h octets v104..v135 and four slots of nine SiLU
     // temporaries, v136.. and v145.. (VOPD partner slots 0/1) and v4.. and
@@ -152,6 +154,8 @@ impl Regs {
     // s[32:33]; the up-row scale base s[34:35] (SA holds the gate-row one);
     // SiLU lane masks s36, s38, .., s50 (one aligned pair each).
     const MK: u8 = 30; const SS: u8 = 32; const SU: u8 = 34; const MASKS: u8 = 36;
+    // ADD touch: M*128 (32 tokens of residual) and the touched line's base.
+    const M128: u8 = 30; const STB: u8 = 32;
 }
 
 /// SiLU region slots (instances live at once) and their temporaries.
@@ -221,12 +225,11 @@ fn plan(epi: Epi) -> Result<RegPlan, String> {
     p.s::<2>("y_base", Regs::SY, Live::Whole)?;
     match epi {
         Epi::Set => {}
-        Epi::Add | Epi::AddTouch => {
+        Epi::Add => {
             for q in 0..16u8 { p.v::<4>("residual", Regs::RESID + 4 * q, epl())?; }
-            if epi == Epi::AddTouch {
-                p.v::<1>("touch_off", Regs::TOFF, Live::Whole)?;
-                for r in Regs::TDST { p.v::<1>("touch_sink", r, Live::Whole)?; }
-            }
+            for (name, r) in [("touch_off", Regs::TOFF), ("touch_pair", Regs::TPAIR), ("touch_sink", Regs::TSINK)] { p.v::<1>(name, r, Live::Whole)?; }
+            p.s::<1>("m128", Regs::M128, Live::Whole)?;
+            p.s::<2>("touch_base", Regs::STB, Live::Whole)?;
         }
         Epi::Silu => {
             p.v::<1>("scale_f16_up", Regs::WSU, kl())?;
@@ -370,7 +373,7 @@ fn prologue(b: &mut Builder, epi: Epi) -> Result<(), String> {
     op(b, format!("v_lshl_add_u32 v15, s{}, {wave_rows_log2}, v15", Regs::WR), &[v(15)], &[s(Regs::WR), v(15)])?;
     op(b, format!("v_mad_u32_u24 v15, v14, s{}, v15", ar.m), &[v(15)], &[v(14), s(ar.m), v(15)])?;
     op(b, format!("v_lshlrev_b32_e32 v{}, 2, v15", Regs::YOFF), &[v(Regs::YOFF)], &[v(15)])?;
-    if epi == Epi::AddTouch {
+    if epi == Epi::Add {
         // Residual line l = tid + 256*i of the tile (8 64-byte lines per
         // token): token tid/8 + 32*i, byte (tid%8)*64; i*32 tokens are
         // added in the tail.
@@ -380,8 +383,9 @@ fn prologue(b: &mut Builder, epi: Epi) -> Result<(), String> {
         op(b, "v_lshlrev_b32_e32 v18, 6, v18", &[v(18)], &[v(18)])?;
         op(b, format!("v_mad_u32_u24 v{}, v17, s{t1}, v18", Regs::TOFF), &[v(Regs::TOFF)], &[v(17), s(t1), v(18)])?;
         // M7's gfx1100 table reads a `saddr` global offset as a VGPR pair:
-        // the first touch reads sink v183 as the pair's high half.
-        op(b, format!("v_mov_b32_e32 v{}, 0", Regs::TDST[1]), &[v(Regs::TDST[1])], &[])?;
+        // the touch reads v182 as the pair's high half.
+        op(b, format!("v_mov_b32_e32 v{}, 0", Regs::TPAIR), &[v(Regs::TPAIR)], &[])?;
+        op(b, format!("s_lshl_b32 s{}, s{}, 7", Regs::M128, ar.m), &[s(Regs::M128)], &[s(ar.m)])?;
     }
 
     // Stage epoch 0 into slot 0, and seed the chain constant and the sums
@@ -489,7 +493,7 @@ fn fold(b: &mut Builder, epi: Epi, a: u8) -> Result<(), String> {
 /// staging packet of epoch e+1 is loaded, published into slot 1-p and the
 /// barrier hands the slots over; the last epoch has neither. `touch` (ADD
 /// touch, last two epochs) loads residual lines `touch` and `touch + 1`.
-fn epoch(b: &mut Builder, epi: Epi, p: usize, next: bool, touch: Option<u8>) -> Result<(), String> {
+fn epoch(b: &mut Builder, epi: Epi, p: usize, next: bool, touch: bool) -> Result<(), String> {
     // Current-epoch metadata first: in-order VMcnt returns it before the packet.
     let scales: &[(u8, u8)] = if epi.silu() { &[(Regs::WS, Regs::SA), (Regs::WSU, Regs::SU)] } else { &[(Regs::WS, Regs::SA)] };
     for &(dst, base) in scales {
@@ -497,7 +501,7 @@ fn epoch(b: &mut Builder, epi: Epi, p: usize, next: bool, touch: Option<u8>) -> 
             &[v(dst)], &[v(Regs::LWS), sr(base, 2)], MemoryClass::VmemLoad)?;
     }
     for c in 0..4u8 { global_load(b, 1, Regs::DC + c, Regs::LXS, Regs::SX, 16 * XBLK_BYTES * u32::from(c))?; }
-    if let Some(line) = touch { touch_loads(b, epi, line)?; }
+    if touch { touch_window(b, p)?; }
     if next {
         if p == 1 {
             // Epoch e+1 starts the next 136-byte A group.
@@ -517,43 +521,37 @@ fn epoch(b: &mut Builder, epi: Epi, p: usize, next: bool, touch: Option<u8>) -> 
         step_wmma(b, i)?;
         if i == 7 { fold(b, epi, 0)?; }
     }
+    // Publish the staged packet before fold pass 1 (slot 1-p was retired by
+    // the previous barrier), so its LGKM drain hides under the fold: this
+    // measured 0.3-0.6% faster on gate/up than publishing after the fold.
+    if next { stage_store(b, 1 - p)?; }
     fold(b, epi, 1)?;
     if next {
-        stage_store(b, 1 - p)?;
         b.barrier(&[Transition::Retire(SLOT_A[p]), Transition::Retire(SLOT_X[p]), Transition::Ready(SLOT_A[1 - p]), Transition::Ready(SLOT_X[1 - p])])?;
     }
     Ok(())
 }
 
-/// ADD touch: one dword of residual lines `first` and `first + 1` of this
-/// thread (line i is 32*i tokens past `TOFF`) into the two sinks. The loads
-/// ride ahead of the staging packet, whose wait retires them; the values
-/// are never read.
-fn touch_loads(b: &mut Builder, epi: Epi, first: u8) -> Result<(), String> {
-    let m = args(epi).m;
+/// ADD residual touch, every loop epoch: loop trip t (the trip-count SGPR, which
+/// runs K/256-1 .. 1) covers epochs E-2-2t and E-1-2t, so epoch parity p of
+/// trips 7 and 6 is window epoch i = 14 - 2t + p of E-16..E-13 and touches
+/// line i (32*i tokens past `TOFF`). EXEC is empty outside the window, so
+/// the body stays one straight-line trip; the load always counts on VMcnt
+/// and rides ahead of the staging packet, whose wait retires it.
+fn touch_window(b: &mut Builder, p: usize) -> Result<(), String> {
     let (t0, t1) = (Regs::T0, Regs::T1);
-    let [d0, d1] = Regs::TDST;
-    let load = |b: &mut Builder, dst: u8, voff: u8| mem(b, format!("global_load_b32 v{dst}, v{voff}, s[{}:{}]", Regs::SY, Regs::SY + 1),
-        &[v(dst)], &[v(voff), sr(Regs::SY, 2)], MemoryClass::VmemLoad);
-    match first {
-        // Issue order keeps every VGPR offset's successor free of a pending
-        // load: M7's gfx1100 table models a `saddr` global's offset as a
-        // 64-bit pair, which is conservative but must stay obligation-free.
-        0 => {
-            op(b, format!("s_lshl_b32 s{t1}, s{m}, 7"), &[s(t1)], &[s(m)])?;
-            op(b, format!("v_add_nc_u32_e32 v{d0}, s{t1}, v{}", Regs::TOFF), &[v(d0)], &[s(t1), v(Regs::TOFF)])?;
-            load(b, d1, d0)?;
-            load(b, d0, Regs::TOFF)
-        }
-        2 => {
-            op(b, format!("s_lshl_b32 s{t0}, s{m}, 8"), &[s(t0)], &[s(m)])?;
-            op(b, format!("v_add_nc_u32_e32 v{d0}, s{t0}, v{}", Regs::TOFF), &[v(d0)], &[s(t0), v(Regs::TOFF)])?;
-            op(b, format!("v_add_nc_u32_e32 v{d1}, s{t1}, v{d0}"), &[v(d1)], &[s(t1), v(d0)])?;
-            load(b, d0, d0)?;
-            load(b, d1, d1)
-        }
-        _ => Err("touch lines come in pairs 0,1 and 2,3".into()),
-    }
+    op(b, format!("s_add_i32 s{t0}, s{}, -6", Regs::TRIPS), &[s(t0)], &[s(Regs::TRIPS)])?;
+    op(b, format!("s_cmp_lt_u32 s{t0}, 2"), &[], &[s(t0)])?;
+    op(b, "s_cselect_b32 exec_lo, -1, 0", &[], &[])?;
+    op(b, format!("s_lshl_b32 s{t1}, s{t0}, 1"), &[s(t1)], &[s(t0)])?;
+    op(b, format!("s_sub_i32 s{t1}, {}, s{t1}", 2 + p), &[s(t1)], &[s(t1)])?;
+    op(b, format!("s_mul_i32 s{t1}, s{t1}, s{}", Regs::M128), &[s(t1)], &[s(t1), s(Regs::M128)])?;
+    op(b, format!("s_add_u32 s{}, s{}, s{t1}", Regs::STB, Regs::SY), &[s(Regs::STB)], &[s(Regs::SY), s(t1)])?;
+    op(b, format!("s_addc_u32 s{}, s{}, 0", Regs::STB + 1, Regs::SY + 1), &[s(Regs::STB + 1)], &[s(Regs::SY + 1)])?;
+    let sink = Regs::TSINK;
+    mem(b, format!("global_load_b32 v{sink}, v{}, s[{}:{}]", Regs::TOFF, Regs::STB, Regs::STB + 1),
+        &[v(sink)], &[v(Regs::TOFF), sr(Regs::STB, 2)], MemoryClass::VmemLoad)?;
+    op(b, "s_mov_b32 exec_lo, -1", &[], &[])
 }
 
 fn kloop(b: &mut Builder, epi: Epi) -> Result<(), String> {
@@ -562,8 +560,9 @@ fn kloop(b: &mut Builder, epi: Epi) -> Result<(), String> {
     op(b, format!("s_cmp_eq_u32 s{}, 0", Regs::TRIPS), &[], &[s(Regs::TRIPS)])?;
     op(b, format!("s_cbranch_scc1 {TAIL}"), &[], &[])?;
     b.loop_(K_LOOP, |b| {
-        epoch(b, epi, 0, true, None)?;
-        epoch(b, epi, 1, true, None)?;
+        let touch = epi == Epi::Add;
+        epoch(b, epi, 0, true, touch)?;
+        epoch(b, epi, 1, true, touch)?;
         op(b, format!("s_add_i32 s{0}, s{0}, -1", Regs::TRIPS), &[s(Regs::TRIPS)], &[s(Regs::TRIPS)])?;
         op(b, format!("s_cmp_lg_u32 s{}, 0", Regs::TRIPS), &[], &[s(Regs::TRIPS)])?;
         op(b, format!("s_cbranch_scc1 {K_LOOP}"), &[], &[])
@@ -573,9 +572,8 @@ fn kloop(b: &mut Builder, epi: Epi) -> Result<(), String> {
     // empty ledger, so its waits hold on either.
     if !b.ledger.is_empty() { return Err("K loop exit leaves memory operations pending".into()) }
     b.label(TAIL)?;
-    let touch = epi == Epi::AddTouch;
-    epoch(b, epi, 0, true, touch.then_some(0))?;
-    epoch(b, epi, 1, false, touch.then_some(2))
+    epoch(b, epi, 0, true, false)?;
+    epoch(b, epi, 1, false, false)
 }
 
 /// Lane (hi, lr) owns rows 8hi..8hi+7 of each fragment for one token; two
@@ -601,7 +599,7 @@ fn epilogue(b: &mut Builder, epi: Epi) -> Result<(), String> {
         Epi::Set => {
             for (c, a, q) in quads() { store(b, c, acc(c, a, q), offset(a, q))?; }
         }
-        Epi::Add | Epi::AddTouch => {
+        Epi::Add => {
             for (i, (c, a, q)) in quads().enumerate() {
                 let r = Regs::RESID + 4 * i as u8;
                 mem(b, format!("global_load_b128 {}, v{c}, s[{}:{}]{}", vr(r, 4), Regs::SY, Regs::SY + 1, off(offset(a, q))?),

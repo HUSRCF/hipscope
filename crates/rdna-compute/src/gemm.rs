@@ -20454,16 +20454,17 @@ impl Gpu {
             // `_add_touch` touches the residual tile ahead of the epilogue,
             // byte-identical to `_add`. The builder tile
             // (`gfx1100_pm_gemm`) runs the same algorithm from the embedded
-            // certified bundle as one 256-thread block.
-            let touch = hipfire_config::developer_var("HIPFIRE_V2C_ADDEPI").as_deref() != Ok("0");
+            // certified bundle as one 256-thread block; its ADD always
+            // touches the residual over `_add_touch`'s epoch window.
             let pm = gfx1100_pm_gemm(m);
-            let kernel_name = match (pm, add, touch) {
-                (false, false, _) => "gemm_mq4g256v2_residual_iu4_v2c_set_gfx11",
-                (false, true, true) => "gemm_mq4g256v2_residual_iu4_v2c_add_touch_gfx11",
-                (false, true, false) => "gemm_mq4g256v2_residual_iu4_v2c_add_gfx11",
-                (true, false, _) => "gemm_mq4g256v2_residual_iu4_pm_set_gfx1100",
-                (true, true, true) => "gemm_mq4g256v2_residual_iu4_pm_add_touch_gfx1100",
-                (true, true, false) => "gemm_mq4g256v2_residual_iu4_pm_add_gfx1100",
+            let kernel_name = match (pm, add) {
+                (true, false) => "gemm_mq4g256v2_residual_iu4_pm_set_gfx1100",
+                (true, true) => "gemm_mq4g256v2_residual_iu4_pm_add_gfx1100",
+                (false, false) => "gemm_mq4g256v2_residual_iu4_v2c_set_gfx11",
+                (false, true) if hipfire_config::developer_var("HIPFIRE_V2C_ADDEPI").as_deref() != Ok("0") => {
+                    "gemm_mq4g256v2_residual_iu4_v2c_add_touch_gfx11"
+                }
+                (false, true) => "gemm_mq4g256v2_residual_iu4_v2c_add_gfx11",
             };
             if pm {
                 self.ensure_embedded_kernel(

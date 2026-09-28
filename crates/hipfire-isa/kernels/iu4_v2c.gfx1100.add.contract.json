@@ -12,7 +12,7 @@
     "ds_load_2addr_b64": 160,
     "ds_store_2addr_b64": 16,
     "global_load_b64": 32,
-    "global_load_b32": 16,
+    "global_load_b32": 18,
     "global_load_u16": 4,
     "global_load_b128": 16,
     "global_store_b128": 16,
