@@ -14023,7 +14023,7 @@ impl Gpu {
         };
 
         // gfx1151, K = 320 (Qwen4 decode HC read up): rows staged through LDS,
-        // two per block (132 -> 218 GB/s against gemv_q8_0_wide).
+        // four per block (132 -> 218 GB/s against gemv_q8_0_wide).
         if self.arch_caps.is_gfx1151() && k == 320 {
             const FUNC: &str = "gemv_q8_0_k320_staged";
             self.ensure_kernel("gemv_q8_0", kernels::GEMV_Q8_0_SRC, FUNC)?;
@@ -14035,8 +14035,35 @@ impl Gpu {
             ];
             return self.launch_maybe_blob(
                 FUNC,
-                [m.div_ceil(2) as u32, 1, 1],
-                [64, 1, 1],
+                [m.div_ceil(4) as u32, 1, 1],
+                [128, 1, 1],
+                0,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(a_ptr);
+                    b.push_ptr(x_ptr);
+                    b.push_ptr(y_ptr);
+                    b.push_i32(m_val);
+                    b
+                },
+            );
+        }
+        // gfx1151, K = 640 (Qwen4 decode shared-expert down): gemv_q8_0_wide's
+        // math on rows staged through LDS, four per block (bitwise).
+        if self.arch_caps.is_gfx1151() && k == 640 {
+            const FUNC: &str = "gemv_q8_0_wide_k640_staged";
+            self.ensure_kernel("gemv_q8_0_wide", kernels::GEMV_Q8_0_WIDE_SRC, FUNC)?;
+            let mut params = [
+                &a_ptr as *const _ as *mut c_void,
+                &x_ptr as *const _ as *mut c_void,
+                &y_ptr as *const _ as *mut c_void,
+                &m_val as *const _ as *mut c_void,
+            ];
+            return self.launch_maybe_blob(
+                FUNC,
+                [m.div_ceil(4) as u32, 1, 1],
+                [128, 1, 1],
                 0,
                 &mut params,
                 || {
@@ -14118,6 +14145,60 @@ impl Gpu {
             t.finish(&self.hip);
         }
         result
+    }
+
+    /// [`Gpu::gemv_q8_0`] of two `[m x k]` weights over the same `x`
+    /// (`y0 = a0 x`, `y1 = a1 x`), each output bitwise the single call's. On
+    /// gfx1151 at K = 2560 both run in one launch; elsewhere two calls.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_q8_0_pair(
+        &mut self,
+        a0: &GpuTensor,
+        a1: &GpuTensor,
+        x: &GpuTensor,
+        y0: &GpuTensor,
+        y1: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        if !(self.arch_caps.is_gfx1151() && k == 2560) {
+            self.gemv_q8_0(a0, x, y0, m, k)?;
+            return self.gemv_q8_0(a1, x, y1, m, k);
+        }
+        self.bind_thread()?;
+        const FUNC: &str = "gemv_q8_0_k2560_staged_pair";
+        self.ensure_kernel("gemv_q8_0", kernels::GEMV_Q8_0_SRC, FUNC)?;
+        let p0 = a0.buf.as_ptr();
+        let p1 = a1.buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let q0 = y0.buf.as_ptr();
+        let q1 = y1.buf.as_ptr();
+        let mv = m as i32;
+        let mut params = [
+            &p0 as *const _ as *mut c_void,
+            &p1 as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &q0 as *const _ as *mut c_void,
+            &q1 as *const _ as *mut c_void,
+            &mv as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            FUNC,
+            [2 * m as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(p0);
+                b.push_ptr(p1);
+                b.push_ptr(xp);
+                b.push_ptr(q0);
+                b.push_ptr(q1);
+                b.push_i32(mv);
+                b
+            },
+        )
     }
 
     /// y = A_q8hfq * x (split-metadata Q8 GEMV, row_stride = padded row bytes)

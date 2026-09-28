@@ -68,16 +68,11 @@ extern "C" __global__ void gemv_q8_0(
 // LDS with dword loads, every load before the first store (32 x 4 B per load
 // instead of the row loop's 32 x 1 B quant loads and broadcast scale loads),
 // then runs the same row loop on the copy.
-__launch_bounds__(32, 20)
-extern "C" __global__ void gemv_q8_0_k2560_staged(
-    const unsigned char* __restrict__ A_q8,
-    const float* __restrict__ x,
-    float* __restrict__ y,
-    int M
+static __device__ __forceinline__ void gemv_q8_0_k2560_staged_row(
+    const unsigned char* __restrict__ A_q8, const float* __restrict__ x, float* __restrict__ y,
+    int row
 ) {
     __shared__ __align__(16) unsigned int staged_row[680];
-    const int row = blockIdx.x;
-    if (row >= M) return;
     const int tid = threadIdx.x;
     const unsigned int* src = reinterpret_cast<const unsigned int*>(A_q8 + (size_t)row * 2720);
     unsigned int v[22];
@@ -94,30 +89,75 @@ extern "C" __global__ void gemv_q8_0_k2560_staged(
     if (tid == 0) y[row] = sum;
 }
 
+__launch_bounds__(32, 20)
+extern "C" __global__ void gemv_q8_0_k2560_staged(
+    const unsigned char* __restrict__ A_q8,
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    int M
+) {
+    if ((int)blockIdx.x >= M) return;
+    gemv_q8_0_k2560_staged_row(A_q8, x, y, blockIdx.x);
+}
+
+// Two [M x 2560] matrices of one activation in one launch (grid 2M): rows
+// [0, M) of A0 then of A1, each bitwise gemv_q8_0_k2560_staged's.
+__launch_bounds__(32, 20)
+extern "C" __global__ void gemv_q8_0_k2560_staged_pair(
+    const unsigned char* __restrict__ A0,
+    const unsigned char* __restrict__ A1,
+    const float* __restrict__ x,
+    float* __restrict__ y0,
+    float* __restrict__ y1,
+    int M
+) {
+    const int row = blockIdx.x;
+    if (row < M) {
+        gemv_q8_0_k2560_staged_row(A0, x, y0, row);
+    } else if (row < 2 * M) {
+        gemv_q8_0_k2560_staged_row(A1, x, y1, row - M);
+    }
+}
+
 // gemv_q8_0 for K = 320 (340-byte rows, Qwen4 decode HC read up), staged like
-// gemv_q8_0_k2560_staged; two rows (waves) per block. 132 -> 218 GB/s on
-// gfx1151 against gemv_q8_0_wide.
-__launch_bounds__(64)
+// gemv_q8_0_k2560_staged; four rows (waves) per block, the row's loads issued
+// before the x loads, x held in registers. 132 -> 218 GB/s on gfx1151 against
+// gemv_q8_0_wide.
+__launch_bounds__(128)
 extern "C" __global__ void gemv_q8_0_k320_staged(
     const unsigned char* __restrict__ A_q8,
     const float* __restrict__ x,
     float* __restrict__ y,
     int M
 ) {
-    __shared__ __align__(16) unsigned int staged[2][85];
+    __shared__ __align__(16) unsigned int staged[4][85];
     const int wave = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
-    const int row = blockIdx.x * 2 + wave;
+    const int row = blockIdx.x * 4 + wave;
     if (row >= M) return;
     const unsigned int* src = reinterpret_cast<const unsigned int*>(A_q8 + (size_t)row * 340);
     const unsigned int v0 = src[lane];
     const unsigned int v1 = src[lane + 32];
     const unsigned int v2 = lane < 21 ? src[lane + 64] : 0u;
+    float xr[10];
+#pragma unroll
+    for (int b = 0; b < 10; ++b) xr[b] = x[b * 32 + lane];
     staged[wave][lane] = v0;
     staged[wave][lane + 32] = v1;
     if (lane < 21) staged[wave][lane + 64] = v2;
     __builtin_amdgcn_fence(__ATOMIC_ACQ_REL, "wavefront");
-    const float sum = gemv_q8_0_row(reinterpret_cast<const unsigned char*>(staged[wave]), x, 320, lane);
+    const unsigned char* data = reinterpret_cast<const unsigned char*>(staged[wave]);
+    // gemv_q8_0_row's per-lane order over the ten blocks and its tree.
+    float sum = 0.0f;
+#pragma unroll
+    for (int b = 0; b < 10; ++b) {
+        const unsigned char* block = data + b * 34;
+        const float d = (float)*((const _Float16*)block);
+        const signed char qval = (signed char)block[2 + lane];
+        sum += d * (float)qval * xr[b];
+    }
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum += __shfl_down(sum, offset);
     if (lane == 0) y[row] = sum;
 }
 

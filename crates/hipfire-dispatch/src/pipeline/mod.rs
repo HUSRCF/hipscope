@@ -2936,7 +2936,7 @@ fn decode_gate_side_stage(
             // Router, selector and shared gate/up are projections of the same
             // natural activation, each row computed as the single-matrix GEMV
             // would: the BF16 ones share one launch, a Q8_0 gate/up pair
-            // (recipe r2) runs as its own two GEMVs.
+            // (recipe r2) shares another.
             let bf16_shared = shared_gate_w.dtype == DType::BF16;
             let rows = |m: usize| if bf16_shared { m } else { 0 };
             hip!(gpu.gemv_bf16_xf32_x4(
@@ -2950,9 +2950,15 @@ fn decode_gate_side_stage(
                 p.router.k,
             ))?;
             if !bf16_shared {
-                for (w, y) in [(shared_gate_w, shared_gate), (shared_up_w, shared_up)] {
-                    hip!(gpu.gemv_q8_0(w.buf, p.x_norm, y, w.m, w.k))?;
-                }
+                hip!(gpu.gemv_q8_0_pair(
+                    shared_gate_w.buf,
+                    shared_up_w.buf,
+                    p.x_norm,
+                    shared_gate,
+                    shared_up,
+                    shared_gate_w.m,
+                    shared_gate_w.k,
+                ))?;
             }
         } else {
             static GEMV_GATE: OnceLock<GemvFamily> = OnceLock::new();
