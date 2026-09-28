@@ -73,17 +73,40 @@ extern "C" __global__ void moe_gate_up_unscatter_silu_top10_bf16in(
 // mq_rotate_x_128_v2 of its output: each lane forms four activations with the
 // unscatter's expression and rotates them with that kernel's butterfly, so
 // `rotated` ([N*10 x mi], flat row order) is bitwise the two launches.
-// mi % 128 == 0.  Grid (m_total, mi / 128), block 32.
+// Optional shared expert (`shared_n` > 0): blocks past `m_total` apply
+// silu_mul.hip's shared_expert_activation_bf16_f32 (the same expressions) to
+// the shared gate/up and the first `selectors` selector scalars.
+// mi % 128 == 0.  Grid (m_total + shared blocks, mi / 128), block 32.
 extern "C" __global__ __launch_bounds__(32, 16) void moe_gate_up_unscatter_silu_rotate128_top10(
     const float* __restrict__ Y_grouped,
     const int*   __restrict__ sorted_slot_index,
     const float* __restrict__ signs1,
     const float* __restrict__ signs2,
     float*       __restrict__ rotated,
-    int mi, int m_total, int bf16_rt
+    int mi, int m_total, int bf16_rt,
+    const float* __restrict__ shared_gate,
+    const float* __restrict__ shared_up,
+    float*       __restrict__ shared_out,
+    float*       __restrict__ selector,
+    int shared_n, int selectors
 ) {
     const int slot = blockIdx.x;
-    if (slot >= m_total) return;
+    if (slot >= m_total) {
+        const int i0 = ((slot - m_total) * (int)gridDim.y + (int)blockIdx.y) * 128
+            + (int)threadIdx.x * 4;
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            const int i = i0 + e;
+            if (i < selectors)
+                selector[i] = 1.0f / (1.0f + expf(-moe_bf16_round_trip(selector[i])));
+            if (i < shared_n) {
+                const float v = moe_bf16_round_trip(shared_gate[i]);
+                shared_out[i] = moe_bf16_round_trip(
+                    (v / (1.0f + expf(-v))) * moe_bf16_round_trip(shared_up[i]));
+            }
+        }
+        return;
+    }
     const int flat = sorted_slot_index[slot];
     if (flat < 0) return;
     const int tid = threadIdx.x;

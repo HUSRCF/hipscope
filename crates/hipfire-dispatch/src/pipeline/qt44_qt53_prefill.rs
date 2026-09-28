@@ -13,6 +13,7 @@ use super::layer_ops::hip;
 use crate::families::gemv::WeightRef;
 use crate::families::moe::MoePrefillParams;
 use crate::types::DispatchError;
+use rdna_compute::moe::SharedExpertActivation;
 use rdna_compute::tensor_ops::{bf16_scaled_add_batched, Bf16ScaledAddBatched};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -236,8 +237,13 @@ pub(crate) fn shared_gate_up(gpu: &mut Gpu, p: &MoePrefillParams<'_>) -> Result<
 pub(crate) fn shared_activation(
     gpu: &mut Gpu,
     p: &MoePrefillParams<'_>,
+    use_path2: bool,
 ) -> Result<(), DispatchError> {
     require_geometry(p)?;
+    // Path 2's fused unscatter launch runs it (see `shared_in_unscatter`).
+    if use_path2 && shared_in_unscatter(gpu, p) {
+        return Ok(());
+    }
     let shared = p
         .prelude
         .shared
@@ -468,6 +474,29 @@ pub(crate) fn unscatter(
         ));
     }
     if unscatter_rotates(gpu, p) {
+        // The shared expert's activation rides in the same launch; its stage
+        // skipped it (the shared down reads it after the combine).
+        let shared = p
+            .prelude
+            .shared
+            .as_ref()
+            .filter(|_| shared_in_unscatter(gpu, p))
+            .map(|shared| {
+                let live = p.batch_size * shared.intermediate;
+                (
+                    f32_view(shared.gate_out, 0, live),
+                    f32_view(shared.up_out, 0, live),
+                    f32_view(shared.rotated, 0, live),
+                    shared.scalar,
+                )
+            });
+        let shared = shared.as_ref().map(|(gate, up, out, selector)| SharedExpertActivation {
+            gate,
+            up,
+            out,
+            selector,
+            selectors: p.batch_size,
+        });
         return hip(gpu.moe_gate_up_unscatter_silu_rotate128_top10(
             p.y_gate_up_grouped,
             p.sorted_slot_index,
@@ -475,6 +504,7 @@ pub(crate) fn unscatter(
             p.mi,
             grouped_rows,
             p.recipe.bf16_round_trip(),
+            shared.as_ref(),
         ));
     }
     hip(gpu.moe_gate_up_unscatter_silu_top10(
@@ -491,6 +521,19 @@ pub(crate) fn unscatter(
 /// (in the same launch), leaving [`activation`] nothing to do.
 fn unscatter_rotates(gpu: &Gpu, p: &MoePrefillParams<'_>) -> bool {
     !gateup_bf16(gpu, p) && !down_wmma(gpu, p) && p.mi % 128 == 0
+}
+
+/// Whether path 2's fused unscatter launch also runs the BF16 shared expert
+/// activation: its only reader, a natural-basis shared down, runs after the
+/// combine (so after the unscatter).
+fn shared_in_unscatter(gpu: &Gpu, p: &MoePrefillParams<'_>) -> bool {
+    unscatter_rotates(gpu, p)
+        && p.recipe.bf16_round_trip()
+        && p.recipe.shared_after_combine()
+        && p.prelude
+            .shared
+            .as_ref()
+            .is_some_and(|shared| shared.weights.down.dtype != DType::MQ4G128V2)
 }
 
 pub(crate) fn activation(
