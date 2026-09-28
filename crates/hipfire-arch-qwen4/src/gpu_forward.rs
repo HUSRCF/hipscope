@@ -328,7 +328,8 @@ fn program_dims(config: &Qwen4Config) -> Qwen4ProgramDims {
 /// Q8_0 decode copies per layer (`Qwen4GpuForward::decode_q8`).
 const DECODE_Q8_PER_LAYER: usize = 7;
 
-/// A single-token forward's projection: its Q8_0 decode copy
+/// A decode-shaped forward's projection (one token, or the few rows of a
+/// speculative verify, which must match it bitwise): its Q8_0 decode copy
 /// (`Qwen4GpuForward::decode_q8`) when one exists.
 fn decode_copy<'a>(
     copies: &'a [GpuTensor],
@@ -337,7 +338,7 @@ fn decode_copy<'a>(
     source: WeightRef<'a>,
 ) -> WeightRef<'a> {
     match copies.get(index) {
-        Some(buf) if rows == 1 => WeightRef {
+        Some(buf) if rows <= 8 => WeightRef {
             buf,
             dtype: DType::Q8_0,
             row_stride: row_stride(DType::Q8_0, source.k),
@@ -824,7 +825,9 @@ pub(crate) fn execute_moe(
     scratch: Qwen4MoeScratch<'_>,
 ) -> Result<(), Qwen4GpuForwardError> {
     let ctx = DispatchCtx::new(gpu);
-    gpu.hip.memset(&output.buf, 0, output.buf.size())?;
+    // A stream-ordered kernel, not a blocking default-stream hipMemset that
+    // drains the queue every MTP draft step; both write exact +0.0.
+    gpu.zero_f32(output)?;
     let dtypes = MoeDtypes {
         router: runtime.router.dtype,
         shared: Some(MoeSharedDtypes {
@@ -1998,6 +2001,7 @@ impl Qwen4GpuForward {
                         value_dim: dims.linear_value_head_dim,
                         conv_kernel: dims.linear_conv_kernel_dim,
                         input_width: dims.hidden,
+                        row_capture: bundle.state.gdn_row_capture(gdn_slot - 1, n),
                     }));
                 }
                 LayerType::FullAttention => {
@@ -2589,6 +2593,7 @@ impl Qwen4GpuForward {
                     next_history.push(token);
                 }
                 bundle.state.ple_history = next_history;
+                bundle.state.commit_row_capture(n);
                 bundle.state.position = next_position
                     .checked_add(n)
                     .ok_or_else(|| invalid("Qwen4 forward position overflows at commit"))?;

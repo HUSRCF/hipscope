@@ -934,7 +934,12 @@ impl ExpertTable {
         }
         fn layout(record: &ExpertMetadata) -> [Layout<'_>; 4] {
             let r = record.resources();
-            [key(r.gate_up()), key(r.gate()), key(r.up()), key(Some(r.down()))]
+            [
+                key(r.gate_up()),
+                key(r.gate()),
+                key(r.up()),
+                key(Some(r.down())),
+            ]
         }
         let uniform_layout = experts
             .first()
@@ -1143,7 +1148,10 @@ fn live_entry_ptrs(
     experts: &[(LiveWeightIdentity, LiveWeightIdentity)],
 ) -> (Box<[usize]>, Box<[usize]>) {
     (
-        experts.iter().map(|(gate_up, _)| gate_up.buffer.ptr).collect(),
+        experts
+            .iter()
+            .map(|(gate_up, _)| gate_up.buffer.ptr)
+            .collect(),
         experts.iter().map(|(_, down)| down.buffer.ptr).collect(),
     )
 }
@@ -2082,18 +2090,20 @@ pub(super) fn produce_prefill_route<'a>(
                     "prefill softmax producer requires a 2-D [batch,n_experts] score view",
                 ));
             }
-            if params.recipe.bf16_round_trip() {
+            let grouped = matches!(route, Some(MoeRouteCapability::Qt44Qt53Grouped));
+            // The grouped top-10 router rounds each logit it reads itself.
+            if params.recipe.bf16_round_trip() && !grouped {
                 gpu.bf16_round_trip_f32(scores)
                     .map_err(|e| DispatchError::Hip(e.to_string()))?;
             }
-            if matches!(route, Some(MoeRouteCapability::Qt44Qt53Grouped)) {
+            if grouped {
                 gpu.moe_router_softmax_top10_f32(
                     scores,
                     params.topk_indices,
                     params.topk_weights,
                     params.batch_size,
                     normalize,
-                    false,
+                    params.recipe.bf16_round_trip(),
                 )
                 .map_err(|e| DispatchError::Hip(e.to_string()))?;
             } else {
@@ -2120,7 +2130,8 @@ pub(super) fn produce_prefill_route<'a>(
                 };
                 result.map_err(|e| DispatchError::Hip(e.to_string()))?;
             }
-            if params.recipe.bf16_round_trip() {
+            // The grouped router already stores its weights BF16-rounded.
+            if params.recipe.bf16_round_trip() && !grouped {
                 gpu.bf16_round_trip_f32(params.topk_weights)
                     .map_err(|e| DispatchError::Hip(e.to_string()))?;
             }

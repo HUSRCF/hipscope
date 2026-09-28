@@ -3408,10 +3408,11 @@ impl Gpu {
         result
     }
 
-    /// The decode HC read's four-branch mix (`hyper_read_projected`) of `up`
-    /// and `normalized` into `mixed`, plus `mq_rotate_x(mixed)` into
-    /// `rotated`, one launch; bitwise both. The next `rotate_x_mq(mixed,
-    /// rotated, hidden)` is then a no-op (see `ScratchState::prerotated`).
+    /// The HC read's four-branch mix (`hyper_read_projected`) of `rows` rows
+    /// of `up` and `normalized` into `mixed`, plus `mq_rotate_x` of each mixed
+    /// row into `rotated`, one launch; bitwise both. The next
+    /// `rotate_x_mq(mixed, rotated, hidden)` / `rotate_x_mq_batched(mixed,
+    /// rotated, hidden, rows)` is then a no-op (see `ScratchState::prerotated`).
     pub fn hyper_read_projected_rotate(
         &mut self,
         normalized: &GpuTensor,
@@ -3419,12 +3420,14 @@ impl Gpu {
         mixed: &GpuTensor,
         rotated: &GpuTensor,
         hidden: usize,
+        rows: usize,
     ) -> HipResult<()> {
         if !hidden.is_multiple_of(256)
-            || normalized.numel() < 4 * hidden
-            || up.numel() < 4 * hidden
-            || mixed.numel() < hidden
-            || rotated.numel() < hidden
+            || rows == 0
+            || normalized.numel() < 4 * hidden * rows
+            || up.numel() < 4 * hidden * rows
+            || mixed.numel() < hidden * rows
+            || rotated.numel() < hidden * rows
         {
             return Err(hip_bridge::HipError::new(
                 1,
@@ -3453,7 +3456,7 @@ impl Gpu {
         ];
         self.launch_maybe_blob(
             FUNC,
-            [(hidden / 256) as u32, 1, 1],
+            [(hidden / 256) as u32, rows as u32, 1],
             [256, 1, 1],
             0,
             &mut params,
@@ -3469,7 +3472,7 @@ impl Gpu {
                 b
             },
         )?;
-        self.scratch.prerotated = Some((m_ptr as usize, r_ptr as usize, hidden));
+        self.scratch.prerotated = Some((m_ptr as usize, r_ptr as usize, hidden * rows));
         Ok(())
     }
 
@@ -3596,6 +3599,14 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        let key = (
+            x.buf.as_ptr() as usize,
+            x_rot.buf.as_ptr() as usize,
+            k * batch_size,
+        );
+        if self.scratch.prerotated.take() == Some(key) {
+            return Ok(());
+        }
         self.bind_thread()?;
         let validate_live = self.arch == "gfx942"
             && gfx942_rotate_live_validation_enabled()
@@ -14012,7 +14023,7 @@ impl Gpu {
         };
 
         // gfx1151, K = 320 (Qwen4 decode HC read up): rows staged through LDS,
-        // two per block (132 -> 218 GB/s against gemv_q8_0_wide).
+        // four per block (132 -> 218 GB/s against gemv_q8_0_wide).
         if self.arch_caps.is_gfx1151() && k == 320 {
             const FUNC: &str = "gemv_q8_0_k320_staged";
             self.ensure_kernel("gemv_q8_0", kernels::GEMV_Q8_0_SRC, FUNC)?;
@@ -14455,7 +14466,11 @@ impl Gpu {
             ));
         }
         self.bind_thread()?;
-        self.ensure_kernel("gemv_bf16_xf32", kernels::GEMV_BF16_XF32_SRC, "gemv_bf16_xf32_k4")?;
+        self.ensure_kernel(
+            "gemv_bf16_xf32",
+            kernels::GEMV_BF16_XF32_SRC,
+            "gemv_bf16_xf32_k4",
+        )?;
         self.launch_gemv_split("gemv_bf16_xf32_k4", 128, weight, x, y, m, k, hc_act_scale)
     }
 
@@ -14479,6 +14494,259 @@ impl Gpu {
         self.bind_thread()?;
         self.ensure_kernel("gemv_q8_0", kernels::GEMV_Q8_0_SRC, "gemv_q8_0_k8")?;
         self.launch_gemv_split("gemv_q8_0_k8", 256, weight, x, y, m, k, hc_act_scale)
+    }
+
+    /// [`Gpu::gemv_q8_0_k8`] of `rows` activation rows (x row stride K, y row
+    /// stride M) in one launch; each row bitwise the single-row kernel's.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_q8_0_k8_rows(
+        &mut self,
+        weight: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        hc_act_scale: Option<f32>,
+        rows: usize,
+    ) -> HipResult<()> {
+        const FUNCS: [&str; 7] = [
+            "gemv_q8_0_k8_rows_r2",
+            "gemv_q8_0_k8_rows_r3",
+            "gemv_q8_0_k8_rows_r4",
+            "gemv_q8_0_k8_rows_r5",
+            "gemv_q8_0_k8_rows_r6",
+            "gemv_q8_0_k8_rows_r7",
+            "gemv_q8_0_k8_rows_r8",
+        ];
+        if rows == 1 {
+            return self.gemv_q8_0_k8(weight, x, y, m, k, hc_act_scale);
+        }
+        if !k.is_multiple_of(256) || !(2..=8).contains(&rows) {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "gemv_q8_0_k8_rows needs K % 256 == 0 and 1..=8 rows",
+            ));
+        }
+        self.bind_thread()?;
+        let func = FUNCS[rows - 2];
+        self.ensure_kernel("gemv_q8_0", kernels::GEMV_Q8_0_SRC, func)?;
+        let w_ptr = weight.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let scale = hc_act_scale.unwrap_or(1.0);
+        let hc_act = i32::from(hc_act_scale.is_some());
+        let mut params: Vec<*mut c_void> = vec![
+            &w_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &scale as *const _ as *mut c_void,
+            &hc_act as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(func, [m as u32, 1, 1], [256, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(w_ptr);
+            b.push_ptr(x_ptr);
+            b.push_ptr(y_ptr);
+            b.push_i32(m_val);
+            b.push_i32(k_val);
+            b.push_f32(scale);
+            b.push_i32(hc_act);
+            b
+        })
+    }
+
+    /// Argmax of `head_q8 · x` (Q8_0, K = 2560) restricted to the top 8
+    /// entries of the approximate `logits` (`n` rows), each scored with the
+    /// decode kernel's exact dot; the token id lands in `out[0]`. Logit row j
+    /// is token j unless `order = (front, special, tail)` says the ranking head
+    /// was laid out `[0, front) ++ [special, special + tail) ++ [front, special)`
+    /// (identity: `front >= n`). `partial` is scratch of at least
+    /// [`Gpu::TOPK8_PARTIAL_BYTES`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn q8_0_topk8_rescore_k2560(
+        &mut self,
+        logits: &GpuTensor,
+        n: usize,
+        order: (usize, usize, usize),
+        head_q8: &GpuTensor,
+        x: &GpuTensor,
+        partial: &GpuTensor,
+        out: &GpuTensor,
+    ) -> HipResult<()> {
+        const GROUPS: usize = 128;
+        let chunk = n.div_ceil(GROUPS);
+        if chunk > 2048 || partial.buf.size() < Self::TOPK8_PARTIAL_BYTES || x.numel() < 2560 {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "q8_0_topk8_rescore_k2560 shape",
+            ));
+        }
+        self.bind_thread()?;
+        self.ensure_kernel("gemv_q8_0", kernels::GEMV_Q8_0_SRC, "topk8_partial_f32")?;
+        self.ensure_kernel(
+            "gemv_q8_0",
+            kernels::GEMV_Q8_0_SRC,
+            "topk8_rescore_q8_0_k2560",
+        )?;
+        let v_ptr = logits.buf.as_ptr();
+        let pv_ptr = partial.buf.as_ptr();
+        let pi_ptr =
+            unsafe { (partial.buf.as_ptr() as *mut u8).add(GROUPS * 8 * 4) as *mut c_void };
+        let n_val = n as i32;
+        let chunk_val = chunk as i32;
+        let (front, special, tail) = (order.0 as i32, order.1 as i32, order.2 as i32);
+        let mut params = [
+            &v_ptr as *const _ as *mut c_void,
+            &n_val as *const _ as *mut c_void,
+            &chunk_val as *const _ as *mut c_void,
+            &pv_ptr as *const _ as *mut c_void,
+            &pi_ptr as *const _ as *mut c_void,
+            &front as *const _ as *mut c_void,
+            &special as *const _ as *mut c_void,
+            &tail as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "topk8_partial_f32",
+            [GROUPS as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(v_ptr);
+                b.push_i32(n_val);
+                b.push_i32(chunk_val);
+                b.push_ptr(pv_ptr);
+                b.push_ptr(pi_ptr);
+                b.push_i32(front);
+                b.push_i32(special);
+                b.push_i32(tail);
+                b
+            },
+        )?;
+        let m_val = (GROUPS * 8) as i32;
+        let a_ptr = head_q8.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let o_ptr = out.buf.as_ptr();
+        let mut params = [
+            &pv_ptr as *const _ as *mut c_void,
+            &pi_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &o_ptr as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "topk8_rescore_q8_0_k2560",
+            [1, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pv_ptr);
+                b.push_ptr(pi_ptr);
+                b.push_i32(m_val);
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(o_ptr);
+                b
+            },
+        )
+    }
+
+    /// Scratch bytes [`Gpu::q8_0_topk8_rescore_k2560`] needs.
+    pub const TOPK8_PARTIAL_BYTES: usize = 128 * 8 * 8;
+
+    /// Whether [`Gpu::gemv_q8_0_staged_rows`] covers this shape.
+    pub fn gemv_q8_0_staged_rows_supported(&self, k: usize, rows: usize) -> bool {
+        self.arch_caps.is_gfx1151()
+            && (k == 2560 || k == 320 || (k <= 1536 && k.is_multiple_of(32)))
+            && (1..=8).contains(&rows)
+    }
+
+    /// [`Gpu::gemv_q8_0`]'s gfx1151 kernels (staged K = 2560 / 320, wide K <= 1536) over
+    /// `rows` activation rows in one launch: each weight row is loaded once;
+    /// each output row is bitwise the single-row kernel's.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_q8_0_staged_rows(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        rows: usize,
+    ) -> HipResult<()> {
+        if !self.gemv_q8_0_staged_rows_supported(k, rows) {
+            return Err(hip_bridge::HipError::new(1, "gemv_q8_0_staged_rows shape"));
+        }
+        self.bind_thread()?;
+        if k != 2560 && k != 320 {
+            // gemv_q8_0's small-K wide kernel, per row.
+            const FUNC: &str = "gemv_q8_0_wide_rows";
+            self.ensure_kernel("gemv_q8_0_wide", kernels::GEMV_Q8_0_WIDE_SRC, FUNC)?;
+            let a_ptr = a_raw.buf.as_ptr();
+            let x_ptr = x.buf.as_ptr();
+            let y_ptr = y.buf.as_ptr();
+            let (m_val, k_val, rows_val) = (m as i32, k as i32, rows as i32);
+            let mut params = [
+                &a_ptr as *const _ as *mut c_void,
+                &x_ptr as *const _ as *mut c_void,
+                &y_ptr as *const _ as *mut c_void,
+                &m_val as *const _ as *mut c_void,
+                &k_val as *const _ as *mut c_void,
+                &rows_val as *const _ as *mut c_void,
+            ];
+            return self.launch_maybe_blob(
+                FUNC,
+                [m.div_ceil(2) as u32, 1, 1],
+                [64, 1, 1],
+                0,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(a_ptr);
+                    b.push_ptr(x_ptr);
+                    b.push_ptr(y_ptr);
+                    b.push_i32(m_val);
+                    b.push_i32(k_val);
+                    b.push_i32(rows_val);
+                    b
+                },
+            );
+        }
+        let (func, grid, block) = if k == 2560 {
+            ("gemv_q8_0_k2560_staged_rows", m as u32, 32u32)
+        } else {
+            ("gemv_q8_0_k320_staged_rows", m.div_ceil(4) as u32, 128u32)
+        };
+        self.ensure_kernel("gemv_q8_0", kernels::GEMV_Q8_0_SRC, func)?;
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let rows_val = rows as i32;
+        let mut params = [
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &rows_val as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(func, [grid, 1, 1], [block, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(a_ptr);
+            b.push_ptr(x_ptr);
+            b.push_ptr(y_ptr);
+            b.push_i32(m_val);
+            b.push_i32(rows_val);
+            b
+        })
     }
 
     /// Requantize a row-major BF16 `[m, k]` weight to a new Q8_0 tensor
@@ -14521,6 +14789,97 @@ impl Gpu {
             },
         );
         match launched {
+            Ok(()) => Ok(out),
+            Err(error) => {
+                let _ = self.free_tensor(out);
+                Err(error)
+            }
+        }
+    }
+
+    /// Requantize a row-major `[m, k]` weight into an MQ{2,3,4,5,6}G256V2
+    /// tensor (load-time precision experiments). BF16 / Q8_0 sources are
+    /// rotated into the MQ G256 basis; MQ G256 V2 sources already live in it
+    /// and are repacked from their dequantized values. `k % 256 == 0`.
+    pub fn requant_g256(
+        &mut self,
+        weight: &GpuTensor,
+        m: usize,
+        k: usize,
+        target: DType,
+    ) -> HipResult<GpuTensor> {
+        let bad = |what: &str| {
+            Err(hip_bridge::HipError::new(
+                1,
+                &format!("requant_g256: {what}"),
+            ))
+        };
+        let mq_bits = |dtype: DType| match dtype {
+            DType::MQ2G256V2 => Some(2),
+            DType::MQ3G256V2 => Some(3),
+            DType::MQ4G256V2 => Some(4),
+            DType::MQ5G256V2 => Some(5),
+            DType::MQ6G256V2 => Some(6),
+            _ => None,
+        };
+        let Some(bits) = mq_bits(target) else {
+            return bad("target must be an MQ G256 V2 format");
+        };
+        let (unpack, source_bits, rotate) = match weight.dtype {
+            DType::BF16 => ("requant_bf16_to_f32", 0, true),
+            DType::Q8_0 => ("requant_q8_0_to_f32", 0, true),
+            dtype => match mq_bits(dtype) {
+                Some(source_bits) => ("requant_mqg256v2_to_f32", source_bits, false),
+                None => return bad("source must be BF16, Q8_0 or an MQ G256 V2 format"),
+            },
+        };
+        if m == 0 || !k.is_multiple_of(256) {
+            return bad("needs m > 0 and K % 256 == 0");
+        }
+        self.bind_thread()?;
+        let n = m * k;
+        let values = self.alloc_tensor(&[n], DType::F32)?;
+        let out = self.alloc_tensor(&[n / 256 * (8 + 32 * bits as usize)], target)?;
+        let run = |gpu: &mut Self,
+                   func: &str,
+                   src: &GpuTensor,
+                   dst: &GpuTensor,
+                   count: usize,
+                   bits: i32| {
+            gpu.ensure_kernel("requant_g256", kernels::REQUANT_G256_SRC, func)?;
+            let (s, d, c) = (src.buf.as_ptr(), dst.buf.as_ptr(), count as i64);
+            let mut params: Vec<*mut c_void> = vec![
+                &s as *const _ as *mut c_void,
+                &d as *const _ as *mut c_void,
+                &c as *const _ as *mut c_void,
+                &bits as *const _ as *mut c_void,
+            ];
+            gpu.launch_maybe_blob(
+                func,
+                [count.div_ceil(64) as u32, 1, 1],
+                [64, 1, 1],
+                0,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(s);
+                    b.push_ptr(d);
+                    b.push_u64(c as u64);
+                    b.push_i32(bits);
+                    b
+                },
+            )
+        };
+        let result = (|| {
+            run(self, unpack, weight, &values, n, source_bits)?;
+            if rotate {
+                self.rotate_x_mq_batched(&values, &values, k, m)?;
+            }
+            run(self, "requant_pack_mqg256v2", &values, &out, n / 128, bits)?;
+            self.hip.device_synchronize()
+        })();
+        let freed = self.free_tensor(values);
+        match result.and(freed) {
             Ok(()) => Ok(out),
             Err(error) => {
                 let _ = self.free_tensor(out);
@@ -14675,6 +15034,150 @@ impl Gpu {
             blob_builder,
         )
     }
+    /// [`Gpu::gemm_mq6g256v2_f32_rows`] of up to four MQ6G256V2 matrices
+    /// reading the same rotated `[rows, k]` x in one launch (blocks routed as
+    /// [`Gpu::gemv_mq6g256v2_x4`]); each output bitwise the one-matrix call.
+    pub fn gemm_mq6g256v2_f32_rows_x4(
+        &mut self,
+        parts: [(&GpuTensor, &GpuTensor, usize); 4],
+        x: &GpuTensor,
+        k: usize,
+        rows: usize,
+    ) -> HipResult<()> {
+        const FUNCS: [&str; 7] = [
+            "gemm_mq6g256v2_f32_rows_x4_r2",
+            "gemm_mq6g256v2_f32_rows_x4_r3",
+            "gemm_mq6g256v2_f32_rows_x4_r4",
+            "gemm_mq6g256v2_f32_rows_x4_r5",
+            "gemm_mq6g256v2_f32_rows_x4_r6",
+            "gemm_mq6g256v2_f32_rows_x4_r7",
+            "gemm_mq6g256v2_f32_rows_x4_r8",
+        ];
+        if !(2..=8).contains(&rows) || k == 0 || !k.is_multiple_of(256) {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "MQ6 F32 rows x4 needs 2..=8 rows, K % 256 == 0",
+            ));
+        }
+        let func = FUNCS[rows - 2];
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemm_mq6g256v2_f32_rows",
+            kernels::GEMM_MQ6G256V2_F32_ROWS_SRC,
+            func,
+        )?;
+        let a = parts.map(|(w, _, _)| w.buf.as_ptr());
+        let y = parts.map(|(_, y, _)| y.buf.as_ptr());
+        let m = parts.map(|(_, _, m)| m as i32);
+        let x_ptr = x.buf.as_ptr();
+        let k_val = k as i32;
+        let blocks: usize = parts.iter().map(|(_, _, m)| m).sum();
+        let mut params: Vec<*mut c_void> = Vec::with_capacity(13);
+        for p in &a {
+            params.push(p as *const _ as *mut c_void);
+        }
+        params.push(&x_ptr as *const _ as *mut c_void);
+        for p in &y {
+            params.push(p as *const _ as *mut c_void);
+        }
+        for v in &m {
+            params.push(v as *const _ as *mut c_void);
+        }
+        params.push(&k_val as *const _ as *mut c_void);
+        self.launch_maybe_blob(
+            func,
+            [blocks as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                for p in a {
+                    b.push_ptr(p);
+                }
+                b.push_ptr(x_ptr);
+                for p in y {
+                    b.push_ptr(p);
+                }
+                for v in m {
+                    b.push_i32(v);
+                }
+                b.push_i32(k_val);
+                b
+            },
+        )
+    }
+
+    /// [`Gpu::gemv_bf16_xf32_x4`] over `rows` (2..=8) activation rows: x is
+    /// `[rows, k]`, each output `[rows, m]`; every weight row is read once
+    /// and each output element is bitwise the one-row kernel's.
+    pub fn gemv_bf16_xf32_x4_rows(
+        &mut self,
+        parts: [(&GpuTensor, &GpuTensor, usize); 4],
+        x: &GpuTensor,
+        k: usize,
+        rows: usize,
+    ) -> HipResult<()> {
+        const FUNCS: [&str; 7] = [
+            "gemv_bf16_xf32_x4_rows_r2",
+            "gemv_bf16_xf32_x4_rows_r3",
+            "gemv_bf16_xf32_x4_rows_r4",
+            "gemv_bf16_xf32_x4_rows_r5",
+            "gemv_bf16_xf32_x4_rows_r6",
+            "gemv_bf16_xf32_x4_rows_r7",
+            "gemv_bf16_xf32_x4_rows_r8",
+        ];
+        if !(2..=8).contains(&rows) {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "gemv_bf16_xf32_x4_rows needs 2..=8 rows",
+            ));
+        }
+        let func = FUNCS[rows - 2];
+        self.bind_thread()?;
+        self.ensure_kernel("gemv_bf16_xf32", kernels::GEMV_BF16_XF32_SRC, func)?;
+        let w = parts.map(|(w, _, _)| w.buf.as_ptr());
+        let y = parts.map(|(_, y, _)| y.buf.as_ptr());
+        let m = parts.map(|(_, _, m)| m as i32);
+        let x_ptr = x.buf.as_ptr();
+        let k_val = k as i32;
+        let blocks: usize = parts.iter().map(|(_, _, m)| m).sum();
+        let mut params: Vec<*mut c_void> = Vec::with_capacity(13);
+        for p in &w {
+            params.push(p as *const _ as *mut c_void);
+        }
+        params.push(&x_ptr as *const _ as *mut c_void);
+        for p in &y {
+            params.push(p as *const _ as *mut c_void);
+        }
+        for v in &m {
+            params.push(v as *const _ as *mut c_void);
+        }
+        params.push(&k_val as *const _ as *mut c_void);
+        self.launch_maybe_blob(
+            func,
+            [blocks as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                for p in w {
+                    b.push_ptr(p);
+                }
+                b.push_ptr(x_ptr);
+                for p in y {
+                    b.push_ptr(p);
+                }
+                for v in m {
+                    b.push_i32(v);
+                }
+                b.push_i32(k_val);
+                b
+            },
+        )
+    }
+
     pub fn deepseek4_gemv_mq2g256_lloyd_moe_down_residual_scaled_indexed(
         &mut self,
         expert_ptrs: &GpuTensor,
@@ -16454,7 +16957,11 @@ impl Gpu {
             2 => "gemm_mq6g256v2_f32_rows_r2",
             3 => "gemm_mq6g256v2_f32_rows_r3",
             4 => "gemm_mq6g256v2_f32_rows_r4",
-            _ => return Err(hip_bridge::HipError::new(1, "MQ6 F32 rows must be 2..=4")),
+            5 => "gemm_mq6g256v2_f32_rows_r5",
+            6 => "gemm_mq6g256v2_f32_rows_r6",
+            7 => "gemm_mq6g256v2_f32_rows_r7",
+            8 => "gemm_mq6g256v2_f32_rows_r8",
+            _ => return Err(hip_bridge::HipError::new(1, "MQ6 F32 rows must be 2..=8")),
         };
         if m == 0 || k == 0 || k % 256 != 0 || m > i32::MAX as usize || k > i32::MAX as usize {
             return Err(hip_bridge::HipError::new(

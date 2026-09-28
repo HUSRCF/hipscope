@@ -31,7 +31,7 @@ pub(crate) mod steps;
 pub use layer_ops::{
     execute_argmax, execute_clear, execute_final_hyper, execute_gated_delta_net,
     execute_grouped_depthwise, execute_hyper_read, execute_hyper_write, execute_indexed_attention,
-    execute_lm_head, project_weight, validate_lm_head, ClearOp, GatedDeltaNetOp,
+    execute_lm_head, project_weight, validate_lm_head, ClearOp, GatedDeltaNetOp, GdnRowCapture,
     GroupedDepthwiseOp, HyperReadOp, HyperWriteOp, IndexedAttentionOp, IndexedAttentionState,
 };
 pub use steps::{
@@ -3190,11 +3190,8 @@ fn decode_route_gpu_stage(
                 p.norm_topk_prob
             ))?;
         }
-        // The grouped route's top-10 combine rounds each weight to BF16 as it
-        // reads it (a deferred combine may read them elsewhere).
-        let combine_rounds =
-            route == Some(MoeRouteCapability::Qt44Qt53Grouped) && !p.defer_routed_combine;
-        if p.recipe.bf16_round_trip() && !combine_rounds {
+        // The grouped top-10 router stores its weights BF16-rounded itself.
+        if p.recipe.bf16_round_trip() && route != Some(MoeRouteCapability::Qt44Qt53Grouped) {
             // Only the selected slots are live; scratch may be prefill-sized.
             hip!(gpu.bf16_round_trip_f32(&slice_moe_f32_view(p.topk_weights, 0, p.k)))?;
         }
@@ -3243,6 +3240,7 @@ fn decode_shared_down_stage(
                     shared_up,
                     &shared_hid,
                     &scalar_live,
+                    1,
                 ))?;
             } else {
                 hip!(gpu.sigmoid_f32(&scalar_live))?;

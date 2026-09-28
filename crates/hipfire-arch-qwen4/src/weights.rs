@@ -1459,6 +1459,69 @@ impl Qwen4Weights {
         }
         first.map_or(Ok(()), Err)
     }
+
+    /// Load-time precision experiments: `HIPFIRE_QWEN4_REQUANT="pat=fmt;..."`
+    /// replaces every resident rank-2 weight whose name contains `pat` (first
+    /// matching rule wins) with a requantized copy, `fmt` = `mq2` .. `mq6`
+    /// (MQ G256 V2) | `q8` (from BF16 only). Decode and prefill both bind it.
+    pub fn requant_from_env(&mut self, gpu: &mut Gpu) -> Result<(), String> {
+        let Ok(spec) = std::env::var("HIPFIRE_QWEN4_REQUANT") else {
+            return Ok(());
+        };
+        let mut rules = Vec::new();
+        for rule in spec.split(';').filter(|rule| !rule.trim().is_empty()) {
+            let (pattern, format) = rule
+                .split_once('=')
+                .ok_or_else(|| format!("HIPFIRE_QWEN4_REQUANT rule {rule:?} is not pat=fmt"))?;
+            let target = match format.trim() {
+                "mq2" => DType::MQ2G256V2,
+                "mq3" => DType::MQ3G256V2,
+                "mq4" => DType::MQ4G256V2,
+                "mq5" => DType::MQ5G256V2,
+                "mq6" => DType::MQ6G256V2,
+                "q8" => DType::Q8_0,
+                other => return Err(format!("HIPFIRE_QWEN4_REQUANT format {other:?}")),
+            };
+            rules.push((pattern.trim().to_string(), target));
+        }
+        let (mut count, mut before, mut after) = (0usize, 0usize, 0usize);
+        for taken in &mut self.taken {
+            let WeightHandle::Resident(tensor) = &taken.handle else {
+                continue;
+            };
+            let Some(&(_, target)) = rules
+                .iter()
+                .find(|(pattern, _)| taken.key.name.contains(pattern.as_str()))
+            else {
+                continue;
+            };
+            let [m, k] = taken.projection.logical_shape[..] else {
+                continue;
+            };
+            if tensor.dtype == target {
+                continue;
+            }
+            let copy = if target == DType::Q8_0 {
+                gpu.quantize_bf16_q8_0(tensor, m, k)
+            } else {
+                gpu.requant_g256(tensor, m, k, target)
+            }
+            .map_err(|error| format!("requant {} -> {target:?}: {error}", taken.key.name))?;
+            count += 1;
+            before += tensor.buf.size();
+            after += copy.buf.size();
+            let WeightHandle::Resident(old) =
+                std::mem::replace(&mut taken.handle, WeightHandle::Resident(copy))
+            else {
+                unreachable!()
+            };
+            gpu.free_tensor(old).map_err(|error| error.to_string())?;
+        }
+        eprintln!(
+            "[qwen4] HIPFIRE_QWEN4_REQUANT {spec:?}: {count} tensors, {before} -> {after} bytes"
+        );
+        Ok(())
+    }
 }
 
 fn build_root_refs(config: &Qwen4Config) -> Result<Qwen4RootWeights, WeightError> {

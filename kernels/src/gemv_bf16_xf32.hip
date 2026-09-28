@@ -186,12 +186,22 @@ extern "C" __global__ void hyper_write_norm_f32(
     int branches,
     int hidden
 ) {
+    // Grid [branches, rows]: block (branch, row) owns one branch of one token
+    // row; the weights are per branch.
     const int branch = (int)blockIdx.x;
+    const int row = (int)blockIdx.y;
     const int tid = (int)threadIdx.x;
-    const int offset = branch * hidden;
+    const int woff = branch * hidden;
+    const int offset = row * branches * hidden + woff;
+    mixed += (size_t)row * hidden;
+    gates += (size_t)row * branches;
+    if (quarters_in) quarters_in += (size_t)row * 16;
+    if (quarters_out) quarters_out += (size_t)row * 16;
     // Optional: a scratch prefix the following steps expect zeroed.
     if (clear) {
-        for (int i = branch * 256 + tid; i < clear_elements; i += branches * 256) clear[i] = 0.0f;
+        const int blocks = (int)gridDim.y * branches;
+        for (int i = (row * branches + branch) * 256 + tid; i < clear_elements; i += blocks * 256)
+            clear[i] = 0.0f;
     }
     __shared__ float rms_sum[256];
     __shared__ __align__(16) float xn[2560];
@@ -206,14 +216,14 @@ extern "C" __global__ void hyper_write_norm_f32(
     for (int u = 0; u < 10; ++u) {
         raw[u] = input[offset + tid + u * 256];
         mix[u] = mixed[tid + u * 256];
-        weight[u] = HF_BF16_LO((unsigned int)norm_weight[offset + tid + u * 256]);
+        weight[u] = HF_BF16_LO((unsigned int)norm_weight[woff + tid + u * 256]);
     }
     if (quarters_out) {
 #pragma unroll
         for (int u = 0; u < 10; ++u)
-            next_weight[u] = HF_BF16_LO((unsigned int)next_norm[offset + tid + u * 256]);
+            next_weight[u] = HF_BF16_LO((unsigned int)next_norm[woff + tid + u * 256]);
         if (wave < 4) {
-            const unsigned short* w_row = next_inject + (size_t)wave * 4 * hidden + offset;
+            const unsigned short* w_row = next_inject + (size_t)wave * 4 * hidden + woff;
 #pragma unroll
             for (int s = 0; s < 10; ++s) wv[s] = *(const uint4*)(w_row + lane * 8 + s * 256);
         }
@@ -328,3 +338,105 @@ extern "C" __global__ void gemv_bf16_xf32_x4(
     const float sum = gemv_bf16_xf32_row(W + (size_t)row * K, x, K, threadIdx.x);
     if (threadIdx.x == 0) y[row] = sum;
 }
+
+// gemv_bf16_xf32_x4 over R activation rows (x row stride K, y row stride of
+// each output's M): each weight row is loaded once and dotted with every x
+// row in gemv_bf16_xf32_row's exact order, so each output is bitwise the
+// one-row kernel's. Unused matrices have M = 0.
+template <int R>
+__device__ __forceinline__ void gemv_bf16_xf32_rows_body(
+    const unsigned short* __restrict__ w_row,
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    int M, int K, int row
+) {
+    const int tid = threadIdx.x;
+    float a0[R], a1[R], a2[R], a3[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) a0[r] = a1[r] = a2[r] = a3[r] = 0.0f;
+    if ((K & 7) == 0) {
+        int i = tid * 8;
+        for (; i + 8 * 32 * 8 <= K; i += 32 * 8 * 8) {
+            uint4 wv[8];
+#pragma unroll
+            for (int s = 0; s < 8; ++s) wv[s] = *(const uint4*)(w_row + i + s * (32 * 8));
+#pragma unroll
+            for (int s = 0; s < 8; ++s) {
+#pragma unroll
+                for (int r = 0; r < R; ++r) {
+                    const float* xr = x + (size_t)r * K;
+                    const float4 xa = *(const float4*)(xr + i + s * (32 * 8));
+                    const float4 xb = *(const float4*)(xr + i + s * (32 * 8) + 4);
+                    a0[r] += HF_BF16_LO(wv[s].x) * xa.x;
+                    a1[r] += HF_BF16_HI(wv[s].x) * xa.y;
+                    a2[r] += HF_BF16_LO(wv[s].y) * xa.z;
+                    a3[r] += HF_BF16_HI(wv[s].y) * xa.w;
+                    a0[r] += HF_BF16_LO(wv[s].z) * xb.x;
+                    a1[r] += HF_BF16_HI(wv[s].z) * xb.y;
+                    a2[r] += HF_BF16_LO(wv[s].w) * xb.z;
+                    a3[r] += HF_BF16_HI(wv[s].w) * xb.w;
+                }
+            }
+        }
+        for (; i + 8 <= K; i += 32 * 8) {
+            const uint4 wv = *(const uint4*)(w_row + i);
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                const float* xr = x + (size_t)r * K;
+                const float4 xa = *(const float4*)(xr + i);
+                const float4 xb = *(const float4*)(xr + i + 4);
+                a0[r] += HF_BF16_LO(wv.x) * xa.x;
+                a1[r] += HF_BF16_HI(wv.x) * xa.y;
+                a2[r] += HF_BF16_LO(wv.y) * xa.z;
+                a3[r] += HF_BF16_HI(wv.y) * xa.w;
+                a0[r] += HF_BF16_LO(wv.z) * xb.x;
+                a1[r] += HF_BF16_HI(wv.z) * xb.y;
+                a2[r] += HF_BF16_LO(wv.w) * xb.z;
+                a3[r] += HF_BF16_HI(wv.w) * xb.w;
+            }
+        }
+    }
+    for (int i = ((K & 7) == 0 ? (K & ~7) : 0) + tid; i < K; i += 32) {
+        const float w = __uint_as_float(((unsigned int)w_row[i]) << 16);
+#pragma unroll
+        for (int r = 0; r < R; ++r) a0[r] += w * x[(size_t)r * K + i];
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        float sum = (a0[r] + a1[r]) + (a2[r] + a3[r]);
+        for (int offset = 16; offset > 0; offset >>= 1) sum += __shfl_down(sum, offset);
+        if (tid == 0) y[(size_t)r * M + row] = sum;
+    }
+}
+
+#define GEMV_BF16_XF32_X4_ROWS(R)                                                        \
+    __launch_bounds__(32, 12) extern "C" __global__ void gemv_bf16_xf32_x4_rows_r##R(     \
+        const unsigned short* __restrict__ W0, const unsigned short* __restrict__ W1,     \
+        const unsigned short* __restrict__ W2, const unsigned short* __restrict__ W3,     \
+        const float* __restrict__ x, float* __restrict__ y0, float* __restrict__ y1,      \
+        float* __restrict__ y2, float* __restrict__ y3, int M0, int M1, int M2, int M3,   \
+        int K) {                                                                         \
+        int row = blockIdx.x;                                                            \
+        const unsigned short* W = W0;                                                    \
+        float* y = y0;                                                                   \
+        int M = M0;                                                                      \
+        if (row >= M0) {                                                                 \
+            row -= M0; W = W1; y = y1; M = M1;                                           \
+            if (row >= M1) {                                                             \
+                row -= M1; W = W2; y = y2; M = M2;                                       \
+                if (row >= M2) {                                                         \
+                    row -= M2; W = W3; y = y3; M = M3;                                   \
+                    if (row >= M3) return;                                               \
+                }                                                                        \
+            }                                                                            \
+        }                                                                                \
+        gemv_bf16_xf32_rows_body<R>(W + (size_t)row * K, x, y, M, K, row);               \
+    }
+GEMV_BF16_XF32_X4_ROWS(2)
+GEMV_BF16_XF32_X4_ROWS(3)
+GEMV_BF16_XF32_X4_ROWS(4)
+GEMV_BF16_XF32_X4_ROWS(5)
+GEMV_BF16_XF32_X4_ROWS(6)
+GEMV_BF16_XF32_X4_ROWS(7)
+GEMV_BF16_XF32_X4_ROWS(8)
+#undef GEMV_BF16_XF32_X4_ROWS

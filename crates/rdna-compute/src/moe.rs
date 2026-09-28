@@ -10,6 +10,16 @@ use crate::dispatch::{DType, Gpu, GpuTensor};
 use crate::kernels;
 use hip_bridge::HipResult;
 
+/// The shared expert's BF16 activation carried by a fused MoE launch: the
+/// operands of [`Gpu::shared_expert_activation_bf16_f32`].
+pub struct SharedExpertActivation<'a> {
+    pub gate: &'a GpuTensor,
+    pub up: &'a GpuTensor,
+    pub out: &'a GpuTensor,
+    pub selector: &'a GpuTensor,
+    pub selectors: usize,
+}
+
 impl Gpu {
     /// Combine pass for the atomic-free MoE down path. Sums K_TOP expert
     /// outputs per (token, m) weighted by topk_weights, accumulates into
@@ -1784,8 +1794,9 @@ impl Gpu {
         )
     }
     /// Qwen4's fixed 512-way/top-10 GPU router.  The incumbent k=8 routers
-    /// remain separate symbols and launchers.  `round_logits` reads the logits
-    /// through [`Gpu::bf16_round_trip_f32`]'s rounding (the buffer is unchanged).
+    /// remain separate symbols and launchers.  `round_logits` (the BF16 recipe)
+    /// reads the logits through [`Gpu::bf16_round_trip_f32`]'s rounding (the
+    /// buffer is unchanged) and stores the weights through it too.
     pub fn moe_router_softmax_top10_f32(
         &mut self,
         logits: &GpuTensor,
@@ -2291,6 +2302,106 @@ impl Gpu {
             },
         )?;
         Ok(out)
+    }
+
+    /// [`Gpu::moe_gate_up_unscatter_silu_top10`] followed by the in-place
+    /// [`Gpu::rotate_x_mq_128_v2`] of its activation rows, one launch (bitwise
+    /// both): `rotated` receives the MoE down's F32 input.  With `shared`, the
+    /// same launch also runs [`Gpu::shared_expert_activation_bf16_f32`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_gate_up_unscatter_silu_rotate128_top10(
+        &mut self,
+        grouped_gate_up: &GpuTensor,
+        sorted_slot_index: &GpuTensor,
+        rotated: &GpuTensor,
+        mi: usize,
+        grouped_rows: usize,
+        bf16_round_trip: bool,
+        shared: Option<&SharedExpertActivation<'_>>,
+    ) -> HipResult<()> {
+        if mi % 128 != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "fused unscatter/rotate needs mi % 128 == 0",
+            ));
+        }
+        self.bind_thread()?;
+        const FUNC: &str = "moe_gate_up_unscatter_silu_rotate128_top10";
+        self.ensure_kernel(
+            "moe_gate_up_unscatter_silu_top10",
+            kernels::MOE_GATE_UP_UNSCATTER_SILU_TOP10_SRC,
+            FUNC,
+        )?;
+        self.ensure_mq_signs_128()?;
+        let yp = grouped_gate_up.buf.as_ptr();
+        let sp = sorted_slot_index.buf.as_ptr();
+        let s1 = self.scratch.mq_signs1_128.as_ref().unwrap().buf.as_ptr();
+        let s2 = self.scratch.mq_signs2_128.as_ref().unwrap().buf.as_ptr();
+        let rp = rotated.buf.as_ptr();
+        let mi_val = mi as i32;
+        let rows_val = grouped_rows as i32;
+        let rt_val = bf16_round_trip as i32;
+        let null = std::ptr::null_mut::<c_void>();
+        let (sgp, sup, sop, selp, shared_n, selectors) = match shared {
+            Some(s) => (
+                s.gate.buf.as_ptr(),
+                s.up.buf.as_ptr(),
+                s.out.buf.as_ptr(),
+                s.selector.buf.as_ptr(),
+                s.gate.numel(),
+                s.selectors,
+            ),
+            None => (null, null, null, null, 0, 0),
+        };
+        let shared_blocks = shared_n.max(selectors).div_ceil(mi);
+        let shared_n_val = shared_n as i32;
+        let selectors_val = selectors as i32;
+        let mut params = [
+            &yp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &s1 as *const _ as *mut c_void,
+            &s2 as *const _ as *mut c_void,
+            &rp as *const _ as *mut c_void,
+            &mi_val as *const _ as *mut c_void,
+            &rows_val as *const _ as *mut c_void,
+            &rt_val as *const _ as *mut c_void,
+            &sgp as *const _ as *mut c_void,
+            &sup as *const _ as *mut c_void,
+            &sop as *const _ as *mut c_void,
+            &selp as *const _ as *mut c_void,
+            &shared_n_val as *const _ as *mut c_void,
+            &selectors_val as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            FUNC,
+            [(grouped_rows + shared_blocks) as u32, (mi / 128) as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(yp);
+                b.push_ptr(sp);
+                b.push_ptr(s1);
+                b.push_ptr(s2);
+                b.push_ptr(rp);
+                b.push_i32(mi_val);
+                b.push_i32(rows_val);
+                b.push_i32(rt_val);
+                b.push_ptr(sgp);
+                b.push_ptr(sup);
+                b.push_ptr(sop);
+                b.push_ptr(selp);
+                b.push_i32(shared_n_val);
+                b.push_i32(selectors_val);
+                b
+            },
+        )?;
+        self.invalidate_x_caches_for(rp);
+        if !sop.is_null() {
+            self.invalidate_x_caches_for(sop);
+        }
+        Ok(())
     }
 
     /// [`Gpu::moe_gate_up_unscatter_silu_top10`] reading the grouped rows as BF16 bits (written by a

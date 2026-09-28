@@ -40,20 +40,22 @@ extern "C" __global__ void silu_mul_bf16_rt_f32(
     }
 }
 
-// The BF16 shared-expert activation of one decode token in one launch:
-// `out` is silu_mul_bf16_rt_f32(gate, up) and thread 0 also replaces the
-// selector scalar with sigmoid(its BF16 round trip) — bitwise the separate
-// round-trip, sigmoid_f32 and silu_mul_bf16_rt_f32 launches.
+// The BF16 shared-expert activation of `selectors` tokens in one launch:
+// `out` is silu_mul_bf16_rt_f32(gate, up) and threads below `selectors` also
+// replace their token's selector scalar with sigmoid(its BF16 round trip) —
+// bitwise the separate round-trip, sigmoid_f32 and silu_mul_bf16_rt_f32
+// launches (n >= selectors).
 extern "C" __global__ void shared_expert_activation_bf16_f32(
     const float* __restrict__ gate,
     const float* __restrict__ up,
     float* __restrict__ out,
     float* __restrict__ selector,
-    int n
+    int n,
+    int selectors
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i == 0) {
-        selector[0] = 1.0f / (1.0f + expf(-silu_mul_bf16_rt(selector[0])));
+    if (i < selectors) {
+        selector[i] = 1.0f / (1.0f + expf(-silu_mul_bf16_rt(selector[i])));
     }
     if (i < n) {
         float v = silu_mul_bf16_rt(gate[i]);

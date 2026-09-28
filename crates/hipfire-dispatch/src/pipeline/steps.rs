@@ -773,7 +773,20 @@ pub fn execute_validated_steps<'a>(
                     Some(Step::Moe(call)) => call
                         .decode_params()
                         .filter(|p| p.x_norm.buf.as_ptr() == mixed && !p.x_rot_prerotated)
-                        .map(|p| p.x_rot_local),
+                        .map(|p| p.x_rot_local)
+                        .or_else(|| {
+                            // Few-row grouped prefill (speculative verify): its
+                            // input basis rotates the provided `mixed` rows.
+                            call.prefill_params()
+                                .filter(|p| {
+                                    p.x_norm_batch.buf.as_ptr() == mixed
+                                        && matches!(
+                                            p.prelude.normalization,
+                                            crate::families::moe::MoeNormalization::Provided
+                                        )
+                                })
+                                .map(|p| p.x_rot_batch)
+                        }),
                     _ => None,
                 };
                 if let Some(produced) = execute_hyper_write_then_read(

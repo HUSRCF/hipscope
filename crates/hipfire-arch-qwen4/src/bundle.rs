@@ -11,7 +11,7 @@
 
 use crate::config::Qwen4Config;
 use crate::gpu_forward::{Qwen4GpuForward, Qwen4OutputRows, QWEN4_PREFILL_CHUNK_CAP};
-use crate::mtp_gpu::{MtpGpuStateSnapshot, Qwen4MtpGpu};
+use crate::mtp_gpu::{MtpGpuStateSnapshot, MtpStep, Qwen4MtpGpu};
 use crate::ple::PleHashMetadata;
 use crate::state::{Qwen4State, Qwen4StateSnapshot, StateError};
 use crate::weights::{
@@ -242,6 +242,9 @@ impl Qwen4Bundle {
             ));
         }
         let max_chunk = max_chunk.min(QWEN4_PREFILL_CHUNK_CAP);
+        self.weights
+            .requant_from_env(gpu)
+            .map_err(BundleError::Forward)?;
         let forward = Qwen4GpuForward::new(gpu, self, max_chunk)
             .map_err(|error| BundleError::Forward(error.to_string()))?;
         let logits_len = max_chunk
@@ -485,6 +488,48 @@ impl Qwen4Bundle {
             .map_err(BundleError::Hip)
     }
 
+    /// Keep the first `keep` rows of the armed `tokens.len()`-row verify the
+    /// active snapshot ticket brackets, without re-running them; the ticket
+    /// stays active for the caller's commit or restore.
+    pub(crate) fn rollback_verify_rows_retain(
+        &mut self,
+        gpu: &mut Gpu,
+        snapshot: Qwen4StateSnapshot,
+        keep: usize,
+        tokens: &[u32],
+    ) -> Result<(), BundleError> {
+        let ple_normed = &self
+            .execution
+            .as_ref()
+            .ok_or_else(|| {
+                BundleError::Forward("Qwen4 forward resources are not attached".to_string())
+            })?
+            .scratch
+            .ple_normed;
+        self.state
+            .rollback_rows_retain(
+                gpu,
+                snapshot,
+                keep,
+                tokens.len(),
+                tokens,
+                ple_normed,
+                self.config.ple_conv_history_rows(),
+                self.config.linear_conv_kernel_dim - 1,
+                self.config.indexer_compress_ratio,
+                self.config.indexer_budget,
+            )
+            .map_err(BundleError::State)
+    }
+
+    /// Start reading the PLE rows `tokens` (the next tokens after the
+    /// committed history, in order) will need, so a forward over them later
+    /// finds them cached. Best effort: a failure only loses the head start.
+    pub(crate) fn warm_ple_rows(&self, tokens: &[u32]) {
+        let ids = self.state.ple_history.row_ids(&self.ple_metadata, tokens);
+        let _ = self.ple_rows.warm(ids);
+    }
+
     pub(crate) fn spec_capture_token(
         &mut self,
         gpu: &mut Gpu,
@@ -517,12 +562,19 @@ impl Qwen4Bundle {
             backbone_hidden,
             position,
             fresh_qsa_selection,
-            true,
+            MtpStep::Predict,
         )
         .map_err(|error| BundleError::Forward(error.to_string()))?
         .ok_or_else(|| {
             BundleError::Forward("MTP prediction requested but no token produced".into())
         })
+    }
+
+    /// Exact logit margin of the last MTP draft over its runner-up.
+    pub(crate) fn mtp_draft_margin(&self) -> f32 {
+        self.mtp
+            .as_ref()
+            .map_or(f32::INFINITY, |mtp| mtp.draft_margin)
     }
 
     pub(crate) fn mtp_advance_token(
@@ -544,7 +596,34 @@ impl Qwen4Bundle {
                 backbone_hidden,
                 position,
                 fresh_qsa_selection,
-                false,
+                MtpStep::Advance,
+            )
+            .map(|_| ())
+            .map_err(|error| BundleError::Forward(error.to_string()))
+    }
+
+    /// The last MTP step of a chain: append only its K/V and index-key cache
+    /// rows (see [`MtpStep::Append`]); the next step must bring its own
+    /// backbone hidden and a fresh selection.
+    pub(crate) fn mtp_append_token(
+        &mut self,
+        gpu: &mut Gpu,
+        token: u32,
+        backbone_hidden: Option<&GpuTensor>,
+        position: usize,
+    ) -> Result<(), BundleError> {
+        self.mtp
+            .as_mut()
+            .ok_or_else(|| BundleError::Forward("Qwen4 MTP resources are not attached".into()))?
+            .forward_token(
+                gpu,
+                &self.weights,
+                &self.config,
+                token,
+                backbone_hidden,
+                position,
+                true,
+                MtpStep::Append,
             )
             .map(|_| ())
             .map_err(|error| BundleError::Forward(error.to_string()))
@@ -612,6 +691,21 @@ impl Qwen4Bundle {
                 BundleError::Forward("Qwen4 MTP resources are not attached".to_string())
             })?
             .restore_retain(gpu, snapshot)
+            .map_err(|error| BundleError::Forward(error.to_string()))
+    }
+
+    pub(crate) fn mtp_truncate_retain(
+        &mut self,
+        snapshot: MtpGpuStateSnapshot,
+        keep: usize,
+    ) -> Result<(), BundleError> {
+        let compress = self.config.indexer_compress_ratio;
+        self.mtp
+            .as_mut()
+            .ok_or_else(|| {
+                BundleError::Forward("Qwen4 MTP resources are not attached".to_string())
+            })?
+            .truncate_retain(snapshot, keep, compress)
             .map_err(|error| BundleError::Forward(error.to_string()))
     }
 

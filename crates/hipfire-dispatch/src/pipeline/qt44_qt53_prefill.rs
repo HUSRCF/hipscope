@@ -13,6 +13,7 @@ use super::layer_ops::hip;
 use crate::families::gemv::WeightRef;
 use crate::families::moe::MoePrefillParams;
 use crate::types::DispatchError;
+use rdna_compute::moe::SharedExpertActivation;
 use rdna_compute::tensor_ops::{bf16_scaled_add_batched, Bf16ScaledAddBatched};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -100,6 +101,10 @@ fn batch_projection(
         DType::MQ4G128V2 => {
             hip(gpu.gemm_mq4g128v2_batched(weight.buf, x, y, weight.m, weight.k, batch_size))
         }
+        // Qwen4's few-row decode copies: rows <= 8 run the decode GEMV per row.
+        DType::Q8_0 => {
+            hip(gpu.gemm_q8_0_batched_f32_chunked(weight.buf, x, y, weight.m, weight.k, batch_size))
+        }
         _ => Err(DispatchError::UnsupportedVariant {
             family: "moe",
             variant: "qt44-qt53-shared-projection-dtype",
@@ -116,6 +121,10 @@ pub(crate) fn router_projection(
     p: &MoePrefillParams<'_>,
 ) -> Result<(), DispatchError> {
     require_geometry(p)?;
+    // Projected by the shared gate/up stage's launch instead.
+    if router_with_shared(p) {
+        return Ok(());
+    }
     batch_projection(
         gpu,
         &p.prelude.router,
@@ -123,6 +132,24 @@ pub(crate) fn router_projection(
         p.prelude.router_logits,
         p.batch_size,
     )
+}
+
+/// Whether a few-row forward (<= 8 rows, where the grouped BF16 row kernel is
+/// bitwise each projection's own) projects the router together with the
+/// all-BF16 shared selector/gate/up in one launch (the shared gate/up stage,
+/// which the route always runs right after the router stage).
+fn router_with_shared(p: &MoePrefillParams<'_>) -> bool {
+    p.batch_size <= 8
+        && p.prelude.router.dtype == DType::BF16
+        && p.prelude.shared.as_ref().is_some_and(|shared| {
+            [
+                &shared.weights.selector,
+                &shared.weights.gate,
+                &shared.weights.up,
+            ]
+            .iter()
+            .all(|w| w.dtype == DType::BF16)
+        })
 }
 
 /// Shared selector and gate/up are ordinary batched projections.  This is the
@@ -137,7 +164,21 @@ pub(crate) fn shared_gate_up(gpu: &mut Gpu, p: &MoePrefillParams<'_>) -> Result<
         .as_ref()
         .ok_or_else(|| DispatchError::Hip("grouped prefill shared weights missing".into()))?;
     let weights = &shared.weights;
-    if [&weights.selector, &weights.gate, &weights.up]
+    if router_with_shared(p) {
+        // All read the natural activation: one launch (one F16 conversion).
+        super::layer_ops::project_weights(
+            gpu,
+            p.x_norm_batch,
+            p.batch_size,
+            None,
+            &[
+                (&p.prelude.router, p.prelude.router_logits),
+                (&weights.selector, shared.scalar),
+                (&weights.gate, shared.gate_out),
+                (&weights.up, shared.up_out),
+            ],
+        )?;
+    } else if [&weights.selector, &weights.gate, &weights.up]
         .iter()
         .all(|w| w.dtype == DType::BF16)
     {
@@ -174,7 +215,7 @@ pub(crate) fn shared_gate_up(gpu: &mut Gpu, p: &MoePrefillParams<'_>) -> Result<
             p.batch_size,
         )?;
         let x_gate = match shared.weights.gate.dtype {
-            DType::BF16 | DType::F32 => p.x_norm_batch,
+            DType::BF16 | DType::F32 | DType::Q8_0 => p.x_norm_batch,
             DType::MQ4G256V2 => p.x_rot_batch,
             _ => {
                 return Err(DispatchError::UnsupportedVariant {
@@ -194,12 +235,9 @@ pub(crate) fn shared_gate_up(gpu: &mut Gpu, p: &MoePrefillParams<'_>) -> Result<
         )?;
         batch_projection(gpu, &shared.weights.up, x_gate, shared.up_out, p.batch_size)?;
     }
-    if p.recipe.bf16_round_trip() {
-        // gate/up are round-tripped where the activation reads them (their
-        // only reader), in the same pass.
-        hip(gpu.bf16_round_trip_f32(p.prelude.router_logits))?;
-        hip(gpu.bf16_round_trip_f32(shared.scalar))?;
-    }
+    // BF16 recipe: every reader rounds what it reads (the top-10 router its
+    // logits, the shared activation its selector, gate and up), so no
+    // separate round trip is owed here.
     Ok(())
 }
 
@@ -207,26 +245,18 @@ pub(crate) fn shared_gate_up(gpu: &mut Gpu, p: &MoePrefillParams<'_>) -> Result<
 pub(crate) fn shared_activation(
     gpu: &mut Gpu,
     p: &MoePrefillParams<'_>,
+    use_path2: bool,
 ) -> Result<(), DispatchError> {
     require_geometry(p)?;
+    // Path 2's fused unscatter launch runs it (see `shared_in_unscatter`).
+    if use_path2 && shared_in_unscatter(gpu, p) {
+        return Ok(());
+    }
     let shared = p
         .prelude
         .shared
         .as_ref()
         .ok_or_else(|| DispatchError::Hip("grouped prefill shared weights missing".into()))?;
-    let scalar = f32_view(shared.scalar, 0, p.batch_size);
-    if p.recipe.bf16_round_trip() {
-        #[cfg(feature = "deltanet")]
-        hip(gpu.sigmoid_f32(&scalar))?;
-        #[cfg(not(feature = "deltanet"))]
-        return Err(DispatchError::UnsupportedVariant {
-            family: "moe",
-            variant: "grouped-shared-sigmoid-requires-deltanet",
-            arch: "",
-            quant: "",
-        });
-        hip(gpu.bf16_round_trip_f32(&scalar))?;
-    }
     // The live rows only: the shared buffers are sized for the chunk cap.
     let live = p.batch_size * shared.intermediate;
     let (gate, up, rotated) = (
@@ -235,7 +265,15 @@ pub(crate) fn shared_activation(
         f32_view(shared.rotated, 0, live),
     );
     if p.recipe.bf16_round_trip() {
-        hip(gpu.silu_mul_bf16_rt_f32(&gate, &up, &rotated))?;
+        // The selector's round trip and sigmoid ride in the same launch; the
+        // shared down's scaled add rounds the selector again on read.
+        hip(gpu.shared_expert_activation_bf16_f32(
+            &gate,
+            &up,
+            &rotated,
+            shared.scalar,
+            p.batch_size,
+        ))?;
     } else {
         hip(gpu.silu_mul_f32(&gate, &up, &rotated))?;
     }
@@ -263,7 +301,7 @@ pub(crate) fn shared_down(gpu: &mut Gpu, p: &MoePrefillParams<'_>) -> Result<(),
     let target = p.routed_out.unwrap_or(p.x_batch);
     let out = f32_view(p.down_expanded, 0, p.batch_size * p.down_m);
     match down.dtype {
-        DType::BF16 | DType::F32 | DType::MQ4G256V2 | DType::MQ4G128V2 => {
+        DType::BF16 | DType::F32 | DType::Q8_0 | DType::MQ4G256V2 | DType::MQ4G128V2 => {
             // The shared activation is already in the basis consumed by this
             // projection (G128 for QT53); the BF16 storage boundary, if any,
             // was applied by the recipe before this launch.
@@ -421,7 +459,8 @@ pub(crate) fn gate_up(
 /// Path-2 unscatter fused with the SwiGLU activation: the grouped gate/up
 /// rows go straight to the rotation input (`rot_batch`) with the recipe's BF16
 /// round trips, bitwise the unfused unscatter -> round trip -> silu_mul ->
-/// round trip sequence.  [`activation`] then only rotates.
+/// round trip sequence, rotated in the same launch when
+/// [`unscatter_rotates`] (else [`activation`] rotates).
 pub(crate) fn unscatter(
     gpu: &mut Gpu,
     p: &MoePrefillParams<'_>,
@@ -442,6 +481,42 @@ pub(crate) fn unscatter(
             p.recipe.bf16_round_trip(),
         ));
     }
+    if unscatter_rotates(gpu, p) {
+        // The shared expert's activation rides in the same launch; its stage
+        // skipped it (the shared down reads it after the combine).
+        let shared = p
+            .prelude
+            .shared
+            .as_ref()
+            .filter(|_| shared_in_unscatter(gpu, p))
+            .map(|shared| {
+                let live = p.batch_size * shared.intermediate;
+                (
+                    f32_view(shared.gate_out, 0, live),
+                    f32_view(shared.up_out, 0, live),
+                    f32_view(shared.rotated, 0, live),
+                    shared.scalar,
+                )
+            });
+        let shared = shared
+            .as_ref()
+            .map(|(gate, up, out, selector)| SharedExpertActivation {
+                gate,
+                up,
+                out,
+                selector,
+                selectors: p.batch_size,
+            });
+        return hip(gpu.moe_gate_up_unscatter_silu_rotate128_top10(
+            p.y_gate_up_grouped,
+            p.sorted_slot_index,
+            p.rot_batch,
+            p.mi,
+            grouped_rows,
+            p.recipe.bf16_round_trip(),
+            shared.as_ref(),
+        ));
+    }
     hip(gpu.moe_gate_up_unscatter_silu_top10(
         p.y_gate_up_grouped,
         p.sorted_slot_index,
@@ -450,6 +525,25 @@ pub(crate) fn unscatter(
         grouped_rows,
         p.recipe.bf16_round_trip(),
     ))
+}
+
+/// Whether path 2's F32 unscatter also applies the down's 128-wide rotation
+/// (in the same launch), leaving [`activation`] nothing to do.
+fn unscatter_rotates(gpu: &Gpu, p: &MoePrefillParams<'_>) -> bool {
+    !gateup_bf16(gpu, p) && !down_wmma(gpu, p) && p.mi % 128 == 0
+}
+
+/// Whether path 2's fused unscatter launch also runs the BF16 shared expert
+/// activation: its only reader, a natural-basis shared down, runs after the
+/// combine (so after the unscatter).
+fn shared_in_unscatter(gpu: &Gpu, p: &MoePrefillParams<'_>) -> bool {
+    unscatter_rotates(gpu, p)
+        && p.recipe.bf16_round_trip()
+        && p.recipe.shared_after_combine()
+        && p.prelude
+            .shared
+            .as_ref()
+            .is_some_and(|shared| shared.weights.down.dtype != DType::MQ4G128V2)
 }
 
 pub(crate) fn activation(
@@ -466,11 +560,22 @@ pub(crate) fn activation(
             hip(gpu.bf16_round_trip_f32(p.rot_batch))?;
         }
     }
-    // The F16 WMMA down rotates straight to F16 itself (see `down`).
-    if use_path2 && down_wmma(gpu, p) {
+    // The F16 WMMA down rotates straight to F16 itself (see `down`); the F32
+    // unscatter may already have rotated.
+    if use_path2 && (down_wmma(gpu, p) || unscatter_rotates(gpu, p)) {
         return Ok(());
     }
     hip(gpu.rotate_x_mq_128_v2(p.rot_batch, p.rot_batch, p.mi, total_slots))
+}
+
+/// A few-row forward (speculative verify) on grouped path 2 without the WMMA
+/// down: the route slots are nearly all distinct experts, so the grouped down
+/// tile (16 slot rows per expert) runs almost empty; the decode kernel's
+/// per-slot down over the unscattered, rotated rows streams the experts
+/// faster.  Its per-slot dot is the grouped kernel's (bitwise), combined in
+/// slot order.
+fn indexed_down(gpu: &Gpu, p: &MoePrefillParams<'_>, use_path2: bool) -> bool {
+    use_path2 && p.batch_size <= 8 && !down_wmma(gpu, p)
 }
 
 pub(crate) fn down(
@@ -481,6 +586,9 @@ pub(crate) fn down(
 ) -> Result<(), DispatchError> {
     require_geometry(p)?;
     let total_slots = p.batch_size * p.k_top;
+    if indexed_down(gpu, p, use_path2) {
+        return down(gpu, p, false, grouped_rows);
+    }
     if use_path2 && down_wmma(gpu, p) {
         // Rotation and GEMM in one stage: the rotated F16 rows live in the
         // shared FP16 scratch, which another stage's GEMM would overwrite.
@@ -536,10 +644,7 @@ pub(crate) fn down(
             p.batch_size,
             p.n_exp,
         ))?;
-        let expanded = f32_view(p.down_expanded, 0, total_slots * p.down_m);
-        if p.recipe.bf16_round_trip() {
-            hip(gpu.bf16_round_trip_f32(&expanded))?;
-        }
+        // The combine rounds every expert output it reads to BF16 itself.
     }
     Ok(())
 }
@@ -552,6 +657,9 @@ pub(crate) fn combine(
 ) -> Result<(), DispatchError> {
     require_geometry(p)?;
     let target = p.routed_out.unwrap_or(p.x_batch);
+    if indexed_down(gpu, p, use_path2) {
+        return combine(gpu, p, false, grouped_rows);
+    }
     if use_path2 && down_wmma(gpu, p) {
         // The rank order goes to `down_expanded`: unused on this route until
         // the shared down, which runs after the combine.

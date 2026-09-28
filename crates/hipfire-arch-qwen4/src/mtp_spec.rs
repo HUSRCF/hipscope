@@ -393,7 +393,18 @@ impl SpecTarget for Qwen4Bundle {
                 self.state.max_seq_len
             ));
         }
-        let snapshot = self.snapshot(gpu).map_err(|error| error.to_string())?;
+        // The verify leaves per-row rollback points, so a rejected suffix is
+        // dropped without re-running the accepted rows (armed before the
+        // snapshot: the GDN states then need no copy).
+        self.state.row_capture_armed =
+            block.len() >= 2 && self.state.row_capture_rows() >= block.len();
+        let snapshot = match self.snapshot(gpu) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.state.row_capture_armed = false;
+                return Err(error.to_string());
+            }
+        };
         scratch
             .as_any_mut()
             .downcast_mut::<Qwen4SpecScratch>()
@@ -402,6 +413,7 @@ impl SpecTarget for Qwen4Bundle {
         let result = self
             .spec_forward_rows(gpu, block, true)
             .map_err(|error| error.to_string());
+        self.state.row_capture_armed = false;
         if let Err(error) = &result {
             let snapshot = scratch
                 .as_any_mut()
@@ -503,6 +515,39 @@ enum DraftPairing {
     AlignedTarget,
 }
 
+/// Cost of a batched window that drafts K tokens (index K: K draft steps,
+/// a (K+1)-row verify, rollback), in interleaved-route emitted tokens (one
+/// single-row forward plus one draft step). gfx1151, Qwen3.8-Flash-Next,
+/// measured: interleaved ~33.5 ms/token, K=2 window ~62.5 ms, K=3 ~75.4 ms;
+/// the others from the few-row forward's growth (2 rows ~50 ms, 5 ~69,
+/// 8 ~98) plus ~2.7 ms per draft step.
+const MTP_WINDOW_COST: [f32; 8] = [1.0, 1.7, 1.87, 2.25, 2.55, 2.75, 3.0, 3.6];
+/// Per-window decay of the per-depth agreement counts.
+const MTP_AGREEMENT_DECAY: f32 = 0.875;
+/// Per-depth (accepted, compared) counts a request starts from (0.8).
+const MTP_AGREEMENT_PRIOR: (f32, f32) = (1.6, 2.0);
+/// Draft depths tracked (the drafter's K is clamped to this).
+const MTP_MAX_DEPTH: usize = 10;
+/// Smallest probability that a verify row's whole draft prefix is accepted
+/// for the row (plus its draft step) to pay: ~6 ms of a ~47 ms window
+/// emitting ~2-3.5 tokens.
+const MTP_ROW_WORTH: f32 = 0.2;
+/// Best per-draft acceptance [`draft_accept_estimate`] gives.
+const DRAFT_ACCEPT_MAX: f32 = 0.98;
+
+/// Acceptance of a draft whose exact logit leads its runner-up (among the
+/// re-scored candidates) by `margin`; measured on the committed sweep prompts
+/// (gfx1151, Qwen3.8-Flash-Next, all depths pooled).
+fn draft_accept_estimate(margin: f32) -> f32 {
+    match margin {
+        m if m < 0.25 => 0.3,
+        m if m < 1.5 => 0.5,
+        m if m < 3.0 => 0.7,
+        m if m < 6.0 => 0.82,
+        _ => DRAFT_ACCEPT_MAX,
+    }
+}
+
 /// Native GPU MTP drafter.  The MTP operator/state stay model-owned by the
 /// target bundle; this adapter owns only the reusable verifier scratch and one
 /// pending target-hidden row needed to seed each MTP window.
@@ -516,6 +561,10 @@ pub struct Qwen4MtpDrafter {
     /// Prompt rows one chunked prefill call may capture; mirrors the attached
     /// forward's chunk capacity and sizes the spec hidden capture buffer.
     prefill_rows: usize,
+    /// Recent agreement per draft depth as decayed (accepted, compared)
+    /// counts (see `observe_agreement`); picks the verify route and draft
+    /// depth when `HIPFIRE_MTP_INCREMENTAL` is unset.
+    agreement: [(f32, f32); MTP_MAX_DEPTH],
 }
 
 impl Qwen4MtpDrafter {
@@ -528,6 +577,7 @@ impl Qwen4MtpDrafter {
             pending_hidden: None,
             row_hidden: None,
             prefill_rows: 0,
+            agreement: [MTP_AGREEMENT_PRIOR; MTP_MAX_DEPTH],
         }
     }
 
@@ -554,6 +604,18 @@ impl Qwen4MtpDrafter {
         };
         let prefill_rows = {
             let bundle = Self::bundle(target)?;
+            // Row capture rides the few-row persistent GDN recurrence.
+            let config = &bundle.config;
+            if gpu.arch_caps.has_gfx11_plus_simt()
+                && config.linear_key_head_dim == 128
+                && config.linear_value_head_dim == 128
+                && config.linear_conv_kernel_dim == 4
+            {
+                bundle
+                    .state
+                    .ensure_row_capture(gpu, self.max_k + 1, config.linear_conv_kernel_dim - 1)
+                    .map_err(|error| error.to_string())?;
+            }
             bundle.spec_chunk_rows().unwrap_or(1).max(1)
         };
         if self.scratch.is_none() {
@@ -659,7 +721,7 @@ impl Qwen4MtpDrafter {
                 {
                     let bundle = Self::bundle(target)?;
                     bundle
-                        .mtp_advance_token(gpu, token, hidden, token_position, row == 0)
+                        .mtp_append_token(gpu, token, hidden, token_position)
                         .map_err(|error| error.to_string())?;
                 }
                 committed.push(pick);
@@ -751,6 +813,41 @@ impl Qwen4MtpDrafter {
         })
     }
 
+    /// Only the drafts compared before the first rejection count, so each
+    /// depth measures the agreement conditional on its prefix being accepted
+    /// (the same quantity on both routes).
+    fn observe_agreement(&mut self, window: &MtpWindow) {
+        let compared = (window.accepted + 1).min(window.drafts_generated);
+        for (depth, (accepted, total)) in self.agreement.iter_mut().enumerate() {
+            *accepted *= MTP_AGREEMENT_DECAY;
+            *total *= MTP_AGREEMENT_DECAY;
+            if depth < compared {
+                *total += 1.0;
+                *accepted += f32::from(u8::from(depth < window.accepted));
+            }
+        }
+    }
+
+    /// Draft depth for the next window: the K maximizing expected emitted
+    /// tokens (1 + sum over depths of the accepted-prefix probability) per
+    /// window cost, or 0 (interleaved) when no batched window beats one
+    /// token per interleaved step.
+    fn batched_depth(&self, k: usize) -> usize {
+        let mut best = (0, 1.0f32);
+        let mut prefix = 1.0f32;
+        let mut expected = 1.0f32;
+        for depth in 1..=k.min(MTP_WINDOW_COST.len() - 1) {
+            let (accepted, total) = self.agreement[depth - 1];
+            prefix *= accepted / total.max(f32::MIN_POSITIVE);
+            expected += prefix;
+            let rate = expected / MTP_WINDOW_COST[depth];
+            if rate > best.1 {
+                best = (depth, rate);
+            }
+        }
+        best.0
+    }
+
     fn pending_hidden(&self) -> Result<&GpuTensor, String> {
         self.pending_hidden
             .as_ref()
@@ -771,6 +868,7 @@ impl MtpDrafter for Qwen4MtpDrafter {
     ) -> Result<u32, String> {
         require_native_greedy(self.request.temp)?;
         validate_native_mtp_prefill_request(prompt_tokens, fill_tokens, start_pos, cache_hit)?;
+        self.agreement = [MTP_AGREEMENT_PRIOR; MTP_MAX_DEPTH];
         // Native Qwen4 MTP has no exact target+MTP suffix rehydration yet.
         // Always discard any AR or stale MTP prefix and rebuild the complete
         // rendered prompt from position zero.
@@ -820,7 +918,7 @@ impl MtpDrafter for Qwen4MtpDrafter {
                     .copy_spec_hidden_row_to(gpu, index, pending)
                     .map_err(|error| error.to_string())?;
                 bundle
-                    .mtp_advance_token(gpu, token, Some(pending), position, true)
+                    .mtp_append_token(gpu, token, Some(pending), position)
                     .map_err(|error| error.to_string())?;
             }
             first_token = Some(pick);
@@ -848,11 +946,23 @@ impl MtpDrafter for Qwen4MtpDrafter {
         }
         self.ensure_resources(gpu, target)?;
         let trace = std::env::var("HIPFIRE_MTP_TRACE").is_ok_and(|value| value == "1");
-        // Incremental verification is the default on every GPU; batching is opt-in.
-        let incremental = !matches!(std::env::var("HIPFIRE_MTP_INCREMENTAL").as_deref(), Ok("0"));
-        if incremental {
-            return self.mtp_step_incremental(gpu, target, position, seed, k, eos, trace);
+        // Route: a (k+1)-row batched verify costs about 2.5 single-row
+        // forwards, so it pays only while drafts keep being accepted; the
+        // interleaved verify costs one forward per emitted token and wastes no
+        // draft. `HIPFIRE_MTP_INCREMENTAL=0|1` forces a route.
+        let depth = match std::env::var("HIPFIRE_MTP_INCREMENTAL").as_deref() {
+            Ok("0") => k,
+            Ok("1") => 0,
+            _ => self.batched_depth(k),
+        };
+        if depth == 0 {
+            let window = self.mtp_step_incremental(gpu, target, position, seed, k, eos, trace)?;
+            self.observe_agreement(&window);
+            return Ok(window);
         }
+        // History picks the route and the most drafts; the drafts' own
+        // margins stop early.
+        let k_max = depth;
         {
             let bundle = Self::bundle(target)?;
             let target_position = bundle.state.position;
@@ -876,11 +986,22 @@ impl MtpDrafter for Qwen4MtpDrafter {
         let mut accepted_drafts = 0usize;
         let window_start = Instant::now();
         let result = (|| -> Result<MtpWindow, String> {
-            let mut drafts = Vec::with_capacity(k);
+            timers.mark(gpu, "draft");
+            let mut drafts = Vec::with_capacity(k_max);
+            let mut margins: Vec<f32> = Vec::with_capacity(k_max);
             let mut input = seed;
+            // The verify's PLE rows are SSD-resident: start reading each
+            // token's rows as soon as it is known, while the drafts run.
+            let mut known = Vec::with_capacity(k_max + 1);
+            known.push(seed);
+            Self::bundle(target)?.warm_ple_rows(&known);
+            // Probability the whole draft prefix is accepted, from each
+            // draft's exact logit margin over its runner-up.
+            let mut prefix = 1.0f32;
+            let mut steps = 0usize;
             // Every proposal starts with a fresh QSA selection; only later
             // draft rows within this window reuse it.
-            for index in 0..k {
+            for index in 0..k_max {
                 let hidden = if index == 0 {
                     Some(self.pending_hidden()?)
                 } else {
@@ -892,8 +1013,25 @@ impl MtpDrafter for Qwen4MtpDrafter {
                 input = Self::bundle(target)?
                     .mtp_forward_token(gpu, input, hidden, token_position, index == 0)
                     .map_err(|error| error.to_string())?;
+                steps += 1;
+                let margin = Self::bundle(target)?.mtp_draft_margin();
+                prefix *= draft_accept_estimate(margin);
+                // A verify row pays only while its whole prefix is likely
+                // accepted; the first draft always rides.
+                if index > 0 && prefix < MTP_ROW_WORTH {
+                    break;
+                }
+                margins.push(margin);
                 drafts.push(input);
+                if prefix * DRAFT_ACCEPT_MAX < MTP_ROW_WORTH {
+                    break;
+                }
+                if index + 1 < k_max {
+                    known.push(input);
+                    Self::bundle(target)?.warm_ple_rows(&known);
+                }
             }
+            let k = drafts.len();
             let mut block = Vec::with_capacity(k + 1);
             block.push(seed);
             block.extend_from_slice(&drafts);
@@ -916,9 +1054,10 @@ impl MtpDrafter for Qwen4MtpDrafter {
                 let rows = drafts
                     .iter()
                     .zip(target_picks.iter())
-                    .map(|(draft, pick)| {
+                    .zip(margins.iter())
+                    .map(|((draft, pick), margin)| {
                         format!(
-                            "{{\"draft\":{draft},\"pick\":{pick},\"match\":{}}}",
+                            "{{\"draft\":{draft},\"pick\":{pick},\"match\":{},\"margin\":{margin:.4}}}",
                             draft == pick
                         )
                     })
@@ -942,7 +1081,17 @@ impl MtpDrafter for Qwen4MtpDrafter {
             // Keep both pre-window tickets active until every replay and hidden
             // copy succeeds. A retained restore lets the outer rollback repair
             // both owners if either side's GPU work fails.
-            if !full_accept {
+            if !full_accept && picks.state.row_capture_rows() >= block.len() {
+                timers.mark(gpu, "target_rollback");
+                picks
+                    .rollback_verify_rows_retain(
+                        gpu,
+                        target_snapshot,
+                        target_accept_len + 1,
+                        &block,
+                    )
+                    .map_err(|error| error.to_string())?;
+            } else if !full_accept {
                 timers.mark(gpu, "target_replay");
                 picks
                     .restore_retain(gpu, target_snapshot)
@@ -952,12 +1101,15 @@ impl MtpDrafter for Qwen4MtpDrafter {
                     .map(|_| ())
                     .map_err(|error| error.to_string())?;
             }
-            timers.mark(gpu, "mtp_replay");
+            timers.mark(gpu, "mtp_commit");
             let mtp_ticket = snapshot
                 .as_ref()
                 .copied()
                 .expect("MTP snapshot remains active until transaction commit");
-            if full_accept && k > 0 {
+            if full_accept && steps > k {
+                // The step that drafted the dropped token already consumed
+                // the last kept draft at its position.
+            } else if full_accept && k > 0 {
                 let last_draft = *drafts
                     .last()
                     .ok_or_else(|| "Qwen4 native MTP full accept has no final draft".to_string())?;
@@ -965,7 +1117,13 @@ impl MtpDrafter for Qwen4MtpDrafter {
                     .checked_add(k)
                     .ok_or_else(|| "Qwen4 MTP step position overflow".to_string())?;
                 picks
-                    .mtp_advance_token(gpu, last_draft, None, last_position, false)
+                    .mtp_append_token(gpu, last_draft, None, last_position)
+                    .map_err(|error| error.to_string())?;
+            } else if target_accept_len < drafts.len() {
+                // The draft steps already consumed the kept prefix with the
+                // replay's exact inputs: keep them, drop the rejected tail.
+                picks
+                    .mtp_truncate_retain(mtp_ticket, target_accept_len + 1)
                     .map_err(|error| error.to_string())?;
             } else {
                 picks
@@ -982,9 +1140,12 @@ impl MtpDrafter for Qwen4MtpDrafter {
                     let token_position = position
                         .checked_add(index)
                         .ok_or_else(|| "Qwen4 MTP step position overflow".to_string())?;
-                    picks
-                        .mtp_advance_token(gpu, token, hidden, token_position, index == 0)
-                        .map_err(|error| error.to_string())?;
+                    let result = if index == target_accept_len {
+                        picks.mtp_append_token(gpu, token, hidden, token_position)
+                    } else {
+                        picks.mtp_advance_token(gpu, token, hidden, token_position, index == 0)
+                    };
+                    result.map_err(|error| error.to_string())?;
                 }
             }
             timers.mark(gpu, "commit");
@@ -1024,6 +1185,9 @@ impl MtpDrafter for Qwen4MtpDrafter {
             snapshot = None;
             Ok(window)
         })();
+        if let Ok(window) = &result {
+            self.observe_agreement(window);
+        }
         if timers.enabled() {
             let fields = format!(
                 "\"position\":{position},\"k\":{k},\"accepted\":{accepted_drafts},\"window_us\":{:.1},\"t_end\":{}",
@@ -1103,7 +1267,7 @@ impl MtpDrafter for Qwen4MtpDrafter {
                 .copy_spec_hidden_row_to(gpu, 0, pending)
                 .map_err(|error| error.to_string())?;
             bundle
-                .mtp_advance_token(gpu, token, Some(pending), position, true)
+                .mtp_append_token(gpu, token, Some(pending), position)
                 .map_err(|error| error.to_string())?;
         }
         Ok(true)

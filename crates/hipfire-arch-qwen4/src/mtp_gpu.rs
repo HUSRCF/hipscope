@@ -13,22 +13,21 @@ use crate::config::Qwen4Config;
 use crate::gpu_forward::{
     execute_moe, Qwen4GpuForwardError, Qwen4MoeLayerRuntime, Qwen4MoeScratch,
 };
-use crate::projection::{dispatch_embedding, dispatch_gemv};
+use crate::projection::{dispatch_embedding, dispatch_gemv, dispatch_gemv_rows};
 use crate::weights::{HyperConnectionWeights, Qwen4Weights, TensorRef, WeightError};
 use hipfire_runtime::spec::SpecGrammar;
 use rdna_compute::tensor_ops::{
     argmax_f32, hc_activation_fused_f32, hyper_norm, hyper_read_projected, hyper_write,
-    indexed_attention_attention, indexed_attention_cache_append, indexed_attention_norm_rope,
-    indexed_attention_pool_rope, indexed_attention_reuse_selection, indexed_attention_select,
-    ArgmaxF32, HcActivationFused, HyperNorm, HyperReadProjected, HyperWrite,
-    IndexedAttentionAttention, IndexedAttentionCacheAppend, IndexedAttentionNormRope,
-    IndexedAttentionPoolRope, IndexedAttentionReuseSelection, IndexedAttentionSelect,
+    indexed_attention_attention, indexed_attention_decode_prologue, indexed_attention_pool_rope,
+    indexed_attention_reuse_selection, indexed_attention_select, ArgmaxF32, HcActivationFused,
+    HyperNorm, HyperReadProjected, HyperWrite, IndexedAttentionAttention,
+    IndexedAttentionDecodePrologue, IndexedAttentionPoolRope, IndexedAttentionReuseSelection,
+    IndexedAttentionSelect,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::fmt;
 
 const MTP_BRANCHES: usize = 4;
-const MTP_ROTARY_DIM: usize = 64;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_MTP_MODEL_ID: AtomicU64 = AtomicU64::new(1);
@@ -78,33 +77,25 @@ fn hc_read(
             state_bf16: false,
         },
     )?;
-    dispatch_gemv(
-        gpu,
-        down,
-        normalized,
-        rotation,
-        low,
-        config.hc_lowrank,
-        config.hc_count * config.hidden_size,
-    )?;
-    hc_activation_fused_f32(
-        gpu,
-        &HcActivationFused {
-            values: low,
-            scale: 1.0 / config.hc_count as f32,
-            bf16_out: None,
-        },
-    )?;
-    dispatch_gemv(
-        gpu,
-        up_weight,
-        low,
-        rotation,
-        up,
-        config.hc_count * config.hidden_size,
-        config.hc_lowrank,
-    )?;
-    let projected_up = f32_view(up, 0, config.hc_count * config.hidden_size);
+    let (low_rank, wide) = (config.hc_lowrank, config.hc_count * config.hidden_size);
+    let scale = 1.0 / config.hc_count as f32;
+    if down.dtype == DType::BF16 {
+        // Four waves per row (320 one-wave rows starve the GPU) with the
+        // activation in the epilogue. Drafts only: not bitwise the one-wave sum.
+        gpu.gemv_bf16_xf32_k4(down, normalized, low, low_rank, wide, Some(scale))?;
+    } else {
+        dispatch_gemv(gpu, down, normalized, rotation, low, low_rank, wide)?;
+        hc_activation_fused_f32(
+            gpu,
+            &HcActivationFused {
+                values: low,
+                scale,
+                bf16_out: None,
+            },
+        )?;
+    }
+    dispatch_gemv(gpu, up_weight, low, rotation, up, wide, low_rank)?;
+    let projected_up = f32_view(up, 0, wide);
     hyper_read_projected(
         gpu,
         &HyperReadProjected {
@@ -257,8 +248,6 @@ pub struct MtpGpuScratch {
     hc_gates: GpuTensor,
     rotation: GpuTensor,
     index: GpuTensor,
-    index_query: GpuTensor,
-    index_key: GpuTensor,
     q_and_gate: GpuTensor,
     qsa_k: GpuTensor,
     qsa_v: GpuTensor,
@@ -299,10 +288,6 @@ impl MtpGpuScratch {
         let index_width = (config.indexer_n_heads + config.indexer_kv_heads)
             .checked_mul(config.indexer_head_dim)
             .ok_or_else(|| invalid("MTP index width overflow"))?;
-        let index_query_width = config
-            .indexer_n_heads
-            .checked_mul(config.indexer_head_dim)
-            .ok_or_else(|| invalid("MTP index-query width overflow"))?;
         let hc_up = wide
             .checked_mul(config.hc_lowrank)
             .ok_or_else(|| invalid("MTP HC up scratch overflow"))?;
@@ -329,11 +314,6 @@ impl MtpGpuScratch {
             alloc(&[config.hc_count], DType::F32)?;
             alloc(&[max_rotation], DType::F32)?;
             alloc(&[index_width], DType::F32)?;
-            alloc(&[index_query_width], DType::F32)?;
-            alloc(
-                &[config.indexer_kv_heads * config.indexer_head_dim],
-                DType::F32,
-            )?;
             alloc(&[2 * q_width], DType::F32)?;
             alloc(&[kv_width], DType::F32)?;
             alloc(&[kv_width], DType::F32)?;
@@ -365,7 +345,7 @@ impl MtpGpuScratch {
             )?;
             alloc(&[config.shared_expert_intermediate_size.max(1)], DType::F32)?;
             alloc(&[config.vocab_size], DType::F32)?;
-            alloc(&[std::mem::size_of::<i32>()], DType::Raw)?;
+            alloc(&[2 * std::mem::size_of::<i32>()], DType::Raw)?;
             Ok::<(), MtpGpuError>(())
         })();
         if let Err(error) = result {
@@ -392,8 +372,6 @@ impl MtpGpuScratch {
             hc_gates: next(),
             rotation: next(),
             index: next(),
-            index_query: next(),
-            index_key: next(),
             q_and_gate: next(),
             qsa_k: next(),
             qsa_v: next(),
@@ -436,8 +414,6 @@ impl MtpGpuScratch {
             self.hc_gates,
             self.rotation,
             self.index,
-            self.index_query,
-            self.index_key,
             self.q_and_gate,
             self.qsa_k,
             self.qsa_v,
@@ -954,6 +930,34 @@ impl MtpGpuState {
         self.restore_impl(gpu, snapshot, false)
     }
 
+    /// Keep the first `keep` tokens consumed since the ticket's mark,
+    /// retaining the ticket. The K/V, raw and pooled key arenas are append
+    /// storage (later rows are invisible until overwritten; a step re-pools
+    /// every complete block), and the selection and own hidden are rebuilt by
+    /// the next window's first step, so only the marks move.
+    pub(crate) fn truncate_retain(
+        &mut self,
+        snapshot: MtpGpuStateSnapshot,
+        keep: usize,
+        compress: usize,
+    ) -> Result<(), MtpGpuError> {
+        self.snapshot_arena.validate_ticket(self, &snapshot)?;
+        let mark = self.snapshot_arena.mark;
+        let position = mark.position + keep;
+        if position > self.position {
+            return Err(invalid(format!(
+                "MTP truncate to {position} is past the consumed end {}",
+                self.position
+            )));
+        }
+        self.position = position;
+        self.full_len = position;
+        self.raw_len = position;
+        self.pooled_len = position / compress;
+        self.step_index = mark.step_index.wrapping_add(keep);
+        Ok(())
+    }
+
     pub(crate) fn validate_commit(&self, snapshot: MtpGpuStateSnapshot) -> Result<(), MtpGpuError> {
         self.snapshot_arena.validate_ticket(self, &snapshot)
     }
@@ -1037,6 +1041,86 @@ pub struct Qwen4MtpGpu {
     pub(crate) state: MtpGpuState,
     pub(crate) moe: Qwen4MoeLayerRuntime,
     pub(crate) max_seq: usize,
+    /// Lower-precision copy of the LM head the draft steps rank the
+    /// vocabulary with (`HIPFIRE_MTP_DRAFT_HEAD=mq2..mq6[r]`, default `mq2r`;
+    /// anything else = the model's own head). Drafts only steer acceptance:
+    /// the target verifies every emitted token. On the shipped Q8_0 head an
+    /// MQ2 copy with exact re-scoring of its top 8 (`r`) drafts the Q8_0
+    /// head's own argmax at a quarter of its read; plain MQ3 loses acceptance.
+    draft_head: Option<GpuTensor>,
+    /// With a draft head over a Q8_0 LM head (`HIPFIRE_MTP_DRAFT_HEAD=mqNr`):
+    /// top-8 scratch for re-scoring the draft head's best 8 exactly, so the
+    /// draft is the Q8_0 head's argmax whenever it ranks there.
+    draft_rescore: Option<GpuTensor>,
+    /// With re-scoring: the draft head's rows are laid out token ids
+    /// `[0, draft_front)` (BPE merge order puts the frequent tokens first),
+    /// then EOS and the control tokens after it, then the rest, and a draft
+    /// step ranks only the first two ranges while no recent input token was
+    /// outside them (0 = whole vocabulary always).
+    draft_front: usize,
+    /// Draft steps still ranking the whole vocabulary after such a token.
+    draft_full_steps: u32,
+    /// Exact logit margin of the last draft over its runner-up among the
+    /// re-scored candidates (infinite without re-scoring).
+    pub(crate) draft_margin: f32,
+}
+
+/// Draft-head front: tokens below this id, plus EOS and the control ids
+/// after it, covered every non-control token of the committed English/code
+/// prompt set except rare multilingual ones and cut the draft head read 60%.
+const DRAFT_FRONT: usize = 100_000;
+/// Draft steps that rank the whole vocabulary after an input token outside
+/// the front (non-English text keeps the full head).
+const DRAFT_FULL_HOLD: u32 = 64;
+
+/// `head` (`vocab` equal rows) reordered `[0, front) ++ [special, vocab)
+/// ++ [front, special)`; `front == 0` keeps it.
+fn front_first(
+    gpu: &mut Gpu,
+    head: GpuTensor,
+    front: usize,
+    special: usize,
+    vocab: usize,
+) -> hip_bridge::HipResult<GpuTensor> {
+    if front == 0 {
+        return Ok(head);
+    }
+    let stride = head.buf.size() / vocab;
+    let out = match gpu.alloc_tensor(&head.shape, head.dtype) {
+        Ok(out) => out,
+        Err(error) => {
+            let _ = gpu.free_tensor(head);
+            return Err(error);
+        }
+    };
+    let mut dst = 0;
+    let mut copied = Ok(());
+    for (start, end) in [(0, front), (special, vocab), (front, special)] {
+        let bytes = (end - start) * stride;
+        copied = copied
+            .and_then(|_| gpu.memcpy_dtod_at_auto(&out.buf, dst, &head.buf, start * stride, bytes));
+        dst += bytes;
+    }
+    let copied = copied.and_then(|_| gpu.hip.device_synchronize());
+    let freed = gpu.free_tensor(head);
+    if let Err(error) = copied.and(freed) {
+        let _ = gpu.free_tensor(out);
+        return Err(error);
+    }
+    Ok(out)
+}
+
+/// What one MTP head step must produce.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MtpStep {
+    /// The full step and its argmax draft token.
+    Predict,
+    /// The full step: its head state feeds a following step without hidden.
+    Advance,
+    /// Only this position's K/V and index-key cache rows. For the last step
+    /// of a chain: the next step brings its own backbone hidden and reselects
+    /// (the head state and selection are left stale; a reuse is refused).
+    Append,
 }
 
 impl Qwen4MtpGpu {
@@ -1066,11 +1150,67 @@ impl Qwen4MtpGpu {
                 return Err(error.into());
             }
         };
+        let draft_choice =
+            std::env::var("HIPFIRE_MTP_DRAFT_HEAD").unwrap_or_else(|_| "mq2r".to_string());
+        let rescore = draft_choice.ends_with('r');
+        let draft_format = match draft_choice.trim_end_matches('r') {
+            "mq6" => Some(DType::MQ6G256V2),
+            "mq5" => Some(DType::MQ5G256V2),
+            "mq4" => Some(DType::MQ4G256V2),
+            "mq3" => Some(DType::MQ3G256V2),
+            "mq2" => Some(DType::MQ2G256V2),
+            _ => None,
+        };
+        let lm_head = weights.resident(&weights.root.lm_head)?;
+        // Only a bigger head is worth a smaller copy.
+        let draft_format = draft_format.filter(|&format| {
+            matches!(
+                lm_head.dtype,
+                DType::Q8_0 | DType::BF16 | DType::MQ6G256V2 | DType::MQ5G256V2
+            ) && format != lm_head.dtype
+        });
+        let rescore = rescore
+            && draft_format.is_some()
+            && lm_head.dtype == DType::Q8_0
+            && config.hidden_size == 2560;
+        let eos = config.eos_token_id as usize;
+        let draft_front = if rescore && DRAFT_FRONT < eos {
+            DRAFT_FRONT
+        } else {
+            0
+        };
+        let draft_head = match draft_format {
+            Some(format) => {
+                match gpu
+                    .requant_g256(lm_head, config.vocab_size, config.hidden_size, format)
+                    .and_then(|copy| front_first(gpu, copy, draft_front, eos, config.vocab_size))
+                {
+                    Ok(copy) => Some(copy),
+                    Err(error) => {
+                        let _ = moe.free_gpu(gpu);
+                        let _ = state.free_gpu(gpu);
+                        let _ = scratch.free_gpu(gpu);
+                        return Err(error.into());
+                    }
+                }
+            }
+            None => None,
+        };
+        let draft_rescore = if rescore {
+            Some(gpu.zeros(&[Gpu::TOPK8_PARTIAL_BYTES], DType::Raw)?)
+        } else {
+            None
+        };
         Ok(Self {
             scratch,
             state,
             moe,
             max_seq,
+            draft_head,
+            draft_rescore,
+            draft_front,
+            draft_full_steps: 0,
+            draft_margin: f32::INFINITY,
         })
     }
 
@@ -1079,8 +1219,13 @@ impl Qwen4MtpGpu {
             scratch,
             state,
             moe,
+            draft_head,
+            draft_rescore,
             ..
         } = self;
+        for tensor in [draft_head, draft_rescore].into_iter().flatten() {
+            let _ = gpu.free_tensor(tensor);
+        }
         let scratch_error = scratch.free_gpu(gpu);
         let state_error = state.free_gpu(gpu);
         let moe_error = moe.free_gpu(gpu);
@@ -1136,6 +1281,15 @@ impl Qwen4MtpGpu {
         self.state.restore_retain(gpu, snapshot)
     }
 
+    pub(crate) fn truncate_retain(
+        &mut self,
+        snapshot: MtpGpuStateSnapshot,
+        keep: usize,
+        compress: usize,
+    ) -> Result<(), MtpGpuError> {
+        self.state.truncate_retain(snapshot, keep, compress)
+    }
+
     pub(crate) fn validate_commit(&self, snapshot: MtpGpuStateSnapshot) -> Result<(), MtpGpuError> {
         self.state.validate_commit(snapshot)
     }
@@ -1174,7 +1328,7 @@ impl Qwen4MtpGpu {
                 None,
                 position,
                 fresh_qsa_selection,
-                true,
+                MtpStep::Predict,
             )?
             .ok_or_else(|| invalid("MTP prediction requested but no token produced"))?;
         gpu.copy_d2d(&self.scratch.logits, logits, logits.byte_size())?;
@@ -1190,7 +1344,7 @@ impl Qwen4MtpGpu {
         backbone_hidden: Option<&GpuTensor>,
         position: usize,
         fresh_qsa_selection: bool,
-        predict: bool,
+        step: MtpStep,
     ) -> Result<Option<u32>, MtpGpuError> {
         let wide = MTP_BRANCHES
             .checked_mul(config.hidden_size)
@@ -1220,6 +1374,10 @@ impl Qwen4MtpGpu {
         let next_position = position
             .checked_add(1)
             .ok_or_else(|| invalid("MTP position overflow"))?;
+        let eos = config.eos_token_id as usize;
+        if (self.draft_front..eos).contains(&(token as usize)) {
+            self.draft_full_steps = DRAFT_FULL_HOLD;
+        }
         let scratch = &mut self.scratch;
         let state = &mut self.state;
         let backbone_hidden = backbone_hidden.unwrap_or(&scratch.backbone_hidden);
@@ -1265,12 +1423,18 @@ impl Qwen4MtpGpu {
             },
         )?;
         let fc_hidden = weights.resident(&weights.mtp.fc_hidden)?;
+        // Both branch rows in one projection (each bitwise its own).
+        dispatch_gemv_rows(
+            gpu,
+            fc_hidden,
+            &scratch.hidden_norm,
+            &scratch.rotation,
+            &scratch.projected_hidden,
+            config.hidden_size,
+            config.hidden_size,
+            MTP_BRANCHES,
+        )?;
         for branch in 0..MTP_BRANCHES {
-            let hidden_row = f32_view(
-                &scratch.hidden_norm,
-                branch * config.hidden_size,
-                config.hidden_size,
-            );
             let projected_row = f32_view(
                 &scratch.projected_hidden,
                 branch * config.hidden_size,
@@ -1281,15 +1445,6 @@ impl Qwen4MtpGpu {
                 branch * config.hidden_size,
                 config.hidden_size,
             );
-            dispatch_gemv(
-                gpu,
-                fc_hidden,
-                &hidden_row,
-                &scratch.rotation,
-                &projected_row,
-                config.hidden_size,
-                config.hidden_size,
-            )?;
             gpu.add_f32(&projected_row, &scratch.projected_embedding, &wide_row)?;
         }
 
@@ -1322,46 +1477,10 @@ impl Qwen4MtpGpu {
             index_width,
             config.hidden_size,
         )?;
+        // The fused prologue (after q/k/v) normalizes the index query in place.
         let index_query = f32_view(&scratch.index, 0, index_query_width);
-        let index_key = f32_view(&scratch.index, index_query_width, index_key_width);
-        gpu.copy_d2d(
-            &index_query,
-            &scratch.index_query,
-            scratch.index_query.byte_size(),
-        )?;
-        gpu.copy_d2d(
-            &index_key,
-            &scratch.index_key,
-            scratch.index_key.byte_size(),
-        )?;
         let index_query_norm = weights.resident(&qsa.indexer_q_norm)?;
         let index_key_norm = weights.resident(&qsa.indexer_k_norm)?;
-        indexed_attention_norm_rope(
-            gpu,
-            &IndexedAttentionNormRope {
-                values: &scratch.index_query,
-                norm: index_query_norm,
-                heads: config.indexer_n_heads,
-                head_dim: index_dim,
-                head_stride: config.indexer_head_dim,
-                position,
-                rotary_dim: MTP_ROTARY_DIM.min(index_dim),
-            },
-        )?;
-        // Keep raw BF16 index keys in the cache; source key RMSNorm and RoPE
-        // happen after four-token block pooling.
-        gpu.bf16_round_trip_f32(&scratch.index_key)?;
-        let raw_offset = position
-            .checked_mul(index_key_width)
-            .and_then(|v| v.checked_mul(std::mem::size_of::<f32>()))
-            .ok_or_else(|| invalid("MTP index cache offset overflow"))?;
-        gpu.memcpy_dtod_at_auto(
-            &state.raw_index_keys.buf,
-            raw_offset,
-            &scratch.index_key.buf,
-            0,
-            scratch.index_key.byte_size(),
-        )?;
 
         let q_width = config.num_attention_heads * config.head_dim;
         let kv_width = config.num_key_value_heads * config.head_dim;
@@ -1369,15 +1488,17 @@ impl Qwen4MtpGpu {
         let k_weight = weights.resident(&qsa.k)?;
         let v_weight = weights.resident(&qsa.v)?;
         let q_and_gate = &scratch.q_and_gate;
-        dispatch_gemv(
-            gpu,
-            q_weight,
-            &scratch.hc_mixed,
-            &scratch.rotation,
-            q_and_gate,
-            2 * q_width,
-            config.hidden_size,
-        )?;
+        if step != MtpStep::Append {
+            dispatch_gemv(
+                gpu,
+                q_weight,
+                &scratch.hc_mixed,
+                &scratch.rotation,
+                q_and_gate,
+                2 * q_width,
+                config.hidden_size,
+            )?;
+        }
         dispatch_gemv(
             gpu,
             k_weight,
@@ -1396,43 +1517,30 @@ impl Qwen4MtpGpu {
             kv_width,
             config.hidden_size,
         )?;
-        let q_norm = weights.resident(&qsa.q_norm)?;
-        let k_norm = weights.resident(&qsa.k_norm)?;
-        // q_proj already emits [Q, gate] for each head. Normalize and rotate
-        // each Q half in place while preserving its adjacent gate half.
-        indexed_attention_norm_rope(
+        // Index-query, query and key norm+RoPE, the K/V cache append and the
+        // raw BF16 index key, in one launch (on an Append the query parts
+        // normalize stale rows nothing reads).
+        indexed_attention_decode_prologue(
             gpu,
-            &IndexedAttentionNormRope {
-                values: q_and_gate,
-                norm: q_norm,
-                heads: config.num_attention_heads,
-                head_dim: config.head_dim,
-                head_stride: 2 * config.head_dim,
-                position,
-                rotary_dim: MTP_ROTARY_DIM.min(config.head_dim),
-            },
-        )?;
-        indexed_attention_norm_rope(
-            gpu,
-            &IndexedAttentionNormRope {
-                values: &scratch.qsa_k,
-                norm: k_norm,
-                heads: config.num_key_value_heads,
-                head_dim: config.head_dim,
-                head_stride: config.head_dim,
-                position,
-                rotary_dim: MTP_ROTARY_DIM.min(config.head_dim),
-            },
-        )?;
-        indexed_attention_cache_append(
-            gpu,
-            &IndexedAttentionCacheAppend {
-                key: &scratch.qsa_k,
-                value: &scratch.qsa_v,
+            &IndexedAttentionDecodePrologue {
+                index_row: &scratch.index,
+                qgate: q_and_gate,
+                keys: &scratch.qsa_k,
+                values: &scratch.qsa_v,
                 full_keys: &state.full_keys,
                 full_values: &state.full_values,
+                raw_index_keys: &state.raw_index_keys,
+                index_q_norm: index_query_norm,
+                q_norm: weights.resident(&qsa.q_norm)?,
+                k_norm: weights.resident(&qsa.k_norm)?,
+                index_heads: config.indexer_n_heads,
+                index_dim,
+                index_kv_width: index_key_width,
+                heads: config.num_attention_heads,
+                kv_heads: config.num_key_value_heads,
+                head_dim: config.head_dim,
                 position,
-                kv_width,
+                rows: 1,
             },
         )?;
         let visible = next_position;
@@ -1455,6 +1563,15 @@ impl Qwen4MtpGpu {
                 },
             )?;
         }
+        if step == MtpStep::Append {
+            state.position = next_position;
+            state.full_len = visible;
+            state.raw_len = visible;
+            state.pooled_len = complete;
+            state.selected_len = 0;
+            state.step_index = state.step_index.wrapping_add(1);
+            return Ok(None);
+        }
         let budget_blocks = config.indexer_budget / config.indexer_compress_ratio;
         // Reselect for the first step of each proposal (and every prefill token);
         // the request cursor still tracks state, not the selection's lifetime.
@@ -1462,7 +1579,7 @@ impl Qwen4MtpGpu {
             indexed_attention_select(
                 gpu,
                 &IndexedAttentionSelect {
-                    query: &scratch.index_query,
+                    query: &index_query,
                     pooled: &state.pooled_keys,
                     selected: &state.selected_indices,
                     block_count: complete,
@@ -1478,6 +1595,9 @@ impl Qwen4MtpGpu {
                 - complete * config.indexer_compress_ratio;
             state.selected_len = selected.min(state.selected_capacity);
         } else {
+            if state.selected_len == 0 {
+                return Err(invalid("MTP QSA selection reuse after a K/V-only append"));
+            }
             indexed_attention_reuse_selection(
                 gpu,
                 &IndexedAttentionReuseSelection {
@@ -1488,25 +1608,13 @@ impl Qwen4MtpGpu {
                     selected_len_out: &state.selected_len_out,
                 },
             )?;
-            let mut selected_len_bytes = [0u8; std::mem::size_of::<i32>()];
-            gpu.hip
-                .memcpy_dtoh(&mut selected_len_bytes, &state.selected_len_out.buf)?;
-            let selected_len = i32::from_ne_bytes(selected_len_bytes);
-            if selected_len < 0 {
-                return Err(invalid(
-                    "Qwen4 QSA reuse returned a negative selection length",
-                ));
-            }
-            let selected_len = selected_len as usize;
-            if selected_len == 0 || selected_len > state.selected_capacity || selected_len > visible
-            {
-                return Err(invalid(format!(
-                    "Qwen4 QSA reuse returned invalid selection length {selected_len} \
-                     (capacity {}, visible {visible})",
-                    state.selected_capacity
-                )));
-            }
-            state.selected_len = selected_len;
+            // No readback: the kernel keeps the prior rows (all before
+            // `position`) and appends `position`, so the length is prev + 1
+            // (capacity-bounded). Were a row dropped instead, the kernel pads
+            // the tail with -1, which the attention skips exactly.
+            state.selected_len = (state.selected_len + 1)
+                .min(state.selected_capacity)
+                .min(visible);
         }
         let selected = state.selected_len;
         indexed_attention_attention(
@@ -1598,7 +1706,7 @@ impl Qwen4MtpGpu {
             &scratch.wide,
             &scratch.rotation,
         )?;
-        let next_token = if predict {
+        let next_token = if step == MtpStep::Predict {
             hc_read(
                 gpu,
                 config,
@@ -1613,28 +1721,56 @@ impl Qwen4MtpGpu {
                 &scratch.hc_mixed,
                 &scratch.rotation,
             )?;
-            let lm_head = weights.resident(&weights.root.lm_head)?;
+            let lm_head = match self.draft_head.as_ref() {
+                Some(head) => head,
+                None => weights.resident(&weights.root.lm_head)?,
+            };
+            let vocab = config.vocab_size;
+            let (ranked, order) = match (self.draft_front, self.draft_full_steps) {
+                (0, _) => (vocab, (vocab, vocab, 0)),
+                (front, 0) => (front + vocab - eos, (front, eos, vocab - eos)),
+                (front, _) => (vocab, (front, eos, vocab - eos)),
+            };
+            self.draft_full_steps = self.draft_full_steps.saturating_sub(1);
             dispatch_gemv(
                 gpu,
                 lm_head,
                 &scratch.hc_mixed,
                 &scratch.rotation,
                 &scratch.logits,
-                config.vocab_size,
+                ranked,
                 config.hidden_size,
             )?;
-            argmax_f32(
-                gpu,
-                &ArgmaxF32 {
-                    logits: &scratch.logits,
-                    indices: &scratch.top1,
-                    rows: 1,
-                    vocab: config.vocab_size,
-                },
-            )?;
-            let mut token_bytes = [0u8; 4];
-            gpu.hip.memcpy_dtoh(&mut token_bytes, &scratch.top1.buf)?;
-            let next_token = u32::from_ne_bytes(token_bytes);
+            if let Some(partial) = self.draft_rescore.as_ref() {
+                gpu.q8_0_topk8_rescore_k2560(
+                    &scratch.logits,
+                    ranked,
+                    order,
+                    weights.resident(&weights.root.lm_head)?,
+                    &scratch.hc_mixed,
+                    partial,
+                    &scratch.top1,
+                )?;
+            } else {
+                argmax_f32(
+                    gpu,
+                    &ArgmaxF32 {
+                        logits: &scratch.logits,
+                        indices: &scratch.top1,
+                        rows: 1,
+                        vocab: config.vocab_size,
+                    },
+                )?;
+            }
+            let mut top_bytes = [0u8; 8];
+            gpu.hip.memcpy_dtoh(&mut top_bytes, &scratch.top1.buf)?;
+            let next_token =
+                u32::from_ne_bytes([top_bytes[0], top_bytes[1], top_bytes[2], top_bytes[3]]);
+            self.draft_margin = if self.draft_rescore.is_some() {
+                f32::from_ne_bytes([top_bytes[4], top_bytes[5], top_bytes[6], top_bytes[7]])
+            } else {
+                f32::INFINITY
+            };
             if next_token as usize >= config.vocab_size {
                 return Err(invalid(format!(
                     "MTP argmax token {next_token} is outside vocab {}",

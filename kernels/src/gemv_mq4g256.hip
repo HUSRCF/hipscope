@@ -97,10 +97,11 @@ __global__ void mq_rotate_x(
     for (int e = 0; e < 8; ++e) x_out_b[base + e] = v[e] * s * signs2[d0 + e];
 }
 
-// Decode HC read branch mix (tensor_ops.hip's hyper_read_projected_f32 for
-// four branches, same expression) that also writes the mixed row's
-// mq_rotate_x rotation: a block per 256-column group, wave 0 rotates the
-// group from LDS. Grid [hidden / 256], block 256.
+// HC read branch mix (tensor_ops.hip's hyper_read_projected_f32 for four
+// branches, same expression) that also writes each mixed row's mq_rotate_x
+// rotation: a block per 256-column group and row, wave 0 rotates the group
+// from LDS. Grid [hidden / 256, rows], block 256; rows are [rows, 4, hidden]
+// in and [rows, hidden] out.
 static __device__ __forceinline__ float mq_bf16(float v) {
     return static_cast<float>(static_cast<hip_bfloat16>(v));
 }
@@ -118,6 +119,11 @@ __global__ void hyper_read_projected_rotate_f32(
     __shared__ float group_values[256];
     const int tid = threadIdx.x;
     const int column = blockIdx.x * 256 + tid;
+    const long long row = blockIdx.y;
+    normalized += row * 4 * hidden;
+    projected_up += row * 4 * hidden;
+    mixed += row * hidden;
+    rotated += row * hidden;
     float value = 0.0f;
 #pragma unroll
     for (int branch = 0; branch < 4; ++branch) {

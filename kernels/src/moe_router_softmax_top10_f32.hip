@@ -51,8 +51,9 @@ __device__ __forceinline__ int router_wave_min(int v) {
     return v;
 }
 
-// `round_logits != 0` reads every logit through that BF16 round trip, the
-// source storage boundary a separate bf16_round_trip_f32 launch would apply.
+// `round_logits != 0` (the BF16 recipe) reads every logit through that BF16
+// round trip, the source storage boundary a separate bf16_round_trip_f32
+// launch would apply, and stores the weights through it as well.
 __launch_bounds__(256, 1)
 extern "C" __global__ void moe_router_softmax_top10_f32(
     const float* __restrict__ logits, // [tokens, n_exp]
@@ -170,6 +171,7 @@ extern "C" __global__ void moe_router_softmax_top10_f32(
         }
 
         for (int rank = 0; rank < top_k; ++rank)
-            topk_w[output_base + rank] = probabilities[rank];
+            topk_w[output_base + rank] =
+                round_logits != 0 ? router_bf16_rt(probabilities[rank]) : probabilities[rank];
     }
 }

@@ -46,6 +46,11 @@ static __device__ __forceinline__ float gemv_q8_0_row(
     return sum;
 }
 
+template <int R>
+static __device__ __forceinline__ void gemv_q8_0_row_multi(
+    const unsigned char* row_data, const float* __restrict__ x, int x_stride, int K, int tid,
+    float (&sum)[R]);
+
 __launch_bounds__(32, 20)
 extern "C" __global__ void gemv_q8_0(
     const unsigned char* __restrict__ A_q8,
@@ -89,31 +94,21 @@ extern "C" __global__ void gemv_q8_0_k2560_staged(
     if (tid == 0) y[row] = sum;
 }
 
+template <int R>
+static __device__ __forceinline__ void gemv_q8_0_k320_body(
+    const unsigned char* __restrict__ A_q8, const float* __restrict__ x, float* __restrict__ y, int M);
+
 // gemv_q8_0 for K = 320 (340-byte rows, Qwen4 decode HC read up), staged like
-// gemv_q8_0_k2560_staged; two rows (waves) per block. 132 -> 218 GB/s on
-// gfx1151 against gemv_q8_0_wide.
-__launch_bounds__(64)
+// gemv_q8_0_k2560_staged; four rows (waves) per block, the row's loads issued
+// before the x loads. 132 -> 218 GB/s on gfx1151 against gemv_q8_0_wide.
+__launch_bounds__(128)
 extern "C" __global__ void gemv_q8_0_k320_staged(
     const unsigned char* __restrict__ A_q8,
     const float* __restrict__ x,
     float* __restrict__ y,
     int M
 ) {
-    __shared__ __align__(16) unsigned int staged[2][85];
-    const int wave = threadIdx.x >> 5;
-    const int lane = threadIdx.x & 31;
-    const int row = blockIdx.x * 2 + wave;
-    if (row >= M) return;
-    const unsigned int* src = reinterpret_cast<const unsigned int*>(A_q8 + (size_t)row * 340);
-    const unsigned int v0 = src[lane];
-    const unsigned int v1 = src[lane + 32];
-    const unsigned int v2 = lane < 21 ? src[lane + 64] : 0u;
-    staged[wave][lane] = v0;
-    staged[wave][lane + 32] = v1;
-    if (lane < 21) staged[wave][lane + 64] = v2;
-    __builtin_amdgcn_fence(__ATOMIC_ACQ_REL, "wavefront");
-    const float sum = gemv_q8_0_row(reinterpret_cast<const unsigned char*>(staged[wave]), x, 320, lane);
-    if (lane == 0) y[row] = sum;
+    gemv_q8_0_k320_body<1>(A_q8, x, y, M);
 }
 
 // Long-K rows (Qwen4 decode HC read down, K = 4 * 2560): eight waves take an
@@ -152,6 +147,197 @@ extern "C" __global__ void gemv_q8_0_k8(
     y[row] = value;
 }
 
+// Multi-row variants of the staged / split decode kernels above: each weight
+// row is loaded once and dotted with `rows` activation rows (x row stride K,
+// y row stride M). Every row's value is bitwise the single-row kernel's.
+__launch_bounds__(32, 20)
+extern "C" __global__ void gemv_q8_0_k2560_staged_rows(
+    const unsigned char* __restrict__ A_q8,
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    int M,
+    int rows
+) {
+    __shared__ __align__(16) unsigned int staged_row[680];
+    const int row = blockIdx.x;
+    if (row >= M) return;
+    const int tid = threadIdx.x;
+    const unsigned int* src = reinterpret_cast<const unsigned int*>(A_q8 + (size_t)row * 2720);
+    unsigned int v[22];
+#pragma unroll
+    for (int u = 0; u < 21; ++u) v[u] = src[tid + u * 32];
+    v[21] = tid < 8 ? src[tid + 672] : 0u;
+#pragma unroll
+    for (int u = 0; u < 21; ++u) staged_row[tid + u * 32] = v[u];
+    if (tid < 8) staged_row[tid + 672] = v[21];
+    __builtin_amdgcn_fence(__ATOMIC_ACQ_REL, "wavefront");
+    for (int r = 0; r < rows; ++r) {
+        const float sum = gemv_q8_0_row(
+            reinterpret_cast<const unsigned char*>(staged_row), x + (size_t)r * 2560, 2560, tid);
+        if (tid == 0) y[(size_t)r * M + row] = sum;
+    }
+}
+
+// One 340-byte row per wave, four waves per block: the row's dword loads go
+// out first, the R x rows (10 values per lane each) are held in registers,
+// then the row is staged through LDS. Each (scale, quant) pair is folded into
+// every row's sum in gemv_q8_0_row's order, so each output is bitwise the
+// single-row kernel's.
+template <int R>
+static __device__ __forceinline__ void gemv_q8_0_k320_body(
+    const unsigned char* __restrict__ A_q8, const float* __restrict__ x, float* __restrict__ y, int M
+) {
+    __shared__ __align__(16) unsigned int staged[4][85];
+    const int wave = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int row = blockIdx.x * 4 + wave;
+    if (row >= M) return;
+    const unsigned int* src = reinterpret_cast<const unsigned int*>(A_q8 + (size_t)row * 340);
+    const unsigned int v0 = src[lane];
+    const unsigned int v1 = src[lane + 32];
+    const unsigned int v2 = lane < 21 ? src[lane + 64] : 0u;
+    float xr[R][10];
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+#pragma unroll
+        for (int b = 0; b < 10; ++b) xr[r][b] = x[r * 320 + b * 32 + lane];
+    staged[wave][lane] = v0;
+    staged[wave][lane + 32] = v1;
+    if (lane < 21) staged[wave][lane + 64] = v2;
+    __builtin_amdgcn_fence(__ATOMIC_ACQ_REL, "wavefront");
+    const unsigned char* data = reinterpret_cast<const unsigned char*>(staged[wave]);
+    float sum[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) sum[r] = 0.0f;
+#pragma unroll
+    for (int b = 0; b < 10; ++b) {
+        const unsigned char* block = data + b * 34;
+        float d = (float)*((const _Float16*)block);
+        signed char qval = (signed char)block[2 + lane];
+#pragma unroll
+        for (int r = 0; r < R; ++r) sum[r] += d * (float)qval * xr[r][b];
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+        for (int offset = 16; offset > 0; offset >>= 1) sum[r] += __shfl_down(sum[r], offset);
+    if (lane == 0)
+#pragma unroll
+        for (int r = 0; r < R; ++r) y[(size_t)r * M + row] = sum[r];
+}
+
+__launch_bounds__(128)
+extern "C" __global__ void gemv_q8_0_k320_staged_rows(
+    const unsigned char* __restrict__ A_q8,
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    int M,
+    int rows
+) {
+    switch (rows) {
+    case 1: gemv_q8_0_k320_body<1>(A_q8, x, y, M); return;
+    case 2: gemv_q8_0_k320_body<2>(A_q8, x, y, M); return;
+    case 3: gemv_q8_0_k320_body<3>(A_q8, x, y, M); return;
+    case 4: gemv_q8_0_k320_body<4>(A_q8, x, y, M); return;
+    case 5: gemv_q8_0_k320_body<5>(A_q8, x, y, M); return;
+    case 6: gemv_q8_0_k320_body<6>(A_q8, x, y, M); return;
+    case 7: gemv_q8_0_k320_body<7>(A_q8, x, y, M); return;
+    case 8: gemv_q8_0_k320_body<8>(A_q8, x, y, M); return;
+    }
+}
+
+// gemv_q8_0_row over R activation rows: each (scale, quant) pair is loaded
+// once and folded into every row's sum in the single-row order.
+template <int R>
+static __device__ __forceinline__ void gemv_q8_0_row_multi(
+    const unsigned char* row_data,
+    const float* __restrict__ x,
+    int x_stride,
+    int K,
+    int tid,
+    float (&sum)[R]
+) {
+    const int blocks_per_row = K / 32;
+#pragma unroll
+    for (int r = 0; r < R; ++r) sum[r] = 0.0f;
+    const int outer_iters = blocks_per_row / 8;
+    for (int oi = 0; oi < outer_iters; oi++) {
+        const unsigned char* base = row_data + oi * 8 * 34;
+        #pragma unroll
+        for (int sub = 0; sub < 8; sub++) {
+            const unsigned char* block = base + sub * 34;
+            float d = (float)*((const _Float16*)block);
+            signed char qval = (signed char)block[2 + tid];
+            const float* xb = x + oi * 256 + sub * 32 + tid;
+#pragma unroll
+            for (int r = 0; r < R; ++r)
+                sum[r] += d * (float)qval * xb[r * x_stride];
+        }
+    }
+    for (int bi = outer_iters * 8; bi < blocks_per_row; bi++) {
+        const unsigned char* block = row_data + bi * 34;
+        float d = (float)*((const _Float16*)block);
+        signed char qval = (signed char)block[2 + tid];
+#pragma unroll
+        for (int r = 0; r < R; ++r)
+            sum[r] += d * (float)qval * x[r * x_stride + bi * 32 + tid];
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+        for (int offset = 16; offset > 0; offset >>= 1)
+            sum[r] += __shfl_down(sum[r], offset);
+}
+
+template <int R>
+static __device__ __forceinline__ void gemv_q8_0_k8_rows_body(
+    const unsigned char* __restrict__ A_q8,
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    int M, int K,
+    float scale,
+    int hc_act
+) {
+    __shared__ float part[R][8];
+    const int row = blockIdx.x;
+    if (row >= M) return;
+    const int wave = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int pk = K / 8;
+    float s[R];
+    gemv_q8_0_row_multi<R>(A_q8 + ((size_t)row * 8 + wave) * (pk / 32) * 34, x + wave * pk,
+                           K, pk, lane, s);
+    if (lane == 0) {
+#pragma unroll
+        for (int r = 0; r < R; ++r) part[r][wave] = s[r];
+    }
+    __syncthreads();
+    const int r = threadIdx.x;
+    if (r >= R) return;
+    float value = ((part[r][0] + part[r][1]) + (part[r][2] + part[r][3])) + ((part[r][4] + part[r][5]) + (part[r][6] + part[r][7]));
+    if (hc_act) {
+        value = static_cast<float>(static_cast<hip_bfloat16>(value));
+        value *= scale;
+        value = static_cast<float>(static_cast<hip_bfloat16>(value));
+        value = value / (1.0f + expf(-value));
+        value = static_cast<float>(static_cast<hip_bfloat16>(value));
+    }
+    y[(size_t)r * M + row] = value;
+}
+
+#define GEMV_Q8_0_K8_ROWS(R)                                                        \
+    __launch_bounds__(256) extern "C" __global__ void gemv_q8_0_k8_rows_r##R(        \
+        const unsigned char* __restrict__ A_q8, const float* __restrict__ x,        \
+        float* __restrict__ y, int M, int K, float scale, int hc_act) {             \
+        gemv_q8_0_k8_rows_body<R>(A_q8, x, y, M, K, scale, hc_act);                 \
+    }
+GEMV_Q8_0_K8_ROWS(2)
+GEMV_Q8_0_K8_ROWS(3)
+GEMV_Q8_0_K8_ROWS(4)
+GEMV_Q8_0_K8_ROWS(5)
+GEMV_Q8_0_K8_ROWS(6)
+GEMV_Q8_0_K8_ROWS(7)
+GEMV_Q8_0_K8_ROWS(8)
+#undef GEMV_Q8_0_K8_ROWS
+
 // Requantize BF16 to Q8_0, one thread per 32-block: scale = f16(amax / 127),
 // q = round(w / scale) with the stored (f16) scale.
 extern "C" __global__ void quantize_bf16_q8_0(
@@ -176,5 +362,125 @@ extern "C" __global__ void quantize_bf16_q8_0(
     for (int i = 0; i < 32; ++i) {
         const int q = d == 0.0f ? 0 : max(-127, min(127, (int)rintf(v[i] / d)));
         o[2 + i] = (unsigned char)(signed char)q;
+    }
+}
+
+// ── Draft-head argmax through an approximate head ─────────────────────────
+// A low-bit copy of a Q8_0 LM head ranks the vocabulary; its top 8 are then
+// scored exactly against the Q8_0 rows, so the result is the Q8_0 head's own
+// argmax whenever that token ranks in the approximate top 8.
+
+// (value, index) order of argmax_f32: larger value, then smaller index.
+static __device__ __forceinline__ bool q8_topk_better(float v, int i, float bv, int bi) {
+    return v > bv || (v == bv && i < bi);
+}
+
+// Block-wide best (value, index) of each thread's candidate; every thread gets it.
+static __device__ __forceinline__ void q8_topk_block_best(float& v, int& i, float* sv, int* si) {
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        const float ov = __shfl_down(v, offset);
+        const int oi = __shfl_down(i, offset);
+        if (q8_topk_better(ov, oi, v, i)) { v = ov; i = oi; }
+    }
+    const int wave = threadIdx.x >> 5;
+    if ((threadIdx.x & 31) == 0) { sv[wave] = v; si[wave] = i; }
+    __syncthreads();
+    v = sv[0]; i = si[0];
+    for (int w = 1; w < (int)(blockDim.x >> 5); ++w)
+        if (q8_topk_better(sv[w], si[w], v, i)) { v = sv[w]; i = si[w]; }
+    __syncthreads();
+}
+
+// Grid G, block 256: block b's top 8 of v[b*chunk, (b+1)*chunk) -> pv/pi[b*8 + j].
+// chunk <= 256 * 8. Row j of v is token j, except for a head reordered as
+// [0, front) ++ [special, special + tail) ++ [front, special): pi gets token ids.
+__launch_bounds__(256)
+extern "C" __global__ void topk8_partial_f32(
+    const float* __restrict__ v, int n, int chunk, float* __restrict__ pv, int* __restrict__ pi,
+    int front, int special, int tail
+) {
+    __shared__ float sv[8];
+    __shared__ int si[8];
+    const int begin = blockIdx.x * chunk;
+    const int end = min(n, begin + chunk);
+    float val[8];
+    int idx[8];
+#pragma unroll
+    for (int u = 0; u < 8; ++u) {
+        const int j = begin + threadIdx.x + u * 256;
+        const bool ok = j < end;
+        val[u] = ok ? v[j] : -INFINITY;
+        idx[u] = ok ? j : 0x7fffffff;
+    }
+    for (int round = 0; round < 8; ++round) {
+        float bv = -INFINITY;
+        int bi = 0x7fffffff;
+#pragma unroll
+        for (int u = 0; u < 8; ++u)
+            if (q8_topk_better(val[u], idx[u], bv, bi)) { bv = val[u]; bi = idx[u]; }
+        q8_topk_block_best(bv, bi, sv, si);
+#pragma unroll
+        for (int u = 0; u < 8; ++u)
+            if (idx[u] == bi) { val[u] = -INFINITY; idx[u] = 0x7fffffff; }
+        if (threadIdx.x == 0) {
+            const int token = bi < front ? bi : (bi < front + tail ? bi - front + special : bi - tail);
+            pv[blockIdx.x * 8 + round] = bv;
+            pi[blockIdx.x * 8 + round] = token;
+        }
+    }
+}
+
+// One block of 256: the top 8 of m <= 2048 partial candidates, each scored
+// exactly against its Q8_0 row (K = 2560, the staged decode kernel's dot),
+// the best written to out[0].
+__launch_bounds__(256)
+extern "C" __global__ void topk8_rescore_q8_0_k2560(
+    const float* __restrict__ pv, const int* __restrict__ pi, int m,
+    const unsigned char* __restrict__ A_q8, const float* __restrict__ x, int* __restrict__ out
+) {
+    __shared__ float sv[8];
+    __shared__ int si[8];
+    __shared__ int cand[8];
+    __shared__ float exact[8];
+    float val[8];
+    int idx[8];
+#pragma unroll
+    for (int u = 0; u < 8; ++u) {
+        const int j = threadIdx.x + u * 256;
+        const bool ok = j < m;
+        val[u] = ok ? pv[j] : -INFINITY;
+        idx[u] = ok ? pi[j] : 0x7fffffff;
+    }
+    for (int round = 0; round < 8; ++round) {
+        float bv = -INFINITY;
+        int bi = 0x7fffffff;
+#pragma unroll
+        for (int u = 0; u < 8; ++u)
+            if (q8_topk_better(val[u], idx[u], bv, bi)) { bv = val[u]; bi = idx[u]; }
+        q8_topk_block_best(bv, bi, sv, si);
+#pragma unroll
+        for (int u = 0; u < 8; ++u)
+            if (idx[u] == bi) { val[u] = -INFINITY; idx[u] = 0x7fffffff; }
+        if (threadIdx.x == 0) cand[round] = bi;
+    }
+    __syncthreads();
+    const int wave = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int row = cand[wave];
+    const float s = gemv_q8_0_row(A_q8 + (size_t)row * 2720, x, 2560, lane);
+    if (lane == 0) exact[wave] = s;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float bv = exact[0];
+        int bi = cand[0];
+        int bw = 0;
+        for (int w = 1; w < 8; ++w)
+            if (q8_topk_better(exact[w], cand[w], bv, bi)) { bv = exact[w]; bi = cand[w]; bw = w; }
+        // out[1]: the winner's exact margin over the best other candidate.
+        float second = -INFINITY;
+        for (int w = 0; w < 8; ++w)
+            if (w != bw) second = fmaxf(second, exact[w]);
+        out[0] = bi;
+        out[1] = __float_as_int(bv - second);
     }
 }

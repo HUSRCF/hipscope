@@ -21,6 +21,31 @@
     (prefill-route KLD +0.0035) and short prompts had no fast exact Q8
     multi-row GEMM (+46% prefill time at ~100 tokens).
 
+- Qwen4 native MTP decode on gfx1151: 28.7 → 54.1 tok/s (geomean of the
+  committed code and prose prompts, greedy, `qwen3.8-flash-next.mq6q8-pleq8`;
+  AR ~33 on the same build), with greedy MTP tokens equal to AR's. The 2..8-row
+  verify forward is now bitwise the single-row decode route and ~2x cheaper
+  than before (HC Q8 copies, staged Q8 LM head and MQ6 kernels over all rows,
+  fused HC write+norm, per-slot MoE down, and ~35% fewer launches: fused
+  rotations, QSA prologue, GDN conv+params, grouped-MoE round trips, router,
+  unscatter and shared activation); the verify keeps only its last GDN state
+  and a rejected suffix re-runs the kept rows' recurrence for every GDN layer
+  in one launch, and state snapshots copy in one launch; each window picks
+  the draft depth (or the interleaved route) from per-depth draft agreement
+  and stops early once the drafts' exact logit margins make the prefix
+  unlikely to be accepted;
+  drafts come from an MQ2 copy of the LM head re-scored exactly on its top 8
+  (`HIPFIRE_MTP_DRAFT_HEAD`), ranking only token ids below 100 000 plus the
+  control tokens until an input token outside them appears, and the MTP
+  head's attention, selection reuse and chain-final K/V-only steps no longer
+  stall or waste work. SSD-resident PLE rows are read concurrently and warmed
+  while drafting, which also helps AR decode on cold rows.
+  `HIPFIRE_MTP_INCREMENTAL` unset now means adaptive (`0` batched, `1`
+  interleaved).
+  [The checkpoint](docs/perf-checkpoints/2026-09-28-qwen4-mtp-decode-autoresearch-gfx1151.md)
+  and amendments [1](docs/perf-checkpoints/2026-09-28-qwen4-mtp-decode-autoresearch-gfx1151-amendment-1.md),
+  [2](docs/perf-checkpoints/2026-09-28-qwen4-mtp-decode-autoresearch-gfx1151-amendment-2.md).
+
 - Qwen4 decode on gfx1151: 19.2 → 32.3 tok/s (1131-token prompt, greedy,
   `qwen3.8-flash-next.mq6q8-pleq8`). Per-token dispatches drop by fusing the
   small kernels between the streaming GEMVs (HC write + next HC read norm and
