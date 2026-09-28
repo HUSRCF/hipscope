@@ -161,7 +161,7 @@ fn selected_kernel_stream_is_reencoded_not_copied() {
 #[test]
 fn builder_bundles_round_trip() {
     for (relative, sha, kernels, bytes) in [
-        ("../../kernels/gemm_mq4g256v2_wmma_fp8_gfx12_b1.hxaco", "1b26cd3a0bbddfafd8cf93250283aacee16bd37a4886233461fe0e175133f373", 12, 367_072),
+        ("../../kernels/gemm_mq4g256v2_wmma_fp8_gfx12_b1.hxaco", "73168098cae2d414ad8e0c97883b0c953350fbd2795af763d34a367085dcce4e", 12, 362_032),
         ("../../kernels/gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1.hxaco", "c6e714e7d189e26bea6c4d7ee178e6a1834a77dec19b3354f172ba38373769f8", 5, 83_224),
         ("../../kernels/gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s.hxaco", "d5190d97df5e15fbf53aef47593d5fff49dd0732ef4fc13ed641d63c03015d63", 5, 83_504),
     ] {

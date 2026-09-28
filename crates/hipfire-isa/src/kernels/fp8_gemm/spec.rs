@@ -126,7 +126,7 @@ pub fn check_lds_access(source:&str,symbol:&str,launch_dynamic:u32)->Result<u32,
         if line=="s_mov_b32 exec_lo, s74" {masked=false;mask_ready=false}
         let Some((opcode,operands))=line.split_once(' ') else {continue};
         if !opcode.starts_with("ds_") {continue}
-        let width=if opcode.ends_with("_b64"){8}else if opcode.ends_with("_b32"){4}else{
+        let width=if opcode.ends_with("_b128"){16}else if opcode.ends_with("_b64"){8}else if opcode.ends_with("_b32"){4}else{
             return Err(format!("{symbol}: unrecognized LDS access {opcode}"))
         };
         let (args,offset)=if let Some((args,imm))=operands.split_once(" offset:"){
@@ -158,6 +158,7 @@ pub fn check_lds_access(source:&str,symbol:&str,launch_dynamic:u32)->Result<u32,
 /// is over the remaining instructions.
 fn check_gdn_lds(symbol:&str,text:&str)->Result<u32,String>{
     const RING:u32=19;
+    use super::gdn_epilogue::{FIXED_LDS,ROW_BYTES};
     let lines:Vec<&str>=text.lines().map(str::trim).filter(|l|!l.is_empty()&&!l.ends_with(':')&&!l.starts_with("s_delay_alu")&&!l.starts_with("s_wait")).collect();
     let fail=|what:String|Err(format!("{symbol}: GDN LDS certificate: {what}"));
     fn dst(l:&str)->&str{l.split_whitespace().nth(1).map(|t|t.trim_end_matches(',')).unwrap_or("")}
@@ -204,28 +205,28 @@ fn check_gdn_lds(symbol:&str,text:&str)->Result<u32,String>{
         let (args,offset)=match operands.split_once(" offset:") {Some((a,o))=>(a,o.parse::<u32>().map_err(|_|"invalid GDN LDS offset")?),None=>(operands,0)};
         let addr=if opcode=="ds_store_b128" {args.split(',').next()} else if opcode=="ds_load_b128" {args.split(',').nth(1)} else {return fail(format!("unexpected {opcode}"))}.unwrap_or("").trim();
         let base_max=match (opcode,addr) {
-            // Ring row min(r, r - 19) of r = s93 + lane15 <= 33, times 1024, plus the channel term.
+            // Ring row min(r, r - 19) of r = s93 + lane15 <= 33, times the row pitch, plus the channel term.
             ("ds_store_b128","v182")=>{
                 let d=defs("v182");
                 let j=(0..i).rev().find(|j|d.contains(j)).ok_or("W address undefined")?;
-                if !(at(j)=="v_lshl_add_u32 v182, v182, 10, v183"&&at(j-1)=="v_min_u32_e32 v182, v182, v186"&&at(j-2)==format!("v_subrev_nc_u32_e32 v186, {RING}, v182")&&at(j-3)=="v_add_nc_u32_e32 v182, s93, v184") {
+                if !(at(j)==format!("v_mad_u32_u24 v182, v182, {ROW_BYTES:#x}, v183")&&at(j-1)=="v_min_u32_e32 v182, v182, v186"&&at(j-2)==format!("v_subrev_nc_u32_e32 v186, {RING}, v182")&&at(j-3)=="v_add_nc_u32_e32 v182, s93, v184") {
                     return fail("W ring address derivation changed".into())
                 }
-                (RING-1)*1024+800
+                (RING-1)*ROW_BYTES+800
             }
             // Halo rows 0..2 through the per-lane head base.
-            ("ds_store_b128","v185") if offset<=2048 => 1008,
-            // P rows: ((s94 + k) mod 19) << 10 over the head base.
+            ("ds_store_b128","v185") if offset<=2*ROW_BYTES => 1008,
+            // P rows: ((s94 + k) mod 19) times the row pitch over the head base.
             ("ds_load_b128","v186")=>{
-                let row_ok=i>=7&&at(i-1)=="v_add_nc_u32_e32 v186, s97, v185"&&at(i-2)=="s_lshl_b32 s97, s97, 10"&&mod19(i-6,"s97")
+                let row_ok=i>=7&&at(i-1)=="v_add_nc_u32_e32 v186, s97, v185"&&at(i-2)==format!("s_mul_i32 s97, s97, {ROW_BYTES:#x}")&&mod19(i-6,"s97")
                     &&(at(i-6)=="s_mov_b32 s97, s94"||(1..=3).any(|k|at(i-6)==format!("s_add_co_i32 s97, s94, {k}")));
                 if !row_ok {return fail(format!("P row address before line `{l}` changed"))}
-                (RING-1)*1024+1008
+                (RING-1)*ROW_BYTES+1008
             }
             _=>return fail(format!("unproven LDS base {addr} in `{l}`")),
         };
         let end=offset+base_max+16;
-        if end>LDS_BYTES {return fail(format!("`{l}` reaches LDS byte {end}"))}
+        if end>LDS_BYTES+FIXED_LDS {return fail(format!("`{l}` reaches LDS byte {end}"))}
         max_end=max_end.max(end);accesses+=1;
     }
     if accesses==0 {return fail("no accesses".into())}

@@ -87,6 +87,8 @@ pub struct IsaShapeContract {
     #[serde(default)] pub require_zero_spills: bool,
     #[serde(default)] pub require_zero_private: bool,
     #[serde(default)] pub launch_dynamic_lds_bytes: Option<u32>,
+    /// Kernel-descriptor fixed LDS the symbol must declare (0 unless set).
+    #[serde(default)] pub group_segment_fixed_bytes: u32,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -438,8 +440,8 @@ pub fn certify(toolchain: &Toolchain, build: &BuildOutput, source: &Path, arch: 
             .ok_or_else(|| format!("inspection missing kernel {}", contract.symbol))?;
         let mut shape = check_shape(&build.disassembly, report, contract)?;
         let kd = read_kd(&build.elf, &contract.symbol)?;
-        if kd.private_segment_size != 0 || kd.group_segment_size != 0 || !kd.wave32 {
-            return Err(format!("kernel descriptor violates custom-arm resources: {kd:?}"));
+        if kd.private_segment_size != 0 || kd.group_segment_size != contract.group_segment_fixed_bytes || !kd.wave32 {
+            return Err(format!("kernel descriptor violates custom-arm resources (fixed LDS must be {}): {kd:?}", contract.group_segment_fixed_bytes));
         }
         // The register-use audit covers every builder symbol that reuses
         // registers across phases: F2 and the fused A4 GDN projection.

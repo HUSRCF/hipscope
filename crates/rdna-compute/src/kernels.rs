@@ -4285,14 +4285,13 @@ pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1_CONTROL: &[u8] =
 pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1S: &[u8] =
     include_bytes!("../../../kernels/gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s.hxaco");
 /// Certified gfx1201 F2 Row/K128 bundle; production selects Row only.
-/// SHA-256 1b26cd3a0bbddfafd8cf93250283aacee16bd37a4886233461fe0e175133f373:
-/// the prefetch F2 symbols (code unchanged since 962fe61d: next K128's W in
-/// retired ring units, Rw row ratio before slab 0) plus the QKVZA+GDN symbol
-/// with the lean conv+SiLU and one ring row per token (outputs byte-identical
-/// to the 7fd9f338 bundle; /home/kaden/qcal/perf/fp8-4k5/qkvza-epi/report.md).
-/// Prefetch release qualification: 200 poisoned whole-buffer byte/guard comparisons
-/// per family at N=8192/1024/1023/513/512, full H2 and single-CU four-row.
-/// Reproduction: /home/kaden/qcal/perf/fp8-4k5/f2/prefetch/report.md.
+/// SHA-256 73168098cae2d414ad8e0c97883b0c953350fbd2795af763d34a367085dcce4e:
+/// the 1b26cd3a symbols with every Row fold's ratios batched (two
+/// `ds_load_b128` per 8-row group, loaded one group ahead through v168..v175
+/// and v[183:186]/v[188:191]) and the QKVZA+GDN ring rows padded to 1,040 B
+/// (304 B fixed LDS). K128 symbols code-identical; outputs byte-identical to
+/// 1b26cd3a (/home/kaden/qcal/perf/fp8-rb2g/report.md). A/B against the former
+/// bundle with `HIPFIRE_G12_FP8_F2_BUNDLE=<path>`.
 /// Regenerate with `hipfire-isa emit --kernel fp8_gemm --scale both --epi all`
 /// and one contract-checked `peacemaker custom build` per Row epilogue.
 pub const GEMM_MQ4G256V2_WMMA_FP8_GFX12_B1: &[u8] =

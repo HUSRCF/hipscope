@@ -9,9 +9,11 @@
 //! (the persistent conv ring). Tile heads 128j..128j+2 (j >= 1) are left to
 //! that pass; the first tile reads the conv ring as its halo.
 //!
-//! LDS is one 19-row ring of 256 f32 channels (19,456 bytes, the F2
-//! allocation): token t of the tile lives in row (t + 3) mod 19, so the 16
-//! tokens of block b and the 3 previous ones are always resident. Block b
+//! LDS is one 19-row ring of 256 f32 channels with rows 1,040 bytes apart
+//! (1,024 data bytes plus a 16-byte bank skew): 19,760 bytes, the 19,456-byte
+//! F2 launch allocation plus `FIXED_LDS` in the kernel descriptor. Token t of
+//! the tile lives in row (t + 3) mod 19, so the 16 tokens of block b and the 3
+//! previous ones are always resident. Block b
 //! (tokens 16b..16b+15) is drained from the accumulators of token half
 //! b / 4, column block b % 4, by that half's four waves, which then run the
 //! per-token regions in `gdn_chunk_prep`'s lane layout: a wave owns
@@ -24,7 +26,11 @@ use crate::{insn::{Instruction, MemoryClass}, lds::Transition, ledger::Counter};
 
 pub(super) const ENTRY: &str = ".Lfp8_gdn";
 const RING_ROWS: u32 = 19;
-const RING_BYTES: u32 = RING_ROWS * 1024;
+/// Ring row pitch: 1,024 bytes of data plus 16 (bank skew; keeps b128 alignment).
+pub const ROW_BYTES: u32 = 1040;
+pub const RING_BYTES: u32 = RING_ROWS * ROW_BYTES;
+/// Fixed LDS of the GDN-fused symbol: the padded ring beyond the launch's dynamic bytes.
+pub const FIXED_LDS: u32 = RING_BYTES - super::spec::LDS_BYTES;
 
 // VGPRs of the GDN path (the accumulators v0..v127 drain block by block).
 const W: u8 = 128; // conv taps: w[tap][c] at W + 4*tap + c
@@ -139,7 +145,7 @@ fn norm_bind(r: &Region) -> Result<Binding, String> {
 /// Load ring row `(R + k) mod 19` of this head into window slot `slot`.
 fn load_row(b: &mut Builder, g: usize, k: u8, slot: u8) -> Result<(), String> {
     mod19(b, S0, R, u32::from(k))?;
-    so(b, format!("s_lshl_b32 s{S0}, s{S0}, 10"), &[S0], &[S0])?;
+    so(b, format!("s_mul_i32 s{S0}, s{S0}, {ROW_BYTES:#x}"), &[S0], &[S0])?;
     vo(b, format!("v_add_nc_u32_e32 v{VPA}, s{S0}, v{VP}"), &[VPA], &[VP], &[S0])?;
     ds_load_b128(b, g, ROWS + 4 * slot, VPA)
 }
@@ -277,7 +283,7 @@ pub(super) fn emit(b: &mut Builder) -> Result<(), String> {
         vo(b, format!("v_add_nc_u32_e32 v{VA}, s{RB}, v{VL}"), &[VA], &[VL], &[RB])?;
         vo(b, format!("v_subrev_nc_u32_e32 v{VPA}, {RING_ROWS}, v{VA}"), &[VPA], &[VA], &[])?;
         vo(b, format!("v_min_u32_e32 v{VA}, v{VA}, v{VPA}"), &[VA], &[VA, VPA], &[])?;
-        vo(b, format!("v_lshl_add_u32 v{VA}, v{VA}, 10, v{VC}"), &[VA], &[VA, VC], &[])?;
+        vo(b, format!("v_mad_u32_u24 v{VA}, v{VA}, {ROW_BYTES:#x}, v{VC}"), &[VA], &[VA, VC], &[])?;
         for tt in 0..4u8 {
             so(b, format!("s_cmp_eq_u32 s{TT}, {tt}"), &[], &[TT])?;
             op(b, format!("s_cbranch_scc1 {ENTRY}_w{tt}"), &[], &[])?;
@@ -309,7 +315,7 @@ pub(super) fn emit(b: &mut Builder) -> Result<(), String> {
         b.label(&format!("{ENTRY}_halo_zero"))?;
         for r in 0..12u8 { vo(b, format!("v_mov_b32_e32 v{}, 0", ROWS + r), &[ROWS + r], &[], &[])?; }
         b.label(&format!("{ENTRY}_halo_store"))?;
-        for r in 0..3u8 { ds_store_b128(b, g, VP, ROWS + 4 * r, u32::from(r) * 1024)?; }
+        for r in 0..3u8 { ds_store_b128(b, g, VP, ROWS + 4 * r, u32::from(r) * ROW_BYTES)?; }
         b.label(&format!("{ENTRY}_w_skip"))?;
         b.barrier(&[Transition::Ready(g)])?;
         // P: wave rg owns head rg >> 1 and tokens 16b + 8(rg & 1) .. +7.

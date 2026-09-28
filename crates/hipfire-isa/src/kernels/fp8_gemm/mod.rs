@@ -52,14 +52,15 @@ fn ds_store(b:&mut Builder,slot:usize,data:u8,width:u8,addr:u8,offset:u32)->Resu
     b.ds_store(slot,Instruction::new(format!("{name} v{addr}, {}{off}",vr(data,width)),vec![],vec![v(addr),vr(data,width)]).memory(MemoryClass::DsStore))
 }
 fn ds_load(b:&mut Builder,slot:usize,data:u8,width:u8,addr:u8,offset:u32)->Result<(),String>{
-    let name=match width {1=>"ds_load_b32",2=>"ds_load_b64",_=>return Err("invalid DS load width".into())};
+    let name=match width {1=>"ds_load_b32",2=>"ds_load_b64",4=>"ds_load_b128",_=>return Err("invalid DS load width".into())};
     let off=if offset==0 {String::new()}else{format!(" offset:{offset}")};
     b.ds_load(slot,Instruction::new(format!("{name} {}, v{addr}{off}",vr(data,width)),vec![vr(data,width)],vec![v(addr)]).memory(MemoryClass::DsLoad))
 }
 
 // v0:127 accumulator, v128:159 alternating K32 weight units, v160:167
 // current activation fragments. v168:175 staging/ratio borrow, v176:191
-// addresses and temporary metadata. Prologue and epilogue borrow dead ranges.
+// addresses and temporary metadata; v[183:186] and v[188:191] also stage
+// the Row fold's odd ratio groups. Prologue and epilogue borrow dead ranges.
 fn plan()->Result<RegPlan,String>{
     let mut p=RegPlan::new(spec::VGPR_CEILING,104)?;
     let pro=||Live::Between("entry".into(),BEGIN.into());
@@ -71,7 +72,8 @@ fn plan()->Result<RegPlan,String>{
     for i in 0..4u8 {p.v::<8>("weight_ring",128+i*8,body())?;}
     p.v::<8>("activation_fragments",160,body())?;
     p.v::<8>("staging_and_ratio_alias",168,body())?;
-    for i in 176..192 {p.v::<1>("hoisted_address",i,body())?;}
+    for i in (176..183).chain([187]) {p.v::<1>("hoisted_address",i,body())?;}
+    for i in [183,188] {p.v::<4>("hoisted_address_or_ratio_group",i,body())?;}
     for i in (128..192).step_by(8) {p.v::<8>("prologue_address",i,pro())?;}
     p.s::<2>("kernarg",0,Live::Whole)?;
     for i in (8..32).step_by(8) {p.s::<8>("kernargs",i,Live::Whole)?;}
@@ -91,7 +93,8 @@ pub fn emit(spec:Spec)->Result<Emitted,String>{
     spec.validate()?;
     let kernel=KernelSpec{kernel_id:"fp8_gemm".into(),variant:spec.variant(),arch:spec.arch,symbol:spec.symbol(),
         kernargs:spec.kernargs(),user_sgpr_count:2,system_sgpr_workgroup_id_y:true,
-        workgroup_size:256,group_segment_fixed_size:0,wave32:true,cu_mode:false};
+        workgroup_size:256,group_segment_fixed_size:if spec.epi==Epi::QkvzaGdn {gdn_epilogue::FIXED_LDS} else {0},
+        wave32:true,cu_mode:false};
     let mut b=Builder::new(kernel,plan()?);
     b.enable_delay_alu();
     declare_lds(&mut b)?;
