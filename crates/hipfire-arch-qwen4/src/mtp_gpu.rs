@@ -1180,15 +1180,8 @@ impl Qwen4MtpGpu {
             Some(format) => {
                 match gpu
                     .requant_g256(lm_head, config.vocab_size, config.hidden_size, format)
-                    .and_then(|copy| {
-                        front_first(
-                            gpu,
-                            copy,
-                            draft_front,
-                            eos,
-                            config.vocab_size,
-                        )
-                    }) {
+                    .and_then(|copy| front_first(gpu, copy, draft_front, eos, config.vocab_size))
+                {
                     Ok(copy) => Some(copy),
                     Err(error) => {
                         let _ = moe.free_gpu(gpu);

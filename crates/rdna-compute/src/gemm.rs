@@ -39474,7 +39474,11 @@ impl Gpu {
         let timer = crate::profile::begin_timer(&self.hip, "gemm", FUNC, bytes);
         let result = self.launch_maybe_blob(
             func,
-            [m.div_ceil(16) as u32, grouped_rows.div_ceil(slots) as u32, 1],
+            [
+                m.div_ceil(16) as u32,
+                grouped_rows.div_ceil(slots) as u32,
+                1,
+            ],
             [128, 1, 1],
             0,
             &mut params,

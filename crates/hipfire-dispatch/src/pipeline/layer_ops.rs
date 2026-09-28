@@ -25,13 +25,12 @@ use rdna_compute::tensor_ops::{
     indexed_attention_cache_append_batch, indexed_attention_decode_prologue,
     indexed_attention_norm_rope_batch, indexed_attention_pool_rope,
     indexed_attention_pool_rope_incremental, indexed_attention_select_batch_mirrored, scale_f32,
-    ArgmaxF32, Bf16Roundtrip, GatedDeltaConv,
-    GatedDeltaConvBatched, GatedDeltaGate, GatedDeltaGateBatched, GatedDeltaParams,
-    GatedDeltaParamsBatched, GatedDeltaStep, GatedDeltaStepBatched, HcActivationFused,
-    HyperNextGates, HyperNorm, HyperNormGate, HyperReadProjected, HyperReadUpFused, HyperWrite,
-    IndexedAttentionAttentionBatch, IndexedAttentionCacheAppendBatch,
-    IndexedAttentionDecodePrologue, IndexedAttentionNormRopeBatch, IndexedAttentionPoolRope,
-    IndexedAttentionSelectBatch, ScaleF32,
+    ArgmaxF32, Bf16Roundtrip, GatedDeltaConv, GatedDeltaConvBatched, GatedDeltaGate,
+    GatedDeltaGateBatched, GatedDeltaParams, GatedDeltaParamsBatched, GatedDeltaStep,
+    GatedDeltaStepBatched, HcActivationFused, HyperNextGates, HyperNorm, HyperNormGate,
+    HyperReadProjected, HyperReadUpFused, HyperWrite, IndexedAttentionAttentionBatch,
+    IndexedAttentionCacheAppendBatch, IndexedAttentionDecodePrologue,
+    IndexedAttentionNormRopeBatch, IndexedAttentionPoolRope, IndexedAttentionSelectBatch, ScaleF32,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 use smallvec::SmallVec;

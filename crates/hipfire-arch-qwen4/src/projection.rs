@@ -144,14 +144,7 @@ pub(crate) fn dispatch_gemv_rows(
         rotation: None,
         awq_scale: None,
     };
-    hipfire_dispatch::pipeline::project_weight(
-        gpu,
-        &reference,
-        input,
-        output,
-        rows,
-        Some(rotation),
-    )
+    hipfire_dispatch::pipeline::project_weight(gpu, &reference, input, output, rows, Some(rotation))
         .map_err(|error| hip_bridge::HipError::new(0, &error.to_string()))
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

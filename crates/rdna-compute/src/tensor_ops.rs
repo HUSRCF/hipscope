@@ -2613,7 +2613,10 @@ pub fn indexed_attention_reuse_selection(
     // The prior entries snapshot (the kernel compacts in place).
     let snapshot_bytes = p.selected_len.min(p.capacity) * std::mem::size_of::<i32>();
     if snapshot_bytes > QSA_SELECT_DYNAMIC_LDS_LIMIT_BYTES {
-        return Err(HipError::new(0, "QSA reuse selection exceeds its LDS snapshot"));
+        return Err(HipError::new(
+            0,
+            "QSA reuse selection exceeds its LDS snapshot",
+        ));
     }
     gpu.launch_blob_recorded(
         "indexed_attention_reuse_selection",
