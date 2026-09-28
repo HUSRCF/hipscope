@@ -94,21 +94,31 @@ extern "C" __global__ void gemv_q8_0_k2560_staged(
     if (tid == 0) y[row] = sum;
 }
 
-template <int R>
-static __device__ __forceinline__ void gemv_q8_0_k320_body(
-    const unsigned char* __restrict__ A_q8, const float* __restrict__ x, float* __restrict__ y, int M);
-
 // gemv_q8_0 for K = 320 (340-byte rows, Qwen4 decode HC read up), staged like
-// gemv_q8_0_k2560_staged; four rows (waves) per block, the row's loads issued
-// before the x loads. 132 -> 218 GB/s on gfx1151 against gemv_q8_0_wide.
-__launch_bounds__(128)
+// gemv_q8_0_k2560_staged; two rows (waves) per block. 132 -> 218 GB/s on
+// gfx1151 against gemv_q8_0_wide.
+__launch_bounds__(64)
 extern "C" __global__ void gemv_q8_0_k320_staged(
     const unsigned char* __restrict__ A_q8,
     const float* __restrict__ x,
     float* __restrict__ y,
     int M
 ) {
-    gemv_q8_0_k320_body<1>(A_q8, x, y, M);
+    __shared__ __align__(16) unsigned int staged[2][85];
+    const int wave = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int row = blockIdx.x * 2 + wave;
+    if (row >= M) return;
+    const unsigned int* src = reinterpret_cast<const unsigned int*>(A_q8 + (size_t)row * 340);
+    const unsigned int v0 = src[lane];
+    const unsigned int v1 = src[lane + 32];
+    const unsigned int v2 = lane < 21 ? src[lane + 64] : 0u;
+    staged[wave][lane] = v0;
+    staged[wave][lane + 32] = v1;
+    if (lane < 21) staged[wave][lane + 64] = v2;
+    __builtin_amdgcn_fence(__ATOMIC_ACQ_REL, "wavefront");
+    const float sum = gemv_q8_0_row(reinterpret_cast<const unsigned char*>(staged[wave]), x, 320, lane);
+    if (lane == 0) y[row] = sum;
 }
 
 // Long-K rows (Qwen4 decode HC read down, K = 4 * 2560): eight waves take an
@@ -178,54 +188,7 @@ extern "C" __global__ void gemv_q8_0_k2560_staged_rows(
     }
 }
 
-// One 340-byte row per wave, four waves per block: the row's dword loads go
-// out first, the R x rows (10 values per lane each) are held in registers,
-// then the row is staged through LDS. Each (scale, quant) pair is folded into
-// every row's sum in gemv_q8_0_row's order, so each output is bitwise the
-// single-row kernel's.
-template <int R>
-static __device__ __forceinline__ void gemv_q8_0_k320_body(
-    const unsigned char* __restrict__ A_q8, const float* __restrict__ x, float* __restrict__ y, int M
-) {
-    __shared__ __align__(16) unsigned int staged[4][85];
-    const int wave = threadIdx.x >> 5;
-    const int lane = threadIdx.x & 31;
-    const int row = blockIdx.x * 4 + wave;
-    if (row >= M) return;
-    const unsigned int* src = reinterpret_cast<const unsigned int*>(A_q8 + (size_t)row * 340);
-    const unsigned int v0 = src[lane];
-    const unsigned int v1 = src[lane + 32];
-    const unsigned int v2 = lane < 21 ? src[lane + 64] : 0u;
-    float xr[R][10];
-#pragma unroll
-    for (int r = 0; r < R; ++r)
-#pragma unroll
-        for (int b = 0; b < 10; ++b) xr[r][b] = x[r * 320 + b * 32 + lane];
-    staged[wave][lane] = v0;
-    staged[wave][lane + 32] = v1;
-    if (lane < 21) staged[wave][lane + 64] = v2;
-    __builtin_amdgcn_fence(__ATOMIC_ACQ_REL, "wavefront");
-    const unsigned char* data = reinterpret_cast<const unsigned char*>(staged[wave]);
-    float sum[R];
-#pragma unroll
-    for (int r = 0; r < R; ++r) sum[r] = 0.0f;
-#pragma unroll
-    for (int b = 0; b < 10; ++b) {
-        const unsigned char* block = data + b * 34;
-        float d = (float)*((const _Float16*)block);
-        signed char qval = (signed char)block[2 + lane];
-#pragma unroll
-        for (int r = 0; r < R; ++r) sum[r] += d * (float)qval * xr[r][b];
-    }
-#pragma unroll
-    for (int r = 0; r < R; ++r)
-        for (int offset = 16; offset > 0; offset >>= 1) sum[r] += __shfl_down(sum[r], offset);
-    if (lane == 0)
-#pragma unroll
-        for (int r = 0; r < R; ++r) y[(size_t)r * M + row] = sum[r];
-}
-
-__launch_bounds__(128)
+__launch_bounds__(64)
 extern "C" __global__ void gemv_q8_0_k320_staged_rows(
     const unsigned char* __restrict__ A_q8,
     const float* __restrict__ x,
@@ -233,15 +196,35 @@ extern "C" __global__ void gemv_q8_0_k320_staged_rows(
     int M,
     int rows
 ) {
+    __shared__ __align__(16) unsigned int staged[2][85];
+    const int wave = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int row = blockIdx.x * 2 + wave;
+    if (row >= M) return;
+    const unsigned int* src = reinterpret_cast<const unsigned int*>(A_q8 + (size_t)row * 340);
+    const unsigned int v0 = src[lane];
+    const unsigned int v1 = src[lane + 32];
+    const unsigned int v2 = lane < 21 ? src[lane + 64] : 0u;
+    staged[wave][lane] = v0;
+    staged[wave][lane + 32] = v1;
+    if (lane < 21) staged[wave][lane + 64] = v2;
+    __builtin_amdgcn_fence(__ATOMIC_ACQ_REL, "wavefront");
+    const unsigned char* data = reinterpret_cast<const unsigned char*>(staged[wave]);
     switch (rows) {
-    case 1: gemv_q8_0_k320_body<1>(A_q8, x, y, M); return;
-    case 2: gemv_q8_0_k320_body<2>(A_q8, x, y, M); return;
-    case 3: gemv_q8_0_k320_body<3>(A_q8, x, y, M); return;
-    case 4: gemv_q8_0_k320_body<4>(A_q8, x, y, M); return;
-    case 5: gemv_q8_0_k320_body<5>(A_q8, x, y, M); return;
-    case 6: gemv_q8_0_k320_body<6>(A_q8, x, y, M); return;
-    case 7: gemv_q8_0_k320_body<7>(A_q8, x, y, M); return;
-    case 8: gemv_q8_0_k320_body<8>(A_q8, x, y, M); return;
+#define K320_ROWS(R)                                                                   \
+    case R: {                                                                          \
+        float s[R];                                                                    \
+        gemv_q8_0_row_multi<R>(data, x, 320, 320, lane, s);                            \
+        if (lane == 0)                                                                 \
+            for (int r = 0; r < R; ++r) y[(size_t)r * M + row] = s[r];                 \
+        return;                                                                        \
+    }
+    K320_ROWS(2) K320_ROWS(3) K320_ROWS(4) K320_ROWS(5) K320_ROWS(6) K320_ROWS(7) K320_ROWS(8)
+#undef K320_ROWS
+    }
+    for (int r = 0; r < rows; ++r) {
+        const float sum = gemv_q8_0_row(data, x + (size_t)r * 320, 320, lane);
+        if (lane == 0) y[(size_t)r * M + row] = sum;
     }
 }
 
