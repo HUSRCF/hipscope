@@ -76,9 +76,14 @@ static __device__ __forceinline__ unsigned int hf_nibble_bytes(unsigned int x) {
 // Grid: [ceil(M / 16), ceil(grouped_rows / 8), 1], block 128.
 // expert_tile_ids is indexed per 16-slot tile: subtile s reads tile s / 2.
 // ---------------------------------------------------------------------------
-#define HF_R8 8
-__launch_bounds__(128, 1)
-extern "C" __global__ void gemm_mq4g256v2_moe_grouped_top10_o4_r8_x4(
+// Slot count R per subtile (even): the production O4 x R8 and a few-row
+// O4 x R2 (speculative verify: an expert tile rarely holds more than one or
+// two live slots, so R8's staging of eight slots of X per 16 weight rows is
+// mostly dead traffic).  R < 8 subtiles without a live slot exit at once:
+// their grouped rows are never read on the few-row route (the unscatter
+// skips dead slots).  Per live slot the arithmetic is R8's.
+template <int R>
+__device__ __forceinline__ void grouped_top10_o4_body(
     const unsigned long long* __restrict__ expert_weight_ptrs,
     const int* __restrict__ expert_tile_ids,
     const int* __restrict__ sorted_slot_index,
@@ -87,29 +92,30 @@ extern "C" __global__ void gemm_mq4g256v2_moe_grouped_top10_o4_r8_x4(
     int M,
     int K,
     int x_row_div,
-    int grouped_rows
+    int grouped_rows,
+    float4* xs
 ) {
+    static_assert(R % 2 == 0 && R <= 8, "slots per subtile");
     // readfirstlane: the compiler cannot see that threadIdx.x >> 5 is
     // wave-uniform, and a VGPR row offset turns every buffer load into a
     // waterfall loop.
     const int wave = __builtin_amdgcn_readfirstlane(threadIdx.x >> 5);
     const int tid = threadIdx.x & 31;
     const int row0 = (blockIdx.x * 4 + wave) * 4;
-    const int slot_start = blockIdx.y * HF_R8;
+    const int slot_start = blockIdx.y * R;
     // Block-uniform exits only: every wave takes part in the barriers.
     if (slot_start >= grouped_rows) return;
 
-    int flat_raw[HF_R8];
+    int flat_raw[R];
 #pragma unroll
-    for (int slot = 0; slot < HF_R8; ++slot) {
+    for (int slot = 0; slot < R; ++slot) {
         const int grouped_slot = slot_start + slot;
         flat_raw[slot] = sorted_slot_index[
             grouped_slot < grouped_rows ? grouped_slot : grouped_rows - 1];
     }
-    const int expert_id = expert_tile_ids[blockIdx.y >> 1];
-    asm volatile("" :: "s"(flat_raw[0]), "s"(flat_raw[1]), "s"(flat_raw[2]),
-                 "s"(flat_raw[3]), "s"(flat_raw[4]), "s"(flat_raw[5]),
-                 "s"(flat_raw[6]), "s"(flat_raw[7]));
+    const int expert_id = expert_tile_ids[slot_start >> 4];
+#pragma unroll
+    for (int slot = 0; slot < R; ++slot) asm volatile("" :: "s"(flat_raw[slot]));
     if (expert_id < 0) return;
     const char* __restrict__ A =
         reinterpret_cast<const char*>(expert_weight_ptrs[expert_id]);
@@ -125,11 +131,11 @@ extern "C" __global__ void gemm_mq4g256v2_moe_grouped_top10_o4_r8_x4(
         row_soff[r] = (row_valid[r] ? row0 + r : M - 1) * row_stride;
     }
 
-    bool live[HF_R8];
-    int x_soff[HF_R8];
+    bool live[R];
+    int x_soff[R];
     bool any_live = false;
 #pragma unroll
-    for (int slot = 0; slot < HF_R8; ++slot) {
+    for (int slot = 0; slot < R; ++slot) {
         const int grouped_slot = slot_start + slot;
         const int flat = (grouped_slot < grouped_rows) ? flat_raw[slot] : -1;
         live[slot] = flat >= 0;
@@ -138,6 +144,7 @@ extern "C" __global__ void gemm_mq4g256v2_moe_grouped_top10_o4_r8_x4(
         x_soff[slot] = x_row * K * 4;
         any_live |= live[slot];
     }
+    if (R < 8 && !any_live) return;
     const int group_walk = any_live ? groups_per_row : 0;
 
     const __amdgpu_buffer_rsrc_t wrsrc =
@@ -147,28 +154,28 @@ extern "C" __global__ void gemm_mq4g256v2_moe_grouped_top10_o4_r8_x4(
     const int boff = tid * 4;
     const int hoff = (tid < 16) ? 0 : 4;
 
-    // Staging: float4 v = j * 128 + threadIdx.x of the 8 x 64 chunk belongs
+    // Staging: float4 v = j * 128 + threadIdx.x of the R x 64 chunk belongs
     // to slot 2j + (wave >> 1) (wave-uniform), float4 (wave & 1) * 32 + tid
     // within it.
-    __shared__ float4 xs[HF_R8 * 64];
+    constexpr int L = R / 2;
     const int stage_part = (wave & 1) * 32 + tid;
-    int stage_soff[4];
+    int stage_soff[L];
 #pragma unroll
-    for (int j = 0; j < 4; ++j) {
+    for (int j = 0; j < L; ++j) {
         const int s0 = x_soff[2 * j], s1 = x_soff[2 * j + 1];
         stage_soff[j] = (wave >> 1) ? s1 : s0;
     }
 
-    float acc[4][4][HF_R8];  // [chain][row][slot]
+    float acc[4][4][R];  // [chain][row][slot]
 #pragma unroll
     for (int c = 0; c < 4; ++c)
 #pragma unroll
         for (int r = 0; r < 4; ++r)
 #pragma unroll
-            for (int slot = 0; slot < HF_R8; ++slot) acc[c][r][slot] = 0.0f;
+            for (int slot = 0; slot < R; ++slot) acc[c][r][slot] = 0.0f;
 
     unsigned int nh[4], npk[4];
-    float4 st0, st1, st2, st3;
+    float4 st[L];
 #define R8_LOAD(G) do { \
         _Pragma("unroll") \
         for (int r = 0; r < 4; ++r) { \
@@ -177,14 +184,10 @@ extern "C" __global__ void gemm_mq4g256v2_moe_grouped_top10_o4_r8_x4(
             npk[r] = __builtin_amdgcn_raw_buffer_load_b32( \
                 wrsrc, 8 + boff, row_soff[r] + (G) * 136, 0); \
         } \
-        st0 = __builtin_bit_cast(float4, __builtin_amdgcn_raw_buffer_load_b128( \
-            xrsrc, stage_part * 16, stage_soff[0] + (G) * 1024, 0)); \
-        st1 = __builtin_bit_cast(float4, __builtin_amdgcn_raw_buffer_load_b128( \
-            xrsrc, stage_part * 16, stage_soff[1] + (G) * 1024, 0)); \
-        st2 = __builtin_bit_cast(float4, __builtin_amdgcn_raw_buffer_load_b128( \
-            xrsrc, stage_part * 16, stage_soff[2] + (G) * 1024, 0)); \
-        st3 = __builtin_bit_cast(float4, __builtin_amdgcn_raw_buffer_load_b128( \
-            xrsrc, stage_part * 16, stage_soff[3] + (G) * 1024, 0)); \
+        _Pragma("unroll") \
+        for (int j = 0; j < L; ++j) \
+            st[j] = __builtin_bit_cast(float4, __builtin_amdgcn_raw_buffer_load_b128( \
+                xrsrc, stage_part * 16, stage_soff[j] + (G) * 1024, 0)); \
     } while (0)
 #define R8_DECODE(R) \
     float w##R[8]; \
@@ -211,15 +214,13 @@ extern "C" __global__ void gemm_mq4g256v2_moe_grouped_top10_o4_r8_x4(
         unsigned int ch[4], cpk[4]; \
         _Pragma("unroll") \
         for (int r = 0; r < 4; ++r) { ch[r] = nh[r]; cpk[r] = npk[r]; } \
-        xs[0 * 128 + threadIdx.x] = st0; \
-        xs[1 * 128 + threadIdx.x] = st1; \
-        xs[2 * 128 + threadIdx.x] = st2; \
-        xs[3 * 128 + threadIdx.x] = st3; \
+        _Pragma("unroll") \
+        for (int j = 0; j < L; ++j) xs[j * 128 + threadIdx.x] = st[j]; \
         __syncthreads(); \
         if ((G) + 1 < group_walk) R8_LOAD((G) + 1); \
         R8_DECODE(0) R8_DECODE(1) R8_DECODE(2) R8_DECODE(3) \
         _Pragma("unroll") \
-        for (int slot = 0; slot < HF_R8; ++slot) { \
+        for (int slot = 0; slot < R; ++slot) { \
             if (!live[slot]) continue; \
             const float4 xa = xs[slot * 64 + tid * 2]; \
             const float4 xb = xs[slot * 64 + tid * 2 + 1]; \
@@ -229,7 +230,7 @@ extern "C" __global__ void gemm_mq4g256v2_moe_grouped_top10_o4_r8_x4(
         } \
         /* ALU results carry no memory chain; pin them before the barrier. */ \
         _Pragma("unroll") \
-        for (int slot = 0; slot < HF_R8; ++slot) \
+        for (int slot = 0; slot < R; ++slot) \
             asm volatile("" : "+v"(acc[C][0][slot]), "+v"(acc[C][1][slot]), \
                          "+v"(acc[C][2][slot]), "+v"(acc[C][3][slot])); \
         __syncthreads(); \
@@ -256,21 +257,21 @@ extern "C" __global__ void gemm_mq4g256v2_moe_grouped_top10_o4_r8_x4(
 #undef R8_DECODE
 #undef R8_LOAD
 
-    float sum[4][HF_R8];
+    float sum[4][R];
 #pragma unroll
     for (int r = 0; r < 4; ++r)
 #pragma unroll
-        for (int slot = 0; slot < HF_R8; ++slot)
+        for (int slot = 0; slot < R; ++slot)
             sum[r][slot] = (acc[0][r][slot] + acc[1][r][slot])
                 + (acc[2][r][slot] + acc[3][r][slot]);
 #pragma unroll
-    for (int slot = 0; slot < HF_R8; ++slot) {
+    for (int slot = 0; slot < R; ++slot) {
         hf_lane0_tree_sum2(sum[0][slot], sum[1][slot]);
         hf_lane0_tree_sum2(sum[2][slot], sum[3][slot]);
     }
     if (tid == 0) {
 #pragma unroll
-        for (int slot = 0; slot < HF_R8; ++slot) {
+        for (int slot = 0; slot < R; ++slot) {
             const int grouped_slot = slot_start + slot;
             if (grouped_slot >= grouped_rows) continue;
 #pragma unroll
@@ -280,4 +281,38 @@ extern "C" __global__ void gemm_mq4g256v2_moe_grouped_top10_o4_r8_x4(
         }
     }
 }
-#undef HF_R8
+
+__launch_bounds__(128, 1)
+extern "C" __global__ void gemm_mq4g256v2_moe_grouped_top10_o4_r8_x4(
+    const unsigned long long* __restrict__ expert_weight_ptrs,
+    const int* __restrict__ expert_tile_ids,
+    const int* __restrict__ sorted_slot_index,
+    const float* __restrict__ X_src,
+    float* __restrict__ Y_grouped,
+    int M,
+    int K,
+    int x_row_div,
+    int grouped_rows
+) {
+    __shared__ float4 xs[8 * 64];
+    grouped_top10_o4_body<8>(expert_weight_ptrs, expert_tile_ids, sorted_slot_index, X_src,
+                             Y_grouped, M, K, x_row_div, grouped_rows, xs);
+}
+
+// Grid [ceil(M / 16), ceil(grouped_rows / 2), 1], block 128.
+__launch_bounds__(128, 2)
+extern "C" __global__ void gemm_mq4g256v2_moe_grouped_top10_o4_r2_x4(
+    const unsigned long long* __restrict__ expert_weight_ptrs,
+    const int* __restrict__ expert_tile_ids,
+    const int* __restrict__ sorted_slot_index,
+    const float* __restrict__ X_src,
+    float* __restrict__ Y_grouped,
+    int M,
+    int K,
+    int x_row_div,
+    int grouped_rows
+) {
+    __shared__ float4 xs[2 * 64];
+    grouped_top10_o4_body<2>(expert_weight_ptrs, expert_tile_ids, sorted_slot_index, X_src,
+                             Y_grouped, M, K, x_row_div, grouped_rows, xs);
+}

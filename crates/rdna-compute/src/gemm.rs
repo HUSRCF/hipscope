@@ -39400,6 +39400,7 @@ impl Gpu {
                 k,
                 x_row_div,
                 grouped_rows,
+                x_src_rows <= 8,
             );
         }
         self.gemm_mq4g256v2_moe_grouped_top10_simt(
@@ -39418,7 +39419,9 @@ impl Gpu {
     /// path.  Four waves per 128-thread block each pair four adjacent output
     /// rows with one eight-slot subtile; the subtile's X is staged once per
     /// block through LDS.  Like the O2×R8 arm this is deliberately selected
-    /// only for M=1280, K=2560.
+    /// only for M=1280, K=2560.  `few` (<= 8 source rows) takes the two-slot
+    /// subtiles (O4×R2) that skip slot-free subtiles and leave their grouped
+    /// rows unwritten (the few-row unscatter never reads them).
     #[allow(clippy::too_many_arguments)]
     fn gemm_mq4g256v2_moe_grouped_top10_o4_r8_x4_gfx1151(
         &mut self,
@@ -39431,14 +39434,21 @@ impl Gpu {
         k: usize,
         x_row_div: usize,
         grouped_rows: usize,
+        few: bool,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        const FUNC: &str = "gemm_mq4g256v2_moe_grouped_top10_o4_r8_x4";
+        const MODULE: &str = "gemm_mq4g256v2_moe_grouped_top10_o4_r8_x4";
+        let (func, slots) = if few {
+            ("gemm_mq4g256v2_moe_grouped_top10_o4_r2_x4", 2)
+        } else {
+            (MODULE, 8)
+        };
         self.ensure_kernel(
-            FUNC,
+            MODULE,
             kernels::GEMM_MQ4G256V2_MOE_GROUPED_TOP10_O4_R8_X4_GFX1151_SRC,
-            FUNC,
+            func,
         )?;
+        const FUNC: &str = MODULE;
         let ep = expert_weight_ptrs.buf.as_ptr();
         let tp = expert_tile_ids.buf.as_ptr();
         let sp = sorted_slot_index.buf.as_ptr();
@@ -39463,8 +39473,8 @@ impl Gpu {
             grouped_rows.saturating_mul(m.saturating_mul(4).saturating_add(k.saturating_mul(4)));
         let timer = crate::profile::begin_timer(&self.hip, "gemm", FUNC, bytes);
         let result = self.launch_maybe_blob(
-            FUNC,
-            [m.div_ceil(16) as u32, grouped_rows.div_ceil(8) as u32, 1],
+            func,
+            [m.div_ceil(16) as u32, grouped_rows.div_ceil(slots) as u32, 1],
             [128, 1, 1],
             0,
             &mut params,
@@ -40044,7 +40054,7 @@ mod tests {
                 )
             } else {
                 gpu.gemm_mq4g256v2_moe_grouped_top10_o4_r8_x4_gfx1151(
-                    &ptrs_gpu, &tiles_gpu, &slots_gpu, &x_gpu, &y, M, K, 10, GROUPED,
+                    &ptrs_gpu, &tiles_gpu, &slots_gpu, &x_gpu, &y, M, K, 10, GROUPED, false,
                 )
             }
             .expect("gate/up launch");
