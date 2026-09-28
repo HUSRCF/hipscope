@@ -23,6 +23,12 @@ use hip_bridge::HipResult;
 
 const FA_PREP_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/qwen35_fa_prep_batched.gfx1100.hip");
+/// gfx1151 twin: the same source under its own symbol, so either arch's
+/// kernel can change without touching the other's object.
+const FA_PREP_BATCHED_GFX1151_SRC: &str = concat!(
+    "#define QWEN35_FA_PREP_BATCHED_KERNEL qwen35_fa_prep_batched_gfx1151\n",
+    include_str!("../../../kernels/src/qwen35_fa_prep_batched.gfx1100.hip")
+);
 const KV_PAIR_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/kv_cache_write_q8_0_pair_batched.gfx1100.hip");
 const FA_PREP_BATCHED_GFX1201_SRC: &str =
@@ -77,24 +83,76 @@ impl Gpu {
                 "qwen35_fa_prep_batched_gfx1100 is certified only on gfx1100",
             ));
         }
+        self.qwen35_fa_prep_batched_gfx11(
+            "qwen35_fa_prep_batched_gfx1100", FA_PREP_BATCHED_SRC, q_interleaved, q, gate, k, q_weight,
+            k_weight, positions, eps, freq_base, pos_offset, n_q_heads, n_kv_heads, batch_size,
+        )
+    }
+
+    /// gfx1151 twin of [`Self::qwen35_fa_prep_batched_gfx1100`]: same kernel
+    /// source and contract, compiled under `qwen35_fa_prep_batched_gfx1151`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn qwen35_fa_prep_batched_gfx1151(
+        &mut self,
+        q_interleaved: &GpuTensor,
+        q: &GpuTensor,
+        gate: &GpuTensor,
+        k: &GpuTensor,
+        q_weight: &GpuTensor,
+        k_weight: &GpuTensor,
+        positions: &GpuTensor,
+        eps: f32,
+        freq_base: f32,
+        pos_offset: i32,
+        n_q_heads: usize,
+        n_kv_heads: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if !self.arch_caps.is_gfx1151() {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "qwen35_fa_prep_batched_gfx1151 is certified only on gfx1151",
+            ));
+        }
+        self.qwen35_fa_prep_batched_gfx11(
+            "qwen35_fa_prep_batched_gfx1151", FA_PREP_BATCHED_GFX1151_SRC, q_interleaved, q, gate, k, q_weight,
+            k_weight, positions, eps, freq_base, pos_offset, n_q_heads, n_kv_heads, batch_size,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn qwen35_fa_prep_batched_gfx11(
+        &mut self,
+        name: &'static str,
+        src: &'static str,
+        q_interleaved: &GpuTensor,
+        q: &GpuTensor,
+        gate: &GpuTensor,
+        k: &GpuTensor,
+        q_weight: &GpuTensor,
+        k_weight: &GpuTensor,
+        positions: &GpuTensor,
+        eps: f32,
+        freq_base: f32,
+        pos_offset: i32,
+        n_q_heads: usize,
+        n_kv_heads: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
         if !FA_PREP_BATCHED_GEOMETRIES.contains(&(n_q_heads, n_kv_heads)) {
             return Err(hip_bridge::HipError::new(
                 1,
-                "qwen35_fa_prep_batched_gfx1100 requires 16Q/2K or 24Q/4K heads",
+                "qwen35_fa_prep_batched_gfx11 requires 16Q/2K or 24Q/4K heads",
             ));
         }
         if batch_size == 0 {
             return Err(hip_bridge::HipError::new(
                 1,
-                "qwen35_fa_prep_batched_gfx1100 requires batch_size >= 1",
+                "qwen35_fa_prep_batched_gfx11 requires batch_size >= 1",
             ));
         }
-        self.ensure_kernel(
-            "qwen35_fa_prep_batched_gfx1100",
-            FA_PREP_BATCHED_SRC,
-            "qwen35_fa_prep_batched_gfx1100",
-        )?;
-
+        self.ensure_kernel(name, src, name)?;
         let qip = q_interleaved.buf.as_ptr();
         let qp = q.buf.as_ptr();
         let gp = gate.buf.as_ptr();
@@ -125,14 +183,9 @@ impl Gpu {
         ];
         // Per (head, token): interleaved read + norm read + q/gate/k writes.
         let bytes = batch_size * ((n_q_heads + n_kv_heads) * 256 * 4 * 2);
-        let timer = crate::profile::begin_timer(
-            &self.hip,
-            "fused",
-            "qwen35_fa_prep_batched_gfx1100",
-            bytes,
-        );
+        let timer = crate::profile::begin_timer(&self.hip, "fused", name, bytes);
         let result = self.launch_maybe_blob(
-            "qwen35_fa_prep_batched_gfx1100",
+            name,
             [(n_q_heads + n_kv_heads) as u32, batch_size as u32, 1],
             [256, 1, 1],
             0,

@@ -8828,6 +8828,17 @@ fn batch_chunk_full_attn_prepare(
         && !hipfire_runtime::triattn::tap_enabled()
         && fa_prep_shape_ok
         && n >= 1;
+    // gfx1151 twin (`qwen35_fa_prep_batched_gfx1151`, same source) in
+    // ordinary prefill, bit-exact against the three-launch chain on the
+    // Halo; HIPFIRE_GFX1151_FA_PREP=0 restores the chain.
+    let fa_prep_fused_gfx1151_ok = fusion == DflashFusionCtx::Off
+        && hipfire_config::developer_bool("HIPFIRE_GFX1151_FA_PREP", true)
+        && gpu.arch_caps.is_gfx1151()
+        && !gpu.flags.fa_batch_fuse_off
+        && !gpu.flags.rope_interleaved_legacy
+        && !hipfire_runtime::triattn::tap_enabled()
+        && fa_prep_shape_ok
+        && n >= 1;
     if gfx12_fa_prep {
         if gfx12_fa_prep_fp8q {
             let bytes = n * config.n_heads * (config.head_dim + 4);
@@ -8855,6 +8866,22 @@ fn batch_chunk_full_attn_prepare(
         }
     } else if fa_prep_fused_ok {
         gpu.qwen35_fa_prep_batched_gfx1100(
+            &pbs.fa_q_full_batch,
+            &pbs.fa_q_batch,
+            &pbs.fa_gate_batch,
+            &pbs.fa_k_batch,
+            &layer.q_norm,
+            &layer.k_norm,
+            fa_prep_rope_pos_buf,
+            config.norm_eps,
+            config.rope_theta,
+            kv_cache.compact_offset as i32,
+            config.n_heads,
+            config.n_kv_heads,
+            n,
+        )?;
+    } else if fa_prep_fused_gfx1151_ok {
+        gpu.qwen35_fa_prep_batched_gfx1151(
             &pbs.fa_q_full_batch,
             &pbs.fa_q_batch,
             &pbs.fa_gate_batch,
