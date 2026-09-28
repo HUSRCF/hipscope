@@ -2330,7 +2330,7 @@ pub fn indexed_attention_select_batch(
     indexed_attention_select_batch_impl(gpu, p, None).map(|_| ())
 }
 
-/// [`indexed_attention_select_batch`] of a single row that also writes the
+/// [`indexed_attention_select_batch`] that also writes the final row's
 /// selection into `mirror` (`capacity` i32) on the parallel route; returns
 /// whether it did (the caller copies otherwise).
 pub fn indexed_attention_select_batch_mirrored(
@@ -2463,7 +2463,6 @@ fn indexed_attention_select_batch_impl(
     args.push_i32(capacity);
     let mirror = mirror.filter(|m| {
         kernel_name == "indexed_attention_select_f32_batched"
-            && p.rows == 1
             && m.numel() * m.dtype.size() >= p.capacity * std::mem::size_of::<i32>()
     });
     if kernel_name == "indexed_attention_select_f32_batched" {

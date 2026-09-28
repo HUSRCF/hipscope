@@ -24,8 +24,8 @@ use rdna_compute::tensor_ops::{
     hyper_write, hyper_write_norm, indexed_attention_attention_batch,
     indexed_attention_cache_append_batch, indexed_attention_decode_prologue,
     indexed_attention_norm_rope_batch, indexed_attention_pool_rope,
-    indexed_attention_pool_rope_incremental, indexed_attention_select_batch,
-    indexed_attention_select_batch_mirrored, scale_f32, ArgmaxF32, Bf16Roundtrip, GatedDeltaConv,
+    indexed_attention_pool_rope_incremental, indexed_attention_select_batch_mirrored, scale_f32,
+    ArgmaxF32, Bf16Roundtrip, GatedDeltaConv,
     GatedDeltaConvBatched, GatedDeltaGate, GatedDeltaGateBatched, GatedDeltaParams,
     GatedDeltaParamsBatched, GatedDeltaStep, GatedDeltaStepBatched, HcActivationFused,
     HyperNextGates, HyperNorm, HyperNormGate, HyperReadProjected, HyperReadUpFused, HyperWrite,
@@ -1880,18 +1880,13 @@ pub fn execute_indexed_attention(
         capacity: op.state.selected_capacity,
         shape_blocks: op.state.pooled_capacity,
     };
-    // Decode: the selection also lands in the persistent selected indices
+    // The final row's selection also lands in the persistent selected indices
     // (the copy at the end is then skipped).
-    let selection_persisted = if op.rows == 1 {
-        hip(indexed_attention_select_batch_mirrored(
-            gpu,
-            &select,
-            op.state.selected_indices,
-        ))?
-    } else {
-        hip(indexed_attention_select_batch(gpu, &select))?;
-        false
-    };
+    let selection_persisted = hip(indexed_attention_select_batch_mirrored(
+        gpu,
+        &select,
+        op.state.selected_indices,
+    ))?;
     hip(indexed_attention_attention_batch(
         gpu,
         &IndexedAttentionAttentionBatch {

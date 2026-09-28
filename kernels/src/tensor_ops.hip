@@ -2062,6 +2062,8 @@ extern "C" __global__ void indexed_attention_select_f32_batched(
     int* mirror) {
     int row = (int)blockIdx.x;
     if (row >= rows) return;
+    // The persistent selection is the final row's.
+    if (row != rows - 1) mirror = nullptr;
     extern __shared__ __align__(16) float scores[];
     int visible = position_start + row + 1;
     int row_block_count = visible / compress;
