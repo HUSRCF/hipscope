@@ -492,6 +492,38 @@ enum Mq4v2QkvVariant {
 /// `gemm_mq4g256v2_mmq_prequant_iu4`).
 const V2B_DOWN_SWZ_GRP: i32 = 4;
 
+/// Certified builder V2B module for gfx1151 (`kernels::GEMM_MQ4G256V2_RESIDUAL_IU4_PM_V2B_GFX1151`).
+const PM_V2B_MODULE: &str = "gemm_mq4g256v2_residual_iu4_pm_v2b_gfx1151";
+const PM_V2B_SET: &str = "gemm_mq4g256v2_residual_iu4_pm_v2b_set_gfx1151";
+const PM_V2B_ADD: &str = "gemm_mq4g256v2_residual_iu4_pm_v2b_add_gfx1151";
+const PM_V2B_SILU: &str = "gemm_mq4g256v2_gate_up_silu_iu4_pm_v2b_gfx1151";
+/// The builder ADD touches the residual over epochs E-16..E-8, so it needs
+/// at least that many K128 epochs.
+const PM_V2B_ADD_MIN_K: usize = 2048;
+
+/// Builder twin of a hipcc V2B entry (gfx1151 only: the V2B tile is), with
+/// the builder ADD's log2 raster group; `None` keeps the hipcc entry.
+/// `HIPFIRE_V2B_PM=0` restores every hipcc entry. The Z|beta|alpha
+/// `_set_zba` scatter and the plain `_add` (`HIPFIRE_V2B_ADDEPI=0`) stay on
+/// hipcc; the ADD twin takes power-of-two groups that divide the row tiles.
+/// Outputs are byte-identical to the entry replaced.
+fn v2b_pm_entry(hipcc: &str, swz_grp: i32, m: usize, k: usize) -> Option<(&'static str, u32)> {
+    if hipfire_config::developer_var("HIPFIRE_V2B_PM").as_deref() == Ok("0") {
+        return None;
+    }
+    match hipcc {
+        "gemm_mq4g256v2_residual_iu4_v2b_set_gfx11" => Some((PM_V2B_SET, 0)),
+        "gemm_mq4g256v2_residual_iu4_v2b_add_touch_gfx11"
+        | "gemm_mq4g256v2_residual_iu4_v2b_add_touch_swz_gfx11" => {
+            let grp = swz_grp.max(1) as usize;
+            (k >= PM_V2B_ADD_MIN_K && grp.is_power_of_two() && (m / 256) % grp == 0)
+                .then(|| (PM_V2B_ADD, grp.trailing_zeros()))
+        }
+        "gemm_mq4g256v2_gate_up_silu_iu4_v2b_gfx11" => Some((PM_V2B_SILU, 0)),
+        _ => None,
+    }
+}
+
 /// GEMM v2 tile of an exact-gfx11 symmetric IU4 full-tile prefill GEMM
 /// (`Gpu::iu4_v2_tile`). Both read the unchanged MQ4V2 / `block_i4_128`
 /// layouts and are bit-identical to X5.
@@ -20563,18 +20595,42 @@ impl Gpu {
             } else {
                 kernel_name
             };
-            self.ensure_kernel(
-                "gemm_mq4g256v2_residual_iu4_v2b_gfx11",
-                kernels::GEMM_MQ4G256V2_RESIDUAL_IU4_V2B_GFX11_SRC,
-                kernel_name,
-            )?;
+            // Certified builder V2B (`HIPFIRE_V2B_PM=0` restores the hipcc
+            // entry): same tiles and output bytes, launched as a flat
+            // 512-thread block; ADD takes the raster group as a shift.
+            let pm = v2b_pm_entry(kernel_name, swz_grp, m, k);
+            let launch_name = match pm {
+                Some((name, _)) => {
+                    self.ensure_embedded_kernel(
+                        PM_V2B_MODULE,
+                        kernels::GEMM_MQ4G256V2_RESIDUAL_IU4_PM_V2B_GFX1151,
+                        name,
+                    )?;
+                    name
+                }
+                None => {
+                    self.ensure_kernel(
+                        "gemm_mq4g256v2_residual_iu4_v2b_gfx11",
+                        kernels::GEMM_MQ4G256V2_RESIDUAL_IU4_V2B_GFX11_SRC,
+                        kernel_name,
+                    )?;
+                    kernel_name
+                }
+            };
             let mut a_ptr = a_raw.buf.as_ptr();
             let mut xq_ptr = x_i4_ptr;
             let mut y_ptr = fold.map_or(y.buf.as_ptr(), |a| a.delta);
             let mut m_val = m as i32;
             let mut k_val = k as i32;
             let mut n_val = batch_size as i32;
-            let mut grp_val = swz_grp;
+            // Trailing argument: the hipcc raster group, or the builder ADD's
+            // group shift; absent for SET.
+            let extra = match pm {
+                Some((PM_V2B_ADD, gshift)) => Some(gshift as i32),
+                Some(_) => None,
+                None => (swz_grp > 0).then_some(swz_grp),
+            };
+            let mut extra_val = extra.unwrap_or(0);
             let mut params: Vec<*mut c_void> = vec![
                 &mut a_ptr as *mut _ as *mut c_void,
                 &mut xq_ptr as *mut _ as *mut c_void,
@@ -20583,17 +20639,23 @@ impl Gpu {
                 &mut k_val as *mut _ as *mut c_void,
                 &mut n_val as *mut _ as *mut c_void,
             ];
-            if swz_grp > 0 {
-                params.push(&mut grp_val as *mut _ as *mut c_void);
+            if extra.is_some() {
+                params.push(&mut extra_val as *mut _ as *mut c_void);
             }
             const V2B_LDS_BYTES: u32 = Iu4V2Tile::V2b.lds_bytes();
             let bytes = m * (k / 256) * crate::dispatch::MQ4V2_GROUP_BYTES + batch_size * m * 4;
-            let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
-            // Token tile on x, row tile on y.
+            let timer = crate::profile::begin_timer(&self.hip, "gemm", launch_name, bytes);
+            // Token tile on x, row tile on y; the builder ADD folds 2^gshift
+            // row tiles into x (`_add_touch_swz`'s dispatch order).
+            let gshift = match pm { Some((_, s)) => s, None => 0 };
+            let (grid, block) = match pm {
+                Some(_) => ([((batch_size / 256) << gshift) as u32, ((m / 256) >> gshift) as u32, 1], [512, 1, 1]),
+                None => ([(batch_size / 256) as u32, (m / 256) as u32, 1], [32, 16, 1]),
+            };
             let result = self.launch_maybe_blob(
-                kernel_name,
-                [(batch_size / 256) as u32, (m / 256) as u32, 1],
-                [32, 16, 1],
+                launch_name,
+                grid,
+                block,
                 V2B_LDS_BYTES,
                 &mut params,
                 || {
@@ -20604,8 +20666,8 @@ impl Gpu {
                     b.push_i32(m_val);
                     b.push_i32(k_val);
                     b.push_i32(n_val);
-                    if swz_grp > 0 {
-                        b.push_i32(swz_grp);
+                    if let Some(e) = extra {
+                        b.push_i32(e);
                     }
                     b
                 },
@@ -32764,11 +32826,25 @@ impl Gpu {
                 "gemm_mq4g256v2_gate_up_silu_iu4_v2b_gfx11",
             ),
         };
-        if pm {
-            self.ensure_embedded_kernel(module, kernels::GEMM_MQ4G256V2_RESIDUAL_IU4_PM_GFX1100, kernel_name)?;
-        } else {
-            self.ensure_kernel(module, source, kernel_name)?;
-        }
+        // gfx1151: the certified builder twin unless `HIPFIRE_V2B_PM=0`.
+        let v2b_pm = match tile {
+            Iu4V2Tile::V2b => v2b_pm_entry(kernel_name, 0, gate_m, k).map(|(name, _)| name),
+            Iu4V2Tile::V2c => None,
+        };
+        let kernel_name = match v2b_pm {
+            Some(name) => {
+                self.ensure_embedded_kernel(PM_V2B_MODULE, kernels::GEMM_MQ4G256V2_RESIDUAL_IU4_PM_V2B_GFX1151, name)?;
+                name
+            }
+            None if pm => {
+                self.ensure_embedded_kernel(module, kernels::GEMM_MQ4G256V2_RESIDUAL_IU4_PM_GFX1100, kernel_name)?;
+                kernel_name
+            }
+            None => {
+                self.ensure_kernel(module, source, kernel_name)?;
+                kernel_name
+            }
+        };
         let mut g_ptr = a_gate.buf.as_ptr();
         let mut u_ptr = a_up.buf.as_ptr();
         let mut xq_ptr = xq;
@@ -32793,7 +32869,7 @@ impl Gpu {
         let result = self.launch_maybe_blob(
             kernel_name,
             [(batch_size / t) as u32, (2 * gate_m / t) as u32, 1],
-            if pm { [256, 1, 1] } else { [32, tile.waves(), 1] },
+            if pm { [256, 1, 1] } else if v2b_pm.is_some() { [512, 1, 1] } else { [32, tile.waves(), 1] },
             tile.lds_bytes(),
             &mut params,
             || {

@@ -4237,6 +4237,15 @@ pub const GEMM_MQ4G256V2_WMMA_FP8_GFX12_B1: &[u8] =
 /// ef2f779637e797745651630b916858f64d2a006ca86502df2f4c91f417a64d29.
 pub const MQ4V2_FP8_FRAGMENT_REPACK_GFX1201: &[u8] =
     include_bytes!("../../../kernels/mq4v2_fp8_fragment_repack_gfx1201.hsaco");
+/// Certified gfx1151 V2B builder bundle (`hipfire-isa emit --kernel iu4_v2b
+/// --epi all --arch gfx1151`, one contract-checked `peacemaker custom build`
+/// per entry): SET, ADD (residual touch + grouped raster, `GSHIFT`) and the
+/// gate/up SiLU, byte-identical to the hipcc V2B `_set`, `_add_touch(_swz)`
+/// and `gate_up_silu` entries, with every fold op VOPD-paired. Dispatched by
+/// `v2b_pm_entry` (gemm.rs) on gfx1151 only; `HIPFIRE_V2B_PM=0` opts out.
+/// SHA-256 7a884d2a78a90f2b141a56a572e5653b634c87483bcd9f28077878bac421aa6d.
+pub const GEMM_MQ4G256V2_RESIDUAL_IU4_PM_V2B_GFX1151: &[u8] =
+    include_bytes!("../../../kernels/gemm_mq4g256v2_residual_iu4_pm_v2b_gfx1151.hxaco");
 
 
 /// gfx1201 A8 MQ4v2: standalone K128 int8 quantizer and all three GEMM entries.
