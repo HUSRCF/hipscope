@@ -1,7 +1,7 @@
-//! Offline gfx1201 packaged-object census. No GPU, runtime dependency, or ISA-table edits.
-//! Usage: pm-census <registry.tsv> <compiled/gfx1201> <output-dir>
-//!                  <llvm-objdump> <RDNA4-encodings.tsv> <builder-f2.hxaco> <builder-iu4.hxaco>
-//! Generate the TSV from the pinned RDNA4 XML with tools/pm-census-xml.py.
+//! Offline packaged-object census for gfx1100, gfx1151 and gfx1201.
+//! Usage: pm-census <arch> <registry.tsv> <compiled/<arch>> <output-dir>
+//!                  <llvm-objdump> <arch-encodings.tsv> [builder.hxaco ...]
+//! Generate the TSV from the matching pinned MR-ISA XML with tools/pm-census-xml.py.
 //! Matching full XML encoding identifiers and word widths avoids guessing literal forms.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -21,7 +21,20 @@ use peacemaker_lift::{emit, lift_object, LiftError, Options};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-const ARCH: Arch = Arch::Gfx1201;
+fn arch_name(arch: Arch) -> &'static str {
+    match arch {
+        Arch::Gfx1100 => "gfx1100", Arch::Gfx1151 => "gfx1151", Arch::Gfx1201 => "gfx1201",
+        _ => unreachable!("census accepts gfx1100, gfx1151 or gfx1201 only"),
+    }
+}
+fn xml_sha(arch: Arch) -> &'static str {
+    match arch {
+        Arch::Gfx1100 => "6eee5f8737172adf08c0e7d5994ea916e9555b9c23ccb9ec80d9ee38678733b4",
+        Arch::Gfx1151 => "c36b6d79b1e940d74107221c985f5a7fde248025da251d2c6ef756c4cd31391a",
+        Arch::Gfx1201 => "f8a290c8471e26a1071b08b61a33e4d9efa46ec6cedcdb8e5ba57d7969b60692",
+        _ => unreachable!(),
+    }
+}
 
 type Result<T, E = Box<dyn std::error::Error>> = std::result::Result<T, E>;
 
@@ -30,15 +43,15 @@ struct Line { addr: u64, words: Vec<u32>, text: String }
 
 fn hex(bytes: &[u8]) -> String { bytes.iter().map(|byte| format!("{byte:02x}")).collect() }
 
-fn device_elf(bytes: &[u8]) -> Result<&[u8]> {
+fn device_elf(bytes: &[u8], arch: Arch) -> Result<&[u8]> {
     if !Bundle::is_bundle(bytes) { return Ok(bytes); }
     let (bundle, payloads) = Bundle::read(bytes)?;
-    Ok(payloads[bundle.device_entry(ARCH)?])
+    Ok(payloads[bundle.device_entry(arch)?])
 }
 
-fn disassemble(elf: &[u8], objdump: &Path, scratch: &Path) -> Result<Vec<Line>> {
+fn disassemble(elf: &[u8], objdump: &Path, scratch: &Path, arch: Arch) -> Result<Vec<Line>> {
     fs::write(scratch, elf)?;
-    let result = Command::new(objdump).args(["--mcpu=gfx1201", "-d"]).arg(scratch).output()?;
+    let result = Command::new(objdump).arg(format!("--mcpu={}", arch_name(arch))).arg("-d").arg(scratch).output()?;
     fs::remove_file(scratch)?;
     if !result.status.success() { return Err(format!("llvm-objdump: {}", String::from_utf8_lossy(&result.stderr)).into()); }
     let stdout = String::from_utf8(result.stdout)?;
@@ -55,19 +68,19 @@ fn disassemble(elf: &[u8], objdump: &Path, scratch: &Path) -> Result<Vec<Line>> 
     Ok(lines)
 }
 
-const XML_SHA: &str = "f8a290c8471e26a1071b08b61a33e4d9efa46ec6cedcdb8e5ba57d7969b60692";
+// Pinned per-target XML digests are checked by `xml_sha`.
 
 struct XmlRow { encoding: String, opcode: String, bits: usize, mask: u128, ids: Vec<u128> }
 type XmlTable = BTreeMap<String, Vec<XmlRow>>;
 
-fn xml_table(path: &Path) -> Result<XmlTable> {
+fn xml_table(path: &Path, arch: Arch) -> Result<XmlTable> {
     let contents = fs::read_to_string(path)?;
     let mut lines = contents.lines();
-    if lines.next() != Some(format!("# xml_sha256={XML_SHA}").as_str()) {
-        return Err(format!("{} is not exported from pinned RDNA4 XML", path.display()).into());
+    if lines.next() != Some(format!("# xml_sha256={}", xml_sha(arch)).as_str()) {
+        return Err(format!("{} is not exported from pinned {} XML", path.display(), arch_name(arch)).into());
     }
     if lines.next() != Some("encoding\topcode\tbits\tspelling\tid_mask\tids") {
-        return Err("invalid RDNA4 XML encoding-table header".into());
+        return Err("invalid MR-ISA XML encoding-table header".into());
     }
     let mut table: XmlTable = BTreeMap::new();
     for (line_no, line) in lines.enumerate() {
@@ -128,7 +141,7 @@ fn kernel_facts(kernel: &Kernel, program: &peacemaker_ir::inst::Program) -> Resu
     let lds_unknown = lds.accesses.iter().filter(|(access, _)| matches!(access.addr, AddrFact::Unknown)).count();
     let lds_unbounded = lds.accesses.iter().filter(|(access, _)| matches!(access.addr, AddrFact::Bounded { hi: u32::MAX, .. })).count();
     let windows = windows::check_windows(&kernel.body)?;
-    let pairings = barriers::analyze(&kernel.body, ARCH)?;
+    let pairings = barriers::analyze(&kernel.body, program.target.arch)?;
     let ambiguous = windows.delays.iter().filter(|delay| delay.is_ambiguous()).count();
     Ok(json!({
         "symbol": kernel.symbol.0, "instructions": kernel.body.layout.len(),
@@ -148,19 +161,21 @@ fn kernel_facts(kernel: &Kernel, program: &peacemaker_ir::inst::Program) -> Resu
 }
 
 fn scan_module(name: &str, path: &Path, indexed: bool, objdump: &Path, scratch: &Path,
-    xml: &XmlTable, unknowns: &mut BTreeMap<String, Value>) -> Result<Value> {
+    xml: &XmlTable, unknowns: &mut BTreeMap<String, Value>, arch: Arch) -> Result<Value> {
     let input = fs::read(path)?;
     let sha = hex(&Sha256::digest(&input));
+    let mut packaging_index = None;
     let indexed_symbols = if indexed {
         let index: Value = serde_json::from_slice(&fs::read(path.with_extension("index.json"))?)?;
-        if index["module"] != name || index["arch"] != "gfx1201" || index["object_sha256"] != sha {
+        if index["module"] != name || index["arch"] != arch_name(arch) || index["object_sha256"] != sha {
             return Err(format!("{}: packaging index does not match module, arch, or SHA", path.display()).into());
         }
+        packaging_index = Some(index.clone());
         Some(index["symbols"].as_array().ok_or("index symbols are not an array")?
             .iter().map(|v| v.as_str().ok_or("index symbol is not a string").map(str::to_owned))
             .collect::<std::result::Result<BTreeSet<_>, _>>()?)
     } else { None };
-    let elf = device_elf(&input)?;
+    let elf = device_elf(&input, arch)?;
     let (_, images) = peacemaker_ir::envelope::Envelope::read(elf)?;
     let actual = images.iter().map(|image| image.name.clone()).collect::<BTreeSet<_>>();
     if let Some(expected) = &indexed_symbols {
@@ -169,7 +184,7 @@ fn scan_module(name: &str, path: &Path, indexed: bool, objdump: &Path, scratch: 
         }
     }
     let unindexed_elf_symbols = actual.difference(indexed_symbols.as_ref().unwrap_or(&actual)).cloned().collect::<Vec<_>>();
-    let lines = disassemble(elf, objdump, scratch)?;
+    let lines = disassemble(elf, objdump, scratch, arch)?;
     let mut kernel_lines = BTreeMap::new();
     let mut spellings = BTreeMap::<String, usize>::new();
     let mut missing_lines = Vec::new();
@@ -190,12 +205,17 @@ fn scan_module(name: &str, path: &Path, indexed: bool, objdump: &Path, scratch: 
         for line in &these {
             let spelling = line.text.split_whitespace().next().unwrap_or("<no-spelling>").to_owned();
             *spellings.entry(spelling.clone()).or_default() += 1;
-            let decoded = gfx12::decode(&line.words);
+            let decoded = gfx12::decode_for(arch, &line.words);
             if let Ok((inst, n)) = &decoded {
                 if *n == line.words.len() {
                     checked_instructions += 1;
-                    let decoded_name = peacemaker_ir::isa::lookup(ARCH, inst.op, inst.form).map(|row| row.name);
-                    if decoded_name != Some(spelling.as_str()) {
+                    let decoded_name = peacemaker_ir::isa::lookup(arch, inst.op, inst.form).map(|row| row.name);
+                    // gfx11 objdump can elide the optional e64 spelling on a VOP3,
+                    // but the form and full instruction words must still agree.
+                    let rendered_matches = decoded_name == Some(spelling.as_str()) ||
+                        (arch != Arch::Gfx1201 && inst.form == peacemaker_ir::inst::Form::Vop3 &&
+                         decoded_name.and_then(|name| name.strip_suffix("_e64")) == Some(spelling.as_str()));
+                    if !rendered_matches {
                         opcode_disagreements.push(format!("{} at {:#x}: codec {} vs llvm {}",
                             image.name, line.addr, decoded_name.unwrap_or("<unknown>"), spelling));
                     }
@@ -206,7 +226,7 @@ fn scan_module(name: &str, path: &Path, indexed: bool, objdump: &Path, scratch: 
                 let key = format!("{}@{}", spelling, xml_rows.join(","));
                 let entry = unknowns.entry(key).or_insert_with(|| json!({
                     "spelling": spelling, "form": xml_rows.iter().map(|s| s.split(':').next().unwrap()).collect::<Vec<_>>(),
-                    "xml_opcode": xml_rows, "table_has_spelling": peacemaker_ir::isa::gfx12().iter().any(|row| row.name == spelling),
+                    "xml_opcode": xml_rows, "table_has_spelling": peacemaker_ir::isa::table(arch).iter().any(|row| row.name == spelling),
                     "occurrences": 0, "modules": BTreeMap::<String, usize>::new(),
                     "sample": {"module": name, "kernel": image.name, "offset": format!("{:#x}", line.addr), "words": line.words.iter().map(|w| format!("0x{w:08x}")).collect::<Vec<_>>(), "text": line.text},
                     "decode_reason": decoded.err().map(|e| e.to_string())
@@ -234,12 +254,12 @@ fn scan_module(name: &str, path: &Path, indexed: bool, objdump: &Path, scratch: 
             for kernel in &lifted.program.kernels {
                 let these = &kernel_lines[&kernel.symbol.0];
                 let emitted = emit::insts(kernel)?;
-                let texts = emit::text(kernel, ARCH)?;
+                let texts = emit::text(kernel, arch)?;
                 if these.len() != emitted.len() {
                     word_boundary_mismatches.push(format!("{}: {} objdump vs {} codec instructions", kernel.symbol.0, these.len(), emitted.len()));
                 }
                 for (inst, (text, line)) in emitted.iter().zip(texts.iter().zip(these)) {
-                    let words = gfx12::encode(inst)?;
+                    let words = gfx12::encode_for(arch, inst)?;
                     if inst.prov.pc.map(u64::from) != Some(line.addr) || words.as_slice() != line.words {
                         word_boundary_mismatches.push(format!("{} at {:#x}: codec pc {:?} words {:?}, llvm words {:?}",
                             kernel.symbol.0, line.addr, inst.prov.pc, words, line.words));
@@ -262,6 +282,7 @@ fn scan_module(name: &str, path: &Path, indexed: bool, objdump: &Path, scratch: 
     } else { "agrees" };
     Ok(json!({"module": name, "kind": if indexed {"indexed"} else {"builder"},
         "path": path.display().to_string(), "sha256": sha,
+        "packaging_index": packaging_index,
         "symbols": images.iter().map(|image| image.name.clone()).collect::<Vec<_>>(),
         "indexed_symbols": indexed_symbols, "unindexed_elf_symbols": unindexed_elf_symbols,
         "objdump_instructions": kernel_lines.values().map(Vec::len).sum::<usize>(),
@@ -271,7 +292,7 @@ fn scan_module(name: &str, path: &Path, indexed: bool, objdump: &Path, scratch: 
         "objdump_text_differences": text_differences, "objdump_semantic_agreement": semantic_agreement}))
 }
 
-fn report(modules: &[Value], unknowns: &BTreeMap<String, Value>, provenance: Value, out: &Path) -> Result<()> {
+fn report(modules: &[Value], unknowns: &BTreeMap<String, Value>, provenance: Value, out: &Path, arch: Arch) -> Result<()> {
     let mut rejected = BTreeMap::<String, usize>::new();
     let mut rejected_rules = BTreeMap::<String, usize>::new();
     let mut obligations = BTreeMap::<String, usize>::new();
@@ -305,13 +326,13 @@ fn report(modules: &[Value], unknowns: &BTreeMap<String, Value>, provenance: Val
         "unknown_encoding_spellings": unknowns.values().map(|v| v["spelling"].as_str().unwrap()).collect::<BTreeSet<_>>().len(),
         "unknown_encoding_rows": unknowns.len(),
         "unknown_encoding_occurrences": unknowns.values().map(|v| v["occurrences"].as_u64().unwrap()).sum::<u64>()});
-    let record = json!({"schema": 1, "arch": "gfx1201", "provenance": provenance, "totals": totals, "modules": modules, "unknown_encodings": unknowns.values().collect::<Vec<_>>()});
+    let record = json!({"schema": 1, "arch": arch_name(arch), "provenance": provenance, "totals": totals, "modules": modules, "unknown_encodings": unknowns.values().collect::<Vec<_>>()});
     fs::write(out.join("census.json"), serde_json::to_vec_pretty(&record)?)?;
-    let mut md = String::from("# gfx1201 shipped-kernel census\n\nOffline compiler/encoder inspection only; neither strict certification nor GPU/admission evidence. `census.json` holds every symbol, spelling, offset, obligation, and diagnostic.\n\n");
-    md.push_str("## Inputs and method\n\n93 indexed objects were generated from the exact Rust registry exporter, followed by `hipfire-kernel-pack --arch gfx1201 --registry registry.tsv --output .../compiled/gfx1201 --extra-flags '-DIU4_A4_CANDIDATES=2'` with `ROCM_PATH=/opt/rocm/core-10.0`. Builder F2 and IU4 `_b1` `.hxaco` bundles are separate inputs. Registry and index symbol sets / object SHAs were verified. The emitter re-encodes typed fields. Rejected modules have no analyzed kernel or round-trip proof; independent LLVM disassembly still inventories their entire kernel ranges. Exact per-kernel results and input/tool hashes are in JSON. XML encoding names/opcodes come from an exhaustive XML export checked against the pinned RDNA4 XML SHA-256 `f8a290c8471e26a1071b08b61a33e4d9efa46ec6cedcdb8e5ba57d7969b60692`; sample instruction words are matched to XML encoding bit-width and identifier fields, not inferred from mnemonic alone.\n\n");
+    let mut md = format!("# {} shipped-kernel census\n\nOffline compiler/encoder inspection only; neither strict certification nor GPU/admission evidence. `census.json` holds every symbol, spelling, offset, obligation, and diagnostic.\n\n", arch_name(arch));
+    md.push_str(&format!("## Inputs and method\n\n{indexed} indexed objects were generated from the exact Rust registry exporter and `hipfire-kernel-pack --arch {} --registry registry.tsv --output .../compiled/{} --extra-flags '-DIU4_A4_CANDIDATES=2'` with `ROCM_PATH=/opt/rocm/core-10.0`. {} builder bundles were included. Registry and index symbol sets / object SHAs were verified. The emitter re-encodes typed fields. Rejected modules have no analyzed kernel or round-trip proof; independent LLVM disassembly still inventories their entire kernel ranges. Exact per-kernel results and input/tool hashes are in JSON. XML encoding names/opcodes come from the matching pinned MR-ISA XML SHA-256 `{}`; sample instruction words are matched to XML encoding bit-width and identifier fields, not inferred from mnemonic alone.\n\n", arch_name(arch), arch_name(arch), modules.len()-indexed, xml_sha(arch)));
     md.push_str(&format!("## Totals\n\nIndexed: {indexed}; builder: {}; lifted with byte-identical emit: {clean}/{}; rejected modules: {}; analyzed kernels: {analyzed}; objdump opcode disagreements: {opcode_disagreements}, word/boundary disagreements on lifted modules: {word_disagreements}, text differences on lifted modules: {text_differences}; unsupported codec encoding rows: {}, unique spellings: {}; occurrences: {}. Text differences do **not** establish semantic inequality (builder bundles contain VMEM `offen`/`offset` ordering and `m0`/`null` rendering differences); semantic agreement remains unproven where text differs or lifting rejects.\n\n", modules.len()-indexed, modules.len(), modules.len()-clean, unknowns.len(), totals["unknown_encoding_spellings"], totals["unknown_encoding_occurrences"]));
     let indexed_clean = modules.iter().filter(|m| m["kind"] == "indexed" && m["lifted_roundtrip"] == true).count();
-    md.push_str(&format!("**M6 result: {}.** {indexed_clean}/{indexed} indexed modules and {}/{} builder bundles produce a byte-identical lift/emit; {} modules reject (listed above). These are diagnostic compiler/encoder receipts only: no strict receipt is issued for the indexed set, no candidate is promoted, and packaging/admission policy stays **off** by default.\n\n",
+    md.push_str(&format!("**M7 result: {}.** {indexed_clean}/{indexed} indexed modules and {}/{} builder bundles produce a byte-identical lift/emit; {} modules reject (listed above). These are diagnostic compiler/encoder receipts only: no strict receipt is issued for the indexed set, no candidate is promoted, and packaging/admission policy stays **off** by default.\n\n",
         if clean == modules.len() { "every object round-trips" } else { "fail closed" },
         clean - indexed_clean, modules.len() - indexed, modules.len() - clean));
     md.push_str("### Rejections by rule\n\n| Rule | Count |\n|---|---:|\n");
@@ -334,7 +355,7 @@ fn report(modules: &[Value], unknowns: &BTreeMap<String, Value>, provenance: Val
         let obs = kernels.iter().map(|k| k["obligation_details"].as_array().unwrap().len()).sum::<usize>();
         md.push_str(&format!("| {} | {} | {} | {} | {} | {obs} | {} | {} | {} | {} | {} | {} | {} / {} |\n", module["module"].as_str().unwrap(), module["symbols"].as_array().unwrap().len(), module["objdump_instructions"], module["lifted_roundtrip"], issue.replace('|', "\\|"), resources.0, resources.1, resources.2, count("barriers", "paired_signals"), count("windows", "ambiguous_delays"), kernels.iter().map(|k| k["hazards"].as_u64().unwrap_or(0)).sum::<u64>(), module["objdump_semantic_agreement"].as_str().unwrap(), module["objdump_text_differences"].as_array().unwrap().len()));
     }
-    md.push_str("\n## Unsupported codec encodings\n\nThe `form` and `XML opcode` entries are pinned RDNA4 XML encoding names/opcodes; `table_has_spelling` in JSON separates a missing row from an unsupported field/variant of an existing row. Every listed sample has the full LLVM instruction words.\n\n| Spelling | Occurrences | Modules | Form | XML opcode | Sample words |\n|---|---:|---:|---|---|---|\n");
+    md.push_str("\n## Unsupported codec encodings\n\nThe `form` and `XML opcode` entries are pinned MR-ISA XML encoding names/opcodes; `table_has_spelling` in JSON separates a missing row from an unsupported field/variant of an existing row. Every listed sample has the full LLVM instruction words.\n\n| Spelling | Occurrences | Modules | Form | XML opcode | Sample words |\n|---|---:|---:|---|---|---|\n");
     for value in unknowns.values() {
         let strings = |key: &str| value[key].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect::<Vec<_>>().join(", ");
         let sample = value["sample"]["words"].as_array().unwrap().iter().map(|w| w.as_str().unwrap()).collect::<Vec<_>>().join(" ");
@@ -346,15 +367,19 @@ fn report(modules: &[Value], unknowns: &BTreeMap<String, Value>, provenance: Val
 
 fn run() -> Result<()> {
     let args = std::env::args_os().skip(1).map(PathBuf::from).collect::<Vec<_>>();
-    let [registry, compiled, output, objdump, xml_tsv, f2, iu4] = args.as_slice() else {
-        return Err("usage: pm-census <registry.tsv> <compiled/gfx1201> <output-dir> <llvm-objdump> <RDNA4-encodings.tsv> <builder-f2.hxaco> <builder-iu4.hxaco>".into());
+    let [arch_arg, registry, compiled, output, objdump, xml_tsv, builders @ ..] = args.as_slice() else {
+        return Err("usage: pm-census <gfx1100|gfx1151|gfx1201> <registry.tsv> <compiled/arch> <output-dir> <llvm-objdump> <arch-encodings.tsv> [builder.hxaco ...]".into());
+    };
+    let arch = match arch_arg.to_str() {
+        Some("gfx1100") => Arch::Gfx1100, Some("gfx1151") => Arch::Gfx1151,
+        Some("gfx1201") => Arch::Gfx1201, _ => return Err("unsupported census architecture".into()),
     };
     fs::create_dir_all(output)?;
-    let xml = xml_table(xml_tsv)?;
+    let xml = xml_table(xml_tsv, arch)?;
     let mut names = BTreeSet::new();
     for row in fs::read_to_string(registry)?.lines() {
         let cols = row.split('\t').collect::<Vec<_>>();
-        if cols.len() != 6 || cols[0] != "gfx1201" { return Err(format!("invalid registry row: {row}").into()); }
+        if cols.len() != 6 || cols[0] != arch_name(arch) { return Err(format!("invalid registry row: {row}").into()); }
         if !names.insert(cols[1].to_owned()) { return Err(format!("duplicate registry module {}", cols[1]).into()); }
     }
     let objects = fs::read_dir(compiled)?.map(|entry| entry.map(|e| e.path())).collect::<std::io::Result<Vec<_>>>()?
@@ -366,19 +391,20 @@ fn run() -> Result<()> {
     let mut modules = Vec::new();
     for name in names {
         eprintln!("census {name}");
-        modules.push(scan_module(&name, &compiled.join(format!("{name}.hsaco")), true, objdump, &scratch, &xml, &mut unknowns)?);
+        modules.push(scan_module(&name, &compiled.join(format!("{name}.hsaco")), true, objdump, &scratch, &xml, &mut unknowns, arch)?);
     }
-    for (name, path) in [("builder_f2", f2), ("builder_iu4_b1", iu4)] {
+    for path in builders {
+        let name = path.file_stem().ok_or("builder object has no stem")?.to_string_lossy();
         eprintln!("census {name}");
-        modules.push(scan_module(name, path, false, objdump, &scratch, &xml, &mut unknowns)?);
+        modules.push(scan_module(&name, path, false, objdump, &scratch, &xml, &mut unknowns, arch)?);
     }
     let provenance = json!({
         "registry_sha256": hex(&Sha256::digest(&fs::read(registry)?)),
         "xml_encoding_tsv_sha256": hex(&Sha256::digest(&fs::read(xml_tsv)?)),
         "llvm_objdump_sha256": hex(&Sha256::digest(&fs::read(objdump)?)),
-        "rocm": "/opt/rocm/core-10.0", "xml_sha256": XML_SHA
+        "rocm": "/opt/rocm/core-10.0", "xml_sha256": xml_sha(arch)
     });
-    report(&modules, &unknowns, provenance, output)?;
+    report(&modules, &unknowns, provenance, output, arch)?;
     eprintln!("wrote {} and {}", output.join("census.json").display(), output.join("census.md").display());
     Ok(())
 }

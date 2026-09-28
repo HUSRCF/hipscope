@@ -383,7 +383,7 @@ impl Analyzed<Program> {
             offset += 4 * passes::cfg::dwords_of(low) as u32;
             let inst = body.insts.get(id).expect("laid out");
             if matches!(inst.effects.control, Control::Branch { .. } | Control::Jump) {
-                if let (Some(bytes), Ok(words)) = (inst.prov.bytes, crate::codec::gfx12::encode(low)) {
+                if let (Some(bytes), Ok(words)) = (inst.prov.bytes, crate::codec::gfx12::encode_for(program.target.arch, low)) {
                     if words.first() != Some(&bytes[0]) { reencoded_branches.push(id); }
                 }
             }
@@ -458,12 +458,12 @@ pub fn lower_labels(body: &Body) -> Result<Vec<Inst>, EditError> {
 }
 
 /// Encode a kernel body (labels lowered from its current layout) with the
-/// gfx1201 codec. Never reads `prov.bytes`.
+/// selected target codec. Never reads `prov.bytes`.
 pub fn encode_stream(body: &Body, arch: Arch) -> Result<Vec<u32>, EditError> {
-    if arch != Arch::Gfx1201 { return Err(EditError::Unsupported(format!("no codec for {arch:?}"))); }
+    if !matches!(arch, Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1201) { return Err(EditError::Unsupported(format!("no codec for {arch:?}"))); }
     let mut words = Vec::new();
     for (inst, &id) in lower_labels(body)?.iter().zip(&body.layout) {
-        words.extend(crate::codec::gfx12::encode(inst).map_err(|e| EditError::Encode { inst: id, reason: e.to_string() })?);
+        words.extend(crate::codec::gfx12::encode_for(arch, inst).map_err(|e| EditError::Encode { inst: id, reason: e.to_string() })?);
     }
     Ok(words)
 }
@@ -703,9 +703,9 @@ fn partial_undefined(arch: Arch, inst: &Inst, missing: &Bits) -> Bits {
 }
 
 
-/// gfx12 ABI entry table (core.md §6.2): the only locations defined at entry.
+/// HSA ABI entry table (core.md §6.2): the only locations defined at entry.
 fn entry_seed(kern: &Kernel, arch: Arch) -> Result<Bits, EditError> {
-    if arch != Arch::Gfx1201 { return Err(EditError::Unsupported(format!("no ABI entry table for {arch:?}"))); }
+    if !matches!(arch, Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1201) { return Err(EditError::Unsupported(format!("no ABI entry table for {arch:?}"))); }
     let mut seed = Bits::default();
     let (user, wg_x, wg_yz) = match &kern.abi {
         Abi::Hsa { descriptor, .. } => {
@@ -1211,7 +1211,7 @@ impl Tx {
         if derived.effects != inst.effects { return Err(bad("effects are not the table-derived effects".into())); }
         let mut probe = derived.clone();
         for op in probe.operands.iter_mut() { if matches!(op, Operand::Label(_)) { *op = Operand::Imm(ImmField::Sopp(0)); } }
-        if self.arch == Arch::Gfx1201 { crate::codec::gfx12::encode(&probe).map_err(|e| bad(format!("not encodable: {e}")))?; }
+        crate::codec::gfx12::encode_for(self.arch, &probe).map_err(|e| bad(format!("not encodable: {e}")))?;
         let mut out = derived;
         out.prov = Provenance { source: Source::Edit(self.id), pc: None, bytes: None, line: inst.prov.line, edit: Some(self.id) };
         Ok(out)
@@ -1736,7 +1736,7 @@ impl Tx {
             if checked {
                 let mut probe = rebuilt.clone();
                 for op in probe.operands.iter_mut() { if matches!(op, Operand::Label(_)) { *op = Operand::Imm(ImmField::Sopp(0)); } }
-                crate::codec::gfx12::encode(&probe).map_err(|e| bad(format!("{id:?} not encodable: {e}")))?;
+                crate::codec::gfx12::encode_for(self.arch, &probe).map_err(|e| bad(format!("{id:?} not encodable: {e}")))?;
                 if vopd_banks_ok(&inst) && !vopd_banks_ok(&rebuilt) { return Err(bad(format!("{id:?} breaks the VOPD bank rule"))); }
             }
             let acc = access(self.arch, self.wave(), &rebuilt)?;

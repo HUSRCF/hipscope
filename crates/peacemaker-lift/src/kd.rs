@@ -22,6 +22,9 @@ const KCP_USES_DYNAMIC_STACK: u16 = 1 << 11;
 /// GFX120* rsrc1 bits that must be 0: SGPR granule (9:6, reserved on GFX10–12), PRIORITY
 /// (11:10), PRIV (20), DEBUG_MODE (22), DISABLE_PERF (23), BULKY (24), CDBG_USER (25), 27, 28.
 pub const GFX120_RSRC1_MUST_BE_ZERO: u32 = 0x1bd0_0fc0;
+/// GFX11 bit 23 is ENABLE_IEEE_MODE rather than reserved DISABLE_PERF.
+/// LLVM AMDGPUUsage.rst compute_pgm_rsrc1-gfx6-gfx12-table, bit 23.
+pub const GFX11_RSRC1_MUST_BE_ZERO: u32 = GFX120_RSRC1_MUST_BE_ZERO & !(1 << 23);
 /// GFX120* rsrc2 bit 6 is ENABLE_DYNAMIC_VGPR (the trap-handler bit on GFX6–11).
 pub const GFX120_RSRC2_DYNAMIC_VGPR: u32 = 1 << 6;
 /// rsrc2 23:15 GRANULATED_LDS_SIZE: CP takes LDS from the dispatch packet; must be 0.
@@ -31,6 +34,10 @@ pub const RSRC2_MUST_BE_ZERO: u32 = (1 << 13) | (1 << 14) | (1 << 31);
 /// GFX120* rsrc3: everything but INST_PREF_SIZE (11:4), GLG_EN (13) and IMAGE_OP (31) is
 /// reserved; this includes bit 17 (ENABLE_DYNAMIC_VGPR only on GFX125*).
 pub const GFX120_RSRC3_MUST_BE_ZERO: u32 = 0x7fff_d00f;
+/// LLVM AMDGPUUsage.rst compute_pgm_rsrc3-gfx10-gfx11: shared VGPRs [3:0],
+/// gfx11 prefetch [9:4], traps [11:10] must be zero, bits [30:12] reserved,
+/// and IMAGE_OP [31] must be zero for compute.
+pub const GFX11_RSRC3_MUST_BE_ZERO: u32 = 0xffff_fc00;
 
 /// Byte codec for the kernel descriptor, so callers can write `KernelDescriptor::from_bytes`.
 pub trait DescriptorCodec: Sized {
@@ -107,14 +114,14 @@ pub enum DescriptorReject {
     ArchitectedFlatScratch(&'static str),
     #[error("GRANULATED_LDS_SIZE is {0}; it must be 0 (LDS comes from the dispatch packet)")]
     LdsGranule(u32),
-    #[error("descriptor validity is only tabulated for gfx1201 in M1, not {0:?}")]
+    #[error("descriptor validity is not tabulated for {0:?}")]
     UnsupportedArch(Arch),
 }
 
-/// Applies the core.md §5.2 descriptor rejects for `arch` (validity per subfamily; M1
-/// tabulates GFX120* only). Every bit it accepts is kept exactly as encoded.
+/// Applies LLVM's per-architecture kernel-descriptor tables (AMDGPUUsage.rst,
+/// compute_pgm_rsrc3-gfx10-gfx11 and compute_pgm_rsrc3-gfx12).
 pub fn validate(kd: &KernelDescriptor, arch: Arch) -> Result<(), DescriptorReject> {
-    if arch != Arch::Gfx1201 {
+    if !matches!(arch, Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1201) {
         return Err(DescriptorReject::UnsupportedArch(arch));
     }
     let reserved_bytes = RESERVED.iter().flat_map(|&(lo, hi)| lo..hi).zip(kd.reserved);
@@ -136,7 +143,8 @@ pub fn validate(kd: &KernelDescriptor, arch: Arch) -> Result<(), DescriptorRejec
     // The KD table defines KERNARG_PRELOAD only for GFX90A/GFX942; GFX12 has no row, so a
     // nonzero value would ask CP for preloaded SGPRs it does not provide.
     reserved("kernarg_preload", u32::from(kd.kernarg_preload.0))?;
-    reserved("compute_pgm_rsrc1", kd.compute_pgm_rsrc1.0 & GFX120_RSRC1_MUST_BE_ZERO)?;
+    reserved("compute_pgm_rsrc1", kd.compute_pgm_rsrc1.0 &
+        if arch == Arch::Gfx1201 { GFX120_RSRC1_MUST_BE_ZERO } else { GFX11_RSRC1_MUST_BE_ZERO })?;
     let rsrc2 = kd.compute_pgm_rsrc2.0;
     if rsrc2 & GFX120_RSRC2_DYNAMIC_VGPR != 0 {
         return Err(DescriptorError::DynamicVgpr.into());
@@ -145,7 +153,10 @@ pub fn validate(kd: &KernelDescriptor, arch: Arch) -> Result<(), DescriptorRejec
         return Err(DescriptorReject::LdsGranule((rsrc2 & RSRC2_LDS_SIZE) >> 15));
     }
     reserved("compute_pgm_rsrc2", rsrc2 & RSRC2_MUST_BE_ZERO)?;
-    reserved("compute_pgm_rsrc3", kd.compute_pgm_rsrc3.0 & GFX120_RSRC3_MUST_BE_ZERO)?;
+    let rsrc3 = kd.compute_pgm_rsrc3.0;
+    let mask = if arch == Arch::Gfx1201 { GFX120_RSRC3_MUST_BE_ZERO }
+        else { GFX11_RSRC3_MUST_BE_ZERO | if kd.kernel_code_properties.wave32() { 0xf } else { 0 } };
+    reserved("compute_pgm_rsrc3", rsrc3 & mask)?;
     Ok(())
 }
 

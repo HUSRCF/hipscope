@@ -1,4 +1,4 @@
-//! gfx1201 opcode/encoding rows. All source text is compiled into the IR crate.
+//! Per-target opcode/encoding rows. Tables are backed by AMD XML and pinned LLVM samples.
 use std::sync::LazyLock;
 use crate::inst::{Arch, Family, Form, Opcode, VmemForm};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -44,8 +44,11 @@ fn family(form: Form) -> Family {
 }
 /// Tab-separated: `name form opcode grammar defs uses implicit counter sample words field-rules`.
 pub fn parse_gfx12() -> Result<Vec<OpRow>, TableError> {
+    parse(include_str!("../isa/gfx12.tbl"))
+}
+fn parse(contents: &'static str) -> Result<Vec<OpRow>, TableError> {
     let mut rows = Vec::new();
-    for (index, line) in include_str!("../isa/gfx12.tbl").lines().enumerate() {
+    for (index, line) in contents.lines().enumerate() {
         if line.is_empty() || line.starts_with('#') { continue; }
         let fields: Vec<_> = line.split('\t').collect();
         let fail = |reason: &str| TableError::Malformed { line: index + 1, reason: reason.into() };
@@ -77,11 +80,31 @@ pub fn gfx12() -> &'static [OpRow] {
     static TABLE: LazyLock<Vec<OpRow>> = LazyLock::new(|| parse_gfx12().expect("shipped gfx12 table must parse"));
     &TABLE
 }
+pub fn gfx1100() -> &'static [OpRow] {
+    static TABLE: LazyLock<Vec<OpRow>> = LazyLock::new(|| parse(include_str!("../isa/gfx1100.tbl")).expect("shipped gfx1100 table must parse"));
+    &TABLE
+}
+pub fn gfx1151() -> &'static [OpRow] {
+    static TABLE: LazyLock<Vec<OpRow>> = LazyLock::new(|| {
+        let mut rows = gfx1100().to_vec();
+        for delta in parse(include_str!("../isa/gfx1151.tbl")).expect("shipped gfx1151 deltas must parse") {
+            if let Some(old) = rows.iter_mut().find(|row| row.op == delta.op && row.form == delta.form) {
+                *old = delta;
+            } else { rows.push(delta); }
+        }
+        rows
+    });
+    &TABLE
+}
+pub fn table(arch: Arch) -> &'static [OpRow] {
+    match arch {
+        Arch::Gfx1100 => gfx1100(), Arch::Gfx1151 => gfx1151(),
+        Arch::Gfx1201 => gfx12(), Arch::Gfx1010 | Arch::Gfx1030 => &[],
+    }
+}
 pub fn lookup(arch: Arch, opcode: Opcode, form: Form) -> Option<&'static OpRow> {
-    if arch != Arch::Gfx1201 { return None; }
-    gfx12().iter().find(|row| row.op == opcode && row.form == form)
+    table(arch).iter().find(|row| row.op == opcode && row.form == form)
 }
 pub fn lookup_opcode(arch: Arch, opcode: Opcode) -> Option<&'static OpRow> {
-    if arch != Arch::Gfx1201 { return None; }
-    gfx12().iter().find(|row| row.op == opcode)
+    table(arch).iter().find(|row| row.op == opcode)
 }

@@ -1,5 +1,5 @@
 //! RDNA4 encoding layouts (AMD RDNA4 MR-ISA XML, ENC_* bitmaps).
-use crate::inst::{Form, VmemForm};
+use crate::inst::{Arch, Form, VmemForm};
 
 #[derive(Clone, Copy)]
 pub(super) struct Field { pub name: &'static str, pub bit: u8, pub width: u8 }
@@ -51,6 +51,11 @@ pub(super) fn layout(form: Form) -> &'static [Field] {
 pub(super) fn field(form: Form, name: &str) -> Option<Field> {
     layout(form).iter().copied().find(|f| f.name == name)
 }
+pub(super) fn field_for(arch: Arch, form: Form, name: &str) -> Option<Field> {
+    if matches!(arch, Arch::Gfx1100 | Arch::Gfx1151) {
+        super::forms_gfx11::field(form, name)
+    } else { field(form, name) }
+}
 pub(super) fn opcode(form: Form) -> Option<Field> {
     Some(match form {
         Form::Sop1 => f!("OP",8,8), Form::Sop2 => f!("OP",23,7),
@@ -62,6 +67,11 @@ pub(super) fn opcode(form: Form) -> Option<Field> {
         Form::Vmem(VmemForm::Global | VmemForm::Buffer | VmemForm::Scratch) => f!("OP",14,8),
         _ => return None,
     })
+}
+pub(super) fn opcode_for(arch: Arch, form: Form) -> Option<Field> {
+    if matches!(arch, Arch::Gfx1100 | Arch::Gfx1151) {
+        super::forms_gfx11::opcode(form)
+    } else { opcode(form) }
 }
 pub(super) fn prefix(form: Form) -> Option<(u32,u32)> {
     Some(match form {
@@ -75,4 +85,9 @@ pub(super) fn prefix(form: Form) -> Option<(u32,u32)> {
         Form::Vmem(VmemForm::Buffer) => (0xfc00_0000,0xc400_0000),
         Form::Vmem(VmemForm::Scratch) => (0xff00_0000,0xed00_0000), _ => return None,
     })
+}
+pub(super) fn prefix_for(arch: Arch, form: Form) -> Option<(u32,u32)> {
+    if matches!(arch, Arch::Gfx1100 | Arch::Gfx1151) {
+        super::forms_gfx11::prefix(form)
+    } else { prefix(form) }
 }

@@ -18,7 +18,7 @@ pub mod rewrite;
 pub mod text;
 
 use peacemaker_ir::cfg::{BlockId, Body};
-use peacemaker_ir::codec::gfx12;
+use peacemaker_ir::codec::{gfx11, gfx12};
 use peacemaker_ir::envelope::{Bundle, KernelSlot, Source};
 use peacemaker_ir::inst::{Abi, Arch, Frontend, Kernel, KernelOrigin, Program, Setting, SymbolId, Target, Wave};
 use peacemaker_ir::operand::Operand;
@@ -44,9 +44,8 @@ pub enum Rule {
     Envelope,
     /// Target outside the supported set, ABI below code object v4, or no opcode table yet.
     UnsupportedArch,
-    /// Words the gfx1201 table does not declare: unknown opcode (e.g. `s_waitcnt`,
-    /// `s_setpc_b64`), unknown bits, a don't-care outside the benign list, or an
-    /// instruction crossing the symbol end.
+    /// Words the target table does not declare: unknown opcode, unknown bits,
+    /// a don't-care outside the benign list, or an instruction crossing the symbol end.
     Decode,
     /// Typed fields do not re-encode to the input words.
     StreamIdentity,
@@ -177,8 +176,8 @@ pub fn lift_object(bytes: &[u8], options: Options) -> Result<Lifted<Program>, Li
     let arch = input_arch(bytes)?;
     let (source, images) = Source::read(bytes, arch).map_err(|e| module_error(Rule::Envelope, e))?;
     let target = target_of(&source, arch)?;
-    if arch != Arch::Gfx1201 {
-        return Err(module_error(Rule::UnsupportedArch, format!("{arch:?} has no opcode table in M1")));
+    if !matches!(arch, Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1201) {
+        return Err(module_error(Rule::UnsupportedArch, format!("{arch:?} has no opcode table")));
     }
     let object_sha = sha256(device_elf(bytes, &source, arch)?);
     if images.len() != source.elf.kernels.len() {
@@ -188,7 +187,7 @@ pub fn lift_object(bytes: &[u8], options: Options) -> Result<Lifted<Program>, Li
     let mut streams = Vec::with_capacity(images.len());
     for (image, slot) in images.iter().zip(&source.elf.kernels) {
         let kernel = lift_kernel(image, slot, arch, options.frontend, object_sha)?;
-        let code = emit::bytes(&kernel).map_err(|e| kernel_error(image, image.entry_va, Rule::StreamIdentity, e))?;
+        let code = emit::bytes(&kernel, arch).map_err(|e| kernel_error(image, image.entry_va, Rule::StreamIdentity, e))?;
         if code != image.code {
             let at = code.iter().zip(&image.code).position(|(a, b)| a != b).unwrap_or(code.len().min(image.code.len()));
             return Err(kernel_error(image, image.entry_va + at as u64, Rule::StreamIdentity, "label-lowered stream differs from the input"));
@@ -227,9 +226,10 @@ fn lift_kernel(image: &KernelImage, slot: &KernelSlot, arch: Arch, frontend: Fro
     let mut at = 0;
     while at < words.len() {
         let va = image.entry_va + 4 * at as u64;
-        let (mut inst, n) = gfx12::decode(&words[at..]).map_err(|e| kernel_error(image, va, Rule::Decode, e))?;
+        let (mut inst, n) = match arch { Arch::Gfx1100 | Arch::Gfx1151 => gfx11::decode(arch, &words[at..]),
+            _ => gfx12::decode(&words[at..]) }.map_err(|e| kernel_error(image, va, Rule::Decode, e))?;
         let original = &words[at..at + n];
-        let encoded = gfx12::encode(&inst).map_err(|e| kernel_error(image, va, Rule::StreamIdentity, e))?;
+        let encoded = gfx12::encode_for(arch, &inst).map_err(|e| kernel_error(image, va, Rule::StreamIdentity, e))?;
         if encoded.as_slice() != original {
             return Err(kernel_error(image, va, Rule::StreamIdentity, format!("re-encoded {encoded:08x?} != input {original:08x?}")));
         }
@@ -394,10 +394,10 @@ pub mod emit {
     }
 
     /// Encoded words of the kernel stream.
-    pub fn words(kernel: &Kernel) -> Result<Vec<u32>, EmitError> {
+    pub fn words(kernel: &Kernel, arch: Arch) -> Result<Vec<u32>, EmitError> {
         let mut out = Vec::with_capacity(kernel.body.layout.len() * 2);
         for (index, inst) in insts(kernel)?.iter().enumerate() {
-            let encoded = gfx12::encode(inst)
+            let encoded = gfx12::encode_for(arch, inst)
                 .map_err(|e| EmitError::Encode { kernel: kernel.symbol.0.clone(), index, reason: e.to_string() })?;
             out.extend_from_slice(&encoded);
         }
@@ -405,8 +405,8 @@ pub mod emit {
     }
 
     /// Little-endian bytes of the kernel stream.
-    pub fn bytes(kernel: &Kernel) -> Result<Vec<u8>, EmitError> {
-        Ok(words(kernel)?.iter().flat_map(|w| w.to_le_bytes()).collect())
+    pub fn bytes(kernel: &Kernel, arch: Arch) -> Result<Vec<u8>, EmitError> {
+        Ok(words(kernel, arch)?.iter().flat_map(|w| w.to_le_bytes()).collect())
     }
 
     /// Canonical (pinned `llvm-objdump`) text, one line per instruction; the input of
@@ -427,7 +427,7 @@ pub mod emit {
     /// code, the metadata note or a kernel name no longer fits, `crate::layout`).
     pub fn module(program: &Program) -> Result<Vec<u8>, EmitError> {
         let source = program.source.as_ref().ok_or(EmitError::NoEnvelope)?;
-        let codes = program.kernels.iter().map(bytes).collect::<Result<Vec<_>, _>>()?;
+        let codes = program.kernels.iter().map(|kernel| bytes(kernel, program.target.arch)).collect::<Result<Vec<_>, _>>()?;
         Ok(source.write(&parts(program, &codes)?)?)
     }
 
@@ -436,7 +436,7 @@ pub mod emit {
     /// layout derived (entry offset and `INST_PREF_SIZE` follow the new layout).
     pub fn checked(program: &Program, options: crate::Options) -> Result<(Vec<u8>, Lifted<Program>), EmitError> {
         let source = program.source.as_ref().ok_or(EmitError::NoEnvelope)?;
-        let codes = program.kernels.iter().map(bytes).collect::<Result<Vec<_>, _>>()?;
+        let codes = program.kernels.iter().map(|kernel| bytes(kernel, program.target.arch)).collect::<Result<Vec<_>, _>>()?;
         let parts = parts(program, &codes)?;
         let layout = source.elf.layout(&parts).map_err(SourceError::from)?;
         let out = source.write(&parts)?;
@@ -447,7 +447,7 @@ pub mod emit {
         for ((kernel, back), descriptor) in program.kernels.iter().zip(&lifted.program.kernels).zip(&layout.descriptors) {
             let differ = |what: &str| EmitError::Mismatch { kernel: kernel.symbol.0.clone(), what: what.into() };
             if kernel.symbol != back.symbol { return Err(differ("symbol")); }
-            if words(kernel)? != words(back)? { return Err(differ("instruction stream")); }
+            if words(kernel, program.target.arch)? != words(back, program.target.arch)? { return Err(differ("instruction stream")); }
             let (Abi::Hsa { metadata, .. }, Abi::Hsa { descriptor: read, metadata: read_meta }) = (&kernel.abi, &back.abi) else {
                 return Err(differ("ABI"));
             };

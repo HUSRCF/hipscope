@@ -113,7 +113,7 @@ fn selected_kernel_stream_is_reencoded_not_copied() {
             kernel.body.insts.get_mut(id).unwrap().prov.bytes = None;
         }
     }
-    assert_eq!(emit::bytes(selected(&masked)).unwrap(), original);
+    assert_eq!(emit::bytes(selected(&masked), ARCH).unwrap(), original);
     assert_eq!(emit::module(&masked).unwrap(), co, "module identity without provenance words");
 
     // op_sel on one v_mov_b16_e64: the typed flip is the op_sel bit and the half it selects.
@@ -129,7 +129,7 @@ fn selected_kernel_stream_is_reencoded_not_copied() {
     inst.mods.op_sel ^= 1;
     let Some(Operand::Half(_, half)) = inst.operands.get_mut(1) else { panic!("v_mov_b16_e64 source is a half") };
     *half = Half::Lo;
-    let changed = emit::bytes(selected(&flipped)).unwrap();
+    let changed = emit::bytes(selected(&flipped), ARCH).unwrap();
     let diffs: Vec<usize> = (0..changed.len()).filter(|&i| changed[i] != original[i]).collect();
     assert!(!diffs.is_empty());
     assert!(diffs.iter().all(|i| (start..end).contains(i)), "op_sel flip changed bytes outside [{start}, {end}): {diffs:?}");
@@ -148,8 +148,8 @@ fn selected_kernel_stream_is_reencoded_not_copied() {
     inst.fields = FormFields::Vop3b { src2_unused: if src2_unused == 0x80 { 0x00 } else { 0x80 } };
     assert_eq!(inst.text(ARCH).unwrap(), before.text(ARCH).unwrap());
     assert_eq!(peacemaker_lift::text::canonical(inst, ARCH).unwrap(), peacemaker_lift::text::canonical(&before, ARCH).unwrap());
-    let refilled = emit::words(selected(&filled)).unwrap();
-    let words = emit::words(selected(&masked)).unwrap();
+    let refilled = emit::words(selected(&filled), ARCH).unwrap();
+    let words = emit::words(selected(&masked), ARCH).unwrap();
     let at: usize = layout(selected(&masked))[..index].iter().map(|inst| width(inst)).sum();
     let differing: Vec<usize> = (0..words.len()).filter(|&i| words[i] != refilled[i]).collect();
     assert_eq!(differing, vec![at + 1], "only the VOP3b second dword changes");
@@ -173,7 +173,7 @@ fn builder_bundles_round_trip() {
         assert_eq!(emit::module(&lifted.program).unwrap(), input, "{relative}");
         for kernel in &lifted.program.kernels {
             let KernelOrigin::Frontend { size, .. } = kernel.origin else { panic!("lifted origin") };
-            assert_eq!(emit::bytes(kernel).unwrap().len() as u64, size, "{}", kernel.symbol.0);
+            assert_eq!(emit::bytes(kernel, ARCH).unwrap().len() as u64, size, "{}", kernel.symbol.0);
             assert_eq!(kernel.wave, Wave::Wave32);
         }
     }
@@ -722,7 +722,7 @@ fn assembler_parity_where_syntax_is_lossless() {
         .map(|(_, line)| line.clone())
         .collect();
     assert!(mismatched.is_empty(), "required set not byte-equal (reported set must be empty for KT48): {mismatched:?}");
-    assert_eq!(assembled.concat(), emit::words(kernel).unwrap());
+    assert_eq!(assembled.concat(), emit::words(kernel, ARCH).unwrap());
 
     let reassembled = &mc(&tools, std::slice::from_ref(&synth_text))[0];
     assert_ne!(reassembled.as_slice(), synth_words.as_slice());
@@ -749,7 +749,7 @@ fn edit_inverse_restores_bytes() {
     let lifted = lift(&co, Frontend::Hipcc);
     let symbol = SymbolId(SELECTED.into());
     let base = analyze(lifted.program, &symbol).unwrap();
-    let original = emit::bytes(selected(&base.program)).unwrap();
+    let original = emit::bytes(selected(&base.program), ARCH).unwrap();
     // s_load_b128 s[4:7], s[0:1], 0x148; s_load_b64 s[8:9], s[0:1], 0x158;
     // s_wait_kmcnt 0x0; s_mov_b32 s28, s4; s_mov_b32 s29, s5.
     let words: [&[u32]; 5] = [&[0xf400_4100, 0xf800_0148], &[0xf400_2200, 0xf800_0158], &[0xbfc7_0000], &[0xbe9c_0004], &[0xbe9d_0005]];
@@ -775,7 +775,7 @@ fn edit_inverse_restores_bytes() {
     let (edited, delta) = base.edit(&symbol, script).unwrap();
     assert_eq!(delta.kernel.0, profiled);
     let kernel = edited.program.kernels.iter().find(|k| k.symbol.0 == profiled).expect("renamed kernel");
-    assert_eq!(emit::bytes(kernel).unwrap(), [header_bytes, original.clone()].concat(), "the original stream follows the header unchanged");
+    assert_eq!(emit::bytes(kernel, ARCH).unwrap(), [header_bytes, original.clone()].concat(), "the original stream follows the header unchanged");
     let Abi::Hsa { descriptor, metadata } = &kernel.abi else { unreachable!() };
     assert_eq!((descriptor.kernarg_size, metadata.parsed.args.len(), metadata.parsed.sgpr_count), (352, 28, 32));
     assert_eq!(&metadata.parsed.args[25..], args.as_slice());
@@ -783,6 +783,6 @@ fn edit_inverse_restores_bytes() {
     assert_eq!(count(&edited), count(&base), "the script opens no obligation");
 
     let (restored, _) = edited.undo(&delta).unwrap();
-    assert_eq!(emit::bytes(selected(&restored.program)).unwrap(), original, "stream identity after the inverse");
+    assert_eq!(emit::bytes(selected(&restored.program), ARCH).unwrap(), original, "stream identity after the inverse");
     assert_eq!(emit::module(&restored.program).unwrap(), co, "module identity after the inverse");
 }

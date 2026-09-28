@@ -49,7 +49,7 @@ impl Effects {
     /// Single table source for authoring and lifted instruction effects.
     /// Physical register widths come from decoded operands; implicit reads and
     /// writes, counter membership and opcode-specific accumulator uses come
-    /// from the same gfx12 row.
+    /// from the target's opcode table.
     pub fn from_table(arch: Arch, op: Opcode, form: Form, operands: &[Operand]) -> Result<Self, ValidateError> {
         let row = crate::isa::lookup(arch, op, form)
             .ok_or(ValidateError::UnknownOpcode { op, form })?;
@@ -103,33 +103,38 @@ impl Effects {
                     else if name.ends_with("vccnz") { Cond::Vccnz }
                     else if name.ends_with("execnz") { Cond::Execnz } else { Cond::Execz };
                 Control::Branch { cond }
+            } else if name == "s_barrier" { Control::Barrier(BarrierKind::Full)
             } else if name == "s_barrier_signal" { Control::Barrier(BarrierKind::Signal(crate::cfg::BarrierId(0))) }
             else if name == "s_barrier_wait" { Control::Barrier(BarrierKind::Wait) }
             else if name.starts_with("s_wait") { Control::Wait }
             else if name == "s_clause" { Control::Clause }
             else if name == "s_delay_alu" { Control::Delay }
             else { Control::None };
-        if row.counter != "-" {
-            let (counter, units) = row.counter.split_once(':').ok_or_else(|| ValidateError::Operand("malformed counter rule".into()))?;
+        for pair in row.counter.split(',') {
+            let Some((counter, units)) = pair.split_once(':') else { continue };
             let counter = match counter {
                 "Km" => Counter::Km, "Ds" => Counter::Ds, "Load" => Counter::Load,
                 "Store" => Counter::Store, "Sample" => Counter::Sample, "Bvh" => Counter::Bvh,
-                "Exp" => Counter::Exp, _ => return Err(ValidateError::Operand("unknown counter rule".into())),
+                "Exp" => Counter::Exp, "Vm" => Counter::Vm, "Vs" => Counter::Vs,
+                "Lgkm" => Counter::Lgkm,
+                _ => return Err(ValidateError::Operand("unknown counter rule".into())),
             };
             if !matches!(units, "1" | "2") { return Err(ValidateError::Operand("unsupported counter unit weight".into())); }
-            let mut counters = CounterSet::default();
-            counters.insert(counter);
             let (class, order) = if name.starts_with("s_load") { (MemClass::SmemLoad, OrderType::Smem) }
-                // Returns its SGPRs through KMcnt, out of order like SMEM (RDNA4 §5.7.1).
                 else if name.starts_with("s_sendmsg_rtn") { (MemClass::SmemLoad, OrderType::Smem) }
                 else if name.starts_with("ds_load") { (MemClass::DsLoad, OrderType::Ds) }
                 else if name.starts_with("ds_store") { (MemClass::DsStore, OrderType::Ds) }
                 else if name.starts_with("ds_") { (MemClass::DsAtomic { returns: !out.defs.is_empty() }, OrderType::Ds) }
+                else if name.starts_with("flat_load") { (MemClass::FlatLoad, OrderType::Load) }
+                else if name.starts_with("flat_store") { (MemClass::FlatStore, OrderType::Store) }
                 else if name.starts_with("global_load") || name.starts_with("buffer_load") || name.starts_with("scratch_load") { (MemClass::VmemLoad, OrderType::Load) }
                 else if name.starts_with("global_store") || name.starts_with("buffer_store") || name.starts_with("scratch_store") { (MemClass::VmemStore, OrderType::Store) }
                 else { return Err(ValidateError::Operand(format!("unclassified memory rule for {name}"))); };
-            out.mem = Some(MemEffect { class, counters, in_order_type: order,
-                src_read: if matches!(class, MemClass::DsStore) { SrcRead::Deferred } else { SrcRead::AtIssue } });
+            let mem = out.mem.get_or_insert_with(|| MemEffect {
+                class, counters: CounterSet::default(), in_order_type: order,
+                src_read: if matches!(class, MemClass::DsStore) { SrcRead::Deferred } else { SrcRead::AtIssue },
+            });
+            mem.counters.insert(counter);
         }
         Ok(out)
     }

@@ -43,7 +43,7 @@ use crate::wait::{Counter, CounterSet, EventId, PendingEvent, WaitFact, WaitStat
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum WaitError {
-    #[error("wait replay needs the gfx1201 table (got {0:?})")]
+    #[error("wait replay needs a gfx11 or gfx12 opcode table (got {0:?})")]
     UnsupportedArch(Arch),
     #[error("layout refers to a tombstoned or missing instruction")]
     DanglingInst { id: InstId },
@@ -232,6 +232,9 @@ fn unit_weights(inst: &Inst, arch: Arch) -> [u8; N] {
             "Sample" => Counter::Sample,
             "Bvh" => Counter::Bvh,
             "Exp" => Counter::Exp,
+            "Vm" => Counter::Vm,
+            "Vs" => Counter::Vs,
+            "Lgkm" => Counter::Lgkm,
             _ => continue,
         };
         units[slot as usize] = weight.parse().unwrap_or(1);
@@ -305,7 +308,7 @@ fn retire(
     count: u8,
 ) -> Vec<EventId> {
     if count != 0 {
-        if matches!(counter, Counter::Km | Counter::Store) {
+        if matches!(counter, Counter::Km | Counter::Store | Counter::Vs | Counter::Lgkm) {
             return Vec::new();
         }
         if counter == Counter::Load {
@@ -324,19 +327,23 @@ fn retire(
         let units: u32 = state
             .pending
             .iter()
-            .filter(|e| e.counters.contains(counter))
+            .filter(|e| e.counters.contains(counter) && !e.satisfied.contains(counter))
             .map(|e| u32::from(e.units[counter as usize]))
             .sum();
         if units <= u32::from(count) {
             break;
         }
         let Some(position) =
-            state.pending.iter().position(|e| e.counters.contains(counter))
+            state.pending.iter().position(|e| e.counters.contains(counter) && !e.satisfied.contains(counter))
         else {
             break;
         };
-        retired.push(state.pending[position].id);
-        state.pending.remove(position);
+        let event = &mut state.pending[position];
+        event.satisfied.insert(counter);
+        if event.satisfied == event.counters {
+            retired.push(event.id);
+            state.pending.remove(position);
+        }
     }
     retired
 }
@@ -570,7 +577,7 @@ fn ranges_of(body: &Body) -> Vec<(BlockId, (usize, usize), Vec<BlockId>)> {
 
 /// CFG-aware wait replay with fixpoint over the block graph.
 pub fn replay(body: &Body, arch: Arch) -> Result<WaitReplay, WaitError> {
-    if arch != Arch::Gfx1201 {
+    if !matches!(arch, Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1201) {
         return Err(WaitError::UnsupportedArch(arch));
     }
     for id in &body.layout {
@@ -661,7 +668,7 @@ fn fixpoint(body: &Body, arch: Arch, ranges: &[(BlockId, (usize, usize), Vec<Blo
 
 /// Count wait instructions by opcode for T6.
 pub fn census(body: &Body, arch: Arch) -> Result<WaitCensus, WaitError> {
-    if arch != Arch::Gfx1201 {
+    if !matches!(arch, Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1201) {
         return Err(WaitError::UnsupportedArch(arch));
     }
     let mut out = WaitCensus::default();
