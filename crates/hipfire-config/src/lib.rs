@@ -2245,6 +2245,15 @@ pub static FIELDS: &[ConfigField] = &[
         "Launch the gfx1201 _v2 RMSNorm and gated-norm int4 producers (default on exact gfx1201; set to false or HIPFIRE_G12_NORM=0 to restore the incumbent _gfx12 symbols; batched sum-of-squares loads, one-reciprocal RTN codes and one wave per gated-norm group, bit-identical)."
     ),
     process_bool_field!(
+        "kernel.g12_dec_norm",
+        "g12_dec_norm",
+        Kernel,
+        true,
+        false,
+        "HIPFIRE_G12_DEC_NORM",
+        "Launch the gfx1201 decode norms as multi-workgroup grids (default on exact gfx1201; set to false or HIPFIRE_G12_DEC_NORM=0 to restore the single-workgroup launches; f32 AWQ RMSNorm+FWHT K/256 workgroups, out-of-place rmsnorm_f32 n/256 workgroups per row, half-split partial RoPE one workgroup per head, bit-identical)."
+    ),
+    process_bool_field!(
         "kernel.g12_a4c2",
         "g12_a4c2",
         Kernel,

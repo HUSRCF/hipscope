@@ -109,16 +109,33 @@ impl Gpu {
         // Generic RMSNorm is route-neutral. DeepSeek-only experiments must not
         // leak into Qwen/MiniMax through process-wide environment state.
         let warp_reduce = false;
-        let symbol = if warp_reduce {
+        let x_ptr = x.buf.as_ptr();
+        let w_ptr = weight.buf.as_ptr();
+        let out_ptr = out.buf.as_ptr();
+        // gfx1201 decode (one row): n/256 workgroups, each recomputing the
+        // row's rms (bit-identical). Other workgroups still read x while one
+        // writes, so `out` must not overlap `x`. Batched rows keep one
+        // workgroup per row: the split re-reads every row n/256 times.
+        let row_bytes = n as usize * 4;
+        let disjoint = (x_ptr as usize).saturating_add(row_bytes) <= out_ptr as usize
+            || (out_ptr as usize).saturating_add(row_bytes) <= x_ptr as usize;
+        let rowsplit = self.flags.g12_dec_norm_enabled()
+            && batch == 1
+            && n > 256
+            && n % 256 == 0
+            && disjoint;
+        let symbol = if rowsplit {
+            "rmsnorm_f32_rowsplit"
+        } else if warp_reduce {
             "rmsnorm_f32_warp_reduce"
         } else {
             "rmsnorm_f32"
         };
-        self.ensure_kernel(symbol, kernels::RMSNORM_SRC, symbol)?;
-
-        let x_ptr = x.buf.as_ptr();
-        let w_ptr = weight.buf.as_ptr();
-        let out_ptr = out.buf.as_ptr();
+        if rowsplit {
+            self.ensure_kernel(symbol, kernels::RMSNORM_ROWSPLIT_SRC, symbol)?;
+        } else {
+            self.ensure_kernel(symbol, kernels::RMSNORM_SRC, symbol)?;
+        }
         let n_val = n;
         let eps_val = eps;
 
@@ -132,12 +149,17 @@ impl Gpu {
 
         let block_size = 256u32.min(n as u32);
         let shared_mem = if warp_reduce { 8 * 4 } else { block_size * 4 };
+        let grid = if rowsplit {
+            [n as u32 / 256, 1, 1]
+        } else {
+            [batch as u32, 1, 1]
+        };
 
         let bytes = crate::profile::rmsnorm_bytes(batch * n as usize);
-        let timer = crate::profile::begin_timer(&self.hip, "rmsnorm", "rmsnorm_f32", bytes);
+        let timer = crate::profile::begin_timer(&self.hip, "rmsnorm", symbol, bytes);
         let result = self.launch_maybe_blob(
             symbol,
-            [batch as u32, 1, 1],
+            grid,
             [block_size, 1, 1],
             shared_mem,
             &mut params,
@@ -1016,6 +1038,18 @@ impl Gpu {
         } else {
             "rope_partial_halfsplit"
         };
+        // gfx1201 decode: one workgroup per head instead of one wave looping
+        // over all heads (bit-identical; each workgroup owns its head).
+        let headgrid = !legacy && self.flags.g12_dec_norm_enabled();
+        let (src, entry, cache_key) = if headgrid {
+            (
+                kernels::ROPE_PARTIAL_HALFSPLIT_HEADGRID_SRC,
+                "rope_partial_halfsplit_f32_headgrid",
+                "rope_partial_halfsplit_f32_headgrid",
+            )
+        } else {
+            (src, entry, cache_key)
+        };
         self.ensure_kernel(cache_key, src, entry)?;
         let qp = q.buf.as_ptr();
         let kp = k.buf.as_ptr();
@@ -1027,7 +1061,8 @@ impl Gpu {
         let fb = freq_base;
         let n_pairs = (n_rot / 2) as u32;
         let block = 32u32.min(n_pairs);
-        let grid = [(n_pairs + block - 1) / block, 1, 1];
+        let grid_y = if headgrid { (n_heads_q + n_heads_k) as u32 } else { 1 };
+        let grid = [(n_pairs + block - 1) / block, grid_y, 1];
         let bytes = crate::profile::rope_bytes(n_heads_q, n_heads_k, head_dim);
         let timer = crate::profile::begin_timer(&self.hip, "rope", entry, bytes);
         let mut params: Vec<*mut c_void> = vec![

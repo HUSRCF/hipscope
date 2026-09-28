@@ -46,6 +46,8 @@ mod kernels {
     #[cfg(not(feature = "deltanet"))]
     pub const ROPE_PARTIAL_HALFSPLIT_SRC: &str = include_str!("../../../kernels/src/rope_partial_halfsplit.hip");
     #[cfg(not(feature = "deltanet"))]
+    pub const ROPE_PARTIAL_HALFSPLIT_HEADGRID_SRC: &str = include_str!("../../../kernels/src/rope_partial_halfsplit_headgrid.hip");
+    #[cfg(not(feature = "deltanet"))]
     pub const ROPE_PARTIAL_HALFSPLIT_BATCHED_SRC: &str = include_str!("../../../kernels/src/rope_partial_halfsplit_batched.hip");
 }
 
@@ -253,6 +255,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         add!("fused_qkv_hfq4g256_mq4v2", kernels::FUSED_QKV_MQ4G256V2_SRC, ["fused_qkv_mq4g256v2"]);
         add!("fused_qkvza_hfq4g256_mq4v2", kernels::FUSED_QKVZA_MQ4G256V2_SRC, ["fused_qkvza_mq4g256v2"]);
         add!("fused_rmsnorm_mq_rotate_awq", kernels::FUSED_RMSNORM_MQ_ROTATE_AWQ_SRC, ["fused_rmsnorm_mq_rotate_awq"]);
+        add!("fused_rmsnorm_mq_rotate_awq_g12dec", kernels::FUSED_RMSNORM_MQ_ROTATE_AWQ_G12DEC_SRC, ["fused_rmsnorm_mq_rotate_awq_g12dec"]);
         add!("fused_silu_mul_mq_rotate_awq", kernels::FUSED_SILU_MUL_MQ_ROTATE_AWQ_SRC, ["fused_silu_mul_mq_rotate_awq"]);
         add!("gated_delta_net_q8_fast", kernels::GATED_DELTA_NET_Q8_FAST_SRC, ["gated_delta_net_q8_fast"]);
         add!("gdn_pre_batched_gfx1201", include_str!("../../../kernels/src/gdn_pre_batched.gfx1201.hip"), ["gdn_pre_batched_gfx1201"]);
@@ -268,7 +271,9 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         add!("mq_rotate_x", kernels::GEMV_MQ4G256_SRC, ["mq_rotate_x"]);
         add!("qwen35_fa_prep_batched_gfx1201", include_str!("../../../kernels/src/qwen35_fa_prep_batched.gfx1201.hip"), ["qwen35_fa_prep_batched_gfx1201"]);
         add!("rmsnorm_f32", kernels::RMSNORM_SRC, ["rmsnorm_f32"]);
+        add!("rmsnorm_f32_rowsplit", kernels::RMSNORM_ROWSPLIT_SRC, ["rmsnorm_f32_rowsplit"]);
         add!("rope_partial_halfsplit", kernels::ROPE_PARTIAL_HALFSPLIT_SRC, ["rope_partial_halfsplit_f32"]);
+        add!("rope_partial_halfsplit_f32_headgrid", kernels::ROPE_PARTIAL_HALFSPLIT_HEADGRID_SRC, ["rope_partial_halfsplit_f32_headgrid"]);
         add!("rotate_x_mq_awq", kernels::ROTATE_X_MQ_AWQ_SRC, ["rotate_x_mq_awq"]);
         add!("deinterleave_q_rmsnorm_f32_batched", kernels::DEINTERLEAVE_Q_RMSNORM_BATCHED_SRC, ["deinterleave_q_rmsnorm_f32_batched"]);
         add!("fused_gate_up_hfq4g256_k1024_gfx1201", kernels::FUSED_GATE_UP_HFQ4G256_K1024_GFX1201_SRC, ["fused_gate_up_hfq4g256_k1024_gfx1201"]);
@@ -320,8 +325,10 @@ mod tests {
         }
         assert_eq!(count, 92);
         // The installer trace predates the scalar-prefill runtime's BR/BC
-        // specialization. Its default key/source is additional to P0's 92.
-        assert_eq!(registry.len(), count + 1, "unexpected gfx1201 inventory size");
+        // specialization and the `HIPFIRE_G12_DEC_NORM` decode twins
+        // (fused RMSNorm+FWHT group grid, rmsnorm row split, RoPE head grid).
+        // Those four keys are additional to P0's 92.
+        assert_eq!(registry.len(), count + 4, "unexpected gfx1201 inventory size");
         let default_prefill = by_name.get("attention_q8_0_flash_prefill_br8_bc16").unwrap();
         assert_eq!(default_prefill.symbols, ["attention_q8_0_flash_prefill"]);
         assert!(default_prefill.source().starts_with(

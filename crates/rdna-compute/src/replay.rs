@@ -1296,8 +1296,12 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             write(48),
         ]),
         "deinterleave_f32" => Some(vec![read(0), write(8), write(16)]),
-        "rmsnorm_f32" | "rmsnorm_f32_warp_reduce" => Some(vec![read(0), read(8), write(16)]),
-        "rope_partial_halfsplit_f32" => Some(vec![write(0), write(8), read(16)]),
+        "rmsnorm_f32" | "rmsnorm_f32_warp_reduce" | "rmsnorm_f32_rowsplit" => {
+            Some(vec![read(0), read(8), write(16)])
+        }
+        "rope_partial_halfsplit_f32" | "rope_partial_halfsplit_f32_headgrid" => {
+            Some(vec![write(0), write(8), read(16)])
+        }
         "kv_cache_write_asym_k_fwht3" => {
             Some(vec![write(0), read(8), read(16), read(24), read(32)])
         }
@@ -1670,6 +1674,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "moe_topk_renorm_k8"
         | "rmsnorm_f32"
         | "rmsnorm_f32_warp_reduce"
+        | "rmsnorm_f32_rowsplit"
         | "rmsnorm_reduce_gfx1100"
         | "hc_input_map_4stream"
         | "sigmoid_mul_f32" => Some(32),
@@ -1706,6 +1711,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "mq_rotate_x"
         | "repeat_interleave_qk_f32"
         | "rope_partial_halfsplit_f32"
+        | "rope_partial_halfsplit_f32_headgrid"
         | "conv1d_gated_decode_f32" => Some(48),
         "conv1d_silu_split_f32"
         | "gated_norm_mq_rotate_gfx1100"
@@ -2957,10 +2963,14 @@ fn required_mid_acquire(previous: &str, current: &str) -> bool {
     }
     matches!(
         previous,
-        "repeat_interleave_qk_f32" | "rope_partial_halfsplit_f32"
+        "repeat_interleave_qk_f32"
+            | "rope_partial_halfsplit_f32"
+            | "rope_partial_halfsplit_f32_headgrid"
     ) || matches!(
         current,
-        "repeat_interleave_qk_f32" | "rope_partial_halfsplit_f32"
+        "repeat_interleave_qk_f32"
+            | "rope_partial_halfsplit_f32"
+            | "rope_partial_halfsplit_f32_headgrid"
     )
 }
 
@@ -2983,6 +2993,7 @@ fn conservative_mid_acquire_except(previous: &str, current: &str, excluded: Opti
                 | "fused_silu_mul_mq_rotate"
                 | "mq_rotate_x"
                 | "rope_partial_halfsplit_f32"
+                | "rope_partial_halfsplit_f32_headgrid"
         ))
         || (Some(current) != excluded
             && matches!(
@@ -2990,6 +3001,7 @@ fn conservative_mid_acquire_except(previous: &str, current: &str, excluded: Opti
                 "repeat_interleave_qk_f32"
                     | "fused_silu_mul_mq_rotate"
                     | "rope_partial_halfsplit_f32"
+                    | "rope_partial_halfsplit_f32_headgrid"
             ))
 }
 
@@ -4733,7 +4745,10 @@ impl ReplayController {
                 }
             } else if matches!(
                 launch.kernel.as_str(),
-                "fused_silu_mul_mq_rotate" | "mq_rotate_x" | "rope_partial_halfsplit_f32"
+                "fused_silu_mul_mq_rotate"
+                    | "mq_rotate_x"
+                    | "rope_partial_halfsplit_f32"
+                    | "rope_partial_halfsplit_f32_headgrid"
             ) {
                 if launch.kernel == "mq_rotate_x" {
                     headers[index] = HeaderPolicy::BATCH_INTERNAL_RELEASE_SYSTEM;

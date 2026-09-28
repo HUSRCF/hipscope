@@ -278,6 +278,14 @@ pub struct FeatureFlags {
     /// the gated-norm twin runs one wave per 256-group. Bit-identical outputs;
     /// any byte difference kills it.
     pub g12_norm: bool,
+    /// gfx1201 decode norm grids (`HIPFIRE_G12_DEC_NORM`,
+    /// `kernel.g12_dec_norm`). Default ON on exact gfx1201; `=0` restores the
+    /// single-workgroup launches. The f32 AWQ RMSNorm+FWHT runs K/256
+    /// workgroups (each redoes the row's reduction, rotates one group), the
+    /// out-of-place `rmsnorm_f32` n/256 workgroups per row, and the half-split
+    /// partial RoPE one workgroup per head. Bit-identical outputs; any byte
+    /// difference kills it.
+    pub g12_dec_norm: bool,
     /// gfx11 sigmoid/gated-norm + int4 quant fusions
     /// (`HIPFIRE_GFX11_PRODUCER_QUANT_FUSED`,
     /// `kernel.gfx11_producer_quant_fused`). Default ON on gfx1100/gfx1151;
@@ -731,6 +739,7 @@ impl FeatureFlags {
             gfx12_producer_quant_fused: parse_bool("HIPFIRE_GFX12_PRODUCER_QUANT_FUSED")
                 .unwrap_or(arch == "gfx1201"),
             g12_norm: parse_bool("HIPFIRE_G12_NORM").unwrap_or(arch == "gfx1201"),
+            g12_dec_norm: parse_bool("HIPFIRE_G12_DEC_NORM").unwrap_or(arch == "gfx1201"),
             gfx11_producer_quant_fused: parse_bool("HIPFIRE_GFX11_PRODUCER_QUANT_FUSED")
                 .unwrap_or(matches!(arch, "gfx1100" | "gfx1151")),
             gfx12_fp8_stream: parse_bool("HIPFIRE_GFX12_FP8_STREAM")
@@ -924,6 +933,12 @@ impl FeatureFlags {
     pub fn g12_norm_enabled(&self) -> bool {
         self.g12_norm && self.arch == "gfx1201"
     }
+    /// True only on exact gfx1201 with `HIPFIRE_G12_DEC_NORM` on: the decode
+    /// RMSNorm+FWHT, final RMSNorm and RoPE launch their bit-identical
+    /// multi-workgroup twins.
+    pub fn g12_dec_norm_enabled(&self) -> bool {
+        self.g12_dec_norm && self.arch == "gfx1201"
+    }
     /// True only on gfx1100/gfx1151 with the opt-in set. The `_gfx11`
     /// sigmoid/gated-norm producers emit the shared `block_i4_128` recipe,
     /// so output is bit-identical to the standalone
@@ -1086,6 +1101,7 @@ impl FeatureFlags {
             gfx12_silu_quant_fused: false,
             gfx12_producer_quant_fused: false,
             g12_norm: false,
+            g12_dec_norm: false,
             gfx11_producer_quant_fused: false,
             gfx12_fp8_stream: false,
             residual_ldsstage: false,

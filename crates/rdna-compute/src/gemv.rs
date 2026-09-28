@@ -186,6 +186,16 @@ fn awq_norm_kernel() -> (&'static str, &'static str, u32) {
     )
 }
 
+/// `HIPFIRE_G12_DEC_NORM` twin of [`awq_norm_kernel`]: launched with one
+/// workgroup per 256-group (grid K/256) instead of one workgroup per row.
+fn awq_norm_dec_kernel() -> (&'static str, &'static str, u32) {
+    (
+        "fused_rmsnorm_mq_rotate_awq_g12dec",
+        kernels::FUSED_RMSNORM_MQ_ROTATE_AWQ_G12DEC_SRC,
+        (256 * 4) as u32,
+    )
+}
+
 /// HIPFIRE_E8_DGPU_TWIN: on RDNA3 dGPU (gfx1100/1101/1102), route E8 MoE
 /// GEMVs to the 4-way-unroll gfx11_dgpu twin rather than the gfx1151 kernel.
 ///
@@ -2717,8 +2727,13 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_mq_signs()?;
-        let (module, source, shared_mem) = awq_norm_kernel();
-        self.ensure_kernel(module, source, "fused_rmsnorm_mq_rotate_awq")?;
+        // gfx1201 decode: K/256 workgroups, each redoing the row's reduction
+        // and rotating one group (bit-identical to the one-workgroup launch).
+        let group_grid = self.flags.g12_dec_norm_enabled() && k % 256 == 0;
+        let (module, source, shared_mem) =
+            if group_grid { awq_norm_dec_kernel() } else { awq_norm_kernel() };
+        self.ensure_kernel(module, source, module)?;
+        let grid_x = if group_grid { (k / 256) as u32 } else { 1 };
         let s1_ptr = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
         let s2_ptr = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
 
@@ -2743,11 +2758,10 @@ impl Gpu {
         let block_size = 256u32;
         // Bandwidth: read x + weight + awq_scale + signs + write x_rot.
         let bytes = k * 4 * 4 + 2 * 256 * 4;
-        let timer =
-            crate::profile::begin_timer(&self.hip, "fused", "fused_rmsnorm_mq_rotate_awq", bytes);
+        let timer = crate::profile::begin_timer(&self.hip, "fused", module, bytes);
         let result = self.launch_maybe_blob(
-            "fused_rmsnorm_mq_rotate_awq",
-            [1, 1, 1],
+            module,
+            [grid_x, 1, 1],
             [block_size, 1, 1],
             shared_mem,
             &mut params,

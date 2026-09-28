@@ -1088,6 +1088,18 @@ pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_SRC: &str = concat!(
     "#define HIPFIRE_RMSNORM_AWQ 1\n",
     include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate.hip")
 );
+/// gfx1201 decode twin of `FUSED_RMSNORM_MQ_ROTATE_AWQ_SRC`
+/// (`HIPFIRE_G12_DEC_NORM`, default on): launched with grid K/256 instead of
+/// one workgroup. Every workgroup redoes the row's sum of squares (loads
+/// batched, same fma chain) and the unchanged reduction tree, so rms is
+/// bit-identical, then wave 0 rotates only its own 256-group.
+pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_G12DEC_SRC: &str = concat!(
+    "#define HIPFIRE_RMSNORM_AWQ 1\n",
+    "#define HIPFIRE_RMSNORM_GROUP_GRID 1\n",
+    "#define HIPFIRE_RMSNORM_P1A_BATCHED 1\n",
+    "#define HIPFIRE_RMSNORM_KERNEL fused_rmsnorm_mq_rotate_awq_g12dec\n",
+    include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate.hip")
+);
 /// C2 IU4 producer sidecar: RMSNorm/FWHT + in-register `block_i4_128` emit.
 /// Prepends the shared quant recipe; old plain/AWQ symbols stay untouched.
 pub const BLOCK_I4_128_QUANT_SRC: &str =
@@ -6282,6 +6294,11 @@ pub const GEMV_Q6K_SRC: &str = include_str!("../../../kernels/src/gemv_q6k.hip")
 /// RMSNorm: y[i] = x[i] * weight[i] / sqrt(mean(x^2) + eps)
 pub const RMSNORM_SRC: &str = include_str!("../../../kernels/src/rmsnorm.hip");
 
+/// gfx1201 decode twin of `rmsnorm_f32` (`HIPFIRE_G12_DEC_NORM`): grid n/256
+/// per row, every workgroup recomputes the row's rms bit-identically and
+/// writes its own 256 outputs. Not in-place.
+pub const RMSNORM_ROWSPLIT_SRC: &str = include_str!("../../../kernels/src/rmsnorm_rowsplit.hip");
+
 /// Fused sandwich post-norm + residual-add: out = residual + rmsnorm(x, weight).
 /// Collapses (rmsnorm + memcpy + add_inplace) 3 launches into 1 (gemma4 L4).
 pub const RMSNORM_RESIDUAL_ADD_SRC: &str =
@@ -7357,6 +7374,12 @@ pub const ROPE_PARTIAL_INTERLEAVED_SRC: &str =
 #[cfg(feature = "deltanet")]
 pub const ROPE_PARTIAL_HALFSPLIT_SRC: &str =
     include_str!("../../../kernels/src/rope_partial_halfsplit.hip");
+
+/// gfx1201 decode twin of `rope_partial_halfsplit_f32` (`HIPFIRE_G12_DEC_NORM`):
+/// one workgroup per head instead of one wave looping over all heads.
+#[cfg(feature = "deltanet")]
+pub const ROPE_PARTIAL_HALFSPLIT_HEADGRID_SRC: &str =
+    include_str!("../../../kernels/src/rope_partial_halfsplit_headgrid.hip");
 
 /// Gemma 4 full-attention partial RoPE (HF `rotate_half` pairing). head_dim=512
 /// but only the first `n_rot_pairs` pairs (i, i+head_dim/2) rotate; the rest are

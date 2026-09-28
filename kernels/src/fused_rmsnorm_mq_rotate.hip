@@ -81,6 +81,10 @@
 #if defined(HIPFIRE_RMSNORM_AWQ_RCP) && !defined(HIPFIRE_RMSNORM_AWQ)
 #error "HIPFIRE_RMSNORM_AWQ_RCP replaces the AWQ divide"
 #endif
+#if defined(HIPFIRE_RMSNORM_GROUP_GRID) && (!defined(HIPFIRE_RMSNORM_AWQ) \
+    || defined(HIPFIRE_IU4_SIDECAR) || defined(HIPFIRE_FP8_STREAM) || defined(HIPFIRE_RMSNORM_AWQ_RCP))
+#error "HIPFIRE_RMSNORM_GROUP_GRID is the f32 AWQ decode variant"
+#endif
 #ifdef HIPFIRE_RMSNORM_AWQ_RCP
 // RN(y / a) from the loader's planes (see the header): exact where the
 // caller's wave check admits q.
@@ -143,7 +147,15 @@ extern "C" __global__ void HIPFIRE_RMSNORM_KERNEL(
     const int warp_id = tid >> 5;      // 0..7
     const int num_warps = block_size >> 5;
 
+#ifdef HIPFIRE_RMSNORM_GROUP_GRID
+    // Group grid (gfx1201 decode, `HIPFIRE_G12_DEC_NORM`): grid = (K/256, N).
+    // Every workgroup recomputes the row's rms with the unchanged 256-thread
+    // Phase 1a/1b (bit-identical), then wave 0 rotates only group blockIdx.x.
+    // The single-workgroup launch ran up to three groups per wave serially.
+    const long long batch_off = (long long)blockIdx.y * K;
+#else
     const long long batch_off = (long long)blockIdx.x * K;
+#endif
 #ifdef HIPFIRE_RMSNORM_FOLD
     float* x_b           = x     + batch_off;
     const float* d_b     = delta + batch_off;
@@ -220,6 +232,10 @@ extern "C" __global__ void HIPFIRE_RMSNORM_KERNEL(
     // loads ride under Phase-1b barriers. groups layout is wave-uniform
     // (depends only on K and warp_id), so this is safe before rms exists.
     const int groups_total = K / 256;
+#ifdef HIPFIRE_RMSNORM_GROUP_GRID
+    const int groups_per_warp = (warp_id == 0) ? 1 : 0;
+    const int warp_group_start = (int)blockIdx.x;
+#else
     const int groups_per_warp = (groups_total + num_warps - 1) / num_warps;
 #ifdef HIPFIRE_RMSNORM_FP8_STRIDED
     // Spread consecutive 256-value groups across the eight waves; each wave
@@ -227,6 +243,7 @@ extern "C" __global__ void HIPFIRE_RMSNORM_KERNEL(
     const int warp_group_start = warp_id;
 #else
     const int warp_group_start = warp_id * groups_per_warp;
+#endif
 #endif
     const int d0 = lane_id * 8;
 
