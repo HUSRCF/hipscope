@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Qwen4 native MTP is now on by default: `speculation.mtp = auto` attaches the
+  MTP head, where before only an explicit `on` did. Greedy requests then run
+  MTP (1.77x AR decode on `qwen3.8-flash-next.mq4`, tokens equal to AR's).
+  Sampled requests stay on the AR route, and attaching the head showed no
+  measurable prefill cost. `speculation.mtp = off` keeps AR.
+  A `.mq4r` load is the exception: there the retained Redline default stays
+  in force. Its tape is the single-row AR forward, which no MTP window runs,
+  so under `auto` the load stays AR, and an explicit `on` still refuses.
+
 - Qwen4 MTP draft head runs as one engine `Step` list: the prologue
   (`Embed`, `HyperNorm`, `Project`, `BroadcastAdd`), HC read/write, indexed
   attention (new `IndexedAttentionMode` append-only and selection-reuse

@@ -985,6 +985,16 @@ reuse of the earlier one.
     medians were HIP 33.07/33.15 against auto 33.03/33.02.
   - Attempt 3's HIP arm never became stationary within 120 rows while two
     external `llama-server` processes held the GPU at 100%.
+- **Re-run with both `llama-server` processes paused** (SIGSTOP for the whole
+  run), at both contexts. Neither run is fully valid:
+  - Context 1500: HIP spread 0.086%, valid. The retained arm's window holds
+    single-row dips (33.1 → 32.2 tok/s), so its spread is 2.73%.
+  - Context 128: HIP spread 1.07% and retained 1.03%, from single-row dips on
+    both arms.
+  - The medians stay at parity: 0.998 at context 1500, 0.994 at context 128.
+  - So the row-to-row variance on this model does not come from the external
+    servers. It is also not specific to the retained route: the HIP arm dips
+    too.
 
 **Gate 8 by item:**
 - **Long context:** positions 1500–1599.

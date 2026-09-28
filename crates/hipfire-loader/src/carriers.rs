@@ -344,10 +344,8 @@ impl Carrier for Qwen4Carrier {
                 ctx.max_seq
             ));
         }
-        // Native execution is opt-in. The validated artifact carries the MTP
-        // tensors for capability discovery, but only `Some(true)` may attach
-        // the GPU head and publish a speculative drafter.
-        let native_mtp = crate::admission::qwen4_native_mtp_requested(ctx.spec);
+        let native_mtp =
+            crate::admission::qwen4_native_mtp(ctx.spec, &ctx.gpu.arch, ctx.path, ctx.pp, 1)?;
         self.admit_options(
             ctx.draft_path,
             crate::admission::SourceAdmissionOptions {
@@ -366,21 +364,6 @@ impl Carrier for Qwen4Carrier {
                 pflash: false,
             },
         )?;
-        if native_mtp
-            && hipfire_runtime::config::retained_redline_default(
-                &ctx.gpu.arch,
-                "qwen4",
-                ctx.path,
-                ctx.pp,
-                1,
-                true,
-            )
-        {
-            return Err(
-                "qwen4: native MTP cannot be admitted with retained Redline; load the non-MQ4R HFQM artifact or disable MTP"
-                    .into(),
-            );
-        }
         let meta = resolve_source_meta(&src, ctx.path)?;
         let ModelSource::Hfq(mut hfq) = src else {
             return Err(

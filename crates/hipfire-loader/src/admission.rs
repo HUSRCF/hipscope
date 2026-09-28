@@ -61,10 +61,29 @@ pub fn qwen4_kv_adaptive_requested(value: Option<&str>) -> bool {
     value.is_some_and(|value| !value.is_empty() && value != "off")
 }
 
-/// Native Qwen4 MTP is an explicit load intent. A missing field and an
-/// explicit disable both keep the carrier on its ordinary AR-only shape.
-pub(crate) const fn qwen4_native_mtp_requested(spec: SpecLoadCfg) -> bool {
-    matches!(spec.mtp, Some(true))
+/// Whether a Qwen4 load attaches its native MTP head. The executable HFQM
+/// manifest always carries the validated head, so `auto` (`None`) attaches it
+/// and `Some(false)` keeps AR. The retained Redline default (a `.mq4r` name)
+/// owns the load instead: its tape is the single-row AR forward, which no MTP
+/// window runs, so `auto` stays AR there and an explicit `Some(true)` refuses.
+pub(crate) fn qwen4_native_mtp(
+    spec: SpecLoadCfg,
+    gpu_arch: &str,
+    path: &str,
+    pp: usize,
+    tp: usize,
+) -> Result<bool, String> {
+    let retained =
+        hipfire_runtime::config::retained_redline_default(gpu_arch, "qwen4", path, pp, tp, true);
+    match spec.mtp {
+        Some(false) => Ok(false),
+        Some(true) if retained => Err(
+            "qwen4: native MTP cannot be admitted with retained Redline; load the non-MQ4R HFQM artifact or disable MTP"
+                .into(),
+        ),
+        Some(true) => Ok(true),
+        None => Ok(!retained),
+    }
 }
 
 /// The source-only portion of Qwen4 admission. The validated config and
@@ -649,23 +668,10 @@ pub fn admit_source_with_options(
                 "qwen4: max_seq must be exactly 2048 (got {max_seq})"
             ));
         }
-        // The executable HFQM manifest always carries the validated one-layer
-        // MTP head. Native execution is opt-in: only `Some(true)` expresses
-        // the request to attach it; `None` and `Some(false)` remain AR-only.
-        let native_mtp = qwen4_native_mtp_requested(options.spec);
+        let native_mtp = qwen4_native_mtp(options.spec, gpu_arch, path, pp, tp)?;
         crate::carrier_for(arch_id)
             .ok_or_else(|| "no carrier for qwen4".to_string())?
             .admit_options(draft_path, options)?;
-        if native_mtp
-            && hipfire_runtime::config::retained_redline_default(
-                gpu_arch, "qwen4", path, pp, tp, true,
-            )
-        {
-            return Err(
-                "qwen4: native MTP cannot be admitted with retained Redline; load the non-MQ4R HFQM artifact or disable MTP"
-                    .into(),
-            );
-        }
         if kv_backend != KvBackend::Contiguous {
             return Err(format!(
                 "qwen4: KV backend '{}' is unsupported; only contiguous is admitted",
@@ -856,15 +862,32 @@ mod tests {
     }
 
     #[test]
-    fn qwen4_native_mtp_request_is_explicit() {
-        let mut spec = SpecLoadCfg::default();
-        assert!(!qwen4_native_mtp_requested(spec));
-
-        spec.mtp = Some(false);
-        assert!(!qwen4_native_mtp_requested(spec));
-
-        spec.mtp = Some(true);
-        assert!(qwen4_native_mtp_requested(spec));
+    fn qwen4_native_mtp_is_default_on_and_yields_to_retained_redline() {
+        let with = |mtp| SpecLoadCfg {
+            mtp,
+            ..SpecLoadCfg::default()
+        };
+        let (hfq, mq4r) = ("m/qwen3.8-flash-next.mq4", "m/qwen3.8-flash-next.mq4r");
+        assert_eq!(qwen4_native_mtp(with(None), "gfx1151", hfq, 1, 1), Ok(true));
+        assert_eq!(
+            qwen4_native_mtp(with(Some(false)), "gfx1151", hfq, 1, 1),
+            Ok(false)
+        );
+        assert_eq!(
+            qwen4_native_mtp(with(Some(true)), "gfx1151", hfq, 1, 1),
+            Ok(true)
+        );
+        // A `.mq4r` load on a retained-default GPU is the retained AR route.
+        assert_eq!(
+            qwen4_native_mtp(with(None), "gfx1151", mq4r, 1, 1),
+            Ok(false)
+        );
+        assert!(qwen4_native_mtp(with(Some(true)), "gfx1151", mq4r, 1, 1).is_err());
+        // Off the retained-default GPUs the name does not claim the load.
+        assert_eq!(
+            qwen4_native_mtp(with(None), "gfx1030", mq4r, 1, 1),
+            Ok(true)
+        );
     }
 
     mod qwen4_ddtree_admission {

@@ -2407,17 +2407,7 @@ pub fn load_model_with_kv_backend(
                     pflash: false,
                 },
             )?;
-        let native_mtp = admission::qwen4_native_mtp_requested(spec);
-        if native_mtp
-            && hipfire_runtime::config::retained_redline_default(
-                &gpu.arch, "qwen4", path, 1, 1, true,
-            )
-        {
-            return Err(
-                "qwen4: native MTP cannot be admitted with retained Redline; load the non-MQ4R HFQM artifact or disable MTP"
-                    .into(),
-            );
-        }
+        let native_mtp = admission::qwen4_native_mtp(spec, &gpu.arch, path, 1, 1)?;
         crate::admission::admit_qwen4_source(
             &src,
             hipfire_arch_qwen4::EffectiveMesh::single(),
@@ -4382,9 +4372,8 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
                         let _ = dev.bind_thread();
                         if let Err(e) = kv.free_gpu(dev) {
                             if ep_first_err.is_none() {
-                                ep_first_err = Some(format!(
-                                    "unload dense qwen TP KV rank {rank}: {e:?}"
-                                ));
+                                ep_first_err =
+                                    Some(format!("unload dense qwen TP KV rank {rank}: {e:?}"));
                             }
                         }
                         // Per-rank VMM teardown gate (mirrors the single-GPU
@@ -4393,9 +4382,8 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
                         // success for contiguous (no arenas registered).
                         if let Err(e) = dev.ensure_vmm_cleaned() {
                             if ep_first_err.is_none() {
-                                ep_first_err = Some(format!(
-                                    "unload dense qwen TP VMM rank {rank}: {e:?}"
-                                ));
+                                ep_first_err =
+                                    Some(format!("unload dense qwen TP VMM rank {rank}: {e:?}"));
                             }
                         }
                     }

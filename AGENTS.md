@@ -631,7 +631,8 @@ Caveats that are part of the fixture, not trivia:
 - Loading it needs a build whose qwen4 trunk source contract admits **both**
   packed trunk tiers and whose external-PLE admission accepts both PLE tiers.
   Older builds refuse at load; that refusal is correct, not a corrupt file.
-- **MTP is enabled by default on this recipe as of `6b9db7774`.** Each MTP
+- **MTP is on by default (`speculation.mtp = auto`) except on `.mq4r` loads,
+  which keep the retained Redline AR route; greedy requests only.** Each MTP
   window picks its verification route: a batched `(K+1)`-row verify at the
   draft depth `K` that maximizes expected emitted tokens per window cost
   (per-depth draft agreement, decayed), or the interleaved route (one target
