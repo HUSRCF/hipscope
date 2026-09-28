@@ -1171,7 +1171,7 @@ impl Qwen4MtpGpu {
         });
         let rescore = rescore
             && draft_format.is_some()
-            && lm_head.dtype == DType::Q8_0
+            && matches!(lm_head.dtype, DType::Q8_0 | DType::MQ6G256V2)
             && config.hidden_size == 2560;
         let eos = config.eos_token_id as usize;
         let draft_front = if rescore && DRAFT_FRONT < eos {
@@ -1742,12 +1742,19 @@ impl Qwen4MtpGpu {
                 config.hidden_size,
             )?;
             if let Some(partial) = self.draft_rescore.as_ref() {
-                gpu.q8_0_topk8_rescore_k2560(
+                let head = weights.resident(&weights.root.lm_head)?;
+                // An MQ6 head reads the draft copy's FWHT-rotated input.
+                let x = if head.dtype == DType::Q8_0 {
+                    &scratch.hc_mixed
+                } else {
+                    &scratch.rotation
+                };
+                gpu.topk8_rescore_k2560(
                     &scratch.logits,
                     ranked,
                     order,
-                    weights.resident(&weights.root.lm_head)?,
-                    &scratch.hc_mixed,
+                    head,
+                    x,
                     partial,
                     &scratch.top1,
                 )?;

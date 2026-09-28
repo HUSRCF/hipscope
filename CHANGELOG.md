@@ -42,10 +42,11 @@
   while drafting, which also helps AR decode on cold rows.
   `HIPFIRE_MTP_INCREMENTAL` unset now means adaptive (`0` batched, `1`
   interleaved).
-  The exact top-8 re-score needs a Q8_0 head: on `qwen3.8-flash-next.mq4`
-  (MQ6G256V2 head) drafts come from the plain MQ2 copy, and greedy MTP is
-  1.1-2.1x AR over the committed sweep prompts versus 1.5-2.2x on the
-  Q8-head fixture (tokens still equal to AR's).
+  The re-score reads a Q8_0 or MQ6G256V2 head. On `qwen3.8-flash-next.mq4`
+  (MQ6G256V2 head) it lifts greedy MTP from 55.4 to 59.5 tok/s (geomean over
+  9 committed prompts, 3 interleaved rounds; mean tau 1.89 → 2.10), level
+  with the same artifact carrying a Q8_0 head (59.2), whose AR is 1.6% slower
+  (33.1 vs 33.7).
   [The checkpoint](docs/perf-checkpoints/2026-09-28-qwen4-mtp-decode-autoresearch-gfx1151.md)
   and amendments [1](docs/perf-checkpoints/2026-09-28-qwen4-mtp-decode-autoresearch-gfx1151-amendment-1.md),
   [2](docs/perf-checkpoints/2026-09-28-qwen4-mtp-decode-autoresearch-gfx1151-amendment-2.md).

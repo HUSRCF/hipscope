@@ -5136,7 +5136,16 @@ pub const GEMV_Q8_0_WIDE_SRC: &str = include_str!("../../../kernels/src/gemv_q8_
 pub const GEMM_Q8_0_BATCHED_WIDE_EXACT_SRC: &str =
     include_str!("../../../kernels/src/gemm_q8_0_batched_wide_exact.hip");
 
-pub const GEMV_Q8_0_SRC: &str = include_str!("../../../kernels/src/gemv_q8_0.hip");
+pub const GEMV_Q8_0_SRC: &str = concat!(
+    include_str!("../../../kernels/src/topk8_select.hip"),
+    include_str!("../../../kernels/src/gemv_q8_0.hip")
+);
+/// The MQ6G256V2 draft-head re-score (`Gpu::topk8_rescore_k2560`).
+pub const TOPK8_RESCORE_MQ6G256V2_SRC: &str = concat!(
+    "#define HIPFIRE_TOPK8_RESCORE 1\n",
+    include_str!("../../../kernels/src/topk8_select.hip"),
+    include_str!("../../../kernels/src/gemv_mq6g256v2.hip")
+);
 pub const REQUANT_G256_SRC: &str = include_str!("../../../kernels/src/requant_g256.hip");
 
 /// Batched Q8_0 GEMM. Same per-row math as gemv_q8_0 but holds MAX_BATCH

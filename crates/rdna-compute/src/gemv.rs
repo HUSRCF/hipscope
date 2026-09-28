@@ -14640,39 +14640,52 @@ impl Gpu {
         })
     }
 
-    /// Argmax of `head_q8 · x` (Q8_0, K = 2560) restricted to the top 8
-    /// entries of the approximate `logits` (`n` rows), each scored with the
-    /// decode kernel's exact dot; the token id lands in `out[0]`. Logit row j
+    /// Argmax of `head · x` (K = 2560; a Q8_0 head reads the natural `x`, an
+    /// MQ6G256V2 head `x` in its FWHT basis) restricted to the top 8 entries of
+    /// the approximate `logits` (`n` rows), each scored with the decode
+    /// kernel's exact row dot; the token id lands in `out[0]`, its exact margin
+    /// over the other seven (f32 bits) in `out[1]`. Logit row j
     /// is token j unless `order = (front, special, tail)` says the ranking head
     /// was laid out `[0, front) ++ [special, special + tail) ++ [front, special)`
     /// (identity: `front >= n`). `partial` is scratch of at least
     /// [`Gpu::TOPK8_PARTIAL_BYTES`].
     #[allow(clippy::too_many_arguments)]
-    pub fn q8_0_topk8_rescore_k2560(
+    pub fn topk8_rescore_k2560(
         &mut self,
         logits: &GpuTensor,
         n: usize,
         order: (usize, usize, usize),
-        head_q8: &GpuTensor,
+        head: &GpuTensor,
         x: &GpuTensor,
         partial: &GpuTensor,
         out: &GpuTensor,
     ) -> HipResult<()> {
         const GROUPS: usize = 128;
         let chunk = n.div_ceil(GROUPS);
+        let (module, src, rescore) = match head.dtype {
+            DType::Q8_0 => (
+                "gemv_q8_0",
+                kernels::GEMV_Q8_0_SRC,
+                "topk8_rescore_q8_0_k2560",
+            ),
+            DType::MQ6G256V2 => (
+                "topk8_rescore_mq6g256v2",
+                kernels::TOPK8_RESCORE_MQ6G256V2_SRC,
+                "topk8_rescore_mq6g256v2_k2560",
+            ),
+            _ => {
+                return Err(hip_bridge::HipError::new(
+                    1,
+                    "topk8_rescore_k2560 head dtype",
+                ))
+            }
+        };
         if chunk > 2048 || partial.buf.size() < Self::TOPK8_PARTIAL_BYTES || x.numel() < 2560 {
-            return Err(hip_bridge::HipError::new(
-                1,
-                "q8_0_topk8_rescore_k2560 shape",
-            ));
+            return Err(hip_bridge::HipError::new(1, "topk8_rescore_k2560 shape"));
         }
         self.bind_thread()?;
         self.ensure_kernel("gemv_q8_0", kernels::GEMV_Q8_0_SRC, "topk8_partial_f32")?;
-        self.ensure_kernel(
-            "gemv_q8_0",
-            kernels::GEMV_Q8_0_SRC,
-            "topk8_rescore_q8_0_k2560",
-        )?;
+        self.ensure_kernel(module, src, rescore)?;
         let v_ptr = logits.buf.as_ptr();
         let pv_ptr = partial.buf.as_ptr();
         let pi_ptr =
@@ -14710,7 +14723,7 @@ impl Gpu {
             },
         )?;
         let m_val = (GROUPS * 8) as i32;
-        let a_ptr = head_q8.buf.as_ptr();
+        let a_ptr = head.buf.as_ptr();
         let x_ptr = x.buf.as_ptr();
         let o_ptr = out.buf.as_ptr();
         let mut params = [
@@ -14721,26 +14734,19 @@ impl Gpu {
             &x_ptr as *const _ as *mut c_void,
             &o_ptr as *const _ as *mut c_void,
         ];
-        self.launch_maybe_blob(
-            "topk8_rescore_q8_0_k2560",
-            [1, 1, 1],
-            [256, 1, 1],
-            0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(pv_ptr);
-                b.push_ptr(pi_ptr);
-                b.push_i32(m_val);
-                b.push_ptr(a_ptr);
-                b.push_ptr(x_ptr);
-                b.push_ptr(o_ptr);
-                b
-            },
-        )
+        self.launch_maybe_blob(rescore, [1, 1, 1], [256, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(pv_ptr);
+            b.push_ptr(pi_ptr);
+            b.push_i32(m_val);
+            b.push_ptr(a_ptr);
+            b.push_ptr(x_ptr);
+            b.push_ptr(o_ptr);
+            b
+        })
     }
 
-    /// Scratch bytes [`Gpu::q8_0_topk8_rescore_k2560`] needs.
+    /// Scratch bytes [`Gpu::topk8_rescore_k2560`] needs.
     pub const TOPK8_PARTIAL_BYTES: usize = 128 * 8 * 8;
 
     /// Whether [`Gpu::gemv_q8_0_staged_rows`] covers this shape.

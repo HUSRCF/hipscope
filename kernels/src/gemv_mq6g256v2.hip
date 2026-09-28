@@ -19,15 +19,14 @@
 // Half 0 governs q[0..128), half 1 q[128..256); reconstruction q*f32(s[h])+f32(z[h]).
 // K%256 required. Same 4-accumulator interleaving as gemv_mq4g256v2 for byte-exact.
 
-// One output row. Every entry point below runs this body, so a row's value
-// does not depend on which launch computed it.
-static __device__ __forceinline__ void mq6g256v2_row(
+// One output row's dot, valid in lane `tid` 0 of the row's wave. Every entry
+// point below runs this body, so a row's value does not depend on which
+// launch computed it.
+static __device__ __forceinline__ float mq6g256v2_row_dot(
     const char* __restrict__ A,
     const float* __restrict__ x,
-    float* __restrict__ y,
-    int row, int K
+    int row, int K, int tid
 ) {
-    const int tid = threadIdx.x;
 
 #if defined(HIPFIRE_MQ6G256V2_K2048)
     const int groups_per_row = 8;
@@ -181,9 +180,37 @@ static __device__ __forceinline__ void mq6g256v2_row(
     float acc = (acc0 + acc1) + (acc2 + acc3);
     for (int offset = 16; offset > 0; offset >>= 1)
         acc += __shfl_down(acc, offset);
-
-    if (tid == 0) y[row] = acc;
+    return acc;
 }
+
+static __device__ __forceinline__ void mq6g256v2_row(
+    const char* __restrict__ A,
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    int row, int K
+) {
+    const float acc = mq6g256v2_row_dot(A, x, row, K, threadIdx.x);
+    if (threadIdx.x == 0) y[row] = acc;
+}
+
+#if defined(HIPFIRE_TOPK8_RESCORE)
+// topk8_rescore_q8_0_k2560 for an MQ6G256V2 head (K = 2560): each candidate
+// is scored with the decode GEMV's row dot; x is in the head's FWHT basis.
+__launch_bounds__(256)
+extern "C" __global__ void topk8_rescore_mq6g256v2_k2560(
+    const float* __restrict__ pv, const int* __restrict__ pi, int m,
+    const char* __restrict__ A, const float* __restrict__ x, int* __restrict__ out
+) {
+    __shared__ int cand[8];
+    __shared__ float exact[8];
+    topk8_select(pv, pi, m, cand);
+    const int wave = threadIdx.x >> 5;
+    const float s = mq6g256v2_row_dot(A, x, cand[wave], 2560, threadIdx.x & 31);
+    if ((threadIdx.x & 31) == 0) exact[wave] = s;
+    __syncthreads();
+    if (threadIdx.x == 0) topk8_finish(exact, cand, out);
+}
+#endif
 
 __launch_bounds__(32, 16)
 extern "C" __global__ void HIPFIRE_MQ6G256V2_KERNEL(
