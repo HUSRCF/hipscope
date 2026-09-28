@@ -87,3 +87,47 @@ extern "C" __global__ void gemv_q8_0_wide(
         sum += __shfl_down(sum, offset);
     if (lane == 0) y[row] = sum;
 }
+
+// gfx1151, K = 640 (680-byte rows, Qwen4 decode shared-expert down): the same
+// four-accumulator math on a row staged through LDS with dword loads issued
+// before the x loads, x (20 values per lane) held in registers, four rows
+// (waves) per block. Bitwise gemv_q8_0_wide; 10.5 -> 9.5 us per call.
+__launch_bounds__(128)
+extern "C" __global__ void gemv_q8_0_wide_k640_staged(
+    const unsigned char* __restrict__ A_q8,
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    int M
+) {
+    __shared__ __align__(16) unsigned int staged[4][170];
+    const int wave = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int row = blockIdx.x * 4 + wave;
+    if (row >= M) return;
+    const unsigned int* src = reinterpret_cast<const unsigned int*>(A_q8 + (size_t)row * 680);
+    unsigned int v[6];
+#pragma unroll
+    for (int u = 0; u < 5; ++u) v[u] = src[lane + u * 32];
+    v[5] = lane < 10 ? src[lane + 160] : 0u;
+    float xr[20];
+#pragma unroll
+    for (int b = 0; b < 20; ++b) xr[b] = x[b * 32 + lane];
+#pragma unroll
+    for (int u = 0; u < 5; ++u) staged[wave][lane + u * 32] = v[u];
+    if (lane < 10) staged[wave][lane + 160] = v[5];
+    __builtin_amdgcn_fence(__ATOMIC_ACQ_REL, "wavefront");
+    const unsigned char* data = reinterpret_cast<const unsigned char*>(staged[wave]);
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+#pragma unroll
+    for (int q = 0; q < 5; ++q) {
+        const unsigned char* bp = data + q * 4 * 34;
+        acc0 += (float)*((const _Float16*)bp) * (float)(signed char)bp[2 + lane] * xr[q * 4 + 0];
+        acc1 += (float)*((const _Float16*)(bp + 34)) * (float)(signed char)bp[36 + lane] * xr[q * 4 + 1];
+        acc2 += (float)*((const _Float16*)(bp + 68)) * (float)(signed char)bp[70 + lane] * xr[q * 4 + 2];
+        acc3 += (float)*((const _Float16*)(bp + 102)) * (float)(signed char)bp[104 + lane] * xr[q * 4 + 3];
+    }
+    float sum = (acc0 + acc1) + (acc2 + acc3);
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum += __shfl_down(sum, offset);
+    if (lane == 0) y[row] = sum;
+}
