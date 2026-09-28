@@ -12,7 +12,9 @@
   unscatter and shared activation); the verify keeps only its last GDN state
   and a rejected suffix re-runs the kept rows' recurrence for every GDN layer
   in one launch, and state snapshots copy in one launch; each window picks
-  the draft depth (or the interleaved route) from per-depth draft agreement;
+  the draft depth (or the interleaved route) from per-depth draft agreement
+  and stops early once the drafts' exact logit margins make the prefix
+  unlikely to be accepted;
   drafts come from an MQ2 copy of the LM head re-scored exactly on its top 8
   (`HIPFIRE_MTP_DRAFT_HEAD`), ranking only token ids below 100 000 plus the
   control tokens until an input token outside them appears, and the MTP

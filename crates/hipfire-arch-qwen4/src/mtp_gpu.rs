@@ -1764,7 +1764,8 @@ impl Qwen4MtpGpu {
             }
             let mut top_bytes = [0u8; 8];
             gpu.hip.memcpy_dtoh(&mut top_bytes, &scratch.top1.buf)?;
-            let next_token = u32::from_ne_bytes([top_bytes[0], top_bytes[1], top_bytes[2], top_bytes[3]]);
+            let next_token =
+                u32::from_ne_bytes([top_bytes[0], top_bytes[1], top_bytes[2], top_bytes[3]]);
             self.draft_margin = if self.draft_rescore.is_some() {
                 f32::from_ne_bytes([top_bytes[4], top_bytes[5], top_bytes[6], top_bytes[7]])
             } else {
