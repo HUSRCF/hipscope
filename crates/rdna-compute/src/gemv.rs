@@ -3408,10 +3408,11 @@ impl Gpu {
         result
     }
 
-    /// The decode HC read's four-branch mix (`hyper_read_projected`) of `up`
-    /// and `normalized` into `mixed`, plus `mq_rotate_x(mixed)` into
-    /// `rotated`, one launch; bitwise both. The next `rotate_x_mq(mixed,
-    /// rotated, hidden)` is then a no-op (see `ScratchState::prerotated`).
+    /// The HC read's four-branch mix (`hyper_read_projected`) of `rows` rows
+    /// of `up` and `normalized` into `mixed`, plus `mq_rotate_x` of each mixed
+    /// row into `rotated`, one launch; bitwise both. The next
+    /// `rotate_x_mq(mixed, rotated, hidden)` / `rotate_x_mq_batched(mixed,
+    /// rotated, hidden, rows)` is then a no-op (see `ScratchState::prerotated`).
     pub fn hyper_read_projected_rotate(
         &mut self,
         normalized: &GpuTensor,
@@ -3419,12 +3420,14 @@ impl Gpu {
         mixed: &GpuTensor,
         rotated: &GpuTensor,
         hidden: usize,
+        rows: usize,
     ) -> HipResult<()> {
         if !hidden.is_multiple_of(256)
-            || normalized.numel() < 4 * hidden
-            || up.numel() < 4 * hidden
-            || mixed.numel() < hidden
-            || rotated.numel() < hidden
+            || rows == 0
+            || normalized.numel() < 4 * hidden * rows
+            || up.numel() < 4 * hidden * rows
+            || mixed.numel() < hidden * rows
+            || rotated.numel() < hidden * rows
         {
             return Err(hip_bridge::HipError::new(
                 1,
@@ -3453,7 +3456,7 @@ impl Gpu {
         ];
         self.launch_maybe_blob(
             FUNC,
-            [(hidden / 256) as u32, 1, 1],
+            [(hidden / 256) as u32, rows as u32, 1],
             [256, 1, 1],
             0,
             &mut params,
@@ -3469,7 +3472,7 @@ impl Gpu {
                 b
             },
         )?;
-        self.scratch.prerotated = Some((m_ptr as usize, r_ptr as usize, hidden));
+        self.scratch.prerotated = Some((m_ptr as usize, r_ptr as usize, hidden * rows));
         Ok(())
     }
 
@@ -3596,6 +3599,10 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        let key = (x.buf.as_ptr() as usize, x_rot.buf.as_ptr() as usize, k * batch_size);
+        if self.scratch.prerotated.take() == Some(key) {
+            return Ok(());
+        }
         self.bind_thread()?;
         let validate_live = self.arch == "gfx942"
             && gfx942_rotate_live_validation_enabled()

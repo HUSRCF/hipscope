@@ -674,16 +674,17 @@ fn execute_hyper_read_inner(
     }
     project_weight(gpu, &op.input_mix_up, &low, &up, op.rows, Some(op.rotation))?;
     if let Some(rotated) = rotate_into.filter(|r| {
-        op.rows == 1 && op.branches == 4 && op.hidden.is_multiple_of(256) && r.numel() >= op.hidden
+        op.branches == 4 && op.hidden.is_multiple_of(256) && r.numel() >= op.rows * op.hidden
     }) {
         // The next step rotates `mixed` into `rotated` first: write that
-        // rotation here too (the step's rotate_x_mq then skips).
+        // rotation here too (the step's rotate then skips).
         return hip(gpu.hyper_read_projected_rotate(
             &normalized,
             &up,
             &mixed,
-            &view(rotated, 0, op.hidden),
+            &view(rotated, 0, op.rows * op.hidden),
             op.hidden,
+            op.rows,
         ));
     }
     hip(hyper_read_projected(

@@ -774,6 +774,9 @@ pub fn execute_validated_steps<'a>(
                         .decode_params()
                         .filter(|p| p.x_norm.buf.as_ptr() == mixed && !p.x_rot_prerotated)
                         .map(|p| p.x_rot_local),
+                    Some(Step::MoeStage(op, crate::pipeline::moe_program::MoeStage::Normalize)) => {
+                        op.prefill_rotation_of(mixed)
+                    }
                     _ => None,
                 };
                 if let Some(produced) = execute_hyper_write_then_read(
