@@ -184,6 +184,32 @@ fn gfx1100_asym3_q8_pair_enabled(gpu: &Gpu, head_dim: usize) -> bool {
         && hipfire_config::developer_bool("HIPFIRE_GFX1100_ASYM3_Q8_PAIR", true)
 }
 
+/// gfx1201 fp8 decode attention through the GQA-shared tile and the
+/// head-dim-split reduce (default on; `HIPFIRE_FP8_DECODE_ATTN_GQA=0` restores
+/// `attention_flash_fp8_e4m3_tile` + `attention_flash_q8_0_reduce`). Both
+/// pairs write byte-identical partials and output. The tile's geometry is
+/// compile-time: head_dim 256, GQA group 6, tile 128 (H2 decode).
+fn fp8_decode_attn_gqa_admitted(
+    gpu: &Gpu,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    tile_size: usize,
+) -> bool {
+    gpu.arch_caps.is_gfx1201()
+        && head_dim == 256
+        && n_kv_heads > 0
+        && n_heads == 6 * n_kv_heads
+        && tile_size == 128
+        && hipfire_config::developer_bool("HIPFIRE_FP8_DECODE_ATTN_GQA", true)
+}
+
+/// Grid-y cap of the GQA-shared fp8 decode tile. Its workgroups loop over
+/// tiles y, y + cap, ..., so the graph-captured max_tiles grid (2048 at
+/// max_seq 262,144) does not dispatch thousands of idle 256-thread
+/// workgroups (6 µs/layer measured at 2048, 0.9 µs at 512).
+const FP8_DECODE_GQA_TILE_GRID_Y_CAP: usize = 512;
+
 #[inline]
 fn replay_stable_tile_count(
     actual_tiles: usize,
@@ -7590,6 +7616,25 @@ impl Gpu {
             self.graphs.capture_mode,
             self.replay.is_recording(),
         );
+        if output_gate.is_none()
+            && fp8_decode_attn_gqa_admitted(self, n_heads, n_kv_heads, head_dim, tile_size)
+        {
+            return self.attention_flash_fp8_e4m3_gqa_gfx1201(
+                q,
+                k_cache,
+                v_cache,
+                out,
+                pos_buf,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                max_seq,
+                partials,
+                tile_size,
+                max_tiles,
+                launch_tiles,
+            );
+        }
         // ── Tile kernel ──
         self.ensure_kernel(
             "attention_flash_fp8_e4m3_tile",
@@ -7712,6 +7757,124 @@ impl Gpu {
             )?;
         }
         Ok(())
+    }
+
+    /// gfx1201 fp8 decode attention: GQA-shared tile (one 256-thread
+    /// workgroup per (kv head, tile), K/V read once for the group's six q
+    /// heads) + head-dim-split reduce. Same ABIs and byte-identical partials
+    /// and output as `attention_flash_fp8_e4m3_tile` + `attention_flash_q8_0_reduce`.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_flash_fp8_e4m3_gqa_gfx1201(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        pos_buf: &DeviceBuffer,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+        partials: &GpuTensor,
+        tile_size: usize,
+        max_tiles: usize,
+        launch_tiles: usize,
+    ) -> HipResult<()> {
+        const TILE: &str = "attention_flash_fp8_e4m3_tile_gqa_gfx1201";
+        const REDUCE: &str = "attention_flash_reduce_dsplit_gfx1201";
+        self.ensure_kernel(TILE, kernels::ATTENTION_FLASH_FP8_E4M3_TILE_GQA_GFX1201_SRC, TILE)?;
+        self.ensure_kernel(REDUCE, kernels::ATTENTION_FLASH_REDUCE_DSPLIT_GFX1201_SRC, REDUCE)?;
+        let q_ptr = q.buf.as_ptr();
+        let k_ptr = k_cache.buf.as_ptr();
+        let v_ptr = v_cache.buf.as_ptr();
+        let p_ptr = partials.buf.as_ptr();
+        let o_ptr = out.buf.as_ptr();
+        let pos_ptr = pos_buf.as_ptr();
+        let nh = n_heads as i32;
+        let nkv = n_kv_heads as i32;
+        let hd = head_dim as i32;
+        let ms = max_seq as i32;
+        let sc = 1.0f32 / (head_dim as f32).sqrt();
+        let ts = tile_size as i32;
+        let wn = 0i32;
+        let es = 0i32;
+        let mt = max_tiles as i32;
+        {
+            let grid = [
+                n_kv_heads as u32,
+                launch_tiles.min(FP8_DECODE_GQA_TILE_GRID_Y_CAP) as u32,
+                1,
+            ];
+            let mut params: Vec<*mut c_void> = vec![
+                &q_ptr as *const _ as *mut c_void,
+                &k_ptr as *const _ as *mut c_void,
+                &v_ptr as *const _ as *mut c_void,
+                &p_ptr as *const _ as *mut c_void,
+                &pos_ptr as *const _ as *mut c_void,
+                &nh as *const _ as *mut c_void,
+                &nkv as *const _ as *mut c_void,
+                &hd as *const _ as *mut c_void,
+                &ms as *const _ as *mut c_void,
+                &sc as *const _ as *mut c_void,
+                &ts as *const _ as *mut c_void,
+                &wn as *const _ as *mut c_void,
+                &es as *const _ as *mut c_void,
+            ];
+            self.launch_maybe_blob_position_grid(
+                TILE,
+                grid,
+                [256, 1, 1],
+                0,
+                &mut params,
+                1,
+                1,
+                tile_size as u32,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(q_ptr);
+                    b.push_ptr(k_ptr);
+                    b.push_ptr(v_ptr);
+                    b.push_ptr(p_ptr);
+                    b.push_ptr(pos_ptr);
+                    b.push_i32(nh);
+                    b.push_i32(nkv);
+                    b.push_i32(hd);
+                    b.push_i32(ms);
+                    b.push_f32(sc);
+                    b.push_i32(ts);
+                    b.push_i32(wn);
+                    b.push_i32(es);
+                    b
+                },
+            )?;
+        }
+        let mut params: Vec<*mut c_void> = vec![
+            &p_ptr as *const _ as *mut c_void,
+            &o_ptr as *const _ as *mut c_void,
+            &nh as *const _ as *mut c_void,
+            &hd as *const _ as *mut c_void,
+            &pos_ptr as *const _ as *mut c_void,
+            &ts as *const _ as *mut c_void,
+            &mt as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            REDUCE,
+            [n_heads as u32, (head_dim / 32) as u32, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(p_ptr);
+                b.push_ptr(o_ptr);
+                b.push_i32(nh);
+                b.push_i32(hd);
+                b.push_ptr(pos_ptr);
+                b.push_i32(ts);
+                b.push_i32(mt);
+                b
+            },
+        )
     }
 
     /// Compile a givens4 kernel — prepends turbo_common + givens_common headers.

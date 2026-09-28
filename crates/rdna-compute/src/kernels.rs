@@ -7183,6 +7183,18 @@ pub const ATTENTION_FLASH_FP8_E4M3_TILE_SRC: &str = concat!(
     "#define HIPFIRE_KV_FP8_E4M3 1\n",
     include_str!("../../../kernels/src/attention_flash_q8_0_tile.hip")
 );
+/// GQA-shared fp8 decode flash tile (`attention_flash_fp8_e4m3_tile_gqa_gfx1201`):
+/// one 256-thread workgroup per (kv head, tile) serves the six q heads of its kv
+/// head, so each K/V tile is read once. Same 13-arg ABI and byte-identical
+/// `[2+head_dim]` partials as [`ATTENTION_FLASH_FP8_E4M3_TILE_SRC`] at head_dim
+/// 256, GQA group 6, tile 128, window 0. gfx1201 only.
+pub const ATTENTION_FLASH_FP8_E4M3_TILE_GQA_GFX1201_SRC: &str =
+    include_str!("../../../kernels/src/attention_flash_fp8_e4m3_tile_gqa.gfx1201.hip");
+/// Head-dim-split flash-decode reduce (`attention_flash_reduce_dsplit_gfx1201`):
+/// byte-identical to `attention_flash_q8_0_reduce` on the same partials, one
+/// workgroup per (head, 32-dim chunk). Same 7-arg ABI, no dynamic LDS.
+pub const ATTENTION_FLASH_REDUCE_DSPLIT_GFX1201_SRC: &str =
+    include_str!("../../../kernels/src/attention_flash_reduce_dsplit.gfx1201.hip");
 /// Batched fp8 flash tile (`attention_flash_fp8_e4m3_tile_batched`): same TU
 /// as [`ATTENTION_FLASH_Q8_0_TILE_BATCHED_SRC`] with `HIPFIRE_KV_FP8_E4M3=1`.
 /// Same full asym ABI (cos/sin dummies, tree_bias, v_mode_bits, window,
