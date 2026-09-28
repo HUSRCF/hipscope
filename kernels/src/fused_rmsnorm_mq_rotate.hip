@@ -36,12 +36,13 @@
 // rides the same float4 prefetch as x/weight. Uniform builds are textually
 // unchanged.
 //
-// -DHIPFIRE_RMSNORM_P1A_BATCHED=1 (gfx1201 `_v2` IU4 symbols) keeps up to 20
-// Phase-1a row loads in flight per wave instead of one: the incumbent loop
-// waits on each x[i] before issuing x[i + 256], so a wave held a single 128-B
-// request and the sum-of-squares pass was DRAM-latency bound. Same elements,
-// same strictly sequential fma(v, v, acc) chain from +0 as the incumbent
-// loop's contraction, same reduction tree: bit-identical rms.
+// -DHIPFIRE_RMSNORM_P1A_BATCHED=1 (gfx1201 `_v2` IU4 symbols, gfx1100 `_b8`
+// IU4 symbols) keeps up to 20 Phase-1a row loads in flight per wave instead
+// of one: the incumbent loop waits on each x[i] before issuing x[i + 256], so
+// a wave held a single 128-B request and the sum-of-squares pass was
+// DRAM-latency bound. Same elements, same strictly sequential fma(v, v, acc)
+// chain from +0 as the incumbent loop's contraction, same reduction tree:
+// bit-identical rms.
 #ifdef HIPFIRE_RMSNORM_KERNEL
 /* caller (host JIT concat) already named the symbol */
 #elif defined(HIPFIRE_RMSNORM_AWQ) && defined(HIPFIRE_FP8_STREAM)
@@ -149,7 +150,11 @@ extern "C" __global__ void HIPFIRE_RMSNORM_KERNEL(
     // With HIPFIRE_RMSNORM_P1A_DRAIN, a full load wait separates each batch's
     // issue from its use, so no fma reads a load that has not retired.
 #ifdef HIPFIRE_RMSNORM_P1A_DRAIN
+#if defined(__GFX12__)
 #define HIPFIRE_RMSNORM_P1A_ISSUE_BARRIER() asm volatile("s_wait_loadcnt 0x0" ::: "memory")
+#else
+#define HIPFIRE_RMSNORM_P1A_ISSUE_BARRIER() asm volatile("s_waitcnt vmcnt(0)" ::: "memory")
+#endif
 #else
 #define HIPFIRE_RMSNORM_P1A_ISSUE_BARRIER() ((void)0)
 #endif
