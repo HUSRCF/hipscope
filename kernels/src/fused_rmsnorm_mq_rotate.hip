@@ -419,15 +419,26 @@ extern "C" __global__ void HIPFIRE_RMSNORM_KERNEL(
     #ifdef HIPFIRE_FP8_STREAM
     // FP8 stream: whole-row scale + pack from the just-written F32 row
     // (L1-resident re-read). Byte-identical to pack_f32_to_fp8_mq4v2_gfx12
-    // with scale_mode=1 on finite rows; reuses the reduction smem.
+    // with scale_mode=1 on finite rows.
+    //
+    // The pack gets reduce[8..15], never reduce[0..7]. No barrier separates
+    // Phase 2 from the pack's first `smem8[wave] = amax` store, so wave 0 can
+    // reach that store while another wave has not yet executed its
+    // `rms = reduce[0]` load (Phase 1b's last barrier releases all waves,
+    // but nothing orders their LDS accesses after it). Aliasing reduce[0]
+    // then hands that wave wave 0's amax as its rms: a wrong-scale row that
+    // appears only when the waves of a workgroup drift apart, e.g. next to
+    // another process's ALU-bound waves. reduce[8..15] is untouched by
+    // Phase 1b and inside the launch's (K + 256) * 4 B of dynamic LDS.
     {
+        float* pack8 = reduce + 8;
         const int token = (int)blockIdx.x;
         const long long frow = (long long)token * K;
         const int gpr = K >> 8;
 #ifdef HIPFIRE_FP8_PROD_INREG
         fp8stream_pack_row_inreg(
             held, x_fp8 + frow, fp8_half_sums + (long long)token * (K >> 7),
-            fp8_row_scales + token, row_amax, reduce, K, lane_id, warp_id,
+            fp8_row_scales + token, row_amax, pack8, K, lane_id, warp_id,
 #ifdef HIPFIRE_RMSNORM_FP8_STRIDED
             warp_group_start, num_warps, row_scale_shift);
 #else
@@ -439,7 +450,7 @@ extern "C" __global__ void HIPFIRE_RMSNORM_KERNEL(
             x_fp8 + frow,
             fp8_half_sums + (long long)token * gpr * 2,
             fp8_row_scales + token,
-            row_amax, reduce, K, tid, lane_id, warp_id, row_scale_shift);
+            row_amax, pack8, K, tid, lane_id, warp_id, row_scale_shift);
 #endif
     }
     #endif

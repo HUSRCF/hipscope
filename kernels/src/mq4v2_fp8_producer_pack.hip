@@ -83,8 +83,10 @@ __device__ inline float fp8stream_row_scale_from_absmax(float amax) {
 // Uniform call over a 256-thread (8-wave) row workgroup; contains the two
 // __syncthreads that separate the producer stores from the pack read and
 // the scale publication from the encode (same barriers as the standalone
-// pack). `smem8` is 8 shared floats (the producer's reduction smem reused
-// after its last use). `x_row` is the row just stored by this workgroup
+// pack). `smem8` is 8 shared floats that no wave may still read: the first
+// `smem8[wave]` store precedes this helper's first barrier, so a slot the
+// caller last read after its own final barrier (e.g. a broadcast rms) races
+// with lagging waves. `x_row` is the row just stored by this workgroup
 // (L1-resident re-read, no extra DRAM traffic); `out_row`, `sums_row`
 // (`[K/256,2]`), and `scale_slot` follow the standalone pack layout for
 // row n. Reduces `row_amax` (the caller's per-thread finite absmax over the
