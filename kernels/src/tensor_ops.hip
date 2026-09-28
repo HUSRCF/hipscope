@@ -459,10 +459,14 @@ __device__ __forceinline__ void gated_delta_step_persistent256_body(
                 output[row * value_width + value_head * 128 + value_index] = out;
             }
             if (kCapture) {
+                // Streamed out now, while this latency-bound kernel leaves
+                // DRAM idle: a write-back copy would sit dirty in the MALL
+                // and be evicted by the bandwidth-bound GEMVs a few kernels on.
                 float* slot = row_states + (size_t)row * value_heads * 128 * 128;
                 #pragma unroll
                 for (int kd = 0; kd < 64; ++kd) {
-                    slot[state_base + (kd_base + kd) * 128 + value_index] = state_half[kd];
+                    __builtin_nontemporal_store(
+                        state_half[kd], &slot[state_base + (kd_base + kd) * 128 + value_index]);
                 }
             }
         }

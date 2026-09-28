@@ -18,17 +18,16 @@ use crate::weights::{HyperConnectionWeights, Qwen4Weights, TensorRef, WeightErro
 use hipfire_runtime::spec::SpecGrammar;
 use rdna_compute::tensor_ops::{
     argmax_f32, hc_activation_fused_f32, hyper_norm, hyper_read_projected, hyper_write,
-    indexed_attention_attention, indexed_attention_cache_append, indexed_attention_norm_rope,
-    indexed_attention_pool_rope, indexed_attention_reuse_selection, indexed_attention_select,
-    ArgmaxF32, HcActivationFused, HyperNorm, HyperReadProjected, HyperWrite,
-    IndexedAttentionAttention, IndexedAttentionCacheAppend, IndexedAttentionNormRope,
-    IndexedAttentionPoolRope, IndexedAttentionReuseSelection, IndexedAttentionSelect,
+    indexed_attention_attention, indexed_attention_decode_prologue, indexed_attention_pool_rope,
+    indexed_attention_reuse_selection, indexed_attention_select, ArgmaxF32, HcActivationFused,
+    HyperNorm, HyperReadProjected, HyperWrite, IndexedAttentionAttention,
+    IndexedAttentionDecodePrologue, IndexedAttentionPoolRope, IndexedAttentionReuseSelection,
+    IndexedAttentionSelect,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::fmt;
 
 const MTP_BRANCHES: usize = 4;
-const MTP_ROTARY_DIM: usize = 64;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_MTP_MODEL_ID: AtomicU64 = AtomicU64::new(1);
@@ -257,8 +256,6 @@ pub struct MtpGpuScratch {
     hc_gates: GpuTensor,
     rotation: GpuTensor,
     index: GpuTensor,
-    index_query: GpuTensor,
-    index_key: GpuTensor,
     q_and_gate: GpuTensor,
     qsa_k: GpuTensor,
     qsa_v: GpuTensor,
@@ -299,10 +296,6 @@ impl MtpGpuScratch {
         let index_width = (config.indexer_n_heads + config.indexer_kv_heads)
             .checked_mul(config.indexer_head_dim)
             .ok_or_else(|| invalid("MTP index width overflow"))?;
-        let index_query_width = config
-            .indexer_n_heads
-            .checked_mul(config.indexer_head_dim)
-            .ok_or_else(|| invalid("MTP index-query width overflow"))?;
         let hc_up = wide
             .checked_mul(config.hc_lowrank)
             .ok_or_else(|| invalid("MTP HC up scratch overflow"))?;
@@ -329,11 +322,6 @@ impl MtpGpuScratch {
             alloc(&[config.hc_count], DType::F32)?;
             alloc(&[max_rotation], DType::F32)?;
             alloc(&[index_width], DType::F32)?;
-            alloc(&[index_query_width], DType::F32)?;
-            alloc(
-                &[config.indexer_kv_heads * config.indexer_head_dim],
-                DType::F32,
-            )?;
             alloc(&[2 * q_width], DType::F32)?;
             alloc(&[kv_width], DType::F32)?;
             alloc(&[kv_width], DType::F32)?;
@@ -392,8 +380,6 @@ impl MtpGpuScratch {
             hc_gates: next(),
             rotation: next(),
             index: next(),
-            index_query: next(),
-            index_key: next(),
             q_and_gate: next(),
             qsa_k: next(),
             qsa_v: next(),
@@ -436,8 +422,6 @@ impl MtpGpuScratch {
             self.hc_gates,
             self.rotation,
             self.index,
-            self.index_query,
-            self.index_key,
             self.q_and_gate,
             self.qsa_k,
             self.qsa_v,
@@ -1504,50 +1488,10 @@ impl Qwen4MtpGpu {
             index_width,
             config.hidden_size,
         )?;
+        // The fused prologue (after q/k/v) normalizes the index query in place.
         let index_query = f32_view(&scratch.index, 0, index_query_width);
-        let index_key = f32_view(&scratch.index, index_query_width, index_key_width);
-        if step != MtpStep::Append {
-            gpu.copy_d2d(
-                &index_query,
-                &scratch.index_query,
-                scratch.index_query.byte_size(),
-            )?;
-        }
-        gpu.copy_d2d(
-            &index_key,
-            &scratch.index_key,
-            scratch.index_key.byte_size(),
-        )?;
         let index_query_norm = weights.resident(&qsa.indexer_q_norm)?;
         let index_key_norm = weights.resident(&qsa.indexer_k_norm)?;
-        if step != MtpStep::Append {
-            indexed_attention_norm_rope(
-                gpu,
-                &IndexedAttentionNormRope {
-                    values: &scratch.index_query,
-                    norm: index_query_norm,
-                    heads: config.indexer_n_heads,
-                    head_dim: index_dim,
-                    head_stride: config.indexer_head_dim,
-                    position,
-                    rotary_dim: MTP_ROTARY_DIM.min(index_dim),
-                },
-            )?;
-        }
-        // Keep raw BF16 index keys in the cache; source key RMSNorm and RoPE
-        // happen after four-token block pooling.
-        gpu.bf16_round_trip_f32(&scratch.index_key)?;
-        let raw_offset = position
-            .checked_mul(index_key_width)
-            .and_then(|v| v.checked_mul(std::mem::size_of::<f32>()))
-            .ok_or_else(|| invalid("MTP index cache offset overflow"))?;
-        gpu.memcpy_dtod_at_auto(
-            &state.raw_index_keys.buf,
-            raw_offset,
-            &scratch.index_key.buf,
-            0,
-            scratch.index_key.byte_size(),
-        )?;
 
         let q_width = config.num_attention_heads * config.head_dim;
         let kv_width = config.num_key_value_heads * config.head_dim;
@@ -1584,45 +1528,30 @@ impl Qwen4MtpGpu {
             kv_width,
             config.hidden_size,
         )?;
-        let q_norm = weights.resident(&qsa.q_norm)?;
-        let k_norm = weights.resident(&qsa.k_norm)?;
-        // q_proj already emits [Q, gate] for each head. Normalize and rotate
-        // each Q half in place while preserving its adjacent gate half.
-        if step != MtpStep::Append {
-            indexed_attention_norm_rope(
-                gpu,
-                &IndexedAttentionNormRope {
-                    values: q_and_gate,
-                    norm: q_norm,
-                    heads: config.num_attention_heads,
-                    head_dim: config.head_dim,
-                    head_stride: 2 * config.head_dim,
-                    position,
-                    rotary_dim: MTP_ROTARY_DIM.min(config.head_dim),
-                },
-            )?;
-        }
-        indexed_attention_norm_rope(
+        // Index-query, query and key norm+RoPE, the K/V cache append and the
+        // raw BF16 index key, in one launch (on an Append the query parts
+        // normalize stale rows nothing reads).
+        indexed_attention_decode_prologue(
             gpu,
-            &IndexedAttentionNormRope {
-                values: &scratch.qsa_k,
-                norm: k_norm,
-                heads: config.num_key_value_heads,
-                head_dim: config.head_dim,
-                head_stride: config.head_dim,
-                position,
-                rotary_dim: MTP_ROTARY_DIM.min(config.head_dim),
-            },
-        )?;
-        indexed_attention_cache_append(
-            gpu,
-            &IndexedAttentionCacheAppend {
-                key: &scratch.qsa_k,
-                value: &scratch.qsa_v,
+            &IndexedAttentionDecodePrologue {
+                index_row: &scratch.index,
+                qgate: q_and_gate,
+                keys: &scratch.qsa_k,
+                values: &scratch.qsa_v,
                 full_keys: &state.full_keys,
                 full_values: &state.full_values,
+                raw_index_keys: &state.raw_index_keys,
+                index_q_norm: index_query_norm,
+                q_norm: weights.resident(&qsa.q_norm)?,
+                k_norm: weights.resident(&qsa.k_norm)?,
+                index_heads: config.indexer_n_heads,
+                index_dim,
+                index_kv_width: index_key_width,
+                heads: config.num_attention_heads,
+                kv_heads: config.num_key_value_heads,
+                head_dim: config.head_dim,
                 position,
-                kv_width,
+                rows: 1,
             },
         )?;
         let visible = next_position;
@@ -1661,7 +1590,7 @@ impl Qwen4MtpGpu {
             indexed_attention_select(
                 gpu,
                 &IndexedAttentionSelect {
-                    query: &scratch.index_query,
+                    query: &index_query,
                     pooled: &state.pooled_keys,
                     selected: &state.selected_indices,
                     block_count: complete,
