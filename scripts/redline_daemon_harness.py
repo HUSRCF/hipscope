@@ -409,15 +409,20 @@ def qwen4_recipe_failures(model):
             f"{sorted(QWEN4_ADMITTED_TRUNK_TYPES)}; the first offenders: {named}"
         )
     # The input/output distributions ship at BF16 (16) or the eight-bit class
-    # tier Q8F16 (3); every MoE recipe in this tree uses one of those two for
-    # them, and anything narrower is the regression this gate exists for.
+    # tier Q8F16 (3); anything narrower is the regression this gate exists for.
+    # The one exception is recipe r2's language head at MQ6G256V2 (47), the
+    # floor measured for it (weights.rs `QWEN4_LM_HEAD`).
     quantized_sensitive = sorted(
-        {name for name, quant_type in sensitive if quant_type not in (16, 3)}
+        {
+            name
+            for name, quant_type in sensitive
+            if quant_type not in (16, 3) and not (name == "lm_head.weight" and quant_type == 47)
+        }
     )
     if quantized_sensitive:
         failures.append(
             "these classes carry the model's input/output distribution and must stay "
-            f"BF16 (16) or Q8F16 (3): {quantized_sensitive[:6]}"
+            f"BF16 (16) or Q8F16 (3), the head also MQ6G256V2 (47): {quantized_sensitive[:6]}"
         )
     return failures
 

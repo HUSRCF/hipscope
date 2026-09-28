@@ -642,8 +642,8 @@ Caveats that are part of the fixture, not trivia:
   whose GDN route captures per-row states (gfx11+ SIMT) a rejected suffix
   rolls back without re-running the accepted rows; elsewhere the batched
   route restores and replays. Drafts rank the vocabulary with an MQ2 copy of
-  the LM head and re-score its top 8 exactly against the Q8_0 rows
-  (`HIPFIRE_MTP_DRAFT_HEAD`, default `mq2r`).
+  the LM head and re-score its top 8 exactly against the head's own Q8_0 or
+  MQ6G256V2 rows (`HIPFIRE_MTP_DRAFT_HEAD`, default `mq2r`).
   Teacher-forced prompt and replay steps advance MTP state without computing
   an unused language-head prediction; prompt target chunks emit only their
   final logit row while retaining every wide hidden row.
@@ -670,6 +670,11 @@ Caveats that are part of the fixture, not trivia:
   MTP decode was code ~55 and prose ~37 tok/s against AR ~33 on the same
   build, with greedy MTP ids equal to AR's. The GPU was shared with external
   processes; read the checkpoint's method before citing a number.
+- **On `qwen3.8-flash-next.mq4` (2026-09-28, fixture-bound):** with the
+  MQ6G256V2 head's re-score, greedy MTP geomean over nine committed prompts
+  was 59.5 tok/s against AR 33.7 (55.4 without the re-score); the same file
+  with a Q8_0 head reached 59.2 at AR 33.1. Method and caveats:
+  [`docs/perf-checkpoints/2026-09-28-qwen4-mtp-mq6-rescore-gfx1151.md`](docs/perf-checkpoints/2026-09-28-qwen4-mtp-mq6-rescore-gfx1151.md).
 - `hipfire bench` cannot measure this model at all: the qwen4 contract pins
   `max_seq` to 2048 while bench asks for the configured 32768 (still 5120 with
   `memory.max_seq` forced to 2048), so it fails closed at load and never
