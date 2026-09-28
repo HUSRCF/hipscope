@@ -14023,7 +14023,7 @@ impl Gpu {
         };
 
         // gfx1151, K = 320 (Qwen4 decode HC read up): rows staged through LDS,
-        // two per block (132 -> 218 GB/s against gemv_q8_0_wide).
+        // four per block (132 -> 218 GB/s against gemv_q8_0_wide).
         if self.arch_caps.is_gfx1151() && k == 320 {
             const FUNC: &str = "gemv_q8_0_k320_staged";
             self.ensure_kernel("gemv_q8_0", kernels::GEMV_Q8_0_SRC, FUNC)?;
@@ -14687,7 +14687,7 @@ impl Gpu {
         let (func, grid, block) = if k == 2560 {
             ("gemv_q8_0_k2560_staged_rows", m as u32, 32u32)
         } else {
-            ("gemv_q8_0_k320_staged_rows", m.div_ceil(2) as u32, 64u32)
+            ("gemv_q8_0_k320_staged_rows", m.div_ceil(4) as u32, 128u32)
         };
         self.ensure_kernel("gemv_q8_0", kernels::GEMV_Q8_0_SRC, func)?;
         let a_ptr = a_raw.buf.as_ptr();
