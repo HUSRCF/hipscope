@@ -1,7 +1,7 @@
 //! Prologue: kernel arguments, banded raster (hipcc `IU4_G12_RASTER`, band 8),
 //! buffer descriptors, hoisted lane offsets, block-0 staging and the first
 //! rendezvous. Workgroup ids on gfx1201 are `ttmp9` (x) and `ttmp7[15:0]` (y).
-use super::{END, Gen, Tile, lit, mem, op, publish, s, sr, v};
+use super::{END, Epi, Gen, Tile, lit, mem, op, publish, s, sr, v};
 use crate::{Builder, insn::MemoryClass, lds::Transition};
 
 /// SALU unsigned 32-bit division, LLVM's AMDGPU expansion: a float
@@ -46,6 +46,10 @@ pub(crate) fn emit(b: &mut Builder, g: &Gen) -> Result<(), String> {
     let t: [u8; 8] = std::array::from_fn(|i| g.tmp + i as u8);
     mem(b, "s_load_b256 s[8:15], s[0:1], 0x0", &[sr(8, 8)], &[sr(0, 2)], MemoryClass::SmemLoad)?;
     mem(b, "s_load_b256 s[16:23], s[0:1], 0x20", &[sr(16, 8)], &[sr(0, 2)], MemoryClass::SmemLoad)?;
+    let gdn = g.spec.epi == Epi::QkvzaGdn;
+    if gdn {
+        mem(b, format!("s_load_b64 s[{}:{}], s[0:1], {}", a.bcx, a.bcy, lit(super::spec::GDN_KERNARG_BYTES)), &[sr(a.bcx, 2)], &[sr(0, 2)], MemoryClass::SmemLoad)?;
+    }
 
     // Banded raster: lin = y * gridDim.x + x; bands of 8 row tiles, rows
     // fastest within a band, then token tiles (bijective, partial last band).
@@ -61,6 +65,18 @@ pub(crate) fn emit(b: &mut Builder, g: &Gen) -> Result<(), String> {
     sop(b, format!("s_add_co_i32 s{0}, s{1}, s{0}", t[0], t[5]), &[t[0]], &[t[0], t[5]])?;
     sop(b, format!("s_lshl_b32 s{}, s{}, {}", g.rs, t[0], tile.rows().trailing_zeros()), &[g.rs], &[t[0]])?;
     sop(b, format!("s_lshl_b32 s{}, s{}, 7", g.bs, t[7]), &[g.bs], &[t[7]])?;
+    if gdn {
+        // Segments: row tiles below M0/128 read Wqkv; the rest read the Z fold
+        // (Mz + 128 rows) from its own row 0. s31 = segment (0 QKV, 1 Z fold).
+        let (m0, mz, seg) = (20u8, 21u8, 31u8);
+        sop(b, format!("s_sub_co_i32 s{}, s{}, s{m0}", t[1], g.rs), &[t[1]], &[g.rs, m0])?;
+        sop(b, format!("s_add_co_i32 s{}, s{mz}, {}", a.m, lit(super::spec::GDN_FOLD_EXTRA_ROWS)), &[a.m], &[mz])?;
+        sop(b, format!("s_cmp_ge_u32 s{}, s{m0}", g.rs), &[], &[g.rs, m0])?;
+        sop(b, format!("s_cselect_b32 s{0}, s{1}, s{0}", g.rs, t[1]), &[g.rs], &[g.rs, t[1]])?;
+        sop(b, format!("s_cselect_b32 s{0}, s{0}, s{m0}", a.m), &[a.m], &[a.m, m0])?;
+        op(b, format!("s_cselect_b64 s[{0}:{1}], s[10:11], s[{0}:{1}]", a.a, a.a + 1), &[sr(a.a, 2)], &[sr(10, 2), sr(a.a, 2)])?;
+        sop(b, format!("s_cselect_b32 s{seg}, 1, 0"), &[seg], &[])?;
+    }
     // Tiles past the problem exit (none for the host grid; kept for safety).
     sop(b, format!("s_lshl_b32 s54, s{}, {}", a.m, u32::from(silu)), &[54], &[a.m])?;
     sop(b, format!("s_cmp_ge_u32 s{}, s54", g.rs), &[], &[g.rs, 54])?;

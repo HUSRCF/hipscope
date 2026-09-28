@@ -6023,9 +6023,10 @@ fn mq_f16_projection_fast_route(gpu: &Gpu, fusion: DflashFusionCtx, n: usize, di
 /// Same statements, same order, same launches as the inlined block.
 /// S9-mq4v2-persistent-prologues will issue `try_mq4v2_persistent_prologue`
 /// from inside this hook after S3/S4 land.
-/// With `gdn` (the admitted chunk-scan route), the gfx1201 FP8 F2 QKVZA may
-/// also run `gdn_chunk_prep` in its epilogue; the return value says whether it
-/// did, in which case the caller runs `gdn_chunk_prep_fixup` instead of the prep.
+/// With `gdn` (the admitted chunk-scan route), the gfx1201 FP8 F2 QKVZA or
+/// the A4 `_b1` fused QKVZ+beta/alpha projection may also run
+/// `gdn_chunk_prep` in its epilogue; the return value says whether it did, in
+/// which case the caller runs `gdn_chunk_prep_fixup` instead of the prep.
 #[allow(clippy::too_many_arguments)]
 fn batch_chunk_delta_net_input_projection(
     gpu: &mut Gpu,
@@ -6225,6 +6226,25 @@ fn batch_chunk_delta_net_input_projection(
                 layer.wqkv.m, layer.wz.m, layer.wqkv.k, n,
             )?;
         } else {
+            // gfx1201 A4: one `_b1` launch over QKV and the load-time Z fold
+            // whose q/k/v tiles also run `gdn_chunk_prep` in the epilogue.
+            if let Some(targets) = gdn {
+                if gpu.gemm_qkvza_mq4g256v2_iu4_gdn_prepared(
+                    &layer.wqkv.buf,
+                    &layer.wz.buf,
+                    prep,
+                    &pbs.dn_qkv_batch,
+                    &pbs.dn_z_batch,
+                    &pbs.dn_beta_batch,
+                    &pbs.dn_alpha_batch,
+                    [layer.wqkv.m, layer.wz.m, layer.w_beta.m, layer.w_alpha.m],
+                    layer.wqkv.k,
+                    n,
+                    targets,
+                )? {
+                    return Ok(true);
+                }
+            }
             gpu.gemm_qkvza_mq4g256v2_wmma_iu4_prepared(
                 &layer.wqkv.buf,
                 &layer.wz.buf,

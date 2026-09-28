@@ -334,6 +334,10 @@ fn g12_iu4_b1_image() -> &'static [u8] {
 /// under the 300 W cap. Parsed once so a producer and its consumers agree.
 static A4_SLAB: LazyLock<bool> =
     LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_A4_SLAB", true));
+/// Quality receipts count the fused A4 GDN projection launches (print-only,
+/// one stderr line per launch). Kept off in production and all timing runs.
+static G12_IU4_GDN_COVERAGE: LazyLock<bool> =
+    LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_G12_IU4_GDN_COVERAGE", false));
 /// Physically packed bf16 SiLU h is independently selectable for each producer route.
 /// A4 stays opt-in after both pp8192 orders regressed; fp8 F2 defaults on after
 /// both orders improved. Each flag restores the f32 handoff when disabled.
@@ -30503,6 +30507,137 @@ impl Gpu {
             )?;
         }
         Ok(())
+    }
+
+    /// gfx1201 A4 fused GDN input projection is admitted for these weights:
+    /// the certified `_b1` bundle (not the control), symmetric MQ4V2, the
+    /// Qwen3.5 GDN geometry the epilogue hard-codes (q/k/v = 16 + 16 + 48
+    /// heads of 128, beta/alpha 48) and `HIPFIRE_GDN_PREP_FUSED` != `0`. The
+    /// loader appends beta/alpha to Z ([`Self::iu4_gdn_fold_rows`]) under the
+    /// same predicate, so it must not depend on the batch.
+    pub fn iu4_gdn_fold_active(&self, dims: [usize; 4], k: usize) -> bool {
+        self.arch == "gfx1201"
+            && self.mq4v2_symmetric
+            && self.flags.iu4_prefill_enabled()
+            && self.flags.g12_iu4_isa
+            && !*G12_IU4_B1_CONTROL
+            && hipfire_config::developer_var("HIPFIRE_IU4_SYMFOLD").as_deref() != Ok("0")
+            && hipfire_config::developer_var("HIPFIRE_GDN_PREP_FUSED").as_deref() != Ok("0")
+            && dims == [10240, 6144, 48, 48]
+            && k > 0
+            && k % 256 == 0
+            && k <= i32::MAX as usize
+    }
+
+    /// Rows of the gfx1201 Z fold: Z, beta in rows 0..47 of one extra
+    /// 128-row tile, alpha in its rows 64..111, zero rows elsewhere (each
+    /// half is one pair of `_b1` wave row groups). Returns (rows, beta row,
+    /// alpha row).
+    pub fn iu4_gdn_fold_rows(z_m: usize) -> (usize, usize, usize) {
+        (z_m + 128, z_m, z_m + 64)
+    }
+
+    /// A4 (`_b1`) QKV + Z + beta + alpha in one SET launch whose QKV row
+    /// tiles (one 128-channel head each) also run `gdn_chunk_prep` in the
+    /// epilogue (`gemm_mq4g256v2_residual_mmq_iu4_qkvzagdn_b1`). `a_z_fold`
+    /// is the loader's Z fold. Returns `Ok(false)` without launching anything
+    /// when not admitted; after `Ok(true)` the caller must run
+    /// [`Self::gdn_chunk_prep_fixup`], and `y_qkv` holds only the raw rows
+    /// that pass reads.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_qkvza_mq4g256v2_iu4_gdn_prepared(
+        &mut self,
+        a_qkv: &GpuTensor,
+        a_z_fold: &GpuTensor,
+        prepared: &crate::scratch::Int4MmqPrepared,
+        y_qkv: &GpuTensor,
+        y_z: &GpuTensor,
+        y_beta: &GpuTensor,
+        y_alpha: &GpuTensor,
+        dims: [usize; 4],
+        k: usize,
+        n: usize,
+        gdn: &F2GdnTargets<'_>,
+    ) -> HipResult<bool> {
+        const MODULE: &str = "gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1";
+        const SYMBOL: &str = "gemm_mq4g256v2_residual_mmq_iu4_qkvzagdn_b1";
+        self.bind_thread()?;
+        let row_bytes = k / 256 * crate::dispatch::MQ4V2_GROUP_BYTES;
+        let aligned = |t: &GpuTensor| (t.buf.as_ptr() as usize) % 16 == 0;
+        if !(self.iu4_gdn_fold_active(dims, k)
+            && n > 0
+            && n <= i32::MAX as usize
+            && a_qkv.buf.size() >= dims[0] * row_bytes
+            && a_z_fold.buf.size() == Self::iu4_gdn_fold_rows(dims[1]).0 * row_bytes
+            && y_qkv.buf.size() >= n * dims[0] * 4
+            && y_z.buf.size() >= n * dims[1] * 4
+            && [y_beta, y_alpha].iter().all(|t| t.buf.size() >= n * 48 * 4)
+            && [gdn.q, gdn.k].iter().all(|t| t.buf.size() >= n * 16 * 128 * 2)
+            && gdn.v.buf.size() >= n * 48 * 128 * 2
+            && gdn.conv_weight.buf.size() >= dims[0] * 4 * 4
+            && gdn.conv_state.buf.size() >= dims[0] * 3 * 4
+            && [a_qkv, a_z_fold, y_qkv, y_z, y_beta, y_alpha, gdn.q, gdn.k, gdn.v].into_iter().all(aligned))
+        {
+            return Ok(false);
+        }
+        let xq = self.int4_mmq_prepared_ptr(prepared, k, n)?;
+        // This symbol stages token-order records; slab-layout activations
+        // (`HIPFIRE_A4_SLAB`) take the four `_b1s` SETs + prep instead.
+        if self.scratch.int4_mmq_slab_at(xq) {
+            return Ok(false);
+        }
+        // An owed residual add must land before any further GEMM.
+        self.flush_residual_fold()?;
+        self.ensure_embedded_kernel(MODULE, g12_iu4_b1_image(), SYMBOL)?;
+        let mut ptrs = [a_qkv, a_z_fold].map(|t| t.buf.as_ptr());
+        let mut xq_ptr = xq;
+        let mut outs = [y_z, y_beta, y_alpha].map(|t| t.buf.as_ptr());
+        let mut ints = [dims[0] as i32, dims[1] as i32, k as i32, n as i32];
+        let mut gdn_ptrs = [gdn.conv_weight, gdn.conv_state, gdn.q, gdn.k, gdn.v, y_qkv].map(|t| t.buf.as_ptr());
+        let mut scales = [gdn.q_scale, gdn.eps];
+        let [p0, p1] = &mut ptrs;
+        let [o0, o1, o2] = &mut outs;
+        let [i0, i1, i2, i3] = &mut ints;
+        let [g0, g1, g2, g3, g4, g5] = &mut gdn_ptrs;
+        let [f0, f1] = &mut scales;
+        let mut params: Vec<*mut c_void> = vec![
+            p0 as *mut _ as *mut c_void, p1 as *mut _ as *mut c_void, &mut xq_ptr as *mut _ as *mut c_void,
+            o0 as *mut _ as *mut c_void, o1 as *mut _ as *mut c_void, o2 as *mut _ as *mut c_void,
+            i0 as *mut _ as *mut c_void, i1 as *mut _ as *mut c_void, i2 as *mut _ as *mut c_void, i3 as *mut _ as *mut c_void,
+            g0 as *mut _ as *mut c_void, g1 as *mut _ as *mut c_void, g2 as *mut _ as *mut c_void,
+            g3 as *mut _ as *mut c_void, g4 as *mut _ as *mut c_void, g5 as *mut _ as *mut c_void,
+            f0 as *mut _ as *mut c_void, f1 as *mut _ as *mut c_void,
+        ];
+        let row_tiles = (dims[0] + Self::iu4_gdn_fold_rows(dims[1]).0).div_ceil(128);
+        let bytes = (dims[0] + dims[1] + 96) * row_bytes + n * (dims[1] + 96) * 4 + n * (32 + 48) * 128 * 2;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", SYMBOL, bytes);
+        let blob_ptrs = (ptrs, xq, outs, ints, gdn_ptrs, scales);
+        let result = self.launch_maybe_blob(
+            SYMBOL,
+            [row_tiles as u32, n.div_ceil(128) as u32, 1],
+            [256, 1, 1],
+            20480,
+            &mut params,
+            || {
+                let (ptrs, xq, outs, ints, gdn_ptrs, scales) = blob_ptrs;
+                let mut b = hip_bridge::KernargBlob::new();
+                for p in ptrs { b.push_ptr(p); }
+                b.push_ptr(xq);
+                for p in outs { b.push_ptr(p); }
+                for i in ints { b.push_i32(i); }
+                for p in gdn_ptrs { b.push_ptr(p); }
+                for f in scales { b.push_f32(f); }
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result?;
+        if *G12_IU4_GDN_COVERAGE {
+            eprintln!("iu4_gdn_selected: symbol={SYMBOL} n={n} k={k} dims={dims:?}");
+        }
+        Ok(true)
     }
 
     /// Append beta/alpha as ordinary Z weight rows. The SET selector is the

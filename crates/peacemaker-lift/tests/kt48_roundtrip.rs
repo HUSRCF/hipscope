@@ -156,13 +156,13 @@ fn selected_kernel_stream_is_reencoded_not_copied() {
     assert_eq!((words[at + 1] ^ refilled[at + 1]) & !(0x1ff << 18), 0, "only the src2 field changes");
 }
 
-/// F2 builder bundle (12 kernels) and iu4 bundle (4 kernels) round trip through
+/// F2 builder bundle (12 kernels) and iu4 bundle (5 kernels) round trip through
 /// `lift_object`/`emit` byte for byte.
 #[test]
 fn builder_bundles_round_trip() {
     for (relative, sha, kernels, bytes) in [
         ("../../kernels/gemm_mq4g256v2_wmma_fp8_gfx12_b1.hxaco", "1b26cd3a0bbddfafd8cf93250283aacee16bd37a4886233461fe0e175133f373", 12, 367_072),
-        ("../../kernels/gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1.hxaco", "06be81f79503947041382bf42bac6a045d9d76a3968ff890d9347703d659ed69", 4, 60_168),
+        ("../../kernels/gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1.hxaco", "89c7c87aad2a25cc8cd5e5061e0d61216fe9cb907062040339903884d16691b3", 5, 79_344),
     ] {
         let input = load(relative, sha);
         assert_eq!(input.len(), bytes);

@@ -12,9 +12,11 @@ pub enum Tile { T128x128x8, T256x128x16 }
 /// Number of int32 accumulator sets. `Two` is dropped by G0g (plan §8).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Cacc { One, Two }
-/// Epilogue family.
+/// Epilogue family. `QkvzaGdn` is the fused GDN input projection: one SET
+/// launch over the QKV weight and the load-time Z fold (Z, beta, alpha),
+/// whose QKV tiles run `gdn_chunk_prep` in the epilogue (`gdn_epilogue`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Epi { Set, Add, GateUpSilu, GateUpSiluBf16 }
+pub enum Epi { Set, Add, GateUpSilu, GateUpSiluBf16, QkvzaGdn }
 /// Activation layout inside each K128 block of `Xq` (N tokens, N*72 bytes
 /// either way). `Token`: one 72-B `block_i4_128` record per token.
 /// `Slab`: the same bytes as planes `[d: 4N][s: 4N][qs[0..32): 32N]
@@ -37,6 +39,13 @@ pub const BLOCK_I4_128: u32 = 72;
 pub const GROUP_BYTES: u32 = 136;
 /// Row tiles per raster band (IU4_RASTER_BAND).
 pub const RASTER_BAND: u32 = 8;
+/// Rows of the fused projection's Z fold: Z, then beta in rows 0..47 and
+/// alpha in rows 64..111 of one extra 128-row tile (zero rows elsewhere), so
+/// each beta/alpha half is one pair of wave row groups.
+pub const GDN_FOLD_EXTRA_ROWS: u32 = 128;
+pub const GDN_FOLD_ALPHA_ROW: u32 = 64;
+/// Explicit kernarg bytes of the fused projection (hidden arguments follow).
+pub const GDN_KERNARG_BYTES: u32 = 120;
 
 /// LDS byte layout. Every plane is a separate builder slot so each publish and
 /// retirement is a checked transition. `DS`/`SZ` hold one f32 per token/row
@@ -73,8 +82,8 @@ impl Fold {
 }
 
 impl Epi {
-    pub fn variant(self) -> Variant { match self { Self::Set => Variant::FullSet, Self::Add => Variant::FullAdd, Self::GateUpSilu | Self::GateUpSiluBf16 => Variant::GateUpSilu } }
-    pub fn name(self) -> &'static str { match self { Self::Set => "set", Self::Add => "add", Self::GateUpSilu => "silu", Self::GateUpSiluBf16 => "silu-bf16" } }
+    pub fn variant(self) -> Variant { match self { Self::Set | Self::QkvzaGdn => Variant::FullSet, Self::Add => Variant::FullAdd, Self::GateUpSilu | Self::GateUpSiluBf16 => Variant::GateUpSilu } }
+    pub fn name(self) -> &'static str { match self { Self::Set => "set", Self::Add => "add", Self::GateUpSilu => "silu", Self::GateUpSiluBf16 => "silu-bf16", Self::QkvzaGdn => "qkvzagdn" } }
     pub fn is_silu(self) -> bool { matches!(self, Self::GateUpSilu | Self::GateUpSiluBf16) }
 }
 
@@ -92,10 +101,36 @@ impl Spec {
             Epi::Set => "gemm_mq4g256v2_residual_mmq_iu4_full_set",
             Epi::Add => "gemm_mq4g256v2_residual_mmq_iu4_full_add",
             Epi::GateUpSilu | Epi::GateUpSiluBf16 => "gemm_mq4g256v2_gate_up_silu_mmq_iu4",
+            Epi::QkvzaGdn => "gemm_mq4g256v2_residual_mmq_iu4_qkvzagdn",
         };
         format!("{stem}{}{}", self.suffix(), if self.epi == Epi::GateUpSiluBf16 { "_bf16" } else { "" })
     }
-    pub fn kernargs(self) -> KernargLayout { self.epi.variant().kernargs() }
+    /// The fused projection's ABI: pointers Wqkv, Wzfold, Xq, Yz, Ybeta,
+    /// Yalpha; M0, Mz, K, N; pointers ConvW, ConvState, Q, K16, V, X (raw
+    /// rows for `gdn_chunk_prep_fixup`); QScale, Eps; then K1's hidden block.
+    pub fn kernargs(self) -> KernargLayout {
+        if self.epi != Epi::QkvzaGdn { return self.epi.variant().kernargs() }
+        let mut args = KernargLayout::new(GDN_KERNARG_BYTES + 256);
+        for (i, name) in ["Wqkv", "Wz", "Xq", "Yz", "Ybeta", "Yalpha"].iter().enumerate() { args = args.pointer(name, 8 * i as u32); }
+        for (i, name) in ["M0", "Mz", "K", "N"].iter().enumerate() { args = args.hidden(name, 48 + 4 * i as u32, 4, "by_value"); }
+        for (i, name) in ["ConvW", "ConvState", "Q", "K16", "V", "X"].iter().enumerate() { args = args.pointer(name, 64 + 8 * i as u32); }
+        args = args.hidden("QScale", 112, 4, "by_value").hidden("Eps", 116, 4, "by_value");
+        let h = GDN_KERNARG_BYTES;
+        for (i, name) in ["x", "y", "z"].iter().enumerate() {
+            args = args.hidden(&format!("hidden_block_count_{name}"), h + 4 * i as u32, 4, &format!("hidden_block_count_{name}"));
+        }
+        for (i, name) in ["x", "y", "z"].iter().enumerate() {
+            args = args.hidden(&format!("hidden_group_size_{name}"), h + 12 + 2 * i as u32, 2, &format!("hidden_group_size_{name}"));
+        }
+        for (i, name) in ["x", "y", "z"].iter().enumerate() {
+            args = args.hidden(&format!("hidden_remainder_{name}"), h + 18 + 2 * i as u32, 2, &format!("hidden_remainder_{name}"));
+        }
+        for (i, name) in ["x", "y", "z"].iter().enumerate() {
+            args = args.hidden(&format!("hidden_global_offset_{name}"), h + 40 + 8 * i as u32, 8, &format!("hidden_global_offset_{name}"));
+        }
+        args.hidden("hidden_grid_dims", h + 64, 2, "hidden_grid_dims")
+            .hidden("hidden_dynamic_lds_size", h + 120, 4, "hidden_dynamic_lds_size")
+    }
     pub fn variant_name(self) -> String {
         format!("{}-{}-{}{}-{}",
             match self.fold { Fold::K128 => "k128", Fold::K256Shared => "k256s", Fold::K256Pow2 => "k256p" },
@@ -111,6 +146,7 @@ impl Spec {
         if self.cacc != Cacc::One { return Err("Cacc::Two is dropped by G0g: it cannot fit the 192-VGPR occupancy ceiling".into()) }
         if self.epi == Epi::GateUpSiluBf16 && self.tile != Tile::T128x128x8 { return Err("packed bf16 h is emitted only for the production _b1 tile".into()) }
         if self.act == ALayout::Slab && self.tile != Tile::T128x128x8 { return Err("the slab activation layout is emitted only for the production _b1 tile".into()) }
+        if self.epi == Epi::QkvzaGdn && self.tile != Tile::T128x128x8 { return Err("the fused GDN projection needs the 128-row tile (one head per tile)".into()) }
         Ok(())
     }
 }
@@ -118,5 +154,5 @@ impl Spec {
 impl std::str::FromStr for Fold { type Err = String; fn from_str(s: &str) -> Result<Self, String> { match s { "k128" => Ok(Self::K128), "k256s" => Ok(Self::K256Shared), "k256p" => Ok(Self::K256Pow2), _ => Err(format!("unknown fold {s}")) } } }
 impl std::str::FromStr for Tile { type Err = String; fn from_str(s: &str) -> Result<Self, String> { match s { "128x128x8" => Ok(Self::T128x128x8), "256x128x16" => Ok(Self::T256x128x16), _ => Err(format!("unknown tile {s}")) } } }
 impl std::str::FromStr for Cacc { type Err = String; fn from_str(s: &str) -> Result<Self, String> { match s { "1" => Ok(Self::One), "2" => Ok(Self::Two), _ => Err(format!("unknown cacc {s}")) } } }
-impl std::str::FromStr for Epi { type Err = String; fn from_str(s: &str) -> Result<Self, String> { match s { "set" => Ok(Self::Set), "add" => Ok(Self::Add), "silu" => Ok(Self::GateUpSilu), "silu-bf16" => Ok(Self::GateUpSiluBf16), _ => Err(format!("unknown epilogue {s}")) } } }
+impl std::str::FromStr for Epi { type Err = String; fn from_str(s: &str) -> Result<Self, String> { match s { "set" => Ok(Self::Set), "add" => Ok(Self::Add), "silu" => Ok(Self::GateUpSilu), "silu-bf16" => Ok(Self::GateUpSiluBf16), "qkvzagdn" => Ok(Self::QkvzaGdn), _ => Err(format!("unknown epilogue {s}")) } } }
 impl std::str::FromStr for ALayout { type Err = String; fn from_str(s: &str) -> Result<Self, String> { match s { "token" => Ok(Self::Token), "slab" => Ok(Self::Slab), _ => Err(format!("unknown activation layout {s}")) } } }

@@ -19,6 +19,7 @@ pub mod fold;
 pub mod publish;
 pub mod epilogue;
 pub mod region;
+pub mod gdn_epilogue;
 
 pub use spec::{ALayout, Cacc, Epi, Fold, Spec, Tile};
 use crate::{Builder, Emitted, KernelSpec, RegPlan, insn::{Instruction, MemoryClass, Sop}, reg::{Kind, Live, RegRef}};
@@ -31,6 +32,8 @@ pub(crate) const K_LOOP: &str = ".Liu4_k_loop";
 pub(crate) const K_LOOP_END: &str = ".Liu4_k_loop_end";
 pub(crate) const EPI: &str = ".Liu4_epilogue";
 pub(crate) const END: &str = ".Liu4_end";
+/// Fused projection only: the QKV tiles' GDN preparation (after the stores).
+pub(crate) const GDN: &str = ".Liu4_gdn";
 
 pub(crate) fn v(n: u8) -> RegRef { RegRef { kind: Kind::V, base: n, len: 1 } }
 pub(crate) fn vr(n: u8, len: u8) -> RegRef { RegRef { kind: Kind::V, base: n, len } }
@@ -96,6 +99,10 @@ impl Gen {
         let tile = spec.tile;
         let args = if spec.epi.is_silu() {
             Args { a: 8, u: Some(10), xq: 12, y: 14, m: 16, k: 17, n: 18, bcx: 20, bcy: 21 }
+        } else if spec.epi == Epi::QkvzaGdn {
+            // s[8:15] Wqkv Wz Xq Yz, s[16:23] Ybeta Yalpha M0 Mz K N; the block
+            // counts load into s[28:29]; s30 is the selected segment's rows.
+            Args { a: 8, u: None, xq: 12, y: 14, m: 30, k: 22, n: 23, bcx: 28, bcy: 29 }
         } else {
             Args { a: 8, u: None, xq: 10, y: 12, m: 14, k: 15, n: 16, bcx: 18, bcy: 19 }
         };
@@ -125,12 +132,17 @@ impl Gen {
 
     /// Whole-kernel and phase-scoped ranges. Per-block fragment/fold aliases
     /// are declared by the K-loop generator with label-delimited lifetimes.
+    /// The fused projection ends the K-loop/store registers at its GDN label,
+    /// where `gdn_epilogue` reuses them.
     fn plan(&self) -> Result<RegPlan, String> {
+        let gdn = self.spec.epi == Epi::QkvzaGdn;
         let mut p = RegPlan::new(spec::VGPR_CEILING, 104)?;
         let pro = || Live::Between(ENTRY.into(), K_BEGIN.into());
         let kl = || Live::Between(K_BEGIN.into(), EPI.into());
         let kernel = || Live::Between(ENTRY.into(), EPI.into());
-        let epi = || Live::Between(EPI.into(), END.into());
+        let epi = || if gdn { Live::Between(EPI.into(), GDN.into()) } else { Live::Between(EPI.into(), END.into()) };
+        // Kernel-wide SGPRs the GDN path reuses.
+        let shared = || if gdn { Live::Between(ENTRY.into(), GDN.into()) } else { Live::Whole };
         for i in 0..8u8 { p.v::<8>(CACC_NAMES[usize::from(i)], self.cacc + 8 * i, kl())?; }
         for i in 0..PRO_TEMPS { p.v::<1>(if i == 0 { "tid" } else { "prologue_tmp" }, i, pro())?; }
         for i in 0..8u8 { p.v::<8>(ACC_NAMES[usize::from(i)], self.acc + 8 * i, Live::Whole)?; }
@@ -155,19 +167,22 @@ impl Gen {
         p.s::<2>("kernarg_ptr", self.karg, Live::Whole)?;
         p.s::<8>("kernargs_0x00", 8, Live::Whole)?;
         p.s::<8>("kernargs_0x20", 16, Live::Whole)?;
-        p.s::<4>("srd_w", self.srd_w, Live::Whole)?;
+        p.s::<4>("srd_w", self.srd_w, shared())?;
         if self.srd_z != self.srd_w { p.s::<4>("srd_z", self.srd_z, Live::Whole)?; }
-        p.s::<4>("srd_a0", self.srd_a[0], Live::Whole)?;
-        p.s::<4>("srd_a1", self.srd_a[1], Live::Whole)?;
-        if let Some(r) = self.a_slab1 { p.s::<1>("a_slab1_soff", r, Live::Whole)?; }
-        p.s::<4>("srd_y", self.srd_y, Live::Whole)?;
-        p.s::<2>("a_step2", self.step2, Live::Whole)?;
+        if gdn { p.s::<4>("block_counts_segment", 28, shared())?; }
+        p.s::<4>("srd_a0", self.srd_a[0], shared())?;
+        p.s::<4>("srd_a1", self.srd_a[1], shared())?;
+        if let Some(r) = self.a_slab1 { p.s::<1>("a_slab1_soff", r, shared())?; }
+        p.s::<4>("srd_y", self.srd_y, shared())?;
+        p.s::<2>("a_step2", self.step2, shared())?;
         for (name, r) in [("goff", self.goff), ("trips", self.trips), ("rs", self.rs), ("bs", self.bs), ("wave", self.wave),
             ("gpr136", self.gpr136), ("m_minus_1", self.mm1), ("hs", self.hs), ("rows", 54), ("scratch_s55", 55)] {
-            p.s::<1>(name, r, Live::Whole)?;
+            // rs, bs and the wave index stay live into the GDN path.
+            p.s::<1>(name, r, if matches!(name, "rs" | "bs" | "wave") { Live::Whole } else { shared() })?;
         }
-        for i in 0..S_TEMPS { p.s::<1>("s_tmp", self.tmp + i, Live::Whole)?; }
-        for i in 0..EPI_S { p.s::<1>("epi_s", self.epi_s + i, Live::Whole)?; }
+        for i in 0..S_TEMPS { p.s::<1>("s_tmp", self.tmp + i, shared())?; }
+        for i in 0..EPI_S { p.s::<1>("epi_s", self.epi_s + i, shared())?; }
+        if gdn { gdn_epilogue::plan(&mut p)?; }
         Ok(p)
     }
 
@@ -197,6 +212,7 @@ pub fn emit(spec: Spec) -> Result<Emitted, String> {
     prologue::emit(&mut b, &g)?;
     kloop::emit(&mut b, &g)?;
     epilogue::emit(&mut b, &g)?;
+    if spec.epi == Epi::QkvzaGdn { gdn_epilogue::emit(&mut b, &g)?; }
     b.label(END)?;
     b.push(Sop::End.encode(spec.arch)?)?;
     b.finish()
@@ -241,10 +257,12 @@ pub fn module(emitted: &[Emitted], name: &str) -> Result<(String, ModuleProof), 
     Ok((text, proof))
 }
 
-/// All original epilogue symbols plus packed bf16 h for the production tile.
+/// All original epilogue symbols plus packed bf16 h and the fused GDN input
+/// projection for the production tile.
 pub fn emit_module(fold: Fold, tile: Tile, cacc: Cacc, act: ALayout, arch: crate::Arch) -> Result<(Vec<Emitted>, String, ModuleProof), String> {
     let mut epis = vec![Epi::Set, Epi::Add, Epi::GateUpSilu];
     if tile == Tile::T128x128x8 { epis.push(Epi::GateUpSiluBf16); }
+    if tile == Tile::T128x128x8 && act == ALayout::Token { epis.push(Epi::QkvzaGdn); }
     let emitted = epis.into_iter().map(|epi| emit(Spec { fold, tile, cacc, epi, act, arch })).collect::<Result<Vec<_>, _>>()?;
     let (text, proof) = module(&emitted, &Spec { fold, tile, cacc, epi: Epi::Set, act, arch }.module())?;
     Ok((emitted, text, proof))

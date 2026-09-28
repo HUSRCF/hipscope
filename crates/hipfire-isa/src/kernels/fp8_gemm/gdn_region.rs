@@ -1,4 +1,5 @@
-//! Imported hipcc regions of `gdn_chunk_prep` for the F2 QKVZA+GDN epilogue.
+//! Imported hipcc regions of `gdn_chunk_prep` for the F2 QKVZA+GDN epilogue
+//! (and the A4 `_b1` fused projection, `iu4_gemm::gdn_epilogue`).
 //!
 //! The per-token arithmetic of the GDN preparation (width-4 causal conv1d,
 //! SiLU, the q/k head RMS norm with its xor butterfly, the q scale and the

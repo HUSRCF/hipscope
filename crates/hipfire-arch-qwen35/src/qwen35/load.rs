@@ -2916,7 +2916,9 @@ fn load_layer_into(
 /// MQ4V2's 136-byte groups contain both half-group headers inline, and rows
 /// are consecutive groups. Appending complete rows therefore preserves every
 /// scale, zero and nibble verbatim; zero rows complete the SET's M128 tile
-/// (M256 on Halo). Keep the original beta/alpha owners for decode/fallback.
+/// (M256 on Halo). gfx1201's fused A4 projection instead places beta at row
+/// 0 and alpha at row 64 of the extra tile (`Gpu::iu4_gdn_fold_rows`). Keep
+/// the original beta/alpha owners for decode/fallback.
 fn append_betaalpha_to_z(
     hfq: &HfqFile,
     gpu: &mut Gpu,
@@ -2924,16 +2926,22 @@ fn append_betaalpha_to_z(
     dn: &mut DeltaNetLayerWeights,
 ) -> HipResult<()> {
     let (qkv, z, beta, alpha) = (&dn.wqkv, &mut dn.wz, &dn.w_beta, &dn.w_alpha);
+    let gfx12 = gpu.iu4_gdn_fold_active([qkv.m, z.m, beta.m, alpha.m], qkv.k);
     if [qkv.gpu_dtype, z.gpu_dtype, beta.gpu_dtype, alpha.gpu_dtype]
         != [DType::MQ4G256V2; 4]
-        || !gpu.mq4v2_fold_betaalpha_active(qkv.m, z.m, beta.m, alpha.m, qkv.k, 512)
+        || !(gfx12 || gpu.mq4v2_fold_betaalpha_active(qkv.m, z.m, beta.m, alpha.m, qkv.k, 512))
         || [z.k, beta.k, alpha.k] != [qkv.k; 3]
     {
         return Ok(());
     }
     let row_bytes = (z.k / 256) * rdna_compute::MQ4V2_GROUP_BYTES;
-    let mut rows = vec![0u8; gpu.mq4v2_fold_betaalpha_padded_m(z.m) * row_bytes];
-    for (stem, start, count) in [("z", 0, z.m), ("b", z.m, beta.m), ("a", z.m + beta.m, alpha.m)] {
+    let (total, beta_row, alpha_row) = if gfx12 {
+        Gpu::iu4_gdn_fold_rows(z.m)
+    } else {
+        (gpu.mq4v2_fold_betaalpha_padded_m(z.m), z.m, z.m + beta.m)
+    };
+    let mut rows = vec![0u8; total * row_bytes];
+    for (stem, start, count) in [("z", 0, z.m), ("b", beta_row, beta.m), ("a", alpha_row, alpha.m)] {
         let name = format!("{prefix}.linear_attn.in_proj_{stem}.weight");
         let (info, data) = qwen35_tensor_data_cow(hfq, &name)
             .ok_or_else(|| HipError::new(0, &format!("fold weight missing: {name}")))?;

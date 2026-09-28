@@ -412,7 +412,10 @@ pub fn certify(toolchain: &Toolchain, build: &BuildOutput, source: &Path, arch: 
         if kd.private_segment_size != 0 || kd.group_segment_size != 0 || !kd.wave32 {
             return Err(format!("kernel descriptor violates custom-arm resources: {kd:?}"));
         }
-        if contract.symbol.starts_with("gemm_mq4g256v2_fp8_") {
+        // The register-use audit covers every builder symbol that reuses
+        // registers across phases: F2 and the fused A4 GDN projection.
+        let gdn_iu4=contract.symbol.contains("_iu4_qkvzagdn_");
+        if contract.symbol.starts_with("gemm_mq4g256v2_fp8_") || gdn_iu4 {
             let mut highest_v=0u32;
             let mut highest_s=0u32;
             let mut in_symbol=false;
@@ -434,7 +437,7 @@ pub fn certify(toolchain: &Toolchain, build: &BuildOutput, source: &Path, arch: 
             let descriptor_vgprs=((kd.compute_pgm_rsrc1&0x3f)+1)*8;
             if highest_v>descriptor_vgprs || highest_v>report.vgpr_count
                 || highest_s>report.sgpr_count || descriptor_vgprs!=report.vgpr_count {
-                return Err(format!("F2 register use v{highest_v}/s{highest_s} exceeds descriptor/report reservation v{descriptor_vgprs}/s{}",report.sgpr_count));
+                return Err(format!("register use v{highest_v}/s{highest_s} exceeds descriptor/report reservation v{descriptor_vgprs}/s{}",report.sgpr_count));
             }
             shape.max_used_vgpr=Some(highest_v);
             shape.max_used_sgpr=Some(highest_s);
@@ -446,6 +449,17 @@ pub fn certify(toolchain: &Toolchain, build: &BuildOutput, source: &Path, arch: 
             let max_end=crate::kernels::fp8_gemm::spec::check_lds_access(&source_text,&contract.symbol,dynamic)?;
             if max_end>kd.group_segment_size+dynamic {
                 return Err(format!("F2 LDS access ends at {max_end} beyond launch allocation {}",kd.group_segment_size+dynamic));
+            }
+            shape.launch_dynamic_lds_bytes=Some(dynamic);
+            shape.max_lds_access_end=Some(max_end);
+        }
+        if gdn_iu4 {
+            let dynamic=contract.launch_dynamic_lds_bytes.ok_or("iu4 GDN contract missing launch dynamic LDS bytes")?;
+            let source_text=fs::read_to_string(source).map_err(|e|e.to_string())?;
+            let gdn_end=crate::kernels::iu4_gemm::gdn_epilogue::check_lds_access(&source_text,&contract.symbol,dynamic)?;
+            let max_end=gdn_end.max(crate::kernels::iu4_gemm::Tile::T128x128x8.layout().end);
+            if max_end>kd.group_segment_size+dynamic {
+                return Err(format!("iu4 GDN LDS access ends at {max_end} beyond launch allocation {}",kd.group_segment_size+dynamic));
             }
             shape.launch_dynamic_lds_bytes=Some(dynamic);
             shape.max_lds_access_end=Some(max_end);
