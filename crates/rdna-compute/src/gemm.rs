@@ -534,6 +534,18 @@ const PM_V2B_SILU: &str = "gemm_mq4g256v2_gate_up_silu_iu4_pm_v2b_gfx1151";
 /// at least 16 K128 epochs.
 const PM_V2B_ADD_MIN_K: usize = 2048;
 
+/// Developer same-binary A/B of the gfx1151 V2B builder bundle (for example
+/// the previous certified bundle as the opt-out arm):
+/// `HIPFIRE_V2B_PM_BUNDLE=<path>` loads it from a file instead of the
+/// embedded image. Read once; an unreadable file fails every V2B builder launch.
+static V2B_PM_BUNDLE: LazyLock<BundleOverride> =
+    LazyLock::new(|| g12_iu4_bundle_override("HIPFIRE_V2B_PM_BUNDLE"));
+
+#[inline]
+fn v2b_pm_image() -> HipResult<&'static [u8]> {
+    g12_iu4_bundle(&V2B_PM_BUNDLE, kernels::GEMM_MQ4G256V2_RESIDUAL_IU4_PM_V2B_GFX1151)
+}
+
 /// Builder twin of a hipcc V2B entry (gfx1151 only: the V2B tile is), with
 /// the builder ADD's log2 raster group; `None` keeps the hipcc entry.
 /// `HIPFIRE_V2B_PM=0` restores every hipcc entry. The Z|beta|alpha
@@ -20634,11 +20646,7 @@ impl Gpu {
             let pm = v2b_pm_entry(kernel_name, swz_grp, m, k);
             let launch_name = match pm {
                 Some((name, _)) => {
-                    self.ensure_embedded_kernel(
-                        PM_V2B_MODULE,
-                        kernels::GEMM_MQ4G256V2_RESIDUAL_IU4_PM_V2B_GFX1151,
-                        name,
-                    )?;
+                    self.ensure_embedded_kernel(PM_V2B_MODULE, v2b_pm_image()?, name)?;
                     name
                 }
                 None => {
@@ -32866,7 +32874,7 @@ impl Gpu {
         };
         let kernel_name = match v2b_pm {
             Some(name) => {
-                self.ensure_embedded_kernel(PM_V2B_MODULE, kernels::GEMM_MQ4G256V2_RESIDUAL_IU4_PM_V2B_GFX1151, name)?;
+                self.ensure_embedded_kernel(PM_V2B_MODULE, v2b_pm_image()?, name)?;
                 name
             }
             None if pm => {

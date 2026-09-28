@@ -22,6 +22,9 @@
 //! word's rows come from one weight tensor: word `w` of lane `(hi, lr)` holds
 //! the row of wave fragment `w + 2*(lr>>3)`, so pass `a` shares word `a&1`
 //! from lane `8*(a>>1) + j` (gate rows and up rows never share a word).
+//! Fold products sit at `t + (j^2)` so no fmac half reads one VGPR bank
+//! three times. The SET stores each pass's final sums one b128 per WMMA step
+//! during the last epoch; ADD and SiLU store after the K loop.
 //!
 //! Launch contracts (block `[512,1,1]`, dynamic LDS 65536; `M % 256 ==
 //! N % 256 == 0`, `K % 256 == 0`; Y token-major `[N][M]` f32):
@@ -132,6 +135,9 @@ impl Regs {
     /// scale), each an aligned pair: M7 sizes a VOP3 SGPR destination as a
     /// lane-mask pair.
     const MASK: u8 = 48;
+    /// SET with early stores: Y bases of token fragments 1..3 (fragment 0
+    /// uses SY), in the SiLU entry's mask range.
+    const SYC: [u8; 3] = [48, 50, 52];
 }
 
 /// Kernel-argument SGPRs of one entry.
@@ -156,7 +162,7 @@ enum Sched {
     Early,
 }
 
-struct Gen { spec: Spec, args: Args, sched: Sched }
+struct Gen { spec: Spec, args: Args, sched: Sched, early: bool }
 
 impl Gen {
     fn new(spec: Spec) -> Self {
@@ -170,7 +176,11 @@ impl Gen {
         // in the epoch head, which `Early` would move across the touch
         // loop's boundary, so it keeps `Defer`.
         let sched = if spec.epi == Epi::Add { Sched::Defer } else { Sched::Early };
-        Self { spec, args, sched }
+        // The SET stores each pass's final sums during the last epoch
+        // (`early_store`). The ADD's residual rings and the SiLU's
+        // temporaries need VGPRs the K loop still holds, so they store after it.
+        let early = spec.epi == Epi::Set;
+        Self { spec, args, sched, early }
     }
     fn label(&self, name: &str) -> String { format!(".Lv2b_{}_{name}", self.spec.epi.tag()) }
     fn silu(&self) -> bool { self.spec.epi == Epi::GateUpSilu }
@@ -189,7 +199,7 @@ impl Gen {
         let body = || Live::Between(l("epi_body"), l("end"));
         for c in 0..4u8 { p.v::<8>("C", Regs::C + 8 * c, kl())?; }
         for i in 0..32u8 { p.v::<1>(if i == 0 { "tid" } else { "prologue_tmp" }, Regs::C + i, pro())?; }
-        for i in 0..4u8 { p.v::<1>("y_off_c", Regs::C + i, epi())?; }
+        if !self.early { for i in 0..4u8 { p.v::<1>("y_off_c", Regs::C + i, epi())?; } }
         for k in 0..16u8 { p.v::<8>("acc", Regs::ACC + 8 * k, Live::Whole)?; }
         p.v::<8>("magic8", Regs::MAGIC, kernel())?;
         // The prologue issues the first epoch's step-0 fragment loads.
@@ -201,7 +211,7 @@ impl Gen {
         for r in Regs::DC { p.v::<4>("d_x", r, kernel())?; }
         for r in Regs::WSF { p.v::<1>("scale_f32", r, kl())?; }
         for r in Regs::WS { p.v::<1>("scale_f16", r, kernel())?; }
-        p.v::<1>("y_off", Regs::YOFF, Live::Between("entry".into(), l("epi_body")))?;
+        p.v::<1>("y_off", Regs::YOFF, Live::Between("entry".into(), l(if self.early { "end" } else { "epi_body" })))?;
         for i in 0..4u8 { p.v::<2>("stage_a", Regs::STA + 2 * i, kernel())?; p.v::<2>("stage_x", Regs::STX + 2 * i, kernel())?; }
         for (name, r) in [("a_off", Regs::A_OFF), ("x_off", Regs::X_OFF), ("lws", Regs::LWS), ("lxs", Regs::LXS), ("st", Regs::ST),
             ("ab00", Regs::AB[0][0]), ("ab01", Regs::AB[0][1]), ("ab10", Regs::AB[1][0]), ("ab11", Regs::AB[1][1]),
@@ -242,6 +252,7 @@ impl Gen {
             p.s::<1>("token_tile", Regs::BX, Live::Whole)?;
             p.s::<2>("touch_base", Regs::STB, Live::Whole)?;
         }
+        if self.early { for r in Regs::SYC { p.s::<2>("y_base_c", r, Live::Whole)?; } }
         Ok(p)
     }
 }
@@ -358,6 +369,15 @@ fn prologue(b: &mut Builder, g: &Gen) -> Result<(), String> {
     op(b, format!("s_lshl_b64 s[{lo}:{hi}], s[{lo}:{hi}], 2"), &[sr(lo, 2)], &[sr(lo, 2)])?;
     salu(b, format!("s_add_u32 s{}, s{}, s{lo}", Regs::SY, a.y), &[Regs::SY], &[a.y, lo])?;
     salu(b, format!("s_addc_u32 s{}, s{}, s{hi}", Regs::SY + 1, a.y + 1), &[Regs::SY + 1], &[a.y + 1, hi])?;
+    if g.early {
+        // Token fragment c's Y base = SY + c*16*M*4 (M64 bytes per fragment).
+        let mut prev = Regs::SY;
+        for r in Regs::SYC {
+            salu(b, format!("s_add_u32 s{r}, s{prev}, s{}", Regs::M64), &[r], &[prev, Regs::M64])?;
+            salu(b, format!("s_addc_u32 s{}, s{}, 0", r + 1, prev + 1), &[r + 1], &[prev + 1])?;
+            prev = r;
+        }
+    }
 
     // Staging: lane (hi, lr) of wave w loads row/token 16w + lr's K16 slice
     // pair i at +8 (header / d,s skip) + 8*hi + 16*i.
@@ -492,18 +512,23 @@ fn fold(b: &mut Builder, a: u8, dc: u8) -> Result<(), String> {
     for c in 0..4u8 {
         // t_j = d_c * sc_j paired with C[c][j^1] += -1.5*2^23 (opposite
         // destination parity, distinct src1 banks); then the fmac pairs,
-        // each at least six packets after the products it reads.
+        // each at least four packets after the products it reads.
+        // Element j's product sits at t + (j^2): acc and C of element j are
+        // both in VGPR bank j%4, so an fmac half then reads that bank twice
+        // and bank (j^2)%4 once instead of bank j%4 three times (HaloR2
+        // price list: fmac packets cost 2.3-2.9 cycles, mul/add ~1.1).
         let t = Regs::T;
+        let ts = |j: u8| t + (j ^ 2);
         for j in 0..8u8 {
-            let mul = VopdOp { op: VopdF32::Mul, dst: t + j, src0: Operand::V(dc + c), src1: Regs::SCF + j };
+            let mul = VopdOp { op: VopdF32::Mul, dst: ts(j), src0: Operand::V(dc + c), src1: Regs::SCF + j };
             let cf = Regs::C + 8 * c + (j ^ 1);
             let add = VopdOp { op: VopdF32::Add, dst: cf, src0: Operand::Lit(MAGIC_NEG), src1: cf };
             b.vopd(mul, add)?;
         }
         let acc = Regs::ACC + 8 * (4 * a + c);
         for j in (0..8u8).step_by(2) {
-            let x = VopdOp { op: VopdF32::Fmac, dst: acc + j, src0: Operand::V(t + j), src1: Regs::C + 8 * c + j };
-            let y = VopdOp { op: VopdF32::Fmac, dst: acc + j + 1, src0: Operand::V(t + j + 1), src1: Regs::C + 8 * c + j + 1 };
+            let x = VopdOp { op: VopdF32::Fmac, dst: acc + j, src0: Operand::V(ts(j)), src1: Regs::C + 8 * c + j };
+            let y = VopdOp { op: VopdF32::Fmac, dst: acc + j + 1, src0: Operand::V(ts(j + 1)), src1: Regs::C + 8 * c + j + 1 };
             b.vopd(x, y)?;
         }
     }
@@ -549,14 +574,24 @@ fn head(b: &mut Builder, p: usize, stage: bool, touch: bool) -> Result<(), Strin
 fn epoch(b: &mut Builder, g: &Gen, p: usize, next: bool, succ_stages: bool, touch: bool) -> Result<(), String> {
     let sched = g.sched;
     if sched != Sched::Early { head(b, p, next, touch)?; }
+    // Early stores (SET): in the last epoch, pass a's final sums are stored
+    // one b128 per WMMA step of pass a+1, spreading the tile's Y writes over
+    // the epoch instead of bursting them after it.
+    let mut pending: Vec<(u8, u8, u8)> = Vec::new();
     for i in 0..32 {
         if i + 1 < 32 { step_loads(b, p, i + 1)?; }
         step_wmma(b, i)?;
+        if let Some((a, c, q)) = pending.pop() { early_store(b, a, c, q)?; }
         if i % 8 == 7 && i < 31 {
             fold(b, (i / 8) as u8, Regs::DC[p])?;
             if next && i / 8 == PUBLISH_AFTER_PASS { stage_store(b, 1 - p)?; }
+            if g.early && !next {
+                let a = (i / 8) as u8;
+                for c in (0..4u8).rev() { for q in (0..2u8).rev() { pending.push((a, c, q)); } }
+            }
         }
     }
+    if !pending.is_empty() { return Err("early stores left pending".into()) }
     if next {
         b.barrier(&[Transition::Retire(SLOT_A[p]), Transition::Retire(SLOT_X[p]), Transition::Ready(SLOT_A[1 - p]), Transition::Ready(SLOT_X[1 - p])])?;
         step_loads(b, 1 - p, 0)?;
@@ -606,15 +641,27 @@ fn kloop(b: &mut Builder, g: &Gen) -> Result<(), String> {
     epoch(b, g, 1, false, false, false)
 }
 
+/// One b128 of pass `a`, token fragment `c`, row quad `q` (SET): Y bases are
+/// per-fragment SGPR pairs so the store needs no VGPR beyond YOFF.
+fn early_store(b: &mut Builder, a: u8, c: u8, q: u8) -> Result<(), String> {
+    let base = if c == 0 { Regs::SY } else { Regs::SYC[usize::from(c - 1)] };
+    let data = vr(acc(a, c) + 4 * q, 4);
+    mem(b, format!("global_store_b128 v{}, {data}, s[{base}:{}]{}", Regs::YOFF, base + 1, off(4 * (16 * u32::from(a) + 4 * u32::from(q)))?),
+        &[], &[v(Regs::YOFF), data, sr(base, 2)], MemoryClass::VmemStore)
+}
+
 fn acc(a: u8, c: u8) -> u8 { Regs::ACC + 8 * (4 * a + c) }
 
 /// Lane (hi, lr) owns rows 8hi..8hi+7 of each fragment for one token; token
-/// fragment c is 16*M*4 bytes further (v0..v3 = its Y offsets).
+/// fragment c is 16*M*4 bytes further (v0..v3 = its Y offsets; the SET's
+/// early stores use per-fragment SGPR bases instead).
 fn epilogue(b: &mut Builder, g: &Gen) -> Result<(), String> {
     b.label(&g.label("epilogue"))?;
-    op(b, format!("v_mov_b32_e32 v0, v{}", Regs::YOFF), &[v(0)], &[v(Regs::YOFF)])?;
-    for c in 1..4u8 {
-        op(b, format!("v_add_nc_u32_e32 v{c}, s{}, v{}", Regs::M64, c - 1), &[v(c)], &[s(Regs::M64), v(c - 1)])?;
+    if !g.early {
+        op(b, format!("v_mov_b32_e32 v0, v{}", Regs::YOFF), &[v(0)], &[v(Regs::YOFF)])?;
+        for c in 1..4u8 {
+            op(b, format!("v_add_nc_u32_e32 v{c}, s{}, v{}", Regs::M64, c - 1), &[v(c)], &[s(Regs::M64), v(c - 1)])?;
+        }
     }
     b.label(&g.label("epi_body"))?;
     let store = |b: &mut Builder, c: u8, data: u8, offset: u32| -> Result<(), String> {
@@ -622,6 +669,9 @@ fn epilogue(b: &mut Builder, g: &Gen) -> Result<(), String> {
         mem(b, format!("global_store_b128 v{c}, {data}, s[{}:{}]{}", Regs::SY, Regs::SY + 1, off(offset)?), &[], &[v(c), data, sr(Regs::SY, 2)], MemoryClass::VmemStore)
     };
     match g.spec.epi {
+        Epi::Set if g.early => {
+            for c in 0..4u8 { for q in 0..2u8 { early_store(b, 3, c, q)?; } }
+        }
         Epi::Set => {
             for c in 0..4u8 { for a in 0..4u8 { for q in 0..2u8 {
                 store(b, c, acc(a, c) + 4 * q, 4 * (16 * u32::from(a) + 4 * u32::from(q)))?;
