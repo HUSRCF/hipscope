@@ -497,8 +497,8 @@ const PM_V2B_MODULE: &str = "gemm_mq4g256v2_residual_iu4_pm_v2b_gfx1151";
 const PM_V2B_SET: &str = "gemm_mq4g256v2_residual_iu4_pm_v2b_set_gfx1151";
 const PM_V2B_ADD: &str = "gemm_mq4g256v2_residual_iu4_pm_v2b_add_gfx1151";
 const PM_V2B_SILU: &str = "gemm_mq4g256v2_gate_up_silu_iu4_pm_v2b_gfx1151";
-/// The builder ADD touches the residual over epochs E-16..E-8, so it needs
-/// at least that many K128 epochs.
+/// The builder ADD touches the residual over epochs E-16..E-9, so it needs
+/// at least 16 K128 epochs.
 const PM_V2B_ADD_MIN_K: usize = 2048;
 
 /// Builder twin of a hipcc V2B entry (gfx1151 only: the V2B tile is), with
