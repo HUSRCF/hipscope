@@ -2910,7 +2910,63 @@ fn load_layer_into(
             return Err(e);
         }
     }
+    if let Err(e) = attach_awq_rcp_planes(hfq, gpu, p, &mut layer) {
+        layer.free_gpu(gpu);
+        return Err(e);
+    }
     Ok(layer)
+}
+
+/// gfx1201 A4 RMSNorm producer divide (`HIPFIRE_A4_RMS_FDIV`, see
+/// `rdna_compute::gemv::awq_rcp_planes`): re-read the AWQ sidecar of each
+/// linear an RMSNorm producer feeds (DeltaNet `in_proj_qkv`, attention
+/// `q_proj`, `mlp.gate_proj`) from the checkpoint and replace its device
+/// scale by `[a][R][Rlo]` under shape `[k, 3]`. The `a` plane is the same
+/// f16 -> f32 decode as `load_awq_scale_for`; the planes add 8 B per scale
+/// element (5.2 MB for H2's 128 scales of K 5120). Computed at every load,
+/// never cached on disk.
+fn attach_awq_rcp_planes(
+    hfq: &HfqFile,
+    gpu: &mut Gpu,
+    prefix: &str,
+    layer: &mut LayerWeights,
+) -> HipResult<()> {
+    if !gpu.a4_rms_fdiv_planes_wanted() {
+        return Ok(());
+    }
+    let targets: [(&str, &mut WeightTensor); 2] = match layer {
+        LayerWeights::DeltaNet(dn) => {
+            [("linear_attn.in_proj_qkv", &mut dn.wqkv), ("mlp.gate_proj", &mut dn.w_gate)]
+        }
+        LayerWeights::FullAttn(fa) => {
+            [("self_attn.q_proj", &mut fa.wq), ("mlp.gate_proj", &mut fa.w_gate)]
+        }
+        _ => return Ok(()),
+    };
+    for (stem, wt) in targets {
+        if wt.gpu_dtype != DType::MQ4G256V2 || wt.awq_scale.is_none() {
+            continue;
+        }
+        let name = format!("{prefix}.{stem}.awq_scale.weight");
+        let (info, data) = qwen35_tensor_data_cow(hfq, &name)
+            .ok_or_else(|| HipError::new(0, &format!("AWQ sidecar missing: {name}")))?;
+        if info.quant_type != 1 || data.len() != wt.k * 2 {
+            return Err(HipError::new(0, &format!("AWQ sidecar layout mismatch: {name}")));
+        }
+        let awq: Vec<f32> = data
+            .chunks_exact(2)
+            .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+            .collect();
+        let bytes: Vec<u8> = rdna_compute::gemv::awq_rcp_planes(&awq)
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let planes = gpu.upload_raw(&bytes, &[wt.k, rdna_compute::gemv::AWQ_RCP_ROWS])?;
+        if let Some(old) = wt.awq_scale.replace(planes) {
+            gpu.release_tensor_immediate(old)?;
+        }
+    }
+    Ok(())
 }
 
 /// MQ4V2's 136-byte groups contain both half-group headers inline, and rows

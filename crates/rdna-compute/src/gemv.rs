@@ -6,6 +6,68 @@ use hip_bridge::HipResult;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::LazyLock;
+
+/// Rows of an AWQ scale tensor that carries the gfx1201 A4 RMSNorm producer's
+/// reciprocal planes: `[a 0..K-1][R K..2K-1][Rlo 2K..3K-1]` under shape
+/// `[K, AWQ_RCP_ROWS]`. Every other consumer reads only the first K floats.
+pub const AWQ_RCP_ROWS: usize = 3;
+
+/// `[a][R][Rlo]` for the `_v2_slab_fdiv` producer (`HIPFIRE_A4_RMS_FDIV`):
+/// R = RN(1/a) and Rlo = RN(fma(-a, R, 1) * R), so R + Rlo is 1/a to 2^-47
+/// relative; both are NaN unless 2^-20 <= |a| <= 2^20, which sends every
+/// lane that divides by that `a` to the IEEE divide. f32 `/`, `mul_add` and
+/// `*` are IEEE round-to-nearest here as on the GPU.
+pub fn awq_rcp_planes(awq: &[f32]) -> Vec<f32> {
+    let k = awq.len();
+    let mut out = Vec::with_capacity(AWQ_RCP_ROWS * k);
+    out.extend_from_slice(awq);
+    out.resize(AWQ_RCP_ROWS * k, f32::NAN);
+    for (i, &a) in awq.iter().enumerate() {
+        let m = a.abs();
+        if (1.0 / 1_048_576.0..=1_048_576.0).contains(&m) {
+            let r = 1.0f32 / a;
+            out[k + i] = r;
+            out[2 * k + i] = (-a).mul_add(r, 1.0) * r;
+        }
+    }
+    out
+}
+
+/// True when `awq` was loaded with [`awq_rcp_planes`] for input width `k`.
+pub fn awq_has_rcp_planes(awq: &GpuTensor, k: usize) -> bool {
+    awq.shape == [k, AWQ_RCP_ROWS]
+}
+
+#[cfg(test)]
+mod awq_rcp_planes_tests {
+    use super::awq_rcp_planes;
+
+    // The producer's exactness proof covers |a| in [2^-20, 2^20]; every other
+    // scale must reach the kernel as NaN planes so its lanes take the divide.
+    #[test]
+    fn planes_are_exact_reciprocal_pairs_inside_the_proved_range_only() {
+        let lo = 1.0f32 / 1_048_576.0;
+        let hi = 1_048_576.0f32;
+        let below = f32::from_bits(lo.to_bits() - 1);
+        let above = f32::from_bits(hi.to_bits() + 1);
+        let awq = [3.0f32, -0.1, lo, below, hi, above, 0.0, f32::INFINITY, f32::NAN, 1.0];
+        let p = awq_rcp_planes(&awq);
+        let k = awq.len();
+        assert_eq!(p.len(), 3 * k);
+        for (i, &a) in awq.iter().enumerate() {
+            assert_eq!(p[i].to_bits(), a.to_bits(), "scale plane must be verbatim");
+            let (r, rl) = (p[k + i], p[2 * k + i]);
+            if [3.0, -0.1, lo, hi, 1.0].contains(&a) {
+                assert_eq!(r.to_bits(), (1.0f32 / a).to_bits());
+                // R + Rlo is 1/a to 2^-47 relative (the faithful-q0 premise).
+                let err = (r as f64 + rl as f64) * a as f64 - 1.0;
+                assert!(err.abs() <= 2f64.powi(-47), "a={a} err={err}");
+            } else {
+                assert!(r.is_nan() && rl.is_nan(), "a={a} must fall back to the divide");
+            }
+        }
+    }
+}
 static GFX942_ROTATE_LIVE_VALIDATED: AtomicBool = AtomicBool::new(false);
 
 fn gfx942_rotate_live_validation_enabled() -> bool {
@@ -3516,7 +3578,10 @@ impl Gpu {
     /// Seals `reservation` into a prepared handle — never calls
     /// `ensure_int4_mmq_x`. Gated by `HIPFIRE_GFX12_PRODUCER_QUANT_FUSED`;
     /// `HIPFIRE_G12_NORM` (default on) selects the bit-identical `_v2` twins
-    /// (same geometry and arguments).
+    /// (same geometry and arguments). The A4 slab AWQ twin divides with the
+    /// loader's reciprocal planes (`_v2_slab_fdiv`, one extra `awq_rcp`
+    /// argument) when `awq` carries them ([`awq_has_rcp_planes`]) and
+    /// `HIPFIRE_A4_RMS_FDIV` is on.
     pub fn fused_rmsnorm_rotate_mq_i4_gfx12_batched(
         &mut self,
         x: &GpuTensor,
@@ -3538,6 +3603,8 @@ impl Gpu {
         self.ensure_mq_signs()?;
         let v2 = self.flags.g12_norm_enabled();
         let slab = awq.is_some() && v2 && self.a4_slab_active();
+        let fdiv =
+            slab && crate::gemm::a4_rms_fdiv_enabled() && awq.is_some_and(|t| awq_has_rcp_planes(t, k));
         let (module, source, kernel) = match (awq.is_some(), v2) {
             (true, false) => (
                 "fused_rmsnorm_mq_rotate_awq_i4_gfx12",
@@ -3548,6 +3615,11 @@ impl Gpu {
                 "fused_rmsnorm_mq_rotate_i4_gfx12",
                 kernels::FUSED_RMSNORM_MQ_ROTATE_I4_GFX12_SRC,
                 "fused_rmsnorm_mq_rotate_i4_gfx12",
+            ),
+            (true, true) if fdiv => (
+                "fused_rmsnorm_mq_rotate_awq_i4_gfx12_v2_slab_fdiv",
+                kernels::FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_GFX12_V2_SLAB_FDIV_SRC,
+                "fused_rmsnorm_mq_rotate_awq_i4_gfx12_v2_slab_fdiv",
             ),
             (true, true) if slab => (
                 "fused_rmsnorm_mq_rotate_awq_i4_gfx12_v2_slab",
@@ -3571,6 +3643,12 @@ impl Gpu {
         let mut xp = x.buf.as_ptr();
         let mut wp = weight.buf.as_ptr();
         let mut awp = awq.map(|t| t.buf.as_ptr()).unwrap_or(std::ptr::null_mut());
+        // `_fdiv`: the [R][Rlo] planes follow the K scales in the same buffer.
+        let mut arp = if fdiv {
+            awp.wrapping_byte_add(k * std::mem::size_of::<f32>())
+        } else {
+            std::ptr::null_mut()
+        };
         let mut xrp = x_rot
             .map(|t| t.buf.as_ptr())
             .unwrap_or(std::ptr::null_mut());
@@ -3581,10 +3659,15 @@ impl Gpu {
         let mut eps_v = eps;
         let mut nv = batch_size as i32;
         let mut params: Vec<*mut c_void> = if awq.is_some() {
-            vec![
+            let mut p = vec![
                 &mut xp as *mut _ as *mut c_void,
                 &mut wp as *mut _ as *mut c_void,
                 &mut awp as *mut _ as *mut c_void,
+            ];
+            if fdiv {
+                p.push(&mut arp as *mut _ as *mut c_void);
+            }
+            p.extend([
                 &mut s1 as *mut _ as *mut c_void,
                 &mut s2 as *mut _ as *mut c_void,
                 &mut xrp as *mut _ as *mut c_void,
@@ -3592,7 +3675,8 @@ impl Gpu {
                 &mut kv as *mut _ as *mut c_void,
                 &mut eps_v as *mut _ as *mut c_void,
                 &mut nv as *mut _ as *mut c_void,
-            ]
+            ]);
+            p
         } else {
             vec![
                 &mut xp as *mut _ as *mut c_void,
@@ -3636,6 +3720,9 @@ impl Gpu {
                 b.push_ptr(wp);
                 if awq.is_some() {
                     b.push_ptr(awp);
+                }
+                if fdiv {
+                    b.push_ptr(arp);
                 }
                 b.push_ptr(s1);
                 b.push_ptr(s2);

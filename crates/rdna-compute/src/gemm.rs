@@ -374,6 +374,19 @@ static A4_HIN_TOKFAST: LazyLock<bool> =
 pub(crate) fn a4_hin_tokfast_enabled() -> bool {
     *A4_HIN_TOKFAST
 }
+/// Reciprocal-plane divide in the A4 RMSNorm slab producer
+/// (`HIPFIRE_A4_RMS_FDIV`, default on; `=0` opts out): the loader appends
+/// R = RN(1/a) and Rlo planes to each producer-fed AWQ scale
+/// ([`crate::gemv::awq_rcp_planes`]) and `fused_rmsnorm_mq_rotate_awq_i4_gfx12_v2_slab_fdiv`
+/// replaces the per-element IEEE divide by a Markstein correction with an
+/// exact wave fallback. Byte-identical codes. Parsed once so the loader and
+/// the producer agree.
+static A4_RMS_FDIV: LazyLock<bool> =
+    LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_A4_RMS_FDIV", true));
+#[inline]
+pub(crate) fn a4_rms_fdiv_enabled() -> bool {
+    *A4_RMS_FDIV
+}
 /// Quality receipts count the fused A4 GDN projection launches (print-only,
 /// one stderr line per launch). Kept off in production and all timing runs.
 static G12_IU4_GDN_COVERAGE: LazyLock<bool> =
@@ -452,6 +465,13 @@ impl Gpu {
             && !*G12_IU4_B1_CONTROL
             && self.g12_iu4_isa_requested()
             && self.flags.hipcc_extra_flags.split_whitespace().any(|f| f == "-DIU4_A4_CANDIDATES=2")
+    }
+
+    /// Whether the loader should append reciprocal planes to the AWQ scales
+    /// of the linears fed by the RMSNorm producer (`HIPFIRE_A4_RMS_FDIV`):
+    /// exact gfx1201 only, where the `_v2_slab_fdiv` producer can run.
+    pub fn a4_rms_fdiv_planes_wanted(&self) -> bool {
+        a4_rms_fdiv_enabled() && self.arch == "gfx1201"
     }
 }
 

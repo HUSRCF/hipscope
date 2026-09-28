@@ -43,6 +43,20 @@
 // DRAM-latency bound. Same elements, same strictly sequential fma(v, v, acc)
 // chain from +0 as the incumbent loop's contraction, same reduction tree:
 // bit-identical rms.
+//
+// -DHIPFIRE_RMSNORM_AWQ_RCP=1 (gfx1201 A4 `_v2_slab_fdiv`, AWQ only) adds an
+// `awq_rcp` input after `awq_scale`: the planes [R 0..K-1][Rlo K..2K-1]
+// that the loader computes once per AWQ scale a (rdna-compute
+// `awq_rcp_planes`): R = RN(1/a), Rlo = RN(fma(-a, R, 1) * R), both NaN
+// unless 2^-20 <= |a| <= 2^20. The divide y / a becomes
+//   q0 = fma(y, R, y * Rlo), q = fma(fma(-a, q0, y), R, q0).
+// y * (R + Rlo) is within 2^-47 of y / a relative, so q0 is a faithful
+// rounding of y / a, and with R = RN(1/a) one Markstein correction returns
+// RN(y / a). The wave keeps q only when every lane's eight |q| lie in
+// [2^-80, 2^80] (no NaN); otherwise the whole wave recomputes the IEEE
+// divides. q equals the divide for every f32 y and every f16 AWQ scale
+// (exhaustive gfx1201 check, `a4-5k3/rms-row`), so the codes are
+// bit-identical.
 #ifdef HIPFIRE_RMSNORM_KERNEL
 /* caller (host JIT concat) already named the symbol */
 #elif defined(HIPFIRE_RMSNORM_AWQ) && defined(HIPFIRE_FP8_STREAM)
@@ -64,6 +78,17 @@
 #if defined(HIPFIRE_RMSNORM_P1A_BATCHED) && defined(HIPFIRE_RMSNORM_FOLD)
 #error "HIPFIRE_RMSNORM_P1A_BATCHED batches plain x loads only"
 #endif
+#if defined(HIPFIRE_RMSNORM_AWQ_RCP) && !defined(HIPFIRE_RMSNORM_AWQ)
+#error "HIPFIRE_RMSNORM_AWQ_RCP replaces the AWQ divide"
+#endif
+#ifdef HIPFIRE_RMSNORM_AWQ_RCP
+// RN(y / a) from the loader's planes (see the header): exact where the
+// caller's wave check admits q.
+__device__ __forceinline__ float rmsnorm_awq_rcp_div(float y, float a, float r, float rl) {
+    const float q0 = __fmaf_rn(y, r, __fmul_rn(y, rl));
+    return __fmaf_rn(__fmaf_rn(-a, q0, y), r, q0);
+}
+#endif
 #ifdef HIPFIRE_FP8_PROD_SHORT
 #define HIPFIRE_RMSNORM_FP8_GROUPS 3
 #else
@@ -82,6 +107,9 @@ extern "C" __global__ void HIPFIRE_RMSNORM_KERNEL(
     const float* __restrict__ weight,
 #ifdef HIPFIRE_RMSNORM_AWQ
     const float* __restrict__ awq_scale,
+#ifdef HIPFIRE_RMSNORM_AWQ_RCP
+    const float* __restrict__ awq_rcp,  // [R K][Rlo K], loader planes of awq_scale
+#endif
 #endif
     const float* __restrict__ signs1,
     const float* __restrict__ signs2,
@@ -314,7 +342,53 @@ extern "C" __global__ void HIPFIRE_RMSNORM_KERNEL(
         *reinterpret_cast<float4*>(x_b + base + 4) = x1;
 #endif
 
-#ifdef HIPFIRE_RMSNORM_AWQ
+#if defined(HIPFIRE_RMSNORM_AWQ) && defined(HIPFIRE_RMSNORM_AWQ_RCP)
+        // (((x * weight) * rms) / awq_scale) * sign with the divide from the
+        // loader's reciprocal planes; any lane outside the admitted range
+        // sends the wave to the IEEE divides.
+        const float4 r0 = *reinterpret_cast<const float4*>(awq_rcp + base);
+        const float4 r1 = *reinterpret_cast<const float4*>(awq_rcp + base + 4);
+        const float4 l0 = *reinterpret_cast<const float4*>(awq_rcp + K + base);
+        const float4 l1 = *reinterpret_cast<const float4*>(awq_rcp + K + base + 4);
+        float qd0 = rmsnorm_awq_rcp_div(x0.x * w0.x * rms, a0.x, r0.x, l0.x);
+        float qd1 = rmsnorm_awq_rcp_div(x0.y * w0.y * rms, a0.y, r0.y, l0.y);
+        float qd2 = rmsnorm_awq_rcp_div(x0.z * w0.z * rms, a0.z, r0.z, l0.z);
+        float qd3 = rmsnorm_awq_rcp_div(x0.w * w0.w * rms, a0.w, r0.w, l0.w);
+        float qd4 = rmsnorm_awq_rcp_div(x1.x * w1.x * rms, a1.x, r1.x, l1.x);
+        float qd5 = rmsnorm_awq_rcp_div(x1.y * w1.y * rms, a1.y, r1.y, l1.y);
+        float qd6 = rmsnorm_awq_rcp_div(x1.z * w1.z * rms, a1.z, r1.z, l1.z);
+        float qd7 = rmsnorm_awq_rcp_div(x1.w * w1.w * rms, a1.w, r1.w, l1.w);
+        {
+            // minimum propagates NaN, so mn >= 2^-80 also rejects NaN.
+            float mn = __builtin_elementwise_minimum(
+                __builtin_elementwise_minimum(fabsf(qd0), fabsf(qd1)),
+                __builtin_elementwise_minimum(fabsf(qd2), fabsf(qd3)));
+            mn = __builtin_elementwise_minimum(mn, __builtin_elementwise_minimum(
+                __builtin_elementwise_minimum(fabsf(qd4), fabsf(qd5)),
+                __builtin_elementwise_minimum(fabsf(qd6), fabsf(qd7))));
+            const float mx = fmaxf(fmaxf(fmaxf(fabsf(qd0), fabsf(qd1)), fmaxf(fabsf(qd2), fabsf(qd3))),
+                                   fmaxf(fmaxf(fabsf(qd4), fabsf(qd5)), fmaxf(fabsf(qd6), fabsf(qd7))));
+            const bool admitted = mn >= 0x1p-80f && mx <= 0x1p80f;
+            if (__builtin_amdgcn_ballot_w32(!admitted) != 0u) {
+                qd0 = x0.x * w0.x * rms / a0.x;
+                qd1 = x0.y * w0.y * rms / a0.y;
+                qd2 = x0.z * w0.z * rms / a0.z;
+                qd3 = x0.w * w0.w * rms / a0.w;
+                qd4 = x1.x * w1.x * rms / a1.x;
+                qd5 = x1.y * w1.y * rms / a1.y;
+                qd6 = x1.z * w1.z * rms / a1.z;
+                qd7 = x1.w * w1.w * rms / a1.w;
+            }
+        }
+        float v0 = qd0 * s10.x;
+        float v1 = qd1 * s10.y;
+        float v2 = qd2 * s10.z;
+        float v3 = qd3 * s10.w;
+        float v4 = qd4 * s11.x;
+        float v5 = qd5 * s11.y;
+        float v6 = qd6 * s11.z;
+        float v7 = qd7 * s11.w;
+#elif defined(HIPFIRE_RMSNORM_AWQ)
         // Exact order of the retired LDS-staged AWQ kernel:
         // (((x * weight) * rms) / awq_scale) * sign.
         float v0 = (x0.x * w0.x * rms / a0.x) * s10.x;

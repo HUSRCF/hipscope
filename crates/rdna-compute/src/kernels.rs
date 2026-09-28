@@ -1216,6 +1216,20 @@ pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_GFX12_V2_SLAB_SRC: &str = concat!(
     "#define HIPFIRE_RMSNORM_KERNEL fused_rmsnorm_mq_rotate_awq_i4_gfx12_v2_slab\n",
     include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate.hip")
 );
+/// Reciprocal-plane divide twin of the slab producer (`HIPFIRE_A4_RMS_FDIV`,
+/// default on): one extra `awq_rcp` argument after `awq_scale`, pointing at
+/// the loader's `[R][Rlo]` planes (`gemv::awq_rcp_planes`). Same geometry;
+/// byte-identical slab output.
+pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_GFX12_V2_SLAB_FDIV_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
+    "#define HIPFIRE_IU4_RTN_RCP 1\n#define HIPFIRE_IU4_SLAB 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    "#define HIPFIRE_IU4_SIDECAR 1\n",
+    "#define HIPFIRE_RMSNORM_AWQ 1\n#define HIPFIRE_RMSNORM_AWQ_RCP 1\n",
+    "#define HIPFIRE_RMSNORM_P1A_BATCHED 1\n",
+    "#define HIPFIRE_RMSNORM_KERNEL fused_rmsnorm_mq_rotate_awq_i4_gfx12_v2_slab_fdiv\n",
+    include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate.hip")
+);
 /// gfx1201 FP8-stream producer: RMSNorm/FWHT + in-register whole-row scale +
 /// E4M3 pack under distinct entry symbols so HSACO caches and profiler rows
 /// cannot alias any other fusion. Emits byte-identical
