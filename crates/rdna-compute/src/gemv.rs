@@ -45,9 +45,11 @@ pub(crate) fn fp8_row_scale_shift() -> HipResult<i32> {
     }
 }
 
-/// Where [`Gpu::rotate_x_mq_fp8_gfx12_batched`] reads the FA sigmoid gate.
+/// Where the gfx1201 FA-output sigmoid producers
+/// ([`Gpu::rotate_x_mq_fp8_gfx12_batched`],
+/// [`Gpu::sigmoid_mul_rotate_x_mq_awq_i4_gfx12_batched`]) read the gate.
 #[derive(Clone, Copy)]
-pub enum Fp8SigmoidGate<'a> {
+pub enum SigmoidGate<'a> {
     /// Compact row-major `[batch × k]` F32 gate rows.
     Rows(&'a GpuTensor),
     /// The FA Q/gate projection rows `[batch × k/256 × (256 q, 256 gate)]`
@@ -5610,12 +5612,12 @@ impl Gpu {
     /// divide. Emits MQ4v2 FP8 prepared planes; the opt-in in-register
     /// variant does not write the rotated F32 row. The gate is either compact
     /// rows or read in place from the FA Q/gate projection rows
-    /// ([`Fp8SigmoidGate`]); both give byte-identical planes.
+    /// ([`SigmoidGate`]); both give byte-identical planes.
     #[allow(clippy::too_many_arguments)]
     pub fn rotate_x_mq_fp8_gfx12_batched(
         &mut self,
         x_in: &GpuTensor,
-        gate: Option<Fp8SigmoidGate<'_>>,
+        gate: Option<SigmoidGate<'_>>,
         awq: Option<&GpuTensor>,
         x_out: &GpuTensor,
         k: usize,
@@ -5637,8 +5639,8 @@ impl Gpu {
         if x_in.numel() < batch_size * k
             || x_out.numel() < batch_size * k
             || gate.is_some_and(|g| match g {
-                Fp8SigmoidGate::Rows(t) => t.numel() < batch_size * k,
-                Fp8SigmoidGate::QGateInterleaved(t) => t.numel() < batch_size * 2 * k,
+                SigmoidGate::Rows(t) => t.numel() < batch_size * k,
+                SigmoidGate::QGateInterleaved(t) => t.numel() < batch_size * 2 * k,
             })
             || awq.is_some_and(|t| t.numel() < k)
         {
@@ -5649,7 +5651,7 @@ impl Gpu {
         }
         let mut row_scale_shift = fp8_row_scale_shift()?;
         self.ensure_mq_signs()?;
-        let gate_in_place = matches!(gate, Some(Fp8SigmoidGate::QGateInterleaved(_)));
+        let gate_in_place = matches!(gate, Some(SigmoidGate::QGateInterleaved(_)));
         let (module, source, kernel) = match (gate.is_some(), awq.is_some(), fp8_prod_inreg(k)) {
             (true, false, true) if gate_in_place => (
                 "sigmoid_mul_rotate_x_mq4v2_fp8_inreg_gil_gfx12",
@@ -5739,7 +5741,7 @@ impl Gpu {
         let mut xp = x_in.buf.as_ptr();
         let mut gp = gate
             .map(|g| match g {
-                Fp8SigmoidGate::Rows(t) | Fp8SigmoidGate::QGateInterleaved(t) => t.buf.as_ptr(),
+                SigmoidGate::Rows(t) | SigmoidGate::QGateInterleaved(t) => t.buf.as_ptr(),
             })
             .unwrap_or(std::ptr::null_mut());
         let mut awp = awq.map(|t| t.buf.as_ptr()).unwrap_or(std::ptr::null_mut());
@@ -5827,11 +5829,14 @@ impl Gpu {
     /// in-register `block_i4_128`. The old path stored the sigmoided attention
     /// row to f32 and immediately reloaded it in `rotate_x_mq_awq_i4_gfx12`;
     /// this entry keeps that f32 value in-register and leaves `attn` unmodified.
+    /// The gate is either compact rows or read in place from the FA Q/gate
+    /// projection rows (`_gil_` twin, [`SigmoidGate`]); both give identical
+    /// `block_i4_128` bytes.
     #[allow(clippy::too_many_arguments)]
     pub fn sigmoid_mul_rotate_x_mq_awq_i4_gfx12_batched(
         &mut self,
         attn: &GpuTensor,
-        gate: &GpuTensor,
+        gate: SigmoidGate<'_>,
         awq: &GpuTensor,
         x_out: Option<&GpuTensor>,
         reservation: crate::scratch::Int4MmqReservation,
@@ -5845,14 +5850,30 @@ impl Gpu {
                 "sigmoid_mul_rotate_x_mq_awq_i4_gfx12_batched: reservation (k,n) mismatch",
             ));
         }
+        let (gate, gate_numel, kernel, source, label) = match gate {
+            SigmoidGate::Rows(t) => (
+                t,
+                batch_size * k,
+                "sigmoid_mul_rotate_x_mq_awq_i4_gfx12",
+                kernels::SIGMOID_MUL_MQ_ROTATE_X_AWQ_I4_GFX12_SRC,
+                "sigmoid_mul_rotate_x_mq_awq_i4_gfx12_batched",
+            ),
+            SigmoidGate::QGateInterleaved(t) => (
+                t,
+                batch_size * 2 * k,
+                "sigmoid_mul_rotate_x_mq_awq_i4_gil_gfx12",
+                kernels::SIGMOID_MUL_MQ_ROTATE_X_AWQ_I4_GIL_GFX12_SRC,
+                "sigmoid_mul_rotate_x_mq_awq_i4_gil_gfx12_batched",
+            ),
+        };
+        if gate.numel() < gate_numel {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "sigmoid_mul_rotate_x_mq_awq_i4_gfx12_batched: undersized gate",
+            ));
+        }
         self.ensure_mq_signs()?;
-        const MODULE: &str = "sigmoid_mul_rotate_x_mq_awq_i4_gfx12";
-        const KERNEL: &str = "sigmoid_mul_rotate_x_mq_awq_i4_gfx12";
-        self.ensure_kernel(
-            MODULE,
-            kernels::SIGMOID_MUL_MQ_ROTATE_X_AWQ_I4_GFX12_SRC,
-            KERNEL,
-        )?;
+        self.ensure_kernel(kernel, source, kernel)?;
         let mut ap = attn.buf.as_ptr();
         let mut gp = gate.buf.as_ptr();
         let mut awp = awq.buf.as_ptr();
@@ -5875,14 +5896,9 @@ impl Gpu {
         ];
         let blocks_k = k / 128;
         let bytes = (k * 4 * 3 + blocks_k * 72 + 2 * 256 * 4) * batch_size;
-        let timer = crate::profile::begin_timer(
-            &self.hip,
-            "fwht",
-            "sigmoid_mul_rotate_x_mq_awq_i4_gfx12_batched",
-            bytes,
-        );
+        let timer = crate::profile::begin_timer(&self.hip, "fwht", label, bytes);
         let result = self.launch_maybe_blob(
-            KERNEL,
+            kernel,
             [((k / 256) * batch_size) as u32, 1, 1],
             [32, 1, 1],
             0,

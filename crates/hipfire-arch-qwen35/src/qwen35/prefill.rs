@@ -494,29 +494,46 @@ fn try_gfx12_rotate_quant_fused_prepared(
     )?;
     Ok(Some(prep))
 }
+/// Whether [`try_gfx12_sigmoid_rotate_quant_fused_prepared`] admits: the
+/// gfx1201 IU4 AWQ sigmoid producer is the FA output projection's producer.
+fn gfx12_sigmoid_rotate_quant_admitted(
+    gpu: &Gpu,
+    wo: &hipfire_runtime::llama::WeightTensor,
+    k: usize,
+    n: usize,
+    epilogue: &BatchEpilogue<'_>,
+) -> bool {
+    wo.gpu_dtype == DType::MQ4G256V2
+        && matches!(epilogue, BatchEpilogue::Residual)
+        && wo.awq_scale.as_ref().is_some_and(|awq| awq.numel() >= k)
+        && gpu.iu4_producer_quant_fused_active(n, k)
+}
+/// A4 (IU4) FA gate in place: `HIPFIRE_A4_FA_GATE_IL=0` keeps the fp8q prep's
+/// gate copy and the compact-gate IU4 sigmoid producer (default on).
+fn a4_fa_gate_in_place_enabled() -> bool {
+    hipfire_config::developer_bool("HIPFIRE_A4_FA_GATE_IL", true)
+}
 /// gfx1201 FA out-proj producer: fuse the still-standalone
 /// `sigmoid_mul_f32` into the AWQ rotate+IU4 sidecar. This is deliberately
 /// AWQ-only: the arm of record has AWQ sidecars, while every failed predicate
 /// keeps the established sigmoid → rotate/quant chain byte-for-byte.
+/// `gate` is the compact gate copy or, when the fp8q FA prep skipped the
+/// copy, the gate half of `fa_q_full_batch` read in place.
 fn try_gfx12_sigmoid_rotate_quant_fused_prepared(
     gpu: &mut Gpu,
     wo: &hipfire_runtime::llama::WeightTensor,
     attn: &GpuTensor,
-    gate: &GpuTensor,
+    gate: rdna_compute::gemv::SigmoidGate<'_>,
     k: usize,
     n: usize,
     epilogue: &BatchEpilogue<'_>,
 ) -> HipResult<Option<rdna_compute::Int4MmqPrepared>> {
+    if !gfx12_sigmoid_rotate_quant_admitted(gpu, wo, k, n, epilogue) {
+        return Ok(None);
+    }
     let Some(awq) = wo.awq_scale.as_ref() else {
         return Ok(None);
     };
-    if wo.gpu_dtype != DType::MQ4G256V2
-        || !matches!(epilogue, BatchEpilogue::Residual)
-        || awq.numel() < k
-        || !gpu.iu4_producer_quant_fused_active(n, k)
-    {
-        return Ok(None);
-    }
     let res = gpu.reserve_int4_mmq(k, n)?;
     let prep = gpu.sigmoid_mul_rotate_x_mq_awq_i4_gfx12_batched(
         attn, gate, awq, None, res, k, n,
@@ -532,7 +549,7 @@ fn try_gfx12_fp8_stream_sigmoid_prepared(
     gpu: &mut Gpu,
     wo: &hipfire_runtime::llama::WeightTensor,
     attn: &GpuTensor,
-    gate: rdna_compute::gemv::Fp8SigmoidGate<'_>,
+    gate: rdna_compute::gemv::SigmoidGate<'_>,
     x_rot: &GpuTensor,
     k: usize,
     n: usize,
@@ -8707,7 +8724,8 @@ fn batch_chunk_full_attn_prepare(
     gfx12_fa_prep: bool,
     gfx12_fa_prep_fp8q: bool,
     // The fp8q prep leaves the gate in `fa_q_full_batch` (no gate copy); the
-    // output projection must then read it in place (`fa_gate_in_place`).
+    // output projection must then read it in place (`fa_gate_in_place`) with
+    // the IU4 or FP8-stream sigmoid producer.
     fa_gate_in_place: bool,
 ) -> HipResult<()> {
     // S6-fa-prep-q8-pair: exact gfx1100 fold of steps 3-5 (deinterleave +
@@ -8888,7 +8906,8 @@ fn batch_chunk_full_attn_output_projection(
     epilogue: BatchEpilogue<'_>,
     fusion: DflashFusionCtx,
     // Set with the matching `batch_chunk_full_attn_prepare` flag: the gate
-    // was left in `fa_q_full_batch` and only the FP8-stream producer reads it.
+    // was left in `fa_q_full_batch` and only the gfx1201 IU4 or FP8-stream
+    // sigmoid producer reads it.
     fa_gate_in_place: bool,
 ) -> HipResult<()> {
     // S4: one sigmoid*attn+FWHT+F16 producer + direct-F16 residual GEMM
@@ -8963,9 +8982,14 @@ fn batch_chunk_full_attn_output_projection(
             layer.wo.k, n, &epilogue,
         )?
     };
-    let mut iu4_wo_prep = if a8_wo_prep.is_none() && !fa_gate_in_place {
+    let fa_gate = if fa_gate_in_place {
+        rdna_compute::gemv::SigmoidGate::QGateInterleaved(&pbs.fa_q_full_batch)
+    } else {
+        rdna_compute::gemv::SigmoidGate::Rows(&pbs.fa_gate_batch)
+    };
+    let mut iu4_wo_prep = if a8_wo_prep.is_none() {
         try_gfx12_sigmoid_rotate_quant_fused_prepared(
-            gpu, &layer.wo, &pbs.fa_attn_out_batch, &pbs.fa_gate_batch,
+            gpu, &layer.wo, &pbs.fa_attn_out_batch, fa_gate,
             layer.wo.k, n, &epilogue,
         )?
     } else { None };
@@ -8985,26 +9009,21 @@ fn batch_chunk_full_attn_output_projection(
     }
     let mut fp8_wo_prep: Option<rdna_compute::Mq4v2Fp8Prepared> = None;
     if a8_wo_prep.is_none() && iu4_wo_prep.is_none() {
-        let gate = if fa_gate_in_place {
-            rdna_compute::gemv::Fp8SigmoidGate::QGateInterleaved(&pbs.fa_q_full_batch)
-        } else {
-            rdna_compute::gemv::Fp8SigmoidGate::Rows(&pbs.fa_gate_batch)
-        };
         fp8_wo_prep = try_gfx12_fp8_stream_sigmoid_prepared(
             gpu,
             &layer.wo,
             &pbs.fa_attn_out_batch,
-            gate,
+            fa_gate,
             &pbs.fa_attn_out_rot_batch,
             layer.wo.k,
             n,
         )?;
-        if fa_gate_in_place && fp8_wo_prep.is_none() {
-            return Err(hip_bridge::HipError::new(
-                0,
-                "FA output: gate left in fa_q_full_batch but the FP8-stream producer was not admitted",
-            ));
-        }
+    }
+    if fa_gate_in_place && iu4_wo_prep.is_none() && fp8_wo_prep.is_none() {
+        return Err(hip_bridge::HipError::new(
+            0,
+            "FA output: gate left in fa_q_full_batch but neither the IU4 nor the FP8-stream sigmoid producer was admitted",
+        ));
     }
     if a8_wo_prep.is_none() && iu4_wo_prep.is_none() && fp8_wo_prep.is_none() {
         gpu.sigmoid_mul_f32(&pbs.fa_attn_out_batch, &pbs.fa_gate_batch)?;
@@ -9487,15 +9506,21 @@ pub(crate) fn batch_chunk_full_attn_attn(
                 && n % WIDENED_COMMIT_ROWS == 0));
     // The fp8q prep can leave the sigmoid gate in `fa_q_full_batch` (no
     // 4·n·q_dim-byte copy, and its gate half is never read by the prep) when
-    // the output projection will select the FP8-stream sigmoid producer,
-    // which then reads the gate in place. Mirrors that producer's admission:
-    // A8 is excluded by `fp8_stream_active`, the IU4/gfx11 sigmoid fusions
-    // by their predicates; gfx1100 S4 needs `gfx12_fa_prep`'s gfx1201 false.
+    // the output projection will select a sigmoid producer that reads the
+    // gate in place: the gfx1201 IU4 AWQ producer (A4, unless
+    // `HIPFIRE_A4_FA_GATE_IL=0`) or the FP8-stream producer. Mirrors their
+    // admission: A8 is excluded by `iu4_producer_quant_fused_active` /
+    // `fp8_stream_active`, the IU4 producer is tried first and the gfx11
+    // fusion only after it; gfx1100 S4 needs `gfx12_fa_prep`'s gfx1201 false.
     let fa_gate_in_place = gfx12_fa_prep_fp8q
-        && matches!(layer.wo.gpu_dtype, DType::MQ4G256V2 | DType::MQ4G256V2Lloyd)
-        && gpu.fp8_stream_active(n, layer.wo.k)
-        && !gpu.iu4_producer_quant_fused_active(n, layer.wo.k)
-        && layer.wo.k == q_dim;
+        && layer.wo.k == q_dim
+        && if gfx12_sigmoid_rotate_quant_admitted(gpu, &layer.wo, layer.wo.k, n, &epilogue) {
+            a4_fa_gate_in_place_enabled()
+        } else {
+            matches!(layer.wo.gpu_dtype, DType::MQ4G256V2 | DType::MQ4G256V2Lloyd)
+                && gpu.fp8_stream_active(n, layer.wo.k)
+                && !gpu.iu4_producer_quant_fused_active(n, layer.wo.k)
+        };
     batch_chunk_full_attn_input_projection(gpu, layer, config, pbs, n, dim, q8_wmma_arch, fusion)?;
 
     batch_chunk_full_attn_prepare(

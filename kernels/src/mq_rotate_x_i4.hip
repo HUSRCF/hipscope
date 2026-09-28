@@ -23,6 +23,10 @@
 // -DHIPFIRE_ROTATE_SIGMOID_GATE=1 adds a read-only gate input and forms
 // `x_in[i] * sigmoid(gate[i])` with the exact `sigmoid_mul_f32` expression
 // before the AWQ divide/FWHT. The original input remains unmodified.
+// -DHIPFIRE_ROTATE_GATE_IL=1 (with the gate) reads it in place from the FA
+// Q/gate projection rows `[N x K/256 x (256 q, 256 gate)]` that
+// `qwen35_fa_prep_fp8q_nogate_batched_gfx1201` leaves unconsumed, instead of
+// a compact `[N x K]` gate copy: the same f32 values, so identical bytes.
 //
 // Bit-exactness: the FWHT body is a verbatim copy of `mq_rotate_x` /
 // `rotate_x_mq_awq` (same grid, same multiply order, same butterfly, same
@@ -49,7 +53,7 @@ __launch_bounds__(32, 16)
 extern "C" __global__ void HIPFIRE_ROTATE_KERNEL(
     const float* __restrict__ x_in,
 #ifdef HIPFIRE_ROTATE_SIGMOID_GATE
-    const float* __restrict__ gate,        // [N, K], FP32
+    const float* __restrict__ gate,        // [N, K] FP32; GATE_IL: [N, 2K] Q/gate rows
 #endif
 #ifdef HIPFIRE_ROTATE_AWQ
     const float* __restrict__ awq_scale,   // [K], FP32
@@ -72,7 +76,13 @@ extern "C" __global__ void HIPFIRE_ROTATE_KERNEL(
     const long long batch_off = (long long)batch * K;
     const float* x_in_b  = x_in  + batch_off;
 #ifdef HIPFIRE_ROTATE_SIGMOID_GATE
+#ifdef HIPFIRE_ROTATE_GATE_IL
+    // Group g's gate is floats [512 g + 256, 512 g + 512) of the 2K-float
+    // row; `base` below adds the other `g * 256 + d0`.
+    const float* gate_b = gate + (long long)batch * (2LL * K) + (group + 1) * 256;
+#else
     const float* gate_b = gate + batch_off;
+#endif
 #endif
           float* x_out_b = (x_out != nullptr) ? (x_out + batch_off) : nullptr;
 

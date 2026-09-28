@@ -256,7 +256,7 @@ impl Gpu {
     /// `k` is read pre-norm and written post-norm+rope in place. `gate` is
     /// the compact `[batch × n_q × 256]` gate copy; `None` (fp8 codes only)
     /// leaves the gate in `q_interleaved` for
-    /// `Fp8SigmoidGate::QGateInterleaved` and skips the copy.
+    /// `SigmoidGate::QGateInterleaved` and skips the copy.
     #[allow(clippy::too_many_arguments)]
     pub fn qwen35_fa_prep_batched_gfx1201(
         &mut self,

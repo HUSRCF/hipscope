@@ -1443,6 +1443,20 @@ pub const SIGMOID_MUL_MQ_ROTATE_X_AWQ_I4_GFX12_SRC: &str = concat!(
     "#define HIPFIRE_ROTATE_KERNEL sigmoid_mul_rotate_x_mq_awq_i4_gfx12\n",
     include_str!("../../../kernels/src/mq_rotate_x_i4.hip")
 );
+/// Gate-in-place twin of [`SIGMOID_MUL_MQ_ROTATE_X_AWQ_I4_GFX12_SRC`]
+/// (`HIPFIRE_ROTATE_GATE_IL`): the sigmoid gate is read from the FA Q/gate
+/// projection rows `[N x K/256 x (256 q, 256 gate)]`, which
+/// `qwen35_fa_prep_fp8q_nogate_batched_gfx1201` leaves in place instead of
+/// copying. Same gate values, so byte-identical `block_i4_128` output.
+pub const SIGMOID_MUL_MQ_ROTATE_X_AWQ_I4_GIL_GFX12_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    "#define HIPFIRE_ROTATE_SIGMOID_GATE 1\n",
+    "#define HIPFIRE_ROTATE_GATE_IL 1\n",
+    "#define HIPFIRE_ROTATE_AWQ 1\n",
+    "#define HIPFIRE_ROTATE_KERNEL sigmoid_mul_rotate_x_mq_awq_i4_gil_gfx12\n",
+    include_str!("../../../kernels/src/mq_rotate_x_i4.hip")
+);
 
 pub const RMSNORM_REDUCE_GFX942_SRC: &str =
     include_str!("../../../kernels/src/rmsnorm_reduce.gfx942.hip");
