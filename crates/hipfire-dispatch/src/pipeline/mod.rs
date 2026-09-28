@@ -117,14 +117,12 @@ fn select_grouped_route(
                 && !has_sidecars
                 && dtype_tags.is_none()
                 && formats.router == DType::BF16
-                && [
-                    formats.shared_selector,
-                    formats.shared_gate,
-                    formats.shared_up,
-                ]
-                .into_iter()
-                .all(|dtype| dtype == DType::BF16)
-                && matches!(formats.shared_down, DType::BF16 | DType::MQ4G128V2)
+                && formats.shared_selector == DType::BF16
+                // The shared gate/up read the natural activation as one
+                // format; down may also be the row-local QT53.
+                && matches!(formats.shared_gate, DType::BF16 | DType::Q8_0)
+                && formats.shared_up == formats.shared_gate
+                && matches!(formats.shared_down, DType::BF16 | DType::Q8_0 | DType::MQ4G128V2)
                 && [
                     dtypes.router,
                     shared.selector,
@@ -272,6 +270,40 @@ mod qwen4_route_tests {
         let mut dtypes = canonical_dtypes();
         dtypes.shared.as_mut().unwrap().down = DType::BF16;
         assert_eq!(is_canonical_qwen4(&dtypes), cfg!(feature = "deltanet"));
+    }
+
+    #[test]
+    fn qwen4_route_admits_q8_shared_expert_only_as_a_matched_pair() {
+        let route = |gate: DType, up: DType, down: DType| {
+            let mut dtypes = canonical_dtypes();
+            let shared = dtypes.shared.as_mut().unwrap();
+            (shared.gate, shared.up, shared.down) = (gate, up, down);
+            let mut declared = policy(down);
+            (declared.formats.shared_gate, declared.formats.shared_up) = (gate, up);
+            select_grouped_route(
+                &dtypes,
+                512,
+                10,
+                2560,
+                640,
+                640,
+                2560,
+                2560,
+                640,
+                None,
+                false,
+                Some(declared),
+            )
+            .is_some()
+        };
+        let deltanet = cfg!(feature = "deltanet");
+        assert_eq!(route(DType::Q8_0, DType::Q8_0, DType::Q8_0), deltanet);
+        assert_eq!(route(DType::Q8_0, DType::Q8_0, DType::BF16), deltanet);
+        // Gate and up share one activation read: a mixed pair is refused, as
+        // are formats the route has no projection for.
+        assert!(!route(DType::Q8_0, DType::BF16, DType::Q8_0));
+        assert!(!route(DType::MQ6G256V2, DType::MQ6G256V2, DType::Q8_0));
+        assert!(!route(DType::Q8_0, DType::Q8_0, DType::MQ6G256V2));
     }
 
     #[test]
@@ -2896,21 +2928,32 @@ fn decode_gate_side_stage(
         } else if route == Some(MoeRouteCapability::Qt44Qt53Grouped)
             && [&p.router, shared_expert_gate, shared_gate_w, shared_up_w]
                 .iter()
-                .all(|w| w.dtype == DType::BF16 && w.awq_scale.is_none() && w.k == p.router.k)
+                .all(|w| w.awq_scale.is_none() && w.k == p.router.k)
+            && [p.router.dtype, shared_expert_gate.dtype] == [DType::BF16; 2]
+            && matches!(shared_gate_w.dtype, DType::BF16 | DType::Q8_0)
+            && shared_up_w.dtype == shared_gate_w.dtype
         {
-            // Router, selector and shared gate/up are BF16 projections of the
-            // same natural activation: one launch, each row computed as the
-            // single-matrix GEMV would.
+            // Router, selector and shared gate/up are projections of the same
+            // natural activation, each row computed as the single-matrix GEMV
+            // would: the BF16 ones share one launch, a Q8_0 gate/up pair
+            // (recipe r2) runs as its own two GEMVs.
+            let bf16_shared = shared_gate_w.dtype == DType::BF16;
+            let rows = |m: usize| if bf16_shared { m } else { 0 };
             hip!(gpu.gemv_bf16_xf32_x4(
                 [
                     (p.router.buf, p.router_logits, p.router.m),
                     (shared_expert_gate.buf, scalar_buf, shared_expert_gate.m),
-                    (shared_gate_w.buf, shared_gate, shared_gate_w.m),
-                    (shared_up_w.buf, shared_up, shared_up_w.m),
+                    (shared_gate_w.buf, shared_gate, rows(shared_gate_w.m)),
+                    (shared_up_w.buf, shared_up, rows(shared_up_w.m)),
                 ],
                 p.x_norm,
                 p.router.k,
             ))?;
+            if !bf16_shared {
+                for (w, y) in [(shared_gate_w, shared_gate), (shared_up_w, shared_up)] {
+                    hip!(gpu.gemv_q8_0(w.buf, p.x_norm, y, w.m, w.k))?;
+                }
+            }
         } else {
             static GEMV_GATE: OnceLock<GemvFamily> = OnceLock::new();
             let gemv = GEMV_GATE.get_or_init(GemvFamily::new);

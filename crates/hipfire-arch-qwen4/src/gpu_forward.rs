@@ -274,8 +274,10 @@ fn dense_ref<'a>(
 }
 
 /// The admitted Qwen4 grouped route is declared by this architecture
-/// constructor and consumed as data by shared sealing/lowering.
-fn qwen4_route_policy(config: &Qwen4Config, shared_down: DType) -> MoeRoutePolicy {
+/// constructor and consumed as data by shared sealing/lowering.  The shared
+/// expert's formats are those of the bound weights: BF16, or the Q8_0 decode
+/// copies (`Qwen4GpuForward::decode_q8`).
+fn qwen4_route_policy(config: &Qwen4Config, shared: &MoeSharedWeights<'_>) -> MoeRoutePolicy {
     MoeRoutePolicy {
         capability: MoeRouteCapability::Qt44Qt53Grouped,
         geometry: MoeRouteGeometry {
@@ -288,9 +290,9 @@ fn qwen4_route_policy(config: &Qwen4Config, shared_down: DType) -> MoeRoutePolic
         formats: MoeRouteFormats {
             router: DType::BF16,
             shared_selector: DType::BF16,
-            shared_gate: DType::BF16,
-            shared_up: DType::BF16,
-            shared_down,
+            shared_gate: shared.gate.dtype,
+            shared_up: shared.up.dtype,
+            shared_down: shared.down.dtype,
             routed_gate_up: DType::MQ4G256V2,
             routed_down: DType::MQ4G128V2,
         },
@@ -323,9 +325,12 @@ fn program_dims(config: &Qwen4Config) -> Qwen4ProgramDims {
     }
 }
 
-/// A single-token forward's HC read projection: its Q8_0 decode copy
-/// (`Qwen4GpuForward::hc_q8`) when one exists.
-fn hc_mix<'a>(
+/// Q8_0 decode copies per layer (`Qwen4GpuForward::decode_q8`).
+const DECODE_Q8_PER_LAYER: usize = 7;
+
+/// A single-token forward's projection: its Q8_0 decode copy
+/// (`Qwen4GpuForward::decode_q8`) when one exists.
+fn decode_copy<'a>(
     copies: &'a [GpuTensor],
     index: usize,
     rows: usize,
@@ -418,11 +423,15 @@ fn ple_desc<'a>(
     })
 }
 
+/// `decode_q8` / `rows`: the forward's Q8_0 decode copies and row count; a
+/// one-row forward binds this layer's shared-expert copies.
 fn layer_desc<'a>(
     weights: &'a Qwen4Weights,
     layer: &Qwen4LayerWeights,
     moe: &'a Qwen4MoeLayerRuntime,
     config: &Qwen4Config,
+    decode_q8: &'a [GpuTensor],
+    rows: usize,
 ) -> Result<Qwen4LayerDescription<'a>, Qwen4GpuForwardError> {
     let attention = match layer.kind {
         LayerType::LinearAttention => Qwen4AttentionWeights::Linear(gdn_desc(
@@ -440,22 +449,31 @@ fn layer_desc<'a>(
                 .ok_or_else(|| invalid("QSA weights missing"))?,
         )?),
     };
+    let copy = |slot: usize, source: &'a ProjectionView| {
+        decode_copy(
+            decode_q8,
+            layer.layer * DECODE_Q8_PER_LAYER + slot,
+            rows,
+            source.dispatch_ref(),
+        )
+    };
+    let shared = MoeSharedWeights {
+        selector: moe.shared_scalar.dispatch_ref(),
+        gate: copy(4, &moe.shared_gate),
+        up: copy(5, &moe.shared_up),
+        down: copy(6, &moe.shared_down),
+    };
     Ok(Qwen4LayerDescription {
         attn_hyper: hyper_desc(weights, &layer.attn_hyper)?,
         mlp_hyper: hyper_desc(weights, &layer.mlp_hyper)?,
         attention,
         moe: Qwen4MoeBinding {
-            route_policy: qwen4_route_policy(config, moe.shared_down.dtype),
+            route_policy: qwen4_route_policy(config, &shared),
             table: &moe.table,
             cache: &moe.cache,
             routed_experts: moe,
             router: moe.router.dispatch_ref(),
-            shared: MoeSharedWeights {
-                selector: moe.shared_scalar.dispatch_ref(),
-                gate: moe.shared_gate.dispatch_ref(),
-                up: moe.shared_up.dispatch_ref(),
-                down: moe.shared_down.dispatch_ref(),
-            },
+            shared,
             intermediate: moe
                 .experts
                 .first()
@@ -834,13 +852,19 @@ pub(crate) fn execute_moe(
         per_expert_gate_up: None,
         per_expert_down: None,
     };
+    let shared = MoeSharedWeights {
+        selector: runtime.shared_scalar.dispatch_ref(),
+        gate: runtime.shared_gate.dispatch_ref(),
+        up: runtime.shared_up.dispatch_ref(),
+        down: runtime.shared_down.dispatch_ref(),
+    };
     let params = MoeParams {
         dtypes,
         recipe: MoeRecipe::SoftmaxGatedShared {
             bf16_round_trip: true,
             shared_after_combine: true,
         },
-        route_policy: Some(qwen4_route_policy(config, runtime.shared_down.dtype)),
+        route_policy: Some(qwen4_route_policy(config, &shared)),
         normalization: MoeNormalization::Provided,
         batch_size: 1,
         hidden: config.hidden_size,
@@ -858,12 +882,7 @@ pub(crate) fn execute_moe(
         skip_shared: false,
         router: runtime.router.dispatch_ref(),
         shared: Some(MoeSharedDecode {
-            weights: MoeSharedWeights {
-                selector: runtime.shared_scalar.dispatch_ref(),
-                gate: runtime.shared_gate.dispatch_ref(),
-                up: runtime.shared_up.dispatch_ref(),
-                down: runtime.shared_down.dispatch_ref(),
-            },
+            weights: shared,
             intermediate: config.shared_expert_intermediate_size,
             scalar: scratch.scalar_buf,
             gate_out: scratch.gate_buf,
@@ -1334,13 +1353,14 @@ pub struct Qwen4GpuForward {
     /// Device-argmax token readback (`forward_token_or_argmax`), once used.
     token_readback: Option<TokenReadback>,
     moe: Vec<Qwen4MoeLayerRuntime>,
-    /// Four per layer [attn down, attn up, mlp down, mlp up]: the HC read
-    /// projections requantized BF16 -> Q8_0 for single-token forwards (gfx1151).
-    /// Batch-1 decode streams every weight once per token, and these BF16
-    /// matrices are ~1.3 GB of it; Q8_0 halves that at a decode KLD inside the
-    /// noise band (0.0743 -> 0.0754 / 0.0730 over 32 chunks for fake-quant
-    /// variants). Prefill keeps the BF16 source for its WMMA routes.
-    hc_q8: Vec<GpuTensor>,
+    /// `DECODE_Q8_PER_LAYER` per layer [HC attn down, attn up, mlp down, mlp
+    /// up, shared gate, up, down]: BF16 matrices requantized to Q8_0 for
+    /// single-token forwards (gfx1151). Batch-1 decode streams every weight
+    /// once per token, and these are ~1.7 GB of it; Q8_0 halves that at a
+    /// decode KLD inside the noise band (HC 0.0743 -> 0.0754, shared +0.0007
+    /// over 32 chunks). Prefill keeps the BF16 source for its WMMA routes and
+    /// the exact multi-row arms short prompts take.
+    decode_q8: Vec<GpuTensor>,
 }
 
 /// An event after a forward's device argmax and a stream independent of the
@@ -1359,7 +1379,7 @@ impl Qwen4GpuForward {
         let (scratch, host_token_bytes, host_ple_bytes) =
             Qwen4GpuForwardScratch::new(gpu, &bundle.config, max_chunk)?;
         let mut moe = Vec::with_capacity(bundle.config.num_hidden_layers);
-        let mut hc_q8 = Vec::new();
+        let mut decode_q8 = Vec::new();
         let result = (|| {
             for layer in &bundle.weights.layer_refs {
                 moe.push(Qwen4MoeLayerRuntime::new(
@@ -1374,11 +1394,15 @@ impl Qwen4GpuForward {
                 .layer_refs
                 .iter()
                 .flat_map(|layer| {
+                    let moe = &layer.moe;
                     [
                         &layer.attn_hyper.input_mix_down,
                         &layer.attn_hyper.input_mix_up,
                         &layer.mlp_hyper.input_mix_down,
                         &layer.mlp_hyper.input_mix_up,
+                        &moe.shared_gate,
+                        &moe.shared_up,
+                        &moe.shared_down,
                     ]
                 })
                 .map(|reference| dense_ref(&bundle.weights, reference))
@@ -1389,7 +1413,7 @@ impl Qwen4GpuForward {
                     .all(|weight| weight.dtype == DType::BF16 && weight.k % 32 == 0)
             {
                 for weight in sources {
-                    hc_q8.push(gpu.quantize_bf16_q8_0(weight.buf, weight.m, weight.k)?);
+                    decode_q8.push(gpu.quantize_bf16_q8_0(weight.buf, weight.m, weight.k)?);
                 }
             }
             Ok::<(), Qwen4GpuForwardError>(())
@@ -1398,7 +1422,7 @@ impl Qwen4GpuForward {
             for layer in moe {
                 let _ = layer.free_gpu(gpu);
             }
-            for tensor in hc_q8 {
+            for tensor in decode_q8 {
                 let _ = gpu.free_tensor(tensor);
             }
             let _ = scratch.free_gpu(gpu);
@@ -1410,7 +1434,7 @@ impl Qwen4GpuForward {
             host_ple_bytes,
             token_readback: None,
             moe,
-            hc_q8,
+            decode_q8,
         })
     }
 
@@ -1419,11 +1443,11 @@ impl Qwen4GpuForward {
             scratch,
             moe,
             token_readback,
-            hc_q8,
+            decode_q8,
             ..
         } = self;
         let mut first = scratch.free_gpu(gpu);
-        for tensor in hc_q8 {
+        for tensor in decode_q8 {
             if let Err(error) = gpu.free_tensor(tensor) {
                 first.get_or_insert(error);
             }
@@ -1887,7 +1911,14 @@ impl Qwen4GpuForward {
                 }));
             }
 
-            let description = layer_desc(&bundle.weights, layer, &self.moe[layer_index], &config)?;
+            let description = layer_desc(
+                &bundle.weights,
+                layer,
+                &self.moe[layer_index],
+                &config,
+                &self.decode_q8,
+                n,
+            )?;
             let attn_read = &description.attn_hyper.read;
             if steps.len() >= QWEN4_STEP_INLINE_CAPACITY {
                 return Err(invalid(
@@ -1899,8 +1930,18 @@ impl Qwen4GpuForward {
                 state_bf16: bf16_state,
                 input: &self.scratch.streams,
                 norm_weight: attn_read.norm,
-                input_mix_down: hc_mix(&self.hc_q8, layer_index * 4, n, attn_read.input_mix_down),
-                input_mix_up: hc_mix(&self.hc_q8, layer_index * 4 + 1, n, attn_read.input_mix_up),
+                input_mix_down: decode_copy(
+                    &self.decode_q8,
+                    layer_index * DECODE_Q8_PER_LAYER,
+                    n,
+                    attn_read.input_mix_down,
+                ),
+                input_mix_up: decode_copy(
+                    &self.decode_q8,
+                    layer_index * DECODE_Q8_PER_LAYER + 1,
+                    n,
+                    attn_read.input_mix_up,
+                ),
                 normalized: &self.scratch.hc_normalized,
                 low: &self.scratch.hc_low,
                 up: &self.scratch.hc_up,
@@ -2043,13 +2084,18 @@ impl Qwen4GpuForward {
                 state_bf16: bf16_state,
                 input: &self.scratch.streams,
                 norm_weight: mlp_read.norm,
-                input_mix_down: hc_mix(
-                    &self.hc_q8,
-                    layer_index * 4 + 2,
+                input_mix_down: decode_copy(
+                    &self.decode_q8,
+                    layer_index * DECODE_Q8_PER_LAYER + 2,
                     n,
                     mlp_read.input_mix_down,
                 ),
-                input_mix_up: hc_mix(&self.hc_q8, layer_index * 4 + 3, n, mlp_read.input_mix_up),
+                input_mix_up: decode_copy(
+                    &self.decode_q8,
+                    layer_index * DECODE_Q8_PER_LAYER + 3,
+                    n,
+                    mlp_read.input_mix_up,
+                ),
                 normalized: &self.scratch.hc_normalized,
                 low: &self.scratch.hc_low,
                 up: &self.scratch.hc_up,
