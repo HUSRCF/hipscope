@@ -1078,6 +1078,19 @@ pub struct Qwen4MtpGpu {
     draft_rescore: Option<GpuTensor>,
 }
 
+/// What one MTP head step must produce.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MtpStep {
+    /// The full step and its argmax draft token.
+    Predict,
+    /// The full step: its head state feeds a following step without hidden.
+    Advance,
+    /// Only this position's K/V and index-key cache rows. For the last step
+    /// of a chain: the next step brings its own backbone hidden and reselects
+    /// (the head state and selection are left stale; a reuse is refused).
+    Append,
+}
+
 impl Qwen4MtpGpu {
     pub(crate) fn new(
         gpu: &mut Gpu,
@@ -1271,7 +1284,7 @@ impl Qwen4MtpGpu {
                 None,
                 position,
                 fresh_qsa_selection,
-                true,
+                MtpStep::Predict,
             )?
             .ok_or_else(|| invalid("MTP prediction requested but no token produced"))?;
         gpu.copy_d2d(&self.scratch.logits, logits, logits.byte_size())?;
@@ -1287,7 +1300,7 @@ impl Qwen4MtpGpu {
         backbone_hidden: Option<&GpuTensor>,
         position: usize,
         fresh_qsa_selection: bool,
-        predict: bool,
+        step: MtpStep,
     ) -> Result<Option<u32>, MtpGpuError> {
         let wide = MTP_BRANCHES
             .checked_mul(config.hidden_size)
@@ -1421,11 +1434,13 @@ impl Qwen4MtpGpu {
         )?;
         let index_query = f32_view(&scratch.index, 0, index_query_width);
         let index_key = f32_view(&scratch.index, index_query_width, index_key_width);
-        gpu.copy_d2d(
-            &index_query,
-            &scratch.index_query,
-            scratch.index_query.byte_size(),
-        )?;
+        if step != MtpStep::Append {
+            gpu.copy_d2d(
+                &index_query,
+                &scratch.index_query,
+                scratch.index_query.byte_size(),
+            )?;
+        }
         gpu.copy_d2d(
             &index_key,
             &scratch.index_key,
@@ -1433,18 +1448,20 @@ impl Qwen4MtpGpu {
         )?;
         let index_query_norm = weights.resident(&qsa.indexer_q_norm)?;
         let index_key_norm = weights.resident(&qsa.indexer_k_norm)?;
-        indexed_attention_norm_rope(
-            gpu,
-            &IndexedAttentionNormRope {
-                values: &scratch.index_query,
-                norm: index_query_norm,
-                heads: config.indexer_n_heads,
-                head_dim: index_dim,
-                head_stride: config.indexer_head_dim,
-                position,
-                rotary_dim: MTP_ROTARY_DIM.min(index_dim),
-            },
-        )?;
+        if step != MtpStep::Append {
+            indexed_attention_norm_rope(
+                gpu,
+                &IndexedAttentionNormRope {
+                    values: &scratch.index_query,
+                    norm: index_query_norm,
+                    heads: config.indexer_n_heads,
+                    head_dim: index_dim,
+                    head_stride: config.indexer_head_dim,
+                    position,
+                    rotary_dim: MTP_ROTARY_DIM.min(index_dim),
+                },
+            )?;
+        }
         // Keep raw BF16 index keys in the cache; source key RMSNorm and RoPE
         // happen after four-token block pooling.
         gpu.bf16_round_trip_f32(&scratch.index_key)?;
@@ -1466,15 +1483,17 @@ impl Qwen4MtpGpu {
         let k_weight = weights.resident(&qsa.k)?;
         let v_weight = weights.resident(&qsa.v)?;
         let q_and_gate = &scratch.q_and_gate;
-        dispatch_gemv(
-            gpu,
-            q_weight,
-            &scratch.hc_mixed,
-            &scratch.rotation,
-            q_and_gate,
-            2 * q_width,
-            config.hidden_size,
-        )?;
+        if step != MtpStep::Append {
+            dispatch_gemv(
+                gpu,
+                q_weight,
+                &scratch.hc_mixed,
+                &scratch.rotation,
+                q_and_gate,
+                2 * q_width,
+                config.hidden_size,
+            )?;
+        }
         dispatch_gemv(
             gpu,
             k_weight,
@@ -1497,18 +1516,20 @@ impl Qwen4MtpGpu {
         let k_norm = weights.resident(&qsa.k_norm)?;
         // q_proj already emits [Q, gate] for each head. Normalize and rotate
         // each Q half in place while preserving its adjacent gate half.
-        indexed_attention_norm_rope(
-            gpu,
-            &IndexedAttentionNormRope {
-                values: q_and_gate,
-                norm: q_norm,
-                heads: config.num_attention_heads,
-                head_dim: config.head_dim,
-                head_stride: 2 * config.head_dim,
-                position,
-                rotary_dim: MTP_ROTARY_DIM.min(config.head_dim),
-            },
-        )?;
+        if step != MtpStep::Append {
+            indexed_attention_norm_rope(
+                gpu,
+                &IndexedAttentionNormRope {
+                    values: q_and_gate,
+                    norm: q_norm,
+                    heads: config.num_attention_heads,
+                    head_dim: config.head_dim,
+                    head_stride: 2 * config.head_dim,
+                    position,
+                    rotary_dim: MTP_ROTARY_DIM.min(config.head_dim),
+                },
+            )?;
+        }
         indexed_attention_norm_rope(
             gpu,
             &IndexedAttentionNormRope {
@@ -1552,6 +1573,15 @@ impl Qwen4MtpGpu {
                 },
             )?;
         }
+        if step == MtpStep::Append {
+            state.position = next_position;
+            state.full_len = visible;
+            state.raw_len = visible;
+            state.pooled_len = complete;
+            state.selected_len = 0;
+            state.step_index = state.step_index.wrapping_add(1);
+            return Ok(None);
+        }
         let budget_blocks = config.indexer_budget / config.indexer_compress_ratio;
         // Reselect for the first step of each proposal (and every prefill token);
         // the request cursor still tracks state, not the selection's lifetime.
@@ -1575,6 +1605,9 @@ impl Qwen4MtpGpu {
                 - complete * config.indexer_compress_ratio;
             state.selected_len = selected.min(state.selected_capacity);
         } else {
+            if state.selected_len == 0 {
+                return Err(invalid("MTP QSA selection reuse after a K/V-only append"));
+            }
             indexed_attention_reuse_selection(
                 gpu,
                 &IndexedAttentionReuseSelection {
@@ -1683,7 +1716,7 @@ impl Qwen4MtpGpu {
             &scratch.wide,
             &scratch.rotation,
         )?;
-        let next_token = if predict {
+        let next_token = if step == MtpStep::Predict {
             hc_read(
                 gpu,
                 config,

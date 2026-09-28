@@ -702,7 +702,7 @@ impl Qwen4MtpDrafter {
                 {
                     let bundle = Self::bundle(target)?;
                     bundle
-                        .mtp_advance_token(gpu, token, hidden, token_position, row == 0)
+                        .mtp_append_token(gpu, token, hidden, token_position)
                         .map_err(|error| error.to_string())?;
                 }
                 committed.push(pick);
@@ -899,7 +899,7 @@ impl MtpDrafter for Qwen4MtpDrafter {
                     .copy_spec_hidden_row_to(gpu, index, pending)
                     .map_err(|error| error.to_string())?;
                 bundle
-                    .mtp_advance_token(gpu, token, Some(pending), position, true)
+                    .mtp_append_token(gpu, token, Some(pending), position)
                     .map_err(|error| error.to_string())?;
             }
             first_token = Some(pick);
@@ -1074,7 +1074,7 @@ impl MtpDrafter for Qwen4MtpDrafter {
                     .checked_add(k)
                     .ok_or_else(|| "Qwen4 MTP step position overflow".to_string())?;
                 picks
-                    .mtp_advance_token(gpu, last_draft, None, last_position, false)
+                    .mtp_append_token(gpu, last_draft, None, last_position)
                     .map_err(|error| error.to_string())?;
             } else if target_accept_len < drafts.len() {
                 // The draft steps already consumed the kept prefix with the
@@ -1097,9 +1097,12 @@ impl MtpDrafter for Qwen4MtpDrafter {
                     let token_position = position
                         .checked_add(index)
                         .ok_or_else(|| "Qwen4 MTP step position overflow".to_string())?;
-                    picks
-                        .mtp_advance_token(gpu, token, hidden, token_position, index == 0)
-                        .map_err(|error| error.to_string())?;
+                    let result = if index == target_accept_len {
+                        picks.mtp_append_token(gpu, token, hidden, token_position)
+                    } else {
+                        picks.mtp_advance_token(gpu, token, hidden, token_position, index == 0)
+                    };
+                    result.map_err(|error| error.to_string())?;
                 }
             }
             timers.mark(gpu, "commit");
@@ -1221,7 +1224,7 @@ impl MtpDrafter for Qwen4MtpDrafter {
                 .copy_spec_hidden_row_to(gpu, 0, pending)
                 .map_err(|error| error.to_string())?;
             bundle
-                .mtp_advance_token(gpu, token, Some(pending), position, true)
+                .mtp_append_token(gpu, token, Some(pending), position)
                 .map_err(|error| error.to_string())?;
         }
         Ok(true)

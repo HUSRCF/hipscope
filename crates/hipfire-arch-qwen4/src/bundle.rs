@@ -11,7 +11,7 @@
 
 use crate::config::Qwen4Config;
 use crate::gpu_forward::{Qwen4GpuForward, Qwen4OutputRows, QWEN4_PREFILL_CHUNK_CAP};
-use crate::mtp_gpu::{MtpGpuStateSnapshot, Qwen4MtpGpu};
+use crate::mtp_gpu::{MtpGpuStateSnapshot, MtpStep, Qwen4MtpGpu};
 use crate::ple::PleHashMetadata;
 use crate::state::{Qwen4State, Qwen4StateSnapshot, StateError};
 use crate::weights::{
@@ -562,7 +562,7 @@ impl Qwen4Bundle {
             backbone_hidden,
             position,
             fresh_qsa_selection,
-            true,
+            MtpStep::Predict,
         )
         .map_err(|error| BundleError::Forward(error.to_string()))?
         .ok_or_else(|| {
@@ -589,7 +589,34 @@ impl Qwen4Bundle {
                 backbone_hidden,
                 position,
                 fresh_qsa_selection,
-                false,
+                MtpStep::Advance,
+            )
+            .map(|_| ())
+            .map_err(|error| BundleError::Forward(error.to_string()))
+    }
+
+    /// The last MTP step of a chain: append only its K/V and index-key cache
+    /// rows (see [`MtpStep::Append`]); the next step must bring its own
+    /// backbone hidden and a fresh selection.
+    pub(crate) fn mtp_append_token(
+        &mut self,
+        gpu: &mut Gpu,
+        token: u32,
+        backbone_hidden: Option<&GpuTensor>,
+        position: usize,
+    ) -> Result<(), BundleError> {
+        self.mtp
+            .as_mut()
+            .ok_or_else(|| BundleError::Forward("Qwen4 MTP resources are not attached".into()))?
+            .forward_token(
+                gpu,
+                &self.weights,
+                &self.config,
+                token,
+                backbone_hidden,
+                position,
+                true,
+                MtpStep::Append,
             )
             .map(|_| ())
             .map_err(|error| BundleError::Forward(error.to_string()))

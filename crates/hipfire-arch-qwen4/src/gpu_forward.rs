@@ -807,7 +807,9 @@ pub(crate) fn execute_moe(
     scratch: Qwen4MoeScratch<'_>,
 ) -> Result<(), Qwen4GpuForwardError> {
     let ctx = DispatchCtx::new(gpu);
-    gpu.hip.memset(&output.buf, 0, output.buf.size())?;
+    // A stream-ordered kernel, not a blocking default-stream hipMemset that
+    // drains the queue every MTP draft step; both write exact +0.0.
+    gpu.zero_f32(output)?;
     let dtypes = MoeDtypes {
         router: runtime.router.dtype,
         shared: Some(MoeSharedDtypes {
