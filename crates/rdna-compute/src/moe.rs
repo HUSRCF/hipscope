@@ -2294,6 +2294,73 @@ impl Gpu {
         Ok(out)
     }
 
+    /// [`Gpu::moe_gate_up_unscatter_silu_top10`] followed by the in-place
+    /// [`Gpu::rotate_x_mq_128_v2`] of its activation rows, one launch (bitwise
+    /// both): `rotated` receives the MoE down's F32 input.
+    pub fn moe_gate_up_unscatter_silu_rotate128_top10(
+        &mut self,
+        grouped_gate_up: &GpuTensor,
+        sorted_slot_index: &GpuTensor,
+        rotated: &GpuTensor,
+        mi: usize,
+        grouped_rows: usize,
+        bf16_round_trip: bool,
+    ) -> HipResult<()> {
+        if mi % 128 != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "fused unscatter/rotate needs mi % 128 == 0",
+            ));
+        }
+        self.bind_thread()?;
+        const FUNC: &str = "moe_gate_up_unscatter_silu_rotate128_top10";
+        self.ensure_kernel(
+            "moe_gate_up_unscatter_silu_top10",
+            kernels::MOE_GATE_UP_UNSCATTER_SILU_TOP10_SRC,
+            FUNC,
+        )?;
+        self.ensure_mq_signs_128()?;
+        let yp = grouped_gate_up.buf.as_ptr();
+        let sp = sorted_slot_index.buf.as_ptr();
+        let s1 = self.scratch.mq_signs1_128.as_ref().unwrap().buf.as_ptr();
+        let s2 = self.scratch.mq_signs2_128.as_ref().unwrap().buf.as_ptr();
+        let rp = rotated.buf.as_ptr();
+        let mi_val = mi as i32;
+        let rows_val = grouped_rows as i32;
+        let rt_val = bf16_round_trip as i32;
+        let mut params = [
+            &yp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &s1 as *const _ as *mut c_void,
+            &s2 as *const _ as *mut c_void,
+            &rp as *const _ as *mut c_void,
+            &mi_val as *const _ as *mut c_void,
+            &rows_val as *const _ as *mut c_void,
+            &rt_val as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            FUNC,
+            [grouped_rows as u32, (mi / 128) as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(yp);
+                b.push_ptr(sp);
+                b.push_ptr(s1);
+                b.push_ptr(s2);
+                b.push_ptr(rp);
+                b.push_i32(mi_val);
+                b.push_i32(rows_val);
+                b.push_i32(rt_val);
+                b
+            },
+        )?;
+        self.invalidate_x_caches_for(rp);
+        Ok(())
+    }
+
     /// [`Gpu::moe_gate_up_unscatter_silu_top10`] reading the grouped rows as BF16 bits (written by a
     /// `*_bf16out` MoE GEMM).
     #[allow(clippy::too_many_arguments)]

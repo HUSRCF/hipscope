@@ -413,7 +413,8 @@ pub(crate) fn gate_up(
 /// Path-2 unscatter fused with the SwiGLU activation: the grouped gate/up
 /// rows go straight to the rotation input (`rot_batch`) with the recipe's BF16
 /// round trips, bitwise the unfused unscatter -> round trip -> silu_mul ->
-/// round trip sequence.  [`activation`] then only rotates.
+/// round trip sequence, rotated in the same launch when
+/// [`unscatter_rotates`] (else [`activation`] rotates).
 pub(crate) fn unscatter(
     gpu: &mut Gpu,
     p: &MoePrefillParams<'_>,
@@ -434,6 +435,16 @@ pub(crate) fn unscatter(
             p.recipe.bf16_round_trip(),
         ));
     }
+    if unscatter_rotates(gpu, p) {
+        return hip(gpu.moe_gate_up_unscatter_silu_rotate128_top10(
+            p.y_gate_up_grouped,
+            p.sorted_slot_index,
+            p.rot_batch,
+            p.mi,
+            grouped_rows,
+            p.recipe.bf16_round_trip(),
+        ));
+    }
     hip(gpu.moe_gate_up_unscatter_silu_top10(
         p.y_gate_up_grouped,
         p.sorted_slot_index,
@@ -442,6 +453,12 @@ pub(crate) fn unscatter(
         grouped_rows,
         p.recipe.bf16_round_trip(),
     ))
+}
+
+/// Whether path 2's F32 unscatter also applies the down's 128-wide rotation
+/// (in the same launch), leaving [`activation`] nothing to do.
+fn unscatter_rotates(gpu: &Gpu, p: &MoePrefillParams<'_>) -> bool {
+    !gateup_bf16(gpu, p) && !down_wmma(gpu, p) && p.mi % 128 == 0
 }
 
 pub(crate) fn activation(
@@ -458,8 +475,9 @@ pub(crate) fn activation(
             hip(gpu.bf16_round_trip_f32(p.rot_batch))?;
         }
     }
-    // The F16 WMMA down rotates straight to F16 itself (see `down`).
-    if use_path2 && down_wmma(gpu, p) {
+    // The F16 WMMA down rotates straight to F16 itself (see `down`); the F32
+    // unscatter may already have rotated.
+    if use_path2 && (down_wmma(gpu, p) || unscatter_rotates(gpu, p)) {
         return Ok(());
     }
     hip(gpu.rotate_x_mq_128_v2(p.rot_batch, p.rot_batch, p.mi, total_slots))
