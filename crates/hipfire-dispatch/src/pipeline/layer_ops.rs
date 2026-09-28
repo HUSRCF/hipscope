@@ -16,9 +16,8 @@
 use crate::families::gemv::WeightRef;
 use crate::types::DispatchError;
 use rdna_compute::tensor_ops::{
-    argmax_f32, bf16_roundtrip_f32, gated_delta_chunk_route, gated_delta_conv_batched,
-    gated_delta_conv_params, gated_delta_gate_batched, gated_delta_gate_batched_rotate,
-    gated_delta_params_batched,
+    argmax_f32, bf16_roundtrip_f32, gated_delta_chunk_route, gated_delta_conv_params,
+    gated_delta_conv_params_batched, gated_delta_gate_batched, gated_delta_gate_batched_rotate,
     gated_delta_step_batched, gated_delta_step_gate_wmma, gated_delta_step_gated,
     hc_activation_fused_f32, hc_state_bf16_add_f32, hc_state_bf16_to_f32, hyper_norm,
     hyper_norm_f16, hyper_norm_gate, hyper_read_projected, hyper_read_up_fused, hyper_read_up_wmma,
@@ -1213,7 +1212,8 @@ pub fn execute_gated_delta_net(
         if chunked {
             conv_output.dtype = DType::BF16;
         }
-        hip(gated_delta_conv_batched(
+        // Convolution and gate parameters in one launch.
+        hip(gated_delta_conv_params_batched(
             gpu,
             &GatedDeltaConvBatched {
                 input: &projection,
@@ -1227,9 +1227,6 @@ pub fn execute_gated_delta_net(
                 kernel_size: op.conv_kernel,
                 start_cursor,
             },
-        ))?;
-        hip(gated_delta_params_batched(
-            gpu,
             &GatedDeltaParamsBatched {
                 a: &a,
                 b: &b,

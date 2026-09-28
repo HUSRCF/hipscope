@@ -1231,7 +1231,29 @@ extern "C" __global__ void gated_delta_conv_bf16_f32(
 // row-0 chunk reads the history, and it alone writes next_history after its
 // reads: history may alias next_history.
 // `output_bf16`: store the (BF16-rounded) outputs as packed BF16 bits.
-// Grid [ceil(channels / 256), ceil(rows / 16)], block 256.
+// Optional gate parameters (`param_elements` > 0): blocks past the channel
+// grid run gated_delta_params_bf16_f32_batched's body (block row 0 only).
+// Grid [ceil(channels / 256) + param blocks, ceil(rows / 16)], block 256.
+static __device__ __forceinline__ void gated_delta_params_flat(
+    const float* a,
+    const float* b,
+    const __hip_bfloat16* a_log,
+    const __hip_bfloat16* dt_bias,
+    float* gate,
+    float* beta,
+    int flat,
+    int heads) {
+    const int head = flat % heads;
+    const float al = bf16_to_f32(a_log[head]);
+    const float dt = bf16_to_f32(dt_bias[head]);
+    const float value = bf16_to_f32(bf16_round(a[flat])) + dt;
+    const float softplus = value > 20.0f
+        ? value
+        : (value < -20.0f ? expf(value) : log1pf(expf(value)));
+    gate[flat] = -expf(al) * softplus;
+    beta[flat] = 1.0f / (1.0f + expf(-bf16_to_f32(bf16_round(b[flat]))));
+}
+
 extern "C" __global__ void gated_delta_conv_bf16_f32_batched_k4(
     const float* input,
     const __hip_bfloat16* kernel,
@@ -1244,7 +1266,22 @@ extern "C" __global__ void gated_delta_conv_bf16_f32_batched_k4(
     int kernel_size,
     int start_cursor,
     int output_bf16,
-    int input_bf16) {
+    int input_bf16,
+    const float* param_a,
+    const float* param_b,
+    const __hip_bfloat16* a_log,
+    const __hip_bfloat16* dt_bias,
+    float* gate,
+    float* beta,
+    int param_elements,
+    int heads) {
+    const int conv_blocks = (channels + 255) / 256;
+    if ((int)blockIdx.x >= conv_blocks) {
+        const int flat = ((int)blockIdx.x - conv_blocks) * 256 + (int)threadIdx.x;
+        if (blockIdx.y == 0 && flat < param_elements)
+            gated_delta_params_flat(param_a, param_b, a_log, dt_bias, gate, beta, flat, heads);
+        return;
+    }
     const int channel = (int)(blockIdx.x * blockDim.x + threadIdx.x);
     const int r0 = (int)blockIdx.y * 16;
     if (channel >= channels || r0 >= rows
@@ -1311,17 +1348,8 @@ extern "C" __global__ void gated_delta_params_bf16_f32_batched(
     int rows,
     int heads) {
     const int flat = (int)(blockIdx.x * blockDim.x + threadIdx.x);
-    const int total = rows * heads;
-    if (flat >= total) return;
-    const int head = flat % heads;
-    const float al = bf16_to_f32(a_log[head]);
-    const float dt = bf16_to_f32(dt_bias[head]);
-    const float value = bf16_to_f32(bf16_round(a[flat])) + dt;
-    const float softplus = value > 20.0f
-        ? value
-        : (value < -20.0f ? expf(value) : log1pf(expf(value)));
-    gate[flat] = -expf(al) * softplus;
-    beta[flat] = 1.0f / (1.0f + expf(-bf16_to_f32(bf16_round(b[flat]))));
+    if (flat >= rows * heads) return;
+    gated_delta_params_flat(a, b, a_log, dt_bias, gate, beta, flat, heads);
 }
 
 static __device__ __forceinline__ void gated_delta_params_head(

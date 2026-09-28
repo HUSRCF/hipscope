@@ -1367,6 +1367,25 @@ pub struct GatedDeltaConvBatched<'a> {
 }
 
 pub fn gated_delta_conv_batched(gpu: &mut Gpu, p: &GatedDeltaConvBatched<'_>) -> HipResult<()> {
+    gated_delta_conv_batched_impl(gpu, p, None)
+}
+
+/// [`gated_delta_conv_batched`] and [`gated_delta_params_batched`] in one
+/// launch (the parameter blocks follow the convolution grid); bitwise both.
+pub fn gated_delta_conv_params_batched(
+    gpu: &mut Gpu,
+    conv: &GatedDeltaConvBatched<'_>,
+    params: &GatedDeltaParamsBatched<'_>,
+) -> HipResult<()> {
+    validate_gated_delta_params_batched(params)?;
+    gated_delta_conv_batched_impl(gpu, conv, Some(params))
+}
+
+fn gated_delta_conv_batched_impl(
+    gpu: &mut Gpu,
+    p: &GatedDeltaConvBatched<'_>,
+    params: Option<&GatedDeltaParamsBatched<'_>>,
+) -> HipResult<()> {
     for tensor in [p.history, p.next_history] {
         ensure_f32(tensor)?;
     }
@@ -1425,7 +1444,24 @@ pub fn gated_delta_conv_batched(gpu: &mut Gpu, p: &GatedDeltaConvBatched<'_>) ->
     let start_cursor_offset = args.len() - 4;
     args.push_i32(i32::from(output_bf16));
     args.push_i32(i32::from(input_bf16));
+    let (param_elements, param_heads) = match params {
+        Some(q) => {
+            for tensor in [q.a, q.b, q.a_log, q.dt_bias, q.gate, q.beta] {
+                args.push_ptr(tensor.buf.as_ptr());
+            }
+            (q.rows * q.heads, q.heads)
+        }
+        None => {
+            for _ in 0..6 {
+                args.push_ptr(std::ptr::null());
+            }
+            (0, 1)
+        }
+    };
+    args.push_i32(checked_i32(param_elements, "GDN batched parameter extent")?);
+    args.push_i32(checked_i32(param_heads, "GDN batched parameter heads")?);
     args.pad_to(16);
+    let param_grid = checked_u32(param_elements.div_ceil(256), "GDN batched parameter grid")?;
     // `start_cursor` is `start_position % history_rows` for the chunk (the
     // kernel advances the ring per row from there), so the declared binding
     // re-derives it at the replay position.
@@ -1437,7 +1473,7 @@ pub fn gated_delta_conv_batched(gpu: &mut Gpu, p: &GatedDeltaConvBatched<'_>) ->
     }];
     gpu.launch_blob_recorded(
         kernel,
-        [grid, row_grid, 1],
+        [grid + param_grid, row_grid, 1],
         [256, 1, 1],
         0,
         args.as_mut_slice(),
@@ -1507,7 +1543,7 @@ pub struct GatedDeltaParamsBatched<'a> {
     pub heads: usize,
 }
 
-pub fn gated_delta_params_batched(gpu: &mut Gpu, p: &GatedDeltaParamsBatched<'_>) -> HipResult<()> {
+fn validate_gated_delta_params_batched(p: &GatedDeltaParamsBatched<'_>) -> HipResult<usize> {
     for tensor in [p.a, p.b, p.gate, p.beta] {
         ensure_f32(tensor)?;
     }
@@ -1525,6 +1561,11 @@ pub fn gated_delta_params_batched(gpu: &mut Gpu, p: &GatedDeltaParamsBatched<'_>
     {
         return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
     }
+    Ok(elements)
+}
+
+pub fn gated_delta_params_batched(gpu: &mut Gpu, p: &GatedDeltaParamsBatched<'_>) -> HipResult<()> {
+    let elements = validate_gated_delta_params_batched(p)?;
     let rows = checked_i32(p.rows, "GDN batched parameter rows")?;
     let heads = checked_i32(p.heads, "GDN batched parameter heads")?;
     let grid = blocks(elements)?;
