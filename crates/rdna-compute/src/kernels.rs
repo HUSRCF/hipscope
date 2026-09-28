@@ -4190,8 +4190,9 @@ pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1_CONTROL: &[u8] =
     include_bytes!("../../../kernels/gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1_control.hxaco");
 /// Certified gfx1201 `_b1s` bundle: the `_b1` K-loop and epilogues staging
 /// the slab activation layout (`hipfire-isa emit --alayout slab`), fed only
-/// by the slab producer twins (`Gpu::a4_slab_active`).
-/// SHA-256 d87e36b73c31b0afe0fa7ad63b9857664d2b64fd924eec67293fbd2b1df34e03.
+/// by the slab producer twins (`Gpu::a4_slab_active`), including the fused
+/// GDN input projection `gemm_mq4g256v2_residual_mmq_iu4_qkvzagdn_b1s`.
+/// SHA-256 c8f957fc1f88be36466a871c077e7d8f224da9faef61e40c213da81f0de0bcbb.
 pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1S: &[u8] =
     include_bytes!("../../../kernels/gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s.hxaco");
 /// Certified gfx1201 F2 Row/K128 bundle; production selects Row only.

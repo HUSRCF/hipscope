@@ -30537,11 +30537,12 @@ impl Gpu {
         (z_m + 128, z_m, z_m + 64)
     }
 
-    /// A4 (`_b1`) QKV + Z + beta + alpha in one SET launch whose QKV row
-    /// tiles (one 128-channel head each) also run `gdn_chunk_prep` in the
-    /// epilogue (`gemm_mq4g256v2_residual_mmq_iu4_qkvzagdn_b1`). `a_z_fold`
-    /// is the loader's Z fold. Returns `Ok(false)` without launching anything
-    /// when not admitted; after `Ok(true)` the caller must run
+    /// A4 (`_b1`/`_b1s`) QKV + Z + beta + alpha in one SET launch whose QKV
+    /// row tiles (one 128-channel head each) also run `gdn_chunk_prep` in the
+    /// epilogue (`gemm_mq4g256v2_residual_mmq_iu4_qkvzagdn_b1`, or its `_b1s`
+    /// twin when a slab producer wrote the activations). `a_z_fold` is the
+    /// loader's Z fold. Returns `Ok(false)` without launching anything when
+    /// not admitted; after `Ok(true)` the caller must run
     /// [`Self::gdn_chunk_prep_fixup`], and `y_qkv` holds only the raw rows
     /// that pass reads.
     #[allow(clippy::too_many_arguments)]
@@ -30559,8 +30560,6 @@ impl Gpu {
         n: usize,
         gdn: &F2GdnTargets<'_>,
     ) -> HipResult<bool> {
-        const MODULE: &str = "gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1";
-        const SYMBOL: &str = "gemm_mq4g256v2_residual_mmq_iu4_qkvzagdn_b1";
         self.bind_thread()?;
         let row_bytes = k / 256 * crate::dispatch::MQ4V2_GROUP_BYTES;
         let aligned = |t: &GpuTensor| (t.buf.as_ptr() as usize) % 16 == 0;
@@ -30581,14 +30580,25 @@ impl Gpu {
             return Ok(false);
         }
         let xq = self.int4_mmq_prepared_ptr(prepared, k, n)?;
-        // This symbol stages token-order records; slab-layout activations
-        // (`HIPFIRE_A4_SLAB`) take the four `_b1s` SETs + prep instead.
-        if self.scratch.int4_mmq_slab_at(xq) {
-            return Ok(false);
-        }
+        // The two symbols differ only in how they stage Xq: token-order
+        // records (`_b1`) or the slab planes a slab producer twin wrote
+        // (`_b1s`, the only reader of slab activations).
+        let (module, image, symbol) = if self.scratch.int4_mmq_slab_at(xq) {
+            (
+                "gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s",
+                kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1S,
+                "gemm_mq4g256v2_residual_mmq_iu4_qkvzagdn_b1s",
+            )
+        } else {
+            (
+                "gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1",
+                g12_iu4_b1_image(),
+                "gemm_mq4g256v2_residual_mmq_iu4_qkvzagdn_b1",
+            )
+        };
         // An owed residual add must land before any further GEMM.
         self.flush_residual_fold()?;
-        self.ensure_embedded_kernel(MODULE, g12_iu4_b1_image(), SYMBOL)?;
+        self.ensure_embedded_kernel(module, image, symbol)?;
         let mut ptrs = [a_qkv, a_z_fold].map(|t| t.buf.as_ptr());
         let mut xq_ptr = xq;
         let mut outs = [y_z, y_beta, y_alpha].map(|t| t.buf.as_ptr());
@@ -30610,10 +30620,10 @@ impl Gpu {
         ];
         let row_tiles = (dims[0] + Self::iu4_gdn_fold_rows(dims[1]).0).div_ceil(128);
         let bytes = (dims[0] + dims[1] + 96) * row_bytes + n * (dims[1] + 96) * 4 + n * (32 + 48) * 128 * 2;
-        let timer = crate::profile::begin_timer(&self.hip, "gemm", SYMBOL, bytes);
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", symbol, bytes);
         let blob_ptrs = (ptrs, xq, outs, ints, gdn_ptrs, scales);
         let result = self.launch_maybe_blob(
-            SYMBOL,
+            symbol,
             [row_tiles as u32, n.div_ceil(128) as u32, 1],
             [256, 1, 1],
             20480,
@@ -30635,7 +30645,7 @@ impl Gpu {
         }
         result?;
         if *G12_IU4_GDN_COVERAGE {
-            eprintln!("iu4_gdn_selected: symbol={SYMBOL} n={n} k={k} dims={dims:?}");
+            eprintln!("iu4_gdn_selected: symbol={symbol} n={n} k={k} dims={dims:?}");
         }
         Ok(true)
     }

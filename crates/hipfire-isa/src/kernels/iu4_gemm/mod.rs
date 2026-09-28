@@ -261,8 +261,7 @@ pub fn module(emitted: &[Emitted], name: &str) -> Result<(String, ModuleProof), 
 /// projection for the production tile.
 pub fn emit_module(fold: Fold, tile: Tile, cacc: Cacc, act: ALayout, arch: crate::Arch) -> Result<(Vec<Emitted>, String, ModuleProof), String> {
     let mut epis = vec![Epi::Set, Epi::Add, Epi::GateUpSilu];
-    if tile == Tile::T128x128x8 { epis.push(Epi::GateUpSiluBf16); }
-    if tile == Tile::T128x128x8 && act == ALayout::Token { epis.push(Epi::QkvzaGdn); }
+    if tile == Tile::T128x128x8 { epis.push(Epi::GateUpSiluBf16); epis.push(Epi::QkvzaGdn); }
     let emitted = epis.into_iter().map(|epi| emit(Spec { fold, tile, cacc, epi, act, arch })).collect::<Result<Vec<_>, _>>()?;
     let (text, proof) = module(&emitted, &Spec { fold, tile, cacc, epi: Epi::Set, act, arch }.module())?;
     Ok((emitted, text, proof))
