@@ -38,8 +38,8 @@ use hipfire_dispatch::pipeline::sealed_moe::{
 use hipfire_dispatch::pipeline::{
     execute_steps, execute_validated_steps, seal_decode, validate_steps, BoundMoeExperts, ClearOp,
     ExpertBindingCache, ExpertMetadata, ExpertResource, ExpertResources, ExpertTable,
-    GatedDeltaNetOp, GroupedDepthwiseOp, HyperReadOp, HyperWriteOp, IndexedAttentionOp,
-    IndexedAttentionState, Step,
+    GatedDeltaNetOp, GroupedDepthwiseOp, HyperReadOp, HyperWriteOp, IndexedAttentionMode,
+    IndexedAttentionOp, IndexedAttentionState, Step,
 };
 use hipfire_dispatch::types::dtype_rotation_plan;
 use hipfire_runtime::external_rows::RowFetch;
@@ -2017,6 +2017,7 @@ impl Qwen4GpuForward {
                     };
                     steps.push(Step::IndexedAttention(IndexedAttentionOp {
                         rotation: &self.scratch.rotation,
+                        mode: IndexedAttentionMode::Full,
                         indexer_qk: weights.indexer_qk,
                         indexer_q_norm: weights.indexer_q_norm,
                         indexer_k_norm: weights.indexer_k_norm,

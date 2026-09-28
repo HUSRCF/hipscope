@@ -21,16 +21,17 @@ use rdna_compute::tensor_ops::{
     gated_delta_step_batched, gated_delta_step_gate_wmma, gated_delta_step_gated,
     hc_activation_fused_f32, hc_state_bf16_add_f32, hc_state_bf16_to_f32, hyper_norm,
     hyper_norm_f16, hyper_norm_gate, hyper_read_projected, hyper_read_up_fused, hyper_read_up_wmma,
-    hyper_write, hyper_write_norm, indexed_attention_attention_batch,
+    hyper_write, hyper_write_norm, indexed_attention_attention, indexed_attention_attention_batch,
     indexed_attention_cache_append_batch, indexed_attention_decode_prologue,
     indexed_attention_norm_rope_batch, indexed_attention_pool_rope,
-    indexed_attention_pool_rope_incremental, indexed_attention_select_batch_mirrored, scale_f32,
-    ArgmaxF32, Bf16Roundtrip, GatedDeltaConv, GatedDeltaConvBatched, GatedDeltaGate,
-    GatedDeltaGateBatched, GatedDeltaParams, GatedDeltaParamsBatched, GatedDeltaStep,
-    GatedDeltaStepBatched, HcActivationFused, HyperNextGates, HyperNorm, HyperNormGate,
-    HyperReadProjected, HyperReadUpFused, HyperWrite, IndexedAttentionAttentionBatch,
-    IndexedAttentionCacheAppendBatch, IndexedAttentionDecodePrologue,
-    IndexedAttentionNormRopeBatch, IndexedAttentionPoolRope, IndexedAttentionSelectBatch, ScaleF32,
+    indexed_attention_pool_rope_incremental, indexed_attention_reuse_selection,
+    indexed_attention_select_batch_mirrored, scale_f32, ArgmaxF32, Bf16Roundtrip, GatedDeltaConv,
+    GatedDeltaConvBatched, GatedDeltaGate, GatedDeltaGateBatched, GatedDeltaParams,
+    GatedDeltaParamsBatched, GatedDeltaStep, GatedDeltaStepBatched, HcActivationFused,
+    HyperNextGates, HyperNorm, HyperNormGate, HyperReadProjected, HyperReadUpFused, HyperWrite,
+    IndexedAttentionAttention, IndexedAttentionAttentionBatch, IndexedAttentionCacheAppendBatch,
+    IndexedAttentionDecodePrologue, IndexedAttentionNormRopeBatch, IndexedAttentionPoolRope,
+    IndexedAttentionReuseSelection, IndexedAttentionSelectBatch, ScaleF32,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 use smallvec::SmallVec;
@@ -1400,6 +1401,20 @@ pub struct IndexedAttentionState<'a> {
     pub position: usize,
 }
 
+/// Which part of the indexed-attention body one call runs.
+#[derive(Clone, Copy)]
+pub enum IndexedAttentionMode<'a> {
+    /// Append the rows, select for every row, attend, project the output.
+    Full,
+    /// Append K/V and index keys only: no query projection, selection,
+    /// attention or output projection. The persistent selection goes
+    /// stale, so `selected_len` commits as 0.
+    AppendOnly,
+    /// One row: keep the persistent selection, append this position to it
+    /// on device, attend over it, project the output.
+    ReuseSelection { selected_len_out: &'a GpuTensor },
+}
+
 pub struct IndexedAttentionOp<'a> {
     pub indexer_qk: WeightRef<'a>,
     pub indexer_q_norm: &'a GpuTensor,
@@ -1433,10 +1448,33 @@ pub struct IndexedAttentionOp<'a> {
     /// FWHT basis scratch for quantized payloads (`rows * k` elements); the
     /// BF16 path never reads it.
     pub rotation: &'a GpuTensor,
+    pub mode: IndexedAttentionMode<'a>,
 }
 
 impl IndexedAttentionOp<'_> {
     pub fn validate_for_gpu(&self, _gpu: &Gpu) -> Result<(), DispatchError> {
+        self.validate_layout()
+    }
+
+    fn validate_layout(&self) -> Result<(), DispatchError> {
+        if let IndexedAttentionMode::ReuseSelection { selected_len_out } = self.mode {
+            if self.rows != 1 {
+                return Err(DispatchError::Hip(
+                    "indexed attention selection reuse needs one row".into(),
+                ));
+            }
+            if self.state.selected_len == 0 {
+                return Err(DispatchError::Hip(
+                    "indexed attention selection reuse after a K/V-only append".into(),
+                ));
+            }
+            if selected_len_out.dtype != DType::Raw || selected_len_out.numel() < 4 {
+                return Err(DispatchError::Hip(
+                    "indexed attention selection-length output must be a four-byte Raw scalar"
+                        .into(),
+                ));
+            }
+        }
         if self.rows == 0
             || self.input_width == 0
             || self.index_heads == 0
@@ -1685,10 +1723,21 @@ impl IndexedAttentionOp<'_> {
             ));
         }
         let complete = final_position / self.compress;
-        let budget_blocks = self.budget / self.compress;
-        let selected_len = (budget_blocks.min(complete) * self.compress + final_position
-            - complete * self.compress)
-            .min(self.state.selected_capacity);
+        let selected_len = match self.mode {
+            IndexedAttentionMode::Full => {
+                let budget_blocks = self.budget / self.compress;
+                (budget_blocks.min(complete) * self.compress + final_position
+                    - complete * self.compress)
+                    .min(self.state.selected_capacity)
+            }
+            IndexedAttentionMode::AppendOnly => 0,
+            // The reuse kernel keeps the prior rows (all before this
+            // position) and appends this one; a dropped row pads with -1,
+            // which the attention skips exactly.
+            IndexedAttentionMode::ReuseSelection { .. } => (self.state.selected_len + 1)
+                .min(self.state.selected_capacity)
+                .min(final_position),
+        };
         Ok((
             final_position,
             final_position,
@@ -1709,7 +1758,7 @@ pub fn execute_indexed_attention(
     let q_width = op.heads * op.head_dim;
     let kv_width = op.kv_heads * op.head_dim;
     let initial_position = op.state.position;
-    let (_, _, complete, _, _) = op.next_lengths()?;
+    let (_, _, complete, selected_len, _) = op.next_lengths()?;
     let index_batch = view(op.index_scratch, 0, op.rows * index_width);
     let qgate_batch = view(op.qgate_scratch, 0, op.rows * 2 * q_width);
     let k_batch = view(op.k_scratch, 0, op.rows * kv_width);
@@ -1720,18 +1769,18 @@ pub fn execute_indexed_attention(
         0,
         op.rows * op.state.selected_capacity * std::mem::size_of::<i32>(),
     );
-    project_weights(
-        gpu,
-        op.input,
-        op.rows,
-        Some(op.rotation),
-        &[
-            (&op.indexer_qk, &index_batch),
-            (&op.q, &qgate_batch),
-            (&op.k, &k_batch),
-            (&op.v, &v_batch),
-        ],
-    )?;
+    let all = [
+        (&op.indexer_qk, &index_batch),
+        (&op.q, &qgate_batch),
+        (&op.k, &k_batch),
+        (&op.v, &v_batch),
+    ];
+    let without_q = [all[0], all[2], all[3]];
+    let projections: &[_] = match op.mode {
+        IndexedAttentionMode::AppendOnly => &without_q,
+        _ => &all,
+    };
+    project_weights(gpu, op.input, op.rows, Some(op.rotation), projections)?;
 
     if op.rows <= 8 && op.index_dim <= 256 && op.head_dim <= 256 {
         // Decode / few-row verify: the norms, RoPE, cache append and
@@ -1870,6 +1919,47 @@ pub fn execute_indexed_attention(
                 grid_bound: op.state.pooled_capacity,
             },
         ))?;
+    }
+    let selected_len_out = match op.mode {
+        IndexedAttentionMode::Full => None,
+        IndexedAttentionMode::AppendOnly => return Ok(()),
+        IndexedAttentionMode::ReuseSelection { selected_len_out } => Some(selected_len_out),
+    };
+    // Reuse keeps the persistent selection: no per-row selection or mirror.
+    if let Some(selected_len_out) = selected_len_out {
+        hip(indexed_attention_reuse_selection(
+            gpu,
+            &IndexedAttentionReuseSelection {
+                selected: op.state.selected_indices,
+                selected_len: op.state.selected_len,
+                position: initial_position,
+                capacity: op.state.selected_capacity,
+                selected_len_out,
+            },
+        ))?;
+        hip(indexed_attention_attention(
+            gpu,
+            &IndexedAttentionAttention {
+                q_with_gate: &qgate_batch,
+                full_keys: op.state.full_keys,
+                full_values: op.state.full_values,
+                selected: op.state.selected_indices,
+                output: &qsa_output_batch,
+                n_heads: op.heads,
+                n_kv_heads: op.kv_heads,
+                head_dim: op.head_dim,
+                selected_len,
+                full_capacity: op.state.full_capacity,
+            },
+        ))?;
+        return project_weight(
+            gpu,
+            &op.output,
+            &qsa_output_batch,
+            &view(op.attention_output, 0, op.output.m),
+            1,
+            Some(op.rotation),
+        );
     }
     let budget_blocks = op.budget / op.compress;
     let select = IndexedAttentionSelectBatch {
@@ -2375,5 +2465,118 @@ mod tests {
             .validate_layout()
             .expect_err("F32 dt bias must not pass the BF16 kernel contract");
         assert!(error.to_string().contains("gated delta dt bias"));
+    }
+
+    /// Null-tensor QSA op over `compress` 4, budget 8, 16 selected slots.
+    fn indexed_attention<'a>(
+        t: &'a GpuTensor,
+        rows: usize,
+        position: usize,
+        selected_len: usize,
+        mode: IndexedAttentionMode<'a>,
+    ) -> IndexedAttentionOp<'a> {
+        let weight = WeightRef {
+            buf: t,
+            dtype: DType::BF16,
+            m: 1,
+            k: 1,
+            row_stride: 1,
+            rotation: None,
+            awq_scale: None,
+        };
+        IndexedAttentionOp {
+            indexer_qk: weight,
+            indexer_q_norm: t,
+            indexer_k_norm: t,
+            q: weight,
+            k: weight,
+            v: weight,
+            q_norm: t,
+            k_norm: t,
+            output: weight,
+            state: IndexedAttentionState {
+                full_keys: t,
+                full_values: t,
+                raw_index_keys: t,
+                pooled_keys: t,
+                selected_indices: t,
+                full_capacity: 64,
+                raw_capacity: 64,
+                pooled_capacity: 16,
+                selected_capacity: 16,
+                position_capacity: 64,
+                full_len: position,
+                raw_len: position,
+                pooled_len: position / 4,
+                selected_len,
+                position,
+            },
+            input: t,
+            index_scratch: t,
+            qgate_scratch: t,
+            k_scratch: t,
+            v_scratch: t,
+            qsa_output: t,
+            selected_scratch: t,
+            attention_output: t,
+            bf16_scratch: t,
+            rows,
+            index_heads: 1,
+            index_kv_heads: 1,
+            index_dim: 2,
+            budget: 8,
+            compress: 4,
+            heads: 1,
+            kv_heads: 1,
+            head_dim: 2,
+            input_width: 1,
+            rotation: t,
+            mode,
+        }
+    }
+
+    #[test]
+    fn indexed_attention_next_lengths_follow_mode() {
+        let t = tensor(1, DType::F32);
+        let scalar = tensor(4, DType::Raw);
+        let reuse = IndexedAttentionMode::ReuseSelection {
+            selected_len_out: &scalar,
+        };
+        // Past the budget: 2 budget blocks (8) plus the 1 row of the open block.
+        let full = indexed_attention(&t, 1, 20, 12, IndexedAttentionMode::Full);
+        assert_eq!(full.next_lengths().unwrap(), (21, 21, 5, 9, 21));
+        let append = indexed_attention(&t, 1, 20, 12, IndexedAttentionMode::AppendOnly);
+        assert_eq!(append.next_lengths().unwrap().3, 0);
+        assert_eq!(
+            indexed_attention(&t, 1, 20, 12, reuse)
+                .next_lengths()
+                .unwrap()
+                .3,
+            13
+        );
+        assert_eq!(
+            indexed_attention(&t, 1, 20, 16, reuse)
+                .next_lengths()
+                .unwrap()
+                .3,
+            16
+        );
+    }
+
+    #[test]
+    fn indexed_attention_reuse_validation_refuses_stale_or_multirow_selection() {
+        let t = tensor(1, DType::F32);
+        let scalar = tensor(4, DType::Raw);
+        let reuse = IndexedAttentionMode::ReuseSelection {
+            selected_len_out: &scalar,
+        };
+        let error = indexed_attention(&t, 2, 20, 12, reuse)
+            .validate_layout()
+            .expect_err("selection reuse is one row");
+        assert!(error.to_string().contains("needs one row"));
+        let error = indexed_attention(&t, 1, 20, 0, reuse)
+            .validate_layout()
+            .expect_err("a K/V-only append leaves no selection to reuse");
+        assert!(error.to_string().contains("after a K/V-only append"));
     }
 }
