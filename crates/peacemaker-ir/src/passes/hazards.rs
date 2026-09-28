@@ -319,9 +319,10 @@ pub struct HazardAnalysis {
     pub obligations: Vec<Obligation>,
 }
 
-/// Whole-program wave32 hazard replay for the supported ISA tables.
+/// Whole-program hazard replay for the supported ISA tables. RDNA3 gfx11
+/// admits wave32 and wave64; gfx1201's validated SGPR model is wave32 only.
 pub fn analyze(body: &Body, arch: Arch, wave: Wave) -> Result<HazardAnalysis, HazardError> {
-    if wave != Wave::Wave32 {
+    if arch == Arch::Gfx1201 && wave != Wave::Wave32 {
         return Err(HazardError::Unsupported(arch, wave));
     }
     let mut analysis = HazardAnalysis::default();
@@ -362,7 +363,7 @@ fn gfx11_block(body: &Body, arch: Arch, block: &crate::cfg::Block,
         // AMDGPU.td FeatureISAVersion11_Common enable this on both targets.
         // fixVcmpxPermlaneHazards: V_NOP does NOT break the chain; a real
         // intervening VALU (e.g. v_mov_b32) does.
-        let perm_lane = name.starts_with("v_permlane");
+        let perm_lane = name == "v_permlane16_b32" || name == "v_permlanex16_b32";
         if perm_lane && state.cmpx_pending {
             if let Some(analysis) = &mut analysis {
                 analysis.missing.push(MissingWait { inst: id, wait: "v_mov_b32 <live vgpr>, <same vgpr>".into() });
@@ -629,6 +630,40 @@ mod tests {
                 && obligation.insts == vec![body.layout[0]]), "{found:?}");
         assert!(!analyze(&body, Arch::Gfx1151, Wave::Wave32).unwrap()
             .obligations.iter().any(|obligation| obligation.rule_id == "gfx1100-trans-valu"));
+    }
+
+    /// Non-runtime LLVM-MC conformance probe: gfx11 VCMPX→V_NOP→PERMLANE16
+    /// still needs a real VALU, while VCMPX→V_MOV→PERMLANEX16 is safe.
+    /// These are assembled machine words, not a claim about runtime JIT sites.
+    #[test]
+    fn gfx11_cmpx_permlane_probe_in_both_wave_sizes() {
+        use crate::cfg::Body;
+        let words = [
+            0x7d28_0300, // v_cmpx_gt_f32_e32 v0, v1
+            0x7e00_0000, // v_nop: LLVM does not count this as a separator
+            0xd65b_0002, 0x0004_0101, // v_permlane16_b32 v2, v1, s0, s1
+            0x7d28_0300, // another VCMPX
+            0x7e00_0300, // v_mov_b32_e32 v0, v0: real VALU separator
+            0xd65c_0002, 0x0004_0101, // v_permlanex16_b32 v2, v1, s0, s1
+            0xbfb0_0000, // s_endpgm
+        ];
+        for arch in [Arch::Gfx1100, Arch::Gfx1151] {
+            let mut body = Body::default();
+            let mut offset = 0;
+            while offset < words.len() {
+                let (inst, width) = crate::codec::gfx12::decode_for(arch, &words[offset..]).unwrap();
+                assert_eq!(crate::codec::gfx12::encode_for(arch, &inst).unwrap().as_slice(), &words[offset..offset + width]);
+                body.layout.push(body.insts.insert(inst));
+                offset += width;
+            }
+            crate::passes::cfg::build_blocks(&mut body, arch).unwrap();
+            for wave in [Wave::Wave32, Wave::Wave64] {
+                let analysis = analyze(&body, arch, wave).unwrap();
+                let sites = analysis.obligations.iter().filter(|o| o.rule_id == "gfx11-vcmpx-permlane")
+                    .map(|o| o.insts.as_slice()).collect::<Vec<_>>();
+                assert_eq!(sites, vec![&body.layout[2..3]], "{arch:?}/{wave:?}: {analysis:?}");
+            }
+        }
     }
 }
 

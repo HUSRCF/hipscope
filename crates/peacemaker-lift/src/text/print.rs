@@ -398,10 +398,15 @@ fn modifier_suffix(inst: &Inst, row: &OpRow) -> Result<String, PrintError> {
     match inst.form {
         Form::Vop1Dpp | Form::Vop2Dpp => {
             let dpp = mods.dpp.ok_or_else(|| PrintError::Unspellable("DPP modifiers missing".into()))?;
-            let shift = dpp.ctrl.checked_sub(0x100).filter(|v| (1..=15).contains(v))
-                .ok_or_else(|| PrintError::Unspellable(format!("DPP control {:#x}", dpp.ctrl)))?;
-            out.push_str(&format!(" row_shl:{shift} row_mask:{:#x} bank_mask:{:#x} bound_ctrl:{}",
-                dpp.row_mask, dpp.bank_mask, u8::from(dpp.bound_ctrl)));
+            let control = if let Some(shift) = dpp.ctrl.checked_sub(0x100).filter(|v| (1..=15).contains(v)) {
+                format!("row_shl:{shift}")
+            } else if let Some(lane) = dpp.ctrl.checked_sub(0x150).filter(|v| *v <= 15) {
+                format!("row_share:{lane}")
+            } else {
+                return Err(PrintError::Unspellable(format!("DPP control {:#x}", dpp.ctrl)));
+            };
+            out.push_str(&format!(" {control} row_mask:{:#x} bank_mask:{:#x}", dpp.row_mask, dpp.bank_mask));
+            if dpp.bound_ctrl { out.push_str(" bound_ctrl:1"); }
         }
         Form::Vop3 => {
             if mods.omod != Omod::None {

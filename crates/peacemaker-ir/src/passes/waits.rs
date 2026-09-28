@@ -314,12 +314,14 @@ fn retire(
         }
         // LLVM SIInsertWaitcnts.cpp::counterOutOfOrder: pre-gfx12 LGKM
         // includes LDS and SMEM. SMEM reads can retire out of order; LDS
-        // accesses alone complete in issue order. A positive lgkmcnt can
+        // accesses (including atomics) complete in issue order (RDNA3 ISA
+        // §9: FLAT LGKM path is in-order with DS). A positive lgkmcnt can
         // therefore retire the oldest LDS only if no SMEM/GDS/message event
         // remains on any reaching path (the joined pending set is maximal).
         if counter == Counter::Lgkm && state.pending.iter().any(|event| {
             event.counters.contains(counter) && !event.satisfied.contains(counter)
-                && !matches!(event.class, MemClass::DsLoad | MemClass::DsStore)
+                && !matches!(event.class,
+                    MemClass::DsLoad | MemClass::DsStore | MemClass::DsAtomic { .. })
         }) {
             return Vec::new();
         }
@@ -570,7 +572,10 @@ fn walk_block(
             }
         }
         if let Some(mem) = &inst.effects.mem {
-            if is_tracked(mem.class) {
+            if is_tracked(mem.class)
+                || (matches!(arch, Arch::Gfx1100 | Arch::Gfx1151)
+                    && matches!(mem.class, MemClass::DsAtomic { .. }))
+            {
                 push_event(arch, &mut state, events, id, inst, mem, recorder.is_some());
             }
         }
@@ -819,6 +824,13 @@ mod c5_tests {
                 inst("v_add_f32_e32", vec![v(20, 1), v(2, 1), v(21, 1)])]);
             assert!(replay(&ds_later, arch).unwrap().obligations.iter()
                 .any(|obligation| obligation.rule_id == "wait-raw-ds-load"));
+            let atomic = inst("ds_min_i32", vec![
+                v(30, 1), v(31, 1), Operand::Imm(ImmField::DsOffset(0)),
+            ]);
+            let atomics_in_order = body_of(vec![atomic, ds(1), ds(2), ds(3), wait.clone(),
+                inst("v_mov_b32_e32", vec![v(31, 1), v(21, 1)])]);
+            assert!(replay(&atomics_in_order, arch).unwrap().obligations.is_empty(),
+                "{arch:?}: oldest LDS atomic has retired before reusing its data source");
             let smem = inst("s_load_b32", vec![
                 s(20, 1), s(0, 2), Operand::Imm(ImmField::SmemOffset(0)),
             ]);

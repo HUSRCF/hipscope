@@ -326,3 +326,46 @@ v_sqrt_f32_e32	vop1	0x33	VDST:32,SRC0:32	VDST	SRC0	-	-	v_sqrt_f32_e32 v3, v2	7E0
 v_subrev_co_ci_u32_e64	vop3	0x122	VDST:32,SDST:64,SRC0:32,SRC1:32,SRC2:64	VDST,SDST	SRC0,SRC1,SRC2	-	-	v_subrev_co_ci_u32_e64 v3, null, 0, v3, vcc_lo	D5227C03 01AA0680	-
 v_fmaak_f32	vop2	0x2d	VDST:32,SRC0:32,VSRC1:32,literal@last	VDST	SRC0,VSRC1,VDST	-	-	v_fmaak_f32 v9, v8, v9, 0x3ecccdef	5A121308 3ECCCDEF	-
 v_fmamk_f32	vop2	0x2c	VDST:32,SRC0:32,VSRC1:32,literal@last	VDST	SRC0,VSRC1,VDST	-	-	v_fmamk_f32 v7, v4, 0x32a5705f, v7	580E0F04 32A5705F	-
+# Runtime-JIT Qwen3.5 gfx11 route encodings (ROCm LLVM + RDNA3 XML); samples are actual JIT words unless noted.
+ds_load_2addr_b64	ds	0x77	VDST:128,ADDR:32	VDST	ADDR	-	Lgkm:1	ds_load_2addr_b64 v[4:7], v2 offset0:68 offset1:85	D9DC5544 04000002	w0_extra:ignored:0x30000:0x0
+ds_load_b96	ds	0xfe	VDST:96,ADDR:32	VDST	ADDR	-	Lgkm:1	ds_load_b96 v[16:18], v2 offset:816	DBF80330 10000002	w0_extra:ignored:0x30000:0x0
+ds_load_u16_d16_hi	ds	0xa7	VDST:32,ADDR:32	VDST	ADDR,VDST	-	Lgkm:1	ds_load_u16_d16_hi v6, v2 offset:136	DA9C0088 06000002	w0_extra:ignored:0x30000:0x0
+ds_store_b16	ds	0x1f	ADDR:32,DATA0:32	-	ADDR,DATA0	-	Lgkm:1	ds_store_b16 v3, v1 offset:64	D87C0040 00000103	w0_extra:ignored:0x30000:0x0
+ds_store_b16_d16_hi	ds	0xa1	ADDR:32,DATA0:32	-	ADDR,DATA0	-	Lgkm:1	ds_store_b16_d16_hi v3, v1 offset:192	DA8400C0 00000103	w0_extra:ignored:0x30000:0x0
+flat_load_d16_b16	flat	0x20	VDST:32,ADDR:64,SADDR:64	VDST	ADDR,SADDR,VDST	-	Vm:1	flat_load_d16_b16 v42, v[10:11] offset:8	DC800008 2A7C000A	-
+flat_load_u16	flat	0x12	VDST:32,ADDR:64,SADDR:64	VDST	ADDR,SADDR	-	Vm:1	flat_load_u16 v31, v[27:28] offset:16	DC480010 1F7C001B	-
+flat_load_u8	flat	0x10	VDST:32,ADDR:64,SADDR:64	VDST	ADDR,SADDR	-	Vm:1	flat_load_u8 v32, v[29:30]	DC400000 207C001D	-
+global_load_d16_hi_b16	global	0x23	VDST:32,ADDR:64,SADDR:64	VDST	ADDR,SADDR,VDST	-	Vm:1	global_load_d16_hi_b16 v4, v[6:7], off	DC8E0000 047C0006	-
+s_and_b64	sop2	0x17	SDST:64,SSRC0:64,SSRC1:64	SDST	SSRC0,SSRC1	scc:w	-	s_and_b64 vcc, s[4:5], vcc	8BEA6A04	-
+s_and_saveexec_b64	sop1	0x21	SDST:64,SSRC0:64	SDST	SSRC0	exec:w,scc:w,exec:r	-	s_and_saveexec_b64 s[2:3], s[18:19]	BE822112	-
+s_bitcmp0_b32	sopc	0xc	SSRC0:32,SSRC1:32	-	SSRC0,SSRC1	scc:w	-	s_bitcmp0_b32 s0, 0	BF0C8000	-
+s_cmpk_gt_i32	sopk	0x5	SDST:32,SIMM16:16	-	SDST,SIMM16	scc:w	-	s_cmpk_gt_i32 s29, 0xff	B29D00FF	-
+s_cmpk_gt_u32	sopk	0xb	SDST:32,SIMM16:16	-	SDST,SIMM16	scc:w	-	s_cmpk_gt_u32 s18, 0x6f	B592006F	-
+s_nor_b32	sop2	0x1e	SDST:32,SSRC0:32,SSRC1:32	SDST	SSRC0,SSRC1	scc:w	-	s_nor_b32 s14, vcc_lo, s2	8F0E026A	-
+scratch_load_b96	scratch	0x16	VDST:96,VADDR:64,SADDR:64	VDST	VADDR,SADDR	-	Vm:1	scratch_load_b96 v[0:2], off, off offset:164	DC5900A4 007C0000	-
+scratch_store_b64	scratch	0x1b	VADDR:64,VSRC:64,SADDR:64	-	VADDR,VSRC,SADDR	-	Vs:1	scratch_store_b64 off, v[13:14], off offset:116	DC6D0074 007C0D00	-
+scratch_store_b96	scratch	0x1c	VADDR:64,VSRC:96,SADDR:64	-	VADDR,VSRC,SADDR	-	Vs:1	scratch_store_b96 off, v[39:41], off offset:164	DC7100A4 007C2700	-
+v_add_f32_dpp	vop2_dpp	0x3	VDST:32,SRC0:32,VSRC1:32	VDST	SRC0,VSRC1	-	-	v_add_f32_dpp v20, v20, v20 row_shl:8 row_mask:0xf bank_mask:0xf bound_ctrl:1	062828FA FF090814	dpp_fi:honored:0x40000
+v_cmp_gt_i16_e64	vop3	0x34	VDST:64,SRC0:16,SRC1:16	VDST	SRC0,SRC1	-	-	v_cmp_gt_i16_e64 s0, 0, v29.l	D4340000 02023A80	src2_unused:ignored:0x1ff:0x00/0x80/0x101
+v_cmp_ne_u64_e32	vopc	0x5d	SRC0:64,VSRC1:64	implicit	SRC0,VSRC1	vcc:w	-	v_cmp_ne_u64_e32 vcc_lo, 0, v[3:4]	7CBA0680	-
+v_cmp_ne_u64_e64	vop3	0x5d	VDST:64,SRC0:64,SRC1:64	VDST	SRC0,SRC1	-	-	v_cmp_ne_u64_e64 s3, 0, v[177:178]	D45D0003 02036280	src2_unused:ignored:0x1ff:0x00/0x80/0x101
+v_cmpx_lt_u32_e32	vopc	0xc9	SRC0:32,VSRC1:32,literal@last	-	SRC0,VSRC1	exec:w	-	v_cmpx_lt_u32_e32 0x7f, v0	7D9200FF 0000007F	-
+v_cvt_f16_f32_e64	vop3	0x18a	VDST:16,SRC0:32	VDST	SRC0,VDST	-	-	v_cvt_f16_f32_e64 v162.l, v164	D58A00A2 020101A4	src1_unused:ignored:0x1ff:0x00/0x80/0x101,src2_unused:ignored:0x1ff:0x00/0x80/0x101
+v_cvt_f16_i16_e64	vop3	0x1d1	VDST:16,SRC0:16	VDST	SRC0,VDST	-	-	v_cvt_f16_i16_e64 v188.l, v144.l	D5D100BC 02010190	src1_unused:ignored:0x1ff:0x00/0x80/0x101,src2_unused:ignored:0x1ff:0x00/0x80/0x101
+v_cvt_f16_u16_e32	vop1	0x50	VDST:16,SRC0:16	VDST	SRC0,VDST	-	-	v_cvt_f16_u16_e32 v35.h, v21.h	7F46A195	w0_extra:ignored:0x10000:0x0
+v_mad_i32_i24	vop3	0x20a	VDST:32,SRC0:32,SRC1:32,SRC2:32	VDST	SRC0,SRC1,SRC2	-	-	v_mad_i32_i24 v26, v3, s29, v26	D60A001A 04683B03	-
+v_maxmin_f32	vop3	0x25e	VDST:32,SRC0:32,SRC1:32,SRC2:32,literal@last	VDST	SRC0,SRC1,SRC2	-	-	v_maxmin_f32 v53, v53, s27, 0x40e00000	D65E0035 03FC3735 40E00000	-
+v_mbcnt_hi_u32_b32	vop3	0x320	VDST:32,SRC0:32,SRC1:32	VDST	SRC0,SRC1	-	-	v_mbcnt_hi_u32_b32 v5, -1, v5	D7200005 02020AC1	src2_unused:ignored:0x1ff:0x00/0x80/0x101
+v_minmax_f32	vop3	0x25f	VDST:32,SRC0:32,SRC1:32,SRC2:32,literal@last	VDST	SRC0,SRC1,SRC2	-	-	v_minmax_f32 v10, v0, 0x42fe0000, s0	D65F000A 0001FF00 42FE0000	-
+v_mov_b32_dpp	vop1_dpp	0x1	VDST:32,SRC0:32	VDST	SRC0	-	-	v_mov_b32_dpp v2, v1 row_shl:1 row_mask:0xf bank_mask:0xf bound_ctrl:1	7E0402FA FF090101	dpp_fi:honored:0x40000
+v_mul_f16_e64	vop3	0x135	VDST:16,SRC0:16,SRC1:16	VDST	SRC0,SRC1,VDST	-	-	v_mul_f16_e64 v128.h, v128.l, v128.h op_sel:[0,1,1]	D5355080 02030180	src2_unused:ignored:0x1ff:0x00/0x80/0x101
+v_permlane16_b32	vop3	0x25b	VDST:32,SRC0:32,SRC1:32,SRC2:32	VDST	SRC0,SRC1,SRC2	-	-	v_permlane16_b32 v0, v1, s0, s1	D65B0000 00040101	-
+v_permlane64_b32	vop1	0x67	VDST:32,SRC0:32	VDST	SRC0	-	-	v_permlane64_b32 v6, v5	7E0CCF05	w0_extra:ignored:0x10000:0x0
+v_pk_add_f16	vop3p	0xf	VDST:32,SRC0:32,SRC1:32,literal@last	VDST	SRC0,SRC1	-	-	v_pk_add_f16 v64, 0xe480, v64 op_sel_hi:[0,1]	CC0F4040 120280FF 0000E480	w0_extra:ignored:0x800000:0x0,src2_unused:ignored:0x1ff:0x00/0x80/0x101
+v_sub_co_ci_u32_e64	vop3	0x121	VDST:32,SDST:64,SRC0:32,SRC1:32,SRC2:64	VDST,SDST	SRC0,SRC1,SRC2	-	-	v_sub_co_ci_u32_e64 v8, null, v4, v8, s2	D5217C08 000A1104	-
+v_sub_co_u32	vop3	0x301	VDST:32,SDST:64,SRC0:32,SRC1:32	VDST,SDST	SRC0,SRC1	-	-	v_sub_co_u32 v11, s2, v2, v9	D701020B 02021302	src2_unused:ignored:0x1ff:0x00/0x80/0x101
+v_wmma_f32_16x16x16_f16	vop3p	0x40	VDST:256,SRC0:256,SRC1:256,SRC2:256	VDST	SRC0,SRC1,SRC2	-	-	v_wmma_f32_16x16x16_f16 v[146:153], v[204:211], v[162:169], v[146:153]	CC404092 1E4B45CC	w0_extra:ignored:0x800000:0x0
+v_wmma_i32_16x16x16_iu4	vop3p	0x45	VDST:256,SRC0:64,SRC1:64,SRC2:256	VDST	SRC0,SRC1,SRC2	-	-	v_wmma_i32_16x16x16_iu4 v[114:121], v[146:147], v[150:151], v[0:7] neg_lo:[1,1,0]	CC454072 7C032D92	w0_extra:ignored:0x800000:0x0
+v_wmma_i32_16x16x16_iu8	vop3p	0x44	VDST:256,SRC0:128,SRC1:128,SRC2:256	VDST	SRC0,SRC1,SRC2	-	-	v_wmma_i32_16x16x16_iu8 v[140:147], v[16:19], v[32:35], v[0:7] neg_lo:[1,1,0] clamp	CC44C08C 7C024110	w0_extra:ignored:0x800000:0x0
+# Non-runtime LLVM-MC conformance probe: the V_NOP between VCMPX and PERMLANE is not a safe separator.
+v_nop_e32	vop1	0x0	-	-	-	-	-	v_nop_e32	7E000000	-

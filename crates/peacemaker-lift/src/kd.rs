@@ -225,6 +225,6 @@ mod tests {
         assert_eq!(with(|kd| kd.reserved[4] = 1), Err(DescriptorError::Reserved { offset: 24 }.into()));
         // GLG_EN (rsrc3 bit 13) and WG_RR_EN (rsrc1 bit 21) are defined on GFX12: kept, not rejected.
         assert_eq!(with(|kd| { kd.compute_pgm_rsrc3.0 |= 1 << 13; kd.compute_pgm_rsrc1.0 |= 1 << 21 }), Ok(()));
-        assert_eq!(validate(&kd, Arch::Gfx1100), Err(DescriptorReject::UnsupportedArch(Arch::Gfx1100)));
+        assert_eq!(validate(&kd, Arch::Gfx1030), Err(DescriptorReject::UnsupportedArch(Arch::Gfx1030)));
     }
 }

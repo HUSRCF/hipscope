@@ -150,6 +150,7 @@ fn is_suffix_token(token: &str) -> bool {
         || token == "mul:4"
         || token == "div:2"
         || token.starts_with("row_shl:")
+        || token.starts_with("row_share:")
         || token.starts_with("row_mask:")
         || token.starts_with("bank_mask:")
         || token.starts_with("bound_ctrl:")
@@ -1023,6 +1024,10 @@ fn parse_suffixes(
             let shift: u16 = value.parse().map_err(|_| bad_operand(row.name, suffix, "invalid DPP row shift"))?;
             if !(1..=15).contains(&shift) { return Err(bad_operand(row.name, suffix, "DPP shift outside 1..=15")); }
             mods.dpp.as_mut().ok_or_else(|| bad_operand(row.name, suffix, "DPP control on non-DPP row"))?.ctrl = 0x100 + shift;
+        } else if let Some(value) = suffix.strip_prefix("row_share:") {
+            let lane: u16 = value.parse().map_err(|_| bad_operand(row.name, suffix, "invalid DPP row-share lane"))?;
+            if lane > 15 { return Err(bad_operand(row.name, suffix, "DPP row-share lane outside 0..=15")); }
+            mods.dpp.as_mut().ok_or_else(|| bad_operand(row.name, suffix, "DPP control on non-DPP row"))?.ctrl = 0x150 + lane;
         } else if let Some(value) = suffix.strip_prefix("row_mask:") {
             let mask = parse_number(value, row.name, suffix)?;
             if mask > 15 { return Err(bad_operand(row.name, suffix, "DPP row mask exceeds four bits")); }

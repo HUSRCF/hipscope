@@ -23,6 +23,7 @@ fn dpp_text_roundtrips_and_assembles_to_the_shipped_words() {
     for (words, expected) in [
         ([0x0624_24fa, 0xff09_0812], "v_add_f32_dpp v18, v18, v18 row_shl:8 row_mask:0xf bank_mask:0xf bound_ctrl:1"),
         ([0x7e04_02fa, 0xff09_0101], "v_mov_b32_dpp v2, v1 row_shl:1 row_mask:0xf bank_mask:0xf bound_ctrl:1"),
+        ([0x7fb2_02fa, 0xff01_50ed], "v_mov_b32_dpp v217, v237 row_share:0 row_mask:0xf bank_mask:0xf"),
     ] {
         let (inst, used) = gfx12::decode(&words).expect("shipped DPP encoding");
         assert_eq!(used, 2);

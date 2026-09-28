@@ -328,8 +328,8 @@ fn report(modules: &[Value], unknowns: &BTreeMap<String, Value>, provenance: Val
         "unknown_encoding_occurrences": unknowns.values().map(|v| v["occurrences"].as_u64().unwrap()).sum::<u64>()});
     let record = json!({"schema": 1, "arch": arch_name(arch), "provenance": provenance, "totals": totals, "modules": modules, "unknown_encodings": unknowns.values().collect::<Vec<_>>()});
     fs::write(out.join("census.json"), serde_json::to_vec_pretty(&record)?)?;
-    let mut md = format!("# {} shipped-kernel census\n\nOffline compiler/encoder inspection only; neither strict certification nor GPU/admission evidence. `census.json` holds every symbol, spelling, offset, obligation, and diagnostic.\n\n", arch_name(arch));
-    md.push_str(&format!("## Inputs and method\n\n{indexed} indexed objects were generated from the exact Rust registry exporter and `hipfire-kernel-pack --arch {} --registry registry.tsv --output .../compiled/{} --extra-flags '-DIU4_A4_CANDIDATES=2'` with `ROCM_PATH=/opt/rocm/core-10.0`. {} builder bundles were included. Registry and index symbol sets / object SHAs were verified. The emitter re-encodes typed fields. Rejected modules have no analyzed kernel or round-trip proof; independent LLVM disassembly still inventories their entire kernel ranges. Exact per-kernel results and input/tool hashes are in JSON. XML encoding names/opcodes come from the matching pinned MR-ISA XML SHA-256 `{}`; sample instruction words are matched to XML encoding bit-width and identifier fields, not inferred from mnemonic alone.\n\n", arch_name(arch), arch_name(arch), modules.len()-indexed, xml_sha(arch)));
+    let mut md = format!("# {} compiled-kernel census\n\nOffline compiler/encoder inspection only; neither strict certification nor GPU/admission evidence. `census.json` holds every symbol, spelling, offset, obligation, and diagnostic.\n\n", arch_name(arch));
+    md.push_str(&format!("## Inputs and method\n\n{indexed} indexed code objects and {} additional bundles were checked. The TSV identifies the canonical module, source and compile recipe; a seventh field, when present, identifies the distinct artifact key of a JIT variant. The matching index's canonical module, arch, symbol set and object SHA-256 were verified. The emitter re-encodes typed fields. Rejected modules have no analyzed kernel or round-trip proof; independent LLVM disassembly still inventories their entire kernel ranges. Exact per-kernel results and input/tool hashes are in JSON. XML encoding names/opcodes come from the matching pinned MR-ISA XML SHA-256 `{}`; sample instruction words are matched to XML encoding bit-width and identifier fields, not inferred from mnemonic alone.\n\n", modules.len()-indexed, xml_sha(arch)));
     md.push_str(&format!("## Totals\n\nIndexed: {indexed}; builder: {}; lifted with byte-identical emit: {clean}/{}; rejected modules: {}; analyzed kernels: {analyzed}; objdump opcode disagreements: {opcode_disagreements}, word/boundary disagreements on lifted modules: {word_disagreements}, text differences on lifted modules: {text_differences}; unsupported codec encoding rows: {}, unique spellings: {}; occurrences: {}. Text differences do **not** establish semantic inequality (builder bundles contain VMEM `offen`/`offset` ordering and `m0`/`null` rendering differences); semantic agreement remains unproven where text differs or lifting rejects.\n\n", modules.len()-indexed, modules.len(), modules.len()-clean, unknowns.len(), totals["unknown_encoding_spellings"], totals["unknown_encoding_occurrences"]));
     let indexed_clean = modules.iter().filter(|m| m["kind"] == "indexed" && m["lifted_roundtrip"] == true).count();
     md.push_str(&format!("**M7 result: {}.** {indexed_clean}/{indexed} indexed modules and {}/{} builder bundles produce a byte-identical lift/emit; {} modules reject (listed above). These are diagnostic compiler/encoder receipts only: no strict receipt is issued for the indexed set, no candidate is promoted, and packaging/admission policy stays **off** by default.\n\n",
@@ -376,22 +376,28 @@ fn run() -> Result<()> {
     };
     fs::create_dir_all(output)?;
     let xml = xml_table(xml_tsv, arch)?;
-    let mut names = BTreeSet::new();
+    let mut entries = BTreeMap::<String, String>::new();
     for row in fs::read_to_string(registry)?.lines() {
         let cols = row.split('\t').collect::<Vec<_>>();
-        if cols.len() != 6 || cols[0] != arch_name(arch) { return Err(format!("invalid registry row: {row}").into()); }
-        if !names.insert(cols[1].to_owned()) { return Err(format!("duplicate registry module {}", cols[1]).into()); }
+        if !(cols.len() == 6 || cols.len() == 7) || cols[0] != arch_name(arch) {
+            return Err(format!("invalid registry row: {row}").into());
+        }
+        let key = cols.get(6).unwrap_or(&cols[1]).to_string();
+        if entries.insert(key.clone(), cols[1].to_owned()).is_some() {
+            return Err(format!("duplicate registry artifact key {key}").into());
+        }
     }
     let objects = fs::read_dir(compiled)?.map(|entry| entry.map(|e| e.path())).collect::<std::io::Result<Vec<_>>>()?
         .into_iter().filter(|p| p.extension().is_some_and(|ext| ext == "hsaco"))
         .filter_map(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned())).collect::<BTreeSet<_>>();
-    if names != objects { return Err(format!("registry/pack object-set mismatch: missing {:?}, extra {:?}", names.difference(&objects).collect::<Vec<_>>(), objects.difference(&names).collect::<Vec<_>>()).into()); }
+    let keys = entries.keys().cloned().collect::<BTreeSet<_>>();
+    if keys != objects { return Err(format!("registry/pack object-set mismatch: missing {:?}, extra {:?}", keys.difference(&objects).collect::<Vec<_>>(), objects.difference(&keys).collect::<Vec<_>>()).into()); }
     let scratch = output.join(".pm-census-device.co");
     let mut unknowns = BTreeMap::new();
     let mut modules = Vec::new();
-    for name in names {
-        eprintln!("census {name}");
-        modules.push(scan_module(&name, &compiled.join(format!("{name}.hsaco")), true, objdump, &scratch, &xml, &mut unknowns, arch)?);
+    for (key, name) in entries {
+        eprintln!("census {key}");
+        modules.push(scan_module(&name, &compiled.join(format!("{key}.hsaco")), true, objdump, &scratch, &xml, &mut unknowns, arch)?);
     }
     for path in builders {
         let name = path.file_stem().ok_or("builder object has no stem")?.to_string_lossy();

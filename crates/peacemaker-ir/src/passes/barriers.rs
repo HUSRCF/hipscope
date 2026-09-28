@@ -1,14 +1,15 @@
-//! C5: split-barrier pairing and drain checks.
+//! C5: split-barrier pairing, gfx11 full barriers, and DS drain checks.
 //!
-//! For every `s_barrier_signal` the pass proves, over the CFG, that each
-//! path meets exactly one `s_barrier_wait` before the next signal or
-//! `s_endpgm` (and symmetrically that every wait is preceded by a signal on
-//! every path). The forward/backward scans are memoized per
-//! `(BlockId, position)` so loops terminate: a path that cycles without
-//! meeting a barrier fails the pairing. Additionally every barrier
-//! (signal, wait, or full `s_barrier`) must see drained DS stores —
-//! checked against the [`WaitReplay`] states, mirroring the builder's
-//! `pending_stores` drain before `barrier_signal` (`lib.rs:111-118`).
+//! Gfx11 `s_barrier` is one combined arrival and wait for the live waves of
+//! the workgroup, so it is represented as a self-pair. RDNA3 ISA §5.5 and
+//! §16.5 explicitly say it does not wait for memory counters; a preceding
+//! `s_waitcnt lgkmcnt` must drain outstanding DS writes that it protects.
+//! Gfx12 `s_barrier_signal` must meet exactly one `s_barrier_wait` along
+//! each CFG path before another signal or `s_endpgm` (and each wait must have
+//! a reaching signal). Forward/backward scans memoize per `(BlockId, position)`
+//! to terminate loops; a path cycling without a barrier fails the pairing.
+//! Both targets check pending DS writes at synchronization sites against
+//! [`WaitReplay`]; gfx11 DS uses LGKMcnt, gfx12 uses DScnt.
 
 use std::collections::{HashMap, HashSet};
 
@@ -208,23 +209,28 @@ fn backward_inner(
     Scan::Good(signals)
 }
 
-fn ds_stores_pending(replay: &WaitReplay, id: InstId) -> bool {
-    replay
-        .before
-        .get(&id)
-        .is_some_and(|state| {
-            state.pending.iter().any(|event| {
-                event.counters.contains(Counter::Ds) && !event.src_locks.0.is_empty()
-            })
+fn ds_stores_pending(replay: &WaitReplay, id: InstId, arch: Arch) -> bool {
+    let counter = if arch == Arch::Gfx1201 { Counter::Ds } else { Counter::Lgkm };
+    replay.before.get(&id).is_some_and(|state| {
+        state.pending.iter().any(|event| {
+            event.counters.contains(counter) && !event.satisfied.contains(counter)
+                && match arch {
+                    Arch::Gfx1100 | Arch::Gfx1151 =>
+                        matches!(event.class, crate::effects::MemClass::DsStore
+                            | crate::effects::MemClass::DsAtomic { .. }),
+                    _ => !event.src_locks.0.is_empty(),
+                }
         })
+    })
 }
 
-fn drain_obligation(id: InstId, what: &str) -> Obligation {
+fn drain_obligation(id: InstId, what: &str, arch: Arch) -> Obligation {
+    let counter = if arch == Arch::Gfx1201 { "DScnt" } else { "LGKMcnt" };
     Obligation {
         kind: ObligationKind::Hazard,
         insts: vec![id],
         rule_id: "barrier-ds-pending".into(),
-        text: format!("{what} with a DS store still holding DScnt"),
+        text: format!("{what} with a DS write still holding {counter}"),
     }
 }
 
@@ -269,8 +275,8 @@ pub fn analyze(body: &Body, arch: Arch) -> Result<BarrierAnalysis, BarrierError>
                             text: "s_barrier_signal is not followed by exactly one s_barrier_wait on every path".into(),
                         }),
                     }
-                    if ds_stores_pending(&replay, id) {
-                        analysis.obligations.push(drain_obligation(id, "s_barrier_signal"));
+                    if ds_stores_pending(&replay, id, arch) {
+                        analysis.obligations.push(drain_obligation(id, "s_barrier_signal", arch));
                     }
                     let _ = index;
                 }
@@ -287,15 +293,20 @@ pub fn analyze(body: &Body, arch: Arch) -> Result<BarrierAnalysis, BarrierError>
                             text: "s_barrier_wait is reachable without a preceding s_barrier_signal on some path".into(),
                         });
                     }
-                    if ds_stores_pending(&replay, id) {
-                        analysis.obligations.push(drain_obligation(id, "s_barrier_wait"));
+                    if ds_stores_pending(&replay, id, arch) {
+                        analysis.obligations.push(drain_obligation(id, "s_barrier_wait", arch));
                     }
                 }
-                Control::Barrier(_) => {
-                    if ds_stores_pending(&replay, id) {
-                        analysis.obligations.push(drain_obligation(id, "barrier"));
+                Control::Barrier(crate::cfg::BarrierKind::Full) => {
+                    // gfx11 s_barrier synchronizes arrival and release in
+                    // one instruction; it is not a gfx12 split-barrier
+                    // signal with an independently reachable wait.
+                    analysis.pairs.push(BarrierPair { signal: id, waits: vec![id] });
+                    if ds_stores_pending(&replay, id, arch) {
+                        analysis.obligations.push(drain_obligation(id, "s_barrier", arch));
                     }
                 }
+                Control::Barrier(_) => {}
                 _ => {}
             }
         }
@@ -340,6 +351,52 @@ mod kt48_tests {
         assert!(!analysis.pairs.is_empty(), "KT48 uses split barriers");
         for pair in &analysis.pairs {
             assert_eq!(pair.waits.len(), 1);
+        }
+    }
+}
+
+#[cfg(test)]
+mod gfx11_tests {
+    use smallvec::SmallVec;
+    use crate::cfg::Body;
+    use crate::inst::{Arch, FormFields, Inst};
+    use crate::operand::{ImmField, Modifiers, Operand};
+    use crate::provenance::Provenance;
+    use crate::reg::{Kind, RegRef};
+
+    fn body_of(insts: Vec<Inst>) -> Body {
+        let mut body = Body::default();
+        for inst in insts {
+            let id = body.insts.insert(inst);
+            body.layout.push(id);
+        }
+        body
+    }
+
+    #[test]
+    fn gfx11_full_barrier_pairs_itself_but_requires_prior_lgkm_drain() {
+        for arch in [Arch::Gfx1100, Arch::Gfx1151] {
+            let row = crate::isa::table(arch).iter().find(|row| row.name == "ds_store_b32").unwrap();
+            let v = |base| Operand::Reg(RegRef { kind: Kind::V, base, len: 1 });
+            let store = Inst::from_parts(
+                arch, row.op, row.form, FormFields::None,
+                SmallVec::from_vec(vec![v(1), v(2), Operand::Imm(ImmField::DsOffset(0))]),
+                Modifiers::default(), None, Provenance::default(),
+            ).unwrap();
+            let barrier = crate::codec::gfx11::decode(arch, &[0xbfbd_0000]).unwrap().0;
+            let wait = crate::codec::gfx11::decode(arch, &[0xbf89_0000]).unwrap().0;
+            let pending = body_of(vec![store.clone(), barrier.clone()]);
+            let pending_facts = super::analyze(&pending, arch).unwrap();
+            assert_eq!(pending_facts.pairs.len(), 1);
+            assert_eq!(pending_facts.pairs[0].signal, pending.layout[1]);
+            assert_eq!(pending_facts.pairs[0].waits, vec![pending.layout[1]]);
+            assert_eq!(pending_facts.obligations.len(), 1);
+            assert_eq!(pending_facts.obligations[0].rule_id, "barrier-ds-pending");
+            assert!(pending_facts.obligations[0].text.contains("LGKMcnt"));
+            let drained = body_of(vec![store, wait, barrier]);
+            let drained_facts = super::analyze(&drained, arch).unwrap();
+            assert_eq!(drained_facts.pairs.len(), 1);
+            assert!(drained_facts.obligations.is_empty(), "{arch:?}: {drained_facts:?}");
         }
     }
 }
