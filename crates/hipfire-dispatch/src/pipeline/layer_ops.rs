@@ -1163,6 +1163,10 @@ pub fn execute_gated_delta_net(
         ));
     }
     let capture = op.row_capture.as_ref();
+    // A row capture keeps the qkv projection: project straight into it.
+    if let Some(capture) = capture {
+        projection = view(capture.inputs, 0, op.rows * qkv);
+    }
     let dims = GatedDeltaStepBatched {
         projection: &projection2,
         gate: &gate,
@@ -1203,9 +1207,6 @@ pub fn execute_gated_delta_net(
             (&op.z, &z),
         ],
     )?;
-    if let Some(capture) = capture {
-        hip(gpu.copy_f32_buffer(capture.inputs, &projection, op.rows * qkv))?;
-    }
     let mut gdn_output = view(op.output_scratch, 0, op.rows * value);
     if persistent_batch {
         let start_cursor = op.start_position % history_rows;

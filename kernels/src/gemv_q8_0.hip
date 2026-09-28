@@ -46,6 +46,11 @@ static __device__ __forceinline__ float gemv_q8_0_row(
     return sum;
 }
 
+template <int R>
+static __device__ __forceinline__ void gemv_q8_0_row_multi(
+    const unsigned char* row_data, const float* __restrict__ x, int x_stride, int K, int tid,
+    float (&sum)[R]);
+
 __launch_bounds__(32, 20)
 extern "C" __global__ void gemv_q8_0(
     const unsigned char* __restrict__ A_q8,
@@ -204,9 +209,21 @@ extern "C" __global__ void gemv_q8_0_k320_staged_rows(
     staged[wave][lane + 32] = v1;
     if (lane < 21) staged[wave][lane + 64] = v2;
     __builtin_amdgcn_fence(__ATOMIC_ACQ_REL, "wavefront");
+    const unsigned char* data = reinterpret_cast<const unsigned char*>(staged[wave]);
+    switch (rows) {
+#define K320_ROWS(R)                                                                   \
+    case R: {                                                                          \
+        float s[R];                                                                    \
+        gemv_q8_0_row_multi<R>(data, x, 320, 320, lane, s);                            \
+        if (lane == 0)                                                                 \
+            for (int r = 0; r < R; ++r) y[(size_t)r * M + row] = s[r];                 \
+        return;                                                                        \
+    }
+    K320_ROWS(2) K320_ROWS(3) K320_ROWS(4) K320_ROWS(5) K320_ROWS(6) K320_ROWS(7) K320_ROWS(8)
+#undef K320_ROWS
+    }
     for (int r = 0; r < rows; ++r) {
-        const float sum = gemv_q8_0_row(
-            reinterpret_cast<const unsigned char*>(staged[wave]), x + (size_t)r * 320, 320, lane);
+        const float sum = gemv_q8_0_row(data, x + (size_t)r * 320, 320, lane);
         if (lane == 0) y[(size_t)r * M + row] = sum;
     }
 }
