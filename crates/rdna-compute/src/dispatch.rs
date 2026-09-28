@@ -1395,6 +1395,7 @@ impl Gpu {
                 int4_mmq_x_scratch: None,
                 int4_mmq_x_scratch_bytes: 0,
                 int4_mmq_generation: 0,
+                int4_mmq_slab_generation: None,
                 int8_mmq_x_scratch: None,
                 int8_mmq_x_scratch_bytes: 0,
                 int8_mmq_generation: 0,

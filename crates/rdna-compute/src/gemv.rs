@@ -3520,6 +3520,7 @@ impl Gpu {
         }
         self.ensure_mq_signs()?;
         let v2 = self.flags.g12_norm_enabled();
+        let slab = awq.is_some() && v2 && self.a4_slab_active();
         let (module, source, kernel) = match (awq.is_some(), v2) {
             (true, false) => (
                 "fused_rmsnorm_mq_rotate_awq_i4_gfx12",
@@ -3530,6 +3531,11 @@ impl Gpu {
                 "fused_rmsnorm_mq_rotate_i4_gfx12",
                 kernels::FUSED_RMSNORM_MQ_ROTATE_I4_GFX12_SRC,
                 "fused_rmsnorm_mq_rotate_i4_gfx12",
+            ),
+            (true, true) if slab => (
+                "fused_rmsnorm_mq_rotate_awq_i4_gfx12_v2_slab",
+                kernels::FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_GFX12_V2_SLAB_SRC,
+                "fused_rmsnorm_mq_rotate_awq_i4_gfx12_v2_slab",
             ),
             (true, true) => (
                 "fused_rmsnorm_mq_rotate_awq_i4_gfx12_v2",
@@ -3631,7 +3637,11 @@ impl Gpu {
             self.invalidate_x_caches_for(xrp);
         }
         result?;
-        Ok(crate::scratch::Int4MmqPrepared::from_reservation(reservation))
+        let prepared = crate::scratch::Int4MmqPrepared::from_reservation(reservation);
+        if slab {
+            self.scratch.mark_int4_mmq_slab(&prepared)?;
+        }
+        Ok(prepared)
     }
     /// gfx1201 FP8-stream producer: RMSNorm/FWHT + whole-row scale + E4M3
     /// pack. The opt-in in-register variant retains the F32 row only in
@@ -4258,10 +4268,16 @@ impl Gpu {
             self.round_h_bf16_quality_only(h, batch_size * k)?;
         }
         self.ensure_mq_signs()?;
+        let slab = !bf16_h && self.arch == "gfx1201" && self.a4_slab_active();
         let (source, kernel) = if bf16_h {
             (
                 kernels::FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_HIN_BF16_GFX12_SRC,
                 "fused_silu_mul_mq_rotate_awq_i4_hin_bf16_gfx12",
+            )
+        } else if slab {
+            (
+                kernels::FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_HIN_GFX12_SLAB_SRC,
+                "fused_silu_mul_mq_rotate_awq_i4_hin_gfx12_slab",
             )
         } else if self.arch == "gfx1201" {
             (
@@ -4321,7 +4337,11 @@ impl Gpu {
             t.finish(&self.hip);
         }
         result?;
-        Ok(crate::scratch::Int4MmqPrepared::from_reservation(reservation))
+        let prepared = crate::scratch::Int4MmqPrepared::from_reservation(reservation);
+        if slab {
+            self.scratch.mark_int4_mmq_slab(&prepared)?;
+        }
+        Ok(prepared)
     }
     /// gfx1201 slice-1 IU4 producer: SwiGLU/FWHT + in-register `block_i4_128`
     /// sidecar for the down-proj input. `x_rot = None` skips the f32 store
@@ -4776,9 +4796,14 @@ impl Gpu {
         self.ensure_mq_signs()?;
         let v2 = self.flags.g12_norm_enabled();
         let bf16 = x_fmt == crate::norm::GdnScanOut::Bf16;
+        let slab = awq.is_some() && v2 && self.a4_slab_active();
         let (module, source) = match (awq.is_some(), v2, bf16) {
             (true, false, false) => ("gated_norm_mq_rotate_awq_i4_gfx12", kernels::GATED_NORM_MQ_ROTATE_AWQ_I4_GFX12_SRC),
             (false, false, false) => ("gated_norm_mq_rotate_i4_gfx12", kernels::GATED_NORM_MQ_ROTATE_I4_GFX12_SRC),
+            (true, true, false) if slab => (
+                "gated_norm_mq_rotate_awq_i4_gfx12_v2_slab",
+                kernels::GATED_NORM_MQ_ROTATE_AWQ_I4_GFX12_V2_SLAB_SRC,
+            ),
             (true, true, false) => ("gated_norm_mq_rotate_awq_i4_gfx12_v2", kernels::GATED_NORM_MQ_ROTATE_AWQ_I4_GFX12_V2_SRC),
             (false, true, false) => ("gated_norm_mq_rotate_i4_gfx12_v2", kernels::GATED_NORM_MQ_ROTATE_I4_GFX12_V2_SRC),
             (true, false, true) => (
@@ -4786,6 +4811,10 @@ impl Gpu {
                 kernels::GATED_NORM_MQ_ROTATE_AWQ_I4_GFX12_XBF16_SRC,
             ),
             (false, false, true) => ("gated_norm_mq_rotate_i4_gfx12_xbf16", kernels::GATED_NORM_MQ_ROTATE_I4_GFX12_XBF16_SRC),
+            (true, true, true) if slab => (
+                "gated_norm_mq_rotate_awq_i4_gfx12_v2_xbf16_slab",
+                kernels::GATED_NORM_MQ_ROTATE_AWQ_I4_GFX12_V2_XBF16_SLAB_SRC,
+            ),
             (true, true, true) => (
                 "gated_norm_mq_rotate_awq_i4_gfx12_v2_xbf16",
                 kernels::GATED_NORM_MQ_ROTATE_AWQ_I4_GFX12_V2_XBF16_SRC,
@@ -4884,7 +4913,11 @@ impl Gpu {
             self.invalidate_x_caches_for(xrp);
         }
         result?;
-        Ok(crate::scratch::Int4MmqPrepared::from_reservation(reservation))
+        let prepared = crate::scratch::Int4MmqPrepared::from_reservation(reservation);
+        if slab {
+            self.scratch.mark_int4_mmq_slab(&prepared)?;
+        }
+        Ok(prepared)
     }
     /// gfx1201 FP8-stream LA output producer: gated RMSNorm + AWQ/FWHT +
     /// scale_mode=1 E4M3 preparation in one row workgroup. `x_fmt` is the
@@ -5850,19 +5883,34 @@ impl Gpu {
                 "sigmoid_mul_rotate_x_mq_awq_i4_gfx12_batched: reservation (k,n) mismatch",
             ));
         }
-        let (gate, gate_numel, kernel, source, label) = match gate {
-            SigmoidGate::Rows(t) => (
+        let slab = self.a4_slab_active();
+        let (gate, gate_numel, kernel, source, label) = match (gate, slab) {
+            (SigmoidGate::Rows(t), false) => (
                 t,
                 batch_size * k,
                 "sigmoid_mul_rotate_x_mq_awq_i4_gfx12",
                 kernels::SIGMOID_MUL_MQ_ROTATE_X_AWQ_I4_GFX12_SRC,
                 "sigmoid_mul_rotate_x_mq_awq_i4_gfx12_batched",
             ),
-            SigmoidGate::QGateInterleaved(t) => (
+            (SigmoidGate::Rows(t), true) => (
+                t,
+                batch_size * k,
+                "sigmoid_mul_rotate_x_mq_awq_i4_gfx12_slab",
+                kernels::SIGMOID_MUL_MQ_ROTATE_X_AWQ_I4_GFX12_SLAB_SRC,
+                "sigmoid_mul_rotate_x_mq_awq_i4_gfx12_batched",
+            ),
+            (SigmoidGate::QGateInterleaved(t), false) => (
                 t,
                 batch_size * 2 * k,
                 "sigmoid_mul_rotate_x_mq_awq_i4_gil_gfx12",
                 kernels::SIGMOID_MUL_MQ_ROTATE_X_AWQ_I4_GIL_GFX12_SRC,
+                "sigmoid_mul_rotate_x_mq_awq_i4_gil_gfx12_batched",
+            ),
+            (SigmoidGate::QGateInterleaved(t), true) => (
+                t,
+                batch_size * 2 * k,
+                "sigmoid_mul_rotate_x_mq_awq_i4_gil_gfx12_slab",
+                kernels::SIGMOID_MUL_MQ_ROTATE_X_AWQ_I4_GIL_GFX12_SLAB_SRC,
                 "sigmoid_mul_rotate_x_mq_awq_i4_gil_gfx12_batched",
             ),
         };
@@ -5924,7 +5972,11 @@ impl Gpu {
             self.invalidate_x_caches_for(xrp);
         }
         result?;
-        Ok(crate::scratch::Int4MmqPrepared::from_reservation(reservation))
+        let prepared = crate::scratch::Int4MmqPrepared::from_reservation(reservation);
+        if slab {
+            self.scratch.mark_int4_mmq_slab(&prepared)?;
+        }
+        Ok(prepared)
     }
 
     /// gfx1201 A8 producer: [`Self::fused_rmsnorm_rotate_mq_i4_gfx12_batched`]'s

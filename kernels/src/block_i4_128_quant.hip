@@ -345,12 +345,25 @@ __device__ __forceinline__ void emit_iu4_sidecar_c2_gfx12(
     s += iu4_row_xmask_i32<2>(s);
     s += iu4_row_xmask_i32<1>(s);
 
+#if defined(HIPFIRE_IU4_SLAB)
+    // Slab layout (builder `_b1s` consumers): the same 72 bytes per token
+    // per K128 block, stored as planes [d 4N][s 4N][qs 0..31: 32N]
+    // [qs 32..63: 32N]. Word j = lane & 15 holds qs bytes 4j..4j+3.
+    unsigned char* blk = reinterpret_cast<unsigned char*>(Y) + (long long)(2 * group + (lane >> 4)) * N * 72;
+    const int j = lane & 15;
+    *reinterpret_cast<unsigned int*>(blk + (long long)(j < 8 ? 8 : 40) * N + (long long)token * 32 + 4 * (j & 7)) = word;
+    if (j == 0) {
+        *reinterpret_cast<float*>(blk + (long long)token * 4) = unit ? 1.0f : (use1 ? d1 : d0);
+        *reinterpret_cast<int*>(blk + 4LL * N + (long long)token * 4) = s;
+    }
+#else
     block_i4_128* out = Y + (long long)(2 * group + (lane >> 4)) * N + token;
     reinterpret_cast<unsigned int*>(out->qs)[lane & 15] = word;
     if ((lane & 15) == 0) {
         out->d = unit ? 1.0f : (use1 ? d1 : d0);
         out->s = s;
     }
+#endif
 }
 #endif
 
@@ -372,6 +385,9 @@ __device__ __forceinline__ void emit_iu4_sidecar_from_producer8(
     const float x[8] = {f0, f1, f2, f3, f4, f5, f6, f7};
     emit_iu4_sidecar_c2_gfx12(x, Y, group, token, N, lane);
 #else
+#if defined(HIPFIRE_IU4_SLAB) && defined(__HIP_DEVICE_COMPILE__)
+#error "HIPFIRE_IU4_SLAB is emitted only by the gfx1201 IU4_A4_CANDIDATES=2 path"
+#endif
     #pragma unroll
     for (int h = 0; h < 2; ++h) {
         const int src = 16 * h + (lane >> 1);

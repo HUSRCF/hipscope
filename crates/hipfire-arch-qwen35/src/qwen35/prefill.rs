@@ -15782,6 +15782,23 @@ mod tests {
         );
     }
 
+    /// Token-order `block_i4_128` records of a slab-layout IU4 sidecar
+    /// (`HIPFIRE_A4_SLAB` producer twins: per K128 block of `n` tokens the
+    /// planes `[d 4n][s 4n][qs 0..31: 32n][qs 32..63: 32n]`).
+    fn slab_to_token_i4(slab: &[u8], n: usize) -> Vec<u8> {
+        let mut out = vec![0u8; slab.len()];
+        for (src, dst) in slab.chunks_exact(n * 72).zip(out.chunks_exact_mut(n * 72)) {
+            for t in 0..n {
+                let r = &mut dst[t * 72..t * 72 + 72];
+                r[..4].copy_from_slice(&src[t * 4..t * 4 + 4]);
+                r[4..8].copy_from_slice(&src[4 * n + t * 4..4 * n + t * 4 + 4]);
+                r[8..40].copy_from_slice(&src[8 * n + t * 32..8 * n + t * 32 + 32]);
+                r[40..].copy_from_slice(&src[40 * n + t * 32..40 * n + t * 32 + 32]);
+            }
+        }
+        out
+    }
+
     /// gfx1201 slices-2 gate: fused rmsnorm+quant producer vs the unfused
     /// rmsnorm+rotate → f32 → standalone-quantizer chain on REAL layer-0
     /// qkvza/gate_up inputs. Runs one layer-0-only prefill chunk (N=128) on
@@ -15934,6 +15951,9 @@ mod tests {
             .memcpy_dtoh(&mut bytes_fused, &view_fused)
             .expect("dl fused blocks");
         std::mem::forget(view_fused);
+        if gpu.scratch.int4_mmq_slab_at(ptr_fused) {
+            bytes_fused = slab_to_token_i4(&bytes_fused, N);
+        }
 
         assert_eq!(f32_unfused.len(), f32_fused.len(), "f32 length mismatch");
         let mut first_f32_diff = None;
@@ -16323,6 +16343,9 @@ mod tests {
             .memcpy_dtoh(&mut bytes_fused, &view_fused)
             .expect("dl fused blocks");
         std::mem::forget(view_fused);
+        if gpu.scratch.int4_mmq_slab_at(ptr_fused) {
+            bytes_fused = slab_to_token_i4(&bytes_fused, N);
+        }
 
         assert_eq!(f32_unfused.len(), f32_fused.len(), "f32 length mismatch");
         let mut first_f32_diff = None;

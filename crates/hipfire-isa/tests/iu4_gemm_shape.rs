@@ -3,13 +3,15 @@
 //! ceiling, deterministic emission, the loop wait-ledger fix point, the
 //! imported SiLU region, and assembly of every emitted module.
 use hipfire_isa::Arch;
-use hipfire_isa::kernels::iu4_gemm::{self, Cacc, Epi, Fold, Spec, Tile, region::{self, Region}};
+use hipfire_isa::kernels::iu4_gemm::{self, ALayout, Cacc, Epi, Fold, Spec, Tile, region::{self, Region}};
 use serde_json::Value;
 use std::io::Write;
 use std::process::{Command, Stdio};
 
 const MC: &str = "/opt/rocm/core-10.0/lib/llvm/bin/llvm-mc";
-const POINTS: [(Tile, &str); 2] = [(Tile::T128x128x8, "128x128x8"), (Tile::T256x128x16, "256x128x16")];
+/// Product points: tile, activation layout, hot-loop contract tile name.
+const POINTS: [(Tile, ALayout, &str); 3] = [(Tile::T128x128x8, ALayout::Token, "128x128x8"), (Tile::T128x128x8, ALayout::Slab, "128x128x8"),
+    (Tile::T256x128x16, ALayout::Token, "256x128x16")];
 const EPIS: [Epi; 3] = [Epi::Set, Epi::Add, Epi::GateUpSilu];
 
 fn contract(tile: &str) -> Value {
@@ -46,10 +48,10 @@ fn assemble(text: &str) -> Result<(), String> {
 
 #[test]
 fn hot_loop_meets_shape_contract_for_every_product_symbol() {
-    for (tile, name) in POINTS {
+    for (tile, act, name) in POINTS {
         let c = contract(name);
         for epi in EPIS {
-            let e = iu4_gemm::emit(Spec { fold: Fold::K128, tile, cacc: Cacc::One, epi, arch: Arch::Gfx1201 }).unwrap();
+            let e = iu4_gemm::emit(Spec { fold: Fold::K128, tile, cacc: Cacc::One, epi, act, arch: Arch::Gfx1201 }).unwrap();
             let census = iu4_gemm::hot_loop_census(&e.s_text);
             check_counts(&census, &c["counts"]).unwrap_or_else(|m| panic!("{name} {epi:?}: {m}"));
             for f in c["forbidden"].as_array().unwrap() {
@@ -63,10 +65,10 @@ fn hot_loop_meets_shape_contract_for_every_product_symbol() {
 
 #[test]
 fn register_plans_keep_occupancy_ceiling() {
-    for (tile, vgprs) in [(Tile::T128x128x8, 187), (Tile::T256x128x16, 186)] {
+    for (tile, act, vgprs) in [(Tile::T128x128x8, ALayout::Token, 187), (Tile::T128x128x8, ALayout::Slab, 187), (Tile::T256x128x16, ALayout::Token, 186)] {
         for epi in EPIS {
-            let e = iu4_gemm::emit(Spec { fold: Fold::K128, tile, cacc: Cacc::One, epi, arch: Arch::Gfx1201 }).unwrap();
-            assert_eq!(e.shape.next_free_vgpr, vgprs, "{tile:?} {epi:?}");
+            let e = iu4_gemm::emit(Spec { fold: Fold::K128, tile, cacc: Cacc::One, epi, act, arch: Arch::Gfx1201 }).unwrap();
+            assert_eq!(e.shape.next_free_vgpr, vgprs, "{tile:?} {act:?} {epi:?}");
             assert!(e.shape.next_free_vgpr <= iu4_gemm::spec::VGPR_CEILING);
         }
     }
@@ -74,9 +76,9 @@ fn register_plans_keep_occupancy_ceiling() {
 
 #[test]
 fn emission_is_deterministic_and_loop_ledger_reaches_fixed_point() {
-    for (tile, _) in POINTS {
-        let (a, text_a, proof_a) = iu4_gemm::emit_module(Fold::K128, tile, Cacc::One, Arch::Gfx1201).unwrap();
-        let (_, text_b, proof_b) = iu4_gemm::emit_module(Fold::K128, tile, Cacc::One, Arch::Gfx1201).unwrap();
+    for (tile, act, _) in POINTS {
+        let (a, text_a, proof_a) = iu4_gemm::emit_module(Fold::K128, tile, Cacc::One, act, Arch::Gfx1201).unwrap();
+        let (_, text_b, proof_b) = iu4_gemm::emit_module(Fold::K128, tile, Cacc::One, act, Arch::Gfx1201).unwrap();
         assert_eq!(text_a, text_b);
         assert_eq!(proof_a.s_text_sha256, proof_b.s_text_sha256);
         for e in &a {
@@ -87,9 +89,9 @@ fn emission_is_deterministic_and_loop_ledger_reaches_fixed_point() {
 
 #[test]
 fn every_module_assembles_with_zero_diagnostics() {
-    for (tile, _) in POINTS {
-        let (_, text, _) = iu4_gemm::emit_module(Fold::K128, tile, Cacc::One, Arch::Gfx1201).unwrap();
-        assemble(&text).unwrap_or_else(|e| panic!("{tile:?}: {e}"));
+    for (tile, act, _) in POINTS {
+        let (_, text, _) = iu4_gemm::emit_module(Fold::K128, tile, Cacc::One, act, Arch::Gfx1201).unwrap();
+        assemble(&text).unwrap_or_else(|e| panic!("{tile:?} {act:?}: {e}"));
     }
 }
 
@@ -98,9 +100,9 @@ fn every_module_assembles_with_zero_diagnostics() {
 #[cfg(feature = "toolchain")]
 #[test]
 fn module_waits_pass_independent_replay() {
-    for (tile, _) in POINTS {
-        let (_, text, _) = iu4_gemm::emit_module(Fold::K128, tile, Cacc::One, Arch::Gfx1201).unwrap();
-        hipfire_isa::ledger_replay::replay_waits(&text).unwrap_or_else(|e| panic!("{tile:?}: {e}"));
+    for (tile, act, _) in POINTS {
+        let (_, text, _) = iu4_gemm::emit_module(Fold::K128, tile, Cacc::One, act, Arch::Gfx1201).unwrap();
+        hipfire_isa::ledger_replay::replay_waits(&text).unwrap_or_else(|e| panic!("{tile:?} {act:?}: {e}"));
     }
 }
 
@@ -111,6 +113,7 @@ fn closed_and_dropped_axes_are_rejected() {
         Spec { fold: Fold::K256Pow2, ..Spec::control(Epi::Set) },
         Spec { cacc: Cacc::Two, ..Spec::control(Epi::Set) },
         Spec { arch: Arch::Gfx1100, ..Spec::control(Epi::Set) },
+        Spec { tile: Tile::T256x128x16, act: ALayout::Slab, ..Spec::control(Epi::Set) },
     ] {
         assert!(iu4_gemm::emit(spec).is_err(), "{spec:?}");
     }

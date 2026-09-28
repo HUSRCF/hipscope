@@ -326,6 +326,14 @@ fn g12_iu4_b1_image() -> &'static [u8] {
         kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1
     }
 }
+/// B-1 slab activation layout (`HIPFIRE_A4_SLAB`, default on; `=0` opts
+/// out): the default gfx1201 A4 producers store each K128 block's
+/// `block_i4_128` bytes as `[d 4N][s 4N][qs 0..31: 32N][qs 32..63: 32N]`
+/// and the `_b1s` bundle stages them as whole lines. Bit-identical outputs
+/// (same bytes, moved); the K-loop runs the same cycles at a higher clock
+/// under the 300 W cap. Parsed once so a producer and its consumers agree.
+static A4_SLAB: LazyLock<bool> =
+    LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_A4_SLAB", true));
 /// Physically packed bf16 SiLU h is independently selectable for each producer route.
 /// A4 stays opt-in after both pp8192 orders regressed; fp8 F2 defaults on after
 /// both orders improved. Each flag restores the f32 handoff when disabled.
@@ -366,6 +374,27 @@ static G12_FP8_F2_COVERAGE: LazyLock<bool> =
 #[inline]
 fn g12_iu4_b1_eligible(m: usize, k: usize, output: *mut c_void) -> bool {
     k % 256 == 0 && m % 4 == 0 && (output as usize) % 16 == 0
+}
+
+impl Gpu {
+    /// Every condition of the gfx1201 builder `_b1` selection except the
+    /// per-launch shape/pointer check ([`g12_iu4_b1_eligible`]).
+    fn g12_iu4_isa_requested(&self) -> bool {
+        self.mq4v2_symmetric
+            && hipfire_config::developer_var("HIPFIRE_IU4_SYMFOLD").as_deref() != Ok("0")
+            && self.flags.g12_iu4_isa
+    }
+
+    /// True when the slab producer twins may run: their only consumer is the
+    /// `_b1s` bundle, and they emit through the one-pass gfx1201 A4C2 path
+    /// (`-DIU4_A4_CANDIDATES=2`), the only emit with a slab store.
+    pub fn a4_slab_active(&self) -> bool {
+        *A4_SLAB
+            && self.arch == "gfx1201"
+            && !*G12_IU4_B1_CONTROL
+            && self.g12_iu4_isa_requested()
+            && self.flags.hipcc_extra_flags.split_whitespace().any(|f| f == "-DIU4_A4_CANDIDATES=2")
+    }
 }
 
 /// Full-slab A-prefetch is the measured A8 default; K32 remains selectable.
@@ -20184,7 +20213,26 @@ impl Gpu {
             // the kernel header); `HIPFIRE_G12_RASTER=0` restores the
             // incumbent modules.
             let g12r = hipfire_config::developer_var("HIPFIRE_G12_RASTER").as_deref() != Ok("0");
-            let (module, source, kernel_name) = if isa {
+            // Slab-layout activations (a slab producer twin wrote the live
+            // scratch) have exactly one reader: the `_b1s` bundle.
+            let slab = self.scratch.int4_mmq_slab_at(x_i4_ptr);
+            if slab && !isa {
+                return Err(hip_bridge::HipError::new(
+                    1,
+                    &format!("slab A4 activations need the gfx1201 _b1s GEMM (m={m} k={k} n={batch_size})"),
+                ));
+            }
+            let (module, source, kernel_name) = if slab {
+                (
+                    "gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s",
+                    "",
+                    if add {
+                        "gemm_mq4g256v2_residual_mmq_iu4_full_add_b1s"
+                    } else {
+                        "gemm_mq4g256v2_residual_mmq_iu4_full_set_b1s"
+                    },
+                )
+            } else if isa {
                 (
                     "gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1",
                     "",
@@ -20246,7 +20294,7 @@ impl Gpu {
             if isa {
                 self.ensure_embedded_kernel(
                     module,
-                    g12_iu4_b1_image(),
+                    if slab { kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1S } else { g12_iu4_b1_image() },
                     kernel_name,
                 )?;
             } else {
@@ -32474,7 +32522,24 @@ impl Gpu {
                 0, "bf16 h requires the production gfx1201 IU4 b1 SiLU object",
             ));
         }
-        let (module, source, kernel) = if isa {
+        let slab = self.scratch.int4_mmq_slab_at(xq);
+        if slab && !isa {
+            return Err(hip_bridge::HipError::new(
+                1,
+                &format!("slab A4 activations need the gfx1201 _b1s SiLU GEMM (m={m} k={k} n={n})"),
+            ));
+        }
+        let (module, source, kernel) = if slab {
+            (
+                "gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s",
+                "",
+                if bf16_h_a4_enabled() {
+                    "gemm_mq4g256v2_gate_up_silu_mmq_iu4_b1s_bf16"
+                } else {
+                    "gemm_mq4g256v2_gate_up_silu_mmq_iu4_b1s"
+                },
+            )
+        } else if isa {
             (
                 "gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1",
                 "",
@@ -32506,7 +32571,7 @@ impl Gpu {
         if isa {
             self.ensure_embedded_kernel(
                 module,
-                g12_iu4_b1_image(),
+                if slab { kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1S } else { g12_iu4_b1_image() },
                 kernel,
             )?;
         } else {

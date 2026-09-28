@@ -26,6 +26,16 @@ pub(crate) fn ds_load(b: &mut Builder, slot: usize, text: String, dst: crate::re
     b.ds_load(slot, Instruction::new(text, vec![dst], vec![v(addr)]).memory(MemoryClass::DsLoad))
 }
 
+/// Scalar offset and immediate of staging round `r` of activation slab
+/// `slab` (0: K bytes 0..31, 1: K bytes 32..63) relative to `st_a`.
+pub(crate) fn a_offset(g: &Gen, slab: u32, r: usize) -> (Option<u8>, u32) {
+    let rows = r as u32 * g.tile.round_rows();
+    match g.a_slab1 {
+        None => (None, 8 + 32 * slab + rows * super::spec::BLOCK_I4_128),
+        Some(s1) => ((slab == 1).then_some(s1), rows * 32),
+    }
+}
+
 /// Fetch slab 1 of block `h` (K bytes 32..63), using the group-relative W offset.
 pub(crate) fn fetch_slab1(b: &mut Builder, g: &Gen, h: usize) -> Result<(), String> {
     fetch_slab1_at(b, g, h, h as u32 * 64 + 40)
@@ -37,10 +47,10 @@ pub(crate) fn fetch_slab1_next_group(b: &mut Builder, g: &Gen) -> Result<(), Str
 }
 
 fn fetch_slab1_at(b: &mut Builder, g: &Gen, h: usize, weight_offset: u32) -> Result<(), String> {
-    let tile = g.tile;
     b.clause(|b| {
         for (r, &dst) in g.a_pf.iter().enumerate() {
-            vload(b, dst, 2, g.st_a, g.srd_a[h], None, 40 + r as u32 * tile.round_rows() * super::spec::BLOCK_I4_128)?;
+            let (soff, offset) = a_offset(g, 1, r);
+            vload(b, dst, 2, g.st_a, g.srd_a[h], soff, offset)?;
         }
         for (r, &dst) in g.w_pf.iter().enumerate() {
             vload(b, dst, 2, g.st_w[r], g.srd_w, Some(g.goff), weight_offset)?;
@@ -61,12 +71,12 @@ pub(crate) fn fetch_next_meta(b: &mut Builder, g: &Gen, h: usize) -> Result<(), 
 
 /// Next-block slab-0 fetch epoch after B1 of block `h`.
 pub(crate) fn fetch_next(b: &mut Builder, g: &Gen, h: usize) -> Result<(), String> {
-    let tile = g.tile;
     // Next (group, half) relative to the current group offset in `goff`.
     let next = if h == 0 { 64 } else { super::spec::GROUP_BYTES };
     b.clause(|b| {
         for (r, &dst) in g.a_pf.iter().enumerate() {
-            vload(b, dst, 2, g.st_a, g.srd_a[h ^ 1], None, 8 + r as u32 * tile.round_rows() * super::spec::BLOCK_I4_128)?;
+            let (soff, offset) = a_offset(g, 0, r);
+            vload(b, dst, 2, g.st_a, g.srd_a[h ^ 1], soff, offset)?;
         }
         for (r, &dst) in g.w_pf.iter().enumerate() {
             vload(b, dst, 2, g.st_w[r], g.srd_w, Some(g.goff), next + 8)?;

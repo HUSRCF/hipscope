@@ -212,6 +212,10 @@ pub struct ScratchState {
     /// Generation bumped on every `reserve_int4_mmq` so a prepared handle
     /// cannot outlive a later re-reservation of the same scratch slot.
     pub int4_mmq_generation: u64,
+    /// Generation whose `int4_mmq_x_scratch` contents a slab producer twin
+    /// wrote (`HIPFIRE_IU4_SLAB` planes, read only by the `_b1s` GEMMs).
+    /// Every other generation holds token-order `block_i4_128` records.
+    pub int4_mmq_slab_generation: Option<u64>,
     /// A8 `block_i8_128` sidecar, [K/128, N] of 136-byte blocks.
     pub int8_mmq_x_scratch: Option<DeviceBuffer>,
     pub int8_mmq_x_scratch_bytes: usize,
@@ -1809,6 +1813,24 @@ impl ScratchState {
             .map(|b| b.as_ptr())
             .unwrap_or(std::ptr::null_mut());
         (self.int4_mmq_generation, ptr)
+    }
+
+    /// Record that a slab producer twin wrote the live generation sealed
+    /// into `prepared` (host only). Fails closed on a stale handle.
+    pub fn mark_int4_mmq_slab(&mut self, prepared: &Int4MmqPrepared) -> HipResult<()> {
+        let (generation, ptr) = self.int4_mmq_live();
+        prepared.checked_ptr(generation, ptr, prepared.k(), prepared.n())?;
+        self.int4_mmq_slab_generation = Some(generation);
+        Ok(())
+    }
+
+    /// True when `ptr` is the live IU4 scratch and its contents are the slab
+    /// layout; a later reservation or standalone quantize bumps the
+    /// generation, so this can never describe overwritten contents.
+    #[inline]
+    pub fn int4_mmq_slab_at(&self, ptr: *mut c_void) -> bool {
+        let (generation, live) = self.int4_mmq_live();
+        !ptr.is_null() && ptr == live && self.int4_mmq_slab_generation == Some(generation)
     }
 
     /// Invalidate the FP16/FP8 activation scratch caches. Must be called

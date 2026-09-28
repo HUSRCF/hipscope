@@ -1176,6 +1176,21 @@ pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_GFX12_V2_SRC: &str = concat!(
     "#define HIPFIRE_RMSNORM_KERNEL fused_rmsnorm_mq_rotate_awq_i4_gfx12_v2\n",
     include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate.hip")
 );
+/// B-1 slab twins of the default gfx1201 A4 producers (`HIPFIRE_A4_SLAB`,
+/// `Gpu::a4_slab_active`): identical math and codes; `HIPFIRE_IU4_SLAB`
+/// stores each K128 block's `block_i4_128` bytes as the planes
+/// `[d 4N][s 4N][qs 0..31: 32N][qs 32..63: 32N]` that the builder `_b1s`
+/// GEMMs stage (`hipfire-isa` `ALayout::Slab`).
+pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_GFX12_V2_SLAB_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
+    "#define HIPFIRE_IU4_RTN_RCP 1\n#define HIPFIRE_IU4_SLAB 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    "#define HIPFIRE_IU4_SIDECAR 1\n",
+    "#define HIPFIRE_RMSNORM_AWQ 1\n",
+    "#define HIPFIRE_RMSNORM_P1A_BATCHED 1\n",
+    "#define HIPFIRE_RMSNORM_KERNEL fused_rmsnorm_mq_rotate_awq_i4_gfx12_v2_slab\n",
+    include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate.hip")
+);
 /// gfx1201 FP8-stream producer: RMSNorm/FWHT + in-register whole-row scale +
 /// E4M3 pack under distinct entry symbols so HSACO caches and profiler rows
 /// cannot alias any other fusion. Emits byte-identical
@@ -1457,6 +1472,26 @@ pub const SIGMOID_MUL_MQ_ROTATE_X_AWQ_I4_GIL_GFX12_SRC: &str = concat!(
     "#define HIPFIRE_ROTATE_KERNEL sigmoid_mul_rotate_x_mq_awq_i4_gil_gfx12\n",
     include_str!("../../../kernels/src/mq_rotate_x_i4.hip")
 );
+/// Slab twin (see [`FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_GFX12_V2_SLAB_SRC`]).
+pub const SIGMOID_MUL_MQ_ROTATE_X_AWQ_I4_GFX12_SLAB_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n#define HIPFIRE_IU4_SLAB 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    "#define HIPFIRE_ROTATE_SIGMOID_GATE 1\n",
+    "#define HIPFIRE_ROTATE_AWQ 1\n",
+    "#define HIPFIRE_ROTATE_KERNEL sigmoid_mul_rotate_x_mq_awq_i4_gfx12_slab\n",
+    include_str!("../../../kernels/src/mq_rotate_x_i4.hip")
+);
+/// Slab twin of [`SIGMOID_MUL_MQ_ROTATE_X_AWQ_I4_GIL_GFX12_SRC`]: gate read in
+/// place from the FA Q/gate rows and the `HIPFIRE_IU4_SLAB` sidecar store.
+pub const SIGMOID_MUL_MQ_ROTATE_X_AWQ_I4_GIL_GFX12_SLAB_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n#define HIPFIRE_IU4_SLAB 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    "#define HIPFIRE_ROTATE_SIGMOID_GATE 1\n",
+    "#define HIPFIRE_ROTATE_GATE_IL 1\n",
+    "#define HIPFIRE_ROTATE_AWQ 1\n",
+    "#define HIPFIRE_ROTATE_KERNEL sigmoid_mul_rotate_x_mq_awq_i4_gil_gfx12_slab\n",
+    include_str!("../../../kernels/src/mq_rotate_x_i4.hip")
+);
 
 pub const RMSNORM_REDUCE_GFX942_SRC: &str =
     include_str!("../../../kernels/src/rmsnorm_reduce.gfx942.hip");
@@ -1578,6 +1613,15 @@ pub const GATED_NORM_MQ_ROTATE_AWQ_I4_GFX12_V2_SRC: &str = concat!(
     "#define HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL gated_norm_mq_rotate_awq_i4_gfx12_v2\n",
     include_str!("../../../kernels/src/gated_norm_mq_rotate_quant.gfx12.hip")
 );
+/// Slab twin (see [`FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_GFX12_V2_SLAB_SRC`]).
+pub const GATED_NORM_MQ_ROTATE_AWQ_I4_GFX12_V2_SLAB_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n#define HIPFIRE_IU4_SLAB 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    "#define HIPFIRE_GATED_NORM_MQ_ROTATE_AWQ 1\n",
+    "#define HIPFIRE_GATED_NORM_WAVE_GROUP 1\n",
+    "#define HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL gated_norm_mq_rotate_awq_i4_gfx12_v2_slab\n",
+    include_str!("../../../kernels/src/gated_norm_mq_rotate_quant.gfx12.hip")
+);
 /// `_xbf16` twins of the four gfx1201 gated-norm IU4 producers: `x` is the
 /// bf16 GDN chunk-scan plane (`GDN_CHUNK_SCAN_BF16_SRC`), widened exactly to
 /// f32 at load; everything else is the f32 producer.
@@ -1608,6 +1652,15 @@ pub const GATED_NORM_MQ_ROTATE_AWQ_I4_GFX12_V2_XBF16_SRC: &str = concat!(
     "#define HIPFIRE_GATED_NORM_X_BF16 1\n#define HIPFIRE_GATED_NORM_MQ_ROTATE_AWQ 1\n",
     "#define HIPFIRE_GATED_NORM_WAVE_GROUP 1\n",
     "#define HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL gated_norm_mq_rotate_awq_i4_gfx12_v2_xbf16\n",
+    include_str!("../../../kernels/src/gated_norm_mq_rotate_quant.gfx12.hip")
+);
+/// Slab twin (see [`FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_GFX12_V2_SLAB_SRC`]).
+pub const GATED_NORM_MQ_ROTATE_AWQ_I4_GFX12_V2_XBF16_SLAB_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n#define HIPFIRE_IU4_SLAB 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    "#define HIPFIRE_GATED_NORM_X_BF16 1\n#define HIPFIRE_GATED_NORM_MQ_ROTATE_AWQ 1\n",
+    "#define HIPFIRE_GATED_NORM_WAVE_GROUP 1\n",
+    "#define HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL gated_norm_mq_rotate_awq_i4_gfx12_v2_xbf16_slab\n",
     include_str!("../../../kernels/src/gated_norm_mq_rotate_quant.gfx12.hip")
 );
 /// gfx1201 FP8-stream gated-norm producer for the LA output projection.
@@ -1728,6 +1781,15 @@ pub const FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_HIN_GFX12_SRC: &str = concat!(
     "#define HIPFIRE_IU4_SIDECAR 1\n",
     "#define HIPFIRE_SILU_HIN 1\n",
     "#define HIPFIRE_SILU_MQ_ROTATE_KERNEL fused_silu_mul_mq_rotate_awq_i4_hin_gfx12\n",
+    include_str!("../../../kernels/src/fused_silu_mul_mq_rotate_awq.hip")
+);
+/// Slab twin (see [`FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_GFX12_V2_SLAB_SRC`]).
+pub const FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_HIN_GFX12_SLAB_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n#define HIPFIRE_IU4_SLAB 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    "#define HIPFIRE_IU4_SIDECAR 1\n",
+    "#define HIPFIRE_SILU_HIN 1\n",
+    "#define HIPFIRE_SILU_MQ_ROTATE_KERNEL fused_silu_mul_mq_rotate_awq_i4_hin_gfx12_slab\n",
     include_str!("../../../kernels/src/fused_silu_mul_mq_rotate_awq.hip")
 );
 pub const FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_HIN_BF16_GFX12_SRC: &str = concat!(
@@ -4126,6 +4188,12 @@ pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1: &[u8] =
 /// SHA-256 e57061d5d7f580e8e070baa9d741c72e0759365bc956e9ed3b4a58ad6f47940b.
 pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1_CONTROL: &[u8] =
     include_bytes!("../../../kernels/gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1_control.hxaco");
+/// Certified gfx1201 `_b1s` bundle: the `_b1` K-loop and epilogues staging
+/// the slab activation layout (`hipfire-isa emit --alayout slab`), fed only
+/// by the slab producer twins (`Gpu::a4_slab_active`).
+/// SHA-256 d87e36b73c31b0afe0fa7ad63b9857664d2b64fd924eec67293fbd2b1df34e03.
+pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1S: &[u8] =
+    include_bytes!("../../../kernels/gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s.hxaco");
 /// Certified gfx1201 F2 Row/K128 bundle; production selects Row only.
 /// SHA-256 1b26cd3a0bbddfafd8cf93250283aacee16bd37a4886233461fe0e175133f373:
 /// the prefetch F2 symbols (code unchanged since 962fe61d: next K128's W in

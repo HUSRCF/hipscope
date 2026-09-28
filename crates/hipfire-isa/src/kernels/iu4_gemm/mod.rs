@@ -20,7 +20,7 @@ pub mod publish;
 pub mod epilogue;
 pub mod region;
 
-pub use spec::{Cacc, Epi, Fold, Spec, Tile};
+pub use spec::{ALayout, Cacc, Epi, Fold, Spec, Tile};
 use crate::{Builder, Emitted, KernelSpec, RegPlan, insn::{Instruction, MemoryClass, Sop}, reg::{Kind, Live, RegRef}};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -80,6 +80,9 @@ pub(crate) struct Gen {
     pub karg: u8, pub srd_w: u8, pub srd_z: u8, pub srd_a: [u8; 2], pub srd_y: u8, pub step2: u8,
     pub goff: u8, pub trips: u8, pub rs: u8, pub bs: u8, pub wave: u8, pub gpr136: u8, pub mm1: u8, pub hs: u8,
     pub tmp: u8, pub epi_s: u8,
+    /// `ALayout::Slab` only: the SGPR holding `32 * N`, the byte distance
+    /// from a token's slab-0 plane entry to its slab-1 entry.
+    pub a_slab1: Option<u8>,
     // LDS slot ids
     pub slot_a: [usize; 2], pub slot_w: [usize; 2], pub slot_ds: [usize; 2], pub slot_sz: [usize; 2],
 }
@@ -115,6 +118,7 @@ impl Gen {
             karg: 0, srd_w: 24, srd_z: if silu { 28 } else { 24 }, srd_a: [32, 36], srd_y: 40, step2: 44,
             goff: 46, trips: 47, rs: 48, bs: 49, wave: 50, gpr136: 51, mm1: 52, hs: 53,
             tmp: 56, epi_s: 64,
+            a_slab1: (spec.act == ALayout::Slab).then_some(2),
             slot_a: [0, 2], slot_w: [1, 3], slot_ds: [4, 5], slot_sz: [6, 7],
         }
     }
@@ -155,6 +159,7 @@ impl Gen {
         if self.srd_z != self.srd_w { p.s::<4>("srd_z", self.srd_z, Live::Whole)?; }
         p.s::<4>("srd_a0", self.srd_a[0], Live::Whole)?;
         p.s::<4>("srd_a1", self.srd_a[1], Live::Whole)?;
+        if let Some(r) = self.a_slab1 { p.s::<1>("a_slab1_soff", r, Live::Whole)?; }
         p.s::<4>("srd_y", self.srd_y, Live::Whole)?;
         p.s::<2>("a_step2", self.step2, Live::Whole)?;
         for (name, r) in [("goff", self.goff), ("trips", self.trips), ("rs", self.rs), ("bs", self.bs), ("wave", self.wave),
@@ -237,11 +242,11 @@ pub fn module(emitted: &[Emitted], name: &str) -> Result<(String, ModuleProof), 
 }
 
 /// All original epilogue symbols plus packed bf16 h for the production tile.
-pub fn emit_module(fold: Fold, tile: Tile, cacc: Cacc, arch: crate::Arch) -> Result<(Vec<Emitted>, String, ModuleProof), String> {
+pub fn emit_module(fold: Fold, tile: Tile, cacc: Cacc, act: ALayout, arch: crate::Arch) -> Result<(Vec<Emitted>, String, ModuleProof), String> {
     let mut epis = vec![Epi::Set, Epi::Add, Epi::GateUpSilu];
     if tile == Tile::T128x128x8 { epis.push(Epi::GateUpSiluBf16); }
-    let emitted = epis.into_iter().map(|epi| emit(Spec { fold, tile, cacc, epi, arch })).collect::<Result<Vec<_>, _>>()?;
-    let (text, proof) = module(&emitted, &Spec { fold, tile, cacc, epi: Epi::Set, arch }.module())?;
+    let emitted = epis.into_iter().map(|epi| emit(Spec { fold, tile, cacc, epi, act, arch })).collect::<Result<Vec<_>, _>>()?;
+    let (text, proof) = module(&emitted, &Spec { fold, tile, cacc, epi: Epi::Set, act, arch }.module())?;
     Ok((emitted, text, proof))
 }
 

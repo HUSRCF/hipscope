@@ -15,9 +15,16 @@ pub enum Cacc { One, Two }
 /// Epilogue family.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Epi { Set, Add, GateUpSilu, GateUpSiluBf16 }
+/// Activation layout inside each K128 block of `Xq` (N tokens, N*72 bytes
+/// either way). `Token`: one 72-B `block_i4_128` record per token.
+/// `Slab`: the same bytes as planes `[d: 4N][s: 4N][qs[0..32): 32N]
+/// [qs[32..64): 32N]`, so a wave's 8-token staging load covers 256
+/// contiguous bytes and its 16-token `d` load 64 bytes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ALayout { Token, Slab }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Spec { pub fold: Fold, pub tile: Tile, pub cacc: Cacc, pub epi: Epi, pub arch: Arch }
+pub struct Spec { pub fold: Fold, pub tile: Tile, pub cacc: Cacc, pub epi: Epi, pub act: ALayout, pub arch: Arch }
 
 /// Every variant keeps occupancy only at or below this many VGPRs (G0g:
 /// 4 WG/WGP for 8-wave and 2 WG/WGP for 16-wave workgroups).
@@ -72,10 +79,13 @@ impl Epi {
 }
 
 impl Spec {
-    pub fn control(epi: Epi) -> Self { Self { fold: Fold::K128, tile: Tile::T128x128x8, cacc: Cacc::One, epi, arch: Arch::Gfx1201 } }
+    pub fn control(epi: Epi) -> Self { Self { fold: Fold::K128, tile: Tile::T128x128x8, cacc: Cacc::One, epi, act: ALayout::Token, arch: Arch::Gfx1201 } }
     /// Product symbol suffix. The control keeps the plan's `_b1`; the 16-wave
-    /// tile needs different launch geometry, so it is a distinct module.
-    pub fn suffix(self) -> &'static str { match self.tile { Tile::T128x128x8 => "_b1", Tile::T256x128x16 => "_b1t256" } }
+    /// tile needs different launch geometry, so it is a distinct module; the
+    /// slab activation layout reads different bytes, so it is one too.
+    pub fn suffix(self) -> &'static str {
+        match (self.tile, self.act) { (Tile::T128x128x8, ALayout::Token) => "_b1", (Tile::T128x128x8, ALayout::Slab) => "_b1s", (Tile::T256x128x16, _) => "_b1t256" }
+    }
     pub fn module(self) -> String { format!("gemm_mq4g256v2_residual_mmq_iu4_gfx12{}", self.suffix()) }
     pub fn symbol(self) -> String {
         let stem = match self.epi {
@@ -87,10 +97,11 @@ impl Spec {
     }
     pub fn kernargs(self) -> KernargLayout { self.epi.variant().kernargs() }
     pub fn variant_name(self) -> String {
-        format!("{}-{}-{}-{}",
+        format!("{}-{}-{}{}-{}",
             match self.fold { Fold::K128 => "k128", Fold::K256Shared => "k256s", Fold::K256Pow2 => "k256p" },
             match self.tile { Tile::T128x128x8 => "128x128x8", Tile::T256x128x16 => "256x128x16" },
-            match self.cacc { Cacc::One => "cacc1", Cacc::Two => "cacc2" }, self.epi.name())
+            match self.cacc { Cacc::One => "cacc1", Cacc::Two => "cacc2" },
+            match self.act { ALayout::Token => "", ALayout::Slab => "-slab" }, self.epi.name())
     }
     /// Reject combinations that have no generator: closed fold tracks, the
     /// dropped second accumulator set, and non-gfx12 targets.
@@ -99,6 +110,7 @@ impl Spec {
         if self.fold != Fold::K128 { return Err("K256 folds are closed at Q0 (plan §5); no product generator".into()) }
         if self.cacc != Cacc::One { return Err("Cacc::Two is dropped by G0g: it cannot fit the 192-VGPR occupancy ceiling".into()) }
         if self.epi == Epi::GateUpSiluBf16 && self.tile != Tile::T128x128x8 { return Err("packed bf16 h is emitted only for the production _b1 tile".into()) }
+        if self.act == ALayout::Slab && self.tile != Tile::T128x128x8 { return Err("the slab activation layout is emitted only for the production _b1 tile".into()) }
         Ok(())
     }
 }
@@ -107,3 +119,4 @@ impl std::str::FromStr for Fold { type Err = String; fn from_str(s: &str) -> Res
 impl std::str::FromStr for Tile { type Err = String; fn from_str(s: &str) -> Result<Self, String> { match s { "128x128x8" => Ok(Self::T128x128x8), "256x128x16" => Ok(Self::T256x128x16), _ => Err(format!("unknown tile {s}")) } } }
 impl std::str::FromStr for Cacc { type Err = String; fn from_str(s: &str) -> Result<Self, String> { match s { "1" => Ok(Self::One), "2" => Ok(Self::Two), _ => Err(format!("unknown cacc {s}")) } } }
 impl std::str::FromStr for Epi { type Err = String; fn from_str(s: &str) -> Result<Self, String> { match s { "set" => Ok(Self::Set), "add" => Ok(Self::Add), "silu" => Ok(Self::GateUpSilu), "silu-bf16" => Ok(Self::GateUpSiluBf16), _ => Err(format!("unknown epilogue {s}")) } } }
+impl std::str::FromStr for ALayout { type Err = String; fn from_str(s: &str) -> Result<Self, String> { match s { "token" => Ok(Self::Token), "slab" => Ok(Self::Slab), _ => Err(format!("unknown activation layout {s}")) } } }

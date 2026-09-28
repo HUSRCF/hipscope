@@ -148,12 +148,25 @@ pub(crate) fn emit(b: &mut Builder, g: &Gen) -> Result<(), String> {
     vop(b, format!("v_or_b32_e32 v{lo}, v{lo}, v{qb}"), lo, &[lo, qb], &[])?;
     vop(b, format!("v_lshlrev_b32_e32 v{lo}, 3, v{lo}"), lo, &[lo], &[])?;
     vop(b, format!("v_add_nc_u32_e32 v{}, v{fr}, v{lo}", g.st_lds), g.st_lds, &[fr, lo], &[])?;
-    // Global slab offsets: token (bs + R)*72 + q*8; weight row clamped to M-1.
+    // Global slab offsets: token (bs + R)*72 + q*8 (Token), or
+    // 8N + (bs + R)*32 + q*8 into the slab-0 plane (Slab; slab 1 adds the
+    // 32N held in `a_slab1`); weight row clamped to M-1.
     let (q8, row, hr) = (12u8, 13u8, 14u8);
     vop(b, format!("v_lshlrev_b32_e32 v{q8}, 3, v{q}"), q8, &[q], &[])?;
     vop(b, format!("v_add_nc_u32_e32 v{row}, s{}, v{r0}", g.bs), row, &[r0], &[g.bs])?;
-    vop(b, format!("v_mul_u32_u24_e32 v{row}, 0x48, v{row}"), row, &[row], &[])?;
-    vop(b, format!("v_add_nc_u32_e32 v{}, v{row}, v{q8}", g.st_a), g.st_a, &[row, q8], &[])?;
+    match g.a_slab1 {
+        None => {
+            vop(b, format!("v_mul_u32_u24_e32 v{row}, 0x48, v{row}"), row, &[row], &[])?;
+            vop(b, format!("v_add_nc_u32_e32 v{}, v{row}, v{q8}", g.st_a), g.st_a, &[row, q8], &[])?;
+        }
+        Some(s1) => {
+            sop(b, format!("s_lshl_b32 s{s1}, s{}, 5", a.n), &[s1], &[a.n])?;
+            sop(b, format!("s_lshl_b32 s{x}, s{}, 3", a.n), &[x], &[a.n])?;
+            vop(b, format!("v_lshlrev_b32_e32 v{row}, 5, v{row}"), row, &[row], &[])?;
+            vop(b, format!("v_add_nc_u32_e32 v{row}, s{x}, v{row}"), row, &[row], &[x])?;
+            vop(b, format!("v_add_nc_u32_e32 v{}, v{row}, v{q8}", g.st_a), g.st_a, &[row, q8], &[])?;
+        }
+    }
     // Gate/up virtual row R -> h row hs + 16*(R>>5) + (R&15).
     let hrow_of = |b: &mut Builder, src: u8, dst: u8| -> Result<(), String> {
         vop(b, format!("v_lshrrev_b32_e32 v{dst}, 5, v{src}"), dst, &[src], &[])?;
@@ -182,7 +195,11 @@ pub(crate) fn emit(b: &mut Builder, g: &Gen) -> Result<(), String> {
     }
     vop(b, format!("v_lshlrev_b32_e32 v{}, 2, v{tok}", g.meta_ds), g.meta_ds, &[tok], &[])?;
     vop(b, format!("v_add_nc_u32_e32 v{row}, s{}, v{tok}", g.bs), row, &[tok], &[g.bs])?;
-    vop(b, format!("v_mul_u32_u24_e32 v{}, 0x48, v{row}", g.ds_voff), g.ds_voff, &[row], &[])?;
+    // Token scale `d`: record offset 0 (Token) or the d plane at offset 0 (Slab).
+    match g.a_slab1 {
+        None => vop(b, format!("v_mul_u32_u24_e32 v{}, 0x48, v{row}", g.ds_voff), g.ds_voff, &[row], &[])?,
+        Some(_) => vop(b, format!("v_lshlrev_b32_e32 v{}, 2, v{row}", g.ds_voff), g.ds_voff, &[row], &[])?,
+    }
     if silu {
         hrow_of(b, vv, hr)?;
         vop(b, format!("v_add_nc_u32_e32 v{row}, s{}, v{hr}", g.hs), row, &[hr], &[g.hs])?;
@@ -204,7 +221,8 @@ pub(crate) fn emit(b: &mut Builder, g: &Gen) -> Result<(), String> {
     // Block 0: slab 0, d plane 0, sc plane 0.
     b.clause(|b| {
         for (r, &dst) in g.a_pf.iter().enumerate() {
-            publish::vload(b, dst, 2, g.st_a, a0, None, 8 + r as u32 * tile.round_rows() * super::spec::BLOCK_I4_128)?;
+            let (soff, offset) = publish::a_offset(g, 0, r);
+            publish::vload(b, dst, 2, g.st_a, a0, soff, offset)?;
         }
         for (r, &dst) in g.w_pf.iter().enumerate() { publish::vload(b, dst, 2, g.st_w[r], g.srd_w, Some(g.goff), 8)?; }
         publish::vload(b, g.ds_nx, 1, g.ds_voff, a0, None, 0)?;
