@@ -2952,7 +2952,14 @@ fn append_betaalpha_to_z(
     }
     let packed = gpu.upload_raw(&rows, &[rows.len()])?;
     let old = std::mem::replace(&mut z.buf, packed);
-    gpu.free_tensor(old)?;
+    if gfx12 {
+        // The replaced Z (16.7 MB per H2 layer) goes back to HIP, not to the
+        // buffer pool, which would otherwise hold it for the process and
+        // count against the post-weight KV capacity.
+        gpu.release_tensor_immediate(old)?;
+    } else {
+        gpu.free_tensor(old)?;
+    }
     Ok(())
 }
 
