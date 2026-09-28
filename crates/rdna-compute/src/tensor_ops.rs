@@ -3010,8 +3010,10 @@ const QSA_ATTENTION_HG4_HEADS: usize = 4;
 
 /// Below this many rows the grouped kernel launches too few workgroups
 /// (`rows * n_heads / 4`) to fill the GPU and the per-head kernel is faster
-/// (decode: 0.48 vs 0.73 ms per call at 1131 context on gfx1151).
-const QSA_ATTENTION_HG4_MIN_ROWS: usize = 16;
+/// (decode: 0.48 vs 0.73 ms per call at 1131 context on gfx1151). From two
+/// rows (speculative verify) sharing each K/V row across four heads wins
+/// (4 rows, 232 context: 55 -> 27 us per layer).
+const QSA_ATTENTION_HG4_MIN_ROWS: usize = 2;
 
 /// Dynamic LDS for the grouped kernel, or `None` when the shape is not the one
 /// it is specialised for (gfx11+ ISA, head_dim 256, four heads per KV group,
