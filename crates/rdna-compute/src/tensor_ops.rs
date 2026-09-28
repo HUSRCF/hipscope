@@ -2629,6 +2629,86 @@ pub struct IndexedAttentionAttention<'a> {
     pub full_capacity: usize,
 }
 
+/// One device-to-device copy for [`copy_regions`].
+pub struct CopyRegion<'a> {
+    pub dst: &'a hip_bridge::DeviceBuffer,
+    pub dst_offset: usize,
+    pub src: &'a hip_bridge::DeviceBuffer,
+    pub src_offset: usize,
+    pub bytes: usize,
+}
+
+/// Regions per `copy_regions_u32` launch (its by-value kernarg table).
+const COPY_REGIONS_MAX: usize = 64;
+
+/// Many small independent device copies in one launch per 64 regions instead
+/// of one blit dispatch (and host API call) each. Regions of one call run
+/// concurrently, so none may write another's source or destination. A region
+/// that is not 4-byte aligned takes a plain copy.
+pub fn copy_regions(gpu: &mut Gpu, regions: &[CopyRegion<'_>]) -> HipResult<()> {
+    let mut table = [(0u64, 0u64, 0u32); COPY_REGIONS_MAX];
+    let mut count = 0;
+    for region in regions {
+        if region.dst_offset + region.bytes > region.dst.size()
+            || region.src_offset + region.bytes > region.src.size()
+        {
+            return Err(HipError::new(0, "copy_regions: region exceeds its buffer"));
+        }
+        let dst = region.dst.as_ptr() as u64 + region.dst_offset as u64;
+        let src = region.src.as_ptr() as u64 + region.src_offset as u64;
+        let words = region.bytes / 4;
+        if (dst | src | region.bytes as u64) % 4 != 0 || words > u32::MAX as usize {
+            gpu.memcpy_dtod_at_auto(
+                region.dst,
+                region.dst_offset,
+                region.src,
+                region.src_offset,
+                region.bytes,
+            )?;
+            continue;
+        }
+        if words == 0 {
+            continue;
+        }
+        table[count] = (dst, src, words as u32);
+        count += 1;
+        if count == COPY_REGIONS_MAX {
+            launch_copy_regions(gpu, &table[..count])?;
+            count = 0;
+        }
+    }
+    if count > 0 {
+        launch_copy_regions(gpu, &table[..count])?;
+    }
+    Ok(())
+}
+
+fn launch_copy_regions(gpu: &mut Gpu, table: &[(u64, u64, u32)]) -> HipResult<()> {
+    const NAME: &str = "copy_regions_u32";
+    gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, NAME)?;
+    let mut args = KernargBlob::new();
+    for index in 0..COPY_REGIONS_MAX {
+        args.push_u64(table.get(index).map_or(0, |entry| entry.0));
+    }
+    for index in 0..COPY_REGIONS_MAX {
+        args.push_u64(table.get(index).map_or(0, |entry| entry.1));
+    }
+    for index in 0..COPY_REGIONS_MAX {
+        args.push_u32(table.get(index).map_or(0, |entry| entry.2));
+    }
+    args.push_i32(table.len() as i32);
+    args.pad_to(16);
+    let max_words = table.iter().map(|entry| entry.2).max().unwrap_or(0);
+    gpu.launch_blob_recorded(
+        NAME,
+        [max_words.div_ceil(256).clamp(1, 64), table.len() as u32, 1],
+        [256, 1, 1],
+        0,
+        args.as_mut_slice(),
+        crate::dispatch::ReplayLaunchBindings::NONE,
+    )
+}
+
 pub fn indexed_attention_attention(
     gpu: &mut Gpu,
     p: &IndexedAttentionAttention<'_>,

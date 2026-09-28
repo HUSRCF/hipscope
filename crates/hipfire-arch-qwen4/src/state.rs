@@ -10,6 +10,7 @@
 use crate::config::{LayerType, Qwen4Config};
 use crate::ple::PleHistory;
 use hipfire_dispatch::pipeline::GdnRowCapture;
+use rdna_compute::tensor_ops::{copy_regions, CopyRegion};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -18,6 +19,17 @@ static NEXT_QWEN4_MODEL_ID: AtomicU64 = AtomicU64::new(1);
 
 fn next_qwen4_model_id() -> u64 {
     NEXT_QWEN4_MODEL_ID.fetch_add(1, Ordering::Relaxed).max(1)
+}
+
+/// The first `bytes` of `src` into the start of `dst`.
+fn whole<'a>(src: &'a GpuTensor, dst: &'a GpuTensor, bytes: usize) -> CopyRegion<'a> {
+    CopyRegion {
+        dst: &dst.buf,
+        dst_offset: 0,
+        src: &src.buf,
+        src_offset: 0,
+        bytes,
+    }
 }
 
 /// Reference-only GDN state used by CPU equation tests.
@@ -828,38 +840,34 @@ impl Qwen4State {
         }
         let generation = self.snapshot_arena.generation;
         let result = (|| -> Result<(), StateError> {
-            let arena = &mut self.snapshot_arena;
-            arena.gdn_live =
+            self.snapshot_arena.gdn_live =
                 (self.row_capture_armed && !self.row_capture.is_empty()).then_some(self.gdn_live);
+            let arena = &self.snapshot_arena;
+            let mut copies = Vec::with_capacity(2 * self.gdn.len() + 4 * self.qsa.len() + 2);
             if arena.gdn_live.is_none() {
                 for (layer, destination) in self.gdn.iter().zip(&arena.recurrent) {
-                    gpu.copy_d2d(&layer.recurrent, destination, layer.recurrent.byte_size())
-                        .map_err(StateError::Hip)?;
+                    copies.push(whole(&layer.recurrent, destination, layer.recurrent.byte_size()));
                 }
             }
             for (layer, destination) in self.gdn.iter().zip(&arena.conv) {
-                gpu.copy_d2d(&layer.conv, destination, layer.conv.byte_size())
-                    .map_err(StateError::Hip)?;
+                copies.push(whole(&layer.conv, destination, layer.conv.byte_size()));
             }
             for (index, layer) in self.qsa.iter().enumerate() {
-                gpu.copy_d2d(
+                copies.push(whole(
                     &layer.partial_keys,
                     &arena.qsa_partial_keys[index],
                     layer.partial_keys.byte_size(),
-                )
-                .map_err(StateError::Hip)?;
-                gpu.copy_d2d(
+                ));
+                copies.push(whole(
                     &layer.partial_values,
                     &arena.qsa_partial_values[index],
                     layer.partial_values.byte_size(),
-                )
-                .map_err(StateError::Hip)?;
-                gpu.copy_d2d(
+                ));
+                copies.push(whole(
                     &layer.selected_indices,
                     &arena.qsa_selected[index],
                     layer.selected_indices.byte_size(),
-                )
-                .map_err(StateError::Hip)?;
+                ));
                 let raw_width = layer
                     .raw_index_keys
                     .numel()
@@ -875,25 +883,26 @@ impl Qwen4State {
                         .checked_mul(raw_width)
                         .and_then(|v| v.checked_mul(std::mem::size_of::<f32>()))
                         .ok_or(StateError::DimensionOverflow)?;
-                    gpu.memcpy_dtod_at_auto(
-                        &arena.qsa_raw_circular[index].buf,
-                        0,
-                        &layer.raw_index_keys.buf,
-                        source_offset,
+                    copies.push(CopyRegion {
+                        dst: &arena.qsa_raw_circular[index].buf,
+                        dst_offset: 0,
+                        src: &layer.raw_index_keys.buf,
+                        src_offset: source_offset,
                         bytes,
-                    )
-                    .map_err(StateError::Hip)?;
+                    });
                 }
-                arena.qsa_marks[index] = layer.mark();
             }
-            gpu.copy_d2d(&self.ple_conv, &arena.ple_conv, self.ple_conv.byte_size())
-                .map_err(StateError::Hip)?;
-            gpu.copy_d2d(
+            copies.push(whole(&self.ple_conv, &arena.ple_conv, self.ple_conv.byte_size()));
+            copies.push(whole(
                 &self.hyper_feedback,
                 &arena.hyper_feedback,
                 self.hyper_feedback.byte_size(),
-            )
-            .map_err(StateError::Hip)?;
+            ));
+            copy_regions(gpu, &copies).map_err(StateError::Hip)?;
+            let arena = &mut self.snapshot_arena;
+            for (index, layer) in self.qsa.iter().enumerate() {
+                arena.qsa_marks[index] = layer.mark();
+            }
             arena.ple_history = self.ple_history;
             arena.position = self.position;
             arena.active = true;
@@ -926,36 +935,32 @@ impl Qwen4State {
             if let Some(live) = self.snapshot_arena.gdn_live {
                 self.set_gdn_live(live);
             }
-            let arena = &mut self.snapshot_arena;
+            let arena = &self.snapshot_arena;
+            let mut copies = Vec::with_capacity(2 * self.gdn.len() + 4 * self.qsa.len() + 2);
             if arena.gdn_live.is_none() {
-                for (layer, source) in self.gdn.iter_mut().zip(&arena.recurrent) {
-                    gpu.copy_d2d(source, &layer.recurrent, layer.recurrent.byte_size())
-                        .map_err(StateError::Hip)?;
+                for (layer, source) in self.gdn.iter().zip(&arena.recurrent) {
+                    copies.push(whole(source, &layer.recurrent, layer.recurrent.byte_size()));
                 }
             }
-            for (layer, source) in self.gdn.iter_mut().zip(&arena.conv) {
-                gpu.copy_d2d(source, &layer.conv, layer.conv.byte_size())
-                    .map_err(StateError::Hip)?;
+            for (layer, source) in self.gdn.iter().zip(&arena.conv) {
+                copies.push(whole(source, &layer.conv, layer.conv.byte_size()));
             }
-            for (index, layer) in self.qsa.iter_mut().enumerate() {
-                gpu.copy_d2d(
+            for (index, layer) in self.qsa.iter().enumerate() {
+                copies.push(whole(
                     &arena.qsa_partial_keys[index],
                     &layer.partial_keys,
                     layer.partial_keys.byte_size(),
-                )
-                .map_err(StateError::Hip)?;
-                gpu.copy_d2d(
+                ));
+                copies.push(whole(
                     &arena.qsa_partial_values[index],
                     &layer.partial_values,
                     layer.partial_values.byte_size(),
-                )
-                .map_err(StateError::Hip)?;
-                gpu.copy_d2d(
+                ));
+                copies.push(whole(
                     &arena.qsa_selected[index],
                     &layer.selected_indices,
                     layer.selected_indices.byte_size(),
-                )
-                .map_err(StateError::Hip)?;
+                ));
                 let mark = arena.qsa_marks[index];
                 let raw_width = layer
                     .raw_index_keys
@@ -972,15 +977,25 @@ impl Qwen4State {
                         .checked_mul(raw_width)
                         .and_then(|v| v.checked_mul(std::mem::size_of::<f32>()))
                         .ok_or(StateError::DimensionOverflow)?;
-                    gpu.memcpy_dtod_at_auto(
-                        &layer.raw_index_keys.buf,
-                        destination_offset,
-                        &arena.qsa_raw_circular[index].buf,
-                        0,
+                    copies.push(CopyRegion {
+                        dst: &layer.raw_index_keys.buf,
+                        dst_offset: destination_offset,
+                        src: &arena.qsa_raw_circular[index].buf,
+                        src_offset: 0,
                         bytes,
-                    )
-                    .map_err(StateError::Hip)?;
+                    });
                 }
+            }
+            copies.push(whole(&arena.ple_conv, &self.ple_conv, self.ple_conv.byte_size()));
+            copies.push(whole(
+                &arena.hyper_feedback,
+                &self.hyper_feedback,
+                self.hyper_feedback.byte_size(),
+            ));
+            copy_regions(gpu, &copies).map_err(StateError::Hip)?;
+            let arena = &mut self.snapshot_arena;
+            for (index, layer) in self.qsa.iter_mut().enumerate() {
+                let mark = arena.qsa_marks[index];
                 layer.full_len = mark.full_len;
                 layer.raw_len = mark.raw_len;
                 layer.pooled_len = mark.pooled_len;
@@ -988,14 +1003,6 @@ impl Qwen4State {
                 layer.selected_len = mark.selected_len;
                 layer.position = mark.position;
             }
-            gpu.copy_d2d(&arena.ple_conv, &self.ple_conv, self.ple_conv.byte_size())
-                .map_err(StateError::Hip)?;
-            gpu.copy_d2d(
-                &arena.hyper_feedback,
-                &self.hyper_feedback,
-                self.hyper_feedback.byte_size(),
-            )
-            .map_err(StateError::Hip)?;
             self.ple_history = arena.ple_history;
             self.position = arena.position;
             if consume {
@@ -1224,29 +1231,55 @@ impl Qwen4State {
             .ok_or(StateError::SnapshotTicket)?;
         self.set_gdn_live(self.capture_base(before) + keep - 1);
         let arena = &self.snapshot_arena;
+        let row_bytes = self.ple_conv.byte_size() / ple_history_rows;
+        let mut copies = Vec::with_capacity(
+            self.gdn.len() * conv_history + self.qsa.len() + ple_history_rows,
+        );
+        // Convolution history slot `position % conv_history`: the kept verify
+        // rows' inputs where they reach, the snapshot's history elsewhere.
+        let rows_from = (start + keep).saturating_sub(conv_history).max(start);
         for (index, layer) in self.gdn.iter().enumerate() {
             let (_, inputs) = &self.row_capture[index];
-            gpu.copy_d2d(&arena.conv[index], &layer.conv, layer.conv.byte_size())
-                .map_err(StateError::Hip)?;
             let channel_bytes = layer.conv.byte_size() / conv_history;
-            for position in (start + keep).saturating_sub(conv_history).max(start)..start + keep {
-                gpu.memcpy_dtod_at_auto(
-                    &layer.conv.buf,
-                    (position % conv_history) * channel_bytes,
-                    &inputs.buf,
-                    (position - start) * channel_bytes,
-                    channel_bytes,
-                )
-                .map_err(StateError::Hip)?;
+            for slot in 0..conv_history {
+                let kept = (rows_from..start + keep).find(|position| position % conv_history == slot);
+                let (src, src_offset) = match kept {
+                    Some(position) => (&inputs.buf, (position - start) * channel_bytes),
+                    None => (&arena.conv[index].buf, slot * channel_bytes),
+                };
+                copies.push(CopyRegion {
+                    dst: &layer.conv.buf,
+                    dst_offset: slot * channel_bytes,
+                    src,
+                    src_offset,
+                    bytes: channel_bytes,
+                });
             }
         }
-        for (index, layer) in self.qsa.iter_mut().enumerate() {
-            gpu.copy_d2d(
+        for (index, layer) in self.qsa.iter().enumerate() {
+            copies.push(whole(
                 &arena.qsa_selected[index],
                 &layer.selected_indices,
                 layer.selected_indices.byte_size(),
-            )
-            .map_err(StateError::Hip)?;
+            ));
+        }
+        for row in 0..ple_history_rows {
+            let source = keep + row;
+            let (src, src_offset) = if source < ple_history_rows {
+                (&arena.ple_conv.buf, source * row_bytes)
+            } else {
+                (&ple_normed.buf, (source - ple_history_rows) * row_bytes)
+            };
+            copies.push(CopyRegion {
+                dst: &self.ple_conv.buf,
+                dst_offset: row * row_bytes,
+                src,
+                src_offset,
+                bytes: row_bytes,
+            });
+        }
+        copy_regions(gpu, &copies).map_err(StateError::Hip)?;
+        for (index, layer) in self.qsa.iter_mut().enumerate() {
             let mark = arena.qsa_marks[index];
             let position = mark.position + keep;
             let complete = position / compress;
@@ -1257,28 +1290,6 @@ impl Qwen4State {
                 - complete * compress)
                 .min(layer.selected_capacity);
             layer.position = position;
-        }
-        let row_bytes = self.ple_conv.byte_size() / ple_history_rows;
-        for row in 0..ple_history_rows {
-            let source = keep + row;
-            if source < ple_history_rows {
-                gpu.memcpy_dtod_at_auto(
-                    &self.ple_conv.buf,
-                    row * row_bytes,
-                    &arena.ple_conv.buf,
-                    source * row_bytes,
-                    row_bytes,
-                )
-            } else {
-                gpu.memcpy_dtod_at_auto(
-                    &self.ple_conv.buf,
-                    row * row_bytes,
-                    &ple_normed.buf,
-                    (source - ple_history_rows) * row_bytes,
-                    row_bytes,
-                )
-            }
-            .map_err(StateError::Hip)?;
         }
         let mut history = arena.ple_history;
         for &token in &tokens[..keep] {

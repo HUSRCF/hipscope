@@ -2155,6 +2155,27 @@ extern "C" __global__ void indexed_attention_select_f32(
         selected[offset++] = token;
     }
 }
+// Many independent small device copies in one launch (copy_regions in
+// tensor_ops.rs): the region table rides in the kernarg segment by value;
+// grid.y selects the region, grid.x strides over its 4-byte words.
+#define COPY_REGIONS_MAX 64
+struct CopyRegions {
+    unsigned long long dst[COPY_REGIONS_MAX];
+    unsigned long long src[COPY_REGIONS_MAX];
+    unsigned int words[COPY_REGIONS_MAX];
+};
+extern "C" __global__ void copy_regions_u32(CopyRegions regions, int count) {
+    const int region = (int)blockIdx.y;
+    if (region >= count) return;
+    unsigned int* dst = reinterpret_cast<unsigned int*>(regions.dst[region]);
+    const unsigned int* src = reinterpret_cast<const unsigned int*>(regions.src[region]);
+    const unsigned int words = regions.words[region];
+    for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x; i < words;
+         i += gridDim.x * blockDim.x)
+        dst[i] = src[i];
+}
+#undef COPY_REGIONS_MAX
+
 // Reuse the previous MTP QSA sparse row after step zero. The selected buffer
 // stores i32 indices in a byte-addressed Raw allocation. One workgroup owns
 // the row so compaction is stable and requires no host round-trip or scratch
