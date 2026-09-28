@@ -7700,6 +7700,17 @@ pub const GDN_CHUNK_SCAN_BF16_SRC: &str = concat!(
     "#define GDN_SCAN_OUT_BF16 1\n#define GDN_CHUNK_SCAN_KERNEL gdn_chunk_scan_bf16\n",
     include_str!("../../../kernels/src/gdn_chunk_scan.gfx1201.hip")
 );
+/// One launch per layer of [`GDN_CHUNK_SCAN_BF16_SRC`] (`HIPFIRE_GDN_SCAN_MSEG`,
+/// default on): walks every 512-row commit segment in order, carrying the
+/// state between segments through the same q8/scale/EF round trip in
+/// registers; stores the state after the last segment only. Byte-identical
+/// `out` and state.
+#[cfg(feature = "deltanet")]
+pub const GDN_CHUNK_SCAN_BF16_MSEG_SRC: &str = concat!(
+    "#define GDN_SCAN_OUT_BF16 1\n#define GDN_SCAN_MULTISEG 1\n",
+    "#define GDN_CHUNK_SCAN_KERNEL gdn_chunk_scan_bf16_mseg\n",
+    include_str!("../../../kernels/src/gdn_chunk_scan.gfx1201.hip")
+);
 
 /// Decode-only compact-QK variants for Qwen3.5 DeltaNet GQA (16 Q/K heads,
 /// 32 value/state heads). Each pair of state heads reads one normalized Q/K

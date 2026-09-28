@@ -7375,30 +7375,47 @@ pub(crate) fn batch_chunk_delta_net_attn(
         if kkt_batched {
             gpu.gdn_chunk_kkt_solve_batched(&k, &pbs.dn_alpha_batch, &pbs.dn_beta_batch, &a, n)?;
         }
-        for row0 in (0..n).step_by(segment_rows) {
-            let rows = (n - row0).min(segment_rows);
-            // Batched: this segment's A blocks start at its layer row.
-            let a_seg = if kkt_batched {
-                a.sub_offset(row0 * 48 * 64 * 2, rows.div_ceil(64) * 64 * 48 * 64 * 2)
-            } else {
-                a.shallow_clone()
-            };
-            gpu.gdn_chunk_scan_segment(
+        if kkt_batched && gpu.gdn_scan_mseg_enabled(scan_out, segment_rows) {
+            // One scan launch walks every commit segment (byte-identical).
+            gpu.gdn_chunk_scan_layer_mseg(
                 &q,
                 &k,
                 &v,
-                &a_seg,
+                &a,
                 &pbs.dn_alpha_batch,
                 &pbs.dn_beta_batch,
                 &dn_state.s_matrices[delta_layer_idx],
                 &dn_state.s_scales[delta_layer_idx],
                 ef,
                 &pbs.dn_attn_out_batch,
-                scan_out,
-                row0,
-                rows,
-                !kkt_batched,
+                n,
             )?;
+        } else {
+            for row0 in (0..n).step_by(segment_rows) {
+                let rows = (n - row0).min(segment_rows);
+                // Batched: this segment's A blocks start at its layer row.
+                let a_seg = if kkt_batched {
+                    a.sub_offset(row0 * 48 * 64 * 2, rows.div_ceil(64) * 64 * 48 * 64 * 2)
+                } else {
+                    a.shallow_clone()
+                };
+                gpu.gdn_chunk_scan_segment(
+                    &q,
+                    &k,
+                    &v,
+                    &a_seg,
+                    &pbs.dn_alpha_batch,
+                    &pbs.dn_beta_batch,
+                    &dn_state.s_matrices[delta_layer_idx],
+                    &dn_state.s_scales[delta_layer_idx],
+                    ef,
+                    &pbs.dn_attn_out_batch,
+                    scan_out,
+                    row0,
+                    rows,
+                    !kkt_batched,
+                )?;
+            }
         }
         batch_chunk_delta_net_output_projection(
             gpu,

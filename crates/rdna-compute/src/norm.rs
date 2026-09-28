@@ -4830,6 +4830,80 @@ impl Gpu {
         self.arch == "gfx1201" && hipfire_config::developer_bool("HIPFIRE_GDN_KKT_BATCHED", true)
     }
 
+    /// One chunk-scan launch per layer ([`Self::gdn_chunk_scan_layer_mseg`])
+    /// instead of one per 512-row commit segment (gfx1201 bf16 `out`,
+    /// default on; `HIPFIRE_GDN_SCAN_MSEG=0` keeps the per-segment launches).
+    /// The caller also requires batched KKT A blocks for every row.
+    #[cfg(feature = "deltanet")]
+    pub fn gdn_scan_mseg_enabled(&self, out: GdnScanOut, segment_rows: usize) -> bool {
+        self.arch == "gfx1201"
+            && out == GdnScanOut::Bf16
+            && segment_rows == 512
+            && hipfire_config::developer_var("HIPFIRE_GDN_SCAN_OUT_EMU").is_err()
+            && hipfire_config::developer_bool("HIPFIRE_GDN_SCAN_MSEG", true)
+    }
+
+    /// Every 512-row commit segment of one layer's GDN chunk scan in one
+    /// launch (`gdn_chunk_scan_bf16_mseg`): the same segments, in order, as
+    /// successive [`Self::gdn_chunk_scan_segment`] calls with `kkt = false`
+    /// over `a` holding the batched KKT's A for all `n_tokens` rows. Between
+    /// segments the state takes the q8/scale/EF round trip in registers, so
+    /// `out` and the final state are byte-identical; only the last segment
+    /// stores the state.
+    #[cfg(feature = "deltanet")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_chunk_scan_layer_mseg(
+        &mut self,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        v: &GpuTensor,
+        a: &GpuTensor,
+        g: &GpuTensor,
+        beta: &GpuTensor,
+        state_q8: &GpuTensor,
+        state_scales: &GpuTensor,
+        ef_residual: &GpuTensor,
+        out: &GpuTensor,
+        n_tokens: usize,
+    ) -> HipResult<()> {
+        const MODULE: &str = "gdn_chunk_scan_bf16_mseg";
+        self.bind_thread()?;
+        self.ensure_kernel(MODULE, kernels::GDN_CHUNK_SCAN_BF16_MSEG_SRC, MODULE)?;
+        // Same frame cadence as one reservation per segment launch.
+        for row0 in (0..n_tokens).step_by(512) {
+            let _frame = reserve_gdn_requant_frames((n_tokens - row0).min(512) as u32);
+        }
+        let (qp, kp, vp, ap) = (q.buf.as_ptr(), k.buf.as_ptr(), v.buf.as_ptr(), a.buf.as_ptr());
+        let (gp, bp) = (g.buf.as_ptr(), beta.buf.as_ptr());
+        let (sqp, scp, efp, op) =
+            (state_q8.buf.as_ptr(), state_scales.buf.as_ptr(), ef_residual.buf.as_ptr(), out.buf.as_ptr());
+        let r0 = 0i32;
+        let nt = n_tokens as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &vp as *const _ as *mut c_void,
+            &ap as *const _ as *mut c_void,
+            &gp as *const _ as *mut c_void,
+            &bp as *const _ as *mut c_void,
+            &sqp as *const _ as *mut c_void,
+            &scp as *const _ as *mut c_void,
+            &efp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &r0 as *const _ as *mut c_void,
+            &nt as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(MODULE, [1, 48, 1], [512, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            for p in [qp, kp, vp, ap, gp, bp, sqp, scp, efp, op] {
+                b.push_ptr(p);
+            }
+            b.push_i32(r0);
+            b.push_i32(nt);
+            b
+        })
+    }
+
     /// Resolve the gfx1100/gfx1151/gfx1201 chunk scan modules before any
     /// admitted route mutates its input scratch or persistent convolution state.
     /// `out` selects the scan variant [`Self::gdn_chunk_scan_segment`] will run.
@@ -4857,7 +4931,15 @@ impl Gpu {
             }
         }
         let (scan_module, scan_source) = self.gdn_chunk_scan_module(out)?;
-        self.ensure_kernel(scan_module, scan_source, scan_module)
+        self.ensure_kernel(scan_module, scan_source, scan_module)?;
+        if self.gdn_kkt_batched_enabled() && self.gdn_scan_mseg_enabled(out, 512) {
+            self.ensure_kernel(
+                "gdn_chunk_scan_bf16_mseg",
+                kernels::GDN_CHUNK_SCAN_BF16_MSEG_SRC,
+                "gdn_chunk_scan_bf16_mseg",
+            )?;
+        }
+        Ok(())
     }
 
     /// Chunk-scan `out` format for a gfx1201 LA layer whose output producer has

@@ -10,6 +10,11 @@
 #define GS_BV 64
 #define GS_KP 132
 #define GS_AP 68
+#ifdef GDN_SCAN_MULTISEG
+// Multi-segment launch (`gdn_chunk_scan_bf16_mseg`, HIPFIRE_GDN_SCAN_MSEG):
+// T is the layer's whole row count, walked in commit segments of GS_SEG rows.
+#define GS_SEG 512
+#endif
 
 #if defined(__gfx1200__) || defined(__gfx1201__)
 #define GDN_CHUNK_GFX12 1
@@ -128,7 +133,11 @@ __global__ void GDN_CHUNK_SCAN_KERNEL(
  const unsigned short* __restrict__ A,const float* __restrict__ G,const float* __restrict__ beta,
  signed char* __restrict__ sq,float* __restrict__ sc,_Float16* __restrict__ ef,gs_out_t* __restrict__ out,int row0,int T){
 #endif
+#ifdef GDN_SCAN_MULTISEG
+ if(T<=0)return;
+#else
  if(T<=0||T>512)return;
+#endif
  const int head=(int)blockIdx.y;
  if((int)blockIdx.x!=0||head>=48)return;
  const int tid=(int)threadIdx.x,lane=tid&31,lo=lane&15,hi=lane>>4;
@@ -162,6 +171,18 @@ __global__ void GDN_CHUNK_SCAN_KERNEL(
   for(int ki=0;ki<2;++ki)for(int vi=0;vi<2;++vi){int t=ki*2+vi;int vv=(vt0+vi)*16+lo;
    for(int e=0;e<8;++e)sm.state[half][vv][(kt0+ki)*16+gs_acc_row(lane,e)]=gs_b16(St[t][e]);}
  };
+#ifdef GDN_SCAN_MULTISEG
+ // One launch walks the layer's GS_SEG-row commit segments in order. Inside
+ // the loop row0/T/A name the segment exactly as the per-segment launch's
+ // arguments did (A offset to the segment's first row, as the host's
+ // batched-KKT view). Between segments the state takes the per-segment
+ // launch's q8/scale/EF round trip in registers (below); only the last
+ // segment stores it.
+ const int gs_T_all=T;const unsigned short* const gs_A_all=A;
+ for(int gs_seg0=0;gs_seg0<gs_T_all;gs_seg0+=GS_SEG){
+ const int row0=gs_seg0,T=gs_T_all-gs_seg0<GS_SEG?gs_T_all-gs_seg0:GS_SEG;
+ const unsigned short* const A=gs_A_all+(unsigned long long)gs_seg0*48*GS_C;
+#endif
  const int nch=(T+GS_C-1)/GS_C;
 #if GS_G12_PIPE
  // Scheduling-only differences from the #else loop:
@@ -345,6 +366,33 @@ __global__ void GDN_CHUNK_SCAN_KERNEL(
   GS_BAR();
  }
 
+#endif
+#ifdef GDN_SCAN_MULTISEG
+ if(gs_seg0+GS_SEG<gs_T_all){
+  // The end-of-launch requant below, then the next launch's state load
+  // (float)sq*sc+(float)ef, without the global round trip (contraction is
+  // off in this module, so the products and sums round as there).
+  float vmax[2]={0,0};
+#pragma unroll
+  for(int vi=0;vi<2;++vi){int vv=vbase+(vt0+vi)*16+lo;
+#pragma unroll
+   for(int ki=0;ki<2;++ki){int t=ki*2+vi;
+#pragma unroll
+    for(int e=0;e<8;++e)vmax[vi]=fmaxf(vmax[vi],fabsf(St[t][e]));}
+   vmax[vi]=fmaxf(vmax[vi],__shfl_xor(vmax[vi],16));if(hi==0)reinterpret_cast<float*>(&sm.state[half][0][0])[(swave>>1)*GS_BV+vv-vbase]=vmax[vi];}
+  GS_BAR();
+#pragma unroll
+  for(int vi=0;vi<2;++vi){int vv=vbase+(vt0+vi)*16+lo;float mx=0;
+#pragma unroll
+   for(int g=0;g<4;++g)mx=fmaxf(mx,reinterpret_cast<float*>(&sm.state[half][0][0])[g*GS_BV+vv-vbase]);float inv=mx>0?127.0f/mx:0.0f,scale=mx>0?mx/127.0f:1.0f;
+#pragma unroll
+   for(int ki=0;ki<2;++ki){int t=ki*2+vi;
+#pragma unroll
+    for(int e=0;e<8;++e){float qf=fminf(fmaxf(rintf(St[t][e]*inv),-128.0f),127.0f);const float qs=qf*scale;St[t][e]=qs+(float)(_Float16)(St[t][e]-qs);}}}
+  // The next segment's stage_state overwrites the reduction tile.
+  GS_BAR();
+ }
+ }
 #endif
 
 #ifdef GDN_CHUNK_SCAN_F32_EDGE
