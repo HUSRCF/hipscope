@@ -934,6 +934,82 @@ tokens, the timed arm's sampler seed, and the author's predeclared promotion rul
 plus disposition. No promotion rule exists yet, so nothing here may be cited as
 an admission.
 
+## Certification re-run: REDLINE §7 gates (evidence collected 2026-09-28)
+
+**Fixture:**
+- Commit `84f37623b` (PR #774 head).
+- Daemon: sha256 `a8b267330e495655bf97fafe3dab945972137442959bc6532cd76a9e5f06934c`,
+  md5 `d9f654c430815e20e6cb229ffbb22535`.
+- Model: `qwen3.8-flash-next.mq4` (recipe r2, MQ6G256V2 language head), sha256
+  `cd7cbb911d3d016e034b1d22be1be37b42873a21699c94f09337528f1eee9db6`.
+  - It was served as `~/.hipfire/models/qwen3.8-flash-next.mq4r`, a hard link to
+    the same inode, so `mq4r_redline_default` arms. The route admission is
+    filename-based; the bytes are the published `.mq4`.
+- Host `halo`: gfx1151, HIP 7.2 through `HIPFIRE_ROCM_PATH=~/.hipfire/rocm-merged`.
+  The default `HIP_PATH` store has no `libhsa-runtime64`, and the AQL contract
+  probe needs it.
+- Prompt: `benchmarks/prompts/qwen4_ar_primes.txt`.
+
+**Instruments:**
+- `tools/redline bench` (`--transport pm4`, contexts 128 and 1500).
+- `scripts/redline_daemon_harness.py --qwen4 --pm4 --skip-prefill
+  --shadow-iterations 5`.
+- `scripts/serve_harness.py --mode chain` with `HIPFIRE_REPLAY_ROUTE_PROOF_LOG=1`.
+- A three-load swap probe.
+
+Raw reports are local under `.codeinsight+research/qwen4/pr774-final/`
+(gitignored).
+
+This head changed the Qwen4 tape against 2026-09-20 (1069 launches, 32 kernels
+here, against 2845 and 33 then). The sealed-MoE and decode-kernel work in
+between shortened the body, so the table below is a fresh collection, not a
+reuse of the earlier one.
+
+| Gate | Collected | Evidence |
+|---:|---|---|
+| 1. Baseline correctness | **yes** | The bench HIP arm is coherent on the prompt (expected `2, 3, 5, 7`) in every run, with route proof `state=hip` and `retained_rows=0`. |
+| 2. Capture completeness | **yes** | `computed=1069 recorded=1069 external=0`, 32 unique kernels, sequence hash `2cca77287bdc22bd`. The same hash came from every fresh process: 3 daemon-harness runs, 4 bench runs, 2 swap-probe loads and 2 serve chains. Effects `htod=0 dtod=0 dtoh=0`; see the memset note below. |
+| 3. ABI/artifact validation | **yes** | `certified_artifacts=14/14`, `certified_launches=1069 fallback_launches=0 unknown_launches=0`, PM4 wait audit `boundaries=1068 covered=1068`, prepared identity `[1069,1,2,30730,1,1]`. |
+| 4. Multi-position shadow parity | **yes** | HIP, retained PM4 and the HIP-kernarg-blob oracle are bit-exact at positions 129–133 over 126,623,888 state bytes per position; harness `failures=[]`. |
+| 5. Route proof | **yes** | Every bench run: the auto arm has `route_proof.valid=true`, `retained_rows=10`, observed positions `[128,227]` or `[1500,1599]`, `errors=[]`, and `lifecycle_route_proof.valid=true`; the HIP arm has `retained_rows=0`. |
+| 6. Production serve | **yes** | Bench coherence passes on both arms. The five-turn serve chain on the retained route finished `stop` on every turn, with 0 runaway, empty or attractor turns and coherent answers. The route-proof log shows replays 196/169/289/248/211 at positions 85/252/398/520/702, i.e. every generated token after the first of each turn. |
+| 7. Stationary matched performance | **yes at context 128**, not at 1500 | See the context breakdown below the table. |
+| 8. Long-context and lifecycle | **yes** | See the item breakdown below the table. |
+
+**Gate 7 by context:**
+- **Context 128:** one fully valid run, HIP 34.309 against auto 34.110 tok/s,
+  `speedup=0.994`, both arms stationary and route-proven.
+- **Context 1500:** three attempts, none fully valid.
+  - Attempts 1 and 2 had valid route proofs on both arms, and each rejected a
+    single arm's measured window at 1.19% and 1.24% spread (limit 1.0%). The
+    medians were HIP 33.07/33.15 against auto 33.03/33.02.
+  - Attempt 3's HIP arm never became stationary within 120 rows while two
+    external `llama-server` processes held the GPU at 100%.
+
+**Gate 8 by item:**
+- **Long context:** positions 1500–1599.
+- **KV growth and recurrent state:** covered by gate 4.
+- **Request reset:** the multi-turn chain replays on every turn.
+- **Replay failure:** induced through the harness's `failure_behavior`. The
+  plan refuses position 128 against a prepared max of 127, the route poisons
+  with that reason, and recovery runs on HIP, bit-exact against clean HIP.
+- **Model swap:** a Qwen4 → `lfm2.5-350m.mq4` → Qwen4 cycle in one daemon.
+  Each Qwen4 load re-prepares the retained body and emits the same greedy
+  stream. The 2026-09-20 VMM teardown blocker no longer reproduces.
+
+**Memset in the capture window.** Some first captures report one memset inside
+the capture window (`effect-incomplete — … 1 memset(s)`), while a capture later
+in the same process reports zero. The plan still prepares, and gates 4–6 hold on
+those processes, which is consistent with a first-use lazy initialisation rather
+than per-token state. It is not yet named, so it stays open.
+
+**Disposition:** this is evidence for gates 1–8 at this head, with gate 7
+collected at context 128 only. It is **not** a promotion or an admission:
+- no promotion rule was declared in advance (REDLINE §3), and there is no
+  `admissions.yml` row;
+- the retained route measured at speed parity with HIP (0.994), so this
+  evidence offers no performance case for promotion.
+
 ## Verification ladder
 
 | Stage | Route | State |
@@ -1062,6 +1138,10 @@ Append-only. One line per landed change with the commit hash once it exists.
   2051, attention grid 24 workgroups, LDS ≤ 16 408 B); neither 64 KiB switch flips
   in the 2048-token range. Options A1/A2, B1–B4 and C1–C5 recorded with
   pro/contra and a measurement plan; recommendation A1 + B1 + C1 + A4.
+- 2026-09-28 — **REDLINE §7 gates re-collected** at `84f37623b` on
+  `qwen3.8-flash-next.mq4`: gates 1–6 and 8 collected, gate 7 at context 128
+  only (0.994); model swap no longer blocked. No promotion rule, no admission
+  (see "Certification re-run").
 
 ### Next
 
