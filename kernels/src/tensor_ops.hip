@@ -2254,30 +2254,63 @@ extern "C" __global__ void copy_regions_u32(CopyRegions regions, int count) {
 
 // Reuse the previous MTP QSA sparse row after step zero. The selected buffer
 // stores i32 indices in a byte-addressed Raw allocation. One workgroup owns
-// the row so compaction is stable and requires no host round-trip or scratch
-// allocation.
+// the row: it snapshots the prior entries to LDS, keeps the valid ones (>= 0,
+// <= position) in order via a block scan over contiguous per-thread ranges,
+// appends `position` unless present, and fills the rest with -1 — the serial
+// in-place compaction's exact result, with no host round-trip.
+// Block 256; dynamic LDS min(selected_len, capacity) ints.
 extern "C" __global__ void indexed_attention_reuse_selection(
     int* selected,
     int* selected_len_out,
     int selected_len,
     int position,
     int capacity) {
-    if (blockIdx.x != 0 || threadIdx.x != 0) return;
-    int write = 0;
-    bool has_current = false;
-    for (int read = 0; read < selected_len && read < capacity; ++read) {
-        int token = selected[read];
+    if (blockIdx.x != 0) return;
+    extern __shared__ int prior[];
+    __shared__ int wave_totals[32];
+    __shared__ int has_current;
+    const int tid = (int)threadIdx.x;
+    const int threads = (int)blockDim.x;
+    const int n = min(selected_len, capacity);
+    if (tid == 0) has_current = 0;
+    for (int i = tid; i < n; i += threads) prior[i] = selected[i];
+    __syncthreads();
+    const int per = (n + threads - 1) / threads;
+    const int first = min(tid * per, n);
+    const int last = min(first + per, n);
+    int keep = 0;
+    for (int i = first; i < last; ++i) {
+        const int token = prior[i];
         if (token < 0 || token > position) continue;
-        if (token == position) has_current = true;
+        ++keep;
+        if (token == position) has_current = 1;
+    }
+    const int lane = tid & 31;
+    const int wave = tid >> 5;
+    const int waves = (threads + 31) >> 5;
+    int inclusive = keep;
+    for (int offset = 1; offset < 32; offset <<= 1) {
+        const int up = __shfl_up(inclusive, offset, 32);
+        if (lane >= offset) inclusive += up;
+    }
+    if (lane == 31 || tid == threads - 1) wave_totals[wave] = inclusive;
+    __syncthreads();
+    if (tid == 0)
+        for (int w = 1; w < waves; ++w) wave_totals[w] += wave_totals[w - 1];
+    __syncthreads();
+    int write = inclusive - keep + (wave > 0 ? wave_totals[wave - 1] : 0);
+    for (int i = first; i < last; ++i) {
+        const int token = prior[i];
+        if (token < 0 || token > position) continue;
         selected[write++] = token;
     }
-    if (!has_current && write < capacity) {
-        selected[write++] = position;
+    int count = wave_totals[waves - 1];
+    if (!has_current && count < capacity) {
+        if (tid == 0) selected[count] = position;
+        ++count;
     }
-    for (int index = write; index < capacity; ++index) {
-        selected[index] = -1;
-    }
-    *selected_len_out = write;
+    for (int i = count + tid; i < capacity; i += threads) selected[i] = -1;
+    if (tid == 0) *selected_len_out = count;
 }
 
 

@@ -2237,6 +2237,30 @@ pub fn indexed_attention_select(gpu: &mut Gpu, p: &IndexedAttentionSelect<'_>) -
     {
         return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
     }
+    // The rank-parallel batched kernel emits the serial selection sort's
+    // bytes; one row at `visible - 1` is this selection whenever the block
+    // count follows the visible prefix (the single-row kernel is O(chosen x
+    // blocks) in one thread).
+    if p.block_count == p.visible / p.compress {
+        return indexed_attention_select_batch(
+            gpu,
+            &IndexedAttentionSelectBatch {
+                query: p.query,
+                pooled: p.pooled,
+                selected: p.selected,
+                rows: 1,
+                query_row_stride: query_elements,
+                block_count: p.block_count,
+                index_heads: p.index_heads,
+                index_dim: p.index_dim,
+                budget_blocks: p.budget_blocks,
+                compress: p.compress,
+                position_start: p.visible - 1,
+                capacity: p.capacity,
+                shape_blocks: p.block_count,
+            },
+        );
+    }
     let (kernel_name, block, shared_mem) =
         match p.block_count.checked_mul(std::mem::size_of::<f32>()) {
             Some(bytes)
@@ -2522,11 +2546,16 @@ pub fn indexed_attention_reuse_selection(
     args.push_i32(position);
     args.push_i32(capacity);
     args.pad_to(16);
+    // The prior entries snapshot (the kernel compacts in place).
+    let snapshot_bytes = p.selected_len.min(p.capacity) * std::mem::size_of::<i32>();
+    if snapshot_bytes > QSA_SELECT_DYNAMIC_LDS_LIMIT_BYTES {
+        return Err(HipError::new(0, "QSA reuse selection exceeds its LDS snapshot"));
+    }
     gpu.launch_blob_recorded(
         "indexed_attention_reuse_selection",
         [1, 1, 1],
-        [1, 1, 1],
-        0,
+        [256, 1, 1],
+        snapshot_bytes as u32,
         args.as_mut_slice(),
         crate::dispatch::ReplayLaunchBindings::NONE,
     )
