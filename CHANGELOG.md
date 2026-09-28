@@ -2,20 +2,25 @@
 
 ## Unreleased
 
-- Qwen4 native MTP decode on gfx1151: 28.7 → 45.3 tok/s (geomean of the
+- Qwen4 native MTP decode on gfx1151: 28.7 → 50.2 tok/s (geomean of the
   committed code and prose prompts, greedy, `qwen3.8-flash-next.mq6q8-pleq8`;
   AR ~33 on the same build), with greedy MTP tokens equal to AR's. The 2..8-row
   verify forward is now bitwise the single-row decode route and ~2x cheaper
   than before (HC Q8 copies, staged Q8 LM head and MQ6 kernels over all rows,
-  fused HC write+norm, per-slot MoE down); a rejected suffix rolls back from
-  per-row GDN states kept in a ring instead of re-running the accepted rows;
-  each window picks the draft depth (or the interleaved route) from per-depth
-  draft agreement; drafts come from an MQ2 copy of the LM head re-scored
-  exactly on its top 8 (`HIPFIRE_MTP_DRAFT_HEAD`). SSD-resident PLE rows are
-  read concurrently and warmed while drafting, which also helps AR decode on
-  cold rows. `HIPFIRE_MTP_INCREMENTAL` unset now means adaptive (`0` batched,
-  `1` interleaved).
-  [The checkpoint](docs/perf-checkpoints/2026-09-28-qwen4-mtp-decode-autoresearch-gfx1151.md).
+  fused HC write+norm, per-slot MoE down, and ~35% fewer launches: fused
+  rotations, QSA prologue, GDN conv+params, grouped-MoE round trips, router,
+  unscatter and shared activation); a rejected suffix rolls back from
+  per-row GDN states kept in a ring instead of re-running the accepted rows,
+  and state snapshots copy in one launch; each window picks the draft depth
+  (or the interleaved route) from per-depth draft agreement; drafts come from
+  an MQ2 copy of the LM head re-scored exactly on its top 8
+  (`HIPFIRE_MTP_DRAFT_HEAD`), and the MTP head's attention, selection reuse
+  and chain-final K/V-only steps no longer stall or waste work. SSD-resident
+  PLE rows are read concurrently and warmed while drafting, which also helps
+  AR decode on cold rows. `HIPFIRE_MTP_INCREMENTAL` unset now means adaptive
+  (`0` batched, `1` interleaved).
+  [The checkpoint](docs/perf-checkpoints/2026-09-28-qwen4-mtp-decode-autoresearch-gfx1151.md)
+  and [amendment](docs/perf-checkpoints/2026-09-28-qwen4-mtp-decode-autoresearch-gfx1151-amendment-1.md).
 
 - Qwen4 decode on gfx1151: 19.2 → 32.3 tok/s (1131-token prompt, greedy,
   `qwen3.8-flash-next.mq6q8-pleq8`). Per-token dispatches drop by fusing the

@@ -138,9 +138,13 @@ fn router_with_shared(p: &MoePrefillParams<'_>) -> bool {
     p.batch_size <= 8
         && p.prelude.router.dtype == DType::BF16
         && p.prelude.shared.as_ref().is_some_and(|shared| {
-            [&shared.weights.selector, &shared.weights.gate, &shared.weights.up]
-                .iter()
-                .all(|w| w.dtype == DType::BF16)
+            [
+                &shared.weights.selector,
+                &shared.weights.gate,
+                &shared.weights.up,
+            ]
+            .iter()
+            .all(|w| w.dtype == DType::BF16)
         })
 }
 
@@ -490,13 +494,15 @@ pub(crate) fn unscatter(
                     shared.scalar,
                 )
             });
-        let shared = shared.as_ref().map(|(gate, up, out, selector)| SharedExpertActivation {
-            gate,
-            up,
-            out,
-            selector,
-            selectors: p.batch_size,
-        });
+        let shared = shared
+            .as_ref()
+            .map(|(gate, up, out, selector)| SharedExpertActivation {
+                gate,
+                up,
+                out,
+                selector,
+                selectors: p.batch_size,
+            });
         return hip(gpu.moe_gate_up_unscatter_silu_rotate128_top10(
             p.y_gate_up_grouped,
             p.sorted_slot_index,

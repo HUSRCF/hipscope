@@ -846,7 +846,11 @@ impl Qwen4State {
             let mut copies = Vec::with_capacity(2 * self.gdn.len() + 4 * self.qsa.len() + 2);
             if arena.gdn_live.is_none() {
                 for (layer, destination) in self.gdn.iter().zip(&arena.recurrent) {
-                    copies.push(whole(&layer.recurrent, destination, layer.recurrent.byte_size()));
+                    copies.push(whole(
+                        &layer.recurrent,
+                        destination,
+                        layer.recurrent.byte_size(),
+                    ));
                 }
             }
             for (layer, destination) in self.gdn.iter().zip(&arena.conv) {
@@ -892,7 +896,11 @@ impl Qwen4State {
                     });
                 }
             }
-            copies.push(whole(&self.ple_conv, &arena.ple_conv, self.ple_conv.byte_size()));
+            copies.push(whole(
+                &self.ple_conv,
+                &arena.ple_conv,
+                self.ple_conv.byte_size(),
+            ));
             copies.push(whole(
                 &self.hyper_feedback,
                 &arena.hyper_feedback,
@@ -986,7 +994,11 @@ impl Qwen4State {
                     });
                 }
             }
-            copies.push(whole(&arena.ple_conv, &self.ple_conv, self.ple_conv.byte_size()));
+            copies.push(whole(
+                &arena.ple_conv,
+                &self.ple_conv,
+                self.ple_conv.byte_size(),
+            ));
             copies.push(whole(
                 &arena.hyper_feedback,
                 &self.hyper_feedback,
@@ -1232,9 +1244,8 @@ impl Qwen4State {
         self.set_gdn_live(self.capture_base(before) + keep - 1);
         let arena = &self.snapshot_arena;
         let row_bytes = self.ple_conv.byte_size() / ple_history_rows;
-        let mut copies = Vec::with_capacity(
-            self.gdn.len() * conv_history + self.qsa.len() + ple_history_rows,
-        );
+        let mut copies =
+            Vec::with_capacity(self.gdn.len() * conv_history + self.qsa.len() + ple_history_rows);
         // Convolution history slot `position % conv_history`: the kept verify
         // rows' inputs where they reach, the snapshot's history elsewhere.
         let rows_from = (start + keep).saturating_sub(conv_history).max(start);
@@ -1242,7 +1253,8 @@ impl Qwen4State {
             let (_, inputs) = &self.row_capture[index];
             let channel_bytes = layer.conv.byte_size() / conv_history;
             for slot in 0..conv_history {
-                let kept = (rows_from..start + keep).find(|position| position % conv_history == slot);
+                let kept =
+                    (rows_from..start + keep).find(|position| position % conv_history == slot);
                 let (src, src_offset) = match kept {
                     Some(position) => (&inputs.buf, (position - start) * channel_bytes),
                     None => (&arena.conv[index].buf, slot * channel_bytes),

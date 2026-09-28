@@ -202,7 +202,9 @@ pub fn project_weights(
             }
             let group: SmallVec<[usize; 4]> = (i..projections.len())
                 .filter(|&j| {
-                    !done[j] && projections[j].0.dtype == DType::BF16 && projections[j].0.k == weight.k
+                    !done[j]
+                        && projections[j].0.dtype == DType::BF16
+                        && projections[j].0.k == weight.k
                 })
                 .collect();
             for chunk in group.chunks(4) {
@@ -342,7 +344,8 @@ fn project_rotated(
     if weight.dtype == DType::MQ6G256V2 && (2..=8).contains(&rows) {
         return hip(gpu.gemm_mq6g256v2_f32_rows(weight.buf, x, output, weight.m, weight.k, rows));
     }
-    if weight.dtype == DType::BF16 && (2..=8).contains(&rows) && gpu.arch_caps.has_gfx11_plus_simt() {
+    if weight.dtype == DType::BF16 && (2..=8).contains(&rows) && gpu.arch_caps.has_gfx11_plus_simt()
+    {
         let part = (weight.buf, output, weight.m);
         let none = (weight.buf, output, 0);
         return hip(gpu.gemv_bf16_xf32_x4_rows([part, none, none, none], x, weight.k, rows));

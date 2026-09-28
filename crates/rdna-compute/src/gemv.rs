@@ -3599,7 +3599,11 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
-        let key = (x.buf.as_ptr() as usize, x_rot.buf.as_ptr() as usize, k * batch_size);
+        let key = (
+            x.buf.as_ptr() as usize,
+            x_rot.buf.as_ptr() as usize,
+            k * batch_size,
+        );
         if self.scratch.prerotated.take() == Some(key) {
             return Ok(());
         }
@@ -15002,11 +15006,18 @@ impl Gpu {
             "gemm_mq6g256v2_f32_rows_x4_r8",
         ];
         if !(2..=8).contains(&rows) || k == 0 || !k.is_multiple_of(256) {
-            return Err(hip_bridge::HipError::new(1, "MQ6 F32 rows x4 needs 2..=8 rows, K % 256 == 0"));
+            return Err(hip_bridge::HipError::new(
+                1,
+                "MQ6 F32 rows x4 needs 2..=8 rows, K % 256 == 0",
+            ));
         }
         let func = FUNCS[rows - 2];
         self.bind_thread()?;
-        self.ensure_kernel("gemm_mq6g256v2_f32_rows", kernels::GEMM_MQ6G256V2_F32_ROWS_SRC, func)?;
+        self.ensure_kernel(
+            "gemm_mq6g256v2_f32_rows",
+            kernels::GEMM_MQ6G256V2_F32_ROWS_SRC,
+            func,
+        )?;
         let a = parts.map(|(w, _, _)| w.buf.as_ptr());
         let y = parts.map(|(_, y, _)| y.buf.as_ptr());
         let m = parts.map(|(_, _, m)| m as i32);
@@ -15025,21 +15036,28 @@ impl Gpu {
             params.push(v as *const _ as *mut c_void);
         }
         params.push(&k_val as *const _ as *mut c_void);
-        self.launch_maybe_blob(func, [blocks as u32, 1, 1], [32, 1, 1], 0, &mut params, || {
-            let mut b = hip_bridge::KernargBlob::new();
-            for p in a {
-                b.push_ptr(p);
-            }
-            b.push_ptr(x_ptr);
-            for p in y {
-                b.push_ptr(p);
-            }
-            for v in m {
-                b.push_i32(v);
-            }
-            b.push_i32(k_val);
-            b
-        })
+        self.launch_maybe_blob(
+            func,
+            [blocks as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                for p in a {
+                    b.push_ptr(p);
+                }
+                b.push_ptr(x_ptr);
+                for p in y {
+                    b.push_ptr(p);
+                }
+                for v in m {
+                    b.push_i32(v);
+                }
+                b.push_i32(k_val);
+                b
+            },
+        )
     }
 
     /// [`Gpu::gemv_bf16_xf32_x4`] over `rows` (2..=8) activation rows: x is
@@ -15062,7 +15080,10 @@ impl Gpu {
             "gemv_bf16_xf32_x4_rows_r8",
         ];
         if !(2..=8).contains(&rows) {
-            return Err(hip_bridge::HipError::new(1, "gemv_bf16_xf32_x4_rows needs 2..=8 rows"));
+            return Err(hip_bridge::HipError::new(
+                1,
+                "gemv_bf16_xf32_x4_rows needs 2..=8 rows",
+            ));
         }
         let func = FUNCS[rows - 2];
         self.bind_thread()?;
@@ -15085,21 +15106,28 @@ impl Gpu {
             params.push(v as *const _ as *mut c_void);
         }
         params.push(&k_val as *const _ as *mut c_void);
-        self.launch_maybe_blob(func, [blocks as u32, 1, 1], [32, 1, 1], 0, &mut params, || {
-            let mut b = hip_bridge::KernargBlob::new();
-            for p in w {
-                b.push_ptr(p);
-            }
-            b.push_ptr(x_ptr);
-            for p in y {
-                b.push_ptr(p);
-            }
-            for v in m {
-                b.push_i32(v);
-            }
-            b.push_i32(k_val);
-            b
-        })
+        self.launch_maybe_blob(
+            func,
+            [blocks as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                for p in w {
+                    b.push_ptr(p);
+                }
+                b.push_ptr(x_ptr);
+                for p in y {
+                    b.push_ptr(p);
+                }
+                for v in m {
+                    b.push_i32(v);
+                }
+                b.push_i32(k_val);
+                b
+            },
+        )
     }
 
     pub fn deepseek4_gemv_mq2g256_lloyd_moe_down_residual_scaled_indexed(

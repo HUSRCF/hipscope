@@ -1765,7 +1765,11 @@ pub fn gated_delta_gate_batched_rotate(
     args.pad_to(16);
     gpu.launch_blob_recorded(
         KERNEL,
-        [checked_u32(elements / 256, "GDN batched gate pair grid")?, 1, 1],
+        [
+            checked_u32(elements / 256, "GDN batched gate pair grid")?,
+            1,
+            1,
+        ],
         [64, 1, 1],
         0,
         args.as_mut_slice(),
@@ -1897,8 +1901,8 @@ pub fn indexed_attention_decode_prologue(
     }
     let kv_width = checked_product(p.kv_heads, p.head_dim, "QSA prologue KV width")?;
     let end = checked_add(p.position, p.rows, "QSA prologue position")?;
-    let index_width = checked_product(p.index_heads, p.index_dim, "QSA prologue index")?
-        + p.index_kv_width;
+    let index_width =
+        checked_product(p.index_heads, p.index_dim, "QSA prologue index")? + p.index_kv_width;
     let bad = [p.index_q_norm, p.q_norm, p.k_norm]
         .iter()
         .any(|n| n.dtype != DType::BF16)

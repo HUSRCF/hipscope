@@ -934,7 +934,12 @@ impl ExpertTable {
         }
         fn layout(record: &ExpertMetadata) -> [Layout<'_>; 4] {
             let r = record.resources();
-            [key(r.gate_up()), key(r.gate()), key(r.up()), key(Some(r.down()))]
+            [
+                key(r.gate_up()),
+                key(r.gate()),
+                key(r.up()),
+                key(Some(r.down())),
+            ]
         }
         let uniform_layout = experts
             .first()
@@ -1143,7 +1148,10 @@ fn live_entry_ptrs(
     experts: &[(LiveWeightIdentity, LiveWeightIdentity)],
 ) -> (Box<[usize]>, Box<[usize]>) {
     (
-        experts.iter().map(|(gate_up, _)| gate_up.buffer.ptr).collect(),
+        experts
+            .iter()
+            .map(|(gate_up, _)| gate_up.buffer.ptr)
+            .collect(),
         experts.iter().map(|(_, down)| down.buffer.ptr).collect(),
     )
 }
