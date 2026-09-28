@@ -99,6 +99,22 @@ pub(crate) fn dispatch_gemv(
     m: usize,
     k: usize,
 ) -> hip_bridge::HipResult<()> {
+    dispatch_gemv_rows(gpu, weight, input, rotation, output, m, k, 1)
+}
+
+/// [`dispatch_gemv`] over `rows` row-major input rows (`[rows, k]` in,
+/// `[rows, m]` out); each row is bitwise its single-row projection.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn dispatch_gemv_rows(
+    gpu: &mut Gpu,
+    weight: &GpuTensor,
+    input: &GpuTensor,
+    rotation: &GpuTensor,
+    output: &GpuTensor,
+    m: usize,
+    k: usize,
+    rows: usize,
+) -> hip_bridge::HipResult<()> {
     match weight.dtype {
         DType::MQ4G256V2
         | DType::MQ4G128V2
@@ -128,7 +144,14 @@ pub(crate) fn dispatch_gemv(
         rotation: None,
         awq_scale: None,
     };
-    hipfire_dispatch::pipeline::project_weight(gpu, &reference, input, output, 1, Some(rotation))
+    hipfire_dispatch::pipeline::project_weight(
+        gpu,
+        &reference,
+        input,
+        output,
+        rows,
+        Some(rotation),
+    )
         .map_err(|error| hip_bridge::HipError::new(0, &error.to_string()))
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

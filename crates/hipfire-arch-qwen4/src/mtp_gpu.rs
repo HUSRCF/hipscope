@@ -13,7 +13,7 @@ use crate::config::Qwen4Config;
 use crate::gpu_forward::{
     execute_moe, Qwen4GpuForwardError, Qwen4MoeLayerRuntime, Qwen4MoeScratch,
 };
-use crate::projection::{dispatch_embedding, dispatch_gemv};
+use crate::projection::{dispatch_embedding, dispatch_gemv, dispatch_gemv_rows};
 use crate::weights::{HyperConnectionWeights, Qwen4Weights, TensorRef, WeightError};
 use hipfire_runtime::spec::SpecGrammar;
 use rdna_compute::tensor_ops::{
@@ -1375,12 +1375,18 @@ impl Qwen4MtpGpu {
             },
         )?;
         let fc_hidden = weights.resident(&weights.mtp.fc_hidden)?;
+        // Both branch rows in one projection (each bitwise its own).
+        dispatch_gemv_rows(
+            gpu,
+            fc_hidden,
+            &scratch.hidden_norm,
+            &scratch.rotation,
+            &scratch.projected_hidden,
+            config.hidden_size,
+            config.hidden_size,
+            MTP_BRANCHES,
+        )?;
         for branch in 0..MTP_BRANCHES {
-            let hidden_row = f32_view(
-                &scratch.hidden_norm,
-                branch * config.hidden_size,
-                config.hidden_size,
-            );
             let projected_row = f32_view(
                 &scratch.projected_hidden,
                 branch * config.hidden_size,
@@ -1391,15 +1397,6 @@ impl Qwen4MtpGpu {
                 branch * config.hidden_size,
                 config.hidden_size,
             );
-            dispatch_gemv(
-                gpu,
-                fc_hidden,
-                &hidden_row,
-                &scratch.rotation,
-                &projected_row,
-                config.hidden_size,
-                config.hidden_size,
-            )?;
             gpu.add_f32(&projected_row, &scratch.projected_embedding, &wide_row)?;
         }
 
