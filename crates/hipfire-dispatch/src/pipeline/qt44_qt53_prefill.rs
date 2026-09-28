@@ -194,17 +194,9 @@ pub(crate) fn shared_gate_up(gpu: &mut Gpu, p: &MoePrefillParams<'_>) -> Result<
         )?;
         batch_projection(gpu, &shared.weights.up, x_gate, shared.up_out, p.batch_size)?;
     }
-    if p.recipe.bf16_round_trip() {
-        // gate/up are round-tripped where the activation reads them (their
-        // only reader), in the same pass. The live rows only: both buffers
-        // are sized for the chunk cap.
-        hip(gpu.bf16_round_trip_f32(&f32_view(
-            p.prelude.router_logits,
-            0,
-            p.batch_size * p.n_exp,
-        )))?;
-        hip(gpu.bf16_round_trip_f32(&f32_view(shared.scalar, 0, p.batch_size)))?;
-    }
+    // BF16 recipe: every reader rounds what it reads (the top-10 router its
+    // logits, the shared activation its selector, gate and up), so no
+    // separate round trip is owed here.
     Ok(())
 }
 
@@ -219,19 +211,6 @@ pub(crate) fn shared_activation(
         .shared
         .as_ref()
         .ok_or_else(|| DispatchError::Hip("grouped prefill shared weights missing".into()))?;
-    let scalar = f32_view(shared.scalar, 0, p.batch_size);
-    if p.recipe.bf16_round_trip() {
-        #[cfg(feature = "deltanet")]
-        hip(gpu.sigmoid_f32(&scalar))?;
-        #[cfg(not(feature = "deltanet"))]
-        return Err(DispatchError::UnsupportedVariant {
-            family: "moe",
-            variant: "grouped-shared-sigmoid-requires-deltanet",
-            arch: "",
-            quant: "",
-        });
-        hip(gpu.bf16_round_trip_f32(&scalar))?;
-    }
     // The live rows only: the shared buffers are sized for the chunk cap.
     let live = p.batch_size * shared.intermediate;
     let (gate, up, rotated) = (
@@ -240,7 +219,15 @@ pub(crate) fn shared_activation(
         f32_view(shared.rotated, 0, live),
     );
     if p.recipe.bf16_round_trip() {
-        hip(gpu.silu_mul_bf16_rt_f32(&gate, &up, &rotated))?;
+        // The selector's round trip and sigmoid ride in the same launch; the
+        // shared down's scaled add rounds the selector again on read.
+        hip(gpu.shared_expert_activation_bf16_f32(
+            &gate,
+            &up,
+            &rotated,
+            shared.scalar,
+            p.batch_size,
+        ))?;
     } else {
         hip(gpu.silu_mul_f32(&gate, &up, &rotated))?;
     }
@@ -554,10 +541,7 @@ pub(crate) fn down(
             p.batch_size,
             p.n_exp,
         ))?;
-        let expanded = f32_view(p.down_expanded, 0, total_slots * p.down_m);
-        if p.recipe.bf16_round_trip() {
-            hip(gpu.bf16_round_trip_f32(&expanded))?;
-        }
+        // The combine rounds every expert output it reads to BF16 itself.
     }
     Ok(())
 }

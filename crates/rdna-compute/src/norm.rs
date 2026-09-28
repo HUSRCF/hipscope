@@ -640,20 +640,23 @@ impl Gpu {
         result
     }
 
-    /// [`Gpu::silu_mul_bf16_rt_f32`] of the shared expert's gate/up plus the
-    /// selector gate `selector[0] = sigmoid(bf16_round_trip(selector[0]))`, in
-    /// one launch (bitwise the round trip / sigmoid / silu_mul launches).
+    /// [`Gpu::silu_mul_bf16_rt_f32`] of the shared expert's gate/up plus, for
+    /// each of the first `selectors` tokens, the selector gate
+    /// `selector[t] = sigmoid(bf16_round_trip(selector[t]))`, in one launch
+    /// (bitwise the round trip / sigmoid / silu_mul launches).
     pub fn shared_expert_activation_bf16_f32(
         &mut self,
         gate: &GpuTensor,
         up: &GpuTensor,
         out: &GpuTensor,
         selector: &GpuTensor,
+        selectors: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
         const KERNEL: &str = "shared_expert_activation_bf16_f32";
         self.ensure_kernel("silu_mul", kernels::SILU_MUL_SRC, KERNEL)?;
         let n = gate.numel() as i32;
+        let selectors = selectors as i32;
         let gate_ptr = gate.buf.as_ptr();
         let up_ptr = up.buf.as_ptr();
         let out_ptr = out.buf.as_ptr();
@@ -664,9 +667,10 @@ impl Gpu {
             &out_ptr as *const _ as *mut c_void,
             &selector_ptr as *const _ as *mut c_void,
             &n as *const _ as *mut c_void,
+            &selectors as *const _ as *mut c_void,
         ];
         let block = 256u32;
-        let grid = (n as u32).max(1).div_ceil(block);
+        let grid = (n.max(selectors) as u32).max(1).div_ceil(block);
         self.launch_maybe_blob(KERNEL, [grid, 1, 1], [block, 1, 1], 0, &mut params, || {
             let mut b = hip_bridge::KernargBlob::new();
             b.push_ptr(gate_ptr);
@@ -674,6 +678,7 @@ impl Gpu {
             b.push_ptr(out_ptr);
             b.push_ptr(selector_ptr);
             b.push_i32(n);
+            b.push_i32(selectors);
             b
         })
     }

@@ -2082,18 +2082,20 @@ pub(super) fn produce_prefill_route<'a>(
                     "prefill softmax producer requires a 2-D [batch,n_experts] score view",
                 ));
             }
-            if params.recipe.bf16_round_trip() {
+            let grouped = matches!(route, Some(MoeRouteCapability::Qt44Qt53Grouped));
+            // The grouped top-10 router rounds each logit it reads itself.
+            if params.recipe.bf16_round_trip() && !grouped {
                 gpu.bf16_round_trip_f32(scores)
                     .map_err(|e| DispatchError::Hip(e.to_string()))?;
             }
-            if matches!(route, Some(MoeRouteCapability::Qt44Qt53Grouped)) {
+            if grouped {
                 gpu.moe_router_softmax_top10_f32(
                     scores,
                     params.topk_indices,
                     params.topk_weights,
                     params.batch_size,
                     normalize,
-                    false,
+                    params.recipe.bf16_round_trip(),
                 )
                 .map_err(|e| DispatchError::Hip(e.to_string()))?;
             } else {

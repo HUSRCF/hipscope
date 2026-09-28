@@ -3200,6 +3200,7 @@ fn decode_shared_down_stage(
                     shared_up,
                     &shared_hid,
                     &scalar_live,
+                    1,
                 ))?;
             } else {
                 hip!(gpu.sigmoid_f32(&scalar_live))?;
