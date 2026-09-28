@@ -2122,7 +2122,8 @@ pub(super) fn produce_prefill_route<'a>(
                 };
                 result.map_err(|e| DispatchError::Hip(e.to_string()))?;
             }
-            if params.recipe.bf16_round_trip() {
+            // The grouped router already stores its weights BF16-rounded.
+            if params.recipe.bf16_round_trip() && !grouped {
                 gpu.bf16_round_trip_f32(params.topk_weights)
                     .map_err(|e| DispatchError::Hip(e.to_string()))?;
             }

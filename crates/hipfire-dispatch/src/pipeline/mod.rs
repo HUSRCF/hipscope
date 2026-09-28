@@ -3147,11 +3147,8 @@ fn decode_route_gpu_stage(
                 p.norm_topk_prob
             ))?;
         }
-        // The grouped route's top-10 combine rounds each weight to BF16 as it
-        // reads it (a deferred combine may read them elsewhere).
-        let combine_rounds =
-            route == Some(MoeRouteCapability::Qt44Qt53Grouped) && !p.defer_routed_combine;
-        if p.recipe.bf16_round_trip() && !combine_rounds {
+        // The grouped top-10 router stores its weights BF16-rounded itself.
+        if p.recipe.bf16_round_trip() && route != Some(MoeRouteCapability::Qt44Qt53Grouped) {
             // Only the selected slots are live; scratch may be prefill-sized.
             hip!(gpu.bf16_round_trip_f32(&slice_moe_f32_view(p.topk_weights, 0, p.k)))?;
         }

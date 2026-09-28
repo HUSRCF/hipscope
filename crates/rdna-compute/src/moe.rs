@@ -1784,8 +1784,9 @@ impl Gpu {
         )
     }
     /// Qwen4's fixed 512-way/top-10 GPU router.  The incumbent k=8 routers
-    /// remain separate symbols and launchers.  `round_logits` reads the logits
-    /// through [`Gpu::bf16_round_trip_f32`]'s rounding (the buffer is unchanged).
+    /// remain separate symbols and launchers.  `round_logits` (the BF16 recipe)
+    /// reads the logits through [`Gpu::bf16_round_trip_f32`]'s rounding (the
+    /// buffer is unchanged) and stores the weights through it too.
     pub fn moe_router_softmax_top10_f32(
         &mut self,
         logits: &GpuTensor,
