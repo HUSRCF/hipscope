@@ -263,6 +263,118 @@ enum FfnGateOutput {
     A8H,
 }
 
+fn packed_mq4_down_admitted(
+    packed_admitted: bool,
+    separate: bool,
+    residual: bool,
+    down: (DType, usize, usize),
+    hidden_dim: usize,
+) -> bool {
+    packed_admitted && separate && residual
+        && matches!(down.0, DType::MQ4G256 | DType::MQ4G256V2)
+        && (down.1, down.2) == (5120, 17408)
+        && hidden_dim == down.2
+}
+
+/// Only consume separate F32 gate/up planes; never reinterpret a prepared H
+/// plane or add a residual to a tensor-parallel partial output.
+fn try_packed_mq4_down(
+    gpu: &mut Gpu,
+    down: &WeightTensor,
+    pbs: &PrefillBatchScratch,
+    hidden_dim: usize,
+    n: usize,
+    epilogue: &BatchEpilogue<'_>,
+    h_source: FfnGateOutput,
+) -> HipResult<bool> {
+    if !packed_mq4_down_admitted(
+        gpu.packed_mq4_admitted(down.m, down.k, n),
+        h_source == FfnGateOutput::Separate,
+        matches!(epilogue, BatchEpilogue::Residual),
+        (down.gpu_dtype, down.m, down.k), hidden_dim,
+    ) {
+        return Ok(false);
+    }
+    gpu.flush_residual_fold()?;
+    fused_silu_mul_rotate_mq_batched_for(
+        gpu, down, &pbs.gate_ffn_batch, &pbs.up_batch,
+        &pbs.ffn_hidden_batch, hidden_dim, n,
+    )?;
+    if down.gpu_dtype == DType::MQ4G256V2 {
+        gpu.gemm_mq4v2_packed(&down.buf, &pbs.ffn_hidden_batch, &pbs.x_batch,
+            down.m, down.k, n, true)?;
+    } else {
+        gpu.gemm_mq4_packed(&down.buf, &pbs.ffn_hidden_batch, &pbs.x_batch,
+            down.m, down.k, n, true)?;
+    }
+    Ok(true)
+}
+
+/// Uniform MQ4 or MQ4V2 only; the explicit packed opt-in leaves all native
+/// routes unchanged when disabled. Lloyd and mixed wire formats are excluded.
+fn packed_mq4_ffn_gate_up_admitted(
+    packed_admitted: bool,
+    gate: (DType, usize, usize),
+    up: (DType, usize, usize),
+    n: usize,
+) -> bool {
+    packed_admitted
+        && matches!(gate.0, DType::MQ4G256 | DType::MQ4G256V2)
+        && (gate.1, gate.2) == (17_408, 5_120)
+        && up == gate
+        && n > 0
+        && n % 256 == 0
+}
+
+/// Runs before native prepared producers: explicitly emit AWQ-aware rotated
+/// F32 input, never reuse a potentially unwritten F32 plane from an A8/IU4/FP8
+/// producer. Output remains separate F32 planes with no residual epilogue.
+fn try_packed_mq4_ffn_gate_up(
+    gpu: &mut Gpu,
+    gate: &WeightTensor,
+    up: &WeightTensor,
+    norm: &GpuTensor,
+    config: &Qwen35Config,
+    pbs: &PrefillBatchScratch,
+    n: usize,
+) -> HipResult<bool> {
+    if !packed_mq4_ffn_gate_up_admitted(
+        gpu.packed_mq4_admitted(gate.m, gate.k, n),
+        (gate.gpu_dtype, gate.m, gate.k),
+        (up.gpu_dtype, up.m, up.k),
+        n,
+    ) {
+        return Ok(false);
+    }
+    gpu.flush_residual_fold()?;
+    let separate_awq_inputs = gate.awq_scale.is_some() || up.awq_scale.is_some();
+    for (index, (weight, output)) in [
+        (gate, &pbs.gate_ffn_batch),
+        (up, &pbs.up_batch),
+    ].into_iter().enumerate() {
+        // Sidecars are per-weight and may differ (or exist on only one side).
+        // Reuse the rotated input only when neither projection carries AWQ.
+        if index == 0 || separate_awq_inputs {
+            fused_rmsnorm_rotate_mq_batched_for(
+                gpu, &pbs.x_batch, norm, weight, &pbs.x_rot_batch,
+                weight.k, config.norm_eps, n,
+            )?;
+        }
+        if weight.gpu_dtype == DType::MQ4G256V2 {
+            gpu.gemm_mq4v2_packed(
+                &weight.buf, &pbs.x_rot_batch, output,
+                weight.m, weight.k, n, false,
+            )?;
+        } else {
+            gpu.gemm_mq4_packed(
+                &weight.buf, &pbs.x_rot_batch, output,
+                weight.m, weight.k, n, false,
+            )?;
+        }
+    }
+    Ok(true)
+}
+
 /// F1-lite: true when this FFN may fold SwiGLU into the gate/up GEMM, i.e.
 /// the down projection would take the AWQ IU4 SwiGLU producer
 /// ([`try_iu4_silu_prepared`] with an AWQ scale: uniform MQ4G256V2, `Residual`
@@ -7794,6 +7906,11 @@ fn batch_chunk_delta_net_ffn_gate_up(
     f1lite: bool,
 ) -> HipResult<FfnGateOutput> {
     let _ = fusion;
+    if try_packed_mq4_ffn_gate_up(
+        gpu, &layer.w_gate, &layer.w_up, &layer.ffn_norm, config, pbs, n,
+    )? {
+        return Ok(FfnGateOutput::Separate);
+    }
     // S3-f16-projection-inputs fast path: exact-FP16 FFN gate/up inputs.
     // gate/up share the pre-rotation input, so both must be MQ4G256V2.
     if mq_f16_projection_fast_route(gpu, fusion, n, dim)
@@ -8205,6 +8322,9 @@ fn batch_chunk_delta_net_ffn_down(
     fusion: DflashFusionCtx,
     h_source: FfnGateOutput,
 ) -> HipResult<()> {
+    if try_packed_mq4_down(gpu, &layer.w_down, pbs, hidden_dim, n, &epilogue, h_source)? {
+        return Ok(());
+    }
     // S4: one silu*up+FWHT+F16 producer + direct-F16 residual GEMM instead
     // of fused_silu_mul_rotate_mq_batched + convert.
     if h_source == FfnGateOutput::Separate && s4_residual_fast(gpu, fusion, layer.w_down.gpu_dtype, &epilogue, n) {
@@ -9886,6 +10006,11 @@ fn batch_chunk_full_attn_ffn_gate_up(
     f1lite: bool,
 ) -> HipResult<FfnGateOutput> {
     let _ = fusion;
+    if try_packed_mq4_ffn_gate_up(
+        gpu, &layer.w_gate, &layer.w_up, &layer.ffn_norm, config, pbs, n,
+    )? {
+        return Ok(FfnGateOutput::Separate);
+    }
     // S3-f16-projection-inputs fast path: exact-FP16 FA-FFN gate/up inputs.
     if mq_f16_projection_fast_route(gpu, fusion, n, dim)
         && layer.w_gate.gpu_dtype == DType::MQ4G256V2
@@ -10292,6 +10417,9 @@ fn batch_chunk_full_attn_ffn_down(
     fusion: DflashFusionCtx,
     h_source: FfnGateOutput,
 ) -> HipResult<()> {
+    if try_packed_mq4_down(gpu, &layer.w_down, pbs, hidden_dim, n, &epilogue, h_source)? {
+        return Ok(());
+    }
     // S4: one silu*up+FWHT+F16 producer + direct-F16 residual GEMM instead
     // of fused_silu_mul_rotate_mq_batched + convert.
     if h_source == FfnGateOutput::Separate && s4_residual_fast(gpu, fusion, layer.w_down.gpu_dtype, &epilogue, n) {
@@ -14099,6 +14227,52 @@ mod tests {
     use super::*;
     use hipfire_dispatch::context::DispatchWorkload;
     use rdna_compute::DType;
+
+    #[test]
+    fn packed_mq4_ffn_gate_up_route_is_exact_and_opt_in() {
+        let shape = (DType::MQ4G256, 17_408, 5_120);
+        let v2 = (DType::MQ4G256V2, 17_408, 5_120);
+        for n in [256, 512, 768] {
+            assert!(packed_mq4_ffn_gate_up_admitted(true, shape, shape, n));
+            assert!(packed_mq4_ffn_gate_up_admitted(true, v2, v2, n));
+            assert!(!packed_mq4_ffn_gate_up_admitted(false, shape, shape, n));
+            assert!(!packed_mq4_ffn_gate_up_admitted(false, v2, v2, n));
+            assert!(!packed_mq4_ffn_gate_up_admitted(true, shape, v2, n));
+            assert!(!packed_mq4_ffn_gate_up_admitted(true, v2, shape, n));
+        }
+        for n in [0, 1, 128, 255, 257] {
+            assert!(!packed_mq4_ffn_gate_up_admitted(true, shape, shape, n));
+            assert!(!packed_mq4_ffn_gate_up_admitted(true, v2, v2, n));
+        }
+        for rejected in [
+            (DType::MQ4G256V2Lloyd, 17_408, 5_120),
+            (DType::MQ4G256Lloyd, 17_408, 5_120),
+            (DType::HFQ4G256, 17_408, 5_120),
+            (DType::Q8_0, 17_408, 5_120),
+            (DType::MQ4G256, 8_704, 5_120),
+            (DType::MQ4G256, 17_408, 2_560),
+        ] {
+            assert!(!packed_mq4_ffn_gate_up_admitted(true, rejected, shape, 256));
+            assert!(!packed_mq4_ffn_gate_up_admitted(true, shape, rejected, 256));
+            assert!(!packed_mq4_ffn_gate_up_admitted(true, rejected, rejected, 256));
+        }
+    }
+
+    #[test]
+    fn packed_mq4_down_refuses_prepared_partial_and_nonuniform_inputs() {
+        for dtype in [DType::MQ4G256, DType::MQ4G256V2] {
+            let shape = (dtype, 5120, 17408);
+            assert!(packed_mq4_down_admitted(true, true, true, shape, 17408));
+            assert!(!packed_mq4_down_admitted(false, true, true, shape, 17408));
+            assert!(!packed_mq4_down_admitted(true, false, true, shape, 17408));
+            assert!(!packed_mq4_down_admitted(true, true, false, shape, 17408));
+            assert!(!packed_mq4_down_admitted(true, true, true, shape, 8704));
+            assert!(!packed_mq4_down_admitted(true, true, true, (dtype, 2560, 17408), 17408));
+        }
+        for dtype in [DType::MQ4G256V2Lloyd, DType::MQ4G256Lloyd, DType::HFQ4G256, DType::Q8_0] {
+            assert!(!packed_mq4_down_admitted(true, true, true, (dtype, 5120, 17408), 17408));
+        }
+    }
 
     #[test]
     fn q8_multirow_attn_admits_only_measured_arch_shapes() {
