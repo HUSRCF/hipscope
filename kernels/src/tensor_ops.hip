@@ -1735,12 +1735,13 @@ extern "C" __global__ void indexed_attention_norm_rope_f32_batched(
     if ((int)threadIdx.x < head_dim) values[start + threadIdx.x] = value;
 }
 
-// Single-row decode QSA prologue in one launch (block 256, one block per
-// head): the index-query, query and key RMSNorm + RoPE (the three
+// QSA prologue of `rows` consecutive rows in one launch (block 256, one block
+// per head and row): the index-query, query and key RMSNorm + RoPE (the three
 // indexed_attention_norm_rope_f32_batched launches), the key/value cache
-// append at `position`, and the index key's BF16 round trip and raw-key copy
-// (bf16_round_trip_f32_strided + copy_rows_strided_f32). Same per-element
-// operations. Grid [index_heads + heads + kv_heads + 1].
+// append at `position + row`, and the index key's BF16 round trip and raw-key
+// copy (bf16_round_trip_f32_strided + copy_rows_strided_f32). Same
+// per-element operations. Grid [index_heads + heads + kv_heads + 1, rows];
+// row r's inputs sit at r times each buffer's row width.
 extern "C" __global__ __launch_bounds__(256) void indexed_attention_decode_prologue_f32(
     float* index_row,
     float* qgate,
@@ -1758,10 +1759,18 @@ extern "C" __global__ __launch_bounds__(256) void indexed_attention_decode_prolo
     int heads,
     int kv_heads,
     int head_dim,
-    int position) {
+    int position_start) {
     __shared__ float input_row[256];
     __shared__ float row_sum;
     const int c = (int)threadIdx.x;
+    const int r = (int)blockIdx.y;
+    const int position = position_start + r;
+    const int index_q_width = index_heads * index_dim;
+    const int kv_width = kv_heads * head_dim;
+    index_row += r * (index_q_width + index_kv_width);
+    qgate += r * 2 * heads * head_dim;
+    keys += r * kv_width;
+    values += r * kv_width;
     int block = (int)blockIdx.x;
     if (block < index_heads) {
         float* row = index_row + block * index_dim;
@@ -1779,7 +1788,6 @@ extern "C" __global__ __launch_bounds__(256) void indexed_attention_decode_prolo
         return;
     }
     block -= heads;
-    const int kv_width = kv_heads * head_dim;
     if (block < kv_heads) {
         float* row = keys + block * head_dim;
         const float value = qsa_norm_rope_head(row, k_norm, head_dim, position,
@@ -1792,7 +1800,6 @@ extern "C" __global__ __launch_bounds__(256) void indexed_attention_decode_prolo
         }
         return;
     }
-    const int index_q_width = index_heads * index_dim;
     for (int i = c; i < index_kv_width; i += 256) {
         float v = index_row[index_q_width + i];
         if (isfinite(v)) {

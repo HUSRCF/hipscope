@@ -1722,9 +1722,9 @@ pub fn execute_indexed_attention(
         ],
     )?;
 
-    if op.rows == 1 && op.index_dim <= 256 && op.head_dim <= 256 {
-        // Decode: the norms, RoPE, cache append and index-key round trip and
-        // copy below, in one launch.
+    if op.rows <= 8 && op.index_dim <= 256 && op.head_dim <= 256 {
+        // Decode / few-row verify: the norms, RoPE, cache append and
+        // index-key round trip and copy below, in one launch.
         hip(indexed_attention_decode_prologue(
             gpu,
             &IndexedAttentionDecodePrologue {
@@ -1745,6 +1745,7 @@ pub fn execute_indexed_attention(
                 kv_heads: op.kv_heads,
                 head_dim: op.head_dim,
                 position: initial_position,
+                rows: op.rows,
             },
         ))?;
     } else {

@@ -1853,9 +1853,10 @@ pub struct IndexedAttentionNormRopeBatch<'a> {
     pub rotary_dim: usize,
 }
 
-/// Single-row decode QSA prologue: the index-query, query and key norm+RoPE,
-/// the key/value cache append and the index key's BF16 round trip + raw-key
-/// copy, in one launch (bitwise the six launches it replaces).
+/// QSA prologue of `rows` consecutive rows (decode: one): the index-query,
+/// query and key norm+RoPE, the key/value cache append and the index key's
+/// BF16 round trip + raw-key copy, in one launch (bitwise the six launches it
+/// replaces). Row buffers are row-major at their natural row widths.
 pub struct IndexedAttentionDecodePrologue<'a> {
     /// `[index q (index_heads * index_dim) | index k (index_kv_width)]`.
     pub index_row: &'a GpuTensor,
@@ -1876,6 +1877,7 @@ pub struct IndexedAttentionDecodePrologue<'a> {
     pub kv_heads: usize,
     pub head_dim: usize,
     pub position: usize,
+    pub rows: usize,
 }
 
 pub fn indexed_attention_decode_prologue(
@@ -1894,10 +1896,13 @@ pub fn indexed_attention_decode_prologue(
         ensure_f32(tensor)?;
     }
     let kv_width = checked_product(p.kv_heads, p.head_dim, "QSA prologue KV width")?;
-    let end = checked_add(p.position, 1, "QSA prologue position")?;
+    let end = checked_add(p.position, p.rows, "QSA prologue position")?;
+    let index_width = checked_product(p.index_heads, p.index_dim, "QSA prologue index")?
+        + p.index_kv_width;
     let bad = [p.index_q_norm, p.q_norm, p.k_norm]
         .iter()
         .any(|n| n.dtype != DType::BF16)
+        || p.rows == 0
         || p.index_heads == 0
         || p.heads == 0
         || p.kv_heads == 0
@@ -1908,11 +1913,11 @@ pub fn indexed_attention_decode_prologue(
         || p.index_q_norm.numel() != p.index_dim
         || p.q_norm.numel() != p.head_dim
         || p.k_norm.numel() != p.head_dim
-        || p.index_row.numel()
-            < checked_product(p.index_heads, p.index_dim, "QSA prologue index")? + p.index_kv_width
-        || p.qgate.numel() < checked_product(2 * p.heads, p.head_dim, "QSA prologue query")?
-        || p.keys.numel() < kv_width
-        || p.values.numel() < kv_width
+        || p.index_row.numel() < checked_product(p.rows, index_width, "QSA prologue index")?
+        || p.qgate.numel()
+            < checked_product3(p.rows, 2 * p.heads, p.head_dim, "QSA prologue query")?
+        || p.keys.numel() < checked_product(p.rows, kv_width, "QSA prologue keys")?
+        || p.values.numel() < checked_product(p.rows, kv_width, "QSA prologue values")?
         || p.full_keys.numel() < checked_product(end, kv_width, "QSA prologue cache")?
         || p.full_values.numel() < checked_product(end, kv_width, "QSA prologue cache")?
         || p.raw_index_keys.numel()
@@ -1965,7 +1970,7 @@ pub fn indexed_attention_decode_prologue(
     }];
     gpu.launch_blob_recorded(
         "indexed_attention_decode_prologue_f32",
-        [blocks_x, 1, 1],
+        [blocks_x, checked_u32(p.rows, "QSA prologue rows")?, 1],
         [256, 1, 1],
         0,
         args.as_mut_slice(),
