@@ -247,6 +247,15 @@ extern "C" __global__ void gated_delta_step_shared_norm128_gfx1151(
                                       key_dim, value_dim, query_scale, &out))
         output[blockIdx.x * 128 + (blockIdx.y * blockDim.x + threadIdx.x)] = out;
 }
+// Workgroup barrier ordering LDS only: every handoff in the persistent GDN
+// step is through LDS, and a full __syncthreads would also wait at each
+// barrier for the row's global stores (outputs, captured states) to land.
+__device__ __forceinline__ void gdn_lds_barrier() {
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
+    __builtin_amdgcn_s_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
+}
+
 // Wave-size-independent persistent row-batched path for exact 128x128 geometry.
 // A block owns one value head and 256 threads.  tid%128 is the output channel
 // and tid/128 selects the half; each thread retains 64 state values in
@@ -325,7 +334,7 @@ __device__ __forceinline__ void gated_delta_step_persistent256_body(
 
     for (int block = 0; block < rows; block += 256) {
         const int block_rows = min(256, rows - block);
-        __syncthreads();
+        gdn_lds_barrier();
         if (thread < block_rows) {
             const int row = block + thread;
             const int row_base = row * qkv_width;
@@ -361,7 +370,7 @@ __device__ __forceinline__ void gated_delta_step_persistent256_body(
             decay_rows[thread] = expf(gate[row * value_heads + value_head]);
             beta_rows[thread] = beta[row * value_heads + value_head];
         }
-        __syncthreads();
+        gdn_lds_barrier();
 
         for (int r = 0; r < block_rows; ++r) {
             const int row = block + r;
@@ -387,7 +396,7 @@ __device__ __forceinline__ void gated_delta_step_persistent256_body(
                     k_norm[buf][value_index] = bf16_round(
                         bf16_to_f32(bf16_round(cur_b)) * bf16_to_f32(k_inv_rows[r]));
                 }
-                __syncthreads();
+                gdn_lds_barrier();
             }
 
             const float decay = decay_rows[r];
@@ -407,7 +416,7 @@ __device__ __forceinline__ void gated_delta_step_persistent256_body(
             if (half == 0) {
                 handoff_kv[value_index] = kv_mem;
             }
-            __syncthreads();
+            gdn_lds_barrier();
 
             if (half == 1) {
                 kv_mem = handoff_kv[value_index];
@@ -421,7 +430,7 @@ __device__ __forceinline__ void gated_delta_step_persistent256_body(
                     (bf16_to_f32(v_value) - kv_mem) * beta_value;
                 handoff_delta[value_index] = delta;
             }
-            __syncthreads();
+            gdn_lds_barrier();
 
             const float delta = handoff_delta[value_index];
             #pragma unroll
@@ -446,7 +455,7 @@ __device__ __forceinline__ void gated_delta_step_persistent256_body(
                         bf16_to_f32(bf16_round(raw_b)) * bf16_to_f32(k_inv_rows[r + 1]));
                 }
             }
-            __syncthreads();
+            gdn_lds_barrier();
 
             if (half == 1) {
                 out = handoff_out[value_index];
