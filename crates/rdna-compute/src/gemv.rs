@@ -14975,6 +14975,66 @@ impl Gpu {
             blob_builder,
         )
     }
+    /// [`Gpu::gemm_mq6g256v2_f32_rows`] of up to four MQ6G256V2 matrices
+    /// reading the same rotated `[rows, k]` x in one launch (blocks routed as
+    /// [`Gpu::gemv_mq6g256v2_x4`]); each output bitwise the one-matrix call.
+    pub fn gemm_mq6g256v2_f32_rows_x4(
+        &mut self,
+        parts: [(&GpuTensor, &GpuTensor, usize); 4],
+        x: &GpuTensor,
+        k: usize,
+        rows: usize,
+    ) -> HipResult<()> {
+        const FUNCS: [&str; 7] = [
+            "gemm_mq6g256v2_f32_rows_x4_r2",
+            "gemm_mq6g256v2_f32_rows_x4_r3",
+            "gemm_mq6g256v2_f32_rows_x4_r4",
+            "gemm_mq6g256v2_f32_rows_x4_r5",
+            "gemm_mq6g256v2_f32_rows_x4_r6",
+            "gemm_mq6g256v2_f32_rows_x4_r7",
+            "gemm_mq6g256v2_f32_rows_x4_r8",
+        ];
+        if !(2..=8).contains(&rows) || k == 0 || !k.is_multiple_of(256) {
+            return Err(hip_bridge::HipError::new(1, "MQ6 F32 rows x4 needs 2..=8 rows, K % 256 == 0"));
+        }
+        let func = FUNCS[rows - 2];
+        self.bind_thread()?;
+        self.ensure_kernel("gemm_mq6g256v2_f32_rows", kernels::GEMM_MQ6G256V2_F32_ROWS_SRC, func)?;
+        let a = parts.map(|(w, _, _)| w.buf.as_ptr());
+        let y = parts.map(|(_, y, _)| y.buf.as_ptr());
+        let m = parts.map(|(_, _, m)| m as i32);
+        let x_ptr = x.buf.as_ptr();
+        let k_val = k as i32;
+        let blocks: usize = parts.iter().map(|(_, _, m)| m).sum();
+        let mut params: Vec<*mut c_void> = Vec::with_capacity(13);
+        for p in &a {
+            params.push(p as *const _ as *mut c_void);
+        }
+        params.push(&x_ptr as *const _ as *mut c_void);
+        for p in &y {
+            params.push(p as *const _ as *mut c_void);
+        }
+        for v in &m {
+            params.push(v as *const _ as *mut c_void);
+        }
+        params.push(&k_val as *const _ as *mut c_void);
+        self.launch_maybe_blob(func, [blocks as u32, 1, 1], [32, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            for p in a {
+                b.push_ptr(p);
+            }
+            b.push_ptr(x_ptr);
+            for p in y {
+                b.push_ptr(p);
+            }
+            for v in m {
+                b.push_i32(v);
+            }
+            b.push_i32(k_val);
+            b
+        })
+    }
+
     /// [`Gpu::gemv_bf16_xf32_x4`] over `rows` (2..=8) activation rows: x is
     /// `[rows, k]`, each output `[rows, m]`; every weight row is read once
     /// and each output element is bitwise the one-row kernel's.

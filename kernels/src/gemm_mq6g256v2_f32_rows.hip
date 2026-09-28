@@ -44,12 +44,10 @@ __device__ __forceinline__ void mq6g256v2_f32_rows_group(
 }
 
 template<int R>
-__device__ __forceinline__ void mq6g256v2_f32_rows_body(
+__device__ __forceinline__ void mq6g256v2_f32_rows_row(
     const char* __restrict__ A, const float* __restrict__ x,
-    float* __restrict__ y, int M, int K
+    float* __restrict__ y, int M, int K, int row
 ) {
-    const int row = blockIdx.x;
-    if (row >= M) return;
     const int tid = threadIdx.x;
     const int groups_per_row = K / 256;
     const char* row_ptr = A + (long long)row * groups_per_row * 200;
@@ -89,6 +87,16 @@ __device__ __forceinline__ void mq6g256v2_f32_rows_body(
     }
 }
 
+template<int R>
+__device__ __forceinline__ void mq6g256v2_f32_rows_body(
+    const char* __restrict__ A, const float* __restrict__ x,
+    float* __restrict__ y, int M, int K
+) {
+    const int row = blockIdx.x;
+    if (row >= M) return;
+    mq6g256v2_f32_rows_row<R>(A, x, y, M, K, row);
+}
+
 __launch_bounds__(32, 16)
 extern "C" __global__ void gemm_mq6g256v2_f32_rows_r2(
     const char* A, const float* x, float* y, int M, int K
@@ -123,3 +131,33 @@ __launch_bounds__(32, 4)
 extern "C" __global__ void gemm_mq6g256v2_f32_rows_r8(
     const char* A, const float* x, float* y, int M, int K
 ) { mq6g256v2_f32_rows_body<8>(A, x, y, M, K); }
+
+// Four MQ6G256V2 matrices reading the same R rotated x rows (same K) in one
+// launch, blocks routed as gemv_mq6g256v2_x4 routes them; each output row is
+// the one-matrix rows kernel's (bitwise). Unused matrices have M = 0.
+#define MQ6_ROWS_X4(R, OCC)                                                          \
+    __launch_bounds__(32, OCC) extern "C" __global__ void gemm_mq6g256v2_f32_rows_x4_r##R( \
+        const char* A0, const char* A1, const char* A2, const char* A3, const float* x, \
+        float* y0, float* y1, float* y2, float* y3, int M0, int M1, int M2, int M3, int K) { \
+        int row = blockIdx.x;                                                        \
+        const char* A = A0; float* y = y0; int M = M0;                               \
+        if (row >= M0) {                                                             \
+            row -= M0; A = A1; y = y1; M = M1;                                       \
+            if (row >= M1) {                                                         \
+                row -= M1; A = A2; y = y2; M = M2;                                   \
+                if (row >= M2) {                                                     \
+                    row -= M2; A = A3; y = y3; M = M3;                               \
+                    if (row >= M3) return;                                           \
+                }                                                                    \
+            }                                                                        \
+        }                                                                            \
+        mq6g256v2_f32_rows_row<R>(A, x, y, M, K, row);                               \
+    }
+MQ6_ROWS_X4(2, 16)
+MQ6_ROWS_X4(3, 12)
+MQ6_ROWS_X4(4, 8)
+MQ6_ROWS_X4(5, 6)
+MQ6_ROWS_X4(6, 6)
+MQ6_ROWS_X4(7, 4)
+MQ6_ROWS_X4(8, 4)
+#undef MQ6_ROWS_X4
