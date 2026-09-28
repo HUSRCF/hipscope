@@ -1506,22 +1506,15 @@ extern "C" __global__ void gated_delta_step_gate_norm128_gfx1151(
 // the norm reduction, matching the scalar BF16 boundary.  One wave owns one
 // head (four channels per lane): the norm sum is the scalar kernel's serial
 // i = 0..127 chain, run once per wave over the LDS-staged rounded head rather
-// than once per channel thread.  Grid [rows * value_heads], block 32.
-extern "C" __global__ __launch_bounds__(32) void gated_delta_gate_bf16_f32_batched(
+// than once per channel thread.  Returns the lane's four outputs.
+static __device__ __forceinline__ float4 gated_delta_gate_head128(
     float* recurrent,
     const float* z,
     const __hip_bfloat16* norm,
     float* output,
-    int rows,
-    int value_heads,
-    int value_dim) {
-    const int flat_head = (int)blockIdx.x;
-    const int lane = (int)threadIdx.x;
-    const int total_heads = rows * value_heads;
-    if (flat_head >= total_heads || value_dim != 128) return;
-    const int start = flat_head * 128;
-    __shared__ float rounded[128];
-
+    int start,
+    int lane,
+    float* rounded) {
     const float4 raw = *reinterpret_cast<const float4*>(recurrent + start + lane * 4);
     const float4 value = make_float4(
         bf16_to_f32(bf16_round(raw.x)), bf16_to_f32(bf16_round(raw.y)),
@@ -1539,7 +1532,7 @@ extern "C" __global__ __launch_bounds__(32) void gated_delta_gate_bf16_f32_batch
         sum += v.z * v.z;
         sum += v.w * v.w;
     }
-    const float inv = rsqrtf(sum / (float)value_dim + 1.0e-6f);
+    const float inv = rsqrtf(sum / 128.0f + 1.0e-6f);
     const float4 zv = *reinterpret_cast<const float4*>(z + start + lane * 4);
     const float in[4] = {value.x, value.y, value.z, value.w};
     const float zs[4] = {zv.x, zv.y, zv.z, zv.w};
@@ -1552,8 +1545,56 @@ extern "C" __global__ __launch_bounds__(32) void gated_delta_gate_bf16_f32_batch
         const float gate = bf16_to_f32(bf16_round(zs[e]));
         out[e] = bf16_to_f32(bf16_round(normalized / (1.0f + expf(-gate))));
     }
-    *reinterpret_cast<float4*>(output + start + lane * 4) =
-        make_float4(out[0], out[1], out[2], out[3]);
+    const float4 result = make_float4(out[0], out[1], out[2], out[3]);
+    *reinterpret_cast<float4*>(output + start + lane * 4) = result;
+    return result;
+}
+
+// Grid [rows * value_heads], block 32.
+extern "C" __global__ __launch_bounds__(32) void gated_delta_gate_bf16_f32_batched(
+    float* recurrent,
+    const float* z,
+    const __hip_bfloat16* norm,
+    float* output,
+    int rows,
+    int value_heads,
+    int value_dim) {
+    const int flat_head = (int)blockIdx.x;
+    if (flat_head >= rows * value_heads || value_dim != 128) return;
+    __shared__ float rounded[128];
+    gated_delta_gate_head128(recurrent, z, norm, output, flat_head * 128,
+                             (int)threadIdx.x, rounded);
+}
+
+// gated_delta_gate_bf16_f32_batched over head pairs (even value_heads), also
+// writing mq_rotate_x(output) to `rotated`: the pair's 256 outputs form one
+// rotation group, which wave 0 rotates from LDS.  Grid [rows * value_heads /
+// 2], block 64.
+extern "C" __global__ __launch_bounds__(64) void gated_delta_gate_rotate_bf16_f32_batched(
+    float* recurrent,
+    const float* z,
+    const __hip_bfloat16* norm,
+    float* output,
+    float* rotated,
+    const float* signs1,
+    const float* signs2) {
+    const int wave = (int)threadIdx.x >> 5;
+    const int lane = (int)threadIdx.x & 31;
+    __shared__ float rounded[2][128];
+    __shared__ float pair[256];
+    const float4 result = gated_delta_gate_head128(
+        recurrent, z, norm, output, ((int)blockIdx.x * 2 + wave) * 128, lane, rounded[wave]);
+    *reinterpret_cast<float4*>(pair + wave * 128 + lane * 4) = result;
+    __syncthreads();
+    if (wave != 0) return;
+    const int d0 = lane * 8;
+    float values[8];
+#pragma unroll
+    for (int e = 0; e < 8; ++e) values[e] = pair[d0 + e] * signs1[d0 + e];
+    mq_fwht256_lane(values, lane);
+#pragma unroll
+    for (int e = 0; e < 8; ++e)
+        rotated[(int)blockIdx.x * 256 + d0 + e] = values[e] * 0.0625f * signs2[d0 + e];
 }
 
 extern "C" __global__ void indexed_attention_norm_rope_f32(

@@ -1650,7 +1650,7 @@ pub struct GatedDeltaGateBatched<'a> {
     pub value_dim: usize,
 }
 
-pub fn gated_delta_gate_batched(gpu: &mut Gpu, p: &GatedDeltaGateBatched<'_>) -> HipResult<()> {
+fn validate_gated_delta_gate_batched(p: &GatedDeltaGateBatched<'_>) -> HipResult<usize> {
     for tensor in [p.recurrent_output, p.z, p.output] {
         ensure_f32(tensor)?;
     }
@@ -1666,6 +1666,11 @@ pub fn gated_delta_gate_batched(gpu: &mut Gpu, p: &GatedDeltaGateBatched<'_>) ->
     {
         return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
     }
+    Ok(elements)
+}
+
+pub fn gated_delta_gate_batched(gpu: &mut Gpu, p: &GatedDeltaGateBatched<'_>) -> HipResult<()> {
+    let elements = validate_gated_delta_gate_batched(p)?;
     let rows = checked_i32(p.rows, "GDN batched gate rows")?;
     let value_heads = checked_i32(p.value_heads, "GDN batched gate heads")?;
     let value_dim = checked_i32(p.value_dim, "GDN batched gate width")?;
@@ -1691,6 +1696,46 @@ pub fn gated_delta_gate_batched(gpu: &mut Gpu, p: &GatedDeltaGateBatched<'_>) ->
         args.as_mut_slice(),
         crate::dispatch::ReplayLaunchBindings::NONE,
     )
+}
+
+/// [`gated_delta_gate_batched`] (even `value_heads`) that also writes
+/// `mq_rotate_x(p.output)` into `rotated` (head pairs form the 256-wide
+/// groups); the next matching `Gpu::rotate_x_mq_batched` then skips
+/// (`ScratchState::prerotated`).
+pub fn gated_delta_gate_batched_rotate(
+    gpu: &mut Gpu,
+    p: &GatedDeltaGateBatched<'_>,
+    rotated: &GpuTensor,
+) -> HipResult<()> {
+    const KERNEL: &str = "gated_delta_gate_rotate_bf16_f32_batched";
+    let elements = validate_gated_delta_gate_batched(p)?;
+    ensure_f32(rotated)?;
+    if !p.value_heads.is_multiple_of(2) || rotated.numel() < elements {
+        return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
+    }
+    gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, KERNEL)?;
+    gpu.ensure_mq_signs()?;
+    let mut args = KernargBlob::new();
+    for tensor in [p.recurrent_output, p.z, p.norm, p.output, rotated] {
+        args.push_ptr(tensor.buf.as_ptr());
+    }
+    args.push_ptr(gpu.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr());
+    args.push_ptr(gpu.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr());
+    args.pad_to(16);
+    gpu.launch_blob_recorded(
+        KERNEL,
+        [checked_u32(elements / 256, "GDN batched gate pair grid")?, 1, 1],
+        [64, 1, 1],
+        0,
+        args.as_mut_slice(),
+        crate::dispatch::ReplayLaunchBindings::NONE,
+    )?;
+    gpu.scratch.prerotated = Some((
+        p.output.buf.as_ptr() as usize,
+        rotated.buf.as_ptr() as usize,
+        elements,
+    ));
+    Ok(())
 }
 pub struct IndexedAttentionNormRope<'a> {
     pub values: &'a GpuTensor,
