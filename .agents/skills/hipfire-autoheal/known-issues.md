@@ -57,7 +57,7 @@ Playbook fix 9.
 
 | Field | Value |
 |---|---|
-| **Status** | Current — driver-level; observed 2026-09-27 on gfx1100 (Navi31 / RX 7900 XTX) |
+| **Status** | Current — driver-level; **single-box observation 2026-09-27**, gfx1100 (Navi31 / RX 7900 XTX); pattern is machine-independent, numbers are not |
 | **Scope** | AMD RDNA serve loads (seen loading `qwen3.8:27b-mq4-xt`, mq4 weights + q8 KV) |
 
 **Symptom:** Loads never complete and every restart reproduces it. The daemon
@@ -68,17 +68,24 @@ spins in `R` state while `serve.log` freezes mid-layer; two threads park in
 
 **Workaround (privileged — approval + owner inspection; playbook fix 11):**
 
+Machine-agnostic — DRM node indexes and service-unit names are
+host-specific, so resolve them on the box in question:
+
 ```bash
-systemctl --user stop hipfire
-echo 1 | sudo tee /sys/class/drm/card2/device/reset   # card2 = AMD Navi31
+# Identify the AMD GPU first — do NOT assume a card index
+for c in /sys/class/drm/card*/device; do
+  echo "$(basename "$(dirname "$c")"): vendor=$(cat "$c/vendor")"
+done   # AMD = 0x1002
+
+# Stop the daemon's supervision, reset that GPU, start again
+systemctl --user stop hipfire.service      # or the unit in use
+echo 1 | sudo tee /sys/class/drm/<card-of-amd>/device/reset
 systemctl --user start hipfire.service
-systemctl --user start hipfire-watchdog.timer
 ```
 
-Restarting serve does **not** clear this. `~/.hipfire/bin/hipfire-watchdog.sh`
-detects the repeating pattern (`MAX_WEDGES_IN_A_ROW`) and notifies the same
-sequence; a reboot also clears it. Verify the DRM node vendor is `0x1002`
-before resetting — do **not** assume `card2`.
+Restarting serve does **not** clear this; a full reset (or a reboot) does.
+If wedges repeat across sessions, escalate with the full triage bundle
+rather than making resets a routine.
 
 ---
 

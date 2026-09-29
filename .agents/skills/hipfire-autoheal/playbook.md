@@ -353,6 +353,10 @@ Do not kill unknown PIDs without user confirmation of what they are.
 
 ### 11. Loader wedge → degraded GPU/driver state (needs a GPU reset)
 
+> Evidence status: observed **once**, on a single gfx1100 (Navi31) box. The
+> symptom signature is machine-independent but the numbers below are from
+> that one observation — treat as a pattern, not a spec.
+
 **Symptom:** Loads never finish, and every restart reproduces it. The daemon
 main thread spins in `R` state, `~/.hipfire/serve.log` freezes mid-layer (seen
 at 62/64, 54, 49, 41, 33, 10 …), the model reports `null`, VRAM stays held
@@ -368,30 +372,32 @@ another serve restart cannot clear it, a reset can.
 
 **Minimal repair (privileged — approval + owner inspection first):**
 
-```bash
-# 1) Stop the service so nothing holds VRAM across the reset
-systemctl --user stop hipfire
-
-# 2) Reset the GPU
-echo 1 | sudo tee /sys/class/drm/card2/device/reset   # card2 = AMD Navi31
-
-# 3) Bring the service and its watchdog back
-systemctl --user start hipfire.service
-systemctl --user start hipfire-watchdog.timer
-```
-
-Pick the DRM node that is actually the AMD GPU — verify the vendor, do **not**
-assume `card2`:
+All commands below must be adapted to the actual host: DRM node indexes
+and service-unit names are machine-specific. Do not copy a card index
+from a note.
 
 ```bash
+# 1) Identify the AMD DRM node first — do NOT assume a card index
 for c in /sys/class/drm/card*/device; do
   echo "$(basename "$(dirname "$c")"): vendor=$(cat "$c/vendor")"
 done   # AMD = 0x1002
+
+# 2) Stop whatever supervises the daemon so nothing holds VRAM across
+#    the reset (service unit, container, or process — match the host)
+systemctl --user stop hipfire.service   # or the unit/container in use
+
+# 3) Reset the GPU identified in step 1
+echo 1 | sudo tee /sys/class/drm/<card-of-amd>/device/reset
+
+# 4) Start the daemon again (same supervision as stopped in step 2)
+systemctl --user start hipfire.service
 ```
 
-A reboot also clears the state. Do **not** loop restarts: `hipfire-watchdog.sh`
-counts consecutive wedges (`MAX_WEDGES_IN_A_ROW`) and, once exceeded,
-desktop-notifies this exact reset sequence instead of restarting forever.
+A reboot also clears the state. Do **not** loop restarts: if the same
+mid-layer wedge returns on every restart, restarts cannot clear it — go
+straight to the reset path above (with owner approval), and if wedges
+re-occur over sessions, that is the escalation signal to file an issue
+with the full evidence bundle rather than automating resets.
 
 **Verify:** the model loads past the previously frozen layer and
 `rocm-smi --showmeminfo vram` reflects a resident model; a later cold start
