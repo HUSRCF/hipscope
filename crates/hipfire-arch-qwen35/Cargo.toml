@@ -76,6 +76,11 @@ path = "examples/test_dflash_replay_ml.rs"
 required-features = ["deltanet"]
 
 [[example]]
+name = "test_dflash_replay_from_snapshot"
+path = "examples/test_dflash_replay_from_snapshot.rs"
+required-features = ["deltanet"]
+
+[[example]]
 name = "test_select_regrid"
 path = "examples/test_select_regrid.rs"
 required-features = ["deltanet"]

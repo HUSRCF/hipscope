@@ -17,6 +17,11 @@
 //!    with the shipping defines plus `HIPFIRE_GDN_LAYER_TABLE`, grid.z =
 //!    layer, frames reserved exactly as the per-layer launches would.
 //!
+//! Railgun D8 adds `_from` twins of both kernels (`DFLASH_GDN_REPLAY_STATE_SRC`
+//! / `HIPFIRE_GDN_STATE_SRC`): the same bodies with the recurrent-state loads
+//! redirected to a second table column, so the DFlash rollback replays from
+//! the snapshot buffers into the live ones instead of restoring first.
+//!
 //! Both kernels read pointers from device memory, so a Redline tape could
 //! not attribute their effects; the launchers therefore decline (return
 //! `Ok(false)`) while a Redline recording is open. HipGraph capture is fine
@@ -40,6 +45,29 @@ pub const GATED_DELTA_NET_Q8_FAST_ML_SRC: &str = concat!(
 );
 /// Compiled-module key and device symbol for the recurrence kernel.
 pub const GATED_DELTA_NET_Q8_FAST_ML_SYMBOL: &str = "gated_delta_net_q8_fast_ml";
+
+/// Railgun D8: the preamble built with `DFLASH_GDN_REPLAY_STATE_SRC` — its
+/// first step reads the conv ring from the snapshot row
+/// ([`DflashReplayPreLayerFrom::conv_state_src`]) and every step writes the
+/// live ring, so a rollback needs no restore copy of the conv state.
+pub const DFLASH_GDN_REPLAY_PRE_ML_FROM_SRC: &str = concat!(
+    "#define DFLASH_GDN_REPLAY_STATE_SRC 1\n",
+    "#define DFLASH_GDN_REPLAY_PRE_KERNEL dflash_gdn_replay_pre_ml_from\n",
+    include_str!("../../../kernels/src/dflash_gdn_replay_pre_ml.hip")
+);
+/// Compiled-module key and device symbol of [`DFLASH_GDN_REPLAY_PRE_ML_FROM_SRC`].
+pub const DFLASH_GDN_REPLAY_PRE_ML_FROM_SYMBOL: &str = "dflash_gdn_replay_pre_ml_from";
+/// Railgun D8: the recurrence of [`GATED_DELTA_NET_Q8_FAST_ML_SRC`] plus
+/// `HIPFIRE_GDN_STATE_SRC` — it reads S / scales / EF residual from the
+/// snapshot row ([`GdnLayerTableFrom`]) and writes the live state.
+pub const GATED_DELTA_NET_Q8_FAST_ML_FROM_SRC: &str = concat!(
+    "#define HIPFIRE_GDN_DPP_REDUCE 1\n#define HIPFIRE_GDN_PREFETCH 1\n",
+    "#define HIPFIRE_GDN_LAYER_TABLE 1\n#define HIPFIRE_GDN_STATE_SRC 1\n",
+    "#define HIPFIRE_GDN_KERNEL gated_delta_net_q8_fast_ml_from\n",
+    include_str!("../../../kernels/src/gated_delta_net_q8_fast.hip")
+);
+/// Compiled-module key and device symbol of [`GATED_DELTA_NET_Q8_FAST_ML_FROM_SRC`].
+pub const GATED_DELTA_NET_Q8_FAST_ML_FROM_SYMBOL: &str = "gated_delta_net_q8_fast_ml_from";
 
 /// Preamble threads per block (matches `GDN_PRE_BLOCK`).
 pub const DFLASH_GDN_REPLAY_PRE_BLOCK: u32 = 256;
@@ -80,9 +108,32 @@ pub struct GdnLayerTable {
     pub ef: u64,
 }
 
+/// Railgun D8 preamble row: [`DflashReplayPreLayer`] (whose `conv_state` is
+/// the live ring, written) plus the snapshot ring the first step reads.
+/// `#[repr(C)]` layout matches the `DFLASH_GDN_REPLAY_STATE_SRC` struct.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DflashReplayPreLayerFrom {
+    pub base: DflashReplayPreLayer,
+    pub conv_state_src: u64,
+}
+
+/// Railgun D8 recurrence row: [`GdnLayerTable`] (whose `s_q8` / `s_scales` /
+/// `ef` are the live state, written) plus the snapshot state it reads.
+/// `#[repr(C)]` layout matches the `HIPFIRE_GDN_STATE_SRC` struct. `ef_src` is
+/// 0 exactly when `base.ef` is.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GdnLayerTableFrom {
+    pub base: GdnLayerTable,
+    pub s_q8_src: u64,
+    pub s_scales_src: u64,
+    pub ef_src: u64,
+}
+
 /// Byte view of a `#[repr(C)]` table of plain `u64`s for one `memcpy_htod`.
 pub fn table_bytes<T: Copy>(rows: &[T]) -> &[u8] {
-    // SAFETY: callers pass the two repr(C) all-u64 row types above.
+    // SAFETY: callers pass the repr(C) all-u64 row types above.
     unsafe { std::slice::from_raw_parts(rows.as_ptr() as *const u8, std::mem::size_of_val(rows)) }
 }
 
@@ -126,6 +177,21 @@ impl Gpu {
         )
     }
 
+    /// Railgun D8: JIT the snapshot-source twins of both kernels (idempotent).
+    pub fn ensure_dflash_gdn_replay_ml_from(&mut self) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            DFLASH_GDN_REPLAY_PRE_ML_FROM_SYMBOL,
+            DFLASH_GDN_REPLAY_PRE_ML_FROM_SRC,
+            DFLASH_GDN_REPLAY_PRE_ML_FROM_SYMBOL,
+        )?;
+        self.ensure_kernel(
+            GATED_DELTA_NET_Q8_FAST_ML_FROM_SYMBOL,
+            GATED_DELTA_NET_Q8_FAST_ML_FROM_SRC,
+            GATED_DELTA_NET_Q8_FAST_ML_FROM_SYMBOL,
+        )
+    }
+
     /// Conv1d + QK norm + interleave for `n_layers` table rows in one launch.
     #[allow(clippy::too_many_arguments)]
     pub fn dflash_gdn_replay_pre_ml(
@@ -143,6 +209,69 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_dflash_gdn_replay_ml()?;
+        self.launch_replay_pre_ml(
+            DFLASH_GDN_REPLAY_PRE_ML_SYMBOL,
+            table,
+            n_layers,
+            n_v_heads,
+            n_key_heads,
+            k_dim,
+            v_dim,
+            qkv_dim,
+            n_steps,
+            q_scale,
+            eps,
+        )
+    }
+
+    /// Railgun D8: [`Self::dflash_gdn_replay_pre_ml`] over
+    /// [`DflashReplayPreLayerFrom`] rows (conv ring read from the snapshot).
+    #[allow(clippy::too_many_arguments)]
+    pub fn dflash_gdn_replay_pre_ml_from(
+        &mut self,
+        table: *const c_void,
+        n_layers: usize,
+        n_v_heads: usize,
+        n_key_heads: usize,
+        k_dim: usize,
+        v_dim: usize,
+        qkv_dim: usize,
+        n_steps: usize,
+        q_scale: f32,
+        eps: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_dflash_gdn_replay_ml_from()?;
+        self.launch_replay_pre_ml(
+            DFLASH_GDN_REPLAY_PRE_ML_FROM_SYMBOL,
+            table,
+            n_layers,
+            n_v_heads,
+            n_key_heads,
+            k_dim,
+            v_dim,
+            qkv_dim,
+            n_steps,
+            q_scale,
+            eps,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn launch_replay_pre_ml(
+        &mut self,
+        symbol: &str,
+        table: *const c_void,
+        n_layers: usize,
+        n_v_heads: usize,
+        n_key_heads: usize,
+        k_dim: usize,
+        v_dim: usize,
+        qkv_dim: usize,
+        n_steps: usize,
+        q_scale: f32,
+        eps: f32,
+    ) -> HipResult<()> {
         let tp = table as *mut c_void;
         let nvh = n_v_heads as i32;
         let nkh = n_key_heads as i32;
@@ -165,7 +294,7 @@ impl Gpu {
         ];
         let v_blocks = v_dim.div_ceil(DFLASH_GDN_REPLAY_PRE_BLOCK as usize);
         self.launch_maybe_blob(
-            DFLASH_GDN_REPLAY_PRE_ML_SYMBOL,
+            symbol,
             [(n_key_heads + v_blocks) as u32, n_layers as u32, 1],
             [DFLASH_GDN_REPLAY_PRE_BLOCK, 1, 1],
             0,
@@ -201,6 +330,48 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_dflash_gdn_replay_ml()?;
+        self.launch_gdn_q8_fast_ml(
+            GATED_DELTA_NET_Q8_FAST_ML_SYMBOL,
+            table,
+            n_layers,
+            n_steps,
+            n_heads,
+            head_dim,
+        )
+    }
+
+    /// Railgun D8: [`Self::gated_delta_net_q8_fast_ml`] over
+    /// [`GdnLayerTableFrom`] rows (state read from the snapshot, written to
+    /// the live buffers). Same frames, grid and arithmetic.
+    pub fn gated_delta_net_q8_fast_ml_from(
+        &mut self,
+        table: *const c_void,
+        n_layers: usize,
+        n_steps: usize,
+        n_heads: usize,
+        head_dim: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_dflash_gdn_replay_ml_from()?;
+        self.launch_gdn_q8_fast_ml(
+            GATED_DELTA_NET_Q8_FAST_ML_FROM_SYMBOL,
+            table,
+            n_layers,
+            n_steps,
+            n_heads,
+            head_dim,
+        )
+    }
+
+    fn launch_gdn_q8_fast_ml(
+        &mut self,
+        symbol: &str,
+        table: *const c_void,
+        n_layers: usize,
+        n_steps: usize,
+        n_heads: usize,
+        head_dim: usize,
+    ) -> HipResult<()> {
         let tp = table as *mut c_void;
         let nt = n_steps as i32;
         let nh = n_heads as i32;
@@ -214,7 +385,7 @@ impl Gpu {
             &fr as *const _ as *mut c_void,
         ];
         self.launch_maybe_blob(
-            GATED_DELTA_NET_Q8_FAST_ML_SYMBOL,
+            symbol,
             [
                 n_heads as u32,
                 DFLASH_GDN_REPLAY_HEAD_DIM as u32 / GDN_TILE_ROWS,

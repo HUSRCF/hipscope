@@ -493,6 +493,11 @@ pub struct FeatureFlags {
     /// per-row `topk_values_batched_f32` / `argmax_f32_batched` launches (the
     /// gfx1201 multi-block re-grid is default-on there).
     pub select_regrid_off: bool,
+    /// Railgun D8: `HIPFIRE_DN_SNAPSHOT_FLIP=1` opts exact gfx1201 into the
+    /// DFlash rollback without the restore copy: the GDN tape replay reads the
+    /// pre-verify state from the snapshot buffers and writes the live ones
+    /// (the snapshot stays the pre-window state). Default off.
+    pub dn_snapshot_flip: bool,
 }
 
 impl FeatureFlags {
@@ -879,6 +884,7 @@ impl FeatureFlags {
                 == Some("1"),
             gdn_replay_ml_off: value("HIPFIRE_GDN_REPLAY_ML_OFF").ok().as_deref() == Some("1"),
             select_regrid_off: value("HIPFIRE_SELECT_REGRID_OFF").ok().as_deref() == Some("1"),
+            dn_snapshot_flip: value("HIPFIRE_DN_SNAPSHOT_FLIP").ok().as_deref() == Some("1"),
         }
     }
 
@@ -1199,6 +1205,7 @@ impl FeatureFlags {
             mq_prologue_fuse_off: false,
             gdn_replay_ml_off: false,
             select_regrid_off: false,
+            dn_snapshot_flip: false,
         }
     }
 }

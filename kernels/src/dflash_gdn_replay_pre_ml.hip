@@ -30,12 +30,23 @@
 #define GDN_PRE_BLOCK 256
 #define GDN_PRE_MAXN 16
 
+// Railgun D8 (`DFLASH_GDN_REPLAY_STATE_SRC`): the first step reads the conv
+// ring from the snapshot (`conv_state_src`); every step writes `conv_state`,
+// and later steps read back what this thread wrote there. Each channel is
+// owned by one thread for all steps, so the result equals an in-place
+// replay on a restored ring. Without the define `GDN_PRE_CONV_RD(t)` is `S`.
+#if defined(DFLASH_GDN_REPLAY_STATE_SRC)
+#define GDN_PRE_CONV_RD(T) ((T) == 0 ? S_src : S)
+#else
+#define GDN_PRE_CONV_RD(T) S
+#endif
+
 #define GDN_PRE_CONV_STEP(X, C, Y)                                            \
     do {                                                                      \
         float x = (X);                                                        \
-        float s0 = (S)[(C) * 3];                                              \
-        float s1 = (S)[(C) * 3 + 1];                                          \
-        float s2 = (S)[(C) * 3 + 2];                                          \
+        float s0 = (GDN_PRE_CONV_RD(t))[(C) * 3];                             \
+        float s1 = (GDN_PRE_CONV_RD(t))[(C) * 3 + 1];                         \
+        float s2 = (GDN_PRE_CONV_RD(t))[(C) * 3 + 2];                         \
         float y = fmaf((W)[(C) * 4 + 3], x, (W)[(C) * 4 + 2] * s0);            \
         y = fmaf((W)[(C) * 4 + 1], s1, y);                                    \
         y = fmaf((W)[(C) * 4], s2, y);                                        \
@@ -55,10 +66,17 @@ struct DflashReplayPreLayer {
     float* v_out;           // [n_steps x v_dim]
     float* q_dst;           // [n_steps x n_v_heads*HD] normed+scaled+repeated
     float* k_dst;           // [n_steps x n_v_heads*HD] normed+repeated
+#if defined(DFLASH_GDN_REPLAY_STATE_SRC)
+    const float* conv_state_src;  // [n_channels x 3] pre-step ring (snapshot)
+#endif
 };
 
+#ifndef DFLASH_GDN_REPLAY_PRE_KERNEL
+#define DFLASH_GDN_REPLAY_PRE_KERNEL dflash_gdn_replay_pre_ml
+#endif
+
 extern "C" __launch_bounds__(GDN_PRE_BLOCK)
-__global__ void dflash_gdn_replay_pre_ml(
+__global__ void DFLASH_GDN_REPLAY_PRE_KERNEL(
     const DflashReplayPreLayer* __restrict__ layers,
     int n_v_heads,
     int n_key_heads,
@@ -81,6 +99,9 @@ __global__ void dflash_gdn_replay_pre_ml(
     float* __restrict__ k_dst = layer.k_dst;
     const float* W = layer.conv_w;
     float* S = layer.conv_state;
+#if defined(DFLASH_GDN_REPLAY_STATE_SRC)
+    const float* S_src = layer.conv_state_src;
+#endif
     const int tid = threadIdx.x;
     const int bx = blockIdx.x;
     const int v_blocks = (v_dim + GDN_PRE_BLOCK - 1) / GDN_PRE_BLOCK;
