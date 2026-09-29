@@ -35,7 +35,11 @@ Dispatch cleanup commit: `ad337d202`. New daemon SHA256:
 `82a74ce541cbd2e1aab64604980cda0b1d9e45e0d8fa7f282de81e971159cbd2`.
 New-versus-frozen GPU state comparisons at512 and8193 rows both passed all646
 records exactly. Packed CPU tests passed9/9; dispatch all-lib tests passed279,
-with1 ignored. New-build timing is still running. Earlier long quality
+with1 ignored. New-build timing completed: native786.2 -> packed919.7 tok/s
+(+16.98%), decode36.7 ->36.8 tok/s,1024-token texts identical. This is one
+supplemental fresh-process pair, not a replacement for the previous three-run
+statistics. Raw evidence and state comparison reports are attached in
+`benchmarks/results/mq4-g32-registry-validation.tar.gz`. Earlier long quality
 evidence remains pinned above, not misattributed to this new executable.
 
 ## Check disposition
