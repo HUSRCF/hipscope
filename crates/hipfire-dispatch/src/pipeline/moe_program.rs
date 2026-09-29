@@ -1066,8 +1066,8 @@ fn lower_prefill<'a>(
     let (params, selection) = state.prefill_parts()?;
     let mut steps = SmallVec::new();
     let op = |state: &'a MoeStepState<'a>| SealedMoeOp::new(state);
+    append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Normalize))?;
     if matches!(selection.route, Some(MoeRouteCapability::Qt44Qt53Grouped)) {
-        append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Normalize))?;
         append_step(&mut steps, Step::MoeStage(op(state), MoeStage::InputBasis))?;
         append_step(
             &mut steps,
