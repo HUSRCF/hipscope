@@ -74,9 +74,9 @@ impl DflashVerifyPm4Phase {
 
     pub fn reason(&self) -> Option<&str> {
         match self {
-            Self::Disabled { reason } | Self::Poisoned { reason } | Self::Quarantined { reason } => {
-                Some(reason.as_str())
-            }
+            Self::Disabled { reason }
+            | Self::Poisoned { reason }
+            | Self::Quarantined { reason } => Some(reason.as_str()),
             _ => None,
         }
     }
@@ -561,7 +561,13 @@ mod tests {
     use super::*;
 
     fn binding(generation: u64, max_position: usize) -> DflashVerifyBinding {
-        DflashVerifyBinding::new(DFLASH_VERIFY_PM4_BLOCK, "gfx1201", 0xabc, generation, max_position)
+        DflashVerifyBinding::new(
+            DFLASH_VERIFY_PM4_BLOCK,
+            "gfx1201",
+            0xabc,
+            generation,
+            max_position,
+        )
     }
 
     fn identity(dispatch_count: usize) -> PreparedReplayIdentity {
@@ -575,7 +581,11 @@ mod tests {
         }
     }
 
-    fn window<'a>(bound: &'a DflashVerifyBinding, batch: usize, position: usize) -> DflashVerifyWindow<'a> {
+    fn window<'a>(
+        bound: &'a DflashVerifyBinding,
+        batch: usize,
+        position: usize,
+    ) -> DflashVerifyWindow<'a> {
         DflashVerifyWindow {
             batch,
             tree: false,
@@ -638,10 +648,7 @@ mod tests {
             DflashVerifyRoute::CaptureRecord
         );
         route.note_capture();
-        route.note_ready(
-            bound.clone(),
-            identity(1154),
-        );
+        route.note_ready(bound.clone(), identity(1154));
         assert_eq!(*route.phase(), DflashVerifyPm4Phase::Ready);
         assert_eq!(
             route.plan_route(&window(&bound, 16, 32)),
@@ -658,10 +665,7 @@ mod tests {
         let bound = binding(1, 64);
         let mut route = DflashVerifyPm4::armed();
         route.note_prime_success(bound.clone());
-        route.note_ready(
-            bound.clone(),
-            identity(8),
-        );
+        route.note_ready(bound.clone(), identity(8));
         // Exactly at the prepared bound (48 + 16 == 64) is still admitted.
         assert_eq!(
             route.plan_route(&window(&bound, 16, 48)),
@@ -684,10 +688,7 @@ mod tests {
         let grown = binding(2, 8192);
         let mut route = DflashVerifyPm4::armed();
         route.note_prime_success(bound.clone());
-        route.note_ready(
-            bound,
-            identity(8),
-        );
+        route.note_ready(bound, identity(8));
         assert_eq!(
             route.plan_route(&window(&grown, 16, 0)),
             DflashVerifyRoute::PrimeDirect
@@ -701,10 +702,7 @@ mod tests {
         let bound = binding(1, 4096);
         let mut route = DflashVerifyPm4::armed();
         route.note_prime_success(bound.clone());
-        route.note_ready(
-            bound.clone(),
-            identity(8),
-        );
+        route.note_ready(bound.clone(), identity(8));
         route.note_replay_failure(64, ReplayQuiescence::Proven, "signal timeout");
         assert!(matches!(
             route.phase(),
@@ -724,10 +722,7 @@ mod tests {
         let bound = binding(1, 4096);
         let mut route = DflashVerifyPm4::armed();
         route.note_prime_success(bound.clone());
-        route.note_ready(
-            bound,
-            identity(8),
-        );
+        route.note_ready(bound, identity(8));
         route.note_replay_failure(80, ReplayQuiescence::Unknown, "teardown failed");
         assert!(matches!(
             route.phase(),

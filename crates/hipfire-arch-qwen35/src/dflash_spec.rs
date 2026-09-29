@@ -15,10 +15,10 @@ use crate::qwen35::{self, DeltaNetState, Qwen35Config, Qwen35Weights, StateQuant
 use crate::speculative::{
     apply_eviction_retain_to_draft, apply_host_nucleus, apply_host_topk, sample_categorical,
     scatter_hidden_block_to_interleaved, seed_target_hidden_dense_tp2_abortable,
-    seed_target_hidden_from_prompt_abortable, seed_target_hidden_suffix_abortable, softmax_temp_into,
-    spec_step_ddtree_batched, spec_step_dflash, spec_step_dflash_dense_tp2, xorshift_next_unit,
-    DdtreeScratch, DeltaNetSnapshot, DenseTpTargetView, GdnTape, HiddenStateRingBuffer, ModelSlot,
-    SpecStepResult, VerifyScratch,
+    seed_target_hidden_from_prompt_abortable, seed_target_hidden_suffix_abortable,
+    softmax_temp_into, spec_step_ddtree_batched, spec_step_dflash, spec_step_dflash_dense_tp2,
+    xorshift_next_unit, DdtreeScratch, DeltaNetSnapshot, DenseTpTargetView, GdnTape,
+    HiddenStateRingBuffer, ModelSlot, SpecStepResult, VerifyScratch,
 };
 use hipfire_runtime::dflash::{DflashConfig, DflashScratch, DflashWeights, TargetHiddenLogMark};
 use hipfire_runtime::dflash_adaptive_block::DflashAdaptiveBlock;
@@ -1451,8 +1451,7 @@ pub fn load_dflash_speculator_dense_tp2(
     let dim = target.configs[0].dim;
     let vocab = target.configs[0].vocab_size;
     let hidden_k = dim.next_power_of_two();
-    let draft_hfq =
-        HfqFile::open(Path::new(draft_path)).map_err(|e| format!("draft open: {e}"))?;
+    let draft_hfq = HfqFile::open(Path::new(draft_path)).map_err(|e| format!("draft open: {e}"))?;
     let draft_config = DflashConfig::from_hfq(&draft_hfq)
         .ok_or_else(|| "draft: failed to parse DflashConfig from HFQ metadata".to_string())?;
     if !draft_config.all_layers_sliding {
@@ -1605,7 +1604,14 @@ pub fn load_dflash_speculator_dense_tp2(
             "HiddenStateRingBuffer::new_for_layers"
         );
         let verify_scratch = or_unwind_owned!(
-            VerifyScratch::with_prefill(gpu, block_size, dim, vocab, hidden_k, &target.configs[rank]),
+            VerifyScratch::with_prefill(
+                gpu,
+                block_size,
+                dim,
+                vocab,
+                hidden_k,
+                &target.configs[rank]
+            ),
             "VerifyScratch::with_prefill"
         );
         let target_snap = or_unwind_owned!(
