@@ -1193,6 +1193,26 @@ mod tests {
             "superseded MQ4R filename must not remain addressable"
         );
 
+        // The symmetric XT checkpoint (H2) is the canonical dense fixture. It has
+        // exactly the asymmetric XT's size, so only the digest tells them apart;
+        // it shares the MQ4 DFlash draft.
+        let (xts_tag, xts) = registry.model("qwen3.8:27b-mq4-xts").unwrap();
+        assert_eq!(xts_tag, "qwen3.8:27b-mq4-xts");
+        assert_eq!(xts.file, "qwen3.8-27b.mq4-xts");
+        assert_eq!(xts.arch_id, Some(5));
+        assert_eq!(xts.quant.as_deref(), Some("mq4"));
+        assert_eq!(xts.default_kv_mode.as_deref(), Some("q8"));
+        assert_eq!(
+            xts.sha256.as_deref(),
+            Some("3e38ccbae3776470eb5a89344d300e9279d6b9ab6c31fd40ca1758c4f7c6f8ae")
+        );
+        assert_eq!(xts.size_bytes, Some(14987185152));
+        assert_ne!(xts.sha256, fast.sha256, "XTS and XT are distinct artifacts");
+        assert_eq!(
+            xts.dflash.as_ref().map(|draft| &draft.file),
+            fast.dflash.as_ref().map(|draft| &draft.file)
+        );
+
         let settings = model
             .recommended_settings
             .as_ref()

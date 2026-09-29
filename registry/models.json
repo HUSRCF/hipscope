@@ -870,10 +870,10 @@
       "file": "qwen3.8-27b.mq4-xts",
       "size_gb": 14.99,
       "size_bytes": 14987185152,
-      "sha256": "de8ee8256033c3690b0f1a2aff14e77cc88fff490e118648b04a833a3f2969b5",
+      "sha256": "3e38ccbae3776470eb5a89344d300e9279d6b9ab6c31fd40ca1758c4f7c6f8ae",
       "min_vram_gb": 16,
       "default_kv_mode": "q8",
-      "desc": "Qwen3.8 27B MQ4V2 XT, symmetric, QAT r7s200. Test SKU for the mq4-lloyd gfx11 prefill work (X5 staging, V2C on gfx1100, V2B on gfx1151). WT2 c24 q8/q8: 0.076879 gfx1100, 0.076901 gfx1151. qwen3.8:27b-mq4-xt is unchanged.",
+      "desc": "Qwen3.8 27B MQ4V2 XT, symmetric (H2: per-group AWQ alpha + three GPTQ scale-refit rounds). Runs the int4-activation (A4) prefill on gfx1201/gfx1100/gfx1151. gfx1201 KLD (24 chunks, fp8 KV) A4 WT2 0.0696 / code24 0.0521; native-fp8 WT2 0.0419 / code24 0.0299. Canonical dense fixture (AGENTS.md §5).",
       "recommended_settings": {
         "temperature": 1.0,
         "top_p": 0.95,

@@ -73,8 +73,8 @@ hipfire pull <tag>    # exact tag from registry; check min_vram_gb vs free VRAM
 
 Do not hard-code a “standard matrix” of sizes. Pick one primary tag that fits
 the card and the claim (e.g. `qwen3.5:4b` for **fast dense MQ4 smoke only**;
-acceptance / dense validation uses `qwen3.8:27b-mq4-xt` →
-`~/.hipfire/models/qwen3.8-27b.mq4-xt` + draft
+acceptance / dense validation uses `qwen3.8:27b-mq4-xts` →
+`~/.hipfire/models/qwen3.8-27b.mq4-xts` + draft
 `~/qcal/ladder-v2/drafts/qwen3.8-27b-dflash.mq4v2.hfq`; an `lfm2.5:*`
 tag only for LFM routes). Confirm the on-disk file under `~/.hipfire/models/`
 (or the path you pass to harnesses).

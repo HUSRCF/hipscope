@@ -224,9 +224,9 @@ works, what to measure, what counts as pass/fail.
 DFlash draft sidecar (same mechanism as the MTP/DSpark sidecars):
 
 ```bash
-# Canonical acceptance / dense validation fixture (Qwen3.8-27B MQ4XT):
-hipfire pull qwen3.8:27b-mq4-xt    # ~15 GB target + MQ4 DFlash draft sidecar
-# lands at ~/.hipfire/models/qwen3.8-27b.mq4-xt
+# Canonical acceptance / dense validation fixture (Qwen3.8-27B MQ4XTS):
+hipfire pull qwen3.8:27b-mq4-xts   # ~15 GB target + MQ4 DFlash draft sidecar
+# lands at ~/.hipfire/models/qwen3.8-27b.mq4-xts
 # measured draft identity (acceptance/perf pin):
 #   ~/qcal/ladder-v2/drafts/qwen3.8-27b-dflash.mq4v2.hfq
 #   (see §5 "Pinned Hugging Face bench fixture")
@@ -247,7 +247,7 @@ filename; renaming breaks the pairing — `dflash_mode auto` then runs AR
 
 ### Verify hashes after pull (paranoid mode)
 
-For the **canonical dense fixture** (`qwen3.8-27b.mq4-xt`), verify
+For the **canonical dense fixture** (`qwen3.8-27b.mq4-xts`), verify
 SHA-256 against the pin in §5 — do not trust filename alone.
 
 Registry-present smoke / historical artifacts (still in
@@ -336,12 +336,12 @@ Standalone: `cargo run --release -p hipfire-runtime --example encode_prompt -- M
 
 ### E. DFlash draft endpoints (HuggingFace)
 
-**Current acceptance fixture** (dense Qwen3.8-27B MQ4XT):
+**Current acceptance fixture** (dense Qwen3.8-27B MQ4XTS):
 
-- Target: `hipfire-models/qwen3.8-27b` / `qwen3.8-27b.mq4-xt`
-  (registry tag `qwen3.8:27b-mq4-xt` → `~/.hipfire/models/qwen3.8-27b.mq4-xt`)
+- Target: `hipfire-models/qwen3.8-27b` / `qwen3.8-27b.mq4-xts`
+  (registry tag `qwen3.8:27b-mq4-xts` → `~/.hipfire/models/qwen3.8-27b.mq4-xts`)
 - Registry draft sidecar: `qwen38-27b-dflash-mq4.hfq`
-  (`hipfire pull qwen3.8:27b-mq4-xt` or `hipfire pull qwen3.8:27b-draft`)
+  (`hipfire pull qwen3.8:27b-mq4-xts` or `hipfire pull qwen3.8:27b-draft`)
 - Measured draft identity (acceptance/perf pin):
   `~/qcal/ladder-v2/drafts/qwen3.8-27b-dflash.mq4v2.hfq` (see §5)
 
@@ -455,13 +455,13 @@ reassurance.
 If you're testing an actual user UX flow:
 
 ```bash
-hipfire pull qwen3.8:27b-mq4-xt    # target + registry draft sidecar
+hipfire pull qwen3.8:27b-mq4-xts   # target + registry draft sidecar
 hipfire config set dflash_mode auto    # opt in (default since 2026-04-26: off)
 # Acceptance draft pin when measuring (optional override of registry sidecar):
 # export HIPFIRE_DFLASH_DRAFT=~/qcal/ladder-v2/drafts/qwen3.8-27b-dflash.mq4v2.hfq
-hipfire run qwen3.8:27b-mq4-xt "Write a Python function to find the longest substring without repeating characters"
+hipfire run qwen3.8:27b-mq4-xts "Write a Python function to find the longest substring without repeating characters"
 # expected: loader logs 'DFlash draft loaded: ...'
-# on-disk target: ~/.hipfire/models/qwen3.8-27b.mq4-xt
+# on-disk target: ~/.hipfire/models/qwen3.8-27b.mq4-xts
 ```
 
 
@@ -551,22 +551,53 @@ canonical trunk by local filename. Local filenames drift and lookalike
 MQ4/MQ4V2 files are not comparable.
 
 The canonical dense trunk is whichever local artifact byte-matches
-`qwen3.8-27b.mq4-xt` from HF repo `hipfire-models/qwen3.8-27b`
-(registry tag `qwen3.8:27b-mq4-xt`):
+`qwen3.8-27b.mq4-xts` from HF repo `hipfire-models/qwen3.8-27b`
+(registry tag `qwen3.8:27b-mq4-xts`):
 
 - HF repo: `hipfire-models/qwen3.8-27b`
-- HF / local file: `qwen3.8-27b.mq4-xt`
-- File size: `14987185152` (re-issued 2026-09-15 with AWQ sidecars; the prior `14980361216` / `9f91556f…` upload lacked them, WT2 KLD 0.057 vs 0.048)
-- SHA-256: `80e7c624424fd1d363ba86681d3dc1e5ac5534e0e064306a32be204c4843d0f3`
-- Paired draft (measured with the canonical fixture identity):
+- HF / local file: `qwen3.8-27b.mq4-xts`
+- File size: `14987185152`. `qwen3.8-27b.mq4-xt` has exactly the same
+  size, so only the digest tells them apart.
+- SHA-256: `3e38ccbae3776470eb5a89344d300e9279d6b9ab6c31fd40ca1758c4f7c6f8ae`
+- Checkpoint: H2, symmetric MQ4V2 XT (qt44) with per-group AWQ alpha and
+  three GPTQ scale-refit rounds on the v5 Hessian. It replaces the
+  2026-09-23 `mq4-xts` test upload (QAT r7s200, `de8ee825…`), which is not
+  comparable.
+- Paired draft (the registry sidecar `qwen38-27b-dflash-mq4.hfq`, same bytes):
   `~/qcal/ladder-v2/drafts/qwen3.8-27b-dflash.mq4v2.hfq`
   (sha256 `d0a74a232a0e2166d889f823e91e0fbf778d21dd9668d7de055cdecb065401bc`)
 
 Before reporting dense 3.8 MQ4V2/DFlash results, verify the candidate
-trunk with `sha256sum` and require the digest above. Reports that use a
-trunk with a different digest are not comparable and should be discarded.
+trunk with `scripts/check_fixture.sh [PATH]` (size + SHA-256) and require
+the digest above. Reports that use a trunk with a different digest are
+not comparable and should be discarded.
 
-Historical: the prior dense pin was Qwen3.6-27B
+**Quality pins.** `eval_hipfire --scoring-mode prefill --max-chunks 24`
+with `HIPFIRE_GRAPH=0`, `HIPFIRE_NORMALIZE_PROMPT=0` and a fresh HOME
+and kernel cache. References: WT2 `qwen3.8-27b.ref_wt2.bin` (sha256
+`8c545178fb43647499c4c7bdd33178c24fd402615c641add9ed51a0c9a43234a`),
+code24 `heldout-code24.gptqsym.kldref.bin` (sha256
+`43ab7591f2acf6b5b4058b77253109230d96591be02469ddef55235102ec7582`).
+A change that claims to be bit-exact must reproduce its arch's `.kldseq`
+byte for byte. A change that moves a pin on purpose re-pins it here.
+
+| Arch | Route, KV flags | Corpus | KLD | `.kldseq` SHA-256 |
+|---|---|---|---:|---|
+| gfx1201 | A4 (default), `--kv-mode fp8 --kv-v q8` | WT2 | 0.069571 | `483cfc58b4cc71ea3a9a71c657833e34aa847f513aceae50c1c0f0dfe65ae898` |
+| gfx1201 | A4 (default), `--kv-mode fp8 --kv-v q8` | code24 | 0.052119 | `6339dc9e54bbd498774667cfe25c8405049d20c2c61e930ab7e783b662c5f13a` |
+| gfx1201 | native fp8 (`HIPFIRE_IU4_PREFILL=0`), `--kv-mode fp8 --kv-v q8` | WT2 | 0.041859 | `19227d5fb08eb3bf10207eef6f5cc81addbb20befe90519a9692827d53c96508` |
+| gfx1201 | native fp8 (`HIPFIRE_IU4_PREFILL=0`), `--kv-mode fp8 --kv-v q8` | code24 | 0.029867 | `5e7ac9dcd264a930e35b0bd627232bcecea11665ec669a8640cd014cfe22ba3a` |
+| gfx1100 | A4 (default), `--kv-mode q8` | WT2 | 0.068687 | `ccf95389f9dd5e45b3927c98bd8bafac93ae3922417e6730c280fd9e6dce6dcd` |
+| gfx1100 | A4 (default), `--kv-mode q8` | code24 | 0.052666 | `a7eac2b4d06bfd96ead1889dcbaa0cf230dc32cfdc55a82ae73bccedbcbe532f` |
+| gfx1151 | A4 (default), `--kv-mode q8 --kv-v q8` | WT2 | 0.068955 | `c1056943318f2abb667a149d73548e0087fb506724f48dfa14dc2e292d3bdff2` |
+| gfx1151 | A4 (default), `--kv-mode q8 --kv-v q8` | code24 | 0.051358 | `04f06883e2a95306ebeead6d6bf256e8381128e4c115c6593b99c95f594fb308` |
+
+Historical: the previous dense pin was the asymmetric Qwen3.8-27B MQ4V2 XT
+(`hipfire-models/qwen3.8-27b` / `qwen3.8-27b.mq4-xt`, registry tag
+`qwen3.8:27b-mq4-xt`, size `14987185152`, sha256
+`80e7c624424fd1d363ba86681d3dc1e5ac5534e0e064306a32be204c4843d0f3`; re-issued
+2026-09-15 with AWQ sidecars, the prior `14980361216` / `9f91556f…` upload
+lacked them, WT2 KLD 0.057 vs 0.048). Before that it was Qwen3.6-27B
 (`hipfire-models/qwen3.6-27b` / `qwen3.6-27b.mq4`, size `14984158208`,
 sha256 `86a5f80fd29d545abb1093dead242725ced6d68b8607c6d566d897b1a82442dc`).
 
