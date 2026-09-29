@@ -122,8 +122,6 @@ struct RouteStamp {
     k_top: usize,
     indices_tensor: usize,
     weights_tensor: usize,
-    scores: usize,
-    normalized: bool,
     adopted_from: Option<u64>,
 }
 
@@ -169,8 +167,6 @@ impl<'a> MoeStepState<'a> {
                     k_top,
                     indices_tensor,
                     weights_tensor,
-                    scores,
-                    normalized,
                     adopted_from,
                 )| RouteStamp {
                     invocation,
@@ -180,8 +176,6 @@ impl<'a> MoeStepState<'a> {
                     k_top,
                     indices_tensor,
                     weights_tensor,
-                    scores,
-                    normalized,
                     adopted_from,
                 },
             );
@@ -243,8 +237,6 @@ impl<'a> MoeStepState<'a> {
         &self,
         n_experts: usize,
         k_top: usize,
-        scores: usize,
-        normalized: bool,
         adopted_from: Option<u64>,
     ) -> Result<(), DispatchError> {
         if self.route_stamp.get().is_some() {
@@ -276,8 +268,6 @@ impl<'a> MoeStepState<'a> {
             k_top,
             indices_tensor,
             weights_tensor,
-            scores,
-            normalized,
             adopted_from,
         }));
         Ok(())
@@ -319,9 +309,6 @@ impl<'a> MoeStepState<'a> {
                 "sealed moe: route readiness stamp does not match this invocation".into(),
             ));
         }
-        // Producer score identity and normalization/provenance are diagnostic;
-        // invocation and route-buffer identity remain the execution authority.
-        let _ = (stamp.scores, stamp.normalized, stamp.adopted_from);
         Ok(())
     }
 }
@@ -621,8 +608,6 @@ impl<'a> SealedMoeOp<'a> {
                 self.state.install_route_stamp(
                     params.n_exp,
                     params.k_top,
-                    scores.buf.as_ptr() as usize,
-                    params.prelude.norm_topk_prob,
                     receipt.adopted_from(),
                 )?;
                 Ok(())
@@ -683,13 +668,7 @@ impl<'a> SealedMoeOp<'a> {
                         self.state.call.router_input(),
                     )?;
                 }
-                self.state.install_route_stamp(
-                    params.n_exp,
-                    params.k,
-                    std::ptr::addr_of!(*params.router_logits) as usize,
-                    params.norm_topk_prob,
-                    None,
-                )
+                self.state.install_route_stamp(params.n_exp, params.k, None)
             }
         }
     }
@@ -813,10 +792,6 @@ impl<'a> SealedMoeOp<'a> {
                 selection.path2_m_total,
             );
         }
-        let total_slots = params
-            .batch_size
-            .checked_mul(params.k_top)
-            .ok_or_else(|| DispatchError::Hip("sealed moe: prefill slot count overflows".into()))?;
         super::prefill_gate_up_stage(
             gpu,
             params,
@@ -824,10 +799,6 @@ impl<'a> SealedMoeOp<'a> {
             selection.path2_m_total,
             selection.force_mq4_grouped_fp16,
         )
-        .and_then(|_| {
-            let _ = total_slots;
-            Ok(())
-        })
     }
 
     pub(super) fn unscatter(&self, gpu: &mut Gpu) -> Result<(), DispatchError> {

@@ -2348,8 +2348,7 @@ impl Gpus {
                         shape: vec![count],
                         dtype: DType::F32,
                     };
-                    self.devices[rank]
-                        .add_peer_residual_f32(&x, &p_first, p_second_ptr, count)?;
+                    self.devices[rank].add_peer_residual_f32(&x, &p_first, p_second_ptr, count)?;
                 }
                 {
                     let gpu = &self.devices[rank];

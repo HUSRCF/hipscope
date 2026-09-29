@@ -1408,7 +1408,11 @@ pub fn forward_scratch(
     // Grow before any possible AR graph capture/replay. Stable virtual
     // addresses keep existing graph pointer arguments valid.
     super::prefill::release_widened_pbs_for_kv_growth(
-        gpu, kv_cache, config, scratch, required_tokens,
+        gpu,
+        kv_cache,
+        config,
+        scratch,
+        required_tokens,
     )?;
     kv_cache.ensure_mapped_capacity(gpu, required_tokens)?;
     let dim = config.dim;
@@ -1733,7 +1737,11 @@ pub fn forward_scratch_with_hidden(
 ) -> HipResult<()> {
     let required_tokens = checked_kv_end(pos, 1, "forward_scratch_with_hidden")?;
     super::prefill::release_widened_pbs_for_kv_growth(
-        gpu, kv_cache, config, scratch, required_tokens,
+        gpu,
+        kv_cache,
+        config,
+        scratch,
+        required_tokens,
     )?;
     kv_cache.ensure_mapped_capacity(gpu, required_tokens)?;
     let dim = config.dim;
@@ -1785,7 +1793,11 @@ pub fn forward_scratch_embed(
 ) -> HipResult<()> {
     let required_tokens = checked_kv_end(pos, 1, "forward_scratch_embed")?;
     super::prefill::release_widened_pbs_for_kv_growth(
-        gpu, kv_cache, config, scratch, required_tokens,
+        gpu,
+        kv_cache,
+        config,
+        scratch,
+        required_tokens,
     )?;
     kv_cache.ensure_mapped_capacity(gpu, required_tokens)?;
     let pos_i32 = pos as i32;
@@ -5293,7 +5305,7 @@ fn forward_prefill_dense_tp_batched(
                                 q8_flags[rank],
                                 BatchEpilogue::Partial(partials[rank]),
                                 DflashFusionCtx::Off,
-                                None, // commit_stride: TP ranks keep legacy cadence
+                                None,  // commit_stride: TP ranks keep legacy cadence
                                 false, // Chunk scan is single-GPU ordinary prefill only
                             ) {
                                 process_res = Err(e);
@@ -7271,9 +7283,15 @@ mod tests {
     fn gfx1201_fa_epilogue_admits_q8_and_fp8_tile() {
         assert!(qwen35_fa_epilogue_route_supported(true, true, false, false));
         assert!(qwen35_fa_epilogue_route_supported(true, false, false, true));
-        assert!(!qwen35_fa_epilogue_route_supported(true, false, true, false));
-        assert!(qwen35_fa_epilogue_route_supported(false, false, true, false));
-        assert!(!qwen35_fa_epilogue_route_supported(true, false, false, false));
+        assert!(!qwen35_fa_epilogue_route_supported(
+            true, false, true, false
+        ));
+        assert!(qwen35_fa_epilogue_route_supported(
+            false, false, true, false
+        ));
+        assert!(!qwen35_fa_epilogue_route_supported(
+            true, false, false, false
+        ));
     }
 
     // ── #397 Ship 6 — lowered decode super-op program shapes ──────────────

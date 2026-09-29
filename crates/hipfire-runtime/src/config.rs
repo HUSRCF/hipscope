@@ -473,18 +473,30 @@ mod tests {
     #[test]
     fn qwen35_dense_redline_default_requires_gfx1201_single_gpu_ar() {
         let h2 = "/models/h2.group-alpha-refit.hfq";
-        assert!(retained_redline_default("gfx1201", "qwen3_5", h2, 1, 1, false));
+        assert!(retained_redline_default(
+            "gfx1201", "qwen3_5", h2, 1, 1, false
+        ));
         // A drafter keeps the model on its speculative path.
-        assert!(!retained_redline_default("gfx1201", "qwen3_5", h2, 1, 1, true));
+        assert!(!retained_redline_default(
+            "gfx1201", "qwen3_5", h2, 1, 1, true
+        ));
         // Pipeline / tensor parallel stay on HIP.
-        assert!(!retained_redline_default("gfx1201", "qwen3_5", h2, 2, 1, false));
-        assert!(!retained_redline_default("gfx1201", "qwen3_5", h2, 1, 2, false));
+        assert!(!retained_redline_default(
+            "gfx1201", "qwen3_5", h2, 2, 1, false
+        ));
+        assert!(!retained_redline_default(
+            "gfx1201", "qwen3_5", h2, 1, 2, false
+        ));
         // Exact gfx1201 only; other dense archs and the MoE sibling stay on HIP.
         for gpu_arch in ["gfx1100", "gfx1151", "gfx1200"] {
-            assert!(!retained_redline_default(gpu_arch, "qwen3_5", h2, 1, 1, false));
+            assert!(!retained_redline_default(
+                gpu_arch, "qwen3_5", h2, 1, 1, false
+            ));
         }
         for model_arch in ["qwen3_5_moe", "qwen3", "qwen2", "gemma4"] {
-            assert!(!retained_redline_default("gfx1201", model_arch, h2, 1, 1, false));
+            assert!(!retained_redline_default(
+                "gfx1201", model_arch, h2, 1, 1, false
+            ));
         }
     }
 }

@@ -50,8 +50,8 @@ pub struct PrefillBatchScratch {
     pub x_norm_batch: GpuTensor,
 
     // LA-layer projection outputs
-    pub dn_qkv_batch: GpuTensor,      // [N × qkv_dim]
-    pub dn_z_batch: GpuTensor,        // [N × v_dim]
+    pub dn_qkv_batch: GpuTensor, // [N × qkv_dim]
+    pub dn_z_batch: GpuTensor,   // [N × v_dim]
     /// Z plus up to 256 appended beta/alpha/padding rows, used only by the
     /// symmetric IU4 fold; output is deinterleaved before GDN consumes it.
     pub dn_z_fold_batch: GpuTensor,
@@ -206,7 +206,14 @@ impl PrefillBatchScratch {
         max_batch: usize,
         cap_gdn_tape: bool,
     ) -> HipResult<Self> {
-        Self::new_opt_with_alloc(gpu, config, max_batch, cap_gdn_tape, false, Gpu::alloc_tensor)
+        Self::new_opt_with_alloc(
+            gpu,
+            config,
+            max_batch,
+            cap_gdn_tape,
+            false,
+            Gpu::alloc_tensor,
+        )
     }
 
     /// Only for the model-wide admitted ordinary gfx11 route; callers must
@@ -312,7 +319,11 @@ impl PrefillBatchScratch {
         // from `TreeVerifyCtx.positions`; FA RoPE kernels read it ONLY
         // when `tree_verify.is_some()`. Same i32-in-F32 cosmetic dtype
         // pattern as `positions`.
-        let i_rope_positions = if lean { None } else { Some(alloc!(&[max_batch], DType::F32)) };
+        let i_rope_positions = if lean {
+            None
+        } else {
+            Some(alloc!(&[max_batch], DType::F32))
+        };
         let i_tokens = alloc!(&[max_batch], DType::F32);
         let i_fa_q_full_batch = alloc!(&[max_batch * q_dim * 2], DType::F32);
         let i_fa_q_batch = alloc!(&[max_batch * q_dim], DType::F32);
@@ -321,10 +332,26 @@ impl PrefillBatchScratch {
         let i_fa_v_batch = alloc!(&[max_batch * kv_dim], DType::F32);
         let i_fa_attn_out_batch = alloc!(&[max_batch * q_dim], DType::F32);
         let i_fa_attn_out_rot_batch = alloc!(&[fallback_rows * q_dim], DType::F32);
-        let i_x_rot_f16_batch = if lean { None } else { Some(alloc!(&[max_batch * dim], DType::F16)) };
-        let i_dn_normed_rot_f16_batch = if lean { None } else { Some(alloc!(&[max_batch * v_dim], DType::F16)) };
-        let i_ffn_hidden_f16_batch = if lean { None } else { Some(alloc!(&[max_batch * hidden_dim], DType::F16)) };
-        let i_fa_attn_out_rot_f16_batch = if lean { None } else { Some(alloc!(&[max_batch * q_dim], DType::F16)) };
+        let i_x_rot_f16_batch = if lean {
+            None
+        } else {
+            Some(alloc!(&[max_batch * dim], DType::F16))
+        };
+        let i_dn_normed_rot_f16_batch = if lean {
+            None
+        } else {
+            Some(alloc!(&[max_batch * v_dim], DType::F16))
+        };
+        let i_ffn_hidden_f16_batch = if lean {
+            None
+        } else {
+            Some(alloc!(&[max_batch * hidden_dim], DType::F16))
+        };
+        let i_fa_attn_out_rot_f16_batch = if lean {
+            None
+        } else {
+            Some(alloc!(&[max_batch * q_dim], DType::F16))
+        };
         let i_mq_prologue_ctrl = alloc!(&[256], DType::Raw);
         let i_moe_router_logits_batch = alloc_opt!(
             config.num_experts > 0,
@@ -452,13 +479,15 @@ impl PrefillBatchScratch {
             shape: vec![0],
             dtype,
         };
-        let sentinels = lean.then(|| (
-            borrowed_sentinel(DType::F32),
-            borrowed_sentinel(DType::F16),
-            borrowed_sentinel(DType::F16),
-            borrowed_sentinel(DType::F16),
-            borrowed_sentinel(DType::F16),
-        ));
+        let sentinels = lean.then(|| {
+            (
+                borrowed_sentinel(DType::F32),
+                borrowed_sentinel(DType::F16),
+                borrowed_sentinel(DType::F16),
+                borrowed_sentinel(DType::F16),
+                borrowed_sentinel(DType::F16),
+            )
+        });
         let (
             rope_positions,
             x_rot_f16_batch,
@@ -1503,6 +1532,20 @@ pub(crate) fn valid_lane_mask(max_batch: usize) -> HipResult<u64> {
     } else {
         Ok((1u64 << max_batch) - 1)
     }
+}
+
+/// Active-lane mask to honour for a batch, or `None` when every row is live.
+/// Only independent decode batches (at most 64 lanes) carry a mask; sequential
+/// prefill chunks run up to `PREFILL_MAX_BATCH` rows and never build one.
+pub(crate) fn partial_lane_mask(active_mask: Option<u64>, n: usize) -> HipResult<Option<u64>> {
+    let Some(mask) = active_mask else {
+        return Ok(None);
+    };
+    let full = valid_lane_mask(n)?;
+    if mask == 0 || mask & !full != 0 {
+        return Err(HipError::new(0, "active lane mask out of range"));
+    }
+    Ok((mask != full).then_some(mask))
 }
 
 #[inline]

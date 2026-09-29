@@ -2935,12 +2935,14 @@ fn attach_awq_rcp_planes(
         return Ok(());
     }
     let targets: [(&str, &mut WeightTensor); 2] = match layer {
-        LayerWeights::DeltaNet(dn) => {
-            [("linear_attn.in_proj_qkv", &mut dn.wqkv), ("mlp.gate_proj", &mut dn.w_gate)]
-        }
-        LayerWeights::FullAttn(fa) => {
-            [("self_attn.q_proj", &mut fa.wq), ("mlp.gate_proj", &mut fa.w_gate)]
-        }
+        LayerWeights::DeltaNet(dn) => [
+            ("linear_attn.in_proj_qkv", &mut dn.wqkv),
+            ("mlp.gate_proj", &mut dn.w_gate),
+        ],
+        LayerWeights::FullAttn(fa) => [
+            ("self_attn.q_proj", &mut fa.wq),
+            ("mlp.gate_proj", &mut fa.w_gate),
+        ],
         _ => return Ok(()),
     };
     for (stem, wt) in targets {
@@ -2951,7 +2953,10 @@ fn attach_awq_rcp_planes(
         let (info, data) = qwen35_tensor_data_cow(hfq, &name)
             .ok_or_else(|| HipError::new(0, &format!("AWQ sidecar missing: {name}")))?;
         if info.quant_type != 1 || data.len() != wt.k * 2 {
-            return Err(HipError::new(0, &format!("AWQ sidecar layout mismatch: {name}")));
+            return Err(HipError::new(
+                0,
+                &format!("AWQ sidecar layout mismatch: {name}"),
+            ));
         }
         let awq: Vec<f32> = data
             .chunks_exact(2)
@@ -2983,8 +2988,7 @@ fn append_betaalpha_to_z(
 ) -> HipResult<()> {
     let (qkv, z, beta, alpha) = (&dn.wqkv, &mut dn.wz, &dn.w_beta, &dn.w_alpha);
     let gfx12 = gpu.iu4_gdn_fold_active([qkv.m, z.m, beta.m, alpha.m], qkv.k);
-    if [qkv.gpu_dtype, z.gpu_dtype, beta.gpu_dtype, alpha.gpu_dtype]
-        != [DType::MQ4G256V2; 4]
+    if [qkv.gpu_dtype, z.gpu_dtype, beta.gpu_dtype, alpha.gpu_dtype] != [DType::MQ4G256V2; 4]
         || !(gfx12 || gpu.mq4v2_fold_betaalpha_active(qkv.m, z.m, beta.m, alpha.m, qkv.k, 512))
         || [z.k, beta.k, alpha.k] != [qkv.k; 3]
     {
@@ -2997,12 +3001,19 @@ fn append_betaalpha_to_z(
         (gpu.mq4v2_fold_betaalpha_padded_m(z.m), z.m, z.m + beta.m)
     };
     let mut rows = vec![0u8; total * row_bytes];
-    for (stem, start, count) in [("z", 0, z.m), ("b", beta_row, beta.m), ("a", alpha_row, alpha.m)] {
+    for (stem, start, count) in [
+        ("z", 0, z.m),
+        ("b", beta_row, beta.m),
+        ("a", alpha_row, alpha.m),
+    ] {
         let name = format!("{prefix}.linear_attn.in_proj_{stem}.weight");
         let (info, data) = qwen35_tensor_data_cow(hfq, &name)
             .ok_or_else(|| HipError::new(0, &format!("fold weight missing: {name}")))?;
         if info.quant_type != MQ4V2_G256_QT || data.len() != count * row_bytes {
-            return Err(HipError::new(0, &format!("fold weight layout mismatch: {name}")));
+            return Err(HipError::new(
+                0,
+                &format!("fold weight layout mismatch: {name}"),
+            ));
         }
         rows[start * row_bytes..(start + count) * row_bytes].copy_from_slice(&data);
     }
@@ -5553,30 +5564,6 @@ pub(crate) struct SealedEpLoadCtx<'a> {
     pub assignment: ExpertAssign,
 }
 
-fn validate_ep_physical_device_ids(
-    physical_devices: &[i32],
-    emulation_enabled: bool,
-) -> HipResult<()> {
-    let mut seen = std::collections::HashSet::new();
-    for (device_rank, &device) in physical_devices.iter().enumerate() {
-        if device < 0 {
-            return Err(HipError::new(
-                0,
-                &format!("qwen35: EP physical device id {device} is invalid at rank {device_rank}"),
-            ));
-        }
-        if !emulation_enabled && !seen.insert(device) {
-            return Err(HipError::new(
-                0,
-                &format!(
-                    "qwen35: EP physical device id {device} is duplicate at rank {device_rank}"
-                ),
-            ));
-        }
-    }
-    Ok(())
-}
-
 /// Validate every EP admission rule BEFORE any GPU allocation: mesh/rank
 /// identity, physical device agreement, supported (exact Stride/Contiguous)
 /// assignment, no REAP/paging/AWQ, and a well-formed MoE config. Returns the
@@ -5625,7 +5612,8 @@ fn validate_ep_load_topology(
         ));
     }
     let emulation_enabled = hipfire_runtime::config::get().emulate_gpus.is_some();
-    validate_ep_physical_device_ids(physical_devices, emulation_enabled)?;
+    hipfire_runtime::sealed_moe::validate_physical_device_ids(physical_devices, emulation_enabled)
+        .map_err(|message| HipError::new(0, &format!("qwen35: EP {message}")))?;
     if physical_devices[rank] != gpu.device_id {
         return Err(HipError::new(
             0,
@@ -6366,8 +6354,8 @@ fn load_weights_ep_rank_inner(
 #[cfg(test)]
 mod sealed_ep_tests {
     use super::{
-        load_weights, load_weights_ep_rank, load_weights_ep_rank_with_fault,
-        validate_ep_physical_device_ids, EpFault, EpLoadStage, HfqSource, Layout,
+        load_weights, load_weights_ep_rank, load_weights_ep_rank_with_fault, EpFault, EpLoadStage,
+        HfqSource, Layout,
     };
     use crate::qwen35::{
         config_from_hfq, shard_all_moe_layers, shard_all_moe_layers_with_fault, LayerWeights,
@@ -7017,12 +7005,6 @@ mod sealed_ep_tests {
         weights.free_gpu(&mut gpus.devices[0]);
         gpus.devices[0].drain_pool();
         gpus.devices[1].drain_pool();
-    }
-    #[test]
-    fn ep_load_physical_device_aliases_require_explicit_emulation() {
-        assert!(validate_ep_physical_device_ids(&[7, 7], false).is_err());
-        assert!(validate_ep_physical_device_ids(&[7, 7], true).is_ok());
-        assert!(validate_ep_physical_device_ids(&[-1, 7], true).is_err());
     }
 }
 /// Direct-Qwen35 load fault-boundary evidence (G4.3 final-head).
