@@ -4876,14 +4876,21 @@ pub(crate) fn batch_chunk_embed_tokens(
     // Multi-GPU band-mode: skip embedding when this is not the first band.
     // The activation already lives in `pbs.x_batch` from a peer-copy of
     // the previous band's `pbs.x_batch`.
-    let full_mask = valid_lane_mask(n)?;
-    let embed_mask = active_mask.unwrap_or(full_mask);
-    if embed_mask == 0 || embed_mask & !full_mask != 0 {
-        return Err(HipError::new(
-            0,
-            "batch_chunk_embed_tokens: active mask out of range",
-        ));
-    }
+    // Lane masks exist only for independent batches (at most 64 lanes);
+    // sequential prefill passes `None` and its chunk may be wider than a mask.
+    let partial_mask = match active_mask {
+        None => None,
+        Some(mask) => {
+            let full_mask = valid_lane_mask(n)?;
+            if mask == 0 || mask & !full_mask != 0 {
+                return Err(HipError::new(
+                    0,
+                    "batch_chunk_embed_tokens: active mask out of range",
+                ));
+            }
+            (mask != full_mask).then_some(mask)
+        }
+    };
     if do_embed
         && !pre_embedded
         && matches!(
@@ -4892,13 +4899,8 @@ pub(crate) fn batch_chunk_embed_tokens(
         )
     {
         if !pre_uploaded {
-            if embed_mask == full_mask {
-                let tokens_host: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
-                let tokens_bytes: &[u8] =
-                    unsafe { std::slice::from_raw_parts(tokens_host.as_ptr() as *const u8, n * 4) };
-                gpu.hip.memcpy_htod(&pbs.tokens.buf, tokens_bytes)?;
-            } else {
-                for_each_active_span(embed_mask, n, |start, len| {
+            if let Some(mask) = partial_mask {
+                for_each_active_span(mask, n, |start, len| {
                     let tokens_host: Vec<i32> = tokens[start..start + len]
                         .iter()
                         .map(|&t| t as i32)
@@ -4909,28 +4911,15 @@ pub(crate) fn batch_chunk_embed_tokens(
                     gpu.hip
                         .memcpy_htod_offset(&pbs.tokens.buf, start * 4, tokens_bytes)
                 })?;
+            } else {
+                let tokens_host: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+                let tokens_bytes: &[u8] =
+                    unsafe { std::slice::from_raw_parts(tokens_host.as_ptr() as *const u8, n * 4) };
+                gpu.hip.memcpy_htod(&pbs.tokens.buf, tokens_bytes)?;
             }
         }
-        if embed_mask == full_mask {
-            match weights.embd_format {
-                EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256_batched(
-                    &weights.token_embd,
-                    &pbs.x_batch,
-                    &pbs.tokens,
-                    n,
-                    dim,
-                )?,
-                EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8_batched(
-                    &weights.token_embd,
-                    &pbs.x_batch,
-                    &pbs.tokens,
-                    n,
-                    dim,
-                )?,
-                _ => unreachable!(),
-            }
-        } else {
-            for_each_active_span(embed_mask, n, |start, len| {
+        if let Some(mask) = partial_mask {
+            for_each_active_span(mask, n, |start, len| {
                 let output = pbs.x_batch.sub_offset(start * dim, len * dim);
                 let token_ids = pbs.tokens.sub_offset(start, len);
                 match weights.embd_format {
@@ -4951,10 +4940,28 @@ pub(crate) fn batch_chunk_embed_tokens(
                     _ => unreachable!(),
                 }
             })?;
+        } else {
+            match weights.embd_format {
+                EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256_batched(
+                    &weights.token_embd,
+                    &pbs.x_batch,
+                    &pbs.tokens,
+                    n,
+                    dim,
+                )?,
+                EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8_batched(
+                    &weights.token_embd,
+                    &pbs.x_batch,
+                    &pbs.tokens,
+                    n,
+                    dim,
+                )?,
+                _ => unreachable!(),
+            }
         }
     } else if do_embed && !pre_embedded {
         for (i, &tok) in tokens.iter().enumerate() {
-            if (embed_mask >> i) & 1 == 0 {
+            if partial_mask.is_some_and(|mask| (mask >> i) & 1 == 0) {
                 continue;
             }
             match weights.embd_format {
@@ -5006,7 +5013,7 @@ pub(crate) fn batch_chunk_embed_tokens(
                 ovr.embed.len(),
                 dim,
             );
-            if (embed_mask >> ovr.slot) & 1 != 0 {
+            if partial_mask.is_none_or(|mask| (mask >> ovr.slot) & 1 != 0) {
                 let bytes: &[u8] =
                     unsafe { std::slice::from_raw_parts(ovr.embed.as_ptr() as *const u8, dim * 4) };
                 let offset = ovr.slot * dim_row_bytes;
@@ -5058,10 +5065,11 @@ pub(crate) fn batch_chunk_upload_positions(
     // while KV writes + attention seq_len keep the flat physical slots
     // (no sibling write race, contiguous-cache invariants intact).
     if !pre_uploaded {
-        let (positions_host, active_mask) = match batch_semantics {
+        // Sequential chunks are fully active and may be wider than a 64-lane mask.
+        let (positions_host, partial_mask) = match batch_semantics {
             BatchSemantics::Sequential => (
                 (0..n).map(|i| (start_pos + i) as i32).collect::<Vec<_>>(),
-                valid_lane_mask(n)?,
+                None,
             ),
             BatchSemantics::Independent {
                 positions,
@@ -5069,14 +5077,14 @@ pub(crate) fn batch_chunk_upload_positions(
                 ..
             } => {
                 debug_assert_eq!(positions.len(), n);
+                let full_mask = valid_lane_mask(n)?;
                 (
                     positions.iter().map(|&p| p as i32).collect::<Vec<_>>(),
-                    active_mask,
+                    (active_mask != full_mask).then_some(active_mask),
                 )
             }
         };
-        let full_mask = valid_lane_mask(n)?;
-        if active_mask == full_mask {
+        if partial_mask.is_none() {
             let positions_bytes: &[u8] =
                 unsafe { std::slice::from_raw_parts(positions_host.as_ptr() as *const u8, n * 4) };
             gpu.hip.memcpy_htod(&pbs.positions.buf, positions_bytes)?;
@@ -5087,7 +5095,7 @@ pub(crate) fn batch_chunk_upload_positions(
                 };
                 gpu.hip.memcpy_htod(&pbs.rope_positions.buf, rope_bytes)?;
             }
-        } else {
+        } else if let Some(active_mask) = partial_mask {
             for_each_active_span(active_mask, n, |start, len| {
                 let positions_bytes: &[u8] = unsafe {
                     std::slice::from_raw_parts(
