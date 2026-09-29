@@ -301,11 +301,13 @@ fn try_packed_mq4_down(
         &pbs.ffn_hidden_batch, hidden_dim, n,
     )?;
     if down.gpu_dtype == DType::MQ4G256V2 {
-        gpu.gemm_mq4v2_packed(&down.buf, &pbs.ffn_hidden_batch, &pbs.x_batch,
-            down.m, down.k, n, true)?;
+        run_residual_gemm_key(gpu, hipfire_dispatch::types::KernelKey::GemmMq4V2PackedResidual,
+            &down.buf, down.gpu_dtype, &pbs.ffn_hidden_batch, &pbs.x_batch,
+            down.m, down.k, n)?;
     } else {
-        gpu.gemm_mq4_packed(&down.buf, &pbs.ffn_hidden_batch, &pbs.x_batch,
-            down.m, down.k, n, true)?;
+        run_residual_gemm_key(gpu, hipfire_dispatch::types::KernelKey::GemmMq4PackedResidual,
+            &down.buf, down.gpu_dtype, &pbs.ffn_hidden_batch, &pbs.x_batch,
+            down.m, down.k, n)?;
     }
     Ok(true)
 }
@@ -361,14 +363,16 @@ fn try_packed_mq4_ffn_gate_up(
             )?;
         }
         if weight.gpu_dtype == DType::MQ4G256V2 {
-            gpu.gemm_mq4v2_packed(
-                &weight.buf, &pbs.x_rot_batch, output,
-                weight.m, weight.k, n, false,
+            run_plain_gemm_key(
+                gpu, hipfire_dispatch::types::KernelKey::GemmMq4V2Packed,
+                &weight.buf, weight.gpu_dtype, &pbs.x_rot_batch, output,
+                weight.m, weight.k, n,
             )?;
         } else {
-            gpu.gemm_mq4_packed(
-                &weight.buf, &pbs.x_rot_batch, output,
-                weight.m, weight.k, n, false,
+            run_plain_gemm_key(
+                gpu, hipfire_dispatch::types::KernelKey::GemmMq4Packed,
+                &weight.buf, weight.gpu_dtype, &pbs.x_rot_batch, output,
+                weight.m, weight.k, n,
             )?;
         }
     }
