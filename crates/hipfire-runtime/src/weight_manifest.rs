@@ -1088,7 +1088,9 @@ fn validate_expert_sources(spec: &ExpertGroupSpec, manifest: &[WeightEntry]) -> 
             }
             let entry = manifest_entry(spec, manifest, &format!("{label}[{index}]"), name)?;
             source_shape_matches(spec, label, per_expert, entry)?;
-            if per_expert {
+            // Sidecars (e.g. PARO pairs/theta/scales) are distinct group-shared
+            // tensors, not one slice per expert, so their shapes may differ.
+            if per_expert && label != "sidecar" {
                 if let Some(previous) = &shape {
                     if previous != &entry.logical_shape {
                         return Err(format!(
@@ -1725,5 +1727,59 @@ mod tests {
         let missing_source =
             validate_expert_group_specs(&[spec(vec!["gate0", "missing"])], &manifest).unwrap_err();
         assert!(missing_source.contains("not found"));
+    }
+
+    #[test]
+    fn per_expert_sidecars_may_differ_in_shape() {
+        let mut manifest = vec![WeightEntry::layer(
+            "router",
+            0,
+            vec![2, 2],
+            DType::F16,
+            ShardPolicy::Replicate,
+        )];
+        for (name, shape) in [
+            ("gate0", vec![2, 2]),
+            ("gate1", vec![2, 2]),
+            ("up0", vec![2, 2]),
+            ("up1", vec![2, 2]),
+            ("down0", vec![2, 2]),
+            ("down1", vec![2, 2]),
+            ("pairs", vec![8, 512]),
+            ("scales", vec![1, 512]),
+        ] {
+            manifest.push(WeightEntry::layer(
+                name,
+                0,
+                shape,
+                DType::F16,
+                ShardPolicy::Replicate,
+            ));
+        }
+        let spec = ExpertGroupSpec {
+            group: "paro".into(),
+            layer: Some(0),
+            n_experts: 2,
+            parallelism: ExpertParallelism::Single,
+            assignment: ExpertAssign::Stride,
+            source_layout: ExpertSourceLayout::PerExpertSeparate {
+                gate: vec!["gate0".into(), "gate1".into()],
+                up: vec!["up0".into(), "up1".into()],
+                down: vec!["down0".into(), "down1".into()],
+                sidecars: vec!["pairs".into(), "scales".into()],
+            },
+            resources: ExpertResourceRequirements::new(vec![
+                ExpertProjectionResources {
+                    gate_bytes: 16,
+                    up_bytes: 16,
+                    down_bytes: 16,
+                    alignment: 8,
+                };
+                2
+            ]),
+            router: "router".into(),
+            execution: "test.paro".into(),
+        };
+        validate_expert_group_specs(&[spec], &manifest).unwrap();
     }
 }
