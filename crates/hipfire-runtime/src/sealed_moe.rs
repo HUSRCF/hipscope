@@ -1232,7 +1232,9 @@ fn validate_and_build_group(
     })
 }
 
-fn validate_physical_device_ids(
+/// Refuse negative physical device ids, and duplicates unless developer
+/// logical-GPU emulation is enabled.
+pub fn validate_physical_device_ids(
     physical_devices: &[i32],
     emulation_enabled: bool,
 ) -> Result<(), String> {

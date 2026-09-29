@@ -1353,10 +1353,6 @@ pub(super) struct MoeRouteReceipt<'a> {
     router: MoeRouterInput,
     n_experts: usize,
     k_top: usize,
-    /// Identity of the score tensor consumed by the producer.  This is kept as
-    /// an opaque pointer identity; no pointer is ever dereferenced here.
-    scores: usize,
-    normalized: bool,
     indices: &'a GpuTensor,
     weights: &'a GpuTensor,
     /// Provenance for adopted EP prefill receipts: the root invocation the
@@ -1579,8 +1575,6 @@ impl SealedMoeCall<'_> {
         usize,
         usize,
         usize,
-        usize,
-        bool,
         Option<u64>,
     )> {
         self.route_receipt.as_ref().map(|receipt| {
@@ -1592,8 +1586,6 @@ impl SealedMoeCall<'_> {
                 receipt.k_top,
                 std::ptr::addr_of!(*receipt.indices) as usize,
                 std::ptr::addr_of!(*receipt.weights) as usize,
-                receipt.scores,
-                receipt.normalized,
                 receipt.adopted_from,
             )
         })
@@ -1612,8 +1604,6 @@ impl SealedMoeCall<'_> {
         usize,
         usize,
         usize,
-        usize,
-        bool,
         Option<u64>,
     )> {
         let router = match self.router {
@@ -1633,8 +1623,6 @@ impl SealedMoeCall<'_> {
             params.k,
             std::ptr::addr_of!(*params.topk_indices) as usize,
             std::ptr::addr_of!(*params.topk_weights) as usize,
-            std::ptr::addr_of!(*params.router_logits) as usize,
-            params.norm_topk_prob,
             None,
         ))
     }
@@ -1662,8 +1650,6 @@ impl<'a> SealedMoeCall<'a> {
             router: self.router,
             n_experts,
             k_top,
-            scores: 0,
-            normalized: false,
             indices,
             weights,
             adopted_from: None,
@@ -1919,8 +1905,6 @@ pub(super) fn produce_prefill_route<'a>(
         router: expected.router,
         n_experts: expected.n_experts,
         k_top: expected.k_top,
-        scores: scores.buf.as_ptr() as usize,
-        normalized: normalize,
         indices: expected.indices,
         weights: expected.weights,
         adopted_from: None,
@@ -2057,8 +2041,6 @@ pub(super) fn adopt_prefill_route<'a>(
         router: call.router,
         n_experts: params.n_exp,
         k_top: params.k_top,
-        scores: 0,
-        normalized: false,
         indices: params.topk_indices,
         weights: params.topk_weights,
         adopted_from: Some(proof.invocation),
@@ -4499,8 +4481,6 @@ mod tests {
             router: MoeRouterInput::PrecomputedSoftmaxTopK,
             n_experts: 4,
             k_top: 2,
-            scores: 0,
-            normalized: false,
             indices: &indices,
             weights: &weights,
             adopted_from: None,
@@ -4511,8 +4491,6 @@ mod tests {
             router: expected.router,
             n_experts: expected.n_experts,
             k_top: expected.k_top,
-            scores: 0,
-            normalized: false,
             indices: expected.indices,
             weights: expected.weights,
             adopted_from: None,
