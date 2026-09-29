@@ -33,7 +33,8 @@
 //! * `soak` — every PM4 rung on both works, cycled for `--secs`.
 //!
 //! Works:
-//! * `empty` — `bb_empty`, 1 workgroup × 64 lanes (the T0 `empty_1x64` shape).
+//! * `empty` — `bb_empty`, 1 workgroup × 64 lanes (the T0 `empty_1x64` shape);
+//!   `empty:<wgs>x<lanes>` for the decode-floor large-grid shapes.
 //! * `rmsnorm` — hipfire's `rmsnorm_f32` (H2's final-norm shape: n = 5120,
 //!   grid 1, block 256, 1 KiB dynamic LDS), chained RAW by ping-pong: kernel i
 //!   reads `x[i % 2]` and writes `x[(i + 1) % 2]`. Every process also runs
@@ -62,7 +63,7 @@ const RMS_N: usize = 5120;
 const RMS_BLOCK: u32 = 256;
 const RMS_LDS: u32 = RMS_BLOCK * 4;
 const RMS_EXPLICIT: usize = 32; // x, weight, out, n, eps
-const EMPTY_LANES: u32 = 64;
+const EMPTY: Work = Work::Empty { wgs: 1, lanes: 64 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Rung {
@@ -130,23 +131,30 @@ impl Rung {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Work {
-    Empty,
+    /// `bb_empty` over `wgs` workgroups of `lanes` lanes.
+    Empty { wgs: u32, lanes: u32 },
     Rmsnorm,
 }
 
 impl Work {
+    /// `empty` (1x64), `empty:<wgs>x<lanes>`, or `rmsnorm`.
     fn parse(s: &str) -> R<Self> {
-        match s {
-            "empty" => Ok(Self::Empty),
-            "rmsnorm" => Ok(Self::Rmsnorm),
-            _ => Err(format!("unknown work {s}")),
+        if s == "empty" {
+            return Ok(EMPTY);
         }
+        if s == "rmsnorm" {
+            return Ok(Self::Rmsnorm);
+        }
+        let shape = s.strip_prefix("empty:").ok_or_else(|| format!("unknown work {s}"))?;
+        let (w, l) = shape.split_once('x').ok_or_else(|| format!("bad shape {shape}"))?;
+        Ok(Self::Empty { wgs: w.parse().map_err(err)?, lanes: l.parse().map_err(err)? })
     }
 
-    fn name(self) -> &'static str {
+    fn name(self) -> String {
         match self {
-            Self::Empty => "empty",
-            Self::Rmsnorm => "rmsnorm",
+            EMPTY => "empty".into(),
+            Self::Empty { wgs, lanes } => format!("empty:{wgs}x{lanes}"),
+            Self::Rmsnorm => "rmsnorm".into(),
         }
     }
 }
@@ -208,7 +216,7 @@ fn parse_args() -> R<Args> {
         out: PathBuf::new(),
         label: String::new(),
         arm: Arm::HipGraph,
-        work: Work::Empty,
+        work: EMPTY,
         n: 1000,
         secs: 10.0,
         parity: 4,
@@ -245,7 +253,7 @@ fn parse_args() -> R<Args> {
         return Err("--arch, --bus, --uuid and --out are required".into());
     }
     if a.label.is_empty() {
-        a.label = format!("{}-{}", a.arm.name().replace(':', "_"), a.work.name());
+        a.label = format!("{}-{}", a.arm.name(), a.work.name()).replace(':', "_");
     }
     if a.n < 2 {
         return Err("--n must be at least 2".into());
@@ -378,7 +386,7 @@ impl Hip {
 fn run_hip(args: &Args, hip: &Hip) -> R<Value> {
     let h = &hip.hip;
     let (co, symbol) = match args.work {
-        Work::Empty => (&args.empty_co, "bb_empty"),
+        Work::Empty { .. } => (&args.empty_co, "bb_empty"),
         Work::Rmsnorm => (&args.rmsnorm_co, "rmsnorm_f32"),
     };
     let image = std::fs::read(co).map_err(|e| format!("{}: {e}", co.display()))?;
@@ -390,7 +398,9 @@ fn run_hip(args: &Args, hip: &Hip) -> R<Value> {
     let launch = |i: usize, blobs: &mut Vec<[u8; RMS_EXPLICIT]>| -> R<()> {
         unsafe {
             match args.work {
-                Work::Empty => h.launch_kernel(&func, [1, 1, 1], [EMPTY_LANES, 1, 1], 0, Some(&stream), &mut []),
+                Work::Empty { wgs, lanes } => {
+                    h.launch_kernel(&func, [wgs, 1, 1], [lanes, 1, 1], 0, Some(&stream), &mut [])
+                }
                 Work::Rmsnorm => {
                     h.launch_kernel_blob(&func, [1, 1, 1], [RMS_BLOCK, 1, 1], RMS_LDS, Some(&stream), &mut blobs[i])
                 }
@@ -480,12 +490,12 @@ fn put_u32(b: &mut [u8], o: usize, v: u32) {
 /// The HIP module-launch implicit suffix, as Redline's
 /// `populate_gfx12_kernarg` synthesizes it (block counts, group sizes, zero
 /// remainders, grid dims, dynamic LDS).
-fn fill_implicit(b: &mut [u8], base: usize, block: u16, lds: u32) {
+fn fill_implicit(b: &mut [u8], base: usize, wgs: u32, block: u16, lds: u32) {
     if b.len() < base + 256 {
         return;
     }
     for axis in 0..3 {
-        put_u32(b, base + axis * 4, 1);
+        put_u32(b, base + axis * 4, if axis == 0 { wgs } else { 1 });
         put_u16(b, base + 12 + axis * 2, if axis == 0 { block } else { 1 });
         put_u16(b, base + 18 + axis * 2, 0);
     }
@@ -545,7 +555,7 @@ impl Pm4 {
     fn build(&self, args: &Args, hip: &Hip, work: Work, rung: Rung) -> R<Ib> {
         let n = args.n;
         let kernel = match work {
-            Work::Empty => &self.empty,
+            Work::Empty { .. } => &self.empty,
             Work::Rmsnorm => &self.rmsnorm,
         };
         let seg = (kernel.metadata().kernarg_segment_size as usize).max(64);
@@ -558,16 +568,16 @@ impl Pm4 {
             for i in 0..n {
                 let b = &mut bytes[i * stride..i * stride + seg];
                 match work {
-                    Work::Empty => fill_implicit(b, 0, EMPTY_LANES as u16, 0),
+                    Work::Empty { wgs, lanes } => fill_implicit(b, 0, wgs, lanes as u16, 0),
                     Work::Rmsnorm => {
                         b[..RMS_EXPLICIT].copy_from_slice(&hip.rms_explicit(i));
-                        fill_implicit(b, RMS_EXPLICIT, RMS_BLOCK as u16, RMS_LDS);
+                        fill_implicit(b, RMS_EXPLICIT, 1, RMS_BLOCK as u16, RMS_LDS);
                     }
                 }
             }
         }
         let (geometry, lds) = match work {
-            Work::Empty => (LaunchGeometry::new([EMPTY_LANES, 1, 1], [EMPTY_LANES as u16, 1, 1]), 0),
+            Work::Empty { wgs, lanes } => (LaunchGeometry::new([wgs * lanes, 1, 1], [lanes as u16, 1, 1]), 0),
             Work::Rmsnorm => (LaunchGeometry::new([RMS_BLOCK, 1, 1], [RMS_BLOCK as u16, 1, 1]), RMS_LDS),
         };
         let geometry = geometry.map_err(err)?;
@@ -679,7 +689,7 @@ fn run_pm4(args: &Args, hip: &Hip, pm4: &mut Pm4, rung: Rung) -> R<Value> {
 
 fn run_soak(args: &Args, hip: &Hip, pm4: &mut Pm4) -> R<Value> {
     let mut ibs = Vec::new();
-    for work in [Work::Empty, Work::Rmsnorm] {
+    for work in [EMPTY, Work::Rmsnorm] {
         for rung in ALL_RUNGS {
             ibs.push((work, rung, pm4.build(args, hip, work, rung)?));
         }
