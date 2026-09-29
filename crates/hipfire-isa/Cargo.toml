@@ -1,0 +1,24 @@
+[package]
+name = "hipfire-isa"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "peacemaker"
+path = "src/bin/peacemaker.rs"
+required-features = ["toolchain"]
+
+[features]
+# gfx11 certification lifts the linked object with M7 (`pm_check`).
+toolchain = ["dep:radiowave", "lift"]
+# `region-import --gdn-object`: lift the hipcc code object with peacemaker.
+lift = ["dep:peacemaker-lift", "dep:peacemaker-ir"]
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+sha2.workspace = true
+radiowave = { path = "../radiowave", optional = true }
+peacemaker-lift = { path = "../peacemaker-lift", optional = true }
+peacemaker-ir = { path = "../peacemaker-ir", optional = true }

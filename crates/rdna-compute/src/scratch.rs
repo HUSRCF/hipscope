@@ -32,6 +32,143 @@ pub struct Mq4v2Fp8Prepared {
     pub scale_mode: i32,
 }
 
+/// Opaque reservation of the shared `int4_mmq_x_scratch` buffer for a
+/// producer-emitted IU4 sidecar (C2). Obtained from
+/// [`ScratchState::reserve_int4_mmq`] / [`crate::Gpu::reserve_int4_mmq`].
+/// Does not launch a quantizer — the producer writes `block_i4_128` in place.
+/// Converted to [`Int4MmqPrepared`] only after a successful producer launch.
+#[derive(Debug)]
+pub struct Int4MmqReservation {
+    ptr: *mut c_void,
+    k: usize,
+    n: usize,
+    generation: u64,
+}
+
+impl Int4MmqReservation {
+    #[inline]
+    pub fn ptr(&self) -> *mut c_void {
+        self.ptr
+    }
+
+    #[inline]
+    pub fn k(&self) -> usize {
+        self.k
+    }
+
+    #[inline]
+    pub fn n(&self) -> usize {
+        self.n
+    }
+
+    #[inline]
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
+/// Frozen producer-emitted IU4 handle. Fields are intentionally private so
+/// consumers cannot reconstruct a fake handle or bypass generation checks.
+/// Valid only until the next `reserve_int4_mmq` on the same Gpu (generation
+/// bump) or teardown.
+#[derive(Debug)]
+pub struct Int4MmqPrepared {
+    ptr: *mut c_void,
+    k: usize,
+    n: usize,
+    generation: u64,
+}
+
+impl Int4MmqPrepared {
+    /// Seal a reservation after the producer wrote the sidecar. Host only —
+    /// no device work.
+    pub fn from_reservation(res: Int4MmqReservation) -> Self {
+        Self {
+            ptr: res.ptr,
+            k: res.k,
+            n: res.n,
+            generation: res.generation,
+        }
+    }
+
+    /// Validate generation / (k,n) / pointer against the live scratch and
+    /// return the device pointer for the IU4 consumer. Fails closed on any
+    /// mismatch so a stale handle cannot silently re-enter the standalone
+    /// quantizer path.
+    pub fn checked_ptr(
+        &self,
+        live_generation: u64,
+        live_ptr: *mut c_void,
+        k: usize,
+        n: usize,
+    ) -> HipResult<*mut c_void> {
+        if self.ptr.is_null()
+            || live_ptr.is_null()
+            || self.ptr != live_ptr
+            || self.generation != live_generation
+            || self.k != k
+            || self.n != n
+        {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "Int4MmqPrepared: stale or mismatched IU4 sidecar handle",
+            ));
+        }
+        Ok(self.ptr)
+    }
+
+    #[inline]
+    pub fn k(&self) -> usize {
+        self.k
+    }
+
+    #[inline]
+    pub fn n(&self) -> usize {
+        self.n
+    }
+
+    #[inline]
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
+/// Reservation for one producer-emitted `block_i8_128` sidecar.
+#[derive(Debug)]
+pub struct Int8MmqReservation {
+    ptr: *mut c_void,
+    k: usize,
+    n: usize,
+    generation: u64,
+}
+
+impl Int8MmqReservation {
+    pub fn ptr(&self) -> *mut c_void { self.ptr }
+    pub fn k(&self) -> usize { self.k }
+    pub fn n(&self) -> usize { self.n }
+}
+
+/// Valid only until the next int8 sidecar reservation or quantization.
+#[derive(Debug)]
+pub struct Int8MmqPrepared {
+    ptr: *mut c_void,
+    k: usize,
+    n: usize,
+    generation: u64,
+}
+
+impl Int8MmqPrepared {
+    pub fn from_reservation(res: Int8MmqReservation) -> Self {
+        Self { ptr: res.ptr, k: res.k, n: res.n, generation: res.generation }
+    }
+
+    pub fn checked_ptr(&self, generation: u64, ptr: *mut c_void, k: usize, n: usize) -> HipResult<*mut c_void> {
+        if ptr.is_null() || ptr != self.ptr || generation != self.generation || k != self.k || n != self.n {
+            return Err(hip_bridge::HipError::new(0, "Int8MmqPrepared: stale or mismatched A8 sidecar"));
+        }
+        Ok(ptr)
+    }
+}
 
 pub struct ScratchState {
     pub mq_signs1: Option<GpuTensor>,
@@ -82,6 +219,17 @@ pub struct ScratchState {
     /// never writes, so aliasing would corrupt both routes.
     pub int4_mmq_x_scratch: Option<DeviceBuffer>,
     pub int4_mmq_x_scratch_bytes: usize,
+    /// Generation bumped on every `reserve_int4_mmq` so a prepared handle
+    /// cannot outlive a later re-reservation of the same scratch slot.
+    pub int4_mmq_generation: u64,
+    /// Generation whose `int4_mmq_x_scratch` contents a slab producer twin
+    /// wrote (`HIPFIRE_IU4_SLAB` planes, read only by the `_b1s` GEMMs).
+    /// Every other generation holds token-order `block_i4_128` records.
+    pub int4_mmq_slab_generation: Option<u64>,
+    /// A8 `block_i8_128` sidecar, [K/128, N] of 136-byte blocks.
+    pub int8_mmq_x_scratch: Option<DeviceBuffer>,
+    pub int8_mmq_x_scratch_bytes: usize,
+    pub int8_mmq_generation: u64,
     /// Dedicated MQ4v2 FP8 pre-pass X buffer (E4M3 bytes, [N,K]). Not shared
     /// with `fp8_x_scratch` and never pointer-cached — always overwritten.
     pub mq4v2_fp8_x_scratch: Option<DeviceBuffer>,
@@ -92,6 +240,10 @@ pub struct ScratchState {
     /// Per-row power-of-two (or unit) scales [N] f32 for MQ4v2 FP8 activations.
     pub mq4v2_fp8_row_scales_scratch: Option<DeviceBuffer>,
     pub mq4v2_fp8_row_scales_scratch_bytes: usize,
+    /// One reusable F2 weight workspace: Wf followed by Rw and Ew. Each
+    /// repack overwrites all valid planes before its same-stream GEMM reads them.
+    pub fp8_f2_weights: Option<DeviceBuffer>,
+    pub fp8_f2_weights_bytes: usize,
     /// Partials buffer for the deterministic K-split GEMM (ksplit_det):
     /// [K_SPLITS][batch_size][M] fp32, grows-never-shrinks.
     pub ksplit_det_partials: Option<DeviceBuffer>,
@@ -102,6 +254,23 @@ pub struct ScratchState {
     /// in one allocation; grows-never-shrinks.
     pub sample_partials: Option<DeviceBuffer>,
     pub sample_partials_bytes: usize,
+    /// F4b: f16 Q scratch for the gfx11 FA2 pair (`attention_fa2_q_preconvert_gfx11`
+    /// writes it, the FA2 body reads it): [batch, 24, 256] f16, grows-never-shrinks.
+    /// Every valid cell is written by the pre-convert launch before the body reads
+    /// it (same-stream ordering), so no init is needed.
+    pub fa2_q16_scratch: Option<DeviceBuffer>,
+    pub fa2_q16_scratch_bytes: usize,
+    /// Stage-b fp8 Q scratch (the stage-b Q pre-convert writes it, the
+    /// stage-b FA2 body reads it): [batch, 24, 256] e4m3 codes followed by
+    /// [batch, 24] f32 `sq`, followed (route Q only) by the 64-key scale
+    /// plane (256 B per (blockIdx.x, kv_h, split) slot: 64 f16 K scales +
+    /// 64 f16 V scales). Grows-never-shrinks with the same pre-growth
+    /// capture invalidation as `fa2_q16_scratch`. Route N never sizes the
+    /// scale plane (it reads scales from the native row header). Every
+    /// valid cell is written by the pre-convert/fill before the body reads
+    /// it (same-stream ordering), so no init is needed.
+    pub fa2_fp8_q_scratch: Option<DeviceBuffer>,
+    pub fa2_fp8_q_scratch_bytes: usize,
 }
 
 // ── Shared kernel dispatch helpers ──────────────────────────────────────
@@ -119,7 +288,7 @@ pub(crate) fn compile_and_load_kernel(
     if functions.contains_key(func_name) {
         return Ok(());
     }
-    let obj_path = compiler.compile(module_name, source)?;
+    let obj_path = compiler.compile_for_symbol(module_name, source, func_name)?;
     let obj_path_str = obj_path.to_str().unwrap().to_string();
     // Alias the launched function name to this arch's compiled artifact so the
     // retained-PM4 capture can resolve func_name -> owning .hsaco even when the
@@ -129,7 +298,7 @@ pub(crate) fn compile_and_load_kernel(
         compiler.register_func_artifact(func_name, std::path::PathBuf::from(&obj_path_str));
     }
     if !modules.contains_key(module_name) {
-        let module = module_load_or_recompile(hip, compiler, module_name, source, &obj_path_str)?;
+        let module = module_load_or_recompile(hip, compiler, module_name, source, func_name, &obj_path_str)?;
         modules.insert(module_name.to_string(), module);
     }
     let module = &modules[module_name];
@@ -154,6 +323,7 @@ pub(crate) fn module_load_or_recompile(
     compiler: &mut crate::compiler::KernelCompiler,
     module_name: &str,
     source: &str,
+    symbol: &str,
     obj_path: &str,
 ) -> HipResult<Module> {
     match hip.module_load(obj_path) {
@@ -163,7 +333,7 @@ pub(crate) fn module_load_or_recompile(
                 "  {module_name}: cached kernel image invalid (HIP {}); recompiling from source",
                 e.code
             );
-            let fresh = compiler.recompile(module_name, source)?;
+            let fresh = compiler.recompile(module_name, source, symbol)?;
             hip.module_load(fresh.to_str().unwrap())
         }
         Err(e) => Err(e),
@@ -298,7 +468,7 @@ fn gen_fwht_signs(seed: u32, n: usize) -> Vec<f32> {
 /// session that sees a sequence of increasing shapes leaks one buffer per
 /// distinct larger shape.
 ///
-/// Measured on gfx1100 (25.8 GB) before this fix, issuing requests with
+/// Measured on gfx1100 (25.8 GB) before the leak fix, issuing requests with
 /// growing prompts and sampling VRAM between them: repeating the SAME shape
 /// cost +0.0 MB (the buffer is correctly reused), while each larger shape
 /// added its FULL size rather than the increment --
@@ -312,6 +482,22 @@ fn gen_fwht_signs(seed: u32, n: usize) -> Vec<f32> {
 /// bounded by the largest shape ever seen, so this sync is rare and its cost
 /// is irrelevant next to the allocation it replaces.
 ///
+/// A captured hipGraph embeds the pointers live at capture time, so this
+/// function MUST NOT free a replaced buffer while a stale graph could still
+/// replay it: freeing here once broke qwen35 outright, every turn empty with
+/// `spec_step: HipError(700) ... reset_recurrent`. The previous revision
+/// handled that with `std::mem::forget(old)` once any graph had been
+/// captured — correct output, but the retained buffers were the 5.7 GB leak
+/// above. The fix is invalidation, not retention: every `Gpu` caller checks
+/// [`scratch_will_grow`] before delegating and drops all captured execution
+/// state first (`Gpu::invalidate_for_scratch_growth`, which reuses the
+/// model-swap teardown `invalidate_for_layout_growth`: AR graph + verify /
+/// replay graphs + retained Redline route). Graphs re-capture lazily on the
+/// next replay, so each growth event costs at most one re-capture — rare, and
+/// bounded by the largest shape ever seen. Per-pointer attribution is
+/// impossible (captured graphs store only baked device pointers, no slot
+/// provenance), so invalidation is wholesale by design.
+///
 /// Frees BEFORE allocating: the whole point is to run when memory is tight,
 /// and holding both at once is what we are trying to avoid. On allocation
 /// failure the slot is left empty with a zero byte count, so the `?` in the
@@ -322,21 +508,14 @@ fn grow_scratch_buffer(
     have_bytes: &mut usize,
     needed: usize,
 ) -> HipResult<()> {
-    if *have_bytes >= needed && slot.is_some() {
+    if !scratch_will_grow(*have_bytes, slot.is_some(), needed) {
         return Ok(());
     }
     if let Some(old) = slot.take() {
-        if crate::graph::any_graph_captured() {
-            // A captured hipGraph embeds the pointers live at capture time, so
-            // releasing this buffer would make every later replay read freed
-            // memory. Measured: freeing here breaks qwen35 outright, every turn
-            // empty with `spec_step: HipError(700) ... reset_recurrent`. Retain
-            // it (the pre-existing behaviour) and let the process reclaim it.
-            std::mem::forget(old);
-        } else {
-            hip.device_synchronize()?;
-            let _ = hip.free(old);
-        }
+        // The caller invalidated captured graphs before delegating (see the
+        // doc comment): no live graph embeds `old`, so sync + free is safe.
+        hip.device_synchronize()?;
+        let _ = hip.free(old);
     }
     *have_bytes = 0;
     let fresh = hip.malloc(needed)?;
@@ -345,7 +524,139 @@ fn grow_scratch_buffer(
     Ok(())
 }
 
+/// True when [`grow_scratch_buffer`] would replace the slot: the early-return
+/// condition factored out so `Gpu` callers can invalidate captured graphs
+/// BEFORE delegating. Single source of truth — the two sites cannot drift.
+///
+/// `slot_is_some` matters: a never-allocated slot with a stale non-zero byte
+/// count must still allocate.
+#[inline]
+pub(crate) fn scratch_will_grow(
+    have_bytes: usize,
+    slot_is_some: bool,
+    needed: usize,
+) -> bool {
+    !(have_bytes >= needed && slot_is_some)
+}
+
+/// Whether a scratch growth must invalidate captured execution state first:
+/// a graph has been captured in this process, and no capture/record is in
+/// flight (mid-flight invalidation would clear the `capture_blobs` the
+/// in-flight capture is filling). Pure so the contract is unit-testable;
+/// `Gpu::invalidate_for_scratch_growth` feeds it live state.
+#[inline]
+pub(crate) fn scratch_growth_invalidates(
+    graph_captured: bool,
+    capture_mode: bool,
+    recording: bool,
+) -> bool {
+    graph_captured && !capture_mode && !recording
+}
+
+/// Byte size of the `q8_1_mmq_x_scratch` slot for `(k, batch_size)`: one 144 B
+/// `block_q8_1_mmq` per [K/128 block, batch]. Shared by
+/// `ensure_q8_1_mmq_x` / `ensure_q8_1_mmq_x128` and their `Gpu` callers, which
+/// need the same number for the pre-growth invalidation check.
+#[inline]
+pub(crate) fn q8_1_mmq_x_needed(k: usize, batch_size: usize) -> usize {
+    let blocks_k = (k + 127) / 128;
+    let block_q8_1_mmq_bytes = 144usize;
+    blocks_k * batch_size * block_q8_1_mmq_bytes
+}
+/// Byte geometry of the stage-b fp8 Q scratch slot for
+/// `(batch_size, n_splits, with_scale_plane)`: returns
+/// `(total_bytes, sq_offset, scale_offset)` where `sq_offset` starts the
+/// `[batch, 24]` f32 `sq` section after the `[batch, 24, 256]` e4m3 codes,
+/// and `scale_offset` starts the route-Q 64-key scale plane (256 B per
+/// `(blockIdx.x, kv_h, split)` slot: 64 f16 K scales + 64 f16 V scales).
+/// Route N passes `with_scale_plane = false` (scales come from the native
+/// row header, never sized in). All three sections are 16-byte aligned at
+/// every admitted batch (codes are batch*6144 B, sq batch*96 B, plane
+/// slots*256 B). Shared by `ensure_fa2_fp8_q_scratch` and the stage-b
+/// launchers, which need the same number for the pre-growth invalidation
+/// check. Callers must have validated `batch_size`/`n_splits` first.
+#[inline]
+pub(crate) fn fa2_fp8_q_needed(
+    batch_size: usize,
+    n_splits: usize,
+    with_scale_plane: bool,
+) -> (usize, usize, usize) {
+    let codes_bytes = batch_size * 24 * 256;
+    let sq_bytes = batch_size * 24 * 4;
+    let sq_offset = codes_bytes;
+    let scale_offset = codes_bytes + sq_bytes;
+    let scale_bytes = if with_scale_plane {
+        batch_size.div_ceil(8) * 4 * n_splits * 256
+    } else {
+        0
+    };
+    (scale_offset + scale_bytes, sq_offset, scale_offset)
+}
+
+/// Byte size of the `int4_mmq_x_scratch` slot for `(k, batch_size)`: one 72 B
+/// `block_i4_128` per [K/128 block, batch]. Shared by `ensure_int4_mmq_x`
+/// and its `Gpu` caller.
+#[inline]
+pub(crate) fn int4_mmq_x_needed(k: usize, batch_size: usize) -> usize {
+    let blocks_k = (k + 127) / 128;
+    let block_i4_128_bytes = 72usize;
+    blocks_k * batch_size * block_i4_128_bytes
+}
+
+/// Byte size of the `int4_mmq_x_scratch` slot for a producer reservation
+/// `(k, n)`. Shared by `reserve_int4_mmq` and its `Gpu` caller. The caller
+/// must have checked `k % 256 == 0 && n > 0` first (same as `reserve_int4_mmq`).
+#[inline]
+pub(crate) fn int4_mmq_reserve_needed(k: usize, n: usize) -> usize {
+    let blocks_k = k / 128;
+    blocks_k * n * 72
+}
+
+#[inline]
+pub(crate) fn int8_mmq_x_needed(k: usize, n: usize) -> usize {
+    k.div_ceil(128) * n * 136
+}
+
+/// Byte sizes of the three MQ4v2 FP8 pre-pass buffers `(x_fp8, half_sums,
+/// row_scales)` for `(n, k)`: X8 = `n*k` bytes, half_sums =
+/// `n*(k/256)*2` f32, row_scales = `n` f32. Shared by
+/// `prepare_mq4v2_fp8_x` / `prepare_mq4v2_fp8_x_f32` and their `Gpu` caller.
+#[inline]
+pub(crate) fn mq4v2_fp8_needed(n: usize, k: usize) -> (usize, usize, usize) {
+    let x_fp8_bytes = n.checked_mul(k).expect("mq4v2 fp8 x extent overflow");
+    let groups = k / 256;
+    let half_sums_bytes = n
+        .checked_mul(groups)
+        .and_then(|v| v.checked_mul(2))
+        .and_then(|v| v.checked_mul(std::mem::size_of::<f32>()))
+        .expect("mq4v2 fp8 half_sums extent overflow");
+    let row_scales_bytes = n
+        .checked_mul(std::mem::size_of::<f32>())
+        .expect("mq4v2 fp8 row_scales extent overflow");
+    (x_fp8_bytes, half_sums_bytes, row_scales_bytes)
+}
+
+/// Wf (Mp*K bytes), Rw (Mp*K/128 f32), Ew (Mp f32).
+pub(crate) fn fp8_f2_weight_extents(m: usize, k: usize) -> Option<(usize, usize, usize)> {
+    let mp = m.checked_add(255)? / 256 * 256;
+    let wf = mp.checked_mul(k)?;
+    let rw = mp.checked_mul(k / 128)?.checked_mul(4)?;
+    let ew = mp.checked_mul(4)?;
+    Some((wf, rw, ew))
+}
+
 impl ScratchState {
+    /// Grow the single ordered-stream F2 workspace; no caller may retain
+    /// its contents after a later repack, even when the allocation did not grow.
+    pub(crate) fn ensure_fp8_f2_weights(
+        &mut self,
+        hip: &HipRuntime,
+        needed: usize,
+    ) -> HipResult<*mut c_void> {
+        grow_scratch_buffer(hip, &mut self.fp8_f2_weights, &mut self.fp8_f2_weights_bytes, needed)?;
+        Ok(self.fp8_f2_weights.as_ref().unwrap().as_ptr())
+    }
+
     /// Ensure the ksplit_det partials scratch is at least `n_bytes`, growing
     /// (never shrinking). Returns the device pointer. No init needed: every
     /// valid output cell is written exactly once per K-split before finalize.
@@ -381,6 +692,44 @@ impl ScratchState {
         Ok(self.sample_partials.as_ref().unwrap().as_ptr())
     }
 
+    /// Ensure the F4b FA2 f16 Q scratch holds at least `n_bytes`
+    /// (batch*24*256*2 for the gfx11 FA2 pair), growing (never shrinking).
+    /// Returns the device base pointer. No init needed: the pre-convert
+    /// launch writes every valid cell before the FA2 body reads it
+    /// (same-stream ordering).
+    pub fn ensure_fa2_q16_scratch(
+        &mut self,
+        hip: &HipRuntime,
+        n_bytes: usize,
+    ) -> HipResult<*mut c_void> {
+        grow_scratch_buffer(
+            hip,
+            &mut self.fa2_q16_scratch,
+            &mut self.fa2_q16_scratch_bytes,
+            n_bytes,
+        )?;
+        Ok(self.fa2_q16_scratch.as_ref().unwrap().as_ptr())
+    }
+    /// Ensure the stage-b FA2 fp8 Q scratch holds at least `n_bytes`
+    /// (`fa2_fp8_q_needed(batch, n_splits, with_scale_plane).0`), growing
+    /// (never shrinking). Returns the device base pointer: e4m3 codes at
+    /// +0, f32 `sq` at +batch*24*256, route-Q scale plane after that.
+    /// No init needed: the stage-b pre-convert/fill writes every valid
+    /// cell before the stage-b body reads it (same-stream ordering).
+    pub fn ensure_fa2_fp8_q_scratch(
+        &mut self,
+        hip: &HipRuntime,
+        n_bytes: usize,
+    ) -> HipResult<*mut c_void> {
+        grow_scratch_buffer(
+            hip,
+            &mut self.fa2_fp8_q_scratch,
+            &mut self.fa2_fp8_q_scratch_bytes,
+            n_bytes,
+        )?;
+        Ok(self.fa2_fp8_q_scratch.as_ref().unwrap().as_ptr())
+    }
+
     /// Ensure the dedicated GEMV-residual temporary can hold at least
     /// `min_elems` F32 values, growing on demand and never shrinking.
     pub fn ensure_gemv_residual_tmp(
@@ -396,6 +745,13 @@ impl ScratchState {
             .as_ref()
             .map_or(true, |tmp| tmp.buf.size() < needed_bytes);
         if needs_grow {
+            // `GpuTensor` has no `Drop` impl: overwrite would strand the old
+            // device allocation. The `Gpu` caller invalidated captured graphs
+            // first (same contract as `grow_scratch_buffer`), so sync + free.
+            if let Some(old) = self.gemv_residual_tmp.take() {
+                hip.device_synchronize()?;
+                let _ = hip.free(old.buf);
+            }
             self.gemv_residual_tmp = Some(GpuTensor {
                 buf: hip.malloc(needed_bytes)?,
                 shape: vec![min_elems],
@@ -499,6 +855,11 @@ impl ScratchState {
                 return Ok(());
             }
         }
+        // Free-before-alloc: `GpuTensor` has no `Drop`; see `ensure_gemv_residual_tmp`.
+        if let Some(old) = self.paro_x_scratch.take() {
+            hip.device_synchronize()?;
+            let _ = hip.free(old.buf);
+        }
         let buf = hip.malloc(dim * 4)?; // F32
         self.paro_x_scratch = Some(GpuTensor {
             buf,
@@ -527,11 +888,23 @@ impl ScratchState {
                 // Grow any buffer that's too small (never shrinks).
                 for buf in bufs.iter_mut() {
                     if buf.buf.size() < needed_bytes {
-                        *buf = GpuTensor {
-                            buf: hip.malloc(needed_bytes)?,
-                            shape: vec![k],
-                            dtype: DType::F32,
-                        };
+                        // Alloc-first (not free-first): a malloc failure leaves
+                        // the old buffer live in the slot via `?`, and these
+                        // four F32 rows are small enough that briefly holding
+                        // both is harmless. `GpuTensor`/`DeviceBuffer` have no
+                        // `Drop`, so free the replaced buffer explicitly. The
+                        // `Gpu` caller invalidated captured graphs first (same
+                        // contract as `grow_scratch_buffer`), so sync + free.
+                        let old = std::mem::replace(
+                            buf,
+                            GpuTensor {
+                                buf: hip.malloc(needed_bytes)?,
+                                shape: vec![k],
+                                dtype: DType::F32,
+                            },
+                        );
+                        hip.device_synchronize()?;
+                        let _ = hip.free(old.buf);
                     }
                 }
             }
@@ -907,18 +1280,10 @@ impl ScratchState {
         k: usize,
         scale_mode: i32,
     ) -> HipResult<Mq4v2Fp8Prepared> {
+        let mut row_scale_shift = crate::gemv::fp8_row_scale_shift()?;
         compile_and_load_kernel(compiler, hip, modules, functions, module, ksrc, symbol)?;
 
-        let x_fp8_bytes = n.checked_mul(k).expect("mq4v2 fp8 x extent overflow");
-        let groups = k / 256;
-        let half_sums_bytes = n
-            .checked_mul(groups)
-            .and_then(|v| v.checked_mul(2))
-            .and_then(|v| v.checked_mul(std::mem::size_of::<f32>()))
-            .expect("mq4v2 fp8 half_sums extent overflow");
-        let row_scales_bytes = n
-            .checked_mul(std::mem::size_of::<f32>())
-            .expect("mq4v2 fp8 row_scales extent overflow");
+        let (x_fp8_bytes, half_sums_bytes, row_scales_bytes) = mq4v2_fp8_needed(n, k);
 
         grow_scratch_buffer(
             hip,
@@ -958,6 +1323,7 @@ impl ScratchState {
             &mut k_val as *mut _ as *mut c_void,
             &mut n_val as *mut _ as *mut c_void,
             &mut scale_mode_m as *mut _ as *mut c_void,
+            &mut row_scale_shift as *mut _ as *mut c_void,
         ];
         // Profile bytes: input row read (F16×2 B or F32×4 B per elem) + FP8
         // bytes, half-sums and row-scales writes. Bandwidth attribution only;
@@ -1000,6 +1366,7 @@ impl ScratchState {
                 b.push_i32(k_val);
                 b.push_i32(n_val);
                 b.push_i32(scale_mode);
+                b.push_i32(row_scale_shift);
                 b
             },
         );
@@ -1053,9 +1420,7 @@ impl ScratchState {
             "quantize_q8_1_mmq_ds4",
         )?;
 
-        let blocks_k = (k + 127) / 128;
-        let block_q8_1_mmq_bytes = 144usize;
-        let needed = blocks_k * batch_size * block_q8_1_mmq_bytes;
+        let needed = q8_1_mmq_x_needed(k, batch_size);
         grow_scratch_buffer(
             hip,
             &mut self.q8_1_mmq_x_scratch,
@@ -1141,9 +1506,7 @@ impl ScratchState {
             "quantize_q8_1_mmq_ds4_x128",
         )?;
 
-        let blocks_k = (k + 127) / 128;
-        let block_q8_1_mmq_bytes = 144usize;
-        let needed = blocks_k * batch_size * block_q8_1_mmq_bytes;
+        let needed = q8_1_mmq_x_needed(k, batch_size);
         grow_scratch_buffer(
             hip,
             &mut self.q8_1_mmq_x_scratch,
@@ -1198,10 +1561,11 @@ impl ScratchState {
     /// Ensure prefill activations are quantized to int4 (`block_i4_128`, 72 B
     /// per [K/128 block, batch]: f32 d, i32 s, 64 B nibbles) for the
     /// iu4-direct MMQ consumer (`gemm_mq4g256v2_mmq_prequant_iu4`), gated by
-    /// `HIPFIRE_GFX11_MQ4V2_IU4`. Same [K/128, batch] order and always-launch
+    /// `HIPFIRE_IU4_PREFILL`. Same [K/128, batch] order and always-launch
     /// lifetime contract as [`Self::ensure_q8_1_mmq_x128`], but a dedicated
     /// `int4_mmq_x_scratch` buffer — the layouts differ (72 B vs 144 B) and
     /// the iu4 consumer reads nibble headers the Q8_1 prelude never writes.
+    /// Bumps `int4_mmq_generation` so any prior prepared handle fails closed.
     pub fn ensure_int4_mmq_x(
         &mut self,
         hip: &HipRuntime,
@@ -1229,15 +1593,15 @@ impl ScratchState {
             "quantize_int4_mmq_ds128",
         )?;
 
-        let blocks_k = (k + 127) / 128;
-        let block_i4_128_bytes = 72usize;
-        let needed = blocks_k * batch_size * block_i4_128_bytes;
+        let needed = int4_mmq_x_needed(k, batch_size);
         grow_scratch_buffer(
             hip,
             &mut self.int4_mmq_x_scratch,
             &mut self.int4_mmq_x_scratch_bytes,
             needed,
         )?;
+        // Invalidate any outstanding prepared producer handle.
+        self.int4_mmq_generation = self.int4_mmq_generation.wrapping_add(1);
 
         let src_ptr = x.buf.as_ptr();
         let must_convert = true;
@@ -1255,7 +1619,7 @@ impl ScratchState {
             ];
             let grid_x = ((k + 1023) / 1024) as u32;
             let grid_y = batch_size as u32;
-            let bytes = batch_size * k * 4 + blocks_k * batch_size * block_i4_128_bytes;
+            let bytes = batch_size * k * 4 + needed;
             let timer =
                 crate::profile::begin_timer(hip, "quantize", "quantize_int4_mmq_ds128", bytes);
             launch_maybe_blob(
@@ -1287,6 +1651,181 @@ impl ScratchState {
         }
 
         Ok(self.int4_mmq_x_scratch.as_ref().unwrap().as_ptr())
+    }
+
+    /// Grow `int4_mmq_x_scratch` for a producer-emitted IU4 sidecar and bump
+    /// the generation. Does **not** launch `quantize_int4_mmq_ds128` — the
+    /// RMSNorm/FWHT or SwiGLU/FWHT producer writes the 72-byte blocks.
+    pub fn reserve_int4_mmq(
+        &mut self,
+        hip: &HipRuntime,
+        k: usize,
+        n: usize,
+    ) -> HipResult<Int4MmqReservation> {
+        if k == 0 || n == 0 || k % 256 != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "reserve_int4_mmq: need k%256==0 and n>0",
+            ));
+        }
+        let needed = int4_mmq_reserve_needed(k, n);
+        grow_scratch_buffer(
+            hip,
+            &mut self.int4_mmq_x_scratch,
+            &mut self.int4_mmq_x_scratch_bytes,
+            needed,
+        )?;
+        self.int4_mmq_generation = self.int4_mmq_generation.wrapping_add(1);
+        let ptr = self.int4_mmq_x_scratch.as_ref().unwrap().as_ptr();
+        Ok(Int4MmqReservation {
+            ptr,
+            k,
+            n,
+            generation: self.int4_mmq_generation,
+        })
+    }
+
+    /// Always re-quantize the f32 activation row into the dedicated A8 sidecar.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ensure_int8_mmq_x(
+        &mut self,
+        hip: &HipRuntime,
+        compiler: &mut crate::compiler::KernelCompiler,
+        modules: &mut HashMap<String, Module>,
+        functions: &mut HashMap<String, Function>,
+        stream: Option<&Stream>,
+        capture_blobs: &mut Vec<Vec<u8>>,
+        capture_mode: bool,
+        force_blob_path: bool,
+        replay: &mut crate::replay::ReplayController,
+        device_id: i32,
+        x: &GpuTensor,
+        n: usize,
+        k: usize,
+    ) -> HipResult<*mut c_void> {
+        crate::graph::bind_thread(hip, device_id)?;
+        compile_and_load_kernel(
+            compiler, hip, modules, functions,
+            "gemm_mq4g256v2_residual_mmq_i8_gfx12",
+            kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_I8_GFX12_SRC,
+            "quantize_int8_mmq_ds128",
+        )?;
+        let needed = int8_mmq_x_needed(k, n);
+        grow_scratch_buffer(hip, &mut self.int8_mmq_x_scratch, &mut self.int8_mmq_x_scratch_bytes, needed)?;
+        self.int8_mmq_generation = self.int8_mmq_generation.wrapping_add(1);
+        let xp = x.buf.as_ptr();
+        let yp = self.int8_mmq_x_scratch.as_ref().unwrap().as_ptr();
+        let mut x_ptr = xp;
+        let mut y_ptr = yp;
+        let mut k_val = k as i32;
+        let mut n_val = n as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut x_ptr as *mut _ as *mut c_void, &mut y_ptr as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void, &mut n_val as *mut _ as *mut c_void,
+        ];
+        let timer = crate::profile::begin_timer(hip, "quantize", "quantize_int8_mmq_ds128", n*k*4 + needed);
+        launch_maybe_blob(
+            hip, Some(&*compiler), functions, stream, capture_blobs, capture_mode,
+            force_blob_path, Some(replay), "quantize_int8_mmq_ds128",
+            [k.div_ceil(1024) as u32, n as u32, 1], [256, 1, 1], 0, &mut params,
+            || {
+                let mut b = KernargBlob::new();
+                b.push_ptr(xp); b.push_ptr(yp); b.push_i32(k_val); b.push_i32(n_val); b
+            },
+        )?;
+        if let Some(t) = timer { t.finish(hip); }
+        Ok(yp)
+    }
+
+    pub fn reserve_int8_mmq(&mut self, hip: &HipRuntime, k: usize, n: usize) -> HipResult<Int8MmqReservation> {
+        if k == 0 || n == 0 || k % 256 != 0 {
+            return Err(hip_bridge::HipError::new(0, "reserve_int8_mmq: need k%256==0 and n>0"));
+        }
+        let needed = int8_mmq_x_needed(k, n);
+        grow_scratch_buffer(hip, &mut self.int8_mmq_x_scratch, &mut self.int8_mmq_x_scratch_bytes, needed)?;
+        self.int8_mmq_generation = self.int8_mmq_generation.wrapping_add(1);
+        Ok(Int8MmqReservation {
+            ptr: self.int8_mmq_x_scratch.as_ref().unwrap().as_ptr(),
+            k, n, generation: self.int8_mmq_generation,
+        })
+    }
+
+    pub fn int8_mmq_live(&self) -> (u64, *mut c_void) {
+        (self.int8_mmq_generation, self.int8_mmq_x_scratch.as_ref().map_or(std::ptr::null_mut(), |b| b.as_ptr()))
+    }
+    /// Grow the three MQ4v2 FP8 pre-pass buffers for a producer-emitted FP8
+    /// stream and return their device pointers `(x_fp8, half_sums,
+    /// row_scales)`. Does **not** launch `pack_f32_to_fp8_mq4v2_gfx12` — the
+    /// fused `_mq4v2_fp8_gfx12` producer writes all three planes in place
+    /// with byte-identical outputs. Same always-overwrite contract as
+    /// `prepare_mq4v2_fp8_x_impl` (never pointer-cached); the caller seals
+    /// the pointers into [`Mq4v2Fp8Prepared`] only after a successful
+    /// producer launch.
+    pub fn grow_mq4v2_fp8_for_producer(
+        &mut self,
+        hip: &HipRuntime,
+        n: usize,
+        k: usize,
+    ) -> HipResult<(*mut c_void, *mut c_void, *mut c_void)> {
+        if k == 0 || n == 0 || k % 256 != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "grow_mq4v2_fp8_for_producer: need k%256==0 and n>0",
+            ));
+        }
+        let (x_fp8_bytes, half_sums_bytes, row_scales_bytes) = mq4v2_fp8_needed(n, k);
+        grow_scratch_buffer(
+            hip,
+            &mut self.mq4v2_fp8_x_scratch,
+            &mut self.mq4v2_fp8_x_scratch_bytes,
+            x_fp8_bytes,
+        )?;
+        grow_scratch_buffer(
+            hip,
+            &mut self.mq4v2_fp8_half_sums_scratch,
+            &mut self.mq4v2_fp8_half_sums_scratch_bytes,
+            half_sums_bytes,
+        )?;
+        grow_scratch_buffer(
+            hip,
+            &mut self.mq4v2_fp8_row_scales_scratch,
+            &mut self.mq4v2_fp8_row_scales_scratch_bytes,
+            row_scales_bytes,
+        )?;
+        Ok((
+            self.mq4v2_fp8_x_scratch.as_ref().unwrap().as_ptr(),
+            self.mq4v2_fp8_half_sums_scratch.as_ref().unwrap().as_ptr(),
+            self.mq4v2_fp8_row_scales_scratch.as_ref().unwrap().as_ptr(),
+        ))
+    }
+
+    /// Live generation + pointer for [`Int4MmqPrepared::checked_ptr`].
+    #[inline]
+    pub fn int4_mmq_live(&self) -> (u64, *mut c_void) {
+        let ptr = self
+            .int4_mmq_x_scratch
+            .as_ref()
+            .map(|b| b.as_ptr())
+            .unwrap_or(std::ptr::null_mut());
+        (self.int4_mmq_generation, ptr)
+    }
+
+    /// Record that a slab producer twin wrote the live generation sealed
+    /// into `prepared` (host only). Fails closed on a stale handle.
+    pub fn mark_int4_mmq_slab(&mut self, prepared: &Int4MmqPrepared) -> HipResult<()> {
+        let (generation, ptr) = self.int4_mmq_live();
+        prepared.checked_ptr(generation, ptr, prepared.k(), prepared.n())?;
+        self.int4_mmq_slab_generation = Some(generation);
+        Ok(())
+    }
+
+    /// True when `ptr` is the live IU4 scratch and its contents are the slab
+    /// layout; a later reservation or standalone quantize bumps the
+    /// generation, so this can never describe overwritten contents.
+    #[inline]
+    pub fn int4_mmq_slab_at(&self, ptr: *mut c_void) -> bool {
+        let (generation, live) = self.int4_mmq_live();
+        !ptr.is_null() && ptr == live && self.int4_mmq_slab_generation == Some(generation)
     }
 
     /// Invalidate the FP16/FP8 activation scratch caches. Must be called
@@ -1829,4 +2368,117 @@ fn alloc_tensor_on(
         shape: shape.to_vec(),
         dtype,
     })
+}
+
+#[cfg(test)]
+mod scratch_growth_tests {
+    use super::*;
+
+    /// The will-grow predicate is the single source of truth shared by
+    /// `grow_scratch_buffer` and every `Gpu` pre-growth invalidation guard.
+    /// These two sites must agree, or a growth frees a buffer a live graph
+    /// embeds (HipError 700) or an invalidation fires without a growth
+    /// (needless re-capture every decode token).
+    #[test]
+    fn will_grow_matches_replacement_condition() {
+        // Empty slot must allocate, even against a stale byte count.
+        assert!(scratch_will_grow(0, false, 100));
+        assert!(scratch_will_grow(10_000, false, 100));
+        // Occupied slot: only when short.
+        assert!(scratch_will_grow(0, true, 100));
+        assert!(scratch_will_grow(99, true, 100));
+        assert!(!scratch_will_grow(100, true, 100));
+        assert!(!scratch_will_grow(10_000, true, 100));
+        // Zero-size requests never grow an occupied slot.
+        assert!(!scratch_will_grow(100, true, 0));
+    }
+
+    /// Invalidation fires exactly when a stale graph could exist and no
+    /// capture/record is in flight. Mid-flight invalidation would clear the
+    /// `capture_blobs` the in-flight capture is filling, corrupting it.
+    #[test]
+    fn invalidation_contract() {
+        // Nothing captured: never invalidate (keeps pre-capture prefill and
+        // the never-capturing archs on the fast path).
+        assert!(!scratch_growth_invalidates(false, false, false));
+        assert!(!scratch_growth_invalidates(false, true, false));
+        assert!(!scratch_growth_invalidates(false, false, true));
+        // Captured, steady state: invalidate (the leak fix).
+        assert!(scratch_growth_invalidates(true, false, false));
+        // Captured but mid-flight: never invalidate.
+        assert!(!scratch_growth_invalidates(true, true, false));
+        assert!(!scratch_growth_invalidates(true, false, true));
+        assert!(!scratch_growth_invalidates(true, true, true));
+    }
+
+    /// Geometry helpers shared by the ensure bodies and the `Gpu` guards:
+    /// both sides must compute the same byte counts.
+    #[test]
+    fn needed_helpers_match_slot_geometry() {
+        // q8_1: 144 B per [K/128 block, batch].
+        assert_eq!(q8_1_mmq_x_needed(2048, 8192), 16 * 8192 * 144);
+        assert_eq!(q8_1_mmq_x_needed(2048, 65535), 16 * 65535 * 144);
+        // Non-multiple K rounds up a block.
+        assert_eq!(q8_1_mmq_x_needed(2049, 1), 17 * 1 * 144);
+        // int4: 72 B per [K/128 block, batch].
+        assert_eq!(int4_mmq_x_needed(2048, 1024), 16 * 1024 * 72);
+        assert_eq!(int4_mmq_reserve_needed(2048, 1024), 16 * 1024 * 72);
+        // mq4v2 fp8: n*k bytes, n*(k/256)*2 f32 half-sums, n f32 row scales.
+        assert_eq!(mq4v2_fp8_needed(32, 2048), (65536, 32 * 8 * 2 * 4, 32 * 4));
+    }
+    /// Stage-b fp8 Q scratch layout (§3–§4 of the stage-b plan): sections
+    /// 16-byte aligned and mutually disjoint for every admitted
+    /// batch × splits combination, with the route-Q scale plane never
+    /// aliasing `sq` and route N sizing no plane at all.
+    #[test]
+    fn fa2_fp8_q_layout_aligned_and_disjoint() {
+        for &batch in &[1usize, 7, 8, 9, 512] {
+            for &splits in &[1usize, 8] {
+                for &with_plane in &[false, true] {
+                    let (total, sq_off, scale_off) =
+                        fa2_fp8_q_needed(batch, splits, with_plane);
+                    let codes_bytes = batch * 24 * 256;
+                    let sq_bytes = batch * 24 * 4;
+                    // Sections tile the buffer exactly, in order.
+                    assert_eq!(sq_off, codes_bytes, "b={batch} s={splits}");
+                    assert_eq!(scale_off, codes_bytes + sq_bytes, "b={batch} s={splits}");
+                    // Every section start (and the end) is 16-byte aligned.
+                    assert_eq!(sq_off % 16, 0, "b={batch}");
+                    assert_eq!(scale_off % 16, 0, "b={batch}");
+                    assert_eq!(total % 16, 0, "b={batch} s={splits}");
+                    // Non-empty codes/sq for every admitted batch.
+                    assert!(codes_bytes > 0 && sq_bytes > 0);
+                    let grid_x = batch.div_ceil(8);
+                    let n_slots = grid_x * 4 * splits;
+                    if with_plane {
+                        // 256 B per (blockIdx.x, kv_h, split) slot: 64 f16
+                        // K scales + 64 f16 V scales.
+                        assert_eq!(total - scale_off, n_slots * 256);
+                        // First and last slots' K/V halves are disjoint and
+                        // inside the plane.
+                        for &slot in &[0, n_slots - 1] {
+                            let base = scale_off + slot * 256;
+                            let k_end = base + 128;
+                            let v_end = base + 256;
+                            assert!(base >= scale_off && v_end <= total);
+                            assert!(k_end <= base + 128 && base + 128 < v_end);
+                        }
+                    } else {
+                        // Route N: no scale plane sized in, nothing aliases sq.
+                        assert_eq!(total, scale_off);
+                    }
+                }
+                // Route N never pays for the route-Q plane.
+                let (with, _, _) = fa2_fp8_q_needed(batch, splits, true);
+                let (without, _, _) = fa2_fp8_q_needed(batch, splits, false);
+                assert!(with > without);
+            }
+        }
+        // Pin the §13 total: batch 512 / 8 splits with plane = 3,719,168 B.
+        assert_eq!(fa2_fp8_q_needed(512, 8, true).0, 3_719_168);
+        assert_eq!(
+            fa2_fp8_q_needed(512, 8, true),
+            (3_719_168, 512 * 24 * 256, 512 * 24 * 256 + 512 * 24 * 4)
+        );
+    }
 }

@@ -30,7 +30,10 @@ pub fn mq4r_redline_default(gpu_arch: &str, model_path: &str, pp: usize, tp: usi
 /// dispatch path that cannot yet execute it. Delete this carve-out together
 /// with the lowering. DeepSeek4 MQ2R is narrower still: only the certified
 /// gfx1151 single-GPU AR route is admitted, and an installed drafter keeps the
-/// model on its speculative execution path.
+/// model on its speculative execution path. Qwen3.5 dense (arch 5) on exact
+/// gfx1201 is admitted for any weight format on the single-GPU plain-AR route
+/// (no drafter): its retained PM4 decode tape is byte-identical to the HIP
+/// AR graph. `replay.backend = "hip"` opts out.
 pub fn retained_redline_default(
     gpu_arch: &str,
     model_arch: &str,
@@ -43,6 +46,14 @@ pub fn retained_redline_default(
         return false;
     }
     if mq4r_redline_default(gpu_arch, model_path, pp, tp) {
+        return true;
+    }
+    if gpu_arch.eq_ignore_ascii_case("gfx1201")
+        && model_arch.eq_ignore_ascii_case("qwen3_5")
+        && pp == 1
+        && tp == 1
+        && !has_drafter
+    {
         return true;
     }
     gpu_arch.eq_ignore_ascii_case("gfx1151")
@@ -93,6 +104,10 @@ pub struct RuntimeConfig {
     pub uniform_vram_tolerance_gb: Option<f32>,
     pub mtp_mode: String,
     pub mtp_k: usize,
+    /// Opt-in gfx1151 XDNA NPU spillover (`kernel.npu_spillover`,
+    /// `HIPFIRE_NPU_SPILLOVER`). Default false; snapshotted once here, never
+    /// re-read from the environment on hot paths.
+    pub npu_spillover: bool,
 }
 
 static CONFIG: OnceLock<RuntimeConfig> = OnceLock::new();
@@ -183,9 +198,9 @@ impl RuntimeConfig {
             max_total_think_tokens: value("HIPFIRE_MAX_TOTAL_THINK_TOKENS")
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(0),
-            // `hardware.devices` is installed as physical ROCr selectors and
-            // matching logical HIP selectors before GPU initialization. The
-            // engine therefore addresses the filtered set as logical 0..N-1.
+            // Each `hardware.devices` entry resolves to one physical card,
+            // installed as a ROCr selector with HIP logical `0..N-1` before
+            // GPU initialization. The engine addresses that set as 0..N-1.
             devices: value("HIPFIRE_DEVICES")
                 .filter(|value| !value.is_empty())
                 .map(|value| {
@@ -204,6 +219,7 @@ impl RuntimeConfig {
             mtp_k: value("HIPFIRE_MTP_K")
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(3),
+            npu_spillover: value("HIPFIRE_NPU_SPILLOVER").as_deref() == Some("1"),
         }
     }
 }
@@ -213,6 +229,26 @@ mod tests {
     use super::{mq4r_redline_default, retained_redline_default, RuntimeConfig};
     use hipfire_config::{resolve, ConfigLayer, ConfigSource, NamedLayer, ProcessConfig};
 
+    #[test]
+    fn npu_spillover_is_off_unless_process_snapshot_enables_it() {
+        let process = ProcessConfig::from_resolved(&resolve([]).unwrap()).unwrap();
+        let cfg = RuntimeConfig::from_process_config(&process);
+        assert!(!cfg.npu_spillover);
+        let mut layer = ConfigLayer::default();
+        layer.set_cli("kernel.npu_spillover", "true").unwrap();
+        let process = ProcessConfig::from_resolved(
+            &resolve([NamedLayer {
+                source: ConfigSource::GlobalUser {
+                    path: "config.toml".into(),
+                },
+                layer,
+            }])
+            .unwrap(),
+        )
+        .unwrap();
+        let cfg = RuntimeConfig::from_process_config(&process);
+        assert!(cfg.npu_spillover);
+    }
     #[test]
     fn ngram_loop_guard_is_off_by_default() {
         let process = ProcessConfig::from_resolved(&resolve([]).unwrap()).unwrap();
@@ -432,5 +468,23 @@ mod tests {
             1,
             false,
         ));
+    }
+
+    #[test]
+    fn qwen35_dense_redline_default_requires_gfx1201_single_gpu_ar() {
+        let h2 = "/models/h2.group-alpha-refit.hfq";
+        assert!(retained_redline_default("gfx1201", "qwen3_5", h2, 1, 1, false));
+        // A drafter keeps the model on its speculative path.
+        assert!(!retained_redline_default("gfx1201", "qwen3_5", h2, 1, 1, true));
+        // Pipeline / tensor parallel stay on HIP.
+        assert!(!retained_redline_default("gfx1201", "qwen3_5", h2, 2, 1, false));
+        assert!(!retained_redline_default("gfx1201", "qwen3_5", h2, 1, 2, false));
+        // Exact gfx1201 only; other dense archs and the MoE sibling stay on HIP.
+        for gpu_arch in ["gfx1100", "gfx1151", "gfx1200"] {
+            assert!(!retained_redline_default(gpu_arch, "qwen3_5", h2, 1, 1, false));
+        }
+        for model_arch in ["qwen3_5_moe", "qwen3", "qwen2", "gemma4"] {
+            assert!(!retained_redline_default("gfx1201", model_arch, h2, 1, 1, false));
+        }
     }
 }

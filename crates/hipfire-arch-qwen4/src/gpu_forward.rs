@@ -271,6 +271,9 @@ pub(crate) fn dense_ref<'a>(
         row_stride: row_stride(tensor.dtype, k),
         rotation: None,
         awq_scale: None,
+        lloyd_lut_e4m3: None,
+        lloyd_lut_f16: None,
+        lloyd_lut_c16: None,
     })
 }
 

@@ -182,8 +182,9 @@ encoding of legacy `MQ4G128`: typed Qwen4 sealed/dense consumers admit qt=53
 through dedicated kernels, while generic loaders and GPU consumers MUST reject
 it rather than reinterpret it as the legacy format.
 The Qwen4 producer chooses qt=44 when `K % 256 == 0` and qt=53 otherwise.
-qt=52 remains Qwen4's non-weight raw-I64 metadata record and is not a
-quantized dtype.
+qt=54 is Qwen4's non-weight raw-I64 metadata record and is not a
+quantized dtype (Qwen4 artifacts written before qt=52 became MQ4G256V2L
+used qt=52 for it; only the Qwen4 loader still reads that spelling).
 
 Each logical row is tiled independently as `ceil(K / 128)` groups.  A final
 partial group is zero-padded to 128 values before the FWHT-128 transform; the
@@ -551,3 +552,60 @@ files, where the launcher plumbing amortises.
   matched-granularity Lloyd comparison, and its amendment
 - `docs/perf-checkpoints/2026-08-17-gl-clips-the-largest-coefficient-in-83pct-of-blocks.md` —
   the clipping diagnosis that started this line
+
+---
+
+## 11 · Lloyd variant (qt=52)
+
+**qt=52 `MQ4G256V2L` / `DType::MQ4G256V2Lloyd`** keeps the **same 136 B group
+container** as qt=44 (dual fp16 scale+zero per 128 weights at `[0..8)`, 128 B
+nibbles at `[8..136)`). The nibble payload is still 4-bit indices `q ∈ 0..15`;
+what changes is the reconstruction table.
+
+### Sidecar
+
+Each weight tensor may carry a per-tensor F32[16] sidecar named
+`<tensor>.lloyd_levels` (loader alias `lloyd_levels`). Levels `L[0..15]` are
+constrained to the E4M3-centered grid:
+
+```text
+L ∈ { 7.5 + e  :  e finite E4M3 (bias-7),  |e| < 8 }
+```
+
+so centered magnitudes stay inside the dense E4M3 region used by gfx12 FP8
+WMMA prefill (`|C| ≤ 7.5`).
+
+### Loader rewrite
+
+At load time the host centers the codebook and rewrites the zero-point in the
+weight header **before** GPU upload (file bytes keep the uncentered `zp`):
+
+```text
+C[q]  = L[q] − 7.5
+zp'   = f16(zp + 7.5 · sc)     # sc untouched
+w     = sc · C[q] + zp'
+```
+
+Kernel LUTs:
+
+| Path | LUT entry |
+|---|---|
+| FP8 prefill (gfx12 WMMA) | `E4M3(L − 7.5)` as 4 kernel-arg dwords per source tensor |
+| Decode GEMV | `f16(L − 7.5)` |
+
+AWQ composes exactly as for qt=44: when a tensor carries `awq_scale`, the
+activation path divides by the scale before FWHT; the weight path remains
+`W' = W · diag(s)` offline. Lloyd centering and AWQ are independent.
+
+### Product tiers
+
+| Tier name | Role |
+|---|---|
+| `mq4l-xt` | Lloyd XT (light / bandwidth) |
+| `mq4l` / `mq4-l` | Lloyd base |
+| `mq4l-pro` | Lloyd pro (heavier cal / AWQ stack) |
+
+Wire id is always qt=52; tier labels are ladder/product names, not separate
+codecs. See [`QUANTIZATION.md`](../QUANTIZATION.md) inventory and
+`crates/hipfire-runtime/src/lloyd_lut.rs` for the host contract.
+

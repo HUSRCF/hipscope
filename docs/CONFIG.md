@@ -133,7 +133,7 @@ Process-wide scalar policy is typed as well:
 
 | Key | Default | Values / purpose |
 |---|---:|---|
-| `hardware.devices` | `null` | Physical device list installed as `ROCR_VISIBLE_DEVICES`; HIP receives matching post-filter logical selectors `0..N-1` before initialization, avoiding compounded nonzero filters. |
+| `hardware.devices` | `null` | Comma-separated device list in logical order: PCI-order index (`rocm-smi` order), `gfxNNNN` (first free card of that arch; repeat for more), `GPU-<uuid>`, or PCI address. Resolved from the KFD topology, reserved, installed as `ROCR_VISIBLE_DEVICES` UUIDs/ordinals plus HIP `0..N-1` before initialization, and checked against HIP after it. See [multi-gpu.md](multi-gpu.md#device-selection). |
 | `hardware.uniform_vram_tolerance_gb` | `null` | Free-VRAM spread override; unset uses the compiled default. |
 | `generation.loop_guard_threshold` | `0` | Repeated 4-gram count that forces EOS; zero disables. |
 | `generation.loop_guard_window` | `256` | Token window inspected by the loop guard. |
@@ -205,7 +205,7 @@ startup.
 | `presence_penalty` | `0.0` | number 0.0–2.0 | OpenAI-style flat penalty over the repeat window; zero disables it. |
 | `repeat_penalty` | `1.05` | number 1.0–3.0 | Kept low; higher values harm some MQ4 greedy paths (source comment). Stored default only; see send path below. |
 | `max_tokens` | `4096` | int 1–393216 | Per-turn generation cap for run / OpenAI fallback; 384 Ki tokens matches DeepSeek V4 Flash 0731's documented maximum output length. |
-| `max_seq` | `32768` | int 512–1048576 | KV logical capacity at load; the 1 Mi-token ceiling is serviced by VMM growth where supported. |
+| `max_seq` | automatic on growing Qwen VMM KV | int 512–1048576 when set | Default: min(checkpoint `config.text_config.max_position_embeddings`, card capacity after weights, admitted prefill scratch, and VRAM headroom). Explicit user values override either bound, including the trained window. |
 | `thinking` | `"on"` | `on` \| `off` | Thinking **mode** (on/off). Independent of effort and of any hard think-token cap. When off wins, effort and cap controls are dropped with a warning. |
 | `reasoning_effort` | `"auto"` | `auto` \| `none` \| `low` \| `medium` \| `high` \| `xhigh` \| `max` | **Semantic** effort only — prompt / framing strength. Field meaning never changes by family and is **never** reinterpreted as a token budget. Unsupported or cross-family values are dropped with a warning (see below). |
 | `thinking_budget` | `"med"` | `low` \| `med` \| `high` \| `xhigh` \| `max` \| `uncapped` | Legacy **named cap preset** only on models that still honor that config route. Not an effort dial. On effort-native models the string is dropped with a warning (no implicit cap). |
@@ -278,22 +278,142 @@ model's contract still accepts the named-cap route):
 
 | Key | Default | Validated values |
 |---|---|---|
-| `kv_cache` | `"auto"` | `auto`, `q8`, `asym4`, `asym3`, `asym2`, `fwht4`, `fwht3`, `fwht2`, `turbo`, `turbo4`, `turbo3`, `turbo2` |
+| `kv_cache` | `"auto"` | `auto`, `q8`, `asym4`, `asym3`, `asym2`, `fwht4`, `fwht3`, `fwht2`, `turbo`, `turbo4`, `turbo3`, `turbo2`, `fp8`, `bf16` (family-dependent) |
+| `kv_k` | empty (unset) | Qwen-only: `q8`, `fwht2`–`fwht4`, `asym2`–`asym4`, `turbo`/`turbo2`–`turbo4`, `legacy-asym2`–`legacy-asym4` |
+| `kv_v` | empty (unset) | Qwen-only: `q8`, `lloyd2`–`lloyd4` |
 | `kv_adaptive` | `"off"` | `off`, `conservative`, `balanced`, `aggressive`, or `advanced:k=<fwht4\|fwht3\|fwht2>,v=<lloyd4\|lloyd3\|lloyd2>` |
+| `kv_backend` | automatic (prefer VMM) | `legacy` \| `vmm` |
 
-**Resolution of `auto`:** registry entry `default_kv_mode` if present and valid;
-else universal fallback **`q8`**. There is no per-arch implicit FWHT table.
+### Mode, K, and V
 
-`turbo*` values remain accepted aliases for validation/compat; resolution maps them in `resolveKvMode`.
+`memory.kv_cache` / `--kv-mode` is the whole-cache preset: quantized modes
+seed a split *(K, V)* pair, while native `fp8`/`bf16` are one K+V layout
+without an independent V axis. Typed `memory.kv_k` / `memory.kv_v` (CLI
+`--kv-k` / `--kv-v`) are **Qwen-only** axis overrides, empty by default and
+omitted from IPC when unset. They replace their respective axis of a split
+pair; see the native override refusal below.
 
-`kv_adaptive` is opt-in. With adaptive on, `max_seq` is the context guaranteed at the floor tier. Daemon param overrides `HIPFIRE_KV_ADAPTIVE` when set through CLI load path.
+**Qwen K names** (shared table for `--kv-mode` preset K and `--kv-k`):
 
-`--kv-backend vmm` enables on-demand HIP VMM mapping for single-GPU Qwen3.5
-`q8`, `asym3`, and `fwht3` KV caches. The default remains `contiguous`. VMM
-currently does not compose with pipeline/expert parallelism or CASK/TriAttention
-eviction.
+- `q8` → Q8 K
+- `fwht2` \| `fwht3` \| `fwht4` → signed FWHT K at that bit width
+- `asym2` \| `asym3` \| `asym4` and `turbo` \| `turbo2` \| `turbo3` \| `turbo4`
+  → **FWHT** K (`turbo` ≡ `fwht3`, `turboN`/`asymN` ≡ `fwhtN`). These are
+  not the old Givens-Asym constructors.
+- `legacy-asym2` \| `legacy-asym3` \| `legacy-asym4` → old Givens-Asym K
+  (explicit rollback spelling)
 
-Legacy one-shot alias: `HIPFIRE_KV_MODE` (see [`env-vars.md`](env-vars.md)).
+**Qwen V names:** `q8`, `lloyd2`, `lloyd3`, `lloyd4`. Lloyd V **requires**
+FWHT K (including `asymN`/`turboN` aliases that resolve to FWHT). Lloyd V
+with `q8` or `legacy-asymN` K is rejected before teardown.
+
+**Native pairs are indivisible.** An authored `--kv-mode fp8` or `bf16`
+(or the same via config) cannot be combined with any authored K or V axis
+override — even when the override would equal the native axis. Adaptive
+plus a fixed K/V override is likewise refused. An `auto` selection that
+landed on eligible gfx1201 native FP8 is **not** an authored `fp8` mode:
+both axes together may replace that pair when the constructor supports
+them; a single axis against native FP8 refuses and advises `--kv-mode q8`
+or both axes (never FP8-K/Q8-V).
+
+Unsupported K/V by topology, head dimension, or arch; static CASK with
+FWHT/Lloyd-V; and explicit native FP8/BF16 on unsupported arch/PP all fail
+**before** destructive teardown with requested/effective values and
+supported alternatives. No silent fallback on unsupported Qwen sites.
+
+**Resolution of `auto` / unset (Qwen family):** Q8/Q8 on every route
+(HFQ, PaRo, PP, Dir) except exact **gfx1201** eligible single-GPU sites
+whose accepted set includes native FP8, which select FP8/FP8. Qwen PP/Dir
+without an FP8 constructor stay Q8/Q8. gfx1200 / gfx11 / gfx94x never
+inherit FP8. Registry Qwen cards leave mode as `auto` (no q8 pin).
+
+**Non-Qwen families are unchanged:** Maple keeps BF16/BF16 (registry and
+direct-path auto; explicit `--kv-mode q8` still works). Gemma4 eager stays
+Q8/Q8; lowered stays sliding Q8 / full Asym3+Q8. DeepSeek4 keeps its F32
+compressor default (or explicit F16); V is not independently selectable
+there. Other carriers keep their existing site policy.
+
+**Kill switch:** `HIPFIRE_QWEN_KV_DEFAULT_Q8=0` restores the prior
+*implicit Qwen* per-site default (HFQ/PaRo auto distinctions). Default is
+ON (Q8/Q8). It must not override any authored CLI/config mode or K/V, must
+not touch the exact eligible gfx1201 FP8 path, and must not affect
+non-Qwen families.
+
+**Precedence** (each key independently — mode, K, V, backend):
+
+CLI flag **>** one-shot env **>** per-model TOML **>** global TOML **>**
+registry preset / arch default.
+
+Mode supplies the initial layout; axis overrides apply to split modes
+regardless of which layer authored the mode. Effective resolution logs
+`requested mode=…, effective K=…, effective V=…` for split layouts or
+`requested mode=…, effective KV=fp8` (respectively `bf16`) for native.
+
+`kv_adaptive` is opt-in and is a *changing tier* path (starts FWHT4/Q8,
+downshifts toward FWHT/Lloyd floors), not a fixed static pair. With
+adaptive on, `max_seq` is the context guaranteed at the floor tier. Daemon
+param overrides `HIPFIRE_KV_ADAPTIVE` when set through the CLI load path.
+Adaptive plus authored `--kv-k`/`--kv-v` is rejected.
+
+### `kv_backend` (allocation backend)
+
+Accepted values are **`legacy`** and **`vmm` only**. The former spelling
+`contiguous` is **rejected** with an actionable migration message naming
+`legacy` (e.g. use `--kv-backend legacy` or
+`memory.kv_backend = "legacy"`). It is not a deprecated alias.
+
+Omitted `memory.kv_backend` / `--kv-backend` is **automatic**. Automatic
+selects on-demand HIP VMM mapping on certified Qwen layout/device/topology
+combinations (single-GPU and dense TP with per-rank VMM), covering static
+modes, adaptive, and native `fp8`/`bf16`. Otherwise it falls back to
+**legacy** once per load, logging the reason and the effective backend.
+Absolute HFQ/safetensors paths and registry tags resolve identically for
+the same source/mode/topology; registry cards set neither backend nor
+`memory.max_seq`, but may still set `generation.max_tokens`. On
+gfx1100/gfx1151 the certified Qwen VMM route is q8 only; unvalidated modes
+retain the existing legacy fallback.
+
+For single-card **dense** Qwen HFQ VMM loads, omission of `max_seq` first
+preflights projected model fit before tearing down a resident model. After
+weights actually load, the Qwen carrier measures free VRAM immediately before
+KV construction. It subtracts only the minimum viable 512-row prefill scratch,
+the existing 1 GiB transient headroom and VMM page rounding to derive card
+capacity; the preflight weight projection never caps the effective context.
+Only full-attention layers carry KV (16 of 64 for Qwen3.8-27B), so card capacity
+divides that remaining memory by the selected K+V token stride. VMM reserves
+virtual space to `max_seq` and maps physical pages on demand; without eviction,
+`physical_cap == max_seq`, while CASK can make `physical_cap < max_seq`.
+Larger prefill PBS allocations are lazy: each request chooses the widest rung
+that fits currently free VRAM after mapped (not virtually reserved) KV. When
+future KV growth needs the memory, widened PBS reuse is released between
+requests, allowing later chunks to narrow rather than making growth OOM.
+The loaded diagnostic reports `max_seq`, its `model`/`card`/`user` bound,
+`model_ctx`, `card_cap` and KV mode. Qwen MoE keeps its prior 32768 built-in
+default (with a loaded diagnostic reason) until its distinct prefill scratch can
+be budgeted; other carriers keep their existing context behavior until their
+different cache ownership can use the same allocation accounting.
+
+**Explicit backend override precedence** (forced choices, not automatic
+policy): CLI `--kv-backend` **>** per-model TOML `memory.kv_backend` **>**
+global TOML `memory.kv_backend`. Explicit `legacy` always wins and never
+emits a misleading VMM marker. Explicit `vmm` on an unsupported combination
+fails with an actionable capability error **before** resident-model teardown
+and never silently falls back (refusal may suggest `--kv-backend legacy`).
+
+Unsupported automatic cases (for example MoE EP/PP, non-Qwen carriers without a
+matching owner, uncertified device/OS, or missing HIP VMM symbols) keep
+legacy service with a logged reason. Adaptive→CASK handoff **requires**
+VMM: if VMM is unavailable that combination is refused rather than handed off as
+invalid legacy. Private speculative draft caches (DFlash/MTP) are owned
+separately from the trunk KV backend and do not relabel it; their actual backend
+is logged on its own.
+
+On Windows (ROCm 7.2), VMM maps the full reservation upfront for correctness —
+do not expect on-demand VRAM savings there. There is no env-based second default
+for the backend (`memory.kv_backend` has no `HIPFIRE_*` compat binding).
+
+One-shot aliases: `HIPFIRE_KV_MODE` for **mode** only; see also
+`HIPFIRE_QWEN_KV_DEFAULT_Q8` above and [`env-vars.md`](env-vars.md).
 
 ---
 
@@ -588,7 +708,7 @@ uses ambient variables in engine hot paths.
 | `ngram_min_count` | `speculation.ngram_min_count` | `HIPFIRE_NGRAM_MIN_COUNT` | 2 |
 | `prompt_cache_capacity` | `memory.prompt_cache_capacity` | `HIPFIRE_PROMPT_CACHE_CAP` | 32 |
 | `prompt_cache_unbounded` | `memory.prompt_cache_unbounded` | `HIPFIRE_PROMPT_CACHE_UNBOUNDED` | false |
-| `devices` | `hardware.devices` | `HIPFIRE_DEVICES` | unset |
+| `devices` | `hardware.devices` | `HIPFIRE_DEVICES` (alias `HIPFIRE_DEVICE`) | unset |
 | `allow_mixed_arch` | `hardware.allow_mixed_arch` | `HIPFIRE_ALLOW_MIXED_ARCH` | false unless `1` |
 | `uniform_vram_tolerance_gb` | `hardware.uniform_vram_tolerance_gb` | `HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB` | unset |
 | `mtp_mode` | `speculation.mtp` | `HIPFIRE_MTP_MODE` | `"auto"` |
@@ -602,7 +722,7 @@ policy and filename/registry discovery.
 
 Note: CLI `ddtree_budget` default is `0` while bare `RuntimeConfig` default is `256` when only env/runtime path is used — CLI load params are the product path for `hipfire run`/`serve`.
 
-Redline eligibility helper `mq4r_redline_default` (same file) is a **narrow runtime-default predicate** for replay backend selection (exact GPU arch `gfx1100`/`gfx1151`/`gfx1201` + case-insensitive `.mq4r` + pp=tp=1; model-family agnostic, no `arch_id` gate; `gfx1200` and all other arches remain opt-in), not a general config key and not Redline certification/registry admission. Built-in `hip` config profile or an explicit backend selection disables the automatic default. Policy: [`REDLINE.md`](REDLINE.md).
+Redline eligibility helpers `mq4r_redline_default` and `retained_redline_default` (same file) are **narrow runtime-default predicates** for replay backend selection: exact GPU arch `gfx1100`/`gfx1151`/`gfx1201` + case-insensitive `.mq4r` + pp=tp=1 (model-family agnostic, no `arch_id` gate; `gfx1200` and all other arches remain opt-in), plus Qwen3.5 dense (`qwen3_5`) plain-AR decode on exact `gfx1201` with pp=tp=1 and no drafter. They are not general config keys and not Redline certification/registry admission. `replay.backend = "hip"`, the built-in `hip` config profile or another explicit backend selection disables the automatic default. Policy: [`REDLINE.md`](REDLINE.md).
 
 ---
 

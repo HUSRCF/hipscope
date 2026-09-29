@@ -102,8 +102,8 @@ const MFP4G32E8SOA_BLOCK_SIZE: u64 = 32;
 /// kernels assert (`assert!(k % 256 == 0)`).
 const MFP4G32E8SOA_K_ALIGNMENT: u64 = 256;
 /// Raw signed-I64 records are a distinct HFQ type.  TidI32 is not a valid
-/// representation for Qwen4's hash metadata.
-const QWEN4_I64_QUANT_TYPE: u8 = 52;
+/// representation for Qwen4's hash metadata. (qt=52 is MQ4G256V2L.)
+const QWEN4_I64_QUANT_TYPE: u8 = 54;
 const MAX_HEADER_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_CONFIG_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_REOPEN_REGION_BYTES: u64 = 64 * 1024 * 1024;
@@ -5530,7 +5530,7 @@ mod tests {
         let (_file, tensor) = source_tensor(&bytes, vec![3], "I64");
         assert_eq!(read_i64_array(&tensor, 3).unwrap(), values);
         assert_eq!(i64_role("x.layer_multipliers"), Some(I64Role::Multipliers));
-        assert_eq!(QWEN4_I64_QUANT_TYPE, 52);
+        assert_eq!(QWEN4_I64_QUANT_TYPE, 54);
         assert!(
             validate_output_entry_len("x.layer_multipliers", QWEN4_I64_QUANT_TYPE, &[3], 24,)
                 .is_ok()

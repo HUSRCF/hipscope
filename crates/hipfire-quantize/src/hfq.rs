@@ -88,6 +88,7 @@ impl QuantType {
             49 => Some(Self::MQ3G256V2),
             50 => Some(Self::MQ2G256V2),
             51 => Some(Self::MQ2G256LloydU),
+            52 => Some(Self::MQ4G256V2L),
             53 => Some(Self::MQ4G128V2),
             _ => None,
         }
@@ -241,6 +242,11 @@ pub(crate) enum QuantType {
     /// approximation. Three slots are used, slot 3 duplicates slot 2 and is
     /// never indexed. 2.25 bpw. `K % 256 == 0`.
     MQ2G256LloydU = 51,
+    /// MQ4G256V2L (qt=52): MQ4v2 wire layout (136 B/group, per-128 fp16 sc/zp) with
+    /// codes indexing a per-tensor 16-level Lloyd-Max codebook `L` in [0,15] units.
+    /// Dequant: `w = sc · L[q] + zp`. Codebook shipped as F32 sidecar
+    /// `<stem>.lloyd_levels.weight` shape `[16]` (not embedded in the weight blob).
+    MQ4G256V2L = 52,
     /// MQ4-G128 v2 (qt=53): FWHT-rotated 4-bit, per-128 asymmetric affine.
     /// Each logical row is independently tiled as `ceil(K/128)` groups; every
     /// group is 68 B: `[0..2)` fp16 scale, `[2..4)` fp16 zero, `[4..68)`
@@ -282,6 +288,7 @@ pub(crate) fn default_promote_target(base: GgufFormat) -> GgufFormat {
         | GgufFormat::Mq3
         | GgufFormat::Mq4
         | GgufFormat::Mq4V2
+        | GgufFormat::Mq4V2Lloyd
         | GgufFormat::Mq4C
         | GgufFormat::Mq5
         | GgufFormat::Mq6

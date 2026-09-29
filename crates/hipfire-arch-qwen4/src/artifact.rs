@@ -24,7 +24,16 @@ use std::sync::Arc;
 
 const QWEN4_FORMAT_VERSION: u32 = 1;
 const QWEN4_QT_BF16: u8 = 16;
-const QWEN4_QT_I64: u8 = 52;
+/// Raw signed-I64 metadata record (non-weight).
+const QWEN4_QT_I64: u8 = 54;
+/// Artifacts quantized before qt=52 went to MQ4G256V2L wrote their I64 records
+/// as qt=52; the loader still reads that spelling so published files keep
+/// loading. The runtime labels it by the register name (`MQ4G256V2L`).
+const QWEN4_QT_I64_LEGACY: u8 = 52;
+
+fn is_qwen4_i64(quant_type: u8) -> bool {
+    quant_type == QWEN4_QT_I64 || quant_type == QWEN4_QT_I64_LEGACY
+}
 const QWEN4_QT_MQ4G256V2: u8 = 44;
 const QWEN4_QT_MQ4G128V2: u8 = 53;
 /// MQ6G256V2 (qt=47): aligned-K 256 groups, 200 B/group (6-bit payload).
@@ -101,6 +110,7 @@ fn source_dtype_name(quant_type: u8) -> Option<&'static str> {
     match quant_type {
         QWEN4_QT_BF16 => Some("BF16"),
         QWEN4_QT_I64 => Some("I64"),
+        QWEN4_QT_I64_LEGACY => Some("MQ4G256V2L"),
         QWEN4_QT_MQ4G256V2 => Some("MQ4G256V2"),
         QWEN4_QT_MQ4G128V2 => Some("MQ4G128V2"),
         QWEN4_QT_MQ6G256V2 => Some("MQ6G256V2"),
@@ -473,9 +483,9 @@ fn validate_metadata_geometry(
             metadata.name, info.shape, metadata.shape
         )));
     }
-    if metadata.source_dtype != "I64" || info.quant_type != QWEN4_QT_I64 || info.group_size != 0 {
+    if metadata.source_dtype != "I64" || !is_qwen4_i64(info.quant_type) || info.group_size != 0 {
         return Err(Qwen4ArtifactError::new(format!(
-            "qwen4: metadata tensor {} must use HFQM I64 (qt52/group0), got qt{}/group{}",
+            "qwen4: metadata tensor {} must use HFQM I64 (qt54/group0), got qt{}/group{}",
             metadata.name, info.quant_type, info.group_size
         )));
     }
@@ -812,9 +822,9 @@ fn read_i64_record(
     let info = hfq.find_tensor_info(name).ok_or_else(|| {
         Qwen4ArtifactError::new(format!("qwen4: PLE metadata record {name} is missing"))
     })?;
-    if info.quant_type != QWEN4_QT_I64 || info.group_size != 0 || info.data_size != expected_bytes {
+    if !is_qwen4_i64(info.quant_type) || info.group_size != 0 || info.data_size != expected_bytes {
         return Err(Qwen4ArtifactError::new(format!(
-            "qwen4: PLE metadata record {name} has qt={}, group={}, bytes={}, expected qt52/group0/{}",
+            "qwen4: PLE metadata record {name} has qt={}, group={}, bytes={}, expected qt54/group0/{}",
             info.quant_type, info.group_size, info.data_size, expected_bytes
         )));
     }
@@ -918,19 +928,19 @@ mod tests {
         dir.join("artifact.hfq")
     }
 
-    fn write_ple_fixture(path: &Path, multipliers: &[i64]) {
+    fn write_ple_fixture(path: &Path, multipliers: &[i64], quant_type: u8) {
         let canonical = PleHashMetadata::qwen4();
         let tensors = vec![
             HfqMemTensor {
                 name: PLE_MULTIPLIERS_NAME.to_string(),
-                quant_type: QWEN4_QT_I64,
+                quant_type,
                 shape: vec![3],
                 group_size: 0,
                 data: i64_bytes(multipliers),
             },
             HfqMemTensor {
                 name: PLE_OFFSETS_NAME.to_string(),
-                quant_type: QWEN4_QT_I64,
+                quant_type,
                 shape: vec![16],
                 group_size: 0,
                 data: i64_bytes(
@@ -943,7 +953,7 @@ mod tests {
             },
             HfqMemTensor {
                 name: PLE_VOCAB_SIZES_NAME.to_string(),
-                quant_type: QWEN4_QT_I64,
+                quant_type,
                 shape: vec![16],
                 group_size: 0,
                 data: i64_bytes(
@@ -963,7 +973,7 @@ mod tests {
         let path = fixture_path("mismatch");
         let mut multipliers = PleHashMetadata::qwen4().multipliers().to_vec();
         multipliers[1] += 1;
-        write_ple_fixture(&path, &multipliers);
+        write_ple_fixture(&path, &multipliers, QWEN4_QT_I64);
         let hfq = HfqFile::open(&path).unwrap();
         let error = validate_ple_records(&hfq, &PleHashMetadata::qwen4()).unwrap_err();
         assert!(
@@ -976,12 +986,15 @@ mod tests {
 
     #[test]
     fn bounded_ple_i64_validation_accepts_canonical_payloads() {
-        let path = fixture_path("canonical");
-        write_ple_fixture(&path, PleHashMetadata::qwen4().multipliers());
-        let hfq = HfqFile::open(&path).unwrap();
-        validate_ple_records(&hfq, &PleHashMetadata::qwen4()).unwrap();
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_dir(path.parent().unwrap());
+        // Published artifacts predate the qt=54 renumber and carry qt=52.
+        for quant_type in [QWEN4_QT_I64, QWEN4_QT_I64_LEGACY] {
+            let path = fixture_path(&format!("canonical-qt{quant_type}"));
+            write_ple_fixture(&path, PleHashMetadata::qwen4().multipliers(), quant_type);
+            let hfq = HfqFile::open(&path).unwrap();
+            validate_ple_records(&hfq, &PleHashMetadata::qwen4()).unwrap();
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_dir(path.parent().unwrap());
+        }
     }
 
     /// A routed expert block is rank-3 on disk and rows-by-K in the format, so

@@ -152,7 +152,7 @@ pub enum QuantFormat {
     Mq4G128V2,
     /// Native bfloat16 record, HFQM quant_type 16.
     BF16,
-    /// Raw signed-I64 metadata record, HFQM quant_type 52.
+    /// Raw signed-I64 metadata record, HFQM quant_type 54 (legacy artifacts: 52).
     I64,
     Other(String),
 }

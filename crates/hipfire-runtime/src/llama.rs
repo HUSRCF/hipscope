@@ -518,6 +518,20 @@ pub struct WeightTensor {
     /// `None` for tensors that weren't AWQ-pre-scaled — backward-compatible
     /// with all existing .hfq files.
     pub awq_scale: Option<GpuTensor>,
+    /// MQ4G256V2-Lloyd (qt=52) per-tensor centered codebook LUTs, built by the
+    /// loader from the `<weight>.lloyd_levels.weight` F32 sidecar (see
+    /// `crate::lloyd_lut`). `lloyd_lut_e4m3` packs the 16 centered (`L−7.5`)
+    /// E4M3 bytes as 4 dwords for the gfx12 FP8 prefill kernels
+    /// (`HIPFIRE_FP8_LUT_ARG` mode); `lloyd_lut_f16` packs the same 16 centered
+    /// levels as f16 bits in 8 dwords for the GEMV/decode kernels;
+    /// `lloyd_lut_c16` packs signed `round_ties_even(16·(L−7.5))` bytes as 4
+    /// dwords for the gfx11 MMQ-LUT prefill twin. Host values (no GPU upload).
+    /// `Some` iff `gpu_dtype == DType::MQ4G256V2Lloyd` on a correctly loaded
+    /// tensor — dispatch fails closed when a Lloyd tensor arrives with `None`
+    /// here, so a missing sidecar can never silently decode on the uniform grid.
+    pub lloyd_lut_e4m3: Option<[u32; 4]>,
+    pub lloyd_lut_f16: Option<[u32; 8]>,
+    pub lloyd_lut_c16: Option<[u32; 4]>,
 }
 
 impl WeightTensor {
@@ -577,6 +591,9 @@ impl WeightTensor {
                 krot: p.krot as usize,
             }),
             awq_scale: self.awq_scale.as_ref(),
+            lloyd_lut_e4m3: self.lloyd_lut_e4m3,
+            lloyd_lut_f16: self.lloyd_lut_f16,
+            lloyd_lut_c16: self.lloyd_lut_c16,
         }
     }
 }
@@ -793,6 +810,9 @@ pub fn weight_gemv(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor
         row_stride: 0,
         rotation: None,
         awq_scale: None,
+        lloyd_lut_e4m3: w.lloyd_lut_e4m3,
+        lloyd_lut_f16: w.lloyd_lut_f16,
+        lloyd_lut_c16: w.lloyd_lut_c16,
     };
 
     if !dtype_needs_rotation(w.gpu_dtype) {
@@ -1330,6 +1350,9 @@ pub fn weight_gemv_prerotated(
             row_stride: 0,
             rotation: None,
             awq_scale: None,
+            lloyd_lut_e4m3: w.lloyd_lut_e4m3,
+            lloyd_lut_f16: w.lloyd_lut_f16,
+            lloyd_lut_c16: w.lloyd_lut_c16,
         };
         return gemv
             .run_auto(&ctx, gpu, &wr, x, y)
@@ -1369,6 +1392,9 @@ pub fn weight_gemv_prerotated(
                 row_stride: 0,
                 rotation: None,
                 awq_scale: None,
+                lloyd_lut_e4m3: w.lloyd_lut_e4m3,
+                lloyd_lut_f16: w.lloyd_lut_f16,
+                lloyd_lut_c16: w.lloyd_lut_c16,
             };
             return gemv
                 .run(
@@ -1397,6 +1423,9 @@ pub fn weight_gemv_prerotated(
         row_stride: 0,
         rotation: None,
         awq_scale: None,
+        lloyd_lut_e4m3: w.lloyd_lut_e4m3,
+        lloyd_lut_f16: w.lloyd_lut_f16,
+        lloyd_lut_c16: w.lloyd_lut_c16,
     };
     gemv.run_auto(&ctx, gpu, &wr, x, y)
         .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))
@@ -1435,6 +1464,9 @@ pub fn weight_gemv_residual(
         row_stride: 0,
         rotation: None,
         awq_scale: None,
+        lloyd_lut_e4m3: w.lloyd_lut_e4m3,
+        lloyd_lut_f16: w.lloyd_lut_f16,
+        lloyd_lut_c16: w.lloyd_lut_c16,
     };
 
     match w.gpu_dtype {
@@ -1457,6 +1489,9 @@ pub fn weight_gemv_residual(
         | DType::MQ6G256V2
         | DType::MQ5G256V2
         | DType::MQ4G256
+        // qt=52 rides the exact-V2 residual path: FWHT-rotate, then the
+        // GemvFamily WithResidual LUT kernel (fail-closed on missing LUT).
+        | DType::MQ4G256V2Lloyd
         | DType::MQ4G256V2
         | DType::MQ4CG256
         | DType::MQ3G256
@@ -1531,10 +1566,16 @@ pub fn weight_gemv_swiglu_residual(
         row_stride: 0,
         rotation: None,
         awq_scale: None,
+        lloyd_lut_e4m3: w_down.lloyd_lut_e4m3,
+        lloyd_lut_f16: w_down.lloyd_lut_f16,
+        lloyd_lut_c16: w_down.lloyd_lut_c16,
     };
     match w_down.gpu_dtype {
         DType::MQ4G256
         | DType::MQ4G256V2
+        // qt=52: same FWHT input contract as qt=44; the residual GEMV is the
+        // LUT twin (family branches on dtype).
+        | DType::MQ4G256V2Lloyd
         | DType::MQ4CG256
         | DType::MQ6G256
         | DType::MQ6G256V2
@@ -1988,9 +2029,14 @@ pub fn mqv2_gfx11_wmma_enabled_from_env(value: Option<&str>, arch: &str) -> bool
 /// `MQ4CG256` (qt45) stays gfx12-only in its caller and is intentionally
 /// NOT part of this rule.
 pub fn mqv2_wmma_batchable(dt: DType, mqv2_gfx11_wmma: Option<&str>, arch: &str) -> bool {
+    // MQ4G256V2Lloyd (qt52) shares the V2 wire layout and dispatches through
+    // the LUT variants of the same WMMA/FP8 prefill families (gfx12) — admit
+    // it exactly like qt44; the dispatch layer fails closed on any family
+    // without a LUT variant.
     matches!(
         dt,
         DType::MQ4G256V2
+            | DType::MQ4G256V2Lloyd
             | DType::MQ6G256V2
             | DType::MQ5G256V2
             | DType::MQ3G256V2
@@ -3091,6 +3137,7 @@ fn forward_prefill_chunk(
                 block_start: 0,
                 block_cols: 0,
                 output_gate: None,
+                output_awq_scale: None,
                 output: &pbs.fa_attn_out_batch,
             };
             attention_family()
@@ -3567,6 +3614,9 @@ pub fn load_weights(
                     row_stride: 0,
                     paro: None,
                     awq_scale: None,
+                    lloyd_lut_e4m3: None,
+                    lloyd_lut_f16: None,
+                    lloyd_lut_c16: None,
                 })
             }
             GgmlType::Q6K => {
@@ -3579,6 +3629,9 @@ pub fn load_weights(
                     row_stride: 0,
                     paro: None,
                     awq_scale: None,
+                    lloyd_lut_e4m3: None,
+                    lloyd_lut_f16: None,
+                    lloyd_lut_c16: None,
                 })
             }
             GgmlType::Q8_0 => {
@@ -3591,6 +3644,9 @@ pub fn load_weights(
                     row_stride: 0,
                     paro: None,
                     awq_scale: None,
+                    lloyd_lut_e4m3: None,
+                    lloyd_lut_f16: None,
+                    lloyd_lut_c16: None,
                 })
             }
             GgmlType::F32 => {
@@ -3603,6 +3659,9 @@ pub fn load_weights(
                     row_stride: 0,
                     paro: None,
                     awq_scale: None,
+                    lloyd_lut_e4m3: None,
+                    lloyd_lut_f16: None,
+                    lloyd_lut_c16: None,
                 })
             }
             _ => {
@@ -3620,6 +3679,9 @@ pub fn load_weights(
                     row_stride: 0,
                     paro: None,
                     awq_scale: None,
+                    lloyd_lut_e4m3: None,
+                    lloyd_lut_f16: None,
+                    lloyd_lut_c16: None,
                 })
             }
         }
@@ -3662,6 +3724,9 @@ pub fn load_weights(
             row_stride: 0,
             paro: None,
             awq_scale: None,
+            lloyd_lut_e4m3: None,
+            lloyd_lut_f16: None,
+            lloyd_lut_c16: None,
         }
     };
 
@@ -4011,6 +4076,7 @@ fn llama_kv_write_attend(
             block_start: 0,
             block_cols: 0,
             output_gate: None,
+            output_awq_scale: None,
             output: &scratch.attn_out,
         };
         attention_family()
@@ -4394,6 +4460,7 @@ impl crate::arch_spec::DenseArch for LlamaDense<'_> {
             block_start: 0,
             block_cols: 0,
             output_gate: None,
+            output_awq_scale: None,
             output: &s.attn_out,
         };
         Ok(Some((plan, io)))
@@ -4530,6 +4597,7 @@ pub fn forward_scratch_layers(
                 block_start: 0,
                 block_cols: 0,
                 output_gate: None,
+                output_awq_scale: None,
                 output: &scratch.attn_out,
             };
             attention_family()
@@ -5121,6 +5189,7 @@ pub fn forward_scratch_compute_capture(
                 block_start: 0,
                 block_cols: 0,
                 output_gate: None,
+                output_awq_scale: None,
                 output: &scratch.attn_out,
             };
             attention_family()
@@ -6043,6 +6112,7 @@ impl KvCacheExt for KvCache {
             is_hfq8,
             self.quant_fwht,
             self.quant_bf16,
+            self.quant_fp8,
         )
     }
 
@@ -6059,6 +6129,7 @@ impl KvCacheExt for KvCache {
             quant_int8: self.quant_int8,
             quant_hfq8: self.is_hfq8_kv(),
             quant_bf16: self.quant_bf16,
+            quant_fp8: self.quant_fp8,
             f32_policy: hipfire_dispatch::families::kv_tier::F32AttnPolicy::Simple,
             v_mode_bits: self.v_mode.bits() as i32,
             pos: 0,
@@ -6076,7 +6147,7 @@ impl KvCacheExt for KvCache {
     where
         Self: Sized,
     {
-        <Self as KvCacheExt>::from_mode_with_backend(mode, KvBackend::Contiguous, target, dims)
+        <Self as KvCacheExt>::from_mode_with_backend(mode, KvBackend::Legacy, target, dims)
     }
 
     fn from_mode_with_backend(
@@ -6091,10 +6162,10 @@ impl KvCacheExt for KvCache {
         let single_gpu = matches!(&target, KvTarget::Single(_));
         Self::validate_mode_with_backend(mode, backend, single_gpu, dims)?;
         match (backend, target) {
-            (KvBackend::Contiguous, KvTarget::Single(gpu)) => {
+            (KvBackend::Legacy, KvTarget::Single(gpu)) => {
                 saddle_core::kv::KvCache::from_mode_with_backend(mode, backend, gpu, dims)
             }
-            (KvBackend::Contiguous, KvTarget::Multi(gpus)) => {
+            (KvBackend::Legacy, KvTarget::Multi(gpus)) => {
                 <Self as KvCacheExt>::from_mode_multi(mode, gpus, dims)
             }
             (KvBackend::Vmm, KvTarget::Single(gpu)) => {
@@ -6120,6 +6191,12 @@ impl KvCacheExt for KvCache {
             (KvMode::Asym3, Mask(m), Some(cap)) => Self::new_gpu_asym3_capped_multi_filtered(gpus, m, nh, hd, ms, cap),
             (KvMode::Fwht3, Mask(m), Some(cap)) => Self::new_gpu_fwht3_capped_multi_filtered(gpus, m, nh, hd, ms, cap),
             (KvMode::Fwht2, Mask(m), Some(cap)) => Self::new_gpu_fwht2_capped_multi_filtered(gpus, m, nh, hd, ms, cap),
+            // Fp8 is single-GPU only: fail closed here, never fall through to
+            // a q8 multi-GPU allocation for an explicit fp8 request.
+            (KvMode::Fp8, _, _) => Err(hip_bridge::HipError::new(
+                0,
+                "<KvCache as KvCacheExt>::from_mode_multi: Fp8 KV is single-GPU only",
+            )),
             (m, l, c) => Err(hip_bridge::HipError::new(
                 0,
                 &format!(
@@ -6184,6 +6261,7 @@ impl KvCacheExt for KvCache {
             quant_asym2: false,
             quant_fwht: false,
             quant_bf16: false,
+            quant_fp8: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
@@ -6225,6 +6303,7 @@ impl KvCacheExt for KvCache {
             quant_asym2: false,
             quant_fwht: false,
             quant_bf16: false,
+            quant_fp8: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
@@ -6285,6 +6364,7 @@ impl KvCacheExt for KvCache {
             quant_asym2: false,
             quant_fwht: false,
             quant_bf16: false,
+            quant_fp8: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
@@ -6326,6 +6406,7 @@ impl KvCacheExt for KvCache {
             quant_asym2: false,
             quant_fwht: false,
             quant_bf16: false,
+            quant_fp8: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
@@ -6367,6 +6448,7 @@ impl KvCacheExt for KvCache {
             quant_asym2: false,
             quant_fwht: false,
             quant_bf16: false,
+            quant_fp8: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
@@ -6413,6 +6495,7 @@ impl KvCacheExt for KvCache {
             quant_asym2: false,
             quant_fwht: false,
             quant_bf16: false,
+            quant_fp8: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
@@ -6459,6 +6542,7 @@ impl KvCacheExt for KvCache {
             quant_asym2: false,
             quant_fwht: false,
             quant_bf16: false,
+            quant_fp8: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
@@ -6526,6 +6610,7 @@ impl KvCacheExt for KvCache {
             quant_asym2: false,
             quant_fwht: false,
             quant_bf16: false,
+            quant_fp8: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
@@ -6593,6 +6678,7 @@ impl KvCacheExt for KvCache {
             quant_asym2: false,
             quant_fwht: false,
             quant_bf16: false,
+            quant_fp8: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
@@ -6660,6 +6746,7 @@ impl KvCacheExt for KvCache {
             quant_asym2: true,
             quant_fwht: false,
             quant_bf16: false,
+            quant_fp8: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
@@ -6735,6 +6822,7 @@ impl KvCacheExt for KvCache {
             quant_asym2: false,
             quant_fwht: true,
             quant_bf16: false,
+            quant_fp8: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
@@ -6803,6 +6891,7 @@ impl KvCacheExt for KvCache {
             quant_asym2: false,
             quant_fwht: true,
             quant_bf16: false,
+            quant_fp8: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
@@ -6870,6 +6959,7 @@ impl KvCacheExt for KvCache {
             quant_asym2: true,
             quant_fwht: true,
             quant_bf16: false,
+            quant_fp8: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
@@ -6916,6 +7006,7 @@ impl KvCacheExt for KvCache {
             quant_asym2: false,
             quant_fwht: false,
             quant_bf16: false,
+            quant_fp8: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
@@ -6966,6 +7057,7 @@ impl KvCacheExt for KvCache {
             quant_asym2: false,
             quant_fwht: false,
             quant_bf16: false,
+            quant_fp8: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
@@ -7016,6 +7108,7 @@ impl KvCacheExt for KvCache {
             quant_asym2: false,
             quant_fwht: false,
             quant_bf16: false,
+            quant_fp8: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
@@ -7066,6 +7159,7 @@ impl KvCacheExt for KvCache {
             quant_asym2: true,
             quant_fwht: false,
             quant_bf16: false,
+            quant_fp8: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
@@ -7116,6 +7210,7 @@ impl KvCacheExt for KvCache {
             quant_asym2: false,
             quant_fwht: true,
             quant_bf16: false,
+            quant_fp8: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
@@ -7166,6 +7261,7 @@ impl KvCacheExt for KvCache {
             quant_asym2: false,
             quant_fwht: true,
             quant_bf16: false,
+            quant_fp8: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
@@ -7216,6 +7312,7 @@ impl KvCacheExt for KvCache {
             quant_asym2: true,
             quant_fwht: true,
             quant_bf16: false,
+            quant_fp8: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
@@ -8692,6 +8789,7 @@ mod tests {
             quant_int8: false,
             quant_hfq8: false,
             quant_bf16: false,
+            quant_fp8: false,
             f32_policy: hipfire_dispatch::families::kv_tier::F32AttnPolicy::Simple,
             v_mode_bits: kv.v_mode_bits(),
             pos: 100,
@@ -8739,6 +8837,7 @@ mod tests {
             quant_int8: false,
             quant_hfq8: false,
             quant_bf16: false,
+            quant_fp8: false,
             f32_policy: hipfire_dispatch::families::kv_tier::F32AttnPolicy::Simple,
             v_mode_bits: kv.v_mode_bits(),
             pos: 100,
@@ -8797,6 +8896,7 @@ mod tests {
             got.quant_q8,
             got.quant_hfq4,
             got.quant_q4,
+            got.quant_fp8,
         ]
         .iter()
         .filter(|&&b| b)
@@ -8816,6 +8916,7 @@ mod tests {
             quant_int8: false,
             quant_hfq8: false,
             quant_bf16: false,
+            quant_fp8: false,
             f32_policy: hipfire_dispatch::families::kv_tier::F32AttnPolicy::Simple,
             v_mode_bits: kv.v_mode_bits(),
             pos: 100,
@@ -8862,6 +8963,7 @@ mod tests {
             quant_asym2: false,
             quant_fwht: false,
             quant_bf16: false,
+            quant_fp8: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
@@ -8907,6 +9009,7 @@ mod tests {
             quant_asym2: false,
             quant_fwht: false,
             quant_bf16: false,
+            quant_fp8: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,

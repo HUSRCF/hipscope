@@ -2593,6 +2593,9 @@ mod tests {
                     row_stride: k,
                     rotation: None,
                     awq_scale: None,
+                    lloyd_lut_e4m3: None,
+                    lloyd_lut_f16: None,
+                    lloyd_lut_c16: None,
                 }
             }
 
@@ -2684,6 +2687,9 @@ mod tests {
             row_stride: 1,
             rotation: None,
             awq_scale: None,
+            lloyd_lut_e4m3: None,
+            lloyd_lut_f16: None,
+            lloyd_lut_c16: None,
         };
         IndexedAttentionOp {
             indexer_qk: weight,
