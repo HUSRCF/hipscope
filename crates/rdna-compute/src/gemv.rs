@@ -186,7 +186,7 @@ fn awq_norm_kernel() -> (&'static str, &'static str, u32) {
     )
 }
 
-/// `HIPFIRE_G12_DEC_NORM` twin of [`awq_norm_kernel`]: launched with one
+/// `HIPFIRE_G12_DEC_NORM` / `HIPFIRE_GFX1100_DEC_NORM` twin of [`awq_norm_kernel`]: launched with one
 /// workgroup per 256-group (grid K/256) instead of one workgroup per row.
 fn awq_norm_dec_kernel() -> (&'static str, &'static str, u32) {
     (
@@ -2727,9 +2727,9 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_mq_signs()?;
-        // gfx1201 decode: K/256 workgroups, each redoing the row's reduction
+        // gfx1201 / gfx1100 decode: K/256 workgroups, each redoing the row's reduction
         // and rotating one group (bit-identical to the one-workgroup launch).
-        let group_grid = self.flags.g12_dec_norm_enabled() && k % 256 == 0;
+        let group_grid = self.flags.dec_norm_grids_enabled() && k % 256 == 0;
         let (module, source, shared_mem) =
             if group_grid { awq_norm_dec_kernel() } else { awq_norm_kernel() };
         self.ensure_kernel(module, source, module)?;

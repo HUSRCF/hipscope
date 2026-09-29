@@ -286,6 +286,14 @@ pub struct FeatureFlags {
     /// partial RoPE one workgroup per head. Bit-identical outputs; any byte
     /// difference kills it.
     pub g12_dec_norm: bool,
+    /// gfx1100 decode norm grids (`HIPFIRE_GFX1100_DEC_NORM`,
+    /// `kernel.gfx1100_dec_norm`). Default ON on exact gfx1100; `=0` restores
+    /// the single-workgroup launches. Same twins as `g12_dec_norm` built for
+    /// gfx1100: the f32 AWQ RMSNorm+FWHT runs K/256 workgroups and the
+    /// out-of-place `rmsnorm_f32` n/256 workgroups per row (RoPE is untouched:
+    /// gfx1100 decode fuses it into its FA prep). Bit-identical outputs; any
+    /// byte difference kills it.
+    pub gfx1100_dec_norm: bool,
     /// gfx11 sigmoid/gated-norm + int4 quant fusions
     /// (`HIPFIRE_GFX11_PRODUCER_QUANT_FUSED`,
     /// `kernel.gfx11_producer_quant_fused`). Default ON on gfx1100/gfx1151;
@@ -740,6 +748,7 @@ impl FeatureFlags {
                 .unwrap_or(arch == "gfx1201"),
             g12_norm: parse_bool("HIPFIRE_G12_NORM").unwrap_or(arch == "gfx1201"),
             g12_dec_norm: parse_bool("HIPFIRE_G12_DEC_NORM").unwrap_or(arch == "gfx1201"),
+            gfx1100_dec_norm: parse_bool("HIPFIRE_GFX1100_DEC_NORM").unwrap_or(arch == "gfx1100"),
             gfx11_producer_quant_fused: parse_bool("HIPFIRE_GFX11_PRODUCER_QUANT_FUSED")
                 .unwrap_or(matches!(arch, "gfx1100" | "gfx1151")),
             gfx12_fp8_stream: parse_bool("HIPFIRE_GFX12_FP8_STREAM")
@@ -939,6 +948,18 @@ impl FeatureFlags {
     pub fn g12_dec_norm_enabled(&self) -> bool {
         self.g12_dec_norm && self.arch == "gfx1201"
     }
+    /// True only on exact gfx1100 with `HIPFIRE_GFX1100_DEC_NORM` on: the
+    /// decode RMSNorm+FWHT and final RMSNorm launch their bit-identical
+    /// multi-workgroup twins.
+    pub fn gfx1100_dec_norm_enabled(&self) -> bool {
+        self.gfx1100_dec_norm && self.arch == "gfx1100"
+    }
+    /// The decode RMSNorm+FWHT and final RMSNorm run as multi-workgroup
+    /// grids: exact gfx1201 (`g12_dec_norm`) or exact gfx1100
+    /// (`gfx1100_dec_norm`).
+    pub fn dec_norm_grids_enabled(&self) -> bool {
+        self.g12_dec_norm_enabled() || self.gfx1100_dec_norm_enabled()
+    }
     /// True only on gfx1100/gfx1151 with the opt-in set. The `_gfx11`
     /// sigmoid/gated-norm producers emit the shared `block_i4_128` recipe,
     /// so output is bit-identical to the standalone
@@ -1102,6 +1123,7 @@ impl FeatureFlags {
             gfx12_producer_quant_fused: false,
             g12_norm: false,
             g12_dec_norm: false,
+            gfx1100_dec_norm: false,
             gfx11_producer_quant_fused: false,
             gfx12_fp8_stream: false,
             residual_ldsstage: false,

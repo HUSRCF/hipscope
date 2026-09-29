@@ -210,6 +210,36 @@ fn fp8_decode_attn_gqa_admitted(
 /// workgroups (6 µs/layer measured at 2048, 0.9 µs at 512).
 const FP8_DECODE_GQA_TILE_GRID_Y_CAP: usize = 512;
 
+/// gfx1100 Q8_0 gated-AWQ decode attention through the GQA-shared tile and
+/// the load-ahead reduce (default on; `HIPFIRE_GFX1100_DECODE_ATTN_GQA=0`
+/// restores `attention_flash_q8_0_tile` +
+/// `attention_flash_q8_0_reduce_gated_mq_rotate_awq_gfx1100`). Both pairs
+/// write byte-identical partials and output. The tile's geometry is
+/// compile-time: head_dim 256, GQA group 6, tile 128, full causal (H2 decode).
+/// The reduce keeps 2 * max_tiles f32 of dynamic LDS.
+fn q8_decode_attn_gqa_gfx1100_admitted(
+    gpu: &Gpu,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    tile_size: usize,
+    max_tiles: usize,
+    window: i32,
+) -> bool {
+    gpu.arch_caps.is_gfx1100()
+        && head_dim == 256
+        && n_kv_heads > 0
+        && n_heads == 6 * n_kv_heads
+        && tile_size == 128
+        && window <= 0
+        && max_tiles <= Q8_DECODE_GQA_REDUCE_MAX_TILES
+        && hipfire_config::developer_bool("HIPFIRE_GFX1100_DECODE_ATTN_GQA", true)
+}
+
+/// LDS bound of the gfx1100 load-ahead reduce: 2 * max_tiles f32 of dynamic
+/// LDS next to ~2.2 KiB static, inside the 64 KiB workgroup limit.
+const Q8_DECODE_GQA_REDUCE_MAX_TILES: usize = 7680;
+
 #[inline]
 fn replay_stable_tile_count(
     actual_tiles: usize,
@@ -7433,6 +7463,30 @@ impl Gpu {
             self.replay.is_recording(),
         );
 
+        if let (Some(gate), Some(awq_scale)) = (output_gate, output_awq_scale) {
+            if q8_decode_attn_gqa_gfx1100_admitted(
+                self, n_heads, n_kv_heads, head_dim, tile_size, max_tiles, window,
+            ) {
+                return self.attention_flash_q8_0_gqa_gated_awq_gfx1100(
+                    q,
+                    k_cache,
+                    v_cache,
+                    out,
+                    gate,
+                    awq_scale,
+                    pos_buf,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    max_seq,
+                    partials,
+                    tile_size,
+                    max_tiles,
+                    launch_tiles,
+                );
+            }
+        }
+
         // ── Tile kernel ──
         let gfx1151_tile_dpp = self.arch_caps.is_gfx1151()
             && hipfire_config::developer_var("HIPFIRE_GFX1151_ATTENTION_TILE_DPP").as_deref()
@@ -7875,6 +7929,162 @@ impl Gpu {
                 b
             },
         )
+    }
+
+    /// gfx1100 Q8_0 gated-AWQ decode attention: GQA-shared tile (one
+    /// 256-thread workgroup per (kv head, tile), K/V read once for the
+    /// group's six q heads) + load-ahead reduce/gate/rotate (one 1024-thread
+    /// workgroup per head). Same ABIs and byte-identical partials and output
+    /// as `attention_flash_q8_0_tile` +
+    /// `attention_flash_q8_0_reduce_gated_mq_rotate_awq_gfx1100`.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_flash_q8_0_gqa_gated_awq_gfx1100(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        gate: &GpuTensor,
+        awq_scale: &GpuTensor,
+        pos_buf: &DeviceBuffer,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+        partials: &GpuTensor,
+        tile_size: usize,
+        max_tiles: usize,
+        launch_tiles: usize,
+    ) -> HipResult<()> {
+        const TILE: &str = "attention_flash_q8_0_tile_gqa_gfx1100";
+        const REDUCE: &str = "attention_flash_q8_0_reduce_gated_mq_rotate_awq_dec_gfx1100";
+        if awq_scale.numel() < n_heads * head_dim {
+            return Err(hip_bridge::HipError::new(
+                1,
+                &format!(
+                    "gated mq rotate reducer: undersized awq_scale (got {}, required {})",
+                    awq_scale.numel(),
+                    n_heads * head_dim,
+                ),
+            ));
+        }
+        self.ensure_kernel(TILE, kernels::ATTENTION_FLASH_Q8_0_TILE_GQA_GFX1100_SRC, TILE)?;
+        self.ensure_kernel(
+            REDUCE,
+            kernels::ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_AWQ_DEC_GFX1100_SRC,
+            REDUCE,
+        )?;
+        self.ensure_mq_signs()?;
+        let q_ptr = q.buf.as_ptr();
+        let k_ptr = k_cache.buf.as_ptr();
+        let v_ptr = v_cache.buf.as_ptr();
+        let p_ptr = partials.buf.as_ptr();
+        let o_ptr = out.buf.as_ptr();
+        let g_ptr = gate.buf.as_ptr();
+        let aw_ptr = awq_scale.buf.as_ptr();
+        let s1_ptr = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2_ptr = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let pos_ptr = pos_buf.as_ptr();
+        let nh = n_heads as i32;
+        let nkv = n_kv_heads as i32;
+        let hd = head_dim as i32;
+        let ms = max_seq as i32;
+        let sc = 1.0f32 / (head_dim as f32).sqrt();
+        let ts = tile_size as i32;
+        let wn = 0i32;
+        let es = 0i32;
+        let mt = max_tiles as i32;
+        {
+            let grid = [
+                n_kv_heads as u32,
+                launch_tiles.min(FP8_DECODE_GQA_TILE_GRID_Y_CAP) as u32,
+                1,
+            ];
+            let mut params: Vec<*mut c_void> = vec![
+                &q_ptr as *const _ as *mut c_void,
+                &k_ptr as *const _ as *mut c_void,
+                &v_ptr as *const _ as *mut c_void,
+                &p_ptr as *const _ as *mut c_void,
+                &pos_ptr as *const _ as *mut c_void,
+                &nh as *const _ as *mut c_void,
+                &nkv as *const _ as *mut c_void,
+                &hd as *const _ as *mut c_void,
+                &ms as *const _ as *mut c_void,
+                &sc as *const _ as *mut c_void,
+                &ts as *const _ as *mut c_void,
+                &wn as *const _ as *mut c_void,
+                &es as *const _ as *mut c_void,
+            ];
+            self.launch_maybe_blob_position_grid(
+                TILE,
+                grid,
+                [256, 1, 1],
+                0,
+                &mut params,
+                1,
+                1,
+                tile_size as u32,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(q_ptr);
+                    b.push_ptr(k_ptr);
+                    b.push_ptr(v_ptr);
+                    b.push_ptr(p_ptr);
+                    b.push_ptr(pos_ptr);
+                    b.push_i32(nh);
+                    b.push_i32(nkv);
+                    b.push_i32(hd);
+                    b.push_i32(ms);
+                    b.push_f32(sc);
+                    b.push_i32(ts);
+                    b.push_i32(wn);
+                    b.push_i32(es);
+                    b
+                },
+            )?;
+        }
+        let mut params: Vec<*mut c_void> = vec![
+            &p_ptr as *const _ as *mut c_void,
+            &o_ptr as *const _ as *mut c_void,
+            &g_ptr as *const _ as *mut c_void,
+            &aw_ptr as *const _ as *mut c_void,
+            &s1_ptr as *const _ as *mut c_void,
+            &s2_ptr as *const _ as *mut c_void,
+            &nh as *const _ as *mut c_void,
+            &hd as *const _ as *mut c_void,
+            &pos_ptr as *const _ as *mut c_void,
+            &ts as *const _ as *mut c_void,
+            &mt as *const _ as *mut c_void,
+        ];
+        let k = n_heads * head_dim;
+        let bytes = n_heads * max_tiles * (2 + head_dim) * 4 + k * 4 * 3;
+        let timer = crate::profile::begin_timer(&self.hip, "fused", REDUCE, bytes);
+        let result = self.launch_maybe_blob(
+            REDUCE,
+            [n_heads as u32, 1, 1],
+            [1024, 1, 1],
+            (2 * max_tiles * 4) as u32,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(p_ptr);
+                b.push_ptr(o_ptr);
+                b.push_ptr(g_ptr);
+                b.push_ptr(aw_ptr);
+                b.push_ptr(s1_ptr);
+                b.push_ptr(s2_ptr);
+                b.push_i32(nh);
+                b.push_i32(hd);
+                b.push_ptr(pos_ptr);
+                b.push_i32(ts);
+                b.push_i32(mt);
+                b
+            },
+        );
+        if let Some(timer) = timer {
+            timer.finish(&self.hip);
+        }
+        result
     }
 
     /// Compile a givens4 kernel — prepends turbo_common + givens_common headers.

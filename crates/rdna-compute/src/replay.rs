@@ -1327,9 +1327,12 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             read(40),
             read(48),
         ]),
-        // The gfx1201 GQA fp8 decode tile and head-dim-split reduce keep their
-        // reference twins' 13/7-argument ABIs and pointer effects.
-        "attention_flash_q8_0_tile" | "attention_flash_fp8_e4m3_tile_gqa_gfx1201" => {
+        // The gfx1201 GQA fp8 decode tile and head-dim-split reduce and the
+        // gfx1100 GQA Q8_0 decode tile keep their reference twins'
+        // 13/7-argument ABIs and pointer effects.
+        "attention_flash_q8_0_tile"
+        | "attention_flash_fp8_e4m3_tile_gqa_gfx1201"
+        | "attention_flash_q8_0_tile_gqa_gfx1100" => {
             Some(vec![read(0), read(8), read(16), write(24), read(32)])
         }
         "attention_flash_q8_0_reduce" | "attention_flash_reduce_dsplit_gfx1201" => {
@@ -1755,6 +1758,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         "attention_flash_q8_0_tile"
         | "attention_flash_fp8_e4m3_tile_gqa_gfx1201"
         | "gated_norm_mq_rotate_awq_k6144_gfx1201"
+        | "attention_flash_q8_0_tile_gqa_gfx1100"
         | "fused_qkv_hfq4g256"
         | "fused_qkv_mq4g256v2"
         | "fused_qkv_mq4g256v2_k2048_x_buffer_gfx1100"

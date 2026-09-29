@@ -112,14 +112,14 @@ impl Gpu {
         let x_ptr = x.buf.as_ptr();
         let w_ptr = weight.buf.as_ptr();
         let out_ptr = out.buf.as_ptr();
-        // gfx1201 decode (one row): n/256 workgroups, each recomputing the
+        // gfx1201 / gfx1100 decode (one row): n/256 workgroups, each recomputing the
         // row's rms (bit-identical). Other workgroups still read x while one
         // writes, so `out` must not overlap `x`. Batched rows keep one
         // workgroup per row: the split re-reads every row n/256 times.
         let row_bytes = n as usize * 4;
         let disjoint = (x_ptr as usize).saturating_add(row_bytes) <= out_ptr as usize
             || (out_ptr as usize).saturating_add(row_bytes) <= x_ptr as usize;
-        let rowsplit = self.flags.g12_dec_norm_enabled()
+        let rowsplit = self.flags.dec_norm_grids_enabled()
             && batch == 1
             && n > 256
             && n % 256 == 0
