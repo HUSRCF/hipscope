@@ -1657,6 +1657,8 @@ pub fn forward_scratch(
     };
     let _ = gpu.graphs.ar_forward_replay_enabled; // suppress unused warning
 
+    let gap_started = rdna_compute::gap_timing::begin_forward();
+    let embed_started = rdna_compute::gap_timing::now();
     // Embedding lookup into scratch.x (always direct, changes per token)
     match weights.embd_format {
         EmbeddingFormat::HFQ4G256 => {
@@ -1673,6 +1675,7 @@ pub fn forward_scratch(
         }
         _ => panic!("unsupported embedding format"),
     }
+    rdna_compute::gap_timing::add_since(rdna_compute::gap_timing::Slot::Embed, embed_started);
 
     let pos_i32 = pos as i32;
     if gpu.replay.should_route_aql() {
@@ -1689,9 +1692,12 @@ pub fn forward_scratch(
         };
     }
     if gpu.replay.should_route_pm4() {
+        let copy_started = rdna_compute::gap_timing::now();
         gpu.hip
             .memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
+        rdna_compute::gap_timing::add_since(rdna_compute::gap_timing::Slot::PosCopy, copy_started);
         let replay = unsafe { gpu.replay.replay_pm4(pos) };
+        rdna_compute::gap_timing::end_forward(gap_started, "pm4");
         return match replay {
             Ok(_) => Ok(()),
             Err(reason) => {
@@ -1712,10 +1718,18 @@ pub fn forward_scratch(
         // as the buffers are the plain-AR continuation — which the spec markers
         // + verify invalidation guarantee — and this call passes the buffers
         // the graph was captured with (`ar_graph_binding`). ──
+        let copy_started = rdna_compute::gap_timing::now();
         gpu.hip
             .memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
+        rdna_compute::gap_timing::add_since(rdna_compute::gap_timing::Slot::PosCopy, copy_started);
+        let launch_started = rdna_compute::gap_timing::now();
         gpu.graphs
             .graph_launch(&gpu.hip, gpu.device_id, gpu.active_stream.as_ref().unwrap())?;
+        rdna_compute::gap_timing::add_since(
+            rdna_compute::gap_timing::Slot::GraphLaunch,
+            launch_started,
+        );
+        rdna_compute::gap_timing::end_forward(gap_started, "hip_graph");
         if ar_graph_trace_enabled() {
             eprintln!("[qwen-ar-graph] replay pos={pos}");
         }

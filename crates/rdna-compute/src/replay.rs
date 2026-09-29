@@ -474,7 +474,12 @@ impl Pm4Commands {
         boundaries: &mut [Pm4DispatchBoundary],
     ) -> Result<(), String> {
         let Self::Gfx12(commands) = self else {
-            return Err("per-dispatch PM4 profiling currently requires gfx12".to_owned());
+            // Legacy boundary flags were recorded while planning; the first
+            // dispatch follows the entry acquire.
+            if let Some(first) = boundaries.first_mut() {
+                first.entry_acquire = true;
+            }
+            return Ok(());
         };
         let attributions = commands
             .dispatch_span_attributions()
@@ -512,7 +517,17 @@ impl Pm4Commands {
                 architecture: Pm4Architecture::Gfx11,
                 commands,
                 ..
-            } => SingleQueuePm4Ib::create_profiled_gfx11(device, pool, commands),
+            } => {
+                if dispatch_profile {
+                    SingleQueuePm4Ib::create_boundary_profiled_legacy(device, pool, commands)
+                } else if let Some(ib_pool) = ib_pool {
+                    SingleQueuePm4Ib::create_profiled_legacy_with_ib_pool(
+                        device, pool, ib_pool, commands,
+                    )
+                } else {
+                    SingleQueuePm4Ib::create_profiled_gfx11(device, pool, commands)
+                }
+            }
             Self::Legacy {
                 architecture: Pm4Architecture::Gfx12,
                 ..
@@ -2642,10 +2657,25 @@ impl Pm4RegisterPolicy {
     }
 }
 
+/// Diagnostic opt-in, default off: `HIPFIRE_GFX1100_PM4_EXPERIMENTS=1` lets
+/// the gfx1151 initiator / interleave / resource-limits knobs apply to gfx1100
+/// as well. Without it gfx1100 keeps the legacy encoding byte-for-byte.
+fn gfx1100_experiment_alias(architecture: Pm4Architecture, device_name: &str) -> &str {
+    if architecture == Pm4Architecture::Gfx11
+        && device_name.eq_ignore_ascii_case("gfx1100")
+        && hipfire_config::process_value("HIPFIRE_GFX1100_PM4_EXPERIMENTS").as_deref() == Some("1")
+    {
+        "gfx1151"
+    } else {
+        device_name
+    }
+}
+
 fn gfx10_dispatch_initiator_policy(
     architecture: Pm4Architecture,
     device_name: &str,
 ) -> Gfx10DispatchInitiatorPolicy {
+    let device_name = gfx1100_experiment_alias(architecture, device_name);
     let value = hipfire_config::process_value("HIPFIRE_GFX1151_PM4_INITIATOR")
         .unwrap_or_else(|| "legacy".to_owned());
     let policy = gfx10_dispatch_initiator_policy_from_value(architecture, device_name, &value)
@@ -2684,6 +2714,7 @@ fn gfx1151_dispatch_interleave(
     architecture: Pm4Architecture,
     device_name: &str,
 ) -> Option<Gfx11DispatchInterleave> {
+    let device_name = gfx1100_experiment_alias(architecture, device_name);
     let value = hipfire_config::process_value("HIPFIRE_GFX1151_PM4_INTERLEAVE")
         .unwrap_or_else(|| "inherit".to_owned());
     let interleave = gfx1151_dispatch_interleave_from_value(architecture, device_name, &value)
@@ -2726,6 +2757,7 @@ fn gfx1151_resource_limits_policy(
     architecture: Pm4Architecture,
     device_name: &str,
 ) -> Gfx11ComputeResourceLimitsPolicy {
+    let device_name = gfx1100_experiment_alias(architecture, device_name);
     let value = hipfire_config::process_value("HIPFIRE_GFX1151_PM4_RESOURCE_LIMITS")
         .unwrap_or_else(|| "legacy".to_owned());
     let policy = gfx1151_resource_limits_policy_from_value(architecture, device_name, &value)
@@ -4418,6 +4450,7 @@ impl PreparedPm4Replay {
                 });
             }
         }
+        let patch_started = crate::gap_timing::now();
         // Patch typed kernarg bindings while queue is quiescent.
         // Single code path shared with recorded-HIP replay: both transports
         // must apply the identical binding set via `apply_kernarg_bindings_for_dispatch`.
@@ -4490,16 +4523,27 @@ impl PreparedPm4Replay {
         if let Some(index) = self.kernarg_publish {
             self.kernargs[index].publish_host_writes();
         }
+        crate::gap_timing::add_since(crate::gap_timing::Slot::Patch, patch_started);
+        let wait_started = crate::gap_timing::now();
         // SAFETY: forwarded from the caller that owns the model allocations.
-        unsafe { self.graph.replay_and_wait_profiled_checked() }.map_err(|(error, quiescence)| {
-            RetainedReplayFailure {
+        let result = unsafe { self.graph.replay_and_wait_profiled_checked() }.map_err(
+            |(error, quiescence)| RetainedReplayFailure {
                 error: error.to_string(),
                 quiescence: match quiescence {
                     Quiescence::Proven => ReplayQuiescence::Proven,
                     Quiescence::Unknown => ReplayQuiescence::Unknown,
                 },
-            }
-        })
+            },
+        );
+        crate::gap_timing::add_since(crate::gap_timing::Slot::SubmitWait, wait_started);
+        if let Ok(timing) = &result {
+            crate::gap_timing::add_ns(
+                crate::gap_timing::Slot::GpuSpan,
+                timing.last_end.saturating_sub(timing.first_start).saturating_mul(1_000_000_000)
+                    / timing.frequency_hz.max(1),
+            );
+        }
+        result
     }
 
     /// Replay one instrumented retained graph exactly once.
@@ -5358,8 +5402,8 @@ impl ReplayController {
             .select_gpu(GpuSelector::Ordinal(device_ordinal))
             .map_err(|error| error.to_string())?;
         let pm4_architecture = Pm4Architecture::from_device(&device)?;
-        if dispatch_profile && pm4_architecture != Pm4Architecture::Gfx12 {
-            return Err("per-dispatch PM4 profiling currently requires gfx12".to_owned());
+        if dispatch_profile && pm4_architecture == Pm4Architecture::Gfx10 {
+            return Err("per-dispatch PM4 profiling requires gfx11 or gfx12".to_owned());
         }
         let dispatch_initiator_policy =
             gfx10_dispatch_initiator_policy(pm4_architecture, device.name());

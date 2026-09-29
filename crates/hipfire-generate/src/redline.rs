@@ -4657,9 +4657,15 @@ pub fn handle_redline_dispatch_profile(
             let started = Instant::now();
             // SAFETY: the loaded model owns every captured pointer.
             let profile = unsafe { gpu.replay.replay_pm4_dispatch_profile(context) }?;
-            if profile.spans_nanoseconds.len() != launch_count {
+            // gfx12 stamps after each dispatch (one span per launch); the
+            // gfx10/gfx11 tape also stamps after each compute-idle packet, so
+            // spans alternate kernel issue-to-idle and boundary idle-to-issue.
+            if profile.spans_nanoseconds.len() != launch_count
+                && profile.spans_nanoseconds.len() != 2 * launch_count
+            {
                 return Err(format!(
-                    "dispatch span length mismatch: expected {launch_count}, got {}",
+                    "dispatch span length mismatch: expected {launch_count} or {}, got {}",
+                    2 * launch_count,
                     profile.spans_nanoseconds.len()
                 ));
             }
