@@ -610,19 +610,25 @@ The canonical Flash-Next trunk is whichever local artifact byte-matches
 - HF repo: `hipfire-models/qwen3.8-flash-next`
 - HF / local file: `qwen3.8-flash-next.mq4`
 - File size: `125288540696`
-- SHA-256: `cd7cbb911d3d016e034b1d22be1be37b42873a21699c94f09337528f1eee9db6`
-- MD5: `b91c31fb43847e9fda814e10d955e08c`
+- SHA-256: `8aa01cf41bf2a90b319b9a1c70837baf51a2f92811af551f59b59d418518f650`
+- MD5: `001878abd9b68218876ac0ae732e481b`
 - Recipe (r2): MQ6G256V2 trunk (240 tensors) and language head,
   MQ4G256V2/MQ4G128V2 experts, Q8F16 embed/MTP-attention and PLE n-gram rows
   (128 shards, external-resident, 54,400,261,120 B). Needs a build at or
-  after `c7c8c52f1` (MQ6G256V2 head admission).
+  after `cb566dab9` (qt=54 I64 metadata records).
+- Container revision 2026-09-29: the three I64 PLE metadata records were
+  re-tagged qt=52 -> qt=54 in place; payloads are byte-identical to the
+  2026-09-28 upload (sha256 `cd7cbb911d3d016e034b1d22be1be37b42873a21699c94f09337528f1eee9db6`),
+  so measurements taken on those bytes still apply.
 
 Before reporting Flash-Next results, verify the candidate trunk with
 `sha256sum` and require the digest above.
 
 Historical: the prior pin was `qwen3.8-flash-next.mq6q8-pleq8` (still on HF,
 tag `qwen3.8:flash-next-mq6q8-pleq8`; size `125467331096`, sha256
-`58fb4f586403000b3394413c38f58b0ec0d8845675f81c3d3c0b5de2cdaa4aed`); it differs
+`c0628b848077f02afed9ce5a4daa0598c379aa1d1e5ca0c0b24ddd04b49773a9` after the
+same qt=54 re-tag, `58fb4f586403000b3394413c38f58b0ec0d8845675f81c3d3c0b5de2cdaa4aed`
+before it); it differs
 only in its Q8F16 head. The caveats and measurements below were taken on that
 prior pin unless they say otherwise.
 

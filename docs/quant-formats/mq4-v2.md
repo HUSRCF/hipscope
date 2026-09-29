@@ -183,8 +183,7 @@ through dedicated kernels, while generic loaders and GPU consumers MUST reject
 it rather than reinterpret it as the legacy format.
 The Qwen4 producer chooses qt=44 when `K % 256 == 0` and qt=53 otherwise.
 qt=54 is Qwen4's non-weight raw-I64 metadata record and is not a
-quantized dtype (Qwen4 artifacts written before qt=52 became MQ4G256V2L
-used qt=52 for it; only the Qwen4 loader still reads that spelling).
+quantized dtype.
 
 Each logical row is tiled independently as `ceil(K / 128)` groups.  A final
 partial group is zero-padded to 128 values before the FWHT-128 transform; the

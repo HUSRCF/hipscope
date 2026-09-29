@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Qwen4 raw-I64 PLE metadata records are HFQM qt=54 (qt=52 is MQ4G256V2L).
+  The published `qwen3.8:flash-next` and `qwen3.8:flash-next-mq6q8-pleq8`
+  files were re-tagged in place (payloads unchanged) and re-pinned; the loader
+  refuses the old qt=52 spelling, so re-pull them.
+
 - Qwen4 native MTP is now on by default: `speculation.mtp = auto` attaches the
   MTP head, where before only an explicit `on` did. Greedy requests then run
   MTP (1.77x AR decode on `qwen3.8-flash-next.mq4`, tokens equal to AR's).
