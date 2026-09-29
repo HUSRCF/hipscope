@@ -953,6 +953,39 @@ impl Carrier for Qwen35Carrier {
             }
         }
     }
+
+    fn spawn_slot_engine(
+        &self,
+        cfg: hipfire_runtime::serve::SlotEngineConfig,
+    ) -> Result<Box<dyn hipfire_runtime::serve::SlotEngineHandle>, String> {
+        use hipfire_arch_qwen35::serve_engine::{EngineConfig, SlotEngine};
+        let engine = SlotEngine::spawn(EngineConfig {
+            model_path: cfg.model_path,
+            n_slots: cfg.n_slots,
+            cap_tokens: cfg.cap_tokens,
+            prefill_chunk: cfg.prefill_chunk,
+            host_budget_bytes: cfg.host_budget_bytes,
+            swap_dir: cfg.swap_dir,
+            is_vl: cfg.is_vl,
+            vl_path: cfg.vl_path,
+            mtp_k: cfg.mtp_k,
+            kv_mode_raw: cfg.kv_mode_raw,
+            kv_backend: cfg.kv_backend,
+            prefix_cache: cfg.prefix_cache,
+            prefix_cache_max_bytes: cfg.prefix_cache_max_bytes,
+            max_batch_tokens: cfg.max_batch_tokens,
+            prefill_min_tokens: cfg.prefill_min_tokens,
+            wait_max_count: cfg.wait_max_count,
+            wait_max_bytes: cfg.wait_max_bytes,
+            queue_timeout_ms: cfg.queue_timeout_ms,
+            structured_jump_forward: cfg.structured_jump_forward,
+            dflash_draft: cfg.dflash_draft,
+            dflash_required: cfg.dflash_required,
+        })
+        .map_err(|e| format!("SlotEngine spawn: {e}"))?;
+        Ok(Box::new(engine))
+    }
+
 }
 
 // ─── LlamaCarrier ────────────────────────────────────────────────────

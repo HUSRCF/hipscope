@@ -49,7 +49,9 @@ use hipfire_runtime::prompt_frame::{
     continuation_suffix_tool_results, qwen35_grammar_on, AssistantPrefix, ChatFrame,
     JinjaChatFrame, Message, Role, ThinkMode, ToolCall,
 };
-use hipfire_runtime::serve::{Continuation, DoneReason, Event, SubmitRequest, VisualData};
+use hipfire_runtime::serve::{
+    Continuation, DoneReason, Event, SlotEngineConfig, SubmitRequest, VisualData,
+};
 use hipfire_runtime::spec::{ClientEvent, SpecEmitCtx};
 use hipfire_runtime::tokenizer::Tokenizer;
 
@@ -72,57 +74,6 @@ fn emit_qwen_ar_slot_error<W: std::io::Write>(
     );
 }
 
-/// Family-neutral spawn parameters. Each per-arch arm of [`AnySlotEngine::spawn`]
-/// turns these into its own engine's config; policy constants that are genuinely
-/// engine-shaped (host budget, swap dir) stay in the arms until a second family
-/// says otherwise.
-struct EngineSpawnParams {
-    model_path: PathBuf,
-    n_slots: usize,
-    cap_tokens: usize,
-    prefill_chunk: usize,
-    mtp_k: usize,
-    is_vl: bool,
-    vl_path: Option<PathBuf>,
-    /// Raw KV-mode string from the load request (empty = resolve from env /
-    /// config in the engine, via the slots policy).
-    kv_mode_raw: String,
-    /// Effective `--kv-backend` for this load (`legacy` default; slots
-    /// refuse `vmm`). Rig::build fails closed on anything else.
-    kv_backend: String,
-    /// Cross-session prefix cache enabled (spec §4.5–4.6). Read from
-    /// `serve.prefix_cache` config key; default false.
-    prefix_cache: bool,
-    /// Checkpoint pool max bytes. Read from `serve.prefix_cache_max_bytes`;
-    /// default 0.
-    prefix_cache_max_bytes: u64,
-    /// Global trunk-row budget (spec §5.2 S2). Read from
-    /// `serve.max_batch_tokens`; default 4096.
-    max_batch_tokens: usize,
-    /// Minimum prefill quantum (spec §5.2 S2 / §5.3 S3). Read from
-    /// `serve.prefill_min_tokens`; default 1.
-    prefill_min_tokens: usize,
-    /// Bounded waiting room: max queued request count (spec §5.3 S3). Read
-    /// from `serve.max_queue`; must be non-zero.
-    wait_max_count: usize,
-    /// Bounded waiting room: max total queued bytes (spec §5.3 S3). Read
-    /// from `serve.max_queue_bytes`; must be non-zero.
-    wait_max_bytes: u64,
-    /// Bounded waiting room: per-waiter timeout in scheduler ticks (spec
-    /// §5.3 S3). Derived from `serve.queue_timeout_ms` — the engine ticks
-    /// once per serve iteration, so the millisecond value is used directly
-    /// as the tick count.
-    queue_timeout_ms: u64,
-    /// Structured-output jump-forward (spec §7.3 G3). Read from
-    /// `serve.structured_jump_forward`; default false.
-    structured_jump_forward: bool,
-    /// DFlash2 draft path (resolved daemon-side: HIPFIRE_DFLASH_DRAFT >
-    /// params.draft, suppressed by dflash_mode=off). None = no DFlash.
-    dflash_draft: Option<PathBuf>,
-    /// dflash_mode=on: a missing/failed draft load fails the engine load
-    /// instead of degrading to AR.
-    dflash_required: bool,
-}
 
 /// The per-arch multi-slot engine behind the four-method surface
 /// `handle_generate` drives (`submit` / `close` / `reset` / `shutdown`).
@@ -139,93 +90,32 @@ struct EngineSpawnParams {
 /// variants want behavior beyond these four calls, graduate this into a
 /// trait shaped by that port (the same driver-style rule the run-loop
 /// extraction follows — see `hipfire-arch-qwen35::serve_engine`).
-enum AnySlotEngine {
-    /// Qwen3.5 / Qwen3.5-VL / Qwen3.5-MoE (arch_id 5 | 6).
-    Qwen35(hipfire_arch_qwen35::serve_engine::SlotEngine),
-}
+/// The per-arch multi-slot engine behind the four-method surface
+/// `handle_generate` drives (`submit` / `close` / `reset` / `shutdown`).
+///
+/// Slot-mode arch dispatch goes through `hipfire_loader::carrier_for`:
+/// the carrier that claims `arch_id` overrides `Carrier::spawn_slot_engine`
+/// and returns an arch-erased `Box<dyn SlotEngineHandle>`. `loader` depends
+/// on the arch crates, so the concrete engine is boxed there without a
+/// loader -> arch -> loader cycle — this file never names a concrete engine
+/// type. A new model family with a slot engine only adds a `spawn_slot_engine`
+/// override on its carrier; nothing here changes.
+type AnySlotEngine = Box<dyn hipfire_runtime::serve::SlotEngineHandle>;
 
-impl AnySlotEngine {
-    fn spawn(arch_id: u32, p: EngineSpawnParams) -> Result<Self, String> {
-        match arch_id {
-            5 | 6 => Ok(Self::Qwen35(
-                hipfire_arch_qwen35::serve_engine::SlotEngine::spawn(
-                    hipfire_arch_qwen35::serve_engine::EngineConfig {
-                        model_path: p.model_path,
-                        n_slots: p.n_slots,
-                        cap_tokens: p.cap_tokens,
-                        prefill_chunk: p.prefill_chunk,
-                        host_budget_bytes: 16 * 1024 * 1024 * 1024,
-                        swap_dir: std::env::temp_dir().join("hipfire-serve-swap"),
-                        is_vl: p.is_vl,
-                        vl_path: p.vl_path,
-                        mtp_k: p.mtp_k,
-                        kv_mode_raw: p.kv_mode_raw,
-                        kv_backend: p.kv_backend,
-                        // Cross-session prefix cache (spec §4.5–4.6).
-                        // Read from serve.prefix_cache / serve.prefix_cache_max_bytes
-                        // config keys (env HIPFIRE_SERVE_PREFIX_CACHE*).
-                        // Default false/0 — product defaults stay unchanged.
-                        prefix_cache: p.prefix_cache,
-                        prefix_cache_max_bytes: p.prefix_cache_max_bytes,
-                        // Global trunk-row budget and minimum prefill quantum
-                        // (spec §5.2 S2 / §5.3 S3). Read from
-                        // serve.max_batch_tokens / serve.prefill_min_tokens
-                        // config keys. Defaults 4096/1 (the registered config
-                        // defaults).
-                        max_batch_tokens: p.max_batch_tokens,
-                        prefill_min_tokens: p.prefill_min_tokens,
-                        // Bounded waiting room (spec §5.3 S3). Read from
-                        // serve.max_queue / serve.max_queue_bytes /
-                        // serve.queue_timeout_ms config keys.
-                        wait_max_count: p.wait_max_count,
-                        wait_max_bytes: p.wait_max_bytes,
-                        queue_timeout_ms: p.queue_timeout_ms,
-                        // Structured-output jump-forward (spec §7.3 G3).
-                        // Read from serve.structured_jump_forward; default
-                        // false — no behavior change on the constrained-
-                        // decode path.
-                        structured_jump_forward: p.structured_jump_forward,
-                        // DFlash2 spec-decode sidecar (resolved daemon-side:
-                        // HIPFIRE_DFLASH_DRAFT > params.draft, suppressed by
-                        // dflash_mode=off). dflash_required = mode "on".
-                        dflash_draft: p.dflash_draft,
-                        dflash_required: p.dflash_required,
-                    },
-                )
-                .map_err(|e| format!("SlotEngine spawn: {e}"))?,
-            )),
-            other => Err(format!(
-                "no multi-slot engine for arch_id {other} — slot mode currently \
-                 ships for qwen3_5 only (arch_id 5|6); wire the family in \
-                 AnySlotEngine::spawn"
-            )),
-        }
-    }
-    fn submit(&self, req: SubmitRequest) -> Result<(), String> {
-        match self {
-            Self::Qwen35(e) => e.submit(req),
-        }
-    }
-    fn cancel_waiting(&self, request_tag: u64) {
-        match self {
-            Self::Qwen35(e) => e.cancel_waiting(request_tag),
-        }
-    }
-    fn close(&self, session: u64) -> Result<(), String> {
-        match self {
-            Self::Qwen35(e) => e.close(session),
-        }
-    }
-    fn reset(&self) -> Result<(), String> {
-        match self {
-            Self::Qwen35(e) => e.reset(),
-        }
-    }
-    fn shutdown(self) -> Result<(), String> {
-        match self {
-            Self::Qwen35(e) => e.shutdown(),
-        }
-    }
+/// Resolve the carrier for `arch_id` and spawn its multi-slot engine. The
+/// family-neutral `SlotEngineConfig` carries every serve.* knob; the carrier
+/// maps it onto its own engine config. `Err` names the arch when no carrier
+/// provides a slot engine.
+fn spawn_slot_engine(
+    arch_id: u32,
+    cfg: SlotEngineConfig,
+) -> Result<AnySlotEngine, String> {
+    let carrier = hipfire_loader::carrier_for(arch_id).ok_or_else(|| {
+        format!("no carrier claims arch_id {arch_id} — slot mode cannot dispatch")
+    })?;
+    carrier.spawn_slot_engine(cfg).map_err(|e| {
+        format!("no multi-slot engine for arch_id {arch_id}: {e}")
+    })
 }
 
 /// Slot-engine load parameters parsed from a `load` message. The daemon's
@@ -622,15 +512,20 @@ impl SlotBackend {
         let cap_tokens = cap_tokens.max(1);
         let prefill_chunk = prefill_chunk.max(1).min(cap_tokens);
 
-        // Arch dispatch point: pick the family's engine here. Everything
-        // downstream drives the family-neutral four-method surface only.
-        let engine = AnySlotEngine::spawn(
+        // Arch dispatch point: the carrier that claims `arch_id` spawns its
+        // multi-slot engine via `Carrier::spawn_slot_engine`. Everything
+        // downstream drives the family-neutral `SlotEngineHandle` surface
+        // only. `host_budget_bytes` / `swap_dir` are engine-policy constants
+        // the family-neutral config carries for the spawn arm.
+        let engine = spawn_slot_engine(
             arch_id,
-            EngineSpawnParams {
+            SlotEngineConfig {
                 model_path: PathBuf::from(model_path),
                 n_slots,
                 cap_tokens,
                 prefill_chunk,
+                host_budget_bytes: 16 * 1024 * 1024 * 1024,
+                swap_dir: std::env::temp_dir().join("hipfire-serve-swap"),
                 mtp_k,
                 is_vl,
                 vl_path,

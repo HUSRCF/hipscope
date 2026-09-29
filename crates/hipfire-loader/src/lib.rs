@@ -184,6 +184,22 @@ pub trait Carrier: Send + Sync {
     ) -> Option<bool> {
         None
     }
+
+    /// Spawn this arch's multi-slot engine, arch-erased as a
+    /// [`hipfire_runtime::serve::SlotEngineHandle`]. This is the daemon's
+    /// single slot-mode dispatch — it resolves `carrier_for(arch_id)` and
+    /// calls this rather than naming `hipfire_arch_qwen35::serve_engine`.
+    /// `loader` depends on the arch crates, so the concrete engine can be
+    /// boxed here without a loader->arch->loader cycle.
+    ///
+    /// Default: `Err` (arch has no multi-slot engine). Only the qwen35
+    /// carrier overrides today (arch_id 5|6).
+    fn spawn_slot_engine(
+        &self,
+        _cfg: hipfire_runtime::serve::SlotEngineConfig,
+    ) -> Result<Box<dyn hipfire_runtime::serve::SlotEngineHandle>, String> {
+        Err(format!("{}: no multi-slot engine", self.name()))
+    }
 }
 
 /// The single registry lookup the daemon's spec path routes through: resolve the

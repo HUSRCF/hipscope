@@ -265,7 +265,7 @@ impl SlotEngine {
     /// in-flight requests, joins the engine thread and returns GPU teardown
     /// or poison errors. The daemon can call this and withhold `unloaded`
     /// on failure. Graph is destroyed before buffers.
-    pub fn shutdown(mut self) -> Result<(), String> {
+    pub fn shutdown_engine(mut self) -> Result<(), String> {
         self.tx = None;
         if let Some(h) = self.handle.take() {
             match h.join() {
@@ -295,6 +295,29 @@ impl Drop for SlotEngine {
     }
 }
 
+
+impl hipfire_runtime::serve::SlotEngineHandle for SlotEngine {
+    fn submit(&self, req: SubmitRequest) -> Result<(), String> {
+        SlotEngine::submit(self, req)
+    }
+    fn cancel_waiting(&self, request_tag: u64) {
+        SlotEngine::cancel_waiting(self, request_tag)
+    }
+    fn close(&self, session: u64) -> Result<(), String> {
+        SlotEngine::close(self, session)
+    }
+    fn reset(&self) -> Result<(), String> {
+        SlotEngine::reset(self)
+    }
+    fn stats(&self) -> EngineStats {
+        SlotEngine::stats(self)
+    }
+    fn shutdown(self: Box<Self>) -> Result<(), String> {
+        // `shutdown_engine` consumes `self`; move the engine out of the Box
+        // and run teardown on the owned value.
+        (*self).shutdown_engine()
+    }
+}
 /// Everything the engine thread owns.
 /// Upper bound on a request's token-penalty window (`repeat_window`). The
 /// penalty prepass is O(window²) per launch on device, and the per-slot

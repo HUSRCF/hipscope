@@ -16,6 +16,7 @@
 // owns the protocol types both sides share — the same layering reason
 // `swap::snapshot` takes an opaque buffer slice instead of a `DeltaNetState`.
 
+use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 
 /// Visual payload for a VL request.
@@ -239,6 +240,100 @@ impl EngineStats {
     pub fn note_pool_free_pages(&mut self, n: usize) {
         self.pool_free_pages = n;
     }
+}
+
+// ── Slot-engine handle (arch-erased multi-slot engine) ───────────────────
+//
+// The daemon's slot-mode dispatch is a `Carrier` hook in `hipfire-loader`.
+// `hipfire-loader` cannot name a concrete arch engine type (that would be a
+// loader -> arch -> loader cycle), so the engine is carried across the
+// crate boundary as `Box<dyn SlotEngineHandle>`. The trait object is the
+// single arch-erased surface `handle_generate` drives; the concrete engine
+// (e.g. `hipfire_arch_qwen35::serve_engine::SlotEngine`) implements it.
+//
+// `SlotEngineConfig` is the family-neutral spawn record — every field is a
+// primitive/`PathBuf`/`String`/`Option`, so a carrier can map it onto its
+// own engine config without seeing arch types. It mirrors
+// `hipfire_arch_qwen35::serve_engine::EngineConfig` field-for-field; keep
+// them in lock-step (the qwen35 carrier maps them 1:1).
+
+
+/// Family-neutral multi-slot engine spawn parameters. Constructed once by
+/// the daemon from serve.* config keys + the load request, then handed to
+/// `Carrier::spawn_slot_engine`, which adapts it into the concrete engine's
+/// own config. Field-for-field with the qwen35 `EngineConfig`; a second
+/// engine family may ignore fields it does not implement.
+#[derive(Debug, Clone)]
+pub struct SlotEngineConfig {
+    pub model_path: PathBuf,
+    pub n_slots: usize,
+    /// Per-slot generation cap (tokens) used by the paged-KV budget.
+    pub cap_tokens: usize,
+    /// Prompt-chunk size (tokens) per prefill step.
+    pub prefill_chunk: usize,
+    /// Host-side swap/scratch budget in bytes.
+    pub host_budget_bytes: u64,
+    /// Directory the swap manager writes cold slot snapshots to.
+    pub swap_dir: PathBuf,
+    /// The checkpoint is a VL model (vision tower present in the HFQ or in a
+    /// separate `.vl` sidecar). Affects RoPE/M-RoPE + embed routing.
+    pub is_vl: bool,
+    /// Path to the `.vl` vision sidecar, if the vision weights live outside
+    /// the text HFQ.
+    pub vl_path: Option<PathBuf>,
+    /// MTP draft depth (K+1 verify rows per speculative cycle). 0 = off.
+    pub mtp_k: usize,
+    /// Raw KV-mode string from the load request (empty = resolve from
+    /// env/config in the engine).
+    pub kv_mode_raw: String,
+    /// Effective KV backend (`legacy`/`vmm`); slot engines may refuse `vmm`.
+    pub kv_backend: String,
+    /// Cross-session prefix cache enabled (spec §4.5–4.6).
+    pub prefix_cache: bool,
+    /// Checkpoint pool max bytes; `prefix_cache` with `0` must refuse at
+    /// spawn rather than fail mid-request.
+    pub prefix_cache_max_bytes: u64,
+    /// Global trunk-row budget per step (spec §5.2 S2).
+    pub max_batch_tokens: usize,
+    /// Minimum prefill quantum (spec §5.2 S2 / §5.3 S3).
+    pub prefill_min_tokens: usize,
+    /// Bounded waiting room: max queued request count (spec §5.3 S3).
+    pub wait_max_count: usize,
+    /// Bounded waiting room: max total queued bytes (spec §5.3 S3).
+    pub wait_max_bytes: u64,
+    /// Per-waiter timeout in scheduler ticks (spec §5.3 S3).
+    pub queue_timeout_ms: u64,
+    /// Structured-output jump-forward (spec §7.3 G3).
+    pub structured_jump_forward: bool,
+    /// DFlash2 draft path; `None` = DFlash off.
+    pub dflash_draft: Option<PathBuf>,
+    /// `dflash_mode=on`: a draft load failure fails the engine load.
+    pub dflash_required: bool,
+}
+
+/// Arch-erased multi-slot engine. The concrete engine runs its own thread
+/// and is driven through this narrow surface: submit a request, cancel a
+/// queued one, close/reset a session, read stats, and shut down. The wire
+/// types (`SubmitRequest`, `EngineStats`) already live in this module, so
+/// the trait stays family-neutral. Object-safe; carried as
+/// `Box<dyn SlotEngineHandle>` by `hipfire_loader::Carrier::spawn_slot_engine`.
+pub trait SlotEngineHandle: Send + Sync {
+    /// Enqueue a generate request. `Err` when the engine is shutting down.
+    fn submit(&self, req: SubmitRequest) -> Result<(), String>;
+    /// Cancel a QUEUED request by submitter tag. Idempotent; tag 0 is a no-op.
+    fn cancel_waiting(&self, request_tag: u64);
+    /// Close a session synchronously, cancelling any in-flight request and
+    /// releasing its session/pool/swap state. Never silently ignored.
+    fn close(&self, session: u64) -> Result<(), String>;
+    /// Drop every session and swap entry back to a cold empty table. `Err`
+    /// while any slot is still generating.
+    fn reset(&self) -> Result<(), String>;
+    /// Snapshot of engine-level counters (submitted/rejected/completed/…).
+    fn stats(&self) -> EngineStats;
+    /// Consuming shutdown: close the command channel, fail in-flight
+    /// requests, join the engine thread and free GPU state. On `Err` the
+    /// caller may withhold `unloaded` to keep the load registered.
+    fn shutdown(self: Box<Self>) -> Result<(), String>;
 }
 
 #[cfg(test)]
