@@ -37,6 +37,9 @@ legacy grouping and native fallback. This keeps each row's quantization
 route unchanged when widening packed prefill. Packed MQ4V2 also requires
 full rather than lean PBS and its extra activation scratch is budgeted.
 The combination is experimental too.
+Packed activations retain native MMQ's per-32-element Q8 scale and matching
+per-32 dot/zero correction; the legacy `group128` kernel symbol is not the
+current precision contract. The earlier G128 experiment is historical only.
 `HIPFIRE_PREFILL_CHUNK_ROWS` chooses the requested 512/1024/2048/4096/8192 rung;
 memory admission may reduce it. This does not widen verify/TP/MoE paths or
 enable V2-only producer/lean-scratch optimizations for MQ4.

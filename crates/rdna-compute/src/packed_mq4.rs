@@ -2,7 +2,7 @@
 // Copyright (c) 2026 HUSRCF
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Isolated, default-off restoration of the PR #616 Q8-group128 packed path.
+//! Default-off PR #616 packed layout, with native Q8-group32 activation precision.
 //! This is not the MQ4V2 INT8 sidecar (136 bytes/block): it uses 144-byte DS4.
 use crate::dispatch::{Gpu, GpuTensor};
 use hip_bridge::{HipError, HipResult};

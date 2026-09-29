@@ -6,6 +6,10 @@ use rdna_compute::{DType, Gpu};
 use std::time::Instant;
 
 fn main() {
+    // Optional numerical-only mode. Refuse existing directories and preserve
+    // GPU-produced activation bytes for an independent CPU oracle.
+    let dump = std::env::var_os("MQ4_ORACLE_DIR").map(std::path::PathBuf::from);
+    if let Some(path) = &dump { std::fs::create_dir(path).unwrap(); }
     let mut gpu = Gpu::init_with_device(0).expect("GPU init");
     assert_eq!(gpu.arch, "gfx1100");
     for (m, k, add) in [(17408usize, 5120usize, false), (5120, 17408, true)] {
@@ -25,6 +29,13 @@ fn main() {
         let dw = gpu.upload_raw(&w, &[w.len()]).unwrap();
         let dx = gpu.upload_f32(&x, &[n, k]).unwrap();
         let dy = gpu.zeros(&[n, m], DType::F32).unwrap();
+        let case_dir = dump.as_ref().map(|root| {
+            let path = root.join(format!("m{m}-k{k}-n{n}"));
+            std::fs::create_dir(&path).unwrap();
+            std::fs::write(path.join("weights.bin"), &w).unwrap();
+            write_f32(&path.join("input.bin"), &x);
+            path
+        });
         let mut reference = Vec::new();
         for packed in [false, true] {
             // Zero once for numerical comparison; timing uses the same ADD
@@ -43,6 +54,14 @@ fn main() {
             gpu.hip.device_synchronize().unwrap();
             let result = gpu.download_f32(&dy).unwrap();
             assert!(result.iter().all(|v| v.is_finite()));
+            if let Some(path) = &case_dir {
+                let name = if packed { "packed" } else { "native" };
+                write_f32(&path.join(format!("{name}-output.bin")), &result);
+                let buf = gpu.scratch.q8_1_mmq_x_scratch.as_ref().unwrap();
+                let mut bytes = vec![0u8; (k / 128) * n * 144];
+                gpu.hip.memcpy_dtoh(&mut bytes, buf).unwrap();
+                std::fs::write(path.join(format!("{name}-activation.bin")), bytes).unwrap();
+            }
             if !packed {
                 reference = result;
             } else {
@@ -57,6 +76,7 @@ fn main() {
                 }
                 println!("NUMERIC m={m} k={k} n={n} add={add} max_abs={max_abs} relative_l2={}", (sq / ref_sq).sqrt());
             }
+            if dump.is_some() { continue; }
             for _ in 0..10 { launch(&mut gpu).unwrap(); }
             gpu.hip.device_synchronize().unwrap();
             let start = Instant::now();
@@ -68,4 +88,9 @@ fn main() {
         gpu.free_tensor(dx).unwrap();
         gpu.free_tensor(dy).unwrap();
     }
+}
+
+fn write_f32(path: &std::path::Path, values: &[f32]) {
+    let bytes: Vec<u8> = values.iter().flat_map(|x| x.to_le_bytes()).collect();
+    std::fs::write(path, bytes).unwrap();
 }

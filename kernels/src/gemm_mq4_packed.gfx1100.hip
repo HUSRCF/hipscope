@@ -2,7 +2,8 @@
 // Copyright (c) 2026 Daniil Markevich
 // hipfire — see LICENSE and NOTICE in the project root.
 // Restored from PR #616 (473efc835): gfx1100 X256/Y64, permuted-nibble,
-// Q8-group128, quad-row-u32x2. Checkpoint layout remains unchanged.
+// Quad-row-u32x2 layout, with native Q8-group32 activation precision.
+// Checkpoint layout remains unchanged.
 // Compile-time experimental branches have been pruned from the old source.
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
@@ -36,7 +37,9 @@ extern "C" __global__ void quantize_mq4_packed_group128(
         : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
     float amax = fmaxf(fmaxf(fabsf(xi.x), fabsf(xi.y)),
                        fmaxf(fabsf(xi.z), fabsf(xi.w)));
-    for (int offset = 16; offset > 0; offset >>= 1) {
+    // Eight lanes load 32 values. The symbol retains its legacy name, but
+    // each of the four DS4 entries now carries its own native-MMQ scale.
+    for (int offset = 4; offset > 0; offset >>= 1) {
         amax = fmaxf(amax, __shfl_xor(amax, offset, 32));
     }
     float sum = xi.x + xi.y + xi.z + xi.w;
@@ -506,12 +509,10 @@ static __device__ __forceinline__ void gemm_mq4_packed_gfx1100_full_body(
         } else if constexpr (COMBINE_ZERO && !0) {
             collect_q8_1_sums(tile_y, zero_sums, true);
         }
-        if constexpr (1) {
-            vec_dot_q8_1_group128_mma(tile_x, tile_y, sum, 0);
-        } else {
-            vec_dot_q8_1_q8_1_mma<!COMBINE_ZERO, REG_ZERO>(
-                tile_x, tile_y, sum, 0, activation_sums);
-        }
+        // Consume all four independent G32 scales; do not combine integer
+        // dots under a single G128 scale or defer the zero correction.
+        vec_dot_q8_1_q8_1_mma<!COMBINE_ZERO, REG_ZERO>(
+            tile_x, tile_y, sum, 0, activation_sums);
         __syncthreads();
         if (2 * kb + 1 < blocks128) {
             const int* by1 = (const int*)(Xq + (long long)(2 * kb + 1) * N + col0);
@@ -523,13 +524,8 @@ static __device__ __forceinline__ void gemm_mq4_packed_gfx1100_full_body(
             if constexpr (COMBINE_ZERO && !REG_ZERO && !0) {
                 collect_q8_1_sums(tile_y, zero_sums, false);
             }
-            if constexpr (1) {
-                vec_dot_q8_1_group128_mma(
-                    tile_x, tile_y, sum, 32);
-            } else {
-                vec_dot_q8_1_q8_1_mma<!COMBINE_ZERO, REG_ZERO>(
-                    tile_x, tile_y, sum, 32, activation_sums);
-            }
+            vec_dot_q8_1_q8_1_mma<!COMBINE_ZERO, REG_ZERO>(
+                tile_x, tile_y, sum, 32, activation_sums);
             __syncthreads();
         }
         if constexpr (REG_ZERO) {
@@ -570,11 +566,7 @@ void gemm_mq4_packed_gfx1100_full_add(
     int N,
     int
 ) {
-#ifdef PACKED_MQ4_V2
     gemm_mq4_packed_gfx1100_full_body<true, false>(A, Xq, Y, M, K, N);
-#else
-    gemm_mq4_packed_gfx1100_full_body<true, true>(A, Xq, Y, M, K, N);
-#endif
 }
 extern "C" __global__ __launch_bounds__(8 * 32, 2)
 void gemm_mq4_packed_gfx1100_full_set(
@@ -586,11 +578,7 @@ void gemm_mq4_packed_gfx1100_full_set(
     int N,
     int
 ) {
-#ifdef PACKED_MQ4_V2
     gemm_mq4_packed_gfx1100_full_body<false, false>(A, Xq, Y, M, K, N);
-#else
-    gemm_mq4_packed_gfx1100_full_body<false, true>(A, Xq, Y, M, K, N);
-#endif
 }
 extern "C" __global__ __launch_bounds__(8 * 32, 2)
 void gemm_mq4_packed_gfx1100_full_set_f16(
@@ -602,9 +590,5 @@ void gemm_mq4_packed_gfx1100_full_set_f16(
     int N,
     int
 ) {
-#ifdef PACKED_MQ4_V2
     gemm_mq4_packed_gfx1100_full_body<false, false, false, half>(A, Xq, Y, M, K, N);
-#else
-    gemm_mq4_packed_gfx1100_full_body<false, true, false, half>(A, Xq, Y, M, K, N);
-#endif
 }
