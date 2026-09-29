@@ -282,6 +282,16 @@ even with hipcc present. A missing or stale index falls back to JIT only when
 hipcc is available; compiler-free loads fail closed. Packaged module names
 come from the exact Rust registry, never HIP source basenames.
 
+JIT and packaged objects share one core recipe: `--genco --offload-arch=<arch>
+-O3 --no-offload-compress -fuse-cuid=none`, then the extra, per-module and
+per-kernel flags (`KernelCompiler::recipe_for_source`).
+`-fuse-cuid=none` drops hipcc's `__hip_cuid_*` symbol, which is named after the
+input path and argv. On one host the object bytes therefore depend only on the
+source, the recipe and the resolved toolchain and headers, not on the cache root
+or temp name. The cache ABI is part of every hot key, packaging key and index.
+It changes whenever the core recipe does, so objects from an older recipe miss
+and are recompiled instead of being mixed in.
+
 Some arch crates also ship crate-local HIP (registered through their own
 `kernels.rs`) for family-specific ops.
 

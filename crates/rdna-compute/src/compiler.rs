@@ -325,7 +325,33 @@ fn seed_hot_from_cold(cold: &Path, hot: &Path) -> std::io::Result<()> {
 /// Cache-key version. Bump when the kernel ABI or hipcc invocation changes in a
 /// way that makes previously-cached `.hsaco` blobs incompatible, to force a clean
 /// recompile instead of loading a stale "invalid device image".
-const KERNEL_CACHE_ABI: u32 = 4;
+///
+/// 5: `core_hipcc_flags` gained `-fuse-cuid=none`, so objects built under 4
+/// carry a path-derived `__hip_cuid_*` symbol that current builds do not.
+const KERNEL_CACHE_ABI: u32 = 5;
+
+/// Leading hipcc flags of every runtime JIT and packaged compile. The argv and
+/// the recipe recorded in pack indexes both come from here, so they cannot drift.
+///
+/// - `--no-offload-compress`: clang ≥19 compresses offload bundles by default.
+///   HIP's loader accepts the compressed container; the public HSA reader
+///   Redline uses does not, so a CCOB blob demotes every retained route to
+///   plain HIP.
+/// - `-fuse-cuid=none`: without it hipcc emits a `__hip_cuid_<md5>` symbol named
+///   after the input path and the full argv. JIT inputs and outputs live under
+///   the cache root with unique temp names, so two compiles of the same source
+///   and recipe produced different bytes with identical code. With it, the
+///   bytes depend only on the source, the recipe and the toolchain and headers
+///   the compile resolves.
+fn core_hipcc_flags(arch: &str) -> Vec<String> {
+    vec![
+        "--genco".to_owned(),
+        format!("--offload-arch={arch}"),
+        "-O3".to_owned(),
+        "--no-offload-compress".to_owned(),
+        "-fuse-cuid=none".to_owned(),
+    ]
+}
 
 /// Compiles HIP kernel sources to code objects, with caching.
 ///
@@ -781,12 +807,7 @@ impl KernelCompiler {
             .ok()
             .and_then(|value| SchedulerProfile::parse(&value))
             .unwrap_or_else(|| crate::kernels::scheduler_profile_for_module(arch, module));
-        let mut flags = vec![
-            "--genco".to_owned(),
-            format!("--offload-arch={arch}"),
-            "-O3".to_owned(),
-            "--no-offload-compress".to_owned(),
-        ];
+        let mut flags = core_hipcc_flags(arch);
         flags.extend(extra_flags.iter().cloned());
         flags.extend(Self::module_flags_with_profile(arch, module, &selected, profile));
         CompileRecipe {
@@ -1289,22 +1310,14 @@ impl KernelCompiler {
         Self::rocm_root_flags_with(root, Self::win_short_path_if_needed)
     }
 
-    /// Core hipcc argv: genco/arch/O3, then passthrough, then -o out src.
+    /// Core hipcc argv: `core_hipcc_flags`, then passthrough, then -o out src.
     fn direct_hipcc_args(
         arch: &str,
         src_path: &Path,
         obj_path: &Path,
         passthrough: Vec<String>,
     ) -> Vec<String> {
-        // clang ≥19 compresses offload bundles by default. HIP's loader accepts the
-        // compressed container; the public HSA reader Redline uses does not, so a
-        // CCOB blob demotes every retained route to plain HIP.
-        let mut args: Vec<String> = vec![
-            "--genco".into(),
-            format!("--offload-arch={arch}"),
-            "-O3".into(),
-            "--no-offload-compress".into(),
-        ];
+        let mut args = core_hipcc_flags(arch);
         args.extend(passthrough);
         args.push("-o".into());
         args.push(obj_path.to_str().unwrap().into());
@@ -2096,6 +2109,7 @@ mod tests {
                 "--offload-arch=gfx1100",
                 "-O3",
                 "--no-offload-compress",
+                "-fuse-cuid=none",
                 "-I/opt/rocm/include",
                 "-o",
                 "kernel.hsaco",
