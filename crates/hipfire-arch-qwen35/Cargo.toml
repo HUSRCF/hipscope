@@ -71,6 +71,16 @@ path = "examples/test_dflash_snapshot_bulk_gfx1100.rs"
 required-features = ["deltanet"]
 
 [[example]]
+name = "test_dflash_replay_ml"
+path = "examples/test_dflash_replay_ml.rs"
+required-features = ["deltanet"]
+
+[[example]]
+name = "test_select_regrid"
+path = "examples/test_select_regrid.rs"
+required-features = ["deltanet"]
+
+[[example]]
 name = "test_mq_f16_projection_producers_gfx1100"
 path = "examples/test_mq_f16_projection_producers_gfx1100.rs"
 required-features = ["deltanet"]

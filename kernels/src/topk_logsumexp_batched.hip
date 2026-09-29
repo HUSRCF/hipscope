@@ -54,6 +54,14 @@ __global__ void topk_logsumexp_batched_f32(
     int K,
     int raw_values
 ) {
+#if defined(HIPFIRE_TOPK_FIXUP_MARKED)
+    // Railgun E0 / L6d fixup entry (`topk_values_fixup_f32`): only rows the
+    // re-grid kernel marked with top_idx[b*K] == -1 (a tie among the leading
+    // K+1 values) rerun this body; every other row keeps the re-grid result.
+    // Every thread reads the marker before the first barrier, so thread 0's
+    // final store cannot race it.
+    if (top_idx[(size_t)blockIdx.x * K] != -1) return;
+#endif
     const int b = blockIdx.x;
     const int tid = threadIdx.x;
     const int nth = blockDim.x;

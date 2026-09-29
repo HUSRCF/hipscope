@@ -485,6 +485,14 @@ pub struct FeatureFlags {
     pub ddtree_topk_direct_off: bool,
     /// S9: `HIPFIRE_MQ_PROLOGUE_FUSE_OFF=1` restores producer+GEMM pairs.
     pub mq_prologue_fuse_off: bool,
+    /// Railgun E0 / L6c: `HIPFIRE_GDN_REPLAY_ML_OFF=1` restores the per-layer
+    /// GDN replay launches (the gfx1201 two-launch multi-layer replay is
+    /// default-on there).
+    pub gdn_replay_ml_off: bool,
+    /// Railgun E0 / L6d: `HIPFIRE_SELECT_REGRID_OFF=1` restores the one-block-
+    /// per-row `topk_values_batched_f32` / `argmax_f32_batched` launches (the
+    /// gfx1201 multi-block re-grid is default-on there).
+    pub select_regrid_off: bool,
 }
 
 impl FeatureFlags {
@@ -869,6 +877,8 @@ impl FeatureFlags {
                 == Some("1"),
             mq_prologue_fuse_off: value("HIPFIRE_MQ_PROLOGUE_FUSE_OFF").ok().as_deref()
                 == Some("1"),
+            gdn_replay_ml_off: value("HIPFIRE_GDN_REPLAY_ML_OFF").ok().as_deref() == Some("1"),
+            select_regrid_off: value("HIPFIRE_SELECT_REGRID_OFF").ok().as_deref() == Some("1"),
         }
     }
 
@@ -1187,6 +1197,8 @@ impl FeatureFlags {
             draft_collapse_off: false,
             ddtree_topk_direct_off: false,
             mq_prologue_fuse_off: false,
+            gdn_replay_ml_off: false,
+            select_regrid_off: false,
         }
     }
 }

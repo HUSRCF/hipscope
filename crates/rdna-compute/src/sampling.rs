@@ -115,7 +115,9 @@ impl Gpu {
 
     /// GPU-side batched argmax: writes one i32 index per row into `result`
     /// (shape `[batch_size]`). Avoids downloading `batch_size × n` floats
-    /// to the host — only `batch_size × 4` bytes land on PCIe.
+    /// to the host — only `batch_size × 4` bytes land on PCIe. On exact
+    /// gfx1201 this is the byte-identical L6d re-grid
+    /// ([`Self::select_regrid_enabled`]); elsewhere the shipping kernel.
     pub fn argmax_f32_batched(
         &mut self,
         data: &GpuTensor,
@@ -124,38 +126,10 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel(
-            "argmax_f32_batched",
-            kernels::ARGMAX_BATCHED_SRC,
-            "argmax_f32_batched",
-        )?;
-
-        let mut dp = data.buf.as_ptr();
-        let mut rp = result.buf.as_ptr();
-        let mut nn = n as i32;
-
-        let mut params: Vec<*mut c_void> = vec![
-            &mut dp as *mut _ as *mut c_void,
-            &mut rp as *mut _ as *mut c_void,
-            &mut nn as *mut _ as *mut c_void,
-        ];
-
-        let block_size = 256u32;
-        let shared = block_size * 8; // f32 + i32 per thread
-        self.launch_maybe_blob(
-            "argmax_f32_batched",
-            [batch_size as u32, 1, 1],
-            [block_size, 1, 1],
-            shared,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(dp);
-                b.push_ptr(rp);
-                b.push_i32(nn);
-                b
-            },
-        )
+        if self.select_regrid_enabled() {
+            return self.argmax_f32_batched_regrid(data, result, n, batch_size);
+        }
+        self.argmax_f32_batched_shipping(data, result, n, batch_size)
     }
 
     /// GPU-side argmax: returns index of max value. Avoids downloading full logits.
@@ -850,6 +824,26 @@ impl Gpu {
     }
 
     fn launch_topk_batched_f32(
+        &mut self,
+        logits: &GpuTensor,
+        top_idx: &GpuTensor,
+        top_out: &GpuTensor,
+        vocab: usize,
+        k: usize,
+        b: usize,
+        raw_values: bool,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(k >= 1 && k <= 16, "topk_batched: K={} must be in [1,16]", k);
+        if raw_values && self.select_regrid_enabled() {
+            return self.topk_values_regrid_f32(logits, top_idx, top_out, vocab, k, b);
+        }
+        self.launch_topk_batched_f32_shipping(logits, top_idx, top_out, vocab, k, b, raw_values)
+    }
+
+    /// The shipping one-block-per-row top-K launch.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn launch_topk_batched_f32_shipping(
         &mut self,
         logits: &GpuTensor,
         top_idx: &GpuTensor,

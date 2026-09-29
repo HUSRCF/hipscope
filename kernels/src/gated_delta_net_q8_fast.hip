@@ -83,6 +83,48 @@ __device__ __forceinline__ float hipfire_gdn_read_lane0(float value) {
 }
 #endif
 
+#if defined(HIPFIRE_GDN_LAYER_TABLE)
+// Railgun E0 / L6c multi-layer replay: one launch advances the recurrence of
+// every LinearAttention layer. grid.z selects a layer row of this pointer
+// table (layout mirrors `GdnLayerTable` in
+// crates/rdna-compute/src/dflash_gdn_replay.rs); the per-block body below is
+// the single-lane (lane = 0) body unchanged. Layer z gets the frame the
+// per-layer launch sequence would have reserved for it: frame + z * n_tokens.
+struct GdnLayerTable {
+    const float* q;
+    const float* k;
+    const float* v;
+    const float* gate;
+    const float* beta;
+    signed char* s_q8;
+    float* s_scales;
+    float* output;
+    __half* s_ef_residual;
+};
+
+extern "C" __launch_bounds__(HIPFIRE_GDN_BLOCK_SIZE, HIPFIRE_GDN_MIN_BLOCKS)
+__global__ void HIPFIRE_GDN_KERNEL(
+    const GdnLayerTable* __restrict__ gdn_layers,
+    int n_tokens,
+    int n_heads,
+    int head_dim,
+    unsigned int frame_base
+) {
+    const GdnLayerTable gdn_layer = gdn_layers[blockIdx.z];
+    const float* __restrict__ q = gdn_layer.q;
+    const float* __restrict__ k = gdn_layer.k;
+    const float* __restrict__ v = gdn_layer.v;
+    const float* __restrict__ gate = gdn_layer.gate;
+    const float* __restrict__ beta = gdn_layer.beta;
+    signed char* __restrict__ s_q8 = gdn_layer.s_q8;
+    float* __restrict__ s_scales = gdn_layer.s_scales;
+    float* __restrict__ output = gdn_layer.output;
+    __half* __restrict__ s_ef_residual = gdn_layer.s_ef_residual;
+    const unsigned int frame = frame_base + (unsigned int)blockIdx.z * (unsigned int)n_tokens;
+    const int h = blockIdx.x;
+    const int tile = blockIdx.y;
+    const int lane = 0;
+#else
 extern "C" __launch_bounds__(HIPFIRE_GDN_BLOCK_SIZE, HIPFIRE_GDN_MIN_BLOCKS)
 __global__ void HIPFIRE_GDN_KERNEL(
     const float* __restrict__ q,
@@ -102,6 +144,7 @@ __global__ void HIPFIRE_GDN_KERNEL(
     const int h = blockIdx.x;
     const int tile = blockIdx.y;
     const int lane = blockIdx.z;
+#endif
     if (h >= n_heads) return;
 #if HIPFIRE_GDN_WAVES_PER_BLOCK == 2
     const int wave = threadIdx.x >> 5;
@@ -488,6 +531,7 @@ __global__ void HIPFIRE_GDN_KERNEL(
 #undef HIPFIRE_GDN_S_INDEX
 }
 
+#if !defined(HIPFIRE_GDN_LAYER_TABLE)
 // Masked independent sibling for the fast (single-end requant) path.
 // Derives lane from blockIdx.z and returns before any read/write for inactive
 // lanes. Full-mask callers use the unmasked fast kernel for exact parity.
@@ -722,3 +766,4 @@ __global__ void gated_delta_net_q8_fast_independent_masked(
 
 #undef HIPFIRE_GDN_S_INDEX_M
 }
+#endif

@@ -45,7 +45,7 @@ pub fn restore_gdn_requant_frame_checkpoint(frame: u32) {
 /// roundtrip (PARO drift-echo correctness, ~1.8× slower batched). Strictly OFF
 /// for MQ4/HFQ; opt in via `HIPFIRE_DN_REQUANT_PER_TOKEN=1` for PARO checkpoints
 /// (shisa-ai A3B). For n_tokens==1 (AR decode / DFlash draft) both are identical.
-fn dn_requant_per_token() -> bool {
+pub(crate) fn dn_requant_per_token() -> bool {
     // Truthy (non-empty, non-"0") predicate preserved verbatim from the
     // cached form; only the process-global cache is gone (the snapshot is
     // the cache now).

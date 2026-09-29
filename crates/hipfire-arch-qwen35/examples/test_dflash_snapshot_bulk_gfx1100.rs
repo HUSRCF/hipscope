@@ -24,9 +24,10 @@
 //! 7/layer (84 total).
 //!
 //! Run: `cargo run --release -p hipfire-arch-qwen35 --example
-//! test_dflash_snapshot_bulk_gfx1100`. Passes on any arch (off-gfx1100 the
-//! snapshot rides the memcpy loops and `bulk_n_items()` is `None`); on
-//! gfx1100 the tables must arm with the exact item counts.
+//! test_dflash_snapshot_bulk_gfx1100`. Passes on any arch (outside the bulk
+//! arches the snapshot rides the memcpy loops and `bulk_n_items()` is
+//! `None`); on gfx1100 and gfx1201 (railgun E0 port) the tables must arm with
+//! the exact item counts. The test name keeps its historical suffix.
 
 use hipfire_arch_qwen35::qwen35::{DeltaNetState, StateQuant};
 use hipfire_arch_qwen35::speculative::DeltaNetSnapshot;
@@ -131,7 +132,7 @@ fn poison_state(gpu: &mut Gpu, state: &DeltaNetState, seed: u64) {
     }
 }
 
-fn run_case(gpu: &mut Gpu, gfx1100: bool, ef_on: bool) {
+fn run_case(gpu: &mut Gpu, bulk_arch: bool, ef_on: bool) {
     let tag = if ef_on { "EF-on" } else { "EF-off" };
     let mut state = make_state(gpu, ef_on, 0x11);
     let mut snap = DeltaNetSnapshot::new_for(gpu, &state).expect("new_for");
@@ -144,16 +145,16 @@ fn run_case(gpu: &mut Gpu, gfx1100: bool, ef_on: bool) {
         };
     match snap.bulk_n_items() {
         Some(n) => {
-            assert!(gfx1100, "{tag}: tables armed off gfx1100");
+            assert!(bulk_arch, "{tag}: tables armed off gfx1100/gfx1201");
             assert_eq!(n, expect_items, "{tag}: item count");
         }
         None => assert!(
-            !gfx1100,
-            "{tag}: tables disarmed on gfx1100 (n_items would be {expect_items})"
+            !bulk_arch,
+            "{tag}: tables disarmed on gfx1100/gfx1201 (n_items would be {expect_items})"
         ),
     }
     eprintln!(
-        "{tag}: bulk_n_items={:?} (expect {expect_items} on gfx1100)",
+        "{tag}: bulk_n_items={:?} (expect {expect_items} on gfx1100/gfx1201)",
         snap.bulk_n_items()
     );
 
@@ -220,9 +221,10 @@ fn run_case(gpu: &mut Gpu, gfx1100: bool, ef_on: bool) {
 
 fn main() {
     let mut gpu = Gpu::init().expect("Gpu::init");
-    let gfx1100 = gpu.arch_caps.is_gfx1100();
-    eprintln!("arch={} gfx1100={gfx1100}", gpu.arch);
-    run_case(&mut gpu, gfx1100, true);
-    run_case(&mut gpu, gfx1100, false);
-    println!("S1 bulk snapshot gate: PASS (EF on/off, gfx1100={gfx1100})");
+    let bulk_arch = (gpu.arch_caps.is_gfx1100() || gpu.arch_caps.is_gfx1201())
+        && !gpu.flags.dn_snapshot_bulk_off;
+    eprintln!("arch={} bulk_arch={bulk_arch}", gpu.arch);
+    run_case(&mut gpu, bulk_arch, true);
+    run_case(&mut gpu, bulk_arch, false);
+    println!("S1 bulk snapshot gate: PASS (EF on/off, bulk_arch={bulk_arch})");
 }
