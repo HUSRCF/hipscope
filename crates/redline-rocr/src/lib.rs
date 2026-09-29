@@ -38,7 +38,8 @@ pub use packet::{
     PacketError,
 };
 pub use pm4::{
-    Gfx12Pm4CommandBuffer, Gfx12RmwAcquirePolicy, Pm4BuildError, Pm4DispatchSpanAttribution,
+    Gfx12DispatchPacing, Gfx12Pm4CommandBuffer, Gfx12RmwAcquirePolicy, Pm4BuildError,
+    Pm4DispatchSpanAttribution,
 };
 pub use pm4_gfx10::{
     Gfx10DispatchInitiatorPolicy, Gfx10KernelImage, Gfx10Pm4BuildError, Gfx10Pm4CommandBuffer,

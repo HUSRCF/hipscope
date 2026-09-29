@@ -2342,6 +2342,20 @@ fn main() {
                                 gpu.replay.transport_name()
                             );
                         }
+                        // NOP pacing is certified for the gfx1201 Qwen3.5-dense
+                        // retained tape only; MQ4R and every other retained
+                        // default keep their unpaced tapes.
+                        let gfx1201_dense_pacing = redline_default
+                            && gpu.arch == "gfx1201"
+                            && arch == "qwen3_5"
+                            && !hipfire_runtime::config::mq4r_redline_default(
+                                &gpu.arch, path, pp, tp,
+                            );
+                        gpu.replay.set_pm4_gfx12_dispatch_pacing(if gfx1201_dense_pacing {
+                            rdna_compute::replay::gfx1201_pm4_pacing_from_config()
+                        } else {
+                            Default::default()
+                        });
                         let vl = m.vision_config().is_some() || m.dots_ocr().is_some();
                         let (dim, layers, vocab) = m.ack_dims();
 

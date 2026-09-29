@@ -24,7 +24,7 @@ use radiowave::{CodeObjectCertification, KernelArgumentAccess, MutableReadCache}
 use redline_dispatch::aql::{
     load_symbols, BatchFencePolicy, Executable, FenceScope, Gfx10DispatchInitiatorPolicy,
     Gfx10Pm4CommandBuffer, Gfx10SetShRegRecord, Gfx11ComputeResourceLimitsPolicy,
-    Gfx11DispatchInterleave, Gfx12Pm4CommandBuffer, Gfx12RmwAcquirePolicy, GpuBatchTiming, GpuDevice, GpuMultiQueueTiming,
+    Gfx11DispatchInterleave, Gfx12DispatchPacing, Gfx12Pm4CommandBuffer, Gfx12RmwAcquirePolicy, GpuBatchTiming, GpuDevice, GpuMultiQueueTiming,
     GpuSelector, HeaderPolicy, KernargBuffer, KernargPool, Kernel, LaunchGeometry,
     PhasedMultiQueuePm4Ib, QueuePolicy, Quiescence, RecordedDispatch, Runtime,
     SingleQueueBatchGraph, SingleQueuePm4Ib,
@@ -3542,6 +3542,39 @@ pub fn dispatch_profile_enabled() -> bool {
         .is_some_and(|value| value != "0" && !value.is_empty())
 }
 
+/// Default NOP pacing of the retained gfx1201 Qwen3.5-dense decode tape.
+const GFX1201_DEFAULT_PM4_PACING: Gfx12DispatchPacing = Gfx12DispatchPacing::PostDispatchNop(64);
+
+/// `HIPFIRE_GFX1201_PM4_PACING` (`replay.gfx1201_pm4_pacing`): unset or
+/// `auto` selects the default, `0`/`off` disables pacing and `nop:N` emits an
+/// N-body-dword NOP after every dispatch. An unparseable value keeps the
+/// default.
+pub fn gfx1201_pm4_pacing_from_config() -> Gfx12DispatchPacing {
+    let value = hipfire_config::process_value("HIPFIRE_GFX1201_PM4_PACING");
+    parse_gfx1201_pm4_pacing(value.as_deref()).unwrap_or_else(|reason| {
+        eprintln!("[redline] ignoring HIPFIRE_GFX1201_PM4_PACING: {reason}");
+        GFX1201_DEFAULT_PM4_PACING
+    })
+}
+
+fn parse_gfx1201_pm4_pacing(value: Option<&str>) -> Result<Gfx12DispatchPacing, String> {
+    let value = value.map(str::trim).unwrap_or("auto");
+    let count = |text: &str| {
+        text.parse::<u32>()
+            .ok()
+            .filter(|dwords| (1..=0x4000).contains(dwords))
+            .ok_or_else(|| format!("{value:?}: dword count must be 1..=16384"))
+    };
+    match value.to_ascii_lowercase().as_str() {
+        "" | "auto" => Ok(GFX1201_DEFAULT_PM4_PACING),
+        "0" | "off" | "false" | "none" => Ok(Gfx12DispatchPacing::None),
+        other => match other.split_once(':') {
+            Some(("nop", dwords)) => count(dwords).map(Gfx12DispatchPacing::PostDispatchNop),
+            _ => Err(format!("{value:?}: expected auto, off or nop:N")),
+        },
+    }
+}
+
 /// Summarise per-dispatch spans so a slow machine reports a distribution
 /// rather than a single throughput number.
 ///
@@ -4253,6 +4286,8 @@ pub struct ReplayController {
     pm4_wait_policy: Pm4WaitPolicy,
     pm4_register_policy: Pm4RegisterPolicy,
     pm4_queue_policy: QueuePolicy,
+    /// NOP pacing for the single-queue gfx12 tape; set by the daemon on load.
+    pm4_gfx12_dispatch_pacing: Gfx12DispatchPacing,
     state: ReplayState,
     recorded: Vec<RecordedHipLaunch>,
     certified_speedups: Vec<f64>,
@@ -4323,6 +4358,7 @@ impl ReplayController {
             pm4_wait_policy: Pm4WaitPolicy::from_config(),
             pm4_register_policy: Pm4RegisterPolicy::from_config(),
             pm4_queue_policy: pm4_queue_policy_from_config(),
+            pm4_gfx12_dispatch_pacing: Gfx12DispatchPacing::None,
             state,
             recorded: Vec::new(),
             certified_speedups: Vec::new(),
@@ -4498,6 +4534,12 @@ impl ReplayController {
 
     pub fn pm4_queue_policy(&self) -> QueuePolicy {
         self.pm4_queue_policy
+    }
+
+    /// Pace the next single-queue gfx12 PM4 preparation (ignored on gfx10/11,
+    /// multi-queue tapes and the per-dispatch profile).
+    pub fn set_pm4_gfx12_dispatch_pacing(&mut self, pacing: Gfx12DispatchPacing) {
+        self.pm4_gfx12_dispatch_pacing = pacing;
     }
 
     pub fn prepared_pm4_shape(&self) -> Option<(usize, usize)> {
@@ -5269,6 +5311,14 @@ impl ReplayController {
                 resource_limits_policy,
                 dependency_mode,
             );
+            let pacing = if dispatch_profile {
+                Gfx12DispatchPacing::None
+            } else {
+                self.pm4_gfx12_dispatch_pacing
+            };
+            if let Pm4Commands::Gfx12(gfx12) = &mut commands {
+                gfx12.set_dispatch_pacing(pacing);
+            }
             // Sentinel epoch 0 before entry acquire: every immutable replay
             // re-submits this prefix so a stale prior epoch cannot satisfy the
             // next run (ABA).
@@ -5361,6 +5411,16 @@ impl ReplayController {
                 commands.populate_dispatch_span_boundaries(&mut dispatch_boundaries)?;
             }
             let command_dwords = commands.len_dwords();
+            if let Pm4Commands::Gfx12(gfx12) = &commands {
+                if pacing != Gfx12DispatchPacing::None {
+                    eprintln!(
+                        "[redline] gfx12 PM4 dispatch pacing {pacing:?}: dispatches={prefix} \
+                         nop_dwords={} ({:.1}/dispatch) command_dwords={command_dwords}",
+                        gfx12.pacing_dwords(),
+                        gfx12.pacing_dwords() as f64 / prefix as f64,
+                    );
+                }
+            }
             if reorder_window.is_some() {
                 eprintln!(
                     "[redline] single-IB schedule stats arch={}: \
@@ -10228,5 +10288,23 @@ mod tests {
         assert!(line.contains("command_dwords=8"));
         drop(report);
         let _ = std::mem::size_of::<PreparedPm4Replay>();
+    }
+
+    #[test]
+    fn gfx1201_pm4_pacing_parses_opt_out_sizes_and_rejects_bad_values() {
+        use Gfx12DispatchPacing::PostDispatchNop;
+        for (value, want) in [
+            (None, Ok(GFX1201_DEFAULT_PM4_PACING)),
+            (Some("auto"), Ok(GFX1201_DEFAULT_PM4_PACING)),
+            (Some("0"), Ok(Gfx12DispatchPacing::None)),
+            (Some(" OFF "), Ok(Gfx12DispatchPacing::None)),
+            (Some("nop:128"), Ok(PostDispatchNop(128))),
+            (Some("nop:16384"), Ok(PostDispatchNop(16384))),
+        ] {
+            assert_eq!(parse_gfx1201_pm4_pacing(value), want, "{value:?}");
+        }
+        for bad in ["nop:0", "nop:16385", "align:64", "64", "pad:8"] {
+            assert!(parse_gfx1201_pm4_pacing(Some(bad)).is_err(), "{bad}");
+        }
     }
 }

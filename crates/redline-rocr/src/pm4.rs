@@ -17,6 +17,9 @@ const PACKET3_COPY_DATA: u32 = 0x40;
 const PACKET3_RELEASE_MEM: u32 = 0x49;
 const PACKET3_EVENT_WRITE: u32 = 0x46;
 const PACKET3_ACQUIRE_MEM: u32 = 0x58;
+const PACKET3_NOP: u32 = 0x10;
+/// Largest body a single type-3 packet can carry (14-bit count field + 1).
+const PACKET3_MAX_BODY_DWORDS: u32 = 0x4000;
 
 // GC 12.0.x SET_SH_REG offsets used by gfx1200/gfx1201. The register headers
 // number COMPUTE registers from regCOMPUTE_DISPATCH_INITIATOR=0x1ba0;
@@ -85,12 +88,27 @@ impl Gfx12RmwAcquirePolicy {
     }
 }
 
+/// Command-processor pacing around each `DISPATCH_DIRECT` of a retained gfx12
+/// tape. Every variant emits only `NOP` packets, which write no register and
+/// no memory, so a paced tape runs the same dispatches with the same state as
+/// the unpaced one; only packet positions in the IB move.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Gfx12DispatchPacing {
+    #[default]
+    None,
+    /// One `NOP` with this many zero body dwords after every dispatch
+    /// (clamped to one packet's maximum body).
+    PostDispatchNop(u32),
+}
+
 /// Retained GFX12 PM4 command words suitable for one PM4 indirect buffer.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Gfx12Pm4CommandBuffer {
     dwords: Vec<u32>,
     register_state: Option<BTreeMap<u32, u32>>,
     cache_dynamic_registers: bool,
+    pacing: Gfx12DispatchPacing,
+    pacing_dwords: u64,
 }
 
 impl Gfx12Pm4CommandBuffer {
@@ -103,9 +121,9 @@ impl Gfx12Pm4CommandBuffer {
     /// The first write to every register is always emitted.
     pub fn new_stateful() -> Self {
         Self {
-            dwords: Vec::new(),
             register_state: Some(BTreeMap::new()),
             cache_dynamic_registers: true,
+            ..Self::default()
         }
     }
 
@@ -114,9 +132,36 @@ impl Gfx12Pm4CommandBuffer {
     /// in the legacy encoder.
     pub fn new_static_stateful() -> Self {
         Self {
-            dwords: Vec::new(),
             register_state: Some(BTreeMap::new()),
             cache_dynamic_registers: false,
+            ..Self::default()
+        }
+    }
+
+    /// Pace every later [`Self::dispatch`] with `NOP` packets.
+    pub fn set_dispatch_pacing(&mut self, pacing: Gfx12DispatchPacing) {
+        self.pacing = pacing;
+    }
+
+    /// Dwords of `NOP` packets emitted by dispatch pacing so far.
+    pub fn pacing_dwords(&self) -> u64 {
+        self.pacing_dwords
+    }
+
+    /// Emit one `NOP` packet of exactly `total` dwords (header included).
+    fn nop(&mut self, total: u32) {
+        debug_assert!((2..=PACKET3_MAX_BODY_DWORDS + 1).contains(&total));
+        self.dwords.push(packet3(PACKET3_NOP, total - 1, false));
+        self.dwords
+            .extend(std::iter::repeat_n(0, (total - 1) as usize));
+        self.pacing_dwords += u64::from(total);
+    }
+
+    fn pace_after_dispatch(&mut self) {
+        if let Gfx12DispatchPacing::PostDispatchNop(body) = self.pacing {
+            if body != 0 {
+                self.nop(body.min(PACKET3_MAX_BODY_DWORDS) + 1);
+            }
         }
     }
 
@@ -448,6 +493,7 @@ impl Gfx12Pm4CommandBuffer {
         // with CS_W32_EN derived from the kernel descriptor. A mixed-wave
         // retained tape must never inherit this bit from the preceding node.
         self.dwords.push(dispatch_initiator(wave32));
+        self.pace_after_dispatch();
         Ok(())
     }
 
@@ -907,5 +953,73 @@ mod tests {
             commands.len_dwords() - dynamic_len,
             dynamic_len - static_len
         );
+    }
+
+    /// Emit `n` dispatches with register runs of varying length the way
+    /// `dispatch` does, under `pacing`.
+    fn paced_stream(n: usize, pacing: Gfx12DispatchPacing) -> Gfx12Pm4CommandBuffer {
+        let mut buffer = Gfx12Pm4CommandBuffer::new();
+        buffer.set_dispatch_pacing(pacing);
+        buffer.acquire_system_gfx12();
+        for i in 0..n {
+            if i % 3 == 1 {
+                buffer.wait_compute_idle();
+            }
+            buffer.emit_set_sh_regs(COMPUTE_PGM_LO, &vec![i as u32; 1 + i % 5]);
+            buffer
+                .dwords
+                .push(packet3(PACKET3_DISPATCH_DIRECT, 4, true));
+            buffer.dwords.extend_from_slice(&[i as u32 + 1, 1, 1, 0x8025]);
+            buffer.pace_after_dispatch();
+        }
+        buffer.wait_compute_idle();
+        buffer
+    }
+
+    /// Packets of `dwords` with every NOP removed, plus the DISPATCH_DIRECT
+    /// header positions.
+    fn strip_nops(dwords: &[u32]) -> (Vec<u32>, Vec<usize>) {
+        let (mut kept, mut dispatches, mut cursor) = (Vec::new(), Vec::new(), 0);
+        while cursor < dwords.len() {
+            let header = dwords[cursor];
+            assert_eq!(header >> 30, 3, "non-PACKET3 header at {cursor}");
+            let next = cursor + 2 + ((header >> 16) & 0x3fff) as usize;
+            let opcode = (header >> 8) & 0xff;
+            if opcode == PACKET3_NOP {
+                assert!(dwords[cursor + 1..next].iter().all(|word| *word == 0));
+            } else {
+                if opcode == PACKET3_DISPATCH_DIRECT {
+                    dispatches.push(cursor);
+                }
+                kept.extend_from_slice(&dwords[cursor..next]);
+            }
+            cursor = next;
+        }
+        (kept, dispatches)
+    }
+
+    /// Pacing only inserts zero-body NOP packets: removing them restores the
+    /// unpaced tape exactly, and the NOP immediately follows every dispatch.
+    #[test]
+    fn dispatch_pacing_inserts_only_nops_at_the_requested_positions() {
+        let plain = paced_stream(23, Gfx12DispatchPacing::None);
+        assert_eq!(plain.pacing_dwords(), 0);
+        for body in [1, 64, 128] {
+            let pacing = Gfx12DispatchPacing::PostDispatchNop(body);
+            let paced = paced_stream(23, pacing);
+            assert_eq!(
+                u64::from(paced.len_dwords() - plain.len_dwords()),
+                paced.pacing_dwords(),
+                "{pacing:?}"
+            );
+            let timed = paced.with_gpu_timestamps(0x1000, 0x1008);
+            let (kept, dispatches) = strip_nops(timed.dwords());
+            assert_eq!(kept, plain.with_gpu_timestamps(0x1000, 0x1008).dwords(), "{pacing:?}");
+            assert_eq!(dispatches.len(), 23);
+            assert_eq!(paced.pacing_dwords(), 23 * u64::from(body + 1));
+            for at in dispatches {
+                assert_eq!(timed.dwords()[at + 5], packet3(PACKET3_NOP, body, false));
+            }
+        }
     }
 }

@@ -3149,6 +3149,16 @@ pub static FIELDS: &[ConfigField] = &[
         "HIPFIRE_REPLAY_PM4_GFX11_VMEM_ACQUIRE",
         "Enable Radiowave-classified VMEM acquires on gfx11; auto selects gfx1151."
     ),
+    process_field!(
+        "replay.gfx1201_pm4_pacing",
+        "gfx1201_pm4_pacing",
+        Replay,
+        DefaultValue::String("auto"),
+        ValueRule::String,
+        false,
+        "HIPFIRE_GFX1201_PM4_PACING",
+        "NOP pacing of the retained gfx1201 Qwen3.5-dense decode PM4 tape: auto (default: a 64-dword NOP after every dispatch), off/0, or nop:N (N-dword NOP after every dispatch). NOPs write no register or memory; decode is bit-identical."
+    ),
     diagnostic_field!(
         "diagnostic.replay.gfx1151_initiator",
         "gfx1151_pm4_initiator",
