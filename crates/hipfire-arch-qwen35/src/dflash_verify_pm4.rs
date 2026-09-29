@@ -263,6 +263,16 @@ impl DflashVerifyPm4 {
         &self.phase
     }
 
+    /// True when the route was admitted at load (armed or beyond; only a
+    /// `Disabled` route was refused). Load-time callers use this to keep
+    /// mutually exclusive opt-ins apart — e.g. DFlash adaptive-B is forced
+    /// off when admitted, because a shrunk verify window fails
+    /// `eligible_shape` (`batch == DFLASH_VERIFY_PM4_BLOCK` required) and
+    /// PM4 replay would silently degrade to partial_hip.
+    pub fn admitted(&self) -> bool {
+        !matches!(self.phase, DflashVerifyPm4Phase::Disabled { .. })
+    }
+
     pub fn counters(&self) -> &DflashVerifyPm4Counters {
         &self.counters
     }

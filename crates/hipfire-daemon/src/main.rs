@@ -1780,15 +1780,20 @@ fn main() {
                     .unwrap_or(hipfire_runtime::config::get().mtp_k);
                 let mtp_path = request_guards::mtp_sidecar_path(&msg, &mtp_mode);
 
+                // DFlash adaptive verify-block (default on): clamp(ceil(τ̂)+2, 2, full)
+                // over the trailing 8 verify cycles, full below 2k ctx. Mutually
+                // exclusive with the retained-PM4 route (fixed B=16 shape);
+                // HIPFIRE_DFLASH_ADAPTIVE_B=0 forces fixed.
+                let adaptive_b = msg
+                    .get("params")
+                    .and_then(|p| p.get("dflash_adaptive_b"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+
                 // Model-free n-gram policy normally arrives as per-load params
                 // resolved by the CLI. Direct protocol clients inherit the
                 // daemon's typed process policy instead of ambient env.
                 let spec_cfg = hipfire_runtime::loader_api::SpecLoadCfg {
-                    dflash_adaptive_b: msg
-                        .get("params")
-                        .and_then(|p| p.get("dflash_adaptive_b"))
-                        .and_then(|v| v.as_bool())
-                        .or(Some(true)),
                     ngram_draft: msg
                         .get("params")
                         .and_then(|p| p.get("ngram_draft"))
@@ -1848,6 +1853,7 @@ fn main() {
                         _ => None, // "auto" → loader default
                     },
                     mtp_k: Some(mtp_k),
+                    dflash_adaptive_b: Some(adaptive_b),
                 };
 
                 // 0.1.7: TriAttention / CASK eviction protocol fields. When

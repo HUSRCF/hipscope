@@ -21,6 +21,7 @@ use crate::speculative::{
     SpecStepResult, VerifyScratch,
 };
 use hipfire_runtime::dflash::{DflashConfig, DflashScratch, DflashWeights, TargetHiddenLogMark};
+use hipfire_runtime::dflash_adaptive_block::DflashAdaptiveBlock;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_runtime::spec::{
@@ -28,7 +29,7 @@ use hipfire_runtime::spec::{
     SpecRequestConfig, SpecStep, SpecTarget, Speculator,
 };
 use rdna_compute::{Gpu, GpuTensor};
-use std::{collections::VecDeque, path::Path};
+use std::path::Path;
 
 /// Extract layers the retained B=16 DFlash2 verify route admits.
 const DFLASH_VERIFY_PM4_EXTRACT_LAYERS: [usize; 5] = [5, 19, 33, 47, 61];
@@ -553,10 +554,13 @@ pub struct DflashSpeculator {
     ck_interval: usize,
     ck_cap: usize,
     last_window: Option<DflashWindowMark>,
-    adaptive_b: bool,
-    adaptive_b_current: usize,
-    adaptive_b_cooldown: usize,
-    adaptive_accepts: VecDeque<usize>,
+    /// Adaptive verify-block controller (trailing-τ proposal shrink),
+    /// owned by `hipfire_runtime::dflash_adaptive_block` so the policy is
+    /// family-free. Disabled (fixed full block) when the load knob opted out,
+    /// `HIPFIRE_DFLASH_ADAPTIVE_B=0` wins, or the retained-PM4 verify route
+    /// was admitted (its replay is shape-frozen at B=16; see
+    /// `build_dflash_speculator`). Reset to full at request start.
+    adaptive: DflashAdaptiveBlock,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -570,6 +574,9 @@ impl DflashSpeculator {
     /// `resume_enabled`/`ck_interval`/`ck_cap` mirror the daemon's
     /// `ckpt_resume_enabled()`/`ckpt_interval()`/`ckpt_max()` — passed in by
     /// `build_dflash_speculator` so `new` itself is env-free (and unit-testable).
+    /// `adaptive_b` is the already-resolved knob (load param AND env
+    /// kill-switch AND the retained-PM4 gate folded by `build_dflash_speculator`)
+    /// — likewise env-free and PM4-free here.
     pub fn new(
         df: DflashState,
         resume_enabled: bool,
@@ -577,7 +584,7 @@ impl DflashSpeculator {
         ck_cap: usize,
         adaptive_b: bool,
     ) -> Self {
-        let adaptive_b_current = df.block_size.max(2);
+        let adaptive = DflashAdaptiveBlock::new(df.block_size, adaptive_b);
         Self {
             df,
             // Same fixed seed the daemon's DFlash loop used. `set_sampling`
@@ -596,60 +603,7 @@ impl DflashSpeculator {
             ck_interval,
             ck_cap,
             last_window: None,
-            adaptive_b,
-            adaptive_b_current,
-            adaptive_b_cooldown: 0,
-            adaptive_accepts: VecDeque::with_capacity(4),
-        }
-    }
-
-    fn reset_adaptive_b(&mut self) {
-        self.adaptive_b_current = self.df.block_size.max(2);
-        self.adaptive_b_cooldown = 0;
-        self.adaptive_accepts.clear();
-    }
-
-    fn note_acceptance(&mut self, accepted: usize) {
-        // DDTree has its own structural budget; adaptive chain-B must not
-        // alter tree verification geometry.
-        if !self.adaptive_b || self.df.ddtree.is_some() || self.df.block_size <= 8 {
-            return;
-        }
-        const WINDOW: usize = 4;
-        const COOLDOWN: usize = 4;
-        const STEP: usize = 2;
-        const MIN_B: usize = 8;
-        const UP: f64 = 0.45;
-        const DOWN: f64 = 0.25;
-
-        if self.adaptive_accepts.len() == WINDOW {
-            self.adaptive_accepts.pop_front();
-        }
-        self.adaptive_accepts.push_back(accepted);
-        if self.adaptive_accepts.len() < WINDOW {
-            self.adaptive_b_cooldown = self.adaptive_b_cooldown.saturating_add(1);
-            return;
-        }
-        if self.adaptive_b_cooldown < COOLDOWN {
-            self.adaptive_b_cooldown += 1;
-            return;
-        }
-
-        let mean = self.adaptive_accepts.iter().sum::<usize>() as f64 / WINDOW as f64;
-        let util = mean / self.adaptive_b_current.saturating_sub(1).max(1) as f64;
-        let old = self.adaptive_b_current;
-        if util > UP && self.adaptive_b_current + STEP <= self.df.block_size {
-            self.adaptive_b_current += STEP;
-            self.adaptive_b_cooldown = 0;
-        } else if util < DOWN && self.adaptive_b_current >= MIN_B + STEP {
-            self.adaptive_b_current -= STEP;
-            self.adaptive_b_cooldown = 0;
-        }
-        if old != self.adaptive_b_current {
-            eprintln!(
-                "  DFlash adaptive-B: {} -> {} (mean_accept={:.2}, util={:.3})",
-                old, self.adaptive_b_current, mean, util
-            );
+            adaptive,
         }
     }
 
@@ -680,7 +634,7 @@ impl Speculator for DflashSpeculator {
         resume_from: Option<usize>,
         abort: &dyn Fn() -> bool,
     ) -> Result<PrefillOutcome, String> {
-        self.reset_adaptive_b();
+        self.adaptive.reset();
         self.last_window = None;
         let slot = target
             .as_any_mut()
@@ -925,11 +879,19 @@ impl Speculator for DflashSpeculator {
         // (uniform for max_emit >= 1); max_accept clamps accept before commit
         // so max_emit == 1 is a true one-token path (accept 0 + bonus).
         let block_override = {
-            let cfg_b = if self.adaptive_b {
-                self.adaptive_b_current.max(2)
-            } else {
-                self.df.block_size.max(2)
-            };
+            // Adaptive proposal width at this absolute position: the
+            // trailing-τ controller's effective block, gated on context
+            // length (full below ADAPTIVE_CTX_GATE where the B×L scan is
+            // trivial; full until 8 cycles observed / when opted out),
+            // further bounded by the remaining client budget below.
+            // Proposing fewer rows only shortens the accepted run —
+            // rows 1..=k are the causal prefix rows, never a different
+            // prefix (bound documented on DflashAdaptiveBlock).
+            let cfg_b = self
+                .adaptive
+                .effective_at(position)
+                .max(2)
+                .min(self.df.block_size.max(2));
             let want = max_emit.max(2);
             let b = cfg_b.min(want);
             if b < cfg_b || b != self.df.draft_config.block_size {
@@ -1031,13 +993,29 @@ impl Speculator for DflashSpeculator {
         };
 
         let lowered = result
-            .map(|s| {
-                self.note_acceptance(s.accepted);
-                lower_qwen35(s)
-            })
+            .map(lower_qwen35)
             // Defense only — accept stage already committed ≤ max_emit.
             .map(|s| s.cap_emit(max_emit))
             .map_err(|e| e.to_string());
+        // Feed the committed accept count into the trailing-τ controller for
+        // the NEXT cycle's proposal width (cap_emit already reconciled
+        // `accepted` with the truncated emit, so this is what really
+        // committed). DDTree has its own structural budget — only the chain
+        // proposal width shrinks; the tree budget is never fed here.
+        if let Ok(s) = &lowered {
+            let prev = self.adaptive.effective();
+            let next = self.adaptive.observe(s.accepted);
+            if next != prev {
+                eprintln!(
+                    "[dflash] adaptive_b {}: block {} -> {} (tau_hat {:.2} over last 8, full {})",
+                    if next < prev { "shrink" } else { "recover" },
+                    prev,
+                    next,
+                    self.adaptive.tau_hat().unwrap_or(0.0),
+                    self.adaptive.full(),
+                );
+            }
+        }
         self.last_window = lowered.as_ref().ok().map(|_| window_mark);
         lowered
     }
@@ -1062,10 +1040,11 @@ impl Speculator for DflashSpeculator {
     fn reset(&mut self, gpu: &mut Gpu) -> Result<(), String> {
         // Drafter-local reset: invalidate cached suffix projections and free the
         // divergent-render checkpoint ring (the target KV/recurrent reset is the
-        // daemon's job — it owns the bundle).
+        // daemon's job — it owns the bundle). The adaptive window reseeds to
+        // full too — the fail-safe direction (today's fixed-B behaviour).
         self.df.draft_scratch.reset_upload_tracking();
         self.last_window = None;
-        self.reset_adaptive_b();
+        self.adaptive.reset();
         for (_, snap) in self.checkpoints.drain(..) {
             snap.free_gpu(gpu);
         }
@@ -1151,7 +1130,10 @@ impl Speculator for DflashSpeculator {
     }
 
     fn block_size(&self) -> usize {
-        self.df.block_size
+        // Effective proposal width (adaptive shrink); full when opted out or
+        // seeding. The generate loop's capacity checks + overflow guard read
+        // this per cycle, and `step` truncates the draft block to match.
+        self.adaptive.effective()
     }
 
     fn ctx_capacity(&self) -> usize {
@@ -1200,6 +1182,10 @@ impl Speculator for DflashSpeculator {
         self.sample_cactus = cfg.cactus_delta;
         self.rng_state = request_rng_state(cfg.rng_seed);
         self.last_window = None;
+        // Per-request reseed of the adaptive window: a new request opens at
+        // the full block; the controller re-shrinks only after a fresh
+        // 8-cycle window (no cross-request stale-history shrink).
+        self.adaptive.reset();
     }
 
     fn requires_greedy(&self) -> bool {
@@ -1235,7 +1221,11 @@ impl Speculator for DflashSpeculator {
 /// the env config the daemon's old `generate_dflash` read inline: checkpoint
 /// resume (`HIPFIRE_DFLASH_CKPT_RESUME` + no-eviction) and interval/cap
 /// (`HIPFIRE_CACHE_CKPT_INTERVAL`/`_MAX`, matching the daemon's
-/// `ckpt_interval()`/`ckpt_max()` defaults). Called once at load.
+/// `ckpt_interval()`/`ckpt_max()` defaults), plus the adaptive-B kill-switch
+/// (`HIPFIRE_DFLASH_ADAPTIVE_B=0` forces the fixed full block, mirroring
+/// DSpark's `HIPFIRE_DSPARK_ADAPTIVE_BLOCK=0`). Called once at load.
+/// `adaptive_b` is the `SpecLoadCfg::dflash_adaptive_b` load param (None =
+/// default on).
 pub fn build_dflash_speculator(
     df: DflashState,
     eviction_is_none: bool,
@@ -1256,6 +1246,28 @@ pub fn build_dflash_speculator(
         .and_then(|v| v.parse().ok())
         .unwrap_or(8usize)
         .max(1);
+    // Default-on; HIPFIRE_DFLASH_ADAPTIVE_B=0 opts out (fixed block == today).
+    // The load param ANDs into this here so the constructor stays the single
+    // env-touching site and `new` stays pure (mirrors
+    // build_dspark_speculator).
+    let adaptive_b = adaptive_b
+        && hipfire_config::developer_var("HIPFIRE_DFLASH_ADAPTIVE_B")
+            .ok()
+            .as_deref()
+            != Some("0");
+    // Retained-PM4 verify replay is shape-frozen at B=16: an adaptive
+    // controller shrinks windows below DFLASH_VERIFY_PM4_BLOCK, the PM4
+    // window's `eligible_shape()` then refuses (`batch == B` only) and every
+    // verify silently falls back to partial_hip — PM4 opt-in users would
+    // silently lose replay. Fixed block wins for the whole load; adaptive
+    // and PM4 replay are mutually exclusive opt-ins by construction.
+    let pm4_replay = df.verify_pm4.admitted();
+    if adaptive_b && pm4_replay {
+        eprintln!(
+            "[dflash] adaptive_b: fixed block (retained PM4 verify replay is shape-frozen at B={DFLASH_VERIFY_PM4_BLOCK})"
+        );
+    }
+    let adaptive_b = adaptive_b && !pm4_replay;
     Box::new(DflashSpeculator::new(
         df,
         resume_enabled,
