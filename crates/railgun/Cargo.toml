@@ -25,7 +25,13 @@ sha2.workspace = true
 [features]
 # `examples/g4_probe.rs`: the G4 cache-visibility silicon probe (design §5 G4).
 g4-probe = []
+# `examples/boundary_bench.rs`: the gfx11 PM4 boundary-cost microbenchmark.
+boundary-bench = []
 
 [[example]]
 name = "g4_probe"
 required-features = ["g4-probe"]
+
+[[example]]
+name = "boundary_bench"
+required-features = ["boundary-bench"]
