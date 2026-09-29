@@ -1718,38 +1718,41 @@ impl Rig {
         }
     }
 
+}
+
+impl ModelRig {
     /// Borrowed Q8 KvCache viewing this slot's contiguous K/V slabs.
     /// Sequential `forward_scratch_*` writes here; the batched path reads
     /// the same bytes via `legacy_base`. Views are `DeviceBuffer::Borrowed`
     /// — dropping the KvCache does not free the arenas.
-    fn slot_kv_view(&self, slot: SlotId) -> KvCache {
+    fn slot_kv_view(&self, pool: &SlotPool, slot: SlotId) -> KvCache {
         // Paged slots have no contiguous slab: every legacy base is 0, so this
         // view would alias the arena prefix for ALL slots. Sequential writers
         // (VL, MTP prefill/replay) must be gated off under paged KV at
         // activation — if one reaches here, fail loudly rather than corrupt.
         assert!(
-            !self.pool.is_paged(),
+            !pool.is_paged(),
             "slot_kv_view: flat slab view requested under a paged pool — a \
              sequential KV writer would alias every slot onto the arena prefix"
         );
         assert!(
-            self.model.kv_tier.is_q8(),
+            self.kv_tier.is_q8(),
             "slot_kv_view: this view hardwires the q8 layout, but the engine \
              runs the {:?} KV tier — a sequential write here would corrupt the \
              rotated-K arena",
-            self.model.kv_tier.mode
+            self.kv_tier.mode
         );
-        let cap = self.pool.cap_tokens();
-        let per_pos_bytes = self.model.config.n_kv_heads * (self.model.config.head_dim / 32) * 34;
-        let base = self.pool.descriptors()[slot.0].legacy_k_base as usize;
+        let cap = pool.cap_tokens();
+        let per_pos_bytes = self.config.n_kv_heads * (self.config.head_dim / 32) * 34;
+        let base = pool.descriptors()[slot.0].legacy_k_base as usize;
         let span = cap * per_pos_bytes;
-        let mut k_gpu = Vec::with_capacity(self.model.config.n_layers);
-        let mut v_gpu = Vec::with_capacity(self.model.config.n_layers);
+        let mut k_gpu = Vec::with_capacity(self.config.n_layers);
+        let mut v_gpu = Vec::with_capacity(self.config.n_layers);
         let mut fa = 0usize;
-        for t in &self.model.config.layer_types {
+        for t in &self.config.layer_types {
             if *t == LayerType::FullAttention {
-                k_gpu.push(self.model.k_arenas[fa].sub_offset(base, span));
-                v_gpu.push(self.model.v_arenas[fa].sub_offset(base, span));
+                k_gpu.push(self.k_arenas[fa].sub_offset(base, span));
+                v_gpu.push(self.v_arenas[fa].sub_offset(base, span));
                 fa += 1;
             } else {
                 k_gpu.push(GpuTensor::null_for_test());
@@ -1761,11 +1764,11 @@ impl Rig {
             v_gpu,
             k_scales: vec![],
             v_scales: vec![],
-            kv_dim: self.model.config.n_kv_heads * self.model.config.head_dim,
+            kv_dim: self.config.n_kv_heads * self.config.head_dim,
             max_seq: cap,
             physical_cap: cap,
-            n_kv_heads: self.model.config.n_kv_heads,
-            head_dim: self.model.config.head_dim,
+            n_kv_heads: self.config.n_kv_heads,
+            head_dim: self.config.head_dim,
             quantized: true,
             quant_q8: true,
             quant_int8: false,
@@ -1791,29 +1794,39 @@ impl Rig {
 ///
 /// VL slots stay on this path for the whole request because batched 1D RoPE
 /// disagrees with M-RoPE on image tokens and on decode (`t=h=w = pos+delta`).
-fn vl_forward_remaining(
-    rig: &mut Rig,
-    slot: SlotId,
-    work: &mut PendingWork,
-    image_pad_id: u32,
-    mut grammar: Option<&mut GrammarConstraint>,
-) -> Result<u32, String> {
+impl ModelRig {
+    /// Sequential VL step: encode the image if needed, prefill/decode every
+    /// remaining token with M-RoPE, then sample the next token from
+    /// `scratch.logits`. VL slots stay on this path for the whole request
+    /// because batched 1D RoPE disagrees with M-RoPE on image tokens and on
+    /// decode (`t=h=w = pos+delta`).
+    fn vl_forward_remaining(
+        &mut self,
+        mut gpu: &mut Gpu,
+        pool: &mut SlotPool,
+        tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
+        sample_params: &mut [SlotSampleParams],
+        slot: SlotId,
+        work: &mut PendingWork,
+        image_pad_id: u32,
+        mut grammar: Option<&mut GrammarConstraint>,
+    ) -> Result<u32, String> {
     let mut vl = work
         .vl_prefill
         .take()
         .ok_or_else(|| "vl_forward_remaining: slot has no VL state".to_string())?;
     let first_step = vl.embeddings.is_empty();
     if first_step {
-        let weights = rig.model
+        let weights = self
             .vision_weights
             .as_ref()
             .ok_or_else(|| "VL request but model has no vision encoder".to_string())?;
-        let config = rig.model
+        let config = self
             .vision_config
             .as_ref()
             .ok_or_else(|| "VL request but model has no vision config".to_string())?;
         let emb = hipfire_arch_qwen35_vl::qwen35_vl::vision_forward(
-            &mut rig.gpu,
+            &mut gpu,
             weights,
             config,
             &vl.patches,
@@ -1822,16 +1835,16 @@ fn vl_forward_remaining(
         )
         .map_err(|e| format!("vision_forward: {e}"))?;
         vl.embeddings = emb;
-        vl.dim = rig.model.config.dim;
+        vl.dim = self.config.dim;
         vl.patches.clear();
-        hipfire_runtime::llama::reset_cpu_sampler_rng(rig.sample_params[slot.0].seed);
+        hipfire_runtime::llama::reset_cpu_sampler_rng(sample_params[slot.0].seed);
     }
 
     let prompt_tokens = std::mem::take(&mut work.remaining_prompt);
     let mut pos = work.next_pos;
-    let mut kv_cache = rig.slot_kv_view(slot);
+    let mut kv_cache = self.slot_kv_view(pool, slot);
     let mrope_ctx = qwen35::MropeCtx::new(
-        &rig.model.config,
+        &self.config,
         vl.base,
         vl.mrope_positions.clone(),
         vl.rope_delta,
@@ -1846,28 +1859,28 @@ fn vl_forward_remaining(
                 .get(start..start + dim)
                 .ok_or_else(|| "VL embedding slice out of range".to_string())?;
             qwen35::forward_scratch_embed_mrope(
-                &mut rig.gpu,
-                &rig.model.weights,
-                &rig.model.config,
+                &mut gpu,
+                &self.weights,
+                &self.config,
                 emb,
                 pos,
                 &mut kv_cache,
-                &mut rig.model.dn_states[slot.0],
-                &rig.model.scratch,
+                &mut self.dn_states[slot.0],
+                &self.scratch,
                 Some(&mrope_ctx),
             )
             .map_err(|e| format!("VL prefill embed: {e}"))?;
             visual_idx += 1;
         } else {
             qwen35::forward_scratch_mrope(
-                &mut rig.gpu,
-                &rig.model.weights,
-                &rig.model.config,
+                &mut gpu,
+                &self.weights,
+                &self.config,
                 token,
                 pos,
                 &mut kv_cache,
-                &mut rig.model.dn_states[slot.0],
-                &rig.model.scratch,
+                &mut self.dn_states[slot.0],
+                &self.scratch,
                 Some(&mrope_ctx),
             )
             .map_err(|e| format!("VL forward: {e}"))?;
@@ -1876,14 +1889,13 @@ fn vl_forward_remaining(
     }
     vl.visual_idx = visual_idx;
     work.next_pos = pos;
-    rig.pool
+    pool
         .set_seq_len(slot, pos)
         .map_err(|e| format!("VL set_seq_len: {e}"))?;
     work.vl_prefill = Some(vl);
 
-    let mut logits = rig
-        .gpu
-        .download_f32(&rig.model.scratch.logits)
+    let mut logits = gpu
+        .download_f32(&self.scratch.logits)
         .map_err(|e| format!("VL download logits: {e}"))?;
     // Hard grammar mask BEFORE the host sampler (spec §7.2 G2 — the same
     // contract the batched path enforces on logits_out). This sequential
@@ -1891,7 +1903,7 @@ fn vl_forward_remaining(
     // could leave the matcher accepting and sail through as a success.
     if let Some(constraint) = grammar.as_deref_mut() {
         let mask = constraint
-            .build_mask(&rig.tokenizer, rig.model.config.vocab_size)
+            .build_mask(&tokenizer, self.config.vocab_size)
             .map_err(|e| format!("VL grammar mask: {e}"))?;
         for (i, &allowed) in mask.iter().enumerate() {
             if !allowed && i < logits.len() {
@@ -1899,7 +1911,7 @@ fn vl_forward_remaining(
             }
         }
     }
-    let sp = &rig.sample_params[slot.0];
+    let sp = &sample_params[slot.0];
     let cfg = hipfire_runtime::sampler::SamplerConfig {
         temperature: sp.temperature,
         top_p: sp.top_p,
@@ -1921,6 +1933,7 @@ fn vl_forward_remaining(
     };
     Ok(hipfire_runtime::sampler::sample_cpu(&mut logits, &[], &cfg))
 }
+}
 
 /// Advance slot `s`'s batched-VL vision-tower encode by ONE layer, starting
 /// the [`VisionTowerJob`] on the first call and finishing it (merger epilogue
@@ -1939,25 +1952,24 @@ fn vl_forward_remaining(
 /// `Ok(false)` → `job` is `Some` (encode continues next iteration);
 /// `Ok(true)` → encode finished, embeddings spliced, `job` is `None`;
 /// `Err` → the job was freed, `job` is `None`.
-fn vision_tower_step(
-    rig: &mut Rig,
-    s: usize,
-    job: &mut Option<hipfire_arch_qwen35_vl::qwen35_vl::VisionTowerJob>,
-    vl: &mut VlPrefill,
-) -> Result<bool, String> {
-    let Rig {
-        gpu,
-        model:
-            ModelRig {
-                vision_weights,
-                vision_config,
-                vl_ext_devs,
-                config,
-                ..
-            },
-        ..
-    } = rig;
-    if job.is_none() {
+impl ModelRig {
+    /// Advance slot `s`'s vision-tower job by one tower layer, creating it on
+    /// the first call from `vl.patches`. `Ok(true)` when the encode finished
+    /// and the slot's ext-embedding matrix is uploaded into
+    /// `vl_ext_devs[s]`; `Ok(false)` = still mid-encode (returns to the
+    /// scheduler so other slots keep decoding). `Err` → the job was freed.
+    fn vision_tower_step(
+        &mut self,
+        gpu: &mut Gpu,
+        s: usize,
+        vl: &mut VlPrefill,
+    ) -> Result<bool, String> {
+        let vision_weights = &self.vision_weights;
+        let vision_config = &self.vision_config;
+        let vl_ext_devs = &mut self.vl_ext_devs;
+        let config = &self.config;
+        let job = &mut self.vl_tower_jobs[s];
+        if job.is_none() {
         let weights = vision_weights
             .as_ref()
             .ok_or("VL request but model has no vision encoder")?;
@@ -2021,18 +2033,25 @@ fn vision_tower_step(
     vl.embeddings = emb;
     vl.dim = config.dim;
     Ok(true)
+    }
 }
 
 /// Free slot `s`'s VL GPU state (ext-embedding matrix + any tower job still
 /// mid-encode). For every site that clears a slot's work: dropping either
 /// without freeing leaks VRAM — the buffers are neither pooled nor hipFree'd
 /// by Drop.
-fn clear_slot_vl_state(rig: &mut Rig, s: usize) {
-    if let Some(dev) = rig.model.vl_ext_devs[s].take() {
-        let _ = rig.gpu.free_tensor(dev);
-    }
-    if let Some(job) = rig.model.vl_tower_jobs[s].take() {
-        let _ = job.free(&mut rig.gpu);
+impl ModelRig {
+    /// Free slot `s`'s VL GPU state (ext-embedding matrix + any tower job
+    /// still mid-encode). For every site that clears a slot's work: dropping
+    /// either without freeing leaks VRAM — the buffers are neither pooled
+    /// nor hipFree'd by Drop.
+    fn clear_slot_vl_state(&mut self, gpu: &mut Gpu, s: usize) {
+        if let Some(dev) = self.vl_ext_devs[s].take() {
+            let _ = gpu.free_tensor(dev);
+        }
+        if let Some(job) = self.vl_tower_jobs[s].take() {
+            let _ = job.free(gpu);
+        }
     }
 }
 
@@ -2048,106 +2067,108 @@ fn clear_slot_vl_state(rig: &mut Rig, s: usize) {
 /// chunk's last row — the correct draft seed hidden once the prompt drains.
 ///
 /// `row_off` is the slot's first row in the step batch; `m` its row count.
-fn mtp_head_prefill_chunk(
-    rig: &mut Rig,
-    slot: SlotId,
-    chunk_tokens: &[u32],
-    chunk_positions: &[i32],
-    row_off: usize,
-    m: usize,
-) -> Result<(), String> {
-    let head = rig.model
-        .mtp_head
-        .as_ref()
-        .ok_or_else(|| "mtp_head_prefill_chunk: MTP head not loaded".to_string())?;
-    let Some((scratch, rot)) = rig.model.mtp_prefill_batched.as_mut() else {
-        return Err("mtp_head_prefill_chunk: batched head scratch missing".to_string());
-    };
-    if rig.model.mtp_states[slot.0].is_none() {
-        let state = crate::mtp_spec::MtpSpecState::new_for_components(
-            &mut rig.gpu,
-            &rig.model.config,
-            &rig.model.dn_states[slot.0],
-            head,
-            rig.model.mtp_k,
-            crate::mtp_head::MtpKvMode::Q8,
-        )
-        .map_err(|e| format!("mtp state alloc: {e}"))?;
-        rig.model.mtp_states[slot.0] = Some(state);
-    }
-    if let Some(cvs) = head.weights.compressed_vocab_size {
-        let state = rig.model.mtp_states[slot.0].as_mut().unwrap();
-        state
-            .ensure_compressed_lm_logits(&mut rig.gpu, cvs)
-            .map_err(|e| format!("ensure compressed logits: {e}"))?;
-        // The draft phase reads `mtp_scratch.logits_compressed` (head-side
-        // buffer) — distinct from `mtp_lm_logits_compressed` above. Without
-        // this allocation the first draft step on a compressed head panics
-        // the engine thread (the sequential speculator was the only caller
-        // of `ensure_compressed_logits`).
-        state
-            .mtp_scratch
-            .ensure_compressed_logits(&mut rig.gpu, cvs)
-            .map_err(|e| format!("ensure head compressed logits: {e}"))?;
-    }
-
-    let dim = rig.model.config.dim;
-    let mut state = rig.model.mtp_states[slot.0]
-        .take()
-        .expect("just ensured it exists");
-
-    // The head consumes POST-output-norm trunk hidden (the convention it was
-    // exported with and the one the sequential path feeds it); pbs.x_batch
-    // holds the PRE-norm residual, so norm the chunk's rows into staging.
-    let hidden_rows = rig.model.pbs.x_batch.sub_offset(row_off * dim, m * dim);
-    let staged = rig.model.mtp_prefill_hidden.sub_offset(0, m * dim);
-    let norm_outcome = rig
-        .gpu
-        .rmsnorm_batched(
-            &hidden_rows,
-            &rig.model.weights.output_norm,
-            &staged,
-            m,
-            dim,
-            rig.model.config.norm_eps,
-        )
-        .map_err(|e| format!("mtp prefill hidden norm: {e}"));
-
-    // Disjoint field borrows: `scratch`/`rot` from mtp_prefill_batched,
-    // `gpu`/`weights`/head separately. No closure — it would capture all of
-    // `rig` and collide with the scratch borrow.
-    let mtp_outcome = norm_outcome.and_then(|()| {
-        crate::mtp_head::mtp_head_forward_block_batched(
-            &mut rig.gpu,
-            head,
-            scratch,
-            &mut state.mtp_kv,
-            chunk_tokens,
-            &staged,
-            chunk_positions,
-            m,
-            &rig.model.weights,
-            Some(rot),
-            /* kv_only */ true,
-        )
-        .map_err(|e| format!("mtp head prefill: {e}"))
-    });
-    // Seed hidden for the first draft cycle: the (normed) trunk hidden of
-    // the chunk's last token — same convention as the verify-path capture.
-    let hidden_outcome = mtp_outcome.and_then(|()| {
-        rig.gpu
-            .hip
-            .memcpy_dtod_at(
-                &state.prev_hidden.buf,
-                0,
-                &rig.model.mtp_prefill_hidden.buf,
-                (m - 1) * dim * 4,
-                dim * 4,
+impl ModelRig {
+    fn mtp_head_prefill_chunk(
+        &mut self,
+        mut gpu: &mut Gpu,
+        slot: SlotId,
+        chunk_tokens: &[u32],
+        chunk_positions: &[i32],
+        row_off: usize,
+        m: usize,
+    ) -> Result<(), String> {
+        let head = self
+            .mtp_head
+            .as_ref()
+            .ok_or_else(|| "mtp_head_prefill_chunk: MTP head not loaded".to_string())?;
+        let Some((scratch, rot)) = self.mtp_prefill_batched.as_mut() else {
+            return Err("mtp_head_prefill_chunk: batched head scratch missing".to_string());
+        };
+        if self.mtp_states[slot.0].is_none() {
+            let state = crate::mtp_spec::MtpSpecState::new_for_components(
+                &mut gpu,
+                &self.config,
+                &self.dn_states[slot.0],
+                head,
+                self.mtp_k,
+                crate::mtp_head::MtpKvMode::Q8,
             )
-            .map_err(|e| format!("mtp prev_hidden capture: {e:?}"))
-    });
-    rig.model.mtp_states[slot.0] = Some(state);
-    hidden_outcome
+            .map_err(|e| format!("mtp state alloc: {e}"))?;
+            self.mtp_states[slot.0] = Some(state);
+        }
+        if let Some(cvs) = head.weights.compressed_vocab_size {
+            let state = self.mtp_states[slot.0].as_mut().unwrap();
+            state
+                .ensure_compressed_lm_logits(&mut gpu, cvs)
+                .map_err(|e| format!("ensure compressed logits: {e}"))?;
+            // The draft phase reads `mtp_scratch.logits_compressed` (head-side
+            // buffer) — distinct from `mtp_lm_logits_compressed` above. Without
+            // this allocation the first draft step on a compressed head panics
+            // the engine thread (the sequential speculator was the only caller
+            // of `ensure_compressed_logits`).
+            state
+                .mtp_scratch
+                .ensure_compressed_logits(&mut gpu, cvs)
+                .map_err(|e| format!("ensure head compressed logits: {e}"))?;
+        }
+
+        let dim = self.config.dim;
+        let mut state = self.mtp_states[slot.0]
+            .take()
+            .expect("just ensured it exists");
+
+        // The head consumes POST-output-norm trunk hidden (the convention it was
+        // exported with and the one the sequential path feeds it); pbs.x_batch
+        // holds the PRE-norm residual, so norm the chunk's rows into staging.
+        let hidden_rows = self.pbs.x_batch.sub_offset(row_off * dim, m * dim);
+        let staged = self.mtp_prefill_hidden.sub_offset(0, m * dim);
+        let norm_outcome = gpu
+            .rmsnorm_batched(
+                &hidden_rows,
+                &self.weights.output_norm,
+                &staged,
+                m,
+                dim,
+                self.config.norm_eps,
+            )
+            .map_err(|e| format!("mtp prefill hidden norm: {e}"));
+
+        // Disjoint field borrows: `scratch`/`rot` from mtp_prefill_batched,
+        // `gpu`/`weights`/head separately. No closure — it would capture all of
+        // `rig` and collide with the scratch borrow.
+        let mtp_outcome = norm_outcome.and_then(|()| {
+            crate::mtp_head::mtp_head_forward_block_batched(
+                &mut gpu,
+                head,
+                scratch,
+                &mut state.mtp_kv,
+                chunk_tokens,
+                &staged,
+                chunk_positions,
+                m,
+                &self.weights,
+                Some(rot),
+                /* kv_only */ true,
+            )
+            .map_err(|e| format!("mtp head prefill: {e}"))
+        });
+        // Seed hidden for the first draft cycle: the (normed) trunk hidden of
+        // the chunk's last token — same convention as the verify-path capture.
+        let hidden_outcome = mtp_outcome.and_then(|()| {
+            gpu
+                .hip
+                .memcpy_dtod_at(
+                    &state.prev_hidden.buf,
+                    0,
+                    &self.mtp_prefill_hidden.buf,
+                    (m - 1) * dim * 4,
+                    dim * 4,
+                )
+                .map_err(|e| format!("mtp prev_hidden capture: {e:?}"))
+        });
+        self.mtp_states[slot.0] = Some(state);
+        hidden_outcome
+    }
 }
 
 /// MTP draft phase: run K serial head-forward steps, save DN snapshot.
@@ -2156,44 +2177,52 @@ fn mtp_head_prefill_chunk(
 /// `work.remaining_prompt.last()`. Saves DN snapshot to `state.trunk_snap`
 /// for rollback during verify. Returns the draft output for the batched
 /// verify phase.
-fn mtp_draft_step(
-    rig: &mut Rig,
-    slot: SlotId,
-    work: &mut PendingWork,
-) -> Result<crate::mtp_spec::MtpDraftOutput, String> {
-    let head = rig.model
+impl ModelRig {
+    /// MTP draft phase: run K serial head-forward steps, save DN snapshot.
+    ///
+    /// Called when `work.decoding` (subsequent MTP steps). Takes the seed
+    /// from `work.remaining_prompt.last()`. Saves DN snapshot to
+    /// `state.trunk_snap` for rollback during verify. Returns the draft
+    /// output for the batched verify phase.
+    fn mtp_draft_step(
+        &mut self,
+        mut gpu: &mut Gpu,
+        slot: SlotId,
+        work: &mut PendingWork,
+    ) -> Result<crate::mtp_spec::MtpDraftOutput, String> {
+    let head = self
         .mtp_head
         .as_ref()
         .ok_or_else(|| "mtp_draft_step: MTP head not loaded".to_string())?;
 
-    if rig.model.mtp_states[slot.0].is_none() {
+    if self.mtp_states[slot.0].is_none() {
         let state = crate::mtp_spec::MtpSpecState::new_for_components(
-            &mut rig.gpu,
-            &rig.model.config,
-            &rig.model.dn_states[slot.0],
+            &mut gpu,
+            &self.config,
+            &self.dn_states[slot.0],
             head,
-            rig.model.mtp_k,
+            self.mtp_k,
             crate::mtp_head::MtpKvMode::Q8,
         )
         .map_err(|e| format!("mtp state alloc: {e}"))?;
-        rig.model.mtp_states[slot.0] = Some(state);
+        self.mtp_states[slot.0] = Some(state);
     }
-    let mut state = rig.model.mtp_states[slot.0]
+    let mut state = self.mtp_states[slot.0]
         .take()
         .expect("just ensured it exists");
 
     if let Some(cvs) = head.weights.compressed_vocab_size {
-        if let Err(e) = state.ensure_compressed_lm_logits(&mut rig.gpu, cvs) {
-            rig.model.mtp_states[slot.0] = Some(state);
+        if let Err(e) = state.ensure_compressed_lm_logits(&mut gpu, cvs) {
+            self.mtp_states[slot.0] = Some(state);
             return Err(format!("ensure compressed logits: {e}"));
         }
         // Head-side compressed buffer for the draft phase (see the alloc
         // comment in `mtp_head_prefill_chunk`).
         if let Err(e) = state
             .mtp_scratch
-            .ensure_compressed_logits(&mut rig.gpu, cvs)
+            .ensure_compressed_logits(&mut gpu, cvs)
         {
-            rig.model.mtp_states[slot.0] = Some(state);
+            self.mtp_states[slot.0] = Some(state);
             return Err(format!("ensure head compressed logits: {e}"));
         }
     }
@@ -2210,18 +2239,18 @@ fn mtp_draft_step(
         // Save DN snapshot for rollback during verify phase.
         state
             .trunk_snap
-            .save_from(&mut rig.model.dn_states[slot.0], &mut rig.gpu)
+            .save_from(&mut self.dn_states[slot.0], &mut gpu)
             .map_err(|e| format!("mtp dn snapshot: {e}"))?;
 
         let draft_outcome = crate::mtp_spec::mtp_draft_phase_inner(
-            &mut rig.gpu,
-            &rig.model.weights,
-            &rig.model.config,
+            &mut gpu,
+            &self.weights,
+            &self.config,
             head,
             &mut state,
             pos,
             seed,
-            rig.model.mtp_k,
+            self.mtp_k,
             /* skip_proposal_graph */ true,
         )
         .map_err(|e| format!("mtp draft: {e}"));
@@ -2231,8 +2260,9 @@ fn mtp_draft_step(
         draft_outcome
     })();
 
-    rig.model.mtp_states[slot.0] = Some(state);
+    self.mtp_states[slot.0] = Some(state);
     outcome
+}
 }
 
 /// MTP verify/accept phase: after the batched forward, run the trunk lm_head
@@ -2246,17 +2276,29 @@ fn mtp_draft_step(
 /// `mtp_batched_verify_accept_from_batch`). Returns committed tokens
 /// (excludes seed, includes bonus).
 #[allow(clippy::too_many_arguments)]
-fn mtp_verify_accept_step(
-    rig: &mut Rig,
-    slot: SlotId,
-    work: &mut PendingWork,
-    draft: crate::mtp_spec::MtpDraftOutput,
-    hidden_row_offset: usize,
-    produced: usize,
-    max_tokens: usize,
-    sess_len: usize,
-) -> Result<Vec<u32>, String> {
-    let mut state = rig.model.mtp_states[slot.0]
+impl ModelRig {
+    /// MTP verify/accept phase: after the batched forward, run the trunk
+    /// lm_head over the slot's verify rows (normed views of `pbs.x_batch`),
+    /// greedy-accept, and repair the DeltaNet state on partial accepts.
+    /// `hidden_row_offset` is the flat row index where this slot's verify
+    /// rows begin in the step batch (computed from `batch.m_per_slot` by
+    /// the caller). `produced`/`max_tokens` are the in-flight request
+    /// counters, used to clamp the accept tail to the request's budget.
+    fn mtp_verify_accept_step(
+        &mut self,
+        mut gpu: &mut Gpu,
+        pool: &mut SlotPool,
+        tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
+        cap_tokens: usize,
+        slot: SlotId,
+        work: &mut PendingWork,
+        draft: crate::mtp_spec::MtpDraftOutput,
+        hidden_row_offset: usize,
+        produced: usize,
+        max_tokens: usize,
+        sess_len: usize,
+    ) -> Result<Vec<u32>, String> {
+    let mut state = self.mtp_states[slot.0]
         .take()
         .expect("mtp state must exist from draft phase");
 
@@ -2268,26 +2310,26 @@ fn mtp_verify_accept_step(
     // `sess.tokens.len() + 1 >= cap`, so room is `cap - len`).
     let commit_budget = max_tokens
         .saturating_sub(produced)
-        .min(rig.cap_tokens.saturating_sub(sess_len))
+        .min(cap_tokens.saturating_sub(sess_len))
         .max(1);
 
     let outcome: Result<Vec<u32>, String> = (|| {
         let result = crate::mtp_spec::mtp_batched_verify_accept_from_batch(
-            &mut rig.gpu,
-            &rig.model.weights,
-            &rig.model.config,
-            &mut rig.model.dn_states[slot.0],
-            &rig.model.pbs,
+            &mut gpu,
+            &self.weights,
+            &self.config,
+            &mut self.dn_states[slot.0],
+            &self.pbs,
             &mut state,
             &draft,
             hidden_row_offset,
-            rig.model.spec_verify_tape
+            self.spec_verify_tape
                 .as_ref()
                 .expect("MTP drafts require the verify tape"),
-            rig.model.spec_rows,
+            self.spec_rows,
             slot.0,
-            rig.tokenizer.eos_id,
-            rig.tokenizer.eot_id,
+            tokenizer.eos_id,
+            tokenizer.eot_id,
             commit_budget,
         )
         .map_err(|e| format!("mtp verify: {e}"))?;
@@ -2297,15 +2339,15 @@ fn mtp_verify_accept_step(
         // them: every subsequent write is position-ordered.
         let new_pos = pos + result.advance;
         work.next_pos = new_pos;
-        rig.pool
+        pool
             .set_seq_len(slot, new_pos)
             .map_err(|e| format!("mtp set_seq_len: {e}"))?;
 
         Ok(result.committed)
     })();
-
-    rig.model.mtp_states[slot.0] = Some(state);
+    self.mtp_states[slot.0] = Some(state);
     outcome
+    }
 }
 
 /// DFlash2 draft phase for one slot: run the draft forward over the slot's
@@ -2313,105 +2355,118 @@ fn mtp_verify_accept_step(
 ///
 /// Called when `work.decoding` (subsequent spec steps). Takes the seed from
 /// `work.remaining_prompt.last()` — same protocol as `mtp_draft_step`.
-fn dflash_draft_step(
-    rig: &mut Rig,
-    slot: SlotId,
-    work: &mut PendingWork,
-) -> Result<crate::dflash_slot::DflashSlotDraft, String> {
-    let shared = rig.model
-        .dflash
-        .as_ref()
-        .ok_or_else(|| "dflash_draft_step: DFlash not loaded".to_string())?;
-    let mut st = rig.model.dflash_states[slot.0]
-        .take()
-        .ok_or_else(|| "dflash_draft_step: slot state missing (admit bug)".to_string())?;
+impl ModelRig {
+    fn dflash_draft_step(
+        &mut self,
+        mut gpu: &mut Gpu,
+        slot: SlotId,
+        work: &mut PendingWork,
+    ) -> Result<crate::dflash_slot::DflashSlotDraft, String> {
+        let shared = self
+            .dflash
+            .as_ref()
+            .ok_or_else(|| "dflash_draft_step: DFlash not loaded".to_string())?;
+        let mut st = self.dflash_states[slot.0]
+            .take()
+            .ok_or_else(|| "dflash_draft_step: slot state missing (admit bug)".to_string())?;
 
-    let prompt_tokens = std::mem::take(&mut work.remaining_prompt);
-    let pos = work.next_pos;
-    let outcome: Result<crate::dflash_slot::DflashSlotDraft, String> = (|| {
-        let seed = *prompt_tokens
-            .last()
-            .ok_or_else(|| "dflash_draft_step: no seed token".to_string())?;
-        // Save DN snapshot for rollback during verify phase.
-        st.trunk_snap
-            .save_from(&mut rig.model.dn_states[slot.0], &mut rig.gpu)
-            .map_err(|e| format!("dflash dn snapshot: {e}"))?;
-        crate::dflash_slot::dflash_slot_draft_step(
-            &mut rig.gpu,
-            shared,
-            &rig.model.weights,
-            &rig.model.config,
-            &mut st,
-            seed,
-            pos,
-        )
-    })();
+        let prompt_tokens = std::mem::take(&mut work.remaining_prompt);
+        let pos = work.next_pos;
+        let outcome: Result<crate::dflash_slot::DflashSlotDraft, String> = (|| {
+            let seed = *prompt_tokens
+                .last()
+                .ok_or_else(|| "dflash_draft_step: no seed token".to_string())?;
+            // Save DN snapshot for rollback during verify phase.
+            st.trunk_snap
+                .save_from(&mut self.dn_states[slot.0], &mut gpu)
+                .map_err(|e| format!("dflash dn snapshot: {e}"))?;
+            crate::dflash_slot::dflash_slot_draft_step(
+                &mut gpu,
+                shared,
+                &self.weights,
+                &self.config,
+                &mut st,
+                seed,
+                pos,
+            )
+        })();
 
-    rig.model.dflash_states[slot.0] = Some(st);
-    outcome
+        self.dflash_states[slot.0] = Some(st);
+        outcome
+    }
 }
+
 
 /// DFlash2 verify/accept phase: norm the slot's verify rows out of
 /// `pbs.x_batch`, run the trunk lm_head, greedy-accept, repair DN state on
 /// partial accept, and commit the kept rows' extract-layer hiddens into the
 /// slot's `target_hidden` ring. Mirrors `mtp_verify_accept_step`.
 #[allow(clippy::too_many_arguments)]
-fn dflash_verify_accept_step(
-    rig: &mut Rig,
-    slot: SlotId,
-    work: &mut PendingWork,
-    mut draft: crate::dflash_slot::DflashSlotDraft,
-    hidden_row_offset: usize,
-    produced: usize,
-    max_tokens: usize,
-    sess_len: usize,
-) -> Result<Vec<u32>, String> {
-    let mut st = rig.model.dflash_states[slot.0]
-        .take()
-        .expect("dflash state must exist from draft phase");
-    let pos = work.next_pos;
-    let commit_budget = max_tokens
-        .saturating_sub(produced)
-        .min(rig.cap_tokens.saturating_sub(sess_len))
-        .max(1);
+impl ModelRig {
+    /// DFlash2 verify/accept phase: norm the slot's verify rows out of
+    /// `pbs.x_batch`, run the trunk lm_head, greedy-accept, repair DN state
+    /// on partial accept, and commit the kept rows' extract-layer hiddens
+    /// into the slot's `target_hidden` ring. Mirrors `mtp_verify_accept_step`.
+    fn dflash_verify_accept_step(
+        &mut self,
+        mut gpu: &mut Gpu,
+        pool: &mut SlotPool,
+        tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
+        cap_tokens: usize,
+        slot: SlotId,
+        work: &mut PendingWork,
+        mut draft: crate::dflash_slot::DflashSlotDraft,
+        hidden_row_offset: usize,
+        produced: usize,
+        max_tokens: usize,
+        sess_len: usize,
+    ) -> Result<Vec<u32>, String> {
+        let mut st = self.dflash_states[slot.0]
+            .take()
+            .expect("dflash state must exist from draft phase");
+        let pos = work.next_pos;
+        let commit_budget = max_tokens
+            .saturating_sub(produced)
+            .min(cap_tokens.saturating_sub(sess_len))
+            .max(1);
 
-    let outcome: Result<Vec<u32>, String> = (|| {
-        let committed = crate::dflash_slot::dflash_slot_verify_accept(
-            &mut rig.gpu,
-            rig.model.dflash
-                .as_ref()
-                .expect("dflash draft requires shared state"),
-            &rig.model.weights,
-            &rig.model.config,
-            &mut rig.model.dn_states[slot.0],
-            &rig.model.pbs,
-            &mut st,
-            &mut draft,
-            pos,
-            hidden_row_offset,
-            rig.model.spec_verify_tape
-                .as_ref()
-                .expect("DFlash drafts require the verify tape"),
-            rig.model.spec_rows,
-            slot,
-            rig.tokenizer.eos_id,
-            rig.tokenizer.eot_id,
-            commit_budget,
-        )
-        .map_err(|e| format!("dflash verify: {e}"))?;
+        let outcome: Result<Vec<u32>, String> = (|| {
+            let committed = crate::dflash_slot::dflash_slot_verify_accept(
+                &mut gpu,
+                self.dflash
+                    .as_ref()
+                    .expect("dflash draft requires shared state"),
+                &self.weights,
+                &self.config,
+                &mut self.dn_states[slot.0],
+                &self.pbs,
+                &mut st,
+                &mut draft,
+                pos,
+                hidden_row_offset,
+                self.spec_verify_tape
+                    .as_ref()
+                    .expect("DFlash drafts require the verify tape"),
+                self.spec_rows,
+                slot,
+                tokenizer.eos_id,
+                tokenizer.eot_id,
+                commit_budget,
+            )
+            .map_err(|e| format!("dflash verify: {e}"))?;
 
-        let new_pos = pos + committed.len();
-        work.next_pos = new_pos;
-        rig.pool
-            .set_seq_len(slot, new_pos)
-            .map_err(|e| format!("dflash set_seq_len: {e}"))?;
-        Ok(committed)
-    })();
+            let new_pos = pos + committed.len();
+            work.next_pos = new_pos;
+            pool.set_seq_len(slot, new_pos)
+                .map_err(|e| format!("dflash set_seq_len: {e}"))?;
+            Ok(committed)
+        })();
 
-    // Keep the draft's device buffers for the next cycle's reuse.
-    st.draft = Some(draft);
-    rig.model.dflash_states[slot.0] = Some(st);
-    outcome
+        // Keep the draft's device buffers for the next cycle's reuse.
+        st.draft = Some(draft);
+        self.dflash_states[slot.0] = Some(st);
+        outcome
+    }
 }
 
 /// DFlash2 prefill chunk: lazily allocate the slot's draft state, scatter
@@ -2419,39 +2474,42 @@ fn dflash_verify_accept_step(
 /// staging during the forward) into the slot's `target_hidden` ring, and
 /// advance the thlog watermark. `chunk_pos` is the chunk's first absolute
 /// position (`batch.positions[row_off]`).
-fn dflash_prefill_chunk(
-    rig: &mut Rig,
-    slot: SlotId,
-    row_off: usize,
-    m: usize,
-    chunk_pos: usize,
-) -> Result<(), String> {
-    if rig.model.dflash_states[slot.0].is_none() {
-        let st = crate::dflash_slot::new_dflash_slot_state(
-            &mut rig.gpu,
-            rig.model.dflash
-                .as_ref()
-                .ok_or_else(|| "dflash prefill: shared state missing".to_string())?,
-            &rig.model.config,
-            &rig.model.dn_states[slot.0],
+impl ModelRig {
+    fn dflash_prefill_chunk(
+        &mut self,
+        mut gpu: &mut Gpu,
+        slot: SlotId,
+        row_off: usize,
+        m: usize,
+        chunk_pos: usize,
+    ) -> Result<(), String> {
+        if self.dflash_states[slot.0].is_none() {
+            let st = crate::dflash_slot::new_dflash_slot_state(
+                &mut gpu,
+                self.dflash
+                    .as_ref()
+                    .ok_or_else(|| "dflash prefill: shared state missing".to_string())?,
+                &self.config,
+                &self.dn_states[slot.0],
+            )
+            .map_err(|e| format!("dflash state alloc: {e}"))?;
+            self.dflash_states[slot.0] = Some(st);
+        }
+        let st = self.dflash_states[slot.0].as_mut().unwrap();
+        let shared = self.dflash.as_ref().unwrap();
+        crate::dflash_slot::scatter_staging_rows_to_interleaved(
+            &mut gpu,
+            shared,
+            st,
+            row_off,
+            chunk_pos,
+            m,
         )
-        .map_err(|e| format!("dflash state alloc: {e}"))?;
-        rig.model.dflash_states[slot.0] = Some(st);
+        .map_err(|e| format!("dflash prefill scatter: {e}"))?;
+        st.scratch.thlog.append_committed(chunk_pos, m, 0);
+        st.seeded_through = chunk_pos + m;
+        Ok(())
     }
-    let st = rig.model.dflash_states[slot.0].as_mut().unwrap();
-    let shared = rig.model.dflash.as_ref().unwrap();
-    crate::dflash_slot::scatter_staging_rows_to_interleaved(
-        &mut rig.gpu,
-        shared,
-        st,
-        row_off,
-        chunk_pos,
-        m,
-    )
-    .map_err(|e| format!("dflash prefill scatter: {e}"))?;
-    st.scratch.thlog.append_committed(chunk_pos, m, 0);
-    st.seeded_through = chunk_pos + m;
-    Ok(())
 }
 
 /// One slot's in-flight spec draft between the draft phase and the
@@ -3024,7 +3082,7 @@ fn commit_sampled_token(
         // the fairness budget (spec §5.3 S3). Idempotent (NotFound ignored).
         let _ = rig.fair_queue.remove(session.0);
         clear_work_slot(&mut work[s]);
-        clear_slot_vl_state(rig, s);
+        rig.model.clear_slot_vl_state(&mut rig.gpu, s);
         if matches!(reason, DoneReason::ClientGone) {
             rig.swap.forget(session.0);
             rig.sessions.close(&mut rig.pool, &mut rig.adm, session);
@@ -3446,7 +3504,7 @@ fn run_loop(
                 rig.sessions.close(&mut rig.pool, &mut rig.adm, sid);
                 let _ = rig.fair_queue.remove(sid.0);
                 clear_work_slot(&mut work[s]);
-                clear_slot_vl_state(rig, s);
+                rig.model.clear_slot_vl_state(&mut rig.gpu, s);
             }
         }
     };
@@ -3604,7 +3662,7 @@ fn run_loop(
                 }
                 let pad = image_pad_id.unwrap_or(u32::MAX);
                 let grammar = slots[s].as_mut().and_then(|f| f.grammar.as_mut());
-                match vl_forward_remaining(&mut rig, SlotId(s), &mut work[s], pad, grammar) {
+                match rig.model.vl_forward_remaining(&mut rig.gpu, &mut rig.pool, &rig.tokenizer, &mut rig.sample_params, SlotId(s), &mut work[s], pad, grammar) {
                     Ok(tok) => commit_sampled_token(&mut rig, &mut slots, &mut work, s, tok),
                     Err(reason) => {
                         if let Some(mut f) = slots[s].take() {
@@ -3621,7 +3679,7 @@ fn run_loop(
                             rig.sessions.close(&mut rig.pool, &mut rig.adm, f.session);
                         }
                         clear_work_slot(&mut work[s]);
-                        clear_slot_vl_state(&mut rig, s);
+                        rig.model.clear_slot_vl_state(&mut rig.gpu, s);
                     }
                 }
             }
@@ -3737,11 +3795,11 @@ fn run_loop(
                         let seed = work[s].remaining_prompt.last().copied();
                         let outcome = match work[s].spec {
                             SpecKind::Mtp => {
-                                mtp_draft_step(&mut rig, SlotId(s), &mut work[s])
+                                rig.model.mtp_draft_step(&mut rig.gpu, SlotId(s), &mut work[s])
                                     .map(SpecDraftRows::Mtp)
                             }
                             SpecKind::Dflash => {
-                                dflash_draft_step(&mut rig, SlotId(s), &mut work[s])
+                                rig.model.dflash_draft_step(&mut rig.gpu, SlotId(s), &mut work[s])
                                     .map(SpecDraftRows::Dflash)
                             }
                             SpecKind::None => {
@@ -3768,7 +3826,7 @@ fn run_loop(
                                     rig.sessions.close(&mut rig.pool, &mut rig.adm, f.session);
                                 }
                                 clear_work_slot(&mut work[s]);
-                                clear_slot_vl_state(&mut rig, s);
+                                rig.model.clear_slot_vl_state(&mut rig.gpu, s);
                             }
                         }
                     }
@@ -3794,9 +3852,7 @@ fn run_loop(
                     if !vl.embeddings.is_empty() || vl.n_visual_tokens == 0 {
                         continue;
                     }
-                    let mut job = rig.model.vl_tower_jobs[s].take();
-                    let outcome = vision_tower_step(&mut rig, s, &mut job, vl);
-                    rig.model.vl_tower_jobs[s] = job;
+                    let outcome = rig.model.vision_tower_step(&mut rig.gpu, s, vl);
                     if let Err(reason) = outcome {
                         if let Some(mut f) = slots[s].take() {
                             let _ = send_event(
@@ -3812,7 +3868,7 @@ fn run_loop(
                             rig.sessions.close(&mut rig.pool, &mut rig.adm, f.session);
                         }
                         clear_work_slot(&mut work[s]);
-                        clear_slot_vl_state(&mut rig, s);
+                        rig.model.clear_slot_vl_state(&mut rig.gpu, s);
                     }
                 }
             }
@@ -4063,7 +4119,7 @@ fn run_loop(
                         let _ = rig.fair_queue.remove(f.session.0);
                         rig.sessions.close(&mut rig.pool, &mut rig.adm, f.session);
                         clear_work_slot(&mut work[s]);
-                        clear_slot_vl_state(&mut rig, s);
+                        rig.model.clear_slot_vl_state(&mut rig.gpu, s);
                         // Free the dropped draft's device buffers — the slot is
                         // gone but its DflashSlotDraft GpuTensors would leak.
                         if let Some(d) = spec_drafts[s].take() {
@@ -4177,7 +4233,7 @@ fn run_loop(
                         let _ = rig.fair_queue.remove(f.session.0);
                         rig.sessions.close(&mut rig.pool, &mut rig.adm, f.session);
                         clear_work_slot(&mut work[s]);
-                        clear_slot_vl_state(&mut rig, s);
+                        rig.model.clear_slot_vl_state(&mut rig.gpu, s);
                     }
                 }
                 // Rebuild the flat arrays to drop the failed slots' rows. The
@@ -4239,7 +4295,7 @@ fn run_loop(
                         rig.sessions.close(&mut rig.pool, &mut rig.adm, f.session);
                     }
                     clear_work_slot(&mut work[s]);
-                    clear_slot_vl_state(&mut rig, s);
+                    rig.model.clear_slot_vl_state(&mut rig.gpu, s);
                     if let Some(d) = spec_drafts[s].take() {
                         d.free_gpu(&mut rig.gpu);
                     }
@@ -4655,7 +4711,7 @@ fn run_loop(
                     let _ = rig.fair_queue.remove(f.session.0);
                     rig.sessions.close(&mut rig.pool, &mut rig.adm, f.session);
                     clear_work_slot(&mut work[s]);
-                    clear_slot_vl_state(&mut rig, s);
+                    rig.model.clear_slot_vl_state(&mut rig.gpu, s);
                 }
             }
             // ── Jump-forward planner (spec §7.3 G3) ───────────────────────
@@ -4809,8 +4865,11 @@ fn run_loop(
                         None => (0, usize::MAX, 0),
                     };
                     let accept_outcome = match draft {
-                        SpecDraftRows::Mtp(d) => mtp_verify_accept_step(
-                            &mut rig,
+                        SpecDraftRows::Mtp(d) => rig.model.mtp_verify_accept_step(
+                            &mut rig.gpu,
+                            &mut rig.pool,
+                            &rig.tokenizer,
+                            rig.cap_tokens,
                             SlotId(s),
                             &mut work[s],
                             d,
@@ -4819,8 +4878,11 @@ fn run_loop(
                             max_tokens,
                             sess_len,
                         ),
-                        SpecDraftRows::Dflash(d) => dflash_verify_accept_step(
-                            &mut rig,
+                        SpecDraftRows::Dflash(d) => rig.model.dflash_verify_accept_step(
+                            &mut rig.gpu,
+                            &mut rig.pool,
+                            &rig.tokenizer,
+                            rig.cap_tokens,
                             SlotId(s),
                             &mut work[s],
                             d,
@@ -4897,7 +4959,7 @@ fn run_loop(
                                 rig.sessions.close(&mut rig.pool, &mut rig.adm, f.session);
                             }
                             clear_work_slot(&mut work[s]);
-                            clear_slot_vl_state(&mut rig, s);
+                            rig.model.clear_slot_vl_state(&mut rig.gpu, s);
                         }
                     }
                     continue;
@@ -4920,8 +4982,8 @@ fn run_loop(
                                 batch.tokens[row_off..row_off + m].to_vec();
                             let chunk_positions: Vec<i32> =
                                 batch.positions[row_off..row_off + m].to_vec();
-                            mtp_head_prefill_chunk(
-                                &mut rig,
+                            rig.model.mtp_head_prefill_chunk(
+                                &mut rig.gpu,
                                 SlotId(s),
                                 &chunk_tokens,
                                 &chunk_positions,
@@ -4929,8 +4991,8 @@ fn run_loop(
                                 m,
                             )
                         }
-                        SpecKind::Dflash => dflash_prefill_chunk(
-                            &mut rig,
+                        SpecKind::Dflash => rig.model.dflash_prefill_chunk(
+                            &mut rig.gpu,
                             SlotId(s),
                             row_off,
                             m,
@@ -4967,7 +5029,7 @@ fn run_loop(
                                 rig.sessions.close(&mut rig.pool, &mut rig.adm, f.session);
                             }
                             clear_work_slot(&mut work[s]);
-                            clear_slot_vl_state(&mut rig, s);
+                            rig.model.clear_slot_vl_state(&mut rig.gpu, s);
                         }
                     }
                     continue;
@@ -5101,7 +5163,7 @@ fn run_loop(
                     slots[s] = None;
                     let _ = rig.fair_queue.remove(session.0);
                     clear_work_slot(&mut work[s]);
-                    clear_slot_vl_state(&mut rig, s);
+                    rig.model.clear_slot_vl_state(&mut rig.gpu, s);
                     if matches!(reason, DoneReason::ClientGone) {
                         // Nobody will follow up on a vanished client, so hand the
                         // slot back at once.
@@ -5279,7 +5341,7 @@ fn handle_command(
                     drop(inflight.reply);
                 }
                 clear_work_slot(&mut work[idx]);
-                clear_slot_vl_state(rig, idx);
+                rig.model.clear_slot_vl_state(&mut rig.gpu, idx);
                 let _ = rig.fair_queue.remove(session);
             }
             rig.swap.forget(session);
@@ -6533,7 +6595,7 @@ fn admit(
                                      // scheduler holds the slot's rows until then. Free the old matrix +
                                      // job explicitly — dropping them unfreed leaks VRAM (the buffers are
                                      // neither pooled nor hipFree'd by Drop).
-        clear_slot_vl_state(rig, slot.0);
+        rig.model.clear_slot_vl_state(&mut rig.gpu, slot.0);
         work[slot.0].vl_prefill = Some(VlPrefill {
             patches: vd.patches,
             grid_h: vd.grid_h,
