@@ -48,6 +48,11 @@ pub fn residual_gemm_key_for(dtype: DType) -> KernelKey {
         DType::MQ5G256V2 => KernelKey::GemmMq5G256V2Residual,
         DType::MQ3G256V2 => KernelKey::GemmMq3G256V2Residual,
         DType::MQ2G256V2 => KernelKey::GemmMq2G256V2Residual,
+        // qt=52 must NEVER alias a uniform key (silent noise at full speed):
+        // Lloyd prefill uses the FP8-LUT launchers directly, never these keys.
+        DType::MQ4G256V2Lloyd => panic!(
+            "residual_gemm_key_for: MQ4G256V2Lloyd (qt=52) has no uniform residual key — route Lloyd prefill through gemm_hfq4g256_residual_wmma_gfx12_mq4v2_fp8_lloyd"
+        ),
         _ => KernelKey::GemmHfq4G256Residual,
     }
 }
@@ -280,6 +285,33 @@ impl GemmFamily {
                  v2 stores fp16 scale/zero per 128 weights (s0/z0 for 0..127, s1/z1 for 128..255) \
                  where v1 stores f32 scale/zero per 256, so the v1 kernel decodes every weight \
                  to ~1e-14. This is a missing v2 routing arm at the callsite, not a valid configuration.",
+                w.dtype, key
+            )));
+        }
+        // qt=52 (Lloyd-V2) must NEVER ride a uniform kernel: same 136 B stride
+        // as qt=44/v1, so the mis-route runs at full speed and returns noise.
+        // Lloyd prefill goes through the FP8-LUT launchers (`*_fp8_lloyd`),
+        // never these uniform keys.
+        if w.dtype == DType::MQ4G256V2Lloyd && is_gemm_hfq4_key(key) {
+            return Err(DispatchError::Hip(format!(
+                "qt=52 (MQ4G256V2Lloyd) weight (dtype {:?}) routed to uniform v1 kernel key {:?}: \
+                 Lloyd codes decoded on the uniform affine grid are silent noise. \
+                 Route Lloyd prefill through the FP8-LUT launchers (*_fp8_lloyd), not uniform keys.",
+                w.dtype, key
+            )));
+        }
+        if w.dtype == DType::MQ4G256V2Lloyd && is_gemm_mq4v2_key(key) {
+            return Err(DispatchError::Hip(format!(
+                "qt=52 (MQ4G256V2Lloyd) weight (dtype {:?}) routed to uniform qt=44 kernel key {:?}: \
+                 same 136 B stride but Lloyd codes need the per-tensor codebook LUT. \
+                 Route Lloyd prefill through the FP8-LUT launchers (*_fp8_lloyd), not uniform keys.",
+                w.dtype, key
+            )));
+        }
+        if w.dtype == DType::MQ4G256V2Lloyd && is_gemm_mq4c_key(key) {
+            return Err(DispatchError::Hip(format!(
+                "qt=52 (MQ4G256V2Lloyd) weight (dtype {:?}) routed to mq4c kernel key {:?}: \
+                 equal stride is not interchangeable; mis-route is silent noise.",
                 w.dtype, key
             )));
         }

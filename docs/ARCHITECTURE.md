@@ -105,10 +105,10 @@ Native CLI (`crates/hipfire-cli`)
   resolve registry tag → model path under ~/.hipfire/models/ (or local path)
   if serve up AND not forced local → HTTP POST /v1/chat/completions
     forced local when `HIPFIRE_LOCAL` is truthy or any of `--image`,
-    `--kv-mode`, `--kv-backend`, `--spec`/`--speculation`, `--model-draft`,
-    `--draft-max`, `--dspark-conf-threshold` is passed (`force_local` in
-    `crates/hipfire-cli/src/main.rs`; `--json`/`--no-stream` ride the HTTP
-    route and do not force local)
+    `--kv-mode`, `--kv-backend`, `--kv-k`, `--kv-v`, `--spec`/`--speculation`,
+    `--model-draft`, `--draft-max`, `--dspark-conf-threshold` is passed
+    (`force_local` in `crates/hipfire-cli/src/main.rs`; `--json`/`--no-stream`
+    ride the HTTP route and do not force local)
     if HTTP fails while serve still live → abort (no local spawn; would collide)
   else → spawn one-shot daemon binary
         │
@@ -267,20 +267,20 @@ clauses when a newer predicate subsumes them.
 ### Kernel build
 
 ```text
-kernels/src/<name>.hip
-kernels/src/<name>.gfx1201.hip          # chip override
-kernels/src/<name>.gfx12.hip            # family override (e.g. gfx1200+gfx1201)
-        │  scripts/compile-kernels.sh  (chip → family → base)
+Rust ensure_kernel source expression (preambles, header stitching, selectors)
+        │ hipfire-kernel-registry --arch <arch>
         ▼
-kernels/compiled/<arch>/…               # packaged / tree prebuild output
-~/.hipfire_kernels/<arch>/<name>.<hash>.hsaco  # default JIT cache (or HIPFIRE_KERNEL_CACHE)
+exact six-column source/flags registry
+        │ scripts/compile-kernels.sh → hipfire-kernel-pack
+        ▼
+<daemon-bin-dir>/kernels/compiled/<arch>/<module>.hsaco + .index.json + .hash
+~/.hipfire_kernels/<arch>/<module>.<hash>.hsaco  # writable JIT cache
 ```
 
-On startup the runtime prefers a hash-matching precompiled blob. Missing or
-mismatched hash → hipcc JIT into the cache when hipcc is available; if hipcc is
-unavailable, an explicitly warned **unvalidated** precompiled blob may still be
-used. `hipfire diag` reports compiled blob/hash counts per arch, not which path
-supplied each kernel.
+The runtime verifies the installed index and object SHA-256 before loading,
+even with hipcc present. A missing or stale index falls back to JIT only when
+hipcc is available; compiler-free loads fail closed. Packaged module names
+come from the exact Rust registry, never HIP source basenames.
 
 Some arch crates also ship crate-local HIP (registered through their own
 `kernels.rs`) for family-specific ops.
@@ -372,8 +372,29 @@ accepted sets differ by carrier). Concrete modes include:
 | `asym2` / `asym3` / `asym4` | Lower-bit rotated/Lloyd K; V typically wider |
 | `fwht2` / `fwht3` / `fwht4` | FWHT-rotated K tiers |
 
-Exact layouts and math: [`QUANTIZATION.md`](QUANTIZATION.md). Hybrid linear
-layers (DeltaNet) use fixed recurrent state instead of FA KV for those layers.
+**Qwen-family `auto` / unset** (arch-aware, Qwen only): targets **q8/q8** on
+every arch except exact `gfx1201`, where eligible single-GPU Qwen routes keep
+native **fp8/fp8**. Non-Qwen family defaults are unchanged (Maple BF16, DeepSeek
+compressor F32, Gemma layered policy, …). Full K/V axis overrides (`--kv-k` /
+`--kv-v`) and precedence live in [`CONFIG.md`](CONFIG.md) / [`CLI.md`](CLI.md).
+
+**Backend selection** (`--kv-backend` / `memory.kv_backend`): accept only
+`legacy` \| `vmm`. Omitted request is **automatic** and prefers **VMM** on
+certified combinations; otherwise falls back to legacy once per load with a
+logged reason. Selecting legacy (explicit or automatic) emits exactly one
+stderr warning whose stable token is the contiguous substring
+`HIPFIRE_KV_BACKEND=legacy`. Old spelling `contiguous` is rejected with a
+migration error that names `legacy`. Explicit `vmm` on an unsupported
+combination fails closed before teardown.
+
+**Physical layout:** the legacy backend still backs the trunk KV arena as one
+physically contiguous allocation (stable base pointer for the full
+reservation). VMM instead reserves a virtual address range and maps physical
+pages on demand; both keep graph/retained base pointers stable within their
+model. Private draft caches (DFlash/MTP) are owned separately and do not
+relabel the trunk backend. Exact quant layouts and math:
+[`QUANTIZATION.md`](QUANTIZATION.md). Hybrid linear layers (DeltaNet) use fixed
+recurrent state instead of FA KV for those layers.
 
 ## Observability hooks
 

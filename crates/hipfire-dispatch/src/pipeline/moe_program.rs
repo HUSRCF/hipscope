@@ -723,10 +723,6 @@ impl<'a> SealedMoeOp<'a> {
             );
         }
         let (params, selection) = self.state.prefill_parts()?;
-        let total_slots = params
-            .batch_size
-            .checked_mul(params.k_top)
-            .ok_or_else(|| DispatchError::Hip("sealed moe: prefill slot count overflows".into()))?;
         super::prefill_gate_up_stage(
             gpu,
             params,
@@ -734,10 +730,6 @@ impl<'a> SealedMoeOp<'a> {
             selection.path2_m_total,
             selection.force_mq4_grouped_fp16,
         )
-        .and_then(|_| {
-            let _ = total_slots;
-            Ok(())
-        })
     }
 
     pub(super) fn unscatter(&self, gpu: &mut Gpu) -> Result<(), DispatchError> {

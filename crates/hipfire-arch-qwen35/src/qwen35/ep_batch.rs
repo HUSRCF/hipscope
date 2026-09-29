@@ -1312,6 +1312,7 @@ impl PrefillRootScheduleContext<'_> {
             Some(&routed),
             self.semantics,
             DflashFusionCtx::Off,
+            None, // commit_stride: EP bands keep legacy cadence
         )
     }
 
@@ -1612,6 +1613,7 @@ impl TickRootScheduleContext<'_> {
                 active_mask: self.active_mask,
             },
             DflashFusionCtx::Off,
+            None, // commit_stride: EP lanes keep legacy cadence
         )
     }
 
@@ -2427,6 +2429,7 @@ impl Qwen35DecodeBatchEpState {
                                 routed_out.as_ref(),
                                 BatchSemantics::Sequential,
                                 DflashFusionCtx::Off,
+                                None, // commit_stride: EP lanes keep legacy cadence
                             )?;
                         }
                     }
@@ -2798,6 +2801,7 @@ impl Qwen35DecodeBatchEpState {
                                 active_mask,
                             },
                             DflashFusionCtx::Off,
+                            None, // commit_stride: EP lanes keep legacy cadence
                         )?;
                     }
                 }
@@ -3579,6 +3583,7 @@ pub fn forward_prefill_batch_ep(
                     None,  // max_layer
                     routed_out,
                     DflashFusionCtx::Off,
+                    None, // commit_stride: EP bands keep legacy cadence
                 )?;
             }
         }
@@ -5496,6 +5501,7 @@ pub fn forward_prefill_batch_multi(
                         None, // max_layer: multi-GPU PP path runs full stack
                         None, // routed_out: PP bands are multi-layer, not EP
                         DflashFusionCtx::Off,
+                        None, // commit_stride: EP bands keep legacy cadence
                     )?;
                 }
 
