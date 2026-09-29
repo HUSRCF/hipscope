@@ -1006,13 +1006,25 @@ impl Speculator for DflashSpeculator {
             let prev = self.adaptive.effective();
             let next = self.adaptive.observe(s.accepted);
             if next != prev {
+                // Log with the gate state: below ADAPTIVE_CTX_GATE the internal
+                // width follows τ̂ while effective_at() keeps returning the full
+                // block, so a serve.log reader must not mistake a logged
+                // "shrink" for an applied proposal width (this run's verify
+                // width is the `applied` column).
+                let applied = self.adaptive.effective_at(position);
                 eprintln!(
-                    "[dflash] adaptive_b {}: block {} -> {} (tau_hat {:.2} over last 8, full {})",
+                    "[dflash] adaptive_b {}: internal {} -> {} (tau_hat {:.2} over last 8, full {}; applied {}, ctx {position}){}",
                     if next < prev { "shrink" } else { "recover" },
                     prev,
                     next,
                     self.adaptive.tau_hat().unwrap_or(0.0),
                     self.adaptive.full(),
+                    applied,
+                    if applied != next {
+                        " — gated below 2k ctx: internal follow only, verify holds full"
+                    } else {
+                        ""
+                    },
                 );
             }
         }
