@@ -383,8 +383,7 @@ pub trait RootRoutedEpBinding {
         partial: &GpuTensor,
     ) -> Result<(), DispatchError>;
     /// Run the family's ordinary single-device slot-order combine once on root.
-    fn finish_combine(&mut self, gpu: &mut Gpu, partial: &GpuTensor)
-        -> Result<(), DispatchError>;
+    fn finish_combine(&mut self, gpu: &mut Gpu, partial: &GpuTensor) -> Result<(), DispatchError>;
     /// Add the broadcast routed partial into this rank's residual stream.
     fn residual_finish(
         &mut self,
@@ -393,7 +392,11 @@ pub trait RootRoutedEpBinding {
         partial: &GpuTensor,
     ) -> Result<(), DispatchError>;
     /// Synchronize a shared-expert residual base after non-root route work.
-    fn sync_shared_residual(&mut self, _gpus: &mut Gpus, _count: usize) -> Result<(), DispatchError> {
+    fn sync_shared_residual(
+        &mut self,
+        _gpus: &mut Gpus,
+        _count: usize,
+    ) -> Result<(), DispatchError> {
         Ok(())
     }
     /// Per-rank fix-up of the combined partial before the root broadcast.
@@ -467,7 +470,12 @@ pub fn execute_root_routed_ep<B: RootRoutedEpBinding>(
     // memset. This is the transaction boundary for the whole schedule.
     let admission = binding.preflight_root(&gpus.devices[0], &operands.partials[0])?;
     for rank in 1..n {
-        binding.preflight_rank(rank, &gpus.devices[rank], &operands.partials[rank], &admission)?;
+        binding.preflight_rank(
+            rank,
+            &gpus.devices[rank],
+            &operands.partials[rank],
+            &admission,
+        )?;
     }
     for rank in 0..n {
         let route = binding.route_buffers(rank)?;
@@ -952,9 +960,13 @@ impl<B: ForwardBindings> RootRoutedEpBinding for DecodeRootRoutedContext<'_, B> 
     }
 
     fn sync_shared_residual(&mut self, gpus: &mut Gpus, count: usize) -> Result<(), DispatchError> {
-        let bytes = count.checked_mul(std::mem::size_of::<f32>()).ok_or_else(|| {
-            DispatchError::Hip("run_layer_program_ep: shared residual byte count overflow".into())
-        })?;
+        let bytes = count
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| {
+                DispatchError::Hip(
+                    "run_layer_program_ep: shared residual byte count overflow".into(),
+                )
+            })?;
         let residuals: Vec<&DeviceBuffer> = self
             .bindings
             .iter()

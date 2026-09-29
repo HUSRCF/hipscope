@@ -544,7 +544,11 @@ impl<'a> SealedMoeOp<'a> {
                         .prefill_route_producer_proof_for_receipt(&receipt)?;
                     slot.set(Some(proof));
                 }
-                self.state.install_route_stamp(params.n_exp, params.k_top, receipt.adopted_from())?;
+                self.state.install_route_stamp(
+                    params.n_exp,
+                    params.k_top,
+                    receipt.adopted_from(),
+                )?;
                 Ok(())
             }
             MoeProtocol::IndexedDecode => {

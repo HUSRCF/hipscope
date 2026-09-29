@@ -51,8 +51,8 @@ use hip_bridge::HipError;
 use hip_bridge::HipResult;
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::pipeline::execute_steps;
-use hipfire_dispatch::types::DispatchError;
 use hipfire_dispatch::pipeline::sealed_moe::PrefillRouteMode;
+use hipfire_dispatch::types::DispatchError;
 
 use hipfire_dispatch::pipeline::GemvInput;
 use hipfire_dispatch::pipeline::Step;
@@ -1199,7 +1199,11 @@ impl RootEpRanks<'_> {
     fn state_mut(
         &mut self,
         rank: usize,
-    ) -> (&mut llama::KvCache, &mut DeltaNetState, &PrefillBatchScratch) {
+    ) -> (
+        &mut llama::KvCache,
+        &mut DeltaNetState,
+        &PrefillBatchScratch,
+    ) {
         match self {
             Self::Split { kv, dn, pbs } => (&mut kv[rank], &mut dn[rank], &pbs[rank]),
             Self::Lanes(ranks) => {
@@ -1369,12 +1373,25 @@ impl RootRoutedEpBinding for QwenRootEpBinding<'_> {
 
     fn route_buffers(&self, rank: usize) -> Result<EpRouteBuffers<'_>, DispatchError> {
         let pbs = self.ranks.pbs(rank)?;
-        let missing =
-            |what: &str| DispatchError::Hip(format!("Qwen root EP rank {rank} {what} is unavailable"));
+        let missing = |what: &str| {
+            DispatchError::Hip(format!("Qwen root EP rank {rank} {what} is unavailable"))
+        };
         Ok(EpRouteBuffers {
-            ids: &pbs.moe_topk_indices_batch.as_ref().ok_or_else(|| missing("route IDs"))?.buf,
-            weights: &pbs.moe_topk_weights_batch.as_ref().ok_or_else(|| missing("route weights"))?.buf,
-            slot_outputs: &pbs.moe_down_expanded_batch.as_ref().ok_or_else(|| missing("slot output"))?.buf,
+            ids: &pbs
+                .moe_topk_indices_batch
+                .as_ref()
+                .ok_or_else(|| missing("route IDs"))?
+                .buf,
+            weights: &pbs
+                .moe_topk_weights_batch
+                .as_ref()
+                .ok_or_else(|| missing("route weights"))?
+                .buf,
+            slot_outputs: &pbs
+                .moe_down_expanded_batch
+                .as_ref()
+                .ok_or_else(|| missing("slot output"))?
+                .buf,
         })
     }
 
