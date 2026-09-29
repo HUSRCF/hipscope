@@ -371,19 +371,19 @@ impl Scheduler {
 // seed token in `remaining_prompt`; prefill slots carry the un-prefilled
 // prompt suffix.
 /// Sequential VL or a decoding spec slot: owned elsewhere, never batched here.
-pub(crate) fn skip_entirely(w: &PendingWork, vl_sequential: bool) -> bool {
+pub fn skip_entirely(w: &PendingWork, vl_sequential: bool) -> bool {
     (w.vl_prefill.is_some() && vl_sequential) || (w.spec.active() && w.decoding)
 }
 
 /// Batched VL slot whose vision-tower embeddings have not landed yet.
-pub(crate) fn vl_waiting(w: &PendingWork) -> bool {
+pub fn vl_waiting(w: &PendingWork) -> bool {
     w.vl_prefill
         .as_ref()
         .is_some_and(|vl| vl.embeddings.is_empty() && vl.n_visual_tokens > 0)
 }
 
 /// A decoding slot that contributes one ordinary decode row this step.
-pub(crate) fn is_runnable_decode(w: &PendingWork, vl_sequential: bool) -> bool {
+pub fn is_runnable_decode(w: &PendingWork, vl_sequential: bool) -> bool {
     if skip_entirely(w, vl_sequential) || vl_waiting(w) {
         return false;
     }
@@ -391,7 +391,7 @@ pub(crate) fn is_runnable_decode(w: &PendingWork, vl_sequential: bool) -> bool {
 }
 
 /// A prefilling slot with prompt tokens left to feed.
-pub(crate) fn is_runnable_prefill(w: &PendingWork, vl_sequential: bool) -> bool {
+pub fn is_runnable_prefill(w: &PendingWork, vl_sequential: bool) -> bool {
     if skip_entirely(w, vl_sequential) || vl_waiting(w) {
         return false;
     }

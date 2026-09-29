@@ -90,7 +90,7 @@ use crate::qwen35::{
     DeltaNetState, FullAttnLayerWeights, FullAttnMoeLayerWeights, LayerType, LayerWeights,
     MoeFfnWeights, PrefillBatchScratch, Qwen35Config, Qwen35Scratch, Qwen35Weights, StateQuant,
 };
-use crate::slot_batch::SlotBatch;
+use hipfire_runtime::slot_batch::SlotBatch;
 use hip_bridge::{HipError, HipResult};
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::families::gemv::{GemvFamily, RotateInputs};

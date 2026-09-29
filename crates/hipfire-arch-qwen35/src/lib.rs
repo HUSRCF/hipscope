@@ -112,15 +112,6 @@ pub use grammar_config::{resolve_grammar_config, resolve_qwen35_grammar_config};
 /// drives the qwen35 `grammar` matcher. Built via [`spec_emit::Qwen35Emit::from_ctx`].
 pub mod spec_emit;
 
-/// `SlotBatch` — one forward step's ragged work across N slots. Pure CPU
-/// data structure; no GPU dependencies. See module docs for the
-/// per-slot-absolute `positions[]` invariant.
-pub mod slot_batch;
-
-/// `Scheduler` — decides what goes into each step's `SlotBatch`. Pure CPU
-/// logic; no GPU dependencies. Round-robin, chunked prefill mixed with
-/// decode; deliberately minimal — see module docs for why.
-pub mod scheduler;
 
 #[cfg(feature = "deltanet")]
 pub use arch::Qwen35;

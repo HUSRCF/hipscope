@@ -38,10 +38,10 @@ use crate::grammar;
 use crate::qwen35::{
     self, DeltaNetState, LayerType, PrefillBatchScratch, Qwen35Scratch, Qwen35Weights,
 };
-use crate::scheduler::{
-    is_runnable_decode, is_runnable_prefill, PendingWork, Scheduler, VlPrefill,
+use hipfire_runtime::scheduler::{
+    is_runnable_decode, is_runnable_prefill, PendingWork, Scheduler, SpecKind, VlPrefill,
 };
-use crate::slot_batch::SlotBatch;
+use hipfire_runtime::slot_batch::SlotBatch;
 use crate::speculative::DeltaNetSnapshot;
 use hipfire_runtime::llama::{KvCache, VMode};
 use hipfire_runtime::prefix_index::{Handle, PinTicket, PrefixIndex};
@@ -2462,7 +2462,7 @@ fn clear_work_slot(work: &mut PendingWork) {
     work.decoding = false;
     work.next_pos = 0;
     work.vl_prefill = None;
-    work.spec = crate::scheduler::SpecKind::None;
+    work.spec = SpecKind::None;
     work.pos3_delta = 0;
     // Adaptive-retire counters are per-REQUEST state: a request that ends
     // mid-window must not leave its failures behind for the slot's next
@@ -3305,7 +3305,7 @@ fn run_loop(
             next_pos: 0,
             decoding: false,
             vl_prefill: None,
-            spec: crate::scheduler::SpecKind::None,
+            spec: SpecKind::None,
             spec_cycles: 0,
             spec_committed: 0,
             spec_retire_fails: 0,
@@ -3589,14 +3589,14 @@ fn run_loop(
                         // (mirroring the cap guard below) so it runs ordinary
                         // decode — no drop, no wedge, just no spec-decode for
                         // the rest of the request.
-                        work[s].spec = crate::scheduler::SpecKind::None;
+                        work[s].spec = SpecKind::None;
                         if let Some(last) = work[s].remaining_prompt.last().copied() {
                             work[s].remaining_prompt.clear();
                             work[s].remaining_prompt.push(last);
                         }
                         continue;
                     }
-                    if work[s].spec == crate::scheduler::SpecKind::Dflash
+                    if work[s].spec == SpecKind::Dflash
                         && rig.dflash.as_ref().is_some_and(|d| {
                             d.window.is_none() && work[s].next_pos >= d.ctx_capacity
                         })
@@ -3604,7 +3604,7 @@ fn run_loop(
                         // Legacy DFlash owns context-indexed draft buffers capped by
                         // HIPFIRE_DFLASH_CTX_CAP. Past the cap the documented policy
                         // is plain AR fallback, not an out-of-bounds scatter/assert.
-                        work[s].spec = crate::scheduler::SpecKind::None;
+                        work[s].spec = SpecKind::None;
                         if let Some(last) = work[s].remaining_prompt.last().copied() {
                             work[s].remaining_prompt.clear();
                             work[s].remaining_prompt.push(last);
@@ -3620,7 +3620,7 @@ fn run_loop(
                         // finish under its per-token guard. Of the committed
                         // tokens only the newest is not yet in KV — the rest
                         // are dead seed copies — so keep just it.
-                        work[s].spec = crate::scheduler::SpecKind::None;
+                        work[s].spec = SpecKind::None;
                         if let Some(last) = work[s].remaining_prompt.last().copied() {
                             work[s].remaining_prompt.clear();
                             work[s].remaining_prompt.push(last);
@@ -3631,15 +3631,15 @@ fn run_loop(
                         // can restore it.
                         let seed = work[s].remaining_prompt.last().copied();
                         let outcome = match work[s].spec {
-                            crate::scheduler::SpecKind::Mtp => {
+                            SpecKind::Mtp => {
                                 mtp_draft_step(&mut rig, SlotId(s), &mut work[s])
                                     .map(SpecDraftRows::Mtp)
                             }
-                            crate::scheduler::SpecKind::Dflash => {
+                            SpecKind::Dflash => {
                                 dflash_draft_step(&mut rig, SlotId(s), &mut work[s])
                                     .map(SpecDraftRows::Dflash)
                             }
-                            crate::scheduler::SpecKind::None => {
+                            SpecKind::None => {
                                 unreachable!("spec.active() gate above")
                             }
                         };
@@ -3870,7 +3870,7 @@ fn run_loop(
                                 // `skip_entirely` hold and every readiness
                                 // predicate false: the slot would contribute zero
                                 // rows forever (a wedge).
-                                work[s].spec = crate::scheduler::SpecKind::None;
+                                work[s].spec = SpecKind::None;
                                 if let Some(seed) = spec_seeds[s].take() {
                                     work[s].remaining_prompt.clear();
                                     work[s].remaining_prompt.push(seed);
@@ -4201,7 +4201,7 @@ fn run_loop(
             // contribute rows this step — prefill chunks (draft-context seed)
             // and verify rows (post-accept commit) alike.
             let any_dflash_rows = (0..n).any(|s| {
-                work[s].spec == crate::scheduler::SpecKind::Dflash
+                work[s].spec == SpecKind::Dflash
                     && batch.m_per_slot.get(s).copied().unwrap_or(0) > 0
             });
             let fwd = (|| {
@@ -4791,7 +4791,7 @@ fn run_loop(
                                             MTP_RETIRE_WINDOWS
                                         );
                                         }
-                                        work[s].spec = crate::scheduler::SpecKind::None;
+                                        work[s].spec = SpecKind::None;
                                         work[s].spec_retire_fails = 0;
                                         // Of the committed tokens only the newest
                                         // lacks a KV row (the rest were written by
@@ -4840,7 +4840,7 @@ fn run_loop(
                         .map(|i| batch.m_per_slot.get(i).copied().unwrap_or(0))
                         .sum();
                     let prefill_outcome: Result<(), String> = match work[s].spec {
-                        crate::scheduler::SpecKind::Mtp => {
+                        SpecKind::Mtp => {
                             let chunk_tokens: Vec<u32> =
                                 batch.tokens[row_off..row_off + m].to_vec();
                             let chunk_positions: Vec<i32> =
@@ -4854,14 +4854,14 @@ fn run_loop(
                                 m,
                             )
                         }
-                        crate::scheduler::SpecKind::Dflash => dflash_prefill_chunk(
+                        SpecKind::Dflash => dflash_prefill_chunk(
                             &mut rig,
                             SlotId(s),
                             row_off,
                             m,
                             batch.positions[row_off] as usize,
                         ),
-                        crate::scheduler::SpecKind::None => Ok(()),
+                        SpecKind::None => Ok(()),
                     };
                     match prefill_outcome {
                         Ok(()) => {
@@ -5789,11 +5789,11 @@ fn admit(
                             }
                         }
                         work[slot.0].spec = if mtp_ok {
-                            crate::scheduler::SpecKind::Mtp
+                            SpecKind::Mtp
                         } else if dflash_ok {
-                            crate::scheduler::SpecKind::Dflash
+                            SpecKind::Dflash
                         } else {
-                            crate::scheduler::SpecKind::None
+                            SpecKind::None
                         };
                         if !work[slot.0].spec.active() {
                             if let Some(state) = rig.mtp_states[slot.0].as_mut() {
@@ -6475,7 +6475,7 @@ fn admit(
             rope_delta: vd.rope_delta,
             base: 0,
         });
-        work[slot.0].spec = crate::scheduler::SpecKind::None;
+        work[slot.0].spec = SpecKind::None;
     } else {
         work[slot.0].remaining_prompt = req.prompt_tokens[reused..].to_vec();
         work[slot.0].next_pos = reused;
@@ -6531,11 +6531,11 @@ fn admit(
             && dflash_ctx_fits
             && reused == 0;
         work[slot.0].spec = if mtp_ok {
-            crate::scheduler::SpecKind::Mtp
+            SpecKind::Mtp
         } else if dflash_ok {
-            crate::scheduler::SpecKind::Dflash
+            SpecKind::Dflash
         } else {
-            crate::scheduler::SpecKind::None
+            SpecKind::None
         };
     }
     rig.sample_params[slot.0] = sample_params;

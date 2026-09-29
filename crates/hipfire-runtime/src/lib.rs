@@ -64,6 +64,15 @@ pub mod checkpoint_pool;
 pub mod serve_contract;
 pub mod serve_fairness;
 pub mod serve_wait;
+/// `SlotBatch` — one forward step's ragged work across N slots. Pure CPU
+/// data structure; no GPU dependencies. Moved from `hipfire-arch-qwen35`
+/// (the multi-slot scheduler/batch substrate is model-agnostic). See module
+/// docs for the per-slot-absolute `positions[]` invariant.
+pub mod slot_batch;
+/// `Scheduler` — decides what goes into each step's `SlotBatch`. Pure CPU
+/// logic; no GPU dependencies. Round-robin, chunked prefill mixed with
+/// decode. Moved from `hipfire-arch-qwen35` with `slot_batch`.
+pub mod scheduler;
 pub mod sidecar;
 pub mod spec;
 
