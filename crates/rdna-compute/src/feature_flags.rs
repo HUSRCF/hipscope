@@ -278,8 +278,8 @@ pub struct FeatureFlags {
     /// the gated-norm twin runs one wave per 256-group. Bit-identical outputs;
     /// any byte difference kills it.
     pub g12_norm: bool,
-    /// gfx1201 decode norm grids (`HIPFIRE_G12_DEC_NORM`,
-    /// `kernel.g12_dec_norm`). Default ON on exact gfx1201; `=0` restores the
+    /// Decode norm grids (`HIPFIRE_G12_DEC_NORM`, `kernel.g12_dec_norm`).
+    /// Default ON on exact gfx1201 and exact gfx1151; `=0` restores the
     /// single-workgroup launches. The f32 AWQ RMSNorm+FWHT runs K/256
     /// workgroups (each redoes the row's reduction, rotates one group), the
     /// out-of-place `rmsnorm_f32` n/256 workgroups per row, and the half-split
@@ -747,7 +747,8 @@ impl FeatureFlags {
             gfx12_producer_quant_fused: parse_bool("HIPFIRE_GFX12_PRODUCER_QUANT_FUSED")
                 .unwrap_or(arch == "gfx1201"),
             g12_norm: parse_bool("HIPFIRE_G12_NORM").unwrap_or(arch == "gfx1201"),
-            g12_dec_norm: parse_bool("HIPFIRE_G12_DEC_NORM").unwrap_or(arch == "gfx1201"),
+            g12_dec_norm: parse_bool("HIPFIRE_G12_DEC_NORM")
+                .unwrap_or(matches!(arch, "gfx1201" | "gfx1151")),
             gfx1100_dec_norm: parse_bool("HIPFIRE_GFX1100_DEC_NORM").unwrap_or(arch == "gfx1100"),
             gfx11_producer_quant_fused: parse_bool("HIPFIRE_GFX11_PRODUCER_QUANT_FUSED")
                 .unwrap_or(matches!(arch, "gfx1100" | "gfx1151")),
@@ -942,11 +943,11 @@ impl FeatureFlags {
     pub fn g12_norm_enabled(&self) -> bool {
         self.g12_norm && self.arch == "gfx1201"
     }
-    /// True only on exact gfx1201 with `HIPFIRE_G12_DEC_NORM` on: the decode
-    /// RMSNorm+FWHT, final RMSNorm and RoPE launch their bit-identical
-    /// multi-workgroup twins.
+    /// True only on exact gfx1201 or exact gfx1151 with `HIPFIRE_G12_DEC_NORM`
+    /// on: the decode RMSNorm+FWHT, final RMSNorm and RoPE launch their
+    /// bit-identical multi-workgroup twins.
     pub fn g12_dec_norm_enabled(&self) -> bool {
-        self.g12_dec_norm && self.arch == "gfx1201"
+        self.g12_dec_norm && matches!(self.arch.as_str(), "gfx1201" | "gfx1151")
     }
     /// True only on exact gfx1100 with `HIPFIRE_GFX1100_DEC_NORM` on: the
     /// decode RMSNorm+FWHT and final RMSNorm launch their bit-identical
@@ -955,7 +956,7 @@ impl FeatureFlags {
         self.gfx1100_dec_norm && self.arch == "gfx1100"
     }
     /// The decode RMSNorm+FWHT and final RMSNorm run as multi-workgroup
-    /// grids: exact gfx1201 (`g12_dec_norm`) or exact gfx1100
+    /// grids: exact gfx1201 or gfx1151 (`g12_dec_norm`) or exact gfx1100
     /// (`gfx1100_dec_norm`).
     pub fn dec_norm_grids_enabled(&self) -> bool {
         self.g12_dec_norm_enabled() || self.gfx1100_dec_norm_enabled()

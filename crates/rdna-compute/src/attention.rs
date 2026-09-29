@@ -204,11 +204,57 @@ fn fp8_decode_attn_gqa_admitted(
         && hipfire_config::developer_bool("HIPFIRE_FP8_DECODE_ATTN_GQA", true)
 }
 
-/// Grid-y cap of the GQA-shared fp8 decode tile. Its workgroups loop over
-/// tiles y, y + cap, ..., so the graph-captured max_tiles grid (2048 at
-/// max_seq 262,144) does not dispatch thousands of idle 256-thread
-/// workgroups (6 µs/layer measured at 2048, 0.9 µs at 512).
-const FP8_DECODE_GQA_TILE_GRID_Y_CAP: usize = 512;
+/// gfx1151 Q8_0 decode attention through the GQA-shared tile and the
+/// head-dim-split reduce (default on; `HIPFIRE_GFX1151_Q8_DECODE_ATTN_GQA=0`
+/// restores `attention_flash_q8_0_tile` + `attention_flash_q8_0_reduce`). Both
+/// pairs write byte-identical partials and output. The tile's geometry is
+/// compile-time: head_dim 256, GQA group 6, tile 128, full causal (H2 decode).
+fn q8_decode_attn_gqa_gfx1151_admitted(
+    gpu: &Gpu,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    tile_size: usize,
+    window: i32,
+) -> bool {
+    gpu.arch_caps.is_gfx1151()
+        && window <= 0
+        && head_dim == 256
+        && n_kv_heads > 0
+        && n_heads == 6 * n_kv_heads
+        && tile_size == 128
+        && hipfire_config::developer_bool("HIPFIRE_GFX1151_Q8_DECODE_ATTN_GQA", true)
+}
+
+/// Kernel pair of a GQA-shared decode attention route: a 13-arg tile with one
+/// 256-thread workgroup per (kv head, tile) and a 7-arg head-dim-split reduce.
+struct DecodeGqaPair {
+    tile: &'static str,
+    tile_src: &'static str,
+    reduce: &'static str,
+    reduce_src: &'static str,
+    /// Grid-y cap of the tile. Its workgroups loop over tiles y, y + cap, ...,
+    /// so the graph-captured max_tiles grid (2048 at max_seq 262,144) does not
+    /// dispatch thousands of idle 256-thread workgroups (gfx1201: 6 µs/layer
+    /// measured at 2048, 0.9 µs at 512).
+    grid_y_cap: usize,
+}
+
+const FP8_DECODE_GQA_GFX1201: DecodeGqaPair = DecodeGqaPair {
+    tile: "attention_flash_fp8_e4m3_tile_gqa_gfx1201",
+    tile_src: kernels::ATTENTION_FLASH_FP8_E4M3_TILE_GQA_GFX1201_SRC,
+    reduce: "attention_flash_reduce_dsplit_gfx1201",
+    reduce_src: kernels::ATTENTION_FLASH_REDUCE_DSPLIT_GFX1201_SRC,
+    grid_y_cap: 512,
+};
+
+const Q8_DECODE_GQA_GFX1151: DecodeGqaPair = DecodeGqaPair {
+    tile: "attention_flash_q8_0_tile_gqa_gfx1151",
+    tile_src: kernels::ATTENTION_FLASH_Q8_0_TILE_GQA_GFX1151_SRC,
+    reduce: "attention_flash_reduce_dsplit_gfx1151",
+    reduce_src: kernels::ATTENTION_FLASH_REDUCE_DSPLIT_GFX1151_SRC,
+    grid_y_cap: 512,
+};
 
 /// gfx1100 Q8_0 gated-AWQ decode attention through the GQA-shared tile and
 /// the load-ahead reduce (default on; `HIPFIRE_GFX1100_DECODE_ATTN_GQA=0`
@@ -239,6 +285,10 @@ fn q8_decode_attn_gqa_gfx1100_admitted(
 /// LDS bound of the gfx1100 load-ahead reduce: 2 * max_tiles f32 of dynamic
 /// LDS next to ~2.2 KiB static, inside the 64 KiB workgroup limit.
 const Q8_DECODE_GQA_REDUCE_MAX_TILES: usize = 7680;
+
+/// Grid-y cap of the gfx1100 GQA-shared Q8_0 decode tile (same 512 as the
+/// [`DecodeGqaPair`] routes): its workgroups loop over tiles y, y + cap, ...
+const Q8_DECODE_GQA_GFX1100_TILE_GRID_Y_CAP: usize = 512;
 
 #[inline]
 fn replay_stable_tile_count(
@@ -7487,6 +7537,29 @@ impl Gpu {
             }
         }
 
+        if output_gate.is_none()
+            && q8_decode_attn_gqa_gfx1151_admitted(
+                self, n_heads, n_kv_heads, head_dim, tile_size, window,
+            )
+        {
+            return self.attention_flash_decode_gqa_pair(
+                &Q8_DECODE_GQA_GFX1151,
+                q,
+                k_cache,
+                v_cache,
+                out,
+                pos_buf,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                max_seq,
+                partials,
+                tile_size,
+                max_tiles,
+                launch_tiles,
+            );
+        }
+
         // ── Tile kernel ──
         let gfx1151_tile_dpp = self.arch_caps.is_gfx1151()
             && hipfire_config::developer_var("HIPFIRE_GFX1151_ATTENTION_TILE_DPP").as_deref()
@@ -7673,7 +7746,8 @@ impl Gpu {
         if output_gate.is_none()
             && fp8_decode_attn_gqa_admitted(self, n_heads, n_kv_heads, head_dim, tile_size)
         {
-            return self.attention_flash_fp8_e4m3_gqa_gfx1201(
+            return self.attention_flash_decode_gqa_pair(
+                &FP8_DECODE_GQA_GFX1201,
                 q,
                 k_cache,
                 v_cache,
@@ -7813,13 +7887,15 @@ impl Gpu {
         Ok(())
     }
 
-    /// gfx1201 fp8 decode attention: GQA-shared tile (one 256-thread
-    /// workgroup per (kv head, tile), K/V read once for the group's six q
-    /// heads) + head-dim-split reduce. Same ABIs and byte-identical partials
-    /// and output as `attention_flash_fp8_e4m3_tile` + `attention_flash_q8_0_reduce`.
+    /// GQA-shared decode attention (gfx1201 fp8, gfx1151 Q8_0): the pair's
+    /// tile runs one 256-thread workgroup per (kv head, tile), reading K/V once
+    /// for the group's six q heads, then its head-dim-split reduce. Same ABIs
+    /// and byte-identical partials and output as the reference tile +
+    /// `attention_flash_q8_0_reduce`.
     #[allow(clippy::too_many_arguments)]
-    fn attention_flash_fp8_e4m3_gqa_gfx1201(
+    fn attention_flash_decode_gqa_pair(
         &mut self,
+        pair: &DecodeGqaPair,
         q: &GpuTensor,
         k_cache: &GpuTensor,
         v_cache: &GpuTensor,
@@ -7834,10 +7910,9 @@ impl Gpu {
         max_tiles: usize,
         launch_tiles: usize,
     ) -> HipResult<()> {
-        const TILE: &str = "attention_flash_fp8_e4m3_tile_gqa_gfx1201";
-        const REDUCE: &str = "attention_flash_reduce_dsplit_gfx1201";
-        self.ensure_kernel(TILE, kernels::ATTENTION_FLASH_FP8_E4M3_TILE_GQA_GFX1201_SRC, TILE)?;
-        self.ensure_kernel(REDUCE, kernels::ATTENTION_FLASH_REDUCE_DSPLIT_GFX1201_SRC, REDUCE)?;
+        let (tile, reduce) = (pair.tile, pair.reduce);
+        self.ensure_kernel(tile, pair.tile_src, tile)?;
+        self.ensure_kernel(reduce, pair.reduce_src, reduce)?;
         let q_ptr = q.buf.as_ptr();
         let k_ptr = k_cache.buf.as_ptr();
         let v_ptr = v_cache.buf.as_ptr();
@@ -7856,7 +7931,7 @@ impl Gpu {
         {
             let grid = [
                 n_kv_heads as u32,
-                launch_tiles.min(FP8_DECODE_GQA_TILE_GRID_Y_CAP) as u32,
+                launch_tiles.min(pair.grid_y_cap) as u32,
                 1,
             ];
             let mut params: Vec<*mut c_void> = vec![
@@ -7875,7 +7950,7 @@ impl Gpu {
                 &es as *const _ as *mut c_void,
             ];
             self.launch_maybe_blob_position_grid(
-                TILE,
+                tile,
                 grid,
                 [256, 1, 1],
                 0,
@@ -7912,7 +7987,7 @@ impl Gpu {
             &mt as *const _ as *mut c_void,
         ];
         self.launch_maybe_blob(
-            REDUCE,
+            reduce,
             [n_heads as u32, (head_dim / 32) as u32, 1],
             [256, 1, 1],
             0,
@@ -7997,7 +8072,7 @@ impl Gpu {
         {
             let grid = [
                 n_kv_heads as u32,
-                launch_tiles.min(FP8_DECODE_GQA_TILE_GRID_Y_CAP) as u32,
+                launch_tiles.min(Q8_DECODE_GQA_GFX1100_TILE_GRID_Y_CAP) as u32,
                 1,
             ];
             let mut params: Vec<*mut c_void> = vec![

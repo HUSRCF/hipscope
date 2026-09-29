@@ -1327,17 +1327,18 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             read(40),
             read(48),
         ]),
-        // The gfx1201 GQA fp8 decode tile and head-dim-split reduce and the
-        // gfx1100 GQA Q8_0 decode tile keep their reference twins'
+        // The gfx1201 GQA fp8, gfx1100 GQA Q8_0 and gfx1151 GQA Q8_0 decode
+        // tiles and the head-dim-split reduces keep their reference twins'
         // 13/7-argument ABIs and pointer effects.
         "attention_flash_q8_0_tile"
         | "attention_flash_fp8_e4m3_tile_gqa_gfx1201"
-        | "attention_flash_q8_0_tile_gqa_gfx1100" => {
+        | "attention_flash_q8_0_tile_gqa_gfx1100"
+        | "attention_flash_q8_0_tile_gqa_gfx1151" => {
             Some(vec![read(0), read(8), read(16), write(24), read(32)])
         }
-        "attention_flash_q8_0_reduce" | "attention_flash_reduce_dsplit_gfx1201" => {
-            Some(vec![read(0), write(8), read(24)])
-        }
+        "attention_flash_q8_0_reduce"
+        | "attention_flash_reduce_dsplit_gfx1201"
+        | "attention_flash_reduce_dsplit_gfx1151" => Some(vec![read(0), write(8), read(24)]),
         "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1100"
         | "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1151"
         | "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1201" => Some(vec![
@@ -1702,6 +1703,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         "gemma4_ple_gelu_mul_strided_f32" => Some(48),
         "attention_flash_q8_0_reduce"
         | "attention_flash_reduce_dsplit_gfx1201"
+        | "attention_flash_reduce_dsplit_gfx1151"
         | "fused_rmsnorm_mq_rotate"
         | "fused_rmsnorm_mq_rotate_vecsum"
         | "fused_rmsnorm_mq_rotate_vecsum_sign_const"
@@ -1759,6 +1761,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "attention_flash_fp8_e4m3_tile_gqa_gfx1201"
         | "gated_norm_mq_rotate_awq_k6144_gfx1201"
         | "attention_flash_q8_0_tile_gqa_gfx1100"
+        | "attention_flash_q8_0_tile_gqa_gfx1151"
         | "fused_qkv_hfq4g256"
         | "fused_qkv_mq4g256v2"
         | "fused_qkv_mq4g256v2_k2048_x_buffer_gfx1100"
@@ -7568,57 +7571,68 @@ mod tests {
     }
 
     #[test]
-    fn gfx1201_fp8_decode_attention_pair_keeps_padded_replay_contract() {
-        // Launcher order: q, k, v, partials, pos, then 8 scalars.
-        let tile = "attention_flash_fp8_e4m3_tile_gqa_gfx1201";
-        let mut blob = hip_bridge::KernargBlob::new();
-        for _ in 0..5 {
-            blob.push_ptr(std::ptr::null());
-        }
-        for _ in 0..4 {
-            blob.push_i32(0);
-        }
-        blob.push_f32(0.0);
-        for _ in 0..3 {
-            blob.push_i32(0);
-        }
-        blob.pad_to(16);
-        assert_eq!(expected_kernarg_bytes(tile), Some(blob.len()));
-        let effects = pointer_effects(tile).expect("GQA tile contract");
-        let modes: Vec<_> = effects.iter().map(|e| (e.offset, e.mode)).collect();
-        assert_eq!(
-            modes,
-            vec![
-                (0, RecordedAccessMode::Read),
-                (8, RecordedAccessMode::Read),
-                (16, RecordedAccessMode::Read),
-                (24, RecordedAccessMode::Write),
-                (32, RecordedAccessMode::Read),
-            ]
-        );
+    fn gqa_decode_attention_pairs_keep_padded_replay_contract() {
+        for (tile, reduce) in [
+            (
+                "attention_flash_fp8_e4m3_tile_gqa_gfx1201",
+                "attention_flash_reduce_dsplit_gfx1201",
+            ),
+            (
+                "attention_flash_q8_0_tile_gqa_gfx1151",
+                "attention_flash_reduce_dsplit_gfx1151",
+            ),
+        ] {
+            // Launcher order: q, k, v, partials, pos, then 8 scalars.
+            let mut blob = hip_bridge::KernargBlob::new();
+            for _ in 0..5 {
+                blob.push_ptr(std::ptr::null());
+            }
+            for _ in 0..4 {
+                blob.push_i32(0);
+            }
+            blob.push_f32(0.0);
+            for _ in 0..3 {
+                blob.push_i32(0);
+            }
+            blob.pad_to(16);
+            assert_eq!(expected_kernarg_bytes(tile), Some(blob.len()), "{tile}");
+            let effects = pointer_effects(tile).expect("GQA tile contract");
+            let modes: Vec<_> = effects.iter().map(|e| (e.offset, e.mode)).collect();
+            assert_eq!(
+                modes,
+                vec![
+                    (0, RecordedAccessMode::Read),
+                    (8, RecordedAccessMode::Read),
+                    (16, RecordedAccessMode::Read),
+                    (24, RecordedAccessMode::Write),
+                    (32, RecordedAccessMode::Read),
+                ],
+                "{tile}"
+            );
 
-        // Launcher order: partials, out, n_heads, head_dim, pos, tile, max_tiles.
-        let reduce = "attention_flash_reduce_dsplit_gfx1201";
-        let mut blob = hip_bridge::KernargBlob::new();
-        blob.push_ptr(std::ptr::null());
-        blob.push_ptr(std::ptr::null());
-        blob.push_i32(0);
-        blob.push_i32(0);
-        blob.push_ptr(std::ptr::null());
-        blob.push_i32(0);
-        blob.push_i32(0);
-        blob.pad_to(16);
-        assert_eq!(expected_kernarg_bytes(reduce), Some(blob.len()));
-        let effects = pointer_effects(reduce).expect("dsplit reduce contract");
-        let modes: Vec<_> = effects.iter().map(|e| (e.offset, e.mode)).collect();
-        assert_eq!(
-            modes,
-            vec![
-                (0, RecordedAccessMode::Read),
-                (8, RecordedAccessMode::Write),
-                (24, RecordedAccessMode::Read),
-            ]
-        );
+            // Launcher order: partials, out, n_heads, head_dim, pos, tile, max_tiles.
+            let mut blob = hip_bridge::KernargBlob::new();
+            blob.push_ptr(std::ptr::null());
+            blob.push_ptr(std::ptr::null());
+            blob.push_i32(0);
+            blob.push_i32(0);
+            blob.push_ptr(std::ptr::null());
+            blob.push_i32(0);
+            blob.push_i32(0);
+            blob.pad_to(16);
+            assert_eq!(expected_kernarg_bytes(reduce), Some(blob.len()), "{reduce}");
+            let effects = pointer_effects(reduce).expect("dsplit reduce contract");
+            let modes: Vec<_> = effects.iter().map(|e| (e.offset, e.mode)).collect();
+            assert_eq!(
+                modes,
+                vec![
+                    (0, RecordedAccessMode::Read),
+                    (8, RecordedAccessMode::Write),
+                    (24, RecordedAccessMode::Read),
+                ],
+                "{reduce}"
+            );
+        }
     }
 
     #[test]
