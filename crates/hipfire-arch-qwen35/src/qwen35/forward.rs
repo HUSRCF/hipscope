@@ -1697,7 +1697,7 @@ pub fn forward_scratch(
             .memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
         rdna_compute::gap_timing::add_since(rdna_compute::gap_timing::Slot::PosCopy, copy_started);
         let replay = unsafe { gpu.replay.replay_pm4(pos) };
-        rdna_compute::gap_timing::end_forward(gap_started, "pm4");
+        rdna_compute::gap_timing::end_forward(gap_started, pos, "pm4");
         return match replay {
             Ok(_) => Ok(()),
             Err(reason) => {
@@ -1729,7 +1729,7 @@ pub fn forward_scratch(
             rdna_compute::gap_timing::Slot::GraphLaunch,
             launch_started,
         );
-        rdna_compute::gap_timing::end_forward(gap_started, "hip_graph");
+        rdna_compute::gap_timing::end_forward(gap_started, pos, "hip_graph");
         if ar_graph_trace_enabled() {
             eprintln!("[qwen-ar-graph] replay pos={pos}");
         }
