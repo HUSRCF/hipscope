@@ -134,7 +134,7 @@ pub fn parse_qwen_k_name(raw: &str) -> Result<KvMode, KvPairError> {
         "legacy-asym3" => Ok(Asym3),
         "legacy-asym4" => Ok(Asym4),
         other => Err(KvPairError::new(format!(
-            "unrecognized Qwen K name '{other}' (expected q8|fwht2|fwht3|fwht4|asym2|asym3|asym4|turbo|turbo2|turbo3|turbo4|legacy-asym2|legacy-asym3|legacy-asym4; fp8/bf16 require --kv-mode)"
+            "unrecognized Qwen K name '{other}' (expected q8|fwht2|fwht3|fwht4|asym2|asym3|asym4|turbo|turbo2|turbo3|turbo4|legacy-asym2|legacy-asym3|legacy-asym4; fp8/bf16/f16 require --kv-mode)"
         ))),
     }
 }
@@ -166,6 +166,7 @@ pub fn qwen_k_display_name(k: KvMode) -> &'static str {
         Fwht4 => "fwht4",
         Fp8 => "fp8",
         Bf16 => "bf16",
+        F16 => "f16",
     }
 }
 
@@ -256,6 +257,7 @@ pub fn resolve_kv_pair(
         match mode_trim {
             "fp8" => KvPair::Native(Fp8),
             "bf16" => KvPair::Native(Bf16),
+            "f16" => KvPair::Native(F16),
             _ => KvPair::Split(parse_qwen_k_name(mode_trim)?, VMode::Q8),
         }
     };
@@ -294,10 +296,15 @@ const FULL_LADDER: &[KvMode] = &[Q8, Asym2, Asym3, Asym4, Fwht2, Fwht3, Fwht4, F
 
 /// Qwen shared alias surface for the legacy single-string [`resolve`] path.
 /// Named K values use [`parse_qwen_k_name`]; `""`|`auto` map to Q8 (arch-unaware —
-/// pair resolution belongs in [`resolve_kv_pair`]).
+/// pair resolution belongs in [`resolve_kv_pair`]). The three indivisible
+/// native presets (`fp8`/`bf16`/`f16`) normalize here too — sites that don't
+/// accept them take [`resolve`]'s explicit-native carry-forward refusal.
 fn normalize_qwen(raw: &str) -> Option<KvMode> {
     match raw.trim() {
         "" | "auto" => Some(Q8),
+        "fp8" => Some(Fp8),
+        "bf16" => Some(Bf16),
+        "f16" => Some(F16),
         other => parse_qwen_k_name(other).ok(),
     }
 }
@@ -402,8 +409,10 @@ pub const MAPLE_POLICY: KvModePolicy = KvModePolicy {
 /// Q8_0-only for its whole life; the full static ladder is now wired
 /// end-to-end (descriptor-aware K writers + flash tile kernels, legacy and
 /// paged pools), so every rotated tier the sequential path accepts is
-/// accepted here too — EXCEPT the native fp8/bf16 tiers, which have no
-/// slot-reader support and must stay refused (fail closed) on this site.
+/// accepted here too — plus the flat 2-byte native tiers bf16 and f16, which
+/// DO have slot readers (descriptor-aware `kv_cache_write_*` +
+/// `attention_flash_*_tile_batched` kernels). Only fp8 stays refused: it
+/// has no slot-reader support (fail closed) on this site.
 /// The DEFAULT stays q8 — deliberately NOT the sequential site's fwht3:
 /// the slots q8 path has production mileage on every fixture, and an
 /// operator who wants a rotated tier on the slots engine says so
@@ -414,7 +423,7 @@ pub const MAPLE_POLICY: KvModePolicy = KvModePolicy {
 pub const QWEN35_SLOTS_POLICY: KvModePolicy = KvModePolicy {
     site: "qwen35-slots",
     normalize_alias: normalize_qwen,
-    accepted: &[Q8, Asym2, Asym3, Asym4, Fwht2, Fwht3, Fwht4],
+    accepted: &[Q8, Asym2, Asym3, Asym4, Fwht2, Fwht3, Fwht4, Bf16, F16],
     default: Q8,
 };
 /// Pure: `&str + &'static policy → ResolveResult`. No GPU, no env read.
@@ -425,18 +434,18 @@ pub fn resolve(raw: &str, policy: &KvModePolicy) -> ResolveResult {
     let requested: Option<KvMode> = (policy.normalize_alias)(raw);
 
     // 2. accept only if the site supports it; else fall to the site's
-    //    (unconditional) default — EXCEPT an explicit fp8/bf16 request, which
-    //    is carried forward WITH a warning so no unsupported site can silently
-    //    resolve it to q8/fwht3. Downstream construction fails closed on a
-    //    mode it cannot build. Any other non-empty raw that normalize rejected
-    //    (None) or that normalized to an unaccepted mode warns and defaults;
-    //    unset ("") defaults silently.
+    //    (unconditional) default — EXCEPT an explicit fp8/bf16/f16 request,
+    //    which is carried forward WITH a warning so no unsupported site can
+    //    silently resolve it to q8/fwht3. Downstream construction fails
+    //    closed on a mode it cannot build. Any other non-empty raw that
+    //    normalize rejected (None) or that normalized to an unaccepted mode
+    //    warns and defaults; unset ("") defaults silently.
     let (mode, warning) = match requested {
         Some(m) if policy.accepted.contains(&m) => (m, None),
-        Some(m @ (Fp8 | Bf16)) => (
+        Some(m @ (Fp8 | Bf16 | F16)) => (
             m,
             Some(
-                "explicit fp8/bf16 KV requested but unsupported at this site; load will fail closed",
+                "explicit fp8/bf16/f16 KV requested but unsupported at this site; load will fail closed",
             ),
         ),
         _ => {
@@ -973,29 +982,64 @@ mod tests {
             assert_eq!(r.mode, mode, "{raw} must be honored on the slots site");
             assert!(r.warning.is_none(), "{raw} must not warn");
         }
-        // fp8/bf16 are not allocatable on the slots site (no slot readers):
-        // the single-string path refuses to the default WITH a warning
-        // (never a silent downgrade), and the pair path hard-errors instead
-        // of selecting an indivisible native tier.
-        for raw in ["fp8", "bf16"] {
+        // The flat 16-bit native tiers ARE allocatable on the slots site
+        // (descriptor-aware write/attend kernels exist for both layouts) —
+        // honored cleanly, no warning.
+        for (raw, mode) in [("bf16", KvMode::Bf16), ("f16", KvMode::F16)] {
             let r = resolve(raw, p);
-            assert_eq!(
-                r.mode,
-                KvMode::Q8,
-                "{raw} must not resolve to a native tier"
-            );
-            assert!(
-                r.warning.is_some(),
-                "{raw} must warn, not silently downgrade"
-            );
-            assert!(
-                resolve_kv_pair(raw, None, None, p, "gfx1201", true).is_err(),
-                "{raw} must error on the slots pair path"
-            );
+            assert_eq!(r.mode, mode, "{raw} must be honored on the slots site");
+            assert!(r.warning.is_none(), "{raw} must not warn");
         }
+        // fp8 alone stays refused (no slot readers): the single-string path
+        // carries the native forward WITH a warning so construction fails
+        // closed, and the pair path hard-errors instead of selecting an
+        // indivisible native tier.
+        let r = resolve("fp8", p);
+        assert!(r.warning.is_some(), "fp8 must warn on the slots site");
+        assert!(
+            resolve_kv_pair("fp8", None, None, p, "gfx1201", true).is_err(),
+            "fp8 must error on the slots pair path"
+        );
         let garbage = resolve("garbage", p);
         assert_eq!(garbage.mode, KvMode::Q8);
         assert!(garbage.warning.is_some());
+    }
+
+    #[test]
+    fn f16_warns_off_slots_site() {
+        // NEGATIVE CONTROL: "f16" must not be silently honored anywhere but
+        // slots. On the slice-lineage carry-forward semantics an explicit
+        // f16/bf16 request on a non-slots Qwen site resolves to that mode
+        // WITH a warning so construction fails closed — never a silent
+        // downgrade to q8.
+        for p in [
+            &QWEN35_HFQ_POLICY,
+            &QWEN35_PARO_POLICY,
+            &QWEN35_PP_POLICY,
+            &QWEN35_TP_POLICY,
+            &DIR_SAFETENSORS_POLICY,
+        ] {
+            let r = resolve("f16", p);
+            assert!(
+                r.warning.is_some(),
+                "site {} must WARN on f16, not silently default",
+                p.site
+            );
+        }
+        // bf16 warns only where it is NOT in `accepted` — hfq/paro admit it
+        // already, so check the sites that refuse it.
+        for p in [&QWEN35_PP_POLICY, &QWEN35_TP_POLICY, &DIR_SAFETENSORS_POLICY] {
+            let r = resolve("bf16", p);
+            assert!(
+                r.warning.is_some(),
+                "site {} must WARN on explicit bf16, not silently default",
+                p.site
+            );
+        }
+        // The slots site is the one place f16 IS honored — and bf16 now has
+        // two honored sites (maple + slots).
+        assert_eq!(resolve("f16", &QWEN35_SLOTS_POLICY).mode, KvMode::F16);
+        assert_eq!(resolve("bf16", &QWEN35_SLOTS_POLICY).mode, KvMode::Bf16);
     }
 
     #[test]

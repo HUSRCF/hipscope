@@ -1909,6 +1909,30 @@ fn kv_write_slots(
                 Some(row_slot),
             )
         }
+        // f16 is the same flat layout as bf16 — per-arena writes, K and V
+        // share the stride, descriptor-aware kernel.
+        KvMode::F16 => {
+            gpu.kv_cache_write_f16_batched(
+                k_cache,
+                k_batch,
+                positions,
+                n_kv_heads,
+                head_dim,
+                n_rows,
+                Some(descs),
+                Some(row_slot),
+            )?;
+            gpu.kv_cache_write_f16_batched(
+                v_cache,
+                v_batch,
+                positions,
+                n_kv_heads,
+                head_dim,
+                n_rows,
+                Some(descs),
+                Some(row_slot),
+            )
+        }
         // Native fp8 has no slot readers; Rig::build refuses it before any
         // allocation, so reaching here means a gate was bypassed.
         KvMode::Fp8 => Err(HipError::new(
@@ -2103,6 +2127,26 @@ fn tier_attend_slots(
             r,
         ),
         KvMode::Bf16 => gpu.attention_flash_bf16_batched_masked_windowed_slots(
+            q,
+            k_cache,
+            v_cache,
+            out,
+            positions,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            physical_cap,
+            max_ctx_len,
+            batch_size,
+            flash_partials,
+            None,
+            0,
+            0,
+            /*window=*/ 0,
+            d,
+            r,
+        ),
+        KvMode::F16 => gpu.attention_flash_f16_batched_masked_windowed_slots(
             q,
             k_cache,
             v_cache,

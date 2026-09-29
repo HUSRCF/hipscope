@@ -19,6 +19,12 @@ pub enum KvMode {
     /// site whose `accepted` list names it can ever resolve to it — today that
     /// is maple alone, so every other site's behaviour is unchanged.
     Bf16,
+    /// Flat 2-byte IEEE fp16 K/V — the same layout as BF16 with the true
+    /// half format (better small-magnitude precision, narrower exponent
+    /// range). Slots-engine tier only today: descriptor-aware write/attend
+    /// kernels exist for it there. Same constraints as BF16: no rotation,
+    /// no scales, no adaptive/compaction.
+    F16,
     Asym2,
     Asym3,
     Asym4,
@@ -419,11 +425,11 @@ impl SlotKvTierPlan {
                 }
                 (head_dim / 32) * 34
             }
-            // Bf16 is flat 2 bytes/element with no per-head blocks and no
-            // rotation table. It is allocatable by the maple site only —
-            // whether a given engine ACCEPTS the tier is its policy's call
-            // (see kv_mode.rs); this helper just describes the layout.
-            KvMode::Bf16 => {
+            // Bf16 and F16 are flat 2 bytes/element with no per-head blocks
+            // and no rotation table. Whether a given engine ACCEPTS the tier
+            // is its policy's call (see kv_mode.rs); this helper just
+            // describes the layout.
+            KvMode::Bf16 | KvMode::F16 => {
                 let kv_dim = n_kv_heads
                     .checked_mul(head_dim)
                     .ok_or_else(|| hip_bridge::HipError::new(0, "slot KV kv_dim overflowed"))?;
@@ -452,16 +458,16 @@ impl SlotKvTierPlan {
             }
         };
         let k_bytes_per_pos = match mode {
-            // bf16's stride is already per-position (kv_dim flat elements, no
-            // per-head blocks) — it must NOT be scaled by n_kv_heads again.
-            KvMode::Bf16 => k_bph,
+            // Flat 2-byte tiers: the stride is already per-position (kv_dim
+            // flat elements, no per-head blocks) — never scaled by n_kv_heads.
+            KvMode::Bf16 | KvMode::F16 => k_bph,
             _ => n_kv_heads
                 .checked_mul(k_bph)
                 .ok_or_else(|| hip_bridge::HipError::new(0, "slot KV K stride overflowed"))?,
         };
         let v_bytes_per_pos = match mode {
-            // bf16 V is flat like its K.
-            KvMode::Bf16 => k_bytes_per_pos,
+            // Flat tiers store V exactly like K.
+            KvMode::Bf16 | KvMode::F16 => k_bytes_per_pos,
             _ => {
                 // Static multi-slot ladder stores V at Q8_0 — the same
                 // per-head layout the asym/fwht constructors allocate.
@@ -603,9 +609,10 @@ impl KvCache {
                 }
                 Self::checked_vmm_product("q8 K head stride", &[head_dim / 32, 34])
             }
-            // BF16 is flat unscaled: 2 bytes/element, same rows as the
-            // contiguous bf16 constructor (per-token row = n_kv_heads*D*2).
-            KvMode::Bf16 => head_dim
+            // BF16/F16 are flat unscaled: 2 bytes/element (per-token row =
+            // n_kv_heads*D*2). F16 has no VMM constructor today — computing
+            // the stride here is harmless; the constructors gate it.
+            KvMode::Bf16 | KvMode::F16 => head_dim
                 .checked_mul(2)
                 .ok_or_else(|| hip_bridge::HipError::new(0, "VMM bf16 K head stride overflowed")),
             // FP8 token-local rows: D codes + one inline f16 scale per head.
@@ -704,6 +711,15 @@ impl KvCache {
                         "VMM bf16 only supports VMode::Q8 (K/V pair is indivisible)",
                     ));
                 }
+            }
+            // F16 flat rows exist only on the slots engine (contiguous,
+            // descriptor-addressed). There is no VMM constructor — fail
+            // closed rather than compute a layout nothing can allocate.
+            KvMode::F16 => {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    "VMM does not support f16 KV (slots/contiguous only)",
+                ));
             }
             // FP8 token-local rows: exact admitted geometry (D256); v_mode
             // carries the ignored Q8 default, V is fp8 like K.
@@ -813,9 +829,9 @@ impl KvCache {
             Self::checked_vmm_product("V reserve", &[physical_cap, v_bytes_per_token])?;
         let rotation_table_len = match mode {
             KvMode::Q8 => 0,
-            // Unrotated, like Q8. Neither tier uses a rotation table, so 0 is
-            // the honest answer for both.
-            KvMode::Bf16 => 0,
+            // Unrotated, like Q8. None of these tiers uses a rotation table,
+            // so 0 is the honest answer for all of them.
+            KvMode::Bf16 | KvMode::F16 => 0,
             KvMode::Fp8 => 0,
             KvMode::Asym2 | KvMode::Asym3 | KvMode::Asym4 => head_dim / 2,
             KvMode::Fwht3 => 256,
@@ -991,6 +1007,12 @@ impl KvCache {
             KvMode::Bf16 => panic!(
                 "vmm_mode_flags: bf16 has no 5-flag VMM bundle representation — \
                  use new_gpu_bf16_vmm_capped_filtered"
+            ),
+            // F16 likewise: slots-only tier with no VMM bundle. Panic loudly
+            // rather than return a lie.
+            KvMode::F16 => panic!(
+                "vmm_mode_flags: f16 has no 5-flag VMM bundle representation — \
+                 it is a slots/contiguous-only tier"
             ),
             // FP8 likewise: the dedicated `new_gpu_fp8_vmm_capped_filtered`
             // sets its flags directly. Panic loudly rather than return a lie.
@@ -4968,7 +4990,7 @@ mod vmm_layout_tests {
             KvMode::Asym3 | KvMode::Fwht3 => 4 + (head_dim * 3) / 8,
             KvMode::Asym4 | KvMode::Fwht4 => 4 + head_dim / 2,
             KvMode::Fp8 => head_dim + 2,
-            KvMode::Bf16 => head_dim * 2,
+            KvMode::Bf16 | KvMode::F16 => head_dim * 2,
         }
     }
 
@@ -6259,6 +6281,21 @@ mod slot_kv_plan_tests {
         assert!(!p.kv_strides_differ());
         assert!(p.givens_len.is_none());
         assert!(p.fwht_len.is_none());
+    }
+
+    #[test]
+    fn f16_is_flat_and_table_free() {
+        let p = SlotKvTierPlan::resolve(KvMode::F16, 4, 256).unwrap();
+        assert_eq!(p.k_bytes_per_pos, 4 * 256 * 2);
+        assert_eq!(p.v_bytes_per_pos, p.k_bytes_per_pos);
+        assert!(!p.kv_strides_differ());
+        assert!(p.givens_len.is_none());
+        assert!(p.fwht_len.is_none());
+        // And the VMM gate refuses it — the tier is slots/contiguous only.
+        let err = KvCache::vmm_static_layout(KvMode::F16, VMode::Q8, 4, 256, 64)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("f16"), "{err}");
     }
 
     #[test]

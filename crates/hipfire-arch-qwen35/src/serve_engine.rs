@@ -565,16 +565,15 @@ impl Rig {
                 hipfire_runtime::kv_mode::QWEN35_SLOTS_POLICY.site
             ));
         }
-        // Native fp8/bf16 KV tiers have no slot readers even when the site
-        // policy accepts them; storing foreign bytes under the slot layout
-        // is silent corruption — refuse before any GPU allocation.
-        if matches!(
-            kv_mode,
-            hipfire_runtime::kv_mode::KvMode::Fp8 | hipfire_runtime::kv_mode::KvMode::Bf16
-        ) {
+        // Native fp8 KV has no slot readers even when the site policy
+        // accepts it; storing foreign bytes under the slot layout is silent
+        // corruption — refuse before any GPU allocation. bf16/f16 ARE
+        // admitted: the descriptor-aware flat-2B writers and attend kernels
+        // exist for both.
+        if matches!(kv_mode, hipfire_runtime::kv_mode::KvMode::Fp8) {
             return Err(format!(
                 "experimental multi-slot does not admit kv_mode {kv_mode:?}; \
-                 fp8/bf16 KV is not admitted on slot arenas"
+                 fp8 KV is not admitted on slot arenas"
             ));
         }
         // The tier's arena geometry: the K and V per-position strides DIFFER
@@ -1214,6 +1213,7 @@ impl Rig {
             hipfire_runtime::kv_mode::KvMode::Fwht3 => 32,
             hipfire_runtime::kv_mode::KvMode::Fwht4 => 42,
             hipfire_runtime::kv_mode::KvMode::Bf16 => 12,
+            hipfire_runtime::kv_mode::KvMode::F16 => 13,
             other => {
                 // Sentinel or unnamed tier (auto-select placeholder / native
                 // tier with no slot-arena stamp) reached Rig::build — refuse
