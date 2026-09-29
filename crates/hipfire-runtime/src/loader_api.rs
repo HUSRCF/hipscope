@@ -141,9 +141,6 @@ pub struct LoadCtx<'a> {
 /// yields the chosen mechanism without the loader needing a selector of its own.
 #[derive(Clone, Copy, Default)]
 pub struct SpecLoadCfg {
-    /// Adapt the DFlash chain block size from recent acceptance. `None` keeps
-    /// the loader/runtime default.
-    pub dflash_adaptive_b: Option<bool>,
     /// Enable the model-free n-gram drafter for this load. `None` = unspecified.
     pub ngram_draft: Option<bool>,
     /// n-gram draft window K (`HIPFIRE_NGRAM_DRAFT_K`). `None` = loader default.
@@ -181,6 +178,12 @@ pub struct SpecLoadCfg {
     /// `Some(false)` = `off` (skip), `None` = `auto` (load when present,
     /// log-and-AR fallback otherwise).
     pub dflash: Option<bool>,
+    /// DFlash adaptive verify-block (`dflash_adaptive_b`, default true).
+    /// `None` = loader default (on). Env `HIPFIRE_DFLASH_ADAPTIVE_B=0`
+    /// forces the fixed full block at build, mirroring
+    /// `HIPFIRE_DSPARK_ADAPTIVE_BLOCK=0`. Mutually exclusive with the
+    /// retained-PM4 verify route (which needs the fixed B=16 shape).
+    pub dflash_adaptive_b: Option<bool>,
 }
 
 /// CASK/TriAttention params forwarded by the CLI at load time.
