@@ -4736,24 +4736,33 @@ impl Gpu {
         }
         self.ensure_mq_signs()?;
         let (module, src, kernel) = if n_heads == 48 {
-            if !self.arch_caps.is_gfx1100() {
-                return Err(hip_bridge::HipError::new(
-                    1,
-                    "48-head gated norm/MQ rotation is certified only on gfx1100",
-                ));
-            }
-            if awq_scale.is_some() {
-                (
+            match (self.arch_caps.is_gfx1100(), self.arch_caps.is_gfx1201(), awq_scale.is_some()) {
+                (true, _, true) => (
                     "gated_norm_mq_rotate_awq_k6144_gfx1100",
                     kernels::gated_norm_mq_rotate_awq_k6144_gfx1100_src(),
                     "gated_norm_mq_rotate_awq_k6144_gfx1100",
-                )
-            } else {
-                (
+                ),
+                (true, _, false) => (
                     "gated_norm_mq_rotate_k6144_gfx1100",
                     kernels::gated_norm_mq_rotate_k6144_gfx1100_src(),
                     "gated_norm_mq_rotate_k6144_gfx1100",
-                )
+                ),
+                (false, true, true) => (
+                    "gated_norm_mq_rotate_awq_k6144_gfx1201",
+                    kernels::gated_norm_mq_rotate_awq_k6144_gfx1201_src(),
+                    "gated_norm_mq_rotate_awq_k6144_gfx1201",
+                ),
+                (false, true, false) => (
+                    "gated_norm_mq_rotate_k6144_gfx1201",
+                    kernels::gated_norm_mq_rotate_k6144_gfx1201_src(),
+                    "gated_norm_mq_rotate_k6144_gfx1201",
+                ),
+                (false, false, _) => {
+                    return Err(hip_bridge::HipError::new(
+                        1,
+                        "48-head gated norm/MQ rotation is certified only on gfx1100 and gfx1201",
+                    ));
+                }
             }
         } else if self.arch_caps.is_gfx1201() {
             if awq_scale.is_some() {

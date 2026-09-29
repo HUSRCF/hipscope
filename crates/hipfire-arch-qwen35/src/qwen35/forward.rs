@@ -7066,7 +7066,9 @@ fn gdn_compact2_enabled(
 
 /// 3:1 compact-QK route for Qwen3.6-27B dense. A 512-token graph-on A/B/B/A
 /// measured +0.45%, while profiling confirmed 853 -> 805 dispatches/token and
-/// a net 64.35 us/token reduction in GPU compute. Set
+/// a net 64.35 us/token reduction in GPU compute. Exact gfx1201 runs the same
+/// `gated_delta_net_q8_compact3_b2` object for the same shape (its state,
+/// output and EF bytes equal the materialized repeat-interleave route). Set
 /// `HIPFIRE_GDN_COMPACT3=0` to restore explicit Q/K materialization.
 fn gdn_compact3_enabled(
     gpu: &Gpu,
@@ -7082,7 +7084,7 @@ fn gdn_compact3_enabled(
             != Some("0")
     });
     enabled
-        && gpu.arch_caps.is_gfx1100()
+        && (gpu.arch_caps.is_gfx1100() || gfx1201_state_fusions_enabled(gpu))
         && quant == StateQuant::Q8
         && config.linear_num_key_heads * 3 == n_v_heads
         && super::config::qwen36_27b_dense_shape(config, n_v_heads)
@@ -7106,10 +7108,10 @@ fn gdn_compact_qk_div(
 /// Keep DeltaNet's normalized output on chip and feed the exact MQ rotation
 /// directly from LDS. Each pair of 128-value heads forms one 256-value MQ
 /// group without changing either operation's arithmetic order. The 32-head
-/// A3B route remains isolated from the gfx1100-only 48-head Qwen3.6-27B route;
-/// the latter measured +0.45% over a 512-token A/B/B/A and removes 48
-/// dispatches/token. Set `HIPFIRE_GATED_NORM_MQ_ROTATE=0` to restore both
-/// explicit operations.
+/// A3B route remains isolated from the 48-head Qwen3.6-27B route (gfx1100 and
+/// exact gfx1201, each with its own k6144 entry symbol); on gfx1100 the latter
+/// measured +0.45% over a 512-token A/B/B/A and removes 48 dispatches/token.
+/// Set `HIPFIRE_GATED_NORM_MQ_ROTATE=0` to restore both explicit operations.
 fn gated_norm_mq_rotate_enabled(
     gpu: &Gpu,
     config: &Qwen35Config,
@@ -7128,7 +7130,8 @@ fn gated_norm_mq_rotate_enabled(
         || gfx1201_state_fusions_enabled(gpu))
         && config.dim == 2_048
         && n_v_heads == 32)
-        || (gpu.arch_caps.is_gfx1100() && super::config::qwen36_27b_dense_shape(config, n_v_heads));
+        || ((gpu.arch_caps.is_gfx1100() || gfx1201_state_fusions_enabled(gpu))
+            && super::config::qwen36_27b_dense_shape(config, n_v_heads));
     enabled
         && admitted_arch_shape
         && config.linear_value_head_dim == 128
@@ -7141,9 +7144,10 @@ fn gated_norm_mq_rotate_enabled(
 
 /// Collapse full-attention Q/gate deinterleave, Q/K RMS normalization, and
 /// partial half-split RoPE into one head-local launch on the certified gfx1100
-/// shapes. The Qwen3.6-27B q24k4 route measured +0.64% over a 512-token
-/// A/B/B/A and reduced 757 -> 709 dispatches/token. Set
-/// `HIPFIRE_QWEN35_FA_PREP_FUSE=0` to retain the legacy path.
+/// shapes (and their exact-gfx1201 twins). The Qwen3.6-27B q24k4 route
+/// measured +0.64% over a 512-token A/B/B/A on gfx1100 and reduced 757 -> 709
+/// dispatches/token. Set `HIPFIRE_QWEN35_FA_PREP_FUSE=0` to retain the legacy
+/// path.
 /// The legacy interleaved-RoPE compatibility mode and diagnostic tap retain
 /// the established multi-dispatch path.
 fn qwen35_fa_prep_enabled(gpu: &Gpu, config: &Qwen35Config) -> bool {
@@ -7160,7 +7164,7 @@ fn qwen35_fa_prep_enabled(gpu: &Gpu, config: &Qwen35Config) -> bool {
         && config.n_heads == 16
         && config.n_kv_heads == 2)
         || (gfx1201_state_fusions_enabled(gpu) && gfx1201_qwen35_a3b_state_fusion_shape(config))
-        || (gpu.arch_caps.is_gfx1100()
+        || ((gpu.arch_caps.is_gfx1100() || gfx1201_state_fusions_enabled(gpu))
             && super::config::qwen36_27b_dense_shape(config, config.linear_num_value_heads)
             && config.n_heads == 24
             && config.n_kv_heads == 4);

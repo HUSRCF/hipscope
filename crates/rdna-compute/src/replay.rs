@@ -1197,7 +1197,8 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         "gated_norm_mq_rotate_gfx1100"
         | "gated_norm_mq_rotate_k6144_gfx1100"
         | "gated_norm_mq_rotate_gfx1151"
-        | "gated_norm_mq_rotate_gfx1201" => Some(vec![
+        | "gated_norm_mq_rotate_gfx1201"
+        | "gated_norm_mq_rotate_k6144_gfx1201" => Some(vec![
             read(0),
             read(8),
             read(16),
@@ -1205,10 +1206,21 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             read(32),
             write(40),
         ]),
+        // AWQ twin: x, z, weight, awq_scale, signs1, signs2, x_rot.
+        "gated_norm_mq_rotate_awq_k6144_gfx1201" => Some(vec![
+            read(0),
+            read(8),
+            read(16),
+            read(24),
+            read(32),
+            read(40),
+            write(48),
+        ]),
         "qwen35_fa_prep_gfx1100"
         | "qwen36_27b_fa_prep_gfx1100"
         | "qwen35_fa_prep_gfx1151"
-        | "qwen35_fa_prep_gfx1201" => Some(vec![
+        | "qwen35_fa_prep_gfx1201"
+        | "qwen36_27b_fa_prep_gfx1201" => Some(vec![
             read(0),
             write(8),
             write(16),
@@ -1725,10 +1737,12 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "gated_norm_mq_rotate_k6144_gfx1100"
         | "gated_norm_mq_rotate_gfx1151"
         | "gated_norm_mq_rotate_gfx1201"
+        | "gated_norm_mq_rotate_k6144_gfx1201"
         | "qwen35_fa_prep_gfx1100"
         | "qwen36_27b_fa_prep_gfx1100"
         | "qwen35_fa_prep_gfx1151"
         | "qwen35_fa_prep_gfx1201"
+        | "qwen36_27b_fa_prep_gfx1201"
         | "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1100"
         | "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1151"
         | "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1201"
@@ -1740,6 +1754,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         "gemv_hfq4g256_moe_down_k8_indexed_last_combine" => Some(64),
         "attention_flash_q8_0_tile"
         | "attention_flash_fp8_e4m3_tile_gqa_gfx1201"
+        | "gated_norm_mq_rotate_awq_k6144_gfx1201"
         | "fused_qkv_hfq4g256"
         | "fused_qkv_mq4g256v2"
         | "fused_qkv_mq4g256v2_k2048_x_buffer_gfx1100"
@@ -6830,10 +6845,13 @@ mod tests {
         "gated_norm_mq_rotate_k6144_gfx1100",
         "gated_norm_mq_rotate_gfx1151",
         "gated_norm_mq_rotate_gfx1201",
+        "gated_norm_mq_rotate_k6144_gfx1201",
+        "gated_norm_mq_rotate_awq_k6144_gfx1201",
         "qwen35_fa_prep_gfx1100",
         "qwen36_27b_fa_prep_gfx1100",
         "qwen35_fa_prep_gfx1151",
         "qwen35_fa_prep_gfx1201",
+        "qwen36_27b_fa_prep_gfx1201",
         "mq_rotate_x",
         "gemv_hfq4g256_residual",
         "gemv_hfq4g256_residual_cpol_rt",
@@ -7536,6 +7554,57 @@ mod tests {
                 (8, RecordedAccessMode::Write),
                 (24, RecordedAccessMode::Read),
             ]
+        );
+    }
+
+    #[test]
+    fn gfx1201_qwen36_27b_decode_fusions_keep_padded_replay_contract() {
+        use RecordedAccessMode::{Read, Write};
+        // Gated norm/MQ rotation launcher: x, z, weight, [awq_scale], signs1,
+        // signs2, x_rot, then n_heads, head_dim, eps.
+        for (kernel, awq) in [
+            ("gated_norm_mq_rotate_k6144_gfx1201", false),
+            ("gated_norm_mq_rotate_awq_k6144_gfx1201", true),
+        ] {
+            let pointers = if awq { 7 } else { 6 };
+            let mut blob = hip_bridge::KernargBlob::new();
+            for _ in 0..pointers {
+                blob.push_ptr(std::ptr::null());
+            }
+            blob.push_i32(0);
+            blob.push_i32(0);
+            blob.push_f32(0.0);
+            blob.pad_to(16);
+            assert_eq!(expected_kernarg_bytes(kernel), Some(blob.len()), "{kernel}");
+            let modes: Vec<_> = pointer_effects(kernel)
+                .expect("gated norm/MQ rotation contract")
+                .iter()
+                .map(|e| (e.offset, e.mode))
+                .collect();
+            let mut expected: Vec<_> = (0..pointers - 1).map(|i| (i * 8, Read)).collect();
+            expected.push(((pointers - 1) * 8, Write));
+            assert_eq!(modes, expected, "{kernel}");
+        }
+
+        // FA prep launcher: q_interleaved, q, gate, k, q_weight, k_weight,
+        // pos, then eps and freq_base.
+        let prep = "qwen36_27b_fa_prep_gfx1201";
+        let mut blob = hip_bridge::KernargBlob::new();
+        for _ in 0..7 {
+            blob.push_ptr(std::ptr::null());
+        }
+        blob.push_f32(0.0);
+        blob.push_f32(0.0);
+        blob.pad_to(16);
+        assert_eq!(expected_kernarg_bytes(prep), Some(blob.len()));
+        let modes: Vec<_> = pointer_effects(prep)
+            .expect("FA prep contract")
+            .iter()
+            .map(|e| (e.offset, e.mode))
+            .collect();
+        assert_eq!(
+            modes,
+            vec![(0, Read), (8, Write), (16, Write), (24, Write), (32, Read), (40, Read), (48, Read)]
         );
     }
 

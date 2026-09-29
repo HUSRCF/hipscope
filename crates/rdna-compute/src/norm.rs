@@ -1122,17 +1122,24 @@ impl Gpu {
             ));
         }
         let (module, src, kernel) = if n_heads == 24 {
-            if !self.arch_caps.is_gfx1100() {
+            if self.arch_caps.is_gfx1100() {
+                (
+                    "qwen36_27b_fa_prep_gfx1100",
+                    kernels::qwen36_27b_fa_prep_gfx1100_src(),
+                    "qwen36_27b_fa_prep_gfx1100",
+                )
+            } else if self.arch_caps.is_gfx1201() {
+                (
+                    "qwen36_27b_fa_prep_gfx1201",
+                    kernels::qwen36_27b_fa_prep_gfx1201_src(),
+                    "qwen36_27b_fa_prep_gfx1201",
+                )
+            } else {
                 return Err(hip_bridge::HipError::new(
                     1,
-                    "24Q/4K fused FA prep is certified only on gfx1100",
+                    "24Q/4K fused FA prep is certified only on gfx1100 and gfx1201",
                 ));
             }
-            (
-                "qwen36_27b_fa_prep_gfx1100",
-                kernels::qwen36_27b_fa_prep_gfx1100_src(),
-                "qwen36_27b_fa_prep_gfx1100",
-            )
         } else if self.arch_caps.is_gfx1201() {
             (
                 "qwen35_fa_prep_gfx1201",
