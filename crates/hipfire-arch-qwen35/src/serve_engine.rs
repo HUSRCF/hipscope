@@ -391,6 +391,64 @@ struct ModelRig {
     checkpoint_pool: Option<crate::checkpoint::QwenCheckpointPool<DeltaNetSnapshot>>,
 }
 
+impl ModelRig {
+    /// One batched forward step across the N slots (spec §5.2). Wraps
+    /// `forward_slots::forward_batch_slots_graphed_opts` with every model
+    /// field drawn from `self`; the capture is built internally from
+    /// `any_verify`/`any_dflash_rows` so the engine loop never names model
+    /// buffers. `gpu`/`pool`/`graph`/`batch`/`lm_head_skip` are the
+    /// family-neutral engine pieces passed in by the caller.
+    fn forward_step(
+        &mut self,
+        gpu: &mut Gpu,
+        batch: &SlotBatch,
+        pool: &mut SlotPool,
+        graph: &mut SlotDecodeGraph,
+        lm_head_skip: &[bool],
+        any_verify: bool,
+        any_dflash_rows: bool,
+    ) -> rdna_compute::HipResult<()> {
+        let mut capture = (any_verify || any_dflash_rows).then(|| {
+            let tape = self
+                .spec_verify_tape
+                .as_mut()
+                .expect("spec drafts require the verify tape");
+            crate::forward_slots::SpecVerifyCapture {
+                tape,
+                verify_slots: lm_head_skip,
+                stride: self.spec_rows,
+                hidden: if any_dflash_rows {
+                    self.dflash
+                        .as_ref()
+                        .map(|d| d.hidden_capture(self.config.dim))
+                } else {
+                    None
+                },
+            }
+        });
+        crate::forward_slots::forward_batch_slots_graphed_opts(
+            gpu,
+            &self.weights,
+            &self.config,
+            batch,
+            pool,
+            &mut self.dn_states,
+            &self.k_arenas,
+            &self.v_arenas,
+            &mut self.desc_staging,
+            &self.kv_tier,
+            &self.pbs,
+            &self.scratch,
+            &self.logits_out,
+            graph,
+            self.spec_rows,
+            lm_head_skip,
+            capture.as_mut(),
+        )
+    }
+}
+
+
 struct Rig {
     gpu: Gpu,
     tokenizer: hipfire_runtime::tokenizer::Tokenizer,
@@ -4251,45 +4309,15 @@ fn run_loop(
                 work[s].spec == SpecKind::Dflash
                     && batch.m_per_slot.get(s).copied().unwrap_or(0) > 0
             });
-            let fwd = (|| {
-                let mut capture = (any_verify || any_dflash_rows).then(|| {
-                    let tape = rig.model
-                        .spec_verify_tape
-                        .as_mut()
-                        .expect("spec drafts require the verify tape");
-                    crate::forward_slots::SpecVerifyCapture {
-                        tape,
-                        verify_slots: &lm_head_skip,
-                        stride: rig.model.spec_rows,
-                        hidden: if any_dflash_rows {
-                            rig.model.dflash
-                                .as_ref()
-                                .map(|d| d.hidden_capture(rig.model.config.dim))
-                        } else {
-                            None
-                        },
-                    }
-                });
-                forward_batch_slots_graphed_opts(
-                    &mut rig.gpu,
-                    &rig.model.weights,
-                    &rig.model.config,
-                    &batch,
-                    &mut rig.pool,
-                    &mut rig.model.dn_states,
-                    &rig.model.k_arenas,
-                    &rig.model.v_arenas,
-                    &mut rig.model.desc_staging,
-                    &rig.model.kv_tier,
-                    &rig.model.pbs,
-                    &rig.model.scratch,
-                    &rig.model.logits_out,
-                    &mut graph,
-                    rig.model.spec_rows,
-                    &lm_head_skip,
-                    capture.as_mut(),
-                )
-            })();
+            let fwd = rig.model.forward_step(
+                &mut rig.gpu,
+                &batch,
+                &mut rig.pool,
+                &mut graph,
+                &lm_head_skip,
+                any_verify,
+                any_dflash_rows,
+            );
             // ── Publication (spec §4.6 C6) ──────────────────────────────────
             // After a SUCCESSFUL prefill chunk, publish sealed full pages at
             // committed page-aligned boundaries. Only when prefix_cache is on.
