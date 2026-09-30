@@ -9674,7 +9674,7 @@ fn batch_chunk_fa_attend(
             && stride == WIDENED_COMMIT_ROWS
             && (64..=8192).contains(&n)
             && (n <= WIDENED_COMMIT_ROWS || n % WIDENED_COMMIT_ROWS == 0)
-            && (64..=32768).contains(&max_ctx_len)
+            && gpu.fa2_gfx11_ctx_admitted(max_ctx_len)
             && start_pos.checked_add(n) == Some(max_ctx_len)
             && max_ctx_len <= kv_cache.physical_cap
             && tree_verify.is_none();
@@ -12426,7 +12426,7 @@ fn fa_pair_env_admitted(
         return false;
     }
     // Same window the second half would see through ingress/dispatch.
-    if !(64..=32768).contains(&max_ctx_end) {
+    if !gpu.fa2_gfx11_ctx_admitted(max_ctx_end) {
         return false;
     }
     if !gpu.flags.gfx11_fa2_prefill {
