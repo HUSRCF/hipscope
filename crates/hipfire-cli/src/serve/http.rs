@@ -595,10 +595,15 @@ async fn serve_connection(
         }
     };
     if let Err(err) = result {
-        // Resets, clients gone mid-request and idle connections reaped by
-        // the header timeout are normal; stay quiet for those.
+        // Normal closes stay quiet: resets, idle connections reaped by the
+        // header timeout, and a client closing while its response is still
+        // open (IncompleteMessage). The last one is every streaming client
+        // that stops reading at `data: [DONE]`: the chunked terminator is
+        // written only after the daemon commit succeeds, so the body can
+        // still fail if the commit does. A close before `[DONE]` is a client
+        // cancel, which the body's drop already aborts.
         let msg = err.to_string();
-        if !err.is_timeout() && !msg.contains("incomplete") && !msg.contains("reset") {
+        if !err.is_timeout() && !err.is_incomplete_message() && !msg.contains("reset") {
             eprintln!("[hipfire] connection error: {err:#}");
         }
     }

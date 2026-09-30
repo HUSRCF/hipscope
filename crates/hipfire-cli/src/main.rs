@@ -13853,4 +13853,122 @@ mod tests {
             "{response}"
         );
     }
+
+    /// One HTTP/1.1 response from a kept-alive connection: status and body,
+    /// de-chunked or by Content-Length. Fails if the response does not end.
+    #[cfg(unix)]
+    fn read_keepalive_response(
+        reader: &mut std::io::BufReader<std::net::TcpStream>,
+    ) -> (u16, Vec<u8>) {
+        use std::io::BufRead;
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("status line");
+        let status = line
+            .split_whitespace()
+            .nth(1)
+            .expect("status")
+            .parse()
+            .unwrap();
+        let (mut length, mut chunked) = (None, false);
+        loop {
+            line.clear();
+            reader.read_line(&mut line).expect("header");
+            let header = line.trim().to_ascii_lowercase();
+            if header.is_empty() {
+                break;
+            }
+            if let Some(value) = header.strip_prefix("content-length:") {
+                length = Some(value.trim().parse::<usize>().unwrap());
+            }
+            chunked |= header == "transfer-encoding: chunked";
+        }
+        let mut body = Vec::new();
+        if !chunked {
+            body.resize(length.expect("content-length"), 0);
+            reader.read_exact(&mut body).expect("body");
+            return (status, body);
+        }
+        loop {
+            line.clear();
+            reader
+                .read_line(&mut line)
+                .expect("chunk size (response never ended)");
+            let size = usize::from_str_radix(line.trim(), 16).expect("chunk size hex");
+            let mut chunk = vec![0; size + 2];
+            reader.read_exact(&mut chunk).expect("chunk");
+            if size == 0 {
+                return (status, body);
+            }
+            body.extend_from_slice(&chunk[..size]);
+        }
+    }
+
+    /// A client that keeps its connection gets complete, prompt responses to
+    /// a stream, then a non-stream, then a stream request on it; and a client
+    /// that closes as soon as it reads `[DONE]` does not hold the server up.
+    #[cfg(unix)]
+    #[test]
+    fn keepalive_connection_serves_stream_and_nonstream_in_turn() {
+        let harness = Task11HttpHarness::spawn("keepalive-reuse");
+        let port = harness.port();
+        let stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut writer = stream.try_clone().unwrap();
+        let mut reader = std::io::BufReader::new(stream);
+        for is_stream in [true, false, true] {
+            let payload = harness.base_body("t11-stop-text", is_stream).to_string();
+            write!(
+                writer,
+                "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+                 Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
+                payload.len()
+            )
+            .unwrap();
+            let started = Instant::now();
+            let (status, body) = read_keepalive_response(&mut reader);
+            assert_eq!(status, 200, "stream={is_stream}");
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "stream={is_stream} took {:?}",
+                started.elapsed()
+            );
+            if is_stream {
+                let payloads = sse_payloads(&body);
+                assert_eq!(payloads.last().map(String::as_str), Some("[DONE]"));
+                assert!(payloads
+                    .iter()
+                    .any(|p| p.contains("hello from fake daemon")));
+            } else {
+                let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(value["choices"][0]["finish_reason"], "stop");
+            }
+        }
+
+        // Close as soon as `[DONE]` arrives, like serve_harness and most SSE
+        // readers, before the chunked terminator.
+        let mut early = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        early
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let payload = harness.base_body("t11-stop-text", true).to_string();
+        write!(
+            early,
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
+            payload.len()
+        )
+        .unwrap();
+        let mut seen = Vec::new();
+        let mut buf = [0u8; 4096];
+        while !String::from_utf8_lossy(&seen).contains("data: [DONE]") {
+            let n = early.read(&mut buf).expect("read until [DONE]");
+            assert!(n > 0, "closed before [DONE]");
+            seen.extend_from_slice(&buf[..n]);
+        }
+        drop(early);
+        let (status, _, _) = raw_chat_post(port, &harness.base_body("t11-stop-text", false));
+        assert_eq!(status, 200);
+    }
 }
