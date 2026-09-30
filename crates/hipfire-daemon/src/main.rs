@@ -1773,6 +1773,17 @@ fn main() {
                     .and_then(|v| v.as_u64())
                     .map(|value| value as usize)
                     .unwrap_or(hipfire_runtime::config::get().mtp_k);
+                // Qwen MTP head sidecar resolved by the CLI (models dir, then
+                // beside the path as typed, then beside the canonical trunk).
+                // The load path is canonical, so without this a sidecar beside
+                // a symlinked trunk is not found. Absent → the loader looks for
+                // `<trunk>.mtp`. `mtp_mode=off` never carries one.
+                let mtp_path: Option<std::path::PathBuf> = msg
+                    .get("params")
+                    .and_then(|p| p.get("mtp"))
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty() && mtp_mode != "off")
+                    .map(std::path::PathBuf::from);
 
                 // Model-free n-gram policy normally arrives as per-load params
                 // resolved by the CLI. Direct protocol clients inherit the
@@ -2270,6 +2281,7 @@ fn main() {
                         draft_path.as_deref(),
                         gemma4_drafter.as_deref(),
                         gemma4_draft_len,
+                        mtp_path.as_deref(),
                         kv_mode_override.as_deref(),
                         kv_k_override.as_deref(),
                         kv_v_override.as_deref(),
