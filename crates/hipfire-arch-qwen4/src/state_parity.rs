@@ -1109,6 +1109,7 @@ fn profile_elapsed_between_ns(started: Instant, ended: Instant) -> u64 {
 fn profile_source_residency(residency: WeightResidency) -> Value {
     match residency {
         WeightResidency::Resident => json!("resident"),
+        WeightResidency::HostMapped => json!("host_mapped"),
         WeightResidency::ExternalRows {
             row_bytes,
             valid_rows,

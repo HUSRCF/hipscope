@@ -383,12 +383,55 @@ impl Carrier for Qwen4Carrier {
         let receipt =
             hipfire_arch_qwen4::admit_hfqm_artifact(&hfq).map_err(|error| error.to_string())?;
         let config = receipt.config;
-        let manifest = receipt.manifest;
+        let mut manifest = receipt.manifest;
         let metadata = receipt.ple;
         let placements = receipt.placements;
         let use_ranges = ctx.gpu.is_uma();
         if use_ranges {
             hfq.drop_mmap();
+        }
+        if let Some(policy) = hipfire_arch_qwen4::expert_residency::expert_vram_layers_from_env()
+            .map_err(|error| format!("qwen4: {error}"))?
+        {
+            use hipfire_arch_qwen4::expert_residency as residency;
+            if use_ranges {
+                return Err(format!(
+                    "qwen4: {} places experts in host RAM, which only a discrete GPU needs",
+                    residency::EXPERT_VRAM_LAYERS_ENV
+                ));
+            }
+            let bytes_of = |entry: &hipfire_runtime::weight_manifest::WeightEntry| {
+                hfq.tensor_data(&entry.name).map(|(_, bytes)| bytes.len() as u64)
+            };
+            let vram_layers = match policy {
+                residency::ExpertVramLayers::Layers(layers) => layers,
+                residency::ExpertVramLayers::Auto => {
+                    let (free, _) = ctx
+                        .gpu
+                        .hip
+                        .get_vram_info()
+                        .map_err(|error| format!("qwen4: VRAM query: {error}"))?;
+                    let (non_expert, layer_experts) =
+                        residency::resident_split(&manifest.weights, bytes_of)
+                            .map_err(|error| format!("qwen4: {error}"))?;
+                    residency::auto_vram_layers(
+                        free as u64,
+                        non_expert,
+                        layer_experts,
+                        config.num_hidden_layers,
+                    )
+                }
+            };
+            let moved = residency::place_routed_experts(&mut manifest.weights, vram_layers);
+            let host_bytes = residency::host_mapped_bytes(&manifest.weights, bytes_of)
+                .map_err(|error| format!("qwen4: {error}"))?;
+            residency::check_host_ram(host_bytes, rdna_compute::kv_slots::mem_available_bytes())
+                .map_err(|error| format!("qwen4: {error}"))?;
+            eprintln!(
+                "  qwen4 routed experts: layers 0..{} in VRAM, {moved} expert tensors ({:.1} GiB) in pinned host RAM",
+                vram_layers.min(config.num_hidden_layers),
+                host_bytes as f64 / (1u64 << 30) as f64
+            );
         }
         let mesh = DeviceMesh::single().map_err(|error| format!("qwen4: mesh: {error}"))?;
         let expected = WeightOrigin::for_single(&mesh, ctx.gpu);

@@ -4189,6 +4189,26 @@ impl Gpu {
         }
     }
 
+    /// Upload raw bytes into a **host-mapped** tensor: pinned system RAM the
+    /// kernels read directly over PCIe (zero-copy), charged to no device heap.
+    ///
+    /// Same allocation as [`Self::upload_raw_host`]
+    /// ([`Self::alloc_host_mapped_tensor`], padded by [`HOST_TAIL_PAD_BYTES`]),
+    /// but the bytes are copied on the CPU through the host pointer and the pad
+    /// is zeroed. Qwen4 host-mapped routed experts load through this path.
+    pub fn upload_raw_host_mapped(&mut self, data: &[u8], shape: &[usize]) -> HipResult<GpuTensor> {
+        let tensor = self.alloc_host_mapped_tensor(data.len(), shape, DType::Raw)?;
+        let host_ptr = self.host_mapped[&(tensor.buf.as_ptr() as usize)] as *mut u8;
+        // SAFETY: `alloc_host_mapped_tensor` registered `host_ptr` as a live
+        // allocation of `data.len() + HOST_TAIL_PAD_BYTES` bytes that nothing
+        // else references yet.
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), host_ptr, data.len());
+            std::ptr::write_bytes(host_ptr.add(data.len()), 0, HOST_TAIL_PAD_BYTES);
+        }
+        Ok(tensor)
+    }
+
     /// Allocate a pool tensor then run `init`. On init failure the owner is
     /// returned to the pool and the original error is preserved — constructors
     /// that allocate then memset/htod must not strand the buffer when init fails

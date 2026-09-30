@@ -14,6 +14,7 @@ pub mod admission;
 pub mod artifact;
 pub mod bundle;
 pub mod config;
+pub mod expert_residency;
 pub mod gpu_forward;
 pub mod mtp_gpu;
 pub mod mtp_spec;
