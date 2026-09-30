@@ -131,12 +131,16 @@ runs the same download and checks on an existing install, for example to
 restore kernels on a machine without hipcc.
 
 Maintainers: the tag-triggered `release-kernel-packs` workflow
-(`.github/workflows/release.yml`) builds every arch in a ROCm dev container and
-attaches the assets to the release. Repository variables choose the image
-(`HIPFIRE_ROCM_IMAGE`, default the Containerfile's `rocm/dev-ubuntu-24.04`) and,
-optionally, a wider admitted range (`HIPFIRE_PACK_ROCM_MIN` and
-`HIPFIRE_PACK_ROCM_MAX_EXCLUSIVE`, set both). To publish from a local toolchain
-instead:
+(`.github/workflows/release.yml`) builds every arch in a ROCm dev image and
+attaches the assets to the release. The default image,
+`rocm/dev-ubuntu-26.04:10.0.0-full`, carries the same ROCm 10.0.0 packages
+(HIP 7.15.26333) as the project's GPU hosts, so its packs admit ROCm
+[10.0, 11.0) and install on hosts with that hipcc. A pack only installs where
+the local hipcc, if any, is the build that compiled it; hosts on another ROCm
+compile locally. Repository variables choose another image
+(`HIPFIRE_ROCM_IMAGE`) and, optionally, a wider admitted range
+(`HIPFIRE_PACK_ROCM_MIN` and `HIPFIRE_PACK_ROCM_MAX_EXCLUSIVE`, set both). To
+publish from a local toolchain instead:
 
 ```bash
 scripts/build-kernel-pack.sh --tag v0.4.0 --out dist            # every admitted arch

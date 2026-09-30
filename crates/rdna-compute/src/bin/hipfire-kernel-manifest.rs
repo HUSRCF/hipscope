@@ -51,8 +51,11 @@ fn run() -> Result<(), String> {
     // Same derivation as hipfire-kernel-registry and Gpu::init.
     let extra_flags = extra_flags
         .unwrap_or_else(|| rdna_compute::FeatureFlags::from_active_config(&arch).hipcc_extra_flags);
+    // Same fallback as hipfire-rocm-resolve and `hipfire setup`: a TheRock
+    // `/opt/rocm` holds no `.info/version`; its versioned `core-X.Y` root does.
     let rocm_version = hipfire_config::rocm::version_for_root(&rocm_root)
-        .ok_or_else(|| format!("{}: no .info/version", rocm_root.display()))?;
+        .or_else(hipfire_config::rocm::version)
+        .ok_or_else(|| format!("{}: no ROCm version (.info/version)", rocm_root.display()))?;
     let (default_min, default_max) = kernel_pack::default_rocm_range(&rocm_version)
         .ok_or_else(|| format!("unparseable ROCm version {rocm_version}"))?;
     let rocm_min = rocm_min.unwrap_or(default_min);
