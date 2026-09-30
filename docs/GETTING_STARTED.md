@@ -9,9 +9,9 @@ Audience: first install on an AMD GPU host. Goal: install → verify → pull a 
   use the tag's prebuilt [kernel pack](#prebuilt-kernel-packs) for the kernel
   registry, and installs with only the HIP runtime (`lib/libamdhip64.so`,
   `libhsa-runtime64.so`) and `bin/rocm_agent_enumerator`. Kernels outside the
-  registry still JIT on first use — today that includes Qwen3.8 H2 prefill,
-  MTP and DFlash modules on gfx1201 and most H2 modules on gfx1100/gfx1151 —
-  so running models still needs hipcc. The selected
+  registry still JIT on first use. On gfx1201 the registry covers Qwen3.8 H2
+  AR, MTP and DFlash `hipfire run` without a device compiler; other models and
+  routes can still JIT, so running models generally needs hipcc. The selected
   ROCm root should therefore also provide `include/hip/hip_runtime.h` and
   `bin/hipcc`. Install a supported AMD ROCm HIP runtime, development headers, and device
   compiler via
