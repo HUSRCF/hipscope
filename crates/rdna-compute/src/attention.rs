@@ -4362,14 +4362,14 @@ impl Gpu {
     /// `max_ctx_len`. The former 32768 ceiling sent every longer prefill to
     /// the tiled partials+reduce kernel (R9700 H2 at 65K: 299.3 s vs 56.8 s).
     ///
-    /// hipGraph capture: at or below 32K a captured call keeps the query16
-    /// incumbent (unchanged envelope). Above 32K the only alternative is that
-    /// same tiled kernel, so a captured call takes FA2 whenever the launcher
-    /// can run without allocating ([`Self::gfx12_q8_fa2_capture_ready`]). The
-    /// launcher was never capture-unsafe: Q is pre-converted into Gpu-owned
-    /// scratch and never mutated (F4b), and both launches go through
-    /// `launch_maybe_blob` with owned kernarg blobs. The old eager-only gate
-    /// dates from the research opt-in, before F4b.
+    /// hipGraph capture: a captured call takes FA2 whenever the launcher can
+    /// run without allocating ([`Self::gfx12_q8_fa2_capture_ready`]), at every
+    /// context, so a warmed capture replays the eager call's bytes. A cold
+    /// capture keeps the incumbent (query16 at or below 32K, the tiled
+    /// partials+reduce kernel above). The launcher was never capture-unsafe:
+    /// Q is pre-converted into Gpu-owned scratch and never mutated (F4b), and
+    /// both launches go through `launch_maybe_blob` with owned kernarg blobs.
+    /// The old eager-only gate dates from the research opt-in, before F4b.
     pub fn gfx12_q8_fa2_prefill_admitted(
         &self,
         n_heads: usize,
@@ -4381,9 +4381,7 @@ impl Gpu {
         self.flags.gfx12_fa2_prefill
             && self.arch == "gfx1201"
             && !self.replay.is_recording()
-            && (!self.graphs.capture_mode
-                || (max_ctx_len > GFX12_QUERY16_MAX_CTX
-                    && self.gfx12_q8_fa2_capture_ready(batch_size)))
+            && (!self.graphs.capture_mode || self.gfx12_q8_fa2_capture_ready(batch_size))
             && n_heads == 24
             && n_kv_heads == 4
             && head_dim == 256
@@ -4402,7 +4400,7 @@ impl Gpu {
     /// hipGraph capture: its module is already loaded (no JIT) and its f16 Q
     /// scratch already holds `batch_size` H24/D256 rows (no growth, which
     /// would synchronize, free and malloc mid-capture). A cold capture keeps
-    /// the tiled route instead of failing the capture.
+    /// the incumbent route instead of failing the capture.
     fn gfx12_q8_fa2_capture_ready(&self, batch_size: usize) -> bool {
         self.functions.contains_key("attention_q8_0_fa2_gqa_gfx1201")
             && self.functions.contains_key("attention_fa2_q_preconvert_gfx1201")
@@ -4479,7 +4477,7 @@ impl Gpu {
         // (`gfx12_q8_fa2_prefill_admitted`); everything else falls through to
         // the byte-identical incumbent path below. Never inside `_wmma_slots`
         // (its all-or-none slot ABI is unchanged) and never under replay
-        // recording; under graph capture only above 32K, once warmed.
+        // recording; under graph capture once warmed.
         // Opt out with `HIPFIRE_GFX12_FA2_PREFILL=0`.
         if self.gfx12_q8_fa2_prefill_admitted(
             n_heads,
