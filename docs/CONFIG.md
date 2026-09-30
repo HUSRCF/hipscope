@@ -568,7 +568,7 @@ runtime PFlash module — not restated here.
 | `serve.local` | `false` | Force the current command to use a locally spawned daemon. |
 | `max_request_bytes` | `67108864` (64 MiB) | int 4096–4GiB |
 | `serve_max_queue` | `64` | int 0–100000 (`0` = uncapped depth) |
-| `serve_queue_timeout_ms` | `30000` | int 0–3600000 (`0` = no wait timeout) |
+| `serve_queue_timeout_ms` | `600000` (10 min) | int 0–3600000 (`0` = no wait timeout). Serve runs one generation at a time by default, so this must cover a full generation. |
 | `experimental_budget_alert` | `false` | bool |
 | `serve.multi_slot` | `false` | Serve concurrent requests on the multi-slot engine instead of one at a time. |
 | `serve.multi_slot_slots` | `4` | int 1–64 concurrent slots. |

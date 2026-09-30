@@ -1106,7 +1106,7 @@ pub static FIELDS: &[ConfigField] = &[
         "serve_queue_timeout_ms",
         Serve,
         Process,
-        DefaultValue::Integer(30000),
+        DefaultValue::Integer(600000),
         ValueRule::Integer {
             min: 0,
             max: 3600000
@@ -1114,7 +1114,7 @@ pub static FIELDS: &[ConfigField] = &[
         false,
         false,
         Some("HIPFIRE_SERVE_QUEUE_TIMEOUT_MS"),
-        "Maximum admission-queue wait."
+        "Maximum admission-queue wait before a queued request gets 503. Serve runs one generation at a time by default, so this must cover one full generation; zero waits forever."
     ),
     process_bool_field!(
         "serve.retry_enabled",

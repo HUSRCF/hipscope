@@ -272,13 +272,7 @@ impl Admission {
             });
         }
         if self.max_queue != 0 && state.queued >= self.max_queue {
-            return Err(AdmissionError {
-                message: format!(
-                    "serve queue full (depth {}/{})",
-                    state.queued, self.max_queue
-                ),
-                retry_after_seconds: self.retry_after_seconds(),
-            });
+            return Err(self.queue_full_error(state.queued));
         }
         state.queued = state.queued.saturating_add(1);
         let started = Instant::now();
@@ -292,13 +286,7 @@ impl Admission {
                 let remaining = self.timeout.saturating_sub(started.elapsed());
                 if remaining.is_zero() {
                     state.queued = state.queued.saturating_sub(1);
-                    return Err(AdmissionError {
-                        message: format!(
-                            "serve queue wait exceeded {}ms",
-                            self.timeout.as_millis()
-                        ),
-                        retry_after_seconds: self.retry_after_seconds(),
-                    });
+                    return Err(self.wait_timeout_error());
                 }
                 let (next, wait) = self
                     .available
@@ -315,13 +303,7 @@ impl Admission {
                     };
                     if !can_acquire {
                         state.queued = state.queued.saturating_sub(1);
-                        return Err(AdmissionError {
-                            message: format!(
-                                "serve queue wait exceeded {}ms",
-                                self.timeout.as_millis()
-                            ),
-                            retry_after_seconds: self.retry_after_seconds(),
-                        });
+                        return Err(self.wait_timeout_error());
                     }
                 }
             }
@@ -361,13 +343,34 @@ impl Admission {
         state.eligible + usize::from(state.ineligible_busy) + state.queued
     }
 
+    /// `Retry-After` for a 503. The waiter has already spent the whole queue
+    /// timeout, and the running generation may end at any moment, so the hint
+    /// stays short instead of repeating that wait.
     pub(crate) fn retry_after_seconds(&self) -> u64 {
-        if self.timeout.is_zero() {
-            1
-        } else {
-            self.timeout.as_secs().max(1)
+        self.timeout.as_secs().clamp(1, 30)
+    }
+
+    fn queue_full_error(&self, queued: usize) -> AdmissionError {
+        AdmissionError {
+            message: format!(
+                "server busy: serve queue full (depth {queued}/{}); retry later",
+                self.max_queue
+            ),
+            retry_after_seconds: self.retry_after_seconds(),
         }
     }
+
+    fn wait_timeout_error(&self) -> AdmissionError {
+        AdmissionError {
+            message: format!(
+                "server busy: serve queue wait exceeded {}ms while another generation ran \
+                 (serve.queue_timeout_ms); retry later",
+                self.timeout.as_millis()
+            ),
+            retry_after_seconds: self.retry_after_seconds(),
+        }
+    }
+
     pub(crate) async fn acquire_async(
         self: &Arc<Self>,
         cancel: CancellationToken,
@@ -418,13 +421,7 @@ impl Admission {
                 });
             }
             if self.max_queue != 0 && state.queued >= self.max_queue {
-                return Err(AdmissionError {
-                    message: format!(
-                        "serve queue full (depth {}/{})",
-                        state.queued, self.max_queue
-                    ),
-                    retry_after_seconds: self.retry_after_seconds(),
-                });
+                return Err(self.queue_full_error(state.queued));
             }
             state.queued = state.queued.saturating_add(1);
         }
@@ -478,10 +475,7 @@ impl Admission {
 
             let remaining = self.timeout.saturating_sub(started.elapsed());
             if !self.timeout.is_zero() && remaining.is_zero() {
-                return Err(AdmissionError {
-                    message: format!("serve queue wait exceeded {}ms", self.timeout.as_millis()),
-                    retry_after_seconds: self.retry_after_seconds(),
-                });
+                return Err(self.wait_timeout_error());
             }
             if self.timeout.is_zero() {
                 tokio::select! {
@@ -1616,6 +1610,17 @@ mod tests {
         let timeout = admission.acquire().unwrap_err();
         assert!(timeout.message.contains("wait exceeded"));
         assert_eq!(admission.inflight(), 1);
+    }
+
+    #[test]
+    fn admission_retry_after_stays_short_for_long_queue_waits() {
+        let secs = |timeout| Admission::new(1, timeout).retry_after_seconds();
+        // The default 10-minute wait must not tell clients to back off 10 minutes.
+        assert_eq!(secs(Duration::from_secs(600)), 30);
+        assert_eq!(secs(Duration::from_secs(5)), 5);
+        // Unbounded wait (0) and sub-second waits still send a valid header.
+        assert_eq!(secs(Duration::ZERO), 1);
+        assert_eq!(secs(Duration::from_millis(5)), 1);
     }
 
     #[test]

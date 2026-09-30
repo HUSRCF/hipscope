@@ -12,7 +12,7 @@ configuration ([CONFIG.md](CONFIG.md)); the HTTP surface is implemented by
 | Pre-warm model | `serve.default_model = "qwen3.5:9b"` or a positional model arg |
 | Idle unload | `serve.idle_timeout_seconds = 300` (`0` = never) |
 | Max request body | `serve.max_request_bytes = 67108864` (64 MiB) |
-| Admission queue | `serve.max_queue = 64`, `serve.queue_timeout_ms = 30000` |
+| Admission queue | `serve.max_queue = 64`, `serve.queue_timeout_ms = 600000` (10 min) |
 | Pid / log | `~/.hipfire/serve.pid`, `~/.hipfire/serve.log` |
 
 Truth state: **shipped / ref-pinned** for the HTTP contract and lifecycle
@@ -83,8 +83,13 @@ Config and env owners for bind, idle, queue, and body limits:
 2. **Daemon.** Spawns the Rust `daemon` example over stdio JSON.
 3. **Pre-warm (default).** Loads the chosen model asynchronously. Failures log
    and leave the process serving; the model loads on the first real request.
-4. **HTTP.** The native server accepts traffic. Only one generation holds the
-   daemon lock at a time (bounded queue).
+4. **HTTP.** The native server accepts traffic. Serve is single-stream by
+   default: one generation holds the daemon at a time and later requests wait
+   in a bounded queue (`serve.max_queue`). Continuous batching covers only
+   thinking-off, single-turn Qwen requests (`serve.continuous_batch_size`). A
+   waiter that is still queued after `serve.queue_timeout_ms` (default 10
+   minutes, long enough for one full generation; `0` waits forever) gets
+   **503** "server busy" with `Retry-After`.
 5. **Idle eviction.** When `idle_timeout > 0`, an interval unloads the model
    after idle seconds **and** only when no generation is in flight and the
    serve lock is free. Next request reloads.
