@@ -4416,9 +4416,12 @@ mod ep_admission_tests {
         publications: usize,
     }
 
-    fn qwen35_moe_fixture() -> PathBuf {
+    /// `tag` must be unique per caller: tests run in one process, so a
+    /// pid-only filename is shared by parallel tests that write, read, and
+    /// unlink the same path — a flake, not a fixture.
+    fn qwen35_moe_fixture(tag: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
-            "hipfire-loader-qwen35-moe-admission-{}.hfq",
+            "hipfire-loader-qwen35-moe-admission-{tag}-{}.hfq",
             std::process::id()
         ));
         let metadata = serde_json::json!({
@@ -4494,7 +4497,7 @@ mod ep_admission_tests {
     /// equally before-teardown).
     #[test]
     fn qwen35_moe_ep_unsupported_degree_preserves_active_model() {
-        let candidate = qwen35_moe_fixture();
+        let candidate = qwen35_moe_fixture("ep-degree");
         let mut active = ActiveModel {
             identity: "qwen3.6:27b-a3b-active",
             response: b"active-model-response".to_vec(),
@@ -4513,7 +4516,7 @@ mod ep_admission_tests {
     }
     #[test]
     fn explicit_unsupported_vmm_preserves_active_model() {
-        let candidate = qwen35_moe_fixture();
+        let candidate = qwen35_moe_fixture("vmm-explicit");
         let mut active = ActiveModel {
             identity: "resident",
             response: b"still-serving".to_vec(),
@@ -4524,7 +4527,7 @@ mod ep_admission_tests {
             &candidate, 1, admission::KvBackendRequest::Explicit(hipfire_runtime::kv_backend::KvBackend::Vmm),
             "gfx1100", &mut active, &mut effects,
         ).unwrap_err();
-        assert!(refusal.contains("vmm") && refusal.contains("contiguous"));
+        assert!(refusal.contains("vmm") && refusal.contains("unsupported"));
         assert_eq!(effects, LoadEffects::default());
         assert_eq!(active.request(), before);
         let _ = std::fs::remove_file(candidate);
