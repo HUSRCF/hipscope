@@ -2240,6 +2240,28 @@ pub fn gemma4_pb_flash_partials_len_for_config(max_seq: usize, config: &Gemma4Co
     gemma4_pb_flash_partials_len(max_seq, config.n_heads, config.full_head_dim)
 }
 
+/// Single-query flash partial length that covers every decode attend tier the
+/// lowered path can run on `arch`: the asym3 hd512 tile ([`GEMMA4_FLASH_TILE`])
+/// and the Q8 decode tile (`q8_flash_tile_size`) for the full tier at `max_seq`
+/// and the sliding ring at `min(sliding_window, max_seq)`. The Q8 tile can be
+/// smaller than 128 (tile32 on gfx1100 up to 8K), which needs more partials.
+pub fn gemma4_decode_flash_partials_len(arch: &str, config: &Gemma4Config, max_seq: usize) -> usize {
+    let q8_len = |n_kv_heads: usize, head_dim: usize, cap: usize| {
+        let tile = rdna_compute::attention::q8_flash_tile_size(
+            arch,
+            config.n_heads,
+            n_kv_heads,
+            head_dim,
+            cap,
+        );
+        config.n_heads * cap.div_ceil(tile) * (2 + head_dim)
+    };
+    let sliding_cap = config.sliding_window.min(max_seq);
+    gemma4_flash_partials_len_for_config(max_seq, config)
+        .max(q8_len(config.full_n_kv_heads, config.full_head_dim, max_seq))
+        .max(q8_len(config.sliding_n_kv_heads, config.sliding_head_dim, sliding_cap))
+}
+
 /// Per-decode scratch, sized once at model-load time against the MAX of
 /// sliding and full attention dimensions so a single buffer works across
 /// layer types. 31B target shapes: sliding Q=[32*256]=8192, full Q=[32*512]=16384
@@ -2269,9 +2291,9 @@ pub struct Gemma4Scratch {
     pub sample_buf: GpuTensor, // [2] — (token_id, new_rng_state) for GPU sampling
     pub repeat_buf: GpuTensor, // [1024] — rolling window for repeat penalty
 
-    // Flash attention tile partials. Sized for the LARGER of the two
-    // cache shapes: full-attn uses head_dim=512, max_tiles=max_seq/128.
-    // Sliding uses head_dim=256, max_tiles=sliding_window/128 (much smaller).
+    // Flash attention tile partials. Sized by `gemma4_decode_flash_partials_len`
+    // for the LARGER of the cache shapes: full-attn head_dim=512 at the asym3
+    // tile (128) or the arch's Q8 decode tile, sliding head_dim=256 over the ring.
     pub flash_partials: GpuTensor,
 
     // No-scale v_norm ones buffer (full-attn layers compute v_norm without
@@ -2479,13 +2501,12 @@ impl Gemma4Scratch {
         let i_sample_buf = alloc!(&[2], DType::F32);
         let i_repeat_buf = alloc!(&[1024], DType::F32);
 
-        // Flash partials sizing. Per-head × max_tiles × (2 + head_dim) floats.
-        // Sized for FULL attn (head_dim=512 stride 514, vs sliding 256 stride 258);
-        // sliding-layer dispatches use part of the buffer, full-layer dispatches
-        // use all of it. `max_seq` is the single authority shared with both KV
-        // caches — no independent `HIPFIRE_KV_SEQ` env var.
-        let flash_partials_sz =
-            gemma4_flash_partials_len(max_seq, config.n_heads, config.full_head_dim);
+        // Flash partials sizing. Per-head × max_tiles × (2 + head_dim) floats,
+        // covering the full tier (head_dim=512, stride 514) in either KV format
+        // and the sliding q8 ring (256, stride 258) at this arch's Q8 decode
+        // tile. `max_seq` is the single authority shared with both KV caches —
+        // no independent `HIPFIRE_KV_SEQ` env var.
+        let flash_partials_sz = gemma4_decode_flash_partials_len(&gpu.arch, config, max_seq);
         let i_flash_partials = alloc!(&[flash_partials_sz], DType::F32);
 
         // (Note 2026-05-19): removed the precomputed sliding/full cos+sin
@@ -2799,6 +2820,38 @@ mod scratch_geometry_tests {
             gemma4_flash_partials_len(131071, 32, 512),
             gemma4_flash_partials_len(131072, 32, 512)
         );
+    }
+
+    #[test]
+    fn decode_partials_cover_q8_decode_tile() {
+        let cfg = dummy_cfg_31b();
+        // gfx1100 decodes Q8 with tile32 up to 8K: 4x the tile-128 partials.
+        assert_eq!(
+            gemma4_decode_flash_partials_len("gfx1100", &cfg, 8192),
+            32 * (8192 / 32) * 514
+        );
+        assert_eq!(
+            gemma4_decode_flash_partials_len("gfx1100", &cfg, 8192),
+            4 * gemma4_flash_partials_len_for_config(8192, &cfg)
+        );
+        // Tile128 arches keep the tile-128 geometry.
+        for arch in ["gfx1201", "gfx1151"] {
+            for max_seq in [128usize, 8192, 32768] {
+                assert_eq!(
+                    gemma4_decode_flash_partials_len(arch, &cfg, max_seq),
+                    gemma4_flash_partials_len_for_config(max_seq, &cfg)
+                );
+            }
+        }
+        // Past 8K gfx1100 is tile128 too.
+        assert_eq!(
+            gemma4_decode_flash_partials_len("gfx1100", &cfg, 32768),
+            gemma4_flash_partials_len_for_config(32768, &cfg)
+        );
+        // Small contexts: the sliding q8 ring (tile32) must fit as well.
+        let small = gemma4_decode_flash_partials_len("gfx1100", &cfg, 1000);
+        assert!(small >= 32 * 1000usize.div_ceil(32) * 258);
+        assert!(small >= 32 * 1000usize.div_ceil(32) * 514);
     }
 }
 #[cfg(test)]
@@ -6107,7 +6160,7 @@ fn forward_prefill_batch_v2(
                 // Batched full-layer attention (hd=512): all N tokens in ONE
                 // masked flash call instead of a per-token loop. Full layers are
                 // non-ring (cache_capacity=0) and non-windowed (window_size=0);
-                // the asym3 batched-masked kernel derives each query's causal
+                // the batched-masked kernel (q8 or legacy asym3) derives each query's causal
                 // bound from pb_positions, so this reproduces the per-token
                 // result with 1 launch/layer instead of N. (Sliding layers stay
                 // per-token until the q8 batched ring kernel lands — A.2.)

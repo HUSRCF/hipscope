@@ -677,7 +677,7 @@ impl hipfire_runtime::arch_model::ArchModel for Gemma4LoweredBundle {
         "gemma4"
     }
     fn kv_cache_mut(&mut self) -> Option<&mut hipfire_runtime::llama::KvCache> {
-        // Two caches (q8 sliding + asym3 full) and no basis for preferring
+        // Two caches (q8 sliding + q8/legacy-asym3 full) and no basis for preferring
         // one, so expose neither rather than silently picking.
         None
     }
@@ -775,7 +775,8 @@ pub struct Gemma4Bundle {
 /// Lowered / MoE Gemma 4 execution bundle (arch_id=13 26B-A4B + opt-in
 /// batched/WMMA dense prefill). Uses `lowered::{Gemma4Config, Gemma4Weights,
 /// Gemma4Scratch}` plus TWO `hipfire_runtime::llama::KvCache`s (q8
-/// ring-buffered sliding + asym3 full) and `eos_tok`. Mutually exclusive
+/// ring-buffered sliding + full tier from `kv_cache`: q8, or legacy asym3 on
+/// `legacy-asym3`) and `eos_tok`. Mutually exclusive
 /// with `Gemma4Bundle` (eager) via the `ModelState` enum — a given
 /// `LoadedModel` populates exactly one of the two variants.
 /// Chose second `ModelState` variant over enum-inside-bundle to keep
