@@ -26,6 +26,7 @@
 //   soak <secs>               back-to-back candidate launches (B16 32K fp8/q8),
 //                             every output compared with the reference.
 //   bench                     wall-clock per call, reference vs candidate.
+//   bench_rows                Q8 eager: multi-row R4/R8 vs VerifyAttn wall-clock.
 // Exit 0 = pass. Run: cargo run --release -p rdna-compute --example verify_attn_oracle -- oracle both
 
 use rdna_compute::attention::VerifyKv;
@@ -538,6 +539,48 @@ fn bench(gpu: &mut Gpu, kvs: &[VerifyKv]) {
     }
 }
 
+/// Q8 eager verify above 4K runs the multi-row R4/R8 kernel
+/// (`attention_flash_q8_0_rows_masked`) when admitted; compare it with
+/// VerifyAttn on the same eager shapes (not byte-compared: different arithmetic).
+fn bench_rows(gpu: &mut Gpu) {
+    for &b in &[4usize, 16] {
+        for &ctx in &[8192usize, 16384, 32768, 65536] {
+            let c = Case { kv: VerifyKv::Q8, b, ctx, capture: false, cap: ctx + 64, partial_rows: 16 };
+            let bf = Bufs::new(gpu, &c, 0xBE4C);
+            let mut ms = [0f64; 2];
+            for arm in 0..2 {
+                let go = |gpu: &mut Gpu| {
+                    if arm == 0 {
+                        assert!(gpu
+                            .attention_flash_q8_0_rows_masked(
+                                &bf.q, &bf.k, &bf.v, &bf.out, &bf.pos, NH, NKV, HD, c.max_ctx_len(), c.b, &bf.part,
+                            )
+                            .expect("rows launch"));
+                    } else {
+                        launch(gpu, &c, &bf, true);
+                    }
+                };
+                for _ in 0..3 {
+                    go(gpu);
+                }
+                gpu.hip.device_synchronize().expect("sync");
+                let iters = 20;
+                let t = Instant::now();
+                for _ in 0..iters {
+                    go(gpu);
+                }
+                gpu.hip.device_synchronize().expect("sync");
+                ms[arm] = t.elapsed().as_secs_f64() * 1e3 / iters as f64;
+            }
+            println!(
+                "BENCH_ROWS kv=q8 B={} ctx={} rows_r{}_ms={:.4} verify_attn_ms={:.4} speedup={:.2}",
+                b, ctx, if b >= 8 { 8 } else { 4 }, ms[0], ms[1], ms[0] / ms[1]
+            );
+            bf.free(gpu);
+        }
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mode = args.get(1).map(String::as_str).unwrap_or("oracle");
@@ -552,6 +595,10 @@ fn main() {
         "soak" => soak(&mut gpu, args.get(2).and_then(|s| s.parse().ok()).unwrap_or(60)),
         "bench" => {
             bench(&mut gpu, &parse_kvs(args.get(2).map(String::as_str)));
+            true
+        }
+        "bench_rows" => {
+            bench_rows(&mut gpu);
             true
         }
         m => panic!("unknown mode {m}"),

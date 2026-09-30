@@ -125,71 +125,26 @@ __device__ __forceinline__ void va_dequant(const VaSlice& s, float (&out)[8]) {
         va_dequant_fp8(s.lo, s.hi, va_f16(s.sc), out);
 }
 
-template <int KV>
-__device__ __forceinline__ void va_verify_gqa(
-    const float* __restrict__ q, const unsigned char* __restrict__ k_cache,
-    const unsigned char* __restrict__ v_cache, float* __restrict__ partials,
-    const int* __restrict__ positions, int n_rows, int n_kv_heads, int max_tiles,
-    int batch_offset, float scale_attn) {
-    __shared__ __attribute__((aligned(16))) float sc_lds[VA_WAVES][VA_PPW][VA_TILE];
-
-    const int n_heads = n_kv_heads * VA_GROUP;
-    const int n_rg = (n_rows + VA_ROWS - 1) / VA_ROWS;
-    const int kv_h = (int)blockIdx.x / n_rg;
-    const int rg = (int)blockIdx.x - kv_h * n_rg;
-    if (kv_h >= n_kv_heads) return;
-    const int row0 = rg * VA_ROWS;
-    const int rows_here = min(VA_ROWS, n_rows - row0);
-
-    const int wave = __builtin_amdgcn_readfirstlane((int)threadIdx.x >> 5);
+// Every tile of one wave's workgroup range, for the wave's first NP pairs
+// (the valid pairs of a wave are always a prefix j < NP, so the pair loops
+// are straight-line and interleave across pairs).
+template <int KV, int NP>
+__device__ __forceinline__ void va_tiles(
+    const unsigned char* __restrict__ k_cache, const unsigned char* __restrict__ v_cache,
+    float* __restrict__ partials, float (&sc)[VA_PPW][VA_TILE], const float (&qa)[VA_PPW][8],
+    const float (&qb)[VA_PPW][8], const int (&pair_len)[VA_PPW], const size_t (&pair_base)[VA_PPW],
+    int group_len, int n_tiles, int kv_h, int n_kv_heads, unsigned per_pos, float scale_attn) {
     const int lane = (int)threadIdx.x & 31;
     const int half = lane >> 4;
     const int rl = lane & 15;
 
-    const unsigned per_pos = (KV == VA_KV_Q8) ? (unsigned)n_kv_heads * (VA_HD / 32) * 34u
-                                              : (unsigned)n_kv_heads * (VA_HD + 2);
-
-    // Live key range of this row group, from the device positions.
-    int group_len = 0;
-    for (int r = 0; r < rows_here; ++r) group_len = max(group_len, positions[batch_offset + row0 + r] + 1);
-    // The reference grid covers tiles < max_tiles only; never write past it.
-    const int n_tiles = min((group_len + VA_TILE - 1) / VA_TILE, max_tiles);
-
-    // This wave's pairs: p = wave + 8j -> (row p/6, head p%6).
-    int pair_len[VA_PPW];
-    int pair_head[VA_PPW];
-    int pair_row[VA_PPW];
-    float qa[VA_PPW][8], qb[VA_PPW][8];
-#pragma unroll
-    for (int j = 0; j < VA_PPW; ++j) {
-        const int p = wave + VA_WAVES * j;
-        const int r = p / VA_GROUP;
-        pair_row[j] = row0 + r;
-        pair_head[j] = kv_h * VA_GROUP + (p - r * VA_GROUP);
-        pair_len[j] = (r < rows_here) ? positions[batch_offset + row0 + r] + 1 : 0;
-        if (r < rows_here) {
-            const float* qr = q + ((size_t)(row0 + r) * n_heads + pair_head[j]) * VA_HD;
-            const float4 a0 = *(const float4*)(qr + 8 * rl);
-            const float4 a1 = *(const float4*)(qr + 8 * rl + 4);
-            const float4 b0 = *(const float4*)(qr + 128 + 8 * rl);
-            const float4 b1 = *(const float4*)(qr + 128 + 8 * rl + 4);
-            qa[j][0] = a0.x; qa[j][1] = a0.y; qa[j][2] = a0.z; qa[j][3] = a0.w;
-            qa[j][4] = a1.x; qa[j][5] = a1.y; qa[j][6] = a1.z; qa[j][7] = a1.w;
-            qb[j][0] = b0.x; qb[j][1] = b0.y; qb[j][2] = b0.z; qb[j][3] = b0.w;
-            qb[j][4] = b1.x; qb[j][5] = b1.y; qb[j][6] = b1.z; qb[j][7] = b1.w;
-        } else {
-#pragma unroll
-            for (int i = 0; i < 8; ++i) { qa[j][i] = 0.0f; qb[j][i] = 0.0f; }
-        }
-    }
-
     for (int tile = blockIdx.y; tile < n_tiles; tile += gridDim.y) {
         const int tile_start = tile * VA_TILE;
         const int tl_max = min(VA_TILE, group_len - tile_start);
-        int tl[VA_PPW];
+        int tl[NP];
         bool full = true;
 #pragma unroll
-        for (int j = 0; j < VA_PPW; ++j) {
+        for (int j = 0; j < NP; ++j) {
             tl[j] = min(VA_TILE, max(0, pair_len[j] - tile_start));
             full = full && (tl[j] == 0 || tl[j] == tl_max);
         }
@@ -214,15 +169,20 @@ __device__ __forceinline__ void va_verify_gqa(
                 float ka[8], kb[8];
                 va_dequant<KV>(ca, ka);
                 va_dequant<KV>(cb, kb);
+                float v[NP];
 #pragma unroll
-                for (int j = 0; j < VA_PPW; ++j) {
-                    if (tl[j] == 0) continue;
-                    float v = va_leaf(qa[j], ka) + va_leaf(qb[j], kb);
-                    v = va_row_xmask_add<0x168>(v);
-                    v = va_row_xmask_add<0x164>(v);
-                    v = va_row_xmask_add<0x162>(v);
-                    v = va_row_xmask_add<0x161>(v);
-                    if (rl == 0 && t < tl_max) sc_lds[wave][j][t] = v * scale_attn;
+                for (int j = 0; j < NP; ++j) v[j] = va_leaf(qa[j], ka) + va_leaf(qb[j], kb);
+#pragma unroll
+                for (int j = 0; j < NP; ++j) v[j] = va_row_xmask_add<0x168>(v[j]);
+#pragma unroll
+                for (int j = 0; j < NP; ++j) v[j] = va_row_xmask_add<0x164>(v[j]);
+#pragma unroll
+                for (int j = 0; j < NP; ++j) v[j] = va_row_xmask_add<0x162>(v[j]);
+#pragma unroll
+                for (int j = 0; j < NP; ++j) v[j] = va_row_xmask_add<0x161>(v[j]);
+                if (rl == 0 && t < tl_max) {
+#pragma unroll
+                    for (int j = 0; j < NP; ++j) sc[j][t] = v[j] * scale_attn;
                 }
                 ca = na;
                 cb = nb;
@@ -233,10 +193,10 @@ __device__ __forceinline__ void va_verify_gqa(
 
         // ── Phases B/C: the reference's lane-strided softmax, one pair at a time.
 #pragma unroll
-        for (int j = 0; j < VA_PPW; ++j) {
+        for (int j = 0; j < NP; ++j) {
             const int tile_len = tl[j];
             if (tile_len == 0) continue;
-            float* scores = sc_lds[wave][j];
+            float* scores = sc[j];
             float local_max = -1e30f;
             for (int i = lane; i < tile_len; i += 32)
                 local_max = fmaxf(local_max, scores[i]);
@@ -252,7 +212,7 @@ __device__ __forceinline__ void va_verify_gqa(
             for (int off = 16; off > 0; off >>= 1)
                 local_sum += __shfl_xor(local_sum, off);
             if (lane == 0) {
-                float* p = partials + (((size_t)pair_row[j] * n_heads + pair_head[j]) * max_tiles + tile) * VA_STRIDE;
+                float* p = partials + (pair_base[j] + tile) * VA_STRIDE;
                 p[0] = tile_max;
                 p[1] = local_sum;
             }
@@ -260,28 +220,60 @@ __device__ __forceinline__ void va_verify_gqa(
         __builtin_amdgcn_fence(__ATOMIC_SEQ_CST, "wavefront");
         __builtin_amdgcn_wave_barrier();
 
-        // ── Phase D: PV. Lane l owns dims 8l..8l+7 of every pair.
-        float acc[VA_PPW][8];
+        // ── Phase D: PV. Lane l owns dims 8l..8l+7 of every pair. The full
+        //    path runs every pair (a pair with no key in this tile computes
+        //    unused sums); the ragged path skips keys past each pair's bound.
+        float acc[NP][8];
 #pragma unroll
-        for (int j = 0; j < VA_PPW; ++j)
+        for (int j = 0; j < NP; ++j)
 #pragma unroll
             for (int i = 0; i < 8; ++i) acc[j][i] = 0.0f;
         {
             VaSlice cv = va_load_slice<KV>(v_rsrc, 0u, kv_h, n_kv_heads, 8 * lane);
             if (full) {
-                for (int t = 0; t < tl_max; ++t) {
-                    const VaSlice nv = va_load_slice<KV>(
-                        v_rsrc, (unsigned)min(t + 1, tl_max - 1) * per_pos, kv_h, n_kv_heads, 8 * lane);
-                    float vq[8];
-                    va_dequant<KV>(cv, vq);
+                // Four keys per step: one 16-byte LDS broadcast of each
+                // pair's weights, the next step's four V slices in flight.
+                const int t4 = tl_max & ~3;
+                VaSlice c4[4];
 #pragma unroll
-                    for (int j = 0; j < VA_PPW; ++j) {
-                        if (tl[j] == 0) continue;
-                        const float w = sc_lds[wave][j][t];
+                for (int u = 0; u < 4; ++u)
+                    c4[u] = va_load_slice<KV>(v_rsrc, (unsigned)min(u, tl_max - 1) * per_pos, kv_h, n_kv_heads, 8 * lane);
+                int t = 0;
+                for (; t < t4; t += 4) {
+                    VaSlice n4[4];
+#pragma unroll
+                    for (int u = 0; u < 4; ++u)
+                        n4[u] = va_load_slice<KV>(v_rsrc, (unsigned)min(t + 4 + u, tl_max - 1) * per_pos, kv_h,
+                                                  n_kv_heads, 8 * lane);
+                    float4 w4[NP];
+#pragma unroll
+                    for (int j = 0; j < NP; ++j) w4[j] = *(const float4*)&sc[j][t];
+#pragma unroll
+                    for (int u = 0; u < 4; ++u) {
+                        float vq[8];
+                        va_dequant<KV>(c4[u], vq);
+#pragma unroll
+                        for (int j = 0; j < NP; ++j) {
+                            const float w = w4[j][u];
+#pragma unroll
+                            for (int i = 0; i < 8; ++i) acc[j][i] = __builtin_fmaf(w, vq[i], acc[j][i]);
+                        }
+                    }
+#pragma unroll
+                    for (int u = 0; u < 4; ++u) c4[u] = n4[u];
+                }
+                for (; t < tl_max; ++t) {
+                    float vq[8];
+                    va_dequant<KV>(c4[0], vq);
+#pragma unroll
+                    for (int j = 0; j < NP; ++j) {
+                        const float w = sc[j][t];
 #pragma unroll
                         for (int i = 0; i < 8; ++i) acc[j][i] = __builtin_fmaf(w, vq[i], acc[j][i]);
                     }
-                    cv = nv;
+                    c4[0] = c4[1];
+                    c4[1] = c4[2];
+                    c4[2] = c4[3];
                 }
             } else {
                 for (int t = 0; t < tl_max; ++t) {
@@ -290,9 +282,9 @@ __device__ __forceinline__ void va_verify_gqa(
                     float vq[8];
                     va_dequant<KV>(cv, vq);
 #pragma unroll
-                    for (int j = 0; j < VA_PPW; ++j) {
+                    for (int j = 0; j < NP; ++j) {
                         if (t >= tl[j]) continue;
-                        const float w = sc_lds[wave][j][t];
+                        const float w = sc[j][t];
 #pragma unroll
                         for (int i = 0; i < 8; ++i) acc[j][i] = __builtin_fmaf(w, vq[i], acc[j][i]);
                     }
@@ -301,16 +293,91 @@ __device__ __forceinline__ void va_verify_gqa(
             }
         }
 #pragma unroll
-        for (int j = 0; j < VA_PPW; ++j) {
+        for (int j = 0; j < NP; ++j) {
             if (tl[j] == 0) continue;
-            float* p = partials + (((size_t)pair_row[j] * n_heads + pair_head[j]) * max_tiles + tile) * VA_STRIDE
-                     + 2 + 8 * lane;
+            float* p = partials + (pair_base[j] + tile) * VA_STRIDE + 2 + 8 * lane;
 #pragma unroll
             for (int i = 0; i < 8; i += 2) *(float2*)(p + i) = make_float2(acc[j][i], acc[j][i + 1]);
         }
         __builtin_amdgcn_fence(__ATOMIC_SEQ_CST, "wavefront");
         __builtin_amdgcn_wave_barrier();
     }
+}
+
+template <int KV>
+__device__ __forceinline__ void va_verify_gqa(
+    const float* __restrict__ q, const unsigned char* __restrict__ k_cache,
+    const unsigned char* __restrict__ v_cache, float* __restrict__ partials,
+    const int* __restrict__ positions, int n_rows, int n_kv_heads, int max_tiles,
+    int batch_offset, float scale_attn) {
+    __shared__ __attribute__((aligned(16))) float sc_lds[VA_WAVES][VA_PPW][VA_TILE];
+
+    const int n_heads = n_kv_heads * VA_GROUP;
+    const int n_rg = (n_rows + VA_ROWS - 1) / VA_ROWS;
+    const int kv_h = (int)blockIdx.x / n_rg;
+    const int rg = (int)blockIdx.x - kv_h * n_rg;
+    if (kv_h >= n_kv_heads) return;
+    const int row0 = rg * VA_ROWS;
+    const int rows_here = min(VA_ROWS, n_rows - row0);
+
+    const int wave = __builtin_amdgcn_readfirstlane((int)threadIdx.x >> 5);
+    const int rl = (int)threadIdx.x & 15;
+
+    const unsigned per_pos = (KV == VA_KV_Q8) ? (unsigned)n_kv_heads * (VA_HD / 32) * 34u
+                                              : (unsigned)n_kv_heads * (VA_HD + 2);
+
+    // Live key range of this row group, from the device positions.
+    int group_len = 0;
+    for (int r = 0; r < rows_here; ++r) group_len = max(group_len, positions[batch_offset + row0 + r] + 1);
+    // The reference grid covers tiles < max_tiles only; never write past it.
+    const int n_tiles = min((group_len + VA_TILE - 1) / VA_TILE, max_tiles);
+
+    // This wave's pairs: p = wave + 8j -> (row p/6, head p%6); valid pairs
+    // (row < rows_here) are the prefix j < np.
+    int np = 0;
+    int pair_len[VA_PPW];
+    size_t pair_base[VA_PPW];
+    float qa[VA_PPW][8], qb[VA_PPW][8];
+#pragma unroll
+    for (int j = 0; j < VA_PPW; ++j) {
+        const int p = wave + VA_WAVES * j;
+        const int r = p / VA_GROUP;
+        const int head = kv_h * VA_GROUP + (p - r * VA_GROUP);
+        pair_base[j] = ((size_t)(row0 + r) * n_heads + head) * max_tiles;
+        pair_len[j] = (r < rows_here) ? positions[batch_offset + row0 + r] + 1 : 0;
+        if (r < rows_here) {
+            np = j + 1;
+            const float* qr = q + ((size_t)(row0 + r) * n_heads + head) * VA_HD;
+            const float4 a0 = *(const float4*)(qr + 8 * rl);
+            const float4 a1 = *(const float4*)(qr + 8 * rl + 4);
+            const float4 b0 = *(const float4*)(qr + 128 + 8 * rl);
+            const float4 b1 = *(const float4*)(qr + 128 + 8 * rl + 4);
+            qa[j][0] = a0.x; qa[j][1] = a0.y; qa[j][2] = a0.z; qa[j][3] = a0.w;
+            qa[j][4] = a1.x; qa[j][5] = a1.y; qa[j][6] = a1.z; qa[j][7] = a1.w;
+            qb[j][0] = b0.x; qb[j][1] = b0.y; qb[j][2] = b0.z; qb[j][3] = b0.w;
+            qb[j][4] = b1.x; qb[j][5] = b1.y; qb[j][6] = b1.z; qb[j][7] = b1.w;
+        } else {
+#pragma unroll
+            for (int i = 0; i < 8; ++i) { qa[j][i] = 0.0f; qb[j][i] = 0.0f; }
+        }
+    }
+
+#define VA_TILES(N)                                                                                     \
+    case N:                                                                                             \
+        va_tiles<KV, N>(k_cache, v_cache, partials, sc_lds[wave], qa, qb, pair_len, pair_base, group_len, \
+                        n_tiles, kv_h, n_kv_heads, per_pos, scale_attn);                                \
+        break;
+    switch (np) {
+        VA_TILES(1)
+        VA_TILES(2)
+        VA_TILES(3)
+        VA_TILES(4)
+        VA_TILES(5)
+        VA_TILES(6)
+        default:
+            break;
+    }
+#undef VA_TILES
 }
 
 // Grid: [ceil(n_rows/8) * n_kv_heads, S], block 256. Workgroup x = kv_h *
@@ -359,9 +426,29 @@ __global__ void attention_verify_reduce_gfx1201(
             global_max = fmaxf(global_max, p[0]);
     }
 
+    // Same serial per-dim order as the reference; the loads of 8 tiles are
+    // issued ahead of their (in-order) accumulation.
     float global_sum = 0.0f;
     float g = 0.0f;
-    for (int tile = 0; tile < n_tiles; tile++) {
+    int tile = 0;
+    for (; tile + 8 <= n_tiles; tile += 8) {
+        float pm[8], ps[8], pv[8];
+#pragma unroll
+        for (int u = 0; u < 8; ++u) {
+            const float* p = my_partials + (tile + u) * VA_STRIDE;
+            pm[u] = p[0];
+            ps[u] = p[1];
+            pv[u] = p[2 + d];
+        }
+#pragma unroll
+        for (int u = 0; u < 8; ++u) {
+            if (ps[u] <= 0.0f) continue;
+            const float corr = expf(pm[u] - global_max);
+            g += pv[u] * corr;
+            global_sum += ps[u] * corr;
+        }
+    }
+    for (; tile < n_tiles; tile++) {
         const float* p = my_partials + tile * VA_STRIDE;
         const float tile_max = p[0];
         const float tile_sum = p[1];
