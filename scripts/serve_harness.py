@@ -88,9 +88,19 @@ def resolve_model_default(explicit, tag, registry_path, field, fallback, explici
 
 
 def resolve_kv_mode(explicit, tag, registry_path):
-    """Resolve the cache mode from an explicit override or the model registry."""
-    return resolve_model_default(
+    """Resolve the cache mode the product would load, unless --kv overrides it.
+
+    Mirrors the product KV precedence (docs/QUANTIZATION.md): a registry
+    ``default_kv_mode`` applies only when it is not ``q8``; a ``q8`` card value
+    is left to ``auto`` (native fp8 on eligible gfx1201, Q8 elsewhere). Writing
+    the registry ``q8`` as an explicit ``kv_cache`` would certify Q8 instead of
+    the shipped default.
+    """
+    kv, source = resolve_model_default(
         explicit, tag, registry_path, "default_kv_mode", "auto", "explicit(--kv)")
+    if explicit is None and kv == "q8":
+        return "auto", f"{source}:q8->auto"
+    return kv, source
 
 
 def _tag_load_policy(canonical_tag):
@@ -1340,7 +1350,8 @@ def _self_test_kv_resolution():
     """Prove registry defaults, aliases, explicit overrides, and fallback."""
     with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as tmp:
         json.dump({
-            "models": {"deepseek-v4-flash:mq2r": {"default_kv_mode": "f32"}},
+            "models": {"deepseek-v4-flash:mq2r": {"default_kv_mode": "f32"},
+                       "qwen3.8:27b-mq4-xts": {"default_kv_mode": "q8"}},
             "aliases": {"deepseek4:mq2r": "deepseek-v4-flash:mq2r"},
         }, tmp)
         path = tmp.name
@@ -1350,6 +1361,11 @@ def _self_test_kv_resolution():
         assert resolve_kv_mode("f16", "deepseek4:mq2r", path) == (
             "f16", "explicit(--kv)")
         assert resolve_kv_mode(None, "missing", path) == ("auto", "default(auto)")
+        # A registry q8 is left to the product's auto (fp8 on gfx1201), not pinned.
+        assert resolve_kv_mode(None, "qwen3.8:27b-mq4-xts", path) == (
+            "auto", "registry(qwen3.8:27b-mq4-xts):q8->auto")
+        assert resolve_kv_mode("q8", "qwen3.8:27b-mq4-xts", path) == (
+            "q8", "explicit(--kv)")
     finally:
         os.unlink(path)
     print("serve_harness: kv-resolution self-test OK", flush=True)
@@ -1581,7 +1597,8 @@ def _self_test_load_defaults():
         assert cfg["max_seq_source"] == "automatic(model/card)"
         assert cfg["max_tokens"] == 81920
         assert cfg["max_tokens_source"] == "tag-policy(qwen3.8:27b)"
-        assert cfg["kv"] == "q8"
+        assert cfg["kv"] == "auto"
+        assert cfg["kv_source"] == "registry(qwen3.8:27b):q8->auto"
         with tempfile.TemporaryDirectory() as home:
             Path(home, ".hipfire").mkdir()
             _write_native_config(cfg, home)
@@ -3854,7 +3871,8 @@ def main():
     ap.add_argument("--tag", default=None, help="registry tag for recommended_settings (else inferred)")
     ap.add_argument("--registry", default=os.path.join(REPO, "registry/v1.json"))
     ap.add_argument("--kv", default=None,
-                    help="cache mode override; omitted resolves the registry default")
+                    help="cache mode override; omitted resolves what the product loads "
+                         "(registry non-q8 default_kv_mode, else auto)")
     ap.add_argument(
         "--kv-backend",
         default=None,
