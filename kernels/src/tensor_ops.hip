@@ -3806,7 +3806,7 @@ extern "C" __global__ __launch_bounds__(256) void indexed_attention_select_from_
     const int row = (int)blockIdx.x;
     if (row >= rows) return;
     if (row != rows - 1) mirror = nullptr;
-    __shared__ unsigned hist[256];
+    __shared__ unsigned hist[8][256];  // one copy per wave: fewer atomic collisions
     __shared__ int wave_totals[8];
     __shared__ unsigned radix_prefix;
     __shared__ int radix_need;
@@ -3828,23 +3828,31 @@ extern "C" __global__ __launch_bounds__(256) void indexed_attention_select_from_
         int need = chosen;
         for (int shift = 24; shift >= 0; shift -= 8) {
             const unsigned high = shift == 24 ? 0u : ~0u << (shift + 8);
-            hist[tid] = 0u;
+#pragma unroll
+            for (int w = 0; w < 8; ++w) hist[w][tid] = 0u;
             __syncthreads();
             for (int block = tid; block < row_block_count; block += 256) {
                 const unsigned key = keys[block];
-                if ((key & high) == prefix) atomicAdd(&hist[(key >> shift) & 255u], 1u);
+                if ((key & high) == prefix) atomicAdd(&hist[wave][(key >> shift) & 255u], 1u);
             }
             __syncthreads();
-            if (tid == 0) {
-                int above = 0;
-                int digit = 255;
-                for (; digit > 0; --digit) {
-                    const int count = (int)hist[digit];
-                    if (above + count >= need) break;
-                    above += count;
-                }
-                radix_prefix = prefix | ((unsigned)digit << shift);
-                radix_need = need - above;
+            // Thread t owns digit 255 - t: an inclusive scan over t gives the
+            // count at or above each digit; the digit where it first reaches
+            // `need` holds the chosen-th largest key.
+            int count = 0;
+#pragma unroll
+            for (int w = 0; w < 8; ++w) count += (int)hist[w][255 - tid];
+            int at_or_above = count;
+            for (int offset = 1; offset < 32; offset <<= 1) {
+                const int up = __shfl_up(at_or_above, offset, 32);
+                if (lane >= offset) at_or_above += up;
+            }
+            if (lane == 31) wave_totals[wave] = at_or_above;
+            __syncthreads();
+            for (int w = 0; w < wave; ++w) at_or_above += wave_totals[w];
+            if (at_or_above >= need && at_or_above - count < need) {
+                radix_prefix = prefix | ((unsigned)(255 - tid) << shift);
+                radix_need = need - (at_or_above - count);
             }
             __syncthreads();
             prefix = radix_prefix;
