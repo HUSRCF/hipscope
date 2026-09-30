@@ -225,6 +225,7 @@ Starting after 0.4.0, hipfire releases on a fixed, published schedule. That way 
   | 0.4.6 | Sunday 2026-11-08 |
 
   The same pattern continues after that.
+- **Packaging deadline:** each release is packaged and published by **11:59 PM MST on its release day**. That's 06:59 UTC the following day; for 0.4.1, it's by 11:59 PM MST Tuesday 10/06, which is 06:59 UTC Wednesday 10/07.
 - **Features** always go into the *upcoming* release. They land on `beta`, which is packaged and released on the next release day.
 - **Bug fixes** can go into the current release and the upcoming one.
 - **Cutoff:** a PR filed before **11:59 PM MST (UTC−7) on the day before a release date** is incorporated into that release. MST is fixed year-round (no daylight saving), so the cutoff is always **06:59 UTC on release day**:
