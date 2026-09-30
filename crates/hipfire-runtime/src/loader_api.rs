@@ -90,6 +90,11 @@ pub struct LoadCtx<'a> {
     /// trunk. Read by `Qwen35Carrier` only, after the bundled trailer probe.
     /// `None` = look beside the canonical trunk (`<trunk>.with_extension("mtp")`).
     pub mtp_path: Option<PathBuf>,
+    /// Resolved `vision.mode` (`off`/`auto`/`on`). Gates `<stem>.vl` sibling
+    /// discovery in the carrier — `vision_path` alone cannot distinguish
+    /// "off" (never probe) from "auto with no explicit sidecar" (probe).
+    /// `off` suppresses discovery; `auto`/`on` allow it.
+    pub vision_mode: String,
     pub kv_mode_override: Option<&'a str>,
     /// Authored Qwen-only K and V overrides. None preserves the selected whole-cache mode.
     pub kv_k_override: Option<&'a str>,

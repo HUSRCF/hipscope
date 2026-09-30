@@ -1628,7 +1628,16 @@ fn list_command(paths: &Paths, args: ListArgs) -> Result<()> {
 
 pub(crate) fn list_local_models(paths: &Paths, registry: &RegistryV1) -> Result<Vec<LocalModel>> {
     let mut candidates = local_model_paths(paths)?;
+    let mut catalog_tags: std::collections::HashMap<PathBuf, String> =
+        std::collections::HashMap::new();
     if let Ok(catalog) = load_catalog(&paths.config) {
+        for model in catalog.catalog.models.values() {
+            if let (Some(path), Some(tag)) = (&model.path, &model.registry_tag) {
+                if let Ok(canonical) = fs::canonicalize(path) {
+                    catalog_tags.insert(canonical, tag.clone());
+                }
+            }
+        }
         candidates.extend(
             catalog
                 .catalog
@@ -1657,7 +1666,8 @@ pub(crate) fn list_local_models(paths: &Paths, registry: &RegistryV1) -> Result<
         let registry_tag = registry
             .models
             .iter()
-            .find_map(|(tag, model)| (model.file == name).then(|| tag.clone()));
+            .find_map(|(tag, model)| (model.file == name).then(|| tag.clone()))
+            .or_else(|| catalog_tags.get(&canonical).cloned());
         models.push(LocalModel {
             name,
             path: canonical,
@@ -3108,7 +3118,6 @@ pub(crate) fn find_model_path(
     candidates.into_iter().next()
 }
 
-
 /// Clap value parser for `--kv-backend`: shared `KvBackend::from_str` so the old
 /// `contiguous` spelling returns the migration error naming `legacy`.
 fn parse_kv_backend_arg(raw: &str) -> std::result::Result<String, String> {
@@ -3336,10 +3345,7 @@ pub(crate) fn load_params(
     if let Some(kv_v) = authored_kv_axis(resolved, "memory.kv_v")? {
         params["kv_v"] = serde_json::json!(kv_v);
     }
-    let max_seq_source = &resolved
-        .get("memory.max_seq")
-        .expect("schema field")
-        .source;
+    let max_seq_source = &resolved.get("memory.max_seq").expect("schema field").source;
     if matches!(
         max_seq_source,
         ConfigSource::GlobalUser { .. }
@@ -4788,7 +4794,7 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
     if args.exp {
         return bench_experimental(paths, &args);
     }
-    let (mut engine, loaded, pre_diag, post_diag) = open_bench_engine(paths, &args, None)?;
+    let (mut engine, loaded, pre_diag, post_diag) = open_bench_engine(paths, &args, None, &BenchLoadOpts::default())?;
     let prompt = resolve_bench_prompt(&args)?;
     let prompt_md5 = bench_prompt_md5(&prompt);
     let prompt_chars = prompt.chars().count() as u64;
@@ -4954,13 +4960,18 @@ fn bench_concurrency_command(paths: &Paths, args: &BenchArgs, spec: &str) -> Res
     // weights and KV arenas, so leaving this scope is what actually frees the
     // first model before the daemon loads the second.
     if matches!(backend_sel, BackendSel::Slots | BackendSel::Both) {
-        let registry = load_registry(&paths.registry).registry;
-        let model_path = find_model_path(paths, &registry, &args.model)
-            .ok_or_else(|| anyhow!("model not found: {}", args.model))?;
+        preflight_headroom_for_model(paths, &args.model)?;
+        let mut slot_args = args.clone();
+        slot_args.concurrency = None;
         // 2048-token slots, not the serve default of 8192: the sweep's prompts
         // are one short turn and --max-tokens is small, so a larger arena buys
         // nothing and multiplies per-slot KV by four.
-        match SlotDriver::start(&model_path, max_k, 2048) {
+        let (engine, loaded, _, _) = open_bench_engine_slots(paths, &slot_args, max_k, 2048)?;
+        let slot_capable = loaded
+            .get("experimental_multi_slot")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        match SlotDriver::start(engine, max_k, slot_capable) {
             Ok(mut d) => {
                 eprintln!("  slots backend up ({max_k} slots)");
                 let r = sweep_backend(
@@ -4988,7 +4999,7 @@ fn bench_concurrency_command(paths: &Paths, args: &BenchArgs, spec: &str) -> Res
         preflight_headroom_for_model(paths, &args.model)?;
         let mut seq_args = args.clone();
         seq_args.concurrency = None;
-        let (engine, _, _, _) = open_bench_engine(paths, &seq_args, None)?;
+        let (engine, _, _, _) = open_bench_engine(paths, &seq_args, None, &BenchLoadOpts::default())?;
         let mut d = SequentialDriver::start(engine, max_k)?;
         eprintln!("  noslots backend up (sequential daemon path)");
         let r = sweep_backend(
@@ -5096,16 +5107,57 @@ fn open_bench_engine_batched(
     serde_json::Value,
     serde_json::Value,
 )> {
-    std::env::set_var("HIPFIRE_BENCH_CONTINUOUS_BATCH", batch_size.to_string());
-    let r = open_bench_engine(paths, args, None);
-    std::env::remove_var("HIPFIRE_BENCH_CONTINUOUS_BATCH");
-    r
+    open_bench_engine(
+        paths,
+        args,
+        None,
+        &BenchLoadOpts {
+            continuous_batch: Some(batch_size),
+            ..Default::default()
+        },
+    )
+}
+
+/// Spawn a daemon and load the model with `experimental_multi_slot=true` so
+/// the slot backend owns the GPU. The slot count and per-slot context cap are
+/// fixed per load, which is why the sweep holds them at max.
+fn open_bench_engine_slots(
+    paths: &Paths,
+    args: &BenchArgs,
+    slots: usize,
+    ctx: usize,
+) -> Result<(
+    Engine,
+    serde_json::Value,
+    serde_json::Value,
+    serde_json::Value,
+)> {
+    open_bench_engine(
+        paths,
+        args,
+        None,
+        &BenchLoadOpts {
+            multi_slot: Some((slots, ctx)),
+            ..Default::default()
+        },
+    )
+}
+
+/// Optional load-time knobs for `open_bench_engine`, threaded explicitly
+/// rather than via `std::env::set_var` — `hipfire_config::developer_var`
+/// reads the OnceLock process-config snapshot, not the ambient environment,
+/// so a set_var inside the process is invisible once the snapshot is taken.
+#[derive(Default)]
+struct BenchLoadOpts {
+    multi_slot: Option<(usize, usize)>,
+    continuous_batch: Option<usize>,
 }
 
 fn open_bench_engine(
     paths: &Paths,
     args: &BenchArgs,
     rdna2_variant: Option<u8>,
+    load_opts: &BenchLoadOpts,
 ) -> Result<(
     Engine,
     serde_json::Value,
@@ -5207,13 +5259,16 @@ fn open_bench_engine(
             }
         }
     }
-    if let Ok(n) = hipfire_config::developer_var("HIPFIRE_BENCH_CONTINUOUS_BATCH") {
-        if let Ok(n) = n.parse::<u64>() {
-            params["continuous_batch_size"] = serde_json::json!(n);
-        }
+    if let Some(n) = load_opts.continuous_batch {
+        params["continuous_batch_size"] = serde_json::json!(n as u64);
     }
     if let Some(tp) = args.tp.filter(|&tp| tp > 1) {
         params["tp"] = serde_json::json!(tp);
+    }
+    if let Some((slots, ctx)) = load_opts.multi_slot {
+        params["experimental_multi_slot"] = serde_json::json!(true);
+        params["experimental_multi_slot_slots"] = serde_json::json!(slots as u64);
+        params["experimental_multi_slot_ctx"] = serde_json::json!(ctx as u64);
     }
     let loaded = engine.load(&path, params)?;
     let post_diag = engine.request(&serde_json::json!({ "type": "diag" }))?;
@@ -5331,8 +5386,9 @@ fn bench_ttft(
             }
             Ok(())
         })?;
-        let elapsed =
-            first.ok_or_else(|| anyhow!("no streamed token observed; cannot measure client-side TTFT"))?;
+        let elapsed = first.ok_or_else(|| {
+            anyhow!("no streamed token observed; cannot measure client-side TTFT")
+        })?;
         ttft_ms_samples.push(elapsed.as_secs_f64() * 1000.0);
         if prompt_tokens.is_none() {
             prompt_tokens = bench_prompt_tokens_from_done(&done);
@@ -5512,7 +5568,7 @@ fn bench_matrix(
 fn bench_experimental(paths: &Paths, args: &BenchArgs) -> Result<()> {
     let mut rows = Vec::new();
     for variant in 1..=5 {
-        let (mut engine, _, _, diag) = open_bench_engine(paths, args, Some(variant))?;
+        let (mut engine, _, _, diag) = open_bench_engine(paths, args, Some(variant), &BenchLoadOpts::default())?;
         let arch = diag
             .get("arch")
             .and_then(serde_json::Value::as_str)
@@ -5583,7 +5639,7 @@ fn profile_command(paths: &Paths, args: ProfileArgs) -> Result<()> {
             prompt: Vec::new(),
             prompt_file: None,
         };
-        let (mut engine, _, _, _) = open_bench_engine(paths, &bench, None)?;
+        let (mut engine, _, _, _) = open_bench_engine(paths, &bench, None, &BenchLoadOpts::default())?;
         let _ = bench_generate(&mut engine, "Hello", 1)?;
         engine
     } else {
@@ -7651,7 +7707,6 @@ mod tests {
         );
     }
 
-
     #[test]
     pub(crate) fn resolved_for_model_applies_qwen_tag_policy_and_excludes_original_and_sidecars() {
         let paths = test_paths("registry-qwen-tag-policy");
@@ -7864,7 +7919,10 @@ mod tests {
             Some(entry),
         )
         .unwrap();
-        assert_eq!(config_string(&resolved, "memory.kv_backend").unwrap(), "vmm");
+        assert_eq!(
+            config_string(&resolved, "memory.kv_backend").unwrap(),
+            "vmm"
+        );
 
         // DeepSeek tags keep generation.max_tokens only; no max_seq/backend pin.
         for tag in [
@@ -7975,9 +8033,7 @@ mod tests {
 
         // Global user override wins over registry tag policy (registry below global).
         let mut user_layer = ConfigLayer::default();
-        user_layer
-            .set_cli("memory.kv_backend", "legacy")
-            .unwrap();
+        user_layer.set_cli("memory.kv_backend", "legacy").unwrap();
         user_layer.set_cli("memory.max_seq", "32768").unwrap();
         user_layer.set_cli("generation.max_tokens", "1024").unwrap();
         let overridden = hipfire_config::resolve(vec![
@@ -8064,9 +8120,7 @@ mod tests {
 
         // Precedence: flag > model config > global config.
         let mut global_layer = ConfigLayer::default();
-        global_layer
-            .set_cli("memory.kv_backend", "legacy")
-            .unwrap();
+        global_layer.set_cli("memory.kv_backend", "legacy").unwrap();
         let mut model_layer = ConfigLayer::default();
         model_layer.set_cli("memory.kv_backend", "vmm").unwrap();
         let model_over_global = hipfire_config::resolve(vec![
@@ -8468,11 +8522,13 @@ mod tests {
 
     fn sha256_hex(bytes: &[u8]) -> String {
         let digest = Sha256::digest(bytes);
-        digest.iter().fold(String::with_capacity(64), |mut out, byte| {
-            out.push(char::from_digit((byte >> 4) as u32, 16).unwrap());
-            out.push(char::from_digit((byte & 0x0F) as u32, 16).unwrap());
-            out
-        })
+        digest
+            .iter()
+            .fold(String::with_capacity(64), |mut out, byte| {
+                out.push(char::from_digit((byte >> 4) as u32, 16).unwrap());
+                out.push(char::from_digit((byte & 0x0F) as u32, 16).unwrap());
+                out
+            })
     }
 
     /// A manifest-v1 `.xdna.zip` binding the given payloads, written to the
@@ -8835,7 +8891,10 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(params.get("xdna").is_none(), "flag-off must not project xdna");
+        assert!(
+            params.get("xdna").is_none(),
+            "flag-off must not project xdna"
+        );
         fs::remove_dir_all(&paths.root).unwrap();
     }
 
@@ -11186,6 +11245,22 @@ mod tests {
 
             let registry = hipfire_registry::bundled().unwrap();
             let shared = Arc::new(ServeShared {
+                capabilities: crate::serve::route_capabilities(
+                    false,
+                    4,
+                    8192,
+                    1024,
+                    false,
+                    0,
+                    false,
+                    4096,
+                    1,
+                    64,
+                    268435456,
+                    30000,
+                    None,
+                    64 << 20,
+                ),
                 metrics: crate::serve::metrics::Metrics::default(),
                 runtime: Mutex::new(ServeRuntime {
                     engine,
@@ -11222,6 +11297,7 @@ mod tests {
                         allow_paths: false,
                         operator_model: None,
                     },
+                    max_batch_tokens: 4096,
                 }),
                 meta: Mutex::new(ServeMeta {
                     current_model: None,
@@ -11241,6 +11317,7 @@ mod tests {
                 retry_enabled,
                 retry_backoff,
                 backoff_hook: Mutex::new(None),
+                stream_stall_timeout: None,
             });
 
             let std_listener =

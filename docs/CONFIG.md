@@ -8,7 +8,7 @@
 - Compact runtime snapshots: `hipfire_runtime::config::RuntimeConfig` and
   `rdna_compute::feature_flags::FeatureFlags`
 
-**Last checked:** 2026-07-21.
+**Last checked:** 2026-09-05.
 
 Persistent stores under `~/.hipfire/`:
 
@@ -571,6 +571,13 @@ runtime PFlash module — not restated here.
 | `serve_queue_timeout_ms` | `600000` (10 min) | int 0–3600000 (`0` = no wait timeout). Serve runs one generation at a time by default, so this must cover a full generation. |
 | `serve.allow_request_pull` | `false` | bool. Let a chat request that names a registry model not on disk download it; off → 404 "run `hipfire pull`". Env: `HIPFIRE_SERVE_ALLOW_REQUEST_PULL`. |
 | `serve.allow_request_paths` | `false` | bool. Let a chat request load any readable file it names; off → only installed models (models directory, catalog paths, the pre-warm model). Env: `HIPFIRE_SERVE_ALLOW_REQUEST_PATHS`. |
+| `serve.max_queue_bytes` | `268435456` | int 1–1TiB. Multi-slot route: total request bytes allowed to wait in the admission queue |
+| `serve.max_batch_tokens` | `4096` | int 1–1048576 (global trunk-row budget) |
+| `serve.prefill_min_tokens` | `1` | int 1–1048576 (prefill quantum) |
+| `serve.prefix_cache` | `false` | bool — experimental; off until route admission |
+| `serve.prefix_cache_max_bytes` | `0` | int 0–1TiB (0 = no retained cache) |
+| `serve.structured_jump_forward` | `false` | bool — experimental |
+| `serve.stream_stall_timeout_ms` | `30000` | int 0–3600000. Multi-slot route: a streaming client that leaves its response channel full (or a final frame unflushed) this long is aborted and its queue permit released |
 | `experimental_budget_alert` | `false` | bool |
 | `serve.multi_slot` | `false` | Serve concurrent requests on the multi-slot engine instead of one at a time. |
 | `serve.multi_slot_slots` | `4` | int 1–64 concurrent slots. |

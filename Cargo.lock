@@ -1437,6 +1437,7 @@ dependencies = [
  "base64",
  "hip-bridge",
  "hipfire-arch-qwen35",
+ "hipfire-arch-qwen35-vl",
  "hipfire-config",
  "hipfire-engine",
  "hipfire-generate",
@@ -1445,6 +1446,7 @@ dependencies = [
  "hipfire-runtime",
  "libc",
  "rdna-compute",
+ "saddle-core",
  "serde_json",
  "tracing",
  "tracing-subscriber",
@@ -3082,6 +3084,7 @@ version = "0.4.0"
 dependencies = [
  "hip-bridge",
  "rdna-compute",
+ "serde_json",
 ]
 
 [[package]]

@@ -43,6 +43,8 @@ mtp_k = 3
 ngram = "off"
 
 [serve]
+# Loopback by default: the serve surface has no authentication and advertises
+# a permissive HTTP API, so binding a LAN address must be an explicit choice.
 host = "127.0.0.1"
 port = 11435
 # Replaces HIPFIRE_IDLE_TIMEOUT=300.

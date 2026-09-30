@@ -37,7 +37,7 @@ use std::{
         Arc, Mutex,
     },
     task::{Context as TaskContext, Poll},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
@@ -635,6 +635,9 @@ async fn handle_request(
                 "loading_model": meta.loading_model,
                 "pid": std::process::id(),
                 "token": meta.instance_token,
+                // Route capabilities: the resolved config the slot engine was
+                // built from (multi-slot, prefix cache, structured output).
+                "capabilities": shared.capabilities,
                 "native": true,
             });
             let status = if state == crate::serve::EngineState::Up {
@@ -1267,6 +1270,7 @@ async fn handle_streaming(
             .pointer("/stream_options/include_usage")
             .and_then(|v| v.as_bool())
             == Some(true),
+        stall_timeout: shared.stream_stall_timeout,
     };
     let role = serde_json::json!({
         "id": sink.id,
@@ -1349,6 +1353,7 @@ async fn handle_nonstreaming(
     let body_for_worker = body;
     let staged_tx_clone = Arc::clone(&staged_tx);
     let staged_tx_for_worker = Arc::clone(&staged_tx);
+    let stall_timeout = shared.stream_stall_timeout;
     tokio::task::spawn_blocking(move || {
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
             let staged_for_terminal = Arc::clone(&staged_tx_for_worker);
@@ -1375,9 +1380,9 @@ async fn handle_nonstreaming(
                         return Err(hipfire_client::ClientError::Cancelled);
                     }
                 }
-                match ack_rx.recv() {
-                    Ok(Ok(())) => Ok(()),
-                    Ok(Err(_)) | Err(_) => Err(hipfire_client::ClientError::Cancelled),
+                match wait_flush_ack(&ack_rx, stall_timeout) {
+                    Ok(()) => Ok(()),
+                    Err(()) => Err(hipfire_client::ClientError::Cancelled),
                 }
             };
             complete_request_cancellable(
@@ -1484,9 +1489,10 @@ impl RequestFailure {
 
 /// HTTP status for a failed completion. A typed daemon error maps on its wire
 /// `class`, never on its message: `validation`, `context_length` and
-/// `unsupported` are the client's to fix (400), `transient` is worth a retry
-/// (503), and every other class is a server fault (500). Only gateway-side
-/// errors, which carry no class, fall back to matching their message.
+/// `unsupported` are the client's to fix (400), `transient` and the
+/// multi-slot engine's `overload` (capacity) are worth a retry (503), and
+/// every other class is a server fault (500). Only gateway-side errors, which
+/// carry no class, fall back to their validation tag, then their message.
 pub(crate) fn request_error_status(error: &anyhow::Error) -> u16 {
     use hipfire_client::error_class;
     let typed = error
@@ -1496,11 +1502,15 @@ pub(crate) fn request_error_status(error: &anyhow::Error) -> u16 {
     if let Some(typed) = typed {
         return match typed.class.as_str() {
             error_class::VALIDATION | error_class::CONTEXT_LENGTH | error_class::UNSUPPORTED => 400,
-            error_class::TRANSIENT => 503,
+            error_class::TRANSIENT | error_class::OVERLOAD => 503,
             _ => 500,
         };
     }
-    let lower = error.to_string().to_ascii_lowercase();
+    let message = error.to_string();
+    if message.contains(crate::serve::REQUEST_VALIDATION_TAG) {
+        return 400;
+    }
+    let lower = message.to_ascii_lowercase();
     if lower.contains("model not found") {
         404
     } else if lower.contains("kv budget")
@@ -1571,11 +1581,40 @@ struct SseSink {
     created: u64,
     model: String,
     include_usage: bool,
+    /// Multi-slot route only (`serve.stream_stall_timeout_ms`): how long a
+    /// consumer may leave the response channel full, or the terminal frame
+    /// unflushed, before the request is aborted and its permit released.
+    /// `None` (standard route) waits for as long as the connection lives.
+    stall_timeout: Option<Duration>,
+}
+
+/// How often a stalled send re-checks the channel.
+const STALL_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Wait for a frame's flush ack. With a stall bound, a client that never
+/// reads the body is given up on after `stall_timeout` instead of pinning the
+/// worker and its admission permit.
+fn wait_flush_ack(
+    ack_rx: &std::sync::mpsc::Receiver<Result<(), ()>>,
+    stall_timeout: Option<Duration>,
+) -> Result<(), ()> {
+    let outcome = match stall_timeout {
+        None => ack_rx.recv().map_err(|_| ()),
+        Some(limit) => ack_rx.recv_timeout(limit).map_err(|error| {
+            if error == std::sync::mpsc::RecvTimeoutError::Timeout {
+                eprintln!(
+                    "[hipfire] response not flushed within serve.stream_stall_timeout_ms; aborting"
+                );
+            }
+        }),
+    };
+    outcome.and_then(|ack| ack)
 }
 
 impl SseSink {
     /// Send one frame, committing the response first if this is the first.
-    /// A dropped receiver maps to `Cancelled`.
+    /// A dropped receiver, or (multi-slot) a channel left full for the stall
+    /// timeout, maps to `Cancelled`.
     fn send(&self, chunk: ResponseChunk) -> Result<(), hipfire_client::ClientError> {
         if !self.committed.get() {
             // Only this worker ever rejects, and only after its last send, so
@@ -1583,9 +1622,34 @@ impl SseSink {
             let _ = commit_stream(&self.commit);
             self.committed.set(true);
         }
-        self.tx
-            .blocking_send(chunk)
-            .map_err(|_| hipfire_client::ClientError::Cancelled)
+        let Some(limit) = self.stall_timeout else {
+            return self
+                .tx
+                .blocking_send(chunk)
+                .map_err(|_| hipfire_client::ClientError::Cancelled);
+        };
+        let deadline = Instant::now() + limit;
+        let mut chunk = chunk;
+        loop {
+            match self.tx.try_send(chunk) {
+                Ok(()) => return Ok(()),
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    return Err(hipfire_client::ClientError::Cancelled);
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Full(returned)) => {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        eprintln!(
+                            "[hipfire] {}: stream consumer stalled past serve.stream_stall_timeout_ms; aborting",
+                            self.id
+                        );
+                        return Err(hipfire_client::ClientError::Cancelled);
+                    }
+                    std::thread::sleep(STALL_RETRY_INTERVAL.min(deadline - now));
+                    chunk = returned;
+                }
+            }
+        }
     }
 
     /// Forward one logical generate event. Delta-bearing events serialize to
@@ -1616,10 +1680,8 @@ impl SseSink {
         let (ack_tx, ack_rx) = std::sync::mpsc::channel();
         self.terminal_sent.set(true);
         self.send(ResponseChunk::last(bytes, Some(ack_tx)))?;
-        match ack_rx.recv() {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(_)) | Err(_) => Err(hipfire_client::ClientError::Cancelled),
-        }
+        wait_flush_ack(&ack_rx, self.stall_timeout)
+            .map_err(|()| hipfire_client::ClientError::Cancelled)
     }
 
     /// Close the body after `complete_request_cancellable`.
