@@ -7265,6 +7265,14 @@ pub const ATTENTION_FLASH_Q8_0_TILE_ROWS_SRC: &str =
     include_str!("../../../kernels/src/attention_flash_q8_0_tile_rows.hip");
 pub const ATTENTION_FLASH_ASYM_REDUCE_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/attention_flash_asym_reduce_batched.hip");
+/// VerifyAttn Stage 0 (gfx1201): `attention_verify_gqa_{q8,fp8}_gfx1201`, the
+/// GQA-shared split-K twins of the batched Q8_0 / fp8 flash tiles (one KV scan
+/// per kv head for 8 query rows x 6 q heads, fixed context-independent grid),
+/// and `attention_verify_reduce_gfx1201`, the parallel twin of
+/// [`ATTENTION_FLASH_ASYM_REDUCE_BATCHED_SRC`]. Partials and output are
+/// byte-identical to the tile_batched + reduce pair at head_dim 256, GQA 6.
+pub const ATTENTION_VERIFY_GQA_GFX1201_SRC: &str =
+    include_str!("../../../kernels/src/attention_verify_gqa.gfx1201.hip");
 
 // lloyd-V (FWHT-rotated centroid) dedicated reduce kernels. Used ONLY when
 // v_mode != 8 — the tile kernels now write rotated V partials and these

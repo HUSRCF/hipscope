@@ -316,6 +316,63 @@ fn replay_stable_tile_count(
     }
 }
 
+/// KV storage read by the batched flash tile a VerifyAttn launch replaces.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VerifyKv {
+    Q8,
+    Fp8,
+}
+
+/// VerifyAttn Stage-0 kernel set of one arch: GQA-shared split-K twins of
+/// `attention_flash_{q8_0,fp8_e4m3}_tile_batched` (one KV scan per kv head for
+/// [`VERIFY_GQA_ROWS`] query rows x 6 q heads) plus the parallel twin of
+/// `attention_flash_asym_reduce_batched`. Partials and output are
+/// byte-identical to that pair; the contract (entry ABI, grid, live range,
+/// arithmetic) is in `kernels/src/attention_verify_gqa.gfx1201.hip`. A gfx11
+/// twin adds one row here.
+struct VerifyGqaKernels {
+    module: &'static str,
+    src: &'static str,
+    tile_q8: Option<&'static str>,
+    tile_fp8: Option<&'static str>,
+    reduce: &'static str,
+}
+
+const VERIFY_GQA_GFX1201: VerifyGqaKernels = VerifyGqaKernels {
+    module: "attention_verify_gqa_gfx1201",
+    src: kernels::ATTENTION_VERIFY_GQA_GFX1201_SRC,
+    tile_q8: Some("attention_verify_gqa_q8_gfx1201"),
+    tile_fp8: Some("attention_verify_gqa_fp8_gfx1201"),
+    reduce: "attention_verify_reduce_gfx1201",
+};
+
+fn verify_gqa_kernels(gpu: &Gpu) -> Option<&'static VerifyGqaKernels> {
+    if gpu.arch_caps.is_gfx1201() {
+        Some(&VERIFY_GQA_GFX1201)
+    } else {
+        None
+    }
+}
+
+/// Query rows one VerifyAttn workgroup serves (compile-time in the kernel).
+const VERIFY_GQA_ROWS: usize = 8;
+/// Largest verify block VerifyAttn admits (DFlash B <= 16, MTP K+1, ngram).
+const VERIFY_GQA_MAX_ROWS: usize = 32;
+/// Workgroups the split count aims for: the fixed grid is
+/// `[row_groups * n_kv_heads, splits]` and each workgroup loops over tiles
+/// `y, y + splits, ...` of its row group's live range.
+const VERIFY_GQA_TARGET_WORKGROUPS: usize = 256;
+
+/// Grid-y (split count) of a VerifyAttn launch. It depends on the context only
+/// through `max_tiles`, which under HIP-graph capture is the physical-capacity
+/// tile count, so a captured verify graph (keyed by batch size) always gets the
+/// capped value. The split count never changes output bytes.
+fn verify_gqa_splits(max_tiles: usize, row_groups: usize, n_kv_heads: usize) -> usize {
+    let per_split = (row_groups * n_kv_heads).max(1);
+    let cap = VERIFY_GQA_TARGET_WORKGROUPS.div_ceil(per_split).max(1);
+    max_tiles.clamp(1, cap)
+}
+
 /// Opt-in gate for the WMMA flash-attention prefill path.
 fn is_wmma_fa_enabled() -> bool {
     hipfire_config::developer_bool("HIPFIRE_WMMA_FA", false)
@@ -6951,6 +7008,165 @@ impl Gpu {
         })
     }
 
+    /// VerifyAttn: run a batched flash tile + reduce of `batch_size <= 32`
+    /// query rows through the GQA-shared split-K twin pair
+    /// ([`VerifyGqaKernels`]). `Ok(false)` = not admitted; the caller runs its
+    /// unchanged reference launch. Output and `partials` are byte-identical to
+    /// `attention_flash_{q8_0,fp8_e4m3}_tile_batched` +
+    /// `attention_flash_asym_reduce_batched` with the same arguments, so the
+    /// callers intercept unconditionally (DFlash / MTP / ngram verify, short
+    /// prefill tails). Admission: exact table arch, `kernel.verify_attn`,
+    /// head_dim 256, GQA group 6, tile 128, non-tree full causal legacy-slot
+    /// KV, not recording a Redline tape, partials fit one row. The grid is
+    /// `[ceil(rows/8) * n_kv_heads, splits]` with the tile range derived from
+    /// `positions` on the device, so it is graph-capture-stable.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_attention_verify_gqa(
+        &mut self,
+        kv: VerifyKv,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+        partials: &GpuTensor,
+        tree_bias: Option<&GpuTensor>,
+        block_cols: usize,
+    ) -> HipResult<bool> {
+        if !self.flags.verify_attn || tree_bias.is_some() || block_cols != 0 || self.replay.is_recording() {
+            return Ok(false);
+        }
+        let Some(set) = verify_gqa_kernels(self) else {
+            return Ok(false);
+        };
+        let tile_func = match kv {
+            VerifyKv::Q8 => set.tile_q8,
+            VerifyKv::Fp8 => set.tile_fp8,
+        };
+        let Some(tile_func) = tile_func else {
+            return Ok(false);
+        };
+        let tile_size = self.attn_tile_size();
+        if head_dim != 256
+            || n_kv_heads == 0
+            || n_heads != 6 * n_kv_heads
+            || tile_size != 128
+            || !(1..=VERIFY_GQA_MAX_ROWS).contains(&batch_size)
+            || max_ctx_len == 0
+        {
+            return Ok(false);
+        }
+        let max_tiles = max_ctx_len.div_ceil(tile_size);
+        let stride = 2 + head_dim;
+        let partials_bytes_per_row = n_heads * max_tiles * stride * 4;
+        let partials_capacity = partials.numel() * 4;
+        if partials_capacity < partials_bytes_per_row {
+            return Ok(false);
+        }
+        // Same sub-batching as `launch_asym_flash_batched`, so chunk-local
+        // partial rows land where the reference writes them.
+        let sub_batch = (partials_capacity / partials_bytes_per_row).min(batch_size);
+
+        self.ensure_kernel(set.module, set.src, tile_func)?;
+        self.ensure_kernel(set.module, set.src, set.reduce)?;
+
+        let q_dim = n_heads * head_dim;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let mut offset = 0usize;
+        while offset < batch_size {
+            let chunk = (batch_size - offset).min(sub_batch);
+            let row_groups = chunk.div_ceil(VERIFY_GQA_ROWS);
+            let splits = verify_gqa_splits(max_tiles, row_groups, n_kv_heads);
+            {
+                let q_ptr =
+                    unsafe { (q.buf.as_ptr() as *mut u8).add(offset * q_dim * 4) as *mut c_void };
+                let k_ptr = k_cache.buf.as_ptr();
+                let v_ptr = v_cache.buf.as_ptr();
+                let p_ptr = partials.buf.as_ptr();
+                let pos_ptr = positions.buf.as_ptr();
+                let nr = chunk as i32;
+                let nkv = n_kv_heads as i32;
+                let mt = max_tiles as i32;
+                let bo = offset as i32;
+                let sc = scale;
+                let mut params: Vec<*mut c_void> = vec![
+                    &q_ptr as *const _ as *mut c_void,
+                    &k_ptr as *const _ as *mut c_void,
+                    &v_ptr as *const _ as *mut c_void,
+                    &p_ptr as *const _ as *mut c_void,
+                    &pos_ptr as *const _ as *mut c_void,
+                    &nr as *const _ as *mut c_void,
+                    &nkv as *const _ as *mut c_void,
+                    &mt as *const _ as *mut c_void,
+                    &bo as *const _ as *mut c_void,
+                    &sc as *const _ as *mut c_void,
+                ];
+                self.launch_maybe_blob(
+                    tile_func,
+                    [(row_groups * n_kv_heads) as u32, splits as u32, 1],
+                    [256, 1, 1],
+                    0,
+                    &mut params,
+                    || {
+                        let mut b = hip_bridge::KernargBlob::new();
+                        b.push_ptr(q_ptr);
+                        b.push_ptr(k_ptr);
+                        b.push_ptr(v_ptr);
+                        b.push_ptr(p_ptr);
+                        b.push_ptr(pos_ptr);
+                        b.push_i32(nr);
+                        b.push_i32(nkv);
+                        b.push_i32(mt);
+                        b.push_i32(bo);
+                        b.push_f32(sc);
+                        b
+                    },
+                )?;
+            }
+            {
+                let p_ptr = partials.buf.as_ptr();
+                let o_ptr =
+                    unsafe { (out.buf.as_ptr() as *mut u8).add(offset * q_dim * 4) as *mut c_void };
+                let pos_ptr = positions.buf.as_ptr();
+                let nh = n_heads as i32;
+                let mt = max_tiles as i32;
+                let bo = offset as i32;
+                let mut params: Vec<*mut c_void> = vec![
+                    &p_ptr as *const _ as *mut c_void,
+                    &o_ptr as *const _ as *mut c_void,
+                    &pos_ptr as *const _ as *mut c_void,
+                    &nh as *const _ as *mut c_void,
+                    &mt as *const _ as *mut c_void,
+                    &bo as *const _ as *mut c_void,
+                ];
+                self.launch_maybe_blob(
+                    set.reduce,
+                    [n_heads as u32, chunk as u32, 1],
+                    [256, 1, 1],
+                    0,
+                    &mut params,
+                    || {
+                        let mut b = hip_bridge::KernargBlob::new();
+                        b.push_ptr(p_ptr);
+                        b.push_ptr(o_ptr);
+                        b.push_ptr(pos_ptr);
+                        b.push_i32(nh);
+                        b.push_i32(mt);
+                        b.push_i32(bo);
+                        b
+                    },
+                )?;
+            }
+            offset += chunk;
+        }
+        Ok(true)
+    }
+
     /// Batched flash attention for Q8_0 KV — tile + reduce two-kernel path.
     /// No LDS capacity limit: tiles seq_len into chunks of `tile_size` only,
     /// so shared memory is O(tile_size), not O(max_ctx_len). Replaces the
@@ -6981,6 +7197,24 @@ impl Gpu {
         block_cols: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        if self.try_attention_verify_gqa(
+            VerifyKv::Q8,
+            q,
+            k_cache,
+            v_cache,
+            out,
+            positions,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx_len,
+            batch_size,
+            partials,
+            tree_bias,
+            block_cols,
+        )? {
+            return Ok(());
+        }
         self.launch_asym_flash_batched(
             "attention_flash_q8_0_tile_batched",
             kernels::ATTENTION_FLASH_Q8_0_TILE_BATCHED_SRC,
@@ -7047,6 +7281,24 @@ impl Gpu {
             fp8_e4m3_row_bytes(n_kv_heads, head_dim),
             "attention_flash_fp8_e4m3_tile_batched",
         )?;
+        if self.try_attention_verify_gqa(
+            VerifyKv::Fp8,
+            q,
+            k_cache,
+            v_cache,
+            out,
+            positions,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx_len,
+            batch_size,
+            partials,
+            tree_bias,
+            block_cols,
+        )? {
+            return Ok(());
+        }
         self.launch_asym_flash_batched(
             "attention_flash_fp8_e4m3_tile_batched",
             kernels::ATTENTION_FLASH_FP8_E4M3_TILE_BATCHED_SRC,
