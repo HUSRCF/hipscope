@@ -16,6 +16,70 @@ use crate::tables::KernelRegistry;
 use crate::traits::KernelFamily;
 use crate::types::*;
 
+/// Exact wire format and epilogue for the opt-in packed dispatcher entries.
+fn packed_gemm_contract(key: KernelKey) -> Option<(DType, bool)> {
+    use KernelKey::*;
+    match key {
+        GemmMq4Packed => Some((DType::MQ4G256, false)),
+        GemmMq4PackedResidual => Some((DType::MQ4G256, true)),
+        GemmMq4V2Packed => Some((DType::MQ4G256V2, false)),
+        GemmMq4V2PackedResidual => Some((DType::MQ4G256V2, true)),
+        _ => None,
+    }
+}
+
+fn validate_packed_gemm_dtype(key: KernelKey, dtype: DType) -> Result<(), DispatchError> {
+    if let Some((expected, _)) = packed_gemm_contract(key) {
+        if dtype != expected {
+            return Err(DispatchError::Hip(format!(
+                "packed GEMM key {:?} requires {:?}, got {:?}",
+                key, expected, dtype
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Run a Q8 projection while refreshing the F16 activation conversion on every
+/// invocation. Pointer-keyed conversion caches are unsafe for layer-reused
+/// scratch buffers whose contents change between projections.
+#[inline]
+pub fn run_q8_projection_fresh(
+    gpu: &mut Gpu,
+    w: &GpuTensor,
+    x: &GpuTensor,
+    y: &GpuTensor,
+    m: usize,
+    k: usize,
+    batch_size: usize,
+    x_f16: &GpuTensor,
+    enable_wmma: bool,
+) -> hip_bridge::HipResult<()> {
+    if enable_wmma && gpu.arch_caps.has_wmma() && k % 32 == 0 {
+        gpu.deepseek4_convert_f32_to_f16(x, x_f16, (batch_size * k) as i64)?;
+        gpu.gemm_q8_0_wmma(w, x_f16, y, m, k, batch_size)
+    } else {
+        gpu.gemm_q8_0_batched_chunked(w, x, y, m, k, batch_size)
+    }
+}
+
+/// Select the residual GEMM key for a packed weight container.
+pub fn residual_gemm_key_for(dtype: DType) -> KernelKey {
+    match dtype {
+        DType::MQ4G256V2 => KernelKey::GemmMq4G256V2Residual,
+        DType::MQ4CG256 => KernelKey::GemmMq4CG256Residual,
+        DType::MQ6G256V2 => KernelKey::GemmMq6G256V2Residual,
+        DType::MQ5G256V2 => KernelKey::GemmMq5G256V2Residual,
+        DType::MQ3G256V2 => KernelKey::GemmMq3G256V2Residual,
+        DType::MQ2G256V2 => KernelKey::GemmMq2G256V2Residual,
+        // qt=52 must NEVER alias a uniform key (silent noise at full speed):
+        // Lloyd prefill uses the FP8-LUT launchers directly, never these keys.
+        DType::MQ4G256V2Lloyd => panic!(
+            "residual_gemm_key_for: MQ4G256V2Lloyd (qt=52) has no uniform residual key — route Lloyd prefill through gemm_hfq4g256_residual_wmma_gfx12_mq4v2_fp8_lloyd"
+        ),
+        _ => KernelKey::GemmHfq4G256Residual,
+    }
+}
 fn is_gemm_hfq4_key(key: KernelKey) -> bool {
     matches!(
         key,
@@ -145,6 +209,14 @@ impl GemmFamily {
             DType::TQ2G128 => KernelKey::GemmTQ2G128Prefill,
             DType::BQ1G128 => KernelKey::GemmBQ1G128Prefill,
             DType::MQ4G256V2 => KernelKey::GemmMq4G256V2,
+            DType::MQ4G128V2 => {
+                return Err(DispatchError::UnsupportedVariant {
+                    family: "gemm",
+                    variant: "mq4g128v2_specialized_route_only",
+                    arch: "",
+                    quant: "MQ4G128V2",
+                });
+            }
             DType::MQ6G256V2 => KernelKey::GemmMq6G256V2,
             DType::MQ5G256V2 => KernelKey::GemmMq5G256V2,
             DType::MQ3G256V2 => KernelKey::GemmMq3G256V2,
@@ -194,6 +266,10 @@ impl GemmFamily {
     /// site that called the dispatcher entry point directly. Use this method for
     /// those; use [`run`] only where the dtype-keyed heuristic matches the
     /// site's prior behavior.
+    ///
+    /// Explicit packed MQ4 entries retain their GPU entry's narrow experimental
+    /// admission checks (opt-in, exact arch/shape, outside capture). Registry
+    /// membership alone does not imply that a packed call is admitted.
     pub fn run_key(
         &self,
         key: KernelKey,
@@ -201,6 +277,14 @@ impl GemmFamily {
         gpu: &mut Gpu,
         params: &GemmParams,
     ) -> Result<(), DispatchError> {
+        if params.w.dtype == DType::MQ4G128V2 {
+            return Err(DispatchError::UnsupportedVariant {
+                family: "gemm",
+                variant: "mq4g128v2_specialized_route_only",
+                arch: "",
+                quant: "MQ4G128V2",
+            });
+        }
         // Validate the explicit key is registered and arch-admissible. The
         // dispatcher-entry keys used at migrated prefill sites are registered
         // `ArchPredicate::Always`, so this never rejects on a supported build.
@@ -212,6 +296,19 @@ impl GemmFamily {
         let batch_size = params.batch_size;
         let m = w.m;
         let k = w.k;
+
+        // Preserve the former direct-call sequence: packed consumes already
+        // rotated F32, and must not acquire the generic calibration tap below.
+        // Registry resolution above is mandatory; the original GPU entry owns
+        // opt-in / arch / shape / capture admission and the pack+GEMM sequence.
+        if let Some((dtype, add)) = packed_gemm_contract(key) {
+            validate_packed_gemm_dtype(key, w.dtype)?;
+            return if dtype == DType::MQ4G256V2 {
+                hip!(gpu.gemm_mq4v2_packed(w.buf, x, y, m, k, batch_size, add))
+            } else {
+                hip!(gpu.gemm_mq4_packed(w.buf, x, y, m, k, batch_size, add))
+            };
+        }
 
         // Calibration tap. This is the batched chokepoint for every arch that
         // migrated off `llama::weight_gemm` onto dispatcher-entry keys —
@@ -245,6 +342,33 @@ impl GemmFamily {
                  v2 stores fp16 scale/zero per 128 weights (s0/z0 for 0..127, s1/z1 for 128..255) \
                  where v1 stores f32 scale/zero per 256, so the v1 kernel decodes every weight \
                  to ~1e-14. This is a missing v2 routing arm at the callsite, not a valid configuration.",
+                w.dtype, key
+            )));
+        }
+        // qt=52 (Lloyd-V2) must NEVER ride a uniform kernel: same 136 B stride
+        // as qt=44/v1, so the mis-route runs at full speed and returns noise.
+        // Lloyd prefill goes through the FP8-LUT launchers (`*_fp8_lloyd`),
+        // never these uniform keys.
+        if w.dtype == DType::MQ4G256V2Lloyd && is_gemm_hfq4_key(key) {
+            return Err(DispatchError::Hip(format!(
+                "qt=52 (MQ4G256V2Lloyd) weight (dtype {:?}) routed to uniform v1 kernel key {:?}: \
+                 Lloyd codes decoded on the uniform affine grid are silent noise. \
+                 Route Lloyd prefill through the FP8-LUT launchers (*_fp8_lloyd), not uniform keys.",
+                w.dtype, key
+            )));
+        }
+        if w.dtype == DType::MQ4G256V2Lloyd && is_gemm_mq4v2_key(key) {
+            return Err(DispatchError::Hip(format!(
+                "qt=52 (MQ4G256V2Lloyd) weight (dtype {:?}) routed to uniform qt=44 kernel key {:?}: \
+                 same 136 B stride but Lloyd codes need the per-tensor codebook LUT. \
+                 Route Lloyd prefill through the FP8-LUT launchers (*_fp8_lloyd), not uniform keys.",
+                w.dtype, key
+            )));
+        }
+        if w.dtype == DType::MQ4G256V2Lloyd && is_gemm_mq4c_key(key) {
+            return Err(DispatchError::Hip(format!(
+                "qt=52 (MQ4G256V2Lloyd) weight (dtype {:?}) routed to mq4c kernel key {:?}: \
+                 equal stride is not interchangeable; mis-route is silent noise.",
                 w.dtype, key
             )));
         }
@@ -550,6 +674,52 @@ mod tests {
     use crate::context::DispatchCtx;
     use crate::types::{DispatchError, KernelKey};
     use rdna_compute::DType;
+
+    #[test]
+    fn packed_gemm_registry_preserves_wire_format_and_epilogue() {
+        use super::{packed_gemm_contract, validate_packed_gemm_dtype};
+        let family = GemmFamily::new();
+        let ctx = DispatchCtx::for_test("gfx1100");
+        for (key, dtype, add) in [
+            (KernelKey::GemmMq4Packed, DType::MQ4G256, false),
+            (KernelKey::GemmMq4PackedResidual, DType::MQ4G256, true),
+            (KernelKey::GemmMq4V2Packed, DType::MQ4G256V2, false),
+            (KernelKey::GemmMq4V2PackedResidual, DType::MQ4G256V2, true),
+        ] {
+            let resolved = family.registry().resolve(key, &ctx, None).unwrap();
+            assert_eq!(resolved.key, key);
+            assert_eq!(packed_gemm_contract(resolved.key), Some((dtype, add)));
+            assert!(validate_packed_gemm_dtype(key, dtype).is_ok());
+            for other in [
+                DType::MQ4G256,
+                DType::MQ4G256V2,
+                DType::MQ4G256V2Lloyd,
+                DType::HFQ4G256,
+                DType::MQ4CG256,
+            ] {
+                assert_eq!(
+                    validate_packed_gemm_dtype(key, other).is_ok(),
+                    other == dtype
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn packed_gemm_never_changes_default_resolution() {
+        use super::packed_gemm_contract;
+        let family = GemmFamily::new();
+        for arch in [
+            "gfx906", "gfx1030", "gfx1100", "gfx1151", "gfx1200", "gfx1201",
+        ] {
+            let ctx = DispatchCtx::for_test(arch);
+            for dtype in [DType::MQ4G256, DType::MQ4G256V2, DType::HFQ4G256] {
+                if let Ok(resolved) = family.resolve(dtype, &ctx, None) {
+                    assert_eq!(packed_gemm_contract(resolved.key), None);
+                }
+            }
+        }
+    }
 
     #[test]
     fn v2_plain_resolves_exact_not_hfq4() {

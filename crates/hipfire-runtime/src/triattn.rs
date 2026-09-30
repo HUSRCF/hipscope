@@ -2,6 +2,8 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
+// lifecycle: deprecated since 0.4.0, removal 0.5.0 — CASK/TriAttention KV eviction is unsupported research; use compact kv_cache modes
+
 //! TriAttention: KV-cache compression via trigonometric series scoring.
 //!
 //! Reference: Mao et al. 2026 "TriAttention: Efficient Long Reasoning with
@@ -972,7 +974,8 @@ impl EvictionCtx {
         let tier = kv.k_tier();
         assert!(
             tier.is_compactable(),
-            "TriAttention eviction only supports Q8, asym2, asym3, asym4 KV modes for now (got {tier:?})"
+            "TriAttention eviction only supports Q8, asym2, asym3, asym4 KV modes for now \
+             (got {tier:?}); native fp8/bf16 KV is rejected before compaction, never re-encoded"
         );
         let k_bytes_per_pos = tier.k_bytes_per_pos(self.n_kv_heads, self.head_dim);
         let v_bytes_per_pos = match kv.v_mode {

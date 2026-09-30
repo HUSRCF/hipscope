@@ -39,13 +39,16 @@ Under standard MQ/HF/HFP/MFP recipes, embeddings are forced to `Q8F16`
 (Q4-grade embedding error compounds). 1D norms / scales stay F16. Direct
 recipes such as `q4k-all` intentionally bypass that embedding rule.
 
-### Magnum V2 family (qt 44 / 47–50) and MQ4C (qt 45)
+### Magnum V2 family (qt 44 / 47–50 / 52) and MQ4C (qt 45)
 
 Magnum V2 uses a neutral-size **8 B dual half `fp16 scale + fp16 zero` header
 per 128 weights**, with payload packing unchanged from the matching v1 bit
 width. Group strides: bits **2/3/4/5/6 → 72/104/136/168/200** B per 256
 elements. MQ4C is separate: one per-256 fp16 scale+zero pair at `[0..4)`,
-zero padding at `[4..8)`, and the 4-bit payload at `+8`.
+zero padding at `[4..8)`, and the 4-bit payload at `+8`. qt=52
+`MQ4G256V2L` / `DType::MQ4G256V2Lloyd` keeps the qt=44 136 B group container
+and adds a per-tensor F32[16] `lloyd_levels` sidecar (see
+[mq4-v2.md](quant-formats/mq4-v2.md) Lloyd section).
 
 | `--format` | qt | `DType` | B/group | Product note |
 |---|---:|---|---:|---|
@@ -55,6 +58,7 @@ zero padding at `[4..8)`, and the 4-bit payload at `+8`.
 | `mq5v2` | **48** | `MQ5G256V2` | 168 | Dense product candidate (ladder) |
 | `mq3v2` | **49** | `MQ3G256V2` | 104 | Dense product candidate (ladder) |
 | `mq2v2` | **50** | `MQ2G256V2` | 72 | **Wire + runtime supported; product quality-rejected** |
+| `mq4v2-lloyd` / tiers `mq4l-xt` · `mq4l` · `mq4l-pro` | **52** | `MQ4G256V2Lloyd` | 136 + `lloyd_levels` | V2 wire + per-tensor 16-level Lloyd codebook; product tiers vs AWQ'd uniform |
 
 **Wire implementation ≠ product admission.** MQ2V2 loads, decodes, and passes
 parity, but measured Qwen3.8 ladder KLD is catastrophic (~12–14 nats WT2/v6sel).
@@ -123,8 +127,8 @@ the PARO probe path.)
 |---|---|---|
 | `MQ3G256` | WMMA on gfx1100/1101/1102/1150/1151/1200/1201; scalar batched on gfx101x/103x; else not | Same plus **gfx1103** and **gfx1152** on the WMMA set; same gfx10 scalar set |
 | `HFP4G32`, `MFP4G32` | WMMA arches only (llama set above) | WMMA arches only (qwen35 set, includes gfx1103/1152) |
-| `MQ3G256Lloyd` | **Not** batch-eligible | WMMA on gfx1100/1101/1102/1150/1151; gfx1200/1201 only with `HIPFIRE_LLOYD_GFX12=1` |
-| `MQ4G256Lloyd` | **Not** batch-eligible | WMMA on gfx1100/1101/1102/1151 (no gfx1150); gfx1200/1201 only with `HIPFIRE_LLOYD_GFX12=1` |
+| `MQ3G256Lloyd` | **Not** batch-eligible | WMMA on gfx1100/1101/1102/1150/1151/1200/1201 |
+| `MQ4G256Lloyd` | **Not** batch-eligible | WMMA on gfx1100/1101/1102/1151/1200/1201 (no gfx1150) |
 | Other Lloyd / E8 / research dtypes | Not batch-eligible here | Additional arms (e.g. E8) may exist behind their own env gates — see source |
 
 Uniform MQ3 ships WMMA residual / fused GEMM kernels on RDNA3+ and is
@@ -173,7 +177,7 @@ Per 256 elements, 8-byte header + packed payload. HFQ4 and MQ4 v1 both store an
 - zero / min: f32
 - data: `bitwidth × 256 / 8` bytes (128 for 4-bit, 96 for 3-bit, 192 for 6-bit, …)
 
-### V2 (qt 44 / 47–50) and MQ4C (qt 45)
+### V2 (qt 44 / 47–50 / 52) and MQ4C (qt 45)
 
 Same 8-byte header budget and payload offset **+8**, different header encoding:
 
@@ -181,29 +185,40 @@ Same 8-byte header budget and payload offset **+8**, different header encoding:
   at `[4..8)`; payload packing identical to the matching v1 bit width.
 - **MQ4CG256:** one packed fp16 scale+zero at `[0..4)`, mandatory zero pad
   `[4..8)`, 128 B nibbles at `[8..136)` (v1-compatible geometry).
+- **MQ4G256V2L (qt 52):** byte-identical 136 B group to qt=44; nibble `q`
+  decodes through a per-tensor F32[16] Lloyd codebook sidecar
+  (`<tensor>.lloyd_levels`), with loader zero-point rewrite
+  `zp' = f16(zp + 7.5·sc)` and centered levels `C = L − 7.5`.
 
-Lloyd variants replace the uniform grid with a per-block (or per-tensor) fp16
-codebook plus packed indices; byte sizes differ (e.g. MQ3-Lloyd 112 B/group,
-MQ4-Lloyd 160 B/group).
+Legacy Lloyd variants (qt 19/20/30) replace the uniform grid with a per-block
+(or per-tensor) fp16 codebook plus packed indices; byte sizes differ (e.g.
+MQ3-Lloyd 112 B/group, MQ4-Lloyd 160 B/group).
 
 ## KV cache
 
 K and V are quantized differently: K enters softmax (errors exponentiate); V is
-already attention-weighted. Live modes store **V as Q8** and compress **K**:
+already attention-weighted. Split modes store **V as Q8** (or Lloyd V via
+`--kv-v`) and compress **K**; native `fp8`/`bf16` store K and V in one layout:
 
 | Mode | K | V | Notes |
 |---|---|---|---|
-| `q8` | Q8_0 (G32) | Q8_0 | Default fall-through; DFlash-safe |
-| `fwht4` / `fwht3` / `fwht2` | FWHT-rotated K at 4/3/2-bit | Q8_0 | Same byte layout family as legacy asym; FWHT basis matches MQ drafts → better DFlash acceptance |
-| `asym4` / `asym3` / `asym2` | Givens + Lloyd-Max K | Q8_0 | **Legacy**; degrades DFlash acceptance vs fwht* |
-| `turbo` / `turbo2` / `turbo3` / `turbo4` | aliases | | Map to asym3 / asym2 / asym3 / asym4 |
+| `q8` | Q8_0 (G32) | Q8_0 | `auto` default wherever native fp8 does not apply (gfx1100, gfx1151, …); DFlash-safe |
+| `fp8` | FP8 E4M3 | FP8 E4M3 | Qwen-only native pair; `auto` default on native-eligible exact gfx1201 (H24/Hkv4/D256, single GPU, no adaptive/CASK) |
+| `fwht4` / `fwht3` / `fwht2` | FWHT-rotated K at 4/3/2-bit | Q8_0 | Optional headroom modes (Qwen3.5 family, any arch), not a default. Same byte layout family as legacy asym; FWHT basis matches MQ drafts → better DFlash acceptance |
+| `asym4` / `asym3` / `asym2`, `turbo` / `turbo2` / `turbo3` / `turbo4` | **Legacy spellings** | Q8_0 | On Qwen they are aliases: `asymN`/`turboN` → `fwhtN`, `turbo` → `fwht3`. Only the llama HFQ loader still maps bare `asym3`/`asym4`/`turbo4` to the Givens constructors |
+| `legacy-asym4` / `legacy-asym3` / `legacy-asym2` | Givens + Lloyd-Max K | Q8_0 | **Legacy**; Qwen `--kv-k` only; degrades DFlash acceptance vs fwht* |
 
-**Default resolution** (`crates/hipfire-cli/src/main.rs`):
+**Default resolution** (`load_params` in `crates/hipfire-cli/src/main.rs`,
+then the load site's policy in `crates/hipfire-runtime/src/kv_mode.rs`):
 
-1. `HIPFIRE_KV_MODE` env
-2. Per-model config `kv_cache`
-3. Registry `default_kv_mode` when config is `auto`
-4. Else **`q8`**
+1. CLI `--kv-mode`
+2. `HIPFIRE_KV_MODE` env, then per-model / global config `kv_cache`
+3. Registry `default_kv_mode` when no user layer sets `kv_cache` and the
+   card's value is not `q8` (a `q8` card value is left to `auto`)
+4. Else `auto`, resolved by the architecture: Qwen native **fp8** on
+   native-eligible exact gfx1201, **q8** on every other Qwen load
+   (gfx1100, gfx1151, …); other families keep their own default (Maple
+   bf16, DeepSeek V4 f32, others q8)
 
 There is **no** live per-arch `archDefaults` table (removed). Compressed modes
 are opt-in via registry cards or explicit config — not guessed from GPU VRAM.
@@ -290,6 +305,8 @@ Source of truth: [`quant-formats/qt-register.txt`](quant-formats/qt-register.txt
 | 48 | MQ5G256V2 | Magnum 5-bit V2 — 168 B |
 | 49 | MQ3G256V2 | Magnum 3-bit V2 — 104 B |
 | 50 | MQ2G256V2 | Magnum 2-bit V2 — 72 B; **wire OK, product rejected** |
+| 51 | MQ2G256LloydU | Maple Lloyd-U passthrough (register) |
+| 52 | MQ4G256V2L | **MQ4 V2 + per-tensor Lloyd codebook** — 136 B group + `lloyd_levels` F32[16] sidecar; product tiers `mq4l-xt` / `mq4l` / `mq4l-pro` |
 
 **Current reserved wire IDs:** 23 and 25–27 only. IDs **22, 29, and 30 were
 reassigned** (TidI32, PARO4G128T, MQ4G256Lloyd). qt **42–43 and 46** are not

@@ -9,6 +9,7 @@ cargo check --workspace --examples
 
 echo "== Rust no-GPU unit tests =="
 cargo test -p rdna-compute --lib
+cargo test -p hipfire-cpu --lib
 cargo test -p hipfire-arch-qwen35 --lib moe_prefill
 cargo test -p hipfire-config -p hipfire-registry -p hipfire-client -p hipfire-cli -p hipfire-tui
 
@@ -28,3 +29,6 @@ python3 scripts/test_uninstall.py
 
 echo "== Env/docs drift check =="
 python3 scripts/check-env-docs.py
+
+echo "== Lifecycle check (deprecated surfaces opt-in; env/config lifecycle status) =="
+python3 scripts/check-lifecycle.py

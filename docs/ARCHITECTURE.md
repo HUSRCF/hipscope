@@ -95,6 +95,25 @@ hot-path `dyn` forward. **LLaMA exception:** `hipfire-arch-llama` is a facade �
 canonical dense LLaMA/Mistral/plain-Qwen3 forward and shared transformer types
 still live in `hipfire_runtime::llama`; the arch crate re-exports them.
 
+### Qwen4 typed layer seam
+
+The current Qwen4 ordinary-HIP path keeps family binding in
+`crates/hipfire-arch-qwen4/src/program.rs` and `gpu_forward.rs`: typed
+dimensions/descriptors, resident-resource binding, bounded scratch, row-shaped
+router views, and whole-program preflight live there. Neutral stateful
+operation contracts and execution remain in
+`crates/hipfire-dispatch/src/pipeline/layer_ops.rs` and `steps.rs`; the sealed
+QT44/QT53 MoE route remains shared in `pipeline/sealed_moe.rs`,
+`moe_program.rs`, and `qt44_qt53_prefill.rs`. Fixed Qwen4 HIP helpers are
+registered by `hipfire-arch-qwen4/src/gpu_ops.rs`, while
+`rdna-compute/src/tensor_ops.rs` and `grouped_ops.rs` provide neutral wrapper
+contracts. This is an implementation ownership map, not replay/PM4 admission,
+physical-EP proof, or a performance promotion.
+
+With `deltanet` enabled, the fixed-geometry QT44/QT53 route is admitted on
+any AMD GPU for matching wire formats and operands; gfx1151-specific kernel
+optimizations do not gate ordinary-HIP serving.
+
 ## Request lifecycle
 
 ```text
@@ -105,10 +124,10 @@ Native CLI (`crates/hipfire-cli`)
   resolve registry tag → model path under ~/.hipfire/models/ (or local path)
   if serve up AND not forced local → HTTP POST /v1/chat/completions
     forced local when `HIPFIRE_LOCAL` is truthy or any of `--image`,
-    `--kv-mode`, `--kv-backend`, `--spec`/`--speculation`, `--model-draft`,
-    `--draft-max`, `--dspark-conf-threshold` is passed (`force_local` in
-    `crates/hipfire-cli/src/main.rs`; `--json`/`--no-stream` ride the HTTP
-    route and do not force local)
+    `--kv-mode`, `--kv-backend`, `--kv-k`, `--kv-v`, `--spec`/`--speculation`,
+    `--model-draft`, `--draft-max`, `--dspark-conf-threshold` is passed
+    (`force_local` in `crates/hipfire-cli/src/main.rs`; `--json`/`--no-stream`
+    ride the HTTP route and do not force local)
     if HTTP fails while serve still live → abort (no local spawn; would collide)
   else → spawn one-shot daemon binary
         │
@@ -267,20 +286,30 @@ clauses when a newer predicate subsumes them.
 ### Kernel build
 
 ```text
-kernels/src/<name>.hip
-kernels/src/<name>.gfx1201.hip          # chip override
-kernels/src/<name>.gfx12.hip            # family override (e.g. gfx1200+gfx1201)
-        │  scripts/compile-kernels.sh  (chip → family → base)
+Rust ensure_kernel source expression (preambles, header stitching, selectors)
+        │ hipfire-kernel-registry --arch <arch>
         ▼
-kernels/compiled/<arch>/…               # packaged / tree prebuild output
-~/.hipfire_kernels/<arch>/<name>.<hash>.hsaco  # default JIT cache (or HIPFIRE_KERNEL_CACHE)
+exact six-column source/flags registry
+        │ scripts/compile-kernels.sh → hipfire-kernel-pack
+        ▼
+<daemon-bin-dir>/kernels/compiled/<arch>/<module>.hsaco + .index.json + .hash
+~/.hipfire_kernels/<arch>/<module>.<hash>.hsaco  # writable JIT cache
 ```
 
-On startup the runtime prefers a hash-matching precompiled blob. Missing or
-mismatched hash → hipcc JIT into the cache when hipcc is available; if hipcc is
-unavailable, an explicitly warned **unvalidated** precompiled blob may still be
-used. `hipfire diag` reports compiled blob/hash counts per arch, not which path
-supplied each kernel.
+The runtime verifies the installed index and object SHA-256 before loading,
+even with hipcc present. A missing or stale index falls back to JIT only when
+hipcc is available; compiler-free loads fail closed. Packaged module names
+come from the exact Rust registry, never HIP source basenames.
+
+JIT and packaged objects share one core recipe: `--genco --offload-arch=<arch>
+-O3 --no-offload-compress -fuse-cuid=none`, then the extra, per-module and
+per-kernel flags (`KernelCompiler::recipe_for_source`).
+`-fuse-cuid=none` drops hipcc's `__hip_cuid_*` symbol, which is named after the
+input path and argv. On one host the object bytes therefore depend only on the
+source, the recipe and the resolved toolchain and headers, not on the cache root
+or temp name. The cache ABI is part of every hot key, packaging key and index.
+It changes whenever the core recipe does, so objects from an older recipe miss
+and are recompiled instead of being mixed in.
 
 Some arch crates also ship crate-local HIP (registered through their own
 `kernels.rs`) for family-specific ops.
@@ -369,11 +398,53 @@ accepted sets differ by carrier). Concrete modes include:
 | Mode | Role (summary) |
 |---|---|
 | `q8` | Q8_0 K and V |
-| `asym2` / `asym3` / `asym4` | Lower-bit rotated/Lloyd K; V typically wider |
-| `fwht2` / `fwht3` / `fwht4` | FWHT-rotated K tiers |
+| `fp8` / `bf16` | Native K+V layout (`fp8`: Qwen single-GPU; `bf16`: Qwen quality-control arm, Maple default) |
+| `fwht2` / `fwht3` / `fwht4` | FWHT-rotated K tiers + Q8 V; optional headroom modes |
+| `asym2` / `asym3` / `asym4` | **Legacy** Givens-rotated Lloyd K + Q8 V. On Qwen the bare names alias `fwhtN`; the Givens constructors need `legacy-asymN` |
 
-Exact layouts and math: [`QUANTIZATION.md`](QUANTIZATION.md). Hybrid linear
-layers (DeltaNet) use fixed recurrent state instead of FA KV for those layers.
+**Qwen-family `auto` / unset** (arch-aware, Qwen only): native **fp8/fp8** on
+exact `gfx1201` when the load is native-eligible (H24/Hkv4/D256, single GPU,
+no adaptive, no CASK); **q8/q8** everywhere else, gfx1100 and gfx1151
+included. Non-Qwen family defaults are unchanged (Maple BF16, DeepSeek
+compressor F32, Gemma layered policy, …). Full K/V axis overrides (`--kv-k` /
+`--kv-v`) and precedence live in [`CONFIG.md`](CONFIG.md) / [`CLI.md`](CLI.md).
+
+**Backend selection** (`--kv-backend` / `memory.kv_backend`): accept only
+`legacy` \| `vmm`. Omitted request is **automatic** and prefers **VMM** on
+certified combinations; otherwise falls back to legacy once per load with a
+logged reason. Selecting legacy (explicit or automatic) emits exactly one
+stderr warning whose stable token is the contiguous substring
+`HIPFIRE_KV_BACKEND=legacy`. Old spelling `contiguous` is rejected with a
+migration error that names `legacy`. Explicit `vmm` on an unsupported
+combination fails closed before teardown.
+
+**Physical layout:** the legacy backend still backs the trunk KV arena as one
+physically contiguous allocation (stable base pointer for the full
+reservation). VMM instead reserves a virtual address range and maps physical
+pages on demand; both keep graph/retained base pointers stable within their
+model. Private draft caches (DFlash/MTP) are owned separately and do not
+relabel the trunk backend. Exact quant layouts and math:
+[`QUANTIZATION.md`](QUANTIZATION.md). Hybrid linear layers (DeltaNet) use fixed
+recurrent state instead of FA KV for those layers.
+
+**VMM virtual-address lifetime:** a released `VmmArena` unmaps its segments and
+frees its physical handles, but never returns its virtual range to the driver
+(`hipMemAddressFree` is not called). The range stays reserved for the life of
+the process and is counted by `hip_bridge::retired_va_bytes()`. On ROCm 10.0 (HIP 7.15), a VA can
+keep translating to its first backing after `hipMemUnmap` + `hipMemMap` of
+another handle: kernels read stale pages even after `hipDeviceSynchronize`.
+In the 80 × 2 MiB repro that is every page on gfx1201 (R9700), 84% on gfx1100
+(7900 XTX), and none on gfx1151 (Strix Halo). The exact
+trigger is not isolated; a replay of hipfire's own release → re-reserve
+sequence got the same VA back but read no stale pages. A hint-less `hipMemAddressReserve` after a free
+returns exactly the freed range, so without retirement every unload → load in
+one daemon (model swap, serve idle eviction, `max_seq` change, failed-load
+retry) would re-map VAs the GPU had translated before. Retired VA is cheap:
+Qwen3.8-27B at `max_seq` 4096 retires 192 MiB per load (about 8 GiB at 256K).
+New reservations are refused with a restart hint once 64 TiB is retired, half
+of the 128 TiB user VA space. Growth inside a live arena only ever maps
+fresh offsets. A failed access reset in `map_next` poisons the arena instead of
+letting a retry map a new handle at the address it just unmapped.
 
 ## Observability hooks
 

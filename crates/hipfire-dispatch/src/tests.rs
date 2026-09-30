@@ -775,6 +775,33 @@ fn gemv_steps_rotation_matches_plan() {
 // ── GemvFamily::resolve via populated table ───────────────────────────────────
 
 #[test]
+fn mq4g128v2_is_explicitly_rejected_by_generic_dispatch_families() {
+    let gemv = GemvFamily::new();
+    for variant in [
+        GemvVariant::Plain,
+        GemvVariant::Prerotated,
+        GemvVariant::WithResidual,
+        GemvVariant::WithSwiGLUResidual,
+    ] {
+        let result = gemv.resolve(DType::MQ4G128V2, variant, false, &ctx_rdna3(), None);
+        match result {
+            Err(DispatchError::UnsupportedVariant { quant, .. }) => {
+                assert_eq!(quant, "MQ4G128V2");
+            }
+            other => panic!("qt53 GEMV unexpectedly resolved through a generic family: {other:?}"),
+        }
+    }
+
+    let gemm = crate::families::gemm::GemmFamily::new();
+    match gemm.resolve(DType::MQ4G128V2, &ctx_rdna3(), None) {
+        Err(DispatchError::UnsupportedVariant { quant, .. }) => {
+            assert_eq!(quant, "MQ4G128V2");
+        }
+        other => panic!("qt53 GEMM unexpectedly resolved through a generic family: {other:?}"),
+    }
+}
+
+#[test]
 fn gemv_family_resolves_f32_on_all_archs() {
     let fam = GemvFamily::new();
     assert!(fam
@@ -953,15 +980,17 @@ fn pipeline_single_op_self_satisfies() {
 }
 
 // ── MoeResolution eligibility lattice (mirrors qwen35.rs:4598-4671) ──
-use crate::families::moe::{MoeDtypes, MoeResolution};
+use crate::families::moe::{MoeDtypes, MoeResolution, MoeSharedDtypes};
 
 fn dtypes_all_mq4() -> MoeDtypes<'static> {
     MoeDtypes {
         router: DType::MQ4G256,
-        shared_gate: DType::MQ4G256,
-        shared_expert_gate: DType::MQ4G256,
-        shared_expert_up: DType::MQ4G256,
-        shared_expert_down: DType::MQ4G256,
+        shared: Some(MoeSharedDtypes {
+            selector: DType::MQ4G256,
+            gate: DType::MQ4G256,
+            up: DType::MQ4G256,
+            down: DType::MQ4G256,
+        }),
         experts_all_gate_up_mq4: true,
         routed_gate_up: DType::MQ4G256,
         routed_down: DType::MQ4G256,
@@ -1090,6 +1119,30 @@ fn moe_res_q8_router_still_gpu_topk() {
 }
 
 #[test]
+fn qwen35_and_cohere_k8_preserve_gpu_topk_routed_decode() {
+    // Qwen3.5 uses an MQ4 router; Cohere's route uses Q8.  The router dtype
+    // only changes the fused gate-side decision, never the existing k=8
+    // routed-expert top-k path.
+    for (family, router) in [("Qwen3.5", DType::MQ4G256), ("Cohere", DType::Q8_0)] {
+        let mut d = dtypes_all_mq4();
+        d.router = router;
+        let resolved = MoeResolution::resolve(&d, 8);
+        assert!(
+            resolved.routed_indexable_mq4,
+            "{family}: routed MQ4 experts must remain indexable"
+        );
+        assert!(
+            resolved.use_gpu_topk,
+            "{family}: k=8 must retain device-side top-k routing"
+        );
+        assert!(
+            resolved.needs_x_rot_local,
+            "{family}: routed MQ4 experts require FWHT activation rotation"
+        );
+    }
+}
+
+#[test]
 fn moe_res_k6_disables_gpu_topk_even_when_indexable() {
     // deepseek-shaped: indexable routed dtype but k != 8 => no GPU fast path
     let r = MoeResolution::resolve(&dtypes_all_mq4(), 6);
@@ -1118,10 +1171,12 @@ fn moe_res_all_mq4v2_gate_quartet_is_fusable_mq4v2() {
     // never the V1 fused route. Still needs the rotated activation.
     let mut d = dtypes_all_mq4();
     d.router = DType::MQ4G256V2;
-    d.shared_gate = DType::MQ4G256V2;
-    d.shared_expert_gate = DType::MQ4G256V2;
-    d.shared_expert_up = DType::MQ4G256V2;
-    d.shared_expert_down = DType::MQ4G256V2;
+    d.shared = Some(MoeSharedDtypes {
+        selector: DType::MQ4G256V2,
+        gate: DType::MQ4G256V2,
+        up: DType::MQ4G256V2,
+        down: DType::MQ4G256V2,
+    });
     d.routed_gate_up = DType::MQ4G256V2;
     d.routed_down = DType::MQ4G256V2;
     d.experts_all_gate_up_mq4 = true;
@@ -1166,7 +1221,7 @@ fn moe_res_mixed_v1_v2_gate_quartet_is_not_fusable() {
 
     // V1 router + one V2 shared half
     let mut d = dtypes_all_mq4();
-    d.shared_expert_up = DType::MQ4G256V2;
+    d.shared.as_mut().unwrap().up = DType::MQ4G256V2;
     let r = MoeResolution::resolve(&d, 8);
     assert!(!r.gate_fusable, "single V2 shared-up disqualifies V1 fuse");
     assert!(
@@ -1191,10 +1246,12 @@ fn moe_res_shipped_ornith15_takes_the_indexed_path() {
     // the shipped model decoded through the resident CPU-fallback path.
     let mut d = dtypes_all_mq4();
     d.router = DType::Q8_0;
-    d.shared_gate = DType::Q8_0;
-    d.shared_expert_gate = DType::MQ6G256;
-    d.shared_expert_up = DType::MQ6G256;
-    d.shared_expert_down = DType::MQ6G256;
+    d.shared = Some(MoeSharedDtypes {
+        selector: DType::Q8_0,
+        gate: DType::MQ6G256,
+        up: DType::MQ6G256,
+        down: DType::MQ6G256,
+    });
     d.routed_gate_up = DType::MQ4G256V2;
     d.routed_down = DType::MQ4G256V2;
     d.experts_all_gate_up_mq4 = false;
@@ -1608,6 +1665,9 @@ fn dummy_wr<'a>(t: &'a rdna_compute::GpuTensor) -> WeightRef<'a> {
         row_stride: 0,
         rotation: None,
         awq_scale: None,
+        lloyd_lut_e4m3: None,
+        lloyd_lut_f16: None,
+        lloyd_lut_c16: None,
     }
 }
 
@@ -1809,6 +1869,9 @@ fn guard_qkv_mq4g256lloyd_fires() {
         row_stride: 0,
         rotation: None,
         awq_scale: None,
+        lloyd_lut_e4m3: None,
+        lloyd_lut_f16: None,
+        lloyd_lut_c16: None,
     };
     let steps = make_qkv3_steps(&dummy, &wr, RotationPlan::FwhtG256);
     assert!(guard_qkv_mq4g256lloyd(&steps, &ctx_rdna3()));
@@ -1825,6 +1888,9 @@ fn guard_qkv_mq4g256lloyd_rejects_wrong_dtype() {
         row_stride: 0,
         rotation: None,
         awq_scale: None,
+        lloyd_lut_e4m3: None,
+        lloyd_lut_f16: None,
+        lloyd_lut_c16: None,
     };
     let steps = make_qkv3_steps(&dummy, &wr, RotationPlan::None);
     assert!(!guard_qkv_mq4g256lloyd(&steps, &ctx_rdna3()));
@@ -1841,6 +1907,9 @@ fn guard_qkv_mq4g256lloyd_rejects_awq_scale() {
         row_stride: 0,
         rotation: None,
         awq_scale: Some(&dummy),
+        lloyd_lut_e4m3: None,
+        lloyd_lut_f16: None,
+        lloyd_lut_c16: None,
     }; // AWQ present → reject
     let steps = make_qkv3_steps(&dummy, &wr, RotationPlan::FwhtG256);
     assert!(!guard_qkv_mq4g256lloyd(&steps, &ctx_rdna3()));
@@ -1857,6 +1926,9 @@ fn guard_qkv_mq4g256lloyd_rejects_force_unfused() {
         row_stride: 0,
         rotation: None,
         awq_scale: None,
+        lloyd_lut_e4m3: None,
+        lloyd_lut_f16: None,
+        lloyd_lut_c16: None,
     };
     let steps = make_qkv3_steps(&dummy, &wr, RotationPlan::FwhtG256);
     let mut ctx = ctx_rdna3();
@@ -1875,6 +1947,9 @@ fn guard_qkv_hfq4g256_covers_mq4g256() {
         row_stride: 0,
         rotation: None,
         awq_scale: None,
+        lloyd_lut_e4m3: None,
+        lloyd_lut_f16: None,
+        lloyd_lut_c16: None,
     };
     let steps = make_qkv3_steps(&dummy, &wr, RotationPlan::FwhtG256);
     assert!(guard_qkv_hfq4g256(&steps, &ctx_rdna3()));
@@ -1891,6 +1966,9 @@ fn guard_qkv_hfq4g256_covers_hfq4g256() {
         row_stride: 0,
         rotation: None,
         awq_scale: None,
+        lloyd_lut_e4m3: None,
+        lloyd_lut_f16: None,
+        lloyd_lut_c16: None,
     };
     let steps = make_qkv3_steps(&dummy, &wr, RotationPlan::None);
     assert!(guard_qkv_hfq4g256(&steps, &ctx_rdna3()));
@@ -1913,6 +1991,9 @@ fn guard_qkv_hfq6g256_dp4a_decoupled() {
         row_stride: 0,
         rotation: None,
         awq_scale: None,
+        lloyd_lut_e4m3: None,
+        lloyd_lut_f16: None,
+        lloyd_lut_c16: None,
     };
     let wr_mq6 = WeightRef {
         buf: &dummy,
@@ -1922,6 +2003,9 @@ fn guard_qkv_hfq6g256_dp4a_decoupled() {
         row_stride: 0,
         rotation: None,
         awq_scale: None,
+        lloyd_lut_e4m3: None,
+        lloyd_lut_f16: None,
+        lloyd_lut_c16: None,
     };
     let steps_hfq6 = make_qkv3_steps(&dummy, &wr_hfq6, RotationPlan::FwhtG256);
     let steps_mq6 = make_qkv3_steps(&dummy, &wr_mq6, RotationPlan::FwhtG256);
@@ -1948,6 +2032,9 @@ fn guard_qkv_rejects_mixed_gemv_input() {
         row_stride: 0,
         rotation: None,
         awq_scale: None,
+        lloyd_lut_e4m3: None,
+        lloyd_lut_f16: None,
+        lloyd_lut_c16: None,
     };
     let steps = vec![
         Step::RmsnormAutomatic {
@@ -1990,6 +2077,9 @@ fn guard_gate_up_mq4g256lloyd_fires() {
         row_stride: 0,
         rotation: None,
         awq_scale: None,
+        lloyd_lut_e4m3: None,
+        lloyd_lut_f16: None,
+        lloyd_lut_c16: None,
     };
     let steps = make_gate_up2_steps(&dummy, &wr, RotationPlan::FwhtG256);
     assert!(guard_gate_up_mq4g256lloyd(&steps, &ctx_rdna3()));
@@ -2006,6 +2096,9 @@ fn match_fused_prefix_admits_exact_mq4g256v2_qkv() {
         row_stride: 0,
         rotation: None,
         awq_scale: None,
+        lloyd_lut_e4m3: None,
+        lloyd_lut_f16: None,
+        lloyd_lut_c16: None,
     };
     let steps = make_qkv3_steps(&dummy, &wr, RotationPlan::FwhtG256);
     assert!(guard_qkv_mq4g256v2(&steps, &ctx_rdna3()));
@@ -2026,6 +2119,9 @@ fn match_fused_prefix_admits_exact_mq4g256v2_qkvza() {
         row_stride: 0,
         rotation: None,
         awq_scale: None,
+        lloyd_lut_e4m3: None,
+        lloyd_lut_f16: None,
+        lloyd_lut_c16: None,
     };
     // QKVZA = QKV3 window + one extra Gemv (reuse builder, no new abstraction).
     let mut steps = make_qkv3_steps(&dummy, &wr, RotationPlan::FwhtG256);
@@ -2052,6 +2148,9 @@ fn match_fused_prefix_admits_exact_mq4g256v2_gate_up() {
         row_stride: 0,
         rotation: None,
         awq_scale: None,
+        lloyd_lut_e4m3: None,
+        lloyd_lut_f16: None,
+        lloyd_lut_c16: None,
     };
     let steps = make_gate_up2_steps(&dummy, &wr, RotationPlan::FwhtG256);
     assert!(guard_gate_up_mq4g256v2(&steps, &ctx_rdna3()));
@@ -2073,6 +2172,9 @@ fn match_fused_prefix_rejects_mixed_v1_v2_mq4_window() {
         row_stride: 0,
         rotation: None,
         awq_scale: None,
+        lloyd_lut_e4m3: None,
+        lloyd_lut_f16: None,
+        lloyd_lut_c16: None,
     };
     let wr_v1 = WeightRef {
         buf: &dummy,
@@ -2082,6 +2184,9 @@ fn match_fused_prefix_rejects_mixed_v1_v2_mq4_window() {
         row_stride: 0,
         rotation: None,
         awq_scale: None,
+        lloyd_lut_e4m3: None,
+        lloyd_lut_f16: None,
+        lloyd_lut_c16: None,
     };
     let steps = vec![
         Step::RmsnormAutomatic {
@@ -2139,6 +2244,9 @@ fn match_fused_prefix_rejects_mq4g256v2_on_unsupported_arch() {
         row_stride: 0,
         rotation: None,
         awq_scale: None,
+        lloyd_lut_e4m3: None,
+        lloyd_lut_f16: None,
+        lloyd_lut_c16: None,
     };
     let ctx = ctx_rdna4(); // gfx1200 — not gfx1201
     let qkv = make_qkv3_steps(&dummy, &wr, RotationPlan::FwhtG256);
@@ -2183,10 +2291,12 @@ use crate::families::moe::MoePrefillResolution;
 fn moe_dtypes_mq4() -> MoeDtypes<'static> {
     MoeDtypes {
         router: DType::Q8_0,
-        shared_gate: DType::Q8_0,
-        shared_expert_gate: DType::MQ4G256,
-        shared_expert_up: DType::MQ4G256,
-        shared_expert_down: DType::MQ4G256,
+        shared: Some(MoeSharedDtypes {
+            selector: DType::Q8_0,
+            gate: DType::MQ4G256,
+            up: DType::MQ4G256,
+            down: DType::MQ4G256,
+        }),
         experts_all_gate_up_mq4: true,
         routed_gate_up: DType::MQ4G256,
         routed_down: DType::MQ4G256,
@@ -2521,4 +2631,100 @@ fn codebook_grouped_gemm_kernarg_contract_is_the_uniform_nine() {
             assert!(sig.contains(arg), "{name}: signature is missing `{arg}`");
         }
     }
+}
+
+// ── CPU-executed offload (memory.offload_exec=cpu) ────────────────────────────
+
+/// The seam's coverage table and the launcher's rotation table must agree: the
+/// CPU path applies `rotate_x` to a `Raw` activation exactly when the launcher
+/// would, so a dtype that maps to a `CpuQuant` while `dtype_rotation_plan` says
+/// something else would silently feed unrotated activations to rotated weights
+/// (or double-rotate them) — the silent-garbage failure mode, not an error.
+#[test]
+fn cpu_quant_rotation_agrees_with_plan() {
+    for dtype in [
+        DType::MQ4G256,
+        DType::MQ4G256V2,
+        DType::MQ4CG256,
+        DType::MQ6G256,
+        DType::MQ6G256V2,
+        DType::MQ5G256,
+        DType::MQ5G256V2,
+        DType::MQ3G256,
+        DType::MQ3G256V2,
+        DType::MQ3G256Lloyd,
+        DType::MQ2G256,
+        DType::MQ2G256V2,
+        DType::MQ2G256Lloyd,
+        DType::MQ2G256LloydU,
+        DType::MQ4G256Lloyd,
+        DType::HFQ6G256,
+        DType::HFQ4G256,
+        DType::HFQ4G128,
+        DType::HFQ3G256,
+        DType::HFQ3G128,
+        DType::HFQ2G256,
+        DType::HFQ2G128,
+        DType::TQ2G128,
+        DType::BQ1G128,
+        DType::Q8_0,
+        DType::F16,
+        DType::F32,
+        DType::BF16,
+    ] {
+        let q = crate::cpu_quant_for(dtype)
+            .unwrap_or_else(|| panic!("{dtype:?} has a CPU decoder and must be in cpu_quant_for"));
+        assert_eq!(
+            q.is_fwht_g256(),
+            dtype_rotation_plan(dtype) == RotationPlan::FwhtG256,
+            "{dtype:?}: CPU rotation disagrees with dtype_rotation_plan"
+        );
+    }
+}
+
+/// Formats the CPU must refuse, including ones that look adjacent to a covered
+/// format. Each of these has its own layout (codebook size, bit width, or a
+/// non-FWHT rotation) that `hipfire-cpu` does not implement, so a step over one
+/// stays on the GPU over PCIe.
+#[test]
+fn cpu_quant_refuses_unimplemented_formats() {
+    for dtype in [
+        DType::MQ8G256, // RotationPlan::Mq8Internal: int8 activation, not FWHT-f32
+        DType::MQ4G128, // RotationPlan::FwhtG128: a different transform
+        DType::HFP4G32, // per-row 16 B header + per-32 block scales
+        DType::MFP4G32,
+        DType::MFP4G32Lloyd,
+        DType::MFP4G32P,
+        DType::MFP4G32E8,
+        DType::MFP4G32E8SOA,
+        DType::ParoQ4G128, // Givens rotation on the activation
+        DType::Q4K,        // no dense HFQ artifact uses it
+        DType::Q8HFQ,      // padded rows (row_stride), not expressible in the group model
+        DType::Raw,
+    ] {
+        assert!(
+            crate::cpu_quant_for(dtype).is_none(),
+            "{dtype:?} must not be CPU-executed until its decode is transcribed"
+        );
+    }
+}
+
+/// The Redline refusal is a conjunction: it must fire for the configured
+/// conflict and for nothing else, or a plain CPU-exec run would fail to load.
+#[test]
+fn cpu_exec_redline_conflict_is_exactly_the_conjunction() {
+    use crate::cpu_exec_redline_conflict as conflict;
+    assert!(
+        conflict(true, 12, true),
+        "cpu + spill + replay is the conflict"
+    );
+    assert!(!conflict(false, 12, true), "pcie must never be refused");
+    assert!(
+        !conflict(true, 0, true),
+        "nothing spilled, nothing on the CPU"
+    );
+    assert!(
+        !conflict(true, 12, false),
+        "no replay controller: no conflict"
+    );
 }

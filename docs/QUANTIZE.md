@@ -1,9 +1,11 @@
 # Quantize
 
 `hipfire quantize` is the user-facing wrapper around the CPU-only
-`hipfire-quantize` binary. It converts HuggingFace safetensors, a local
-model directory, or a GGUF file into hipfire’s HFQM container (extensions
-`.mq4`, `.hf4`, `.mq6`, …). The daemon mmaps the result directly.
+`hipfire-quantize` binary. It converts HuggingFace safetensors or a local
+model directory into hipfire’s HFQM container (extensions `.mq4`, `.hf4`,
+`.mq6`, …). The daemon mmaps the result directly. GGUF **weight** input is
+deprecated since 0.4.0 (removal in 0.5.0): GGUF→mqN is lossy double quantization; use llama.cpp for GGUF. A llama.cpp
+`imatrix.gguf` (`--imatrix`) stays supported.
 
 Design / math / wire IDs: [QUANTIZATION.md](QUANTIZATION.md).
 Magnum V2 specs: [quant-formats/mq4-v2.md](quant-formats/mq4-v2.md),
@@ -107,7 +109,12 @@ Directory needs `config.json` plus one or more `.safetensors` files. The
 quantizer accepts many architectures; inference only runs if a carrier/loader
 exists for that `arch_id` (see [architecture-ids.md](architecture-ids.md)).
 
-## From GGUF
+## From GGUF (deprecated, removal in 0.5.0)
+
+**Deprecated since 0.4.0, removal in 0.5.0: GGUF→mqN is lossy double quantization; use llama.cpp for GGUF.**
+A GGUF weight input prints
+`warning: GGUF weight input is deprecated and will be removed in 0.5.0; … (imatrix.gguf input stays supported)`.
+Quantize from the original safetensors instead. `--imatrix <file.gguf>` is not affected.
 
 ```bash
 hipfire quantize ./tinyllama.Q4_K_M.gguf \
@@ -178,7 +185,7 @@ Full alias set and product-ladder controls. Common extras:
 | `--fixed-tier <spec>` | Per-class codec overrides, e.g. `lm_head:mq6v2,ssm_out:mq6v2`. Classes: `lm_head,embed,router,attn,ssm_out` (plus `attn_full` where applicable). Dtypes: `q8,mq2v2,mq3v2,mq4v2,mq5v2,mq6v2` (+ limited legacy). Env: `HIPFIRE_FIXED_TIER`. |
 | `--imatrix <gguf>` | llama.cpp imatrix for activation-aware recipes |
 | `--hessian-dir <dir>` | GPTQ-E8 Hessians |
-| `--awq` / `--awq-alpha` | AWQ pre-scale (default alpha 0.55) |
+| `--awq` / `--awq-alpha` / `--awq-a4-aware` | AWQ pre-scale (default alpha 0.55). `--awq-a4-aware` is MQ4V2-only and selects an alpha per shared activation group from 0.35/0.45/0.55/0.65/0.75 by sampled W4A4 block-output error, using the imatrix RMS profile and the runtime-exact four-candidate `block_i4_128` fake quantizer. Fused qkvza/gate-up siblings share the anchor projection's alpha so their single runtime inverse scale remains valid. |
 | `--kmap-dense` / `--kmap-mode` / `--no-kmap` / `--uniform` | K-map promotion policy |
 | `--q8-router` / `--no-q8-conv1d` | Protect routers / conv1d |
 | `--reap-overlay` / `--reap-bake` / `--reap-out` / `--reap-arch` | REAP plan paths |
@@ -262,20 +269,14 @@ not a guarantee):
 
 Peak RAM is roughly `max(tensor elements) × 4` (one tensor dequantized to f32).
 
-## After quantizing: CASK sidecar
+## Deprecated: CASK sidecar (removal in 0.5.0)
 
-For long-context CASK eviction calibration:
-
-```bash
-hipfire sidecar-gen my-finetune.mq4 --corpus /path/to/corpus.txt
-# or via registered tag:
-hipfire sidecar-gen finetune:1b --corpus /path/to/corpus.txt
-```
-
-Writes `my-finetune.mq4.triattn.bin` beside the model by default. The daemon
-does not attach it by default. Set `cask_sidecar` to the exact path, or opt into
-sibling discovery with `cask_auto_attach=true`. Set `cask=true` separately only
-when core-aware m-folding is intended. See [CONFIG.md](CONFIG.md).
+CASK / TriAttention eviction is deprecated and will be removed in 0.5.0; it is
+not a post-quantize step and not supported. Until then,
+`hipfire sidecar-gen <model> --corpus <file>` still writes
+`<model>.triattn.bin` (with a deprecation warning); nothing
+attaches it unless `cask_sidecar` or `cask_auto_attach=true` is set. See
+[CONFIG.md](CONFIG.md).
 
 ## Related
 

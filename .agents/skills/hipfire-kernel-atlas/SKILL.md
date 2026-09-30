@@ -114,15 +114,15 @@ python3 scripts/kernel_atlas.py collect-ar \
   --output .codeinsight+research/kernel-atlas/runs/atlas.jsonl
 ```
 
-DFlash collection (acceptance fixture = Qwen3.8-27B MQ4XT + measured draft;
+DFlash collection (acceptance fixture = Qwen3.8-27B MQ4XTS + measured draft;
 prompts under `benchmarks/prompts/` when present):
 
 ```bash
 python3 scripts/kernel_atlas.py collect-dflash \
-  --target ~/.hipfire/models/qwen3.8-27b.mq4-xt \
+  --target ~/.hipfire/models/qwen3.8-27b.mq4-xts \
   --draft ~/qcal/ladder-v2/drafts/qwen3.8-27b-dflash.mq4v2.hfq \
   --prompt-file benchmarks/prompts/merge_sort_thinking_off.txt \
-  --workload qwen3.8-27b-mq4-xt-dflash-merge-sort \
+  --workload qwen3.8-27b-mq4-xts-dflash-merge-sort \
   --max-tokens 256 \
   --ctx 2048 \
   --kv-mode q8 \

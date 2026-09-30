@@ -61,6 +61,8 @@ pub mod error_class {
     pub const INTERNAL: &str = "internal";
     pub const ADAPTIVE_POISON: &str = "adaptive_poison";
     pub const DETERMINISTIC_MISMATCH: &str = "deterministic_mismatch";
+    /// Multi-slot engine capacity refusal (queue full, budget exhausted).
+    pub const OVERLOAD: &str = "overload";
 }
 
 #[derive(Debug, Error)]
@@ -417,6 +419,9 @@ struct EngineInner {
     last_state_epoch: Mutex<Option<u64>>,
     active_attempt_id: Mutex<Option<u64>>,
     last_retry_reset_eligible: Mutex<Option<bool>>,
+    /// Set by the reader thread when the daemon's stdout reaches EOF: the
+    /// daemon exited (or can no longer answer) even if it is not reaped yet.
+    stdout_closed: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -447,6 +452,8 @@ impl Engine {
         let control: Arc<Mutex<Option<mpsc::Sender<Value>>>> = Arc::new(Mutex::new(None));
         let pending_clone = Arc::clone(&pending);
         let control_clone = Arc::clone(&control);
+        let stdout_closed = Arc::new(AtomicBool::new(false));
+        let stdout_closed_reader = Arc::clone(&stdout_closed);
         let handle = thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
             let mut line = String::new();
@@ -514,6 +521,7 @@ impl Engine {
                 let mut map = pending_clone.lock().unwrap();
                 map.clear();
             }
+            stdout_closed_reader.store(true, Ordering::Release);
             *control_clone.lock().unwrap() = None;
         });
         let inner = EngineInner {
@@ -527,6 +535,7 @@ impl Engine {
             last_state_epoch: Mutex::new(None),
             active_attempt_id: Mutex::new(None),
             last_retry_reset_eligible: Mutex::new(None),
+            stdout_closed,
         };
         Ok(Self {
             inner: Arc::new(inner),
@@ -536,30 +545,15 @@ impl Engine {
     /// Start the engine daemon and install validated process policy before the
     /// daemon initializes a GPU. This is the native control-plane path; the
     /// environment map is reserved for non-hipfire bootstrap state inherited
-    /// by external launchers.
+    /// by external launchers. The daemon itself resolves `hardware.devices`,
+    /// reserving the chosen cards in the same step, and lowers it to ROCr/HIP
+    /// visibility; resolving here could not hold those reservations.
     pub fn spawn_configured(
         daemon: impl AsRef<Path>,
         environment: &BTreeMap<String, String>,
         config: &hipfire_config::ProcessConfig,
     ) -> Result<Self> {
-        let mut environment = environment.clone();
-        let hip = environment
-            .get(hipfire_config::HIP_VISIBLE_DEVICES)
-            .cloned()
-            .or_else(|| std::env::var(hipfire_config::HIP_VISIBLE_DEVICES).ok());
-        let rocr = environment
-            .get(hipfire_config::ROCR_VISIBLE_DEVICES)
-            .cloned()
-            .or_else(|| std::env::var(hipfire_config::ROCR_VISIBLE_DEVICES).ok());
-        let visibility =
-            hipfire_config::synchronized_device_visibility(config, hip.as_deref(), rocr.as_deref())
-                .map_err(|error| ClientError::Protocol(error.to_string()))?;
-        if let Some(visibility) = visibility {
-            environment.insert(hipfire_config::HIP_VISIBLE_DEVICES.into(), visibility.hip);
-            environment.insert(hipfire_config::ROCR_VISIBLE_DEVICES.into(), visibility.rocr);
-        }
-
-        let engine = Self::spawn(daemon, &environment)?;
+        let engine = Self::spawn(daemon, environment)?;
         let response = engine.request(&serde_json::json!({
             "type": "configure",
             "config": config,
@@ -760,12 +754,93 @@ impl Engine {
         self.generate_common(request, Some(cancelled), &mut event)
     }
 
-    fn generate_common(
+    /// Submit a generate request without blocking on its lifecycle.
+    ///
+    /// Registers a per-`(id, attempt_id)` channel with the reader-routing map
+    /// (the same registration [`Engine::generate`] performs), sends the request,
+    /// and returns the receiver. The caller drains lifecycle events
+    /// (`gen_start`, `token`, `reasoning`, `commit_ready`, `done`, `error`)
+    /// from the receiver and performs the commit handshake via
+    /// [`Engine::commit_attempt`] when `commit_ready` arrives.
+    ///
+    /// When the caller has finished draining (after `done` or `error`), it
+    /// MUST call [`Engine::release_attempt`] to remove the pending entry;
+    /// otherwise the entry leaks until the engine is dropped.
+    ///
+    /// To cancel an in-flight stream, call [`Engine::cancel_attempt`] and then
+    /// drain `aborted`/`done` from the returned receiver.
+    ///
+    /// **Interleaving constraint:** `generate`/`generate_cancellable` and
+    /// streaming submissions share the same `(id, attempt_id)` pending map.
+    /// An attempt may not be interleaved on the same id — a second submission
+    /// for a live key returns [`ClientError::Protocol`] with a
+    /// `duplicate live generate` message. Use a distinct `attempt_id` for a
+    /// new turn on the same conversation id.
+    pub fn submit_streaming(
         &self,
         request: &Value,
-        cancelled: Option<&AtomicBool>,
-        event: &mut dyn FnMut(&Value) -> Result<()>,
-    ) -> Result<Value> {
+    ) -> Result<(String, u64, mpsc::Receiver<Value>)> {
+        let (request_id, attempt_id, rx) = self.register_pending_channel(request)?;
+        if let Err(err) = self.send(request) {
+            self.inner
+                .dispatch
+                .pending
+                .lock()
+                .unwrap()
+                .remove(&(request_id.clone(), attempt_id));
+            return Err(err);
+        }
+        Ok((request_id, attempt_id, rx))
+    }
+
+    /// Send a `commit` for a streaming attempt.
+    ///
+    /// Called after `commit_ready` is received on the stream's receiver. The
+    /// daemon responds with the final `done` on the same receiver.
+    pub fn commit_attempt(&self, id: &str, attempt_id: u64) -> Result<()> {
+        self.send(&serde_json::json!({
+            "type": "commit",
+            "id": id,
+            "attempt_id": attempt_id,
+        }))
+    }
+
+    /// Send an `abort` for a streaming attempt without blocking.
+    ///
+    /// Draining the resulting `aborted`/`done` events remains the caller's
+    /// job via the receiver returned by [`Engine::submit_streaming`]. After
+    /// draining, call [`Engine::release_attempt`] to clean up the pending
+    /// entry.
+    pub fn cancel_attempt(&self, id: &str, attempt_id: u64) -> Result<()> {
+        self.send(&serde_json::json!({
+            "type": "abort",
+            "id": id,
+            "attempt_id": attempt_id,
+        }))
+    }
+
+    /// Remove a streaming attempt's pending channel entry.
+    ///
+    /// Must be called after the caller has finished draining the receiver
+    /// returned by [`Engine::submit_streaming`] (terminal `done` or `error`,
+    /// or `done` after [`Engine::cancel_attempt`]). Failing to call this leaks
+    /// the entry until the engine is dropped.
+    pub fn release_attempt(&self, id: &str, attempt_id: u64) {
+        self.inner
+            .dispatch
+            .pending
+            .lock()
+            .unwrap()
+            .remove(&(id.to_owned(), attempt_id));
+    }
+
+    /// Extract `(request_id, attempt_id)` from a generate request, create a
+    /// channel, and register it with the reader-routing pending map. Shared
+    /// by [`Engine::generate_common`] and [`Engine::submit_streaming`].
+    fn register_pending_channel(
+        &self,
+        request: &Value,
+    ) -> Result<(String, u64, mpsc::Receiver<Value>)> {
         let request_id = request
             .get("id")
             .and_then(Value::as_str)
@@ -774,9 +849,6 @@ impl Engine {
             .to_owned();
         let attempt_id = require_attempt_id(request.get("attempt_id"))
             .map_err(|reason| ClientError::Protocol(format!("generate request {reason}")))?;
-        if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
-            return Err(ClientError::Cancelled);
-        }
         let (tx, rx) = mpsc::channel();
         {
             let mut map = self.inner.dispatch.pending.lock().unwrap();
@@ -790,6 +862,19 @@ impl Engine {
             }
             map.insert(key, tx);
         }
+        Ok((request_id, attempt_id, rx))
+    }
+
+    fn generate_common(
+        &self,
+        request: &Value,
+        cancelled: Option<&AtomicBool>,
+        event: &mut dyn FnMut(&Value) -> Result<()>,
+    ) -> Result<Value> {
+        if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            return Err(ClientError::Cancelled);
+        }
+        let (request_id, attempt_id, rx) = self.register_pending_channel(request)?;
         *self.inner.active_attempt_id.lock().unwrap() = Some(attempt_id);
         if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
             self.inner
@@ -1190,6 +1275,24 @@ impl Engine {
 
     pub fn child_id(&self) -> u32 {
         self.inner.child.lock().unwrap().id()
+    }
+
+    /// True once the daemon can no longer answer: its stdout reached EOF or
+    /// the process has exited.
+    pub fn exited(&self) -> bool {
+        self.inner.stdout_closed.load(Ordering::Acquire)
+            || matches!(self.inner.child.lock().unwrap().try_wait(), Ok(Some(_)))
+    }
+
+    /// Kill the daemon if it still runs and reap it, so its GPU memory is
+    /// released before a replacement starts. Returns the exit status.
+    pub fn terminate(&self) -> String {
+        let mut child = self.inner.child.lock().unwrap();
+        let _ = child.kill();
+        child
+            .wait()
+            .map(|status| status.to_string())
+            .unwrap_or_else(|error| format!("unknown ({error})"))
     }
 }
 
@@ -1695,7 +1798,7 @@ mod tests {
         ));
         let daemon = write_fake_daemon(
             &root,
-            "#!/bin/sh\nconfigured=0\nwhile IFS= read -r line; do\n case \"$line\" in *'\"configure\"'*) if [ \"$HIP_VISIBLE_DEVICES\" = '0,1' ] && [ \"$ROCR_VISIBLE_DEVICES\" = '2,3' ]; then configured=1; echo '{\"type\":\"configured\"}'; else echo '{\"type\":\"error\",\"message\":\"device visibility is not synchronized\"}'; fi ;; *'\"ping\"'*) if [ \"$configured\" = 1 ]; then echo '{\"type\":\"pong\"}'; else echo '{\"type\":\"error\",\"message\":\"not configured\"}'; fi ;; *'\"unload\"'*) echo '{\"type\":\"unloaded\"}'; exit 0 ;; esac\ndone\n",
+            "#!/bin/sh\nconfigured=0\nwhile IFS= read -r line; do\n case \"$line\" in *'\"configure\"'*) case \"$line\" in *'\"hardware.devices\":\"2,3\"'*) configured=1; echo '{\"type\":\"configured\"}' ;; *) echo '{\"type\":\"error\",\"message\":\"device policy missing\"}' ;; esac ;; *'\"ping\"'*) if [ \"$configured\" = 1 ]; then echo '{\"type\":\"pong\"}'; else echo '{\"type\":\"error\",\"message\":\"not configured\"}'; fi ;; *'\"unload\"'*) echo '{\"type\":\"unloaded\"}'; exit 0 ;; esac\ndone\n",
         );
         let mut layer = hipfire_config::ConfigLayer::default();
         layer.set_cli("hardware.devices", "2,3").unwrap();
@@ -1783,6 +1886,7 @@ mod tests {
             last_state_epoch: std::sync::Mutex::new(None),
             active_attempt_id: std::sync::Mutex::new(None),
             last_retry_reset_eligible: std::sync::Mutex::new(None),
+            stdout_closed: std::sync::Arc::new(AtomicBool::new(false)),
         };
         Engine {
             inner: std::sync::Arc::new(inner),
@@ -3776,5 +3880,64 @@ done
             .spawn()
             .expect("true");
         child.stdout.take().expect("stdout")
+    }
+
+    /// `register_pending_channel` is the shared seam between `generate_common`
+    /// and `submit_streaming`. A duplicate live key must be rejected without
+    /// disturbing the original entry, and `release_attempt` must clean up so a
+    /// subsequent registration on the same key succeeds.
+    #[test]
+    fn streaming_registration_rejects_duplicate_and_release_allows_reuse() {
+        let engine = dummy_engine();
+        let req = serde_json::json!({
+            "type": "generate",
+            "id": "stream-test-1",
+            "attempt_id": 1,
+            "prompt": "hello",
+        });
+        // First registration succeeds.
+        let (id, attempt_id, _rx) = engine
+            .register_pending_channel(&req)
+            .expect("first registration");
+        assert_eq!(id, "stream-test-1");
+        assert_eq!(attempt_id, 1);
+        // Duplicate key is rejected; the original entry is left intact.
+        let err = engine
+            .register_pending_channel(&req)
+            .expect_err("duplicate rejected");
+        assert!(err.to_string().contains("duplicate live generate"), "{err}");
+        // Release the entry.
+        engine.release_attempt(&id, attempt_id);
+        // Re-registration on the same key now succeeds.
+        let (_, _, _) = engine
+            .register_pending_channel(&req)
+            .expect("re-registration after release");
+        engine.release_attempt("stream-test-1", 1);
+    }
+
+    /// `submit_streaming` requires a non-empty id and a numeric attempt_id,
+    /// matching `generate`'s validation.
+    #[test]
+    fn streaming_rejects_missing_id_and_attempt() {
+        let engine = dummy_engine();
+        let no_id = serde_json::json!({
+            "type": "generate",
+            "attempt_id": 1,
+            "prompt": "hello",
+        });
+        let err = engine
+            .register_pending_channel(&no_id)
+            .expect_err("missing id rejected");
+        assert!(err.to_string().contains("missing id"), "{err}");
+
+        let no_attempt = serde_json::json!({
+            "type": "generate",
+            "id": "x",
+            "prompt": "hello",
+        });
+        let err = engine
+            .register_pending_channel(&no_attempt)
+            .expect_err("missing attempt_id rejected");
+        assert!(err.to_string().contains("attempt_id"), "{err}");
     }
 }

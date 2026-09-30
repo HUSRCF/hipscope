@@ -32,11 +32,16 @@ pub mod ddtree;
 pub mod device_mesh;
 #[cfg(feature = "deltanet")]
 pub mod dflash;
+/// Adaptive DFlash verify-block controller — family-free policy object shared
+/// by arch speculators (`hipfire-arch-qwen35::dflash_spec`); the DSpark
+/// analogue is `dspark_block_controller`. Pure math, no GPU types.
+pub mod dflash_adaptive_block;
 pub mod dflash_generic;
 pub mod dspark_block_controller;
 pub mod dspark_core;
 pub mod ep;
 pub mod eval_common;
+pub mod external_rows;
 pub mod gguf;
 pub mod hfq;
 pub mod hfq_parallel;
@@ -46,6 +51,7 @@ pub mod kv_backend;
 pub mod kv_mode;
 pub mod llama;
 pub mod llama_spec;
+pub mod lloyd_lut;
 pub mod loader_api;
 pub mod loop_guard;
 pub mod model_load;
@@ -53,11 +59,26 @@ pub mod model_source;
 pub mod multi_gpu;
 pub mod paro;
 pub mod prefix;
+pub mod prefix_index;
 pub mod reset_core;
 pub mod safetensors_source;
 pub mod sampler;
 pub mod sealed_moe;
 pub mod serve;
+pub mod checkpoint_pool;
+pub mod serve_contract;
+pub mod serve_fairness;
+pub mod serve_wait;
+/// `SlotBatch` — one forward step's ragged work across N slots. Pure CPU
+/// data structure; no GPU dependencies. Moved from `hipfire-arch-qwen35`
+/// (the multi-slot scheduler/batch substrate is model-agnostic). See module
+/// docs for the per-slot-absolute `positions[]` invariant.
+pub mod slot_batch;
+/// `Scheduler` — decides what goes into each step's `SlotBatch`. Pure CPU
+/// logic; no GPU dependencies. Round-robin, chunked prefill mixed with
+/// decode. Moved from `hipfire-arch-qwen35` with `slot_batch`.
+pub mod scheduler;
+pub mod sidecar;
 pub mod spec;
 
 pub mod ngram_mod;
@@ -75,6 +96,7 @@ pub mod emit_text;
 pub mod eos_filter;
 pub mod prompt_frame;
 pub mod semantic;
+pub mod stop_sequence;
 pub mod session_table;
 pub mod tokenizer;
 
@@ -83,3 +105,9 @@ pub mod tool_call;
 pub mod weight_backend;
 
 pub use crate::arch::{maybe_screen_mmq, screen_weight_tensor, MmqScreenable};
+pub use crate::serve_contract::{
+    ArchPolicy, CacheDomain, CanonicalError, CheckpointId, CommitBoundary, DeviceTopology,
+    DrafterDecision, KvLayout, LastTokenHandling, MissReason, PrefixLookup, PrefixLookupResult,
+    PublishLease, ReleaseDisposition, ReservationError, ResumeBundle, ResumePlan, ResumePlanError,
+    SharingNamespace, StepNeeds, StepReservation, StepTicket, TemplateIdentity, TokenizerIdentity,
+};

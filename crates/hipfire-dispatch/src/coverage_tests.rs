@@ -27,7 +27,7 @@
 //! #397 Phase-0.4 should adopt — a single coverage gate over (op × dtype × arch).
 
 use crate::context::DispatchCtx;
-use crate::families::moe::{MoeDtypes, MoeResolution};
+use crate::families::moe::{MoeDtypes, MoeResolution, MoeSharedDtypes};
 use crate::types::*;
 use rdna_compute::DType::{self, *};
 
@@ -249,6 +249,34 @@ const FLEET: &[OpUse] = &[
         dtype: MQ6G256V2,
         archs: &["gfx1200", "gfx1201"],
     },
+    // ── MQ4G256V2Lloyd (qt52): same dual-half wire + per-tensor Lloyd LUT ──
+    // Plain/residual/swiglu share the V2 prerotated GEMV keys; fused QKV/QKVZA/
+    // GateUp have dedicated Always-gated Lloyd keys (see mqv2_fused test).
+    OpUse {
+        model: "qwen3.8-27b.mq4-lloyd",
+        role: Role::Plain,
+        dtype: MQ4G256V2Lloyd,
+        archs: WAVE32,
+    },
+    OpUse {
+        model: "qwen3.8-27b.mq4-lloyd",
+        role: Role::Residual,
+        dtype: MQ4G256V2Lloyd,
+        archs: WAVE32,
+    },
+    OpUse {
+        model: "qwen3.8-27b.mq4-lloyd",
+        role: Role::SwigluResidual,
+        dtype: MQ4G256V2Lloyd,
+        archs: WAVE32,
+    },
+    // RDNA4 anchors — Lloyd V2 must not re-acquire a gfx11-only gate.
+    OpUse {
+        model: "qwen-mq4v2-lloyd-rdna4",
+        role: Role::Plain,
+        dtype: MQ4G256V2Lloyd,
+        archs: &["gfx1200", "gfx1201"],
+    },
 ];
 
 /// Does the forward lowering for (role, dtype) have ANY dispatch plan (so it
@@ -428,10 +456,12 @@ fn non_k8_and_q8_routed_moe_has_a_dispatch_plan() {
     ] {
         let d = MoeDtypes {
             router: Q8_0,
-            shared_gate: Q8_0,
-            shared_expert_gate: Q8_0,
-            shared_expert_up: Q8_0,
-            shared_expert_down: Q8_0,
+            shared: Some(MoeSharedDtypes {
+                selector: Q8_0,
+                gate: Q8_0,
+                up: Q8_0,
+                down: Q8_0,
+            }),
             experts_all_gate_up_mq4: u.routed_gate_up == MQ4G256,
             routed_gate_up: u.routed_gate_up,
             routed_down: u.routed_down,
@@ -488,10 +518,12 @@ fn moe_decode_pre_guard_admits_fallback_and_rejects_invalid() {
     // (op=moe, dtype=MQ4G256, k=4) → resolves to the CPU fallback, NOT GPU-top-K.
     let mq4_k4 = MoeDtypes {
         router: Q8_0,
-        shared_gate: Q8_0,
-        shared_expert_gate: Q8_0,
-        shared_expert_up: Q8_0,
-        shared_expert_down: Q8_0,
+        shared: Some(MoeSharedDtypes {
+            selector: Q8_0,
+            gate: Q8_0,
+            up: Q8_0,
+            down: Q8_0,
+        }),
         experts_all_gate_up_mq4: true,
         routed_gate_up: MQ4G256,
         routed_down: MQ4G256,
@@ -993,6 +1025,32 @@ fn fused_qkv_keys_resolve_on_fleet_archs() {
             key: KernelKey::FusedGateUpMq4G256Lloyd,
             archs: WMMA_ARCHS,
         },
+        // ── MQ4G256V2 / MQ4G256V2Lloyd fused (qt44/qt52 dual-half): Always ──
+        // Same gate as table rows; WAVE32 floor like the V2 GEMV path.
+        FusedKeyUse {
+            key: KernelKey::FusedQkvMq4G256V2,
+            archs: WAVE32,
+        },
+        FusedKeyUse {
+            key: KernelKey::FusedQkvzaMq4G256V2,
+            archs: WAVE32,
+        },
+        FusedKeyUse {
+            key: KernelKey::FusedGateUpMq4G256V2,
+            archs: WAVE32,
+        },
+        FusedKeyUse {
+            key: KernelKey::FusedQkvMq4G256V2Lloyd,
+            archs: WAVE32,
+        },
+        FusedKeyUse {
+            key: KernelKey::FusedQkvzaMq4G256V2Lloyd,
+            archs: WAVE32,
+        },
+        FusedKeyUse {
+            key: KernelKey::FusedGateUpMq4G256V2Lloyd,
+            archs: WAVE32,
+        },
         // ── #397 Ship 5.2 slice 2: prefill gate+up dtypes ──
         // HFQ3G256: Always — base `gemm_gate_up_hfq3g256` carries a full
         // cross-arch internal ladder (MMQ→dp4a→dot2→fp16→scalar gfx1010), and
@@ -1365,10 +1423,12 @@ fn w4_mq3_lloyd_still_rejected_on_cdna_wave64() {
 fn moe_dtypes_uniform(gate_up: DType, down: DType) -> MoeDtypes<'static> {
     MoeDtypes {
         router: Q8_0,
-        shared_gate: Q8_0,
-        shared_expert_gate: Q8_0,
-        shared_expert_up: Q8_0,
-        shared_expert_down: Q8_0,
+        shared: Some(MoeSharedDtypes {
+            selector: Q8_0,
+            gate: Q8_0,
+            up: Q8_0,
+            down: Q8_0,
+        }),
         experts_all_gate_up_mq4: false,
         routed_gate_up: gate_up,
         routed_down: down,
@@ -1772,6 +1832,9 @@ fn mqv2_fused_and_gemm_keys_resolve_on_gfx11_gfx12() {
         KernelKey::FusedQkvMq4G256V2,
         KernelKey::FusedQkvzaMq4G256V2,
         KernelKey::FusedGateUpMq4G256V2,
+        KernelKey::FusedQkvMq4G256V2Lloyd,
+        KernelKey::FusedQkvzaMq4G256V2Lloyd,
+        KernelKey::FusedGateUpMq4G256V2Lloyd,
         KernelKey::FusedQkvMq6G256V2,
         KernelKey::FusedQkvzaMq6G256V2,
         KernelKey::FusedGateUpMq6G256V2,

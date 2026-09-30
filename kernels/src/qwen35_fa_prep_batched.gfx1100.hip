@@ -23,8 +23,14 @@
 //   in sdata[0] with the same association order, and out = x*w*rms matches;
 // - RoPE reuses the halfsplit source expression, pair mapping (i, i+32),
 //   and positions[b] + pos_offset phase, per (row, head, i).
+//
+// The gfx1151 twin compiles this source under its own symbol
+// (`QWEN35_FA_PREP_BATCHED_KERNEL=qwen35_fa_prep_batched_gfx1151`).
+#ifndef QWEN35_FA_PREP_BATCHED_KERNEL
+#define QWEN35_FA_PREP_BATCHED_KERNEL qwen35_fa_prep_batched_gfx1100
+#endif
 extern "C" __launch_bounds__(256, 1)
-__global__ void qwen35_fa_prep_batched_gfx1100(
+__global__ void QWEN35_FA_PREP_BATCHED_KERNEL(
     const float* __restrict__ q_interleaved, // [N x NQ x 256 x 2]
     float* __restrict__ q,                   // [N x NQ x 256]
     float* __restrict__ gate,                // [N x NQ x 256]

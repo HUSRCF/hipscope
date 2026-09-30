@@ -172,6 +172,32 @@ pub struct Tokenizer {
     ///     llama.cpp SPM convention).
     /// Unused on the GPT-2 BPE path.
     sp_dummy_prefix: bool,
+    /// Lazily-built cache of each vocab id's **raw bytes** (lossless).
+    ///
+    /// Built on first call to [`Tokenizer::token_bytes`]. Each entry is
+    /// `decode_bytes(&[id])` — the exact byte sequence the token emits,
+    /// **not** `decode(&[id])` which runs `from_utf8_lossy` and can
+    /// replace incomplete UTF-8 with U+FFFD.
+    ///
+    /// ## U+FFFD hazard
+    ///
+    /// `decode(&[id])` calls `String::from_utf8_lossy` on the raw bytes.
+    /// For byte-fallback vocabulary entries (e.g. SentencePiece `<0xE4>`,
+    /// `<0xB8>`, `<0xAD>` which encode the CJK character 中 = E4 B8 AD),
+    /// each individual token's bytes are an **incomplete UTF-8 sequence**.
+    /// `from_utf8_lossy` replaces each with U+FFFD (0xEF 0xBF 0xBD), so:
+    ///
+    /// - `decode(&[0xE4_id])` → `"\u{FFFD}"` (3 bytes EF BF BD)
+    /// - `decode_bytes(&[0xE4_id])` → `[0xE4]` (1 byte)
+    ///
+    /// A grammar mask built on the lossy `decode()` output would see the
+    /// same U+FFFD string for **every** byte-fallback token, collapsing
+    /// distinct raw bytes into one replacement character. Strict JSON
+    /// schema masks that need to distinguish token bytes (e.g. to allow
+    /// a token whose raw bytes continue a multi-byte UTF-8 sequence
+    /// inside a string value) MUST use [`Tokenizer::token_bytes`], never
+    /// `decode()`.
+    token_bytes_cache: std::sync::OnceLock<Vec<Vec<u8>>>,
 }
 
 /// Resolve a list of `(left_string, right_string)` merge pairs into a
@@ -317,7 +343,6 @@ fn sp_dummy_prefix_from_hf_json(tok: &serde_json::Value) -> bool {
         || pre_tokenizer.map(pretokenizer_prepends).unwrap_or(false)
 }
 
-
 impl Tokenizer {
     /// Load tokenizer from GGUF metadata.
     pub fn from_gguf(gguf: &GgufFile) -> Result<Self, TokenizerError> {
@@ -425,6 +450,7 @@ impl Tokenizer {
             eot_id,
             is_gpt2_bpe,
             sp_dummy_prefix,
+            token_bytes_cache: std::sync::OnceLock::new(),
         })
     }
 
@@ -573,6 +599,7 @@ impl Tokenizer {
             eot_id,
             is_gpt2_bpe,
             sp_dummy_prefix,
+            token_bytes_cache: std::sync::OnceLock::new(),
         })
     }
 
@@ -757,6 +784,7 @@ impl Tokenizer {
             eot_id,
             is_gpt2_bpe,
             sp_dummy_prefix,
+            token_bytes_cache: std::sync::OnceLock::new(),
         })
     }
 
@@ -827,6 +855,43 @@ impl Tokenizer {
             }
         }
         bytes
+    }
+
+    /// Return the **raw bytes** for a single vocab id, losslessly.
+    ///
+    /// This is the byte-exact path for grammar mask construction: it
+    /// calls [`Self::decode_bytes`] on `[id]`, which maps GPT-2 BPE
+    /// chars to their original bytes and emits SentencePiece `<0xHH>`
+    /// byte-fallback tokens as the raw byte `0xHH` — never
+    /// `from_utf8_lossy`.
+    ///
+    /// Contrast with [`Self::decode`] which returns a `String` via
+    /// `from_utf8_lossy`: for byte-fallback tokens whose bytes are
+    /// incomplete UTF-8 (e.g. `<0xE4>` = byte 0xE4, the first byte of
+    /// 中 = E4 B8 AD), `decode(&[id])` produces `"\u{FFFD}"` (U+FFFD
+    /// replacement character), while `token_bytes(id)` returns
+    /// `[0xE4]`. See the `token_bytes_cache` field doc for the full
+    /// hazard description.
+    ///
+    /// The table is built once on first access and cached for the
+    /// lifetime of the `Tokenizer`. Out-of-range ids return an empty
+    /// slice.
+    pub fn token_bytes(&self, id: u32) -> &[u8] {
+        let table = self
+            .token_bytes_cache
+            .get_or_init(|| self.build_token_bytes_table());
+        table.get(id as usize).map(|v| v.as_slice()).unwrap_or(&[])
+    }
+
+    /// Build the full id → raw-bytes table by calling
+    /// [`Self::decode_bytes`] on each single-token id sequence.
+    fn build_token_bytes_table(&self) -> Vec<Vec<u8>> {
+        let n = self.vocab.len();
+        let mut table = Vec::with_capacity(n);
+        for id in 0..n {
+            table.push(self.decode_bytes(&[id as u32]));
+        }
+        table
     }
 
     /// Encode text to token IDs.
@@ -1195,6 +1260,46 @@ impl Tokenizer {
     /// constructors. Used for cross-tokenizer equivalence checks.
     pub fn special_tokens(&self) -> &[(String, u32)] {
         &self.special_tokens
+    }
+
+    /// SHA-256 of the decoded vocabulary table in id order (spec §4.1 C1).
+    /// Computed once at load for cache-domain identity; never per request.
+    pub fn vocab_digest(&self) -> Vec<u8> {
+        use sha2::{Digest as Sha256Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update((self.vocab.len() as u64).to_le_bytes());
+        for tok in &self.vocab {
+            h.update((tok.len() as u64).to_le_bytes());
+            h.update(tok.as_bytes());
+        }
+        h.finalize().to_vec()
+    }
+
+    /// SHA-256 of tokenizer configuration that affects encoding: merge
+    /// ranks, special tokens, BOS/EOS/EOT, and the GPT-2 / SentencePiece
+    /// flags (spec §4.1 C1). Independent of [`Self::vocab_digest`].
+    pub fn config_digest(&self) -> Vec<u8> {
+        use sha2::{Digest as Sha256Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update((self.merges.len() as u64).to_le_bytes());
+        for m in &self.merges {
+            h.update(m.to_le_bytes());
+        }
+        h.update((self.special_tokens.len() as u64).to_le_bytes());
+        for (s, id) in &self.special_tokens {
+            h.update((s.len() as u64).to_le_bytes());
+            h.update(s.as_bytes());
+            h.update(id.to_le_bytes());
+        }
+        h.update(self.bos_id.to_le_bytes());
+        h.update(self.eos_id.to_le_bytes());
+        h.update(self.eot_id.unwrap_or(u32::MAX).to_le_bytes());
+        h.update([
+            u8::from(self.add_bos),
+            u8::from(self.is_gpt2_bpe),
+            u8::from(self.sp_dummy_prefix),
+        ]);
+        h.finalize().to_vec()
     }
 
     /// Stable 64-bit signature derived from the full vocab + every special
@@ -1731,6 +1836,205 @@ fn needs_trailing_ws_strip(s: &str) -> bool {
     false
 }
 
+/// Incremental token → text decoder for per-token streaming emit sites.
+///
+/// `Tokenizer::decode` reassembles byte fragments only within one call, so
+/// calling it once per streamed token (`decode(&[tok])`) runs
+/// `from_utf8_lossy` over a partial sequence. Byte-level BPE and
+/// SentencePiece byte-fallback both spread one character over several tokens
+/// (`中` = `<0xE4> <0xB8> <0xAD>`, most emoji), so per-token decode sends one
+/// U+FFFD per fragment instead of the character.
+///
+/// `TokenTextStream` holds back only a trailing *incomplete* code point
+/// (at most 3 bytes) and returns everything before it. `decode_bytes` is
+/// concatenative over tokens, so this is exact and O(1) per token. Emit
+/// sites must skip the empty string a holdback step returns, and call
+/// [`flush`](Self::flush) once after the loop so a turn that stops
+/// mid-character does not silently drop its last bytes.
+#[derive(Debug, Clone, Default)]
+pub struct TokenTextStream {
+    /// Trailing bytes of an incomplete UTF-8 code point.
+    pending: Vec<u8>,
+}
+
+impl TokenTextStream {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feed one token; returns the text it completed (`""` while a
+    /// character is still split).
+    pub fn push(&mut self, tokenizer: &Tokenizer, token: u32) -> String {
+        self.push_bytes(&tokenizer.decode_bytes(&[token]))
+    }
+
+    /// Feed raw decoded bytes.
+    pub fn push_bytes(&mut self, bytes: &[u8]) -> String {
+        self.pending.extend_from_slice(bytes);
+        let mut out = String::new();
+        loop {
+            match std::str::from_utf8(&self.pending) {
+                Ok(s) => {
+                    out.push_str(s);
+                    self.pending.clear();
+                    return out;
+                }
+                Err(e) => {
+                    let valid = e.valid_up_to();
+                    // `valid_up_to` guarantees this prefix is well-formed.
+                    out.push_str(std::str::from_utf8(&self.pending[..valid]).unwrap_or_default());
+                    match e.error_len() {
+                        // Incomplete trailing sequence: wait for the next token.
+                        None => {
+                            self.pending.drain(..valid);
+                            return out;
+                        }
+                        // Bytes that can never become valid: holding them would
+                        // mute the rest of the turn, so replace and step past.
+                        Some(bad) => {
+                            out.push(char::REPLACEMENT_CHARACTER);
+                            self.pending.drain(..valid + bad);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// End of stream: the held-back bytes of a truncated character, decoded
+    /// lossily rather than dropped. Empty unless generation stopped
+    /// mid-character.
+    pub fn flush(&mut self) -> String {
+        let tail = String::from_utf8_lossy(&self.pending).into_owned();
+        self.pending.clear();
+        tail
+    }
+}
+
+#[cfg(test)]
+mod token_text_stream_tests {
+    use super::*;
+
+    const LITERALS: &[&str] = &["hello", "中", "🎉", " world", "∑", "!"];
+
+    /// SentencePiece vocab with full byte fallback: ids 0..=255 are the
+    /// `<0xHH>` tokens, then whole-character literals — the vocab shape that
+    /// spreads one character over several tokens.
+    fn byte_fallback_tokenizer() -> Tokenizer {
+        let mut vocab: Vec<String> = (0u32..=255).map(|b| format!("<0x{b:02X}>")).collect();
+        vocab.extend(LITERALS.iter().map(|s| (*s).to_string()));
+        let token_to_id = vocab
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.clone(), i as u32))
+            .collect();
+        Tokenizer {
+            vocab,
+            token_to_id,
+            merges: Vec::new(),
+            merge_pair_rank: HashMap::new(),
+            byte_to_id: None,
+            special_tokens: Vec::new(),
+            bos_id: 0,
+            eos_id: 0,
+            add_bos: false,
+            eot_id: None,
+            is_gpt2_bpe: false,
+            sp_dummy_prefix: false,
+            token_bytes_cache: std::sync::OnceLock::new(),
+        }
+    }
+
+    fn byte_tokens(s: &str) -> Vec<u32> {
+        s.bytes().map(u32::from).collect()
+    }
+
+    fn stream_all(tk: &Tokenizer, seq: &[u32]) -> String {
+        let mut stream = TokenTextStream::new();
+        let mut out = String::new();
+        for &t in seq {
+            out.push_str(&stream.push(tk, t));
+            assert!(stream.pending.len() <= 3, "holdback grew past one code point");
+        }
+        out.push_str(&stream.flush());
+        out
+    }
+
+    #[test]
+    fn per_token_decode_is_lossy_but_stream_is_exact() {
+        let tk = byte_fallback_tokenizer();
+        let text = "emoji 🎉🔥 中文 ∑";
+        let seq = byte_tokens(text);
+        let per_token: String = seq.iter().map(|&t| tk.decode(&[t])).collect();
+        assert!(per_token.contains('\u{FFFD}'), "baseline must reproduce the bug");
+        assert_eq!(stream_all(&tk, &seq), text);
+    }
+
+    #[test]
+    fn stream_equals_batch_decode_over_random_sequences() {
+        let tk = byte_fallback_tokenizer();
+        let vocab_len = (256 + LITERALS.len()) as u64;
+        let mut x: u64 = 0x5EED_1234_ABCD_0001;
+        for _ in 0..2000 {
+            let mut next = || {
+                x ^= x >> 12;
+                x ^= x << 25;
+                x ^= x >> 27;
+                x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+            };
+            let len = 1 + (next() % 24) as usize;
+            let seq: Vec<u32> = (0..len).map(|_| (next() % vocab_len) as u32).collect();
+            assert_eq!(stream_all(&tk, &seq), tk.decode(&seq), "seq {seq:?}");
+        }
+    }
+
+    #[test]
+    fn every_byte_split_reassembles() {
+        let text = "a🎉b∑中";
+        let bytes = text.as_bytes();
+        let n = bytes.len();
+        for mask in 0u32..(1 << (n - 1)) {
+            let mut stream = TokenTextStream::new();
+            let mut out = String::new();
+            let mut start = 0;
+            for i in 0..n {
+                if i == n - 1 || (mask >> i) & 1 == 1 {
+                    out.push_str(&stream.push_bytes(&bytes[start..=i]));
+                    start = i + 1;
+                }
+            }
+            out.push_str(&stream.flush());
+            assert_eq!(out, text, "mask {mask:#b}");
+        }
+    }
+
+    #[test]
+    fn split_character_yields_empty_until_complete() {
+        let mut stream = TokenTextStream::new();
+        assert_eq!(stream.push_bytes(&[0xF0]), "");
+        assert_eq!(stream.push_bytes(&[0x9F, 0x8E]), "");
+        assert_eq!(stream.push_bytes(&[0x89, b'!']), "🎉!");
+    }
+
+    #[test]
+    fn flush_keeps_a_truncated_tail() {
+        let mut stream = TokenTextStream::new();
+        assert_eq!(stream.push_bytes(&[b'a', 0xF0, 0x9F]), "a");
+        assert_eq!(stream.flush(), "\u{FFFD}");
+        assert_eq!(stream.flush(), "");
+    }
+
+    #[test]
+    fn invalid_bytes_never_stall() {
+        let mut stream = TokenTextStream::new();
+        assert_eq!(stream.push_bytes(&[0x80]), "\u{FFFD}");
+        assert_eq!(stream.push_bytes(&[0xFF, b'x']), "\u{FFFD}x");
+        // An impossible continuation after a lead byte is replaced, not held.
+        assert_eq!(stream.push_bytes(&[0xE4, b'y']), "\u{FFFD}y");
+        assert!(stream.pending.is_empty());
+    }
+}
+
 #[cfg(test)]
 mod bpe_tests {
     use super::*;
@@ -1779,6 +2083,7 @@ mod bpe_tests {
             eot_id: None,
             is_gpt2_bpe: true,
             sp_dummy_prefix: true,
+            token_bytes_cache: std::sync::OnceLock::new(),
         }
     }
 
@@ -2092,6 +2397,7 @@ mod sp_tests {
             // convention. Config-driven coverage lives in
             // `sp_dummy_prefix_tests`.
             sp_dummy_prefix: true,
+            token_bytes_cache: std::sync::OnceLock::new(),
         }
     }
 
@@ -2454,7 +2760,6 @@ mod prompt_norm_tests {
     }
 }
 
-
 #[cfg(test)]
 mod sp_dummy_prefix_tests {
     //! Config-driven SP dummy-prefix coverage (gemma4 first-word bug,
@@ -2528,8 +2833,7 @@ mod sp_dummy_prefix_tests {
 
     #[test]
     fn gemma4_no_dummy_prefix_first_word_matches_hf() {
-        let t = Tokenizer::from_hfq_metadata(&gemma4_fixture_metadata())
-            .expect("fixture parses");
+        let t = Tokenizer::from_hfq_metadata(&gemma4_fixture_metadata()).expect("fixture parses");
         assert_eq!(t.bos_id, 2, "generation_config bos override");
         let mut ids = vec![t.bos_id];
         ids.extend(t.encode("The capital of France is"));
@@ -2538,8 +2842,7 @@ mod sp_dummy_prefix_tests {
 
     #[test]
     fn gemma4_chat_tail_thought_channel_matches_hf() {
-        let t = Tokenizer::from_hfq_metadata(&gemma4_fixture_metadata())
-            .expect("fixture parses");
+        let t = Tokenizer::from_hfq_metadata(&gemma4_fixture_metadata()).expect("fixture parses");
         assert_eq!(
             t.encode("<|channel>thought\n<channel|>The capital of France is"),
             vec![100, 45518, 107, 101, 818, 5279, 529, 7001, 563],
@@ -2729,5 +3032,139 @@ mod lfm2_bos_tests {
             1,
             "must not double-prepend when text already starts with BOS literal"
         );
+    }
+}
+
+#[cfg(test)]
+mod token_bytes_tests {
+    //! Tests for the byte-exact `token_bytes` API (spec §7 G2).
+    //!
+    //! The key property: `token_bytes(id)` returns the RAW bytes via
+    //! `decode_bytes`, while `decode(&[id])` runs `from_utf8_lossy` which
+    //! replaces incomplete UTF-8 with U+FFFD. For byte-fallback tokens
+    //! (e.g. SentencePiece `<0xE4>`), these two paths MUST diverge —
+    //! `token_bytes` gives `[0xE4]`, `decode` gives `"\u{FFFD}"`.
+
+    use super::*;
+    use serde_json::json;
+
+    /// Build a SentencePiece-mode meta JSON with byte-fallback tokens.
+    fn sp_meta_bytes(tokens: &[&str]) -> serde_json::Value {
+        json!({
+            "tokenizer.ggml.tokens": tokens,
+            "tokenizer.ggml.merges": [],
+            "tokenizer.ggml.model": "llama",
+        })
+    }
+
+    #[test]
+    fn token_bytes_returns_raw_bytes_for_ascii() {
+        // Simple ASCII tokens: token_bytes matches decode.
+        let meta = sp_meta_bytes(&["hello", "world"]);
+        let tok = Tokenizer::from_gguf_meta_json(&meta).expect("sp meta");
+        assert_eq!(tok.token_bytes(0), b"hello");
+        assert_eq!(tok.token_bytes(1), b"world");
+        assert_eq!(tok.decode(&[0]), "hello");
+        assert_eq!(tok.decode(&[1]), "world");
+    }
+
+    #[test]
+    fn token_bytes_diverges_from_decode_on_byte_fallback() {
+        // SentencePiece byte-fallback tokens for CJK 中 (UTF-8: E4 B8 AD).
+        // Each individual token is an incomplete UTF-8 sequence:
+        //   <0xE4> → raw byte 0xE4 (start of 3-byte sequence)
+        //   <0xB8> → raw byte 0xB8 (continuation byte)
+        //   <0xAD> → raw byte 0xAD (continuation byte)
+        //
+        // decode(&[id]) runs from_utf8_lossy → U+FFFD for each.
+        // token_bytes(id) → the raw single byte.
+        let meta = sp_meta_bytes(&["<0xE4>", "<0xB8>", "<0xAD>"]);
+        let tok = Tokenizer::from_gguf_meta_json(&meta).expect("sp meta");
+
+        // token_bytes returns the raw bytes — distinct for each id.
+        assert_eq!(tok.token_bytes(0), &[0xE4]);
+        assert_eq!(tok.token_bytes(1), &[0xB8]);
+        assert_eq!(tok.token_bytes(2), &[0xAD]);
+
+        // decode returns U+FFFD for each — the lossy path collapses them.
+        let d0 = tok.decode(&[0]);
+        let d1 = tok.decode(&[1]);
+        let d2 = tok.decode(&[2]);
+        assert_eq!(d0, "\u{FFFD}");
+        assert_eq!(d1, "\u{FFFD}");
+        assert_eq!(d2, "\u{FFFD}");
+
+        // The two paths diverge: raw bytes are distinct, lossy strings are identical.
+        assert_ne!(tok.token_bytes(0), tok.token_bytes(1));
+        assert_ne!(tok.token_bytes(1), tok.token_bytes(2));
+        assert_eq!(d0, d1, "lossy decode collapses distinct bytes to U+FFFD");
+        assert_eq!(d1, d2, "lossy decode collapses distinct bytes to U+FFFD");
+    }
+
+    #[test]
+    fn token_bytes_reassembles_multi_byte_across_ids() {
+        // When all three byte-fallback tokens are decoded together,
+        // decode_bytes reassembles the full UTF-8 sequence for 中.
+        let meta = sp_meta_bytes(&["<0xE4>", "<0xB8>", "<0xAD>"]);
+        let tok = Tokenizer::from_gguf_meta_json(&meta).expect("sp meta");
+
+        // Individual raw bytes:
+        assert_eq!(tok.token_bytes(0), &[0xE4]);
+        assert_eq!(tok.token_bytes(1), &[0xB8]);
+        assert_eq!(tok.token_bytes(2), &[0xAD]);
+
+        // decode_bytes of all three → the full character 中.
+        let reassembled = tok.decode_bytes(&[0, 1, 2]);
+        assert_eq!(reassembled, "中".as_bytes());
+
+        // decode of all three → the string "中" (valid UTF-8, no lossy replacement).
+        assert_eq!(tok.decode(&[0, 1, 2]), "中");
+    }
+
+    #[test]
+    fn token_bytes_out_of_range_returns_empty() {
+        let meta = sp_meta_bytes(&["a"]);
+        let tok = Tokenizer::from_gguf_meta_json(&meta).expect("sp meta");
+        assert_eq!(tok.token_bytes(999), &[] as &[u8]);
+    }
+
+    #[test]
+    fn token_bytes_cached_across_calls() {
+        // The cache is built once; repeated calls return the same slice.
+        let meta = sp_meta_bytes(&["test"]);
+        let tok = Tokenizer::from_gguf_meta_json(&meta).expect("sp meta");
+        let b1 = tok.token_bytes(0);
+        let b2 = tok.token_bytes(0);
+        // Same pointer (cached).
+        assert!(std::ptr::eq(b1, b2));
+    }
+}
+
+#[cfg(test)]
+mod cache_identity_digest_tests {
+    use super::*;
+
+    fn sp_meta(vocab: &[&str]) -> serde_json::Value {
+        serde_json::json!({
+            "tokenizer.ggml.tokens": vocab,
+            "tokenizer.ggml.merges": [],
+            "tokenizer.ggml.model": "llama",
+        })
+    }
+
+    #[test]
+    fn vocab_digest_changes_when_vocab_changes() {
+        let a = Tokenizer::from_gguf_meta_json(&sp_meta(&["a", "b"])).expect("a");
+        let b = Tokenizer::from_gguf_meta_json(&sp_meta(&["a", "c"])).expect("b");
+        assert_ne!(a.vocab_digest(), b.vocab_digest());
+        assert_eq!(a.vocab_digest(), a.vocab_digest());
+    }
+
+    #[test]
+    fn config_digest_stable_for_same_tokenizer() {
+        let t = Tokenizer::from_gguf_meta_json(&sp_meta(&["hello"])).expect("t");
+        assert_eq!(t.config_digest(), t.config_digest());
+        assert_eq!(t.vocab_digest().len(), 32);
+        assert_eq!(t.config_digest().len(), 32);
     }
 }

@@ -1,0 +1,15 @@
+[package]
+name = "peacemaker-ir"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+smallvec = "1"
+thiserror.workspace = true
+petgraph = "0.8"
+
+[dev-dependencies]
+proptest.workspace = true
+insta = "1"
+serde_json.workspace = true

@@ -31,17 +31,34 @@ use hipfire_quantize::safetensors_file::{SafetensorsFile, TensorMeta};
 #[command(
     name = "hipfire-quantize",
     version,
-    about = "Quantize Hugging Face safetensors or GGUF weights into Hipfire HFQ"
+    about = "Quantize Hugging Face safetensors (or deprecated GGUF weights) into Hipfire HFQ"
 )]
 pub(crate) struct QuantizeArgs {
-    /// Hugging Face model directory, model ID, or GGUF file. Not used by
+    /// Hugging Face model directory or model ID. A GGUF weight file is
+    /// deprecated (removal in 0.5.0): GGUF→mqN is lossy double quantization; use llama.cpp for GGUF. For
+    /// `--qwen4-flash-next`, use a local directory/file or the immutable
+    /// remote form `hf://OWNER/REPO@40_HEX_REVISION`; floating refs such as
+    /// `main`, tags, and short revisions are rejected. Not used by
     /// `--flux-pipe`, which names its own input.
     #[arg(
         long,
         value_name = "PATH_OR_MODEL_ID",
         required_unless_present = "flux_pipe"
     )]
+    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — GGUF→mqN is lossy double quantization; use llama.cpp for GGUF (GGUF weight input only; imatrix.gguf stays)
     pub input: Option<String>,
+
+    /// Produce the native Qwen4/Qwen3.8-Flash-Next streaming artifact.  This
+    /// transactional path always includes typed PLE metadata, all PLE shards,
+    /// and native MTP experts; legacy recipe flags are ignored.
+    #[arg(long, conflicts_with = "flux_pipe")]
+    pub qwen4_flash_next: bool,
+    /// Explicit non-production bounded fixture mode for exercising the full
+    /// transactional writer with a compact local component. Production remains
+    /// the default and keeps the pinned checkpoint admission counts.
+    #[arg(long, value_name = "MODE", default_value = "production",
+          value_parser = ["production", "compact-fixture"])]
+    pub qwen4_component_mode: String,
 
     /// Destination HFQ file.
     #[arg(long, value_name = "PATH")]
@@ -61,20 +78,15 @@ pub(crate) struct QuantizeArgs {
     /// ENTIRETY every decoded token — 622 MB of BF16 at 205 GB/s, 90% of this
     /// box's achievable DRAM bandwidth and 36% of the decode token. It is the
     /// only bandwidth-bound part of the model, so this carrier is a decode-speed
-    /// decision, not a fidelity one. `bf16` (default) preserves existing
-    /// behaviour; `q8` is 331 MB, `mq4` is 195 MB.
+    /// decision, not a fidelity one.
     ///
-    /// Does NOT touch `word_embeddings` (same shape, but only ONE ROW is read
-    /// per token — a RAM question, not a bandwidth one), the ternary expert
-    /// path, or the router.
-    /// Default is q8, not bf16. Measured on gfx1151 against a bf16 reference
+    /// Default is `q8` (331 MB). Measured on gfx1151 against a bf16 reference
     /// (2048 teacher-forced tokens): q8 and bf16 heads give the IDENTICAL mean
     /// KL of 0.0511, but q8 decodes 23% faster (144.6 vs 117.6 tok/s). A bf16
     /// head is therefore strictly dominated -- it costs throughput and buys
-    /// exactly zero accuracy. mq4 (qt=30 Lloyd, 5.0 bpw) is +10.4% decode over
-    /// q8 but +51% mean KL and -2.7pp top-1, which is a poor trade on this
-    /// stack; note the vendor DOES ship a Q4_K head, because on their CPU path
-    /// the same swap buys 49% rather than 10%.
+    /// exactly zero accuracy. mq4v2 (qt=44, 4.25 bpw, FWHT-rotated) is +10.4%
+    /// decode over q8 but +51% mean KL and -2.7pp top-1, which is a poor trade
+    /// on this stack.
     ///
     /// `mq4` (qt=30) is DEPRECATED and no longer selectable: mq4v2 (qt=44)
     /// beats it on every axis -- lower KL (0.0744 vs 0.0772), faster (165.8 vs
@@ -204,6 +216,67 @@ pub(crate) struct QuantizeArgs {
     /// Enable AWQ pre-scaling with an explicit alpha.
     #[arg(long, value_name = "ALPHA")]
     pub awq_alpha: Option<f32>,
+    /// Correct Qwen3.8 linear-attention out_proj imatrix head order before
+    /// fitting AWQ scales. Does not change the alpha or any other tensor.
+    #[arg(long, requires = "imatrix")]
+    pub awq_fix_la_head_order: bool,
+
+    /// Reproduce the historical A4-aware alpha search (four A4 candidates,
+    /// asymmetric W surrogate, positive imatrix-RMS activation).
+    #[arg(long, conflicts_with = "awq_alpha")]
+    pub awq_a4_aware: bool,
+
+    /// Search shared AWQ alpha with the gfx1201 fused c2 A4 recipe and
+    /// symmetric qt44 W writer for every eligible layer. Without captured
+    /// rows, retains the legacy imatrix RMS activation statistic.
+    #[arg(long, requires = "mq4v2_symmetric", conflicts_with = "awq_a4_aware")]
+    pub awq_a4_route_c2: bool,
+    /// Optionally replace the imatrix RMS statistic with signed QAT producer
+    /// rows on captured sites; uncaptured sites still use c2/symmetric objective.
+    #[arg(long, value_name = "CAPTURE_DIR", requires_all = ["awq_a4_route_c2", "awq_a4_source_sha"])]
+    pub awq_a4_signed_capture: Option<PathBuf>,
+
+    /// SHA-256 of the BF16 parent recorded in the signed QAT capture manifest.
+    #[arg(long, value_name = "SHA256", requires = "awq_a4_signed_capture")]
+    pub awq_a4_source_sha: Option<String>,
+
+    /// Encode MQ4V2 with a per-128 symmetric grid while retaining the existing
+    /// affine header layout. The stored zero is `-8*d`, so code 8 maps to zero.
+    #[arg(long)]
+    pub mq4v2_symmetric: bool,
+
+    /// Encode MQ3V2 with a per-128 symmetric grid while retaining the existing
+    /// affine header layout. The stored zero is `-4*d`, so code 4 maps to zero.
+    #[arg(long)]
+    pub mq3v2_symmetric: bool,
+
+    /// Encode MQ2V2 with a per-128 symmetric grid while retaining the existing
+    /// affine header layout. The stored zero is `-2*d`, so code 2 maps to zero.
+    #[arg(long)]
+    pub mq2v2_symmetric: bool,
+
+    /// Replace selected MQ4V2-XT tensors in an existing HFQ with trained final
+    /// codes. PATH is one frozen-record `.safetensors` file or a directory of
+    /// them; each record carries metadata `name,M,K,qt,source_sha` and tensors
+    /// `S_f16`, `d_z_f16`, `codes_u8`. `--input` must be the source HFQ named
+    /// by `source_sha`; unselected tensor/index/metadata bytes are copied intact.
+    #[arg(
+        long,
+        value_name = "PATH",
+        conflicts_with_all = ["flux_pipe", "reap_overlay", "reap_bake"]
+    )]
+    pub mq4v2_final_codes: Option<PathBuf>,
+
+    /// Replace only packed MQ3V2 code bytes in an existing HFQ using frozen-grid
+    /// safetensors records. The source HFQ SHA, tensor shape, qt=49, and
+    /// unchanged fp16 grid are checked before writing.
+    #[arg(long, value_name = "DIR", conflicts_with_all = ["mq4v2_final_codes", "mq2v2_final_codes", "flux_pipe", "reap_overlay", "reap_bake"])]
+    pub mq3v2_final_codes: Option<PathBuf>,
+
+    /// Replace only packed MQ2V2 code bytes in an existing HFQ using frozen-grid
+    /// safetensors records (qt=50).
+    #[arg(long, value_name = "DIR", conflicts_with_all = ["mq4v2_final_codes", "mq3v2_final_codes", "flux_pipe", "reap_overlay", "reap_bake"])]
+    pub mq2v2_final_codes: Option<PathBuf>,
 
     /// Enable K-map promotion for dense models.
     #[arg(long)]

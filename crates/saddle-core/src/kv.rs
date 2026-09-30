@@ -19,26 +19,39 @@ pub enum KvMode {
     /// site whose `accepted` list names it can ever resolve to it — today that
     /// is maple alone, so every other site's behaviour is unchanged.
     Bf16,
+    /// Flat 2-byte IEEE fp16 K/V — the same layout as BF16 with the true
+    /// half format (better small-magnitude precision, narrower exponent
+    /// range). Slots-engine tier only today: descriptor-aware write/attend
+    /// kernels exist for it there. Same constraints as BF16: no rotation,
+    /// no scales, no adaptive/compaction.
+    F16,
     Asym2,
     Asym3,
     Asym4,
     Fwht2,
     Fwht3,
     Fwht4,
+    /// Native E4M3FN K/V, independently scaled per (layer, token, KV head)
+    /// with one f16 scale per 256-element head stored inline in the token
+    /// row (`[Hkv x D codes][Hkv f16 scales]`, 1032 bytes/row/side at
+    /// Hkv=4/D=256). K/V pair is indivisible: fp8 on both sides.
+    /// Legacy-backend, single-GPU, Qwen dense H24/Hkv4/D256 only;
+    /// no VMM / adaptive / compaction / slots support.
+    Fp8,
 }
 
 /// KV storage backend selection.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum KvBackend {
+    Legacy,
     #[default]
-    Contiguous,
     Vmm,
 }
 
 impl KvBackend {
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Contiguous => "contiguous",
+            Self::Legacy => "legacy",
             Self::Vmm => "vmm",
         }
     }
@@ -55,7 +68,7 @@ pub struct ParseKvBackendError {
     value: String,
 }
 
-pub const KV_BACKEND_NAMES: &[&str] = &["contiguous", "vmm"];
+pub const KV_BACKEND_NAMES: &[&str] = &["legacy", "vmm"];
 
 pub const DEFAULT_KV_CHUNK_TOKENS: usize = 64;
 pub const DEFAULT_VMM_PHYSICAL_CHUNK_BYTES: usize = 2 * 1024 * 1024;
@@ -223,6 +236,11 @@ fn checked_round_up(value: usize, alignment: usize) -> Result<usize, KvChunkPlan
 
 impl std::fmt::Display for ParseKvBackendError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.value == "contiguous" {
+            return f.write_str(
+                "KV backend 'contiguous' was renamed to 'legacy'; use --kv-backend legacy or memory.kv_backend = \"legacy\"",
+            );
+        }
         write!(
             f,
             "unknown KV backend {:?}; expected one of: {}",
@@ -239,7 +257,7 @@ impl std::str::FromStr for KvBackend {
 
     fn from_str(raw: &str) -> Result<Self, Self::Err> {
         match raw {
-            "contiguous" => Ok(Self::Contiguous),
+            "legacy" => Ok(Self::Legacy),
             "vmm" => Ok(Self::Vmm),
             other => Err(ParseKvBackendError {
                 value: other.to_string(),
@@ -316,6 +334,12 @@ pub struct KvCache {
     /// every `quant_*` tier flag above; `quantized` is also set so the legacy
     /// llama/qwen35 `!quantized` branches never mistake it for plain F32.
     pub quant_bf16: bool,
+    /// True when K and V are stored as native E4M3FN with one f16 scale per
+    /// (token, KV head) stored inline in the token row (`[Hkv x D codes]
+    /// [Hkv f16 scales]`). Mutually exclusive with every other `quant_*`
+    /// tier flag; `quantized` is also set so legacy `!quantized` branches
+    /// never mistake it for plain F32.
+    pub quant_fp8: bool,
     /// V-cache quantization mode (independent of the K mode). Defaults to Q8.
     pub v_mode: VMode,
     /// Per-layer flag: true = this layer uses Q8 (boundary layer)
@@ -328,6 +352,162 @@ pub struct KvCache {
     /// absolute phase, and the cache write still lands at `pos` (physical).
     /// Zero when no compaction has happened.
     pub compact_offset: usize,
+}
+
+/// Per-tier arena plan for a flat multi-slot KV pool (the `SlotEngine`
+/// addressing scheme): byte strides for one position of K and of V, plus the
+/// rotation-table geometry the tier's write/attend kernels need.
+///
+/// This is the multi-slot sibling of [`KvCache::vmm_k_bytes_per_head`] — the
+/// same packed layouts, addressed per position instead of per VMM head. The
+/// two stride facts that matter to a slot pool live here:
+///
+/// * K and V strides DIFFER on every rotated-K tier (asym{2,3,4} /
+///   fwht{2,3,4} store K packed + a 4-byte norm/sign header per head, V at
+///   Q8_0), so a pool must track them separately and the 32-byte
+///   `KvSlotDesc` carries separate `legacy_k_base`/`legacy_v_base`.
+/// * The rotation tables are MODEL-global (shared by every slot and layer):
+///   Givens angles for asym tiers, ±1 sign vectors for fwht tiers, nothing
+///   for q8/bf16. Seeds match the `new_gpu_*_filtered` constructors exactly
+///   (42 for the primary table, 1042 for the secondary FWHT signs) so a slot
+///   pool writes bit-identical cache bytes to the sequential path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SlotKvTierPlan {
+    pub k_bytes_per_pos: usize,
+    pub v_bytes_per_pos: usize,
+    /// Givens cos/sin table length (asym tiers): `head_dim / 2`.
+    pub givens_len: Option<usize>,
+    /// FWHT sign-vector length (fwht tiers): 128 (Q8-V sign width).
+    pub fwht_len: Option<usize>,
+}
+
+impl SlotKvTierPlan {
+    /// Resolve the plan for `mode` (+ static Q8 V, the multi-slot ladder).
+    /// Geometry gates mirror the contiguous `new_gpu_*_filtered`
+    /// constructors: asym3/fwht3 need head_dim 256, the other rotated tiers
+    /// need 128 or 256, every packed tier needs head_dim divisible by 32.
+    pub fn resolve(mode: KvMode, n_kv_heads: usize, head_dim: usize) -> HipResult<Self> {
+        if n_kv_heads == 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "slot KV plan requires n_kv_heads > 0",
+            ));
+        }
+        let quant_gate = |name: &str, ok_hd: bool| -> HipResult<()> {
+            if !head_dim.is_multiple_of(32) {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    &format!("{name} slot KV requires head_dim divisible by 32 (got {head_dim})"),
+                ));
+            }
+            if !ok_hd {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    &format!(
+                        "{name} slot KV requires head_dim {} (got {head_dim})",
+                        if matches!(mode, KvMode::Asym3 | KvMode::Fwht3) {
+                            "256"
+                        } else {
+                            "128 or 256"
+                        }
+                    ),
+                ));
+            }
+            Ok(())
+        };
+        let k_bph = match mode {
+            KvMode::Q8 => {
+                if head_dim == 0 || !head_dim.is_multiple_of(32) {
+                    return Err(hip_bridge::HipError::new(
+                        0,
+                        &format!("q8 slot KV requires head_dim divisible by 32 (got {head_dim})"),
+                    ));
+                }
+                (head_dim / 32) * 34
+            }
+            // Bf16 and F16 are flat 2 bytes/element with no per-head blocks
+            // and no rotation table. Whether a given engine ACCEPTS the tier
+            // is its policy's call (see kv_mode.rs); this helper just
+            // describes the layout.
+            KvMode::Bf16 | KvMode::F16 => {
+                let kv_dim = n_kv_heads
+                    .checked_mul(head_dim)
+                    .ok_or_else(|| hip_bridge::HipError::new(0, "slot KV kv_dim overflowed"))?;
+                kv_dim * 2
+            }
+            KvMode::Asym2 | KvMode::Fwht2 => {
+                quant_gate("asym2", head_dim == 128 || head_dim == 256)?;
+                4 + head_dim / 4
+            }
+            KvMode::Asym3 | KvMode::Fwht3 => {
+                quant_gate("asym3", head_dim == 256)?;
+                4 + (head_dim * 3) / 8
+            }
+            KvMode::Asym4 | KvMode::Fwht4 => {
+                quant_gate("asym4", head_dim == 128 || head_dim == 256)?;
+                4 + head_dim / 2
+            }
+            // Native fp8 has no slot-reader support on the slot engine:
+            // refuse the tier plan so the site cannot describe a layout it
+            // cannot serve (the policy gate refuses fp8 before this too).
+            KvMode::Fp8 => {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    "KV mode fp8 has no slot-reader support on the slot engine",
+                ));
+            }
+        };
+        let k_bytes_per_pos = match mode {
+            // Flat 2-byte tiers: the stride is already per-position (kv_dim
+            // flat elements, no per-head blocks) — never scaled by n_kv_heads.
+            KvMode::Bf16 | KvMode::F16 => k_bph,
+            _ => n_kv_heads
+                .checked_mul(k_bph)
+                .ok_or_else(|| hip_bridge::HipError::new(0, "slot KV K stride overflowed"))?,
+        };
+        let v_bytes_per_pos = match mode {
+            // Flat tiers store V exactly like K.
+            KvMode::Bf16 | KvMode::F16 => k_bytes_per_pos,
+            _ => {
+                // Static multi-slot ladder stores V at Q8_0 — the same
+                // per-head layout the asym/fwht constructors allocate.
+                if head_dim == 0 || !head_dim.is_multiple_of(32) {
+                    return Err(hip_bridge::HipError::new(
+                        0,
+                        &format!(
+                            "Q8_0 V slot KV requires head_dim divisible by 32 (got {head_dim})"
+                        ),
+                    ));
+                }
+                n_kv_heads * (head_dim / 32) * 34
+            }
+        };
+        Ok(Self {
+            k_bytes_per_pos,
+            v_bytes_per_pos,
+            givens_len: matches!(mode, KvMode::Asym2 | KvMode::Asym3 | KvMode::Asym4)
+                .then_some(head_dim / 2),
+            // fwht3's K-rotation kernel is `fwht_shfl_forward_256` — it reads
+            // signs[0..255] (d0 = tid*8 → lane 31 touches index 255). The
+            // sequential path already allocates 256 for Fwht3 (kv.rs:776);
+            // the slot path must match or the sign table is 512 B short →
+            // OOB read + a wrong rotation → silently corrupted KV.
+            // fwht2/fwht4 use the 128-wide `fwht_shfl_forward_128`.
+            fwht_len: match mode {
+                KvMode::Fwht3 => Some(256),
+                KvMode::Fwht2 | KvMode::Fwht4 => Some(128),
+                _ => None,
+            },
+        })
+    }
+
+    /// True when the K and V per-position strides differ (the rotated-K
+    /// tiers). Drives whether a pool's descriptors carry distinct
+    /// `legacy_k_base`/`legacy_v_base` and whether the V-side write must
+    /// resolve the V base instead of the shared K base.
+    pub fn kv_strides_differ(&self) -> bool {
+        self.k_bytes_per_pos != self.v_bytes_per_pos
+    }
 }
 
 /// Layer addressing for [`KvCache::from_mode`]: a per-layer "is this a
@@ -429,13 +609,17 @@ impl KvCache {
                 }
                 Self::checked_vmm_product("q8 K head stride", &[head_dim / 32, 34])
             }
-            // BF16 is contiguous-only. It has no growable-arena constructor, so
-            // refuse here rather than compute a stride for a layout the VMM
-            // path cannot actually allocate.
-            KvMode::Bf16 => Err(hip_bridge::HipError::new(
-                0,
-                "VMM does not support bf16 KV (contiguous backend only)",
-            )),
+            // BF16/F16 are flat unscaled: 2 bytes/element (per-token row =
+            // n_kv_heads*D*2). F16 has no VMM constructor today — computing
+            // the stride here is harmless; the constructors gate it.
+            KvMode::Bf16 | KvMode::F16 => head_dim
+                .checked_mul(2)
+                .ok_or_else(|| hip_bridge::HipError::new(0, "VMM bf16 K head stride overflowed")),
+            // FP8 token-local rows: D codes + one inline f16 scale per head.
+            // Same 1032-byte rows at Hkv4/D256 as the contiguous constructor.
+            KvMode::Fp8 => head_dim
+                .checked_add(2)
+                .ok_or_else(|| hip_bridge::HipError::new(0, "VMM fp8 K head stride overflowed")),
             KvMode::Asym2 | KvMode::Fwht2 => head_dim
                 .checked_div(4)
                 .and_then(|n| n.checked_add(4))
@@ -512,13 +696,46 @@ impl KvCache {
                     ));
                 }
             }
-            // Fail closed: bf16 has no VMM constructor. Callers that want bf16
-            // must use the contiguous backend.
+            // BF16 flat rows: any non-zero head_dim (no block structure).
+            // K/V pair is indivisible; v_mode carries the ignored Q8 default.
             KvMode::Bf16 => {
+                if head_dim == 0 {
+                    return Err(hip_bridge::HipError::new(
+                        0,
+                        "VMM bf16 requires head_dim>0 (got 0)",
+                    ));
+                }
+                if !matches!(v_mode, VMode::Q8) {
+                    return Err(hip_bridge::HipError::new(
+                        0,
+                        "VMM bf16 only supports VMode::Q8 (K/V pair is indivisible)",
+                    ));
+                }
+            }
+            // F16 flat rows exist only on the slots engine (contiguous,
+            // descriptor-addressed). There is no VMM constructor — fail
+            // closed rather than compute a layout nothing can allocate.
+            KvMode::F16 => {
                 return Err(hip_bridge::HipError::new(
                     0,
-                    "VMM does not support bf16 KV (contiguous backend only)",
+                    "VMM does not support f16 KV (slots/contiguous only)",
                 ));
+            }
+            // FP8 token-local rows: exact admitted geometry (D256); v_mode
+            // carries the ignored Q8 default, V is fp8 like K.
+            KvMode::Fp8 => {
+                if head_dim != 256 {
+                    return Err(hip_bridge::HipError::new(
+                        0,
+                        &format!("VMM fp8 requires head_dim=256 (got {head_dim})"),
+                    ));
+                }
+                if !matches!(v_mode, VMode::Q8) {
+                    return Err(hip_bridge::HipError::new(
+                        0,
+                        "VMM fp8 only supports VMode::Q8 (K/V pair is indivisible)",
+                    ));
+                }
             }
             KvMode::Asym2 | KvMode::Asym3 | KvMode::Asym4 => {
                 let ok_hd = match mode {
@@ -596,7 +813,12 @@ impl KvCache {
         }
         let kv_dim = Self::checked_vmm_product("logical", &[n_kv_heads, head_dim])?;
         let k_bytes_per_head = Self::vmm_k_bytes_per_head(mode, head_dim)?;
-        let v_bytes_per_head = Self::vmm_v_bytes_per_head(v_mode, head_dim)?;
+        // FP8/BF16 are K/V-indivisible: V shares K's exact row layout and
+        // v_mode carries the ignored Q8 default (never read on these paths).
+        let v_bytes_per_head = match mode {
+            KvMode::Fp8 | KvMode::Bf16 => k_bytes_per_head,
+            _ => Self::vmm_v_bytes_per_head(v_mode, head_dim)?,
+        };
         let k_bytes_per_token =
             Self::checked_vmm_product("K token stride", &[n_kv_heads, k_bytes_per_head])?;
         let v_bytes_per_token =
@@ -607,10 +829,10 @@ impl KvCache {
             Self::checked_vmm_product("V reserve", &[physical_cap, v_bytes_per_token])?;
         let rotation_table_len = match mode {
             KvMode::Q8 => 0,
-            // Unrotated, like Q8. Unreachable in practice — the validate above
-            // rejects bf16 for VMM before this runs — but 0 is the honest
-            // answer for a tier with no rotation table.
-            KvMode::Bf16 => 0,
+            // Unrotated, like Q8. None of these tiers uses a rotation table,
+            // so 0 is the honest answer for all of them.
+            KvMode::Bf16 | KvMode::F16 => 0,
+            KvMode::Fp8 => 0,
             KvMode::Asym2 | KvMode::Asym3 | KvMode::Asym4 => head_dim / 2,
             KvMode::Fwht3 => 256,
             KvMode::Fwht2 | KvMode::Fwht4 => {
@@ -777,14 +999,26 @@ impl KvCache {
             KvMode::Fwht2 => (false, false, false, true, true),
             KvMode::Fwht3 => (false, false, true, false, true),
             KvMode::Fwht4 => (false, true, false, false, true),
-            // Bf16 is NOT representable in this 5-flag VMM bundle — all-false
+            // Bf16 is NOT representable in this 5-flag bundle — all-false
             // here would decode as KTier::F32 and hand a bf16 buffer to the
-            // F32 kernels, which read it at twice the stride. It can never
-            // legitimately arrive: `validate_vmm_mode` rejects bf16 before any
-            // VMM constructor runs. Panic loudly rather than return a lie.
+            // F32 kernels. Bf16 VMM caches are built by the dedicated
+            // `new_gpu_bf16_vmm_capped_filtered`, never this bundle.
+            // Panic loudly rather than return a lie.
             KvMode::Bf16 => panic!(
-                "vmm_mode_flags: bf16 has no VMM layout — it is contiguous-only \
-                 and should have been rejected by validate_mode_with_backend"
+                "vmm_mode_flags: bf16 has no 5-flag VMM bundle representation — \
+                 use new_gpu_bf16_vmm_capped_filtered"
+            ),
+            // F16 likewise: slots-only tier with no VMM bundle. Panic loudly
+            // rather than return a lie.
+            KvMode::F16 => panic!(
+                "vmm_mode_flags: f16 has no 5-flag VMM bundle representation — \
+                 it is a slots/contiguous-only tier"
+            ),
+            // FP8 likewise: the dedicated `new_gpu_fp8_vmm_capped_filtered`
+            // sets its flags directly. Panic loudly rather than return a lie.
+            KvMode::Fp8 => panic!(
+                "vmm_mode_flags: fp8 has no 5-flag VMM bundle representation — \
+                 use new_gpu_fp8_vmm_capped_filtered"
             ),
         }
     }
@@ -806,6 +1040,17 @@ impl KvCache {
                     } else {
                         "asym3"
                     },
+                    dims.head_dim
+                ),
+            ));
+        }
+        // FP8 is exact-geometry (D256); the VMM arm below re-validates it
+        // through the layout table, but legacy requests fail here too.
+        if mode == KvMode::Fp8 && dims.head_dim != 256 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "fp8 KV cache requires head_dim=256; head_dim={} is unsupported",
                     dims.head_dim
                 ),
             ));
@@ -850,7 +1095,9 @@ impl KvCache {
             | KvMode::Asym4
             | KvMode::Fwht2
             | KvMode::Fwht3
-            | KvMode::Fwht4 => {
+            | KvMode::Fwht4
+            | KvMode::Fp8
+            | KvMode::Bf16 => {
                 // Default static V is Q8; Lloyd-V is validated when a constructor
                 // is invoked with an explicit v_mode.
                 Self::vmm_static_layout(
@@ -865,7 +1112,7 @@ impl KvCache {
                 return Err(hip_bridge::HipError::new(
                     0,
                     &format!(
-                        "KV backend 'vmm' supports kv_mode=q8|asym2|asym3|asym4|fwht2|fwht3|fwht4 only (got {other:?})"
+                        "KV backend 'vmm' supports kv_mode=q8|asym2|asym3|asym4|fwht2|fwht3|fwht4|fp8|bf16 only (got {other:?})"
                     ),
                 ));
             }
@@ -988,6 +1235,7 @@ impl KvCache {
             givens_sin: None,
             quant_fwht: false,
             quant_bf16: false,
+            quant_fp8: false,
             v_mode: VMode::Q8,
             layer_is_boundary: self.layer_is_boundary.clone(),
             compact_offset: 0,
@@ -1026,7 +1274,7 @@ impl KvCache {
     /// target)` cells return `Err` rather than panic, so a future policy mis-wire
     /// surfaces as a clean load failure.
     pub fn from_mode(mode: KvMode, gpu: &mut Gpu, dims: &KvDims) -> HipResult<Self> {
-        Self::from_mode_with_backend(mode, KvBackend::Contiguous, gpu, dims)
+        Self::from_mode_with_backend(mode, KvBackend::Legacy, gpu, dims)
     }
 
     pub fn from_mode_with_backend(
@@ -1037,7 +1285,7 @@ impl KvCache {
     ) -> HipResult<Self> {
         Self::validate_mode_with_backend(mode, backend, true, dims)?;
         match backend {
-            KvBackend::Contiguous => Self::from_mode_single(mode, gpu, dims),
+            KvBackend::Legacy => Self::from_mode_single(mode, gpu, dims),
             KvBackend::Vmm => Self::from_mode_single_vmm(mode, gpu, dims),
         }
     }
@@ -1052,6 +1300,14 @@ impl KvCache {
         // Static path defaults V to Q8. Carrier may call
         // `new_gpu_vmm_capped_filtered` directly with Lloyd-V for FWHT-K.
         match mode {
+            KvMode::Fp8 => Self::new_gpu_fp8_vmm_capped_filtered(
+                gpu,
+                is_kv_layer,
+                dims.n_kv_heads,
+                dims.head_dim,
+                dims.max_seq,
+                physical_cap,
+            ),
             KvMode::Q8
             | KvMode::Asym2
             | KvMode::Asym3
@@ -1068,6 +1324,14 @@ impl KvCache {
                 mode,
                 VMode::Q8,
             ),
+            KvMode::Bf16 => Self::new_gpu_bf16_vmm_capped_filtered(
+                gpu,
+                is_kv_layer,
+                dims.n_kv_heads,
+                dims.head_dim,
+                dims.max_seq,
+                physical_cap,
+            ),
             other => unreachable!("VMM mode {other:?} validated before dispatch"),
         }
     }
@@ -1078,7 +1342,7 @@ impl KvCache {
         let hd = dims.head_dim;
         let ms = dims.max_seq;
         match (mode, &dims.layers, dims.physical_cap) {
-            // Mask + Some(cap): _capped_filtered (only q8/asym3/fwht2/fwht3 have it).
+            // Mask + Some(cap): _capped_filtered (q8/asym3/fwht2/fwht3/fp8/bf16).
             (KvMode::Q8, Mask(m), Some(cap)) => {
                 Self::new_gpu_q8_capped_filtered(gpu, m, nh, hd, ms, cap)
             }
@@ -1091,6 +1355,11 @@ impl KvCache {
             (KvMode::Fwht3, Mask(m), Some(cap)) => {
                 Self::new_gpu_fwht3_capped_filtered(gpu, m, nh, hd, ms, cap)
             }
+            // FP8 is Mask-only (hybrid FA layers carry KV): capped + plain
+            // filtered pair. Flat and VMM fall through to the error below.
+            (KvMode::Fp8, Mask(m), Some(cap)) => {
+                Self::new_gpu_fp8_capped_filtered(gpu, m, nh, hd, ms, cap)
+            }
             // Mask + cap-but-no-capped-variant: cap DROPPED, use _filtered (faithful).
             (KvMode::Asym2, Mask(m), _) => Self::new_gpu_asym2_filtered(gpu, m, nh, hd, ms),
             (KvMode::Asym4, Mask(m), _) => Self::new_gpu_asym4_filtered(gpu, m, nh, hd, ms),
@@ -1100,6 +1369,7 @@ impl KvCache {
             (KvMode::Asym3, Mask(m), None) => Self::new_gpu_asym3_filtered(gpu, m, nh, hd, ms),
             (KvMode::Fwht2, Mask(m), None) => Self::new_gpu_fwht2_filtered(gpu, m, nh, hd, ms),
             (KvMode::Fwht3, Mask(m), None) => Self::new_gpu_fwht3_filtered(gpu, m, nh, hd, ms),
+            (KvMode::Fp8, Mask(m), None) => Self::new_gpu_fp8_filtered(gpu, m, nh, hd, ms),
             // Flat + Some(cap): _capped (only q8/asym3/asym4).
             (KvMode::Q8, Flat(n), Some(cap)) => Self::new_gpu_q8_capped(gpu, *n, nh, hd, ms, cap),
             (KvMode::Asym3, Flat(n), Some(cap)) => {
@@ -1112,10 +1382,12 @@ impl KvCache {
             (KvMode::Q8, Flat(n), None) => Self::new_gpu_q8(gpu, *n, nh, hd, ms),
             (KvMode::Asym3, Flat(n), None) => Self::new_gpu_asym3(gpu, *n, nh, hd, ms),
             (KvMode::Asym4, Flat(n), None) => Self::new_gpu_asym4(gpu, *n, nh, hd, ms),
-            // Bf16 is Flat-only: there is no _filtered constructor because no
-            // hybrid arch (the reason _filtered exists) uses this tier. A
-            // Mask request therefore falls through to the error below rather
-            // than silently allocating every layer.
+            // Bf16 also serves hybrid stacks via the _filtered pair (Qwen
+            // eval quality control); Flat keeps the legacy plain constructors.
+            (KvMode::Bf16, Mask(m), Some(cap)) => {
+                Self::new_gpu_bf16_capped_filtered(gpu, m, nh, hd, ms, cap)
+            }
+            (KvMode::Bf16, Mask(m), None) => Self::new_gpu_bf16_filtered(gpu, m, nh, hd, ms),
             (KvMode::Bf16, Flat(n), Some(cap)) => {
                 Self::new_gpu_bf16_capped(gpu, *n, nh, hd, ms, cap)
             }
@@ -1171,6 +1443,7 @@ impl KvCache {
             quant_asym2: false,
             quant_fwht: false,
             quant_bf16: false,
+            quant_fp8: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
@@ -1220,6 +1493,7 @@ impl KvCache {
             quant_asym2: false,
             quant_fwht: false,
             quant_bf16: false,
+            quant_fp8: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
@@ -1330,6 +1604,7 @@ impl KvCache {
             quant_asym2: false,
             quant_fwht: false,
             quant_bf16: false,
+            quant_fp8: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
@@ -1352,6 +1627,7 @@ impl KvCache {
     ///
     /// Sized by `physical_cap` like `new_gpu_q8_capped`, so eviction-bounded
     /// callers get the buffer they asked for.
+
     pub fn new_gpu_bf16(
         gpu: &mut Gpu,
         n_layers: usize,
@@ -1418,6 +1694,7 @@ impl KvCache {
             quant_asym2: false,
             quant_fwht: false,
             quant_bf16: true,
+            quant_fp8: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
@@ -1426,6 +1703,84 @@ impl KvCache {
             // V is bf16 too. `VMode::Q8` is the struct's default and is never
             // read on this path — the tier decode reaches `KTier::Bf16` before
             // any v_mode branch.
+            v_mode: VMode::Q8,
+        })
+    }
+
+    /// Flat bf16 KV cache that skips allocation for layers flagged as
+    /// non-KV (Qwen hybrid): same unscaled `Hkv*D*2`-byte rows as
+    /// [`Self::new_gpu_bf16`], 1-element placeholders elsewhere.
+    pub fn new_gpu_bf16_filtered(
+        gpu: &mut Gpu,
+        is_kv_layer: &[bool],
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+    ) -> HipResult<Self> {
+        Self::new_gpu_bf16_capped_filtered(
+            gpu,
+            is_kv_layer,
+            n_kv_heads,
+            head_dim,
+            max_seq_len,
+            max_seq_len,
+        )
+    }
+
+    /// Capped variant of [`Self::new_gpu_bf16_filtered`]: buffers sized by
+    /// `physical_cap`, `max_seq_len` retained for RoPE/masks.
+    pub fn new_gpu_bf16_capped_filtered(
+        gpu: &mut Gpu,
+        is_kv_layer: &[bool],
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        physical_cap: usize,
+    ) -> HipResult<Self> {
+        assert!(
+            physical_cap > 0 && physical_cap <= max_seq_len,
+            "physical_cap ({physical_cap}) must be in (0, max_seq_len={max_seq_len}]"
+        );
+        let kv_dim = n_kv_heads
+            .checked_mul(head_dim)
+            .ok_or_else(|| hip_bridge::HipError::new(0, "bf16 KV kv_dim overflowed"))?;
+        let row_bytes = Self::bf16_row_bytes(n_kv_heads, head_dim)?;
+        let cache_bytes = row_bytes
+            .checked_mul(physical_cap)
+            .ok_or_else(|| hip_bridge::HipError::new(0, "bf16 KV cache byte size overflowed"))?;
+        let cache_elems = cache_bytes.div_ceil(4);
+        let (k_gpu, v_gpu) = Self::alloc_k_v_filtered(gpu, cache_elems, cache_elems, is_kv_layer)?;
+        let n_kv = is_kv_layer.iter().filter(|b| **b).count();
+        eprintln!(
+            "KV cache: bf16 backend=legacy ({n_kv}/{} layers carry KV, others placeholder)",
+            is_kv_layer.len()
+        );
+        Ok(Self {
+            k_gpu,
+            v_gpu,
+            k_scales: vec![],
+            v_scales: vec![],
+            kv_dim,
+            max_seq: max_seq_len,
+            physical_cap,
+            n_kv_heads,
+            head_dim,
+            quantized: true,
+            quant_q8: false,
+            quant_int8: false,
+            quant_hfq4: false,
+            quant_asym4: false,
+            quant_asym3: false,
+            quant_asym2: false,
+            quant_fwht: false,
+            quant_bf16: true,
+            quant_fp8: false,
+            boundary_layers: 0,
+            givens_cos: None,
+            givens_sin: None,
+            layer_is_boundary: vec![],
+            compact_offset: 0,
+            // V is bf16 too; `VMode::Q8` is never read on this path.
             v_mode: VMode::Q8,
         })
     }
@@ -1445,7 +1800,7 @@ impl KvCache {
         let n = is_kv_layer.len();
         let mut k_gpu = Vec::with_capacity(n);
         let mut v_gpu = Vec::with_capacity(n);
-        // Contiguous path mirrors alloc_k_v_vmm_filtered: on any mid-loop
+        // Legacy path mirrors alloc_k_v_vmm_filtered: on any mid-loop
         // failure free every tensor already pushed so a partial build never
         // leaks device memory (GpuTensor has no freeing Drop).
         let result = (|| -> HipResult<()> {
@@ -1510,8 +1865,14 @@ impl KvCache {
     /// Resolve the current K `KvMode` from live cache flags.
     /// Read-only: the mode this cache is currently laid out for.
     pub fn current_kv_mode(&self) -> HipResult<KvMode> {
+        if self.quant_fp8 {
+            return Ok(KvMode::Fp8);
+        }
         if self.quant_q8 {
             return Ok(KvMode::Q8);
+        }
+        if self.quant_bf16 {
+            return Ok(KvMode::Bf16);
         }
         if self.quant_asym4 {
             return Ok(if self.quant_fwht {
@@ -1545,6 +1906,16 @@ impl KvCache {
     fn vmm_bytes_per_token(&self) -> HipResult<(usize, usize)> {
         if self.n_kv_heads == 0 {
             return Err(hip_bridge::HipError::new(0, "VMM KV requires n_kv_heads>0"));
+        }
+        // Indivisible tiers short-circuit the flag decode: both sides share
+        // one token-local row (fp8: codes + inline f16 scales; bf16: flat).
+        if self.quant_fp8 {
+            let row = Self::fp8_row_bytes(self.n_kv_heads, self.head_dim)?;
+            return Ok((row, row));
+        }
+        if self.quant_bf16 {
+            let row = Self::bf16_row_bytes(self.n_kv_heads, self.head_dim)?;
+            return Ok((row, row));
         }
         let mode = self.current_kv_mode()?;
         // Geometry for the live encoding; lloyd-V only legal on FWHT-K.
@@ -1727,6 +2098,66 @@ impl KvCache {
         Ok(grown)
     }
 
+    /// Same fast no-growth gate used by `ensure_mapped_capacity`. Optional
+    /// caches need not scan every KV layer on each decode token.
+    pub fn needs_mapped_growth(&self, required_tokens: usize) -> HipResult<bool> {
+        Ok(self
+            .fast_mapped_token_capacity()?
+            .is_some_and(|capacity| required_tokens > capacity))
+    }
+
+    /// Physical bytes the next `ensure_mapped_capacity` would map. Used by
+    /// optional caches to yield memory to KV before mapping, with the same
+    /// per-tensor chunk plan and current encoding strides as actual growth.
+    pub fn planned_mapped_growth_bytes(
+        &self,
+        gpu: &Gpu,
+        required_tokens: usize,
+    ) -> HipResult<usize> {
+        if !self.uses_vmm_backend() {
+            return Ok(0);
+        }
+        let (k_stride, v_stride) = self.vmm_bytes_per_token()?;
+        let mut bytes = 0usize;
+        for (tensors, stride) in [(&self.k_gpu, k_stride), (&self.v_gpu, v_stride)] {
+            for tensor in tensors {
+                if !tensor.buf.is_vmm_owner() {
+                    if tensor.numel() > 1 {
+                        return Err(hip_bridge::HipError::new(
+                            0,
+                            "VMM KV contains a non-VMM tensor",
+                        ));
+                    }
+                    continue;
+                }
+                let mapped = gpu.vmm_mapped_bytes(tensor).ok_or_else(|| {
+                    hip_bridge::HipError::new(0, "VMM KV tensor is not registered with its GPU")
+                })?;
+                let granularity = gpu.vmm_granularity(tensor).ok_or_else(|| {
+                    hip_bridge::HipError::new(0, "VMM KV tensor has no allocation granularity")
+                })?;
+                let side_cap = (tensor.byte_size() / stride).min(self.physical_cap);
+                let plan = KvChunkPlan::new(
+                    stride,
+                    side_cap,
+                    DEFAULT_KV_CHUNK_TOKENS,
+                    granularity,
+                    DEFAULT_VMM_PHYSICAL_CHUNK_BYTES,
+                )
+                .map_err(|err| hip_bridge::HipError::new(0, &err.to_string()))?;
+                if let Some(growth) = plan
+                    .growth(mapped, required_tokens)
+                    .map_err(|err| hip_bridge::HipError::new(0, &err.to_string()))?
+                {
+                    bytes = bytes.checked_add(growth.size_bytes).ok_or_else(|| {
+                        hip_bridge::HipError::new(0, "VMM KV planned growth overflows usize")
+                    })?;
+                }
+            }
+        }
+        Ok(bytes)
+    }
+
     /// Ensure both K and V mapped prefixes cover `required_tokens` at the
     /// **current** strides. Growth is independent per side and completes before
     /// the caller may write. Never replaces VMM owners.
@@ -1769,6 +2200,11 @@ impl KvCache {
             required_tokens,
         )?;
         self.require_mapped_capacity(required_tokens)?;
+        let mapped = self.mapped_token_capacity()?.unwrap_or(0);
+        eprintln!(
+            "KV cache: mapped_prefix={fast_capacity}->{mapped} / physical_cap={} / max_seq={}",
+            self.physical_cap, self.max_seq,
+        );
         Ok(())
     }
 
@@ -1818,6 +2254,7 @@ impl KvCache {
             && !self.quant_asym3
             && !self.quant_asym2
             && !self.quant_bf16
+            && !self.quant_fp8
             && self.k_scales.is_empty()
     }
 
@@ -1836,6 +2273,7 @@ impl KvCache {
             && !self.quant_asym4
             && !self.quant_asym3
             && !self.quant_asym2
+            && !self.quant_fp8
     }
 
     /// The sealed decode of this cache's storage tier. The sanctioned way to
@@ -1874,6 +2312,13 @@ impl KvCache {
     /// K rotation reads only indices 0..127 so the LCG prefix is byte-identical).
     /// Note: single-GPU only; multi-GPU V-mode wiring is deferred (plan Task 9).
     pub fn set_v_mode_realloc(&mut self, gpu: &mut Gpu, v_mode: VMode) -> HipResult<()> {
+        // Indivisible tiers have no V-mode axis: V shares K's encoding.
+        if self.quant_fp8 || self.quant_bf16 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "set_v_mode_realloc refuses fp8/bf16 caches (K/V pair is indivisible)",
+            ));
+        }
         assert!(
             ((self.quant_asym2 || self.quant_asym3 || self.quant_asym4) && self.quant_fwht)
                 || matches!(v_mode, VMode::Q8),
@@ -1944,6 +2389,13 @@ impl KvCache {
         v_floor: VMode,
         k_floor_bph: usize,
     ) -> HipResult<()> {
+        // Indivisible tiers never enter the adaptive ladder.
+        if self.quant_fp8 || self.quant_bf16 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "set_adaptive_floor_alloc refuses fp8/bf16 caches (no adaptive transcoders)",
+            ));
+        }
         // VMM owners are never replaced after publication. Adaptive VMM must be
         // constructed via `new_gpu_vmm_adaptive_filtered` with floor reserve.
         if self.uses_vmm_backend() {
@@ -2022,6 +2474,7 @@ impl KvCache {
         self.quant_asym3 = false;
         self.quant_asym2 = false;
         self.quant_fwht = true;
+        self.quant_fp8 = false;
         self.v_mode = VMode::Q8;
         self.quantized = true;
     }
@@ -2044,6 +2497,13 @@ impl KvCache {
         target: VMode,
         n_positions: usize,
     ) -> HipResult<()> {
+        // Indivisible tiers never enter the adaptive ladder.
+        if self.quant_fp8 || self.quant_bf16 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "transcode_v_step refuses fp8/bf16 caches (no adaptive transcoders)",
+            ));
+        }
         // Mirror set_v_mode_realloc's guard: lloyd-V is 256-wide and needs an
         // FWHT K mode + head_dim==256.
         assert!(
@@ -2122,7 +2582,7 @@ impl KvCache {
         let (cur_k_bpt, cur_v_bpt) = if self.uses_vmm_backend() {
             self.vmm_bytes_per_token()?
         } else {
-            // Contiguous: full buffer is mapped; keep prior full-layer scratch size.
+            // Legacy: full buffer is mapped; keep prior full-layer scratch size.
             (0, 0)
         };
         let prefix_v_bytes = if self.uses_vmm_backend() {
@@ -2527,6 +2987,7 @@ impl KvCache {
             quant_asym2: false,
             quant_fwht: true,
             quant_bf16: false,
+            quant_fp8: false,
             boundary_layers: 0,
             givens_cos: Some(s1),
             givens_sin: Some(s2),
@@ -2601,7 +3062,7 @@ impl KvCache {
         let (k_gpu, v_gpu) = Self::alloc_k_v_filtered(gpu, cache_elems, cache_elems, is_kv_layer)?;
         let n_kv = is_kv_layer.iter().filter(|b| **b).count();
         eprintln!(
-            "KV cache: q8 ({n_kv}/{} layers carry KV, others placeholder)",
+            "KV cache: q8 backend=legacy ({n_kv}/{} layers carry KV, others placeholder)",
             is_kv_layer.len()
         );
         Ok(Self {
@@ -2623,6 +3084,170 @@ impl KvCache {
             quant_asym2: false,
             quant_fwht: false,
             quant_bf16: false,
+            quant_fp8: false,
+            boundary_layers: 0,
+            givens_cos: None,
+            givens_sin: None,
+            layer_is_boundary: vec![],
+            compact_offset: 0,
+            v_mode: VMode::Q8,
+        })
+    }
+    /// E4M3FN KV codec constants (plan §2.1; OCP E4M3FN as implemented by
+    /// gfx1201's `cvt_pk_fp8_f32`, not gfx942 FNUZ).
+    /// Maximum finite magnitude of the encoding; per-head scales satisfy
+    /// `amax / scale <= 448` so every code is finite.
+    pub const FP8_E4M3_MAX_F32: f32 = 448.0;
+    /// Minimum per-head scale floor (2^-24): `amax / 448` below this pins
+    /// to this value. All-zero rows use scale 1.0 with zero codes.
+    pub const FP8_KV_MIN_SCALE_F32: f32 = 5.9604645e-8;
+
+    /// Checked bytes-per-token-row per side for the native fp8 layout:
+    /// `[Hkv x D codes, head-major][Hkv little-endian f16 scales]`.
+    /// Exactly 1032 at Hkv=4/D=256. Pure math, no GPU.
+    pub fn fp8_row_bytes(n_kv_heads: usize, head_dim: usize) -> HipResult<usize> {
+        if n_kv_heads == 0 || head_dim == 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "fp8 KV requires n_kv_heads>0 and head_dim>0 (got n_kv_heads={n_kv_heads}, head_dim={head_dim})"
+                ),
+            ));
+        }
+        let codes = n_kv_heads
+            .checked_mul(head_dim)
+            .ok_or_else(|| hip_bridge::HipError::new(0, "fp8 KV codes bytes overflowed"))?;
+        let scales = n_kv_heads
+            .checked_mul(2)
+            .ok_or_else(|| hip_bridge::HipError::new(0, "fp8 KV scales bytes overflowed"))?;
+        codes
+            .checked_add(scales)
+            .ok_or_else(|| hip_bridge::HipError::new(0, "fp8 KV row bytes overflowed"))
+    }
+
+    /// This cache's fp8 bytes-per-token-row per side. Rejects non-fp8
+    /// caches rather than derive a stride for foreign bytes (the redline
+    /// guard-span oracle uses this instead of q8's `n_kv*(D/32)*34`).
+    pub fn fp8_bytes_per_token(&self) -> HipResult<usize> {
+        if !self.quant_fp8 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "fp8_bytes_per_token requires a native fp8 KV cache",
+            ));
+        }
+        Self::fp8_row_bytes(self.n_kv_heads, self.head_dim)
+    }
+
+    /// Checked bytes-per-token-row per side for flat unscaled bf16:
+    /// `Hkv * D` bf16 elements (2 bytes each), head-major, no scales.
+    /// Same rows as the contiguous bf16 constructor. Pure math, no GPU.
+    pub fn bf16_row_bytes(n_kv_heads: usize, head_dim: usize) -> HipResult<usize> {
+        if n_kv_heads == 0 || head_dim == 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "bf16 KV requires n_kv_heads>0 and head_dim>0 (got n_kv_heads={n_kv_heads}, head_dim={head_dim})"
+                ),
+            ));
+        }
+        n_kv_heads
+            .checked_mul(head_dim)
+            .and_then(|n| n.checked_mul(2))
+            .ok_or_else(|| hip_bridge::HipError::new(0, "bf16 KV row bytes overflowed"))
+    }
+
+    /// This cache's bf16 bytes-per-token-row per side. Rejects non-bf16
+    /// caches rather than derive a stride for foreign bytes.
+    pub fn bf16_bytes_per_token(&self) -> HipResult<usize> {
+        if !self.quant_bf16 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "bf16_bytes_per_token requires a flat bf16 KV cache",
+            ));
+        }
+        Self::bf16_row_bytes(self.n_kv_heads, self.head_dim)
+    }
+
+    /// Native fp8 KV cache that skips allocation for layers flagged as
+    /// non-KV. Each `is_kv_layer[i] == false` slot gets a 1-element
+    /// placeholder instead of the full row-bytes allocation, mirroring
+    /// [`Self::new_gpu_q8_filtered`].
+    pub fn new_gpu_fp8_filtered(
+        gpu: &mut Gpu,
+        is_kv_layer: &[bool],
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+    ) -> HipResult<Self> {
+        Self::new_gpu_fp8_capped_filtered(
+            gpu,
+            is_kv_layer,
+            n_kv_heads,
+            head_dim,
+            max_seq_len,
+            max_seq_len,
+        )
+    }
+
+    /// Capped variant of [`Self::new_gpu_fp8_filtered`]: buffers are sized
+    /// by `physical_cap` while `max_seq_len` is retained for RoPE/masks.
+    /// Exact admitted geometry (D256, contiguous, single-GPU Qwen dense)
+    /// is validated here; topology/architecture admission lives one layer
+    /// up. K/V pair is indivisible: fp8 on both sides, neutral V only.
+    pub fn new_gpu_fp8_capped_filtered(
+        gpu: &mut Gpu,
+        is_kv_layer: &[bool],
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        physical_cap: usize,
+    ) -> HipResult<Self> {
+        assert!(
+            physical_cap > 0 && physical_cap <= max_seq_len,
+            "physical_cap ({physical_cap}) must be in (0, max_seq_len={max_seq_len}]"
+        );
+        if head_dim != 256 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("fp8 KV cache requires head_dim=256 (got head_dim={head_dim})"),
+            ));
+        }
+        let kv_dim = n_kv_heads
+            .checked_mul(head_dim)
+            .ok_or_else(|| hip_bridge::HipError::new(0, "fp8 KV kv_dim overflowed"))?;
+        let row_bytes = Self::fp8_row_bytes(n_kv_heads, head_dim)?;
+        let cache_bytes = row_bytes
+            .checked_mul(physical_cap)
+            .ok_or_else(|| hip_bridge::HipError::new(0, "fp8 KV cache byte size overflowed"))?;
+        // Allocator is typed F32; rows are 8-byte aligned by construction
+        // (Hkv*(D+2) is even for every real geometry) so the ceil is exact.
+        let cache_elems = cache_bytes.div_ceil(4);
+        let (k_gpu, v_gpu) = Self::alloc_k_v_filtered(gpu, cache_elems, cache_elems, is_kv_layer)?;
+        let n_kv = is_kv_layer.iter().filter(|b| **b).count();
+        eprintln!(
+            "KV cache: fp8-e4m3 backend=legacy ({n_kv}/{} layers carry KV, others placeholder)",
+            is_kv_layer.len()
+        );
+        Ok(Self {
+            k_gpu,
+            v_gpu,
+            k_scales: vec![],
+            v_scales: vec![],
+            kv_dim,
+            max_seq: max_seq_len,
+            physical_cap,
+            n_kv_heads,
+            head_dim,
+            quantized: true,
+            quant_q8: false,
+            quant_int8: false,
+            quant_hfq4: false,
+            quant_asym4: false,
+            quant_asym3: false,
+            quant_asym2: false,
+            quant_fwht: false,
+            quant_bf16: false,
+            quant_fp8: true,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
@@ -2740,6 +3365,7 @@ impl KvCache {
             quant_asym2,
             quant_fwht,
             quant_bf16: false,
+            quant_fp8: false,
             boundary_layers: 0,
             givens_cos,
             givens_sin,
@@ -2797,6 +3423,144 @@ impl KvCache {
         )
     }
 
+    /// Shared VMM build for the K/V-indivisible tiers (fp8 token-local
+    /// rows, flat bf16 rows): reserve stable K/V VAs from
+    /// [`vmm_static_layout`], map an initial prefix, never replace owners
+    /// afterward. No rotation tables; tier flags are set directly since
+    /// these modes have no 5-flag bundle representation. Reserve and mapped
+    /// sizes round up to the device allocation granularity (growth in
+    /// ≥2 MiB steps); rows stay unpadded and equal-sized, so token
+    /// capacity is `floor(mapped_bytes / row_bytes)` and tree-gather row
+    /// copies keep working.
+    fn new_gpu_indivisible_vmm_capped_filtered(
+        gpu: &mut Gpu,
+        is_kv_layer: &[bool],
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        physical_cap: usize,
+        mode: KvMode,
+    ) -> HipResult<Self> {
+        debug_assert!(matches!(mode, KvMode::Fp8 | KvMode::Bf16));
+        if physical_cap == 0 || physical_cap > max_seq_len {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "VMM {mode:?} physical_cap must be in 1..=max_seq_len (got physical_cap={physical_cap}, max_seq_len={max_seq_len})"
+                ),
+            ));
+        }
+        if !is_kv_layer.iter().any(|is_kv| *is_kv) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("VMM {mode:?} requires at least one KV-carrying layer"),
+            ));
+        }
+        // Static V is the ignored Q8 default on both tiers (K/V indivisible).
+        let layout = Self::vmm_static_layout(mode, VMode::Q8, n_kv_heads, head_dim, physical_cap)?;
+        let (k_gpu, v_gpu) = Self::alloc_k_v_vmm_filtered(
+            gpu,
+            layout.k_reserve_elems,
+            layout.v_reserve_elems,
+            is_kv_layer,
+        )?;
+        let (quant_fp8, quant_bf16) = match mode {
+            KvMode::Fp8 => (true, false),
+            KvMode::Bf16 => (false, true),
+            _ => unreachable!("indivisible VMM modes are fp8|bf16 (validated before dispatch)"),
+        };
+        let mut cache = Self {
+            k_gpu,
+            v_gpu,
+            k_scales: vec![],
+            v_scales: vec![],
+            kv_dim: layout.kv_dim,
+            max_seq: max_seq_len,
+            physical_cap,
+            n_kv_heads,
+            head_dim,
+            quantized: true,
+            quant_q8: false,
+            quant_int8: false,
+            quant_hfq4: false,
+            quant_asym4: false,
+            quant_asym3: false,
+            quant_asym2: false,
+            quant_fwht: false,
+            quant_bf16,
+            quant_fp8,
+            boundary_layers: 0,
+            givens_cos: None,
+            givens_sin: None,
+            layer_is_boundary: vec![],
+            compact_offset: 0,
+            v_mode: VMode::Q8,
+        };
+        // Map initial prefix before any write; roll back on failure.
+        if let Err(err) = cache.ensure_mapped_capacity(gpu, 1) {
+            let _ = cache.free_gpu(gpu);
+            return Err(err);
+        }
+        let n_kv = is_kv_layer.iter().filter(|is_kv| **is_kv).count();
+        let mapped = match cache.mapped_token_capacity() {
+            Ok(capacity) => capacity.unwrap_or(0),
+            Err(err) => {
+                let _ = cache.free_gpu(gpu);
+                return Err(err);
+            }
+        };
+        eprintln!(
+            "KV cache: {mode:?} vmm ({n_kv}/{} layers carry KV; K/V {}B/row; mapped_prefix={mapped} / physical_cap={physical_cap} / max_seq={max_seq_len})",
+            is_kv_layer.len(),
+            layout.k_bytes_per_token,
+        );
+        Ok(cache)
+    }
+
+    /// VMM-backed native fp8 cache for Qwen3.5 hybrid stacks: token-local
+    /// `[codes][f16 scales]` rows, same 1032-byte rows at Hkv4/D256 as the
+    /// contiguous constructor. Routed internally by `from_mode_with_backend`.
+    pub fn new_gpu_fp8_vmm_capped_filtered(
+        gpu: &mut Gpu,
+        is_kv_layer: &[bool],
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        physical_cap: usize,
+    ) -> HipResult<Self> {
+        Self::new_gpu_indivisible_vmm_capped_filtered(
+            gpu,
+            is_kv_layer,
+            n_kv_heads,
+            head_dim,
+            max_seq_len,
+            physical_cap,
+            KvMode::Fp8,
+        )
+    }
+
+    /// VMM-backed flat bf16 cache for Qwen3.5 hybrid stacks: same unscaled
+    /// rows as the contiguous bf16 constructor. Routed internally by
+    /// `from_mode_with_backend`.
+    pub fn new_gpu_bf16_vmm_capped_filtered(
+        gpu: &mut Gpu,
+        is_kv_layer: &[bool],
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        physical_cap: usize,
+    ) -> HipResult<Self> {
+        Self::new_gpu_indivisible_vmm_capped_filtered(
+            gpu,
+            is_kv_layer,
+            n_kv_heads,
+            head_dim,
+            max_seq_len,
+            physical_cap,
+            KvMode::Bf16,
+        )
+    }
+
     /// Create INT8 co-located KV cache: [f32 scale][pad 4B][int8 × head_dim] = 136 bytes per head.
     pub fn new_gpu_int8c(
         gpu: &mut Gpu,
@@ -2835,6 +3599,7 @@ impl KvCache {
             quant_asym2: false,
             quant_fwht: false,
             quant_bf16: false,
+            quant_fp8: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
@@ -2882,6 +3647,7 @@ impl KvCache {
             quant_asym2: false,
             quant_fwht: false,
             quant_bf16: false,
+            quant_fp8: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
@@ -2931,6 +3697,7 @@ impl KvCache {
             quant_asym2: false,
             quant_fwht: false,
             quant_bf16: false,
+            quant_fp8: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
@@ -2982,6 +3749,7 @@ impl KvCache {
             quant_asym2: false,
             quant_fwht: false,
             quant_bf16: false,
+            quant_fp8: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
@@ -3058,7 +3826,7 @@ impl KvCache {
         let v_bph = v_bpp / n_kv_heads;
         let n_kv = is_kv_layer.iter().filter(|b| **b).count();
         eprintln!(
-            "KV cache: asym4 filtered ({n_kv}/{} layers carry KV; K rotated-4b {k_bph}B + V Q8 {v_bph}B = {} B/head)",
+            "KV cache: asym4 filtered backend=legacy ({n_kv}/{} layers carry KV; K rotated-4b {k_bph}B + V Q8 {v_bph}B = {} B/head)",
             is_kv_layer.len(),
             k_bph + v_bph,
         );
@@ -3081,6 +3849,7 @@ impl KvCache {
             quant_asym2: false,
             quant_fwht: false,
             quant_bf16: false,
+            quant_fp8: false,
             boundary_layers: 0,
             givens_cos: Some(ct),
             givens_sin: Some(st),
@@ -3130,7 +3899,7 @@ impl KvCache {
         let v_bph = v_bpp / n_kv_heads;
         let n_kv = is_kv_layer.iter().filter(|b| **b).count();
         eprintln!(
-            "KV cache: fwht4 filtered ({n_kv}/{} layers carry KV; K FWHT-4b {k_bph}B + V Q8 {v_bph}B = {} B/head)",
+            "KV cache: fwht4 filtered backend=legacy ({n_kv}/{} layers carry KV; K FWHT-4b {k_bph}B + V Q8 {v_bph}B = {} B/head)",
             is_kv_layer.len(),
             k_bph + v_bph,
         );
@@ -3153,6 +3922,7 @@ impl KvCache {
             quant_asym2: false,
             quant_fwht: true,
             quant_bf16: false,
+            quant_fp8: false,
             boundary_layers: 0,
             givens_cos: Some(s1),
             givens_sin: Some(s2),
@@ -3203,7 +3973,7 @@ impl KvCache {
         gpu.hip.memcpy_htod(&st.buf, &sb)?;
         let v_bph = v_bpp / n_kv_heads;
         eprintln!(
-            "KV cache: asym4 (K rotated-4b {k_bph}B + V Q8 {v_bph}B = {} B/head, {:.1}x vs fp32)",
+            "KV cache: asym4 backend=legacy (K rotated-4b {k_bph}B + V Q8 {v_bph}B = {} B/head, {:.1}x vs fp32)",
             k_bph + v_bph,
             (head_dim * 4 * 2) as f64 / (k_bph + v_bph) as f64
         );
@@ -3226,6 +3996,7 @@ impl KvCache {
             quant_asym2: false,
             quant_fwht: false,
             quant_bf16: false,
+            quant_fp8: false,
             boundary_layers: 0,
             givens_cos: Some(ct),
             givens_sin: Some(st),
@@ -3303,7 +4074,7 @@ impl KvCache {
         gpu.hip.memcpy_htod(&s2.buf, &s2_bytes)?;
         let v_bph = v_bpp / n_kv_heads;
         eprintln!(
-            "KV cache: fwht4 (K FWHT-4b {k_bph}B + V Q8 {v_bph}B = {} B/head, {:.1}x vs fp32)",
+            "KV cache: fwht4 backend=legacy (K FWHT-4b {k_bph}B + V Q8 {v_bph}B = {} B/head, {:.1}x vs fp32)",
             k_bph + v_bph,
             (head_dim * 4 * 2) as f64 / (k_bph + v_bph) as f64
         );
@@ -3326,6 +4097,7 @@ impl KvCache {
             quant_asym2: false,
             quant_fwht: true,
             quant_bf16: false,
+            quant_fp8: false,
             boundary_layers: 0,
             givens_cos: Some(s1),
             givens_sin: Some(s2),
@@ -3430,7 +4202,7 @@ impl KvCache {
         let v_bph = v_bpp / n_kv_heads;
         let n_kv = is_kv_layer.iter().filter(|b| **b).count();
         eprintln!(
-            "KV cache: asym3 filtered ({n_kv}/{} layers carry KV; K rotated-3b {k_bph}B + V Q8 {v_bph}B = {} B/head, physical_cap={physical_cap} / max_seq={max_seq_len})",
+            "KV cache: asym3 filtered backend=legacy ({n_kv}/{} layers carry KV; K rotated-3b {k_bph}B + V Q8 {v_bph}B = {} B/head, physical_cap={physical_cap} / max_seq={max_seq_len})",
             is_kv_layer.len(),
             k_bph + v_bph,
         );
@@ -3453,6 +4225,7 @@ impl KvCache {
             quant_asym2: false,
             quant_fwht: false,
             quant_bf16: false,
+            quant_fp8: false,
             boundary_layers: 0,
             givens_cos: Some(ct),
             givens_sin: Some(st),
@@ -3613,7 +4386,7 @@ impl KvCache {
         let v_bph = v_bpp / n_kv_heads;
         let n_kv = is_kv_layer.iter().filter(|b| **b).count();
         eprintln!(
-            "KV cache: fwht3 filtered ({n_kv}/{} layers carry KV; K FWHT-3b {k_bph}B + V Q8 {v_bph}B = {} B/head)",
+            "KV cache: fwht3 filtered backend=legacy ({n_kv}/{} layers carry KV; K FWHT-3b {k_bph}B + V Q8 {v_bph}B = {} B/head)",
             is_kv_layer.len(),
             k_bph + v_bph,
         );
@@ -3636,6 +4409,7 @@ impl KvCache {
             quant_asym2: false,
             quant_fwht: true,
             quant_bf16: false,
+            quant_fp8: false,
             boundary_layers: 0,
             givens_cos: Some(s1),
             givens_sin: Some(s2),
@@ -3808,7 +4582,7 @@ impl KvCache {
         };
         let v_bph = v_bpp / n_kv_heads;
         eprintln!(
-            "KV cache: asym3 (K rotated-3b {k_bph}B + V Q8 {v_bph}B = {} B/head, {:.1}x vs fp32, physical_cap={physical_cap} / max_seq={max_seq_len})",
+            "KV cache: asym3 backend=legacy (K rotated-3b {k_bph}B + V Q8 {v_bph}B = {} B/head, {:.1}x vs fp32, physical_cap={physical_cap} / max_seq={max_seq_len})",
             k_bph + v_bph,
             (head_dim * 4 * 2) as f64 / (k_bph + v_bph) as f64
         );
@@ -3831,6 +4605,7 @@ impl KvCache {
             quant_asym2: false,
             quant_fwht: false,
             quant_bf16: false,
+            quant_fp8: false,
             boundary_layers: 0,
             givens_cos: Some(ct),
             givens_sin: Some(st),
@@ -3892,7 +4667,7 @@ impl KvCache {
         let v_bph = v_bpp / n_kv_heads;
         let n_kv = is_kv_layer.iter().filter(|b| **b).count();
         eprintln!(
-            "KV cache: asym2 filtered ({n_kv}/{} layers carry KV; K rotated-2b {k_bph}B + V Q8 {v_bph}B = {} B/head)",
+            "KV cache: asym2 filtered backend=legacy ({n_kv}/{} layers carry KV; K rotated-2b {k_bph}B + V Q8 {v_bph}B = {} B/head)",
             is_kv_layer.len(),
             k_bph + v_bph,
         );
@@ -3915,6 +4690,7 @@ impl KvCache {
             quant_asym2: true,
             quant_fwht: false,
             quant_bf16: false,
+            quant_fp8: false,
             boundary_layers: 0,
             givens_cos: Some(ct),
             givens_sin: Some(st),
@@ -3982,7 +4758,7 @@ impl KvCache {
         let v_bph = v_bpp / n_kv_heads;
         let n_kv = is_kv_layer.iter().filter(|b| **b).count();
         eprintln!(
-            "KV cache: fwht2 filtered ({n_kv}/{} layers carry KV; K FWHT-2b {k_bph}B + V Q8 {v_bph}B = {} B/head)",
+            "KV cache: fwht2 filtered backend=legacy ({n_kv}/{} layers carry KV; K FWHT-2b {k_bph}B + V Q8 {v_bph}B = {} B/head)",
             is_kv_layer.len(),
             k_bph + v_bph,
         );
@@ -4005,6 +4781,7 @@ impl KvCache {
             quant_asym2: true,
             quant_fwht: true,
             quant_bf16: false,
+            quant_fp8: false,
             boundary_layers: 0,
             givens_cos: Some(s1),
             givens_sin: Some(s2),
@@ -4055,7 +4832,7 @@ impl KvCache {
         gpu.hip.memcpy_htod(&st.buf, &sb)?;
         let v_bph = v_bpp / n_kv_heads;
         eprintln!(
-            "KV cache: asym2 (K rotated-2b {k_bph}B + V Q8 {v_bph}B = {} B/head, {:.1}x vs fp32)",
+            "KV cache: asym2 backend=legacy (K rotated-2b {k_bph}B + V Q8 {v_bph}B = {} B/head, {:.1}x vs fp32)",
             k_bph + v_bph,
             (head_dim * 4 * 2) as f64 / (k_bph + v_bph) as f64
         );
@@ -4078,6 +4855,7 @@ impl KvCache {
             quant_asym2: true,
             quant_fwht: false,
             quant_bf16: false,
+            quant_fp8: false,
             boundary_layers: 0,
             givens_cos: Some(ct),
             givens_sin: Some(st),
@@ -4105,7 +4883,7 @@ impl KvCache {
     /// Free all GPU tensors in this cache. Call before drop to return VRAM.
     /// After calling, follow with gpu.drain_pool() to actually release memory.
     ///
-    /// Contiguous frees keep prior log-and-continue behavior. VMM teardown
+    /// Legacy frees keep prior log-and-continue behavior. VMM teardown
     /// failures are aggregated and returned so unload cannot claim success
     /// while arenas remain registered (retry via `Gpu::ensure_vmm_cleaned`).
     pub fn free_gpu(self, gpu: &mut Gpu) -> HipResult<()> {
@@ -4161,6 +4939,14 @@ impl KvCache {
         k_data: &[f32],
         v_data: &[f32],
     ) -> HipResult<()> {
+        // The f32 row addressing below only fits plain-F32 buffers; fp8
+        // token-local rows must go through the native device writer.
+        if self.quant_fp8 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "store_kv refuses fp8 caches (use the native fp8 device writer)",
+            ));
+        }
         let byte_offset = pos * self.kv_dim * 4; // float = 4 bytes
         let k_bytes =
             unsafe { std::slice::from_raw_parts(k_data.as_ptr() as *const u8, k_data.len() * 4) };
@@ -4203,7 +4989,8 @@ mod vmm_layout_tests {
             KvMode::Asym2 | KvMode::Fwht2 => 4 + head_dim / 4,
             KvMode::Asym3 | KvMode::Fwht3 => 4 + (head_dim * 3) / 8,
             KvMode::Asym4 | KvMode::Fwht4 => 4 + head_dim / 2,
-            KvMode::Bf16 => panic!("bf16 is not a VMM layout mode"),
+            KvMode::Fp8 => head_dim + 2,
+            KvMode::Bf16 | KvMode::F16 => head_dim * 2,
         }
     }
 
@@ -4217,7 +5004,16 @@ mod vmm_layout_tests {
     }
 
     fn flag_standin(mode: KvMode, v_mode: VMode, n_kv_heads: usize, head_dim: usize) -> KvCache {
-        let (q8, a4, a3, a2, fwht) = KvCache::vmm_mode_flags(mode);
+        // Indivisible tiers bypass the 5-flag VMM bundle (it panics for them
+        // by design); set their flags directly like their constructors do.
+        let (q8, a4, a3, a2, fwht, bf16, fp8) = match mode {
+            KvMode::Fp8 => (false, false, false, false, false, false, true),
+            KvMode::Bf16 => (false, false, false, false, false, true, false),
+            _ => {
+                let (q8, a4, a3, a2, fwht) = KvCache::vmm_mode_flags(mode);
+                (q8, a4, a3, a2, fwht, false, false)
+            }
+        };
         KvCache {
             k_gpu: vec![],
             v_gpu: vec![],
@@ -4236,7 +5032,8 @@ mod vmm_layout_tests {
             quant_asym3: a3,
             quant_asym2: a2,
             quant_fwht: fwht,
-            quant_bf16: false,
+            quant_bf16: bf16,
+            quant_fp8: fp8,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
@@ -4322,9 +5119,9 @@ mod vmm_layout_tests {
         ] {
             KvCache::validate_mode_with_backend(mode, KvBackend::Vmm, true, &dims)
                 .unwrap_or_else(|e| panic!("mode={mode:?}: {e}"));
-            // Contiguous admission remains open (no VMM-only gate).
-            KvCache::validate_mode_with_backend(mode, KvBackend::Contiguous, true, &dims)
-                .unwrap_or_else(|e| panic!("contiguous mode={mode:?}: {e}"));
+            // Legacy admission remains open (no VMM-only gate).
+            KvCache::validate_mode_with_backend(mode, KvBackend::Legacy, true, &dims)
+                .unwrap_or_else(|e| panic!("legacy mode={mode:?}: {e}"));
         }
     }
 
@@ -4599,6 +5396,7 @@ mod bf16_tier_projection_tests {
         quant_asym2: bool,
         quant_fwht: bool,
         quant_bf16: bool,
+        quant_fp8: bool,
         k_scales_empty: bool,
     ) -> KvCache {
         KvCache {
@@ -4629,6 +5427,7 @@ mod bf16_tier_projection_tests {
             quant_asym2,
             quant_fwht,
             quant_bf16,
+            quant_fp8,
             v_mode: VMode::Q8,
             boundary_layers: 0,
             givens_cos: None,
@@ -4652,6 +5451,7 @@ mod bf16_tier_projection_tests {
             cache.quant_int8,
             cache.is_hfq8_kv(),
             cache.quant_bf16,
+            cache.quant_fp8,
         ];
         flags.iter().filter(|&&b| b).count()
     }
@@ -4660,7 +5460,7 @@ mod bf16_tier_projection_tests {
     fn bf16_projection_is_exclusive_q4_false_bf16_true() {
         // Maple BF16: quantized true, empty scales, bf16 true, no other tier.
         let bf16 = stub(
-            true, false, false, false, false, false, false, false, true, true,
+            true, false, false, false, false, false, false, false, true, false, true,
         );
         assert!(
             !bf16.quant_q4_residual(),
@@ -4685,7 +5485,7 @@ mod bf16_tier_projection_tests {
     fn q4_residual_still_reports_q4_only() {
         // LLaMA legacy Q4: quantized true, empty scales, no named tier, no bf16.
         let q4 = stub(
-            true, false, false, false, false, false, false, false, false, true,
+            true, false, false, false, false, false, false, false, false, false, true,
         );
         assert!(q4.quant_q4_residual(), "legacy Q4 must report q4 residual");
         assert!(!q4.quant_bf16);
@@ -4702,7 +5502,7 @@ mod bf16_tier_projection_tests {
     fn q8_projection_is_exclusive_q4_false() {
         // Q8: quantized true, q8 true, empty scales, no bf16. Must not also be Q4.
         let q8 = stub(
-            true, true, false, false, false, false, false, false, false, true,
+            true, true, false, false, false, false, false, false, false, false, true,
         );
         assert!(
             !q8.quant_q4_residual(),
@@ -4724,7 +5524,7 @@ mod bf16_tier_projection_tests {
         // Asym3 (qwen35 default) was the original motivator for the asym exclusion;
         // ensure the new bf16 exclusion didn't reintroduce overlap.
         let asym3 = stub(
-            true, false, false, false, false, true, false, false, false, true,
+            true, false, false, false, false, true, false, false, false, false, true,
         );
         assert!(
             !asym3.quant_q4_residual(),
@@ -4734,7 +5534,7 @@ mod bf16_tier_projection_tests {
 
         // HFQ8 has non-empty k_scales and is its own tier.
         let hfq8 = stub(
-            true, false, false, false, false, false, false, false, false, false,
+            true, false, false, false, false, false, false, false, false, false, false,
         );
         assert!(hfq8.is_hfq8_kv(), "hfq8 with scales must report hfq8");
         assert!(
@@ -4745,7 +5545,7 @@ mod bf16_tier_projection_tests {
 
         // F32: quantized false => no tier at all (KTier::F32).
         let f32_cache = stub(
-            false, false, false, false, false, false, false, false, false, true,
+            false, false, false, false, false, false, false, false, false, false, true,
         );
         assert!(!f32_cache.quant_q4_residual());
         assert!(!f32_cache.is_hfq8_kv());
@@ -4919,5 +5719,622 @@ mod kv_capped_rollback_tests {
             );
         }
         gpu.drain_pool();
+    }
+}
+/// Native fp8 + flat bf16 format contract tests (GPU-free).
+///
+/// Pins the frozen §2.1 layout (1032-byte fp8 rows, 2048-byte bf16 rows at
+/// Hkv4/D256), the VMM admission matrix, tier exclusivity, and the exact
+/// CPU model of the writer's scale/code rule that O's screen assumes:
+/// smallest f16 `s >= amax/448` (floor 2^-24, zero row → 1.0), codes
+/// `E4M3_RNE(x / f32(s))` with a next-up bump when `448*f32(s) < amax`,
+/// decode `f16(f32(s) * e4m3(code))`. OCP E4M3FN numbers: bias 7, max 448,
+/// min normal 2^-6, min subnormal 2^-9, RNE, finite saturation, NaN 0x7F.
+#[cfg(test)]
+mod fp8_bf16_format_tests {
+    use super::*;
+
+    // ── layout sizing ────────────────────────────────────────────────
+
+    #[test]
+    fn canonical_rows_match_frozen_strides() {
+        assert_eq!(KvCache::fp8_row_bytes(4, 256).unwrap(), 1032);
+        assert_eq!(KvCache::bf16_row_bytes(4, 256).unwrap(), 2048);
+        // Head-major codes then packed f16 scales / flat bf16, no padding.
+        assert_eq!(KvCache::fp8_row_bytes(1, 256).unwrap(), 258);
+        assert_eq!(KvCache::bf16_row_bytes(8, 128).unwrap(), 2048);
+    }
+
+    #[test]
+    fn row_helpers_reject_degenerate_and_overflow() {
+        for bad in [
+            KvCache::fp8_row_bytes(0, 256),
+            KvCache::fp8_row_bytes(4, 0),
+            KvCache::bf16_row_bytes(0, 256),
+            KvCache::bf16_row_bytes(4, 0),
+            KvCache::fp8_row_bytes(usize::MAX, 256),
+            KvCache::bf16_row_bytes(usize::MAX, 256),
+        ] {
+            assert!(bad.is_err());
+        }
+    }
+
+    // ── admission matrix (GPU-free validation) ───────────────────────
+
+    fn mask_dims(head_dim: usize, cap: Option<usize>) -> KvDims {
+        KvDims {
+            layers: KvLayers::Mask(vec![true, false, true]),
+            n_kv_heads: 4,
+            head_dim,
+            max_seq: 1024,
+            physical_cap: cap,
+        }
+    }
+
+    #[test]
+    fn validate_admits_fp8_bf16_legacy_and_vmm() {
+        // Legacy: fp8 exact geometry, bf16 any non-zero geometry.
+        KvCache::validate_mode_with_backend(
+            KvMode::Fp8,
+            KvBackend::Legacy,
+            true,
+            &mask_dims(256, None),
+        )
+        .unwrap();
+        KvCache::validate_mode_with_backend(
+            KvMode::Bf16,
+            KvBackend::Legacy,
+            true,
+            &mask_dims(128, None),
+        )
+        .unwrap();
+        let err = KvCache::validate_mode_with_backend(
+            KvMode::Fp8,
+            KvBackend::Legacy,
+            true,
+            &mask_dims(128, None),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("head_dim=256"), "{err}");
+        // VMM: mask + cap required, single-GPU only, exact geometry.
+        KvCache::validate_mode_with_backend(
+            KvMode::Fp8,
+            KvBackend::Vmm,
+            true,
+            &mask_dims(256, Some(512)),
+        )
+        .unwrap();
+        KvCache::validate_mode_with_backend(
+            KvMode::Bf16,
+            KvBackend::Vmm,
+            true,
+            &mask_dims(256, Some(512)),
+        )
+        .unwrap();
+        let err = KvCache::validate_mode_with_backend(
+            KvMode::Fp8,
+            KvBackend::Vmm,
+            true,
+            &mask_dims(128, Some(512)),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("head_dim=256"), "{err}");
+        let err = KvCache::validate_mode_with_backend(
+            KvMode::Fp8,
+            KvBackend::Vmm,
+            false,
+            &mask_dims(256, Some(512)),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("single-GPU"), "{err}");
+        let flat = KvDims {
+            layers: KvLayers::Flat(64),
+            n_kv_heads: 4,
+            head_dim: 256,
+            max_seq: 1024,
+            physical_cap: Some(512),
+        };
+        let err = KvCache::validate_mode_with_backend(KvMode::Fp8, KvBackend::Vmm, true, &flat)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("filtered"), "{err}");
+    }
+
+    #[test]
+    fn vmm_layout_strides_match_row_helpers() {
+        let fp8 = KvCache::vmm_static_layout(KvMode::Fp8, VMode::Q8, 4, 256, 64).unwrap();
+        assert_eq!(fp8.k_bytes_per_token, 1032);
+        assert_eq!(fp8.v_bytes_per_token, 1032);
+        assert_eq!(fp8.k_reserve_bytes, 64 * 1032);
+        assert_eq!(fp8.rotation_table_len, 0);
+        let bf16 = KvCache::vmm_static_layout(KvMode::Bf16, VMode::Q8, 4, 256, 64).unwrap();
+        assert_eq!(bf16.k_bytes_per_token, 2048);
+        assert_eq!(bf16.v_bytes_per_token, 2048);
+        assert_eq!(bf16.rotation_table_len, 0);
+        // K/V indivisible: lloyd-V never pairs with fp8/bf16 K.
+        assert!(KvCache::vmm_static_layout(KvMode::Fp8, VMode::Lloyd4, 4, 256, 64).is_err());
+        assert!(KvCache::vmm_static_layout(KvMode::Bf16, VMode::Lloyd2, 4, 256, 64).is_err());
+        assert!(KvCache::vmm_static_layout(KvMode::Bf16, VMode::Q8, 4, 0, 64).is_err());
+    }
+
+    // ── live-flag decode ─────────────────────────────────────────────
+
+    fn indivisible_standin(fp8: bool, bf16: bool) -> KvCache {
+        KvCache {
+            k_gpu: vec![],
+            v_gpu: vec![],
+            k_scales: vec![],
+            v_scales: vec![],
+            kv_dim: 4 * 256,
+            max_seq: 128,
+            physical_cap: 128,
+            n_kv_heads: 4,
+            head_dim: 256,
+            quantized: true,
+            quant_q8: false,
+            quant_int8: false,
+            quant_hfq4: false,
+            quant_asym4: false,
+            quant_asym3: false,
+            quant_asym2: false,
+            quant_fwht: false,
+            quant_bf16: bf16,
+            quant_fp8: fp8,
+            boundary_layers: 0,
+            givens_cos: None,
+            givens_sin: None,
+            layer_is_boundary: vec![],
+            compact_offset: 0,
+            v_mode: VMode::Q8,
+        }
+    }
+
+    #[test]
+    fn live_strides_and_modes_resolve() {
+        let fp8 = indivisible_standin(true, false);
+        assert_eq!(fp8.current_kv_mode().unwrap(), KvMode::Fp8);
+        assert_eq!(fp8.vmm_bytes_per_token().unwrap(), (1032, 1032));
+        assert_eq!(fp8.fp8_bytes_per_token().unwrap(), 1032);
+        assert!(fp8.bf16_bytes_per_token().is_err());
+        let bf16 = indivisible_standin(false, true);
+        assert_eq!(bf16.current_kv_mode().unwrap(), KvMode::Bf16);
+        assert_eq!(bf16.vmm_bytes_per_token().unwrap(), (2048, 2048));
+        assert_eq!(bf16.bf16_bytes_per_token().unwrap(), 2048);
+        assert!(bf16.fp8_bytes_per_token().is_err());
+    }
+
+    #[test]
+    fn indivisible_tiers_stay_out_of_residual_ladders() {
+        for cache in [
+            indivisible_standin(true, false),
+            indivisible_standin(false, true),
+        ] {
+            assert!(!cache.quant_q4_residual());
+            assert!(!cache.is_hfq8_kv());
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "no 5-flag VMM bundle representation")]
+    fn vmm_mode_flags_rejects_fp8() {
+        let _ = KvCache::vmm_mode_flags(KvMode::Fp8);
+    }
+
+    #[test]
+    #[should_panic(expected = "no 5-flag VMM bundle representation")]
+    fn vmm_mode_flags_rejects_bf16() {
+        let _ = KvCache::vmm_mode_flags(KvMode::Bf16);
+    }
+
+    // ── CPU model of the §2.1 writer rule ────────────────────────────
+    //
+    // OCP E4M3FN as frozen: bias 7, max finite 448, min normal 2^-6, min
+    // subnormal 2^-9, RNE, finite saturation, NaN 0x7F/0xFF, no infinities.
+
+    /// RNE f32 → f16 bit pattern; overflows saturate to max finite (the
+    /// writer's domain is finite and the oracle rejects the rest).
+    fn f32_to_f16_rne_bits(x: f32) -> u16 {
+        let b = x.to_bits();
+        let sign = ((b >> 16) & 0x8000) as u16;
+        let e = ((b >> 23) & 0xff) as i32;
+        let m = b & 0x7f_ffff;
+        if e == 0xff {
+            return sign | 0x7bff;
+        }
+        if e == 0 {
+            return sign;
+        }
+        let unbiased = e - 127;
+        if unbiased > 15 {
+            return sign | 0x7bff;
+        }
+        if unbiased >= -14 {
+            let mut m16 = m >> 13;
+            let rest = m & 0x1fff;
+            if rest > 0x1000 || (rest == 0x1000 && (m16 & 1) == 1) {
+                m16 += 1;
+                if m16 == 0x400 {
+                    let e16 = unbiased + 16;
+                    if e16 >= 31 {
+                        return sign | 0x7bff;
+                    }
+                    return sign | ((e16 as u16) << 10);
+                }
+            }
+            return sign | (((unbiased + 15) as u16) << 10) | (m16 as u16);
+        }
+        if unbiased < -25 {
+            return sign;
+        }
+        // Subnormal: value = M * 2^(unbiased-23), unit 2^-24.
+        let full = m | 0x80_0000;
+        let shift = (-unbiased - 1) as u32;
+        let mut m16 = full >> shift;
+        let rest = full & ((1u32 << shift) - 1);
+        let half = 1u32 << (shift - 1);
+        if rest > half || (rest == half && (m16 & 1) == 1) {
+            m16 += 1;
+        }
+        if m16 >= 0x400 {
+            return sign | (1 << 10);
+        }
+        sign | (m16 as u16)
+    }
+
+    fn f16_to_f32(bits: u16) -> f32 {
+        let s = ((bits >> 15) & 1) as u32;
+        let e = ((bits >> 10) & 0x1f) as i32;
+        let m = (bits & 0x3ff) as u32;
+        let fbits = if e == 0 {
+            // Subnormal: m * 2^-24.
+            if m == 0 {
+                s << 31
+            } else {
+                // Normalize into f32 range exactly.
+                let mut mm = m;
+                let mut ee: i32 = -14;
+                while mm & 0x400 == 0 {
+                    mm <<= 1;
+                    ee -= 1;
+                }
+                mm &= 0x3ff;
+                (s << 31) | (((ee + 127) as u32) << 23) | (mm << 13)
+            }
+        } else if e == 0x1f {
+            (s << 31) | (0xff << 23) | (m << 13)
+        } else {
+            (s << 31) | (((e - 15 + 127) as u32) << 23) | (m << 13)
+        };
+        f32::from_bits(fbits)
+    }
+
+    /// RNE f32 → E4M3FN byte (bias 7, saturating, NaN → sign-preserving
+    /// 0x7F/0xFF, infinities saturate; E=15/m=7 is never emitted for
+    /// finite inputs — those saturate to 448).
+    fn e4m3_encode_rne(x: f32) -> u8 {
+        let b = x.to_bits();
+        let sign = if b & 0x8000_0000 != 0 { 0x80 } else { 0 };
+        let e = ((b >> 23) & 0xff) as i32;
+        let m = b & 0x7f_ffff;
+        if e == 0xff {
+            if m == 0 {
+                return sign | 0x7e;
+            }
+            return sign | 0x7f;
+        }
+        if e == 0 {
+            return sign;
+        }
+        let unbiased = e - 127;
+        if unbiased > 8 {
+            return sign | 0x7e;
+        }
+        if unbiased >= -6 {
+            let field = unbiased + 7;
+            let mut m3 = m >> 20;
+            let rest = m & 0xf_ffff;
+            if rest > 0x8_0000 || (rest == 0x8_0000 && (m3 & 1) == 1) {
+                m3 += 1;
+            }
+            let (mut ef, mut mm) = (field, m3);
+            if mm == 8 {
+                mm = 0;
+                ef += 1;
+            }
+            if ef > 15 || (ef == 15 && mm == 7) {
+                return sign | 0x7e;
+            }
+            return sign | ((ef as u8) << 3) | (mm as u8);
+        }
+        if unbiased < -10 {
+            return sign;
+        }
+        // Subnormal: value = M * 2^(unbiased-23), unit 2^-9.
+        let full = m | 0x80_0000;
+        let shift = (14 - unbiased) as u32;
+        let mut m3 = full >> shift;
+        let rest = full & ((1u32 << shift) - 1);
+        let half = 1u32 << (shift - 1);
+        if rest > half || (rest == half && (m3 & 1) == 1) {
+            m3 += 1;
+        }
+        if m3 >= 8 {
+            return sign | 0x08;
+        }
+        sign | (m3 as u8)
+    }
+
+    fn e4m3_decode(code: u8) -> f32 {
+        let s = (code & 0x80) != 0;
+        let e = ((code >> 3) & 0x0f) as i32;
+        let m = (code & 7) as f32;
+        let v = if e == 0 {
+            m * 2f32.powi(-9)
+        } else if e == 15 {
+            if m as u8 == 7 {
+                f32::NAN
+            } else {
+                2f32.powi(8) * (1.0 + m / 8.0)
+            }
+        } else {
+            2f32.powi(e - 7) * (1.0 + m / 8.0)
+        };
+        if s {
+            -v
+        } else {
+            v
+        }
+    }
+
+    /// Frozen scale rule: smallest positive f16 `s >= amax/448`, floor
+    /// 2^-24, zero row → 1.0, next-up bump when `448*f32(s) < amax`.
+    fn fp8_pick_scale_bits(amax: f32) -> u16 {
+        if !(amax > 0.0) {
+            return 0x3c00;
+        }
+        let mut s = f32_to_f16_rne_bits(amax / KvCache::FP8_E4M3_MAX_F32);
+        if s < 0x0001 {
+            s = 0x0001;
+        }
+        if KvCache::FP8_E4M3_MAX_F32 * f16_to_f32(s) < amax {
+            s = if s >= 0x7bff { 0x7bff } else { s + 1 };
+        }
+        s
+    }
+
+    #[test]
+    fn e4m3_codec_known_vectors() {
+        assert_eq!(e4m3_encode_rne(0.0), 0x00);
+        assert_eq!(e4m3_encode_rne(-0.0), 0x80);
+        assert_eq!(e4m3_encode_rne(1.0), 0x38);
+        assert_eq!(e4m3_encode_rne(-1.0), 0xb8);
+        assert_eq!(e4m3_encode_rne(0.5), 0x30);
+        assert_eq!(e4m3_encode_rne(448.0), 0x7e);
+        assert_eq!(e4m3_encode_rne(-448.0), 0xfe);
+        // Finite saturation (hardware cvt saturates; never NaN/Inf).
+        assert_eq!(e4m3_encode_rne(500.0), 0x7e);
+        assert_eq!(e4m3_encode_rne(-500.0), 0xfe);
+        assert_eq!(e4m3_encode_rne(f32::INFINITY), 0x7e);
+        assert_eq!(e4m3_encode_rne(f32::NAN), 0x7f);
+        // Subnormal floor and exact decode points.
+        assert_eq!(e4m3_encode_rne(2f32.powi(-9)), 0x01);
+        assert_eq!(e4m3_decode(0x38), 1.0);
+        assert_eq!(e4m3_decode(0xb8), -1.0);
+        assert_eq!(e4m3_decode(0x01), 2f32.powi(-9));
+        assert_eq!(e4m3_decode(0x7e), 448.0);
+        assert!(e4m3_decode(0x7f).is_nan());
+        // RNE tie: halfway between 1.0 (0x38) and 1.125 (0x39) is 1.0625;
+        // even mantissa (0) wins → 0x38.
+        assert_eq!(e4m3_encode_rne(1.0625), 0x38);
+    }
+
+    #[test]
+    fn f16_rne_known_vectors() {
+        assert_eq!(f32_to_f16_rne_bits(1.0), 0x3c00);
+        assert_eq!(f32_to_f16_rne_bits(0.5), 0x3800);
+        assert_eq!(f32_to_f16_rne_bits(65504.0), 0x7bff);
+        assert_eq!(f32_to_f16_rne_bits(100000.0), 0x7bff);
+        assert_eq!(f32_to_f16_rne_bits(2f32.powi(-24)), 0x0001);
+        assert_eq!(f32_to_f16_rne_bits(0.0), 0x0000);
+        // Tie 1+2^-11 → even (0x3c00), not up.
+        assert_eq!(f32_to_f16_rne_bits(1.0 + 2f32.powi(-11)), 0x3c00);
+        // Just above the tie → up.
+        assert_eq!(f32_to_f16_rne_bits(1.0 + 2f32.powi(-10)), 0x3c01);
+        // Round-trip through the exact decoder.
+        for bits in [0x0000u16, 0x0001, 0x03ff, 0x0400, 0x3c00, 0x7bff] {
+            assert_eq!(f32_to_f16_rne_bits(f16_to_f32(bits)), bits);
+        }
+    }
+
+    #[test]
+    fn scale_selection_zero_floor_and_bump() {
+        // All-zero row → canonical s=1, zero codes by construction.
+        assert_eq!(fp8_pick_scale_bits(0.0), 0x3c00);
+        // amax/448 rounds to zero in f16 → pin to the 2^-24 floor.
+        assert_eq!(fp8_pick_scale_bits(1e-5), 0x0001);
+        // Exact unity.
+        assert_eq!(fp8_pick_scale_bits(448.0), 0x3c00);
+        // Upward-half case: f16(448.01/448) rounds DOWN to 1.0, but
+        // 448*1.0 < 448.01, so the stored scale bumps one ulp.
+        let bumped = fp8_pick_scale_bits(448.01);
+        assert_eq!(bumped, 0x3c01);
+        assert!(KvCache::FP8_E4M3_MAX_F32 * f16_to_f32(bumped) >= 448.01);
+        // Bumped scale is still the SMALLEST f16 covering amax.
+        assert!(KvCache::FP8_E4M3_MAX_F32 * f16_to_f32(bumped - 1) < 448.01);
+    }
+
+    fn xorshift(state: &mut u32) -> u32 {
+        let mut x = *state;
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        *state = x;
+        x
+    }
+
+    #[test]
+    fn writer_rule_round_trip_stays_within_one_ulp() {
+        // Deterministic rows across five magnitude decades. Error is
+        // measured in the scaled domain (|decode(code) - x/s|), isolating
+        // the codec from the scale choice: normals get ≤6.5% relative,
+        // subnormals get an absolute 2^-10 floor.
+        let mut state = 0x243f_6a88u32;
+        for _row in 0..32 {
+            let mut xs = [0f32; 256];
+            let mut amax = 0f32;
+            // Keep every row's amax inside the finite domain.
+            let exp = (xorshift(&mut state) % 17) as i32 - 10;
+            for x in xs.iter_mut() {
+                let mant = 1.0 + (xorshift(&mut state) % 1000) as f32 / 1000.0;
+                let sign = if xorshift(&mut state) & 1 == 0 {
+                    1.0
+                } else {
+                    -1.0
+                };
+                *x = sign * mant * 2f32.powi(exp);
+                amax = amax.max(x.abs());
+            }
+            let s_bits = fp8_pick_scale_bits(amax);
+            let s = f16_to_f32(s_bits);
+            assert!(s > 0.0 && s.is_finite());
+            assert!(KvCache::FP8_E4M3_MAX_F32 * s >= amax);
+            let mut worst = 0f32;
+            for x in xs {
+                let code = e4m3_encode_rne(x / s);
+                let v = e4m3_decode(code);
+                let target = x / s;
+                let bound = (target.abs() * 0.065).max(2f32.powi(-10));
+                let err = (v - target).abs();
+                assert!(
+                    err <= bound,
+                    "x={x} s={s} code={code:#x} err={err} bound={bound}"
+                );
+                worst = worst.max(err);
+                // Fill-side decode point: f16(f32(s) * code) stays finite.
+                let fill = f32_to_f16_rne_bits(s * v);
+                assert_ne!(fill, 0x7c00, "fill decode overflowed to Inf");
+            }
+            let _ = worst;
+        }
+        // Zero row: canonical scale, every code zero, decode exact.
+        let s_bits = fp8_pick_scale_bits(0.0);
+        assert_eq!(s_bits, 0x3c00);
+        assert_eq!(e4m3_encode_rne(0.0 / f16_to_f32(s_bits)), 0x00);
+    }
+}
+
+/// Slot-pool tier-plan truth table: strides must equal the constructor
+/// formulas (`expected_k_bph` above) and the Q8_0 V stride, the rotation
+/// metadata must match the tier family, and the geometry gates must refuse
+/// what the constructors refuse.
+#[cfg(test)]
+mod slot_kv_plan_tests {
+    use super::*;
+
+    #[test]
+    fn strides_match_constructor_formulas() {
+        let n_kv_heads = 8usize;
+        for (mode, hd, k_bph) in [
+            (KvMode::Q8, 256usize, 8 * 34usize),
+            (KvMode::Asym2, 128, 4 + 128 / 4),
+            (KvMode::Asym2, 256, 4 + 256 / 4),
+            (KvMode::Asym3, 256, 4 + (256 * 3) / 8),
+            (KvMode::Asym4, 128, 4 + 128 / 2),
+            (KvMode::Asym4, 256, 4 + 256 / 2),
+            (KvMode::Fwht2, 256, 4 + 256 / 4),
+            (KvMode::Fwht3, 256, 4 + (256 * 3) / 8),
+            (KvMode::Fwht4, 256, 4 + 256 / 2),
+        ] {
+            let p = SlotKvTierPlan::resolve(mode, n_kv_heads, hd)
+                .unwrap_or_else(|e| panic!("{mode:?} hd={hd}: {e}"));
+            assert_eq!(p.k_bytes_per_pos, n_kv_heads * k_bph, "{mode:?} hd={hd}");
+            assert_eq!(
+                p.v_bytes_per_pos,
+                n_kv_heads * (hd / 32) * 34,
+                "{mode:?} hd={hd} V must be Q8_0 stride"
+            );
+            assert_eq!(
+                p.kv_strides_differ(),
+                !matches!(mode, KvMode::Q8),
+                "{mode:?}: only q8 shares the K/V stride"
+            );
+        }
+    }
+
+    #[test]
+    fn q8_shares_strides_and_has_no_tables() {
+        let p = SlotKvTierPlan::resolve(KvMode::Q8, 4, 256).unwrap();
+        assert_eq!(p.k_bytes_per_pos, p.v_bytes_per_pos);
+        assert!(!p.kv_strides_differ());
+        assert!(p.givens_len.is_none());
+        assert!(p.fwht_len.is_none());
+    }
+
+    #[test]
+    fn bf16_is_flat_and_table_free() {
+        let p = SlotKvTierPlan::resolve(KvMode::Bf16, 4, 256).unwrap();
+        assert_eq!(p.k_bytes_per_pos, 4 * 256 * 2);
+        assert_eq!(p.v_bytes_per_pos, p.k_bytes_per_pos);
+        assert!(!p.kv_strides_differ());
+        assert!(p.givens_len.is_none());
+        assert!(p.fwht_len.is_none());
+    }
+
+    #[test]
+    fn f16_is_flat_and_table_free() {
+        let p = SlotKvTierPlan::resolve(KvMode::F16, 4, 256).unwrap();
+        assert_eq!(p.k_bytes_per_pos, 4 * 256 * 2);
+        assert_eq!(p.v_bytes_per_pos, p.k_bytes_per_pos);
+        assert!(!p.kv_strides_differ());
+        assert!(p.givens_len.is_none());
+        assert!(p.fwht_len.is_none());
+        // And the VMM gate refuses it — the tier is slots/contiguous only.
+        let err = KvCache::vmm_static_layout(KvMode::F16, VMode::Q8, 4, 256, 64)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("f16"), "{err}");
+    }
+
+    #[test]
+    fn rotation_tables_match_tier_family() {
+        for m in [KvMode::Asym2, KvMode::Asym3, KvMode::Asym4] {
+            let p = SlotKvTierPlan::resolve(m, 2, 256).unwrap();
+            assert_eq!(p.givens_len, Some(128), "{m:?}: head_dim/2 givens angles");
+            assert!(p.fwht_len.is_none(), "{m:?} must not carry fwht signs");
+        }
+        for m in [KvMode::Fwht2, KvMode::Fwht4] {
+            let p = SlotKvTierPlan::resolve(m, 2, 256).unwrap();
+            assert_eq!(p.fwht_len, Some(128), "{m:?}: 128-wide sign vectors");
+            assert!(p.givens_len.is_none(), "{m:?} must not carry givens angles");
+        }
+        // fwht3's K-rotation kernel reads signs[0..255] — 256-wide, not 128.
+        let p = SlotKvTierPlan::resolve(KvMode::Fwht3, 2, 256).unwrap();
+        assert_eq!(p.fwht_len, Some(256), "Fwht3: 256-wide sign vectors");
+        assert!(p.givens_len.is_none(), "Fwht3 must not carry givens angles");
+    }
+
+    #[test]
+    fn geometry_gates_refuse_what_constructors_refuse() {
+        // asym3/fwht3 are 256-only (Qwen 3.5 geometry).
+        for m in [KvMode::Asym3, KvMode::Fwht3] {
+            assert!(SlotKvTierPlan::resolve(m, 2, 128).is_err(), "{m:?} @128");
+        }
+        // asym2/asym4 accept 128 or 256, nothing else in between.
+        for m in [KvMode::Asym2, KvMode::Asym4] {
+            assert!(SlotKvTierPlan::resolve(m, 2, 256).is_ok(), "{m:?} @256");
+            assert!(SlotKvTierPlan::resolve(m, 2, 64).is_err(), "{m:?} @64");
+        }
+        // Packed tiers need head_dim % 32.
+        for m in [KvMode::Q8, KvMode::Asym3, KvMode::Fwht4] {
+            assert!(SlotKvTierPlan::resolve(m, 2, 100).is_err(), "{m:?} @100");
+        }
+        // fp8 is native-only on the slot engine: no slot reader exists, so
+        // the plan refuses it fail-closed like the sentinel.
+        assert!(SlotKvTierPlan::resolve(KvMode::Fp8, 2, 256).is_err());
+        // Zero heads refused.
+        assert!(SlotKvTierPlan::resolve(KvMode::Q8, 0, 256).is_err());
     }
 }

@@ -122,6 +122,100 @@ DFLASH_EXACT_FIELDS = (
 # recorded-HIP/PM4 routes, not the separate HipGraph route.
 DFLASH_COMPARED_ARMS = ("recorded_hip", "pm4")
 
+# Qwen4 (Qwen3.8 Flash-Next) state surfaces. The retained replay and the
+# exact-kernarg HIP oracle must agree with ordinary HIP on every one of these at
+# every compared position: the decoded token is not the gate, the state is.
+QWEN4_EXACT_FIELDS = (
+    "tokens_equal",
+    "argmax_equal",
+    "position_equal",
+    "lengths_equal",
+    "state_bit_exact",
+    "qsa_full_equal",
+    "gdn_equal",
+    "ple_equal",
+)
+
+
+def qwen4_shadow_failures(shadow):
+    """Every reason this Qwen4 multi-position parity run is not evidence."""
+    failures = []
+    route = shadow.get("route") or {}
+    counters = route.get("counters") or {}
+    if route.get("phase") != "ready":
+        failures.append(f"route phase is {route.get('phase')!r}, not 'ready'")
+    if int(counters.get("replays") or 0) == 0:
+        failures.append("route.counters.replays == 0")
+    for name in ("replay_failures", "poison_count", "contract_failures", "prepare_failures"):
+        if int(counters.get(name) or 0) != 0:
+            failures.append(f"counters.{name} == {counters.get(name)}")
+
+    capture = shadow.get("capture") or {}
+    identity = shadow.get("prepared_identity") or {}
+    if not identity.get("dispatch_equals_launches"):
+        failures.append(
+            f"prepared dispatches {identity.get('dispatch_count')} != "
+            f"captured launches {capture.get('launches')}"
+        )
+    if identity.get("queue_count") != 1 or identity.get("phase_count") != 1:
+        failures.append(f"prepared route is not single-queue/single-phase: {identity!r}")
+
+    if not shadow.get("bit_exact"):
+        failures.append("retained transport != ordinary HIP over the compared state")
+    if not shadow.get("blob_bit_exact"):
+        failures.append("recorded-HIP oracle != ordinary HIP over the compared state")
+
+    parity = shadow.get("parity") or {}
+    windows = parity.get("windows") or []
+    if not windows:
+        failures.append("parity table has no windows")
+    # The recorded-HIP oracle applies the same synthesized and program-declared
+    # position bindings as the retained plan, so both arms carry the
+    # multi-position claim.
+    for window in windows:
+        position = window.get("position")
+        for arm in ("pm4", "recorded_hip"):
+            row = window.get(arm) or {}
+            if not row:
+                failures.append(f"position {position}: {arm} arm missing from parity")
+                continue
+            failures.extend(qwen4_row_failures(row, f"position {position}: {arm}"))
+
+    failure = shadow.get("failure_behavior") or {}
+    if not failure:
+        failures.append("failure_behavior missing")
+    else:
+        if not failure.get("route_poisoned"):
+            failures.append("induced replay failure did not poison the route")
+        if "exceeds prepared max_position" not in (failure.get("error") or ""):
+            failures.append(
+                f"induced failure did not surface the plan's refusal: {failure.get('error')!r}"
+            )
+        if not failure.get("fallback_reason"):
+            failures.append("poisoned route has no fallback reason")
+        if not failure.get("recovery_uses_hip"):
+            failures.append("recovery forward is not on HIP")
+        if not failure.get("recovered_bit_exact_against_clean_hip"):
+            failures.append("recovery forward is not bit-exact against clean HIP")
+    return failures
+
+
+def qwen4_row_failures(row, label):
+    failures = []
+    for field in QWEN4_EXACT_FIELDS:
+        if field not in row:
+            failures.append(f"{label}.{field} missing")
+        elif not row[field]:
+            failures.append(f"{label}.{field} is false")
+    for field, value in row.items():
+        if isinstance(value, dict) and "max_abs" in value:
+            if (value.get("max_abs") or 0) != 0 or (value.get("max_rel") or 0) != 0:
+                failures.append(
+                    f"{label}.{field} diverged max_abs={value.get('max_abs')} "
+                    f"max_rel={value.get('max_rel')}"
+                )
+    return failures
+
 
 def dflash_shadow_failures(shadow):
     """Every reason this shadow run is not evidence. Empty list == pass.
@@ -189,6 +283,137 @@ def dflash_shadow_failures(shadow):
     return failures
 
 
+# The trunk tier this harness is allowed to certify.  Four bits on a dense
+# trunk projection (which writes straight into the residual stream) produced a
+# model that opened a reasoning block it could not close, and BF16 is the
+# unpacked path this packing exists to replace.  A recipe that drifts to either
+# one is a recipe error, so the gate below refuses to run rather than certify it.
+QWEN4_ADMITTED_TRUNK_TYPES = {47, 35}  # MQ6G256V2, and MFP4G32E8SOA for the E8 A/B
+QWEN4_REQUIRED_SOURCE_EXACT = ("embed_tokens.weight", "lm_head.weight", "hyper_connection")
+
+
+def read_qwen4_index(model):
+    """Return [(name, quant_type)] read from the artifact's own index.
+
+    Ground truth, not the artifact's self-description: a hardcoded recipe can
+    claim a trunk tier the payload does not carry.  Only the metadata/index
+    region is read; the payload is never touched.
+    """
+    with model.open("rb") as handle:
+        header = handle.read(32)
+        if len(header) < 32 or header[:4] != b"HFQM":
+            return None
+        count = int.from_bytes(header[12:16], "little")
+        metadata_offset = int.from_bytes(header[16:24], "little")
+        data_offset = int.from_bytes(header[24:32], "little")
+        if not 32 <= metadata_offset <= data_offset:
+            return None
+        handle.seek(metadata_offset)
+        region = handle.read(min(data_offset - metadata_offset, 64 * 1024 * 1024))
+    depth = 0
+    in_string = False
+    escaped = False
+    cursor = None
+    for index, byte in enumerate(region):
+        char = chr(byte)
+        if escaped:
+            escaped = False
+            continue
+        if in_string:
+            if char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                cursor = index + 1
+                break
+    if cursor is None:
+        return None
+    import struct as _struct
+
+    position = cursor
+    (index_count,) = _struct.unpack_from("<I", region, position)
+    position += 4
+    if index_count != count:
+        return None
+    entries = []
+    for _ in range(index_count):
+        (name_len,) = _struct.unpack_from("<H", region, position)
+        position += 2
+        name = region[position : position + name_len].decode("utf-8")
+        position += name_len
+        quant_type = region[position]
+        position += 1
+        n_dims = region[position]
+        position += 1
+        dims = _struct.unpack_from("<%dI" % n_dims, region, position)
+        position += 4 * n_dims
+        position += 4  # group size
+        position += 8  # data length
+        entries.append((name, quant_type, dims))
+    return entries
+
+
+def qwen4_recipe_failures(model):
+    """Check the artifact's actual trunk tier and source-exact classes."""
+    entries = read_qwen4_index(model)
+    if entries is None:
+        return ["artifact index is unreadable; its trunk tier cannot be certified"]
+    trunk = []
+    sensitive = []
+    for name, quant_type, dims in entries:
+        short = name.replace("model.language_model.", "")
+        if short.startswith("mtp."):
+            continue  # the drafter's Q8 projections are not trunk projections
+        if any(
+            marker in short
+            for marker in ("embed_tokens.weight", "lm_head.weight", "hyper_connection")
+        ):
+            sensitive.append((short, quant_type))
+            continue
+        if not any(marker in short for marker in (".linear_attn.", ".self_attn.")):
+            continue
+        if len(dims) != 2 or dims[-1] % 128 != 0:
+            continue
+        trunk.append((short, quant_type))
+    failures = []
+    if not trunk:
+        failures.append("no packed trunk projection found; the trunk decodes unpacked")
+    wrong = sorted({quant_type for _, quant_type in trunk} - QWEN4_ADMITTED_TRUNK_TYPES)
+    if wrong:
+        named = ", ".join(
+            f"{quant_type} ({name})" for name, quant_type in trunk if quant_type in wrong
+        )[:400]
+        failures.append(
+            f"trunk projections carry quant types {wrong}, admitted is "
+            f"{sorted(QWEN4_ADMITTED_TRUNK_TYPES)}; the first offenders: {named}"
+        )
+    # The input/output distributions ship at BF16 (16) or the eight-bit class
+    # tier Q8F16 (3); anything narrower is the regression this gate exists for.
+    # The one exception is recipe r2's language head at MQ6G256V2 (47), the
+    # floor measured for it (weights.rs `QWEN4_LM_HEAD`).
+    quantized_sensitive = sorted(
+        {
+            name
+            for name, quant_type in sensitive
+            if quant_type not in (16, 3) and not (name == "lm_head.weight" and quant_type == 47)
+        }
+    )
+    if quantized_sensitive:
+        failures.append(
+            "these classes carry the model's input/output distribution and must stay "
+            f"BF16 (16) or Q8F16 (3), the head also MQ6G256V2 (47): {quantized_sensitive[:6]}"
+        )
+    return failures
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True)
@@ -207,9 +432,11 @@ def main():
     parser.add_argument("--decode-context", type=int, default=128)
     parser.add_argument(
         "--kv-mode",
-        choices=("q8", "fwht2", "fwht3", "fwht4"),
-        default="q8",
-        help="KV layout used by capture, shadow replay, and the HIP oracle",
+        choices=("q8", "fwht2", "fwht3", "fwht4", "bf16"),
+        help=(
+            "KV layout used by capture, shadow replay, and the HIP oracle "
+            "(default: q8; bf16 with --qwen4, whose KV is BF16 only)"
+        ),
     )
     parser.add_argument("--capture-repeats", type=int, default=2)
     parser.add_argument("--measure-repeats", type=int, default=5)
@@ -225,6 +452,11 @@ def main():
         type=int,
         default=1,
         help="position increment per shadow replay; 0 isolates queue lifetime from context growth",
+    )
+    parser.add_argument(
+        "--qwen4",
+        action="store_true",
+        help="gate the Qwen4 (Qwen3.8 Flash-Next) multi-position state-parity table",
     )
     parser.add_argument(
         "--shadow-replay-only",
@@ -310,6 +542,10 @@ def main():
         help="fixed target verify batch for the DSpark shadow (default: 3)",
     )
     args = parser.parse_args()
+    if args.kv_mode is None:
+        args.kv_mode = "bf16" if args.qwen4 else "q8"
+    if args.qwen4 and args.kv_mode != "bf16":
+        sys.exit(f"--qwen4 requires --kv-mode bf16 (got {args.kv_mode})")
 
     model = Path(args.model).expanduser().resolve()
     daemon_path = Path(args.daemon).expanduser().resolve()
@@ -331,6 +567,13 @@ def main():
                 "DeepSeek4 discovers DSpark only as the sibling "
                 f"{discovered_draft}; --draft resolved to {draft}"
             )
+
+    if args.qwen4:
+        recipe_failures = qwen4_recipe_failures(model)
+        if recipe_failures:
+            for line in recipe_failures:
+                print(f"  FAIL {line}", flush=True)
+            sys.exit(f"qwen4 artifact recipe preflight failed for {model}")
 
     report = {
         "model": str(model),
@@ -563,6 +806,19 @@ def main():
                     f"host_us={shadow.get('aql_host_us'):.1f}",
                     flush=True,
                 )
+            elif args.qwen4:
+                failures = qwen4_shadow_failures(shadow)
+                report["qwen4_shadow_failures"] = failures
+                shadow_pass = not failures
+                positions = [w.get("position") for w in (shadow.get("parity") or {}).get("windows", [])]
+                print(
+                    f"qwen4-shadow: positions={positions} "
+                    f"bit_exact={shadow.get('bit_exact')} "
+                    f"blob_bit_exact={shadow.get('blob_bit_exact')} "
+                    f"state_bytes={shadow.get('state_bytes_compared_per_position')} "
+                    f"failures={failures}",
+                    flush=True,
+                )
             else:
                 frame_values = [
                     shadow.get(arm, {}).get("gdn_frame")
@@ -579,11 +835,18 @@ def main():
                     and bool(shadow["blob_bit_exact"])
                     and frame_exact
                 )
+                backend = "pm4_ib" if args.pm4 else "aql_packets"
+                replay_us = report["aql_shadow"]["aql_host_us"]
+                hip_us = report["aql_shadow"]["hip_host_us"]
+                # The daemon field is named `aql_host_us` for both transports;
+                # label it by the backend that actually ran so a PM4 run never
+                # reads as an AQL number.
                 print(
-                    f"shadow: backend={'pm4_ib' if args.pm4 else 'aql_packets'} "
+                    f"shadow: backend={backend} "
                     f"exact={shadow_pass} gdn_frame_exact={frame_exact} "
-                    f"aql={report['aql_shadow']['aql_host_us']:.1f}us "
-                    f"hip={report['aql_shadow']['hip_host_us']:.1f}us",
+                    f"{backend}={replay_us:.1f}us "
+                    f"hip={hip_us:.1f}us "
+                    f"delta={(replay_us / hip_us - 1.0) * 100.0:+.2f}%",
                     flush=True,
                 )
         else:

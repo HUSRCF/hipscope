@@ -31,7 +31,9 @@ mod quant_e8;
 mod quant_fwht;
 mod quant_hfp4;
 mod quant_mq;
+mod quant_mq4v2_lloyd;
 mod quant_q4;
+mod qwen4;
 mod reap_overlay;
 
 fn main() {

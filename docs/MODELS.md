@@ -32,7 +32,7 @@ Default serve pre-warm tag is `qwen3.5:9b` (`CONFIG.md` → `default_model`). Pe
 
 ## Registry tags (from `registry/models.json`)
 
-Fields: **Tag**, **File** (`file`), **Size GB** (`size_gb`), **Min VRAM GB** (`min_vram_gb`), **Default KV** (`default_kv_mode` when set; else empty — global `kv_cache=auto` resolves to `q8`), **Notes** (`desc`, truncated).
+Fields: **Tag**, **File** (`file`), **Size GB** (`size_gb`), **Min VRAM GB** (`min_vram_gb`), **Default KV** (`default_kv_mode` when set; else empty — global `kv_cache=auto` resolves to the architecture default: Qwen native `fp8` on eligible exact gfx1201, otherwise `q8`), **Notes** (`desc`, truncated).
 
 ### Qwen 3.5 dense / hybrid
 
@@ -76,7 +76,7 @@ Several A3B entries carry an `mtp.file` sidecar name (`qwen3.6-35b-a3b.mtp`). MT
 
 | Tag | File | Size GB | Min VRAM | Default KV | Notes |
 |---|---|---:|---:|---|---|
-| `qwen3.6:27b` | `qwen3.6-27b.mq4` | 15.0 | 16 | q8 | Ships `triattn.file` in registry; template not effort-native — `reasoning_effort` dropped+warned, never converted to a cap |
+| `qwen3.6:27b` | `qwen3.6-27b.mq4` | 15.0 | 16 | q8 | Registry also lists a `triattn` sidecar (deprecated CASK, removal in 0.5.0: `pull` fetches it, nothing attaches it by default); template not effort-native — `reasoning_effort` dropped+warned, never converted to a cap |
 | `qwen3.6:27b-mq3` | `qwen3.6-27b.mq3` | 10.7 | 12 | | MQ3 alpha |
 
 ### Qwen 3.8 dense
@@ -87,6 +87,7 @@ Several A3B entries carry an `mtp.file` sidecar name (`qwen3.6-35b-a3b.mtp`). MT
 | `qwen3.8:27b-mq3` | `qwen3.8-27b.mq3` | 12.62 | 14 | q8 | MQ3V2 base |
 | `qwen3.8:27b-mq3-pro` | `qwen3.8-27b.mq3-pro` | 13.18 | 15 | q8 | MQ3V2 Pro |
 | `qwen3.8:27b-mq4-xt` | `qwen3.8-27b.mq4-xt` | 14.98 | 16 | q8 | MQ4V2 XT (speed; supersedes legacy `.mq4r`) |
+| `qwen3.8:27b-mq4-xts` | `qwen3.8-27b.mq4-xts` | 14.99 | 16 | q8 | MQ4V2 XT, symmetric (H2); int4-activation prefill on gfx1201/gfx1100/gfx1151; canonical dense fixture ([`AGENTS.md`](../AGENTS.md) §5) |
 | `qwen3.8:27b` | `qwen3.8-27b.mq4` | 15.66 | 17 | q8 | MQ4V2 base; default; effort-native (`low`/`medium`/`xhigh`, default `xhigh`); uncapped think span unless explicit integer cap |
 | `qwen3.8:27b-mq4-pro` | `qwen3.8-27b.mq4-pro` | 16.46 | 18 | q8 | MQ4V2 Pro |
 | `qwen3.8:27b-mq5-xt` | `qwen3.8-27b.mq5-xt` | 18.18 | 20 | q8 | MQ5V2 XT |
@@ -117,6 +118,13 @@ Draft **loading** is registry-driven: `hipfire pull <tag>` fetches the draft sid
 
 Vision-tower **loading** is registry-driven the same way: every `qwen3.8:27b*` tier declares the shared `vision.file` (`qwen3.8-27b-vision.hfq`, llama.cpp mmproj-style), so `hipfire pull <tag>` fetches the tower once and every text quant tier serves images without requantizing the trunk. The loader opens the sidecar as a separate pack and applies it with the trunk's vision config. `vision_mode` ([`CONFIG.md`](CONFIG.md#vision-tower), [`env-vars.md`](env-vars.md)) decides what happens next — default **`off`** never loads the tower (even an explicit `--vision` is skipped, the daemon's `dflash_mode=off`-style hard override, so text loads pay no tower VRAM); `auto` uses the registry/sibling sidecar when present and stays silently text-only when absent; `on` requires the declared sidecar and fails the load closed without it. A trunk with an embedded tower declares no sidecar and is unaffected by this key. Override per load with `run --vision` / `serve --vision` or `HIPFIRE_VISION_SIDECAR` (empty opts out); a `<trunk-stem>-vision.hfq` file beside the trunk is also discovered. `hipfire rm` keeps the shared file while another installed declarer still needs it ([`CLI.md`](CLI.md)).
 
+MTP-head **loading** is registry-driven too. Every Qwen3.8-27B trunk tier above (`mq3*`, `mq4*`, `mq5*`, `mq6*`) declares the shared `mtp.file` `qwen3.8-27b.mtp` (225,716,224 B, sha256 `f0d46d07ded75abc095ebfdbccc167c68418a6515b187bf810395faa460bd32e`), so `hipfire pull <tag>` fetches it once for all tiers. It is the native `mtp.*` layer of the public `Qwen/Qwen3.8-27B` checkpoint, packed by `hipfire-quantize`'s `mtp_extract --quant mq4` (arch 21). It carries no trunk weights: the head reuses the trunk's embeddings and `lm_head`, which is why one file serves every tier. The MQ4L tiers and the DFlash drafts declare no head.
+- `speculation` and `mtp_mode` ([`CONFIG.md`](CONFIG.md#speculative-decode)) both default to `auto`, so a resolved head runs on every request. The load logs `MTP head loaded (sidecar …)` and each request logs `drafter=mtp`. `off` never loads the head, and `on` fails the load without it.
+- Lookup order: `mtp.file` in the models directory, then `<file>.mtp` beside the model path as typed, then beside the canonical (symlink-resolved) trunk. A head placed beside a symlinked trunk is therefore found.
+- The loader refuses a head whose hidden size or vocab differs from the trunk's (for example a 35B-A3B head beside a 27B trunk). `auto` falls back to AR with one log line, and `on` fails the load with the two sets of dimensions.
+- On gfx1201 with H2 (`qwen3.8:27b-mq4-xts`), MTP decode against AR measured 1.09–1.65× on six of eight task genres, 0.96× on a tool answer and 0.95× on code editing. Greedy MTP output matches its own verifier's argmax, but it can differ from greedy AR output.
+- `hipfire rm` keeps the shared head while another installed tier still declares it ([`CLI.md`](CLI.md)).
+
 ### Qwen3 (non-3.5) dense HF4
 
 | Tag | File | Size GB | Min VRAM | Notes |
@@ -138,10 +146,10 @@ Vision-tower **loading** is registry-driven the same way: every `qwen3.8:27b*` t
 | `qwopus:9b-mq6` | `qwopus-9b.mq6` | 7.3 | 8 | |
 | `qwopus:27b` | `qwopus-27b.mq4` | 15.0 | 16 | |
 | `qwopus:27b-mq6` | `qwopus-27b.mq6` | 21.4 | 24 | |
-| `qwopus3.6:27b-coder` | `qwopus3.6-27b-coder.mq4` | 15.0 | 16 | q8 default KV; agentic coder finetune |
-| `nex-n2:mini` | `nex-n2-mini.mq4p` | 19.82 | 22 | q8 default KV; Qwen3.5-35B-A3B agentic MoE finetune |
-| `ornith-1.5:35b-a3b` | `ornith-1.5-35b-a3b.mq4` | 19.02 | 22 | q8 default KV; MQ4G256V2 quality trunk with selective MQ6/Q8 protection; semantic `low`/`medium`/`xhigh` effort (default `xhigh`), uncapped unless an explicit integer cap is set |
-| `ornith-1.5:35b-a3b-mq4r` | `ornith-1.5-35b-a3b.mq4r` | 18.70 | 22 | q8 default KV; uniform MQ4G256V2 Redline SKU, 20,871 qt44 and zero qt13/qt15; same effort contract as the quality trunk. Speed SKU aliases: `ornith-1.5:fast` / `ornith-1.5:35b-a3b-fast` → this tag (Muse/Qwen3.8 `:fast` pattern) |
+| `qwopus3.6:27b-coder` | `qwopus3.6-27b-coder.mq4` | 15.0 | 16 | registry `default_kv_mode` q8 (`auto` still applies); agentic coder finetune |
+| `nex-n2:mini` | `nex-n2-mini.mq4p` | 19.82 | 22 | registry `default_kv_mode` q8 (`auto` still applies); Qwen3.5-35B-A3B agentic MoE finetune |
+| `ornith-1.5:35b-a3b` | `ornith-1.5-35b-a3b.mq4` | 19.02 | 22 | registry `default_kv_mode` q8 (`auto` still applies); MQ4G256V2 quality trunk with selective MQ6/Q8 protection; semantic `low`/`medium`/`xhigh` effort (default `xhigh`), uncapped unless an explicit integer cap is set |
+| `ornith-1.5:35b-a3b-mq4r` | `ornith-1.5-35b-a3b.mq4r` | 18.70 | 22 | registry `default_kv_mode` q8 (`auto` still applies); uniform MQ4G256V2 Redline SKU, 20,871 qt44 and zero qt13/qt15; same effort contract as the quality trunk. Speed SKU aliases: `ornith-1.5:fast` / `ornith-1.5:35b-a3b-fast` → this tag (Muse/Qwen3.8 `:fast` pattern) |
 
 ### Other families (registry)
 
@@ -300,7 +308,7 @@ Runtime dispatch uses HFQ `arch_id` ([`architecture-ids.md`](architecture-ids.md
 
 `hipfire-arch-lfm2moe` is a **non-optional** dependency of `hipfire-loader` / daemon load paths on this tree (see crate `Cargo.toml` graphs). Feature flags on `hipfire-runtime` default set do not list a separate `arch-lfm2moe` toggle the way some other arches do — loader always links the crate.
 
-Capability features (DFlash, CASK, PP, MTP, batched prefill, n-gram) are **per-path and often narrower than “model loads”**. Spec inventory history: [`speculation-support-inventory.md`](speculation-support-inventory.md) (historical). Product claims need source + [`admissions.yml`](admissions.yml).
+Capability features (DFlash, PP, MTP, batched prefill, n-gram) are **per-path and often narrower than “model loads”**. Spec inventory history: [`speculation-support-inventory.md`](speculation-support-inventory.md) (historical). Product claims need source + [`admissions.yml`](admissions.yml).
 
 ### LFM optimized prefill — branch-only scope
 
@@ -336,7 +344,9 @@ See [`QUANTIZE.md`](QUANTIZE.md) and [`QUANTIZATION.md`](QUANTIZATION.md).
 
 Requires `config.json` + `.safetensors`. Architectures the **engine** loads are those with arch crates / loaders above; the quantizer may accept more shapes than inference can run.
 
-### GGUF
+### GGUF (deprecated, removal in 0.5.0)
+
+GGUF weight input is deprecated since 0.4.0: GGUF→mqN is lossy double quantization; use llama.cpp for GGUF.
 
 ```bash
 hipfire quantize ./model.Q4_K_M.gguf --install --register my:tag

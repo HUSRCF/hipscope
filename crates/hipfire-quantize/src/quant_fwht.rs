@@ -58,6 +58,38 @@ pub(crate) fn cpu_fwht_256(x: &mut [f32], signs1: &[f32], signs2: &[f32]) {
         x[i] *= scale * signs2[i];
     }
 }
+/// CPU-side FWHT on a 128-element group.
+///
+/// The transform is the same sign/butterfly/sign sequence as the G256
+/// rotation, with `1/sqrt(128)` normalization.  MQ4G128V2 keeps this helper
+/// separate from the legacy G128 encoder so its wire contract cannot be
+/// mistaken for the old 72-byte MQ4G128 layout.
+pub(crate) fn cpu_fwht_128(x: &mut [f32], signs1: &[f32], signs2: &[f32]) {
+    assert!(x.len() == 128);
+    assert!(signs1.len() == 128);
+    assert!(signs2.len() == 128);
+    for i in 0..128 {
+        x[i] *= signs1[i];
+    }
+    let mut stride = 1;
+    while stride < 128 {
+        let mut i = 0;
+        while i < 128 {
+            for j in 0..stride {
+                let a = x[i + j];
+                let b = x[i + j + stride];
+                x[i + j] = a + b;
+                x[i + j + stride] = a - b;
+            }
+            i += stride * 2;
+        }
+        stride <<= 1;
+    }
+    let scale = 1.0f32 / (128.0f32).sqrt();
+    for i in 0..128 {
+        x[i] *= scale * signs2[i];
+    }
+}
 
 /// Generate FWHT sign table (matches engine's gen_fwht_signs).
 pub(crate) fn gen_fwht_signs(seed: u32, n: usize) -> Vec<f32> {
@@ -121,6 +153,8 @@ pub(crate) const MQ4V2_GROUP_BYTES: usize = 136;
 pub(crate) const MQ4C_GROUP_BYTES: usize = 136;
 pub(crate) const MQ6V2_GROUP_BYTES: usize = 200;
 pub(crate) const MQ5V2_GROUP_BYTES: usize = 168;
+/// MQ4G128V2 wire size: fp16 scale + fp16 zero + 64 B of nibble payload.
+pub(crate) const MQ4G128V2_GROUP_BYTES: usize = 68;
 
 /// MQ4CG256 encoder — single-scale per-256 asymmetric, fp16 header, 136 B/group (pad layout).
 ///
@@ -197,6 +231,124 @@ pub(crate) fn quantize_mq4cg256(
 ///   for i in half: q[i]=clamp(rint((w[i]-z)/st),0,15)
 /// Degenerate half (hi==lo): scale=0, zero=f16(lo), all q=0.
 /// Header: [0..2) fp16 scale h0, [2..4) fp16 zero h0, [4..6) fp16 scale h1, [6..8) fp16 zero h1, [8..136) nibbles.
+fn write_mq4g256v2_group(
+    output: &mut [u8],
+    scales: [u16; 2],
+    zeros: [u16; 2],
+    codes: &[u8],
+) {
+    debug_assert_eq!(output.len(), MQ4V2_GROUP_BYTES);
+    debug_assert_eq!(codes.len(), 256);
+    output[..2].copy_from_slice(&scales[0].to_le_bytes());
+    output[2..4].copy_from_slice(&zeros[0].to_le_bytes());
+    output[4..6].copy_from_slice(&scales[1].to_le_bytes());
+    output[6..8].copy_from_slice(&zeros[1].to_le_bytes());
+    for i in 0..128 {
+        output[8 + i] = codes[2 * i] | (codes[2 * i + 1] << 4);
+    }
+}
+
+/// Pack already-selected MQ4V2 codes without applying FWHT or rounding again.
+///
+/// `headers` is one `[scale0, zero0, scale1, zero1]` F16-bit tuple per
+/// 256-weight group. `codes` is row-major and contains one unpacked uint4 code
+/// per weight. This is the export boundary used by learned-rounding tools.
+pub(crate) fn pack_mq4g256v2_from_codes(
+    m: usize,
+    k: usize,
+    headers: &[[u16; 4]],
+    codes: &[u8],
+) -> Result<Vec<u8>, String> {
+    if k % 256 != 0 {
+        return Err(format!("MQ4V2 learned codes require K % 256 == 0, got K={k}"));
+    }
+    let expected_codes = m
+        .checked_mul(k)
+        .ok_or_else(|| format!("MQ4V2 shape overflows: {m}x{k}"))?;
+    if codes.len() != expected_codes {
+        return Err(format!(
+            "MQ4V2 learned code count {} != M*K {}",
+            codes.len(),
+            expected_codes
+        ));
+    }
+    let group_count = expected_codes / 256;
+    if headers.len() != group_count {
+        return Err(format!(
+            "MQ4V2 learned header count {} != M*K/256 {}",
+            headers.len(),
+            group_count
+        ));
+    }
+    if let Some((index, code)) = codes.iter().enumerate().find(|(_, code)| **code > 15) {
+        return Err(format!("MQ4V2 code {code} at index {index} exceeds uint4"));
+    }
+
+    let mut output = vec![0u8; group_count * MQ4V2_GROUP_BYTES];
+    for group in 0..group_count {
+        let header = headers[group];
+        let group_codes = &codes[group * 256..(group + 1) * 256];
+        for half in 0..2 {
+            if header[half * 2] == 0
+                && group_codes[half * 128..(half + 1) * 128]
+                    .iter()
+                    .any(|&code| code != 0)
+            {
+                return Err(format!(
+                    "MQ4V2 group {group} half {half} has zero scale with nonzero codes"
+                ));
+            }
+        }
+        write_mq4g256v2_group(
+            &mut output[group * MQ4V2_GROUP_BYTES..(group + 1) * MQ4V2_GROUP_BYTES],
+            [header[0], header[2]],
+            [header[1], header[3]],
+            group_codes,
+        );
+    }
+    Ok(output)
+}
+
+/// Pack the frozen C3 `[M,K/256,2,2]` F16 `(d,z)` grid and unpacked U8
+/// codes directly. This function only serializes: it never applies FWHT or
+/// selects a grid/code, so trained codes cross the export boundary exactly once.
+pub(crate) fn pack_mq4g256v2_from_f16_grid(
+    m: usize,
+    k: usize,
+    d_z_f16: &[u8],
+    codes: &[u8],
+) -> Result<Vec<u8>, String> {
+    if k % 256 != 0 {
+        return Err(format!("MQ4V2 final codes require K % 256 == 0, got K={k}"));
+    }
+    let group_count = m
+        .checked_mul(k)
+        .ok_or_else(|| format!("MQ4V2 shape overflows: {m}x{k}"))?
+        / 256;
+    let expected_grid_bytes = group_count
+        .checked_mul(8)
+        .ok_or_else(|| format!("MQ4V2 grid byte count overflows: {m}x{k}"))?;
+    if d_z_f16.len() != expected_grid_bytes {
+        return Err(format!(
+            "MQ4V2 d_z_f16 byte count {} != M*K/256*2*2*2 {}",
+            d_z_f16.len(),
+            expected_grid_bytes
+        ));
+    }
+    let headers: Vec<[u16; 4]> = d_z_f16
+        .chunks_exact(8)
+        .map(|bytes| {
+            [
+                u16::from_le_bytes([bytes[0], bytes[1]]),
+                u16::from_le_bytes([bytes[2], bytes[3]]),
+                u16::from_le_bytes([bytes[4], bytes[5]]),
+                u16::from_le_bytes([bytes[6], bytes[7]]),
+            ]
+        })
+        .collect();
+    pack_mq4g256v2_from_codes(m, k, &headers, codes)
+}
+
 pub(crate) fn quantize_mq4g256v2(
     w: &[f32],
     m: usize,
@@ -204,72 +356,276 @@ pub(crate) fn quantize_mq4g256v2(
     signs1: &[f32],
     signs2: &[f32],
 ) -> Vec<u8> {
-    let _ = (m, k);
-    let group_size = 256;
-    let block_bytes = MQ4V2_GROUP_BYTES;
-    let n = w.len();
-    let n_blocks = (n + group_size - 1) / group_size;
-    let mut output = vec![0u8; n_blocks * block_bytes];
-    for b in 0..n_blocks {
-        let start = b * group_size;
-        let end = (start + group_size).min(n);
+    quantize_mq4g256v2_impl(w, m, k, signs1, signs2, false)
+}
+
+/// MQ4V2 with a symmetric per-128 grid in the existing affine wire format.
+///
+/// The stored zero point is exactly `-8*d`, so code 8 reconstructs zero and
+/// shipped decoders remain byte-format compatible. The four scale candidates
+/// mirror the runtime A4 producer ladder, shifted to the 15-interval midpoint
+/// grid; selection includes fp16 round-trip error.
+pub(crate) fn quantize_mq4g256v2_symmetric(
+    w: &[f32],
+    m: usize,
+    k: usize,
+    signs1: &[f32],
+    signs2: &[f32],
+) -> Vec<u8> {
+    quantize_mq4g256v2_impl(w, m, k, signs1, signs2, true)
+}
+
+fn quantize_mq4g256v2_impl(
+    w: &[f32],
+    m: usize,
+    k: usize,
+    signs1: &[f32],
+    signs2: &[f32],
+    symmetric: bool,
+) -> Vec<u8> {
+    assert!(k % 256 == 0, "MQ4V2 requires K % 256 == 0, got K={k}");
+    assert_eq!(w.len(), m * k, "w.len() {} != m*k {}*{}={}", w.len(), m, k, m * k);
+    let group_count = w.len() / 256;
+    let mut output = vec![0u8; group_count * MQ4V2_GROUP_BYTES];
+    for group_index in 0..group_count {
         let mut group = [0.0f32; 256];
-        let actual_len = end - start;
-        group[..actual_len].copy_from_slice(&w[start..end]);
+        group.copy_from_slice(&w[group_index * 256..(group_index + 1) * 256]);
         cpu_fwht_256(&mut group, signs1, signs2);
+
         let mut scales = [0u16; 2];
         let mut zeros = [0u16; 2];
-        let mut sts = [0.0f32; 2];
-        let mut zs = [0.0f32; 2];
-        let mut degenerate = [false; 2];
-        for h in 0..2 {
-            let off = h * 128;
-            let slice = &group[off..off + 128];
-            let lo = slice.iter().cloned().fold(f32::INFINITY, f32::min);
-            let hi = slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let step_f32 = if hi > lo { (hi - lo) / 15.0 } else { 0.0 };
-            let sc_bits = f32_to_f16(step_f32);
-            let z_bits = f32_to_f16(lo);
-            let sc_bits = if hi == lo { 0u16 } else { sc_bits };
-            scales[h] = sc_bits;
-            zeros[h] = z_bits;
-            let st = f16_to_f32(sc_bits);
-            let z = f16_to_f32(z_bits);
-            sts[h] = st;
-            zs[h] = z;
-            degenerate[h] = hi == lo || step_f32 == 0.0 || st == 0.0;
-        }
-        let out_off = b * block_bytes;
-        output[out_off..out_off + 2].copy_from_slice(&scales[0].to_le_bytes());
-        output[out_off + 2..out_off + 4].copy_from_slice(&zeros[0].to_le_bytes());
-        output[out_off + 4..out_off + 6].copy_from_slice(&scales[1].to_le_bytes());
-        output[out_off + 6..out_off + 8].copy_from_slice(&zeros[1].to_le_bytes());
-        let mut q = [0u8; 256];
-        for h in 0..2 {
-            let off = h * 128;
-            if degenerate[h] {
+        let mut codes = [0u8; 256];
+        for half in 0..2 {
+            let offset = half * 128;
+            let values = &group[offset..offset + 128];
+            if symmetric {
+                let amax = values.iter().fold(0.0f32, |acc, &value| acc.max(value.abs()));
+                if amax == 0.0 {
+                    scales[half] = 0;
+                    zeros[half] = f32_to_f16(-0.0);
+                    codes[offset..offset + 128].fill(8);
+                    continue;
+                }
+
+                let candidate_base = (amax / 7.5) * 0.5;
+                let multipliers = [
+                    1.0f32,
+                    f32::from_bits(0x3fa4_9249),
+                    f32::from_bits(0x3fdb_6db7),
+                    2.0f32,
+                ];
+                let mut best_mse = f64::INFINITY;
+                for multiplier in multipliers {
+                    let scale_bits = f32_to_f16(candidate_base * multiplier);
+                    let scale = f16_to_f32(scale_bits);
+                    if scale == 0.0 {
+                        continue;
+                    }
+                    let zero_bits = f32_to_f16(-8.0 * scale);
+                    let zero = f16_to_f32(zero_bits);
+                    let inverse = 1.0 / scale;
+                    let mut mse = 0.0f64;
+                    for &value in values {
+                        let code = ((value - zero) * inverse + 0.5).floor().clamp(0.0, 15.0);
+                        let error = value - code.mul_add(scale, zero);
+                        mse += (error as f64) * (error as f64);
+                    }
+                    if mse < best_mse {
+                        best_mse = mse;
+                        scales[half] = scale_bits;
+                        zeros[half] = zero_bits;
+                    }
+                }
+                let scale = f16_to_f32(scales[half]);
+                let zero = f16_to_f32(zeros[half]);
+                let inverse = 1.0 / scale;
                 for i in 0..128 {
-                    q[off + i] = 0;
+                    codes[offset + i] =
+                        ((group[offset + i] - zero) * inverse + 0.5).floor().clamp(0.0, 15.0)
+                            as u8;
                 }
             } else {
-                let st = sts[h];
-                let z = zs[h];
-                let inv = 1.0 / st;
-                for i in 0..128 {
-                    let v = group[off + i];
-                    let qq = ((v - z) * inv + 0.5).floor().clamp(0.0, 15.0) as u8;
-                    q[off + i] = qq;
+                let lo = values.iter().copied().fold(f32::INFINITY, f32::min);
+                let hi = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let step_f32 = if hi > lo { (hi - lo) / 15.0 } else { 0.0 };
+                scales[half] = if hi == lo { 0 } else { f32_to_f16(step_f32) };
+                zeros[half] = f32_to_f16(lo);
+                let scale = f16_to_f32(scales[half]);
+                let zero = f16_to_f32(zeros[half]);
+                if hi != lo && step_f32 != 0.0 && scale != 0.0 {
+                    let inverse = 1.0 / scale;
+                    for i in 0..128 {
+                        codes[offset + i] =
+                            ((group[offset + i] - zero) * inverse + 0.5).floor().clamp(0.0, 15.0)
+                                as u8;
+                    }
                 }
             }
         }
-        for i in 0..128 {
-            let lo_q = q[2 * i];
-            let hi_q = q[2 * i + 1];
-            output[out_off + 8 + i] = (lo_q & 0xF) | ((hi_q & 0xF) << 4);
-        }
+        write_mq4g256v2_group(
+            &mut output[group_index * MQ4V2_GROUP_BYTES
+                ..(group_index + 1) * MQ4V2_GROUP_BYTES],
+            scales,
+            zeros,
+            &codes,
+        );
     }
     output
 }
+
+/// MQ4G128V2 encoder — row-local, per-128 asymmetric fp16 header.
+///
+/// Every logical row is tiled independently as `ceil(K / 128)` groups.  The
+/// final group in a row is zero-padded before the FWHT, so no row can consume
+/// its neighbour's values.  The wire group is exactly 68 bytes:
+/// `[0..2)` fp16 scale, `[2..4)` fp16 zero, `[4..68)` 64 low-even nibbles.
+pub(crate) fn quantize_mq4g128v2(
+    w: &[f32],
+    m: usize,
+    k: usize,
+    signs1: &[f32],
+    signs2: &[f32],
+) -> Result<Vec<u8>, String> {
+    const GROUP_SIZE: usize = 128;
+    if m == 0 || k == 0 {
+        return Err(format!(
+            "MQ4G128V2 requires nonzero dimensions, got M={m} K={k}"
+        ));
+    }
+    let expected_values = m
+        .checked_mul(k)
+        .ok_or_else(|| format!("MQ4G128V2 dimensions overflow: M={m} K={k}"))?;
+    if w.len() != expected_values {
+        return Err(format!(
+            "MQ4G128V2 source length {} != M*K {}*{}={expected_values}",
+            w.len(),
+            m,
+            k
+        ));
+    }
+    if signs1.len() != GROUP_SIZE || signs2.len() != GROUP_SIZE {
+        return Err(format!(
+            "MQ4G128V2 requires 128 signs per table, got {} and {}",
+            signs1.len(),
+            signs2.len()
+        ));
+    }
+    if signs1.iter().any(|value| !value.is_finite())
+        || signs2.iter().any(|value| !value.is_finite())
+    {
+        return Err("MQ4G128V2 signs contain non-finite values".to_string());
+    }
+    if w.iter().any(|value| !value.is_finite()) {
+        return Err("MQ4G128V2 source contains non-finite values".to_string());
+    }
+    let groups_per_row = k
+        .checked_add(GROUP_SIZE - 1)
+        .ok_or_else(|| format!("MQ4G128V2 K overflows group rounding: K={k}"))?
+        / GROUP_SIZE;
+    let total_groups = m
+        .checked_mul(groups_per_row)
+        .ok_or_else(|| "MQ4G128V2 group count overflows usize".to_string())?;
+    let output_len = total_groups
+        .checked_mul(MQ4G128V2_GROUP_BYTES)
+        .ok_or_else(|| "MQ4G128V2 output length overflows usize".to_string())?;
+    let mut output = vec![0u8; output_len];
+
+    for row in 0..m {
+        let row_start = row
+            .checked_mul(k)
+            .ok_or_else(|| format!("MQ4G128V2 row offset overflows at row {row}"))?;
+        for group_index in 0..groups_per_row {
+            let group_start = group_index
+                .checked_mul(GROUP_SIZE)
+                .ok_or_else(|| "MQ4G128V2 group offset overflows".to_string())?;
+            let actual = k.saturating_sub(group_start).min(GROUP_SIZE);
+            let mut group = [0.0f32; GROUP_SIZE];
+            if actual != 0 {
+                let source_start = row_start
+                    .checked_add(group_start)
+                    .ok_or_else(|| "MQ4G128V2 source offset overflows".to_string())?;
+                let source_end = source_start
+                    .checked_add(actual)
+                    .ok_or_else(|| "MQ4G128V2 source end overflows".to_string())?;
+                group[..actual].copy_from_slice(&w[source_start..source_end]);
+            }
+            cpu_fwht_128(&mut group, signs1, signs2);
+            if group.iter().any(|value| !value.is_finite()) {
+                return Err(format!(
+                    "MQ4G128V2 FWHT produced non-finite values at row {row}, group {group_index}"
+                ));
+            }
+            let lo = group.iter().copied().fold(f32::INFINITY, f32::min);
+            let hi = group.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let range = hi - lo;
+            if !range.is_finite() {
+                return Err(format!(
+                    "MQ4G128V2 range is non-finite at row {row}, group {group_index}"
+                ));
+            }
+            let step = if hi > lo { range / 15.0 } else { 0.0 };
+            if !step.is_finite() {
+                return Err(format!(
+                    "MQ4G128V2 scale is non-finite at row {row}, group {group_index}"
+                ));
+            }
+            let mut scale_bits = f32_to_f16(step);
+            let zero_bits = f32_to_f16(lo);
+            let mut scale = f16_to_f32(scale_bits);
+            let zero = f16_to_f32(zero_bits);
+            if !zero.is_finite() {
+                return Err(format!(
+                    "MQ4G128V2 zero is non-finite at row {row}, group {group_index}"
+                ));
+            }
+            // A constant group, or a step too small for fp16, has no usable
+            // affine scale.  Keep the finite fp16 zero and q=0 so decode is
+            // deterministic and does not divide by zero.
+            let degenerate = hi == lo || step == 0.0 || scale == 0.0;
+            if !degenerate && !scale.is_finite() {
+                return Err(format!(
+                    "MQ4G128V2 fp16 scale is non-finite at row {row}, group {group_index}"
+                ));
+            }
+            if degenerate {
+                scale_bits = 0;
+                scale = 0.0;
+            }
+            let out_group = row
+                .checked_mul(groups_per_row)
+                .and_then(|base| base.checked_add(group_index))
+                .and_then(|index| index.checked_mul(MQ4G128V2_GROUP_BYTES))
+                .ok_or_else(|| "MQ4G128V2 output offset overflows".to_string())?;
+            output[out_group..out_group + 2].copy_from_slice(&scale_bits.to_le_bytes());
+            output[out_group + 2..out_group + 4].copy_from_slice(&zero_bits.to_le_bytes());
+            if !degenerate {
+                let inv_scale = 1.0 / scale;
+                if !inv_scale.is_finite() {
+                    return Err(format!(
+                        "MQ4G128V2 inverse scale is non-finite at row {row}, group {group_index}"
+                    ));
+                }
+                for index in 0..GROUP_SIZE {
+                    let normalized = (group[index] - zero) * inv_scale;
+                    if !normalized.is_finite() {
+                        return Err(format!(
+                            "MQ4G128V2 quantization value is non-finite at row {row}, group {group_index}"
+                        ));
+                    }
+                    let quantized = (normalized + 0.5).floor().clamp(0.0, 15.0) as u8;
+                    let byte = out_group + 4 + index / 2;
+                    if index & 1 == 0 {
+                        output[byte] = quantized & 0x0f;
+                    } else {
+                        output[byte] |= (quantized & 0x0f) << 4;
+                    }
+                }
+            }
+        }
+    }
+    Ok(output)
+}
+
 /// MQ6G256V2 encoder — per-128 asymmetric fp16 header, neutral-size GEMM/GEMV.
 ///
 /// Layout per 256-weight group: `[0..2) fp16 s0,[2..4) fp16 z0,[4..6) fp16 s1,[6..8) fp16 z1,[8..200) 192B packed 6-bit`.
@@ -681,6 +1037,41 @@ mod tests {
     }
 
     #[test]
+    fn mq4g256v2_learned_code_export_is_byte_exact() {
+        let m = 2usize;
+        let k = 512usize;
+        let w: Vec<f32> = (0..m * k)
+            .map(|i| ((i as f32 * 0.03125).sin() * 3.0) + (i % 11) as f32)
+            .collect();
+        let s1 = gen_fwht_signs(42, 256);
+        let s2 = gen_fwht_signs(1042, 256);
+        let encoded = quantize_mq4g256v2(&w, m, k, &s1, &s2);
+        let mut headers = Vec::new();
+        let mut codes = Vec::new();
+        for block in encoded.chunks_exact(MQ4V2_GROUP_BYTES) {
+            headers.push([
+                u16::from_le_bytes([block[0], block[1]]),
+                u16::from_le_bytes([block[2], block[3]]),
+                u16::from_le_bytes([block[4], block[5]]),
+                u16::from_le_bytes([block[6], block[7]]),
+            ]);
+            for &packed in &block[8..] {
+                codes.push(packed & 0x0f);
+                codes.push(packed >> 4);
+            }
+        }
+        let repacked = pack_mq4g256v2_from_codes(m, k, &headers, &codes).unwrap();
+        assert_eq!(repacked, encoded);
+        let d_z_f16: Vec<u8> = headers
+            .iter()
+            .flat_map(|header| header.iter().flat_map(|bits| bits.to_le_bytes()))
+            .collect();
+        let repacked_from_grid =
+            pack_mq4g256v2_from_f16_grid(m, k, &d_z_f16, &codes).unwrap();
+        assert_eq!(repacked_from_grid, encoded);
+    }
+
+    #[test]
     fn mq4cg256_pad_layout_136() {
         let m = 2usize;
         let k = 512usize;
@@ -705,12 +1096,59 @@ mod tests {
     }
 
     #[test]
+    fn mq4g128v2_is_row_local_and_ceil_tiled() {
+        let m = 2usize;
+        let k = 129usize;
+        let signs1 = gen_fwht_signs(43, 128);
+        let signs2 = gen_fwht_signs(1043, 128);
+        let w: Vec<f32> = (0..m * k)
+            .map(|index| (index as f32 * 0.037).sin())
+            .collect();
+        let blob = quantize_mq4g128v2(&w, m, k, &signs1, &signs2).expect("encode");
+        assert_eq!(blob.len(), m * k.div_ceil(128) * MQ4G128V2_GROUP_BYTES);
+        assert_eq!(MQ4G128V2_GROUP_BYTES, 68);
+        // Encoding each row independently must produce the exact corresponding
+        // slices; a flat ceil over M*K would leak row 0's tail into row 1.
+        for row in 0..m {
+            let one = quantize_mq4g128v2(&w[row * k..(row + 1) * k], 1, k, &signs1, &signs2)
+                .expect("single-row encode");
+            let start = row * k.div_ceil(128) * MQ4G128V2_GROUP_BYTES;
+            assert_eq!(
+                &blob[start..start + one.len()],
+                one.as_slice(),
+                "row {row} was not encoded independently"
+            );
+        }
+        for group in blob.chunks_exact(MQ4G128V2_GROUP_BYTES) {
+            assert!(f16_to_f32(u16::from_le_bytes([group[0], group[1]])).is_finite());
+            assert!(f16_to_f32(u16::from_le_bytes([group[2], group[3]])).is_finite());
+        }
+    }
+
+    #[test]
+    fn mq4g128v2_rejects_invalid_inputs() {
+        let signs1 = gen_fwht_signs(43, 128);
+        let signs2 = gen_fwht_signs(1043, 128);
+        assert!(quantize_mq4g128v2(&[], 0, 128, &signs1, &signs2).is_err());
+        assert!(quantize_mq4g128v2(&[0.0; 128], 1, 128, &signs1[..127], &signs2).is_err());
+        assert!(quantize_mq4g128v2(&[0.0; 127], 1, 128, &signs1, &signs2).is_err());
+        let mut nonfinite = vec![0.0; 128];
+        nonfinite[17] = f32::NAN;
+        assert!(quantize_mq4g128v2(&nonfinite, 1, 128, &signs1, &signs2).is_err());
+    }
+
+    #[test]
     fn mq4_flags_map_to_quant_types() {
         // codec mapping reachability: labels map via QuantType and GgufFormat
         use crate::hfq::QuantType;
         use crate::pipeline_gguf::GgufFormat;
         assert_eq!(GgufFormat::from_flag("mq4"), Some(GgufFormat::Mq4V2));
         assert_eq!(GgufFormat::from_flag("mq4v2"), Some(GgufFormat::Mq4V2));
+        assert_eq!(
+            GgufFormat::from_flag("mq4v2-lloyd"),
+            Some(GgufFormat::Mq4V2Lloyd)
+        );
+        assert_eq!(GgufFormat::from_flag("mq4l"), Some(GgufFormat::Mq4V2Lloyd));
         assert_eq!(GgufFormat::from_flag("mq4c"), Some(GgufFormat::Mq4C));
         assert_eq!(GgufFormat::from_flag("mq4v1"), Some(GgufFormat::Mq4));
         assert_eq!(GgufFormat::from_flag("mq4g256v2"), Some(GgufFormat::Mq4V2));
@@ -738,9 +1176,15 @@ mod tests {
         // ternary), claimed 2026-08-22. This line previously pinned 51 as free.
         assert_eq!(QuantType::from_u8(51), Some(QuantType::MQ2G256LloydU));
         assert_eq!(QuantType::MQ2G256LloydU as u8, 51);
-        // unknown remains rejected — 46 and 52 are the next genuinely free ids
+        // 52 = MQ4G256V2L (MQ4v2 + per-tensor Lloyd codebook). Claimed with this PR.
+        assert_eq!(QuantType::from_u8(52), Some(QuantType::MQ4G256V2L));
+        assert_eq!(QuantType::MQ4G256V2L as u8, 52);
+        // 53 = MQ4G128V2 (Qwen4 G128 V2 rows). 54 is Qwen4 raw-I64 metadata,
+        // a non-weight record the Qwen4 quantizer writes directly.
+        assert_eq!(QuantType::from_u8(53), Some(QuantType::MQ4G128V2));
+        assert_eq!(QuantType::MQ4G128V2 as u8, 53);
+        // unknown remains rejected — 46 is the next genuinely free id
         assert_eq!(QuantType::from_u8(46), None);
-        assert_eq!(QuantType::from_u8(52), None);
         assert_eq!(QuantType::from_u8(255), None);
     }
 
@@ -751,7 +1195,7 @@ mod tests {
         // byte count: m*ceil(k/256)*B
         for (m, k, b) in [
             (1usize, 256usize, MQ6V2_GROUP_BYTES),
-            (2, 512, MQ6V2_GROUP_BYTES),
+            (2usize, 512usize, MQ6V2_GROUP_BYTES),
             (4, 1024, MQ6V2_GROUP_BYTES),
         ] {
             let w = vec![0.1f32; m * k];
@@ -818,6 +1262,95 @@ mod tests {
             let payload = &blob[base + 8..base + MQ5V2_GROUP_BYTES];
             assert_eq!(payload.len(), MQ5V2_GROUP_BYTES - 8);
             assert!(payload.iter().any(|&b| b != 0));
+        }
+    }
+    fn decode_mq4g128v2_dot_reference(
+        blob: &[u8],
+        row: usize,
+        k: usize,
+        x_rot: &[f32],
+    ) -> f32 {
+        assert_eq!(x_rot.len(), k);
+        let groups_per_row = k.div_ceil(128);
+        let row_stride = groups_per_row * MQ4G128V2_GROUP_BYTES;
+        let row_base = row * row_stride;
+        let mut acc = 0.0f32;
+        for group in 0..groups_per_row {
+            let base = row_base + group * MQ4G128V2_GROUP_BYTES;
+            let scale = f16_to_f32(u16::from_le_bytes([blob[base], blob[base + 1]]));
+            let zero = f16_to_f32(u16::from_le_bytes([blob[base + 2], blob[base + 3]]));
+            let logical = (k - group * 128).min(128);
+            for i in 0..logical {
+                let qbyte = blob[base + 4 + i / 2];
+                let q = if i & 1 == 0 {
+                    qbyte & 0x0f
+                } else {
+                    qbyte >> 4
+                };
+                acc += (scale * f32::from(q) + zero) * x_rot[group * 128 + i];
+            }
+        }
+        acc
+    }
+
+    #[test]
+    fn mq4g128v2_cpu_reference_covers_ragged_row_local_k() {
+        for &k in &[1usize, 127, 128, 129, 160, 320, 640] {
+            let m = 2usize;
+            let groups_per_row = k.div_ceil(128);
+            let row_stride = groups_per_row * MQ4G128V2_GROUP_BYTES;
+            let mut blob = vec![0u8; m * row_stride];
+            for row in 0..m {
+                for group in 0..groups_per_row {
+                    let base = row * row_stride + group * MQ4G128V2_GROUP_BYTES;
+                    blob[base..base + 2].copy_from_slice(&0x3c00u16.to_le_bytes());
+                    blob[base + 2..base + 4].copy_from_slice(&0u16.to_le_bytes());
+                    for i in 0..128 {
+                        let q = ((row * 5 + group * 3 + i) & 0x0f) as u8;
+                        let byte = &mut blob[base + 4 + i / 2];
+                        if i & 1 == 0 {
+                            *byte = q;
+                        } else {
+                            *byte |= q << 4;
+                        }
+                    }
+                }
+            }
+            let x_rot: Vec<f32> = (0..k).map(|i| 0.25 + i as f32 * 0.007).collect();
+            for row in 0..m {
+                let expected = (0..k)
+                    .map(|i| {
+                        let group = i / 128;
+                        let in_group = i & 127;
+                        let base = row * row_stride + group * MQ4G128V2_GROUP_BYTES;
+                        let qbyte = blob[base + 4 + in_group / 2];
+                        let q = if in_group & 1 == 0 {
+                            qbyte & 0x0f
+                        } else {
+                            qbyte >> 4
+                        };
+                        f32::from(q) * x_rot[i]
+                    })
+                    .sum::<f32>();
+                let actual = decode_mq4g128v2_dot_reference(&blob, row, k, &x_rot);
+                assert!(
+                    (actual - expected).abs() < 1e-5,
+                    "qt53 CPU reference mismatch at row={row}, K={k}: {actual} vs {expected}"
+                );
+            }
+
+            let weights: Vec<f32> = (0..m * k)
+                .map(|i| (i as f32 * 0.013).sin() - 0.2)
+                .collect();
+            let signs1 = gen_fwht_signs(43, 128);
+            let signs2 = gen_fwht_signs(1043, 128);
+            let encoded = quantize_mq4g128v2(&weights, m, k, &signs1, &signs2)
+                .expect("qt53 encoder accepts reference dimensions");
+            assert_eq!(
+                encoded.len(),
+                m * groups_per_row * MQ4G128V2_GROUP_BYTES,
+                "qt53 row extent at K={k}"
+            );
         }
     }
 }

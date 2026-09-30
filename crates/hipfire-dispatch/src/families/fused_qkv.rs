@@ -7,6 +7,22 @@ use crate::traits::KernelFamily;
 use crate::types::*;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
+/// Select the fused gate/up kernel key for a packed weight container.
+pub fn fused_gate_up_key_for(dtype: DType) -> KernelKey {
+    match dtype {
+        DType::MQ4G256V2 => KernelKey::FusedGateUpMq4G256V2,
+        DType::MQ4CG256 => KernelKey::FusedGateUpMq4CG256,
+        DType::MQ6G256V2 => KernelKey::FusedGateUpMq6G256V2,
+        DType::MQ5G256V2 => KernelKey::FusedGateUpMq5G256V2,
+        DType::MQ3G256V2 => KernelKey::FusedGateUpMq3G256V2,
+        DType::MQ2G256V2 => KernelKey::FusedGateUpMq2G256V2,
+        // qt=52 must NEVER alias a uniform fused key: no fused LUT kernel exists.
+        DType::MQ4G256V2Lloyd => panic!(
+            "fused_gate_up_key_for: MQ4G256V2Lloyd (qt=52) has no fused key — route Lloyd prefill through gemm_gate_up_hfq4g256_wmma_gfx12_mq4v2_fp8_lloyd"
+        ),
+        _ => KernelKey::FusedGateUpHfq4G256,
+    }
+}
 fn is_fused_hfq4_key(key: KernelKey) -> bool {
     matches!(
         key,
@@ -75,6 +91,21 @@ fn guard_fused_qkv_dtype_key(weights: &[&GpuTensor], key: KernelKey) -> Result<(
     let is_v2 = is_fused_v2_key(key);
     let is_mq4c = is_fused_mq4cg256_key(key);
     let is_mq4v2 = is_fused_mq4v2_key(key);
+    // qt=52 (Lloyd-V2): this family has no LUT ABI (fused kernels here decode
+    // the uniform grid only). Decode never routes through the family for these
+    // keys — `launch_fused` handles Fused*Mq4G256V2Lloyd first (steps.rs
+    // FusedQkv/Qkvza/GateUp Lloyd arms). Any Lloyd weight arriving here is a
+    // missing re-arm at the callsite: refuse, never silent-uniform.
+    for (idx, w) in weights.iter().enumerate() {
+        if w.dtype == DType::MQ4G256V2Lloyd {
+            return Err(DispatchError::Hip(format!(
+                "fused_qkv family: qt=52 (MQ4G256V2Lloyd) weight[{idx}] (dtype {:?}) routed to fused kernel key {key:?}: \
+                 no fused LUT kernel exists — decode must use per-projection LUT GEMVs \
+                 (gemv_mq4g256v2_lloyd / residual_lloyd) and prefill the FP8-LUT launchers (*_fp8_lloyd).",
+                w.dtype
+            )));
+        }
+    }
     for (idx, w) in weights.iter().enumerate() {
         let w_is_v2 = is_v2_dtype(w.dtype);
         let w_is_mq4v2 = w.dtype == DType::MQ4G256V2;

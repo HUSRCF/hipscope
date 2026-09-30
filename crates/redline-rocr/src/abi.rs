@@ -34,6 +34,8 @@ pub const AGENT_INFO_QUEUE_TYPE: u32 = 15;
 pub const AGENT_INFO_DEVICE: u32 = 17;
 pub const AMD_AGENT_INFO_BDFID: u32 = 0xA006;
 pub const AMD_AGENT_INFO_DOMAIN: u32 = 0xA00F;
+pub const AMD_AGENT_INFO_COMPUTE_UNIT_COUNT: u32 = 0xA002;
+pub const AMD_AGENT_INFO_COOPERATIVE_COMPUTE_UNIT_COUNT: u32 = 0xA014;
 pub const AMD_AGENT_INFO_TIMESTAMP_FREQUENCY: u32 = 0xA016;
 
 pub const PROFILE_BASE: u32 = 0;
@@ -75,6 +77,12 @@ pub const AMD_MEMORY_POOL_INFO_RUNTIME_ALLOC_GRANULE: u32 = 6;
 pub const AMD_MEMORY_POOL_INFO_RUNTIME_ALLOC_ALIGNMENT: u32 = 7;
 pub const AMD_MEMORY_POOL_STANDARD_FLAG: u32 = 0;
 pub const AMD_MEMORY_POOL_EXECUTABLE_FLAG: u32 = 1 << 2;
+/// `HSA_AMD_AGENT_MEMORY_POOL_INFO_ACCESS` (`hsa_amd_agent_memory_pool_info_t`).
+pub const AMD_AGENT_MEMORY_POOL_INFO_ACCESS: u32 = 0;
+/// `hsa_amd_memory_pool_access_t`.
+pub const AMD_MEMORY_POOL_ACCESS_NEVER_ALLOWED: u32 = 0;
+pub const AMD_MEMORY_POOL_ACCESS_ALLOWED_BY_DEFAULT: u32 = 1;
+pub const AMD_MEMORY_POOL_ACCESS_DISALLOWED_BY_DEFAULT: u32 = 2;
 
 pub const EXECUTABLE_SYMBOL_INFO_TYPE: u32 = 0;
 pub const SYMBOL_KIND_KERNEL: u32 = 1;
@@ -175,8 +183,9 @@ pub type QueueInactivateFn = unsafe extern "C" fn(*mut Queue) -> Status;
 pub type QueueLoadReadIndexRelaxedFn = unsafe extern "C" fn(*const Queue) -> u64;
 pub type QueueLoadReadIndexScAcquireFn = unsafe extern "C" fn(*const Queue) -> u64;
 pub type QueueLoadWriteIndexRelaxedFn = unsafe extern "C" fn(*const Queue) -> u64;
-pub type QueueAddWriteIndexRelaxedFn = unsafe extern "C" fn(*const Queue, u64) -> u64;
 pub type QueueCuSetMaskFn = unsafe extern "C" fn(*const Queue, u32, *const u32) -> Status;
+pub type QueueCuGetMaskFn = unsafe extern "C" fn(*const Queue, u32, *mut u32) -> Status;
+pub type QueueAddWriteIndexRelaxedFn = unsafe extern "C" fn(*const Queue, u64) -> u64;
 pub type ProfilingSetProfilerEnabledFn = unsafe extern "C" fn(*mut Queue, i32) -> Status;
 pub type ProfilingGetDispatchTimeFn =
     unsafe extern "C" fn(Agent, Signal, *mut ProfilingDispatchTime) -> Status;
@@ -187,6 +196,8 @@ pub type ProfilingGetAsyncCopyTimeFn =
 pub type AgentIterateMemoryPoolsFn =
     unsafe extern "C" fn(Agent, Option<MemoryPoolCallback>, *mut c_void) -> Status;
 pub type MemoryPoolGetInfoFn = unsafe extern "C" fn(MemoryPool, u32, *mut c_void) -> Status;
+pub type AgentMemoryPoolGetInfoFn =
+    unsafe extern "C" fn(Agent, MemoryPool, u32, *mut c_void) -> Status;
 pub type MemoryPoolAllocateFn =
     unsafe extern "C" fn(MemoryPool, usize, u32, *mut *mut c_void) -> Status;
 pub type MemoryPoolFreeFn = unsafe extern "C" fn(*mut c_void) -> Status;
@@ -262,12 +273,20 @@ pub struct Symbols {
     pub queue_load_write_index_relaxed: QueueLoadWriteIndexRelaxedFn,
     pub queue_add_write_index_relaxed: QueueAddWriteIndexRelaxedFn,
     pub queue_cu_set_mask: QueueCuSetMaskFn,
+    /// `hsa_amd_queue_cu_get_mask`, present on ROCm back to 7.14-era
+    /// runtimes. Optional so CU-affinity read-back degrades to the
+    /// post-set effective cache instead of breaking symbol loading on
+    /// older libraries; creation-time masking itself stays required.
+    pub queue_cu_get_mask: Option<QueueCuGetMaskFn>,
     pub profiling_set_profiler_enabled: ProfilingSetProfilerEnabledFn,
     pub profiling_get_dispatch_time: ProfilingGetDispatchTimeFn,
     pub profiling_async_copy_enable: Option<ProfilingAsyncCopyEnableFn>,
     pub profiling_get_async_copy_time: Option<ProfilingGetAsyncCopyTimeFn>,
     pub agent_iterate_memory_pools: AgentIterateMemoryPoolsFn,
     pub memory_pool_get_info: MemoryPoolGetInfoFn,
+    /// `hsa_amd_agent_memory_pool_get_info`; optional so its absence only
+    /// disables device-local retained kernargs (host-pool fallback).
+    pub agent_memory_pool_get_info: Option<AgentMemoryPoolGetInfoFn>,
     pub memory_pool_allocate: MemoryPoolAllocateFn,
     pub memory_pool_free: MemoryPoolFreeFn,
     pub agents_allow_access: AgentsAllowAccessFn,
@@ -367,6 +386,10 @@ impl Symbols {
                 QueueAddWriteIndexRelaxedFn
             ),
             queue_cu_set_mask: symbol!("hsa_amd_queue_cu_set_mask", QueueCuSetMaskFn),
+            queue_cu_get_mask: optional_symbol!(
+                "hsa_amd_queue_cu_get_mask",
+                QueueCuGetMaskFn
+            ),
             profiling_set_profiler_enabled: symbol!(
                 "hsa_amd_profiling_set_profiler_enabled",
                 ProfilingSetProfilerEnabledFn
@@ -388,6 +411,10 @@ impl Symbols {
                 AgentIterateMemoryPoolsFn
             ),
             memory_pool_get_info: symbol!("hsa_amd_memory_pool_get_info", MemoryPoolGetInfoFn),
+            agent_memory_pool_get_info: optional_symbol!(
+                "hsa_amd_agent_memory_pool_get_info",
+                AgentMemoryPoolGetInfoFn
+            ),
             memory_pool_allocate: symbol!("hsa_amd_memory_pool_allocate", MemoryPoolAllocateFn),
             memory_pool_free: symbol!("hsa_amd_memory_pool_free", MemoryPoolFreeFn),
             agents_allow_access: symbol!("hsa_amd_agents_allow_access", AgentsAllowAccessFn),

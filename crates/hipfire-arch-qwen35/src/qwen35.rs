@@ -24,7 +24,8 @@ pub use batch::{
 };
 pub use config::{
     apply_reap_plan, config_from_hfq, config_from_metadata_json, config_from_safetensors,
-    dense_tp_rank_layouts, local_dense_tp_config, validate_dense_tp, DenseTpRankLayout,
+    dense_tp_rank_layouts, local_dense_tp_config, offload_residency_report,
+    offload_topology_refusal, validate_dense_tp, DenseTpRankLayout,
     DflashFusionCtx, LayerType, MaskEmbedOverride, MropeCtx, Qwen35BatchCompatibility,
     Qwen35BatchLoadConfig, Qwen35BatchParallelism, Qwen35Config, Qwen35EpBatchReceipt,
     Qwen35EpReduce, Qwen35EpTopology, TreeVerifyCtx,
@@ -46,16 +47,17 @@ pub use load::{
     EpLoadStage, HfqSource, Layout, ParoSource, StagedLoadFault,
 };
 pub use prefill::{
-    forward_prefill_batch, forward_prefill_batch_capped,
+    forward_prefill_batch, forward_prefill_batch_capped, forward_prefill_batch_capture_hidden,
     forward_prefill_batch_single_chunk_captured, forward_prefill_batch_single_chunk_captured_opts,
     forward_prefill_batch_with_pbs, forward_prefill_batch_with_pbs_opts,
-    prefill_batch_pbs_eligible, prefill_max_batch, prefill_max_batch_ep, prefill_max_batch_tp,
-    qwen35_layer_batch_admissible, upload_prefill_batch_inputs, PREFILL_MAX_BATCH,
+    ordinary_prefill_chunk_limit, prefill_batch_pbs_eligible, prefill_max_batch,
+    prefill_max_batch_ep, prefill_max_batch_tp, qwen35_layer_batch_admissible,
+    upload_prefill_batch_inputs, PREFILL_MAX_BATCH,
 };
 pub(crate) use prefill::{
-    moe_ffn_batched_admissible, mq6_batched_admit_enabled_from_env, prefill_moe_ffn_body_batched,
-    q8_prefill_wmma_enabled, run_fused_gate_up_key, run_fused_qkv_key, run_fused_qkvza_key,
-    run_plain_gemm_key, run_residual_gemm_key,
+    moe_prefill_dtypes, prefill_moe_ffn_body_batched, q8_prefill_wmma_enabled,
+    run_fused_gate_up_key, run_fused_qkv_key, run_fused_qkvza_key, run_plain_gemm_key,
+    run_residual_gemm_key,
 };
 pub use weights::{
     mixed_expert_tag, DeltaNetLayerWeights, DeltaNetMoeLayerWeights, DeltaNetState, ExpertWeights,

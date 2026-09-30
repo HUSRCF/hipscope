@@ -19,7 +19,6 @@ max_total_tokens = 0
 [memory]
 # Replaces HIPFIRE_KV_MODE=q8.
 kv_cache = "q8"
-kv_backend = "contiguous"
 max_seq = 32768
 # Replaces HIPFIRE_PROMPT_CACHE_CAP=32.
 prompt_cache_capacity = 32
@@ -44,11 +43,16 @@ mtp_k = 3
 ngram = "off"
 
 [serve]
-host = "0.0.0.0"
+# Loopback by default: the serve surface has no authentication and advertises
+# a permissive HTTP API, so binding a LAN address must be an explicit choice.
+host = "127.0.0.1"
 port = 11435
 # Replaces HIPFIRE_IDLE_TIMEOUT=300.
 idle_timeout_seconds = 300
 local = false
 # Serve requests concurrently on the multi-slot engine instead of one at a
 # time. Off by default; the single-daemon path is unchanged when false.
+# Concurrent requests can produce different greedy text than serial requests
+# at >=4 slots; output is deterministic for a fixed batch composition. 2 slots
+# matched serial in testing.
 multi_slot = false

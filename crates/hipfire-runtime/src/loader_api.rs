@@ -57,10 +57,20 @@ impl ModelSource {
     }
 }
 
+/// Qwen's load-time sequence decision: capacity is filled from actual free
+/// VRAM after weights upload and before its VMM cache is constructed.
+#[derive(Clone, Copy)]
+pub struct SequenceHint {
+    pub model_ctx: usize,
+    pub automatic: bool,
+    pub card_cap: usize,
+}
+
 /// Everything a carrier's `load` needs beyond the source itself.
 pub struct LoadCtx<'a> {
     pub path: &'a str,
     pub max_seq: usize,
+    pub sequence: Option<SequenceHint>,
     /// DeepSeek V4-only physical compute placement. The default is `Single`;
     /// other carriers must ignore it.
     pub deepseek4_compute_placement: hipfire_config::Deepseek4ComputePlacement,
@@ -75,7 +85,22 @@ pub struct LoadCtx<'a> {
     /// loads against the trunk's `vision_config_from_hfq`. `None` = trunk-only
     /// (or text-only when the trunk has no tower either).
     pub vision_path: Option<PathBuf>,
+    /// Qwen MTP head sidecar (`.mtp`) resolved by the CLI (`params.mtp`):
+    /// models dir, then beside the path as typed, then beside the canonical
+    /// trunk. Read by `Qwen35Carrier` only, after the bundled trailer probe.
+    /// `None` = look beside the canonical trunk (`<trunk>.with_extension("mtp")`).
+    pub mtp_path: Option<PathBuf>,
+    /// Resolved `vision.mode` (`off`/`auto`/`on`). Gates `<stem>.vl` sibling
+    /// discovery in the carrier — `vision_path` alone cannot distinguish
+    /// "off" (never probe) from "auto with no explicit sidecar" (probe).
+    /// `off` suppresses discovery; `auto`/`on` allow it.
+    pub vision_mode: String,
     pub kv_mode_override: Option<&'a str>,
+    /// Authored Qwen-only K and V overrides. None preserves the selected whole-cache mode.
+    pub kv_k_override: Option<&'a str>,
+    pub kv_v_override: Option<&'a str>,
+    /// Sampled once per load from HIPFIRE_QWEN_KV_DEFAULT_Q8; never per token.
+    pub qwen_default_q8: bool,
     // NOTE: head overlays (`--head`) deliberately have NO LoadCtx field. They
     // validate and attach in `admit_source` before teardown, so the admitted
     // source the carrier consumes is already effective — threading a second
@@ -98,6 +123,14 @@ pub struct LoadCtx<'a> {
     /// load time via `gemma4_eagle_spec_len` (1..=5, default 3). Meaningful
     /// only when `gemma4_drafter_path` is `Some`.
     pub gemma4_draft_len: usize,
+    /// Opt-in gfx1151 XDNA NPU spillover sidecar, verified at load time
+    /// (`XdnaSidecarDescriptor::load_verified`) and admitted only when the
+    /// `kernel.npu_spillover` process flag is on AND the host arch is exactly
+    /// `gfx1151` (see `admit_for_arch`). `None` = GPU-only; carriers must not
+    /// open `/dev/accel`, allocate NPU mirrors, or change numerics when this
+    /// is `None`. Populated by the loader from the daemon `xdna` load param;
+    /// projected CLI-side by `load_params` from the registry `xdna` slot.
+    pub xdna: Option<hipfire_registry::XdnaSidecarDescriptor>,
 }
 
 /// Per-load model-free n-gram speculator settings, resolved by the CLI through
@@ -150,8 +183,15 @@ pub struct SpecLoadCfg {
     /// `Some(false)` = `off` (skip), `None` = `auto` (load when present,
     /// log-and-AR fallback otherwise).
     pub dflash: Option<bool>,
+    /// DFlash adaptive verify-block (`dflash_adaptive_b`, default false).
+    /// `None` = loader default (off: fixed block). Env `HIPFIRE_DFLASH_ADAPTIVE_B=0`
+    /// forces the fixed full block at build, mirroring
+    /// `HIPFIRE_DSPARK_ADAPTIVE_BLOCK=0`. Mutually exclusive with the
+    /// retained-PM4 verify route (which needs the fixed B=16 shape).
+    pub dflash_adaptive_b: Option<bool>,
 }
 
+// lifecycle: deprecated since 0.4.0, removal 0.5.0 — CASK/TriAttention KV eviction is unsupported research; use compact kv_cache modes
 /// CASK/TriAttention params forwarded by the CLI at load time.
 #[derive(Default)]
 pub struct CaskConfig {

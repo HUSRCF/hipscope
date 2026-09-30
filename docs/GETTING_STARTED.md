@@ -4,11 +4,16 @@ Audience: first install on an AMD GPU host. Goal: install → verify → pull a 
 
 ## Prerequisites
 
-- **Linux:** AMD GPU with `/dev/kfd` plus a ROCm HIP development stack.
-  hipfire JIT-compiles kernels, so a runtime-only install is insufficient: the
-  selected ROCm root must provide `lib/libamdhip64.so` (and
-  `libhsa-runtime64.so`), `include/hip/hip_runtime.h`, and `bin/hipcc`.
-  Install a supported AMD ROCm HIP runtime, development headers, and device
+- **Linux:** AMD GPU with `/dev/kfd` plus a ROCm HIP stack. A release-tag
+  install on an admitted GPU (gfx1201, gfx1100, gfx1151, gfx906, gfx942) can
+  use the tag's prebuilt [kernel pack](#prebuilt-kernel-packs) for the kernel
+  registry, and installs with only the HIP runtime (`lib/libamdhip64.so`,
+  `libhsa-runtime64.so`) and `bin/rocm_agent_enumerator`. Kernels outside the
+  registry still JIT on first use. On gfx1201 the registry covers Qwen3.8 H2
+  AR, MTP and DFlash `hipfire run` without a device compiler; other models and
+  routes can still JIT, so running models generally needs hipcc. The selected
+  ROCm root should therefore also provide `include/hip/hip_runtime.h` and
+  `bin/hipcc`. Install a supported AMD ROCm HIP runtime, development headers, and device
   compiler via
   [AMD's live install selector](https://rocm.docs.amd.com/en/latest/install/rocm.html)
   (choose packages for your GPU, OS, and ROCm version — package names drift;
@@ -76,11 +81,78 @@ Use `--tag v0.2.1` when the kind is known, or `--commit <full-sha>` for an
 immutable commit. Fetching a pinned script but omitting the selector installs
 `master`, so keep the two pins together.
 
-The installer detects GPU arch, ensures HIP and Rust build prerequisites, builds
-or copies the daemon, installs the native `hipfire` binary under
-`~/.hipfire/bin/`, and places kernels at
-`~/.hipfire/bin/kernels/compiled/<arch>/`. It can add that bin directory to
-`PATH`; reload the shell afterward if `hipfire` is not found.
+The installer detects GPU arch and ROCm and builds the daemon and native CLI.
+With `--tag` (or a tag-named `--ref`) on an admitted GPU it then installs the
+tag's [prebuilt kernel pack](#prebuilt-kernel-packs); otherwise, or when the
+pack cannot be used, it packages exact-source registry kernels with
+`hipfire-kernel-pack`'s shared compiler. Either way the result is
+`~/.hipfire/bin/kernels/compiled/<arch>/`, where each `.hsaco` requires a
+matching `.index.json`; re-run the installer after upgrading an older install.
+The bin directory can be added to `PATH`; reload the shell afterward.
+
+GPUs not in the admitted registry remain JIT-only and need hipcc at runtime;
+they cannot run with `HIPFIRE_NO_DEVICE_COMPILER=1`.
+
+### Prebuilt kernel packs
+
+Each release tag carries one pack per admitted architecture, built from the
+tag's exact commit by `scripts/build-kernel-pack.sh` (hipcc, no GPU):
+
+| Release asset | Contents |
+|---|---|
+| `hipfire-kernels-<tag>-<arch>.tar.gz` | `manifest.json` and `<arch>/` with every registry module's `.hsaco`, `.hash` and `.index.json` |
+| `hipfire-kernels-<tag>-<arch>.tar.gz.sha256` | `sha256sum` line for the tarball |
+| `hipfire-kernels-<tag>-<arch>.manifest.json` | copy of the manifest: commit, ROCm and HIP version, compiler identity, code-object version, admitted ROCm range |
+
+`install.sh --tag <tag>` (also `--ref <tag>` and `hipfire update --tag <tag>`)
+downloads the pack for the detected arch and installs it only when all of
+these hold; otherwise it says why and compiles locally with hipcc:
+
+- the tarball matches the published SHA-256, and holds only flat regular files;
+- the manifest names the same tag, arch and commit as the checkout, and the
+  runtime's kernel cache ABI;
+- the local ROCm version (`<root>/.info/version`) is inside the manifest's
+  range — by default the build's `major.minor` up to the next major release;
+- a local hipcc, if any, is the same build that compiled the pack (a different
+  one would make the runtime reject and recompile every kernel), and the
+  active hipfire config selects the same kernel flags;
+- every registry module's index matches the checked-out sources, recipe and
+  object bytes, and the directory holds nothing else.
+
+Pass `--compile-kernels` to skip the pack. `--kernel-pack-url` points at another
+directory or URL holding the assets (`https://…`, `file:///…`, or a plain
+path), for mirrors and offline installs:
+
+```bash
+bash install.sh --tag v0.4.0 --kernel-pack-url file:///srv/hipfire-packs/v0.4.0
+```
+
+`hipfire kernel-pack install --tag <tag> --arch <arch> --source ~/.hipfire/src`
+runs the same download and checks on an existing install, for example to
+restore kernels on a machine without hipcc.
+
+Maintainers: the tag-triggered `release-kernel-packs` workflow
+(`.github/workflows/release.yml`) builds every arch in a ROCm dev image and
+attaches the assets to the release. The default image,
+`rocm/dev-ubuntu-26.04:10.0.0-full`, carries the same ROCm 10.0.0 packages
+(HIP 7.15.26333) as the project's GPU hosts, so its packs admit ROCm
+[10.0, 11.0) and install on hosts with that hipcc. A pack only installs where
+the local hipcc, if any, is the build that compiled it; hosts on another ROCm
+compile locally. Repository variables choose another image
+(`HIPFIRE_ROCM_IMAGE`) and, optionally, a wider admitted range
+(`HIPFIRE_PACK_ROCM_MIN` and `HIPFIRE_PACK_ROCM_MAX_EXCLUSIVE`, set both). To
+publish from a local toolchain instead:
+
+```bash
+scripts/build-kernel-pack.sh --tag v0.4.0 --out dist            # every admitted arch
+scripts/build-kernel-pack.sh --tag v0.4.0 --out dist gfx1201    # or a subset
+gh release upload v0.4.0 dist/hipfire-kernels-v0.4.0-*
+```
+
+The script compiles `git archive` of the tag's commit with a fresh `HOME` and
+no `HIPFIRE_*` feature overrides, verifies every index against that toolchain,
+and writes byte-reproducible tarballs. `--rocm-min X.Y --rocm-max-exclusive X.Y`
+declares a range other than the default; it must contain the build's ROCm.
 
 ### Windows — select a branch, tag, or commit
 
@@ -109,17 +181,18 @@ The native `hipfire update` command remains Linux-only because Windows cannot
 atomically replace the running executable; re-run `install.ps1` with the
 desired selector instead.
 
-Uses a GitHub release `daemon.exe` when available; otherwise builds from source
-under `~\.hipfire\src`. The native CLI is built from the same checkout, and the
-installer runs `daemon.exe --precompile` into
-`~\.hipfire\bin\kernels\compiled\<arch>\`. To force a full kernel compile after install:
+Builds `daemon.exe` and the native CLI from the same selected source revision
+under `~\.hipfire\src`. With `-Tag` (or a tag-named `-Ref`) on an admitted GPU
+the installer runs `hipfire kernel-pack install` for the tag's
+[prebuilt kernel pack](#prebuilt-kernel-packs) (`-KernelPackUrl` overrides the
+download location, `-CompileKernels` skips it). Otherwise, or when the pack
+cannot be used, hipcc from the HIP SDK packages exact registry sources: the
+installer runs `daemon.exe --precompile` to produce indexed packages in
+`~\.hipfire\bin\kernels\compiled\<arch>\`. Re-run `install.ps1` after
+upgrading: copying bare `.hsaco` files is insufficient.
 
-```powershell
-cd ~\.hipfire\src
-.\scripts\compile-kernels.ps1 gfx1100   # or your arch
-# script writes to the checkout's kernels\compiled\<arch>\ — copy into the install cache (or re-run install.ps1):
-Copy-Item .\kernels\compiled\<arch>\* $env:USERPROFILE\.hipfire\bin\kernels\compiled\<arch>\ -Force
-```
+Unsupported GPU architectures likewise require hipcc JIT at runtime; the
+installer does not copy bare checkout objects into the installed cache.
 
 ### Source checkout
 
@@ -214,9 +287,9 @@ hipfire run qwen3.5:4b "..."   # reuses serve when healthy
 hipfire stop                   # graceful stop of the tracked daemon
 ```
 
-Defaults (overridable in config): bind **`0.0.0.0:11435`**, pre-warm **`default_model`** (`qwen3.5:9b` unless you set another). HTTP surface: [SERVE.md](SERVE.md). Subcommand flags: [CLI.md](CLI.md).
+Defaults (overridable in config): bind **`127.0.0.1:11435`** (loopback only), pre-warm **`default_model`** (`qwen3.5:9b` unless you set another). HTTP surface: [SERVE.md](SERVE.md). Subcommand flags: [CLI.md](CLI.md).
 
-> **No auth / no TLS:** the serve HTTP API has **neither authentication nor TLS**. The default `0.0.0.0` listens on all interfaces and exposes inference to any reachable network (including chat-spawned serves). For local-only use, bind loopback: `hipfire config set host 127.0.0.1` or `hipfire serve 127.0.0.1 11435`. Expose beyond localhost only on a trusted/firewalled network **or** behind an **authenticated TLS-terminating reverse proxy** you control — never publish the raw port to the internet.
+> **No auth / no TLS:** the serve HTTP API has **neither authentication nor TLS**. The default bind `127.0.0.1` accepts connections from this machine only. `hipfire config set host 0.0.0.0` (or `hipfire serve 0.0.0.0 11435`) listens on all interfaces and exposes inference to any reachable network (including chat-spawned serves). Expose beyond localhost only on a trusted/firewalled network **or** behind an **authenticated TLS-terminating reverse proxy** you control — never publish the raw port to the internet.
 
 Force a one-shot daemon and skip HTTP:
 
@@ -239,11 +312,11 @@ Defaults that matter on day one (from the native schema; full table in [CONFIG.m
 |---|---|---|
 | `temperature` | `0.3` | Stored global default only for run/serve send (see above); Chat session seed |
 | `max_tokens` | `4096` | Per-request generation cap for `run` / API fallback |
-| `kv_cache` | `auto` | Resolves via registry `default_kv_mode`, else `q8` |
+| `kv_cache` | `auto` | Resolves via a registry non-q8 `default_kv_mode`, else the architecture default: Qwen native `fp8` on eligible exact gfx1201, `q8` on gfx1100 / gfx1151 and elsewhere. `fwht3` is an optional headroom mode |
 | `dflash_mode` | **`off`** | DFlash is opt-in; pulling a draft does not enable it |
 | `speculation` | `auto` | Mechanism selector; DFlash stays off when `dflash_mode=off`, but eligible **MTP / DSpark** paths may still activate under `auto`. Use `speculation=off` to force plain AR. |
 | `thinking` | `on` | Reasoning models may emit `<think>`; display strip is CLI/API-side |
-| `host` / `port` | `0.0.0.0` / `11435` | Serve bind (no auth, no TLS) |
+| `host` / `port` | `127.0.0.1` / `11435` | Serve bind (no auth, no TLS) |
 
 Enable draft-model speculation only when you intend to:
 
@@ -260,20 +333,17 @@ another installed target still declares it (see [CLI.md](CLI.md)).
 
 ## Long context (optional)
 
-CASK/TriAttention eviction is experimental and disabled by default. It is
-**not** required for short prompts. When deliberately testing it for long
-context on limited VRAM:
-
-1. Prefer models whose `pull` ships a `.triattn.bin` sidecar, **or** generate one: `hipfire sidecar-gen <model>`.
-2. Set `cask_sidecar` to that exact path. Enable `cask` separately only when m-folding is intended.
-3. Read constraints (A3B, DFlash + m-fold) in [CONFIG.md](CONFIG.md) before enabling on MoE or with DFlash. `cask_auto_attach` remains `false` unless explicitly opted in.
+Long context needs no extra setup beyond `max_seq` and VRAM; for KV headroom
+pick a compact `kv_cache` mode (see [CONFIG.md](CONFIG.md)). CASK/TriAttention
+eviction is deprecated and will be removed in 0.5.0 — off by default, not
+supported, and not a recommended route to long context.
 
 ### Measured capacity (Qwen3.5/3.6 35B-A3B-class, 24GB)
 
 On 24GB GPUs, Q8 KV is about 10,880 B/token across 10 full-attention layers,
 plus O(N) flash partials (~2,064 B/token), ~25 MiB DeltaNet state, and multi-GiB
 fixed HIP/graph overhead. **50K Q8 is tight but physically feasible**; **200K Q8
-is not a 24GB-class configuration** — it needs >32GB-class VRAM or CASK/compressed
+is not a 24GB-class configuration** — it needs >32GB-class VRAM or compressed
 KV. Some historical 131K sidecar benches clamped physical capacity to ~2432
 tokens and should not be read as full-context Q8 support. Long-context decode
 slowdown is expected O(N) full-attention bandwidth, not by itself an admission
@@ -303,6 +373,6 @@ tail -f ~/.hipfire/serve.log
 | [CHAT.md](CHAT.md) | Interactive chat, thinking display, daemon attach |
 | [SERVE.md](SERVE.md) | OpenAI-compatible HTTP |
 | [MODELS.md](MODELS.md) | Tags, VRAM, BYO quantize, thinking/templates |
-| [CONFIG.md](CONFIG.md) | All config keys and experimental CASK/TriAttention opt-ins |
+| [CONFIG.md](CONFIG.md) | All config keys |
 | [QUANTIZE.md](QUANTIZE.md) | `hipfire quantize` operator guide |
 | [INDEX.md](INDEX.md) | Ownership map for the rest of `docs/` |

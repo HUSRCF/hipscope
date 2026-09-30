@@ -7,6 +7,8 @@
 
 use hip_bridge::HipResult;
 use radiowave::{CodeObjectCertification, ExistingCodeObjectRequest, SchedulerProfile};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
@@ -90,6 +92,44 @@ fn pair_valid(hsaco: &Path, hash: &Path, src_hash: &str) -> bool {
         let stored = std::fs::read_to_string(hash).unwrap_or_default();
         stored.trim() == src_hash
     }
+}
+
+const PACK_INDEX_VERSION: u32 = 1;
+
+/// One object per module; the index authenticates the bytes and records the
+/// producing compiler separately from the portable lookup key.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PackIndex {
+    version: u32,
+    module: String,
+    symbols: Vec<String>,
+    arch: String,
+    source_sha256: String,
+    flags: Vec<String>,
+    scheduler_profile: String,
+    cache_abi: u32,
+    packaging_key: String,
+    object_sha256: String,
+    toolchain_id: String,
+    toolchain_sha256: String,
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn valid_identifier(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompileRecipe {
+    pub arch: String,
+    pub flags: Vec<String>,
+    pub scheduler_profile: Option<String>,
+    pub cache_abi: u32,
 }
 
 /// Transactionally publish a blob+hash pair into `dest_dir`.
@@ -201,22 +241,15 @@ fn publish_blob_only(dest_dir: &Path, name: &str, src_blob: &Path) -> Result<(),
     Ok(())
 }
 
-/// Copy a validated hot `.hsaco` into the persistent cold install dir, then
-/// publish the matching `.hash` only after the blob is published.
-///
-/// When `force` is false, a cold pair that is already valid for `src_hash` is
-/// left alone. When `force` is true (post-recompile after a driver-rejected
-/// image), the cold pair is replaced even if its hash already matched.
-///
-/// Optional: never fails the caller. Never copies a path onto itself.
-/// Unwritable cold dirs only warn — hot runtime remains valid.
-fn writeback_cold(name: &str, obj_path: &Path, src_hash: &str, cold: &Path, force: bool) {
-    if let Err(e) = publish_pair(cold, name, obj_path, src_hash, force) {
-        eprintln!(
-            "  WARNING: {name}: cold writeback failed ({e}); \
-             runtime blob remains valid in the hot cache"
-        );
-    }
+fn publish_index(dir: &Path, index: &PackIndex) -> Result<(), String> {
+    let path = dir.join(format!("{}.index.json", index.module));
+    let temp = dir.join(format!(".{}.{}.index.tmp", index.module, unique_token()));
+    let bytes = serde_json::to_vec_pretty(index).map_err(|e| e.to_string())?;
+    std::fs::write(&temp, bytes).map_err(|e| e.to_string())?;
+    std::fs::rename(&temp, &path).map_err(|e| {
+        let _ = std::fs::remove_file(&temp);
+        e.to_string()
+    })
 }
 
 /// Seed hot from cold using **complete kernel pairs**, never independent
@@ -248,6 +281,11 @@ fn seed_hot_from_cold(cold: &Path, hot: &Path) -> std::io::Result<()> {
             Some(s) if !s.is_empty() && !s.starts_with('.') => s,
             _ => continue,
         };
+        // Index-managed objects must be checked at their original path: a
+        // seed of only the pair would discard object SHA and toolchain identity.
+        if cold.join(format!("{stem}.index.json")).exists() {
+            continue;
+        }
 
         let cold_hash_path = cold.join(format!("{stem}.hash"));
         let hot_hsaco = hot.join(format!("{stem}.hsaco"));
@@ -287,7 +325,33 @@ fn seed_hot_from_cold(cold: &Path, hot: &Path) -> std::io::Result<()> {
 /// Cache-key version. Bump when the kernel ABI or hipcc invocation changes in a
 /// way that makes previously-cached `.hsaco` blobs incompatible, to force a clean
 /// recompile instead of loading a stale "invalid device image".
-const KERNEL_CACHE_ABI: u32 = 3;
+///
+/// 5: `core_hipcc_flags` gained `-fuse-cuid=none`, so objects built under 4
+/// carry a path-derived `__hip_cuid_*` symbol that current builds do not.
+pub const KERNEL_CACHE_ABI: u32 = 5;
+
+/// Leading hipcc flags of every runtime JIT and packaged compile. The argv and
+/// the recipe recorded in pack indexes both come from here, so they cannot drift.
+///
+/// - `--no-offload-compress`: clang ≥19 compresses offload bundles by default.
+///   HIP's loader accepts the compressed container; the public HSA reader
+///   Redline uses does not, so a CCOB blob demotes every retained route to
+///   plain HIP.
+/// - `-fuse-cuid=none`: without it hipcc emits a `__hip_cuid_<md5>` symbol named
+///   after the input path and the full argv. JIT inputs and outputs live under
+///   the cache root with unique temp names, so two compiles of the same source
+///   and recipe produced different bytes with identical code. With it, the
+///   bytes depend only on the source, the recipe and the toolchain and headers
+///   the compile resolves.
+fn core_hipcc_flags(arch: &str) -> Vec<String> {
+    vec![
+        "--genco".to_owned(),
+        format!("--offload-arch={arch}"),
+        "-O3".to_owned(),
+        "--no-offload-compress".to_owned(),
+        "-fuse-cuid=none".to_owned(),
+    ]
+}
 
 /// Compiles HIP kernel sources to code objects, with caching.
 ///
@@ -334,7 +398,88 @@ pub struct KernelCompiler {
     sched_profile_override: Option<SchedulerProfile>,
 }
 
+/// Resolved device compiler and its identity, probed once per process use.
+struct DeviceCompilerProbe {
+    /// Resolved device-compiler binary. Bare "hipcc" when PATH provides it;
+    /// otherwise an absolute path discovered under a resolved ROCm root.
+    hipcc_bin: PathBuf,
+    /// ROCM_PATH handed to the spawned compiler so it can find its own LLVM.
+    rocm_env_root: Option<PathBuf>,
+    has_hipcc: bool,
+    /// `hipcc --version` first line; empty when no compiler ran.
+    toolchain_id: String,
+    /// `HIPFIRE_NO_DEVICE_COMPILER` forced the compiler absent.
+    disabled: bool,
+}
+
+fn probe_device_compiler() -> DeviceCompilerProbe {
+    // Probe for hipcc once at init, not per-kernel. Capture its version line
+    // as a toolchain fingerprint for the cache hash (Fix #1).
+    //
+    // Resolve hipcc through the same selected ROCm root as the runtime and
+    // headers. Probing a bare PATH hipcc first could pair a configured
+    // ROCM_PATH from one version with another version's compiler.
+    let resolved_hipcc = hipfire_config::rocm::tool("hipcc");
+    let hipcc_bin = resolved_hipcc
+        .clone()
+        .unwrap_or_else(|| std::path::PathBuf::from("hipcc"));
+    // hipcc resolves its LLVM as $ROCM_PATH/lib/llvm/bin/clang++ and
+    // ROCM_PATH defaults to /opt/rocm. On a root elsewhere the probe below
+    // still succeeds while every real compile fails, so hand the child the
+    // selected compiler's installation root unless the operator already
+    // set one that matches.
+    let rocm_env_root = hipfire_config::rocm::compiler_env_root(&hipcc_bin);
+
+    // HIPFIRE_NO_DEVICE_COMPILER=1 makes the engine behave as if no device
+    // compiler exists, so pre-compiled blobs are used verbatim instead of
+    // being recompiled locally.
+    //
+    // This has to be an explicit switch. It used to be achievable by
+    // removing the compiler from PATH, because the probe was a bare
+    // `Command::new("hipcc")`. Resolved-root discovery (added so a ROCm
+    // rooted outside /opt/rocm still works) finds the compiler regardless
+    // of PATH, which silently defeated PATH-shadowing and made
+    // "pin these exact code objects" quietly recompile instead. Verified:
+    // a pinned cross-machine run reported 0 recompiles while actually
+    // executing locally-built blobs.
+    let disabled = hipfire_config::developer_var_os("HIPFIRE_NO_DEVICE_COMPILER")
+        .is_some_and(|v| v != "0" && !v.is_empty());
+
+    let hipcc_out = if disabled || resolved_hipcc.is_none() {
+        None
+    } else {
+        let mut probe = Command::new(&hipcc_bin);
+        probe.arg("--version");
+        if let Some(root) = &rocm_env_root {
+            probe.env("ROCM_PATH", root);
+        }
+        probe.output().ok()
+    };
+    let has_hipcc = hipcc_out
+        .as_ref()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    let toolchain_id = hipcc_out
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_string()
+        })
+        .unwrap_or_default();
+    DeviceCompilerProbe { hipcc_bin, rocm_env_root, has_hipcc, toolchain_id, disabled }
+}
+
 impl KernelCompiler {
+    /// The toolchain identity a runtime on this machine checks pack indexes
+    /// against, or `None` when no device compiler resolves (then any recorded
+    /// toolchain is accepted and packaged objects load verbatim).
+    pub fn local_toolchain_id() -> Option<String> {
+        Some(probe_device_compiler().toolchain_id).filter(|id| !id.is_empty())
+    }
+
     pub fn new(arch: &str, extra_flags: String) -> HipResult<Self> {
         // Hot JIT cache defaults to the shared `$HOME/.hipfire_kernels` root
         // (overridable via `HIPFIRE_KERNEL_CACHE`), so parallel worktrees and
@@ -417,68 +562,14 @@ impl KernelCompiler {
         }
         let precompiled_dir = effective_precompiled;
 
-        // Probe for hipcc once at init, not per-kernel. Capture its version line
-        // as a toolchain fingerprint for the cache hash (Fix #1).
-        //
-        // Resolve hipcc through the same selected ROCm root as the runtime and
-        // headers. Probing a bare PATH hipcc first could pair a configured
-        // ROCM_PATH from one version with another version's compiler.
-        let resolved_hipcc = hipfire_config::rocm::tool("hipcc");
-        let hipcc_bin = resolved_hipcc
-            .clone()
-            .unwrap_or_else(|| std::path::PathBuf::from("hipcc"));
-        // hipcc resolves its LLVM as $ROCM_PATH/lib/llvm/bin/clang++ and
-        // ROCM_PATH defaults to /opt/rocm. On a root elsewhere the probe below
-        // still succeeds while every real compile fails, so hand the child the
-        // selected compiler's installation root unless the operator already
-        // set one that matches.
-        let rocm_env_root = hipfire_config::rocm::compiler_env_root(&hipcc_bin);
-
-        // HIPFIRE_NO_DEVICE_COMPILER=1 makes the engine behave as if no device
-        // compiler exists, so pre-compiled blobs are used verbatim instead of
-        // being recompiled locally.
-        //
-        // This has to be an explicit switch. It used to be achievable by
-        // removing the compiler from PATH, because the probe was a bare
-        // `Command::new("hipcc")`. Resolved-root discovery (added so a ROCm
-        // rooted outside /opt/rocm still works) finds the compiler regardless
-        // of PATH, which silently defeated PATH-shadowing and made
-        // "pin these exact code objects" quietly recompile instead. Verified:
-        // a pinned cross-machine run reported 0 recompiles while actually
-        // executing locally-built blobs.
-        let compiler_disabled = hipfire_config::developer_var_os("HIPFIRE_NO_DEVICE_COMPILER")
-            .is_some_and(|v| v != "0" && !v.is_empty());
-
-        let hipcc_out = if compiler_disabled {
+        let probe = probe_device_compiler();
+        if probe.disabled {
             eprintln!(
                 "  HIPFIRE_NO_DEVICE_COMPILER set — treating the device compiler as absent; \
                  pre-compiled blobs will be used verbatim"
             );
-            None
-        } else if resolved_hipcc.is_none() {
-            None
-        } else {
-            let mut probe = Command::new(&hipcc_bin);
-            probe.arg("--version");
-            if let Some(ref root) = rocm_env_root {
-                probe.env("ROCM_PATH", root);
-            }
-            probe.output().ok()
-        };
-        let has_hipcc = hipcc_out
-            .as_ref()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-        let toolchain_id = hipcc_out
-            .map(|o| {
-                String::from_utf8_lossy(&o.stdout)
-                    .lines()
-                    .next()
-                    .unwrap_or("")
-                    .trim()
-                    .to_string()
-            })
-            .unwrap_or_default();
+        }
+        let DeviceCompilerProbe { hipcc_bin, rocm_env_root, has_hipcc, toolchain_id, .. } = probe;
 
         let gfx1151_cumode_modules = if arch == "gfx1151" {
             hipfire_config::developer_var("HIPFIRE_GFX1151_CUMODE_MODULES")
@@ -540,9 +631,28 @@ impl KernelCompiler {
         name: &str,
         gfx1151_cumode_modules: &HashSet<String>,
     ) -> Vec<String> {
-        // Radiowave-selected spill-free RM2/BV6 schedule.
-        if arch == "gfx1100" && name == "gemm_hfq4g256_residual_wmma_gfx1100_muse_rm_bt" {
-            vec!["-mllvm".to_owned(), "-misched=gcn-iterative-ilp".to_owned()]
+        if matches!(arch, "gfx1100" | "gfx1151" | "gfx1201")
+            && matches!(
+                name,
+                "gdn_chunk_prep"
+                    | "gdn_chunk_prep_fixup"
+                    | "gdn_chunk_kkt_solve"
+                    | "gdn_chunk_kkt_solve_batched"
+                    | "gdn_chunk_scan"
+                    | "gdn_chunk_scan_emu_bf16"
+                    | "gdn_chunk_scan_emu_f16"
+                    | "gdn_chunk_scan_bf16"
+                    | "gdn_chunk_scan_bf16_mseg"
+                    | "gdn_chunk_scan_gfx1151"
+                    | "gdn_chunk_prep_gfx11"
+                    | "gdn_chunk_kkt_solve_gfx1100"
+            )
+        {
+            let mut flags = vec!["-ffp-contract=off".to_owned()];
+            if arch == "gfx1201" && name.starts_with("gdn_chunk_scan") {
+                flags.push("-mcumode".to_owned());
+            }
+            flags
         } else if arch == "gfx1151" && gfx1151_cumode_modules.contains(name) {
             vec!["-mcumode".to_owned()]
         } else {
@@ -551,41 +661,32 @@ impl KernelCompiler {
     }
 
     fn module_flags(&self, name: &str) -> Vec<String> {
-        let mut flags = Self::module_flags_for(&self.arch, name, &self.gfx1151_cumode_modules);
-        let profile = self.scheduler_profile_for(name);
+        Self::module_flags_with_profile(
+            &self.arch,
+            name,
+            &self.gfx1151_cumode_modules,
+            self.scheduler_profile_for(name),
+        )
+    }
+
+    fn module_flags_with_profile(
+        arch: &str,
+        name: &str,
+        gfx1151_cumode_modules: &HashSet<String>,
+        profile: SchedulerProfile,
+    ) -> Vec<String> {
+        let mut flags = Self::module_flags_for(arch, name, gfx1151_cumode_modules);
         flags.extend(profile.llvm_args().iter().map(|flag| flag.to_string()));
         flags
     }
 
-    /// Select the scheduler profile for a kernel. The per-kernel table is the
-    /// primary source; `HIPFIRE_SCHED_PROFILE` overrides everything when set.
-    ///
-    /// **The table is deliberately empty.** A kernel was
-    /// briefly mapped to `MemoryClause` on the strength of static counters
-    /// (r4 VGPR 120 -> 109, max consecutive VMEM 10 -> 16, zero spills, and
-    /// strictly better than every ILP profile). Measured device-side with HIP
-    /// events on gfx1201 that produced **no benefit** — multirow medians over
-    /// three runs were 22.32 / 22.88 / 23.56 us under `memory-clause` against
-    /// 22.32 / 22.56 / 22.56 us under `default`, overlapping at the fast end
-    /// and differing by less than the run-to-run spread.
-    ///
-    /// Better static counters are not a performance result. A non-default
-    /// compile policy with no measured win is carried complexity, so the
-    /// selection was withdrawn and the boring baseline kept. The mechanism
-    /// stays, and is worth keeping: the manifest now reports the real profile
-    /// instead of a hardcoded `Default`, the profile participates in the cache
-    /// hash so changing it cannot silently reuse a stale object, and
-    /// `HIPFIRE_SCHED_PROFILE` makes a sweep cheap.
-    ///
-    /// If you add an entry here, gate it on a device-side measurement, not on
-    /// VGPR or clause counts. Note also that `IterativeIlp` spills 138 VGPRs on
-    /// the GL multirow kernel and must never be selected for it.
+    /// Select the profile registered for this module; the developer-only
+    /// `HIPFIRE_SCHED_PROFILE` overrides it for whole-run experiments.
     fn scheduler_profile_for(&self, name: &str) -> SchedulerProfile {
         if let Some(profile) = self.sched_profile_override {
             return profile;
         }
-        let _ = name;
-        SchedulerProfile::Default
+        crate::kernels::scheduler_profile_for_module(&self.arch, name)
     }
 
     /// Single hashing sequence for all kernel cache keys. Every caller must
@@ -598,6 +699,10 @@ impl KernelCompiler {
         module_flags: &[String],
         toolchain_id: &str,
         scheduler_profile: SchedulerProfile,
+        arm: &str,
+        builder_version: &str,
+        kernel_id_variant: &str,
+        assembler_identity: &str,
     ) -> String {
         let mut hasher = DefaultHasher::new();
         source.hash(&mut hasher);
@@ -609,8 +714,27 @@ impl KernelCompiler {
         }
         toolchain_id.hash(&mut hasher);
         scheduler_profile.as_str().hash(&mut hasher);
+        arm.hash(&mut hasher);
+        builder_version.hash(&mut hasher);
+        kernel_id_variant.hash(&mut hasher);
+        assembler_identity.hash(&mut hasher);
         KERNEL_CACHE_ABI.hash(&mut hasher);
         format!("{:016x}", hasher.finish())
+    }
+
+    /// Distinct identity for a builder-authored object. This computes the key
+    /// only; custom `.hxaco` publication is owned by the later admission path.
+    pub fn custom_isa_hash_for(
+        source: &str,
+        arch: &str,
+        builder_version: &str,
+        kernel_id_variant: &str,
+        assembler_identity: &str,
+    ) -> String {
+        Self::hash_parts(
+            source, arch, "", &[], "", SchedulerProfile::Default,
+            "custom-isa", builder_version, kernel_id_variant, assembler_identity,
+        )
     }
 
     fn cache_hash(&self, name: &str, source: &str) -> String {
@@ -621,6 +745,10 @@ impl KernelCompiler {
             &self.module_flags(name),
             &self.toolchain_id,
             self.scheduler_profile_for(name),
+            "hipcc",
+            "",
+            "",
+            "",
         )
     }
 
@@ -642,6 +770,10 @@ impl KernelCompiler {
             &self.module_flags(name),
             "",
             self.scheduler_profile_for(name),
+            "hipcc",
+            "",
+            "",
+            "",
         )
     }
 
@@ -660,11 +792,17 @@ impl KernelCompiler {
         } else {
             HashSet::new()
         };
-        let module_flags = Self::module_flags_for(arch, name, &gfx1151_cumode_modules);
         let sched_profile_override = hipfire_config::developer_var("HIPFIRE_SCHED_PROFILE")
             .ok()
             .and_then(|value| SchedulerProfile::parse(&value));
-        let scheduler_profile = sched_profile_override.unwrap_or(SchedulerProfile::Default);
+        let scheduler_profile = sched_profile_override
+            .unwrap_or_else(|| crate::kernels::scheduler_profile_for_module(arch, name));
+        let module_flags = Self::module_flags_with_profile(
+            arch,
+            name,
+            &gfx1151_cumode_modules,
+            scheduler_profile,
+        );
         Self::hash_parts(
             source,
             arch,
@@ -672,7 +810,236 @@ impl KernelCompiler {
             &module_flags,
             "",
             scheduler_profile,
+            "hipcc",
+            "",
+            "",
+            "",
         )
+    }
+
+    /// Portable compile recipe. Source-specific flags are added by
+    /// `recipe_for_source`; neither path requires hipcc or a GPU.
+    pub fn recipe_for(arch: &str, module: &str, extra_flags: &[String]) -> CompileRecipe {
+        let selected = if arch == "gfx1151" {
+            hipfire_config::developer_var("HIPFIRE_GFX1151_CUMODE_MODULES")
+                .unwrap_or_default()
+                .split(|c: char| c == ',' || c == ';' || c.is_whitespace())
+                .filter(|name| !name.is_empty())
+                .map(str::to_owned)
+                .collect()
+        } else {
+            HashSet::new()
+        };
+        let profile = hipfire_config::developer_var("HIPFIRE_SCHED_PROFILE")
+            .ok()
+            .and_then(|value| SchedulerProfile::parse(&value))
+            .unwrap_or_else(|| crate::kernels::scheduler_profile_for_module(arch, module));
+        let mut flags = core_hipcc_flags(arch);
+        flags.extend(extra_flags.iter().cloned());
+        flags.extend(Self::module_flags_with_profile(arch, module, &selected, profile));
+        CompileRecipe {
+            arch: arch.to_owned(),
+            flags,
+            scheduler_profile: Some(profile.as_str().to_owned()),
+            cache_abi: KERNEL_CACHE_ABI,
+        }
+    }
+
+    pub fn recipe_for_source(
+        arch: &str,
+        module: &str,
+        source: &str,
+        extra_flags: &str,
+    ) -> CompileRecipe {
+        let extra = extra_flags.split_whitespace().map(str::to_owned).collect::<Vec<_>>();
+        let mut recipe = Self::recipe_for(arch, module, &extra);
+        recipe.flags.extend(Self::per_kernel_flags(source));
+        recipe
+    }
+
+    pub fn packaging_flags_for(
+        arch: &str,
+        module: &str,
+        source: &str,
+        extra_flags: &str,
+    ) -> Vec<String> {
+        Self::recipe_for_source(arch, module, source, extra_flags).flags
+    }
+
+    fn pack_index(
+        &self,
+        module: &str,
+        source: &str,
+        symbols: Vec<String>,
+        object: &Path,
+    ) -> Result<PackIndex, String> {
+        if !valid_identifier(module) || symbols.is_empty() || !symbols.iter().all(|s| valid_identifier(s)) {
+            return Err(format!("invalid module/symbol for package: {module}"));
+        }
+        if self.toolchain_id.is_empty() {
+            return Err(format!("{module}: missing hipcc toolchain identity"));
+        }
+        let object_sha256 = sha256_hex(&std::fs::read(object).map_err(|e| e.to_string())?);
+        let recipe = Self::recipe_for_source(&self.arch, module, source, &self.extra_flags);
+        Ok(PackIndex {
+            version: PACK_INDEX_VERSION,
+            module: module.to_owned(),
+            symbols,
+            arch: self.arch.clone(),
+            source_sha256: sha256_hex(source.as_bytes()),
+            flags: recipe.flags,
+            scheduler_profile: recipe.scheduler_profile.unwrap_or_default(),
+            cache_abi: KERNEL_CACHE_ABI,
+            packaging_key: self.packaging_hash(module, source),
+            object_sha256,
+            toolchain_id: self.toolchain_id.clone(),
+            toolchain_sha256: sha256_hex(self.toolchain_id.as_bytes()),
+        })
+    }
+
+    fn indexed_object(
+        &self,
+        dir: &Path,
+        module: &str,
+        source: &str,
+        symbol: &str,
+    ) -> Result<Option<PathBuf>, String> {
+        Self::check_indexed_object(
+            dir,
+            &self.arch,
+            module,
+            source,
+            &[symbol],
+            &self.extra_flags,
+            &self.packaging_hash(module, source),
+            &self.toolchain_id,
+        )
+        .map(|found| found.map(|(object, _)| object))
+    }
+
+    /// Check one installed indexed object against the recipe this build
+    /// computes for `source`. The runtime lookup and whole-pack installer
+    /// verification both go through here, so they cannot disagree about what a
+    /// valid object is. Returns the object path and its recorded toolchain.
+    ///
+    /// `local_toolchain_id` is the resolved device compiler's identity; empty
+    /// means no compiler, which accepts any recorded toolchain. A present
+    /// compiler with a different identity rejects the object so it is rebuilt.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn check_indexed_object(
+        dir: &Path,
+        arch: &str,
+        module: &str,
+        source: &str,
+        symbols: &[&str],
+        extra_flags: &str,
+        packaging_key: &str,
+        local_toolchain_id: &str,
+    ) -> Result<Option<(PathBuf, String)>, String> {
+        let index_path = dir.join(format!("{module}.index.json"));
+        if !index_path.exists() {
+            if dir.join(format!("{module}.hsaco")).exists() {
+                return Err(format!("{}: index missing for installed object", index_path.display()));
+            }
+            return Ok(None);
+        }
+        let fail = |reason: &str| format!("{}: {reason}", index_path.display());
+        let bytes = std::fs::read(&index_path).map_err(|e| fail(&e.to_string()))?;
+        let index: PackIndex = serde_json::from_slice(&bytes).map_err(|e| fail(&e.to_string()))?;
+        let recipe = Self::recipe_for_source(arch, module, source, extra_flags);
+        if index.version != PACK_INDEX_VERSION
+            || index.module != module
+            || index.arch != arch
+            || !symbols.iter().all(|symbol| index.symbols.iter().any(|entry| entry == symbol))
+            || index.source_sha256 != sha256_hex(source.as_bytes())
+            || index.flags != recipe.flags
+            || index.scheduler_profile != recipe.scheduler_profile.unwrap_or_default()
+            || index.cache_abi != KERNEL_CACHE_ABI
+            || index.packaging_key != packaging_key
+            || index.toolchain_id.is_empty()
+            || index.toolchain_sha256 != sha256_hex(index.toolchain_id.as_bytes())
+            || (!local_toolchain_id.is_empty() && index.toolchain_id != local_toolchain_id)
+        {
+            return Err(fail("index identity, symbol, source, flags, profile, ABI or toolchain mismatch"));
+        }
+        let object = dir.join(format!("{module}.hsaco"));
+        if !pair_valid(&object, &dir.join(format!("{module}.hash")), &index.packaging_key) {
+            return Err(fail("object/hash pair missing or stale"));
+        }
+        let bytes = std::fs::read(&object).map_err(|e| fail(&e.to_string()))?;
+        if sha256_hex(&bytes) != index.object_sha256 {
+            return Err(fail("object SHA-256 mismatch"));
+        }
+        Ok(Some((object, index.toolchain_id)))
+    }
+
+    fn writeback_package(&self, module: &str, source: &str, symbol: &str, object: &Path, force: bool) {
+        let Some(dir) = self.writeback_dir() else { return };
+        let key = self.packaging_hash(module, source);
+        let index_path = dir.join(format!("{module}.index.json"));
+        let cold_object = dir.join(format!("{module}.hsaco"));
+        let cold_hash = dir.join(format!("{module}.hash"));
+        let mut index = match self.pack_index(module, source, vec![symbol.to_owned()], object) {
+            Ok(index) => index,
+            Err(error) => {
+                eprintln!("  WARNING: {module}: cold index unavailable ({error})");
+                return;
+            }
+        };
+        let existing = std::fs::read(&index_path).ok()
+            .and_then(|bytes| serde_json::from_slice::<PackIndex>(&bytes).ok());
+        let same_bytes = existing.as_ref().is_some_and(|prior| {
+            prior.version == index.version
+                && prior.module == index.module
+                && prior.arch == index.arch
+                && prior.source_sha256 == index.source_sha256
+                && prior.flags == index.flags
+                && prior.scheduler_profile == index.scheduler_profile
+                && prior.cache_abi == index.cache_abi
+                && prior.packaging_key == index.packaging_key
+                && prior.object_sha256 == index.object_sha256
+                && prior.toolchain_id == index.toolchain_id
+                && prior.toolchain_sha256 == index.toolchain_sha256
+        });
+        if same_bytes && pair_valid(&cold_object, &cold_hash, &key) {
+            index.symbols.extend(existing.unwrap().symbols.into_iter().filter(|s| s != symbol));
+            // Even if the old index says its digest matches, check the actual
+            // cold bytes; a corrupted blob must be repaired from the hot object.
+            if std::fs::read(&cold_object)
+                .ok()
+                .is_some_and(|bytes| sha256_hex(&bytes) == index.object_sha256)
+                && !force
+            {
+                if let Err(error) = publish_index(dir, &index) {
+                    eprintln!("  WARNING: {module}: cold index writeback failed ({error})");
+                }
+                return;
+            }
+        }
+        let _ = std::fs::remove_file(&index_path);
+        if let Err(error) = publish_pair(dir, module, object, &key, true) {
+            eprintln!("  WARNING: {module}: cold writeback failed ({error})");
+            return;
+        }
+        if let Err(error) = publish_index(dir, &index) {
+            eprintln!("  WARNING: {module}: cold index writeback failed ({error})");
+        }
+    }
+
+    /// Build or retrieve one object, publishing a verified install package.
+    pub fn pack_to(&mut self, module: &str, source: &str, symbols: &[String], dir: &Path) -> HipResult<PathBuf> {
+        if symbols.is_empty() || !self.has_hipcc {
+            return Err(self.compiler_unavailable_error(module, "packaging requires hipcc and at least one symbol"));
+        }
+        std::fs::create_dir_all(dir).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+        let object = self.compile_for_symbol(module, source, &symbols[0])?.to_path_buf();
+        let index = self.pack_index(module, source, symbols.to_vec(), &object)
+            .map_err(|e| hip_bridge::HipError::new(0, &e))?;
+        let _ = std::fs::remove_file(dir.join(format!("{module}.index.json")));
+        publish_pair(dir, module, &object, &index.packaging_key, true)
+            .and_then(|_| publish_index(dir, &index))
+            .map_err(|e| hip_bridge::HipError::new(0, &e))?;
+        Ok(dir.join(format!("{module}.hsaco")))
     }
 
     /// Persistent install dir for writeback. None when no cold location was
@@ -690,6 +1057,24 @@ impl KernelCompiler {
         hip_bridge::HipError::new(
             0,
             &format!("{name}: {action}, but hipcc is unavailable.\n{guidance}"),
+        )
+    }
+
+    fn unverified_object_error(
+        &self,
+        name: &str,
+        expected_key: &str,
+        found: &Path,
+    ) -> hip_bridge::HipError {
+        self.compiler_unavailable_error(
+            name,
+            &format!(
+                "unverified kernel image for arch {}: expected key {expected_key} for {} \
+                 (missing or mismatched .hash, or empty/non-file object); \
+                 reinstall kernels with matching .hash sidecars or install hipcc to recompile",
+                self.arch,
+                found.display()
+            ),
         )
     }
 
@@ -711,7 +1096,9 @@ impl KernelCompiler {
             .ok()
             .zip(std::fs::read_to_string(&manifest).ok())
             .is_some_and(|(code, encoded)| {
-                CodeObjectCertification::from_json(&code, &encoded).is_ok()
+                CodeObjectCertification::from_json(&code, &encoded).is_ok_and(|certification| {
+                    certification.manifest().scheduler_profile == self.scheduler_profile_for(name)
+                })
             });
         if already_valid {
             return;
@@ -740,8 +1127,30 @@ impl KernelCompiler {
     /// Compile a HIP kernel source string. Returns path to .hsaco file.
     /// Tries pre-compiled blob first (with hash validation), falls back to hipcc.
     pub fn compile(&mut self, name: &str, source: &str) -> HipResult<&Path> {
-        if self.compiled.contains_key(name) {
-            return Ok(&self.compiled[name]);
+        self.compile_for_symbol(name, source, name)
+    }
+
+    /// Check the exact exported symbol before a packaged object reaches HIP.
+    pub fn compile_for_symbol(&mut self, name: &str, source: &str, symbol: &str) -> HipResult<&Path> {
+        if !valid_identifier(name) || !valid_identifier(symbol) {
+            return Err(hip_bridge::HipError::new(0, "invalid kernel module or symbol"));
+        }
+        if let Some(dir) = &self.cold_dir {
+            match self.indexed_object(dir, name, source, symbol) {
+                Ok(Some(object)) => {
+                    eprintln!("  {name}: indexed package verified: {}", object.display());
+                    self.compiled.insert(name.to_owned(), object);
+                    return Ok(&self.compiled[name]);
+                }
+                Ok(None) => {}
+                Err(error) if !self.has_hipcc => {
+                    return Err(hip_bridge::HipError::new(0, &format!(
+                        "{name} {}: packaged object rejected ({error}); reinstall kernels or install hipcc",
+                        self.arch
+                    )));
+                }
+                Err(error) => eprintln!("  {name}: packaged object rejected ({error}); falling back to JIT"),
+            }
         }
 
         // Hash source + arch + flags + toolchain + ABI for cache validation (used by
@@ -751,35 +1160,19 @@ impl KernelCompiler {
         let module_flags = self.module_flags(name);
         let src_hash = self.cache_hash(name, source);
 
-        // Try pre-compiled .hsaco first. A hit requires a nonempty regular blob;
-        // matching hash certifies it. Hashless/mismatched nonempty blobs may be
-        // used only when hipcc is unavailable (packaged install), with warning.
-        // See: https://github.com/warpfront/hipfire/issues/2
+        // Only a nonempty object with a matching sidecar can be selected.
+        // Keep the rejected path for a useful compiler-free error, but try
+        // content-keyed hot and validated legacy entries before failing.
+        let mut unverified_object = None;
+        let mut stale_precompiled = false;
         if let Some(dir) = &self.precompiled_dir {
             let precompiled = dir.join(format!("{name}.hsaco"));
-            let hash_file = dir.join(format!("{name}.hash"));
-            if pair_valid(&precompiled, &hash_file, &src_hash) {
-                // Validated pair still refreshes a distinct cold install dir when
-                // that pair is missing, empty, or stale.
-                if let Some(cold) = self.writeback_dir().map(Path::to_path_buf) {
-                    writeback_cold(name, &precompiled, &src_hash, &cold, false);
+            if precompiled.exists() {
+                if nonempty_blob(&precompiled) {
+                    // A content-keyed hot entry may still hit below.
+                    stale_precompiled = true;
                 }
-                self.ensure_radiowave_certification(name, &precompiled);
-                self.compiled.insert(name.to_string(), precompiled);
-                return Ok(&self.compiled[name]);
-            }
-            if nonempty_blob(&precompiled) {
-                if !self.has_hipcc {
-                    eprintln!(
-                        "  WARNING: {name}: using UNVALIDATED pre-compiled blob (hipcc unavailable)"
-                    );
-                    eprintln!(
-                        "           Output may be incorrect. Install ROCm SDK or rebuild blobs with matching hashes."
-                    );
-                    self.compiled.insert(name.to_string(), precompiled);
-                    return Ok(&self.compiled[name]);
-                }
-                eprintln!("  {name}: pre-compiled blob has no hash file, recompiling");
+                unverified_object = Some(precompiled);
             }
         }
 
@@ -790,9 +1183,7 @@ impl KernelCompiler {
         let obj_path = self.cache_dir.join(hot_object_name(name, &src_hash));
 
         if nonempty_blob(&obj_path) {
-            if let Some(dir) = self.writeback_dir() {
-                writeback_cold(name, &obj_path, &src_hash, dir, false);
-            }
+            self.writeback_package(name, source, symbol, &obj_path, false);
             self.ensure_radiowave_certification(name, &obj_path);
             self.compiled.insert(name.to_string(), obj_path);
             return Ok(&self.compiled[name]);
@@ -812,33 +1203,25 @@ impl KernelCompiler {
             } else {
                 legacy_obj
             };
-            if let Some(dir) = self.writeback_dir() {
-                writeback_cold(name, &hit_path, &src_hash, dir, false);
-            }
+            self.writeback_package(name, source, symbol, &hit_path, false);
             self.ensure_radiowave_certification(name, &hit_path);
             self.compiled.insert(name.to_string(), hit_path);
             return Ok(&self.compiled[name]);
         }
 
         if !self.has_hipcc {
-            // Content-keyed hits returned above, so only a legacy unvalidated
-            // blob can still be usable on packaged installs (same warning as
-            // the precompiled path).
-            if nonempty_blob(&legacy_obj) {
-                eprintln!(
-                    "  WARNING: {name}: using UNVALIDATED pre-compiled blob (hipcc unavailable)"
-                );
-                eprintln!(
-                    "           Output may be incorrect. Install ROCm SDK or rebuild blobs with matching hashes."
-                );
-                self.compiled.insert(name.to_string(), legacy_obj);
-                return Ok(&self.compiled[name]);
+            if unverified_object.is_none() && legacy_obj.exists() {
+                unverified_object = Some(legacy_obj);
             }
-            return Err(
-                self.compiler_unavailable_error(name, "no usable cached kernel image exists")
-            );
+            return Err(match unverified_object {
+                Some(found) => self.unverified_object_error(name, &src_hash, &found),
+                None => self.compiler_unavailable_error(name, "no usable cached kernel image exists"),
+            });
         }
 
+        if stale_precompiled {
+            eprintln!("  {name}: pre-compiled blob hash is stale and no cached build matches; recompiling");
+        }
         Self::hipcc_compile_publish(
             &self.hipcc_bin,
             self.rocm_env_root.as_deref(),
@@ -852,13 +1235,9 @@ impl KernelCompiler {
         )?;
         self.ensure_radiowave_certification(name, &obj_path);
 
-        // Ensure cold install dir has valid hash + blob (writeback from hot).
-        // Must target cold_dir, not the lookup view: when hot is preferred for
-        // lookup, precompiled_dir == cache_dir and writing there would leave
-        // the persistent install stale. Failures warn only (see writeback_cold).
-        if let Some(dir) = self.writeback_dir() {
-            writeback_cold(name, &obj_path, &src_hash, dir, false);
-        }
+        // Hot keys keep the toolchain ID; cold pairs use the packaging key
+        // with toolchain identity bound in the checked index.
+        self.writeback_package(name, source, symbol, &obj_path, false);
 
         self.compiled.insert(name.to_string(), obj_path);
         Ok(&self.compiled[name])
@@ -870,7 +1249,7 @@ impl KernelCompiler {
     /// dirs are aliased). Bypasses all lookup and invokes transactional hipcc
     /// publication directly. Cold is force-synced only after success. A failed
     /// hipcc leaves prior durable pairs intact.
-    pub(crate) fn recompile(&mut self, name: &str, source: &str) -> HipResult<PathBuf> {
+    pub(crate) fn recompile(&mut self, name: &str, source: &str, symbol: &str) -> HipResult<PathBuf> {
         if !self.has_hipcc {
             return Err(self.compiler_unavailable_error(
                 name,
@@ -897,10 +1276,8 @@ impl KernelCompiler {
         )?;
         self.ensure_radiowave_certification(name, &obj_path);
 
-        // Force-sync distinct cold only after a successful fresh hot compile.
-        if let Some(dir) = self.writeback_dir().map(Path::to_path_buf) {
-            writeback_cold(name, &obj_path, &src_hash, &dir, true);
-        }
+        // Force-sync only after the new object is complete.
+        self.writeback_package(name, source, symbol, &obj_path, true);
 
         self.compiled.insert(name.to_string(), obj_path.clone());
         Ok(obj_path)
@@ -992,22 +1369,14 @@ impl KernelCompiler {
         Self::rocm_root_flags_with(root, Self::win_short_path_if_needed)
     }
 
-    /// Core hipcc argv: genco/arch/O3, then passthrough, then -o out src.
+    /// Core hipcc argv: `core_hipcc_flags`, then passthrough, then -o out src.
     fn direct_hipcc_args(
         arch: &str,
         src_path: &Path,
         obj_path: &Path,
         passthrough: Vec<String>,
     ) -> Vec<String> {
-        // clang ≥19 compresses offload bundles by default. HIP's loader accepts the
-        // compressed container; the public HSA reader Redline uses does not, so a
-        // CCOB blob demotes every retained route to plain HIP.
-        let mut args: Vec<String> = vec![
-            "--genco".into(),
-            format!("--offload-arch={arch}"),
-            "-O3".into(),
-            "--no-offload-compress".into(),
-        ];
+        let mut args = core_hipcc_flags(arch);
         args.extend(passthrough);
         args.push("-o".into());
         args.push(obj_path.to_str().unwrap().into());
@@ -1235,41 +1604,45 @@ impl KernelCompiler {
     /// Compile multiple kernels in parallel. Returns paths to .hsaco files.
     /// Kernels already compiled or cached are skipped.
     pub fn compile_batch(&mut self, kernels: &[(&str, &str)]) -> HipResult<()> {
-        // Partition into already-done vs needs-work
-        let mut to_compile: Vec<(String, String, String, Vec<String>)> = Vec::new();
+        let with_symbols = kernels.iter().map(|&(name, source)| (name, source, name)).collect::<Vec<_>>();
+        self.compile_batch_for_symbols(&with_symbols)
+    }
 
-        for &(name, source) in kernels {
-            if self.compiled.contains_key(name) {
-                continue;
+    /// Preserve parallel JIT builds while validating the symbol for packaged hits.
+    pub fn compile_batch_for_symbols(&mut self, kernels: &[(&str, &str, &str)]) -> HipResult<()> {
+        let mut to_compile: Vec<(String, String, String, String, Vec<String>)> = Vec::new();
+
+        for &(name, source, symbol) in kernels {
+            if !valid_identifier(name) || !valid_identifier(symbol) {
+                return Err(hip_bridge::HipError::new(0, "invalid kernel module or symbol"));
+            }
+            if let Some(dir) = &self.cold_dir {
+                match self.indexed_object(dir, name, source, symbol) {
+                    Ok(Some(object)) => {
+                        eprintln!("  {name}: indexed package verified: {}", object.display());
+                        self.compiled.insert(name.to_owned(), object);
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(error) if !self.has_hipcc => {
+                        return Err(hip_bridge::HipError::new(0, &format!(
+                            "{name} {}: packaged object rejected ({error}); reinstall kernels or install hipcc",
+                            self.arch
+                        )));
+                    }
+                    Err(error) => eprintln!("  {name}: packaged object rejected ({error}); falling back to JIT"),
+                }
             }
 
             let module_flags = self.module_flags(name);
             let src_hash = self.cache_hash(name, source);
+            let mut unverified_object = None;
 
             // Check precompiled with valid pair (nonempty blob + matching hash).
             if let Some(dir) = &self.precompiled_dir {
                 let precompiled = dir.join(format!("{name}.hsaco"));
-                let hash_file = dir.join(format!("{name}.hash"));
-                if pair_valid(&precompiled, &hash_file, &src_hash) {
-                    // Same opportunistic cold sync as compile(): a hot hit must
-                    // not skip writeback when the install dir is still stale.
-                    if let Some(cold) = self.writeback_dir().map(Path::to_path_buf) {
-                        writeback_cold(name, &precompiled, &src_hash, &cold, false);
-                    }
-                    self.compiled.insert(name.to_string(), precompiled);
-                    continue;
-                }
-                if nonempty_blob(&precompiled) && !self.has_hipcc {
-                    // Mirror compile()'s two-line warning so a later compile()
-                    // short-circuit via `compiled` cannot suppress it.
-                    eprintln!(
-                        "  WARNING: {name}: using UNVALIDATED pre-compiled blob (hipcc unavailable)"
-                    );
-                    eprintln!(
-                        "           Output may be incorrect. Install ROCm SDK or rebuild blobs with matching hashes."
-                    );
-                    self.compiled.insert(name.to_string(), precompiled);
-                    continue;
+                if precompiled.exists() {
+                    unverified_object = Some(precompiled);
                 }
             }
 
@@ -1279,9 +1652,7 @@ impl KernelCompiler {
             let obj_path = self.cache_dir.join(hot_object_name(name, &src_hash));
 
             if nonempty_blob(&obj_path) {
-                if let Some(dir) = self.writeback_dir() {
-                    writeback_cold(name, &obj_path, &src_hash, dir, false);
-                }
+                self.writeback_package(name, source, symbol, &obj_path, false);
                 self.compiled.insert(name.to_string(), obj_path);
                 continue;
             }
@@ -1295,30 +1666,22 @@ impl KernelCompiler {
                     } else {
                         legacy_obj
                     };
-                if let Some(dir) = self.writeback_dir() {
-                    writeback_cold(name, &hit_path, &src_hash, dir, false);
-                }
+                self.writeback_package(name, source, symbol, &hit_path, false);
                 self.compiled.insert(name.to_string(), hit_path);
                 continue;
             }
 
             if !self.has_hipcc {
-                if nonempty_blob(&legacy_obj) {
-                    eprintln!(
-                        "  WARNING: {name}: using UNVALIDATED pre-compiled blob (hipcc unavailable)"
-                    );
-                    eprintln!(
-                        "           Output may be incorrect. Install ROCm SDK or rebuild blobs with matching hashes."
-                    );
-                    self.compiled.insert(name.to_string(), legacy_obj);
-                    continue;
+                if unverified_object.is_none() && legacy_obj.exists() {
+                    unverified_object = Some(legacy_obj);
                 }
-                return Err(
-                    self.compiler_unavailable_error(name, "no usable cached kernel image exists")
-                );
+                return Err(match unverified_object {
+                    Some(found) => self.unverified_object_error(name, &src_hash, &found),
+                    None => self.compiler_unavailable_error(name, "no usable cached kernel image exists"),
+                });
             }
 
-            to_compile.push((name.to_string(), source.to_string(), src_hash, module_flags));
+            to_compile.push((name.to_string(), source.to_string(), symbol.to_string(), src_hash, module_flags));
         }
 
         if to_compile.is_empty() {
@@ -1329,7 +1692,7 @@ impl KernelCompiler {
         eprintln!("  compiling {n} kernels in parallel...");
         let arch = self.arch.clone();
         let cache_dir = self.cache_dir.clone();
-        let writeback_dir = self.writeback_dir().map(|p| p.to_path_buf());
+        // Writeback happens on the joining thread after each successful build.
         let hipcc_bin = self.hipcc_bin.clone();
         let rocm_env_root = self.rocm_env_root.clone();
 
@@ -1341,10 +1704,9 @@ impl KernelCompiler {
         // Spawn hipcc in parallel threads — each uses transactional publication.
         let results: Vec<_> = to_compile
             .into_iter()
-            .map(|(name, source, src_hash, module_flags)| {
+            .map(|(name, source, symbol, src_hash, module_flags)| {
                 let arch = arch.clone();
                 let cache_dir = cache_dir.clone();
-                let writeback_dir = writeback_dir.clone();
                 let hipcc_bin = hipcc_bin.clone();
                 let rocm_env_root = rocm_env_root.clone();
                 let extra_flags = self.extra_flags.clone();
@@ -1361,18 +1723,12 @@ impl KernelCompiler {
                         &extra_flags,
                         &module_flags,
                     );
-                    if result.is_ok() {
-                        let obj_path = cache_dir.join(hot_object_name(&name, &src_hash));
-                        // Write back to cold install dir (blob before hash).
-                        if let Some(dir) = &writeback_dir {
-                            writeback_cold(&name, &obj_path, &src_hash, dir, false);
-                        }
-                    }
+
                     let i = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                     let marker = if result.is_ok() { "✓" } else { "✗" };
                     eprintln!("  [{i:>3}/{n}] {marker} {name}");
                     let obj_path = cache_dir.join(hot_object_name(&name, &src_hash));
-                    (name, obj_path, result)
+                    (name, source, symbol, obj_path, result)
                 });
                 handle
             })
@@ -1380,9 +1736,10 @@ impl KernelCompiler {
 
         let mut errors = Vec::new();
         for handle in results {
-            let (name, obj_path, result) = handle.join().unwrap();
+            let (name, source, symbol, obj_path, result) = handle.join().unwrap();
             match result {
                 Ok(()) => {
+                    self.writeback_package(&name, &source, &symbol, &obj_path, false);
                     self.compiled.insert(name, obj_path);
                 }
                 Err(e) => errors.push(e),
@@ -1419,8 +1776,19 @@ mod tests {
     }
 
     #[test]
-    fn cache_abi_invalidates_pre_radiowave_compiler_entries() {
-        assert_eq!(KERNEL_CACHE_ABI, 3);
+    fn custom_arm_cache_key_cannot_alias_hipcc() {
+        let baseline = KernelCompiler::hash_parts(
+            "source", "gfx1201", "", &[], "llvm", SchedulerProfile::Default,
+            "hipcc", "", "", "",
+        );
+        let custom = KernelCompiler::custom_isa_hash_for(
+            "source", "gfx1201", "0.1.0", "iu4_k1:cacc2=0", "llvm-mc 23",
+        );
+        assert_ne!(baseline, custom);
+        let other_variant = KernelCompiler::custom_isa_hash_for(
+            "source", "gfx1201", "0.1.0", "iu4_k1:cacc2=1", "llvm-mc 23",
+        );
+        assert_ne!(custom, other_variant);
     }
 
     #[test]
@@ -1497,163 +1865,9 @@ mod tests {
     }
 
     #[test]
-    fn writeback_cold_skips_self_copy_and_missing_src() {
-        // No real dirs required: missing src → warn path, no panic.
-        // Self-path equality short-circuits before copy.
-        let missing = Path::new("/nonexistent/hipfire_writeback_test/kernel.hsaco");
-        let cold = Path::new("/nonexistent/hipfire_writeback_test_cold");
-        writeback_cold("kernel", missing, "deadbeef", cold, false);
-
-        // Same path → no-op (must not attempt copy-onto-self).
-        writeback_cold(
-            "kernel",
-            missing,
-            "deadbeef",
-            Path::new("/nonexistent"),
-            false,
-        );
-        // The join cold/kernel.hsaco differs from missing above; exercise the
-        // explicit same_path guard with identical paths:
-        writeback_cold(
-            "kernel",
-            Path::new("/nonexistent/kernel.hsaco"),
-            "deadbeef",
-            Path::new("/nonexistent"),
-            false,
-        );
-    }
-
-    #[test]
-    fn writeback_cold_restores_missing_or_empty_blob() {
-        // Verified RED: matching cold hash alone must not skip writeback when
-        // the HSACO is missing or empty.
-        let root = temp_root("wb_missing_blob");
-        let hot = root.join("hot");
-        let cold = root.join("cold");
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&hot).unwrap();
-        std::fs::create_dir_all(&cold).unwrap();
-
-        let name = "add_inplace";
-        let src_hash = "abc123hash";
-        let hot_hsaco = hot.join(format!("{name}.hsaco"));
-        std::fs::write(&hot_hsaco, b"HOT_VALID_BLOB").unwrap();
-
-        // Case A: hash present, blob missing.
-        std::fs::write(cold.join(format!("{name}.hash")), src_hash).unwrap();
-        assert!(!cold.join(format!("{name}.hsaco")).exists());
-        writeback_cold(name, &hot_hsaco, src_hash, &cold, false);
-        assert_eq!(
-            std::fs::read(cold.join(format!("{name}.hsaco"))).unwrap(),
-            b"HOT_VALID_BLOB"
-        );
-        assert_eq!(
-            std::fs::read_to_string(cold.join(format!("{name}.hash")))
-                .unwrap()
-                .trim(),
-            src_hash
-        );
-
-        // Case B: hash present, blob empty — still invalid, must restore.
-        std::fs::write(cold.join(format!("{name}.hsaco")), b"").unwrap();
-        writeback_cold(name, &hot_hsaco, src_hash, &cold, false);
-        assert_eq!(
-            std::fs::read(cold.join(format!("{name}.hsaco"))).unwrap(),
-            b"HOT_VALID_BLOB"
-        );
-
-        // No leftover stage temps in cold.
-        let leftovers: Vec<_> = std::fs::read_dir(&cold)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|n| n.contains(".tmp"))
-            .collect();
-        assert!(
-            leftovers.is_empty(),
-            "stage temps must be cleaned up: {leftovers:?}"
-        );
-
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn writeback_cold_force_replaces_hash_matching_pair() {
-        // After a driver-rejected image, force must overwrite cold even when
-        // the source hash already matches.
-        let root = temp_root("wb_force");
-        let hot = root.join("hot");
-        let cold = root.join("cold");
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&hot).unwrap();
-        std::fs::create_dir_all(&cold).unwrap();
-
-        let name = "add_inplace";
-        let src_hash = "samehash";
-        let hot_hsaco = hot.join(format!("{name}.hsaco"));
-        std::fs::write(&hot_hsaco, b"FRESH_HOT").unwrap();
-        std::fs::write(cold.join(format!("{name}.hsaco")), b"OLD_REJECTED").unwrap();
-        std::fs::write(cold.join(format!("{name}.hash")), src_hash).unwrap();
-
-        // Non-force leaves a valid matching pair alone.
-        writeback_cold(name, &hot_hsaco, src_hash, &cold, false);
-        assert_eq!(
-            std::fs::read(cold.join(format!("{name}.hsaco"))).unwrap(),
-            b"OLD_REJECTED"
-        );
-
-        // Force replaces it.
-        writeback_cold(name, &hot_hsaco, src_hash, &cold, true);
-        assert_eq!(
-            std::fs::read(cold.join(format!("{name}.hsaco"))).unwrap(),
-            b"FRESH_HOT"
-        );
-        assert_eq!(
-            std::fs::read_to_string(cold.join(format!("{name}.hash")))
-                .unwrap()
-                .trim(),
-            src_hash
-        );
-
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn writeback_cold_failed_stage_preserves_prior_pair() {
-        // Missing/empty hot source must not clobber an existing valid cold pair.
-        let root = temp_root("wb_preserve");
-        let cold = root.join("cold");
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&cold).unwrap();
-
-        let name = "add_inplace";
-        let src_hash = "keepme";
-        std::fs::write(cold.join(format!("{name}.hsaco")), b"PRIOR_COLD").unwrap();
-        std::fs::write(cold.join(format!("{name}.hash")), src_hash).unwrap();
-
-        let missing_hot = root.join("nope.hsaco");
-        writeback_cold(name, &missing_hot, "newhash", &cold, true);
-
-        assert_eq!(
-            std::fs::read(cold.join(format!("{name}.hsaco"))).unwrap(),
-            b"PRIOR_COLD",
-            "failed force writeback must leave prior cold blob untouched"
-        );
-        assert_eq!(
-            std::fs::read_to_string(cold.join(format!("{name}.hash")))
-                .unwrap()
-                .trim(),
-            src_hash,
-            "failed force writeback must leave prior cold hash untouched"
-        );
-
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
     fn validated_hot_lookup_writeback_refreshes_stale_cold() {
-        // End-to-end: hot lookup is hash-valid so compile returns without hipcc,
-        // but a distinct cold install pair is stale and must still be refreshed.
+        // With a compiler available, a hot-keyed build repairs a stale,
+        // unindexed cold install pair without invoking hipcc again.
         let root = temp_root("hot_lookup_wb");
         let hot = root.join("hot");
         let cold = root.join("cold");
@@ -1665,7 +1879,7 @@ mod tests {
         c.cache_dir = hot.clone();
         c.precompiled_dir = Some(hot.clone());
         c.cold_dir = Some(cold.clone());
-        c.has_hipcc = false;
+        c.has_hipcc = true;
 
         let name = "add_inplace";
         let source = "__global__ void add_inplace() {}";
@@ -1678,13 +1892,13 @@ mod tests {
 
         let path = c
             .compile(name, source)
-            .expect("validated hot lookup must succeed without hipcc");
-        assert_eq!(path, &hot.join(format!("{name}.hsaco")));
+            .expect("validated hot lookup must refresh stale installed object");
+        assert_eq!(std::fs::read(path).unwrap(), b"HOT_BLOB_V1");
 
         let cold_hash = std::fs::read_to_string(cold.join(format!("{name}.hash"))).unwrap();
         assert_eq!(
             cold_hash.trim(),
-            src_hash,
+            c.packaging_hash(name, source),
             "stale cold hash must be refreshed from validated hot lookup"
         );
         assert_eq!(
@@ -1736,7 +1950,7 @@ mod tests {
         let path = c
             .compile(name, source)
             .expect("validated hot lookup must succeed without hipcc");
-        assert_eq!(path, &hot.join(format!("{name}.hsaco")));
+        assert_eq!(std::fs::read(path).unwrap(), b"HOT_BLOB_V1");
 
         assert!(
             cold.join(format!("{name}.hsaco")).exists(),
@@ -1750,7 +1964,7 @@ mod tests {
             std::fs::read_to_string(cold.join(format!("{name}.hash")))
                 .unwrap()
                 .trim(),
-            src_hash
+            c.packaging_hash(name, source)
         );
 
         let _ = std::fs::remove_dir_all(&root);
@@ -1858,13 +2072,16 @@ mod tests {
         let dest_path = dest.join(format!("{name}.hsaco"));
 
         // The reader owns its observations locally and returns them through
-        // the scoped join — no shared lock between the threads.
+        // the scoped join — no shared lock between the threads. It samples
+        // until it has seen the writer finish, and the read after that
+        // observation is guaranteed to see the final generation, so the test
+        // does not depend on how the two threads are scheduled.
         let (seen, missings) = std::thread::scope(|scope| {
             let reader = scope.spawn(move || {
                 let mut seen: Vec<Vec<u8>> = Vec::new();
                 let mut missings = 0;
-                let mut samples = 0;
-                while samples < 500 {
+                loop {
+                    let finished = reader_done.load(std::sync::atomic::Ordering::SeqCst);
                     match std::fs::read(&dest_path) {
                         Ok(bytes) => {
                             if !seen.contains(&bytes) {
@@ -1873,8 +2090,7 @@ mod tests {
                         }
                         Err(_) => missings += 1,
                     }
-                    samples += 1;
-                    if reader_done.load(std::sync::atomic::Ordering::SeqCst) && samples >= 100 {
+                    if finished {
                         break;
                     }
                 }
@@ -1954,6 +2170,7 @@ mod tests {
                 "--offload-arch=gfx1100",
                 "-O3",
                 "--no-offload-compress",
+                "-fuse-cuid=none",
                 "-I/opt/rocm/include",
                 "-o",
                 "kernel.hsaco",
@@ -2028,6 +2245,54 @@ mod tests {
         assert_ne!(
             control.cache_hash(module, source),
             gfx1100.cache_hash(module, source)
+        );
+    }
+
+    #[test]
+    fn gfx1201_k1_scheduler_is_module_exact_and_cache_keyed() {
+        let source = "__global__ void kernel() {}";
+        let module = "gemm_mq4g256v2_residual_mmq_iu4_gfx12_v3";
+        let shipping = "gemm_mq4g256v2_residual_mmq_iu4_gfx12_symfold_g12r";
+        let mut compiler = test_compiler("", "hipcc 7.2");
+        compiler.arch = "gfx1201".to_owned();
+
+        assert_eq!(
+            compiler.module_flags(module),
+            SchedulerProfile::IterativeIlp
+                .llvm_args()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            compiler.scheduler_profile_for(module),
+            SchedulerProfile::IterativeIlp
+        );
+        assert!(compiler.module_flags(shipping).is_empty());
+        assert!(compiler.module_flags("gemv_mq4g256v2_mq4v2").is_empty());
+        assert_ne!(
+            compiler.cache_hash(module, source),
+            KernelCompiler::hash_parts(
+                source,
+                "gfx1201",
+                "",
+                &[],
+                "hipcc 7.2",
+                SchedulerProfile::Default,
+                "hipcc", "", "", "",
+            )
+        );
+        assert_eq!(
+            compiler.cache_hash(shipping, source),
+            KernelCompiler::hash_parts(
+                source,
+                "gfx1201",
+                "",
+                &[],
+                "hipcc 7.2",
+                SchedulerProfile::Default,
+                "hipcc", "", "", "",
+            )
         );
     }
 
@@ -2177,12 +2442,7 @@ mod tests {
         std::fs::write(hot.join(format!("{name}.hsaco")), b"").unwrap();
         std::fs::write(hot.join(format!("{name}.hash")), &src_hash).unwrap();
 
-        let err = c.compile(name, source).unwrap_err();
-        assert!(
-            err.to_string().contains("hipcc unavailable")
-                || err.to_string().contains("no usable cached"),
-            "empty blob must error without hipcc: {err}"
-        );
+        c.compile(name, source).unwrap_err();
         assert!(!c.compiled.contains_key(name));
 
         // Directory named like a blob with matching hash.
@@ -2191,21 +2451,11 @@ mod tests {
         std::fs::create_dir(hot.join(format!("{name}.hsaco"))).unwrap();
         std::fs::write(hot.join(format!("{name}.hash")), &src_hash).unwrap();
 
-        let err = c.compile(name, source).unwrap_err();
-        assert!(
-            err.to_string().contains("hipcc unavailable")
-                || err.to_string().contains("no usable cached"),
-            "directory blob must error without hipcc: {err}"
-        );
+        c.compile(name, source).unwrap_err();
 
         // Batch path must agree.
         c.compiled.clear();
-        let err = c.compile_batch(&[(name, source)]).unwrap_err();
-        assert!(
-            err.to_string().contains("hipcc unavailable")
-                || err.to_string().contains("no usable cached"),
-            "batch empty/dir blob must error without hipcc: {err}"
-        );
+        c.compile_batch(&[(name, source)]).unwrap_err();
         assert!(!c.compiled.contains_key(name));
 
         let _ = std::fs::remove_dir_all(&root);
@@ -2232,7 +2482,7 @@ mod tests {
         std::fs::write(shared.join(format!("{name}.hsaco")), b"PRIOR_PAIR").unwrap();
         std::fs::write(shared.join(format!("{name}.hash")), &src_hash).unwrap();
 
-        let err = c.recompile(name, source).unwrap_err();
+        let err = c.recompile(name, source, name).unwrap_err();
         assert!(err.to_string().contains("hipcc"), "{err}");
 
         assert_eq!(
@@ -2280,7 +2530,7 @@ mod tests {
         std::fs::write(real.join(format!("{name}.hsaco")), b"ALIAS_PRIOR").unwrap();
         std::fs::write(real.join(format!("{name}.hash")), &src_hash).unwrap();
 
-        let _ = c.recompile(name, source).unwrap_err();
+        let _ = c.recompile(name, source, name).unwrap_err();
 
         assert_eq!(
             std::fs::read(real.join(format!("{name}.hsaco"))).unwrap(),
@@ -2432,20 +2682,11 @@ mod tests {
     }
 
     #[test]
-    fn packaging_hash_validates_on_compiler_free_runtime() {
-        // Proves that a blob+hash pair emitted by compile-kernels.sh in
-        // packaging mode (toolchain_id = "") satisfies pair_valid for a
-        // compiler-free runtime (has_hipcc = false, empty toolchain_id) so
-        // compile() uses the silent validated path, not the UNVALIDATED
-        // fallback.
-        let root = temp_root("packaging_hash_validates");
-        let _ = std::fs::remove_dir_all(&root);
-        let precompiled = root.join("precompiled");
-        std::fs::create_dir_all(&precompiled).unwrap();
-
+    fn packaging_hash_matches_without_a_local_compiler() {
         let name = "packaged_kernel";
         let source = "__global__ void packaged_kernel() {}";
         let arch = "gfx1201";
+
 
         // Builder has a real toolchain, but packaging must use empty id.
         let mut builder = test_compiler("", "hipcc 7.2");
@@ -2471,36 +2712,300 @@ mod tests {
             packaging_via_instance, builder_hash,
             "packaging (empty toolchain) must differ from normal cache hash"
         );
+    }
+    // Exercise both public lookup paths with separate instances so an earlier
+    // successful lookup cannot hide a subsequent batch lookup.
+    fn prebuilt_gate_compiler(root: &Path, with_hipcc: bool) -> KernelCompiler {
+        let mut compiler = test_compiler("", "");
+        compiler.arch = "gfx1201".to_owned();
+        compiler.cache_dir = root.join("hot");
+        std::fs::create_dir_all(&compiler.cache_dir).unwrap();
+        let cold = root.join("cold");
+        std::fs::create_dir_all(&cold).unwrap();
+        compiler.precompiled_dir = Some(cold.clone());
+        compiler.cold_dir = Some(cold);
+        compiler.has_hipcc = with_hipcc;
+        if with_hipcc {
+            compiler.toolchain_id = "hipcc 7.2".to_owned();
+            compiler.hipcc_bin = install_fake_hipcc(&root.join("bin"), b"FRESH", false);
+        }
+        compiler
+    }
 
-        // Bake blob+hash as the script now does.
-        let hsaco = precompiled.join(format!("{name}.hsaco"));
-        let hash_file = precompiled.join(format!("{name}.hash"));
-        std::fs::write(&hsaco, b"FAKE_HSACO_BLOB").unwrap();
-        std::fs::write(&hash_file, &packaging_via_instance).unwrap();
 
-        // Direct pair_valid check: what compile() checks first.
-        assert!(
-            pair_valid(&hsaco, &hash_file, &runtime_hash),
-            "packaged pair must be pair_valid for compiler-free hash"
-        );
+    #[test]
+    fn prebuilt_gate_missing_or_wrong_hash_rejected() {
+        for hash in [None, Some("wrong-key")] {
+            let root = temp_root("gate_bad_hash");
+            let name = "gate";
+            let source = "__global__ void gate() {}";
+            let cold = root.join("cold");
+            let mut producer = prebuilt_gate_compiler(&root, true);
+            producer.compile_for_symbol(name, source, name).unwrap();
+            let single = prebuilt_gate_compiler(&root, false);
+            let hash_path = cold.join("gate.hash");
+            match hash {
+                None => { std::fs::remove_file(&hash_path).unwrap(); }
+                Some(bad) => { std::fs::write(&hash_path, bad).unwrap(); }
+            }
+            for (batch, mut compiler) in [single, prebuilt_gate_compiler(&root, false)]
+                .into_iter()
+                .enumerate()
+            {
+                let err = if batch == 0 {
+                    compiler.compile(name, source).unwrap_err()
+                } else {
+                    compiler.compile_batch(&[(name, source)]).unwrap_err()
+                };
+                assert!(err.to_string().contains("pair missing or stale"), "{err}");
+                assert!(!compiler.compiled.contains_key(name));
+            }
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
 
-        // End-to-end via KernelCompiler::compile with has_hipcc = false:
-        // must take the validated branch (no UNVALIDATED warning path) and
-        // return the precompiled blob.
-        let mut c = test_compiler("", "");
-        c.arch = arch.to_string();
-        c.has_hipcc = false;
-        c.cache_dir = root.join("hot");
-        std::fs::create_dir_all(&c.cache_dir).unwrap();
-        c.precompiled_dir = Some(precompiled.clone());
-        c.cold_dir = Some(precompiled.clone());
+    #[test]
+    fn prebuilt_gate_truncated_to_empty_and_legacy_without_hash_rejected() {
+        for legacy in [false, true] {
+            let root = temp_root("gate_empty_or_legacy");
+            let name = "gate";
+            let source = "__global__ void gate() {}";
+            let single = prebuilt_gate_compiler(&root, false);
+            let dir = if legacy { root.join("hot") } else { root.join("cold") };
+            let object = dir.join("gate.hsaco");
+            std::fs::write(&object, b"PREBUILT").unwrap();
+            if legacy {
+                // A legacy hot entry without its sidecar is not content-keyed.
+            } else {
+                std::fs::write(dir.join("gate.hash"), single.cache_hash(name, source)).unwrap();
+                // Simulate an interrupted/truncated copy of a formerly valid pair.
+                std::fs::write(&object, b"").unwrap();
+            }
+            for (batch, mut compiler) in [single, prebuilt_gate_compiler(&root, false)]
+                .into_iter()
+                .enumerate()
+            {
+                if batch == 0 {
+                    compiler.compile(name, source).unwrap_err();
+                } else {
+                    compiler.compile_batch(&[(name, source)]).unwrap_err();
+                }
+                assert!(!compiler.compiled.contains_key(name));
+            }
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
 
-        let path = c
-            .compile(name, source)
-            .expect("packaged blob must validate without hipcc");
-        assert_eq!(path, &hsaco);
-        assert!(c.compiled.contains_key(name));
+    #[test]
+    fn prebuilt_gate_bad_cold_falls_through_to_hipcc() {
+        for batch in [false, true] {
+            let root = temp_root("gate_recompile");
+            let name = "gate";
+            let source = "__global__ void gate() {}";
+            let mut compiler = prebuilt_gate_compiler(&root, true);
+            let old = root.join("cold/gate.hsaco");
+            std::fs::write(&old, b"STALE").unwrap();
+            std::fs::write(root.join("cold/gate.hash"), "wrong-key").unwrap();
+            let key = compiler.cache_hash(name, source);
+            if batch {
+                compiler.compile_batch(&[(name, source)]).unwrap();
+            } else {
+                compiler.compile(name, source).unwrap();
+            }
+            let hot = root.join("hot").join(hot_object_name(name, &key));
+            assert_eq!(compiler.compiled[name], hot);
+            assert_eq!(std::fs::read(&hot).unwrap(), b"FRESH");
+            assert_eq!(std::fs::read(&old).unwrap(), b"FRESH");
+            assert_eq!(std::fs::read_to_string(root.join("cold/gate.hash")).unwrap(), compiler.packaging_hash(name, source));
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
 
-        let _ = std::fs::remove_dir_all(&root);
+    #[test]
+    fn stale_indexed_cold_cannot_fall_through_to_hot_without_compiler() {
+        for batch in [false, true] {
+            let root = temp_root("gate_hot_hit");
+            let name = "gate";
+            let source = "__global__ void gate() {}";
+            let mut producer = prebuilt_gate_compiler(&root, true);
+            producer.compile_for_symbol(name, source, name).unwrap();
+            let mut compiler = prebuilt_gate_compiler(&root, false);
+            std::fs::write(root.join("cold/gate.hsaco"), b"CORRUPTED").unwrap();
+            let key = compiler.cache_hash(name, source);
+            let hot = root.join("hot").join(hot_object_name(name, &key));
+            std::fs::write(&hot, b"HOT_VALID").unwrap();
+            if batch {
+                compiler.compile_batch(&[(name, source)]).unwrap_err();
+            } else {
+                compiler.compile(name, source).unwrap_err();
+            }
+            assert!(!compiler.compiled.contains_key(name));
+            assert_eq!(std::fs::read(&hot).unwrap(), b"HOT_VALID");
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn precompile_indexed_pair_is_accepted_without_compiler_for_both_lookups() {
+        let root = temp_root("indexed_precompile");
+        let mut producer = prebuilt_gate_compiler(&root, true);
+        let source = "__global__ void rmsnorm_f32() {}";
+        let name = "rmsnorm";
+        let symbol = "rmsnorm_f32";
+        let hot_key = producer.cache_hash(name, source);
+        let portable_key = producer.packaging_hash(name, source);
+        assert_ne!(hot_key, portable_key);
+        producer.compile_batch_for_symbols(&[(name, source, symbol)]).unwrap();
+        let cold = root.join("cold");
+        let object = cold.join("rmsnorm.hsaco");
+        assert!(pair_valid(&object, &cold.join("rmsnorm.hash"), &portable_key));
+        let index: PackIndex = serde_json::from_slice(&std::fs::read(cold.join("rmsnorm.index.json")).unwrap()).unwrap();
+        assert_eq!(index.toolchain_id, "hipcc 7.2");
+        assert_eq!(index.object_sha256, sha256_hex(b"FRESH"));
+        assert_eq!(index.symbols, [symbol]);
+
+        for batch in [false, true] {
+            let mut consumer = prebuilt_gate_compiler(&root, false);
+            if batch {
+                consumer.compile_batch_for_symbols(&[(name, source, symbol)]).unwrap();
+                assert_eq!(consumer.compiled[name], object);
+            } else {
+                assert_eq!(consumer.compile_for_symbol(name, source, symbol).unwrap(), object);
+            }
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn indexed_writeback_preserves_all_symbols_in_shared_module() {
+        let root = temp_root("shared_module_symbols");
+        let source = "__global__ void a() {} __global__ void b() {}";
+        let mut producer = prebuilt_gate_compiler(&root, true);
+        producer.compile_for_symbol("shared", source, "a").unwrap();
+        producer.compile_for_symbol("shared", source, "b").unwrap();
+        let mut consumer = prebuilt_gate_compiler(&root, false);
+        assert!(consumer.compile_for_symbol("shared", source, "a").is_ok());
+        assert!(consumer.compile_for_symbol("shared", source, "b").is_ok());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn indexed_package_rejects_wrong_object_symbol_source_and_identity() {
+        let root = temp_root("indexed_negative");
+        let source = "__global__ void rmsnorm_f32() {}";
+        let name = "rmsnorm";
+        let symbol = "rmsnorm_f32";
+        let mut producer = prebuilt_gate_compiler(&root, true);
+        producer.compile_for_symbol(name, source, symbol).unwrap();
+        let cold = root.join("cold");
+        let object = cold.join("rmsnorm.hsaco");
+        let index_path = cold.join("rmsnorm.index.json");
+        let original = std::fs::read(&index_path).unwrap();
+
+        for field in [
+            "version", "module", "symbols", "arch", "source_sha256", "flags", "scheduler_profile",
+            "cache_abi", "packaging_key", "object_sha256", "toolchain_id", "toolchain_sha256",
+        ] {
+            let mut mutated: serde_json::Value = serde_json::from_slice(&original).unwrap();
+            mutated[field] = match field {
+                "version" => serde_json::json!(PACK_INDEX_VERSION + 1),
+                "symbols" => serde_json::json!(["other_symbol"]),
+                "flags" => serde_json::json!(["-O0"]),
+                "cache_abi" => serde_json::json!(0),
+                _ => serde_json::json!("wrong"),
+            };
+            std::fs::write(&index_path, serde_json::to_vec(&mutated).unwrap()).unwrap();
+            let mut consumer = prebuilt_gate_compiler(&root, false);
+            let err = consumer.compile_for_symbol(name, source, symbol).unwrap_err();
+            assert!(err.to_string().contains("packaged object rejected"), "{field}: {err}");
+        }
+        std::fs::write(&index_path, &original).unwrap();
+        let mut consumer = prebuilt_gate_compiler(&root, false);
+        assert!(consumer.compile_for_symbol(name, source, "other_symbol").is_err());
+        assert!(consumer.compile_for_symbol(name, "__global__ void changed() {}", symbol).is_err());
+        std::fs::write(&object, b"CORRUPTED").unwrap();
+        let mut consumer = prebuilt_gate_compiler(&root, false);
+        assert!(consumer.compile_batch_for_symbols(&[(name, source, symbol)]).unwrap_err().to_string().contains("SHA-256"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn indexed_package_from_another_compiler_build_is_rebuilt_not_loaded() {
+        let root = temp_root("indexed_foreign_toolchain");
+        let (name, source, symbol) = ("rmsnorm", "__global__ void rmsnorm_f32() {}", "rmsnorm_f32");
+        let mut producer = prebuilt_gate_compiler(&root, true);
+        producer.compile_for_symbol(name, source, symbol).unwrap();
+        let cold = root.join("cold");
+        assert_eq!(std::fs::read(cold.join("rmsnorm.hsaco")).unwrap(), b"FRESH");
+
+        // The installed index is intact, but this machine's compiler is a
+        // different build: the object must not load, it must be rebuilt.
+        let mut consumer = prebuilt_gate_compiler(&root, true);
+        consumer.toolchain_id = "hipcc 9.9".to_owned();
+        consumer.hipcc_bin = install_fake_hipcc(&root.join("local-bin"), b"LOCAL", false);
+        let loaded = consumer.compile_for_symbol(name, source, symbol).unwrap().to_path_buf();
+        assert_eq!(std::fs::read(&loaded).unwrap(), b"LOCAL");
+        assert_ne!(loaded, cold.join("rmsnorm.hsaco"));
+        let index: PackIndex =
+            serde_json::from_slice(&std::fs::read(cold.join("rmsnorm.index.json")).unwrap()).unwrap();
+        assert_eq!(index.toolchain_id, "hipcc 9.9");
+        assert_eq!(std::fs::read(cold.join("rmsnorm.hsaco")).unwrap(), b"LOCAL");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pack_verification_requires_exact_registry_one_toolchain_and_no_strays() {
+        use crate::kernel_registry::KernelEntry;
+        let root = temp_root("pack_verify");
+        let mut producer = prebuilt_gate_compiler(&root, true);
+        // Minimal AMDGPU HSA ELF header: OS/ABI 64, ABI version 4 (code object v6).
+        let mut elf = b"\x7fELF\x02\x01\x01\x40\x04".to_vec();
+        elf.resize(64, 0);
+        producer.hipcc_bin = install_fake_hipcc(&root.join("elf-bin"), &elf, false);
+        let entries = vec![
+            KernelEntry {
+                arch: "gfx1201",
+                module: "alpha",
+                symbols: &["alpha_f32"],
+                source: "__global__ void alpha_f32() {}".into(),
+                flags: Vec::new(),
+                scheduler_profile: None,
+            },
+            KernelEntry {
+                arch: "gfx1201",
+                module: "beta",
+                symbols: &["beta_a", "beta_b"],
+                source: "__global__ void beta_a() {} __global__ void beta_b() {}".into(),
+                flags: Vec::new(),
+                scheduler_profile: None,
+            },
+        ];
+        let pack = root.join("pack").join("gfx1201");
+        for entry in &entries {
+            let symbols = entry.symbols.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+            producer.pack_to(entry.module, entry.source(), &symbols, &pack).unwrap();
+        }
+        let verify = |local: Option<&str>| {
+            crate::kernel_pack::verify_entries(&entries, "gfx1201", "", &pack, local)
+        };
+        let verified = verify(None).unwrap();
+        assert_eq!(verified.modules, 2);
+        assert_eq!(verified.toolchain_id, "hipcc 7.2");
+        assert_eq!(verified.code_object_version, 6);
+        assert!(verify(Some("hipcc 7.2")).is_ok());
+        // A different local compiler would reject every object at load time.
+        assert!(verify(Some("hipcc 9.9")).unwrap_err().contains("toolchain mismatch"));
+
+        // An unindexed pair would be seeded into the hot cache unchecked.
+        std::fs::write(pack.join("stray.hsaco"), &elf).unwrap();
+        assert!(verify(None).unwrap_err().contains("not part of"));
+        std::fs::remove_file(pack.join("stray.hsaco")).unwrap();
+
+        let beta_index = std::fs::read(pack.join("beta.index.json")).unwrap();
+        std::fs::remove_file(pack.join("beta.index.json")).unwrap();
+        assert!(verify(None).unwrap_err().contains("index missing"));
+        std::fs::write(pack.join("beta.index.json"), &beta_index).unwrap();
+        assert!(verify(None).is_ok());
+        let _ = std::fs::remove_dir_all(root);
     }
 }

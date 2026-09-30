@@ -69,7 +69,7 @@ use hipfire_runtime::llama::{
     rotate_x_mq_for, weight_gemv, EmbeddingFormat, WeightTensor,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 // ─── Config ──────────────────────────────────────────────────────────────
 
@@ -813,6 +813,81 @@ pub fn load_mtp_head_bundled(
     Ok(Some(head))
 }
 
+// ─── Trunk compatibility ─────────────────────────────────────────────────
+
+/// Refuse a `.mtp` head that cannot attach to the trunk it sits beside,
+/// before any GPU upload.
+///
+/// The head reads the trunk's final hidden state and reuses the trunk's
+/// `embed_tokens` and `lm_head`, so its `n_embd` must equal the trunk's
+/// hidden size and its `vocab_size` the trunk's vocab. A mismatched head
+/// would otherwise load and draft from out-of-range rows. `base_offset`
+/// is `0` for a standalone `.mtp` and the trailer offset for a bundle.
+///
+/// This checks shape only: a head from another checkpoint with the same
+/// dims (e.g. a Qwen3.5-27B head on a Qwen3.8-27B trunk) passes, and the
+/// verify then rejects its drafts rather than committing them.
+pub fn check_mtp_head_for_trunk(
+    path: &Path,
+    base_offset: u64,
+    trunk_dim: usize,
+    trunk_vocab: usize,
+) -> Result<(), String> {
+    let hfq = HfqFile::open_at_offset(path, base_offset)
+        .map_err(|e| format!("cannot open {} as an HFQM .mtp head: {e}", path.display()))?;
+    if hfq.arch_id != 21 {
+        return Err(format!(
+            "{} has arch_id={} (expected 21 = qwen35_mtp_head)",
+            path.display(),
+            hfq.arch_id
+        ));
+    }
+    let meta: serde_json::Value = serde_json::from_str(&hfq.metadata_json)
+        .map_err(|e| format!("{}: metadata JSON is invalid: {e}", path.display()))?;
+    let dim = |key: &str| {
+        meta.get(key)
+            .and_then(serde_json::Value::as_u64)
+            .map(|value| value as usize)
+            .ok_or_else(|| format!("{}: metadata has no '{key}'", path.display()))
+    };
+    let (n_embd, vocab_size) = (dim("n_embd")?, dim("vocab_size")?);
+    if n_embd != trunk_dim || vocab_size != trunk_vocab {
+        let source = meta
+            .get("source_model")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        return Err(format!(
+            "{} does not match this trunk: head n_embd={n_embd} vocab={vocab_size} \
+             (source_model={source}), trunk hidden={trunk_dim} vocab={trunk_vocab}; \
+             use the head extracted from this model's own checkpoint",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Candidate `.mtp` sidecar paths for a trunk weight file, most specific
+/// first.
+///
+/// `Path::with_extension("mtp")` only replaces the last extension, so
+/// `qwen3.5-4b.mq4v2.hfq` becomes `qwen3.5-4b.mq4v2.mtp`. Product extracts
+/// sit next to the trunk as `qwen3.5-4b.mtp`. Both are probed, plus the
+/// no-`.hfq`/no-quant sibling (`qwen3.5-4b.mq4` → `qwen3.5-4b.mtp`).
+///
+/// The list itself lives in [`hipfire_runtime::sidecar`], shared with the
+/// `.vl` probe and the CLI's capability advertisement so the three cannot
+/// drift apart.
+pub fn mtp_sidecar_candidates(trunk: &Path) -> Vec<PathBuf> {
+    hipfire_runtime::sidecar::sidecar_candidates(trunk, "mtp")
+}
+
+/// First candidate that exists on disk, if any.
+pub fn find_mtp_sidecar(trunk: &Path) -> Option<PathBuf> {
+    mtp_sidecar_candidates(trunk)
+        .into_iter()
+        .find(|p| p.exists())
+}
+
 // ─── Loader ──────────────────────────────────────────────────────────────
 
 /// Load a `.mtp` file (arch_id = 21) created by `mtp_extract` (Task 8).
@@ -1157,6 +1232,9 @@ fn weight_tensor_from_raw(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         3 => {
@@ -1171,6 +1249,9 @@ fn weight_tensor_from_raw(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         1 => {
@@ -1192,6 +1273,9 @@ fn weight_tensor_from_raw(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         2 => {
@@ -1205,6 +1289,9 @@ fn weight_tensor_from_raw(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         other => panic!(
@@ -1253,6 +1340,65 @@ mod packed_dtype_tests {
                 DType::MQ4G256V2
             ]
         ));
+    }
+}
+
+#[cfg(test)]
+mod trunk_compat_tests {
+    use super::check_mtp_head_for_trunk;
+    use hipfire_runtime::hfq::write_hfqm_package_mem;
+    use std::path::PathBuf;
+
+    fn write_head(name: &str, arch_id: u32, meta: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("mtp-compat-{}-{name}", std::process::id()));
+        write_hfqm_package_mem(&path, arch_id, meta, &[]).expect("write test head");
+        path
+    }
+
+    #[test]
+    fn head_matching_trunk_dims_is_accepted() {
+        let path = write_head(
+            "ok.mtp",
+            21,
+            r#"{"n_embd":5120,"vocab_size":248320,"source_model":"qwen3.8-27b"}"#,
+        );
+        assert_eq!(check_mtp_head_for_trunk(&path, 0, 5120, 248320), Ok(()));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn head_with_other_hidden_size_or_vocab_is_refused() {
+        // A Qwen3.6-35B-A3B head (hidden 2048) beside a 27B trunk (hidden 5120).
+        let path = write_head(
+            "a3b.mtp",
+            21,
+            r#"{"n_embd":2048,"vocab_size":248320,"source_model":"qwen3.6-35b-a3b"}"#,
+        );
+        let err = check_mtp_head_for_trunk(&path, 0, 5120, 248320).unwrap_err();
+        assert!(err.contains("head n_embd=2048"), "{err}");
+        assert!(err.contains("trunk hidden=5120"), "{err}");
+        assert!(err.contains("source_model=qwen3.6-35b-a3b"), "{err}");
+        // Same hidden size, different vocabulary.
+        let err = check_mtp_head_for_trunk(&path, 0, 2048, 151936).unwrap_err();
+        assert!(err.contains("vocab=248320"), "{err}");
+        assert!(err.contains("trunk hidden=2048 vocab=151936"), "{err}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn non_mtp_container_is_refused_without_panicking() {
+        let path = write_head("trunk.mtp", 5, r#"{"n_embd":5120,"vocab_size":248320}"#);
+        let err = check_mtp_head_for_trunk(&path, 0, 5120, 248320).unwrap_err();
+        assert!(err.contains("arch_id=5"), "{err}");
+        let _ = std::fs::remove_file(path);
+
+        let path = write_head("nodims.mtp", 21, r#"{"n_embd":5120}"#);
+        let err = check_mtp_head_for_trunk(&path, 0, 5120, 248320).unwrap_err();
+        assert!(err.contains("no 'vocab_size'"), "{err}");
+        let _ = std::fs::remove_file(path);
+
+        let missing = std::env::temp_dir().join("mtp-compat-does-not-exist.mtp");
+        assert!(check_mtp_head_for_trunk(&missing, 0, 5120, 248320).is_err());
     }
 }
 
@@ -1663,6 +1809,7 @@ pub fn mtp_head_forward_block_only_with_pos_buf(
         block_start: 0,
         block_cols: 0,
         output_gate: None,
+        output_awq_scale: None,
         output: &scratch.attn_out,
     };
     hipfire_dispatch::pipeline::execute_steps(
@@ -1943,7 +2090,7 @@ pub fn mtp_head_apply_lm_head_batched(
                     n,
                 )?;
             } else {
-                gpu.gemm_q8_0_batched(
+                gpu.gemm_q8_0_batched_f32_chunked(
                     &lm_head_weights.buf,
                     tmp_batched,
                     &logits_view,
@@ -2186,7 +2333,7 @@ fn weight_gemm_batched(
     rotated_x_scratch: Option<&GpuTensor>,
 ) -> HipResult<()> {
     match w.gpu_dtype {
-        DType::Q8_0 => gpu.gemm_q8_0_batched(&w.buf, x_batched, y_batched, w.m, w.k, n),
+        DType::Q8_0 => gpu.gemm_q8_0_batched_f32_chunked(&w.buf, x_batched, y_batched, w.m, w.k, n),
         DType::HFQ4G256 => gpu.gemm_hfq4g256(&w.buf, x_batched, y_batched, w.m, w.k, n),
         DType::MQ4G256 => {
             // MQ4 needs an FWHT-rotated x first (matches trunk lm_head + dflash patterns).
@@ -2208,6 +2355,16 @@ fn weight_gemm_batched(
                 w.k,
                 n,
             )
+        }
+        // qt=52: no batched-LUT kernel exists — per-row LUT GEMV via
+        // weight_gemv (rotates internally). Slow but correct.
+        DType::MQ4G256V2Lloyd => {
+            for i in 0..n {
+                let x_row = x_batched.sub_offset(i * w.k, w.k);
+                let y_row = y_batched.sub_offset(i * w.m, w.m);
+                weight_gemv(gpu, w, &x_row, &y_row)?;
+            }
+            Ok(())
         }
         DType::MQ6G256V2 => {
             let rot = rotated_x_scratch.expect("MQ6V2 batched gemm requires rotated_x_scratch");
@@ -2247,6 +2404,8 @@ fn weight_gemm_batched_supported(dtype: DType) -> bool {
             | DType::HFQ4G256
             | DType::MQ4G256
             | DType::MQ4G256V2
+            // qt=52 served by the per-row LUT-GEMV arm (slow but correct).
+            | DType::MQ4G256V2Lloyd
             | DType::MQ6G256V2
             | DType::F32
     )
@@ -2613,4 +2772,44 @@ pub fn mtp_head_forward_block_batched(
     )?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod sidecar_probe_tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn mq4v2_hfq_also_probes_stem_mtp() {
+        let c = mtp_sidecar_candidates(Path::new("/models/qwen3.5-4b.mq4v2.hfq"));
+        assert!(
+            c.iter().any(|p| p.ends_with("qwen3.5-4b.mq4v2.mtp")),
+            "{c:?}"
+        );
+        assert!(c.iter().any(|p| p.ends_with("qwen3.5-4b.mtp")), "{c:?}");
+    }
+
+    #[test]
+    fn mq4_probes_stem_mtp() {
+        let c = mtp_sidecar_candidates(Path::new("/models/qwen3.5-4b.mq4"));
+        assert!(c.iter().any(|p| p.ends_with("qwen3.5-4b.mtp")), "{c:?}");
+    }
+
+    #[test]
+    fn find_mtp_sidecar_uses_stem_when_last_extension_missing() {
+        let dir = std::env::temp_dir().join(format!("hipfire-mtp-probe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let trunk = dir.join("qwen3.5-4b.mq4v2.hfq");
+        let stem = dir.join("qwen3.5-4b.mtp");
+        std::fs::write(&trunk, b"trunk").expect("trunk");
+        std::fs::write(&stem, b"mtp").expect("stem sidecar");
+        let found = find_mtp_sidecar(&trunk).expect("stem sidecar exists");
+        assert_eq!(found, stem);
+        assert!(
+            find_mtp_sidecar(&dir.join("missing.mq4v2.hfq")).is_none(),
+            "absent sidecars must miss"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -6,10 +6,9 @@
 //! The Bun CLI spawns this process and communicates via IPC.
 //! Usage: daemon (reads JSON from stdin, writes JSON to stdout)
 //!
-//! Exactly one daemon runs at a time per machine — enforced by an exclusive
-//! flock(2) on ~/.hipfire/daemon.pid. A second daemon invocation exits with
-//! `FATAL: hipfire daemon already running (PID N)` before touching the GPU,
-//! preventing orphan doubles from silently double-consuming VRAM.
+//! Daemons sharing a physical GPU are excluded by machine-wide flock(2) locks
+//! keyed on the card's resolved identity (UUID, else PCI address). Daemons on
+//! distinct GPUs may coexist, even in one HOME.
 //!
 //! Protocol:
 //!   → {"type":"load","model":"path.hfq","params":{"max_seq":4096}}
@@ -23,6 +22,7 @@
 
 use base64::Engine;
 use hipfire_config::developer_var;
+use hipfire_config::devices::{Claim, DeviceSelection, GpuDevice, ObservedDevice};
 use hipfire_runtime::emit_text::{
     currently_in_think, extract_tool_calls_from_text, ThinkOutputRouter, ThinkRouteEvent,
     ToolOutputRouter, ToolRouteError, ToolRouteEvent,
@@ -82,7 +82,10 @@ use hipfire_generate::redline::{
     RedlineDsparkReplayArm, RedlineDsparkVerifySnapshot, RedlineLfm2MoeSnapshot,
     RedlineQwenSnapshot, RedlineSnapshot,
 };
+mod request_guards;
 mod slots;
+mod vision_ladder;
+use vision_ladder::{apply_vision_mode_gate, resolve_vision_ladder};
 
 #[cfg(test)]
 pub(crate) static TERMINAL_TEST_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
@@ -385,58 +388,231 @@ fn gpu_block_attractor_token(
             .memcpy_htod_offset(logits_buf, (tok_id as usize) * 4, &bytes);
     }
 }
+#[cfg(unix)]
+fn prepare_gpu_lock_dir(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    if !path.is_absolute() {
+        return Err(format!("GPU lock directory must be absolute: {}", path.display()));
+    }
+    if !path.exists() {
+        std::fs::create_dir_all(path).map_err(|e| format!("create {}: {e}", path.display()))?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o1777))
+            .map_err(|e| format!("set permissions on {}: {e}", path.display()))?;
+    }
+    if !path.is_dir() {
+        return Err(format!("GPU lock path is not a directory: {}", path.display()));
+    }
+    let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+        .map_err(|e| format!("invalid GPU lock directory {}: {e}", path.display()))?;
+    if unsafe { libc::access(c_path.as_ptr(), libc::W_OK | libc::X_OK) } != 0 {
+        return Err(format!("GPU lock directory is not writable: {}", path.display()));
+    }
+    Ok(())
+}
 
-fn acquire_daemon_lock() -> std::fs::File {
-    use std::io::{Seek, Write};
+#[cfg(unix)]
+fn gpu_lock_dir() -> Result<std::path::PathBuf, String> {
+    if let Some(override_dir) = std::env::var_os("HIPFIRE_LOCK_DIR") {
+        let dir = std::path::PathBuf::from(override_dir);
+        prepare_gpu_lock_dir(&dir)?;
+        return Ok(dir);
+    }
+    let primary = Path::new("/run/lock/hipfire");
+    if prepare_gpu_lock_dir(primary).is_ok() {
+        return Ok(primary.to_path_buf());
+    }
+    let fallback = Path::new("/tmp/hipfire-locks");
+    prepare_gpu_lock_dir(fallback)?;
+    Ok(fallback.to_path_buf())
+}
 
-    #[cfg(unix)]
-    let home = std::env::var("HOME").expect("HOME environment variable not set");
-    #[cfg(windows)]
-    let home = std::env::var("USERPROFILE").expect("USERPROFILE environment variable not set");
+/// Machine-wide GPU reservations held until process exit. Lock files are
+/// keyed by [`GpuDevice::lock_identity`]: `gpu-GPU-<uuid>.lock`, or
+/// `gpu-pci-<bdf>.lock` for cards without a UUID. The per-HOME PID file is
+/// advisory discovery for uninstall tooling, not a mutex: two daemons using
+/// different cards in one HOME must both run.
+#[cfg(unix)]
+struct GpuLocks {
+    dir: std::path::PathBuf,
+    held: Vec<(String, std::fs::File)>,
+}
 
-    let hipfire_dir = std::path::PathBuf::from(home).join(".hipfire");
-    std::fs::create_dir_all(&hipfire_dir).expect("failed to create ~/.hipfire");
-    let pid_path = hipfire_dir.join("daemon.pid");
-
-    let mut f = {
-        let mut opts = std::fs::OpenOptions::new();
-        opts.read(true).write(true).create(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        opts.open(&pid_path)
-            .expect("failed to open ~/.hipfire/daemon.pid")
-    };
-
-    #[cfg(unix)]
-    {
-        use std::io::Read;
-        use std::os::unix::io::AsRawFd;
-        let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if rc != 0 {
-            let mut existing = String::new();
-            let _ = f.read_to_string(&mut existing);
-            let pid = existing.trim();
-            let pid_display = if pid.is_empty() { "<unknown>" } else { pid };
-            let kill_arg = if pid.is_empty() { "<pid>" } else { pid };
-            eprintln!(
-                "FATAL: hipfire daemon already running (PID {}). Run `kill {}` and retry.",
-                pid_display, kill_arg
-            );
-            std::process::exit(1);
-        }
+#[cfg(unix)]
+impl GpuLocks {
+    fn open() -> Result<Self, String> {
+        let dir = gpu_lock_dir()?;
+        eprintln!("[gpu-lock] directory={}", dir.display());
+        Ok(Self { dir, held: Vec::new() })
     }
 
-    // Got the lock (Unix) / opened the PID file (Windows). Truncate any stale
-    // content and write our PID so tooling and the Unix-side error above can
-    // both show a useful number.
-    f.set_len(0).ok();
-    f.seek(std::io::SeekFrom::Start(0)).ok();
-    writeln!(f, "{}", std::process::id()).ok();
-    f.flush().ok();
-    f
+    /// Non-blocking reservation; a busy card reports its holder so arch
+    /// selectors can move on to the next card. Never waits, so the claim
+    /// order cannot deadlock against another daemon.
+    fn try_claim(&mut self, device: &GpuDevice) -> Result<Claim, String> {
+        use std::io::{Read, Seek, Write};
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        use std::os::unix::io::AsRawFd;
+
+        let identity = device.lock_identity();
+        if self.held.iter().any(|(held, _)| *held == identity) {
+            return Ok(Claim::Claimed);
+        }
+        let path = self.dir.join(device.lock_file_name());
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true).mode(0o666).custom_flags(libc::O_NOFOLLOW);
+        let mut file = options.open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                let mut holder = String::new();
+                let _ = file.read_to_string(&mut holder);
+                return Ok(Claim::Busy(format!(
+                    "already reserved by holder PID {}",
+                    holder.split_whitespace().next().unwrap_or("<unknown>")
+                )));
+            }
+            return Err(format!("flock {}: {error}", path.display()));
+        }
+        // The lock file stays on disk forever; never unlink an active inode.
+        // Loosen files created under a restrictive umask for other HOME/users.
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666));
+        file.set_len(0).map_err(|e| e.to_string())?;
+        file.seek(std::io::SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+        writeln!(file, "{} {}", std::process::id(), device.bdf).map_err(|e| e.to_string())?;
+        file.flush().map_err(|e| e.to_string())?;
+        eprintln!("[gpu-lock] reserved {}", path.display());
+        self.held.push((identity, file));
+        Ok(Claim::Claimed)
+    }
+
+    /// Reserve every card in `devices`, sorted by identity; any busy card
+    /// fails the whole set (held descriptors close on process exit).
+    fn claim_all(&mut self, devices: &[GpuDevice]) -> Result<(), String> {
+        let mut sorted = devices.iter().collect::<Vec<_>>();
+        sorted.sort_by_key(|device| device.lock_identity());
+        for device in sorted {
+            if let Claim::Busy(holder) = self.try_claim(device)? {
+                return Err(format!(
+                    "GPU {} (PCI {}) {holder}",
+                    device.lock_identity(),
+                    device.bdf
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn write_pid_file(&self) -> Result<(), String> {
+        if self.held.is_empty() {
+            return Err("no visible GPUs to reserve".into());
+        }
+        let mut identities = self.held.iter().map(|(identity, _)| identity.as_str()).collect::<Vec<_>>();
+        identities.sort_unstable();
+        let home = std::env::var("HOME").map_err(|e| format!("HOME: {e}"))?;
+        let hipfire_dir = Path::new(&home).join(".hipfire");
+        std::fs::create_dir_all(&hipfire_dir).map_err(|e| e.to_string())?;
+        let pid_path = hipfire_dir.join(format!("daemon-{}.pid", identities.join("_")));
+        std::fs::write(&pid_path, format!("{}\n", std::process::id()))
+            .map_err(|e| format!("write {}: {e}", pid_path.display()))
+    }
+}
+
+#[cfg(not(unix))]
+struct GpuLocks;
+
+#[cfg(not(unix))]
+impl GpuLocks {
+    fn open() -> Result<Self, String> {
+        Err("per-GPU locking requires Unix flock; refusing to run unlocked".into())
+    }
+    fn try_claim(&mut self, _: &GpuDevice) -> Result<Claim, String> {
+        unreachable!("GpuLocks::open fails on non-Unix hosts")
+    }
+    fn claim_all(&mut self, _: &[GpuDevice]) -> Result<(), String> {
+        unreachable!("GpuLocks::open fails on non-Unix hosts")
+    }
+    fn write_pid_file(&self) -> Result<(), String> {
+        unreachable!("GpuLocks::open fails on non-Unix hosts")
+    }
+}
+
+/// Query what HIP exposes: one entry per logical device.
+fn observe_hip_devices() -> Result<Vec<ObservedDevice>, String> {
+    let hip = hip_bridge::HipRuntime::load().map_err(|e| e.to_string())?;
+    let count = hip.device_count().map_err(|e| e.to_string())?;
+    if count < 1 {
+        return Err("no visible GPUs to reserve".into());
+    }
+    (0..count)
+        .map(|id| {
+            Ok(ObservedDevice {
+                logical: id as usize,
+                arch: hip.get_arch(id).map_err(|e| e.to_string())?,
+                pci_bus_id: hip.device_pci_bus_id(id).map_err(|e| e.to_string())?,
+            })
+        })
+        .collect()
+}
+
+/// Complete the GPU reservation after visibility is installed and check the
+/// identity of every logical device HIP now exposes.
+///
+/// `hardware.devices` already reserved its cards while resolving; here each
+/// logical device must be exactly the resolved card (arch and PCI bus ID).
+/// Without it (raw inherited filters or none), the HIP-visible cards are
+/// identified by PCI address in the KFD topology and reserved all-or-nothing.
+fn reserve_and_verify_gpus(locks: &mut GpuLocks) -> Result<(), String> {
+    let observed = observe_hip_devices()?;
+    if let Some(active) = hipfire_config::devices::active_devices() {
+        active.verify_visible(&observed)?;
+        for (seen, device) in observed.iter().zip(&active.devices) {
+            eprintln!(
+                "[devices] verified logical {}: HIP {} {} = index {} {} rocr={}",
+                seen.logical,
+                seen.arch,
+                seen.pci_bus_id,
+                device.index,
+                device.lock_identity(),
+                device.rocr_selector()
+            );
+        }
+    } else {
+        let topology = hipfire_config::devices::enumerate_gpus(Path::new(
+            hipfire_config::devices::KFD_TOPOLOGY_NODES,
+        ))
+        .map_err(|e| e.to_string())?;
+        let devices = observed
+            .iter()
+            .map(|seen| {
+                let bdf = hipfire_config::devices::PciBdf::parse(&seen.pci_bus_id);
+                topology
+                    .iter()
+                    .find(|device| Some(device.bdf) == bdf)
+                    .cloned()
+                    .ok_or_else(|| {
+                        format!(
+                            "HIP logical device {} (PCI {}) is not in the KFD topology\n{}",
+                            seen.logical,
+                            seen.pci_bus_id,
+                            hipfire_config::devices::device_table(&topology)
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        locks.claim_all(&devices)?;
+        for (seen, device) in observed.iter().zip(&devices) {
+            eprintln!(
+                "[devices] logical {}: HIP {} {} = index {} {}",
+                seen.logical,
+                seen.arch,
+                seen.pci_bus_id,
+                device.index,
+                device.lock_identity()
+            );
+        }
+    }
+    locks.write_pid_file()
 }
 
 /// Cap on the *encoded* base64 string length the daemon will accept on the
@@ -477,6 +653,77 @@ fn write_typed_error(
     );
 }
 
+/// Resident KV backend metadata for `loaded` ACK and `diag`.
+/// Set only on successful publish; cleared on unload / empty handoff.
+#[derive(Clone, Debug)]
+struct ResidentKvDiag {
+    request: String,
+    backend: String,
+    reason: Option<String>,
+    legacy: bool,
+    warning: Option<String>,
+    mode: Option<String>,
+}
+
+impl ResidentKvDiag {
+    fn from_admission(
+        request: hipfire_loader::admission::KvBackendRequest,
+        backend: hipfire_runtime::kv_backend::KvBackend,
+        automatic_reason: Option<&str>,
+    ) -> Self {
+        use hipfire_loader::admission::KvBackendRequest;
+        use hipfire_runtime::kv_backend::KvBackend;
+        let request_str = match request {
+            KvBackendRequest::Automatic => "automatic",
+            KvBackendRequest::Explicit(_) => "explicit",
+        };
+        let legacy = matches!(backend, KvBackend::Legacy);
+        let warn_reason = if legacy && matches!(request, KvBackendRequest::Automatic) {
+            automatic_reason
+        } else {
+            None
+        };
+        let warning = hipfire_loader::admission::legacy_warning(backend, warn_reason);
+        if let Some(w) = &warning {
+            eprintln!("{w}");
+        }
+        let reason = if legacy {
+            match request {
+                KvBackendRequest::Automatic => automatic_reason.map(str::to_string),
+                KvBackendRequest::Explicit(_) => Some("explicit operator choice".to_string()),
+            }
+        } else {
+            None
+        };
+        Self {
+            request: request_str.to_string(),
+            backend: backend.as_str().to_string(),
+            reason,
+            legacy,
+            warning,
+            mode: None,
+        }
+    }
+
+    /// Fixed Q8 slot arena always admits legacy storage.
+    fn for_slot(explicit: bool) -> Self {
+        use hipfire_loader::admission::KvBackendRequest;
+        use hipfire_runtime::kv_backend::KvBackend;
+        let request = if explicit {
+            KvBackendRequest::Explicit(KvBackend::Legacy)
+        } else {
+            KvBackendRequest::Automatic
+        };
+        let automatic_reason = if explicit {
+            None
+        } else {
+            Some("fixed Q8 slot arena has no VMM owner")
+        };
+        Self::from_admission(request, KvBackend::Legacy, automatic_reason)
+    }
+}
+
+
 /// Pure gate for the deferred EP (tp>1) load handoff.
 ///
 /// After a new EP model is constructed, the prior model is unloaded. The new
@@ -508,21 +755,6 @@ fn ep_deferred_handoff_error_message(prior_err: &str, rollback_err: Option<&str>
 /// occupies `model` — that path tears down after successful new load.
 fn ep_deferred_needs_vmm_preflight(load_tp: usize, model_present: bool) -> bool {
     load_tp > 1 && !model_present
-}
-
-/// Daemon-side `vision_mode` gate for the tower sidecar path.
-///
-/// `off` (the default) is a hard override that drops even an explicit
-/// sidecar, mirroring the `dflash_mode=off` draft guard at the load site.
-/// Any other mode passes the `HIPFIRE_VISION_SIDECAR` / `params.vision`
-/// ladder result through untouched. Pure string plumbing — no arch or
-/// tensor knowledge; admission still validates the surviving path.
-fn apply_vision_mode_gate(vision_mode: &str, raw_vision: Option<String>) -> Option<String> {
-    if vision_mode == "off" {
-        None
-    } else {
-        raw_vision
-    }
 }
 
 /// Print a friendly, user-actionable message when Gpu::init fails. Matches
@@ -597,9 +829,34 @@ fn init_tracing() {
     }
 }
 
-fn install_process_config(config: hipfire_config::ProcessConfig) -> Result<(), String> {
+/// Validate and install process policy, resolving `hardware.devices` against
+/// the KFD topology before any GPU runtime initializes. `claim` reserves each
+/// resolved card as part of that same step.
+fn install_process_config(
+    config: hipfire_config::ProcessConfig,
+    claim: &mut hipfire_config::devices::ClaimFn<'_>,
+) -> Result<(), String> {
     config.validate().map_err(|error| error.to_string())?;
-    hipfire_config::apply_device_visibility(&config).map_err(|error| error.to_string())?;
+    let selection = hipfire_config::devices::apply_device_visibility(&config, claim)
+        .map_err(|error| error.to_string())?;
+    match &selection {
+        DeviceSelection::Resolved { devices, visibility } => eprintln!(
+            "[devices] hardware.devices={:?} -> {} (ROCR_VISIBLE_DEVICES={} HIP_VISIBLE_DEVICES={})",
+            config.legacy_value("HIPFIRE_DEVICES").unwrap_or_default(),
+            devices
+                .iter()
+                .map(|device| format!("index {} {} {} {}", device.index, device.arch, device.lock_identity(), device.bdf))
+                .collect::<Vec<_>>()
+                .join(", "),
+            visibility.rocr,
+            visibility.hip
+        ),
+        DeviceSelection::Inherited(visibility) => eprintln!(
+            "[devices] inherited ROCR_VISIBLE_DEVICES={} HIP_VISIBLE_DEVICES={}",
+            visibility.rocr, visibility.hip
+        ),
+        DeviceSelection::Unfiltered => {}
+    }
     let runtime = hipfire_runtime::config::RuntimeConfig::from_process_config(&config);
     hipfire_config::install_process_config(config)
         .map_err(|_| "process configuration was already initialized".to_owned())?;
@@ -684,41 +941,22 @@ fn main() {
 
     let args: Vec<String> = std::env::args().collect();
 
-    // --precompile: compile all kernels for this GPU, write hash files, exit.
-    // Used by scripts/install.sh and `hipfire update` so first `hipfire run`
-    // isn't a 2-minute hipcc wait.
-    //
-    // Covers the current default path (mq4 weights + asym3 KV) plus the legacy
-    // compat paths (hfq4, hfq6, q8 weights × asym3, q8 KV) so models from any
-    // era of the registry start instantly.
+    // --precompile packages the exact-source registry beside this executable.
+    // The installed index, not a historical model/format hand list, defines
+    // which objects can be used without a device compiler.
     if args.iter().any(|a| a == "--precompile") {
         let process_config = hipfire_config::load_local_process_config().unwrap_or_else(|error| {
             eprintln!("FATAL: invalid process configuration: {error}");
             std::process::exit(1);
         });
-        install_process_config(process_config).unwrap_or_else(|error| {
+        // Packaging needs only the arch and reserves no card.
+        install_process_config(process_config, &mut |_| Ok(Claim::Claimed)).unwrap_or_else(|error| {
             eprintln!("FATAL: failed to install process configuration: {error}");
             std::process::exit(1);
         });
-        // Pre-create the expected precompiled-dir next to this binary so the
-        // compiler's writeback path fires. Without this, Gpu::init probes for
-        // an existing dir and silently disables writeback if it's missing —
-        // meaning fresh installs would compile but never cache cross-invocation.
-        if let Some(exe_dir) = std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-        {
-            // Arch is unknown until Gpu::init; use a broad mkdir for the common arches
-            // we support so the probe picks one up. The real arch check after init
-            // will log the active dir.
-            for arch in [
-                "gfx906", "gfx1010", "gfx1013", "gfx1030", "gfx1031", "gfx1100", "gfx1101",
-                "gfx1102", "gfx1151", "gfx1152", "gfx1200", "gfx1201",
-            ] {
-                let _ =
-                    std::fs::create_dir_all(exe_dir.join("kernels").join("compiled").join(arch));
-            }
-        }
+        // A separate --module probe below exercises the real GPU launch. Normal
+        // packaging needs the active architecture but no writable cold directory
+        // during Gpu::init: pack_to publishes to the executable-neighbor path.
         let mut gpu = match rdna_compute::Gpu::init() {
             Ok(g) => g,
             Err(e) => {
@@ -726,32 +964,78 @@ fn main() {
                 std::process::exit(1);
             }
         };
-        eprintln!("Pre-compiling kernels for {}...", gpu.arch);
-        let mut ok = 0usize;
-        let mut failed = 0usize;
-        for kv in &["asym3", "q8"] {
-            for wq in &["mq4", "mq6", "hfq4", "hfq6", "q8"] {
-                if let Err(e) = gpu.precompile_qwen35(wq, kv, 256) {
-                    if *wq == "mq4" && *kv == "asym3" {
-                        eprintln!("ERROR: required kernel precompile failed: mq4/asym3: {e}");
-                        std::process::exit(1);
-                    }
-                    eprintln!("  {wq}/{kv}: {e}");
-                    failed += 1;
-                } else {
-                    ok += 1;
-                }
+        // Exercise the production Gpu::rmsnorm_f32 route, whose installed
+        // module key is rmsnorm_f32 (the batched route uses rmsnorm).
+        if let Some(position) = args.iter().position(|arg| arg == "--module") {
+            if args.get(position + 1).map(String::as_str) != Some("rmsnorm_f32") {
+                eprintln!("ERROR: --precompile --module currently supports only rmsnorm_f32");
+                std::process::exit(2);
             }
+            let result = (|| -> rdna_compute::HipResult<Vec<f32>> {
+                let input = gpu.upload_f32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], &[8])?;
+                let weight = gpu.upload_f32(&[1.0, 0.5, 1.5, 2.0, 0.25, 0.75, 1.0, 1.25], &[8])?;
+                let output = gpu.zeros(&[8], rdna_compute::DType::F32)?;
+                gpu.rmsnorm_f32(&input, &weight, &output, 1e-5)?;
+                let values = gpu.download_f32(&output)?;
+                gpu.free_tensor(input)?;
+                gpu.free_tensor(weight)?;
+                gpu.free_tensor(output)?;
+                Ok(values)
+            })().unwrap_or_else(|error| {
+                eprintln!("ERROR: rmsnorm_f32 execution failed: {error}");
+                std::process::exit(1);
+            });
+            let input = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+            let weight = [1.0f32, 0.5, 1.5, 2.0, 0.25, 0.75, 1.0, 1.25];
+            let scale = (input.iter().map(|v| v * v).sum::<f32>() / 8.0 + 1e-5).sqrt().recip();
+            if result.iter().zip(input.iter().zip(weight)).any(|(&got, (&x, w))| (got - x * w * scale).abs() > 1e-5) {
+                eprintln!("ERROR: rmsnorm_f32 numerical output differs from reference: {result:?}");
+                std::process::exit(1);
+            }
+            eprintln!(
+                "precompile: rmsnorm_f32 execution succeeded on {}: output_bits={:?}",
+                gpu.arch,
+                result.iter().map(|v| format!("{:08x}", v.to_bits())).collect::<Vec<_>>()
+            );
+            return;
         }
-        eprintln!("precompile: {ok} ok, {failed} optional failed");
+        let output = std::env::current_exe()
+            .expect("cannot resolve daemon executable")
+            .parent()
+            .expect("daemon executable has no parent")
+            .join("kernels")
+            .join("compiled")
+            .join(&gpu.arch);
+        let extra_flags = rdna_compute::FeatureFlags::from_active_config(&gpu.arch).hipcc_extra_flags;
+        let entries = rdna_compute::kernel_registry::entries(&gpu.arch, &extra_flags)
+            .unwrap_or_else(|error| {
+                eprintln!("ERROR: no indexed kernel registry for {}: {error:?}", gpu.arch);
+                std::process::exit(1);
+            });
+        let count = entries.len();
+        let mut compiler = rdna_compute::KernelCompiler::new(&gpu.arch, extra_flags)
+            .unwrap_or_else(|error| {
+                eprintln!("ERROR: kernel packer initialization failed: {error}");
+                std::process::exit(1);
+            });
+        for entry in entries {
+            compiler.pack_to(
+                entry.module,
+                entry.source(),
+                &entry.symbols.iter().map(|symbol| (*symbol).to_owned()).collect::<Vec<_>>(),
+                &output,
+            ).unwrap_or_else(|error| {
+                eprintln!("ERROR: packaging {} failed: {error}", entry.module);
+                std::process::exit(1);
+            });
+        }
+        eprintln!("precompile: packaged {count} indexed modules for {}", gpu.arch);
         return;
     }
 
-    // Machine-wide mutex — prevents orphan daemons from silently coexisting
-    // (observed 2026-04-13: two daemons at 100% CPU survived pkill -f rounds
-    // because they'd been reparented to PID 1 after their bun parent died).
-    // Kept in a binding so the fd lives for the full process lifetime.
-    let _daemon_lock = acquire_daemon_lock();
+    // Resolve hardware.devices, reserve the cards it names and install ROCr/HIP
+    // visibility in one step, then check what HIP exposes before any GPU
+    // context is created.
 
     let mut stdout = std::io::stdout();
     let Some((process_config, pending_message, acknowledge_config)) =
@@ -762,8 +1046,17 @@ fn main() {
     else {
         return;
     };
-    install_process_config(process_config).unwrap_or_else(|error| {
-        eprintln!("FATAL: failed to install process configuration: {error}");
+    let mut gpu_locks = GpuLocks::open().unwrap_or_else(|error| {
+        eprintln!("FATAL: {error}");
+        std::process::exit(1);
+    });
+    install_process_config(process_config, &mut |device| gpu_locks.try_claim(device))
+        .unwrap_or_else(|error| {
+            eprintln!("FATAL: failed to install process configuration: {error}");
+            std::process::exit(1);
+        });
+    reserve_and_verify_gpus(&mut gpu_locks).unwrap_or_else(|error| {
+        eprintln!("FATAL: {error}");
         std::process::exit(1);
     });
     if acknowledge_config {
@@ -823,6 +1116,11 @@ fn main() {
     // None => ordinary LoadedModel path. Continuous-batching integration is deferred.
     // Arc allows request workers to hold the model alive only while active; reset/unload/swap refuse while active.
     let mut slot_backend: Option<std::sync::Arc<slots::SlotBackend>> = None;
+    // KV backend ACK fields for the currently published model/slot. Cleared on
+    // unload and empty handoff; preserved when a replacement fails and the prior
+    // resident remains loaded.
+    let mut resident_kv: Option<ResidentKvDiag> = None;
+
 
     // Background stdin reader. Drains stdin into an mpsc channel so
     // the main loop can pull non-blockingly between messages. Abort /
@@ -914,7 +1212,11 @@ fn main() {
         }
     });
     let mut inbox = DaemonInbox::new(msg_rx);
-    while let Ok(daemon_msg) = inbox.recv() {
+    loop {
+        request_guards::exit_if_gpu_poisoned(&mut stdout);
+        let Ok(daemon_msg) = inbox.recv() else {
+            break;
+        };
         let (msg, admission_from_message, mut singleton_transfer_from_message) = match daemon_msg {
             DaemonMsg::Regular(m) => (m, None, None),
             DaemonMsg::RegularWithAdmission(m, admission) => (m, Some(admission), None),
@@ -979,18 +1281,17 @@ fn main() {
                     .and_then(|p| p.get("experimental_multi_slot"))
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
-                // #666 G1: fail-closed floor admission BEFORE any teardown or
-                // allocation on either branch below; both downstream read
-                // sites reuse `requested_seq`, so the refusal cannot be
-                // outflanked by branch order.
+                // Omitted max_seq is resolved from model metadata and card
+                // capacity by source admission. Explicit zero still refuses
+                // before teardown (the fixed slot owner retains its 4096 default).
                 let requested_seq = msg
                     .get("params")
                     .and_then(|p| p.get("max_seq"))
                     .and_then(|v| v.as_u64())
-                    .unwrap_or(4096) as usize;
-                if requested_seq < MIN_REQUESTED_SEQ {
+                    .map(|n| n as usize);
+                if requested_seq.is_some_and(|n| n < MIN_REQUESTED_SEQ) {
                     let e = format!(
-                        "load refused: max_seq {requested_seq} below floor {MIN_REQUESTED_SEQ}"
+                        "load refused: max_seq {} below floor {MIN_REQUESTED_SEQ}", requested_seq.unwrap()
                     );
                     emit_uncorrelated_error(&mut stdout, None, &e, "validation", false, false);
                     let _ = stdout.flush();
@@ -1011,6 +1312,34 @@ fn main() {
                         let _ = stdout.flush();
                         continue;
                     }
+                    let slot_kv_k = msg
+                        .get("params")
+                        .and_then(|p| p.get("kv_k"))
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty());
+                    let slot_kv_v = msg
+                        .get("params")
+                        .and_then(|p| p.get("kv_v"))
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty());
+                    if slot_kv_k.is_some() || slot_kv_v.is_some() {
+                        emit_uncorrelated_error(
+                            &mut stdout,
+                            None,
+                            "slots do not support --kv-k/--kv-v",
+                            "validation",
+                            false,
+                            false,
+                        );
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                    let slot_kv_explicit = msg
+                        .get("params")
+                        .and_then(|p| p.get("kv_backend"))
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                        .is_some();
                     // Refuse model swap while slot requests active; do not keep old Arc alive via workers.
                     if slot_backend.as_ref().is_some_and(|b| b.active_count() > 0) {
                         emit_uncorrelated_error(
@@ -1055,9 +1384,13 @@ fn main() {
                                     continue;
                                 }
                                 batch_clear_all_terminals();
+                                resident_kv = None;
                             }
                         }
                     }
+                    // Fixed Q8 slot arena has no VMM owner — always legacy.
+                    // Emit once here; prior model/slot is about to be torn down.
+                    let slot_kv_diag = ResidentKvDiag::for_slot(slot_kv_explicit);
                     // Tear down PFlash / ordinary model (eager; experimental requires pp=tp=1 so no EP deferral).
                     if let Some(mut pf) = pflash_state.take() {
                         if let Some(mut dg) = pflash_drafter_gpu.take() {
@@ -1082,6 +1415,8 @@ fn main() {
                             let _ = stdout.flush();
                             continue;
                         }
+                        // Prior ordinary model is gone; clear resident until slot publishes.
+                        resident_kv = None;
                     } else if let Err(err) = hipfire_loader::ensure_vmm_ready_for_load(&mut gpu) {
                         emit_uncorrelated_error(&mut stdout, None, &err, "internal", false, false);
                         let _ = stdout.flush();
@@ -1106,7 +1441,7 @@ fn main() {
                         continue;
                     }
                     // Floor already admitted pre-teardown above.
-                    let requested_max_seq = requested_seq;
+                    let requested_max_seq = requested_seq.unwrap_or(4096);
                     let max_seq = requested_max_seq.min(MAX_REQUESTED_SEQ);
                     let n_slots = msg
                         .get("params")
@@ -1124,15 +1459,40 @@ fn main() {
                         .and_then(|p| p.get("experimental_multi_slot_prefill_chunk"))
                         .and_then(|v| v.as_u64())
                         .unwrap_or(1024) as usize;
-                    match slots::SlotBackend::load(path, n_slots, cap_tokens, prefill_chunk) {
+                    let slot_params = slots::SlotLoadParams::from_load_msg(&msg);
+                    // Vision tower: the SAME ladder the ordinary arm applies
+                    // (`vision_mode=off` is a hard override). The slot engine
+                    // discovers the `.vl` sibling itself, so it has to be told
+                    // the mode — otherwise the documented text-only default
+                    // still pays the tower's ~1 GB on this route.
+                    let (slot_vision_mode, slot_vision, _) = resolve_vision_ladder(&msg);
+                    match slots::SlotBackend::load(
+                        path,
+                        n_slots,
+                        cap_tokens,
+                        prefill_chunk,
+                        slot_params.mtp_k,
+                        &slot_params.kv_mode_raw,
+                        &slot_params.kv_backend,
+                        slot_params.dflash_draft,
+                        slot_params.dflash_required,
+                        &slot_vision_mode,
+                        slot_vision,
+                        slot_params.max_batch_tokens,
+                    ) {
                         Ok(backend) => {
                             let arch = backend.arch_str().to_string();
                             let dim = backend.dim();
                             let layers = backend.layers();
                             let vocab = backend.vocab();
+                            let vl = backend.is_vl();
                             // Ensure ordinary model stays None — exactly one weight copy.
                             model = None;
                             slot_backend = Some(std::sync::Arc::new(backend));
+                            resident_kv = Some(ResidentKvDiag {
+                                mode: Some(slot_params.kv_mode_resolved.to_owned()),
+                                ..slot_kv_diag.clone()
+                            });
                             // Per contract: continuous_batch_capable false, cache_capable true, reasoning_contract qwen_jinja, plus experimental flag.
                             let ack = serde_json::json!({
                                 "type": "loaded",
@@ -1140,14 +1500,20 @@ fn main() {
                                 "dim": dim,
                                 "layers": layers,
                                 "vocab": vocab,
-                                "vl": false,
+                                "vl": vl,
                                 "reasoning_contract": "qwen_jinja",
                                 "reasoning_effort_native": false,
                                 "reasoning_efforts": [],
                                 "cache_capable": true,
                                 "retry_reset_eligible": false,
                                 "continuous_batch_capable": false,
-                                "experimental_multi_slot": true
+                                "experimental_multi_slot": true,
+                                "kv_backend_request": slot_kv_diag.request,
+                                "kv_backend": slot_kv_diag.backend,
+                                "kv_backend_reason": slot_kv_diag.reason,
+                                "kv_backend_legacy": slot_kv_diag.legacy,
+                                "kv_backend_warning": slot_kv_diag.warning,
+                                "kv_mode": slot_params.kv_mode_resolved,
                             });
                             let _ = writeln!(stdout, "{ack}");
                             let _ = stdout.flush();
@@ -1208,18 +1574,17 @@ fn main() {
                                 continue;
                             }
                             batch_clear_all_terminals();
+                            resident_kv = None;
+
                         }
                     }
                 }
 
                 let path = msg.get("model").and_then(|v| v.as_str()).unwrap_or("");
-                // hunt3 H-D: clamp request-driven max_seq to the config ceiling
-                // (MAX_REQUESTED_SEQ = 1M). Without this an unvalidated 10M
-                // max_seq drives a multi-GB KV allocation and OOMs the daemon at
-                // load. Emit an info event when the clamp actually fires so the
-                // operator sees the truncation rather than silently getting 1M.
-                // Floor already admitted pre-teardown above.
-                let requested_max_seq = requested_seq;
+                // Only an explicit request is clamped; omission lets
+                // admission choose the trained/model-card minimum instead
+                // of the old fixed daemon default.
+                let requested_max_seq = requested_seq.unwrap_or(0);
                 let max_seq = requested_max_seq.min(MAX_REQUESTED_SEQ);
                 if requested_max_seq > MAX_REQUESTED_SEQ {
                     let _ = writeln!(
@@ -1282,32 +1647,11 @@ fn main() {
                 // sidecar is skipped, so a default load never pays the +~1 GB
                 // tower VRAM. CLI-side gating is the primary path; this guard
                 // makes the flag durable for non-hipfire-CLI clients.
-                let vision_mode = msg
-                    .get("params")
-                    .and_then(|p| p.get("vision_mode"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("off");
-                let env_vision = developer_var("HIPFIRE_VISION_SIDECAR").ok();
-                let raw_vision: Option<String> = match env_vision.as_deref() {
-                    Some("") => None,
-                    Some(p) => Some(p.to_string()),
-                    None => msg
-                        .get("params")
-                        .and_then(|p| p.get("vision"))
-                        .and_then(|v| v.as_str())
-                        .filter(|s| !s.is_empty())
-                        .map(|s| s.to_string()),
-                };
-                vision_gated_off = None;
-                if vision_mode == "off" {
-                    if let Some(v) = raw_vision.as_deref() {
-                        eprintln!(
-                            "[hipfire-daemon] vision_mode=off — skipping tower sidecar load ({v})"
-                        );
-                        vision_gated_off = Some(v.to_string());
-                    }
-                }
-                let vision_path: Option<String> = apply_vision_mode_gate(vision_mode, raw_vision);
+                //
+                // One implementation for both load arms: `resolve_vision_ladder`
+                // (next to `apply_vision_mode_gate`).
+                let (vision_mode, vision_path, gated_off) = resolve_vision_ladder(&msg);
+                vision_gated_off = gated_off;
                 // Gemma 4 EAGLE drafter (arch-22 `gemma4_unified_assistant`).
                 // Deliberately a SEPARATE param from `params.draft` (the
                 // qwen3.5 DFlash knob) so a DFlash .hfq can never be routed
@@ -1363,6 +1707,34 @@ fn main() {
                     .and_then(|v| v.as_str())
                     .filter(|s| !s.is_empty())
                     .map(|s| s.to_string());
+                let kv_k_override = msg
+                    .get("params")
+                    .and_then(|p| p.get("kv_k"))
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string());
+                let kv_v_override = msg
+                    .get("params")
+                    .and_then(|p| p.get("kv_v"))
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string());
+                // lifecycle: deprecated since 0.4.0, removal 0.5.0 — Givens asym KV and the asymN/turboN aliases are superseded by fwht3
+                // One warning line when the load names a deprecated KV format
+                // (kv_mode falls back to HIPFIRE_KV_MODE exactly as the carriers do).
+                if let Some(warning) = [
+                    Some(kv_mode_override.as_deref().unwrap_or(
+                        hipfire_runtime::config::get().kv_mode.as_str(),
+                    )),
+                    kv_k_override.as_deref(),
+                ]
+                .into_iter()
+                .flatten()
+                .find_map(hipfire_runtime::kv_mode::deprecated_kv_name_warning)
+                {
+                    eprintln!("[hipfire-daemon] {warning}");
+                }
+
                 // Per-load adaptive-KV selector (mirrors kv_mode). Overrides the
                 // HIPFIRE_KV_ADAPTIVE env. off|conservative|balanced|aggressive|
                 // advanced:k=..,v=.. — resolved in load_model (param > env > off).
@@ -1388,6 +1760,17 @@ fn main() {
                     .and_then(|v| v.as_u64())
                     .map(|value| value as usize)
                     .unwrap_or(hipfire_runtime::config::get().mtp_k);
+                let mtp_path = request_guards::mtp_sidecar_path(&msg, &mtp_mode);
+
+                // DFlash adaptive verify-block (opt-in, default off): clamp(ceil(τ̂)+2,
+                // 2, full) over the trailing 8 verify cycles, full below 2k ctx.
+                // Mutually exclusive with the retained-PM4 route (fixed B=16 shape);
+                // HIPFIRE_DFLASH_ADAPTIVE_B=0 forces fixed.
+                let adaptive_b = msg
+                    .get("params")
+                    .and_then(|p| p.get("dflash_adaptive_b"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
 
                 // Model-free n-gram policy normally arrives as per-load params
                 // resolved by the CLI. Direct protocol clients inherit the
@@ -1452,19 +1835,10 @@ fn main() {
                         _ => None, // "auto" → loader default
                     },
                     mtp_k: Some(mtp_k),
+                    dflash_adaptive_b: Some(adaptive_b),
                 };
 
-                // 0.1.7-alpha: DFlash tuning knobs forwarded from the CLI.
-                // `adaptive_b` matches dflash_spec_demo's --adaptive-b default.
-                // Accepted here; the generate loop will honor it in the
-                // 0.1.7-stable release where we port the demo's outer τ-window
-                // trip-wire (below 2.5 → shrink block to 8).
-                let _adaptive_b = msg
-                    .get("params")
-                    .and_then(|p| p.get("dflash_adaptive_b"))
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(true);
-
+                // lifecycle: deprecated since 0.4.0, removal 0.5.0 — CASK/TriAttention KV eviction is unsupported research; use compact kv_cache modes
                 // 0.1.7: TriAttention / CASK eviction protocol fields. When
                 // `cask_sidecar` is set, `load_model` sizes the KV cache to a
                 // *physical_cap* (budget+beta+safety, clamped to max_seq) instead
@@ -1509,6 +1883,13 @@ fn main() {
                     .and_then(|p| p.get("cask_fold_m"))
                     .and_then(|v| v.as_u64())
                     .unwrap_or(2) as usize;
+                // CASK/TriAttention eviction is deprecated (removal in 0.5.0):
+                // it still loads, but every opt-in gets exactly one warning line.
+                if cask_sidecar.is_some() || cask_enabled {
+                    eprintln!(
+                        "[hipfire-daemon] warning: CASK is deprecated and will be removed in 0.5.0; not supported (cask_sidecar/cask set at load)"
+                    );
+                }
                 // Known-broken combo guard: CASK m-folding + DFlash spec decode
                 // degenerates into single-token loops after the first eviction
                 // (the m-folded synthetic K/V rows are off the draft's trained
@@ -1553,6 +1934,7 @@ fn main() {
                     gpu.mmq_screen.threshold = v as f32;
                 }
 
+                // lifecycle: deprecated since 0.4.0, removal 0.5.0 — PFlash is unsupported research; prefix caching supersedes it
                 // ── PFlash load-time params (Phase 4.0 #93) ──────────────
                 //
                 // Parse compression knobs per PRD §5.3.2. None of these
@@ -1640,6 +2022,13 @@ fn main() {
                     } else {
                         None
                     };
+                // PFlash is deprecated (removal in 0.5.0): it still loads, but
+                // every opt-in (prefill_compression != off) gets one warning line.
+                if pflash_mode_str != "off" {
+                    eprintln!(
+                        "[hipfire-daemon] warning: PFlash is deprecated and will be removed in 0.5.0; not supported, prefix caching supersedes it (prefill_compression={pflash_mode_str} set at load)"
+                    );
+                }
 
                 // Pipeline-parallel degree (Stage 7 of #58). Default 1 =
                 // single-GPU (no behavior change). pp > 1 routes through
@@ -1753,16 +2142,47 @@ fn main() {
                 // BEFORE any destructive side effect so a refusal leaves the
                 // prior model usable. The retained SourceAdmission is consumed
                 // by the load route below — no re-open, no re-classify.
-                let admission = match hipfire_loader::admission::admit_source(
-                    path,
-                    tp,
-                    pp,
-                    kv_backend_override.as_deref(),
-                    draft_path.as_deref(),
-                    gpu.arch.as_str(),
-                    vision_path.as_deref(),
-                    head_path.as_deref(),
-                    max_seq,
+                let qwen4_admission_options = hipfire_loader::admission::SourceAdmissionOptions {
+                    spec: spec_cfg,
+                    kv_adaptive: hipfire_loader::admission::qwen4_kv_adaptive_requested(
+                        kv_adaptive_override.as_deref(),
+                    ),
+                    eagle_drafter: gemma4_drafter.is_some(),
+                    cask: cask.sidecar.is_some(),
+                    state_quant: state_quant_override.is_some(),
+                    non_single_compute: !matches!(
+                        deepseek4_compute_placement,
+                        hipfire_config::Deepseek4ComputePlacement::Single
+                    ),
+                    expert_count_override: deepseek4_experts_per_token.is_some(),
+                    pflash: pflash_drafter.is_some() || pflash_mode_str != "off",
+                };
+                let backend_request = match hipfire_loader::admission::KvBackendRequest::from_override(
+                    kv_backend_override.as_deref()
+                ) {
+                    Ok(request) => request,
+                    Err(e) => {
+                        emit_uncorrelated_error(&mut stdout, None, &e, "validation", false, false);
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                };
+                let admission = match hipfire_loader::admission::admit_source_with_options(
+                    path, tp, pp, backend_request, draft_path.as_deref(),
+                    gpu.arch.as_str(), vision_path.as_deref(), &vision_mode,
+                    head_path.as_deref(), max_seq,
+                    hipfire_loader::admission::KvBackendHints {
+                        kv_mode: kv_mode_override.as_deref(),
+                        kv_k: kv_k_override.as_deref(),
+                        kv_v: kv_v_override.as_deref(),
+                        kv_adaptive: kv_adaptive_override.as_deref(),
+                        cask: Some(&cask),
+                        deepseek4_heterogeneous: !matches!(deepseek4_compute_placement, hipfire_config::Deepseek4ComputePlacement::Single),
+                        vmm_runtime_available: gpu.vmm_recommended_granularity().is_ok(),
+                        free_vram_bytes: gpu.hip.get_vram_info().ok().map(|(free, _)| free),
+                        qwen_default_q8: hipfire_loader::admission::qwen_default_q8_enabled(),
+                    },
+                    qwen4_admission_options,
                 ) {
                     Ok(a) => a,
                     Err(e) => {
@@ -1774,6 +2194,17 @@ fn main() {
                         continue;
                     }
                 };
+                let defer_prior_unload =
+                    load_tp > 1 || hipfire_loader::defers_prior_unload(admission.arch_id);
+                let max_seq = admission.max_seq;
+                let sequence_reason = admission.sequence_reason;
+                // Exactly one legacy warning per admitted trunk; loader admitted
+                // path does not emit (daemon owns the boundary).
+                let pending_kv_diag = ResidentKvDiag::from_admission(
+                    backend_request,
+                    admission.kv_backend,
+                    admission.kv_backend_reason.as_deref(),
+                );
 
                 // Unload previous if any. PFlash drafter goes first so
                 // its tensors join the pool before unload_model drains
@@ -1794,7 +2225,7 @@ fn main() {
                 // the original order. (EP archs are ds4/minimax and refuse
                 // PFlash drafters, so on a SUCCESSFUL tp>1 load this just frees
                 // the outgoing model's drafter at the deferred site.)
-                if load_tp <= 1 {
+                if !defer_prior_unload {
                     if let Some(mut pf) = pflash_state.take() {
                         if let Some(mut dg) = pflash_drafter_gpu.take() {
                             dg.bind_thread_or_warn();
@@ -1816,8 +2247,11 @@ fn main() {
                                 false,
                             );
                             let _ = stdout.flush();
+                            resident_kv = None;
                             continue;
                         }
+                        // Prior ordinary model is gone until the new load publishes.
+                        resident_kv = None;
                     } else if let Err(err) = hipfire_loader::ensure_vmm_ready_for_load(&mut gpu) {
                         emit_uncorrelated_error(&mut stdout, None, &err, "internal", false, false);
                         let _ = stdout.flush();
@@ -1844,7 +2278,8 @@ fn main() {
                         max_seq,
                         tp,
                         kv_mode_override.as_deref(),
-                        kv_backend_override.as_deref(),
+                        kv_k_override.as_deref(),
+                        kv_v_override.as_deref(),
                         state_quant_override.as_deref(),
                     )
                 } else {
@@ -1857,7 +2292,10 @@ fn main() {
                         draft_path.as_deref(),
                         gemma4_drafter.as_deref(),
                         gemma4_draft_len,
+                        mtp_path.as_deref(),
                         kv_mode_override.as_deref(),
+                        kv_k_override.as_deref(),
+                        kv_v_override.as_deref(),
                         kv_adaptive_override.as_deref(),
                         state_quant_override.as_deref(),
                         &cask,
@@ -1868,26 +2306,33 @@ fn main() {
                 };
                 match loaded {
                     Ok(mut m) => {
+                        let max_seq = m.max_seq;
+                        let resolved = m.sequence.as_ref();
+                        let seq_bound = resolved.map_or(
+                            if requested_seq.is_some() { "user" } else { "legacy" },
+                            |s| s.bound,
+                        );
+                        let model_ctx = resolved.map(|s| s.model_ctx);
+                        let card_cap = resolved.map(|s| s.card_cap);
+                        let seq_kv = resolved.map_or_else(
+                            || kv_mode_override.as_deref().unwrap_or("auto"),
+                            |s| s.kv_mode,
+                        );
+                        let seq_reason_json = serde_json::to_string(&sequence_reason).unwrap();
+                        if let Some(s) = resolved {
+                            eprintln!("max_seq: {max_seq} (bound={seq_bound}; model_ctx={}, card_cap={}, kv={seq_kv})", s.model_ctx, s.card_cap);
+                        } else {
+                            eprintln!("max_seq: {max_seq} (bound={seq_bound}; model_ctx=unknown, card_cap=unknown, kv={seq_kv})");
+                        }
+                        if let Some(reason) = sequence_reason {
+                            eprintln!("{reason}");
+                        }
                         // Deferred EP retirement lives AFTER continuous-batch
                         // staging below: the prior resident in `model` (and
                         // its PFlash drafter) must survive every fallible
                         // stage of the new model so a staging failure rolls
                         // back only `m` and keeps the prior usable.
-                        let arch = match m.arch_id {
-                            5 => "qwen3_5",
-                            6 => "qwen3_5_moe",
-                            7 => "qwen2",
-                            8 => "dots-ocr",
-                            9 => "deepseek4",
-                            10 => "minimax_m2",
-                            11 => "lfm2moe",
-                            12 => "north_mini_code",
-                            13 => "gemma4",
-                            14 => "muse_glimmer",
-                            40 => "flux_mmdit",
-                            45 => "flux2_mmdit",
-                            _ => "qwen3",
-                        };
+                        let arch = hipfire_loader::arch_label(m.arch_id);
                         let drafter = m.speculator.as_ref().map(|speculator| speculator.name());
                         let redline_default = hipfire_runtime::config::retained_redline_default(
                             &gpu.arch,
@@ -1906,7 +2351,21 @@ fn main() {
                                 gpu.replay.transport_name()
                             );
                         }
-                        let vl = m.vision_config().is_some() || m.dots_ocr().is_some();
+                        // NOP pacing is certified for the gfx1201 Qwen3.5-dense
+                        // retained tape only; MQ4R and every other retained
+                        // default keep their unpaced tapes.
+                        let gfx1201_dense_pacing = redline_default
+                            && gpu.arch == "gfx1201"
+                            && arch == "qwen3_5"
+                            && !hipfire_runtime::config::mq4r_redline_default(
+                                &gpu.arch, path, pp, tp,
+                            );
+                        gpu.replay.set_pm4_gfx12_dispatch_pacing(if gfx1201_dense_pacing {
+                            rdna_compute::replay::gfx1201_pm4_pacing_from_config()
+                        } else {
+                            Default::default()
+                        });
+                        let vl = m.has_vision_encoder();
                         let (dim, layers, vocab) = m.ack_dims();
 
                         // Apply MTP config from load-message params.
@@ -2016,20 +2475,20 @@ fn main() {
                                 continue;
                             }
                         };
-                        // FIX #1 (deferred EP unload, after staging): the new
-                        // model is fully staged — NOW retire the prior model
-                        // before publishing (single-GPU/pp models were already
-                        // unloaded eagerly above; this branch only fires for
-                        // deferred tp>1). Prior PFlash drafter is part of that
-                        // prior model, so tear it down first in the same
-                        // drafter-before-unload order used elsewhere.
+                        // FIX #1 (deferred model retirement, after staging):
+                        // the new model is fully staged — NOW retire the
+                        // prior model before publishing. Single-GPU/pp models
+                        // are unloaded eagerly above; this branch handles
+                        // deferred TP or Qwen4 loads. Prior PFlash drafter is
+                        // part of that prior model, so tear it down first in
+                        // the same drafter-before-unload order used elsewhere.
                         //
                         // Transactional: if prior unload fails, do NOT install
                         // or emit `loaded` for the new model. Explicitly unload
-                        // the newly built EP model, clear associated fresh
-                        // state, and emit a hard error covering prior failure
-                        // and any rollback failure.
-                        if load_tp > 1 {
+                        // the newly built model, clear associated fresh state,
+                        // and emit a hard error covering prior failure and any
+                        // rollback failure.
+                        if defer_prior_unload {
                             if let Some(mut pf) = pflash_state.take() {
                                 if let Some(mut dg) = pflash_drafter_gpu.take() {
                                     dg.bind_thread_or_warn();
@@ -2056,6 +2515,7 @@ fn main() {
                                     Err(e) => Some(e),
                                 };
                                 // model stays None; pflash already cleared above.
+                                resident_kv = None;
                                 let msg = ep_deferred_handoff_error_message(
                                     &prior_err,
                                     rollback_err.as_deref(),
@@ -2118,11 +2578,22 @@ fn main() {
                         };
                         let reasoning_efforts_json = serde_json::to_string(&reasoning_efforts)
                             .unwrap_or_else(|_| "[]".to_string());
-                        // Load ack exposes batch dimensions/capability; EP adds parallelism metadata but never infers operation from logs.
+                        let backend_reason_json =
+                            serde_json::to_string(&pending_kv_diag.reason)
+                                .expect("backend reason is serializable");
+                        let backend_warning_json =
+                            serde_json::to_string(&pending_kv_diag.warning)
+                                .expect("backend warning is serializable");
+                        // Publish resident KV metadata with the loaded ACK.
+                        resident_kv = Some(ResidentKvDiag {
+                            mode: Some(seq_kv.to_owned()),
+                            ..pending_kv_diag.clone()
+                        });
+                        // Load ack reports effective storage, not only the request.
                         if staged_ep_batch {
                             let _ = writeln!(
                                 stdout,
-                                r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{},"reasoning_contract":"{}","reasoning_effort_native":{},"reasoning_efforts":{},"cache_capable":{},"retry_reset_eligible":{},"continuous_batch_capable":{},"continuous_batch_slots":{},"continuous_batch_lane_capacity":{},"continuous_batch_parallelism":"expert_parallel","continuous_batch_rank_count":4,"continuous_batch_reduce":"peer_rooted_f32"}}"#,
+                                r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{},"reasoning_contract":"{}","reasoning_effort_native":{},"reasoning_efforts":{},"cache_capable":{},"retry_reset_eligible":{},"continuous_batch_capable":{},"continuous_batch_slots":{},"continuous_batch_lane_capacity":{},"continuous_batch_parallelism":"expert_parallel","continuous_batch_rank_count":4,"continuous_batch_reduce":"peer_rooted_f32","kv_backend_request":"{}","kv_backend":"{}","kv_backend_reason":{},"kv_backend_legacy":{},"kv_backend_warning":{},"max_seq":{},"max_seq_bound":"{}","max_seq_reason":{},"model_ctx":{},"card_cap":{},"kv_mode":"{}"}}"#,
                                 arch,
                                 dim,
                                 layers,
@@ -2136,11 +2607,18 @@ fn main() {
                                 continuous_batch_capable,
                                 staged_ep_slots,
                                 staged_ep_lane_cap,
+                                pending_kv_diag.request,
+                                pending_kv_diag.backend,
+                                backend_reason_json,
+                                pending_kv_diag.legacy,
+                                backend_warning_json,
+                                max_seq, seq_bound, seq_reason_json, serde_json::to_string(&model_ctx).unwrap(),
+                                serde_json::to_string(&card_cap).unwrap(), seq_kv,
                             );
                         } else {
                             let _ = writeln!(
                                 stdout,
-                                r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{},"reasoning_contract":"{}","reasoning_effort_native":{},"reasoning_efforts":{},"cache_capable":{},"retry_reset_eligible":{},"continuous_batch_capable":{}}}"#,
+                                r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{},"reasoning_contract":"{}","reasoning_effort_native":{},"reasoning_efforts":{},"cache_capable":{},"retry_reset_eligible":{},"continuous_batch_capable":{},"kv_backend_request":"{}","kv_backend":"{}","kv_backend_reason":{},"kv_backend_legacy":{},"kv_backend_warning":{},"max_seq":{},"max_seq_bound":"{}","max_seq_reason":{},"model_ctx":{},"card_cap":{},"kv_mode":"{}"}}"#,
                                 arch,
                                 dim,
                                 layers,
@@ -2151,7 +2629,14 @@ fn main() {
                                 reasoning_efforts_json,
                                 cache_capable,
                                 retry_reset_eligible,
-                                continuous_batch_capable
+                                continuous_batch_capable,
+                                pending_kv_diag.request,
+                                pending_kv_diag.backend,
+                                backend_reason_json,
+                                pending_kv_diag.legacy,
+                                backend_warning_json,
+                                max_seq, seq_bound, seq_reason_json, serde_json::to_string(&model_ctx).unwrap(),
+                                serde_json::to_string(&card_cap).unwrap(), seq_kv,
                             );
                         }
                         // ── PFlash drafter load (Phase 4.0) ──────────────
@@ -2354,11 +2839,32 @@ fn main() {
                 // mode owns exactly one SlotEngine/weight set with no ordinary-model fallback.
                 // Spawn a bounded request worker so the main loop continues accepting independent generates.
                 if let Some(slot) = slot_backend.clone() {
+                    // Bound thread creation BEFORE spawning (spec §5.3:
+                    // "a guard acquired inside an already spawned thread
+                    // does not bound thread creation"). The worker's own
+                    // acquire_guard remains the hard atomic bound; this
+                    // pre-check keeps an arrival burst from spawning a
+                    // thread per rejected request.
+                    if slot.active_count() >= 32 {
+                        hipfire_engine::emit::emit_active_attempt_error(
+                            &mut stdout,
+                            Some(id),
+                            "too many concurrent slot requests (bounded worker limit hit)",
+                            // Overload, not validation: slot saturation is a
+                            // transient capacity condition → 429 + Retry-After.
+                            "overload",
+                            true,
+                            false,
+                        );
+                        let _ = stdout.flush();
+                        batch_clear_terminal(id, gen_attempt_id);
+                        continue;
+                    }
                     let msg_clone = msg.clone();
                     let id_owned = id.to_string();
                     let slot_clone = slot.clone();
                     let admission = admission;
-                    // Bounded: refuse if too many active? The backend's active counter bounds concurrency;
+                    // Bounded: the backend's active counter bounds concurrency;
                     // engine itself is the only GPU worker, so workers serialize on engine submit.
                     std::thread::spawn(move || {
                         // Each worker uses its own stdout handle; every event is one serde JSON line.
@@ -2575,24 +3081,11 @@ fn main() {
                         },
                         None => None,
                     };
-                // hunt3 M-F: parse user stop sequences (top-level `stop` field on
-                // the generate message; the CLI forwards OpenAI `stop` here, already
-                // normalized to string[], <=4 entries, <=64 chars each). The decode
-                // loops match these against the decoded output suffix and finish
-                // with finish_reason="stop" on a hit. Re-apply the cap defensively
-                // in case a non-hipfire client drives the daemon directly.
-                let stop_seqs: Vec<String> = msg
-                    .get("stop")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|s| s.as_str())
-                            .filter(|s| !s.is_empty())
-                            .take(4)
-                            .map(|s| s.chars().take(64).collect::<String>())
-                            .collect()
-                    })
-                    .unwrap_or_default();
+                // OpenAI `stop` (string or array form); an invalid value is rejected.
+                let Some(stop_seqs) = hipfire_generate::ar::stop_or_reject(&mut stdout, id, &msg)
+                else {
+                    continue;
+                };
 
                 // Sampling defaults differ by arch: qwen35 family was tuned
                 // at `temp=0.3, top_p=0.8` (DFlash-friendly, instruct-stable);
@@ -2631,6 +3124,7 @@ fn main() {
                     .get("max_tokens")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(4096) as usize;
+                let _fit = request_guards::fit_max_tokens(&msg);
                 let top_p = msg
                     .get("top_p")
                     .and_then(|v| v.as_f64())
@@ -2826,6 +3320,10 @@ fn main() {
                 // Covers qwen35-vl (arch 5/6 bundle), dots-ocr (arch 8) AND
                 // lfm2-vl (arch-11 bundle) in one declared-capability probe.
                 let has_vl = m.has_vision_encoder();
+                let tp = m.ep.is_some();
+                if request_guards::refuse_ep_request(&mut stdout, id, &msg, tp, has_image) {
+                    continue;
+                }
 
                 if has_image {
                     let _ =
@@ -3801,6 +4299,7 @@ fn main() {
                                     continuous_batch_size = 1;
                                     batch_poisoned = None;
                                     batch_clear_all_terminals();
+                                    resident_kv = None;
                                     let _ = writeln!(stdout, "{}", r#"{"type":"unloaded"}"#);
                                     let _ = stdout.flush();
                                 }
@@ -3821,6 +4320,7 @@ fn main() {
                             },
                         }
                     } else {
+                        resident_kv = None;
                         let _ = writeln!(stdout, "{}", r#"{"type":"unloaded"}"#);
                         let _ = stdout.flush();
                     }
@@ -3871,9 +4371,12 @@ fn main() {
                 };
                 match unload_result {
                     Ok(()) => {
+                        resident_kv = None;
                         let _ = writeln!(stdout, r#"{{"type":"unloaded"}}"#);
                     }
                     Err(err) => {
+                        // Model handle is already taken; clear resident claim.
+                        resident_kv = None;
                         emit_uncorrelated_error(
                             &mut stdout,
                             None,
@@ -3957,23 +4460,10 @@ fn main() {
             "diag" => {
                 let (vram_free, vram_total) = gpu.hip.get_vram_info().unwrap_or((0, 0));
                 let hip_ver = gpu.hip.runtime_version().unwrap_or((0, 0));
-                let has_model = model.is_some();
+                let has_model = model.is_some() || slot_backend.is_some();
                 let model_arch = model
                     .as_ref()
-                    .map(|m| match m.arch_id {
-                        5 => "qwen3_5",
-                        6 => "qwen3_5_moe",
-                        7 => "qwen2",
-                        9 => "deepseek4",
-                        10 => "minimax_m2",
-                        11 => "lfm2moe",
-                        12 => "north_mini_code",
-                        13 => "gemma4",
-                        14 => "muse_glimmer",
-                        40 => "flux_mmdit",
-                        45 => "flux2_mmdit",
-                        _ => "qwen3",
-                    })
+                    .map(|m| hipfire_loader::arch_label(m.arch_id))
                     .unwrap_or("none");
                 // Count pre-compiled kernels
                 let kernel_dir = std::env::current_exe()
@@ -4020,9 +4510,21 @@ fn main() {
                         (hsaco, hash)
                     })
                     .unwrap_or((0, 0));
+                let kv = resident_kv.as_ref();
+                let kv_backend_json = serde_json::to_string(&kv.map(|k| k.backend.as_str()))
+                    .expect("kv_backend serializable");
+                let kv_request_json = serde_json::to_string(&kv.map(|k| k.request.as_str()))
+                    .expect("kv_backend_request serializable");
+                let kv_reason_json = serde_json::to_string(&kv.and_then(|k| k.reason.as_deref()))
+                    .expect("kv_backend_reason serializable");
+                let kv_legacy = kv.map(|k| k.legacy).unwrap_or(false);
+                let kv_warning_json = serde_json::to_string(&kv.and_then(|k| k.warning.as_deref()))
+                    .expect("kv_backend_warning serializable");
+                let kv_mode_json = serde_json::to_string(&kv.and_then(|k| k.mode.as_deref()))
+                    .expect("kv_mode serializable");
                 let _ = writeln!(
                     stdout,
-                    r#"{{"type":"diag","arch":"{}","hip_version":"{}.{}","vram_free_mb":{},"vram_total_mb":{},"model_loaded":{},"model_arch":"{}","kernels":{},"kernel_hashes":{}}}"#,
+                    r#"{{"type":"diag","arch":"{}","hip_version":"{}.{}","vram_free_mb":{},"vram_total_mb":{},"model_loaded":{},"model_arch":"{}","kernels":{},"kernel_hashes":{},"kv_backend":{},"kv_backend_request":{},"kv_backend_reason":{},"kv_backend_legacy":{},"kv_backend_warning":{},"kv_mode":{}}}"#,
                     gpu.arch,
                     hip_ver.0,
                     hip_ver.1,
@@ -4031,7 +4533,13 @@ fn main() {
                     has_model,
                     model_arch,
                     hsaco_count,
-                    hash_count
+                    hash_count,
+                    kv_backend_json,
+                    kv_request_json,
+                    kv_reason_json,
+                    kv_legacy,
+                    kv_warning_json,
+                    kv_mode_json,
                 );
                 let _ = stdout.flush();
             }
@@ -4312,12 +4820,16 @@ fn main() {
                 // in which forward they call.
                 if m.pp > 1
                     || m.ep.is_some()
-                    || (m.arch_id != 5 && m.arch_id != 6 && m.arch_id != 13 && m.arch_id != 14)
+                    || (m.arch_id != 5
+                        && m.arch_id != 6
+                        && m.arch_id != 13
+                        && m.arch_id != 14
+                        && m.arch_id != 16)
                 {
                     emit_uncorrelated_error(
                         &mut stdout,
                         None,
-                        "bench_decode requires a single-GPU Qwen3.5, Gemma4, or Muse Glimmer model",
+                        "bench_decode requires a single-GPU Qwen3.5, Qwen4, Gemma4, or Muse Glimmer model",
                         "unsupported",
                         false,
                         false,
@@ -4390,6 +4902,7 @@ fn main() {
                 let prime_error: Option<String> =
                     match hipfire_loader::bench_decode_route(m.arch_id) {
                         hipfire_loader::BenchDecodeRoute::Qwen35
+                        | hipfire_loader::BenchDecodeRoute::Qwen4
                         | hipfire_loader::BenchDecodeRoute::Gemma4
                         | hipfire_loader::BenchDecodeRoute::MuseGlimmer => {
                             hipfire_loader::carrier_for(m.arch_id)
@@ -4449,6 +4962,7 @@ fn main() {
                 let mut decode_err: Option<String> = None;
                 let run_ok = match hipfire_loader::bench_decode_route(m.arch_id) {
                     hipfire_loader::BenchDecodeRoute::Qwen35
+                    | hipfire_loader::BenchDecodeRoute::Qwen4
                     | hipfire_loader::BenchDecodeRoute::Gemma4
                     | hipfire_loader::BenchDecodeRoute::MuseGlimmer => {
                         hipfire_loader::carrier_for(m.arch_id)

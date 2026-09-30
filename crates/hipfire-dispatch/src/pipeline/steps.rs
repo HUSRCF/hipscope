@@ -8,6 +8,7 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 use std::sync::OnceLock;
 
 use crate::context::DispatchCtx;
+use crate::cpu_exec;
 use crate::families::fused_qkv::{FusedQkvBiasParams, FusedQkvFamily, FusedQkvParams};
 use crate::families::gemv::{GemvFamily, GemvParams, RotateInputs, WeightRef};
 use crate::families::rotation::{RotationFamily, RotationParams};
@@ -82,25 +83,59 @@ pub enum Step<'a> {
         bias: &'a GpuTensor,
         dim: usize,
     },
-    /// Complete validated MoE program. The call owns the bound expert view and
-    /// raw operands privately; callers can only obtain it through `seal_*`.
+    /// Grouped hyper-connection read.  The operation contract is model-neutral;
+    /// architecture crates bind the resident projections and fixed-capacity views.
+    HyperRead(crate::pipeline::layer_ops::HyperReadOp<'a>),
+    /// Gated DeltaNet recurrent attention with borrowed state and scratch.
+    GatedDeltaNet(crate::pipeline::layer_ops::GatedDeltaNetOp<'a>),
+    /// Indexed causal attention with borrowed cache metadata.
+    IndexedAttention(crate::pipeline::layer_ops::IndexedAttentionOp<'a>),
+    /// Grouped hyper-connection write with in-place residual injection.
+    HyperWrite(crate::pipeline::layer_ops::HyperWriteOp<'a>),
+    /// Grouped causal convolution/gating operation.
+    GroupedDepthwise(crate::pipeline::layer_ops::GroupedDepthwiseOp<'a>),
+    /// Launch-free clear of a preallocated scratch prefix.
+    Clear(crate::pipeline::layer_ops::ClearOp<'a>),
+    /// Embedding-table lookup of device-resident token ids.
+    Embed(crate::pipeline::layer_ops::EmbeddingOp<'a>),
+    /// Grouped hyper-connection RMS norm.
+    HyperNorm(crate::pipeline::layer_ops::HyperNormOp<'a>),
+    /// One weight projection through the shared stateful-op contract.
+    Project(crate::pipeline::layer_ops::ProjectOp<'a>),
+    /// Per-row broadcast add of one activation row.
+    BroadcastAdd(crate::pipeline::layer_ops::BroadcastAddOp<'a>),
+    /// Complete validated MoE program; granular operands come from its shared lowerer.
     Moe(sealed_moe::SealedMoeCall<'a>),
+    /// Validated granular MoE stage; the sealed call is still the public authority.
+    MoeStage(
+        crate::pipeline::moe_program::SealedMoeOp<'a>,
+        crate::pipeline::moe_program::MoeStage,
+    ),
 }
 
-/// Op-kind for fusion matching. Total over Step variants.
-fn op_kind(step: &Step) -> PipelineOp {
+/// Op-kind for fusion matching. Composite and opaque MoE operations are
+/// barriers, represented by `None` rather than a fake numeric opcode.
+fn op_kind(step: &Step) -> Option<PipelineOp> {
     match step {
-        Step::Gemv { .. } => PipelineOp::Gemv,
-        Step::GemvResidual { .. } => PipelineOp::GemvResidual,
-        Step::RmsnormAutomatic { .. } => PipelineOp::RmsnormAutomatic,
-        Step::Attend { .. } => PipelineOp::Attend,
-        Step::Rope { .. } => PipelineOp::Rope,
-        Step::QkNorm { .. } => PipelineOp::QkNorm,
-        Step::BiasAdd { .. } => PipelineOp::BiasAdd,
-        // MoE is already a complete grammar, so it must never be considered
-        // a projection fusion prefix.  `MoeCombine` is the existing pipeline
-        // marker and lowers to the dedicated `SuperOpKind::Moe`.
-        Step::Moe(_) => PipelineOp::MoeCombine,
+        Step::Gemv { .. } => Some(PipelineOp::Gemv),
+        Step::GemvResidual { .. } => Some(PipelineOp::GemvResidual),
+        Step::RmsnormAutomatic { .. } => Some(PipelineOp::RmsnormAutomatic),
+        Step::Attend { .. } => Some(PipelineOp::Attend),
+        Step::Rope { .. } => Some(PipelineOp::Rope),
+        Step::QkNorm { .. } => Some(PipelineOp::QkNorm),
+        Step::BiasAdd { .. } => Some(PipelineOp::BiasAdd),
+        Step::HyperRead(_)
+        | Step::GatedDeltaNet(_)
+        | Step::IndexedAttention(_)
+        | Step::HyperWrite(_)
+        | Step::GroupedDepthwise(_)
+        | Step::Clear(_)
+        | Step::Embed(_)
+        | Step::HyperNorm(_)
+        | Step::Project(_)
+        | Step::BroadcastAdd(_)
+        | Step::Moe(_)
+        | Step::MoeStage(..) => None,
     }
 }
 
@@ -158,10 +193,42 @@ pub(crate) fn guard_qkv_mq4g256lloyd(steps: &[Step], ctx: &DispatchCtx) -> bool 
     steps.len() == 4 && gemv_steps_uniform(steps, DType::MQ4G256Lloyd, true)
 }
 
-/// Exact MQ4G256V2 scalar fusion is fail-closed to gfx1100 + gfx1201 only.
+/// Exact MQ4G256V2 scalar fusion is fail-closed to gfx1100 + gfx1151 + gfx1201.
 /// Keep `force_unfused` first so the global kill-switch still wins.
 fn mq4g256v2_scalar_fusion_ok(ctx: &DispatchCtx) -> bool {
-    !ctx.flags.force_unfused && (ctx.arch.is_gfx1100() || ctx.arch.is_gfx1201())
+    !ctx.flags.force_unfused
+        && (ctx.arch.is_gfx1100() || ctx.arch.is_gfx1151() || ctx.arch.is_gfx1201())
+}
+
+/// True if all Gemv steps in the window (indices 1..) are MQ4G256V2-Lloyd
+/// (qt=52) with a decode LUT attached, Prerotated input, and no AWQ on the
+/// weight ref (AWQ is applied in the RmsnormAutomatic step). A Lloyd tensor
+/// without its LUT must never fuse onto the uniform decode grid.
+fn gemv_steps_uniform_mq4g256v2_lloyd(steps: &[Step]) -> bool {
+    steps[1..].iter().all(|s| match s {
+        Step::Gemv {
+            w,
+            input: GemvInput::Prerotated(_),
+            ..
+        } => w.dtype == DType::MQ4G256V2Lloyd && w.awq_scale.is_none() && w.lloyd_lut_f16.is_some(),
+        _ => false,
+    })
+}
+
+/// MQ4G256V2-Lloyd (qt=52) QKV decode fusion: same arch set as the uniform
+/// V2 guard; the family arm passes the three per-tensor codebooks.
+pub(crate) fn guard_qkv_mq4g256v2_lloyd(steps: &[Step], ctx: &DispatchCtx) -> bool {
+    mq4g256v2_scalar_fusion_ok(ctx) && steps.len() == 4 && gemv_steps_uniform_mq4g256v2_lloyd(steps)
+}
+
+/// MQ4G256V2-Lloyd (qt=52) QKVZA decode fusion (four codebooks).
+pub(crate) fn guard_qkvza_mq4g256v2_lloyd(steps: &[Step], ctx: &DispatchCtx) -> bool {
+    mq4g256v2_scalar_fusion_ok(ctx) && steps.len() == 5 && gemv_steps_uniform_mq4g256v2_lloyd(steps)
+}
+
+/// MQ4G256V2-Lloyd (qt=52) gate+up decode fusion (two codebooks).
+pub(crate) fn guard_gate_up_mq4g256v2_lloyd(steps: &[Step], ctx: &DispatchCtx) -> bool {
+    mq4g256v2_scalar_fusion_ok(ctx) && steps.len() == 3 && gemv_steps_uniform_mq4g256v2_lloyd(steps)
 }
 
 /// Exact MQ4G256V2 (qt44) QKV decode fusion. Official Ornith is all-qt44;
@@ -224,7 +291,7 @@ pub(crate) fn guard_qkvza_mq4g256lloyd(steps: &[Step], ctx: &DispatchCtx) -> boo
 }
 
 /// Exact MQ4G256V2 (qt44) QKVZA decode fusion.
-/// Fail-closed to gfx1100/gfx1201; other arches keep per-projection V2 GEMVs.
+/// Fail-closed to gfx1100/gfx1151/gfx1201; other arches keep per-projection V2 GEMVs.
 pub(crate) fn guard_qkvza_mq4g256v2(steps: &[Step], ctx: &DispatchCtx) -> bool {
     mq4g256v2_scalar_fusion_ok(ctx)
         && steps.len() == 5
@@ -281,7 +348,7 @@ pub(crate) fn guard_gate_up_mq4g256lloyd(steps: &[Step], ctx: &DispatchCtx) -> b
 }
 
 /// Exact MQ4G256V2 (qt44) gate+up decode fusion.
-/// Fail-closed to gfx1100/gfx1201; other arches keep per-projection V2 GEMVs.
+/// Fail-closed to gfx1100/gfx1151/gfx1201; other arches keep per-projection V2 GEMVs.
 pub(crate) fn guard_gate_up_mq4g256v2(steps: &[Step], ctx: &DispatchCtx) -> bool {
     mq4g256v2_scalar_fusion_ok(ctx)
         && steps.len() == 3
@@ -472,24 +539,24 @@ pub fn match_prefix(
         .filter(|p| {
             !p.ops.is_empty()
                 && p.ops.len() <= steps.len()
-                && p.ops.iter().zip(steps).all(|(o, s)| *o == op_kind(s))
+                && p.ops.iter().zip(steps).all(|(o, s)| op_kind(s) == Some(*o))
                 && (p.guard)(&steps[..p.ops.len()], ctx)
         })
         .max_by_key(|p| p.ops.len())
         .map(|p| (p.key, p.ops.len()))
 }
 
-/// Lower-time fusion match over the canonical `FUSED_TABLE`. The Ship-6 super-op
-/// lowering (`superop::lower_layer`) calls THIS — reusing the same table + guards
-/// verbatim — so a lowered program can never drift from what `execute_steps`
-/// would dispatch live (the fusion-drift mitigation, spike risk #1).
-pub(crate) fn match_fused_prefix(steps: &[Step], ctx: &DispatchCtx) -> Option<(KernelKey, usize)> {
-    match_prefix(FUSED_TABLE, steps, ctx)
+/// Crate-local accessor retained for the dormant super-op substrate. Opaque
+/// MoE operations remain fusion barriers and map to the complete MoE marker
+/// only when that substrate asks for a single-step kind.
+pub(crate) fn step_op_kind(step: &Step) -> PipelineOp {
+    op_kind(step).unwrap_or(PipelineOp::MoeCombine)
 }
 
-/// Public(crate) op-kind accessor for the lowering (mirror of the private `op_kind`).
-pub(crate) fn step_op_kind(step: &Step) -> PipelineOp {
-    op_kind(step)
+/// Match the canonical fused-operation table while treating sealed MoE
+/// operations as fusion barriers.
+pub(crate) fn match_fused_prefix(steps: &[Step], ctx: &DispatchCtx) -> Option<(KernelKey, usize)> {
+    match_prefix(FUSED_TABLE, steps, ctx)
 }
 
 const QKV3: &[PipelineOp] = &[
@@ -531,6 +598,11 @@ const FUSED_TABLE: &[FusedPattern] = &[
     },
     FusedPattern {
         ops: QKV3,
+        key: KernelKey::FusedQkvMq4G256V2Lloyd,
+        guard: guard_qkv_mq4g256v2_lloyd,
+    },
+    FusedPattern {
+        ops: QKV3,
         key: KernelKey::FusedQkvHfq4G256,
         guard: guard_qkv_hfq4g256,
     },
@@ -555,6 +627,11 @@ const FUSED_TABLE: &[FusedPattern] = &[
         ops: QKVZA4,
         key: KernelKey::FusedQkvzaMq4G256V2,
         guard: guard_qkvza_mq4g256v2,
+    },
+    FusedPattern {
+        ops: QKVZA4,
+        key: KernelKey::FusedQkvzaMq4G256V2Lloyd,
+        guard: guard_qkvza_mq4g256v2_lloyd,
     },
     FusedPattern {
         ops: QKVZA4,
@@ -588,6 +665,11 @@ const FUSED_TABLE: &[FusedPattern] = &[
         ops: GATE_UP2,
         key: KernelKey::FusedGateUpMq4G256V2,
         guard: guard_gate_up_mq4g256v2,
+    },
+    FusedPattern {
+        ops: GATE_UP2,
+        key: KernelKey::FusedGateUpMq4G256V2Lloyd,
+        guard: guard_gate_up_mq4g256v2_lloyd,
     },
     FusedPattern {
         ops: GATE_UP2,
@@ -653,25 +735,67 @@ const FUSED_TABLE: &[FusedPattern] = &[
 static GEMV: OnceLock<GemvFamily> = OnceLock::new();
 static ROTATION: OnceLock<RotationFamily> = OnceLock::new();
 static FUSED_QKV: OnceLock<FusedQkvFamily> = OnceLock::new();
-
-pub fn execute_steps(
-    gpu: &mut Gpu,
-    ctx: &DispatchCtx,
-    steps: &[Step],
-) -> Result<(), DispatchError> {
-    // Validate every sealed call before issuing even the first non-MoE launch.
-    // This is intentionally a separate pass: a malformed later call must not
-    // leave an earlier step partially executed.
+/// Preflight every new composite operation and sealed MoE call in a typed
+/// program without launching or mutating state.  The legacy scalar `Step`
+/// variants deliberately retain their existing launch-time validation and are
+/// not widened by this seam.
+///
+/// Architecture binders use this before unrelated effects (embedding, cache
+/// staging, or PLE leases) begin.
+pub fn validate_steps<'a>(gpu: &Gpu, steps: &[Step<'a>]) -> Result<(), DispatchError> {
     for step in steps {
         match step {
             Step::Moe(call) => call.validate_for_gpu(gpu)?,
+            Step::HyperRead(op) => op.validate_for_gpu(gpu)?,
+            Step::GatedDeltaNet(op) => op.validate_for_gpu(gpu)?,
+            Step::IndexedAttention(op) => op.validate_for_gpu(gpu)?,
+            Step::HyperWrite(op) => op.validate_for_gpu(gpu)?,
+            Step::GroupedDepthwise(op) => op.validate_for_gpu(gpu)?,
+            Step::Clear(op) => op.validate_for_gpu(gpu)?,
+            Step::Embed(op) => op.validate_for_gpu(gpu)?,
+            Step::HyperNorm(op) => op.validate_for_gpu(gpu)?,
+            Step::Project(op) => op.validate_for_gpu(gpu)?,
+            Step::BroadcastAdd(op) => op.validate_for_gpu(gpu)?,
             _ => {}
         }
     }
+    Ok(())
+}
 
+pub fn execute_steps<'a>(
+    gpu: &mut Gpu,
+    ctx: &DispatchCtx,
+    steps: &[Step<'a>],
+) -> Result<(), DispatchError> {
+    validate_steps(gpu, steps)?;
+    execute_validated_steps(gpu, ctx, steps)
+}
+
+/// Execute a list after [`validate_steps`] has completed.  This entry point is
+/// for architecture owners that must preflight the entire list before other
+/// request effects begin.
+pub fn execute_validated_steps<'a>(
+    gpu: &mut Gpu,
+    ctx: &DispatchCtx,
+    steps: &[Step<'a>],
+) -> Result<(), DispatchError> {
     let mut i = 0;
+    // A fused hyper write that produced the gate quarters of the hyper write
+    // at this index, and the quarter slot it used.
+    let mut gates_ready: Option<(usize, usize)> = None;
     while i < steps.len() {
-        if let Some((key, len)) = match_prefix(FUSED_TABLE, &steps[i..], ctx) {
+        // Fusion is bypassed for a window that contains a CPU-executed step: a
+        // fused entry is one kernel launch over several weights, so it cannot
+        // half-land on the CPU seam, and splitting it costs launches it was
+        // there to save — nothing else. (Fusion has no numerical contract to
+        // preserve here; see the module docs on the tolerance contract.)
+        let fused = match_prefix(FUSED_TABLE, &steps[i..], ctx).filter(|(_, len)| {
+            !cpu_exec::cpu_exec_enabled()
+                || !steps[i..i + *len]
+                    .iter()
+                    .any(|s| cpu_exec::plan_step(gpu, s).is_some())
+        });
+        if let Some((key, len)) = fused {
             // ── QKV bias fold (HIPFIRE_FUSE_QKV_BIAS) ────────────────────────
             // When the flag is on, the matched window is a per-row 3-way QKV
             // decode key whose kernel supports the fold, and the 3 steps right
@@ -687,12 +811,120 @@ pub fn execute_steps(
             }
             launch_fused(gpu, ctx, key, &steps[i..i + len])?;
             i += len;
+        } else if let Some(plan) = cpu_exec::plan_step(gpu, &steps[i]) {
+            cpu_exec::run_step(gpu, &plan)?;
+            i += 1;
         } else {
+            if cpu_exec::cpu_exec_enabled() && cpu_exec::reads_host_mapped_weight(gpu, &steps[i]) {
+                // Host-mapped weight that the CPU could not take: an unsupported
+                // quant format, or a step shape that never reached the seam. Counted
+                // so the failure is visible instead of silent (see the coverage
+                // line at load and `cpu_exec_counters`).
+                cpu_exec::count_host_mapped_gpu_step();
+            }
+            if let (Step::HyperWrite(write), Some(Step::HyperRead(read))) =
+                (&steps[i], steps.get(i + 1))
+            {
+                use crate::pipeline::layer_ops::{
+                    execute_hyper_write_then_read, hyper_gate_quarters,
+                };
+                let quarters_in = gates_ready
+                    .filter(|(at, _)| *at == i)
+                    .and_then(|(_, slot)| hyper_gate_quarters(write, slot));
+                let slot = gates_ready.map_or(0, |(_, slot)| slot ^ 1);
+                let next =
+                    next_fused_hyper_write(steps, i + 2, read).and_then(|j| match &steps[j] {
+                        Step::HyperWrite(next) => {
+                            hyper_gate_quarters(next, slot).map(|q| (j, next, q))
+                        }
+                        _ => None,
+                    });
+                // A Clear right after the read is folded into the same launch.
+                let clear = match steps.get(i + 2) {
+                    Some(Step::Clear(op)) => Some(op),
+                    _ => None,
+                };
+                // A mixer reading `mixed` through the read's rotation scratch:
+                // the read writes that rotation too (consumed by the mixer's
+                // first rotate, cleared after that step).
+                let mixed = read.mixed.buf.as_ptr();
+                let rotate_into = match steps.get(i + if clear.is_some() { 3 } else { 2 }) {
+                    Some(Step::GatedDeltaNet(op)) if op.input.buf.as_ptr() == mixed => {
+                        Some(op.rotation)
+                    }
+                    Some(Step::IndexedAttention(op)) if op.input.buf.as_ptr() == mixed => {
+                        Some(op.rotation)
+                    }
+                    Some(Step::Moe(call)) => call
+                        .decode_params()
+                        .filter(|p| p.x_norm.buf.as_ptr() == mixed && !p.x_rot_prerotated)
+                        .map(|p| p.x_rot_local)
+                        .or_else(|| {
+                            // Few-row grouped prefill (speculative verify): its
+                            // input basis rotates the provided `mixed` rows.
+                            call.prefill_params()
+                                .filter(|p| {
+                                    p.x_norm_batch.buf.as_ptr() == mixed
+                                        && matches!(
+                                            p.prelude.normalization,
+                                            crate::families::moe::MoeNormalization::Provided
+                                        )
+                                })
+                                .map(|p| p.x_rot_batch)
+                        }),
+                    _ => None,
+                };
+                if let Some(produced) = execute_hyper_write_then_read(
+                    gpu,
+                    write,
+                    read,
+                    quarters_in.as_ref(),
+                    next.as_ref().map(|(_, op, q)| (*op, q)),
+                    clear,
+                    rotate_into,
+                )? {
+                    gates_ready = next.filter(|_| produced).map(|(j, _, _)| (j, slot));
+                    i += if clear.is_some() { 3 } else { 2 };
+                    continue;
+                }
+            }
             launch_op(gpu, ctx, &steps[i])?;
+            // A pending prerotated input lives until its consumer step ran;
+            // a sealed MoE consumes it in one of its granular stages.
+            if !matches!(steps[i], Step::Moe(_) | Step::MoeStage(..)) {
+                gpu.scratch.prerotated = None;
+            }
             i += 1;
         }
     }
     Ok(())
+}
+
+/// The index of the next hyper write of `read`'s streams when it is itself
+/// followed by a hyper read of them and only stream-neutral mixer steps
+/// separate it from `read` (so the streams it normalizes are the ones `read`
+/// normalized). Its gates can then come from the fused write before `read`.
+fn next_fused_hyper_write(
+    steps: &[Step<'_>],
+    from: usize,
+    read: &crate::pipeline::layer_ops::HyperReadOp<'_>,
+) -> Option<usize> {
+    let streams = read.input.buf.as_ptr();
+    for (j, step) in steps.iter().enumerate().skip(from) {
+        match step {
+            Step::GatedDeltaNet(_) | Step::IndexedAttention(_) | Step::Clear(_) | Step::Moe(_) => {}
+            Step::HyperWrite(write)
+                if write.input.buf.as_ptr() == streams
+                    && write.output.buf.as_ptr() == streams
+                    && matches!(steps.get(j + 1),
+                        Some(Step::HyperRead(next)) if next.input.buf.as_ptr() == streams) =>
+            {
+                return Some(j);
+            }
+            _ => return None,
+        }
+    }
+    None
 }
 
 /// Keys whose 3-way QKV **decode** dispatch arm folds the optional Q/K/V bias
@@ -729,7 +961,10 @@ fn qkv_bias_fold_supported(key: KernelKey, ctx: &DispatchCtx) -> bool {
 /// bias tensors `[bias_q, bias_k, bias_v]`. Otherwise `None` (no fold). The
 /// ptr-identity check guarantees we only fold the qwen2 `attention_bias` adds
 /// that immediately follow this exact QKV window, never an unrelated `BiasAdd`.
-fn match_trailing_qkv_bias<'a>(steps: &'a [Step<'a>], len: usize) -> Option<[&'a GpuTensor; 3]> {
+fn match_trailing_qkv_bias<'step, 'res>(
+    steps: &'step [Step<'res>],
+    len: usize,
+) -> Option<[&'res GpuTensor; 3]> {
     if len + 3 > steps.len() {
         return None;
     }
@@ -754,7 +989,7 @@ fn match_trailing_qkv_bias<'a>(steps: &'a [Step<'a>], len: usize) -> Option<[&'a
         && std::ptr::eq(*bx_k as *const GpuTensor, out_k as *const GpuTensor)
         && std::ptr::eq(*bx_v as *const GpuTensor, out_v as *const GpuTensor)
     {
-        Some([bq, bk, bv])
+        Some([*bq, *bk, *bv])
     } else {
         None
     }
@@ -1018,32 +1253,52 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
         Step::BiasAdd { x, bias, dim } => gpu
             .bias_add_f32(x, bias, 1, *dim)
             .map_err(|e| DispatchError::Hip(e.to_string())),
-        Step::Moe(call) => sealed_moe::execute_sealed(gpu, ctx, call),
+        Step::HyperRead(op) => crate::pipeline::layer_ops::execute_hyper_read(gpu, op),
+        Step::GatedDeltaNet(op) => crate::pipeline::layer_ops::execute_gated_delta_net(gpu, op),
+        Step::IndexedAttention(op) => {
+            crate::pipeline::layer_ops::execute_indexed_attention(gpu, op)
+        }
+        Step::HyperWrite(op) => crate::pipeline::layer_ops::execute_hyper_write(gpu, op),
+        Step::GroupedDepthwise(op) => {
+            crate::pipeline::layer_ops::execute_grouped_depthwise(gpu, op)
+        }
+        Step::Clear(op) => crate::pipeline::layer_ops::execute_clear(gpu, op),
+        Step::Embed(op) => crate::pipeline::layer_ops::execute_embedding(gpu, op),
+        Step::HyperNorm(op) => crate::pipeline::layer_ops::execute_hyper_norm(gpu, op),
+        Step::Project(op) => crate::pipeline::layer_ops::execute_project(gpu, op),
+        Step::BroadcastAdd(op) => crate::pipeline::layer_ops::execute_broadcast_add(gpu, op),
+        Step::Moe(call) => sealed_moe::execute_sealed(gpu, call),
+        Step::MoeStage(op, stage) => op.execute_stage(gpu, *stage),
     }
 }
-
-/// Borrow `out` from a `RmsnormAutomatic` step. The guard has already confirmed
-/// step[0] is RmsnormAutomatic; this panics in debug if called incorrectly.
-fn rmsnorm_out<'a>(step: &'a Step<'a>) -> &'a rdna_compute::GpuTensor {
+fn rmsnorm_out<'a>(step: &Step<'a>) -> &'a rdna_compute::GpuTensor {
     match step {
-        Step::RmsnormAutomatic { out, .. } => out,
+        Step::RmsnormAutomatic { out, .. } => *out,
         _ => panic!("launch_fused: expected RmsnormAutomatic at step[0]"),
     }
 }
 
 /// Borrow `w` and `out` from a `Gemv` step.
-fn gemv_weight_out<'a>(step: &'a Step<'a>) -> (&'a WeightRef<'a>, &'a rdna_compute::GpuTensor) {
+fn gemv_weight_out<'a>(step: &Step<'a>) -> (&'a WeightRef<'a>, &'a rdna_compute::GpuTensor) {
     match step {
-        Step::Gemv { w, out, .. } => (w, out),
+        Step::Gemv { w, out, .. } => (*w, *out),
         _ => panic!("launch_fused: expected Gemv step"),
     }
 }
 
-fn launch_fused(
+/// The decode f16 codebook of a qt=52 weight ref; the fused-Lloyd guards
+/// already required it, so a miss here is a programming error, not a route.
+fn lloyd_lut(w: &WeightRef<'_>) -> Result<[u32; 8], DispatchError> {
+    w.lloyd_lut_f16.ok_or_else(|| {
+        DispatchError::Hip("MQ4G256V2Lloyd fused decode: weight ref has no lloyd_lut_f16".into())
+    })
+}
+
+fn launch_fused<'a>(
     gpu: &mut Gpu,
     ctx: &DispatchCtx,
     key: KernelKey,
-    steps: &[Step],
+    steps: &[Step<'a>],
 ) -> Result<(), DispatchError> {
     // Step 0 is always RmsnormAutomatic — run it to fill the activated buffer.
     launch_op(gpu, ctx, &steps[0])?;
@@ -1051,6 +1306,46 @@ fn launch_fused(
     let fused_qkv = FUSED_QKV.get_or_init(FusedQkvFamily::new);
 
     match key {
+        // ── MQ4G256V2-Lloyd (qt=52) decode fusions ──
+        // Launched here rather than through `FusedQkvFamily`: the LUT lives on
+        // the `WeightRef`s (the guard proved every one is `Some`), and these
+        // keys are decode-only (batched prefill takes the FP8-LUT GEMMs).
+        KernelKey::FusedQkvMq4G256V2Lloyd => {
+            let (wq, q) = gemv_weight_out(&steps[1]);
+            let (wk, k) = gemv_weight_out(&steps[2]);
+            let (wv, v) = gemv_weight_out(&steps[3]);
+            let luts = [lloyd_lut(wq)?, lloyd_lut(wk)?, lloyd_lut(wv)?];
+            gpu.fused_qkv_mq4g256v2_lloyd(
+                wq.buf, wk.buf, wv.buf, activated, q, k, v, wq.m, wk.m, wv.m, wq.k, luts,
+            )
+            .map_err(|e| DispatchError::Hip(e.to_string()))
+        }
+        KernelKey::FusedGateUpMq4G256V2Lloyd => {
+            let (wg, gate) = gemv_weight_out(&steps[1]);
+            let (wu, up) = gemv_weight_out(&steps[2]);
+            let (lg, lu) = (lloyd_lut(wg)?, lloyd_lut(wu)?);
+            gpu.fused_gate_up_mq4g256v2_lloyd(
+                wg.buf, wu.buf, activated, gate, up, wg.m, wu.m, wg.k, lg, lu,
+            )
+            .map_err(|e| DispatchError::Hip(e.to_string()))
+        }
+        KernelKey::FusedQkvzaMq4G256V2Lloyd => {
+            let (wqkv, qkv) = gemv_weight_out(&steps[1]);
+            let (wz, z) = gemv_weight_out(&steps[2]);
+            let (wb, beta) = gemv_weight_out(&steps[3]);
+            let (wa, alpha) = gemv_weight_out(&steps[4]);
+            let luts = [
+                lloyd_lut(wqkv)?,
+                lloyd_lut(wz)?,
+                lloyd_lut(wb)?,
+                lloyd_lut(wa)?,
+            ];
+            gpu.fused_qkvza_mq4g256v2_lloyd(
+                wqkv.buf, wz.buf, wb.buf, wa.buf, activated, qkv, z, beta, alpha, wqkv.m, wz.m,
+                wb.m, wa.m, wqkv.k, luts,
+            )
+            .map_err(|e| DispatchError::Hip(e.to_string()))
+        }
         KernelKey::FusedQkvMq4G256Lloyd
         | KernelKey::FusedQkvMq4G256V2
         | KernelKey::FusedQkvMq3G256Lloyd
@@ -1275,6 +1570,7 @@ fn launch_fused(
 mod tests {
     use super::*;
     use crate::context::DispatchCtx;
+    use crate::cpu_exec;
     use crate::families::fused_qkv::FusedQkvFamily;
     use crate::types::KernelKey;
 
@@ -1356,19 +1652,9 @@ mod tests {
         // returns false even for otherwise-matching dtypes. We can't build full
         // Steps with real GPU tensors, so we test the guard logic directly with
         // the flag set.
-        use rdna_compute::feature_flags::FeatureFlags;
         use std::sync::Arc;
-        let mut flags = FeatureFlags::for_test("gfx1100");
-        flags.force_unfused = true;
-        let ctx = DispatchCtx {
-            arch: rdna_compute::arch_caps::ArchCaps::new(
-                "gfx1100",
-                Arc::new(FeatureFlags::for_test("gfx1100")),
-            ),
-            flags: Arc::new(flags),
-            resources: crate::resource::ResourceManager::for_test(),
-            workload: crate::context::DispatchWorkload::Standard,
-        };
+        let mut ctx = DispatchCtx::for_test("gfx1100");
+        Arc::make_mut(&mut ctx.flags).force_unfused = true;
         // short-circuit: every guard opens with `force_unfused → false`, so even
         // an empty slice returns false. This proves the branch exists.
         let empty: &[Step] = &[];
@@ -1514,19 +1800,9 @@ mod tests {
     fn q4k_q8_0_guards_reject_force_unfused() {
         // All three new guards must return false when force_unfused is set,
         // even for empty slices (the guard opens with the early-return).
-        use rdna_compute::feature_flags::FeatureFlags;
         use std::sync::Arc;
-        let mut flags = FeatureFlags::for_test("gfx1100");
-        flags.force_unfused = true;
-        let ctx = DispatchCtx {
-            arch: rdna_compute::arch_caps::ArchCaps::new(
-                "gfx1100",
-                Arc::new(FeatureFlags::for_test("gfx1100")),
-            ),
-            flags: Arc::new(flags),
-            resources: crate::resource::ResourceManager::for_test(),
-            workload: crate::context::DispatchWorkload::Standard,
-        };
+        let mut ctx = DispatchCtx::for_test("gfx1100");
+        Arc::make_mut(&mut ctx.flags).force_unfused = true;
         let empty: &[Step] = &[];
         assert!(
             !guard_qkv_q4k(empty, &ctx),
@@ -1571,6 +1847,242 @@ mod tests {
         assert!(
             keys.contains(&KernelKey::FusedGateUpQ8_0),
             "FusedGateUpQ8_0 missing from FUSED_TABLE"
+        );
+    }
+
+    // ── MQ4G256V2 / Lloyd scalar-fusion arch admission (T1 gfx1151) ──
+
+    fn weight_ref_v2<'a>(
+        dummy: &'a GpuTensor,
+        dtype: DType,
+        lut: Option<[u32; 8]>,
+    ) -> WeightRef<'a> {
+        WeightRef {
+            buf: dummy,
+            dtype,
+            m: 4096,
+            k: 4096,
+            row_stride: 0,
+            rotation: None,
+            awq_scale: None,
+            lloyd_lut_e4m3: None,
+            lloyd_lut_f16: lut,
+            lloyd_lut_c16: None,
+        }
+    }
+
+    fn make_qkv3_window<'a>(dummy: &'a GpuTensor, wr: &'a WeightRef<'a>) -> [Step<'a>; 4] {
+        [
+            Step::RmsnormAutomatic {
+                x: dummy,
+                norm_weight: dummy,
+                x_plain: dummy,
+                out: dummy,
+                awq_scale: None,
+                k: 4096,
+                eps: 1e-6,
+                rotation: RotationPlan::FwhtG256,
+            },
+            Step::Gemv {
+                w: wr,
+                input: GemvInput::Prerotated(dummy),
+                out: dummy,
+            },
+            Step::Gemv {
+                w: wr,
+                input: GemvInput::Prerotated(dummy),
+                out: dummy,
+            },
+            Step::Gemv {
+                w: wr,
+                input: GemvInput::Prerotated(dummy),
+                out: dummy,
+            },
+        ]
+    }
+
+    fn make_gate_up_window<'a>(dummy: &'a GpuTensor, wr: &'a WeightRef<'a>) -> [Step<'a>; 3] {
+        [
+            Step::RmsnormAutomatic {
+                x: dummy,
+                norm_weight: dummy,
+                x_plain: dummy,
+                out: dummy,
+                awq_scale: None,
+                k: 4096,
+                eps: 1e-6,
+                rotation: RotationPlan::FwhtG256,
+            },
+            Step::Gemv {
+                w: wr,
+                input: GemvInput::Prerotated(dummy),
+                out: dummy,
+            },
+            Step::Gemv {
+                w: wr,
+                input: GemvInput::Prerotated(dummy),
+                out: dummy,
+            },
+        ]
+    }
+
+    fn make_qkvza_window<'a>(dummy: &'a GpuTensor, wr: &'a WeightRef<'a>) -> [Step<'a>; 5] {
+        [
+            Step::RmsnormAutomatic {
+                x: dummy,
+                norm_weight: dummy,
+                x_plain: dummy,
+                out: dummy,
+                awq_scale: None,
+                k: 4096,
+                eps: 1e-6,
+                rotation: RotationPlan::FwhtG256,
+            },
+            Step::Gemv {
+                w: wr,
+                input: GemvInput::Prerotated(dummy),
+                out: dummy,
+            },
+            Step::Gemv {
+                w: wr,
+                input: GemvInput::Prerotated(dummy),
+                out: dummy,
+            },
+            Step::Gemv {
+                w: wr,
+                input: GemvInput::Prerotated(dummy),
+                out: dummy,
+            },
+            Step::Gemv {
+                w: wr,
+                input: GemvInput::Prerotated(dummy),
+                out: dummy,
+            },
+        ]
+    }
+
+    #[test]
+    fn mq4g256v2_lloyd_guards_admit_gfx1151() {
+        // Fused Lloyd decode kernels are scalar wave32; gfx1151 (Strix Halo)
+        // shares the same TU as gfx1100/gfx1201 once the scalar-fusion gate opens.
+        let dummy = GpuTensor::null_for_test();
+        let lut = [0u32; 8];
+        let wr = weight_ref_v2(&dummy, DType::MQ4G256V2Lloyd, Some(lut));
+        let ctx = DispatchCtx::for_test("gfx1151");
+        let qkv = make_qkv3_window(&dummy, &wr);
+        let qkvza = make_qkvza_window(&dummy, &wr);
+        let gate_up = make_gate_up_window(&dummy, &wr);
+        assert!(
+            guard_qkv_mq4g256v2_lloyd(&qkv, &ctx),
+            "gfx1151 must admit guard_qkv_mq4g256v2_lloyd"
+        );
+        assert!(
+            guard_qkvza_mq4g256v2_lloyd(&qkvza, &ctx),
+            "gfx1151 must admit guard_qkvza_mq4g256v2_lloyd"
+        );
+        assert!(
+            guard_gate_up_mq4g256v2_lloyd(&gate_up, &ctx),
+            "gfx1151 must admit guard_gate_up_mq4g256v2_lloyd"
+        );
+        // Same predicate governs uniform V2 fusion.
+        let wr_v2 = weight_ref_v2(&dummy, DType::MQ4G256V2, None);
+        let qkv_v2 = make_qkv3_window(&dummy, &wr_v2);
+        let qkvza_v2 = make_qkvza_window(&dummy, &wr_v2);
+        let gate_up_v2 = make_gate_up_window(&dummy, &wr_v2);
+        assert!(
+            guard_qkv_mq4g256v2(&qkv_v2, &ctx),
+            "gfx1151 must admit guard_qkv_mq4g256v2"
+        );
+        assert!(
+            guard_qkvza_mq4g256v2(&qkvza_v2, &ctx),
+            "gfx1151 must admit guard_qkvza_mq4g256v2"
+        );
+        assert!(
+            guard_gate_up_mq4g256v2(&gate_up_v2, &ctx),
+            "gfx1151 must admit guard_gate_up_mq4g256v2"
+        );
+    }
+
+    #[test]
+    fn mq4g256v2_lloyd_guards_still_admit_gfx1100_and_gfx1201() {
+        let dummy = GpuTensor::null_for_test();
+        let lut = [0u32; 8];
+        let wr = weight_ref_v2(&dummy, DType::MQ4G256V2Lloyd, Some(lut));
+        let qkv = make_qkv3_window(&dummy, &wr);
+        let qkvza = make_qkvza_window(&dummy, &wr);
+        let gate_up = make_gate_up_window(&dummy, &wr);
+        for arch in ["gfx1100", "gfx1201"] {
+            let ctx = DispatchCtx::for_test(arch);
+            assert!(
+                guard_qkv_mq4g256v2_lloyd(&qkv, &ctx),
+                "{arch} must keep admitting Lloyd QKV fusion"
+            );
+            assert!(
+                guard_qkvza_mq4g256v2_lloyd(&qkvza, &ctx),
+                "{arch} must keep admitting Lloyd QKVZA fusion"
+            );
+            assert!(
+                guard_gate_up_mq4g256v2_lloyd(&gate_up, &ctx),
+                "{arch} must keep admitting Lloyd gate+up fusion"
+            );
+        }
+    }
+
+    #[test]
+    fn mq4g256v2_lloyd_guards_refuse_gfx1150_and_gfx1152() {
+        // Near-miss RDNA3.5 siblings stay fail-closed (no kernels selected /
+        // no hardware to validate in this plan).
+        let dummy = GpuTensor::null_for_test();
+        let lut = [0u32; 8];
+        let wr = weight_ref_v2(&dummy, DType::MQ4G256V2Lloyd, Some(lut));
+        let wr_v2 = weight_ref_v2(&dummy, DType::MQ4G256V2, None);
+        let qkv = make_qkv3_window(&dummy, &wr);
+        let qkvza = make_qkvza_window(&dummy, &wr);
+        let gate_up = make_gate_up_window(&dummy, &wr);
+        let qkv_v2 = make_qkv3_window(&dummy, &wr_v2);
+        let qkvza_v2 = make_qkvza_window(&dummy, &wr_v2);
+        let gate_up_v2 = make_gate_up_window(&dummy, &wr_v2);
+        for arch in ["gfx1150", "gfx1152"] {
+            let ctx = DispatchCtx::for_test(arch);
+            assert!(
+                !guard_qkv_mq4g256v2_lloyd(&qkv, &ctx),
+                "{arch} must refuse Lloyd QKV fusion"
+            );
+            assert!(
+                !guard_qkvza_mq4g256v2_lloyd(&qkvza, &ctx),
+                "{arch} must refuse Lloyd QKVZA fusion"
+            );
+            assert!(
+                !guard_gate_up_mq4g256v2_lloyd(&gate_up, &ctx),
+                "{arch} must refuse Lloyd gate+up fusion"
+            );
+            assert!(
+                !guard_qkv_mq4g256v2(&qkv_v2, &ctx),
+                "{arch} must refuse uniform V2 QKV fusion"
+            );
+            assert!(
+                !guard_qkvza_mq4g256v2(&qkvza_v2, &ctx),
+                "{arch} must refuse uniform V2 QKVZA fusion"
+            );
+            assert!(
+                !guard_gate_up_mq4g256v2(&gate_up_v2, &ctx),
+                "{arch} must refuse uniform V2 gate+up fusion"
+            );
+        }
+    }
+
+    #[test]
+    fn mq4g256v2_lloyd_guards_force_unfused_still_wins_on_gfx1151() {
+        use std::sync::Arc;
+        let dummy = GpuTensor::null_for_test();
+        let lut = [0u32; 8];
+        let wr = weight_ref_v2(&dummy, DType::MQ4G256V2Lloyd, Some(lut));
+        let qkv = make_qkv3_window(&dummy, &wr);
+        let mut ctx = DispatchCtx::for_test("gfx1151");
+        Arc::make_mut(&mut ctx.flags).force_unfused = true;
+        assert!(
+            !guard_qkv_mq4g256v2_lloyd(&qkv, &ctx),
+            "force_unfused must still win on gfx1151"
         );
     }
 }

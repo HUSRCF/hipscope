@@ -11,6 +11,7 @@ use super::config::Qwen35Config;
 use super::forward::Qwen35Scratch;
 use super::prefill::forward_batch_chunk_impl;
 use super::prefill::forward_prefill_batch;
+use super::prefill::HiddenCapture;
 use super::prefill::moe_grouped_m_total_max;
 use super::prefill::run_plain_gemm_key;
 use super::prefill::MOE_GROUPED_BLOCK_M;
@@ -36,6 +37,9 @@ use rdna_compute::GpuTensor;
 /// longer prompts are processed in chunks of `max_batch`.
 pub struct PrefillBatchScratch {
     pub max_batch: usize,
+    /// Ordinary gfx11 PBS owner: fallback-only fields have 64 rows, and
+    /// verify-only fields are non-owning zero-length sentinels.
+    pub lean: bool,
 
     // Residual stream and rotation scratch — all [N × dim]
     pub x_batch: GpuTensor,
@@ -47,8 +51,11 @@ pub struct PrefillBatchScratch {
     pub x_norm_batch: GpuTensor,
 
     // LA-layer projection outputs
-    pub dn_qkv_batch: GpuTensor,      // [N × qkv_dim]
-    pub dn_z_batch: GpuTensor,        // [N × v_dim]
+    pub dn_qkv_batch: GpuTensor, // [N × qkv_dim]
+    pub dn_z_batch: GpuTensor,   // [N × v_dim]
+    /// Z plus up to 256 appended beta/alpha/padding rows, used only by the
+    /// symmetric IU4 fold; output is deinterleaved before GDN consumes it.
+    pub dn_z_fold_batch: GpuTensor,
     pub dn_alpha_batch: GpuTensor,    // [N × n_v_heads]
     pub dn_beta_batch: GpuTensor,     // [N × n_v_heads]
     pub dn_q_raw_batch: GpuTensor,    // [N × k_dim] (pre repeat-interleave)
@@ -79,6 +86,13 @@ pub struct PrefillBatchScratch {
     // tree-verify mode; FA RoPE reads it instead of `positions` while KV
     // writes and attention seq_len keep the flat physical slots.
     pub rope_positions: GpuTensor,
+    // VL M-RoPE phases: [max_batch × 3] i32-in-F32 per-row absolute (t,h,w).
+    // Read by the FA RoPE branch only on steps whose SlotBatch carries pos3.
+    pub pos3: GpuTensor,
+    // VL external-embedding scatter inputs (i32-in-F32 index, and per-row
+    // matrix pointer as 64-bit payload). See the alloc-site comment.
+    pub ext_emb_index: GpuTensor,
+    pub ext_emb_row_ptr: GpuTensor,
     // Token-ids buffer feeding the batched embedding kernel. [max_batch] i32
     // stored as F32 (same dtype-cosmetic pattern as `positions`). Uploaded
     // once per batched forward and read by `embedding_lookup_hfq4g256_batched`.
@@ -133,6 +147,10 @@ pub struct PrefillBatchScratch {
     // applied. RDNA-only (atomic on GDDR is slow); the wave64/CDNA path
     // stays on the residual_scaled atomic kernel.
     pub moe_down_expanded_batch: Option<GpuTensor>,
+    /// Backup for inactive residual rows around a partial-mask MoE call.
+    /// MoE kernels currently execute fixed-width rows, so the batched EP path
+    /// restores inactive `x_batch` rows after the stateless FFN body.
+    pub moe_inactive_backup: Option<GpuTensor>,
 
     // Path 2 (SGLang-style scatter + grouped-WMMA-GEMM) scratch. All
     // allocated when num_experts > 0; gated at runtime by
@@ -196,7 +214,20 @@ impl PrefillBatchScratch {
         max_batch: usize,
         cap_gdn_tape: bool,
     ) -> HipResult<Self> {
-        Self::new_opt_with_alloc(gpu, config, max_batch, cap_gdn_tape, Gpu::alloc_tensor)
+        Self::new_opt_with_alloc(
+            gpu,
+            config,
+            max_batch,
+            cap_gdn_tape,
+            false,
+            Gpu::alloc_tensor,
+        )
+    }
+
+    /// Only for the model-wide admitted ordinary gfx11 route; callers must
+    /// reject verify or non-fused dispatch before using its shortened fields.
+    pub fn new_opt_lean(gpu: &mut Gpu, config: &Qwen35Config, max_batch: usize) -> HipResult<Self> {
+        Self::new_opt_with_alloc(gpu, config, max_batch, false, true, Gpu::alloc_tensor)
     }
 
     fn new_opt_with_alloc(
@@ -204,8 +235,11 @@ impl PrefillBatchScratch {
         config: &Qwen35Config,
         max_batch: usize,
         cap_gdn_tape: bool,
+        lean: bool,
         mut allocate: impl FnMut(&mut Gpu, &[usize], DType) -> HipResult<GpuTensor>,
     ) -> HipResult<Self> {
+        const FALLBACK_ROWS: usize = 64;
+        let fallback_rows = if lean { FALLBACK_ROWS } else { max_batch };
         let dim = config.dim;
         let hidden_dim = config.hidden_dim;
         let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
@@ -260,22 +294,27 @@ impl PrefillBatchScratch {
 
         let i_x_batch = alloc!(&[max_batch * dim], DType::F32);
         let i_x_rot_batch = alloc!(&[max_batch * dim], DType::F32);
-        let i_x_norm_batch = alloc!(&[max_batch * dim], DType::F32);
+        let i_x_norm_batch = alloc!(&[fallback_rows * dim], DType::F32);
         let i_dn_qkv_batch = alloc!(&[max_batch * qkv_dim], DType::F32);
         let i_dn_z_batch = alloc!(&[max_batch * v_dim], DType::F32);
+        let i_dn_z_fold_batch = alloc!(&[max_batch * (v_dim + 256)], DType::F32);
         let i_dn_alpha_batch = alloc!(&[max_batch * n_v_heads], DType::F32);
         let i_dn_beta_batch = alloc!(&[max_batch * n_v_heads], DType::F32);
-        let i_dn_q_raw_batch = alloc!(&[max_batch * k_dim], DType::F32);
+        // dn_q_raw_batch doubles as the GDN chunk scan's A workspace, which is
+        // viewed at rows padded to the 64-row chunk (prefill.rs a_rows); size it
+        // for that padding so short requests (e.g. 112 rows) do not fail the
+        // "A scratch undersized" check.
+        let i_dn_q_raw_batch = alloc!(&[max_batch.div_ceil(64) * 64 * k_dim], DType::F32);
         let i_dn_k_raw_batch = alloc!(&[max_batch * k_dim], DType::F32);
         let i_dn_v_batch = alloc!(&[max_batch * v_dim], DType::F32);
         let i_dn_q_batch = alloc!(&[max_batch * v_dim], DType::F32);
         let i_dn_k_batch = alloc!(&[max_batch * v_dim], DType::F32);
         let i_dn_attn_out_batch = alloc!(&[max_batch * v_dim], DType::F32);
-        let i_dn_normed_batch = alloc!(&[max_batch * v_dim], DType::F32);
+        let i_dn_normed_batch = alloc!(&[fallback_rows * v_dim], DType::F32);
         let i_gate_ffn_batch = alloc!(&[max_batch * hidden_dim], DType::F32);
         let i_up_batch = alloc!(&[max_batch * hidden_dim], DType::F32);
-        let i_ffn_hidden_batch = alloc!(&[max_batch * hidden_dim], DType::F32);
-        let i_dn_normed_rot_batch = alloc!(&[max_batch * v_dim], DType::F32);
+        let i_ffn_hidden_batch = alloc!(&[fallback_rows * hidden_dim], DType::F32);
+        let i_dn_normed_rot_batch = alloc!(&[fallback_rows * v_dim], DType::F32);
         // F32 dtype = 4 bytes/element, same layout as i32. The rope /
         // attention / kv_write kernels cast the pointer to `const int*`,
         // so dtype is cosmetic. Upload i32 bits via memcpy_htod.
@@ -288,7 +327,25 @@ impl PrefillBatchScratch {
         // from `TreeVerifyCtx.positions`; FA RoPE kernels read it ONLY
         // when `tree_verify.is_some()`. Same i32-in-F32 cosmetic dtype
         // pattern as `positions`.
-        let i_rope_positions = alloc!(&[max_batch], DType::F32);
+        let i_rope_positions = if lean {
+            None
+        } else {
+            Some(alloc!(&[max_batch], DType::F32))
+        };
+        // VL M-RoPE phases: [max_batch × 3] i32-in-F32, per-row absolute
+        // (t, h, w). Uploaded only on steps whose SlotBatch carries
+        // `pos3`; the FA RoPE branch dispatches the batched M-RoPE
+        // kernel instead of the 1D one. Same cosmetic-dtype pattern as
+        // `positions`.
+        let i_pos3 = alloc!(&[max_batch * 3], DType::F32);
+        // VL external-embedding scatter inputs: per-row index into that
+        // row's slot's vision-embedding matrix (-1 = token table), and
+        // per-row device pointer to that matrix (null when the slot has
+        // none). Uploaded on VL steps; the scatter kernel runs right
+        // after the token-embedding lookup and overwrites image-pad rows.
+        let i_ext_emb_index = alloc!(&[max_batch], DType::F32);
+        // u64 device pointers — 8 B/row, Raw dtype counts bytes.
+        let i_ext_emb_row_ptr = alloc!(&[max_batch * 8], DType::Raw);
         let i_tokens = alloc!(&[max_batch], DType::F32);
         let i_fa_q_full_batch = alloc!(&[max_batch * q_dim * 2], DType::F32);
         let i_fa_q_batch = alloc!(&[max_batch * q_dim], DType::F32);
@@ -296,13 +353,27 @@ impl PrefillBatchScratch {
         let i_fa_k_batch = alloc!(&[max_batch * kv_dim], DType::F32);
         let i_fa_v_batch = alloc!(&[max_batch * kv_dim], DType::F32);
         let i_fa_attn_out_batch = alloc!(&[max_batch * q_dim], DType::F32);
-        let i_fa_attn_out_rot_batch = alloc!(&[max_batch * q_dim], DType::F32);
-        let i_x_rot_f16_batch = alloc!(&[max_batch * dim], DType::F16);
-        let i_dn_normed_rot_f16_batch = alloc!(&[max_batch * v_dim], DType::F16);
-        let i_ffn_hidden_f16_batch = alloc!(&[max_batch * hidden_dim], DType::F16);
-        let i_fa_attn_out_rot_f16_batch = alloc!(&[max_batch * q_dim], DType::F16);
-        // S9 prologue control plane: 256 bytes of device-resident
-        // counters/generations. Raw dtype counts bytes.
+        let i_fa_attn_out_rot_batch = alloc!(&[fallback_rows * q_dim], DType::F32);
+        let i_x_rot_f16_batch = if lean {
+            None
+        } else {
+            Some(alloc!(&[max_batch * dim], DType::F16))
+        };
+        let i_dn_normed_rot_f16_batch = if lean {
+            None
+        } else {
+            Some(alloc!(&[max_batch * v_dim], DType::F16))
+        };
+        let i_ffn_hidden_f16_batch = if lean {
+            None
+        } else {
+            Some(alloc!(&[max_batch * hidden_dim], DType::F16))
+        };
+        let i_fa_attn_out_rot_f16_batch = if lean {
+            None
+        } else {
+            Some(alloc!(&[max_batch * q_dim], DType::F16))
+        };
         let i_mq_prologue_ctrl = alloc!(&[256], DType::Raw);
         let i_moe_router_logits_batch = alloc_opt!(
             config.num_experts > 0,
@@ -356,6 +427,12 @@ impl PrefillBatchScratch {
             &[max_batch * config.num_experts_per_tok * config.dim],
             DType::F32
         );
+        let i_moe_inactive_backup = alloc_opt!(
+            config.num_experts > 0,
+            &[max_batch * config.dim],
+            DType::F32
+        );
+
         // Path 2 scatter + grouped-WMMA-GEMM scratch (gated at runtime by
         // HIPFIRE_MOE_GROUPED_GEMM=1). m_total_max = N*K_TOP + E*(BLOCK_M-1).
         // i32 buffers stored as Raw (4 bytes/elem matches; no DType::I32 yet).
@@ -416,6 +493,40 @@ impl PrefillBatchScratch {
             DType::F32
         );
 
+        // No HIP allocations for ordinary-only verify sidecars. Borrow the
+        // already-owned positions pointer solely as a zero-length sentinel;
+        // every verify route rejects lean PBS before dereferencing one.
+        let borrowed_sentinel = |dtype| GpuTensor {
+            buf: unsafe { slots[i_positions].as_ref().unwrap().buf.alias() },
+            shape: vec![0],
+            dtype,
+        };
+        let sentinels = lean.then(|| {
+            (
+                borrowed_sentinel(DType::F32),
+                borrowed_sentinel(DType::F16),
+                borrowed_sentinel(DType::F16),
+                borrowed_sentinel(DType::F16),
+                borrowed_sentinel(DType::F16),
+            )
+        });
+        let (
+            rope_positions,
+            x_rot_f16_batch,
+            dn_normed_rot_f16_batch,
+            ffn_hidden_f16_batch,
+            fa_attn_out_rot_f16_batch,
+        ) = if let Some(sentinels) = sentinels {
+            sentinels
+        } else {
+            (
+                take!(i_rope_positions.unwrap()),
+                take!(i_x_rot_f16_batch.unwrap()),
+                take!(i_dn_normed_rot_f16_batch.unwrap()),
+                take!(i_ffn_hidden_f16_batch.unwrap()),
+                take!(i_fa_attn_out_rot_f16_batch.unwrap()),
+            )
+        };
         let moe_router_logits_batch = i_moe_router_logits_batch.map(|i| take!(i));
         let moe_router_score_views_batch = moe_router_logits_batch.as_ref().map(|router_logits| {
             (1..=max_batch)
@@ -428,12 +539,14 @@ impl PrefillBatchScratch {
                 .into_boxed_slice()
         });
         Ok(Self {
+            lean,
             max_batch,
             x_batch: take!(i_x_batch),
             x_rot_batch: take!(i_x_rot_batch),
             x_norm_batch: take!(i_x_norm_batch),
             dn_qkv_batch: take!(i_dn_qkv_batch),
             dn_z_batch: take!(i_dn_z_batch),
+            dn_z_fold_batch: take!(i_dn_z_fold_batch),
             dn_alpha_batch: take!(i_dn_alpha_batch),
             dn_beta_batch: take!(i_dn_beta_batch),
             dn_q_raw_batch: take!(i_dn_q_raw_batch),
@@ -448,7 +561,10 @@ impl PrefillBatchScratch {
             ffn_hidden_batch: take!(i_ffn_hidden_batch),
             dn_normed_rot_batch: take!(i_dn_normed_rot_batch),
             positions: take!(i_positions),
-            rope_positions: take!(i_rope_positions),
+            rope_positions,
+            pos3: take!(i_pos3),
+            ext_emb_index: take!(i_ext_emb_index),
+            ext_emb_row_ptr: take!(i_ext_emb_row_ptr),
             tokens: take!(i_tokens),
             fa_q_full_batch: take!(i_fa_q_full_batch),
             fa_q_batch: take!(i_fa_q_batch),
@@ -457,10 +573,10 @@ impl PrefillBatchScratch {
             fa_v_batch: take!(i_fa_v_batch),
             fa_attn_out_batch: take!(i_fa_attn_out_batch),
             fa_attn_out_rot_batch: take!(i_fa_attn_out_rot_batch),
-            x_rot_f16_batch: take!(i_x_rot_f16_batch),
-            dn_normed_rot_f16_batch: take!(i_dn_normed_rot_f16_batch),
-            ffn_hidden_f16_batch: take!(i_ffn_hidden_f16_batch),
-            fa_attn_out_rot_f16_batch: take!(i_fa_attn_out_rot_f16_batch),
+            x_rot_f16_batch,
+            dn_normed_rot_f16_batch,
+            ffn_hidden_f16_batch,
+            fa_attn_out_rot_f16_batch,
             mq_prologue_ctrl: take!(i_mq_prologue_ctrl),
             moe_router_logits_batch,
             moe_router_score_views_batch,
@@ -474,6 +590,8 @@ impl PrefillBatchScratch {
             moe_up_batch: i_moe_up_batch.map(|i| take!(i)),
             moe_rot_batch: i_moe_rot_batch.map(|i| take!(i)),
             moe_down_expanded_batch: i_moe_down_expanded_batch.map(|i| take!(i)),
+            moe_inactive_backup: i_moe_inactive_backup.map(|i| take!(i)),
+
             moe_expert_token_counts: i_moe_expert_token_counts.map(|i| take!(i)),
             moe_expert_offsets: i_moe_expert_offsets.map(|i| take!(i)),
             moe_sorted_slot_index: i_moe_sorted_slot_index.map(|i| take!(i)),
@@ -502,6 +620,7 @@ impl PrefillBatchScratch {
             self.x_norm_batch,
             self.dn_qkv_batch,
             self.dn_z_batch,
+            self.dn_z_fold_batch,
             self.dn_alpha_batch,
             self.dn_beta_batch,
             self.dn_q_raw_batch,
@@ -516,7 +635,9 @@ impl PrefillBatchScratch {
             self.ffn_hidden_batch,
             self.dn_normed_rot_batch,
             self.positions,
-            self.rope_positions,
+            self.pos3,
+            self.ext_emb_index,
+            self.ext_emb_row_ptr,
             self.tokens,
             self.fa_q_full_batch,
             self.fa_q_batch,
@@ -525,13 +646,20 @@ impl PrefillBatchScratch {
             self.fa_v_batch,
             self.fa_attn_out_batch,
             self.fa_attn_out_rot_batch,
-            self.x_rot_f16_batch,
-            self.dn_normed_rot_f16_batch,
-            self.ffn_hidden_f16_batch,
-            self.fa_attn_out_rot_f16_batch,
             self.mq_prologue_ctrl,
         ] {
             note(gpu.free_tensor(t));
+        }
+        if !self.lean {
+            for t in [
+                self.rope_positions,
+                self.x_rot_f16_batch,
+                self.dn_normed_rot_f16_batch,
+                self.ffn_hidden_f16_batch,
+                self.fa_attn_out_rot_f16_batch,
+            ] {
+                note(gpu.free_tensor(t));
+            }
         }
         // `moe_router_score_views_batch` contains non-owning aliases of
         // `moe_router_logits_batch`; only the owner is released below.
@@ -547,6 +675,7 @@ impl PrefillBatchScratch {
             self.moe_up_batch,
             self.moe_rot_batch,
             self.moe_down_expanded_batch,
+            self.moe_inactive_backup,
             self.moe_expert_token_counts,
             self.moe_expert_offsets,
             self.moe_sorted_slot_index,
@@ -1277,8 +1406,8 @@ impl PrefillBatchScratch {
         add(cm(n, v_dim)?, 4)?;
         add(cm(n, v_heads)?, 4)?;
         add(cm(n, v_heads)?, 4)?;
+        add(cm(n.div_ceil(64) * 64, k_dim)?, 4)?;
         add(cm(n, k_dim)?, 4)?;
-        add(cm(n, k_dim)?, 4)?;
         add(cm(n, v_dim)?, 4)?;
         add(cm(n, v_dim)?, 4)?;
         add(cm(n, v_dim)?, 4)?;
@@ -1290,6 +1419,12 @@ impl PrefillBatchScratch {
         add(n, 4)?;
         add(n, 4)?;
         add(n, 4)?;
+        // VL side arrays: pos3 [n×3] and ext_emb_index [n] (i32-in-F32, 4
+        // B/row each) plus ext_emb_row_ptr [n] raw u64 pointers (8 B/row) —
+        // must mirror the alloc!s in new_opt exactly.
+        add(cm(n, 3)?, 4)?;
+        add(n, 4)?;
+        add(n, 8)?;
         add(
             cm(n, q_dim)?
                 .checked_mul(2)
@@ -1341,6 +1476,7 @@ impl PrefillBatchScratch {
                 cm(cm(n, config.num_experts_per_tok as u64)?, config.dim as u64)?,
                 4,
             )?;
+            add(cm(n, config.dim as u64)?, 4)?;
             let m_max =
                 moe_grouped_m_total_max(max_batch, config.num_experts_per_tok, config.num_experts)
                     as u64;
@@ -1430,6 +1566,20 @@ pub(crate) fn valid_lane_mask(max_batch: usize) -> HipResult<u64> {
     } else {
         Ok((1u64 << max_batch) - 1)
     }
+}
+
+/// Active-lane mask to honour for a batch, or `None` when every row is live.
+/// Only independent decode batches (at most 64 lanes) carry a mask; sequential
+/// prefill chunks run up to `PREFILL_MAX_BATCH` rows and never build one.
+pub(crate) fn partial_lane_mask(active_mask: Option<u64>, n: usize) -> HipResult<Option<u64>> {
+    let Some(mask) = active_mask else {
+        return Ok(None);
+    };
+    let full = valid_lane_mask(n)?;
+    if mask == 0 || mask & !full != 0 {
+        return Err(HipError::new(0, "active lane mask out of range"));
+    }
+    Ok((mask != full).then_some(mask))
 }
 
 #[inline]
@@ -1523,6 +1673,17 @@ pub(crate) fn lm_head_batched(
                 output.k,
                 batch_size,
             )
+        }
+        // qt=52: no batched-LUT lm_head kernel exists — per-row LUT GEMV
+        // (weight_gemv rotates internally). Slow but correct; mirrors the
+        // DFlash-verify fallback in mtp_spec.rs.
+        DType::MQ4G256V2Lloyd => {
+            for i in 0..batch_size {
+                let row = hidden.sub_offset(i * output.k, output.k);
+                let logits_row = logits.sub_offset(i * output.m, output.m);
+                llama::weight_gemv(gpu, output, &row, &logits_row)?;
+            }
+            Ok(())
         }
         DType::MQ4CG256 => {
             llama::rotate_x_mq_batched_for(gpu, output, hidden, rot, output.k, batch_size)?;
@@ -1771,7 +1932,7 @@ pub fn forward_decode_batch_prepared(
         scratch,
         &state.pbs,
         None,
-        Some((&final_hidden, 0)),
+        Some((&final_hidden, 0, HiddenCapture::Verify)),
         None,
         0,
         None,
@@ -1788,6 +1949,7 @@ pub fn forward_decode_batch_prepared(
             active_mask,
         },
         DflashFusionCtx::Off,
+        None, // commit_stride: independent lanes keep legacy cadence
     )?;
 
     let logits = state.logits.sub_offset(0, n * config.vocab_size);
@@ -1830,6 +1992,7 @@ mod allocation_tests {
             &config,
             2,
             true,
+            false,
             |gpu, shape, dtype| {
                 allocations += 1;
                 gpu.alloc_tensor(shape, dtype)
@@ -1844,6 +2007,7 @@ mod allocation_tests {
             &config,
             2,
             true,
+            false,
             |gpu, shape, dtype| {
                 attempted += 1;
                 if attempted == allocations {

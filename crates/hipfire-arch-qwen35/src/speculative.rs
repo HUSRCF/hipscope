@@ -17,26 +17,26 @@
 //! speculative decode serializes draft-generate then target-verify).
 
 use crate::carrier::Qwen35Bundle;
+use crate::dflash_spec::DenseTpDflashRankState;
 use crate::dflash_verify_pm4::{
     fingerprint_u64, DflashVerifyBinding, DflashVerifyPm4, DflashVerifyPm4Phase, DflashVerifyRoute,
     DflashVerifyWindow,
 };
-use crate::qwen35::{self, DeltaNetState, Qwen35Config, Qwen35Scratch, Qwen35Weights};
-use hip_bridge::{DeviceBuffer, HipError, HipResult, Stream};
-use crate::dflash_spec::DenseTpDflashRankState;
-use hipfire_dispatch::families::kv_tier::KTier;
-use hipfire_runtime::dflash::{self, DflashConfig, DflashScratch, DflashWeights};
 use crate::qwen35::forward::{
     forward_prefill_dense_tp, forward_prefill_dense_tp_with_pbs_capture, DenseTpDflashCapture,
 };
+use crate::qwen35::{self, DeltaNetState, Qwen35Config, Qwen35Scratch, Qwen35Weights};
+use hip_bridge::{DeviceBuffer, HipError, HipResult, Stream};
+use hipfire_dispatch::families::kv_tier::KTier;
+use hipfire_runtime::dflash::{self, DflashConfig, DflashScratch, DflashWeights};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::{self, KvCache};
+use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_runtime::tokenizer::{Tokenizer, TokenizerError};
+use hipfire_runtime::tp_shard::ShardConfig;
 use rdna_compute::dflash_state_copy::{DflashStateCopyDesc, DFLASH_STATE_BULK_COPY_MAX_ITEMS};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::path::Path;
-use hipfire_runtime::multi_gpu::Gpus;
-use hipfire_runtime::tp_shard::ShardConfig;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// #397 Ship 5.3: route a single spec-decode (DFlash) batched GEMM through
@@ -95,6 +95,9 @@ fn run_spec_gemm_key(
         row_stride: k,
         rotation: None,
         awq_scale: None,
+        lloyd_lut_e4m3: None,
+        lloyd_lut_f16: None,
+        lloyd_lut_c16: None,
     };
     let params = GemmParams {
         w: &w,
@@ -725,8 +728,15 @@ pub enum KvMode {
     /// leverage tier — Asym2 is doc'd "most lossy" and 2-bit centroid quant
     /// suffers most from outliers. Opt-in via `--kv-mode fwht2`.
     Fwht2,
+    /// Native fp8 E4M3 KV (gfx1201 Qwen dense only). ModelSlot::load rejects
+    /// this mode: single-slot speculative assembly goes through the carrier
+    /// path, never the slot constructors below. Present so `--kv-mode fp8`
+    /// fails closed here instead of parsing as a neighboring mode.
+    Fp8,
+    /// Flat native bf16 KV quality-control arm. Same rejection contract as
+    /// Fp8 above: ModelSlot::load refuses, carrier path owns admission.
+    Bf16,
 }
-
 impl Default for KvMode {
     fn default() -> Self {
         KvMode::Q8
@@ -949,6 +959,13 @@ impl ModelSlot {
                 config.head_dim,
                 slot_config.max_seq,
             )?,
+            KvMode::Fp8 | KvMode::Bf16 => {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    "ModelSlot::load rejects fp8/bf16 KV: single-slot speculative assembly \
+                     has no native-format slot constructors; load through the carrier path",
+                ));
+            }
         };
 
         let dn_state = DeltaNetState::new_with_quant(gpu, &config, slot_config.state_quant)?;
@@ -1130,8 +1147,8 @@ pub struct DeltaNetSnapshot {
     /// F16 per-element EF residual backups; `len == state.s_ef_residual.len()`.
     s_ef_residual_bufs: Vec<DeviceBuffer>,
     /// S1: persistent forward (live -> backup) descriptor table, device
-    /// resident, built once at `new_for`. `None` unless the gfx1100 bulk
-    /// route armed (non-gfx1100, kill switch, JIT failure, or bad alignment
+    /// resident, built once at `new_for`. `None` unless the bulk route armed
+    /// (arch outside `bulk_arch`, kill switch, JIT failure, or bad alignment
     /// all leave this `None` and every op uses the memcpy loops).
     bulk_fwd: Option<DeviceBuffer>,
     /// S1: persistent reverse (backup -> live) descriptor table. Same
@@ -1264,6 +1281,15 @@ impl DeltaNetSnapshot {
         Some((fwd_buf, rev_buf, n_items))
     }
 
+    /// S1 arch gate. gfx1100 (S1) and exact gfx1201 (railgun E0 port). The
+    /// kernel is a pure byte copy with no arch-specific code; the `_gfx1100`
+    /// suffix on its symbol is historical. `HIPFIRE_DN_SNAPSHOT_BULK_OFF=1`
+    /// opts out on both.
+    fn bulk_arch(gpu: &Gpu) -> bool {
+        !gpu.flags.dn_snapshot_bulk_off
+            && (gpu.arch_caps.is_gfx1100() || gpu.arch_caps.is_gfx1201())
+    }
+
     /// S1: shared fast-path gate. Returns the table + count to launch, or
     /// `None` when the call must use the memcpy loops (kill switch, arch,
     /// disarmed tables, or stale fingerprint).
@@ -1273,7 +1299,7 @@ impl DeltaNetSnapshot {
         gpu: &Gpu,
         forward: bool,
     ) -> Option<(&DeviceBuffer, u32)> {
-        if gpu.flags.dn_snapshot_bulk_off || !gpu.arch_caps.is_gfx1100() {
+        if !Self::bulk_arch(gpu) {
             return None;
         }
         if self.bulk_n_items == 0 || Self::bulk_fingerprint(state) != self.bulk_fingerprint {
@@ -1326,10 +1352,10 @@ impl DeltaNetSnapshot {
             bulk_n_items: 0,
             bulk_fingerprint: Self::bulk_fingerprint(state),
         };
-        // Arm the gfx1100 bulk route: JIT + table upload happen here at
-        // setup, never in a decode cycle. Any failure leaves the snapshot on
-        // the legacy memcpy path.
-        if gpu.arch_caps.is_gfx1100() && !gpu.flags.dn_snapshot_bulk_off {
+        // Arm the bulk route (gfx1100 / gfx1201): JIT + table upload happen
+        // here at setup, never in a decode cycle. Any failure leaves the
+        // snapshot on the legacy memcpy path.
+        if Self::bulk_arch(gpu) {
             let backs = [
                 &snap.s_matrix_bufs[..],
                 &snap.s_scale_bufs[..],
@@ -1345,6 +1371,26 @@ impl DeltaNetSnapshot {
         Ok(snap)
     }
 
+    /// Total device bytes a snapshot of `state` would occupy, computed
+    /// WITHOUT allocating — lets `capture_checkpoint` pre-check the pool
+    /// ceiling before paying for `hipMalloc` + device-to-device copy.
+    pub fn bytes_for(state: &DeltaNetState) -> u64 {
+        let mut total: u64 = 0;
+        for t in &state.s_matrices {
+            total += t.buf.size() as u64;
+        }
+        for t in &state.s_scales {
+            total += t.buf.size() as u64;
+        }
+        for t in &state.conv_states {
+            total += t.buf.size() as u64;
+        }
+        for t in &state.s_ef_residual {
+            total += t.buf.size() as u64;
+        }
+        total
+    }
+
     /// Number of EF residual backup buffers (0 when EF is off).
     #[inline]
     pub fn s_ef_len(&self) -> usize {
@@ -1353,7 +1399,7 @@ impl DeltaNetSnapshot {
 
     /// S1: armed descriptor count, or `None` when the snapshot rides the
     /// legacy memcpy loops. Diagnostics only (the launch-count gate proves
-    /// engagement); always `None` off gfx1100 or under the kill switch.
+    /// engagement); always `None` outside `bulk_arch` or under the kill switch.
     #[inline]
     pub fn bulk_n_items(&self) -> Option<u32> {
         self.bulk_fwd
@@ -1362,9 +1408,32 @@ impl DeltaNetSnapshot {
             .map(|_| self.bulk_n_items)
     }
 
+    /// Railgun D8: one same-size backup per live tensor in every family (true
+    /// for a snapshot `new_for` made from this state), so a kernel can read
+    /// backup `i` in place of live tensor `i`.
+    pub fn mirrors(&self, state: &DeltaNetState) -> bool {
+        fn same(live: &[GpuTensor], backs: &[DeviceBuffer]) -> bool {
+            live.len() == backs.len()
+                && live.iter().zip(backs).all(|(t, b)| t.buf.size() == b.size())
+        }
+        same(&state.s_matrices, &self.s_matrix_bufs)
+            && same(&state.s_scales, &self.s_scale_bufs)
+            && same(&state.conv_states, &self.conv_state_bufs)
+            && same(&state.s_ef_residual, &self.s_ef_residual_bufs)
+    }
+
+    /// Railgun D8: every backup buffer, family by family (fingerprinting).
+    fn backup_buffers(&self) -> impl Iterator<Item = &DeviceBuffer> {
+        self.s_matrix_bufs
+            .iter()
+            .chain(&self.s_scale_bufs)
+            .chain(&self.conv_state_bufs)
+            .chain(&self.s_ef_residual_bufs)
+    }
+
     /// Copy live state → backup (S/scale/conv + EF residual).
     ///
-    /// S1: on gfx1100 with armed tables and a matching fingerprint this is a
+    /// S1: on gfx1100/gfx1201 with armed tables and a matching fingerprint this is a
     /// single descriptor-driven `dflash_state_bulk_copy_gfx1100` launch over
     /// the forward table (plus a stream sync preserving the synchronous
     /// contract); otherwise the legacy per-tensor memcpy loop below runs.
@@ -1439,7 +1508,7 @@ impl DeltaNetSnapshot {
 
     /// Copy backup → live state (rewinds recurrent + EF residual to the snapshot).
     ///
-    /// S1: on gfx1100 with armed tables and a matching fingerprint this is a
+    /// S1: on gfx1100/gfx1201 with armed tables and a matching fingerprint this is a
     /// single descriptor-driven `dflash_state_bulk_copy_gfx1100` launch over
     /// the reverse table (plus a stream sync preserving the synchronous
     /// contract); otherwise the legacy per-tensor memcpy loop below runs.
@@ -1495,6 +1564,51 @@ impl DeltaNetSnapshot {
             let _ = gpu.hip.free(t);
         }
     }
+
+    /// Total device bytes across all backup buffers (S matrices + scales +
+    /// conv rings + EF residuals). Used by the checkpoint pool for
+    /// byte-bounded LRU accounting (spec §4.5 C5).
+    pub fn bytes_len(&self) -> u64 {
+        let mut total: u64 = 0;
+        for b in &self.s_matrix_bufs {
+            total += b.size() as u64;
+        }
+        for b in &self.s_scale_bufs {
+            total += b.size() as u64;
+        }
+        for b in &self.conv_state_bufs {
+            total += b.size() as u64;
+        }
+        for b in &self.s_ef_residual_bufs {
+            total += b.size() as u64;
+        }
+        total
+    }
+
+    /// Copy this snapshot's device buffers into `dst` (device-to-device).
+    /// `dst` must have been allocated with matching shapes (e.g. via
+    /// [`DeltaNetSnapshot::new_for`] against the same state). Used by the
+    /// checkpoint pool's `restore_private` to copy an immutable cached
+    /// snapshot into a caller-owned private snapshot (spec §4.5 C5).
+    pub fn copy_to(&self, dst: &mut DeltaNetSnapshot, gpu: &mut Gpu) -> HipResult<()> {
+        for (src, d) in self.s_matrix_bufs.iter().zip(dst.s_matrix_bufs.iter()) {
+            gpu.hip.memcpy_dtod(d, src, src.size())?;
+        }
+        for (src, d) in self.s_scale_bufs.iter().zip(dst.s_scale_bufs.iter()) {
+            gpu.hip.memcpy_dtod(d, src, src.size())?;
+        }
+        for (src, d) in self.conv_state_bufs.iter().zip(dst.conv_state_bufs.iter()) {
+            gpu.hip.memcpy_dtod(d, src, src.size())?;
+        }
+        for (src, d) in self
+            .s_ef_residual_bufs
+            .iter()
+            .zip(dst.s_ef_residual_bufs.iter())
+        {
+            gpu.hip.memcpy_dtod(d, src, src.size())?;
+        }
+        Ok(())
+    }
 }
 
 /// A series of `n_slots` `DeltaNetSnapshot` slots, used by the tape-replay
@@ -1545,6 +1659,10 @@ pub struct GdnTape {
     pub q_scratch: GpuTensor,     // [max_n × v_dim] (post repeat-interleave)
     pub k_scratch: GpuTensor,     // [max_n × v_dim]
     pub attn_scratch: GpuTensor,  // [max_n × v_dim]
+    /// Railgun E0 / L6c multi-layer replay state (gfx1201). `None` until the
+    /// first eligible replay arms it; `Some(None)` when arming failed (the
+    /// per-layer path then runs for the life of the tape).
+    replay_ml: std::sync::Mutex<Option<Option<GdnReplayMl>>>,
 }
 
 impl GdnTape {
@@ -1591,6 +1709,7 @@ impl GdnTape {
             q_scratch: gpu.alloc_tensor(&[max_n * v_dim], rdna_compute::DType::F32)?,
             k_scratch: gpu.alloc_tensor(&[max_n * v_dim], rdna_compute::DType::F32)?,
             attn_scratch: gpu.alloc_tensor(&[max_n * v_dim], rdna_compute::DType::F32)?,
+            replay_ml: std::sync::Mutex::new(None),
         })
     }
 
@@ -1609,6 +1728,324 @@ impl GdnTape {
         let _ = gpu.free_tensor(self.q_scratch);
         let _ = gpu.free_tensor(self.k_scratch);
         let _ = gpu.free_tensor(self.attn_scratch);
+        if let Some(Some(ml)) = self
+            .replay_ml
+            .into_inner()
+            .unwrap_or_else(|e| e.into_inner())
+        {
+            ml.free_gpu(gpu);
+        }
+    }
+
+    /// Pointer fingerprint of everything the multi-layer tables reference
+    /// outside the tape itself (conv weights and live DN state). A mismatch
+    /// rebuilds the tables before launch; the tape's own buffers are fixed
+    /// for its lifetime.
+    fn replay_ml_fingerprint(
+        weights: &qwen35::Qwen35Weights,
+        config: &qwen35::Qwen35Config,
+        dn_state: &qwen35::DeltaNetState,
+    ) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut mix = |v: u64| {
+            h ^= v;
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        };
+        let mut la_idx = 0usize;
+        for (layer_idx, lt) in config.layer_types.iter().enumerate() {
+            if *lt != qwen35::LayerType::LinearAttention {
+                continue;
+            }
+            let conv_weight = match &weights.layers[layer_idx] {
+                qwen35::LayerWeights::DeltaNet(l) => &l.conv_weight,
+                qwen35::LayerWeights::DeltaNetMoe(l) => &l.conv_weight,
+                _ => unreachable!("LA layer type mismatch in replay_gdn"),
+            };
+            mix(conv_weight.buf.as_ptr() as u64);
+            mix(dn_state.conv_states[la_idx].buf.as_ptr() as u64);
+            mix(dn_state.s_matrices[la_idx].buf.as_ptr() as u64);
+            mix(dn_state.s_scales[la_idx].buf.as_ptr() as u64);
+            mix(dn_state
+                .ef_residual(la_idx)
+                .map_or(0, |t| t.buf.as_ptr() as u64));
+            la_idx += 1;
+        }
+        mix(la_idx as u64);
+        h
+    }
+
+    /// Railgun E0 / L6c: host-side admission of the two-launch replay
+    /// (arch, opt-out, open Redline recording, quant/requant mode, dims, step
+    /// count). Shared by the in-place and the D8 snapshot-source routes.
+    fn replay_ml_admits(
+        &self,
+        gpu: &Gpu,
+        dn_state: &qwen35::DeltaNetState,
+        n_steps: usize,
+    ) -> bool {
+        let n_la = self.qkv_bufs.len();
+        dn_state.quant == qwen35::StateQuant::Q8
+            && n_la != 0
+            && n_steps <= self.max_n
+            && dn_state.s_matrices.len() == n_la
+            && dn_state.conv_states.len() == n_la
+            && gpu.gdn_replay_ml_eligible(
+                self.n_v_heads,
+                self.n_key_heads,
+                self.key_head_dim,
+                self.value_head_dim,
+                n_steps,
+            )
+    }
+
+    /// Railgun E0 / L6c: one preamble row and one recurrence row per LA layer,
+    /// with the live DeltaNet state as both source and destination.
+    fn replay_ml_rows(
+        &self,
+        ml: &GdnReplayMl,
+        weights: &qwen35::Qwen35Weights,
+        config: &qwen35::Qwen35Config,
+        dn_state: &qwen35::DeltaNetState,
+    ) -> (
+        Vec<rdna_compute::dflash_gdn_replay::DflashReplayPreLayer>,
+        Vec<rdna_compute::dflash_gdn_replay::GdnLayerTable>,
+    ) {
+        let n_la = self.qkv_bufs.len();
+        let row = self.max_n * self.v_dim * 4;
+        let mut pre = Vec::with_capacity(n_la);
+        let mut gdn = Vec::with_capacity(n_la);
+        let mut la_idx = 0usize;
+        for (layer_idx, lt) in config.layer_types.iter().enumerate() {
+            if *lt != qwen35::LayerType::LinearAttention {
+                continue;
+            }
+            let conv_weight = match &weights.layers[layer_idx] {
+                qwen35::LayerWeights::DeltaNet(l) => &l.conv_weight,
+                qwen35::LayerWeights::DeltaNetMoe(l) => &l.conv_weight,
+                _ => unreachable!("LA layer type mismatch in replay_gdn"),
+            };
+            let off = (la_idx * row) as u64;
+            let q = ml.q.buf.as_ptr() as u64 + off;
+            let k = ml.k.buf.as_ptr() as u64 + off;
+            let v = ml.v.buf.as_ptr() as u64 + off;
+            pre.push(rdna_compute::dflash_gdn_replay::DflashReplayPreLayer {
+                qkv_tape: self.qkv_bufs[la_idx].buf.as_ptr() as u64,
+                conv_w: conv_weight.buf.as_ptr() as u64,
+                conv_state: dn_state.conv_states[la_idx].buf.as_ptr() as u64,
+                v_out: v,
+                q_dst: q,
+                k_dst: k,
+            });
+            gdn.push(rdna_compute::dflash_gdn_replay::GdnLayerTable {
+                q,
+                k,
+                v,
+                gate: self.alpha_bufs[la_idx].buf.as_ptr() as u64,
+                beta: self.beta_bufs[la_idx].buf.as_ptr() as u64,
+                s_q8: dn_state.s_matrices[la_idx].buf.as_ptr() as u64,
+                s_scales: dn_state.s_scales[la_idx].buf.as_ptr() as u64,
+                output: ml.out.buf.as_ptr() as u64 + off,
+                ef: dn_state
+                    .ef_residual(la_idx)
+                    .map_or(0, |t| t.buf.as_ptr() as u64),
+            });
+            la_idx += 1;
+        }
+        (pre, gdn)
+    }
+
+    /// Railgun E0 / L6c: two-launch replay of every LA layer (preamble, then
+    /// recurrence) over device pointer tables. Returns `Ok(false)` — the
+    /// caller then runs the per-layer launches — when the route is
+    /// ineligible (arch, opt-out, open Redline recording, quant/requant mode,
+    /// dims, step count) or arming failed. Byte parity with the per-layer
+    /// path is gated by `test_dflash_replay_ml`.
+    fn replay_gdn_ml(
+        &self,
+        gpu: &mut Gpu,
+        weights: &qwen35::Qwen35Weights,
+        config: &qwen35::Qwen35Config,
+        dn_state: &qwen35::DeltaNetState,
+        n_steps: usize,
+    ) -> HipResult<bool> {
+        if !self.replay_ml_admits(gpu, dn_state, n_steps) {
+            return Ok(false);
+        }
+        let n_la = self.qkv_bufs.len();
+        let mut guard = self.replay_ml.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.is_none() {
+            *guard = Some(GdnReplayMl::arm(gpu, n_la, self.max_n, self.v_dim));
+        }
+        let Some(Some(ml)) = guard.as_mut() else {
+            return Ok(false);
+        };
+        let fp = Self::replay_ml_fingerprint(weights, config, dn_state);
+        if ml.fingerprint != Some(fp) {
+            // Tables may still be read by an in-flight replay: drain first.
+            if ml.fingerprint.is_some() {
+                gpu.hip.device_synchronize()?;
+            }
+            let (pre, gdn) = self.replay_ml_rows(ml, weights, config, dn_state);
+            gpu.hip.memcpy_htod(
+                &ml.pre_table,
+                rdna_compute::dflash_gdn_replay::table_bytes(&pre),
+            )?;
+            gpu.hip.memcpy_htod(
+                &ml.gdn_table,
+                rdna_compute::dflash_gdn_replay::table_bytes(&gdn),
+            )?;
+            ml.fingerprint = Some(fp);
+        }
+        let hd = self.key_head_dim;
+        gpu.dflash_gdn_replay_pre_ml(
+            ml.pre_table.as_ptr() as *const _,
+            n_la,
+            self.n_v_heads,
+            self.n_key_heads,
+            self.k_dim,
+            self.v_dim,
+            self.qkv_dim,
+            n_steps,
+            1.0 / (hd as f32).sqrt(),
+            config.norm_eps,
+        )?;
+        gpu.gated_delta_net_q8_fast_ml(
+            ml.gdn_table.as_ptr() as *const _,
+            n_la,
+            n_steps,
+            self.n_v_heads,
+            self.value_head_dim,
+        )?;
+        Ok(true)
+    }
+
+    /// Railgun D8: whether [`Self::replay_gdn_from_snapshot`] can run —
+    /// `HIPFIRE_DN_SNAPSHOT_FLIP=1`, the two-launch replay admits this call,
+    /// and `snap` mirrors `dn_state` (one same-size backup per live tensor in
+    /// every family). Host-only; no allocation.
+    pub fn replay_from_snapshot_admits(
+        &self,
+        gpu: &Gpu,
+        dn_state: &qwen35::DeltaNetState,
+        snap: &DeltaNetSnapshot,
+        n_steps: usize,
+    ) -> bool {
+        gpu.flags.dn_snapshot_flip
+            && self.replay_ml_admits(gpu, dn_state, n_steps)
+            && snap.mirrors(dn_state)
+    }
+
+    /// Railgun D8: [`Self::replay_gdn`] for `n_steps` that reads the
+    /// pre-verify state (conv ring, S, scales, EF residual) from `snap`'s
+    /// buffers and writes the advanced state to `dn_state`, in the same two
+    /// launches as the E0 multi-layer replay. It is the byte-for-byte result
+    /// of `snap.restore_to(dn_state)` followed by the in-place replay (every
+    /// live element is written; the kernels are the E0 ones with only the
+    /// load addresses changed), without the restore copy, and `snap` is not
+    /// written, so it stays the pre-window state that terminal repair
+    /// restores. Returns `Ok(false)` without touching any state when
+    /// [`Self::replay_from_snapshot_admits`] is false or arming failed; the
+    /// caller then restores and replays in place.
+    #[allow(clippy::too_many_arguments)]
+    pub fn replay_gdn_from_snapshot(
+        &self,
+        gpu: &mut Gpu,
+        weights: &qwen35::Qwen35Weights,
+        config: &qwen35::Qwen35Config,
+        dn_state: &mut qwen35::DeltaNetState,
+        snap: &DeltaNetSnapshot,
+        n_steps: usize,
+    ) -> HipResult<bool> {
+        if !self.replay_from_snapshot_admits(gpu, dn_state, snap, n_steps) {
+            return Ok(false);
+        }
+        let n_la = self.qkv_bufs.len();
+        let mut guard = self.replay_ml.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.is_none() {
+            *guard = Some(GdnReplayMl::arm(gpu, n_la, self.max_n, self.v_dim));
+        }
+        let Some(Some(ml)) = guard.as_mut() else {
+            return Ok(false);
+        };
+        if ml.from.is_none() {
+            ml.from = Some(GdnReplayMlFrom::arm(gpu, n_la));
+        }
+        if !matches!(ml.from, Some(Some(_))) {
+            return Ok(false);
+        }
+        let fp = {
+            let mut h = Self::replay_ml_fingerprint(weights, config, dn_state);
+            for buf in snap.backup_buffers() {
+                h ^= buf.as_ptr() as u64;
+                h = h.wrapping_mul(0x0100_0000_01b3);
+            }
+            h
+        };
+        let stale = ml.from.as_ref().and_then(|f| f.as_ref()).map(|f| f.fingerprint) != Some(Some(fp));
+        if stale {
+            let (pre, gdn) = self.replay_ml_rows(ml, weights, config, dn_state);
+            let pre: Vec<_> = pre
+                .into_iter()
+                .enumerate()
+                .map(|(la, base)| rdna_compute::dflash_gdn_replay::DflashReplayPreLayerFrom {
+                    base,
+                    conv_state_src: snap.conv_state_bufs[la].as_ptr() as u64,
+                })
+                .collect();
+            let gdn: Vec<_> = gdn
+                .into_iter()
+                .enumerate()
+                .map(|(la, base)| rdna_compute::dflash_gdn_replay::GdnLayerTableFrom {
+                    base,
+                    s_q8_src: snap.s_matrix_bufs[la].as_ptr() as u64,
+                    s_scales_src: snap.s_scale_bufs[la].as_ptr() as u64,
+                    ef_src: snap
+                        .s_ef_residual_bufs
+                        .get(la)
+                        .map_or(0, |b| b.as_ptr() as u64),
+                })
+                .collect();
+            let Some(Some(from)) = ml.from.as_mut() else {
+                unreachable!("armed above")
+            };
+            // Tables may still be read by an in-flight replay: drain first.
+            if from.fingerprint.is_some() {
+                gpu.hip.device_synchronize()?;
+            }
+            gpu.hip.memcpy_htod(
+                &from.pre_table,
+                rdna_compute::dflash_gdn_replay::table_bytes(&pre),
+            )?;
+            gpu.hip.memcpy_htod(
+                &from.gdn_table,
+                rdna_compute::dflash_gdn_replay::table_bytes(&gdn),
+            )?;
+            from.fingerprint = Some(fp);
+        }
+        let Some(Some(from)) = ml.from.as_ref() else {
+            unreachable!("armed above")
+        };
+        let hd = self.key_head_dim;
+        gpu.dflash_gdn_replay_pre_ml_from(
+            from.pre_table.as_ptr() as *const _,
+            n_la,
+            self.n_v_heads,
+            self.n_key_heads,
+            self.k_dim,
+            self.v_dim,
+            self.qkv_dim,
+            n_steps,
+            1.0 / (hd as f32).sqrt(),
+            config.norm_eps,
+        )?;
+        gpu.gated_delta_net_q8_fast_ml_from(
+            from.gdn_table.as_ptr() as *const _,
+            n_la,
+            n_steps,
+            self.n_v_heads,
+            self.value_head_dim,
+        )?;
+        Ok(true)
     }
 
     /// Replay the full LA sub-pipeline (conv1d + qk-l2norm + repeat-interleave +
@@ -1711,6 +2148,9 @@ impl GdnTape {
             n_steps <= self.max_n,
             "replay_gdn: n_steps {n_steps} > max_n"
         );
+        if self.replay_gdn_ml(gpu, weights, config, dn_state, n_steps)? {
+            return Ok(());
+        }
         let n_v_heads = self.n_v_heads;
         let n_key_heads = self.n_key_heads;
         let hd = self.key_head_dim;
@@ -1863,6 +2303,132 @@ impl GdnTape {
             la_idx += 1;
         }
         Ok(())
+    }
+}
+
+/// Railgun E0 / L6c: device state of the multi-layer replay. Each LA layer
+/// owns rows `[la * max_n * v_dim, (la + 1) * max_n * v_dim)` of the q/k/v
+/// preamble outputs and of the (dead) recurrence output, so all layers run
+/// concurrently without sharing scratch. `fingerprint` is `None` until the
+/// tables are first written.
+struct GdnReplayMl {
+    q: GpuTensor,
+    k: GpuTensor,
+    v: GpuTensor,
+    out: GpuTensor,
+    pre_table: DeviceBuffer,
+    gdn_table: DeviceBuffer,
+    fingerprint: Option<u64>,
+    /// Railgun D8 snapshot-source tables. `None` until the first D8 replay
+    /// arms them; `Some(None)` when arming failed (D8 then restores and
+    /// replays in place for the life of the tape).
+    from: Option<Option<GdnReplayMlFrom>>,
+}
+
+/// Railgun D8: device tables of [`GdnTape::replay_gdn_from_snapshot`]
+/// (`DflashReplayPreLayerFrom` / `GdnLayerTableFrom` rows). They reuse
+/// [`GdnReplayMl`]'s q/k/v/out scratch. `fingerprint` covers the live state,
+/// the conv weights and the snapshot buffers; `None` until first written.
+struct GdnReplayMlFrom {
+    pre_table: DeviceBuffer,
+    gdn_table: DeviceBuffer,
+    fingerprint: Option<u64>,
+}
+
+impl GdnReplayMlFrom {
+    /// JIT both snapshot-source kernels and allocate the two tables. Any
+    /// failure frees what was allocated and returns `None`.
+    fn arm(gpu: &mut Gpu, n_la: usize) -> Option<Self> {
+        if gpu.ensure_dflash_gdn_replay_ml_from().is_err() {
+            return None;
+        }
+        let pre_bytes = n_la
+            * std::mem::size_of::<rdna_compute::dflash_gdn_replay::DflashReplayPreLayerFrom>();
+        let gdn_bytes =
+            n_la * std::mem::size_of::<rdna_compute::dflash_gdn_replay::GdnLayerTableFrom>();
+        let pre_table = gpu.hip.malloc(pre_bytes).ok()?;
+        let Ok(gdn_table) = gpu.hip.malloc(gdn_bytes) else {
+            let _ = gpu.hip.free(pre_table);
+            return None;
+        };
+        Some(Self {
+            pre_table,
+            gdn_table,
+            fingerprint: None,
+        })
+    }
+
+    fn free_gpu(self, gpu: &mut Gpu) {
+        let _ = gpu.hip.free(self.pre_table);
+        let _ = gpu.hip.free(self.gdn_table);
+    }
+}
+
+impl GdnReplayMl {
+    /// Allocate scratch + tables and JIT both kernels. Any failure frees what
+    /// was allocated and returns `None`: the tape stays on the per-layer path.
+    fn arm(gpu: &mut Gpu, n_la: usize, max_n: usize, v_dim: usize) -> Option<Self> {
+        if gpu.ensure_dflash_gdn_replay_ml().is_err() {
+            return None;
+        }
+        let n = n_la * max_n * v_dim;
+        let mut tensors = Vec::with_capacity(4);
+        for _ in 0..4 {
+            match gpu.alloc_tensor(&[n], DType::F32) {
+                Ok(t) => tensors.push(t),
+                Err(_) => {
+                    for t in tensors {
+                        let _ = gpu.free_tensor(t);
+                    }
+                    return None;
+                }
+            }
+        }
+        let pre_bytes =
+            n_la * std::mem::size_of::<rdna_compute::dflash_gdn_replay::DflashReplayPreLayer>();
+        let gdn_bytes =
+            n_la * std::mem::size_of::<rdna_compute::dflash_gdn_replay::GdnLayerTable>();
+        let tables = gpu
+            .hip
+            .malloc(pre_bytes)
+            .and_then(|p| match gpu.hip.malloc(gdn_bytes) {
+                Ok(g) => Ok((p, g)),
+                Err(e) => {
+                    let _ = gpu.hip.free(p);
+                    Err(e)
+                }
+            });
+        let Ok((pre_table, gdn_table)) = tables else {
+            for t in tensors {
+                let _ = gpu.free_tensor(t);
+            }
+            return None;
+        };
+        let out = tensors.pop()?;
+        let v = tensors.pop()?;
+        let k = tensors.pop()?;
+        let q = tensors.pop()?;
+        Some(Self {
+            q,
+            k,
+            v,
+            out,
+            pre_table,
+            gdn_table,
+            fingerprint: None,
+            from: None,
+        })
+    }
+
+    fn free_gpu(self, gpu: &mut Gpu) {
+        for t in [self.q, self.k, self.v, self.out] {
+            let _ = gpu.free_tensor(t);
+        }
+        let _ = gpu.hip.free(self.pre_table);
+        let _ = gpu.hip.free(self.gdn_table);
+        if let Some(Some(from)) = self.from {
+            from.free_gpu(gpu);
+        }
     }
 }
 
@@ -2290,6 +2856,13 @@ impl HiddenStateRingBuffer {
     /// rest of the engine relies on for ordering with null-stream consumers
     /// (e.g. the draft forward's D2H of hidden rows after this commit).
     pub fn commit_staging_to_ring(&mut self, gpu: &mut Gpu, n: usize) -> HipResult<()> {
+        assert!(
+            n <= self.max_batch,
+            "commit_staging_to_ring: n {} > staging max_batch {} — a chunk wider than \
+             staging wrote straight to the ring; finish it with finish_prefill_chunk",
+            n,
+            self.max_batch
+        );
         let row_bytes = self.hidden_dim * 4;
         let head = self.head;
         let max_pos = self.max_positions;
@@ -2360,6 +2933,101 @@ impl HiddenStateRingBuffer {
         self.head = (head + n) % max_pos;
         self.written += n;
         Ok(())
+    }
+
+    /// Whether a ring-carrying prompt prefill may take the ordinary (AR)
+    /// prefill route: widened chunks, the GDN chunk scan, and chunks wider than
+    /// staging, whose rows [`write_chunk_rows`](Self::write_chunk_rows) writes
+    /// straight to the ring at `head`. Eager only: under graph capture or
+    /// Redline recording the rows must go through fixed-offset staging (a baked
+    /// `head` is wrong on replay), so chunks stay capped at `max_batch`.
+    /// `HIPFIRE_DFLASH_LEGACY_PREFILL=1` keeps the staged route everywhere.
+    pub fn rides_ordinary_prefill(&self, gpu: &Gpu) -> bool {
+        !gpu.graphs.capture_mode && !gpu.replay.is_recording() && !dflash_legacy_prefill()
+    }
+
+    /// Whether an `n`-row prefill chunk writes its rows straight to the ring
+    /// instead of staging. Only chunks wider than staging do, so every chunk
+    /// that fits (verify blocks, short prompts) keeps the staged commit.
+    pub fn writes_direct(&self, gpu: &Gpu, n: usize) -> bool {
+        n > self.max_batch && self.rides_ordinary_prefill(gpu)
+    }
+
+    /// Per-extract-layer write of an `n`-row prefill chunk: staging (see
+    /// [`write_rows_to_staging`](Self::write_rows_to_staging)), or for a
+    /// [`writes_direct`](Self::writes_direct) chunk the ring slots
+    /// `head..head + n`, wrapping. Pair with
+    /// [`finish_prefill_chunk`](Self::finish_prefill_chunk) after the chunk.
+    pub fn write_chunk_rows(
+        &self,
+        gpu: &mut Gpu,
+        extract_idx: usize,
+        src: &GpuTensor,
+        n: usize,
+    ) -> HipResult<()> {
+        if !self.writes_direct(gpu, n) {
+            return self.write_rows_to_staging(gpu, extract_idx, src, n);
+        }
+        assert!(
+            n <= self.max_positions,
+            "write_chunk_rows: n {} > ring max_positions {}",
+            n,
+            self.max_positions
+        );
+        let first = n.min(self.max_positions - self.head);
+        self.copy_rows_into_ring(gpu, extract_idx, self.head, src, 0, first)?;
+        if first < n {
+            self.copy_rows_into_ring(gpu, extract_idx, 0, src, first, n - first)?;
+        }
+        Ok(())
+    }
+
+    /// Place an `n`-row prefill chunk written by
+    /// [`write_chunk_rows`](Self::write_chunk_rows) and advance `head` by `n`:
+    /// commit staging, or for a direct chunk wait for its copies when a stream
+    /// is active (null-stream readers such as `download_hidden_block` follow).
+    pub fn finish_prefill_chunk(&mut self, gpu: &mut Gpu, n: usize) -> HipResult<()> {
+        if !self.writes_direct(gpu, n) {
+            return self.commit_staging_to_ring(gpu, n);
+        }
+        if let Some(stream) = gpu.active_stream.as_ref() {
+            gpu.hip.stream_synchronize(stream)?;
+        }
+        self.advance_head_by(n);
+        Ok(())
+    }
+
+    /// Copy `rows` rows of `src` from row `src_row` to ring slot `dst_slot` of
+    /// one extract layer, on the active stream when one is set so the copy is
+    /// ordered after the forward kernels that produced `src`.
+    fn copy_rows_into_ring(
+        &self,
+        gpu: &Gpu,
+        extract_idx: usize,
+        dst_slot: usize,
+        src: &GpuTensor,
+        src_row: usize,
+        rows: usize,
+    ) -> HipResult<()> {
+        let row_bytes = self.hidden_dim * 4;
+        let dst = &self.layer_bufs[extract_idx].buf;
+        match gpu.active_stream.as_ref() {
+            Some(stream) => gpu.hip.memcpy_dtod_async_at(
+                dst,
+                dst_slot * row_bytes,
+                &src.buf,
+                src_row * row_bytes,
+                rows * row_bytes,
+                stream,
+            ),
+            None => gpu.hip.memcpy_dtod_at(
+                dst,
+                dst_slot * row_bytes,
+                &src.buf,
+                src_row * row_bytes,
+                rows * row_bytes,
+            ),
+        }
     }
 
     /// Reset to empty (head=0, written=0). GPU buffers are not zeroed; stale
@@ -2880,6 +3548,13 @@ fn verify_dflash_block_inner(
             &format!("DFlash verify KV token range overflow ({start_pos} + {b})"),
         )
     })?;
+    qwen35::prefill::release_widened_pbs_for_kv_growth(
+        gpu,
+        &target.kv_cache,
+        &target.config,
+        &target.scratch,
+        required_tokens,
+    )?;
     // Verify replay bypasses the regular qwen35 forward wrappers.
     target
         .kv_cache
@@ -5199,9 +5874,15 @@ pub fn spec_step_dflash(
     // `verify_scratch.logits` buffer, so the host full-logit download + host
     // argmax are skipped — that's the target-side half of the cost cut.
     let want_full_logits = (use_temp_sampling && !fast_sample_active) || host_path_active;
+    // Railgun D8: a kept full accept relies on the HIP/HipGraph verify body —
+    // no route, or a route that planned this window as its ordinary HIP window
+    // (`full_hip`/`partial_hip` advanced; prime/capture/PM4 windows do not).
+    let mut verify_on_hip = verify_pm4.is_none();
     let verify_out = match verify_pm4 {
         Some(route) => {
             let replay_failures_before = route.counters().replay_failures;
+            let hip_windows = |r: &DflashVerifyPm4| r.counters().full_hip + r.counters().partial_hip;
+            let hip_windows_before = hip_windows(route);
             match verify_dflash_block_retained(
                 gpu,
                 target,
@@ -5213,7 +5894,10 @@ pub fn spec_step_dflash(
                 verify_scratch,
                 route,
             ) {
-                Ok(out) => out,
+                Ok(out) => {
+                    verify_on_hip = hip_windows(route) == hip_windows_before + 1;
+                    out
+                }
                 Err(error) => {
                     // Fail closed when quiescence was never proven: a PM4 body
                     // may still be executing against KV, DeltaNet state, and
@@ -5755,7 +6439,33 @@ pub fn spec_step_dflash(
     // draft tokens). The bonus token is NOT replayed — it will be
     // block[0] of the next iter. This keeps the invariant that before each
     // verify, target state is at position `start` (= pre-verify position).
-    target_snap.restore_to(&mut target.dn_state, gpu)?;
+    //
+    // Railgun D8 (`HIPFIRE_DN_SNAPSHOT_FLIP=1`, exact gfx1201, tape path with
+    // the two-launch replay admitted) drops the restore copy. `target_snap`
+    // stays the pre-verify (pre-window) state throughout, so terminal repair
+    // is unaffected, and the live state ends byte-identical to restore +
+    // in-place replay on every rollback path:
+    // - full accept (`accept_len + 1 == b`, EF residual on, HIP/HipGraph
+    //   verify): keep the verify-advanced live buffers. The verify ran the
+    //   replay's arithmetic on the same b taped rows from the same state
+    //   (same conv1d, same two-multiply QK norm, repeat-interleave as a copy,
+    //   the same GDN kernel with deterministic EF requant), so restore +
+    //   replay(b) would rewrite the same bytes;
+    // - any shorter accept, including zero and the `max_accept` clamp: the
+    //   replay reads the pre-verify state from `target_snap` and writes the
+    //   live buffers;
+    // - no tape, EF off, a retained-PM4 verify, or any other decline: restore
+    //   and run exactly as before. (DFlash never stops on EOS here.)
+    let replay_from_snapshot = gdn_tape_opt.as_deref().is_some_and(|tape| {
+        tape.replay_from_snapshot_admits(gpu, &target.dn_state, target_snap, accept_len + 1)
+    });
+    let keep_verified = replay_from_snapshot
+        && verify_on_hip
+        && accept_len + 1 == b
+        && !target.dn_state.s_ef_residual.is_empty();
+    if !replay_from_snapshot {
+        target_snap.restore_to(&mut target.dn_state, gpu)?;
+    }
 
     if phase_on {
         gpu.hip.device_synchronize()?;
@@ -5773,13 +6483,29 @@ pub fn spec_step_dflash(
     // tokens, same as the prior version — re-runs the full target but one
     // batched call instead of (accept+1) sequential decodes.
     if let Some(tape) = gdn_tape_opt.as_deref() {
-        tape.replay_gdn(
-            gpu,
-            &target.weights,
-            &target.config,
-            &mut target.dn_state,
-            accept_len + 1,
-        )?;
+        let done = keep_verified
+            || (replay_from_snapshot
+                && tape.replay_gdn_from_snapshot(
+                    gpu,
+                    &target.weights,
+                    &target.config,
+                    &mut target.dn_state,
+                    target_snap,
+                    accept_len + 1,
+                )?);
+        if !done {
+            if replay_from_snapshot {
+                // Arming the snapshot-source tables failed: restore after all.
+                target_snap.restore_to(&mut target.dn_state, gpu)?;
+            }
+            tape.replay_gdn(
+                gpu,
+                &target.weights,
+                &target.config,
+                &mut target.dn_state,
+                accept_len + 1,
+            )?;
+        }
     } else {
         let replay_tokens = &committed[..accept_len + 1];
         qwen35::forward_prefill_batch(
@@ -5894,7 +6620,9 @@ fn dense_tp_dflash_gates(
     let dim = target.configs[0].dim;
     let n_layers = target.configs[0].n_layers;
     for cfg in target.configs.iter() {
-        if cfg.dim != dim || cfg.n_layers != n_layers || cfg.layer_types != target.configs[0].layer_types
+        if cfg.dim != dim
+            || cfg.n_layers != n_layers
+            || cfg.layer_types != target.configs[0].layer_types
         {
             return Err("dense TP DFlash configs diverge on global shape".into());
         }
@@ -5910,9 +6638,7 @@ fn dense_tp_dflash_gates(
         if !s.dflash.draft_config.all_layers_sliding
             || !s.dflash.draft_weights.has_candidate_selector()
         {
-            return Err(
-                "dense TP DFlash requires a DFlash2 all-sliding selector draft".into(),
-            );
+            return Err("dense TP DFlash requires a DFlash2 all-sliding selector draft".into());
         }
         if s.dflash.draft_config.target_layer_ids.len() != s.dflash.hidden_rb.extract_layers.len() {
             return Err("dense TP DFlash rank hidden ring disagrees with draft layers".into());
@@ -6026,13 +6752,8 @@ pub fn seed_target_hidden_dense_tp2_abortable(
         }
     }
     // All CPU gates passed — now mutate device state.
-    reset_dense_tp_dflash_ranks(
-        gpus,
-        &mut *target.kv_caches,
-        &mut *target.dn_states,
-        states,
-    )
-    .map_err(|e| e.to_string())?;
+    reset_dense_tp_dflash_ranks(gpus, &mut *target.kv_caches, &mut *target.dn_states, states)
+        .map_err(|e| e.to_string())?;
     let mut off = 0usize;
     let mut last_n = 0usize;
     while off < prompt.len() {
@@ -6051,12 +6772,18 @@ pub fn seed_target_hidden_dense_tp2_abortable(
             let [s0, s1] = states else {
                 return Err("dense TP DFlash seed lost a rank".into());
             };
-            let pbs0 = s0.dflash.verify_scratch.prefill_batch.as_ref().ok_or(
-                "dense TP DFlash rank 0 lost its persistent PBS",
-            )?;
-            let pbs1 = s1.dflash.verify_scratch.prefill_batch.as_ref().ok_or(
-                "dense TP DFlash rank 1 lost its persistent PBS",
-            )?;
+            let pbs0 = s0
+                .dflash
+                .verify_scratch
+                .prefill_batch
+                .as_ref()
+                .ok_or("dense TP DFlash rank 0 lost its persistent PBS")?;
+            let pbs1 = s1
+                .dflash
+                .verify_scratch
+                .prefill_batch
+                .as_ref()
+                .ok_or("dense TP DFlash rank 1 lost its persistent PBS")?;
             let fh = s0.dflash.verify_scratch.final_hidden.sub_offset(0, n * dim);
             let mut caps = [
                 DenseTpDflashCapture {
@@ -6090,7 +6817,9 @@ pub fn seed_target_hidden_dense_tp2_abortable(
     // Prime each rank's draft target-hidden cache + upload log, and keep a
     // host shadow for the (all-sliding no-op) backfill call below.
     for rank in 0..2 {
-        gpus.devices[rank].bind_thread().map_err(|e| e.to_string())?;
+        gpus.devices[rank]
+            .bind_thread()
+            .map_err(|e| e.to_string())?;
         let modulus = states[rank].dflash.draft_scratch.ctx_modulus();
         scatter_hidden_block_to_interleaved(
             &gpus.devices[rank],
@@ -6102,9 +6831,16 @@ pub fn seed_target_hidden_dense_tp2_abortable(
             modulus,
         )
         .map_err(|e| e.to_string())?;
-        let host = download_hidden_block(&gpus.devices[rank], &states[rank].dflash.hidden_rb, prompt.len())
-            .map_err(|e| e.to_string())?;
-        states[rank].dflash.target_hidden_host.extend_from_slice(&host);
+        let host = download_hidden_block(
+            &gpus.devices[rank],
+            &states[rank].dflash.hidden_rb,
+            prompt.len(),
+        )
+        .map_err(|e| e.to_string())?;
+        states[rank]
+            .dflash
+            .target_hidden_host
+            .extend_from_slice(&host);
         hipfire_runtime::dflash::draft_seed_backfill(
             &mut gpus.devices[rank],
             &states[rank].dflash.draft_weights,
@@ -6114,7 +6850,11 @@ pub fn seed_target_hidden_dense_tp2_abortable(
             prompt.len(),
         )
         .map_err(|e| e.to_string())?;
-        states[rank].dflash.draft_scratch.thlog.seed_prompt(prompt.len());
+        states[rank]
+            .dflash
+            .draft_scratch
+            .thlog
+            .seed_prompt(prompt.len());
         states[rank].logical_pos = prompt.len();
         states[rank].receipt_generation = u64::MAX;
     }
@@ -6150,7 +6890,11 @@ pub fn seed_target_hidden_dense_tp2_abortable(
         row.iter()
             .enumerate()
             .fold((0u32, f32::NEG_INFINITY), |(best, bv), (i, &v)| {
-                if v > bv { (i as u32, v) } else { (best, bv) }
+                if v > bv {
+                    (i as u32, v)
+                } else {
+                    (best, bv)
+                }
             })
             .0
     };
@@ -6171,7 +6915,10 @@ pub fn verify_dflash_block_dense_tp2(
 ) -> HipResult<Vec<u32>> {
     let b = dense_tp_dflash_gates(gpus, &target, states).map_err(|e| HipError::new(0, &e))?;
     if block.len() != b {
-        return Err(HipError::new(0, "dense TP DFlash verify block must be B rows"));
+        return Err(HipError::new(
+            0,
+            "dense TP DFlash verify block must be B rows",
+        ));
     }
     for s in states.iter() {
         if s.logical_pos != position {
@@ -6274,7 +7021,11 @@ pub fn verify_dflash_block_dense_tp2(
     let w_out = &target.weights[0].output;
     let mut argmax_per_pos: Vec<u32> = Vec::with_capacity(b);
     if dflash_batched_lm_head_supported(w_out.gpu_dtype) {
-        let fh = states[0].dflash.verify_scratch.final_hidden.sub_offset(0, b * dim);
+        let fh = states[0]
+            .dflash
+            .verify_scratch
+            .final_hidden
+            .sub_offset(0, b * dim);
         dflash_enqueue_verify_lm_head(
             &mut gpus.devices[0],
             w_out,
@@ -6285,12 +7036,17 @@ pub fn verify_dflash_block_dense_tp2(
         )?;
         let argmax_buf = states[0].dflash.verify_scratch.argmax.sub_offset(0, b);
         gpus.devices[0].argmax_f32_batched(
-            &states[0].dflash.verify_scratch.logits.sub_offset(0, b * vocab),
+            &states[0]
+                .dflash
+                .verify_scratch
+                .logits
+                .sub_offset(0, b * vocab),
             &argmax_buf,
             vocab,
             b,
         )?;
-        argmax_per_pos = dflash_download_verify_argmax(&gpus.devices[0], &states[0].dflash.verify_scratch, b)?;
+        argmax_per_pos =
+            dflash_download_verify_argmax(&gpus.devices[0], &states[0].dflash.verify_scratch, b)?;
     } else {
         for i in 0..b {
             let hidden_row = states[0]
@@ -6298,7 +7054,11 @@ pub fn verify_dflash_block_dense_tp2(
                 .verify_scratch
                 .final_hidden
                 .sub_offset(i * dim, dim);
-            let logits_row = states[0].dflash.verify_scratch.logits.sub_offset(i * vocab, vocab);
+            let logits_row = states[0]
+                .dflash
+                .verify_scratch
+                .logits
+                .sub_offset(i * vocab, vocab);
             llama::weight_gemv(
                 &mut gpus.devices[0],
                 &target.weights[0].output,
@@ -6397,7 +7157,10 @@ pub fn spec_step_dflash_dense_tp2(
             "dense TP DFlash rank draft candidates diverge — mesh reset, no tokens published",
         ));
     }
-    let drafted = drafted_per_rank.into_iter().next().expect("two rank drafts");
+    let drafted = drafted_per_rank
+        .into_iter()
+        .next()
+        .expect("two rank drafts");
     for i in 1..b {
         block[i] = drafted[i];
     }
@@ -8398,14 +9161,152 @@ pub fn seed_target_hidden_from_prompt(
     Ok(())
 }
 
-/// Abortable variant of `seed_target_hidden_from_prompt`. Manually
-/// chunks the prefill at [`qwen35::PREFILL_MAX_BATCH`] boundaries and
-/// calls `abort_check` between chunks. Returns `Ok(true)` if aborted
-/// (state has been fully reset — caller should NOT continue with
-/// decode), `Ok(false)` on normal completion. The chunked path matches
-/// the kernel-internal sub-batch size, so per-chunk throughput is the
-/// same as the one-shot variant; the only overhead is one
-/// `download_hidden_block` per chunk (host-side memcpy of ~5 MB).
+/// `HIPFIRE_DFLASH_LEGACY_PREFILL=1`: the DFlash target prompt prefill keeps
+/// its previous route, 256-row seed chunks whose hidden rows go through ring
+/// staging, outside the widened chunk and the GDN chunk scan. Default off: the
+/// seed prefills on AR's ordinary route (see [`SeedPrefill`]).
+pub fn dflash_legacy_prefill() -> bool {
+    hipfire_config::developer_bool("HIPFIRE_DFLASH_LEGACY_PREFILL", false)
+}
+
+/// Outer chunk plan and scratch shared by the DFlash prompt seeds.
+///
+/// Default: the plan of AR's ordinary prefill (`hipfire-generate` `ar.rs`,
+/// no-eviction branch): the ceiling is `ordinary_prefill_chunk_limit`, taken
+/// once per prompt, and each outer chunk is `ordinary_serve_prefill_chunk_len`.
+/// Each chunk runs the same forward AR runs, plus the hidden ring, which
+/// rides AR's route ([`HiddenStateRingBuffer::rides_ordinary_prefill`]). So
+/// after the prompt the target's KV, DeltaNet state and last-token logits are
+/// byte-identical to AR's prefill of the same prompt.
+///
+/// The ring holds only `max_positions` rows (a windowed draft's ring is W
+/// rows), so an outer chunk wider than the ring runs as ring-sized pieces
+/// ([`SeedPrefill::piece_len`]) whose hidden rows are read back one piece at
+/// a time.
+///
+/// Legacy (`HIPFIRE_DFLASH_LEGACY_PREFILL=1`): 256-row outer chunks.
+struct SeedPrefill {
+    ceiling: usize,
+    /// One scratch for every chunk that does not reuse the retained widened
+    /// scratch. Allocated on the first such chunk and freed by
+    /// [`SeedPrefill::free`]. Every PBS tensor is overwritten before it is
+    /// read, so reuse is bit-identical to a fresh scratch per chunk.
+    pbs: Option<qwen35::PrefillBatchScratch>,
+}
+
+impl SeedPrefill {
+    fn plan(gpu: &Gpu, target: &ModelSlot) -> Self {
+        let ceiling = if dflash_legacy_prefill() {
+            qwen35::PREFILL_MAX_BATCH
+        } else {
+            match qwen35::ordinary_prefill_chunk_limit(
+                gpu,
+                &target.weights,
+                &target.config,
+                &target.dn_state,
+                &target.kv_cache,
+                None,
+            ) {
+                Ok(limit) => limit,
+                Err(e) => {
+                    eprintln!("dflash seed: chunk-limit query failed ({e}); keeping legacy ceiling");
+                    qwen35::prefill_max_batch(gpu)
+                }
+            }
+        };
+        Self { ceiling, pbs: None }
+    }
+
+    fn next_len(&self, remaining: usize) -> usize {
+        qwen35::prefill::ordinary_serve_prefill_chunk_len(remaining, self.ceiling)
+            .unwrap_or(remaining.min(self.ceiling).max(1))
+    }
+
+    /// Rows of the next forward call inside an outer chunk with `remaining`
+    /// rows left. A chunk the ring can hold runs whole. A wider one runs as
+    /// pieces planned by the widened chunk rule at the ring size rounded down
+    /// to the 512-row commit stride: the pieces keep every boundary AR's own
+    /// chunk planner makes, and each added boundary falls on one of the 512-row
+    /// commits the widened chunk already makes there.
+    fn piece_len(hidden_rb: &HiddenStateRingBuffer, remaining: usize) -> usize {
+        let ring = hidden_rb.max_positions;
+        if remaining <= ring {
+            return remaining;
+        }
+        let stride = qwen35::prefill::WIDENED_COMMIT_ROWS;
+        let cap = if ring >= stride { ring / stride * stride } else { ring };
+        qwen35::prefill::next_exact_prefill_chunk_len(remaining, cap)
+            .unwrap_or(remaining.min(cap))
+    }
+
+    /// Prefill one piece at `pos`, extracting hidden rows into the ring.
+    /// `total` is the seed's token count, which bounds the scratch.
+    fn forward(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut ModelSlot,
+        hidden_rb: &mut HiddenStateRingBuffer,
+        chunk: &[u32],
+        pos: usize,
+        total: usize,
+    ) -> HipResult<()> {
+        // A widened ceiling reuses the retained widened scratch, and a
+        // configured legacy cache (`HIPFIRE_PREFILL_REUSE_PBS=1`) is its own
+        // reuse: both run exactly the forward AR runs.
+        if self.ceiling > qwen35::prefill::WIDENED_COMMIT_ROWS
+            || target.scratch.prefill_batch.is_some()
+        {
+            return qwen35::forward_prefill_batch(
+                gpu,
+                &target.weights,
+                &target.config,
+                chunk,
+                pos,
+                &mut target.kv_cache,
+                &mut target.dn_state,
+                &target.scratch,
+                Some(hidden_rb),
+                None,
+                None,
+                None,
+            );
+        }
+        if self.pbs.is_none() {
+            let rows = self.ceiling.min(total).max(2);
+            self.pbs = Some(qwen35::PrefillBatchScratch::new_opt(gpu, &target.config, rows, false)?);
+        }
+        qwen35::forward_prefill_batch_with_pbs(
+            gpu,
+            &target.weights,
+            &target.config,
+            chunk,
+            pos,
+            &mut target.kv_cache,
+            &mut target.dn_state,
+            &target.scratch,
+            Some(hidden_rb),
+            None,
+            None,
+            None,
+            self.pbs.as_ref(),
+            None,
+            None,
+        )
+    }
+
+    fn free(self, gpu: &mut Gpu) {
+        if let Some(pbs) = self.pbs {
+            let _ = pbs.free_gpu(gpu);
+        }
+    }
+}
+
+/// Abortable variant of `seed_target_hidden_from_prompt`. Chunks the prefill
+/// with [`SeedPrefill`] (AR's plan by default) and calls `abort_check`
+/// between chunks. Returns `Ok(true)` if aborted (state has been fully reset,
+/// so the caller should NOT continue with decode), `Ok(false)` on normal
+/// completion. Each chunk costs one `download_hidden_block` on top of the
+/// forward (a host copy of its hidden rows).
 ///
 /// Used by the daemon's `generate_dflash` to honor client-side
 /// cancellation on long-context retries (cache-miss scenarios where
@@ -8433,43 +9334,37 @@ pub fn seed_target_hidden_from_prompt_abortable(
             snap.free_gpu(gpu);
         }
     }
-    let chunk_max = qwen35::PREFILL_MAX_BATCH;
-    let mut seq_pos: usize = 0;
-    while seq_pos < prompt_tokens.len() {
-        if abort_check() {
-            let _ = target.reset_state(gpu);
-            target_hidden_host.clear();
-            if let Some(cks) = checkpoints.as_deref_mut() {
-                for (_, snap) in cks.drain(..) {
-                    snap.free_gpu(gpu);
+    let mut seed = SeedPrefill::plan(gpu, target);
+    let result = (|| -> HipResult<bool> {
+        let mut seq_pos: usize = 0;
+        while seq_pos < prompt_tokens.len() {
+            if abort_check() {
+                let _ = target.reset_state(gpu);
+                target_hidden_host.clear();
+                if let Some(cks) = checkpoints.as_deref_mut() {
+                    for (_, snap) in cks.drain(..) {
+                        snap.free_gpu(gpu);
+                    }
                 }
+                return Ok(true);
             }
-            return Ok(true);
+            let end = seq_pos + seed.next_len(prompt_tokens.len() - seq_pos);
+            while seq_pos < end {
+                let piece = SeedPrefill::piece_len(hidden_rb, end - seq_pos);
+                let chunk = &prompt_tokens[seq_pos..seq_pos + piece];
+                seed.forward(gpu, target, hidden_rb, chunk, seq_pos, prompt_tokens.len())?;
+                let block = download_hidden_block(gpu, hidden_rb, piece)?;
+                target_hidden_host.extend_from_slice(&block);
+                seq_pos += piece;
+            }
+            if let Some(cks) = checkpoints.as_deref_mut() {
+                take_dn_checkpoint(cks, &target.dn_state, gpu, seq_pos, ckpt_interval, ckpt_cap);
+            }
         }
-        let end = (seq_pos + chunk_max).min(prompt_tokens.len());
-        let chunk = &prompt_tokens[seq_pos..end];
-        qwen35::forward_prefill_batch(
-            gpu,
-            &target.weights,
-            &target.config,
-            chunk,
-            seq_pos,
-            &mut target.kv_cache,
-            &mut target.dn_state,
-            &target.scratch,
-            Some(hidden_rb),
-            None,
-            None,
-            None,
-        )?;
-        let block = download_hidden_block(gpu, hidden_rb, chunk.len())?;
-        target_hidden_host.extend_from_slice(&block);
-        seq_pos = end;
-        if let Some(cks) = checkpoints.as_deref_mut() {
-            take_dn_checkpoint(cks, &target.dn_state, gpu, seq_pos, ckpt_interval, ckpt_cap);
-        }
-    }
-    Ok(false)
+        Ok(false)
+    })();
+    seed.free(gpu);
+    result
 }
 
 /// Incremental prompt seed for the DFlash prompt cache: prefill ONLY the
@@ -8505,36 +9400,29 @@ pub fn seed_target_hidden_suffix_abortable(
     ckpt_interval: usize,
     ckpt_cap: usize,
 ) -> HipResult<bool> {
-    let chunk_max = qwen35::PREFILL_MAX_BATCH;
-    let mut off: usize = 0;
-    let mut pos = start_pos;
-    while off < suffix.len() {
-        if abort_check() {
-            return Ok(true);
+    let mut seed = SeedPrefill::plan(gpu, target);
+    let result = (|| -> HipResult<bool> {
+        let mut off: usize = 0;
+        let mut pos = start_pos;
+        while off < suffix.len() {
+            if abort_check() {
+                return Ok(true);
+            }
+            let end = off + seed.next_len(suffix.len() - off);
+            while off < end {
+                let piece = SeedPrefill::piece_len(hidden_rb, end - off);
+                seed.forward(gpu, target, hidden_rb, &suffix[off..off + piece], pos, suffix.len())?;
+                pos += piece;
+                off += piece;
+            }
+            if let Some(cks) = checkpoints.as_deref_mut() {
+                take_dn_checkpoint(cks, &target.dn_state, gpu, pos, ckpt_interval, ckpt_cap);
+            }
         }
-        let end = (off + chunk_max).min(suffix.len());
-        let chunk = &suffix[off..end];
-        qwen35::forward_prefill_batch(
-            gpu,
-            &target.weights,
-            &target.config,
-            chunk,
-            pos,
-            &mut target.kv_cache,
-            &mut target.dn_state,
-            &target.scratch,
-            Some(hidden_rb),
-            None,
-            None,
-            None,
-        )?;
-        pos += chunk.len();
-        off = end;
-        if let Some(cks) = checkpoints.as_deref_mut() {
-            take_dn_checkpoint(cks, &target.dn_state, gpu, pos, ckpt_interval, ckpt_cap);
-        }
-    }
-    Ok(false)
+        Ok(false)
+    })();
+    seed.free(gpu);
+    result
 }
 
 /// Mirror a TriAttention KV eviction into the DFlash draft's GPU-resident

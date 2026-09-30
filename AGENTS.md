@@ -165,12 +165,28 @@ works, what to measure, what counts as pass/fail.
 - **`dflash_mode=off` is the default.** Any test exercising DFlash
   still needs `hipfire config set dflash_mode auto` or
   `HIPFIRE_DFLASH_DRAFT=<path>` first.
-- **PFlash is retained legacy research, not mainline or production functionality.**
-  It lives in `crates/hipfire-pflash` outside `crates/hipfire-arch-*` and exists
-  only for historical reference and reproduction; prefix caching supersedes it
-  for supported serving workloads. Agents must not treat PFlash as a production
-  element, recommendation, acceptance route, or basis for a current
-  performance claim.
+- **PFlash is deprecated since 0.4.0 and will be removed in 0.5.0.**
+  It lives in `crates/hipfire-pflash` outside `crates/hipfire-arch-*`, still
+  loads, warns when used (`prefill_compression` != `off`), and is not
+  supported; prefix caching supersedes it for supported serving workloads.
+  Agents must not treat PFlash as a production element, recommendation,
+  acceptance route, or basis for a current performance claim.
+- **Also deprecated since 0.4.0, removal in 0.5.0** (each entry point carries
+  `// lifecycle: deprecated since 0.4.0, removal 0.5.0 — <reason>`; the
+  status of every env var / config key is in `docs/env-vars.md` /
+  `docs/CONFIG.md`, enforced by `scripts/check-lifecycle.py`): Givens asym KV
+  (`legacy-asymN`) and the `asymN`/`turboN` KV aliases (use `fwhtN`);
+  legacy contiguous DFlash knobs (`HIPFIRE_DFLASH_WINDOW=0`,
+  `HIPFIRE_DFLASH_CTX_CAP`); the `scripts/coherence-gate-*.sh` batteries,
+  `_coherence_runner.py`, `awq_coherence_check.sh`, `pflash-gate.sh`;
+  GGUF **weight** input to the quantizer (lossy double quantization; use
+  llama.cpp for GGUF — `imatrix.gguf` stays); MQ4R / DS4 MQ2R route selection
+  by file extension (no runtime warning; 0.5.0 selects by HFQ metadata).
+- **CASK is deprecated since 0.4.0 and will be removed in 0.5.0.**
+  CASK / TriAttention KV eviction (FlashCASK, `memory.cask.*`, `hipfire
+  sidecar-gen`) still loads, warns when used, and is not supported. Do not
+  treat it as a production element, recommendation, acceptance route, or basis
+  for a current performance claim, and do not build on it.
 
 ---
 
@@ -224,9 +240,9 @@ works, what to measure, what counts as pass/fail.
 DFlash draft sidecar (same mechanism as the MTP/DSpark sidecars):
 
 ```bash
-# Canonical acceptance / dense validation fixture (Qwen3.8-27B MQ4XT):
-hipfire pull qwen3.8:27b-mq4-xt    # ~15 GB target + MQ4 DFlash draft sidecar
-# lands at ~/.hipfire/models/qwen3.8-27b.mq4-xt
+# Canonical acceptance / dense validation fixture (Qwen3.8-27B MQ4XTS):
+hipfire pull qwen3.8:27b-mq4-xts   # ~15 GB target + MQ4 DFlash draft sidecar
+# lands at ~/.hipfire/models/qwen3.8-27b.mq4-xts
 # measured draft identity (acceptance/perf pin):
 #   ~/qcal/ladder-v2/drafts/qwen3.8-27b-dflash.mq4v2.hfq
 #   (see §5 "Pinned Hugging Face bench fixture")
@@ -247,7 +263,7 @@ filename; renaming breaks the pairing — `dflash_mode auto` then runs AR
 
 ### Verify hashes after pull (paranoid mode)
 
-For the **canonical dense fixture** (`qwen3.8-27b.mq4-xt`), verify
+For the **canonical dense fixture** (`qwen3.8-27b.mq4-xts`), verify
 SHA-256 against the pin in §5 — do not trust filename alone.
 
 Registry-present smoke / historical artifacts (still in
@@ -323,7 +339,7 @@ token 1358 `\n\n\n` for the HOT token 271 `\n\n` on Qwen3.5/3.6 vocab).
 
 - Env: `HIPFIRE_NORMALIZE_PROMPT=0`
 - TUI: `hipfire config set prompt_normalize false`
-- Per-model: `hipfire config qwen3.8:27b-mq4-xt set prompt_normalize false`
+- Per-model: `hipfire config qwen3.8:27b-mq4-xts set prompt_normalize false`
 
 
 **Verify:** see §3 prompt-shape A/B test.
@@ -336,12 +352,12 @@ Standalone: `cargo run --release -p hipfire-runtime --example encode_prompt -- M
 
 ### E. DFlash draft endpoints (HuggingFace)
 
-**Current acceptance fixture** (dense Qwen3.8-27B MQ4XT):
+**Current acceptance fixture** (dense Qwen3.8-27B MQ4XTS):
 
-- Target: `hipfire-models/qwen3.8-27b` / `qwen3.8-27b.mq4-xt`
-  (registry tag `qwen3.8:27b-mq4-xt` → `~/.hipfire/models/qwen3.8-27b.mq4-xt`)
+- Target: `hipfire-models/qwen3.8-27b` / `qwen3.8-27b.mq4-xts`
+  (registry tag `qwen3.8:27b-mq4-xts` → `~/.hipfire/models/qwen3.8-27b.mq4-xts`)
 - Registry draft sidecar: `qwen38-27b-dflash-mq4.hfq`
-  (`hipfire pull qwen3.8:27b-mq4-xt` or `hipfire pull qwen3.8:27b-draft`)
+  (`hipfire pull qwen3.8:27b-mq4-xts` or `hipfire pull qwen3.8:27b-draft`)
 - Measured draft identity (acceptance/perf pin):
   `~/qcal/ladder-v2/drafts/qwen3.8-27b-dflash.mq4v2.hfq` (see §5)
 
@@ -455,13 +471,13 @@ reassurance.
 If you're testing an actual user UX flow:
 
 ```bash
-hipfire pull qwen3.8:27b-mq4-xt    # target + registry draft sidecar
+hipfire pull qwen3.8:27b-mq4-xts   # target + registry draft sidecar
 hipfire config set dflash_mode auto    # opt in (default since 2026-04-26: off)
 # Acceptance draft pin when measuring (optional override of registry sidecar):
 # export HIPFIRE_DFLASH_DRAFT=~/qcal/ladder-v2/drafts/qwen3.8-27b-dflash.mq4v2.hfq
-hipfire run qwen3.8:27b-mq4-xt "Write a Python function to find the longest substring without repeating characters"
+hipfire run qwen3.8:27b-mq4-xts "Write a Python function to find the longest substring without repeating characters"
 # expected: loader logs 'DFlash draft loaded: ...'
-# on-disk target: ~/.hipfire/models/qwen3.8-27b.mq4-xt
+# on-disk target: ~/.hipfire/models/qwen3.8-27b.mq4-xts
 ```
 
 
@@ -551,22 +567,53 @@ canonical trunk by local filename. Local filenames drift and lookalike
 MQ4/MQ4V2 files are not comparable.
 
 The canonical dense trunk is whichever local artifact byte-matches
-`qwen3.8-27b.mq4-xt` from HF repo `hipfire-models/qwen3.8-27b`
-(registry tag `qwen3.8:27b-mq4-xt`):
+`qwen3.8-27b.mq4-xts` from HF repo `hipfire-models/qwen3.8-27b`
+(registry tag `qwen3.8:27b-mq4-xts`):
 
 - HF repo: `hipfire-models/qwen3.8-27b`
-- HF / local file: `qwen3.8-27b.mq4-xt`
-- File size: `14980361216`
-- SHA-256: `9f91556f7e0431a077d03756a7102d0154108757289e6e5fe9a2d204c0c9eeb7`
-- Paired draft (measured with the canonical fixture identity):
+- HF / local file: `qwen3.8-27b.mq4-xts`
+- File size: `14987185152`. `qwen3.8-27b.mq4-xt` has exactly the same
+  size, so only the digest tells them apart.
+- SHA-256: `3e38ccbae3776470eb5a89344d300e9279d6b9ab6c31fd40ca1758c4f7c6f8ae`
+- Checkpoint: H2, symmetric MQ4V2 XT (qt44) with per-group AWQ alpha and
+  three GPTQ scale-refit rounds on the v5 Hessian. It replaces the
+  2026-09-23 `mq4-xts` test upload (QAT r7s200, `de8ee825…`), which is not
+  comparable.
+- Paired draft (the registry sidecar `qwen38-27b-dflash-mq4.hfq`, same bytes):
   `~/qcal/ladder-v2/drafts/qwen3.8-27b-dflash.mq4v2.hfq`
   (sha256 `d0a74a232a0e2166d889f823e91e0fbf778d21dd9668d7de055cdecb065401bc`)
 
 Before reporting dense 3.8 MQ4V2/DFlash results, verify the candidate
-trunk with `sha256sum` and require the digest above. Reports that use a
-trunk with a different digest are not comparable and should be discarded.
+trunk with `scripts/check_fixture.sh [PATH]` (size + SHA-256) and require
+the digest above. Reports that use a trunk with a different digest are
+not comparable and should be discarded.
 
-Historical: the prior dense pin was Qwen3.6-27B
+**Quality pins.** `eval_hipfire --scoring-mode prefill --max-chunks 24`
+with `HIPFIRE_GRAPH=0`, `HIPFIRE_NORMALIZE_PROMPT=0` and a fresh HOME
+and kernel cache. References: WT2 `qwen3.8-27b.ref_wt2.bin` (sha256
+`8c545178fb43647499c4c7bdd33178c24fd402615c641add9ed51a0c9a43234a`),
+code24 `heldout-code24.gptqsym.kldref.bin` (sha256
+`43ab7591f2acf6b5b4058b77253109230d96591be02469ddef55235102ec7582`).
+A change that claims to be bit-exact must reproduce its arch's `.kldseq`
+byte for byte. A change that moves a pin on purpose re-pins it here.
+
+| Arch | Route, KV flags | Corpus | KLD | `.kldseq` SHA-256 |
+|---|---|---|---:|---|
+| gfx1201 | A4 (default), `--kv-mode fp8 --kv-v q8` | WT2 | 0.069571 | `483cfc58b4cc71ea3a9a71c657833e34aa847f513aceae50c1c0f0dfe65ae898` |
+| gfx1201 | A4 (default), `--kv-mode fp8 --kv-v q8` | code24 | 0.052119 | `6339dc9e54bbd498774667cfe25c8405049d20c2c61e930ab7e783b662c5f13a` |
+| gfx1201 | native fp8 (`HIPFIRE_IU4_PREFILL=0`), `--kv-mode fp8 --kv-v q8` | WT2 | 0.041859 | `19227d5fb08eb3bf10207eef6f5cc81addbb20befe90519a9692827d53c96508` |
+| gfx1201 | native fp8 (`HIPFIRE_IU4_PREFILL=0`), `--kv-mode fp8 --kv-v q8` | code24 | 0.029867 | `5e7ac9dcd264a930e35b0bd627232bcecea11665ec669a8640cd014cfe22ba3a` |
+| gfx1100 | A4 (default), `--kv-mode q8` | WT2 | 0.068687 | `ccf95389f9dd5e45b3927c98bd8bafac93ae3922417e6730c280fd9e6dce6dcd` |
+| gfx1100 | A4 (default), `--kv-mode q8` | code24 | 0.052666 | `a7eac2b4d06bfd96ead1889dcbaa0cf230dc32cfdc55a82ae73bccedbcbe532f` |
+| gfx1151 | A4 (default), `--kv-mode q8 --kv-v q8` | WT2 | 0.068955 | `c1056943318f2abb667a149d73548e0087fb506724f48dfa14dc2e292d3bdff2` |
+| gfx1151 | A4 (default), `--kv-mode q8 --kv-v q8` | code24 | 0.051358 | `04f06883e2a95306ebeead6d6bf256e8381128e4c115c6593b99c95f594fb308` |
+
+Historical: the previous dense pin was the asymmetric Qwen3.8-27B MQ4V2 XT
+(`hipfire-models/qwen3.8-27b` / `qwen3.8-27b.mq4-xt`, registry tag
+`qwen3.8:27b-mq4-xt`, size `14987185152`, sha256
+`80e7c624424fd1d363ba86681d3dc1e5ac5534e0e064306a32be204c4843d0f3`; re-issued
+2026-09-15 with AWQ sidecars, the prior `14980361216` / `9f91556f…` upload
+lacked them, WT2 KLD 0.057 vs 0.048). Before that it was Qwen3.6-27B
 (`hipfire-models/qwen3.6-27b` / `qwen3.6-27b.mq4`, size `14984158208`,
 sha256 `86a5f80fd29d545abb1093dead242725ced6d68b8607c6d566d897b1a82442dc`).
 
@@ -601,6 +648,96 @@ The only permitted prompt fixtures for this A3B MoE DFlash thread are:
 Runs using any other prompt are exploratory only and must not be compared
 against the A3B MoE DFlash perfmaxx line.
 
+### Pinned Flash-Next bench fixture
+
+The canonical Flash-Next trunk is whichever local artifact byte-matches
+`qwen3.8-flash-next.mq4` from HF repo `hipfire-models/qwen3.8-flash-next`
+(registry tag `qwen3.8:flash-next`, since 2026-09-28):
+
+- HF repo: `hipfire-models/qwen3.8-flash-next`
+- HF / local file: `qwen3.8-flash-next.mq4`
+- File size: `125288540696`
+- SHA-256: `8aa01cf41bf2a90b319b9a1c70837baf51a2f92811af551f59b59d418518f650`
+- MD5: `001878abd9b68218876ac0ae732e481b`
+- Recipe (r2): MQ6G256V2 trunk (240 tensors) and language head,
+  MQ4G256V2/MQ4G128V2 experts, Q8F16 embed/MTP-attention and PLE n-gram rows
+  (128 shards, external-resident, 54,400,261,120 B). Needs a build at or
+  after `cb566dab9` (qt=54 I64 metadata records).
+- Container revision 2026-09-29: the three I64 PLE metadata records were
+  re-tagged qt=52 -> qt=54 in place; payloads are byte-identical to the
+  2026-09-28 upload (sha256 `cd7cbb911d3d016e034b1d22be1be37b42873a21699c94f09337528f1eee9db6`),
+  so measurements taken on those bytes still apply.
+
+Before reporting Flash-Next results, verify the candidate trunk with
+`sha256sum` and require the digest above.
+
+Historical: the prior pin was `qwen3.8-flash-next.mq6q8-pleq8` (still on HF,
+tag `qwen3.8:flash-next-mq6q8-pleq8`; size `125467331096`, sha256
+`c0628b848077f02afed9ce5a4daa0598c379aa1d1e5ca0c0b24ddd04b49773a9` after the
+same qt=54 re-tag, `58fb4f586403000b3394413c38f58b0ec0d8845675f81c3d3c0b5de2cdaa4aed`
+before it); it differs
+only in its Q8F16 head. The caveats and measurements below were taken on that
+prior pin unless they say otherwise.
+
+Caveats that are part of the fixture, not trivia:
+
+- Loading it needs a build whose qwen4 trunk source contract admits **both**
+  packed trunk tiers and whose external-PLE admission accepts both PLE tiers.
+  Older builds refuse at load; that refusal is correct, not a corrupt file.
+- **MTP is on by default (`speculation.mtp = auto`) except on `.mq4r` loads,
+  which keep the retained Redline AR route; greedy requests only.** Each MTP
+  window picks its verification route: a batched `(K+1)`-row verify at the
+  draft depth `K` that maximizes expected emitted tokens per window cost
+  (per-depth draft agreement, decayed), or the interleaved route (one target
+  row per draft, stop at the first rejection) when no depth pays.
+  `HIPFIRE_MTP_INCREMENTAL=0` forces batched at the full `mtp_k`; `1` forces
+  interleaved. The few-row (2..8) verify forward is bitwise the single-row
+  decode route, so greedy MTP emits AR's exact tokens on either route. On GPUs
+  whose GDN route captures per-row states (gfx11+ SIMT) a rejected suffix
+  rolls back without re-running the accepted rows; elsewhere the batched
+  route restores and replays. Drafts rank the vocabulary with an MQ2 copy of
+  the LM head and re-score its top 8 exactly against the head's own Q8_0 or
+  MQ6G256V2 rows (`HIPFIRE_MTP_DRAFT_HEAD`, default `mq2r`).
+  Teacher-forced prompt and replay steps advance MTP state without computing
+  an unused language-head prediction; prompt target chunks emit only their
+  final logit row while retaining every wide hidden row.
+- **Measured, not an 80% claim:** on 2026-09-23, gfx1151, HIP 7.2, greedy,
+  KV q8, `max_seq=2048`, graph off, three fresh daemon processes per mode and
+  byte-identical committed prompts, median code decode was AR 19.4 versus
+  MTP 20.1 tok/s (end-to-end 17.1 versus 17.2); prose decode was AR 17.9
+  versus MTP 18.0 (end-to-end 15.6 versus 17.1, with large run-to-run
+  spread). Daemon md5 `d09ff1d3220b818c4f4d06a3c60cc85b`; prompt md5s:
+  code `df5dedc8040ce70ba55080c4548e6024`, prose
+  `07a7880965142971dbb3cc7493f8fb94`. All three MTP runs emitted AR's
+  exact 227 code and 256 prose token IDs. Local raw reports:
+  `.codeinsight+research/qwen4/mtp-parity/runs/moe-buffer-fix/perf-v2/`.
+- After fixing routed/shared MoE scratch aliasing, restoring the learned final
+  HC mixer, and reselecting QSA at source-correct boundaries, conditional
+  draft agreement was 0.708/0.532/0.476 for prose and
+  0.922/0.932/0.889 for code at steps 1/2/3. The remaining throughput gap
+  to a claimed 80% gain is verifier/replay cost, not evidence that the
+  trained drafter is defective. Do not extrapolate these fixture-bound
+  measurements to other architectures or prompts.
+- **Later measurement (2026-09-28, same prompts, fixture-bound):** after the
+  few-row verify, rollback and draft-head work in
+  [`docs/perf-checkpoints/2026-09-28-qwen4-mtp-decode-autoresearch-gfx1151.md`](docs/perf-checkpoints/2026-09-28-qwen4-mtp-decode-autoresearch-gfx1151.md),
+  MTP decode was code ~55 and prose ~37 tok/s against AR ~33 on the same
+  build, with greedy MTP ids equal to AR's. The GPU was shared with external
+  processes; read the checkpoint's method before citing a number.
+- **On `qwen3.8-flash-next.mq4` (2026-09-28, fixture-bound):** with the
+  MQ6G256V2 head's re-score, greedy MTP geomean over nine committed prompts
+  was 59.5 tok/s against AR 33.7 (55.4 without the re-score); the same file
+  with a Q8_0 head reached 59.2 at AR 33.1. Method and caveats:
+  [`docs/perf-checkpoints/2026-09-28-qwen4-mtp-mq6-rescore-gfx1151.md`](docs/perf-checkpoints/2026-09-28-qwen4-mtp-mq6-rescore-gfx1151.md).
+- `hipfire bench` cannot measure this model at all: the qwen4 contract pins
+  `max_seq` to 2048 while bench asks for the configured 32768 (still 5120 with
+  `memory.max_seq` forced to 2048), so it fails closed at load and never
+  reaches a measurement. Use the serve or probe path. The fix, if wanted, is a
+  bench-side `max_seq` knob — not an MTP change.
+- Decode numbers are not comparable across instruments: the raw decode probe
+  measured 22.74 tok/s (ctx128, graph off, kv q8), the serve path ~19.9 tok/s.
+  Same model, different measurement; never average or compare them across.
+
 ---
 
 ## 6 · Common pitfalls (history of what bit us)
@@ -609,13 +746,12 @@ against the A3B MoE DFlash perfmaxx line.
 |---|---|---|
 | "DFlash got slower overnight" | Prompt structure changed (one newline added/removed) | Use byte-identical prompts via `benchmarks/prompts/*.txt` |
 | `τ=9.42` on first run, `τ=8.07` on next | Different prompt — see above | Same fix |
-| "0 evictions even though sidecar loaded" | `cask_beta` too high (default 128) means trigger is at budget+128 | Lower beta to 16 to actually exercise the eviction policy |
 | "DFlash 102 tok/s on prose vs 124 AR" | Draft-target argmax disagreement on prose tokens, τ collapses to ~1.2 | Expected with z-lab drafts; no retraining fix is planned — Path C (custom draft training, `feat/mtp-dflash-training`) was a failed month-1 experiment and is dead. Use AR or accept the genre-conditional behaviour. |
 | 3.6-A3B DFlash 68.6 tok/s vs AR 135 tok/s (50% loss) | 3.6 draft trained on 3.5 traces; target distribution mismatch on code. τ=1.22 on hard code. | Use AR mode for 3.6-A3B. Draft mismatch is expected and no 3.6 retrain is planned — Path C (`feat/mtp-dflash-training`) is dead/out-of-scope, not a forthcoming fix. 3.5-A3B DFlash works (τ=4.91). |
-| `hipMalloc out of memory` at hidden_rb | Long ctx (≥16K real tokens) + 27B + asym3 = tight on 24 GB | Reduce ctx, use a smaller target, or wait for the bounded-rolling-buffer trick (roadmap) |
+| `hipMalloc out of memory` at hidden_rb | Legacy contiguous DFlash (draft declares no window or `HIPFIRE_DFLASH_WINDOW=0`) sizes the draft context structures to the context; long ctx + 27B can exhaust 24 GB | Use the default windowed draft (draft VRAM pinned at W); otherwise lower `HIPFIRE_DFLASH_CTX_CAP` or ctx. KV headroom: `fwht3` is the optional compact mode on every arch |
 | `tok/s` below expected on long-ctx | KV cache growth — prefill is fine but decode slows past ~2K | Test at small ctx first, then scale |
 | daemon doesn't pair a pulled draft | Renamed draft file, or pulled before the sidecar existed | Don't rename files after pull; re-run `hipfire pull <tag>` to fetch the registry-declared sidecar |
-| `[hipfire-daemon] dflash_mode=off — skipping draft load` | Default flipped to `off` in 35265c6 (post-2026-04-26). Pulling a draft does NOT auto-enable DFlash anymore. | `hipfire config set dflash_mode auto` (or `on`); or per-model `hipfire config qwen3.8:27b-mq4-xt set dflash_mode on` |
+| `[hipfire-daemon] dflash_mode=off — skipping draft load` | Default flipped to `off` in 35265c6 (post-2026-04-26). Pulling a draft does NOT auto-enable DFlash anymore. | `hipfire config set dflash_mode auto` (or `on`); or per-model `hipfire config qwen3.8:27b-mq4-xts set dflash_mode on` |
 | "Numbers don't match the README" | Forgot `HIPFIRE_NORMALIZE_PROMPT=1` (pre-2026-04-26) | Now default ON. Pull latest. If you opted out via `prompt_normalize=false`, that overrides the default — flip back. |
 | "27B DFlash regressed 30-40% suddenly" | PR #32 (cleanup-dead-wmma-kernels) on master removed `gemm_hfq4g256_residual_wmma{,2,_k4}.hip` thinking dead. Dispatch fell back to slower variants. | Verify against canonical 199 tok/s @ max=120 with default flags. If kernel files missing in `kernels/src/`, `git checkout` from a known-good commit (see commit 9a2c667 for the full recovery context). |
 | `HIPFIRE_GRAPH=1` reports plausible tok/s but output is garbage | Dangling stack-pointer kernargs from raw `self.hip.launch_kernel(...)` calls in `forward_scratch_layers` (kv_cache_write_*, attention_flash_*, fused_qkv_hfq4g256, rmsnorm_batched, rope_partial_interleaved_f32, gated_delta_net_q8, etc.) — captured pointers dangle past `end_graph_capture` | Bench tok/s alone never proves graph correctness. Always eyeball under `HIPFIRE_GRAPH=1` and run the claim-scoped VALIDATION serve route — never retired coherence-gate scripts as acceptance. Fix: migrate every raw-launch helper used in forward_scratch_layers to `launch_maybe_blob` (model after `conv1d_silu_split_f32_n`). |
@@ -631,16 +767,18 @@ against the A3B MoE DFlash perfmaxx line.
 | `HIPFIRE_PROMPT_TOKEN_HEAT` | Per-position BPE merge-rank dump | OFF |
 | `HIPFIRE_PROMPT_HEAT_JSON` | JSON output for heat dump | OFF |
 | `HIPFIRE_PROMPT_HEAT_LIMIT` | Max rows in heat dump | 64 |
-| `HIPFIRE_KV_MODE` | Override kv_cache config | (config) |
+| `HIPFIRE_KV_MODE` | Override `kv_cache` config. `fwht3` is the optional compact mode; `asymN`/`turboN` on Qwen are aliases of `fwhtN`, and Givens asym is `legacy-asymN` only | `auto`: fp8 on gfx1201 (Qwen H24/Hkv4/D256, single GPU, no adaptive/CASK), q8 otherwise incl. gfx1100/gfx1151 (`kv_mode.rs:28-46,194-215`) |
 | `HIPFIRE_ATTN_FLASH` | Override flash_mode config | (config) |
 | `HIPFIRE_OOM_GUARD` | Memory preflight OOM guard (`kv_slots::preflight_alloc`, SlotPool arena, bench-sweep headroom check). `auto`: on for unified-memory APUs (Strix Halo — overshoot is a global OOM), off for discrete GPUs, swap-decided for GPU-less processes | `auto` (`memory.oom_guard`) |
 |`HIPFIRE_DFLASH_DRAFT`|Force a specific draft path, overriding the registry sidecar. Empty string = explicit opt-out|(unset: registry sidecar when `dflash_mode` is `auto`/`on`)|
-|`HIPFIRE_DFLASH_CTX_CAP`|Max rows for draft context-indexed structures (target_hidden, draft K/V caches, hidden ring). Bounds draft-side VRAM on large-`max_seq` serve loads; over-cap requests fall back to AR (identical output, slower). `0` = uncapped legacy.|8192|
-|`HIPFIRE_DFLASH_WINDOW`|Windowed draft context (NInfer pattern): SWA over the last W rows on draft layers 0..n-2 + full-attention last layer reaching min(physical_cap, 4W). Draft VRAM pins at W regardless of `max_seq`; past-W requests degrade τ instead of falling back to AR. Refused with CASK eviction. `0`/unset = Legacy (cap + AR fallback).|0 (off)|
+|`HIPFIRE_DFLASH_CTX_CAP`|**Legacy contiguous DFlash only** (draft declares no window or `HIPFIRE_DFLASH_WINDOW=0`). Max rows for draft context-indexed structures (target_hidden, draft K/V caches, hidden ring); over-cap requests fall back to AR (identical output, slower). `0` = uncapped. Ignored in windowed mode.|8192|
+|`HIPFIRE_DFLASH_WINDOW`|Windowed draft context: sliding attention over the last W rows (DFlash2: every layer; otherwise layers 0..n-2 plus a full-attention last layer). Draft VRAM pins at W regardless of `max_seq`; past-W requests degrade τ instead of falling back to AR. Unset = the draft's declared `sliding_window` (`dflash_spec.rs:170-200`); `<rows>` = override (warns on mismatch); `0` = legacy contiguous.|draft-declared window (legacy contiguous if none)|
 | `HIPFIRE_LM_HEAD_F16` | `auto`/`native` keeps qt=1 lm_head as F16; `f32`/`legacy` expands to F32 | auto/native |
 | `HIPFIRE_LOCAL` | Force local-spawn (skip serve HTTP) | OFF |
 | `HIPFIRE_HOST_TIMING` | Per-cycle host timing probe | OFF |
 | `HIPFIRE_VERIFY_GRAPH` | Verify-forward graph capture (0 = off) | ON |
+| `HIPFIRE_GPU_LAYER_BUDGET` | Resident-layer budget for partial GPU offload: `N` keeps the last `N` layers on the GPU and spills the prefix to host RAM. Counts layers **on** the GPU, not offloaded — `3` on a 64-layer model spills 61. Unset/`auto`/`-1`/unparseable = fully resident (never forces offload). Sibling of `HIPFIRE_OFFLOAD_EXEC`. See [docs/plans/partial-gpu-offload-design.md](docs/plans/partial-gpu-offload-design.md). | unset (fully resident) |
+| `HIPFIRE_OFFLOAD_EXEC` | Which engine multiplies a spilled layer's host-mapped weights: `pcie` (default) or `cpu`. Sibling of `memory.gpu_layer_budget`; `cpu` executes the weight-reading GEMVs on the CPU instead of reading them over PCIe. See [docs/plans/partial-gpu-offload-design.md](docs/plans/partial-gpu-offload-design.md) § 6.2.1. | `pcie` |
 | `HIPFIRE_DDTREE_*` | Various DDTree diagnostics | various |
 
 | `hipfire bench` flag | Purpose |
@@ -651,9 +789,13 @@ against the A3B MoE DFlash perfmaxx line.
 | `--ddtree-batched` | Use batched tree verify (research) |
 | `--ddtree-budget N` | Tree node budget |
 | `--ddtree-topk K` | Tree fan-out |
-| `--cask-sidecar PATH` | Load TriAttention sidecar |
-| `--cask-budget N` | KV eviction target |
-| `--cask-beta N` | Hysteresis (lower = more aggressive eviction) |
+
+**Deprecation note — CASK.** CASK / TriAttention KV eviction (`memory.cask.*`
+config keys, `hipfire sidecar-gen`, and the `dflash_spec_demo --cask-*`
+flags; FlashCASK) is deprecated since 0.4.0 and will be removed in 0.5.0.
+It prints a deprecation warning when used, forces legacy contiguous DFlash
+(windowed draft disabled), and is not a flag, fix or pitfall workaround to
+reach for.
 
 ---
 
@@ -674,7 +816,7 @@ If you want to actively contribute findings, these are open:
 
 ---
 
-*Last updated: 2026-09-13 (v0.3.1 cut; fixture pin: Qwen3.8-27B MQ4XT). When this
+*Last updated: 2026-09-30 (0.4.0 cycle: DFlash window default, KV docs; fixture pin: Qwen3.8-27B MQ4XTS). When this
 doc gets stale (more than 1-2 releases behind HEAD), update it as part of the release PR.*
 
 

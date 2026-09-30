@@ -52,8 +52,50 @@ pub struct Session {
     /// message. Matching on the user turns and then replaying our own tokens
     /// keeps the prompt aligned with the KV we actually hold.
     pub convo: Vec<u64>,
+    /// M-RoPE phase offset carried by this conversation's KV, set by the
+    /// image turn that produced it (`VisualData::rope_delta`; 0 for
+    /// text-only conversations).
+    ///
+    /// A text follow-up to an image turn must keep addressing KV rows by
+    /// token index (that is what block tables and `positions[]` use) while
+    /// taking its rope phases from `pos + rope_delta` — the image turn's
+    /// stored keys carry compressed-grid phases, and after a merged image
+    /// grid the phase space trails the token index by exactly this delta.
+    /// Dropping it re-rotates every follow-up query against every image-turn
+    /// key by `|rope_delta|` positions and degrades cross-turn attention to
+    /// near-garbage (the "image follow-up echoes the previous answer"
+    /// symptom). Lives on the session, not the slot: it must survive
+    /// eviction/restore and apply wherever the session is resumed.
+    pub rope_delta: i32,
+    /// True once any turn of this conversation carried an image
+    /// (`req.visual_data.is_some()`). Sticky: a text continuation of an
+    /// image conversation keeps it set.
+    ///
+    /// This is the publish/lookup gate for the cross-session prefix cache —
+    /// NOT `rope_delta != 0`. `rope_delta` is `max(lh,lw) − lh·lw` for the
+    /// merged grid, which is 0 for any single-row/single-column image
+    /// (min(lh,lw) == 1), so a thin-image turn would publish its image-row
+    /// KV to the radix and a later text request could restore it — silent
+    /// wrong output (spec §6 X2). `has_image` is the positive marker.
+    pub has_image: bool,
+    /// Highest page-aligned token boundary of this session's KV that has
+    /// been published to the cross-session prefix cache (spec §4.6 C6).
+    ///
+    /// Lives on the session, not the slot: a continuation turn must resume
+    /// publication from here, or it re-takes cache refs on pages the radix
+    /// already owns (each orphaned ref strands the page away from the free
+    /// list — a monotonic pool drain across turns). Reset to 0 whenever the
+    /// session's physical pages are lost (swap/cold), because the radix's
+    /// handles no longer describe the restored pages.
+    pub published_boundary: usize,
     /// Monotonic stamp for LRU. Bumped by `touch`.
     pub last_used: u64,
+    /// Whether this session currently holds its VRAM admission grant.
+    /// Admission is charged for GPU-resident state only (#776): a Swapped or
+    /// Cold session holds no KV on the device, so leaving it charged lets
+    /// idle conversations exhaust the budget while slots sit free. Private so
+    /// the grant is only taken and returned through the methods below.
+    admitted: bool,
 }
 
 #[derive(Default)]
@@ -76,18 +118,21 @@ impl SessionTable {
         adm: &mut AdmissionController,
         requested_ctx: usize,
     ) -> Result<SessionId, AdmitError> {
-        let granted_ctx = adm.admit(requested_ctx)?;
+        // Mint the id first so the admission grant is keyed by it — two
+        // sessions with identical context sizes must never release each
+        // other's budget.
+        let id = self.next_id;
+        let granted_ctx = adm.admit(id, requested_ctx)?;
         let slot = match pool.acquire() {
             Some(slot) => slot,
             None => {
-                adm.release(granted_ctx);
+                adm.release(id);
                 return Err(AdmitError::PoolFull);
             }
         };
         // Monotonically increasing, never reused: a stale id from a closed
         // session must resolve to `None`, never silently address whoever now
         // holds that slot.
-        let id = self.next_id;
         self.next_id += 1;
         self.sessions.insert(
             id,
@@ -98,6 +143,10 @@ impl SessionTable {
                 next_pos: 0,
                 residency: Residency::Resident,
                 convo: Vec::new(),
+                rope_delta: 0,
+                has_image: false,
+                published_boundary: 0,
+                admitted: true,
                 last_used: {
                     self.clock += 1;
                     self.clock
@@ -107,14 +156,41 @@ impl SessionTable {
         Ok(SessionId(id))
     }
 
-    /// Close a session, returning its slot and budget together.
+    /// Close a session, returning its slot and budget together. A Swapped or
+    /// Cold session already returned its grant when it left the GPU.
     pub fn close(&mut self, pool: &mut SlotPool, adm: &mut AdmissionController, id: SessionId) {
         if let Some(session) = self.sessions.remove(&id.0) {
             if let Some(slot) = session.slot {
                 pool.release(slot);
             }
-            adm.release(session.granted_ctx);
+            if session.admitted {
+                adm.release(id.0);
+            }
         }
+    }
+
+    /// Re-take the VRAM admission of a session that left the GPU, before its
+    /// state is restored into a slot, at the session's last grant. No-op for
+    /// a session that already holds it. On error the session stays
+    /// unadmitted; the caller marks it Cold.
+    pub fn readmit(
+        &mut self,
+        adm: &mut AdmissionController,
+        id: SessionId,
+    ) -> Result<(), AdmitError> {
+        let Some(s) = self.sessions.get_mut(&id.0) else {
+            return Ok(());
+        };
+        if !s.admitted {
+            adm.admit(id.0, s.granted_ctx)?;
+            s.admitted = true;
+        }
+        Ok(())
+    }
+
+    /// Whether the session currently holds its VRAM admission grant.
+    pub fn is_admitted(&self, id: SessionId) -> bool {
+        self.sessions.get(&id.0).is_some_and(|s| s.admitted)
     }
 
     pub fn get(&self, id: SessionId) -> Option<&Session> {
@@ -244,29 +320,69 @@ impl SessionTable {
             .map(|(id, _)| SessionId(*id))
     }
 
-    /// Give up the slot, keeping the session restorable from its snapshot.
-    pub fn mark_swapped(&mut self, pool: &mut SlotPool, id: SessionId) {
+    /// Resize a resident session's admission grant to a turn's actual need
+    /// (spec §5.1 request-sized grants) and remember it, so a later
+    /// [`Self::readmit`] after a swap re-takes the grant the session last
+    /// held rather than its opening one.
+    pub fn resize_grant(
+        &mut self,
+        adm: &mut AdmissionController,
+        id: SessionId,
+        new_ctx: usize,
+    ) -> Result<usize, AdmitError> {
+        let granted = adm.resize(id.0, new_ctx)?;
         if let Some(s) = self.sessions.get_mut(&id.0) {
-            if let Some(slot) = s.slot.take() {
-                pool.release(slot);
-            }
-            s.residency = Residency::Swapped;
+            s.granted_ctx = granted;
+        }
+        Ok(granted)
+    }
+
+    /// Return the grant of a session leaving the GPU, exactly once.
+    fn release_grant(s: &mut Session, adm: &mut AdmissionController, id: SessionId) {
+        if s.admitted {
+            adm.release(id.0);
+            s.admitted = false;
         }
     }
 
-    /// Give up the slot with no usable snapshot. The tokens survive, so the
-    /// next turn re-prefills — slow, never wrong. Every swap failure ends here.
-    pub fn mark_cold(&mut self, pool: &mut SlotPool, id: SessionId) {
+    /// Give up the slot and its VRAM admission, keeping the session
+    /// restorable from its snapshot.
+    pub fn mark_swapped(
+        &mut self,
+        pool: &mut SlotPool,
+        adm: &mut AdmissionController,
+        id: SessionId,
+    ) {
         if let Some(s) = self.sessions.get_mut(&id.0) {
             if let Some(slot) = s.slot.take() {
                 pool.release(slot);
             }
+            Self::release_grant(s, adm, id);
+            s.residency = Residency::Swapped;
+            // The snapshot restore allocates FRESH pages; the radix's
+            // handles no longer describe this session's table, so the next
+            // published turn must start its publication accounting over.
+            s.published_boundary = 0;
+        }
+    }
+
+    /// Give up the slot and its VRAM admission with no usable snapshot. The
+    /// tokens survive, so the next turn re-prefills — slow, never wrong.
+    /// Every swap failure ends here.
+    pub fn mark_cold(&mut self, pool: &mut SlotPool, adm: &mut AdmissionController, id: SessionId) {
+        if let Some(s) = self.sessions.get_mut(&id.0) {
+            if let Some(slot) = s.slot.take() {
+                pool.release(slot);
+            }
+            Self::release_grant(s, adm, id);
             s.residency = Residency::Cold;
             s.next_pos = 0;
+            s.published_boundary = 0;
         }
     }
 
     /// Re-attach a session to a slot after its state has been restored.
+    /// Call [`Self::readmit`] first; this does not touch admission.
     pub fn mark_resident(&mut self, id: SessionId, slot: SlotId, seq_len: usize) {
         self.clock += 1;
         let now = self.clock;
@@ -443,7 +559,7 @@ mod tests {
             s.convo = vec![11];
             s.tokens = vec![1, 2, 3];
         }
-        t.mark_swapped(&mut pool, a);
+        t.mark_swapped(&mut pool, &mut adm, a);
         assert_eq!(t.find_continuation(&[11, 22], &[]), Some(a));
     }
 
@@ -457,7 +573,7 @@ mod tests {
             s.convo = vec![11];
             s.tokens = vec![1, 2, 3];
         }
-        t.mark_cold(&mut pool, a);
+        t.mark_cold(&mut pool, &mut adm, a);
         assert_eq!(t.find_continuation(&[11, 22], &[]), None);
     }
 
@@ -558,7 +674,7 @@ mod tests {
         t.get_mut(a).unwrap().tokens.clear();
         assert_eq!(t.confirm_reentry(a, &[11], &[]), None, "nothing in its KV");
         t.get_mut(a).unwrap().tokens = vec![1];
-        t.mark_cold(&mut pool, a);
+        t.mark_cold(&mut pool, &mut adm, a);
         assert_eq!(t.confirm_reentry(a, &[11], &[]), None, "cold");
     }
 
@@ -593,7 +709,7 @@ mod tests {
     fn a_swapped_session_holds_no_slot_and_frees_it() {
         let (mut pool, mut adm, mut t) = rig(1);
         let a = t.open(&mut pool, &mut adm, 1024).unwrap();
-        t.mark_swapped(&mut pool, a);
+        t.mark_swapped(&mut pool, &mut adm, a);
         assert!(t.get(a).unwrap().slot.is_none());
         assert_eq!(t.get(a).unwrap().residency, Residency::Swapped);
         assert_eq!(t.resident(), 0);
@@ -606,7 +722,7 @@ mod tests {
         let (mut pool, mut adm, mut t) = rig(1);
         let a = t.open(&mut pool, &mut adm, 1024).unwrap();
         t.get_mut(a).unwrap().tokens.extend_from_slice(&[1, 2, 3]);
-        t.mark_cold(&mut pool, a);
+        t.mark_cold(&mut pool, &mut adm, a);
         assert_eq!(t.get(a).unwrap().residency, Residency::Cold);
         assert_eq!(
             t.get(a).unwrap().tokens,
@@ -621,7 +737,7 @@ mod tests {
         let (mut pool, mut adm, mut t) = rig(2);
         let a = t.open(&mut pool, &mut adm, 1024).unwrap();
         let first = t.get(a).unwrap().slot.unwrap();
-        t.mark_swapped(&mut pool, a);
+        t.mark_swapped(&mut pool, &mut adm, a);
         // The pool hands back whichever slot is free, which is usually the one
         // just released. What matters is that mark_resident accepts ANY slot --
         // residency is a property of the session, not the slot -- so restore
@@ -637,7 +753,7 @@ mod tests {
     fn begin_turn_on_a_swapped_session_is_an_error() {
         let (mut pool, mut adm, mut t) = rig(1);
         let a = t.open(&mut pool, &mut adm, 1024).unwrap();
-        t.mark_swapped(&mut pool, a);
+        t.mark_swapped(&mut pool, &mut adm, a);
         assert!(
             t.begin_turn(&mut pool, a, &[1, 2]).is_err(),
             "a session with no slot cannot begin a turn"
@@ -650,5 +766,93 @@ mod tests {
         let a = t.open(&mut pool, &mut adm, 1024).unwrap();
         t.close(&mut pool, &mut adm, a);
         assert!(t.get(a).is_none(), "a closed session must not resolve");
+    }
+
+    /// Budget that fits the weights plus exactly `n` sessions of `ctx`.
+    fn rig_budget(n_slots: usize, ctx: usize, n: u64) -> (SlotPool, AdmissionController, SessionTable) {
+        let pool = SlotPool::new(n_slots, 4096, PPB).unwrap();
+        let adm = AdmissionController::new(
+            ModelFootprint {
+                weights_bytes: GIB,
+                kv_bytes_per_token: 1024,
+            },
+            GIB + n * ctx as u64 * 1024 + 1,
+        );
+        (pool, adm, SessionTable::default())
+    }
+
+    #[test]
+    fn eviction_returns_admission_so_new_conversations_keep_opening() {
+        // 2 slots, budget for 2 sessions. Every new conversation parks the
+        // LRU idle one, the way serve_engine's admit path does. A swapped
+        // session that stayed charged made the third conversation refuse
+        // with WouldExceedBudget while a slot sat free (#776).
+        let (mut pool, mut adm, mut t) = rig_budget(2, 1024, 2);
+        for i in 0..10 {
+            let id = match t.open(&mut pool, &mut adm, 1024) {
+                Ok(id) => id,
+                Err(_) => {
+                    let v = t.lru_idle_victim(&[]).expect("idle victim");
+                    t.mark_swapped(&mut pool, &mut adm, v);
+                    t.open(&mut pool, &mut adm, 1024)
+                        .unwrap_or_else(|e| panic!("conversation {i} refused: {e}"))
+                }
+            };
+            t.touch(id);
+        }
+        assert_eq!(t.resident(), 2);
+        assert_eq!(adm.used_bytes(), GIB + 2 * 1024 * 1024);
+    }
+
+    #[test]
+    fn closing_a_swapped_session_does_not_release_twice() {
+        let (mut pool, mut adm, mut t) = rig(2);
+        let a = t.open(&mut pool, &mut adm, 1024).unwrap();
+        let _b = t.open(&mut pool, &mut adm, 1024).unwrap();
+        t.mark_swapped(&mut pool, &mut adm, a);
+        let _c = t.open(&mut pool, &mut adm, 1024).unwrap();
+        let charged = adm.used_bytes();
+        assert_eq!(charged, GIB + 2 * 1024 * 1024);
+        t.close(&mut pool, &mut adm, a);
+        assert_eq!(adm.used_bytes(), charged, "b and c are still resident");
+    }
+
+    #[test]
+    fn a_cold_session_returns_its_admission() {
+        let (mut pool, mut adm, mut t) = rig(1);
+        let a = t.open(&mut pool, &mut adm, 1024).unwrap();
+        t.mark_cold(&mut pool, &mut adm, a);
+        assert!(!t.is_admitted(a));
+        assert_eq!(adm.used_bytes(), 0);
+        t.close(&mut pool, &mut adm, a);
+        assert_eq!(adm.used_bytes(), 0);
+    }
+
+    #[test]
+    fn readmit_charges_a_restored_session_once_at_its_last_grant() {
+        let (mut pool, mut adm, mut t) = rig(1);
+        let a = t.open(&mut pool, &mut adm, 1024).unwrap();
+        t.resize_grant(&mut adm, a, 2048).unwrap();
+        t.mark_swapped(&mut pool, &mut adm, a);
+        assert_eq!(adm.used_bytes(), 0);
+        t.readmit(&mut adm, a).unwrap();
+        t.readmit(&mut adm, a).unwrap(); // idempotent
+        assert_eq!(adm.used_bytes(), GIB + 2048 * 1024);
+        let slot = pool.acquire().unwrap();
+        t.mark_resident(a, slot, 0);
+        t.close(&mut pool, &mut adm, a);
+        assert_eq!(adm.used_bytes(), 0);
+    }
+
+    #[test]
+    fn readmit_refused_by_budget_leaves_the_session_unadmitted() {
+        let (mut pool, mut adm, mut t) = rig_budget(2, 1024, 1);
+        let a = t.open(&mut pool, &mut adm, 1024).unwrap();
+        t.mark_swapped(&mut pool, &mut adm, a);
+        let _b = t.open(&mut pool, &mut adm, 1024).unwrap();
+        assert!(t.readmit(&mut adm, a).is_err());
+        assert!(!t.is_admitted(a));
+        t.close(&mut pool, &mut adm, a);
+        assert_eq!(adm.used_bytes(), GIB + 1024 * 1024, "b keeps its charge");
     }
 }

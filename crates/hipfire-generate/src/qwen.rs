@@ -31,6 +31,7 @@ use hipfire_runtime::eos_filter::{EosFilter, EosFilterConfig, FilterAction};
 use hipfire_runtime::llama;
 use hipfire_runtime::prompt_frame::ThinkMode;
 use hipfire_runtime::sampler::{self, SamplerConfig};
+use hipfire_runtime::tokenizer::TokenTextStream;
 use std::any::Any;
 use std::io::{BufRead, Write};
 use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
@@ -284,7 +285,6 @@ pub fn generate_ep(
             &prompt_ids,
             eos_tok,
             max_tokens,
-            stop,
             primed_think,
             sampling,
         ),
@@ -299,6 +299,7 @@ pub fn generate_ep(
             stop,
             primed_think,
             sampling,
+            tools.is_some_and(|tools| !tools.is_empty()),
         ),
         EpServeTarget::Qwen35DenseTp => ep_serve_qwen35_dense_tp(
             m,
@@ -311,6 +312,7 @@ pub fn generate_ep(
             stop,
             primed_think,
             sampling,
+            tools.is_some_and(|tools| !tools.is_empty()),
         ),
         EpServeTarget::Deepseek4 => ep_serve_ds4(
             m,
@@ -321,7 +323,6 @@ pub fn generate_ep(
             max_tokens,
             think_mode,
             tools,
-            stop,
             sampling,
         ),
         EpServeTarget::UnsupportedArch(arch) => {
@@ -347,15 +348,12 @@ pub fn generate_ep(
     }
 }
 
-/// Stream a token JSON event; returns true if a stop sequence is now satisfied.
-pub fn ep_emit_token(
-    stdout: &mut std::io::Stdout,
-    id: &str,
-    piece: &str,
-    text_acc: &mut String,
-    stop: &[String],
-) -> bool {
-    text_acc.push_str(piece);
+/// Stream one decoded text fragment as a token JSON event (empty fragments,
+/// e.g. half a multi-byte character, are held by the caller's stream).
+pub fn ep_emit_token(stdout: &mut std::io::Stdout, id: &str, piece: &str) {
+    if piece.is_empty() {
+        return;
+    }
     let _ = writeln!(
         stdout,
         r#"{{"type":"token","id":"{}","text":{},"attempt_id":{}}}"#,
@@ -364,7 +362,6 @@ pub fn ep_emit_token(
         active_attempt_id()
     );
     let _ = stdout.flush();
-    stop.iter().any(|s| !s.is_empty() && text_acc.ends_with(s))
 }
 
 /// Dense Qwen TP2..TP5 serving loop with batched tensor-parallel prefill and
@@ -381,8 +378,10 @@ pub fn ep_serve_qwen35_dense_tp(
     stop: &[String],
     primed_think: bool,
     sampling: EpSampling,
+    tools_enabled: bool,
 ) {
     let prompt_n = prompt_ids.len();
+    let max_tokens = crate::common::fit_max_tokens(max_tokens, prompt_n, m.physical_cap);
     if prompt_n.saturating_add(max_tokens) > m.physical_cap {
         emit_active_attempt_error(
             stdout,
@@ -557,12 +556,13 @@ pub fn ep_serve_qwen35_dense_tp(
 
     let t_decode = Instant::now();
     let mut semantic =
-        crate::ar::QwenArSemanticProducer::new_with_tool_protocol(id, primed_think, false);
+        crate::ar::QwenArSemanticProducer::new_with_tool_protocol(id, primed_think, tools_enabled);
     let mut streamed_tokens: Vec<u32> = Vec::new();
     let mut bytes_fed_to_filter = 0usize;
     let mut generated = 0usize;
     let mut think_count = 0usize;
-    let mut hit_custom_stop = false;
+    // User stop sequences gate the answer channel before it is emitted.
+    semantic.stop = hipfire_runtime::stop_sequence::StopMatcher::new(stop);
     while generated < max_tokens {
         if check_abort(id) {
             ep_emit_abort(
@@ -646,16 +646,6 @@ pub fn ep_serve_qwen35_dense_tp(
         };
         generated += 1;
 
-        // Custom stops match visible answer text (post EosFilter/think route),
-        // never raw protocol bytes.
-        if stop
-            .iter()
-            .any(|s| !s.is_empty() && semantic.visible().ends_with(s.as_str()))
-        {
-            hit_custom_stop = true;
-            break;
-        }
-
         // Conservative think-budget: count tokens while the router is inside a
         // think span. Exceeding a nonzero cap fails closed — no force-close
         // splice and no partial semantic done.
@@ -706,8 +696,8 @@ pub fn ep_serve_qwen35_dense_tp(
         };
     }
 
-    // Custom stop is a natural/filter-class terminal, not length.
-    let hit_length_cap = generated >= max_tokens && !hit_custom_stop;
+    // A stop sequence resolves ahead of length inside `finish`.
+    let hit_length_cap = generated >= max_tokens;
     let (finish, _visible) = match semantic.finish(stdout, hit_length_cap) {
         Ok(pair) => pair,
         Err(err) => {
@@ -730,6 +720,7 @@ pub fn ep_serve_qwen35_dense_tp(
     let finish_reason = match finish.finish_reason {
         "length" => "length",
         "error" => "error",
+        "tool_calls" => "tool_calls",
         _ => "stop",
     };
     ep_emit_done(
@@ -742,6 +733,7 @@ pub fn ep_serve_qwen35_dense_tp(
         prefill_ms,
         t_decode.elapsed().as_secs_f64() * 1000.0,
         finish_reason,
+        &finish.wire_tool_calls,
     );
 }
 
@@ -781,8 +773,10 @@ pub fn ep_serve_qwen35_moe(
     stop: &[String],
     primed_think: bool,
     sampling: EpSampling,
+    tools_enabled: bool,
 ) {
     let prompt_n = prompt_ids.len();
+    let max_tokens = crate::common::fit_max_tokens(max_tokens, prompt_n, m.physical_cap);
     if prompt_n.saturating_add(max_tokens) > m.physical_cap {
         emit_active_attempt_error(
             stdout,
@@ -1027,12 +1021,13 @@ pub fn ep_serve_qwen35_moe(
 
     let t_decode = Instant::now();
     let mut semantic =
-        crate::ar::QwenArSemanticProducer::new_with_tool_protocol(id, primed_think, false);
+        crate::ar::QwenArSemanticProducer::new_with_tool_protocol(id, primed_think, tools_enabled);
     let mut streamed_tokens: Vec<u32> = Vec::new();
     let mut bytes_fed_to_filter = 0usize;
     let mut generated = 0usize;
     let mut think_count = 0usize;
-    let mut hit_custom_stop = false;
+    // User stop sequences gate the answer channel before it is emitted.
+    semantic.stop = hipfire_runtime::stop_sequence::StopMatcher::new(stop);
     while generated < max_tokens {
         if check_abort(id) {
             ep_emit_abort(
@@ -1122,16 +1117,6 @@ pub fn ep_serve_qwen35_moe(
         };
         generated += 1;
 
-        // Custom stops match visible answer text (post EosFilter/think route),
-        // never raw protocol bytes.
-        if stop
-            .iter()
-            .any(|s| !s.is_empty() && semantic.visible().ends_with(s.as_str()))
-        {
-            hit_custom_stop = true;
-            break;
-        }
-
         // Conservative think-budget: count tokens while the router is inside a
         // think span. Exceeding a nonzero cap fails closed — no force-close
         // splice and no partial semantic done.
@@ -1182,8 +1167,8 @@ pub fn ep_serve_qwen35_moe(
         };
     }
 
-    // Custom stop is a natural/filter-class terminal, not length.
-    let hit_length_cap = generated >= max_tokens && !hit_custom_stop;
+    // A stop sequence resolves ahead of length inside `finish`.
+    let hit_length_cap = generated >= max_tokens;
     let (finish, _visible) = match semantic.finish(stdout, hit_length_cap) {
         Ok(pair) => pair,
         Err(err) => {
@@ -1206,6 +1191,7 @@ pub fn ep_serve_qwen35_moe(
     let finish_reason = match finish.finish_reason {
         "length" => "length",
         "error" => "error",
+        "tool_calls" => "tool_calls",
         _ => "stop",
     };
     ep_emit_done(
@@ -1218,6 +1204,7 @@ pub fn ep_serve_qwen35_moe(
         prefill_ms,
         t_decode.elapsed().as_secs_f64() * 1000.0,
         finish_reason,
+        &finish.wire_tool_calls,
     );
 }
 
@@ -1231,6 +1218,7 @@ pub fn ep_emit_done(
     prefill_ms: f64,
     decode_ms: f64,
     finish_reason: &str,
+    tool_calls: &[hipfire_runtime::prompt_frame::ToolCall],
 ) {
     let decode_tok_s = if decode_ms > 0.0 {
         generated as f64 / (decode_ms / 1000.0)
@@ -1253,7 +1241,7 @@ pub fn ep_emit_done(
         "expert-parallel generation completed"
     );
     eprintln!("[daemon] EP generate done: {generated} tok, {decode_tok_s:.1} tok/s");
-    let pending_done = serde_json::json!({
+    let mut pending_done = serde_json::json!({
         "type": "done",
         "id": id,
         "tokens": generated,
@@ -1266,6 +1254,8 @@ pub fn ep_emit_done(
         "finish_reason": finish_reason,
         "attempt_id": active_attempt_id(),
     });
+    // Canonical calls ride the staged terminal, as on the single-GPU Qwen AR.
+    hipfire_engine::emit::stage_terminal_tool_calls(&mut pending_done, finish_reason, tool_calls);
     match await_client_terminal_commit(stdout, id, &pending_done) {
         ClientTerminalDecision::Commit => {
             crate::ar::emit_generation_done_value(route, stdout, &pending_done);
@@ -1521,7 +1511,6 @@ pub fn ep_serve_ds4(
     max_tokens: usize,
     think_mode: ThinkMode,
     tools: Option<&[serde_json::Value]>,
-    stop: &[String],
     sampling: EpSampling,
 ) {
     use hipfire_arch_deepseek4::dsml::StreamEvent;
@@ -1537,6 +1526,7 @@ pub fn ep_serve_ds4(
     // Emit a clean error and return BEFORE prefill — mirror the qwen35 guard.
     // saturating_add: an adversarially huge max_tokens must not wrap usize and
     // slip under the cap.
+    let max_tokens = crate::common::fit_max_tokens(max_tokens, prompt_n, m.physical_cap);
     if prompt_n.saturating_add(max_tokens) > m.physical_cap {
         emit_active_attempt_error(
             stdout,
@@ -1821,7 +1811,7 @@ pub fn ep_serve_ds4(
     let t_decode = Instant::now();
     let mut generated = 0usize;
     let mut pos = prompt_n;
-    let mut text_acc = String::new();
+    let mut text_stream = TokenTextStream::new();
     let mut local_emitted_ids: Vec<u32> = Vec::new();
     while generated < max_tokens {
         // FIX #3 (ep-no-abort): client cancel mid-decode → emit aborted+done,
@@ -1854,7 +1844,7 @@ pub fn ep_serve_ds4(
         if next == eos_tok {
             break;
         }
-        let piece = m.tokenizer.as_ref().unwrap().decode(&[next]);
+        let piece = text_stream.push(m.tokenizer.as_ref().unwrap(), next);
         for ev in parser.feed(&piece) {
             absorb_event(&ev);
             emit_stream_event(stdout, id, ev);
@@ -1868,14 +1858,11 @@ pub fn ep_serve_ds4(
         );
         let _ = stdout.flush();
         if grammar_active {
-            matcher.advance(&piece);
+            // Grammar masks come from per-token decoded text; advance on the same.
+            matcher.advance(&m.tokenizer.as_ref().unwrap().decode(&[next]));
         }
         local_emitted_ids.push(next);
-        text_acc.push_str(&piece);
         generated += 1;
-        if stop.iter().any(|s| !s.is_empty() && text_acc.ends_with(s)) {
-            break;
-        }
         let EpState { gpus, inner } = m.ep.as_mut().unwrap();
         let EpArch::Ds4 {
             config,
@@ -1929,7 +1916,7 @@ pub fn ep_serve_ds4(
             None => break,
         };
     }
-    for ev in parser.finish() {
+    for ev in parser.feed(&text_stream.flush()).into_iter().chain(parser.finish()) {
         absorb_event(&ev);
         emit_stream_event(stdout, id, ev);
     }
@@ -2059,7 +2046,6 @@ pub fn ep_serve_minimax(
     prompt_ids: &[u32],
     eos_tok: u32,
     max_tokens: usize,
-    stop: &[String],
     primed_think: bool,
     sampling: EpSampling,
 ) {
@@ -2080,6 +2066,7 @@ pub fn ep_serve_minimax(
     // error and return BEFORE any state mutation — mirror the qwen35 guard.
     // saturating_add: an adversarially huge max_tokens must not wrap usize and
     // slip under the cap.
+    let max_tokens = crate::common::fit_max_tokens(max_tokens, prompt_n, m.physical_cap);
     if prompt_n.saturating_add(max_tokens) > m.physical_cap {
         crate::ar::emit_generation_error(
             crate::ar::GenerationRoute::MiniMaxEp,
@@ -2270,7 +2257,7 @@ pub fn ep_serve_minimax(
     let t_decode = Instant::now();
     let mut generated = 0usize;
     let mut pos = prompt_n;
-    let mut text_acc = String::new();
+    let mut text_stream = TokenTextStream::new();
     let mut natural_stop = false;
     while generated < max_tokens {
         // FIX #3 (ep-no-abort): client cancel mid-decode → emit aborted+done,
@@ -2300,13 +2287,10 @@ pub fn ep_serve_minimax(
             natural_stop = true;
             break;
         }
-        let piece = m.tokenizer.as_ref().unwrap().decode(&[next]);
+        let piece = text_stream.push(m.tokenizer.as_ref().unwrap(), next);
         generated += 1;
         m.conversation_tokens.push(next);
-        if ep_emit_token(stdout, id, &piece, &mut text_acc, stop) {
-            natural_stop = true;
-            break;
-        }
+        ep_emit_token(stdout, id, &piece);
         let EpState { gpus, inner } = m.ep.as_mut().unwrap();
         let EpArch::Minimax {
             config,
@@ -2356,6 +2340,7 @@ pub fn ep_serve_minimax(
             }
         };
     }
+    ep_emit_token(stdout, id, &text_stream.flush());
     let finish_reason = if !natural_stop && generated >= max_tokens {
         "length"
     } else {
@@ -2371,6 +2356,7 @@ pub fn ep_serve_minimax(
         prefill_ms,
         t_decode.elapsed().as_secs_f64() * 1000.0,
         finish_reason,
+        &[],
     );
 }
 
@@ -2389,6 +2375,15 @@ pub fn qwen_history_tool_render(model_path: &str) -> hipfire_runtime::prompt_fra
             .as_deref(),
         model_path,
     )
+}
+
+/// Native Qwen4 MTP has no validated exact-prefix rehydrate path yet. Keep
+/// those requests on a cold full-prefix replay, including transitions from an
+/// AR turn whose host conversation cache still looks like a strict extension.
+/// Qwen3.5/3.6/3.8 MTP and DFlash keep the prompt cache: the loaded model's
+/// family decides, never the speculator's name.
+pub fn spec_cache_disabled_for(native_qwen4_mtp: bool, env_disabled: bool) -> bool {
+    env_disabled || native_qwen4_mtp
 }
 
 /// Pure LCP prompt-cache decision shared in spirit with the AR `generate`
@@ -2880,6 +2875,18 @@ pub fn generate_dflash(
         .map(|s| s.ctx_capacity())
         .unwrap_or(usize::MAX);
     let spec_block_size = m.speculator.as_ref().map(|s| s.block_size()).unwrap_or(0);
+    // An omitted client max_tokens fits the target context first (the same
+    // budget the AR fallback would use), then the draft capacity decides
+    // spec vs AR.
+    let max_tokens = crate::common::fit_max_tokens(
+        max_tokens,
+        prompt_tokens.len(),
+        if m.eviction.is_none() {
+            m.physical_cap
+        } else {
+            m.max_seq
+        },
+    );
     // Shared margin with the `generate_spec` hard guard below: prompt +
     // budget + one draft block must fit, so any request the loop would refuse
     // falls back to AR here instead of erroring after `gen_start`.
@@ -2916,10 +2923,13 @@ pub fn generate_dflash(
     // spliced stream byte-matches the end-of-turn bake. Divergence (edited
     // history, roundtrip-unstable text) lands on the checkpoint-resume path —
     // worst case equals today's cold prefill, never wrong tokens.
-    let cache_disabled = hipfire_config::developer_var("HIPFIRE_QWEN_PROMPT_CACHE")
-        .ok()
-        .as_deref()
-        == Some("0");
+    let cache_disabled = spec_cache_disabled_for(
+        m.qwen4().is_some(),
+        hipfire_config::developer_var("HIPFIRE_QWEN_PROMPT_CACHE")
+            .ok()
+            .as_deref()
+            == Some("0"),
+    );
     // DFlash divergent-render resume (default ON; opt out with
     // HIPFIRE_DFLASH_CKPT_RESUME=0). Requires no eviction (resume rewinds the
     // resident KV prefix). When on, the recurrent state is checkpointed during
@@ -3104,7 +3114,9 @@ pub fn generate_dflash(
     //
     // Thread the request's sampling into the speculator BEFORE the step loop.
     // SpecRequestConfig is installed once; greedy (temp 0) is unchanged.
-    // ngram-mod is greedy MTP only: env opt-in, thinking off (`max_think_tokens==1`).
+    // ngram-mod is greedy MTP only: env opt-in, thinking off. `enable_thinking`
+    // is the resolved Jinja toggle; serve lowers thinking-off to
+    // `thinking_enabled=false` and never sends the legacy `max_think_tokens==1`.
     if let Some(spec) = m.speculator.as_mut() {
         spec.configure_request(SpecRequestConfig {
             temp,
@@ -3119,7 +3131,7 @@ pub fn generate_dflash(
                     .as_deref()
                     == Some("1")
                 && temp <= 1e-6
-                && max_think_tokens == 1,
+                && !enable_thinking,
         });
     }
     let prefill_tokens_full = prefill_tokens.len();
@@ -3258,13 +3270,20 @@ pub fn generate_dflash(
             .as_ref()
             .map(|ep| ep.rolled_back)
             .unwrap_or(false);
-        let terminal = qwen_dflash_wire_terminal(
+        let mut terminal = qwen_dflash_wire_terminal(
             &run.finish,
             hit_length_cap,
             run.grammar_violated,
             &visible,
             rolled_back,
         );
+        // A stop sequence trims the answer, but the KV holds the stop text the
+        // client never saw: never prime the asst-turn cache from it.
+        if run.semantic_stop == Some(StopReason::StopSequence) {
+            if let QwenDflashWireTerminal::Done { store_cache, .. } = &mut terminal {
+                *store_cache = false;
+            }
+        }
         match &terminal {
             QwenDflashWireTerminal::Malformed {
                 message,
@@ -3458,7 +3477,10 @@ pub fn generate_dflash(
                 "grammar violation during speculative decode"
             } else if run.finish.open_think || run.finish.finish_reason == "open_think" {
                 "open think span at end of generation (validation)"
-            } else if run.finish.finish_reason == "malformed_protocol" {
+            } else if matches!(
+                run.finish.finish_reason,
+                "malformed_protocol" | "truncated_tool_call"
+            ) {
                 "malformed tool protocol"
             } else {
                 "fail-closed speculative decode"
@@ -3674,6 +3696,11 @@ pub fn generate_spec(
     // #462 cross-request state-bleed class. `m.speculator`, `m.state`,
     // `m.seq_pos`, `m.conversation_tokens` and `m.eviction` are disjoint fields,
     // so the guard, the speculator borrow, and the bookkeeping below coexist.
+    // `block_size` is the speculator's EFFECTIVE proposal width: the DFlash
+    // trailing-τ controller reseeds it to full at request start
+    // (`configure_request`) and only shrinks it after 8 observed cycles, so
+    // the request-start capacity checks below see the full block while the
+    // in-loop overflow guard re-reads the live value each cycle.
     let (block_size, ctx_capacity) = match m.speculator.as_ref() {
         Some(s) => (s.block_size(), s.ctx_capacity()),
         None => {
@@ -3836,7 +3863,7 @@ pub fn generate_spec(
             stdout,
             Some(id),
             &format!(
-                "prompt+max_tokens exceeds ctx_capacity {} (enable cask_sidecar for long decode)",
+                "prompt+max_tokens exceeds ctx_capacity {} (raise max_seq or shorten the request)",
                 ctx_capacity,
             ),
             "context_length",
@@ -4243,7 +4270,10 @@ pub fn generate_spec(
             emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
             return None;
         }
-        if position.saturating_add(block_size) >= ctx_capacity {
+        // Overflow guard reads the CURRENT effective width each cycle — the
+        // controller may have shrunk the proposal below the full block since
+        // the request-start capacity checks above.
+        if position.saturating_add(spec.block_size()) >= ctx_capacity {
             ctx_exhausted = true;
             break;
         }
@@ -4907,10 +4937,21 @@ pub fn generate_spec(
     // returns a `SpecRun` summary instead of writing them itself.
     let finish = emit.finish();
     // Open-think / malformed finish reasons also need a truthful rollback when
-    // grammar did not already reset (state may still be baked).
+    // grammar did not already reset (state may still be baked). An open think
+    // span or an unfinished tool call at a pure length exit is an ordinary
+    // `length` terminal instead: state intact, same rule as the wrapper's
+    // classifier and AR.
+    let length_exit = ctx_exhausted
+        || qwen_dflash_hit_length_cap(
+            generated,
+            max_tokens,
+            finish.decoded_eot,
+            semantic_stop.is_some(),
+        );
+    let open_think = finish.open_think || finish.finish_reason == "open_think";
+    let truncated_call = finish.finish_reason == "truncated_tool_call";
     if fail_closed_rollback.is_none()
-        && (finish.open_think
-            || finish.finish_reason == "open_think"
+        && (((open_think || truncated_call) && !length_exit)
             || finish.finish_reason == "malformed_protocol")
     {
         // Guard already dropped — reset via host-held bundle/speculator.
@@ -5060,7 +5101,6 @@ pub fn generate_multi(
     assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
-    stop: &[String],
     reasoning_effort: Option<&str>,
     enable_thinking: bool,
     // Per-request sampler seed (see hipfire-engine::request_seed_for). Replaces
@@ -5367,6 +5407,11 @@ pub fn generate_multi(
     let tokenizer = m.tokenizer.as_ref().unwrap();
 
     let trailer = nl.len();
+    let max_tokens = crate::common::fit_max_tokens(
+        max_tokens,
+        m.seq_pos + new_tokens.len() + trailer,
+        m.physical_cap,
+    );
     if m.seq_pos
         .saturating_add(new_tokens.len())
         .saturating_add(max_tokens)
@@ -5719,20 +5764,6 @@ pub fn generate_multi(
         }
         if tokenizer.is_terminator(next_token) {
             break;
-        }
-
-        // hunt3 M-F: user stop-sequence match against the decoded output suffix
-        // (pp>1 multi-GPU path). Mirrors the AR generate() loop; matches the
-        // full decoded text so a stop string spanning a token boundary is
-        // caught. A plain break exits the `while generated < max_tokens` loop
-        // (this path's `done` event carries no finish_reason field, so there is
-        // no reason to resolve — terminating generation is the contract). Gated
-        // behind `!stop.is_empty()` so the common path pays nothing.
-        if !stop.is_empty() {
-            let decoded_suffix = tokenizer.decode(&streamed_tokens);
-            if stop.iter().any(|s| decoded_suffix.ends_with(s.as_str())) {
-                break;
-            }
         }
         // max_think_tokens / force-answer enforcement: same decoded-text scan
         // as pp=1, but all recurrent-state writes route through *_multi.
@@ -6222,7 +6253,6 @@ pub fn generate_mesh_carrier(
     assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
-    stop: &[String],
     reasoning_effort: Option<&str>,
     enable_thinking: bool,
     request_seed: u64,
@@ -6251,7 +6281,6 @@ pub fn generate_mesh_carrier(
         assistant_prefix,
         tools,
         messages_history,
-        stop,
         reasoning_effort,
         enable_thinking,
         request_seed,
@@ -6348,10 +6377,21 @@ pub fn qwen_dflash_wire_terminal(
             rolled_back,
         };
     }
-    // Open think is a nonretryable unsafe terminal (error XOR done).
-    if finish.open_think || finish.finish_reason == "open_think" {
+    // Open think and an unfinished tool call are nonretryable unsafe terminals
+    // (error XOR done) when the model ended the turn inside them. Running out
+    // of budget there is an ordinary length stop — no calls, no cache — exactly
+    // as AR classifies it (`qwen_ar_finish_route`).
+    if (finish.open_think || finish.finish_reason == "open_think") && !hit_length_cap {
         return QwenDflashWireTerminal::Malformed {
             message: "open think span at end of generation (validation)".to_string(),
+            class: "validation",
+            retryable: false,
+            rolled_back,
+        };
+    }
+    if finish.finish_reason == "truncated_tool_call" && !hit_length_cap {
+        return QwenDflashWireTerminal::Malformed {
+            message: "malformed tool protocol".to_string(),
             class: "validation",
             retryable: false,
             rolled_back,
@@ -7543,4 +7583,273 @@ mod pp_forward_order_tests {
         assert_eq!(result, Ok(()));
         assert_eq!(events, vec!["token"]);
     }
+}
+
+/// Single-GPU Qwen4 AR producer.
+///
+/// Qwen4 owns a hybrid GDN/QSA state machine rather than a Qwen3.5
+/// `forward_scratch` bundle.  Keep this body behind the existing AR route
+/// scheduler and semantic producer: the only architecture-specific operation
+/// here is the carrier-owned [`Qwen4Bundle::forward_chunk`]/
+/// [`Qwen4Bundle::forward_token`] call.  Prompt state is reset at the start of
+/// every turn until a verified prompt-cache contract exists for Qwen4.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_qwen4_ar(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    temp: f32,
+    top_p: f32,
+    top_k: Option<u32>,
+    min_p: Option<f32>,
+    max_tokens: usize,
+    repeat_penalty: f32,
+    repeat_window: usize,
+    presence_penalty: f32,
+    frequency_penalty: f32,
+    max_think_tokens: usize,
+    assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
+    tools: Option<&[serde_json::Value]>,
+    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+    think_mode: ThinkMode,
+    stop: &[String],
+    reasoning_effort: Option<&str>,
+    enable_thinking: bool,
+    _request_seed: u32,
+) {
+    let route = crate::ar::GenerationRoute::Qwen4Ar;
+    let Some((vocab_size, eos_token)) = m
+        .qwen4()
+        .map(|bundle| (bundle.config.vocab_size, bundle.config.eos_token_id))
+    else {
+        emit_active_attempt_error(
+            stdout,
+            Some(id),
+            "qwen4 AR dispatch requires a loaded Qwen4 bundle",
+            "internal",
+            false,
+            false,
+        );
+        return;
+    };
+    if max_tokens == 0 {
+        emit_active_attempt_error(
+            stdout,
+            Some(id),
+            "max_tokens must be > 0",
+            "validation",
+            false,
+            false,
+        );
+        return;
+    }
+
+    // The Qwen4 carrier currently rejects speculative/PFlash state, so these
+    // inputs are intentionally consumed by the common AR contract rather than
+    // silently selecting another producer.
+    let _ = think_mode;
+
+    let mut started_in_think = matches!(
+        assistant_prefix,
+        hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
+    );
+    let prompt_tokens = {
+        let tokenizer = m.tokenizer.as_ref().unwrap();
+        let jinja_enabled = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT")
+            .ok()
+            .as_deref()
+            != Some("0");
+        let prompt_tokens = if jinja_enabled {
+            if let Some(template) = m.chat_template.as_ref() {
+                let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
+                    tokenizer,
+                    template,
+                    system: system_prompt,
+                    user: prompt,
+                    enable_thinking,
+                    bos_token: None,
+                    reasoning_strength: None,
+                    reasoning_effort,
+                };
+                let rendered = if tools.is_some() || messages_history.is_some() {
+                    let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
+                    let messages = match messages_history {
+                        Some(messages) => messages,
+                        None => {
+                            let mut value = Vec::new();
+                            if let Some(system) = system_prompt {
+                                value.push(hipfire_runtime::prompt_frame::Message {
+                                    role: hipfire_runtime::prompt_frame::Role::System,
+                                    content: system.to_string(),
+                                    reasoning_content: None,
+                                    name: None,
+                                    rendered_name: None,
+                                    tool_calls: Vec::new(),
+                                    tool_call_id: None,
+                                    tool_plan: String::new(),
+                                });
+                            }
+                            value.push(hipfire_runtime::prompt_frame::Message {
+                                role: hipfire_runtime::prompt_frame::Role::User,
+                                content: prompt.to_string(),
+                                reasoning_content: None,
+                                name: None,
+                                rendered_name: None,
+                                tool_calls: Vec::new(),
+                                tool_call_id: None,
+                                tool_plan: String::new(),
+                            });
+                            synthesized = value;
+                            &synthesized
+                        }
+                    };
+                    frame.render_messages(messages, tools, None)
+                } else {
+                    frame.render()
+                };
+                match rendered {
+                    Ok(rendered) => {
+                        started_in_think = render_tail_opens_think(&rendered);
+                        tokenizer.encode(&rendered)
+                    }
+                    Err(error) => {
+                        emit_active_attempt_error(
+                            stdout,
+                            Some(id),
+                            &format!("qwen4 Jinja render failed: {error}"),
+                            "validation",
+                            false,
+                            false,
+                        );
+                        return;
+                    }
+                }
+            } else {
+                hipfire_runtime::prompt_frame::ChatFrame {
+                    tokenizer,
+                    system: system_prompt,
+                    user: prompt,
+                    assistant_prefix,
+                    raw: false,
+                }
+                .build()
+            }
+        } else {
+            hipfire_runtime::prompt_frame::ChatFrame {
+                tokenizer,
+                system: system_prompt,
+                user: prompt,
+                assistant_prefix,
+                raw: false,
+            }
+            .build()
+        };
+        prompt_tokens
+    };
+    if prompt_tokens.is_empty() {
+        emit_active_attempt_error(
+            stdout,
+            Some(id),
+            "qwen4 AR prompt rendered to zero tokens",
+            "validation",
+            false,
+            false,
+        );
+        return;
+    }
+    let required = prompt_tokens
+        .len()
+        .checked_add(max_tokens)
+        .and_then(|n| n.checked_add(1));
+    if required.is_none_or(|n| n > m.max_seq) {
+        emit_active_attempt_error(
+            stdout,
+            Some(id),
+            &format!(
+                "qwen4 request exceeds context window: prompt={} + max_tokens={} + trailer=1 > max_seq={}",
+                prompt_tokens.len(),
+                max_tokens,
+                m.max_seq
+            ),
+            "context_length",
+            false,
+            false,
+        );
+        return;
+    }
+
+    // Qwen4 state has no validated prefix-cache splice yet.  Reset before
+    // replaying the canonical rendered prompt so retry and multi-turn paths
+    // cannot mix old QSA/GDN/PLE state with a new prompt.
+    if m.seq_pos != 0 || !m.conversation_tokens.is_empty() {
+        let reset = m
+            .qwen4_mut()
+            .ok_or_else(|| "qwen4 AR state disappeared before reset".to_string())
+            .and_then(|bundle| bundle.reset(gpu).map_err(|error| error.to_string()));
+        m.seq_pos = 0;
+        m.conversation_tokens.clear();
+        if let Err(error) = reset {
+            let ep = production_fail_closed_rollback(m, gpu, None, None);
+            emit_fail_closed_error(
+                stdout,
+                Some(id),
+                &format!("qwen4 pre-generation reset failed: {error}"),
+                "gpu",
+                false,
+                &ep,
+            );
+            return;
+        }
+    }
+
+    crate::ar::generate_ar_with_forward(
+        m,
+        gpu,
+        stdout,
+        id,
+        route,
+        &prompt_tokens,
+        vocab_size,
+        eos_token,
+        temp,
+        top_p,
+        top_k,
+        min_p,
+        max_tokens,
+        repeat_penalty,
+        repeat_window,
+        presence_penalty,
+        frequency_penalty,
+        max_think_tokens,
+        started_in_think,
+        stop,
+        true,
+        |model, device, tokens, logits| {
+            // Prefill is never the retained body: the tape holds ordinary
+            // single-token continuation only (docs/REDLINE.md §3). The Qwen4
+            // forward declares that boundary itself and owns the whole
+            // per-forward retained-body lifecycle (arm, route, close, prepare).
+            model
+                .qwen4_mut()
+                .ok_or_else(|| "qwen4 AR bundle disappeared before prefill".to_string())
+                .and_then(|bundle| {
+                    bundle
+                        .forward_chunk_final(device, tokens, logits, None)
+                        .map_err(|error| error.to_string())
+                })
+        },
+        |model, device, token, logits| {
+            model
+                .qwen4_mut()
+                .ok_or_else(|| "qwen4 AR bundle disappeared during decode".to_string())
+                .and_then(|bundle| {
+                    bundle
+                        .forward_token_or_argmax(device, token, logits)
+                        .map_err(|error| error.to_string())
+                })
+        },
+    );
 }

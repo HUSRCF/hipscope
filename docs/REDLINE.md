@@ -142,11 +142,13 @@ transport crate.
 ### Model load and automatic default
 
 After a successful model load, the daemon may request Auto via
-`ReplayController::configure_model_default` when the MQ4R runtime-default
-predicate matches. **Current automatic runtime selection is only**
-`mq4r_redline_default` for single-GPU `.mq4r` on the exact GPU-arch allowlist.
-Existing LFM `.mq4` registry evidence is not auto-selected because it is not
-`.mq4r` (not because LFM is categorically model-family exempt).
+`ReplayController::configure_model_default` when `retained_redline_default`
+matches. **Current automatic runtime selection is only** the MQ4R predicate
+`mq4r_redline_default` (single-GPU `.mq4r` on the exact GPU-arch allowlist),
+the gfx1201 Qwen3.5 dense plain-AR predicate below, and the gfx1151 DeepSeek4
+`.mq2r` AR predicate. Existing LFM `.mq4` registry evidence is not
+auto-selected because it is not `.mq4r` (not because LFM is categorically
+model-family exempt).
 
 #### MQ4R runtime default
 
@@ -174,6 +176,45 @@ config wizard, choosing an explicit backend there, or setting
 `HIPFIRE_REPLAY_BACKEND=hip`. That opt-out does **not** relax certification or
 admission requirements for any later promotion claim.
 
+#### gfx1201 Qwen3.5 dense plain-AR runtime default
+
+`retained_redline_default` — source: `crates/hipfire-runtime/src/config.rs`.
+
+```text
+exact GPU arch is gfx1201
+AND model_arch is qwen3_5 (dense, arch_id 5), any weight format
+AND pipeline parallelism == 1
+AND tensor parallelism == 1
+AND no drafter is installed
+```
+
+Plain-AR decode then runs as one retained PM4-IB submission per token (the
+first eligible forward records as ordinary HIP, then the tape is prepared).
+On H2 (27B, native fp8 KV) the tape is 899 launches; it is byte-identical to
+the HIP AR graph for logits, final hidden, DeltaNet state and KV at ctx 512 /
+8,192 / 32,768 over 256 greedy tokens and a 200-replay stress, and saves
+≈0.7–0.8 ms per token. Evidence:
+`/home/kaden/qcal/perf/decode-1201/dec-redline/report.md` and
+`/home/kaden/qcal/perf/decode-1201/land/report.md`.
+
+It ships together with the prefill gate in
+`crates/hipfire-arch-qwen35/src/qwen35/prefill.rs`: the chunked GDN prefill
+scan is withheld only while a forward is being **recorded**
+(`is_recording()`), not for the whole life of a Redline-enabled process, so a
+Redline process prefills exactly like the HIP-graph default.
+
+Opt-out: `replay.backend = "hip"` (or `HIPFIRE_REPLAY_BACKEND=hip`, or the
+wizard's built-in `hip` profile) restores the HIP AR graph for the process. A
+failed tape preparation or PM4 replay falls back closed to the HIP graph.
+Known limits: every new gfx1201 decode kernel must be covered by Radiowave
+certification or by the name-keyed tables in
+`crates/rdna-compute/src/replay.rs` (resource effects, kernarg sizes, acquire
+and header policies); an uncovered kernel loses its typed resource binding and
+can fail preparation, which silently gives the gain back to the HIP graph; 80 of
+H2's 898 boundary waits are elided by the `resource` wait policy, proven
+empirically for this tape; and `ROC_GLOBAL_CU_MASK` does not constrain the
+Redline PM4 queue.
+
 #### LFM registry evidence (not a runtime default)
 
 Registry owner: [`admissions.yml`](admissions.yml) row
@@ -198,12 +239,13 @@ hash `04305cf1254244f6`.
 
 An explicit `HIPFIRE_REPLAY_BACKEND` selection, config wizard / profile
 backend selection (including the built-in `hip` opt-out), or enabled
-`HIPFIRE_REPLAY_MANUAL_CAPTURE` bypasses the MQ4R runtime default.
+`HIPFIRE_REPLAY_MANUAL_CAPTURE` bypasses every automatic runtime default.
 `HIPFIRE_REPLAY_TRANSPORT` does **not**: it changes only the
-transport. Therefore an eligible automatic-default `.mq4r` model still
+transport. Therefore an eligible automatic-default model still
 requests `Auto` when only the transport is explicit (using that transport);
-with transport unset, it uses `Pm4Ib`. When `mq4r_redline_default` is false
-and no backend/manual selection applies, the backend remains ordinary HIP.
+with transport unset, it uses `Pm4Ib`. When `retained_redline_default` is
+false and no backend/manual selection applies, the backend remains ordinary
+HIP.
 
 Explicit opt-in can exercise broader implementation capability (including LFM
 retained routes when the implementation supports them). Opt-in availability is
@@ -321,6 +363,15 @@ A retained route is valid only when all of the following hold.
 - Artifact path, artifact digest, symbol, loader kernarg size/alignment, padded
   blob, grid, block, and shared memory are one identity contract. A stable
   kernel-name hash alone is insufficient.
+- Retained PM4 kernarg segments live in a host-writable GPU-agent (VRAM) pool
+  by default: kernels whose prologue chains dependent kernarg `s_load`s
+  otherwise pay host-memory latency on every round. The per-replay binding
+  patches stay plain host stores through the BAR, and one fence plus a one-byte
+  readback publishes them before the doorbell. Small-BAR systems (CPU access
+  never allowed) and a gfx1151 non-system entry acquire keep the CPU-agent
+  fine-grained pool; `HIPFIRE_PM4_KERNARG_POOL=host` forces it. The daemon log
+  records the choice as `[redline] retained PM4 kernargs: pool=…`. The indirect
+  buffer, timestamps and completion words stay in the host pool.
 
 ### Geometry and dynamic bindings
 
@@ -640,10 +691,12 @@ with their dates and fixtures. None of these cases is a universal admission.
 
 ### 11.2 Qwen3.6 35B-A3B MQ4R across gfx1100, gfx1151, and gfx1201
 
-Current automatic predicate `mq4r_redline_default` is model-family agnostic
+The MQ4R automatic predicate `mq4r_redline_default` is model-family agnostic
 and narrower than full implementation capability: exact GPU arch `gfx1100`,
 `gfx1151`, or `gfx1201`; single GPU (`pp=tp=1`); case-insensitive `.mq4r`.
 No `arch_id` gate. `gfx1200` and every other arch remain explicit opt-in.
+Separately, Qwen3.5 dense (`arch_id=5`, any weight format) plain-AR decode on
+exact gfx1201 defaults to retained PM4 (§3).
 Explicit backend selection (including the config wizard / profile backend)
 can request broader implemented paths or disable the automatic default.
 Explicit transport changes only the transport. Runtime default ≠ Section 7
@@ -874,7 +927,7 @@ Prefer paths and symbols over line numbers.
 
 | Concern | Stable source path and symbols |
 |---|---|
-| Automatic product predicates | `crates/hipfire-runtime/src/config.rs` — `mq4r_redline_default` only (`.mq4r` + exact `gfx1100`/`gfx1151`/`gfx1201` + `pp=tp=1`; model-family agnostic, no `arch_id` gate). Existing LFM `.mq4` sealed evidence has no automatic selector. |
+| Automatic product predicates | `crates/hipfire-runtime/src/config.rs` — `retained_redline_default`: `mq4r_redline_default` (`.mq4r` + exact `gfx1100`/`gfx1151`/`gfx1201` + `pp=tp=1`; model-family agnostic, no `arch_id` gate), Qwen3.5 dense (`qwen3_5`) on exact gfx1201 with `pp=tp=1` and no drafter, and DeepSeek4 `.mq2r` on gfx1151 AR. Existing LFM `.mq4` sealed evidence has no automatic selector. |
 | Model-load application and diagnostic handlers | `crates/hipfire-daemon/src/main.rs` — load-time `configure_model_default`; `redline_capture`; `redline_shadow_aql`; `redline_shadow_pm4` |
 | Qwen model boundary and route | `crates/hipfire-arch-qwen35/src/qwen35.rs` — `forward_scratch`; `prepare_scratch_inputs`; `set_forward_eligible`; `should_route_aql`; `should_route_pm4`; `finish_capture`; `prepare_*` |
 | LFM decode path and registry evidence | `crates/hipfire-arch-lfm2moe/src/forward.rs` — `decode_step`; `decode_step_with_graph`; lowered path under `HIPFIRE_FORWARD_LOWERED`. Sealed LFM retained-PM4 evidence/admission: [`admissions.yml`](admissions.yml) row `lfm25-350m-mq4-gfx1201-retained-pm4-plain-ar` (no current runtime selector). |

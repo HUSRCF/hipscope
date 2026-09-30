@@ -45,7 +45,7 @@ pub fn restore_gdn_requant_frame_checkpoint(frame: u32) {
 /// roundtrip (PARO drift-echo correctness, ~1.8× slower batched). Strictly OFF
 /// for MQ4/HFQ; opt in via `HIPFIRE_DN_REQUANT_PER_TOKEN=1` for PARO checkpoints
 /// (shisa-ai A3B). For n_tokens==1 (AR decode / DFlash draft) both are identical.
-fn dn_requant_per_token() -> bool {
+pub(crate) fn dn_requant_per_token() -> bool {
     // Truthy (non-empty, non-"0") predicate preserved verbatim from the
     // cached form; only the process-global cache is gone (the snapshot is
     // the cache now).
@@ -56,6 +56,7 @@ fn dn_requant_per_token() -> bool {
         })
         .unwrap_or(false)
 }
+
 
 /// Use the chunked (parallel) FP32 GDN kernel on the multi-token (n>1) linear
 /// arm instead of the sequential batch_seq. DEFAULT OFF. Correctness-first
@@ -82,6 +83,17 @@ pub fn gdn_chunk_size() -> usize {
     cs.clamp(1, 32)
 }
 
+/// Storage of the GDN chunk-scan `out` plane (`[T][48][128]` elements, see
+/// [`Gpu::gdn_chunk_scan_segment`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GdnScanOut {
+    /// The shipped f32 plane.
+    F32,
+    /// gfx1201 only: the same values rounded to bf16 RNE, half the bytes. Read
+    /// only by the LA output producers' `_xbf16` twins.
+    Bf16,
+}
+
 impl Gpu {
     /// out = rmsnorm(x, weight, eps)
     pub fn rmsnorm_f32(
@@ -97,16 +109,33 @@ impl Gpu {
         // Generic RMSNorm is route-neutral. DeepSeek-only experiments must not
         // leak into Qwen/MiniMax through process-wide environment state.
         let warp_reduce = false;
-        let symbol = if warp_reduce {
+        let x_ptr = x.buf.as_ptr();
+        let w_ptr = weight.buf.as_ptr();
+        let out_ptr = out.buf.as_ptr();
+        // gfx1201 / gfx1151 / gfx1100 decode (one row): n/256 workgroups, each recomputing the
+        // row's rms (bit-identical). Other workgroups still read x while one
+        // writes, so `out` must not overlap `x`. Batched rows keep one
+        // workgroup per row: the split re-reads every row n/256 times.
+        let row_bytes = n as usize * 4;
+        let disjoint = (x_ptr as usize).saturating_add(row_bytes) <= out_ptr as usize
+            || (out_ptr as usize).saturating_add(row_bytes) <= x_ptr as usize;
+        let rowsplit = self.flags.dec_norm_grids_enabled()
+            && batch == 1
+            && n > 256
+            && n % 256 == 0
+            && disjoint;
+        let symbol = if rowsplit {
+            "rmsnorm_f32_rowsplit"
+        } else if warp_reduce {
             "rmsnorm_f32_warp_reduce"
         } else {
             "rmsnorm_f32"
         };
-        self.ensure_kernel(symbol, kernels::RMSNORM_SRC, symbol)?;
-
-        let x_ptr = x.buf.as_ptr();
-        let w_ptr = weight.buf.as_ptr();
-        let out_ptr = out.buf.as_ptr();
+        if rowsplit {
+            self.ensure_kernel(symbol, kernels::RMSNORM_ROWSPLIT_SRC, symbol)?;
+        } else {
+            self.ensure_kernel(symbol, kernels::RMSNORM_SRC, symbol)?;
+        }
         let n_val = n;
         let eps_val = eps;
 
@@ -120,12 +149,17 @@ impl Gpu {
 
         let block_size = 256u32.min(n as u32);
         let shared_mem = if warp_reduce { 8 * 4 } else { block_size * 4 };
+        let grid = if rowsplit {
+            [n as u32 / 256, 1, 1]
+        } else {
+            [batch as u32, 1, 1]
+        };
 
         let bytes = crate::profile::rmsnorm_bytes(batch * n as usize);
-        let timer = crate::profile::begin_timer(&self.hip, "rmsnorm", "rmsnorm_f32", bytes);
+        let timer = crate::profile::begin_timer(&self.hip, "rmsnorm", symbol, bytes);
         let result = self.launch_maybe_blob(
             symbol,
-            [batch as u32, 1, 1],
+            grid,
             [block_size, 1, 1],
             shared_mem,
             &mut params,
@@ -270,11 +304,15 @@ impl Gpu {
         result
     }
 
-    /// c = a + b (element-wise)
+    /// `c = a + b`, element-wise.
+    ///
+    /// Launched through the shared dispatch funnel so the kernarg pointers survive
+    /// stream capture and the launch reaches the retained recorder. The funnel
+    /// falls back to the ordinary `kernelParams` launch when nothing is capturing
+    /// or recording, so this is the plain path in the steady state.
     pub fn add_f32(&mut self, a: &GpuTensor, b: &GpuTensor, c: &GpuTensor) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel("add", kernels::ADD_SRC, "add_f32")?;
-        let func = &self.functions["add_f32"];
 
         let n = a.numel() as i32;
         let mut a_ptr = a.buf.as_ptr();
@@ -290,39 +328,7 @@ impl Gpu {
         ];
 
         let block = 256u32;
-        let grid = ((n as u32) + block - 1) / block;
-        unsafe {
-            self.hip
-                .launch_kernel(func, [grid, 1, 1], [block, 1, 1], 0, None, &mut params)
-        }
-    }
-
-    /// HIP-graphs-safe variant of `add_f32`. Uses `launch_maybe_blob` instead of
-    /// raw `launch_kernel` so kernarg pointers survive stream capture.
-    pub fn add_f32_graph_safe(
-        &mut self,
-        a: &GpuTensor,
-        b: &GpuTensor,
-        c: &GpuTensor,
-    ) -> HipResult<()> {
-        self.bind_thread()?;
-        self.ensure_kernel("add", kernels::ADD_SRC, "add_f32")?;
-
-        let n = a.numel() as i32;
-        let mut a_ptr = a.buf.as_ptr();
-        let mut b_ptr = b.buf.as_ptr();
-        let mut c_ptr = c.buf.as_ptr();
-        let mut n_val = n;
-
-        let mut params: Vec<*mut c_void> = vec![
-            &mut a_ptr as *mut _ as *mut c_void,
-            &mut b_ptr as *mut _ as *mut c_void,
-            &mut c_ptr as *mut _ as *mut c_void,
-            &mut n_val as *mut _ as *mut c_void,
-        ];
-
-        let block = 256u32;
-        let grid = ((n as u32) + block - 1) / block;
+        let grid = (n as u32).div_ceil(block);
         self.launch_maybe_blob(
             "add_f32",
             [grid, 1, 1],
@@ -330,24 +336,32 @@ impl Gpu {
             0,
             &mut params,
             || {
-                let mut bb = hip_bridge::KernargBlob::new();
-                bb.push_ptr(a_ptr);
-                bb.push_ptr(b_ptr);
-                bb.push_ptr(c_ptr);
-                bb.push_i32(n_val);
-                bb
+                let mut blob = hip_bridge::KernargBlob::new();
+                blob.push_ptr(a_ptr);
+                blob.push_ptr(b_ptr);
+                blob.push_ptr(c_ptr);
+                blob.push_i32(n_val);
+                blob
             },
         )
     }
 
     /// a += b (in-place element-wise add)
     pub fn add_inplace_f32(&mut self, a: &GpuTensor, b: &GpuTensor) -> HipResult<()> {
+        self.add_inplace_f32_raw(a.buf.as_ptr(), b.buf.as_ptr(), a.numel())
+    }
+
+    /// `a[0..n] += b[0..n]` over raw device pointers.
+    pub(crate) fn add_inplace_f32_raw(
+        &mut self,
+        a_ptr: *mut c_void,
+        b_ptr: *mut c_void,
+        n: usize,
+    ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel("add_inplace", kernels::ADD_INPLACE_SRC, "add_inplace_f32")?;
 
-        let n = a.numel() as i32;
-        let a_ptr = a.buf.as_ptr();
-        let b_ptr = b.buf.as_ptr();
+        let n = n as i32;
         let n_val = n;
 
         let mut params: Vec<*mut c_void> = vec![
@@ -611,8 +625,46 @@ impl Gpu {
         up: &GpuTensor,
         out: &GpuTensor,
     ) -> HipResult<()> {
+        self.silu_mul_launch(
+            "silu_mul",
+            kernels::SILU_MUL_SRC,
+            "silu_mul_f32",
+            gate,
+            up,
+            out,
+        )
+    }
+
+    /// [`Gpu::silu_mul_f32`] of BF16-round-tripped gate and up, the result
+    /// round-tripped too ([`Gpu::bf16_round_trip_f32`]'s rounding): the
+    /// round trip / silu_mul / round trip sequence in one pass.
+    pub fn silu_mul_bf16_rt_f32(
+        &mut self,
+        gate: &GpuTensor,
+        up: &GpuTensor,
+        out: &GpuTensor,
+    ) -> HipResult<()> {
+        self.silu_mul_launch(
+            "qwen4_silu_mul",
+            kernels::QWEN4_SILU_MUL_SRC,
+            "silu_mul_bf16_rt_f32",
+            gate,
+            up,
+            out,
+        )
+    }
+
+    fn silu_mul_launch(
+        &mut self,
+        module: &str,
+        source: &str,
+        kernel: &'static str,
+        gate: &GpuTensor,
+        up: &GpuTensor,
+        out: &GpuTensor,
+    ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel("silu_mul", kernels::SILU_MUL_SRC, "silu_mul_f32")?;
+        self.ensure_kernel(module, source, kernel)?;
 
         let n = gate.numel() as i32;
         let mut gate_ptr = gate.buf.as_ptr();
@@ -630,26 +682,63 @@ impl Gpu {
         let block = 256u32;
         let grid = ((n as u32) + block - 1) / block;
         let bytes = crate::profile::elementwise_bytes(n as usize);
-        let timer = crate::profile::begin_timer(&self.hip, "elementwise", "silu_mul_f32", bytes);
-        let result = self.launch_maybe_blob(
-            "silu_mul_f32",
-            [grid, 1, 1],
-            [block, 1, 1],
-            0,
-            &mut params,
-            || {
+        let timer = crate::profile::begin_timer(&self.hip, "elementwise", kernel, bytes);
+        let result =
+            self.launch_maybe_blob(kernel, [grid, 1, 1], [block, 1, 1], 0, &mut params, || {
                 let mut b = hip_bridge::KernargBlob::new();
                 b.push_ptr(gate_ptr);
                 b.push_ptr(up_ptr);
                 b.push_ptr(out_ptr);
                 b.push_i32(n_val);
                 b
-            },
-        );
+            });
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
         result
+    }
+
+    /// [`Gpu::silu_mul_bf16_rt_f32`] of the shared expert's gate/up plus, for
+    /// each of the first `selectors` tokens, the selector gate
+    /// `selector[t] = sigmoid(bf16_round_trip(selector[t]))`, in one launch
+    /// (bitwise the round trip / sigmoid / silu_mul launches).
+    pub fn shared_expert_activation_bf16_f32(
+        &mut self,
+        gate: &GpuTensor,
+        up: &GpuTensor,
+        out: &GpuTensor,
+        selector: &GpuTensor,
+        selectors: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        const KERNEL: &str = "shared_expert_activation_bf16_f32";
+        self.ensure_kernel("qwen4_silu_mul", kernels::QWEN4_SILU_MUL_SRC, KERNEL)?;
+        let n = gate.numel() as i32;
+        let selectors = selectors as i32;
+        let gate_ptr = gate.buf.as_ptr();
+        let up_ptr = up.buf.as_ptr();
+        let out_ptr = out.buf.as_ptr();
+        let selector_ptr = selector.buf.as_ptr();
+        let mut params: Vec<*mut c_void> = vec![
+            &gate_ptr as *const _ as *mut c_void,
+            &up_ptr as *const _ as *mut c_void,
+            &out_ptr as *const _ as *mut c_void,
+            &selector_ptr as *const _ as *mut c_void,
+            &n as *const _ as *mut c_void,
+            &selectors as *const _ as *mut c_void,
+        ];
+        let block = 256u32;
+        let grid = (n.max(selectors) as u32).max(1).div_ceil(block);
+        self.launch_maybe_blob(KERNEL, [grid, 1, 1], [block, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(gate_ptr);
+            b.push_ptr(up_ptr);
+            b.push_ptr(out_ptr);
+            b.push_ptr(selector_ptr);
+            b.push_i32(n);
+            b.push_i32(selectors);
+            b
+        })
     }
 
     /// In-place softmax over last dimension
@@ -996,6 +1085,18 @@ impl Gpu {
         } else {
             "rope_partial_halfsplit"
         };
+        // gfx1201/gfx1151 decode: one workgroup per head instead of one wave looping
+        // over all heads (bit-identical; each workgroup owns its head).
+        let headgrid = !legacy && self.flags.g12_dec_norm_enabled();
+        let (src, entry, cache_key) = if headgrid {
+            (
+                kernels::ROPE_PARTIAL_HALFSPLIT_HEADGRID_SRC,
+                "rope_partial_halfsplit_f32_headgrid",
+                "rope_partial_halfsplit_f32_headgrid",
+            )
+        } else {
+            (src, entry, cache_key)
+        };
         self.ensure_kernel(cache_key, src, entry)?;
         let qp = q.buf.as_ptr();
         let kp = k.buf.as_ptr();
@@ -1007,7 +1108,8 @@ impl Gpu {
         let fb = freq_base;
         let n_pairs = (n_rot / 2) as u32;
         let block = 32u32.min(n_pairs);
-        let grid = [(n_pairs + block - 1) / block, 1, 1];
+        let grid_y = if headgrid { (n_heads_q + n_heads_k) as u32 } else { 1 };
+        let grid = [(n_pairs + block - 1) / block, grid_y, 1];
         let bytes = crate::profile::rope_bytes(n_heads_q, n_heads_k, head_dim);
         let timer = crate::profile::begin_timer(&self.hip, "rope", entry, bytes);
         let mut params: Vec<*mut c_void> = vec![
@@ -1067,17 +1169,24 @@ impl Gpu {
             ));
         }
         let (module, src, kernel) = if n_heads == 24 {
-            if !self.arch_caps.is_gfx1100() {
+            if self.arch_caps.is_gfx1100() {
+                (
+                    "qwen36_27b_fa_prep_gfx1100",
+                    kernels::qwen36_27b_fa_prep_gfx1100_src(),
+                    "qwen36_27b_fa_prep_gfx1100",
+                )
+            } else if self.arch_caps.is_gfx1201() {
+                (
+                    "qwen36_27b_fa_prep_gfx1201",
+                    kernels::qwen36_27b_fa_prep_gfx1201_src(),
+                    "qwen36_27b_fa_prep_gfx1201",
+                )
+            } else {
                 return Err(hip_bridge::HipError::new(
                     1,
-                    "24Q/4K fused FA prep is certified only on gfx1100",
+                    "24Q/4K fused FA prep is certified only on gfx1100 and gfx1201",
                 ));
             }
-            (
-                "qwen36_27b_fa_prep_gfx1100",
-                kernels::qwen36_27b_fa_prep_gfx1100_src(),
-                "qwen36_27b_fa_prep_gfx1100",
-            )
         } else if self.arch_caps.is_gfx1201() {
             (
                 "qwen35_fa_prep_gfx1201",
@@ -1289,15 +1398,19 @@ impl Gpu {
             &mut po as *mut _ as *mut c_void,
         ];
         let n_pairs = (n_rot / 2) as u32;
-        let block = 32u32.min(n_pairs);
-        let grid_x = (n_pairs + block - 1) / block;
+        let (grid_x, block, shared_bytes) = if legacy {
+            let block = 32u32.min(n_pairs);
+            ((n_pairs + block - 1) / block, block, 0)
+        } else {
+            (1, 256, 2 * n_pairs * std::mem::size_of::<f32>() as u32)
+        };
         let bytes = crate::profile::rope_bytes(n_heads_q, n_heads_k, head_dim) * batch_size;
         let timer = crate::profile::begin_timer(&self.hip, "rope", entry, bytes);
         let result = self.launch_maybe_blob(
             entry,
             [grid_x, batch_size as u32, 1],
             [block, 1, 1],
-            0,
+            shared_bytes,
             &mut params,
             || {
                 let mut b = hip_bridge::KernargBlob::new();
@@ -1864,6 +1977,95 @@ impl Gpu {
         result
     }
 
+    /// In-place exact BF16 round-trip over a contiguous slice in each strided
+    /// row. QSA uses this for the index-K half of an interleaved projection;
+    /// keep this on the bit-level round-trip kernel rather than the generic
+    /// tensor-op cast path.
+    pub fn bf16_round_trip_f32_strided(
+        &mut self,
+        x: &GpuTensor,
+        rows: usize,
+        row_offset: usize,
+        row_stride: usize,
+        width: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if x.dtype != DType::F32
+            || rows == 0
+            || width == 0
+            || row_offset
+                .checked_add(width)
+                .map_or(true, |end| end > row_stride)
+        {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "bf16_round_trip_f32_strided: invalid shape",
+            ));
+        }
+        let last = (rows - 1)
+            .checked_mul(row_stride)
+            .and_then(|base| base.checked_add(row_offset))
+            .and_then(|base| base.checked_add(width))
+            .ok_or_else(|| {
+                hip_bridge::HipError::new(0, "bf16_round_trip_f32_strided: shape overflow")
+            })?;
+        if last > x.numel() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "bf16_round_trip_f32_strided: buffer too small",
+            ));
+        }
+        let total = rows.checked_mul(width).ok_or_else(|| {
+            hip_bridge::HipError::new(0, "bf16_round_trip_f32_strided: extent overflow")
+        })?;
+        let rows_i = i32::try_from(rows).map_err(|_| {
+            hip_bridge::HipError::new(0, "bf16_round_trip_f32_strided: rows exceed i32")
+        })?;
+        let row_offset_i = i32::try_from(row_offset).map_err(|_| {
+            hip_bridge::HipError::new(0, "bf16_round_trip_f32_strided: offset exceeds i32")
+        })?;
+        let row_stride_i = i32::try_from(row_stride).map_err(|_| {
+            hip_bridge::HipError::new(0, "bf16_round_trip_f32_strided: stride exceeds i32")
+        })?;
+        let width_i = i32::try_from(width).map_err(|_| {
+            hip_bridge::HipError::new(0, "bf16_round_trip_f32_strided: width exceeds i32")
+        })?;
+        let total_i = i32::try_from(total).map_err(|_| {
+            hip_bridge::HipError::new(0, "bf16_round_trip_f32_strided: extent exceeds i32")
+        })?;
+        self.ensure_kernel(
+            "qwen4_bf16_round_trip",
+            kernels::QWEN4_BF16_ROUND_TRIP_SRC,
+            "bf16_round_trip_f32_strided",
+        )?;
+        let xp = x.buf.as_ptr();
+        let block_size = 256u32;
+        let grid = ((total_i as u32 + block_size - 1) / block_size).max(1);
+        let mut params: Vec<*mut c_void> = vec![
+            &xp as *const _ as *mut c_void,
+            &rows_i as *const _ as *mut c_void,
+            &row_offset_i as *const _ as *mut c_void,
+            &row_stride_i as *const _ as *mut c_void,
+            &width_i as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "bf16_round_trip_f32_strided",
+            [grid, 1, 1],
+            [block_size, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(xp);
+                b.push_i32(rows_i);
+                b.push_i32(row_offset_i);
+                b.push_i32(row_stride_i);
+                b.push_i32(width_i);
+                b
+            },
+        )
+    }
+
     /// Sigmoid activation, in-place.
     #[cfg(feature = "deltanet")]
     /// Repeat-interleave Q and K key heads up to value heads count.
@@ -2133,6 +2335,85 @@ impl Gpu {
         result
     }
 
+    /// T-C Halo prefill fusion: batched deinterleave with the FullAttention Q
+    /// RMSNorm folded in. Bit-identical q_out/gate_out to the
+    /// `deinterleave_f32_batched` + in-place `rmsnorm_batched(q)` sequence;
+    /// the Q global-memory round trip is gone. Uses the same blockDim the
+    /// unfused `rmsnorm_batched` would pick (min(256, head_dim)) so the
+    /// reduction order matches exactly. `q_out` must not alias `interleaved`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn deinterleave_q_rmsnorm_f32_batched(
+        &mut self,
+        interleaved: &GpuTensor,
+        q_out: &GpuTensor,
+        gate_out: &GpuTensor,
+        q_norm: &GpuTensor,
+        n_heads: usize,
+        head_dim: usize,
+        n: usize,
+        eps: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let block = 256u32.min(head_dim as u32);
+        if head_dim > 8 * block as usize {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "deinterleave+qnorm fusion requires head_dim<=2048",
+            ));
+        }
+        const KERNEL: &str = "deinterleave_q_rmsnorm_f32_batched";
+        self.ensure_kernel(
+            KERNEL,
+            kernels::DEINTERLEAVE_Q_RMSNORM_BATCHED_SRC,
+            KERNEL,
+        )?;
+        let mut inp = interleaved.buf.as_ptr();
+        let mut qp = q_out.buf.as_ptr();
+        let mut gp = gate_out.buf.as_ptr();
+        let mut wp = q_norm.buf.as_ptr();
+        let mut nh = n_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut nn = n as i32;
+        let mut ep = eps;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut inp as *mut _ as *mut c_void,
+            &mut qp as *mut _ as *mut c_void,
+            &mut gp as *mut _ as *mut c_void,
+            &mut wp as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut nn as *mut _ as *mut c_void,
+            &mut ep as *mut _ as *mut c_void,
+        ];
+        // Fused traffic: interleaved read + Q/gate writes + norm weight;
+        // the Q store+reload round trip is gone.
+        let bytes = n * n_heads * head_dim * 4 * 4 + head_dim * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "fused", KERNEL, bytes);
+        let result = self.launch_maybe_blob(
+            KERNEL,
+            [n_heads as u32, n as u32, 1],
+            [block, 1, 1],
+            block * 4,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(inp);
+                b.push_ptr(qp);
+                b.push_ptr(gp);
+                b.push_ptr(wp);
+                b.push_i32(nh);
+                b.push_i32(hd);
+                b.push_i32(nn);
+                b.push_f32(ep);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     #[cfg(feature = "deltanet")]
     pub fn sigmoid_f32(&mut self, x: &GpuTensor) -> HipResult<()> {
         self.bind_thread()?;
@@ -2266,6 +2547,10 @@ impl Gpu {
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
+        // `out` is a stable batched scratch rewritten every layer; drop any
+        // pointer-keyed F16/FP8 conversion cached from its previous contents
+        // (the Q8 residual WMMA consumer would otherwise reuse stale X).
+        self.invalidate_x_caches_for(out.buf.as_ptr());
         result
     }
 
@@ -2547,6 +2832,10 @@ impl Gpu {
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
+        // `out` is a stable batched scratch rewritten every layer; drop any
+        // pointer-keyed F16/FP8 conversion cached from its previous contents
+        // (the Q8 residual WMMA consumer would otherwise reuse stale X).
+        self.invalidate_x_caches_for(out.buf.as_ptr());
         result
     }
 
@@ -2990,20 +3279,18 @@ impl Gpu {
         self.bind_thread()?;
 
         let use_fast = !dn_requant_per_token();
-        let kernel_name = if use_fast {
-            "gated_delta_net_q8_fast"
+        let (kernel_name, kernel_src, kernel_fn) = if use_fast {
+            (
+                "gated_delta_net_q8_fast",
+                kernels::GATED_DELTA_NET_Q8_FAST_SRC,
+                "gated_delta_net_q8_fast",
+            )
         } else {
-            "gated_delta_net_q8"
-        };
-        let kernel_src = if use_fast {
-            kernels::GATED_DELTA_NET_Q8_FAST_SRC
-        } else {
-            kernels::GATED_DELTA_NET_Q8_SRC
-        };
-        let kernel_fn = if use_fast {
-            "gated_delta_net_q8_fast"
-        } else {
-            "gated_delta_net_q8"
+            (
+                "gated_delta_net_q8",
+                kernels::GATED_DELTA_NET_Q8_SRC,
+                "gated_delta_net_q8",
+            )
         };
         self.ensure_kernel(kernel_name, kernel_src, kernel_fn)?;
 
@@ -3054,7 +3341,7 @@ impl Gpu {
                 &mut efp as *mut _ as *mut c_void,
             ];
             self.launch_maybe_blob(
-                "gated_delta_net_q8_fast",
+                kernel_name,
                 [n_heads as u32, n_tiles, 1],
                 [32, 1, 1],
                 0,
@@ -3125,6 +3412,8 @@ impl Gpu {
         }
         result
     }
+
+
 
     /// One-token recurrent update for several independent sequence lanes.
     /// State tensors are lane-major; the kernel uses grid.z as the lane id.
@@ -4564,6 +4853,663 @@ impl Gpu {
             t.finish(&self.hip);
         }
         result
+    }
+
+    /// gfx1201 batched prefill GDN preamble fusion (slice P): sigmoid(beta) +
+    /// alpha gate + conv1d + SiLU + split + Q/K norm + scale + interleave in
+    /// ONE launch (`gdn_pre_batched_gfx1201`). Byte-exact vs the 3-launch
+    /// sequence; the launcher gates every admission condition the kernel
+    /// header requires (exact gfx1201 is checked at the dispatch site).
+    /// `q_raw`/`k_raw` stores are kept (v1).
+    #[cfg(feature = "deltanet")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_pre_batched_gfx1201(
+        &mut self,
+        beta: &GpuTensor,
+        alpha: &GpuTensor,
+        dt_bias: &GpuTensor,
+        a_log: &GpuTensor,
+        qkv_in: &GpuTensor,
+        conv_w: &GpuTensor,
+        conv_state: &GpuTensor,
+        q_raw: &GpuTensor,
+        k_raw: &GpuTensor,
+        v_out: &GpuTensor,
+        q_dst: &GpuTensor,
+        k_dst: &GpuTensor,
+        n_v_heads: usize,
+        n_key_heads: usize,
+        ratio: usize,
+        k_dim: usize,
+        v_dim: usize,
+        n_tokens: usize,
+        q_scale: f32,
+        eps: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        const KERNEL: &str = "gdn_pre_batched_gfx1201";
+        const BLOCK: u32 = 256;
+        const R: usize = 32;
+        self.ensure_kernel(KERNEL, kernels::GDN_PRE_BATCHED_GFX1201_SRC, KERNEL)?;
+        let bp = beta.buf.as_ptr();
+        let ap = alpha.buf.as_ptr();
+        let dtp = dt_bias.buf.as_ptr();
+        let alp = a_log.buf.as_ptr();
+        let ip = qkv_in.buf.as_ptr();
+        let wp = conv_w.buf.as_ptr();
+        let sp = conv_state.buf.as_ptr();
+        let qrp = q_raw.buf.as_ptr();
+        let krp = k_raw.buf.as_ptr();
+        let vp = v_out.buf.as_ptr();
+        let qdp = q_dst.buf.as_ptr();
+        let kdp = k_dst.buf.as_ptr();
+        let nvh = n_v_heads as i32;
+        let nkh = n_key_heads as i32;
+        let ra = ratio as i32;
+        let kd = k_dim as i32;
+        let vd = v_dim as i32;
+        let qkv = (2 * k_dim + v_dim) as i32;
+        let nt = n_tokens as i32;
+        let qs = q_scale;
+        let ep = eps;
+        let mut params: Vec<*mut c_void> = vec![
+            &bp as *const _ as *mut c_void,
+            &ap as *const _ as *mut c_void,
+            &dtp as *const _ as *mut c_void,
+            &alp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &qrp as *const _ as *mut c_void,
+            &krp as *const _ as *mut c_void,
+            &vp as *const _ as *mut c_void,
+            &qdp as *const _ as *mut c_void,
+            &kdp as *const _ as *mut c_void,
+            &nvh as *const _ as *mut c_void,
+            &nkh as *const _ as *mut c_void,
+            &ra as *const _ as *mut c_void,
+            &kd as *const _ as *mut c_void,
+            &vd as *const _ as *mut c_void,
+            &qkv as *const _ as *mut c_void,
+            &nt as *const _ as *mut c_void,
+            &qs as *const _ as *mut c_void,
+            &ep as *const _ as *mut c_void,
+        ];
+        let n_groups = (n_tokens + R - 1) / R;
+        let qk_blocks = n_key_heads * n_groups;
+        let v_blocks = (v_dim + BLOCK as usize - 1) / BLOCK as usize;
+        let grid = (qk_blocks + v_blocks * n_groups + n_groups) as u32;
+        // Distinct DRAM: qkv read + raw write + normed q/k write +
+        // beta/alpha read+write (weights/ring negligible, L2-resident).
+        let n = n_tokens;
+        let bytes = n * (2 * k_dim + v_dim) * 4
+            + n * (2 * k_dim + v_dim) * 4
+            + 2 * n * n_v_heads * 128 * 4
+            + 4 * n * n_v_heads * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "deltanet", KERNEL, bytes);
+        let result = self.launch_maybe_blob(
+            KERNEL,
+            [grid, 1, 1],
+            [BLOCK, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(bp);
+                b.push_ptr(ap);
+                b.push_ptr(dtp);
+                b.push_ptr(alp);
+                b.push_ptr(ip);
+                b.push_ptr(wp);
+                b.push_ptr(sp);
+                b.push_ptr(qrp);
+                b.push_ptr(krp);
+                b.push_ptr(vp);
+                b.push_ptr(qdp);
+                b.push_ptr(kdp);
+                b.push_i32(nvh);
+                b.push_i32(nkh);
+                b.push_i32(ra);
+                b.push_i32(kd);
+                b.push_i32(vd);
+                b.push_i32(qkv);
+                b.push_i32(nt);
+                b.push_f32(qs);
+                b.push_f32(ep);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// Row-major GDN preparation is exact on gfx11. Disable for A/B via
+    /// `HIPFIRE_GDN_PREP_GFX11=0`.
+    #[cfg(feature = "deltanet")]
+    fn gdn_chunk_prep_gfx11(&self) -> bool {
+        matches!(self.arch.as_str(), "gfx1100" | "gfx1151")
+            && hipfire_config::developer_var("HIPFIRE_GDN_PREP_GFX11").as_deref() != Ok("0")
+    }
+
+    #[cfg(feature = "deltanet")]
+    fn gdn_chunk_kkt_gfx1100(&self) -> bool {
+        self.arch == "gfx1100"
+            && hipfire_config::developer_var("HIPFIRE_GDN_KKT_GFX1100").as_deref() != Ok("0")
+    }
+
+    /// One KKT launch per layer ([`Self::gdn_chunk_kkt_solve_batched`]) instead
+    /// of one per commit segment (gfx1201, default on;
+    /// `HIPFIRE_GDN_KKT_BATCHED=0` keeps the per-segment launches). The caller
+    /// also requires 64-row-aligned segments and more than one of them.
+    #[cfg(feature = "deltanet")]
+    pub fn gdn_kkt_batched_enabled(&self) -> bool {
+        self.arch == "gfx1201" && hipfire_config::developer_bool("HIPFIRE_GDN_KKT_BATCHED", true)
+    }
+
+    /// One chunk-scan launch per layer ([`Self::gdn_chunk_scan_layer_mseg`])
+    /// instead of one per 512-row commit segment (gfx1201 bf16 `out`,
+    /// default on; `HIPFIRE_GDN_SCAN_MSEG=0` keeps the per-segment launches).
+    /// The caller also requires batched KKT A blocks for every row.
+    #[cfg(feature = "deltanet")]
+    pub fn gdn_scan_mseg_enabled(&self, out: GdnScanOut, segment_rows: usize) -> bool {
+        self.arch == "gfx1201"
+            && out == GdnScanOut::Bf16
+            && segment_rows == 512
+            && hipfire_config::developer_var("HIPFIRE_GDN_SCAN_OUT_EMU").is_err()
+            && hipfire_config::developer_bool("HIPFIRE_GDN_SCAN_MSEG", true)
+    }
+
+    /// Every 512-row commit segment of one layer's GDN chunk scan in one
+    /// launch (`gdn_chunk_scan_bf16_mseg`): the same segments, in order, as
+    /// successive [`Self::gdn_chunk_scan_segment`] calls with `kkt = false`
+    /// over `a` holding the batched KKT's A for all `n_tokens` rows. Between
+    /// segments the state takes the q8/scale/EF round trip in registers, so
+    /// `out` and the final state are byte-identical; only the last segment
+    /// stores the state.
+    #[cfg(feature = "deltanet")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_chunk_scan_layer_mseg(
+        &mut self,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        v: &GpuTensor,
+        a: &GpuTensor,
+        g: &GpuTensor,
+        beta: &GpuTensor,
+        state_q8: &GpuTensor,
+        state_scales: &GpuTensor,
+        ef_residual: &GpuTensor,
+        out: &GpuTensor,
+        n_tokens: usize,
+    ) -> HipResult<()> {
+        const MODULE: &str = "gdn_chunk_scan_bf16_mseg";
+        self.bind_thread()?;
+        self.ensure_kernel(MODULE, kernels::GDN_CHUNK_SCAN_BF16_MSEG_SRC, MODULE)?;
+        // Same frame cadence as one reservation per segment launch.
+        for row0 in (0..n_tokens).step_by(512) {
+            let _frame = reserve_gdn_requant_frames((n_tokens - row0).min(512) as u32);
+        }
+        let (qp, kp, vp, ap) = (q.buf.as_ptr(), k.buf.as_ptr(), v.buf.as_ptr(), a.buf.as_ptr());
+        let (gp, bp) = (g.buf.as_ptr(), beta.buf.as_ptr());
+        let (sqp, scp, efp, op) =
+            (state_q8.buf.as_ptr(), state_scales.buf.as_ptr(), ef_residual.buf.as_ptr(), out.buf.as_ptr());
+        let r0 = 0i32;
+        let nt = n_tokens as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &vp as *const _ as *mut c_void,
+            &ap as *const _ as *mut c_void,
+            &gp as *const _ as *mut c_void,
+            &bp as *const _ as *mut c_void,
+            &sqp as *const _ as *mut c_void,
+            &scp as *const _ as *mut c_void,
+            &efp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &r0 as *const _ as *mut c_void,
+            &nt as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(MODULE, [1, 48, 1], [512, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            for p in [qp, kp, vp, ap, gp, bp, sqp, scp, efp, op] {
+                b.push_ptr(p);
+            }
+            b.push_i32(r0);
+            b.push_i32(nt);
+            b
+        })
+    }
+
+    /// Resolve the gfx1100/gfx1151/gfx1201 chunk scan modules before any
+    /// admitted route mutates its input scratch or persistent convolution state.
+    /// `out` selects the scan variant [`Self::gdn_chunk_scan_segment`] will run.
+    #[cfg(feature = "deltanet")]
+    pub fn gdn_chunk_prepare(&mut self, out: GdnScanOut) -> HipResult<()> {
+        self.gdn_chunk_prep_module()?;
+        if self.gdn_chunk_kkt_gfx1100() {
+            self.ensure_kernel(
+                "gdn_chunk_kkt_solve_gfx1100",
+                kernels::GDN_CHUNK_KKT_SOLVE_GFX1100_SRC,
+                "gdn_chunk_kkt_solve_gfx1100",
+            )?;
+        } else {
+            self.ensure_kernel(
+                "gdn_chunk_kkt_solve",
+                kernels::GDN_CHUNK_KKT_SOLVE_SRC,
+                "gdn_chunk_kkt_solve",
+            )?;
+            if self.gdn_kkt_batched_enabled() {
+                self.ensure_kernel(
+                    "gdn_chunk_kkt_solve_batched",
+                    kernels::GDN_CHUNK_KKT_SOLVE_BATCHED_SRC,
+                    "gdn_chunk_kkt_solve_batched",
+                )?;
+            }
+        }
+        let (scan_module, scan_source) = self.gdn_chunk_scan_module(out)?;
+        self.ensure_kernel(scan_module, scan_source, scan_module)?;
+        if self.gdn_kkt_batched_enabled() && self.gdn_scan_mseg_enabled(out, 512) {
+            self.ensure_kernel(
+                "gdn_chunk_scan_bf16_mseg",
+                kernels::GDN_CHUNK_SCAN_BF16_MSEG_SRC,
+                "gdn_chunk_scan_bf16_mseg",
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Chunk-scan `out` format for a gfx1201 LA layer whose output producer has
+    /// an `_xbf16` twin; `route_default` is that route's shipped format.
+    /// `HIPFIRE_GDN_SCAN_OUT=f32|bf16` overrides it; the
+    /// `HIPFIRE_GDN_SCAN_OUT_EMU` diagnostic implies the f32 plane. Always f32
+    /// off gfx1201.
+    #[cfg(feature = "deltanet")]
+    pub fn gdn_scan_out(&self, route_default: GdnScanOut) -> HipResult<GdnScanOut> {
+        if self.arch != "gfx1201" {
+            return Ok(GdnScanOut::F32);
+        }
+        let emu = hipfire_config::developer_var("HIPFIRE_GDN_SCAN_OUT_EMU").is_ok();
+        match hipfire_config::developer_var("HIPFIRE_GDN_SCAN_OUT").ok().as_deref() {
+            None if emu => Ok(GdnScanOut::F32),
+            None => Ok(route_default),
+            Some("f32") => Ok(GdnScanOut::F32),
+            Some("bf16") if !emu => Ok(GdnScanOut::Bf16),
+            Some(v) => Err(hip_bridge::HipError::new(
+                0,
+                &format!("HIPFIRE_GDN_SCAN_OUT={v}: expected f32|bf16 (bf16 excludes HIPFIRE_GDN_SCAN_OUT_EMU)"),
+            )),
+        }
+    }
+
+    #[cfg(feature = "deltanet")]
+    fn gdn_chunk_prep_module(&mut self) -> HipResult<()> {
+        self.bind_thread()?;
+        if self.gdn_chunk_prep_gfx11() {
+            self.ensure_kernel(
+                "gdn_chunk_prep_gfx11",
+                kernels::GDN_CHUNK_PREP_GFX11_SRC,
+                "gdn_chunk_prep_gfx11",
+            )
+        } else {
+            self.ensure_kernel("gdn_chunk_prep", kernels::GDN_CHUNK_PREP_SRC, "gdn_chunk_prep")
+        }
+    }
+
+    /// Chunk-scan module (= symbol) writing `out` in the given format.
+    /// `HIPFIRE_GDN_SCAN_OUT_EMU=bf16|f16` (gfx1201, f32 `out` only) is a
+    /// quality diagnostic that rounds every `out` value to bf16/f16 RNE while
+    /// keeping the f32 store; `emu_bf16` is the byte oracle of the bf16 plane.
+    /// Exact gfx1151 runs its pipelined twin (`gdn_chunk_scan_gfx1151`,
+    /// byte-identical); `HIPFIRE_GFX1151_GDN_SCAN=0` restores `gdn_chunk_scan`.
+    #[cfg(feature = "deltanet")]
+    fn gdn_chunk_scan_module(&self, out: GdnScanOut) -> HipResult<(&'static str, &'static str)> {
+        let emu = hipfire_config::developer_var("HIPFIRE_GDN_SCAN_OUT_EMU").ok();
+        match (self.arch.as_str(), out, emu.as_deref()) {
+            ("gfx1201", GdnScanOut::Bf16, None) => Ok(("gdn_chunk_scan_bf16", kernels::GDN_CHUNK_SCAN_BF16_SRC)),
+            ("gfx1151", GdnScanOut::F32, None) if hipfire_config::developer_bool("HIPFIRE_GFX1151_GDN_SCAN", true) => {
+                Ok(("gdn_chunk_scan_gfx1151", kernels::GDN_CHUNK_SCAN_GFX1151_SRC))
+            }
+            (_, GdnScanOut::F32, None) => Ok(("gdn_chunk_scan", kernels::GDN_CHUNK_SCAN_SRC)),
+            ("gfx1201", GdnScanOut::F32, Some("bf16")) => {
+                Ok(("gdn_chunk_scan_emu_bf16", kernels::GDN_CHUNK_SCAN_EMU_BF16_SRC))
+            }
+            ("gfx1201", GdnScanOut::F32, Some("f16")) => {
+                Ok(("gdn_chunk_scan_emu_f16", kernels::GDN_CHUNK_SCAN_EMU_F16_SRC))
+            }
+            (arch, out, emu) => Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "GDN chunk scan: out {out:?} with HIPFIRE_GDN_SCAN_OUT_EMU={emu:?} is unsupported on {arch} \
+                     (emulation needs gfx1201, an f32 plane and bf16|f16)"
+                ),
+            )),
+        }
+    }
+    /// GDN chunk scan preamble for gfx1100/gfx1151/gfx1201. The compact Q/K/V
+    /// buffers are BF16 byte views borrowed from the ordinary prefill scratch.
+    #[cfg(feature = "deltanet")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_chunk_prep(
+        &mut self,
+        input: &GpuTensor,
+        conv_weight: &GpuTensor,
+        conv_state: &GpuTensor,
+        g: &GpuTensor,
+        beta: &GpuTensor,
+        dt_bias: &GpuTensor,
+        a_log: &GpuTensor,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        v: &GpuTensor,
+        n_tokens: usize,
+        q_scale: f32,
+        eps: f32,
+    ) -> HipResult<()> {
+        self.gdn_chunk_prep_module()?;
+        let gfx11 = self.gdn_chunk_prep_gfx11();
+        let prep_module = if gfx11 {
+            "gdn_chunk_prep_gfx11"
+        } else {
+            "gdn_chunk_prep"
+        };
+        let chunks = ((n_tokens + 63) / 64) as u32;
+        let grid = if gfx11 { [10, chunks, 1] } else { [chunks, 10, 1] };
+
+        let xp = input.buf.as_ptr();
+        let wp = conv_weight.buf.as_ptr();
+        let sp = conv_state.buf.as_ptr();
+        let gp = g.buf.as_ptr();
+        let bp = beta.buf.as_ptr();
+        let dtp = dt_bias.buf.as_ptr();
+        let alp = a_log.buf.as_ptr();
+        let qp = q.buf.as_ptr();
+        let kp = k.buf.as_ptr();
+        let vp = v.buf.as_ptr();
+        let nt = n_tokens as i32;
+        let qs = q_scale;
+        let ep = eps;
+        let mut params: Vec<*mut c_void> = vec![
+            &xp as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &gp as *const _ as *mut c_void,
+            &bp as *const _ as *mut c_void,
+            &dtp as *const _ as *mut c_void,
+            &alp as *const _ as *mut c_void,
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &vp as *const _ as *mut c_void,
+            &nt as *const _ as *mut c_void,
+            &qs as *const _ as *mut c_void,
+            &ep as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            prep_module,
+            grid,
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(xp);
+                b.push_ptr(wp);
+                b.push_ptr(sp);
+                b.push_ptr(gp);
+                b.push_ptr(bp);
+                b.push_ptr(dtp);
+                b.push_ptr(alp);
+                b.push_ptr(qp);
+                b.push_ptr(kp);
+                b.push_ptr(vp);
+                b.push_i32(nt);
+                b.push_f32(qs);
+                b.push_f32(ep);
+                b
+            },
+        )
+    }
+
+    /// The fused F2 QKVZA+GDN route (gfx1201, default on; `HIPFIRE_GDN_PREP_FUSED=0`
+    /// keeps the f32 projection + `gdn_chunk_prep`). The GEMM itself is admitted
+    /// separately by [`Self::gemm_qkvza_mq4g256v2_fp8_gdn_prepared`].
+    #[cfg(feature = "deltanet")]
+    pub fn gdn_prep_fused_enabled(&self) -> bool {
+        self.arch == "gfx1201"
+            && hipfire_config::developer_var("HIPFIRE_GDN_PREP_FUSED").as_deref() != Ok("0")
+    }
+
+    /// JIT the completion pass before the projection mutates anything.
+    #[cfg(feature = "deltanet")]
+    pub fn gdn_chunk_prep_fixup_prepare(&mut self) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("gdn_chunk_prep_fixup", kernels::GDN_CHUNK_PREP_FIXUP_SRC, "gdn_chunk_prep_fixup")
+    }
+
+    /// Completion pass after the F2 QKVZA+GDN GEMM (`gemm_mq4g256v2_fp8_qkvzagdn_row_b1`):
+    /// same ABI as [`Self::gdn_chunk_prep`], where `input` holds only the raw rows
+    /// that GEMM left (tile positions 0..2 / 125..127 and the last three tokens).
+    /// Grid `(max(ceil(T/64), ceil(T/128)), 11)`: row 0 owns the C64 gates, rows
+    /// 1..10 the 80 q/k/v units of every tile head and the persistent conv ring.
+    #[cfg(feature = "deltanet")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_chunk_prep_fixup(
+        &mut self,
+        input: &GpuTensor,
+        conv_weight: &GpuTensor,
+        conv_state: &GpuTensor,
+        g: &GpuTensor,
+        beta: &GpuTensor,
+        dt_bias: &GpuTensor,
+        a_log: &GpuTensor,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        v: &GpuTensor,
+        n_tokens: usize,
+        q_scale: f32,
+        eps: f32,
+    ) -> HipResult<()> {
+        const MODULE: &str = "gdn_chunk_prep_fixup";
+        self.gdn_chunk_prep_fixup_prepare()?;
+        let grid_x = n_tokens.div_ceil(64).max(n_tokens.div_ceil(128)) as u32;
+        let ptrs = [input, conv_weight, conv_state, g, beta, dt_bias, a_log, q, k, v].map(|t| t.buf.as_ptr());
+        let nt = n_tokens as i32;
+        let mut params: Vec<*mut c_void> = ptrs.iter().map(|p| p as *const _ as *mut c_void).collect();
+        params.extend([&nt as *const _ as *mut c_void, &q_scale as *const _ as *mut c_void, &eps as *const _ as *mut c_void]);
+        self.launch_maybe_blob(MODULE, [grid_x, 11, 1], [256, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            for p in ptrs { b.push_ptr(p); }
+            b.push_i32(nt);
+            b.push_f32(q_scale);
+            b.push_f32(eps);
+            b
+        })
+    }
+
+    /// [`Self::gdn_chunk_scan_segment`]'s KKT solve for every row of the layer
+    /// chunk in one launch (`gdn_chunk_kkt_solve_batched`, row0 = 0, T =
+    /// `n_tokens`, grid [16 key heads, chunks]): chunk c's A block lands at
+    /// row 64c of `a`, so the segment at `row0` (a multiple of 64) reads it
+    /// from `a` offset by `row0` rows. Gated by
+    /// [`Self::gdn_kkt_batched_enabled`]; each segment then runs with `kkt = false`.
+    #[cfg(feature = "deltanet")]
+    pub fn gdn_chunk_kkt_solve_batched(
+        &mut self,
+        k: &GpuTensor,
+        g: &GpuTensor,
+        beta: &GpuTensor,
+        a: &GpuTensor,
+        n_tokens: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        const SYMBOL: &str = "gdn_chunk_kkt_solve_batched";
+        self.ensure_kernel(SYMBOL, kernels::GDN_CHUNK_KKT_SOLVE_BATCHED_SRC, SYMBOL)?;
+        let kp = k.buf.as_ptr();
+        let gp = g.buf.as_ptr();
+        let bp = beta.buf.as_ptr();
+        let ap = a.buf.as_ptr();
+        let r0 = 0i32;
+        let nt = n_tokens as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &kp as *const _ as *mut c_void,
+            &gp as *const _ as *mut c_void,
+            &bp as *const _ as *mut c_void,
+            &ap as *const _ as *mut c_void,
+            &r0 as *const _ as *mut c_void,
+            &nt as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(SYMBOL, [16, n_tokens.div_ceil(64) as u32, 1], [128, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(kp);
+            b.push_ptr(gp);
+            b.push_ptr(bp);
+            b.push_ptr(ap);
+            b.push_i32(r0);
+            b.push_i32(nt);
+            b
+        })
+    }
+
+    /// GDN KKT solve and fused scan for one legacy segment.
+    /// All parent arrays remain unsliced; `row0` selects the segment and state
+    /// stays the single unsliced persistent owner. `out` is `[T][48][128]` in
+    /// `out_fmt` elements (4 or 2 bytes). `kkt = false` skips the KKT launch
+    /// when [`Self::gdn_chunk_kkt_solve_batched`] already wrote this segment's
+    /// A blocks and `a` points at the segment's first row.
+    #[cfg(feature = "deltanet")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_chunk_scan_segment(
+        &mut self,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        v: &GpuTensor,
+        a: &GpuTensor,
+        g: &GpuTensor,
+        beta: &GpuTensor,
+        state_q8: &GpuTensor,
+        state_scales: &GpuTensor,
+        ef_residual: &GpuTensor,
+        out: &GpuTensor,
+        out_fmt: GdnScanOut,
+        row0: usize,
+        n_tokens: usize,
+        kkt: bool,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let (kkt_module, kkt_source, kkt_symbol, kkt_rows, kkt_heads, kkt_block) =
+            if self.gdn_chunk_kkt_gfx1100() {
+                (
+                    "gdn_chunk_kkt_solve_gfx1100",
+                    kernels::GDN_CHUNK_KKT_SOLVE_GFX1100_SRC,
+                    "gdn_chunk_kkt_solve_gfx1100",
+                    64,
+                    48,
+                    128,
+                )
+            } else {
+                (
+                    "gdn_chunk_kkt_solve",
+                    kernels::GDN_CHUNK_KKT_SOLVE_SRC,
+                    "gdn_chunk_kkt_solve",
+                    64,
+                    16,
+                    128,
+                )
+            };
+        if kkt {
+            self.ensure_kernel(kkt_module, kkt_source, kkt_symbol)?;
+        }
+        let (scan_module, scan_source) = self.gdn_chunk_scan_module(out_fmt)?;
+        self.ensure_kernel(scan_module, scan_source, scan_module)?;
+        // The gfx1151 twin runs one BV=64 value half of a head per 256-thread
+        // workgroup; every other scan module runs both halves in 512 threads.
+        let (scan_grid, scan_block) = if scan_module == "gdn_chunk_scan_gfx1151" {
+            ([2, 48, 1], [256, 1, 1])
+        } else {
+            ([1, 48, 1], [512, 1, 1])
+        };
+
+        let kp = k.buf.as_ptr();
+        let gp = g.buf.as_ptr();
+        let bp = beta.buf.as_ptr();
+        let ap = a.buf.as_ptr();
+        let r0 = row0 as i32;
+        let nt = n_tokens as i32;
+        if kkt {
+            let mut kkt_params: Vec<*mut c_void> = vec![
+                &kp as *const _ as *mut c_void,
+                &gp as *const _ as *mut c_void,
+                &bp as *const _ as *mut c_void,
+                &ap as *const _ as *mut c_void,
+                &r0 as *const _ as *mut c_void,
+                &nt as *const _ as *mut c_void,
+            ];
+            self.launch_maybe_blob(
+                kkt_symbol,
+                [((n_tokens + kkt_rows - 1) / kkt_rows) as u32, kkt_heads, 1],
+                [kkt_block, 1, 1],
+                0,
+                &mut kkt_params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(kp);
+                    b.push_ptr(gp);
+                    b.push_ptr(bp);
+                    b.push_ptr(ap);
+                    b.push_i32(r0);
+                    b.push_i32(nt);
+                    b
+                },
+            )?;
+        }
+
+        // Preserve the incumbent deterministic frame cadence even though the
+        // required EF path does not consume the stochastic seed.
+        let _frame = reserve_gdn_requant_frames(n_tokens as u32);
+        let qp = q.buf.as_ptr();
+        let vp = v.buf.as_ptr();
+        let sqp = state_q8.buf.as_ptr();
+        let scp = state_scales.buf.as_ptr();
+        let efp = ef_residual.buf.as_ptr();
+        let op = out.buf.as_ptr();
+        let mut scan_params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &vp as *const _ as *mut c_void,
+            &ap as *const _ as *mut c_void,
+            &gp as *const _ as *mut c_void,
+            &bp as *const _ as *mut c_void,
+            &sqp as *const _ as *mut c_void,
+            &scp as *const _ as *mut c_void,
+            &efp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &r0 as *const _ as *mut c_void,
+            &nt as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            scan_module,
+            scan_grid,
+            scan_block,
+            0,
+            &mut scan_params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(qp);
+                b.push_ptr(kp);
+                b.push_ptr(vp);
+                b.push_ptr(ap);
+                b.push_ptr(gp);
+                b.push_ptr(bp);
+                b.push_ptr(sqp);
+                b.push_ptr(scp);
+                b.push_ptr(efp);
+                b.push_ptr(op);
+                b.push_i32(r0);
+                b.push_i32(nt);
+                b
+            },
+        )
     }
 
     /// Independent-sequence decode variant of [`Self::conv1d_silu_split_f32_n`].

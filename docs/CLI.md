@@ -10,9 +10,9 @@ Bare interactive `hipfire` launches the terminal UI when `hipfire-tui` is instal
 
 | Command | Purpose |
 |---|---|
-| `hipfire pull <tag>` | Download a registry model into `~/.hipfire/models/`. When the entry declares a DFlash draft (`dflash.file`), the pull also fetches that sidecar. Pull does **not** enable speculation: `dflash_mode` defaults to **`off`**. With `auto`, the loader uses the sidecar when present (otherwise AR); with `on`, load fails closed if the sidecar is missing. Override the path with `developer.dflash_draft` / `HIPFIRE_DFLASH_DRAFT` (or `run --model-draft`). When the entry declares a vision tower (`vision.file`, e.g. every `qwen3.8:27b*` tier → `qwen3.8-27b-vision.hfq`), the pull also fetches that sidecar; override with `run --vision` / `serve --vision` / `HIPFIRE_VISION_SIDECAR`. |
+| `hipfire pull <tag>` | Download a registry model into `~/.hipfire/models/`. When the entry declares a DFlash draft (`dflash.file`), the pull also fetches that sidecar. Pull does **not** enable speculation: `dflash_mode` defaults to **`off`**. With `auto`, the loader uses the sidecar when present (otherwise AR); with `on`, load fails closed if the sidecar is missing. Override the path with `developer.dflash_draft` / `HIPFIRE_DFLASH_DRAFT` (or `run --model-draft`). When the entry declares a vision tower (`vision.file`, e.g. every `qwen3.8:27b*` tier → `qwen3.8-27b-vision.hfq`), the pull also fetches that sidecar; override with `run --vision` / `serve --vision` / `HIPFIRE_VISION_SIDECAR`. When the entry declares an MTP head (`mtp.file`, e.g. every Qwen3.8-27B trunk tier → `qwen3.8-27b.mtp`), the pull fetches it too, and because `mtp_mode` defaults to `auto`, the next load speculates with it ([MODELS.md](MODELS.md#dflash-draft-artifacts-registry)). |
 | `hipfire list [-r\|--remote] [-j\|--json]` | Local models; `-r` also lists pullable registry tags; user aliases from `quantize --register` appear separately. |
-| `hipfire rm <tag\|path> [-y\|--yes]` | Delete the weight file and sibling sidecars (`.triattn*.bin`, `*.mtp`, matching DSpark). A declared DFlash draft is **shared**: several tags can name the same `dflash.file` (e.g. `qwen3.8:27b` / `qwen3.8:27b-mq4-pro` / `qwen3.8:27b-mq4-xt` → one `qwen38-27b-dflash-mq4.hfq`). If any *other* registry entry that declares the same draft still has its own target file on disk, `rm` **keeps** the sidecar and prints one stderr line; otherwise the draft is removed with the target. The `vision` tower sidecar follows the same shared-keeper rule (every `qwen3.8:27b*` tier declares the one `qwen3.8-27b-vision.hfq`). Confirms unless `-y`. |
+| `hipfire rm <tag\|path> [-y\|--yes]` | Delete the weight file and sibling sidecars (`.triattn*.bin`, `*.mtp`, matching DSpark). A declared DFlash draft is **shared**: several tags can name the same `dflash.file` (e.g. `qwen3.8:27b` / `qwen3.8:27b-mq4-pro` / `qwen3.8:27b-mq4-xt` → one `qwen38-27b-dflash-mq4.hfq`). If any *other* registry entry that declares the same draft still has its own target file on disk, `rm` **keeps** the sidecar and prints one stderr line; otherwise the draft is removed with the target. The `vision` tower sidecar and the `mtp` head follow the same shared-keeper rule (every `qwen3.8:27b*` tier declares the one `qwen3.8-27b-vision.hfq`, and every trunk tier the one `qwen3.8-27b.mtp`). Confirms unless `-y`. |
 | `hipfire ps [-j\|--json]` | Running daemon / quantize / upload processes and whether the configured serve port is busy (process scan is Linux-oriented). |
 
 Tags resolve through the dynamic registry + aliases. Authoritative live list:
@@ -43,7 +43,11 @@ Flags may appear before or after the model. CLI help and the native typed schema
 | `--top-p <float>` | Nucleus sampling when set. Stored global default `0.8` is not auto-sent. |
 | `--repeat-penalty <float>` | Repeat penalty when set. Stored global default `1.05` is not auto-sent. |
 | `-n, --max-tokens <int>` | Generation cap (config default `4096`). |
-| `--kv-mode <m>` | This-load KV mode: `auto`, `q8`, `fwht4`/`3`/`2`, `asym4`/`3`/`2`, `turbo`… |
+| `--kv-mode <m>` | Whole-cache KV preset for this load: `auto`, `q8`, `fp8`, `bf16`, `fwht4`/`3`/`2`; legacy spellings `asym4`/`3`/`2`, `turbo`… (see [KV load flags](#kv-load-flags-run--serve--bench)). |
+| `--kv-backend <legacy\|vmm>` | KV allocation backend. Omitted = automatic (prefer VMM). `contiguous` is **rejected** (renamed to `legacy`). |
+| `--kv-k <name>` | Qwen-family K-axis override (`q8`, `fwhtN`; deprecated, removal in 0.5.0: legacy `asymN`/`turboN` → `fwhtN`; legacy Givens `legacy-asymN`). |
+| `--kv-v <name>` | Qwen-family V-axis override (`q8`, `lloyd2`/`3`/`4`). |
+| `--max-seq <n>` | Context length for this load. Eligible growing Qwen VMM KV defaults to min(model trained context, measured card capacity); legacy and other owners retain their bounds. Explicit value wins. |
 | `--spec <m>` / `--speculation <m>` | Spec mechanism: `off` \| `auto` \| `ngram` \| `dflash` \| `mtp` \| `dspark` (config default `auto`). |
 | `-md, --model-draft <path>` | DFlash draft path; implies `--spec dflash` unless `--spec`/env already set. |
 | `--draft-max`, `--draft <N>` | Draft window for the active mechanism. |
@@ -64,15 +68,35 @@ hipfire run qwen3.5:27b -md ~/.hipfire/models/qwen35-27b-dflash-mq4.hfq "..."
 HIPFIRE_LOCAL=1 hipfire run qwen3.5:4b "..."   # skip HTTP; always local spawn
 ```
 
-Local-forcing (skip a healthy serve): `HIPFIRE_LOCAL` truthy, `--image`, `--kv-mode`, `--kv-backend`, `--spec`/`--speculation`, `--model-draft`, `--vision`, `--draft-max`, or `--dspark-conf-threshold` (exact list: `force_local` in `crates/hipfire-cli/src/main.rs`). JSON and non-streaming responses are supported by the native HTTP service and do not by themselves force a local daemon.
+Local-forcing (skip a healthy serve): `HIPFIRE_LOCAL` truthy, `--image`, `--kv-mode`, `--kv-backend`, `--kv-k`, `--kv-v`, `--max-seq`, `--spec`/`--speculation`, `--model-draft`, `--vision`, `--draft-max`, or `--dspark-conf-threshold` (exact list: `force_local` in `crates/hipfire-cli/src/main.rs`). JSON and non-streaming responses are supported by the native HTTP service and do not by themselves force a local daemon.
+
+### KV load flags (`run` / `serve` / `bench`)
+
+Shared by `hipfire run`, `hipfire serve`, and `hipfire bench` (including `--matrix`). Full config surface: [CONFIG.md](CONFIG.md#kv-cache).
+
+| Flag | Values / default | Notes |
+|---|---|---|
+| `--kv-backend` | `legacy` \| `vmm`; **default automatic prefer VMM** | Accepts only those two spellings. Old `contiguous` is rejected with a migration error that names `legacy` (e.g. use `--kv-backend legacy` or `memory.kv_backend = "legacy"`). Selecting legacy (explicit or automatic fallback) prints one stderr warning containing the stable token `HIPFIRE_KV_BACKEND=legacy`. Explicit `vmm` on an unsupported combination fails closed before teardown. |
+| `--kv-mode` | `auto` (default when unset), `q8`, `fp8`, `bf16`, `fwht2`/`3`/`4`; legacy spellings `asym2`/`3`/`4`, `turbo`/`turbo2`/`3`/`4`; … | Whole-cache preset. Native `fp8`/`bf16` encode K and V together, without a separate V mode. `fwhtN` is an optional headroom mode, not a default. |
+| `--kv-k` / `--kv-v` | Qwen-only axis overrides; omitted when unset | Orthogonal to mode. On supported Qwen sites the legacy spellings `asymN` and `turboN` (bare `turbo` = `turbo3`) mean **`fwhtN`**; `legacy-asymN` selects the legacy Givens asym K. `asymN`, `turboN` and `legacy-asymN` are deprecated since 0.4.0 (removal in 0.5.0) and warn at load. V names: `q8`, `lloyd2`/`3`/`4`. Non-Qwen carriers refuse these axes before teardown. |
+| `--max-seq` | int when set; else automatic | On eligible growing Qwen VMM KV, default = **min(model trained context, measured card capacity)** after weights load; legacy and other owners retain their existing bounds. Explicit CLI/config override wins. |
+
+**Qwen `auto` / unset mode:** native `fp8` (both K and V) on exact `gfx1201` when the load is native-eligible — H24/Hkv4/D256 attention, single GPU (no PP/TP/EP), no `kv_adaptive`, no CASK sidecar; `q8`/`q8` everywhere else, including gfx1100 and gfx1151. Native modes report `kv_mode=fp8` or `bf16` in loaded/diag/bench JSON; no synthetic `V=q8` axis is reported. Non-Qwen family defaults are unchanged (e.g. Maple BF16, DeepSeek compressor F32, Gemma layered policy).
+
+**K/V precedence** (split modes only): CLI flag **>** per-model config **>** global config **>** registry / arch default. Mode seeds the pair; `--kv-k` overrides K and `--kv-v` overrides V. An authored `--kv-mode fp8`/`bf16` refuses every axis override, including `--kv-v q8`; an auto-selected native pair can be replaced only when both axes are supplied. Full refusal rules: [CONFIG.md](CONFIG.md#kv-cache).
+
+**Backend precedence** (forced choices): CLI `--kv-backend` **>** per-model `memory.kv_backend` **>** global `memory.kv_backend`. Omitted backend stays automatic VMM-preferring policy, not an authored pin.
 
 ### `hipfire serve` flags
 
 | Flag / arg | Purpose |
 |---|---|
-| `[host]` `[port]` or `host:port` | Bind (config defaults `0.0.0.0` and `11435`). **No authentication and no TLS** — prefer `127.0.0.1` for local-only; expose beyond localhost only on a trusted/firewalled network or behind an **authenticated TLS-terminating reverse proxy**. |
+| `[host]` `[port]` or `host:port` | Bind (config defaults `127.0.0.1` and `11435`). **No authentication and no TLS** — `0.0.0.0` exposes the API on every interface; do that only on a trusted/firewalled network or behind an **authenticated TLS-terminating reverse proxy**. |
 | `-d`, `--detach`, `--background` | Background; log `~/.hipfire/serve.log`, pid `~/.hipfire/serve.pid`. |
-| `--kv-mode <m>` | KV mode for this process. |
+| `--kv-mode <m>` | KV mode preset for this process (same contract as `run`). |
+| `--kv-backend <legacy\|vmm>` | KV allocation backend (same as `run`; `contiguous` rejected → use `legacy`). |
+| `--kv-k <name>` / `--kv-v <name>` | Qwen-family K/V axis overrides (same as `run`). |
+| `--max-seq <n>` | Context length (eligible growing Qwen VMM KV defaults to min(trained context, card capacity); explicit wins). |
 | `--idle-timeout <s>` | Unload after idle seconds (`0` = never; max `86400`). |
 | `--no-prewarm` | Lazy-load on first request. |
 | `--tp N` | Expert-parallel across N GPUs (supported MoE paths only; `1..64`). |
@@ -114,9 +138,9 @@ Do not inventory every key here — [CONFIG.md](CONFIG.md) owns defaults and ran
 
 | Command | Purpose |
 |---|---|
-| `hipfire quantize <hf-id\|dir\|file.gguf> [flags]` | CPU quantize via `hipfire-quantize`. |
+| `hipfire quantize <hf-id\|dir\|file.gguf> [flags]` | CPU quantize via `hipfire-quantize`. GGUF weight input is deprecated (removal in 0.5.0): GGUF→mqN is lossy double quantization; use llama.cpp for GGUF. |
 | `hipfire-quantize --flux-pipe <pipe_dir> -o <base.hfq>` | Pack a FLUX.1 or FLUX.2 Klein diffusers pipe into per-component HFQ files (`<base>-transformer.hfq` plus `-t5.hfq`, `-clip.hfq`, `-vae.hfq` for FLUX.1, or `-qwen3.hfq`, `-vae.hfq` for Klein; arch ids 40–46). `--flux-component` packs one. The packs are the only form the daemon loads. |
-| `hipfire sidecar-gen <model> [flags]` | Build a `.triattn.bin` next to the model (does not pull). |
+| `hipfire sidecar-gen <model> [flags]` | **Deprecated (CASK), removal in 0.5.0.** Build a `.triattn.bin` next to the model (does not pull); prints a deprecation warning. |
 
 ### `quantize` (summary)
 
@@ -131,7 +155,7 @@ Do not inventory every key here — [CONFIG.md](CONFIG.md) owns defaults and ran
 
 Supported CLI formats include `mq4`, `mq6`, `q8`/`q8f16`, `hf4`/`hf6` and hfq aliases. Graded MoE recipes need the quantizer binary directly — [QUANTIZE.md](QUANTIZE.md).
 
-### `sidecar-gen` (summary)
+### `sidecar-gen` (summary; deprecated, removal in 0.5.0)
 
 | Flag | Purpose |
 |---|---|
@@ -147,7 +171,7 @@ Supported CLI formats include `mq4`, `mq6`, `q8`/`q8f16`, `hf4`/`hf6` and hfq al
 | Command | Purpose |
 |---|---|
 | `hipfire bench <model> [opts] [prompt]` | Prefill/decode timing. `--runs N` (default 5), `--json`, `--exp` (RDNA2 variant sweep). `--prompt-file PATH` reads the prompt verbatim; JSON records `prompt_tokens`/`prompt_md5`/`prompt_chars`/`warnings` (short prompts warn that `prefill_tok_s` is launch overhead). |
-| `hipfire bench <model> --matrix ...` | Synthetic PP/context/TG matrix (`--pp`, `--ctx`, `--tg`, `--sustained-tg`, `--sustained-ctx`, `--warmups`, `--kv-mode`, `--redline`). |
+| `hipfire bench <model> --matrix ...` | Synthetic PP/context/TG matrix (`--pp`, `--ctx`, `--tg`, `--sustained-tg`, `--sustained-ctx`, `--warmups`, `--kv-mode`, `--kv-backend`, `--kv-k`, `--kv-v`, `--max-seq`, `--redline`). Same KV contract as `run`/`serve`; `--json` surfaces the effective loaded `kv_mode` and backend fields. |
 | `hipfire profile [model] [--kernel substr] [--json]` | Live daemon roofline and compiled-kernel VGPR/SGPR/LDS/occupancy report. Use `hipfire-atlas` for measured ISA-fit and workload analysis. |
 | `hipfire diag` | Static device/runtime checks plus a live HIP arch, version, and VRAM probe when the daemon is available. |
 | `hipfire --version` | Concise semver + build commit + source ref identity. |
@@ -192,7 +216,8 @@ Single-invocation knobs (non-exhaustive; full list in [env-vars.md](env-vars.md)
 | `HIPFIRE_LOCAL=1` | `run` skips HTTP serve and spawns a local daemon (also forced by load-time overrides such as `--kv-mode` or `--image`). |
 | `HIPFIRE_HOME=...` | Override the state/config root (default `~/.hipfire`). |
 | `HIPFIRE_MODELS_DIR=...` | Override model discovery, pull, list, and TUI model paths. |
-| `HIPFIRE_KV_MODE=...` | Override KV layout. |
+| `HIPFIRE_KV_MODE=...` | Override KV layout preset (`auto` → Qwen fp8 on native-eligible exact gfx1201, else q8/q8; non-Qwen unchanged). |
+| `HIPFIRE_KV_BACKEND=...` | Not a second default plane for ordinary loads; the stable **warning token** `HIPFIRE_KV_BACKEND=legacy` appears on stderr when legacy storage is selected. Config/CLI use `legacy`\|`vmm` only. |
 | `HIPFIRE_SPECULATION=...` | Top of speculation ladder. |
 | `HIPFIRE_DFLASH_DRAFT=...` | Explicit draft path. |
 | `HIPFIRE_VISION_SIDECAR=...` | Explicit vision-tower sidecar path; empty opts out. Skipped while `vision_mode=off`. |

@@ -120,23 +120,30 @@ pub fn dtype_rotation_plan(dtype: DType) -> RotationPlan {
     match dtype {
         // MQ2G256GL / MQ3G256GL are encoded against FWHT-256-rotated
         // blocks exactly like the other MQ*-G256 dtypes.
-        MQ4G256 | MQ4G256V2 | MQ5G256V2 | MQ6G256V2 | MQ3G256V2 | MQ2G256V2 | MQ4CG256
-        | MQ3G256 | MQ2G256 | MQ5G256 | MQ6G256 | MQ2G256Lloyd | MQ3G256Lloyd | MQ4G256Lloyd
-        | MQ2G256GL | MQ3G256GL | MFP4G32 | MFP4G32Lloyd | MFP4G32P | MFP4G32E8 | MFP4G32E8SOA
-        | MFP3G32E8 | MFP2G32E8 => RotationPlan::FwhtG256,
-        // MQ4G128 and MQ8G256 carry their OWN plans and MUST NOT reach the `_` arm:
-        // falling through to RotationPlan::None leaves x unrotated against weights
-        // that were encoded post-rotation, which is silent garbage, not an error.
-        MQ4G128 => RotationPlan::FwhtG128,
+        MQ4G256 | MQ4G256V2 | MQ4G256V2Lloyd | MQ5G256V2 | MQ6G256V2 | MQ3G256V2 | MQ2G256V2
+        | MQ4CG256 | MQ3G256 | MQ2G256 | MQ5G256 | MQ6G256 | MQ2G256Lloyd | MQ3G256Lloyd
+        | MQ4G256Lloyd | MQ2G256GL | MQ3G256GL | MFP4G32 | MFP4G32Lloyd | MFP4G32P | MFP4G32E8
+        | MFP4G32E8SOA | MFP3G32E8 | MFP2G32E8 => RotationPlan::FwhtG256,
+        // MQ4G128 and MQ4G128V2 carry their own G128 activation basis.  V2
+        // uses the qt53 68-byte row format; it must not fall through to the
+        // natural-basis default.
+        MQ4G128 | MQ4G128V2 => RotationPlan::FwhtG128,
+        // qt=42 mfp4-E8 carries the SAME G128 activation basis as qt=53 —
+        // 128-element FWHT segments, sign seeds 43/1043, rotated by
+        // `rotate_x_mq_128`. Mapping it to FwhtG256 would feed x rotated in
+        // 256-wide segments into weights rotated in 128-wide ones: both are
+        // orthogonal, but they are NOT the same transform, so the result would
+        // be fluent garbage rather than a fault.
+        MFP4G32E8G128 => RotationPlan::FwhtG128,
         MQ8G256 => RotationPlan::Mq8Internal,
         ParoQ4G128 => RotationPlan::Givens,
         // MQ2G256LloydU is the UNROTATED Lloyd sibling: its weights are encoded
         // in the natural basis, so x must NOT be rotated. Stated explicitly
         // rather than left to the `_` fallthrough below — by the same argument
-        // as the comment above, a dtype that lands on `None` by accident rather
-        // than by intent is precisely the silent-garbage failure mode, and
-        // whoever adds the next Lloyd variant should be forced to decide which
-        // side of this line it belongs on.
+        // as the comment above, a dtype that lands on `None` by accident
+        // rather than by intent is precisely the silent-garbage failure mode,
+        // and whoever adds the next Lloyd variant should be forced to decide
+        // which side of this line it belongs on.
         MQ2G256LloydU => RotationPlan::None,
         _ => RotationPlan::None,
     }
@@ -151,9 +158,10 @@ pub fn dtype_post_rotation_variant(dtype: DType) -> GemvVariant {
         ParoQ4G128 => GemvVariant::Plain,
         // GL formats are MoE-indexed-only and intentionally have no dense
         // prerotated GEMV route.
-        MQ4G256 | MQ4G256V2 | MQ5G256V2 | MQ6G256V2 | MQ3G256V2 | MQ2G256V2 | MQ4CG256
-        | MQ3G256 | MQ2G256 | MQ5G256 | MQ6G256 | MQ8G256 | MQ2G256Lloyd | MQ3G256Lloyd
-        | MQ4G256Lloyd | MFP4G32 | MFP4G32Lloyd | MFP4G32P | MFP4G32E8 | MFP4G32E8SOA | MQ4G128 => {
+        MQ4G256 | MQ4G256V2 | MQ4G256V2Lloyd | MQ5G256V2 | MQ6G256V2 | MQ3G256V2 | MQ2G256V2
+        | MQ4CG256 | MQ3G256 | MQ2G256 | MQ5G256 | MQ6G256 | MQ8G256 | MQ2G256Lloyd
+        | MQ3G256Lloyd | MQ4G256Lloyd | MFP4G32 | MFP4G32Lloyd | MFP4G32P | MFP4G32E8
+        | MFP4G32E8SOA | MFP3G32E8 | MFP2G32E8 | MQ4G128 | MQ4G128V2 | MFP4G32E8G128 => {
             GemvVariant::Prerotated
         }
         _ => GemvVariant::Plain,
@@ -171,13 +179,26 @@ pub fn fused_qkv_variant_for_key(key: KernelKey) -> Option<FusedQkvVariant> {
     use KernelKey::*;
     match key {
         // 3-way Fused QKV (incl. Q4K, Q8_0/HFQ3/HFP4 prefill, and the Paro 4G128T QKV synthesis)
-        FusedQkvHfq4G256 | FusedQkvMq4G256V2 | FusedQkvMq6G256V2 | FusedQkvMq5G256V2
-        | FusedQkvMq3G256V2 | FusedQkvMq2G256V2 | FusedQkvMq4CG256 | FusedQkvMq3G256Lloyd
-        | FusedQkvMq4G256Lloyd | FusedQkvHfq6G256 | FusedQkvQ4K | FusedQkvQ8_0
-        | FusedQkvHfq3G256 | FusedQkvHfp4G32 | FusedQkvParo4G128T => Some(FusedQkvVariant::Qkv),
+        FusedQkvHfq4G256
+        | FusedQkvMq4G256V2
+        | FusedQkvMq4G256V2Lloyd
+        | FusedQkvMq6G256V2
+        | FusedQkvMq5G256V2
+        | FusedQkvMq3G256V2
+        | FusedQkvMq2G256V2
+        | FusedQkvMq4CG256
+        | FusedQkvMq3G256Lloyd
+        | FusedQkvMq4G256Lloyd
+        | FusedQkvHfq6G256
+        | FusedQkvQ4K
+        | FusedQkvQ8_0
+        | FusedQkvHfq3G256
+        | FusedQkvHfp4G32
+        | FusedQkvParo4G128T => Some(FusedQkvVariant::Qkv),
         // 4-way Fused QKVZA (DeltaNet linear attention, incl. Q8_0/HFQ3/HFP4 prefill and Paro 4G128T)
         FusedQkvzaHfq4G256
         | FusedQkvzaMq4G256V2
+        | FusedQkvzaMq4G256V2Lloyd
         | FusedQkvzaMq6G256V2
         | FusedQkvzaMq5G256V2
         | FusedQkvzaMq3G256V2
@@ -193,6 +214,7 @@ pub fn fused_qkv_variant_for_key(key: KernelKey) -> Option<FusedQkvVariant> {
         | FusedQkvzaParo4G128T => Some(FusedQkvVariant::Qkvza),
         FusedGateUpHfq4G256
         | FusedGateUpMq4G256V2
+        | FusedGateUpMq4G256V2Lloyd
         | FusedGateUpMq6G256V2
         | FusedGateUpMq5G256V2
         | FusedGateUpMq3G256V2
@@ -273,6 +295,11 @@ pub enum KernelKey {
     GemvMfp4G32PPrerotated,
     GemvMfp4G32E8Prerotated,
     GemvMfp4G32E8SoaPrerotated,
+    /// qt=42 mfp4-E8, 128-wide rotation group. Same E8 lattice body as the
+    /// MFP4G32E8 keys; only the activation basis and the kernel's coverage
+    /// arithmetic (whole 8-block groups + a masked remainder) differ.
+    GemvMfp4G32E8G128,
+    GemvMfp4G32E8G128Prerotated,
     // GEMV residual
     GemvHfq4G256Residual,
     GemvHfq3G256Residual,
@@ -371,6 +398,11 @@ pub enum KernelKey {
     GemmHfq3G256Residual,
     GemmHfp4G32Residual,
     GemmMq3G256LloydResidual,
+    // Explicit experimental packed entries only; never selected by resolve().
+    GemmMq4Packed,
+    GemmMq4PackedResidual,
+    GemmMq4V2Packed,
+    GemmMq4V2PackedResidual,
     // GEMM — spec-decode (DFlash) batched lm_head catalog (#397 Ship 5.3).
     // These take the canonical signature `(a, x, y, m, k, batch_size)` and
     // dispatch the batched verify/draft lm_head GEMM. Each `gpu.gemm_*` method
@@ -391,6 +423,8 @@ pub enum KernelKey {
     // Fused QKV
     FusedQkvHfq4G256,
     FusedQkvMq4G256V2,
+    /// qt=52 (MQ4G256V2-Lloyd) decode twin: same wire layout, per-tensor f16 codebook LUT.
+    FusedQkvMq4G256V2Lloyd,
     FusedQkvMq4CG256,
     FusedQkvMq5G256V2,
     FusedQkvMq6G256V2,
@@ -406,6 +440,8 @@ pub enum KernelKey {
     FusedQkvHfp4G32,
     FusedQkvzaHfq4G256,
     FusedQkvzaMq4G256V2,
+    /// qt=52 (MQ4G256V2-Lloyd) decode twin: same wire layout, per-tensor f16 codebook LUT.
+    FusedQkvzaMq4G256V2Lloyd,
     FusedQkvzaMq4CG256,
     FusedQkvzaMq5G256V2,
     FusedQkvzaMq6G256V2,
@@ -422,6 +458,8 @@ pub enum KernelKey {
     FusedQkvzaMfp4G32E8,
     FusedGateUpHfq4G256,
     FusedGateUpMq4G256V2,
+    /// qt=52 (MQ4G256V2-Lloyd) decode twin: same wire layout, per-tensor f16 codebook LUT.
+    FusedGateUpMq4G256V2Lloyd,
     FusedGateUpMq4CG256,
     FusedGateUpMq5G256V2,
     FusedGateUpMq6G256V2,
@@ -495,6 +533,18 @@ pub enum KernelKey {
     AttnQ8_0KvBatchedMasked,         // P-1 no-LDS-cap tiled kernel
     AttnQ8_0KvBatchedMaskedWindowed, // sliding-window batched Q8 (cohere2moe prefill)
     AttnBf16KvBatchedMaskedWindowed, // sliding-window batched BF16 (maple prefill)
+    // Native fp8 E4M3 KV (gfx1201-only; see attention_table registrations).
+    AttnFp8E4m3Kv, // scalar decode / per-token fallback (Q0 format gate)
+    AttnFlashFp8E4m3, // flash tile decode
+    AttnFp8E4m3KvBatchedMasked, // batched prefill / tree-verify
+    // Flat-BF16 KV for non-windowed (Qwen dense) caches. Maple keeps the
+    // windowed keys above. `AttnBf16Kv{,_BatchedMasked}` lower to F's NEW
+    // native bf16 kernels `attention_bf16_kv{,_batched}` (HIPFIRE_KV_BF16=1
+    // in attention_q8_0_kv{,_batched}.hip); only `AttnFlashBf16` reuses the
+    // existing `attention_flash_bf16_windowed` launcher with window=0.
+    AttnBf16Kv, // scalar decode; launches attention_bf16_kv
+    AttnFlashBf16, // flash tile decode via attention_flash_bf16_windowed, window=0
+    AttnBf16KvBatchedMasked, // batched prefill / tree-verify; launches attention_bf16_kv_batched
     // TODO(3.3): F32-batched key for models with F32 KV + batchable weights
     // Full attention (no KV cache — vision / dflash cross-attention)
     AttnFullF16,       // F16 K/V, non-causal
@@ -524,6 +574,9 @@ pub enum KernelKey {
     KvWriteAsym2FwhtBatched,
     KvWriteQ8_0Batched,
     KvWriteBf16Batched,
+    // Native fp8 E4M3 KV write (single-token + batched).
+    KvWriteFp8E4m3,
+    KvWriteFp8E4m3Batched,
 }
 
 // ── Shape context for predicate evaluation ───────────
@@ -577,6 +630,15 @@ pub enum ArchPredicate {
     /// means `v_dot4_i32_i8` (gfx906-only), while this checks `v_dot2_f32_f16`
     /// (RDNA1.1+). The two are unrelated ISA features.
     HasDot2F32F16,
+    /// `is_gfx942()` — CDNA3 MI300-series exactly. Gates kernels built from a
+    /// `.gfx942.hip` source with no sibling for any other arch, currently the
+    /// BF16 MFMA GEMM. Narrower than `is_cdna3()` on purpose: the wrapper
+    /// refuses non-gfx942 outright, so the predicate must match the wrapper.
+    IsGfx942,
+    /// Exact gfx1201 (R9700). Gates the native fp8 E4M3 KV keys whose device
+    /// builtins are gfx1201-guarded: no other arch may resolve them, so an
+    /// fp8 cache fails closed at dispatch outside the admitted target.
+    IsGfx1201,
     HasSdot4,
     HasMmq,
     HasCdna3LdsGemv,
@@ -584,11 +646,6 @@ pub enum ArchPredicate {
     /// Gates the gfx906 wave64 `v_dot4_i32_i8` (sdot4) fused kernels (HFQ6/MQ6).
     /// This IS AMD "dp4a" — `v_dot4_i32_i8` INT8 dot4 accumulate, gfx906/gfx908.
     HasDp4a,
-    /// `is_gfx942()` — CDNA3 MI300-series exactly. Gates kernels built from a
-    /// `.gfx942.hip` source with no sibling for any other arch, currently the
-    /// BF16 MFMA GEMM. Narrower than `is_cdna3()` on purpose: the wrapper
-    /// refuses non-gfx942 outright, so the predicate must match the wrapper.
-    IsGfx942,
 }
 
 #[derive(Clone, Debug)]
@@ -723,11 +780,20 @@ impl KernelKey {
             (MFP4G32P, Plain) => Ok(Self::GemvMfp4G32P),
             (MFP4G32E8, Plain) => Ok(Self::GemvMfp4G32E8),
             (MFP4G32E8SOA, Plain) => Ok(Self::GemvMfp4G32E8Soa),
+            (MFP4G32E8G128, Plain) => Ok(Self::GemvMfp4G32E8G128),
             (HFP4G32, Plain) => Ok(Self::GemvHfp4G32),
             (ParoQ4G128, Plain) => Ok(Self::GemvParoQ4G128),
             (Q4F16G64, Plain) => Ok(Self::GemvQ4F16G64),
             (Q4F16G32, Plain) => Ok(Self::GemvQ4F16G32),
             (Q8HFQ, Plain) => Ok(Self::GemvQ8HFQ),
+            // qt=53 is admitted only by typed Qwen4 sealed/dense consumers;
+            // generic family resolution remains an explicit refusal.
+            (MQ4G128V2, _) => Err(DispatchError::UnsupportedVariant {
+                family: "gemv",
+                variant: "mq4g128v2_specialized_route_only",
+                arch: "",
+                quant: "MQ4G128V2",
+            }),
             _ => Err(DispatchError::UnsupportedVariant {
                 family: "gemv",
                 variant: "unknown",
@@ -742,6 +808,11 @@ impl KernelKey {
         match dtype {
             MQ4G256 => Ok(Self::GemvMq4G256Prerotated),
             MQ4G256V2 => Ok(Self::GemvMq4G256V2Prerotated),
+            // qt=52 reuses the qt=44 dispatch key: the LAUNCH arm branches on
+            // w.dtype and selects the LUT kernel (fail-closed on missing LUT).
+            // A distinct key would need full table + test duplication for zero
+            // behavioral difference.
+            MQ4G256V2Lloyd => Ok(Self::GemvMq4G256V2Prerotated),
             MQ4CG256 => Ok(Self::GemvMq4CG256Prerotated),
             MQ5G256V2 => Ok(Self::GemvMq5G256V2Prerotated),
             MQ6G256V2 => Ok(Self::GemvMq6G256V2Prerotated),
@@ -760,6 +831,7 @@ impl KernelKey {
             MFP4G32P => Ok(Self::GemvMfp4G32PPrerotated),
             MFP4G32E8 => Ok(Self::GemvMfp4G32E8Prerotated),
             MFP4G32E8SOA => Ok(Self::GemvMfp4G32E8SoaPrerotated),
+            MFP4G32E8G128 => Ok(Self::GemvMfp4G32E8G128Prerotated),
             // Q8/Paro have no separate "prerotated" kernel: Q8 is not FWHT-rotated
             // (prerotated input == raw input → gemv_q8_0), and Paro's Givens-rotated
             // input feeds the same gemv_hfq4g128 kernel as its Plain path. launch()
@@ -773,6 +845,12 @@ impl KernelKey {
             // Q4K/Q6K/HFQ3G256/HFQ6G256/HFQ2G256/HFP4G32). Rotation-needing dtypes not
             // enumerated above (e.g. MQ4G128 = FwhtG128) MUST NOT fall through — the
             // plain path would re-rotate already-rotated input — so they stay an Err.
+            MQ4G128V2 => Err(DispatchError::UnsupportedVariant {
+                family: "gemv",
+                variant: "mq4g128v2_specialized_route_only",
+                arch: "",
+                quant: "MQ4G128V2",
+            }),
             _ => {
                 if dtype_rotation_plan(dtype) == RotationPlan::None {
                     Self::for_gemv(dtype, GemvVariant::Plain, false)
@@ -796,6 +874,9 @@ impl KernelKey {
             HFQ6G256 => Ok(Self::GemvHfq6G256Residual),
             MQ4G256 => Ok(Self::GemvMq4G256Residual),
             MQ4G256V2 => Ok(Self::GemvMq4G256V2Residual),
+            // qt=52 reuses the qt=44 residual key (launch arm selects the
+            // residual-LUT kernel, fail-closed on missing LUT).
+            MQ4G256V2Lloyd => Ok(Self::GemvMq4G256V2Residual),
             MQ4CG256 => Ok(Self::GemvMq4CG256Residual),
             MQ5G256V2 => Ok(Self::GemvMq5G256V2Residual),
             MQ6G256V2 => Ok(Self::GemvMq6G256V2Residual),
@@ -806,6 +887,12 @@ impl KernelKey {
             MQ6G256 => Ok(Self::GemvMq6G256Residual),
             MQ3G256Lloyd => Ok(Self::GemvMq3G256LloydResidual),
             MQ4G256Lloyd => Ok(Self::GemvMq4G256LloydResidual),
+            MQ4G128V2 => Err(DispatchError::UnsupportedVariant {
+                family: "gemv",
+                variant: "mq4g128v2_specialized_route_only",
+                arch: "",
+                quant: "MQ4G128V2",
+            }),
             _ => Err(DispatchError::UnsupportedVariant {
                 family: "gemv",
                 variant: "residual",
@@ -833,6 +920,17 @@ impl KernelKey {
             MQ6G256 => Ok(Self::GemvMq6G256SwiGLUResidual),
             MQ3G256Lloyd => Ok(Self::GemvMq3G256LloydSwiGLUResidual),
             MQ4G256Lloyd => Ok(Self::GemvMq4G256LloydSwiGLUResidual),
+            MQ4G128V2 => Err(DispatchError::UnsupportedVariant {
+                family: "gemv",
+                variant: "mq4g128v2_specialized_route_only",
+                arch: "",
+                quant: "MQ4G128V2",
+            }),
+            // qt=52 shares the qt=44 key: the SwiGLU-residual variant is a
+            // residual GEMV over caller-supplied silu(gate)*up (already
+            // FWHT-rotated), and the family arm branches on the WEIGHT dtype to
+            // the LUT residual kernel — never the uniform grid.
+            MQ4G256V2Lloyd => Ok(Self::GemvMq4G256V2SwiGLUResidual),
             _ => Err(DispatchError::UnsupportedVariant {
                 family: "gemv",
                 variant: "swiglu_residual",
@@ -862,7 +960,7 @@ impl KernelKey {
             HFQ4G256 | HFQ4G128 | HFQ2G256 | HFQ2G128
             | MQ4G256 | MQ4G128 | MQ2G256 | MQ8G256
             | HFP4G32 | MFP4G32 | MFP4G32Lloyd | MFP4G32P
-            | MFP4G32E8 | MFP4G32E8SOA
+            | MFP4G32E8 | MFP4G32E8SOA | MFP4G32E8G128
             | MFP3G32E8 | MFP2G32E8  // mfpN-E8: same RDNA3/4 gating as MFP4G32E8 via e8_with_wmma
             | ParoQ4G128
             // TQ2G128: ternary GEMV kernel (gemv_tq2g128, Task 9) is a generic
@@ -890,7 +988,11 @@ impl KernelKey {
             // MQ2G256LloydU shares MQ2G256Lloyd's kernels byte-for-byte, so it
             // inherits the identical arch gating.
             MQ2G256Lloyd | MQ2G256LloydU | MQ3G256Lloyd | MQ4G256Lloyd => ArchPredicate::HasWave32,
-            MQ2G256GL | MQ3G256GL | MQ4G256V2 | MQ2G256V2 | MQ3G256V2 | MQ5G256V2 | MQ6G256V2 | MQ4CG256 => ArchPredicate::HasWave32,
+            MQ2G256GL | MQ3G256GL | MQ4G256V2 | MQ4G256V2Lloyd | MQ2G256V2 | MQ3G256V2 | MQ5G256V2 | MQ6G256V2 | MQ4CG256 => ArchPredicate::HasWave32,
+            // qt=53 has a typed Qwen4 implementation, but no generic family
+            // implementation; keep it explicit so it cannot inherit a legacy
+            // MQ4G128 route.
+            MQ4G128V2 => ArchPredicate::Always,
             Q8HFQ | Raw => ArchPredicate::Always,
         }
     }
@@ -908,8 +1010,9 @@ impl KernelKey {
             Prerotated => &[PipelineOp::Gemv],
             WithResidual => {
                 let steps: &[PipelineOp] = match dtype {
-                    MQ4G256 | MQ4G256V2 | MQ2G256V2 | MQ3G256V2 | MQ5G256V2 | MQ6G256V2
-                    | MQ4CG256 | MQ3G256 | MQ5G256 | MQ6G256 | MQ3G256Lloyd | MQ4G256Lloyd => &[
+                    MQ4G256 | MQ4G256V2 | MQ4G256V2Lloyd | MQ2G256V2 | MQ3G256V2 | MQ5G256V2
+                    | MQ6G256V2 | MQ4CG256 | MQ3G256 | MQ5G256 | MQ6G256 | MQ3G256Lloyd
+                    | MQ4G256Lloyd => &[
                         PipelineOp::RotateFwht,
                         PipelineOp::Gemv,
                         PipelineOp::ResidualAdd,
@@ -920,10 +1023,9 @@ impl KernelKey {
             }
             WithSwiGLUResidual => {
                 let steps: &[PipelineOp] = match dtype {
-                    MQ4G256 | MQ4G256V2 | MQ2G256V2 | MQ3G256V2 | MQ5G256V2 | MQ6G256V2
-                    | MQ4CG256 | MQ3G256 | MQ5G256 | MQ6G256 | MQ3G256Lloyd | MQ4G256Lloyd => {
-                        &[PipelineOp::SiluMulRotate, PipelineOp::GemvResidual]
-                    }
+                    MQ4G256 | MQ4G256V2 | MQ4G256V2Lloyd | MQ2G256V2 | MQ3G256V2 | MQ5G256V2
+                    | MQ6G256V2 | MQ4CG256 | MQ3G256 | MQ5G256 | MQ6G256 | MQ3G256Lloyd
+                    | MQ4G256Lloyd => &[PipelineOp::SiluMulRotate, PipelineOp::GemvResidual],
                     _ => &[
                         PipelineOp::SiluMul,
                         PipelineOp::Gemv,
@@ -944,6 +1046,10 @@ pub fn dtype_needs_rotation(dtype: DType) -> bool {
         dtype,
         MQ4G256
             | MQ4G256V2
+            // qt=52 shares qt=44's FWHT-G256 contract exactly (same offline
+            // rotation, same seeds): omitting it leaves x unrotated against
+            // Lloyd weights — silent fluent corruption, not a fault.
+            | MQ4G256V2Lloyd
             | MQ5G256V2
             | MQ6G256V2
             | MQ3G256V2
@@ -987,5 +1093,29 @@ mod tests {
         let k = KernelKey::for_gemv(DType::BQ1G128, GemvVariant::Plain, false)
             .expect("BQ1G128 should resolve to a GEMV kernel key");
         assert_eq!(k, KernelKey::GemvBQ1G128);
+    }
+
+    #[test]
+    fn mq4g256v2lloyd_reuses_v2_keys_never_v1_lloyd() {
+        // qt=52 is the qt=44 container (136 B dual-fp16 groups), NOT the
+        // V1-Lloyd container (160 B groups): aliasing a V1-Lloyd key would
+        // decode every group at the wrong stride — silent noise.
+        assert_eq!(
+            KernelKey::for_gemv_prerotated(DType::MQ4G256V2Lloyd).unwrap(),
+            KernelKey::GemvMq4G256V2Prerotated
+        );
+        assert_eq!(
+            KernelKey::for_gemv_residual(DType::MQ4G256V2Lloyd).unwrap(),
+            KernelKey::GemvMq4G256V2Residual
+        );
+        assert_eq!(
+            KernelKey::for_gemv_swiglu_residual(DType::MQ4G256V2Lloyd).unwrap(),
+            KernelKey::GemvMq4G256V2SwiGLUResidual
+        );
+        assert!(dtype_needs_rotation(DType::MQ4G256V2Lloyd));
+        assert!(
+            KernelKey::gemv_steps(DType::MQ4G256V2Lloyd, GemvVariant::WithResidual)
+                .contains(&PipelineOp::RotateFwht)
+        );
     }
 }

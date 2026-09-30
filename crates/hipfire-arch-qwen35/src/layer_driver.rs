@@ -384,6 +384,9 @@ mod tests {
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
 
@@ -409,6 +412,9 @@ mod tests {
                     row_stride: 0,
                     paro: None,
                     awq_scale: None,
+                    lloyd_lut_e4m3: None,
+                    lloyd_lut_f16: None,
+                    lloyd_lut_c16: None,
                 }
             }
             let (expert_execution_plan, expert_table, expert_binding) =
@@ -483,6 +489,7 @@ mod tests {
         Qwen35Config {
             dim: 1,
             n_layers: 1,
+            i_gpu_start: 0,
             vocab_size: 1,
             norm_eps: 1e-5,
             eos_token: 0,
