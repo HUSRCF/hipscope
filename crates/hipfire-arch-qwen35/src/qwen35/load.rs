@@ -2847,6 +2847,15 @@ impl WeightSource for HfqSource<'_> {
         self.hfq.mq4v2_symmetric()
     }
     fn prepare(&mut self, n_devices: usize) -> HipResult<()> {
+        // Partial GPU offload: this source is where the spilled prefix is
+        // placed, so the MoE / multi-device refusal backstops daemon admission
+        // here, and the residency line prints only once placement is applied.
+        if let Some(refusal) = super::config::offload_topology_refusal(self.c, 1, n_devices) {
+            return Err(HipError::new(0, &refusal));
+        }
+        if let Some(line) = super::config::offload_residency_report(self.c) {
+            eprintln!("{line}");
+        }
         // Keep the mmap alive on discrete GPUs (the carrier cleared
         // `evict_page_cache` there): weight uploads DMA straight out of
         // page-cache pages with no heap staging copy — measured 11–16 GB/s
@@ -3249,9 +3258,20 @@ fn append_betaalpha_to_z(
         }
         rows[start * row_bytes..(start + count) * row_bytes].copy_from_slice(&data);
     }
-    let packed = gpu.upload_raw(&rows, &[rows.len()])?;
+    // Partial offload: a spilled layer's Z lives in host-mapped RAM, and the
+    // folded Z|beta|alpha rows replace it there, so the fold never pulls a
+    // spilled layer back into VRAM. `free_tensor` returns a host-mapped owner
+    // through `hipHostFree`.
+    let host = gpu.host_located(&z.buf);
+    let packed = if host {
+        gpu.upload_raw_host(&rows, &[rows.len()])?
+    } else {
+        gpu.upload_raw(&rows, &[rows.len()])?
+    };
     let old = std::mem::replace(&mut z.buf, packed);
-    if gfx12 {
+    if host {
+        gpu.free_tensor(old)?;
+    } else if gfx12 {
         // The replaced Z (16.7 MB per H2 layer) goes back to HIP, not to the
         // buffer pool, which would otherwise hold it for the process and
         // count against the post-weight KV capacity.

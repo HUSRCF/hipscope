@@ -973,7 +973,7 @@ fn from_config_value(config: &serde_json::Value) -> Result<Qwen35Config, String>
 ///
 /// A resident count above the model's layer count keeps everything on the GPU
 /// (`saturating_sub` saturates). That is not an error, but it is not what was
-/// asked for either, so [`apply_offload_policy`] reports it rather than letting a
+/// asked for either, so [`residency_report`] reports it rather than letting a
 /// configured budget do nothing in silence.
 fn offload_split(n_layers: usize, budget: GpuLayerBudget) -> usize {
     match budget {
@@ -1007,21 +1007,74 @@ fn offload_split(n_layers: usize, budget: GpuLayerBudget) -> usize {
 /// byte-identical to stock. `Layers(n)` is pure arithmetic on `n_layers` and
 /// needs no device measurement, which is why it can be resolved here.
 ///
-/// Infallible. Nothing a user can put in this key fails the load any more; the
-/// cases where a *configured* budget ends up having no effect are reported
-/// instead, because a configured no-op with no log line is what made this knob
-/// confusing. Silence still means exactly one thing — nothing was configured and
-/// every layer is resident — so stock-vs-branch log diffs stay clean.
+/// Infallible, and silent. Config parsing also runs for admission probes and
+/// for topologies that refuse a spill ([`offload_topology_refusal`]), so the
+/// residency line is printed by the single-GPU loader once the placement is
+/// actually applied ([`offload_residency_report`]), not here.
 fn apply_offload_policy(config: &mut Qwen35Config) {
-    use hipfire_config::memory::gpu_layer_budget;
+    config.i_gpu_start = offload_split(config.n_layers, hipfire_config::memory::gpu_layer_budget());
+}
 
-    let budget = gpu_layer_budget();
-    let n_layers = config.n_layers;
-    config.i_gpu_start = offload_split(n_layers, budget);
+/// The load-time residency line for `config`'s resolved placement, for the
+/// single-GPU loader to print when it applies that placement. `None` only for
+/// the unset default (see [`residency_report`]).
+pub fn offload_residency_report(config: &Qwen35Config) -> Option<String> {
+    residency_report(
+        config.n_layers,
+        hipfire_config::memory::gpu_layer_budget(),
+        config.i_gpu_start,
+    )
+}
 
-    if let Some(line) = residency_report(n_layers, budget, config.i_gpu_start) {
-        eprintln!("{line}");
+/// Admission refusal for a partial-offload split the loader cannot honour.
+///
+/// Only the single-GPU dense loader places layers in host RAM. Under tp>1 the
+/// dense-TP and EP rank loaders keep every layer resident, so a configured
+/// spill would be announced and then ignored; under pp>1 the first band's
+/// layers would spill into host RAM mapped by device 0, a path nobody has run;
+/// on a MoE model only the attention and DeltaNet weights would spill while the
+/// expert stacks stay in VRAM. Each is refused before any teardown. `None` when
+/// nothing spills (unset, `auto`, or a budget of at least `n_layers`).
+pub fn offload_topology_refusal(config: &Qwen35Config, tp: usize, pp: usize) -> Option<String> {
+    offload_topology_refusal_for(
+        config.n_layers,
+        config.i_gpu_start,
+        config.num_experts,
+        tp,
+        pp,
+    )
+}
+
+fn offload_topology_refusal_for(
+    n_layers: usize,
+    i_gpu_start: usize,
+    num_experts: usize,
+    tp: usize,
+    pp: usize,
+) -> Option<String> {
+    if i_gpu_start == 0 {
+        return None;
     }
+    let why = if tp > 1 {
+        format!("tp={tp} loads every layer on every rank and never places one in host RAM")
+    } else if pp > 1 {
+        format!(
+            "pp={pp} would place the first pipeline band's spilled layers in host RAM mapped \
+             by device 0, which has never been run"
+        )
+    } else if num_experts > 0 {
+        format!(
+            "this is a MoE model ({num_experts} experts); its expert weights would stay in VRAM \
+             and only the attention and DeltaNet weights would spill"
+        )
+    } else {
+        return None;
+    };
+    Some(format!(
+        "load refused: partial GPU offload (memory.gpu_layer_budget would spill {i_gpu_start} of \
+         {n_layers} layers to host RAM) supports single-GPU dense Qwen3.5 only; {why}. Unset \
+         memory.gpu_layer_budget (HIPFIRE_GPU_LAYER_BUDGET) for this model"
+    ))
 }
 
 /// The load-time residency report for a resolved placement.
@@ -1786,6 +1839,31 @@ mod tests {
         );
         // A model with no layers must not underflow either.
         assert_eq!(offload_split(0, B::Layers(0)), 0, "degenerate model");
+    }
+
+    /// A spill the loader cannot honour (tp>1, pp>1, MoE) is refused; a
+    /// single-GPU dense spill, or any placement that spills nothing, is not.
+    #[test]
+    fn offload_topology_refusal_refuses_only_unhonourable_spills() {
+        // (n_layers, i_gpu_start, num_experts, tp, pp) -> refused?
+        let cases = [
+            ((64, 0, 0, 1, 1), false),
+            ((64, 0, 256, 4, 2), false),
+            ((64, 8, 0, 1, 1), false),
+            ((64, 8, 0, 2, 1), true),
+            ((64, 8, 0, 1, 2), true),
+            ((40, 8, 256, 1, 1), true),
+            ((40, 40, 256, 2, 1), true),
+        ];
+        for ((n, split, experts, tp, pp), refused) in cases {
+            let got = offload_topology_refusal_for(n, split, experts, tp, pp);
+            assert_eq!(
+                got.is_some(),
+                refused,
+                "{:?} -> {got:?}",
+                (n, split, experts, tp, pp)
+            );
+        }
     }
 
     /// Every reported case, offline. The unset default must stay silent, and each

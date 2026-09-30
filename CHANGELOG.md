@@ -114,6 +114,15 @@
 - Architectures without an admitted registry remain hipcc JIT-only; installers do not install unindexed objects for them.
 
 
+### v0.4.0 folded PRs — partial GPU offload, serve discovery, decide endpoint, GGUF hybrid ingest
+
+- **Partial GPU offload for single-GPU dense Qwen3.5 (#793, Avery Drouillard; opt-in, default off).** `memory.gpu_layer_budget` (env `HIPFIRE_GPU_LAYER_BUDGET`) keeps that many layers in VRAM and places the weights of the layers before them in pinned host RAM (`hipHostMalloc` mapped), so a model larger than the card still loads; the KV cache stays in VRAM. `memory.offload_exec` (env `HIPFIRE_OFFLOAD_EXEC`) chooses who multiplies a spilled layer: `pcie` (default) runs the GPU kernels against the host-mapped weights over the link; `cpu` runs those layers' decode GEMVs on the host (new `hipfire-cpu` crate, AVX2 row dots for every dense quant format with a scalar fallback). The TUI Settings easy list gains `GPU layers` and `Offload exec` rows.
+  - Unset (the default) places every layer in VRAM through the same upload calls as before, and no kernel source changes.
+  - A spill is refused at load admission, before the resident model is unloaded, when it cannot be honoured: tp>1 (the dense-TP and EP rank loaders keep every layer resident), pp>1 (the first band would spill into host RAM mapped by device 0, which has never been run) and MoE models (only attention and DeltaNet weights would spill; the expert stacks stay in VRAM). The Qwen3.5 weight source refuses the same cases for every other load path. The `partial offload: N resident / M offloaded` line now prints when the loader applies the placement, not at every config parse.
+  - `memory.offload_exec=cpu` with a spill is not bit-identical to a resident load and runs without a HIP graph. On gfx1201 such a process no longer gets the retained Redline PM4 default, whose tape would skip the host steps; an explicit `replay.backend` other than `hip` is refused at load, as before.
+  - The gfx1201 A4 `Z|beta|alpha` fold of a spilled DeltaNet layer keeps the folded rows in host RAM instead of moving them back to VRAM.
+  - Also from the PR: `Gpu::gemv_mq4g256` no longer passes the FWHT sign tables as kernargs (no product caller used the wrapper), `vmm_tensor_smoke` no longer asserts that a non-granular map size is rejected, and the `dispatch` GPU tests serialize on a module lock.
+
 ### v0.4.0 fixes — serve gateway, generation, Qwen3.8 MTP head, and CI gates
 
 - **Qwen3.8-27B ships an MTP head, and MTP turns on by default when it is present.** Every Qwen3.8-27B trunk tier (`qwen3.8:27b` and the `-mq3*`, `-mq4*`, `-mq5*` and `-mq6*` tags) now declares one shared `mtp` sidecar, `qwen3.8-27b.mtp` (225,716,224 B, sha256 `f0d46d07ded75abc095ebfdbccc167c68418a6515b187bf810395faa460bd32e`). `hipfire pull` fetches it with the trunk. The head is the native `mtp.*` layer of the public `Qwen/Qwen3.8-27B` checkpoint, packed by the in-tree `mtp_extract --quant mq4`; re-extracting it reproduces the file byte for byte. It holds no trunk weights and reuses the trunk's embeddings and `lm_head`, so every tier shares it. The MQ4L tiers and the DFlash drafts declare no head.
