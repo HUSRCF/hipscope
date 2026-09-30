@@ -323,7 +323,7 @@ token 1358 `\n\n\n` for the HOT token 271 `\n\n` on Qwen3.5/3.6 vocab).
 
 - Env: `HIPFIRE_NORMALIZE_PROMPT=0`
 - TUI: `hipfire config set prompt_normalize false`
-- Per-model: `hipfire config qwen3.8:27b-mq4-xt set prompt_normalize false`
+- Per-model: `hipfire config qwen3.8:27b-mq4-xts set prompt_normalize false`
 
 
 **Verify:** see §3 prompt-shape A/B test.
@@ -646,7 +646,7 @@ against the A3B MoE DFlash perfmaxx line.
 | `hipMalloc out of memory` at hidden_rb | Legacy contiguous DFlash (draft declares no window, `HIPFIRE_DFLASH_WINDOW=0`, or CASK eviction active) sizes the draft context structures to the context; long ctx + 27B can exhaust 24 GB | Use the default windowed draft (draft VRAM pinned at W); otherwise lower `HIPFIRE_DFLASH_CTX_CAP` or ctx. KV headroom: `fwht3` is the optional compact mode on every arch |
 | `tok/s` below expected on long-ctx | KV cache growth — prefill is fine but decode slows past ~2K | Test at small ctx first, then scale |
 | daemon doesn't pair a pulled draft | Renamed draft file, or pulled before the sidecar existed | Don't rename files after pull; re-run `hipfire pull <tag>` to fetch the registry-declared sidecar |
-| `[hipfire-daemon] dflash_mode=off — skipping draft load` | Default flipped to `off` in 35265c6 (post-2026-04-26). Pulling a draft does NOT auto-enable DFlash anymore. | `hipfire config set dflash_mode auto` (or `on`); or per-model `hipfire config qwen3.8:27b-mq4-xt set dflash_mode on` |
+| `[hipfire-daemon] dflash_mode=off — skipping draft load` | Default flipped to `off` in 35265c6 (post-2026-04-26). Pulling a draft does NOT auto-enable DFlash anymore. | `hipfire config set dflash_mode auto` (or `on`); or per-model `hipfire config qwen3.8:27b-mq4-xts set dflash_mode on` |
 | "Numbers don't match the README" | Forgot `HIPFIRE_NORMALIZE_PROMPT=1` (pre-2026-04-26) | Now default ON. Pull latest. If you opted out via `prompt_normalize=false`, that overrides the default — flip back. |
 | "27B DFlash regressed 30-40% suddenly" | PR #32 (cleanup-dead-wmma-kernels) on master removed `gemm_hfq4g256_residual_wmma{,2,_k4}.hip` thinking dead. Dispatch fell back to slower variants. | Verify against canonical 199 tok/s @ max=120 with default flags. If kernel files missing in `kernels/src/`, `git checkout` from a known-good commit (see commit 9a2c667 for the full recovery context). |
 | `HIPFIRE_GRAPH=1` reports plausible tok/s but output is garbage | Dangling stack-pointer kernargs from raw `self.hip.launch_kernel(...)` calls in `forward_scratch_layers` (kv_cache_write_*, attention_flash_*, fused_qkv_hfq4g256, rmsnorm_batched, rope_partial_interleaved_f32, gated_delta_net_q8, etc.) — captured pointers dangle past `end_graph_capture` | Bench tok/s alone never proves graph correctness. Always eyeball under `HIPFIRE_GRAPH=1` and run the claim-scoped VALIDATION serve route — never retired coherence-gate scripts as acceptance. Fix: migrate every raw-launch helper used in forward_scratch_layers to `launch_maybe_blob` (model after `conv1d_silu_split_f32_n`). |
@@ -705,7 +705,7 @@ If you want to actively contribute findings, these are open:
 
 ---
 
-*Last updated: 2026-09-30 (0.4.0 cycle: DFlash window default, KV docs; fixture pin: Qwen3.8-27B MQ4XT). When this
+*Last updated: 2026-09-30 (0.4.0 cycle: DFlash window default, KV docs; fixture pin: Qwen3.8-27B MQ4XTS). When this
 doc gets stale (more than 1-2 releases behind HEAD), update it as part of the release PR.*
 
 
