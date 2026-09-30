@@ -178,6 +178,12 @@ pub struct SpecLoadCfg {
     /// `Some(false)` = `off` (skip), `None` = `auto` (load when present,
     /// log-and-AR fallback otherwise).
     pub dflash: Option<bool>,
+    /// DFlash adaptive verify-block (`dflash_adaptive_b`, default false).
+    /// `None` = loader default (off: fixed block). Env `HIPFIRE_DFLASH_ADAPTIVE_B=0`
+    /// forces the fixed full block at build, mirroring
+    /// `HIPFIRE_DSPARK_ADAPTIVE_BLOCK=0`. Mutually exclusive with the
+    /// retained-PM4 verify route (which needs the fixed B=16 shape).
+    pub dflash_adaptive_b: Option<bool>,
 }
 
 /// CASK/TriAttention params forwarded by the CLI at load time.

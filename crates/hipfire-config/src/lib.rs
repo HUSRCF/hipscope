@@ -1170,12 +1170,12 @@ pub static FIELDS: &[ConfigField] = &[
         "dflash_adaptive_b",
         Speculation,
         ModelLoad,
-        DefaultValue::Bool(true),
+        DefaultValue::Bool(false),
         ValueRule::Bool,
         true,
         false,
         None,
-        "Adapt the DFlash block size to observed acceptance."
+        "Opt in to the DFlash trailing-τ adaptive verify-block width (default fixed block)."
     ),
     field!(
         "speculation.dflash",

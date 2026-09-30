@@ -6981,7 +6981,7 @@ fn batch_chunk_delta_net_pre_gdn<'a>(
 /// post-attention/down hooks.
 ///
 /// True only for the frozen fixture route: chain (non-tree) verify on exact
-/// gfx1100, the slice kill switch clear, an MQ4G256V2 residual consumer, a
+/// gfx1100 or exact gfx1201, the slice kill switch clear, an MQ4G256V2 residual consumer, a
 /// `Residual` epilogue, and a verify-block batch `1 <= n <= 16`. Every false
 /// keeps the pre-change path byte-for-byte.
 fn s4_residual_fast(
@@ -6993,7 +6993,7 @@ fn s4_residual_fast(
 ) -> bool {
     fusion == DflashFusionCtx::ChainVerify
         && !gpu.flags.mq_f16_residual_off
-        && gpu.arch_caps.is_gfx1100()
+        && gpu.arch_caps.supports_dflash_f16_residual_fusions()
         && w_dtype == DType::MQ4G256V2
         && matches!(epilogue, BatchEpilogue::Residual)
         && (1..=16).contains(&n)
