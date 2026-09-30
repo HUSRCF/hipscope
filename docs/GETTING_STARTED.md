@@ -4,11 +4,16 @@ Audience: first install on an AMD GPU host. Goal: install → verify → pull a 
 
 ## Prerequisites
 
-- **Linux:** AMD GPU with `/dev/kfd` plus a ROCm HIP development stack.
-  hipfire JIT-compiles kernels, so a runtime-only install is insufficient: the
-  selected ROCm root must provide `lib/libamdhip64.so` (and
-  `libhsa-runtime64.so`), `include/hip/hip_runtime.h`, and `bin/hipcc`.
-  Install a supported AMD ROCm HIP runtime, development headers, and device
+- **Linux:** AMD GPU with `/dev/kfd` plus a ROCm HIP stack. A release-tag
+  install on an admitted GPU (gfx1201, gfx1100, gfx1151, gfx906, gfx942) can
+  use the tag's prebuilt [kernel pack](#prebuilt-kernel-packs) for the kernel
+  registry, and installs with only the HIP runtime (`lib/libamdhip64.so`,
+  `libhsa-runtime64.so`) and `bin/rocm_agent_enumerator`. Kernels outside the
+  registry still JIT on first use. On gfx1201 the registry covers Qwen3.8 H2
+  AR, MTP and DFlash `hipfire run` without a device compiler; other models and
+  routes can still JIT, so running models generally needs hipcc. The selected
+  ROCm root should therefore also provide `include/hip/hip_runtime.h` and
+  `bin/hipcc`. Install a supported AMD ROCm HIP runtime, development headers, and device
   compiler via
   [AMD's live install selector](https://rocm.docs.amd.com/en/latest/install/rocm.html)
   (choose packages for your GPU, OS, and ROCm version — package names drift;
@@ -76,14 +81,78 @@ Use `--tag v0.2.1` when the kind is known, or `--commit <full-sha>` for an
 immutable commit. Fetching a pinned script but omitting the selector installs
 `master`, so keep the two pins together.
 
-The installer detects GPU arch and ROCm, builds the daemon and native CLI,
-then packages exact-source registry kernels with `hipfire-kernel-pack`'s shared
-compiler into `~/.hipfire/bin/kernels/compiled/<arch>/`. Each `.hsaco` requires
-a matching `.index.json`; re-run the installer after upgrading an older install.
+The installer detects GPU arch and ROCm and builds the daemon and native CLI.
+With `--tag` (or a tag-named `--ref`) on an admitted GPU it then installs the
+tag's [prebuilt kernel pack](#prebuilt-kernel-packs); otherwise, or when the
+pack cannot be used, it packages exact-source registry kernels with
+`hipfire-kernel-pack`'s shared compiler. Either way the result is
+`~/.hipfire/bin/kernels/compiled/<arch>/`, where each `.hsaco` requires a
+matching `.index.json`; re-run the installer after upgrading an older install.
 The bin directory can be added to `PATH`; reload the shell afterward.
 
 GPUs not in the admitted registry remain JIT-only and need hipcc at runtime;
 they cannot run with `HIPFIRE_NO_DEVICE_COMPILER=1`.
+
+### Prebuilt kernel packs
+
+Each release tag carries one pack per admitted architecture, built from the
+tag's exact commit by `scripts/build-kernel-pack.sh` (hipcc, no GPU):
+
+| Release asset | Contents |
+|---|---|
+| `hipfire-kernels-<tag>-<arch>.tar.gz` | `manifest.json` and `<arch>/` with every registry module's `.hsaco`, `.hash` and `.index.json` |
+| `hipfire-kernels-<tag>-<arch>.tar.gz.sha256` | `sha256sum` line for the tarball |
+| `hipfire-kernels-<tag>-<arch>.manifest.json` | copy of the manifest: commit, ROCm and HIP version, compiler identity, code-object version, admitted ROCm range |
+
+`install.sh --tag <tag>` (also `--ref <tag>` and `hipfire update --tag <tag>`)
+downloads the pack for the detected arch and installs it only when all of
+these hold; otherwise it says why and compiles locally with hipcc:
+
+- the tarball matches the published SHA-256, and holds only flat regular files;
+- the manifest names the same tag, arch and commit as the checkout, and the
+  runtime's kernel cache ABI;
+- the local ROCm version (`<root>/.info/version`) is inside the manifest's
+  range — by default the build's `major.minor` up to the next major release;
+- a local hipcc, if any, is the same build that compiled the pack (a different
+  one would make the runtime reject and recompile every kernel), and the
+  active hipfire config selects the same kernel flags;
+- every registry module's index matches the checked-out sources, recipe and
+  object bytes, and the directory holds nothing else.
+
+Pass `--compile-kernels` to skip the pack. `--kernel-pack-url` points at another
+directory or URL holding the assets (`https://…`, `file:///…`, or a plain
+path), for mirrors and offline installs:
+
+```bash
+bash install.sh --tag v0.4.0 --kernel-pack-url file:///srv/hipfire-packs/v0.4.0
+```
+
+`hipfire kernel-pack install --tag <tag> --arch <arch> --source ~/.hipfire/src`
+runs the same download and checks on an existing install, for example to
+restore kernels on a machine without hipcc.
+
+Maintainers: the tag-triggered `release-kernel-packs` workflow
+(`.github/workflows/release.yml`) builds every arch in a ROCm dev image and
+attaches the assets to the release. The default image,
+`rocm/dev-ubuntu-26.04:10.0.0-full`, carries the same ROCm 10.0.0 packages
+(HIP 7.15.26333) as the project's GPU hosts, so its packs admit ROCm
+[10.0, 11.0) and install on hosts with that hipcc. A pack only installs where
+the local hipcc, if any, is the build that compiled it; hosts on another ROCm
+compile locally. Repository variables choose another image
+(`HIPFIRE_ROCM_IMAGE`) and, optionally, a wider admitted range
+(`HIPFIRE_PACK_ROCM_MIN` and `HIPFIRE_PACK_ROCM_MAX_EXCLUSIVE`, set both). To
+publish from a local toolchain instead:
+
+```bash
+scripts/build-kernel-pack.sh --tag v0.4.0 --out dist            # every admitted arch
+scripts/build-kernel-pack.sh --tag v0.4.0 --out dist gfx1201    # or a subset
+gh release upload v0.4.0 dist/hipfire-kernels-v0.4.0-*
+```
+
+The script compiles `git archive` of the tag's commit with a fresh `HOME` and
+no `HIPFIRE_*` feature overrides, verifies every index against that toolchain,
+and writes byte-reproducible tarballs. `--rocm-min X.Y --rocm-max-exclusive X.Y`
+declares a range other than the default; it must contain the build's ROCm.
 
 ### Windows — select a branch, tag, or commit
 
@@ -113,10 +182,14 @@ atomically replace the running executable; re-run `install.ps1` with the
 desired selector instead.
 
 Builds `daemon.exe` and the native CLI from the same selected source revision
-under `~\.hipfire\src`; hipcc from the HIP SDK is required to package exact
-registry sources. The installer runs `daemon.exe --precompile` to produce
-indexed packages in `~\.hipfire\bin\kernels\compiled\<arch>\`. Re-run
-`install.ps1` after upgrading: copying bare `.hsaco` files is insufficient.
+under `~\.hipfire\src`. With `-Tag` (or a tag-named `-Ref`) on an admitted GPU
+the installer runs `hipfire kernel-pack install` for the tag's
+[prebuilt kernel pack](#prebuilt-kernel-packs) (`-KernelPackUrl` overrides the
+download location, `-CompileKernels` skips it). Otherwise, or when the pack
+cannot be used, hipcc from the HIP SDK packages exact registry sources: the
+installer runs `daemon.exe --precompile` to produce indexed packages in
+`~\.hipfire\bin\kernels\compiled\<arch>\`. Re-run `install.ps1` after
+upgrading: copying bare `.hsaco` files is insufficient.
 
 Unsupported GPU architectures likewise require hipcc JIT at runtime; the
 installer does not copy bare checkout objects into the installed cache.

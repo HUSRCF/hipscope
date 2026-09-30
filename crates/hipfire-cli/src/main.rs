@@ -50,6 +50,7 @@ use std::{
 
 mod bench_concurrency;
 mod serve;
+mod kernel_pack;
 mod setup;
 use crate::serve::complete::next_attempt_id;
 use crate::serve::http::request_id;
@@ -124,6 +125,8 @@ pub(crate) enum Commands {
     Update(UpdateArgs),
     /// Install or repair this machine's hipfire runtime.
     Setup(SetupArgs),
+    /// Install a prebuilt release kernel pack (no device compiler needed).
+    KernelPack(KernelPackArgs),
     /// Quantize a Hugging Face or local model with the Rust quantizer.
     Quantize(QuantizeArgs),
     // lifecycle: deprecated since 0.4.0, removal 0.5.0 — CASK/TriAttention KV eviction is unsupported research; use compact kv_cache modes
@@ -247,6 +250,7 @@ struct SetupArgs {
     #[arg(long, short = 'y', visible_alias = "non-interactive")]
     yes: bool,
     /// Requested revision ref forwarded by scripts/install.sh for install.json.
+    /// A tag-named ref also selects that release's kernel pack.
     #[arg(
         long = "ref",
         value_name = "REF",
@@ -262,12 +266,57 @@ struct SetupArgs {
         conflicts_with_all = ["tag", "commit"]
     )]
     branch: Option<String>,
-    /// Requested tag forwarded by scripts/install.sh for install.json.
+    /// Requested tag forwarded by scripts/install.sh for install.json; also
+    /// selects that release's prebuilt kernel pack.
     #[arg(long, value_name = "TAG", hide = true, conflicts_with = "commit")]
     tag: Option<String>,
     /// Requested commit forwarded by scripts/install.sh for install.json.
     #[arg(long, value_name = "SHA", hide = true)]
     commit: Option<String>,
+    /// Compile kernels locally with hipcc even when a release kernel pack exists.
+    #[arg(long)]
+    compile_kernels: bool,
+    /// Directory or URL (https://, file://, or a path) holding the release
+    /// kernel pack assets. Default: the tag's GitHub release downloads.
+    #[arg(long, value_name = "URL")]
+    kernel_pack_url: Option<String>,
+}
+
+#[derive(Args, Debug)]
+struct KernelPackArgs {
+    #[command(subcommand)]
+    action: KernelPackAction,
+}
+
+#[derive(Subcommand, Debug)]
+enum KernelPackAction {
+    /// Download, verify and install the pack for TAG and ARCH.
+    Install(KernelPackInstallArgs),
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct KernelPackInstallArgs {
+    /// Release tag whose pack to install.
+    #[arg(long)]
+    tag: String,
+    /// GPU architecture, e.g. gfx1201.
+    #[arg(long, value_name = "ARCH")]
+    arch: String,
+    /// Source checkout the installed daemon was built from; its HEAD must be
+    /// the pack's commit.
+    #[arg(long, value_name = "PATH")]
+    source: PathBuf,
+    /// Installed kernel directory to replace.
+    /// Default: ~/.hipfire/bin/kernels/compiled/ARCH.
+    #[arg(long, value_name = "DIR")]
+    dest: Option<PathBuf>,
+    /// Directory or URL holding the release assets. Default: the tag's GitHub release.
+    #[arg(long, value_name = "URL")]
+    url: Option<String>,
+    /// Local ROCm version checked against the pack's supported range.
+    /// Default: the resolved ROCm root's .info/version.
+    #[arg(long, value_name = "VERSION")]
+    rocm_version: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -755,6 +804,9 @@ fn run() -> Result<()> {
         Some(Commands::Version(output)) => version_command(&paths, output),
         Some(Commands::Update(args)) => update_command(&paths, args),
         Some(Commands::Setup(args)) => setup_command(&paths, args),
+        Some(Commands::KernelPack(args)) => match args.action {
+            KernelPackAction::Install(args) => kernel_pack::install_command(&paths, args),
+        },
         Some(Commands::Quantize(args)) => quantize_command(&paths, args),
         Some(Commands::SidecarGen(args)) => sidecar_command(&paths, args),
         Some(Commands::Run(args)) => run_command(&paths, args),

@@ -20802,14 +20802,6 @@ impl Gpu {
             "gemm_mq4g256v2_residual_mmq_iu4_gfx11_symfold";
         const GRIDSPEC_SYMFOLD_MODULE: &str =
             "gemm_mq4g256v2_residual_mmq_iu4_gridspec_symfold";
-        const GRIDSPEC_SYMFOLD_SRC: &str = concat!(
-            "#define IU4_SYMMETRIC_FOLD 1\n",
-            include_str!("../../../kernels/src/block_i4_128_quant.hip"),
-            include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_iu4.gfx11.hip"),
-            include_str!(
-                "../../../kernels/src/gemm_mq4g256v2_residual_mmq_iu4_gridspec.gfx11.hip"
-            )
-        );
         let (module, source) = if x5 {
             (
                 "gemm_mq4g256v2_residual_mmq_iu4_gfx11_x5_symfold",
@@ -20817,7 +20809,10 @@ impl Gpu {
             )
         } else {
             match (gridspec, symfold) {
-                (true, true) => (GRIDSPEC_SYMFOLD_MODULE, GRIDSPEC_SYMFOLD_SRC),
+                (true, true) => (
+                    GRIDSPEC_SYMFOLD_MODULE,
+                    kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GRIDSPEC_SYMFOLD_SRC,
+                ),
                 (true, false) => (GRIDSPEC_MODULE, GRIDSPEC_SRC),
                 (false, true) => (
                     SYMFOLD_MODULE,

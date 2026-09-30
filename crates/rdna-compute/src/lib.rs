@@ -25,6 +25,7 @@ mod gemma4_ext;
 mod gemma4_ops;
 pub mod gemv;
 pub mod graph;
+pub mod kernel_pack;
 pub mod kernel_registry;
 mod kernels;
 pub mod kv_slots;
