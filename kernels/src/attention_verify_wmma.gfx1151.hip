@@ -70,9 +70,19 @@ typedef float __attribute__((ext_vector_type(4))) vw_float4;
 #define VW_RSRC 0x31004000u
 
 // LDS-only workgroup barrier: keeps in-flight global prefetches in flight.
+// Each wave waits for its own LDS stores (lgkmcnt(0), vmcnt/expcnt left
+// open: gfx11 s_waitcnt 0xFC07) before it signals the barrier. The LDS-only
+// release fence alone emits no wait (the memory legalizer assumes one total
+// LDS order), but in WGP mode a workgroup's waves span both CUs and their
+// LDS request queues are not ordered against each other, so another wave's
+// read after the barrier could overtake a store still queued. That lost the
+// K tile store of the S launch's loop (1 of 1,200 launches in a two-process
+// stress; never serial or on one CU).
+#define VW_WAIT_LGKM0 0xFC07
 #define VW_LDS_BARRIER()                                                   \
     do {                                                                   \
         __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");   \
+        __builtin_amdgcn_s_waitcnt(VW_WAIT_LGKM0);                         \
         __builtin_amdgcn_s_barrier();                                      \
         __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");   \
     } while (0)
