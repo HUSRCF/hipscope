@@ -91,11 +91,11 @@ Values and defaults below match `hipfire-config`, the native CLI, and/or `Runtim
 
 | Variable | Default / sense | Source |
 |---|---|---|
-| `HIPFIRE_KV_MODE` | From config; **`auto` → registry `default_kv_mode` else Qwen-family Q8/Q8 — except single-GPU Qwen on exact gfx1201, where `auto`/unset means native `fp8`** (stage-b FA2 arithmetic; explicit `--kv-mode q8` still honored). Non-Qwen families keep their own defaults (Maple BF16, Gemma layered, DeepSeek compressor). | CLI / pair resolver; **not** a legacy hard-coded fwht-per-arch table |
+| `HIPFIRE_KV_MODE` | From config; **`auto` → registry non-q8 `default_kv_mode`, else Qwen-family native `fp8` on exact gfx1201 when native-eligible (H24/Hkv4/D256, single GPU, no adaptive/CASK), else Qwen Q8/Q8** (gfx1100, gfx1151 and every other load; explicit `--kv-mode q8` still honored). `fwht2`/`fwht3`/`fwht4` are optional headroom modes that `auto` does not select (only the kill switch below does); `asymN`/`turboN` are legacy spellings (Qwen aliases of `fwhtN`). Non-Qwen families keep their own defaults (Maple BF16, Gemma layered, DeepSeek compressor). | CLI / pair resolver; **not** a legacy hard-coded fwht-per-arch table |
 | `HIPFIRE_KV_ADAPTIVE` | off unless set / param | Loader/CLI |
 | `HIPFIRE_KV_PHYSICAL_CAP` | optional physical slot cap | Daemon |
 | `HIPFIRE_KV_V` | **developer-only** V-axis override (e.g. `lloyd2`/`lloyd3`/`lloyd4`); **lower precedence** than an authored `--kv-v` or `memory.kv_v` | Qwen carrier (`developer_var`); not a second user config plane — prefer CLI/TOML |
-| `HIPFIRE_QWEN_KV_DEFAULT_Q8` | default **ON** (implicit Qwen Q8/Q8 off gfx1201). **`=0`** is the emergency kill switch: restores the prior *implicit* HFQ/PaRo defaults on non-gfx1201 (HFQ/PaRo `"auto"` → FWHT3/Q8; PaRo raw unset stays Q8). Does **not** override authored `--kv-mode`/`--kv-k`/`--kv-v` or `memory.kv_*`, native gfx1201 fp8, or non-Qwen families. | Loader admission (`qwen_default_q8_enabled`); sampled once per load |
+| `HIPFIRE_QWEN_KV_DEFAULT_Q8` | default **ON** (implicit Qwen Q8/Q8 wherever `auto` does not pick native fp8). **`=0`** is the emergency kill switch: restores the prior *implicit* HFQ/PaRo defaults on every load that does not get native fp8, gfx1201 included (HFQ `auto`/unset and PaRo `"auto"` → FWHT3/Q8; PaRo raw unset stays Q8). Does **not** override authored `--kv-mode`/`--kv-k`/`--kv-v` or `memory.kv_*`, native gfx1201 fp8, or non-Qwen families. | Loader admission (`qwen_default_q8_enabled`); sampled once per load |
 | `HIPFIRE_ATTN_FLASH` | from `flash_mode` (`auto`/`always`/`never`) | CLI → daemon |
 | `HIPFIRE_NORMALIZE_PROMPT` | on unless `0`/`false`/`off`/`no` | `RuntimeConfig` |
 | `HIPFIRE_PROMPT_TOKEN_HEAT=1` | dump BPE heat | RuntimeConfig |
@@ -110,8 +110,8 @@ Values and defaults below match `hipfire-config`, the native CLI, and/or `Runtim
 | `HIPFIRE_SPECULATION` | `off`/`auto`/`ngram`/`dflash`/`mtp`/`dspark` | Canonical selector |
 | `HIPFIRE_DFLASH_DRAFT` | explicit draft path (overrides the registry sidecar); empty opts out | Legacy `developer.dflash_draft` read; still appears in legacy gate scripts. |
 | `HIPFIRE_VISION_SIDECAR` | explicit vision-tower sidecar path (overrides `params.vision`); empty opts out | Daemon load; validated at admission (arch 5\|6 + tower tensor), loaded by the Qwen35 carrier |
-| `HIPFIRE_DFLASH_CTX_CAP` | **8192**; `0` restores uncapped legacy behavior | Caps draft-side context storage; over-cap requests fall back to AR |
-| `HIPFIRE_DFLASH_WINDOW` | **0 / unset** (legacy), unless declared by draft metadata | Enables bounded draft SWA; refused with CASK eviction |
+| `HIPFIRE_DFLASH_WINDOW` | **unset → the draft artifact's declared `sliding_window`** (DFlash2 drafts: all layers sliding; DFlash drafts declaring n−1 sliding + last full: SWA on layers 0..n−2, last layer full). `<rows>` overrides (warns on mismatch); **`0` forces legacy contiguous** | Windowed draft context: draft VRAM pins at W and past-W requests degrade τ instead of falling back to AR. Legacy contiguous applies only when the draft declares no window, `HIPFIRE_DFLASH_WINDOW=0`, or CASK eviction is active |
+| `HIPFIRE_DFLASH_CTX_CAP` | **8192**; `0` = uncapped | **Legacy contiguous mode only** (no draft window, `HIPFIRE_DFLASH_WINDOW=0`, or CASK eviction): caps draft-side context storage; over-cap requests fall back to AR. Ignored when the draft runs windowed |
 | `HIPFIRE_DFLASH_MODE` | RuntimeConfig default **`off`** | Distinct from config `dflash_mode` apply path — product CLI also uses load params |
 | `HIPFIRE_DFLASH_NGRAM_BLOCK` | set/clear from config | |
 | `HIPFIRE_DFLASH_ADAPTIVE_B` | unused; `0` forces the fixed full block | Overrides an enabled `dflash_adaptive_b` load param/setting (default `false`, fixed block). Adaptive is also auto-suppressed on retained-PM4 verify loads (replay needs the fixed B=16 shape). |

@@ -364,7 +364,7 @@ the prefill MMQ redesign log is at
 | [IMAGEGEN.md](docs/IMAGEGEN.md) | FLUX.1 / FLUX.2 Klein image generation — local test guide |
 | [BENCHMARKS.md](docs/BENCHMARKS.md) | Measured perf per arch, vs ollama |
 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | Engine layout, dispatch, two model paths |
-| [QUANTIZATION.md](docs/QUANTIZATION.md) | MQ4 / HF4 design, asym KV cache, FWHT math |
+| [QUANTIZATION.md](docs/QUANTIZATION.md) | MQ4 / HF4 design, KV cache modes (q8 / fp8 / fwht; legacy asym), FWHT math |
 | [CONTAINER.md](docs/CONTAINER.md) | Runtime and GPU gate-runner containers |
 | [multi-gpu.md](docs/multi-gpu.md) | Pipeline-parallel (pp≥2) — memory budget, deployment, refusals |
 | [methodology/perf-benchmarking.md](docs/methodology/perf-benchmarking.md) | Bench protocol — read before claiming a perf win |

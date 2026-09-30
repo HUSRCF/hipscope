@@ -278,7 +278,7 @@ model's contract still accepts the named-cap route):
 
 | Key | Default | Validated values |
 |---|---|---|
-| `kv_cache` | `"auto"` | `auto`, `q8`, `asym4`, `asym3`, `asym2`, `fwht4`, `fwht3`, `fwht2`, `turbo`, `turbo4`, `turbo3`, `turbo2`, `fp8`, `bf16` (family-dependent) |
+| `kv_cache` | `"auto"` | `auto`, `q8`, `fp8`, `bf16`, `fwht4`, `fwht3`, `fwht2`, `f32`/`f16` (DeepSeek V4 only); legacy spellings `asym4`, `asym3`, `asym2`, `turbo`, `turbo4`, `turbo3`, `turbo2` (family-dependent; see below) |
 | `kv_k` | empty (unset) | Qwen-only: `q8`, `fwht2`–`fwht4`, `asym2`–`asym4`, `turbo`/`turbo2`–`turbo4`, `legacy-asym2`–`legacy-asym4` |
 | `kv_v` | empty (unset) | Qwen-only: `q8`, `lloyd2`–`lloyd4` |
 | `kv_adaptive` | `"off"` | `off`, `conservative`, `balanced`, `aggressive`, or `advanced:k=<fwht4\|fwht3\|fwht2>,v=<lloyd4\|lloyd3\|lloyd2>` |
@@ -299,9 +299,24 @@ pair; see the native override refusal below.
 - `fwht2` \| `fwht3` \| `fwht4` → signed FWHT K at that bit width
 - `asym2` \| `asym3` \| `asym4` and `turbo` \| `turbo2` \| `turbo3` \| `turbo4`
   → **FWHT** K (`turbo` ≡ `fwht3`, `turboN`/`asymN` ≡ `fwhtN`). These are
-  not the old Givens-Asym constructors.
+  legacy spellings kept as aliases; they do not build the old Givens-Asym
+  constructors. Write `fwhtN` in new configs.
 - `legacy-asym2` \| `legacy-asym3` \| `legacy-asym4` → old Givens-Asym K
-  (explicit rollback spelling)
+  (**legacy**; explicit rollback spelling, `--kv-k` / `memory.kv_k` only —
+  `memory.kv_cache` does not accept it)
+
+`fwht3` (and `fwht2`/`fwht4`) is an optional **headroom** mode on the
+Qwen3.5-family sites of every arch: it shrinks K to trade quality for
+context/VRAM. No default selects it (only the developer kill switch below).
+
+Qwen3 dense (flat constructor) accepts only `q8` K plus `legacy-asym3` /
+`legacy-asym4` at head_dim 256; bare `asymN`/`turboN`/`fwhtN` are refused.
+Outside Qwen, the llama-family **HFQ** loader keeps the pre-migration alias
+table: bare `asym3`/`asym4`/`turbo4` still build the legacy Givens
+constructors, while `asym2`/`turbo2`/`turbo`/`turbo3`/`fwhtN` are unsupported
+and fall back to `q8` with a warning. The llama **Dir** loader reads names
+through the Qwen table, so bare `asymN`/`turboN` mean FWHT there and fall back
+to `q8` with a warning.
 
 **Qwen V names:** `q8`, `lloyd2`, `lloyd3`, `lloyd4`. Lloyd V **requires**
 FWHT K (including `asymN`/`turboN` aliases that resolve to FWHT). Lloyd V
@@ -321,23 +336,30 @@ FWHT/Lloyd-V; and explicit native FP8/BF16 on unsupported arch/PP all fail
 **before** destructive teardown with requested/effective values and
 supported alternatives. No silent fallback on unsupported Qwen sites.
 
-**Resolution of `auto` / unset (Qwen family):** Q8/Q8 on every route
-(HFQ, PaRo, PP, Dir) except exact **gfx1201** eligible single-GPU sites
-whose accepted set includes native FP8, which select FP8/FP8. Qwen PP/Dir
-without an FP8 constructor stay Q8/Q8. gfx1200 / gfx11 / gfx94x never
-inherit FP8. Registry Qwen cards leave mode as `auto` (no q8 pin).
+**Resolution of `auto` / unset (Qwen family):** native **fp8** (one K+V
+layout) on exact **gfx1201** when the load is native-eligible: attention
+geometry H24 / Hkv4 / D256, single GPU (`pp = tp = 1`), no `kv_adaptive`,
+no CASK sidecar. Every other Qwen load resolves **q8/q8**: gfx1100, gfx1151
+and every other arch; gfx1201 with a different geometry, with adaptive or
+CASK, or on PP / dense TP / MoE EP (those policies have no native
+constructor); and Qwen3 dense (flat constructor). gfx1200 / gfx11 / gfx94x
+never inherit fp8. Registry Qwen cards leave mode as `auto` (a registry
+`default_kv_mode = "q8"` is not lowered into config).
 
 **Non-Qwen families are unchanged:** Maple keeps BF16/BF16 (registry and
 direct-path auto; explicit `--kv-mode q8` still works). Gemma4 eager stays
-Q8/Q8; lowered stays sliding Q8 / full Asym3+Q8. DeepSeek4 keeps its F32
+Q8/Q8; lowered hard-codes sliding Q8 plus a full-attention tier in legacy
+Givens Asym3 + Q8 V and ignores `kv_cache`. DeepSeek4 keeps its F32
 compressor default (or explicit F16); V is not independently selectable
-there. Other carriers keep their existing site policy.
+there. Other carriers keep their existing site policy (llama, MiniMax and
+LFM2-MoE resolve `auto` to q8).
 
-**Kill switch:** `HIPFIRE_QWEN_KV_DEFAULT_Q8=0` restores the prior
-*implicit Qwen* per-site default (HFQ/PaRo auto distinctions). Default is
-ON (Q8/Q8). It must not override any authored CLI/config mode or K/V, must
-not touch the exact eligible gfx1201 FP8 path, and must not affect
-non-Qwen families.
+**Kill switch:** `HIPFIRE_QWEN_KV_DEFAULT_Q8=0` (developer variable) restores
+the prior *implicit Qwen* per-site default wherever `auto` does not pick
+native fp8: HFQ `auto`/unset → FWHT3 K + Q8 V, PaRo `auto` → FWHT3/Q8,
+PaRo unset → Q8/Q8, other sites Q8/Q8. Default is ON (Q8/Q8). It must not
+override any authored CLI/config mode or K/V, must not touch the eligible
+gfx1201 fp8 path, and must not affect non-Qwen families.
 
 **Precedence** (each key independently — mode, K, V, backend):
 
@@ -572,7 +594,7 @@ runtime PFlash module — not restated here.
 | `serve.allow_request_pull` | `false` | bool. Let a chat request that names a registry model not on disk download it; off → 404 "run `hipfire pull`". Env: `HIPFIRE_SERVE_ALLOW_REQUEST_PULL`. |
 | `serve.allow_request_paths` | `false` | bool. Let a chat request load any readable file it names; off → only installed models (models directory, catalog paths, the pre-warm model). Env: `HIPFIRE_SERVE_ALLOW_REQUEST_PATHS`. |
 | `experimental_budget_alert` | `false` | bool |
-| `serve.multi_slot` | `false` | Serve concurrent requests on the multi-slot engine instead of one at a time. |
+| `serve.multi_slot` | `false` | Serve concurrent requests on the multi-slot engine instead of one at a time. Needs `memory.kv_cache = "q8"` set explicitly: the slot engine refuses every other value, including the default `auto`. |
 | `serve.multi_slot_slots` | `4` | int 1–64 concurrent slots. |
 | `serve.multi_slot_ctx` | `8192` | int 512–1048576 per-slot context capacity (tokens). |
 | `serve.multi_slot_prefill_chunk` | `1024` | int 1–1048576. Prefill tokens taken from one slot per multi-slot step; batch scratch is sized `n_slots ×` this. Env: `HIPFIRE_SERVE_MULTI_SLOT_PREFILL_CHUNK`. |

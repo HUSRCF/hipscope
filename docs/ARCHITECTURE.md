@@ -379,12 +379,14 @@ accepted sets differ by carrier). Concrete modes include:
 | Mode | Role (summary) |
 |---|---|
 | `q8` | Q8_0 K and V |
-| `asym2` / `asym3` / `asym4` | Lower-bit rotated/Lloyd K; V typically wider |
-| `fwht2` / `fwht3` / `fwht4` | FWHT-rotated K tiers |
+| `fp8` / `bf16` | Native K+V layout (`fp8`: Qwen single-GPU; `bf16`: Qwen quality-control arm, Maple default) |
+| `fwht2` / `fwht3` / `fwht4` | FWHT-rotated K tiers + Q8 V; optional headroom modes |
+| `asym2` / `asym3` / `asym4` | **Legacy** Givens-rotated Lloyd K + Q8 V. On Qwen the bare names alias `fwhtN`; the Givens constructors need `legacy-asymN` |
 
-**Qwen-family `auto` / unset** (arch-aware, Qwen only): targets **q8/q8** on
-every arch except exact `gfx1201`, where eligible single-GPU Qwen routes keep
-native **fp8/fp8**. Non-Qwen family defaults are unchanged (Maple BF16, DeepSeek
+**Qwen-family `auto` / unset** (arch-aware, Qwen only): native **fp8/fp8** on
+exact `gfx1201` when the load is native-eligible (H24/Hkv4/D256, single GPU,
+no adaptive, no CASK); **q8/q8** everywhere else, gfx1100 and gfx1151
+included. Non-Qwen family defaults are unchanged (Maple BF16, DeepSeek
 compressor F32, Gemma layered policy, …). Full K/V axis overrides (`--kv-k` /
 `--kv-v`) and precedence live in [`CONFIG.md`](CONFIG.md) / [`CLI.md`](CLI.md).
 
