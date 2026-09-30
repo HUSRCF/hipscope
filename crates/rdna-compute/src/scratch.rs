@@ -207,6 +207,14 @@ pub struct ScratchState {
     pub paro_fused_scratch: Option<Vec<GpuTensor>>,
     pub fp16_x_scratch: Option<DeviceBuffer>,
     pub fp16_x_scratch_bytes: usize,
+    /// Global score rows for the QSA block selector when an arena's pooled
+    /// block count exceeds its dynamic-LDS row (contexts past 61,440 tokens):
+    /// `QSA_SELECT_GLOBAL_ROWS` rows of the arena's padded block count.
+    pub qsa_select_scores: Option<DeviceBuffer>,
+    pub qsa_select_scores_bytes: usize,
+    /// F32 dequantization of one Q8 GDN state for the chunked prefill route.
+    pub gdn_state_f32: Option<DeviceBuffer>,
+    pub gdn_state_f32_bytes: usize,
     pub fp16_x_source_ptr: *mut c_void,
     pub fp8_x_scratch: Option<DeviceBuffer>,
     pub fp8_x_scratch_bytes: usize,
@@ -522,6 +530,16 @@ fn grow_scratch_buffer(
     *slot = Some(fresh);
     *have_bytes = needed;
     Ok(())
+}
+
+/// [`grow_scratch_buffer`] for slots owned outside this module's helpers.
+pub(crate) fn grow_scratch_slot(
+    hip: &HipRuntime,
+    slot: &mut Option<DeviceBuffer>,
+    have_bytes: &mut usize,
+    needed: usize,
+) -> HipResult<()> {
+    grow_scratch_buffer(hip, slot, have_bytes, needed)
 }
 
 /// True when [`grow_scratch_buffer`] would replace the slot: the early-return

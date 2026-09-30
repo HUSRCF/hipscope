@@ -24,6 +24,7 @@ use hipfire_dispatch::pipeline::{
 };
 use hipfire_dispatch::types::DispatchError;
 use hipfire_runtime::spec::SpecGrammar;
+use rdna_compute::tensor_ops::QsaKvFormat;
 use rdna_compute::{DType, Gpu, GpuTensor};
 use smallvec::SmallVec;
 use std::fmt;
@@ -1237,6 +1238,8 @@ impl Qwen4MtpGpu {
                 k_norm: qsa.k_norm,
                 output: qsa.output,
                 state: IndexedAttentionState {
+                    // The one MTP layer keeps the exact F32 QSA state.
+                    format: QsaKvFormat::F32,
                     full_keys: &state.full_keys,
                     full_values: &state.full_values,
                     raw_index_keys: &state.raw_index_keys,
@@ -1514,7 +1517,8 @@ mod tests {
             return;
         };
         let config = compact_test_config();
-        let mut target = Qwen4State::new(&mut gpu, &config, 8).expect("compact target state");
+        let mut target = Qwen4State::new(&mut gpu, &config, 8, crate::state::Qwen4StateFormat::F32)
+            .expect("compact target state");
         let mut mtp = MtpGpuState::new(&mut gpu, &config, 8).expect("compact MTP state");
         let target_recurrent_size = target.gdn[0].recurrent.byte_size();
         let mut target_bytes = vec![0u8; target_recurrent_size];

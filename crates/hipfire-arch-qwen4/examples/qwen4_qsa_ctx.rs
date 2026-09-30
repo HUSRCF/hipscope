@@ -40,6 +40,7 @@ use hipfire_runtime::hfq::{HfqFile, HfqModelSource};
 use hipfire_runtime::model_source::{ModelSource as _, SourcePayload};
 use hipfire_runtime::tokenizer::Tokenizer;
 use hipfire_runtime::weight_store::{fulfill_manifest_from_payloads, WeightOrigin};
+use rdna_compute::tensor_ops::QsaKvFormat;
 use rdna_compute::{DType, Gpu, GpuTensor};
 use serde_json::{json, Value};
 use std::cmp::Ordering;
@@ -53,13 +54,90 @@ fn err(e: impl std::fmt::Debug) -> String {
     format!("{e:?}")
 }
 
+/// `len` bytes of `tensor` from byte `offset`.
+fn read_bytes(gpu: &Gpu, tensor: &GpuTensor, offset: usize, len: usize) -> Result<Vec<u8>> {
+    let mut bytes = vec![0u8; len];
+    gpu.hip
+        .memcpy_dtoh(&mut bytes, &tensor.buf.byte_view(offset, len))
+        .map_err(err)?;
+    Ok(bytes)
+}
+
+/// `len` values of an F32 or BF16 index arena from element `offset`, as F32
+/// (the BF16 arenas hold the values the F32 ones do, already BF16-rounded).
+fn read_index(gpu: &Gpu, tensor: &GpuTensor, offset: usize, len: usize) -> Result<Vec<f32>> {
+    match tensor.dtype {
+        DType::F32 => read_f32(gpu, tensor, offset, len),
+        DType::BF16 => Ok(read_bytes(gpu, tensor, offset * 2, len * 2)?
+            .chunks_exact(2)
+            .map(|b| f32::from_bits((u16::from_le_bytes([b[0], b[1]]) as u32) << 16))
+            .collect()),
+        other => Err(format!("unexpected index arena dtype {other:?}")),
+    }
+}
+
+fn f16_bits_to_f32(bits: u16) -> f32 {
+    let sign = if bits & 0x8000 != 0 { -1.0f32 } else { 1.0 };
+    let exp = ((bits >> 10) & 0x1f) as i32;
+    let man = (bits & 0x3ff) as f32;
+    match exp {
+        0 => sign * man * 2f32.powi(-24),
+        31 => if man == 0.0 { sign * f32::INFINITY } else { f32::NAN },
+        _ => sign * (1.0 + man / 1024.0) * 2f32.powi(exp - 15),
+    }
+}
+
+fn e4m3_to_f32(code: u8) -> f32 {
+    let sign = if code & 0x80 != 0 { -1.0f32 } else { 1.0 };
+    let exp = ((code >> 3) & 0xf) as i32;
+    let man = (code & 7) as f32;
+    if exp == 15 && code & 7 == 7 {
+        return f32::NAN;
+    }
+    if exp == 0 {
+        sign * man / 8.0 * 2f32.powi(-6)
+    } else {
+        sign * (1.0 + man / 8.0) * 2f32.powi(exp - 7)
+    }
+}
+
+/// `count` K or V rows from token `start`, dequantized to F32 per the QSA
+/// state format (`QsaKvFormat` row layouts).
+fn read_kv_rows(
+    gpu: &Gpu,
+    tensor: &GpuTensor,
+    format: QsaKvFormat,
+    start: usize,
+    count: usize,
+    kv_heads: usize,
+    head_dim: usize,
+) -> Result<Vec<f32>> {
+    let row_bytes = format.kv_row_bytes(kv_heads, head_dim);
+    let bytes = read_bytes(gpu, tensor, start * row_bytes, count * row_bytes)?;
+    let width = kv_heads * head_dim;
+    let mut out = Vec::with_capacity(count * width);
+    for row in bytes.chunks_exact(row_bytes) {
+        match format {
+            QsaKvFormat::F32 => out.extend(row.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))),
+            QsaKvFormat::Fp8 => {
+                let (codes, scales) = row.split_at(width);
+                for head in 0..kv_heads {
+                    let scale = f16_bits_to_f32(u16::from_le_bytes([scales[2 * head], scales[2 * head + 1]]));
+                    out.extend(codes[head * head_dim..(head + 1) * head_dim].iter().map(|&c| e4m3_to_f32(c) * scale));
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
 fn read_f32(gpu: &Gpu, tensor: &GpuTensor, offset: usize, len: usize) -> Result<Vec<f32>> {
     gpu.download_f32(&tensor.sub_offset(offset, len)).map_err(err)
 }
 
-/// `len` bytes of a byte-addressed Raw tensor from byte `offset`.
+/// `len` elements of `tensor` from element `offset`, as raw bytes.
 fn read_raw(gpu: &Gpu, tensor: &GpuTensor, offset: usize, len: usize) -> Result<Vec<u8>> {
-    let mut bytes = vec![0u8; len];
+    let mut bytes = vec![0u8; len * tensor.dtype.size()];
     gpu.hip
         .memcpy_dtoh(&mut bytes, &tensor.sub_offset(offset, len).buf)
         .map_err(err)?;
@@ -169,19 +247,37 @@ struct Probe {
     /// Per slot: pooled blocks already checked this session.
     pooled_checked: Vec<usize>,
     wmma_dense: bool,
+    /// Teacher-forced decode rows after the prefill (the prefill's final row
+    /// is `ctx - decode`).
+    decode: usize,
 }
 
 impl Probe {
     fn sampled(&self, rows: usize, start: usize, r: usize) -> bool {
         let visible = start + r + 1;
         rows == 1
-            || r + 1 == rows
+            || visible + self.decode == self.ctx
             || visible % self.stride == 0
             || (visible > 2048 && visible <= 2052)
     }
 
     fn tap(&mut self, gpu: &mut Gpu, slot: usize, op: &IndexedAttentionOp<'_>) -> Result<()> {
+        let waited = Instant::now();
         gpu.hip.device_synchronize().map_err(err)?;
+        let gpu_s = waited.elapsed().as_secs_f64();
+        let started = Instant::now();
+        let result = self.tap_inner(gpu, slot, op);
+        let cpu_s = started.elapsed().as_secs_f64();
+        if gpu_s > 5.0 || cpu_s > 5.0 {
+            eprintln!(
+                "[slow tap] ctx {} slot {slot} rows {} position {} gpu wait {gpu_s:.1}s tap {cpu_s:.1}s",
+                self.ctx, op.rows, op.state.position
+            );
+        }
+        result
+    }
+
+    fn tap_inner(&mut self, gpu: &mut Gpu, slot: usize, op: &IndexedAttentionOp<'_>) -> Result<()> {
         let n = op.rows;
         let start = op.state.position;
         let end = start + n;
@@ -199,7 +295,7 @@ impl Probe {
             self.pooled_checked.resize(slot + 1, 0);
         }
         if self.k_norm[slot].is_none() {
-            let bytes = read_raw(gpu, op.indexer_k_norm, 0, dim * 2)?;
+            let bytes = read_raw(gpu, op.indexer_k_norm, 0, dim)?;
             self.k_norm[slot] = Some(
                 bytes
                     .chunks_exact(2)
@@ -207,12 +303,12 @@ impl Probe {
                     .collect(),
             );
         }
-        let pooled = read_f32(gpu, op.state.pooled_keys, 0, blocks_end.max(1) * dim)?;
 
         // Pooled arena vs a CPU pool of the GPU's raw keys (new blocks only).
         let first = self.pooled_checked[slot].min(blocks_end);
         if first < blocks_end {
-            let raw = read_f32(
+            let pooled_new = read_index(gpu, op.state.pooled_keys, first * dim, (blocks_end - first) * dim)?;
+            let raw = read_index(
                 gpu,
                 op.state.raw_index_keys,
                 first * compress * dim,
@@ -238,7 +334,7 @@ impl Probe {
                     .map_err(err)?;
                 for c in 0..dim {
                     let cpu = bf16_round(value[c]);
-                    let gpu_value = pooled[block * dim + c];
+                    let gpu_value = pooled_new[(block - first) * dim + c];
                     let diff = (cpu - gpu_value).abs();
                     max_abs = max_abs.max(diff);
                     max_rel = max_rel.max(diff / cpu.abs().max(1.0e-3));
@@ -257,8 +353,7 @@ impl Probe {
         if sampled.is_empty() {
             return Ok(());
         }
-        let keys = read_f32(gpu, op.state.full_keys, 0, end * kv_width)?;
-        let values = read_f32(gpu, op.state.full_values, 0, end * kv_width)?;
+        let pooled = read_index(gpu, op.state.pooled_keys, 0, blocks_end.max(1) * dim)?;
         let route = if n == 1 {
             "per_head"
         } else if self.wmma_dense && n >= 512 && blocks_end <= budget_blocks && end <= capacity {
@@ -314,12 +409,29 @@ impl Probe {
             let qgate = read_f32(gpu, op.qgate_scratch, r * 2 * q_width, 2 * q_width)?;
             let gpu_out = read_f32(gpu, op.qsa_output, r * q_width, q_width)?;
             let selected: Vec<usize> = gpu_row.iter().filter(|&&t| t >= 0).map(|&t| t as usize).collect();
+            // Gather only the selected K/V rows (contiguous runs), in order.
+            let (mut keys, mut values) = (Vec::with_capacity(selected.len() * kv_width), Vec::with_capacity(selected.len() * kv_width));
+            let mut i = 0;
+            while i < selected.len() {
+                let mut j = i + 1;
+                while j < selected.len() && selected[j] == selected[j - 1] + 1 {
+                    j += 1;
+                }
+                let (start_token, count) = (selected[i], j - i);
+                if start_token + count > visible {
+                    return Err(format!("selected token {} past visible {visible}", start_token + count - 1));
+                }
+                keys.extend(read_kv_rows(gpu, op.state.full_keys, op.state.format, start_token, count, op.kv_heads, op.head_dim)?);
+                values.extend(read_kv_rows(gpu, op.state.full_values, op.state.format, start_token, count, op.kv_heads, op.head_dim)?);
+                i = j;
+            }
+            let compact: Vec<usize> = (0..selected.len()).collect();
             let mut cpu_out = vec![0.0f32; q_width];
             ops::qsa_attention(
                 &qgate,
-                &keys[..visible * kv_width],
-                &values[..visible * kv_width],
-                &selected,
+                &keys,
+                &values,
+                &compact,
                 op.heads,
                 op.kv_heads,
                 op.head_dim,
@@ -384,7 +496,12 @@ fn main() -> Result<()> {
         .unwrap_or_else(|| vec![2048, 4096, 8192, 16384, 32768]);
     let stride: usize = args.get(5).map(|s| s.parse().unwrap()).unwrap_or(256);
     let decode: usize = args.get(6).map(|s| s.parse().unwrap()).unwrap_or(4);
-    let n_ctx = contexts.iter().copied().max().unwrap_or(2048) + 64;
+    // Room for the 24 greedy tokens after the largest context, within the
+    // model's native 262,144 positions.
+    let n_ctx = (contexts.iter().copied().max().unwrap_or(2048) + 64).min(262_144);
+    if contexts.iter().any(|&c| c + 24 > n_ctx) {
+        return Err(format!("a context leaves no room for 24 greedy tokens in {n_ctx}"));
+    }
 
     let mut hfq = HfqFile::open(path).map_err(err)?;
     let tokenizer = Tokenizer::from_hfq_metadata(&hfq.metadata_json).map_err(err)?;
@@ -397,6 +514,12 @@ fn main() -> Result<()> {
     }
     #[allow(unused_mut)]
     let mut weights = receipt.manifest.weights.clone();
+    if let Some(hipfire_arch_qwen4::expert_residency::ExpertVramLayers::Layers(vram_layers)) =
+        hipfire_arch_qwen4::expert_residency::expert_vram_layers_from_env().map_err(err)?
+    {
+        let moved = hipfire_arch_qwen4::expert_residency::place_routed_experts(&mut weights, vram_layers);
+        eprintln!("routed experts: layers 0..{vram_layers} in VRAM, {moved} tensors host-mapped");
+    }
     let mesh = DeviceMesh::single().map_err(err)?;
     let expected = WeightOrigin::for_single(&mesh, &gpu);
     let source = HfqModelSource::from_hfq(hfq);
@@ -424,6 +547,17 @@ fn main() -> Result<()> {
     )
     .map_err(err)?;
     let vocab = receipt.config.vocab_size;
+    // The shipped state formats for this device (HIPFIRE_KV_MODE /
+    // HIPFIRE_STATE_QUANT; `bf16` + `fp32` is the exact reference arm).
+    let state_format = hipfire_arch_qwen4::resolve_state_format(
+        &hipfire_runtime::config::get().kv_mode,
+        &std::env::var("HIPFIRE_STATE_QUANT").unwrap_or_default(),
+        &gpu,
+        &receipt.config,
+    )
+    .map_err(err)?;
+    let qsa_format = state_format.qsa;
+    eprintln!("state format qsa={} gdn={}", qsa_format.name(), state_format.gdn.name());
     let mut bundle = Qwen4Bundle::assemble_with_metadata(
         receipt.config,
         transaction,
@@ -431,6 +565,7 @@ fn main() -> Result<()> {
         &mut gpu,
         n_ctx,
         receipt.ple,
+        state_format,
     )
     .map_err(err)?;
     bundle.attach_forward(&mut gpu, n_ctx).map_err(err)?;
@@ -445,10 +580,12 @@ fn main() -> Result<()> {
         rows: Vec::new(),
         k_norm: Vec::new(),
         pooled_checked: Vec::new(),
+        decode,
         wmma_dense: gpu.arch_caps.has_wmma_w32()
             && std::env::var("HIPFIRE_QWEN4_F16_WMMA").map_or(true, |v| v.trim() != "0"),
     }));
     let mut out = std::fs::File::create(out_path).map_err(err)?;
+    let run_start = Instant::now();
 
     for &ctx in &contexts {
         if tokens.len() < ctx {
@@ -466,12 +603,15 @@ fn main() -> Result<()> {
         let tap_probe = Arc::clone(&probe);
         let tap: Qwen4QsaTap = Box::new(move |gpu, slot, op| tap_probe.lock().unwrap().tap(gpu, slot, op));
         bundle.set_qsa_tap(Some(tap)).map_err(err)?;
+        let phase = |name: &str| eprintln!("[phase] ctx {ctx} {name} at {:.1}s", run_start.elapsed().as_secs_f64());
+        phase("tapped prefill");
         let t = Instant::now();
         bundle
             .forward_chunk_final(&mut gpu, &prompt[..ctx - decode], &logits, None)
             .map_err(err)?;
         let tapped_prefill_s = t.elapsed().as_secs_f64();
         probe.lock().unwrap().phase = "decode";
+        phase("tapped decode");
         for &token in &prompt[ctx - decode..] {
             bundle.forward_token(&mut gpu, token, &logits, None).map_err(err)?;
         }
@@ -482,11 +622,16 @@ fn main() -> Result<()> {
         // Untapped: all-prefill of the same tokens.
         bundle.reset(&mut gpu).map_err(err)?;
         gpu.hip.device_synchronize().map_err(err)?;
+        phase("untapped prefill");
         let t = Instant::now();
         bundle.forward_chunk_final(&mut gpu, prompt, &logits, None).map_err(err)?;
         gpu.hip.device_synchronize().map_err(err)?;
         let prefill_s = t.elapsed().as_secs_f64();
         let prefill_logits = gpu.download_f32(&logits).map_err(err)?;
+        // Final-row logits of the all-prefill route, for cross-arm KL (e.g.
+        // compressed QSA state against the F32 reference).
+        let bytes: Vec<u8> = prefill_logits.iter().flat_map(|v| v.to_le_bytes()).collect();
+        std::fs::write(format!("{out_path}.logits-{ctx}.f32"), bytes).map_err(err)?;
         let max_diff = decode_logits
             .iter()
             .zip(&prefill_logits)
@@ -501,6 +646,7 @@ fn main() -> Result<()> {
         // Greedy continuation from the all-prefill state.
         let mut generated = Vec::new();
         let mut next = argmax(&prefill_logits) as u32;
+        phase("greedy");
         let t = Instant::now();
         for _ in 0..24 {
             generated.push(next);
@@ -510,6 +656,8 @@ fn main() -> Result<()> {
         let decode_tok_s = 24.0 / t.elapsed().as_secs_f64();
         let summary = json!({
             "kind": "logits", "ctx": ctx, "decode_rows": decode,
+            "qsa_format": qsa_format.name(),
+            "gdn_format": state_format.gdn.name(),
             "max_abs_diff": max_diff, "kl_prefill_decode": kl,
             "argmax_prefill": argmax(&prefill_logits), "argmax_decode": argmax(&decode_logits),
             "top5_overlap": top5_overlap,

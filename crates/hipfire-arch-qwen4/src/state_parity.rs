@@ -71,9 +71,9 @@ type Families = BTreeMap<String, Value>;
 
 pub fn run_compact(gpu: &mut Gpu) -> Result<Value, String> {
     let config = compact_test_config();
-    let mut ar = Qwen4State::new(gpu, &config, MAX_SEQ)
+    let mut ar = Qwen4State::new(gpu, &config, MAX_SEQ, crate::state::Qwen4StateFormat::F32)
         .map_err(|error| format!("allocate compact AR state: {error}"))?;
-    let mut native = match Qwen4State::new(gpu, &config, MAX_SEQ) {
+    let mut native = match Qwen4State::new(gpu, &config, MAX_SEQ, crate::state::Qwen4StateFormat::F32) {
         Ok(state) => state,
         Err(error) => {
             let _ = ar.free_gpu(gpu);
@@ -1509,6 +1509,7 @@ fn run_profile_inner(
         &mut gpu,
         1,
         metadata,
+        crate::state::Qwen4StateFormat::F32,
     )
     .map_err(|error| format!("qwen4 bundle assembly failed: {error}"))?;
     let assemble_ns = profile_duration_ns(assemble_started);
@@ -1788,6 +1789,7 @@ pub fn run_state_parity(
         &mut gpu,
         2048,
         metadata,
+        crate::state::Qwen4StateFormat::F32,
     )
     .map_err(|error| format!("qwen4 bundle assembly failed: {error}"))?;
     let real = (|| {

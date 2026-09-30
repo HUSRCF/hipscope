@@ -304,13 +304,12 @@ impl Carrier for Qwen4Carrier {
             || spec.ngram_draft.is_some_and(|enabled| enabled)
             || qwen4_ddtree_requested(spec)
             || options.cask
-            || options.state_quant
             || options.non_single_compute
             || options.expert_count_override
             || options.pflash
         {
             return Err(
-                "qwen4: requested DFlash, DSpark, n-gram, DDTree, adaptive-KV, EAGLE, CASK, state-quant, PFlash, or DeepSeek4/non-Single option is unsupported"
+                "qwen4: requested DFlash, DSpark, n-gram, DDTree, adaptive-KV, EAGLE, CASK, PFlash, or DeepSeek4/non-Single option is unsupported"
                     .into(),
             );
         }
@@ -443,12 +442,35 @@ impl Carrier for Qwen4Carrier {
                 );
             }
         }
-        // Context-sized QSA arenas (trunk layers plus the MTP head's), named
-        // in the refusal when they do not fit.
+        // The state formats (memory.kv_cache for QSA, state_quant for GDN),
+        // resolved before any allocation.
+        let state_format = hipfire_arch_qwen4::resolve_state_format(
+            &kv_mode_from_ctx(ctx),
+            ctx.state_quant_override.unwrap_or(""),
+            ctx.gpu,
+            &config,
+        )?;
+        let qsa_format = state_format.qsa;
+        eprintln!(
+            "  qwen4 state: QSA {} K/V, GDN {} recurrent",
+            match qsa_format {
+                hipfire_arch_qwen4::QsaKvFormat::Fp8 => "fp8",
+                hipfire_arch_qwen4::QsaKvFormat::F32 => "bf16 (exact F32 state)",
+            },
+            state_format.gdn.name()
+        );
+        // Context-sized QSA arenas (trunk layers in `qsa_format`, plus the MTP
+        // head's, which stays F32), named in the refusal when they do not fit.
         let context_state_mib = config
-            .qsa_context_arena_bytes(ctx.max_seq)
-            .map(|bytes| bytes * (config.n_full_layers() + usize::from(native_mtp)) >> 20)
-            .unwrap_or(usize::MAX);
+            .qsa_context_arena_bytes(ctx.max_seq, qsa_format)
+            .and_then(|trunk| trunk.checked_mul(config.n_full_layers()))
+            .zip(if native_mtp {
+                config.qsa_context_arena_bytes(ctx.max_seq, hipfire_arch_qwen4::QsaKvFormat::F32)
+            } else {
+                Some(0)
+            })
+            .and_then(|(trunk, mtp)| trunk.checked_add(mtp))
+            .map_or(usize::MAX, |bytes| bytes >> 20);
         let mesh = DeviceMesh::single().map_err(|error| format!("qwen4: mesh: {error}"))?;
         let expected = WeightOrigin::for_single(&mesh, ctx.gpu);
         let source = HfqModelSource::from_hfq(hfq);
@@ -486,6 +508,7 @@ impl Carrier for Qwen4Carrier {
             ctx.gpu,
             ctx.max_seq,
             metadata,
+            state_format,
         )
         .map_err(|error| {
             format!(

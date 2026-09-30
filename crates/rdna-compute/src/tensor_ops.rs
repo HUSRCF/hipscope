@@ -31,9 +31,29 @@ const QSA_SELECT_DYNAMIC_LDS_LIMIT_BYTES: usize = 64 * 1024;
 /// Static LDS of `indexed_attention_select_f32_batched` beside its dynamic
 /// score row: 256 radix bins and the 512-entry chosen-block list
 /// (`QSA_SELECT_LIST_CAPACITY` in tensor_ops.hip) plus scalars, rounded up.
-/// The parallel route needs `shape_blocks * 4 + this` within the LDS limit,
-/// i.e. at most 15360 pooled blocks (61440 tokens at compress 4).
+/// The LDS route needs `shape_blocks * 4 + this` within the LDS limit, i.e. at
+/// most 15360 pooled blocks (61440 tokens at compress 4); larger arenas keep
+/// their score rows in global memory.
 pub const QSA_SELECT_BATCHED_STATIC_LDS_BYTES: usize = 4 * 1024;
+/// Rows per launch of the batched selector when its scores live in global
+/// memory (arenas past the LDS row); longer batches launch in groups, so the
+/// score scratch is `QSA_SELECT_GLOBAL_ROWS * padded blocks` floats.
+const QSA_SELECT_GLOBAL_ROWS: usize = 256;
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only: route the batched selector to its serial oracle kernel.
+    static SELECT_FORCE_SERIAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+#[cfg(test)]
+fn select_forced_serial() -> bool {
+    SELECT_FORCE_SERIAL.with(|flag| flag.get())
+}
+#[cfg(not(test))]
+#[inline(always)]
+fn select_forced_serial() -> bool {
+    false
+}
 const QSA_ATTENTION_PARALLEL_THREADS: u32 = 256;
 const QSA_ATTENTION_LDS_BYTES_PER_ROW: usize = 8; // F32 score + i32 token.
 const QSA_ATTENTION_DYNAMIC_LDS_LIMIT_BYTES: usize = 64 * 1024;
@@ -112,18 +132,83 @@ pub(crate) fn blocks(elements: usize) -> HipResult<u32> {
     )
 }
 
+/// Storage format of a GDN recurrent state (`kernels/src/tensor_ops.hip`,
+/// "Q8 GDN recurrent state"); the launchers read it from the state tensor's
+/// dtype.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum GdnStateFormat {
+    /// F32 `[value_head][key][value]`: the exact reference.
+    F32,
+    /// Qwen3.5's Q8 DeltaNet state as one Raw byte slot: per value head 128
+    /// rows (value channel) of 128 i8 key-channel codes, then one F32 scale
+    /// per row. 128x128 heads only.
+    Q8,
+}
+
+impl GdnStateFormat {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::F32 => "f32",
+            Self::Q8 => "q8",
+        }
+    }
+
+    pub const fn supports(self, key_dim: usize, value_dim: usize) -> bool {
+        match self {
+            Self::F32 => key_dim > 0 && value_dim > 0,
+            Self::Q8 => key_dim == 128 && value_dim == 128,
+        }
+    }
+
+    pub const fn dtype(self) -> DType {
+        match self {
+            Self::F32 => DType::F32,
+            Self::Q8 => DType::Raw,
+        }
+    }
+
+    /// `dtype` units (F32 elements or bytes) of one state of `value_heads`
+    /// heads of `key_dim x value_dim`.
+    pub const fn state_units(self, value_heads: usize, key_dim: usize, value_dim: usize) -> usize {
+        match self {
+            Self::F32 => value_heads * key_dim * value_dim,
+            Self::Q8 => value_heads * value_dim * (key_dim + 4),
+        }
+    }
+
+    pub const fn state_bytes(self, value_heads: usize, key_dim: usize, value_dim: usize) -> usize {
+        match self {
+            Self::F32 => self.state_units(value_heads, key_dim, value_dim) * 4,
+            Self::Q8 => self.state_units(value_heads, key_dim, value_dim),
+        }
+    }
+
+    /// The format of a state tensor (F32, or a Raw Q8 slot).
+    pub fn of(state: &GpuTensor) -> HipResult<Self> {
+        match state.dtype {
+            DType::F32 => Ok(Self::F32),
+            DType::Raw => Ok(Self::Q8),
+            _ => Err(HipError::new(0, &ComputeError::WrongDtype.to_string())),
+        }
+    }
+}
+
 pub struct GatedDeltaStep<'a> {
     pub q: &'a GpuTensor,
     pub k: &'a GpuTensor,
     pub v: &'a GpuTensor,
     pub gate: &'a GpuTensor,
     pub beta: &'a GpuTensor,
+    /// F32, or a Q8 slot ([`GdnStateFormat`]).
     pub state: &'a GpuTensor,
     pub output: &'a GpuTensor,
     pub key_heads: usize,
     pub value_heads: usize,
     pub key_dim: usize,
     pub value_dim: usize,
+    /// The token's position: seeds a Q8 state's requantization (declared to
+    /// the recorder, so a replayed decode reseeds per position).
+    pub position: usize,
 }
 
 /// Head-pair arrival counters of the fused GDN step's optional rotation.
@@ -174,26 +259,26 @@ fn gated_delta_step_launch(
     gated: Option<&GatedDeltaGate<'_>>,
     rotate_into: Option<&GpuTensor>,
 ) -> HipResult<()> {
-    for tensor in [p.q, p.k, p.v, p.gate, p.beta, p.state, p.output] {
+    let format = GdnStateFormat::of(p.state)?;
+    for tensor in [p.q, p.k, p.v, p.gate, p.beta, p.output] {
         ensure_f32(tensor)?;
     }
     if p.key_heads == 0
         || p.value_heads == 0
         || p.value_heads % p.key_heads != 0
-        || p.key_dim == 0
-        || p.value_dim == 0
+        || !format.supports(p.key_dim, p.value_dim)
     {
         return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
     }
     let key_elements = checked_product(p.key_heads, p.key_dim, "GDN key extent")?;
     let value_elements = checked_product(p.value_heads, p.value_dim, "GDN value extent")?;
-    let state_elements = checked_product(value_elements, p.key_dim, "GDN state extent")?;
+    checked_product(value_elements, p.key_dim, "GDN state extent")?;
     if p.q.numel() != key_elements
         || p.k.numel() != key_elements
         || p.v.numel() != value_elements
         || p.gate.numel() != p.value_heads
         || p.beta.numel() != p.value_heads
-        || p.state.numel() != state_elements
+        || p.state.numel() != format.state_units(p.value_heads, p.key_dim, p.value_dim)
         || p.output.numel() != value_elements
     {
         return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
@@ -204,11 +289,15 @@ fn gated_delta_step_launch(
     let value_dim = checked_i32(p.value_dim, "GDN value width")?;
     let value_heads_grid = checked_u32(p.value_heads, "GDN value-head grid")?;
     let value_dim_grid = blocks(p.value_dim)?;
-    let shared_norm128 =
-        gpu.arch_caps.has_gfx11_plus_simt() && p.key_dim == 128 && p.value_dim == 128;
-    let kernel = match (gated, shared_norm128) {
-        (Some(_), true) => "gated_delta_step_gate_norm128_gfx1151",
-        (None, true) => "gated_delta_step_shared_norm128_gfx1151",
+    let q8 = format == GdnStateFormat::Q8;
+    // The Q8 kernels are the 128x128 bodies on the dequantized state.
+    let shared_norm128 = q8
+        || gpu.arch_caps.has_gfx11_plus_simt() && p.key_dim == 128 && p.value_dim == 128;
+    let kernel = match (gated, shared_norm128, q8) {
+        (Some(_), _, true) => "gated_delta_step_gate_norm128_q8",
+        (None, _, true) => "gated_delta_step_norm128_q8",
+        (Some(_), true, false) => "gated_delta_step_gate_norm128_gfx1151",
+        (None, true, false) => "gated_delta_step_shared_norm128_gfx1151",
         _ => "gated_delta_step_f32",
     };
     let block_x = if shared_norm128 { 128 } else { 256 };
@@ -259,6 +348,14 @@ fn gated_delta_step_launch(
             args.push_ptr(ptr);
         }
     }
+    let mut frame_binding = None;
+    if q8 {
+        args.push_u32(checked_u32(p.position, "GDN Q8 frame")?);
+        frame_binding = Some([crate::replay::ReplayKernargBinding::PositionPlusU32 {
+            offset: args.len() - 4,
+            addend: 0,
+        }]);
+    }
     args.pad_to(16);
     gpu.launch_blob_recorded(
         kernel,
@@ -266,7 +363,13 @@ fn gated_delta_step_launch(
         [block_x, 1, 1],
         0,
         args.as_mut_slice(),
-        crate::dispatch::ReplayLaunchBindings::NONE,
+        match &frame_binding {
+            Some(bindings) => crate::dispatch::ReplayLaunchBindings {
+                grid: None,
+                kernargs: bindings,
+            },
+            None => crate::dispatch::ReplayLaunchBindings::NONE,
+        },
     )
 }
 /// Persistent row-batched GDN recurrence for the exact 128x128 geometry.
@@ -278,11 +381,12 @@ pub struct GatedDeltaStepBatched<'a> {
     pub projection: &'a GpuTensor,
     pub gate: &'a GpuTensor,
     pub beta: &'a GpuTensor,
+    /// F32, or a Q8 slot ([`GdnStateFormat`]).
     pub state: &'a GpuTensor,
     pub output: &'a GpuTensor,
-    /// Optional `[rows, state]` F32: the recurrent state after the last row
-    /// lands in slot `rows - 1` instead of updating `state` (speculative
-    /// verify; `state` keeps the pre-call value).
+    /// Optional `[rows]` ring of states in `state`'s format: the recurrent
+    /// state after the last row lands in slot `rows - 1` instead of updating
+    /// `state` (speculative verify; `state` keeps the pre-call value).
     pub row_states: Option<&'a GpuTensor>,
     pub rows: usize,
     pub qkv_width: usize,
@@ -290,10 +394,14 @@ pub struct GatedDeltaStepBatched<'a> {
     pub value_heads: usize,
     pub key_dim: usize,
     pub value_dim: usize,
+    /// The first row's position; a Q8 state's requantization is seeded by
+    /// the last row's.
+    pub position: usize,
 }
 
 pub fn gated_delta_step_batched(gpu: &mut Gpu, p: &GatedDeltaStepBatched<'_>) -> HipResult<()> {
-    for tensor in [p.projection, p.gate, p.beta, p.state, p.output] {
+    let format = GdnStateFormat::of(p.state)?;
+    for tensor in [p.projection, p.gate, p.beta, p.output] {
         ensure_f32(tensor)?;
     }
     if p.rows == 0
@@ -315,15 +423,15 @@ pub fn gated_delta_step_batched(gpu: &mut Gpu, p: &GatedDeltaStepBatched<'_>) ->
     let rows_qkv = checked_product(p.rows, expected_qkv, "GDN batched projection extent")?;
     let rows_value = checked_product(p.rows, value, "GDN batched output extent")?;
     let rows_heads = checked_product(p.rows, p.value_heads, "GDN batched parameter extent")?;
-    let state_elements = checked_product(value, p.key_dim, "GDN batched state extent")?;
+    let state_units = format.state_units(p.value_heads, p.key_dim, p.value_dim);
     if p.qkv_width != expected_qkv
         || p.projection.numel() != rows_qkv
         || p.gate.numel() != rows_heads
         || p.beta.numel() != rows_heads
-        || p.state.numel() != state_elements
+        || p.state.numel() != state_units
         || p.output.numel() != rows_value
         || p.row_states.is_some_and(|states| {
-            states.dtype != DType::F32 || states.numel() < p.rows * state_elements
+            states.dtype != p.state.dtype || states.numel() < p.rows * state_units
         })
     {
         return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
@@ -335,10 +443,11 @@ pub fn gated_delta_step_batched(gpu: &mut Gpu, p: &GatedDeltaStepBatched<'_>) ->
     let key_dim = checked_i32(p.key_dim, "GDN batched key width")?;
     let value_dim = checked_i32(p.value_dim, "GDN batched value width")?;
     let value_heads_grid = checked_u32(p.value_heads, "GDN batched value-head grid")?;
-    let kernel = if p.row_states.is_some() {
-        "gated_delta_step_halves_state128_persistent256_capture_f32"
-    } else {
-        "gated_delta_step_halves_state128_persistent256_f32"
+    let kernel = match (p.row_states.is_some(), format) {
+        (true, GdnStateFormat::F32) => "gated_delta_step_halves_state128_persistent256_capture_f32",
+        (false, GdnStateFormat::F32) => "gated_delta_step_halves_state128_persistent256_f32",
+        (true, GdnStateFormat::Q8) => "gated_delta_step_halves_state128_persistent256_capture_q8",
+        (false, GdnStateFormat::Q8) => "gated_delta_step_halves_state128_persistent256_q8",
     };
     gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel)?;
     let mut args = KernargBlob::new();
@@ -355,6 +464,9 @@ pub fn gated_delta_step_batched(gpu: &mut Gpu, p: &GatedDeltaStepBatched<'_>) ->
     args.push_i32(key_dim);
     args.push_i32(value_dim);
     args.push_f32((p.key_dim as f32).sqrt().recip());
+    if format == GdnStateFormat::Q8 {
+        args.push_u32(checked_u32(p.position + p.rows - 1, "GDN Q8 frame")?);
+    }
     args.pad_to(16);
     gpu.launch_blob_recorded(
         kernel,
@@ -367,13 +479,15 @@ pub fn gated_delta_step_batched(gpu: &mut Gpu, p: &GatedDeltaStepBatched<'_>) ->
 }
 
 /// Few-row verify rollback of every GDN layer in one launch (kernel
-/// `gated_delta_rollback_layers_f32`): `table` is `layers` pairs of device
-/// pointers (captured recurrence input, state ring); each layer re-runs its
-/// first `keep` of `rows` captured rows from ring slot `from` and leaves the
-/// last kept row's state in slot `to + keep - 1`. 128-wide heads.
+/// `gated_delta_rollback_layers_{f32,q8}`): `table` is `layers` pairs of
+/// device pointers (captured recurrence input, ring of `format` states);
+/// each layer re-runs its first `keep` of `rows` captured rows from ring
+/// slot `from` and leaves the last kept row's state in slot
+/// `to + keep - 1`. 128-wide heads.
 pub struct GatedDeltaRollbackLayers<'a> {
     pub table: &'a GpuTensor,
     pub discard: &'a GpuTensor,
+    pub format: GdnStateFormat,
     pub layers: usize,
     pub rows: usize,
     pub keep: usize,
@@ -382,6 +496,8 @@ pub struct GatedDeltaRollbackLayers<'a> {
     pub qkv_width: usize,
     pub key_heads: usize,
     pub value_heads: usize,
+    /// Position of the last kept row: seeds a Q8 state's requantization.
+    pub position: usize,
 }
 
 pub fn gated_delta_rollback_layers(
@@ -399,7 +515,10 @@ pub fn gated_delta_rollback_layers(
     {
         return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
     }
-    let kernel = "gated_delta_rollback_layers_f32";
+    let kernel = match p.format {
+        GdnStateFormat::F32 => "gated_delta_rollback_layers_f32",
+        GdnStateFormat::Q8 => "gated_delta_rollback_layers_q8",
+    };
     gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel)?;
     let mut args = KernargBlob::new();
     args.push_ptr(p.table.buf.as_ptr());
@@ -416,6 +535,9 @@ pub fn gated_delta_rollback_layers(
         args.push_i32(checked_i32(value, label)?);
     }
     args.push_f32(128f32.sqrt().recip());
+    if p.format == GdnStateFormat::Q8 {
+        args.push_u32(checked_u32(p.position, "GDN Q8 frame")?);
+    }
     args.pad_to(16);
     gpu.launch_blob_recorded(
         kernel,
@@ -460,7 +582,8 @@ pub fn gated_delta_step_gate_wmma(
     if !gated_delta_chunk_route(gpu, p) || p.projection.dtype != DType::BF16 {
         return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
     }
-    for tensor in [p.gate, p.beta, p.state, gate.z] {
+    let format = GdnStateFormat::of(p.state)?;
+    for tensor in [p.gate, p.beta, gate.z] {
         ensure_f32(tensor)?;
     }
     // The gated output is BF16-rounded: stored as BF16 bits or F32.
@@ -474,7 +597,7 @@ pub fn gated_delta_step_gate_wmma(
         || p.projection.numel() < p.rows * p.qkv_width
         || p.gate.numel() < p.rows * p.value_heads
         || p.beta.numel() < p.rows * p.value_heads
-        || p.state.numel() != value * p.key_dim
+        || p.state.numel() != format.state_units(p.value_heads, p.key_dim, p.value_dim)
         || gate.rows != p.rows
         || gate.value_heads != p.value_heads
         || gate.value_dim != p.value_dim
@@ -518,11 +641,26 @@ pub fn gated_delta_step_gate_wmma(
         args.as_mut_slice(),
         crate::dispatch::ReplayLaunchBindings::NONE,
     )?;
+    // A Q8 state runs the chunk on its F32 dequantization (the state scratch)
+    // and is requantized from it after the chunk, seeded by the last row.
+    let state = match format {
+        GdnStateFormat::F32 => p.state.buf.as_ptr(),
+        GdnStateFormat::Q8 => {
+            let scratch = gpu.gdn_state_f32_scratch(
+                GdnStateFormat::F32.state_bytes(p.value_heads, p.key_dim, p.value_dim),
+            )?;
+            gdn_state_convert(gpu, "gdn_state_q8_to_f32", p.state.buf.as_ptr(), scratch, p.value_heads, None)?;
+            scratch
+        }
+    };
     let mut args = KernargBlob::new();
     args.push_ptr(p.projection.buf.as_ptr());
     args.push_ptr(qp);
     args.push_ptr(kp);
-    for tensor in [p.gate, p.beta, p.state, gate.z, gate.norm, gate.output] {
+    args.push_ptr(p.gate.buf.as_ptr());
+    args.push_ptr(p.beta.buf.as_ptr());
+    args.push_ptr(state);
+    for tensor in [gate.z, gate.norm, gate.output] {
         args.push_ptr(tensor.buf.as_ptr());
     }
     args.push_i32(rows);
@@ -536,6 +674,41 @@ pub fn gated_delta_step_gate_wmma(
         "gated_delta_chunk_gate_wmma",
         [checked_u32(p.value_heads, "GDN chunk head grid")?, 1, 1],
         [256, 1, 1],
+        0,
+        args.as_mut_slice(),
+        crate::dispatch::ReplayLaunchBindings::NONE,
+    )?;
+    if format == GdnStateFormat::Q8 {
+        let frame = checked_u32(p.position + p.rows - 1, "GDN Q8 frame")?;
+        gdn_state_convert(gpu, "gdn_state_f32_to_q8", state, p.state.buf.as_ptr(), p.value_heads, Some(frame))?;
+    }
+    Ok(())
+}
+
+/// One of the Q8 GDN state conversions (`gdn_state_q8_to_f32`, or
+/// `gdn_state_f32_to_q8` with its requantization `frame`): grid
+/// `value_heads * 128` value rows, block 128.
+fn gdn_state_convert(
+    gpu: &mut Gpu,
+    kernel: &str,
+    source: *mut std::ffi::c_void,
+    destination: *mut std::ffi::c_void,
+    value_heads: usize,
+    frame: Option<u32>,
+) -> HipResult<()> {
+    gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel)?;
+    let mut args = KernargBlob::new();
+    args.push_ptr(source);
+    args.push_ptr(destination);
+    args.push_i32(checked_i32(value_heads, "GDN state heads")?);
+    if let Some(frame) = frame {
+        args.push_u32(frame);
+    }
+    args.pad_to(16);
+    gpu.launch_blob_recorded(
+        kernel,
+        [checked_u32(value_heads * 128, "GDN state row grid")?, 1, 1],
+        [128, 1, 1],
         0,
         args.as_mut_slice(),
         crate::dispatch::ReplayLaunchBindings::NONE,
@@ -1937,10 +2110,107 @@ pub struct IndexedAttentionNormRopeBatch<'a> {
     pub rotary_dim: usize,
 }
 
+/// Storage format of a QSA layer's state: the full K/V caches and the
+/// indexer's raw and pooled keys (`kernels/src/tensor_ops.hip`, "QSA state
+/// formats"). The index keys are BF16 values in every format, so the fp8
+/// format's BF16 index arenas pool and select exactly what F32 arenas do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum QsaKvFormat {
+    /// F32 K/V and index keys: the exact reference.
+    F32,
+    /// E4M3 K/V with one f16 scale per head and token (the Qwen3.5 native fp8
+    /// row; gfx12 only), BF16 index keys.
+    Fp8,
+}
+
+impl QsaKvFormat {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::F32 => "f32",
+            Self::Fp8 => "fp8",
+        }
+    }
+
+    /// Whether the kernels implement this format for a head geometry.
+    pub const fn supports(self, kv_heads: usize, head_dim: usize) -> bool {
+        match self {
+            Self::F32 => head_dim > 0,
+            // Whole-head scales over one 256-thread block, and 4-byte aligned
+            // code rows (`kv_heads * 258` bytes).
+            Self::Fp8 => head_dim == 256 && kv_heads % 2 == 0,
+        }
+    }
+
+    /// Dtype of the K/V tensors: F32 elements, or fp8 byte rows as Raw.
+    pub const fn kv_dtype(self) -> DType {
+        match self {
+            Self::F32 => DType::F32,
+            Self::Fp8 => DType::Raw,
+        }
+    }
+
+    /// `kv_dtype` units (elements or bytes) per token row of K or of V.
+    pub const fn kv_row_units(self, kv_heads: usize, head_dim: usize) -> usize {
+        match self {
+            Self::F32 => kv_heads * head_dim,
+            Self::Fp8 => kv_heads * (head_dim + 2),
+        }
+    }
+
+    /// Bytes per token row of K or of V.
+    pub const fn kv_row_bytes(self, kv_heads: usize, head_dim: usize) -> usize {
+        match self {
+            Self::F32 => kv_heads * head_dim * 4,
+            Self::Fp8 => self.kv_row_units(kv_heads, head_dim),
+        }
+    }
+
+    /// Dtype of the raw and pooled index-key arenas.
+    pub const fn index_dtype(self) -> DType {
+        match self {
+            Self::F32 => DType::F32,
+            Self::Fp8 => DType::BF16,
+        }
+    }
+
+    /// This format's entry of a `[f32, fp8]` kernel-name table.
+    fn kernel(self, names: [&'static str; 2]) -> &'static str {
+        names[self as usize]
+    }
+}
+
+/// Refuse a format the device or head geometry has no kernels for, and K/V
+/// tensors that are not in its dtype.
+fn check_qsa_format(
+    gpu: &Gpu,
+    format: QsaKvFormat,
+    kv_heads: usize,
+    head_dim: usize,
+    tensors: [&GpuTensor; 2],
+) -> HipResult<()> {
+    if !format.supports(kv_heads, head_dim) {
+        return Err(HipError::new(
+            0,
+            &format!(
+                "QSA {} K/V needs another head geometry ({kv_heads} KV heads x {head_dim})",
+                format.name()
+            ),
+        ));
+    }
+    if format == QsaKvFormat::Fp8 && !(gpu.arch_caps.is_gfx1200() || gpu.arch_caps.is_gfx1201()) {
+        return Err(HipError::new(0, "QSA fp8 K/V needs a gfx12 device"));
+    }
+    if tensors.iter().any(|tensor| tensor.dtype != format.kv_dtype()) {
+        return Err(HipError::new(0, &ComputeError::WrongDtype.to_string()));
+    }
+    Ok(())
+}
+
 /// QSA prologue of `rows` consecutive rows (decode: one): the index-query,
 /// query and key norm+RoPE, the key/value cache append and the index key's
 /// BF16 round trip + raw-key copy, in one launch (bitwise the six launches it
-/// replaces). Row buffers are row-major at their natural row widths.
+/// replaces). Row buffers are row-major at their natural row widths. The
+/// cache rows are `format`'s, the raw index keys its `index_dtype`.
 pub struct IndexedAttentionDecodePrologue<'a> {
     /// `[index q (index_heads * index_dim) | index k (index_kv_width)]`.
     pub index_row: &'a GpuTensor,
@@ -1962,23 +2232,21 @@ pub struct IndexedAttentionDecodePrologue<'a> {
     pub head_dim: usize,
     pub position: usize,
     pub rows: usize,
+    pub format: QsaKvFormat,
 }
 
 pub fn indexed_attention_decode_prologue(
     gpu: &mut Gpu,
     p: &IndexedAttentionDecodePrologue<'_>,
 ) -> HipResult<()> {
-    for tensor in [
-        p.index_row,
-        p.qgate,
-        p.keys,
-        p.values,
-        p.full_keys,
-        p.full_values,
-        p.raw_index_keys,
-    ] {
+    for tensor in [p.index_row, p.qgate, p.keys, p.values] {
         ensure_f32(tensor)?;
     }
+    check_qsa_format(gpu, p.format, p.kv_heads, p.head_dim, [p.full_keys, p.full_values])?;
+    if p.raw_index_keys.dtype != p.format.index_dtype() {
+        return Err(HipError::new(0, &ComputeError::WrongDtype.to_string()));
+    }
+    let row_units = p.format.kv_row_units(p.kv_heads, p.head_dim);
     let kv_width = checked_product(p.kv_heads, p.head_dim, "QSA prologue KV width")?;
     let end = checked_add(p.position, p.rows, "QSA prologue position")?;
     let index_width =
@@ -2002,8 +2270,8 @@ pub fn indexed_attention_decode_prologue(
             < checked_product3(p.rows, 2 * p.heads, p.head_dim, "QSA prologue query")?
         || p.keys.numel() < checked_product(p.rows, kv_width, "QSA prologue keys")?
         || p.values.numel() < checked_product(p.rows, kv_width, "QSA prologue values")?
-        || p.full_keys.numel() < checked_product(end, kv_width, "QSA prologue cache")?
-        || p.full_values.numel() < checked_product(end, kv_width, "QSA prologue cache")?
+        || p.full_keys.numel() < checked_product(end, row_units, "QSA prologue cache")?
+        || p.full_values.numel() < checked_product(end, row_units, "QSA prologue cache")?
         || p.raw_index_keys.numel()
             < checked_product(end, p.index_kv_width, "QSA prologue raw keys")?;
     if bad {
@@ -2013,11 +2281,11 @@ pub fn indexed_attention_decode_prologue(
         p.index_heads + p.heads + p.kv_heads + 1,
         "QSA prologue block count",
     )?;
-    gpu.ensure_kernel_public(
-        "tensor_ops",
-        TENSOR_OPS_SRC,
+    let kernel = p.format.kernel([
         "indexed_attention_decode_prologue_f32",
-    )?;
+        "indexed_attention_decode_prologue_fp8",
+    ]);
+    gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel)?;
     let mut args = KernargBlob::new();
     for tensor in [
         p.index_row,
@@ -2053,7 +2321,7 @@ pub fn indexed_attention_decode_prologue(
         addend: 0,
     }];
     gpu.launch_blob_recorded(
-        "indexed_attention_decode_prologue_f32",
+        kernel,
         [blocks_x, checked_u32(p.rows, "QSA prologue rows")?, 1],
         [256, 1, 1],
         0,
@@ -2200,6 +2468,7 @@ pub fn indexed_attention_cache_append(
     )
 }
 
+/// Append `rows` F32 K/V rows at `position_start` to caches in `format`.
 pub struct IndexedAttentionCacheAppendBatch<'a> {
     pub key: &'a GpuTensor,
     pub value: &'a GpuTensor,
@@ -2207,20 +2476,24 @@ pub struct IndexedAttentionCacheAppendBatch<'a> {
     pub full_values: &'a GpuTensor,
     pub rows: usize,
     pub position_start: usize,
-    pub kv_width: usize,
+    pub kv_heads: usize,
+    pub head_dim: usize,
+    pub format: QsaKvFormat,
 }
 
 pub fn indexed_attention_cache_append_batch(
     gpu: &mut Gpu,
     p: &IndexedAttentionCacheAppendBatch<'_>,
 ) -> HipResult<()> {
-    for tensor in [p.key, p.value, p.full_keys, p.full_values] {
+    for tensor in [p.key, p.value] {
         ensure_f32(tensor)?;
     }
+    check_qsa_format(gpu, p.format, p.kv_heads, p.head_dim, [p.full_keys, p.full_values])?;
+    let kv_width = checked_product(p.kv_heads, p.head_dim, "indexed attention batch width")?;
     if p.rows == 0
-        || p.kv_width == 0
-        || p.key.numel() < checked_product(p.rows, p.kv_width, "indexed attention batch key")?
-        || p.value.numel() < checked_product(p.rows, p.kv_width, "indexed attention batch value")?
+        || kv_width == 0
+        || p.key.numel() < checked_product(p.rows, kv_width, "indexed attention batch key")?
+        || p.value.numel() < checked_product(p.rows, kv_width, "indexed attention batch value")?
         || p.full_keys.numel() != p.full_values.numel()
     {
         return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
@@ -2229,20 +2502,22 @@ pub fn indexed_attention_cache_append_batch(
         .position_start
         .checked_add(p.rows)
         .ok_or_else(|| HipError::new(0, &ComputeError::WrongShape.to_string()))?;
-    let end = checked_product(end_position, p.kv_width, "indexed attention batch cache")?;
+    let end = checked_product(
+        end_position,
+        p.format.kv_row_units(p.kv_heads, p.head_dim),
+        "indexed attention batch cache",
+    )?;
     if end > p.full_keys.numel() || end_position > i32::MAX as usize {
         return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
     }
     let rows = checked_i32(p.rows, "indexed attention batch rows")?;
     let position_start = checked_i32(p.position_start, "indexed attention batch position")?;
-    let kv_width = checked_i32(p.kv_width, "indexed attention batch width")?;
-    let grid = blocks(p.kv_width)?;
     let row_grid = checked_u32(p.rows, "indexed attention batch row grid")?;
-    gpu.ensure_kernel_public(
-        "tensor_ops",
-        TENSOR_OPS_SRC,
+    let kernel = p.format.kernel([
         "indexed_attention_cache_append_f32_batched",
-    )?;
+        "indexed_attention_cache_append_fp8_batched",
+    ]);
+    gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel)?;
     let mut args = KernargBlob::new();
     for tensor in [p.key, p.value, p.full_keys, p.full_values] {
         args.push_ptr(tensor.buf.as_ptr());
@@ -2252,15 +2527,93 @@ pub fn indexed_attention_cache_append_batch(
     // Declared dynamic field: the chunk's start position. Replay re-derives it,
     // so the cache row this launch writes follows the replay position.
     let position_offset = args.len() - 4;
-    args.push_i32(kv_width);
+    // F32 copies channels across a flat grid; the quantized formats reduce
+    // their scales over one block per KV head.
+    let grid = if p.format == QsaKvFormat::F32 {
+        args.push_i32(checked_i32(kv_width, "indexed attention batch width")?);
+        [blocks(kv_width)?, row_grid, 1]
+    } else {
+        args.push_i32(checked_i32(p.kv_heads, "indexed attention batch KV heads")?);
+        args.push_i32(checked_i32(p.head_dim, "indexed attention batch head width")?);
+        [checked_u32(p.kv_heads, "indexed attention batch head grid")?, row_grid, 1]
+    };
     args.pad_to(16);
     let position_binding = [crate::replay::ReplayKernargBinding::PositionPlusU32 {
         offset: position_offset,
         addend: 0,
     }];
     gpu.launch_blob_recorded(
-        "indexed_attention_cache_append_f32_batched",
-        [grid, row_grid, 1],
+        kernel,
+        grid,
+        [256, 1, 1],
+        0,
+        args.as_mut_slice(),
+        crate::dispatch::ReplayLaunchBindings {
+            grid: None,
+            kernargs: &position_binding,
+        },
+    )
+}
+
+/// Prefill index-key tail into a BF16 raw-key arena
+/// (`indexed_attention_index_key_append_bf16_batched`): rounds each row's
+/// index key in `index_rows` to BF16 in place and appends it at
+/// `position_start + row`, exactly as the decode prologue does per row.
+pub struct IndexedAttentionIndexKeyAppendBatch<'a> {
+    /// `rows` rows of `[index q (index_q_width) | index k (index_kv_width)]`.
+    pub index_rows: &'a GpuTensor,
+    pub raw_index_keys: &'a GpuTensor,
+    pub rows: usize,
+    pub index_q_width: usize,
+    pub index_kv_width: usize,
+    pub position_start: usize,
+}
+
+pub fn indexed_attention_index_key_append_batch(
+    gpu: &mut Gpu,
+    p: &IndexedAttentionIndexKeyAppendBatch<'_>,
+) -> HipResult<()> {
+    ensure_f32(p.index_rows)?;
+    if p.raw_index_keys.dtype != DType::BF16 {
+        return Err(HipError::new(0, &ComputeError::WrongDtype.to_string()));
+    }
+    let index_width = checked_add(p.index_q_width, p.index_kv_width, "QSA index-key width")?;
+    let end = checked_add(p.position_start, p.rows, "QSA index-key position")?;
+    if p.rows == 0
+        || p.index_kv_width == 0
+        || p.index_rows.numel() < checked_product(p.rows, index_width, "QSA index-key rows")?
+        || p.raw_index_keys.numel() < checked_product(end, p.index_kv_width, "QSA raw keys")?
+    {
+        return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
+    }
+    const NAME: &str = "indexed_attention_index_key_append_bf16_batched";
+    gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, NAME)?;
+    let mut args = KernargBlob::new();
+    args.push_ptr(p.index_rows.buf.as_ptr());
+    args.push_ptr(p.raw_index_keys.buf.as_ptr());
+    for (value, label) in [
+        (p.rows, "QSA index-key rows"),
+        (p.index_q_width, "QSA index-key query width"),
+        (index_width, "QSA index-key row width"),
+        (p.index_kv_width, "QSA index-key width"),
+    ] {
+        args.push_i32(checked_i32(value, label)?);
+    }
+    args.push_i32(checked_i32(p.position_start, "QSA index-key position")?);
+    // Declared dynamic field: the chunk's start position (the raw-key row).
+    let position_offset = args.len() - 4;
+    args.pad_to(16);
+    let position_binding = [crate::replay::ReplayKernargBinding::PositionPlusU32 {
+        offset: position_offset,
+        addend: 0,
+    }];
+    gpu.launch_blob_recorded(
+        NAME,
+        [
+            blocks(p.index_kv_width)?,
+            checked_u32(p.rows, "QSA index-key row grid")?,
+            1,
+        ],
         [256, 1, 1],
         0,
         args.as_mut_slice(),
@@ -2426,9 +2779,19 @@ fn indexed_attention_select_batch_impl(
     p: &IndexedAttentionSelectBatch<'_>,
     mirror: Option<&GpuTensor>,
 ) -> HipResult<bool> {
-    for tensor in [p.query, p.pooled] {
-        ensure_f32(tensor)?;
-    }
+    ensure_f32(p.query)?;
+    // Pooled keys are F32 or BF16 arenas (`QsaKvFormat::index_dtype`).
+    let (parallel_kernel, serial_kernel) = match p.pooled.dtype {
+        DType::F32 => (
+            "indexed_attention_select_f32_batched",
+            "indexed_attention_select_f32_batched_serial",
+        ),
+        DType::BF16 => (
+            "indexed_attention_select_bf16_batched",
+            "indexed_attention_select_bf16_batched_serial",
+        ),
+        _ => return Err(HipError::new(0, &ComputeError::WrongDtype.to_string())),
+    };
     if p.selected.dtype != DType::Raw
         || p.rows == 0
         || p.query_row_stride == 0
@@ -2509,23 +2872,73 @@ fn indexed_attention_select_batch_impl(
         ));
     }
     let shape_blocks = p.shape_blocks;
-    let (kernel_name, block, shared_mem) =
-        match shape_blocks.checked_mul(std::mem::size_of::<f32>()) {
-            Some(bytes)
-                if gpu.arch_caps.has_gfx11_plus_simt()
-                    && shape_blocks > 0
-                    && bytes + QSA_SELECT_BATCHED_STATIC_LDS_BYTES
-                        <= QSA_SELECT_DYNAMIC_LDS_LIMIT_BYTES
-                    && bytes <= u32::MAX as usize =>
-            {
-                (
-                    "indexed_attention_select_f32_batched",
-                    [QSA_SELECT_PARALLEL_THREADS, 1, 1],
-                    bytes as u32,
-                )
-            }
-            _ => ("indexed_attention_select_f32_batched_serial", [1, 1, 1], 0),
-        };
+    let lds_bytes = shape_blocks
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| HipError::new(0, "QSA batch select shape overflow"))?;
+    let parallel = gpu.arch_caps.has_gfx11_plus_simt()
+        && shape_blocks > 0
+        && !select_forced_serial();
+    // Past the LDS row the scores go to global rows (one per workgroup, at
+    // most QSA_SELECT_GLOBAL_ROWS per launch); the selection is the same.
+    let global = parallel
+        && lds_bytes + QSA_SELECT_BATCHED_STATIC_LDS_BYTES > QSA_SELECT_DYNAMIC_LDS_LIMIT_BYTES;
+    if global && p.rows > QSA_SELECT_GLOBAL_ROWS {
+        let query_elements = p.query.numel();
+        let selected_bytes = p.selected.numel();
+        let row_bytes = p.capacity * std::mem::size_of::<i32>();
+        let mut persisted = false;
+        let mut first = 0;
+        while first < p.rows {
+            let rows = (p.rows - first).min(QSA_SELECT_GLOBAL_ROWS);
+            let last = first + rows == p.rows;
+            let query_offset = first * p.query_row_stride;
+            let query = p.query.sub_offset(query_offset, query_elements - query_offset);
+            let selected = p.selected.sub_offset(first * row_bytes, selected_bytes - first * row_bytes);
+            let group = IndexedAttentionSelectBatch {
+                query: &query,
+                pooled: p.pooled,
+                selected: &selected,
+                rows,
+                query_row_stride: p.query_row_stride,
+                block_count: (p.position_start + first + rows) / p.compress,
+                index_heads: p.index_heads,
+                index_dim: p.index_dim,
+                budget_blocks: p.budget_blocks,
+                compress: p.compress,
+                position_start: p.position_start + first,
+                capacity: p.capacity,
+                shape_blocks: p.shape_blocks,
+            };
+            persisted = indexed_attention_select_batch_impl(
+                gpu,
+                &group,
+                if last { mirror } else { None },
+            )?;
+            first += rows;
+        }
+        return Ok(persisted);
+    }
+    let scores_stride = shape_blocks.div_ceil(4) * 4;
+    let scores_global = if global {
+        let bytes = QSA_SELECT_GLOBAL_ROWS
+            .checked_mul(scores_stride)
+            .and_then(|n| n.checked_mul(std::mem::size_of::<f32>()))
+            .ok_or_else(|| HipError::new(0, "QSA select score rows overflow"))?;
+        gpu.qsa_select_scores(bytes)?
+    } else {
+        std::ptr::null_mut()
+    };
+    let (kernel_name, block, shared_mem) = if global {
+        (parallel_kernel, [QSA_SELECT_PARALLEL_THREADS, 1, 1], 0u32)
+    } else if parallel && lds_bytes <= u32::MAX as usize {
+        (
+            parallel_kernel,
+            [QSA_SELECT_PARALLEL_THREADS, 1, 1],
+            lds_bytes as u32,
+        )
+    } else {
+        (serial_kernel, [1, 1, 1], 0)
+    };
     gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel_name)?;
     let mut args = KernargBlob::new();
     for tensor in [p.query, p.pooled, p.selected] {
@@ -2543,11 +2956,13 @@ fn indexed_attention_select_batch_impl(
     let position_offset = args.len() - 4;
     args.push_i32(capacity);
     let mirror = mirror.filter(|m| {
-        kernel_name == "indexed_attention_select_f32_batched"
+        kernel_name == parallel_kernel
             && m.numel() * m.dtype.size() >= p.capacity * std::mem::size_of::<i32>()
     });
-    if kernel_name == "indexed_attention_select_f32_batched" {
+    if kernel_name == parallel_kernel {
         args.push_ptr(mirror.map_or(std::ptr::null_mut(), |m| m.buf.as_ptr()));
+        args.push_ptr(scores_global);
+        args.push_i32(checked_i32(scores_stride, "QSA select score stride")?);
     }
     args.pad_to(16);
     // Both declared fields make the selection follow the replay position instead
@@ -2705,9 +3120,12 @@ fn indexed_attention_pool_rope_impl(
             "incremental QSA pooling needs a declared position",
         ));
     }
-    for tensor in [p.raw_keys, p.pooled] {
-        ensure_f32(tensor)?;
-    }
+    // Raw and pooled keys share one arena dtype (`QsaKvFormat::index_dtype`).
+    let kernel = match (p.raw_keys.dtype, p.pooled.dtype) {
+        (DType::F32, DType::F32) => "indexed_attention_pool_rope_f32",
+        (DType::BF16, DType::BF16) => "indexed_attention_pool_rope_bf16",
+        _ => return Err(HipError::new(0, &ComputeError::WrongDtype.to_string())),
+    };
     if p.block_count == 0 || p.compress == 0 || p.index_dim == 0 || p.index_dim % 2 != 0 {
         return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
     }
@@ -2762,11 +3180,7 @@ fn indexed_attention_pool_rope_impl(
     if p.raw_keys.numel() < raw_elements || p.pooled.numel() < pooled_elements {
         return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
     }
-    gpu.ensure_kernel_public(
-        "tensor_ops",
-        TENSOR_OPS_SRC,
-        "indexed_attention_pool_rope_f32",
-    )?;
+    gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel)?;
     let mut args = KernargBlob::new();
     args.push_ptr(p.raw_keys.buf.as_ptr());
     args.push_ptr(p.pooled.buf.as_ptr());
@@ -2811,7 +3225,7 @@ fn indexed_attention_pool_rope_impl(
         (Some(_), true) => &bindings[..],
     };
     gpu.launch_blob_recorded(
-        "indexed_attention_pool_rope_f32",
+        kernel,
         [block_grid, dim_grid, 1],
         [256, 1, 1],
         0,
@@ -2834,6 +3248,8 @@ pub struct IndexedAttentionAttention<'a> {
     pub head_dim: usize,
     pub selected_len: usize,
     pub full_capacity: usize,
+    /// K/V cache format.
+    pub format: QsaKvFormat,
 }
 
 /// One device-to-device copy for [`copy_regions`].
@@ -2920,9 +3336,10 @@ pub fn indexed_attention_attention(
     gpu: &mut Gpu,
     p: &IndexedAttentionAttention<'_>,
 ) -> HipResult<()> {
-    for tensor in [p.q_with_gate, p.full_keys, p.full_values, p.output] {
+    for tensor in [p.q_with_gate, p.output] {
         ensure_f32(tensor)?;
     }
+    check_qsa_format(gpu, p.format, p.n_kv_heads, p.head_dim, [p.full_keys, p.full_values])?;
     if p.selected.dtype != DType::Raw
         || p.n_heads == 0
         || p.n_kv_heads == 0
@@ -2934,10 +3351,9 @@ pub fn indexed_attention_attention(
     let head_elements = checked_product(p.n_heads, p.head_dim, "QSA attention head extent")?;
     let q_elements = checked_product(2, head_elements, "QSA attention query extent")?;
     let output_elements = head_elements;
-    let full_elements = checked_product3(
+    let full_elements = checked_product(
         p.full_capacity,
-        p.n_kv_heads,
-        p.head_dim,
+        p.format.kv_row_units(p.n_kv_heads, p.head_dim),
         "QSA attention cache extent",
     )?;
     let selected_bytes = p
@@ -2959,6 +3375,16 @@ pub fn indexed_attention_attention(
     {
         return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
     }
+    let [parallel, serial] = [
+        p.format.kernel([
+            "indexed_attention_attention_f32",
+            "indexed_attention_attention_fp8",
+        ]),
+        p.format.kernel([
+            "indexed_attention_attention_f32_serial",
+            "indexed_attention_attention_fp8_serial",
+        ]),
+    ];
     let (kernel_name, shared_mem) =
         match p.selected_len.checked_mul(QSA_ATTENTION_LDS_BYTES_PER_ROW) {
             Some(bytes)
@@ -2967,9 +3393,9 @@ pub fn indexed_attention_attention(
                     && bytes + 32 <= QSA_ATTENTION_DYNAMIC_LDS_LIMIT_BYTES
                     && bytes <= u32::MAX as usize =>
             {
-                ("indexed_attention_attention_f32", bytes as u32)
+                (parallel, bytes as u32)
             }
-            _ => ("indexed_attention_attention_f32_serial", 0),
+            _ => (serial, 0),
         };
     gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel_name)?;
     let mut args = KernargBlob::new();
@@ -3011,6 +3437,8 @@ pub struct IndexedAttentionAttentionBatch<'a> {
     pub compress: usize,
     pub capacity: usize,
     pub full_capacity: usize,
+    /// K/V cache format.
+    pub format: QsaKvFormat,
     /// Declared shape bound for the LDS reservation and the kernel symbol. A
     /// retained tape needs both to be position-independent, so callers pass the
     /// selected-row capacity (`>= max_selected`); a caller without a capacity
@@ -3068,9 +3496,10 @@ fn indexed_attention_attention_batch_impl(
     p: &IndexedAttentionAttentionBatch<'_>,
     allow_fast: bool,
 ) -> HipResult<()> {
-    for tensor in [p.q_with_gate, p.full_keys, p.full_values, p.output] {
+    for tensor in [p.q_with_gate, p.output] {
         ensure_f32(tensor)?;
     }
+    check_qsa_format(gpu, p.format, p.n_kv_heads, p.head_dim, [p.full_keys, p.full_values])?;
     if p.selected.dtype != DType::Raw
         || p.rows == 0
         || p.position_start.checked_add(p.rows).is_none()
@@ -3085,10 +3514,9 @@ fn indexed_attention_attention_batch_impl(
     }
     let head_elements = checked_product(p.n_heads, p.head_dim, "QSA batch attention heads")?;
     let q_elements = checked_product(2, head_elements, "QSA batch attention query")?;
-    let kv_elements = checked_product3(
-        p.n_kv_heads,
-        p.head_dim,
+    let kv_elements = checked_product(
         p.full_capacity,
+        p.format.kv_row_units(p.n_kv_heads, p.head_dim),
         "QSA batch attention cache",
     )?;
     let q_rows = checked_product(p.rows, q_elements, "QSA batch attention query rows")?;
@@ -3158,7 +3586,10 @@ fn indexed_attention_attention_batch_impl(
         .flatten();
     let (kernel_name, grid, shared_mem) = if let Some(bytes) = hg4_bytes {
         (
-            "indexed_attention_attention_f32_batched_hg4",
+            p.format.kernel([
+                "indexed_attention_attention_f32_batched_hg4",
+                "indexed_attention_attention_fp8_batched_hg4",
+            ]),
             [
                 checked_u32(
                     p.n_heads / QSA_ATTENTION_HG4_HEADS,
@@ -3181,13 +3612,19 @@ fn indexed_attention_attention_batch_impl(
                     && bytes <= u32::MAX as usize =>
             {
                 (
-                    "indexed_attention_attention_f32_batched",
+                    p.format.kernel([
+                        "indexed_attention_attention_f32_batched",
+                        "indexed_attention_attention_fp8_batched",
+                    ]),
                     [head_grid, dim_grid, row_grid],
                     bytes as u32,
                 )
             }
             _ => (
-                "indexed_attention_attention_f32_batched_serial",
+                p.format.kernel([
+                    "indexed_attention_attention_f32_batched_serial",
+                    "indexed_attention_attention_fp8_batched_serial",
+                ]),
                 [head_grid, dim_grid, row_grid],
                 0,
             ),
@@ -3244,7 +3681,7 @@ fn indexed_attention_attention_batch_impl(
 /// head_dim 256 in four-head KV groups, and every row's selection is its
 /// whole causal window: the budget covers every visible block and the
 /// capacity every visible token (indexed_attention_select then emits all of
-/// them).
+/// them). Only F32 caches take this route (fp8 is gfx12-only).
 fn qsa_dense_wmma_applies(
     gpu: &Gpu,
     p: &IndexedAttentionAttentionBatch<'_>,
@@ -3256,6 +3693,7 @@ fn qsa_dense_wmma_applies(
         && !gpu.replay.is_recording()
         && !gpu.graphs.capture_mode
         && p.head_dim == 256
+        && p.format == QsaKvFormat::F32
         && (p.n_heads / p.n_kv_heads) % 4 == 0
         && end_position / p.compress <= p.budget_blocks
         && end_position <= p.capacity
@@ -4114,6 +4552,7 @@ mod tests {
                 value_heads,
                 key_dim: dim,
                 value_dim: dim,
+                position: 0,
             },
         )
         .expect("batched GDN");
@@ -4135,6 +4574,7 @@ mod tests {
                     value_heads,
                     key_dim: dim,
                     value_dim: dim,
+                    position: row,
                 },
             )
             .expect("per-row GDN");
@@ -4251,6 +4691,7 @@ mod tests {
                 value_heads,
                 key_dim: dim,
                 value_dim: dim,
+                position: 0,
             };
             let gated = GatedDeltaGateBatched {
                 recurrent_output: &recurrent,
@@ -4298,6 +4739,372 @@ mod tests {
         assert!(out_rel < 1e-2, "GDN chunk gate output rel L2 {out_rel:.3e}");
         assert!(state_rel < 2e-3, "GDN chunk state rel L2 {state_rel:.3e}");
         for tensor in [proj_gpu, proj_bf16, gate_gpu, beta_gpu, z_gpu, norm_gpu] {
+            gpu.free_tensor(tensor).expect("free");
+        }
+    }
+
+    /// Q8 GDN state (Qwen3.5's DeltaNet Q8 format): every route tracks its
+    /// F32 twin (decode steps, the persistent batch, the chunked prefill),
+    /// the verify capture writes exactly the plain batch's final state into
+    /// its ring slot, and a rollback re-run of the kept rows writes exactly
+    /// the state a plain batch over those rows does. A transposed row, a
+    /// wrong scale or a slot offset lands near 1.
+    #[test]
+    fn gdn_q8_state_tracks_f32_on_every_route() {
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        // `rows` decode steps; the batch routes run every ragged row count
+        // around the persistent kernel's 16-row unroll and 256-row blocks.
+        let (key_heads, value_heads, dim, rows) = (2usize, 6usize, 128usize, 24usize);
+        let batch_rows = [2usize, 15, 16, 17, 255, 256, 257];
+        let max_rows = 257usize;
+        let qk = key_heads * dim;
+        let value = value_heads * dim;
+        let qkv = 2 * qk + value;
+        let format = GdnStateFormat::Q8;
+        let slot_bytes = format.state_units(value_heads, dim, dim);
+        let wave = |seed: usize, n: usize, scale: f32| -> Vec<f32> {
+            (0..n)
+                .map(|i| {
+                    let h = i.wrapping_mul(2_654_435_761).wrapping_add(seed * 97) % 10007;
+                    (h as f32 - 5003.0) / 5003.0 * scale
+                })
+                .collect()
+        };
+        let projection = wave(1, max_rows * qkv, 1.5);
+        let gate: Vec<f32> =
+            wave(2, max_rows * value_heads, 0.5).iter().map(|g| g - 0.6).collect();
+        let beta: Vec<f32> =
+            wave(3, max_rows * value_heads, 0.45).iter().map(|b| b + 0.5).collect();
+        let state0 = wave(4, value * dim, 0.2);
+        let proj_gpu = gpu.upload_f32(&projection, &[projection.len()]).expect("projection");
+        let gate_gpu = gpu.upload_f32(&gate, &[gate.len()]).expect("gate");
+        let beta_gpu = gpu.upload_f32(&beta, &[beta.len()]).expect("beta");
+        let state0_gpu = gpu.upload_f32(&state0, &[state0.len()]).expect("state0");
+        let slot0 = gpu.zeros(&[slot_bytes], DType::Raw).expect("slot");
+        gdn_state_convert(&mut gpu, "gdn_state_f32_to_q8", state0_gpu.buf.as_ptr(), slot0.buf.as_ptr(), value_heads, Some(7))
+            .expect("quantize");
+        let bytes = |gpu: &Gpu, t: &GpuTensor| -> Vec<u8> {
+            let mut out = vec![0u8; t.byte_size()];
+            gpu.hip.memcpy_dtoh(&mut out, &t.buf).expect("download");
+            out
+        };
+        let fresh_slot = |gpu: &mut Gpu| -> GpuTensor {
+            let slot = gpu.zeros(&[slot_bytes], DType::Raw).expect("slot");
+            gpu.copy_d2d(&slot0, &slot, slot_bytes).expect("copy slot");
+            slot
+        };
+        let dequant = |gpu: &mut Gpu, slot: &GpuTensor| -> Vec<f32> {
+            let f = gpu.zeros(&[value * dim], DType::F32).expect("f32");
+            gdn_state_convert(gpu, "gdn_state_q8_to_f32", slot.buf.as_ptr(), f.buf.as_ptr(), value_heads, None)
+                .expect("dequantize");
+            let values = gpu.download_f32(&f).expect("download");
+            gpu.free_tensor(f).expect("free");
+            values
+        };
+        let rel = |a: &[f32], b: &[f32]| {
+            let (mut err, mut norm) = (0.0f64, 0.0f64);
+            for (x, y) in a.iter().zip(b) {
+                err += (*x as f64 - *y as f64).powi(2);
+                norm += (*x as f64).powi(2);
+            }
+            assert!(norm > 0.0, "reference is all zero");
+            (err / norm).sqrt()
+        };
+        let q0 = dequant(&mut gpu, &slot0);
+        let round_trip = rel(&state0, &q0);
+        assert!(round_trip < 1e-2, "Q8 state round trip rel L2 {round_trip:.3e}");
+
+        // Decode: one step per row, F32 and Q8 states from the same start.
+        let decode = |gpu: &mut Gpu, state: &GpuTensor| -> Vec<f32> {
+            let out = gpu.zeros(&[rows * value], DType::F32).expect("output");
+            for row in 0..rows {
+                gated_delta_step(
+                    gpu,
+                    &GatedDeltaStep {
+                        q: &proj_gpu.sub_offset(row * qkv, qk),
+                        k: &proj_gpu.sub_offset(row * qkv + qk, qk),
+                        v: &proj_gpu.sub_offset(row * qkv + 2 * qk, value),
+                        gate: &gate_gpu.sub_offset(row * value_heads, value_heads),
+                        beta: &beta_gpu.sub_offset(row * value_heads, value_heads),
+                        state,
+                        output: &out.sub_offset(row * value, value),
+                        key_heads,
+                        value_heads,
+                        key_dim: dim,
+                        value_dim: dim,
+                        position: row,
+                    },
+                )
+                .expect("GDN step");
+            }
+            let values = gpu.download_f32(&out).expect("download");
+            gpu.free_tensor(out).expect("free");
+            values
+        };
+        let f32_state = gpu.upload_f32(&q0, &[q0.len()]).expect("state");
+        let f32_out = decode(&mut gpu, &f32_state);
+        let f32_final = gpu.download_f32(&f32_state).expect("download");
+        let q8_state = fresh_slot(&mut gpu);
+        let q8_out = decode(&mut gpu, &q8_state);
+        let q8_final = dequant(&mut gpu, &q8_state);
+        let (out_rel, state_rel) = (rel(&f32_out, &q8_out), rel(&f32_final, &q8_final));
+        eprintln!("Q8 decode: output rel {out_rel:.3e}, state rel {state_rel:.3e}");
+        assert!(out_rel < 3e-2 && state_rel < 3e-2, "Q8 decode drifted: {out_rel:.3e} {state_rel:.3e}");
+
+        // Persistent batch, plain and captured, and the F32 twin.
+        let batch = |gpu: &mut Gpu, state: &GpuTensor, ring: Option<&GpuTensor>, n: usize| -> Vec<f32> {
+            let out = gpu.zeros(&[n * value], DType::F32).expect("output");
+            gated_delta_step_batched(
+                gpu,
+                &GatedDeltaStepBatched {
+                    projection: &proj_gpu.sub_offset(0, n * qkv),
+                    gate: &gate_gpu.sub_offset(0, n * value_heads),
+                    beta: &beta_gpu.sub_offset(0, n * value_heads),
+                    state,
+                    output: &out,
+                    row_states: ring,
+                    rows: n,
+                    qkv_width: qkv,
+                    key_heads,
+                    value_heads,
+                    key_dim: dim,
+                    value_dim: dim,
+                    position: 0,
+                },
+            )
+            .expect("batched GDN");
+            let values = gpu.download_f32(&out).expect("download");
+            gpu.free_tensor(out).expect("free");
+            values
+        };
+        // Digest of every Q8 state this test writes: equal across processes
+        // (the multi-process stress compares it).
+        let mut digest = 0xcbf2_9ce4_8422_2325u64;
+        let mut fold = |data: &[u8]| {
+            for byte in data {
+                digest = (digest ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3);
+            }
+        };
+        fold(&bytes(&gpu, &q8_state));
+        for n in batch_rows {
+            let keep = (n / 2).max(1);
+            let f32_batch_state = gpu.upload_f32(&q0, &[q0.len()]).expect("state");
+            let f32_batch_out = batch(&mut gpu, &f32_batch_state, None, n);
+            let f32_batch_final = gpu.download_f32(&f32_batch_state).expect("download");
+            let q8_batch_state = fresh_slot(&mut gpu);
+            let q8_batch_out = batch(&mut gpu, &q8_batch_state, None, n);
+            let q8_batch_final = dequant(&mut gpu, &q8_batch_state);
+            let (out_rel, state_rel) =
+                (rel(&f32_batch_out, &q8_batch_out), rel(&f32_batch_final, &q8_batch_final));
+            eprintln!("Q8 batch {n} rows: output rel {out_rel:.3e}, state rel {state_rel:.3e}");
+            assert!(
+                out_rel < 1e-2 && state_rel < 1e-2,
+                "Q8 batch {n} rows drifted: {out_rel:.3e} {state_rel:.3e}"
+            );
+            fold(&bytes(&gpu, &q8_batch_state));
+
+            let captured_state = fresh_slot(&mut gpu);
+            let ring = gpu.zeros(&[2 * n * slot_bytes], DType::Raw).expect("ring");
+            let captured_out = batch(&mut gpu, &captured_state, Some(&ring), n);
+            assert_eq!(captured_out, q8_batch_out, "{n} rows: captured verify output differs");
+            assert_eq!(
+                bytes(&gpu, &captured_state),
+                bytes(&gpu, &slot0),
+                "{n} rows: capture wrote the live state"
+            );
+            assert_eq!(
+                bytes(&gpu, &ring.sub_offset((n - 1) * slot_bytes, slot_bytes)),
+                bytes(&gpu, &q8_batch_state),
+                "{n} rows: captured slot is not the plain batch's final state"
+            );
+
+            // Rollback: `keep` rows re-run from ring slot 0 into slot `n`. Its
+            // input is the rows' projection, then gate, then beta.
+            let recurrence: Vec<f32> = projection[..n * qkv]
+                .iter()
+                .chain(&gate[..n * value_heads])
+                .chain(&beta[..n * value_heads])
+                .copied()
+                .collect();
+            let recurrence_gpu =
+                gpu.upload_f32(&recurrence, &[recurrence.len()]).expect("recurrence");
+            gpu.copy_d2d(&slot0, &ring, slot_bytes).expect("seed ring");
+            let pointers: Vec<u8> = [recurrence_gpu.buf.as_ptr(), ring.buf.as_ptr()]
+                .iter()
+                .flat_map(|p| (*p as u64).to_ne_bytes())
+                .collect();
+            let table = gpu.upload_raw(&pointers, &[pointers.len()]).expect("table");
+            let discard = gpu.zeros(&[n * value], DType::F32).expect("discard");
+            gated_delta_rollback_layers(
+                &mut gpu,
+                &GatedDeltaRollbackLayers {
+                    table: &table,
+                    discard: &discard,
+                    format,
+                    layers: 1,
+                    rows: n,
+                    keep,
+                    from: 0,
+                    to: n,
+                    qkv_width: qkv,
+                    key_heads,
+                    value_heads,
+                    position: keep - 1,
+                },
+            )
+            .expect("rollback");
+            let kept_state = fresh_slot(&mut gpu);
+            batch(&mut gpu, &kept_state, None, keep);
+            assert_eq!(
+                bytes(&gpu, &ring.sub_offset((n + keep - 1) * slot_bytes, slot_bytes)),
+                bytes(&gpu, &kept_state),
+                "{n} rows: rollback slot is not the kept rows' state"
+            );
+            fold(&bytes(&gpu, &kept_state));
+            for tensor in [
+                f32_batch_state, q8_batch_state, captured_state, ring, recurrence_gpu, table,
+                discard, kept_state,
+            ] {
+                gpu.free_tensor(tensor).expect("free");
+            }
+        }
+        eprintln!("GDN_Q8_DIGEST {digest:016x}");
+        for tensor in [proj_gpu, gate_gpu, beta_gpu, state0_gpu, slot0, f32_state, q8_state] {
+            gpu.free_tensor(tensor).expect("free");
+        }
+    }
+
+    /// The chunked F16 WMMA prefill route on a Q8 state (dequantize, chunk,
+    /// requantize) tracks the same route on the F32 state.
+    #[test]
+    fn gdn_q8_state_chunk_route_tracks_f32() {
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        if !gpu.arch_caps.has_wmma_w32() || !*crate::gemm::QWEN4_F16_WMMA {
+            eprintln!("skip: needs gfx11 WMMA");
+            return;
+        }
+        let (key_heads, value_heads, dim, rows) = (2usize, 6usize, 128usize, 530usize);
+        let qk = key_heads * dim;
+        let value = value_heads * dim;
+        let qkv = 2 * qk + value;
+        let wave = |seed: usize, n: usize, scale: f32| -> Vec<f32> {
+            (0..n)
+                .map(|i| {
+                    let h = i.wrapping_mul(2_654_435_761).wrapping_add(seed * 97) % 10007;
+                    (h as f32 - 5003.0) / 5003.0 * scale
+                })
+                .collect()
+        };
+        let projection = wave(1, rows * qkv, 1.5);
+        let gate: Vec<f32> = wave(2, rows * value_heads, 0.5).iter().map(|g| g - 0.6).collect();
+        let beta: Vec<f32> = wave(3, rows * value_heads, 0.45).iter().map(|b| b + 0.5).collect();
+        let state0 = wave(4, value * dim, 0.2);
+        let z = wave(5, rows * value, 2.0);
+        let norm_bytes: Vec<u8> = wave(6, dim, 1.0)
+            .iter()
+            .flat_map(|v| ((v.to_bits() >> 16) as u16).to_le_bytes())
+            .collect();
+        let proj_bytes: Vec<u8> = projection
+            .iter()
+            .flat_map(|v| {
+                let u = v.to_bits();
+                (((u + 0x7FFF + ((u >> 16) & 1)) >> 16) as u16).to_le_bytes()
+            })
+            .collect();
+        let mut proj_bf16 = gpu.upload_raw(&proj_bytes, &[proj_bytes.len()]).expect("projection");
+        proj_bf16.dtype = DType::BF16;
+        proj_bf16.shape = vec![projection.len()];
+        let gate_gpu = gpu.upload_f32(&gate, &[gate.len()]).expect("gate");
+        let beta_gpu = gpu.upload_f32(&beta, &[beta.len()]).expect("beta");
+        let z_gpu = gpu.upload_f32(&z, &[z.len()]).expect("z");
+        let mut norm_gpu = gpu.upload_raw(&norm_bytes, &[norm_bytes.len()]).expect("norm");
+        norm_gpu.dtype = DType::BF16;
+        norm_gpu.shape = vec![dim];
+        let slot_bytes = GdnStateFormat::Q8.state_units(value_heads, dim, dim);
+        let state0_gpu = gpu.upload_f32(&state0, &[state0.len()]).expect("state0");
+        let seed_slot = gpu.zeros(&[slot_bytes], DType::Raw).expect("slot");
+        gdn_state_convert(&mut gpu, "gdn_state_f32_to_q8", state0_gpu.buf.as_ptr(), seed_slot.buf.as_ptr(), value_heads, Some(3))
+            .expect("quantize");
+        let run = |gpu: &mut Gpu, state: &GpuTensor, n: usize| -> Vec<f32> {
+            let recurrent = gpu.zeros(&[n * value], DType::F32).expect("recurrent");
+            let out = gpu.zeros(&[n * value], DType::F32).expect("output");
+            let step = GatedDeltaStepBatched {
+                projection: &proj_bf16.sub_offset(0, n * qkv),
+                gate: &gate_gpu.sub_offset(0, n * value_heads),
+                beta: &beta_gpu.sub_offset(0, n * value_heads),
+                state,
+                output: &recurrent,
+                row_states: None,
+                rows: n,
+                qkv_width: qkv,
+                key_heads,
+                value_heads,
+                key_dim: dim,
+                value_dim: dim,
+                position: 0,
+            };
+            let gated = GatedDeltaGateBatched {
+                recurrent_output: &recurrent,
+                z: &z_gpu.sub_offset(0, n * value),
+                norm: &norm_gpu,
+                output: &out,
+                rows: n,
+                value_heads,
+                value_dim: dim,
+            };
+            gated_delta_step_gate_wmma(gpu, &step, &gated).expect("chunked GDN");
+            let values = gpu.download_f32(&out).expect("download");
+            gpu.free_tensor(recurrent).expect("free");
+            gpu.free_tensor(out).expect("free");
+            values
+        };
+        let rel = |a: &[f32], b: &[f32]| {
+            let (mut err, mut norm) = (0.0f64, 0.0f64);
+            for (x, y) in a.iter().zip(b) {
+                err += (*x as f64 - *y as f64).powi(2);
+                norm += (*x as f64).powi(2);
+            }
+            assert!(norm > 0.0, "reference is all zero");
+            (err / norm).sqrt()
+        };
+        let mut digest = 0xcbf2_9ce4_8422_2325u64;
+        // The route's minimum and the 16-row chunk boundary +-1.
+        for n in [512usize, 513, 527, 528, 529, 530] {
+            let slot = gpu.zeros(&[slot_bytes], DType::Raw).expect("slot");
+            gpu.copy_d2d(&seed_slot, &slot, slot_bytes).expect("copy slot");
+            let f32_state = gpu.zeros(&[value * dim], DType::F32).expect("state");
+            gdn_state_convert(&mut gpu, "gdn_state_q8_to_f32", slot.buf.as_ptr(), f32_state.buf.as_ptr(), value_heads, None)
+                .expect("dequantize");
+            let f32_out = run(&mut gpu, &f32_state, n);
+            let q8_out = run(&mut gpu, &slot, n);
+            let f32_final = gpu.download_f32(&f32_state).expect("download");
+            let q8_final = gpu.zeros(&[value * dim], DType::F32).expect("state");
+            gdn_state_convert(&mut gpu, "gdn_state_q8_to_f32", slot.buf.as_ptr(), q8_final.buf.as_ptr(), value_heads, None)
+                .expect("dequantize");
+            let q8_final_values = gpu.download_f32(&q8_final).expect("download");
+            // The same inputs and dequantized start: the chunk output is
+            // equal; the final state differs by one requantization.
+            assert_eq!(f32_out, q8_out, "{n} rows: Q8 chunk output differs from its F32 twin");
+            let state_rel = rel(&f32_final, &q8_final_values);
+            eprintln!("Q8 chunk {n} rows: state rel {state_rel:.3e}");
+            assert!(state_rel < 1e-2, "{n} rows: Q8 chunk state rel L2 {state_rel:.3e}");
+            let mut slot_bytes_host = vec![0u8; slot_bytes];
+            gpu.hip.memcpy_dtoh(&mut slot_bytes_host, &slot.buf).expect("download");
+            for byte in slot_bytes_host {
+                digest = (digest ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3);
+            }
+            for tensor in [slot, f32_state, q8_final] {
+                gpu.free_tensor(tensor).expect("free");
+            }
+        }
+        eprintln!("GDN_Q8_CHUNK_DIGEST {digest:016x}");
+        for tensor in [proj_bf16, gate_gpu, beta_gpu, z_gpu, norm_gpu, state0_gpu, seed_slot] {
             gpu.free_tensor(tensor).expect("free");
         }
     }
@@ -4469,6 +5276,7 @@ mod tests {
                 head_dim: 1,
                 selected_len: 1,
                 full_capacity: 1,
+                format: QsaKvFormat::F32,
             },
         )
         .expect_err("QSA attention must require four Raw bytes per index");
@@ -4501,6 +5309,7 @@ mod tests {
             value_heads: 3,
             key_dim: 2,
             value_dim: 4,
+            position: 0,
         };
 
         let error = gated_delta_step(&mut gpu, &params).expect_err("invalid shape must fail");
@@ -4639,6 +5448,7 @@ mod tests {
                 compress,
                 capacity,
                 full_capacity,
+                format: QsaKvFormat::F32,
                 shape_selected: capacity,
             },
         )
@@ -4950,6 +5760,7 @@ mod tests {
                     compress,
                     capacity,
                     full_capacity,
+                    format: QsaKvFormat::F32,
                     shape_selected: bound,
                 },
             )
@@ -5062,6 +5873,7 @@ mod tests {
                     compress,
                     capacity,
                     full_capacity,
+                    format: QsaKvFormat::F32,
                     shape_selected: capacity,
                 },
                 allow_fast,
@@ -5162,6 +5974,7 @@ mod tests {
                     compress,
                     capacity,
                     full_capacity,
+                    format: QsaKvFormat::F32,
                     shape_selected: capacity,
                 },
                 allow_fast,
@@ -5249,6 +6062,17 @@ mod tests {
             .collect()
     }
 
+    /// Arena bound whose score row exceeds the LDS limit: the global route.
+    const GLOBAL_BOUND: usize = QSA_SELECT_DYNAMIC_LDS_LIMIT_BYTES / 4 + 1;
+
+    /// The serial selection-sort oracle kernel for `case`.
+    fn run_select_serial(gpu: &mut Gpu, case: &SelectCase, pooled: &[f32], query: &[f32]) -> Vec<i32> {
+        SELECT_FORCE_SERIAL.with(|flag| flag.set(true));
+        let selected = run_select_case(gpu, case, pooled, query, case.block_count);
+        SELECT_FORCE_SERIAL.with(|flag| flag.set(false));
+        selected
+    }
+
     /// Scores that increase with the block index must select blocks in
     /// descending order, and equal scores must break ties toward the lower
     /// block index — the order the serial scan's strict `>` comparison
@@ -5311,8 +6135,6 @@ mod tests {
             eprintln!("skip: no GPU");
             return;
         };
-        const SERIAL_BOUND: usize = QSA_SELECT_DYNAMIC_LDS_LIMIT_BYTES / 4 + 1;
-
         let mut state = 0x9e37_79b9u32;
         let mut next = move || {
             state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
@@ -5348,8 +6170,15 @@ mod tests {
                                     .collect();
                                 let parallel =
                                     run_select_case(&mut gpu, &case, &pooled, &query, block_count);
-                                let serial =
-                                    run_select_case(&mut gpu, &case, &pooled, &query, SERIAL_BOUND);
+                                let serial = run_select_serial(&mut gpu, &case, &pooled, &query);
+                                let global =
+                                    run_select_case(&mut gpu, &case, &pooled, &query, GLOBAL_BOUND);
+                                assert_eq!(
+                                    global, serial,
+                                    "global-score selection diverged from the serial selection sort: \
+                                     compress={compress} heads={index_heads} dim={index_dim} \
+                                     rows={rows} blocks={block_count} budget={budget_blocks}"
+                                );
                                 assert_eq!(
                                     parallel, serial,
                                     "parallel ranking diverged from the serial selection sort: \
@@ -5374,7 +6203,6 @@ mod tests {
             eprintln!("skip: no GPU");
             return;
         };
-        const SERIAL_BOUND: usize = QSA_SELECT_DYNAMIC_LDS_LIMIT_BYTES / 4 + 1;
         let (compress, index_heads, index_dim, rows, block_count, budget_blocks) =
             (4usize, 4usize, 128usize, 3usize, 4096usize, 512usize);
         let mut state = 0x2545_f491u32;
@@ -5410,10 +6238,15 @@ mod tests {
                 position_start: block_count * compress,
             };
             let parallel = run_select_case(&mut gpu, &case, &pooled, &query, block_count);
-            let serial = run_select_case(&mut gpu, &case, &pooled, &query, SERIAL_BOUND);
+            let serial = run_select_serial(&mut gpu, &case, &pooled, &query);
+            let global = run_select_case(&mut gpu, &case, &pooled, &query, GLOBAL_BOUND);
             assert_eq!(
                 parallel, serial,
                 "past-budget radix select diverged (positive_every={positive_every})"
+            );
+            assert_eq!(
+                global, serial,
+                "past-budget global-score select diverged (positive_every={positive_every})"
             );
             if positive_every == 0 {
                 // All tied: the lowest 512 block indices, in index order.
@@ -5421,6 +6254,40 @@ mod tests {
                 assert_eq!(&parallel[..budget_blocks * compress], &expected[..]);
             }
         }
+    }
+
+    /// A prefill-sized batch (more rows than one global-score launch holds)
+    /// runs in row groups; each row's selection must equal the single-launch
+    /// LDS route's, including rows whose visible prefix ends mid-block.
+    #[test]
+    fn global_score_row_groups_match_the_lds_route() {
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        let (compress, index_heads, index_dim, rows, block_count, budget_blocks) =
+            (4usize, 4usize, 128usize, 2 * QSA_SELECT_GLOBAL_ROWS + 37, 4096usize, 512usize);
+        let mut state = 0x7f4a_7c15u32;
+        let mut next = move || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (state >> 8) as f32 / 8_388_608.0 - 1.0
+        };
+        let query: Vec<f32> = (0..rows * index_heads * index_dim).map(|_| next()).collect();
+        let pooled: Vec<f32> = (0..block_count * index_dim).map(|_| next()).collect();
+        let case = SelectCase {
+            compress,
+            index_heads,
+            index_dim,
+            rows,
+            block_count,
+            budget_blocks,
+            capacity: budget_blocks * compress + compress - 1,
+            // (position_start + rows) / compress == block_count.
+            position_start: block_count * compress - rows + 2,
+        };
+        let lds = run_select_case(&mut gpu, &case, &pooled, &query, block_count);
+        let global = run_select_case(&mut gpu, &case, &pooled, &query, GLOBAL_BOUND);
+        assert_eq!(global, lds, "grouped global-score selection diverged from the LDS route");
     }
 
     #[test]
@@ -5556,5 +6423,492 @@ mod tests {
         }
         gpu.free_tensor(values).expect("free query/gate");
         gpu.free_tensor(norm).expect("free norm");
+    }
+
+    /// Formats this device has QSA kernels for, beyond F32 (fp8: gfx12 only).
+    fn quantized_qsa_formats(gpu: &Gpu) -> Vec<QsaKvFormat> {
+        if gpu.arch_caps.is_gfx1200() || gpu.arch_caps.is_gfx1201() {
+            vec![QsaKvFormat::Fp8]
+        } else {
+            eprintln!("skip: fp8 QSA K/V needs a gfx12 GPU");
+            Vec::new()
+        }
+    }
+
+    fn qsa_lcg(seed: usize, n: usize) -> Vec<f32> {
+        (0..n)
+            .map(|i| {
+                ((i.wrapping_mul(2_654_435_761).wrapping_add(seed) % 2003) as f32 - 1001.0) / 997.0
+            })
+            .collect()
+    }
+
+    fn f16_to_f32(bits: u16) -> f32 {
+        let sign = if bits & 0x8000 != 0 { -1.0 } else { 1.0 };
+        let exponent = ((bits >> 10) & 0x1F) as i32;
+        let mantissa = (bits & 0x3FF) as f32;
+        sign * if exponent == 0 {
+            mantissa / 1024.0 * 2f32.powi(-14)
+        } else {
+            (1.0 + mantissa / 1024.0) * 2f32.powi(exponent - 15)
+        }
+    }
+
+    /// Round-to-nearest-even BF16 bits of a finite value.
+    fn bf16_bits(value: f32) -> u16 {
+        let bits = value.to_bits();
+        ((bits + 0x7FFF + ((bits >> 16) & 1)) >> 16) as u16
+    }
+
+    fn e4m3_to_f32(code: u8) -> f32 {
+        let sign = if code & 0x80 != 0 { -1.0 } else { 1.0 };
+        let exponent = ((code >> 3) & 0xF) as i32;
+        let mantissa = (code & 7) as f32;
+        sign * if exponent == 0 {
+            mantissa / 8.0 * 2f32.powi(-6)
+        } else {
+            (1.0 + mantissa / 8.0) * 2f32.powi(exponent - 7)
+        }
+    }
+
+    /// Host dequantization of `tokens` quantized K or V rows.
+    fn dequantize_qsa_rows(
+        format: QsaKvFormat,
+        bytes: &[u8],
+        tokens: usize,
+        kv_heads: usize,
+        head_dim: usize,
+    ) -> Vec<f32> {
+        let row = format.kv_row_bytes(kv_heads, head_dim);
+        let half = |at: usize| f16_to_f32(u16::from_le_bytes([bytes[at], bytes[at + 1]]));
+        let mut values = Vec::with_capacity(tokens * kv_heads * head_dim);
+        for token in 0..tokens {
+            let base = token * row;
+            for element in 0..kv_heads * head_dim {
+                values.push(match format {
+                    QsaKvFormat::Fp8 => {
+                        let scale = half(base + kv_heads * head_dim + element / head_dim * 2);
+                        e4m3_to_f32(bytes[base + element]) * scale
+                    }
+                    QsaKvFormat::F32 => unreachable!("F32 rows are not quantized"),
+                });
+            }
+        }
+        values
+    }
+
+    fn rel_l2(reference: &[f32], actual: &[f32]) -> f64 {
+        let (mut err, mut norm) = (0.0f64, 0.0f64);
+        for (r, a) in reference.iter().zip(actual) {
+            err += (*r as f64 - *a as f64).powi(2);
+            norm += (*r as f64).powi(2);
+        }
+        (err / norm).sqrt()
+    }
+
+    fn download_bytes(gpu: &Gpu, tensor: &GpuTensor) -> Vec<u8> {
+        let mut bytes = vec![0u8; tensor.byte_size()];
+        gpu.hip
+            .memcpy_dtoh(&mut bytes, &tensor.buf)
+            .expect("download");
+        bytes
+    }
+
+    /// The decode prologue and the prefill appends must write the same
+    /// quantized K/V rows and BF16 raw index keys for the same rows (decode
+    /// after prefill reads what token-by-token decode would have written),
+    /// and those rows must dequantize to the keys and values they encode.
+    #[test]
+    fn qsa_quantized_prologue_and_prefill_appends_write_identical_rows() {
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        let (heads, kv_heads, head_dim) = (4usize, 2usize, 256usize);
+        let (index_heads, index_dim, index_kv_width) = (4usize, 128usize, 128usize);
+        let (rows, position, capacity) = (3usize, 5usize, 16usize);
+        let index_width = index_heads * index_dim + index_kv_width;
+        let kv_width = kv_heads * head_dim;
+        for format in quantized_qsa_formats(&gpu) {
+            let row_units = format.kv_row_units(kv_heads, head_dim);
+            let index_row = qsa_lcg(3, rows * index_width);
+            let index_gpu = gpu.upload_f32(&index_row, &[index_row.len()]).expect("index");
+            let qgate = qsa_lcg(5, rows * 2 * heads * head_dim);
+            let qgate_gpu = gpu.upload_f32(&qgate, &[qgate.len()]).expect("qgate");
+            let keys = qsa_lcg(7, rows * kv_width);
+            let keys_gpu = gpu.upload_f32(&keys, &[keys.len()]).expect("keys");
+            let values = qsa_lcg(11, rows * kv_width);
+            let values_gpu = gpu.upload_f32(&values, &[values.len()]).expect("values");
+            let index_norm = gpu.zeros(&[index_dim], DType::BF16).expect("index norm");
+            let head_norm = gpu.zeros(&[head_dim], DType::BF16).expect("head norm");
+            let cache = |gpu: &mut Gpu| {
+                gpu.zeros(&[capacity * row_units], format.kv_dtype())
+                    .expect("cache")
+            };
+            let (decode_k, decode_v, prefill_k, prefill_v) =
+                (cache(&mut gpu), cache(&mut gpu), cache(&mut gpu), cache(&mut gpu));
+            let decode_raw = gpu
+                .zeros(&[capacity * index_kv_width], DType::BF16)
+                .expect("raw");
+            let prefill_raw = gpu
+                .zeros(&[capacity * index_kv_width], DType::BF16)
+                .expect("raw");
+            indexed_attention_decode_prologue(
+                &mut gpu,
+                &IndexedAttentionDecodePrologue {
+                    index_row: &index_gpu,
+                    qgate: &qgate_gpu,
+                    keys: &keys_gpu,
+                    values: &values_gpu,
+                    full_keys: &decode_k,
+                    full_values: &decode_v,
+                    raw_index_keys: &decode_raw,
+                    index_q_norm: &index_norm,
+                    q_norm: &head_norm,
+                    k_norm: &head_norm,
+                    index_heads,
+                    index_dim,
+                    index_kv_width,
+                    heads,
+                    kv_heads,
+                    head_dim,
+                    position,
+                    rows,
+                    format,
+                },
+            )
+            .expect("QSA prologue");
+            // The prologue leaves the normed keys and rounded index keys in
+            // its scratch: the prefill appends start from those.
+            indexed_attention_cache_append_batch(
+                &mut gpu,
+                &IndexedAttentionCacheAppendBatch {
+                    key: &keys_gpu,
+                    value: &values_gpu,
+                    full_keys: &prefill_k,
+                    full_values: &prefill_v,
+                    rows,
+                    position_start: position,
+                    kv_heads,
+                    head_dim,
+                    format,
+                },
+            )
+            .expect("QSA append");
+            indexed_attention_index_key_append_batch(
+                &mut gpu,
+                &IndexedAttentionIndexKeyAppendBatch {
+                    index_rows: &index_gpu,
+                    raw_index_keys: &prefill_raw,
+                    rows,
+                    index_q_width: index_heads * index_dim,
+                    index_kv_width,
+                    position_start: position,
+                },
+            )
+            .expect("QSA index-key append");
+            let name = format.name();
+            for (decode, prefill, what) in [
+                (&decode_k, &prefill_k, "keys"),
+                (&decode_v, &prefill_v, "values"),
+                (&decode_raw, &prefill_raw, "raw index keys"),
+            ] {
+                assert_eq!(
+                    download_bytes(&gpu, decode),
+                    download_bytes(&gpu, prefill),
+                    "{name} prologue and prefill {what} differ"
+                );
+            }
+            let row_bytes = format.kv_row_bytes(kv_heads, head_dim);
+            let tail = |tensor: &GpuTensor| {
+                download_bytes(&gpu, tensor)[position * row_bytes..].to_vec()
+            };
+            let normed = gpu.download_f32(&keys_gpu).expect("normed keys");
+            let (k_rows, v_rows) = (tail(&decode_k), tail(&decode_v));
+            let dequant_k = dequantize_qsa_rows(format, &k_rows, rows, kv_heads, head_dim);
+            let dequant_v = dequantize_qsa_rows(format, &v_rows, rows, kv_heads, head_dim);
+            // E4M3 keeps 3 mantissa bits. A wrong head or scale lands near 1.
+            let tolerance = 5e-2;
+            for (reference, actual, what) in
+                [(&normed, &dequant_k, "keys"), (&values, &dequant_v, "values")]
+            {
+                let rel = rel_l2(reference, actual);
+                assert!(rel < tolerance, "{name} {what} rel L2 {rel:.3e}");
+            }
+            for tensor in [
+                index_gpu, qgate_gpu, keys_gpu, values_gpu, index_norm, head_norm, decode_k,
+                decode_v, prefill_k, prefill_v, decode_raw, prefill_raw,
+            ] {
+                gpu.free_tensor(tensor).expect("free");
+            }
+        }
+    }
+
+    /// Every quantized attention kernel must agree bit for bit with its
+    /// per-head twin (grouped hg4 batch, single-row) and stay near the F32
+    /// reference at the production head shape.
+    #[test]
+    fn qsa_quantized_attention_kernels_agree() {
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        if !gpu.arch_caps.has_gfx11_plus_simt() {
+            eprintln!("skip: needs a gfx11/gfx12 GPU");
+            return;
+        }
+        let (n_heads, n_kv_heads, head_dim, compress) = (24usize, 2usize, 256usize, 4usize);
+        let (rows, position_start, full_capacity) = (20usize, 610usize, 640usize);
+        let budget_blocks = 150usize;
+        let capacity = budget_blocks * compress + compress - 1;
+        let kv_width = n_kv_heads * head_dim;
+        let q = qsa_lcg(1, rows * n_heads * 2 * head_dim);
+        let keys = qsa_lcg(7, full_capacity * kv_width);
+        let values = qsa_lcg(13, full_capacity * kv_width);
+        let mut selected = vec![-1i32; rows * capacity];
+        for row in 0..rows {
+            let visible = position_start + row + 1;
+            let blocks = visible / compress;
+            let chosen = budget_blocks.min(blocks);
+            for slot in 0..chosen {
+                let block = (blocks - 1 - (slot * 7 + row) % blocks) as i32;
+                for r in 0..compress {
+                    selected[row * capacity + slot * compress + r] =
+                        block * compress as i32 + r as i32;
+                }
+            }
+            let mut offset = chosen * compress;
+            for token in blocks * compress..visible {
+                selected[row * capacity + offset] = token as i32;
+                offset += 1;
+            }
+            selected[row * capacity + 3] = -1;
+        }
+        let q_gpu = gpu.upload_f32(&q, &[q.len()]).expect("q upload");
+        let keys_gpu = gpu.upload_f32(&keys, &[keys.len()]).expect("keys upload");
+        let values_gpu = gpu.upload_f32(&values, &[values.len()]).expect("values upload");
+        let selected_gpu = gpu
+            .zeros(&[selected.len() * 4], DType::Raw)
+            .expect("selected allocation");
+        let selected_bytes: Vec<u8> = selected.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        gpu.hip
+            .memcpy_htod(&selected_gpu.buf, &selected_bytes)
+            .expect("selected upload");
+        let run = |gpu: &mut Gpu,
+                   format: QsaKvFormat,
+                   k: &GpuTensor,
+                   v: &GpuTensor,
+                   allow_fast: bool| {
+            let output = gpu
+                .zeros(&[rows * n_heads * head_dim], DType::F32)
+                .expect("output");
+            indexed_attention_attention_batch_impl(
+                gpu,
+                &IndexedAttentionAttentionBatch {
+                    q_with_gate: &q_gpu,
+                    full_keys: k,
+                    full_values: v,
+                    selected: &selected_gpu,
+                    output: &output,
+                    rows,
+                    position_start,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    budget_blocks,
+                    compress,
+                    capacity,
+                    full_capacity,
+                    format,
+                    shape_selected: capacity,
+                },
+                allow_fast,
+            )
+            .expect("QSA attention");
+            let result = gpu.download_f32(&output).expect("output download");
+            gpu.free_tensor(output).expect("free output");
+            result
+        };
+        let reference = run(&mut gpu, QsaKvFormat::F32, &keys_gpu, &values_gpu, false);
+        for format in quantized_qsa_formats(&gpu) {
+            let name = format.name();
+            let row_units = format.kv_row_units(n_kv_heads, head_dim);
+            let k = gpu
+                .zeros(&[full_capacity * row_units], format.kv_dtype())
+                .expect("K");
+            let v = gpu
+                .zeros(&[full_capacity * row_units], format.kv_dtype())
+                .expect("V");
+            indexed_attention_cache_append_batch(
+                &mut gpu,
+                &IndexedAttentionCacheAppendBatch {
+                    key: &keys_gpu,
+                    value: &values_gpu,
+                    full_keys: &k,
+                    full_values: &v,
+                    rows: full_capacity,
+                    position_start: 0,
+                    kv_heads: n_kv_heads,
+                    head_dim,
+                    format,
+                },
+            )
+            .expect("QSA append");
+            let per_head = run(&mut gpu, format, &k, &v, false);
+            let grouped = run(&mut gpu, format, &k, &v, true);
+            let differing = per_head
+                .iter()
+                .zip(&grouped)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            assert_eq!(differing, 0, "{name} grouped attention differs in {differing} cells");
+            let rel = rel_l2(&reference, &per_head);
+            let tolerance = 5e-2;
+            assert!(rel > 0.0 && rel < tolerance, "{name} attention rel L2 {rel:.3e}");
+            // The single-row entry (explicit selection length) is the batched
+            // per-head body for that row.
+            let row = rows - 1;
+            let visible = position_start + row + 1;
+            let blocks = visible / compress;
+            let selected_len = budget_blocks.min(blocks) * compress + visible - blocks * compress;
+            let row_q = q_gpu.sub_offset(row * n_heads * 2 * head_dim, n_heads * 2 * head_dim);
+            let row_selected = selected_gpu.sub_offset(row * capacity * 4, capacity * 4);
+            let output = gpu.zeros(&[n_heads * head_dim], DType::F32).expect("output");
+            indexed_attention_attention(
+                &mut gpu,
+                &IndexedAttentionAttention {
+                    q_with_gate: &row_q,
+                    full_keys: &k,
+                    full_values: &v,
+                    selected: &row_selected,
+                    output: &output,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    selected_len,
+                    full_capacity: visible,
+                    format,
+                },
+            )
+            .expect("QSA single-row attention");
+            let single = gpu.download_f32(&output).expect("single download");
+            let batched_row = &per_head[row * n_heads * head_dim..];
+            assert!(
+                single.iter().zip(batched_row).all(|(a, b)| a.to_bits() == b.to_bits()),
+                "{name} single-row attention differs from the batched row"
+            );
+            for tensor in [output, k, v] {
+                gpu.free_tensor(tensor).expect("free");
+            }
+        }
+        for tensor in [q_gpu, keys_gpu, values_gpu, selected_gpu] {
+            gpu.free_tensor(tensor).expect("free");
+        }
+    }
+
+    /// BF16 raw/pooled index arenas hold the same BF16 values as F32 arenas,
+    /// so pooling and both selection kernels must produce identical pooled
+    /// keys and selections.
+    #[test]
+    fn qsa_bf16_index_arenas_pool_and_select_like_f32() {
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        let (compress, index_heads, index_dim) = (4usize, 4usize, 128usize);
+        let (rows, position_start, budget_blocks) = (3usize, 1021usize, 64usize);
+        let block_count = (position_start + rows) / compress;
+        let capacity = budget_blocks * compress + compress - 1;
+        // Raw keys are BF16-rounded before they reach the arena.
+        let raw: Vec<f32> = qsa_lcg(17, block_count * compress * index_dim)
+            .into_iter()
+            .map(|v| f32::from_bits((bf16_bits(v) as u32) << 16))
+            .collect();
+        let raw_bits: Vec<u8> = raw
+            .iter()
+            .flat_map(|v| bf16_bits(*v).to_le_bytes())
+            .collect();
+        let raw_f32 = gpu.upload_f32(&raw, &[raw.len()]).expect("raw f32");
+        let raw_bf16 = gpu.zeros(&[raw.len()], DType::BF16).expect("raw bf16");
+        gpu.hip
+            .memcpy_htod(&raw_bf16.buf, &raw_bits)
+            .expect("raw bf16 upload");
+        let norm_bits: Vec<u8> = qsa_lcg(19, index_dim)
+            .iter()
+            .flat_map(|v| bf16_bits(v * 0.25).to_le_bytes())
+            .collect();
+        let norm = gpu.zeros(&[index_dim], DType::BF16).expect("norm");
+        gpu.hip.memcpy_htod(&norm.buf, &norm_bits).expect("norm upload");
+        let pooled_f32 = gpu
+            .zeros(&[block_count * index_dim], DType::F32)
+            .expect("pooled f32");
+        let pooled_bf16 = gpu
+            .zeros(&[block_count * index_dim], DType::BF16)
+            .expect("pooled bf16");
+        for (raw_keys, pooled) in [(&raw_f32, &pooled_f32), (&raw_bf16, &pooled_bf16)] {
+            indexed_attention_pool_rope(
+                &mut gpu,
+                &IndexedAttentionPoolRope {
+                    raw_keys,
+                    pooled,
+                    norm: Some(&norm),
+                    block_count,
+                    compress,
+                    index_dim,
+                    position: None,
+                    grid_bound: block_count,
+                },
+            )
+            .expect("QSA pool");
+        }
+        let pooled_reference = gpu.download_f32(&pooled_f32).expect("pooled f32");
+        let pooled_widened: Vec<f32> = download_bytes(&gpu, &pooled_bf16)
+            .chunks_exact(2)
+            .map(|b| f32::from_bits((u16::from_le_bytes([b[0], b[1]]) as u32) << 16))
+            .collect();
+        assert!(
+            pooled_reference
+                .iter()
+                .zip(&pooled_widened)
+                .all(|(a, b)| a.to_bits() == b.to_bits()),
+            "BF16 pooled keys differ from the F32 arena"
+        );
+        let query = qsa_lcg(23, rows * index_heads * index_dim);
+        let query_gpu = gpu.upload_f32(&query, &[query.len()]).expect("query");
+        // The parallel kernel, then the serial one (a shape bound past its LDS).
+        for shape_blocks in [block_count, QSA_SELECT_DYNAMIC_LDS_LIMIT_BYTES / 4 + 1] {
+            let mut selections = Vec::new();
+            for pooled in [&pooled_f32, &pooled_bf16] {
+                let selected = gpu.zeros(&[rows * capacity * 4], DType::Raw).expect("selected");
+                indexed_attention_select_batch(
+                    &mut gpu,
+                    &IndexedAttentionSelectBatch {
+                        query: &query_gpu,
+                        pooled,
+                        selected: &selected,
+                        rows,
+                        query_row_stride: index_heads * index_dim,
+                        block_count,
+                        index_heads,
+                        index_dim,
+                        budget_blocks,
+                        compress,
+                        position_start,
+                        capacity,
+                        shape_blocks,
+                    },
+                )
+                .expect("QSA select");
+                selections.push(download_bytes(&gpu, &selected));
+                gpu.free_tensor(selected).expect("free selected");
+            }
+            assert_eq!(
+                selections[0], selections[1],
+                "BF16 selection differs (shape bound {shape_blocks})"
+            );
+        }
+        for tensor in [raw_f32, raw_bf16, norm, pooled_f32, pooled_bf16, query_gpu] {
+            gpu.free_tensor(tensor).expect("free");
+        }
     }
 }

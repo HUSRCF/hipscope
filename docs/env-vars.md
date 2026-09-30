@@ -93,7 +93,7 @@ Values and defaults below match `hipfire-config`, the native CLI, and/or `Runtim
 
 | Variable | Default / sense | Source |
 |---|---|---|
-| `HIPFIRE_KV_MODE` | From config; **`auto` → registry non-q8 `default_kv_mode`, else Qwen-family native `fp8` on exact gfx1201 when native-eligible (H24/Hkv4/D256, single GPU, no adaptive/CASK), else Qwen Q8/Q8** (gfx1100, gfx1151 and every other load; explicit `--kv-mode q8` still honored). `fwht2`/`fwht3`/`fwht4` are optional headroom modes that `auto` does not select (only the kill switch below does); `asymN`/`turboN` are legacy spellings (Qwen aliases of `fwhtN`). Non-Qwen families keep their own defaults (Maple BF16, Gemma layered, DeepSeek compressor). | CLI / pair resolver; **not** a legacy hard-coded fwht-per-arch table |
+| `HIPFIRE_KV_MODE` | From config; **`auto` → registry non-q8 `default_kv_mode`, else Qwen-family native `fp8` on exact gfx1201 when native-eligible (H24/Hkv4/D256, single GPU, no adaptive/CASK), else Qwen Q8/Q8** (gfx1100, gfx1151 and every other load; explicit `--kv-mode q8` still honored). `fwht2`/`fwht3`/`fwht4` are optional headroom modes that `auto` does not select (only the kill switch below does); `asymN`/`turboN` are legacy spellings (Qwen aliases of `fwhtN`). Qwen4 / Flash-Next (arch 16) accepts only `auto`, `bf16` and `fp8`: `auto` is fp8 QSA K/V on exact gfx1201 and `bf16` elsewhere ([`CONFIG.md`](CONFIG.md#mode-k-and-v)). Non-Qwen families keep their own defaults (Maple BF16, Gemma layered, DeepSeek compressor). | CLI / pair resolver; **not** a legacy hard-coded fwht-per-arch table |
 | `HIPFIRE_KV_ADAPTIVE` | off unless set / param | Loader/CLI |
 | `HIPFIRE_KV_PHYSICAL_CAP` | optional physical slot cap | Daemon |
 | `HIPFIRE_KV_V` | **developer-only** V-axis override (e.g. `lloyd2`/`lloyd3`/`lloyd4`); **lower precedence** than an authored `--kv-v` or `memory.kv_v` | Qwen carrier (`developer_var`); not a second user config plane — prefer CLI/TOML |
@@ -445,7 +445,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 1354
+**Count:** 1355
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -1517,7 +1517,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_QWEN3_TOP_P` | crates/hipfire-arch-llama/examples/qwen3_dspark_bench.rs | harness |
 | `HIPFIRE_QWEN3_WARMUP` | crates/hipfire-arch-llama/examples/qwen3_dspark_bench.rs | harness |
 | `HIPFIRE_QWEN4_CAPACITY_BYTES` | crates/hipfire-quantize/src/qwen4.rs | developer |
-| `HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS` | crates/hipfire-arch-qwen4/src/expert_residency.rs, crates/hipfire-loader/src/admission.rs | developer |
+| `HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS` | crates/hip-bridge/src/ffi.rs, crates/hipfire-loader/src/admission.rs | developer |
 | `HIPFIRE_QWEN4_F16_WMMA` | crates/hipfire-arch-qwen4/examples/qwen4_qsa_ctx.rs, crates/rdna-compute/src/gemm.rs | developer |
 | `HIPFIRE_QWEN4_F16_WMMA_GFX1201` | crates/rdna-compute/examples/bench_qwen4_hc_wmma.rs, crates/rdna-compute/src/gemm.rs | developer |
 | `HIPFIRE_QWEN4_MTP_TIER` | crates/hipfire-arch-qwen4/src/weights.rs | developer |
@@ -1715,6 +1715,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_SPEC_WINDOW_ROLLBACK` | crates/hipfire-config/src/lib.rs | developer |
 | `HIPFIRE_SPE_OUT_ROOT` | benchmarks/quality-baselines/harness/spe_ablation.sh | harness |
 | `HIPFIRE_SPILL_DIR` | crates/hipfire-config/src/lib.rs, crates/hipfire-quantize/src/pipeline.rs | stable |
+| `HIPFIRE_STATE_QUANT` | crates/hipfire-arch-qwen4/examples/qwen4_kld.rs, crates/hipfire-arch-qwen4/examples/qwen4_qsa_ctx.rs | harness |
 | `HIPFIRE_SWEEP_MAX` | scripts/ddtree_budget_sweep.sh | harness |
 | `HIPFIRE_SWEEP_OUT` | scripts/mq3-mq2-sweep.sh, scripts/spec_decode_genre_sweep.sh | harness |
 | `HIPFIRE_SWEEP_PROMPTS_DIR` | scripts/mq3-mq2-sweep.sh | harness |

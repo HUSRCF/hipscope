@@ -28,6 +28,50 @@ static __device__ __forceinline__ __hip_bfloat16 bf16_add(
     return bf16_round(bf16_to_f32(lhs) + bf16_to_f32(rhs));
 }
 
+// Q8 GDN recurrent state: Qwen3.5's DeltaNet Q8 state format
+// (gated_delta_net_q8_fast.hip). Per value head, 128 rows of 128 signed
+// bytes (row = value channel, byte = key channel), then, after every head's
+// codes, one F32 scale per row (`value_heads * 128`). A row dequantizes as
+// scale * code. A launch requantizes each row once, after its last token, by
+// the row's absmax with Qwen3.5's stochastic rounding (floor(x * 127 / absmax
+// + u), u uniform in [0, 1) from an LCG seeded by head, row, key channel and
+// frame), so repeated decay does not bias the stored state.
+static __device__ __forceinline__ signed char* gdn_q8_row(void* slot, int head, int row) {
+    return reinterpret_cast<signed char*>(slot) + ((size_t)head * 128 + row) * 128;
+}
+
+static __device__ __forceinline__ float* gdn_q8_scales(void* slot, int value_heads) {
+    return reinterpret_cast<float*>(
+        reinterpret_cast<signed char*>(slot) + (size_t)value_heads * 128 * 128);
+}
+
+static __device__ __forceinline__ size_t gdn_q8_slot_bytes(int value_heads) {
+    return (size_t)value_heads * 128 * (128 + sizeof(float));
+}
+
+static __device__ __forceinline__ signed char gdn_q8_round(
+    float value, float inv, int head, int row, int column, unsigned int frame) {
+    unsigned int rng = (unsigned int)head * 1664525u + (unsigned int)row * 1013904223u
+        + (unsigned int)column * 214013u + frame * 2531011u;
+    rng = rng * 1664525u + 1013904223u;
+    const float noise = (float)(rng >> 8) * (1.0f / 16777216.0f);
+    return (signed char)fminf(fmaxf(floorf(value * inv + noise), -128.0f), 127.0f);
+}
+
+static __device__ __forceinline__ float gdn_q8_inv(float peak) {
+    return peak > 0.0f ? 127.0f / peak : 0.0f;
+}
+
+static __device__ __forceinline__ float gdn_q8_scale(float peak) {
+    return peak > 0.0f ? peak / 127.0f : 1.0f;
+}
+
+// Code `b` (0..15, a constant after unrolling) of a 16-byte code word.
+static __device__ __forceinline__ float gdn_q8_code(int4 word, int b) {
+    const int lane = b < 4 ? word.x : b < 8 ? word.y : b < 12 ? word.z : word.w;
+    return (float)(signed char)(lane >> ((b & 3) * 8));
+}
+
 
 
 // q/k/v are source BF16 activations promoted to the explicit F32 recurrent
@@ -112,19 +156,23 @@ extern "C" __global__ void gated_delta_step_f32(
 // One decode step of the 128x128 recurrence for block `value_head`; returns
 // false for threads outside the exact shape, else writes the thread's
 // channel output to `*out`. Shared by the step kernel and the fused
-// step + gated-norm kernel below.
+// step + gated-norm kernel below. `kQ8`: `state` is a Q8 GDN state slot
+// (see gdn_q8_row) and `frame` seeds its requantization; else F32
+// [head][key][value] and `frame` is unused.
+template <bool kQ8>
 static __device__ __forceinline__ bool gated_delta_step_norm128_body(
     const float* q,
     const float* k,
     const float* v,
     const float* gate,
     const float* beta,
-    float* state,
+    void* state,
     int key_heads,
     int value_heads,
     int key_dim,
     int value_dim,
     float query_scale,
+    unsigned int frame,
     float* out_value) {
     const int value_head = (int)blockIdx.x;
     const int value_index = (int)(blockIdx.y * blockDim.x + threadIdx.x);
@@ -200,8 +248,64 @@ static __device__ __forceinline__ bool gated_delta_step_norm128_body(
     const int key_head = value_head / repeat;
     const float decay = expf(gate[value_head]);
     const float beta_value = beta[value_head];
+    const __hip_bfloat16 v_value = bf16_round(
+        v[value_head * 128 + value_index]);
+    if constexpr (kQ8) {
+        // The thread's value row: 128 key-channel codes, read 16 at a time
+        // (a 16-byte word per step, from cache after the first pass) and
+        // dequantized on use. The update is the F32 route's expression on
+        // the dequantized state; the row is requantized from the updated
+        // values (recomputed, not stored) after the output.
+        int4* row = reinterpret_cast<int4*>(gdn_q8_row(state, value_head, value_index));
+        float* scale_slot = gdn_q8_scales(state, value_heads) + value_head * 128 + value_index;
+        const float scale = *scale_slot;
+        float kv_mem = 0.0f;
+        for (int word = 0; word < 8; ++word) {
+            const int4 codes = row[word];
+#pragma unroll
+            for (int b = 0; b < 16; ++b) {
+                const int kd = word * 16 + b;
+                const float kv = bf16_to_f32(k_norm[kd]);
+                const float decayed = (scale * gdn_q8_code(codes, b)) * decay;
+                kv_mem += decayed * kv;
+            }
+        }
+        const float delta = (bf16_to_f32(v_value) - kv_mem) * beta_value;
+        float out = 0.0f;
+        float peak = 0.0f;
+        for (int word = 0; word < 8; ++word) {
+            const int4 codes = row[word];
+#pragma unroll
+            for (int b = 0; b < 16; ++b) {
+                const int kd = word * 16 + b;
+                const float kv = bf16_to_f32(k_norm[kd]);
+                const float decayed = fmaf(kv, delta, (scale * gdn_q8_code(codes, b)) * decay);
+                peak = fmaxf(peak, fabsf(decayed));
+                float qv = bf16_to_f32(q_norm[kd]);
+                qv *= query_scale;
+                out += decayed * qv;
+            }
+        }
+        const float inv = gdn_q8_inv(peak);
+        for (int word = 0; word < 8; ++word) {
+            const int4 codes = row[word];
+            int packed[4] = {0, 0, 0, 0};
+#pragma unroll
+            for (int b = 0; b < 16; ++b) {
+                const int kd = word * 16 + b;
+                const float kv = bf16_to_f32(k_norm[kd]);
+                const float decayed = fmaf(kv, delta, (scale * gdn_q8_code(codes, b)) * decay);
+                const int code = gdn_q8_round(decayed, inv, value_head, value_index, kd, frame);
+                packed[b >> 2] |= (code & 0xff) << ((b & 3) * 8);
+            }
+            row[word] = make_int4(packed[0], packed[1], packed[2], packed[3]);
+        }
+        *scale_slot = gdn_q8_scale(peak);
+        *out_value = out;
+        return true;
+    }
     const int state_base = value_head * 128 * 128;
-    float* column = state + state_base + value_index;
+    float* column = reinterpret_cast<float*>(state) + state_base + value_index;
     // Two passes over the state column (read; read + write) instead of four
     // reads and two writes: the decayed value is recomputed, not stored, and
     // the update and output share a pass. Same per-element operations.
@@ -211,8 +315,6 @@ static __device__ __forceinline__ bool gated_delta_step_norm128_body(
         const float decayed = column[kd * 128] * decay;
         kv_mem += decayed * kv;
     }
-    const __hip_bfloat16 v_value = bf16_round(
-        v[value_head * 128 + value_index]);
     const float delta = (bf16_to_f32(v_value) - kv_mem) * beta_value;
     float out = 0.0f;
     for (int kd = 0; kd < 128; ++kd) {
@@ -230,23 +332,27 @@ static __device__ __forceinline__ bool gated_delta_step_norm128_body(
 }
 
 extern "C" __global__ void gated_delta_step_shared_norm128_gfx1151(
-    const float* q,
-    const float* k,
-    const float* v,
-    const float* gate,
-    const float* beta,
-    float* state,
-    float* output,
-    int key_heads,
-    int value_heads,
-    int key_dim,
-    int value_dim,
+    const float* q, const float* k, const float* v, const float* gate, const float* beta,
+    float* state, float* output, int key_heads, int value_heads, int key_dim, int value_dim,
     float query_scale) {
     float out;
-    if (gated_delta_step_norm128_body(q, k, v, gate, beta, state, key_heads, value_heads,
-                                      key_dim, value_dim, query_scale, &out))
+    if (gated_delta_step_norm128_body<false>(q, k, v, gate, beta, state, key_heads, value_heads,
+                                             key_dim, value_dim, query_scale, 0u, &out))
         output[blockIdx.x * 128 + (blockIdx.y * blockDim.x + threadIdx.x)] = out;
 }
+
+// gated_delta_step_shared_norm128_gfx1151 on a Q8 GDN state slot.
+extern "C" __global__ void gated_delta_step_norm128_q8(
+    const float* q, const float* k, const float* v, const float* gate, const float* beta,
+    signed char* state, float* output, int key_heads, int value_heads, int key_dim,
+    int value_dim, float query_scale, unsigned int frame) {
+    float out;
+    if (gated_delta_step_norm128_body<true>(q, k, v, gate, beta, state, key_heads, value_heads,
+                                            key_dim, value_dim, query_scale, frame, &out))
+        output[blockIdx.x * 128 + (blockIdx.y * blockDim.x + threadIdx.x)] = out;
+}
+
+
 // Workgroup barrier ordering LDS only: every handoff in the persistent GDN
 // step is through LDS, and a full __syncthreads would also wait at each
 // barrier for the row's global stores (outputs, captured states) to land.
@@ -274,21 +380,25 @@ __device__ __forceinline__ void gdn_lds_barrier() {
 // pre-verify state stays intact, and a rollback re-runs the kept rows from
 // it); a separate instantiation so the plain route's register allocation is
 // unchanged.
-template <bool kCapture>
+// `kQ8`: `state` and the `row_states` slots are Q8 GDN state slots (see
+// gdn_q8_row) and `frame` seeds the final requantization; the recurrence
+// runs on the dequantized F32 values.
+template <bool kCapture, bool kQ8 = false>
 __device__ __forceinline__ void gated_delta_step_persistent256_body(
     const float* projection,
     const float* gate,
     const float* beta,
-    float* state,
+    void* state,
     float* output,
-    float* row_states,
+    void* row_states,
     int rows,
     int qkv_width,
     int key_heads,
     int value_heads,
     int key_dim,
     int value_dim,
-    float query_scale) {
+    float query_scale,
+    unsigned int frame = 0u) {
     const int value_head = (int)blockIdx.x;
     const int thread = (int)threadIdx.x;
     const int value_index = thread & 127;
@@ -317,10 +427,23 @@ __device__ __forceinline__ void gated_delta_step_persistent256_body(
     __shared__ float handoff_out[128];
 
     float state_half[64];
-    #pragma unroll
-    for (int kd = 0; kd < 64; ++kd) {
-        state_half[kd] =
-            state[state_base + (kd_base + kd) * 128 + value_index];
+    if constexpr (kQ8) {
+        const int4* codes4 =
+            reinterpret_cast<const int4*>(gdn_q8_row(state, value_head, value_index) + kd_base);
+        const float scale =
+            gdn_q8_scales(state, value_heads)[value_head * 128 + value_index];
+        int4 packed[4];
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) packed[i] = codes4[i];
+        const signed char* codes = reinterpret_cast<const signed char*>(packed);
+        #pragma unroll
+        for (int kd = 0; kd < 64; ++kd) state_half[kd] = scale * (float)codes[kd];
+    } else {
+        #pragma unroll
+        for (int kd = 0; kd < 64; ++kd) {
+            state_half[kd] = reinterpret_cast<const float*>(
+                state)[state_base + (kd_base + kd) * 128 + value_index];
+        }
     }
 
     // Half 0 carries q/k channel value_index, half 1 carries v.
@@ -471,8 +594,40 @@ __device__ __forceinline__ void gated_delta_step_persistent256_body(
         }
     }
 
-    float* const final_state =
-        kCapture ? row_states + (size_t)(rows - 1) * value_heads * 128 * 128 : state;
+    if constexpr (kQ8) {
+        // The row's absmax spans both halves: exchange the half peaks.
+        __shared__ float peak_half[2][128];
+        float peak = 0.0f;
+        #pragma unroll
+        for (int kd = 0; kd < 64; ++kd) peak = fmaxf(peak, fabsf(state_half[kd]));
+        peak_half[half][value_index] = peak;
+        gdn_lds_barrier();
+        peak = fmaxf(peak_half[0][value_index], peak_half[1][value_index]);
+        const float inv = gdn_q8_inv(peak);
+        void* const final_slot = kCapture
+            ? reinterpret_cast<signed char*>(row_states)
+                  + (size_t)(rows - 1) * gdn_q8_slot_bytes(value_heads)
+            : state;
+        int4 packed[4];
+        signed char* codes = reinterpret_cast<signed char*>(packed);
+        #pragma unroll
+        for (int kd = 0; kd < 64; ++kd) {
+            codes[kd] = gdn_q8_round(state_half[kd], inv, value_head, value_index,
+                                     kd_base + kd, frame);
+        }
+        int4* dst =
+            reinterpret_cast<int4*>(gdn_q8_row(final_slot, value_head, value_index) + kd_base);
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) dst[i] = packed[i];
+        if (half == 0) {
+            gdn_q8_scales(final_slot, value_heads)[value_head * 128 + value_index] =
+                gdn_q8_scale(peak);
+        }
+        return;
+    }
+    float* const final_state = kCapture
+        ? reinterpret_cast<float*>(row_states) + (size_t)(rows - 1) * value_heads * 128 * 128
+        : reinterpret_cast<float*>(state);
     #pragma unroll
     for (int kd = 0; kd < 64; ++kd) {
         final_state[state_base + (kd_base + kd) * 128 + value_index] =
@@ -498,6 +653,28 @@ extern "C" __global__ void gated_delta_step_halves_state128_persistent256_captur
         rows, qkv_width, key_heads, value_heads, key_dim, value_dim, query_scale);
 }
 
+// The two persistent kernels above on Q8 GDN state slots (`row_states`: a
+// ring of slots); `frame` seeds the final requantization.
+__launch_bounds__(256)
+extern "C" __global__ void gated_delta_step_halves_state128_persistent256_q8(
+    const float* projection, const float* gate, const float* beta, signed char* state,
+    float* output, int rows, int qkv_width, int key_heads, int value_heads,
+    int key_dim, int value_dim, float query_scale, unsigned int frame) {
+    gated_delta_step_persistent256_body<false, true>(projection, gate, beta, state, output,
+        nullptr, rows, qkv_width, key_heads, value_heads, key_dim, value_dim, query_scale,
+        frame);
+}
+
+__launch_bounds__(256)
+extern "C" __global__ void gated_delta_step_halves_state128_persistent256_capture_q8(
+    const float* projection, const float* gate, const float* beta, signed char* state,
+    float* output, signed char* row_states, int rows, int qkv_width, int key_heads,
+    int value_heads, int key_dim, int value_dim, float query_scale, unsigned int frame) {
+    gated_delta_step_persistent256_body<true, true>(projection, gate, beta, state, output,
+        row_states, rows, qkv_width, key_heads, value_heads, key_dim, value_dim, query_scale,
+        frame);
+}
+
 // Few-row verify rollback: re-run the `keep` kept rows of every GDN layer in
 // one launch (blockIdx.y = layer; the layers' recurrences are independent).
 // `table[2 * layer]` is the layer's captured recurrence input (the verify's
@@ -517,6 +694,60 @@ extern "C" __global__ void gated_delta_rollback_layers_f32(
     gated_delta_step_persistent256_body<true>(recurrence, recurrence + gate,
         recurrence + gate + (size_t)rows * value_heads, ring + from * state, discard,
         ring + to * state, keep, qkv_width, key_heads, value_heads, 128, 128, query_scale);
+}
+
+// gated_delta_rollback_layers_f32 over rings of Q8 GDN state slots.
+__launch_bounds__(256)
+extern "C" __global__ void gated_delta_rollback_layers_q8(
+    const unsigned long long* table, float* discard, int rows, int keep, int from, int to,
+    int qkv_width, int key_heads, int value_heads, float query_scale, unsigned int frame) {
+    const float* recurrence = reinterpret_cast<const float*>(table[2 * blockIdx.y]);
+    signed char* ring = reinterpret_cast<signed char*>(table[2 * blockIdx.y + 1]);
+    const size_t slot = gdn_q8_slot_bytes(value_heads);
+    const size_t gate = (size_t)rows * qkv_width;
+    gated_delta_step_persistent256_body<true, true>(recurrence, recurrence + gate,
+        recurrence + gate + (size_t)rows * value_heads, ring + from * slot, discard,
+        ring + to * slot, keep, qkv_width, key_heads, value_heads, 128, 128, query_scale,
+        frame);
+}
+
+// A Q8 GDN state slot as F32 [head][key][value] (the F32 recurrence's
+// order), for kernels that run on F32 state. Grid value_heads * 128 (one
+// block per value row), block 128 (key channel).
+extern "C" __global__ __launch_bounds__(128) void gdn_state_q8_to_f32(
+    signed char* slot, float* state, int value_heads) {
+    const int flat = (int)blockIdx.x;
+    const int head = flat >> 7;
+    const int row = flat & 127;
+    const int column = (int)threadIdx.x;
+    if (head >= value_heads) return;
+    const float scale = gdn_q8_scales(slot, value_heads)[flat];
+    state[((size_t)head * 128 + column) * 128 + row] =
+        scale * (float)gdn_q8_row(slot, head, row)[column];
+}
+
+// F32 [head][key][value] state requantized into a Q8 GDN state slot, each
+// value row by its absmax (the kernels' own requantization). Grid
+// value_heads * 128, block 128.
+extern "C" __global__ __launch_bounds__(128) void gdn_state_f32_to_q8(
+    const float* state, signed char* slot, int value_heads, unsigned int frame) {
+    const int flat = (int)blockIdx.x;
+    const int head = flat >> 7;
+    const int row = flat & 127;
+    const int column = (int)threadIdx.x;
+    if (head >= value_heads) return;
+    __shared__ float peaks[128];
+    const float value = state[((size_t)head * 128 + column) * 128 + row];
+    peaks[column] = fabsf(value);
+    __syncthreads();
+    for (int stride = 64; stride > 0; stride >>= 1) {
+        if (column < stride) peaks[column] = fmaxf(peaks[column], peaks[column + stride]);
+        __syncthreads();
+    }
+    const float peak = peaks[0];
+    gdn_q8_row(slot, head, row)[column] =
+        gdn_q8_round(value, gdn_q8_inv(peak), head, row, column, frame);
+    if (column == 0) gdn_q8_scales(slot, value_heads)[flat] = gdn_q8_scale(peak);
 }
 
 
@@ -1501,13 +1732,14 @@ extern "C" __global__ void gated_delta_gate_bf16_f32(
 // The decode step and its gated RMSNorm in one launch: the head's recurrent
 // output stays in LDS for the norm (same values the separate launches pass
 // through memory, so bitwise equal). The recurrent output is not stored.
-extern "C" __global__ void gated_delta_step_gate_norm128_gfx1151(
+template <bool kQ8>
+static __device__ __forceinline__ void gated_delta_step_gate_norm128_body(
     const float* q,
     const float* k,
     const float* v,
     const float* gate,
     const float* beta,
-    float* state,
+    void* state,
     const float* z,
     const __hip_bfloat16* norm,
     float* output,
@@ -1519,12 +1751,13 @@ extern "C" __global__ void gated_delta_step_gate_norm128_gfx1151(
     float* rotated,
     const float* signs1,
     const float* signs2,
-    unsigned int* pair_counters) {
+    unsigned int* pair_counters,
+    unsigned int frame) {
     __shared__ float head_values[128];
     __shared__ int rotate_pair;
     float out;
-    if (!gated_delta_step_norm128_body(q, k, v, gate, beta, state, key_heads, value_heads,
-                                       key_dim, value_dim, query_scale, &out))
+    if (!gated_delta_step_norm128_body<kQ8>(q, k, v, gate, beta, state, key_heads, value_heads,
+                                            key_dim, value_dim, query_scale, frame, &out))
         return;
     const int channel = (int)threadIdx.x;
     head_values[channel] = out;
@@ -1554,6 +1787,28 @@ extern "C" __global__ void gated_delta_step_gate_norm128_gfx1151(
 #pragma unroll
     for (int e = 0; e < 8; ++e) rotated[base + d0 + e] = values[e] * 0.0625f * signs2[d0 + e];
     if (threadIdx.x == 0) pair_counters[pair] = 0u;
+}
+
+extern "C" __global__ void gated_delta_step_gate_norm128_gfx1151(
+    const float* q, const float* k, const float* v, const float* gate, const float* beta,
+    float* state, const float* z, const __hip_bfloat16* norm, float* output, int key_heads,
+    int value_heads, int key_dim, int value_dim, float query_scale, float* rotated,
+    const float* signs1, const float* signs2, unsigned int* pair_counters) {
+    gated_delta_step_gate_norm128_body<false>(q, k, v, gate, beta, state, z, norm, output,
+        key_heads, value_heads, key_dim, value_dim, query_scale, rotated, signs1, signs2,
+        pair_counters, 0u);
+}
+
+// gated_delta_step_gate_norm128_gfx1151 on a Q8 GDN state slot.
+extern "C" __global__ void gated_delta_step_gate_norm128_q8(
+    const float* q, const float* k, const float* v, const float* gate, const float* beta,
+    signed char* state, const float* z, const __hip_bfloat16* norm, float* output,
+    int key_heads, int value_heads, int key_dim, int value_dim, float query_scale,
+    float* rotated, const float* signs1, const float* signs2, unsigned int* pair_counters,
+    unsigned int frame) {
+    gated_delta_step_gate_norm128_body<true>(q, k, v, gate, beta, state, z, norm, output,
+        key_heads, value_heads, key_dim, value_dim, query_scale, rotated, signs1, signs2,
+        pair_counters, frame);
 }
 // Row-batched gated RMSNorm. The recurrent output is rounded in place before
 // the norm reduction, matching the scalar BF16 boundary.  One wave owns one
@@ -1692,6 +1947,169 @@ extern "C" __global__ void indexed_attention_norm_rope_f32(
     values[start + channel] = value;
 }
  
+// QSA state formats (`QsaKvFormat` in tensor_ops.rs). K and V are separate
+// token-major caches, one row per position:
+//   F32  kv_heads * head_dim f32.
+//   FP8  kv_heads * head_dim E4M3 codes, then kv_heads f16 scales: the qwen35
+//        native fp8 row, quantized as kv_cache_write_fp8_e4m3 does (gfx12).
+// An fp8 key score is the head's scale times the in-order sum of q * code; a
+// value is scale * code. Every attention kernel goes through the helpers
+// below, so for each format the per-head, grouped and serial kernels stay
+// bitwise equal. The indexer's raw and pooled keys are BF16 values in every
+// format; the fp8 format stores them as BF16, which holds the same values as
+// the F32 arenas.
+#define QSA_KV_F32 0
+#define QSA_KV_FP8 1
+#if defined(__GFX12__)
+#define QSA_HAS_FP8 1
+#endif
+
+typedef float qsa_f32x2 __attribute__((ext_vector_type(2)));
+
+template <int F>
+static __device__ __forceinline__ int qsa_kv_row_bytes(int kv_heads, int head_dim) {
+    if constexpr (F == QSA_KV_F32) {
+        return kv_heads * head_dim * 4;
+    } else {
+        return kv_heads * (head_dim + 2);
+    }
+}
+
+static __device__ __forceinline__ float qsa_half_bits(unsigned int bits) {
+    return (float)__builtin_bit_cast(_Float16, (unsigned short)bits);
+}
+
+#if defined(QSA_HAS_FP8)
+static __device__ __forceinline__ float qsa_fp8_code(unsigned int code) {
+    const qsa_f32x2 pair = __builtin_amdgcn_cvt_pk_f32_fp8(code, false);
+    return pair.x;
+}
+#endif
+
+// Value channel `channel` of KV head `kv_head` in the fp8 token row `row`.
+template <int F>
+static __device__ __forceinline__ float qsa_kv_value(
+    const unsigned char* row,
+    int kv_heads,
+    int head_dim,
+    int kv_head,
+    int channel) {
+    static_assert(F == QSA_KV_FP8, "F32 values keep each kernel's own loads");
+#if defined(QSA_HAS_FP8)
+    const float scale = qsa_half_bits(*reinterpret_cast<const unsigned short*>(
+        row + kv_heads * head_dim + 2 * kv_head));
+    return qsa_fp8_code(row[kv_head * head_dim + channel]) * scale;
+#else
+    return 0.0f;
+#endif
+}
+
+// Unscaled QK dot of `heads` query rows (`q + h * q_stride`, head_dim floats
+// each) with KV head `kv_head` of the fp8 token row `row`, added to
+// `score[h]`; every head sees the same key loads and the association above.
+template <int F, int HEADS>
+static __device__ __forceinline__ void qsa_kv_key_dots(
+    const float* __restrict__ q,
+    int q_stride,
+    const unsigned char* row,
+    int kv_heads,
+    int head_dim,
+    int kv_head,
+    float (&score)[HEADS]) {
+    static_assert(F == QSA_KV_FP8, "F32 keys keep each kernel's own loop");
+#if defined(QSA_HAS_FP8)
+    // Codes are 4-byte aligned: the host admits fp8 for head_dim 256 and an
+    // even KV-head count only.
+    const unsigned int* codes = reinterpret_cast<const unsigned int*>(row + kv_head * head_dim);
+    const float scale = qsa_half_bits(*reinterpret_cast<const unsigned short*>(
+        row + kv_heads * head_dim + 2 * kv_head));
+    float dot[HEADS];
+#pragma unroll
+    for (int h = 0; h < HEADS; ++h) dot[h] = 0.0f;
+#pragma unroll 4
+    for (int d4 = 0; d4 < head_dim / 4; ++d4) {
+        const unsigned int word = codes[d4];
+        const qsa_f32x2 lo = __builtin_amdgcn_cvt_pk_f32_fp8(word, false);
+        const qsa_f32x2 hi = __builtin_amdgcn_cvt_pk_f32_fp8(word, true);
+#pragma unroll
+        for (int h = 0; h < HEADS; ++h) {
+            const float* qh = q + h * q_stride + 4 * d4;
+            dot[h] += qh[0] * lo.x;
+            dot[h] += qh[1] * lo.y;
+            dot[h] += qh[2] * hi.x;
+            dot[h] += qh[3] * hi.y;
+        }
+    }
+#pragma unroll
+    for (int h = 0; h < HEADS; ++h) score[h] += dot[h] * scale;
+#endif
+}
+
+// Store one channel of a K or V row in the fp8 format. Every thread of the
+// block calls it (block 256 over one KV head, `channel` = threadIdx.x; lanes
+// at or past head_dim pass any value and store nothing). The head's absmax is
+// reduced through wave shuffles and `amax_lds` (one float per wave), which
+// synchronizes.
+template <int F>
+static __device__ __forceinline__ void qsa_kv_store(
+    unsigned char* row,
+    float value,
+    int kv_heads,
+    int head_dim,
+    int kv_head,
+    int channel,
+    float* amax_lds) {
+    static_assert(F == QSA_KV_FP8, "F32 rows are stored directly");
+#if defined(QSA_HAS_FP8)
+    const bool active = channel < head_dim;
+    float amax = active ? fabsf(value) : 0.0f;
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        amax = fmaxf(amax, __shfl_xor(amax, offset, 32));
+    }
+    if ((threadIdx.x & 31) == 0) amax_lds[threadIdx.x >> 5] = amax;
+    __syncthreads();
+    amax = amax_lds[0];
+    for (int wave = 1; wave < ((int)blockDim.x + 31) / 32; ++wave) {
+        amax = fmaxf(amax, amax_lds[wave]);
+    }
+    __syncthreads();
+    _Float16 s16 = amax == 0.0f ? (_Float16)1.0f : (_Float16)(amax / 448.0f);
+    if (amax > 0.0f && s16 == (_Float16)0.0f) {
+        s16 = __builtin_bit_cast(_Float16, (unsigned short)0x0001);
+    }
+    float sf = (float)s16;
+    if (amax > 0.0f && 448.0f * sf < amax) {
+        unsigned short bits = __builtin_bit_cast(unsigned short, s16);
+        bits = bits >= 0x7bff ? (unsigned short)0x7bff : (unsigned short)(bits + 1u);
+        s16 = __builtin_bit_cast(_Float16, bits);
+        sf = (float)s16;
+    }
+    if (!active) return;
+    row[kv_head * head_dim + channel] =
+        (unsigned char)__builtin_amdgcn_cvt_pk_fp8_f32(value / sf, 0.0f, 0u, false);
+    if (channel == 0) {
+        *reinterpret_cast<_Float16*>(row + kv_heads * head_dim + 2 * kv_head) = s16;
+    }
+#endif
+}
+
+static __device__ __forceinline__ float qsa_index_f32(float value) {
+    return value;
+}
+
+static __device__ __forceinline__ float qsa_index_f32(__hip_bfloat16 value) {
+    return bf16_to_f32(value);
+}
+
+// Store a BF16-exact index-key value in an F32 or BF16 arena.
+static __device__ __forceinline__ void qsa_index_store(float* slot, __hip_bfloat16 value) {
+    *slot = bf16_to_f32(value);
+}
+
+static __device__ __forceinline__ void qsa_index_store(__hip_bfloat16* slot, __hip_bfloat16 value) {
+    *slot = value;
+}
+
 // One head's RMSNorm + HalfSplit RoPE at `position` (block 256, one channel
 // per thread; returns the channel's value, `head_dim` <= 256). Every block
 // thread must call it (it synchronizes).
@@ -1766,15 +2184,18 @@ extern "C" __global__ void indexed_attention_norm_rope_f32_batched(
 // append at `position + row`, and the index key's BF16 round trip and raw-key
 // copy (bf16_round_trip_f32_strided + copy_rows_strided_f32). Same
 // per-element operations. Grid [index_heads + heads + kv_heads + 1, rows];
-// row r's inputs sit at r times each buffer's row width.
-extern "C" __global__ __launch_bounds__(256) void indexed_attention_decode_prologue_f32(
+// row r's inputs sit at r times each buffer's row width. `F` is the K/V cache
+// format; the raw index keys are F32 for F32 caches and BF16 otherwise, and
+// the fp8 rows are written exactly as the prefill append writes them.
+template <int F, typename RawKey>
+static __device__ __forceinline__ void qsa_decode_prologue(
     float* index_row,
     float* qgate,
     float* keys,
     const float* values,
-    float* full_keys,
-    float* full_values,
-    float* raw_index_keys,
+    unsigned char* full_keys,
+    unsigned char* full_values,
+    RawKey* raw_index_keys,
     const __hip_bfloat16* index_q_norm,
     const __hip_bfloat16* q_norm,
     const __hip_bfloat16* k_norm,
@@ -1787,6 +2208,7 @@ extern "C" __global__ __launch_bounds__(256) void indexed_attention_decode_prolo
     int position_start) {
     __shared__ float input_row[256];
     __shared__ float row_sum;
+    __shared__ float kv_amax[8];
     const int c = (int)threadIdx.x;
     const int r = (int)blockIdx.y;
     const int position = position_start + r;
@@ -1817,11 +2239,22 @@ extern "C" __global__ __launch_bounds__(256) void indexed_attention_decode_prolo
         float* row = keys + block * head_dim;
         const float value = qsa_norm_rope_head(row, k_norm, head_dim, position,
                                                min(head_dim, 64), input_row, &row_sum);
-        if (c < head_dim) {
-            const int channel = block * head_dim + c;
-            row[c] = value;
-            full_keys[position * kv_width + channel] = value;
-            full_values[position * kv_width + channel] = values[channel];
+        if constexpr (F == QSA_KV_F32) {
+            if (c < head_dim) {
+                const int channel = block * head_dim + c;
+                row[c] = value;
+                reinterpret_cast<float*>(full_keys)[position * kv_width + channel] = value;
+                reinterpret_cast<float*>(full_values)[position * kv_width + channel] =
+                    values[channel];
+            }
+        } else {
+            const float v = c < head_dim ? values[block * head_dim + c] : 0.0f;
+            if (c < head_dim) row[c] = value;
+            const size_t row_bytes = (size_t)qsa_kv_row_bytes<F>(kv_heads, head_dim);
+            qsa_kv_store<F>(full_keys + (size_t)position * row_bytes, value, kv_heads, head_dim,
+                            block, c, kv_amax);
+            qsa_kv_store<F>(full_values + (size_t)position * row_bytes, v, kv_heads, head_dim,
+                            block, c, kv_amax);
         }
         return;
     }
@@ -1832,9 +2265,33 @@ extern "C" __global__ __launch_bounds__(256) void indexed_attention_decode_prolo
                                 & 0xFFFF0000u);
             index_row[index_q_width + i] = v;
         }
-        raw_index_keys[position * index_kv_width + i] = v;
+        if constexpr (F == QSA_KV_F32) {
+            raw_index_keys[position * index_kv_width + i] = v;
+        } else {
+            raw_index_keys[(size_t)position * index_kv_width + i] = bf16_round(v);
+        }
     }
 }
+
+#define QSA_DECODE_PROLOGUE(NAME, FORMAT, CACHE, RAW)                                      \
+    extern "C" __global__ __launch_bounds__(256) void NAME(                               \
+        float* index_row, float* qgate, float* keys, const float* values, CACHE* full_keys, \
+        CACHE* full_values, RAW* raw_index_keys, const __hip_bfloat16* index_q_norm,       \
+        const __hip_bfloat16* q_norm, const __hip_bfloat16* k_norm, int index_heads,       \
+        int index_dim, int index_kv_width, int heads, int kv_heads, int head_dim,          \
+        int position_start) {                                                              \
+        qsa_decode_prologue<FORMAT, RAW>(                                                  \
+            index_row, qgate, keys, values, reinterpret_cast<unsigned char*>(full_keys),   \
+            reinterpret_cast<unsigned char*>(full_values), raw_index_keys, index_q_norm,   \
+            q_norm, k_norm, index_heads, index_dim, index_kv_width, heads, kv_heads,       \
+            head_dim, position_start);                                                     \
+    }
+QSA_DECODE_PROLOGUE(indexed_attention_decode_prologue_f32, QSA_KV_F32, float, float)
+#if defined(QSA_HAS_FP8)
+QSA_DECODE_PROLOGUE(indexed_attention_decode_prologue_fp8, QSA_KV_FP8, unsigned char,
+                    __hip_bfloat16)
+#endif
+#undef QSA_DECODE_PROLOGUE
  
 
 extern "C" __global__ void indexed_attention_cache_append_f32(
@@ -1866,16 +2323,80 @@ extern "C" __global__ void indexed_attention_cache_append_f32_batched(
     full_values[position * kv_width + channel] = value[row * kv_width + channel];
 }
 
+// Fp8 twin of indexed_attention_cache_append_f32_batched: grid
+// [kv_heads, rows], block 256, one block per KV head of one row. The rows are
+// byte-identical to the decode prologue's for the same K/V.
+template <int F>
+static __device__ __forceinline__ void qsa_cache_append_batched(
+    const float* key,
+    const float* value,
+    unsigned char* full_keys,
+    unsigned char* full_values,
+    int rows,
+    int position_start,
+    int kv_heads,
+    int head_dim) {
+    __shared__ float kv_amax[8];
+    const int head = (int)blockIdx.x;
+    const int row = (int)blockIdx.y;
+    const int c = (int)threadIdx.x;
+    if (head >= kv_heads || row >= rows) return;
+    const int source = row * kv_heads * head_dim + head * head_dim + c;
+    const float k = c < head_dim ? key[source] : 0.0f;
+    const float v = c < head_dim ? value[source] : 0.0f;
+    const size_t row_bytes = (size_t)qsa_kv_row_bytes<F>(kv_heads, head_dim);
+    const size_t offset = (size_t)(position_start + row) * row_bytes;
+    qsa_kv_store<F>(full_keys + offset, k, kv_heads, head_dim, head, c, kv_amax);
+    qsa_kv_store<F>(full_values + offset, v, kv_heads, head_dim, head, c, kv_amax);
+}
+
+#if defined(QSA_HAS_FP8)
+extern "C" __global__ __launch_bounds__(256) void indexed_attention_cache_append_fp8_batched(
+    const float* key, const float* value, unsigned char* full_keys, unsigned char* full_values,
+    int rows, int position_start, int kv_heads, int head_dim) {
+    qsa_cache_append_batched<QSA_KV_FP8>(key, value, full_keys, full_values, rows,
+                                         position_start, kv_heads, head_dim);
+}
+#endif
+
+// Prefill index-key tail for a BF16 raw-key arena: each row's index key is
+// rounded to BF16 in place (bf16_round_trip_f32_strided's arithmetic) and
+// appended at `position_start + row`, as the decode prologue does per row.
+// Grid [ceil(index_kv_width / 256), rows], block 256.
+extern "C" __global__ void indexed_attention_index_key_append_bf16_batched(
+    float* index_rows,
+    __hip_bfloat16* raw_index_keys,
+    int rows,
+    int index_q_width,
+    int index_width,
+    int index_kv_width,
+    int position_start) {
+    const int row = (int)blockIdx.y;
+    const int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (row >= rows || i >= index_kv_width) return;
+    float* key = index_rows + row * index_width + index_q_width;
+    float v = key[i];
+    if (isfinite(v)) {
+        v = __uint_as_float((__float_as_uint(v) + 0x7FFFu + ((__float_as_uint(v) >> 16) & 1u))
+                            & 0xFFFF0000u);
+        key[i] = v;
+    }
+    raw_index_keys[(size_t)(position_start + row) * index_kv_width + i] = bf16_round(v);
+}
+
 // Complete-block QSA pooling: mean over `compress` raw index keys, grouped
 // RMS, then the same HalfSplit RoPE used by the index key stream.  The output
 // remains in the resident pooled-key arena; no host selection metadata is
 // involved.
 // Complete-block QSA pooling: mean over raw BF16 index keys, followed by the
 // learned source key RMSNorm and HalfSplit RoPE at the block start. A null
-// `norm` is used only by synthetic parity buffers.
-extern "C" __global__ void indexed_attention_pool_rope_f32(
-    const float* raw_keys,
-    float* pooled,
+// `norm` is used only by synthetic parity buffers. `Key` is the arena storage
+// (F32 or BF16, see the QSA format note): both hold the same values, so the
+// pooled keys are the same values too.
+template <typename Key>
+static __device__ __forceinline__ void qsa_pool_rope(
+    const Key* raw_keys,
+    Key* pooled,
     const __hip_bfloat16* norm,
     int block_count,
     int compress,
@@ -1891,7 +2412,7 @@ extern "C" __global__ void indexed_attention_pool_rope_f32(
     float mean = 0.0f;
     if (active) {
         for (int row = 0; row < compress; ++row) {
-            mean += raw_keys[base + row * index_dim + channel]
+            mean += qsa_index_f32(raw_keys[base + row * index_dim + channel])
                 / (float)compress;
         }
     }
@@ -1922,7 +2443,7 @@ extern "C" __global__ void indexed_attention_pool_rope_f32(
         int partner = channel < half ? channel + half : channel - half;
         float other_mean = 0.0f;
         for (int row = 0; row < compress; ++row) {
-            other_mean += raw_keys[base + row * index_dim + partner]
+            other_mean += qsa_index_f32(raw_keys[base + row * index_dim + partner])
                 / (float)compress;
         }
         __hip_bfloat16 other_bf16 = bf16_round(other_mean);
@@ -1939,16 +2460,39 @@ extern "C" __global__ void indexed_attention_pool_rope_f32(
         value = channel < half ? value * cosine - other * sine
             : other * sine + value * cosine;
     }
-    pooled[block * index_dim + channel] = bf16_to_f32(
-        bf16_round(value));
+    qsa_index_store(pooled + block * index_dim + channel, bf16_round(value));
+}
+
+extern "C" __global__ void indexed_attention_pool_rope_f32(
+    const float* raw_keys, float* pooled, const __hip_bfloat16* norm, int block_count,
+    int compress, int index_dim, int first_block) {
+    qsa_pool_rope(raw_keys, pooled, norm, block_count, compress, index_dim, first_block);
+}
+
+extern "C" __global__ void indexed_attention_pool_rope_bf16(
+    const __hip_bfloat16* raw_keys, __hip_bfloat16* pooled, const __hip_bfloat16* norm,
+    int block_count, int compress, int index_dim, int first_block) {
+    qsa_pool_rope(raw_keys, pooled, norm, block_count, compress, index_dim, first_block);
+}
+
+static __device__ __forceinline__ float4 qsa_index_load4(const float* row, int d4) {
+    return reinterpret_cast<const float4*>(row)[d4];
+}
+
+static __device__ __forceinline__ float4 qsa_index_load4(const __hip_bfloat16* row, int d4) {
+    const uint2 w = reinterpret_cast<const uint2*>(row)[d4];
+    return make_float4(__uint_as_float(w.x << 16), __uint_as_float(w.x & 0xFFFF0000u),
+                       __uint_as_float(w.y << 16), __uint_as_float(w.y & 0xFFFF0000u));
 }
 
 // Compute one block score with the original head/dimension traversal. Keeping
 // this as one thread's serial reduction preserves the F32 association and the
 // `fmaxf` NaN/tie behavior while allowing independent blocks to run in parallel.
+// `P` is the pooled-key storage (F32 or BF16; the same values either way).
+template <typename P>
 static __device__ __forceinline__ float indexed_attention_select_score_f32(
     const float* query,
-    const float* pooled,
+    const P* pooled,
     int block,
     int index_heads,
     int index_dim) {
@@ -1957,7 +2501,7 @@ static __device__ __forceinline__ float indexed_attention_select_score_f32(
         float dot = 0.0f;
         for (int d = 0; d < index_dim; ++d) {
             dot += query[head * index_dim + d]
-                * pooled[block * index_dim + d];
+                * qsa_index_f32(pooled[block * index_dim + d]);
         }
         score += fmaxf(dot / sqrtf((float)index_dim), 0.0f);
     }
@@ -1968,19 +2512,19 @@ static __device__ __forceinline__ float indexed_attention_select_score_f32(
 // side, so each pooled value is loaded once for all four (float4 loads when
 // both rows are 16-byte aligned and index_dim % 4 == 0).  Every chain keeps
 // its d order and heads are added in order: the score is bitwise unchanged.
+template <typename P>
 static __device__ __forceinline__ float indexed_attention_select_score4_f32(
     const float* query,
-    const float* pooled,
+    const P* pooled,
     int block,
     int index_heads,
     int index_dim) {
-    const float* row = pooled + block * index_dim;
+    const P* row = pooled + block * index_dim;
     float score = 0.0f;
     int head = 0;
     if ((index_dim & 3) == 0
-        && ((reinterpret_cast<unsigned long long>(query)
-             | reinterpret_cast<unsigned long long>(row)) & 15) == 0) {
-        const float4* p4 = reinterpret_cast<const float4*>(row);
+        && ((reinterpret_cast<unsigned long long>(query) & 15)
+            | (reinterpret_cast<unsigned long long>(row) & (4 * sizeof(P) - 1))) == 0) {
         for (; head + 4 <= index_heads; head += 4) {
             const float4* q0 = reinterpret_cast<const float4*>(query + head * index_dim);
             const float4* q1 = q0 + index_dim / 4;
@@ -1989,7 +2533,7 @@ static __device__ __forceinline__ float indexed_attention_select_score4_f32(
             float dot0 = 0.0f, dot1 = 0.0f, dot2 = 0.0f, dot3 = 0.0f;
 #pragma unroll 4
             for (int d4 = 0; d4 < index_dim / 4; ++d4) {
-                const float4 p = p4[d4];
+                const float4 p = qsa_index_load4(row, d4);
                 const float4 a = q0[d4], b = q1[d4], c = q2[d4], e = q3[d4];
                 dot0 += a.x * p.x; dot0 += a.y * p.y; dot0 += a.z * p.z; dot0 += a.w * p.w;
                 dot1 += b.x * p.x; dot1 += b.y * p.y; dot1 += b.z * p.z; dot1 += b.w * p.w;
@@ -2005,7 +2549,7 @@ static __device__ __forceinline__ float indexed_attention_select_score4_f32(
     for (; head < index_heads; ++head) {
         float dot = 0.0f;
         for (int d = 0; d < index_dim; ++d) {
-            dot += query[head * index_dim + d] * row[d];
+            dot += query[head * index_dim + d] * qsa_index_f32(row[d]);
         }
         score += fmaxf(dot / sqrtf((float)index_dim), 0.0f);
     }
@@ -2017,9 +2561,10 @@ static __device__ __forceinline__ float indexed_attention_select_score4_f32(
 // Batched selection keeps one independent workgroup per query row. The row's
 // visible prefix derives from position_start, so complete blocks that belong
 // only to later rows can never enter an earlier row's candidate set.
-extern "C" __global__ void indexed_attention_select_f32_batched_serial(
+template <typename P>
+static __device__ __forceinline__ void qsa_select_batched_serial(
     const float* query,
-    const float* pooled,
+    const P* pooled,
     int* selected,
     int rows,
     int query_row_stride,
@@ -2071,13 +2616,27 @@ extern "C" __global__ void indexed_attention_select_f32_batched_serial(
     }
 }
 
+#define QSA_SELECT_SERIAL(NAME, POOLED)                                                    \
+    extern "C" __global__ void NAME(const float* query, const POOLED* pooled, int* selected, \
+                                    int rows, int query_row_stride, int block_count,         \
+                                    int index_heads, int index_dim, int budget_blocks,       \
+                                    int compress, int position_start, int capacity) {        \
+        qsa_select_batched_serial(query, pooled, selected, rows, query_row_stride,           \
+                                  block_count, index_heads, index_dim, budget_blocks,        \
+                                  compress, position_start, capacity);                       \
+    }
+QSA_SELECT_SERIAL(indexed_attention_select_f32_batched_serial, float)
+QSA_SELECT_SERIAL(indexed_attention_select_bf16_batched_serial, __hip_bfloat16)
+#undef QSA_SELECT_SERIAL
+
 // Chosen-block list of the past-budget radix path in
-// indexed_attention_select_f32_batched (static LDS with its 256 radix bins;
-// QSA_SELECT_BATCHED_STATIC_LDS_BYTES in tensor_ops.rs bounds both).
+// indexed_attention_select_{f32,bf16}_batched (static LDS with its 256 radix
+// bins; QSA_SELECT_BATCHED_STATIC_LDS_BYTES in tensor_ops.rs bounds both).
 #define QSA_SELECT_LIST_CAPACITY 512
-extern "C" __global__ void indexed_attention_select_f32_batched(
+template <typename P>
+static __device__ __forceinline__ void qsa_select_batched(
     const float* query,
-    const float* pooled,
+    const P* pooled,
     int* selected,
     int rows,
     int query_row_stride,
@@ -2088,12 +2647,20 @@ extern "C" __global__ void indexed_attention_select_f32_batched(
     int compress,
     int position_start,
     int capacity,
-    int* mirror) {
+    int* mirror,
+    float* scores_global,
+    int scores_stride) {
     int row = (int)blockIdx.x;
     if (row >= rows) return;
     // The persistent selection is the final row's.
     if (row != rows - 1) mirror = nullptr;
-    extern __shared__ __align__(16) float scores[];
+    // Scores live in dynamic LDS when the arena's block count fits it, else in
+    // a global row of `scores_stride` floats (a multiple of 4, so the float4
+    // reads below stay 16-byte aligned); every access is the same.
+    extern __shared__ __align__(16) float scores_lds[];
+    float* scores = scores_global != nullptr
+        ? scores_global + (size_t)row * (size_t)scores_stride
+        : scores_lds;
     int visible = position_start + row + 1;
     int row_block_count = visible / compress;
     if (row_block_count > block_count) row_block_count = block_count;
@@ -2249,6 +2816,20 @@ extern "C" __global__ void indexed_attention_select_f32_batched(
         if (mirror) mirror[offset + (token - tail_start)] = token;
     }
 }
+
+#define QSA_SELECT_PARALLEL(NAME, POOLED)                                                      \
+    extern "C" __global__ void NAME(const float* query, const POOLED* pooled, int* selected,    \
+                                    int rows, int query_row_stride, int block_count,            \
+                                    int index_heads, int index_dim, int budget_blocks,          \
+                                    int compress, int position_start, int capacity,             \
+                                    int* mirror, float* scores_global, int scores_stride) {     \
+        qsa_select_batched(query, pooled, selected, rows, query_row_stride, block_count,        \
+                           index_heads, index_dim, budget_blocks, compress, position_start,     \
+                           capacity, mirror, scores_global, scores_stride);                     \
+    }
+QSA_SELECT_PARALLEL(indexed_attention_select_f32_batched, float)
+QSA_SELECT_PARALLEL(indexed_attention_select_bf16_batched, __hip_bfloat16)
+#undef QSA_SELECT_PARALLEL
 
 extern "C" __global__ void indexed_attention_select_f32_serial(
     const float* query,
@@ -2434,11 +3015,13 @@ extern "C" __global__ void indexed_attention_reuse_selection(
 
 
 // Serial fallback off gfx1151 or when score/token rows exceed its LDS limit.
-// Keep the body identical to the original per-channel implementation.
-extern "C" __global__ void indexed_attention_attention_f32_batched_serial(
+// Keep the body identical to the original per-channel implementation. `F` is
+// the K/V format (see the QSA format note).
+template <int F>
+static __device__ __forceinline__ void qsa_attention_batched_serial(
     const float* q_with_gate,
-    const float* full_keys,
-    const float* full_values,
+    const unsigned char* full_keys,
+    const unsigned char* full_values,
     const int* selected_indices,
     float* output,
     int rows,
@@ -2463,15 +3046,38 @@ extern "C" __global__ void indexed_attention_attention_f32_batched_serial(
     int q_row_stride = 2 * n_heads * head_dim;
     int q_head_offset = row * q_row_stride + head * head_dim * 2;
     const int* row_selected = selected_indices + row * capacity;
+    const float* keys = reinterpret_cast<const float*>(full_keys);
+    const float* values = reinterpret_cast<const float*>(full_values);
+    const size_t row_bytes = (size_t)qsa_kv_row_bytes<F>(n_kv_heads, head_dim);
+    auto key_score = [&](int token) {
+        float score = 0.0f;
+        if constexpr (F == QSA_KV_F32) {
+            for (int d = 0; d < head_dim; ++d) {
+                score += q_with_gate[q_head_offset + d]
+                    * keys[token * n_kv_heads * head_dim + kv_head * head_dim + d];
+            }
+        } else {
+            float dots[1] = {0.0f};
+            qsa_kv_key_dots<F, 1>(q_with_gate + q_head_offset, 0,
+                                  full_keys + (size_t)token * row_bytes, n_kv_heads, head_dim,
+                                  kv_head, dots);
+            score = dots[0];
+        }
+        return score;
+    };
+    auto value_of = [&](int token) {
+        if constexpr (F == QSA_KV_F32) {
+            return values[token * n_kv_heads * head_dim + kv_head * head_dim + channel];
+        } else {
+            return qsa_kv_value<F>(full_values + (size_t)token * row_bytes, n_kv_heads, head_dim,
+                                   kv_head, channel);
+        }
+    };
     float max_score = -3.402823466e+38f;
     for (int selected_row = 0; selected_row < selected_len; ++selected_row) {
         int token = row_selected[selected_row];
         if (token < 0 || token >= full_capacity || token >= visible) continue;
-        float score = 0.0f;
-        for (int d = 0; d < head_dim; ++d) {
-            score += q_with_gate[q_head_offset + d]
-                * full_keys[token * n_kv_heads * head_dim + kv_head * head_dim + d];
-        }
+        float score = key_score(token);
         max_score = fmaxf(max_score, score / sqrtf((float)head_dim));
     }
     float denominator = 0.0f;
@@ -2479,15 +3085,10 @@ extern "C" __global__ void indexed_attention_attention_f32_batched_serial(
     for (int selected_row = 0; selected_row < selected_len; ++selected_row) {
         int token = row_selected[selected_row];
         if (token < 0 || token >= full_capacity || token >= visible) continue;
-        float score = 0.0f;
-        for (int d = 0; d < head_dim; ++d) {
-            score += q_with_gate[q_head_offset + d]
-                * full_keys[token * n_kv_heads * head_dim + kv_head * head_dim + d];
-        }
+        float score = key_score(token);
         float weight = expf(score / sqrtf((float)head_dim) - max_score);
         denominator += weight;
-        numerator += weight
-            * full_values[token * n_kv_heads * head_dim + kv_head * head_dim + channel];
+        numerator += weight * value_of(token);
     }
     float gate = q_with_gate[q_head_offset + head_dim + channel];
     int output_offset = row * n_heads * head_dim + head * head_dim + channel;
@@ -2497,10 +3098,11 @@ extern "C" __global__ void indexed_attention_attention_f32_batched_serial(
 
 // One query row of the parallel attention below against `selected_len`
 // entries of `row_selected`; rows at or past `visible` count as invalid.
+template <int F>
 static __device__ __forceinline__ void qsa_attention_row_parallel(
     const float* __restrict__ q,
-    const float* full_keys,
-    const float* full_values,
+    const unsigned char* full_keys,
+    const unsigned char* full_values,
     const int* row_selected,
     float* output_row,
     int selected_len,
@@ -2516,43 +3118,54 @@ static __device__ __forceinline__ void qsa_attention_row_parallel(
     const int head = (int)blockIdx.x;
     const int kv_head = head / (n_heads / n_kv_heads);
     const int kv_stride = n_kv_heads * head_dim;
-    const float* keys = full_keys + kv_head * head_dim;
+    // F32 rows are kept as cache element offsets (token * kv_stride), the
+    // quantized formats' as token indices.
+    const int row_unit = F == QSA_KV_F32 ? kv_stride : 1;
+    const size_t row_bytes = (size_t)qsa_kv_row_bytes<F>(n_kv_heads, head_dim);
+    const float* keys = reinterpret_cast<const float*>(full_keys) + kv_head * head_dim;
     float partial_max = -3.402823466e+38f;
     for (int selected_row = tid; selected_row < selected_len; selected_row += (int)blockDim.x) {
         int token = row_selected[selected_row];
         bool ok = token >= 0 && token < full_capacity && token < visible;
-        row_tokens[selected_row] = ok ? token * kv_stride : -1;
+        row_tokens[selected_row] = ok ? token * row_unit : -1;
         float score = 0.0f;
         if (ok) {
-            const float* key = keys + token * kv_stride;
-            if (head_dim == 256) {
-                // Thirty-two key float4 loads in flight per batch; the FMAs still
-                // run in serial d order.
-                const float4* key4 = reinterpret_cast<const float4*>(key);
-                const float4* q4 = reinterpret_cast<const float4*>(q);
-                for (int c = 0; c < 64; c += 32) {
-                    float4 k4[32];
+            if constexpr (F == QSA_KV_F32) {
+                const float* key = keys + token * kv_stride;
+                if (head_dim == 256) {
+                    // Thirty-two key float4 loads in flight per batch; the FMAs
+                    // still run in serial d order.
+                    const float4* key4 = reinterpret_cast<const float4*>(key);
+                    const float4* q4 = reinterpret_cast<const float4*>(q);
+                    for (int c = 0; c < 64; c += 32) {
+                        float4 k4[32];
 #pragma unroll
-                    for (int u = 0; u < 32; ++u) k4[u] = key4[c + u];
+                        for (int u = 0; u < 32; ++u) k4[u] = key4[c + u];
 #pragma unroll
-                    for (int u = 0; u < 32; ++u) {
-                        const float4 qv = q4[c + u];
-                        score += qv.x * k4[u].x;
-                        score += qv.y * k4[u].y;
-                        score += qv.z * k4[u].z;
-                        score += qv.w * k4[u].w;
+                        for (int u = 0; u < 32; ++u) {
+                            const float4 qv = q4[c + u];
+                            score += qv.x * k4[u].x;
+                            score += qv.y * k4[u].y;
+                            score += qv.z * k4[u].z;
+                            score += qv.w * k4[u].w;
+                        }
                     }
-                }
-            } else if ((head_dim & 3) == 0) {
-                for (int d = 0; d < head_dim; d += 4) {
-                    const float4 k4 = *reinterpret_cast<const float4*>(key + d);
-                    score += q[d] * k4.x;
-                    score += q[d + 1] * k4.y;
-                    score += q[d + 2] * k4.z;
-                    score += q[d + 3] * k4.w;
+                } else if ((head_dim & 3) == 0) {
+                    for (int d = 0; d < head_dim; d += 4) {
+                        const float4 k4 = *reinterpret_cast<const float4*>(key + d);
+                        score += q[d] * k4.x;
+                        score += q[d + 1] * k4.y;
+                        score += q[d + 2] * k4.z;
+                        score += q[d + 3] * k4.w;
+                    }
+                } else {
+                    for (int d = 0; d < head_dim; ++d) score += q[d] * key[d];
                 }
             } else {
-                for (int d = 0; d < head_dim; ++d) score += q[d] * key[d];
+                float dots[1] = {0.0f};
+                qsa_kv_key_dots<F, 1>(q, 0, full_keys + (size_t)token * row_bytes, n_kv_heads,
+                                      head_dim, kv_head, dots);
+                score = dots[0];
             }
             score /= sqrtf((float)head_dim);
             partial_max = fmaxf(partial_max, score);
@@ -2574,7 +3187,16 @@ static __device__ __forceinline__ void qsa_attention_row_parallel(
     __syncthreads();
     int channel = (int)(blockIdx.y * blockDim.x + threadIdx.x);
     if (head >= n_heads || channel >= head_dim) return;
-    const float* values = full_values + kv_head * head_dim + channel;
+    const float* values = reinterpret_cast<const float*>(full_values) + kv_head * head_dim + channel;
+    // `entry` is a row_tokens entry (>= 0).
+    auto load = [&](int entry) -> float {
+        if constexpr (F == QSA_KV_F32) {
+            return values[(unsigned)entry];
+        } else {
+            return qsa_kv_value<F>(full_values + (size_t)entry * row_bytes, n_kv_heads, head_dim,
+                                   kv_head, channel);
+        }
+    };
     float denominator = 0.0f;
     float numerator = 0.0f;
     // Value loads run one batch ahead of the in-order accumulation.
@@ -2585,7 +3207,7 @@ static __device__ __forceinline__ void qsa_attention_row_parallel(
 #pragma unroll
         for (int u = 0; u < UNROLL; ++u) {
             const int offset = row_tokens[u];
-            value[u] = values[(unsigned)(offset < 0 ? 0 : offset)];
+            value[u] = load(offset < 0 ? 0 : offset);
         }
     }
     for (; i + UNROLL <= selected_len; i += UNROLL) {
@@ -2594,7 +3216,7 @@ static __device__ __forceinline__ void qsa_attention_row_parallel(
 #pragma unroll
             for (int u = 0; u < UNROLL; ++u) {
                 const int offset = row_tokens[i + UNROLL + u];
-                next[u] = values[(unsigned)(offset < 0 ? 0 : offset)];
+                next[u] = load(offset < 0 ? 0 : offset);
             }
         }
 #pragma unroll
@@ -2609,7 +3231,7 @@ static __device__ __forceinline__ void qsa_attention_row_parallel(
     for (; i < selected_len; ++i) {
         const int token = row_tokens[i];
         const float weight = row_scores[i];
-        const float value = token < 0 ? 0.0f : values[(unsigned)token];
+        const float value = token < 0 ? 0.0f : load(token);
         denominator += weight;
         numerator += weight * value;
     }
@@ -2625,11 +3247,13 @@ static __device__ __forceinline__ void qsa_attention_row_parallel(
 // (not per channel), and the value loads of UNROLL rows are issued before
 // their in-order accumulation (rows are kept as cache offsets, token *
 // kv_stride).  Invalid rows keep weight 0 and select value
-// 0, adding +0.0 to sums that are never -0.0.
-extern "C" __global__ __launch_bounds__(256) void indexed_attention_attention_f32_batched(
+// 0, adding +0.0 to sums that are never -0.0. Each quantized format keeps the
+// same equality with its serial twin.
+template <int F>
+static __device__ __forceinline__ void qsa_attention_batched(
     const float* q_with_gate,
-    const float* full_keys,
-    const float* full_values,
+    const unsigned char* full_keys,
+    const unsigned char* full_values,
     const int* selected_indices,
     float* output,
     int rows,
@@ -2648,7 +3272,7 @@ extern "C" __global__ __launch_bounds__(256) void indexed_attention_attention_f3
     int chosen = budget_blocks < block_count ? budget_blocks : block_count;
     int selected_len = chosen * compress + visible - block_count * compress;
     if (selected_len > capacity) selected_len = capacity;
-    qsa_attention_row_parallel(
+    qsa_attention_row_parallel<F>(
         q_with_gate + row * 2 * n_heads * head_dim + (int)blockIdx.x * head_dim * 2,
         full_keys, full_values, selected_indices + row * capacity,
         output + row * n_heads * head_dim, selected_len, visible,
@@ -2660,12 +3284,14 @@ extern "C" __global__ __launch_bounds__(256) void indexed_attention_attention_f3
 // softmax sum runs in selected-row order per channel. One workgroup owns four
 // query heads of one KV group, so each key/value row is fetched once for all
 // four, and expf runs once per (head, token) instead of once per channel.
+// Each quantized format keeps the same equality with its serial twin.
 #define QSA_HG 4
 #define QSA_HD 256
-extern "C" __global__ __launch_bounds__(256) void indexed_attention_attention_f32_batched_hg4(
+template <int F>
+static __device__ __forceinline__ void qsa_attention_batched_hg4(
     const float* q_with_gate,
-    const float* full_keys,
-    const float* full_values,
+    const unsigned char* full_keys,
+    const unsigned char* full_values,
     const int* selected_indices,
     float* output,
     int rows,
@@ -2695,8 +3321,9 @@ extern "C" __global__ __launch_bounds__(256) void indexed_attention_attention_f3
     int head0 = (int)blockIdx.x * QSA_HG;
     int kv_head = head0 / (n_heads / n_kv_heads);
     int kv_stride = n_kv_heads * QSA_HD;
-    const float* keys = full_keys + kv_head * QSA_HD;
-    const float* values = full_values + kv_head * QSA_HD;
+    const size_t row_bytes = (size_t)qsa_kv_row_bytes<F>(n_kv_heads, QSA_HD);
+    const float* keys = reinterpret_cast<const float*>(full_keys) + kv_head * QSA_HD;
+    const float* values = reinterpret_cast<const float*>(full_values) + kv_head * QSA_HD;
     const int* row_selected = selected_indices + row * capacity;
     int q_row = row * 2 * n_heads * QSA_HD;
     // The query rows are block-uniform: the score loop reads them as scalar
@@ -2721,18 +3348,23 @@ extern "C" __global__ __launch_bounds__(256) void indexed_attention_attention_f3
 #pragma unroll
         for (int h = 0; h < QSA_HG; ++h) score[h] = 0.0f;
         if (token >= 0) {
-            const float4* key4 = reinterpret_cast<const float4*>(keys + token * kv_stride);
+            if constexpr (F == QSA_KV_F32) {
+                const float4* key4 = reinterpret_cast<const float4*>(keys + token * kv_stride);
 #pragma unroll 4
-            for (int d4 = 0; d4 < QSA_HD / 4; ++d4) {
-                const float4 k4 = key4[d4];
+                for (int d4 = 0; d4 < QSA_HD / 4; ++d4) {
+                    const float4 k4 = key4[d4];
 #pragma unroll
-                for (int h = 0; h < QSA_HG; ++h) {
-                    const float4 q4 = reinterpret_cast<const float4*>(qg + h * QSA_HD * 2)[d4];
-                    score[h] += q4.x * k4.x;
-                    score[h] += q4.y * k4.y;
-                    score[h] += q4.z * k4.z;
-                    score[h] += q4.w * k4.w;
+                    for (int h = 0; h < QSA_HG; ++h) {
+                        const float4 q4 = reinterpret_cast<const float4*>(qg + h * QSA_HD * 2)[d4];
+                        score[h] += q4.x * k4.x;
+                        score[h] += q4.y * k4.y;
+                        score[h] += q4.z * k4.z;
+                        score[h] += q4.w * k4.w;
+                    }
                 }
+            } else {
+                qsa_kv_key_dots<F, QSA_HG>(qg, QSA_HD * 2, full_keys + (size_t)token * row_bytes,
+                                           n_kv_heads, QSA_HD, kv_head, score);
             }
         }
         if (index < selected_len) {
@@ -2780,9 +3412,15 @@ extern "C" __global__ __launch_bounds__(256) void indexed_attention_attention_f3
     auto value_at = [&](int index) {
         const int token = __builtin_amdgcn_readfirstlane(row_selected[index]);
         const bool ok = token >= 0 && token < full_capacity && token < visible;
-        const float v = __builtin_bit_cast(float, __builtin_amdgcn_raw_buffer_load_b32(
-            vrsrc, voff, ok ? token * kv_stride * 4 : 0, 0));
-        return ok ? v : 0.0f;
+        if constexpr (F == QSA_KV_F32) {
+            const float v = __builtin_bit_cast(float, __builtin_amdgcn_raw_buffer_load_b32(
+                vrsrc, voff, ok ? token * kv_stride * 4 : 0, 0));
+            return ok ? v : 0.0f;
+        } else {
+            const float v = qsa_kv_value<F>(full_values + (size_t)(ok ? token : 0) * row_bytes,
+                                            n_kv_heads, QSA_HD, kv_head, channel);
+            return ok ? v : 0.0f;
+        }
     };
     int i = 0;
     for (; i + 8 <= selected_len; i += 8) {
@@ -2826,10 +3464,11 @@ extern "C" __global__ __launch_bounds__(256) void indexed_attention_attention_f3
 #undef QSA_HG
 #undef QSA_HD
 
-extern "C" __global__ void indexed_attention_attention_f32_serial(
+template <int F>
+static __device__ __forceinline__ void qsa_attention_serial(
     const float* q_with_gate,
-    const float* full_keys,
-    const float* full_values,
+    const unsigned char* full_keys,
+    const unsigned char* full_values,
     const int* selected_indices,
     float* output,
     int n_heads,
@@ -2841,15 +3480,38 @@ extern "C" __global__ void indexed_attention_attention_f32_serial(
     int channel = (int)(blockIdx.y * blockDim.x + threadIdx.x);
     if (head >= n_heads || channel >= head_dim) return;
     int kv_head = head / (n_heads / n_kv_heads);
+    const float* keys = reinterpret_cast<const float*>(full_keys);
+    const float* values = reinterpret_cast<const float*>(full_values);
+    const size_t row_bytes = (size_t)qsa_kv_row_bytes<F>(n_kv_heads, head_dim);
+    auto key_score = [&](int token) {
+        float score = 0.0f;
+        if constexpr (F == QSA_KV_F32) {
+            for (int d = 0; d < head_dim; ++d) {
+                score += q_with_gate[head * head_dim * 2 + d]
+                    * keys[token * n_kv_heads * head_dim + kv_head * head_dim + d];
+            }
+        } else {
+            float dots[1] = {0.0f};
+            qsa_kv_key_dots<F, 1>(q_with_gate + head * head_dim * 2, 0,
+                                  full_keys + (size_t)token * row_bytes, n_kv_heads, head_dim,
+                                  kv_head, dots);
+            score = dots[0];
+        }
+        return score;
+    };
+    auto value_of = [&](int token) {
+        if constexpr (F == QSA_KV_F32) {
+            return values[token * n_kv_heads * head_dim + kv_head * head_dim + channel];
+        } else {
+            return qsa_kv_value<F>(full_values + (size_t)token * row_bytes, n_kv_heads, head_dim,
+                                   kv_head, channel);
+        }
+    };
     float max_score = -3.402823466e+38f;
     for (int row = 0; row < selected_len; ++row) {
         int token = selected_indices[row];
         if (token < 0 || token >= full_capacity) continue;
-        float score = 0.0f;
-        for (int d = 0; d < head_dim; ++d) {
-            score += q_with_gate[head * head_dim * 2 + d]
-                * full_keys[token * n_kv_heads * head_dim + kv_head * head_dim + d];
-        }
+        float score = key_score(token);
         max_score = fmaxf(max_score, score / sqrtf((float)head_dim));
     }
     float denominator = 0.0f;
@@ -2857,14 +3519,10 @@ extern "C" __global__ void indexed_attention_attention_f32_serial(
     for (int row = 0; row < selected_len; ++row) {
         int token = selected_indices[row];
         if (token < 0 || token >= full_capacity) continue;
-        float score = 0.0f;
-        for (int d = 0; d < head_dim; ++d) {
-            score += q_with_gate[head * head_dim * 2 + d]
-                * full_keys[token * n_kv_heads * head_dim + kv_head * head_dim + d];
-        }
+        float score = key_score(token);
         float weight = expf(score / sqrtf((float)head_dim) - max_score);
         denominator += weight;
-        numerator += weight * full_values[token * n_kv_heads * head_dim + kv_head * head_dim + channel];
+        numerator += weight * value_of(token);
     }
     float gate = q_with_gate[head * head_dim * 2 + head_dim + channel];
     output[head * head_dim + channel] =
@@ -2874,10 +3532,11 @@ extern "C" __global__ void indexed_attention_attention_f32_serial(
 // Single query row with an explicit selection length (the MTP head's reused
 // selections do not follow the batched length formula); same arithmetic as
 // the batched kernel.
-extern "C" __global__ __launch_bounds__(256) void indexed_attention_attention_f32(
+template <int F>
+static __device__ __forceinline__ void qsa_attention_single(
     const float* q_with_gate,
-    const float* full_keys,
-    const float* full_values,
+    const unsigned char* full_keys,
+    const unsigned char* full_values,
     const int* selected_indices,
     float* output,
     int n_heads,
@@ -2885,11 +3544,54 @@ extern "C" __global__ __launch_bounds__(256) void indexed_attention_attention_f3
     int head_dim,
     int selected_len,
     int full_capacity) {
-    qsa_attention_row_parallel(
+    qsa_attention_row_parallel<F>(
         q_with_gate + (int)blockIdx.x * head_dim * 2, full_keys, full_values,
         selected_indices, output, selected_len, full_capacity,
         n_heads, n_kv_heads, head_dim, full_capacity);
 }
+
+// One exported kernel per (body, format): F32 keeps its historical names and
+// float cache pointers, fp8 takes byte rows.
+#define QSA_ATTENTION_BATCHED(NAME, BODY, BOUNDS, FORMAT, CACHE)                            \
+    extern "C" __global__ BOUNDS void NAME(                                                 \
+        const float* q_with_gate, const CACHE* full_keys, const CACHE* full_values,        \
+        const int* selected_indices, float* output, int rows, int position_start,          \
+        int n_heads, int n_kv_heads, int head_dim, int budget_blocks, int compress,        \
+        int capacity, int full_capacity) {                                                  \
+        BODY<FORMAT>(q_with_gate, reinterpret_cast<const unsigned char*>(full_keys),        \
+                     reinterpret_cast<const unsigned char*>(full_values), selected_indices, \
+                     output, rows, position_start, n_heads, n_kv_heads, head_dim,           \
+                     budget_blocks, compress, capacity, full_capacity);                     \
+    }
+#define QSA_ATTENTION_SINGLE(NAME, BODY, BOUNDS, FORMAT, CACHE)                             \
+    extern "C" __global__ BOUNDS void NAME(                                                 \
+        const float* q_with_gate, const CACHE* full_keys, const CACHE* full_values,        \
+        const int* selected_indices, float* output, int n_heads, int n_kv_heads,           \
+        int head_dim, int selected_len, int full_capacity) {                                \
+        BODY<FORMAT>(q_with_gate, reinterpret_cast<const unsigned char*>(full_keys),        \
+                     reinterpret_cast<const unsigned char*>(full_values), selected_indices, \
+                     output, n_heads, n_kv_heads, head_dim, selected_len, full_capacity);   \
+    }
+#define QSA_NO_BOUNDS
+#define QSA_ATTENTION_KERNELS(TAG, FORMAT, CACHE)                                           \
+    QSA_ATTENTION_BATCHED(indexed_attention_attention_##TAG##_batched_serial,               \
+                          qsa_attention_batched_serial, QSA_NO_BOUNDS, FORMAT, CACHE)       \
+    QSA_ATTENTION_BATCHED(indexed_attention_attention_##TAG##_batched,                      \
+                          qsa_attention_batched, __launch_bounds__(256), FORMAT, CACHE)     \
+    QSA_ATTENTION_BATCHED(indexed_attention_attention_##TAG##_batched_hg4,                  \
+                          qsa_attention_batched_hg4, __launch_bounds__(256), FORMAT, CACHE) \
+    QSA_ATTENTION_SINGLE(indexed_attention_attention_##TAG##_serial, qsa_attention_serial,  \
+                         QSA_NO_BOUNDS, FORMAT, CACHE)                                      \
+    QSA_ATTENTION_SINGLE(indexed_attention_attention_##TAG, qsa_attention_single,           \
+                         __launch_bounds__(256), FORMAT, CACHE)
+QSA_ATTENTION_KERNELS(f32, QSA_KV_F32, float)
+#if defined(QSA_HAS_FP8)
+QSA_ATTENTION_KERNELS(fp8, QSA_KV_FP8, unsigned char)
+#endif
+#undef QSA_ATTENTION_KERNELS
+#undef QSA_NO_BOUNDS
+#undef QSA_ATTENTION_SINGLE
+#undef QSA_ATTENTION_BATCHED
 extern "C" __global__ void scale_f32(
     float* values,
     int elements,
