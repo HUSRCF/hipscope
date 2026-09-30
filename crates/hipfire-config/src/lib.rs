@@ -2363,6 +2363,15 @@ pub static FIELDS: &[ConfigField] = &[
         "Use the bit-exact v2 schedule of the gfx1201 Q-resident FA2 prefill kernel (default on exact gfx1201; set to false or HIPFIRE_ATTN_QRESIDENT_V2=0 to restore the v1 Q-resident kernel; only applies where kernel.attn_qresident selects the Q-resident route)."
     ),
     process_bool_field!(
+        "kernel.verify_attn",
+        "verify_attn",
+        Kernel,
+        true,
+        false,
+        "HIPFIRE_VERIFY_ATTN",
+        "Run speculative-verify attention (1..=32 rows, non-tree) through the gfx1201 GQA-shared split-K VerifyAttn twin of the batched flash tile + reduce (default on exact gfx1201; byte-identical output; set to false or HIPFIRE_VERIFY_ATTN=0 to opt out to attention_flash_*_tile_batched)."
+    ),
+    process_bool_field!(
         "kernel.gfx12_fa_prep_fused",
         "gfx12_fa_prep_fused",
         Kernel,
