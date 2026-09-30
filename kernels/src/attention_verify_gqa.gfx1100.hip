@@ -150,6 +150,16 @@ __device__ __forceinline__ void va_rows_step(bool raise, float w, const float (&
     for (int i = 0; i < 8; ++i) acc[i] = __builtin_fmaf(w, vq[i], acc[i]);
 }
 
+// ROWS: word k of a pair's raise mask (bit l = key 32k + l raises the
+// running max), selected with uniform compares instead of an indexed array.
+__device__ __forceinline__ unsigned int va_word(const unsigned int (&r)[4], int k) {
+    return k == 0 ? r[0] : k == 1 ? r[1] : k == 2 ? r[2] : r[3];
+}
+
+__device__ __forceinline__ bool va_raised(const unsigned int (&r)[4], int t) {
+    return (va_word(r, t >> 5) >> (t & 31)) & 1u;
+}
+
 // Every tile of one wave's workgroup range, for the wave's first NP pairs
 // (the valid pairs of a wave are always a prefix j < NP, so the pair loops
 // are straight-line and interleave across pairs).
@@ -247,44 +257,41 @@ __device__ __forceinline__ void va_tiles(
                 }
             }
         } else {
-            // ── Phase B (ROWS): the running max as a lane scan. Lane l holds
-            //    keys 4l..4l+3; m_t = leftmost max of (-1e30, s_0..s_t) under
-            //    `s > m`, which is associative. Each key's slot becomes e_t =
-            //    exp2(s_t - m_t), or s_t itself where s_t raises the max.
+            // ── Phase B (ROWS): the running max as a lane scan, 32 keys at a
+            //    time (lane l holds key 32k + l of block k). m_t = leftmost
+            //    max of (-1e30, s_0..s_t) under `s > m`, which is associative.
+            //    Each key's slot becomes e_t = exp2(s_t - m_t), or s_t itself
+            //    where s_t raises the max.
 #pragma unroll
             for (int j = 0; j < NP; ++j) {
                 const int tile_len = tl[j];
-                if (tile_len == 0) {
 #pragma unroll
-                    for (int u = 0; u < 4; ++u) raise[j][u] = 0u;
-                    continue;
-                }
-                float4* slot = (float4*)&sc[j][4 * lane];
-                const float4 s4 = *slot;
-                float s[4] = {s4.x, s4.y, s4.z, s4.w};
-                bool valid[4];
-                float m = -1e30f;
+                for (int k = 0; k < 4; ++k) raise[j][k] = 0u;
+                float carry = -1e30f;
+                for (int k = 0; 32 * k < tile_len; ++k) {
+                    const int t = 32 * k + lane;
+                    const bool valid = t < tile_len;
+                    const float s = valid ? sc[j][t] : -1e30f;
+                    float m = s;
 #pragma unroll
-                for (int u = 0; u < 4; ++u) {
-                    valid[u] = 4 * lane + u < tile_len;
-                    if (valid[u] && s[u] > m) m = s[u];
+                    for (int d = 1; d < 32; d <<= 1) {
+                        const float left = __shfl_up(m, d);
+                        if (lane >= d && !(m > left)) m = left;
+                    }
+                    float prev = __shfl_up(m, 1);
+                    if (lane == 0) prev = -1e30f;
+                    if (prev > carry) carry = prev;
+                    prev = carry;
+                    const bool r = valid && s > prev;
+                    const float mt = r ? s : prev;
+                    if (valid) sc[j][t] = r ? s : __builtin_amdgcn_exp2f(s - mt);
+                    const unsigned int bits = (unsigned int)__builtin_amdgcn_ballot_w32(r);
+                    raise[j][0] = k == 0 ? bits : raise[j][0];
+                    raise[j][1] = k == 1 ? bits : raise[j][1];
+                    raise[j][2] = k == 2 ? bits : raise[j][2];
+                    raise[j][3] = k == 3 ? bits : raise[j][3];
+                    carry = __shfl(mt, 31);
                 }
-#pragma unroll
-                for (int d = 1; d < 32; d <<= 1) {
-                    const float left = __shfl_up(m, d);
-                    if (lane >= d && !(m > left)) m = left;
-                }
-                const float prev = __shfl_up(m, 1);
-                m = (lane == 0) ? -1e30f : prev;
-                float o[4];
-#pragma unroll
-                for (int u = 0; u < 4; ++u) {
-                    const bool r = valid[u] && s[u] > m;
-                    if (r) m = s[u];
-                    o[u] = r ? s[u] : __builtin_amdgcn_exp2f(s[u] - m);
-                    raise[j][u] = (unsigned)__builtin_amdgcn_ballot_w32(r);
-                }
-                *slot = make_float4(o[0], o[1], o[2], o[3]);
             }
         }
         __builtin_amdgcn_fence(__ATOMIC_SEQ_CST, "wavefront");
@@ -322,6 +329,11 @@ __device__ __forceinline__ void va_tiles(
                     float4 w4[NP];
 #pragma unroll
                     for (int j = 0; j < NP; ++j) w4[j] = *(const float4*)&sc[j][t];
+                    // ROWS: raise bits of keys t..t+3 (t % 4 == 0, same mask word).
+                    unsigned int nib[NP];
+#pragma unroll
+                    for (int j = 0; j < NP; ++j)
+                        nib[j] = MODE == VA_MODE_ROWS ? (va_word(raise[j], t >> 5) >> (t & 31)) & 0xFu : 0u;
 #pragma unroll
                     for (int u = 0; u < 4; ++u) {
                         float vq[8];
@@ -333,7 +345,7 @@ __device__ __forceinline__ void va_tiles(
 #pragma unroll
                                 for (int i = 0; i < 8; ++i) acc[j][i] = __builtin_fmaf(w, vq[i], acc[j][i]);
                             } else {
-                                va_rows_step((raise[j][u] >> (t >> 2)) & 1u, w, vq, rm[j], rs[j], acc[j]);
+                                va_rows_step((nib[j] >> u) & 1u, w, vq, rm[j], rs[j], acc[j]);
                             }
                         }
                     }
@@ -350,7 +362,7 @@ __device__ __forceinline__ void va_tiles(
 #pragma unroll
                             for (int i = 0; i < 8; ++i) acc[j][i] = __builtin_fmaf(w, vq[i], acc[j][i]);
                         } else {
-                            va_rows_step((raise[j][t & 3] >> (t >> 2)) & 1u, w, vq, rm[j], rs[j], acc[j]);
+                            va_rows_step(va_raised(raise[j], t), w, vq, rm[j], rs[j], acc[j]);
                         }
                     }
                     c4[0] = c4[1];
@@ -371,7 +383,7 @@ __device__ __forceinline__ void va_tiles(
 #pragma unroll
                             for (int i = 0; i < 8; ++i) acc[j][i] = __builtin_fmaf(w, vq[i], acc[j][i]);
                         } else {
-                            va_rows_step((raise[j][t & 3] >> (t >> 2)) & 1u, w, vq, rm[j], rs[j], acc[j]);
+                            va_rows_step(va_raised(raise[j], t), w, vq, rm[j], rs[j], acc[j]);
                         }
                     }
                     cv = nv;
