@@ -129,6 +129,18 @@ pub fn q8_flash_tile_size(
 const QRESIDENT_V2_LDS_BYTES: u32 = 2 * (2 * 12288 + 2 * 192) + 16;
 const _: () = assert!(QRESIDENT_V2_LDS_BYTES == 49936);
 
+/// Context ceiling of the gfx1201 Q8 FA2 prefill body: the model's 262144
+/// positions (the same bound as dispatch's native-fp8 FA2 arms). The body's
+/// causal bound comes from `positions[]` and its K/V offsets are 64-bit, so
+/// nothing in the kernel depends on this value.
+pub const GFX12_Q8_FA2_MAX_CTX: usize = 262_144;
+
+/// Upper context bound of dispatch's default gfx12 query16 Q8 prefill
+/// envelope. At or below it the gfx1201 Q8 FA2 admission is unchanged;
+/// above it FA2 is the default and also takes chunk tails (see
+/// [`Gpu::gfx12_q8_fa2_prefill_admitted`]).
+pub const GFX12_QUERY16_MAX_CTX: usize = 32_768;
+
 /// Output of a Q-resident attention launch: the f32 rows, or (A4 epilogue
 /// twin) the Q/gate rows, output-projection AWQ scales and A4 slab.
 #[derive(Clone, Copy)]
@@ -3726,6 +3738,42 @@ impl Gpu {
         }
     }
 
+    /// Whether the default gfx1201 Q8 FA2 prefill arm of
+    /// [`Self::attention_q8_0_flash_prefill_wmma`] takes this call (exact
+    /// arch/shape/eager gates). Dispatch asks the same question before it
+    /// routes long-context prefill here, so the two never drift.
+    ///
+    /// Context is bounded by the model's 262144 positions
+    /// ([`GFX12_Q8_FA2_MAX_CTX`]), not by the body: it walks KT64 tiles up to
+    /// `max(positions) + 1` with 64-bit K/V row offsets and never reads
+    /// `max_ctx_len`. The former 32768 ceiling sent every longer prefill to
+    /// the tiled partials+reduce kernel (R9700 H2 at 65K: 299.3 s vs 56.8 s).
+    pub fn gfx12_q8_fa2_prefill_admitted(
+        &self,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        batch_size: usize,
+        max_ctx_len: usize,
+    ) -> bool {
+        self.flags.gfx12_fa2_prefill
+            && self.arch == "gfx1201"
+            && !self.replay.is_recording()
+            && !self.graphs.capture_mode
+            && n_heads == 24
+            && n_kv_heads == 4
+            && head_dim == 256
+            && (64..=512).contains(&batch_size)
+            // At or below 32K a batch that is not a whole number of 16-row
+            // tiles keeps dispatch's query16 kernel (unchanged envelope).
+            // Above it the only alternative is the tiled kernel, which runs
+            // such a chunk tail as one 16-row launch after another, each
+            // scanning the whole context (2.5 s of a 49K H2 prefill); the
+            // body guards partial 8-row query tiles, so FA2 takes it.
+            && (batch_size % 16 == 0 || max_ctx_len > GFX12_QUERY16_MAX_CTX)
+            && (64..=GFX12_Q8_FA2_MAX_CTX).contains(&max_ctx_len)
+    }
+
     /// True when a Composable-Kernel FA library is loaded in this process.
     /// The F2 N1024 pair envelope requires this to be false (there is no
     /// 1024-vs-2x512 bit-identity proof for CK tiling); CK stays fail-closed
@@ -3785,17 +3833,13 @@ impl Gpu {
         // incumbent path below. Never inside `_wmma_slots` (its all-or-none
         // slot ABI is unchanged) and never under replay/graph capture.
         // Opt out with `HIPFIRE_GFX12_FA2_PREFILL=0`.
-        if self.flags.gfx12_fa2_prefill
-            && self.arch == "gfx1201"
-            && !self.replay.is_recording()
-            && !self.graphs.capture_mode
-            && n_heads == 24
-            && n_kv_heads == 4
-            && head_dim == 256
-            && (64..=512).contains(&batch_size)
-            && batch_size % 16 == 0
-            && (64..=32768).contains(&max_ctx_len)
-        {
+        if self.gfx12_q8_fa2_prefill_admitted(
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            batch_size,
+            max_ctx_len,
+        ) {
             // q8 cache always runs the f16 FA2 body: stage-b route-Q
             // arithmetic does not exist (B4 pending), so there is nothing to
             // select here.
@@ -4124,11 +4168,11 @@ impl Gpu {
                 ),
             ));
         }
-        if max_ctx_len == 0 || max_ctx_len > 32768 {
+        if max_ctx_len == 0 || max_ctx_len > GFX12_Q8_FA2_MAX_CTX {
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
-                    "attention_q8_0_fa2_gqa_gfx1201 requires 1 <= max_ctx_len <= 32768, got {max_ctx_len}"
+                    "attention_q8_0_fa2_gqa_gfx1201 requires 1 <= max_ctx_len <= {GFX12_Q8_FA2_MAX_CTX}, got {max_ctx_len}"
                 ),
             ));
         }
