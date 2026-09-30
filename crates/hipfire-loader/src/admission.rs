@@ -110,8 +110,6 @@ pub struct SourceAdmissionOptions {
     pub pflash: bool,
 }
 
-/// Qwen4 state is sized for exactly this many tokens.
-const QWEN4_MAX_SEQ: usize = 2048;
 
 /// Return whether a per-load adaptive-KV value requests the active controller.
 /// The CLI schema default is `Some("off")`, which must remain ordinary AR.
@@ -808,10 +806,10 @@ pub fn admit_source_with_options(
     if let Some(refusal) = flux_arch_refusal(arch_id, gpu_arch) {
         return Err(refusal);
     }
-    // Qwen4 state is sized for exactly QWEN4_MAX_SEQ tokens; an omitted
-    // (automatic) request means that bound.
+    // An omitted (automatic) Qwen4 request gets the default context; explicit
+    // values are checked against QWEN4_MAX_CONTEXT below.
     let max_seq = if arch_id == QWEN4_ARCH_ID && max_seq == 0 {
-        QWEN4_MAX_SEQ
+        hipfire_arch_qwen4::QWEN4_DEFAULT_CONTEXT
     } else {
         max_seq
     };
@@ -821,9 +819,10 @@ pub fn admit_source_with_options(
         // Arch 16 is an executable local-path carrier, but only after its
         // complete source-only boundary succeeds. Keep this before vision/head
         // handling so every refusal remains pre-allocation.
-        if max_seq != QWEN4_MAX_SEQ {
+        if max_seq > hipfire_arch_qwen4::QWEN4_MAX_CONTEXT {
             return Err(format!(
-                "qwen4: max_seq must be exactly {QWEN4_MAX_SEQ} (got {max_seq})"
+                "qwen4: max_seq {max_seq} exceeds the admitted context limit {}",
+                hipfire_arch_qwen4::QWEN4_MAX_CONTEXT
             ));
         }
         hipfire_runtime::kv_mode::resolve_qwen4(hints.kv_mode.unwrap_or(""), 256)?;

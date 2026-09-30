@@ -338,10 +338,11 @@ impl Carrier for Qwen4Carrier {
                 ctx.kv_backend.as_str()
             ));
         }
-        if ctx.max_seq != 2048 {
+        if ctx.max_seq == 0 || ctx.max_seq > hipfire_arch_qwen4::QWEN4_MAX_CONTEXT {
             return Err(format!(
-                "qwen4: max_seq must be exactly 2048 (got {})",
-                ctx.max_seq
+                "qwen4: max_seq {} is outside the admitted context range 1..={}",
+                ctx.max_seq,
+                hipfire_arch_qwen4::QWEN4_MAX_CONTEXT
             ));
         }
         let native_mtp =
@@ -373,6 +374,12 @@ impl Carrier for Qwen4Carrier {
         let receipt =
             hipfire_arch_qwen4::admit_hfqm_artifact(&hfq).map_err(|error| error.to_string())?;
         let config = receipt.config;
+        // Context-sized QSA arenas (trunk layers plus the MTP head's), named
+        // in the refusal when they do not fit.
+        let context_state_mib = config
+            .qsa_context_arena_bytes(ctx.max_seq)
+            .map(|bytes| bytes * (config.n_full_layers() + usize::from(native_mtp)) >> 20)
+            .unwrap_or(usize::MAX);
         let manifest = receipt.manifest;
         let metadata = receipt.ple;
         let placements = receipt.placements;
@@ -418,7 +425,12 @@ impl Carrier for Qwen4Carrier {
             ctx.max_seq,
             metadata,
         )
-        .map_err(|error| format!("qwen4: bundle assembly failed: {error}"))?;
+        .map_err(|error| {
+            format!(
+                "qwen4: bundle assembly failed: {error} (max_seq {} needs {context_state_mib} MiB of QSA context state; lower memory.max_seq)",
+                ctx.max_seq
+            )
+        })?;
         if let Err(error) = bundle.attach_forward(ctx.gpu, ctx.max_seq) {
             let detail = error.to_string();
             let _ = bundle.free_gpu(ctx.gpu);
@@ -465,6 +477,35 @@ impl Carrier for Qwen4Carrier {
             };
         }
         Ok(model)
+    }
+
+    /// Bench-prefill for Qwen4: the daemon has reset the request state; run
+    /// the synthetic prompt through the tiled final-row prefill the AR path
+    /// uses (the same call `bench_decode_prime` makes).
+    fn bench_prefill(
+        &self,
+        m: &mut crate::LoadedModel,
+        gpu: &mut rdna_compute::Gpu,
+        synthetic: &[u32],
+        _n: usize,
+        prefill_err: &mut Option<String>,
+    ) -> Option<bool> {
+        let bundle = m.qwen4_mut()?;
+        let vocab = bundle.config.vocab_size;
+        let logits = match gpu.zeros(&[vocab], rdna_compute::DType::F32) {
+            Ok(logits) => logits,
+            Err(error) => {
+                *prefill_err = Some(format!("qwen4 bench prefill logits: {error:?}"));
+                return Some(false);
+            }
+        };
+        let result = bundle.forward_chunk_final(gpu, synthetic, &logits, None);
+        let _ = gpu.free_tensor(logits);
+        if let Err(error) = result {
+            *prefill_err = Some(format!("qwen4 bench prefill: {error}"));
+            return Some(false);
+        }
+        Some(true)
     }
 
     /// Bench-decode prime for Qwen4: reset the request state, then run the

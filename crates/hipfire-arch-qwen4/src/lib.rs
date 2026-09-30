@@ -39,7 +39,7 @@ pub use admission::{
 pub use artifact::{admit_hfqm_artifact, Qwen4ArtifactError, Qwen4HfqmArtifact};
 pub use config::{
     LayerType, Qwen4Config, Qwen4MtpConfig, RecurrentStateDType, SourceDType, ARCHITECTURE_NAME,
-    ARCH_ID, MODEL_TYPE, TEXT_MODEL_TYPE,
+    ARCH_ID, MODEL_TYPE, QWEN4_DEFAULT_CONTEXT, QWEN4_MAX_CONTEXT, TEXT_MODEL_TYPE,
 };
 pub use ple::{
     PleHashMetadata, PleHistory, PleMetadataError, PleRowId, PLE_HEAD_COUNT, PLE_HEAD_OFFSETS,
