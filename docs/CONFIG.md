@@ -606,7 +606,7 @@ runtime PFlash module — not restated here.
 | `serve.structured_jump_forward` | `false` | bool — experimental |
 | `serve.stream_stall_timeout_ms` | `30000` | int 0–3600000. Multi-slot route: a streaming client that leaves its response channel full (or a final frame unflushed) this long is aborted and its queue permit released |
 | `experimental_budget_alert` | `false` | bool |
-| `serve.multi_slot` | `false` | Serve concurrent requests on the multi-slot engine instead of one at a time. Needs `memory.kv_cache = "q8"` set explicitly: the slot engine refuses every other value, including the default `auto`. |
+| `serve.multi_slot` | `false` | Serve concurrent requests on the multi-slot engine instead of one at a time. Needs `memory.kv_cache = "q8"` set explicitly: the slot engine refuses every other value, including the default `auto`. Concurrent requests can produce different greedy text than serial requests at ≥4 slots; output is deterministic for a fixed batch composition. 2 slots matched serial in testing. A pre-warm that fails (for example, slot-engine allocations that do not fit beside another process on the card) exits serve with the load error rather than serving lazily ([`SERVE.md`](SERVE.md) § Lifecycle). |
 | `serve.multi_slot_slots` | `4` | int 1–64 concurrent slots. |
 | `serve.multi_slot_ctx` | `8192` | int 512–1048576 per-slot context capacity (tokens). |
 | `serve.multi_slot_prefill_chunk` | `1024` | int 1–1048576. Prefill tokens taken from one slot per multi-slot step; batch scratch is sized `n_slots ×` this. Env: `HIPFIRE_SERVE_MULTI_SLOT_PREFILL_CHUNK`. |

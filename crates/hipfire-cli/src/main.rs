@@ -11934,6 +11934,82 @@ mod tests {
         assert_eq!(loads, 2);
     }
 
+    /// A failed pre-warm leaves single-slot serve up to load on the next
+    /// request, but fails multi-slot serve closed: `/health` goes 503
+    /// `unhealthy` (never 200 `ok` with every request failing), the daemon is
+    /// stopped, and the load error comes back for serve to exit on.
+    #[cfg(unix)]
+    #[test]
+    fn serve_prewarm_failure_fails_closed_only_on_multi_slot() {
+        let single = Task11HttpHarness::spawn("prewarm-fail-single");
+        fs::write(single.paths.models.join("t20-load-fail.hfq"), b"x").unwrap();
+        {
+            let mut runtime = single.shared.runtime.lock().unwrap();
+            crate::serve::prewarm(&mut runtime, &single.shared.meta, "t20-load-fail.hfq").unwrap();
+        }
+        let (status, health) = serve_health(single.port());
+        assert_eq!(status, 200);
+        assert_eq!(health["status"], "ok");
+        assert!(health["model"].is_null());
+        let ok = single.base_body("t11-stop-text", false);
+        assert_eq!(post_status(single.port(), &ok).0, 200);
+
+        let multi = Task11HttpHarness::spawn("prewarm-fail-multi");
+        fs::write(multi.paths.models.join("t20-load-fail.hfq"), b"x").unwrap();
+        let mut runtime = multi.shared.runtime.lock().unwrap();
+        runtime.multi_slot_enabled = true;
+        let error = crate::serve::prewarm(&mut runtime, &multi.shared.meta, "t20-load-fail.hfq")
+            .unwrap_err();
+        assert!(runtime.engine.exited(), "the daemon is stopped");
+        drop(runtime);
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("multi-slot pre-warm of t20-load-fail.hfq failed")
+                && message.contains("load failed: fixture"),
+            "{message}"
+        );
+        let (status, health) = serve_health(multi.port());
+        assert_eq!(status, 503);
+        assert_eq!(health["status"], "unhealthy");
+        assert!(health["model"].is_null());
+        assert!(health["loading_model"].is_null());
+    }
+
+    /// The reload after a daemon respawn follows the same rule: single-slot
+    /// serve comes back up without the model, multi-slot serve fails closed.
+    #[cfg(unix)]
+    #[test]
+    fn serve_reload_failure_after_respawn_fails_closed_only_on_multi_slot() {
+        for multi_slot in [false, true] {
+            let h = Task11HttpHarness::spawn(&format!("reload-fail-{multi_slot}"));
+            fs::write(h.paths.models.join("t20-load-fail.hfq"), b"x").unwrap();
+            {
+                let mut runtime = h.shared.runtime.lock().unwrap();
+                runtime.multi_slot_enabled = multi_slot;
+                runtime.resident_model = Some("t20-load-fail.hfq".to_owned());
+                runtime.engine.terminate();
+            }
+            let supervised = crate::serve::supervise_engine(&h.shared);
+            let (status, health) = serve_health(h.port());
+            assert!(health["model"].is_null());
+            if multi_slot {
+                let message = format!("{:#}", supervised.unwrap_err());
+                assert!(
+                    message.contains(
+                        "multi-slot reload of t20-load-fail.hfq after the daemon restart failed"
+                    ),
+                    "{message}"
+                );
+                assert_eq!(status, 503);
+                assert_eq!(health["status"], "unhealthy");
+            } else {
+                supervised.unwrap();
+                assert_eq!(status, 200);
+                assert_eq!(health["status"], "ok");
+            }
+        }
+    }
+
     /// DeepSeek V4 (legacy contract) stages tool calls only on the terminal;
     /// they must reach the client (#593).
     #[cfg(unix)]

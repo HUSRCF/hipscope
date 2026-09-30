@@ -84,12 +84,21 @@ Config and env owners for bind, idle, queue, and body limits:
 2. **Daemon.** Spawns the Rust `daemon` example over stdio JSON.
 3. **Pre-warm (default).** Loads the chosen model asynchronously. Failures log
    and leave the process serving; the model loads on the first real request.
+   Multi-slot serve (`serve.multi_slot = true`) fails closed instead: the slot
+   engine is its only backend, so a failed pre-warm (for example, slot-engine
+   allocations that do not fit beside another process on the card) logs the
+   load error, answers `/health` with 503 `unhealthy`, and exits 1.
 4. **HTTP.** The native server accepts traffic. Serve is single-stream by
    default: one generation holds the daemon at a time and later requests wait
    in a bounded queue (`serve.max_queue`). Continuous batching covers only
-   thinking-off, single-turn Qwen requests (`serve.continuous_batch_size`). A
-   waiter that is still queued after `serve.queue_timeout_ms` (default 10
-   minutes, long enough for one full generation; `0` waits forever) gets
+   thinking-off, single-turn Qwen requests (`serve.continuous_batch_size`).
+   With `serve.multi_slot = true`, up to `serve.multi_slot_slots` requests
+   decode at once on the experimental multi-slot engine. Concurrent requests
+   can produce different greedy text than serial requests at ≥4 slots; output
+   is deterministic for a fixed batch composition. 2 slots matched serial in
+   testing. A waiter that is still queued after `serve.queue_timeout_ms`
+   (default 10 minutes, long enough for one full generation; `0` waits
+   forever) gets
    **503** "server busy" with `Retry-After`. A failed `accept` (for example,
    out of file descriptors) is logged and retried, never fatal. At most 512
    connections are served at once; further connects wait in the listen
@@ -130,10 +139,12 @@ Agent / Pi custom-provider configuration, see
 `200` with `status: "ok"` while the daemon is up. `503` with
 `status: "restarting"` while serve respawns a daemon that exited (crash, panic,
 or a sticky GPU fault, after which the daemon exits 75) and reloads the
-resident model; `503` with `status: "unhealthy"` if respawning failed, after
-which serve exits 1 so a service manager can restart it. `model` is the loaded
-tag/path or `null` when idle/unloaded or after a failed model switch;
-`loading_model` names an asynchronous pre-warm or post-restart reload.
+resident model; `503` with `status: "unhealthy"` if respawning failed, or if
+multi-slot serve could not load its model (pre-warm, or the reload after a
+respawn), after which serve exits 1 so a service manager can restart it.
+`model` is the loaded tag/path or `null` when idle/unloaded or after a failed
+model switch; `loading_model` names an asynchronous pre-warm or post-restart
+reload.
 
 ```bash
 # Loopback example (safe default for local smoke):
