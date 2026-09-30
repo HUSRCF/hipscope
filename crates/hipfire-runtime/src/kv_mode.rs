@@ -296,16 +296,25 @@ const FULL_LADDER: &[KvMode] = &[Q8, Asym2, Asym3, Asym4, Fwht2, Fwht3, Fwht4, F
 
 /// Qwen shared alias surface for the legacy single-string [`resolve`] path.
 /// Named K values use [`parse_qwen_k_name`]; `""`|`auto` map to Q8 (arch-unaware —
-/// pair resolution belongs in [`resolve_kv_pair`]). The three indivisible
-/// native presets (`fp8`/`bf16`/`f16`) normalize here too — sites that don't
-/// accept them take [`resolve`]'s explicit-native carry-forward refusal.
+/// pair resolution belongs in [`resolve_kv_pair`]). Native presets are not K
+/// names, so an `fp8`/`bf16` string at these sites warns and takes the site
+/// default (q8 on the PP/TP multi-GPU sites) instead of failing the load.
 fn normalize_qwen(raw: &str) -> Option<KvMode> {
     match raw.trim() {
         "" | "auto" => Some(Q8),
+        other => parse_qwen_k_name(other).ok(),
+    }
+}
+
+/// [`normalize_qwen`] plus the three indivisible native presets, for the
+/// multi-slot site only: bf16/f16 have slot readers, and fp8 (none) takes
+/// [`resolve`]'s explicit-native carry-forward so the slot engine refuses it.
+fn normalize_qwen_slots(raw: &str) -> Option<KvMode> {
+    match raw.trim() {
         "fp8" => Some(Fp8),
         "bf16" => Some(Bf16),
         "f16" => Some(F16),
-        other => parse_qwen_k_name(other).ok(),
+        other => normalize_qwen(other),
     }
 }
 
@@ -422,7 +431,7 @@ pub const MAPLE_POLICY: KvModePolicy = KvModePolicy {
 /// `legacy-asymN` → AsymN.
 pub const QWEN35_SLOTS_POLICY: KvModePolicy = KvModePolicy {
     site: "qwen35-slots",
-    normalize_alias: normalize_qwen,
+    normalize_alias: normalize_qwen_slots,
     accepted: &[Q8, Asym2, Asym3, Asym4, Fwht2, Fwht3, Fwht4, Bf16, F16],
     default: Q8,
 };
@@ -1006,12 +1015,11 @@ mod tests {
     }
 
     #[test]
-    fn f16_warns_off_slots_site() {
-        // NEGATIVE CONTROL: "f16" must not be silently honored anywhere but
-        // slots. On the slice-lineage carry-forward semantics an explicit
-        // f16/bf16 request on a non-slots Qwen site resolves to that mode
-        // WITH a warning so construction fails closed — never a silent
-        // downgrade to q8.
+    fn native_presets_fall_back_to_default_off_slots_site() {
+        // Only the slots site normalizes the native presets. Everywhere else
+        // on the single-string path an fp8/bf16/f16 string is not a Qwen K
+        // name: it warns and takes the site default (q8 on the PP/TP
+        // multi-GPU sites) instead of failing the load.
         for p in [
             &QWEN35_HFQ_POLICY,
             &QWEN35_PARO_POLICY,
@@ -1019,27 +1027,17 @@ mod tests {
             &QWEN35_TP_POLICY,
             &DIR_SAFETENSORS_POLICY,
         ] {
-            let r = resolve("f16", p);
-            assert!(
-                r.warning.is_some(),
-                "site {} must WARN on f16, not silently default",
-                p.site
-            );
+            for raw in ["fp8", "bf16", "f16"] {
+                let r = resolve(raw, p);
+                assert_eq!(r.mode, p.default, "site {} {raw}", p.site);
+                assert!(r.warning.is_some(), "site {} must WARN on {raw}", p.site);
+            }
         }
-        // bf16 warns only where it is NOT in `accepted` — hfq/paro admit it
-        // already, so check the sites that refuse it.
-        for p in [&QWEN35_PP_POLICY, &QWEN35_TP_POLICY, &DIR_SAFETENSORS_POLICY] {
-            let r = resolve("bf16", p);
-            assert!(
-                r.warning.is_some(),
-                "site {} must WARN on explicit bf16, not silently default",
-                p.site
-            );
-        }
-        // The slots site is the one place f16 IS honored — and bf16 now has
-        // two honored sites (maple + slots).
+        // The slots site honors f16 and bf16 and carries fp8 forward (with a
+        // warning) so the slot engine refuses it.
         assert_eq!(resolve("f16", &QWEN35_SLOTS_POLICY).mode, KvMode::F16);
         assert_eq!(resolve("bf16", &QWEN35_SLOTS_POLICY).mode, KvMode::Bf16);
+        assert_eq!(resolve("fp8", &QWEN35_SLOTS_POLICY).mode, KvMode::Fp8);
     }
 
     #[test]
