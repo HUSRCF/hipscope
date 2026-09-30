@@ -6,10 +6,12 @@ Audience: first install on an AMD GPU host. Goal: install → verify → pull a 
 
 - **Linux:** AMD GPU with `/dev/kfd` plus a ROCm HIP stack. A release-tag
   install on an admitted GPU (gfx1201, gfx1100, gfx1151, gfx906, gfx942) can
-  use the tag's prebuilt [kernel pack](#prebuilt-kernel-packs) and then needs
-  only the HIP runtime (`lib/libamdhip64.so`, `libhsa-runtime64.so`) and
-  `bin/rocm_agent_enumerator`. Every other install compiles kernels, so the
-  selected ROCm root must also provide `include/hip/hip_runtime.h` and
+  use the tag's prebuilt [kernel pack](#prebuilt-kernel-packs) for the kernel
+  registry, and installs with only the HIP runtime (`lib/libamdhip64.so`,
+  `libhsa-runtime64.so`) and `bin/rocm_agent_enumerator`. Kernels outside the
+  registry still JIT on first use — today that includes six modules of Qwen3.8
+  H2 decode on gfx1201 — so running models still needs hipcc. The selected
+  ROCm root should therefore also provide `include/hip/hip_runtime.h` and
   `bin/hipcc`. Install a supported AMD ROCm HIP runtime, development headers, and device
   compiler via
   [AMD's live install selector](https://rocm.docs.amd.com/en/latest/install/rocm.html)
