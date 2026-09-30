@@ -3,7 +3,9 @@ name: release-kernel-packs
 # Prebuilt kernel packs for a release tag.
 #
 # hipcc needs no GPU, so a hosted runner compiles every admitted registry arch
-# inside a ROCm dev image and attaches, per arch, to the tag's GitHub release:
+# inside a ROCm dev image and uploads, per arch, to the tag's GitHub release
+# (created as a draft when the tag has none yet; an existing release keeps its
+# draft/prerelease/latest state):
 #   hipfire-kernels-<tag>-<arch>.tar.gz          manifest.json + <arch>/*.{hsaco,hash,index.json}
 #   hipfire-kernels-<tag>-<arch>.tar.gz.sha256
 #   hipfire-kernels-<tag>-<arch>.manifest.json
@@ -90,9 +92,14 @@ jobs:
               chown -R "$OWNER" dist 2>/dev/null || true
               exit "$status"'
 
+      # The repository's Actions allowlist admits only GitHub-owned and a few
+      # named third-party actions, so the upload uses the runner's gh CLI.
       - name: Attach packs to the release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ env.TAG }}
-          files: dist/*
-          fail_on_unmatched_files: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release view "$TAG" >/dev/null 2>&1 \
+            || gh release create "$TAG" --verify-tag --draft --title "$TAG" \
+                 --notes "Kernel packs; release notes to follow."
+          gh release upload "$TAG" dist/* --clobber

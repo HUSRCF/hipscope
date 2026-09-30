@@ -501,6 +501,7 @@
   - The S2 and S4 parity oracles (`test_dflash_hidden_scatter_gfx1100`, `test_mq_f16_residual_producers_gfx1100`) pass bit-exact on gfx1201.
   - E1 DFlash fixture on an R9700, 4 fresh processes per arm, ABBA then BAAB: 56/56 rows keep the same committed tokens and τ; code rows 314.2 → 319.9 tok/s (+1.83 %), the 1,100-token prose row 55.3 → 56.1 tok/s (+1.37 %), every fused process faster than every baseline process. On a 7900 XTX (gfx1100) the fixture's committed tokens and τ are unchanged and both oracles pass. The gfx1201 A4/fp8 and gfx1100 KLD pins are unchanged.
   - Kill switches as before: `HIPFIRE_HIDDEN_SCATTER_FUSE_OFF=1`, `HIPFIRE_MQ_F16_RESIDUAL_OFF=1`.
+- **The kernel-pack release workflow (`.github/workflows/release.yml`) uploads with `gh`; its first tag push failed to start (`startup_failure`, no jobs).** The repo's Actions allowlist admits only GitHub-owned actions and a few named ones, so `softprops/action-gh-release@v2` was blocked. The last step now runs the runner's `gh`: it creates the tag's release as a draft if there is none, then `gh release upload <tag> dist/* --clobber`. An existing release keeps its draft, prerelease and latest state.
 
 
 ### v0.4.0 — KV backend, long context, and gfx11 prefill
