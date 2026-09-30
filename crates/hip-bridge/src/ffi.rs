@@ -258,7 +258,6 @@ pub struct HipRuntime {
     fn_memset_async: unsafe extern "C" fn(*mut c_void, c_int, usize, HipStream) -> u32,
     fn_mem_address_reserve:
         Option<unsafe extern "C" fn(*mut *mut c_void, usize, usize, *mut c_void, u64) -> u32>,
-    fn_mem_address_free: Option<unsafe extern "C" fn(*mut c_void, usize) -> u32>,
     fn_mem_create: Option<
         unsafe extern "C" fn(
             *mut HipMemGenericAllocationHandle,
@@ -517,11 +516,6 @@ impl HipRuntime {
                     lib,
                     "hipMemAddressReserve",
                     unsafe extern "C" fn(*mut *mut c_void, usize, usize, *mut c_void, u64) -> u32
-                ),
-                fn_mem_address_free: load_optional_fn!(
-                    lib,
-                    "hipMemAddressFree",
-                    unsafe extern "C" fn(*mut c_void, usize) -> u32
                 ),
                 fn_mem_create: load_optional_fn!(
                     lib,
@@ -1006,15 +1000,6 @@ impl HipRuntime {
         let code = unsafe { func(&mut ptr, size, alignment, ptr::null_mut(), 0) };
         self.check(code, "hipMemAddressReserve")?;
         Ok(ptr)
-    }
-
-    /// # Safety
-    /// `ptr` and `size` must describe an unmapped reservation returned by
-    /// [`Self::mem_address_reserve`] that has not already been freed.
-    pub unsafe fn mem_address_free(&self, ptr: *mut c_void, size: usize) -> HipResult<()> {
-        let func = self.missing_vmm_symbol("hipMemAddressFree", self.fn_mem_address_free)?;
-        let code = unsafe { func(ptr, size) };
-        self.check(code, "hipMemAddressFree")
     }
 
     pub fn mem_create(

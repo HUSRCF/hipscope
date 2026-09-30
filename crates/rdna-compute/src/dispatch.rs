@@ -6175,6 +6175,42 @@ mod tests {
     }
 
     #[test]
+    fn freed_vmm_tensor_va_is_never_reserved_again() {
+        // ROCm 7.14+/gfx1201 keeps translating a remapped VA to its first
+        // backing, so a model reload must never get a VA an earlier model used.
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        hip_bridge::clear_vmm_faults();
+        let access = [gpu.device_id];
+        let chunk = 2 * 1024 * 1024;
+        let bytes = 32 * chunk;
+        let mut used: Vec<(usize, usize)> = Vec::new();
+        for _ in 0..8 {
+            let tensor = match unsafe {
+                gpu.alloc_vmm_tensor(&[bytes], super::DType::Raw, chunk, &access)
+            } {
+                Ok(t) => t,
+                Err(_) => {
+                    eprintln!("skip: VMM unavailable");
+                    return;
+                }
+            };
+            let base = tensor.buf.as_ptr() as usize;
+            for &(lo, hi) in &used {
+                assert!(
+                    base + bytes <= lo || base >= hi,
+                    "VA 0x{base:x}+{bytes} overlaps released 0x{lo:x}..0x{hi:x}"
+                );
+            }
+            used.push((base, base + bytes));
+            gpu.free_tensor(tensor).expect("free");
+        }
+        assert_eq!(gpu.vmm_allocation_count(), 0);
+    }
+
+    #[test]
     fn access_reset_failure_does_not_publish_live_owner() {
         let Some(mut gpu) = try_gpu() else {
             eprintln!("skip: no GPU");
