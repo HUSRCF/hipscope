@@ -328,7 +328,7 @@ fn seed_hot_from_cold(cold: &Path, hot: &Path) -> std::io::Result<()> {
 ///
 /// 5: `core_hipcc_flags` gained `-fuse-cuid=none`, so objects built under 4
 /// carry a path-derived `__hip_cuid_*` symbol that current builds do not.
-const KERNEL_CACHE_ABI: u32 = 5;
+pub const KERNEL_CACHE_ABI: u32 = 5;
 
 /// Leading hipcc flags of every runtime JIT and packaged compile. The argv and
 /// the recipe recorded in pack indexes both come from here, so they cannot drift.
@@ -398,7 +398,88 @@ pub struct KernelCompiler {
     sched_profile_override: Option<SchedulerProfile>,
 }
 
+/// Resolved device compiler and its identity, probed once per process use.
+struct DeviceCompilerProbe {
+    /// Resolved device-compiler binary. Bare "hipcc" when PATH provides it;
+    /// otherwise an absolute path discovered under a resolved ROCm root.
+    hipcc_bin: PathBuf,
+    /// ROCM_PATH handed to the spawned compiler so it can find its own LLVM.
+    rocm_env_root: Option<PathBuf>,
+    has_hipcc: bool,
+    /// `hipcc --version` first line; empty when no compiler ran.
+    toolchain_id: String,
+    /// `HIPFIRE_NO_DEVICE_COMPILER` forced the compiler absent.
+    disabled: bool,
+}
+
+fn probe_device_compiler() -> DeviceCompilerProbe {
+    // Probe for hipcc once at init, not per-kernel. Capture its version line
+    // as a toolchain fingerprint for the cache hash (Fix #1).
+    //
+    // Resolve hipcc through the same selected ROCm root as the runtime and
+    // headers. Probing a bare PATH hipcc first could pair a configured
+    // ROCM_PATH from one version with another version's compiler.
+    let resolved_hipcc = hipfire_config::rocm::tool("hipcc");
+    let hipcc_bin = resolved_hipcc
+        .clone()
+        .unwrap_or_else(|| std::path::PathBuf::from("hipcc"));
+    // hipcc resolves its LLVM as $ROCM_PATH/lib/llvm/bin/clang++ and
+    // ROCM_PATH defaults to /opt/rocm. On a root elsewhere the probe below
+    // still succeeds while every real compile fails, so hand the child the
+    // selected compiler's installation root unless the operator already
+    // set one that matches.
+    let rocm_env_root = hipfire_config::rocm::compiler_env_root(&hipcc_bin);
+
+    // HIPFIRE_NO_DEVICE_COMPILER=1 makes the engine behave as if no device
+    // compiler exists, so pre-compiled blobs are used verbatim instead of
+    // being recompiled locally.
+    //
+    // This has to be an explicit switch. It used to be achievable by
+    // removing the compiler from PATH, because the probe was a bare
+    // `Command::new("hipcc")`. Resolved-root discovery (added so a ROCm
+    // rooted outside /opt/rocm still works) finds the compiler regardless
+    // of PATH, which silently defeated PATH-shadowing and made
+    // "pin these exact code objects" quietly recompile instead. Verified:
+    // a pinned cross-machine run reported 0 recompiles while actually
+    // executing locally-built blobs.
+    let disabled = hipfire_config::developer_var_os("HIPFIRE_NO_DEVICE_COMPILER")
+        .is_some_and(|v| v != "0" && !v.is_empty());
+
+    let hipcc_out = if disabled || resolved_hipcc.is_none() {
+        None
+    } else {
+        let mut probe = Command::new(&hipcc_bin);
+        probe.arg("--version");
+        if let Some(root) = &rocm_env_root {
+            probe.env("ROCM_PATH", root);
+        }
+        probe.output().ok()
+    };
+    let has_hipcc = hipcc_out
+        .as_ref()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    let toolchain_id = hipcc_out
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_string()
+        })
+        .unwrap_or_default();
+    DeviceCompilerProbe { hipcc_bin, rocm_env_root, has_hipcc, toolchain_id, disabled }
+}
+
 impl KernelCompiler {
+    /// The toolchain identity a runtime on this machine checks pack indexes
+    /// against, or `None` when no device compiler resolves (then any recorded
+    /// toolchain is accepted and packaged objects load verbatim).
+    pub fn local_toolchain_id() -> Option<String> {
+        Some(probe_device_compiler().toolchain_id).filter(|id| !id.is_empty())
+    }
+
     pub fn new(arch: &str, extra_flags: String) -> HipResult<Self> {
         // Hot JIT cache defaults to the shared `$HOME/.hipfire_kernels` root
         // (overridable via `HIPFIRE_KERNEL_CACHE`), so parallel worktrees and
@@ -481,68 +562,14 @@ impl KernelCompiler {
         }
         let precompiled_dir = effective_precompiled;
 
-        // Probe for hipcc once at init, not per-kernel. Capture its version line
-        // as a toolchain fingerprint for the cache hash (Fix #1).
-        //
-        // Resolve hipcc through the same selected ROCm root as the runtime and
-        // headers. Probing a bare PATH hipcc first could pair a configured
-        // ROCM_PATH from one version with another version's compiler.
-        let resolved_hipcc = hipfire_config::rocm::tool("hipcc");
-        let hipcc_bin = resolved_hipcc
-            .clone()
-            .unwrap_or_else(|| std::path::PathBuf::from("hipcc"));
-        // hipcc resolves its LLVM as $ROCM_PATH/lib/llvm/bin/clang++ and
-        // ROCM_PATH defaults to /opt/rocm. On a root elsewhere the probe below
-        // still succeeds while every real compile fails, so hand the child the
-        // selected compiler's installation root unless the operator already
-        // set one that matches.
-        let rocm_env_root = hipfire_config::rocm::compiler_env_root(&hipcc_bin);
-
-        // HIPFIRE_NO_DEVICE_COMPILER=1 makes the engine behave as if no device
-        // compiler exists, so pre-compiled blobs are used verbatim instead of
-        // being recompiled locally.
-        //
-        // This has to be an explicit switch. It used to be achievable by
-        // removing the compiler from PATH, because the probe was a bare
-        // `Command::new("hipcc")`. Resolved-root discovery (added so a ROCm
-        // rooted outside /opt/rocm still works) finds the compiler regardless
-        // of PATH, which silently defeated PATH-shadowing and made
-        // "pin these exact code objects" quietly recompile instead. Verified:
-        // a pinned cross-machine run reported 0 recompiles while actually
-        // executing locally-built blobs.
-        let compiler_disabled = hipfire_config::developer_var_os("HIPFIRE_NO_DEVICE_COMPILER")
-            .is_some_and(|v| v != "0" && !v.is_empty());
-
-        let hipcc_out = if compiler_disabled {
+        let probe = probe_device_compiler();
+        if probe.disabled {
             eprintln!(
                 "  HIPFIRE_NO_DEVICE_COMPILER set — treating the device compiler as absent; \
                  pre-compiled blobs will be used verbatim"
             );
-            None
-        } else if resolved_hipcc.is_none() {
-            None
-        } else {
-            let mut probe = Command::new(&hipcc_bin);
-            probe.arg("--version");
-            if let Some(ref root) = rocm_env_root {
-                probe.env("ROCM_PATH", root);
-            }
-            probe.output().ok()
-        };
-        let has_hipcc = hipcc_out
-            .as_ref()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-        let toolchain_id = hipcc_out
-            .map(|o| {
-                String::from_utf8_lossy(&o.stdout)
-                    .lines()
-                    .next()
-                    .unwrap_or("")
-                    .trim()
-                    .to_string()
-            })
-            .unwrap_or_default();
+        }
+        let DeviceCompilerProbe { hipcc_bin, rocm_env_root, has_hipcc, toolchain_id, .. } = probe;
 
         let gfx1151_cumode_modules = if arch == "gfx1151" {
             hipfire_config::developer_var("HIPFIRE_GFX1151_CUMODE_MODULES")
@@ -877,6 +904,38 @@ impl KernelCompiler {
         source: &str,
         symbol: &str,
     ) -> Result<Option<PathBuf>, String> {
+        Self::check_indexed_object(
+            dir,
+            &self.arch,
+            module,
+            source,
+            &[symbol],
+            &self.extra_flags,
+            &self.packaging_hash(module, source),
+            &self.toolchain_id,
+        )
+        .map(|found| found.map(|(object, _)| object))
+    }
+
+    /// Check one installed indexed object against the recipe this build
+    /// computes for `source`. The runtime lookup and whole-pack installer
+    /// verification both go through here, so they cannot disagree about what a
+    /// valid object is. Returns the object path and its recorded toolchain.
+    ///
+    /// `local_toolchain_id` is the resolved device compiler's identity; empty
+    /// means no compiler, which accepts any recorded toolchain. A present
+    /// compiler with a different identity rejects the object so it is rebuilt.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn check_indexed_object(
+        dir: &Path,
+        arch: &str,
+        module: &str,
+        source: &str,
+        symbols: &[&str],
+        extra_flags: &str,
+        packaging_key: &str,
+        local_toolchain_id: &str,
+    ) -> Result<Option<(PathBuf, String)>, String> {
         let index_path = dir.join(format!("{module}.index.json"));
         if !index_path.exists() {
             if dir.join(format!("{module}.hsaco")).exists() {
@@ -887,19 +946,19 @@ impl KernelCompiler {
         let fail = |reason: &str| format!("{}: {reason}", index_path.display());
         let bytes = std::fs::read(&index_path).map_err(|e| fail(&e.to_string()))?;
         let index: PackIndex = serde_json::from_slice(&bytes).map_err(|e| fail(&e.to_string()))?;
-        let recipe = Self::recipe_for_source(&self.arch, module, source, &self.extra_flags);
+        let recipe = Self::recipe_for_source(arch, module, source, extra_flags);
         if index.version != PACK_INDEX_VERSION
             || index.module != module
-            || index.arch != self.arch
-            || !index.symbols.iter().any(|entry| entry == symbol)
+            || index.arch != arch
+            || !symbols.iter().all(|symbol| index.symbols.iter().any(|entry| entry == symbol))
             || index.source_sha256 != sha256_hex(source.as_bytes())
             || index.flags != recipe.flags
             || index.scheduler_profile != recipe.scheduler_profile.unwrap_or_default()
             || index.cache_abi != KERNEL_CACHE_ABI
-            || index.packaging_key != self.packaging_hash(module, source)
+            || index.packaging_key != packaging_key
             || index.toolchain_id.is_empty()
             || index.toolchain_sha256 != sha256_hex(index.toolchain_id.as_bytes())
-            || (!self.toolchain_id.is_empty() && index.toolchain_id != self.toolchain_id)
+            || (!local_toolchain_id.is_empty() && index.toolchain_id != local_toolchain_id)
         {
             return Err(fail("index identity, symbol, source, flags, profile, ABI or toolchain mismatch"));
         }
@@ -911,7 +970,7 @@ impl KernelCompiler {
         if sha256_hex(&bytes) != index.object_sha256 {
             return Err(fail("object SHA-256 mismatch"));
         }
-        Ok(Some(object))
+        Ok(Some((object, index.toolchain_id)))
     }
 
     fn writeback_package(&self, module: &str, source: &str, symbol: &str, object: &Path, force: bool) {
@@ -2841,9 +2900,14 @@ mod tests {
         let index_path = cold.join("rmsnorm.index.json");
         let original = std::fs::read(&index_path).unwrap();
 
-        for field in ["arch", "source_sha256", "flags", "scheduler_profile", "cache_abi", "packaging_key", "object_sha256", "toolchain_id"] {
+        for field in [
+            "version", "module", "symbols", "arch", "source_sha256", "flags", "scheduler_profile",
+            "cache_abi", "packaging_key", "object_sha256", "toolchain_id", "toolchain_sha256",
+        ] {
             let mut mutated: serde_json::Value = serde_json::from_slice(&original).unwrap();
             mutated[field] = match field {
+                "version" => serde_json::json!(PACK_INDEX_VERSION + 1),
+                "symbols" => serde_json::json!(["other_symbol"]),
                 "flags" => serde_json::json!(["-O0"]),
                 "cache_abi" => serde_json::json!(0),
                 _ => serde_json::json!("wrong"),
@@ -2860,6 +2924,86 @@ mod tests {
         std::fs::write(&object, b"CORRUPTED").unwrap();
         let mut consumer = prebuilt_gate_compiler(&root, false);
         assert!(consumer.compile_batch_for_symbols(&[(name, source, symbol)]).unwrap_err().to_string().contains("SHA-256"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn indexed_package_from_another_compiler_build_is_rebuilt_not_loaded() {
+        let root = temp_root("indexed_foreign_toolchain");
+        let (name, source, symbol) = ("rmsnorm", "__global__ void rmsnorm_f32() {}", "rmsnorm_f32");
+        let mut producer = prebuilt_gate_compiler(&root, true);
+        producer.compile_for_symbol(name, source, symbol).unwrap();
+        let cold = root.join("cold");
+        assert_eq!(std::fs::read(cold.join("rmsnorm.hsaco")).unwrap(), b"FRESH");
+
+        // The installed index is intact, but this machine's compiler is a
+        // different build: the object must not load, it must be rebuilt.
+        let mut consumer = prebuilt_gate_compiler(&root, true);
+        consumer.toolchain_id = "hipcc 9.9".to_owned();
+        consumer.hipcc_bin = install_fake_hipcc(&root.join("local-bin"), b"LOCAL", false);
+        let loaded = consumer.compile_for_symbol(name, source, symbol).unwrap().to_path_buf();
+        assert_eq!(std::fs::read(&loaded).unwrap(), b"LOCAL");
+        assert_ne!(loaded, cold.join("rmsnorm.hsaco"));
+        let index: PackIndex =
+            serde_json::from_slice(&std::fs::read(cold.join("rmsnorm.index.json")).unwrap()).unwrap();
+        assert_eq!(index.toolchain_id, "hipcc 9.9");
+        assert_eq!(std::fs::read(cold.join("rmsnorm.hsaco")).unwrap(), b"LOCAL");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pack_verification_requires_exact_registry_one_toolchain_and_no_strays() {
+        use crate::kernel_registry::KernelEntry;
+        let root = temp_root("pack_verify");
+        let mut producer = prebuilt_gate_compiler(&root, true);
+        // Minimal AMDGPU HSA ELF header: OS/ABI 64, ABI version 4 (code object v6).
+        let mut elf = b"\x7fELF\x02\x01\x01\x40\x04".to_vec();
+        elf.resize(64, 0);
+        producer.hipcc_bin = install_fake_hipcc(&root.join("elf-bin"), &elf, false);
+        let entries = vec![
+            KernelEntry {
+                arch: "gfx1201",
+                module: "alpha",
+                symbols: &["alpha_f32"],
+                source: "__global__ void alpha_f32() {}".into(),
+                flags: Vec::new(),
+                scheduler_profile: None,
+            },
+            KernelEntry {
+                arch: "gfx1201",
+                module: "beta",
+                symbols: &["beta_a", "beta_b"],
+                source: "__global__ void beta_a() {} __global__ void beta_b() {}".into(),
+                flags: Vec::new(),
+                scheduler_profile: None,
+            },
+        ];
+        let pack = root.join("pack").join("gfx1201");
+        for entry in &entries {
+            let symbols = entry.symbols.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+            producer.pack_to(entry.module, entry.source(), &symbols, &pack).unwrap();
+        }
+        let verify = |local: Option<&str>| {
+            crate::kernel_pack::verify_entries(&entries, "gfx1201", "", &pack, local)
+        };
+        let verified = verify(None).unwrap();
+        assert_eq!(verified.modules, 2);
+        assert_eq!(verified.toolchain_id, "hipcc 7.2");
+        assert_eq!(verified.code_object_version, 6);
+        assert!(verify(Some("hipcc 7.2")).is_ok());
+        // A different local compiler would reject every object at load time.
+        assert!(verify(Some("hipcc 9.9")).unwrap_err().contains("toolchain mismatch"));
+
+        // An unindexed pair would be seeded into the hot cache unchecked.
+        std::fs::write(pack.join("stray.hsaco"), &elf).unwrap();
+        assert!(verify(None).unwrap_err().contains("not part of"));
+        std::fs::remove_file(pack.join("stray.hsaco")).unwrap();
+
+        let beta_index = std::fs::read(pack.join("beta.index.json")).unwrap();
+        std::fs::remove_file(pack.join("beta.index.json")).unwrap();
+        assert!(verify(None).unwrap_err().contains("index missing"));
+        std::fs::write(pack.join("beta.index.json"), &beta_index).unwrap();
+        assert!(verify(None).is_ok());
         let _ = std::fs::remove_dir_all(root);
     }
 }

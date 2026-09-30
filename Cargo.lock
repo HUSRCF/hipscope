@@ -1391,6 +1391,7 @@ dependencies = [
  "bytes",
  "clap",
  "ctrlc",
+ "flate2",
  "hipfire-client",
  "hipfire-config",
  "hipfire-registry",

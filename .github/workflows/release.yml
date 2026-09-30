@@ -1,0 +1,70 @@
+name: release-kernel-packs
+
+# Prebuilt kernel packs for a release tag.
+#
+# hipcc needs no GPU, so a hosted runner compiles every admitted registry arch
+# inside a ROCm dev container (the Containerfile's base image by default) and
+# attaches, per arch, to the tag's GitHub release:
+#   hipfire-kernels-<tag>-<arch>.tar.gz          manifest.json + <arch>/*.{hsaco,hash,index.json}
+#   hipfire-kernels-<tag>-<arch>.tar.gz.sha256
+#   hipfire-kernels-<tag>-<arch>.manifest.json
+# `install.sh --tag` / `install.ps1 -Tag` download the pack for the detected
+# arch, check the SHA-256, manifest and every index against the checked-out
+# sources, and fall back to local hipcc compilation when anything differs.
+#
+# The image's ROCm fixes the manifest's toolchain and admitted ROCm range
+# (its major.minor up to the next major). Set the repository variable
+# HIPFIRE_ROCM_IMAGE to build with another ROCm. To publish from a local
+# toolchain instead, run scripts/build-kernel-pack.sh and upload with gh
+# (docs/GETTING_STARTED.md, "Prebuilt kernel packs").
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to build and attach kernel packs for
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-kernel-packs-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  kernel-packs:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    container:
+      image: ${{ vars.HIPFIRE_ROCM_IMAGE || 'docker.io/rocm/dev-ubuntu-24.04:7.2.4' }}
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - name: Install build tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential ca-certificates curl git
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain stable --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ env.TAG }}
+
+      - name: Trust the checkout
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Build kernel packs (every admitted arch)
+        run: scripts/build-kernel-pack.sh --tag "$TAG" --commit HEAD --out dist
+
+      - name: Attach packs to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          files: dist/*
+          fail_on_unmatched_files: true
