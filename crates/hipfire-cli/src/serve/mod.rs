@@ -97,7 +97,8 @@ pub(crate) enum EngineState {
     Up,
     /// The daemon exited; serve is respawning it and reloading the model.
     Restarting,
-    /// Respawning failed; serve exits once the supervisor notices.
+    /// Serve cannot answer requests and exits: the daemon could not be
+    /// respawned, or multi-slot serve could not load its model.
     Down,
 }
 
@@ -161,6 +162,36 @@ pub(crate) fn finish_prewarm(meta: &mut ServeMeta, succeeded: bool) {
     if succeeded {
         meta.last_activity = Instant::now();
     }
+}
+
+/// Load the operator's model (`serve.default_model` / `--model`) at startup.
+///
+/// Single-slot serve logs a failure and keeps serving: the first request
+/// loads the model instead. Multi-slot serve fails closed
+/// ([`ServeRuntime::fail_closed_multi_slot`]) and returns the error, for the
+/// caller to exit on while it still holds `runtime`.
+pub(crate) fn prewarm(
+    runtime: &mut ServeRuntime,
+    meta: &Mutex<ServeMeta>,
+    model: &str,
+) -> Result<()> {
+    let result = runtime.ensure_model(model, meta, ModelOrigin::Operator);
+    {
+        let mut meta = meta.lock().unwrap_or_else(|error| error.into_inner());
+        finish_prewarm(&mut meta, result.is_ok());
+    }
+    match result {
+        Ok(_) => eprintln!("[hipfire] pre-warmed {model}"),
+        Err(error) if runtime.multi_slot_enabled => {
+            return Err(runtime.fail_closed_multi_slot(
+                meta,
+                &format!("pre-warm of {model}"),
+                error,
+            ));
+        }
+        Err(error) => eprintln!("[hipfire] pre-warm failed: {error:#}; serving lazily"),
+    }
+    Ok(())
 }
 
 pub(crate) fn idle_model_expired(meta: &ServeMeta, idle_timeout: Duration) -> bool {
@@ -1417,27 +1448,23 @@ pub(crate) fn serve_foreground(
     eprintln!("[hipfire] native serve listening on http://{bind}");
     if !args.no_prewarm {
         let shared = Arc::clone(&shared);
+        let pid_path = pid_path.clone();
         thread::spawn(move || {
             shared
                 .meta
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
                 .loading_model = Some(default_model.clone());
-            let result = shared
+            let mut runtime = shared
                 .runtime
                 .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .ensure_model(&default_model, &shared.meta, ModelOrigin::Operator);
-            {
-                let mut meta = shared
-                    .meta
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner());
-                finish_prewarm(&mut meta, result.is_ok());
-            }
-            match result {
-                Ok(_) => eprintln!("[hipfire] pre-warmed {default_model}"),
-                Err(error) => eprintln!("[hipfire] pre-warm failed: {error:#}; serving lazily"),
+                .unwrap_or_else(|error| error.into_inner());
+            if let Err(error) = prewarm(&mut runtime, &shared.meta, &default_model) {
+                // Exit with `runtime` still held, so no request waiting on it
+                // starts a load of its own.
+                eprintln!("[hipfire] {error:#}; exiting");
+                let _ = fs::remove_file(&pid_path);
+                std::process::exit(1);
             }
         });
     }
@@ -1861,6 +1888,27 @@ impl ServeRuntime {
         set_engine_state(meta, EngineState::Down);
         bail!("daemon exited and could not be restarted after {attempts} attempts")
     }
+
+    /// Fail multi-slot serve closed after the operator's model failed to load
+    /// (`what`: the pre-warm, or the reload after a daemon respawn). The slot
+    /// engine is multi-slot serve's only backend. Such a load, typically
+    /// slot-engine allocations that do not fit beside another process on the
+    /// card, fails the same way when a request retries it, so serving lazily
+    /// would answer every request 500 while `/health` said `ok`. Marks serve
+    /// unhealthy and stops the daemon; the caller exits with the returned error.
+    pub(crate) fn fail_closed_multi_slot(
+        &mut self,
+        meta: &Mutex<ServeMeta>,
+        what: &str,
+        error: anyhow::Error,
+    ) -> anyhow::Error {
+        set_engine_state(meta, EngineState::Down);
+        self.engine.terminate();
+        anyhow!(
+            "multi-slot {what} failed: {error:#}; multi-slot serve has no backend without its \
+             slot engine, so it fails closed instead of serving lazily"
+        )
+    }
 }
 
 /// How often the supervisor checks whether the daemon is still running.
@@ -1872,8 +1920,8 @@ const ENGINE_RESPAWN_BACKOFF: Duration = Duration::from_secs(1);
 /// One supervisor pass: if the daemon exited, respawn it and reload the model
 /// that was resident. `/health` reports `restarting` (503) until the reload
 /// finishes. Skips the pass while a request or load holds the runtime; that
-/// holder checks the daemon itself. Errors only when the daemon cannot be
-/// respawned.
+/// holder checks the daemon itself. Errors when the daemon cannot be
+/// respawned, or when multi-slot serve cannot reload its model.
 pub(crate) fn supervise_engine(shared: &ServeShared) -> Result<()> {
     let mut runtime = match shared.runtime.try_lock() {
         Ok(runtime) => runtime,
@@ -1890,10 +1938,22 @@ pub(crate) fn supervise_engine(shared: &ServeShared) -> Result<()> {
             .unwrap_or_else(|error| error.into_inner())
             .loading_model = Some(model.clone());
         let reloaded = runtime.ensure_model(&model, &shared.meta, ModelOrigin::Operator);
-        let mut meta = shared.meta.lock().unwrap_or_else(|error| error.into_inner());
-        finish_prewarm(&mut meta, reloaded.is_ok());
+        {
+            let mut meta = shared
+                .meta
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            finish_prewarm(&mut meta, reloaded.is_ok());
+        }
         match reloaded {
             Ok(_) => eprintln!("[hipfire] reloaded {model} after the daemon restart"),
+            Err(error) if runtime.multi_slot_enabled => {
+                return Err(runtime.fail_closed_multi_slot(
+                    &shared.meta,
+                    &format!("reload of {model} after the daemon restart"),
+                    error,
+                ));
+            }
             Err(error) => {
                 eprintln!("[hipfire] reload of {model} after the daemon restart failed: {error:#}")
             }
