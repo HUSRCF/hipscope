@@ -23,7 +23,7 @@ use hyper::{
     body::{Frame, Incoming},
     header, Method, Request, Response,
 };
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use std::{
     cell::Cell,
     collections::VecDeque,
@@ -40,7 +40,9 @@ use std::{
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 // ---------------------------------------------------------------------------
 // Boxed body and helpers
@@ -476,46 +478,123 @@ impl Drop for CancelOnDrop {
 // Public Hyper entry point
 // ---------------------------------------------------------------------------
 
-pub(crate) async fn serve_listener(listener: TcpListener, shared: Arc<ServeShared>) -> Result<()> {
-    serve_listener_until(listener, shared, CancellationToken::new()).await
-}
+/// Most client connections served at once. Further connects wait in the
+/// kernel's listen backlog until one closes, so idle sockets cannot use up
+/// the process's descriptors (the default soft limit is 1024).
+const MAX_CONNECTIONS: usize = 512;
 
-/// Accept loop that exits cleanly when `shutdown` is cancelled.
+/// A client must deliver a complete request head this soon after it connects
+/// or after its previous response; hyper then closes the connection. This is
+/// also what reaps idle keep-alive connections.
+const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Pause after a failed `accept`, doubled per consecutive failure.
+const ACCEPT_BACKOFF_MIN: Duration = Duration::from_millis(10);
+const ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(1);
+
+/// After shutdown, how long in-flight requests get to finish.
+const SHUTDOWN_DRAIN: Duration = Duration::from_secs(30);
+
+/// Accept loop. A failed `accept` (out of descriptors, a connection reset
+/// before it was accepted) is logged and retried, never fatal. When
+/// `shutdown` is cancelled the loop stops accepting and releases the port,
+/// lets requests in flight finish for up to [`SHUTDOWN_DRAIN`], and returns.
 pub(crate) async fn serve_listener_until(
     listener: TcpListener,
     shared: Arc<ServeShared>,
     shutdown: CancellationToken,
 ) -> Result<()> {
+    let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    let connections = TaskTracker::new();
+    let mut backoff = ACCEPT_BACKOFF_MIN;
     loop {
-        tokio::select! {
-            _ = shutdown.cancelled() => return Ok(()),
-            accepted = listener.accept() => {
-                let (stream, _) = accepted?;
-                let shared = Arc::clone(&shared);
-                tokio::spawn(async move {
-                    // One tracker per connection so pipelined responses share FIFO
-                    // flush ordering without global state.
-                    let acks = FlushAcks::new();
-                    let io = TrackedIo::new(stream, acks.clone());
-                    let service = hyper::service::service_fn(move |req: Request<Incoming>| {
-                        let shared = Arc::clone(&shared);
-                        let acks = acks.clone();
-                        async move {
-                            Ok::<_, Infallible>(handle_request(req, shared, acks).await)
-                        }
-                    });
-                    if let Err(err) = http1::Builder::new()
-                        .serve_connection(TokioIo::new(io), service)
-                        .await
-                    {
-                        // Hyper already logs connection resets; keep quiet for normal close.
-                        let msg = err.to_string();
-                        if !msg.contains("incomplete") && !msg.contains("reset") {
-                            eprintln!("[hipfire] connection error: {err:#}");
-                        }
-                    }
-                });
+        let slot = tokio::select! {
+            _ = shutdown.cancelled() => break,
+            slot = Arc::clone(&slots).acquire_owned() => {
+                slot.expect("the connection semaphore is never closed")
             }
+        };
+        let accepted = tokio::select! {
+            _ = shutdown.cancelled() => break,
+            accepted = listener.accept() => accepted,
+        };
+        match accepted {
+            Ok((stream, _)) => {
+                backoff = ACCEPT_BACKOFF_MIN;
+                connections.spawn(serve_connection(
+                    stream,
+                    Arc::clone(&shared),
+                    shutdown.clone(),
+                    slot,
+                ));
+            }
+            Err(error) => {
+                eprintln!(
+                    "[hipfire] accept failed: {error}; retrying in {} ms",
+                    backoff.as_millis()
+                );
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    _ = tokio::time::sleep(backoff) => {}
+                }
+                backoff = (backoff * 2).min(ACCEPT_BACKOFF_MAX);
+            }
+        }
+    }
+    drop(listener);
+    connections.close();
+    if tokio::time::timeout(SHUTDOWN_DRAIN, connections.wait())
+        .await
+        .is_err()
+    {
+        eprintln!(
+            "[hipfire] shutdown: requests still in flight after {} s; exiting",
+            SHUTDOWN_DRAIN.as_secs()
+        );
+    }
+    Ok(())
+}
+
+/// One client connection, holding one of the [`MAX_CONNECTIONS`] slots. On
+/// shutdown it stops keep-alive: an idle connection closes at once, a busy
+/// one after its response.
+async fn serve_connection(
+    stream: TcpStream,
+    shared: Arc<ServeShared>,
+    shutdown: CancellationToken,
+    _slot: OwnedSemaphorePermit,
+) {
+    // One tracker per connection so pipelined responses share FIFO
+    // flush ordering without global state.
+    let acks = FlushAcks::new();
+    let io = TrackedIo::new(stream, acks.clone());
+    let service = hyper::service::service_fn(move |req: Request<Incoming>| {
+        let shared = Arc::clone(&shared);
+        let acks = acks.clone();
+        async move { Ok::<_, Infallible>(handle_request(req, shared, acks).await) }
+    });
+    let mut builder = http1::Builder::new();
+    builder
+        .timer(TokioTimer::new())
+        .header_read_timeout(HEADER_READ_TIMEOUT);
+    let conn = builder.serve_connection(TokioIo::new(io), service);
+    tokio::pin!(conn);
+    let mut draining = false;
+    let result = loop {
+        tokio::select! {
+            result = conn.as_mut() => break result,
+            _ = shutdown.cancelled(), if !draining => {
+                draining = true;
+                conn.as_mut().graceful_shutdown();
+            }
+        }
+    };
+    if let Err(err) = result {
+        // Resets, clients gone mid-request and idle connections reaped by
+        // the header timeout are normal; stay quiet for those.
+        let msg = err.to_string();
+        if !err.is_timeout() && !msg.contains("incomplete") && !msg.contains("reset") {
+            eprintln!("[hipfire] connection error: {err:#}");
         }
     }
 }

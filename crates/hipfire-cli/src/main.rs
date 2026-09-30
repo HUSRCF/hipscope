@@ -13154,4 +13154,102 @@ mod tests {
         assert!(payloads[2].contains(r#""error""#), "{payloads:?}");
         assert_eq!(payloads.last().map(String::as_str), Some("[DONE]"));
     }
+
+    /// Marks the child run of `accept_errors_do_not_stop_serving` (not a
+    /// product setting, so no `HIPFIRE_` prefix).
+    #[cfg(unix)]
+    const EMFILE_CHILD_ENV: &str = "T11_EMFILE_CHILD";
+
+    /// A failed `accept` must not end the server. A child process runs the
+    /// serve harness and then takes every free descriptor, so the kernel
+    /// completes this test's connect but serve's `accept` fails with EMFILE.
+    /// Once the child gives the descriptors back, the same connection must
+    /// be served.
+    #[cfg(unix)]
+    #[test]
+    fn accept_errors_do_not_stop_serving() {
+        use std::io::{BufRead, BufReader};
+        use std::process::{Command, Stdio};
+        if env::var_os(EMFILE_CHILD_ENV).is_some() {
+            return emfile_child();
+        }
+        let mut child = Command::new(env::current_exe().unwrap())
+            .args([
+                "tests::accept_errors_do_not_stop_serving",
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(EMFILE_CHILD_ENV, "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn child test");
+        // Keep the read end open until the child exits: a closed pipe would
+        // make its test output fail.
+        let mut child_stdout = BufReader::new(child.stdout.take().unwrap());
+        let port: u16 = loop {
+            let mut line = String::new();
+            assert!(
+                child_stdout.read_line(&mut line).unwrap() > 0,
+                "child exited before it held every descriptor"
+            );
+            // libtest prints "test <name> ... " on the same line first.
+            if let Some((_, port)) = line.trim().split_once("EMFILE_READY ") {
+                break port.parse().unwrap();
+            }
+        };
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        stream
+            .write_all(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        let mut child_stdin = child.stdin.take().unwrap();
+        writeln!(child_stdin, "connected").unwrap();
+        let mut response = String::new();
+        let _ = stream.read_to_string(&mut response);
+        drop(child_stdin);
+        let output = child.wait_with_output().expect("child test");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("accept failed"),
+            "serve never hit an accept error: {stderr}"
+        );
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "connection not served after EMFILE: {response:?}\n{stderr}"
+        );
+        assert!(output.status.success(), "child test failed: {stderr}");
+        drop(child_stdout);
+    }
+
+    #[cfg(unix)]
+    fn emfile_child() {
+        let harness = Task11HttpHarness::spawn("emfile");
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+            0
+        );
+        limit.rlim_cur = limit.rlim_cur.min(256);
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+        let mut hogs = Vec::new();
+        while let Ok(file) = fs::File::open("/dev/null") {
+            hogs.push(file);
+        }
+        println!("EMFILE_READY {}", harness.port());
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line).unwrap();
+        // Serve fails its accept and backs off meanwhile.
+        thread::sleep(Duration::from_millis(300));
+        drop(hogs);
+        // The parent closes stdin once it has its response.
+        let _ = std::io::stdin().read_line(&mut line);
+    }
 }

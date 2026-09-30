@@ -977,9 +977,19 @@ pub(crate) fn serve_foreground(
         format!("{}\n", serde_json::to_string(&pid_record)?),
     )?;
     let cleanup = pid_path.clone();
+    // SIGINT/SIGTERM stops accepting and lets requests in flight finish
+    // (bounded, see http::serve_listener_until); a second signal exits now.
+    let shutdown = CancellationToken::new();
+    let signal_shutdown = shutdown.clone();
     ctrlc::set_handler(move || {
-        let _ = fs::remove_file(&cleanup);
-        std::process::exit(0);
+        if signal_shutdown.is_cancelled() {
+            let _ = fs::remove_file(&cleanup);
+            std::process::exit(0);
+        }
+        eprintln!(
+            "[hipfire] shutting down: finishing requests in flight (signal again to exit now)"
+        );
+        signal_shutdown.cancel();
     })
     .context("failed to install serve signal handler")?;
     eprintln!("[hipfire] native serve listening on http://{bind}");
@@ -1060,11 +1070,15 @@ pub(crate) fn serve_foreground(
             }
         });
     }
-    runtime.block_on(crate::serve::http::serve_listener(
+    runtime.block_on(crate::serve::http::serve_listener_until(
         listener,
         Arc::clone(&shared),
+        shutdown,
     ))?;
     let _ = fs::remove_file(pid_path);
+    // A request still inside the daemon after the drain bound must not hold
+    // the exit: Runtime::drop would wait for its blocking worker.
+    runtime.shutdown_timeout(Duration::from_secs(1));
     Ok(())
 }
 

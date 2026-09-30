@@ -83,12 +83,19 @@ Config and env owners for bind, idle, queue, and body limits:
 3. **Pre-warm (default).** Loads the chosen model asynchronously. Failures log
    and leave the process serving; the model loads on the first real request.
 4. **HTTP.** The native server accepts traffic. Only one generation holds the
-   daemon lock at a time (bounded queue).
+   daemon lock at a time (bounded queue). A failed `accept` (for example, out
+   of file descriptors) is logged and retried, never fatal. At most 512
+   connections are served at once; further connects wait in the listen
+   backlog. A client must send a complete request head within 30 s of
+   connecting or of its previous response, which also closes idle keep-alive
+   connections.
 5. **Idle eviction.** When `idle_timeout > 0`, an interval unloads the model
    after idle seconds **and** only when no generation is in flight and the
    serve lock is free. Next request reloads.
 6. **Stop.** `hipfire stop` validates pid ownership before SIGTERM. Stale reused
-   pids are **not** killed; the pidfile is removed instead.
+   pids are **not** killed; the pidfile is removed instead. On SIGTERM or
+   Ctrl-C, serve stops accepting and frees the port at once, lets requests in
+   flight finish for up to 30 s, then exits; a second signal exits at once.
 
 Detached readiness: parent polls `GET /health` for up to **60 seconds**.
 `/health` means the native process is answering; inspect `model` and
