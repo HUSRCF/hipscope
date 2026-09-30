@@ -133,7 +133,8 @@ fn unique_suffix() -> String {
 fn fetch(location: &str) -> std::result::Result<Option<Vec<u8>>, String> {
     if location.starts_with("https://") || location.starts_with("http://") {
         let agent: ureq::Agent = ureq::Agent::config_builder()
-            .timeout_global(Some(Duration::from_secs(30 * 60)))
+            .timeout_connect(Some(Duration::from_secs(30)))
+            .timeout_global(Some(Duration::from_secs(10 * 60)))
             .http_status_as_error(false)
             .build()
             .into();
@@ -160,7 +161,12 @@ fn fetch(location: &str) -> std::result::Result<Option<Vec<u8>>, String> {
         }
         return Ok(Some(bytes));
     }
-    let path = PathBuf::from(location.strip_prefix("file://").unwrap_or(location));
+    let mut local = location.strip_prefix("file://").unwrap_or(location);
+    // `file:///C:/packs` names the Windows path `C:/packs`.
+    if cfg!(windows) && local.as_bytes().get(2) == Some(&b':') && local.starts_with('/') {
+        local = &local[1..];
+    }
+    let path = PathBuf::from(local);
     match fs::read(&path) {
         Ok(bytes) => Ok(Some(bytes)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),

@@ -161,10 +161,7 @@ pub(crate) fn setup_command(paths: &crate::Paths, args: crate::SetupArgs) -> Res
         match resolve_rocm_root_with(args.rocm_root.as_deref(), hipcc_override, strict, args.yes) {
             Ok(root) => (root, true),
             Err(error) => match pack_tag.and_then(|_| runtime_only_root(args.rocm_root.as_deref())) {
-                Some(root) => {
-                    eprintln!("No device compiler: kernels must come from the release pack ({error:#})");
-                    (root, false)
-                }
+                Some(root) => (root, false),
                 None => return Err(error),
             },
         };
@@ -176,7 +173,16 @@ pub(crate) fn setup_command(paths: &crate::Paths, args: crate::SetupArgs) -> Res
     // Print resolved provenance before any heavy work so a failing install
     // report always contains it. Uses the same toolchain resolver as
     // hipfire-rocm-resolve so output stays consistent.
-    {
+    if !has_compiler {
+        let version = hipfire_config::rocm::version_for_root(&rocm_root)
+            .unwrap_or_else(|| "unknown".to_string());
+        let runtime = hipfire_config::rocm::runtime_library(&rocm_root)
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "not found".to_string());
+        eprintln!("ROCm root:       {} (version {version})", rocm_root.display());
+        eprintln!("HIPCC:           none (kernels must come from the release kernel pack)");
+        eprintln!("HIP runtime:     {runtime}");
+    } else {
         let toolchain = hipfire_config::rocm::resolve_toolchain_for_explicit(
             Some(&rocm_root),
             hipcc_override,
