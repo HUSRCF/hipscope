@@ -24,7 +24,8 @@ pub use ffi::{
     Event, Function, Graph, GraphExec, HipMemAccessDesc, HipMemAllocationProp,
     HipMemGenericAllocationHandle, HipMemLocation, HipPointerAttribute, HipRuntime, Module, Stream,
     HIP_ERROR_NOT_READY, HIP_EVENT_DISABLE_TIMING, HIP_EVENT_RELEASE_TO_SYSTEM,
-    HIP_MEM_ALLOCATION_GRANULARITY_MINIMUM, HIP_MEM_ALLOCATION_GRANULARITY_RECOMMENDED,
+    HIP_HOST_MALLOC_MAPPED, HIP_MEM_ALLOCATION_GRANULARITY_MINIMUM,
+    HIP_MEM_ALLOCATION_GRANULARITY_RECOMMENDED,
 };
 pub use kernarg::KernargBlob;
 pub use rccl::{RcclComms, RcclDataType, RcclError, RcclRedOp, RcclResult, NCCL_SUCCESS};
@@ -83,6 +84,10 @@ pub struct DeviceBuffer {
 enum DeviceBufferOwnership {
     HipMalloc,
     Vmm,
+    /// Owner of a `hipHostMalloc(hipHostMallocMapped)` allocation: pinned
+    /// system RAM the GPU reads over PCIe. Released with `hipHostFree` through
+    /// the host pointer its `Gpu` registered.
+    HostMapped,
     Borrowed,
 }
 
@@ -105,6 +110,10 @@ impl DeviceBuffer {
 
     pub fn is_borrowed(&self) -> bool {
         self.ownership == DeviceBufferOwnership::Borrowed
+    }
+
+    pub fn is_host_mapped(&self) -> bool {
+        self.ownership == DeviceBufferOwnership::HostMapped
     }
 
     /// Create a non-owning DeviceBuffer from a raw pointer and size.
@@ -134,6 +143,23 @@ impl DeviceBuffer {
             ptr,
             size,
             ownership: DeviceBufferOwnership::Vmm,
+        }
+    }
+
+    /// Create the unique owner descriptor for a mapped host allocation.
+    ///
+    /// `ptr` is the device-visible address kernels are handed; the host
+    /// pointer `hipHostFree` needs must be registered with the owning `Gpu`.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must be the device-visible alias of a live `hipHostMalloc` buffer
+    /// of at least `size` bytes, freed exactly once through its host pointer.
+    pub unsafe fn from_host_mapped(ptr: *mut std::ffi::c_void, size: usize) -> DeviceBuffer {
+        DeviceBuffer {
+            ptr,
+            size,
+            ownership: DeviceBufferOwnership::HostMapped,
         }
     }
 

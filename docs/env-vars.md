@@ -151,6 +151,8 @@ Read only by the Qwen4 carrier and its kernels; no other model reads them.
 | `HIPFIRE_QWEN4_TRUNK_TIER` | Q8F16 declaration | `mq6` declares the rank-2 trunk attention/GDN matrices at MQ6G256V2 for the quantizer; the loader admits both tiers from the file. |
 | `HIPFIRE_QWEN4_MTP_TIER` | recipe tier | `source` keeps the rank-2 MTP matrices at BF16 (quantizer and loader comparison knob). |
 | `HIPFIRE_QWEN4_REQUANT` | unset | Load-time precision experiment: `pat=fmt;...` requantizes resident rank-2 weights whose name contains `pat` to `mq2`..`mq6` or `q8`. |
+| `HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS` | unset: every routed expert in VRAM | Discrete-GPU capacity knob: trunk layers `0..N` keep their routed experts in VRAM; later layers' and the MTP layer's routed experts are fulfilled into pinned, device-mapped host RAM and read over PCIe (zero-copy) by the unchanged sealed MoE kernels. `0` puts every routed expert (~65 GB) in host RAM. Refused on UMA. |
+| `HIPFIRE_QWEN4_ROUTE_TRACE` | unset | Diagnostic: append one line per single-token HIP forward to this file, `position` followed by every layer's routed expert ids. Synchronizes the device each token. |
 
 ### Vision tower sidecar
 

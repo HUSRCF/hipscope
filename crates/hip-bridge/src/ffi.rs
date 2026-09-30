@@ -128,6 +128,11 @@ pub const HIP_EVENT_DISABLE_TIMING: u32 = 0x2;
 /// Request an explicit system-scope release when recording an event.
 pub const HIP_EVENT_RELEASE_TO_SYSTEM: u32 = 0x8000_0000;
 
+/// `hipHostMalloc` flag: map the allocation into device address space so
+/// device code can dereference it (zero-copy). Without it the pages are pinned
+/// but reachable only by the copy engines.
+pub const HIP_HOST_MALLOC_MAPPED: u32 = 0x2;
+
 /// `hipPointerAttribute_t` per ROCm 6.4.3 layout. ROCm 5.x not supported.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -249,6 +254,10 @@ pub struct HipRuntime {
     fn_malloc: unsafe extern "C" fn(*mut *mut c_void, usize) -> u32,
     fn_ext_malloc_with_flags: Option<unsafe extern "C" fn(*mut *mut c_void, usize, c_uint) -> u32>,
     fn_free: unsafe extern "C" fn(*mut c_void) -> u32,
+    fn_host_malloc: Option<unsafe extern "C" fn(*mut *mut c_void, usize, c_uint) -> u32>,
+    fn_host_get_device_pointer:
+        Option<unsafe extern "C" fn(*mut *mut c_void, *mut c_void, c_uint) -> u32>,
+    fn_host_free: Option<unsafe extern "C" fn(*mut c_void) -> u32>,
     fn_mem_get_address_range:
         unsafe extern "C" fn(*mut *mut c_void, *mut usize, *mut c_void) -> u32,
     fn_memcpy: unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_uint) -> u32,
@@ -484,6 +493,21 @@ impl HipRuntime {
                     unsafe extern "C" fn(*mut *mut c_void, usize, c_uint) -> u32
                 ),
                 fn_free: load_fn!(lib, "hipFree", unsafe extern "C" fn(*mut c_void) -> u32),
+                fn_host_malloc: load_optional_fn!(
+                    lib,
+                    "hipHostMalloc",
+                    unsafe extern "C" fn(*mut *mut c_void, usize, c_uint) -> u32
+                ),
+                fn_host_get_device_pointer: load_optional_fn!(
+                    lib,
+                    "hipHostGetDevicePointer",
+                    unsafe extern "C" fn(*mut *mut c_void, *mut c_void, c_uint) -> u32
+                ),
+                fn_host_free: load_optional_fn!(
+                    lib,
+                    "hipHostFree",
+                    unsafe extern "C" fn(*mut c_void) -> u32
+                ),
                 fn_mem_get_address_range: load_fn!(
                     lib,
                     "hipMemGetAddressRange",
@@ -989,6 +1013,38 @@ impl HipRuntime {
         }
         let code = unsafe { (self.fn_free)(buf.ptr) };
         self.check(code, "hipFree")
+    }
+
+    /// Allocate pinned host memory. With [`HIP_HOST_MALLOC_MAPPED`] in `flags`
+    /// device code can read it over PCIe; the returned address is the *host*
+    /// pointer, see [`Self::host_get_device_pointer`] for the kernel address.
+    pub fn host_malloc(&self, size: usize, flags: u32) -> HipResult<*mut c_void> {
+        let func = self.missing_vmm_symbol("hipHostMalloc", self.fn_host_malloc)?;
+        let mut ptr: *mut c_void = ptr::null_mut();
+        let code = unsafe { func(&mut ptr, size, flags) };
+        self.check(code, "hipHostMalloc")?;
+        Ok(ptr)
+    }
+
+    /// Device-visible address of a `hipHostMalloc`'d buffer. HIP treats `host`
+    /// as an opaque address; Rust never dereferences it.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub fn host_get_device_pointer(&self, host: *mut c_void, flags: u32) -> HipResult<*mut c_void> {
+        let func =
+            self.missing_vmm_symbol("hipHostGetDevicePointer", self.fn_host_get_device_pointer)?;
+        let mut dev: *mut c_void = ptr::null_mut();
+        let code = unsafe { func(&mut dev, host, flags) };
+        self.check(code, "hipHostGetDevicePointer")?;
+        Ok(dev)
+    }
+
+    /// Release a `hipHostMalloc`'d buffer by its host pointer. The buffer must
+    /// not be in use on the GPU.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub fn host_free(&self, host: *mut c_void) -> HipResult<()> {
+        let func = self.missing_vmm_symbol("hipHostFree", self.fn_host_free)?;
+        let code = unsafe { func(host) };
+        self.check(code, "hipHostFree")
     }
 
     pub fn mem_get_allocation_granularity(

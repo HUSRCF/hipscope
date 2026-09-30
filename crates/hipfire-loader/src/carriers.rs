@@ -373,12 +373,31 @@ impl Carrier for Qwen4Carrier {
         let receipt =
             hipfire_arch_qwen4::admit_hfqm_artifact(&hfq).map_err(|error| error.to_string())?;
         let config = receipt.config;
-        let manifest = receipt.manifest;
+        let mut manifest = receipt.manifest;
         let metadata = receipt.ple;
         let placements = receipt.placements;
         let use_ranges = ctx.gpu.is_uma();
         if use_ranges {
             hfq.drop_mmap();
+        }
+        if let Some(vram_layers) =
+            hipfire_arch_qwen4::expert_residency::expert_vram_layers_from_env()
+                .map_err(|error| format!("qwen4: {error}"))?
+        {
+            if use_ranges {
+                return Err(format!(
+                    "qwen4: {} places experts in host RAM, which only a discrete GPU needs",
+                    hipfire_arch_qwen4::expert_residency::EXPERT_VRAM_LAYERS_ENV
+                ));
+            }
+            let moved = hipfire_arch_qwen4::expert_residency::place_routed_experts(
+                &mut manifest.weights,
+                vram_layers,
+            );
+            eprintln!(
+                "  qwen4 routed experts: layers 0..{} in VRAM, {moved} expert tensors in host RAM",
+                vram_layers.min(config.num_hidden_layers)
+            );
         }
         let mesh = DeviceMesh::single().map_err(|error| format!("qwen4: mesh: {error}"))?;
         let expected = WeightOrigin::for_single(&mesh, ctx.gpu);

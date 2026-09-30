@@ -244,6 +244,12 @@ pub(crate) fn recorded_launch_artifact(
 /// FP16 WMMA on the production prefill bench can lower it later.
 pub(crate) const FP8_WMMA_MIN_BATCH: usize = 1024;
 
+/// Slack mapped past the end of every host-mapped weight tensor. Forward
+/// kernels may read a few bytes past a weight blob (a group header or vector
+/// tail); on the device path `hipMalloc` slack absorbs it, while an exact-fit
+/// host mapping would fault on the first byte past the allocation.
+const HOST_TAIL_PAD_BYTES: usize = 1024 * 1024;
+
 // AR-forward hipGraph policy (2026-05-15, after `<think>\n!!!!!` attractor
 // debug on Qwen3.5-27B mq4 gfx1100):
 //
@@ -799,6 +805,10 @@ pub struct Gpu {
     /// Arenas whose cleanup failed before they could enter the owner map.
     /// They have no tensor owner and are retried during explicit/Gpu teardown.
     orphan_vmm_arenas: Vec<VmmArena>,
+    /// `hipHostMalloc(hipHostMallocMapped)` owners keyed by the device-visible
+    /// base address kernels are handed; the value is the host pointer
+    /// `hipHostFree` needs (the two may differ, so the pair is remembered).
+    host_mapped: HashMap<usize, usize>,
     /// When set, all kernel launches go to this stream instead of null stream.
     pub active_stream: Option<hip_bridge::Stream>,
     /// Name of the most recently launched kernel on this `Gpu`'s stream.
@@ -1500,6 +1510,7 @@ impl Gpu {
             pool: crate::pool::GpuPool::new(),
             vmm_arenas: HashMap::new(),
             orphan_vmm_arenas: Vec::new(),
+            host_mapped: HashMap::new(),
             active_stream: None,
             last_kernel: None,
             scratch: crate::scratch::ScratchState {
@@ -3902,6 +3913,15 @@ impl Gpu {
     /// is an error so unload/load cannot claim a clean handoff.
     pub fn ensure_vmm_cleaned(&mut self) -> HipResult<()> {
         self.bind_thread()?;
+        let live_host = self.host_mapped.len();
+        if live_host != 0 {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "refusing cleanup while {live_host} live host-mapped tensor owner(s) remain; unload the active model first"
+                ),
+            ));
+        }
         let live = self.vmm_arenas.len();
         if live != 0 {
             return Err(HipError::new(
@@ -3985,6 +4005,81 @@ impl Gpu {
             Some(err) => Err(err),
             None => Ok(self.vmm_allocation_count()),
         }
+    }
+
+    /// Release every registered host-mapped allocation. Entries are removed
+    /// only on success, so a failed `hipHostFree` stays visible.
+    fn release_registered_host_mapped(&mut self) -> HipResult<usize> {
+        let mut first_error = None;
+        let keys: Vec<usize> = self.host_mapped.keys().copied().collect();
+        for key in keys {
+            let host_ptr = self.host_mapped[&key];
+            match self.hip.host_free(host_ptr as *mut c_void) {
+                Ok(()) => {
+                    self.host_mapped.remove(&key);
+                }
+                Err(err) => {
+                    if first_error.is_none() {
+                        first_error = Some(err);
+                    }
+                }
+            }
+        }
+        match first_error {
+            Some(err) => Err(err),
+            None => Ok(self.host_mapped.len()),
+        }
+    }
+
+    /// Live `hipHostMalloc` owners. Zero after a clean unload.
+    pub fn host_mapped_count(&self) -> usize {
+        self.host_mapped.len()
+    }
+
+    /// Upload raw bytes into a **host-mapped** tensor: pinned system RAM the
+    /// kernels read directly over PCIe (zero-copy), charged to no device heap.
+    /// The bytes are copied on the CPU through the host pointer.
+    ///
+    /// The allocation is padded by [`HOST_TAIL_PAD_BYTES`] because some
+    /// forward kernels read a few bytes past a weight blob; `hipMalloc` slack
+    /// absorbs that on the device path, an exact-fit host mapping would fault.
+    pub fn upload_raw_host_mapped(&mut self, data: &[u8], shape: &[usize]) -> HipResult<GpuTensor> {
+        self.bind_thread()?;
+        let alloc_bytes = data
+            .len()
+            .checked_add(HOST_TAIL_PAD_BYTES)
+            .ok_or_else(|| HipError::new(0, "host-mapped tensor size overflowed"))?;
+        let host_ptr = self
+            .hip
+            .host_malloc(alloc_bytes, hip_bridge::HIP_HOST_MALLOC_MAPPED)?;
+        let dev_ptr = match self.hip.host_get_device_pointer(host_ptr, 0) {
+            Ok(ptr) if !ptr.is_null() => ptr,
+            Ok(_) => host_ptr,
+            Err(err) => {
+                let _ = self.hip.host_free(host_ptr);
+                return Err(err);
+            }
+        };
+        let key = dev_ptr as usize;
+        if self.host_mapped.insert(key, host_ptr as usize).is_some() {
+            let _ = self.hip.host_free(host_ptr);
+            return Err(HipError::new(
+                0,
+                &format!("duplicate host-mapped tensor base address 0x{key:x}"),
+            ));
+        }
+        // SAFETY: `host_ptr` is a live allocation of `alloc_bytes >= data.len()`
+        // bytes that nothing else references yet.
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), host_ptr as *mut u8, data.len());
+            std::ptr::write_bytes((host_ptr as *mut u8).add(data.len()), 0, HOST_TAIL_PAD_BYTES);
+        }
+        Ok(GpuTensor {
+            // SAFETY: registered above; freed once through `free_tensor` or drop.
+            buf: unsafe { DeviceBuffer::from_host_mapped(dev_ptr, data.len()) },
+            shape: shape.to_vec(),
+            dtype: DType::Raw,
+        })
     }
 
     /// Allocate a pool tensor then run `init`. On init failure the owner is
@@ -4155,6 +4250,16 @@ impl Gpu {
     pub fn free_tensor(&mut self, tensor: GpuTensor) -> HipResult<()> {
         self.bind_thread()?;
         let key = tensor.buf.as_ptr() as usize;
+        if tensor.buf.is_host_mapped() {
+            // Never pooled: hipHostFree takes the registered host pointer.
+            let host_ptr = self.host_mapped.remove(&key).ok_or_else(|| {
+                HipError::new(
+                    0,
+                    &format!("host-mapped tensor at 0x{key:x} has no registered host pointer"),
+                )
+            })?;
+            return self.hip.host_free(host_ptr as *mut c_void);
+        }
         if self.vmm_arenas.contains_key(&key) {
             if !tensor.buf.is_vmm_owner() {
                 return Err(HipError::new(
@@ -5908,12 +6013,18 @@ impl Drop for Gpu {
     /// impls call `hipFree` etc. Uses `bind_thread_or_warn` to avoid
     /// panic-in-Drop from `bind_thread`'s `debug_assert!`.
     fn drop(&mut self) {
-        if std::thread::panicking() && self.vmm_allocation_count() == 0 {
+        if std::thread::panicking()
+            && self.vmm_allocation_count() == 0
+            && self.host_mapped.is_empty()
+        {
             return;
         }
         self.bind_thread_or_warn();
         if let Err(err) = self.release_registered_vmm() {
             eprintln!("[rdna-compute] failed to release VMM arena during Gpu drop: {err}");
+        }
+        if let Err(err) = self.release_registered_host_mapped() {
+            eprintln!("[rdna-compute] failed to release host-mapped tensor during Gpu drop: {err}");
         }
     }
 }

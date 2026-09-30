@@ -1097,7 +1097,7 @@ fn ple_descriptors(
                 row_bytes,
                 valid_rows,
             } => (row_bytes, valid_rows),
-            WeightResidency::Resident => {
+            WeightResidency::Resident | WeightResidency::HostMapped => {
                 return Err(BundleError::Weights(WeightError::DescriptorMismatch(
                     entry.name.clone(),
                 )))
