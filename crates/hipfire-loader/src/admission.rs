@@ -155,6 +155,21 @@ pub(crate) fn qwen4_native_mtp(
     }
 }
 
+/// Whether an admitted Qwen4 native MTP head stays attached once
+/// `host_mapped_experts` routed-expert tensors were placed in pinned host RAM
+/// (`HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS`). Greedy MTP over host-mapped experts
+/// gains little (gfx1201 N=12: 1.08x median AR, slower on low-tau prompts) and
+/// its text differs from AR on 4/8 prompts, so `auto` keeps AR there and only
+/// an explicit `speculation.mtp = "on"` (`--spec mtp`) attaches the head.
+/// Device-resident loads (Strix Halo: MTP text = AR on 8/8, 1.41x) keep the
+/// `auto` default on.
+pub(crate) fn qwen4_mtp_with_host_mapped_experts(
+    spec: SpecLoadCfg,
+    host_mapped_experts: usize,
+) -> bool {
+    host_mapped_experts == 0 || spec.mtp == Some(true)
+}
+
 /// The source-only portion of Qwen4 admission. The validated config and
 /// inventory are reused by the executable Single carrier without reopening
 /// or reclassifying the HFQM path.
@@ -1363,6 +1378,19 @@ mod tests {
             qwen4_native_mtp(with(None), "gfx1030", mq4r, 1, 1),
             Ok(true)
         );
+    }
+
+    #[test]
+    fn qwen4_host_mapped_experts_make_native_mtp_opt_in() {
+        let with = |mtp| SpecLoadCfg {
+            mtp,
+            ..SpecLoadCfg::default()
+        };
+        // Device-resident experts: the admitted head stays on under `auto`.
+        assert!(qwen4_mtp_with_host_mapped_experts(with(None), 0));
+        // Host-mapped experts: `auto` keeps AR, an explicit `on` keeps MTP.
+        assert!(!qwen4_mtp_with_host_mapped_experts(with(None), 21));
+        assert!(qwen4_mtp_with_host_mapped_experts(with(Some(true)), 21));
     }
 
     mod qwen4_ddtree_admission {

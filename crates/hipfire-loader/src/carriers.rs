@@ -355,7 +355,7 @@ impl Carrier for Qwen4Carrier {
                 hipfire_arch_qwen4::QWEN4_MAX_CONTEXT
             ));
         }
-        let native_mtp =
+        let mut native_mtp =
             crate::admission::qwen4_native_mtp(ctx.spec, &ctx.gpu.arch, ctx.path, ctx.pp, 1)?;
         self.admit_options(
             ctx.draft_path,
@@ -384,12 +384,6 @@ impl Carrier for Qwen4Carrier {
         let receipt =
             hipfire_arch_qwen4::admit_hfqm_artifact(&hfq).map_err(|error| error.to_string())?;
         let config = receipt.config;
-        // Context-sized QSA arenas (trunk layers plus the MTP head's), named
-        // in the refusal when they do not fit.
-        let context_state_mib = config
-            .qsa_context_arena_bytes(ctx.max_seq)
-            .map(|bytes| bytes * (config.n_full_layers() + usize::from(native_mtp)) >> 20)
-            .unwrap_or(usize::MAX);
         let mut manifest = receipt.manifest;
         let metadata = receipt.ple;
         let placements = receipt.placements;
@@ -439,7 +433,20 @@ impl Carrier for Qwen4Carrier {
                 vram_layers.min(config.num_hidden_layers),
                 host_bytes as f64 / (1u64 << 30) as f64
             );
+            if native_mtp && !crate::admission::qwen4_mtp_with_host_mapped_experts(ctx.spec, moved)
+            {
+                native_mtp = false;
+                eprintln!(
+                    "  qwen4 native MTP: off by default with host-mapped experts; opt in with --spec mtp (speculation.mtp = \"on\")"
+                );
+            }
         }
+        // Context-sized QSA arenas (trunk layers plus the MTP head's), named
+        // in the refusal when they do not fit.
+        let context_state_mib = config
+            .qsa_context_arena_bytes(ctx.max_seq)
+            .map(|bytes| bytes * (config.n_full_layers() + usize::from(native_mtp)) >> 20)
+            .unwrap_or(usize::MAX);
         let mesh = DeviceMesh::single().map_err(|error| format!("qwen4: mesh: {error}"))?;
         let expected = WeightOrigin::for_single(&mesh, ctx.gpu);
         let source = HfqModelSource::from_hfq(hfq);
