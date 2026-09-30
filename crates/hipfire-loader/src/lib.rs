@@ -408,7 +408,7 @@ const GEMMA4_TEMPLATE: &str = include_str!("../../hipfire-runtime/templates/gemm
 
 // ─── Eviction policy wrapper ──────────────────────────────────────────
 
-// lifecycle: deprecated since 0.4.0, removal 0.5.0
+// lifecycle: deprecated since 0.4.0, removal 0.5.0 — CASK/TriAttention KV eviction is unsupported research; use compact kv_cache modes
 /// Eviction policy wrapper — dispatches to plain TriAttention or CASK m-folding.
 pub enum Eviction {
     Plain(EvictionCtx),

@@ -127,9 +127,11 @@ impl KvPair {
 pub fn parse_qwen_k_name(raw: &str) -> Result<KvMode, KvPairError> {
     match raw.trim() {
         "q8" => Ok(Q8),
+        // lifecycle: deprecated since 0.4.0, removal 0.5.0 — asymN/turboN aliases of fwhtN; spell fwhtN
         "fwht2" | "asym2" | "turbo2" => Ok(Fwht2),
         "fwht3" | "asym3" | "turbo3" | "turbo" => Ok(Fwht3),
         "fwht4" | "asym4" | "turbo4" => Ok(Fwht4),
+        // lifecycle: deprecated since 0.4.0, removal 0.5.0 — Givens asym KV is superseded by fwht3
         "legacy-asym2" => Ok(Asym2),
         "legacy-asym3" => Ok(Asym3),
         "legacy-asym4" => Ok(Asym4),
@@ -137,6 +139,34 @@ pub fn parse_qwen_k_name(raw: &str) -> Result<KvMode, KvPairError> {
             "unrecognized Qwen K name '{other}' (expected q8|fwht2|fwht3|fwht4|asym2|asym3|asym4|turbo|turbo2|turbo3|turbo4|legacy-asym2|legacy-asym3|legacy-asym4; fp8/bf16/f16 require --kv-mode)"
         ))),
     }
+}
+
+// lifecycle: deprecated since 0.4.0, removal 0.5.0 — Givens asym KV and the asymN/turboN aliases are superseded by fwht3
+/// KV names deprecated since 0.4.0 (removal in 0.5.0): Givens `legacy-asymN`
+/// and the `asymN` / `turbo*` aliases (Qwen: FWHT aliases; llama: Givens).
+pub const DEPRECATED_KV_NAMES: &[&str] = &[
+    "asym2",
+    "asym3",
+    "asym4",
+    "legacy-asym2",
+    "legacy-asym3",
+    "legacy-asym4",
+    "turbo",
+    "turbo2",
+    "turbo3",
+    "turbo4",
+];
+
+/// One-line deprecation warning for an authored KV name, `None` for every
+/// supported name (including unset / `auto`).
+pub fn deprecated_kv_name_warning(raw: &str) -> Option<String> {
+    let name = raw.trim();
+    DEPRECATED_KV_NAMES.contains(&name).then(|| {
+        format!(
+            "warning: KV name '{name}' is deprecated and will be removed in 0.5.0 \
+             (Givens asym KV and the asymN/turboN aliases are superseded by fwht3; use fwhtN or q8)"
+        )
+    })
 }
 
 /// Shared Qwen V-name table: `q8` | `lloyd2` | `lloyd3` | `lloyd4`.
@@ -351,6 +381,7 @@ pub const DIR_SAFETENSORS_POLICY: KvModePolicy = KvModePolicy {
 fn normalize_full(raw: &str) -> Option<KvMode> {
     match raw {
         "q8" => Some(Q8),
+        // lifecycle: deprecated since 0.4.0, removal 0.5.0 — Givens asym KV and the asymN/turboN aliases are superseded by fwht3
         "asym2" | "turbo2" => Some(Asym2),
         "asym3" => Some(Asym3),
         "auto" | "turbo" | "turbo3" => Some(Fwht3),
@@ -528,6 +559,17 @@ mod tests {
         assert_eq!(parse_qwen_v_name("lloyd3").unwrap(), VMode::Lloyd3);
         assert_eq!(parse_qwen_v_name("lloyd4").unwrap(), VMode::Lloyd4);
         assert!(parse_qwen_v_name("lloyd5").is_err());
+    }
+
+    #[test]
+    fn deprecated_kv_names_warn_supported_names_do_not() {
+        for raw in ["", "auto", "q8", "fwht2", "fwht3", "fwht4", "fp8", "bf16", "f16", "lloyd3"] {
+            assert!(deprecated_kv_name_warning(raw).is_none(), "{raw}");
+        }
+        for raw in DEPRECATED_KV_NAMES {
+            let w = deprecated_kv_name_warning(&format!(" {raw} ")).unwrap();
+            assert!(w.contains("removed in 0.5.0"), "{w}");
+        }
     }
 
     #[test]

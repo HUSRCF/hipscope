@@ -209,6 +209,7 @@ pub(crate) fn convert_binary_tensor(
 /// (Q4-grade is too lossy for embeddings) and 1D norms stay F16. Tensor
 /// names are translated GGUF → safetensors style so the engine's existing
 /// `load_weights_hfq` can consume the output.
+// lifecycle: deprecated since 0.4.0, removal 0.5.0 — GGUF→mqN is lossy double quantization; use llama.cpp for GGUF
 pub(crate) fn run_gguf_pipeline(
     input: &Path,
     output: &Path,

@@ -126,7 +126,7 @@ pub(crate) enum Commands {
     Setup(SetupArgs),
     /// Quantize a Hugging Face or local model with the Rust quantizer.
     Quantize(QuantizeArgs),
-    // lifecycle: deprecated since 0.4.0, removal 0.5.0
+    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — CASK/TriAttention KV eviction is unsupported research; use compact kv_cache modes
     /// Deprecated (CASK; removal in 0.5.0): generate a TriAttention calibration sidecar.
     SidecarGen(SidecarArgs),
     /// Generate text through a fresh native daemon process.
@@ -386,7 +386,8 @@ struct RunArgs {
     /// One-shot KV format override for this model load.
     kv_mode: Option<String>,
     #[arg(long = "kv-k")]
-    /// Qwen-only K-format override (e.g. `fwht3`, `legacy-asym3`, `q8`).
+    /// Qwen-only K-format override (e.g. `fwht3`, `q8`; `legacy-asymN`, `asymN`
+    /// and `turboN` are deprecated, removal in 0.5.0).
     kv_k: Option<String>,
     #[arg(long = "kv-v")]
     /// Qwen-only V-format override (`q8`, `lloyd2`, `lloyd3`, `lloyd4`).
@@ -542,7 +543,8 @@ pub(crate) struct BenchArgs {
     #[arg(long)]
     kv_mode: Option<String>,
     #[arg(long = "kv-k")]
-    /// Qwen-only K-format override (e.g. `fwht3`, `legacy-asym3`, `q8`).
+    /// Qwen-only K-format override (e.g. `fwht3`, `q8`; `legacy-asymN`, `asymN`
+    /// and `turboN` are deprecated, removal in 0.5.0).
     kv_k: Option<String>,
     #[arg(long = "kv-v")]
     /// Qwen-only V-format override (`q8`, `lloyd2`, `lloyd3`, `lloyd4`).
@@ -592,7 +594,8 @@ struct ProfileArgs {
 
 #[derive(Args, Debug)]
 struct QuantizeArgs {
-    /// Hugging Face model ID, local safetensors directory, or GGUF file.
+    /// Hugging Face model ID or local safetensors directory (a GGUF file is
+    /// deprecated, removal in 0.5.0: GGUF→mqN is lossy double quantization; use llama.cpp for GGUF).
     input: String,
     #[arg(long = "format")]
     /// Repeatable output format: mq4, mq6, q8, q8f16, hf4, or hf6.
@@ -3263,7 +3266,7 @@ pub(crate) fn load_params(
         .map_err(|err| anyhow!("{err}"))?
         .as_str()
         .to_owned();
-    // lifecycle: deprecated since 0.4.0, removal 0.5.0
+    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — CASK/TriAttention KV eviction is unsupported research; use compact kv_cache modes
     let mut cask_sidecar = config_string(resolved, "memory.cask.sidecar")?;
     if cask_sidecar.is_empty() && config_bool(resolved, "memory.cask.auto_attach")? {
         if let Some(sidecar) = entry.and_then(|entry| entry.triattn.as_ref()) {
@@ -3340,6 +3343,7 @@ pub(crate) fn load_params(
         "cask_handoff_tokens": config_u64(resolved, "memory.cask.handoff_tokens")?,
         "cask_core_frac": config_f64(resolved, "memory.cask.core_fraction")?,
         "cask_fold_m": config_u64(resolved, "memory.cask.fold")?,
+        // lifecycle: deprecated since 0.4.0, removal 0.5.0 — PFlash is unsupported research; prefix caching supersedes it
         "prefill_compression": config_string(resolved, "speculation.prefill.mode")?,
         "prefill_threshold": config_u64(resolved, "speculation.prefill.threshold")?,
         "prefill_keep_ratio": config_f64(resolved, "speculation.prefill.keep_ratio")?,
@@ -6638,6 +6642,8 @@ fn quantize_command(paths: &Paths, mut args: QuantizeArgs) -> Result<()> {
             .extension()
             .and_then(|value| value.to_str())
             .is_some_and(|value| value.eq_ignore_ascii_case("gguf"));
+    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — GGUF→mqN is lossy double quantization; use llama.cpp for GGUF
+    // (the one-line warning is printed by hipfire-quantize itself)
     if args.formats.is_empty() {
         args.formats
             .push(if is_gguf { "hf4".into() } else { "mq4".into() });
@@ -6776,7 +6782,7 @@ fn quantize_command(paths: &Paths, mut args: QuantizeArgs) -> Result<()> {
     Ok(())
 }
 
-// lifecycle: deprecated since 0.4.0, removal 0.5.0
+// lifecycle: deprecated since 0.4.0, removal 0.5.0 — CASK/TriAttention KV eviction is unsupported research; use compact kv_cache modes
 fn sidecar_command(paths: &Paths, args: SidecarArgs) -> Result<()> {
     eprintln!("warning: CASK is deprecated and will be removed in 0.5.0; not supported (sidecar-gen)");
     if !(1..=1_000_000).contains(&args.max_tokens) {

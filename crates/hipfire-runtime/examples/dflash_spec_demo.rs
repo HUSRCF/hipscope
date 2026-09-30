@@ -556,7 +556,9 @@ fn main() {
                 prompt_file = Some(args[i + 1].clone());
                 i += 2;
             }
+            // lifecycle: deprecated since 0.4.0, removal 0.5.0 — PFlash is unsupported research; prefix caching supersedes it
             "--pflash" => {
+                eprintln!("warning: PFlash is deprecated and will be removed in 0.5.0; not supported (--pflash)");
                 pflash_path = Some(args[i + 1].clone());
                 i += 2;
             }
@@ -728,7 +730,7 @@ fn main() {
                 }
                 i += 2;
             }
-            // lifecycle: deprecated since 0.4.0, removal 0.5.0
+            // lifecycle: deprecated since 0.4.0, removal 0.5.0 — CASK/TriAttention KV eviction is unsupported research; use compact kv_cache modes
             "--cask-sidecar" => {
                 cask_sidecar = Some(args[i + 1].clone());
                 i += 2;

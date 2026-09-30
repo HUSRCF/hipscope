@@ -31,16 +31,18 @@ use hipfire_quantize::safetensors_file::{SafetensorsFile, TensorMeta};
 #[command(
     name = "hipfire-quantize",
     version,
-    about = "Quantize Hugging Face safetensors or GGUF weights into Hipfire HFQ"
+    about = "Quantize Hugging Face safetensors (or deprecated GGUF weights) into Hipfire HFQ"
 )]
 pub(crate) struct QuantizeArgs {
-    /// Hugging Face model directory, model ID, or GGUF file. Not used by
+    /// Hugging Face model directory or model ID. A GGUF weight file is
+    /// deprecated (removal in 0.5.0): GGUF→mqN is lossy double quantization; use llama.cpp for GGUF. Not used by
     /// `--flux-pipe`, which names its own input.
     #[arg(
         long,
         value_name = "PATH_OR_MODEL_ID",
         required_unless_present = "flux_pipe"
     )]
+    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — GGUF→mqN is lossy double quantization; use llama.cpp for GGUF (GGUF weight input only; imatrix.gguf stays)
     pub input: Option<String>,
 
     /// Destination HFQ file.

@@ -103,10 +103,11 @@ pub const KNOBS: &[KnobInfo] = &[
             ("fwht4", "4-bit FWHT-rotated K + Q8 V. DFlash-safe."),
             ("fwht3", "3-bit FWHT-rotated, ~5.5x. Best compressed-yet-DFlash-safe."),
             ("fwht2", "2-bit FWHT. Smallest; for genuinely tight VRAM."),
-            ("asym4", "4-bit Givens basis. Legacy; degrades DFlash acceptance."),
-            ("asym3", "3-bit Givens. Legacy; avoid with DFlash."),
-            ("asym2", "2-bit Givens. Legacy; smallest + lowest quality."),
-            ("turbo / turbo2-4", "Legacy aliases for the asym tiers."),
+            // lifecycle: deprecated since 0.4.0, removal 0.5.0 — Givens asym KV and the asymN/turboN aliases are superseded by fwht3
+            ("asym4", "Deprecated (removal in 0.5.0): 4-bit Givens-era name; use fwht4."),
+            ("asym3", "Deprecated (removal in 0.5.0): 3-bit Givens-era name; use fwht3."),
+            ("asym2", "Deprecated (removal in 0.5.0): 2-bit Givens-era name; use fwht2."),
+            ("turbo / turbo2-4", "Deprecated (removal in 0.5.0) aliases; use fwhtN."),
         ],
     },
     KnobInfo {
@@ -187,13 +188,14 @@ pub const KNOBS: &[KnobInfo] = &[
             ("uncapped", "0 = no limit — model reasons until it stops (watch latency)."),
         ],
     },
+    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — PFlash is unsupported research; prefix caching supersedes it
     KnobInfo {
         key: "prefill_compression",
-        title: "Prefill compression (pflash)",
+        title: "Prefill compression (PFlash, deprecated, removal in 0.5.0)",
         summary: "Compresses a long prompt's KV during prefill using a drafter's importance scoring.",
         effect: "Cuts prefill time and KV footprint on long prompts. Costs a little quality on what it drops, and does nothing without a drafter.",
         default: "off",
-        when: "auto = compress only past prefill_threshold tokens; always = every prefill; off = never.",
+        when: "Leave off. PFlash is deprecated (removal in 0.5.0) and not supported; prefix caching supersedes it. auto = compress only past prefill_threshold tokens; always = every prefill; off = never.",
         note: Some("Needs a prefill_drafter (.hfq path). With no drafter set, compression is disabled — the TUI warns when you turn it on."),
         options: &[
             ("off", "Never compress the prefill KV."),
@@ -201,9 +203,10 @@ pub const KNOBS: &[KnobInfo] = &[
             ("always", "Compress every eligible prefill (skips the threshold gate). Still bypassed without a drafter and on the DFlash/tool-call paths."),
         ],
     },
+    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — PFlash is unsupported research; prefix caching supersedes it
     KnobInfo {
         key: "prefill_drafter",
-        title: "Prefill drafter",
+        title: "Prefill drafter (PFlash, deprecated)",
         summary: "Path to the small drafter model (.hfq) that scores prompt importance for pflash.",
         effect: "Required for prefill_compression to engage. Empty disables compression entirely.",
         default: "",
@@ -211,9 +214,10 @@ pub const KNOBS: &[KnobInfo] = &[
         note: Some("An empty drafter disables prefill_compression regardless of its setting (the TUI warns when you enable compression without one)."),
         options: &[],
     },
+    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — PFlash is unsupported research; prefix caching supersedes it
     KnobInfo {
         key: "prefill_threshold",
-        title: "Prefill threshold",
+        title: "Prefill threshold (PFlash, deprecated)",
         summary: "Token count above which auto-mode prefill compression kicks in.",
         effect: "Higher = only very long prompts compress; lower = compress sooner. Only relevant when prefill_compression=auto.",
         default: "32768",
@@ -273,7 +277,7 @@ pub const KNOBS: &[KnobInfo] = &[
             ("auto", "Screen on the supported arches (gfx906 + RDNA3/3.5) when MMQ is active."),
         ],
     },
-    // lifecycle: deprecated since 0.4.0, removal 0.5.0
+    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — CASK/TriAttention KV eviction is unsupported research; use compact kv_cache modes
     KnobInfo {
         key: "cask",
         title: "CASK (deprecated, removal in 0.5.0)",

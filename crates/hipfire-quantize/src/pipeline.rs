@@ -1737,7 +1737,9 @@ pub(crate) fn run() {
     // with no quality benefit.
     {
         let raw_input = Path::new(input_dir);
+        // lifecycle: deprecated since 0.4.0, removal 0.5.0 — GGUF→mqN is lossy double quantization; use llama.cpp for GGUF
         if is_gguf_input(raw_input) {
+            eprintln!("warning: GGUF weight input is deprecated and will be removed in 0.5.0; GGUF→mqN is lossy double quantization; use llama.cpp for GGUF (imatrix.gguf input stays supported)");
             let gguf_format = GgufFormat::from_flag(format).unwrap_or_else(|| {
                 eprintln!(
                     "GGUF input: --format '{format}' not recognized. \

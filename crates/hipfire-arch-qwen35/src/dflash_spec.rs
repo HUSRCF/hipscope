@@ -129,6 +129,23 @@ impl DflashState {
 /// (legacy uncapped behaviour); any other value overrides the ceiling.
 pub const DEFAULT_DFLASH_CTX_CAP: usize = 8192;
 
+// lifecycle: deprecated since 0.4.0, removal 0.5.0 — legacy contiguous DFlash opt-in knobs; the draft-declared window supersedes them
+/// One warning line when an operator opts into legacy contiguous DFlash
+/// (`HIPFIRE_DFLASH_WINDOW=0`) or overrides its draft cap
+/// (`HIPFIRE_DFLASH_CTX_CAP`). Silent when neither knob is set.
+fn warn_deprecated_legacy_dflash_knobs() {
+    let window_zero = hipfire_config::developer_var("HIPFIRE_DFLASH_WINDOW")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        == Some(0);
+    let ctx_cap = hipfire_config::developer_var("HIPFIRE_DFLASH_CTX_CAP").is_ok();
+    if window_zero || ctx_cap {
+        eprintln!(
+            "  warning: HIPFIRE_DFLASH_WINDOW=0 / HIPFIRE_DFLASH_CTX_CAP (legacy contiguous DFlash) are deprecated and will be removed in 0.5.0; use the draft-declared window"
+        );
+    }
+}
+
 pub fn load_dflash_state(
     draft_path: &str,
     ctx_capacity: usize,
@@ -177,6 +194,7 @@ pub fn load_dflash_state(
     //   HIPFIRE_DFLASH_WINDOW=<rows>  explicit override (warns on mismatch)
     //   HIPFIRE_DFLASH_WINDOW=0       explicit Legacy (cap + AR fallback)
     //   unset                         draft-declared window, else Legacy
+    warn_deprecated_legacy_dflash_knobs();
     let window = match hipfire_config::developer_var("HIPFIRE_DFLASH_WINDOW")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
@@ -1467,6 +1485,7 @@ pub fn load_dflash_speculator_dense_tp2(
     // Window posture mirrors `load_dflash_state` (declared window by default,
     // explicit override or Legacy opt-out via HIPFIRE_DFLASH_WINDOW). Mesh
     // loads never enable eviction, so no ring-aware refusal applies here.
+    warn_deprecated_legacy_dflash_knobs();
     let window = match hipfire_config::developer_var("HIPFIRE_DFLASH_WINDOW")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())

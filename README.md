@@ -233,7 +233,8 @@ roughly doubles the superseded MQ2-Lloyd row below it; benchmark against MQ2R,
 not the Lloyd figure. TP3 trades ~2% decode for ~24% faster prefill (481 vs
 389 tok/s) and leaves a fourth card free.
 
-PFlash (prefill compression) is retained legacy research, off by default.
+PFlash (prefill compression) is deprecated and will be removed in 0.5.0: off
+by default, not supported; enabling it prints a deprecation warning.
 CASK / TriAttention KV eviction is deprecated and will be removed in 0.5.0:
 off by default, not supported, and not a recommended setting; loading with a
 CASK option prints a deprecation warning.
@@ -356,7 +357,7 @@ the prefill MMQ redesign log is at
 | [NIXOS.md](docs/NIXOS.md) | NixOS flake, module, dev shell |
 | [CLI.md](docs/CLI.md) | Every subcommand, flags, file locations |
 | [MODELS.md](docs/MODELS.md) | Curated tags, BYO models, file extensions |
-| [QUANTIZE.md](docs/QUANTIZE.md) | `hipfire quantize` for HF / safetensors / GGUF |
+| [QUANTIZE.md](docs/QUANTIZE.md) | `hipfire quantize` for HF / safetensors (GGUF input deprecated) |
 | [CONFIG.md](docs/CONFIG.md) | Every config key and env override |
 | [SERVE.md](docs/SERVE.md) | OpenAI-compatible HTTP API |
 | [IMAGEGEN.md](docs/IMAGEGEN.md) | FLUX.1 / FLUX.2 Klein image generation — local test guide |
