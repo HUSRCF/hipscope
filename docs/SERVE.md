@@ -154,7 +154,7 @@ through to per-model / registry / daemon defaults when omitted):
 | `seed` | OpenAI-compatible deterministic-sampling seed: non-negative integer (≤ u64::MAX). Same seed + same request → same output; `null`/omitted = fresh entropy per request; negative/fractional/non-integer → 400-style error, never silently unseeded. Best-effort like OpenAI: other sampling params and prompt must also match |
 | `presence_penalty`, `frequency_penalty` | Forwarded natively to the daemon (≥ 0); `presence_penalty` also inherits per-model / registry defaults |
 | `max_tokens` | Generation cap |
-| `stop` | Up to 4 strings, each ≤ 64 chars |
+| `stop` | A string or an array of up to 4 strings, each ≤ 64 characters; any other value is a 400. Matched on the answer only (never inside reasoning), and the stop text is not returned. Honoured on the Qwen3.5-family routes (`qwen_ar`, `qwen_dflash`, which covers MTP); every other route answers 400 instead of ignoring it |
 | `tools` | Tool definitions (with structured `messages` when Jinja chat is on) |
 | `chat_template_kwargs.enable_thinking` | Mode axis. `false` forces a no-think turn (Qwen native empty closed think). Independent of effort and cap. |
 | `chat_template_kwargs.preserve_thinking` | Keep `<think>` in final non-stream content |
@@ -285,7 +285,9 @@ curl -s http://127.0.0.1:11435/v1/chat/completions -H 'Content-Type: application
 
 When `messages` contains no `system` or `developer` role, the serve layer inserts `prompt.system` from a per-model TOML override or the registry card's `recommended_settings.system_prompt`. A client-supplied system/developer message always wins.
 
-`finish_reason` values emitted to clients: `stop`, `length`, `tool_calls`.
+`finish_reason` values emitted to clients: `stop`, `length`, `tool_calls`. A
+turn that runs out of `max_tokens` while still reasoning ends with `length`:
+the partial `reasoning_content` is returned and `content` is empty.
 
 Prefix-cache capable arches (daemon `cache_capable`, or arch allowlist
 `deepseek4` / `qwen3_5` / `qwen3_5_moe`) skip per-request `reset` so multi-turn

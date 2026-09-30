@@ -39,6 +39,7 @@ use hipfire_runtime::spec::{
     accept_greedy_prefix, ClientEvent, EvictRetain, FinishSummary, SpecRequestConfig, SpecTarget,
     Speculator, StopReason,
 };
+use hipfire_runtime::tokenizer::TokenTextStream;
 
 pub fn glimmer_turn_key(fp: u64, ordinal: usize) -> u64 {
     fp.wrapping_add((ordinal as u64).wrapping_mul(0x9E3779B97F4A7C15))
@@ -80,6 +81,40 @@ pub fn emit_active_attempt_error(
         rolled_back,
         attempt_id,
     );
+}
+
+/// Emit one plain `token` event on a legacy-contract route. Skips the empty
+/// fragment a [`TokenTextStream`] returns while a character is still split.
+pub fn emit_dense_token_text(stdout: &mut impl std::io::Write, id: &str, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    let envelope = serde_json::json!({
+        "type": "token",
+        "id": id,
+        "text": text,
+        "attempt_id": active_attempt_id(),
+    });
+    let _ = writeln!(stdout, "{envelope}");
+    let _ = stdout.flush();
+}
+
+/// Cohere AR token event; `reasoning` tags the thinking channel.
+fn emit_cohere_token(stdout: &mut impl std::io::Write, id: &str, text: &str, reasoning: bool) {
+    if text.is_empty() {
+        return;
+    }
+    let mut envelope = serde_json::json!({
+        "type": "token",
+        "id": id,
+        "text": text,
+        "attempt_id": active_attempt_id(),
+    });
+    if reasoning {
+        envelope["reasoning"] = serde_json::json!(true);
+    }
+    let _ = writeln!(stdout, "{envelope}");
+    let _ = stdout.flush();
 }
 
 /// Fail-closed operation-failure terminal for the dense AR family (G4.10).
@@ -1309,6 +1344,9 @@ pub fn generate_deepseek4(
                 &mut dsml_malformed,
             );
         };
+        // Multi-byte characters span tokens: decode incrementally so the
+        // parser (and the client) never sees half a code point as U+FFFD.
+        let mut text_stream = TokenTextStream::new();
 
         while generated_count < max_tokens && next_tok != eos_tok {
             if check_abort(id) {
@@ -1326,7 +1364,7 @@ pub fn generate_deepseek4(
                 );
                 return;
             }
-            let frag = tokenizer.decode(&[next_tok]);
+            let frag = text_stream.push(tokenizer, next_tok);
             for ev in parser.feed(&frag) {
                 absorb_event(&ev);
                 emit_stream_event(stdout, id, ev);
@@ -1341,7 +1379,8 @@ pub fn generate_deepseek4(
             let _ = stdout.flush();
             m.conversation_tokens.push(next_tok);
             if grammar_active {
-                matcher.advance(&frag);
+                // Grammar masks come from per-token decoded text; advance on the same.
+                matcher.advance(&tokenizer.decode(&[next_tok]));
             }
             generated_count += 1;
             match deepseek4::forward::decode_step_with_graph(
@@ -1369,7 +1408,7 @@ pub fn generate_deepseek4(
             }
         }
         // Flush any buffered partial markers / content.
-        for ev in parser.finish() {
+        for ev in parser.feed(&text_stream.flush()).into_iter().chain(parser.finish()) {
             absorb_event(&ev);
             emit_stream_event(stdout, id, ev);
         }
@@ -1753,9 +1792,10 @@ pub fn generate_deepseek4_heterogeneous(
     let mut emit_text_buf = String::new();
     let mut emit_tool_calls_buf = Vec::new();
     let mut dsml_malformed = None;
+    let mut text_stream = TokenTextStream::new();
 
     while generated < max_tokens && next_tok != eos_tok {
-        let fragment = tokenizer.decode(&[next_tok]);
+        let fragment = text_stream.push(tokenizer, next_tok);
         for event in parser.feed(&fragment) {
             ds4_absorb_stream_event(
                 &event,
@@ -1830,7 +1870,7 @@ pub fn generate_deepseek4_heterogeneous(
         }
         next_tok = deepseek4::sampling::sample_token(&logits, temp, top_k, top_p, &mut rng);
     }
-    for event in parser.finish() {
+    for event in parser.feed(&text_stream.flush()).into_iter().chain(parser.finish()) {
         ds4_absorb_stream_event(
             &event,
             &mut emit_text_buf,
@@ -2344,6 +2384,7 @@ pub fn generate_gemma4_lowered(
     let mut generated = 0usize;
     let mut ttft_ms = None;
     let decode_t0 = Instant::now();
+    let mut text_stream = TokenTextStream::new();
 
     while generated < max_tokens {
         let next = unsafe {
@@ -2364,7 +2405,7 @@ pub fn generate_gemma4_lowered(
         if ttft_ms.is_none() {
             ttft_ms = Some(t0.elapsed().as_secs_f64() * 1000.0);
         }
-        let frag = m.tokenizer.as_ref().unwrap().decode(&[next]);
+        let frag = text_stream.push(m.tokenizer.as_ref().unwrap(), next);
         let host_logits = if logprobs_top_k.is_some() {
             unsafe { gpu.download_f32(&(*bundle).scratch.logits).ok() }
         } else {
@@ -2419,7 +2460,8 @@ pub fn generate_gemma4_lowered(
         }
         m.seq_pos += 1;
     }
-    for event in router.flush() {
+    let tail = text_stream.flush();
+    for event in router.push(&tail).0.into_iter().chain(router.flush()) {
         match event {
             GemmaEmit::Reasoning(text) => emit_reasoning_token(stdout, id, &text),
             GemmaEmit::Token(text) => emit_visible_token(stdout, id, &text),
@@ -2674,6 +2716,8 @@ pub fn generate_gemma4(
     }
     let prefill_ms = t0.elapsed().as_millis();
     let mut gemma_router = GemmaThoughtRouter::new(enable_thinking, max_think_tokens);
+    // Multi-byte characters span tokens: decode incrementally, never per token.
+    let mut text_stream = TokenTextStream::new();
 
     // ── EAGLE spec-decode fast path (arch-22 drafter loaded; greedy only) ──
     //
@@ -2795,10 +2839,7 @@ pub fn generate_gemma4(
                 if ttft_ms.is_none() {
                     ttft_ms = Some(t0.elapsed().as_secs_f64() * 1000.0);
                 }
-                let frag = {
-                    let tokenizer = m.tokenizer.as_ref().unwrap();
-                    tokenizer.decode(&[t])
-                };
+                let frag = text_stream.push(m.tokenizer.as_ref().unwrap(), t);
                 let (emits, _) = gemma_router.push(&frag);
                 for ev in emits {
                     match ev {
@@ -2821,6 +2862,12 @@ pub fn generate_gemma4(
             // to emitted extent.
             if stop {
                 break;
+            }
+        }
+        for ev in gemma_router.push(&text_stream.flush()).0 {
+            match ev {
+                GemmaEmit::Reasoning(text) => emit_reasoning_token(stdout, id, &text),
+                GemmaEmit::Token(text) => emit_visible_token(stdout, id, &text),
             }
         }
 
@@ -2912,10 +2959,7 @@ pub fn generate_gemma4(
             ttft_ms = Some(t0.elapsed().as_secs_f64() * 1000.0);
         }
 
-        let frag = {
-            let tokenizer = m.tokenizer.as_ref().unwrap();
-            tokenizer.decode(&[next_tok])
-        };
+        let frag = text_stream.push(m.tokenizer.as_ref().unwrap(), next_tok);
         let (emits, _) = gemma_router.push(&frag);
         for ev in emits {
             match ev {
@@ -2968,7 +3012,8 @@ pub fn generate_gemma4(
             }
         }
     }
-    for ev in gemma_router.flush() {
+    let tail = text_stream.flush();
+    for ev in gemma_router.push(&tail).0.into_iter().chain(gemma_router.flush()) {
         match ev {
             GemmaEmit::Reasoning(text) => emit_reasoning_token(stdout, id, &text),
             GemmaEmit::Token(text) => {
@@ -5406,6 +5451,8 @@ pub fn generate_muse_glimmer(
     let mut generated_count: usize = 0;
     let decode_t0 = Instant::now();
     let mut harmony_router = GlimmerHarmonyRouter::new(max_think_tokens);
+    // Multi-byte characters span tokens: decode incrementally, never per token.
+    let mut text_stream = TokenTextStream::new();
     let mut glimmer_recorder = GlimmerChannelRecorder::new();
     let mut glimmer_emitted_ids: Vec<u32> = Vec::new();
     let mut glimmer_visible_acc: String = String::new();
@@ -5519,7 +5566,7 @@ pub fn generate_muse_glimmer(
         // commit the stop token into KV/capture — fall through to shared post-spec finalization.
         let mut skip_spec_loop = false;
         if !stop_set.contains(&last_pick) && generated_count < max_tokens {
-            let frag = m.tokenizer.as_ref().unwrap().decode(&[last_pick]);
+            let frag = text_stream.push(m.tokenizer.as_ref().unwrap(), last_pick);
             // Feed through harmony router; header fragments produce no visible event
             let (events, should_stop_seed) = harmony_router.push(&frag);
             for ev in events {
@@ -5818,7 +5865,7 @@ pub fn generate_muse_glimmer(
                                 last_pick = next_tok;
                                 break;
                             }
-                            let frag = m.tokenizer.as_ref().unwrap().decode(&[next_tok]);
+                            let frag = text_stream.push(m.tokenizer.as_ref().unwrap(), next_tok);
                             let (events, should_stop_fb) = harmony_router.push(&frag);
                             for ev in events {
                                 match ev {
@@ -6176,7 +6223,7 @@ pub fn generate_muse_glimmer(
                         break;
                     }
                     if stop_set.contains(&tok) {
-                        let frag = m.tokenizer.as_ref().unwrap().decode(&[tok]);
+                        let frag = text_stream.push(m.tokenizer.as_ref().unwrap(), tok);
                         let (events, _) = harmony_router.push(&frag);
                         for ev in events {
                             match ev {
@@ -6203,7 +6250,7 @@ pub fn generate_muse_glimmer(
                         should_stop_block = true;
                         break;
                     }
-                    let frag = m.tokenizer.as_ref().unwrap().decode(&[tok]);
+                    let frag = text_stream.push(m.tokenizer.as_ref().unwrap(), tok);
                     let (events, should_stop) = harmony_router.push(&frag);
                     for ev in events {
                         match ev {
@@ -6372,7 +6419,7 @@ pub fn generate_muse_glimmer(
                             if generated_count >= max_tokens {
                                 break;
                             }
-                            let frag = m.tokenizer.as_ref().unwrap().decode(&[pred]);
+                            let frag = text_stream.push(m.tokenizer.as_ref().unwrap(), pred);
                             let (events, should_stop_pred) = harmony_router.push(&frag);
                             for ev in events {
                                 match ev {
@@ -6472,7 +6519,7 @@ pub fn generate_muse_glimmer(
             // eos/eot always stop; eom is handled via router text marker
             if stop_set.contains(&next_tok) {
                 // Flush any pending via router marker path then stop
-                let frag = m.tokenizer.as_ref().unwrap().decode(&[next_tok]);
+                let frag = text_stream.push(m.tokenizer.as_ref().unwrap(), next_tok);
                 let (events, _) = harmony_router.push(&frag);
                 for ev in events {
                     match ev {
@@ -6494,10 +6541,7 @@ pub fn generate_muse_glimmer(
                 break;
             }
 
-            let frag = {
-                let tokenizer = m.tokenizer.as_ref().unwrap();
-                tokenizer.decode(&[next_tok])
-            };
+            let frag = text_stream.push(m.tokenizer.as_ref().unwrap(), next_tok);
             let (events, should_stop) = harmony_router.push(&frag);
             for ev in events {
                 match ev {
@@ -6554,7 +6598,8 @@ pub fn generate_muse_glimmer(
             }
         }
         // Flush any trailing incomplete channel text
-        for ev in harmony_router.flush() {
+        let tail = text_stream.flush();
+        for ev in harmony_router.push(&tail).0.into_iter().chain(harmony_router.flush()) {
             match ev {
                 GlimmerEmit::Reasoning(text) => emit_reasoning_token(stdout, id, &text),
                 GlimmerEmit::Token(text) => emit_visible_token(stdout, id, &text),
@@ -6993,6 +7038,8 @@ pub fn generate_lfm2moe(
 
     let mut generated_count: usize = 0;
     let decode_t0 = Instant::now();
+    // Multi-byte characters span tokens: decode incrementally, never per token.
+    let mut text_stream = TokenTextStream::new();
     loop {
         if check_abort(id) {
             let ep = production_fail_closed_rollback(m, gpu, None, None);
@@ -7007,27 +7054,20 @@ pub fn generate_lfm2moe(
             break;
         }
 
-        let frag = {
-            let tokenizer = m.tokenizer.as_ref().unwrap();
-            tokenizer.decode(&[next_tok])
-        };
+        let tokenizer = m.tokenizer.as_ref().unwrap();
         // String-level EOS-class guard. The id-based `stop_toks` above misses
         // `<|endoftext|>` because encoding the literal STRING doesn't round-trip
         // to the special-token id (it yields subwords), so the real token id is
-        // never in the set. The daemon decodes one token at a time, so the
-        // leaking turn-end token arrives as its own frag — catch it on the
-        // decoded text and stop WITHOUT emitting (was: "...Paris.<|endoftext|>").
-        if matches!(frag.trim(), "<|endoftext|>" | "</s>" | "<|im_end|>") {
+        // never in the set. The leaking turn-end token decodes on its own to the
+        // marker: catch it on the token's own text and stop WITHOUT emitting
+        // (was: "...Paris.<|endoftext|>").
+        if matches!(
+            tokenizer.decode(&[next_tok]).trim(),
+            "<|endoftext|>" | "</s>" | "<|im_end|>"
+        ) {
             break;
         }
-        let envelope = serde_json::json!({
-            "type": "token",
-            "id": id,
-            "text": frag,
-            "attempt_id": active_attempt_id(),
-        });
-        let _ = writeln!(stdout, "{}", envelope);
-        let _ = stdout.flush();
+        emit_dense_token_text(stdout, id, &text_stream.push(tokenizer, next_tok));
         m.conversation_tokens.push(next_tok);
         generated_count += 1;
 
@@ -7061,6 +7101,7 @@ pub fn generate_lfm2moe(
             return;
         }
     }
+    emit_dense_token_text(stdout, id, &text_stream.flush());
 
     // Abort latched between loop exit and commit must not proceed to the
     // two-phase commit handshake — emit the attested `aborted` terminal
@@ -7489,6 +7530,7 @@ pub fn generate_minimax(
 
     let mut generated_count: usize = 0;
     let decode_t0 = Instant::now();
+    let mut text_stream = TokenTextStream::new();
     loop {
         // Decode-side abort check: a mid-decode client cancel stops the loop
         // immediately instead of running the full `max_tokens` of wasted work.
@@ -7506,20 +7548,9 @@ pub fn generate_minimax(
             break;
         }
 
-        // Emit the text fragment. Build through serde_json so a user-supplied
-        // `id` or arbitrary-UTF-8 fragment can't corrupt the JSONL line.
-        let frag = {
-            let tokenizer = m.tokenizer.as_ref().unwrap();
-            tokenizer.decode(&[next_tok])
-        };
-        let envelope = serde_json::json!({
-            "type": "token",
-            "id": id,
-            "text": frag,
-            "attempt_id": active_attempt_id(),
-        });
-        let _ = writeln!(stdout, "{}", envelope);
-        let _ = stdout.flush();
+        // Emit the text this token completed (multi-byte characters span tokens).
+        let frag = text_stream.push(m.tokenizer.as_ref().unwrap(), next_tok);
+        emit_dense_token_text(stdout, id, &frag);
         m.conversation_tokens.push(next_tok);
         generated_count += 1;
 
@@ -7557,6 +7588,7 @@ pub fn generate_minimax(
             return;
         }
     }
+    emit_dense_token_text(stdout, id, &text_stream.flush());
 
     m.seq_pos = m.minimax().unwrap().state.n_tokens;
 
@@ -8080,6 +8112,7 @@ pub fn generate_cohere2moe(
 
     let mut generated_count: usize = 0;
     let decode_t0 = Instant::now();
+    let mut text_stream = TokenTextStream::new();
     loop {
         // Decode-side abort check: a mid-decode client cancel stops the loop
         // immediately instead of running the full `max_tokens` of wasted work.
@@ -8215,12 +8248,7 @@ pub fn generate_cohere2moe(
             }
             sec = Sec::Pre;
         } else {
-            // Build the fragment through serde_json so arbitrary UTF-8 can't
-            // corrupt the JSONL line.
-            let frag = {
-                let tokenizer = m.tokenizer.as_ref().unwrap();
-                tokenizer.decode(&[next_tok])
-            };
+            let tokenizer = m.tokenizer.as_ref().unwrap();
             // Defense-in-depth: never emit a Cohere structural marker into
             // visible output / the action buffer. The ID state machine above
             // handles the 6 THINKING/TEXT/ACTION markers; this catches any OTHER
@@ -8228,36 +8256,31 @@ pub fn generate_cohere2moe(
             // CHATBOT_TOKEN, START_TOOL_RESULT, …) — each decodes to a full
             // `<|MARKER|>`. The token is still fed to decode_step below; only its
             // emit is dropped, so a state-machine miss can never leak a marker.
-            let is_marker = frag.len() > 4
-                && frag.starts_with("<|")
-                && frag.ends_with("|>")
-                && frag[2..frag.len() - 2]
+            // Checked on the token's own text: a streamed fragment can also
+            // carry the tail of a preceding split character.
+            let own = tokenizer.decode(&[next_tok]);
+            let is_marker = own.len() > 4
+                && own.starts_with("<|")
+                && own.ends_with("|>")
+                && own[2..own.len() - 2]
                     .chars()
                     .all(|c| c.is_ascii_uppercase() || c == '_');
             if is_marker {
                 // suppressed
             } else {
+                // Multi-byte characters span tokens: emit only completed text.
+                let frag = text_stream.push(tokenizer, next_tok);
                 match sec {
                     Sec::Action => action_buf.push_str(&frag),
                     Sec::Think => {
                         // Reasoning channel: tagged so clients can fold it; the CLI
                         // (ignoring unknown fields) shows it inline.
-                        let _ = writeln!(
-                            stdout,
-                            "{}",
-                            serde_json::json!({"type": "token", "id": id, "text": frag, "reasoning": true, "attempt_id": active_attempt_id()})
-                        );
-                        let _ = stdout.flush();
+                        emit_cohere_token(stdout, id, &frag, true);
                         think_count += 1;
                     }
                     Sec::Text | Sec::Pre => {
                         vis_buf.push_str(&frag);
-                        let _ = writeln!(
-                            stdout,
-                            "{}",
-                            serde_json::json!({"type": "token", "id": id, "text": frag, "attempt_id": active_attempt_id()})
-                        );
-                        let _ = stdout.flush();
+                        emit_cohere_token(stdout, id, &frag, false);
                         emitted_visible = true;
                     }
                 }
@@ -8286,6 +8309,18 @@ pub fn generate_cohere2moe(
         if generated_count == 1 && take_generation_fault_after_first_decode() {
             dense_fail_closed_error(m, gpu, stdout, id, "injected fault after first decode");
             return;
+        }
+    }
+    // A turn cut mid-character keeps its last bytes (decoded lossily).
+    let tail = text_stream.flush();
+    if !tail.is_empty() {
+        match sec {
+            Sec::Action => action_buf.push_str(&tail),
+            Sec::Think => emit_cohere_token(stdout, id, &tail, true),
+            Sec::Text | Sec::Pre => {
+                vis_buf.push_str(&tail);
+                emit_cohere_token(stdout, id, &tail, false);
+            }
         }
     }
 
@@ -8560,6 +8595,7 @@ pub fn generate_qwen2(
             return;
         }
     };
+    let mut text_stream = TokenTextStream::new();
 
     loop {
         // Decode-side abort check: a mid-decode client cancel stops the loop
@@ -8575,21 +8611,9 @@ pub fn generate_qwen2(
         if eos_set.contains(&next_tok) {
             break;
         }
-        // Emit text fragment for this token. Tokenizer.decode handles
-        // BPE byte-fragment reassembly; for special tokens that decode
-        // to an empty string we still advance the loop. Build through
-        // serde_json so `id` (user-supplied) and `frag` (arbitrary
-        // UTF-8 with possible `"` / `\` / control chars) can't corrupt
-        // the JSONL line.
-        let frag = tokenizer.decode(&[next_tok]);
-        let envelope = serde_json::json!({
-            "type": "token",
-            "id": id,
-            "text": frag,
-            "attempt_id": active_attempt_id(),
-        });
-        let _ = writeln!(stdout, "{}", envelope);
-        let _ = stdout.flush();
+        // Emit the text this token completed: one emoji or CJK character is
+        // several byte-level tokens, so a per-token decode would send U+FFFD.
+        emit_dense_token_text(stdout, id, &text_stream.push(tokenizer, next_tok));
         m.conversation_tokens.push(next_tok);
         generated_count += 1;
 
@@ -8607,6 +8631,7 @@ pub fn generate_qwen2(
             return;
         }
     }
+    emit_dense_token_text(stdout, id, &text_stream.flush());
     // Daemon bookkeeping: seq_pos matches Qwen2State's internal cursor.
     m.seq_pos = state.next_pos;
 

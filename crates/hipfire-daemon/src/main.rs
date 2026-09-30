@@ -3051,24 +3051,11 @@ fn main() {
                         },
                         None => None,
                     };
-                // hunt3 M-F: parse user stop sequences (top-level `stop` field on
-                // the generate message; the CLI forwards OpenAI `stop` here, already
-                // normalized to string[], <=4 entries, <=64 chars each). The decode
-                // loops match these against the decoded output suffix and finish
-                // with finish_reason="stop" on a hit. Re-apply the cap defensively
-                // in case a non-hipfire client drives the daemon directly.
-                let stop_seqs: Vec<String> = msg
-                    .get("stop")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|s| s.as_str())
-                            .filter(|s| !s.is_empty())
-                            .take(4)
-                            .map(|s| s.chars().take(64).collect::<String>())
-                            .collect()
-                    })
-                    .unwrap_or_default();
+                // OpenAI `stop` (string or array form); an invalid value is rejected.
+                let Some(stop_seqs) = hipfire_generate::ar::stop_or_reject(&mut stdout, id, &msg)
+                else {
+                    continue;
+                };
 
                 // Sampling defaults differ by arch: qwen35 family was tuned
                 // at `temp=0.3, top_p=0.8` (DFlash-friendly, instruct-stable);

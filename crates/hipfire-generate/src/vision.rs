@@ -3526,6 +3526,7 @@ pub fn generate_lfm2_vl(
 
     let mut generated_count: usize = 0;
     let decode_t0 = Instant::now();
+    let mut text_stream = hipfire_runtime::tokenizer::TokenTextStream::new();
     loop {
         if check_abort(id) {
             eprintln!("[daemon/vl-lfm2] aborted mid-decode");
@@ -3539,21 +3540,16 @@ pub fn generate_lfm2_vl(
         if stop_toks.contains(&next_tok) {
             break;
         }
-        let frag = m.tokenizer.as_ref().unwrap().decode(&[next_tok]);
+        let tokenizer = m.tokenizer.as_ref().unwrap();
+        // Turn-end markers are checked on the token's own text.
         if matches!(
-            frag.trim(),
+            tokenizer.decode(&[next_tok]).trim(),
             "<|endoftext|>" | "</s>" | "<|im_end|>" | "<|startoftext|>"
         ) {
             break;
         }
-        let envelope = serde_json::json!({
-            "type": "token",
-            "id": id,
-            "text": frag,
-            "attempt_id": active_attempt_id(),
-        });
-        let _ = writeln!(stdout, "{}", envelope);
-        let _ = stdout.flush();
+        // Multi-byte characters span tokens: emit only completed text.
+        crate::dense::emit_dense_token_text(stdout, id, &text_stream.push(tokenizer, next_tok));
         m.conversation_tokens.push(next_tok);
         generated_count += 1;
 
@@ -3580,6 +3576,7 @@ pub fn generate_lfm2_vl(
             }
         }
     }
+    crate::dense::emit_dense_token_text(stdout, id, &text_stream.flush());
     let decode_ms = decode_t0.elapsed().as_millis().max(1);
 
     // Post-loop abort latch — MANDATORY before the two-phase commit
