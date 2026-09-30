@@ -1778,17 +1778,7 @@ fn main() {
                     .and_then(|v| v.as_u64())
                     .map(|value| value as usize)
                     .unwrap_or(hipfire_runtime::config::get().mtp_k);
-                // Qwen MTP head sidecar resolved by the CLI (models dir, then
-                // beside the path as typed, then beside the canonical trunk).
-                // The load path is canonical, so without this a sidecar beside
-                // a symlinked trunk is not found. Absent → the loader looks for
-                // `<trunk>.mtp`. `mtp_mode=off` never carries one.
-                let mtp_path: Option<std::path::PathBuf> = msg
-                    .get("params")
-                    .and_then(|p| p.get("mtp"))
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty() && mtp_mode != "off")
-                    .map(std::path::PathBuf::from);
+                let mtp_path = request_guards::mtp_sidecar_path(&msg, &mtp_mode);
 
                 // Model-free n-gram policy normally arrives as per-load params
                 // resolved by the CLI. Direct protocol clients inherit the
@@ -3111,10 +3101,7 @@ fn main() {
                     .get("max_tokens")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(4096) as usize;
-                // The client omitted max_tokens: routes fit this default to the
-                // context left after the prompt instead of refusing it.
-                let fit = msg.get("max_tokens_fit").and_then(|v| v.as_bool());
-                let _fit = hipfire_generate::common::FitMaxTokensGuard::set(fit == Some(true));
+                let _fit = request_guards::fit_max_tokens(&msg);
                 let top_p = msg
                     .get("top_p")
                     .and_then(|v| v.as_f64())
