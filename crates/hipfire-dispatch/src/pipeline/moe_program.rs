@@ -410,7 +410,7 @@ impl<'a> SealedMoeOp<'a> {
             return super::decode_input_basis_stage(gpu, params, selection.resolution);
         }
         let (params, selection) = self.state.prefill_parts()?;
-        if matches!(selection.route, Some(MoeRouteCapability::Qt44Qt53Grouped)) {
+        if selection.route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped) {
             return super::qt44_qt53_prefill::input_basis(
                 gpu,
                 params,
@@ -498,7 +498,7 @@ impl<'a> SealedMoeOp<'a> {
             }
             MoeProtocol::GroupedPrefill => {
                 let (params, selection) = self.state.prefill_parts()?;
-                if matches!(selection.route, Some(MoeRouteCapability::Qt44Qt53Grouped)) {
+                if selection.route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped) {
                     return super::qt44_qt53_prefill::router_projection(gpu, params);
                 }
                 let prelude = &params.prelude;
@@ -691,7 +691,7 @@ impl<'a> SealedMoeOp<'a> {
             );
         }
         let (params, selection) = self.state.prefill_parts()?;
-        if matches!(selection.route, Some(MoeRouteCapability::Qt44Qt53Grouped)) {
+        if selection.route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped) {
             return super::qt44_qt53_prefill::shared_gate_up(gpu, params);
         }
         super::prefill_shared_gate_up_stage(self.state.dispatch_ctx(), gpu, params)
@@ -717,7 +717,7 @@ impl<'a> SealedMoeOp<'a> {
             );
         }
         let (params, selection) = self.state.prefill_parts()?;
-        if matches!(selection.route, Some(MoeRouteCapability::Qt44Qt53Grouped)) {
+        if selection.route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped) {
             return super::qt44_qt53_prefill::shared_activation(
                 gpu,
                 params,
@@ -747,7 +747,7 @@ impl<'a> SealedMoeOp<'a> {
             );
         }
         let (params, selection) = self.state.prefill_parts()?;
-        if matches!(selection.route, Some(MoeRouteCapability::Qt44Qt53Grouped)) {
+        if selection.route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped) {
             return super::qt44_qt53_prefill::shared_down(gpu, params);
         }
         super::prefill_shared_down_stage(self.state.dispatch_ctx(), gpu, params)
@@ -761,7 +761,7 @@ impl<'a> SealedMoeOp<'a> {
                 "sealed moe: scatter is only valid for grouped prefill path 2".into(),
             ));
         }
-        if matches!(selection.route, Some(MoeRouteCapability::Qt44Qt53Grouped)) {
+        if selection.route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped) {
             return super::qt44_qt53_prefill::scatter(gpu, params, selection.path2_m_total);
         }
         super::prefill_scatter_stage(gpu, params, selection.path2_m_total)
@@ -784,7 +784,7 @@ impl<'a> SealedMoeOp<'a> {
             );
         }
         let (params, selection) = self.state.prefill_parts()?;
-        if matches!(selection.route, Some(MoeRouteCapability::Qt44Qt53Grouped)) {
+        if selection.route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped) {
             return super::qt44_qt53_prefill::gate_up(
                 gpu,
                 params,
@@ -808,7 +808,7 @@ impl<'a> SealedMoeOp<'a> {
                 "sealed moe: unscatter is only valid for grouped prefill path 2".into(),
             ));
         }
-        if matches!(selection.route, Some(MoeRouteCapability::Qt44Qt53Grouped)) {
+        if selection.route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped) {
             return super::qt44_qt53_prefill::unscatter(gpu, params, selection.path2_m_total);
         }
         super::prefill_gate_up_unscatter_stage(gpu, params, selection.path2_m_total)
@@ -825,7 +825,7 @@ impl<'a> SealedMoeOp<'a> {
             );
         }
         let (params, selection) = self.state.prefill_parts()?;
-        if matches!(selection.route, Some(MoeRouteCapability::Qt44Qt53Grouped)) {
+        if selection.route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped) {
             return super::qt44_qt53_prefill::activation(
                 gpu,
                 params,
@@ -856,7 +856,7 @@ impl<'a> SealedMoeOp<'a> {
             );
         }
         let (params, selection) = self.state.prefill_parts()?;
-        if matches!(selection.route, Some(MoeRouteCapability::Qt44Qt53Grouped)) {
+        if selection.route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped) {
             return super::qt44_qt53_prefill::down(
                 gpu,
                 params,
@@ -897,7 +897,7 @@ impl<'a> SealedMoeOp<'a> {
             );
         }
         let (params, selection) = self.state.prefill_parts()?;
-        if matches!(selection.route, Some(MoeRouteCapability::Qt44Qt53Grouped)) {
+        if selection.route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped) {
             return super::qt44_qt53_prefill::combine(
                 gpu,
                 params,
@@ -1013,7 +1013,7 @@ fn lower_decode<'a>(
         let combine_after_down = params.ep_mode
             != crate::families::moe::MoeEpMode::RootRoutedPartial
             && !selection.ninepath_d4
-            && (matches!(selection.route, Some(MoeRouteCapability::Qt44Qt53Grouped))
+            && (selection.route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped)
                 || !down_self_combines)
             && !params.defer_routed_combine;
         if combine_after_down {
@@ -1038,7 +1038,7 @@ fn lower_prefill<'a>(
     let mut steps = SmallVec::new();
     let op = |state: &'a MoeStepState<'a>| SealedMoeOp::new(state);
     append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Normalize))?;
-    if matches!(selection.route, Some(MoeRouteCapability::Qt44Qt53Grouped)) {
+    if selection.route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped) {
         append_step(&mut steps, Step::MoeStage(op(state), MoeStage::InputBasis))?;
         append_step(
             &mut steps,

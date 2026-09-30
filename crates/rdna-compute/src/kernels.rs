@@ -4111,6 +4111,27 @@ pub const MOE_SCATTER_FUSED_TOP10_SRC: &str = concat!(
     "#define moe_scatter_fused_k8 moe_scatter_fused_top10\n",
     include_str!("../../../kernels/src/qwen4_moe_scatter_fused_k8.hip")
 );
+/// Opt-in Qwen4 symmetric IU4 MoE route (fn-moe-sym, gfx1151 only), three
+/// separately named JIT modules; no incumbent module is extended.
+/// Grouped IU4 gate/up SwiGLU + down GEMMs and the per-header symmetric-grid
+/// checker. The shared `block_i4_128` prelude supplies the sidecar layout.
+pub const QWEN4_MOE_IU4_SYM_GFX1151_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    include_str!("../../../kernels/src/qwen4_moe_iu4_sym.gfx1151.hip")
+);
+/// Stable `(expert, flat_slot)` pad16 grouping in three launches, no atomics;
+/// the same six outputs as [`MOE_SCATTER_FUSED_TOP10_SRC`].
+pub const QWEN4_MOE_SCATTER_STABLE_TOP10_SRC: &str =
+    include_str!("../../../kernels/src/qwen4_moe_scatter_stable_top10.hip");
+/// Down A4 producer: grouped BF16 SwiGLU rows -> FWHT128 -> the shared
+/// `quantize_block_i4_128_wave<true>` (candidate set from the host flags,
+/// C2 by default) into a compact flat-slot `block_i4_128` sidecar.
+pub const QWEN4_MOE_ROTATE128_I4_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    include_str!("../../../kernels/src/qwen4_moe_rotate128_i4.hip")
+);
 /// Restore grouped path-2 down outputs to canonical flat `(token, k_rank)`
 /// slot order. Each rank runs this before EP contribution gathering; the root
 /// then uses the ordinary slot-order weighted combine.

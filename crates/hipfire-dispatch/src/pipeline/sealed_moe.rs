@@ -2076,7 +2076,7 @@ pub(super) fn produce_prefill_route<'a>(
                     "prefill softmax producer requires a 2-D [batch,n_experts] score view",
                 ));
             }
-            let grouped = matches!(route, Some(MoeRouteCapability::Qt44Qt53Grouped));
+            let grouped = route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped);
             // The grouped top-10 router rounds each logit it reads itself.
             if params.recipe.bf16_round_trip() && !grouped {
                 gpu.bf16_round_trip_f32(scores)
