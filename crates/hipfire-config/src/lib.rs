@@ -3120,6 +3120,14 @@ pub static FIELDS: &[ConfigField] = &[
         "PM4 register emission policy; static is the gfx12-safe product default and caches only queue-global invariants."
     ),
     diagnostic_field!(
+        "diagnostic.replay.pm4_kernarg_pool",
+        "replay_pm4_kernarg_pool",
+        DefaultValue::String("vram"),
+        ValueRule::Enum(&["vram", "host"]),
+        "HIPFIRE_PM4_KERNARG_POOL",
+        "Retained PM4 kernarg placement: vram (host-writable GPU-agent pool; host pool on small-BAR systems) or host (CPU-agent fine-grained pool)."
+    ),
+    diagnostic_field!(
         "diagnostic.replay.pm4_wait_policy",
         "replay_pm4_wait_policy",
         DefaultValue::String("resource"),

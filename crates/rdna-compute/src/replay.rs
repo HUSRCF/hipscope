@@ -2845,6 +2845,39 @@ fn gfx1151_entry_acquire_policy_from_value(
     }
 }
 
+/// Pool for retained PM4 kernarg segments.
+///
+/// Default `vram`: a host-writable GPU-agent pool. Kernels whose prologue
+/// chains dependent kernarg `s_load`s otherwise pay host-memory latency on
+/// every round (gfx1100 H2: 1.4-1.6 ms/token of in-IB span).
+/// `HIPFIRE_PM4_KERNARG_POOL=host` keeps the CPU-agent fine-grained pool, as
+/// do small-BAR systems. The host patches these segments between replays, so
+/// VRAM placement relies on the IB entry ACQUIRE_MEM invalidating GL2 and the
+/// scalar cache; a gfx1151 non-system entry acquire keeps the host pool.
+fn retained_kernarg_pool(
+    device: &GpuDevice,
+    host_pool: &KernargPool,
+    entry_acquire: Gfx11EntryAcquirePolicy,
+) -> KernargPool {
+    let requested = hipfire_config::process_value("HIPFIRE_PM4_KERNARG_POOL")
+        .unwrap_or_else(|| "vram".to_owned());
+    let fallback = if requested.eq_ignore_ascii_case("host") {
+        "HIPFIRE_PM4_KERNARG_POOL=host".to_owned()
+    } else if entry_acquire != Gfx11EntryAcquirePolicy::System {
+        format!("entry acquire {entry_acquire:?} does not invalidate GL2")
+    } else {
+        match KernargPool::discover_host_writable_device_local(device) {
+            Ok(pool) => {
+                eprintln!("[redline] retained PM4 kernargs: pool=vram");
+                return pool;
+            }
+            Err(error) => format!("fallback: {error}"),
+        }
+    };
+    eprintln!("[redline] retained PM4 kernargs: pool=host ({fallback})");
+    host_pool.clone()
+}
+
 impl Pm4WaitPolicy {
     fn from_value(value: &str) -> Option<Self> {
         match value.to_ascii_lowercase().as_str() {
@@ -4082,6 +4115,9 @@ pub struct PreparedPm4Replay {
     // programmed into the immutable indirect buffer.
     _kernels: Vec<Kernel>,
     kernargs: Vec<KernargBuffer>,
+    /// Last non-empty device-local kernarg segment; publishing it after the
+    /// per-replay patches makes every earlier BAR store GPU-visible.
+    kernarg_publish: Option<usize>,
     /// gfx1010 RELEASE_MEM/WAIT_REG_MEM fence word. Owned for the full
     /// executable lifetime of `graph` so the IB's absolute address stays valid
     /// through every replay; dropped only after queue quiescence via normal
@@ -4201,6 +4237,9 @@ impl PreparedPm4Replay {
                     error: error.to_string(),
                     quiescence: ReplayQuiescence::Proven,
                 })?;
+        }
+        if let Some(index) = self.kernarg_publish {
+            self.kernargs[index].publish_host_writes();
         }
         // SAFETY: forwarded from the caller that owns the model allocations.
         unsafe { self.graph.replay_and_wait_profiled_checked() }.map_err(|(error, quiescence)| {
@@ -4989,6 +5028,7 @@ impl ReplayController {
         let cu_mask = gfx1151_cu_mask(pm4_architecture, device.name());
         let entry_acquire_policy = gfx1151_entry_acquire_policy(pm4_architecture, device.name());
         let pool = KernargPool::discover(&device).map_err(|error| error.to_string())?;
+        let kernarg_pool = retained_kernarg_pool(&device, &pool, entry_acquire_policy);
         let mut executables = BTreeMap::<PathBuf, Executable>::new();
         let mut resolved = BTreeMap::<(PathBuf, String), Kernel>::new();
         let mut kernels = Vec::with_capacity(prefix);
@@ -5021,7 +5061,7 @@ impl ReplayController {
             }
             let kernel = resolved[&key].clone();
             let metadata = kernel.metadata();
-            let mut kernarg = pool
+            let mut kernarg = kernarg_pool
                 .allocate_for(metadata)
                 .map_err(|error| format!("allocate {symbol} kernarg: {error}"))?;
             // Slice 1: typed segments re-encode from `ReplayBindings` (byte-
@@ -5772,6 +5812,9 @@ impl ReplayController {
         self.prepared_pm4 = Some(PreparedPm4Replay {
             graph,
             _kernels: kernels,
+            kernarg_publish: kernargs
+                .iter()
+                .rposition(|kernarg| kernarg.is_device_local() && !kernarg.is_empty()),
             kernargs,
             _dependency_fence: dependency_fence,
             dynamic_gdn_frames,

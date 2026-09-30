@@ -926,6 +926,7 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_PFLASH_DRAFTER_KV` | crates/hipfire-arch-qwen35/src/pflash.rs |
 | `HIPFIRE_PFLASH_SCORE_LAYER` | crates/hipfire-arch-qwen35/src/pflash.rs |
 | `HIPFIRE_PFLASH_TARGET` | scripts/pflash-gate.sh |
+| `HIPFIRE_PM4_KERNARG_POOL` | crates/hipfire-config/src/lib.rs (`diagnostic.replay.pm4_kernarg_pool`), crates/rdna-compute/src/replay.rs |
 | `HIPFIRE_PORT` | crates/hipfire-config/src/lib.rs |
 | `HIPFIRE_POST_LATCH_ANSWER_TOKENS` | crates/hipfire-daemon/src/main.rs |
 | `HIPFIRE_PP_DFLASH` | crates/hipfire-daemon/src/main.rs |
