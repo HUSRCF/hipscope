@@ -12991,4 +12991,167 @@ mod tests {
             }
         }
     }
+
+    /// Raw `POST /v1/chat/completions` with `Connection: close`: status, the
+    /// lowercased response head, and the de-chunked body. Panics if a chunked
+    /// body ends without its terminating zero-size chunk (a torn stream).
+    #[cfg(unix)]
+    fn raw_chat_post(port: u16, body: &serde_json::Value) -> (u16, String, Vec<u8>) {
+        let payload = body.to_string();
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect serve");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("read timeout");
+        write!(
+            stream,
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{payload}",
+            payload.len()
+        )
+        .expect("write request");
+        let mut raw = Vec::new();
+        let _ = stream.read_to_end(&mut raw);
+        let split = raw
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("response head");
+        let head = String::from_utf8_lossy(&raw[..split]).to_ascii_lowercase();
+        let status = head
+            .split_whitespace()
+            .nth(1)
+            .and_then(|code| code.parse().ok())
+            .expect("status code");
+        let mut rest = &raw[split + 4..];
+        if !head.contains("transfer-encoding: chunked") {
+            return (status, head, rest.to_vec());
+        }
+        let mut body = Vec::new();
+        loop {
+            let line_end = rest
+                .windows(2)
+                .position(|w| w == b"\r\n")
+                .unwrap_or_else(|| {
+                    panic!(
+                        "torn chunked body after {:?}",
+                        String::from_utf8_lossy(&body)
+                    )
+                });
+            let size = usize::from_str_radix(
+                std::str::from_utf8(&rest[..line_end]).expect("chunk size"),
+                16,
+            )
+            .expect("chunk size hex");
+            rest = &rest[line_end + 2..];
+            if size == 0 {
+                return (status, head, body);
+            }
+            assert!(
+                rest.len() >= size + 2,
+                "torn chunked body after {:?}",
+                String::from_utf8_lossy(&body)
+            );
+            body.extend_from_slice(&rest[..size]);
+            rest = &rest[size + 2..];
+        }
+    }
+
+    /// `data:` payloads of an SSE body, in order.
+    #[cfg(unix)]
+    fn sse_payloads(body: &[u8]) -> Vec<String> {
+        String::from_utf8_lossy(body)
+            .split("\n\n")
+            .filter_map(|frame| frame.strip_prefix("data: "))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// Error status comes from the daemon's typed class, and a stream that
+    /// fails before its first frame is an ordinary JSON error, not a 200.
+    #[cfg(unix)]
+    #[test]
+    fn typed_errors_keep_their_status_stream_and_nonstream() {
+        let harness = Task11HttpHarness::spawn("error-status");
+        let port = harness.port();
+        for stream in [false, true] {
+            for (tag, status) in [
+                ("t15-class-validation", 400),
+                ("t15-class-context", 400),
+                ("t15-class-unsupported", 400),
+                ("t15-class-internal", 500),
+                ("t15-transient-always", 503),
+            ] {
+                let (got, head, body) = raw_chat_post(port, &harness.base_body(tag, stream));
+                assert_eq!(got, status, "{tag} stream={stream}: {head}");
+                assert!(
+                    head.contains("content-type: application/json"),
+                    "{tag}: {head}"
+                );
+                let err: serde_json::Value = serde_json::from_slice(&body)
+                    .unwrap_or_else(|e| panic!("{tag}: one JSON error body ({e}): {body:?}"));
+                assert!(
+                    err.pointer("/error/message")
+                        .and_then(|v| v.as_str())
+                        .is_some(),
+                    "{tag}: {err}"
+                );
+                assert_eq!(
+                    head.contains("retry-after: 1"),
+                    status == 503,
+                    "{tag}: Retry-After only on 503: {head}"
+                );
+            }
+            // Gateway validation (no daemon class) also fails before commit.
+            let mut body = harness.base_body("t11-stop-text", stream);
+            body["max_tokens"] = serde_json::json!(0);
+            let (got, _, raw) = raw_chat_post(port, &body);
+            assert_eq!(got, 400, "max_tokens=0 stream={stream}");
+            assert!(String::from_utf8_lossy(&raw).contains("max_tokens"));
+        }
+    }
+
+    /// A stream that fails after it committed ends with an OpenAI error event
+    /// and `[DONE]` inside a cleanly terminated body, never a torn one.
+    #[cfg(unix)]
+    #[test]
+    fn stream_failure_after_first_token_ends_with_error_event_and_done() {
+        let harness = Task11HttpHarness::spawn("midstream-error");
+        let port = harness.port();
+        let (status, _, body) = raw_chat_post(port, &harness.base_body("t15-visible-token", true));
+        assert_eq!(status, 200);
+        let payloads = sse_payloads(&body);
+        let [role, token, error, done] = payloads.as_slice() else {
+            panic!("role, token, error, [DONE] expected: {payloads:?}");
+        };
+        assert!(role.contains(r#""role":"assistant""#), "{role}");
+        assert!(token.contains("visible-before-fail"), "{token}");
+        let error: serde_json::Value = serde_json::from_str(error).expect("error event JSON");
+        assert_eq!(error["error"]["type"], "server_error", "{error}");
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("transient after visible token")),
+            "{error}"
+        );
+        assert_eq!(done, "[DONE]");
+
+        // The OpenAI-compatible client reports the server's message.
+        match capture_stream(port, harness.base_body("t15-visible-token", true)) {
+            Err(hipfire_client::ClientError::Http(message)) => {
+                assert!(
+                    message.contains("transient after visible token"),
+                    "{message}"
+                )
+            }
+            other => panic!("expected the stream's error event, got {other:?}"),
+        }
+
+        // Daemon death mid-stream is reported the same way.
+        let (status, _, body) = raw_chat_post(port, &harness.base_body("t11-premature-eof", true));
+        assert_eq!(status, 200);
+        let payloads = sse_payloads(&body);
+        assert!(payloads[1].contains("partial-before-eof"), "{payloads:?}");
+        assert!(payloads[2].contains(r#""error""#), "{payloads:?}");
+        assert_eq!(payloads.last().map(String::as_str), Some("[DONE]"));
+    }
 }

@@ -134,12 +134,19 @@ curl -N http://127.0.0.1:11435/v1/chat/completions \
 ```
 
 - **`stream: true`** (typical clients): SSE `data: {chat.completion.chunk}`
-  lines until `data: [DONE]`.
+  lines until `data: [DONE]`. The `200` and the role chunk go out when
+  generation sends its first frame, or after 15 s of silence (cold load, long
+  prefill), so a request that fails before then gets the same JSON error and
+  status as a non-stream request. A stream that fails after that ends with
+  `data: {"error": {"message", "type"}}` and then `data: [DONE]`.
 - **`stream: false` / omitted falsey:** single `chat.completion` JSON body.
 - Oversized body → **413** before the daemon lock (Content-Length or streamed
   cap at `max_request_bytes`).
 - Saturated admission queue → **503** with `Retry-After`.
 - Invalid JSON body → **400**.
+- Daemon errors map on their typed class: `validation`, `context_length`,
+  `unsupported` → **400**; `transient` → **503** with `Retry-After: 1`; any
+  other class → **500**. An unknown model → **404**.
 
 Request fields honored by the serve layer (non-exhaustive; sampling falls
 through to per-model / registry / daemon defaults when omitted):
