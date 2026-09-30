@@ -500,14 +500,20 @@ impl Carrier for Qwen4Carrier {
             let moved = residency::place_routed_experts(&mut manifest.weights, vram_layers);
             let host_bytes = residency::host_mapped_bytes(&manifest.weights, bytes_of)
                 .map_err(|error| format!("qwen4: {error}"))?;
-            residency::check_host_ram(host_bytes, rdna_compute::kv_slots::mem_available_bytes())
+            let mem_available = rdna_compute::kv_slots::mem_available_bytes();
+            let ttm_pool = residency::ttm_pool_estimate();
+            residency::check_host_ram(host_bytes, mem_available, ttm_pool)
                 .map_err(|error| format!("qwen4: {error}"))?;
             residency::check_gtt_cap(host_bytes, residency::gtt_budget())
                 .map_err(|error| format!("qwen4: {error}"))?;
+            let gib = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
             eprintln!(
-                "  qwen4 routed experts: layers 0..{} in VRAM, {moved} expert tensors ({:.1} GiB) in pinned host RAM",
+                "  qwen4 routed experts: layers 0..{} in VRAM, {moved} expert tensors ({:.1} GiB) in pinned host RAM \
+                 (MemAvailable {:.1} GiB + {:.1} GiB estimated in TTM's page pool)",
                 vram_layers.min(config.num_hidden_layers),
-                host_bytes as f64 / (1u64 << 30) as f64
+                gib(host_bytes),
+                gib(mem_available.unwrap_or(0)),
+                gib(ttm_pool)
             );
             if native_mtp && !crate::admission::qwen4_mtp_with_host_mapped_experts(ctx.spec, moved)
             {
