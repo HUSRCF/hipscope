@@ -5114,21 +5114,16 @@ fn open_bench_engine(
 
 /// The standard benchmark generate: greedy, fixed budget, and **answer mode**.
 ///
-/// Answer mode is the default rather than an opt-in because a benchmark that
-/// lets the model think cannot complete. A reasoning model (any Qwen3.6 SKU,
-/// for one) opens `<think>` within its first tokens and has no chance of
-/// closing it inside the benchmark's budget — 16 tokens for the warmup, 128
-/// for a measured run. The daemon ranks an unclosed think span at finish above
-/// the length cap in both terminal classifiers (`QwenArTerminalCause::resolve`
-/// and `qwen_dflash_wire_terminal`), so it reports the truncation as a
-/// non-retryable validation error rather than `finish_reason=length`. The
-/// benchmark then aborts on the warmup generate, before recording a sample.
+/// Answer mode is the default rather than an opt-in so every model runs the
+/// same turn shape. A reasoning model (any Qwen3.6 SKU, for one) opens
+/// `<think>` within its first tokens and would spend the benchmark's whole
+/// budget — 16 tokens for the warmup, 128 for a measured run — inside it,
+/// ending every sample mid-thought at `finish_reason=length`.
 ///
 /// Benchmarks measure tokens per second and never read the text, so asking for
-/// answer mode costs nothing and removes the dependency on the model finishing
-/// a thought inside an arbitrary budget. `--reasoning-on` restores the
-/// thinking turn for anyone who wants to measure that path — with a budget
-/// large enough to close the span.
+/// answer mode costs nothing and keeps the measured path independent of how
+/// long a model thinks. `--reasoning-on` restores the thinking turn for anyone
+/// who wants to measure that path.
 fn bench_generate_request(prompt: &str, max_tokens: u64) -> serde_json::Value {
     bench_generate_request_reasoning(prompt, max_tokens, false)
 }
@@ -11742,13 +11737,9 @@ mod tests {
 
     /// Every benchmark generate must ask for answer mode.
     ///
-    /// A reasoning model opens `<think>` in its first tokens and cannot close
-    /// it inside a benchmark's fixed budget (16 tokens for the warmup, 128 for
-    /// the measured runs). The daemon classifies an unclosed think span at
-    /// finish as a non-retryable validation terminal *ahead of* the length cap
-    /// — `QwenArTerminalCause::resolve` and `qwen_dflash_wire_terminal` in the
-    /// daemon both order it that way — so a thinking benchmark aborts on the
-    /// warmup, before it records a single sample.
+    /// A reasoning model opens `<think>` in its first tokens and would spend a
+    /// benchmark's fixed budget (16 tokens for the warmup, 128 for the measured
+    /// runs) inside it, so the measured turn would never reach the answer path.
     #[test]
     fn bench_generate_request_is_answer_mode_by_default() {
         let req = bench_generate_request("bench prompt", 128);
