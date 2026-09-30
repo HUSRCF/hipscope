@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- **docs/QUANTIZATION.md names the MQ4-Lloyd `--format` the quantizer accepts.** The qt=52 row said `mq4v2lloyd`, which no parser matches. It now says `mq4v2-lloyd`; `mq4l`, `mq4v2l`, `mq4g256v2l` and `mq4g256v2-lloyd` are also accepted.
 - **A malformed MQ4-Lloyd (qt=52) codebook sidecar fails the load instead of panicking the daemon.** `lloyd_lut_c16_from_levels` ended in an `assert!`, so a `lloyd_levels` sidecar with the right dtype and shape but a level outside [0,15] or NaN aborted the process. It now returns an error, and the load reports `sidecar ... invalid: C16 code ... out of [-120,120]`. Valid sidecars build the same LUTs as before.
 - **Build temps and scratch trees are out of the source tree.** The 18 hipcc `-save-temps` files at the repo root (`x*-hip-amdgcn-amd-amdhsa-*.tmp.bc`, one `.s.tmp`) and the 24 `scratch-*` directories (1,094 files, including `.hsaco` objects and host binaries) are removed, and `.gitignore` now ignores both patterns at the root. They stay reachable in git history.
 - **The serve gateway tests are in the required CI job.** `hipfire-cli` is bin-only, so the `unit tests` job's `cargo test --lib --workspace` never ran its fake-daemon HTTP tests. The job now also runs `cargo test --locked -p hipfire-cli`. The hw-gate selector (`scripts/hw-gate/select.py`) now puts `crates/hipfire-cli/src/serve/**` and `crates/hipfire-client/**` in the `serve` bucket; before, gateway-only changes selected no hardware route.
