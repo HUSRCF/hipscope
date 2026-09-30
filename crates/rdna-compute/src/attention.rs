@@ -361,7 +361,9 @@ const VERIFY_GQA_GFX1100: VerifyGqaKernels = VerifyGqaKernels {
     tile_fp8: None,
     rows_q8: Some("attention_verify_gqa_q8_rows_gfx1100"),
     reduce: "attention_verify_reduce_gfx1100",
-    split_target: VerifySplitTarget::Waves(2048),
+    // Measured on the XTX (B=4/16 at 8K/32K, 768..4608 waves): 4608 fastest
+    // at B=16 32K (1.283 ms vs 1.448 at 2048) and B=4 32K.
+    split_target: VerifySplitTarget::Waves(4608),
 };
 
 fn verify_gqa_kernels(gpu: &Gpu) -> Option<&'static VerifyGqaKernels> {
