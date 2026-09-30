@@ -28,9 +28,9 @@ const INDEXED_ATTENTION_GATHERED_WMMA_SRC: &str =
     include_str!("../../../kernels/src/indexed_attention_gathered_wmma.gfx1151.hip");
 const INDEXED_ATTENTION_GATHERED_WMMA_GFX1201_SRC: &str =
     include_str!("../../../kernels/src/indexed_attention_gathered_wmma.gfx1201.hip");
-/// `HIPFIRE_QWEN4_QSA_WMMA_GATHER=1` routes past-budget QSA prefill attention
-/// (rows >= QWEN4_F16_WMMA_MIN_TOKENS, selection narrower than the causal
-/// window) through the gathered F16 WMMA kernels: gfx1151 on the F32 state,
+/// `HIPFIRE_QWEN4_QSA_WMMA_GATHER=1` routes QSA prefill attention chunks
+/// (rows >= QWEN4_F16_WMMA_MIN_TOKENS) that the full-window dense route does
+/// not take through the gathered F16 WMMA kernels: gfx1151 on the F32 state,
 /// gfx1201 on the fp8 state.  Not bit-exact against the hg4 kernel and no
 /// Flash-Next KLD reference exists yet, so it is off by default; unset or `0`
 /// keeps every launch of the incumbent route.  Read once.
