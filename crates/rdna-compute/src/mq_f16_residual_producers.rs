@@ -39,11 +39,11 @@ use crate::gemm::ResidualVerifyTier;
 use crate::kernels;
 use hip_bridge::HipResult;
 
-const GATED_NORM_F16_SRC: &str =
+pub(crate) const GATED_NORM_F16_SRC: &str =
     include_str!("../../../kernels/src/gated_norm_mq_rotate_f16.gfx1100.hip");
-const SIGMOID_MUL_F16_SRC: &str =
+pub(crate) const SIGMOID_MUL_F16_SRC: &str =
     include_str!("../../../kernels/src/sigmoid_mul_mq_rotate_f16.gfx1100.hip");
-const FUSED_SILU_F16_SRC: &str =
+pub(crate) const FUSED_SILU_F16_SRC: &str =
     include_str!("../../../kernels/src/fused_silu_mul_mq_rotate_f16.gfx1100.hip");
 
 fn check_f16_out(out: &GpuTensor, what: &str) -> HipResult<()> {

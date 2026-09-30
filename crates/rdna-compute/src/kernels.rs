@@ -4194,6 +4194,14 @@ pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX11_X5_SYMFOLD_SRC: &str = concat!(
     include_str!("../../../kernels/src/block_i4_128_quant.hip"),
     include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_iu4.gfx11.hip")
 );
+/// gfx11 grid-specialized symmetric-fold IU4 module
+/// (`gemm_mq4g256v2_residual_mmq_iu4_gridspec_symfold`).
+pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GRIDSPEC_SYMFOLD_SRC: &str = concat!(
+    "#define IU4_SYMMETRIC_FOLD 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_iu4.gfx11.hip"),
+    include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_iu4_gridspec.gfx11.hip")
+);
 /// Kernel-agnostic Z output scatter after a widened ordinary IU4 SET.
 pub const SPLIT_MQ4V2_Z_BETAALPHA_SRC: &str =
     include_str!("../../../kernels/src/split_mq4v2_z_betaalpha.hip");
@@ -7465,7 +7473,6 @@ pub const ROPE_PARTIAL_HALVED_BATCHED_SRC: &str =
 /// gate, RMS-normalize Q/K, then apply partial half-split RoPE head-locally.
 pub const QWEN35_FA_PREP_GFX1100_SRC: &str =
     include_str!("../../../kernels/src/qwen35_fa_prep.gfx1100.hip");
-#[cfg(feature = "deltanet")]
 pub fn qwen36_27b_fa_prep_gfx1100_src() -> &'static str {
     static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     SRC.get_or_init(|| {
@@ -7768,25 +7775,21 @@ pub const GATED_DELTA_NET_Q8_FAST_SRC: &str = concat!(
 );
 
 /// fused chunked gated-delta-net prefill scan, WMMA-resident state (hipfire design; structure informed by public FLA/AITER chunk decomposition).
-#[cfg(feature = "deltanet")]
 pub const GDN_CHUNK_PREP_SRC: &str =
     include_str!("../../../kernels/src/gdn_chunk_scan_prep.gfx1201.hip");
 
 /// gfx1201 completion pass of the F2 QKVZA+GDN epilogue: the C64 gates, the
 /// three tile-head tokens of every 128-token tile after the first and the
 /// persistent conv ring, with `gdn_chunk_prep`'s expressions.
-#[cfg(feature = "deltanet")]
 pub const GDN_CHUNK_PREP_FIXUP_SRC: &str =
     include_str!("../../../kernels/src/gdn_chunk_prep_fixup.gfx1201.hip");
 
 /// gfx1100/gfx1151 GDN chunk-scan preparation: `gdn_chunk_prep` arithmetic on a
 /// row-major (channel group, C64 row chunk) grid with 16-byte x loads.
-#[cfg(feature = "deltanet")]
 pub const GDN_CHUNK_PREP_GFX11_SRC: &str =
     include_str!("../../../kernels/src/gdn_chunk_prep.gfx11.hip");
 
 /// Shared-Gram KKT solve for the GDN chunk scan on gfx1100/gfx1151/gfx1201.
-#[cfg(feature = "deltanet")]
 pub const GDN_CHUNK_KKT_SOLVE_SRC: &str =
     include_str!("../../../kernels/src/gdn_chunk_scan_kkt_solve.gfx1201.hip");
 /// One-launch-per-layer twin of [`GDN_CHUNK_KKT_SOLVE_SRC`]
@@ -7794,19 +7797,16 @@ pub const GDN_CHUNK_KKT_SOLVE_SRC: &str =
 /// chunk, so all commit segments' A blocks are solved before the first scan.
 /// Same chunks and arithmetic; the 512-row segment cap is lifted and the grid
 /// is [16 key heads, chunks] (head fastest).
-#[cfg(feature = "deltanet")]
 pub const GDN_CHUNK_KKT_SOLVE_BATCHED_SRC: &str = concat!(
     "#define GDN_KKT_BATCHED 1\n",
     include_str!("../../../kernels/src/gdn_chunk_scan_kkt_solve.gfx1201.hip")
 );
 
 /// gfx1100 KKT solve: one value head per workgroup, 48-way parallel.
-#[cfg(feature = "deltanet")]
 pub const GDN_CHUNK_KKT_SOLVE_GFX1100_SRC: &str =
     include_str!("../../../kernels/src/gdn_chunk_kkt_solve.gfx11.hip");
 
 /// Fused GDN chunk scan and Q8+EF state commit on gfx1100/gfx1151/gfx1201.
-#[cfg(feature = "deltanet")]
 pub const GDN_CHUNK_SCAN_SRC: &str =
     include_str!("../../../kernels/src/gdn_chunk_scan.gfx1201.hip");
 
@@ -7815,7 +7815,6 @@ pub const GDN_CHUNK_SCAN_SRC: &str =
 /// with the gfx11 layouts, K staged transposed, one BV=64 value half per
 /// 256-thread workgroup (grid [2, 48]). Same LDS values, WMMA operands, order
 /// and roundings: byte-identical `out` and state.
-#[cfg(feature = "deltanet")]
 pub const GDN_CHUNK_SCAN_GFX1151_SRC: &str =
     include_str!("../../../kernels/src/gdn_chunk_scan.gfx1151.hip");
 
@@ -7834,7 +7833,6 @@ pub const GDN_CHUNK_SCAN_EMU_F16_SRC: &str = concat!(
 /// gfx1201 chunk scan with a bf16 `out` plane (RNE, the same values as the
 /// `_emu_bf16` diagnostic): half the store bytes. Read only by the LA output
 /// producers' `_xbf16` twins.
-#[cfg(feature = "deltanet")]
 pub const GDN_CHUNK_SCAN_BF16_SRC: &str = concat!(
     "#define GDN_SCAN_OUT_BF16 1\n#define GDN_CHUNK_SCAN_KERNEL gdn_chunk_scan_bf16\n",
     include_str!("../../../kernels/src/gdn_chunk_scan.gfx1201.hip")
@@ -7844,7 +7842,6 @@ pub const GDN_CHUNK_SCAN_BF16_SRC: &str = concat!(
 /// state between segments through the same q8/scale/EF round trip in
 /// registers; stores the state after the last segment only. Byte-identical
 /// `out` and state.
-#[cfg(feature = "deltanet")]
 pub const GDN_CHUNK_SCAN_BF16_MSEG_SRC: &str = concat!(
     "#define GDN_SCAN_OUT_BF16 1\n#define GDN_SCAN_MULTISEG 1\n",
     "#define GDN_CHUNK_SCAN_KERNEL gdn_chunk_scan_bf16_mseg\n",

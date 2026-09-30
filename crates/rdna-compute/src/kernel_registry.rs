@@ -98,6 +98,25 @@ fn q8_flash_prefill_default_source() -> String {
     )
 }
 
+fn q8_fa2_gqa_gfx1100_source() -> String {
+    // attention.rs gfx11 FA2 GQA prefill on gfx1100 (r3): KT32, f16 Q tile,
+    // fill on, -mcumode recipe comment and the gfx1100 define.
+    format!(
+        "// HIPFIRE_COMPILER_FLAGS: -mcumode\n#define HIPFIRE_FA2_KT 32\n#define HIPFIRE_FA2_Q16 1\n#define HIPFIRE_FA2_FILL 1\n#define HIPFIRE_FA2_GFX1100 1\n{}",
+        kernels::ATTENTION_Q8_0_FA2_GQA_GFX11_SRC
+    )
+}
+
+fn q8_flash_prefill_wmma_gfx11_hd256_source() -> String {
+    // attention.rs WMMA flash prefill defaults (no split Q, fixed head_dim,
+    // V prefetch on) for head_dim 256 on gfx11.
+    format!(
+        "#define SPLIT_Q 0\n#define FIXED_HEAD_DIM 256\n#define PREFETCH_V 1\n{}\n{}",
+        kernels::KV_SLOT_DESC_H,
+        kernels::ATTENTION_Q8_0_FLASH_PREFILL_WMMA_SRC.replace("#include \"kv_slot_desc.h\"", "")
+    )
+}
+
 fn assemble_asym(body: &str) -> String {
     // The slot descriptor appears in asym3 but not all the other asym bodies.
     let needs_slot = body.contains("#include \"kv_slot_desc.h\"");
@@ -125,9 +144,10 @@ fn assemble_asym(body: &str) -> String {
 
 /// Sources covering the gfx1201 H2 FP8-KV/MQ4v2 and 0.8B Q8-KV/MQ4 routes,
 /// plus the union of the daemon's Qwen3.5 `{mq4,mq6,hfq4,hfq6,q8} ×
-/// {asym3,q8}` default precompile matrix. Other arches advertise this
-/// installer inventory plus the default Q8 scalar-flash specialization,
-/// but not unobserved model-specific routes; unsupported pairs fail explicitly.
+/// {asym3,q8}` default precompile matrix, and the H2 modules traced on
+/// gfx1201, gfx1100 and gfx1151. Other arches advertise this installer
+/// inventory plus the default Q8 scalar-flash specialization, but not
+/// unobserved model-specific routes; unsupported pairs fail explicitly.
 ///
 /// `extra_flags` must be the same process-config value used by KernelCompiler.
 /// Non-default runtime selector flags require a separately admitted registry.
@@ -293,6 +313,129 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         add!("gated_norm_mq_rotate_awq_k6144_gfx1201", kernels::gated_norm_mq_rotate_awq_k6144_gfx1201_src(), ["gated_norm_mq_rotate_awq_k6144_gfx1201"]);
         add!("qwen36_27b_fa_prep_gfx1201", kernels::qwen36_27b_fa_prep_gfx1201_src(), ["qwen36_27b_fa_prep_gfx1201"]);
     }
+    // H2 (Qwen3.8-27B MQ4v2) prefill, MTP and DFlash modules JIT-compiled by
+    // `hipfire serve`/`run` beyond the inventory above: gfx1201 fp8 KV, and
+    // gfx1100/gfx1151 Q8 KV. Symbols are every kernel each object defines.
+    if matches!(arch, "gfx1201" | "gfx1100" | "gfx1151") {
+        add!("attention_dflash_sliding_f32", kernels::ATTENTION_DFLASH_SLIDING_SRC, ["attention_dflash_sliding_f32"]);
+        add!("deinterleave_batched", kernels::DEINTERLEAVE_BATCHED_SRC, ["deinterleave_f32_batched"]);
+        add!("dynamic_conv_f32", kernels::DYNAMIC_CONV_F32_SRC, ["dynamic_causal_conv_f32", "dynamic_conv_f32"]);
+        add!("fused_qk_l2_norm_scale_interleave_f32_batched", kernels::FUSED_QK_L2_NORM_SCALE_INTERLEAVE_F32_BATCHED_SRC, ["fused_qk_l2_norm_scale_interleave_f32_batched"]);
+        add!("gemm_hfq4g256", kernels::GEMM_HFQ4G256_SRC, ["gemm_hfq4g256"]);
+        add!("rope_batched", kernels::ROPE_BATCHED_SRC, ["rope_batched_f32"]);
+    }
+    if matches!(arch, "gfx1201" | "gfx1151") {
+        add!("add", kernels::ADD_SRC, ["add_f32"]);
+        add!("argmax_token_chain", kernels::ARGMAX_TOKEN_CHAIN_SRC, ["argmax_token_chain_f32"]);
+        add!("gdn_chunk_kkt_solve", kernels::GDN_CHUNK_KKT_SOLVE_SRC, ["gdn_chunk_kkt_solve"]);
+        add!("gemv_hfq4g256_multirow_default", kernels::GEMV_HFQ4G256_MULTIROW_SRC, ["gemv_hfq4g256_multirow_r2", "gemv_hfq4g256_multirow_r4", "gemv_hfq4g256_multirow_r8"]);
+        add!("greedy_accept", kernels::GREEDY_ACCEPT_SRC, ["greedy_accept_from_argmax_i32"]);
+    }
+    if matches!(arch, "gfx1100" | "gfx1151") {
+        add!("argmax_f32_batched", kernels::ARGMAX_BATCHED_SRC, ["argmax_f32_batched"]);
+        add!("attention_q8_0_flash_prefill_wmma_gfx11_hd256", q8_flash_prefill_wmma_gfx11_hd256_source(), ["attention_q8_0_flash_prefill_wmma"]);
+        add!("convert_f32_to_f16", kernels::GEMM_HFQ4G256_RESIDUAL_FP16_SRC, ["convert_f32_to_f16", "gemm_hfq4g256_residual_fp16"]);
+        add!("fused_gate_up_hfq4g256_mq4v2", kernels::FUSED_GATE_UP_MQ4G256V2_SRC, ["fused_gate_up_mq4g256v2"]);
+        add!("fused_qkv_hfq4g256_mq4v2", kernels::FUSED_QKV_MQ4G256V2_SRC, ["fused_qkv_mq4g256v2"]);
+        add!("fused_qkvza_hfq4g256_mq4v2", kernels::FUSED_QKVZA_MQ4G256V2_SRC, ["fused_qkvza_mq4g256v2"]);
+        add!("fused_rmsnorm_mq_rotate_awq", kernels::FUSED_RMSNORM_MQ_ROTATE_AWQ_SRC, ["fused_rmsnorm_mq_rotate_awq"]);
+        add!("fused_rmsnorm_mq_rotate_awq_g12dec", kernels::FUSED_RMSNORM_MQ_ROTATE_AWQ_G12DEC_SRC, ["fused_rmsnorm_mq_rotate_awq_g12dec"]);
+        add!("fused_silu_mul_mq_rotate_awq", kernels::FUSED_SILU_MUL_MQ_ROTATE_AWQ_SRC, ["fused_silu_mul_mq_rotate_awq"]);
+        add!("fused_silu_mul_mq_rotate_awq_i4", kernels::FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_SRC, ["fused_silu_mul_mq_rotate_awq_i4"]);
+        add!("fused_silu_mul_mq_rotate_awq_i4_hin", kernels::FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_HIN_SRC, ["fused_silu_mul_mq_rotate_awq_i4_hin"]);
+        add!("gated_delta_net_q8_fast", kernels::GATED_DELTA_NET_Q8_FAST_SRC, ["gated_delta_net_q8_fast", "gated_delta_net_q8_fast_independent_masked"]);
+        add!("gdn_chunk_prep_gfx11", kernels::GDN_CHUNK_PREP_GFX11_SRC, ["gdn_chunk_prep_gfx11"]);
+        add!("gemm_gate_up_mq4g256v2_wmma", kernels::GEMM_GATE_UP_MQ4G256V2_WMMA_SRC, ["gemm_gate_up_mq4g256v2_wmma"]);
+        add!("gemm_mq4g256v2_residual_wmma", kernels::GEMM_MQ4G256V2_RESIDUAL_WMMA_SRC, ["gemm_mq4g256v2_residual_wmma"]);
+        add!("gemm_qkv_mq4g256v2_wmma", kernels::GEMM_QKV_MQ4G256V2_WMMA_SRC, ["gemm_qkv_mq4g256v2_wmma"]);
+        add!("gemm_qkvza_mq4g256v2_wmma", kernels::GEMM_QKVZA_MQ4G256V2_WMMA_SRC, ["gemm_qkvza_mq4g256v2_wmma"]);
+        add!("mq_rotate_x", kernels::GEMV_MQ4G256_SRC, ["gemv_mq4g256", "mq_rotate_x"]);
+        add!("rmsnorm_f32_rowsplit", kernels::RMSNORM_ROWSPLIT_SRC, ["rmsnorm_f32_rowsplit"]);
+        add!("rope_partial_halfsplit_batched", kernels::ROPE_PARTIAL_HALFSPLIT_BATCHED_SRC, ["rope_partial_halfsplit_batched_f32"]);
+        add!("rotate_x_mq_awq", kernels::ROTATE_X_MQ_AWQ_SRC, ["rotate_x_mq_awq"]);
+        add!("sigmoid_mul_rotate_x_mq_awq_i4_gfx11", kernels::SIGMOID_MUL_MQ_ROTATE_X_AWQ_I4_GFX11_SRC, ["sigmoid_mul_rotate_x_mq_awq_i4_gfx11"]);
+        add!("softmax_temp_topp_batched", kernels::SOFTMAX_TEMP_BATCHED_SRC, ["softmax_temp_batched_f32", "softmax_temp_topp_batched_f32"]);
+        add!("split_mq4v2_z_betaalpha", kernels::SPLIT_MQ4V2_Z_BETAALPHA_SRC, ["split_mq4v2_z_betaalpha"]);
+        add!("topk_logsumexp_batched", kernels::TOPK_LOGSUMEXP_BATCHED_SRC, ["topk_logsumexp_batched_f32"]);
+    }
+    if arch == "gfx1201" {
+        add!("attention_flash_fp8_e4m3_tile_batched", assemble_asym(kernels::ATTENTION_FLASH_FP8_E4M3_TILE_BATCHED_SRC), ["attention_flash_fp8_e4m3_tile_batched", "attention_flash_q8_0_tile_batched"]);
+        add!("attention_fp8_e4m3_fa2_gqa_qresident_v2_gfx1201", kernels::ATTENTION_FP8_E4M3_FA2_GQA_QRESIDENT_V2_GFX1201_SRC, ["attention_fp8_e4m3_fa2_gqa_gfx1201", "attention_fp8_e4m3_fa2_gqa_merge_gfx1201", "attention_fp8_e4m3_fa2_gqa_partial_gfx1201", "attention_fp8_e4m3_fa2_gqa_qresident_v2_gfx1201", "attention_fp8_e4m3_fa2_q_preconvert_f16_gfx1201", "attention_fp8_e4m3_fa2_q_preconvert_fp8_gfx1201"]);
+        add!("attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_a4epi_gfx1201", kernels::ATTENTION_FP8_E4M3_FA2_GQA_QRESIDENT_V2_Q8_A4EPI_GFX1201_SRC, ["attention_fp8_e4m3_fa2_gqa_gfx1201", "attention_fp8_e4m3_fa2_gqa_merge_gfx1201", "attention_fp8_e4m3_fa2_gqa_partial_gfx1201", "attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_a4epi_gfx1201", "attention_fp8_e4m3_fa2_q_preconvert_f16_gfx1201", "attention_fp8_e4m3_fa2_q_preconvert_fp8_gfx1201"]);
+        add!("dflash_gdn_replay_pre_ml", crate::dflash_gdn_replay::DFLASH_GDN_REPLAY_PRE_ML_SRC, ["dflash_gdn_replay_pre_ml"]);
+        add!("fused_rmsnorm_mq_rotate_awq_i4_gfx12_v2_slab_fdiv", kernels::FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_GFX12_V2_SLAB_FDIV_SRC, ["fused_rmsnorm_mq_rotate_awq_i4_gfx12_v2_slab_fdiv"]);
+        add!("fused_silu_mul_mq_rotate_awq_i4_hin_gfx12_slab_tokfast", kernels::FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_HIN_GFX12_SLAB_TOKFAST_SRC, ["fused_silu_mul_mq_rotate_awq_i4_hin_gfx12_slab_tokfast"]);
+        add!("gated_delta_net_q8_fast_ml", crate::dflash_gdn_replay::GATED_DELTA_NET_Q8_FAST_ML_SRC, ["gated_delta_net_q8_fast_ml"]);
+        add!("gated_norm_mq_rotate_awq_i4_gfx12_v2_slab", kernels::GATED_NORM_MQ_ROTATE_AWQ_I4_GFX12_V2_SLAB_SRC, ["gated_norm_mq_rotate_awq_i4_gfx12_v2_slab"]);
+        add!("gated_norm_mq_rotate_awq_i4_gfx12_v2_xbf16_slab", kernels::GATED_NORM_MQ_ROTATE_AWQ_I4_GFX12_V2_XBF16_SLAB_SRC, ["gated_norm_mq_rotate_awq_i4_gfx12_v2_xbf16_slab"]);
+        add!("gdn_chunk_kkt_solve_batched", kernels::GDN_CHUNK_KKT_SOLVE_BATCHED_SRC, ["gdn_chunk_kkt_solve_batched"]);
+        add!("gdn_chunk_prep", kernels::GDN_CHUNK_PREP_SRC, ["gdn_chunk_prep"]);
+        add!("gdn_chunk_prep_fixup", kernels::GDN_CHUNK_PREP_FIXUP_SRC, ["gdn_chunk_prep_fixup"]);
+        add!("gdn_chunk_scan_bf16", kernels::GDN_CHUNK_SCAN_BF16_SRC, ["gdn_chunk_scan_bf16"]);
+        add!("gdn_chunk_scan_bf16_mseg", kernels::GDN_CHUNK_SCAN_BF16_MSEG_SRC, ["gdn_chunk_scan_bf16_mseg"]);
+        add!("gemm_mq4g256v2_residual_mmq_iu4", kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_SRC, ["gemm_mq4g256v2_residual_mmq_iu4", "gemm_mq4g256v2_residual_mmq_iu4_full_add", "gemm_mq4g256v2_residual_mmq_iu4_full_add_lf16_col_gfx1151", "gemm_mq4g256v2_residual_mmq_iu4_full_add_lf16_gfx1100", "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3", "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3_col_gfx1151", "gemm_mq4g256v2_residual_mmq_iu4_full_set", "gemm_mq4g256v2_residual_mmq_iu4_full_set_lf16_col_gfx1151", "gemm_mq4g256v2_residual_mmq_iu4_full_set_lf16_gfx1100", "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3", "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3_col_gfx1151", "quantize_int4_mmq_ds128"]);
+        add!("qwen35_fa_prep_fp8q_nogate_batched_gfx1201", crate::qwen35_fa_batch::FA_PREP_BATCHED_GFX1201_SRC, ["qwen35_fa_prep_batched_gfx1201", "qwen35_fa_prep_fp8q_batched_gfx1201", "qwen35_fa_prep_fp8q_nogate_batched_gfx1201"]);
+        add!("select_regrid", crate::select_regrid::SELECT_REGRID_SRC, ["argmax_f32_batched_regrid", "topk_values_regrid_f32"]);
+        add!("sigmoid_mul_rotate_x_mq_awq_i4_gfx12_slab", kernels::SIGMOID_MUL_MQ_ROTATE_X_AWQ_I4_GFX12_SLAB_SRC, ["sigmoid_mul_rotate_x_mq_awq_i4_gfx12_slab"]);
+        add!("topk_values_fixup_f32", crate::select_regrid::TOPK_VALUES_FIXUP_SRC, ["topk_values_fixup_f32"]);
+    }
+    if arch == "gfx1100" {
+        add!("attention_flash_q8_0_reduce_gated_mq_rotate_awq_dec_gfx1100", kernels::ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_AWQ_DEC_GFX1100_SRC, ["attention_flash_q8_0_reduce_gated_mq_rotate_awq_dec_gfx1100"]);
+        add!("attention_flash_q8_0_tile_batched", assemble_asym(kernels::ATTENTION_FLASH_Q8_0_TILE_BATCHED_SRC), ["attention_flash_q8_0_tile_batched"]);
+        add!("attention_flash_q8_0_tile_gqa_gfx1100", kernels::ATTENTION_FLASH_Q8_0_TILE_GQA_GFX1100_SRC, ["attention_flash_q8_0_tile_gqa_gfx1100"]);
+        add!("attention_q8_0_fa2_gqa_gfx1100", q8_fa2_gqa_gfx1100_source(), ["attention_fa2_q_preconvert_gfx1100", "attention_q8_0_fa2_gqa_gfx1100"]);
+        add!("conv1d_silu_split_qknorm_b256_scalar_prep", kernels::CONV1D_SILU_SPLIT_QKNORM_B256_SCALAR_PREP_SRC, ["conv1d_silu_split_qknorm_b256_scalar_prep"]);
+        add!("dflash_gdn_pre_gfx1100", crate::dflash_gdn_pre::DFLASH_GDN_PRE_GFX1100_SRC, ["dflash_gdn_pre_capture_gfx1100", "dflash_gdn_pre_replay_gfx1100"]);
+        add!("dflash_hidden_commit5_gfx1100", crate::dflash_hidden_scatter::DFLASH_HIDDEN_SCATTER_SRC, ["dflash_hidden_commit5_gfx1100", "dflash_hidden_scatter5_gfx1100"]);
+        add!("dflash_hidden_scatter5_gfx1100", crate::dflash_hidden_scatter::DFLASH_HIDDEN_SCATTER_SRC, ["dflash_hidden_commit5_gfx1100", "dflash_hidden_scatter5_gfx1100"]);
+        add!("dflash_state_bulk_copy_gfx1100", crate::dflash_state_copy::DFLASH_STATE_BULK_COPY_GFX1100_SRC, ["dflash_state_bulk_copy_gfx1100"]);
+        add!("dynamic_conv_residual_gfx1100", crate::dflash_draft_fusion::COLLAPSE_SRC, ["dynamic_conv_residual_gfx1100", "gemm_hfq4g256_overwrite_wmma_k2_dflash_gfx1100", "gemm_ksplit_det_overwrite_finalize_dflash_gfx1100", "gemm_mq4g256v2_overwrite_ksplit_lds_dflash_gfx1100_ks2", "gemm_mq4g256v2_overwrite_ksplit_lds_dflash_gfx1100_ks4", "gemm_mq4g256v2_overwrite_ksplit_lds_dflash_gfx1100_ks8", "mq_rotate_x_f16_dflash_gfx1100", "rmsnorm_residual_dual_gfx1100"]);
+        add!("fused_rmsnorm_mq_rotate_awq_f16", crate::mq_f16_producers::FUSED_RMSNORM_MQ_ROTATE_F16_SRC, ["fused_rmsnorm_mq_rotate_awq_f16", "fused_rmsnorm_mq_rotate_f16"]);
+        add!("fused_rmsnorm_mq_rotate_awq_i4_b8", kernels::FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_B8_SRC, ["fused_rmsnorm_mq_rotate_awq_i4_b8"]);
+        add!("fused_silu_mul_mq_rotate_f16", crate::mq_f16_residual_producers::FUSED_SILU_F16_SRC, ["fused_silu_mul_mq_rotate_awq_f16_batched_gfx1100", "fused_silu_mul_mq_rotate_f16_batched_gfx1100"]);
+        add!("gated_delta_net_q8_compact3_b2", kernels::GATED_DELTA_NET_Q8_COMPACT3_B2_SRC, ["gated_delta_net_q8_compact3_b2", "gated_delta_net_q8_fast_independent_masked"]);
+        add!("gated_norm_mq_rotate_awq_i4_gfx1100_v2", kernels::GATED_NORM_MQ_ROTATE_AWQ_I4_GFX1100_V2_SRC, ["gated_norm_mq_rotate_awq_i4_gfx1100_v2"]);
+        add!("gated_norm_mq_rotate_awq_k6144_gfx1100", kernels::gated_norm_mq_rotate_awq_k6144_gfx1100_src(), ["gated_norm_mq_rotate_awq_k6144_gfx1100"]);
+        add!("gated_norm_mq_rotate_f16", crate::mq_f16_residual_producers::GATED_NORM_F16_SRC, ["gated_norm_mq_rotate_awq_f16_batched_gfx1100", "gated_norm_mq_rotate_f16_batched_gfx1100"]);
+        add!("gdn_chunk_kkt_solve_gfx1100", kernels::GDN_CHUNK_KKT_SOLVE_GFX1100_SRC, ["gdn_chunk_kkt_solve_gfx1100"]);
+        add!("gdn_chunk_scan", kernels::GDN_CHUNK_SCAN_SRC, ["gdn_chunk_scan"]);
+        add!("gemm_gate_up_mq4g256v2_wmma_gfx1100_ldsstage", kernels::GEMM_GATE_UP_MQ4G256V2_WMMA_GFX1100_LDSSTAGE_SRC, ["gemm_gate_up_mq4g256v2_wmma_gfx1100_ldsstage"]);
+        add!("gemm_mq4g256v2_residual_mmq_iu4", kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_SRC, ["gemm_mq4g256v2_residual_mmq_iu4", "gemm_mq4g256v2_residual_mmq_iu4_full_add", "gemm_mq4g256v2_residual_mmq_iu4_full_add_lf16_col_gfx1151", "gemm_mq4g256v2_residual_mmq_iu4_full_add_lf16_gfx1100", "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3", "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3_col_gfx1151", "gemm_mq4g256v2_residual_mmq_iu4_full_set", "gemm_mq4g256v2_residual_mmq_iu4_full_set_lf16_col_gfx1151", "gemm_mq4g256v2_residual_mmq_iu4_full_set_lf16_gfx1100", "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3", "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3_col_gfx1151", "quantize_int4_mmq_ds128"]);
+        add!("gemm_mq4g256v2_residual_mmq_iu4_gridspec_symfold", kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GRIDSPEC_SYMFOLD_SRC, ["gemm_mq4g256v2_residual_mmq_iu4", "gemm_mq4g256v2_residual_mmq_iu4_branch_gridspec", "gemm_mq4g256v2_residual_mmq_iu4_full_add", "gemm_mq4g256v2_residual_mmq_iu4_full_add_lf16_col_gfx1151", "gemm_mq4g256v2_residual_mmq_iu4_full_add_lf16_col_gfx1151_symfold", "gemm_mq4g256v2_residual_mmq_iu4_full_add_lf16_gfx1100", "gemm_mq4g256v2_residual_mmq_iu4_full_add_lf16_gfx1100_symfold", "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3", "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3_col_gfx1151", "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3_col_gfx1151_symfold", "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3_symfold", "gemm_mq4g256v2_residual_mmq_iu4_full_add_symfold", "gemm_mq4g256v2_residual_mmq_iu4_full_set", "gemm_mq4g256v2_residual_mmq_iu4_full_set_lf16_col_gfx1151", "gemm_mq4g256v2_residual_mmq_iu4_full_set_lf16_col_gfx1151_symfold", "gemm_mq4g256v2_residual_mmq_iu4_full_set_lf16_gfx1100", "gemm_mq4g256v2_residual_mmq_iu4_full_set_lf16_gfx1100_symfold", "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3", "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3_col_gfx1151", "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3_col_gfx1151_symfold", "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3_symfold", "gemm_mq4g256v2_residual_mmq_iu4_full_set_symfold", "gemm_mq4g256v2_residual_mmq_iu4_tail_gridspec", "quantize_int4_mmq_ds128"]);
+        add!("gemm_mq4g256v2_residual_wmma_gfx1100_ldsstage", kernels::GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX1100_LDSSTAGE_SRC, ["gemm_mq4g256v2_residual_wmma_gfx1100_ldsstage"]);
+        add!("gemm_mqv2_wmma_gfx1100_mw_lds", kernels::GEMM_MQV2_WMMA_GFX11_MW_LDS_SRC, ["gemm_gate_up_mq3g256v2_wmma_gfx11_mw4_lds", "gemm_gate_up_mq3g256v2_wmma_gfx11_mw8_lds", "gemm_gate_up_mq4g256v2_wmma_gfx11_mw4_lds", "gemm_gate_up_mq4g256v2_wmma_gfx11_mw8_lds", "gemm_gate_up_mq5g256v2_wmma_gfx11_mw4_lds", "gemm_gate_up_mq5g256v2_wmma_gfx11_mw8_lds", "gemm_gate_up_mq6g256v2_wmma_gfx11_mw4_lds", "gemm_gate_up_mq6g256v2_wmma_gfx11_mw8_lds", "gemm_mq3g256v2_residual_wmma_gfx11_mw4_lds", "gemm_mq3g256v2_residual_wmma_gfx11_mw8_lds", "gemm_mq4g256v2_residual_wmma_gfx11_mw4_lds", "gemm_mq4g256v2_residual_wmma_gfx11_mw8_lds", "gemm_mq5g256v2_residual_wmma_gfx11_mw4_lds", "gemm_mq5g256v2_residual_wmma_gfx11_mw8_lds", "gemm_mq6g256v2_residual_wmma_gfx11_mw4_lds", "gemm_mq6g256v2_residual_wmma_gfx11_mw8_lds"]);
+        add!("gemv_hfq4g256_residual_rdna3_mq4v2", kernels::GEMV_MQ4G256V2_RESIDUAL_SRC, ["gemv_mq4g256v2_residual"]);
+        add!("gemv_mq4g256v2_rdna3_mq4v2", kernels::GEMV_MQ4G256V2_SRC, ["gemv_mq4g256v2"]);
+        add!("kv_cache_write_q8_0_pair", kernels::KV_CACHE_WRITE_Q8_0_PAIR_GFX1100_SRC, ["kv_cache_write_q8_0_pair"]);
+        add!("kv_cache_write_q8_0_pair_batched_gfx1100", crate::qwen35_fa_batch::KV_PAIR_BATCHED_SRC, ["kv_cache_write_q8_0_pair_batched_gfx1100"]);
+        add!("qwen35_fa_prep_batched_gfx1100", crate::qwen35_fa_batch::FA_PREP_BATCHED_SRC, ["qwen35_fa_prep_batched_gfx1100"]);
+        add!("qwen36_27b_fa_prep_gfx1100", kernels::qwen36_27b_fa_prep_gfx1100_src(), ["qwen36_27b_fa_prep_gfx1100"]);
+        add!("rmsnorm_residual_dual_gfx1100", crate::dflash_draft_fusion::COLLAPSE_SRC, ["dynamic_conv_residual_gfx1100", "gemm_hfq4g256_overwrite_wmma_k2_dflash_gfx1100", "gemm_ksplit_det_overwrite_finalize_dflash_gfx1100", "gemm_mq4g256v2_overwrite_ksplit_lds_dflash_gfx1100_ks2", "gemm_mq4g256v2_overwrite_ksplit_lds_dflash_gfx1100_ks4", "gemm_mq4g256v2_overwrite_ksplit_lds_dflash_gfx1100_ks8", "mq_rotate_x_f16_dflash_gfx1100", "rmsnorm_residual_dual_gfx1100"]);
+        add!("rope_partial_halfsplit", kernels::ROPE_PARTIAL_HALFSPLIT_SRC, ["rope_partial_halfsplit_f32"]);
+        add!("sigmoid_mul_mq_rotate_f16", crate::mq_f16_residual_producers::SIGMOID_MUL_F16_SRC, ["sigmoid_mul_mq_rotate_awq_f16_batched_gfx1100", "sigmoid_mul_mq_rotate_f16_batched_gfx1100"]);
+    }
+    if arch == "gfx1151" {
+        add!("attention_flash_q8_0_tile_gqa_gfx1151", kernels::ATTENTION_FLASH_Q8_0_TILE_GQA_GFX1151_SRC, ["attention_flash_q8_0_tile_gqa_gfx1151"]);
+        add!("attention_flash_reduce_dsplit_gfx1151", kernels::ATTENTION_FLASH_REDUCE_DSPLIT_GFX1151_SRC, ["attention_flash_reduce_dsplit_gfx1151"]);
+        add!("attention_q8_0_fa2_gqa_gfx1151", kernels::ATTENTION_Q8_0_FA2_GQA_GFX1151_SRC, ["attention_fa2_q_preconvert_gfx1151", "attention_q8_0_fa2_gqa_gfx1151"]);
+        add!("conv1d_silu_split_qknorm_b256", kernels::CONV1D_SILU_SPLIT_QKNORM_B256_SRC, ["conv1d_silu_split_qknorm_b256"]);
+        add!("deinterleave_q_rmsnorm_f32_batched", kernels::DEINTERLEAVE_Q_RMSNORM_BATCHED_SRC, ["deinterleave_q_rmsnorm_f32_batched"]);
+        add!("fused_rmsnorm_mq_rotate_awq_i4", kernels::FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_SRC, ["fused_rmsnorm_mq_rotate_awq_i4"]);
+        add!("fused_rmsnorm_mq_rotate_awq_i4_fold", kernels::FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_FOLD_SRC, ["fused_rmsnorm_mq_rotate_awq_i4_fold"]);
+        add!("gated_norm_mq_rotate_awq_i4_gfx11", kernels::GATED_NORM_MQ_ROTATE_AWQ_I4_GFX11_SRC, ["gated_norm_mq_rotate_awq_i4_gfx11"]);
+        add!("gdn_chunk_scan_gfx1151", kernels::GDN_CHUNK_SCAN_GFX1151_SRC, ["gdn_chunk_scan_gfx1151"]);
+        add!("gemm_mq4g256v2_residual_iu4_v2b_gfx11", kernels::GEMM_MQ4G256V2_RESIDUAL_IU4_V2B_GFX11_SRC, ["gemm_mq4g256v2_gate_up_silu_iu4_v2b_gfx11", "gemm_mq4g256v2_residual_iu4_v2b_add_gfx11", "gemm_mq4g256v2_residual_iu4_v2b_add_touch_gfx11", "gemm_mq4g256v2_residual_iu4_v2b_add_touch_swz_gfx11", "gemm_mq4g256v2_residual_iu4_v2b_set_gfx11", "gemm_mq4g256v2_residual_iu4_v2b_set_zba_gfx11"]);
+        add!("gemm_mq4g256v2_residual_mmq_iu4", kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_SRC, ["gemm_mq4g256v2_residual_mmq_iu4", "gemm_mq4g256v2_residual_mmq_iu4_full_add", "gemm_mq4g256v2_residual_mmq_iu4_full_add_lf16_col_gfx1151", "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3", "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3_col_gfx1151", "gemm_mq4g256v2_residual_mmq_iu4_full_set", "gemm_mq4g256v2_residual_mmq_iu4_full_set_lf16_col_gfx1151", "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3", "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3_col_gfx1151", "quantize_int4_mmq_ds128"]);
+        add!("gemm_mq4g256v2_residual_mmq_iu4_gfx11_x5_symfold", kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX11_X5_SYMFOLD_SRC, ["gemm_mq4g256v2_residual_mmq_iu4", "gemm_mq4g256v2_residual_mmq_iu4_full_add", "gemm_mq4g256v2_residual_mmq_iu4_full_add_lf16_col_gfx1151", "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3", "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3_col_gfx1151", "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3_col_gfx1151_symfold", "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3_symfold", "gemm_mq4g256v2_residual_mmq_iu4_full_add_symfold", "gemm_mq4g256v2_residual_mmq_iu4_full_add_x5_col_gfx1151_symfold", "gemm_mq4g256v2_residual_mmq_iu4_full_set", "gemm_mq4g256v2_residual_mmq_iu4_full_set_lf16_col_gfx1151", "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3", "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3_col_gfx1151", "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3_col_gfx1151_symfold", "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3_symfold", "gemm_mq4g256v2_residual_mmq_iu4_full_set_symfold", "gemm_mq4g256v2_residual_mmq_iu4_full_set_x5_col_gfx1151_symfold", "quantize_int4_mmq_ds128"]);
+        add!("gemm_mq4g256v2_residual_mmq_iu4_gridspec_symfold", kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GRIDSPEC_SYMFOLD_SRC, ["gemm_mq4g256v2_residual_mmq_iu4", "gemm_mq4g256v2_residual_mmq_iu4_branch_gridspec", "gemm_mq4g256v2_residual_mmq_iu4_full_add", "gemm_mq4g256v2_residual_mmq_iu4_full_add_lf16_col_gfx1151", "gemm_mq4g256v2_residual_mmq_iu4_full_add_lf16_col_gfx1151_symfold", "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3", "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3_col_gfx1151", "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3_col_gfx1151_symfold", "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3_symfold", "gemm_mq4g256v2_residual_mmq_iu4_full_add_symfold", "gemm_mq4g256v2_residual_mmq_iu4_full_set", "gemm_mq4g256v2_residual_mmq_iu4_full_set_lf16_col_gfx1151", "gemm_mq4g256v2_residual_mmq_iu4_full_set_lf16_col_gfx1151_symfold", "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3", "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3_col_gfx1151", "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3_col_gfx1151_symfold", "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3_symfold", "gemm_mq4g256v2_residual_mmq_iu4_full_set_symfold", "gemm_mq4g256v2_residual_mmq_iu4_tail_gridspec", "quantize_int4_mmq_ds128"]);
+        add!("gemm_mqv2_wmma_gfx1151_mw_lds", kernels::GEMM_MQV2_WMMA_GFX11_MW_LDS_SRC, ["gemm_gate_up_mq3g256v2_wmma_gfx11_mw4_lds", "gemm_gate_up_mq3g256v2_wmma_gfx11_mw8_lds", "gemm_gate_up_mq4g256v2_wmma_gfx11_mw4_lds", "gemm_gate_up_mq4g256v2_wmma_gfx11_mw8_lds", "gemm_gate_up_mq5g256v2_wmma_gfx11_mw4_lds", "gemm_gate_up_mq5g256v2_wmma_gfx11_mw8_lds", "gemm_gate_up_mq6g256v2_wmma_gfx11_mw4_lds", "gemm_gate_up_mq6g256v2_wmma_gfx11_mw8_lds", "gemm_mq3g256v2_residual_wmma_gfx11_mw4_lds", "gemm_mq3g256v2_residual_wmma_gfx11_mw8_lds", "gemm_mq4g256v2_residual_wmma_gfx11_mw4_lds", "gemm_mq4g256v2_residual_wmma_gfx11_mw8_lds", "gemm_mq5g256v2_residual_wmma_gfx11_mw4_lds", "gemm_mq5g256v2_residual_wmma_gfx11_mw8_lds", "gemm_mq6g256v2_residual_wmma_gfx11_mw4_lds", "gemm_mq6g256v2_residual_wmma_gfx11_mw8_lds"]);
+        add!("gemv_hfq4g256_multirow_default_mq4v2", kernels::GEMV_MQ4G256V2_MULTIROW_SRC, ["gemv_mq4g256v2_multirow_r2", "gemv_mq4g256v2_multirow_r4", "gemv_mq4g256v2_multirow_r8"]);
+        add!("gemv_mq4g256v2_mq4v2", kernels::GEMV_MQ4G256V2_SRC, ["gemv_mq4g256v2"]);
+        add!("gemv_mq4g256v2_residual_row_serial_gfx1151", kernels::GEMV_MQ4G256V2_RESIDUAL_ROW_SERIAL_GFX1151_SRC, ["gemv_mq4g256v2_residual_row_serial_gfx1151"]);
+        add!("qwen35_fa_prep_batched_gfx1151", crate::qwen35_fa_batch::FA_PREP_BATCHED_GFX1151_SRC, ["qwen35_fa_prep_batched_gfx1151"]);
+        add!("repeat_interleave_qk_batched", kernels::REPEAT_INTERLEAVE_QK_BATCHED_SRC, ["repeat_interleave_qk_f32_batched"]);
+        add!("rope_partial_halfsplit_f32_headgrid", kernels::ROPE_PARTIAL_HALFSPLIT_HEADGRID_SRC, ["rope_partial_halfsplit_f32_headgrid"]);
+    }
     Ok(entries)
 }
 
@@ -335,9 +478,9 @@ mod tests {
         // The installer trace predates the scalar-prefill runtime's BR/BC
         // specialization, the `HIPFIRE_G12_DEC_NORM` decode twins (fused
         // RMSNorm+FWHT group grid, rmsnorm row split, RoPE head grid) and the
-        // six H2 decode modules added for compiler-free packs. Those ten keys
-        // are additional to P0's 92.
-        assert_eq!(registry.len(), count + 10, "unexpected gfx1201 inventory size");
+        // 36 H2 decode, prefill, MTP and DFlash modules added for
+        // compiler-free packs. Those 40 keys are additional to P0's 92.
+        assert_eq!(registry.len(), count + 40, "unexpected gfx1201 inventory size");
         let default_prefill = by_name.get("attention_q8_0_flash_prefill_br8_bc16").unwrap();
         assert_eq!(default_prefill.symbols, ["attention_q8_0_flash_prefill"]);
         assert!(default_prefill.source().starts_with(
