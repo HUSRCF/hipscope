@@ -13,6 +13,7 @@ use crate::tables::KernelRegistry;
 use crate::traits::KernelFamily;
 use crate::types::*;
 use hip_bridge::DeviceBuffer;
+use rdna_compute::attention::GFX12_QUERY16_MAX_CTX;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 pub struct AttnParams<'a> {
@@ -877,7 +878,8 @@ fn dispatch_kv_write(
 /// Above ~60K the combined K+V working set crosses the R9700 last-level-cache
 /// boundary and the lower-workgroup query16 path can lose, so 32K is the
 /// certified upper bound. Explicit `HIPFIRE_FLASH_PREFILL=1` remains available
-/// for research outside this envelope.
+/// for research outside this envelope. Above it, the default stays on only
+/// where the gfx1201 Q8 FA2 body takes the call (see `AttnQ8_0KvBatchedMasked`).
 fn gfx12_query16_default_eligible(
     n_heads: usize,
     head_dim: usize,
@@ -887,10 +889,9 @@ fn gfx12_query16_default_eligible(
     const QUERY_TILE: usize = 16;
     const MIN_WORKGROUPS: usize = 128;
     const MIN_CTX: usize = 256;
-    const MAX_CTX: usize = 32_768;
 
     matches!(head_dim, 64 | 128 | 256)
-        && (MIN_CTX..=MAX_CTX).contains(&max_ctx_len)
+        && (MIN_CTX..=GFX12_QUERY16_MAX_CTX).contains(&max_ctx_len)
         && batch_size.div_ceil(QUERY_TILE) * n_heads >= MIN_WORKGROUPS
 }
 
@@ -2054,7 +2055,23 @@ fn dispatch_attend(
                         io.batch_size,
                         io.max_ctx_len,
                     );
-                let flash_default_on = gpu.arch.starts_with("gfx11") || gfx12_query16_route_ok;
+                // Above the query16 envelope the default stays on only where
+                // the gfx1201 Q8 FA2 body takes the call (same admission the
+                // launcher applies). Otherwise every >32K prefill segment fell
+                // to the tiled partials+reduce kernel below (R9700 H2 prefill
+                // at 49K: 134.9 s vs 34.6 s). At or below 32K nothing changes.
+                let gfx12_fa2_long_ctx_ok = io.max_ctx_len > GFX12_QUERY16_MAX_CTX
+                    && gfx12_query16_workload_eligible(ctx)
+                    && gpu.gfx12_q8_fa2_prefill_admitted(
+                        io.n_heads,
+                        io.n_kv_heads,
+                        io.head_dim,
+                        io.batch_size,
+                        io.max_ctx_len,
+                    );
+                let flash_default_on = gpu.arch.starts_with("gfx11")
+                    || gfx12_query16_route_ok
+                    || gfx12_fa2_long_ctx_ok;
                 let flash_optin = match hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL")
                     .ok()
                     .as_deref()
