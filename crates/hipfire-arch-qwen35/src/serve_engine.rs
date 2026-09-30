@@ -1221,7 +1221,8 @@ fn evict(rig: &mut Rig, victim: SessionId) -> bool {
     match snap {
         Ok(snap) => match rig.swap.park(victim.0, snap) {
             Ok(()) => {
-                rig.sessions.mark_swapped(&mut rig.pool, &mut rig.adm, victim);
+                rig.sessions
+                    .mark_swapped(&mut rig.pool, &mut rig.adm, victim);
                 true
             }
             Err(_) => {

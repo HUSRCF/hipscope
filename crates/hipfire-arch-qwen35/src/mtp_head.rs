@@ -2199,14 +2199,7 @@ fn weight_gemm_batched(
     rotated_x_scratch: Option<&GpuTensor>,
 ) -> HipResult<()> {
     match w.gpu_dtype {
-        DType::Q8_0 => gpu.gemm_q8_0_batched_f32_chunked(
-            &w.buf,
-            x_batched,
-            y_batched,
-            w.m,
-            w.k,
-            n,
-        ),
+        DType::Q8_0 => gpu.gemm_q8_0_batched_f32_chunked(&w.buf, x_batched, y_batched, w.m, w.k, n),
         DType::HFQ4G256 => gpu.gemm_hfq4g256(&w.buf, x_batched, y_batched, w.m, w.k, n),
         DType::MQ4G256 => {
             // MQ4 needs an FWHT-rotated x first (matches trunk lm_head + dflash patterns).
