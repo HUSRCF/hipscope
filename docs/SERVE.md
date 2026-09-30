@@ -83,12 +83,19 @@ Config and env owners for bind, idle, queue, and body limits:
 3. **Pre-warm (default).** Loads the chosen model asynchronously. Failures log
    and leave the process serving; the model loads on the first real request.
 4. **HTTP.** The native server accepts traffic. Only one generation holds the
-   daemon lock at a time (bounded queue).
+   daemon lock at a time (bounded queue). A failed `accept` (for example, out
+   of file descriptors) is logged and retried, never fatal. At most 512
+   connections are served at once; further connects wait in the listen
+   backlog. A client must send a complete request head within 30 s of
+   connecting or of its previous response, which also closes idle keep-alive
+   connections.
 5. **Idle eviction.** When `idle_timeout > 0`, an interval unloads the model
    after idle seconds **and** only when no generation is in flight and the
    serve lock is free. Next request reloads.
 6. **Stop.** `hipfire stop` validates pid ownership before SIGTERM. Stale reused
-   pids are **not** killed; the pidfile is removed instead.
+   pids are **not** killed; the pidfile is removed instead. On SIGTERM or
+   Ctrl-C, serve stops accepting and frees the port at once, lets requests in
+   flight finish for up to 30 s, then exits; a second signal exits at once.
 
 Detached readiness: parent polls `GET /health` for up to **60 seconds**.
 `/health` means the native process is answering; inspect `model` and
@@ -134,12 +141,21 @@ curl -N http://127.0.0.1:11435/v1/chat/completions \
 ```
 
 - **`stream: true`** (typical clients): SSE `data: {chat.completion.chunk}`
-  lines until `data: [DONE]`.
+  lines until `data: [DONE]`. The `200` and the role chunk go out when
+  generation sends its first frame, or after 15 s of silence (cold load, long
+  prefill), so a request that fails before then gets the same JSON error and
+  status as a non-stream request. A stream that fails after that ends with
+  `data: {"error": {"message", "type"}}` and then `data: [DONE]`. Until
+  `[DONE]`, 15 s without a frame sends a `: keepalive` SSE comment, which
+  SSE parsers ignore.
 - **`stream: false` / omitted falsey:** single `chat.completion` JSON body.
 - Oversized body → **413** before the daemon lock (Content-Length or streamed
   cap at `max_request_bytes`).
 - Saturated admission queue → **503** with `Retry-After`.
 - Invalid JSON body → **400**.
+- Daemon errors map on their typed class: `validation`, `context_length`,
+  `unsupported` → **400**; `transient` → **503** with `Retry-After: 1`; any
+  other class → **500**. An unknown model → **404**.
 
 Request fields honored by the serve layer (non-exhaustive; sampling falls
 through to per-model / registry / daemon defaults when omitted):

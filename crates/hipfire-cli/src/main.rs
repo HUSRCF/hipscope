@@ -12982,4 +12982,385 @@ mod tests {
             }
         }
     }
+
+    /// Raw `POST /v1/chat/completions` with `Connection: close`: status, the
+    /// lowercased response head, and the de-chunked body. Panics if a chunked
+    /// body ends without its terminating zero-size chunk (a torn stream).
+    #[cfg(unix)]
+    fn raw_chat_post(port: u16, body: &serde_json::Value) -> (u16, String, Vec<u8>) {
+        let payload = body.to_string();
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect serve");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("read timeout");
+        write!(
+            stream,
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{payload}",
+            payload.len()
+        )
+        .expect("write request");
+        let mut raw = Vec::new();
+        let _ = stream.read_to_end(&mut raw);
+        let split = raw
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("response head");
+        let head = String::from_utf8_lossy(&raw[..split]).to_ascii_lowercase();
+        let status = head
+            .split_whitespace()
+            .nth(1)
+            .and_then(|code| code.parse().ok())
+            .expect("status code");
+        let mut rest = &raw[split + 4..];
+        if !head.contains("transfer-encoding: chunked") {
+            return (status, head, rest.to_vec());
+        }
+        let mut body = Vec::new();
+        loop {
+            let line_end = rest
+                .windows(2)
+                .position(|w| w == b"\r\n")
+                .unwrap_or_else(|| {
+                    panic!(
+                        "torn chunked body after {:?}",
+                        String::from_utf8_lossy(&body)
+                    )
+                });
+            let size = usize::from_str_radix(
+                std::str::from_utf8(&rest[..line_end]).expect("chunk size"),
+                16,
+            )
+            .expect("chunk size hex");
+            rest = &rest[line_end + 2..];
+            if size == 0 {
+                return (status, head, body);
+            }
+            assert!(
+                rest.len() >= size + 2,
+                "torn chunked body after {:?}",
+                String::from_utf8_lossy(&body)
+            );
+            body.extend_from_slice(&rest[..size]);
+            rest = &rest[size + 2..];
+        }
+    }
+
+    /// `data:` payloads of an SSE body, in order.
+    #[cfg(unix)]
+    fn sse_payloads(body: &[u8]) -> Vec<String> {
+        String::from_utf8_lossy(body)
+            .split("\n\n")
+            .filter_map(|frame| frame.strip_prefix("data: "))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// Error status comes from the daemon's typed class, and a stream that
+    /// fails before its first frame is an ordinary JSON error, not a 200.
+    #[cfg(unix)]
+    #[test]
+    fn typed_errors_keep_their_status_stream_and_nonstream() {
+        let harness = Task11HttpHarness::spawn("error-status");
+        let port = harness.port();
+        for stream in [false, true] {
+            for (tag, status) in [
+                ("t15-class-validation", 400),
+                ("t15-class-context", 400),
+                ("t15-class-unsupported", 400),
+                ("t15-class-internal", 500),
+                ("t15-transient-always", 503),
+            ] {
+                let (got, head, body) = raw_chat_post(port, &harness.base_body(tag, stream));
+                assert_eq!(got, status, "{tag} stream={stream}: {head}");
+                assert!(
+                    head.contains("content-type: application/json"),
+                    "{tag}: {head}"
+                );
+                let err: serde_json::Value = serde_json::from_slice(&body)
+                    .unwrap_or_else(|e| panic!("{tag}: one JSON error body ({e}): {body:?}"));
+                assert!(
+                    err.pointer("/error/message")
+                        .and_then(|v| v.as_str())
+                        .is_some(),
+                    "{tag}: {err}"
+                );
+                assert_eq!(
+                    head.contains("retry-after: 1"),
+                    status == 503,
+                    "{tag}: Retry-After only on 503: {head}"
+                );
+            }
+            // Gateway validation (no daemon class) also fails before commit.
+            let mut body = harness.base_body("t11-stop-text", stream);
+            body["max_tokens"] = serde_json::json!(0);
+            let (got, _, raw) = raw_chat_post(port, &body);
+            assert_eq!(got, 400, "max_tokens=0 stream={stream}");
+            assert!(String::from_utf8_lossy(&raw).contains("max_tokens"));
+        }
+    }
+
+    /// A stream that fails after it committed ends with an OpenAI error event
+    /// and `[DONE]` inside a cleanly terminated body, never a torn one.
+    #[cfg(unix)]
+    #[test]
+    fn stream_failure_after_first_token_ends_with_error_event_and_done() {
+        let harness = Task11HttpHarness::spawn("midstream-error");
+        let port = harness.port();
+        let (status, _, body) = raw_chat_post(port, &harness.base_body("t15-visible-token", true));
+        assert_eq!(status, 200);
+        let payloads = sse_payloads(&body);
+        let [role, token, error, done] = payloads.as_slice() else {
+            panic!("role, token, error, [DONE] expected: {payloads:?}");
+        };
+        assert!(role.contains(r#""role":"assistant""#), "{role}");
+        assert!(token.contains("visible-before-fail"), "{token}");
+        let error: serde_json::Value = serde_json::from_str(error).expect("error event JSON");
+        assert_eq!(error["error"]["type"], "server_error", "{error}");
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("transient after visible token")),
+            "{error}"
+        );
+        assert_eq!(done, "[DONE]");
+
+        // The OpenAI-compatible client reports the server's message.
+        match capture_stream(port, harness.base_body("t15-visible-token", true)) {
+            Err(hipfire_client::ClientError::Http(message)) => {
+                assert!(
+                    message.contains("transient after visible token"),
+                    "{message}"
+                )
+            }
+            other => panic!("expected the stream's error event, got {other:?}"),
+        }
+
+        // Daemon death mid-stream is reported the same way.
+        let (status, _, body) = raw_chat_post(port, &harness.base_body("t11-premature-eof", true));
+        assert_eq!(status, 200);
+        let payloads = sse_payloads(&body);
+        assert!(payloads[1].contains("partial-before-eof"), "{payloads:?}");
+        assert!(payloads[2].contains(r#""error""#), "{payloads:?}");
+        assert_eq!(payloads.last().map(String::as_str), Some("[DONE]"));
+    }
+
+    /// Marks the child run of `accept_errors_do_not_stop_serving` (not a
+    /// product setting, so no `HIPFIRE_` prefix).
+    #[cfg(unix)]
+    const EMFILE_CHILD_ENV: &str = "T11_EMFILE_CHILD";
+
+    /// A failed `accept` must not end the server. A child process runs the
+    /// serve harness and then takes every free descriptor, so the kernel
+    /// completes this test's connect but serve's `accept` fails with EMFILE.
+    /// Once the child gives the descriptors back, the same connection must
+    /// be served.
+    #[cfg(unix)]
+    #[test]
+    fn accept_errors_do_not_stop_serving() {
+        use std::io::{BufRead, BufReader};
+        use std::process::{Command, Stdio};
+        if env::var_os(EMFILE_CHILD_ENV).is_some() {
+            return emfile_child();
+        }
+        let mut child = Command::new(env::current_exe().unwrap())
+            .args([
+                "tests::accept_errors_do_not_stop_serving",
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(EMFILE_CHILD_ENV, "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn child test");
+        // Keep the read end open until the child exits: a closed pipe would
+        // make its test output fail.
+        let mut child_stdout = BufReader::new(child.stdout.take().unwrap());
+        let port: u16 = loop {
+            let mut line = String::new();
+            assert!(
+                child_stdout.read_line(&mut line).unwrap() > 0,
+                "child exited before it held every descriptor"
+            );
+            // libtest prints "test <name> ... " on the same line first.
+            if let Some((_, port)) = line.trim().split_once("EMFILE_READY ") {
+                break port.parse().unwrap();
+            }
+        };
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        stream
+            .write_all(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        let mut child_stdin = child.stdin.take().unwrap();
+        writeln!(child_stdin, "connected").unwrap();
+        let mut response = String::new();
+        let _ = stream.read_to_string(&mut response);
+        drop(child_stdin);
+        let output = child.wait_with_output().expect("child test");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("accept failed"),
+            "serve never hit an accept error: {stderr}"
+        );
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "connection not served after EMFILE: {response:?}\n{stderr}"
+        );
+        assert!(output.status.success(), "child test failed: {stderr}");
+        drop(child_stdout);
+    }
+
+    #[cfg(unix)]
+    fn emfile_child() {
+        let harness = Task11HttpHarness::spawn("emfile");
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+            0
+        );
+        limit.rlim_cur = limit.rlim_cur.min(256);
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+        let mut hogs = Vec::new();
+        while let Ok(file) = fs::File::open("/dev/null") {
+            hogs.push(file);
+        }
+        println!("EMFILE_READY {}", harness.port());
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line).unwrap();
+        // Serve fails its accept and backs off meanwhile.
+        thread::sleep(Duration::from_millis(300));
+        drop(hogs);
+        // The parent closes stdin once it has its response.
+        let _ = std::io::stdin().read_line(&mut line);
+    }
+
+    /// One `/metrics` sample value, by exact series name.
+    #[cfg(unix)]
+    fn metric(port: u16, name: &str) -> u64 {
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        stream
+            .write_all(b"GET /metrics HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        let mut text = String::new();
+        stream.read_to_string(&mut text).unwrap();
+        text.lines()
+            .find_map(|line| line.strip_prefix(&format!("{name} ")))
+            .unwrap_or_else(|| panic!("{name} missing from /metrics: {text}"))
+            .parse()
+            .unwrap()
+    }
+
+    /// Failed generations and admission rejections reach `/metrics`, each in
+    /// its own counter; successes reach neither.
+    #[cfg(unix)]
+    #[test]
+    fn failures_and_admission_rejections_are_counted() {
+        let harness = Task11HttpHarness::spawn("metrics-counters");
+        let port = harness.port();
+        let failed = "hipfire_requests_failed_total";
+        let rejected = "hipfire_admission_rejected_total";
+
+        // JSON error, stream rejected before commit, stream failing after it.
+        for (tag, stream, status) in [
+            ("t15-class-validation", false, 400),
+            ("t15-class-internal", true, 500),
+            ("t15-visible-token", true, 200),
+            ("t11-stop-text", false, 200),
+            ("t11-stop-text", true, 200),
+        ] {
+            let (got, _, _) = raw_chat_post(port, &harness.base_body(tag, stream));
+            assert_eq!(got, status, "{tag} stream={stream}");
+        }
+        assert_eq!(metric(port, failed), 3);
+        assert_eq!(metric(port, rejected), 0);
+
+        // Hold the only slot and fill the four-deep queue: the next request
+        // is refused by admission.
+        let held = harness.shared.admission.acquire().unwrap();
+        let queued: Vec<_> = (0..4)
+            .map(|_| {
+                let body = harness.base_body("t11-stop-text", false);
+                thread::spawn(move || raw_chat_post(port, &body).0)
+            })
+            .collect();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while harness.shared.admission.inflight() < 5 {
+            assert!(Instant::now() < deadline, "queue never filled");
+            thread::sleep(Duration::from_millis(10));
+        }
+        let (status, head, _) = raw_chat_post(port, &harness.base_body("t11-stop-text", false));
+        assert_eq!(status, 503, "{head}");
+        drop(held);
+        for waiter in queued {
+            assert_eq!(waiter.join().unwrap(), 200);
+        }
+        assert_eq!(metric(port, rejected), 1);
+        assert_eq!(metric(port, failed), 3);
+    }
+
+    /// An image request queued for admission must not block the server: the
+    /// harness serves on one runtime thread, which a blocking wait would hold.
+    #[cfg(unix)]
+    #[test]
+    fn queued_image_request_does_not_block_the_server() {
+        let harness = Task11HttpHarness::spawn("images-admission");
+        let port = harness.port();
+        let held = harness.shared.admission.acquire().unwrap();
+        let image = thread::spawn(move || {
+            // `images` is refused only after admission, so this never
+            // reaches the daemon once it leaves the queue.
+            let payload = r#"{"prompt":"a red cube","images":["x"]}"#;
+            let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            write!(
+                stream,
+                "POST /v1/images/generations HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+                 Content-Type: application/json\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n{payload}",
+                payload.len()
+            )
+            .unwrap();
+            let mut response = String::new();
+            let _ = stream.read_to_string(&mut response);
+            response
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while harness.shared.admission.inflight() < 2 {
+            assert!(Instant::now() < deadline, "image request never queued");
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let mut health = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        health
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        health
+            .write_all(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        let mut response = String::new();
+        let _ = health.read_to_string(&mut response);
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "/health stalled behind a queued image request: {response:?}"
+        );
+
+        drop(held);
+        let response = image.join().unwrap();
+        assert!(
+            response.starts_with("HTTP/1.1 400") && response.contains("not a field"),
+            "{response}"
+        );
+    }
 }
