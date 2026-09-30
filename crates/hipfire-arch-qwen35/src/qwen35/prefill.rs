@@ -171,7 +171,7 @@ fn residual_fold_consumer_ready(
 ) -> bool {
     w_gate.gpu_dtype == DType::MQ4G256V2
         && gpu.iu4_producer_sidecar_active(n, dim)
-        && !mq_f16_projection_fast_route(gpu, fusion, n, dim)
+        && !mq_f16_projection_weight_fast_route(gpu, fusion, n, dim, w_gate)
 }
 
 /// Residual GEMM of an out-projection whose FFN norm follows directly:
@@ -6032,6 +6032,21 @@ fn mq_f16_projection_fast_route(gpu: &Gpu, fusion: DflashFusionCtx, n: usize, di
         && !gpu.replay.is_recording()
 }
 
+/// The gfx1201 AWQ producer is not admitted: its reduction tree can move the
+/// final F16 result by one ULP relative to the historical F32+cast path. Keep
+/// the already-shipped gfx1100 policy unchanged, but fail closed on gfx1201.
+#[inline]
+fn mq_f16_projection_weight_fast_route(
+    gpu: &Gpu,
+    fusion: DflashFusionCtx,
+    n: usize,
+    dim: usize,
+    next_linear: &hipfire_runtime::llama::WeightTensor,
+) -> bool {
+    mq_f16_projection_fast_route(gpu, fusion, n, dim)
+        && (gpu.arch != "gfx1201" || next_linear.awq_scale.is_none())
+}
+
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 /// Prescaffold (behavior-only) extraction for S3-f16-projection-inputs.
@@ -6062,7 +6077,7 @@ fn batch_chunk_delta_net_input_projection(
     // bit-identical projection outputs. All four weights must share the
     // exact MQ4G256V2 stride (the fused kernel reads them as same-stride
     // byte arrays); anything else stays on the pre-change path.
-    if mq_f16_projection_fast_route(gpu, fusion, n, dim)
+    if mq_f16_projection_weight_fast_route(gpu, fusion, n, dim, &layer.wqkv)
         && layer.wqkv.gpu_dtype == DType::MQ4G256V2
         && layer.wz.gpu_dtype == DType::MQ4G256V2
         && layer.w_beta.gpu_dtype == DType::MQ4G256V2
@@ -7692,7 +7707,7 @@ fn batch_chunk_delta_net_ffn_gate_up(
     let _ = fusion;
     // S3-f16-projection-inputs fast path: exact-FP16 FFN gate/up inputs.
     // gate/up share the pre-rotation input, so both must be MQ4G256V2.
-    if mq_f16_projection_fast_route(gpu, fusion, n, dim)
+    if mq_f16_projection_weight_fast_route(gpu, fusion, n, dim, &layer.w_gate)
         && layer.w_gate.gpu_dtype == DType::MQ4G256V2
         && layer.w_up.gpu_dtype == DType::MQ4G256V2
     {
@@ -8338,7 +8353,7 @@ fn batch_chunk_full_attn_input_projection(
     // S3-f16-projection-inputs fast path: exact-FP16 FA qkv inputs. The
     // fused QKV kernel requires all three weights to share the MQ4G256V2
     // stride (same gate as `qkv_same_dtype` below, restricted to MQ4V2).
-    if mq_f16_projection_fast_route(gpu, fusion, n, dim)
+    if mq_f16_projection_weight_fast_route(gpu, fusion, n, dim, &layer.wq)
         && layer.wq.gpu_dtype == DType::MQ4G256V2
         && layer.wk.gpu_dtype == DType::MQ4G256V2
         && layer.wv.gpu_dtype == DType::MQ4G256V2
@@ -9818,7 +9833,7 @@ fn batch_chunk_full_attn_ffn_gate_up(
 ) -> HipResult<FfnGateOutput> {
     let _ = fusion;
     // S3-f16-projection-inputs fast path: exact-FP16 FA-FFN gate/up inputs.
-    if mq_f16_projection_fast_route(gpu, fusion, n, dim)
+    if mq_f16_projection_weight_fast_route(gpu, fusion, n, dim, &layer.w_gate)
         && layer.w_gate.gpu_dtype == DType::MQ4G256V2
         && layer.w_up.gpu_dtype == DType::MQ4G256V2
     {
