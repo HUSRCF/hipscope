@@ -173,12 +173,13 @@ pub fn build_speculator(
     spec: hipfire_runtime::loader_api::SpecLoadCfg,
 ) -> Option<Box<dyn Speculator>> {
     if let Some(df) = dflash {
-        // `None` = loader default (on); env HIPFIRE_DFLASH_ADAPTIVE_B=0 still
-        // wins inside the constructor, mirroring the DSpark opt-out.
+        // `None` = loader default (off: fixed block); env
+        // HIPFIRE_DFLASH_ADAPTIVE_B=0 still wins inside the constructor when
+        // the knob is on, mirroring the DSpark opt-out.
         return Some(build_dflash_speculator(
             df,
             eviction_is_none,
-            spec.dflash_adaptive_b.unwrap_or(true),
+            spec.dflash_adaptive_b.unwrap_or(false),
         ));
     }
     // qwen35 MTP head (arch 5/6). MTP wins over n-gram when present; the load

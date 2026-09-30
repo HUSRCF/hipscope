@@ -1780,15 +1780,15 @@ fn main() {
                     .unwrap_or(hipfire_runtime::config::get().mtp_k);
                 let mtp_path = request_guards::mtp_sidecar_path(&msg, &mtp_mode);
 
-                // DFlash adaptive verify-block (default on): clamp(ceil(τ̂)+2, 2, full)
-                // over the trailing 8 verify cycles, full below 2k ctx. Mutually
-                // exclusive with the retained-PM4 route (fixed B=16 shape);
+                // DFlash adaptive verify-block (opt-in, default off): clamp(ceil(τ̂)+2,
+                // 2, full) over the trailing 8 verify cycles, full below 2k ctx.
+                // Mutually exclusive with the retained-PM4 route (fixed B=16 shape);
                 // HIPFIRE_DFLASH_ADAPTIVE_B=0 forces fixed.
                 let adaptive_b = msg
                     .get("params")
                     .and_then(|p| p.get("dflash_adaptive_b"))
                     .and_then(|v| v.as_bool())
-                    .unwrap_or(true);
+                    .unwrap_or(false);
 
                 // Model-free n-gram policy normally arrives as per-load params
                 // resolved by the CLI. Direct protocol clients inherit the

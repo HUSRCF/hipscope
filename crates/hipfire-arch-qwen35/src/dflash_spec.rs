@@ -1237,7 +1237,7 @@ impl Speculator for DflashSpeculator {
 /// (`HIPFIRE_DFLASH_ADAPTIVE_B=0` forces the fixed full block, mirroring
 /// DSpark's `HIPFIRE_DSPARK_ADAPTIVE_BLOCK=0`). Called once at load.
 /// `adaptive_b` is the `SpecLoadCfg::dflash_adaptive_b` load param (None =
-/// default on).
+/// default off).
 pub fn build_dflash_speculator(
     df: DflashState,
     eviction_is_none: bool,
@@ -1258,7 +1258,8 @@ pub fn build_dflash_speculator(
         .and_then(|v| v.parse().ok())
         .unwrap_or(8usize)
         .max(1);
-    // Default-on; HIPFIRE_DFLASH_ADAPTIVE_B=0 opts out (fixed block == today).
+    // Opt-in (load param, default off); HIPFIRE_DFLASH_ADAPTIVE_B=0 still
+    // forces the fixed block when the param is on.
     // The load param ANDs into this here so the constructor stays the single
     // env-touching site and `new` stays pure (mirrors
     // build_dspark_speculator).
