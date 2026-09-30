@@ -992,8 +992,8 @@ pub fn hyper_write_norm(
         return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
     }
     gpu.ensure_kernel(
-        "gemv_bf16_xf32",
-        crate::kernels::GEMV_BF16_XF32_SRC,
+        "qwen4_gemv_bf16_xf32",
+        crate::kernels::QWEN4_GEMV_BF16_XF32_SRC,
         "hyper_write_norm_f32",
     )?;
     let null = std::ptr::null_mut();

@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Philipp Hug
 // hipfire — see LICENSE and NOTICE in the project root.
+//
+// Qwen4 copy of gemm_f16_x_f16_wmma_lds256.hip as #774 left it (LDS-only WLDS barrier on
+// gfx1151, the 64x64 k64 tiles). Qwen4's 64x64 tiles load from here, the shipped module on
+// gfx1151 only; the original file keeps the shipped text elsewhere.
 
 // Parameterised LDS-staged WMMA GEMM: F16 weight × F16 input → F32 output,
 // fused bias. gfx1100+ only (RDNA3 / RDNA3.5 wave32 WMMA, 16×16×16 tiles).
@@ -669,6 +673,17 @@ typedef float    __attribute__((ext_vector_type(8)))  float8_t;
 // pattern differs).
 #define WLDS_STAGE_EPILOGUE 1
 
+// Block barrier over LDS only.  On gfx11 __syncthreads is a workgroup fence
+// that also waits for every in-flight global load (WGP mode), including the
+// pipelined next stage; the tile kernels share nothing through global memory.
+// Taken on gfx1151, where it was measured; every other arch keeps
+// __syncthreads, so its WLDS kernels compile exactly as before.
+#if defined(__gfx1151__)
+#define WLDS_BARRIER() asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory")
+#else
+#define WLDS_BARRIER() __syncthreads()
+#endif
+
 // Bytes of LDS the K staging needs, and the slab the coalesced epilogue would
 // need: one 16-column slab of every wave's WROWS×16 patch, padded to 17.
 #define WLDS_KSTAGE_BYTES(BM, BN, KS) ((KS) / 16 * ((BM) + (BN)) * 16 * 2)
@@ -878,7 +893,7 @@ __device__ __forceinline__ void gemm_f16_wmma_lds_tile(
                 *wlds_dst<BN, KT>(x_lds, v) = x_reg[p];
             }
 
-            __syncthreads();
+            WLDS_BARRIER();
 
             // Issue stage k0 + KS NOW, before the WMMA. The loads are
             // independent of everything the WMMA loop touches, so their DRAM
@@ -907,7 +922,7 @@ __device__ __forceinline__ void gemm_f16_wmma_lds_tile(
 
             wlds_wmma_stage<BM, BN, WP, WQ, KT>(a_lds, x_lds, wave_m, wave_n, ml, acc);
 
-            __syncthreads();
+            WLDS_BARRIER();
         }
     } else {
         for (int k0 = 0; k0 < K; k0 += KS) {
@@ -928,11 +943,11 @@ __device__ __forceinline__ void gemm_f16_wmma_lds_tile(
                 *wlds_dst<BN, KT>(x_lds, v) = *wlds_src<KT>(X, B, ldx, n_block, k0, v);
             }
 
-            __syncthreads();
+            WLDS_BARRIER();
 
             wlds_wmma_stage<BM, BN, WP, WQ, KT>(a_lds, x_lds, wave_m, wave_n, ml, acc);
 
-            __syncthreads();
+            WLDS_BARRIER();
         }
     }
 
@@ -957,7 +972,7 @@ __device__ __forceinline__ void gemm_f16_wmma_lds_tile(
         float* slab = stage + wave_id * WROWS * STG;
         for (int j = 0; j < WQ; j++) {
             // Round j's writes must not overtake round j-1's reads.
-            __syncthreads();
+            WLDS_BARRIER();
             #pragma unroll
             for (int i = 0; i < WP; i++) {
                 const float8_t v = acc[i * WQ + j];
@@ -966,7 +981,7 @@ __device__ __forceinline__ void gemm_f16_wmma_lds_tile(
                     slab[(i * 16 + 2 * e + row_half) * STG + ml] = v[e];
                 }
             }
-            __syncthreads();
+            WLDS_BARRIER();
             // 32 lanes per WROWS rows of M; WROWS is 32 or 64.
             #pragma unroll
             for (int mc = 0; mc < WROWS; mc += 32) {
@@ -1162,6 +1177,10 @@ WLDS_KERNEL(gemm_wmma_lds_128_256_32_64_k64_p,  128, 256, 2, 4, 64, false, true)
 WLDS_KERNEL(gemm_wmma_lds_128_128_32_64_k64_p,  128, 128, 2, 4, 64, false, true)
 WLDS_KERNEL(gemm_wmma_lds_256_256_64_64_k64_p,  256, 256, 4, 4, 64, false, true)
 WLDS_KERNEL(gemm_wmma_lds_128_256_64_64_k32_p,  128, 256, 4, 4, 32, false, true)
+// Qwen4 HC input_mix_down (M = 320, K = 10240): a 128-row tile leaves 3 x 9
+// workgroups for 40 CUs; 64 x 64 gives 90 (same K order per output, bitwise).
+WLDS_KERNEL(gemm_wmma_lds_64_64_32_64_k64,       64,  64, 2, 4, 64, false, false)
+WLDS_KERNEL(gemm_wmma_lds_64_64_32_64_k64_p,     64,  64, 2, 4, 64, false, true)
 
 // --- Fused-epilogue instantiations ------------------------------------------
 // Only the five tiles Gpu::lds_tile_for can return (the three per-arch

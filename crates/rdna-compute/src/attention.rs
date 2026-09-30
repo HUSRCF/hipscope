@@ -16819,8 +16819,8 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel(
-            "hc_streams_init_from_embed_batched",
-            kernels::HC_STREAMS_INIT_FROM_EMBED_BATCHED_SRC,
+            "qwen4_hc_streams_init_from_embed_batched",
+            kernels::QWEN4_HC_STREAMS_INIT_FROM_EMBED_BATCHED_SRC,
             "hc_streams_init_from_embed_batched_bf16",
         )?;
         let ep = embed.buf.as_ptr();

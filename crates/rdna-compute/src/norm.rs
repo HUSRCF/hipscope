@@ -2034,8 +2034,8 @@ impl Gpu {
             hip_bridge::HipError::new(0, "bf16_round_trip_f32_strided: extent exceeds i32")
         })?;
         self.ensure_kernel(
-            "bf16_round_trip",
-            kernels::BF16_ROUND_TRIP_SRC,
+            "qwen4_bf16_round_trip",
+            kernels::QWEN4_BF16_ROUND_TRIP_SRC,
             "bf16_round_trip_f32_strided",
         )?;
         let xp = x.buf.as_ptr();

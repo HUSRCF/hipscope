@@ -383,7 +383,7 @@ impl Gpu {
         self.bind_thread()?;
         self.ensure_kernel(
             "moe_scatter_fused_k8",
-            kernels::MOE_SCATTER_FUSED_K8_SRC,
+            kernels::moe_scatter_fused_k8_src(self.arch_caps.is_gfx1151()),
             "moe_scatter_fused_k8",
         )?;
         let ip = topk_indices.buf.as_ptr();

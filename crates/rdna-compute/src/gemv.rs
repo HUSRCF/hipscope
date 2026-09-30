@@ -15539,7 +15539,7 @@ impl Gpu {
         self.bind_thread()?;
         self.ensure_kernel(
             "gemv_mq4g256v2_moe_gate_up_k8_indexed_batched",
-            kernels::GEMV_MQ4G256V2_MOE_GATE_UP_K8_INDEXED_BATCHED_SRC,
+            kernels::gemv_mq4g256v2_moe_gate_up_k8_indexed_batched_src(self.arch_caps.is_gfx1151()),
             "gemv_mq4g256v2_moe_gate_up_k8_indexed_batched",
         )?;
         let pp = expert_ptrs.buf.as_ptr();
@@ -17766,7 +17766,7 @@ impl Gpu {
         self.bind_thread()?;
         self.ensure_kernel(
             "gemv_bf16_xf32",
-            kernels::GEMV_BF16_XF32_SRC,
+            kernels::gemv_bf16_xf32_src(self.arch_caps.is_gfx1151()),
             "gemv_bf16_xf32",
         )?;
 
@@ -17825,8 +17825,8 @@ impl Gpu {
         }
         self.bind_thread()?;
         self.ensure_kernel(
-            "gemv_bf16_xf32",
-            kernels::GEMV_BF16_XF32_SRC,
+            "qwen4_gemv_bf16_xf32",
+            kernels::QWEN4_GEMV_BF16_XF32_SRC,
             "gemv_bf16_xf32_k4",
         )?;
         self.launch_gemv_split("gemv_bf16_xf32_k4", 128, weight, x, y, m, k, hc_act_scale)
@@ -18330,7 +18330,11 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         const FUNC: &str = "gemv_bf16_xf32_bf16_scaled_add";
-        self.ensure_kernel("gemv_bf16_xf32", kernels::GEMV_BF16_XF32_SRC, FUNC)?;
+        self.ensure_kernel(
+            "qwen4_gemv_bf16_xf32",
+            kernels::QWEN4_GEMV_BF16_XF32_SRC,
+            FUNC,
+        )?;
         let w_ptr = weight.buf.as_ptr();
         let x_ptr = x.buf.as_ptr();
         let r_ptr = residual.buf.as_ptr();
@@ -18368,8 +18372,8 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel(
-            "gemv_bf16_xf32",
-            kernels::GEMV_BF16_XF32_SRC,
+            "qwen4_gemv_bf16_xf32",
+            kernels::QWEN4_GEMV_BF16_XF32_SRC,
             "gemv_bf16_xf32_x4",
         )?;
         let w = parts.map(|(w, _, _)| w.buf.as_ptr());
@@ -18515,7 +18519,11 @@ impl Gpu {
         }
         let func = FUNCS[rows - 2];
         self.bind_thread()?;
-        self.ensure_kernel("gemv_bf16_xf32", kernels::GEMV_BF16_XF32_SRC, func)?;
+        self.ensure_kernel(
+            "qwen4_gemv_bf16_xf32",
+            kernels::QWEN4_GEMV_BF16_XF32_SRC,
+            func,
+        )?;
         let w = parts.map(|(w, _, _)| w.buf.as_ptr());
         let y = parts.map(|(_, y, _)| y.buf.as_ptr());
         let m = parts.map(|(_, _, m)| m as i32);
@@ -20274,10 +20282,11 @@ impl Gpu {
         k: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let (v2_src, v2_module) =
-            kernels::gemv_mq6g256v2_for_arch(&self.arch_caps, self.flags.rdna2_variant);
-        let module_v2 = format!("{}_mq6v2", v2_module);
-        self.ensure_kernel(&module_v2, v2_src, "gemv_mq6g256v2_x4")?;
+        self.ensure_kernel(
+            "qwen4_gemv_mq6g256v2",
+            kernels::QWEN4_GEMV_MQ6G256V2_SRC,
+            "gemv_mq6g256v2_x4",
+        )?;
         let a = parts.map(|(w, _, _)| w.buf.as_ptr());
         let y = parts.map(|(_, y, _)| y.buf.as_ptr());
         let m = parts.map(|(_, _, m)| m as i32);

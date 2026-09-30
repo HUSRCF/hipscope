@@ -14558,7 +14558,13 @@ impl Gpu {
             ));
         }
         let (kernel_name, kernel_src) = kernels::mq4g256v2_moe_grouped_wmma_source(is_gfx12);
-        // The BF16-output entries exist in the gfx11 source only.
+        // The BF16-output entries exist in the gfx11 source only, in #774's
+        // copy, which the shipped `_k2` module also takes on gfx1151.
+        let kernel_src = if !is_gfx12 && (gfx11_entry.is_some() || self.arch_caps.is_gfx1151()) {
+            kernels::QWEN4_GEMM_MQ4G256V2_MOE_GROUPED_WMMA_K2_SRC
+        } else {
+            kernel_src
+        };
         let kernel_name = match (gfx11_entry, is_gfx12) {
             (None, _) => kernel_name,
             (Some(entry), false) => entry,
@@ -28883,11 +28889,8 @@ impl Gpu {
         // One wave per wm×wn output patch, 32 threads each.
         let threads = ((bm / wm) * (bn / wn) * 32) as u32;
         self.bind_thread()?;
-        self.ensure_kernel(
-            Self::LDS256_MODULE,
-            kernels::GEMM_F16_X_F16_WMMA_LDS256_SRC,
-            &entry,
-        )?;
+        let (module, source) = self.lds256_tile_module(&entry);
+        self.ensure_kernel(module, source, &entry)?;
         let ap = a_f16.buf.as_ptr();
         let xp = x_f16.buf.as_ptr();
         let yp = y_f32.buf.as_ptr();
@@ -28946,6 +28949,29 @@ impl Gpu {
     /// exactly as the other multi-entry sources in this crate do.
     const LDS256_MODULE: &'static str = "gemm_wmma_lds256";
 
+    /// Module and source of an `EPI = 0` LDS tile entry. #774's 64x64 k64
+    /// tiles exist only in its copy of the source: module `qwen4_gemm_wmma_lds256`,
+    /// except on gfx1151, where the shipped module already compiles that copy
+    /// (one ~30 s JIT of this translation unit instead of two).
+    fn lds256_tile_module(&self, entry: &str) -> (&'static str, &'static str) {
+        let is_gfx1151 = self.arch_caps.is_gfx1151();
+        let qwen4_tile = matches!(
+            entry,
+            "gemm_wmma_lds_64_64_32_64_k64" | "gemm_wmma_lds_64_64_32_64_k64_p"
+        );
+        if qwen4_tile && !is_gfx1151 {
+            (
+                "qwen4_gemm_wmma_lds256",
+                kernels::QWEN4_GEMM_F16_X_F16_WMMA_LDS256_SRC,
+            )
+        } else {
+            (
+                Self::LDS256_MODULE,
+                kernels::gemm_f16_x_f16_wmma_lds256_src(is_gfx1151),
+            )
+        }
+    }
+
     /// A/B knob for the coalesced (LDS-staged) epilogue: `HIPFIRE_LDS_EPI_DIRECT=1`
     /// compiles the same source with `WLDS_STAGE_EPILOGUE 0`, i.e. the direct
     /// store that writes along B at a stride of `4·M`. Both arms are
@@ -28963,7 +28989,7 @@ impl Gpu {
                 const FROM: &str = "#define WLDS_STAGE_EPILOGUE 1";
                 // A patch that matched nothing would silently compile the
                 // default arm and be written up as a null A/B result.
-                let base = kernels::GEMM_F16_X_F16_WMMA_LDS256_SRC;
+                let base = kernels::gemm_f16_x_f16_wmma_lds256_src(self.arch_caps.is_gfx1151());
                 assert!(
                     base.contains(FROM),
                     "lds256_source: no `{FROM}` in the kernel"
@@ -28977,7 +29003,9 @@ impl Gpu {
         } else {
             (
                 Self::LDS256_MODULE,
-                std::borrow::Cow::Borrowed(kernels::GEMM_F16_X_F16_WMMA_LDS256_SRC),
+                std::borrow::Cow::Borrowed(kernels::gemm_f16_x_f16_wmma_lds256_src(
+                    self.arch_caps.is_gfx1151(),
+                )),
             )
         }
     }
@@ -37190,7 +37218,11 @@ impl Gpu {
         } else {
             "gemm_mqv2_wmma_gfx1100_bt"
         };
-        self.ensure_kernel(module, kernels::GEMM_MQV2_WMMA_GFX11_BT_SRC, func_name)?;
+        self.ensure_kernel(
+            module,
+            kernels::gemm_mqv2_wmma_gfx11_bt_src(self.arch_caps.is_gfx1151()),
+            func_name,
+        )?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
         let mut aq = a_qkv.buf.as_ptr();
         let mut az = a_z.buf.as_ptr();
@@ -37319,7 +37351,11 @@ impl Gpu {
         } else {
             "gemm_mqv2_wmma_gfx1100_bt"
         };
-        self.ensure_kernel(module, kernels::GEMM_MQV2_WMMA_GFX11_BT_SRC, func_name)?;
+        self.ensure_kernel(
+            module,
+            kernels::gemm_mqv2_wmma_gfx11_bt_src(self.arch_caps.is_gfx1151()),
+            func_name,
+        )?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
         let mut aq = a_q.buf.as_ptr();
         let mut ak = a_k.buf.as_ptr();
@@ -37436,7 +37472,11 @@ impl Gpu {
         } else {
             "gemm_mqv2_wmma_gfx1100_bt"
         };
-        self.ensure_kernel(module, kernels::GEMM_MQV2_WMMA_GFX11_BT_SRC, func_name)?;
+        self.ensure_kernel(
+            module,
+            kernels::gemm_mqv2_wmma_gfx11_bt_src(self.arch_caps.is_gfx1151()),
+            func_name,
+        )?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
         let mut ag = a_gate.buf.as_ptr();
         let mut au = a_up.buf.as_ptr();
@@ -37577,12 +37617,25 @@ impl Gpu {
             ));
         }
         self.bind_thread()?;
-        let module: &'static str = if self.arch.as_str() == "gfx1151" {
-            "gemm_mqv2_wmma_gfx1151_bt"
+        if xlds {
+            // #774's MQ6 BT8 X-LDS entries live in the Qwen4 copy only.
+            self.ensure_kernel(
+                "qwen4_gemm_mqv2_wmma_gfx11_bt",
+                kernels::QWEN4_GEMM_MQV2_WMMA_GFX11_BT_SRC,
+                func_name,
+            )?;
         } else {
-            "gemm_mqv2_wmma_gfx1100_bt"
-        };
-        self.ensure_kernel(module, kernels::GEMM_MQV2_WMMA_GFX11_BT_SRC, func_name)?;
+            let module: &'static str = if self.arch.as_str() == "gfx1151" {
+                "gemm_mqv2_wmma_gfx1151_bt"
+            } else {
+                "gemm_mqv2_wmma_gfx1100_bt"
+            };
+            self.ensure_kernel(
+                module,
+                kernels::gemm_mqv2_wmma_gfx11_bt_src(self.arch_caps.is_gfx1151()),
+                func_name,
+            )?;
+        }
         let x_f16_ptr = match x_f16 {
             Some(ptr) => ptr,
             None => self.ensure_fp16_x(x, batch_size * k)?,
