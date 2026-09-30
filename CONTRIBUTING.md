@@ -213,16 +213,18 @@ unreproducible — see
 
 Starting after 0.4.0, hipfire releases on a fixed, published schedule. That way contributors know exactly when a merged PR will ship and can plan around it.
 
-- **Releases go out every Sunday and every Tuesday, alternating.** Each release bumps the patch version by 0.0.1:
+- **One release per week, alternating between Tuesday and Sunday.** Weeks run Sunday to Saturday, and a week never has both a Sunday and a Tuesday release. So a Tuesday release is followed by the next Sunday (5 days later), and a Sunday release by the Tuesday of the *following* week (9 days later). Each release bumps the patch version by 0.0.1:
 
   | Version | Release date |
   |---|---|
   | 0.4.1 | Tuesday 2026-10-06 |
   | 0.4.2 | Sunday 2026-10-11 |
-  | 0.4.3 | Tuesday 2026-10-13 |
-  | 0.4.4 | Sunday 2026-10-18 |
+  | 0.4.3 | Tuesday 2026-10-20 |
+  | 0.4.4 | Sunday 2026-10-25 |
+  | 0.4.5 | Tuesday 2026-11-03 |
+  | 0.4.6 | Sunday 2026-11-08 |
 
-  After that, it continues Sunday, Tuesday, Sunday, Tuesday.
+  The same pattern continues after that.
 - **Features** always go into the *upcoming* release. They land on `beta`, which is packaged and released on the next release day.
 - **Bug fixes** can go into the current release and the upcoming one.
 - **Cutoff:** a PR filed before **11:59 PM MST (UTC−7) on the day before a release date** is incorporated into that release. MST is fixed year-round (no daylight saving), so the cutoff is always **06:59 UTC on release day**:
