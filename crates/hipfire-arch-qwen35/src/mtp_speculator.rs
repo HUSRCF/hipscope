@@ -52,7 +52,7 @@ fn ngram_mod_env_config() -> Option<NgramModConfig> {
 /// [`MtpDrafter::configure_request`] and persisted across warm LCP hits.
 ///
 /// Optional n-gram-mod composition is owned here (no Arc/Mutex): the pool may
-/// survive requests; request context/retirement reset per `configure_request`.
+/// survive requests; request context and counters reset per `configure_request`.
 pub struct Qwen35MtpDrafter {
     head: Qwen35MtpHead,
     state: Option<MtpSpecState>,
@@ -65,7 +65,6 @@ pub struct Qwen35MtpDrafter {
     ngram_indexed_until: usize,
     /// Number of host-emitted request tokens already appended to `ngram_context`.
     ngram_emitted_len: usize,
-    ngram_retired: bool,
     /// Request-local wire counters (reset on configure_request).
     stats: MtpRequestStats,
     /// Identity of the window whose pre-verify state is still in `trunk_snap`.
@@ -110,7 +109,6 @@ impl Qwen35MtpDrafter {
             ngram_context: Vec::new(),
             ngram_indexed_until: 0,
             ngram_emitted_len: 0,
-            ngram_retired: false,
             stats: MtpRequestStats::default(),
             last_window: None,
             checkpoints: Vec::new(),
@@ -160,7 +158,6 @@ impl Qwen35MtpDrafter {
         self.ngram_context.clear();
         self.ngram_indexed_until = 0;
         self.ngram_emitted_len = 0;
-        self.ngram_retired = false;
         self.stats = MtpRequestStats::default();
     }
 
@@ -338,7 +335,7 @@ impl MtpDrafter for Qwen35MtpDrafter {
 
         // Seed request-local n-gram history exactly once. Prefix realignment
         // calls prefill again inside the same request; preserving this context
-        // keeps retirement, counters, and already-emitted history intact.
+        // keeps counters and already-emitted history intact.
         if self.ngram_active && self.ngram_context.is_empty() {
             self.ngram_context.extend_from_slice(prompt_tokens);
             self.ngram_context.push(first_token);
@@ -385,7 +382,6 @@ impl MtpDrafter for Qwen35MtpDrafter {
             None
         };
         let used_ngram = ngram_cands.as_ref().is_some_and(|c| !c.is_empty());
-        let retired = self.ngram_retired;
         let modifier = self.ngram_active;
         let native_k = k.min(self.max_n);
 
@@ -396,13 +392,11 @@ impl MtpDrafter for Qwen35MtpDrafter {
                 .as_mut()
                 .ok_or("Qwen35MtpDrafter: mtp_step before mtp_prefill")?;
             if used_ngram {
+                // The takeover fills the head KV for every row it commits, so
+                // native MTP stays live for the next pool miss.
                 let cands = ngram_cands.as_ref().expect("used_ngram implies candidates");
                 spec_step_mtp_compressed_serial_with_takeover_candidates(
-                    gpu, slot, &self.head, state, position, seed, eos, cands, retired,
-                )
-            } else if modifier && retired {
-                spec_step_mtp_compressed_serial_with_k(
-                    gpu, slot, &self.head, state, position, seed, eos, 0,
+                    gpu, slot, &self.head, state, position, seed, eos, cands,
                 )
             } else {
                 spec_step_mtp_compressed_serial_with_k(
@@ -412,13 +406,7 @@ impl MtpDrafter for Qwen35MtpDrafter {
             .map_err(|e| e.to_string())?
         };
         self.last_window = Some((position, seed));
-        let budget = if used_ngram {
-            k
-        } else if modifier && retired {
-            0
-        } else {
-            native_k
-        };
+        let budget = if used_ngram { k } else { native_k };
         debug_assert!(
             r.committed.len() <= budget + 1,
             "qwen35 MTP committed past k budget"
@@ -431,29 +419,19 @@ impl MtpDrafter for Qwen35MtpDrafter {
             if let Some(pool) = self.ngram_pool.as_mut() {
                 let _ = pool.record_draft_result(r.drafts_generated as u32, r.accept_count as u32);
             }
-            if r.accept_count > 0 {
-                self.ngram_retired = true;
-            }
-        } else if modifier {
-            if retired {
-                self.stats.ar_windows += 1;
-            } else {
-                self.stats.mtp_windows += 1;
-            }
         } else {
             self.stats.mtp_windows += 1;
         }
         if modifier {
+            // `retired=0` keeps the historical line format; nothing retires MTP.
             eprintln!(
-                "[mtp-ngram] used={} drafted={} accepted={} retired={}",
+                "[mtp-ngram] used={} drafted={} accepted={} retired=0",
                 u8::from(used_ngram),
                 r.drafts_generated,
                 r.accept_count,
-                u8::from(self.ngram_retired),
             );
         }
 
-        self.stats.mtp_retired = self.ngram_retired;
         Ok(MtpWindow {
             committed: r.committed,
             accepted: r.accept_count,
@@ -654,7 +632,6 @@ impl MtpDrafter for Qwen35MtpDrafter {
     fn request_stats(&self) -> MtpRequestStats {
         let mut s = self.stats;
         s.mtp_ngram = self.ngram_active;
-        s.mtp_retired = self.ngram_retired;
         s.ngram_mod_accept_rate = if s.ngram_mod_drafts > 0 {
             let rate = s.ngram_mod_accepted as f64 / s.ngram_mod_drafts as f64;
             (rate * 1000.0).round() / 1000.0
