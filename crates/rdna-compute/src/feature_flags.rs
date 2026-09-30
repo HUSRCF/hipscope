@@ -330,9 +330,11 @@ pub struct FeatureFlags {
     pub attn_qresident_v2: bool,
     /// VerifyAttn (`HIPFIRE_VERIFY_ATTN`, `kernel.verify_attn`): the
     /// GQA-shared split-K twin of the batched flash tile + reduce for
-    /// speculative-verify-sized batches (1..=32 rows, non-tree). Default ON
-    /// on exact gfx1201; `=0` opts out to `attention_flash_*_tile_batched`.
-    /// Byte-identical partials and output; any byte difference kills it.
+    /// speculative-verify-sized batches (1..=32 rows, non-tree), and on
+    /// gfx1100 also of the multi-row R4/R8 Q8 tile. Default ON on exact
+    /// gfx1201 and gfx1100; `=0` opts out to `attention_flash_*_tile_batched`
+    /// and `attention_flash_q8_0_rows{4,8}_d8`. Byte-identical partials and
+    /// output; any byte difference kills it.
     pub verify_attn: bool,
     /// Exact gfx1201 FA deinterleave, Q/K norm and RoPE fusion.
     /// `HIPFIRE_GFX12_FA_PREP_FUSED=0` restores the original chain.
@@ -781,7 +783,8 @@ impl FeatureFlags {
                 .unwrap_or(arch == "gfx1201"),
             attn_qresident_v2: parse_bool("HIPFIRE_ATTN_QRESIDENT_V2")
                 .unwrap_or(arch == "gfx1201"),
-            verify_attn: parse_bool("HIPFIRE_VERIFY_ATTN").unwrap_or(arch == "gfx1201"),
+            verify_attn: parse_bool("HIPFIRE_VERIFY_ATTN")
+                .unwrap_or(matches!(arch, "gfx1201" | "gfx1100")),
             gfx12_fa_prep_fused: parse_bool("HIPFIRE_GFX12_FA_PREP_FUSED")
                 .unwrap_or(arch == "gfx1201"),
             gfx12_fa_prep_fp8q: parse_bool("HIPFIRE_GFX12_FA_PREP_FP8Q")

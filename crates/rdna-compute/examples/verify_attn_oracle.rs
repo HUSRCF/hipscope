@@ -6,7 +6,9 @@
 // batched flash tile + reduce it replaces
 // (`attention_flash_{fp8_e4m3,q8_0}_tile_batched` +
 // `attention_flash_asym_reduce_batched`), H2 shape (24 q heads, 4 kv heads,
-// head_dim 256).
+// head_dim 256). On gfx1100 (Q8 only) it also checks the multi-row twin
+// (`Gpu::try_attention_verify_gqa_rows`) against the R4/R8 tile + reduce
+// (`attention_flash_q8_0_rows_masked`), the eager Q8 verify route there.
 //
 // Every run poisons the whole output and partials allocations (including guard
 // regions around the views the launch receives), and the KV cache past the
@@ -18,6 +20,8 @@
 //   oracle [fp8|q8|both]      B {1,4,16} (+2,5,9,32) x ctx {1,127,128,2K,8K,16K,32K,64K},
 //                             eager and graph-capture max_ctx_len, full and
 //                             sub-batched partials, cap 262144 capture grid.
+//                             gfx1100: plus the R4/R8 reference, B {4,16}
+//                             (+5,7,8,9,13,32) x ctx {1..64K, 4097}.
 //   stress <reps>             poisoned repeats (rotating 0xFF/0x7F/0x00/0xA5),
 //                             each compared with the reference and the first
 //                             candidate launch. Run it under
@@ -26,7 +30,8 @@
 //   soak <secs>               back-to-back candidate launches (B16 32K fp8/q8),
 //                             every output compared with the reference.
 //   bench                     wall-clock per call, reference vs candidate.
-//   bench_rows                Q8 eager: multi-row R4/R8 vs VerifyAttn wall-clock.
+//   bench_rows                Q8 eager: multi-row R4/R8 vs VerifyAttn wall-clock
+//                             (gfx1100: its R4/R8 twin; gfx1201: the tile twin).
 // Exit 0 = pass. Run: cargo run --release -p rdna-compute --example verify_attn_oracle -- oracle both
 
 use rdna_compute::attention::VerifyKv;
@@ -172,6 +177,8 @@ struct Case {
     cap: usize,
     /// Partials capacity in rows (at this case's max_tiles); < b sub-batches.
     partial_rows: usize,
+    /// Reference is the multi-row R4/R8 tile (Q8, b >= 4) instead of tile_batched.
+    rows: bool,
 }
 
 impl Case {
@@ -193,6 +200,21 @@ impl Case {
     }
     fn partials_len(&self) -> usize {
         self.partial_rows * NH * self.max_tiles() * STRIDE
+    }
+    /// The multi-row reference's rows per block (`flash_rows_per_block`).
+    fn group_rows(&self) -> usize {
+        if self.b >= 8 {
+            8
+        } else {
+            4
+        }
+    }
+    fn ref_name(&self) -> &'static str {
+        if self.rows {
+            "rows"
+        } else {
+            "tile"
+        }
     }
 }
 
@@ -262,6 +284,21 @@ fn bytes_of(gpu: &Gpu, t: &GpuTensor) -> Vec<u8> {
 /// One launch of the reference (`candidate == false`) or VerifyAttn.
 fn launch(gpu: &mut Gpu, c: &Case, bf: &Bufs, candidate: bool) {
     std::sync::Arc::make_mut(&mut gpu.flags).verify_attn = candidate;
+    if c.rows {
+        let ran = if candidate {
+            gpu.try_attention_verify_gqa_rows(
+                &bf.q, &bf.k, &bf.v, &bf.out, &bf.pos, NH, NKV, HD, c.max_ctx_len(), c.b, &bf.part, c.group_rows(),
+            )
+            .expect("verify_attn rows launch")
+        } else {
+            gpu.attention_flash_q8_0_rows_masked(
+                &bf.q, &bf.k, &bf.v, &bf.out, &bf.pos, NH, NKV, HD, c.max_ctx_len(), c.b, &bf.part,
+            )
+            .expect("reference rows")
+        };
+        assert!(ran, "declined an admitted rows case (candidate={candidate}): {c:?}");
+        return;
+    }
     if candidate {
         let ran = gpu
             .try_attention_verify_gqa(
@@ -309,7 +346,8 @@ fn out_view(c: &Case, full: &[u8]) -> Vec<f32> {
 }
 
 /// Byte ranges of the partials the reference writes (tiles below each row's
-/// causal bound), in chunk-local rows of the sub-batched launch.
+/// causal bound; for the multi-row reference, below its row group's bound),
+/// in chunk-local rows of the sub-batched launch.
 fn written_ranges(c: &Case) -> Vec<(usize, usize)> {
     let mt = c.max_tiles();
     let sub = c.partial_rows.min(c.b);
@@ -318,7 +356,8 @@ fn written_ranges(c: &Case) -> Vec<(usize, usize)> {
     while off < c.b {
         let chunk = (c.b - off).min(sub);
         for lr in 0..chunk {
-            let seq = c.start() + off + lr + 1;
+            let last = if c.rows { (lr - lr % c.group_rows() + c.group_rows()).min(chunk) - 1 } else { lr };
+            let seq = c.start() + off + last + 1;
             let nt = seq.div_ceil(TILE).min(mt);
             for h in 0..NH {
                 let base = ((lr * NH + h) * mt) * STRIDE * 4;
@@ -337,25 +376,44 @@ fn kv_name(kv: VerifyKv) -> &'static str {
     }
 }
 
-fn oracle_cases(kvs: &[VerifyKv]) -> Vec<Case> {
+fn oracle_cases(kvs: &[VerifyKv], rows_twin: bool) -> Vec<Case> {
     const CAP: usize = 65536 + 256;
     let mut cases = Vec::new();
     for &kv in kvs {
+        let tile = |b, ctx, capture, cap, partial_rows| Case { kv, b, ctx, capture, cap, partial_rows, rows: false };
         for &b in &[1usize, 4, 16] {
             for &ctx in &[1usize, 127, 128, 2048, 8192, 16384, 32768, 65536] {
                 for &capture in &[false, true] {
-                    cases.push(Case { kv, b, ctx, capture, cap: CAP, partial_rows: 16 });
+                    cases.push(tile(b, ctx, capture, CAP, 16));
                 }
             }
         }
         // Odd batch sizes, ragged row groups, the 32-row ceiling, sub-batching.
         for &(b, ctx, rows) in &[(2, 129, 16), (5, 2047, 16), (9, 4097, 16), (32, 3000, 32), (16, 8191, 5), (13, 300, 4)] {
-            cases.push(Case { kv, b, ctx, capture: false, cap: CAP, partial_rows: rows });
-            cases.push(Case { kv, b, ctx, capture: true, cap: CAP, partial_rows: rows });
+            cases.push(tile(b, ctx, false, CAP, rows));
+            cases.push(tile(b, ctx, true, CAP, rows));
         }
         // The real graph-capture shape: physical cap 262144 (2048 partial tiles).
         for &(b, ctx) in &[(16, 2048), (4, 20000), (16, 9000)] {
-            cases.push(Case { kv, b, ctx, capture: true, cap: 262144, partial_rows: 16 });
+            cases.push(tile(b, ctx, true, 262144, 16));
+        }
+        if rows_twin && kv == VerifyKv::Q8 {
+            // Multi-row reference: `capture` here only sizes max_ctx_len to
+            // the cap (the reference itself is eager-only).
+            let rows = |b, ctx, capture, partial_rows| Case { kv, b, ctx, capture, cap: CAP, partial_rows, rows: true };
+            for &b in &[4usize, 16] {
+                for &ctx in &[1usize, 127, 128, 2048, 4097, 8192, 16384, 32768, 65536] {
+                    for &capture in &[false, true] {
+                        cases.push(rows(b, ctx, capture, 16));
+                    }
+                }
+            }
+            // R4 with two row groups, ragged R8 groups, the 32-row ceiling,
+            // sub-batching (chunks that split R8 groups).
+            for &(b, ctx, pr) in &[(5, 2047, 16), (7, 20000, 16), (8, 129, 16), (9, 4097, 16), (13, 300, 4), (32, 3000, 32), (16, 8191, 5), (6, 255, 16)] {
+                cases.push(rows(b, ctx, false, pr));
+                cases.push(rows(b, ctx, true, pr));
+            }
         }
     }
     cases
@@ -372,7 +430,8 @@ fn parse_kvs(arg: Option<&str>) -> Vec<VerifyKv> {
 fn oracle(gpu: &mut Gpu, kvs: &[VerifyKv]) -> bool {
     let mut ok = true;
     let mut n = 0;
-    for (i, c) in oracle_cases(kvs).iter().enumerate() {
+    let rows_twin = gpu.arch == "gfx1100";
+    for (i, c) in oracle_cases(kvs, rows_twin).iter().enumerate() {
         let bf = Bufs::new(gpu, c, 0x5eed_0000 + i as u64);
         let (ro, rp) = run(gpu, c, &bf, false, 0xA5);
         let (co, cp) = run(gpu, c, &bf, true, 0xA5);
@@ -391,9 +450,9 @@ fn oracle(gpu: &mut Gpu, kvs: &[VerifyKv]) -> bool {
             }
         }
         println!(
-            "ORACLE kv={} B={} ctx={} capture={} cap={} max_tiles={} partial_rows={} out_bytes={} part_bytes={} \
+            "ORACLE kv={} ref={} B={} ctx={} capture={} cap={} max_tiles={} partial_rows={} out_bytes={} part_bytes={} \
              ref_nonfinite={} out_first_diff={:?} part_first_diff={:?} max_abs={:e} max_rel={:e} {}",
-            kv_name(c.kv), c.b, c.ctx, c.capture, c.cap, c.max_tiles(), c.partial_rows, ro.len(), rp.len(), nan,
+            kv_name(c.kv), c.ref_name(), c.b, c.ctx, c.capture, c.cap, c.max_tiles(), c.partial_rows, ro.len(), rp.len(), nan,
             od, pd, abs, rel, if pass { "PASS" } else { "FAIL" }
         );
         ok &= pass;
@@ -408,15 +467,25 @@ fn stress(gpu: &mut Gpu, reps: usize, kvs: &[VerifyKv]) -> bool {
     let mut ok = true;
     let mut launches = 0usize;
     let mut mism = 0usize;
+    let rows_twin = gpu.arch == "gfx1100";
     for &kv in kvs {
-        for &(b, ctx, capture, cap) in &[
-            (16usize, 8192usize, true, 65536 + 256),
-            (16, 1000, false, 4096),
-            (4, 16384, false, 20000),
-            (1, 127, true, 4096),
-            (9, 2049, true, 4096),
-        ] {
-            let c = Case { kv, b, ctx, capture, cap, partial_rows: 16 };
+        let mut shapes = vec![
+            (16usize, 8192usize, true, 65536 + 256, false),
+            (16, 1000, false, 4096, false),
+            (4, 16384, false, 20000, false),
+            (1, 127, true, 4096, false),
+            (9, 2049, true, 4096, false),
+        ];
+        if rows_twin && kv == VerifyKv::Q8 {
+            shapes.extend([
+                (16usize, 8192usize, false, 8192 + 256, true),
+                (4, 16384, false, 20000, true),
+                (9, 5000, false, 8192, true),
+                (5, 4097, true, 8192, true),
+            ]);
+        }
+        for &(b, ctx, capture, cap, rows) in &shapes {
+            let c = Case { kv, b, ctx, capture, cap, partial_rows: 16, rows };
             let bf = Bufs::new(gpu, &c, 0xC0FFEE ^ (b * 131 + ctx) as u64);
             let (ro, rp) = run(gpu, &c, &bf, false, 0xA5);
             let ref_out = out_view(&c, &ro);
@@ -449,8 +518,8 @@ fn stress(gpu: &mut Gpu, reps: usize, kvs: &[VerifyKv]) -> bool {
                 }
             }
             println!(
-                "STRESS kv={} B={} ctx={} capture={} reps={} mismatched={} {}",
-                kv_name(kv), b, ctx, capture, reps, bad, if bad == 0 { "PASS" } else { "FAIL" }
+                "STRESS kv={} ref={} B={} ctx={} capture={} reps={} mismatched={} {}",
+                kv_name(kv), c.ref_name(), b, ctx, capture, reps, bad, if bad == 0 { "PASS" } else { "FAIL" }
             );
             mism += bad;
             ok &= bad == 0;
@@ -466,10 +535,19 @@ fn stress(gpu: &mut Gpu, reps: usize, kvs: &[VerifyKv]) -> bool {
 }
 
 fn soak(gpu: &mut Gpu, secs: u64) -> bool {
-    let cases = [
-        Case { kv: VerifyKv::Fp8, b: 16, ctx: 32768, capture: true, cap: 32768 + 256, partial_rows: 16 },
-        Case { kv: VerifyKv::Q8, b: 16, ctx: 32768, capture: true, cap: 32768 + 256, partial_rows: 16 },
-    ];
+    let cap = 32768 + 256;
+    let cases: Vec<Case> = if gpu.arch == "gfx1100" {
+        vec![
+            Case { kv: VerifyKv::Q8, b: 16, ctx: 32768, capture: true, cap, partial_rows: 16, rows: false },
+            Case { kv: VerifyKv::Q8, b: 16, ctx: 32768, capture: false, cap, partial_rows: 16, rows: true },
+            Case { kv: VerifyKv::Q8, b: 4, ctx: 32768, capture: false, cap, partial_rows: 16, rows: true },
+        ]
+    } else {
+        vec![
+            Case { kv: VerifyKv::Fp8, b: 16, ctx: 32768, capture: true, cap, partial_rows: 16, rows: false },
+            Case { kv: VerifyKv::Q8, b: 16, ctx: 32768, capture: true, cap, partial_rows: 16, rows: false },
+        ]
+    };
     let bufs: Vec<Bufs> = cases.iter().enumerate().map(|(i, c)| Bufs::new(gpu, c, 0x50A4 + i as u64)).collect();
     let refs: Vec<Vec<f32>> = cases
         .iter()
@@ -512,7 +590,7 @@ fn bench(gpu: &mut Gpu, kvs: &[VerifyKv]) {
         for &b in &[4usize, 16] {
             for &ctx in &[2048usize, 8192, 16384, 32768, 65536] {
                 for &(capture, cap) in &[(false, ctx + 64), (true, 262144usize)] {
-                    let c = Case { kv, b, ctx, capture, cap: cap.max(ctx + 64), partial_rows: 16 };
+                    let c = Case { kv, b, ctx, capture, cap: cap.max(ctx + 64), partial_rows: 16, rows: false };
                     let bf = Bufs::new(gpu, &c, 0xBE4C);
                     let mut ms = [0f64; 2];
                     for (arm, cand) in [(0usize, false), (1, true)] {
@@ -541,16 +619,20 @@ fn bench(gpu: &mut Gpu, kvs: &[VerifyKv]) {
 
 /// Q8 eager verify above 4K runs the multi-row R4/R8 kernel
 /// (`attention_flash_q8_0_rows_masked`) when admitted; compare it with
-/// VerifyAttn on the same eager shapes (not byte-compared: different arithmetic).
+/// VerifyAttn on the same eager shapes. gfx1100 times its byte-identical
+/// R4/R8 twin; gfx1201 times the tile twin (not byte-compared: different
+/// arithmetic).
 fn bench_rows(gpu: &mut Gpu) {
+    let rows_twin = gpu.arch == "gfx1100";
     for &b in &[4usize, 16] {
-        for &ctx in &[8192usize, 16384, 32768, 65536] {
-            let c = Case { kv: VerifyKv::Q8, b, ctx, capture: false, cap: ctx + 64, partial_rows: 16 };
+        for &ctx in &[4096usize, 8192, 16384, 32768, 65536] {
+            let c = Case { kv: VerifyKv::Q8, b, ctx, capture: false, cap: ctx + 64, partial_rows: 16, rows: rows_twin };
             let bf = Bufs::new(gpu, &c, 0xBE4C);
             let mut ms = [0f64; 2];
             for arm in 0..2 {
                 let go = |gpu: &mut Gpu| {
                     if arm == 0 {
+                        std::sync::Arc::make_mut(&mut gpu.flags).verify_attn = false;
                         assert!(gpu
                             .attention_flash_q8_0_rows_masked(
                                 &bf.q, &bf.k, &bf.v, &bf.out, &bf.pos, NH, NKV, HD, c.max_ctx_len(), c.b, &bf.part,
@@ -585,16 +667,33 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mode = args.get(1).map(String::as_str).unwrap_or("oracle");
     let mut gpu = Gpu::init().expect("gpu init");
-    assert_eq!(gpu.arch, "gfx1201", "VerifyAttn oracle runs on gfx1201");
+    assert!(
+        matches!(gpu.arch.as_str(), "gfx1201" | "gfx1100"),
+        "VerifyAttn oracle runs on gfx1201 or gfx1100, got {}",
+        gpu.arch
+    );
+    // fp8 KV (and its VerifyAttn twin) is gfx1201-only.
+    let kvs = |arg: Option<&String>, gpu: &Gpu| -> Vec<VerifyKv> {
+        let mut v = parse_kvs(arg.map(String::as_str));
+        if gpu.arch != "gfx1201" {
+            v.retain(|&k| k == VerifyKv::Q8);
+        }
+        v
+    };
     let ok = match mode {
-        "oracle" => oracle(&mut gpu, &parse_kvs(args.get(2).map(String::as_str))),
+        "oracle" => {
+            let k = kvs(args.get(2), &gpu);
+            oracle(&mut gpu, &k)
+        }
         "stress" => {
             let reps = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(200);
-            stress(&mut gpu, reps, &parse_kvs(args.get(3).map(String::as_str)))
+            let k = kvs(args.get(3), &gpu);
+            stress(&mut gpu, reps, &k)
         }
         "soak" => soak(&mut gpu, args.get(2).and_then(|s| s.parse().ok()).unwrap_or(60)),
         "bench" => {
-            bench(&mut gpu, &parse_kvs(args.get(2).map(String::as_str)));
+            let k = kvs(args.get(2), &gpu);
+            bench(&mut gpu, &k);
             true
         }
         "bench_rows" => {
