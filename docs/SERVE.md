@@ -63,7 +63,7 @@ Flags (also accepted by `restart`):
 | Flag | Effect |
 |---|---|
 | `-d` / `--detach` / `--background` | Fork detached child; log → `~/.hipfire/serve.log` |
-| `--kv-mode <m>` | Sets `HIPFIRE_KV_MODE` for this run |
+| `--kv-mode <m>` | KV preset for models this service loads (sent as the `kv_mode` load param; same contract as `run --kv-mode`) |
 | `--idle-timeout <s>` | Sets `HIPFIRE_IDLE_TIMEOUT` (0..86400) |
 | `--no-prewarm` | Sets `HIPFIRE_NO_PREWARM=1` |
 | `--tp N` | Sets `HIPFIRE_TP` (1..64) for expert-parallel load |

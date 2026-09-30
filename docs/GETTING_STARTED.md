@@ -239,7 +239,7 @@ Defaults that matter on day one (from the native schema; full table in [CONFIG.m
 |---|---|---|
 | `temperature` | `0.3` | Stored global default only for run/serve send (see above); Chat session seed |
 | `max_tokens` | `4096` | Per-request generation cap for `run` / API fallback |
-| `kv_cache` | `auto` | Resolves via registry `default_kv_mode`, else `q8` |
+| `kv_cache` | `auto` | Resolves via a registry non-q8 `default_kv_mode`, else the architecture default: Qwen native `fp8` on eligible exact gfx1201, `q8` on gfx1100 / gfx1151 and elsewhere. `fwht3` is an optional headroom mode |
 | `dflash_mode` | **`off`** | DFlash is opt-in; pulling a draft does not enable it |
 | `speculation` | `auto` | Mechanism selector; DFlash stays off when `dflash_mode=off`, but eligible **MTP / DSpark** paths may still activate under `auto`. Use `speculation=off` to force plain AR. |
 | `thinking` | `on` | Reasoning models may emit `<think>`; display strip is CLI/API-side |
