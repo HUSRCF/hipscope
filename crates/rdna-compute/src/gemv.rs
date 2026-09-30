@@ -5496,7 +5496,7 @@ impl Gpu {
         }
         self.bind_thread()?;
         const FUNC: &str = "hyper_read_projected_rotate_f32";
-        self.ensure_kernel("mq_rotate_x", kernels::GEMV_MQ4G256_SRC, FUNC)?;
+        self.ensure_kernel("qwen4_gemv_mq4g256", kernels::QWEN4_GEMV_MQ4G256_SRC, FUNC)?;
         self.ensure_mq_signs()?;
         let s1 = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
         let s2 = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
@@ -5618,7 +5618,7 @@ impl Gpu {
         } else {
             "mq_rotate_x_f16"
         };
-        self.ensure_kernel("mq_rotate_x", kernels::GEMV_MQ4G256_SRC, func)?;
+        self.ensure_kernel("qwen4_gemv_mq4g256", kernels::QWEN4_GEMV_MQ4G256_SRC, func)?;
         self.ensure_mq_signs()?;
         let out = self.qwen4_f16_x_scratch(k * batch_size)?;
         let s1 = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
@@ -17299,7 +17299,7 @@ impl Gpu {
         // four per block (132 -> 218 GB/s against gemv_q8_0_wide).
         if self.arch_caps.is_gfx1151() && k == 320 {
             const FUNC: &str = "gemv_q8_0_k320_staged";
-            self.ensure_kernel("gemv_q8_0", kernels::GEMV_Q8_0_SRC, FUNC)?;
+            self.ensure_kernel("qwen4_gemv_q8_0", kernels::QWEN4_GEMV_Q8_0_SRC, FUNC)?;
             let mut params = [
                 &a_ptr as *const _ as *mut c_void,
                 &x_ptr as *const _ as *mut c_void,
@@ -17326,7 +17326,11 @@ impl Gpu {
         // math on rows staged through LDS, four per block (bitwise).
         if self.arch_caps.is_gfx1151() && k == 640 {
             const FUNC: &str = "gemv_q8_0_wide_k640_staged";
-            self.ensure_kernel("gemv_q8_0_wide", kernels::GEMV_Q8_0_WIDE_SRC, FUNC)?;
+            self.ensure_kernel(
+                "qwen4_gemv_q8_0_wide",
+                kernels::QWEN4_GEMV_Q8_0_WIDE_SRC,
+                FUNC,
+            )?;
             let mut params = [
                 &a_ptr as *const _ as *mut c_void,
                 &x_ptr as *const _ as *mut c_void,
@@ -17379,7 +17383,7 @@ impl Gpu {
         // values; 226 -> 241 GB/s on the Qwen4 LM head).
         if self.arch_caps.is_gfx1151() && k == 2560 {
             const FUNC: &str = "gemv_q8_0_k2560_staged";
-            self.ensure_kernel("gemv_q8_0", kernels::GEMV_Q8_0_SRC, FUNC)?;
+            self.ensure_kernel("qwen4_gemv_q8_0", kernels::QWEN4_GEMV_Q8_0_SRC, FUNC)?;
             let mut params = [
                 &a_ptr as *const _ as *mut c_void,
                 &x_ptr as *const _ as *mut c_void,
@@ -17440,7 +17444,7 @@ impl Gpu {
         }
         self.bind_thread()?;
         const FUNC: &str = "gemv_q8_0_k2560_staged_pair";
-        self.ensure_kernel("gemv_q8_0", kernels::GEMV_Q8_0_SRC, FUNC)?;
+        self.ensure_kernel("qwen4_gemv_q8_0", kernels::QWEN4_GEMV_Q8_0_SRC, FUNC)?;
         let p0 = a0.buf.as_ptr();
         let p1 = a1.buf.as_ptr();
         let xp = x.buf.as_ptr();
@@ -17846,7 +17850,11 @@ impl Gpu {
             ));
         }
         self.bind_thread()?;
-        self.ensure_kernel("gemv_q8_0", kernels::GEMV_Q8_0_SRC, "gemv_q8_0_k8")?;
+        self.ensure_kernel(
+            "qwen4_gemv_q8_0",
+            kernels::QWEN4_GEMV_Q8_0_SRC,
+            "gemv_q8_0_k8",
+        )?;
         self.launch_gemv_split("gemv_q8_0_k8", 256, weight, x, y, m, k, hc_act_scale)
     }
 
@@ -17883,7 +17891,7 @@ impl Gpu {
         }
         self.bind_thread()?;
         let func = FUNCS[rows - 2];
-        self.ensure_kernel("gemv_q8_0", kernels::GEMV_Q8_0_SRC, func)?;
+        self.ensure_kernel("qwen4_gemv_q8_0", kernels::QWEN4_GEMV_Q8_0_SRC, func)?;
         let w_ptr = weight.buf.as_ptr();
         let x_ptr = x.buf.as_ptr();
         let y_ptr = y.buf.as_ptr();
@@ -17937,8 +17945,8 @@ impl Gpu {
         let chunk = n.div_ceil(GROUPS);
         let (module, src, rescore) = match head.dtype {
             DType::Q8_0 => (
-                "gemv_q8_0",
-                kernels::GEMV_Q8_0_SRC,
+                "qwen4_gemv_q8_0",
+                kernels::QWEN4_GEMV_Q8_0_SRC,
                 "topk8_rescore_q8_0_k2560",
             ),
             DType::MQ6G256V2 => (
@@ -17957,7 +17965,11 @@ impl Gpu {
             return Err(hip_bridge::HipError::new(1, "topk8_rescore_k2560 shape"));
         }
         self.bind_thread()?;
-        self.ensure_kernel("gemv_q8_0", kernels::GEMV_Q8_0_SRC, "topk8_partial_f32")?;
+        self.ensure_kernel(
+            "qwen4_gemv_q8_0",
+            kernels::QWEN4_GEMV_Q8_0_SRC,
+            "topk8_partial_f32",
+        )?;
         self.ensure_kernel(module, src, rescore)?;
         let v_ptr = logits.buf.as_ptr();
         let pv_ptr = partial.buf.as_ptr();
@@ -18049,7 +18061,11 @@ impl Gpu {
         if k != 2560 && k != 320 {
             // gemv_q8_0's small-K wide kernel, per row.
             const FUNC: &str = "gemv_q8_0_wide_rows";
-            self.ensure_kernel("gemv_q8_0_wide", kernels::GEMV_Q8_0_WIDE_SRC, FUNC)?;
+            self.ensure_kernel(
+                "qwen4_gemv_q8_0_wide",
+                kernels::QWEN4_GEMV_Q8_0_WIDE_SRC,
+                FUNC,
+            )?;
             let a_ptr = a_raw.buf.as_ptr();
             let x_ptr = x.buf.as_ptr();
             let y_ptr = y.buf.as_ptr();
@@ -18085,7 +18101,7 @@ impl Gpu {
         } else {
             ("gemv_q8_0_k320_staged_rows", m.div_ceil(2) as u32, 64u32)
         };
-        self.ensure_kernel("gemv_q8_0", kernels::GEMV_Q8_0_SRC, func)?;
+        self.ensure_kernel("qwen4_gemv_q8_0", kernels::QWEN4_GEMV_Q8_0_SRC, func)?;
         let a_ptr = a_raw.buf.as_ptr();
         let x_ptr = x.buf.as_ptr();
         let y_ptr = y.buf.as_ptr();
@@ -18124,7 +18140,11 @@ impl Gpu {
             ));
         }
         self.bind_thread()?;
-        self.ensure_kernel("gemv_q8_0", kernels::GEMV_Q8_0_SRC, "quantize_bf16_q8_0")?;
+        self.ensure_kernel(
+            "qwen4_gemv_q8_0",
+            kernels::QWEN4_GEMV_Q8_0_SRC,
+            "quantize_bf16_q8_0",
+        )?;
         let blocks = (m * k / 32) as i32;
         let out = self.alloc_tensor(&[m * k / 32 * 34], DType::Q8_0)?;
         let w_ptr = weight.buf.as_ptr();

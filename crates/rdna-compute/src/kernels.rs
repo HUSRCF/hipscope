@@ -1046,9 +1046,15 @@ pub const GEMV_HFQ3G256_RESIDUAL_SRC: &str =
 pub const GEMV_HFQ3G256_RESIDUAL_GFX1100_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq3g256_residual.gfx1100.hip");
 pub const GEMV_HFQ3G128_SRC: &str = include_str!("../../../kernels/src/gemv_hfq3g128.hip");
-pub const GEMV_MQ4G256_SRC: &str = concat!(
+pub const GEMV_MQ4G256_SRC: &str = include_str!("../../../kernels/src/gemv_mq4g256.hip");
+/// Qwen4's companions of `mq_rotate_x` (module `qwen4_gemv_mq4g256`): the HC
+/// read branch mix that also writes its rotation
+/// (`hyper_read_projected_rotate_f32`) and the F16-output rotations
+/// (`mq_rotate_x_f16`, `mq_rotate_x_bf16_f16`). Their own module, so the
+/// shipped `gemv_mq4g256` / `mq_rotate_x` code objects are untouched.
+pub const QWEN4_GEMV_MQ4G256_SRC: &str = concat!(
     include_str!("../../../kernels/src/mq_fwht256.h"),
-    include_str!("../../../kernels/src/gemv_mq4g256.hip")
+    include_str!("../../../kernels/src/qwen4_gemv_mq4g256.hip")
 );
 pub const MQ_ROTATE_X_GFX942_SRC: &str =
     include_str!("../../../kernels/src/mq_rotate_x.gfx942.hip");
@@ -2557,18 +2563,16 @@ pub const GEMV_MQ4G256V2_RESIDUAL_SIGMOID_SCALED_K512_SRC: &str = concat!(
 /// row is decoded once per launch and every row keeps the scalar kernel's
 /// accumulation order. The batched path on GPUs without WMMA.
 pub const GEMV_MQ4G256V2_XBATCH_SRC: &str = concat!(
-    "#define HIPFIRE_MQ4G256V2_XBATCH 1\n",
     "#define HIPFIRE_MQ4G256V2_XBATCH_MAX 4\n",
     "#define HIPFIRE_MQ4G256V2_XBATCH_KERNEL gemv_mq4g256v2_xbatch\n",
-    include_str!("../../../kernels/src/gemv_mq4g256v2.hip")
+    include_str!("../../../kernels/src/gemv_mq4g256v2_xbatch.hip")
 );
 /// Residual sibling of [`GEMV_MQ4G256V2_XBATCH_SRC`] (`y[b] += A . x[b]`).
 pub const GEMV_MQ4G256V2_XBATCH_RESIDUAL_SRC: &str = concat!(
-    "#define HIPFIRE_MQ4G256V2_XBATCH 1\n",
     "#define HIPFIRE_MQ4G256V2_XBATCH_MAX 4\n",
     "#define HIPFIRE_MQ4G256V2_RESIDUAL_EPILOGUE 1\n",
     "#define HIPFIRE_MQ4G256V2_XBATCH_KERNEL gemv_mq4g256v2_xbatch_residual\n",
-    include_str!("../../../kernels/src/gemv_mq4g256v2.hip")
+    include_str!("../../../kernels/src/gemv_mq4g256v2_xbatch.hip")
 );
 
 pub const GEMV_MQ5G256V2_RESIDUAL_SRC: &str = concat!(
@@ -6488,12 +6492,20 @@ pub const FUSED_GATE_UP_Q4K_SRC: &str = include_str!("../../../kernels/src/fused
 /// Each thread processes K/256 elements strided, then tree-reduce via shared memory.
 /// Better for dim=1024 where 32-thread kernel underutilizes the GPU.
 pub const GEMV_Q8_0_WIDE_SRC: &str = include_str!("../../../kernels/src/gemv_q8_0_wide.hip");
+/// Qwen4 siblings of `gemv_q8_0_wide` (module `qwen4_gemv_q8_0_wide`): the
+/// gfx1151 K=640 staged kernel and the few-row `gemv_q8_0_wide_rows`.
+pub const QWEN4_GEMV_Q8_0_WIDE_SRC: &str =
+    include_str!("../../../kernels/src/qwen4_gemv_q8_0_wide.hip");
 pub const GEMM_Q8_0_BATCHED_WIDE_EXACT_SRC: &str =
     include_str!("../../../kernels/src/gemm_q8_0_batched_wide_exact.hip");
 
-pub const GEMV_Q8_0_SRC: &str = concat!(
+pub const GEMV_Q8_0_SRC: &str = include_str!("../../../kernels/src/gemv_q8_0.hip");
+/// Qwen4 siblings of `gemv_q8_0` (module `qwen4_gemv_q8_0`): the staged
+/// K=320/2560 and eight-wave split kernels with their few-row variants,
+/// BF16 -> Q8_0 requantization and the Q8_0 draft-head re-score.
+pub const QWEN4_GEMV_Q8_0_SRC: &str = concat!(
     include_str!("../../../kernels/src/topk8_select.hip"),
-    include_str!("../../../kernels/src/gemv_q8_0.hip")
+    include_str!("../../../kernels/src/qwen4_gemv_q8_0.hip")
 );
 /// The MQ6G256V2 draft-head re-score (`Gpu::topk8_rescore_k2560`).
 pub const TOPK8_RESCORE_MQ6G256V2_SRC: &str = concat!(
@@ -6658,6 +6670,9 @@ pub const SILU_SRC: &str = include_str!("../../../kernels/src/silu.hip");
 /// Fused SiLU(gate) * up: out[i] = silu(gate[i]) * up[i]
 /// Saves one kernel launch + one intermediate buffer.
 pub const SILU_MUL_SRC: &str = include_str!("../../../kernels/src/silu_mul.hip");
+/// Qwen4 BF16-recipe siblings of `silu_mul_f32` (module `qwen4_silu_mul`):
+/// `silu_mul_bf16_rt_f32` and `shared_expert_activation_bf16_f32`.
+pub const QWEN4_SILU_MUL_SRC: &str = include_str!("../../../kernels/src/qwen4_silu_mul.hip");
 
 /// FLUX VAE decoder kernels (f32, channel-major `[c][h][w]`, correctness-
 /// first companions of the CPU `hipfire_arch_diffusion::vae` reference).
