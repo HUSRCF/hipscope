@@ -271,7 +271,7 @@ fn packed_mq4_down_admitted(
     hidden_dim: usize,
 ) -> bool {
     packed_admitted && separate && residual
-        && matches!(down.0, DType::MQ4G256 | DType::MQ4G256V2)
+        && down.0 == DType::MQ4G256
         && (down.1, down.2) == (5120, 17408)
         && hidden_dim == down.2
 }
@@ -300,20 +300,16 @@ fn try_packed_mq4_down(
         gpu, down, &pbs.gate_ffn_batch, &pbs.up_batch,
         &pbs.ffn_hidden_batch, hidden_dim, n,
     )?;
-    if down.gpu_dtype == DType::MQ4G256V2 {
-        run_residual_gemm_key(gpu, hipfire_dispatch::types::KernelKey::GemmMq4V2PackedResidual,
-            &down.buf, down.gpu_dtype, &pbs.ffn_hidden_batch, &pbs.x_batch,
-            down.m, down.k, n)?;
-    } else {
-        run_residual_gemm_key(gpu, hipfire_dispatch::types::KernelKey::GemmMq4PackedResidual,
-            &down.buf, down.gpu_dtype, &pbs.ffn_hidden_batch, &pbs.x_batch,
-            down.m, down.k, n)?;
-    }
+    run_residual_gemm_key(gpu, hipfire_dispatch::types::KernelKey::GemmMq4PackedResidual,
+        &down.buf, down.gpu_dtype, &pbs.ffn_hidden_batch, &pbs.x_batch,
+        down.m, down.k, n)?;
     Ok(true)
 }
 
-/// Uniform MQ4 or MQ4V2 only; the explicit packed opt-in leaves all native
-/// routes unchanged when disabled. Lloyd and mixed wire formats are excluded.
+/// Uniform MQ4G256 (v1) only; the explicit packed opt-in leaves all native
+/// routes unchanged when disabled. MQ4V2 (qt44, e.g. mq4-xts) keeps the landed
+/// gfx1100 builder V2C / IU4 routes: packed was not measured faster there.
+/// Lloyd and mixed wire formats are excluded.
 fn packed_mq4_ffn_gate_up_admitted(
     packed_admitted: bool,
     gate: (DType, usize, usize),
@@ -321,7 +317,7 @@ fn packed_mq4_ffn_gate_up_admitted(
     n: usize,
 ) -> bool {
     packed_admitted
-        && matches!(gate.0, DType::MQ4G256 | DType::MQ4G256V2)
+        && gate.0 == DType::MQ4G256
         && (gate.1, gate.2) == (17_408, 5_120)
         && up == gate
         && n > 0
@@ -362,19 +358,11 @@ fn try_packed_mq4_ffn_gate_up(
                 weight.k, config.norm_eps, n,
             )?;
         }
-        if weight.gpu_dtype == DType::MQ4G256V2 {
-            run_plain_gemm_key(
-                gpu, hipfire_dispatch::types::KernelKey::GemmMq4V2Packed,
-                &weight.buf, weight.gpu_dtype, &pbs.x_rot_batch, output,
-                weight.m, weight.k, n,
-            )?;
-        } else {
-            run_plain_gemm_key(
-                gpu, hipfire_dispatch::types::KernelKey::GemmMq4Packed,
-                &weight.buf, weight.gpu_dtype, &pbs.x_rot_batch, output,
-                weight.m, weight.k, n,
-            )?;
-        }
+        run_plain_gemm_key(
+            gpu, hipfire_dispatch::types::KernelKey::GemmMq4Packed,
+            &weight.buf, weight.gpu_dtype, &pbs.x_rot_batch, output,
+            weight.m, weight.k, n,
+        )?;
     }
     Ok(true)
 }
@@ -1726,8 +1714,6 @@ fn lean_pbs_route(
     n: usize,
 ) -> bool {
     matches!(gpu.arch.as_str(), "gfx1100" | "gfx1151")
-        // Packed FFN writes full-size F32 planes omitted by lean PBS.
-        && !(gpu.arch == "gfx1100" && gpu.flags.packed_mq4_prefill)
         && config.num_experts == 0
         && config.linear_value_head_dim == 128
         && dense_layers_are_all_mq4v2(weights)
@@ -2093,16 +2079,6 @@ fn memory_admitted_rung(
             .unwrap_or(0);
         let total = need_pbs.saturating_sub(pbs_credit)
             .saturating_add(projection_deficit)
-            // MQ4V2 retains IU4 scratch for its other projections; packed
-            // FFN additionally needs the distinct 144-byte MMQ slot. Native
-            // MQ4 already charged that slot above. Include bounded fallback
-            // tail scratch conservatively rather than borrowing headroom.
-            .saturating_add(if !native_mq4 && gpu.arch == "gfx1100" && gpu.flags.packed_mq4_prefill {
-                native_mq4_projection_deficit(
-                    config, rung, gpu.scratch.q8_1_mmq_x_scratch_bytes,
-                    gpu.scratch.fp16_x_scratch_bytes, gpu.scratch.ksplit_det_partials_bytes,
-                ).unwrap_or(usize::MAX)
-            } else { 0 })
             .saturating_add(q16_missing)
             .saturating_add(WIDENED_VRAM_HEADROOM_BYTES);
         if total <= free_bytes {
@@ -3210,7 +3186,11 @@ fn forward_prefill_batch_with_pbs_opts_inner(
             let remaining = n - chunk_start;
             // Widened grouping keeps an odd tail attached to the largest
             // admitted chunk so its GEMMs use the padded multi-row route.
-            let chunk_n = if wide && gpu.arch == "gfx1100" && gpu.flags.packed_mq4_prefill {
+            let chunk_n = if wide
+                && gpu.arch == "gfx1100"
+                && gpu.flags.packed_mq4_prefill
+                && dense_layers_have_projection_dtype(weights, DType::MQ4G256)
+            {
                 next_packed_prefill_chunk_len(remaining, chunk_batch)
             } else if wide {
                 next_exact_prefill_chunk_len(remaining, chunk_batch)
@@ -14368,7 +14348,8 @@ mod tests {
         let v2 = (DType::MQ4G256V2, 17_408, 5_120);
         for n in [256, 512, 768] {
             assert!(packed_mq4_ffn_gate_up_admitted(true, shape, shape, n));
-            assert!(packed_mq4_ffn_gate_up_admitted(true, v2, v2, n));
+            // MQ4V2 keeps the landed V2C / IU4 routes.
+            assert!(!packed_mq4_ffn_gate_up_admitted(true, v2, v2, n));
             assert!(!packed_mq4_ffn_gate_up_admitted(false, shape, shape, n));
             assert!(!packed_mq4_ffn_gate_up_admitted(false, v2, v2, n));
             assert!(!packed_mq4_ffn_gate_up_admitted(true, shape, v2, n));
@@ -14394,7 +14375,8 @@ mod tests {
 
     #[test]
     fn packed_mq4_down_refuses_prepared_partial_and_nonuniform_inputs() {
-        for dtype in [DType::MQ4G256, DType::MQ4G256V2] {
+        assert!(!packed_mq4_down_admitted(true, true, true, (DType::MQ4G256V2, 5120, 17408), 17408));
+        for dtype in [DType::MQ4G256] {
             let shape = (dtype, 5120, 17408);
             assert!(packed_mq4_down_admitted(true, true, true, shape, 17408));
             assert!(!packed_mq4_down_admitted(false, true, true, shape, 17408));
