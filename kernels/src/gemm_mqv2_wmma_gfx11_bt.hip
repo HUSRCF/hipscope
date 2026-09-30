@@ -460,6 +460,15 @@ gemm_gate_up_mq##BITS##g256v2_wmma_gfx11_bt##BV( \
 // Grid: [ceil(M/16), ceil(N/(16*BV))]. Block: [32].
 // Ascending WMMA order (kt = 0..15), matching MQ4 residual base.
 // ---------------------------------------------------------------------------
+// gfx1151 decodes each half's eight weights and swaps them through
+// permlanex16 (decode_tile_split, bitwise equal); every other gfx11 arch keeps
+// the full decode_tile so its residual BT kernels compile exactly as before.
+#if defined(__gfx1151__)
+#define RESID_BT_DECODE(BITS, payload, kt, sc_h, zp_h) \
+    decode_tile_split<BITS>(payload, kt, sc_h, zp_h, tid >> 4)
+#else
+#define RESID_BT_DECODE(BITS, payload, kt, sc_h, zp_h) decode_tile<BITS>(payload, kt, sc_h, zp_h)
+#endif
 #define GEN_RESID_BT(BITS, BV) \
 extern "C" __launch_bounds__(32, 2) __global__ void \
 gemm_mq##BITS##g256v2_residual_wmma_gfx11_bt##BV( \
@@ -503,7 +512,7 @@ gemm_mq##BITS##g256v2_residual_wmma_gfx11_bt##BV( \
             const _Float16 sc_h = (kt < 8) ? sc0 : sc1; \
             const _Float16 zp_h = (kt < 8) ? zp0 : zp1; \
             const int k_off = kt * 16; \
-            half16_t a_reg = decode_tile_split<BITS>(payload, kt, sc_h, zp_h, tid >> 4); \
+            half16_t a_reg = RESID_BT_DECODE(BITS, payload, kt, sc_h, zp_h); \
             _Pragma("unroll") \
             for (int b = 0; b < (BV); b++) { \
                 half16_t b_reg = *(const half16_t*)(xg[b] + k_off); \

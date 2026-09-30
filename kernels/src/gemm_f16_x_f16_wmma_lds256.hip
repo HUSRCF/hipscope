@@ -672,7 +672,9 @@ typedef float    __attribute__((ext_vector_type(8)))  float8_t;
 // Block barrier over LDS only.  On gfx11 __syncthreads is a workgroup fence
 // that also waits for every in-flight global load (WGP mode), including the
 // pipelined next stage; the tile kernels share nothing through global memory.
-#if defined(__GFX11__)
+// Taken on gfx1151, where it was measured; every other arch keeps
+// __syncthreads, so its WLDS kernels compile exactly as before.
+#if defined(__gfx1151__)
 #define WLDS_BARRIER() asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory")
 #else
 #define WLDS_BARRIER() __syncthreads()

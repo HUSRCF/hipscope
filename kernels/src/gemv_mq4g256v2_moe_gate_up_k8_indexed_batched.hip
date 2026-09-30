@@ -125,10 +125,15 @@ extern "C" __global__ void gemv_mq4g256v2_moe_gate_up_k8_indexed_batched(
     const int quads = groups_per_row >> 2;
     const int tail = groups_per_row & 3;
 
-    // Qwen4 K = 2560: acc0 carries the folded lane sum.
+    // Qwen4 K = 2560 on gfx1151: acc0 carries the folded lane sum. Other archs
+    // compile this kernel exactly as before (the row10 helper serves only the
+    // rows8 entry below there).
+#if defined(__gfx1151__)
     if (groups_per_row == 10) {
         acc0 = mq4v2_gate_up_row10(row_ptr, x_row, tid);
-    } else for (int q = 0; q < quads; q++) {
+    } else
+#endif
+    for (int q = 0; q < quads; q++) {
         const int g = q << 2;
         const char* gp0 = row_ptr + g * 136;
         const char* gp1 = gp0 + 136;
@@ -182,7 +187,11 @@ extern "C" __global__ void gemv_mq4g256v2_moe_gate_up_k8_indexed_batched(
              + (sc * (float)(((pk) >> 24) & 0xFu) + zp) * x_row[(b) + 6] \
              + (sc * (float)(((pk) >> 28) & 0xFu) + zp) * x_row[(b) + 7]
 
+#if defined(__gfx1151__)
     if (groups_per_row != 10 && tail >= 1) {
+#else
+    if (tail >= 1) {
+#endif
         const int g = quads << 2;
         const char* gp = row_ptr + g * 136;
         unsigned int h = *(const unsigned int*)(gp + hoff);
@@ -192,7 +201,11 @@ extern "C" __global__ void gemv_mq4g256v2_moe_gate_up_k8_indexed_batched(
         int base = g * 256 + tid * 8;
         TAIL_DOG(pk, sc, zp, base, acc0);
     }
+#if defined(__gfx1151__)
     if (groups_per_row != 10 && tail >= 2) {
+#else
+    if (tail >= 2) {
+#endif
         const int g = (quads << 2) + 1;
         const char* gp = row_ptr + g * 136;
         unsigned int h = *(const unsigned int*)(gp + hoff);
@@ -214,7 +227,11 @@ extern "C" __global__ void gemv_mq4g256v2_moe_gate_up_k8_indexed_batched(
     }
     #undef TAIL_DOG
 
+#if defined(__gfx1151__)
     float acc = groups_per_row == 10 ? acc0 : (acc0 + acc1) + (acc2 + acc3);
+#else
+    float acc = (acc0 + acc1) + (acc2 + acc3);
+#endif
     for (int offset = 16; offset > 0; offset >>= 1)
         acc += __shfl_down(acc, offset);
 

@@ -68,8 +68,10 @@ extern "C" __global__ void moe_scatter_fused_k8(
     __syncthreads();
 
     // ── Phase 2: pad + exclusive prefix-sum ──
-    // A block-wide scan over contiguous per-thread expert ranges: integer
-    // sums, so the offsets equal the serial walk's exactly.
+#if defined(__gfx1151__)
+    // gfx1151: a block-wide scan over contiguous per-thread expert ranges:
+    // integer sums, so the offsets equal the serial walk's exactly (512-expert
+    // Qwen4 routing). Other archs keep the serial walk below unchanged.
     __shared__ int wave_totals[32];
     const int per = (num_experts + bdim - 1) / bdim;
     const int first = tid * per;
@@ -100,6 +102,20 @@ extern "C" __global__ void moe_scatter_fused_k8(
         expert_token_counts[e] = padded;
         acc += padded;
     }
+#else
+    // Serial in thread 0 — E ≤ 256.
+    if (tid == 0) {
+        int acc = 0;
+        for (int i = 0; i < num_experts; i++) {
+            const int raw = s_workspace[i];
+            const int padded = ((raw + block_m - 1) / block_m) * block_m;
+            expert_offsets[i] = acc;
+            expert_token_counts[i] = padded;
+            acc += padded;
+        }
+        expert_offsets[num_experts] = acc; // M_total
+    }
+#endif
     __syncthreads();
 
     // ── Phase 3a: reset s_workspace for bucket-fill counters ──
