@@ -7463,7 +7463,6 @@ pub const ROPE_PARTIAL_HALVED_BATCHED_SRC: &str =
 
 /// Exact gfx1100 Qwen3.6 full-attention decode preparation: deinterleave Q and
 /// gate, RMS-normalize Q/K, then apply partial half-split RoPE head-locally.
-#[cfg(feature = "deltanet")]
 pub const QWEN35_FA_PREP_GFX1100_SRC: &str =
     include_str!("../../../kernels/src/qwen35_fa_prep.gfx1100.hip");
 #[cfg(feature = "deltanet")]
@@ -7497,7 +7496,6 @@ pub const QWEN35_FA_PREP_GFX1201_SRC: &str = concat!(
 /// (`fma(x0, cos, -(x1 * sin))`, `fma(x0, sin, x1 * cos)`); left to the
 /// compiler, this body fuses the second output as `fma(x1, cos, x0 * sin)`
 /// and differs from the unfused chain in the last bit.
-#[cfg(feature = "deltanet")]
 pub fn qwen36_27b_fa_prep_gfx1201_src() -> &'static str {
     static SRC: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
         let body = QWEN35_FA_PREP_GFX1100_SRC

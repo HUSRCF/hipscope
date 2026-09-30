@@ -284,6 +284,14 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         add!("gemv_hfq4g256_residual", kernels::GEMV_HFQ4G256_RESIDUAL_SRC, ["gemv_hfq4g256_residual"]);
         add!("gemv_q8_0_wide", kernels::GEMV_Q8_0_WIDE_SRC, ["gemv_q8_0_wide"]);
         add!("rope_partial_halfsplit_batched", kernels::ROPE_PARTIAL_HALFSPLIT_BATCHED_SRC, ["rope_partial_halfsplit_batched_f32"]);
+        // H2 (Qwen3.8-27B MQ4v2, fp8 KV) decode, observed JIT-compiled by
+        // `hipfire run` greedy AR/MTP/DFlash on the installer inventory above.
+        add!("attention_flash_fp8_e4m3_tile_gqa_gfx1201", kernels::ATTENTION_FLASH_FP8_E4M3_TILE_GQA_GFX1201_SRC, ["attention_flash_fp8_e4m3_tile_gqa_gfx1201"]);
+        add!("attention_flash_reduce_dsplit_gfx1201", kernels::ATTENTION_FLASH_REDUCE_DSPLIT_GFX1201_SRC, ["attention_flash_reduce_dsplit_gfx1201"]);
+        add!("dflash_state_bulk_copy_gfx1100", crate::dflash_state_copy::DFLASH_STATE_BULK_COPY_GFX1100_SRC, ["dflash_state_bulk_copy_gfx1100"]);
+        add!("gated_delta_net_q8_compact3_b2", kernels::GATED_DELTA_NET_Q8_COMPACT3_B2_SRC, ["gated_delta_net_q8_compact3_b2"]);
+        add!("gated_norm_mq_rotate_awq_k6144_gfx1201", kernels::gated_norm_mq_rotate_awq_k6144_gfx1201_src(), ["gated_norm_mq_rotate_awq_k6144_gfx1201"]);
+        add!("qwen36_27b_fa_prep_gfx1201", kernels::qwen36_27b_fa_prep_gfx1201_src(), ["qwen36_27b_fa_prep_gfx1201"]);
     }
     Ok(entries)
 }
@@ -325,10 +333,11 @@ mod tests {
         }
         assert_eq!(count, 92);
         // The installer trace predates the scalar-prefill runtime's BR/BC
-        // specialization and the `HIPFIRE_G12_DEC_NORM` decode twins
-        // (fused RMSNorm+FWHT group grid, rmsnorm row split, RoPE head grid).
-        // Those four keys are additional to P0's 92.
-        assert_eq!(registry.len(), count + 4, "unexpected gfx1201 inventory size");
+        // specialization, the `HIPFIRE_G12_DEC_NORM` decode twins (fused
+        // RMSNorm+FWHT group grid, rmsnorm row split, RoPE head grid) and the
+        // six H2 decode modules added for compiler-free packs. Those ten keys
+        // are additional to P0's 92.
+        assert_eq!(registry.len(), count + 10, "unexpected gfx1201 inventory size");
         let default_prefill = by_name.get("attention_q8_0_flash_prefill_br8_bc16").unwrap();
         assert_eq!(default_prefill.symbols, ["attention_q8_0_flash_prefill"]);
         assert!(default_prefill.source().starts_with(
