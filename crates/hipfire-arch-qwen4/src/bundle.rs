@@ -241,7 +241,18 @@ impl Qwen4Bundle {
                 "Qwen4 forward chunk capacity is zero".to_string(),
             ));
         }
-        let max_chunk = max_chunk.min(QWEN4_PREFILL_CHUNK_CAP);
+        // One chunk prefetches `rows * PLE_HEAD_COUNT` n-gram rows through a
+        // single row-store staging buffer (26,214 rows = 1,638 tokens), so the
+        // chunk cannot exceed it; round down to 256 rows so a full chunk keeps
+        // the M/N-aligned prefill GEMM tiles.  Longer prompts tile.
+        let ple_rows_cap =
+            self.ple_rows.max_rows_per_prefetch() / crate::ple::PLE_HEAD_COUNT / 256 * 256;
+        if ple_rows_cap == 0 {
+            return Err(BundleError::Forward(
+                "Qwen4 PLE row store cannot stage one 256-token chunk".to_string(),
+            ));
+        }
+        let max_chunk = max_chunk.min(QWEN4_PREFILL_CHUNK_CAP).min(ple_rows_cap);
         self.weights
             .requant_from_env(gpu)
             .map_err(BundleError::Forward)?;
