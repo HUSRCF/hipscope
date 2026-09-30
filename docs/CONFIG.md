@@ -360,8 +360,9 @@ there. Other carriers keep their existing site policy (llama, MiniMax and
 LFM2-MoE resolve `auto` to q8).
 
 **Qwen3.8-Flash-Next / Qwen4 (arch 16)** has its own table: `kv_cache`
-sets the storage of the QSA full-attention K/V arenas (the GatedDeltaNet
-state is unaffected).
+sets the storage of the QSA full-attention K/V arenas. The GatedDeltaNet
+recurrent state is separate: Qwen3.5's Q8 DeltaNet format by default on every
+arch, `fp32` through the `state_quant` load parameter.
 
 | `kv_cache` | gfx1201 | gfx1100, gfx1151 (Halo), other arches |
 |---|---|---|
@@ -374,7 +375,8 @@ state is unaffected).
 kernels implement (head_dim 256, even KV-head count; Flash-Next qualifies);
 otherwise it stays `bf16`. The native MTP layer keeps the exact state. On
 Flash-Next, fp8 cuts each trunk QSA layer's context state from 4,736 to
-1,352 bytes per token.
+1,352 bytes per token, and the Q8 GDN state is 3.88× smaller than F32;
+`memory.max_seq` goes up to the native 262,144.
 
 **Kill switch:** `HIPFIRE_QWEN_KV_DEFAULT_Q8=0` (developer variable) restores
 the prior *implicit Qwen* per-site default wherever `auto` does not pick
