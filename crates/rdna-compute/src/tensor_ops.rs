@@ -26,6 +26,12 @@ const QSA_SELECT_PARALLEL_THREADS: u32 = 256;
 // gfx1151's 64-KiB dynamic LDS budget; other devices use the serial path.
 // Oversized rows also use serial kernels without changing the contract.
 const QSA_SELECT_DYNAMIC_LDS_LIMIT_BYTES: usize = 64 * 1024;
+/// Static LDS of `indexed_attention_select_f32_batched` beside its dynamic
+/// score row: 256 radix bins and the 512-entry chosen-block list
+/// (`QSA_SELECT_LIST_CAPACITY` in tensor_ops.hip) plus scalars, rounded up.
+/// The parallel route needs `shape_blocks * 4 + this` within the LDS limit,
+/// i.e. at most 15360 pooled blocks (61440 tokens at compress 4).
+pub const QSA_SELECT_BATCHED_STATIC_LDS_BYTES: usize = 4 * 1024;
 const QSA_ATTENTION_PARALLEL_THREADS: u32 = 256;
 const QSA_ATTENTION_LDS_BYTES_PER_ROW: usize = 8; // F32 score + i32 token.
 const QSA_ATTENTION_DYNAMIC_LDS_LIMIT_BYTES: usize = 64 * 1024;
@@ -2499,7 +2505,8 @@ fn indexed_attention_select_batch_impl(
             Some(bytes)
                 if gpu.arch_caps.has_gfx11_plus_simt()
                     && shape_blocks > 0
-                    && bytes <= QSA_SELECT_DYNAMIC_LDS_LIMIT_BYTES
+                    && bytes + QSA_SELECT_BATCHED_STATIC_LDS_BYTES
+                        <= QSA_SELECT_DYNAMIC_LDS_LIMIT_BYTES
                     && bytes <= u32::MAX as usize =>
             {
                 (
@@ -5344,6 +5351,65 @@ mod tests {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    /// Production QSA geometry past its budget (512 of 4096 blocks, 4 heads x
+    /// 128, compress 4): the parallel radix-select route must emit the serial
+    /// selection sort's bytes, including when the budget boundary falls inside
+    /// a run of equal scores (ReLU zeros), where the lower block index wins.
+    #[test]
+    fn past_budget_select_matches_serial_on_production_geometry() {
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        const SERIAL_BOUND: usize = QSA_SELECT_DYNAMIC_LDS_LIMIT_BYTES / 4 + 1;
+        let (compress, index_heads, index_dim, rows, block_count, budget_blocks) =
+            (4usize, 4usize, 128usize, 3usize, 4096usize, 512usize);
+        let mut state = 0x2545_f491u32;
+        let mut next = move || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (state >> 8) as f32 / 16_777_216.0
+        };
+        // Positive queries: a block whose pooled row is all negative scores 0.
+        let query: Vec<f32> = (0..rows * index_heads * index_dim).map(|_| next()).collect();
+        // positive_every: 1 = every block scores > 0 (threshold above zero);
+        // 10 = ~410 positive blocks, so the boundary is inside the zero run;
+        // 0 = every block ties at zero.
+        for positive_every in [1usize, 10, 0] {
+            let pooled: Vec<f32> = (0..block_count * index_dim)
+                .map(|i| {
+                    let block = i / index_dim;
+                    let value = next() - 0.25;
+                    if positive_every != 0 && block % positive_every == 0 {
+                        value
+                    } else {
+                        -value.abs() - 0.01
+                    }
+                })
+                .collect();
+            let case = SelectCase {
+                compress,
+                index_heads,
+                index_dim,
+                rows,
+                block_count,
+                budget_blocks,
+                capacity: budget_blocks * compress + compress - 1,
+                position_start: block_count * compress,
+            };
+            let parallel = run_select_case(&mut gpu, &case, &pooled, &query, block_count);
+            let serial = run_select_case(&mut gpu, &case, &pooled, &query, SERIAL_BOUND);
+            assert_eq!(
+                parallel, serial,
+                "past-budget radix select diverged (positive_every={positive_every})"
+            );
+            if positive_every == 0 {
+                // All tied: the lowest 512 block indices, in index order.
+                let expected: Vec<i32> = (0..(budget_blocks * compress) as i32).collect();
+                assert_eq!(&parallel[..budget_blocks * compress], &expected[..]);
             }
         }
     }
