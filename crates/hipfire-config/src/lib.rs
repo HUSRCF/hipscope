@@ -2369,7 +2369,7 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         false,
         "HIPFIRE_VERIFY_ATTN",
-        "Run speculative-verify attention (1..=32 rows, non-tree) through the gfx1201 GQA-shared split-K VerifyAttn twin of the batched flash tile + reduce (default on exact gfx1201; byte-identical output; set to false or HIPFIRE_VERIFY_ATTN=0 to opt out to attention_flash_*_tile_batched)."
+        "Run speculative-verify attention (1..=32 rows, non-tree) through the GQA-shared split-K VerifyAttn twin of the batched flash tile + reduce (default on exact gfx1201 and gfx1100; on gfx1100 it also twins the multi-row R4/R8 Q8 tile; byte-identical output; set to false or HIPFIRE_VERIFY_ATTN=0 to opt out to attention_flash_*_tile_batched / attention_flash_q8_0_rows{4,8}_d8)."
     ),
     process_bool_field!(
         "kernel.gfx12_fa_prep_fused",

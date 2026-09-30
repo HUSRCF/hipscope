@@ -317,13 +317,20 @@ pub enum VerifyKv {
 /// `attention_flash_asym_reduce_batched`. Partials and output are
 /// byte-identical to that pair; the contract (entry ABI, grid, live range,
 /// arithmetic) is in `kernels/src/attention_verify_gqa.gfx1201.hip`. A gfx11
-/// twin adds one row here.
+/// twin adds one row here. `rows_q8` is the optional twin of the multi-row
+/// tile `attention_flash_q8_0_rows{8,4}_d8` (same grid plus the reference's
+/// rows per block), for arches whose eager Q8 verify runs that kernel.
 struct VerifyGqaKernels {
     module: &'static str,
     src: &'static str,
     tile_q8: Option<&'static str>,
     tile_fp8: Option<&'static str>,
+    rows_q8: Option<&'static str>,
     reduce: &'static str,
+    /// Workgroups the split count aims for: the fixed grid is
+    /// `[row_groups * n_kv_heads, splits]` and each workgroup loops over
+    /// tiles `y, y + splits, ...` of its row group's live range.
+    target_workgroups: usize,
 }
 
 const VERIFY_GQA_GFX1201: VerifyGqaKernels = VerifyGqaKernels {
@@ -331,33 +338,57 @@ const VERIFY_GQA_GFX1201: VerifyGqaKernels = VerifyGqaKernels {
     src: kernels::ATTENTION_VERIFY_GQA_GFX1201_SRC,
     tile_q8: Some("attention_verify_gqa_q8_gfx1201"),
     tile_fp8: Some("attention_verify_gqa_fp8_gfx1201"),
+    rows_q8: None,
     reduce: "attention_verify_reduce_gfx1201",
+    target_workgroups: 256,
+};
+
+const VERIFY_GQA_GFX1100: VerifyGqaKernels = VerifyGqaKernels {
+    module: "attention_verify_gqa_gfx1100",
+    src: kernels::ATTENTION_VERIFY_GQA_GFX1100_SRC,
+    tile_q8: Some("attention_verify_gqa_q8_gfx1100"),
+    tile_fp8: None,
+    rows_q8: Some("attention_verify_gqa_q8_rows_gfx1100"),
+    reduce: "attention_verify_reduce_gfx1100",
+    target_workgroups: 256,
 };
 
 fn verify_gqa_kernels(gpu: &Gpu) -> Option<&'static VerifyGqaKernels> {
     if gpu.arch_caps.is_gfx1201() {
         Some(&VERIFY_GQA_GFX1201)
+    } else if gpu.arch_caps.is_gfx1100() {
+        Some(&VERIFY_GQA_GFX1100)
     } else {
         None
     }
+}
+
+/// Which reference a VerifyAttn launch twins.
+#[derive(Clone, Copy)]
+enum VerifyGqaRef {
+    /// `attention_flash_{q8_0,fp8_e4m3}_tile_batched`.
+    Tile(VerifyKv),
+    /// `attention_flash_q8_0_rows{8,4}_d8` with this many rows per block.
+    Rows(usize),
 }
 
 /// Query rows one VerifyAttn workgroup serves (compile-time in the kernel).
 const VERIFY_GQA_ROWS: usize = 8;
 /// Largest verify block VerifyAttn admits (DFlash B <= 16, MTP K+1, ngram).
 const VERIFY_GQA_MAX_ROWS: usize = 32;
-/// Workgroups the split count aims for: the fixed grid is
-/// `[row_groups * n_kv_heads, splits]` and each workgroup loops over tiles
-/// `y, y + splits, ...` of its row group's live range.
-const VERIFY_GQA_TARGET_WORKGROUPS: usize = 256;
 
 /// Grid-y (split count) of a VerifyAttn launch. It depends on the context only
 /// through `max_tiles`, which under HIP-graph capture is the physical-capacity
 /// tile count, so a captured verify graph (keyed by batch size) always gets the
 /// capped value. The split count never changes output bytes.
-fn verify_gqa_splits(max_tiles: usize, row_groups: usize, n_kv_heads: usize) -> usize {
+fn verify_gqa_splits(
+    target_workgroups: usize,
+    max_tiles: usize,
+    row_groups: usize,
+    n_kv_heads: usize,
+) -> usize {
     let per_split = (row_groups * n_kv_heads).max(1);
-    let cap = VERIFY_GQA_TARGET_WORKGROUPS.div_ceil(per_split).max(1);
+    let cap = target_workgroups.div_ceil(per_split).max(1);
     max_tiles.clamp(1, cap)
 }
 
@@ -6994,15 +7025,91 @@ impl Gpu {
         tree_bias: Option<&GpuTensor>,
         block_cols: usize,
     ) -> HipResult<bool> {
-        if !self.flags.verify_attn || tree_bias.is_some() || block_cols != 0 || self.replay.is_recording() {
+        if tree_bias.is_some() || block_cols != 0 {
+            return Ok(false);
+        }
+        self.launch_verify_gqa(
+            VerifyGqaRef::Tile(kv),
+            q,
+            k_cache,
+            v_cache,
+            out,
+            positions,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx_len,
+            batch_size,
+            partials,
+        )
+    }
+
+    /// VerifyAttn twin of the multi-row Q8 tile + reduce
+    /// ([`Self::attention_flash_q8_0_rows_masked`] with `rows_per_block` rows
+    /// per block): byte-identical partials and output on arches with a
+    /// `rows_q8` table entry, same admission as
+    /// [`Self::try_attention_verify_gqa`]. `Ok(false)` = not admitted.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_attention_verify_gqa_rows(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+        partials: &GpuTensor,
+        rows_per_block: usize,
+    ) -> HipResult<bool> {
+        if !matches!(rows_per_block, 4 | 8) {
+            return Ok(false);
+        }
+        self.launch_verify_gqa(
+            VerifyGqaRef::Rows(rows_per_block),
+            q,
+            k_cache,
+            v_cache,
+            out,
+            positions,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx_len,
+            batch_size,
+            partials,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn launch_verify_gqa(
+        &mut self,
+        reference: VerifyGqaRef,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+        partials: &GpuTensor,
+    ) -> HipResult<bool> {
+        if !self.flags.verify_attn || self.replay.is_recording() {
             return Ok(false);
         }
         let Some(set) = verify_gqa_kernels(self) else {
             return Ok(false);
         };
-        let tile_func = match kv {
-            VerifyKv::Q8 => set.tile_q8,
-            VerifyKv::Fp8 => set.tile_fp8,
+        let (tile_func, group_rows) = match reference {
+            VerifyGqaRef::Tile(VerifyKv::Q8) => (set.tile_q8, None),
+            VerifyGqaRef::Tile(VerifyKv::Fp8) => (set.tile_fp8, None),
+            VerifyGqaRef::Rows(rows) => (set.rows_q8, Some(rows as i32)),
         };
         let Some(tile_func) = tile_func else {
             return Ok(false);
@@ -7024,20 +7131,25 @@ impl Gpu {
         if partials_capacity < partials_bytes_per_row {
             return Ok(false);
         }
-        // Same sub-batching as `launch_asym_flash_batched`, so chunk-local
-        // partial rows land where the reference writes them.
+        // Same sub-batching as `launch_asym_flash_batched` and the multi-row
+        // launcher, so chunk-local partial rows land where the reference
+        // writes them.
         let sub_batch = (partials_capacity / partials_bytes_per_row).min(batch_size);
 
         self.ensure_kernel(set.module, set.src, tile_func)?;
         self.ensure_kernel(set.module, set.src, set.reduce)?;
 
         let q_dim = n_heads * head_dim;
-        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        // The multi-row reference carries scores in log2 space.
+        let scale = match reference {
+            VerifyGqaRef::Tile(_) => 1.0f32 / (head_dim as f32).sqrt(),
+            VerifyGqaRef::Rows(_) => std::f32::consts::LOG2_E / (head_dim as f32).sqrt(),
+        };
         let mut offset = 0usize;
         while offset < batch_size {
             let chunk = (batch_size - offset).min(sub_batch);
             let row_groups = chunk.div_ceil(VERIFY_GQA_ROWS);
-            let splits = verify_gqa_splits(max_tiles, row_groups, n_kv_heads);
+            let splits = verify_gqa_splits(set.target_workgroups, max_tiles, row_groups, n_kv_heads);
             {
                 let q_ptr =
                     unsafe { (q.buf.as_ptr() as *mut u8).add(offset * q_dim * 4) as *mut c_void };
@@ -7050,6 +7162,7 @@ impl Gpu {
                 let mt = max_tiles as i32;
                 let bo = offset as i32;
                 let sc = scale;
+                let gr = group_rows.unwrap_or(0);
                 let mut params: Vec<*mut c_void> = vec![
                     &q_ptr as *const _ as *mut c_void,
                     &k_ptr as *const _ as *mut c_void,
@@ -7062,6 +7175,9 @@ impl Gpu {
                     &bo as *const _ as *mut c_void,
                     &sc as *const _ as *mut c_void,
                 ];
+                if group_rows.is_some() {
+                    params.push(&gr as *const _ as *mut c_void);
+                }
                 self.launch_maybe_blob(
                     tile_func,
                     [(row_groups * n_kv_heads) as u32, splits as u32, 1],
@@ -7080,6 +7196,9 @@ impl Gpu {
                         b.push_i32(mt);
                         b.push_i32(bo);
                         b.push_f32(sc);
+                        if group_rows.is_some() {
+                            b.push_i32(gr);
+                        }
                         b
                     },
                 )?;
@@ -7285,6 +7404,8 @@ impl Gpu {
     }
 
     /// One KV scan for `batch_size` query rows; `Ok(false)` = out of scope, caller must fall back.
+    /// On arches with a VerifyAttn `rows_q8` twin (gfx1100) an admitted shape
+    /// runs the byte-identical twin instead ([`Self::try_attention_verify_gqa_rows`]).
     #[allow(clippy::too_many_arguments)]
     pub fn attention_flash_q8_0_rows_masked(
         &mut self,
@@ -7315,6 +7436,22 @@ impl Gpu {
             return Ok(false);
         }
         self.bind_thread()?;
+        if self.try_attention_verify_gqa_rows(
+            q,
+            k_cache,
+            v_cache,
+            out,
+            positions,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx_len,
+            batch_size,
+            partials,
+            rows,
+        )? {
+            return Ok(true);
+        }
         let tile_size = self.attn_tile_size();
         let max_tiles = max_ctx_len.div_ceil(tile_size);
         let stride = 2 + head_dim;

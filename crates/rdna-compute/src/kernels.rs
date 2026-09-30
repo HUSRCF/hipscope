@@ -7273,6 +7273,14 @@ pub const ATTENTION_FLASH_ASYM_REDUCE_BATCHED_SRC: &str =
 /// byte-identical to the tile_batched + reduce pair at head_dim 256, GQA 6.
 pub const ATTENTION_VERIFY_GQA_GFX1201_SRC: &str =
     include_str!("../../../kernels/src/attention_verify_gqa.gfx1201.hip");
+/// VerifyAttn Stage 0 (gfx1100, Q8 only): `attention_verify_gqa_q8_gfx1100`
+/// (twin of `attention_flash_q8_0_tile_batched`),
+/// `attention_verify_gqa_q8_rows_gfx1100` (twin of the multi-row
+/// `attention_flash_q8_0_rows{8,4}_d8`) and `attention_verify_reduce_gfx1100`
+/// (twin of [`ATTENTION_FLASH_ASYM_REDUCE_BATCHED_SRC`]); byte-identical
+/// partials and output at head_dim 256, GQA 6.
+pub const ATTENTION_VERIFY_GQA_GFX1100_SRC: &str =
+    include_str!("../../../kernels/src/attention_verify_gqa.gfx1100.hip");
 
 // lloyd-V (FWHT-rotated centroid) dedicated reduce kernels. Used ONLY when
 // v_mode != 8 — the tile kernels now write rotated V partials and these
