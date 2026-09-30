@@ -13316,4 +13316,60 @@ mod tests {
         assert_eq!(metric(port, rejected), 1);
         assert_eq!(metric(port, failed), 3);
     }
+
+    /// An image request queued for admission must not block the server: the
+    /// harness serves on one runtime thread, which a blocking wait would hold.
+    #[cfg(unix)]
+    #[test]
+    fn queued_image_request_does_not_block_the_server() {
+        let harness = Task11HttpHarness::spawn("images-admission");
+        let port = harness.port();
+        let held = harness.shared.admission.acquire().unwrap();
+        let image = thread::spawn(move || {
+            // `images` is refused only after admission, so this never
+            // reaches the daemon once it leaves the queue.
+            let payload = r#"{"prompt":"a red cube","images":["x"]}"#;
+            let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            write!(
+                stream,
+                "POST /v1/images/generations HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+                 Content-Type: application/json\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n{payload}",
+                payload.len()
+            )
+            .unwrap();
+            let mut response = String::new();
+            let _ = stream.read_to_string(&mut response);
+            response
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while harness.shared.admission.inflight() < 2 {
+            assert!(Instant::now() < deadline, "image request never queued");
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let mut health = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        health
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        health
+            .write_all(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        let mut response = String::new();
+        let _ = health.read_to_string(&mut response);
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "/health stalled behind a queued image request: {response:?}"
+        );
+
+        drop(held);
+        let response = image.join().unwrap();
+        assert!(
+            response.starts_with("HTTP/1.1 400") && response.contains("not a field"),
+            "{response}"
+        );
+    }
 }

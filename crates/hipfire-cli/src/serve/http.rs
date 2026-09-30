@@ -921,9 +921,17 @@ async fn handle_images_generations(
         .map(str::to_owned);
 
     // Serialize against chat traffic and cap queue depth the same way the
-    // chat path does; the daemon processes messages sequentially.
-    let guard = shared.admission.acquire().map_err(|e| e.to_string())?;
-    let _guard = guard;
+    // chat path does; the daemon processes messages sequentially. The wait
+    // is async so a queued image request does not park a runtime worker.
+    // Dropping this future (client gone) withdraws it from the queue.
+    let _guard = match shared
+        .admission
+        .acquire_async(CancellationToken::new())
+        .await
+    {
+        Ok(guard) => guard,
+        Err(error) => return Ok(admission_error_response(&shared.metrics, &error)),
+    };
 
     let (engine, loaded_model) = {
         let runtime = shared.runtime.lock().unwrap_or_else(|e| e.into_inner());
