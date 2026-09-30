@@ -3102,7 +3102,9 @@ pub fn generate_dflash(
     //
     // Thread the request's sampling into the speculator BEFORE the step loop.
     // SpecRequestConfig is installed once; greedy (temp 0) is unchanged.
-    // ngram-mod is greedy MTP only: env opt-in, thinking off (`max_think_tokens==1`).
+    // ngram-mod is greedy MTP only: env opt-in, thinking off. `enable_thinking`
+    // is the resolved Jinja toggle; serve lowers thinking-off to
+    // `thinking_enabled=false` and never sends the legacy `max_think_tokens==1`.
     if let Some(spec) = m.speculator.as_mut() {
         spec.configure_request(SpecRequestConfig {
             temp,
@@ -3117,7 +3119,7 @@ pub fn generate_dflash(
                     .as_deref()
                     == Some("1")
                 && temp <= 1e-6
-                && max_think_tokens == 1,
+                && !enable_thinking,
         });
     }
     let prefill_tokens_full = prefill_tokens.len();

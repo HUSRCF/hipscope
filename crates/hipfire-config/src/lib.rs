@@ -3766,6 +3766,13 @@ pub fn mtp_cache_policy() -> MtpCachePolicy {
 pub fn mtp_ngram_enabled() -> bool {
     developer_bool("HIPFIRE_MTP_NGRAM", false)
 }
+/// MTP prompt-fill route opt-out (`HIPFIRE_MTP_OWN_PREFILL=1`). Strict
+/// snapshot boolean, default off: the MTP prompt fill prefills the trunk
+/// through AR's ordinary route. `1` restores MTP's own route (512-row
+/// speculative-verify capture chunks, sequential GDN recurrence).
+pub fn mtp_own_prefill() -> bool {
+    developer_bool("HIPFIRE_MTP_OWN_PREFILL", false)
+}
 /// Raw `HIPFIRE_NGRAM_MOD_{N_MATCH,N_MIN,N_MAX}` triple with production
 /// defaults (24/48/64). Validation (max <= 64, min <= max, …) stays with the
 /// arch consumer; this only resolves the snapshot values.
