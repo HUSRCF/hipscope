@@ -18176,6 +18176,26 @@ impl Gpu {
         }
     }
 
+    /// `(F32 scratch, packed output)` bytes [`Self::requant_g256`] allocates
+    /// for an `[m, k]` weight; `None` for a non-MQ-G256-V2 target. The
+    /// scratch goes back to the device (not the pool) when the requant
+    /// returns, so only the packed output stays allocated.
+    pub fn requant_g256_bytes(m: usize, k: usize, target: DType) -> Option<(usize, usize)> {
+        let bits = match target {
+            DType::MQ2G256V2 => 2,
+            DType::MQ3G256V2 => 3,
+            DType::MQ4G256V2 => 4,
+            DType::MQ5G256V2 => 5,
+            DType::MQ6G256V2 => 6,
+            _ => return None,
+        };
+        let n = m.checked_mul(k)?;
+        Some((
+            n.checked_mul(std::mem::size_of::<f32>())?,
+            (n / 256).checked_mul(8 + 32 * bits)?,
+        ))
+    }
+
     /// Requantize a row-major `[m, k]` weight into an MQ{2,3,4,5,6}G256V2
     /// tensor (load-time precision experiments). BF16 / Q8_0 sources are
     /// rotated into the MQ G256 basis; MQ G256 V2 sources already live in it
@@ -18215,10 +18235,13 @@ impl Gpu {
         if m == 0 || !k.is_multiple_of(256) {
             return bad("needs m > 0 and K % 256 == 0");
         }
+        let Some((_, out_bytes)) = Self::requant_g256_bytes(m, k, target) else {
+            return bad("weight size overflows");
+        };
         self.bind_thread()?;
         let n = m * k;
         let values = self.alloc_tensor(&[n], DType::F32)?;
-        let out = self.alloc_tensor(&[n / 256 * (8 + 32 * bits as usize)], target)?;
+        let out = self.alloc_tensor(&[out_bytes], target)?;
         let run = |gpu: &mut Self,
                    func: &str,
                    src: &GpuTensor,
@@ -18257,7 +18280,10 @@ impl Gpu {
             run(self, "requant_pack_mqg256v2", &values, &out, n / 128, bits)?;
             self.hip.device_synchronize()
         })();
-        let freed = self.free_tensor(values);
+        // Back to the device, not the pool: a pooled vocab x hidden F32
+        // scratch (2.5 GB for a 248k x 2560 head) sits in a size bucket no
+        // later allocation reuses.
+        let freed = self.release_tensor_immediate(values);
         match result.and(freed) {
             Ok(()) => Ok(out),
             Err(error) => {

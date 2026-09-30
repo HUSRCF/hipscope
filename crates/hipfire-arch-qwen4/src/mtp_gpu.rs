@@ -182,8 +182,12 @@ pub struct MtpGpuScratch {
     host_token_bytes: [u8; 4],
 }
 
+/// Allocations of one [`MtpGpuScratch`], in field order.
+const MTP_SCRATCH_TENSORS: usize = 36;
+
 impl MtpGpuScratch {
-    fn new(gpu: &mut Gpu, config: &Qwen4Config) -> Result<Self, MtpGpuError> {
+    /// Element count and dtype of each scratch tensor, in field order.
+    fn shapes(config: &Qwen4Config) -> Result<[(usize, DType); MTP_SCRATCH_TENSORS], MtpGpuError> {
         let hidden = config.hidden_size;
         let wide = MTP_BRANCHES
             .checked_mul(hidden)
@@ -203,66 +207,71 @@ impl MtpGpuScratch {
             .checked_mul(config.hc_lowrank)
             .ok_or_else(|| invalid("MTP HC up scratch overflow"))?;
         let max_rotation = wide.max(hidden).max(config.hc_lowrank).max(q_width);
-        let mut allocated = Vec::new();
-        let mut alloc = |shape: &[usize], dtype: DType| -> Result<(), MtpGpuError> {
-            allocated.push(gpu.zeros(shape, dtype)?);
-            Ok(())
-        };
-        let result = (|| {
-            alloc(&[std::mem::size_of::<i32>()], DType::Raw)?;
-            alloc(&[hidden], DType::F32)?;
-            alloc(&[hidden], DType::F32)?;
-            alloc(&[hidden], DType::F32)?;
-            alloc(&[wide], DType::F32)?;
-            alloc(&[hidden], DType::F32)?;
-            alloc(&[wide], DType::F32)?;
-            alloc(&[wide], DType::F32)?;
-            alloc(&[wide], DType::F32)?;
-            alloc(&[wide], DType::F32)?;
-            alloc(&[config.hc_lowrank], DType::F32)?;
-            alloc(&[hc_up], DType::F32)?;
-            alloc(&[hidden], DType::F32)?;
-            alloc(&[config.hc_count], DType::F32)?;
-            alloc(
-                &[hidden.max(config.hc_lowrank).max(q_width).max(kv_width)],
+        let routed = config.num_experts_per_tok * config.moe_intermediate_size;
+        Ok([
+            (std::mem::size_of::<i32>(), DType::Raw),
+            (hidden, DType::F32),
+            (hidden, DType::F32),
+            (hidden, DType::F32),
+            (wide, DType::F32),
+            (hidden, DType::F32),
+            (wide, DType::F32),
+            (wide, DType::F32),
+            (wide, DType::F32),
+            (wide, DType::F32),
+            (config.hc_lowrank, DType::F32),
+            (hc_up, DType::F32),
+            (hidden, DType::F32),
+            (config.hc_count, DType::F32),
+            (
+                hidden.max(config.hc_lowrank).max(q_width).max(kv_width),
                 DType::BF16,
-            )?;
-            alloc(&[max_rotation], DType::F32)?;
-            alloc(&[index_width], DType::F32)?;
-            alloc(&[2 * q_width], DType::F32)?;
-            alloc(&[kv_width], DType::F32)?;
-            alloc(&[kv_width], DType::F32)?;
-            alloc(&[q_width], DType::F32)?;
-            alloc(
-                &[config.qsa_selected_capacity() * std::mem::size_of::<i32>()],
+            ),
+            (max_rotation, DType::F32),
+            (index_width, DType::F32),
+            (2 * q_width, DType::F32),
+            (kv_width, DType::F32),
+            (kv_width, DType::F32),
+            (q_width, DType::F32),
+            (
+                config.qsa_selected_capacity() * std::mem::size_of::<i32>(),
                 DType::Raw,
-            )?;
-            alloc(&[config.num_experts], DType::F32)?;
-            alloc(&[hidden], DType::F32)?;
-            alloc(&[2 * config.moe_intermediate_size], DType::F32)?;
-            alloc(&[config.moe_intermediate_size], DType::F32)?;
-            alloc(&[config.moe_intermediate_size], DType::F32)?;
-            alloc(&[config.moe_intermediate_size], DType::F32)?;
-            alloc(&[hidden], DType::F32)?;
-            alloc(
-                &[config.num_experts_per_tok * config.moe_intermediate_size],
+            ),
+            (config.num_experts, DType::F32),
+            (hidden, DType::F32),
+            (2 * config.moe_intermediate_size, DType::F32),
+            (config.moe_intermediate_size, DType::F32),
+            (config.moe_intermediate_size, DType::F32),
+            (config.moe_intermediate_size, DType::F32),
+            (hidden, DType::F32),
+            (routed, DType::F32),
+            (routed, DType::F32),
+            (routed, DType::F32),
+            (config.num_experts_per_tok, DType::F32),
+            (config.num_experts_per_tok, DType::F32),
+            (
+                config.num_experts_per_tok * hidden + hidden.div_ceil(4),
                 DType::F32,
-            )?;
-            alloc(
-                &[config.num_experts_per_tok * config.moe_intermediate_size],
-                DType::F32,
-            )?;
-            alloc(
-                &[config.num_experts_per_tok * config.moe_intermediate_size],
-                DType::F32,
-            )?;
-            alloc(&[config.num_experts_per_tok], DType::F32)?;
-            alloc(&[config.num_experts_per_tok], DType::F32)?;
-            alloc(
-                &[config.num_experts_per_tok * hidden + hidden.div_ceil(4)],
-                DType::F32,
-            )?;
-            alloc(&[config.shared_expert_intermediate_size.max(1)], DType::F32)?;
+            ),
+            (config.shared_expert_intermediate_size.max(1), DType::F32),
+        ])
+    }
+
+    /// Device bytes [`Self::new`] allocates.
+    fn device_bytes(config: &Qwen4Config) -> Result<usize, MtpGpuError> {
+        Ok(Self::shapes(config)?
+            .iter()
+            .map(|&(elements, dtype)| elements * dtype.size())
+            .sum())
+    }
+
+    fn new(gpu: &mut Gpu, config: &Qwen4Config) -> Result<Self, MtpGpuError> {
+        let shapes = Self::shapes(config)?;
+        let mut allocated = Vec::with_capacity(MTP_SCRATCH_TENSORS);
+        let result = (|| {
+            for (elements, dtype) in shapes {
+                allocated.push(gpu.zeros(&[elements], dtype)?);
+            }
             Ok::<(), MtpGpuError>(())
         })();
         if let Err(error) = result {
@@ -594,6 +603,23 @@ impl MtpGpuState {
             position: self.position,
             step_index: self.step_index,
         }
+    }
+    /// Device bytes [`Self::new`] allocates: the context-sized QSA arenas,
+    /// then the selection and wide-hidden carry, twice with their snapshot
+    /// backups.
+    fn device_bytes(config: &Qwen4Config, max_seq: usize) -> Option<usize> {
+        let carry = config
+            .qsa_selected_capacity()
+            .checked_mul(std::mem::size_of::<i32>())?
+            .checked_add(std::mem::size_of::<i32>())?
+            .checked_add(
+                MTP_BRANCHES
+                    .checked_mul(config.hidden_size)?
+                    .checked_mul(std::mem::size_of::<f32>())?,
+            )?;
+        config
+            .qsa_context_arena_bytes(max_seq, QsaKvFormat::F32)?
+            .checked_add(carry.checked_mul(2)?)
     }
     pub(crate) fn new(
         gpu: &mut Gpu,
@@ -989,7 +1015,43 @@ pub(crate) enum MtpStep {
     Append,
 }
 
+/// Draft ranking policy (`HIPFIRE_MTP_DRAFT_HEAD`, default `mq2r`) and row
+/// layout of the MTP draft head.
+fn draft_head_config(config: &Qwen4Config) -> (DraftHeadPolicy, DraftHeadLayout) {
+    let policy = DraftHeadPolicy::parse(
+        &hipfire_config::developer_var("HIPFIRE_MTP_DRAFT_HEAD")
+            .unwrap_or_else(|_| "mq2r".to_string()),
+    );
+    let layout = DraftHeadLayout {
+        vocab: config.vocab_size,
+        hidden: config.hidden_size,
+        front: DRAFT_FRONT,
+        special: config.eos_token_id as usize,
+        full_hold: DRAFT_FULL_HOLD,
+    };
+    (policy, layout)
+}
+
 impl Qwen4MtpGpu {
+    /// `(resident, load scratch)` device bytes [`Self::new`] takes at
+    /// `max_seq` for a language head stored as `head_dtype`: what the
+    /// attached head keeps, and the draft head's build scratch on top of it
+    /// (`DraftHead::device_bytes`), released before `new` returns.
+    pub(crate) fn device_bytes(
+        config: &Qwen4Config,
+        max_seq: usize,
+        head_dtype: DType,
+    ) -> Option<(usize, usize)> {
+        let (policy, layout) = draft_head_config(config);
+        let (draft, scratch) = DraftHead::device_bytes(head_dtype, layout, policy)?;
+        let resident = MtpGpuScratch::device_bytes(config)
+            .ok()?
+            .checked_add(MtpGpuState::device_bytes(config, max_seq)?)?
+            .checked_add(Qwen4MoeLayerRuntime::device_bytes(config)?)?
+            .checked_add(draft)?;
+        Some((resident, scratch))
+    }
+
     pub(crate) fn new(
         gpu: &mut Gpu,
         weights: &Qwen4Weights,
@@ -1016,17 +1078,7 @@ impl Qwen4MtpGpu {
                 return Err(error.into());
             }
         };
-        let policy = DraftHeadPolicy::parse(
-            &hipfire_config::developer_var("HIPFIRE_MTP_DRAFT_HEAD")
-                .unwrap_or_else(|_| "mq2r".to_string()),
-        );
-        let layout = DraftHeadLayout {
-            vocab: config.vocab_size,
-            hidden: config.hidden_size,
-            front: DRAFT_FRONT,
-            special: config.eos_token_id as usize,
-            full_hold: DRAFT_FULL_HOLD,
-        };
+        let (policy, layout) = draft_head_config(config);
         let draft = weights
             .resident(&weights.root.lm_head)
             .map_err(MtpGpuError::from)

@@ -356,6 +356,11 @@ impl Carrier for Qwen4Carrier {
         }
         let mut native_mtp =
             crate::admission::qwen4_native_mtp(ctx.spec, &ctx.gpu.arch, ctx.path, ctx.pp, 1)?;
+        let max_k = ctx
+            .spec
+            .mtp_k
+            .unwrap_or(hipfire_runtime::config::get().mtp_k)
+            .clamp(1, 10);
         self.admit_options(
             ctx.draft_path,
             crate::admission::SourceAdmissionOptions {
@@ -390,6 +395,23 @@ impl Carrier for Qwen4Carrier {
         if use_ranges {
             hfq.drop_mmap();
         }
+        // The state formats (memory.kv_cache for QSA, state_quant for GDN),
+        // resolved before any allocation.
+        let state_format = hipfire_arch_qwen4::resolve_state_format(
+            &kv_mode_from_ctx(ctx),
+            ctx.state_quant_override.unwrap_or(""),
+            ctx.gpu,
+            &config,
+        )?;
+        let qsa_format = state_format.qsa;
+        eprintln!(
+            "  qwen4 state: QSA {} K/V, GDN {} recurrent",
+            match qsa_format {
+                hipfire_arch_qwen4::QsaKvFormat::Fp8 => "fp8",
+                hipfire_arch_qwen4::QsaKvFormat::F32 => "bf16 (exact F32 state)",
+            },
+            state_format.gdn.name()
+        );
         if let Some(policy) = hipfire_arch_qwen4::expert_residency::expert_vram_layers_from_env()
             .map_err(|error| format!("qwen4: {error}"))?
         {
@@ -414,11 +436,64 @@ impl Carrier for Qwen4Carrier {
                     let (non_expert, layer_experts) =
                         residency::resident_split(&manifest.weights, bytes_of)
                             .map_err(|error| format!("qwen4: {error}"))?;
+                    // Every placement host-maps at least the MTP layer's
+                    // routed experts, so the head is still attached after it
+                    // only where the host-mapped policy keeps it (an explicit
+                    // `--spec mtp`); only then does it need VRAM.
+                    let mtp_kept = native_mtp
+                        && crate::admission::qwen4_mtp_with_host_mapped_experts(ctx.spec, 1);
+                    let mtp_bytes = if mtp_kept {
+                        let head = residency::language_head_dtype(&manifest.weights)
+                            .ok_or("qwen4: manifest has no language head")?;
+                        let row_capture =
+                            hipfire_arch_qwen4::mtp_spec::native_mtp_row_capture(ctx.gpu, &config);
+                        Some(
+                            hipfire_arch_qwen4::mtp_spec::native_mtp_device_bytes(
+                                &config,
+                                ctx.max_seq,
+                                max_k,
+                                head,
+                                row_capture,
+                            )
+                            .ok_or("qwen4: native MTP device bytes overflow")?,
+                        )
+                    } else {
+                        None
+                    };
+                    let reserve = residency::auto_vram_reserve(
+                        &config,
+                        ctx.max_seq,
+                        qsa_format,
+                        mtp_bytes,
+                    )
+                    .map_err(|error| format!("qwen4: {error}"))?;
+                    const MIB: u64 = 1 << 20;
+                    eprintln!(
+                        "  qwen4 auto expert placement: {} MiB free, {} MiB non-expert weights, {} MiB reserved ({} MiB native MTP), {} MiB per expert layer",
+                        free as u64 / MIB,
+                        non_expert / MIB,
+                        reserve / MIB,
+                        mtp_bytes.unwrap_or(0) / MIB,
+                        layer_experts / MIB
+                    );
+                    // With every routed expert in host RAM the load would
+                    // still leave less than the reserve, and fail later at
+                    // the first request (e.g. beside another process's
+                    // model): refuse before allocating instead.
+                    if (free as u64) < non_expert.saturating_add(reserve) {
+                        return Err(format!(
+                            "qwen4: {} MiB of free VRAM cannot hold the {} MiB of non-expert weights plus the {} MiB reserve even with every routed expert in host RAM; free VRAM on this GPU",
+                            free as u64 / MIB,
+                            non_expert / MIB,
+                            reserve / MIB
+                        ));
+                    }
                     residency::auto_vram_layers(
                         free as u64,
                         non_expert,
                         layer_experts,
                         config.num_hidden_layers,
+                        reserve,
                     )
                 }
             };
@@ -442,23 +517,6 @@ impl Carrier for Qwen4Carrier {
                 );
             }
         }
-        // The state formats (memory.kv_cache for QSA, state_quant for GDN),
-        // resolved before any allocation.
-        let state_format = hipfire_arch_qwen4::resolve_state_format(
-            &kv_mode_from_ctx(ctx),
-            ctx.state_quant_override.unwrap_or(""),
-            ctx.gpu,
-            &config,
-        )?;
-        let qsa_format = state_format.qsa;
-        eprintln!(
-            "  qwen4 state: QSA {} K/V, GDN {} recurrent",
-            match qsa_format {
-                hipfire_arch_qwen4::QsaKvFormat::Fp8 => "fp8",
-                hipfire_arch_qwen4::QsaKvFormat::F32 => "bf16 (exact F32 state)",
-            },
-            state_format.gdn.name()
-        );
         // Context-sized QSA arenas (trunk layers in `qsa_format`, plus the MTP
         // head's, which stays F32), named in the refusal when they do not fit.
         let context_state_mib = config
@@ -521,11 +579,6 @@ impl Carrier for Qwen4Carrier {
             let _ = bundle.free_gpu(ctx.gpu);
             return Err(format!("qwen4: forward setup failed: {detail}"));
         }
-        let max_k = ctx
-            .spec
-            .mtp_k
-            .unwrap_or(hipfire_runtime::config::get().mtp_k)
-            .clamp(1, 10);
         let speculator = if native_mtp {
             if let Err(error) = bundle.attach_mtp(ctx.gpu, ctx.max_seq) {
                 let detail = error.to_string();

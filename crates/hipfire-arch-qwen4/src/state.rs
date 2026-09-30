@@ -1238,6 +1238,34 @@ impl Qwen4State {
         first.map_or(Ok(()), |error| Err(StateError::Hip(error)))
     }
 
+    /// Device bytes [`Self::ensure_row_capture`] allocates for `rows`-row
+    /// blocks: per GDN layer a two-half recurrent-state ring, the input rows
+    /// and the recurrence inputs, then one output block and the pointer
+    /// table. The single-slot recurrent state each ring replaces is freed
+    /// into the GPU pool, which keeps it.
+    pub(crate) fn row_capture_bytes(config: &Qwen4Config, rows: usize) -> Option<usize> {
+        if rows < 2 {
+            return Some(0);
+        }
+        let value_heads = config.linear_num_value_heads;
+        let state = value_heads
+            .checked_mul(config.linear_value_head_dim)?
+            .checked_mul(config.linear_key_head_dim)?;
+        let qkv = (2 * config.linear_num_key_heads)
+            .checked_mul(config.linear_key_head_dim)?
+            .checked_add(value_heads.checked_mul(config.linear_value_head_dim)?)?;
+        let layer = (2 * rows)
+            .checked_mul(state)?
+            .checked_add(rows.checked_mul(qkv)?)?
+            .checked_add(rows.checked_mul(qkv.checked_add(2 * value_heads)?)?)?;
+        let gdn_layers = config.n_linear_layers();
+        gdn_layers
+            .checked_mul(layer)?
+            .checked_add(rows.checked_mul(value_heads * GDN_HEAD_DIM)?)?
+            .checked_mul(std::mem::size_of::<f32>())?
+            .checked_add(gdn_layers.checked_mul(2 * std::mem::size_of::<u64>())?.max(1))
+    }
+
     /// Allocate the few-row verify rollback points for blocks of up to
     /// `rows` rows (`conv_history` = convolution kernel - 1). Only called
     /// where the GDN route captures rows (see `GatedDeltaNetOp::row_capture`).
