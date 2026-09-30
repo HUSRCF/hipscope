@@ -4221,11 +4221,19 @@ enum PreparedPm4Graph {
 }
 
 impl PreparedPm4Graph {
+    /// # Safety
+    ///
+    /// Same contract as [`Self::replay_and_wait_profiled_checked`].
     unsafe fn replay_and_wait_profiled(&mut self) -> Result<GpuMultiQueueTiming, String> {
-        // SAFETY: checked variant with string conversion.
+        // SAFETY: checked variant with string conversion; caller upholds PM4 tape liveness.
         unsafe { self.replay_and_wait_profiled_checked() }.map_err(|(error, _)| error.to_string())
     }
 
+    /// # Safety
+    ///
+    /// Every pointer captured in the prepared PM4/IB tape must still refer to
+    /// live Hipfire allocations for this model instance; queues must be idle
+    /// enough for the underlying profiled replay helpers' quiescence contract.
     unsafe fn replay_and_wait_profiled_checked(
         &mut self,
     ) -> Result<GpuMultiQueueTiming, (redline_dispatch::aql::ReplayError, Quiescence)> {
@@ -4233,6 +4241,7 @@ impl PreparedPm4Graph {
             if let Self::Single(graph) = self {
                 // Execute the instrumented graph once. Reuse the same timestamp
                 // vector for whole-tape timing and the one-line legacy report.
+                // SAFETY: Single-queue tape + bindings still live; see method # Safety.
                 let (timing, spans) = unsafe { graph.replay_and_wait_dispatch_profiled_checked() }
                     .map_err(|(error, q)| (error, q))?;
                 static REPORTED: std::sync::atomic::AtomicBool =
@@ -4244,7 +4253,9 @@ impl PreparedPm4Graph {
             }
         }
         match self {
+            // SAFETY: prepared graph/tape still live; same contract as method # Safety.
             Self::Single(graph) => unsafe { graph.replay_and_wait_profiled_checked() },
+            // SAFETY: phased multi-queue tape still live; errors map to Proven quiescence.
             Self::Phased(graph) => unsafe { graph.replay_and_wait_profiled() }
                 .map_err(|error| (error, Quiescence::Proven)),
         }
@@ -7111,6 +7122,8 @@ mod tests {
         let resource_a = issuer.resource("fixture-a", 0x1_0000).expect("valid resource");
         let resource_b = issuer.resource("fixture-b", 0x2_0000).expect("valid resource");
         let mut bindings = ReplayBindings::new();
+        // SAFETY: synthetic non-deref'd addresses used only as binding identity
+        // in unit tests; sizes match the fixture resources; never launched.
         unsafe {
             bindings.bind_resource(
                 resource_a,
@@ -7176,6 +7189,8 @@ mod tests {
         // Simulate a survived relocation of allocation A (same size, new
         // base) at revision 1; B is untouched.
         let moved_a: u64 = base_a + 0x10_0000;
+        // SAFETY: synthetic relocated address for unit-test binding identity only;
+        // never dereferenced or launched.
         unsafe {
             bindings.bind_resource(
                 resource_a,
