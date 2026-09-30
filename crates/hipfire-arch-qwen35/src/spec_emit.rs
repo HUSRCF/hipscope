@@ -474,9 +474,14 @@ impl<'a> SpecEmit for Qwen35Emit<'a> {
                 decoded_eot,
                 open_think: false,
             },
+            // The output ended inside a tool call (unclosed span, or a body the
+            // final flush rejects). Like an open think span, this is its own
+            // reason: the wrapper lets a pure length exit win (AR's rule in
+            // `qwen_ar_finish_route`) and fails closed only when the model
+            // ended the turn there. A mid-stream latch stays `malformed_protocol`.
             Err(_) => FinishSummary {
                 events,
-                finish_reason: "malformed_protocol",
+                finish_reason: "truncated_tool_call",
                 tool_calls: 0,
                 visible_text: std::mem::take(&mut self.visible_acc),
                 decoded_eot,
@@ -814,10 +819,10 @@ mod tests {
     }
 
     #[test]
-    fn malformed_unclosed_span_is_fail_closed() {
+    fn unclosed_span_is_truncated_tool_call_with_no_calls() {
         let (stream, finish, _) = drive_text("pre<tool_call>{\"name\":\"x\"");
         assert!(!tokens_text(&stream).contains("<tool_call>"));
-        assert_eq!(finish.finish_reason, "malformed_protocol");
+        assert_eq!(finish.finish_reason, "truncated_tool_call");
         assert_eq!(finish.tool_calls, 0);
         assert!(held_calls(&finish).is_empty());
     }
@@ -895,7 +900,7 @@ mod tests {
     fn finish_does_not_use_whole_output_extraction_authority() {
         let open = "<tool_call>{\"name\": \"recovered\", \"arguments\": {}}";
         let (_stream, finish, _) = drive_text(open);
-        assert_eq!(finish.finish_reason, "malformed_protocol");
+        assert_eq!(finish.finish_reason, "truncated_tool_call");
         assert_eq!(finish.tool_calls, 0);
         assert!(held_calls(&finish).is_empty());
     }
