@@ -500,6 +500,7 @@ const KV_K_NAMES: &[&str] = &[
     "fwht2",
     "fwht3",
     "fwht4",
+    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — Givens asym KV and the asymN/turboN aliases are superseded by fwht3
     "asym2",
     "asym3",
     "asym4",
@@ -520,6 +521,7 @@ const KV_V_NAMES: &[&str] = &["", "q8", "lloyd2", "lloyd3", "lloyd4"];
 // maple's default plus the Qwen quality-control arm; `fp8` is admitted at
 // the single-GPU Qwen sites under the carrier's exact gfx1201/geometry guards.
 const KV_MODES: &[&str] = &[
+    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — Givens asym KV and the asymN/turboN aliases are superseded by fwht3 (asymN / turbo*)
     "auto", "f32", "f16", "bf16", "q8", "asym4", "asym3", "asym2", "fwht4", "fwht3", "fwht2",
     "turbo", "turbo4", "turbo3", "turbo2", "fp8",
 ];
@@ -663,7 +665,7 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         false,
         Some("HIPFIRE_KV_MODE"),
-        "KV cache format; auto inherits the registry recommendation, then q8 — except single-GPU Qwen on exact gfx1201, where auto means native fp8 (stage-b FA2 arithmetic). DeepSeek V4 currently supports f32 and f16."
+        "KV cache format; auto inherits the registry recommendation, then q8 — except single-GPU Qwen on exact gfx1201, where auto means native fp8 (stage-b FA2 arithmetic). DeepSeek V4 currently supports f32 and f16. asymN and turbo* are deprecated (removal in 0.5.0); use fwhtN or q8."
     ),
     field!(
         "memory.kv_adaptive",
@@ -943,7 +945,7 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         false,
         None,
-        "Qwen-only K-axis override; empty leaves the mode-preset K unchanged."
+        "Qwen-only K-axis override; empty leaves the mode-preset K unchanged. asymN, turboN and legacy-asymN are deprecated (removal in 0.5.0); use fwhtN or q8."
     ),
     field!(
         "memory.kv_v",
@@ -1225,7 +1227,7 @@ pub static FIELDS: &[ConfigField] = &[
         Some("HIPFIRE_DFLASH_NGRAM_BLOCK"),
         "Verify-path n-gram defense."
     ),
-    // lifecycle: deprecated since 0.4.0, removal 0.5.0
+    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — CASK/TriAttention KV eviction is unsupported research; use compact kv_cache modes
     field!(
         "memory.cask.sidecar",
         "cask_sidecar",
@@ -1238,7 +1240,7 @@ pub static FIELDS: &[ConfigField] = &[
         Some("HIPFIRE_CASK_SIDECAR"),
         "Deprecated CASK (removal in 0.5.0): TriAttention sidecar path; empty disables eviction."
     ),
-    // lifecycle: deprecated since 0.4.0, removal 0.5.0
+    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — CASK/TriAttention KV eviction is unsupported research; use compact kv_cache modes
     field!(
         "memory.cask.enabled",
         "cask",
@@ -1251,7 +1253,7 @@ pub static FIELDS: &[ConfigField] = &[
         None,
         "Deprecated CASK (removal in 0.5.0): enable core-aware m-folding."
     ),
-    // lifecycle: deprecated since 0.4.0, removal 0.5.0
+    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — CASK/TriAttention KV eviction is unsupported research; use compact kv_cache modes
     field!(
         "memory.cask.budget",
         "cask_budget",
@@ -1267,7 +1269,7 @@ pub static FIELDS: &[ConfigField] = &[
         None,
         "Deprecated CASK (removal in 0.5.0): active-token target after eviction."
     ),
-    // lifecycle: deprecated since 0.4.0, removal 0.5.0
+    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — CASK/TriAttention KV eviction is unsupported research; use compact kv_cache modes
     field!(
         "memory.cask.beta",
         "cask_beta",
@@ -1280,7 +1282,7 @@ pub static FIELDS: &[ConfigField] = &[
         None,
         "Deprecated CASK (removal in 0.5.0): eviction hysteresis."
     ),
-    // lifecycle: deprecated since 0.4.0, removal 0.5.0
+    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — CASK/TriAttention KV eviction is unsupported research; use compact kv_cache modes
     field!(
         "memory.cask.handoff_tokens",
         "cask_handoff_tokens",
@@ -1293,7 +1295,7 @@ pub static FIELDS: &[ConfigField] = &[
         None,
         "Deprecated CASK (removal in 0.5.0): one-way kv_adaptive to plain TriAttention handoff position; zero disables it."
     ),
-    // lifecycle: deprecated since 0.4.0, removal 0.5.0
+    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — CASK/TriAttention KV eviction is unsupported research; use compact kv_cache modes
     field!(
         "memory.cask.core_fraction",
         "cask_core_frac",
@@ -1310,7 +1312,7 @@ pub static FIELDS: &[ConfigField] = &[
         None,
         "Deprecated CASK (removal in 0.5.0): fraction of the budget retained as core."
     ),
-    // lifecycle: deprecated since 0.4.0, removal 0.5.0
+    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — CASK/TriAttention KV eviction is unsupported research; use compact kv_cache modes
     field!(
         "memory.cask.fold",
         "cask_fold_m",
@@ -1323,7 +1325,7 @@ pub static FIELDS: &[ConfigField] = &[
         None,
         "Deprecated CASK (removal in 0.5.0): merge factor."
     ),
-    // lifecycle: deprecated since 0.4.0, removal 0.5.0
+    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — CASK/TriAttention KV eviction is unsupported research; use compact kv_cache modes
     field!(
         "memory.cask.auto_attach",
         "cask_auto_attach",
@@ -1410,6 +1412,7 @@ pub static FIELDS: &[ConfigField] = &[
         "HIPFIRE_PROMPT_CACHE_UNBOUNDED",
         "Remove the assistant-turn cache capacity bound."
     ),
+    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — PFlash is unsupported research; prefix caching supersedes it
     field!(
         "speculation.prefill.mode",
         "prefill_compression",
@@ -1420,8 +1423,9 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         true,
         None,
-        "PFlash speculative-prefill policy."
+        "Deprecated PFlash (removal in 0.5.0): speculative-prefill policy."
     ),
+    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — PFlash is unsupported research; prefix caching supersedes it
     field!(
         "speculation.prefill.threshold",
         "prefill_threshold",
@@ -1435,8 +1439,9 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         true,
         None,
-        "PFlash auto-mode token threshold."
+        "Deprecated PFlash (removal in 0.5.0): auto-mode token threshold."
     ),
+    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — PFlash is unsupported research; prefix caching supersedes it
     field!(
         "speculation.prefill.keep_ratio",
         "prefill_keep_ratio",
@@ -1451,8 +1456,9 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         true,
         None,
-        "PFlash retained-token ratio."
+        "Deprecated PFlash (removal in 0.5.0): retained-token ratio."
     ),
+    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — PFlash is unsupported research; prefix caching supersedes it
     field!(
         "speculation.prefill.alpha",
         "prefill_alpha",
@@ -1467,8 +1473,9 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         true,
         None,
-        "PFlash block-selection strictness."
+        "Deprecated PFlash (removal in 0.5.0): block-selection strictness."
     ),
+    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — PFlash is unsupported research; prefix caching supersedes it
     field!(
         "speculation.prefill.min_keep",
         "prefill_min_keep",
@@ -1482,8 +1489,9 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         true,
         None,
-        "PFlash retained-token floor."
+        "Deprecated PFlash (removal in 0.5.0): retained-token floor."
     ),
+    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — PFlash is unsupported research; prefix caching supersedes it
     field!(
         "speculation.prefill.sink",
         "prefill_sink",
@@ -1494,8 +1502,9 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         true,
         None,
-        "Always-retained prompt prefix."
+        "Deprecated PFlash (removal in 0.5.0): always-retained prompt prefix."
     ),
+    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — PFlash is unsupported research; prefix caching supersedes it
     field!(
         "speculation.prefill.recent",
         "prefill_recent",
@@ -1506,8 +1515,9 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         true,
         None,
-        "Always-retained prompt tail."
+        "Deprecated PFlash (removal in 0.5.0): always-retained prompt tail."
     ),
+    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — PFlash is unsupported research; prefix caching supersedes it
     field!(
         "speculation.prefill.block",
         "prefill_block",
@@ -1518,8 +1528,9 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         true,
         None,
-        "PFlash scoring block size."
+        "Deprecated PFlash (removal in 0.5.0): scoring block size."
     ),
+    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — PFlash is unsupported research; prefix caching supersedes it
     field!(
         "speculation.prefill.drafter",
         "prefill_drafter",
@@ -1530,8 +1541,9 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         true,
         None,
-        "PFlash drafter path."
+        "Deprecated PFlash (removal in 0.5.0): drafter path."
     ),
+    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — PFlash is unsupported research; prefix caching supersedes it
     field!(
         "speculation.prefill.drafter_device",
         "prefill_drafter_device",
@@ -1542,8 +1554,9 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         true,
         None,
-        "PFlash drafter device; -1 uses the target device."
+        "Deprecated PFlash (removal in 0.5.0): drafter device; -1 uses the target device."
     ),
+    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — PFlash is unsupported research; prefix caching supersedes it
     field!(
         "speculation.prefill.profile",
         "prefill_profile",
@@ -1554,8 +1567,9 @@ pub static FIELDS: &[ConfigField] = &[
         false,
         true,
         None,
-        "Emit PFlash stage timings."
+        "Deprecated PFlash (removal in 0.5.0): emit PFlash stage timings."
     ),
+    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — PFlash is unsupported research; prefix caching supersedes it
     field!(
         "speculation.prefill.sparse_threshold",
         "prefill_sparse_threshold",
@@ -1569,8 +1583,9 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         true,
         None,
-        "Sparse-attention threshold."
+        "Deprecated PFlash (removal in 0.5.0): sparse-attention threshold."
     ),
+    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — PFlash is unsupported research; prefix caching supersedes it
     field!(
         "speculation.prefill.drafter_kv",
         "prefill_drafter_kv",
@@ -1581,15 +1596,16 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         true,
         Some("HIPFIRE_PFLASH_DRAFTER_KV"),
-        "KV quantization used by the PFlash drafter scorer."
+        "Deprecated PFlash (removal in 0.5.0): KV quantization used by the PFlash drafter scorer."
     ),
+    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — PFlash is unsupported research; prefix caching supersedes it
     diagnostic_field!(
         "diagnostic.pflash.score_layer",
         "pflash_score_layer",
         DefaultValue::Null,
         ValueRule::NullableInteger { min: 0, max: 65535 },
         "HIPFIRE_PFLASH_SCORE_LAYER",
-        "Override the PFlash scoring layer; null uses model policy."
+        "Deprecated PFlash (removal in 0.5.0): override the PFlash scoring layer; null uses model policy."
     ),
     field!(
         "speculation.mtp",

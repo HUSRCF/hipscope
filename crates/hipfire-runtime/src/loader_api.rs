@@ -180,7 +180,7 @@ pub struct SpecLoadCfg {
     pub dflash: Option<bool>,
 }
 
-// lifecycle: deprecated since 0.4.0, removal 0.5.0
+// lifecycle: deprecated since 0.4.0, removal 0.5.0 — CASK/TriAttention KV eviction is unsupported research; use compact kv_cache modes
 /// CASK/TriAttention params forwarded by the CLI at load time.
 #[derive(Default)]
 pub struct CaskConfig {

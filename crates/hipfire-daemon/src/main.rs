@@ -1752,6 +1752,21 @@ fn main() {
                     .and_then(|v| v.as_str())
                     .filter(|s| !s.is_empty())
                     .map(|s| s.to_string());
+                // lifecycle: deprecated since 0.4.0, removal 0.5.0 — Givens asym KV and the asymN/turboN aliases are superseded by fwht3
+                // One warning line when the load names a deprecated KV format
+                // (kv_mode falls back to HIPFIRE_KV_MODE exactly as the carriers do).
+                if let Some(warning) = [
+                    Some(kv_mode_override.as_deref().unwrap_or(
+                        hipfire_runtime::config::get().kv_mode.as_str(),
+                    )),
+                    kv_k_override.as_deref(),
+                ]
+                .into_iter()
+                .flatten()
+                .find_map(hipfire_runtime::kv_mode::deprecated_kv_name_warning)
+                {
+                    eprintln!("[hipfire-daemon] {warning}");
+                }
 
                 // Per-load adaptive-KV selector (mirrors kv_mode). Overrides the
                 // HIPFIRE_KV_ADAPTIVE env. off|conservative|balanced|aggressive|
@@ -1856,7 +1871,7 @@ fn main() {
                     .and_then(|v| v.as_bool())
                     .unwrap_or(true);
 
-                // lifecycle: deprecated since 0.4.0, removal 0.5.0
+                // lifecycle: deprecated since 0.4.0, removal 0.5.0 — CASK/TriAttention KV eviction is unsupported research; use compact kv_cache modes
                 // 0.1.7: TriAttention / CASK eviction protocol fields. When
                 // `cask_sidecar` is set, `load_model` sizes the KV cache to a
                 // *physical_cap* (budget+beta+safety, clamped to max_seq) instead
@@ -1952,6 +1967,7 @@ fn main() {
                     gpu.mmq_screen.threshold = v as f32;
                 }
 
+                // lifecycle: deprecated since 0.4.0, removal 0.5.0 — PFlash is unsupported research; prefix caching supersedes it
                 // ── PFlash load-time params (Phase 4.0 #93) ──────────────
                 //
                 // Parse compression knobs per PRD §5.3.2. None of these
@@ -2039,6 +2055,13 @@ fn main() {
                     } else {
                         None
                     };
+                // PFlash is deprecated (removal in 0.5.0): it still loads, but
+                // every opt-in (prefill_compression != off) gets one warning line.
+                if pflash_mode_str != "off" {
+                    eprintln!(
+                        "[hipfire-daemon] warning: PFlash is deprecated and will be removed in 0.5.0; not supported, prefix caching supersedes it (prefill_compression={pflash_mode_str} set at load)"
+                    );
+                }
 
                 // Pipeline-parallel degree (Stage 7 of #58). Default 1 =
                 // single-GPU (no behavior change). pp > 1 routes through

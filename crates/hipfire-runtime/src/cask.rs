@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-// lifecycle: deprecated since 0.4.0, removal 0.5.0
+// lifecycle: deprecated since 0.4.0, removal 0.5.0 — CASK/TriAttention KV eviction is unsupported research; use compact kv_cache modes
 
 //! CASK: core-aware selective KV compression (arXiv:2604.10900).
 //!

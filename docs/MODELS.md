@@ -344,7 +344,9 @@ See [`QUANTIZE.md`](QUANTIZE.md) and [`QUANTIZATION.md`](QUANTIZATION.md).
 
 Requires `config.json` + `.safetensors`. Architectures the **engine** loads are those with arch crates / loaders above; the quantizer may accept more shapes than inference can run.
 
-### GGUF
+### GGUF (deprecated, removal in 0.5.0)
+
+GGUF weight input is deprecated since 0.4.0: GGUF→mqN is lossy double quantization; use llama.cpp for GGUF.
 
 ```bash
 hipfire quantize ./model.Q4_K_M.gguf --install --register my:tag

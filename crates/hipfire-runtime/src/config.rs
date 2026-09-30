@@ -10,6 +10,7 @@
 
 use std::sync::OnceLock;
 
+// lifecycle: deprecated since 0.4.0, removal 0.5.0 — MQ4R route selection by file extension; 0.5.0 selects by HFQ metadata (no runtime warning: only way to reach the route today)
 /// Automatic Redline runtime default for single-GPU MQ4R models.
 pub fn mq4r_redline_default(gpu_arch: &str, model_path: &str, pp: usize, tp: usize) -> bool {
     matches!(gpu_arch, "gfx1100" | "gfx1151" | "gfx1201")
@@ -56,6 +57,7 @@ pub fn retained_redline_default(
     {
         return true;
     }
+    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — DS4 MQ2R selection by file extension; 0.5.0 selects by HFQ metadata (no runtime warning: only way to reach the route today)
     gpu_arch.eq_ignore_ascii_case("gfx1151")
         && model_arch.eq_ignore_ascii_case("deepseek4")
         && pp == 1

@@ -1179,6 +1179,7 @@ pub(crate) fn format_bind(host: &str, port: u16) -> String {
     }
 }
 
+// lifecycle: deprecated since 0.4.0, removal 0.5.0 — MQ4R route selection by file extension; 0.5.0 selects by HFQ metadata (no runtime warning: only way to reach the route today)
 pub(crate) fn should_prewarm_qwen_mq4r_decode(
     path: &Path,
     loaded: &serde_json::Value,

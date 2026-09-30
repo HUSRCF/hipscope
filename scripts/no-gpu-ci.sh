@@ -28,3 +28,6 @@ python3 scripts/test_uninstall.py
 
 echo "== Env/docs drift check =="
 python3 scripts/check-env-docs.py
+
+echo "== Lifecycle check (deprecated surfaces opt-in; env/config lifecycle status) =="
+python3 scripts/check-lifecycle.py

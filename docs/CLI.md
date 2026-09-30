@@ -45,7 +45,7 @@ Flags may appear before or after the model. CLI help and the native typed schema
 | `-n, --max-tokens <int>` | Generation cap (config default `4096`). |
 | `--kv-mode <m>` | Whole-cache KV preset for this load: `auto`, `q8`, `fwht4`/`3`/`2`, `asym4`/`3`/`2`, `turbo`… (see [KV load flags](#kv-load-flags-run--serve--bench)). |
 | `--kv-backend <legacy\|vmm>` | KV allocation backend. Omitted = automatic (prefer VMM). `contiguous` is **rejected** (renamed to `legacy`). |
-| `--kv-k <name>` | Qwen-family K-axis override (`q8`, `fwhtN`, `asymN`/`turboN` → `fwhtN`, `legacy-asymN`). |
+| `--kv-k <name>` | Qwen-family K-axis override (`q8`, `fwhtN`; deprecated, removal in 0.5.0: `asymN`/`turboN` → `fwhtN`, `legacy-asymN`). |
 | `--kv-v <name>` | Qwen-family V-axis override (`q8`, `lloyd2`/`3`/`4`). |
 | `--max-seq <n>` | Context length for this load. Eligible growing Qwen VMM KV defaults to min(model trained context, measured card capacity); legacy and other owners retain their bounds. Explicit value wins. |
 | `--spec <m>` / `--speculation <m>` | Spec mechanism: `off` \| `auto` \| `ngram` \| `dflash` \| `mtp` \| `dspark` (config default `auto`). |
@@ -78,7 +78,7 @@ Shared by `hipfire run`, `hipfire serve`, and `hipfire bench` (including `--matr
 |---|---|---|
 | `--kv-backend` | `legacy` \| `vmm`; **default automatic prefer VMM** | Accepts only those two spellings. Old `contiguous` is rejected with a migration error that names `legacy` (e.g. use `--kv-backend legacy` or `memory.kv_backend = "legacy"`). Selecting legacy (explicit or automatic fallback) prints one stderr warning containing the stable token `HIPFIRE_KV_BACKEND=legacy`. Explicit `vmm` on an unsupported combination fails closed before teardown. |
 | `--kv-mode` | `auto` (default when unset), `q8`, `fwht2`/`3`/`4`, `asym2`/`3`/`4`, `turbo`/`turbo2`/`3`/`4`, `fp8`, `bf16`, … | Whole-cache preset. Native `fp8`/`bf16` encode K and V together, without a separate V mode. |
-| `--kv-k` / `--kv-v` | Qwen-only axis overrides; omitted when unset | Orthogonal to mode. On supported Qwen sites `asymN` and `turboN` (bare `turbo` = `turbo3`) mean **`fwhtN`**; `legacy-asymN` selects the old Givens asym K. V names: `q8`, `lloyd2`/`3`/`4`. Non-Qwen carriers refuse these axes before teardown. |
+| `--kv-k` / `--kv-v` | Qwen-only axis overrides; omitted when unset | Orthogonal to mode. On supported Qwen sites `asymN` and `turboN` (bare `turbo` = `turbo3`) mean **`fwhtN`**; `legacy-asymN` selects the old Givens asym K. `asymN`, `turboN` and `legacy-asymN` are deprecated since 0.4.0 (removal in 0.5.0) and warn at load. V names: `q8`, `lloyd2`/`3`/`4`. Non-Qwen carriers refuse these axes before teardown. |
 | `--max-seq` | int when set; else automatic | On eligible growing Qwen VMM KV, default = **min(model trained context, measured card capacity)** after weights load; legacy and other owners retain their existing bounds. Explicit CLI/config override wins. |
 
 **Qwen `auto` / unset mode:** `q8`/`q8` on every arch **except** exact `gfx1201`, where eligible single-GPU Qwen routes default to native `fp8` (both K and V). Native modes report `kv_mode=fp8` or `bf16` in loaded/diag/bench JSON; no synthetic `V=q8` axis is reported. Non-Qwen family defaults are unchanged (e.g. Maple BF16, DeepSeek compressor F32, Gemma layered policy).
@@ -138,7 +138,7 @@ Do not inventory every key here — [CONFIG.md](CONFIG.md) owns defaults and ran
 
 | Command | Purpose |
 |---|---|
-| `hipfire quantize <hf-id\|dir\|file.gguf> [flags]` | CPU quantize via `hipfire-quantize`. |
+| `hipfire quantize <hf-id\|dir\|file.gguf> [flags]` | CPU quantize via `hipfire-quantize`. GGUF weight input is deprecated (removal in 0.5.0): GGUF→mqN is lossy double quantization; use llama.cpp for GGUF. |
 | `hipfire-quantize --flux-pipe <pipe_dir> -o <base.hfq>` | Pack a FLUX.1 or FLUX.2 Klein diffusers pipe into per-component HFQ files (`<base>-transformer.hfq` plus `-t5.hfq`, `-clip.hfq`, `-vae.hfq` for FLUX.1, or `-qwen3.hfq`, `-vae.hfq` for Klein; arch ids 40–46). `--flux-component` packs one. The packs are the only form the daemon loads. |
 | `hipfire sidecar-gen <model> [flags]` | **Deprecated (CASK), removal in 0.5.0.** Build a `.triattn.bin` next to the model (does not pull); prints a deprecation warning. |
 
