@@ -372,6 +372,8 @@ def env_scan() -> dict[str, list[str]]:
     extra_re = re.compile(r"\b(?:" + "|".join(map(re.escape, extra)) + r")\b") if extra else None
     seen: dict[str, list[str]] = {}
     for path in sorted(git_files("*.rs", "*.py", "*.sh")):
+        if path == "scripts/check-lifecycle.py":  # names deprecated vars itself
+            continue
         text = (ROOT / path).read_text(encoding="utf-8", errors="ignore")
         names = set(TOKEN.findall(text))
         if extra_re:
