@@ -52,6 +52,43 @@ pub(crate) struct ServeMeta {
     /// Daemon health published to `/health`. Lives here, not on
     /// `ServeRuntime`, because a respawn and reload hold the runtime lock.
     pub(crate) engine_state: EngineState,
+    /// Effective context of the resident model — the `max_seq` it was actually
+    /// loaded with (KV capacity), not the registry policy and not the trained
+    /// window. `0` while nothing is resident.
+    ///
+    /// Mirrored here, next to `current_model` and set at the same two sites
+    /// (`ensure_model` / `clear_resident`), because `/health` must be able to
+    /// answer while a model load holds `ServeShared::runtime`: that mutex is
+    /// held for the whole load (prewarm and request-time loads alike), so
+    /// reading load facts through it would block `/health` for the duration —
+    /// the endpoint every readiness probe, the TUI and `serve_harness` poll
+    /// with a sub-second timeout (`docs/SERVE.md` § "Detached readiness").
+    pub(crate) n_ctx: u64,
+    /// Facts about the resident model from the daemon's load ack. Same reason
+    /// as `n_ctx` for living here rather than on `ServeRuntime`: it is
+    /// published state, not working state, and `/v1/models` may not need the
+    /// runtime lock to serve an entry.
+    pub(crate) loaded: LoadedInfo,
+}
+
+impl ServeMeta {
+    /// Fresh serve state: no model, no load-ack facts, daemon up.
+    pub(crate) fn new(instance_token: String) -> Self {
+        Self {
+            current_model: None,
+            loading_model: None,
+            instance_token,
+            requests_served: 0,
+            retries_attempted: 0,
+            retries_succeeded: 0,
+            recent_tok_s: None,
+            started: Instant::now(),
+            last_activity: Instant::now(),
+            engine_state: EngineState::Up,
+            n_ctx: 0,
+            loaded: LoadedInfo::default(),
+        }
+    }
 }
 
 /// Whether the daemon behind serve can take requests.
@@ -143,6 +180,25 @@ pub(crate) struct ServePidRecord {
     pub(crate) token: Option<String>,
     #[serde(skip)]
     pub(crate) legacy: bool,
+}
+
+/// Facts about the resident model taken from the daemon's load ack.
+///
+/// The ack has always carried these (`{"type":"loaded","arch":…,"dim":…,
+/// "layers":…,"vocab":…,"vl":…}`); serve read `arch`/`cache_capable`/
+/// `continuous_batch_capable` and dropped the rest. `vl` is the daemon's
+/// `LoadedModel::has_vision_encoder()` — a vision tower is present in this
+/// load (qwen3.5-VL tower, dots.ocr, or the lfm2-vl tower), the same
+/// carrier-level probe the generate path's image gate uses. A tower
+/// configured but skipped by `vision_mode=off` reports `false`; so does a
+/// text-only checkpoint of a VL-capable arch.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct LoadedInfo {
+    pub(crate) vision: bool,
+    /// Hidden size (`dim`) — llama.cpp's `meta.n_embd`.
+    pub(crate) n_embd: u64,
+    /// Vocabulary size (`vocab`) — llama.cpp's `meta.n_vocab`.
+    pub(crate) n_vocab: u64,
 }
 
 pub(crate) struct ServeRuntime {
@@ -1012,18 +1068,7 @@ pub(crate) fn serve_foreground(
             resident_model: None,
             request_policy,
         }),
-        meta: Mutex::new(ServeMeta {
-            current_model: None,
-            loading_model: None,
-            instance_token: instance_token.clone(),
-            requests_served: 0,
-            retries_attempted: 0,
-            retries_succeeded: 0,
-            recent_tok_s: None,
-            started: Instant::now(),
-            last_activity: Instant::now(),
-            engine_state: EngineState::Up,
-        }),
+        meta: Mutex::new(ServeMeta::new(instance_token.clone())),
         max_request_bytes,
         admission: Arc::new(Admission::new_with_capacity(
             max_queue,
@@ -1380,6 +1425,20 @@ impl ServeRuntime {
                 .get("max_seq")
                 .and_then(serde_json::Value::as_u64)
                 .unwrap_or(requested_max_seq);
+            let published = LoadedInfo {
+                vision: loaded
+                    .get("vl")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+                n_embd: loaded
+                    .get("dim")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+                n_vocab: loaded
+                    .get("vocab")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+            };
             // Report the model the way it was requested. A path-form
             // request now resolves its registry entry (for sidecars and
             // tag policy), but clients — serve_harness's warm probe among
@@ -1391,9 +1450,14 @@ impl ServeRuntime {
                 tag.unwrap_or_else(|| model.to_owned())
             };
             self.resident_model = Some(model.to_owned());
-            meta.lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .current_model = Some(served_name);
+            // The served facts land in `ServeMeta`, not `ServeRuntime`: this
+            // method runs with the runtime lock held for the whole load, and
+            // `/health` (100 ms readiness probes, the TUI's 450 ms poll,
+            // `serve_harness`'s 1 s poll) must keep answering while it does.
+            let mut meta = meta.lock().unwrap_or_else(|error| error.into_inner());
+            meta.current_model = Some(served_name);
+            meta.n_ctx = self.current_max_seq;
+            meta.loaded = published;
         }
         Ok(resolved)
     }
@@ -1413,7 +1477,7 @@ impl ServeRuntime {
         let same = |candidate: &Path| fs::canonicalize(candidate).is_ok_and(|c| c == target);
         fs::canonicalize(&self.paths.models).is_ok_and(|models| target.starts_with(models))
             || entry.is_some_and(|entry| same(&self.paths.models.join(&entry.file)))
-            || crate::local_model_paths(&self.paths)
+            || crate::local_model_paths(&self.paths, &self.registry)
                 .unwrap_or_default()
                 .iter()
                 .any(|candidate| same(candidate))
@@ -1448,9 +1512,10 @@ impl ServeRuntime {
         self.current_max_seq = 0;
         self.cache_capable = false;
         self.resident_model = None;
-        meta.lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .current_model = None;
+        let mut meta = meta.lock().unwrap_or_else(|error| error.into_inner());
+        meta.current_model = None;
+        meta.n_ctx = 0;
+        meta.loaded = LoadedInfo::default();
     }
 
     /// Replace a daemon that exited: reap it (freeing its GPU memory), then
@@ -1784,14 +1849,8 @@ mod tests {
         ServeMeta {
             current_model: Some("model.hfq".to_owned()),
             loading_model: Some("model.hfq".to_owned()),
-            instance_token: "test".to_owned(),
-            requests_served: 0,
-            retries_attempted: 0,
-            retries_succeeded: 0,
-            recent_tok_s: None,
-            started: Instant::now(),
             last_activity: Instant::now() - Duration::from_secs(600),
-            engine_state: EngineState::Up,
+            ..ServeMeta::new("test".to_owned())
         }
     }
 

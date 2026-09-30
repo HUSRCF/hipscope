@@ -3099,14 +3099,8 @@ mod tests {
         ServeMeta {
             current_model: Some("model.hfq".to_owned()),
             loading_model: Some("model.hfq".to_owned()),
-            instance_token: "test".to_owned(),
-            requests_served: 0,
-            retries_attempted: 0,
-            retries_succeeded: 0,
-            recent_tok_s: None,
-            started: Instant::now(),
             last_activity: Instant::now() - Duration::from_secs(600),
-            engine_state: crate::serve::EngineState::Up,
+            ..ServeMeta::new("test".to_owned())
         }
     }
 
