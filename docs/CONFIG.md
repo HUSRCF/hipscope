@@ -61,9 +61,10 @@ Process and diagnostic keys are global-only. `hipfire config <model> set ...`
 rejects them because the daemon snapshots these values once; claiming a
 per-model override inside a long-lived serve process would be misleading.
 
-This page is the normative **key/default/enum** table. CASK/TriAttention and
-PFlash are experimental opt-ins; multi-GPU topology lives in its linked owner
-rather than a duplicated matrix here.
+This page is the normative **key/default/enum** table. CASK/TriAttention is
+deprecated (removal in 0.5.0) and PFlash is retained legacy research (see their
+sections); multi-GPU topology
+lives in its linked owner rather than a duplicated matrix here.
 
 ---
 
@@ -404,7 +405,7 @@ capacity; the preflight weight projection never caps the effective context.
 Only full-attention layers carry KV (16 of 64 for Qwen3.8-27B), so card capacity
 divides that remaining memory by the selected K+V token stride. VMM reserves
 virtual space to `max_seq` and maps physical pages on demand; without eviction,
-`physical_cap == max_seq`, while CASK can make `physical_cap < max_seq`.
+`physical_cap == max_seq`, while deprecated CASK eviction can make `physical_cap < max_seq`.
 Larger prefill PBS allocations are lazy: each request chooses the widest rung
 that fits currently free VRAM after mapped (not virtually reserved) KV. When
 future KV growth needs the memory, widened PBS reuse is released between
@@ -424,7 +425,7 @@ and never silently falls back (refusal may suggest `--kv-backend legacy`).
 
 Unsupported automatic cases (for example MoE EP/PP, non-Qwen carriers without a
 matching owner, uncertified device/OS, or missing HIP VMM symbols) keep
-legacy service with a logged reason. Adaptive→CASK handoff **requires**
+legacy service with a logged reason. The deprecated adaptive→CASK handoff **requires**
 VMM: if VMM is unavailable that combination is refused rather than handed off as
 invalid legacy. Private speculative draft caches (DFlash/MTP) are owned
 separately from the trunk KV backend and do not relabel it; their actual backend
@@ -522,7 +523,16 @@ compatibility overrides.
 
 ---
 
-## CASK / TriAttention eviction
+## CASK / TriAttention eviction (deprecated, removal in 0.5.0)
+
+CASK / TriAttention KV eviction (including FlashCASK under DFlash) is
+deprecated since 0.4.0 and will be removed in 0.5.0. The keys below still
+load, but the path is **not supported**, not a recommended setting, and not an
+acceptance route. Every load that sets `cask_sidecar` or `cask=true` prints one
+warning line:
+`[hipfire-daemon] warning: CASK is deprecated and will be removed in 0.5.0; not supported`.
+All defaults leave it off, and a downloaded `.triattn*.bin` sidecar never
+attaches unless `cask_sidecar` or `cask_auto_attach=true` is set.
 
 | Key | Default | Range |
 |---|---|---|
@@ -530,17 +540,12 @@ compatibility overrides.
 | `cask` | `false` | bool (m-fold vs plain drop) |
 | `cask_budget` | `512` | int 64–65536 |
 | `cask_beta` | `128` | int 0–65536 |
+| `cask_handoff_tokens` | `0` | int 0–1048576 |
 | `cask_core_frac` | `0.5` | number 0.0–1.0 |
 | `cask_fold_m` | `2` | int 1–16 |
 | `cask_auto_attach` | `false` | bool |
 
-Developer escapes use `[developer] cask_off = true` and
-`force_a3b_eviction = true`; the old names remain one-shot aliases.
-
-TriAttention and CASK are experimental, opt-in features. A downloaded sidecar
-does not attach by default. To experiment, set `cask_sidecar` explicitly or set
-`cask_auto_attach=true`; set `cask=true` only when core-aware m-folding is also
-intended. Sidecar generation: `hipfire sidecar-gen` — [`CLI.md`](CLI.md).
+Sidecar generation (deprecated with CASK): `hipfire sidecar-gen` — [`CLI.md`](CLI.md).
 
 ---
 

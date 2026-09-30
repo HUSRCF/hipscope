@@ -408,6 +408,7 @@ const GEMMA4_TEMPLATE: &str = include_str!("../../hipfire-runtime/templates/gemm
 
 // ─── Eviction policy wrapper ──────────────────────────────────────────
 
+// lifecycle: deprecated since 0.4.0, removal 0.5.0
 /// Eviction policy wrapper — dispatches to plain TriAttention or CASK m-folding.
 pub enum Eviction {
     Plain(EvictionCtx),
@@ -1850,7 +1851,7 @@ fn build_qwen35_eviction(
             _ => format!("read error ({e}): {sidecar_path}"),
         };
         format!(
-            "cask sidecar load failed — {why} (regen: hipfire sidecar-gen, or HIPFIRE_CASK_OFF=1)"
+            "cask sidecar load failed — {why} (CASK is deprecated and will be removed in 0.5.0; not supported; regen: hipfire sidecar-gen, or clear memory.cask.sidecar)"
         )
     })?;
     let fa_layer_ids: Vec<usize> = config

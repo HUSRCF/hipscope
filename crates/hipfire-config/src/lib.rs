@@ -1343,6 +1343,7 @@ pub static FIELDS: &[ConfigField] = &[
         Some("HIPFIRE_DFLASH_NGRAM_BLOCK"),
         "Verify-path n-gram defense."
     ),
+    // lifecycle: deprecated since 0.4.0, removal 0.5.0
     field!(
         "memory.cask.sidecar",
         "cask_sidecar",
@@ -1351,10 +1352,11 @@ pub static FIELDS: &[ConfigField] = &[
         DefaultValue::String(""),
         ValueRule::String,
         true,
-        false,
+        true,
         Some("HIPFIRE_CASK_SIDECAR"),
-        "TriAttention sidecar path; empty disables eviction."
+        "Deprecated CASK (removal in 0.5.0): TriAttention sidecar path; empty disables eviction."
     ),
+    // lifecycle: deprecated since 0.4.0, removal 0.5.0
     field!(
         "memory.cask.enabled",
         "cask",
@@ -1363,10 +1365,11 @@ pub static FIELDS: &[ConfigField] = &[
         DefaultValue::Bool(false),
         ValueRule::Bool,
         true,
-        false,
+        true,
         None,
-        "Enable core-aware CASK folding."
+        "Deprecated CASK (removal in 0.5.0): enable core-aware m-folding."
     ),
+    // lifecycle: deprecated since 0.4.0, removal 0.5.0
     field!(
         "memory.cask.budget",
         "cask_budget",
@@ -1378,10 +1381,11 @@ pub static FIELDS: &[ConfigField] = &[
             max: 65536
         },
         true,
-        false,
+        true,
         None,
-        "Active-token target after eviction."
+        "Deprecated CASK (removal in 0.5.0): active-token target after eviction."
     ),
+    // lifecycle: deprecated since 0.4.0, removal 0.5.0
     field!(
         "memory.cask.beta",
         "cask_beta",
@@ -1390,10 +1394,11 @@ pub static FIELDS: &[ConfigField] = &[
         DefaultValue::Integer(128),
         ValueRule::Integer { min: 0, max: 65536 },
         true,
-        false,
+        true,
         None,
-        "Eviction hysteresis."
+        "Deprecated CASK (removal in 0.5.0): eviction hysteresis."
     ),
+    // lifecycle: deprecated since 0.4.0, removal 0.5.0
     field!(
         "memory.cask.handoff_tokens",
         "cask_handoff_tokens",
@@ -1402,10 +1407,11 @@ pub static FIELDS: &[ConfigField] = &[
         DefaultValue::Integer(0),
         ValueRule::Integer { min: 0, max: 1048576 },
         true,
-        false,
+        true,
         None,
-        "One-way kv_adaptive to plain TriAttention handoff position; zero disables it."
+        "Deprecated CASK (removal in 0.5.0): one-way kv_adaptive to plain TriAttention handoff position; zero disables it."
     ),
+    // lifecycle: deprecated since 0.4.0, removal 0.5.0
     field!(
         "memory.cask.core_fraction",
         "cask_core_frac",
@@ -1418,10 +1424,11 @@ pub static FIELDS: &[ConfigField] = &[
             min_inclusive: true
         },
         true,
-        false,
+        true,
         None,
-        "Fraction of the CASK budget retained as core."
+        "Deprecated CASK (removal in 0.5.0): fraction of the budget retained as core."
     ),
+    // lifecycle: deprecated since 0.4.0, removal 0.5.0
     field!(
         "memory.cask.fold",
         "cask_fold_m",
@@ -1430,10 +1437,11 @@ pub static FIELDS: &[ConfigField] = &[
         DefaultValue::Integer(2),
         ValueRule::Integer { min: 1, max: 16 },
         true,
-        false,
+        true,
         None,
-        "CASK merge factor."
+        "Deprecated CASK (removal in 0.5.0): merge factor."
     ),
+    // lifecycle: deprecated since 0.4.0, removal 0.5.0
     field!(
         "memory.cask.auto_attach",
         "cask_auto_attach",
@@ -1442,9 +1450,9 @@ pub static FIELDS: &[ConfigField] = &[
         DefaultValue::Bool(false),
         ValueRule::Bool,
         true,
-        false,
+        true,
         None,
-        "Discover a matching TriAttention sidecar when explicitly enabled."
+        "Deprecated CASK (removal in 0.5.0): discover a matching TriAttention sidecar when explicitly enabled."
     ),
     field!(
         "prompt.normalize",
