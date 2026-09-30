@@ -144,7 +144,7 @@ Read only by the Qwen4 carrier and its kernels; no other model reads them.
 | Variable | Default / sense | Notes |
 |---|---|---|
 | `HIPFIRE_QWEN4_F16_WMMA` | on unless `0` | Prefill F16 WMMA arms (grouped MoE gate/up and down, BF16 dense projections through an F16 shadow, HC read, full-window QSA, chunked GDN) from 512 rows. Not bit-exact; admitted by KLD against the BF16 source. `0` keeps the bit-exact F32 arms. |
-| `HIPFIRE_QWEN4_F16_WMMA_GFX1201` | on unless `0` | gfx1201 only: runs the `HIPFIRE_QWEN4_F16_WMMA` BF16-projection and HC-read arms on gfx12 WMMA kernels (`gemm_f16_x_f16_wmma_lds.gfx1201.hip`, `hyper_read_up_wmma.gfx1201.hip`). `0` keeps gfx1201 on the multirow/SIMT arms it ran before; every other arch ignores it. |
+| `HIPFIRE_QWEN4_F16_WMMA_GFX1201` | on unless `0` | gfx1201 only: runs the `HIPFIRE_QWEN4_F16_WMMA` BF16-projection and HC-read arms on gfx12 WMMA kernels (`gemm_f16_x_f16_wmma_lds_splitk.hip`, `hyper_read_up_wmma.gfx1201.hip`). `0` keeps gfx1201 on the multirow/SIMT arms it ran before; every other arch ignores it. |
 | `HIPFIRE_MTP_INCREMENTAL` | **unset**: per-window choice | Native MTP verify route. Unset picks, per window, a batched `(K+1)`-row verify at the depth that maximizes expected tokens per cost, or the interleaved route (one target row per draft, stop at the first rejection). `0` forces batched at the full `mtp_k`; `1` forces interleaved. Both emit AR's greedy tokens. |
 | `HIPFIRE_MTP_DRAFT_HEAD` | `mq2r` | Draft ranking head: an `mq2`..`mq6` copy of the LM head (`r` suffix = re-score its top 8 exactly against the head's own Q8_0 or MQ6G256V2 rows). |
 | `HIPFIRE_MTP_PAIRING` | head state | Draft-step conditioning experiment: `aligned-head` or `aligned`. |

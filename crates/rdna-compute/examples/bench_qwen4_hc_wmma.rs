@@ -18,7 +18,11 @@
 //! `MODE=stress ITERS=n`: every iteration reruns the route and the WMMA read
 //! on ragged shapes and counts outputs that differ bitwise from iteration 0
 //! or leave the multirow reference's tolerance; run several processes at
-//! once on one card.  Exits 1 on any mismatch.
+//! once on one card.  With `CAPTURE=1` each case is also issued once under
+//! hipGraph capture — the route must refuse there, leaving the caller's
+//! multirow / fused fallback, which is captured — and the graph is replayed
+//! every iteration against the eager fallback bitwise.  Exits 1 on any
+//! mismatch.
 //!
 //! Run: cargo run --release --features lab --example bench_qwen4_hc_wmma -p rdna-compute
 //! `SHAPES=MxKxB,...` (projections), `READS=HIDDENxROWS,...`, `REPS=n`.
@@ -48,7 +52,9 @@ fn bf16_val(h: u16) -> f32 {
     f32::from_bits((h as u32) << 16)
 }
 
-/// F16 bits of a BF16-exact normal value (exact: 7 mantissa bits fit in 10).
+/// F16 bits of a BF16-exact value in the F16 range: exact for normals (7
+/// mantissa bits fit in 10); below 2^-14 rounded to the nearest F16 subnormal
+/// (ties to even), as the GPU's F32 -> F16 conversion does.
 fn f16_of_bf16(v: f32) -> u16 {
     let b = v.to_bits();
     let sign = ((b >> 16) & 0x8000) as u16;
@@ -56,7 +62,13 @@ fn f16_of_bf16(v: f32) -> u16 {
         return sign;
     }
     let exp = ((b >> 23) & 0xff) as i32 - 127 + 15;
-    assert!((1..31).contains(&exp), "value {v} outside the F16 normal range");
+    assert!(exp < 31, "value {v} outside the F16 range");
+    if exp < 1 {
+        // |v| < 2^-14: units of 2^-24 (exact in f64), round half to even.
+        let q = (v.abs() as f64) * (1u64 << 24) as f64;
+        let r = q.round_ties_even() as u16;
+        return sign | r;
+    }
     sign | ((exp as u16) << 10) | ((b >> 13) & 0x3ff) as u16
 }
 
@@ -297,35 +309,52 @@ fn stress(gpu: &mut Gpu) -> bool {
     let pid = std::process::id();
     let shapes = parse(
         "SHAPES",
-        "320x20480x1536,320x10240x1131,4x20480x1536,63x2560x641,65x2560x639,319x2624x513,321x2560x1535,511x1280x640,513x1280x767,1023x640x769,1025x640x513,5120x2560x1537",
+        "320x20480x1536,320x10240x1131,4x20480x1536,63x2560x641,65x2560x639,319x2624x513,321x2560x1535,320x2496x1131,320x2816x1131,511x1280x640,513x1280x767,1023x640x769,1025x640x513,5120x2560x1537",
     );
     let reads = parse("READS", "5120x1536,2560x1131,2560x513,2560x1900");
+    let capture = std::env::var("CAPTURE").is_ok_and(|v| v == "1");
     struct Case {
         run: Box<dyn Fn(&mut Gpu)>,
+        /// Issued under capture: the route's refusal, then the caller's fallback into `cap`.
+        fallback: Box<dyn Fn(&mut Gpu)>,
         out: GpuTensor,
+        cap: GpuTensor,
         reference: Vec<f32>,
         tol: f32,
         first: Option<Vec<u32>>,
         name: String,
     }
+    let alias = |t: &GpuTensor| GpuTensor {
+        buf: unsafe { hip_bridge::DeviceBuffer::from_raw(t.buf.as_ptr(), t.numel() * 4) },
+        shape: t.shape.clone(),
+        dtype: t.dtype,
+    };
     let mut cases: Vec<Case> = Vec::new();
     for s in &shapes {
         let (m, k, b) = (s[0], s[1], s[2]);
         let wb: Vec<u16> = lcg(m * k, 11 + m as u64, 0.05).iter().map(|&v| bf16_bits(v)).collect();
         let xr: Vec<f32> = lcg(b * k, 23 + b as u64, 2.0).iter().map(|&v| bf16_val(bf16_bits(v))).collect();
-        let weight = upload_u16(gpu, &wb, DType::BF16);
-        let x = gpu.upload_f32(&xr, &[b * k]).unwrap();
+        let weight = std::rc::Rc::new(upload_u16(gpu, &wb, DType::BF16));
+        let x = std::rc::Rc::new(gpu.upload_f32(&xr, &[b * k]).unwrap());
         let exact = gpu.zeros(&[b * m], DType::F32).unwrap();
         gpu.gemm_bf16_xf32_multirow(&weight, &x, &exact, m, k, b).unwrap();
         let reference = gpu.download_f32(&exact).unwrap();
         let scale = reference.iter().fold(0f32, |a, v| a.max(v.abs()));
         let out = gpu.zeros(&[b * m], DType::F32).unwrap();
-        let o = GpuTensor { buf: unsafe { hip_bridge::DeviceBuffer::from_raw(out.buf.as_ptr(), b * m * 4) }, shape: vec![b * m], dtype: DType::F32 };
+        let o = alias(&out);
+        let cap = gpu.zeros(&[b * m], DType::F32).unwrap();
+        let c = alias(&cap);
+        let (w2, x2) = (weight.clone(), x.clone());
         cases.push(Case {
             run: Box::new(move |g: &mut Gpu| {
                 assert!(g.gemm_bf16_xf32_f16_wmma_qwen4(&[(&weight, &o, m)], &x, k, b).unwrap());
             }),
+            fallback: Box::new(move |g: &mut Gpu| {
+                assert!(!g.gemm_bf16_xf32_f16_wmma_qwen4(&[(&w2, &c, m)], &x2, k, b).unwrap());
+                g.gemm_bf16_xf32_multirow(&w2, &x2, &c, m, k, b).unwrap();
+            }),
             out,
+            cap,
             reference,
             tol: 1e-4 * scale,
             first: None,
@@ -345,7 +374,7 @@ fn stress(gpu: &mut Gpu) -> bool {
             .iter()
             .map(|&v| bf16_val(bf16_bits(if v.abs() < 1e-3 { 1e-3 } else { v })))
             .collect();
-        let up_weight = upload_u16(gpu, &up, DType::BF16);
+        let up_weight = std::rc::Rc::new(upload_u16(gpu, &up, DType::BF16));
         let low_f32 = gpu.upload_f32(&low, &[rows * low_rank]).unwrap();
         let low_bf16 = upload_u16(gpu, &low.iter().map(|&v| bf16_bits(v)).collect::<Vec<_>>(), DType::BF16);
         let norm_f32 = gpu.upload_f32(&norm, &[rows * wide]).unwrap();
@@ -367,7 +396,10 @@ fn stress(gpu: &mut Gpu) -> bool {
         .unwrap();
         let reference = gpu.download_f32(&fused).unwrap();
         let out = gpu.zeros(&[rows * hidden], DType::F32).unwrap();
-        let o = GpuTensor { buf: unsafe { hip_bridge::DeviceBuffer::from_raw(out.buf.as_ptr(), rows * hidden * 4) }, shape: vec![rows * hidden], dtype: DType::F32 };
+        let o = alias(&out);
+        let cap = gpu.zeros(&[rows * hidden], DType::F32).unwrap();
+        let c = alias(&cap);
+        let up2 = up_weight.clone();
         cases.push(Case {
             run: Box::new(move |g: &mut Gpu| {
                 hyper_read_up_wmma(
@@ -385,7 +417,27 @@ fn stress(gpu: &mut Gpu) -> bool {
                 )
                 .unwrap()
             }),
+            // The forward keeps F32 HC streams (and the fused SIMT read) when
+            // `qwen4_bf16_streams` is false, which capture forces.
+            fallback: Box::new(move |g: &mut Gpu| {
+                assert!(!g.qwen4_bf16_streams(rows));
+                hyper_read_up_fused(
+                    g,
+                    &HyperReadUpFused {
+                        up_weight: &up2,
+                        low: &low_f32,
+                        normalized: &norm_f32,
+                        mixed: &c,
+                        rows,
+                        hidden,
+                        low_rank,
+                        normalized_bf16: false,
+                    },
+                )
+                .unwrap()
+            }),
             out,
+            cap,
             // One BF16 step of the fused read (the gate rounding), relative.
             reference,
             tol: -1.0,
@@ -393,8 +445,34 @@ fn stress(gpu: &mut Gpu) -> bool {
             name: format!("read {hidden}x{rows}"),
         });
     }
-    let (mut unstable, mut wrong, mut outputs) = (0usize, 0usize, 0usize);
+    if capture {
+        // Warmup-first, as the forwards do: size every scratch the eager
+        // route grows (F16 X, K-split partials) before capturing, because
+        // scratch growth invalidates captured graphs.
+        for case in &cases {
+            (case.run)(gpu);
+        }
+        if gpu.active_stream.is_none() {
+            gpu.active_stream = Some(gpu.hip.stream_create().unwrap());
+        }
+        gpu.hip.device_synchronize().unwrap();
+        let stream = gpu.active_stream.take().unwrap();
+        gpu.graphs.begin_graph_capture(&gpu.hip, gpu.device_id, &stream).unwrap();
+        gpu.active_stream = Some(stream);
+        for case in &cases {
+            (case.fallback)(gpu);
+        }
+        let stream = gpu.active_stream.take().unwrap();
+        gpu.graphs.end_graph_capture(&gpu.hip, gpu.device_id, &stream).unwrap();
+        gpu.active_stream = Some(stream);
+    }
+    let (mut unstable, mut wrong, mut outputs, mut cap_differ) = (0usize, 0usize, 0usize, 0usize);
     for it in 0..iters {
+        if capture {
+            let stream = gpu.active_stream.take().unwrap();
+            gpu.graphs.graph_launch(&gpu.hip, gpu.device_id, &stream).unwrap();
+            gpu.active_stream = Some(stream);
+        }
         for case in cases.iter_mut() {
             (case.run)(gpu);
             let got = gpu.download_f32(&case.out).unwrap();
@@ -424,14 +502,24 @@ fn stress(gpu: &mut Gpu) -> bool {
                     unstable += differ;
                 }
             }
+            if capture {
+                gpu.hip.device_synchronize().unwrap();
+                let got = gpu.download_f32(&case.cap).unwrap();
+                let differ = got.iter().zip(&case.reference).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+                if differ > 0 {
+                    println!("[{pid}] it {it} {}: {differ} captured-fallback outputs differ from eager", case.name);
+                }
+                cap_differ += differ;
+            }
         }
     }
     println!(
-        "[{pid}] stress {} iterations x {} cases: {outputs} outputs checked, {unstable} differ from iteration 0, {wrong} outside reference tolerance",
+        "[{pid}] stress {} iterations x {} cases (capture {}): {outputs} outputs checked, {unstable} differ from iteration 0, {wrong} outside reference tolerance, {cap_differ} captured-fallback outputs differ from eager",
         iters,
-        cases.len()
+        cases.len(),
+        if capture { "on" } else { "off" }
     );
-    unstable == 0 && wrong == 0
+    unstable == 0 && wrong == 0 && cap_differ == 0
 }
 
 fn main() {

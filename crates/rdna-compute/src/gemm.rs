@@ -27879,7 +27879,7 @@ impl Gpu {
     }
 
     /// gfx1201 runs the Qwen4 F16 WMMA route on its own gfx12 kernels
-    /// (`gemm_f16_x_f16_wmma_lds.gfx1201.hip`, `hyper_read_up_wmma.gfx1201.hip`)
+    /// (`gemm_f16_x_f16_wmma_lds_splitk.hip`, `hyper_read_up_wmma.gfx1201.hip`)
     /// unless `HIPFIRE_QWEN4_F16_WMMA_GFX1201=0`.  Exact arch: gfx1200 and every
     /// other RDNA4 part stay on the multirow arms.
     pub fn qwen4_f16_wmma_gfx1201(&self) -> bool {
