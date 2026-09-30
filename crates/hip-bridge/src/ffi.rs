@@ -505,8 +505,14 @@ const STAGE_ALL_PAGEABLE_COPIES_MB: &str = "100000";
 /// `hipHostMalloc` memory. libhsakmt and clr read both switches once, when
 /// the runtime initializes, so they are set before it loads. APUs ignore the
 /// first switch.
+///
+/// Both switches are process-global, and together they slow other loads: on
+/// gfx1201, H2's weight sweep took 1.20-1.22 s with them instead of
+/// 1.00-1.01 s. So they are set only in a process configured to host-map
+/// Qwen4 experts ([`QWEN4_EXPERT_VRAM_LAYERS_ENV`]), the one known to hold
+/// tens of GB of host memory the GPU reads.
 fn keep_host_memory_out_of_reclaim() {
-    if !cfg!(target_os = "linux") {
+    if !cfg!(target_os = "linux") || !host_maps_qwen4_experts() {
         return;
     }
     for (name, value) in [
@@ -516,6 +522,23 @@ fn keep_host_memory_out_of_reclaim() {
         if std::env::var_os(name).is_none() {
             std::env::set_var(name, value);
         }
+    }
+}
+
+/// Places the routed experts of Qwen4 trunk layers at or past `N` in pinned,
+/// device-mapped host RAM (`hipfire_arch_qwen4::expert_residency`). It is
+/// named here because it decides [`keep_host_memory_out_of_reclaim`] before
+/// the HIP runtime loads.
+pub const QWEN4_EXPERT_VRAM_LAYERS_ENV: &str = "HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS";
+
+/// Whether this process is configured to host-map Qwen4 experts: the
+/// installed process config when there is one (the daemon installs it before
+/// any GPU runtime initializes), otherwise the ambient environment. Like
+/// [`fault_spec`], it never installs the local fallback config.
+fn host_maps_qwen4_experts() -> bool {
+    match hipfire_config::active_process_config() {
+        Some(config) => config.legacy_value(QWEN4_EXPERT_VRAM_LAYERS_ENV).is_some(),
+        None => std::env::var_os(QWEN4_EXPERT_VRAM_LAYERS_ENV).is_some(),
     }
 }
 

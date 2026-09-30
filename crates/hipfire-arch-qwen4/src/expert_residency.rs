@@ -16,8 +16,9 @@ use hipfire_runtime::weight_manifest::{ShardPolicy, WeightEntry, WeightResidency
 
 /// `N` keeps the routed experts of trunk layers `0..N` in VRAM; `auto` picks
 /// the largest `N` that fits the card's free VRAM. Unset keeps every expert
-/// resident (the fully resident load).
-pub const EXPERT_VRAM_LAYERS_ENV: &str = "HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS";
+/// resident (the fully resident load). Set, it also keeps host memory out of
+/// reclaim from before the HIP runtime loads (hip-bridge owns the name).
+pub const EXPERT_VRAM_LAYERS_ENV: &str = hip_bridge::QWEN4_EXPERT_VRAM_LAYERS_ENV;
 
 /// VRAM left free by `auto` beyond the resident non-expert weights: forward
 /// scratch, KV and state for the 2048-token contract plus headroom. Measured
