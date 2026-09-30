@@ -1856,6 +1856,7 @@ fn main() {
                     .and_then(|v| v.as_bool())
                     .unwrap_or(true);
 
+                // lifecycle: deprecated since 0.4.0, removal 0.5.0
                 // 0.1.7: TriAttention / CASK eviction protocol fields. When
                 // `cask_sidecar` is set, `load_model` sizes the KV cache to a
                 // *physical_cap* (budget+beta+safety, clamped to max_seq) instead
@@ -1900,6 +1901,13 @@ fn main() {
                     .and_then(|p| p.get("cask_fold_m"))
                     .and_then(|v| v.as_u64())
                     .unwrap_or(2) as usize;
+                // CASK/TriAttention eviction is deprecated (removal in 0.5.0):
+                // it still loads, but every opt-in gets exactly one warning line.
+                if cask_sidecar.is_some() || cask_enabled {
+                    eprintln!(
+                        "[hipfire-daemon] warning: CASK is deprecated and will be removed in 0.5.0; not supported (cask_sidecar/cask set at load)"
+                    );
+                }
                 // Known-broken combo guard: CASK m-folding + DFlash spec decode
                 // degenerates into single-token loops after the first eviction
                 // (the m-folded synthetic K/V rows are off the draft's trained

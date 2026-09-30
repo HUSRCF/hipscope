@@ -199,16 +199,19 @@ Values and defaults below match `hipfire-config`, the native CLI, and/or `Runtim
 
 Eager LFM prefill remains available when the batch flag is off **or** the GPU is not gfx1201. On gfx1201 with `HIPFIRE_LFM2_PREFILL_BATCH=1`, selection is GPU+flag only with **no post-selection fallback** — unsupported cohorts fail closed at the **runtime fixture validation/guard** (exact 350M dense MQ4 fixture only). Source symbol `validate_350m_mq4_admission` is a fixture-shape check only; its name does **not** create a product admission — [`admissions.yml`](admissions.yml) remains the sole authority (schema v2; exactly one earned retained-PM4 product row).
 
-### CASK / serve / multi-GPU
+### CASK (deprecated, removal in 0.5.0) / serve / multi-GPU
 
-`HIPFIRE_CASK_OFF` is a retired compatibility name. The current Rust control
-plane does not consume it; use an empty `memory.cask.sidecar` and keep
-`memory.cask.auto_attach=false` instead. The old name remains only in a loader
-diagnostic and developer harness exports pending their cleanup.
+CASK / TriAttention eviction is deprecated and will be removed in 0.5.0; it is
+not supported. `HIPFIRE_CASK_SIDECAR` is the legacy env alias of
+`memory.cask.sidecar` and goes with it; setting it (or any CASK key) makes the
+daemon print a deprecation warning at
+load. `HIPFIRE_CASK_OFF` is a retired compatibility name that the Rust control
+plane does not consume; CASK is already off unless `memory.cask.sidecar` is
+set or `memory.cask.auto_attach=true`. The old name remains only in developer
+harness exports pending their cleanup.
 
 | Variable | Notes |
 |---|---|
-| `HIPFIRE_FORCE_A3B_EVICTION=1` | Override A3B refusal (not recommended) |
 | `HIPFIRE_IDLE_TIMEOUT` | Serve idle unload seconds |
 | `HIPFIRE_MAX_REQUEST_BYTES` | Body cap |
 | `HIPFIRE_SERVE_MAX_QUEUE` / `HIPFIRE_SERVE_QUEUE_TIMEOUT_MS` | Admission queue |
@@ -408,7 +411,7 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_CANARY_MODEL` | scripts/gfx906_fallback_canary.sh |
 | `HIPFIRE_CANARY_PREFILL` | scripts/gfx906_fallback_canary.sh |
 | `HIPFIRE_CANARY_RUNS` | scripts/gfx906_fallback_canary.sh |
-| `HIPFIRE_CASK_OFF` | crates/hipfire-loader/src/lib.rs, scripts/redline_daemon_harness.py, tools/redline/product_bench.py, scripts/serve_harness.py (retired literal; not consumed by Rust config) |
+| `HIPFIRE_CASK_OFF` | scripts/redline_daemon_harness.py, tools/redline/product_bench.py, scripts/serve_harness.py (retired literal; not consumed by Rust config) |
 | `HIPFIRE_CASK_SIDECAR` | crates/hipfire-config/src/lib.rs |
 | `HIPFIRE_CHATML` | crates/hipfire-runtime/examples/probe_argmax_agreement.rs |
 | `HIPFIRE_CHAT_CURRENT_DATE` | crates/hipfire-runtime/src/prompt_frame.rs |

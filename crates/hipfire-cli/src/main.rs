@@ -124,7 +124,8 @@ pub(crate) enum Commands {
     Setup(SetupArgs),
     /// Quantize a Hugging Face or local model with the Rust quantizer.
     Quantize(QuantizeArgs),
-    /// Generate a TriAttention calibration sidecar.
+    // lifecycle: deprecated since 0.4.0, removal 0.5.0
+    /// Deprecated (CASK; removal in 0.5.0): generate a TriAttention calibration sidecar.
     SidecarGen(SidecarArgs),
     /// Generate text through a fresh native daemon process.
     Run(RunArgs),
@@ -3223,6 +3224,7 @@ pub(crate) fn load_params(
         .map_err(|err| anyhow!("{err}"))?
         .as_str()
         .to_owned();
+    // lifecycle: deprecated since 0.4.0, removal 0.5.0
     let mut cask_sidecar = config_string(resolved, "memory.cask.sidecar")?;
     if cask_sidecar.is_empty() && config_bool(resolved, "memory.cask.auto_attach")? {
         if let Some(sidecar) = entry.and_then(|entry| entry.triattn.as_ref()) {
@@ -6688,7 +6690,9 @@ fn quantize_command(paths: &Paths, mut args: QuantizeArgs) -> Result<()> {
     Ok(())
 }
 
+// lifecycle: deprecated since 0.4.0, removal 0.5.0
 fn sidecar_command(paths: &Paths, args: SidecarArgs) -> Result<()> {
+    eprintln!("warning: CASK is deprecated and will be removed in 0.5.0; not supported (sidecar-gen)");
     if !(1..=1_000_000).contains(&args.max_tokens) {
         bail!("--max-tokens must be between 1 and 1000000");
     }

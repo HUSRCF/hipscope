@@ -260,20 +260,17 @@ another installed target still declares it (see [CLI.md](CLI.md)).
 
 ## Long context (optional)
 
-CASK/TriAttention eviction is experimental and disabled by default. It is
-**not** required for short prompts. When deliberately testing it for long
-context on limited VRAM:
-
-1. Prefer models whose `pull` ships a `.triattn.bin` sidecar, **or** generate one: `hipfire sidecar-gen <model>`.
-2. Set `cask_sidecar` to that exact path. Enable `cask` separately only when m-folding is intended.
-3. Read constraints (A3B, DFlash + m-fold) in [CONFIG.md](CONFIG.md) before enabling on MoE or with DFlash. `cask_auto_attach` remains `false` unless explicitly opted in.
+Long context needs no extra setup beyond `max_seq` and VRAM; for KV headroom
+pick a compact `kv_cache` mode (see [CONFIG.md](CONFIG.md)). CASK/TriAttention
+eviction is deprecated and will be removed in 0.5.0 — off by default, not
+supported, and not a recommended route to long context.
 
 ### Measured capacity (Qwen3.5/3.6 35B-A3B-class, 24GB)
 
 On 24GB GPUs, Q8 KV is about 10,880 B/token across 10 full-attention layers,
 plus O(N) flash partials (~2,064 B/token), ~25 MiB DeltaNet state, and multi-GiB
 fixed HIP/graph overhead. **50K Q8 is tight but physically feasible**; **200K Q8
-is not a 24GB-class configuration** — it needs >32GB-class VRAM or CASK/compressed
+is not a 24GB-class configuration** — it needs >32GB-class VRAM or compressed
 KV. Some historical 131K sidecar benches clamped physical capacity to ~2432
 tokens and should not be read as full-context Q8 support. Long-context decode
 slowdown is expected O(N) full-attention bandwidth, not by itself an admission
@@ -303,6 +300,6 @@ tail -f ~/.hipfire/serve.log
 | [CHAT.md](CHAT.md) | Interactive chat, thinking display, daemon attach |
 | [SERVE.md](SERVE.md) | OpenAI-compatible HTTP |
 | [MODELS.md](MODELS.md) | Tags, VRAM, BYO quantize, thinking/templates |
-| [CONFIG.md](CONFIG.md) | All config keys and experimental CASK/TriAttention opt-ins |
+| [CONFIG.md](CONFIG.md) | All config keys |
 | [QUANTIZE.md](QUANTIZE.md) | `hipfire quantize` operator guide |
 | [INDEX.md](INDEX.md) | Ownership map for the rest of `docs/` |

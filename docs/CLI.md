@@ -140,7 +140,7 @@ Do not inventory every key here — [CONFIG.md](CONFIG.md) owns defaults and ran
 |---|---|
 | `hipfire quantize <hf-id\|dir\|file.gguf> [flags]` | CPU quantize via `hipfire-quantize`. |
 | `hipfire-quantize --flux-pipe <pipe_dir> -o <base.hfq>` | Pack a FLUX.1 or FLUX.2 Klein diffusers pipe into per-component HFQ files (`<base>-transformer.hfq` plus `-t5.hfq`, `-clip.hfq`, `-vae.hfq` for FLUX.1, or `-qwen3.hfq`, `-vae.hfq` for Klein; arch ids 40–46). `--flux-component` packs one. The packs are the only form the daemon loads. |
-| `hipfire sidecar-gen <model> [flags]` | Build a `.triattn.bin` next to the model (does not pull). |
+| `hipfire sidecar-gen <model> [flags]` | **Deprecated (CASK), removal in 0.5.0.** Build a `.triattn.bin` next to the model (does not pull); prints a deprecation warning. |
 
 ### `quantize` (summary)
 
@@ -155,7 +155,7 @@ Do not inventory every key here — [CONFIG.md](CONFIG.md) owns defaults and ran
 
 Supported CLI formats include `mq4`, `mq6`, `q8`/`q8f16`, `hf4`/`hf6` and hfq aliases. Graded MoE recipes need the quantizer binary directly — [QUANTIZE.md](QUANTIZE.md).
 
-### `sidecar-gen` (summary)
+### `sidecar-gen` (summary; deprecated, removal in 0.5.0)
 
 | Flag | Purpose |
 |---|---|

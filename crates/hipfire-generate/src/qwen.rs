@@ -3843,7 +3843,7 @@ pub fn generate_spec(
             stdout,
             Some(id),
             &format!(
-                "prompt+max_tokens exceeds ctx_capacity {} (enable cask_sidecar for long decode)",
+                "prompt+max_tokens exceeds ctx_capacity {} (raise max_seq or shorten the request)",
                 ctx_capacity,
             ),
             "context_length",

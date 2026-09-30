@@ -76,7 +76,7 @@ Several A3B entries carry an `mtp.file` sidecar name (`qwen3.6-35b-a3b.mtp`). MT
 
 | Tag | File | Size GB | Min VRAM | Default KV | Notes |
 |---|---|---:|---:|---|---|
-| `qwen3.6:27b` | `qwen3.6-27b.mq4` | 15.0 | 16 | q8 | Ships `triattn.file` in registry; template not effort-native — `reasoning_effort` dropped+warned, never converted to a cap |
+| `qwen3.6:27b` | `qwen3.6-27b.mq4` | 15.0 | 16 | q8 | Registry also lists a `triattn` sidecar (deprecated CASK, removal in 0.5.0: `pull` fetches it, nothing attaches it by default); template not effort-native — `reasoning_effort` dropped+warned, never converted to a cap |
 | `qwen3.6:27b-mq3` | `qwen3.6-27b.mq3` | 10.7 | 12 | | MQ3 alpha |
 
 ### Qwen 3.8 dense
@@ -308,7 +308,7 @@ Runtime dispatch uses HFQ `arch_id` ([`architecture-ids.md`](architecture-ids.md
 
 `hipfire-arch-lfm2moe` is a **non-optional** dependency of `hipfire-loader` / daemon load paths on this tree (see crate `Cargo.toml` graphs). Feature flags on `hipfire-runtime` default set do not list a separate `arch-lfm2moe` toggle the way some other arches do — loader always links the crate.
 
-Capability features (DFlash, CASK, PP, MTP, batched prefill, n-gram) are **per-path and often narrower than “model loads”**. Spec inventory history: [`speculation-support-inventory.md`](speculation-support-inventory.md) (historical). Product claims need source + [`admissions.yml`](admissions.yml).
+Capability features (DFlash, PP, MTP, batched prefill, n-gram) are **per-path and often narrower than “model loads”**. Spec inventory history: [`speculation-support-inventory.md`](speculation-support-inventory.md) (historical). Product claims need source + [`admissions.yml`](admissions.yml).
 
 ### LFM optimized prefill — branch-only scope
 
