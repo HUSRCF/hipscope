@@ -299,6 +299,7 @@ pub fn generate_ep(
             stop,
             primed_think,
             sampling,
+            tools.is_some_and(|tools| !tools.is_empty()),
         ),
         EpServeTarget::Qwen35DenseTp => ep_serve_qwen35_dense_tp(
             m,
@@ -311,6 +312,7 @@ pub fn generate_ep(
             stop,
             primed_think,
             sampling,
+            tools.is_some_and(|tools| !tools.is_empty()),
         ),
         EpServeTarget::Deepseek4 => ep_serve_ds4(
             m,
@@ -376,8 +378,10 @@ pub fn ep_serve_qwen35_dense_tp(
     stop: &[String],
     primed_think: bool,
     sampling: EpSampling,
+    tools_enabled: bool,
 ) {
     let prompt_n = prompt_ids.len();
+    let max_tokens = crate::common::fit_max_tokens(max_tokens, prompt_n, m.physical_cap);
     if prompt_n.saturating_add(max_tokens) > m.physical_cap {
         emit_active_attempt_error(
             stdout,
@@ -552,7 +556,7 @@ pub fn ep_serve_qwen35_dense_tp(
 
     let t_decode = Instant::now();
     let mut semantic =
-        crate::ar::QwenArSemanticProducer::new_with_tool_protocol(id, primed_think, false);
+        crate::ar::QwenArSemanticProducer::new_with_tool_protocol(id, primed_think, tools_enabled);
     let mut streamed_tokens: Vec<u32> = Vec::new();
     let mut bytes_fed_to_filter = 0usize;
     let mut generated = 0usize;
@@ -716,6 +720,7 @@ pub fn ep_serve_qwen35_dense_tp(
     let finish_reason = match finish.finish_reason {
         "length" => "length",
         "error" => "error",
+        "tool_calls" => "tool_calls",
         _ => "stop",
     };
     ep_emit_done(
@@ -728,6 +733,7 @@ pub fn ep_serve_qwen35_dense_tp(
         prefill_ms,
         t_decode.elapsed().as_secs_f64() * 1000.0,
         finish_reason,
+        &finish.wire_tool_calls,
     );
 }
 
@@ -767,8 +773,10 @@ pub fn ep_serve_qwen35_moe(
     stop: &[String],
     primed_think: bool,
     sampling: EpSampling,
+    tools_enabled: bool,
 ) {
     let prompt_n = prompt_ids.len();
+    let max_tokens = crate::common::fit_max_tokens(max_tokens, prompt_n, m.physical_cap);
     if prompt_n.saturating_add(max_tokens) > m.physical_cap {
         emit_active_attempt_error(
             stdout,
@@ -1013,7 +1021,7 @@ pub fn ep_serve_qwen35_moe(
 
     let t_decode = Instant::now();
     let mut semantic =
-        crate::ar::QwenArSemanticProducer::new_with_tool_protocol(id, primed_think, false);
+        crate::ar::QwenArSemanticProducer::new_with_tool_protocol(id, primed_think, tools_enabled);
     let mut streamed_tokens: Vec<u32> = Vec::new();
     let mut bytes_fed_to_filter = 0usize;
     let mut generated = 0usize;
@@ -1183,6 +1191,7 @@ pub fn ep_serve_qwen35_moe(
     let finish_reason = match finish.finish_reason {
         "length" => "length",
         "error" => "error",
+        "tool_calls" => "tool_calls",
         _ => "stop",
     };
     ep_emit_done(
@@ -1195,6 +1204,7 @@ pub fn ep_serve_qwen35_moe(
         prefill_ms,
         t_decode.elapsed().as_secs_f64() * 1000.0,
         finish_reason,
+        &finish.wire_tool_calls,
     );
 }
 
@@ -1208,6 +1218,7 @@ pub fn ep_emit_done(
     prefill_ms: f64,
     decode_ms: f64,
     finish_reason: &str,
+    tool_calls: &[hipfire_runtime::prompt_frame::ToolCall],
 ) {
     let decode_tok_s = if decode_ms > 0.0 {
         generated as f64 / (decode_ms / 1000.0)
@@ -1230,7 +1241,7 @@ pub fn ep_emit_done(
         "expert-parallel generation completed"
     );
     eprintln!("[daemon] EP generate done: {generated} tok, {decode_tok_s:.1} tok/s");
-    let pending_done = serde_json::json!({
+    let mut pending_done = serde_json::json!({
         "type": "done",
         "id": id,
         "tokens": generated,
@@ -1243,6 +1254,8 @@ pub fn ep_emit_done(
         "finish_reason": finish_reason,
         "attempt_id": active_attempt_id(),
     });
+    // Canonical calls ride the staged terminal, as on the single-GPU Qwen AR.
+    hipfire_engine::emit::stage_terminal_tool_calls(&mut pending_done, finish_reason, tool_calls);
     match await_client_terminal_commit(stdout, id, &pending_done) {
         ClientTerminalDecision::Commit => {
             crate::ar::emit_generation_done_value(route, stdout, &pending_done);
@@ -1513,6 +1526,7 @@ pub fn ep_serve_ds4(
     // Emit a clean error and return BEFORE prefill — mirror the qwen35 guard.
     // saturating_add: an adversarially huge max_tokens must not wrap usize and
     // slip under the cap.
+    let max_tokens = crate::common::fit_max_tokens(max_tokens, prompt_n, m.physical_cap);
     if prompt_n.saturating_add(max_tokens) > m.physical_cap {
         emit_active_attempt_error(
             stdout,
@@ -2052,6 +2066,7 @@ pub fn ep_serve_minimax(
     // error and return BEFORE any state mutation — mirror the qwen35 guard.
     // saturating_add: an adversarially huge max_tokens must not wrap usize and
     // slip under the cap.
+    let max_tokens = crate::common::fit_max_tokens(max_tokens, prompt_n, m.physical_cap);
     if prompt_n.saturating_add(max_tokens) > m.physical_cap {
         crate::ar::emit_generation_error(
             crate::ar::GenerationRoute::MiniMaxEp,
@@ -2341,6 +2356,7 @@ pub fn ep_serve_minimax(
         prefill_ms,
         t_decode.elapsed().as_secs_f64() * 1000.0,
         finish_reason,
+        &[],
     );
 }
 
@@ -2850,6 +2866,18 @@ pub fn generate_dflash(
         .map(|s| s.ctx_capacity())
         .unwrap_or(usize::MAX);
     let spec_block_size = m.speculator.as_ref().map(|s| s.block_size()).unwrap_or(0);
+    // An omitted client max_tokens fits the target context first (the same
+    // budget the AR fallback would use), then the draft capacity decides
+    // spec vs AR.
+    let max_tokens = crate::common::fit_max_tokens(
+        max_tokens,
+        prompt_tokens.len(),
+        if m.eviction.is_none() {
+            m.physical_cap
+        } else {
+            m.max_seq
+        },
+    );
     // Shared margin with the `generate_spec` hard guard below: prompt +
     // budget + one draft block must fit, so any request the loop would refuse
     // falls back to AR here instead of erroring after `gen_start`.
@@ -5351,6 +5379,11 @@ pub fn generate_multi(
     let tokenizer = m.tokenizer.as_ref().unwrap();
 
     let trailer = nl.len();
+    let max_tokens = crate::common::fit_max_tokens(
+        max_tokens,
+        m.seq_pos + new_tokens.len() + trailer,
+        m.physical_cap,
+    );
     if m.seq_pos
         .saturating_add(new_tokens.len())
         .saturating_add(max_tokens)

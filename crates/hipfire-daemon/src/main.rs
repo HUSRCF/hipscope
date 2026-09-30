@@ -947,6 +947,21 @@ fn receive_startup_config(
     }
 }
 
+/// A sticky GPU fault (HipError 700/719) leaves the HIP context dead; only a
+/// new process gets a live one. The request that hit it has already been
+/// answered, so exit 75 (EX_TEMPFAIL): `hipfire serve` respawns the daemon
+/// and reloads the model instead of failing every later request.
+fn exit_if_gpu_poisoned(stdout: &mut impl Write) {
+    if let Some(poison) = hipfire_runtime::reset_core::gpu_poison() {
+        eprintln!(
+            "[daemon] GPU context dead after sticky HipError({}) at {}; exiting (75) for a process restart",
+            poison.code, poison.site,
+        );
+        let _ = stdout.flush();
+        std::process::exit(75);
+    }
+}
+
 fn main() {
     init_tracing();
     tracing::info!(pid = std::process::id(), "daemon starting");
@@ -1224,7 +1239,11 @@ fn main() {
         }
     });
     let mut inbox = DaemonInbox::new(msg_rx);
-    while let Ok(daemon_msg) = inbox.recv() {
+    loop {
+        exit_if_gpu_poisoned(&mut stdout);
+        let Ok(daemon_msg) = inbox.recv() else {
+            break;
+        };
         let (msg, admission_from_message, mut singleton_transfer_from_message) = match daemon_msg {
             DaemonMsg::Regular(m) => (m, None, None),
             DaemonMsg::RegularWithAdmission(m, admission) => (m, Some(admission), None),
@@ -3094,6 +3113,13 @@ fn main() {
                     .get("max_tokens")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(4096) as usize;
+                // The client omitted max_tokens: routes fit this default to the
+                // context left after the prompt instead of refusing it.
+                let _fit_max_tokens = hipfire_generate::common::FitMaxTokensGuard::set(
+                    msg.get("max_tokens_fit")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
+                );
                 let top_p = msg
                     .get("top_p")
                     .and_then(|v| v.as_f64())
@@ -3289,6 +3315,46 @@ fn main() {
                 // Covers qwen35-vl (arch 5/6 bundle), dots-ocr (arch 8) AND
                 // lfm2-vl (arch-11 bundle) in one declared-capability probe.
                 let has_vl = m.has_vision_encoder();
+                // Tensor-parallel (EP) decode has no penalty sampler and the EP
+                // load carries no vision tower: refuse instead of dropping them.
+                if m.ep.is_some() {
+                    let refusal = if has_image {
+                        Some(
+                            "images are not supported at tp>1 (the tensor-parallel load has no vision tower)"
+                                .to_owned(),
+                        )
+                    } else {
+                        [
+                            ("repeat_penalty", 1.0),
+                            ("repetition_penalty", 1.0),
+                            ("presence_penalty", 0.0),
+                            ("frequency_penalty", 0.0),
+                        ]
+                        .into_iter()
+                        .find(|(key, neutral)| {
+                            msg.get(*key)
+                                .and_then(|v| v.as_f64())
+                                .is_some_and(|value| value != *neutral)
+                        })
+                        .map(|(key, _)| {
+                            format!(
+                                "{key} is not supported at tp>1 (tensor-parallel decode has no penalty sampler); omit it or serve at tp=1"
+                            )
+                        })
+                    };
+                    if let Some(message) = refusal {
+                        hipfire_generate::dense::emit_active_attempt_error(
+                            &mut stdout,
+                            Some(id),
+                            &message,
+                            "unsupported",
+                            false,
+                            false,
+                        );
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                }
 
                 if has_image {
                     let _ =

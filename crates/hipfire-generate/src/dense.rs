@@ -448,6 +448,11 @@ pub fn generate_deepseek4_spec(
     // panic). Mirrors the bespoke ds4 pre-prefill guard — generate_spec's own
     // guard checks ctx_capacity (max_position_embeddings), which for ds4 can far
     // exceed physical_cap, so keep this explicit one.
+    let max_tokens = crate::common::fit_max_tokens(
+        max_tokens,
+        plan.start_pos + suffix.len(),
+        m.physical_cap,
+    );
     if plan
         .start_pos
         .saturating_add(suffix.len())
@@ -1002,6 +1007,9 @@ pub fn generate_deepseek4(
     // cache reset, prefill, HipGraph capture, or retained-PM4 replay. DS4's
     // VMM owner addresses remain stable; crossing a geometry bucket re-arms
     // replay automatically so the new tape is captured once at that shape.
+    // An omitted client max_tokens is fitted before the bucket is sized, so
+    // the preflight and the capacity guard below see the same budget.
+    let max_tokens = crate::common::fit_max_tokens(max_tokens, prompt_ids.len(), m.physical_cap);
     let required_tokens = prompt_ids.len().saturating_add(max_tokens);
     if let Err(error) =
         deepseek4::forward::ensure_request_capacity(cfg, state, gpu, pbs, required_tokens)
@@ -6920,6 +6928,7 @@ pub fn generate_lfm2moe(
     // saturating_add: an adversarially huge max_tokens must not wrap usize
     // and slip under the cap.
     let cap = m.lfm2moe().unwrap().state.max_seq;
+    let max_tokens = crate::common::fit_max_tokens(max_tokens, prompt_ids.len(), cap);
     if prompt_ids.len().saturating_add(max_tokens) > cap {
         emit_active_attempt_error(
             stdout,
@@ -9054,6 +9063,7 @@ pub fn generate_maple(
     // turn that still does not fit cannot be rescued — prefilling it would
     // write past the KV allocation. `decode_step` fails closed on that, but a
     // clean typed error beats a mid-stream arch error.
+    let max_tokens = crate::common::fit_max_tokens(max_tokens, prompt_ids.len() + 1, state.max_seq);
     if prompt_ids
         .len()
         .saturating_add(max_tokens)

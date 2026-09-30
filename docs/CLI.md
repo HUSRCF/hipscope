@@ -91,7 +91,7 @@ Shared by `hipfire run`, `hipfire serve`, and `hipfire bench` (including `--matr
 
 | Flag / arg | Purpose |
 |---|---|
-| `[host]` `[port]` or `host:port` | Bind (config defaults `0.0.0.0` and `11435`). **No authentication and no TLS** — prefer `127.0.0.1` for local-only; expose beyond localhost only on a trusted/firewalled network or behind an **authenticated TLS-terminating reverse proxy**. |
+| `[host]` `[port]` or `host:port` | Bind (config defaults `127.0.0.1` and `11435`). **No authentication and no TLS** — `0.0.0.0` exposes the API on every interface; do that only on a trusted/firewalled network or behind an **authenticated TLS-terminating reverse proxy**. |
 | `-d`, `--detach`, `--background` | Background; log `~/.hipfire/serve.log`, pid `~/.hipfire/serve.pid`. |
 | `--kv-mode <m>` | KV mode preset for this process (same contract as `run`). |
 | `--kv-backend <legacy\|vmm>` | KV allocation backend (same as `run`; `contiguous` rejected → use `legacy`). |

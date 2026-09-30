@@ -621,15 +621,23 @@ async fn handle_request(
     match (method, path.as_str()) {
         (Method::GET, "/health") => {
             let meta = shared.meta.lock().unwrap_or_else(|e| e.into_inner());
+            // 503 while the daemon is dead or being respawned, so probes and
+            // service managers see that requests cannot be served.
+            let state = meta.engine_state;
             let body = serde_json::json!({
-                "status": "ok",
+                "status": state.as_str(),
                 "model": meta.current_model,
                 "loading_model": meta.loading_model,
                 "pid": std::process::id(),
                 "token": meta.instance_token,
                 "native": true,
             });
-            json_response(body, 200)
+            let status = if state == crate::serve::EngineState::Up {
+                200
+            } else {
+                503
+            };
+            json_response(body, status)
         }
         (Method::GET, "/stats") => {
             let meta = shared.meta.lock().unwrap_or_else(|e| e.into_inner());

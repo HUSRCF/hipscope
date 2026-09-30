@@ -7254,6 +7254,7 @@ mod tests {
             recent_tok_s: None,
             started: Instant::now(),
             last_activity: Instant::now() - Duration::from_secs(600),
+            engine_state: crate::serve::EngineState::Up,
         }
     }
 
@@ -10916,6 +10917,18 @@ mod tests {
                     multi_slot_slots: 4,
                     multi_slot_ctx: 8192,
                     multi_slot_prefill_chunk: 1024,
+                    spawner: crate::serve::EngineSpawner {
+                        daemon: daemon.clone(),
+                        process_config: process_config.clone(),
+                        attempts: 3,
+                        backoff: Duration::from_millis(10),
+                    },
+                    resident_model: None,
+                    request_policy: crate::serve::RequestModelPolicy {
+                        allow_pull: false,
+                        allow_paths: false,
+                        operator_model: None,
+                    },
                 }),
                 meta: Mutex::new(ServeMeta {
                     current_model: None,
@@ -10927,6 +10940,7 @@ mod tests {
                     recent_tok_s: None,
                     started: Instant::now(),
                     last_activity: Instant::now(),
+                    engine_state: crate::serve::EngineState::Up,
                 }),
                 max_request_bytes: 8 * 1024 * 1024,
                 admission: Arc::new(Admission::new(4, Duration::from_secs(5))),
@@ -10985,7 +10999,9 @@ mod tests {
             Self {
                 paths,
                 port,
-                model_name: model_path.display().to_string(),
+                // Bare file name, resolved under `paths.models` like an
+                // installed model; request-named paths are refused by default.
+                model_name,
                 shared,
                 shutdown,
                 _join: Some(join),
@@ -11080,6 +11096,187 @@ mod tests {
             // ServeShared is held only by the server thread which has exited.
             let _ = fs::remove_dir_all(&self.paths.root);
         }
+    }
+
+    // ── 0.4.0 serve lifecycle: max_tokens fit, respawn, request policy ──
+
+    #[cfg(unix)]
+    fn serve_health(port: u16) -> (u16, serde_json::Value) {
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .timeout_global(Some(Duration::from_secs(5)))
+            .http_status_as_error(false)
+            .build()
+            .into();
+        let mut response = agent
+            .get(&format!("http://127.0.0.1:{port}/health"))
+            .call()
+            .expect("GET /health");
+        let status = response.status().as_u16();
+        let text = response.body_mut().read_to_string().expect("/health body");
+        let body = serde_json::from_str(&text).expect("/health JSON");
+        (status, body)
+    }
+
+    #[cfg(unix)]
+    fn post_status(port: u16, body: &serde_json::Value) -> (u16, serde_json::Value, String) {
+        let (status, bytes) = raw_nonstream_post(port, body);
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        let json = text
+            .find('{')
+            .and_then(|start| serde_json::from_str(&text[start..]).ok())
+            .unwrap_or(serde_json::Value::Null);
+        (status, json, text)
+    }
+
+    /// An omitted max_tokens (config default 4096 against the fake's 4096
+    /// context) used to reload the model on every request, because the reload
+    /// cannot grow max_seq. Now it is fitted by the daemon, and an explicit
+    /// budget that cannot fit is a 400 with no reload.
+    #[cfg(unix)]
+    #[test]
+    fn serve_omitted_max_tokens_fits_without_reload() {
+        let h = Task11HttpHarness::spawn("fit-max-tokens");
+        let body = h.base_body("t11-stop-text", false);
+        for _ in 0..2 {
+            let (status, _, text) = post_status(h.port(), &body);
+            assert_eq!(status, 200, "{text}");
+        }
+        let mut explicit = body.clone();
+        explicit["max_tokens"] = serde_json::json!(8000);
+        let (status, _, text) = post_status(h.port(), &explicit);
+        assert_eq!(status, 400, "{text}");
+        assert!(text.contains("max_tokens=8000"), "{text}");
+        let mut fits = body.clone();
+        fits["max_tokens"] = serde_json::json!(100);
+        let (status, _, text) = post_status(h.port(), &fits);
+        assert_eq!(status, 200, "{text}");
+
+        let log = h.read_requests_log();
+        assert_eq!(Task11HttpHarness::ops_of_type(&log, "load").len(), 1);
+        let generates = Task11HttpHarness::ops_of_type(&log, "generate");
+        assert_eq!(generates.len(), 3);
+        assert!(generates[..2]
+            .iter()
+            .all(|g| g["max_tokens_fit"] == serde_json::json!(true)));
+        assert_eq!(generates[2]["max_tokens"], serde_json::json!(100));
+        assert!(generates[2].get("max_tokens_fit").is_none());
+    }
+
+    /// A request may not load a file outside the installed models, nor start
+    /// a registry download; an installed model still loads.
+    #[cfg(unix)]
+    #[test]
+    fn serve_refuses_request_file_paths_and_downloads() {
+        let h = Task11HttpHarness::spawn("request-policy");
+        let mut body = h.base_body("t11-stop-text", false);
+        body["model"] = serde_json::json!("/etc/hostname");
+        let (status, _, text) = post_status(h.port(), &body);
+        assert_eq!(status, 404, "{text}");
+        assert!(text.contains("serve.allow_request_paths"), "{text}");
+        body["model"] = serde_json::json!("qwen3.5:0.8b");
+        let (status, _, text) = post_status(h.port(), &body);
+        assert_eq!(status, 404, "{text}");
+        assert!(text.contains("hipfire pull qwen3.5:0.8b"), "{text}");
+        assert!(Task11HttpHarness::ops_of_type(&h.read_requests_log(), "load").is_empty());
+
+        let (status, _, text) = post_status(h.port(), &h.base_body("t11-stop-text", false));
+        assert_eq!(status, 200, "{text}");
+    }
+
+    /// After a failed switch the daemon holds nothing (tp<=1 unloads first):
+    /// `/health` must stop naming the old model and the next request for it
+    /// must reload instead of generating against an empty daemon.
+    #[cfg(unix)]
+    #[test]
+    fn serve_failed_model_switch_clears_residency() {
+        let h = Task11HttpHarness::spawn("switch-fail");
+        let (status, _, text) = post_status(h.port(), &h.base_body("t11-stop-text", false));
+        assert_eq!(status, 200, "{text}");
+        assert_eq!(serve_health(h.port()).1["model"], serde_json::json!(h.model()));
+
+        fs::write(h.paths.models.join("t20-load-fail.hfq"), b"x").unwrap();
+        let mut bad = h.base_body("t11-stop-text", false);
+        bad["model"] = serde_json::json!("t20-load-fail.hfq");
+        let (status, _, text) = post_status(h.port(), &bad);
+        assert_ne!(status, 200, "{text}");
+        assert!(serve_health(h.port()).1["model"].is_null());
+
+        let (status, _, text) = post_status(h.port(), &h.base_body("t11-stop-text", false));
+        assert_eq!(status, 200, "{text}");
+        let loads = Task11HttpHarness::ops_of_type(&h.read_requests_log(), "load").len();
+        assert_eq!(loads, 3, "initial load, failed switch, reload of the old model");
+    }
+
+    /// A daemon that exits (crash, or a sticky GPU fault after which it exits
+    /// 75) is respawned and the next request is served.
+    #[cfg(unix)]
+    #[test]
+    fn serve_respawns_a_daemon_that_exited() {
+        let h = Task11HttpHarness::spawn("respawn");
+        let ok = h.base_body("t11-stop-text", false);
+        assert_eq!(post_status(h.port(), &ok).0, 200);
+        for fault in ["t11-premature-eof", "t20-gpu-poison"] {
+            let (status, _, text) = post_status(h.port(), &h.base_body(fault, false));
+            assert_ne!(status, 200, "{fault}: {text}");
+            let (status, _, text) = post_status(h.port(), &ok);
+            assert_eq!(status, 200, "after {fault}: {text}");
+        }
+        let log = h.read_requests_log();
+        assert_eq!(Task11HttpHarness::ops_of_type(&log, "configure").len(), 3);
+        assert_eq!(Task11HttpHarness::ops_of_type(&log, "load").len(), 3);
+        assert_eq!(serve_health(h.port()).0, 200);
+    }
+
+    /// `/health` is 503 while the daemon is dead and cannot be respawned, and
+    /// the supervisor brings it back with the resident model reloaded.
+    #[cfg(unix)]
+    #[test]
+    fn serve_health_is_unhealthy_until_the_daemon_is_back() {
+        let h = Task11HttpHarness::spawn("respawn-health");
+        assert_eq!(post_status(h.port(), &h.base_body("t11-stop-text", false)).0, 200);
+        let daemon = {
+            let mut runtime = h.shared.runtime.lock().unwrap();
+            std::mem::replace(
+                &mut runtime.spawner.daemon,
+                h.paths.root.join("missing-daemon"),
+            )
+        };
+        let (status, _, text) = post_status(h.port(), &h.base_body("t11-premature-eof", false));
+        assert_ne!(status, 200, "{text}");
+
+        assert!(crate::serve::supervise_engine(&h.shared).is_err());
+        let (status, health) = serve_health(h.port());
+        assert_eq!(status, 503);
+        assert_eq!(health["status"], "unhealthy");
+
+        h.shared.runtime.lock().unwrap().spawner.daemon = daemon;
+        crate::serve::supervise_engine(&h.shared).unwrap();
+        let (status, health) = serve_health(h.port());
+        assert_eq!(status, 200);
+        assert_eq!(health["status"], "ok");
+        assert_eq!(health["model"], serde_json::json!(h.model()));
+        assert_eq!(post_status(h.port(), &h.base_body("t11-stop-text", false)).0, 200);
+        // The supervisor reloaded the model; the request did not load again.
+        let loads = Task11HttpHarness::ops_of_type(&h.read_requests_log(), "load").len();
+        assert_eq!(loads, 2);
+    }
+
+    /// DeepSeek V4 (legacy contract) stages tool calls only on the terminal;
+    /// they must reach the client (#593).
+    #[cfg(unix)]
+    #[test]
+    fn serve_legacy_staged_tool_calls_reach_the_client() {
+        let h = Task11HttpHarness::spawn("legacy-tools");
+        let (status, json, text) =
+            post_status(h.port(), &h.tools_body("t20-legacy-staged-tool", false));
+        assert_eq!(status, 200, "{text}");
+        let choice = &json["choices"][0];
+        assert_eq!(choice["finish_reason"], "tool_calls", "{text}");
+        assert_eq!(
+            choice["message"]["tool_calls"][0]["function"]["name"],
+            "read_file",
+            "{text}"
+        );
     }
 
     #[cfg(unix)]
