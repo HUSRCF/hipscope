@@ -600,7 +600,31 @@ impl Qwen4Config {
     pub fn qsa_selected_capacity(&self) -> usize {
         self.indexer_budget + self.indexer_compress_ratio.saturating_sub(1)
     }
+
+    /// Bytes of one QSA layer's context-sized arenas at `max_seq`: F32 full
+    /// K and V, raw index keys, and pooled index keys. The trunk has
+    /// `n_full_layers()` of these and an attached MTP head one more.
+    pub fn qsa_context_arena_bytes(&self, max_seq: usize) -> Option<usize> {
+        let full = self.num_key_value_heads.checked_mul(self.head_dim)?;
+        let raw = self.indexer_kv_heads.checked_mul(self.indexer_head_dim)?;
+        let pooled_rows = max_seq.div_ceil(self.indexer_compress_ratio);
+        max_seq
+            .checked_mul(full.checked_mul(2)?.checked_add(raw)?)?
+            .checked_add(pooled_rows.checked_mul(raw)?)?
+            .checked_mul(std::mem::size_of::<f32>())
+    }
 }
+
+/// Largest context a Qwen4 load admits. The parallel QSA block selector
+/// stages one F32 score per pooled block of the whole arena
+/// (`max_seq / compress` blocks) in dynamic LDS beside 4 KiB of static LDS
+/// (`rdna_compute::tensor_ops::QSA_SELECT_BATCHED_STATIC_LDS_BYTES`); the
+/// 64 KiB bound (gfx11/gfx12) holds 15360 blocks. A larger arena would route
+/// every row, decode included, to the one-thread serial selector.
+pub const QWEN4_MAX_CONTEXT: usize = 61440;
+
+/// Context a Qwen4 load gets when `max_seq` is omitted.
+pub const QWEN4_DEFAULT_CONTEXT: usize = 32768;
 
 pub(crate) fn compact_test_config() -> Qwen4Config {
     let layers: Vec<_> = (0..48)

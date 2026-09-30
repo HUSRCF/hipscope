@@ -2071,6 +2071,10 @@ extern "C" __global__ void indexed_attention_select_f32_batched_serial(
     }
 }
 
+// Chosen-block list of the past-budget radix path in
+// indexed_attention_select_f32_batched (static LDS with its 256 radix bins;
+// QSA_SELECT_BATCHED_STATIC_LDS_BYTES in tensor_ops.rs bounds both).
+#define QSA_SELECT_LIST_CAPACITY 512
 extern "C" __global__ void indexed_attention_select_f32_batched(
     const float* query,
     const float* pooled,
@@ -2112,38 +2116,126 @@ extern "C" __global__ void indexed_attention_select_f32_batched(
     }
     __syncthreads();
     int chosen = budget_blocks < row_block_count ? budget_blocks : row_block_count;
+    const int tid = (int)threadIdx.x;
+    const int threads = (int)blockDim.x;
     // rank(block) counts the blocks that sort before it under
     // (score desc, index asc) — the exact order the serial selection sort
     // produced — so writing block `b` at slot `rank(b)` emits the same bytes.
     // Live scores are >= 0 (fmaxf against 0, summed per head), so no block can
     // hold the old sentinel and the order is strict: the ranks are distinct.
-    for (int block = (int)threadIdx.x;
-         block < row_block_count;
-         block += (int)blockDim.x) {
-        float score = scores[block];
-        int rank = 0;
-        // Four LDS scores per read (`scores` is 16-byte aligned),
-        // several reads in flight; the count is order-independent.
-        int other = 0;
-#pragma unroll 8
-        for (; other + 4 <= row_block_count; other += 4) {
-            const float4 v = *reinterpret_cast<const float4*>(scores + other);
-            rank += (v.x > score || (v.x == score && other < block));
-            rank += (v.y > score || (v.y == score && other + 1 < block));
-            rank += (v.z > score || (v.z == score && other + 2 < block));
-            rank += (v.w > score || (v.w == score && other + 3 < block));
+    // Non-negative, non-NaN F32 scores order exactly as their bit patterns.
+    if (chosen < row_block_count && chosen <= QSA_SELECT_LIST_CAPACITY) {
+        // Past the budget: find the chosen-th largest score by an 8-bit
+        // radix select, list the chosen blocks (every score above it, then
+        // the lowest-index blocks equal to it), and rank only the list. A
+        // block that sorts before a listed block is itself listed, so its
+        // rank among the list is its rank among all blocks.
+        __shared__ unsigned int bins[256];
+        __shared__ int list[QSA_SELECT_LIST_CAPACITY];
+        __shared__ unsigned int radix_prefix;
+        __shared__ int radix_need;
+        __shared__ int list_len;
+        unsigned int prefix = 0u, mask = 0u;
+        int need = chosen;
+        for (int shift = 24; shift >= 0; shift -= 8) {
+            for (int i = tid; i < 256; i += threads) bins[i] = 0u;
+            __syncthreads();
+            for (int block = tid; block < row_block_count; block += threads) {
+                const unsigned int key = __float_as_uint(scores[block]);
+                if ((key & mask) == prefix) atomicAdd(&bins[(key >> shift) & 255u], 1u);
+            }
+            __syncthreads();
+            if (tid == 0) {
+                int above = 0;
+                int digit = 255;
+                for (; digit > 0; --digit) {
+                    if (above + (int)bins[digit] >= need) break;
+                    above += (int)bins[digit];
+                }
+                radix_need = need - above;
+                radix_prefix = prefix | ((unsigned int)digit << shift);
+            }
+            __syncthreads();
+            need = radix_need;
+            prefix = radix_prefix;
+            mask |= 255u << shift;
         }
-        for (; other < row_block_count; ++other) {
-            float value = scores[other];
-            if (value > score || (value == score && other < block)) ++rank;
+        // `prefix` is the threshold key; the `need` lowest-index blocks equal
+        // to it complete the list. Ordinals by index: contiguous ranges and an
+        // exclusive scan of their equal counts (reusing `bins`).
+        const int per = (row_block_count + threads - 1) / threads;
+        const int first = min(tid * per, row_block_count);
+        const int last = min(first + per, row_block_count);
+        int equal = 0;
+        for (int block = first; block < last; ++block) {
+            equal += __float_as_uint(scores[block]) == prefix;
         }
-        if (rank < chosen) {
+        __syncthreads();
+        bins[tid] = (unsigned int)equal;
+        if (tid == 0) list_len = 0;
+        __syncthreads();
+        if (tid == 0) {
+            unsigned int sum = 0u;
+            for (int i = 0; i < threads; ++i) {
+                const unsigned int count = bins[i];
+                bins[i] = sum;
+                sum += count;
+            }
+        }
+        __syncthreads();
+        int ordinal = (int)bins[tid];
+        for (int block = first; block < last; ++block) {
+            const unsigned int key = __float_as_uint(scores[block]);
+            bool take = key > prefix;
+            if (key == prefix) take = ordinal++ < need;
+            if (take) list[atomicAdd(&list_len, 1)] = block;
+        }
+        __syncthreads();
+        for (int i = tid; i < chosen; i += threads) {
+            const int block = list[i];
+            const float score = scores[block];
+            int rank = 0;
+            for (int j = 0; j < chosen; ++j) {
+                const int other = list[j];
+                const float value = scores[other];
+                rank += (value > score || (value == score && other < block));
+            }
             for (int slot = 0; slot < compress; ++slot) {
                 int index = rank * compress + slot;
                 int token = block * compress + slot;
                 if (index < capacity && token < visible) {
                     row_selected[index] = token;
                     if (mirror) mirror[index] = token;
+                }
+            }
+        }
+    } else {
+        for (int block = tid; block < row_block_count; block += threads) {
+            float score = scores[block];
+            int rank = 0;
+            // Four LDS scores per read (`scores` is 16-byte aligned),
+            // several reads in flight; the count is order-independent.
+            int other = 0;
+#pragma unroll 8
+            for (; other + 4 <= row_block_count; other += 4) {
+                const float4 v = *reinterpret_cast<const float4*>(scores + other);
+                rank += (v.x > score || (v.x == score && other < block));
+                rank += (v.y > score || (v.y == score && other + 1 < block));
+                rank += (v.z > score || (v.z == score && other + 2 < block));
+                rank += (v.w > score || (v.w == score && other + 3 < block));
+            }
+            for (; other < row_block_count; ++other) {
+                float value = scores[other];
+                if (value > score || (value == score && other < block)) ++rank;
+            }
+            if (rank < chosen) {
+                for (int slot = 0; slot < compress; ++slot) {
+                    int index = rank * compress + slot;
+                    int token = block * compress + slot;
+                    if (index < capacity && token < visible) {
+                        row_selected[index] = token;
+                        if (mirror) mirror[index] = token;
+                    }
                 }
             }
         }

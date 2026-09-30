@@ -1625,14 +1625,16 @@ pub fn select_generation_route(i: &GenerationRouteInputs) -> GenerationRoute {
     // 2. Arch short-circuits (Qwen2, DeepSeek4, LFM, Cohere, MiniMax, dots).
     match i.arch_id {
         16 => {
-            // Qwen4 native MTP is a strictly greedy, explicitly requested
-            // route. Any sampler control, adaptive state, or force-AR switch
-            // keeps the request on the ordinary Qwen4 producer.
+            // Qwen4 native MTP verifies greedy picks only. At temperature 0
+            // the AR producer reduces to argmax and ignores top_p/top_k/min_p
+            // (see `greedy_on_gpu` in `generate_ar_with_forward`), so their
+            // presence on the wire must not demote the request: serve forwards
+            // top_p/top_k whenever the client or the registry sets one. Penalties do move
+            // the argmax, so non-neutral ones, adaptive KV, or a force-AR
+            // switch keep the request on the ordinary Qwen4 producer.
             let spec_ok = i.has_speculator
                 && i.speculator_is_mtp
                 && i.temp <= 1e-6
-                && !i.user_explicit_sampling
-                && !i.min_p.is_some_and(|p| p > 0.0)
                 && !i.nonneutral_penalties
                 && !i.force_ar_chat
                 && !i.temp_spec_env_off

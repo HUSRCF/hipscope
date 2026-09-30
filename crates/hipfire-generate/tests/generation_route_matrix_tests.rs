@@ -398,14 +398,31 @@ fn qwen4_native_mtp_route_requires_explicit_greedy_request() {
     };
     assert_eq!(select_generation_route(&mtp), GenerationRoute::Qwen4Spec);
 
-    for refused in [
-        GenerationRouteInputs { temp: 0.7, ..mtp },
+    // Greedy argmax ignores top_p/top_k/min_p, and serve forwards top_p/top_k
+    // whenever the client or the registry sets one, so their presence must
+    // keep a greedy request on native MTP.
+    for greedy in [
         GenerationRouteInputs {
             user_explicit_sampling: true,
             ..mtp
         },
         GenerationRouteInputs {
             min_p: Some(0.1),
+            ..mtp
+        },
+    ] {
+        assert_eq!(
+            select_generation_route(&greedy),
+            GenerationRoute::Qwen4Spec,
+            "greedy Qwen4 request with argmax-neutral sampler fields must use native MTP: {greedy:?}"
+        );
+    }
+
+    for refused in [
+        GenerationRouteInputs { temp: 0.7, ..mtp },
+        GenerationRouteInputs {
+            temp: 0.7,
+            user_explicit_sampling: true,
             ..mtp
         },
         GenerationRouteInputs {
