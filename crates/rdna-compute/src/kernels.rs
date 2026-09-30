@@ -7659,6 +7659,14 @@ pub const ATTENTION_VERIFY_GQA_GFX1201_SRC: &str =
 /// partials and output at head_dim 256, GQA 6.
 pub const ATTENTION_VERIFY_GQA_GFX1100_SRC: &str =
     include_str!("../../../kernels/src/attention_verify_gqa.gfx1100.hip");
+/// VerifyAttn (gfx1151): `attention_verify_wmma_qk_gfx1151` (context-parallel
+/// S = Q.K^T tiles, one K dequant per kv head, f16 S to scratch) and
+/// `attention_verify_wmma_pv{1s_d4,2_d2}_gfx1151` (the per-16-dim-chunk online
+/// softmax + P.V walk), the byte-identical parallel twin of
+/// [`ATTENTION_Q8_0_FLASH_PREFILL_WMMA_SRC`] (legacy single slot, hd 256,
+/// GQA 6) that every gfx1151 speculative verify runs.
+pub const ATTENTION_VERIFY_WMMA_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/attention_verify_wmma.gfx1151.hip");
 
 // lloyd-V (FWHT-rotated centroid) dedicated reduce kernels. Used ONLY when
 // v_mode != 8 — the tile kernels now write rotated V partials and these
