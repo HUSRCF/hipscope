@@ -133,9 +133,9 @@ impl Gpu {
     }
 
     /// AWQ exact-FP16 producer. Bit contract: every stored element equals the
-    /// historical `fused_rmsnorm_rotate_mq_awq_batched` F32 output (identical
-    /// for the base and the gfx1100-direct AWQ kernels — same value operation
-    /// order) followed by `convert_f32_to_f16`.
+    /// historical `fused_rmsnorm_rotate_mq_awq_batched` F32 output followed
+    /// by `convert_f32_to_f16`. The producer mirrors the live F32 kernel's
+    /// two-level wave-shuffle RMS reduction, not the retired LDS tree.
     pub fn fused_rmsnorm_rotate_mq_awq_f16_batched(
         &mut self,
         x: &GpuTensor,

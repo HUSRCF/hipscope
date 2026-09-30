@@ -224,12 +224,6 @@ fn main() {
             for &awq in &[false, true] {
                 let tag = format!("N={n} K={k} awq={awq}");
                 eprintln!("--- {tag} ---");
-                if arch == "gfx1201" && awq {
-                    eprintln!(
-                        "ok {tag}: skipped (gfx1201 production route fails closed to F32+cast)"
-                    );
-                    continue;
-                }
                 // Activations with rich mantissas across the exponent range;
                 // row 0 scaled up to exercise F16 rounding away from 1.0.
                 let x_host: Vec<f32> = (0..n * k)
