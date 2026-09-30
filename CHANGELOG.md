@@ -1,6 +1,18 @@
 # Changelog
 
 ## Unreleased
+- **Serve: experimental multi-slot engine (SCS stack #779–#792, by @ghazni101; opt-in `serve.multi_slot = true`, default off).** Several requests decode concurrently on one GPU.
+  - Paged KV slot descriptors and a page pool (#779), and a runtime for prefix index, fairness, admission, host swap, the session table and a strict JSON-schema grammar matcher (#780).
+  - A Qwen3.5 multi-slot engine with a scheduler, checkpointing, per-slot MTP/DFlash speculation and the vision ladder (#781).
+  - The serve surface, with daemon slots, `hipfire serve` wiring, client streaming and loader admission (#782).
+  - An evidence suite (#783), flat 16-bit KV tiers (bf16, and a new f16) on the slot engine (#791), and the generic scheduler moved into `hipfire-runtime` (#792).
+  - `/health` gains `capabilities`. The engine's overload class maps to 503 + Retry-After, and request validation to 400.
+  - On the multi-slot route only: `serve.stream_stall_timeout_ms`, `serve.max_queue_bytes`, strict `max_tokens` and `response_format` json_schema.
+  - **The default route is unchanged.** `kv_slot_desc.h` is land's 24-byte descriptor. Every descriptor launch compiles a separately named `*_paged` module (`kv_slot_desc_paged.h`), which the installer registry packages. The `.text` of the 37 default modules whose source bytes changed is identical on gfx1100, gfx1151 and gfx1201. The land `http.rs` contract (CORS, `/health` token, 503 + Retry-After) is kept.
+  - Evidence:
+    - Single-slot MTP and AR greedy text equal land on all 8 workload genres, and code-edit τ is 2.81. H2 KLD pins are unchanged on gfx1201 (A4/fp8), XTX and Strix Halo.
+    - gfx1201 decode at 512/8K/32K and pp8192 are within 0.1 % of land.
+    - Multi-slot on gfx1201 returned 200 to every request at 2 and 4 slots, 1.41× and 1.45× faster than the same prompts run one at a time.
 - **VMM KV: a released arena's virtual range is retired, never freed, so no later reservation or `hipMalloc` in the process can land on a VA the GPU has translated before.** On ROCm 10.0 (HIP 7.15), a VA can keep translating to its first backing after `hipMemUnmap` + `hipMemMap` of another handle, even after `hipDeviceSynchronize`. In the 80 × 2 MiB repro that is every page on gfx1201 and 84% on gfx1100; gfx1151 is unaffected. The exact trigger is not isolated. `VmmArena::release` used to call `hipMemAddressFree`, and the next hint-less `hipMemAddressReserve` returns exactly the freed range, so every unload → load in one daemon (model swap, serve idle eviction, `max_seq` change, failed-load retry, DeepSeek4 compressor caches, Glimmer and dense-TP KV) re-mapped VAs the previous model had used.
   - `release` still unmaps every segment and frees every physical handle; only the VA stays reserved. `hip_bridge::retired_va_bytes()` reports the total. Qwen3.8-27B at `max_seq` 4096 retires 192 MiB per load, about 8 GiB at 256K. Reservations are refused with a restart hint once 64 TiB is retired (half of the 128 TiB user VA space).
   - `map_next` poisons the arena after its access-reset cleanup, so a retry cannot map a new handle at the address it just unmapped.

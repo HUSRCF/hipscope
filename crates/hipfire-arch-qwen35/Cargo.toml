@@ -11,7 +11,7 @@ description = "Qwen3.5 architecture (dense + MoE) for hipfire"
 default = ["deltanet"]
 deltanet = ["hipfire-runtime/deltanet", "rdna-compute/deltanet"]
 flash-attn-ck = ["hipfire-dispatch/flash-attn-ck", "rdna-compute/flash-attn-ck"]
-moe-oracle = ["dep:sha2"]
+moe-oracle = []
 # GPU bring-up probes (host-mapped/offloaded weights); build with `--features lab`.
 lab = []
 
@@ -24,7 +24,7 @@ hip-bridge = { path = "../hip-bridge" }
 rdna-compute = { path = "../rdna-compute" }
 hipfire-reap = { path = "../hipfire-reap", default-features = false }
 saddle-core = { path = "../saddle-core" }
-sha2 = { workspace = true, optional = true }
+sha2.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 

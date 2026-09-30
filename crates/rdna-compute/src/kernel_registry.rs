@@ -239,6 +239,20 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
     add!("kv_cache_write_q8_0_independent_masked", prepend_kv_slot_desc(kernels::KV_CACHE_WRITE_Q8_0_BATCHED_SRC), ["kv_cache_write_q8_0_independent_masked"]);
     add!("attention_flash_q8_0_tile", kernels::ATTENTION_FLASH_Q8_0_TILE_SRC, ["attention_flash_q8_0_tile"]);
     add!("attention_flash_q8_0_reduce", kernels::ATTENTION_FLASH_Q8_0_REDUCE_SRC, ["attention_flash_q8_0_reduce"]);
+    // Multi-slot (slot-descriptor) launches of the q8 and asym3 KV routes run
+    // separately named `*_paged` modules (attention.rs `ensure_kv_slot_kernel`,
+    // `ensure_givens4_kv_slot_kernel`, `attention_q8_0_flash_prefill_wmma_slots`).
+    add!("kv_cache_write_q8_0_batched_paged", kernels::kv_slot_desc_paged_source(kernels::KV_CACHE_WRITE_Q8_0_BATCHED_SRC, "kv_cache_write_q8_0_batched", "kv_cache_write_q8_0_batched_paged"), ["kv_cache_write_q8_0_batched_paged"]);
+    add!("attention_q8_0_kv_batched_paged", kernels::kv_slot_desc_paged_source(kernels::ATTENTION_Q8_0_KV_BATCHED_SRC, "attention_q8_0_kv_batched", "attention_q8_0_kv_batched_paged"), ["attention_q8_0_kv_batched_paged"]);
+    add!("attention_flash_q8_0_tile_batched_paged", kernels::kv_slot_givens4_paged_source(kernels::ATTENTION_FLASH_Q8_0_TILE_BATCHED_SRC, "attention_flash_q8_0_tile_batched", "attention_flash_q8_0_tile_batched_paged"), ["attention_flash_q8_0_tile_batched_paged"]);
+    add!("kv_cache_write_asym_k_givens3_batched_paged", kernels::kv_slot_givens4_paged_source(kernels::KV_CACHE_WRITE_ASYM_K_GIVENS3_BATCHED_SRC, "kv_cache_write_asym_k_givens3_batched", "kv_cache_write_asym_k_givens3_batched_paged"), ["kv_cache_write_asym_k_givens3_batched_paged"]);
+    add!("attention_flash_asym3_tile_batched_paged", kernels::kv_slot_givens4_paged_source(kernels::ATTENTION_FLASH_ASYM3_TILE_BATCHED_SRC, "attention_flash_asym3_tile_batched", "attention_flash_asym3_tile_batched_paged"), ["attention_flash_asym3_tile_batched_paged"]);
+    if matches!(arch, "gfx1100" | "gfx1151") {
+        // gfx11 admits the multi-slot WMMA prefill tile by default
+        // (forward_slots `q8_flash_prefill_wmma_eligible`); Qwen3.5 head_dim
+        // 256 with the default SPLIT_Q=0, fixed head dim and V prefetch.
+        add!("attention_q8_0_flash_prefill_wmma_gfx11_hd256_paged", format!("#define SPLIT_Q 0\n#define FIXED_HEAD_DIM 256\n#define PREFETCH_V 1\n{}", kernels::kv_slot_desc_paged_source(kernels::ATTENTION_Q8_0_FLASH_PREFILL_WMMA_SRC, "attention_q8_0_flash_prefill_wmma", "attention_q8_0_flash_prefill_wmma_paged")), ["attention_q8_0_flash_prefill_wmma_paged"]);
+    }
     add!("sample_top_p_parallel", sampling::sample_top_p_parallel_src(), ["sample_apply_repeat_penalty", "sample_topk_partial", "sample_topk_finalize"]);
     add!("sample_top_p_parallel_w64", sampling::sample_top_p_parallel_w64_src(), ["sample_apply_repeat_penalty_w64", "sample_topk_partial_w64", "sample_topk_finalize_w64"]);
     add!("sample_top_p_parallel_fast21", sampling::sample_top_p_parallel_fast_src(21, "fast21"), ["sample_apply_repeat_penalty_fast21", "sample_topk_partial_fast21", "sample_topk_finalize_fast21"]);
@@ -326,9 +340,10 @@ mod tests {
         assert_eq!(count, 92);
         // The installer trace predates the scalar-prefill runtime's BR/BC
         // specialization and the `HIPFIRE_G12_DEC_NORM` decode twins
-        // (fused RMSNorm+FWHT group grid, rmsnorm row split, RoPE head grid).
-        // Those four keys are additional to P0's 92.
-        assert_eq!(registry.len(), count + 4, "unexpected gfx1201 inventory size");
+        // (fused RMSNorm+FWHT group grid, rmsnorm row split, RoPE head grid),
+        // and the five multi-slot `*_paged` modules of the q8/asym3 routes.
+        // Those nine keys are additional to P0's 92.
+        assert_eq!(registry.len(), count + 9, "unexpected gfx1201 inventory size");
         let default_prefill = by_name.get("attention_q8_0_flash_prefill_br8_bc16").unwrap();
         assert_eq!(default_prefill.symbols, ["attention_q8_0_flash_prefill"]);
         assert!(default_prefill.source().starts_with(
@@ -352,11 +367,19 @@ mod tests {
         // Deliberate changes that landed after the P0 capture (kernel cache
         // ABI 4). The traces keep the captured bytes and argv; the portable
         // digests above are re-pinned to the current source.
-        const REPINNED_SINCE_P0: [&str; 4] = [
+        // The five KV-write modules gained paged-only code behind
+        // `#ifdef HIPFIRE_KV_SLOT_PAGED` (fold/scs); their preprocessed source
+        // and gfx1100/gfx1151/gfx1201 `.text` are unchanged.
+        const REPINNED_SINCE_P0: [&str; 9] = [
             "fused_rmsnorm_mq_rotate",
             "fused_rmsnorm_mq_rotate_awq",
             "fused_silu_mul_mq_rotate_awq",
             "gated_delta_net_q8_fast",
+            "kv_cache_write_asym_k_givens3_batched",
+            "kv_cache_write_fp8_e4m3_batched",
+            "kv_cache_write_q8_0_batched",
+            "kv_cache_write_q8_0_independent",
+            "kv_cache_write_q8_0_independent_masked",
         ];
         const FLAGS_ADDED_SINCE_P0: [&str; 1] = ["-fuse-cuid=none"];
         let mut repins_seen = HashSet::new();

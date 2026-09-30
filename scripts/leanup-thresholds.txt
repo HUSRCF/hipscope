@@ -109,4 +109,6 @@ bypass_slack                == 0
 
 # Total across all arch crates. Redundant given the rows, kept so the descent is
 # visible in this file's diff. Lower it when you bank a migration.
-bypass_total                <= 304
+# RATCHET-RAISE 304 -> 305: the "+1 pending from the SCS port PR series" already
+# recorded on the hipfire-arch-qwen35 ledger row, now carried by the SCS fold.
+bypass_total                <= 305

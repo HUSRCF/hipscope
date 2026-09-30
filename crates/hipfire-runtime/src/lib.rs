@@ -58,11 +58,26 @@ pub mod model_source;
 pub mod multi_gpu;
 pub mod paro;
 pub mod prefix;
+pub mod prefix_index;
 pub mod reset_core;
 pub mod safetensors_source;
 pub mod sampler;
 pub mod sealed_moe;
 pub mod serve;
+pub mod checkpoint_pool;
+pub mod serve_contract;
+pub mod serve_fairness;
+pub mod serve_wait;
+/// `SlotBatch` — one forward step's ragged work across N slots. Pure CPU
+/// data structure; no GPU dependencies. Moved from `hipfire-arch-qwen35`
+/// (the multi-slot scheduler/batch substrate is model-agnostic). See module
+/// docs for the per-slot-absolute `positions[]` invariant.
+pub mod slot_batch;
+/// `Scheduler` — decides what goes into each step's `SlotBatch`. Pure CPU
+/// logic; no GPU dependencies. Round-robin, chunked prefill mixed with
+/// decode. Moved from `hipfire-arch-qwen35` with `slot_batch`.
+pub mod scheduler;
+pub mod sidecar;
 pub mod spec;
 
 pub mod ngram_mod;
@@ -89,3 +104,9 @@ pub mod tool_call;
 pub mod weight_backend;
 
 pub use crate::arch::{maybe_screen_mmq, screen_weight_tensor, MmqScreenable};
+pub use crate::serve_contract::{
+    ArchPolicy, CacheDomain, CanonicalError, CheckpointId, CommitBoundary, DeviceTopology,
+    DrafterDecision, KvLayout, LastTokenHandling, MissReason, PrefixLookup, PrefixLookupResult,
+    PublishLease, ReleaseDisposition, ReservationError, ResumeBundle, ResumePlan, ResumePlanError,
+    SharingNamespace, StepNeeds, StepReservation, StepTicket, TemplateIdentity, TokenizerIdentity,
+};

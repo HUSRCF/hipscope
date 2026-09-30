@@ -1824,7 +1824,7 @@ pub fn vmm_kv_token_bytes(
     } else {
         match pair.k() {
             KvMode::Fp8 => head + 2,
-            KvMode::Bf16 => head.checked_mul(2)?,
+            KvMode::Bf16 | KvMode::F16 => head.checked_mul(2)?,
             KvMode::Q8 => head / 32 * 34,
             KvMode::Asym2 | KvMode::Fwht2 => head / 4 + 4,
             KvMode::Asym3 | KvMode::Fwht3 => head * 3 / 8 + 4,

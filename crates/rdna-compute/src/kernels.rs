@@ -6781,6 +6781,14 @@ pub const KV_CACHE_WRITE_FP8_E4M3_BATCHED_SRC: &str = concat!(
 pub const KV_CACHE_WRITE_BF16_SRC: &str =
     include_str!("../../../kernels/src/kv_cache_write_bf16.hip");
 
+/// Flat F16 (IEEE fp16) KV write — the slot-engine f16 tier. Same 2-byte
+/// flat `[max_seq × n_kv_heads × head_dim]` layout as bf16; only the dtype
+/// conversion differs (true fp16 RNE, not the bf16 top-bits trick). Holds
+/// both the decode (`kv_cache_write_f16`) and batched-prefill
+/// (`kv_cache_write_f16_batched`) entry points.
+pub const KV_CACHE_WRITE_F16_SRC: &str =
+    include_str!("../../../kernels/src/kv_cache_write_f16.hip");
+
 /// gfx1100-only paired K/V Q8_0 cache writer. Kept in a separate translation
 /// unit so its dormant body cannot perturb portable/gfx12 writer codegen.
 pub const KV_CACHE_WRITE_Q8_0_PAIR_GFX1100_SRC: &str =
@@ -6796,6 +6804,56 @@ pub const ATTENTION_Q8_0_KV_SRC: &str = include_str!("../../../kernels/src/atten
 /// "kv_slot_desc.h"` have that directive stripped and this body prepended
 /// before compilation (same pattern as `TURBO_COMMON_H` / `GIVENS_COMMON_SRC`).
 pub const KV_SLOT_DESC_H: &str = include_str!("../../../kernels/src/kv_slot_desc.h");
+
+/// Paged (32-byte, block-table) multi-slot KV descriptor — see
+/// `kernels/src/kv_slot_desc_paged.h`. Prepended instead of
+/// [`KV_SLOT_DESC_H`] only for the `*_paged` module variants the slot engine
+/// launches with real descriptors; every descriptor-less (default-route)
+/// module keeps the legacy header and its exact source bytes.
+pub const KV_SLOT_DESC_PAGED_H: &str =
+    include_str!("../../../kernels/src/kv_slot_desc_paged.h");
+
+/// Assemble a descriptor-consuming kernel translation unit for the runtime
+/// compile (which has no `-I` to `kernels/src`): strip `body`'s
+/// `#include "kv_slot_desc.h"` and prepend the header. `paged == false`
+/// reproduces the historical `format!("{KV_SLOT_DESC_H}\n{stripped}")`
+/// byte for byte, so default-route modules keep their source (and JIT cache
+/// key); `paged == true` prepends [`KV_SLOT_DESC_PAGED_H`], which also defines
+/// `HIPFIRE_KV_SLOT_PAGED` for bodies that carry paged-only parameters.
+pub fn kv_slot_desc_source(body: &str, paged: bool) -> String {
+    let header = if paged { KV_SLOT_DESC_PAGED_H } else { KV_SLOT_DESC_H };
+    let stripped = body
+        .replace("#include \"kv_slot_desc.h\"", "")
+        .replace("#include \"kv_slot_desc_paged.h\"", "");
+    format!("{header}\n{stripped}")
+}
+
+/// Source of the paged (slot-engine) variant of descriptor kernel `symbol`
+/// in `body`: the paged header, with `symbol` renamed to `paged_symbol` by
+/// macro so the same body yields a separately named kernel that never shares
+/// a function-cache entry or JIT cache key with the default-route one.
+pub fn kv_slot_desc_paged_source(body: &str, symbol: &str, paged_symbol: &str) -> String {
+    format!(
+        "#define {symbol} {paged_symbol}\n{}",
+        kv_slot_desc_source(body, true)
+    )
+}
+
+/// Source of the paged (slot-engine) variant of a descriptor kernel launched
+/// through the givens4/turbo assembler: `func` renamed to `paged_func` by
+/// macro, then the turbo/givens headers and the paged descriptor header in
+/// place of `body`'s includes. Shared by the runtime and the installer
+/// registry so both build the same module bytes.
+pub fn kv_slot_givens4_paged_source(body: &str, func: &str, paged_func: &str) -> String {
+    let stripped = body
+        .replace("#include \"turbo_common.h\"", "")
+        .replace("#include \"givens_common.h\"", "")
+        .replace("#include \"kv_slot_desc.h\"", "")
+        .replace("#include \"kv_slot_desc_paged.h\"", "");
+    format!(
+        "#define {func} {paged_func}\n{TURBO_COMMON_H}\n{GIVENS_COMMON_SRC}\n{KV_SLOT_DESC_PAGED_H}\n{stripped}"
+    )
+}
 
 /// Sliding-window variant of ATTENTION_Q8_0_KV_SRC. Adds a `window`
 /// parameter: 0 = full causal (identical to the baseline), >0 = attend only
@@ -7107,6 +7165,13 @@ pub const ATTENTION_FLASH_Q8_0_TILE_SRC: &str =
 pub const ATTENTION_FLASH_BF16_TILE_SRC: &str =
     include_str!("../../../kernels/src/attention_flash_bf16_tile.hip");
 
+/// Flat-F16 sibling of the bf16 flash tile — identical partials layout and
+/// per-thread dim mapping, so it shares `attention_flash_q8_0_reduce`
+/// unmodified (reduce is KV-dtype-agnostic). Only the widening differs:
+/// fp16 is a real conversion, not the bf16 top-bits shift.
+pub const ATTENTION_FLASH_F16_TILE_SRC: &str =
+    include_str!("../../../kernels/src/attention_flash_f16_tile.hip");
+
 /// gfx1151-only ISA experiment: preserve the flash tile's reduction tree but
 /// lower cross-lane exchanges to ds_swizzle + DPP8/quad-perm operations.
 pub const ATTENTION_FLASH_Q8_0_TILE_DPP_GFX1151_SRC: &str = concat!(
@@ -7204,6 +7269,8 @@ pub const ATTENTION_FLASH_Q8_0_TILE_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/attention_flash_q8_0_tile_batched.hip");
 pub const ATTENTION_FLASH_BF16_TILE_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/attention_flash_bf16_tile_batched.hip");
+pub const ATTENTION_FLASH_F16_TILE_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/attention_flash_f16_tile_batched.hip");
 /// Native fp8-E4M3 flash tile (`attention_flash_fp8_e4m3_tile`): same TU as
 /// [`ATTENTION_FLASH_Q8_0_TILE_SRC`] with `HIPFIRE_KV_FP8_E4M3=1`. Same
 /// 13-arg ABI (incl. trailing effective_seq_len); the reduce is the shared
@@ -8127,6 +8194,11 @@ pub const EMBEDDING_HFQ4G256_BATCHED_SRC: &str =
 /// verify hot path needs this variant to enable graph capture on that model.
 pub const EMBEDDING_Q8_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/embedding_q8_batched.hip");
+/// VL batched prefill: overwrite image-pad rows of the token-embedding batch
+/// with per-row vision-embedding matrix rows. Consumed by
+/// `Gpu::embedding_scatter_ext_batched` on the multi-slot VL path.
+pub const EMBEDDING_SCATTER_EXT_SRC: &str =
+    include_str!("../../../kernels/src/embedding_scatter_ext.hip");
 
 /// Batched F16 embedding: copies N rows of an F16 table into `[N × dim]` F32,
 /// reading token ids from a device buffer. Keeps the DSpark markov head chain
@@ -8299,6 +8371,13 @@ pub const TRANSPOSE_SRC: &str = include_str!("../../../kernels/src/transpose.hip
 /// Fused ViT self-attention: Q@K^T → softmax → @V, reading QKV from [N, 3*hidden].
 /// Grid=[n_heads, N]. Each block computes one (head, query_pos) output row.
 pub const VIT_ATTENTION_SRC: &str = include_str!("../../../kernels/src/vit_attention.hip");
+/// Q-tiled flash-style ViT attention (`Gpu::vit_attention_qtiled_f32`):
+/// QB queries per block share K/V tiles in LDS - ~QB× less DRAM traffic
+/// than the per-(head, query) `vit_attention_f32`, which was the whole
+/// 25 s @ 68x68-grid vision-forward hot spot (1.02 s/layer measured on
+/// gfx1101 at N=4624). See kernels/src/vit_attention_qtiled.hip.
+pub const VIT_ATTENTION_QTILED_SRC: &str =
+    include_str!("../../../kernels/src/vit_attention_qtiled.hip");
 
 /// 2D rotary positional embedding for the Qwen3.5-VL vision tower. Rotates Q
 /// and K halves of the packed QKV buffer in-place using per-token cos/sin of
