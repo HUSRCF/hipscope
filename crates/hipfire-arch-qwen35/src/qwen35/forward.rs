@@ -1709,11 +1709,20 @@ pub fn forward_scratch(
     }
     // MoE models require `experimental.graph.moe` in addition to the
     // arch/kill-switch guards. Dense models (num_experts==0) are unaffected.
-    let use_graph = ar_graph_test
+    let graph_would_be_used = ar_graph_test
         && graph_enabled
         && graph_eligible
         && !gpu.replay.is_enabled()
         && (config.num_experts == 0 || allow_moe);
+    // A CPU-executed step (memory.offload_exec=cpu over a spilled prefix) is a
+    // host sync point — a D2H and an H2D around the multiplication — so it can
+    // neither be recorded into a hipGraph nor replayed out of one. Take the
+    // non-captured path for the model's whole lifetime instead.
+    let cpu_blocks_capture = hipfire_dispatch::cpu_offload_active(config.i_gpu_start);
+    if graph_would_be_used && cpu_blocks_capture {
+        hipfire_dispatch::log_capture_disabled_once();
+    }
+    let use_graph = graph_would_be_used && !cpu_blocks_capture;
     let _ = gpu.graphs.ar_forward_replay_enabled; // suppress unused warning
 
     // Embedding lookup into scratch.x (always direct, changes per token)

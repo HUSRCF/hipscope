@@ -706,6 +706,23 @@ pub fn admit_source(
         };
         (topology, Some(carrier))
     };
+    // Partial GPU offload (#793): only the single-GPU dense Qwen3.5 loader
+    // places layers in host RAM. Refuse a budget that would spill under tp>1,
+    // pp>1 or on a MoE model before any teardown. Unset budget: no parse.
+    if matches!(arch_id, 5 | 6)
+        && hipfire_config::memory::gpu_layer_budget()
+            != hipfire_config::memory::GpuLayerBudget::Full
+    {
+        if let ModelSource::Hfq(hfq) = &source {
+            let config = hipfire_arch_qwen35::qwen35::config_from_hfq(hfq)
+                .map_err(|e| format!("qwen35 config: {e}"))?;
+            if let Some(refusal) =
+                hipfire_arch_qwen35::qwen35::offload_topology_refusal(&config, tp, pp)
+            {
+                return Err(refusal);
+            }
+        }
+    }
     let heterogeneous_reason = hints.deepseek4_heterogeneous && arch_id == 9;
     let unsupported = if heterogeneous_reason {
         Some("heterogeneous DeepSeek compressor owner uses a dense gfx1100 cache with no VMM layout".to_string())

@@ -113,6 +113,9 @@ tracing = "0.1"
 [dev-dependencies]
 # SHA-256 of the decoded RGB buffer for the `imagedec` PIL-parity test.
 sha2.workspace = true
+# `tests/cpu_quant_cross_check.rs`: holds `hipfire-cpu`'s transcription of the
+# canonical decoder to the decoder itself, over the real fixture tensors.
+hipfire-cpu = { path = "../hipfire-cpu" }
 hipfire-arch-qwen35 = { path = "../hipfire-arch-qwen35" }
 hipfire-arch-qwen35-vl = { path = "../hipfire-arch-qwen35-vl" }
 hipfire-arch-llama = { path = "../hipfire-arch-llama" }

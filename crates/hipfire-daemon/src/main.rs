@@ -2363,7 +2363,7 @@ fn main() {
                         } else {
                             Default::default()
                         });
-                        let vl = m.vision_config().is_some() || m.dots_ocr().is_some();
+                        let vl = m.has_vision_encoder();
                         let (dim, layers, vocab) = m.ack_dims();
 
                         // Apply MTP config from load-message params.
