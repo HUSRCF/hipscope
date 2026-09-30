@@ -31,13 +31,14 @@ pub struct F2GdnTargets<'a> {
 pub(crate) static QWEN4_F16_WMMA: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
     hipfire_config::developer_var("HIPFIRE_QWEN4_F16_WMMA").map_or(true, |v| v.trim() != "0")
 });
-/// `HIPFIRE_QWEN4_F16_WMMA_GFX1201=0` keeps gfx1201 on the multirow arms it
-/// ran before its gfx12 WMMA kernels (the F16 WMMA route for the BF16
-/// projections and the HC read); other arches are untouched.  Read once.
+/// `HIPFIRE_QWEN4_F16_WMMA_GFX1201=1` opts gfx1201 into its gfx12 WMMA
+/// kernels for the F16 WMMA route (the BF16 projections and the HC read).
+/// Default off: the route is not bit-exact and has no Flash-Next KLD
+/// reference yet, so gfx1201 keeps the multirow/SIMT arms it ran before.
+/// Other arches are untouched.  Read once.
 pub(crate) static QWEN4_F16_WMMA_GFX1201: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| {
-        hipfire_config::developer_var("HIPFIRE_QWEN4_F16_WMMA_GFX1201")
-            .map_or(true, |v| v.trim() != "0")
+        hipfire_config::developer_bool("HIPFIRE_QWEN4_F16_WMMA_GFX1201", false)
     });
 /// Tokens from which the F16 WMMA arms are used (measured on gfx1151; the MoE gate/up
 /// arm is slower below ~450; the others break even or win).
@@ -27880,8 +27881,8 @@ impl Gpu {
 
     /// gfx1201 runs the Qwen4 F16 WMMA route on its own gfx12 kernels
     /// (`gemm_f16_x_f16_wmma_lds_splitk.hip`, `hyper_read_up_wmma.gfx1201.hip`)
-    /// unless `HIPFIRE_QWEN4_F16_WMMA_GFX1201=0`.  Exact arch: gfx1200 and every
-    /// other RDNA4 part stay on the multirow arms.
+    /// only with `HIPFIRE_QWEN4_F16_WMMA_GFX1201=1` (opt-in, default off).
+    /// Exact arch: gfx1200 and every other RDNA4 part stay on the multirow arms.
     pub fn qwen4_f16_wmma_gfx1201(&self) -> bool {
         self.arch_caps.is_gfx1201() && *QWEN4_F16_WMMA_GFX1201
     }
