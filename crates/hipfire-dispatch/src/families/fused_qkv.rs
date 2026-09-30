@@ -7,6 +7,22 @@ use crate::traits::KernelFamily;
 use crate::types::*;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
+/// Select the fused gate/up kernel key for a packed weight container.
+pub fn fused_gate_up_key_for(dtype: DType) -> KernelKey {
+    match dtype {
+        DType::MQ4G256V2 => KernelKey::FusedGateUpMq4G256V2,
+        DType::MQ4CG256 => KernelKey::FusedGateUpMq4CG256,
+        DType::MQ6G256V2 => KernelKey::FusedGateUpMq6G256V2,
+        DType::MQ5G256V2 => KernelKey::FusedGateUpMq5G256V2,
+        DType::MQ3G256V2 => KernelKey::FusedGateUpMq3G256V2,
+        DType::MQ2G256V2 => KernelKey::FusedGateUpMq2G256V2,
+        // qt=52 must NEVER alias a uniform fused key: no fused LUT kernel exists.
+        DType::MQ4G256V2Lloyd => panic!(
+            "fused_gate_up_key_for: MQ4G256V2Lloyd (qt=52) has no fused key — route Lloyd prefill through gemm_gate_up_hfq4g256_wmma_gfx12_mq4v2_fp8_lloyd"
+        ),
+        _ => KernelKey::FusedGateUpHfq4G256,
+    }
+}
 fn is_fused_hfq4_key(key: KernelKey) -> bool {
     matches!(
         key,

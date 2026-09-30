@@ -2144,6 +2144,21 @@ fn main() {
                 // BEFORE any destructive side effect so a refusal leaves the
                 // prior model usable. The retained SourceAdmission is consumed
                 // by the load route below — no re-open, no re-classify.
+                let qwen4_admission_options = hipfire_loader::admission::SourceAdmissionOptions {
+                    spec: spec_cfg,
+                    kv_adaptive: hipfire_loader::admission::qwen4_kv_adaptive_requested(
+                        kv_adaptive_override.as_deref(),
+                    ),
+                    eagle_drafter: gemma4_drafter.is_some(),
+                    cask: cask.sidecar.is_some(),
+                    state_quant: state_quant_override.is_some(),
+                    non_single_compute: !matches!(
+                        deepseek4_compute_placement,
+                        hipfire_config::Deepseek4ComputePlacement::Single
+                    ),
+                    expert_count_override: deepseek4_experts_per_token.is_some(),
+                    pflash: pflash_drafter.is_some() || pflash_mode_str != "off",
+                };
                 let backend_request = match hipfire_loader::admission::KvBackendRequest::from_override(
                     kv_backend_override.as_deref()
                 ) {
@@ -2154,7 +2169,7 @@ fn main() {
                         continue;
                     }
                 };
-                let admission = match hipfire_loader::admission::admit_source(
+                let admission = match hipfire_loader::admission::admit_source_with_options(
                     path, tp, pp, backend_request, draft_path.as_deref(),
                     gpu.arch.as_str(), vision_path.as_deref(), head_path.as_deref(), max_seq,
                     hipfire_loader::admission::KvBackendHints {
@@ -2168,6 +2183,7 @@ fn main() {
                         free_vram_bytes: gpu.hip.get_vram_info().ok().map(|(free, _)| free),
                         qwen_default_q8: hipfire_loader::admission::qwen_default_q8_enabled(),
                     },
+                    qwen4_admission_options,
                 ) {
                     Ok(a) => a,
                     Err(e) => {
@@ -2179,6 +2195,8 @@ fn main() {
                         continue;
                     }
                 };
+                let defer_prior_unload =
+                    load_tp > 1 || hipfire_loader::defers_prior_unload(admission.arch_id);
                 let max_seq = admission.max_seq;
                 let sequence_reason = admission.sequence_reason;
                 // Exactly one legacy warning per admitted trunk; loader admitted
@@ -2188,7 +2206,6 @@ fn main() {
                     admission.kv_backend,
                     admission.kv_backend_reason.as_deref(),
                 );
-
 
                 // Unload previous if any. PFlash drafter goes first so
                 // its tensors join the pool before unload_model drains
@@ -2209,7 +2226,7 @@ fn main() {
                 // the original order. (EP archs are ds4/minimax and refuse
                 // PFlash drafters, so on a SUCCESSFUL tp>1 load this just frees
                 // the outgoing model's drafter at the deferred site.)
-                if load_tp <= 1 {
+                if !defer_prior_unload {
                     if let Some(mut pf) = pflash_state.take() {
                         if let Some(mut dg) = pflash_drafter_gpu.take() {
                             dg.bind_thread_or_warn();
@@ -2316,21 +2333,7 @@ fn main() {
                         // its PFlash drafter) must survive every fallible
                         // stage of the new model so a staging failure rolls
                         // back only `m` and keeps the prior usable.
-                        let arch = match m.arch_id {
-                            5 => "qwen3_5",
-                            6 => "qwen3_5_moe",
-                            7 => "qwen2",
-                            8 => "dots-ocr",
-                            9 => "deepseek4",
-                            10 => "minimax_m2",
-                            11 => "lfm2moe",
-                            12 => "north_mini_code",
-                            13 => "gemma4",
-                            14 => "muse_glimmer",
-                            40 => "flux_mmdit",
-                            45 => "flux2_mmdit",
-                            _ => "qwen3",
-                        };
+                        let arch = hipfire_loader::arch_label(m.arch_id);
                         let drafter = m.speculator.as_ref().map(|speculator| speculator.name());
                         let redline_default = hipfire_runtime::config::retained_redline_default(
                             &gpu.arch,
@@ -2473,20 +2476,20 @@ fn main() {
                                 continue;
                             }
                         };
-                        // FIX #1 (deferred EP unload, after staging): the new
-                        // model is fully staged — NOW retire the prior model
-                        // before publishing (single-GPU/pp models were already
-                        // unloaded eagerly above; this branch only fires for
-                        // deferred tp>1). Prior PFlash drafter is part of that
-                        // prior model, so tear it down first in the same
-                        // drafter-before-unload order used elsewhere.
+                        // FIX #1 (deferred model retirement, after staging):
+                        // the new model is fully staged — NOW retire the
+                        // prior model before publishing. Single-GPU/pp models
+                        // are unloaded eagerly above; this branch handles
+                        // deferred TP or Qwen4 loads. Prior PFlash drafter is
+                        // part of that prior model, so tear it down first in
+                        // the same drafter-before-unload order used elsewhere.
                         //
                         // Transactional: if prior unload fails, do NOT install
                         // or emit `loaded` for the new model. Explicitly unload
-                        // the newly built EP model, clear associated fresh
-                        // state, and emit a hard error covering prior failure
-                        // and any rollback failure.
-                        if load_tp > 1 {
+                        // the newly built model, clear associated fresh state,
+                        // and emit a hard error covering prior failure and any
+                        // rollback failure.
+                        if defer_prior_unload {
                             if let Some(mut pf) = pflash_state.take() {
                                 if let Some(mut dg) = pflash_drafter_gpu.take() {
                                     dg.bind_thread_or_warn();
@@ -4440,20 +4443,7 @@ fn main() {
                 let has_model = model.is_some() || slot_backend.is_some();
                 let model_arch = model
                     .as_ref()
-                    .map(|m| match m.arch_id {
-                        5 => "qwen3_5",
-                        6 => "qwen3_5_moe",
-                        7 => "qwen2",
-                        9 => "deepseek4",
-                        10 => "minimax_m2",
-                        11 => "lfm2moe",
-                        12 => "north_mini_code",
-                        13 => "gemma4",
-                        14 => "muse_glimmer",
-                        40 => "flux_mmdit",
-                        45 => "flux2_mmdit",
-                        _ => "qwen3",
-                    })
+                    .map(|m| hipfire_loader::arch_label(m.arch_id))
                     .unwrap_or("none");
                 // Count pre-compiled kernels
                 let kernel_dir = std::env::current_exe()
@@ -4810,12 +4800,16 @@ fn main() {
                 // in which forward they call.
                 if m.pp > 1
                     || m.ep.is_some()
-                    || (m.arch_id != 5 && m.arch_id != 6 && m.arch_id != 13 && m.arch_id != 14)
+                    || (m.arch_id != 5
+                        && m.arch_id != 6
+                        && m.arch_id != 13
+                        && m.arch_id != 14
+                        && m.arch_id != 16)
                 {
                     emit_uncorrelated_error(
                         &mut stdout,
                         None,
-                        "bench_decode requires a single-GPU Qwen3.5, Gemma4, or Muse Glimmer model",
+                        "bench_decode requires a single-GPU Qwen3.5, Qwen4, Gemma4, or Muse Glimmer model",
                         "unsupported",
                         false,
                         false,
@@ -4888,6 +4882,7 @@ fn main() {
                 let prime_error: Option<String> =
                     match hipfire_loader::bench_decode_route(m.arch_id) {
                         hipfire_loader::BenchDecodeRoute::Qwen35
+                        | hipfire_loader::BenchDecodeRoute::Qwen4
                         | hipfire_loader::BenchDecodeRoute::Gemma4
                         | hipfire_loader::BenchDecodeRoute::MuseGlimmer => {
                             hipfire_loader::carrier_for(m.arch_id)
@@ -4947,6 +4942,7 @@ fn main() {
                 let mut decode_err: Option<String> = None;
                 let run_ok = match hipfire_loader::bench_decode_route(m.arch_id) {
                     hipfire_loader::BenchDecodeRoute::Qwen35
+                    | hipfire_loader::BenchDecodeRoute::Qwen4
                     | hipfire_loader::BenchDecodeRoute::Gemma4
                     | hipfire_loader::BenchDecodeRoute::MuseGlimmer => {
                         hipfire_loader::carrier_for(m.arch_id)

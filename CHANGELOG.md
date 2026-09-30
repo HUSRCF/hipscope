@@ -62,6 +62,225 @@
     - **gfx1151 decode norms as multi-workgroup grids.** `kernel.g12_dec_norm` now defaults on for exact gfx1151 too: the f32 AWQ RMSNorm+FWHT producer before every MQ4 input projection runs `fused_rmsnorm_mq_rotate_awq_g12dec` on grid K/256, the out-of-place single-row `rmsnorm_f32` (n > 256) runs `rmsnorm_f32_rowsplit` on n/256 workgroups, and the half-split partial RoPE runs `rope_partial_halfsplit_f32_headgrid` with one workgroup per head. Same sources as gfx1201; the outputs are byte-identical on real H2 decode activations at ctx 512/8,192/32,768 (whole buffer + guards, 3 poisons, negative controls detected, 200× serial and 200× under a one-CU mask, RoPE positions 0…262,144). Standalone on the Halo: AWQ K = 5,120 5.96 → 3.16 µs, `rmsnorm_f32` n = 5,120 6.77 → 2.49 µs, RoPE 5.08 → 2.20 µs. H2 tg128, same binary, four fresh processes per arm, ABBA then BAAB, `hipfire bench --pp 8192 --ctx 512,8192,32768 --tg 128 --backend noslots --workload stateless`, graph on, Q8 KV: off → on 14.958 → 15.079 / 14.583 → 14.700 / 13.678 → 13.779 tok/s at ctx 512/8,192/32,768 (+0.81 %/+0.80 %/+0.74 %; ABBA +0.116/+0.113/+0.100, BAAB +0.121/+0.115/+0.100 tok/s), every on process ahead of every off process; pp8192 1,162.45 → 1,157.55 tok/s, within noise (halves +36.65 / −42.70).
     - **gfx1151 Q8_0 decode attention: GQA-shared flash tile + head-dim-split reduce.** On exact gfx1151, Q8_0 KV, head_dim 256, GQA group 6, tile 128, full causal and no output gate (H2 decode), `attention_flash_q8_0_tile_gqa_gfx1151` replaces `attention_flash_q8_0_tile`: one 256-thread workgroup per (kv head, tile) serves the six q heads, so each Q8_0 K/V tile is read once, and the whole tile's Q, V rows and K codes/scales are issued at entry; each 16-lane row reproduces the reference lanes' dequant (`scale * code`, one rounding), fma leaf order and xor-16…1 add tree, softmax and in-order V accumulation. `attention_flash_reduce_dsplit_gfx1151` (the gfx1201 head-dim-split reduce, renamed) replaces `attention_flash_q8_0_reduce`. The tile grid is capped at 512 tiles with a tile loop. Redline's replay tables type both kernels with their reference twins' 13/7-argument ABIs and pointer effects. Standalone on the Halo, the tile + reduce pair at seq 517 / 8,197 / 32,773: 45.77 → 22.56 / 200.62 → 120.59 / 663.24 → 401.71 µs. The outputs are byte-identical to beta's objects on real H2 decode activations (seq C+1…C+4 for C = 512/8,192/32,768, full-attention layers 0/7/15: 36/36 captures, 3 poisons, graph and eager grids, whole buffer + guards, a one-K-code-byte negative control detected in all 36, 200× serial and 200× under a one-CU mask, 60 s soak). H2 tg128, same binary, four fresh processes per arm, ABBA then BAAB: off → on 14.974 → 15.079 / 14.459 → 14.698 / 13.108 → 13.777 tok/s (+0.70 %/+1.65 %/+5.10 %; ABBA +0.106/+0.242/+0.671, BAAB +0.099/+0.233/+0.663 tok/s), every on process ahead of every off process; pp8192 1,154.90 → 1,154.25 tok/s, within noise (halves +38.35 / −8.30).
     - **Both levers together** (same binary, both opt-outs vs defaults, four fresh processes per arm, ABBA then BAAB): 14.853 → 15.080 / 14.346 → 14.699 / 13.014 → 13.778 tok/s at ctx 512/8,192/32,768 (+1.53 %/+2.46 %/+5.87 %; ABBA +0.225/+0.352/+0.761, BAAB +0.230/+0.355/+0.768 tok/s), every on process ahead of every off process; pp8192 1,152.2 → 1,156.6 tok/s, within noise (halves +7.55 / −0.95). Checks: 256-step greedy logits equal beta at ctx 512/8,192/32,768 (synthetic and WikiText-2 primes, every step's whole logits + hidden, final KV arena + DeltaNet), with the opt-out arm (both levers off) also equal to beta; one continuous 32,788-step greedy decode (positions 512 … 33,299) is byte-identical to beta at every step; the Halo KLD pins `c1056943…` (WT2) / `04f06883…` (code24) are unchanged.
+
+- Qwen4 raw-I64 PLE metadata records are HFQM qt=54 (qt=52 is MQ4G256V2L).
+  The published `qwen3.8:flash-next` and `qwen3.8:flash-next-mq6q8-pleq8`
+  files were re-tagged in place (payloads unchanged) and re-pinned; the loader
+  refuses the old qt=52 spelling, so re-pull them.
+
+- Qwen4 native MTP is now on by default: `speculation.mtp = auto` attaches the
+  MTP head, where before only an explicit `on` did. Greedy requests then run
+  MTP (1.77x AR decode on `qwen3.8-flash-next.mq4`, tokens equal to AR's).
+  Sampled requests stay on the AR route, and attaching the head showed no
+  measurable prefill cost. `speculation.mtp = off` keeps AR.
+  A `.mq4r` load is the exception: there the retained Redline default stays
+  in force. Its tape is the single-row AR forward, which no MTP window runs,
+  so under `auto` the load stays AR, and an explicit `on` still refuses.
+
+- Qwen4 MTP draft head runs as one engine `Step` list: the prologue
+  (`Embed`, `HyperNorm`, `Project`, `BroadcastAdd`), HC read/write, indexed
+  attention (new `IndexedAttentionMode` append-only and selection-reuse
+  modes), MoE and final HC read execute through `hipfire_dispatch`, and the
+  draft ranking moved to the shared `DraftHead`. Greedy MTP tokens still
+  equal AR's; 9-prompt MTP geomean 59.37 → 59.04 tok/s (best of 3, within
+  noise), mean tau unchanged at 2.10.
+
+- Qwen4 decode 32.4 → 33.4 tok/s on gfx1151 (1131-token prompt, 5 runs,
+  same binary), prefill unchanged at ~1255 tok/s:
+  - Single-token forwards also read the shared expert as load-time Q8_0
+    copies (+0.25 GB, like the HC read projections); 32.4 → 32.8 tok/s on
+    the published `qwen3.8-flash-next.mq6q8-pleq8`.
+  - Recipe r2, `qwen3.8-flash-next.mq4` (125288540696 B,
+    quantized from the BF16 checkpoint): the language head ships MQ6G256V2
+    instead of Q8F16 (−0.18 GB read per token); every other tensor is
+    unchanged. 32.8 → 33.4 tok/s. KLD against the BF16 source, 32 chunks:
+    decode route 0.07539 → 0.07602, prefill route 0.07347 → 0.07432.
+    Published on HF `hipfire-models/qwen3.8-flash-next`; `qwen3.8:flash-next`
+    now pulls it (tier tag `qwen3.8:flash-next-mq4`), and the previous file
+    stays available as `qwen3.8:flash-next-mq6q8-pleq8`.
+  - Measured and not taken: Q8 in the file for the shared expert, the PLE
+    key/value and the HC read projections. Decode already reads Q8 copies
+    of the matrices it streams, while prefill then lost its BF16 source
+    (prefill-route KLD +0.0035) and short prompts had no fast exact Q8
+    multi-row GEMM (+46% prefill time at ~100 tokens).
+
+- Qwen4 native MTP decode on gfx1151: 28.7 → 54.1 tok/s (geomean of the
+  committed code and prose prompts, greedy, `qwen3.8-flash-next.mq6q8-pleq8`;
+  AR ~33 on the same build), with greedy MTP tokens equal to AR's. The 2..8-row
+  verify forward is now bitwise the single-row decode route and ~2x cheaper
+  than before (HC Q8 copies, staged Q8 LM head and MQ6 kernels over all rows,
+  fused HC write+norm, per-slot MoE down, and ~35% fewer launches: fused
+  rotations, QSA prologue, GDN conv+params, grouped-MoE round trips, router,
+  unscatter and shared activation); the verify keeps only its last GDN state
+  and a rejected suffix re-runs the kept rows' recurrence for every GDN layer
+  in one launch, and state snapshots copy in one launch; each window picks
+  the draft depth (or the interleaved route) from per-depth draft agreement
+  and stops early once the drafts' exact logit margins make the prefix
+  unlikely to be accepted;
+  drafts come from an MQ2 copy of the LM head re-scored exactly on its top 8
+  (`HIPFIRE_MTP_DRAFT_HEAD`), ranking only token ids below 100 000 plus the
+  control tokens until an input token outside them appears, and the MTP
+  head's attention, selection reuse and chain-final K/V-only steps no longer
+  stall or waste work. SSD-resident PLE rows are read concurrently and warmed
+  while drafting, which also helps AR decode on cold rows.
+  `HIPFIRE_MTP_INCREMENTAL` unset now means adaptive (`0` batched, `1`
+  interleaved).
+  The re-score reads a Q8_0 or MQ6G256V2 head. On `qwen3.8-flash-next.mq4`
+  (MQ6G256V2 head) it lifts greedy MTP from 55.4 to 59.5 tok/s (geomean over
+  9 committed prompts, 3 interleaved rounds; mean tau 1.89 → 2.10), level
+  with the same artifact carrying a Q8_0 head (59.2), whose AR is 1.6% slower
+  (33.1 vs 33.7).
+  [The checkpoint](docs/perf-checkpoints/2026-09-28-qwen4-mtp-decode-autoresearch-gfx1151.md)
+  and amendments [1](docs/perf-checkpoints/2026-09-28-qwen4-mtp-decode-autoresearch-gfx1151-amendment-1.md),
+  [2](docs/perf-checkpoints/2026-09-28-qwen4-mtp-decode-autoresearch-gfx1151-amendment-2.md).
+
+- Qwen4 decode on gfx1151: 19.2 → 32.3 tok/s (1131-token prompt, greedy,
+  `qwen3.8-flash-next.mq6q8-pleq8`). Per-token dispatches drop by fusing the
+  small kernels between the streaming GEMVs (HC write + next HC read norm and
+  the next write's gate, QSA decode prologue, GDN step + gated norm + output
+  rotation, rotations written by their producers) and latency-bound kernels
+  issue their loads up front. Pure-greedy sampling takes the argmax on the GPU
+  (`argmax_f32` now matches `llama::argmax`: first finite maximum), and the
+  greedy token feeds the next forward on the device, read back only at the
+  PLE layer, so the token boundary no longer idles the GPU. One change
+  (four-wave K split of the decode HC GEMVs) moves numerics and lowers decode
+  KLD (32 chunks 0.075160 → 0.074299); every other change is bit-exact.
+  Then 30.0 → 32.3 tok/s: single-token forwards on gfx1151 read the HC read
+  projections as Q8_0 requantized from BF16 at load (+0.67 GB; prefill keeps
+  BF16), decode KLD 0.074299 → 0.075390 over 32 chunks (paired t 1.59, inside
+  the noise band).
+  [The checkpoint](docs/perf-checkpoints/2026-09-27-qwen4-decode-autoresearch-gfx1151.md).
+
+- Qwen4 prefill on gfx1151: 185 → 1301 tok/s on a 1131-token prompt
+  (TTFT 6.10 → 0.87 s; decode unchanged at ~20 tok/s) for
+  `qwen3.8-flash-next.mq6q8-pleq8`. Routed MoE gate/up (the WMMA kernel from
+  PR #775, @nwoolmer) and down, the BF16 dense projections (through a
+  model-lifetime F16 weight shadow), the HC
+  read, full-window QSA attention and the chunked GDN recurrence run on F16
+  WMMA from 512 tokens; KLD against the BF16 source is 0.073471 against
+  0.074745 bit-exact, not separated. `HIPFIRE_QWEN4_F16_WMMA=0` keeps the
+  bit-exact arms. Every other change is bit-exact. Method, per-run ledger and
+  reusable levers:
+  [the checkpoint](docs/perf-checkpoints/2026-09-26-qwen4-prefill-autoresearch-gfx1151.md).
+
+- The Qwen4 routes tuned on gfx1151 now dispatch by ISA capability, on by
+  default wherever their kernels exist: the SIMT/LDS kernels (BF16 multirow,
+  MQ4G128 multirow, MoE O4xR8/O8xR16, GDN/HC/QSA fusions) on gfx11 and gfx12
+  (`has_gfx11_plus_simt`), the gfx11 WMMA kernels (F16 prefill, MQ6 X-LDS,
+  QT53 down, GDN chunk, QSA dense, HC WMMA read) on every gfx11 GPU
+  (`has_wmma_w32`); the grouped gate/up F16 WMMA F32 arm also uses its gfx12
+  sibling. `HIPFIRE_QWEN4_GFX11` is removed. Measured only on gfx1151; gfx12
+  runs the portable kernels where no gfx12 WMMA port exists.
+
+- Review follow-up: Qwen4's grouped QT44/QT53 route now carries an
+  architecture-declared geometry/format contract and remains limited to its
+  proven gfx1151 kernel shape. Shared tensor ops use portable HIP fallbacks
+  off the Qwen4-tuned GPUs; pipeline steps are immutable, with QSA bookkeeping owned by
+  the caller and granular MoE stages sharing one step variant. Qwen4 admission
+  is carrier-owned, its HIP source lives under `kernels/src/`, and reference
+  MTP/parity code requires the `reference-parity` feature outside tests.
+
+- Qwen4 Flash-Next MTP now preserves the trained head's final HC mixer and
+  QSA cadence, and keeps routed MoE output separate from shared-expert scratch.
+  On gfx1151 a shared-weight F32 MQ6 verifier matches scalar target rows
+  exactly; recent acceptance selects it for high-agreement windows.
+  Teacher-forced MTP steps omit unused logits, and target prefill computes only
+  its final logit row. The canonical greedy fixtures emit AR-identical tokens;
+  three fresh-process runs per mode reached decode parity on code and prose,
+  not the 80% speculative speedup seen elsewhere.
+
+- Qwen4 decode now runs on the retained PM4 route end to end on gfx1151. The
+  specialized sealed-MoE route is admitted on evidence rather than argument: the
+  capture census reconciles against an independent launch count (2845 recorded plus
+  3 named external input-boundary launches), is stable across positions, and the
+  window contains no device copy, memset or readback — the per-layer `Clear` and the
+  QSA/depthwise device copies are now recorded launches (`zero_f32`,
+  `copy_f32_buffer`). At launch the retained body also proves the expert pointer
+  tables name the live expert tensors and that each table's pointer mapping is the
+  one the tape latched. The eligible-forward boundary moved into the Qwen4 forward
+  so the tape covers only the body, and replay and HIP derive the same per-layer
+  QSA bookkeeping before executing it. Measured: a 116-token
+  greedy prompt decoded through 115 retained PM4 replays produces the byte-identical
+  stream. REDLINE §7 certification (shadow parity, route-proof ledger, serve,
+  long-context, reset) is not claimed by this change; see
+  [the plan record](docs/design/qwen4-program-retained-pm4.md).
+- Retained capture now has a diagnostic census for the Qwen4 declarative program
+  (`HIPFIRE_REPLAY_DIAGNOSTIC_SPECIALIZED_MOE_CAPTURE=1`, measurement only: it never
+  installs a plan and never routes). It reconciles the retained tape against an
+  independent `hip_bridge` launch count, audits non-launch effects inside the
+  capture window, and names any kernel that escaped the recorder. First use found
+  one such launch (`Gpu::add_f32` was raw while a funnel-based twin existed for the
+  same kernel — now a single funnel path with the twin deleted and its callers
+  migrated), proved the decode body's launch set position-stable across prompt
+  lengths, and quantified the remaining admission blocker: per decode forward the
+  window still contains 48 layer memsets, 13 device-to-device state copies and 2
+  host uploads, none of which a launch tape replays. Admission therefore stays
+  refused. See [the plan record](docs/design/qwen4-program-retained-pm4.md).
+- Retained replay no longer refuses the *whole model* when a family's MoE route has no
+  admitted pointer contract: the specialized sealed-MoE guard is now scoped to the
+  retained body (`is_recording()` or a routed plan), so prefill, ineligible forwards,
+  and an already-poisoned route keep running on HIP. Qwen4 gained the corresponding
+  engine-level retained-body discipline in `hipfire-generate` (prefill ineligible;
+  single-token decode poisons and logs when the route cannot be retained; a body
+  failure inside a capture window poisons instead of failing every later forward; a
+  routed-but-unprepared state fails closed). With the Redline default armed, the
+  `.mq4r` Qwen4 artifact now loads, prefills, and generates on HIP with the refusal
+  reason logged, byte-identical to the explicit HIP baseline; capture stays
+  fail-closed, and `hipfire-arch-qwen4` still carries no replay code. See
+  [the plan record](docs/design/qwen4-program-retained-pm4.md).
+- Qwen4 QSA launches now declare position-independent shapes and position-derived
+  fields, so a retained tape cannot bake a capture position into them. The pool
+  grid, the select LDS/symbol, and the attention LDS/symbol come from declared
+  capacities while the active lengths stay scalars; `position_start` and the
+  pooling count are declared at the launch that computes them (the pooling-count
+  declaration is verified against the launched value); and the index-key write
+  passes its row offset as a scalar (`ReplayKernargBinding::PositionMulU32`)
+  instead of a position-shifted device pointer, which required
+  `copy_rows_strided_f32` to bound a row-absolute column offset by the destination
+  extent rather than by one row pitch. Measured on gfx1151: pinned shapes are
+  bit-identical to the position-derived ones (including the batched select symbol
+  at an active count of zero), a 116-token greedy stream is byte-identical across
+  5 interleaved fresh-process pairs with equal tok/s medians, and no route is
+  admitted. See [the plan record](docs/design/qwen4-program-retained-pm4.md).
+- Retained-replay funnel coverage for the Qwen4 declarative program: the shared
+  tensor-op owner (`rdna-compute::tensor_ops`) launched every Qwen4 GDN/QSA/HC
+  op through the raw `launch_kernel_blob` entry, so those launches never reached
+  `ReplayController` and a capture would have been a silently truncated tape.
+  A new `Gpu::launch_blob_recorded` entry joins the same recorder, exact-bytes
+  capture, and HipGraph capture-blob accounting as the params-shaped funnel, and
+  all 31 raw sites migrated to it. Dynamic kernarg fields can now be *declared*
+  at the lowering that computes them (`ReplayKernargBinding::PositionDivU32` /
+  `PositionModU32`, carried on the recorded launch and merged at prepare with
+  one owner per slot); the GDN convolution ring cursor declares the first such
+  binding instead of being discovered by recording differencing. No route is
+  admitted, no PM4 preparation is claimed, and the sealed-MoE pointer-contract
+  refusal for specialized routes still fails closed. See [the plan record](docs/design/qwen4-program-retained-pm4.md).
+- Rename Qwen4 CPU/reference modules to `reference_forward` and `reference_mtp`; production `gpu_forward`/`mtp_gpu` paths remain unchanged, the old public module paths are removed, and the reference modules are test/feature-gated.
+- Sealed MoE calls lower to granular computation programs; Qwen root-routed EP decode and batched prefill share a checked collective schedule. Compact EP gathers expert outputs in global top-k slot layout and runs the ordinary single-device slot-order combine once on root before byte-broadcasting the finished partial, avoiding rank-grouped floating-point reassociation. Existing kernels, ownership, other-family reduction order, and diagnostic policies are retained. This does not admit new parallel axes or product replay routes; see [the design and validation boundary](docs/design/sealed-granular-moe.md).
+- Add experimental `qwen3.8:flash-next` registry availability for the uploaded 178 GB HFQ artifact with a conservative 128 GB tested-hardware gate; the runtime minimum is unmeasured, and this does not change product or replay admission.
+- Qwen4's production layer path now binds architecture-owned typed
+  descriptors to neutral shared HyperRead/Write, GDN, QSA, grouped-depthwise,
+  Clear, and sealed-MoE contracts. Composite steps are preflighted before
+  token/embedding/PLE effects, exact row views preserve reusable arena
+  capacity semantics, and QSA scalar metadata publishes only after success.
+  Gfx1151 two-token and full natural `[128,128,35]` scalar/natural smokes are
+  bit-exact; the full oracle also matches the immutable original, frozen HC,
+  and frozen N8 references. Corrected AR and native MTP serve smokes both
+  return `Paris` with `finish=stop`, `saw_done=true`, nonempty output, no
+  runaway, and no stream error; MTP reports `tau=1.0`, one cycle, and
+  `mtp=true`. This is an ownership/correctness seam only: no replay/PM4,
+  throughput, or quality promotion claim. See [the current ownership
+  record](docs/design/qwen4-shared-token-batched-prefill-progress-20260918.md).
+- Qwen4's centralized bounded token-batched prefill now carries conservative HC row/grid-Y batching with scalar rows=1 unchanged and exact natural 128/128/35 oracle parity. Explicit marker evidence records frozen-N8 natural HC calls 112,326 versus candidate 1,158; fresh product ABBAAB remains below the requested 500 prefill / 25 decode tok/s thresholds (both open/blocked), with no product throughput or decode-win claim. A deterministic Paris fixture independently passes ordinary AR and native MTP correctness. See [the implementation record](docs/design/qwen4-shared-token-batched-prefill-progress-20260918.md) and [the historical measurement](docs/perf-checkpoints/2026-09-19-qwen4-hc-rows-gridy-final-measurement.md).
+- The Qwen4 `gfx1151` prefill tuning lineage is documented across six staged
+  levers: QSA selection-only, QSA selection-plus-attention, the selection
+  sentinel, GDN shared exact-128 BF16 QK norm, the N8 measured-prefill
+  multirow allowlist, and HC rows/grid-Y batching. These remain fixture-bound
+  engineering records rather than six product promotions; see the
+  [six-lever lineage](docs/design/qwen4-shared-token-batched-prefill-progress-20260918.md)
+  and [final HC measurement](docs/perf-checkpoints/2026-09-19-qwen4-hc-rows-gridy-final-measurement.md).
+- Add developer-only `HIPFIRE_EMULATE_GPUS` logical-rank aliasing and a single-gfx1151 Qwen EP4 batch diagnostic exception. Physical-device admission remains unchanged; logical-rank results do not prove physical EP transport, performance, or G5 acceptance.
+- Fix grouped expert-parallel MoE outputs: rank-local down projections are unscattered to canonical token/top-k slots before gathering across ranks, so root combines in single-device slot order.
 - **gfx1201 decode + Strix Halo round 4 (H2): retained Redline PM4 becomes the default gfx1201 decode backend for single-GPU Qwen3.5 dense, and lands with the gfx1201 decode norm grids, the gfx1201 GQA fp8 decode attention and the gfx1151 prefill round 4 (all byte-identical; R9700 H2 decode 36.44 → 38.89 / 35.28 → 38.08 / 31.44 → 35.93 tok/s at ctx 512/8,192/32,768, +6.71 %/+7.91 %/+14.30 %; Halo pp8192 1,128.1 → 1,140.9 tok/s).** gfx1201 decode goes from 27.44/28.34/31.81 to 25.72/26.26/27.83 ms per token against beta `1621a0090`. That was measured with separate md5-pinned binaries, four fresh processes per arm, ABBA +6.46/+7.77/+14.02 % then BAAB +6.64/+7.87/+14.29 %, `hipfire bench --pp 128 --ctx 512,8192,32768 --tg 128`, graph on, fp8 KV, 300 W. Every land process beat every beta process at every context. Each lever is priced by switching it off in the land binary, as tok/s gained with it on: Redline PM4 +2.16/+2.31/+2.25 % (−0.56/−0.61/−0.63 ms); DecNorm +1.41/+1.54/+1.52 % (−0.36/−0.41/−0.42 ms); DecAttn +2.16/+3.31/+9.99 % (−0.55/−0.87/−2.78 ms). In each of those comparisons, every default process beat every opted-out process. With Redline switched off (`replay.backend = "hip"`), the land binary still gains +4.45/+5.48/+11.78 % over beta. gfx1201 pp8192 is unchanged: 5,134.1 → 5,138.4 tok/s (+0.08 %) on the default route and 5,142.8 (+0.17 %) with `replay.backend = "hip"`. All four gfx1201 WT2/code24 `.kldseq` pins are unchanged (A4 `483cfc58…`/`6339dc9e…`, fp8 `19227d5f…`/`5e7ac9dc…`). On the default route, greedy decode (256 steps at ctx 512/8,192/32,768, synthetic and WikiText-2 primes) is byte-identical to beta: every step's logits and hidden state, plus the final KV arena and DeltaNet state. The Halo keeps both `.kldseq` pins (`c1056943…`/`04f06883…`) and its greedy decode text (`bd30cd27…`). Against the same beta, Halo pp8192 went +0.94 % (ABBA) and +1.20 % (BAAB), every land process ahead of every beta process, with tg1 unchanged. gfx1100 objects are unchanged. Opt-outs:
   - `HIPFIRE_G12_DEC_NORM=0` (or `kernel.g12_dec_norm = false`) turns off DecNorm.
   - `HIPFIRE_FP8_DECODE_ATTN_GQA=0` turns off DecAttn.

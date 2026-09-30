@@ -78,6 +78,16 @@ pub trait Carrier: Send + Sync {
         Ok(())
     }
 
+    /// Read-only, per-carrier request-option refusal before GPU allocation.
+    /// The default leaves other architectures' option behavior unchanged.
+    fn admit_options(
+        &self,
+        _draft_path: Option<&str>,
+        _options: admission::SourceAdmissionOptions,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Declared capabilities for this arch. Default is the conservative
     /// “no capability” set — carriers override to declare what they support.
     fn caps(&self) -> saddle_core::caps::ArchCaps {
@@ -234,6 +244,7 @@ pub enum BenchDecodeRoute {
     Qwen35,
     Gemma4,
     MuseGlimmer,
+    Qwen4,
     Unsupported,
 }
 pub fn bench_decode_route(arch_id: u32) -> BenchDecodeRoute {
@@ -243,8 +254,36 @@ pub fn bench_decode_route(arch_id: u32) -> BenchDecodeRoute {
         5 | 6 => BenchDecodeRoute::Qwen35,
         13 => BenchDecodeRoute::Gemma4,
         14 => BenchDecodeRoute::MuseGlimmer,
+        16 => BenchDecodeRoute::Qwen4,
         _ => BenchDecodeRoute::Unsupported,
     }
+}
+
+/// The daemon's stable per-arch label: the retained-Redline config key and
+/// the status `model_arch` field. Unlisted ids read as dense `qwen3`.
+pub fn arch_label(arch_id: u32) -> &'static str {
+    match arch_id {
+        5 => "qwen3_5",
+        6 => "qwen3_5_moe",
+        7 => "qwen2",
+        8 => "dots-ocr",
+        9 => "deepseek4",
+        10 => "minimax_m2",
+        11 => "lfm2moe",
+        12 => "north_mini_code",
+        13 => "gemma4",
+        14 => "muse_glimmer",
+        16 => "qwen4",
+        40 => "flux_mmdit",
+        45 => "flux2_mmdit",
+        _ => "qwen3",
+    }
+}
+
+/// Whether this arch, like every tp>1 load, is fully staged before the prior
+/// model is retired, so a failed load leaves the prior model usable.
+pub fn defers_prior_unload(arch_id: u32) -> bool {
+    arch_id == hipfire_arch_qwen4::ARCH_ID
 }
 
 /// Vision route. `None` = no vision encoder (text-only). The daemon still
@@ -361,6 +400,7 @@ pub fn generation_early_route(arch_id: u32) -> Option<GenerationEarlyRoute> {
 
 const REGISTRY: &[&dyn Carrier] = &[
     &Qwen2Carrier,
+    &Qwen4Carrier,
     &Qwen35Carrier,
     &LlamaCarrier,
     &DotsOcrCarrier,
@@ -1071,6 +1111,19 @@ impl LoadedModel {
         self.state
             .as_deref_mut()
             .and_then(|s| (s as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>())
+    }
+
+    /// Qwen4 bundle if this model is arch_id=16, else None.
+    pub fn qwen4(&self) -> Option<&hipfire_arch_qwen4::bundle::Qwen4Bundle> {
+        self.state
+            .as_deref()
+            .and_then(|s| (s as &dyn Any).downcast_ref::<hipfire_arch_qwen4::bundle::Qwen4Bundle>())
+    }
+
+    pub fn qwen4_mut(&mut self) -> Option<&mut hipfire_arch_qwen4::bundle::Qwen4Bundle> {
+        self.state.as_deref_mut().and_then(|s| {
+            (s as &mut dyn Any).downcast_mut::<hipfire_arch_qwen4::bundle::Qwen4Bundle>()
+        })
     }
 
     pub fn llama(&self) -> Option<&hipfire_arch_llama::LlamaBundle> {
@@ -2350,8 +2403,7 @@ pub fn load_model_with_gemma4_drafter(
     // Validate draft_len early (refuse-don't-degrade, same rule as daemon).
     let _ = gemma4_eagle_spec_len(Some(gemma4_draft_len as u64))
         .map_err(|e| format!("gemma4 drafter: {e}"))?;
-    // Classify once and admit before any side effect (source-aware admission).
-    let admission = crate::admission::admit_source(
+    let admission = crate::admission::admit_source_with_options(
         path,
         1, // this entry serves tp<=1
         pp,
@@ -2371,6 +2423,19 @@ pub fn load_model_with_gemma4_drafter(
             deepseek4_heterogeneous: !matches!(deepseek4_compute_placement, hipfire_config::Deepseek4ComputePlacement::Single),
             vmm_runtime_available: gpu.vmm_recommended_granularity().is_ok(),
             free_vram_bytes: gpu.hip.get_vram_info().ok().map(|(free, _)| free),
+        },
+        crate::admission::SourceAdmissionOptions {
+            spec,
+            kv_adaptive: crate::admission::qwen4_kv_adaptive_requested(kv_adaptive_override),
+            eagle_drafter: gemma4_drafter_path.is_some(),
+            cask: cask.sidecar.is_some(),
+            state_quant: state_quant_override.is_some(),
+            non_single_compute: !matches!(
+                deepseek4_compute_placement,
+                hipfire_config::Deepseek4ComputePlacement::Single
+            ),
+            expert_count_override: deepseek4_experts_per_token.is_some(),
+            pflash: false,
         },
     )?;
     let warning = crate::admission::legacy_warning(
@@ -4187,9 +4252,8 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
                         let _ = dev.bind_thread();
                         if let Err(e) = kv.free_gpu(dev) {
                             if ep_first_err.is_none() {
-                                ep_first_err = Some(format!(
-                                    "unload dense qwen TP KV rank {rank}: {e:?}"
-                                ));
+                                ep_first_err =
+                                    Some(format!("unload dense qwen TP KV rank {rank}: {e:?}"));
                             }
                         }
                         // Per-rank VMM teardown gate (mirrors the single-GPU
@@ -4198,9 +4262,8 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
                         // success for contiguous (no arenas registered).
                         if let Err(e) = dev.ensure_vmm_cleaned() {
                             if ep_first_err.is_none() {
-                                ep_first_err = Some(format!(
-                                    "unload dense qwen TP VMM rank {rank}: {e:?}"
-                                ));
+                                ep_first_err =
+                                    Some(format!("unload dense qwen TP VMM rank {rank}: {e:?}"));
                             }
                         }
                     }
@@ -4911,14 +4974,15 @@ mod registry_tests {
             );
         }
 
-        // ── bench_decode_route: 9, 11, 5|6, 13, 14; everything else Unsupported ──
-        for id in 0u32..=14 {
+        // ── bench_decode_route: 9, 11, 5|6, 13, 14, 16; everything else Unsupported ──
+        for id in 0u32..=16 {
             let want = match id {
                 9 => BenchDecodeRoute::Deepseek4,
                 11 => BenchDecodeRoute::Lfm2Moe,
                 5 | 6 => BenchDecodeRoute::Qwen35,
                 13 => BenchDecodeRoute::Gemma4,
                 14 => BenchDecodeRoute::MuseGlimmer,
+                16 => BenchDecodeRoute::Qwen4,
                 _ => BenchDecodeRoute::Unsupported,
             };
             assert_eq!(bench_decode_route(id), want, "bench_decode_route({id})");

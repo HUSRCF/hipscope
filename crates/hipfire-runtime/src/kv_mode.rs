@@ -403,6 +403,34 @@ pub const MAPLE_POLICY: KvModePolicy = KvModePolicy {
     default: Bf16,
 };
 
+/// Reserved Qwen4 route: the current KV implementation is BF16 only. Keep
+/// aliases local so an explicit q8/rotated mode cannot be silently rewritten
+/// by the generic fallback resolver.
+fn normalize_qwen4(raw: &str) -> Option<KvMode> {
+    match raw {
+        "" | "auto" | "bf16" => Some(Bf16),
+        _ => None,
+    }
+}
+
+pub const QWEN4_POLICY: KvModePolicy = KvModePolicy {
+    site: "qwen4",
+    normalize_alias: normalize_qwen4,
+    accepted: &[Bf16],
+    default: Bf16,
+};
+
+/// Strict Qwen4 policy resolution. Unsupported explicit modes are refused
+/// before the generic [`resolve`] fallback can rewrite them to BF16.
+pub fn resolve_qwen4(raw: &str, _head_dim: usize) -> Result<ResolveResult, String> {
+    if !raw.is_empty() && normalize_qwen4(raw).is_none() {
+        return Err(format!(
+            "unsupported qwen4 kv mode {raw:?}; explicit mode must be one of: bf16"
+        ));
+    }
+    Ok(resolve(raw, &QWEN4_POLICY))
+}
+
 /// Pure: `&str + &'static policy → ResolveResult`. No GPU, no env read.
 /// Non-Qwen / Maple / legacy single-string path. Qwen pair sites prefer
 /// [`resolve_kv_pair`].
@@ -756,6 +784,29 @@ mod tests {
         let garbage = resolve("garbage", p);
         assert_eq!(garbage.mode, KvMode::Bf16);
         assert!(garbage.warning.is_some());
+    }
+
+    #[test]
+    fn qwen4_is_bf16_only_and_rejects_before_fallback() {
+        let p = &QWEN4_POLICY;
+        for raw in ["", "auto", "bf16"] {
+            let resolved = resolve_qwen4(raw, 256).expect("Qwen4 BF16 alias");
+            assert_eq!(resolved.mode, KvMode::Bf16);
+            assert!(resolved.warning.is_none());
+        }
+        for raw in ["q8", "asym3", "garbage"] {
+            let error = match resolve_qwen4(raw, 256) {
+                Ok(_) => panic!("explicit unsupported mode {raw} must be rejected"),
+                Err(error) => error,
+            };
+            assert!(error.contains("qwen4"));
+            assert!(error.contains(raw));
+            assert_eq!(resolve(raw, p).mode, KvMode::Bf16);
+            assert!(
+                resolve(raw, p).warning.is_some(),
+                "generic resolver remains fallback-and-warning only"
+            );
+        }
     }
 
     #[test]
