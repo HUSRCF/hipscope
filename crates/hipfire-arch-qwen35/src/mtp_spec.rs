@@ -398,6 +398,12 @@ pub struct MtpSpecState {
     /// into the MTP head's first step each cycle. Shape: `[dim]` F32.
     pub prev_hidden: GpuTensor,
 
+    /// Trunk position whose hidden `prev_hidden` holds, or `None` after a
+    /// reset. The MTP head pairs token `p` with the hidden of position
+    /// `p - 1`, so a fill starting at `start_pos` may reuse `prev_hidden`
+    /// only when this is `Some(start_pos - 1)`.
+    pub prev_hidden_pos: Option<usize>,
+
     /// Per-cycle scratch: post-output-norm hidden states from the trunk
     /// verify, one row per verify position. Shape: `[(max_n + 1) × dim]` F32.
     pub verify_hidden: GpuTensor,
@@ -673,6 +679,7 @@ impl MtpSpecState {
 
         Ok(Self {
             prev_hidden,
+            prev_hidden_pos: None,
             verify_hidden,
             verify_logits,
             verify_rot,
@@ -777,10 +784,11 @@ impl MtpSpecState {
     /// call. Source is `target.scratch.tmp` (same buffer lm_head reads from).
     /// Call once after prefill's last `forward_scratch` to seed the cycle.
     pub fn capture_prev_hidden_from_scratch_tmp(
-        &self,
+        &mut self,
         gpu: &Gpu,
         target_scratch_tmp: &GpuTensor,
         dim: usize,
+        pos: usize,
     ) -> HipResult<()> {
         gpu.hip.memcpy_dtod_at(
             &self.prev_hidden.buf,
@@ -788,7 +796,9 @@ impl MtpSpecState {
             &target_scratch_tmp.buf,
             0,
             dim * 4,
-        )
+        )?;
+        self.prev_hidden_pos = Some(pos);
+        Ok(())
     }
 
     /// Capture the trunk's post-output-norm hidden from a row of
@@ -797,8 +807,9 @@ impl MtpSpecState {
     /// from the verify slot corresponding to the last committed token,
     /// avoiding the cost of a separate single-token forward.
     pub fn capture_prev_hidden_from_verify_row(
-        &self,
+        &mut self,
         gpu: &Gpu,
+        cur_pos: usize,
         row: usize,
         dim: usize,
     ) -> HipResult<()> {
@@ -808,7 +819,9 @@ impl MtpSpecState {
             &self.verify_hidden.buf,
             row * dim * 4,
             dim * 4,
-        )
+        )?;
+        self.prev_hidden_pos = Some(cur_pos + row);
+        Ok(())
     }
 
     /// Drafter-local reset for a fresh conversation. Zeros the MTP head KV
@@ -821,6 +834,7 @@ impl MtpSpecState {
         self.mtp_proposal_graph_warmed = false;
         self.mtp_proposal_graph_seq_cap = 0;
         self.mtp_kv.reset(gpu)?;
+        self.prev_hidden_pos = None;
         Ok(())
     }
 
@@ -1524,7 +1538,7 @@ fn mtp_shared_verify_accept_rollback(
     debug_assert!(advance >= 1 && advance <= drafts_generated + 1);
 
     let prev_hidden_row = advance - 1;
-    state.capture_prev_hidden_from_verify_row(gpu, prev_hidden_row, dim)?;
+    state.capture_prev_hidden_from_verify_row(gpu, cur_pos, prev_hidden_row, dim)?;
 
     // ── 3. KV / DN rollback (or skip on full accept) ─────────────────
     let full_accept_no_eos = advance == drafts_generated + 1 && !hit_eos;
@@ -1741,7 +1755,11 @@ where
 
     let dim = target.config.dim;
     let dim_bytes = dim * 4;
-    let prompt_hidden = gpu.alloc_tensor(&[prompt_tokens.len() * dim], DType::F32)?;
+    // The head pairs token `p` with the trunk hidden of position `p - 1`, as
+    // decode does. Row 0 holds the partner of the first fill token; row
+    // `j + 1` holds the hidden of position `start_pos + j`. Fill row `j`
+    // therefore pairs `prompt_tokens[j]` with row `j`.
+    let prompt_hidden = gpu.alloc_tensor(&[(prompt_tokens.len() + 1) * dim], DType::F32)?;
     // The head fills in `head_rows` slices whatever the trunk chunk size.
     let use_batched_mtp_fill = mtp_head::mtp_prompt_fill_uses_batched(
         state.mtp_kv.kv_mode,
@@ -1786,6 +1804,16 @@ where
         let mut trunk_prefill_secs = 0.0f64;
         let mut mtp_prompt_fill_secs = 0.0f64;
         let mut off = 0usize;
+        // Partner of the first token is h_{start_pos-1}. Reuse `prev_hidden`
+        // only when it holds that position; otherwise (cold start, or a warm
+        // fill whose predecessor hidden is gone) pair the token with a zero
+        // hidden, which the head's hnorm maps to zero.
+        if start_pos > 0 && state.prev_hidden_pos == Some(start_pos - 1) {
+            gpu.hip
+                .memcpy_dtod_at(&prompt_hidden.buf, 0, &state.prev_hidden.buf, 0, dim_bytes)?;
+        } else {
+            gpu.hip.memcpy_htod(&prompt_hidden.buf, &vec![0u8; dim_bytes])?;
+        }
         while off < prompt_tokens.len() {
             let remaining = prompt_tokens.len() - off;
             let outer = match route {
@@ -1800,8 +1828,8 @@ where
             let chunk_start_pos = start_pos + off;
             let committed_pos = start_pos + end;
 
-            // Per-chunk hidden destination: row-major slice of the full prompt buffer.
-            let chunk_hidden = prompt_hidden.sub_offset(off * dim, chunk.len() * dim);
+            // Per-chunk hidden destination: rows `off + 1..` of the pairing buffer.
+            let chunk_hidden = prompt_hidden.sub_offset((off + 1) * dim, chunk.len() * dim);
 
             let t_trunk = Instant::now();
             match route {
@@ -1890,9 +1918,10 @@ where
             &state.prev_hidden.buf,
             0,
             &prompt_hidden.buf,
-            last * dim_bytes,
+            (last + 1) * dim_bytes,
             dim_bytes,
         )?;
+        state.prev_hidden_pos = Some(start_pos + last);
         Ok(TrunkSpinePrefillTimings {
             trunk_prefill_secs,
             mtp_prompt_fill_secs,
@@ -2276,7 +2305,7 @@ pub fn spec_step_mtp(
     //
     // Both cases reduce to slot `advance - 1`.
     let prev_hidden_row = advance - 1;
-    state.capture_prev_hidden_from_verify_row(gpu, prev_hidden_row, dim)?;
+    state.capture_prev_hidden_from_verify_row(gpu, cur_pos, prev_hidden_row, dim)?;
 
     // ── 8. Roll back trunk DN state + replay accepted committed tokens ───
     //
@@ -2623,7 +2652,7 @@ pub fn spec_step_mtp_compressed(
 
     // ── 5. Capture prev_hidden from verify slot advance-1 ─────────────────
     let prev_hidden_row = advance - 1;
-    state.capture_prev_hidden_from_verify_row(gpu, prev_hidden_row, dim)?;
+    state.capture_prev_hidden_from_verify_row(gpu, cur_pos, prev_hidden_row, dim)?;
 
     // ── 6. Roll back trunk DN state + replay accepted ─────────────────────
     state.trunk_snap.restore_to(&mut target.dn_state, gpu)?;

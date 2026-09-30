@@ -467,7 +467,7 @@ fn main() {
     // Snapshot trunk's prev_hidden (post-output-norm at last prefill position).
     if !trunk_spine {
         state
-            .capture_prev_hidden_from_scratch_tmp(&gpu, &target.scratch.tmp, target.config.dim)
+            .capture_prev_hidden_from_scratch_tmp(&gpu, &target.scratch.tmp, target.config.dim, prompt_tokens.len() - 1)
             .expect("capture prev_hidden");
     }
 
