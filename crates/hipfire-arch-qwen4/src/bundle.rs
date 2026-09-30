@@ -327,6 +327,19 @@ impl Qwen4Bundle {
         Ok(())
     }
 
+    /// Install (or clear) the QSA parity observer on the attached forward.
+    #[cfg(feature = "reference-parity")]
+    pub fn set_qsa_tap(
+        &mut self,
+        tap: Option<crate::gpu_forward::Qwen4QsaTap>,
+    ) -> Result<(), BundleError> {
+        let forward = self.execution.as_mut().ok_or_else(|| {
+            BundleError::Forward("Qwen4 forward resources are not attached".to_string())
+        })?;
+        forward.qsa_tap = tap;
+        Ok(())
+    }
+
     /// Rows the attached forward can process in one chunked call.  The MTP
     /// prefill uses this to batch a whole prompt chunk through the shared
     /// forward instead of one single-row forward per prompt token.

@@ -1345,6 +1345,14 @@ fn layer_scratch<'a>(
     }
 }
 
+/// Parity-harness observer run after each QSA layer's step on the ordinary HIP
+/// route: `(gpu, qsa_slot, op)`, with the op's scratch and state holding that
+/// layer's inputs, selection and attention output for the forward's rows.
+/// Only `reference-parity` builds can install one ([`Qwen4Bundle::set_qsa_tap`]);
+/// a forward with a tap never records or replays a retained body.
+pub type Qwen4QsaTap =
+    Box<dyn FnMut(&mut Gpu, usize, &IndexedAttentionOp<'_>) -> Result<(), String> + Send>;
+
 /// Reusable production forward owner.  Construct it once per assembled bundle
 /// and use `forward_token`/`forward_chunk` repeatedly; both methods share the
 /// exact same chunk implementation.
@@ -1363,6 +1371,7 @@ pub struct Qwen4GpuForward {
     /// over 32 chunks). Prefill keeps the BF16 source for its WMMA routes and
     /// the exact multi-row arms short prompts take.
     decode_q8: Vec<GpuTensor>,
+    pub(crate) qsa_tap: Option<Qwen4QsaTap>,
 }
 
 /// An event after a forward's device argmax and a stream independent of the
@@ -1437,6 +1446,7 @@ impl Qwen4GpuForward {
             token_readback: None,
             moe,
             decode_q8,
+            qsa_tap: None,
         })
     }
 
@@ -2392,7 +2402,8 @@ impl Qwen4GpuForward {
             //
             // Eligible only for a plain single-token continuation: the wide-hidden
             // capture is the speculative-verify shape and must never enter the tape.
-            let eligible = n == 1 && wide_hidden_capture.is_none();
+            let eligible =
+                n == 1 && wide_hidden_capture.is_none() && self.qsa_tap.is_none();
             gpu.replay.set_forward_eligible(eligible);
             // A manual shadow controller states the executor directly: one prepared
             // tape is compared across the exact-kernarg HIP oracle, the retained
@@ -2490,13 +2501,34 @@ impl Qwen4GpuForward {
                         ))
                     })
                 };
-                match ple_split {
-                    Some(split) => {
-                        execute(gpu, &steps[..split])?;
-                        stage_ple(gpu)?;
-                        execute(gpu, &steps[split..])?;
+                if let Some(tap) = self.qsa_tap.as_mut() {
+                    // Parity tap: run up to and including each QSA step, then
+                    // let the observer read that layer's scratch and state.
+                    let mut start = 0;
+                    let mut qsa_slot = 0;
+                    for (index, step) in steps.iter().enumerate() {
+                        if ple_split == Some(index) {
+                            execute(gpu, &steps[start..index])?;
+                            stage_ple(gpu)?;
+                            start = index;
+                        }
+                        if let Step::IndexedAttention(op) = step {
+                            execute(gpu, &steps[start..=index])?;
+                            start = index + 1;
+                            tap(gpu, qsa_slot, op).map_err(invalid)?;
+                            qsa_slot += 1;
+                        }
                     }
-                    None => execute(gpu, &steps)?,
+                    execute(gpu, &steps[start..])?;
+                } else {
+                    match ple_split {
+                        Some(split) => {
+                            execute(gpu, &steps[..split])?;
+                            stage_ple(gpu)?;
+                            execute(gpu, &steps[split..])?;
+                        }
+                        None => execute(gpu, &steps)?,
+                    }
                 }
             }
 
