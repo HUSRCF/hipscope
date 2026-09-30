@@ -3465,7 +3465,10 @@ pub fn generate_dflash(
                 "grammar violation during speculative decode"
             } else if run.finish.open_think || run.finish.finish_reason == "open_think" {
                 "open think span at end of generation (validation)"
-            } else if run.finish.finish_reason == "malformed_protocol" {
+            } else if matches!(
+                run.finish.finish_reason,
+                "malformed_protocol" | "truncated_tool_call"
+            ) {
                 "malformed tool protocol"
             } else {
                 "fail-closed speculative decode"
@@ -4923,8 +4926,9 @@ pub fn generate_spec(
     let finish = emit.finish();
     // Open-think / malformed finish reasons also need a truthful rollback when
     // grammar did not already reset (state may still be baked). An open think
-    // span at a pure length exit is an ordinary `length` terminal instead:
-    // partial reasoning, state intact, same rule as the wrapper's classifier.
+    // span or an unfinished tool call at a pure length exit is an ordinary
+    // `length` terminal instead: state intact, same rule as the wrapper's
+    // classifier and AR.
     let length_exit = ctx_exhausted
         || qwen_dflash_hit_length_cap(
             generated,
@@ -4933,8 +4937,10 @@ pub fn generate_spec(
             semantic_stop.is_some(),
         );
     let open_think = finish.open_think || finish.finish_reason == "open_think";
+    let truncated_call = finish.finish_reason == "truncated_tool_call";
     if fail_closed_rollback.is_none()
-        && ((open_think && !length_exit) || finish.finish_reason == "malformed_protocol")
+        && (((open_think || truncated_call) && !length_exit)
+            || finish.finish_reason == "malformed_protocol")
     {
         // Guard already dropped — reset via host-held bundle/speculator.
         fail_closed_rollback = Some(production_fail_closed_rollback(m, gpu, None, None));
@@ -6359,12 +6365,21 @@ pub fn qwen_dflash_wire_terminal(
             rolled_back,
         };
     }
-    // Open think is a nonretryable unsafe terminal (error XOR done) when the
-    // model ended the turn inside it. Running out of budget there is an
-    // ordinary length stop: the reasoning streamed so far, no answer.
+    // Open think and an unfinished tool call are nonretryable unsafe terminals
+    // (error XOR done) when the model ended the turn inside them. Running out
+    // of budget there is an ordinary length stop — no calls, no cache — exactly
+    // as AR classifies it (`qwen_ar_finish_route`).
     if (finish.open_think || finish.finish_reason == "open_think") && !hit_length_cap {
         return QwenDflashWireTerminal::Malformed {
             message: "open think span at end of generation (validation)".to_string(),
+            class: "validation",
+            retryable: false,
+            rolled_back,
+        };
+    }
+    if finish.finish_reason == "truncated_tool_call" && !hit_length_cap {
+        return QwenDflashWireTerminal::Malformed {
+            message: "malformed tool protocol".to_string(),
             class: "validation",
             retryable: false,
             rolled_back,

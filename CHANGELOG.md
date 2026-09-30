@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- **Serve: a tool call cut off by `max_tokens` on DFlash or MTP ends with `finish_reason: "length"`, as it does on AR, instead of a non-retryable "malformed tool protocol" error.** The Qwen spec emitter reported an output that ended inside `<tool_call>` as `malformed_protocol`, and the spec terminal checked that before the length cap. It now reports `truncated_tool_call`, which yields to a pure length exit exactly like an open think span: the answer streamed so far, no tool call, no cache store and no state rollback. The model ending its turn inside the call still fails closed, and so does a call that goes malformed mid-stream (AR errors on the spot there). The multi-slot route keeps failing closed at any exit, as before.
 - **Serve: experimental multi-slot engine (SCS stack #779–#792, by @ghazni101; opt-in `serve.multi_slot = true`, default off).** Several requests decode concurrently on one GPU.
   - Paged KV slot descriptors and a page pool (#779), and a runtime for prefix index, fairness, admission, host swap, the session table and a strict JSON-schema grammar matcher (#780).
   - A Qwen3.5 multi-slot engine with a scheduler, checkpointing, per-slot MTP/DFlash speculation and the vision ladder (#781).
