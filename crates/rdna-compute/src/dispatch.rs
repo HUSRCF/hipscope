@@ -2748,8 +2748,10 @@ impl Gpu {
 
     /// Position-aware variant of [`Self::replay_recorded_hip_prefix`].
     ///
-    /// Applies the identical binding set the retained PM4 route applies, so the
-    /// recorded-blob oracle and the PM4 route stay equivalent: a divergence
+    /// Applies the identical binding set the retained PM4 route applies (GDN
+    /// frames, synthesized position bindings and every launch's engine-declared
+    /// bindings, built once by `ReplayController::retained_kernarg_bindings`), so
+    /// the recorded-blob oracle and the PM4 route stay equivalent: a divergence
     /// between them is then a submission difference, never a patching one.
     pub fn replay_recorded_hip_prefix_at(&self, count: usize, position: usize) -> HipResult<()> {
         self.bind_thread()?;
@@ -2763,7 +2765,15 @@ impl Gpu {
                 ),
             ));
         }
-        let synthesized = self.replay.synthesized_position_bindings();
+        let bindings = self
+            .replay
+            .retained_kernarg_bindings(count)
+            .map_err(|reason| {
+                hip_bridge::HipError::new(
+                    0,
+                    &format!("recorded-HIP oracle kernarg bindings: {reason}"),
+                )
+            })?;
         for (index, launch) in launches.iter().take(count).enumerate() {
             let func = self.functions.get(&launch.kernel).ok_or_else(|| {
                 hip_bridge::HipError::new(
@@ -2772,20 +2782,6 @@ impl Gpu {
                 )
             })?;
             let mut kernarg = launch.kernarg.clone();
-            let mut bindings: Vec<(usize, crate::replay::ReplayKernargBinding)> = synthesized
-                .iter()
-                .filter(|(idx, _)| *idx == index)
-                .cloned()
-                .collect();
-            if crate::replay::is_gdn_kernel(&launch.kernel) {
-                let frames =
-                    crate::replay::gdn_requant_frames_for_dispatch(&launch.kernarg, launch.grid[2])
-                        .map_err(|reason| hip_bridge::HipError::new(0, &reason))?;
-                bindings.push((
-                    index,
-                    crate::replay::ReplayKernargBinding::GdnFrameU32 { offset: 76, frames },
-                ));
-            }
             crate::replay::apply_kernarg_bindings_for_dispatch(
                 &mut kernarg,
                 index,
@@ -6637,6 +6633,71 @@ mod tests {
 
         gpu.free_tensor(tensor).expect("free live owner");
         assert_eq!(gpu.vmm_allocation_count(), 0);
+    }
+
+    /// The recorded-HIP oracle is the reference Redline checks PM4 replay
+    /// against, so it must re-derive every engine-declared kernarg field at its
+    /// replay position, exactly as the retained PM4 plan does. A declared
+    /// destination-row offset captured at position `p` and replayed at `p + k`
+    /// must write row `p + k`; writing row `p` again is the stale capture value.
+    #[test]
+    fn recorded_hip_oracle_applies_declared_bindings_at_replay_position() {
+        let Some((mut gpu, _guard)) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        let width = 64usize;
+        let rows = 8usize;
+        let captured = 2usize;
+        let replayed = 5usize;
+        let src: Vec<f32> = (0..width).map(|i| i as f32 + 1.0).collect();
+        let src_gpu = gpu.upload_f32(&src, &[width]).expect("src upload");
+        let dst_gpu = gpu
+            .zeros(&[rows * width], super::DType::F32)
+            .expect("dst allocation");
+
+        gpu.replay =
+            crate::replay::ReplayController::new_armed(crate::replay::ReplayBackendRequest::Auto);
+        gpu.replay.begin_capture().expect("open recording window");
+        gpu.copy_rows_strided_f32(
+            &src_gpu,
+            &dst_gpu,
+            1,
+            width,
+            width,
+            width,
+            captured * width,
+            Some(width),
+        )
+        .expect("captured copy");
+        gpu.replay.finish_capture().expect("close recording window");
+        assert_eq!(gpu.replay.recorded_launches().len(), 1);
+        assert!(
+            !gpu.replay.recorded_launches()[0]
+                .declared_kernarg_bindings()
+                .is_empty(),
+            "the copy must declare its per-position row offset"
+        );
+
+        gpu.hip
+            .memset(&dst_gpu.buf, 0, rows * width * std::mem::size_of::<f32>())
+            .expect("clear dst");
+        gpu.replay_recorded_hip_prefix_at(1, replayed)
+            .expect("oracle replay");
+        let out = gpu.download_f32(&dst_gpu).expect("download");
+
+        let row = |r: usize| &out[r * width..(r + 1) * width];
+        assert!(
+            row(captured).iter().all(|v| *v == 0.0),
+            "oracle replayed the capture-position row {captured} (stale declared binding)"
+        );
+        assert_eq!(row(replayed), &src[..], "oracle missed row {replayed}");
+        for r in (0..rows).filter(|r| *r != replayed) {
+            assert!(row(r).iter().all(|v| *v == 0.0), "stray write in row {r}");
+        }
+
+        gpu.free_tensor(src_gpu).expect("free src");
+        gpu.free_tensor(dst_gpu).expect("free dst");
     }
 
     #[test]

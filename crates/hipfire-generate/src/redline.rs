@@ -3913,19 +3913,16 @@ fn redline_shadow_qwen4(
         }));
     }
 
-    // The recorded-HIP oracle is the captured blob itself: it re-executes the
-    // recorded kernargs and substitutes position through the controller's
-    // synthesized-binding calibration. The Qwen4 route declares its position
-    // bindings in the program instead, so the oracle is exact at the position it
-    // was captured at — one window, the same geometry the capture used — while
-    // the retained transport carries the multi-position claim.
+    // The recorded-HIP oracle re-executes the captured kernargs with the same
+    // binding set the retained plan patches (synthesized and program-declared
+    // position bindings), so it is compared at every window the retained arm is.
     let (oracle_arm, oracle_host_us) = redline_qwen4_arm(
         gpu,
         bundle,
         Some(rdna_compute::replay::ShadowBodyRoute::HipOracle),
         context,
-        1,
-        0,
+        iterations,
+        position_step,
     )?;
     let (hip_arm, hip_host_us) = redline_qwen4_arm(
         gpu,
@@ -3942,6 +3939,7 @@ fn redline_shadow_qwen4(
         windows.push(serde_json::json!({
             "position": hip_arm[i].position,
             "pm4": redline_qwen4_row(&replay_arm[i], &hip_arm[i], hip_tokens),
+            "recorded_hip": redline_qwen4_row(&oracle_arm[i], &hip_arm[i], hip_tokens),
         }));
     }
     let prepared_identity = identity
@@ -3961,7 +3959,7 @@ fn redline_shadow_qwen4(
         })
         .unwrap_or_else(|| serde_json::json!({"missing": true}));
     let bit_exact = replay_arm == hip_arm;
-    let oracle_bit_exact = oracle_arm[0] == hip_arm[0];
+    let oracle_bit_exact = oracle_arm == hip_arm;
     let compared_bytes = replay_arm
         .first()
         .map_or(0, RedlineQwen4Snapshot::compared_bytes);
@@ -4014,14 +4012,6 @@ fn redline_shadow_qwen4(
         "parity": {
             "q8_byte_parity_invalid": false,
             "windows": windows,
-            "blob": {
-                "position": hip_arm[0].position,
-                "recorded_hip": redline_qwen4_row(
-                    &oracle_arm[0],
-                    &hip_arm[0],
-                    hip_arm[0].argmax,
-                ),
-            },
         },
         "host_us": {
             "pm4": replay_host_us,

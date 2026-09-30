@@ -867,19 +867,20 @@ positions. What was added:
    prepares the transport it chooses rather than the one the controller is
    configured with.
 3. **`--qwen4` mode in `scripts/redline_daemon_harness.py`**, gating
-   `QWEN4_EXACT_FIELDS` per position plus the capture-position oracle row.
+   `QWEN4_EXACT_FIELDS` per position for both the retained arm and the
+   recorded-HIP oracle.
 
 Two semantics worth stating, both learned by running it:
 
-- **The recorded-HIP oracle is exact only at its capture position.** It
-  substitutes position through the controller's *synthesized-binding
-  calibration*; the Qwen4 route instead **declares** its position bindings in
-  the program (G1/G2), which the oracle path does not read. So the oracle is
-  compared once, at the capture geometry, while the retained transport carries
-  the multi-position claim — which is the stronger half anyway. Observed
-  directly: with the tape captured at position 128, the oracle matched HIP at
-  the capture window and diverged from 129 onward, while the retained arm stayed
-  bit-exact at 129–133.
+- **The recorded-HIP oracle applies the retained binding set.** It originally
+  substituted position only through the controller's *synthesized-binding
+  calibration* and ignored the bindings the Qwen4 program **declares** (G1/G2),
+  so it was exact only at its capture position: with the tape captured at
+  position 128, it matched HIP at the capture window and diverged from 129
+  onward while the retained arm stayed bit-exact at 129–133. The oracle and the
+  PM4 plan now build their bindings through one helper
+  (`replay::retained_kernarg_bindings`: GDN frames, synthesized and declared
+  bindings), and the oracle is compared at every window.
 - **`prepared_route_identity` now follows the installed plan**, not the
   configured transport. It previously answered `None` for a PM4 plan on a
   controller whose configured transport was AQL — i.e. it could report an
