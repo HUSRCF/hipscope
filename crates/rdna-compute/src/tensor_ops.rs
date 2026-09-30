@@ -24,6 +24,19 @@ const GATED_DELTA_CHUNK_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gated_delta_chunk_wmma.gfx1151.hip");
 const INDEXED_ATTENTION_DENSE_WMMA_SRC: &str =
     include_str!("../../../kernels/src/indexed_attention_dense_wmma.gfx1151.hip");
+const INDEXED_ATTENTION_GATHERED_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/indexed_attention_gathered_wmma.gfx1151.hip");
+const INDEXED_ATTENTION_GATHERED_WMMA_GFX1201_SRC: &str =
+    include_str!("../../../kernels/src/indexed_attention_gathered_wmma.gfx1201.hip");
+/// `HIPFIRE_QWEN4_QSA_WMMA_GATHER=1` routes past-budget QSA prefill attention
+/// (rows >= QWEN4_F16_WMMA_MIN_TOKENS, selection narrower than the causal
+/// window) through the gathered F16 WMMA kernels: gfx1151 on the F32 state,
+/// gfx1201 on the fp8 state.  Not bit-exact against the hg4 kernel and no
+/// Flash-Next KLD reference exists yet, so it is off by default; unset or `0`
+/// keeps every launch of the incumbent route.  Read once.
+static QWEN4_QSA_WMMA_GATHER: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_QWEN4_QSA_WMMA_GATHER", false)
+});
 const QSA_SELECT_PARALLEL_THREADS: u32 = 256;
 // gfx1151's 64-KiB dynamic LDS budget; other devices use the serial path.
 // Oversized rows also use serial kernels without changing the contract.
@@ -3564,6 +3577,9 @@ fn indexed_attention_attention_batch_impl(
             ),
         ));
     }
+    if allow_fast && qsa_gathered_wmma_applies(gpu, p) {
+        return qsa_gathered_wmma(gpu, p, end_position, max_selected);
+    }
     // Live (unrecorded) launches reserve LDS for this chunk's longest row
     // only; a recorded launch keeps the position-independent shape bound.
     let shape_selected = if gpu.replay.is_recording() || gpu.graphs.capture_mode {
@@ -3768,6 +3784,121 @@ fn qsa_dense_wmma(
         ],
         [256, 1, 1],
         0,
+        args.as_mut_slice(),
+        crate::dispatch::ReplayLaunchBindings::NONE,
+    )
+}
+
+/// Static LDS of the gathered kernels: F16 Q (16 heads x 256), two parity
+/// sets of F16 probabilities (8 waves x 16 x 16) and of the per-wave max/sum.
+const QSA_GATHERED_STATIC_LDS_BYTES: usize = 16 * 256 * 2 + 2 * 8 * 256 * 2 + 2 * 2 * 8 * 16 * 4;
+
+/// Whether the gathered F16 WMMA attention applies (checked after the dense
+/// route): `HIPFIRE_QWEN4_QSA_WMMA_GATHER` set and the Qwen4 F16 route not
+/// opted out, >= QWEN4_F16_WMMA_MIN_TOKENS rows, no recorder or capture,
+/// head_dim 256 with at most 16 query heads per KV head, a token list that
+/// fits the LDS budget, and the state format this arch has a kernel for
+/// (gfx1151: F32, gfx1201: fp8).  The flag is read first, so with it unset
+/// every launch is the incumbent's.
+fn qsa_gathered_wmma_applies(gpu: &Gpu, p: &IndexedAttentionAttentionBatch<'_>) -> bool {
+    *QWEN4_QSA_WMMA_GATHER
+        && *crate::gemm::QWEN4_F16_WMMA
+        && p.rows >= crate::gemm::QWEN4_F16_WMMA_MIN_TOKENS
+        && !gpu.replay.is_recording()
+        && !gpu.graphs.capture_mode
+        && p.head_dim == 256
+        && p.n_heads / p.n_kv_heads <= 16
+        && p.capacity.div_ceil(128) * 128 * 4 + QSA_GATHERED_STATIC_LDS_BYTES
+            <= QSA_ATTENTION_DYNAMIC_LDS_LIMIT_BYTES
+        && match p.format {
+            QsaKvFormat::F32 => gpu.arch_caps.is_gfx1151(),
+            QsaKvFormat::Fp8 => gpu.arch_caps.is_gfx1201(),
+        }
+}
+
+/// QSA attention over each row's selection in F16 WMMA
+/// (kernels/src/indexed_attention_gathered_wmma.gfx{1151,1201}.hip).  The
+/// cache rows `[0, end_position)` are first written as F16 K and
+/// block-transposed V into the shared FP16 X scratch (2 bytes per KV channel
+/// each, i.e. 2 KiB per token at 2 x 256 KV channels).
+fn qsa_gathered_wmma(
+    gpu: &mut Gpu,
+    p: &IndexedAttentionAttentionBatch<'_>,
+    end_position: usize,
+    max_selected: usize,
+) -> HipResult<()> {
+    let (module, src, convert, attend) = match p.format {
+        QsaKvFormat::F32 => (
+            "indexed_attention_gathered_wmma",
+            INDEXED_ATTENTION_GATHERED_WMMA_SRC,
+            "indexed_attention_kv_f16vb",
+            "indexed_attention_gathered_wmma_f16",
+        ),
+        QsaKvFormat::Fp8 => (
+            "indexed_attention_gathered_wmma_gfx1201",
+            INDEXED_ATTENTION_GATHERED_WMMA_GFX1201_SRC,
+            "indexed_attention_kv_f16vb_fp8_gfx1201",
+            "indexed_attention_gathered_wmma_f16_gfx1201",
+        ),
+    };
+    let width = checked_product(p.n_kv_heads, 256, "QSA gathered KV width")?;
+    let k_elements = checked_product(end_position, width, "QSA gathered K")?;
+    // V blocks of four tokens: the last partial block is padded.
+    let vb_elements = checked_product(end_position.div_ceil(4) * 4, width, "QSA gathered V")?;
+    let scratch = gpu.qwen4_f16_x_scratch(k_elements + vb_elements)?;
+    let k16 = scratch.buf.as_ptr();
+    let vb16 = unsafe { (k16 as *mut u8).add(k_elements * 2) } as *mut std::ffi::c_void;
+    let tokens = checked_i32(end_position, "QSA gathered tokens")?;
+    let kv_heads = checked_i32(p.n_kv_heads, "QSA gathered KV heads")?;
+    for kernel in [convert, attend] {
+        gpu.ensure_kernel_public(module, src, kernel)?;
+    }
+    let mut args = KernargBlob::new();
+    args.push_ptr(p.full_keys.buf.as_ptr());
+    args.push_ptr(p.full_values.buf.as_ptr());
+    args.push_ptr(k16);
+    args.push_ptr(vb16);
+    args.push_i32(tokens);
+    args.push_i32(kv_heads);
+    args.pad_to(16);
+    gpu.launch_blob_recorded(
+        convert,
+        [checked_u32(end_position, "QSA gathered token grid")?, p.n_kv_heads as u32, 1],
+        [256, 1, 1],
+        0,
+        args.as_mut_slice(),
+        crate::dispatch::ReplayLaunchBindings::NONE,
+    )?;
+    let mut args = KernargBlob::new();
+    args.push_ptr(p.q_with_gate.buf.as_ptr());
+    args.push_ptr(k16);
+    args.push_ptr(vb16);
+    args.push_ptr(p.selected.buf.as_ptr());
+    args.push_ptr(p.output.buf.as_ptr());
+    for (value, what) in [
+        (p.rows, "QSA gathered rows"),
+        (p.position_start, "QSA gathered position"),
+        (p.n_heads, "QSA gathered heads"),
+        (p.n_kv_heads, "QSA gathered KV heads"),
+        (p.budget_blocks, "QSA gathered budget"),
+        (p.compress, "QSA gathered compress"),
+        (p.capacity, "QSA gathered capacity"),
+        (p.full_capacity, "QSA gathered cache capacity"),
+    ] {
+        args.push_i32(checked_i32(value, what)?);
+    }
+    args.pad_to(16);
+    // The validated token list of the longest selection, in 128-entry tiles.
+    let lds = checked_u32(max_selected.div_ceil(128) * 128 * 4, "QSA gathered LDS")?;
+    gpu.launch_blob_recorded(
+        attend,
+        [
+            checked_u32(p.rows, "QSA gathered row grid")?,
+            checked_u32(p.n_kv_heads, "QSA gathered head grid")?,
+            1,
+        ],
+        [256, 1, 1],
+        lds,
         args.as_mut_slice(),
         crate::dispatch::ReplayLaunchBindings::NONE,
     )
@@ -5999,6 +6130,128 @@ mod tests {
         // It is the WMMA route (F16 rounding), not the exact kernel.
         assert!(rel > 0.0, "dense QSA WMMA route did not run");
         for tensor in [q_gpu, keys_gpu, values_gpu, selected_gpu] {
+            gpu.free_tensor(tensor).expect("free");
+        }
+    }
+
+    /// The gathered F16 WMMA route must match the exact per-head kernel of
+    /// the same state format to F16-rounding accuracy: rows before and past
+    /// the budget, causal tails, a `-1` slot per row, and rows whose blocks
+    /// are emitted in descending token order (the per-token V path).  The
+    /// query is scaled so the softmax is peaked: with the flat LCG query a
+    /// mis-paired key and value barely moves the output.
+    #[test]
+    fn qsa_gathered_wmma_matches_per_head_kernel() {
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        let format = if gpu.arch_caps.is_gfx1151() {
+            QsaKvFormat::F32
+        } else if gpu.arch_caps.is_gfx1201() {
+            QsaKvFormat::Fp8
+        } else {
+            eprintln!("skip: the gathered route is gfx1151 / gfx1201 only");
+            return;
+        };
+        let (n_heads, n_kv_heads, head_dim, compress) = (24usize, 2usize, 256usize, 4usize);
+        // Visible 1901..2420 against a 512-block budget: 475..605 blocks.
+        let (rows, position_start, full_capacity) = (520usize, 1900usize, 2432usize);
+        let budget_blocks = 512usize;
+        let capacity = budget_blocks * compress + compress - 1;
+        let mut q = qsa_lcg(1, rows * n_heads * 2 * head_dim);
+        for head_row in q.chunks_mut(2 * head_dim) {
+            head_row[..head_dim].iter_mut().for_each(|v| *v *= 8.0);
+        }
+        let keys = qsa_lcg(7, full_capacity * n_kv_heads * head_dim);
+        let values = qsa_lcg(13, full_capacity * n_kv_heads * head_dim);
+        let mut selected = vec![-1i32; rows * capacity];
+        for row in 0..rows {
+            let visible = position_start + row + 1;
+            let blocks = visible / compress;
+            let chosen = budget_blocks.min(blocks);
+            for slot in 0..chosen {
+                let block = (blocks - 1 - (slot * 7 + row) % blocks) as i32;
+                for r in 0..compress {
+                    // Odd rows list each block's tokens in descending order.
+                    let token = if row % 2 == 1 { compress - 1 - r } else { r };
+                    selected[row * capacity + slot * compress + r] =
+                        block * compress as i32 + token as i32;
+                }
+            }
+            let mut offset = chosen * compress;
+            for token in blocks * compress..visible {
+                selected[row * capacity + offset] = token as i32;
+                offset += 1;
+            }
+            selected[row * capacity + 3] = -1;
+        }
+        let q_gpu = gpu.upload_f32(&q, &[q.len()]).expect("q upload");
+        let keys_gpu = gpu.upload_f32(&keys, &[keys.len()]).expect("keys upload");
+        let values_gpu = gpu.upload_f32(&values, &[values.len()]).expect("values upload");
+        let (k, v) = if format == QsaKvFormat::F32 {
+            (keys_gpu, values_gpu)
+        } else {
+            let units = format.kv_row_units(n_kv_heads, head_dim);
+            let k = gpu.zeros(&[full_capacity * units], format.kv_dtype()).expect("K");
+            let v = gpu.zeros(&[full_capacity * units], format.kv_dtype()).expect("V");
+            indexed_attention_cache_append_batch(
+                &mut gpu,
+                &IndexedAttentionCacheAppendBatch {
+                    key: &keys_gpu,
+                    value: &values_gpu,
+                    full_keys: &k,
+                    full_values: &v,
+                    rows: full_capacity,
+                    position_start: 0,
+                    kv_heads: n_kv_heads,
+                    head_dim,
+                    format,
+                },
+            )
+            .expect("QSA append");
+            gpu.free_tensor(keys_gpu).expect("free");
+            gpu.free_tensor(values_gpu).expect("free");
+            (k, v)
+        };
+        let selected_gpu = gpu
+            .zeros(&[selected.len() * std::mem::size_of::<i32>()], DType::Raw)
+            .expect("selected allocation");
+        let bytes = selected.iter().flat_map(|v| v.to_ne_bytes()).collect::<Vec<_>>();
+        gpu.hip.memcpy_htod(&selected_gpu.buf, &bytes).expect("selected upload");
+        let output = gpu
+            .zeros(&[rows * n_heads * head_dim], DType::F32)
+            .expect("output allocation");
+        let p = IndexedAttentionAttentionBatch {
+            q_with_gate: &q_gpu,
+            full_keys: &k,
+            full_values: &v,
+            selected: &selected_gpu,
+            output: &output,
+            rows,
+            position_start,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            budget_blocks,
+            compress,
+            capacity,
+            full_capacity,
+            format,
+            shape_selected: capacity,
+        };
+        indexed_attention_attention_batch_impl(&mut gpu, &p, false).expect("per-head QSA");
+        let reference = gpu.download_f32(&output).expect("reference download");
+        let end_position = position_start + rows;
+        qsa_gathered_wmma(&mut gpu, &p, end_position, capacity).expect("gathered QSA");
+        let gathered = gpu.download_f32(&output).expect("gathered download");
+        let rel = rel_l2(&reference, &gathered);
+        eprintln!("gathered QSA WMMA ({}) rel L2 {rel:.3e}", format.name());
+        // F16 operands and probabilities: ~1e-4 here; a wrong entry, head,
+        // dim or key/value pairing lands near 1e-1 or above.
+        assert!(rel < 5e-3, "gathered QSA WMMA ({}) rel L2 {rel:.3e}", format.name());
+        assert!(rel > 0.0, "gathered QSA WMMA route did not run");
+        for tensor in [q_gpu, k, v, selected_gpu, output] {
             gpu.free_tensor(tensor).expect("free");
         }
     }
