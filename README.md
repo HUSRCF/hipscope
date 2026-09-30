@@ -47,13 +47,25 @@ The daemon exposes an OpenAI-compatible API on `127.0.0.1:11435` (loopback
 only by default; set `serve.host` to listen on other interfaces).
 
 Current stable release: **[v0.4.0](https://github.com/warpfront/hipfire/releases/tag/v0.4.0)**.
-Headline items: **Qwen3.8 Flash-Next** MoE at full **262K** context on one R9700
-(gfx1201, tp=1, host-mapped experts) and on Strix Halo; **native fp8 KV** as the
-`auto` default on exact gfx1201; **prebuilt kernel packs** in the installer so a
-release-tag install can run without a device compiler; and serve/API hardening
-(loopback bind by default, daemon respawn, SIGTERM drain, typed errors). See
-[CHANGELOG.md](CHANGELOG.md) and the
-[v0.4.0 GitHub release](https://github.com/warpfront/hipfire/releases/tag/v0.4.0).
+
+**Flagship: Qwen3.8-27B `qwen3.8:27b-mq4-xts`** (symmetric MQ4V2 XT with
+per-group AWQ and GPTQ scale refits). `hipfire pull qwen3.8:27b-mq4-xts`
+fetches the target plus its DFlash draft sidecar. On v0.4.0 it gets:
+
+- **Prefill on one R9700 (gfx1201):** pp8192 ≈ 5,120 tok/s with native fp8 KV
+  as the `auto` default, and 4,464 / 3,804 / 2,940 tok/s at 32K / 64K / 128K.
+- **gfx11 prefill:** pp8192 ≈ 2,985 tok/s on the 7900 XTX and 1,141 tok/s on
+  Strix Halo; FA2 now covers prompts past 32K.
+- **Speculative decode:** the model's MTP head is on by default when present
+  (codeedit 39.3 → 68.1 tok/s on the R9700, same text), and VerifyAttn speeds up
+  long-context DFlash/MTP verify (Halo at 32K: DFlash 9.6 → 27.0 tok/s).
+
+Also in v0.4.0: **Qwen3.8 Flash-Next** MoE at its full **262K** context on one
+R9700 (tp=1, host-mapped experts) and on Strix Halo; **prebuilt kernel packs**
+in the installer; and serve/API hardening (loopback bind by default, daemon
+respawn, SIGTERM drain, typed errors). Numbers are self-measured on ROCm 10.0;
+fixtures and methods are in the release notes. See [CHANGELOG.md](CHANGELOG.md)
+and the [v0.4.0 GitHub release](https://github.com/warpfront/hipfire/releases/tag/v0.4.0).
 
 Curated weights are published through
 [huggingface.co/hipfire-models](https://huggingface.co/hipfire-models)
