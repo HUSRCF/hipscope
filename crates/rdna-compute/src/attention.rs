@@ -4353,14 +4353,23 @@ impl Gpu {
 
     /// Whether the default gfx1201 Q8 FA2 prefill arm of
     /// [`Self::attention_q8_0_flash_prefill_wmma`] takes this call (exact
-    /// arch/shape/eager gates). Dispatch asks the same question before it
-    /// routes long-context prefill here, so the two never drift.
+    /// arch/shape gates). Dispatch asks the same question before it routes
+    /// long-context prefill here, so the two never drift.
     ///
     /// Context is bounded by the model's 262144 positions
     /// ([`GFX12_Q8_FA2_MAX_CTX`]), not by the body: it walks KT64 tiles up to
     /// `max(positions) + 1` with 64-bit K/V row offsets and never reads
     /// `max_ctx_len`. The former 32768 ceiling sent every longer prefill to
     /// the tiled partials+reduce kernel (R9700 H2 at 65K: 299.3 s vs 56.8 s).
+    ///
+    /// hipGraph capture: at or below 32K a captured call keeps the query16
+    /// incumbent (unchanged envelope). Above 32K the only alternative is that
+    /// same tiled kernel, so a captured call takes FA2 whenever the launcher
+    /// can run without allocating ([`Self::gfx12_q8_fa2_capture_ready`]). The
+    /// launcher was never capture-unsafe: Q is pre-converted into Gpu-owned
+    /// scratch and never mutated (F4b), and both launches go through
+    /// `launch_maybe_blob` with owned kernarg blobs. The old eager-only gate
+    /// dates from the research opt-in, before F4b.
     pub fn gfx12_q8_fa2_prefill_admitted(
         &self,
         n_heads: usize,
@@ -4372,7 +4381,9 @@ impl Gpu {
         self.flags.gfx12_fa2_prefill
             && self.arch == "gfx1201"
             && !self.replay.is_recording()
-            && !self.graphs.capture_mode
+            && (!self.graphs.capture_mode
+                || (max_ctx_len > GFX12_QUERY16_MAX_CTX
+                    && self.gfx12_q8_fa2_capture_ready(batch_size)))
             && n_heads == 24
             && n_kv_heads == 4
             && head_dim == 256
@@ -4385,6 +4396,21 @@ impl Gpu {
             // body guards partial 8-row query tiles, so FA2 takes it.
             && (batch_size % 16 == 0 || max_ctx_len > GFX12_QUERY16_MAX_CTX)
             && (64..=GFX12_Q8_FA2_MAX_CTX).contains(&max_ctx_len)
+    }
+
+    /// Whether [`Self::attention_q8_0_fa2_gqa_gfx1201`] can run inside a
+    /// hipGraph capture: its module is already loaded (no JIT) and its f16 Q
+    /// scratch already holds `batch_size` H24/D256 rows (no growth, which
+    /// would synchronize, free and malloc mid-capture). A cold capture keeps
+    /// the tiled route instead of failing the capture.
+    fn gfx12_q8_fa2_capture_ready(&self, batch_size: usize) -> bool {
+        self.functions.contains_key("attention_q8_0_fa2_gqa_gfx1201")
+            && self.functions.contains_key("attention_fa2_q_preconvert_gfx1201")
+            && !crate::scratch::scratch_will_grow(
+                self.scratch.fa2_q16_scratch_bytes,
+                self.scratch.fa2_q16_scratch.is_some(),
+                batch_size * 24 * 256 * 2,
+            )
     }
 
     /// True when a Composable-Kernel FA library is loaded in this process.
@@ -4449,10 +4475,11 @@ impl Gpu {
                 batch_size,
             );
         }
-        // Default-on: gfx1201 GQA-fused FA2 prefill. Exact arch/shape/
-        // eager gates; everything else falls through to the byte-identical
-        // incumbent path below. Never inside `_wmma_slots` (its all-or-none
-        // slot ABI is unchanged) and never under replay/graph capture.
+        // Default-on: gfx1201 GQA-fused FA2 prefill. Exact arch/shape gates
+        // (`gfx12_q8_fa2_prefill_admitted`); everything else falls through to
+        // the byte-identical incumbent path below. Never inside `_wmma_slots`
+        // (its all-or-none slot ABI is unchanged) and never under replay
+        // recording; under graph capture only above 32K, once warmed.
         // Opt out with `HIPFIRE_GFX12_FA2_PREFILL=0`.
         if self.gfx12_q8_fa2_prefill_admitted(
             n_heads,
