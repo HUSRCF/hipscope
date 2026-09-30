@@ -254,7 +254,11 @@ fn mtp_source_tier_active() -> bool {
     MTP_SOURCE_TIER_OVERRIDE
         .with(|value| value.get())
         .unwrap_or_else(|| {
-            qwen4_mtp_source_tier(std::env::var("HIPFIRE_QWEN4_MTP_TIER").ok().as_deref())
+            qwen4_mtp_source_tier(
+                hipfire_config::developer_var("HIPFIRE_QWEN4_MTP_TIER")
+                    .ok()
+                    .as_deref(),
+            )
         })
 }
 
@@ -388,7 +392,11 @@ impl Qwen4Manifest {
     pub fn build(config: &Qwen4Config) -> Result<Self, WeightError> {
         Self::build_with_trunk_tier(
             config,
-            qwen4_trunk_tier(std::env::var("HIPFIRE_QWEN4_TRUNK_TIER").ok().as_deref()),
+            qwen4_trunk_tier(
+                hipfire_config::developer_var("HIPFIRE_QWEN4_TRUNK_TIER")
+                    .ok()
+                    .as_deref(),
+            ),
         )
     }
 
@@ -1465,7 +1473,7 @@ impl Qwen4Weights {
     /// matching rule wins) with a requantized copy, `fmt` = `mq2` .. `mq6`
     /// (MQ G256 V2) | `q8` (from BF16 only). Decode and prefill both bind it.
     pub fn requant_from_env(&mut self, gpu: &mut Gpu) -> Result<(), String> {
-        let Ok(spec) = std::env::var("HIPFIRE_QWEN4_REQUANT") else {
+        let Ok(spec) = hipfire_config::developer_var("HIPFIRE_QWEN4_REQUANT") else {
             return Ok(());
         };
         let mut rules = Vec::new();

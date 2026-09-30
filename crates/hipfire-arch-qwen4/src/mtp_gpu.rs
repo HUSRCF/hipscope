@@ -1016,7 +1016,8 @@ impl Qwen4MtpGpu {
             }
         };
         let policy = DraftHeadPolicy::parse(
-            &std::env::var("HIPFIRE_MTP_DRAFT_HEAD").unwrap_or_else(|_| "mq2r".to_string()),
+            &hipfire_config::developer_var("HIPFIRE_MTP_DRAFT_HEAD")
+                .unwrap_or_else(|_| "mq2r".to_string()),
         );
         let layout = DraftHeadLayout {
             vocab: config.vocab_size,

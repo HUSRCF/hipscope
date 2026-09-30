@@ -3599,18 +3599,18 @@ mod compact_qwen4_ple_tests {
     #[test]
     #[ignore = "disk-only readahead probe; set HIPFIRE_PROBE_MODEL to an HFQ artifact"]
     fn ple_window_readahead_probe() {
-        let Ok(model) = std::env::var("HIPFIRE_PROBE_MODEL") else {
+        let Ok(model) = hipfire_config::developer_var("HIPFIRE_PROBE_MODEL") else {
             println!("ple-window-probe: skipped, HIPFIRE_PROBE_MODEL is unset");
             return;
         };
-        let reads: usize = std::env::var("HIPFIRE_PROBE_READS")
+        let reads: usize = hipfire_config::developer_var("HIPFIRE_PROBE_READS")
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(192);
         // Row width the reader aligns to: 320 B for today's BF16 shards, 170 B
         // for a Q8F16 shard. Offsets are multiples of this, exactly like the
         // reader's page offsets.
-        let align: u64 = std::env::var("HIPFIRE_PROBE_ALIGN")
+        let align: u64 = hipfire_config::developer_var("HIPFIRE_PROBE_ALIGN")
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(320);

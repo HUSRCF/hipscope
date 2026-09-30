@@ -767,7 +767,7 @@ mod range_tests {
     #[test]
     #[ignore = "timing probe; set HIPFIRE_PROBE_MODEL to a sealed file"]
     fn identity_check_cost_probe() {
-        let Ok(model) = std::env::var("HIPFIRE_PROBE_MODEL") else {
+        let Ok(model) = hipfire_config::developer_var("HIPFIRE_PROBE_MODEL") else {
             println!("identity-check-probe: skipped, HIPFIRE_PROBE_MODEL is unset");
             return;
         };

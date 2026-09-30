@@ -94,7 +94,8 @@ impl std::error::Error for Qwen4ArtifactError {}
 /// Escape hatch for deliberately loading an artifact whose manifest target is
 /// quantized while its bytes are BF16 (the unpacked decode path).
 fn unpacked_quantized_target_allowed() -> bool {
-    std::env::var("HIPFIRE_ALLOW_BF16_QUANTIZED_TARGET").is_ok_and(|value| value == "1")
+    hipfire_config::developer_var("HIPFIRE_ALLOW_BF16_QUANTIZED_TARGET")
+        .is_ok_and(|value| value == "1")
 }
 
 fn source_dtype_name(quant_type: u8) -> Option<&'static str> {
@@ -1033,7 +1034,7 @@ mod tests {
     #[test]
     #[ignore = "artifact admission probe; set HIPFIRE_PROBE_MODEL to an HFQ artifact"]
     fn admits_a_sealed_artifact_with_its_declared_ple_tier() {
-        let Ok(model) = std::env::var("HIPFIRE_PROBE_MODEL") else {
+        let Ok(model) = hipfire_config::developer_var("HIPFIRE_PROBE_MODEL") else {
             println!("admit-probe: skipped, HIPFIRE_PROBE_MODEL is unset");
             return;
         };

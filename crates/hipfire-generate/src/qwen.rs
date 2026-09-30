@@ -2377,6 +2377,15 @@ pub fn qwen_history_tool_render(model_path: &str) -> hipfire_runtime::prompt_fra
     )
 }
 
+/// Native Qwen4 MTP has no validated exact-prefix rehydrate path yet. Keep
+/// those requests on a cold full-prefix replay, including transitions from an
+/// AR turn whose host conversation cache still looks like a strict extension.
+/// Qwen3.5/3.6/3.8 MTP and DFlash keep the prompt cache: the loaded model's
+/// family decides, never the speculator's name.
+pub fn spec_cache_disabled_for(native_qwen4_mtp: bool, env_disabled: bool) -> bool {
+    env_disabled || native_qwen4_mtp
+}
+
 /// Pure LCP prompt-cache decision shared in spirit with the AR `generate`
 /// path's inline block — but side-effect-free (touches no GPU/seq_pos state),
 /// so the DFlash path can use it too. Renders the canonical conversation via
@@ -2389,13 +2398,6 @@ pub fn qwen_history_tool_render(model_path: &str) -> hipfire_runtime::prompt_fra
 /// rewind). The exact-match edge (`lcp == rendered.len()`) degrades to a miss to
 /// avoid a 1-token DeltaNet over-advance. Caller must be in the
 /// `messages_history.is_some()` case.
-/// Native Qwen4 MTP has no validated exact-prefix rehydrate path yet. Keep
-/// those requests on a cold full-prefix replay, including transitions from an
-/// AR turn whose host conversation cache still looks like a strict extension.
-pub fn spec_cache_disabled_for(spec_name: &str, env_disabled: bool) -> bool {
-    env_disabled || spec_name == "mtp"
-}
-
 #[allow(clippy::too_many_arguments)]
 pub fn plan_prompt_cache(
     tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
@@ -2922,12 +2924,13 @@ pub fn generate_dflash(
     // history, roundtrip-unstable text) lands on the checkpoint-resume path —
     // worst case equals today's cold prefill, never wrong tokens.
     let cache_disabled = spec_cache_disabled_for(
-        spec_name,
+        m.qwen4().is_some(),
         hipfire_config::developer_var("HIPFIRE_QWEN_PROMPT_CACHE")
             .ok()
             .as_deref()
             == Some("0"),
     );
+    // DFlash divergent-render resume (default ON; opt out with
     // HIPFIRE_DFLASH_CKPT_RESUME=0). Requires no eviction (resume rewinds the
     // resident KV prefix). When on, the recurrent state is checkpointed during
     // the prompt seed and a divergent render resumes from the latest checkpoint

@@ -38,7 +38,8 @@ impl MtpPhaseTimers {
     fn new() -> Self {
         Self {
             spans: SpanProfiler::new(
-                std::env::var("HIPFIRE_MTP_PHASE_TIMING").is_ok_and(|value| value == "1"),
+                hipfire_config::developer_var("HIPFIRE_MTP_PHASE_TIMING")
+                    .is_ok_and(|value| value == "1"),
             ),
             open: None,
         }
@@ -652,7 +653,7 @@ impl Qwen4MtpDrafter {
     /// target's same-row hidden at every row.  Selectable so the pairing can be
     /// measured rather than argued: `HIPFIRE_MTP_PAIRING=aligned-head|aligned`.
     fn draft_pairing() -> DraftPairing {
-        match std::env::var("HIPFIRE_MTP_PAIRING").as_deref() {
+        match hipfire_config::developer_var("HIPFIRE_MTP_PAIRING").as_deref() {
             Ok("aligned-head") => DraftPairing::AlignedHead,
             Ok("aligned") => DraftPairing::AlignedTarget,
             _ => DraftPairing::HeadState,
@@ -946,12 +947,13 @@ impl MtpDrafter for Qwen4MtpDrafter {
             ));
         }
         self.ensure_resources(gpu, target)?;
-        let trace = std::env::var("HIPFIRE_MTP_TRACE").is_ok_and(|value| value == "1");
+        let trace =
+            hipfire_config::developer_var("HIPFIRE_MTP_TRACE").is_ok_and(|value| value == "1");
         // Route: a (k+1)-row batched verify costs about 2.5 single-row
         // forwards, so it pays only while drafts keep being accepted; the
         // interleaved verify costs one forward per emitted token and wastes no
         // draft. `HIPFIRE_MTP_INCREMENTAL=0|1` forces a route.
-        let depth = match std::env::var("HIPFIRE_MTP_INCREMENTAL").as_deref() {
+        let depth = match hipfire_config::developer_var("HIPFIRE_MTP_INCREMENTAL").as_deref() {
             Ok("0") => k,
             Ok("1") => 0,
             _ => self.batched_depth(k),

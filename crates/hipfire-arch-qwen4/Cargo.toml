@@ -10,6 +10,7 @@ description = "Qwen4/ Qwen3.8-Flash-Next text configuration, PLE hashing, admiss
 [dependencies]
 serde_json.workspace = true
 hip-bridge = { path = "../hip-bridge" }
+hipfire-config = { path = "../hipfire-config" }
 hipfire-runtime = { path = "../hipfire-runtime" }
 rdna-compute = { path = "../rdna-compute", features = ["deltanet"] }
 hipfire-dispatch = { path = "../hipfire-dispatch", features = ["deltanet"] }

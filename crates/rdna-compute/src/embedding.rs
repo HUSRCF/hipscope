@@ -348,7 +348,11 @@ impl Gpu {
         {
             return Err(HipError::new(0, "embedding MQv2 shape/dtype mismatch"));
         }
-        let format = if table.dtype == DType::MQ4G256V2 { 44usize } else { 53usize };
+        let format = if table.dtype == DType::MQ4G256V2 {
+            44usize
+        } else {
+            53usize
+        };
         let groups = if format == 44 {
             dim.checked_div(256)
                 .ok_or_else(|| HipError::new(0, "qt44 embedding width is not 256-aligned"))?
@@ -407,7 +411,6 @@ impl Gpu {
             self.rotate_x_mq_128_v2(rotated, output, dim, n)
         }
     }
-
 
     /// Batched HFQ4-G256 embedding lookup. Dequantizes N rows in a single
     /// launch, reading token ids from a device buffer. hipGraph-capture-safe:
