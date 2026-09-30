@@ -45,7 +45,10 @@ daemon_lines                <= 5362
 # Examples compile on every `cargo build --all-targets`. Archived research
 # probes are gated behind `--features lab`; this is the count still ungated.
 # 28 of these are invoked by scripts or CI gates and are meant to stay.
-ungated_examples            <= 61
+# RATCHET-RAISE 61 -> 63: `rdna-compute/verify_attn_oracle` (VerifyAttn byte oracle, gfx1201/gfx1100)
+# and `hipfire-arch-qwen35/mq4_prefill_state_oracle` (#794 cross-process state oracle), test-only
+# correctness oracles that their gates and docs invoke without `--features lab`.
+ungated_examples            <= 63
 
 # --- layering, derived from the Cargo graph (scripts/check-layering.py) ---
 # An arch crate must not depend on anything above the arch band. The band is
