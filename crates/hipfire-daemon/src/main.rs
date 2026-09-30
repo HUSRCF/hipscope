@@ -1900,6 +1900,14 @@ fn main() {
                     .and_then(|p| p.get("cask_fold_m"))
                     .and_then(|v| v.as_u64())
                     .unwrap_or(2) as usize;
+                // CASK/TriAttention eviction is retired legacy research (same
+                // status as PFlash): still loads for historical reproduction,
+                // but every opt-in gets exactly one warning line.
+                if cask_sidecar.is_some() || cask_enabled {
+                    eprintln!(
+                        "[hipfire-daemon] warning: CASK is retired legacy research; not supported (cask_sidecar/cask set at load)"
+                    );
+                }
                 // Known-broken combo guard: CASK m-folding + DFlash spec decode
                 // degenerates into single-token loops after the first eviction
                 // (the m-folded synthetic K/V rows are off the draft's trained

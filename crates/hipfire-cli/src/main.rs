@@ -124,7 +124,7 @@ pub(crate) enum Commands {
     Setup(SetupArgs),
     /// Quantize a Hugging Face or local model with the Rust quantizer.
     Quantize(QuantizeArgs),
-    /// Generate a TriAttention calibration sidecar.
+    /// Legacy research (retired CASK): generate a TriAttention calibration sidecar.
     SidecarGen(SidecarArgs),
     /// Generate text through a fresh native daemon process.
     Run(RunArgs),
@@ -6689,6 +6689,7 @@ fn quantize_command(paths: &Paths, mut args: QuantizeArgs) -> Result<()> {
 }
 
 fn sidecar_command(paths: &Paths, args: SidecarArgs) -> Result<()> {
+    eprintln!("warning: CASK is retired legacy research; not supported (sidecar-gen)");
     if !(1..=1_000_000).contains(&args.max_tokens) {
         bail!("--max-tokens must be between 1 and 1000000");
     }

@@ -1233,9 +1233,9 @@ pub static FIELDS: &[ConfigField] = &[
         DefaultValue::String(""),
         ValueRule::String,
         true,
-        false,
+        true,
         Some("HIPFIRE_CASK_SIDECAR"),
-        "TriAttention sidecar path; empty disables eviction."
+        "Legacy research (retired CASK/TriAttention, unsupported): sidecar path; empty disables eviction."
     ),
     field!(
         "memory.cask.enabled",
@@ -1245,9 +1245,9 @@ pub static FIELDS: &[ConfigField] = &[
         DefaultValue::Bool(false),
         ValueRule::Bool,
         true,
-        false,
+        true,
         None,
-        "Enable core-aware CASK folding."
+        "Legacy research (retired, unsupported): enable core-aware CASK folding."
     ),
     field!(
         "memory.cask.budget",
@@ -1260,9 +1260,9 @@ pub static FIELDS: &[ConfigField] = &[
             max: 65536
         },
         true,
-        false,
+        true,
         None,
-        "Active-token target after eviction."
+        "Legacy research (retired CASK, unsupported): active-token target after eviction."
     ),
     field!(
         "memory.cask.beta",
@@ -1272,9 +1272,9 @@ pub static FIELDS: &[ConfigField] = &[
         DefaultValue::Integer(128),
         ValueRule::Integer { min: 0, max: 65536 },
         true,
-        false,
+        true,
         None,
-        "Eviction hysteresis."
+        "Legacy research (retired CASK, unsupported): eviction hysteresis."
     ),
     field!(
         "memory.cask.handoff_tokens",
@@ -1284,9 +1284,9 @@ pub static FIELDS: &[ConfigField] = &[
         DefaultValue::Integer(0),
         ValueRule::Integer { min: 0, max: 1048576 },
         true,
-        false,
+        true,
         None,
-        "One-way kv_adaptive to plain TriAttention handoff position; zero disables it."
+        "Legacy research (retired CASK, unsupported): one-way kv_adaptive to plain TriAttention handoff position; zero disables it."
     ),
     field!(
         "memory.cask.core_fraction",
@@ -1300,9 +1300,9 @@ pub static FIELDS: &[ConfigField] = &[
             min_inclusive: true
         },
         true,
-        false,
+        true,
         None,
-        "Fraction of the CASK budget retained as core."
+        "Legacy research (retired, unsupported): fraction of the CASK budget retained as core."
     ),
     field!(
         "memory.cask.fold",
@@ -1312,9 +1312,9 @@ pub static FIELDS: &[ConfigField] = &[
         DefaultValue::Integer(2),
         ValueRule::Integer { min: 1, max: 16 },
         true,
-        false,
+        true,
         None,
-        "CASK merge factor."
+        "Legacy research (retired, unsupported): CASK merge factor."
     ),
     field!(
         "memory.cask.auto_attach",
@@ -1324,9 +1324,9 @@ pub static FIELDS: &[ConfigField] = &[
         DefaultValue::Bool(false),
         ValueRule::Bool,
         true,
-        false,
+        true,
         None,
-        "Discover a matching TriAttention sidecar when explicitly enabled."
+        "Legacy research (retired CASK, unsupported): discover a matching TriAttention sidecar when explicitly enabled."
     ),
     field!(
         "prompt.normalize",

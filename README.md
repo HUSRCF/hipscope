@@ -233,12 +233,10 @@ roughly doubles the superseded MQ2-Lloyd row below it; benchmark against MQ2R,
 not the Lloyd figure. TP3 trades ~2% decode for ~24% faster prefill (481 vs
 389 tok/s) and leaves a fourth card free.
 
-Experimental long-context compression and eviction are opt-in. PFlash is off
-by default, TriAttention sidecars do not auto-attach, and CASK m-folding is
-disabled. Generate a sidecar with `hipfire sidecar-gen <model>`, then set
-`memory.cask.sidecar` to its exact path (or explicitly enable
-`memory.cask.auto_attach`). Set `memory.cask.enabled=true` only when m-folding
-is intended. See [CONFIG.md](docs/CONFIG.md) for details.
+PFlash (prefill compression) and CASK / TriAttention KV eviction are retained
+legacy research: off by default, kept only for historical reproduction, and
+neither a supported feature nor a recommended setting. Loading with a CASK
+option prints a retirement warning.
 
 ## Install
 
@@ -359,7 +357,7 @@ the prefill MMQ redesign log is at
 | [CLI.md](docs/CLI.md) | Every subcommand, flags, file locations |
 | [MODELS.md](docs/MODELS.md) | Curated tags, BYO models, file extensions |
 | [QUANTIZE.md](docs/QUANTIZE.md) | `hipfire quantize` for HF / safetensors / GGUF |
-| [CONFIG.md](docs/CONFIG.md) | Every config key, CASK sidecar / KV eviction policies, env overrides |
+| [CONFIG.md](docs/CONFIG.md) | Every config key and env override |
 | [SERVE.md](docs/SERVE.md) | OpenAI-compatible HTTP API |
 | [IMAGEGEN.md](docs/IMAGEGEN.md) | FLUX.1 / FLUX.2 Klein image generation — local test guide |
 | [BENCHMARKS.md](docs/BENCHMARKS.md) | Measured perf per arch, vs ollama |

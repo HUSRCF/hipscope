@@ -76,6 +76,15 @@ code and artifacts exist only for historical reference and reproduction; do
 not treat PFlash as a production element, recommendation, acceptance route, or
 basis for a current performance claim.
 
+### CASK status
+
+CASK / TriAttention KV eviction (FlashCASK, `memory.cask.*`, `hipfire
+sidecar-gen`, `dflash_spec_demo --cask-*`) has the same status as PFlash:
+retained legacy research, kept only for historical reference and
+reproduction. Using it prints a retirement warning; do not treat it as a
+production element, recommendation, acceptance route, or basis for a current
+performance claim.
+
 ## Building, testing & gates
 
 ```

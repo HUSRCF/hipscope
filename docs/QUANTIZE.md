@@ -262,20 +262,14 @@ not a guarantee):
 
 Peak RAM is roughly `max(tensor elements) × 4` (one tensor dequantized to f32).
 
-## After quantizing: CASK sidecar
+## Legacy research: CASK sidecar
 
-For long-context CASK eviction calibration:
-
-```bash
-hipfire sidecar-gen my-finetune.mq4 --corpus /path/to/corpus.txt
-# or via registered tag:
-hipfire sidecar-gen finetune:1b --corpus /path/to/corpus.txt
-```
-
-Writes `my-finetune.mq4.triattn.bin` beside the model by default. The daemon
-does not attach it by default. Set `cask_sidecar` to the exact path, or opt into
-sibling discovery with `cask_auto_attach=true`. Set `cask=true` separately only
-when core-aware m-folding is intended. See [CONFIG.md](CONFIG.md).
+CASK / TriAttention eviction is retired legacy research, kept only for
+historical reproduction; it is not a post-quantize step and not supported.
+To reproduce old CASK runs, `hipfire sidecar-gen <model> --corpus <file>`
+still writes `<model>.triattn.bin` (with a retirement warning); nothing
+attaches it unless `cask_sidecar` or `cask_auto_attach=true` is set. See
+[CONFIG.md](CONFIG.md).
 
 ## Related
 

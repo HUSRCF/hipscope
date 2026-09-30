@@ -246,11 +246,11 @@ pub const KNOBS: &[KnobInfo] = &[
     },
     KnobInfo {
         key: "cask",
-        title: "CASK (TriAttention eviction)",
-        summary: "KV-cache eviction policy that keeps a working set instead of the full context.",
-        effect: "Frees KV VRAM on long contexts. Switches between m-fold and drop eviction; only actually evicts when a TriAttention sidecar is attached.",
+        title: "CASK (retired legacy research)",
+        summary: "Retired legacy research: TriAttention KV-cache eviction, kept only for historical reproduction. Not supported.",
+        effect: "Switches between m-fold and drop eviction; only actually evicts when a TriAttention sidecar is attached. Loading with CASK prints a retirement warning.",
         default: "false",
-        when: "Enable only with a published sidecar and after validating output quality.",
+        when: "Leave false. Not a production or recommended setting.",
         note: Some("m-fold eviction + DFlash can produce a repetition attractor; validate together. Eviction needs a sidecar path, not just this toggle."),
         options: &[
             ("true", "m-fold eviction policy (needs a sidecar to actually evict)."),

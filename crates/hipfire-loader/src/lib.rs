@@ -1834,7 +1834,7 @@ fn build_qwen35_eviction(
             _ => format!("read error ({e}): {sidecar_path}"),
         };
         format!(
-            "cask sidecar load failed — {why} (regen: hipfire sidecar-gen, or HIPFIRE_CASK_OFF=1)"
+            "cask sidecar load failed — {why} (CASK is retired legacy research; regen: hipfire sidecar-gen, or clear memory.cask.sidecar)"
         )
     })?;
     let fa_layer_ids: Vec<usize> = config

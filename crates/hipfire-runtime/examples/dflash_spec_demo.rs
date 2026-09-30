@@ -31,6 +31,11 @@
 //! rows). Single `--prompt` mode emits no row separators — output
 //! stays byte-identical to the legacy path.
 //!
+//! `--cask-sidecar` / `--cask` / `--cask-budget` / `--cask-beta` /
+//! `--cask-core-frac` / `--cask-fold-m` (FlashCASK) are retired legacy
+//! research, kept only for historical reproduction; using them prints a
+//! one-line warning.
+//!
 //! Per-process diagnostics that gate on env vars (`HIPFIRE_PROFILE`,
 //! `HIPFIRE_HOST_TIMING`, `HIPFIRE_DPM_WARMUP_SECS`,
 //! `HIPFIRE_DFLASH_LOOP_BREAK*`) apply **per-row**, not per-process,
@@ -756,6 +761,9 @@ fn main() {
     }
     let target_path = target_path.expect("--target required");
     let draft_path = draft_path.expect("--draft required");
+    if cask_sidecar.is_some() || use_cask {
+        eprintln!("warning: CASK is retired legacy research; not supported (--cask* flags)");
+    }
 
     // Build the prompt manifest. Exactly one of --prompt, --prompt-file,
     // or --prompts-file is accepted. Single-prompt modes emit no row
