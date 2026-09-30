@@ -19,21 +19,21 @@
 #define HEADS_PER_WG 1
 #endif
 
-// gfx1201 only: spell out the arithmetic the unfused reference kernels
-// (conv1d_silu_split_f32 + fused_qk_l2_norm_scale_f32) compile to on gfx1201.
-// Both leave FMA contraction to the compiler, and it contracts the same source
-// expressions differently in this kernel: here w3*x rounds and w2*s0 fuses
-// (the reference rounds w2*s0 and fuses w3*x), and the unrolled square sum
-// fuses the lane's first element onto its second (the reference rounds the
-// first and fuses the second). Either difference moves Q/K/V by an ULP, so the
-// lowered decode (which uses this fusion) was not byte-identical to the hand
-// decode (which uses the reference pair). Explicit fmaf with contraction off
-// makes the fused kernel produce the reference bytes. gfx1100/gfx1151 keep the
-// original expressions (their code objects are unchanged).
-#if defined(__gfx1201__)
+// gfx1201, gfx1100 and gfx1151: spell out the arithmetic the unfused reference
+// kernels (conv1d_silu_split_f32 + fused_qk_l2_norm_scale_f32) compile to on
+// these arches. Both leave FMA contraction to the compiler, and it contracts
+// the same source expressions differently in this kernel: here w3*x rounds and
+// w2*s0 fuses (the reference rounds w2*s0 and fuses w3*x), and the unrolled
+// square sum fuses the lane's first element onto its second (the reference
+// rounds the first and fuses the second). Either difference moves Q/K/V by an
+// ULP, so the lowered decode (which uses this fusion) was not byte-identical to
+// the hand decode (which uses the reference pair). Explicit fmaf with
+// contraction off makes the fused kernel produce the reference bytes. Other
+// arches keep the original expressions (their code objects are unchanged).
+#if defined(__gfx1201__) || defined(__gfx1100__) || defined(__gfx1151__)
 #define HIPFIRE_CQN_REFERENCE_ORDER 1
 
-// conv1d_silu_split_f32 on gfx1201: fma(w0, s2, fma(w1, s1, fma(w3, x, w2*s0))).
+// conv1d_silu_split_f32 on these arches: fma(w0, s2, fma(w1, s1, fma(w3, x, w2*s0))).
 __device__ __forceinline__ float cqn_conv_taps(
     const float* __restrict__ weight, int c, float x, float s0, float s1, float s2
 ) {
@@ -50,8 +50,9 @@ __device__ __forceinline__ float cqn_conv_taps(
 // fused_qk_l2_norm_scale_f32. Q/K conv results stage in LDS, then the first
 // wave for each head performs the existing four-value lane sum, XOR
 // reduction, and two-step Q scale. V channels retain the original independent
-// conv path. Q/K reach global memory only once, already normalized. On gfx1201
-// the arithmetic is byte-identical to the reference pair (see above).
+// conv path. Q/K reach global memory only once, already normalized. On
+// gfx1201, gfx1100 and gfx1151 the arithmetic is byte-identical to the
+// reference pair (see above).
 extern "C" __launch_bounds__(HIPFIRE_CQN_BLOCK)
 __global__ void HIPFIRE_CQN_KERNEL(
     float* __restrict__ q_out,
