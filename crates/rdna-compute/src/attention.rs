@@ -445,6 +445,11 @@ fn flash_rows_per_block(batch_size: usize) -> usize {
         .unwrap_or(0)
 }
 
+#[inline]
+fn q8_multirow_arch_supported(arch: &str) -> bool {
+    matches!(arch, "gfx1100" | "gfx1151" | "gfx1201")
+}
+
 impl Gpu {
     /// DSpark bidirectional staging assembly (on-GPU; replaces a host
     /// d2h+assemble+h2d that forced ~2 stream syncs per stage).
@@ -7484,7 +7489,7 @@ impl Gpu {
         if self.replay.is_recording() {
             return Ok(false);
         }
-        if !(self.arch_caps.is_gfx1100() || self.arch_caps.is_gfx1201()) {
+        if !q8_multirow_arch_supported(self.arch_caps.arch()) {
             return Ok(false);
         }
         let dpt = head_dim / 32;
@@ -20662,7 +20667,8 @@ mod tests {
     use super::{
         flux_attn_dtype_error, flux_attn_dtype_suffix, flux_attn_route_dtypes,
         flux_attn_route_name, pack_attention_q8_0_fa2_gqa_gfx11_kernarg,
-        q8_flash_default_tile_size, q8_flash_reduce_safe_tile_size, replay_stable_tile_count,
+        q8_flash_default_tile_size, q8_flash_reduce_safe_tile_size, q8_multirow_arch_supported,
+        replay_stable_tile_count,
     };
     use crate::DType;
     use std::ffi::c_void;
@@ -20722,6 +20728,16 @@ mod tests {
             bytes[24..32] != bytes[32..40],
             "out slot must not be the positions pointer (old bug)"
         );
+    }
+
+    #[test]
+    fn q8_multirow_arch_support_is_an_exact_candidate_allowlist() {
+        for arch in ["gfx1100", "gfx1151", "gfx1201"] {
+            assert!(q8_multirow_arch_supported(arch), "arch={arch}");
+        }
+        for arch in ["gfx1101", "gfx1150", "gfx1152", "gfx1200", "gfx942"] {
+            assert!(!q8_multirow_arch_supported(arch), "arch={arch}");
+        }
     }
 
     /// The suffix table is the mapping from tensor dtypes to a kernel symbol.
