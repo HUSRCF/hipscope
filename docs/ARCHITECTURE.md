@@ -411,7 +411,7 @@ recurrent state instead of FA KV for those layers.
 **VMM virtual-address lifetime:** a released `VmmArena` unmaps its segments and
 frees its physical handles, but never returns its virtual range to the driver
 (`hipMemAddressFree` is not called). The range stays reserved for the life of
-the process and is counted by `hip_bridge::retired_va_bytes()`. On ROCm 7.15, a VA can
+the process and is counted by `hip_bridge::retired_va_bytes()`. On ROCm 10.0 (HIP 7.15), a VA can
 keep translating to its first backing after `hipMemUnmap` + `hipMemMap` of
 another handle: kernels read stale pages even after `hipDeviceSynchronize`.
 In the 80 × 2 MiB repro that is every page on gfx1201 (R9700), 84% on gfx1100
