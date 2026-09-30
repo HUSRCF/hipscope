@@ -4784,7 +4784,8 @@ impl Gpu {
     ///
     /// Intended for allocation-failure cleanup of tensors that were just
     /// created (e.g. via [`Self::zeros`]) and must not race a pending async
-    /// memset on the active stream. Rejects VMM owners and borrowed buffers
+    /// memset on the active stream, and for one-off load scratch the pool
+    /// would otherwise keep. Rejects VMM owners and borrowed buffers
     /// with the same policy as [`Self::free_tensor`].
     pub fn release_tensor_immediate(&mut self, tensor: GpuTensor) -> HipResult<()> {
         self.bind_thread()?;

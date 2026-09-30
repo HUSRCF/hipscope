@@ -786,6 +786,14 @@ impl Qwen4MoeLayerRuntime {
         })
     }
 
+    /// Device bytes [`Self::from_moe`] allocates: the gate/up and down
+    /// pointer tables, one device pointer per expert each.
+    pub(crate) fn device_bytes(config: &Qwen4Config) -> Option<usize> {
+        config
+            .num_experts
+            .checked_mul(2 * std::mem::size_of::<u64>())
+    }
+
     pub(crate) fn free_gpu(self, gpu: &mut Gpu) -> Option<hip_bridge::HipError> {
         let mut first = None;
         for tensor in [self.expert_gate_up_ptrs, self.expert_down_ptrs] {

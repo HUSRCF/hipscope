@@ -605,13 +605,8 @@ impl Qwen4MtpDrafter {
         };
         let prefill_rows = {
             let bundle = Self::bundle(target)?;
-            // Row capture rides the few-row persistent GDN recurrence.
             let config = &bundle.config;
-            if gpu.arch_caps.has_gfx11_plus_simt()
-                && config.linear_key_head_dim == 128
-                && config.linear_value_head_dim == 128
-                && config.linear_conv_kernel_dim == 4
-            {
+            if native_mtp_row_capture(gpu, config) {
                 bundle
                     .state
                     .ensure_row_capture(gpu, self.max_k + 1, config.linear_conv_kernel_dim - 1)
@@ -1335,6 +1330,49 @@ pub fn build_qwen4_mtp_speculator(max_k: usize, ctx_capacity: usize) -> Box<dyn 
         max_k,
         ctx_capacity,
     )))
+}
+
+/// Whether this GPU's GDN route captures verify rows: row capture rides the
+/// few-row persistent GDN recurrence.
+pub fn native_mtp_row_capture(gpu: &Gpu, config: &crate::Qwen4Config) -> bool {
+    gpu.arch_caps.has_gfx11_plus_simt()
+        && config.linear_key_head_dim == 128
+        && config.linear_value_head_dim == 128
+        && config.linear_conv_kernel_dim == 4
+}
+
+/// Device bytes native MTP adds to a load at `max_seq` with drafts of up to
+/// `max_k` tokens and the language head stored as `head_dtype`: what the
+/// attached head (`Qwen4MtpGpu`) keeps, plus the larger of its build scratch
+/// (released at attach) and what the first speculative request allocates
+/// after it — the verify hidden rows (`max_k + 1` rows or one forward chunk,
+/// whichever is larger), the pending and row hidden carries, and, where
+/// [`native_mtp_row_capture`], the `max_k + 1`-row GDN capture.
+pub fn native_mtp_device_bytes(
+    config: &crate::Qwen4Config,
+    max_seq: usize,
+    max_k: usize,
+    head_dtype: rdna_compute::DType,
+    row_capture: bool,
+) -> Option<u64> {
+    let rows = max_k.clamp(1, 10) + 1;
+    let hidden_row = config
+        .hc_count
+        .checked_mul(config.hidden_size)?
+        .checked_mul(std::mem::size_of::<f32>())?;
+    let verify_rows = rows.max(max_seq.min(crate::gpu_forward::QWEN4_PREFILL_CHUNK_CAP));
+    let capture = if row_capture {
+        crate::state::Qwen4State::row_capture_bytes(config, rows)?
+    } else {
+        0
+    };
+    let (resident, scratch) =
+        crate::mtp_gpu::Qwen4MtpGpu::device_bytes(config, max_seq, head_dtype)?;
+    let request = verify_rows
+        .checked_add(2)?
+        .checked_mul(hidden_row)?
+        .checked_add(capture)?;
+    u64::try_from(resident.checked_add(scratch.max(request))?).ok()
 }
 
 #[cfg(any(test, feature = "reference-parity"))]
