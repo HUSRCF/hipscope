@@ -413,6 +413,14 @@ impl ArchCaps {
     pub fn supports_dflash_gdn_pre_fusions(&self) -> bool {
         self.is_gfx1100 || self.is_gfx1201
     }
+    /// DFlash hidden-ring commit/scatter fusion admission.
+    ///
+    /// This is deliberately separate from snapshot bulk-copy admission: the
+    /// routes have different validation histories and must not widen each
+    /// other implicitly.
+    pub fn supports_dflash_hidden_scatter_fusions(&self) -> bool {
+        self.is_gfx1100 || self.is_gfx1201
+    }
     /// DFlash batched FA preparation and paired Q8 K/V-write admission.
     ///
     /// Both kernels use portable wave32 reductions and no generation-specific
@@ -644,6 +652,24 @@ mod tests {
             "gfx1030", "gfx1101", "gfx1150", "gfx1151", "gfx1200", "gfx942",
         ] {
             assert!(!make_caps(arch).supports_dflash_gdn_pre_fusions(), "{arch}");
+        }
+    }
+
+    #[test]
+    fn dflash_hidden_scatter_fusions_cover_validated_fleet_only() {
+        for arch in ["gfx1100", "gfx1201"] {
+            assert!(
+                make_caps(arch).supports_dflash_hidden_scatter_fusions(),
+                "{arch}"
+            );
+        }
+        for arch in [
+            "gfx1030", "gfx1101", "gfx1150", "gfx1151", "gfx1200", "gfx942",
+        ] {
+            assert!(
+                !make_caps(arch).supports_dflash_hidden_scatter_fusions(),
+                "{arch}"
+            );
         }
     }
 
