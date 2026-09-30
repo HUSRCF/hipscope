@@ -164,6 +164,76 @@ pub fn check_host_ram(host_bytes: u64, mem_available: Option<u64>) -> Result<(),
     Ok(())
 }
 
+/// TTM's page limit, in pages, which caps every GTT allocation on the host.
+const TTM_PAGES_LIMIT: &str = "/sys/module/ttm/parameters/pages_limit";
+
+/// TTM's page size on x86_64, the only host ROCm supports for discrete GPUs.
+const TTM_PAGE_BYTES: u64 = 4096;
+
+/// GTT room on the host: TTM's cap and what amdgpu devices already hold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GttBudget {
+    pub limit_bytes: u64,
+    pub used_bytes: u64,
+}
+
+/// The GTT budget when host-mapped memory is GTT-backed, i.e. when
+/// `HSA_USERPTR_FOR_PAGED_MEM` is `0` (hip-bridge's default). It is `None`
+/// under userptr, or when sysfs does not expose TTM's limit.
+///
+/// Host allocations may count against another device than the one the
+/// process runs on (on a 5-card gfx1201 host, a card-2 process's host-mapped
+/// experts show in card 0's `mem_info_gtt_used`), so this sums
+/// `mem_info_gtt_used` over every amdgpu device.
+pub fn gtt_budget() -> Option<GttBudget> {
+    if std::env::var("HSA_USERPTR_FOR_PAGED_MEM").ok()?.trim() != "0" {
+        return None;
+    }
+    let read_u64 = |path: &std::path::Path| -> Option<u64> {
+        std::fs::read_to_string(path).ok()?.trim().parse().ok()
+    };
+    let limit_bytes = read_u64(TTM_PAGES_LIMIT.as_ref())?.checked_mul(TTM_PAGE_BYTES)?;
+    let mut used_bytes = 0u64;
+    for card in std::fs::read_dir("/sys/class/drm").ok()?.flatten() {
+        let name = card.file_name();
+        let is_card = name
+            .to_str()
+            .and_then(|name| name.strip_prefix("card"))
+            .is_some_and(|index| !index.is_empty() && index.bytes().all(|b| b.is_ascii_digit()));
+        if is_card {
+            used_bytes += read_u64(&card.path().join("device/mem_info_gtt_used")).unwrap_or(0);
+        }
+    }
+    Some(GttBudget { limit_bytes, used_bytes })
+}
+
+/// Refuse before any allocation when GTT-backed host-mapped experts would not
+/// fit under TTM's `pages_limit` beside what amdgpu devices already hold.
+/// Past it `hipHostMalloc` fails, after the load has uploaded the VRAM
+/// weights. `None` (userptr, or no TTM limit in sysfs) skips the check.
+pub fn check_gtt_cap(host_bytes: u64, budget: Option<GttBudget>) -> Result<(), String> {
+    let Some(GttBudget { limit_bytes, used_bytes }) = budget else {
+        return Ok(());
+    };
+    let free = limit_bytes.saturating_sub(used_bytes);
+    if host_bytes > free {
+        return Err(format!(
+            "routed experts need {:.1} GiB of GTT-backed host RAM, but TTM's GTT cap \
+             ({TTM_PAGES_LIMIT} = {} pages, {:.1} GiB) has {:.1} GiB left beside the {:.1} GiB \
+             amdgpu devices already hold; keep more expert layers in VRAM \
+             ({EXPERT_VRAM_LAYERS_ENV}), raise ttm.pages_limit, or set \
+             HSA_USERPTR_FOR_PAGED_MEM=1 for pageable userptr host memory, which host-memory \
+             pressure can stall (ROCm/rocm-systems#12528)",
+            host_bytes as f64 / GIB,
+            limit_bytes / TTM_PAGE_BYTES,
+            limit_bytes as f64 / GIB,
+            free as f64 / GIB,
+            used_bytes as f64 / GIB
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,6 +291,23 @@ mod tests {
         assert!(error.contains("MemAvailable"), "{error}");
         assert!(check_host_ram(host, None).is_err());
         assert!(check_host_ram(0, None).is_ok());
+    }
+
+    #[test]
+    fn gtt_cap_counts_what_devices_already_hold() {
+        // This host: pages_limit 16108144 (61.4 GiB); N=12 host-maps 46.1 GiB.
+        let limit_bytes = 16_108_144 * TTM_PAGE_BYTES;
+        let host = 46u64 << 30;
+        let fresh = GttBudget { limit_bytes, used_bytes: 16 << 20 };
+        assert!(check_gtt_cap(host, Some(fresh)).is_ok());
+        assert!(check_gtt_cap(limit_bytes - fresh.used_bytes, Some(fresh)).is_ok());
+        let error = check_gtt_cap(limit_bytes - fresh.used_bytes + 1, Some(fresh)).unwrap_err();
+        assert!(error.contains("pages_limit") && error.contains("16108144 pages"), "{error}");
+        // A second load beside one already holding 46 GiB of GTT is refused.
+        let beside = GttBudget { limit_bytes, used_bytes: 46 << 30 };
+        assert!(check_gtt_cap(host, Some(beside)).is_err());
+        // Userptr host memory, or no TTM limit in sysfs, is not GTT-capped.
+        assert!(check_gtt_cap(u64::MAX, None).is_ok());
     }
 
     #[test]

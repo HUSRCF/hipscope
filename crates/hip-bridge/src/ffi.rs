@@ -472,11 +472,59 @@ macro_rules! load_optional_fn {
     }};
 }
 
+/// libhsakmt's choice for `hipHostMalloc` memory on a discrete GPU: non-zero
+/// (ROCm's default) backs it with pageable userptr BOs, `0` with GTT BOs.
+const HSA_USERPTR_FOR_PAGED_MEM: &str = "HSA_USERPTR_FOR_PAGED_MEM";
+
+/// clr's size, in MB, from which a copy to or from pageable host memory pins
+/// the pageable pages in place; smaller copies go through clr's own pinned
+/// staging buffer.
+const GPU_PINNED_MIN_XFER_SIZE: &str = "GPU_PINNED_MIN_XFER_SIZE";
+
+/// Stage every pageable copy: larger than any host allocation.
+const STAGE_ALL_PAGEABLE_COPIES_MB: &str = "100000";
+
+/// Keep host memory the GPU reads out of the kernel's reclaim path, unless
+/// the operator set the switches.
+///
+/// Under ROCm's defaults, host pages that the GPU reads are registered as
+/// KFD userptr BOs. That covers every `hipHostMalloc` block, which is shared
+/// anonymous memory, and the source of any large `hipMemcpy` from pageable
+/// memory, such as the mapped model file, which clr pins in place. Reclaim or
+/// migration may take those pages, and every invalidation evicts all of the
+/// process's queues until KFD's restore worker has faulted them back. Under
+/// sustained host-memory pressure the queues stay evicted. The GPU idles and
+/// HIP's signal wait spins a core, with no error (ROCm/rocm-systems#12528).
+/// This was seen with Qwen4's tens of GB of host-mapped routed experts, and
+/// with weight uploads out of the mapped file.
+///
+/// `HSA_USERPTR_FOR_PAGED_MEM=0` backs `hipHostMalloc` memory with GTT BOs,
+/// which are outside reclaim. TTM's `pages_limit` (half of RAM by default)
+/// caps them instead. `GPU_PINNED_MIN_XFER_SIZE` set past any copy size
+/// routes every pageable copy through clr's staging buffer, which is itself
+/// `hipHostMalloc` memory. libhsakmt and clr read both switches once, when
+/// the runtime initializes, so they are set before it loads. APUs ignore the
+/// first switch.
+fn keep_host_memory_out_of_reclaim() {
+    if !cfg!(target_os = "linux") {
+        return;
+    }
+    for (name, value) in [
+        (HSA_USERPTR_FOR_PAGED_MEM, "0"),
+        (GPU_PINNED_MIN_XFER_SIZE, STAGE_ALL_PAGEABLE_COPIES_MB),
+    ] {
+        if std::env::var_os(name).is_none() {
+            std::env::set_var(name, value);
+        }
+    }
+}
+
 impl HipRuntime {
     /// Load the HIP runtime via dlopen.
     /// Uses the shared ROCm resolver so runtime, headers, and hipcc stay within
     /// one selected installation.
     pub fn load() -> HipResult<Self> {
+        keep_host_memory_out_of_reclaim();
         // Windows and Unix share one candidate policy in hipfire_config::rocm so a
         // selected/configured root never falls through to another install's DLL
         // (user cache or bare PATH names). HIP_RUNTIME_LIBRARIES already encodes

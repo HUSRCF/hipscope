@@ -428,6 +428,8 @@ impl Carrier for Qwen4Carrier {
                 .map_err(|error| format!("qwen4: {error}"))?;
             residency::check_host_ram(host_bytes, rdna_compute::kv_slots::mem_available_bytes())
                 .map_err(|error| format!("qwen4: {error}"))?;
+            residency::check_gtt_cap(host_bytes, residency::gtt_budget())
+                .map_err(|error| format!("qwen4: {error}"))?;
             eprintln!(
                 "  qwen4 routed experts: layers 0..{} in VRAM, {moved} expert tensors ({:.1} GiB) in pinned host RAM",
                 vram_layers.min(config.num_hidden_layers),
