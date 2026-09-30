@@ -6,6 +6,9 @@
 //! hip-bridge: Safe Rust FFI to AMD HIP runtime via dlopen.
 //! Modeled after rustane's ane-bridge — no link-time dependency on libamdhip64.
 
+#![warn(clippy::undocumented_unsafe_blocks)]
+#![warn(clippy::multiple_unsafe_ops_per_block)]
+
 mod error;
 mod ffi;
 mod kernarg;
@@ -224,8 +227,10 @@ impl DeviceBuffer {
     }
 }
 
-// DeviceBuffer is Send — GPU pointers can be sent between threads.
-// They are NOT Sync — concurrent access requires stream synchronization.
+// SAFETY: DeviceBuffer is a raw GPU address plus size/ownership tag. Sending
+// the handle between threads is fine; the pointees stay on the device. It is
+// not Sync: concurrent use of the same allocation requires external stream
+// synchronization (aliasing + in-flight lifetime are the caller's contract).
 unsafe impl Send for DeviceBuffer {}
 
 #[cfg(test)]
@@ -234,20 +239,24 @@ mod device_buffer_tests {
 
     #[test]
     fn raw_and_alias_buffers_are_borrowed() {
+        // SAFETY: dangling non-null ptr is never dereferenced; tests only check ownership tags.
         let raw = unsafe { DeviceBuffer::from_raw(std::ptr::dangling_mut(), 4096) };
         assert!(raw.is_borrowed());
         assert!(!raw.is_hip_allocation());
         assert!(!raw.is_vmm_owner());
 
+        // SAFETY: alias must not outlive `raw`; both stay on the stack for this test.
         let alias = unsafe { raw.alias() };
         assert!(alias.is_borrowed());
     }
 
     #[test]
     fn vmm_owner_marker_is_distinct_from_views() {
+        // SAFETY: dangling non-null ptr is never dereferenced; tests only check ownership tags.
         let owner = unsafe { DeviceBuffer::from_vmm_owner(std::ptr::dangling_mut(), 4096) };
         assert!(owner.is_vmm_owner());
         assert!(!owner.is_borrowed());
+        // SAFETY: alias must not outlive `owner`; both stay on the stack for this test.
         let view = unsafe { owner.alias() };
         assert!(view.is_borrowed());
         assert!(!view.is_vmm_owner());

@@ -152,8 +152,10 @@ pub struct VmmArena {
     releasing: bool,
 }
 
-// The HIP process address and allocation handles may move with model state.
-// Concurrent mutation is still excluded because VmmArena is not Sync.
+// SAFETY: VmmArena holds a device VA base and opaque HIP allocation handles that
+// may move with model state across threads. Concurrent mutation is excluded
+// because VmmArena is not Sync; callers must not free/unmap while another thread
+// still has in-flight work on the mapped prefix.
 unsafe impl Send for VmmArena {}
 
 impl VmmArena {
@@ -302,7 +304,11 @@ impl VmmArena {
         let prop = HipMemAllocationProp::device_pinned(self.owner_device);
         let handle = hip.mem_create(size, &prop)?;
         let address = offset_ptr(self.base, self.mapped_bytes);
+        // SAFETY: `address` is base+mapped_bytes within the live reserved VA;
+        // `size` is a granularity multiple and fits the remaining reserve;
+        // `handle` is a fresh owned allocation covering `size`, not yet mapped.
         if let Err(err) = unsafe { hip.mem_map(address, size, handle) } {
+            // SAFETY: map failed so no range references `handle`; release is exclusive.
             return match unsafe { hip.mem_release(handle) } {
                 Ok(()) => Err(err),
                 Err(cleanup) => {
@@ -323,6 +329,9 @@ impl VmmArena {
         // reservation base over the contiguous mapped prefix is accepted and
         // also ensures newly-added peer devices gain access to older segments.
         if let Err(err) = take_fault(VmmFaultKind::AccessReset).map_or_else(
+            // SAFETY: `self.base..+next_mapped` is the contiguous mapped prefix
+            // (just extended by mem_map); `access` lists only owner/peer devices
+            // already validated for peer access.
             || unsafe { hip.mem_set_access(self.base, next_mapped, &access) },
             Err,
         ) {
@@ -346,9 +355,12 @@ impl VmmArena {
                 handle: Some(handle),
                 mapped: true,
             };
+            // SAFETY: `address,size` is the segment just mapped; no kernels are
+            // scheduled on it yet (map_next is pre-use). Unmap before release.
             let cleanup_error = match unsafe { hip.mem_unmap(address, size) } {
                 Ok(()) => {
                     segment.mapped = false;
+                    // SAFETY: unmapped so no mapped range still references handle.
                     match unsafe { hip.mem_release(handle) } {
                         Ok(()) => {
                             segment.handle = None;
@@ -405,6 +417,8 @@ impl VmmArena {
                 ),
             ));
         }
+        // SAFETY: base is a live reserved VA; logical_bytes <= mapped_bytes
+        // (checked above). Borrowed wrapper must not outlive the arena or be freed.
         Ok(unsafe { DeviceBuffer::from_raw(self.base, logical_bytes) })
     }
 
@@ -457,12 +471,17 @@ impl VmmArena {
                 if let Some(err) = take_fault(VmmFaultKind::Unmap) {
                     return Err(err);
                 }
+                // SAFETY: offset/size come from tracked segments; release() already
+                // device_synchronize'd every access device so in-flight work is
+                // quiesced before unmap. base is the arena's reserved VA.
                 unsafe { hip.mem_unmap(offset_ptr(base, offset), size) }
             },
             |handle| {
                 if let Some(err) = take_fault(VmmFaultKind::Release) {
                     return Err(err);
                 }
+                // SAFETY: called after the segment's map is unmapped (cleanup_segments
+                // order); handle is owned and no mapped range should still reference it.
                 unsafe { hip.mem_release(handle) }
             },
         );
@@ -480,6 +499,8 @@ impl VmmArena {
 }
 
 fn offset_ptr(base: *mut c_void, offset: usize) -> *mut c_void {
+    // SAFETY: callers pass base from a live VmmArena reserve and offset within
+    // reserved_bytes (map_next / release segment bookkeeping). u8 add; no deref.
     unsafe { (base as *mut u8).add(offset) as *mut c_void }
 }
 

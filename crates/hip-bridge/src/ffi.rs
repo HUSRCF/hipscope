@@ -452,7 +452,13 @@ pub struct HipRuntime {
 }
 
 // HipRuntime is Send+Sync — the underlying HIP runtime is thread-safe for API calls.
+// SAFETY: HipRuntime holds only function pointers and a Library; HIP's C API
+// is documented as safe to call from multiple threads. Sync allows
+// shared refs; individual buffer/stream races remain the caller's.
 unsafe impl Send for HipRuntime {}
+// SAFETY: HipRuntime holds only function pointers and a Library; HIP's C API
+// is documented as safe to call from multiple threads. Sync allows
+// shared refs; individual buffer/stream races remain the caller's.
 unsafe impl Sync for HipRuntime {}
 
 macro_rules! load_fn {
@@ -554,6 +560,9 @@ impl HipRuntime {
         // the host's preferred filenames (amdhip64*.dll vs libamdhip64.so*).
         let candidates =
             hipfire_config::rocm::library_candidates(hipfire_config::rocm::HIP_RUNTIME_LIBRARIES);
+        // SAFETY: libloading::Library::new maps a shared object by path; on success
+        // the Library owns the mapping for the process. Failure paths only
+        // read the error value.
         let lib = unsafe {
             let mut loaded = None;
             let mut last_err = None;
@@ -593,56 +602,67 @@ impl HipRuntime {
             }
         };
 
-        let runtime = unsafe {
-            Self {
-                fn_init: load_fn!(lib, "hipInit", unsafe extern "C" fn(c_uint) -> u32),
-                fn_runtime_get_version: load_fn!(
+        let runtime = Self {
+                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+                fn_init: unsafe { load_fn!(lib, "hipInit", unsafe extern "C" fn(c_uint) -> u32) },
+                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+                fn_runtime_get_version: unsafe { load_fn!(
                     lib,
                     "hipRuntimeGetVersion",
                     unsafe extern "C" fn(*mut c_int) -> u32
-                ),
-                fn_get_device_count: load_fn!(
+                ) },
+                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+                fn_get_device_count: unsafe { load_fn!(
                     lib,
                     "hipGetDeviceCount",
                     unsafe extern "C" fn(*mut c_int) -> u32
-                ),
-                fn_set_device: load_fn!(lib, "hipSetDevice", unsafe extern "C" fn(c_int) -> u32),
-                fn_set_device_flags: load_fn!(
+                ) },
+                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+                fn_set_device: unsafe { load_fn!(lib, "hipSetDevice", unsafe extern "C" fn(c_int) -> u32) },
+                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+                fn_set_device_flags: unsafe { load_fn!(
                     lib,
                     "hipSetDeviceFlags",
                     unsafe extern "C" fn(c_uint) -> u32
-                ),
-                fn_get_device: load_fn!(
+                ) },
+                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+                fn_get_device: unsafe { load_fn!(
                     lib,
                     "hipGetDevice",
                     unsafe extern "C" fn(*mut c_int) -> u32
-                ),
-                fn_device_get_uuid: load_fn!(
+                ) },
+                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+                fn_device_get_uuid: unsafe { load_fn!(
                     lib,
                     "hipDeviceGetUuid",
                     unsafe extern "C" fn(*mut u8, c_int) -> u32
-                ),
-                fn_device_get_pci_bus_id: load_fn!(
+                ) },
+                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+                fn_device_get_pci_bus_id: unsafe { load_fn!(
                     lib,
                     "hipDeviceGetPCIBusId",
                     unsafe extern "C" fn(*mut c_char, c_int, c_int) -> u32
-                ),
-                fn_device_can_access_peer: load_fn!(
+                ) },
+                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+                fn_device_can_access_peer: unsafe { load_fn!(
                     lib,
                     "hipDeviceCanAccessPeer",
                     unsafe extern "C" fn(*mut c_int, c_int, c_int) -> u32
-                ),
-                fn_device_enable_peer_access: load_fn!(
+                ) },
+                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+                fn_device_enable_peer_access: unsafe { load_fn!(
                     lib,
                     "hipDeviceEnablePeerAccess",
                     unsafe extern "C" fn(c_int, c_uint) -> u32
-                ),
-                fn_memcpy_peer: load_fn!(
+                ) },
+                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+                fn_memcpy_peer: unsafe { load_fn!(
                     lib,
                     "hipMemcpyPeer",
                     unsafe extern "C" fn(*mut c_void, c_int, *const c_void, c_int, usize) -> u32
-                ),
-                fn_memcpy_peer_async: load_fn!(
+                ) },
+                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+                fn_memcpy_peer_async: unsafe { load_fn!(
                     lib,
                     "hipMemcpyPeerAsync",
                     unsafe extern "C" fn(
@@ -653,49 +673,59 @@ impl HipRuntime {
                         usize,
                         HipStream,
                     ) -> u32
-                ),
-                fn_pointer_get_attributes: load_fn!(
+                ) },
+                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+                fn_pointer_get_attributes: unsafe { load_fn!(
                     lib,
                     "hipPointerGetAttributes",
                     unsafe extern "C" fn(*mut HipPointerAttribute, *const c_void) -> u32
-                ),
-                fn_malloc: load_fn!(
+                ) },
+                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+                fn_malloc: unsafe { load_fn!(
                     lib,
                     "hipMalloc",
                     unsafe extern "C" fn(*mut *mut c_void, usize) -> u32
-                ),
-                fn_ext_malloc_with_flags: load_optional_fn!(
+                ) },
+                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+                fn_ext_malloc_with_flags: unsafe { load_optional_fn!(
                     lib,
                     "hipExtMallocWithFlags",
                     unsafe extern "C" fn(*mut *mut c_void, usize, c_uint) -> u32
-                ),
-                fn_free: load_fn!(lib, "hipFree", unsafe extern "C" fn(*mut c_void) -> u32),
-                fn_host_malloc: load_optional_fn!(
+                ) },
+                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+                fn_free: unsafe { load_fn!(lib, "hipFree", unsafe extern "C" fn(*mut c_void) -> u32) },
+                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+                fn_host_malloc: unsafe { load_optional_fn!(
                     lib,
                     "hipHostMalloc",
                     unsafe extern "C" fn(*mut *mut c_void, usize, c_uint) -> u32
-                ),
-                fn_host_get_device_pointer: load_optional_fn!(
+                ) },
+                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+                fn_host_get_device_pointer: unsafe { load_optional_fn!(
                     lib,
                     "hipHostGetDevicePointer",
                     unsafe extern "C" fn(*mut *mut c_void, *mut c_void, c_uint) -> u32
-                ),
-                fn_host_free: load_optional_fn!(
+                ) },
+                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+                fn_host_free: unsafe { load_optional_fn!(
                     lib,
                     "hipHostFree",
                     unsafe extern "C" fn(*mut c_void) -> u32
-                ),
-                fn_mem_get_address_range: load_fn!(
+                ) },
+                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+                fn_mem_get_address_range: unsafe { load_fn!(
                     lib,
                     "hipMemGetAddressRange",
                     unsafe extern "C" fn(*mut *mut c_void, *mut usize, *mut c_void) -> u32
-                ),
-                fn_memcpy: load_fn!(
+                ) },
+                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+                fn_memcpy: unsafe { load_fn!(
                     lib,
                     "hipMemcpy",
                     unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_uint) -> u32
-                ),
-                fn_memcpy_async: load_fn!(
+                ) },
+                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+                fn_memcpy_async: unsafe { load_fn!(
                     lib,
                     "hipMemcpyAsync",
                     unsafe extern "C" fn(
@@ -705,28 +735,33 @@ impl HipRuntime {
                         c_uint,
                         HipStream,
                     ) -> u32
-                ),
-                fn_memset: load_fn!(
+                ) },
+                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+                fn_memset: unsafe { load_fn!(
                     lib,
                     "hipMemset",
                     unsafe extern "C" fn(*mut c_void, c_int, usize) -> u32
-                ),
-                fn_memset_async: load_fn!(
+                ) },
+                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+                fn_memset_async: unsafe { load_fn!(
                     lib,
                     "hipMemsetAsync",
                     unsafe extern "C" fn(*mut c_void, c_int, usize, HipStream) -> u32
-                ),
-                fn_memset_d32_async: load_fn!(
+                ) },
+                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+                fn_memset_d32_async: unsafe { load_fn!(
                     lib,
                     "hipMemsetD32Async",
                     unsafe extern "C" fn(*mut c_void, c_int, usize, HipStream) -> u32
-                ),
-                fn_mem_address_reserve: load_optional_fn!(
+                ) },
+                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+                fn_mem_address_reserve: unsafe { load_optional_fn!(
                     lib,
                     "hipMemAddressReserve",
                     unsafe extern "C" fn(*mut *mut c_void, usize, usize, *mut c_void, u64) -> u32
-                ),
-                fn_mem_create: load_optional_fn!(
+                ) },
+                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+                fn_mem_create: unsafe { load_optional_fn!(
                     lib,
                     "hipMemCreate",
                     unsafe extern "C" fn(
@@ -735,21 +770,24 @@ impl HipRuntime {
                         *const HipMemAllocationProp,
                         u64,
                     ) -> u32
-                ),
-                fn_mem_get_allocation_granularity: load_optional_fn!(
+                ) },
+                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+                fn_mem_get_allocation_granularity: unsafe { load_optional_fn!(
                     lib,
                     "hipMemGetAllocationGranularity",
                     unsafe extern "C" fn(*mut usize, *const HipMemAllocationProp, u32) -> u32
-                ),
-                fn_mem_get_handle_properties: load_optional_fn!(
+                ) },
+                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+                fn_mem_get_handle_properties: unsafe { load_optional_fn!(
                     lib,
                     "hipMemGetAllocationPropertiesFromHandle",
                     unsafe extern "C" fn(
                         *mut HipMemAllocationProp,
                         HipMemGenericAllocationHandle,
                     ) -> u32
-                ),
-                fn_mem_map: load_optional_fn!(
+                ) },
+                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+                fn_mem_map: unsafe { load_optional_fn!(
                     lib,
                     "hipMemMap",
                     unsafe extern "C" fn(
@@ -759,58 +797,69 @@ impl HipRuntime {
                         HipMemGenericAllocationHandle,
                         u64,
                     ) -> u32
-                ),
-                fn_mem_unmap: load_optional_fn!(
+                ) },
+                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+                fn_mem_unmap: unsafe { load_optional_fn!(
                     lib,
                     "hipMemUnmap",
                     unsafe extern "C" fn(*mut c_void, usize) -> u32
-                ),
-                fn_mem_set_access: load_optional_fn!(
+                ) },
+                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+                fn_mem_set_access: unsafe { load_optional_fn!(
                     lib,
                     "hipMemSetAccess",
                     unsafe extern "C" fn(*mut c_void, usize, *const HipMemAccessDesc, usize) -> u32
-                ),
-                fn_mem_release: load_optional_fn!(
+                ) },
+                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+                fn_mem_release: unsafe { load_optional_fn!(
                     lib,
                     "hipMemRelease",
                     unsafe extern "C" fn(HipMemGenericAllocationHandle) -> u32
-                ),
-                fn_stream_create: load_fn!(
+                ) },
+                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+                fn_stream_create: unsafe { load_fn!(
                     lib,
                     "hipStreamCreate",
                     unsafe extern "C" fn(*mut HipStream) -> u32
-                ),
-                fn_stream_create_with_flags: load_fn!(
+                ) },
+                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+                fn_stream_create_with_flags: unsafe { load_fn!(
                     lib,
                     "hipStreamCreateWithFlags",
                     unsafe extern "C" fn(*mut HipStream, c_uint) -> u32
-                ),
-                fn_stream_synchronize: load_fn!(
+                ) },
+                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+                fn_stream_synchronize: unsafe { load_fn!(
                     lib,
                     "hipStreamSynchronize",
                     unsafe extern "C" fn(HipStream) -> u32
-                ),
-                fn_stream_destroy: load_fn!(
+                ) },
+                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+                fn_stream_destroy: unsafe { load_fn!(
                     lib,
                     "hipStreamDestroy",
                     unsafe extern "C" fn(HipStream) -> u32
-                ),
-                fn_module_load: load_fn!(
+                ) },
+                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+                fn_module_load: unsafe { load_fn!(
                     lib,
                     "hipModuleLoad",
                     unsafe extern "C" fn(*mut HipModule, *const c_char) -> u32
-                ),
-                fn_module_load_data: load_fn!(
+                ) },
+                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+                fn_module_load_data: unsafe { load_fn!(
                     lib,
                     "hipModuleLoadData",
                     unsafe extern "C" fn(*mut HipModule, *const c_void) -> u32
-                ),
-                fn_module_get_function: load_fn!(
+                ) },
+                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+                fn_module_get_function: unsafe { load_fn!(
                     lib,
                     "hipModuleGetFunction",
                     unsafe extern "C" fn(*mut HipFunction, HipModule, *const c_char) -> u32
-                ),
-                fn_module_launch_kernel: load_fn!(
+                ) },
+                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+                fn_module_launch_kernel: unsafe { load_fn!(
                     lib,
                     "hipModuleLaunchKernel",
                     unsafe extern "C" fn(
@@ -826,69 +875,83 @@ impl HipRuntime {
                         *mut *mut c_void,
                         *mut *mut c_void,
                     ) -> u32
-                ),
-                fn_module_occupancy_max_active_blocks: load_optional_fn!(
+                ) },
+                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+                fn_module_occupancy_max_active_blocks: unsafe { load_optional_fn!(
                     lib,
                     "hipModuleOccupancyMaxActiveBlocksPerMultiprocessor",
                     unsafe extern "C" fn(*mut c_int, HipFunction, c_int, usize) -> u32
-                ),
-                fn_event_create: load_fn!(
+                ) },
+                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+                fn_event_create: unsafe { load_fn!(
                     lib,
                     "hipEventCreate",
                     unsafe extern "C" fn(*mut HipEvent) -> u32
-                ),
-                fn_event_create_with_flags: load_fn!(
+                ) },
+                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+                fn_event_create_with_flags: unsafe { load_fn!(
                     lib,
                     "hipEventCreateWithFlags",
                     unsafe extern "C" fn(*mut HipEvent, c_uint) -> u32
-                ),
-                fn_event_record: load_fn!(
+                ) },
+                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+                fn_event_record: unsafe { load_fn!(
                     lib,
                     "hipEventRecord",
                     unsafe extern "C" fn(HipEvent, HipStream) -> u32
-                ),
-                fn_event_query: load_fn!(
+                ) },
+                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+                fn_event_query: unsafe { load_fn!(
                     lib,
                     "hipEventQuery",
                     unsafe extern "C" fn(HipEvent) -> u32
-                ),
-                fn_event_synchronize: load_fn!(
+                ) },
+                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+                fn_event_synchronize: unsafe { load_fn!(
                     lib,
                     "hipEventSynchronize",
                     unsafe extern "C" fn(HipEvent) -> u32
-                ),
-                fn_event_elapsed_time: load_fn!(
+                ) },
+                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+                fn_event_elapsed_time: unsafe { load_fn!(
                     lib,
                     "hipEventElapsedTime",
                     unsafe extern "C" fn(*mut f32, HipEvent, HipEvent) -> u32
-                ),
-                fn_event_destroy: load_fn!(
+                ) },
+                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+                fn_event_destroy: unsafe { load_fn!(
                     lib,
                     "hipEventDestroy",
                     unsafe extern "C" fn(HipEvent) -> u32
-                ),
-                fn_stream_wait_event: load_fn!(
+                ) },
+                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+                fn_stream_wait_event: unsafe { load_fn!(
                     lib,
                     "hipStreamWaitEvent",
                     unsafe extern "C" fn(HipStream, HipEvent, c_uint) -> u32
-                ),
-                fn_get_error_string: load_fn!(
+                ) },
+                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+                fn_get_error_string: unsafe { load_fn!(
                     lib,
                     "hipGetErrorString",
                     unsafe extern "C" fn(u32) -> *const i8
-                ),
-                fn_get_last_error: load_fn!(lib, "hipGetLastError", unsafe extern "C" fn() -> u32),
-                fn_stream_begin_capture: load_fn!(
+                ) },
+                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+                fn_get_last_error: unsafe { load_fn!(lib, "hipGetLastError", unsafe extern "C" fn() -> u32) },
+                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+                fn_stream_begin_capture: unsafe { load_fn!(
                     lib,
                     "hipStreamBeginCapture",
                     unsafe extern "C" fn(HipStream, c_uint) -> u32
-                ),
-                fn_stream_end_capture: load_fn!(
+                ) },
+                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+                fn_stream_end_capture: unsafe { load_fn!(
                     lib,
                     "hipStreamEndCapture",
                     unsafe extern "C" fn(HipStream, *mut HipGraph) -> u32
-                ),
-                fn_graph_instantiate: load_fn!(
+                ) },
+                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+                fn_graph_instantiate: unsafe { load_fn!(
                     lib,
                     "hipGraphInstantiate",
                     unsafe extern "C" fn(
@@ -898,54 +961,62 @@ impl HipRuntime {
                         *mut c_void,
                         usize,
                     ) -> u32
-                ),
-                fn_graph_launch: load_fn!(
+                ) },
+                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+                fn_graph_launch: unsafe { load_fn!(
                     lib,
                     "hipGraphLaunch",
                     unsafe extern "C" fn(HipGraphExec, HipStream) -> u32
-                ),
-                fn_graph_exec_destroy: load_fn!(
+                ) },
+                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+                fn_graph_exec_destroy: unsafe { load_fn!(
                     lib,
                     "hipGraphExecDestroy",
                     unsafe extern "C" fn(HipGraphExec) -> u32
-                ),
-                fn_graph_destroy: load_fn!(
+                ) },
+                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+                fn_graph_destroy: unsafe { load_fn!(
                     lib,
                     "hipGraphDestroy",
                     unsafe extern "C" fn(HipGraph) -> u32
-                ),
-                fn_stream_write_value32: load_fn!(
+                ) },
+                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+                fn_stream_write_value32: unsafe { load_fn!(
                     lib,
                     "hipStreamWriteValue32",
                     unsafe extern "C" fn(HipStream, *mut c_void, u32, c_uint) -> u32
-                ),
-                fn_stream_wait_value32: load_optional_fn!(
+                ) },
+                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+                fn_stream_wait_value32: unsafe { load_optional_fn!(
                     lib,
                     "hipStreamWaitValue32",
                     unsafe extern "C" fn(HipStream, *mut c_void, u32, c_uint, u32) -> u32
-                ),
-                fn_device_synchronize: load_fn!(
+                ) },
+                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+                fn_device_synchronize: unsafe { load_fn!(
                     lib,
                     "hipDeviceSynchronize",
                     unsafe extern "C" fn() -> u32
-                ),
-                fn_get_device_properties: load_fn!(
+                ) },
+                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+                fn_get_device_properties: unsafe { load_fn!(
                     lib,
                     "hipGetDeviceProperties",
                     unsafe extern "C" fn(*mut u8, c_int) -> u32
-                ),
-                fn_get_device_attribute: load_fn!(
+                ) },
+                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+                fn_get_device_attribute: unsafe { load_fn!(
                     lib,
                     "hipDeviceGetAttribute",
                     unsafe extern "C" fn(*mut c_int, c_int, c_int) -> u32
-                ),
-                fn_mem_get_info: load_fn!(
+                ) },
+                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+                fn_mem_get_info: unsafe { load_fn!(
                     lib,
                     "hipMemGetInfo",
                     unsafe extern "C" fn(*mut usize, *mut usize) -> u32
-                ),
+                ) },
                 _lib: lib,
-            }
         };
 
         // Empirically required on ROCm 7.2 — hipcc-linked binaries get an
@@ -955,6 +1026,8 @@ impl HipRuntime {
         // blobs without it. Older HIP libs implicitly init on the first
         // hipMalloc/hipGetDevice call, so the absence used to be tolerated.
         // hipInit(0) is documented as safe to call repeatedly.
+        // SAFETY: HIP runtime symbol is live from HipRuntime::load; out-params are
+        // stack locals (or caller-provided device ids). No host pointer aliasing.
         let code = unsafe { (runtime.fn_init)(0) };
         runtime.check(code, "hipInit")?;
         Ok(runtime)
@@ -983,6 +1056,8 @@ impl HipRuntime {
     /// Get HIP runtime version as (major, minor). E.g. ROCm 6.3 → (6, 3).
     pub fn runtime_version(&self) -> HipResult<(i32, i32)> {
         let mut version: c_int = 0;
+        // SAFETY: HIP runtime symbol is live from HipRuntime::load; out-params are
+        // stack locals (or caller-provided device ids). No host pointer aliasing.
         let code = unsafe { (self.fn_runtime_get_version)(&mut version) };
         self.check(code, "hipRuntimeGetVersion")?;
         // HIP version encoding: major * 10000000 + minor * 100000 + patch
@@ -995,6 +1070,8 @@ impl HipRuntime {
 
     pub fn device_count(&self) -> HipResult<i32> {
         let mut count: c_int = 0;
+        // SAFETY: HIP runtime symbol is live from HipRuntime::load; out-params are
+        // stack locals (or caller-provided device ids). No host pointer aliasing.
         let code = unsafe { (self.fn_get_device_count)(&mut count) };
         self.check(code, "hipGetDeviceCount")?;
         Ok(count)
@@ -1003,6 +1080,8 @@ impl HipRuntime {
     /// hipUUID.bytes. Retain that spelling so it matches GPU-... selectors.
     pub fn device_uuid(&self, id: i32) -> HipResult<String> {
         let mut bytes = [0u8; 16];
+        // SAFETY: HIP runtime symbol is live from HipRuntime::load; out-params are
+        // stack locals (or caller-provided device ids). No host pointer aliasing.
         let code = unsafe { (self.fn_device_get_uuid)(bytes.as_mut_ptr(), id) };
         self.check(code, "hipDeviceGetUuid")?;
         let mut uuid = String::with_capacity(36);
@@ -1022,14 +1101,20 @@ impl HipRuntime {
 
     pub fn device_pci_bus_id(&self, id: i32) -> HipResult<String> {
         let mut bytes = [0 as c_char; 32];
+        // SAFETY: HIP runtime symbol is live from HipRuntime::load; out-params are
+        // stack locals (or caller-provided device ids). No host pointer aliasing.
         let code = unsafe { (self.fn_device_get_pci_bus_id)(bytes.as_mut_ptr(), 32, id) };
         self.check(code, "hipDeviceGetPCIBusId")?;
+        // SAFETY: on success HIP wrote a NUL-terminated C string into the local
+        // buffer; the pointer addresses that buffer only for this read.
         Ok(unsafe { std::ffi::CStr::from_ptr(bytes.as_ptr()) }
             .to_string_lossy()
             .into_owned())
     }
 
     pub fn set_device(&self, id: i32) -> HipResult<()> {
+        // SAFETY: HIP runtime symbol is live from HipRuntime::load; out-params are
+        // stack locals (or caller-provided device ids). No host pointer aliasing.
         let code = unsafe { (self.fn_set_device)(id) };
         self.check(code, "hipSetDevice")
     }
@@ -1040,12 +1125,16 @@ impl HipRuntime {
     /// spin is lowest-latency but consumes a CPU core; yield/blocking are more
     /// cooperative with the OS and reduce CPU pressure during long prefill.
     pub fn set_device_flags(&self, flags: u32) -> HipResult<()> {
+        // SAFETY: HIP runtime symbol is live from HipRuntime::load; out-params are
+        // stack locals (or caller-provided device ids). No host pointer aliasing.
         let code = unsafe { (self.fn_set_device_flags)(flags as c_uint) };
         self.check(code, "hipSetDeviceFlags")
     }
 
     pub fn current_device(&self) -> HipResult<i32> {
         let mut id: c_int = 0;
+        // SAFETY: HIP runtime symbol is live from HipRuntime::load; out-params are
+        // stack locals (or caller-provided device ids). No host pointer aliasing.
         let code = unsafe { (self.fn_get_device)(&mut id) };
         self.check(code, "hipGetDevice")?;
         Ok(id)
@@ -1055,6 +1144,8 @@ impl HipRuntime {
 
     pub fn can_access_peer(&self, device: i32, peer_device: i32) -> HipResult<bool> {
         let mut can: c_int = 0;
+        // SAFETY: HIP runtime symbol is live from HipRuntime::load; out-params are
+        // stack locals (or caller-provided device ids). No host pointer aliasing.
         let code = unsafe { (self.fn_device_can_access_peer)(&mut can, device, peer_device) };
         self.check(code, "hipDeviceCanAccessPeer")?;
         Ok(can != 0)
@@ -1063,6 +1154,8 @@ impl HipRuntime {
     /// Idempotent: hipErrorPeerAccessAlreadyEnabled (704) → Ok. Caller must
     /// have bound the source device first (`set_device`).
     pub fn enable_peer_access(&self, peer_device: i32) -> HipResult<()> {
+        // SAFETY: HIP runtime symbol is live from HipRuntime::load; out-params are
+        // stack locals (or caller-provided device ids). No host pointer aliasing.
         let code = unsafe { (self.fn_device_enable_peer_access)(peer_device, 0) };
         if code == HIP_SUCCESS || code == crate::HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED {
             Ok(())
@@ -1093,6 +1186,9 @@ impl HipRuntime {
             "size ({size}) exceeds src ({})",
             src.size()
         );
+        // SAFETY: pointers are live HIP allocations or host slices; sizes were
+        // asserted to fit. Same-device/stream and host-buffer lifetime across
+        // async copies are the caller's contract; Rust does not deref device ptrs.
         let code = unsafe {
             (self.fn_memcpy_peer)(
                 dst.as_ptr(),
@@ -1125,6 +1221,9 @@ impl HipRuntime {
             "size ({size}) exceeds src ({})",
             src.size()
         );
+        // SAFETY: pointers are live HIP allocations or host slices; sizes were
+        // asserted to fit. Same-device/stream and host-buffer lifetime across
+        // async copies are the caller's contract; Rust does not deref device ptrs.
         let code = unsafe {
             (self.fn_memcpy_peer_async)(
                 dst.as_ptr(),
@@ -1140,6 +1239,8 @@ impl HipRuntime {
 
     pub fn pointer_get_attributes(&self, buf: &DeviceBuffer) -> HipResult<HipPointerAttribute> {
         let mut attr = HipPointerAttribute::default();
+        // SAFETY: HIP runtime symbol is live from HipRuntime::load; out-params are
+        // stack locals (or caller-provided device ids). No host pointer aliasing.
         let code = unsafe { (self.fn_pointer_get_attributes)(&mut attr, buf.as_ptr()) };
         self.check(code, "hipPointerGetAttributes")?;
         Ok(attr)
@@ -1149,6 +1250,8 @@ impl HipRuntime {
 
     pub fn malloc(&self, size: usize) -> HipResult<DeviceBuffer> {
         let mut ptr: *mut c_void = ptr::null_mut();
+        // SAFETY: FFI out-params are stack locals with valid writable provenance;
+        // HIP symbols were resolved at load. Returned pointers are opaque to Rust.
         let code = unsafe { (self.fn_malloc)(&mut ptr, size) };
         self.check(code, "hipMalloc")?;
         Ok(DeviceBuffer {
@@ -1172,6 +1275,8 @@ impl HipRuntime {
             ));
         };
         let mut ptr: *mut c_void = ptr::null_mut();
+        // SAFETY: FFI out-params are stack locals with valid writable provenance;
+        // HIP symbols were resolved at load. Returned pointers are opaque to Rust.
         let code = unsafe { ext_malloc(&mut ptr, size, HIP_MALLOC_SIGNAL_MEMORY) };
         self.check(code, "hipExtMallocWithFlags(hipMallocSignalMemory)")?;
         Ok(DeviceBuffer {
@@ -1190,6 +1295,8 @@ impl HipRuntime {
                 "hipFree rejected a borrowed or VMM DeviceBuffer",
             ));
         }
+        // SAFETY: buf.ptr is a live hipMalloc allocation (ownership checked above);
+        // caller must ensure GPU work on it is quiesced (documented on free).
         let code = unsafe { (self.fn_free)(buf.ptr) };
         self.check(code, "hipFree")
     }
@@ -1203,6 +1310,8 @@ impl HipRuntime {
     pub fn host_malloc(&self, size: usize, flags: u32) -> HipResult<*mut c_void> {
         let func = self.missing_vmm_symbol("hipHostMalloc", self.fn_host_malloc)?;
         let mut ptr: *mut c_void = ptr::null_mut();
+        // SAFETY: resolved VMM/host HIP symbol; pointer/handle args meet the method's
+        // # Safety or documented preconditions; out-params are stack locals.
         let code = unsafe { func(&mut ptr, size, flags) };
         self.check(code, "hipHostMalloc")?;
         Ok(ptr)
@@ -1216,6 +1325,8 @@ impl HipRuntime {
         let func =
             self.missing_vmm_symbol("hipHostGetDevicePointer", self.fn_host_get_device_pointer)?;
         let mut dev: *mut c_void = ptr::null_mut();
+        // SAFETY: resolved VMM/host HIP symbol; pointer/handle args meet the method's
+        // # Safety or documented preconditions; out-params are stack locals.
         let code = unsafe { func(&mut dev, host, flags) };
         self.check(code, "hipHostGetDevicePointer")?;
         Ok(dev)
@@ -1227,6 +1338,8 @@ impl HipRuntime {
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn host_free(&self, host: *mut c_void) -> HipResult<()> {
         let func = self.missing_vmm_symbol("hipHostFree", self.fn_host_free)?;
+        // SAFETY: resolved VMM/host HIP symbol; pointer/handle args meet the method's
+        // # Safety or documented preconditions; out-params are stack locals.
         let code = unsafe { func(host) };
         self.check(code, "hipHostFree")
     }
@@ -1241,6 +1354,8 @@ impl HipRuntime {
             self.fn_mem_get_allocation_granularity,
         )?;
         let mut granularity: usize = 0;
+        // SAFETY: resolved VMM/host HIP symbol; pointer/handle args meet the method's
+        // # Safety or documented preconditions; out-params are stack locals.
         let code = unsafe {
             func(
                 &mut granularity,
@@ -1268,7 +1383,11 @@ impl HipRuntime {
             "hipMemGetAllocationPropertiesFromHandle",
             self.fn_mem_get_handle_properties,
         )?;
+        // SAFETY: HipMemAllocationProp is a POD FFI struct; zeroed bytes are a
+        // valid representation overwritten by the subsequent HIP query.
         let mut prop: HipMemAllocationProp = unsafe { std::mem::zeroed() };
+        // SAFETY: resolved VMM/host HIP symbol; pointer/handle args meet the method's
+        // # Safety or documented preconditions; out-params are stack locals.
         let code = unsafe { func(&mut prop as *mut HipMemAllocationProp, handle) };
         self.check(code, "hipMemGetAllocationPropertiesFromHandle")?;
         Ok(prop)
@@ -1276,6 +1395,8 @@ impl HipRuntime {
     pub fn mem_address_reserve(&self, size: usize, alignment: usize) -> HipResult<*mut c_void> {
         let func = self.missing_vmm_symbol("hipMemAddressReserve", self.fn_mem_address_reserve)?;
         let mut ptr: *mut c_void = ptr::null_mut();
+        // SAFETY: resolved VMM/host HIP symbol; pointer/handle args meet the method's
+        // # Safety or documented preconditions; out-params are stack locals.
         let code = unsafe { func(&mut ptr, size, alignment, ptr::null_mut(), 0) };
         self.check(code, "hipMemAddressReserve")?;
         Ok(ptr)
@@ -1288,6 +1409,8 @@ impl HipRuntime {
     ) -> HipResult<HipMemGenericAllocationHandle> {
         let func = self.missing_vmm_symbol("hipMemCreate", self.fn_mem_create)?;
         let mut handle: HipMemGenericAllocationHandle = ptr::null_mut();
+        // SAFETY: resolved VMM/host HIP symbol; pointer/handle args meet the method's
+        // # Safety or documented preconditions; out-params are stack locals.
         let code = unsafe { func(&mut handle, size, prop as *const HipMemAllocationProp, 0) };
         self.check(code, "hipMemCreate")?;
         Ok(handle)
@@ -1303,6 +1426,8 @@ impl HipRuntime {
         handle: HipMemGenericAllocationHandle,
     ) -> HipResult<()> {
         let func = self.missing_vmm_symbol("hipMemMap", self.fn_mem_map)?;
+        // SAFETY: resolved VMM/host HIP symbol; pointer/handle args meet the method's
+        // # Safety or documented preconditions; out-params are stack locals.
         let code = unsafe { func(ptr, size, 0, handle, 0) };
         self.check(code, "hipMemMap")
     }
@@ -1311,6 +1436,8 @@ impl HipRuntime {
     /// `ptr..ptr+size` must describe a currently mapped VMM range.
     pub unsafe fn mem_unmap(&self, ptr: *mut c_void, size: usize) -> HipResult<()> {
         let func = self.missing_vmm_symbol("hipMemUnmap", self.fn_mem_unmap)?;
+        // SAFETY: resolved VMM/host HIP symbol; pointer/handle args meet the method's
+        // # Safety or documented preconditions; out-params are stack locals.
         let code = unsafe { func(ptr, size) };
         self.check(code, "hipMemUnmap")
     }
@@ -1325,6 +1452,8 @@ impl HipRuntime {
         descs: &[HipMemAccessDesc],
     ) -> HipResult<()> {
         let func = self.missing_vmm_symbol("hipMemSetAccess", self.fn_mem_set_access)?;
+        // SAFETY: resolved VMM/host HIP symbol; pointer/handle args meet the method's
+        // # Safety or documented preconditions; out-params are stack locals.
         let code = unsafe { func(ptr, size, descs.as_ptr(), descs.len()) };
         self.check(code, "hipMemSetAccess")
     }
@@ -1334,6 +1463,8 @@ impl HipRuntime {
     /// still reference it.
     pub unsafe fn mem_release(&self, handle: HipMemGenericAllocationHandle) -> HipResult<()> {
         let func = self.missing_vmm_symbol("hipMemRelease", self.fn_mem_release)?;
+        // SAFETY: resolved VMM/host HIP symbol; pointer/handle args meet the method's
+        // # Safety or documented preconditions; out-params are stack locals.
         let code = unsafe { func(handle) };
         self.check(code, "hipMemRelease")
     }
@@ -1350,6 +1481,8 @@ impl HipRuntime {
     ) -> HipResult<(*mut c_void, usize)> {
         let mut base = ptr::null_mut();
         let mut size = 0usize;
+        // SAFETY: FFI out-params are stack locals with valid writable provenance;
+        // HIP symbols were resolved at load. Returned pointers are opaque to Rust.
         let code = unsafe { (self.fn_mem_get_address_range)(&mut base, &mut size, device_ptr) };
         self.check(code, "hipMemGetAddressRange")?;
         if base.is_null() || size == 0 {
@@ -1375,7 +1508,12 @@ impl HipRuntime {
             src.len(),
             dst.size
         );
+        // SAFETY: byte offset was bounds-checked against the DeviceBuffer size;
+        // `u8::add` stays in the same live allocation; no host deref of device memory.
         let dst_ptr = unsafe { (dst.ptr as *mut u8).add(offset) as *mut c_void };
+        // SAFETY: pointers are live HIP allocations or host slices; sizes were
+        // asserted to fit. Same-device/stream and host-buffer lifetime across
+        // async copies are the caller's contract; Rust does not deref device ptrs.
         let code = unsafe {
             (self.fn_memcpy)(
                 dst_ptr,
@@ -1398,9 +1536,16 @@ impl HipRuntime {
     ) -> HipResult<()> {
         assert!(dst_offset + size <= dst.size);
         assert!(src_offset + size <= src.size);
+        // SAFETY: byte offset was bounds-checked against the DeviceBuffer size;
+        // `u8::add` stays in the same live allocation; no host deref of device memory.
         let dst_ptr = unsafe { (dst.ptr as *mut u8).add(dst_offset) as *mut c_void };
+        // SAFETY: byte offset was bounds-checked against the DeviceBuffer size;
+        // `u8::add` stays in the same live allocation; no host deref of device memory.
         let src_ptr = unsafe { (src.ptr as *const u8).add(src_offset) as *const c_void };
         let t = std::time::Instant::now();
+        // SAFETY: pointers are live HIP allocations or host slices; sizes were
+        // asserted to fit. Same-device/stream and host-buffer lifetime across
+        // async copies are the caller's contract; Rust does not deref device ptrs.
         let code = unsafe {
             (self.fn_memcpy)(dst_ptr, src_ptr, size, MemcpyKind::DeviceToDevice as c_uint)
         };
@@ -1418,8 +1563,13 @@ impl HipRuntime {
     ) -> HipResult<()> {
         assert!(size <= dst.size, "size ({size}) exceeds dst ({})", dst.size);
         assert!(src_offset + size <= src.size, "src_offset+size exceeds src");
+        // SAFETY: byte offset was bounds-checked against the DeviceBuffer size;
+        // `u8::add` stays in the same live allocation; no host deref of device memory.
         let src_ptr = unsafe { (src.ptr as *const u8).add(src_offset) as *const c_void };
         let t = std::time::Instant::now();
+        // SAFETY: pointers are live HIP allocations or host slices; sizes were
+        // asserted to fit. Same-device/stream and host-buffer lifetime across
+        // async copies are the caller's contract; Rust does not deref device ptrs.
         let code = unsafe {
             (self.fn_memcpy)(dst.ptr, src_ptr, size, MemcpyKind::DeviceToDevice as c_uint)
         };
@@ -1438,6 +1588,9 @@ impl HipRuntime {
             dst.size
         );
         let t = std::time::Instant::now();
+        // SAFETY: pointers are live HIP allocations or host slices; sizes were
+        // asserted to fit. Same-device/stream and host-buffer lifetime across
+        // async copies are the caller's contract; Rust does not deref device ptrs.
         let code = unsafe {
             (self.fn_memcpy)(
                 dst.ptr,
@@ -1460,6 +1613,9 @@ impl HipRuntime {
         );
         let loc = std::panic::Location::caller();
         let t = std::time::Instant::now();
+        // SAFETY: pointers are live HIP allocations or host slices; sizes were
+        // asserted to fit. Same-device/stream and host-buffer lifetime across
+        // async copies are the caller's contract; Rust does not deref device ptrs.
         let code = unsafe {
             (self.fn_memcpy)(
                 dst.as_mut_ptr() as *mut c_void,
@@ -1505,9 +1661,14 @@ impl HipRuntime {
             dst.len(),
             src.size
         );
+        // SAFETY: byte offset was bounds-checked against the DeviceBuffer size;
+        // `u8::add` stays in the same live allocation; no host deref of device memory.
         let src_ptr = unsafe { (src.ptr as *const u8).add(src_offset) as *const c_void };
         let loc = std::panic::Location::caller();
         let t = std::time::Instant::now();
+        // SAFETY: pointers are live HIP allocations or host slices; sizes were
+        // asserted to fit. Same-device/stream and host-buffer lifetime across
+        // async copies are the caller's contract; Rust does not deref device ptrs.
         let code = unsafe {
             (self.fn_memcpy)(
                 dst.as_mut_ptr() as *mut c_void,
@@ -1545,6 +1706,9 @@ impl HipRuntime {
     ) -> HipResult<()> {
         assert!(size <= dst.size && size <= src.size);
         let t = std::time::Instant::now();
+        // SAFETY: pointers are live HIP allocations or host slices; sizes were
+        // asserted to fit. Same-device/stream and host-buffer lifetime across
+        // async copies are the caller's contract; Rust does not deref device ptrs.
         let code = unsafe {
             (self.fn_memcpy)(
                 dst.ptr,
@@ -1562,6 +1726,9 @@ impl HipRuntime {
         assert!(size <= buf.size);
         let loc = std::panic::Location::caller();
         let t = std::time::Instant::now();
+        // SAFETY: pointers are live HIP allocations or host slices; sizes were
+        // asserted to fit. Same-device/stream and host-buffer lifetime across
+        // async copies are the caller's contract; Rust does not deref device ptrs.
         let code = unsafe { (self.fn_memset)(buf.ptr, value, size) };
         let elapsed = t.elapsed().as_nanos() as u64;
         crate::ffi::launch_counters::memset::record_bytes(elapsed, size as u64);
@@ -1595,6 +1762,9 @@ impl HipRuntime {
     ) -> HipResult<()> {
         assert!(count * 4 <= buf.size);
         let stream_raw = stream.map_or(ptr::null_mut(), |s| s.0);
+        // SAFETY: pointers are live HIP allocations or host slices; sizes were
+        // asserted to fit. Same-device/stream and host-buffer lifetime across
+        // async copies are the caller's contract; Rust does not deref device ptrs.
         let code = unsafe { (self.fn_memset_d32_async)(buf.ptr, value, count, stream_raw) };
         self.check(code, "hipMemsetD32Async")
     }
@@ -1612,6 +1782,9 @@ impl HipRuntime {
         assert!(size <= buf.size);
         let loc = std::panic::Location::caller();
         let t = std::time::Instant::now();
+        // SAFETY: pointers are live HIP allocations or host slices; sizes were
+        // asserted to fit. Same-device/stream and host-buffer lifetime across
+        // async copies are the caller's contract; Rust does not deref device ptrs.
         let code = unsafe { (self.fn_memset_async)(buf.ptr, value, size, stream.0) };
         let elapsed = t.elapsed().as_nanos() as u64;
         crate::ffi::launch_counters::memset::record_bytes(elapsed, size as u64);
@@ -1638,6 +1811,9 @@ impl HipRuntime {
 
     pub fn stream_create(&self) -> HipResult<Stream> {
         let mut stream: HipStream = ptr::null_mut();
+        // SAFETY: stream/event/graph handles are live opaque HIP objects owned by the
+        // wrappers; out-params are stack locals. Destroy/sync require the caller
+        // to have drained dependent work first where HIP demands it.
         let code = unsafe { (self.fn_stream_create)(&mut stream) };
         self.check(code, "hipStreamCreate")?;
         Ok(Stream(stream))
@@ -1647,6 +1823,9 @@ impl HipRuntime {
     /// (`hipStreamNonBlocking`).
     pub fn stream_create_non_blocking(&self) -> HipResult<Stream> {
         let mut stream: HipStream = ptr::null_mut();
+        // SAFETY: stream/event/graph handles are live opaque HIP objects owned by the
+        // wrappers; out-params are stack locals. Destroy/sync require the caller
+        // to have drained dependent work first where HIP demands it.
         let code = unsafe { (self.fn_stream_create_with_flags)(&mut stream, 0x1) };
         self.check(code, "hipStreamCreateWithFlags")?;
         Ok(Stream(stream))
@@ -1657,12 +1836,18 @@ impl HipRuntime {
             return Err(hip_fault_err("sync"));
         }
         let t = std::time::Instant::now();
+        // SAFETY: stream/event/graph handles are live opaque HIP objects owned by the
+        // wrappers; out-params are stack locals. Destroy/sync require the caller
+        // to have drained dependent work first where HIP demands it.
         let code = unsafe { (self.fn_stream_synchronize)(stream.0) };
         crate::ffi::launch_counters::stream_sync::record(t.elapsed().as_nanos() as u64);
         self.check(code, "hipStreamSynchronize")
     }
 
     pub fn stream_destroy(&self, stream: Stream) -> HipResult<()> {
+        // SAFETY: stream/event/graph handles are live opaque HIP objects owned by the
+        // wrappers; out-params are stack locals. Destroy/sync require the caller
+        // to have drained dependent work first where HIP demands it.
         let code = unsafe { (self.fn_stream_destroy)(stream.0) };
         self.check(code, "hipStreamDestroy")
     }
@@ -1673,6 +1858,9 @@ impl HipRuntime {
         let c_path =
             CString::new(path).map_err(|_| HipError::new(1, "invalid path for module_load"))?;
         let mut module: HipModule = ptr::null_mut();
+        // SAFETY: module/function handles are live HIP objects from earlier loads;
+        // CString/image buffers outlive the call; launch arg validity is the
+        // unsafe fn caller's contract when applicable.
         let code = unsafe { (self.fn_module_load)(&mut module, c_path.as_ptr()) };
         self.check(code, "hipModuleLoad")?;
         Ok(Module(module))
@@ -1681,6 +1869,9 @@ impl HipRuntime {
     pub fn module_load_data(&self, image: &[u8]) -> HipResult<Module> {
         let mut module: HipModule = ptr::null_mut();
         let code =
+            // SAFETY: module/function handles are live HIP objects from earlier loads;
+            // CString/image buffers outlive the call; launch arg validity is the
+            // unsafe fn caller's contract when applicable.
             unsafe { (self.fn_module_load_data)(&mut module, image.as_ptr() as *const c_void) };
         self.check(code, "hipModuleLoadData")?;
         Ok(Module(module))
@@ -1690,6 +1881,9 @@ impl HipRuntime {
         let c_name = CString::new(name)
             .map_err(|_| HipError::new(1, "invalid kernel name for module_get_function"))?;
         let mut func: HipFunction = ptr::null_mut();
+        // SAFETY: module/function handles are live HIP objects from earlier loads;
+        // CString/image buffers outlive the call; launch arg validity is the
+        // unsafe fn caller's contract when applicable.
         let code = unsafe { (self.fn_module_get_function)(&mut func, module.0, c_name.as_ptr()) };
         self.check(code, "hipModuleGetFunction")?;
         Ok(Function(func))
@@ -1815,6 +2009,8 @@ impl HipRuntime {
             ));
         };
         let mut n: c_int = 0;
+        // SAFETY: occupancy symbol is present; func.0 is a live module function;
+        // out-param `n` is a stack local.
         let code = unsafe {
             occ(
                 &mut n as *mut c_int,
@@ -1831,6 +2027,9 @@ impl HipRuntime {
 
     pub fn event_create(&self) -> HipResult<Event> {
         let mut event: HipEvent = ptr::null_mut();
+        // SAFETY: stream/event/graph handles are live opaque HIP objects owned by the
+        // wrappers; out-params are stack locals. Destroy/sync require the caller
+        // to have drained dependent work first where HIP demands it.
         let code = unsafe { (self.fn_event_create)(&mut event) };
         self.check(code, "hipEventCreate")?;
         Ok(Event(event))
@@ -1843,6 +2042,9 @@ impl HipRuntime {
     /// [`HIP_EVENT_RELEASE_TO_SYSTEM`] to make the release scope explicit.
     pub fn event_create_with_flags(&self, flags: u32) -> HipResult<Event> {
         let mut event: HipEvent = ptr::null_mut();
+        // SAFETY: stream/event/graph handles are live opaque HIP objects owned by the
+        // wrappers; out-params are stack locals. Destroy/sync require the caller
+        // to have drained dependent work first where HIP demands it.
         let code = unsafe { (self.fn_event_create_with_flags)(&mut event, flags) };
         self.check(code, "hipEventCreateWithFlags")?;
         Ok(Event(event))
@@ -1850,12 +2052,18 @@ impl HipRuntime {
 
     pub fn event_record(&self, event: &Event, stream: Option<&Stream>) -> HipResult<()> {
         let stream_raw = stream.map_or(ptr::null_mut(), |s| s.0);
+        // SAFETY: stream/event/graph handles are live opaque HIP objects owned by the
+        // wrappers; out-params are stack locals. Destroy/sync require the caller
+        // to have drained dependent work first where HIP demands it.
         let code = unsafe { (self.fn_event_record)(event.0, stream_raw) };
         self.check(code, "hipEventRecord")
     }
 
     pub fn event_synchronize(&self, event: &Event) -> HipResult<()> {
         let t = std::time::Instant::now();
+        // SAFETY: stream/event/graph handles are live opaque HIP objects owned by the
+        // wrappers; out-params are stack locals. Destroy/sync require the caller
+        // to have drained dependent work first where HIP demands it.
         let code = unsafe { (self.fn_event_synchronize)(event.0) };
         crate::ffi::launch_counters::event_sync::record(t.elapsed().as_nanos() as u64);
         self.check(code, "hipEventSynchronize")
@@ -1865,6 +2073,9 @@ impl HipRuntime {
         // Non-blocking by construction: hipSuccess = recorded and complete,
         // hipErrorNotReady (600) = work still outstanding, anything else is
         // a real failure (invalid handle, device lost) and propagates.
+        // SAFETY: stream/event/graph handles are live opaque HIP objects owned by the
+        // wrappers; out-params are stack locals. Destroy/sync require the caller
+        // to have drained dependent work first where HIP demands it.
         let code = unsafe { (self.fn_event_query)(event.0) };
         if code == HIP_SUCCESS {
             Ok(true)
@@ -1879,17 +2090,26 @@ impl HipRuntime {
 
     pub fn event_elapsed_ms(&self, start: &Event, stop: &Event) -> HipResult<f32> {
         let mut ms: f32 = 0.0;
+        // SAFETY: stream/event/graph handles are live opaque HIP objects owned by the
+        // wrappers; out-params are stack locals. Destroy/sync require the caller
+        // to have drained dependent work first where HIP demands it.
         let code = unsafe { (self.fn_event_elapsed_time)(&mut ms, start.0, stop.0) };
         self.check(code, "hipEventElapsedTime")?;
         Ok(ms)
     }
 
     pub fn event_destroy(&self, event: Event) -> HipResult<()> {
+        // SAFETY: stream/event/graph handles are live opaque HIP objects owned by the
+        // wrappers; out-params are stack locals. Destroy/sync require the caller
+        // to have drained dependent work first where HIP demands it.
         let code = unsafe { (self.fn_event_destroy)(event.0) };
         self.check(code, "hipEventDestroy")
     }
 
     pub fn stream_wait_event(&self, stream: &Stream, event: &Event) -> HipResult<()> {
+        // SAFETY: stream/event/graph handles are live opaque HIP objects owned by the
+        // wrappers; out-params are stack locals. Destroy/sync require the caller
+        // to have drained dependent work first where HIP demands it.
         let code = unsafe { (self.fn_stream_wait_event)(stream.0, event.0, 0) };
         self.check(code, "hipStreamWaitEvent")
     }
@@ -1897,6 +2117,8 @@ impl HipRuntime {
     // ── Error query ─────────────────────────────────────────────
 
     pub fn last_error(&self) -> u32 {
+        // SAFETY: HIP runtime symbol is live from HipRuntime::load; out-params are
+        // stack locals (or caller-provided device ids). No host pointer aliasing.
         unsafe { (self.fn_get_last_error)() }
     }
 
@@ -1912,6 +2134,9 @@ impl HipRuntime {
             return Err(hip_fault_err("upload"));
         }
         assert!(src.len() <= dst.size);
+        // SAFETY: pointers are live HIP allocations or host slices; sizes were
+        // asserted to fit. Same-device/stream and host-buffer lifetime across
+        // async copies are the caller's contract; Rust does not deref device ptrs.
         let code = unsafe {
             (self.fn_memcpy_async)(
                 dst.ptr,
@@ -1928,6 +2153,9 @@ impl HipRuntime {
     /// stay unchanged until the stream reaches the copy.
     pub fn memcpy_htod_async_default(&self, dst: &DeviceBuffer, src: &[u8]) -> HipResult<()> {
         assert!(src.len() <= dst.size);
+        // SAFETY: pointers are live HIP allocations or host slices; sizes were
+        // asserted to fit. Same-device/stream and host-buffer lifetime across
+        // async copies are the caller's contract; Rust does not deref device ptrs.
         let code = unsafe {
             (self.fn_memcpy_async)(
                 dst.ptr,
@@ -1947,6 +2175,9 @@ impl HipRuntime {
         stream: &Stream,
     ) -> HipResult<()> {
         assert!(dst.len() <= src.size);
+        // SAFETY: pointers are live HIP allocations or host slices; sizes were
+        // asserted to fit. Same-device/stream and host-buffer lifetime across
+        // async copies are the caller's contract; Rust does not deref device ptrs.
         let code = unsafe {
             (self.fn_memcpy_async)(
                 dst.as_mut_ptr() as *mut c_void,
@@ -1974,8 +2205,15 @@ impl HipRuntime {
     ) -> HipResult<()> {
         assert!(dst_offset + size <= dst.size);
         assert!(src_offset + size <= src.size);
+        // SAFETY: byte offset was bounds-checked against the DeviceBuffer size;
+        // `u8::add` stays in the same live allocation; no host deref of device memory.
         let dst_ptr = unsafe { (dst.ptr as *mut u8).add(dst_offset) as *mut c_void };
+        // SAFETY: byte offset was bounds-checked against the DeviceBuffer size;
+        // `u8::add` stays in the same live allocation; no host deref of device memory.
         let src_ptr = unsafe { (src.ptr as *const u8).add(src_offset) as *const c_void };
+        // SAFETY: pointers are live HIP allocations or host slices; sizes were
+        // asserted to fit. Same-device/stream and host-buffer lifetime across
+        // async copies are the caller's contract; Rust does not deref device ptrs.
         let code = unsafe {
             (self.fn_memcpy_async)(
                 dst_ptr,
@@ -2003,8 +2241,15 @@ impl HipRuntime {
     ) -> HipResult<()> {
         assert!(dst_offset + size <= dst.size);
         assert!(src_offset + size <= src.size);
+        // SAFETY: byte offset was bounds-checked against the DeviceBuffer size;
+        // `u8::add` stays in the same live allocation; no host deref of device memory.
         let dst_ptr = unsafe { (dst.ptr as *mut u8).add(dst_offset) as *mut c_void };
+        // SAFETY: byte offset was bounds-checked against the DeviceBuffer size;
+        // `u8::add` stays in the same live allocation; no host deref of device memory.
         let src_ptr = unsafe { (src.ptr as *const u8).add(src_offset) as *const c_void };
+        // SAFETY: pointers are live HIP allocations or host slices; sizes were
+        // asserted to fit. Same-device/stream and host-buffer lifetime across
+        // async copies are the caller's contract; Rust does not deref device ptrs.
         let code = unsafe {
             (self.fn_memcpy_async)(
                 dst_ptr,
@@ -2022,6 +2267,9 @@ impl HipRuntime {
     /// Begin capturing all operations on `stream` into a graph.
     /// mode=0 is hipStreamCaptureModeGlobal.
     pub fn stream_begin_capture(&self, stream: &Stream, mode: u32) -> HipResult<()> {
+        // SAFETY: stream/event/graph handles are live opaque HIP objects owned by the
+        // wrappers; out-params are stack locals. Destroy/sync require the caller
+        // to have drained dependent work first where HIP demands it.
         let code = unsafe { (self.fn_stream_begin_capture)(stream.0, mode as c_uint) };
         self.check(code, "hipStreamBeginCapture")
     }
@@ -2029,6 +2277,9 @@ impl HipRuntime {
     /// End capture on `stream`, returning the captured graph.
     pub fn stream_end_capture(&self, stream: &Stream) -> HipResult<Graph> {
         let mut graph: HipGraph = ptr::null_mut();
+        // SAFETY: stream/event/graph handles are live opaque HIP objects owned by the
+        // wrappers; out-params are stack locals. Destroy/sync require the caller
+        // to have drained dependent work first where HIP demands it.
         let code = unsafe { (self.fn_stream_end_capture)(stream.0, &mut graph) };
         self.check(code, "hipStreamEndCapture")?;
         Ok(Graph(graph))
@@ -2037,6 +2288,9 @@ impl HipRuntime {
     /// Instantiate an executable graph from a captured graph.
     pub fn graph_instantiate(&self, graph: &Graph) -> HipResult<GraphExec> {
         let mut exec: HipGraphExec = ptr::null_mut();
+        // SAFETY: stream/event/graph handles are live opaque HIP objects owned by the
+        // wrappers; out-params are stack locals. Destroy/sync require the caller
+        // to have drained dependent work first where HIP demands it.
         let code = unsafe {
             (self.fn_graph_instantiate)(&mut exec, graph.0, ptr::null_mut(), ptr::null_mut(), 0)
         };
@@ -2047,17 +2301,26 @@ impl HipRuntime {
     /// Launch an executable graph on `stream`.
     pub fn graph_launch(&self, exec: &GraphExec, stream: &Stream) -> HipResult<()> {
         let t = std::time::Instant::now();
+        // SAFETY: stream/event/graph handles are live opaque HIP objects owned by the
+        // wrappers; out-params are stack locals. Destroy/sync require the caller
+        // to have drained dependent work first where HIP demands it.
         let code = unsafe { (self.fn_graph_launch)(exec.0, stream.0) };
         crate::ffi::launch_counters::graph_launch::record(t.elapsed().as_nanos() as u64);
         self.check(code, "hipGraphLaunch")
     }
 
     pub fn graph_exec_destroy(&self, exec: GraphExec) -> HipResult<()> {
+        // SAFETY: stream/event/graph handles are live opaque HIP objects owned by the
+        // wrappers; out-params are stack locals. Destroy/sync require the caller
+        // to have drained dependent work first where HIP demands it.
         let code = unsafe { (self.fn_graph_exec_destroy)(exec.0) };
         self.check(code, "hipGraphExecDestroy")
     }
 
     pub fn graph_destroy(&self, graph: Graph) -> HipResult<()> {
+        // SAFETY: stream/event/graph handles are live opaque HIP objects owned by the
+        // wrappers; out-params are stack locals. Destroy/sync require the caller
+        // to have drained dependent work first where HIP demands it.
         let code = unsafe { (self.fn_graph_destroy)(graph.0) };
         self.check(code, "hipGraphDestroy")
     }
@@ -2073,6 +2336,9 @@ impl HipRuntime {
         value: u32,
         flags: u32,
     ) -> HipResult<()> {
+        // SAFETY: stream/event/graph handles are live opaque HIP objects owned by the
+        // wrappers; out-params are stack locals. Destroy/sync require the caller
+        // to have drained dependent work first where HIP demands it.
         let code = unsafe { (self.fn_stream_write_value32)(stream.0, ptr.as_ptr(), value, flags) };
         self.check(code, "hipStreamWriteValue32")
     }
@@ -2093,6 +2359,8 @@ impl HipRuntime {
                 "hipStreamWaitValue32 unavailable; stream signal waits are unsupported",
             ));
         };
+        // SAFETY: ptr is a live device signal/buffer address from DeviceBuffer; stream
+        // is a live handle. Value wait/write races are ordered by the stream.
         let code = unsafe { wait_value32(stream.0, ptr.as_ptr(), value, flags, mask) };
         self.check(code, "hipStreamWaitValue32")
     }
@@ -2102,6 +2370,8 @@ impl HipRuntime {
             return Err(hip_fault_err("sync"));
         }
         let t = std::time::Instant::now();
+        // SAFETY: HIP runtime symbol is live from HipRuntime::load; out-params are
+        // stack locals (or caller-provided device ids). No host pointer aliasing.
         let code = unsafe { (self.fn_device_synchronize)() };
         crate::ffi::launch_counters::device_sync::record(t.elapsed().as_nanos() as u64);
         self.check(code, "hipDeviceSynchronize")
@@ -2111,6 +2381,8 @@ impl HipRuntime {
     /// Allocates a large buffer for hipDeviceProp_t, reads gcnArchName from offset 0.
     pub fn get_arch(&self, device_id: i32) -> HipResult<String> {
         let mut buf = vec![0u8; 1024]; // hipDeviceProp_t varies by ROCm version, 1024 is safe
+        // SAFETY: HIP runtime symbol is live from HipRuntime::load; out-params are
+        // stack locals (or caller-provided device ids). No host pointer aliasing.
         let code = unsafe { (self.fn_get_device_properties)(buf.as_mut_ptr(), device_id as c_int) };
         self.check(code, "hipGetDeviceProperties")?;
         // gcnArchName is a null-terminated C string at the start of the struct
@@ -2126,6 +2398,8 @@ impl HipRuntime {
         } else {
             // Fallback: read as null-terminated string from known offsets
             // gcnArchName is typically at offset 0 in older ROCm or at a named field
+            // SAFETY: on success HIP wrote a NUL-terminated C string into the local
+            // buffer; the pointer addresses that buffer only for this read.
             let cstr = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr() as *const c_char) };
             let name = cstr.to_string_lossy().to_string();
             if name.starts_with("gfx") {
@@ -2142,6 +2416,8 @@ impl HipRuntime {
     /// when sysfs/KFD is unavailable (Windows, restricted containers).
     pub fn get_device_attribute(&self, attr_id: i32, device_id: i32) -> HipResult<i32> {
         let mut value: c_int = 0;
+        // SAFETY: HIP runtime symbol is live from HipRuntime::load; out-params are
+        // stack locals (or caller-provided device ids). No host pointer aliasing.
         let code = unsafe {
             (self.fn_get_device_attribute)(&mut value, attr_id as c_int, device_id as c_int)
         };
@@ -2153,6 +2429,8 @@ impl HipRuntime {
     pub fn get_vram_info(&self) -> HipResult<(usize, usize)> {
         let mut free: usize = 0;
         let mut total: usize = 0;
+        // SAFETY: FFI out-params are stack locals with valid writable provenance;
+        // HIP symbols were resolved at load. Returned pointers are opaque to Rust.
         let code = unsafe { (self.fn_mem_get_info)(&mut free, &mut total) };
         self.check(code, "hipMemGetInfo")?;
         Ok((free, total))
@@ -2173,24 +2451,42 @@ impl Stream {
         self.0
     }
 }
+// SAFETY: Stream is an opaque HIP handle (*mut c_void). Sending the handle
+// between threads is fine; it is not Sync. Concurrent use needs
+// external stream synchronization; destroy only when idle.
 unsafe impl Send for Stream {}
 
 /// Loaded GPU module (compiled kernels).
 pub struct Module(HipModule);
+// SAFETY: Module is an opaque HIP handle (*mut c_void). Sending the handle
+// between threads is fine; it is not Sync. Concurrent use needs
+// external stream synchronization; destroy only when idle.
 unsafe impl Send for Module {}
 
 /// Handle to a specific kernel function within a module.
 pub struct Function(HipFunction);
+// SAFETY: Function is an opaque HIP handle (*mut c_void). Sending the handle
+// between threads is fine; it is not Sync. Concurrent use needs
+// external stream synchronization; destroy only when idle.
 unsafe impl Send for Function {}
 
 /// GPU event for timing.
 pub struct Event(HipEvent);
+// SAFETY: Event is an opaque HIP handle (*mut c_void). Sending the handle
+// between threads is fine; it is not Sync. Concurrent use needs
+// external stream synchronization; destroy only when idle.
 unsafe impl Send for Event {}
 
 /// Captured GPU operation graph.
 pub struct Graph(HipGraph);
+// SAFETY: Graph is an opaque HIP handle (*mut c_void). Sending the handle
+// between threads is fine; it is not Sync. Concurrent use needs
+// external stream synchronization; destroy only when idle.
 unsafe impl Send for Graph {}
 
 /// Executable (instantiated) graph ready for replay.
 pub struct GraphExec(HipGraphExec);
+// SAFETY: GraphExec is an opaque HIP handle (*mut c_void). Sending the handle
+// between threads is fine; it is not Sync. Concurrent use needs
+// external stream synchronization; destroy only when idle.
 unsafe impl Send for GraphExec {}
