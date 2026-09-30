@@ -432,9 +432,11 @@ def main():
     parser.add_argument("--decode-context", type=int, default=128)
     parser.add_argument(
         "--kv-mode",
-        choices=("q8", "fwht2", "fwht3", "fwht4"),
-        default="q8",
-        help="KV layout used by capture, shadow replay, and the HIP oracle",
+        choices=("q8", "fwht2", "fwht3", "fwht4", "bf16"),
+        help=(
+            "KV layout used by capture, shadow replay, and the HIP oracle "
+            "(default: q8; bf16 with --qwen4, whose KV is BF16 only)"
+        ),
     )
     parser.add_argument("--capture-repeats", type=int, default=2)
     parser.add_argument("--measure-repeats", type=int, default=5)
@@ -540,6 +542,10 @@ def main():
         help="fixed target verify batch for the DSpark shadow (default: 3)",
     )
     args = parser.parse_args()
+    if args.kv_mode is None:
+        args.kv_mode = "bf16" if args.qwen4 else "q8"
+    if args.qwen4 and args.kv_mode != "bf16":
+        sys.exit(f"--qwen4 requires --kv-mode bf16 (got {args.kv_mode})")
 
     model = Path(args.model).expanduser().resolve()
     daemon_path = Path(args.daemon).expanduser().resolve()
