@@ -3929,7 +3929,17 @@ impl Gpu {
         let alloc_bytes = byte_size.saturating_add(HOST_TAIL_PAD_BYTES);
         let host_ptr = self
             .hip
-            .host_malloc(alloc_bytes, hip_bridge::HIP_HOST_MALLOC_MAPPED)?;
+            .host_malloc(alloc_bytes, hip_bridge::HIP_HOST_MALLOC_MAPPED)
+            .map_err(|mut error| {
+                // hip-bridge backs host allocations with GTT unless the operator
+                // set HSA_USERPTR_FOR_PAGED_MEM; TTM caps GTT, not free RAM.
+                error.message.push_str(&format!(
+                    "; {alloc_bytes} host-mapped bytes with HSA_USERPTR_FOR_PAGED_MEM={} \
+                     (0 = GTT, capped by /sys/module/ttm/parameters/pages_limit)",
+                    std::env::var("HSA_USERPTR_FOR_PAGED_MEM").unwrap_or_default()
+                ));
+                error
+            })?;
         // The device alias is what kernels are handed; the host pointer is what
         // hipHostFree needs. They coincide on large-BAR boxes but need not.
         let dev_ptr = match self.hip.host_get_device_pointer(host_ptr, 0) {

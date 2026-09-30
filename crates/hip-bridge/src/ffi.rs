@@ -472,11 +472,82 @@ macro_rules! load_optional_fn {
     }};
 }
 
+/// libhsakmt's choice for `hipHostMalloc` memory on a discrete GPU: non-zero
+/// (ROCm's default) backs it with pageable userptr BOs, `0` with GTT BOs.
+const HSA_USERPTR_FOR_PAGED_MEM: &str = "HSA_USERPTR_FOR_PAGED_MEM";
+
+/// clr's size, in MB, from which a copy to or from pageable host memory pins
+/// the pageable pages in place; smaller copies go through clr's own pinned
+/// staging buffer.
+const GPU_PINNED_MIN_XFER_SIZE: &str = "GPU_PINNED_MIN_XFER_SIZE";
+
+/// Stage every pageable copy: larger than any host allocation.
+const STAGE_ALL_PAGEABLE_COPIES_MB: &str = "100000";
+
+/// Keep host memory the GPU reads out of the kernel's reclaim path, unless
+/// the operator set the switches.
+///
+/// Under ROCm's defaults, host pages that the GPU reads are registered as
+/// KFD userptr BOs. That covers every `hipHostMalloc` block, which is shared
+/// anonymous memory, and the source of any large `hipMemcpy` from pageable
+/// memory, such as the mapped model file, which clr pins in place. Reclaim or
+/// migration may take those pages, and every invalidation evicts all of the
+/// process's queues until KFD's restore worker has faulted them back. Under
+/// sustained host-memory pressure the queues stay evicted. The GPU idles and
+/// HIP's signal wait spins a core, with no error (ROCm/rocm-systems#12528).
+/// This was seen with Qwen4's tens of GB of host-mapped routed experts, and
+/// with weight uploads out of the mapped file.
+///
+/// `HSA_USERPTR_FOR_PAGED_MEM=0` backs `hipHostMalloc` memory with GTT BOs,
+/// which are outside reclaim. TTM's `pages_limit` (half of RAM by default)
+/// caps them instead. `GPU_PINNED_MIN_XFER_SIZE` set past any copy size
+/// routes every pageable copy through clr's staging buffer, which is itself
+/// `hipHostMalloc` memory. libhsakmt and clr read both switches once, when
+/// the runtime initializes, so they are set before it loads. APUs ignore the
+/// first switch.
+///
+/// Both switches are process-global, and together they slow other loads: on
+/// gfx1201, H2's weight sweep took 1.20-1.22 s with them instead of
+/// 1.00-1.01 s. So they are set only in a process configured to host-map
+/// Qwen4 experts ([`QWEN4_EXPERT_VRAM_LAYERS_ENV`]), the one known to hold
+/// tens of GB of host memory the GPU reads.
+fn keep_host_memory_out_of_reclaim() {
+    if !cfg!(target_os = "linux") || !host_maps_qwen4_experts() {
+        return;
+    }
+    for (name, value) in [
+        (HSA_USERPTR_FOR_PAGED_MEM, "0"),
+        (GPU_PINNED_MIN_XFER_SIZE, STAGE_ALL_PAGEABLE_COPIES_MB),
+    ] {
+        if std::env::var_os(name).is_none() {
+            std::env::set_var(name, value);
+        }
+    }
+}
+
+/// Places the routed experts of Qwen4 trunk layers at or past `N` in pinned,
+/// device-mapped host RAM (`hipfire_arch_qwen4::expert_residency`). It is
+/// named here because it decides [`keep_host_memory_out_of_reclaim`] before
+/// the HIP runtime loads.
+pub const QWEN4_EXPERT_VRAM_LAYERS_ENV: &str = "HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS";
+
+/// Whether this process is configured to host-map Qwen4 experts: the
+/// installed process config when there is one (the daemon installs it before
+/// any GPU runtime initializes), otherwise the ambient environment. Like
+/// [`fault_spec`], it never installs the local fallback config.
+fn host_maps_qwen4_experts() -> bool {
+    match hipfire_config::active_process_config() {
+        Some(config) => config.legacy_value(QWEN4_EXPERT_VRAM_LAYERS_ENV).is_some(),
+        None => std::env::var_os(QWEN4_EXPERT_VRAM_LAYERS_ENV).is_some(),
+    }
+}
+
 impl HipRuntime {
     /// Load the HIP runtime via dlopen.
     /// Uses the shared ROCm resolver so runtime, headers, and hipcc stay within
     /// one selected installation.
     pub fn load() -> HipResult<Self> {
+        keep_host_memory_out_of_reclaim();
         // Windows and Unix share one candidate policy in hipfire_config::rocm so a
         // selected/configured root never falls through to another install's DLL
         // (user cache or bare PATH names). HIP_RUNTIME_LIBRARIES already encodes
