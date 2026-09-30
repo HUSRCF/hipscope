@@ -1961,7 +1961,7 @@ fn ordinary_prefill_chunk_limit_with_cache(
 /// singleton after a full ceiling: shorten that chunk by one row so the
 /// 512-row recurrent segments end in a 511-row partial and the final chunk has
 /// two rows. The same rule maps a final in-ceiling 513 rows to 511 + 2.
-fn next_exact_prefill_chunk_len(remaining: usize, ceiling: usize) -> Option<usize> {
+pub(crate) fn next_exact_prefill_chunk_len(remaining: usize, ceiling: usize) -> Option<usize> {
     if remaining < MIN_BATCH || ceiling < MIN_BATCH {
         return None;
     }
@@ -2007,9 +2007,10 @@ fn emit_prefill_chunk_receipt(requested: usize, admitted: usize, commit_stride: 
 }
 ///
 /// Never form a chunk larger than the configured/capped max, the PBS
-/// staging owner, or (when present) the hidden-ring staging owner. A
-/// `HiddenStateRingBuffer` sized to 256 therefore cannot receive a 384/512-row
-/// write even when an arch default exceeds 256.
+/// staging owner, or (when present) the hidden ring's cap: its staging, so a
+/// `HiddenStateRingBuffer` staged at 256 cannot receive a 384/512-row staging
+/// write, or on the eager ring-seed route the ring itself, whose wider chunks
+/// skip staging.
 #[inline]
 fn prefill_effective_chunk_batch(
     configured_max_batch: usize,
@@ -2499,11 +2500,13 @@ pub fn forward_prefill_batch_with_pbs(
 ///
 /// `pbs = None` allocates and frees a right-sized scratch per call;
 /// `pbs = Some(&pbs)` reuses the provided scratch. Chunk size is the minimum of
-/// the configured/arch max ([`prefill_max_batch`]), `pbs.max_batch`, and
-/// `hidden_rb.max_batch` when a hidden ring is supplied — never larger than any
-/// staging owner. Callers driving DFlash verify should size `pbs` (and hidden
-/// staging) to the maximum block they will request so everything fits in one
-/// chunk, or accept multi-chunk commits.
+/// the configured/arch max ([`prefill_max_batch`]), `pbs.max_batch`, and the
+/// ring's staging `hidden_rb.max_batch` when a hidden ring is supplied — never
+/// larger than any staging owner. The exception is an eager ring-only prompt
+/// seed (no per-token hidden, tape or tree), whose chunks wider than staging
+/// write straight to the ring. Callers driving DFlash verify should size `pbs`
+/// (and hidden staging) to the maximum block they will request so everything
+/// fits in one chunk, or accept multi-chunk commits.
 ///
 /// `needs_last_token_logits = false` is only for callers that pass
 /// `per_token_hidden_out` and compute their own logits from those hidden rows.
@@ -2829,20 +2832,34 @@ fn forward_prefill_batch_with_pbs_opts_inner(
             max_batch,
         );
     }
+    // A ring-only forward (no per-token hidden rows, tape or tree) is a DFlash
+    // prompt seed. Eager, it rides the ordinary route below exactly as AR
+    // prefills the same tokens; chunks wider than ring staging write their
+    // hidden rows straight to the ring (`HiddenStateRingBuffer::writes_direct`).
+    // Verify and captured/recorded forwards keep the staged ring route.
+    let ring_seed = match hidden_rb.as_deref() {
+        Some(rb) => {
+            per_token_hidden_out.is_none()
+                && gdn_tape.is_none()
+                && tree_verify.is_none()
+                && rb.rides_ordinary_prefill(gpu)
+        }
+        None => false,
+    };
     // Widened ordinary admission. Decided here, after required KV mapping, so
     // the per-device byte admission charges mapped KV. Only the whole-stack
     // sequential ordinary entry with no caller PBS/cap can widen: captured,
-    // TP/EP (separate callers), tree/tape, hidden-ring, band-limited, fused,
-    // or caller-capped requests resolve to the legacy path before any wider
-    // allocation or launch. The ordinary wrappers omit their *implicit* ≤512
-    // legacy cache above when a wider ceiling is statically admitted, so
+    // TP/EP (separate callers), tree/tape, staged hidden-ring, band-limited,
+    // fused, or caller-capped requests resolve to the legacy path before any
+    // wider allocation or launch. The ordinary wrappers omit their *implicit*
+    // ≤512 legacy cache above when a wider ceiling is statically admitted, so
     // `pbs_in.is_none()` here means the owner decision is ours; an explicit
     // smaller caller PBS always wins and keeps legacy cadence.
     let wide_candidate = pbs_in.is_none()
         && max_batch_cap.is_none()
         && tree_verify.is_none()
         && gdn_tape.is_none()
-        && hidden_rb.is_none()
+        && (hidden_rb.is_none() || ring_seed)
         && max_layer.is_none()
         && matches!(fusion, DflashFusionCtx::Off)
         && !gpu.graphs.capture_mode
@@ -2931,10 +2948,19 @@ fn forward_prefill_batch_with_pbs_opts_inner(
                 own_pbs.as_ref().unwrap()
             }
         };
+        // A ring seed chunks exactly as AR does; chunks wider than staging
+        // land straight in the ring, so the ring (not its staging) bounds
+        // them. Every other ring caller stays capped at staging.
         let chunk_batch = prefill_effective_chunk_batch(
             limit,
             pbs.max_batch,
-            hidden_rb.as_ref().map(|rb| rb.max_batch),
+            hidden_rb.as_ref().map(|rb| {
+                if ring_seed {
+                    rb.max_positions.max(rb.max_batch)
+                } else {
+                    rb.max_batch
+                }
+            }),
         );
         // F2 pair envelope, loop-invariant half: ordinary sequential prefill
         // with FA layers batch-admissible, no tree/tape/max_layer machinery,
@@ -3134,13 +3160,14 @@ fn forward_prefill_batch_with_pbs_opts_inner(
                 commit_stride,
             )?;
             if let Some(rb) = hidden_rb.as_mut() {
-                // Scatter fixed-offset staging writes (done inside the chunk)
-                // to the ring at the current head, then advance head by n.
-                // This is the out-of-capture step: graph-captured writes went
-                // to staging[0..n*h], this commit places them at head*h
-                // where head is read from CPU state at call time (not baked
-                // into a captured graph node).
-                rb.commit_staging_to_ring(gpu, chunk_n)?;
+                // Place the chunk's hidden rows at the ring's current head,
+                // then advance head by n. Staged chunks scatter their
+                // fixed-offset staging writes here, the out-of-capture step:
+                // graph-captured writes went to staging[0..n*h], and head is
+                // read from CPU state at call time (not baked into a captured
+                // graph node). Eager chunks wider than staging already wrote
+                // at head inside the chunk and only advance it.
+                rb.finish_prefill_chunk(gpu, chunk_n)?;
             }
             chunk_start = chunk_end;
         }
@@ -13229,7 +13256,9 @@ pub(crate) fn forward_batch_chunk_impl(
         // chunk scan; prefill never records, so a Redline-enabled process
         // prefills exactly like the HIP-graph default.
         && !gpu.replay.is_recording()
-        && hidden_rb.is_none()
+        // A DFlash prompt seed's ring copies each layer's finished residual
+        // rows, whichever recurrence kernel produced them.
+        && hidden_rb.map_or(true, |rb| rb.rides_ordinary_prefill(gpu))
         // A prompt fill that hands its hidden rows to a draft head runs the
         // same scan plain AR prefill runs; verify captures stay sequential.
         && !captures_verify_hidden(per_token_hidden_out)
@@ -13291,7 +13320,7 @@ pub(crate) fn forward_batch_chunk_impl(
                 )?;
                 if let Some(rb) = hidden_rb {
                     if let Some(slot) = rb.extract_slot(layer_idx) {
-                        rb.write_rows_to_staging(gpu, slot, &pbs.x_batch, n)?;
+                        rb.write_chunk_rows(gpu, slot, &pbs.x_batch, n)?;
                     }
                 }
                 delta_layer_idx += 1;
@@ -13336,7 +13365,7 @@ pub(crate) fn forward_batch_chunk_impl(
                 )?;
                 if let Some(rb) = hidden_rb {
                     if let Some(slot) = rb.extract_slot(layer_idx) {
-                        rb.write_rows_to_staging(gpu, slot, &pbs.x_batch, n)?;
+                        rb.write_chunk_rows(gpu, slot, &pbs.x_batch, n)?;
                     }
                 }
                 kv_layer_idx += 1;
@@ -13358,7 +13387,7 @@ pub(crate) fn forward_batch_chunk_impl(
                 )?;
                 if let Some(rb) = hidden_rb {
                     if let Some(slot) = rb.extract_slot(layer_idx) {
-                        rb.write_rows_to_staging(gpu, slot, &pbs.x_batch, n)?;
+                        rb.write_chunk_rows(gpu, slot, &pbs.x_batch, n)?;
                     }
                 }
                 kv_layer_idx += 1;
@@ -13393,7 +13422,7 @@ pub(crate) fn forward_batch_chunk_impl(
                 )?;
                 if let Some(rb) = hidden_rb {
                     if let Some(slot) = rb.extract_slot(layer_idx) {
-                        rb.write_rows_to_staging(gpu, slot, &pbs.x_batch, n)?;
+                        rb.write_chunk_rows(gpu, slot, &pbs.x_batch, n)?;
                     }
                 }
                 delta_layer_idx += 1;
@@ -13425,7 +13454,7 @@ pub(crate) fn forward_batch_chunk_impl(
                 )?;
                 if let Some(rb) = hidden_rb {
                     if let Some(slot) = rb.extract_slot(layer_idx) {
-                        rb.write_rows_to_staging(gpu, slot, &pbs.x_batch, n)?;
+                        rb.write_chunk_rows(gpu, slot, &pbs.x_batch, n)?;
                     }
                 }
                 kv_layer_idx += 1;
