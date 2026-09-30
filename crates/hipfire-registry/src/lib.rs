@@ -1141,9 +1141,9 @@ mod tests {
         assert_eq!(fast.default_kv_mode.as_deref(), Some("q8"));
         assert_eq!(
             fast.sha256.as_deref(),
-            Some("9f91556f7e0431a077d03756a7102d0154108757289e6e5fe9a2d204c0c9eeb7")
+            Some("80e7c624424fd1d363ba86681d3dc1e5ac5534e0e064306a32be204c4843d0f3")
         );
-        assert_eq!(fast.size_bytes, Some(14980361216));
+        assert_eq!(fast.size_bytes, Some(14987185152));
         assert_ne!(
             fast.sha256, model.sha256,
             "the two tiers must not share a content digest"
@@ -1156,6 +1156,26 @@ mod tests {
         assert!(
             registry.model("qwen3.8-27b.mq4r").is_none(),
             "superseded MQ4R filename must not remain addressable"
+        );
+
+        // The symmetric XT checkpoint (H2) is the canonical dense fixture. It has
+        // exactly the asymmetric XT's size, so only the digest tells them apart;
+        // it shares the MQ4 DFlash draft.
+        let (xts_tag, xts) = registry.model("qwen3.8:27b-mq4-xts").unwrap();
+        assert_eq!(xts_tag, "qwen3.8:27b-mq4-xts");
+        assert_eq!(xts.file, "qwen3.8-27b.mq4-xts");
+        assert_eq!(xts.arch_id, Some(5));
+        assert_eq!(xts.quant.as_deref(), Some("mq4"));
+        assert_eq!(xts.default_kv_mode.as_deref(), Some("q8"));
+        assert_eq!(
+            xts.sha256.as_deref(),
+            Some("3e38ccbae3776470eb5a89344d300e9279d6b9ab6c31fd40ca1758c4f7c6f8ae")
+        );
+        assert_eq!(xts.size_bytes, Some(14987185152));
+        assert_ne!(xts.sha256, fast.sha256, "XTS and XT are distinct artifacts");
+        assert_eq!(
+            xts.dflash.as_ref().map(|draft| &draft.file),
+            fast.dflash.as_ref().map(|draft| &draft.file)
         );
 
         let settings = model
