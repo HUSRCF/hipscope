@@ -353,7 +353,8 @@ fn project_rotated(
     let result = match (weight.dtype, rows > 1) {
         (DType::BF16, false) => gpu.gemv_bf16_xf32(weight.buf, x, output, weight.m, weight.k),
         (DType::BF16, true) => {
-            // gfx1151 long prefill: the KLD-gated F16 WMMA route, else exact.
+            // Long prefill on gfx11 or gfx1201: the KLD-gated F16 WMMA route,
+            // else exact.
             match gpu.gemm_bf16_xf32_f16_wmma_qwen4(
                 &[(weight.buf, output, weight.m)],
                 x,

@@ -18,6 +18,8 @@ pub(crate) const TENSOR_OPS_SRC: &str = concat!(
 );
 const HYPER_READ_UP_WMMA_SRC: &str =
     include_str!("../../../kernels/src/hyper_read_up_wmma.gfx1151.hip");
+const HYPER_READ_UP_WMMA_GFX1201_SRC: &str =
+    include_str!("../../../kernels/src/hyper_read_up_wmma.gfx1201.hip");
 const GATED_DELTA_CHUNK_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gated_delta_chunk_wmma.gfx1151.hip");
 const INDEXED_ATTENTION_DENSE_WMMA_SRC: &str =
@@ -1228,7 +1230,8 @@ pub fn hyper_read_up_fused(gpu: &mut Gpu, p: &HyperReadUpFused<'_>) -> HipResult
         crate::dispatch::ReplayLaunchBindings::NONE,
     )
 }
-/// [`hyper_read_up_fused`] on gfx11 BF16 WMMA; `low` is packed BF16
+/// [`hyper_read_up_fused`] on gfx11 BF16 WMMA, or on gfx1201's gfx12 BF16
+/// WMMA when [`Gpu::qwen4_f16_wmma_gfx1201`] admits it; `low` is packed BF16
 /// ([`HcActivationFused::bf16_out`]) and `normalized` is
 /// [`hyper_norm_f16`]'s F16 copy (`normalized_bf16` is ignored). Not
 /// bit-exact: the logits accumulate the same exact BF16 products in WMMA's F32
@@ -1237,8 +1240,18 @@ pub fn hyper_read_up_fused(gpu: &mut Gpu, p: &HyperReadUpFused<'_>) -> HipResult
 pub fn hyper_read_up_wmma(gpu: &mut Gpu, p: &HyperReadUpFused<'_>) -> HipResult<()> {
     ensure_f32(p.mixed)?;
     let wide = checked_product(4, p.hidden, "HC read width")?;
-    if !gpu.arch_caps.has_wmma_w32()
-        || p.low.dtype != DType::BF16
+    let (module, source, entry) = if gpu.arch_caps.has_wmma_w32() {
+        ("hyper_read_up_wmma", HYPER_READ_UP_WMMA_SRC, "hyper_read_up_wmma_bf16")
+    } else if gpu.qwen4_f16_wmma_gfx1201() {
+        (
+            "hyper_read_up_wmma_gfx1201",
+            HYPER_READ_UP_WMMA_GFX1201_SRC,
+            "hyper_read_up_wmma_bf16_gfx1201",
+        )
+    } else {
+        return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
+    };
+    if p.low.dtype != DType::BF16
         || p.normalized.dtype != DType::F16
         || p.up_weight.dtype != DType::BF16
         || p.rows == 0
@@ -1258,11 +1271,7 @@ pub fn hyper_read_up_wmma(gpu: &mut Gpu, p: &HyperReadUpFused<'_>) -> HipResult<
     let column_grid = checked_u32(p.hidden / 16, "HC read column grid")?;
     let row_grid = checked_u32(p.rows.div_ceil(512), "HC read row grid")?;
     let lds_bytes = checked_u32(64 * (p.low_rank + 8) * 2, "HC read LDS")?;
-    gpu.ensure_kernel_public(
-        "hyper_read_up_wmma",
-        HYPER_READ_UP_WMMA_SRC,
-        "hyper_read_up_wmma_bf16",
-    )?;
+    gpu.ensure_kernel_public(module, source, entry)?;
     let mut args = KernargBlob::new();
     args.push_ptr(p.up_weight.buf.as_ptr());
     args.push_ptr(p.low.buf.as_ptr());
@@ -1273,7 +1282,7 @@ pub fn hyper_read_up_wmma(gpu: &mut Gpu, p: &HyperReadUpFused<'_>) -> HipResult<
     args.push_i32(rows);
     args.pad_to(16);
     gpu.launch_blob_recorded(
-        "hyper_read_up_wmma_bf16",
+        entry,
         [column_grid, row_grid, 1],
         [256, 1, 1],
         lds_bytes,
@@ -3963,7 +3972,7 @@ mod tests {
             "BF16-normalized HC read differs"
         );
         let wmma = gpu.zeros(&[rows * hidden], DType::F32).expect("wmma");
-        if gpu.arch_caps.has_wmma_w32() {
+        if gpu.arch_caps.has_wmma_w32() || gpu.qwen4_f16_wmma_gfx1201() {
             // hyper_norm_f16's F16 copy: the BF16-rounded values, exact in F16
             // (all nonzero |v| here are normal F16s).
             let f16_bytes: Vec<u8> = wave(3, rows * wide, 2.0)

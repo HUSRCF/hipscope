@@ -9237,6 +9237,15 @@ pub const GEMM_F16_X_F16_WMMA_SRC: &str =
 pub const GEMM_F16_X_F16_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_f16_x_f16_wmma.gfx12.hip");
 
+/// Sister of `GEMM_F16_X_F16_WMMA_LDS256_SRC` for the Qwen4 BF16 projections
+/// on the F16 weight shadow (`Gpu::gemm_bf16_xf16_f16_wmma`): the same LDS
+/// tile structure plus an optional deterministic K split, with a per-arch
+/// WMMA fragment map (gfx1201: half8 operands, `_w32_gfx12`, contiguous C
+/// rows; gfx1151: the gfx11 `_w32` map).  Exact-arch: only gfx1201 and
+/// gfx1151 compile or load it.
+pub const GEMM_F16_X_F16_WMMA_LDS_SPLITK_SRC: &str =
+    include_str!("../../../kernels/src/gemm_f16_x_f16_wmma_lds_splitk.hip");
+
 /// LDS-staged 128×128 macro-tile sibling of `GEMM_F16_X_F16_WMMA_SRC`, with
 /// the bias fused into the epilogue. Raises arithmetic intensity from
 /// 8 to 64 FLOP/byte for the dense FLUX MMDiT linears. Requires K % 64 == 0.
