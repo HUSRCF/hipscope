@@ -1891,6 +1891,12 @@ fn build_qwen35_eviction(
     }
 }
 
+/// MTP sidecar path for a trunk: the CLI-resolved `explicit` path, else the
+/// trunk's sibling `.mtp`.
+fn qwen35_mtp_sidecar(trunk_path: &Path, explicit: Option<std::path::PathBuf>) -> std::path::PathBuf {
+    explicit.unwrap_or_else(|| trunk_path.with_extension("mtp"))
+}
+
 /// Bundled `.mq4-mtp` trailer first, then the sidecar (`sidecar`, else the
 /// trunk's sibling `.mtp`). A head whose hidden size or vocab differs from the
 /// trunk is refused before upload. Returns the head, or the errors explaining
@@ -1907,7 +1913,7 @@ fn resolve_qwen35_mtp_head(
 ) -> (Option<hipfire_arch_qwen35::mtp_head::Qwen35MtpHead>, Vec<String>) {
     use hipfire_arch_qwen35::mtp_head;
     let tag = device.map(|d| format!(", {d}")).unwrap_or_default();
-    let sidecar = sidecar.unwrap_or_else(|| trunk_path.with_extension("mtp"));
+    let sidecar = qwen35_mtp_sidecar(trunk_path, sidecar);
     let mut load = |path: &Path, offset: u64| {
         mtp_head::check_mtp_head_for_trunk(path, offset, trunk_dim, trunk_vocab)?;
         mtp_head::load_mtp_head_at_offset(path, gpu, physical_cap, offset)
@@ -3118,7 +3124,7 @@ pub fn load_model_ep_with_kv_mode(
         admission.kv_backend, admission.kv_backend_reason.as_deref()
     );
     let loaded = load_model_ep_admitted(
-        admission, path, max_seq, tp, kv_mode, None, None, state_quant,
+        admission, path, max_seq, tp, kv_mode, None, None, state_quant, None,
         hipfire_runtime::loader_api::SpecLoadCfg::default(),
     );
     if loaded.is_ok() {
@@ -3143,6 +3149,7 @@ pub fn load_model_ep_admitted(
     kv_k: Option<&str>,
     kv_v: Option<&str>,
     state_quant: Option<&str>,
+    mtp_path: Option<&Path>,
     spec: hipfire_runtime::loader_api::SpecLoadCfg,
 ) -> Result<LoadedModel, String> {
     let kv_backend = admission.kv_backend;
@@ -3157,7 +3164,7 @@ pub fn load_model_ep_admitted(
             kv_backend,
         ),
         10 => load_model_ep_minimax(path, max_seq, tp),
-        5 | 6 => load_model_ep_qwen35(path, max_seq, tp, kv_mode, kv_k, kv_v, qwen_default_q8, Some(kv_backend.as_str()), state_quant, spec),
+        5 | 6 => load_model_ep_qwen35(path, max_seq, tp, kv_mode, kv_k, kv_v, qwen_default_q8, Some(kv_backend.as_str()), state_quant, mtp_path, spec),
         // Backstop: `admit_source` above already refused every other arch_id.
         // Route through the shared constructor (not `unreachable!`) so the
         // refusal survives a future edit that drops the early classification,
@@ -3590,6 +3597,7 @@ fn load_model_ep_qwen35(
     qwen_default_q8: bool,
     kv_backend: Option<&str>,
     state_quant: Option<&str>,
+    mtp_path: Option<&Path>,
     spec: hipfire_runtime::loader_api::SpecLoadCfg,
 ) -> Result<LoadedModel, String> {
     use hipfire_runtime::tp_shard::{ExpertAssign, ShardConfig};
@@ -3607,7 +3615,8 @@ fn load_model_ep_qwen35(
     if config.num_experts == 0 {
         drop(hfq_probe);
         return load_model_tp_qwen35_dense(
-            path, max_seq, tp, kv_mode, kv_k, kv_v, qwen_default_q8, kv_backend, state_quant, spec,
+            path, max_seq, tp, kv_mode, kv_k, kv_v, qwen_default_q8, kv_backend, state_quant, mtp_path,
+            spec,
         );
     }
     if let Some(reason) = qwen35_ep_moe_topology_refusal(hfq_probe.arch_id, config.num_experts, tp) {
@@ -3845,6 +3854,7 @@ fn load_model_tp_qwen35_dense(
     qwen_default_q8: bool,
     kv_backend: Option<&str>,
     state_quant: Option<&str>,
+    mtp_path: Option<&Path>,
     spec: hipfire_runtime::loader_api::SpecLoadCfg,
 ) -> Result<LoadedModel, String> {
     use hipfire_runtime::tp_shard::{ExpertAssign, ShardConfig};
@@ -3998,9 +4008,12 @@ fn load_model_tp_qwen35_dense(
     let mtp_head = if spec.mtp == Some(false) {
         None
     } else {
+        // Same sidecar resolution as the single-GPU loader: the CLI's
+        // `mtp_path` (a symlinked trunk's canonical path has no sibling head),
+        // else the trunk's sibling `.mtp`.
         let (head, errors) = resolve_qwen35_mtp_head(
             Path::new(path),
-            None,
+            mtp_path.map(Path::to_path_buf),
             (config.dim, config.vocab_size),
             &mut staging.gpus_mut().devices[0],
             max_seq,
@@ -4612,6 +4625,25 @@ mod ep_admission_tests {
         assert_eq!(effects, LoadEffects::default());
         assert_eq!(active.request(), before);
         let _ = std::fs::remove_file(candidate);
+    }
+}
+
+#[cfg(test)]
+mod mtp_sidecar_tests {
+    use super::qwen35_mtp_sidecar;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn cli_resolved_sidecar_beats_the_canonical_sibling() {
+        // A registry tag's trunk is a symlink: its canonical path has no
+        // sibling head, so the CLI-resolved path must win (single-GPU and TP).
+        let trunk = Path::new("/qcal/h2.group-alpha-refit.hfq");
+        let resolved = PathBuf::from("/models/qwen3.8-27b.mtp");
+        assert_eq!(qwen35_mtp_sidecar(trunk, Some(resolved.clone())), resolved);
+        assert_eq!(
+            qwen35_mtp_sidecar(Path::new("/models/qwen3.8-27b.mq4-xts"), None),
+            PathBuf::from("/models/qwen3.8-27b.mtp")
+        );
     }
 }
 

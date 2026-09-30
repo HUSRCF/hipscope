@@ -2265,6 +2265,7 @@ fn main() {
                         kv_k_override.as_deref(),
                         kv_v_override.as_deref(),
                         state_quant_override.as_deref(),
+                        mtp_path.as_deref(),
                         spec_cfg,
                     )
                 } else {
