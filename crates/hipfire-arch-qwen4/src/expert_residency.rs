@@ -12,7 +12,7 @@
 //! read over PCIe (zero-copy) with no kernel or dispatch change: a decode
 //! token reads only its routed experts' bytes from host RAM.
 
-use hipfire_runtime::weight_manifest::{WeightEntry, WeightResidency};
+use hipfire_runtime::weight_manifest::{ShardPolicy, WeightEntry, WeightResidency};
 
 /// `N` keeps the routed experts of trunk layers `0..N` in VRAM; `auto` picks
 /// the largest `N` that fits the card's free VRAM. Unset keeps every expert
@@ -63,7 +63,8 @@ fn is_routed_expert(name: &str) -> bool {
 }
 
 /// Resident bytes outside the routed experts, and the routed-expert bytes of
-/// one trunk layer (layer 0), from each entry's payload size.
+/// one trunk layer (layer 0), from each entry's payload size. Tied aliases
+/// have no payload of their own and external rows stay in the file.
 pub fn resident_split(
     weights: &[WeightEntry],
     bytes_of: impl Fn(&WeightEntry) -> Option<u64>,
@@ -71,7 +72,7 @@ pub fn resident_split(
     let mut non_expert = 0u64;
     let mut layer_experts = 0u64;
     for entry in weights {
-        if entry.residency.is_external() {
+        if entry.residency.is_external() || matches!(entry.policy, ShardPolicy::Tied { .. }) {
             continue;
         }
         let bytes = bytes_of(entry).ok_or_else(|| format!("no payload size for '{}'", entry.name))?;
