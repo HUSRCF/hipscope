@@ -479,6 +479,17 @@ pub struct MtpSpecState {
     /// by pointer, while the host refreshes the values before every launch.
     pub mtp_positions: GpuTensor,
 
+    /// Takeover head-KV fill input rows, `[(verify_capacity + 1) × dim]` F32.
+    /// Row 0 holds the pre-window `prev_hidden` (h_{cur_pos-1}); row `i > 0`
+    /// holds verify hidden row `i - 1`, so row `i` pairs with verify token `i`
+    /// exactly as decode pairs `(tok_p, h_{p-1})`.
+    pub takeover_fill_hidden: GpuTensor,
+
+    /// Batched head scratch + rotation scratch for the takeover fill, sized to
+    /// `verify_capacity + 1` rows. Allocated by the first takeover window that
+    /// takes the batched route.
+    takeover_fill_batched: Option<(Qwen35MtpHeadBatchedScratch, GpuTensor)>,
+
     /// Captured q8 compressed proposal graph for the greedy device-token-chain
     /// path. It belongs to this state because the graph bakes scratch/weight
     /// pointers into captured kernel nodes.
@@ -656,6 +667,7 @@ impl MtpSpecState {
         let mtp_token_chain = gpu.alloc_tensor(&[max_n + 1], DType::F32)?;
         let mtp_token_embed = gpu.alloc_tensor(&[dim], DType::F32)?;
         let mtp_positions = gpu.alloc_tensor(&[max_n], DType::F32)?;
+        let takeover_fill_hidden = gpu.alloc_tensor(&[(verify_capacity + 1) * dim], DType::F32)?;
 
         // Per-step top-2 scratches for p_min early-exit (16 B total, always
         // allocated — only used when state.p_min > 0).
@@ -692,6 +704,8 @@ impl MtpSpecState {
             mtp_token_chain,
             mtp_token_embed,
             mtp_positions,
+            takeover_fill_hidden,
+            takeover_fill_batched: None,
             mtp_proposal_graph: None,
             mtp_proposal_graph_exec: None,
             mtp_proposal_graph_blobs: Vec::new(),
@@ -838,6 +852,11 @@ impl MtpSpecState {
         let _ = gpu.free_tensor(self.mtp_token_chain);
         let _ = gpu.free_tensor(self.mtp_token_embed);
         let _ = gpu.free_tensor(self.mtp_positions);
+        let _ = gpu.free_tensor(self.takeover_fill_hidden);
+        if let Some((scratch, rot)) = self.takeover_fill_batched {
+            scratch.free_gpu(gpu);
+            let _ = gpu.free_tensor(rot);
+        }
         if let Some(exec) = self.mtp_proposal_graph_exec {
             let _ = gpu.hip.graph_exec_destroy(exec);
         }
@@ -1175,25 +1194,25 @@ fn mtp_assemble_verify_tokens(last_committed: u32, candidates: &[u32]) -> Vec<u3
     build_trunk_spine_verify_tokens(last_committed, candidates)
 }
 
-/// External-takeover MTP-KV repair policy (pure).
+/// Tokens whose MTP-head KV a takeover window fills (pure).
 ///
-/// After shared verify of an external ngram/PLD window:
-/// - If MTP is already retired, never run head repair.
-/// - If `accept_count > 0`, never run head repair: any positive external
-///   acceptance irreversibly retires MTP (caller latches `mtp_retired`).
-/// - If not retired and `accept_count == 0`, repair exactly the one committed
-///   input row (`last_committed` at `cur_pos`) using the pre-window hidden
-///   snapshot. Shared greedy verify always advances by 1 on zero accept
-///   (bonus only).
-///
-/// Returns how many MTP-head block-only forwards the takeover path must run
-/// (0 or 1). No O(accepted) multi-row repair.
-fn mtp_takeover_kv_repair_forwards(mtp_already_retired: bool, accept_count: usize) -> usize {
-    if mtp_already_retired || accept_count > 0 {
-        0
-    } else {
-        1
-    }
+/// After shared verify/rollback the trunk holds `verify_tokens[..advance]`
+/// (`[last_committed, candidates..]`) at `cur_pos..cur_pos + advance`, with or
+/// without a bonus and including the accepted-EOS case. Decode writes head
+/// slot `p` from `(tok_p, h_{p-1})`, so the fill writes exactly those rows:
+/// row 0 pairs `last_committed` with the pre-window hidden, row `i > 0` pairs
+/// `candidates[i - 1]` with verify hidden row `i - 1`. The pending token at
+/// `cur_pos + advance` is written by the next window, as in decode.
+fn mtp_takeover_fill_tokens(last_committed: u32, candidates: &[u32], advance: usize) -> Vec<u32> {
+    assert!(
+        advance >= 1 && advance <= candidates.len() + 1,
+        "takeover fill: advance {advance} out of 1..={}",
+        candidates.len() + 1
+    );
+    let mut tokens = Vec::with_capacity(advance);
+    tokens.push(last_committed);
+    tokens.extend_from_slice(&candidates[..advance - 1]);
+    tokens
 }
 
 /// Enqueue the target lm_head over every MTP verify row.
@@ -3428,33 +3447,22 @@ pub fn spec_step_mtp_compressed_serial_with_k(
     );
 }
 
-/// External ngram-mod/PLD candidate verify with MTP retire-on-accept.
+/// External ngram-mod/PLD candidate verify with MTP-head KV fill.
 ///
 /// Greedy-lossless, MTP-head-bypass path. The daemon supplies a non-empty
 /// greedy candidate window `candidates` (already filtered for length
-/// `<= state.verify_capacity` and temp==0). Native MTP remains state/loop
-/// owner until the first positive external acceptance, after which MTP is
-/// irreversibly retired for the request.
+/// `<= state.verify_capacity` and temp==0).
 ///
 /// * Bypasses all head proposal / graph / device-chain work.
 /// * Uses greedy trunk acceptance (`chain_truncated=false`).
 /// * Sets `drafts_generated = candidates.len()` and `chain_truncated=false`.
-/// * Before shared verify, snapshots pre-window `state.prev_hidden` into
-///   `mtp_t_outs` row 0 **only when MTP is not already retired** (needed for
-///   the zero-accept single-row repair). When already retired the snapshot is
-///   skipped — no repair will run.
-/// * After shared verify/rollback:
-///   - `mtp_already_retired || accept_count > 0` → **zero** MTP-head forwards
-///     (no O(accepted) multi-row repair). Caller must latch retirement on any
-///     `accept_count > 0`.
-///   - not retired and `accept_count == 0` → repair exactly the one committed
-///     input row (`last_committed` at `cur_pos`) with the saved pre-window
-///     hidden; `advance` must be 1 (bonus-only). Leaves native MTP state
-///     aligned for a subsequent native MTP cycle.
-///
-/// Caller invariant: any positive external acceptance irreversibly retires
-/// MTP. Subsequent calls pass `mtp_already_retired = true` and must not rely
-/// on MTP private KV staying warm.
+/// * Before shared verify, stages the pre-window `state.prev_hidden`
+///   (h_{cur_pos-1}) as row 0 of `takeover_fill_hidden`.
+/// * After shared verify/rollback, fills the MTP-head KV for exactly the
+///   `advance` rows the trunk kept ([`mtp_takeover_fill_tokens`]) with
+///   decode's `(tok_p, h_{p-1})` pairing, from the staged hidden and the
+///   verify hidden rows. A rejected tail is never written, so native MTP can
+///   draft on the next window as if those rows had been decoded one by one.
 ///
 /// External candidates must be non-empty, greedy, and `len <= state.verify_capacity`.
 /// Panics if those bounds are violated so daemon bugs surface loudly.
@@ -3468,7 +3476,6 @@ pub fn spec_step_mtp_compressed_serial_with_takeover_candidates(
     last_committed: u32,
     eos_token_id: u32,
     candidates: &[u32],
-    mtp_already_retired: bool,
 ) -> HipResult<MtpSpecResult> {
     assert!(
         mtp_external_candidates_within_capacity(candidates, state.verify_capacity),
@@ -3508,19 +3515,14 @@ pub fn spec_step_mtp_compressed_serial_with_takeover_candidates(
     let dim_bytes = dim * 4;
 
     // Shared verify overwrites `state.prev_hidden` with verify row advance-1.
-    // Snapshot the pre-window partner into `mtp_t_outs` row 0 only when MTP
-    // is still live (zero-accept path needs it for single-row repair).
-    // Device D2D; no host round-trip. `mtp_t_outs` is proposal-only and
-    // unused by the external shared path — safe scratch of size `dim`.
-    if !mtp_already_retired {
-        gpu.hip.memcpy_dtod_at(
-            &state.mtp_t_outs.buf,
-            0,
-            &state.prev_hidden.buf,
-            0,
-            dim_bytes,
-        )?;
-    }
+    // Stage the pre-window partner of `last_committed` as fill row 0.
+    gpu.hip.memcpy_dtod_at(
+        &state.takeover_fill_hidden.buf,
+        0,
+        &state.prev_hidden.buf,
+        0,
+        dim_bytes,
+    )?;
 
     // Shared greedy verify/accept/rollback. Sampling is forced greedy for
     // external windows even if state.sampling.temp > 0 (daemon guarantees
@@ -3544,39 +3546,110 @@ pub fn spec_step_mtp_compressed_serial_with_takeover_candidates(
         false,
     )?;
 
-    // Retire-on-accept: any accept_count>0 (or already-retired) skips all
-    // MTP-head repair. Zero-accept pre-takeover repairs only last_committed
-    // at cur_pos so native MTP stays aligned for the next cycle.
-    let repair_forwards = mtp_takeover_kv_repair_forwards(mtp_already_retired, result.accept_count);
-    if repair_forwards > 0 {
-        debug_assert_eq!(repair_forwards, 1, "takeover repair is single-row only");
-        assert_eq!(
-            result.advance, 1,
-            "spec_step_mtp_compressed_serial_with_takeover_candidates: zero-accept must advance by bonus only (advance={})",
-            result.advance
-        );
-        let trunk_weights: &Qwen35Weights = &target.weights;
-        // Single committed input row: last_committed @ cur_pos with the
-        // pre-window prev_hidden saved in mtp_t_outs row 0.
-        let hidden_ref = state.mtp_t_outs.sub_offset(0, dim);
-        mtp_head::mtp_head_forward_block_only(
-            gpu,
-            head,
-            &state.mtp_scratch,
-            &mut state.mtp_kv,
-            last_committed,
-            &hidden_ref,
-            None,
-            cur_pos,
-            trunk_weights,
-        )?;
-    }
+    mtp_takeover_fill_head_kv(
+        gpu,
+        head,
+        state,
+        &target.weights,
+        cur_pos,
+        &mtp_takeover_fill_tokens(last_committed, candidates, result.advance),
+    )?;
 
     // External path is always greedy and not truncated; ensure result fields
     // cohere even if shared helper drifted.
     result.drafts_generated = drafts_generated;
     result.chain_truncated = false;
     Ok(result)
+}
+
+/// Write MTP-head KV slots `cur_pos..cur_pos + tokens.len()` from
+/// `(tokens[i], takeover_fill_hidden[i])` after a takeover verify.
+///
+/// Row 0 of `takeover_fill_hidden` must already hold the pre-window hidden;
+/// this copies verify hidden rows `0..n-1` into rows `1..n`. Uses the batched
+/// KV-only head pass (same gate and kernels as the batched prompt fill) and
+/// falls back to per-row decode forwards otherwise. Rows are independent:
+/// each slot's K/V depends only on its own token and hidden.
+fn mtp_takeover_fill_head_kv(
+    gpu: &mut Gpu,
+    head: &Qwen35MtpHead,
+    state: &mut MtpSpecState,
+    trunk_weights: &Qwen35Weights,
+    cur_pos: usize,
+    tokens: &[u32],
+) -> HipResult<()> {
+    let n = tokens.len();
+    let dim = head.config.n_embd;
+    let dim_bytes = dim * 4;
+    if n > 1 {
+        gpu.hip.memcpy_dtod_at(
+            &state.takeover_fill_hidden.buf,
+            dim_bytes,
+            &state.verify_hidden.buf,
+            0,
+            (n - 1) * dim_bytes,
+        )?;
+    }
+    let use_batched = mtp_head::mtp_prompt_fill_uses_batched(
+        state.mtp_kv.kv_mode,
+        &[
+            head.weights.eh_proj.gpu_dtype,
+            head.weights.wq.gpu_dtype,
+            head.weights.wk.gpu_dtype,
+            head.weights.wv.gpu_dtype,
+        ],
+    );
+    if use_batched {
+        if state.takeover_fill_batched.is_none() {
+            let rows = state.verify_capacity + 1;
+            let scratch = Qwen35MtpHeadBatchedScratch::new(gpu, &head.config, rows)?;
+            let widest_k = (2 * dim)
+                .max(head.config.n_ff)
+                .max(head.config.n_head * head.config.head_dim);
+            match gpu.alloc_tensor(&[rows * widest_k], DType::F32) {
+                Ok(rot) => state.takeover_fill_batched = Some((scratch, rot)),
+                Err(error) => {
+                    scratch.free_gpu(gpu);
+                    return Err(error);
+                }
+            }
+        }
+        let (scratch, rot) = state
+            .takeover_fill_batched
+            .as_mut()
+            .expect("takeover fill scratch allocated above");
+        let positions: Vec<i32> = (cur_pos..cur_pos + n).map(|p| p as i32).collect();
+        let hidden = state.takeover_fill_hidden.sub_offset(0, n * dim);
+        mtp_head::mtp_head_forward_block_batched(
+            gpu,
+            head,
+            scratch,
+            &mut state.mtp_kv,
+            tokens,
+            &hidden,
+            &positions,
+            n,
+            trunk_weights,
+            Some(rot),
+            true,
+        )
+    } else {
+        for (i, &token) in tokens.iter().enumerate() {
+            let hidden_row = state.takeover_fill_hidden.sub_offset(i * dim, dim);
+            mtp_head::mtp_head_forward_block_only(
+                gpu,
+                head,
+                &state.mtp_scratch,
+                &mut state.mtp_kv,
+                token,
+                &hidden_row,
+                None,
+                cur_pos + i,
+                trunk_weights,
+            )?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -3809,19 +3882,16 @@ mod tests {
     }
 
     #[test]
-    fn takeover_kv_repair_policy_retired_and_accept() {
-        // Already retired → never repair, regardless of accept_count.
-        assert_eq!(mtp_takeover_kv_repair_forwards(true, 0), 0);
-        assert_eq!(mtp_takeover_kv_repair_forwards(true, 1), 0);
-        assert_eq!(mtp_takeover_kv_repair_forwards(true, 7), 0);
-
-        // Live MTP + positive external accept → retire, zero forwards
-        // (no O(accepted) multi-row repair).
-        assert_eq!(mtp_takeover_kv_repair_forwards(false, 1), 0);
-        assert_eq!(mtp_takeover_kv_repair_forwards(false, 3), 0);
-        assert_eq!(mtp_takeover_kv_repair_forwards(false, 64), 0);
-
-        // Live MTP + zero accept → single-row repair of last_committed only.
-        assert_eq!(mtp_takeover_kv_repair_forwards(false, 0), 1);
+    fn takeover_fill_rows_are_the_trunk_kept_prefix() {
+        let cands = [11, 12, 13, 14];
+        // Zero accept: bonus only, the seed row is the only trunk-kept row.
+        assert_eq!(mtp_takeover_fill_tokens(7, &cands, 1), vec![7]);
+        // Partial accept (2 drafts + bonus): rejected tail is never filled.
+        assert_eq!(mtp_takeover_fill_tokens(7, &cands, 3), vec![7, 11, 12]);
+        // Full accept: seed + every draft; the bonus is pending, not filled.
+        assert_eq!(
+            mtp_takeover_fill_tokens(7, &cands, 5),
+            vec![7, 11, 12, 13, 14]
+        );
     }
 }
