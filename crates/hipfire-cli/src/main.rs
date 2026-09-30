@@ -1988,11 +1988,13 @@ fn rm_with_registry(paths: &Paths, registry: &RegistryV1, args: RmArgs) -> Resul
     // bind their model hash, so sharing across entries is unlikely, but a
     // shared file must survive exactly like a shared DFlash draft.
     let mut kept_xdna: Option<(String, String)> = None;
+    // A shared MTP head under the same rule: every `qwen3.8:27b*` tier declares
+    // `qwen3.8-27b.mtp`, and the stem sweep below would otherwise catch it too.
+    let mut kept_mtp: Option<(String, String)> = None;
     if let Some((tag, entry)) = resolved {
         targets.extend(
             [
                 &entry.triattn,
-                &entry.mtp,
                 &entry.dspark,
                 &entry.t5,
                 &entry.clip,
@@ -2078,6 +2080,31 @@ fn rm_with_registry(paths: &Paths, registry: &RegistryV1, args: RmArgs) -> Resul
                 }
             }
         }
+        if let Some(sidecar) = entry.mtp.as_ref() {
+            let sidecar_path = paths.models.join(&sidecar.file);
+            if sidecar_path.is_file() {
+                // `models` is a BTreeMap, so keepers list in sorted tag order.
+                let keepers: Vec<&str> = registry
+                    .models
+                    .iter()
+                    .filter(|(other_tag, other)| {
+                        other_tag.as_str() != tag
+                            && other.file != entry.file
+                            && other
+                                .mtp
+                                .as_ref()
+                                .is_some_and(|other_sidecar| other_sidecar.file == sidecar.file)
+                            && paths.models.join(&other.file).is_file()
+                    })
+                    .map(|(other_tag, _)| other_tag.as_str())
+                    .collect();
+                if keepers.is_empty() {
+                    targets.insert(sidecar_path);
+                } else {
+                    kept_mtp = Some((sidecar.file.clone(), keepers.join(", ")));
+                }
+            }
+        }
         targets.extend(
             entry
                 .heads
@@ -2113,6 +2140,14 @@ fn rm_with_registry(paths: &Paths, registry: &RegistryV1, args: RmArgs) -> Resul
             );
         }
     }
+    if let Some((file, _)) = kept_mtp.as_ref() {
+        // The stem sweep matched the shared head beside the trunk; keep it.
+        let kept = paths.models.join(file);
+        if let Ok(canonical) = fs::canonicalize(&kept) {
+            targets.remove(&canonical);
+        }
+        targets.remove(&kept);
+    }
     if !args.yes {
         eprint!("Remove {} file(s)? [y/N] ", targets.len());
         std::io::stderr().flush()?;
@@ -2133,6 +2168,9 @@ fn rm_with_registry(paths: &Paths, registry: &RegistryV1, args: RmArgs) -> Resul
     }
     if let Some((file, keepers)) = kept_vision {
         eprintln!("keeping Vision sidecar {file}: still declared by {keepers}");
+    }
+    if let Some((file, keepers)) = kept_mtp {
+        eprintln!("keeping MTP sidecar {file}: still declared by {keepers}");
     }
     if let Some((file, keepers)) = kept_xdna {
         eprintln!("keeping XDNA sidecar {file}: still declared by {keepers}");
@@ -2289,6 +2327,14 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
         &model_path,
         canonical.as_deref(),
     )?;
+    resolve_mtp_sidecar(
+        &mut params,
+        entry,
+        &paths.models,
+        &model_path,
+        &args.model,
+        canonical.as_deref(),
+    );
     if let Some(vision) = &args.vision {
         // Forwarded in every mode; the daemon's `vision_mode=off` gate decides
         // and can then name the sidecar it declined on an image request.
@@ -3384,6 +3430,60 @@ fn resolve_dflash_sidecar(
         sidecar.file
     );
     Ok(())
+}
+
+/// Resolve the Qwen MTP head sidecar into `params["mtp"]`.
+///
+/// Call once the final `mtp_mode` is known (after the effective speculation
+/// selector); `off` never carries a head. Otherwise the first existing file
+/// wins: the registry `entry.mtp` file in `models_dir`, then `<entry
+/// file>.mtp` in `models_dir`, then `.mtp` beside `requested` as typed (when
+/// it names a file), then `.mtp` beside the canonical `model_path`.
+/// `find_model_path` canonicalizes, so a head beside a symlinked trunk — the
+/// models-dir layout — is invisible from `model_path` alone. With no hit
+/// `params["mtp"]` stays unset and the loader keeps its bundled-trailer and
+/// `<trunk>.mtp` lookup (and `on` fails there); a registry-declared head that
+/// is not pulled gets a one-line `hipfire pull` hint.
+pub(crate) fn resolve_mtp_sidecar(
+    params: &mut serde_json::Value,
+    entry: Option<&ModelEntry>,
+    models_dir: &Path,
+    model_path: &Path,
+    requested: &str,
+    tag: Option<&str>,
+) {
+    if let Some(obj) = params.as_object_mut() {
+        obj.remove("mtp");
+    }
+    if params["mtp_mode"].as_str() == Some("off") {
+        return;
+    }
+    let mut candidates = Vec::new();
+    if let Some(entry) = entry {
+        if let Some(sidecar) = entry.mtp.as_ref() {
+            candidates.push(models_dir.join(&sidecar.file));
+        }
+        candidates.push(models_dir.join(Path::new(&entry.file).with_extension("mtp")));
+    }
+    let requested = Path::new(requested);
+    if requested.is_file() {
+        // Absolute but not canonical: the daemon may run from another cwd,
+        // and the point is to keep the symlink's own directory.
+        let requested = std::path::absolute(requested).unwrap_or_else(|_| requested.to_path_buf());
+        candidates.push(requested.with_extension("mtp"));
+    }
+    candidates.push(model_path.with_extension("mtp"));
+    if let Some(hit) = candidates.into_iter().find(|candidate| candidate.is_file()) {
+        params["mtp"] = serde_json::json!(hit.display().to_string());
+        return;
+    }
+    if let Some(sidecar) = entry.and_then(|entry| entry.mtp.as_ref()) {
+        eprintln!(
+            "[hipfire] MTP head {} not pulled; `hipfire pull {}` enables MTP speculation",
+            sidecar.file,
+            tag.unwrap_or("<model>")
+        );
+    }
 }
 
 /// Resolve a registry-declared XDNA spillover archive into `params["xdna"]`.
@@ -5086,6 +5186,14 @@ fn open_bench_engine(
         &path,
         tag.as_deref(),
     )?;
+    resolve_mtp_sidecar(
+        &mut params,
+        entry.as_ref(),
+        &paths.models,
+        &path,
+        &args.model,
+        tag.as_deref(),
+    );
     if args.matrix || args.redline {
         let requested = longest_prefill.max(longest_decode).saturating_add(32);
         // Automatic max_seq stays omitted so admission can derive the bound.
@@ -9268,6 +9376,191 @@ mod tests {
         assert!(
             !paths.models.join("qwen3.8-27b-vision.hfq").exists(),
             "vision sidecar goes with the last on-disk declarer"
+        );
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    fn mtp_entry(file: &str, mtp: Option<&str>) -> ModelEntry {
+        ModelEntry {
+            repo: "test/repo".into(),
+            file: file.into(),
+            size_gb: 1.0,
+            min_vram_gb: 1.0,
+            desc: "mtp test".into(),
+            mtp: mtp.map(|head| hipfire_registry::Sidecar {
+                file: head.into(),
+                sha256: None,
+                size_bytes: None,
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mtp_sidecar_resolves_beside_a_symlinked_trunk() {
+        // B2: `find_model_path` canonicalizes, so the trunk path the daemon gets
+        // is the symlink TARGET. The head the user placed (or pulled) beside the
+        // symlink must still be found: via the models dir for a registry tag,
+        // via the path as typed for a bare path.
+        let paths = test_paths("mtp-symlinked-trunk");
+        let store = paths.root.join("store");
+        fs::create_dir_all(&paths.models).unwrap();
+        fs::create_dir_all(&store).unwrap();
+        let target = store.join("h2.group-alpha-refit.hfq");
+        fs::write(&target, b"trunk").unwrap();
+        let link = paths.models.join("qwen3.8-27b.mq4-xts");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let head = paths.models.join("qwen3.8-27b.mtp");
+        fs::write(&head, b"head").unwrap();
+        let canonical = fs::canonicalize(&link).unwrap();
+        assert_eq!(canonical, fs::canonicalize(&target).unwrap());
+
+        // Registry tag with the declared slot.
+        let entry = mtp_entry("qwen3.8-27b.mq4-xts", Some("qwen3.8-27b.mtp"));
+        let mut params = serde_json::json!({ "mtp_mode": "auto" });
+        resolve_mtp_sidecar(
+            &mut params,
+            Some(&entry),
+            &paths.models,
+            &canonical,
+            "qwen3.8:27b-mq4-xts",
+            Some("qwen3.8:27b-mq4-xts"),
+        );
+        assert_eq!(params["mtp"], head.display().to_string());
+
+        // Bare path to a symlink outside the models dir, no registry entry.
+        let elsewhere = paths.root.join("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        let bare_link = elsewhere.join("mine.mq4-xts");
+        std::os::unix::fs::symlink(&target, &bare_link).unwrap();
+        let bare_head = elsewhere.join("mine.mtp");
+        fs::write(&bare_head, b"head").unwrap();
+        let mut params = serde_json::json!({ "mtp_mode": "on" });
+        resolve_mtp_sidecar(
+            &mut params,
+            None,
+            &paths.models,
+            &canonical,
+            bare_link.to_str().unwrap(),
+            None,
+        );
+        assert_eq!(params["mtp"], bare_head.display().to_string());
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn mtp_sidecar_prefers_models_dir_then_falls_back_beside_the_target() {
+        let paths = test_paths("mtp-precedence");
+        let store = paths.root.join("store");
+        fs::create_dir_all(&paths.models).unwrap();
+        fs::create_dir_all(&store).unwrap();
+        let target = store.join("qwen3.8-27b.mq4");
+        fs::write(&target, b"trunk").unwrap();
+        let beside_target = store.join("qwen3.8-27b.mtp");
+        fs::write(&beside_target, b"head").unwrap();
+        let entry = mtp_entry("qwen3.8-27b.mq4", Some("qwen3.8-27b.mtp"));
+        let resolve = |params: &mut serde_json::Value| {
+            resolve_mtp_sidecar(
+                params,
+                Some(&entry),
+                &paths.models,
+                &target,
+                "qwen3.8:27b",
+                None,
+            )
+        };
+
+        // Only the canonical sibling exists: today's loader behaviour is kept.
+        let mut params = serde_json::json!({ "mtp_mode": "auto" });
+        resolve(&mut params);
+        assert_eq!(params["mtp"], beside_target.display().to_string());
+
+        // A pulled head in the models dir wins over the canonical sibling.
+        let pulled = paths.models.join("qwen3.8-27b.mtp");
+        fs::write(&pulled, b"head").unwrap();
+        resolve(&mut params);
+        assert_eq!(params["mtp"], pulled.display().to_string());
+
+        // Nothing anywhere: no param, so the loader's own lookup decides.
+        fs::remove_file(&pulled).unwrap();
+        fs::remove_file(&beside_target).unwrap();
+        resolve(&mut params);
+        assert!(params.get("mtp").is_none(), "{params}");
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn mtp_sidecar_is_never_carried_when_mtp_is_off() {
+        let paths = test_paths("mtp-off");
+        fs::create_dir_all(&paths.models).unwrap();
+        let target = paths.models.join("qwen3.8-27b.mq4");
+        fs::write(&target, b"trunk").unwrap();
+        fs::write(paths.models.join("qwen3.8-27b.mtp"), b"head").unwrap();
+        let entry = mtp_entry("qwen3.8-27b.mq4", Some("qwen3.8-27b.mtp"));
+        let resolve = |params: &mut serde_json::Value| {
+            resolve_mtp_sidecar(
+                params,
+                Some(&entry),
+                &paths.models,
+                &target,
+                "qwen3.8:27b",
+                None,
+            )
+        };
+        // A selector applied after an earlier resolution (e.g. `run --spec
+        // dflash` sets mtp_mode=off) must strip the stale path.
+        let mut params = serde_json::json!({ "mtp_mode": "auto" });
+        resolve(&mut params);
+        assert!(params.get("mtp").is_some());
+        apply_speculation_selector(&mut params, "dflash").unwrap();
+        resolve(&mut params);
+        assert!(params.get("mtp").is_none(), "{params}");
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn rm_keeps_shared_mtp_head_until_the_last_declaring_target() {
+        // Every `qwen3.8:27b*` tier declares `qwen3.8-27b.mtp`, whose name also
+        // matches the `<stem>.mtp` sweep beside the trunk being removed.
+        let paths = test_paths("rm-shared-mtp");
+        fs::create_dir_all(&paths.models).unwrap();
+        for file in ["qwen3.8-27b.mq4", "qwen3.8-27b.mq4-xts", "qwen3.8-27b.mtp"] {
+            fs::write(paths.models.join(file), b"fixture").unwrap();
+        }
+        let mut registry = rm_test_registry(&[
+            ("qwen3.8:27b", "qwen3.8-27b.mq4", None),
+            ("qwen3.8:27b-mq4-xts", "qwen3.8-27b.mq4-xts", None),
+        ]);
+        for entry in registry.models.values_mut() {
+            entry.mtp = Some(hipfire_registry::Sidecar {
+                file: "qwen3.8-27b.mtp".into(),
+                sha256: None,
+                size_bytes: None,
+            });
+        }
+        let rm = |model: &str| {
+            rm_with_registry(
+                &paths,
+                &registry,
+                RmArgs {
+                    model: model.into(),
+                    yes: true,
+                },
+            )
+            .unwrap()
+        };
+        rm("qwen3.8:27b-mq4-xts");
+        assert!(!paths.models.join("qwen3.8-27b.mq4-xts").exists());
+        assert!(
+            paths.models.join("qwen3.8-27b.mtp").exists(),
+            "shared head is kept while a sibling declarer is on disk"
+        );
+        rm("qwen3.8:27b");
+        assert!(!paths.models.join("qwen3.8-27b.mq4").exists());
+        assert!(
+            !paths.models.join("qwen3.8-27b.mtp").exists(),
+            "head goes with the last on-disk declarer"
         );
         fs::remove_dir_all(&paths.root).unwrap();
     }

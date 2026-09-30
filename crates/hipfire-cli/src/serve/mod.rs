@@ -11,8 +11,8 @@
 use crate::{
     apply_kv_axis_overrides, config_bool, config_f64, config_i64, config_string, config_u64,
     find_daemon, find_model_path, http_get_json, list_local_models, load_params, probe_host,
-    pull_command, resolved_for_model, resolved_global, ListArgs, Paths, PullArgs, ServeArgs,
-    StopArgs,
+    pull_command, resolve_mtp_sidecar, resolved_for_model, resolved_global, ListArgs, Paths,
+    PullArgs, ServeArgs, StopArgs,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use hipfire_client::Engine;
@@ -1292,6 +1292,14 @@ impl ServeRuntime {
                 self.kv_k_override.as_deref(),
                 self.kv_v_override.as_deref(),
             )?;
+            resolve_mtp_sidecar(
+                &mut params,
+                entry,
+                &self.paths.models,
+                &path,
+                model,
+                tag.as_deref(),
+            );
             if let Some(vision) = self.vision_override.as_ref() {
                 // Forwarded in every mode; the daemon's `vision_mode=off` gate decides.
                 params["vision"] = serde_json::json!(vision.display().to_string());
