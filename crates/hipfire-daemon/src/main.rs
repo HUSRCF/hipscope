@@ -392,10 +392,7 @@ fn gpu_block_attractor_token(
 fn prepare_gpu_lock_dir(path: &Path) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
     if !path.is_absolute() {
-        return Err(format!(
-            "GPU lock directory must be absolute: {}",
-            path.display()
-        ));
+        return Err(format!("GPU lock directory must be absolute: {}", path.display()));
     }
     if !path.exists() {
         std::fs::create_dir_all(path).map_err(|e| format!("create {}: {e}", path.display()))?;
@@ -403,18 +400,12 @@ fn prepare_gpu_lock_dir(path: &Path) -> Result<(), String> {
             .map_err(|e| format!("set permissions on {}: {e}", path.display()))?;
     }
     if !path.is_dir() {
-        return Err(format!(
-            "GPU lock path is not a directory: {}",
-            path.display()
-        ));
+        return Err(format!("GPU lock path is not a directory: {}", path.display()));
     }
     let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
         .map_err(|e| format!("invalid GPU lock directory {}: {e}", path.display()))?;
     if unsafe { libc::access(c_path.as_ptr(), libc::W_OK | libc::X_OK) } != 0 {
-        return Err(format!(
-            "GPU lock directory is not writable: {}",
-            path.display()
-        ));
+        return Err(format!("GPU lock directory is not writable: {}", path.display()));
     }
     Ok(())
 }
@@ -451,10 +442,7 @@ impl GpuLocks {
     fn open() -> Result<Self, String> {
         let dir = gpu_lock_dir()?;
         eprintln!("[gpu-lock] directory={}", dir.display());
-        Ok(Self {
-            dir,
-            held: Vec::new(),
-        })
+        Ok(Self { dir, held: Vec::new() })
     }
 
     /// Non-blocking reservation; a busy card reports its holder so arch
@@ -471,15 +459,8 @@ impl GpuLocks {
         }
         let path = self.dir.join(device.lock_file_name());
         let mut options = std::fs::OpenOptions::new();
-        options
-            .read(true)
-            .write(true)
-            .create(true)
-            .mode(0o666)
-            .custom_flags(libc::O_NOFOLLOW);
-        let mut file = options
-            .open(&path)
-            .map_err(|e| format!("open {}: {e}", path.display()))?;
+        options.read(true).write(true).create(true).mode(0o666).custom_flags(libc::O_NOFOLLOW);
+        let mut file = options.open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
         let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if rc != 0 {
             let error = std::io::Error::last_os_error();
@@ -497,8 +478,7 @@ impl GpuLocks {
         // Loosen files created under a restrictive umask for other HOME/users.
         let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666));
         file.set_len(0).map_err(|e| e.to_string())?;
-        file.seek(std::io::SeekFrom::Start(0))
-            .map_err(|e| e.to_string())?;
+        file.seek(std::io::SeekFrom::Start(0)).map_err(|e| e.to_string())?;
         writeln!(file, "{} {}", std::process::id(), device.bdf).map_err(|e| e.to_string())?;
         file.flush().map_err(|e| e.to_string())?;
         eprintln!("[gpu-lock] reserved {}", path.display());
@@ -527,11 +507,7 @@ impl GpuLocks {
         if self.held.is_empty() {
             return Err("no visible GPUs to reserve".into());
         }
-        let mut identities = self
-            .held
-            .iter()
-            .map(|(identity, _)| identity.as_str())
-            .collect::<Vec<_>>();
+        let mut identities = self.held.iter().map(|(identity, _)| identity.as_str()).collect::<Vec<_>>();
         identities.sort_unstable();
         let home = std::env::var("HOME").map_err(|e| format!("HOME: {e}"))?;
         let hipfire_dir = Path::new(&home).join(".hipfire");
@@ -746,6 +722,7 @@ impl ResidentKvDiag {
         Self::from_admission(request, KvBackend::Legacy, automatic_reason)
     }
 }
+
 
 /// Pure gate for the deferred EP (tp>1) load handoff.
 ///
@@ -973,12 +950,10 @@ fn main() {
             std::process::exit(1);
         });
         // Packaging needs only the arch and reserves no card.
-        install_process_config(process_config, &mut |_| Ok(Claim::Claimed)).unwrap_or_else(
-            |error| {
-                eprintln!("FATAL: failed to install process configuration: {error}");
-                std::process::exit(1);
-            },
-        );
+        install_process_config(process_config, &mut |_| Ok(Claim::Claimed)).unwrap_or_else(|error| {
+            eprintln!("FATAL: failed to install process configuration: {error}");
+            std::process::exit(1);
+        });
         // A separate --module probe below exercises the real GPU launch. Normal
         // packaging needs the active architecture but no writable cold directory
         // during Gpu::init: pack_to publishes to the executable-neighbor path.
@@ -1006,31 +981,21 @@ fn main() {
                 gpu.free_tensor(weight)?;
                 gpu.free_tensor(output)?;
                 Ok(values)
-            })()
-            .unwrap_or_else(|error| {
+            })().unwrap_or_else(|error| {
                 eprintln!("ERROR: rmsnorm_f32 execution failed: {error}");
                 std::process::exit(1);
             });
             let input = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
             let weight = [1.0f32, 0.5, 1.5, 2.0, 0.25, 0.75, 1.0, 1.25];
-            let scale = (input.iter().map(|v| v * v).sum::<f32>() / 8.0 + 1e-5)
-                .sqrt()
-                .recip();
-            if result
-                .iter()
-                .zip(input.iter().zip(weight))
-                .any(|(&got, (&x, w))| (got - x * w * scale).abs() > 1e-5)
-            {
+            let scale = (input.iter().map(|v| v * v).sum::<f32>() / 8.0 + 1e-5).sqrt().recip();
+            if result.iter().zip(input.iter().zip(weight)).any(|(&got, (&x, w))| (got - x * w * scale).abs() > 1e-5) {
                 eprintln!("ERROR: rmsnorm_f32 numerical output differs from reference: {result:?}");
                 std::process::exit(1);
             }
             eprintln!(
                 "precompile: rmsnorm_f32 execution succeeded on {}: output_bits={:?}",
                 gpu.arch,
-                result
-                    .iter()
-                    .map(|v| format!("{:08x}", v.to_bits()))
-                    .collect::<Vec<_>>()
+                result.iter().map(|v| format!("{:08x}", v.to_bits())).collect::<Vec<_>>()
             );
             return;
         }
@@ -1041,14 +1006,10 @@ fn main() {
             .join("kernels")
             .join("compiled")
             .join(&gpu.arch);
-        let extra_flags =
-            rdna_compute::FeatureFlags::from_active_config(&gpu.arch).hipcc_extra_flags;
+        let extra_flags = rdna_compute::FeatureFlags::from_active_config(&gpu.arch).hipcc_extra_flags;
         let entries = rdna_compute::kernel_registry::entries(&gpu.arch, &extra_flags)
             .unwrap_or_else(|error| {
-                eprintln!(
-                    "ERROR: no indexed kernel registry for {}: {error:?}",
-                    gpu.arch
-                );
+                eprintln!("ERROR: no indexed kernel registry for {}: {error:?}", gpu.arch);
                 std::process::exit(1);
             });
         let count = entries.len();
@@ -1058,26 +1019,17 @@ fn main() {
                 std::process::exit(1);
             });
         for entry in entries {
-            compiler
-                .pack_to(
-                    entry.module,
-                    entry.source(),
-                    &entry
-                        .symbols
-                        .iter()
-                        .map(|symbol| (*symbol).to_owned())
-                        .collect::<Vec<_>>(),
-                    &output,
-                )
-                .unwrap_or_else(|error| {
-                    eprintln!("ERROR: packaging {} failed: {error}", entry.module);
-                    std::process::exit(1);
-                });
+            compiler.pack_to(
+                entry.module,
+                entry.source(),
+                &entry.symbols.iter().map(|symbol| (*symbol).to_owned()).collect::<Vec<_>>(),
+                &output,
+            ).unwrap_or_else(|error| {
+                eprintln!("ERROR: packaging {} failed: {error}", entry.module);
+                std::process::exit(1);
+            });
         }
-        eprintln!(
-            "precompile: packaged {count} indexed modules for {}",
-            gpu.arch
-        );
+        eprintln!("precompile: packaged {count} indexed modules for {}", gpu.arch);
         return;
     }
 
@@ -1168,6 +1120,7 @@ fn main() {
     // unload and empty handoff; preserved when a replacement fails and the prior
     // resident remains loaded.
     let mut resident_kv: Option<ResidentKvDiag> = None;
+
 
     // Background stdin reader. Drains stdin into an mpsc channel so
     // the main loop can pull non-blockingly between messages. Abort /
@@ -1338,8 +1291,7 @@ fn main() {
                     .map(|n| n as usize);
                 if requested_seq.is_some_and(|n| n < MIN_REQUESTED_SEQ) {
                     let e = format!(
-                        "load refused: max_seq {} below floor {MIN_REQUESTED_SEQ}",
-                        requested_seq.unwrap()
+                        "load refused: max_seq {} below floor {MIN_REQUESTED_SEQ}", requested_seq.unwrap()
                     );
                     emit_uncorrelated_error(&mut stdout, None, &e, "validation", false, false);
                     let _ = stdout.flush();
@@ -1623,6 +1575,7 @@ fn main() {
                             }
                             batch_clear_all_terminals();
                             resident_kv = None;
+
                         }
                     }
                 }
@@ -2158,45 +2111,27 @@ fn main() {
                 // BEFORE any destructive side effect so a refusal leaves the
                 // prior model usable. The retained SourceAdmission is consumed
                 // by the load route below — no re-open, no re-classify.
-                let backend_request =
-                    match hipfire_loader::admission::KvBackendRequest::from_override(
-                        kv_backend_override.as_deref(),
-                    ) {
-                        Ok(request) => request,
-                        Err(e) => {
-                            emit_uncorrelated_error(
-                                &mut stdout,
-                                None,
-                                &e,
-                                "validation",
-                                false,
-                                false,
-                            );
-                            let _ = stdout.flush();
-                            continue;
-                        }
-                    };
+                let backend_request = match hipfire_loader::admission::KvBackendRequest::from_override(
+                    kv_backend_override.as_deref()
+                ) {
+                    Ok(request) => request,
+                    Err(e) => {
+                        emit_uncorrelated_error(&mut stdout, None, &e, "validation", false, false);
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                };
                 let admission = match hipfire_loader::admission::admit_source(
-                    path,
-                    tp,
-                    pp,
-                    backend_request,
-                    draft_path.as_deref(),
-                    gpu.arch.as_str(),
-                    vision_path.as_deref(),
-                    &vision_mode,
-                    head_path.as_deref(),
-                    max_seq,
+                    path, tp, pp, backend_request, draft_path.as_deref(),
+                    gpu.arch.as_str(), vision_path.as_deref(), &vision_mode,
+                    head_path.as_deref(), max_seq,
                     hipfire_loader::admission::KvBackendHints {
                         kv_mode: kv_mode_override.as_deref(),
                         kv_k: kv_k_override.as_deref(),
                         kv_v: kv_v_override.as_deref(),
                         kv_adaptive: kv_adaptive_override.as_deref(),
                         cask: Some(&cask),
-                        deepseek4_heterogeneous: !matches!(
-                            deepseek4_compute_placement,
-                            hipfire_config::Deepseek4ComputePlacement::Single
-                        ),
+                        deepseek4_heterogeneous: !matches!(deepseek4_compute_placement, hipfire_config::Deepseek4ComputePlacement::Single),
                         vmm_runtime_available: gpu.vmm_recommended_granularity().is_ok(),
                         free_vram_bytes: gpu.hip.get_vram_info().ok().map(|(free, _)| free),
                         qwen_default_q8: hipfire_loader::admission::qwen_default_q8_enabled(),
@@ -2221,6 +2156,7 @@ fn main() {
                     admission.kv_backend,
                     admission.kv_backend_reason.as_deref(),
                 );
+
 
                 // Unload previous if any. PFlash drafter goes first so
                 // its tensors join the pool before unload_model drains
@@ -2325,11 +2261,7 @@ fn main() {
                         let max_seq = m.max_seq;
                         let resolved = m.sequence.as_ref();
                         let seq_bound = resolved.map_or(
-                            if requested_seq.is_some() {
-                                "user"
-                            } else {
-                                "legacy"
-                            },
+                            if requested_seq.is_some() { "user" } else { "legacy" },
                             |s| s.bound,
                         );
                         let model_ctx = resolved.map(|s| s.model_ctx);
@@ -2612,10 +2544,12 @@ fn main() {
                         };
                         let reasoning_efforts_json = serde_json::to_string(&reasoning_efforts)
                             .unwrap_or_else(|_| "[]".to_string());
-                        let backend_reason_json = serde_json::to_string(&pending_kv_diag.reason)
-                            .expect("backend reason is serializable");
-                        let backend_warning_json = serde_json::to_string(&pending_kv_diag.warning)
-                            .expect("backend warning is serializable");
+                        let backend_reason_json =
+                            serde_json::to_string(&pending_kv_diag.reason)
+                                .expect("backend reason is serializable");
+                        let backend_warning_json =
+                            serde_json::to_string(&pending_kv_diag.warning)
+                                .expect("backend warning is serializable");
                         // Publish resident KV metadata with the loaded ACK.
                         resident_kv = Some(ResidentKvDiag {
                             mode: Some(seq_kv.to_owned()),
@@ -2644,12 +2578,8 @@ fn main() {
                                 backend_reason_json,
                                 pending_kv_diag.legacy,
                                 backend_warning_json,
-                                max_seq,
-                                seq_bound,
-                                seq_reason_json,
-                                serde_json::to_string(&model_ctx).unwrap(),
-                                serde_json::to_string(&card_cap).unwrap(),
-                                seq_kv,
+                                max_seq, seq_bound, seq_reason_json, serde_json::to_string(&model_ctx).unwrap(),
+                                serde_json::to_string(&card_cap).unwrap(), seq_kv,
                             );
                         } else {
                             let _ = writeln!(
@@ -2671,12 +2601,8 @@ fn main() {
                                 backend_reason_json,
                                 pending_kv_diag.legacy,
                                 backend_warning_json,
-                                max_seq,
-                                seq_bound,
-                                seq_reason_json,
-                                serde_json::to_string(&model_ctx).unwrap(),
-                                serde_json::to_string(&card_cap).unwrap(),
-                                seq_kv,
+                                max_seq, seq_bound, seq_reason_json, serde_json::to_string(&model_ctx).unwrap(),
+                                serde_json::to_string(&card_cap).unwrap(), seq_kv,
                             );
                         }
                         // ── PFlash drafter load (Phase 4.0) ──────────────

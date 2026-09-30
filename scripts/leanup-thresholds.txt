@@ -40,10 +40,7 @@ required_features_daemon    == 0
 # there fits under it. Paid down when the arm's branch duplication is factored.
 # RATCHET-RAISE 5355 -> 5362: the gfx1201 retained-decode PM4 pacing scope
 # (0466dbd01, HIPFIRE_GFX1201_PM4_PACING) added 14 lines after #778 measured 5348.
-# RATCHET-RAISE 5362 -> 5424: the SCS stack's declared raise (#782, "daemon_lines
-# 5348 -> 5411"): net -11 semantic lines, the rest rustfmt reflow of main.rs
-# (GpuLocks, precompile block, admit_source call) carried by the surface commit.
-daemon_lines                <= 5424
+daemon_lines                <= 5362
 
 # Examples compile on every `cargo build --all-targets`. Archived research
 # probes are gated behind `--features lab`; this is the count still ungated.
