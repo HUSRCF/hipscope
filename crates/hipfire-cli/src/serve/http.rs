@@ -28,6 +28,7 @@ use std::{
     cell::Cell,
     collections::VecDeque,
     convert::Infallible,
+    future::Future,
     io,
     pin::Pin,
     sync::{
@@ -280,6 +281,8 @@ pub(crate) struct ResponseChunk {
     bytes: Vec<u8>,
     ack: Option<AckSender>,
     fail: bool,
+    /// Ends with `data: [DONE]`: nothing, not even a keepalive, may follow.
+    last: bool,
 }
 
 impl ResponseChunk {
@@ -288,6 +291,16 @@ impl ResponseChunk {
             bytes,
             ack: None,
             fail: false,
+            last: false,
+        }
+    }
+    /// The final frame of a response (its bytes end with `data: [DONE]`).
+    fn last(bytes: Vec<u8>, ack: Option<AckSender>) -> Self {
+        Self {
+            bytes,
+            ack,
+            fail: false,
+            last: true,
         }
     }
     pub(crate) fn fail() -> Self {
@@ -295,14 +308,22 @@ impl ResponseChunk {
             bytes: Vec::new(),
             ack: None,
             fail: true,
+            last: false,
         }
     }
 }
+
+/// SSE comment sent after [`SSE_SILENCE_LIMIT`] without a frame. Conforming
+/// SSE parsers (the OpenAI SDKs, `hipfire_client::read_openai_sse`) drop it.
+const SSE_KEEPALIVE: &[u8] = b": keepalive\n\n";
 
 /// Streaming SSE body: frames the handler already holds (`first`), then the
 /// channel. Dropped receiver closes sender and callback returns Cancelled.
 /// Terminal chunk ack is registered with the connection tracker when that
 /// frame is yielded (not on a later body poll).
+/// Until the last frame, a silence of `keepalive_every` (a long prefill, or a
+/// tool call buffered to the end) yields an [`SSE_KEEPALIVE`] comment, so
+/// clients and proxies with an idle-read timeout keep the connection.
 /// Owns a clone of the worker cancellation flag; drop (client disconnect after
 /// the response is returned) sets it so long silent towers abort promptly.
 pub(crate) struct ChannelBody {
@@ -311,6 +332,10 @@ pub(crate) struct ChannelBody {
     tracker: FlushAcks,
     cancelled: Arc<AtomicBool>,
     failed: bool,
+    /// The last frame (`[DONE]`) has been yielded.
+    done: bool,
+    keepalive: Pin<Box<tokio::time::Sleep>>,
+    keepalive_every: Duration,
 }
 
 impl ChannelBody {
@@ -319,6 +344,7 @@ impl ChannelBody {
         rx: tokio::sync::mpsc::Receiver<ResponseChunk>,
         tracker: FlushAcks,
         cancelled: Arc<AtomicBool>,
+        keepalive_every: Duration,
     ) -> Self {
         Self {
             first,
@@ -326,7 +352,15 @@ impl ChannelBody {
             tracker,
             cancelled,
             failed: false,
+            done: false,
+            keepalive: Box::pin(tokio::time::sleep(keepalive_every)),
+            keepalive_every,
         }
+    }
+
+    fn restart_keepalive(&mut self) {
+        let next = tokio::time::Instant::now() + self.keepalive_every;
+        self.keepalive.as_mut().reset(next);
     }
 }
 
@@ -380,10 +414,19 @@ impl hyper::body::Body for ChannelBody {
                 if let Some(ack) = chunk.ack {
                     self.tracker.register(ack);
                 }
+                self.done |= chunk.last;
+                self.restart_keepalive();
                 Poll::Ready(Some(Ok(Frame::data(Bytes::from(chunk.bytes)))))
             }
             Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => Poll::Pending,
+            Poll::Pending => {
+                if !self.done && self.keepalive.as_mut().poll(cx).is_ready() {
+                    // The next poll_frame polls the re-armed timer again.
+                    self.restart_keepalive();
+                    return Poll::Ready(Some(Ok(Frame::data(Bytes::from_static(SSE_KEEPALIVE)))));
+                }
+                Poll::Pending
+            }
         }
     }
 }
@@ -1080,11 +1123,13 @@ fn images_error_status(message: &str) -> u16 {
 // Streaming / Non-streaming handlers
 // ---------------------------------------------------------------------------
 
-/// Longest an SSE client waits for the status line. A stream commits (200 +
-/// role chunk) when the worker sends its first frame; if generation is still
+/// Longest an SSE client goes without a byte. A stream commits (200 + role
+/// chunk) when the worker sends its first frame; if generation is still
 /// silent this long after admission (cold load, long prefill), it commits
-/// anyway so client and proxy timeouts do not fire.
-const SSE_COMMIT_DEADLINE: Duration = Duration::from_secs(15);
+/// anyway, and a committed stream sends [`SSE_KEEPALIVE`] after this much
+/// silence. 15 s sits under common idle-read limits (nginx
+/// `proxy_read_timeout` 60 s, undici `bodyTimeout` 300 s).
+const SSE_SILENCE_LIMIT: Duration = Duration::from_secs(15);
 
 async fn handle_streaming(
     shared: Arc<ServeShared>,
@@ -1157,14 +1202,14 @@ async fn handle_streaming(
                 };
             }
         },
-        _ = tokio::time::sleep(SSE_COMMIT_DEADLINE) => {
+        _ = tokio::time::sleep(SSE_SILENCE_LIMIT) => {
             if let Err(failure) = commit_stream(&commit) {
                 return failure.response();
             }
         }
     }
 
-    let body = ChannelBody::new(first, rx, acks, body_cancelled);
+    let body = ChannelBody::new(first, rx, acks, body_cancelled, SSE_SILENCE_LIMIT);
     Response::builder()
         .status(200)
         .header(header::CONTENT_TYPE, "text/event-stream")
@@ -1453,11 +1498,7 @@ impl SseSink {
         bytes.extend_from_slice(b"data: [DONE]\n\n");
         let (ack_tx, ack_rx) = std::sync::mpsc::channel();
         self.terminal_sent.set(true);
-        self.send(ResponseChunk {
-            bytes,
-            ack: Some(ack_tx),
-            fail: false,
-        })?;
+        self.send(ResponseChunk::last(bytes, Some(ack_tx)))?;
         match ack_rx.recv() {
             Ok(Ok(())) => Ok(()),
             Ok(Err(_)) | Err(_) => Err(hipfire_client::ClientError::Cancelled),
@@ -1500,7 +1541,7 @@ impl SseSink {
         }
         let _ = self
             .tx
-            .blocking_send(ResponseChunk::plain(failure.sse_event()));
+            .blocking_send(ResponseChunk::last(failure.sse_event(), None));
     }
 }
 
@@ -1576,16 +1617,18 @@ mod tests {
         let acks = FlushAcks::new();
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         let (ack_tx, ack_rx) = std::sync::mpsc::channel();
-        tx.try_send(ResponseChunk {
-            bytes: b"data: hi\n\n".to_vec(),
-            ack: Some(ack_tx),
-            fail: false,
-        })
-        .expect("send chunk");
+        tx.try_send(ResponseChunk::last(b"data: hi\n\n".to_vec(), Some(ack_tx)))
+            .expect("send chunk");
         drop(tx);
 
         let cancelled = Arc::new(AtomicBool::new(false));
-        let mut body = ChannelBody::new(VecDeque::new(), rx, acks.clone(), Arc::clone(&cancelled));
+        let mut body = ChannelBody::new(
+            VecDeque::new(),
+            rx,
+            acks.clone(),
+            Arc::clone(&cancelled),
+            Duration::from_secs(60),
+        );
         let mut cx = noop_cx();
         match Pin::new(&mut body).poll_frame(&mut cx) {
             Poll::Ready(Some(Ok(frame))) => {
@@ -1614,12 +1657,60 @@ mod tests {
         let (_tx, rx) = tokio::sync::mpsc::channel::<ResponseChunk>(1);
         let cancelled = Arc::new(AtomicBool::new(false));
         assert!(!cancelled.load(Ordering::SeqCst), "flag must start false");
-        let body = ChannelBody::new(VecDeque::new(), rx, acks, Arc::clone(&cancelled));
+        let body = ChannelBody::new(
+            VecDeque::new(),
+            rx,
+            acks,
+            Arc::clone(&cancelled),
+            Duration::from_secs(60),
+        );
         drop(body);
         assert!(
             cancelled.load(Ordering::SeqCst),
             "dropping ChannelBody must set cancelled"
         );
+    }
+
+    /// A silent stream gets `: keepalive` comments; after the `[DONE]` frame
+    /// nothing more is written, however long the body stays open.
+    #[tokio::test]
+    async fn channel_body_keepalive_stops_at_the_last_frame() {
+        async fn next(body: &mut ChannelBody) -> Option<Result<Frame<Bytes>, io::Error>> {
+            poll_fn(|cx| Pin::new(&mut *body).poll_frame(cx)).await
+        }
+        fn data(frame: Option<Result<Frame<Bytes>, io::Error>>) -> Bytes {
+            frame
+                .expect("frame")
+                .expect("data frame")
+                .into_data()
+                .expect("data")
+        }
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let mut body = ChannelBody::new(
+            VecDeque::new(),
+            rx,
+            FlushAcks::new(),
+            Arc::new(AtomicBool::new(false)),
+            Duration::from_millis(30),
+        );
+
+        assert_eq!(data(next(&mut body).await), SSE_KEEPALIVE);
+        tx.send(ResponseChunk::plain(b"data: x\n\n".to_vec()))
+            .await
+            .unwrap();
+        assert_eq!(data(next(&mut body).await), &b"data: x\n\n"[..]);
+        tx.send(ResponseChunk::last(b"data: [DONE]\n\n".to_vec(), None))
+            .await
+            .unwrap();
+        assert_eq!(data(next(&mut body).await), &b"data: [DONE]\n\n"[..]);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), next(&mut body))
+                .await
+                .is_err(),
+            "no frame may follow [DONE]"
+        );
+        drop(tx);
+        assert!(next(&mut body).await.is_none());
     }
 
     #[tokio::test]

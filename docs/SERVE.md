@@ -138,7 +138,9 @@ curl -N http://127.0.0.1:11435/v1/chat/completions \
   generation sends its first frame, or after 15 s of silence (cold load, long
   prefill), so a request that fails before then gets the same JSON error and
   status as a non-stream request. A stream that fails after that ends with
-  `data: {"error": {"message", "type"}}` and then `data: [DONE]`.
+  `data: {"error": {"message", "type"}}` and then `data: [DONE]`. Until
+  `[DONE]`, 15 s without a frame sends a `: keepalive` SSE comment, which
+  SSE parsers ignore.
 - **`stream: false` / omitted falsey:** single `chat.completion` JSON body.
 - Oversized body → **413** before the daemon lock (Content-Length or streamed
   cap at `max_request_bytes`).
