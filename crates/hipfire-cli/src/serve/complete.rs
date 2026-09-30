@@ -13,7 +13,7 @@ use crate::serve::http::request_id;
 use crate::serve::{Admission, AdmissionGuard, ModelOrigin, ServeMeta, ServeShared};
 use crate::{
     apply_http_reasoning_request, config_bool, config_string, config_u64, insert_optional_f64,
-    insert_optional_u64, request_f64, request_string, request_u64, unix_timestamp, Paths,
+    insert_optional_u64, request_f64, request_string, request_u64, unix_timestamp,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use hipfire_client::ClientError;
@@ -1354,22 +1354,6 @@ impl AttemptLatches {
 pub(crate) enum RetryDecision {
     Retry,
     Fail,
-}
-
-/// True when `candidate` resolves to a file inside the configured model store.
-///
-/// `canonicalize` resolves symlinks on both sides, so a link dropped in the
-/// store that points elsewhere is refused too. A path that does not exist
-/// resolves to `false` — the refusal is then indistinguishable from "not
-/// found locally", which is what keeps this from being a filesystem oracle.
-fn model_path_in_local_store(paths: &Paths, candidate: &std::path::Path) -> bool {
-    let Ok(store) = paths.models.canonicalize() else {
-        return false;
-    };
-    let Ok(real) = candidate.canonicalize() else {
-        return false;
-    };
-    real.starts_with(store)
 }
 
 /// Single enforced retry-eligibility decision for the serve retry driver.

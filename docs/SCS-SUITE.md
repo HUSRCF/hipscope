@@ -17,7 +17,7 @@ It complements, and does not replace, the other verification layers:
 | Host unit tests | `cargo test --workspace --lib` | pool/index/fairness/grammar internals |
 | GPU compose oracle | `test_serve_prefix_cache --mtp-k N` | engine-level reuse + fault cells (A19/A20) |
 | Product harness | `scripts/serve_harness.py` | generic serve semantics, chain/battery/session |
-| **This suite** | `scripts/scs_suite.py` | **the branch's user-facing contracts end to end**, incl. areas no other layer covers over HTTP (capability advertisement, 429/cancel/stall behavior, schema×cache composition, strict-JSON framing, error-status mapping) |
+| **This suite** | `scripts/scs_suite.py` | **the branch's user-facing contracts end to end**, incl. areas no other layer covers over HTTP (capability advertisement, 503/cancel/stall behavior, schema×cache composition, strict-JSON framing, error-status mapping) |
 
 ## Usage
 
@@ -55,7 +55,7 @@ endpoint.
 | F | typed refusals on the multi-slot route: tools, stop, logprobs, tool-role messages, reasoning_effort/think-cap/budget, min_p range, `n`, `logit_bias` | F1-F9 |
 | G | HTTP limits + error mapping: invalid JSON, unknown model, max_tokens bounds, 413 Content-Length, seed validation, empty messages, ctx overshoot | G1-G7 |
 | V | vision×radix isolation (A18: repeated image request must show `cached_tokens 0`) | V1 |
-| D | scheduler/admission: two-slot parallel generation + progressive service (wave-12), four-slot saturation, queue-full 429 + Retry-After, post-burst drain (pop_ready regression), cancel storm, long/short prefill interleave, queue timeout (env-dependent) | D1-D7 |
+| D | scheduler/admission: two-slot parallel generation + progressive service (wave-12), four-slot saturation, queue-full 503 + Retry-After, post-burst drain (pop_ready regression), cancel storm, long/short prefill interleave, queue timeout (env-dependent) | D1-D7 |
 | H | lifecycle canaries: post-gauntlet health + long-prompt liveness, cold-cycle stability, idle eviction (env-dependent), model swap (out of scope for a single-model container) | H1-H4 |
 
 Design invariants enforced across cells:

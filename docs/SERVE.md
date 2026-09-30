@@ -27,14 +27,7 @@ Anyone who can reach the bind address can call every endpoint, including
 chat completions. Default bind is `127.0.0.1` (loopback only); set
 `serve.host = "0.0.0.0"` (or pass `0.0.0.0:11435`) to listen on all interfaces.
 
-Cross-origin browser access is refused by default: no response carries
-`Access-Control-Allow-Origin`, and `OPTIONS` preflights are rejected, so a web
-page cannot drive a LAN-exposed instance. `GET /health` does not disclose an
-ownership token (`hipfire stop` proves ownership through the pidfile's PID and
-its listening socket). The `model` field accepts a registry tag or local model
-name — filesystem paths are refused over HTTP.
-
-- Prefer loopback for local use (the default): `hipfire serve`
+- Prefer loopback for local use: `hipfire serve 127.0.0.1:11435`
 - Expose beyond localhost only behind a trusted network or an authenticated
   TLS reverse proxy you control. Do not publish the raw port to the internet.
 
@@ -330,7 +323,8 @@ plain HTTP error status (no SSE body). A failure after the stream has started
 emits an OpenAI-shaped SSE `data: {"error": {...}}` frame followed by
 `data: [DONE]`, so a streaming client always sees a terminal event instead of
 a silently truncated `200`. Non-streaming failures keep the typed
-status mapping (`400` request/config, `429` overload, `500` internal).
+status mapping (`400` request/config, `503` + `Retry-After` overload or
+transient, `500` internal).
 
 Prefix-cache capable arches (daemon `cache_capable`, or arch allowlist
 `deepseek4` / `qwen3_5` / `qwen3_5_moe`) skip per-request `reset` so multi-turn
@@ -373,13 +367,6 @@ hipfire run qwen3.5:9b "..."                 # uses HTTP when /health is up
 HIPFIRE_LOCAL=1 hipfire run qwen3.5:9b "..." # force one-shot local daemon
 ```
 
-An HTTP request's `model` must be a registry tag, a local model name, or a
-path that resolves inside the model store (`~/.hipfire/models`); any other
-filesystem path is refused with 400 — otherwise the field is a file-existence
-oracle for anyone who can reach the port. A local `hipfire run <path>` against
-an out-of-store file needs `HIPFIRE_LOCAL=1` (or `--no-stream`/`--json`) so it
-spawns its own daemon instead of going through serve.
-
 `run` probes `http://<probe-host>:<port>/health` (500 ms). Probe host maps
 `0.0.0.0` / `::` → `127.0.0.1`. If serve is up, `run` POSTs
 `/v1/chat/completions` and does **not** spawn a second daemon. If serve is up
@@ -405,11 +392,8 @@ This is not a registry admission.
 
 `/health` carries a `capabilities` object built once at startup from the
 SAME resolved config the daemon's slot engine reads, so what is advertised
-is what the engine was built with. `/v1/models` entries carry a
-per-model `capabilities` projection (route facts plus `.mtp`/`.vl` sidecar
-probes on the model file), and `/stats` reports `mode`, `slots`, and
-`prefix_cache`. OpenAI-compatible clients ignore the extra fields;
-hipfire clients (and deployment tooling) use them for discovery:
+is what the engine was built with. OpenAI-compatible clients ignore the
+extra field; hipfire clients (and deployment tooling) use it for discovery:
 
 ```json
 {
