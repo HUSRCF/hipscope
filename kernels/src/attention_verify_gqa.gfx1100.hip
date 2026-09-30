@@ -74,16 +74,32 @@ __device__ __forceinline__ float va_row_xmask_add(float v) {
     return v + __builtin_bit_cast(float, other);
 }
 
-__device__ __forceinline__ float va_f16(unsigned short b) {
-    return (float)__builtin_bit_cast(_Float16, b);
+typedef _Float16 va_h2 __attribute__((ext_vector_type(2)));
+
+// Four signed Q8 codes as exact f16 values: byte ^ 0x80 = code + 128 is
+// placed under exponent byte 0x64 (f16 1024 + u, v_perm_b32), then 1152 is
+// subtracted (v_pk_add_f16). Every step is exact, and code 0 gives +0, as
+// (float)(signed char)0 does.
+__device__ __forceinline__ void va_codes4(unsigned int w, va_h2& c01, va_h2& c23) {
+    const unsigned int u = w ^ 0x80808080u;
+    const va_h2 bias = {(_Float16)1152.0f, (_Float16)1152.0f};
+    c01 = __builtin_bit_cast(va_h2, __builtin_amdgcn_perm(0x64646464u, u, 0x04010400u)) - bias;
+    c23 = __builtin_bit_cast(va_h2, __builtin_amdgcn_perm(0x64646464u, u, 0x04030402u)) - bias;
 }
 
-// Eight signed Q8 codes times their block scale (exact f32 products).
-__device__ __forceinline__ void va_dequant_q8(unsigned int lo, unsigned int hi, float s, float (&out)[8]) {
+// Eight signed Q8 codes times their f16 block scale: f16 x f16 products are
+// exact in f32 (v_fma_mix_f32), equal to the references' ks * (float)code,
+// signed zeros included.
+__device__ __forceinline__ void va_dequant_q8(unsigned int lo, unsigned int hi, _Float16 s, float (&out)[8]) {
+    va_h2 c[4];
+    va_codes4(lo, c[0], c[1]);
+    va_codes4(hi, c[2], c[3]);
+    const float sf = (float)s;
 #pragma unroll
-    for (int i = 0; i < 4; ++i) out[i] = s * (float)(signed char)(lo >> (8 * i));
-#pragma unroll
-    for (int i = 0; i < 4; ++i) out[4 + i] = s * (float)(signed char)(hi >> (8 * i));
+    for (int i = 0; i < 4; ++i) {
+        out[2 * i] = sf * (float)c[i].x;
+        out[2 * i + 1] = sf * (float)c[i].y;
+    }
 }
 
 // One reference-lane leaf: sequential fma over its 8 dims from +0.
@@ -113,7 +129,7 @@ __device__ __forceinline__ VaSlice va_load_slice(__amdgpu_buffer_rsrc_t rsrc, un
 }
 
 __device__ __forceinline__ void va_dequant(const VaSlice& s, float (&out)[8]) {
-    va_dequant_q8(s.lo, s.hi, va_f16(s.sc), out);
+    va_dequant_q8(s.lo, s.hi, __builtin_bit_cast(_Float16, s.sc), out);
 }
 
 // ROWS mode: out = fma(w, vq, out) and sum += w for one key of one pair,
