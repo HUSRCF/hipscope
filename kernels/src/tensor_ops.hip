@@ -4489,7 +4489,7 @@ static __device__ __forceinline__ void qsa_attention_batched_hg4(
     // Invalid (-1) rows hold weight 0 (their score was never exponentiated)
     // and read value 0, so they add +0.0 to sums that are never -0.0: the
     // accumulation is branch-free and still bitwise the skipping version.
-    // Eight value loads are issued before their in-order accumulation.
+    // Sixteen value loads are issued before their in-order accumulation.
     // Token indices are block-uniform: read them as scalars and fetch each
     // value row through a scalar buffer offset (invalid rows read row 0 and
     // select 0.0, exactly the value the skipped row contributed).
@@ -4510,12 +4510,12 @@ static __device__ __forceinline__ void qsa_attention_batched_hg4(
         }
     };
     int i = 0;
-    for (; i + 8 <= selected_len; i += 8) {
-        float value[8];
+    for (; i + 16 <= selected_len; i += 16) {
+        float value[16];
 #pragma unroll
-        for (int u = 0; u < 8; ++u) value[u] = value_at(i + u);
+        for (int u = 0; u < 16; ++u) value[u] = value_at(i + u);
 #pragma unroll
-        for (int u = 0; u < 8; ++u) {
+        for (int u = 0; u < 16; ++u) {
             const float4 w4 = *reinterpret_cast<const float4*>(weights + (i + u) * QSA_HG);
             denominator[0] += w4.x;
             numerator[0] += w4.x * value[u];
