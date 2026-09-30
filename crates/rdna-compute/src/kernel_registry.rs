@@ -352,7 +352,8 @@ mod tests {
         // Deliberate changes that landed after the P0 capture (kernel cache
         // ABI 4). The traces keep the captured bytes and argv; the portable
         // digests above are re-pinned to the current source.
-        const REPINNED_SINCE_P0: [&str; 4] = [
+        const REPINNED_SINCE_P0: [&str; 5] = [
+            "conv1d_silu_split_qknorm_b256",
             "fused_rmsnorm_mq_rotate",
             "fused_rmsnorm_mq_rotate_awq",
             "fused_silu_mul_mq_rotate_awq",
