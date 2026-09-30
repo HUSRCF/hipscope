@@ -3547,14 +3547,52 @@ pub(crate) fn apply_kernarg_bindings_for_dispatch(
     Ok(())
 }
 
-/// Merge every engine-declared kernarg binding from the retained prefix into the
-/// prepared binding set.
+/// Every kernarg binding the retained replay of `launches[..prefix]` applies,
+/// sorted by `(dispatch, offset)`.
+///
+/// The single owner of the dynamic-slot set: the retained PM4 plan and the
+/// recorded-HIP oracle (`Gpu::replay_recorded_hip_prefix_at`) both build their
+/// bindings here, so the oracle Redline checks PM4 against re-derives exactly
+/// the fields PM4 patches. Three sources, one owner per `(dispatch, offset)`:
+/// the GDN requant frame of every GDN-family launch, the differential position
+/// bindings synthesized from two recordings, and each launch's engine-declared
+/// bindings.
+pub(crate) fn retained_kernarg_bindings(
+    launches: &[RecordedHipLaunch],
+    prefix: usize,
+    synthesized: &[(usize, ReplayKernargBinding)],
+) -> Result<Vec<(usize, ReplayKernargBinding)>, String> {
+    let mut bindings = Vec::new();
+    for (dispatch, launch) in launches.iter().take(prefix).enumerate() {
+        if is_gdn_kernel(&launch.kernel) {
+            // frames = max(1, nt * grid.z): the one helper that decides the
+            // reservation run length for every transport.
+            let frames = gdn_requant_frames_for_dispatch(&launch.kernarg, launch.grid[2])
+                .map_err(|reason| format!("{}: {reason}", launch.kernel))?;
+            bindings.push((
+                dispatch,
+                ReplayKernargBinding::GdnFrameU32 { offset: 76, frames },
+            ));
+        }
+    }
+    bindings.extend(
+        synthesized
+            .iter()
+            .filter(|(dispatch, _)| *dispatch < prefix)
+            .copied(),
+    );
+    merge_declared_kernarg_bindings(launches, prefix, &mut bindings)?;
+    bindings.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.offset().cmp(&b.1.offset())));
+    Ok(bindings)
+}
+
+/// Merge every engine-declared kernarg binding from the retained prefix into
+/// `bindings`.
 ///
 /// One owner per `(dispatch, offset)`: a second binding for the same slot would
 /// patch it twice, so the collision is rejected rather than resolved by order.
-/// The recorded-HIP oracle does not need this — it reads each launch's declared
-/// bindings directly — but both transports must agree on which slots are
-/// dynamic, and this is where PM4 records that set.
+/// Only [`retained_kernarg_bindings`] calls this, so PM4 and the recorded-HIP
+/// oracle see the same declared set.
 fn merge_declared_kernarg_bindings(
     launches: &[RecordedHipLaunch],
     prefix: usize,
@@ -3589,10 +3627,19 @@ fn merge_declared_kernarg_bindings(
 }
 
 impl ReplayController {
-    /// Accessor for the synthesized position bindings (for testing and for
-    /// the recorded-HIP oracle to share the same binding set).
+    /// Accessor for the synthesized position bindings (tests; transports use
+    /// [`Self::retained_kernarg_bindings`]).
     pub(crate) fn synthesized_position_bindings(&self) -> &[(usize, ReplayKernargBinding)] {
         &self.synthesized_position_bindings
+    }
+
+    /// The complete retained binding set for the first `prefix` recorded
+    /// launches; see [`retained_kernarg_bindings`].
+    pub(crate) fn retained_kernarg_bindings(
+        &self,
+        prefix: usize,
+    ) -> Result<Vec<(usize, ReplayKernargBinding)>, String> {
+        retained_kernarg_bindings(&self.recorded, prefix, &self.synthesized_position_bindings)
     }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -5233,7 +5280,6 @@ impl ReplayController {
         let mut geometries = Vec::with_capacity(prefix);
         let mut bound_explicit_lens = Vec::with_capacity(prefix);
         let mut dynamic_gdn_frames = Vec::new();
-        let mut dynamic_kernarg_bindings: Vec<(usize, ReplayKernargBinding)> = Vec::new();
         let mut dynamic_grids = Vec::new();
 
         for launch in self.recorded.iter().take(prefix) {
@@ -5307,30 +5353,10 @@ impl ReplayController {
             device
                 .validate_geometry(geometry)
                 .map_err(|error| format!("{symbol}: {error}"))?;
-            let is_gdn = launch.kernel == "gated_delta_net_q8_fast"
-                || launch.kernel.starts_with("gated_delta_net_q8_compact");
-            if is_gdn {
-                if metadata.kernarg_segment_size < 80 {
-                    return Err(format!(
-                        "{symbol}: loader kernarg is too short for dynamic frame binding"
-                    ));
-                }
-                // Derive the exact reservation run length for this dispatch:
-                // frames = max(1, nt * grid.z) where nt is at kernarg offset 64
-                // and grid.z is the recorded third grid dimension. This is the
-                // single helper that decides consumption for PM4, recorded-blob,
-                // and binding construction.
-                let frames = gdn_requant_frames_for_dispatch(&launch.kernarg, launch.grid[2])
-                    .map_err(|reason| format!("{symbol}: {reason}"))?;
-                dynamic_kernarg_bindings.push((
-                    kernargs.len(),
-                    ReplayKernargBinding::GdnFrameU32 { offset: 76, frames },
+            if is_gdn_kernel(&launch.kernel) && metadata.kernarg_segment_size < 80 {
+                return Err(format!(
+                    "{symbol}: loader kernarg is too short for dynamic frame binding"
                 ));
-                // New tapes rely solely on the typed binding above; the legacy
-                // `dynamic_gdn_frames` vector is left empty so replay has exactly
-                // one path that decides frame consumption. Old prepared objects
-                // with a populated legacy vector remain supported via the
-                // de-duplication check in `replay_and_wait_checked`.
             }
             if let Some(binding) = grid_binding_for_storage {
                 let grid_to_store = if self.prepared_max_position.is_some() {
@@ -5340,40 +5366,17 @@ impl ReplayController {
                 };
                 dynamic_grids.push((kernargs.len(), binding, grid_to_store, launch.block));
             }
-            // Admissibility: every position-dependent scalar must be either
-            // indirect via persistent buffer or covered by a declared binding.
-            // Currently only GDN frame is such a scalar; reject a GDN-family
-            // launch that somehow has no binding (would otherwise replay stale).
-            if is_gdn {
-                let has_gdn_binding = dynamic_kernarg_bindings
-                    .iter()
-                    .any(|(idx, _)| *idx == kernargs.len());
-                if !has_gdn_binding {
-                    return Err(format!(
-                        "{symbol}: GDN-family launch has no kernarg binding"
-                    ));
-                }
-            }
             kernels.push(kernel);
             kernargs.push(kernarg);
             geometries.push(geometry);
         }
-        // Merge differential position bindings synthesized from two recordings.
-        // Both transports must emit the identical binding set through one code
-        // path; the position bindings are stored on the controller and merged
-        // here for PM4. The recorded-HIP path merges the same set via
-        // `apply_kernarg_bindings_for_dispatch`.
-        for (dispatch, binding) in &self.synthesized_position_bindings {
-            if *dispatch < prefix {
-                dynamic_kernarg_bindings.push((*dispatch, *binding));
-            }
-        }
-        // Engine-declared bindings travel with their launch and merge the same
-        // way. A slot with two owners would be patched twice, so it fails closed.
-        merge_declared_kernarg_bindings(&self.recorded, prefix, &mut dynamic_kernarg_bindings)
+        // GDN frames, synthesized position bindings and engine-declared
+        // bindings, from the one builder the recorded-HIP oracle also uses. New
+        // tapes leave the legacy `dynamic_gdn_frames` vector empty so replay has
+        // exactly one path that decides frame consumption.
+        let dynamic_kernarg_bindings = self
+            .retained_kernarg_bindings(prefix)
             .map_err(|reason| format!("retained PM4 kernarg bindings: {reason}"))?;
-        dynamic_kernarg_bindings
-            .sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.offset().cmp(&b.1.offset())));
 
         let gfx12_gcr_trim = hipfire_config::process_value("HIPFIRE_REPLAY_PM4_GCR_TRIM")
             .map(|value| !matches!(value.as_str(), "0" | "false" | "off"))

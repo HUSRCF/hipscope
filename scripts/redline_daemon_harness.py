@@ -169,30 +169,17 @@ def qwen4_shadow_failures(shadow):
     windows = parity.get("windows") or []
     if not windows:
         failures.append("parity table has no windows")
+    # The recorded-HIP oracle applies the same synthesized and program-declared
+    # position bindings as the retained plan, so both arms carry the
+    # multi-position claim.
     for window in windows:
         position = window.get("position")
-        row = window.get("pm4") or {}
-        if not row:
-            failures.append(f"position {position}: retained arm missing from parity")
-            continue
-        failures.extend(qwen4_row_failures(row, f"position {position}: pm4"))
-
-    # The recorded-HIP oracle is the captured blob replayed at its own capture
-    # position: its substitution comes from the controller's synthesized-binding
-    # calibration, which Qwen4 replaces with program-declared bindings. It is
-    # therefore compared once, at the capture geometry, while the retained arm
-    # carries the multi-position claim.
-    blob = parity.get("blob") or {}
-    row = blob.get("recorded_hip") or {}
-    if not row:
-        failures.append("parity.blob.recorded_hip missing (capture-position oracle)")
-    elif blob.get("position") != windows[0].get("position"):
-        failures.append(
-            f"parity.blob.position {blob.get('position')} != first window "
-            f"{windows[0].get('position')} ({row})"
-        )
-    else:
-        failures.extend(qwen4_row_failures(row, "blob.recorded_hip"))
+        for arm in ("pm4", "recorded_hip"):
+            row = window.get(arm) or {}
+            if not row:
+                failures.append(f"position {position}: {arm} arm missing from parity")
+                continue
+            failures.extend(qwen4_row_failures(row, f"position {position}: {arm}"))
 
     failure = shadow.get("failure_behavior") or {}
     if not failure:
