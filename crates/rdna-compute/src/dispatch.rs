@@ -1600,6 +1600,7 @@ impl Gpu {
                 ar_forward_blobs: Vec::new(),
                 ar_forward_kernel_dirty: true,
                 ar_forward_replay_enabled: false,
+                ar_forward_binding: 0,
                 ar_graph_eligible: true,
                 ar_segments: Vec::new(),
                 verify: crate::graph::PerBGraphCache {
