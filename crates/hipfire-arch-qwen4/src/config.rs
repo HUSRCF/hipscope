@@ -620,13 +620,12 @@ impl Qwen4Config {
     }
 }
 
-/// Largest context a Qwen4 load admits. The parallel QSA block selector
-/// stages one F32 score per pooled block of the whole arena
-/// (`max_seq / compress` blocks) in dynamic LDS beside 4 KiB of static LDS
-/// (`rdna_compute::tensor_ops::QSA_SELECT_BATCHED_STATIC_LDS_BYTES`); the
-/// 64 KiB bound (gfx11/gfx12) holds 15360 blocks. A larger arena would route
-/// every row, decode included, to the one-thread serial selector.
-pub const QWEN4_MAX_CONTEXT: usize = 61440;
+/// Largest context a Qwen4 load admits: the model's native
+/// `max_position_embeddings`. Past 15,360 pooled blocks (61,440 tokens) the
+/// QSA selector keeps its score rows in global memory instead of LDS; whether
+/// a context fits is decided by the state allocation, which names the MiB it
+/// needed when it does not.
+pub const QWEN4_MAX_CONTEXT: usize = 262_144;
 
 /// Context a Qwen4 load gets when `max_seq` is omitted.
 pub const QWEN4_DEFAULT_CONTEXT: usize = 32768;

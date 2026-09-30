@@ -1543,6 +1543,8 @@ impl Gpu {
                 paro_fused_scratch: None,
                 fp16_x_scratch: None,
                 fp16_x_scratch_bytes: 0,
+                qsa_select_scores: None,
+                qsa_select_scores_bytes: 0,
                 fp16_x_source_ptr: std::ptr::null_mut(),
                 fp8_x_scratch: None,
                 fp8_x_scratch_bytes: 0,
@@ -2996,6 +2998,28 @@ impl Gpu {
     /// Ensure the FP16 X scratch contains the conversion of `x`. Skips the
     /// convert kernel if `x.buf.as_ptr()` matches the last converted source.
     /// Returns the FP16 device pointer.
+    /// The QSA selector's global score rows, at least `bytes`. Growth follows
+    /// the other scratch slots: invalidate captured graphs and re-arm replay
+    /// before the old buffer is freed. A model's first use already requests
+    /// its final size (the bound comes from the arena capacity, not the
+    /// position), so a retained decode tape never sees the pointer move.
+    pub(crate) fn qsa_select_scores(&mut self, bytes: usize) -> HipResult<*mut c_void> {
+        if crate::scratch::scratch_will_grow(
+            self.scratch.qsa_select_scores_bytes,
+            self.scratch.qsa_select_scores.is_some(),
+            bytes,
+        ) {
+            self.invalidate_for_scratch_growth();
+            crate::scratch::grow_scratch_slot(
+                &self.hip,
+                &mut self.scratch.qsa_select_scores,
+                &mut self.scratch.qsa_select_scores_bytes,
+                bytes,
+            )?;
+        }
+        Ok(self.scratch.qsa_select_scores.as_ref().unwrap().as_ptr())
+    }
+
     pub(crate) fn ensure_fp16_x(
         &mut self,
         x: &GpuTensor,

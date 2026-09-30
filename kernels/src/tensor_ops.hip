@@ -2392,12 +2392,20 @@ static __device__ __forceinline__ void qsa_select_batched(
     int compress,
     int position_start,
     int capacity,
-    int* mirror) {
+    int* mirror,
+    float* scores_global,
+    int scores_stride) {
     int row = (int)blockIdx.x;
     if (row >= rows) return;
     // The persistent selection is the final row's.
     if (row != rows - 1) mirror = nullptr;
-    extern __shared__ __align__(16) float scores[];
+    // Scores live in dynamic LDS when the arena's block count fits it, else in
+    // a global row of `scores_stride` floats (a multiple of 4, so the float4
+    // reads below stay 16-byte aligned); every access is the same.
+    extern __shared__ __align__(16) float scores_lds[];
+    float* scores = scores_global != nullptr
+        ? scores_global + (size_t)row * (size_t)scores_stride
+        : scores_lds;
     int visible = position_start + row + 1;
     int row_block_count = visible / compress;
     if (row_block_count > block_count) row_block_count = block_count;
@@ -2559,10 +2567,10 @@ static __device__ __forceinline__ void qsa_select_batched(
                                     int rows, int query_row_stride, int block_count,            \
                                     int index_heads, int index_dim, int budget_blocks,          \
                                     int compress, int position_start, int capacity,             \
-                                    int* mirror) {                                              \
+                                    int* mirror, float* scores_global, int scores_stride) {     \
         qsa_select_batched(query, pooled, selected, rows, query_row_stride, block_count,        \
                            index_heads, index_dim, budget_blocks, compress, position_start,     \
-                           capacity, mirror);                                                   \
+                           capacity, mirror, scores_global, scores_stride);                     \
     }
 QSA_SELECT_PARALLEL(indexed_attention_select_f32_batched, float)
 QSA_SELECT_PARALLEL(indexed_attention_select_bf16_batched, __hip_bfloat16)

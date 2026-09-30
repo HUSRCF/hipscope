@@ -31,9 +31,29 @@ const QSA_SELECT_DYNAMIC_LDS_LIMIT_BYTES: usize = 64 * 1024;
 /// Static LDS of `indexed_attention_select_f32_batched` beside its dynamic
 /// score row: 256 radix bins and the 512-entry chosen-block list
 /// (`QSA_SELECT_LIST_CAPACITY` in tensor_ops.hip) plus scalars, rounded up.
-/// The parallel route needs `shape_blocks * 4 + this` within the LDS limit,
-/// i.e. at most 15360 pooled blocks (61440 tokens at compress 4).
+/// The LDS route needs `shape_blocks * 4 + this` within the LDS limit, i.e. at
+/// most 15360 pooled blocks (61440 tokens at compress 4); larger arenas keep
+/// their score rows in global memory.
 pub const QSA_SELECT_BATCHED_STATIC_LDS_BYTES: usize = 4 * 1024;
+/// Rows per launch of the batched selector when its scores live in global
+/// memory (arenas past the LDS row); longer batches launch in groups, so the
+/// score scratch is `QSA_SELECT_GLOBAL_ROWS * padded blocks` floats.
+const QSA_SELECT_GLOBAL_ROWS: usize = 256;
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only: route the batched selector to its serial oracle kernel.
+    static SELECT_FORCE_SERIAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+#[cfg(test)]
+fn select_forced_serial() -> bool {
+    SELECT_FORCE_SERIAL.with(|flag| flag.get())
+}
+#[cfg(not(test))]
+#[inline(always)]
+fn select_forced_serial() -> bool {
+    false
+}
 const QSA_ATTENTION_PARALLEL_THREADS: u32 = 256;
 const QSA_ATTENTION_LDS_BYTES_PER_ROW: usize = 8; // F32 score + i32 token.
 const QSA_ATTENTION_DYNAMIC_LDS_LIMIT_BYTES: usize = 64 * 1024;
@@ -2699,23 +2719,73 @@ fn indexed_attention_select_batch_impl(
         ));
     }
     let shape_blocks = p.shape_blocks;
-    let (kernel_name, block, shared_mem) =
-        match shape_blocks.checked_mul(std::mem::size_of::<f32>()) {
-            Some(bytes)
-                if gpu.arch_caps.has_gfx11_plus_simt()
-                    && shape_blocks > 0
-                    && bytes + QSA_SELECT_BATCHED_STATIC_LDS_BYTES
-                        <= QSA_SELECT_DYNAMIC_LDS_LIMIT_BYTES
-                    && bytes <= u32::MAX as usize =>
-            {
-                (
-                    parallel_kernel,
-                    [QSA_SELECT_PARALLEL_THREADS, 1, 1],
-                    bytes as u32,
-                )
-            }
-            _ => (serial_kernel, [1, 1, 1], 0),
-        };
+    let lds_bytes = shape_blocks
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| HipError::new(0, "QSA batch select shape overflow"))?;
+    let parallel = gpu.arch_caps.has_gfx11_plus_simt()
+        && shape_blocks > 0
+        && !select_forced_serial();
+    // Past the LDS row the scores go to global rows (one per workgroup, at
+    // most QSA_SELECT_GLOBAL_ROWS per launch); the selection is the same.
+    let global = parallel
+        && lds_bytes + QSA_SELECT_BATCHED_STATIC_LDS_BYTES > QSA_SELECT_DYNAMIC_LDS_LIMIT_BYTES;
+    if global && p.rows > QSA_SELECT_GLOBAL_ROWS {
+        let query_elements = p.query.numel();
+        let selected_bytes = p.selected.numel();
+        let row_bytes = p.capacity * std::mem::size_of::<i32>();
+        let mut persisted = false;
+        let mut first = 0;
+        while first < p.rows {
+            let rows = (p.rows - first).min(QSA_SELECT_GLOBAL_ROWS);
+            let last = first + rows == p.rows;
+            let query_offset = first * p.query_row_stride;
+            let query = p.query.sub_offset(query_offset, query_elements - query_offset);
+            let selected = p.selected.sub_offset(first * row_bytes, selected_bytes - first * row_bytes);
+            let group = IndexedAttentionSelectBatch {
+                query: &query,
+                pooled: p.pooled,
+                selected: &selected,
+                rows,
+                query_row_stride: p.query_row_stride,
+                block_count: (p.position_start + first + rows) / p.compress,
+                index_heads: p.index_heads,
+                index_dim: p.index_dim,
+                budget_blocks: p.budget_blocks,
+                compress: p.compress,
+                position_start: p.position_start + first,
+                capacity: p.capacity,
+                shape_blocks: p.shape_blocks,
+            };
+            persisted = indexed_attention_select_batch_impl(
+                gpu,
+                &group,
+                if last { mirror } else { None },
+            )?;
+            first += rows;
+        }
+        return Ok(persisted);
+    }
+    let scores_stride = shape_blocks.div_ceil(4) * 4;
+    let scores_global = if global {
+        let bytes = QSA_SELECT_GLOBAL_ROWS
+            .checked_mul(scores_stride)
+            .and_then(|n| n.checked_mul(std::mem::size_of::<f32>()))
+            .ok_or_else(|| HipError::new(0, "QSA select score rows overflow"))?;
+        gpu.qsa_select_scores(bytes)?
+    } else {
+        std::ptr::null_mut()
+    };
+    let (kernel_name, block, shared_mem) = if global {
+        (parallel_kernel, [QSA_SELECT_PARALLEL_THREADS, 1, 1], 0u32)
+    } else if parallel && lds_bytes <= u32::MAX as usize {
+        (
+            parallel_kernel,
+            [QSA_SELECT_PARALLEL_THREADS, 1, 1],
+            lds_bytes as u32,
+        )
+    } else {
+        (serial_kernel, [1, 1, 1], 0)
+    };
     gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel_name)?;
     let mut args = KernargBlob::new();
     for tensor in [p.query, p.pooled, p.selected] {
@@ -2738,6 +2808,8 @@ fn indexed_attention_select_batch_impl(
     });
     if kernel_name == parallel_kernel {
         args.push_ptr(mirror.map_or(std::ptr::null_mut(), |m| m.buf.as_ptr()));
+        args.push_ptr(scores_global);
+        args.push_i32(checked_i32(scores_stride, "QSA select score stride")?);
     }
     args.pad_to(16);
     // Both declared fields make the selection follow the replay position instead
@@ -5467,6 +5539,17 @@ mod tests {
             .collect()
     }
 
+    /// Arena bound whose score row exceeds the LDS limit: the global route.
+    const GLOBAL_BOUND: usize = QSA_SELECT_DYNAMIC_LDS_LIMIT_BYTES / 4 + 1;
+
+    /// The serial selection-sort oracle kernel for `case`.
+    fn run_select_serial(gpu: &mut Gpu, case: &SelectCase, pooled: &[f32], query: &[f32]) -> Vec<i32> {
+        SELECT_FORCE_SERIAL.with(|flag| flag.set(true));
+        let selected = run_select_case(gpu, case, pooled, query, case.block_count);
+        SELECT_FORCE_SERIAL.with(|flag| flag.set(false));
+        selected
+    }
+
     /// Scores that increase with the block index must select blocks in
     /// descending order, and equal scores must break ties toward the lower
     /// block index — the order the serial scan's strict `>` comparison
@@ -5529,8 +5612,6 @@ mod tests {
             eprintln!("skip: no GPU");
             return;
         };
-        const SERIAL_BOUND: usize = QSA_SELECT_DYNAMIC_LDS_LIMIT_BYTES / 4 + 1;
-
         let mut state = 0x9e37_79b9u32;
         let mut next = move || {
             state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
@@ -5566,8 +5647,15 @@ mod tests {
                                     .collect();
                                 let parallel =
                                     run_select_case(&mut gpu, &case, &pooled, &query, block_count);
-                                let serial =
-                                    run_select_case(&mut gpu, &case, &pooled, &query, SERIAL_BOUND);
+                                let serial = run_select_serial(&mut gpu, &case, &pooled, &query);
+                                let global =
+                                    run_select_case(&mut gpu, &case, &pooled, &query, GLOBAL_BOUND);
+                                assert_eq!(
+                                    global, serial,
+                                    "global-score selection diverged from the serial selection sort: \
+                                     compress={compress} heads={index_heads} dim={index_dim} \
+                                     rows={rows} blocks={block_count} budget={budget_blocks}"
+                                );
                                 assert_eq!(
                                     parallel, serial,
                                     "parallel ranking diverged from the serial selection sort: \
@@ -5592,7 +5680,6 @@ mod tests {
             eprintln!("skip: no GPU");
             return;
         };
-        const SERIAL_BOUND: usize = QSA_SELECT_DYNAMIC_LDS_LIMIT_BYTES / 4 + 1;
         let (compress, index_heads, index_dim, rows, block_count, budget_blocks) =
             (4usize, 4usize, 128usize, 3usize, 4096usize, 512usize);
         let mut state = 0x2545_f491u32;
@@ -5628,10 +5715,15 @@ mod tests {
                 position_start: block_count * compress,
             };
             let parallel = run_select_case(&mut gpu, &case, &pooled, &query, block_count);
-            let serial = run_select_case(&mut gpu, &case, &pooled, &query, SERIAL_BOUND);
+            let serial = run_select_serial(&mut gpu, &case, &pooled, &query);
+            let global = run_select_case(&mut gpu, &case, &pooled, &query, GLOBAL_BOUND);
             assert_eq!(
                 parallel, serial,
                 "past-budget radix select diverged (positive_every={positive_every})"
+            );
+            assert_eq!(
+                global, serial,
+                "past-budget global-score select diverged (positive_every={positive_every})"
             );
             if positive_every == 0 {
                 // All tied: the lowest 512 block indices, in index order.
@@ -5639,6 +5731,40 @@ mod tests {
                 assert_eq!(&parallel[..budget_blocks * compress], &expected[..]);
             }
         }
+    }
+
+    /// A prefill-sized batch (more rows than one global-score launch holds)
+    /// runs in row groups; each row's selection must equal the single-launch
+    /// LDS route's, including rows whose visible prefix ends mid-block.
+    #[test]
+    fn global_score_row_groups_match_the_lds_route() {
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        let (compress, index_heads, index_dim, rows, block_count, budget_blocks) =
+            (4usize, 4usize, 128usize, 2 * QSA_SELECT_GLOBAL_ROWS + 37, 4096usize, 512usize);
+        let mut state = 0x7f4a_7c15u32;
+        let mut next = move || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (state >> 8) as f32 / 8_388_608.0 - 1.0
+        };
+        let query: Vec<f32> = (0..rows * index_heads * index_dim).map(|_| next()).collect();
+        let pooled: Vec<f32> = (0..block_count * index_dim).map(|_| next()).collect();
+        let case = SelectCase {
+            compress,
+            index_heads,
+            index_dim,
+            rows,
+            block_count,
+            budget_blocks,
+            capacity: budget_blocks * compress + compress - 1,
+            // (position_start + rows) / compress == block_count.
+            position_start: block_count * compress - rows + 2,
+        };
+        let lds = run_select_case(&mut gpu, &case, &pooled, &query, block_count);
+        let global = run_select_case(&mut gpu, &case, &pooled, &query, GLOBAL_BOUND);
+        assert_eq!(global, lds, "grouped global-score selection diverged from the LDS route");
     }
 
     #[test]
